@@ -98,14 +98,15 @@ func backupParallelEligible(snapshotName string, source ir.Engine, tableParallel
 	return true, ""
 }
 
-// backupTableTask is one table's unit of work for the pool: the table,
-// its pre-staged manifest entry (already appended to manifest.Tables in
-// schema order by [manifestCommitter.stageTables]), and the prior run's
-// entry when the table is being per-chunk-resumed (Bug 34b).
+// backupTableTask is one table's unit of work for the pool: the table
+// and its pre-staged manifest entry (already appended to
+// manifest.Tables in schema order by [Backup.stageBackupTables]).
+// There is deliberately NO prior-run chunk state here: partially-
+// written tables re-stream from scratch on resume (Bug 135 — see
+// [Backup.backupTable]'s doc comment).
 type backupTableTask struct {
-	table      *ir.Table
-	entry      *ir.TableManifest
-	priorTable *ir.TableManifest
+	table *ir.Table
+	entry *ir.TableManifest
 }
 
 // backupReaderFactory mints one additional snapshot-pinned
@@ -217,10 +218,22 @@ var errBackupPoolNoFactory = errors.New("pipeline: backup table pool: dedicated 
 
 // stageBackupTables walks schema.Tables in order and stages one
 // manifest entry per table through the committer: a prior run's
-// fully-complete entry verbatim (whole-table resume skip), or a fresh
-// Partial=true placeholder paired into a [backupTableTask] for the
-// pool. Returns the tasks (the tables that still need streaming) in
-// schema order.
+// fully-complete entry verbatim (whole-table resume skip — sound: the
+// chunk SET is whole and order-independent), or a fresh Partial=true
+// placeholder paired into a [backupTableTask] for the pool. Returns
+// the tasks (the tables that still need streaming) in schema order.
+//
+// A prior run's PARTIAL table is deliberately re-streamed from
+// scratch — its chunks are NOT reused. The per-chunk reuse this
+// replaces (Bug 34b) silently corrupted resumed backups (duplicate +
+// missing rows, exit 0) because it assumed repeatable scan order
+// across runs, which the reader has never guaranteed (Bug 135; see
+// [Backup.backupTable]). The fresh placeholder REPLACES the prior
+// entry in the new manifest, so the corrupt-prone chunk list never
+// survives into the resumed manifest; the prior chunk FILES are
+// overwritten index-by-index as the table re-streams (a byte-identical
+// chunk skips its upload via flush's content-addressed SHA comparison
+// — sound, order-independent).
 func (b *Backup) stageBackupTables(
 	ctx context.Context,
 	committer *manifestCommitter,
@@ -230,7 +243,6 @@ func (b *Backup) stageBackupTables(
 	tasks := make([]backupTableTask, 0, len(schema.Tables))
 	for _, table := range schema.Tables {
 		key := manifestTableKey(table.Schema, table.Name)
-		var priorTable *ir.TableManifest
 		if existing, ok := priorTables[key]; ok {
 			full, err := tableManifestFullyComplete(ctx, b.Store, existing)
 			if err != nil {
@@ -246,14 +258,10 @@ func (b *Backup) stageBackupTables(
 				committer.stageTable(existing)
 				continue
 			}
-			// Partial: pass the prior entry through so backupTable can
-			// per-chunk-skip already-uploaded chunks (Bug 34b).
-			priorTable = existing
 			slog.InfoContext(
-				ctx, "resuming table mid-stream — partial chunks present in prior backup",
+				ctx, "re-streaming partially-backed-up table from scratch — prior partial chunks are not reusable (scan order is not repeatable across runs; Bug 135)",
 				slog.String("table", table.Name),
-				slog.Int("prior_chunks", len(existing.Chunks)),
-				slog.Bool("prior_partial_flag", existing.Partial),
+				slog.Int("discarded_prior_chunks", len(existing.Chunks)),
 			)
 		}
 		entry := &ir.TableManifest{
@@ -262,7 +270,7 @@ func (b *Backup) stageBackupTables(
 			Partial: true, // flips to false on natural EOF; checkpoints persist it as true until then
 		}
 		committer.stageTable(entry)
-		tasks = append(tasks, backupTableTask{table: table, entry: entry, priorTable: priorTable})
+		tasks = append(tasks, backupTableTask{table: table, entry: entry})
 	}
 	return tasks, nil
 }
@@ -416,20 +424,15 @@ func (c *manifestCommitter) stageTable(entry *ir.TableManifest) {
 	c.manifest.Tables = append(c.manifest.Tables, entry)
 }
 
-// appendChunk records one finished chunk on entry and, when checkpoint
-// is set, commits the manifest so a mid-table crash leaves an
-// up-to-date record of exactly which chunks completed (Bug 34b's
-// per-chunk granularity). checkpoint=false is the per-chunk-resume
-// reuse path (the chunk is already on the store AND recorded in the
-// prior manifest; the next written chunk's checkpoint captures it) —
-// matching the pre-pool behaviour, which never checkpointed on skip.
-func (c *manifestCommitter) appendChunk(ctx context.Context, entry *ir.TableManifest, ci *ir.ChunkInfo, checkpoint bool) error {
+// appendChunk records one finished chunk on entry and commits the
+// manifest so a mid-table crash leaves an up-to-date record of exactly
+// which chunks completed — progress observability, plus it keeps
+// flush's content-addressed same-path upload skip effective across a
+// re-run. Resume never REUSES partial chunk lists (Bug 135).
+func (c *manifestCommitter) appendChunk(ctx context.Context, entry *ir.TableManifest, ci *ir.ChunkInfo) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry.Chunks = append(entry.Chunks, ci)
-	if !checkpoint {
-		return nil
-	}
 	return c.commitLocked(ctx)
 }
 

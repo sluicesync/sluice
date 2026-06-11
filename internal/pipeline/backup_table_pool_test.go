@@ -329,7 +329,7 @@ func TestManifestCommitter_ConcurrentCheckpointsKeepSchemaOrder(t *testing.T) {
 					RowCount: 1,
 					SHA256:   "deadbeef",
 				}
-				if err := committer.appendChunk(context.Background(), entry, ci, true); err != nil {
+				if err := committer.appendChunk(context.Background(), entry, ci); err != nil {
 					t.Errorf("appendChunk(%s, %d): %v", entry.Name, c, err)
 					return
 				}

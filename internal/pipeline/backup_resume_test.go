@@ -291,7 +291,7 @@ func TestBackup_ChunkAlreadyMatchesHelper(t *testing.T) {
 // Stash that backup state, simulate a "killed mid-table" by truncating
 // the manifest to keep only chunks 0 and 1. Then re-run; verify chunks
 // 0 and 1 are NOT re-uploaded (Put count proves it) and chunk 2 is.
-func TestBackup_ResumePerChunkSkipsAlreadyUploadedChunks(t *testing.T) {
+func TestBackup_ResumeRestreamsPartialTableWithContentAddressedUploadSkip(t *testing.T) {
 	dir := t.TempDir()
 	store, err := NewLocalStore(dir)
 	if err != nil {
