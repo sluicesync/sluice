@@ -6,6 +6,8 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.37] - 2026-06-11
+
 ### Fixed
 - **Bug 136: PG → MySQL with an index on a `text`/`bytea`/JSON-landing
   column now refuses EARLY — before any DDL or rows move — instead of
