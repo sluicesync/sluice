@@ -47,6 +47,8 @@ package pipeline
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -402,10 +404,81 @@ var errBackupPoolNoImporter = errors.New("pipeline: backup table pool: source en
 // WHOLE manifest) and the same-key `manifest.json` Puts (load-bearing
 // on stores without atomic rename) need one serialization point — this
 // mutex is it. The data-plane chunk Puts (distinct keys) stay outside.
+//
+// Checkpoint cost (ADR-0086, task #54): when the store implements
+// [irbackup.Appender], per-chunk / per-table checkpoints append one
+// JSON line to the `manifest.progress.jsonl` sidecar — O(1) per event
+// — instead of re-marshaling the whole manifest (schema included) per
+// checkpoint, which made the row sweep quadratic in table count
+// (~78 h of pure manifest rewriting at 100k tables, per the #38 scale
+// probe). The base manifest is written once by [commitBase] (stamped
+// [irbackup.FormatVersionProgressSidecar] so OLDER binaries refuse the
+// layout loudly instead of resuming off an under-reporting base), and
+// [finalize] folds everything back into the one self-contained final
+// `manifest.json` (re-stamped to the schema's own format version) and
+// deletes the sidecar — finalized backups keep the pre-ADR shape.
+//
+// Stores without the append capability (object stores) keep the
+// legacy full-rewrite checkpoints byte-for-byte — a named wart: the
+// cost grows with table count, and [commitBase] says so loudly on
+// large corpora.
 type manifestCommitter struct {
 	mu       sync.Mutex
 	store    irbackup.Store
 	manifest *irbackup.Manifest
+
+	// Sidecar mode (ADR-0086). appender == nil means legacy mode:
+	// every checkpoint rewrites the full manifest, exactly the
+	// pre-ADR-0086 behaviour.
+	appender    irbackup.Appender
+	sidecarPath string
+	attemptID   string
+
+	// finalVersion is the manifest's schema-appropriate format version
+	// ([irbackup.FormatVersionFor]), displaced while in progress by the
+	// sidecar-layout stamp and restored by [finalize].
+	finalVersion int
+}
+
+// newManifestCommitter builds the committer for one backup run. When
+// store can append (the [irbackup.Appender] capability), the manifest
+// is switched into the sidecar-checkpoint layout: stamped
+// [irbackup.FormatVersionProgressSidecar] and given a
+// [irbackup.ProgressSidecarRef] with a fresh random attempt ID (the
+// stale-sidecar guard — see the ref's doc). Otherwise the committer
+// runs in legacy full-rewrite mode and the manifest is untouched.
+func newManifestCommitter(store irbackup.Store, manifest *irbackup.Manifest) (*manifestCommitter, error) {
+	c := &manifestCommitter{store: store, manifest: manifest}
+	appender, ok := store.(irbackup.Appender)
+	if !ok {
+		return c, nil
+	}
+	attemptID, err := newBackupAttemptID()
+	if err != nil {
+		return nil, fmt.Errorf("backup: mint progress attempt id: %w", err)
+	}
+	c.appender = appender
+	c.sidecarPath = ManifestProgressFileName
+	c.attemptID = attemptID
+	c.finalVersion = manifest.FormatVersion
+	manifest.FormatVersion = irbackup.FormatVersionProgressSidecar
+	manifest.ProgressSidecar = &irbackup.ProgressSidecarRef{
+		File:      c.sidecarPath,
+		AttemptID: attemptID,
+	}
+	return c, nil
+}
+
+// newBackupAttemptID mints the random per-attempt token sidecar lines
+// are stamped with. 8 random bytes hex-encoded — collision across the
+// handful of attempts a single backup directory ever sees is not a
+// realistic event.
+func newBackupAttemptID() (string, error) {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 // stageTable appends one table's entry to manifest.Tables. The
@@ -425,39 +498,139 @@ func (c *manifestCommitter) stageTable(entry *irbackup.TableManifest) {
 	c.manifest.Tables = append(c.manifest.Tables, entry)
 }
 
-// appendChunk records one finished chunk on entry and commits the
-// manifest so a mid-table crash leaves an up-to-date record of exactly
-// which chunks completed — progress observability, plus it keeps
-// flush's content-addressed same-path upload skip effective across a
-// re-run. Resume never REUSES partial chunk lists (Bug 135).
+// appendChunk records one finished chunk on entry and checkpoints it
+// so a mid-table crash leaves an up-to-date record of exactly which
+// chunks completed — progress observability, plus it keeps flush's
+// content-addressed same-path upload skip effective across a re-run.
+// Resume never REUSES partial chunk lists (Bug 135). Sidecar mode
+// appends one delta line (O(1)); legacy mode rewrites the manifest.
 func (c *manifestCommitter) appendChunk(ctx context.Context, entry *irbackup.TableManifest, ci *irbackup.ChunkInfo) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry.Chunks = append(entry.Chunks, ci)
-	return c.commitLocked(ctx)
+	if c.appender == nil {
+		return c.commitLocked(ctx)
+	}
+	return c.appendEventLocked(ctx, &irbackup.ProgressEvent{
+		AttemptID: c.attemptID,
+		Event:     irbackup.ProgressEventChunk,
+		Schema:    entry.Schema,
+		Table:     entry.Name,
+		Chunk:     ci,
+	})
 }
 
 // finishTable flips entry to its terminal complete state (natural row
-// EOF) and commits the manifest — the per-table checkpoint. Empty
-// tables and tables whose row count is an exact chunk multiple rely on
-// this commit (their last appendChunk checkpoint doesn't carry the
+// EOF) and checkpoints it — the per-table checkpoint. Empty tables and
+// tables whose row count is an exact chunk multiple rely on this
+// checkpoint (their last appendChunk checkpoint doesn't carry the
 // Partial=false flip).
 func (c *manifestCommitter) finishTable(ctx context.Context, entry *irbackup.TableManifest, rowCount int64) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry.RowCount = rowCount
 	entry.Partial = false
-	return c.commitLocked(ctx)
+	if c.appender == nil {
+		return c.commitLocked(ctx)
+	}
+	return c.appendEventLocked(ctx, &irbackup.ProgressEvent{
+		AttemptID: c.attemptID,
+		Event:     irbackup.ProgressEventTableComplete,
+		Schema:    entry.Schema,
+		Table:     entry.Name,
+		RowCount:  rowCount,
+	})
 }
 
-// commit marshals + writes the manifest under the mutex. Used by the
-// orchestrator for the pre-pool and post-pool manifest writes (resume
-// staging, EndPosition, the final complete flip) so every
-// `manifest.json` Put in a backup run flows through one code path.
-func (c *manifestCommitter) commit(ctx context.Context) error {
+// appendEventLocked marshals one progress event and appends it to the
+// sidecar. Callers hold mu — appends to the same path must be
+// serialized (the [irbackup.Appender] contract), and the event reads
+// entry fields peers may otherwise mutate.
+func (c *manifestCommitter) appendEventLocked(ctx context.Context, ev *irbackup.ProgressEvent) error {
+	line, err := ev.MarshalLine()
+	if err != nil {
+		return err
+	}
+	if err := c.appender.Append(ctx, c.sidecarPath, bytes.NewReader(line)); err != nil {
+		return fmt.Errorf("append progress sidecar event: %w", err)
+	}
+	return nil
+}
+
+// commitBase writes the pre-sweep in-progress manifest — the ONE base
+// write the sidecar's deltas accrue on (ADR-0086) — and resets any
+// stale sidecar left by a previous attempt's crash window. The base
+// carries the schema, the ADR-0085 anchor stamp, and every pre-staged
+// table entry; its durability is what allows BackupSnapshot.Commit to
+// fire (the crashed-chain-slot adoption contract — do not reorder).
+//
+// Legacy mode (no appender) is the plain pre-ADR-0086 manifest write,
+// with the quadratic per-checkpoint cost named loudly when the corpus
+// is large enough for it to hurt.
+func (c *manifestCommitter) commitBase(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.commitLocked(ctx)
+	if err := c.commitLocked(ctx); err != nil {
+		return err
+	}
+	if c.appender == nil {
+		logf := slog.DebugContext
+		if len(c.manifest.Tables) >= legacyCheckpointWarnTables {
+			logf = slog.WarnContext
+		}
+		logf(
+			ctx, "backup: store does not support appends; per-chunk checkpoints rewrite the full manifest (cost grows with table count)",
+			slog.Int("tables", len(c.manifest.Tables)),
+		)
+		return nil
+	}
+	// Reset the sidecar AFTER the base write: a stale sidecar surviving
+	// a crash in between is harmless (its lines carry the previous
+	// attempt's ID and replay skips them), whereas deleting first would
+	// widen the window where the PRIOR attempt's progress is lost.
+	if err := c.store.Delete(ctx, c.sidecarPath); err != nil {
+		return fmt.Errorf("reset progress sidecar %q: %w", c.sidecarPath, err)
+	}
+	return nil
+}
+
+// legacyCheckpointWarnTables is the corpus size above which commitBase
+// WARNs (vs DEBUGs) about legacy-mode quadratic checkpoint cost.
+const legacyCheckpointWarnTables = 1000
+
+// finalize writes the final self-contained manifest after the pool has
+// drained: sidecar mode restores the schema-appropriate format version
+// and drops the sidecar reference first, so the finalized manifest is
+// byte-shape-identical to the pre-ADR-0086 contract (older binaries
+// read it; restore/verify/chain tooling unaffected), then deletes the
+// now-redundant sidecar. The delete is best-effort: with the reference
+// cleared the file is inert (replay is gated on the manifest ref), and
+// failing a finished backup over cleanup would be disproportionate.
+//
+// The caller has already set PartialState/BackupID/EndPosition; this
+// is single-threaded (post-pool) but takes the mutex anyway — every
+// manifest mutation in this file happens under mu.
+func (c *manifestCommitter) finalize(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.appender != nil {
+		c.manifest.FormatVersion = c.finalVersion
+		c.manifest.ProgressSidecar = nil
+	}
+	if err := c.commitLocked(ctx); err != nil {
+		return err
+	}
+	if c.appender == nil {
+		return nil
+	}
+	if err := c.store.Delete(ctx, c.sidecarPath); err != nil {
+		slog.WarnContext(
+			ctx, "backup: progress sidecar cleanup failed; the file is inert (the final manifest no longer references it) but remains on the store",
+			slog.String("path", c.sidecarPath),
+			slog.String("err", err.Error()),
+		)
+	}
+	return nil
 }
 
 // commitLocked is the marshal+Put core. Callers hold mu — the marshal

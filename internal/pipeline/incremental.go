@@ -996,7 +996,11 @@ func listAllManifestsViaWalk(ctx context.Context, store irbackup.Store) ([]manif
 }
 
 // readManifestAt is [readManifest] generalised to a caller-supplied
-// path. Same format-version gating as the legacy helper.
+// path. Same format-version gating and ADR-0086 sidecar replay as the
+// legacy helper — chain walkers reading a crashed full's in-progress
+// manifest (the ADR-0085 adoption surface) must see the reconstructed
+// truth too. The sidecar path recorded on the manifest is relative to
+// the same store root the manifest was read from.
 func readManifestAt(ctx context.Context, store irbackup.Store, path string) (*irbackup.Manifest, error) {
 	rc, err := store.Get(ctx, path)
 	if err != nil {
@@ -1014,6 +1018,9 @@ func readManifestAt(ctx context.Context, store irbackup.Store, path string) (*ir
 	if m.FormatVersion > irbackup.BackupFormatVersion {
 		return nil, fmt.Errorf("manifest %q format version %d is newer than this build supports (%d); upgrade sluice",
 			path, m.FormatVersion, irbackup.BackupFormatVersion)
+	}
+	if err := replayManifestProgress(ctx, store, m); err != nil {
+		return nil, err
 	}
 	return m, nil
 }

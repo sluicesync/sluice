@@ -21,6 +21,24 @@ project follows [Semantic Versioning](https://semver.org/).
   falls back to the legacy path, which remains the semantic and
   error oracle; differential sweeps plus two fuzz targets pin the
   two paths equivalent on arbitrary input.
+- **Backup checkpoints are now O(1) per event — the manifest is no
+  longer rewritten per chunk/table (task #54, ADR-0086).** Every
+  per-chunk / per-table checkpoint during `backup full` used to
+  re-marshal the ENTIRE manifest (embedded schema included) and re-Put
+  `manifest.json`, making the row sweep quadratic in table count (the
+  #38 scale probe measured ~78 hours of pure manifest rewriting at
+  100k tables). The in-progress manifest is now a base written once
+  plus an append-only `manifest.progress.jsonl` sidecar (one JSON line
+  per event); the manifest is marshaled exactly twice per run (base +
+  final), and a successful backup's on-disk layout is unchanged —
+  restore/verify/chain tooling and older binaries read finalized
+  backups exactly as before. In-progress sidecar-layout manifests are
+  stamped format version 3 so an OLDER binary asked to resume a
+  crashed backup refuses loudly ("upgrade sluice") instead of silently
+  resuming off a base that under-reports progress; new binaries resume
+  old-format in-progress backups unchanged. Stores without an append
+  primitive (S3/GCS/Azure blob stores) keep the previous full-rewrite
+  checkpoints, named loudly on large corpora.
 
 ### Changed
 - **Schema fingerprints are now stable across manifest JSON

@@ -100,11 +100,11 @@ func TestChooseFormatVersion_Bug116(t *testing.T) {
 			want: FormatVersionLegacy,
 		},
 		{
-			name: "BackupFormatVersion constant is the security-metadata version (v0.94.1+ default ceiling)",
+			name: "security-metadata is the FINALIZED-manifest ceiling (FormatVersionProgressSidecar is in-progress-only and never chosen here)",
 			schema: &ir.Schema{
 				Tables: []*ir.Table{{Name: "x", RLSEnabled: true}},
 			},
-			want: BackupFormatVersion,
+			want: FormatVersionSecurityMetadata,
 		},
 	}
 	for _, c := range cases {
@@ -122,14 +122,16 @@ func TestChooseFormatVersion_Bug116(t *testing.T) {
 	}
 }
 
-// TestBackupFormatVersion_Bumped pins that the constant is now 2 (the
-// Bug 116 closure ceiling). If a future change lowers it without
-// updating chooseFormatVersion's contract, this test catches the
-// regression at build time.
+// TestBackupFormatVersion_Bumped pins the version ladder: the build
+// ceiling is the ADR-0086 in-progress sidecar version, the Bug 116
+// security-metadata version stays the FINALIZED ceiling, and the
+// legacy value is frozen. If a future change reorders these without
+// updating the chooseFormatVersion / sidecar contracts, this test
+// catches the regression at build time.
 func TestBackupFormatVersion_Bumped(t *testing.T) {
-	if BackupFormatVersion != FormatVersionSecurityMetadata {
-		t.Errorf("BackupFormatVersion = %d; want FormatVersionSecurityMetadata=%d (Bug 116 ceiling)",
-			BackupFormatVersion, FormatVersionSecurityMetadata)
+	if BackupFormatVersion != FormatVersionProgressSidecar {
+		t.Errorf("BackupFormatVersion = %d; want FormatVersionProgressSidecar=%d (ADR-0086 ceiling)",
+			BackupFormatVersion, FormatVersionProgressSidecar)
 	}
 	if FormatVersionLegacy != 1 {
 		t.Errorf("FormatVersionLegacy = %d; must stay 1 (load-bearing for older-binary preflight semantics)", FormatVersionLegacy)
@@ -137,5 +139,9 @@ func TestBackupFormatVersion_Bumped(t *testing.T) {
 	if FormatVersionSecurityMetadata <= FormatVersionLegacy {
 		t.Errorf("FormatVersionSecurityMetadata (%d) must be strictly greater than FormatVersionLegacy (%d)",
 			FormatVersionSecurityMetadata, FormatVersionLegacy)
+	}
+	if FormatVersionProgressSidecar <= FormatVersionSecurityMetadata {
+		t.Errorf("FormatVersionProgressSidecar (%d) must be strictly greater than FormatVersionSecurityMetadata (%d) — older binaries refuse the in-progress sidecar layout via the version gate",
+			FormatVersionProgressSidecar, FormatVersionSecurityMetadata)
 	}
 }

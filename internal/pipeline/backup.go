@@ -44,9 +44,13 @@ package pipeline
 //     same path skip the upload (content-addressed); mismatches
 //     overwrite (treating the prior bytes as stale or corrupt).
 //
-// The manifest is committed to the store after every table completes,
-// so a crashed run leaves at most tableParallelism tables' worth of
+// Progress is checkpointed after every chunk and every table, so a
+// crashed run leaves at most tableParallelism tables' worth of
 // in-flight work to redo (one table's, when the sweep runs serial).
+// On append-capable stores each checkpoint is one appended line in the
+// `manifest.progress.jsonl` sidecar (O(1) — ADR-0086) and the
+// in-progress truth is base manifest + sidecar replay; stores without
+// appends keep the legacy full-manifest rewrite per checkpoint.
 //
 // # Resume anchor adoption (task #42, ADR-0085)
 //
@@ -179,6 +183,14 @@ const DefaultBackupChunkRows = 100_000
 // ManifestFileName is the filename of the manifest within a backup
 // directory. Convention; restore looks here first.
 const ManifestFileName = "manifest.json"
+
+// ManifestProgressFileName is the filename of the in-progress
+// checkpoint sidecar next to the manifest (ADR-0086): one appended
+// JSON line per chunk-finished / table-finished event, so checkpoints
+// are O(1) instead of rewriting the whole manifest. Present only while
+// a sidecar-mode backup is in progress — the final manifest write
+// folds the progress back into [ManifestFileName] and deletes it.
+const ManifestProgressFileName = "manifest.progress.jsonl"
 
 // Backup runs a single Phase 1 full backup against Source / SourceDSN
 // and writes to Store. Construct the value, then call Run.
@@ -517,8 +529,13 @@ func (b *Backup) Run(ctx context.Context) error {
 	// order; the committer serializes every entry mutation + manifest
 	// Put. Per-chunk + per-table checkpoints live inside backupTable /
 	// the committer now — a crash leaves at most tableParallelism tables
-	// with partial chunk lists to redo.
-	committer := &manifestCommitter{store: b.Store, manifest: manifest}
+	// with partial chunk lists to redo. On append-capable stores the
+	// checkpoints are O(1) sidecar deltas (ADR-0086) and the in-progress
+	// manifest is stamped with the sidecar-layout format version.
+	committer, err := newManifestCommitter(b.Store, manifest)
+	if err != nil {
+		return err
+	}
 	tasks, err := b.stageBackupTables(ctx, committer, schema, priorTables)
 	if err != nil {
 		return err
@@ -548,7 +565,7 @@ func (b *Backup) Run(ctx context.Context) error {
 	// via the deferred Close — nothing references it yet. On a resumed
 	// run (temporary-anchor shape) and on non-chain-slot runs Commit is
 	// a no-op.
-	if err := committer.commit(ctx); err != nil {
+	if err := committer.commitBase(ctx); err != nil {
 		return fmt.Errorf("backup: write in-progress manifest: %w", err)
 	}
 	if err := snap.Commit(ctx); err != nil {
@@ -628,8 +645,12 @@ func (b *Backup) Run(ctx context.Context) error {
 	// 5. Final manifest write — flip to complete. Routed through the
 	// committer like every other manifest Put this run (the pool has
 	// drained, so this is single-threaded; one code path regardless).
+	// Sidecar mode folds the progress back into the one self-contained
+	// manifest (schema-appropriate format version restored, sidecar
+	// reference cleared + file deleted) so the finalized layout is the
+	// pre-ADR-0086 contract restore/verify/chain tooling already reads.
 	manifest.PartialState = irbackup.BackupStateComplete
-	if err := committer.commit(ctx); err != nil {
+	if err := committer.finalize(ctx); err != nil {
 		return fmt.Errorf("backup: write final manifest: %w", err)
 	}
 	// Chain resources (--chain-slot: the slot anchored at EndPosition)
@@ -1442,7 +1463,11 @@ func chainRootEncryption(ctx context.Context, store irbackup.Store, parent *irba
 }
 
 // readManifest loads and decodes the manifest from store. Used by
-// both restore and `sluice backup verify`.
+// both restore and `sluice backup verify`. An in-progress manifest in
+// the ADR-0086 sidecar layout is reconstructed here (base + sidecar
+// replay), so EVERY reader downstream — resume, restore, verify, the
+// broker's chain-root preflight — sees one truth without knowing the
+// layout exists.
 func readManifest(ctx context.Context, store irbackup.Store) (*irbackup.Manifest, error) {
 	rc, err := store.Get(ctx, ManifestFileName)
 	if err != nil {
@@ -1461,7 +1486,82 @@ func readManifest(ctx context.Context, store irbackup.Store) (*irbackup.Manifest
 		return nil, fmt.Errorf("backup: manifest format version %d is newer than this build supports (%d); upgrade sluice",
 			m.FormatVersion, irbackup.BackupFormatVersion)
 	}
+	if err := replayManifestProgress(ctx, store, &m); err != nil {
+		return nil, err
+	}
 	return &m, nil
+}
+
+// replayManifestProgress reconstructs an in-progress sidecar-layout
+// manifest (ADR-0086): the base manifest under-reports progress by
+// design, and the truth is base + replay of the sidecar's
+// matching-attempt events. A no-op for every other manifest shape
+// (finalized, legacy in-progress, incremental/stream) — those carry no
+// sidecar reference.
+//
+// A missing sidecar is the crash-before-first-checkpoint window: the
+// base is authoritative. A torn final line and stale previous-attempt
+// lines are expected crash debris — tolerated, but logged loudly so
+// operators see them named. Anything else malformed fails loudly
+// (corruption must never silently shrink the reconstructed progress).
+//
+// The decoded manifest is then NORMALIZED to the self-contained shape
+// (sidecar reference cleared, schema-appropriate format version
+// restored): replay is not idempotent — re-applying chunk events onto
+// an already-reconstructed manifest would duplicate chunks — so the
+// in-memory representation must never be replayable again, nor
+// persistable in a shape that references a sidecar it already
+// absorbed. The on-disk base keeps the v3 stamp + reference; only the
+// decoded view is normalized.
+func replayManifestProgress(ctx context.Context, store irbackup.Store, m *irbackup.Manifest) error {
+	if m.PartialState != irbackup.BackupStateInProgress || m.ProgressSidecar == nil {
+		return nil
+	}
+	defer func() {
+		m.ProgressSidecar = nil
+		m.FormatVersion = irbackup.FormatVersionFor(m.Schema)
+	}()
+	sidecar := m.ProgressSidecar.File
+	exists, err := store.Exists(ctx, sidecar)
+	if err != nil {
+		return fmt.Errorf("inspect progress sidecar %q: %w", sidecar, err)
+	}
+	if !exists {
+		slog.DebugContext(
+			ctx, "backup: in-progress manifest has no progress sidecar yet (crash before the first checkpoint); base manifest is authoritative",
+			slog.String("sidecar", sidecar),
+		)
+		return nil
+	}
+	rc, err := store.Get(ctx, sidecar)
+	if err != nil {
+		return fmt.Errorf("read progress sidecar %q: %w", sidecar, err)
+	}
+	defer func() { _ = rc.Close() }()
+	stats, err := irbackup.ReplayProgress(m, rc)
+	if err != nil {
+		return fmt.Errorf("replay progress sidecar %q: %w", sidecar, err)
+	}
+	if stats.TornTail {
+		slog.WarnContext(
+			ctx, "backup: progress sidecar ends in a torn line (crash mid-append); the event it carried is lost and its table will re-stream on resume",
+			slog.String("sidecar", sidecar),
+		)
+	}
+	if stats.StaleLines > 0 {
+		slog.WarnContext(
+			ctx, "backup: progress sidecar carries lines from a previous attempt; skipped (attempt-id mismatch — debris from a crash between a base-manifest write and the sidecar reset)",
+			slog.String("sidecar", sidecar),
+			slog.Int("stale_lines", stats.StaleLines),
+		)
+	}
+	slog.DebugContext(
+		ctx, "backup: reconstructed in-progress manifest from progress sidecar",
+		slog.String("sidecar", sidecar),
+		slog.Int("chunks_applied", stats.ChunksApplied),
+		slog.Int("tables_completed", stats.TablesCompleted),
+	)
+	return nil
 }
 
 // setupChainEncryption configures the manifest's [irbackup.ChainEncryption]
