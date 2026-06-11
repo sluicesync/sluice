@@ -4,6 +4,7 @@
 package mysql
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"database/sql"
@@ -83,9 +84,23 @@ func (w *RowWriter) writeLoadData(ctx context.Context, table *ir.Table, rows <-c
 	// CloseWithError propagates serializer failures to the driver-
 	// side read so the LOAD DATA statement aborts cleanly instead of
 	// hanging on a half-written stream.
+	//
+	// The pipe writer is wrapped in a bufio.Writer so rows batch into
+	// ~64 KiB pipe writes instead of one write PER ROW. io.Pipe is
+	// unbuffered — every Write is a producer↔consumer goroutine
+	// rendezvous, and the driver ships whatever each pipe Read carries
+	// — so per-row writes meant per-row handoffs and small driver
+	// packets. Same finding and fix as the PG raw-copy lane
+	// (rawCopyPipeBufSize, task #37: per-row frames were 80%+ of
+	// single-stream CPU there). Flush before Close on success; on
+	// error CloseWithError poisons the read anyway, so no flush.
 	encErr := make(chan error, 1)
 	go func() {
-		err := encodeRowsTSV(ctx, pw, cols, rows)
+		bw := bufio.NewWriterSize(pw, loadDataPipeBufSize)
+		err := encodeRowsTSV(ctx, bw, cols, rows)
+		if err == nil {
+			err = bw.Flush()
+		}
 		// Always close the pipe writer so the driver's read loop
 		// terminates.
 		if err != nil {
@@ -525,3 +540,10 @@ func appendEscapedByte(dst []byte, c byte) []byte {
 		return append(dst, c)
 	}
 }
+
+// loadDataPipeBufSize is the bufio.Writer capacity in front of the
+// LOAD DATA pipe writer. Mirrors the PG raw-copy lane's
+// rawCopyPipeBufSize (task #37): large enough to amortize the
+// per-write pipe rendezvous into ~64 KiB batches, small enough to be
+// irrelevant against per-stream memory budgets.
+const loadDataPipeBufSize = 64 * 1024
