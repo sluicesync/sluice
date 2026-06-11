@@ -6,6 +6,22 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Performance
+- **Backup/restore per-row JSON codec rewritten as a direct
+  buffer-append fast path (tasks #51/#52).** Profiling the 136 GB
+  bench corpus showed the reflection-based `encoding/json` round trip
+  of the per-row map was 49% of `backup full` CPU and 69% of
+  `restore` CPU. The chunk row encode/decode now runs on a
+  specialized codec that emits/parses the SAME wire bytes
+  (byte-identical output for every shape the fast path accepts, no
+  chunk-format change, old and new binaries read each other's
+  chunks): ~10× faster per row in both
+  directions at the microbenchmark level (encode 82→0 allocs/row,
+  decode 189→27). Any value or line outside the canonical shapes
+  falls back to the legacy path, which remains the semantic and
+  error oracle; differential sweeps plus two fuzz targets pin the
+  two paths equivalent on arbitrary input.
+
 ### Changed
 - **Schema fingerprints are now stable across manifest JSON
   round-trips (task #49).** `ComputeSchemaHash`'s canonical view

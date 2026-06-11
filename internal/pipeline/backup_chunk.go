@@ -106,6 +106,16 @@ type chunkWriter struct {
 	// writer writes here instead of `out` directly; on Close the
 	// bytes get encrypted and pushed to `out`.
 	gzBuf *bytes.Buffer
+
+	// Fast-encoder state (see backup_chunk_fast.go). encBuf is the
+	// reused per-row scratch buffer; sortedNames caches the stdlib
+	// map-key order for the columns slice identified by colsPtr/
+	// colsLen (stable per table in production — the identity check
+	// keeps WriteRow correct if a caller ever varies it).
+	encBuf      []byte
+	sortedNames []string
+	colsPtr     *ir.Column
+	colsLen     int
 }
 
 // newChunkWriter wraps out (the destination — typically a pipe to
@@ -163,10 +173,36 @@ func newChunkWriter(out io.Writer, columns []string, cek []byte, codec Codec) (*
 
 // WriteRow encodes row using the column order pinned at construction
 // and emits one JSON Lines record. Returns the cumulative row count.
+//
+// The encode runs on the fast append-based path (backup_chunk_fast.go,
+// byte-identical output); values the fast path doesn't model — alien
+// Go types, non-finite floats — fall back to the legacy reflection
+// marshal below, which owns both their bytes and their errors.
 func (w *chunkWriter) WriteRow(row ir.Row, columns []*ir.Column) error {
 	if w.closed {
 		return errors.New("chunk writer closed")
 	}
+	b, ok := appendRowJSON(w.encBuf[:0], row, w.columnNamesSorted(columns))
+	if ok {
+		w.encBuf = b
+		if _, err := w.bufW.Write(b); err != nil {
+			return fmt.Errorf("chunk row write: %w", err)
+		}
+		if err := w.bufW.WriteByte('\n'); err != nil {
+			return fmt.Errorf("chunk row newline: %w", err)
+		}
+		w.rowCount++
+		return nil
+	}
+	w.encBuf = b[:0]
+	return w.writeRowLegacy(row, columns)
+}
+
+// writeRowLegacy is the original reflection-based encode — the
+// semantic + error oracle for the fast path, and the fallback for
+// shapes the fast path bails on. The differential tests in
+// backup_chunk_fast_test.go pin the two paths byte-identical.
+func (w *chunkWriter) writeRowLegacy(row ir.Row, columns []*ir.Column) error {
 	enc := make(map[string]any, len(columns))
 	for _, c := range columns {
 		v, ok := row[c.Name]
@@ -188,6 +224,25 @@ func (w *chunkWriter) WriteRow(row ir.Row, columns []*ir.Column) error {
 	}
 	w.rowCount++
 	return nil
+}
+
+// columnNamesSorted returns columns' names in stdlib map-key order,
+// cached against the slice's identity (the production caller passes
+// the same slice every row of a table).
+func (w *chunkWriter) columnNamesSorted(columns []*ir.Column) []string {
+	if len(columns) == 0 {
+		if w.sortedNames == nil {
+			w.sortedNames = []string{}
+		}
+		return w.sortedNames[:0]
+	}
+	if w.colsPtr == columns[0] && w.colsLen == len(columns) {
+		return w.sortedNames
+	}
+	w.colsPtr = columns[0]
+	w.colsLen = len(columns)
+	w.sortedNames = sortedColumnNames(columns)
+	return w.sortedNames
 }
 
 // Close flushes the buffered writer and gzip stream. Safe to call
@@ -259,6 +314,10 @@ type chunkReader struct {
 	// src already; the Close path skips the "drain underlying" step
 	// to avoid reading from an already-consumed reader.
 	consumedSrc bool
+
+	// fastDec is the fast row-decode state (backup_chunk_fast.go):
+	// a per-reader key-canonicalization cache. Zero value ready.
+	fastDec fastRowDecoder
 }
 
 // ErrChunkHashMismatch surfaces when a chunk's recomputed SHA-256
@@ -377,6 +436,11 @@ func (r *chunkReader) Header() chunkHeader { return r.header }
 // ReadRow returns the next row from the chunk, or (nil, io.EOF) at
 // end-of-stream. The caller should drain to EOF and then call Close
 // to finalise the hash check.
+//
+// Decoding runs on the fast single-pass path (backup_chunk_fast.go);
+// lines it doesn't model — alien envelope shapes, grammar violations
+// — fall back to the legacy double-unmarshal below, which owns both
+// their semantics and their errors.
 func (r *chunkReader) ReadRow() (ir.Row, error) {
 	if !r.scanner.Scan() {
 		if err := r.scanner.Err(); err != nil {
@@ -384,8 +448,20 @@ func (r *chunkReader) ReadRow() (ir.Row, error) {
 		}
 		return nil, io.EOF
 	}
+	line := r.scanner.Bytes()
+	if row, ok := r.fastDec.decodeRow(line); ok {
+		return row, nil
+	}
+	return readRowLegacy(line)
+}
+
+// readRowLegacy is the original two-hop typed decode — the semantic +
+// error oracle for the fast path, and the fallback for lines it bails
+// on. The differential tests in backup_chunk_fast_test.go pin the two
+// paths equivalent on arbitrary input.
+func readRowLegacy(line []byte) (ir.Row, error) {
 	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(r.scanner.Bytes(), &raw); err != nil {
+	if err := json.Unmarshal(line, &raw); err != nil {
 		return nil, fmt.Errorf("chunk reader: row decode: %w", err)
 	}
 	row := make(ir.Row, len(raw))
