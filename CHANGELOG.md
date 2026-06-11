@@ -6,6 +6,8 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.38] - 2026-06-11
+
 ### Fixed
 - **Silent chain gap on crash-resume of an anchored backup (task #42,
   ADR-0085) — a CRITICAL silent-loss class.** A resumed `backup full`
