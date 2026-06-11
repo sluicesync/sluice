@@ -138,14 +138,14 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts ir.Back
 	// failovers, so FAILOVER is exactly right there.
 	consistentPoint, snapshotName, err := createLogicalReplicationSlot(ctx, db, replConn, anchorSlot, true)
 	if err != nil {
-		_ = replConn.Close(ctx)
+		closeReplConnGraceful(replConn)
 		_ = db.Close()
 		return nil, fmt.Errorf("postgres: backup snapshot: %w", err)
 	}
 	if snapshotName == "" {
 		// Drop the slot we just made so we don't leak it.
 		_, _ = db.ExecContext(ctx, "SELECT pg_drop_replication_slot($1)", anchorSlot)
-		_ = replConn.Close(ctx)
+		closeReplConnGraceful(replConn)
 		_ = db.Close()
 		return nil, errors.New("postgres: backup snapshot: server returned empty snapshot_name; expected EXPORT_SNAPSHOT to populate it")
 	}
@@ -156,14 +156,14 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts ir.Back
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		_, _ = db.ExecContext(ctx, "SELECT pg_drop_replication_slot($1)", anchorSlot)
-		_ = replConn.Close(ctx)
+		closeReplConnGraceful(replConn)
 		_ = db.Close()
 		return nil, fmt.Errorf("postgres: backup snapshot: pin sql conn: %w", err)
 	}
 	if _, err := conn.ExecContext(ctx, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"); err != nil {
 		_ = conn.Close()
 		_, _ = db.ExecContext(ctx, "SELECT pg_drop_replication_slot($1)", anchorSlot)
-		_ = replConn.Close(ctx)
+		closeReplConnGraceful(replConn)
 		_ = db.Close()
 		return nil, fmt.Errorf("postgres: backup snapshot: BEGIN: %w", err)
 	}
@@ -171,7 +171,7 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts ir.Back
 		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
 		_ = conn.Close()
 		_, _ = db.ExecContext(ctx, "SELECT pg_drop_replication_slot($1)", anchorSlot)
-		_ = replConn.Close(ctx)
+		closeReplConnGraceful(replConn)
 		_ = db.Close()
 		return nil, fmt.Errorf("postgres: backup snapshot: SET TRANSACTION SNAPSHOT: %w", err)
 	}
@@ -189,7 +189,7 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts ir.Back
 		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
 		_ = conn.Close()
 		_, _ = db.ExecContext(ctx, "SELECT pg_drop_replication_slot($1)", anchorSlot)
-		_ = replConn.Close(ctx)
+		closeReplConnGraceful(replConn)
 		_ = db.Close()
 		return nil, fmt.Errorf("postgres: backup snapshot: encode position: %w", err)
 	}

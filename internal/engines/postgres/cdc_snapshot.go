@@ -181,12 +181,12 @@ func (e Engine) openSnapshotStreamShared(ctx context.Context, dsn, slotName stri
 	// survives Patroni / sync_replication_slots failover events.
 	consistentPoint, snapshotName, err := createLogicalReplicationSlot(ctx, db, replConn, slotName, true)
 	if err != nil {
-		_ = replConn.Close(ctx)
+		closeReplConnGraceful(replConn)
 		_ = db.Close()
 		return nil, fmt.Errorf("postgres: snapshot: %w", err)
 	}
 	if snapshotName == "" {
-		_ = replConn.Close(ctx)
+		closeReplConnGraceful(replConn)
 		_ = db.Close()
 		return nil, errors.New("postgres: snapshot: server returned empty snapshot_name; expected EXPORT_SNAPSHOT to populate it")
 	}
@@ -196,20 +196,20 @@ func (e Engine) openSnapshotStreamShared(ctx context.Context, dsn, slotName stri
 	// BEGIN — the docs are explicit about this.
 	conn, err := db.Conn(ctx)
 	if err != nil {
-		_ = replConn.Close(ctx)
+		closeReplConnGraceful(replConn)
 		_ = db.Close()
 		return nil, fmt.Errorf("postgres: snapshot: pin sql conn: %w", err)
 	}
 	if _, err := conn.ExecContext(ctx, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"); err != nil {
 		_ = conn.Close()
-		_ = replConn.Close(ctx)
+		closeReplConnGraceful(replConn)
 		_ = db.Close()
 		return nil, fmt.Errorf("postgres: snapshot: BEGIN: %w", err)
 	}
 	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET TRANSACTION SNAPSHOT '%s'", quoteSnapshotName(snapshotName))); err != nil {
 		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
 		_ = conn.Close()
-		_ = replConn.Close(ctx)
+		closeReplConnGraceful(replConn)
 		_ = db.Close()
 		return nil, fmt.Errorf("postgres: snapshot: SET TRANSACTION SNAPSHOT: %w", err)
 	}
@@ -225,7 +225,7 @@ func (e Engine) openSnapshotStreamShared(ctx context.Context, dsn, slotName stri
 	if err != nil {
 		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
 		_ = conn.Close()
-		_ = replConn.Close(ctx)
+		closeReplConnGraceful(replConn)
 		_ = db.Close()
 		return nil, fmt.Errorf("postgres: snapshot: build cdc reader: %w", err)
 	}
@@ -235,7 +235,7 @@ func (e Engine) openSnapshotStreamShared(ctx context.Context, dsn, slotName stri
 		_ = cdcReader.(closer).Close()
 		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
 		_ = conn.Close()
-		_ = replConn.Close(ctx)
+		closeReplConnGraceful(replConn)
 		_ = db.Close()
 		return nil, fmt.Errorf("postgres: snapshot: encode position: %w", err)
 	}
