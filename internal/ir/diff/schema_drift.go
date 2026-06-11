@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package ir
+package diff
 
 // ADR-0060 — Per-table schema-drift report for CDC apply-side refuse-
 // loudly messages.
@@ -31,6 +31,8 @@ package ir
 import (
 	"reflect"
 	"sort"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // SchemaDriftReport is the structured per-table delta between two IR
@@ -46,10 +48,10 @@ import (
 // output is load-bearing.
 type SchemaDriftReport struct {
 	// Schema is the source schema/database the table lives in.
-	// Mirrors [Table.Schema]; empty for MySQL.
+	// Mirrors [ir.Table.Schema]; empty for MySQL.
 	Schema string
 
-	// Table is the source table name. Mirrors [Table.Name].
+	// Table is the source table name. Mirrors [ir.Table.Name].
 	Table string
 
 	// ColumnsAdded are the columns present in post but absent from
@@ -244,22 +246,22 @@ func (r SchemaDriftReport) HasChanges() bool {
 //
 // Comparison policy:
 //
-//   - Columns are matched by [Column.Name]; same-name-different-type
+//   - Columns are matched by [ir.Column.Name]; same-name-different-type
 //     surfaces as ColumnsAltered.
 //   - Single-add + single-drop with otherwise-identical attributes
 //     surfaces as ColumnsRenamed (see [diffRenameColumnIR]); the
 //     dropped+added entries are then omitted from the add/drop slices
 //     (no double-counting).
-//   - Indexes are matched by [Index.Name]; unnamed indexes are
+//   - Indexes are matched by [ir.Index.Name]; unnamed indexes are
 //     skipped (same convention as [DiffSchemas]).
-//   - CHECK constraints are matched by [CheckConstraint.Name];
+//   - CHECK constraints are matched by [ir.CheckConstraint.Name];
 //     unnamed checks are skipped.
 //   - Foreign keys with non-empty Name match by name; unnamed FKs
 //     match by (Columns, ReferencedTable, ReferencedColumns) tuple.
 //
 // The function is pure: same inputs → same output, no I/O. Slice
 // orderings are deterministic (alphabetical by identifying name).
-func DiffTable(pre, post *Table) SchemaDriftReport {
+func DiffTable(pre, post *ir.Table) SchemaDriftReport {
 	var report SchemaDriftReport
 	switch {
 	case pre == nil && post == nil:
@@ -282,8 +284,8 @@ func DiffTable(pre, post *Table) SchemaDriftReport {
 	var addedColEntries []ColumnDriftEntry
 	var droppedColEntries []ColumnDriftEntry
 	var alteredEntries []ColumnAlterEntry
-	addedColLookup := map[string]*Column{}
-	droppedColLookup := map[string]*Column{}
+	addedColLookup := map[string]*ir.Column{}
+	droppedColLookup := map[string]*ir.Column{}
 
 	if post != nil {
 		for _, c := range post.Columns {
@@ -360,7 +362,7 @@ func DiffTable(pre, post *Table) SchemaDriftReport {
 
 // makeColumnDriftEntry projects an *ir.Column to the drift-entry
 // shape. Used for both add and drop entries.
-func makeColumnDriftEntry(c *Column) ColumnDriftEntry {
+func makeColumnDriftEntry(c *ir.Column) ColumnDriftEntry {
 	return ColumnDriftEntry{
 		Name:     c.Name,
 		Type:     typeStringDrift(c.Type),
@@ -371,7 +373,7 @@ func makeColumnDriftEntry(c *Column) ColumnDriftEntry {
 
 // makeColumnAlterEntry compares two same-name columns and returns
 // (entry, true) when any tracked attribute differs.
-func makeColumnAlterEntry(pre, post *Column) (ColumnAlterEntry, bool) {
+func makeColumnAlterEntry(pre, post *ir.Column) (ColumnAlterEntry, bool) {
 	entry := ColumnAlterEntry{
 		Name:   post.Name,
 		Before: makeColumnDriftEntry(pre),
@@ -394,11 +396,11 @@ func makeColumnAlterEntry(pre, post *Column) (ColumnAlterEntry, bool) {
 
 // columnsByNameDrift indexes a table's columns by name. Returns an
 // empty map when t is nil.
-func columnsByNameDrift(t *Table) map[string]*Column {
+func columnsByNameDrift(t *ir.Table) map[string]*ir.Column {
 	if t == nil {
-		return map[string]*Column{}
+		return map[string]*ir.Column{}
 	}
-	out := make(map[string]*Column, len(t.Columns))
+	out := make(map[string]*ir.Column, len(t.Columns))
 	for _, c := range t.Columns {
 		if c == nil {
 			continue
@@ -416,11 +418,11 @@ func columnsByNameDrift(t *Table) map[string]*Column {
 // Mirrors pipeline.shard_consolidation_probe.go's rename detection —
 // see ADR-0054 v0.78.0 for the locked heuristic and the
 // indistinguishable-from-drop-add-same-attributes edge.
-func diffRenameColumnIR(added, dropped map[string]*Column) (oldName, newName string, ok bool) {
+func diffRenameColumnIR(added, dropped map[string]*ir.Column) (oldName, newName string, ok bool) {
 	if len(added) != 1 || len(dropped) != 1 {
 		return "", "", false
 	}
-	var addCol, dropCol *Column
+	var addCol, dropCol *ir.Column
 	for _, c := range added {
 		addCol = c
 	}
@@ -449,11 +451,11 @@ func diffRenameColumnIR(added, dropped map[string]*Column) (oldName, newName str
 // default" — nil and ir.DefaultNone{} — into a single canonical nil.
 // Same shape as pipeline.normalizeDefaultForRename; kept duplicated
 // here so the ir package stays self-contained.
-func normalizeDefaultForRenameDrift(d DefaultValue) DefaultValue {
+func normalizeDefaultForRenameDrift(d ir.DefaultValue) ir.DefaultValue {
 	if d == nil {
 		return nil
 	}
-	if _, isNone := d.(DefaultNone); isNone {
+	if _, isNone := d.(ir.DefaultNone); isNone {
 		return nil
 	}
 	return d
@@ -461,7 +463,7 @@ func normalizeDefaultForRenameDrift(d DefaultValue) DefaultValue {
 
 // diffIndexesIR returns added and dropped named indexes. Unnamed
 // indexes (Name == "") are skipped.
-func diffIndexesIR(pre, post *Table) (added, dropped []IndexDriftEntry) {
+func diffIndexesIR(pre, post *ir.Table) (added, dropped []IndexDriftEntry) {
 	preIdx := indexesByNameDrift(pre)
 	postIdx := indexesByNameDrift(post)
 	for name, idx := range postIdx {
@@ -480,12 +482,12 @@ func diffIndexesIR(pre, post *Table) (added, dropped []IndexDriftEntry) {
 }
 
 // indexesByNameDrift indexes a table's named indexes. Includes the
-// primary key when [Index.Name] is non-empty.
-func indexesByNameDrift(t *Table) map[string]*Index {
+// primary key when [ir.Index.Name] is non-empty.
+func indexesByNameDrift(t *ir.Table) map[string]*ir.Index {
 	if t == nil {
-		return map[string]*Index{}
+		return map[string]*ir.Index{}
 	}
-	out := make(map[string]*Index, len(t.Indexes)+1)
+	out := make(map[string]*ir.Index, len(t.Indexes)+1)
 	if t.PrimaryKey != nil && t.PrimaryKey.Name != "" {
 		out[t.PrimaryKey.Name] = t.PrimaryKey
 	}
@@ -499,7 +501,7 @@ func indexesByNameDrift(t *Table) map[string]*Index {
 }
 
 // makeIndexDriftEntry projects an *ir.Index to the drift-entry shape.
-func makeIndexDriftEntry(idx *Index) IndexDriftEntry {
+func makeIndexDriftEntry(idx *ir.Index) IndexDriftEntry {
 	cols := make([]string, 0, len(idx.Columns))
 	for _, c := range idx.Columns {
 		switch {
@@ -518,7 +520,7 @@ func makeIndexDriftEntry(idx *Index) IndexDriftEntry {
 
 // diffChecksIR returns added, dropped, and altered CHECK constraints
 // (matched by Name). Unnamed CHECK constraints are skipped.
-func diffChecksIR(pre, post *Table) (added, dropped []CheckDriftEntry, altered []CheckAlterEntry) {
+func diffChecksIR(pre, post *ir.Table) (added, dropped []CheckDriftEntry, altered []CheckAlterEntry) {
 	preChecks := checksByNameDrift(pre)
 	postChecks := checksByNameDrift(post)
 	for name, c := range postChecks {
@@ -547,11 +549,11 @@ func diffChecksIR(pre, post *Table) (added, dropped []CheckDriftEntry, altered [
 }
 
 // checksByNameDrift indexes named CHECK constraints.
-func checksByNameDrift(t *Table) map[string]*CheckConstraint {
+func checksByNameDrift(t *ir.Table) map[string]*ir.CheckConstraint {
 	if t == nil {
-		return map[string]*CheckConstraint{}
+		return map[string]*ir.CheckConstraint{}
 	}
-	out := make(map[string]*CheckConstraint, len(t.CheckConstraints))
+	out := make(map[string]*ir.CheckConstraint, len(t.CheckConstraints))
 	for _, c := range t.CheckConstraints {
 		if c == nil || c.Name == "" {
 			continue
@@ -564,7 +566,7 @@ func checksByNameDrift(t *Table) map[string]*CheckConstraint {
 // diffForeignKeysIR returns added / dropped / altered foreign keys.
 // Named FKs are matched by Name; unnamed FKs are matched by the
 // (Columns, ReferencedTable, ReferencedColumns) tuple.
-func diffForeignKeysIR(pre, post *Table) (added, dropped []ForeignKeyDriftEntry, altered []ForeignKeyAlterEntry) {
+func diffForeignKeysIR(pre, post *ir.Table) (added, dropped []ForeignKeyDriftEntry, altered []ForeignKeyAlterEntry) {
 	preFKs := foreignKeysByKey(pre)
 	postFKs := foreignKeysByKey(post)
 	for k, fk := range postFKs {
@@ -595,11 +597,11 @@ func diffForeignKeysIR(pre, post *Table) (added, dropped []ForeignKeyDriftEntry,
 // foreignKeysByKey indexes FKs by Name when set, else by the
 // structural tuple. The empty-name tuple key prefixes with "@" so it
 // can never collide with a named FK whose name doesn't start with @.
-func foreignKeysByKey(t *Table) map[string]*ForeignKey {
+func foreignKeysByKey(t *ir.Table) map[string]*ir.ForeignKey {
 	if t == nil {
-		return map[string]*ForeignKey{}
+		return map[string]*ir.ForeignKey{}
 	}
-	out := make(map[string]*ForeignKey, len(t.ForeignKeys))
+	out := make(map[string]*ir.ForeignKey, len(t.ForeignKeys))
 	for _, fk := range t.ForeignKeys {
 		if fk == nil {
 			continue
@@ -616,7 +618,7 @@ func foreignKeysByKey(t *Table) map[string]*ForeignKey {
 // fkAttributesEqual reports whether two foreign keys agree on every
 // load-bearing attribute (columns, parent reference, referential
 // actions). Name equality is established by the caller's keying.
-func fkAttributesEqual(a, b *ForeignKey) bool {
+func fkAttributesEqual(a, b *ir.ForeignKey) bool {
 	if a == nil || b == nil {
 		return a == b
 	}
@@ -636,7 +638,7 @@ func fkAttributesEqual(a, b *ForeignKey) bool {
 }
 
 // makeFKDriftEntry projects an *ir.ForeignKey to the drift-entry shape.
-func makeFKDriftEntry(fk *ForeignKey) ForeignKeyDriftEntry {
+func makeFKDriftEntry(fk *ir.ForeignKey) ForeignKeyDriftEntry {
 	return ForeignKeyDriftEntry{
 		Name:              fk.Name,
 		Columns:           joinCols(fk.Columns),
@@ -648,7 +650,7 @@ func makeFKDriftEntry(fk *ForeignKey) ForeignKeyDriftEntry {
 // typeStringDrift renders an IR Type to its String() form, with a
 // "<nil>" sentinel for nil Types (defensive — production IR never
 // has nil Type, but hand-built test fixtures sometimes do).
-func typeStringDrift(t Type) string {
+func typeStringDrift(t ir.Type) string {
 	if t == nil {
 		return "<nil>"
 	}
@@ -659,13 +661,13 @@ func typeStringDrift(t Type) string {
 // DefaultValue for drift comparison. Mirrors [renderDefault] in
 // schema_diff.go but duplicates the helper so neither file depends
 // on the other's package-internal naming.
-func renderDriftDefault(d DefaultValue) string {
+func renderDriftDefault(d ir.DefaultValue) string {
 	switch v := d.(type) {
-	case nil, DefaultNone:
+	case nil, ir.DefaultNone:
 		return "<none>"
-	case DefaultLiteral:
+	case ir.DefaultLiteral:
 		return "'" + v.Value + "'"
-	case DefaultExpression:
+	case ir.DefaultExpression:
 		return v.Expr
 	}
 	return "<unknown>"

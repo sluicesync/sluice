@@ -1,7 +1,12 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package ir
+// Package diff computes structural deltas between IR schemas: the
+// schema-level diff behind `sluice schema diff` (ADR-0029) and the
+// per-table drift report behind CDC refuse-loudly messages (ADR-0060).
+// Everything here is pure functions over internal/ir types — no I/O,
+// no engine knowledge, no rendering.
+package diff
 
 // Schema-level structural diff for `sluice schema diff` (ADR-0029).
 // DiffSchemas is a pure function — no I/O, no engine knowledge, no
@@ -30,6 +35,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // SchemaDiff is the structural delta between two schemas. The naming
@@ -289,7 +296,7 @@ type DiffOptions struct {
 // The function is pure: same inputs → same output, no I/O. The
 // orchestrator (internal/pipeline) handles reading the schemas,
 // applying translation passes, and rendering the result.
-func DiffSchemas(expected, actual *Schema, opts DiffOptions) SchemaDiff {
+func DiffSchemas(expected, actual *ir.Schema, opts DiffOptions) SchemaDiff {
 	var d SchemaDiff
 	if expected == nil || actual == nil {
 		return d
@@ -339,7 +346,7 @@ func DiffSchemas(expected, actual *Schema, opts DiffOptions) SchemaDiff {
 // by name (set semantics, mirroring tables). Definition comparison is
 // trim-and-equal — no SQL parser, no canonicalization. Cross-engine
 // drift is therefore high-noise; the renderer hedges accordingly.
-func diffViews(d *SchemaDiff, expected, actual *Schema, opts DiffOptions) {
+func diffViews(d *SchemaDiff, expected, actual *ir.Schema, opts DiffOptions) {
 	expByName := viewsByName(expected)
 	actByName := viewsByName(actual)
 
@@ -392,11 +399,11 @@ func diffViews(d *SchemaDiff, expected, actual *Schema, opts DiffOptions) {
 
 // viewsByName indexes a schema's Views by name. Returns an empty map
 // for a nil schema or a schema with no views.
-func viewsByName(s *Schema) map[string]*View {
+func viewsByName(s *ir.Schema) map[string]*ir.View {
 	if s == nil {
 		return nil
 	}
-	out := make(map[string]*View, len(s.Views))
+	out := make(map[string]*ir.View, len(s.Views))
 	for _, v := range s.Views {
 		if v == nil || v.Name == "" {
 			continue
@@ -422,7 +429,7 @@ func (td TableDiff) hasChanges() bool {
 		len(td.ExcludesMismatched) > 0
 }
 
-func diffTable(expected, actual *Table, opts DiffOptions) TableDiff {
+func diffTable(expected, actual *ir.Table, opts DiffOptions) TableDiff {
 	td := TableDiff{Name: expected.Name}
 
 	expCols := columnsByName(expected)
@@ -508,7 +515,7 @@ func diffTable(expected, actual *Table, opts DiffOptions) TableDiff {
 // Unnamed CHECKs are skipped: an anonymous constraint can't be
 // matched across sides without expression-text comparison, which
 // would produce false positives on cross-engine spelling differences.
-func diffChecks(td *TableDiff, expected, actual *Table, opts DiffOptions) {
+func diffChecks(td *TableDiff, expected, actual *ir.Table, opts DiffOptions) {
 	expChecks := checksByName(expected)
 	actChecks := checksByName(actual)
 
@@ -555,7 +562,7 @@ func diffChecks(td *TableDiff, expected, actual *Table, opts DiffOptions) {
 // mismatch was found. Fields that match between expected and actual
 // are left zero on the returned struct, so a renderer can emit only
 // the changed fields without re-comparing.
-func diffColumn(expected, actual *Column) (ColumnDiff, bool) {
+func diffColumn(expected, actual *ir.Column) (ColumnDiff, bool) {
 	cd := ColumnDiff{Name: expected.Name}
 	mismatched := false
 
@@ -587,8 +594,8 @@ func diffColumn(expected, actual *Column) (ColumnDiff, bool) {
 		cd.ActualDefault = actDefault
 		// "no default on one side" is high-confidence drift; only
 		// expression-vs-expression mismatches are uncertain.
-		_, expIsExpr := expected.Default.(DefaultExpression)
-		_, actIsExpr := actual.Default.(DefaultExpression)
+		_, expIsExpr := expected.Default.(ir.DefaultExpression)
+		_, actIsExpr := actual.Default.(ir.DefaultExpression)
 		if expIsExpr && actIsExpr {
 			cd.DefaultLowConfidence = true
 		}
@@ -672,13 +679,13 @@ func stripCharsetCollation(cd ColumnDiff) (ColumnDiff, bool) {
 // uses string equality on the returned values, so an unset field
 // (zero value) equals another unset field — only when both sides
 // have a value and they differ does drift surface.
-func charsetCollationOf(t Type) (charset, collation string) {
+func charsetCollationOf(t ir.Type) (charset, collation string) {
 	switch v := t.(type) {
-	case Char:
+	case ir.Char:
 		return v.Charset, v.Collation
-	case Varchar:
+	case ir.Varchar:
 		return v.Charset, v.Collation
-	case Text:
+	case ir.Text:
 		return v.Charset, v.Collation
 	}
 	return "", ""
@@ -689,13 +696,13 @@ func charsetCollationOf(t Type) (charset, collation string) {
 // sentinel distinguishes "no DEFAULT clause" from "DEFAULT ”" (the
 // empty literal). Callers use defaultsEqual rather than direct
 // string comparison so the equivalence map kicks in.
-func renderDefault(d DefaultValue) string {
+func renderDefault(d ir.DefaultValue) string {
 	switch v := d.(type) {
-	case nil, DefaultNone:
+	case nil, ir.DefaultNone:
 		return "<none>"
-	case DefaultLiteral:
+	case ir.DefaultLiteral:
 		return "'" + v.Value + "'"
-	case DefaultExpression:
+	case ir.DefaultExpression:
 		return v.Expr
 	}
 	return "<unknown>"
@@ -833,23 +840,23 @@ var defaultEquivalents = map[string][]string{
 // typeString returns the IR Type's stable rendering. Returns "<nil>"
 // for a nil Type so a malformed Column produces a visible mismatch
 // rather than panicking.
-func typeString(t Type) string {
+func typeString(t ir.Type) string {
 	if t == nil {
 		return "<nil>"
 	}
 	return t.String()
 }
 
-func tablesByName(s *Schema) map[string]*Table {
-	out := make(map[string]*Table, len(s.Tables))
+func tablesByName(s *ir.Schema) map[string]*ir.Table {
+	out := make(map[string]*ir.Table, len(s.Tables))
 	for _, t := range s.Tables {
 		out[t.Name] = t
 	}
 	return out
 }
 
-func columnsByName(t *Table) map[string]*Column {
-	out := make(map[string]*Column, len(t.Columns))
+func columnsByName(t *ir.Table) map[string]*ir.Column {
+	out := make(map[string]*ir.Column, len(t.Columns))
 	for _, c := range t.Columns {
 		out[c.Name] = c
 	}
@@ -858,8 +865,8 @@ func columnsByName(t *Table) map[string]*Column {
 
 // checksByName indexes a table's CheckConstraints by name. Unnamed
 // constraints (Name == "") are skipped — see diffChecks for why.
-func checksByName(t *Table) map[string]*CheckConstraint {
-	out := make(map[string]*CheckConstraint, len(t.CheckConstraints))
+func checksByName(t *ir.Table) map[string]*ir.CheckConstraint {
+	out := make(map[string]*ir.CheckConstraint, len(t.CheckConstraints))
 	for _, c := range t.CheckConstraints {
 		if c == nil || c.Name == "" {
 			continue
@@ -874,8 +881,8 @@ func checksByName(t *Table) map[string]*CheckConstraint {
 // checksByName — the PG schema reader always assigns a name (system-
 // generated when not explicitly named at source), so an unnamed
 // entry would mean a corrupt or hand-built IR. ADR-0053.
-func excludesByName(t *Table) map[string]*ExcludeConstraint {
-	out := make(map[string]*ExcludeConstraint, len(t.ExcludeConstraints))
+func excludesByName(t *ir.Table) map[string]*ir.ExcludeConstraint {
+	out := make(map[string]*ir.ExcludeConstraint, len(t.ExcludeConstraints))
 	for _, c := range t.ExcludeConstraints {
 		if c == nil || c.Name == "" {
 			continue
@@ -892,7 +899,7 @@ func excludesByName(t *Table) map[string]*ExcludeConstraint {
 // constraints produce byte-identical text — any divergence (even
 // whitespace) is treated as a real change (operator hand-edited the
 // target / target PG version normalised differently). ADR-0053.
-func diffExcludes(td *TableDiff, expected, actual *Table, opts DiffOptions) {
+func diffExcludes(td *TableDiff, expected, actual *ir.Table, opts DiffOptions) {
 	expExcl := excludesByName(expected)
 	actExcl := excludesByName(actual)
 
@@ -940,7 +947,7 @@ func diffExcludes(td *TableDiff, expected, actual *Table, opts DiffOptions) {
 // (e.g. PG implicit PKs) are skipped: an unnamed index can't be
 // matched across sides without column-set comparison, which v1
 // deliberately doesn't do.
-func indexNames(t *Table) map[string]struct{} {
+func indexNames(t *ir.Table) map[string]struct{} {
 	out := make(map[string]struct{}, len(t.Indexes)+1)
 	if t.PrimaryKey != nil && t.PrimaryKey.Name != "" {
 		out[t.PrimaryKey.Name] = struct{}{}

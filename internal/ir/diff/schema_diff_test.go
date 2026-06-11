@@ -1,21 +1,23 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package ir
+package diff
 
 import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 func TestDiffSchemas_NoChanges(t *testing.T) {
-	s := &Schema{Tables: []*Table{
+	s := &ir.Schema{Tables: []*ir.Table{
 		{
 			Name: "users",
-			Columns: []*Column{
-				{Name: "id", Type: Integer{Width: 64}},
-				{Name: "email", Type: Varchar{Length: 255}},
+			Columns: []*ir.Column{
+				{Name: "id", Type: ir.Integer{Width: 64}},
+				{Name: "email", Type: ir.Varchar{Length: 255}},
 			},
 		},
 	}}
@@ -26,13 +28,13 @@ func TestDiffSchemas_NoChanges(t *testing.T) {
 }
 
 func TestDiffSchemas_TableMissingAndExtra(t *testing.T) {
-	exp := &Schema{Tables: []*Table{
-		{Name: "users", Columns: []*Column{{Name: "id", Type: Integer{Width: 64}}}},
-		{Name: "orders", Columns: []*Column{{Name: "id", Type: Integer{Width: 64}}}},
+	exp := &ir.Schema{Tables: []*ir.Table{
+		{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+		{Name: "orders", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
 	}}
-	act := &Schema{Tables: []*Table{
-		{Name: "users", Columns: []*Column{{Name: "id", Type: Integer{Width: 64}}}},
-		{Name: "deprecated_log", Columns: []*Column{{Name: "id", Type: Integer{Width: 64}}}},
+	act := &ir.Schema{Tables: []*ir.Table{
+		{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+		{Name: "deprecated_log", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
 	}}
 	d := DiffSchemas(exp, act, DiffOptions{})
 	if !reflect.DeepEqual(d.TablesMissing, []string{"orders"}) {
@@ -47,12 +49,12 @@ func TestDiffSchemas_TableMissingAndExtra(t *testing.T) {
 }
 
 func TestDiffSchemas_IgnoreExtras(t *testing.T) {
-	exp := &Schema{Tables: []*Table{
-		{Name: "users", Columns: []*Column{{Name: "id", Type: Integer{Width: 64}}}},
+	exp := &ir.Schema{Tables: []*ir.Table{
+		{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
 	}}
-	act := &Schema{Tables: []*Table{
-		{Name: "users", Columns: []*Column{{Name: "id", Type: Integer{Width: 64}}, {Name: "extra_col", Type: Varchar{Length: 10}}}},
-		{Name: "other_app_table", Columns: []*Column{{Name: "id", Type: Integer{Width: 64}}}},
+	act := &ir.Schema{Tables: []*ir.Table{
+		{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}, {Name: "extra_col", Type: ir.Varchar{Length: 10}}}},
+		{Name: "other_app_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
 	}}
 	d := DiffSchemas(exp, act, DiffOptions{IgnoreExtras: true})
 	if len(d.TablesExtra) != 0 {
@@ -66,23 +68,23 @@ func TestDiffSchemas_IgnoreExtras(t *testing.T) {
 }
 
 func TestDiffSchemas_ColumnMissingAndExtra(t *testing.T) {
-	exp := &Schema{Tables: []*Table{
+	exp := &ir.Schema{Tables: []*ir.Table{
 		{
 			Name: "users",
-			Columns: []*Column{
-				{Name: "id", Type: Integer{Width: 64}},
-				{Name: "email", Type: Varchar{Length: 255}},
-				{Name: "created_at", Type: Timestamp{Precision: 6}},
+			Columns: []*ir.Column{
+				{Name: "id", Type: ir.Integer{Width: 64}},
+				{Name: "email", Type: ir.Varchar{Length: 255}},
+				{Name: "created_at", Type: ir.Timestamp{Precision: 6}},
 			},
 		},
 	}}
-	act := &Schema{Tables: []*Table{
+	act := &ir.Schema{Tables: []*ir.Table{
 		{
 			Name: "users",
-			Columns: []*Column{
-				{Name: "id", Type: Integer{Width: 64}},
-				{Name: "email", Type: Varchar{Length: 255}},
-				{Name: "legacy_field", Type: Varchar{Length: 50}},
+			Columns: []*ir.Column{
+				{Name: "id", Type: ir.Integer{Width: 64}},
+				{Name: "email", Type: ir.Varchar{Length: 255}},
+				{Name: "legacy_field", Type: ir.Varchar{Length: 50}},
 			},
 		},
 	}}
@@ -110,22 +112,22 @@ func TestDiffSchemas_ColumnMissingAndExtra(t *testing.T) {
 // `schema diff` would emit a permanent false-positive for the
 // discriminator column.
 func TestDiffSchemas_SluiceInjected_SuppressedFromExtras(t *testing.T) {
-	exp := &Schema{Tables: []*Table{{
+	exp := &ir.Schema{Tables: []*ir.Table{{
 		Name: "customer",
-		Columns: []*Column{
-			{Name: "customer_id", Type: Integer{Width: 64}},
-			{Name: "email", Type: Varchar{Length: 255}},
+		Columns: []*ir.Column{
+			{Name: "customer_id", Type: ir.Integer{Width: 64}},
+			{Name: "email", Type: ir.Varchar{Length: 255}},
 		},
-		PrimaryKey: &Index{Columns: []IndexColumn{{Column: "customer_id"}}},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "customer_id"}}},
 	}}}
-	act := &Schema{Tables: []*Table{{
+	act := &ir.Schema{Tables: []*ir.Table{{
 		Name: "customer",
-		Columns: []*Column{
-			{Name: "customer_id", Type: Integer{Width: 64}},
-			{Name: "email", Type: Varchar{Length: 255}},
-			{Name: "source_shard_id", Type: Varchar{Length: 64}, SluiceInjected: true},
+		Columns: []*ir.Column{
+			{Name: "customer_id", Type: ir.Integer{Width: 64}},
+			{Name: "email", Type: ir.Varchar{Length: 255}},
+			{Name: "source_shard_id", Type: ir.Varchar{Length: 64}, SluiceInjected: true},
 		},
-		PrimaryKey: &Index{Columns: []IndexColumn{
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{
 			{Column: "source_shard_id"}, {Column: "customer_id"},
 		}},
 	}}}
@@ -141,17 +143,17 @@ func TestDiffSchemas_SluiceInjected_SuppressedFromExtras(t *testing.T) {
 // the marker; turning the gate off must not weaken the general drift
 // signal.
 func TestDiffSchemas_SluiceInjected_NonInjectedStillSurfaces(t *testing.T) {
-	exp := &Schema{Tables: []*Table{{
+	exp := &ir.Schema{Tables: []*ir.Table{{
 		Name:    "users",
-		Columns: []*Column{{Name: "id", Type: Integer{Width: 64}}},
+		Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
 	}}}
-	act := &Schema{Tables: []*Table{{
+	act := &ir.Schema{Tables: []*ir.Table{{
 		Name: "users",
-		Columns: []*Column{
-			{Name: "id", Type: Integer{Width: 64}},
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
 			// SluiceInjected deliberately false — operator's own
 			// schema drift, not a sluice-managed column.
-			{Name: "stray_column", Type: Varchar{Length: 32}},
+			{Name: "stray_column", Type: ir.Varchar{Length: 32}},
 		},
 	}}}
 	d := DiffSchemas(exp, act, DiffOptions{})
@@ -166,22 +168,22 @@ func TestDiffSchemas_SluiceInjected_NonInjectedStillSurfaces(t *testing.T) {
 func TestDiffSchemas_ColumnTypeMismatch(t *testing.T) {
 	cases := []struct {
 		name    string
-		expType Type
-		actType Type
+		expType ir.Type
+		actType ir.Type
 	}{
-		{"varchar length", Varchar{Length: 255}, Varchar{Length: 100}},
-		{"int width", Integer{Width: 64}, Integer{Width: 32}},
-		{"decimal precision", Decimal{Precision: 18, Scale: 4}, Decimal{Precision: 10, Scale: 2}},
-		{"text size", Text{Size: TextLong}, Text{Size: TextRegular}},
-		{"json binary flag", JSON{Binary: true}, JSON{Binary: false}},
-		{"timestamp tz", Timestamp{Precision: 6, WithTimeZone: true}, Timestamp{Precision: 6}},
-		{"different family", Integer{Width: 32}, Varchar{Length: 10}},
-		{"uuid vs char", UUID{}, Char{Length: 36}},
+		{"varchar length", ir.Varchar{Length: 255}, ir.Varchar{Length: 100}},
+		{"int width", ir.Integer{Width: 64}, ir.Integer{Width: 32}},
+		{"decimal precision", ir.Decimal{Precision: 18, Scale: 4}, ir.Decimal{Precision: 10, Scale: 2}},
+		{"text size", ir.Text{Size: ir.TextLong}, ir.Text{Size: ir.TextRegular}},
+		{"json binary flag", ir.JSON{Binary: true}, ir.JSON{Binary: false}},
+		{"timestamp tz", ir.Timestamp{Precision: 6, WithTimeZone: true}, ir.Timestamp{Precision: 6}},
+		{"different family", ir.Integer{Width: 32}, ir.Varchar{Length: 10}},
+		{"uuid vs char", ir.UUID{}, ir.Char{Length: 36}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			exp := &Schema{Tables: []*Table{{Name: "t", Columns: []*Column{{Name: "c", Type: tc.expType}}}}}
-			act := &Schema{Tables: []*Table{{Name: "t", Columns: []*Column{{Name: "c", Type: tc.actType}}}}}
+			exp := &ir.Schema{Tables: []*ir.Table{{Name: "t", Columns: []*ir.Column{{Name: "c", Type: tc.expType}}}}}
+			act := &ir.Schema{Tables: []*ir.Table{{Name: "t", Columns: []*ir.Column{{Name: "c", Type: tc.actType}}}}}
 			d := DiffSchemas(exp, act, DiffOptions{})
 			if len(d.TablesMismatched) != 1 || len(d.TablesMismatched[0].ColumnsMismatched) != 1 {
 				t.Fatalf("expected one column mismatch; got %+v", d)
@@ -198,11 +200,11 @@ func TestDiffSchemas_ColumnTypeMismatch(t *testing.T) {
 }
 
 func TestDiffSchemas_NullabilityMismatch(t *testing.T) {
-	exp := &Schema{Tables: []*Table{
-		{Name: "t", Columns: []*Column{{Name: "c", Type: Integer{Width: 32}, Nullable: false}}},
+	exp := &ir.Schema{Tables: []*ir.Table{
+		{Name: "t", Columns: []*ir.Column{{Name: "c", Type: ir.Integer{Width: 32}, Nullable: false}}},
 	}}
-	act := &Schema{Tables: []*Table{
-		{Name: "t", Columns: []*Column{{Name: "c", Type: Integer{Width: 32}, Nullable: true}}},
+	act := &ir.Schema{Tables: []*ir.Table{
+		{Name: "t", Columns: []*ir.Column{{Name: "c", Type: ir.Integer{Width: 32}, Nullable: true}}},
 	}}
 	d := DiffSchemas(exp, act, DiffOptions{})
 	if len(d.TablesMismatched) != 1 {
@@ -229,39 +231,39 @@ func TestDiffSchemas_NullabilityMismatch(t *testing.T) {
 func TestDiffSchemas_CharsetCollationMismatch(t *testing.T) {
 	cases := []struct {
 		name                       string
-		exp                        Type
-		act                        Type
+		exp                        ir.Type
+		act                        ir.Type
 		wantCharset, wantCollation bool
 	}{
 		{
 			"charset only",
-			Varchar{Length: 255, Charset: "utf8mb4"},
-			Varchar{Length: 255, Charset: "latin1"},
+			ir.Varchar{Length: 255, Charset: "utf8mb4"},
+			ir.Varchar{Length: 255, Charset: "latin1"},
 			true, false,
 		},
 		{
 			"collation only",
-			Varchar{Length: 255, Collation: "utf8mb4_general_ci"},
-			Varchar{Length: 255, Collation: "utf8mb4_bin"},
+			ir.Varchar{Length: 255, Collation: "utf8mb4_general_ci"},
+			ir.Varchar{Length: 255, Collation: "utf8mb4_bin"},
 			false, true,
 		},
 		{
 			"both differ",
-			Varchar{Length: 255, Charset: "utf8mb4", Collation: "utf8mb4_general_ci"},
-			Varchar{Length: 255, Charset: "latin1", Collation: "latin1_swedish_ci"},
+			ir.Varchar{Length: 255, Charset: "utf8mb4", Collation: "utf8mb4_general_ci"},
+			ir.Varchar{Length: 255, Charset: "latin1", Collation: "latin1_swedish_ci"},
 			true, true,
 		},
 		{
 			"text type also tracks charset/collation",
-			Text{Size: TextLong, Collation: "utf8mb4_bin"},
-			Text{Size: TextLong, Collation: "utf8mb4_general_ci"},
+			ir.Text{Size: ir.TextLong, Collation: "utf8mb4_bin"},
+			ir.Text{Size: ir.TextLong, Collation: "utf8mb4_general_ci"},
 			false, true,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			exp := &Schema{Tables: []*Table{{Name: "t", Columns: []*Column{{Name: "c", Type: tc.exp}}}}}
-			act := &Schema{Tables: []*Table{{Name: "t", Columns: []*Column{{Name: "c", Type: tc.act}}}}}
+			exp := &ir.Schema{Tables: []*ir.Table{{Name: "t", Columns: []*ir.Column{{Name: "c", Type: tc.exp}}}}}
+			act := &ir.Schema{Tables: []*ir.Table{{Name: "t", Columns: []*ir.Column{{Name: "c", Type: tc.act}}}}}
 			d := DiffSchemas(exp, act, DiffOptions{})
 			if len(d.TablesMismatched) != 1 || len(d.TablesMismatched[0].ColumnsMismatched) != 1 {
 				t.Fatalf("expected one column mismatch; got %+v", d)
@@ -296,11 +298,11 @@ func TestDiffSchemas_CharsetCollationMismatch(t *testing.T) {
 // has no charset/collation) plus the non-character-type case.
 func TestDiffSchemas_EmptySourceCharsetCollationNoDrift(t *testing.T) {
 	t.Run("empty source charset + populated target → no drift", func(t *testing.T) {
-		exp := &Schema{Tables: []*Table{{Name: "t", Columns: []*Column{
-			{Name: "c", Type: Char{Length: 36}}, // retargeted from PG UUID; no charset
+		exp := &ir.Schema{Tables: []*ir.Table{{Name: "t", Columns: []*ir.Column{
+			{Name: "c", Type: ir.Char{Length: 36}}, // retargeted from PG UUID; no charset
 		}}}}
-		act := &Schema{Tables: []*Table{{Name: "t", Columns: []*Column{
-			{Name: "c", Type: Char{Length: 36, Charset: "utf8mb4", Collation: "utf8mb4_0900_ai_ci"}},
+		act := &ir.Schema{Tables: []*ir.Table{{Name: "t", Columns: []*ir.Column{
+			{Name: "c", Type: ir.Char{Length: 36, Charset: "utf8mb4", Collation: "utf8mb4_0900_ai_ci"}},
 		}}}}
 		d := DiffSchemas(exp, act, DiffOptions{})
 		if len(d.TablesMismatched) != 0 {
@@ -312,11 +314,11 @@ func TestDiffSchemas_EmptySourceCharsetCollationNoDrift(t *testing.T) {
 		// authoritative. Empty-source means "any actual is fine";
 		// populated-source means "actual must match." So a target
 		// missing the source's declared charset IS drift.
-		exp := &Schema{Tables: []*Table{{Name: "t", Columns: []*Column{
-			{Name: "c", Type: Varchar{Length: 255, Charset: "utf8mb4"}},
+		exp := &ir.Schema{Tables: []*ir.Table{{Name: "t", Columns: []*ir.Column{
+			{Name: "c", Type: ir.Varchar{Length: 255, Charset: "utf8mb4"}},
 		}}}}
-		act := &Schema{Tables: []*Table{{Name: "t", Columns: []*Column{
-			{Name: "c", Type: Varchar{Length: 255}},
+		act := &ir.Schema{Tables: []*ir.Table{{Name: "t", Columns: []*ir.Column{
+			{Name: "c", Type: ir.Varchar{Length: 255}},
 		}}}}
 		d := DiffSchemas(exp, act, DiffOptions{})
 		if len(d.TablesMismatched) != 1 {
@@ -324,11 +326,11 @@ func TestDiffSchemas_EmptySourceCharsetCollationNoDrift(t *testing.T) {
 		}
 	})
 	t.Run("both populated, different → drift (existing behaviour preserved)", func(t *testing.T) {
-		exp := &Schema{Tables: []*Table{{Name: "t", Columns: []*Column{
-			{Name: "c", Type: Varchar{Length: 255, Charset: "utf8mb4"}},
+		exp := &ir.Schema{Tables: []*ir.Table{{Name: "t", Columns: []*ir.Column{
+			{Name: "c", Type: ir.Varchar{Length: 255, Charset: "utf8mb4"}},
 		}}}}
-		act := &Schema{Tables: []*Table{{Name: "t", Columns: []*Column{
-			{Name: "c", Type: Varchar{Length: 255, Charset: "latin1"}},
+		act := &ir.Schema{Tables: []*ir.Table{{Name: "t", Columns: []*ir.Column{
+			{Name: "c", Type: ir.Varchar{Length: 255, Charset: "latin1"}},
 		}}}}
 		d := DiffSchemas(exp, act, DiffOptions{})
 		if len(d.TablesMismatched) != 1 {
@@ -348,11 +350,11 @@ func TestDiffSchemas_EmptySourceCharsetCollationNoDrift(t *testing.T) {
 // surfacing minus the charset/collation fields.
 func TestDiffSchemas_IgnoreCharsetCollation(t *testing.T) {
 	t.Run("only-charset drift suppressed", func(t *testing.T) {
-		exp := &Schema{Tables: []*Table{{Name: "t", Columns: []*Column{
-			{Name: "c", Type: Varchar{Length: 255, Charset: "utf8mb4", Collation: "utf8mb4_general_ci"}},
+		exp := &ir.Schema{Tables: []*ir.Table{{Name: "t", Columns: []*ir.Column{
+			{Name: "c", Type: ir.Varchar{Length: 255, Charset: "utf8mb4", Collation: "utf8mb4_general_ci"}},
 		}}}}
-		act := &Schema{Tables: []*Table{{Name: "t", Columns: []*Column{
-			{Name: "c", Type: Varchar{Length: 255, Charset: "latin1", Collation: "latin1_swedish_ci"}},
+		act := &ir.Schema{Tables: []*ir.Table{{Name: "t", Columns: []*ir.Column{
+			{Name: "c", Type: ir.Varchar{Length: 255, Charset: "latin1", Collation: "latin1_swedish_ci"}},
 		}}}}
 		d := DiffSchemas(exp, act, DiffOptions{IgnoreCharsetCollation: true})
 		if len(d.TablesMismatched) != 0 {
@@ -361,11 +363,11 @@ func TestDiffSchemas_IgnoreCharsetCollation(t *testing.T) {
 	})
 
 	t.Run("type drift survives charset suppression", func(t *testing.T) {
-		exp := &Schema{Tables: []*Table{{Name: "t", Columns: []*Column{
-			{Name: "c", Type: Varchar{Length: 255, Charset: "utf8mb4"}},
+		exp := &ir.Schema{Tables: []*ir.Table{{Name: "t", Columns: []*ir.Column{
+			{Name: "c", Type: ir.Varchar{Length: 255, Charset: "utf8mb4"}},
 		}}}}
-		act := &Schema{Tables: []*Table{{Name: "t", Columns: []*Column{
-			{Name: "c", Type: Varchar{Length: 100, Charset: "latin1"}},
+		act := &ir.Schema{Tables: []*ir.Table{{Name: "t", Columns: []*ir.Column{
+			{Name: "c", Type: ir.Varchar{Length: 100, Charset: "latin1"}},
 		}}}}
 		d := DiffSchemas(exp, act, DiffOptions{IgnoreCharsetCollation: true})
 		if len(d.TablesMismatched) != 1 || len(d.TablesMismatched[0].ColumnsMismatched) != 1 {
@@ -382,23 +384,23 @@ func TestDiffSchemas_IgnoreCharsetCollation(t *testing.T) {
 }
 
 func TestDiffSchemas_IndexAddedRemoved(t *testing.T) {
-	exp := &Schema{Tables: []*Table{
+	exp := &ir.Schema{Tables: []*ir.Table{
 		{
 			Name:    "users",
-			Columns: []*Column{{Name: "id", Type: Integer{Width: 64}}, {Name: "email", Type: Varchar{Length: 255}}},
-			Indexes: []*Index{
-				{Name: "users_email_idx", Columns: []IndexColumn{{Column: "email"}}, Unique: true},
-				{Name: "users_id_idx", Columns: []IndexColumn{{Column: "id"}}},
+			Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}, {Name: "email", Type: ir.Varchar{Length: 255}}},
+			Indexes: []*ir.Index{
+				{Name: "users_email_idx", Columns: []ir.IndexColumn{{Column: "email"}}, Unique: true},
+				{Name: "users_id_idx", Columns: []ir.IndexColumn{{Column: "id"}}},
 			},
 		},
 	}}
-	act := &Schema{Tables: []*Table{
+	act := &ir.Schema{Tables: []*ir.Table{
 		{
 			Name:    "users",
-			Columns: []*Column{{Name: "id", Type: Integer{Width: 64}}, {Name: "email", Type: Varchar{Length: 255}}},
-			Indexes: []*Index{
-				{Name: "users_id_idx", Columns: []IndexColumn{{Column: "id"}}},
-				{Name: "legacy_idx", Columns: []IndexColumn{{Column: "email"}}},
+			Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}, {Name: "email", Type: ir.Varchar{Length: 255}}},
+			Indexes: []*ir.Index{
+				{Name: "users_id_idx", Columns: []ir.IndexColumn{{Column: "id"}}},
+				{Name: "legacy_idx", Columns: []ir.IndexColumn{{Column: "email"}}},
 			},
 		},
 	}}
@@ -416,12 +418,12 @@ func TestDiffSchemas_IndexAddedRemoved(t *testing.T) {
 }
 
 func TestDiffSchemas_PrimaryKeyTracked(t *testing.T) {
-	pk := &Index{Name: "users_pkey", Columns: []IndexColumn{{Column: "id"}}, Unique: true}
-	exp := &Schema{Tables: []*Table{
-		{Name: "users", Columns: []*Column{{Name: "id", Type: Integer{Width: 64}}}, PrimaryKey: pk},
+	pk := &ir.Index{Name: "users_pkey", Columns: []ir.IndexColumn{{Column: "id"}}, Unique: true}
+	exp := &ir.Schema{Tables: []*ir.Table{
+		{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}, PrimaryKey: pk},
 	}}
-	act := &Schema{Tables: []*Table{
-		{Name: "users", Columns: []*Column{{Name: "id", Type: Integer{Width: 64}}}},
+	act := &ir.Schema{Tables: []*ir.Table{
+		{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
 	}}
 	d := DiffSchemas(exp, act, DiffOptions{})
 	if len(d.TablesMismatched) != 1 || len(d.TablesMismatched[0].IndexesMissing) != 1 {
@@ -437,19 +439,19 @@ func TestDiffSchemas_NilInputsReturnEmpty(t *testing.T) {
 	if d.HasChanges() {
 		t.Errorf("nil inputs should produce no diff; got %+v", d)
 	}
-	d = DiffSchemas(&Schema{}, nil, DiffOptions{})
+	d = DiffSchemas(&ir.Schema{}, nil, DiffOptions{})
 	if d.HasChanges() {
 		t.Errorf("nil actual should produce no diff; got %+v", d)
 	}
 }
 
 func TestDiffSchemas_SortedOutput(t *testing.T) {
-	exp := &Schema{Tables: []*Table{
-		{Name: "z_table", Columns: []*Column{{Name: "id", Type: Integer{Width: 32}}}},
-		{Name: "a_table", Columns: []*Column{{Name: "id", Type: Integer{Width: 32}}}},
-		{Name: "m_table", Columns: []*Column{{Name: "id", Type: Integer{Width: 32}}}},
+	exp := &ir.Schema{Tables: []*ir.Table{
+		{Name: "z_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 32}}}},
+		{Name: "a_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 32}}}},
+		{Name: "m_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 32}}}},
 	}}
-	act := &Schema{}
+	act := &ir.Schema{}
 	d := DiffSchemas(exp, act, DiffOptions{})
 	want := []string{"a_table", "m_table", "z_table"}
 	if !reflect.DeepEqual(d.TablesMissing, want) {
@@ -458,18 +460,18 @@ func TestDiffSchemas_SortedOutput(t *testing.T) {
 }
 
 func TestDiffSchemas_DefaultLiteralMismatch(t *testing.T) {
-	exp := &Schema{Tables: []*Table{{
+	exp := &ir.Schema{Tables: []*ir.Table{{
 		Name: "t",
-		Columns: []*Column{{
-			Name: "c", Type: Integer{Width: 32},
-			Default: DefaultLiteral{Value: "1"},
+		Columns: []*ir.Column{{
+			Name: "c", Type: ir.Integer{Width: 32},
+			Default: ir.DefaultLiteral{Value: "1"},
 		}},
 	}}}
-	act := &Schema{Tables: []*Table{{
+	act := &ir.Schema{Tables: []*ir.Table{{
 		Name: "t",
-		Columns: []*Column{{
-			Name: "c", Type: Integer{Width: 32},
-			Default: DefaultLiteral{Value: "2"},
+		Columns: []*ir.Column{{
+			Name: "c", Type: ir.Integer{Width: 32},
+			Default: ir.DefaultLiteral{Value: "2"},
 		}},
 	}}}
 	d := DiffSchemas(exp, act, DiffOptions{})
@@ -486,18 +488,18 @@ func TestDiffSchemas_DefaultLiteralMismatch(t *testing.T) {
 }
 
 func TestDiffSchemas_DefaultExpressionLowConfidence(t *testing.T) {
-	exp := &Schema{Tables: []*Table{{
+	exp := &ir.Schema{Tables: []*ir.Table{{
 		Name: "t",
-		Columns: []*Column{{
-			Name: "c", Type: Timestamp{Precision: 6},
-			Default: DefaultExpression{Expr: "CURRENT_TIMESTAMP(0)"},
+		Columns: []*ir.Column{{
+			Name: "c", Type: ir.Timestamp{Precision: 6},
+			Default: ir.DefaultExpression{Expr: "CURRENT_TIMESTAMP(0)"},
 		}},
 	}}}
-	act := &Schema{Tables: []*Table{{
+	act := &ir.Schema{Tables: []*ir.Table{{
 		Name: "t",
-		Columns: []*Column{{
-			Name: "c", Type: Timestamp{Precision: 6},
-			Default: DefaultExpression{Expr: "now() AT TIME ZONE 'UTC'"},
+		Columns: []*ir.Column{{
+			Name: "c", Type: ir.Timestamp{Precision: 6},
+			Default: ir.DefaultExpression{Expr: "now() AT TIME ZONE 'UTC'"},
 		}},
 	}}}
 	d := DiffSchemas(exp, act, DiffOptions{})
@@ -511,16 +513,16 @@ func TestDiffSchemas_DefaultExpressionLowConfidence(t *testing.T) {
 }
 
 func TestDiffSchemas_DefaultMissingHighConfidence(t *testing.T) {
-	exp := &Schema{Tables: []*Table{{
+	exp := &ir.Schema{Tables: []*ir.Table{{
 		Name: "t",
-		Columns: []*Column{{
-			Name: "c", Type: Integer{Width: 32},
-			Default: DefaultLiteral{Value: "0"},
+		Columns: []*ir.Column{{
+			Name: "c", Type: ir.Integer{Width: 32},
+			Default: ir.DefaultLiteral{Value: "0"},
 		}},
 	}}}
-	act := &Schema{Tables: []*Table{{
+	act := &ir.Schema{Tables: []*ir.Table{{
 		Name:    "t",
-		Columns: []*Column{{Name: "c", Type: Integer{Width: 32}}},
+		Columns: []*ir.Column{{Name: "c", Type: ir.Integer{Width: 32}}},
 	}}}
 	d := DiffSchemas(exp, act, DiffOptions{})
 	cd := d.TablesMismatched[0].ColumnsMismatched[0]
@@ -546,18 +548,18 @@ func TestDiffSchemas_DefaultEquivalencesSuppressDrift(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			exp := &Schema{Tables: []*Table{{
+			exp := &ir.Schema{Tables: []*ir.Table{{
 				Name: "t",
-				Columns: []*Column{{
-					Name: "c", Type: Timestamp{Precision: 6},
-					Default: DefaultExpression{Expr: tc.exp},
+				Columns: []*ir.Column{{
+					Name: "c", Type: ir.Timestamp{Precision: 6},
+					Default: ir.DefaultExpression{Expr: tc.exp},
 				}},
 			}}}
-			act := &Schema{Tables: []*Table{{
+			act := &ir.Schema{Tables: []*ir.Table{{
 				Name: "t",
-				Columns: []*Column{{
-					Name: "c", Type: Timestamp{Precision: 6},
-					Default: DefaultExpression{Expr: tc.act},
+				Columns: []*ir.Column{{
+					Name: "c", Type: ir.Timestamp{Precision: 6},
+					Default: ir.DefaultExpression{Expr: tc.act},
 				}},
 			}}}
 			d := DiffSchemas(exp, act, DiffOptions{})
@@ -569,17 +571,17 @@ func TestDiffSchemas_DefaultEquivalencesSuppressDrift(t *testing.T) {
 }
 
 func TestDiffSchemas_GeneratedExprMismatch(t *testing.T) {
-	exp := &Schema{Tables: []*Table{{
+	exp := &ir.Schema{Tables: []*ir.Table{{
 		Name: "t",
-		Columns: []*Column{{
-			Name: "c", Type: Integer{Width: 32},
+		Columns: []*ir.Column{{
+			Name: "c", Type: ir.Integer{Width: 32},
 			GeneratedExpr: "(price * 1.1)", GeneratedStored: true,
 		}},
 	}}}
-	act := &Schema{Tables: []*Table{{
+	act := &ir.Schema{Tables: []*ir.Table{{
 		Name: "t",
-		Columns: []*Column{{
-			Name: "c", Type: Integer{Width: 32},
+		Columns: []*ir.Column{{
+			Name: "c", Type: ir.Integer{Width: 32},
 			GeneratedExpr: "(price * 1.2)", GeneratedStored: true,
 		}},
 	}}}
@@ -591,16 +593,16 @@ func TestDiffSchemas_GeneratedExprMismatch(t *testing.T) {
 }
 
 func TestDiffSchemas_GeneratedExprMissingOnOneSide(t *testing.T) {
-	exp := &Schema{Tables: []*Table{{
+	exp := &ir.Schema{Tables: []*ir.Table{{
 		Name: "t",
-		Columns: []*Column{{
-			Name: "c", Type: Integer{Width: 32},
+		Columns: []*ir.Column{{
+			Name: "c", Type: ir.Integer{Width: 32},
 			GeneratedExpr: "(price * 1.1)", GeneratedStored: true,
 		}},
 	}}}
-	act := &Schema{Tables: []*Table{{
+	act := &ir.Schema{Tables: []*ir.Table{{
 		Name:    "t",
-		Columns: []*Column{{Name: "c", Type: Integer{Width: 32}}},
+		Columns: []*ir.Column{{Name: "c", Type: ir.Integer{Width: 32}}},
 	}}}
 	d := DiffSchemas(exp, act, DiffOptions{})
 	cd := d.TablesMismatched[0].ColumnsMismatched[0]
@@ -610,17 +612,17 @@ func TestDiffSchemas_GeneratedExprMissingOnOneSide(t *testing.T) {
 }
 
 func TestDiffSchemas_CheckConstraintMissingExtra(t *testing.T) {
-	exp := &Schema{Tables: []*Table{{
+	exp := &ir.Schema{Tables: []*ir.Table{{
 		Name:    "t",
-		Columns: []*Column{{Name: "qty", Type: Integer{Width: 32}}},
-		CheckConstraints: []*CheckConstraint{
+		Columns: []*ir.Column{{Name: "qty", Type: ir.Integer{Width: 32}}},
+		CheckConstraints: []*ir.CheckConstraint{
 			{Name: "qty_nonneg", Expr: "qty >= 0"},
 		},
 	}}}
-	act := &Schema{Tables: []*Table{{
+	act := &ir.Schema{Tables: []*ir.Table{{
 		Name:    "t",
-		Columns: []*Column{{Name: "qty", Type: Integer{Width: 32}}},
-		CheckConstraints: []*CheckConstraint{
+		Columns: []*ir.Column{{Name: "qty", Type: ir.Integer{Width: 32}}},
+		CheckConstraints: []*ir.CheckConstraint{
 			{Name: "legacy_check", Expr: "qty < 1000"},
 		},
 	}}}
@@ -635,17 +637,17 @@ func TestDiffSchemas_CheckConstraintMissingExtra(t *testing.T) {
 }
 
 func TestDiffSchemas_CheckConstraintMismatch(t *testing.T) {
-	exp := &Schema{Tables: []*Table{{
+	exp := &ir.Schema{Tables: []*ir.Table{{
 		Name:    "t",
-		Columns: []*Column{{Name: "qty", Type: Integer{Width: 32}}},
-		CheckConstraints: []*CheckConstraint{
+		Columns: []*ir.Column{{Name: "qty", Type: ir.Integer{Width: 32}}},
+		CheckConstraints: []*ir.CheckConstraint{
 			{Name: "qty_range", Expr: "qty >= 0"},
 		},
 	}}}
-	act := &Schema{Tables: []*Table{{
+	act := &ir.Schema{Tables: []*ir.Table{{
 		Name:    "t",
-		Columns: []*Column{{Name: "qty", Type: Integer{Width: 32}}},
-		CheckConstraints: []*CheckConstraint{
+		Columns: []*ir.Column{{Name: "qty", Type: ir.Integer{Width: 32}}},
+		CheckConstraints: []*ir.CheckConstraint{
 			{Name: "qty_range", Expr: "qty > 0"},
 		},
 	}}}
@@ -661,14 +663,14 @@ func TestDiffSchemas_CheckConstraintMismatch(t *testing.T) {
 }
 
 func TestDiffSchemas_CheckConstraintIgnoreExtras(t *testing.T) {
-	exp := &Schema{Tables: []*Table{{
+	exp := &ir.Schema{Tables: []*ir.Table{{
 		Name:    "t",
-		Columns: []*Column{{Name: "qty", Type: Integer{Width: 32}}},
+		Columns: []*ir.Column{{Name: "qty", Type: ir.Integer{Width: 32}}},
 	}}}
-	act := &Schema{Tables: []*Table{{
+	act := &ir.Schema{Tables: []*ir.Table{{
 		Name:    "t",
-		Columns: []*Column{{Name: "qty", Type: Integer{Width: 32}}},
-		CheckConstraints: []*CheckConstraint{
+		Columns: []*ir.Column{{Name: "qty", Type: ir.Integer{Width: 32}}},
+		CheckConstraints: []*ir.CheckConstraint{
 			{Name: "legacy_check", Expr: "qty < 1000"},
 		},
 	}}}
@@ -682,16 +684,16 @@ func TestDiffSchemas_CheckConstraintsUnnamedSkipped(t *testing.T) {
 	// Anonymous CHECKs aren't matched across sides — they'd produce
 	// false positives on cross-engine spelling differences. The diff
 	// silently drops them.
-	exp := &Schema{Tables: []*Table{{
+	exp := &ir.Schema{Tables: []*ir.Table{{
 		Name:    "t",
-		Columns: []*Column{{Name: "qty", Type: Integer{Width: 32}}},
-		CheckConstraints: []*CheckConstraint{
+		Columns: []*ir.Column{{Name: "qty", Type: ir.Integer{Width: 32}}},
+		CheckConstraints: []*ir.CheckConstraint{
 			{Name: "", Expr: "qty >= 0"},
 		},
 	}}}
-	act := &Schema{Tables: []*Table{{
+	act := &ir.Schema{Tables: []*ir.Table{{
 		Name:    "t",
-		Columns: []*Column{{Name: "qty", Type: Integer{Width: 32}}},
+		Columns: []*ir.Column{{Name: "qty", Type: ir.Integer{Width: 32}}},
 	}}}
 	d := DiffSchemas(exp, act, DiffOptions{})
 	if d.HasChanges() {
@@ -700,18 +702,18 @@ func TestDiffSchemas_CheckConstraintsUnnamedSkipped(t *testing.T) {
 }
 
 func TestDiffSchemas_Summary_IncludesNewCategories(t *testing.T) {
-	exp := &Schema{Tables: []*Table{{
+	exp := &ir.Schema{Tables: []*ir.Table{{
 		Name:    "t",
-		Columns: []*Column{{Name: "qty", Type: Integer{Width: 32}}},
-		CheckConstraints: []*CheckConstraint{
+		Columns: []*ir.Column{{Name: "qty", Type: ir.Integer{Width: 32}}},
+		CheckConstraints: []*ir.CheckConstraint{
 			{Name: "a", Expr: "qty > 0"},
 			{Name: "b", Expr: "qty < 100"},
 		},
 	}}}
-	act := &Schema{Tables: []*Table{{
+	act := &ir.Schema{Tables: []*ir.Table{{
 		Name:    "t",
-		Columns: []*Column{{Name: "qty", Type: Integer{Width: 32}}},
-		CheckConstraints: []*CheckConstraint{
+		Columns: []*ir.Column{{Name: "qty", Type: ir.Integer{Width: 32}}},
+		CheckConstraints: []*ir.CheckConstraint{
 			{Name: "b", Expr: "qty < 50"},
 			{Name: "c", Expr: "qty != 7"},
 		},
@@ -731,17 +733,17 @@ func TestDiffSchemas_Summary_IncludesNewCategories(t *testing.T) {
 // sides always carry empty slices.
 
 func TestDiffSchemas_ExcludeConstraintMissingExtra(t *testing.T) {
-	exp := &Schema{Tables: []*Table{{
+	exp := &ir.Schema{Tables: []*ir.Table{{
 		Name:    "t",
-		Columns: []*Column{{Name: "id", Type: Integer{Width: 64}}},
-		ExcludeConstraints: []*ExcludeConstraint{
+		Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
+		ExcludeConstraints: []*ir.ExcludeConstraint{
 			{Name: "range_no_overlap", Definition: "EXCLUDE USING gist (id WITH =)"},
 		},
 	}}}
-	act := &Schema{Tables: []*Table{{
+	act := &ir.Schema{Tables: []*ir.Table{{
 		Name:    "t",
-		Columns: []*Column{{Name: "id", Type: Integer{Width: 64}}},
-		ExcludeConstraints: []*ExcludeConstraint{
+		Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
+		ExcludeConstraints: []*ir.ExcludeConstraint{
 			{Name: "legacy_overlap", Definition: "EXCLUDE USING gist (id WITH &&)"},
 		},
 	}}}
@@ -760,15 +762,15 @@ func TestDiffSchemas_ExcludeConstraintDefinitionMismatch(t *testing.T) {
 	// surfaces as a real mismatch (pg_get_constraintdef is server-
 	// canonicalized so a real divergence here means hand-edit on one
 	// side).
-	exp := &Schema{Tables: []*Table{{
+	exp := &ir.Schema{Tables: []*ir.Table{{
 		Name: "t",
-		ExcludeConstraints: []*ExcludeConstraint{
+		ExcludeConstraints: []*ir.ExcludeConstraint{
 			{Name: "ex", Definition: "EXCLUDE USING gist (id WITH &&) WHERE (id > 0)"},
 		},
 	}}}
-	act := &Schema{Tables: []*Table{{
+	act := &ir.Schema{Tables: []*ir.Table{{
 		Name: "t",
-		ExcludeConstraints: []*ExcludeConstraint{
+		ExcludeConstraints: []*ir.ExcludeConstraint{
 			{Name: "ex", Definition: "EXCLUDE USING gist (id WITH &&) WHERE ((id > 0))"},
 		},
 	}}}
@@ -790,10 +792,10 @@ func TestDiffSchemas_ExcludeConstraintDefinitionMismatch(t *testing.T) {
 }
 
 func TestDiffSchemas_ExcludeConstraintIgnoreExtras(t *testing.T) {
-	exp := &Schema{Tables: []*Table{{Name: "t"}}}
-	act := &Schema{Tables: []*Table{{
+	exp := &ir.Schema{Tables: []*ir.Table{{Name: "t"}}}
+	act := &ir.Schema{Tables: []*ir.Table{{
 		Name: "t",
-		ExcludeConstraints: []*ExcludeConstraint{
+		ExcludeConstraints: []*ir.ExcludeConstraint{
 			{Name: "legacy_overlap", Definition: "EXCLUDE USING gist (id WITH &&)"},
 		},
 	}}}
@@ -804,16 +806,16 @@ func TestDiffSchemas_ExcludeConstraintIgnoreExtras(t *testing.T) {
 }
 
 func TestDiffSchemas_Summary_IncludesExcludeCategories(t *testing.T) {
-	exp := &Schema{Tables: []*Table{{
+	exp := &ir.Schema{Tables: []*ir.Table{{
 		Name: "t",
-		ExcludeConstraints: []*ExcludeConstraint{
+		ExcludeConstraints: []*ir.ExcludeConstraint{
 			{Name: "a", Definition: "EXCLUDE USING gist (id WITH &&)"},
 			{Name: "b", Definition: "EXCLUDE USING gist (id WITH =)"},
 		},
 	}}}
-	act := &Schema{Tables: []*Table{{
+	act := &ir.Schema{Tables: []*ir.Table{{
 		Name: "t",
-		ExcludeConstraints: []*ExcludeConstraint{
+		ExcludeConstraints: []*ir.ExcludeConstraint{
 			{Name: "b", Definition: "EXCLUDE USING gist (id WITH <>)"},
 			{Name: "c", Definition: "EXCLUDE USING gist (id WITH @>)"},
 		},
@@ -831,11 +833,11 @@ func TestDiffSchemas_Summary_IncludesExcludeCategories(t *testing.T) {
 // missing/extra set-semantics added in the view-support Phase 1
 // commit. Mirrors TestDiffSchemas_TableMissingAndExtra.
 func TestDiffSchemas_ViewsMissingAndExtra(t *testing.T) {
-	exp := &Schema{Views: []*View{
+	exp := &ir.Schema{Views: []*ir.View{
 		{Name: "active_users", Definition: "SELECT id FROM users WHERE active"},
 		{Name: "recent_orders", Definition: "SELECT id FROM orders WHERE created_at > NOW() - INTERVAL '7 days'"},
 	}}
-	act := &Schema{Views: []*View{
+	act := &ir.Schema{Views: []*ir.View{
 		{Name: "active_users", Definition: "SELECT id FROM users WHERE active"},
 		{Name: "deprecated_view", Definition: "SELECT 1"},
 	}}
@@ -854,10 +856,10 @@ func TestDiffSchemas_ViewsMissingAndExtra(t *testing.T) {
 // TestDiffSchemas_ViewsIgnoreExtras verifies the IgnoreExtras opt
 // suppresses extra-on-target views (mirrors the table behaviour).
 func TestDiffSchemas_ViewsIgnoreExtras(t *testing.T) {
-	exp := &Schema{Views: []*View{
+	exp := &ir.Schema{Views: []*ir.View{
 		{Name: "v1", Definition: "SELECT 1"},
 	}}
-	act := &Schema{Views: []*View{
+	act := &ir.Schema{Views: []*ir.View{
 		{Name: "v1", Definition: "SELECT 1"},
 		{Name: "other_app_view", Definition: "SELECT 2"},
 	}}
@@ -871,10 +873,10 @@ func TestDiffSchemas_ViewsIgnoreExtras(t *testing.T) {
 // and-equal definition comparison. A view whose body changes
 // (whitespace-insensitive) surfaces in ViewsMismatched.
 func TestDiffSchemas_ViewsMismatched_DefinitionDrift(t *testing.T) {
-	exp := &Schema{Views: []*View{
+	exp := &ir.Schema{Views: []*ir.View{
 		{Name: "v1", Definition: "SELECT id, email FROM users"},
 	}}
-	act := &Schema{Views: []*View{
+	act := &ir.Schema{Views: []*ir.View{
 		{Name: "v1", Definition: "SELECT id FROM users"},
 	}}
 	d := DiffSchemas(exp, act, DiffOptions{})
@@ -894,10 +896,10 @@ func TestDiffSchemas_ViewsMismatched_DefinitionDrift(t *testing.T) {
 // materialized-flag drift case: same body, different materialized
 // flag.
 func TestDiffSchemas_ViewsMismatched_MaterializedFlag(t *testing.T) {
-	exp := &Schema{Views: []*View{
+	exp := &ir.Schema{Views: []*ir.View{
 		{Name: "v1", Definition: "SELECT 1", Materialized: true},
 	}}
-	act := &Schema{Views: []*View{
+	act := &ir.Schema{Views: []*ir.View{
 		{Name: "v1", Definition: "SELECT 1", Materialized: false},
 	}}
 	d := DiffSchemas(exp, act, DiffOptions{})
@@ -917,11 +919,11 @@ func TestDiffSchemas_ViewsMismatched_MaterializedFlag(t *testing.T) {
 // TestDiffSchemas_ViewsSummary verifies the Summary() rollup picks
 // up view-level drift counts.
 func TestDiffSchemas_ViewsSummary(t *testing.T) {
-	exp := &Schema{Views: []*View{
+	exp := &ir.Schema{Views: []*ir.View{
 		{Name: "a", Definition: "SELECT 1"},
 		{Name: "b", Definition: "SELECT 2"},
 	}}
-	act := &Schema{Views: []*View{
+	act := &ir.Schema{Views: []*ir.View{
 		{Name: "a", Definition: "SELECT 1 WHERE TRUE"}, // mismatched
 		{Name: "c", Definition: "SELECT 3"},            // extra
 	}}

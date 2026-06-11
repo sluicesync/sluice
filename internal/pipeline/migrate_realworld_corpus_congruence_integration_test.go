@@ -22,7 +22,7 @@
 //  3. Apply the authored PG-side corpus DDL into a different schema
 //     ("authored") of the SAME PG container.
 //  4. Read both PG schemas via the PG engine and
-//     ir.DiffSchemas(authored, emitted, {IgnoreCharsetCollation:true,
+//     irdiff.DiffSchemas(authored, emitted, {IgnoreCharsetCollation:true,
 //     IgnoreExtras:false}).
 //  5. Classify: no diff → congruent (log). Diffs → split into a tight,
 //     commented KNOWN-BENIGN engine-idiomatic allowlist (GREEN by
@@ -48,6 +48,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	irdiff "sluicesync.dev/sluice/internal/ir/diff"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -119,7 +120,7 @@ func applyPGDDLInSchema(t *testing.T, dsn, schema, ddl string) {
 //
 // The allowlist is intentionally tight. Each branch:
 //   - matches on the IR Type *string* rendering (typeString), the same
-//     stable form ir.DiffSchemas compares, and
+//     stable form irdiff.DiffSchemas compares, and
 //   - requires the delta to be a documented cross-engine policy, not a
 //     "close enough" guess.
 //
@@ -128,7 +129,7 @@ func applyPGDDLInSchema(t *testing.T, dsn, schema, ddl string) {
 // CHECK drift are never reachable here (classifyCongruenceDiff routes
 // those straight to the failure path), so the allowlist cannot mask a
 // structural translation loss.
-func congruenceBenignReason(cd ir.ColumnDiff) string {
+func congruenceBenignReason(cd irdiff.ColumnDiff) string {
 	exp := strings.ToLower(strings.TrimSpace(cd.ExpectedType)) // authored side
 	act := strings.ToLower(strings.TrimSpace(cd.ActualType))   // sluice-emitted side
 	if exp == "" && act == "" {
@@ -212,7 +213,7 @@ func congruenceBenignReason(cd ir.ColumnDiff) string {
 // type faithfully. Still tight: it is only reached when ExpectedType
 // and ActualType are both empty (DiffSchemas left them zero ⇒ the IR
 // types compared equal).
-func defaultNullableBenignReason(cd ir.ColumnDiff) string {
+func defaultNullableBenignReason(cd irdiff.ColumnDiff) string {
 	switch {
 	case cd.ExpectedDefault != "" || cd.ActualDefault != "":
 		return "type-equal column; only DEFAULT-clause spelling differs between the two expert-authored sides (docs/type-mapping.md default-equivalence)"
@@ -277,7 +278,7 @@ type congruenceVerdict struct {
 // dropped table/column (the real translation-loss class we want to
 // catch). This mirrors the GitLab-leg "characterize the known class,
 // FAIL only on an unexpected shape" pattern.
-func classifyCongruenceDiff(d ir.SchemaDiff) congruenceVerdict {
+func classifyCongruenceDiff(d irdiff.SchemaDiff) congruenceVerdict {
 	if !d.HasChanges() {
 		return congruenceVerdict{congruent: true}
 	}
@@ -378,7 +379,7 @@ func runCongruenceLeg(t *testing.T, mysqlDDLFile, pgDDLFile string, pairSize int
 	// MySQL utf8mb4_* vs PG en_US.utf8 never match by name — benign,
 	// documented (schema_diff.go DiffOptions doc-comment). IgnoreExtras
 	// false: a missing/extra table or column IS a real defect, surface.
-	diff := ir.DiffSchemas(authored, emitted, ir.DiffOptions{
+	diff := irdiff.DiffSchemas(authored, emitted, irdiff.DiffOptions{
 		IgnoreCharsetCollation: true,
 		IgnoreExtras:           false,
 	})
@@ -537,7 +538,7 @@ func runCongruenceReverseLeg(t *testing.T, pgDDLFile, mysqlDDLFile string, pairS
 	emitted := corpusReadMySQLSchema(t, emittedDSN, pairSize)
 
 	// authored = expected, emitted = actual.
-	diff := ir.DiffSchemas(authored, emitted, ir.DiffOptions{
+	diff := irdiff.DiffSchemas(authored, emitted, irdiff.DiffOptions{
 		IgnoreCharsetCollation: true,
 		IgnoreExtras:           false,
 	})
