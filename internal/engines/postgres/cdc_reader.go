@@ -13,6 +13,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pglogrepl"
@@ -118,6 +119,24 @@ type CDCReader struct {
 	// like the cdc-snapshot test paths don't need to construct
 	// a tracker).
 	appliedLSN *lsnTracker
+
+	// holdAck + ackCeil implement the chain-consumer ack mode used by
+	// `backup incremental` / `backup stream` (which have no applier
+	// and therefore no lsnTracker). Without it, the no-tracker
+	// keepalive fallback acks streamedLSN — which advances as the pump
+	// PARSES CommitMessages, before (or regardless of whether) the
+	// orchestrator durably commits those events to chunks. A keepalive
+	// firing between window-close and pump teardown would then push
+	// confirmed_flush_lsn past the manifest's recorded EndPosition,
+	// and the NEXT incremental would silently miss the WAL in between
+	// (the walsender fast-forwards START_REPLICATION to
+	// confirmed_flush_lsn). With holdAck set, the keepalive never
+	// advertises past max(startLSN, ackCeil); the orchestrator raises
+	// ackCeil via ReleaseSlotAckTo as windows durably commit. Both are
+	// atomics: holdAck is set before StreamChanges, ackCeil is raised
+	// from the orchestrator goroutine while the pump reads it.
+	holdAck atomic.Bool
+	ackCeil atomic.Uint64
 
 	// systemID and timeline pin the source's identity (ADR-0051,
 	// research finding F5). Populated from IDENTIFY_SYSTEM at the
@@ -1350,14 +1369,68 @@ func (r *CDCReader) positionAt(lsn pglogrepl.LSN) (ir.Position, error) {
 // applied at startup, and the applier's first commit will report a
 // higher value via the tracker.
 func (r *CDCReader) ackLSN(streamedLSN, startLSN pglogrepl.LSN) pglogrepl.LSN {
-	if r.appliedLSN == nil {
-		return streamedLSN
+	ack := streamedLSN
+	if r.appliedLSN != nil {
+		if applied := r.appliedLSN.LoadApplied(); applied == 0 {
+			ack = startLSN
+		} else {
+			ack = applied
+		}
 	}
-	applied := r.appliedLSN.LoadApplied()
-	if applied == 0 {
-		return startLSN
+	// Chain-consumer clamp (see the holdAck field): never advertise
+	// past what the backup orchestrator has durably committed, floored
+	// at startLSN so the slot stays alive on idle streams. Applied on
+	// top of (not instead of) the tracker branch so the two compose.
+	if r.holdAck.Load() {
+		ceil := pglogrepl.LSN(r.ackCeil.Load())
+		if ceil < startLSN {
+			ceil = startLSN
+		}
+		if ack > ceil {
+			ack = ceil
+		}
 	}
-	return applied
+	return ack
+}
+
+// HoldSlotAckAtCommitted switches the keepalive's slot ack into
+// chain-consumer mode: the advertised confirmed_flush_lsn never
+// passes the highest position released via [ReleaseSlotAckTo]
+// (floored at the stream's start position). `backup incremental` and
+// `backup stream` set this before StreamChanges — they have no
+// applier feedback tracker, and the no-tracker fallback (ack the
+// streamed LSN) would let a keepalive release WAL the chain has not
+// durably captured. Must be called before [CDCReader.StreamChanges].
+func (r *CDCReader) HoldSlotAckAtCommitted() {
+	r.holdAck.Store(true)
+}
+
+// ReleaseSlotAckTo raises the chain-consumer ack ceiling to pos —
+// called by the backup orchestrator after a window's manifest is
+// durably committed, so the slot releases exactly the WAL the chain
+// now carries. Ratchets monotonically (a lower position is ignored).
+// Safe to call from a different goroutine than the pump's.
+func (r *CDCReader) ReleaseSlotAckTo(pos ir.Position) error {
+	decoded, ok, err := decodePGPos(pos)
+	if err != nil {
+		return fmt.Errorf("postgres: release slot ack: %w", err)
+	}
+	if !ok || decoded.LSN == "" {
+		return nil
+	}
+	lsn, err := pglogrepl.ParseLSN(decoded.LSN)
+	if err != nil {
+		return fmt.Errorf("postgres: release slot ack: parse LSN %q: %w", decoded.LSN, err)
+	}
+	for {
+		cur := r.ackCeil.Load()
+		if uint64(lsn) <= cur {
+			return nil
+		}
+		if r.ackCeil.CompareAndSwap(cur, uint64(lsn)) {
+			return nil
+		}
+	}
 }
 
 // setErr stores the first streaming error; subsequent calls are

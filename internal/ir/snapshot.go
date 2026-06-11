@@ -137,6 +137,18 @@ type BackupSnapshot struct {
 	Position Position
 	Rows     RowReader
 	CloseFn  func() error
+
+	// CommitFn, when non-nil, is called by the orchestrator exactly
+	// once after the backup's final manifest commit succeeds — i.e.
+	// the moment the backup becomes a durable, complete chain root.
+	// Engines use it to persist run-scoped resources that must
+	// outlive a SUCCESSFUL run but not a failed one: the Postgres
+	// --chain-slot path keeps the persistent chain slot (anchored at
+	// Position) instead of dropping it in Close. After Commit, Close
+	// must still be called; it releases connections but skips
+	// dropping committed resources. nil when the engine has nothing
+	// to persist (the default temporary-anchor shape).
+	CommitFn func(ctx context.Context) error
 }
 
 // Close releases the snapshot transaction and the underlying
@@ -146,6 +158,16 @@ func (s *BackupSnapshot) Close() error {
 		return nil
 	}
 	return s.CloseFn()
+}
+
+// Commit persists run-scoped resources that should outlive a
+// successful backup (see CommitFn). Safe to call when no CommitFn is
+// set (no-op).
+func (s *BackupSnapshot) Commit(ctx context.Context) error {
+	if s == nil || s.CommitFn == nil {
+		return nil
+	}
+	return s.CommitFn(ctx)
 }
 
 // PositionMonotonicChecker is the OPTIONAL engine surface the
@@ -193,15 +215,64 @@ type PositionMonotonicChecker interface {
 // the implementation onto whichever value is convenient (today: the
 // engine struct itself, parallel to [Engine.OpenSnapshotStream]).
 //
-// The slotName argument is honoured by engines with a slot concept
-// (Postgres: the temporary slot used to anchor the snapshot is
-// distinct from the chain-handoff slot; the slot name is recorded on
-// the manifest's EndPosition so a Phase 3 incremental against this
-// manifest opens CDC against the correct chain-handoff slot, even
-// though the temporary backup slot has long been dropped). MySQL
-// ignores it — the binlog stream is the slot.
+// The options' SlotName is honoured by engines with a slot concept
+// (Postgres: by default a temporary anchor slot — distinct from the
+// chain-handoff slot — pins the snapshot; the chain slot name is
+// recorded on the manifest's EndPosition so a Phase 3 incremental
+// against this manifest opens CDC against the correct chain-handoff
+// slot, even though the temporary backup slot has long been dropped).
+// MySQL ignores it — the binlog stream is the slot.
 type BackupSnapshotOpener interface {
-	OpenBackupSnapshot(ctx context.Context, dsn, slotName string) (*BackupSnapshot, error)
+	OpenBackupSnapshot(ctx context.Context, dsn string, opts BackupSnapshotOptions) (*BackupSnapshot, error)
+}
+
+// BackupSnapshotOptions carries the engine-facing knobs for opening a
+// backup snapshot. A zero value preserves the historical defaults
+// (engine default slot name, temporary anchor slot dropped at Close).
+type BackupSnapshotOptions struct {
+	// SlotName is the chain-handoff replication-slot name recorded on
+	// the snapshot Position for engines with a slot concept. Empty
+	// falls back to the engine default (`sluice_slot` on Postgres).
+	// Engines without slots (MySQL) ignore it.
+	SlotName string
+
+	// PersistChainSlot, when true on engines with a slot concept,
+	// anchors the snapshot on the PERSISTENT chain slot itself
+	// (named SlotName) instead of a temporary anchor slot, and keeps
+	// it once the backup commits ([BackupSnapshot.CommitFn]). The
+	// slot's consistent point then IS the manifest's EndPosition, so
+	// `backup incremental` chains with zero gap by construction —
+	// without it, the operator must create and maintain the chain
+	// slot themselves BEFORE the full backup (a late-created slot
+	// cannot serve the WAL between the full's anchor and its own
+	// creation; see [ChainResumePreflighter]).
+	//
+	// The cost is source-side WAL retention: an unconsumed slot
+	// retains WAL until the next incremental advances it. Engines
+	// without a slot concept log a loud no-op and ignore the field.
+	PersistChainSlot bool
+}
+
+// ChainResumePreflighter is the OPTIONAL engine surface the
+// incremental-backup orchestrator uses to verify, BEFORE opening CDC,
+// that the engine can actually serve the chain from the parent
+// manifest's terminal position. Engines with server-side consumer
+// state (Postgres replication slots) implement it; engines whose
+// resume needs no server-side cursor (MySQL: binlog position is
+// client-side, pruning is detected loudly at stream open) omit it.
+//
+// The Postgres implementation refuses loudly when:
+//   - the slot named in `from` does not exist (it may never have been
+//     created — the chain anchor records where the next incremental
+//     must start, but only a standing slot retains the WAL to serve
+//     it), or
+//   - the slot's confirmed_flush_lsn is AHEAD of `from` (a slot
+//     created or advanced after the parent backup: the WAL in
+//     between is not retained, and PostgreSQL would silently
+//     fast-forward the stream past it — the silent-loss shape this
+//     preflight converts into a loud refusal).
+type ChainResumePreflighter interface {
+	PreflightChainResume(ctx context.Context, dsn string, from Position) error
 }
 
 // TableScopedBackupSnapshotOpener is the OPTIONAL engine surface for
@@ -225,5 +296,5 @@ type BackupSnapshotOpener interface {
 // [BackupSnapshotOpener.OpenBackupSnapshot] (Postgres and vanilla MySQL
 // read per-table and never over-stream, so the scope is a no-op there).
 type TableScopedBackupSnapshotOpener interface {
-	OpenBackupSnapshotForTables(ctx context.Context, dsn, slotName string, tables []string) (*BackupSnapshot, error)
+	OpenBackupSnapshotForTables(ctx context.Context, dsn string, opts BackupSnapshotOptions, tables []string) (*BackupSnapshot, error)
 }

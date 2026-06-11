@@ -170,19 +170,24 @@ func TestBackup_NoCDCSkipsEndPosition(t *testing.T) {
 // rather than calling the post-sweep CaptureBackupPosition fallback.
 type snapshotOpeningEngine struct {
 	*capturingBackupEngine
-	snapshotPos      ir.Position
-	snapshotErr      error
-	snapshotCalls    int
-	snapshotCloses   int
-	gotSnapshotSlot  string
-	useSnapshotRows  bool
-	snapshotRowsHook func() ir.RowReader
+	snapshotPos         ir.Position
+	snapshotErr         error
+	snapshotCalls       int
+	snapshotCloses      int
+	gotSnapshotSlot     string
+	gotPersistChainSlot bool
+	commitCalls         int
+	useSnapshotRows     bool
+	snapshotRowsHook    func() ir.RowReader
 }
 
-// OpenBackupSnapshot implements [ir.BackupSnapshotOpener].
-func (e *snapshotOpeningEngine) OpenBackupSnapshot(_ context.Context, _, slotName string) (*ir.BackupSnapshot, error) {
+// OpenBackupSnapshot implements [ir.BackupSnapshotOpener]. Mirrors the
+// Postgres engine's CommitFn contract: the commit hook is set only on
+// the PersistChainSlot shape.
+func (e *snapshotOpeningEngine) OpenBackupSnapshot(_ context.Context, _ string, opts ir.BackupSnapshotOptions) (*ir.BackupSnapshot, error) {
 	e.snapshotCalls++
-	e.gotSnapshotSlot = slotName
+	e.gotSnapshotSlot = opts.SlotName
+	e.gotPersistChainSlot = opts.PersistChainSlot
 	if e.snapshotErr != nil {
 		return nil, e.snapshotErr
 	}
@@ -192,14 +197,21 @@ func (e *snapshotOpeningEngine) OpenBackupSnapshot(_ context.Context, _, slotNam
 	} else {
 		rows = &fakeRowReader{rows: e.rows}
 	}
-	return &ir.BackupSnapshot{
+	snap := &ir.BackupSnapshot{
 		Position: e.snapshotPos,
 		Rows:     rows,
 		CloseFn: func() error {
 			e.snapshotCloses++
 			return nil
 		},
-	}, nil
+	}
+	if opts.PersistChainSlot {
+		snap.CommitFn = func(context.Context) error {
+			e.commitCalls++
+			return nil
+		}
+	}
+	return snap, nil
 }
 
 // scopedSnapshotOpeningEngine implements BOTH [ir.BackupSnapshotOpener]
@@ -231,15 +243,15 @@ func (e *scopedSnapshotOpeningEngine) makeSnapshot() *ir.BackupSnapshot {
 
 // OpenBackupSnapshot implements [ir.BackupSnapshotOpener] (the base,
 // whole-keyspace surface). The scoped test asserts this is NOT called.
-func (e *scopedSnapshotOpeningEngine) OpenBackupSnapshot(_ context.Context, _, _ string) (*ir.BackupSnapshot, error) {
+func (e *scopedSnapshotOpeningEngine) OpenBackupSnapshot(_ context.Context, _ string, _ ir.BackupSnapshotOptions) (*ir.BackupSnapshot, error) {
 	e.baseCalls++
 	return e.makeSnapshot(), nil
 }
 
 // OpenBackupSnapshotForTables implements [ir.TableScopedBackupSnapshotOpener].
-func (e *scopedSnapshotOpeningEngine) OpenBackupSnapshotForTables(_ context.Context, _, slotName string, tables []string) (*ir.BackupSnapshot, error) {
+func (e *scopedSnapshotOpeningEngine) OpenBackupSnapshotForTables(_ context.Context, _ string, opts ir.BackupSnapshotOptions, tables []string) (*ir.BackupSnapshot, error) {
 	e.scopedCalls++
-	e.gotScopedSlot = slotName
+	e.gotScopedSlot = opts.SlotName
 	e.gotScopedTables = tables
 	return e.makeSnapshot(), nil
 }

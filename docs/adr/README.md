@@ -6,7 +6,7 @@ ADRs are numbered in the order they were proposed. A few notable conventions:
 
 - **Status** lines at the top of each ADR record whether the decision is Accepted, Superseded, or Discovery (research-only).
 - Some ADRs were promoted from a design doc in `docs/dev/notes/` after extended dialogue; the dialogue artifacts stay in `notes/` for traceability.
-- **ADR-0051 collision:** two ADRs share the number — `adr-0051-core-pg-type-verbatim-carry.md` (the canonical one referenced by the roadmap and `ir.VerbatimType`) and `adr-0051-pg-cdc-source-identity-pinning.md` (a sibling concern). Renumbering hasn't been done because both are widely cross-referenced; future ADRs continue from 0082.
+- **ADR-0051 collision:** two ADRs share the number — `adr-0051-core-pg-type-verbatim-carry.md` (the canonical one referenced by the roadmap and `ir.VerbatimType`) and `adr-0051-pg-cdc-source-identity-pinning.md` (a sibling concern). Renumbering hasn't been done because both are widely cross-referenced; future ADRs continue from 0084.
 - **ADR-0066 collision:** `adr-0066-postgres-trigger-engine-variant.md` is the actual ADR; `adr-0066-task-62-planning-brief.md` is a planning brief for the same chunk and not a true ADR.
 
 ## Foundations (0001–0009)
@@ -167,6 +167,12 @@ ADRs are numbered in the order they were proposed. A few notable conventions:
 | ADR | Decision |
 |---|---|
 | [0082](adr-0082-per-table-migration-state-rows.md) | Accepted — repo-audit M2.3: make migrate-state checkpoint writes O(1) in table count. The ≤v0.99.x store re-encoded the WHOLE `map[table]TableProgress` blob into the one hot `sluice_migrate_state` row on every breadcrumb/per-5000-row cursor/chunk checkpoint — O(N²) over a 10k-table migration (~856 KB × ≥20k writes ≈ 17 GB through one row's MVCC/TOAST). Now: a header row (phase, `state_format`, timestamps) + one `sluice_migrate_table_progress` row per table; hot paths use the new `ir.MigrationStateStore.WriteTableProgress` (one upsert; measured 84× faster wall, ~12,770× less payload per checkpoint on real PG). Store logic lands ONCE in `internal/migratestate` (ADR-0081 tier-c dialect-seam precedent); engines are thin SQL shims. Legacy blobs upgrade once, transactionally, on first Read (crash-safe: commit-whole or re-run; orphan-clearing delete-first); the old blob is overwritten with a deliberately-invalid-JSON sentinel so a downgraded binary fails LOUDLY instead of silently re-copying (one-way state compat, as at v0.4.0). Cross-version pin ×2 engines against a byte-captured v0.99.x blob covering every TableProgress family × shape. |
+
+## Backup-chain provisioning (0083)
+
+| ADR | Decision |
+|---|---|
+| [0083](adr-0083-backup-chain-provisioning.md) | Accepted — task #40, found by the 2026-06-10 backup benchmark: the chain-handoff contract ("operator creates the slot before the full") had no provisioning surface, and every natural way of getting it wrong was silent or misleading. Three coordinated pieces: (1) **`backup full --chain-slot`** creates the PERSISTENT chain slot AS the snapshot anchor (consistent point == manifest EndPosition → zero-gap chain by construction) and ensures the pgoutput publication BEFORE the anchor (pgoutput's historic-catalog rule: a late-created publication can never decode the chain's first window); commit-on-success via the new `ir.BackupSnapshot.CommitFn` (failed runs drop the slot), already-exists refused loudly, openers take `ir.BackupSnapshotOptions`. (2) **Chain-resume preflight** (`ir.ChainResumePreflighter`, PG-only): refuse when the slot is missing (it may never have existed — old message blamed pruning) or when `confirmed_flush_lsn` is AHEAD of the parent position — previously the walsender silently fast-forwarded and the incremental SUCCEEDED with the in-between writes gone (silent-loss class; same hazard the live add-table preflight guards). (3) **Chain-consumer ack hold**: no applier → keepalive acked the STREAMED LSN, so a teardown-window keepalive could release WAL the chain never committed; `HoldSlotAckAtCommitted`/`ReleaseSlotAckTo` pin acks to committed window ends and bound `backup stream` WAL retention to ~one rollover window. |
 
 ## Notes / dialogue prep / readiness briefs
 

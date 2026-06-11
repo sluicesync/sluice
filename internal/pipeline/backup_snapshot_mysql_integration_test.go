@@ -192,7 +192,7 @@ func TestBackup_OpenBackupSnapshot_MySQLPositionShape(t *testing.T) {
 		t.Fatal("mysql engine does not implement BackupSnapshotOpener")
 	}
 
-	snap, err := opener.OpenBackupSnapshot(context.Background(), sourceDSN, "")
+	snap, err := opener.OpenBackupSnapshot(context.Background(), sourceDSN, ir.BackupSnapshotOptions{})
 	if err != nil {
 		t.Fatalf("OpenBackupSnapshot: %v", err)
 	}

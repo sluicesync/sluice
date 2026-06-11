@@ -287,12 +287,34 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 		}
 	}
 
+	// 2.5. Chain-resume preflight (engines with server-side consumer
+	// state, i.e. Postgres slots): verify the slot can actually serve
+	// startPos BEFORE opening the stream. Without it, a slot created
+	// (or advanced by another consumer) after the parent backup makes
+	// the walsender silently fast-forward past the WAL in between —
+	// the incremental SUCCEEDS while the chain silently misses those
+	// writes. The preflight converts that into a loud refusal naming
+	// `backup full --chain-slot` as the fix (see [preflightChainResume]).
+	if err := preflightChainResume(ctx, b.Source, b.SourceDSN, startPos); err != nil {
+		return wrapWithHint(PhaseCDC, fmt.Errorf("incremental: chain preflight: %w", err))
+	}
+
 	// 3. Open CDC reader at parent's EndPosition.
 	cdc, err := b.openCDCReader(ctx)
 	if err != nil {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("incremental: open cdc reader: %w", err))
 	}
 	defer closeIf(cdc)
+
+	// Chain-consumer ack mode: without an applier there is no LSN
+	// tracker, and the reader's no-tracker keepalive fallback acks the
+	// STREAMED position — which can run ahead of what this run durably
+	// commits (events parsed by the pump but past the window close are
+	// discarded). An ack past the recorded EndPosition releases WAL
+	// the chain has not captured, silently gapping the next link. Hold
+	// the ack at the stream's start; the committed end is released
+	// after the manifest write below.
+	holdChainAck(cdc)
 
 	changesCh, err := cdc.StreamChanges(ctx, startPos)
 	if err != nil {
@@ -301,7 +323,7 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 		// that loudly with a clear "your --since parent is too old;
 		// take a fresh full" line.
 		if errors.Is(err, ir.ErrPositionInvalid) {
-			return fmt.Errorf("incremental: source has pruned past parent's terminal position; take a fresh full backup or shorten the chain interval. Underlying: %w", err)
+			return fmt.Errorf("incremental: source cannot serve the parent's terminal position (WAL/binlog pruned past it, or the source identity changed); take a fresh full backup — `backup full --chain-slot` provisions retention so this cannot recur — or shorten the chain interval. Underlying: %w", err)
 		}
 		return wrapWithHint(PhaseCDC, fmt.Errorf("incremental: start cdc stream: %w", err))
 	}
@@ -398,6 +420,12 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	if err := writeManifestAt(ctx, b.segStore, manifestPath, manifest); err != nil {
 		return fmt.Errorf("incremental: write manifest: %w", err)
 	}
+	// The window is durable — let the slot release WAL up to its end.
+	// (Effective on the reader's next keepalive; for a one-shot
+	// incremental the release usually lands via the NEXT run's start
+	// ack instead, which is equivalent. The long-lived `backup stream`
+	// path relies on this to bound WAL retention per rollover.)
+	releaseChainAckTo(ctx, cdc, manifest.EndPosition)
 	// ADR-0046: append this incremental to the open segment in
 	// lineage.json (best-effort for the non-rotation path; the
 	// manifest file is authoritative for the one-segment shape).
