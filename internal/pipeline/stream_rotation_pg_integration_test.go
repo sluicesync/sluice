@@ -24,6 +24,7 @@ package pipeline
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -299,6 +300,19 @@ func TestADR0046_CrashInjectionMatrix_PG(t *testing.T) {
 				))
 			}
 
+			// Reap any walsender still holding a sluice slot before the
+			// recovery run (task #48). After run1's injected crash the
+			// server can legitimately keep the slot marked active until
+			// it notices the dead client — under CI's -race scheduler
+			// that can exceed run2's 8-second useful-run window, so run2
+			// burned the whole window in slot-active retries and the
+			// test's cancel surfaced as "context canceled" mid-retry
+			// (fired on PR #178 and PR #190 runs). The retry behaviour
+			// has its own pins; THIS test is about recoverRotationState,
+			// so make the slot handoff deterministic instead of racing
+			// the server's reaper.
+			reapSluiceWalsenders(t, sourceDSN)
+
 			// Restart: recoverRotationState reconciles the marker. <=COMMIT
 			// edges discard the provisional & resume the prior segment;
 			// the post-commit-write edge keeps the new segment.
@@ -550,4 +564,40 @@ func TestADR0046_UnknownRecordedCodecRefused_PG(t *testing.T) {
 	if err == nil {
 		t.Fatal("restore with unknown recorded codec = nil; want loud refusal")
 	}
+}
+
+// reapSluiceWalsenders terminates any backend still holding a
+// sluice-prefixed replication slot ACTIVE, then waits for the slots to
+// read inactive. Test-harness determinism only (task #48): after an
+// injected hard crash the server keeps the slot active until it
+// notices the dead client — correct server behaviour, pinned
+// elsewhere (the v0.99.34 bounded retry + the #186 graceful-Terminate
+// paths); recovery-shape tests shouldn't race that reaper.
+func reapSluiceWalsenders(t *testing.T, dsn string) {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("reapSluiceWalsenders: open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec(
+		`SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots
+		 WHERE active AND active_pid IS NOT NULL AND slot_name LIKE 'sluice%'`,
+	); err != nil {
+		t.Fatalf("reapSluiceWalsenders: terminate: %v", err)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		var n int
+		if err := db.QueryRow(
+			`SELECT count(*) FROM pg_replication_slots WHERE active AND slot_name LIKE 'sluice%'`,
+		).Scan(&n); err != nil {
+			t.Fatalf("reapSluiceWalsenders: poll: %v", err)
+		}
+		if n == 0 {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatal("reapSluiceWalsenders: sluice slots still active after 15s")
 }
