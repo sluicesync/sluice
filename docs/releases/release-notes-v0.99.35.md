@@ -1,5 +1,18 @@
 # sluice v0.99.35
 
+> ⚠️ **KNOWN ISSUE (Bug 135, found by the post-release battle-test; fix in
+> progress for v0.99.36): do NOT `--resume` a crashed/killed PARALLEL
+> `backup full` on this version.** Resuming a backup that was interrupted
+> while running with the new parallel sweep (the v0.99.35 default) can
+> produce a backup containing duplicate and missing rows while exiting 0
+> — detectable at restore time only on PK'd tables, and not at all on
+> tables without unique constraints. Fresh (uninterrupted) parallel
+> backups are correct, serial backups (`--table-parallelism=1`) resume
+> correctly, and v0.99.34 is unaffected. **Workaround:** if a parallel
+> backup is interrupted, discard the partial output and re-run fresh
+> instead of resuming — or run backups with `--table-parallelism=1`
+> until v0.99.36.
+
 **The backup surface, hardened and made fast — `backup full --chain-slot` provisions a zero-gap incremental chain in one flag (ADR-0083); two silent-loss chain bugs, a phantom-schema-delta bug, and a stop-restart walsender stall are closed; and cross-table parallelism (ADR-0084) lands on both `backup full` and `restore` with measured numbers: backup 2367 s → 881 s (2.7×) and a projected ~3 h restore done in 2810 s (≥3.8×) on a 133 GB / 43-table corpus. Drop-in from v0.99.34 with one default change: backups and restores now process 4 tables at a time by default — `--table-parallelism=1` restores the old serial behavior.**
 
 ## Features
