@@ -103,7 +103,7 @@ func TestSlotHealth_DefaultGUCUnlimited(t *testing.T) {
 
 	const slotName = "f13_pin_slot"
 
-	replConn, err := openReplicationConn(ctx, dsn)
+	replConn, err := openReplicationConn(ctx, dsn, "-")
 	if err != nil {
 		t.Fatalf("openReplicationConn: %v", err)
 	}
@@ -168,7 +168,7 @@ func TestSlotHealth_ExplicitGUCBytesConversion(t *testing.T) {
 	applyPGSQL(t, dsn, "SELECT pg_reload_conf()")
 
 	const slotName = "f13_explicit_guc_slot"
-	replConn, err := openReplicationConn(ctx, dsn)
+	replConn, err := openReplicationConn(ctx, dsn, "-")
 	if err != nil {
 		t.Fatalf("openReplicationConn: %v", err)
 	}

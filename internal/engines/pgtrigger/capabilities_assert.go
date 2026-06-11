@@ -25,6 +25,7 @@ import "sluicesync.dev/sluice/internal/ir"
 // Do NOT "fix" a missing-interface compile error by widening this
 // engine — that narrowness is load-bearing.
 var (
-	_ ir.Engine    = Engine{}
-	_ ir.CDCReader = (*CDCReader)(nil)
+	_ ir.Engine            = Engine{}
+	_ ir.ConnectionLabeler = Engine{}
+	_ ir.CDCReader         = (*CDCReader)(nil)
 )

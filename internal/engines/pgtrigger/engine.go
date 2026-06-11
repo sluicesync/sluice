@@ -87,12 +87,38 @@ const EngineName = "postgres-trigger"
 // this" error rather than dialing a non-existent slot.
 type Engine struct {
 	pg postgres.Engine
+
+	// appID is the connection-label id (see [Engine.WithConnectionLabel])
+	// for the trigger-native paths that open their own pools via
+	// [postgres.OpenPgxDB] (the CDC poller and the trigger-native
+	// snapshot); the delegated surfaces carry it inside the labeled
+	// composed engine. Empty (the zero value) gets the "-" fallback.
+	appID string
 }
 
 // Name reports the engine's short identifier. Registered as
 // "postgres-trigger"; the literal lives in [EngineName] so the CLI
 // and integration tests don't repeat it.
 func (Engine) Name() string { return EngineName }
+
+// WithConnectionLabel implements [ir.ConnectionLabeler]. It labels the
+// composed postgres engine — so every delegated Open* surface stamps
+// `sluice/<role>/<id>` exactly as vanilla PG does — and keeps the
+// normalized id for the trigger-native pools opened through
+// [postgres.OpenPgxDB]. Returns a configured copy; the registered
+// engine value stays label-free.
+func (e Engine) WithConnectionLabel(id string) ir.Engine {
+	if id == "" {
+		id = "-"
+	}
+	// The assertion cannot fail today — postgres.Engine.WithConnectionLabel
+	// returns its own concrete type — and if that ever changes, a panic
+	// here is the loud failure we want (silently keeping the unlabeled
+	// composed engine would quietly drop the operator's label).
+	e.pg = e.pg.WithConnectionLabel(id).(postgres.Engine)
+	e.appID = id
+	return e
+}
 
 // OpenSchemaReader delegates to the composed [postgres.Engine] — the
 // trigger engine's schema surface is byte-equivalent to vanilla PG.
@@ -153,8 +179,8 @@ func (Engine) Capabilities() ir.Capabilities { return capabilities }
 // `sluice trigger setup` before the first sync. The caller closes the
 // returned reader (via its Close method) to release the underlying
 // connection pool.
-func (Engine) OpenCDCReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
-	return openCDCReader(ctx, dsn)
+func (e Engine) OpenCDCReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
+	return openCDCReader(ctx, dsn, e.appID)
 }
 
 // capabilities is the static [ir.Capabilities] value the engine

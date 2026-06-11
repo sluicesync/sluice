@@ -52,17 +52,19 @@ type CDCReader struct {
 // openCDCReader constructs a [CDCReader] bound to dsn. The reader's
 // own *sql.DB pool is opened here so Close can release it cleanly;
 // the embedded postgres.Engine's connection lifecycle is not shared.
+// appID is the engine's connection-label id, stamped on the pool's
+// application_name (empty → the "-" fallback).
 //
 // Refuses with a clear error when `sluice_change_log` is absent —
 // the operator forgot to run `sluice trigger setup`. The refusal
 // fires at open time so the streamer surfaces it before any data
 // would move.
-func openCDCReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
+func openCDCReader(ctx context.Context, dsn, appID string) (ir.CDCReader, error) {
 	cfg, err := parseDSNCompat(dsn)
 	if err != nil {
 		return nil, err
 	}
-	db, err := postgres.OpenPgxDB(cfg.dsn)
+	db, err := postgres.OpenPgxDB(cfg.dsn, appID)
 	if err != nil {
 		return nil, fmt.Errorf("pgtrigger: cdc open: %w", err)
 	}

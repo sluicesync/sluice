@@ -204,7 +204,7 @@ func TestRowWriter_BatchedInsertPath(t *testing.T) {
 	// Construct the writer directly to force useCopy=false. The
 	// existing OpenRowWriter would have selected COPY; we want the
 	// fallback path here.
-	cfg, err := parseDSN(dsn)
+	cfg, err := Engine{}.parseDSN(dsn)
 	if err != nil {
 		t.Fatalf("parseDSN: %v", err)
 	}

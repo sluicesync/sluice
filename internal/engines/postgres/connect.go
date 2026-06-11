@@ -22,6 +22,7 @@ import (
 type pgConfig struct {
 	dsn    string // the DSN passed through to the driver, with `schema` stripped
 	schema string // the Postgres schema (namespace) to operate on
+	appID  string // stream-/migration-id for the application_name label; "" → "-" fallback
 }
 
 // parseDSN extracts the schema name from a Postgres DSN and returns a
@@ -36,15 +37,32 @@ type pgConfig struct {
 // In both cases the schema parameter is custom to sluice — Postgres
 // itself doesn't honour it. We strip it from the DSN before passing
 // the remainder to the driver, so pgx doesn't reject it as unknown.
-func parseDSN(dsn string) (*pgConfig, error) {
+//
+// It is an Engine method so the engine's connection-label id (see
+// [Engine.WithConnectionLabel]) rides along on the returned config —
+// every connection the engine opens flows through a pgConfig, which is
+// how the id reaches [withApplicationName] without any package-global
+// state. The zero-value Engine yields an empty appID, which the label
+// choke point normalises to the "-" fallback.
+func (e Engine) parseDSN(dsn string) (*pgConfig, error) {
 	if dsn == "" {
 		return nil, errors.New("postgres: DSN is empty")
 	}
 
+	var (
+		cfg *pgConfig
+		err error
+	)
 	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
-		return parseURIDSN(dsn)
+		cfg, err = parseURIDSN(dsn)
+	} else {
+		cfg, err = parseKVDSN(dsn)
 	}
-	return parseKVDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+	cfg.appID = e.appID
+	return cfg, nil
 }
 
 func parseURIDSN(dsn string) (*pgConfig, error) {
@@ -102,20 +120,21 @@ func parseKVDSN(dsn string) (*pgConfig, error) {
 // (the postgres engine's own pools and the postgres-trigger poller),
 // so the keep-alive policy is applied uniformly. The DSN must already
 // have any sluice-custom parameters (such as `schema`) stripped — see
-// [parseDSN].
+// [Engine.parseDSN].
 //
 // Connections opened here are labelled with the [roleControl]
-// application_name; the postgres engine's own pools call [openDBAs]
+// application_name carrying the given stream-/migration-id (empty →
+// the "-" fallback); the postgres engine's own pools call [openDBAs]
 // with a more specific role.
-func OpenPgxDB(dsn string) (*sql.DB, error) {
-	return openPgxDBAs(dsn, roleControl)
+func OpenPgxDB(dsn, label string) (*sql.DB, error) {
+	return openPgxDBAs(dsn, roleControl, label)
 }
 
 // openPgxDBAs is the role-aware variant behind [OpenPgxDB]. It stamps
-// the application_name for role (unless the operator already set one)
-// before handing the DSN to pgx.
-func openPgxDBAs(dsn string, role connRole) (*sql.DB, error) {
-	connConfig, err := pgx.ParseConfig(withApplicationName(dsn, role))
+// the application_name for role and id (unless the operator already
+// set one) before handing the DSN to pgx.
+func openPgxDBAs(dsn string, role connRole, appID string) (*sql.DB, error) {
+	connConfig, err := pgx.ParseConfig(withApplicationName(dsn, role, appID))
 	if err != nil {
 		return nil, fmt.Errorf("postgres: parse dsn: %w", err)
 	}
@@ -132,11 +151,12 @@ func openDB(ctx context.Context, cfg *pgConfig) (*sql.DB, error) {
 }
 
 // openDBAs is the role-aware variant of [openDB]: it stamps the
-// application_name for role on the connection (see [withApplicationName])
-// so the engine's snapshot / applier / cdc-reader / schema pools are
-// distinguishable in pg_stat_activity.
+// application_name for role and the config's stream-/migration-id on
+// the connection (see [withApplicationName]) so the engine's snapshot /
+// applier / cdc-reader / schema pools are distinguishable in
+// pg_stat_activity.
 func openDBAs(ctx context.Context, cfg *pgConfig, role connRole) (*sql.DB, error) {
-	db, err := openPgxDBAs(cfg.dsn, role)
+	db, err := openPgxDBAs(cfg.dsn, role, cfg.appID)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: open: %w", err)
 	}

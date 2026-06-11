@@ -43,6 +43,11 @@ type SnapshotImporter struct {
 	// can open a FRESH off-snapshot conn for the pre-stream chunk decision —
 	// the pinned import conn must never run that probe (ADR-0079 v1.1).
 	estimatorDSN string
+
+	// estimatorAppID is the stream-/migration-id segment of the
+	// application_name label for those off-snapshot estimator conns,
+	// threaded alongside estimatorDSN (empty → the "-" fallback).
+	estimatorAppID string
 }
 
 // Close releases the underlying connection pool. Callers should close
@@ -117,6 +122,7 @@ func (s *SnapshotImporter) ImportSnapshot(ctx context.Context, snapshotName stri
 			closer:         snapshotConnCloser{conn: conn},
 			snapshotPinned: true,
 			estimatorDSN:   s.estimatorDSN,
+			estimatorAppID: s.estimatorAppID,
 		}
 		readers = append(readers, rdr)
 	}
@@ -141,8 +147,8 @@ func (c snapshotConnCloser) Close() error {
 // database identified by dsn. Implements [ir.SnapshotImporterOpener];
 // the orchestrator type-asserts on this method when wiring N parallel
 // readers to a single exported snapshot.
-func (Engine) OpenSnapshotImporter(ctx context.Context, dsn string) (ir.SnapshotImporter, error) {
-	cfg, err := parseDSN(dsn)
+func (e Engine) OpenSnapshotImporter(ctx context.Context, dsn string) (ir.SnapshotImporter, error) {
+	cfg, err := e.parseDSN(dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -150,5 +156,5 @@ func (Engine) OpenSnapshotImporter(ctx context.Context, dsn string) (ir.Snapshot
 	if err != nil {
 		return nil, err
 	}
-	return &SnapshotImporter{db: db, schema: cfg.schema, estimatorDSN: cfg.dsn}, nil
+	return &SnapshotImporter{db: db, schema: cfg.schema, estimatorDSN: cfg.dsn, estimatorAppID: cfg.appID}, nil
 }

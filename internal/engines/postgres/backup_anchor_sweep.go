@@ -62,7 +62,7 @@ const backupAnchorOrphanMinAge = time.Hour
 // complexity tenet: slot lifecycle is surfaced explicitly, never
 // silently auto-handled.
 func (e Engine) SweepOrphanedBackupAnchors(ctx context.Context, dsn string) error {
-	cfg, err := parseDSN(dsn)
+	cfg, err := e.parseDSN(dsn)
 	if err != nil {
 		return err
 	}

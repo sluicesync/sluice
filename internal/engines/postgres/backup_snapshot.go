@@ -70,7 +70,7 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts ir.Back
 	if chainSlotName == "" {
 		chainSlotName = defaultSlot
 	}
-	cfg, err := parseDSN(dsn)
+	cfg, err := e.parseDSN(dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -163,7 +163,7 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts ir.Back
 	// keep it alive for the lifetime of the BackupSnapshot so the
 	// exported snapshot stays valid through the row sweep. Once we
 	// drop the slot in Close the conn is released too.
-	replConn, err := openReplicationConn(ctx, cfg.dsn)
+	replConn, err := openReplicationConn(ctx, cfg.dsn, cfg.appID)
 	if err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("postgres: backup snapshot: open replication conn: %w", err)

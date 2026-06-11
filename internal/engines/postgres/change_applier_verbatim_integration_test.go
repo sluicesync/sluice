@@ -37,7 +37,7 @@ func TestLoadColumnTypes_Bug97VerbatimEligibleTypes(t *testing.T) {
 	if dsn == "" {
 		t.Skip("PG_PROBE_DSN not set; export e.g. postgres://postgres:postgres@localhost:5443/postgres")
 	}
-	cfg, err := parseDSN(dsn)
+	cfg, err := Engine{}.parseDSN(dsn)
 	if err != nil {
 		t.Fatalf("parseDSN: %v", err)
 	}

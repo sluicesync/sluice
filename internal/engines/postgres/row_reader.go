@@ -79,6 +79,12 @@ type RowReader struct {
 	// snapshot_importer.go).
 	estimatorDSN string
 
+	// estimatorAppID is the stream-/migration-id segment of the
+	// application_name label for the off-snapshot estimator connection,
+	// threaded alongside estimatorDSN from the same mint sites (empty →
+	// the "-" fallback).
+	estimatorAppID string
+
 	mu  sync.Mutex
 	err error // sticky error from the most recent ReadRows call
 }

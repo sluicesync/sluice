@@ -33,13 +33,45 @@ import (
 // engine. Callers should check for it with [errors.Is].
 var ErrNotImplemented = errors.New("postgres engine: not implemented yet")
 
-// Engine is the Postgres implementation of [ir.Engine]. It is stateless;
-// each Open* call creates an independent connection.
-type Engine struct{}
+// Engine is the Postgres implementation of [ir.Engine]. Each Open* call
+// creates an independent connection. The value is cheap to copy and
+// holds no connection state — its only field is the connection-label id
+// (see [Engine.WithConnectionLabel]); the zero value is fully usable
+// and labels its connections with the stable `sluice/<role>/-` fallback,
+// so bare Go-API callers and `go test` paths behave exactly as before
+// the id existed.
+type Engine struct {
+	// appID is the stream-/migration-id segment of the application_name
+	// (`sluice/<role>/<appID>`) stamped on every connection this engine
+	// value opens. Set only via [Engine.WithConnectionLabel]; empty (the
+	// zero value) is normalised to "-" at the [withApplicationName]
+	// choke point.
+	appID string
+}
 
 // Name returns the engine's short identifier as used in configuration
 // files and on the command line.
 func (Engine) Name() string { return "postgres" }
+
+// Compile-time check that the engine keeps satisfying the CLI's
+// connection-labeling type-assertion (labelEngine in cmd/sluice).
+var _ ir.ConnectionLabeler = Engine{}
+
+// WithConnectionLabel implements [ir.ConnectionLabeler]: it returns a
+// copy of the engine configured to stamp `sluice/<role>/<id>` as the
+// application_name on every connection the copy opens, so operators can
+// find this run's sessions in pg_stat_activity and the stale-backend
+// probe can scope to its own stream. The CLI applies it once per run
+// with the resolved --stream-id / --migration-id, before any connection
+// opens. An empty id is normalised to "-" so the label stays
+// well-formed and greppable.
+func (e Engine) WithConnectionLabel(id string) ir.Engine {
+	if id == "" {
+		id = "-"
+	}
+	e.appID = id
+	return e
+}
 
 // Capabilities returns the static capability declaration for vanilla
 // PostgreSQL (14+ baseline). Service variants — Aurora Postgres, GCP
@@ -64,8 +96,8 @@ func (Engine) HasCrossEngineDefaultTranslator(name string) bool {
 //
 // The caller is responsible for closing the returned SchemaReader
 // (via its Close method) to release the underlying connection pool.
-func (Engine) OpenSchemaReader(ctx context.Context, dsn string) (ir.SchemaReader, error) {
-	cfg, err := parseDSN(dsn)
+func (e Engine) OpenSchemaReader(ctx context.Context, dsn string) (ir.SchemaReader, error) {
+	cfg, err := e.parseDSN(dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -82,8 +114,8 @@ func (Engine) OpenSchemaReader(ctx context.Context, dsn string) (ir.SchemaReader
 //
 // The caller is responsible for closing the returned SchemaWriter
 // (via its Close method) to release the underlying connection pool.
-func (Engine) OpenSchemaWriter(ctx context.Context, dsn string) (ir.SchemaWriter, error) {
-	cfg, err := parseDSN(dsn)
+func (e Engine) OpenSchemaWriter(ctx context.Context, dsn string) (ir.SchemaWriter, error) {
+	cfg, err := e.parseDSN(dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -102,8 +134,8 @@ func (Engine) OpenSchemaWriter(ctx context.Context, dsn string) (ir.SchemaWriter
 // OpenRowReader returns a [RowReader] bound to the database identified
 // by dsn. The caller is responsible for closing the returned RowReader
 // (via its Close method) to release the underlying connection pool.
-func (Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, error) {
-	cfg, err := parseDSN(dsn)
+func (e Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, error) {
+	cfg, err := e.parseDSN(dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -122,7 +154,7 @@ func (Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, erro
 // RowWriter (via its Close method) to release the underlying
 // connection pool.
 func (e Engine) OpenRowWriter(ctx context.Context, dsn string) (ir.RowWriter, error) {
-	cfg, err := parseDSN(dsn)
+	cfg, err := e.parseDSN(dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -163,11 +195,11 @@ func (e Engine) OpenCDCReader(ctx context.Context, dsn string) (ir.CDCReader, er
 // supplies `--slot-name` on `sync start`. Empty slotName is replaced
 // with the default `sluice_slot` so the same code path serves both
 // the default and the override case.
-func (Engine) OpenCDCReaderWithSlot(ctx context.Context, dsn, slotName string) (ir.CDCReader, error) {
+func (e Engine) OpenCDCReaderWithSlot(ctx context.Context, dsn, slotName string) (ir.CDCReader, error) {
 	if slotName == "" {
 		slotName = defaultSlot
 	}
-	cfg, err := parseDSN(dsn)
+	cfg, err := e.parseDSN(dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -179,6 +211,7 @@ func (Engine) OpenCDCReaderWithSlot(ctx context.Context, dsn, slotName string) (
 		db:           db,
 		schema:       cfg.schema,
 		dsn:          cfg.dsn,
+		appID:        cfg.appID,
 		publication:  defaultPublication,
 		slotName:     slotName,
 		protoVersion: 2,
@@ -198,8 +231,8 @@ func (Engine) OpenCDCReaderWithSlot(ctx context.Context, dsn, slotName string) (
 // Discovered by the [pipeline.Streamer] via structural interface
 // (publicationEnsurer); engines that don't have logical-replication
 // publications simply omit the method.
-func (Engine) EnsurePublication(ctx context.Context, dsn string, tables []string) error {
-	cfg, err := parseDSN(dsn)
+func (e Engine) EnsurePublication(ctx context.Context, dsn string, tables []string) error {
+	cfg, err := e.parseDSN(dsn)
 	if err != nil {
 		return err
 	}
@@ -227,8 +260,8 @@ func (Engine) EnsurePublication(ctx context.Context, dsn string, tables []string
 // pipeline.AddTable orchestrator via structural interface
 // (publicationAdder); engines without publications simply omit the
 // method.
-func (Engine) AddPublicationTables(ctx context.Context, dsn string, tables []string) error {
-	cfg, err := parseDSN(dsn)
+func (e Engine) AddPublicationTables(ctx context.Context, dsn string, tables []string) error {
+	cfg, err := e.parseDSN(dsn)
 	if err != nil {
 		return err
 	}
@@ -333,11 +366,11 @@ func (e Engine) PrecedesOrEqual(a, b ir.Position) (bool, error) {
 //
 // Discovered structurally on the pipeline side via slotPositionReader;
 // engines without replication slots simply omit the method.
-func (Engine) ReadSlotPosition(ctx context.Context, dsn, slotName string) (string, error) {
+func (e Engine) ReadSlotPosition(ctx context.Context, dsn, slotName string) (string, error) {
 	if slotName == "" {
 		return "", errors.New("postgres: read slot position: slot name is empty")
 	}
-	cfg, err := parseDSN(dsn)
+	cfg, err := e.parseDSN(dsn)
 	if err != nil {
 		return "", err
 	}
@@ -375,8 +408,8 @@ func (Engine) ReadSlotPosition(ctx context.Context, dsn, slotName string) (strin
 // simply omit the method. The diagnostic instrumentation is best-
 // effort: a query failure logs at WARN and returns empty, since this
 // is purely diagnostic and must not abort the live add.
-func (Engine) ReadCurrentWALPosition(ctx context.Context, dsn string) (string, error) {
-	cfg, err := parseDSN(dsn)
+func (e Engine) ReadCurrentWALPosition(ctx context.Context, dsn string) (string, error) {
+	cfg, err := e.parseDSN(dsn)
 	if err != nil {
 		return "", err
 	}
@@ -401,8 +434,8 @@ func (Engine) ReadCurrentWALPosition(ctx context.Context, dsn string) (string, e
 // Implements [ir.SlotManagerOpener]; the CLI checks for this method
 // via type assertion so engines without slot management (e.g. MySQL)
 // can simply omit the method.
-func (Engine) OpenSlotManager(ctx context.Context, dsn string) (ir.SlotManager, error) {
-	cfg, err := parseDSN(dsn)
+func (e Engine) OpenSlotManager(ctx context.Context, dsn string) (ir.SlotManager, error) {
+	cfg, err := e.parseDSN(dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -418,8 +451,8 @@ func (Engine) OpenSlotManager(ctx context.Context, dsn string) (ir.SlotManager, 
 // [ir.MigrationStateStoreOpener]; the pipeline orchestrator type-
 // asserts on this method so engines without a SQL surface for
 // resumable migrations can omit it.
-func (Engine) OpenMigrationStateStore(ctx context.Context, dsn string) (ir.MigrationStateStore, error) {
-	cfg, err := parseDSN(dsn)
+func (e Engine) OpenMigrationStateStore(ctx context.Context, dsn string) (ir.MigrationStateStore, error) {
+	cfg, err := e.parseDSN(dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -437,8 +470,8 @@ func (Engine) OpenMigrationStateStore(ctx context.Context, dsn string) (ir.Migra
 //
 // See the [ChangeApplier] doc comment for important details about
 // no-PK and unique-key-without-PK tables.
-func (Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeApplier, error) {
-	cfg, err := parseDSN(dsn)
+func (e Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeApplier, error) {
+	cfg, err := e.parseDSN(dsn)
 	if err != nil {
 		return nil, err
 	}

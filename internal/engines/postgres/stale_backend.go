@@ -285,8 +285,8 @@ func pgIntArray(i []int) any { return i }
 // error: the orchestrator logs the warning and proceeds. Only a
 // connection-open failure surfaces as a non-nil error (the operator's own
 // DSN is wrong — worth failing on, same as every other Open*).
-func (Engine) DetectStaleBackends(ctx context.Context, dsn string, schemas []string, reap bool) (ir.StaleBackendReport, error) {
-	cfg, err := parseDSN(dsn)
+func (e Engine) DetectStaleBackends(ctx context.Context, dsn string, schemas []string, reap bool) (ir.StaleBackendReport, error) {
+	cfg, err := e.parseDSN(dsn)
 	if err != nil {
 		return ir.StaleBackendReport{}, err
 	}

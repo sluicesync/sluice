@@ -31,7 +31,7 @@ func TestProbeConnectionBudget_SaneNumbers(t *testing.T) {
 	dsn, cleanup := startPostgres(t)
 	defer cleanup()
 
-	cfg, err := parseDSN(dsn)
+	cfg, err := Engine{}.parseDSN(dsn)
 	if err != nil {
 		t.Fatalf("parseDSN: %v", err)
 	}

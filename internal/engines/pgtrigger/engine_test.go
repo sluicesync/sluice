@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/engines/postgres"
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -58,6 +59,30 @@ func TestEngine_Capabilities(t *testing.T) {
 	}
 	if c.DDLDialect != ir.DDLDialectANSI {
 		t.Errorf("DDLDialect = %v; want DDLDialectANSI", c.DDLDialect)
+	}
+}
+
+// TestEngine_WithConnectionLabel pins the [ir.ConnectionLabeler]
+// surface: the id is normalised and stored for the trigger-native
+// pools (the CDC poller / trigger-native snapshot, opened through
+// postgres.OpenPgxDB), AND the composed postgres engine is labeled too
+// — the delegated schema/row/applier surfaces must carry the same id,
+// not silently keep the "-" fallback.
+func TestEngine_WithConnectionLabel(t *testing.T) {
+	labeled, ok := Engine{}.WithConnectionLabel("mystream").(Engine)
+	if !ok {
+		t.Fatal("WithConnectionLabel should return the concrete pgtrigger.Engine")
+	}
+	if labeled.appID != "mystream" {
+		t.Errorf("appID = %q, want %q", labeled.appID, "mystream")
+	}
+	if labeled.pg == (postgres.Engine{}) {
+		t.Error("composed postgres engine was not labeled; delegated surfaces would silently keep the \"-\" fallback")
+	}
+
+	empty := Engine{}.WithConnectionLabel("").(Engine)
+	if empty.appID != "-" {
+		t.Errorf("empty id should normalise to %q, got %q", "-", empty.appID)
 	}
 }
 

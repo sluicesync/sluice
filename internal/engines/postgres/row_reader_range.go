@@ -255,7 +255,7 @@ func (r *RowReader) reltuplesOffConn(ctx context.Context, table *ir.Table) (int6
 		// delegating engine that didn't set it): no estimate, single-stream.
 		return 0, nil
 	}
-	db, err := openDB(ctx, &pgConfig{dsn: r.estimatorDSN, schema: r.schema})
+	db, err := openDB(ctx, &pgConfig{dsn: r.estimatorDSN, schema: r.schema, appID: r.estimatorAppID})
 	if err != nil {
 		return 0, fmt.Errorf("postgres: EstimateRowCount open: %w", err)
 	}
