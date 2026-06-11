@@ -867,6 +867,11 @@ func (b *BackupStream) resolveParent(ctx context.Context) (*ir.Manifest, string,
 				id = ir.ComputeBackupID(m.manifest)
 			}
 			if id == b.ParentRef {
+				// Task #42 (ADR-0085): an in-progress parent (crashed
+				// full or window) cannot anchor a chain extension.
+				if err := refuseInProgressParent(m.manifest, m.path); err != nil {
+					return nil, "", err
+				}
 				return m.manifest, m.path, nil
 			}
 		}
@@ -883,6 +888,9 @@ func (b *BackupStream) resolveParent(ctx context.Context) (*ir.Manifest, string,
 	// off the second-to-last link and branch the lineage (ADR-0046
 	// crash-matrix `pre-commit-write` flake, v0.67.0).
 	tail := chainTailManifest(ctx, b.Store, manifests)
+	if err := refuseInProgressParent(tail.manifest, tail.path); err != nil {
+		return nil, "", err
+	}
 	return tail.manifest, tail.path, nil
 }
 

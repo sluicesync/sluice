@@ -489,6 +489,9 @@ func (b *IncrementalBackup) resolveParent(ctx context.Context) (*ir.Manifest, st
 				id = ir.ComputeBackupID(m.manifest)
 			}
 			if id == b.ParentRef {
+				if err := refuseInProgressParent(m.manifest, m.path); err != nil {
+					return nil, "", err
+				}
 				return m.manifest, m.path, nil
 			}
 		}
@@ -498,7 +501,30 @@ func (b *IncrementalBackup) resolveParent(ctx context.Context) (*ir.Manifest, st
 	// Resume off the chain TAIL (open segment append order), NOT
 	// max CreatedAt. See [chainTailManifest].
 	tail := chainTailManifest(ctx, b.Store, manifests)
+	if err := refuseInProgressParent(tail.manifest, tail.path); err != nil {
+		return nil, "", err
+	}
 	return tail.manifest, tail.path, nil
+}
+
+// refuseInProgressParent refuses to extend a chain off a manifest whose
+// PartialState is still "in_progress" — a crashed (or still running)
+// `backup full`. Required by task #42 (ADR-0085): in-progress full
+// manifests now carry their chain anchor from the first write, so
+// without this guard an incremental would silently chain at the anchor
+// of a full whose row chunks are incomplete — restore would be missing
+// tables while exiting 0. (Incremental/stream manifests are only ever
+// persisted in their complete state, so in practice this fires only on
+// a crashed full at the chain root.)
+func refuseInProgressParent(m *ir.Manifest, path string) error {
+	if m == nil || m.PartialState != ir.BackupStateInProgress {
+		return nil
+	}
+	return fmt.Errorf(
+		"parent backup manifest %q records an interrupted run (partial_state=in_progress); a chain cannot extend from an incomplete link. "+
+			"Finish it first — re-running the same `backup full` command resumes an interrupted full — or start a fresh chain with `backup full --force-overwrite`",
+		path,
+	)
 }
 
 // chainTailManifest returns the chain tail to resume an incremental

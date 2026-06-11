@@ -155,15 +155,19 @@ type BackupSnapshot struct {
 	SnapshotName string
 
 	// CommitFn, when non-nil, is called by the orchestrator exactly
-	// once after the backup's final manifest commit succeeds — i.e.
-	// the moment the backup becomes a durable, complete chain root.
-	// Engines use it to persist run-scoped resources that must
-	// outlive a SUCCESSFUL run but not a failed one: the Postgres
-	// --chain-slot path keeps the persistent chain slot (anchored at
-	// Position) instead of dropping it in Close. After Commit, Close
-	// must still be called; it releases connections but skips
-	// dropping committed resources. nil when the engine has nothing
-	// to persist (the default temporary-anchor shape).
+	// once, the moment the run's in-progress manifest durably records
+	// the chain anchor (task #42, ADR-0085; previously: after the
+	// final manifest commit). Engines use it to persist run-scoped
+	// resources that must outlive the run once anything durable
+	// references them: the Postgres --chain-slot path keeps the
+	// persistent chain slot (anchored at Position) instead of
+	// dropping it in Close — including across a LATER failure of the
+	// same run, because the slot is the WAL-retention guarantee a
+	// resumed run adopts. A run that fails before the manifest is
+	// durable still drops the slot via the uncommitted Close. After
+	// Commit, Close must still be called; it releases connections but
+	// skips dropping committed resources. nil when the engine has
+	// nothing to persist (the default temporary-anchor shape).
 	CommitFn func(ctx context.Context) error
 }
 

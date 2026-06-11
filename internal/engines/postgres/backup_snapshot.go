@@ -53,8 +53,11 @@ const backupSnapshotSlotPrefix = "sluice_backup_anchor_"
 //     consistent point IS the recorded EndPosition and `backup
 //     incremental` chains with zero gap by construction. The slot is
 //     kept only when the orchestrator calls [ir.BackupSnapshot.Commit]
-//     (backup completed); a failed run's Close drops it so retries
-//     start clean. The publication the CDC reader decodes through is
+//     — since task #42 (ADR-0085) that happens once the run's
+//     in-progress manifest durably records the anchor, so an
+//     interrupted-but-resumable run keeps the slot for resume adoption;
+//     a run that fails before that point Closes uncommitted and drops
+//     it. The publication the CDC reader decodes through is
 //     ensured here too — pgoutput evaluates publication membership
 //     with a HISTORIC catalog snapshot, so a publication created
 //     after the anchor cannot decode the chain's first window.
@@ -118,11 +121,20 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts ir.Back
 	if info != nil {
 		_ = db.Close()
 		if opts.PersistChainSlot {
+			// Recovery wording (task #42, ADR-0085): a crashed
+			// --chain-slot backup's slot is the WAL-retention guarantee
+			// for a sound resume — re-running the same backup ADOPTS it
+			// (the resume opens a temporary anchor, so it never reaches
+			// this refusal). The pre-fix message advised drop+retry as
+			// crash recovery, which released the gap-covering WAL and
+			// funneled straight into the silent chain gap.
 			return nil, fmt.Errorf(
 				"postgres: backup snapshot: --chain-slot: replication slot %q already exists. "+
 					"It may belong to a running `sluice sync` (which already retains WAL for chaining — omit --chain-slot and chain off its position), "+
-					"a previous crashed --chain-slot backup (drop it via `sluice slot drop %s` and retry), "+
-					"or another consumer (pass a different --slot-name)",
+					"an interrupted --chain-slot backup (re-run the SAME `backup full` command against the same destination — resume adopts the slot and its anchor; "+
+					"do NOT drop the slot to recover, that releases the WAL the resume needs), "+
+					"or another consumer (pass a different --slot-name). "+
+					"Only for a deliberate fresh start: drop it via `sluice slot drop %s` and pass --force-overwrite",
 				anchorSlot, anchorSlot,
 			)
 		}

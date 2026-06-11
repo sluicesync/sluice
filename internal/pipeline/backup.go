@@ -47,6 +47,23 @@ package pipeline
 // The manifest is committed to the store after every table completes,
 // so a crashed run leaves at most tableParallelism tables' worth of
 // in-flight work to redo (one table's, when the sweep runs serial).
+//
+// # Resume anchor adoption (task #42, ADR-0085)
+//
+// A resumed run keeps the prior attempt's completed tables VERBATIM —
+// those chunks are exact as-of the PRIOR attempt's snapshot anchor. So
+// the chain-handoff position the resumed run records (EndPosition)
+// must be that prior anchor, never the fresh snapshot's: writes that
+// landed on kept tables between the two anchors are in neither the
+// kept chunks nor a next-incremental window opened at the new anchor —
+// a silent chain gap with exit 0. The in-progress manifest therefore
+// carries the anchor from its FIRST write, and a resume ADOPTS it
+// (min-anchor rule); the resumed run's fresh snapshot serves only read
+// consistency for tables streamed this run. Re-streamed tables overlap
+// the chain's replay window — sound for keyed tables (the chain
+// appliers are idempotent, ADR-0010), refused loudly for truly keyless
+// ones. Pre-fix in-progress manifests (no recorded anchor) re-stream
+// every table instead.
 
 import (
 	"bytes"
@@ -57,6 +74,7 @@ import (
 	"io"
 	"log/slog"
 	"path"
+	"strings"
 	"time"
 
 	"sluicesync.dev/sluice/internal/crypto"
@@ -215,8 +233,11 @@ type Backup struct {
 	// resolves publications with a historic catalog snapshot, so a
 	// later-created publication cannot decode the chain's first
 	// window). Engines without a slot concept (MySQL) log a loud
-	// no-op. The slot is dropped if the backup fails, so retries
-	// start clean. See [ir.BackupSnapshotOptions].
+	// no-op. The slot is dropped only when the run fails BEFORE its
+	// in-progress manifest durably records the anchor; after that it
+	// is kept even across a failure — it is the WAL-retention
+	// guarantee a resumed run adopts (task #42, ADR-0085). See
+	// [ir.BackupSnapshotOptions].
 	ChainSlot bool
 
 	// TableParallelism caps how many tables stream CONCURRENTLY during
@@ -236,7 +257,10 @@ type Backup struct {
 	// `partial_state == "complete"` manifest at the destination is an
 	// operator-actionable error. This is the analog of
 	// `migrate --reset-target-data` for the backup verb. In-progress
-	// manifests always resume regardless of this flag.
+	// manifests resume by default; with this flag set they are
+	// DISCARDED and the run starts fresh — the escape hatch the resume
+	// guards (schema drift, keyless re-stream, chain-slot preflight;
+	// task #42 / ADR-0085) name in their refusals.
 	ForceOverwrite bool
 
 	// Encryption, when non-nil, encrypts every chunk this run writes.
@@ -292,53 +316,15 @@ func (b *Backup) Run(ctx context.Context) error {
 		b.Filter = eff
 	}
 
-	// 0. Resume detection: if a manifest already exists in the store,
-	// decide whether to fresh-start, resume, or refuse.
-	prior, priorErr := readManifestIfPresent(ctx, b.Store)
-	if priorErr != nil {
-		return fmt.Errorf("backup: inspect existing manifest: %w", priorErr)
+	// 0. Resume detection + anchor adoption: decide whether to
+	// fresh-start, resume (adopting the prior attempt's anchor), or
+	// refuse — and preflight a --chain-slot adoption — before anything
+	// new is opened on the source.
+	prior, resumeAnchor, err := b.resolveResumeState(ctx)
+	if err != nil {
+		return err
 	}
-	if prior != nil {
-		switch prior.PartialState {
-		case ir.BackupStateInProgress:
-			// Bug 34a: emit a clear "resuming" log line so operators
-			// can see resume happened. The detailed per-table fan-out
-			// (which tables to skip vs resume) follows once the schema
-			// is read; this is the headline.
-			slog.InfoContext(
-				ctx, "resuming from partial backup",
-				slog.String("backup_dir", backupStoreDescriptor(b.Store)),
-				slog.Int("tables_in_prior_manifest", len(prior.Tables)),
-				slog.Time("prior_created_at", prior.CreatedAt),
-			)
-			// Bug 137: an in-progress manifest proves a prior run died
-			// mid-flight. Backups crashed under pre-fix binaries left a
-			// persistent anchor replication slot on the source, each one
-			// silently pinning WAL until the disk fills — give the
-			// engine its chance to sweep that debris now. Best-effort
-			// hygiene via the optional [ir.BackupAnchorSweeper] surface:
-			// a sweep failure must not fail the resume itself.
-			if sweeper, ok := b.Source.(ir.BackupAnchorSweeper); ok {
-				if err := sweeper.SweepOrphanedBackupAnchors(ctx, b.SourceDSN); err != nil {
-					slog.WarnContext(
-						ctx, "backup: orphaned-anchor sweep failed; stale anchor slots may still be retaining WAL on the source",
-						slog.String("engine", b.Source.Name()),
-						slog.String("err", err.Error()),
-					)
-				}
-			}
-		case ir.BackupStateComplete, "":
-			if !b.ForceOverwrite {
-				return fmt.Errorf("backup: a completed backup already exists at this destination (created %s); pass --force-overwrite to replace it",
-					prior.CreatedAt.UTC().Format(time.RFC3339))
-			}
-			slog.InfoContext(
-				ctx, "backup: --force-overwrite set; replacing existing complete backup",
-				slog.Time("prior_created_at", prior.CreatedAt),
-			)
-			prior = nil // discard so we start from scratch
-		}
-	}
+	adopting := resumeAnchor.Engine != "" || resumeAnchor.Token != ""
 
 	// 1. Read source schema.
 	sr, err := b.Source.OpenSchemaReader(ctx, b.SourceDSN)
@@ -376,6 +362,18 @@ func (b *Backup) Run(ctx context.Context) error {
 		return err
 	}
 
+	// 2.5. Schema-stability guard for anchored resume (task #42): the
+	// adopted anchor claims "kept chunks + CDC replay from the anchor
+	// converge to source state", which DDL between the two attempts
+	// breaks — the kept chunks and the new schema disagree, and the
+	// replay window carries events shaped by a schema the manifest
+	// never recorded. Refuse before the snapshot opens.
+	if adopting {
+		if err := refuseAnchoredResumeOnSchemaDrift(schema, prior.Schema); err != nil {
+			return err
+		}
+	}
+
 	// 3. Open the row reader. v0.18.0: prefer the snapshot-anchored
 	// path that captures EndPosition at snapshot START and pins all
 	// table reads to a cross-table consistent view, closing the
@@ -388,7 +386,12 @@ func (b *Backup) Run(ctx context.Context) error {
 	// carry the during-backup write-window gap. One-shot full backups
 	// without CDC are still legitimate; chain correctness is the only
 	// thing that needs the snapshot path.
-	rr, snapshotPos, snap, snapshotCloser, err := b.openSnapshotOrFallback(ctx, schema)
+	//
+	// On an anchored resume the persistent chain slot is NOT re-created
+	// (it already exists at the adopted anchor — see the adoption
+	// preflight above): the snapshot opens in the temporary-anchor
+	// shape, serving only read consistency for tables streamed THIS run.
+	rr, snapshotPos, snap, snapshotCloser, err := b.openSnapshotOrFallback(ctx, schema, b.ChainSlot && !adopting)
 	if err != nil {
 		return err
 	}
@@ -429,6 +432,18 @@ func (b *Backup) Run(ctx context.Context) error {
 		// not the resume point.
 		manifest.CreatedAt = prior.CreatedAt
 	}
+	// Task #42 (ADR-0085): stamp the chain anchor on the IN-PROGRESS
+	// manifest from its first write, so a crashed run leaves the anchor
+	// a future resume must adopt. A resumed run stamps the ADOPTED
+	// prior-attempt anchor — never this run's fresh snapshot position.
+	// The non-snapshot fallback path has no anchor yet and keeps its
+	// post-sweep capture (step 4.5).
+	switch {
+	case adopting:
+		manifest.EndPosition = resumeAnchor
+	case snapshotPos != nil:
+		manifest.EndPosition = *snapshotPos
+	}
 
 	// Phase 6.1: when encryption is enabled, generate the chain-level
 	// CEK (per-chain mode) up-front, wrap it via the envelope, and
@@ -441,6 +456,23 @@ func (b *Backup) Run(ctx context.Context) error {
 	}
 
 	priorTables := indexManifestTables(priorResumableTables(prior))
+	if len(priorTables) > 0 && !adopting && snapshotPos != nil {
+		// Pre-anchor-adoption in-progress manifest (no recorded
+		// EndPosition) under a snapshot-anchored run: keeping its
+		// completed tables verbatim would pair old-anchor chunks with
+		// this run's NEW anchor — exactly the silent chain gap ADR-0085
+		// closes. Re-stream everything instead; the content-addressed
+		// same-path upload skip still avoids re-uploading identical
+		// bytes. The v0.17.x non-snapshot fallback is deliberately NOT
+		// in scope: it records no snapshot anchor (post-sweep capture,
+		// documented during-backup gap), so kept tables introduce no
+		// NEW gap there and table-level resume stays.
+		slog.WarnContext(
+			ctx, "backup: prior in-progress manifest carries no anchor (written by a pre-anchor-adoption binary); its completed tables cannot be kept safely — re-streaming every table from this run's snapshot",
+			slog.String("reason", "kept tables would be exact as-of an unknown earlier anchor; recording this run's anchor over them would silently gap the chain (ADR-0085)"),
+		)
+		priorTables = nil
+	}
 
 	// Bug 34a: Once the schema is in hand, fan out the resume decision
 	// per-table so operators can see exactly what's being resumed and
@@ -491,6 +523,37 @@ func (b *Backup) Run(ctx context.Context) error {
 		return err
 	}
 
+	// Task #42 guard: on an anchored resume, every (re-)streamed table's
+	// chunks are read at THIS run's later snapshot, so they overlap the
+	// chain's replay window (adopted anchor, stop]. The overlap converges
+	// only because the chain appliers are idempotent on a key (ADR-0010);
+	// a truly keyless table falls back to plain INSERT and would
+	// duplicate the overlapping rows — refuse loudly. Kept tables may be
+	// keyless: they are exact at the adopted anchor, no overlap.
+	if adopting {
+		if err := refuseKeylessRestreamOnAnchoredResume(tasks); err != nil {
+			return err
+		}
+	}
+
+	// Task #42 (ADR-0085): make the anchor-stamped in-progress manifest
+	// durable BEFORE the sweep, so every crash from here on leaves a
+	// resumable record carrying the anchor. For a fresh --chain-slot run
+	// this is also the moment the chain slot becomes load-bearing: once
+	// a durable manifest references the anchor, a later failure must NOT
+	// drop the slot (it is the WAL-retention guarantee a resume adopts),
+	// so the snapshot is committed NOW rather than after the final
+	// manifest write. A failure before this point still drops the slot
+	// via the deferred Close — nothing references it yet. On a resumed
+	// run (temporary-anchor shape) and on non-chain-slot runs Commit is
+	// a no-op.
+	if err := committer.commit(ctx); err != nil {
+		return fmt.Errorf("backup: write in-progress manifest: %w", err)
+	}
+	if err := snap.Commit(ctx); err != nil {
+		return fmt.Errorf("backup: persist chain resources: %w", err)
+	}
+
 	snapshotName := ""
 	if snap != nil {
 		snapshotName = snap.SnapshotName
@@ -509,8 +572,14 @@ func (b *Backup) Run(ctx context.Context) error {
 		return err
 	}
 
-	// 4.5. Record EndPosition. Two paths:
+	// 4.5. Record EndPosition. Three paths:
 	//
+	//   - anchored resume (task #42, ADR-0085): the manifest keeps the
+	//     ADOPTED prior-attempt anchor stamped at creation. This run's
+	//     fresh snapshot position must NOT overwrite it — kept tables
+	//     are exact at the adopted anchor, and CDC from there covers
+	//     everything after it (re-streamed tables' overlap converges
+	//     under the idempotent chain appliers).
 	//   - v0.18.0 snapshot-anchored: snapshotPos was captured at
 	//     snapshot START before the row sweep. The row sweep's reads
 	//     all observe the source AS-OF this position, and CDC from
@@ -522,15 +591,30 @@ func (b *Backup) Run(ctx context.Context) error {
 	//     This is the v0.17.2 shape with the documented during-backup
 	//     write-window gap; the openSnapshotOrFallback step has
 	//     already logged a WARN line so operators know.
-	if snapshotPos != nil {
+	switch {
+	case adopting:
+		manifest.EndPosition = resumeAnchor // re-assert: nothing may overwrite the adopted anchor
+		thisRunToken := "<none — v0.17.x fallback read>"
+		if snapshotPos != nil {
+			thisRunToken = snapshotPos.Token
+		}
+		slog.WarnContext(
+			ctx, "backup: resumed run recorded the interrupted attempt's anchor as EndPosition (adoption); this run's snapshot served only read consistency for re-streamed tables",
+			slog.String("engine", manifest.SourceEngine),
+			slog.String("adopted_position_token", resumeAnchor.Token),
+			slog.String("this_run_snapshot_token", thisRunToken),
+		)
+	case snapshotPos != nil:
 		manifest.EndPosition = *snapshotPos
 		slog.InfoContext(
 			ctx, "backup: recorded end position (snapshot-anchored)",
 			slog.String("engine", manifest.SourceEngine),
 			slog.String("position_token", snapshotPos.Token),
 		)
-	} else if err := b.captureEndPosition(ctx, manifest); err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("backup: capture end position: %w", err))
+	default:
+		if err := b.captureEndPosition(ctx, manifest); err != nil {
+			return wrapWithHint(PhaseConnect, fmt.Errorf("backup: capture end position: %w", err))
+		}
 	}
 
 	// Compute BackupID once EndPosition is known. The id is used by
@@ -547,14 +631,10 @@ func (b *Backup) Run(ctx context.Context) error {
 	if err := committer.commit(ctx); err != nil {
 		return fmt.Errorf("backup: write final manifest: %w", err)
 	}
-	// The backup is durable from here — persist run-scoped chain
-	// resources (--chain-slot: keep the slot anchored at EndPosition).
-	// A commit failure is loud: the backup itself is complete, but the
-	// chain the operator asked for was not provisioned, and the
-	// deferred Close will drop the un-committed slot.
-	if err := snap.Commit(ctx); err != nil {
-		return fmt.Errorf("backup: persist chain resources: %w", err)
-	}
+	// Chain resources (--chain-slot: the slot anchored at EndPosition)
+	// were already persisted by the pre-sweep snap.Commit above — they
+	// must survive a mid-sweep failure so a resume can adopt them
+	// (task #42, ADR-0085).
 	// ADR-0046: seed / update lineage.json. A full backup is segment 0
 	// of a one-segment lineage at the conventional root (Dir == "").
 	// Best-effort — the manifest file is authoritative for the
@@ -575,6 +655,105 @@ func (b *Backup) Run(ctx context.Context) error {
 		slog.Int("chunks", totalChunks),
 	)
 	return nil
+}
+
+// resolveResumeState is Run's step 0: inspect any pre-existing manifest
+// at the destination and decide whether to fresh-start (prior == nil),
+// resume (prior != nil; resumeAnchor carries the interrupted attempt's
+// anchor when it recorded one), or refuse.
+//
+// Resume anchor adoption (task #42, ADR-0085): the prior attempt's
+// completed tables are kept verbatim — exact as-of the PRIOR anchor —
+// so the position the resumed run records must be that prior anchor
+// (min-anchor rule), never this run's fresh snapshot position.
+// resumeAnchor stays zero when there is nothing to adopt: a fresh run,
+// or a prior manifest written by a pre-fix binary (those never stamped
+// EndPosition while in progress; Run's re-stream-everything fallback
+// handles them).
+//
+// A --chain-slot resume is an ADOPTION, not a creation: the prior
+// attempt's persistent chain slot already stands at the adopted anchor
+// and IS the chain's WAL-retention guarantee. It is preflighted here,
+// BEFORE anything opens on the source — a slot that is missing or has
+// advanced past the anchor cannot serve the gap WAL, and resuming
+// anyway would silently skip it. The adopted slot is never created,
+// committed, or dropped by the resumed run: its snapshot opens in the
+// temporary-anchor shape (PersistChainSlot=false), so even a failed
+// resume leaves the chain slot standing.
+func (b *Backup) resolveResumeState(ctx context.Context) (prior *ir.Manifest, resumeAnchor ir.Position, err error) {
+	prior, err = readManifestIfPresent(ctx, b.Store)
+	if err != nil {
+		return nil, ir.Position{}, fmt.Errorf("backup: inspect existing manifest: %w", err)
+	}
+	if prior == nil {
+		return nil, ir.Position{}, nil
+	}
+	switch prior.PartialState {
+	case ir.BackupStateInProgress:
+		if b.ForceOverwrite {
+			// Task #42 (ADR-0085): --force-overwrite now also discards
+			// an in-progress prior — it is the escape hatch the resume
+			// guards (schema drift, keyless re-stream, chain-slot
+			// preflight) point operators at, so it must actually
+			// produce a fresh start.
+			slog.InfoContext(
+				ctx, "backup: --force-overwrite set; discarding in-progress prior backup and starting fresh",
+				slog.Time("prior_created_at", prior.CreatedAt),
+			)
+			return nil, ir.Position{}, nil
+		}
+		// Bug 34a: emit a clear "resuming" log line so operators can
+		// see resume happened. The detailed per-table fan-out (which
+		// tables to skip vs resume) follows once the schema is read;
+		// this is the headline.
+		slog.InfoContext(
+			ctx, "resuming from partial backup",
+			slog.String("backup_dir", backupStoreDescriptor(b.Store)),
+			slog.Int("tables_in_prior_manifest", len(prior.Tables)),
+			slog.Time("prior_created_at", prior.CreatedAt),
+		)
+		// Bug 137: an in-progress manifest proves a prior run died
+		// mid-flight. Backups crashed under pre-fix binaries left a
+		// persistent anchor replication slot on the source, each one
+		// silently pinning WAL until the disk fills — give the engine
+		// its chance to sweep that debris now. Best-effort hygiene via
+		// the optional [ir.BackupAnchorSweeper] surface: a sweep
+		// failure must not fail the resume itself.
+		if sweeper, ok := b.Source.(ir.BackupAnchorSweeper); ok {
+			if err := sweeper.SweepOrphanedBackupAnchors(ctx, b.SourceDSN); err != nil {
+				slog.WarnContext(
+					ctx, "backup: orphaned-anchor sweep failed; stale anchor slots may still be retaining WAL on the source",
+					slog.String("engine", b.Source.Name()),
+					slog.String("err", err.Error()),
+				)
+			}
+		}
+		resumeAnchor = prior.EndPosition
+	case ir.BackupStateComplete, "":
+		if !b.ForceOverwrite {
+			return nil, ir.Position{}, fmt.Errorf("backup: a completed backup already exists at this destination (created %s); pass --force-overwrite to replace it",
+				prior.CreatedAt.UTC().Format(time.RFC3339))
+		}
+		slog.InfoContext(
+			ctx, "backup: --force-overwrite set; replacing existing complete backup",
+			slog.Time("prior_created_at", prior.CreatedAt),
+		)
+		return nil, ir.Position{}, nil // discard so we start from scratch
+	}
+
+	if b.ChainSlot && (resumeAnchor.Engine != "" || resumeAnchor.Token != "") {
+		if err := preflightChainResume(ctx, b.Source, b.SourceDSN, resumeAnchor); err != nil {
+			return nil, ir.Position{}, fmt.Errorf(
+				"backup: resume --chain-slot: the chain slot cannot serve the interrupted attempt's anchor, so resuming would silently gap the chain: %w. "+
+					"To deliberately start over instead, pass --force-overwrite (and drop the slot via `sluice slot drop` if it still exists)", err,
+			)
+		}
+		slog.InfoContext(
+			ctx, "backup: resume --chain-slot: adopting the interrupted attempt's chain slot; no new chain slot is created and this run never drops the adopted one",
+			slog.String("adopted_position_token", resumeAnchor.Token),
+		)
+	}
+	return prior, resumeAnchor, nil
 }
 
 // openSnapshotOrFallback returns a row reader the orchestrator drives
@@ -637,10 +816,16 @@ func (b *Backup) Run(ctx context.Context) error {
 // opener was found; err carries an open failure (the caller falls back to
 // the v0.17.x path on a non-nil err exactly as the base OpenBackupSnapshot
 // error path does — a scoped-open error is NOT a different failure mode).
-func (b *Backup) openBackupSnapshotScoped(ctx context.Context, schema *ir.Schema) (snap *ir.BackupSnapshot, implemented bool, err error) {
+//
+// persistChainSlot is b.ChainSlot minus the anchored-resume case: a
+// resume of a --chain-slot backup ADOPTS the prior attempt's standing
+// chain slot (task #42, ADR-0085) and opens this run's snapshot in the
+// temporary-anchor shape so the adopted slot is never re-created — and
+// never dropped by this run's failure path.
+func (b *Backup) openBackupSnapshotScoped(ctx context.Context, schema *ir.Schema, persistChainSlot bool) (snap *ir.BackupSnapshot, implemented bool, err error) {
 	opts := ir.BackupSnapshotOptions{
 		SlotName:         b.SlotName,
-		PersistChainSlot: b.ChainSlot,
+		PersistChainSlot: persistChainSlot,
 	}
 	tables := tableNamesForPublication(schema)
 	if len(tables) > 0 {
@@ -656,8 +841,8 @@ func (b *Backup) openBackupSnapshotScoped(ctx context.Context, schema *ir.Schema
 	return nil, false, nil
 }
 
-func (b *Backup) openSnapshotOrFallback(ctx context.Context, schema *ir.Schema) (ir.RowReader, *ir.Position, *ir.BackupSnapshot, func(), error) {
-	if snap, ok, err := b.openBackupSnapshotScoped(ctx, schema); ok {
+func (b *Backup) openSnapshotOrFallback(ctx context.Context, schema *ir.Schema, persistChainSlot bool) (ir.RowReader, *ir.Position, *ir.BackupSnapshot, func(), error) {
+	if snap, ok, err := b.openBackupSnapshotScoped(ctx, schema, persistChainSlot); ok {
 		if err == nil {
 			slog.InfoContext(
 				ctx, "backup: opened snapshot-anchored consistent view",
@@ -1065,6 +1250,88 @@ func priorResumableTables(prior *ir.Manifest) []*ir.TableManifest {
 		return nil
 	}
 	return prior.Tables
+}
+
+// refuseAnchoredResumeOnSchemaDrift refuses an anchored resume when the
+// source schema's fingerprint no longer matches the interrupted
+// attempt's recorded schema (task #42, ADR-0085). Adoption claims
+// "kept chunks + CDC replay from the adopted anchor converge to source
+// state" — DDL between the two attempts breaks that claim: the kept
+// chunks were shaped by the old schema, the manifest would record the
+// new one, and the replay window carries events under a schema the
+// manifest never saw. Both schemas here are post-filter, so a changed
+// --tables filter between attempts trips this too — equally unsound.
+func refuseAnchoredResumeOnSchemaDrift(current, prior *ir.Schema) error {
+	curHash, err := manifestSchemaFingerprint(current)
+	if err != nil {
+		return fmt.Errorf("backup: resume: fingerprint current schema: %w", err)
+	}
+	priorHash, err := manifestSchemaFingerprint(prior)
+	if err != nil {
+		return fmt.Errorf("backup: resume: fingerprint prior schema: %w", err)
+	}
+	if curHash == priorHash {
+		return nil
+	}
+	return fmt.Errorf(
+		"backup: resume: the source schema changed since the interrupted attempt (fingerprint %s != recorded %s) — "+
+			"resuming would pair the prior attempt's table chunks with a schema they were not read under, corrupting the chain's replay claim. "+
+			"Pass --force-overwrite to discard the interrupted attempt and take a fresh full backup (use the same --tables filter as the prior attempt if the schema itself did not change)",
+		curHash[:12], priorHash[:12],
+	)
+}
+
+// manifestSchemaFingerprint hashes s in the MANIFEST's domain: it
+// JSON-round-trips the schema before hashing. Named wart: the IR's
+// decode hooks materialize concrete zero values for fields a freshly-
+// read schema leaves nil (e.g. a nil Column.Default decodes to an
+// explicit kind=None value that re-marshals non-empty), so
+// [ir.ComputeSchemaHash] over a reader-fresh schema does NOT equal the
+// hash of the same schema after it has been stored in (and re-read
+// from) a manifest. The drift guard compares a fresh read against
+// prior.Schema — which IS round-tripped — so both sides must be
+// normalized into the round-tripped domain first or every resume would
+// false-positive as drift. Pinned by
+// [TestBackup_ResumeAdoptsPriorAnchor] (identical schema across
+// attempts must not refuse).
+func manifestSchemaFingerprint(s *ir.Schema) (string, error) {
+	raw, err := json.Marshal(s)
+	if err != nil {
+		return "", fmt.Errorf("marshal: %w", err)
+	}
+	var rt ir.Schema
+	if err := json.Unmarshal(raw, &rt); err != nil {
+		return "", fmt.Errorf("round-trip decode: %w", err)
+	}
+	return ir.ComputeSchemaHash(&rt)
+}
+
+// refuseKeylessRestreamOnAnchoredResume refuses an anchored resume when
+// any table that must be (re-)streamed THIS run is truly keyless — no
+// PRIMARY KEY and no all-NOT-NULL plain-column UNIQUE index
+// ([ir.TableReplayIdempotent]). Such a table's chunks are read at this
+// run's later snapshot and therefore OVERLAP the chain's replay window
+// (adopted anchor, stop]; the chain appliers' keyless fallback is plain
+// INSERT (ADR-0010), so the overlap would duplicate rows silently.
+// Kept tables may be keyless — they are exact at the adopted anchor,
+// no overlap.
+func refuseKeylessRestreamOnAnchoredResume(tasks []backupTableTask) error {
+	var keyless []string
+	for _, task := range tasks {
+		if !ir.TableReplayIdempotent(task.table) {
+			keyless = append(keyless, task.table.Name)
+		}
+	}
+	if len(keyless) == 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"backup: resume: table(s) %s must be (re-)streamed but have no PRIMARY KEY and no non-null UNIQUE index. "+
+			"A resumed backup adopts the interrupted attempt's anchor, so these tables' chunks would overlap the chain's replay window — "+
+			"and replaying onto a keyless table falls back to plain INSERT (ADR-0010), duplicating the overlapping rows. "+
+			"Add a PRIMARY KEY or a NOT NULL UNIQUE index, exclude the table(s), or pass --force-overwrite to discard the interrupted attempt and start fresh",
+		strings.Join(keyless, ", "),
+	)
 }
 
 // backupStoreDescriptor returns a short human-readable identifier of

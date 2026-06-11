@@ -74,6 +74,13 @@ Close drops the slot so retries start clean. An already-existing slot
 is refused loudly (its consistent point is *not* this backup's anchor;
 the refusal names the three plausible owners and the recovery).
 
+> **Amended by ADR-0085 (task #42):** Commit now fires once the run's
+> anchor-stamped IN-PROGRESS manifest is durable — an interrupted run
+> deliberately keeps the slot (it is the WAL-retention guarantee a
+> resume adopts), and the already-exists refusal's crashed-run clause
+> now says "re-run the same command — resume adopts the slot" instead
+> of advising drop + retry (which released the gap-covering WAL).
+
 Defaults unchanged: without the flag, the temporary-anchor shape and
 an end-of-anchor INFO hint ("to chain incrementals … re-run with
 --chain-slot"). Engines without a slot concept (MySQL) WARN-no-op
@@ -116,10 +123,13 @@ clamp composes with (does not replace) the ADR-0020 applier tracker.
   first full, or hand-edit positions) collapses to one flag, and every
   way of getting it wrong is now a loud refusal instead of a quietly
   gapped chain.
-- A `--chain-slot` full that crashes hard (no Close) leaks the slot;
-  the next `--chain-slot` run hits the already-exists refusal whose
+- A `--chain-slot` full that crashes hard (no Close) leaks the slot.
+  ~~The next `--chain-slot` run hits the already-exists refusal whose
   message names the drop command. The resume-path interaction is
-  task #42's design question.
+  task #42's design question.~~ Resolved by ADR-0085: the re-run
+  RESUMES and adopts the slot (its snapshot opens temp-anchored, so
+  the refusal is never reached); the refusal now fires only on a
+  fresh-start run and no longer advises drop+retry as crash recovery.
 - WAL retention cost is explicit and documented in the flag help: an
   unconsumed chain slot retains WAL until the next incremental (or
   `sluice slot drop`).
