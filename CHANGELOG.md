@@ -28,6 +28,19 @@ project follows [Semantic Versioning](https://semver.org/).
   1390 s — both legs −51%, zero-loss, shrinking the gap to the
   `pg_dump`/`pg_restore -j8` specialists from ~3.1–3.2× to 1.83× /
   1.51× (see `docs/comparison-backup.md`).
+- **PG→PG raw-copy single streams are ~4.9× faster (task #37).** The PG
+  server emits one CopyData message per row on `COPY TO STDOUT`, and each
+  row paid a synchronous unbuffered-pipe rendezvous plus a ~265-byte
+  socket write to the target — 81.8% of single-stream CPU. A 64 KiB
+  buffer ahead of the pipe coalesces the frames (byte-transparent — the
+  COPY stream has no per-Write framing): 72.6 s → 15.0 s on a 4M-row /
+  1040 MB single-stream run (14 → ~73 MB/s), checksum-verified
+  zero-loss.
+- **MySQL `LOAD DATA` bulk writes get the same per-row pipe-rendezvous
+  fix.** The TSV encoder issued one unbuffered pipe write per row; it is
+  now buffered the same way (64 KiB, flushed before close on success,
+  errors still poison the read). Byte-transparent; covered by the
+  existing LOAD DATA zero-loss and warning-probe pins.
 - **Backup checkpoints are now O(1) per event — the manifest is no
   longer rewritten per chunk/table (task #54, ADR-0086).** Every
   per-chunk / per-table checkpoint during `backup full` used to
