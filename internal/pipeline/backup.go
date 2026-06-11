@@ -34,12 +34,15 @@ package pipeline
 //     CLI with `--force-overwrite`, mirroring the friction tier of
 //     `migrate --reset-target-data` (ADR-0023).
 //   - If the prior manifest is `partial_state == "in_progress"`, the
-//     new run resumes: tables already fully written in the prior run
-//     are kept verbatim (their chunks are HEAD-checked for presence),
-//     and the run picks up at the next un-completed table. Within a
-//     table, chunk writes that find an existing object with a
-//     matching SHA-256 are skipped; mismatches overwrite (treating
-//     the prior bytes as a corrupted partial upload).
+//     new run resumes at TABLE granularity: tables already fully
+//     written in the prior run are kept verbatim (their chunks are
+//     HEAD-checked for presence); partially-written tables are
+//     RE-STREAMED FROM SCRATCH — their prior chunks are never reused,
+//     because chunk contents depend on scan order, which is not
+//     repeatable across runs (Bug 135; see [Backup.backupTable]).
+//     Newly-produced chunks whose bytes match what is already at the
+//     same path skip the upload (content-addressed); mismatches
+//     overwrite (treating the prior bytes as stale or corrupt).
 //
 // The manifest is committed to the store after every table completes,
 // so a crashed run leaves at most tableParallelism tables' worth of
@@ -799,14 +802,23 @@ func (b *Backup) validate() error {
 // chunk. Empty tables produce zero chunks (the manifest entry has
 // RowCount=0 and Chunks=nil) — keeps the storage layout tidy.
 //
-// Bug 34b: when task.priorTable is non-nil, its chunk entries are
-// checked before each new chunk gets a writer. If chunk N's prior info
-// exists, the recorded chunk is still on the store, AND its on-store
-// SHA-256 matches the manifest's recorded SHA-256, the chunk is
-// skipped — the orchestrator advances the row cursor by chunk N's
-// recorded RowCount (reading-and-discarding) without opening a writer
-// or hitting Put. Each newly-written chunk checkpoints the manifest so
-// a mid-table crash leaves a record of exactly which chunks completed.
+// Partially-written tables from a prior crashed run are re-streamed
+// FROM SCRATCH — their prior chunks are deliberately not reused. The
+// pre-v0.99.36 per-chunk resume (Bug 34b) reused prior chunk N and
+// advanced the new row stream by N×chunkRows rows, which assumed the
+// two runs' row streams deliver identical order. They don't:
+// [buildSelect] has no ORDER BY (a full-table ORDER BY would gut read
+// throughput), so scan order is only repeatable by accident — and
+// under the ADR-0084 parallel sweep the accident stopped holding,
+// producing backups with duplicate AND missing rows that exit 0
+// (Bug 135, CRITICAL, caught by the v0.99.35 battle-test). Whole-table
+// reuse (Partial=false entries, staged verbatim by
+// [Backup.stageBackupTables]) is order-independent and stays. The redo
+// cost is bounded by the crash contract: at most tableParallelism
+// tables are in flight. flush's same-path SHA comparison below is the
+// only chunk-level reuse left — it is content-addressed (compares the
+// NEWLY-PRODUCED bytes against what's already at the path), so it
+// never depends on scan order.
 func (b *Backup) backupTable(
 	ctx context.Context,
 	rr ir.RowReader,
@@ -815,7 +827,7 @@ func (b *Backup) backupTable(
 	committer *manifestCommitter,
 	chainCEK []byte,
 ) error {
-	table, entry, priorTable := task.table, task.entry, task.priorTable
+	table, entry := task.table, task.entry
 	rows, err := rr.ReadRows(ctx, table)
 	if err != nil {
 		return fmt.Errorf("read rows: %w", err)
@@ -876,107 +888,17 @@ func (b *Backup) backupTable(
 		curWrappedCEK = nil
 		chunkIdx++
 		// Record the chunk + per-chunk checkpoint: commit the manifest
-		// now so a mid-table crash (or kill) leaves an up-to-date record
-		// of exactly which chunks completed. The cost is one extra Put
-		// per chunk; benefit is the per-chunk skip on resume sees the
-		// right state. Bug 34b. The committer serializes the entry
-		// mutation + the same-key manifest Put against peer tables.
-		if err := committer.appendChunk(ctx, entry, ci, true); err != nil {
+		// after every chunk so operators (and the resume plan's log)
+		// can see progress accrue. Resume no longer REUSES these
+		// partial chunks (see the function comment / Bug 135) — the
+		// checkpoint is observability, and it keeps the same-path SHA
+		// fast-skip in flush effective across a re-run. The committer
+		// serializes the entry mutation + the same-key manifest Put
+		// against peer tables.
+		if err := committer.appendChunk(ctx, entry, ci); err != nil {
 			return fmt.Errorf("checkpoint manifest after chunk %d: %w", chunkIdx-1, err)
 		}
 		return nil
-	}
-
-	// trySkipChunk inspects priorTable for a recorded entry at chunk
-	// chunkIdx. If the recorded entry is still on the store and its
-	// on-store bytes hash to the recorded SHA-256, the chunk is reused
-	// verbatim — the orchestrator advances the row cursor over chunk's
-	// rows without opening a writer or issuing a Put.
-	//
-	// Returns (skipped, nil) on a successful skip; (false, nil) when
-	// either no prior entry exists or the prior bytes mismatch (caller
-	// then writes the chunk normally — overwrite-on-mismatch).
-	trySkipChunk := func() (bool, error) {
-		if priorTable == nil || chunkIdx >= len(priorTable.Chunks) {
-			return false, nil
-		}
-		priorChunk := priorTable.Chunks[chunkIdx]
-		if priorChunk == nil || priorChunk.SHA256 == "" {
-			return false, nil
-		}
-		matches, err := chunkAlreadyMatches(ctx, b.Store, priorChunk.File, priorChunk.SHA256)
-		if err != nil {
-			return false, fmt.Errorf("inspect prior chunk %q: %w", priorChunk.File, err)
-		}
-		if !matches {
-			// Either the chunk is missing on the store or its bytes
-			// don't match the recorded SHA-256 (corrupted partial
-			// upload). Surface the second case loudly per the loud-
-			// failure tenet; either way the chunk gets re-written.
-			exists, existsErr := b.Store.Exists(ctx, priorChunk.File)
-			if existsErr == nil && exists {
-				slog.WarnContext(
-					ctx, "prior chunk SHA-256 mismatch — overwriting on resume",
-					slog.String("table", table.Name),
-					slog.Int("chunk", chunkIdx),
-					slog.String("path", priorChunk.File),
-				)
-			}
-			return false, nil
-		}
-		// Reuse the prior entry verbatim and advance the cursor. No
-		// checkpoint — the chunk is already on the store and recorded in
-		// the prior manifest; the next written chunk's checkpoint
-		// captures it (matching the pre-ADR-0084 skip behaviour).
-		if err := committer.appendChunk(ctx, entry, priorChunk, false); err != nil {
-			return false, err
-		}
-		// Discard the rows the skipped chunk covered so the row stream
-		// stays aligned with the chunk index. The chunk-row-range is
-		// deterministic ([N*chunkRows, (N+1)*chunkRows) in PK order),
-		// so reading-and-discarding priorChunk.RowCount rows from the
-		// channel preserves alignment for the next chunk.
-		discardN := priorChunk.RowCount
-		for discardN > 0 {
-			select {
-			case <-ctx.Done():
-				return false, ctx.Err()
-			case _, ok := <-rows:
-				if !ok {
-					return false, fmt.Errorf("row stream ended early while skipping chunk %d (had %d rows of %d to discard)", chunkIdx, priorChunk.RowCount-discardN, priorChunk.RowCount)
-				}
-				discardN--
-			}
-		}
-		rowsTotal += priorChunk.RowCount
-		slog.InfoContext(
-			ctx, "skipping chunk — already complete in partial backup",
-			slog.String("table", table.Name),
-			slog.Int("chunk", chunkIdx),
-			slog.Int64("rows", priorChunk.RowCount),
-			slog.String("sha256", priorChunk.SHA256),
-		)
-		chunkIdx++
-		return true, nil
-	}
-
-	// Drive the per-chunk skip up-front before the row loop opens a
-	// new writer for chunk chunkIdx. We loop because successive chunks
-	// may all be skippable.
-	skipUntilWrite := func() error {
-		for {
-			skipped, err := trySkipChunk()
-			if err != nil {
-				return err
-			}
-			if !skipped {
-				return nil
-			}
-		}
-	}
-
-	if err := skipUntilWrite(); err != nil {
-		return err
 	}
 
 	for {
@@ -1043,11 +965,6 @@ func (b *Backup) backupTable(
 			rowsTotal++
 			if writer.RowCount() >= int64(chunkRows) {
 				if err := flush(); err != nil {
-					return err
-				}
-				// After flushing, the next chunk index might also have
-				// been pre-uploaded in a prior run — try to skip again.
-				if err := skipUntilWrite(); err != nil {
 					return err
 				}
 			}

@@ -95,12 +95,26 @@ A crashed parallel backup leaves at most `tableParallelism` tables
 with `Partial=true` and a per-chunk-accurate chunk list (the in-flight
 workers, each checkpointing after every chunk), plus the pre-staged
 not-yet-started entries (`Partial=true`, zero chunks). The existing
-resume classifier (`tableManifestFullyComplete`) already handles all
-three states — `Partial=true` routes to the per-chunk resume path, and
-a zero-chunk entry simply re-streams from scratch. **The one
-observable change:** the crashed manifest now lists every staged table
-(previously only tables already started appeared); the resume-shape
-unit test was updated to pin the new shape.
+resume classifier (`tableManifestFullyComplete`) handles all three
+states. **The one observable change:** the crashed manifest now lists
+every staged table (previously only tables already started appeared);
+the resume-shape unit test was updated to pin the new shape.
+
+**Amended post-v0.99.35 (Bug 135, CRITICAL):** as originally shipped,
+`Partial=true` routed to the Bug-34b *per-chunk* resume path, which
+reuses prior chunk N and skips N×chunk-rows rows of the new stream —
+an assumption of repeatable scan order that the reader has never
+guaranteed (`buildSelect` has no ORDER BY) and that the parallel sweep
+broke reliably: resumed backups carried duplicate AND missing rows
+while exiting 0. The battle-test caught it within hours of release.
+Resume is now TABLE-granular: `Partial=true` tables re-stream from
+scratch (their chunk lists discarded; redo bounded by this section's
+own crash contract), completed tables stay skip-eligible (whole chunk
+sets are order-independent), and the only chunk-level reuse left is
+the content-addressed same-path upload skip, which compares the
+NEWLY-PRODUCED bytes and is therefore order-proof. Pinned by a
+revert-tested order-divergence test
+(`TestBackup_ResumeAfterScanOrderChange_NoDuplicatesNoHoles`).
 
 ### 4. Thread-safety audit (verified, not assumed)
 

@@ -6,6 +6,26 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **CRITICAL (Bug 135, v0.99.35 regression, caught by the post-release
+  battle-test): resuming an interrupted backup no longer silently
+  corrupts the artifact.** The per-chunk resume reuse kept a prior
+  partial run's chunk N verbatim and skipped N×chunk-rows rows of the
+  NEW row stream — which assumed the two runs deliver rows in identical
+  order. The reader has never guaranteed that (full-table reads carry no
+  ORDER BY by design), and under v0.99.35's parallel sweep the
+  accidental stability broke reliably: resumed backups contained
+  duplicate AND missing rows while exiting 0 with a self-consistent
+  manifest. Resume is now table-granular — fully-completed tables are
+  still kept verbatim (order-independent), partially-written tables
+  re-stream from scratch (bounded by the crash contract: at most
+  `--table-parallelism` tables were in flight), and byte-identical
+  re-produced chunks still skip their upload via a content-addressed
+  comparison. Pinned by a revert-tested order-divergence test that
+  reproduces the exact corruption shape pre-fix. If you resumed an
+  interrupted backup ON v0.99.35, discard that artifact and re-run it
+  fresh.
+
 ## [0.99.35] - 2026-06-11
 
 ### Added
