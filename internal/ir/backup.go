@@ -387,6 +387,15 @@ type Manifest struct {
 	//     the source as it appeared at this position; CDC from this
 	//     position forward covers every write after the snapshot.
 	//     The during-backup window gap is closed.
+	//   - For a RESUMED full (task #42, ADR-0085), this is the FIRST
+	//     interrupted attempt's snapshot anchor, adopted verbatim — the
+	//     minimum anchor across attempts. Kept tables are exact at that
+	//     anchor; tables (re-)streamed by the resumed run are read at a
+	//     later snapshot, so their contents overlap the chain's replay
+	//     window — sound because the chain appliers are idempotent on
+	//     a key (ADR-0010; truly keyless re-streams are refused at
+	//     resume). In-progress full manifests carry the anchor from
+	//     their first write so a crash can never lose it.
 	//
 	// Pre-v0.17.0 full manifests carry an empty value here; the
 	// chain-walk treats them as orphan fulls.

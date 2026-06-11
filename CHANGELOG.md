@@ -6,6 +6,37 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Silent chain gap on crash-resume of an anchored backup (task #42,
+  ADR-0085) — a CRITICAL silent-loss class.** A resumed `backup full`
+  kept the interrupted attempt's completed tables verbatim (exact
+  as-of the FIRST attempt's snapshot anchor A1) but always opened a
+  fresh snapshot and recorded the NEW anchor A2 as the manifest's
+  `EndPosition` — the in-progress manifest never carried an anchor, so
+  a crashed run's anchor was simply lost. Writes landing on kept
+  tables in (A1, A2] were then in NEITHER the row chunks NOR the next
+  incremental's window: the chain restored cleanly, exit 0, missing
+  those writes. The `--chain-slot` shape compounded it — the
+  slot-already-exists refusal advised `sluice slot drop` + retry as
+  crash recovery, releasing the very WAL that covered the gap. Now:
+  the in-progress manifest carries the anchor from its first write
+  (made durable before the sweep), a resume ADOPTS the prior anchor
+  (the fresh snapshot serves only read consistency; re-streamed
+  tables' overlap with the replay window converges under the
+  idempotent ADR-0010 appliers), and a `--chain-slot` resume
+  preflights and adopts the standing chain slot instead of refusing
+  (the slot now deliberately survives an interrupted run — it is the
+  resume's WAL-retention guarantee — and the refusal message says
+  "re-run the same command", reserving drop + `--force-overwrite` for
+  a deliberate fresh start). Loud refusals close the unsound corners:
+  a truly keyless table that must be (re-)streamed on an anchored
+  resume (overlap replay would duplicate it), schema drift between
+  the attempts, and incrementals/streams chaining off a
+  still-in-progress parent. Pre-fix in-progress manifests (no
+  recorded anchor) re-stream every table. `--force-overwrite` now
+  also discards an in-progress prior, making it the uniform escape
+  hatch.
+
 ## [0.99.37] - 2026-06-11
 
 ### Fixed

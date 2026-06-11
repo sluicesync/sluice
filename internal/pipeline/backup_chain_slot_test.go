@@ -4,8 +4,10 @@
 // Unit pins for the --chain-slot chain-provisioning shape (task #40):
 //
 //   - the orchestrator threads ChainSlot → opts.PersistChainSlot,
-//   - the snapshot's CommitFn fires exactly once, AFTER the final
-//     manifest commit, and only on success (a failed run must leave
+//   - the snapshot's CommitFn fires exactly once, the moment the
+//     anchor-stamped in-progress manifest is durable (task #42 /
+//     ADR-0085 commit timing: a mid-sweep failure keeps the slot for
+//     resume adoption; a failure before the manifest is durable leaves
 //     CommitFn uncalled so the engine's Close drops the slot),
 //   - --chain-slot REFUSES the v0.17.x fallback in both flavours
 //     (snapshot open error / engine without an opener) instead of
@@ -79,7 +81,7 @@ func TestBackup_ChainSlot_CommitsSnapshotOnSuccess(t *testing.T) {
 }
 
 // erroringSnapshotRowReader fails the table sweep so the run errors
-// AFTER the snapshot opened — the commit-only-on-success pin.
+// AFTER the snapshot opened — the commit-timing pin.
 type erroringSnapshotRowReader struct{}
 
 func (erroringSnapshotRowReader) ReadRows(context.Context, *ir.Table) (<-chan ir.Row, error) {
@@ -87,30 +89,78 @@ func (erroringSnapshotRowReader) ReadRows(context.Context, *ir.Table) (<-chan ir
 }
 func (erroringSnapshotRowReader) Err() error { return nil }
 
-func TestBackup_ChainSlot_NoCommitOnFailedRun(t *testing.T) {
-	store, err := NewLocalStore(t.TempDir())
-	if err != nil {
-		t.Fatalf("NewLocalStore: %v", err)
-	}
-	src, _ := chainSlotTestEngine(t)
-	src.useSnapshotRows = true
-	src.snapshotRowsHook = func() ir.RowReader { return erroringSnapshotRowReader{} }
+// TestBackup_ChainSlot_CommitTimingOnFailedRun pins the task #42
+// (ADR-0085) commit-timing contract, which REPLACED the original
+// "commit only on success" shape:
+//
+//   - a run that fails MID-SWEEP has already durably written the
+//     anchor-stamped in-progress manifest, so the snapshot is
+//     committed (the chain slot must survive — it is the
+//     WAL-retention guarantee the resumed run adopts);
+//   - a run that fails BEFORE the in-progress manifest is durable
+//     commits nothing — the engine's uncommitted Close drops the
+//     slot, since no on-store record references it.
+func TestBackup_ChainSlot_CommitTimingOnFailedRun(t *testing.T) {
+	t.Run("mid-sweep failure: committed (resumable manifest references the slot)", func(t *testing.T) {
+		store, err := NewLocalStore(t.TempDir())
+		if err != nil {
+			t.Fatalf("NewLocalStore: %v", err)
+		}
+		src, _ := chainSlotTestEngine(t)
+		src.useSnapshotRows = true
+		src.snapshotRowsHook = func() ir.RowReader { return erroringSnapshotRowReader{} }
 
-	b := &Backup{
-		Source:    src,
-		SourceDSN: "src",
-		Store:     store,
-		ChainSlot: true,
-	}
-	if err := b.Run(context.Background()); err == nil {
-		t.Fatal("Backup.Run succeeded; want injected sweep failure")
-	}
-	if src.commitCalls != 0 {
-		t.Errorf("snapshot CommitFn calls = %d on a FAILED run; want 0 (engine Close must drop the slot)", src.commitCalls)
-	}
-	if src.snapshotCloses != 1 {
-		t.Errorf("snapshot Close calls = %d; want 1 (cleanup on failure)", src.snapshotCloses)
-	}
+		b := &Backup{
+			Source:    src,
+			SourceDSN: "src",
+			Store:     store,
+			ChainSlot: true,
+		}
+		if err := b.Run(context.Background()); err == nil {
+			t.Fatal("Backup.Run succeeded; want injected sweep failure")
+		}
+		if src.commitCalls != 1 {
+			t.Errorf("snapshot CommitFn calls = %d on a mid-sweep failure; want 1 (the in-progress manifest is durable — resume adopts the slot)", src.commitCalls)
+		}
+		if src.snapshotCloses != 1 {
+			t.Errorf("snapshot Close calls = %d; want 1 (cleanup on failure)", src.snapshotCloses)
+		}
+		// The durable in-progress manifest must carry the anchor the
+		// resume will adopt.
+		m, err := readManifest(context.Background(), store)
+		if err != nil {
+			t.Fatalf("readManifest: %v", err)
+		}
+		if m.PartialState != ir.BackupStateInProgress {
+			t.Errorf("PartialState = %q; want in_progress", m.PartialState)
+		}
+		if m.EndPosition != src.snapshotPos {
+			t.Errorf("in-progress EndPosition = %+v; want the snapshot anchor %+v", m.EndPosition, src.snapshotPos)
+		}
+	})
+
+	t.Run("pre-manifest failure: uncommitted (Close drops the slot)", func(t *testing.T) {
+		inner, err := NewLocalStore(t.TempDir())
+		if err != nil {
+			t.Fatalf("NewLocalStore: %v", err)
+		}
+		src, _ := chainSlotTestEngine(t)
+		b := &Backup{
+			Source:    src,
+			SourceDSN: "src",
+			Store:     newFailOnNthPutStore(inner, 1), // the pre-sweep manifest write
+			ChainSlot: true,
+		}
+		if err := b.Run(context.Background()); err == nil {
+			t.Fatal("Backup.Run succeeded; want injected manifest-write failure")
+		}
+		if src.commitCalls != 0 {
+			t.Errorf("snapshot CommitFn calls = %d before any durable manifest; want 0 (nothing references the slot)", src.commitCalls)
+		}
+		if src.snapshotCloses != 1 {
+			t.Errorf("snapshot Close calls = %d; want 1 (cleanup on failure)", src.snapshotCloses)
+		}
+	})
 }
 
 func TestBackup_ChainSlot_RefusesSnapshotFallback(t *testing.T) {

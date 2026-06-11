@@ -75,13 +75,15 @@ func TestBackup_ResumeSkipsAlreadyCompletedTables(t *testing.T) {
 	}
 	src := newBackupRecorderEngine("postgres", schema, rows)
 
-	// First run: fail on the 4th Put. Order of Puts (v0.16.1+ — Bug 34b
-	// added per-chunk checkpoint, see backup.go) is:
-	//   1: users chunk 0
-	//   2: per-chunk checkpoint after users chunk 0 (users.Partial=true)
-	//   3: per-table checkpoint after users completes (users.Partial=false)
-	//   4: posts chunk 0  ← fails here
-	failing := newFailOnNthPutStore(inner, 4)
+	// First run: fail on the 5th Put. Order of Puts (v0.16.1+ — Bug 34b
+	// added the per-chunk checkpoint; task #42/ADR-0085 added the
+	// pre-sweep in-progress manifest write) is:
+	//   1: pre-sweep in-progress manifest (anchor-stamped when present)
+	//   2: users chunk 0
+	//   3: per-chunk checkpoint after users chunk 0 (users.Partial=true)
+	//   4: per-table checkpoint after users completes (users.Partial=false)
+	//   5: posts chunk 0  ← fails here
+	failing := newFailOnNthPutStore(inner, 5)
 	b1 := &Backup{
 		Source: src, SourceDSN: "src", Store: failing,
 		ChunkRows: 100, // one chunk per table
@@ -148,6 +150,9 @@ func TestBackup_ResumeSkipsAlreadyCompletedTables(t *testing.T) {
 
 	// The resume run should have done EXACTLY the work the second
 	// table required:
+	//   - 1 manifest Put for the pre-sweep in-progress manifest
+	//     (task #42/ADR-0085 — written before the sweep so a crash
+	//     always leaves a resumable, anchor-stamped record)
 	//   - 1 chunk Put for posts chunk 0
 	//   - 1 manifest Put for the per-chunk checkpoint after posts chunk 0
 	//     (Bug 34b: per-chunk granularity, v0.16.1+)
@@ -157,11 +162,11 @@ func TestBackup_ResumeSkipsAlreadyCompletedTables(t *testing.T) {
 	//     v0.47.0 — only the final write triggers the catalog because
 	//     per-chunk / per-table checkpoint manifests are written with
 	//     an empty BackupID, which updateChainCatalog skips)
-	// = 5 Puts. The users chunk is not in that count — it was already
+	// = 6 Puts. The users chunk is not in that count — it was already
 	// on disk from the first run and trySkipChunk short-circuited the
 	// upload (no row read, no Put).
-	if counting.puts != 5 {
-		t.Errorf("resume Put count = %d; want 5 (1 chunk + 3 manifest checkpoints + 1 chain.json)", counting.puts)
+	if counting.puts != 6 {
+		t.Errorf("resume Put count = %d; want 6 (1 chunk + 4 manifest checkpoints + 1 chain.json)", counting.puts)
 	}
 
 	// Verify the backup overall.

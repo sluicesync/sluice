@@ -116,6 +116,14 @@ NEWLY-PRODUCED bytes and is therefore order-proof. Pinned by a
 revert-tested order-divergence test
 (`TestBackup_ResumeAfterScanOrderChange_NoDuplicatesNoHoles`).
 
+**Amended by ADR-0085 (task #42):** the crashed manifest carries the
+chain anchor (`EndPosition`) from its first write — made durable by a
+pre-sweep manifest commit — and a resume ADOPTS it as the final
+EndPosition (kept tables are exact as-of the FIRST attempt's anchor;
+recording the resume's fresh anchor over them was a silent chain gap).
+See ADR-0085 for the adoption rules, guards, and the `--chain-slot`
+commit-timing change.
+
 ### 4. Thread-safety audit (verified, not assumed)
 
 - `chunkWriter` is per-chunk-local inside each worker — no sharing.
