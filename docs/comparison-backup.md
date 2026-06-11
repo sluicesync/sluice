@@ -22,18 +22,21 @@ the pipeline, into storage the operator owns.
 
 ## TL;DR
 
-- **One-shot full backup/restore speed of a large single-engine database is
-  not the reason to pick sluice today.** `pg_dump -j8` was **10.2× faster**
-  on our 133 GB corpus and `pg_restore -j8` ~**11.5×** — almost entirely a
-  *parallelism* difference, not a per-row one (decomposition below). The
-  cross-table pool that already closed this exact gap on the migrate path
-  (ADR-0076) is the planned fix (task #39).
-- **Incrementals are the reason.** `pg_dump` has no incremental story — its
-  only refresh is a full re-dump (232 s + 16 GB every cycle, on our corpus).
-  `sluice backup incremental` captured a 3.6M-row-event delta in **104 s /
-  1.5 GB**, and the cost scales with the *delta*, not the database. At any
-  realistic change rate, the chain wins from the second cycle onward —
-  and it's restorable cross-engine.
+- **The parallelism gap is closed (ADR-0084, measured below): sluice now
+  sits ~3.1–3.2× behind the `pg_dump`/`pg_restore -j8` specialists on both
+  legs, with defaults.** The original measurements on this corpus were
+  10.2× (backup) and ~11.5× (restore) — almost entirely a *parallelism*
+  difference. Cross-table pools on both sides (the ADR-0076 migrate-pool
+  shape) cut backup 2367 s → **881 s** and restore from a projected ~3 h to
+  **2810 s**, zero-loss, one flag (`--table-parallelism`, default auto=4).
+  The remaining ~3× is per-row cost — the price of cross-engine
+  restorability and per-chunk verifiability (profiling tracked separately).
+- **Incrementals are the structural reason to pick sluice.** `pg_dump` has
+  no incremental story — its only refresh is a full re-dump (232–273 s +
+  16 GB every cycle, on our corpus). `sluice backup incremental` captured a
+  3.6M-row-event delta in **104 s / 1.5 GB**, and the cost scales with the
+  *delta*, not the database. At any realistic change rate, the chain wins
+  from the second cycle onward — and it's restorable cross-engine.
 
 ---
 
@@ -55,8 +58,9 @@ the portable part.
 |---|---|---|---|
 | **pg_dump -Fd -j8 --compress=zstd:3** | **232 s** | 16 GB | 8 parallel workers |
 | pg_dump -Fd -j1 --compress=zstd:3 | 798 s | 16 GB | single worker |
-| **sluice backup full** (snapshot-anchored) | **2367 s** | 22 GB | sequential per table |
+| sluice backup full — pre-ADR-0084 | 2367 s | 22 GB | sequential per table |
 | sluice backup full (non-anchored fallback) | 2398 s | 22 GB | `wal_level=replica` source |
+| **sluice backup full — ADR-0084 defaults** | **881 s** | 22 GB | parallel sweep engaged (`table_parallelism=4`), snapshot-anchored, same exported snapshot across all readers; corpus-matched `pg_dump -j8` re-run: 273 s → **3.2× gap** |
 
 Read-outs:
 
@@ -66,7 +70,8 @@ Read-outs:
    same cross-table pool sluice's migrate path already has (ADR-0076,
    `--table-parallelism`) — the backup orchestrator simply predates it and
    is sequential per table (named in `internal/pipeline/backup.go`:
-   *"Phase 2 will add parallel reads"*; now task #39). The ~3× per-row
+   *"Phase 2 will add parallel reads"*; now shipped — ADR-0084, measured
+   in the table above). The ~3× per-row
    residual is the IR decode + JSONL encode + per-chunk SHA-256 — the price
    of cross-engine restorability and per-chunk verifiability that `pg_dump`'s
    engine-native COPY stream doesn't pay.
@@ -81,12 +86,26 @@ Read-outs:
 | Configuration | Wall | Notes |
 |---|---|---|
 | **pg_restore -j8** | **917 s** | all 422M rows + all 172 indexes, verified |
-| sluice restore | **cut off at 5278 s** with 2/43 tables done | sequential; each 94M-row table took ~41 min; projected ~3 h+ |
+| sluice restore — pre-ADR-0084 | **cut off at 5278 s** with 2/43 tables done | sequential; each 94M-row table took ~41 min; projected ~3 h+ |
+| **sluice restore — ADR-0084 defaults** | **2810 s** | parallel apply engaged (`table_parallelism=4`); all 43 tables + 172 indexes verified; corpus-matched `pg_restore -j8` re-run: 896 s → **3.1× gap** |
 
-Same shape, larger: restore is also sequential per table, and here the gap
-(~11.5× on the projection) matters *more* than backup speed — restore time
-is your recovery time objective. Task #39 covers both sides with one pool
-design.
+Restore matters *more* than backup speed — restore time is your recovery
+time objective. Pre-ADR-0084 the projection was ~11.5× behind
+`pg_restore -j8`; the cross-table writer pool (engine-generic — it engages
+for MySQL targets too, since parallel *writers* need no shared snapshot)
+brings it to ~3.1× with defaults.
+
+### The before/after read-out
+
+Both legs landed at ~3.1–3.2× of their PostgreSQL-native counterpart —
+almost exactly the ~3.0× per-row residual the j1 decomposition below
+predicted. That is the satisfying confirmation of the decomposition: the
+parallelism share of both gaps is now closed, and what remains is the
+per-stream IR decode/encode + per-chunk SHA-256 cost — the price of
+cross-engine restorability and verifiability, and the same per-stream
+frontier already characterized on the migrate path. (After-numbers were
+measured on the post-burst corpus: 136 GB / 431M rows, ~2 % larger than
+the original 133 GB / 422M — the comparators were re-run corpus-matched.)
 
 ## Incremental — the structural win
 
