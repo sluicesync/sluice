@@ -109,7 +109,7 @@ type Differ struct {
 	// InjectShardColumn, when engaged, applies the ADR-0048 Shape A
 	// IR pass to the source-side expected schema BEFORE the diff
 	// comparison runs. Combined with the [ir.Column.SluiceInjected]
-	// suppression in [irdiff.DiffSchemas], this lets `schema diff`
+	// suppression in [irdiff.Schemas], this lets `schema diff`
 	// against a consolidated Shape-A target report "in sync" rather
 	// than surface the discriminator as drift on every run.
 	InjectShardColumn ShardColumnSpec
@@ -250,7 +250,7 @@ func (d *Differ) Run(ctx context.Context) (*irdiff.SchemaDiff, error) {
 	}
 
 	// ---- 3. Compute the diff. ----
-	diff := irdiff.DiffSchemas(expected, actual, irdiff.DiffOptions{
+	diff := irdiff.Schemas(expected, actual, irdiff.Options{
 		IgnoreExtras:           d.IgnoreExtras,
 		IgnoreCharsetCollation: d.IgnoreCharsetCollation,
 	})
@@ -382,7 +382,7 @@ func previewMissingDDL(ctx context.Context, target ir.Engine, dsn, targetSchema 
 
 // collectMissingColumns returns the per-table list of columns absent
 // from the target. Map key is table name, value is the slice of
-// missing column names (in the same alphabetic order DiffSchemas
+// missing column names (in the same alphabetic order irdiff.Schemas
 // returned them).
 func collectMissingColumns(diff irdiff.SchemaDiff) map[string][]string {
 	out := make(map[string][]string, len(diff.TablesMismatched))
@@ -959,7 +959,7 @@ func renderDiffJSON(w io.Writer, srcEngine, tgtEngine string, diff irdiff.Schema
 		SchemaDiff:   diff,
 	}
 	// Stable nested ordering: the fields inside SchemaDiff are already
-	// sorted by DiffSchemas; this defensive sort is a no-op today but
+	// sorted by irdiff.Schemas; this defensive sort is a no-op today but
 	// keeps the JSON renderer's output deterministic if a future caller
 	// constructs SchemaDiff some other way.
 	sort.Strings(out.TablesMissing)

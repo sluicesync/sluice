@@ -22,7 +22,7 @@
 //  3. Apply the authored PG-side corpus DDL into a different schema
 //     ("authored") of the SAME PG container.
 //  4. Read both PG schemas via the PG engine and
-//     irdiff.DiffSchemas(authored, emitted, {IgnoreCharsetCollation:true,
+//     irdiff.Schemas(authored, emitted, {IgnoreCharsetCollation:true,
 //     IgnoreExtras:false}).
 //  5. Classify: no diff → congruent (log). Diffs → split into a tight,
 //     commented KNOWN-BENIGN engine-idiomatic allowlist (GREEN by
@@ -120,7 +120,7 @@ func applyPGDDLInSchema(t *testing.T, dsn, schema, ddl string) {
 //
 // The allowlist is intentionally tight. Each branch:
 //   - matches on the IR Type *string* rendering (typeString), the same
-//     stable form irdiff.DiffSchemas compares, and
+//     stable form irdiff.Schemas compares, and
 //   - requires the delta to be a documented cross-engine policy, not a
 //     "close enough" guess.
 //
@@ -211,7 +211,7 @@ func congruenceBenignReason(cd irdiff.ColumnDiff) string {
 // CURRENT_TIMESTAMP vs now()) or NULL/NOT NULL are an authoring
 // divergence, not a sluice translation defect — sluice carried the
 // type faithfully. Still tight: it is only reached when ExpectedType
-// and ActualType are both empty (DiffSchemas left them zero ⇒ the IR
+// and ActualType are both empty (irdiff.Schemas left them zero ⇒ the IR
 // types compared equal).
 func defaultNullableBenignReason(cd irdiff.ColumnDiff) string {
 	switch {
@@ -377,9 +377,9 @@ func runCongruenceLeg(t *testing.T, mysqlDDLFile, pgDDLFile string, pairSize int
 
 	// authored = expected, emitted = actual. IgnoreCharsetCollation:
 	// MySQL utf8mb4_* vs PG en_US.utf8 never match by name — benign,
-	// documented (schema_diff.go DiffOptions doc-comment). IgnoreExtras
+	// documented (ir/diff schema_diff.go Options doc-comment). IgnoreExtras
 	// false: a missing/extra table or column IS a real defect, surface.
-	diff := irdiff.DiffSchemas(authored, emitted, irdiff.DiffOptions{
+	diff := irdiff.Schemas(authored, emitted, irdiff.Options{
 		IgnoreCharsetCollation: true,
 		IgnoreExtras:           false,
 	})
@@ -538,7 +538,7 @@ func runCongruenceReverseLeg(t *testing.T, pgDDLFile, mysqlDDLFile string, pairS
 	emitted := corpusReadMySQLSchema(t, emittedDSN, pairSize)
 
 	// authored = expected, emitted = actual.
-	diff := irdiff.DiffSchemas(authored, emitted, irdiff.DiffOptions{
+	diff := irdiff.Schemas(authored, emitted, irdiff.Options{
 		IgnoreCharsetCollation: true,
 		IgnoreExtras:           false,
 	})

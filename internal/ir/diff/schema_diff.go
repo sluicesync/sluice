@@ -9,7 +9,7 @@
 package diff
 
 // Schema-level structural diff for `sluice schema diff` (ADR-0029).
-// DiffSchemas is a pure function — no I/O, no engine knowledge, no
+// Schemas is a pure function — no I/O, no engine knowledge, no
 // rendering. The pipeline orchestrator wraps it with the source-side
 // translation pass and the target-side schema read; engine writers
 // turn the diff back into DDL suggestions.
@@ -269,9 +269,9 @@ type ExcludeDiff struct {
 	ActualDefinition   string `json:"actual_definition,omitempty"`
 }
 
-// DiffOptions configures DiffSchemas. The zero value is the strict
+// Options configures Schemas. The zero value is the strict
 // default (every drift surfaces).
-type DiffOptions struct {
+type Options struct {
 	// IgnoreExtras drops "extra on target" entries from the result —
 	// useful when the target hosts other applications' tables that
 	// sluice should ignore. ADR-0029.
@@ -289,14 +289,14 @@ type DiffOptions struct {
 	IgnoreCharsetCollation bool
 }
 
-// DiffSchemas computes the structural delta between expected and
+// Schemas computes the structural delta between expected and
 // actual. Both arguments must be non-nil; either may have zero tables
 // (an empty schema is a valid input).
 //
 // The function is pure: same inputs → same output, no I/O. The
 // orchestrator (internal/pipeline) handles reading the schemas,
 // applying translation passes, and rendering the result.
-func DiffSchemas(expected, actual *ir.Schema, opts DiffOptions) SchemaDiff {
+func Schemas(expected, actual *ir.Schema, opts Options) SchemaDiff {
 	var d SchemaDiff
 	if expected == nil || actual == nil {
 		return d
@@ -346,7 +346,7 @@ func DiffSchemas(expected, actual *ir.Schema, opts DiffOptions) SchemaDiff {
 // by name (set semantics, mirroring tables). Definition comparison is
 // trim-and-equal — no SQL parser, no canonicalization. Cross-engine
 // drift is therefore high-noise; the renderer hedges accordingly.
-func diffViews(d *SchemaDiff, expected, actual *ir.Schema, opts DiffOptions) {
+func diffViews(d *SchemaDiff, expected, actual *ir.Schema, opts Options) {
 	expByName := viewsByName(expected)
 	actByName := viewsByName(actual)
 
@@ -414,7 +414,7 @@ func viewsByName(s *ir.Schema) map[string]*ir.View {
 }
 
 // hasChanges reports whether td carries any non-empty delta. Used by
-// DiffSchemas to suppress empty TableDiff entries from the result.
+// Schemas to suppress empty TableDiff entries from the result.
 func (td TableDiff) hasChanges() bool {
 	return len(td.ColumnsMissing) > 0 ||
 		len(td.ColumnsExtra) > 0 ||
@@ -429,7 +429,7 @@ func (td TableDiff) hasChanges() bool {
 		len(td.ExcludesMismatched) > 0
 }
 
-func diffTable(expected, actual *ir.Table, opts DiffOptions) TableDiff {
+func diffTable(expected, actual *ir.Table, opts Options) TableDiff {
 	td := TableDiff{Name: expected.Name}
 
 	expCols := columnsByName(expected)
@@ -515,7 +515,7 @@ func diffTable(expected, actual *ir.Table, opts DiffOptions) TableDiff {
 // Unnamed CHECKs are skipped: an anonymous constraint can't be
 // matched across sides without expression-text comparison, which
 // would produce false positives on cross-engine spelling differences.
-func diffChecks(td *TableDiff, expected, actual *ir.Table, opts DiffOptions) {
+func diffChecks(td *TableDiff, expected, actual *ir.Table, opts Options) {
 	expChecks := checksByName(expected)
 	actChecks := checksByName(actual)
 
@@ -654,7 +654,7 @@ func diffColumn(expected, actual *ir.Column) (ColumnDiff, bool) {
 
 // stripCharsetCollation clears the four charset/collation fields on
 // a ColumnDiff and reports whether any other drift remains. Used
-// under DiffOptions.IgnoreCharsetCollation to suppress charset /
+// under Options.IgnoreCharsetCollation to suppress charset /
 // collation drift at compare time: column entries whose only
 // mismatch was on those fields drop out of ColumnsMismatched
 // entirely, while entries with additional drift (type, nullability,
@@ -899,7 +899,7 @@ func excludesByName(t *ir.Table) map[string]*ir.ExcludeConstraint {
 // constraints produce byte-identical text — any divergence (even
 // whitespace) is treated as a real change (operator hand-edited the
 // target / target PG version normalised differently). ADR-0053.
-func diffExcludes(td *TableDiff, expected, actual *ir.Table, opts DiffOptions) {
+func diffExcludes(td *TableDiff, expected, actual *ir.Table, opts Options) {
 	expExcl := excludesByName(expected)
 	actExcl := excludesByName(actual)
 

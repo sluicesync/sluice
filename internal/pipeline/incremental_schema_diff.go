@@ -5,7 +5,7 @@ package pipeline
 
 // Phase 3 schema-delta diff: turns a (before, after) pair of source
 // schemas into the [ir.SchemaDeltaEntry] slice that lands on the
-// incremental manifest. Distinct from the ir/diff package's DiffSchemas (which powers
+// incremental manifest. Distinct from the ir/diff package's Schemas (which powers
 // `sluice schema diff` and produces a richer drift shape with names
 // + low-confidence flags) — incrementals only need the simple
 // "added / dropped / altered" shape so chain-restore can replay the

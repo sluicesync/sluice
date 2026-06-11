@@ -301,7 +301,7 @@ func routeForwardBoundary(
 // SPECIFIC columns / indexes / constraints. Both go into the same
 // error so the operator gets a single grep-friendly message.
 func renderDriftForRefusal(pre, post *ir.Table) string {
-	report := irdiff.DiffTable(pre, post)
+	report := irdiff.TableDrift(pre, post)
 	rendered := RenderSchemaDriftReport(report)
 	if rendered == "" {
 		return ""

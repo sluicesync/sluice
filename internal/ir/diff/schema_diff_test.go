@@ -11,7 +11,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
-func TestDiffSchemas_NoChanges(t *testing.T) {
+func TestSchemas_NoChanges(t *testing.T) {
 	s := &ir.Schema{Tables: []*ir.Table{
 		{
 			Name: "users",
@@ -21,13 +21,13 @@ func TestDiffSchemas_NoChanges(t *testing.T) {
 			},
 		},
 	}}
-	d := DiffSchemas(s, s, DiffOptions{})
+	d := Schemas(s, s, Options{})
 	if d.HasChanges() {
 		t.Errorf("expected no changes; got %+v", d)
 	}
 }
 
-func TestDiffSchemas_TableMissingAndExtra(t *testing.T) {
+func TestSchemas_TableMissingAndExtra(t *testing.T) {
 	exp := &ir.Schema{Tables: []*ir.Table{
 		{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
 		{Name: "orders", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
@@ -36,7 +36,7 @@ func TestDiffSchemas_TableMissingAndExtra(t *testing.T) {
 		{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
 		{Name: "deprecated_log", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
 	}}
-	d := DiffSchemas(exp, act, DiffOptions{})
+	d := Schemas(exp, act, Options{})
 	if !reflect.DeepEqual(d.TablesMissing, []string{"orders"}) {
 		t.Errorf("missing = %v; want [orders]", d.TablesMissing)
 	}
@@ -48,7 +48,7 @@ func TestDiffSchemas_TableMissingAndExtra(t *testing.T) {
 	}
 }
 
-func TestDiffSchemas_IgnoreExtras(t *testing.T) {
+func TestSchemas_IgnoreExtras(t *testing.T) {
 	exp := &ir.Schema{Tables: []*ir.Table{
 		{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
 	}}
@@ -56,7 +56,7 @@ func TestDiffSchemas_IgnoreExtras(t *testing.T) {
 		{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}, {Name: "extra_col", Type: ir.Varchar{Length: 10}}}},
 		{Name: "other_app_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
 	}}
-	d := DiffSchemas(exp, act, DiffOptions{IgnoreExtras: true})
+	d := Schemas(exp, act, Options{IgnoreExtras: true})
 	if len(d.TablesExtra) != 0 {
 		t.Errorf("expected no extras under IgnoreExtras; got %v", d.TablesExtra)
 	}
@@ -67,7 +67,7 @@ func TestDiffSchemas_IgnoreExtras(t *testing.T) {
 	}
 }
 
-func TestDiffSchemas_ColumnMissingAndExtra(t *testing.T) {
+func TestSchemas_ColumnMissingAndExtra(t *testing.T) {
 	exp := &ir.Schema{Tables: []*ir.Table{
 		{
 			Name: "users",
@@ -88,7 +88,7 @@ func TestDiffSchemas_ColumnMissingAndExtra(t *testing.T) {
 			},
 		},
 	}}
-	d := DiffSchemas(exp, act, DiffOptions{})
+	d := Schemas(exp, act, Options{})
 	if len(d.TablesMismatched) != 1 {
 		t.Fatalf("expected 1 mismatched table; got %d", len(d.TablesMismatched))
 	}
@@ -104,14 +104,14 @@ func TestDiffSchemas_ColumnMissingAndExtra(t *testing.T) {
 	}
 }
 
-// TestDiffSchemas_SluiceInjected_SuppressedFromExtras pins ADR-0048
+// TestSchemas_SluiceInjected_SuppressedFromExtras pins ADR-0048
 // Decision 2: a target-side column carrying SluiceInjected=true is
 // expected to be present on the consolidated target but absent on
 // the per-shard source's expected schema, so it must NOT surface as
 // `ColumnsExtra` drift. Without this suppression every Shape-A
 // `schema diff` would emit a permanent false-positive for the
 // discriminator column.
-func TestDiffSchemas_SluiceInjected_SuppressedFromExtras(t *testing.T) {
+func TestSchemas_SluiceInjected_SuppressedFromExtras(t *testing.T) {
 	exp := &ir.Schema{Tables: []*ir.Table{{
 		Name: "customer",
 		Columns: []*ir.Column{
@@ -131,18 +131,18 @@ func TestDiffSchemas_SluiceInjected_SuppressedFromExtras(t *testing.T) {
 			{Column: "source_shard_id"}, {Column: "customer_id"},
 		}},
 	}}}
-	d := DiffSchemas(exp, act, DiffOptions{})
+	d := Schemas(exp, act, Options{})
 	if d.HasChanges() {
 		t.Fatalf("expected no drift on sluice-injected column; got %+v", d)
 	}
 }
 
-// TestDiffSchemas_SluiceInjected_NonInjectedStillSurfaces guards the
+// TestSchemas_SluiceInjected_NonInjectedStillSurfaces guards the
 // negative: a target-side column without the SluiceInjected marker
 // still surfaces as `ColumnsExtra` drift. Suppression is opt-in via
 // the marker; turning the gate off must not weaken the general drift
 // signal.
-func TestDiffSchemas_SluiceInjected_NonInjectedStillSurfaces(t *testing.T) {
+func TestSchemas_SluiceInjected_NonInjectedStillSurfaces(t *testing.T) {
 	exp := &ir.Schema{Tables: []*ir.Table{{
 		Name:    "users",
 		Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
@@ -156,7 +156,7 @@ func TestDiffSchemas_SluiceInjected_NonInjectedStillSurfaces(t *testing.T) {
 			{Name: "stray_column", Type: ir.Varchar{Length: 32}},
 		},
 	}}}
-	d := DiffSchemas(exp, act, DiffOptions{})
+	d := Schemas(exp, act, Options{})
 	if len(d.TablesMismatched) != 1 {
 		t.Fatalf("expected one mismatched table; got %+v", d)
 	}
@@ -165,7 +165,7 @@ func TestDiffSchemas_SluiceInjected_NonInjectedStillSurfaces(t *testing.T) {
 	}
 }
 
-func TestDiffSchemas_ColumnTypeMismatch(t *testing.T) {
+func TestSchemas_ColumnTypeMismatch(t *testing.T) {
 	cases := []struct {
 		name    string
 		expType ir.Type
@@ -184,7 +184,7 @@ func TestDiffSchemas_ColumnTypeMismatch(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			exp := &ir.Schema{Tables: []*ir.Table{{Name: "t", Columns: []*ir.Column{{Name: "c", Type: tc.expType}}}}}
 			act := &ir.Schema{Tables: []*ir.Table{{Name: "t", Columns: []*ir.Column{{Name: "c", Type: tc.actType}}}}}
-			d := DiffSchemas(exp, act, DiffOptions{})
+			d := Schemas(exp, act, Options{})
 			if len(d.TablesMismatched) != 1 || len(d.TablesMismatched[0].ColumnsMismatched) != 1 {
 				t.Fatalf("expected one column mismatch; got %+v", d)
 			}
@@ -199,14 +199,14 @@ func TestDiffSchemas_ColumnTypeMismatch(t *testing.T) {
 	}
 }
 
-func TestDiffSchemas_NullabilityMismatch(t *testing.T) {
+func TestSchemas_NullabilityMismatch(t *testing.T) {
 	exp := &ir.Schema{Tables: []*ir.Table{
 		{Name: "t", Columns: []*ir.Column{{Name: "c", Type: ir.Integer{Width: 32}, Nullable: false}}},
 	}}
 	act := &ir.Schema{Tables: []*ir.Table{
 		{Name: "t", Columns: []*ir.Column{{Name: "c", Type: ir.Integer{Width: 32}, Nullable: true}}},
 	}}
-	d := DiffSchemas(exp, act, DiffOptions{})
+	d := Schemas(exp, act, Options{})
 	if len(d.TablesMismatched) != 1 {
 		t.Fatalf("expected one table mismatch; got %+v", d)
 	}
@@ -224,11 +224,11 @@ func TestDiffSchemas_NullabilityMismatch(t *testing.T) {
 	}
 }
 
-// TestDiffSchemas_CharsetCollationMismatch covers the v0.11.0 (or
+// TestSchemas_CharsetCollationMismatch covers the v0.11.0 (or
 // whatever version this lands in) charset/collation drift detection.
 // Both fields surface as separate ColumnDiff fields and combine
 // independently — a column can have both, just one, or neither.
-func TestDiffSchemas_CharsetCollationMismatch(t *testing.T) {
+func TestSchemas_CharsetCollationMismatch(t *testing.T) {
 	cases := []struct {
 		name                       string
 		exp                        ir.Type
@@ -264,7 +264,7 @@ func TestDiffSchemas_CharsetCollationMismatch(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			exp := &ir.Schema{Tables: []*ir.Table{{Name: "t", Columns: []*ir.Column{{Name: "c", Type: tc.exp}}}}}
 			act := &ir.Schema{Tables: []*ir.Table{{Name: "t", Columns: []*ir.Column{{Name: "c", Type: tc.act}}}}}
-			d := DiffSchemas(exp, act, DiffOptions{})
+			d := Schemas(exp, act, Options{})
 			if len(d.TablesMismatched) != 1 || len(d.TablesMismatched[0].ColumnsMismatched) != 1 {
 				t.Fatalf("expected one column mismatch; got %+v", d)
 			}
@@ -290,13 +290,13 @@ func TestDiffSchemas_CharsetCollationMismatch(t *testing.T) {
 	}
 }
 
-// TestDiffSchemas_EmptySourceCharsetCollationNoDrift pins the
+// TestSchemas_EmptySourceCharsetCollationNoDrift pins the
 // v0.11.2 fix: when the source/expected side has an empty charset
 // or collation, comparison is skipped for that field rather than
 // surfacing the difference as drift. Covers the cross-engine
 // retarget case (PG→MySQL UUID→Char(36) where the retargeted Char
 // has no charset/collation) plus the non-character-type case.
-func TestDiffSchemas_EmptySourceCharsetCollationNoDrift(t *testing.T) {
+func TestSchemas_EmptySourceCharsetCollationNoDrift(t *testing.T) {
 	t.Run("empty source charset + populated target → no drift", func(t *testing.T) {
 		exp := &ir.Schema{Tables: []*ir.Table{{Name: "t", Columns: []*ir.Column{
 			{Name: "c", Type: ir.Char{Length: 36}}, // retargeted from PG UUID; no charset
@@ -304,7 +304,7 @@ func TestDiffSchemas_EmptySourceCharsetCollationNoDrift(t *testing.T) {
 		act := &ir.Schema{Tables: []*ir.Table{{Name: "t", Columns: []*ir.Column{
 			{Name: "c", Type: ir.Char{Length: 36, Charset: "utf8mb4", Collation: "utf8mb4_0900_ai_ci"}},
 		}}}}
-		d := DiffSchemas(exp, act, DiffOptions{})
+		d := Schemas(exp, act, Options{})
 		if len(d.TablesMismatched) != 0 {
 			t.Errorf("retargeted column should not surface as drift; got %+v", d.TablesMismatched)
 		}
@@ -320,7 +320,7 @@ func TestDiffSchemas_EmptySourceCharsetCollationNoDrift(t *testing.T) {
 		act := &ir.Schema{Tables: []*ir.Table{{Name: "t", Columns: []*ir.Column{
 			{Name: "c", Type: ir.Varchar{Length: 255}},
 		}}}}
-		d := DiffSchemas(exp, act, DiffOptions{})
+		d := Schemas(exp, act, Options{})
 		if len(d.TablesMismatched) != 1 {
 			t.Fatalf("expected drift when source declares charset and target doesn't; got %+v", d)
 		}
@@ -332,7 +332,7 @@ func TestDiffSchemas_EmptySourceCharsetCollationNoDrift(t *testing.T) {
 		act := &ir.Schema{Tables: []*ir.Table{{Name: "t", Columns: []*ir.Column{
 			{Name: "c", Type: ir.Varchar{Length: 255, Charset: "latin1"}},
 		}}}}
-		d := DiffSchemas(exp, act, DiffOptions{})
+		d := Schemas(exp, act, Options{})
 		if len(d.TablesMismatched) != 1 {
 			t.Fatalf("expected drift for differing charsets; got %+v", d)
 		}
@@ -343,12 +343,12 @@ func TestDiffSchemas_EmptySourceCharsetCollationNoDrift(t *testing.T) {
 	})
 }
 
-// TestDiffSchemas_IgnoreCharsetCollation pins the suppression
-// behaviour: when DiffOptions.IgnoreCharsetCollation is set,
+// TestSchemas_IgnoreCharsetCollation pins the suppression
+// behaviour: when Options.IgnoreCharsetCollation is set,
 // columns whose only drift was charset/collation drop out of
 // ColumnsMismatched entirely; columns with additional drift keep
 // surfacing minus the charset/collation fields.
-func TestDiffSchemas_IgnoreCharsetCollation(t *testing.T) {
+func TestSchemas_IgnoreCharsetCollation(t *testing.T) {
 	t.Run("only-charset drift suppressed", func(t *testing.T) {
 		exp := &ir.Schema{Tables: []*ir.Table{{Name: "t", Columns: []*ir.Column{
 			{Name: "c", Type: ir.Varchar{Length: 255, Charset: "utf8mb4", Collation: "utf8mb4_general_ci"}},
@@ -356,7 +356,7 @@ func TestDiffSchemas_IgnoreCharsetCollation(t *testing.T) {
 		act := &ir.Schema{Tables: []*ir.Table{{Name: "t", Columns: []*ir.Column{
 			{Name: "c", Type: ir.Varchar{Length: 255, Charset: "latin1", Collation: "latin1_swedish_ci"}},
 		}}}}
-		d := DiffSchemas(exp, act, DiffOptions{IgnoreCharsetCollation: true})
+		d := Schemas(exp, act, Options{IgnoreCharsetCollation: true})
 		if len(d.TablesMismatched) != 0 {
 			t.Errorf("expected no mismatches under IgnoreCharsetCollation; got %+v", d.TablesMismatched)
 		}
@@ -369,7 +369,7 @@ func TestDiffSchemas_IgnoreCharsetCollation(t *testing.T) {
 		act := &ir.Schema{Tables: []*ir.Table{{Name: "t", Columns: []*ir.Column{
 			{Name: "c", Type: ir.Varchar{Length: 100, Charset: "latin1"}},
 		}}}}
-		d := DiffSchemas(exp, act, DiffOptions{IgnoreCharsetCollation: true})
+		d := Schemas(exp, act, Options{IgnoreCharsetCollation: true})
 		if len(d.TablesMismatched) != 1 || len(d.TablesMismatched[0].ColumnsMismatched) != 1 {
 			t.Fatalf("expected the type drift to survive; got %+v", d)
 		}
@@ -383,7 +383,7 @@ func TestDiffSchemas_IgnoreCharsetCollation(t *testing.T) {
 	})
 }
 
-func TestDiffSchemas_IndexAddedRemoved(t *testing.T) {
+func TestSchemas_IndexAddedRemoved(t *testing.T) {
 	exp := &ir.Schema{Tables: []*ir.Table{
 		{
 			Name:    "users",
@@ -404,7 +404,7 @@ func TestDiffSchemas_IndexAddedRemoved(t *testing.T) {
 			},
 		},
 	}}
-	d := DiffSchemas(exp, act, DiffOptions{})
+	d := Schemas(exp, act, Options{})
 	if len(d.TablesMismatched) != 1 {
 		t.Fatalf("expected one table mismatch; got %+v", d)
 	}
@@ -417,7 +417,7 @@ func TestDiffSchemas_IndexAddedRemoved(t *testing.T) {
 	}
 }
 
-func TestDiffSchemas_PrimaryKeyTracked(t *testing.T) {
+func TestSchemas_PrimaryKeyTracked(t *testing.T) {
 	pk := &ir.Index{Name: "users_pkey", Columns: []ir.IndexColumn{{Column: "id"}}, Unique: true}
 	exp := &ir.Schema{Tables: []*ir.Table{
 		{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}, PrimaryKey: pk},
@@ -425,7 +425,7 @@ func TestDiffSchemas_PrimaryKeyTracked(t *testing.T) {
 	act := &ir.Schema{Tables: []*ir.Table{
 		{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
 	}}
-	d := DiffSchemas(exp, act, DiffOptions{})
+	d := Schemas(exp, act, Options{})
 	if len(d.TablesMismatched) != 1 || len(d.TablesMismatched[0].IndexesMissing) != 1 {
 		t.Fatalf("expected pk-as-index missing; got %+v", d)
 	}
@@ -434,32 +434,32 @@ func TestDiffSchemas_PrimaryKeyTracked(t *testing.T) {
 	}
 }
 
-func TestDiffSchemas_NilInputsReturnEmpty(t *testing.T) {
-	d := DiffSchemas(nil, nil, DiffOptions{})
+func TestSchemas_NilInputsReturnEmpty(t *testing.T) {
+	d := Schemas(nil, nil, Options{})
 	if d.HasChanges() {
 		t.Errorf("nil inputs should produce no diff; got %+v", d)
 	}
-	d = DiffSchemas(&ir.Schema{}, nil, DiffOptions{})
+	d = Schemas(&ir.Schema{}, nil, Options{})
 	if d.HasChanges() {
 		t.Errorf("nil actual should produce no diff; got %+v", d)
 	}
 }
 
-func TestDiffSchemas_SortedOutput(t *testing.T) {
+func TestSchemas_SortedOutput(t *testing.T) {
 	exp := &ir.Schema{Tables: []*ir.Table{
 		{Name: "z_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 32}}}},
 		{Name: "a_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 32}}}},
 		{Name: "m_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 32}}}},
 	}}
 	act := &ir.Schema{}
-	d := DiffSchemas(exp, act, DiffOptions{})
+	d := Schemas(exp, act, Options{})
 	want := []string{"a_table", "m_table", "z_table"}
 	if !reflect.DeepEqual(d.TablesMissing, want) {
 		t.Errorf("missing = %v; want sorted %v", d.TablesMissing, want)
 	}
 }
 
-func TestDiffSchemas_DefaultLiteralMismatch(t *testing.T) {
+func TestSchemas_DefaultLiteralMismatch(t *testing.T) {
 	exp := &ir.Schema{Tables: []*ir.Table{{
 		Name: "t",
 		Columns: []*ir.Column{{
@@ -474,7 +474,7 @@ func TestDiffSchemas_DefaultLiteralMismatch(t *testing.T) {
 			Default: ir.DefaultLiteral{Value: "2"},
 		}},
 	}}}
-	d := DiffSchemas(exp, act, DiffOptions{})
+	d := Schemas(exp, act, Options{})
 	if len(d.TablesMismatched) != 1 || len(d.TablesMismatched[0].ColumnsMismatched) != 1 {
 		t.Fatalf("expected literal-default mismatch; got %+v", d)
 	}
@@ -487,7 +487,7 @@ func TestDiffSchemas_DefaultLiteralMismatch(t *testing.T) {
 	}
 }
 
-func TestDiffSchemas_DefaultExpressionLowConfidence(t *testing.T) {
+func TestSchemas_DefaultExpressionLowConfidence(t *testing.T) {
 	exp := &ir.Schema{Tables: []*ir.Table{{
 		Name: "t",
 		Columns: []*ir.Column{{
@@ -502,7 +502,7 @@ func TestDiffSchemas_DefaultExpressionLowConfidence(t *testing.T) {
 			Default: ir.DefaultExpression{Expr: "now() AT TIME ZONE 'UTC'"},
 		}},
 	}}}
-	d := DiffSchemas(exp, act, DiffOptions{})
+	d := Schemas(exp, act, Options{})
 	if len(d.TablesMismatched) != 1 || len(d.TablesMismatched[0].ColumnsMismatched) != 1 {
 		t.Fatalf("expected expr-default mismatch; got %+v", d)
 	}
@@ -512,7 +512,7 @@ func TestDiffSchemas_DefaultExpressionLowConfidence(t *testing.T) {
 	}
 }
 
-func TestDiffSchemas_DefaultMissingHighConfidence(t *testing.T) {
+func TestSchemas_DefaultMissingHighConfidence(t *testing.T) {
 	exp := &ir.Schema{Tables: []*ir.Table{{
 		Name: "t",
 		Columns: []*ir.Column{{
@@ -524,7 +524,7 @@ func TestDiffSchemas_DefaultMissingHighConfidence(t *testing.T) {
 		Name:    "t",
 		Columns: []*ir.Column{{Name: "c", Type: ir.Integer{Width: 32}}},
 	}}}
-	d := DiffSchemas(exp, act, DiffOptions{})
+	d := Schemas(exp, act, Options{})
 	cd := d.TablesMismatched[0].ColumnsMismatched[0]
 	if cd.DefaultLowConfidence {
 		t.Errorf("missing-on-one-side default drift should be high confidence; got %+v", cd)
@@ -534,7 +534,7 @@ func TestDiffSchemas_DefaultMissingHighConfidence(t *testing.T) {
 	}
 }
 
-func TestDiffSchemas_DefaultEquivalencesSuppressDrift(t *testing.T) {
+func TestSchemas_DefaultEquivalencesSuppressDrift(t *testing.T) {
 	cases := []struct {
 		name string
 		exp  string
@@ -562,7 +562,7 @@ func TestDiffSchemas_DefaultEquivalencesSuppressDrift(t *testing.T) {
 					Default: ir.DefaultExpression{Expr: tc.act},
 				}},
 			}}}
-			d := DiffSchemas(exp, act, DiffOptions{})
+			d := Schemas(exp, act, Options{})
 			if d.HasChanges() {
 				t.Errorf("expected no drift for %s vs %s; got %+v", tc.exp, tc.act, d)
 			}
@@ -570,7 +570,7 @@ func TestDiffSchemas_DefaultEquivalencesSuppressDrift(t *testing.T) {
 	}
 }
 
-func TestDiffSchemas_GeneratedExprMismatch(t *testing.T) {
+func TestSchemas_GeneratedExprMismatch(t *testing.T) {
 	exp := &ir.Schema{Tables: []*ir.Table{{
 		Name: "t",
 		Columns: []*ir.Column{{
@@ -585,14 +585,14 @@ func TestDiffSchemas_GeneratedExprMismatch(t *testing.T) {
 			GeneratedExpr: "(price * 1.2)", GeneratedStored: true,
 		}},
 	}}}
-	d := DiffSchemas(exp, act, DiffOptions{})
+	d := Schemas(exp, act, Options{})
 	cd := d.TablesMismatched[0].ColumnsMismatched[0]
 	if cd.ExpectedGeneratedExpr != "(price * 1.1)" || cd.ActualGeneratedExpr != "(price * 1.2)" {
 		t.Errorf("expected generated-expr fields populated; got %+v", cd)
 	}
 }
 
-func TestDiffSchemas_GeneratedExprMissingOnOneSide(t *testing.T) {
+func TestSchemas_GeneratedExprMissingOnOneSide(t *testing.T) {
 	exp := &ir.Schema{Tables: []*ir.Table{{
 		Name: "t",
 		Columns: []*ir.Column{{
@@ -604,14 +604,14 @@ func TestDiffSchemas_GeneratedExprMissingOnOneSide(t *testing.T) {
 		Name:    "t",
 		Columns: []*ir.Column{{Name: "c", Type: ir.Integer{Width: 32}}},
 	}}}
-	d := DiffSchemas(exp, act, DiffOptions{})
+	d := Schemas(exp, act, Options{})
 	cd := d.TablesMismatched[0].ColumnsMismatched[0]
 	if cd.ExpectedGeneratedExpr == "" || cd.ActualGeneratedExpr != "" {
 		t.Errorf("expected generated-expr asymmetry; got %+v", cd)
 	}
 }
 
-func TestDiffSchemas_CheckConstraintMissingExtra(t *testing.T) {
+func TestSchemas_CheckConstraintMissingExtra(t *testing.T) {
 	exp := &ir.Schema{Tables: []*ir.Table{{
 		Name:    "t",
 		Columns: []*ir.Column{{Name: "qty", Type: ir.Integer{Width: 32}}},
@@ -626,7 +626,7 @@ func TestDiffSchemas_CheckConstraintMissingExtra(t *testing.T) {
 			{Name: "legacy_check", Expr: "qty < 1000"},
 		},
 	}}}
-	d := DiffSchemas(exp, act, DiffOptions{})
+	d := Schemas(exp, act, Options{})
 	td := d.TablesMismatched[0]
 	if !reflect.DeepEqual(td.ChecksMissing, []string{"qty_nonneg"}) {
 		t.Errorf("missing checks = %v; want [qty_nonneg]", td.ChecksMissing)
@@ -636,7 +636,7 @@ func TestDiffSchemas_CheckConstraintMissingExtra(t *testing.T) {
 	}
 }
 
-func TestDiffSchemas_CheckConstraintMismatch(t *testing.T) {
+func TestSchemas_CheckConstraintMismatch(t *testing.T) {
 	exp := &ir.Schema{Tables: []*ir.Table{{
 		Name:    "t",
 		Columns: []*ir.Column{{Name: "qty", Type: ir.Integer{Width: 32}}},
@@ -651,7 +651,7 @@ func TestDiffSchemas_CheckConstraintMismatch(t *testing.T) {
 			{Name: "qty_range", Expr: "qty > 0"},
 		},
 	}}}
-	d := DiffSchemas(exp, act, DiffOptions{})
+	d := Schemas(exp, act, Options{})
 	td := d.TablesMismatched[0]
 	if len(td.ChecksMismatched) != 1 {
 		t.Fatalf("expected one CHECK mismatch; got %+v", td)
@@ -662,7 +662,7 @@ func TestDiffSchemas_CheckConstraintMismatch(t *testing.T) {
 	}
 }
 
-func TestDiffSchemas_CheckConstraintIgnoreExtras(t *testing.T) {
+func TestSchemas_CheckConstraintIgnoreExtras(t *testing.T) {
 	exp := &ir.Schema{Tables: []*ir.Table{{
 		Name:    "t",
 		Columns: []*ir.Column{{Name: "qty", Type: ir.Integer{Width: 32}}},
@@ -674,13 +674,13 @@ func TestDiffSchemas_CheckConstraintIgnoreExtras(t *testing.T) {
 			{Name: "legacy_check", Expr: "qty < 1000"},
 		},
 	}}}
-	d := DiffSchemas(exp, act, DiffOptions{IgnoreExtras: true})
+	d := Schemas(exp, act, Options{IgnoreExtras: true})
 	if d.HasChanges() {
 		t.Errorf("expected no drift under IgnoreExtras; got %+v", d)
 	}
 }
 
-func TestDiffSchemas_CheckConstraintsUnnamedSkipped(t *testing.T) {
+func TestSchemas_CheckConstraintsUnnamedSkipped(t *testing.T) {
 	// Anonymous CHECKs aren't matched across sides — they'd produce
 	// false positives on cross-engine spelling differences. The diff
 	// silently drops them.
@@ -695,13 +695,13 @@ func TestDiffSchemas_CheckConstraintsUnnamedSkipped(t *testing.T) {
 		Name:    "t",
 		Columns: []*ir.Column{{Name: "qty", Type: ir.Integer{Width: 32}}},
 	}}}
-	d := DiffSchemas(exp, act, DiffOptions{})
+	d := Schemas(exp, act, Options{})
 	if d.HasChanges() {
 		t.Errorf("unnamed CHECK should not surface as drift; got %+v", d)
 	}
 }
 
-func TestDiffSchemas_Summary_IncludesNewCategories(t *testing.T) {
+func TestSchemas_Summary_IncludesNewCategories(t *testing.T) {
 	exp := &ir.Schema{Tables: []*ir.Table{{
 		Name:    "t",
 		Columns: []*ir.Column{{Name: "qty", Type: ir.Integer{Width: 32}}},
@@ -718,7 +718,7 @@ func TestDiffSchemas_Summary_IncludesNewCategories(t *testing.T) {
 			{Name: "c", Expr: "qty != 7"},
 		},
 	}}}
-	d := DiffSchemas(exp, act, DiffOptions{})
+	d := Schemas(exp, act, Options{})
 	got := d.Summary()
 	for _, want := range []string{"missing CHECK", "extra CHECK", "CHECK mismatch"} {
 		if !strings.Contains(got, want) {
@@ -732,7 +732,7 @@ func TestDiffSchemas_Summary_IncludesNewCategories(t *testing.T) {
 // (matched by Name; Definition equality byte-exact). PG-only; MySQL
 // sides always carry empty slices.
 
-func TestDiffSchemas_ExcludeConstraintMissingExtra(t *testing.T) {
+func TestSchemas_ExcludeConstraintMissingExtra(t *testing.T) {
 	exp := &ir.Schema{Tables: []*ir.Table{{
 		Name:    "t",
 		Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
@@ -747,7 +747,7 @@ func TestDiffSchemas_ExcludeConstraintMissingExtra(t *testing.T) {
 			{Name: "legacy_overlap", Definition: "EXCLUDE USING gist (id WITH &&)"},
 		},
 	}}}
-	d := DiffSchemas(exp, act, DiffOptions{})
+	d := Schemas(exp, act, Options{})
 	td := d.TablesMismatched[0]
 	if !reflect.DeepEqual(td.ExcludesMissing, []string{"range_no_overlap"}) {
 		t.Errorf("missing excludes = %v; want [range_no_overlap]", td.ExcludesMissing)
@@ -757,7 +757,7 @@ func TestDiffSchemas_ExcludeConstraintMissingExtra(t *testing.T) {
 	}
 }
 
-func TestDiffSchemas_ExcludeConstraintDefinitionMismatch(t *testing.T) {
+func TestSchemas_ExcludeConstraintDefinitionMismatch(t *testing.T) {
 	// Byte-exact Definition equality — predicate-whitespace difference
 	// surfaces as a real mismatch (pg_get_constraintdef is server-
 	// canonicalized so a real divergence here means hand-edit on one
@@ -774,7 +774,7 @@ func TestDiffSchemas_ExcludeConstraintDefinitionMismatch(t *testing.T) {
 			{Name: "ex", Definition: "EXCLUDE USING gist (id WITH &&) WHERE ((id > 0))"},
 		},
 	}}}
-	d := DiffSchemas(exp, act, DiffOptions{})
+	d := Schemas(exp, act, Options{})
 	td := d.TablesMismatched[0]
 	if len(td.ExcludesMismatched) != 1 {
 		t.Fatalf("expected one EXCLUDE mismatch; got %+v", td)
@@ -791,7 +791,7 @@ func TestDiffSchemas_ExcludeConstraintDefinitionMismatch(t *testing.T) {
 	}
 }
 
-func TestDiffSchemas_ExcludeConstraintIgnoreExtras(t *testing.T) {
+func TestSchemas_ExcludeConstraintIgnoreExtras(t *testing.T) {
 	exp := &ir.Schema{Tables: []*ir.Table{{Name: "t"}}}
 	act := &ir.Schema{Tables: []*ir.Table{{
 		Name: "t",
@@ -799,13 +799,13 @@ func TestDiffSchemas_ExcludeConstraintIgnoreExtras(t *testing.T) {
 			{Name: "legacy_overlap", Definition: "EXCLUDE USING gist (id WITH &&)"},
 		},
 	}}}
-	d := DiffSchemas(exp, act, DiffOptions{IgnoreExtras: true})
+	d := Schemas(exp, act, Options{IgnoreExtras: true})
 	if d.HasChanges() {
 		t.Errorf("expected no drift under IgnoreExtras for extra EXCLUDE; got %+v", d)
 	}
 }
 
-func TestDiffSchemas_Summary_IncludesExcludeCategories(t *testing.T) {
+func TestSchemas_Summary_IncludesExcludeCategories(t *testing.T) {
 	exp := &ir.Schema{Tables: []*ir.Table{{
 		Name: "t",
 		ExcludeConstraints: []*ir.ExcludeConstraint{
@@ -820,7 +820,7 @@ func TestDiffSchemas_Summary_IncludesExcludeCategories(t *testing.T) {
 			{Name: "c", Definition: "EXCLUDE USING gist (id WITH @>)"},
 		},
 	}}}
-	d := DiffSchemas(exp, act, DiffOptions{})
+	d := Schemas(exp, act, Options{})
 	got := d.Summary()
 	for _, want := range []string{"missing EXCLUDE", "extra EXCLUDE", "EXCLUDE mismatch"} {
 		if !strings.Contains(got, want) {
@@ -829,10 +829,10 @@ func TestDiffSchemas_Summary_IncludesExcludeCategories(t *testing.T) {
 	}
 }
 
-// TestDiffSchemas_ViewsMissingAndExtra covers the view-level
+// TestSchemas_ViewsMissingAndExtra covers the view-level
 // missing/extra set-semantics added in the view-support Phase 1
-// commit. Mirrors TestDiffSchemas_TableMissingAndExtra.
-func TestDiffSchemas_ViewsMissingAndExtra(t *testing.T) {
+// commit. Mirrors TestSchemas_TableMissingAndExtra.
+func TestSchemas_ViewsMissingAndExtra(t *testing.T) {
 	exp := &ir.Schema{Views: []*ir.View{
 		{Name: "active_users", Definition: "SELECT id FROM users WHERE active"},
 		{Name: "recent_orders", Definition: "SELECT id FROM orders WHERE created_at > NOW() - INTERVAL '7 days'"},
@@ -841,7 +841,7 @@ func TestDiffSchemas_ViewsMissingAndExtra(t *testing.T) {
 		{Name: "active_users", Definition: "SELECT id FROM users WHERE active"},
 		{Name: "deprecated_view", Definition: "SELECT 1"},
 	}}
-	d := DiffSchemas(exp, act, DiffOptions{})
+	d := Schemas(exp, act, Options{})
 	if !reflect.DeepEqual(d.ViewsMissing, []string{"recent_orders"}) {
 		t.Errorf("ViewsMissing = %v; want [recent_orders]", d.ViewsMissing)
 	}
@@ -853,9 +853,9 @@ func TestDiffSchemas_ViewsMissingAndExtra(t *testing.T) {
 	}
 }
 
-// TestDiffSchemas_ViewsIgnoreExtras verifies the IgnoreExtras opt
+// TestSchemas_ViewsIgnoreExtras verifies the IgnoreExtras opt
 // suppresses extra-on-target views (mirrors the table behaviour).
-func TestDiffSchemas_ViewsIgnoreExtras(t *testing.T) {
+func TestSchemas_ViewsIgnoreExtras(t *testing.T) {
 	exp := &ir.Schema{Views: []*ir.View{
 		{Name: "v1", Definition: "SELECT 1"},
 	}}
@@ -863,23 +863,23 @@ func TestDiffSchemas_ViewsIgnoreExtras(t *testing.T) {
 		{Name: "v1", Definition: "SELECT 1"},
 		{Name: "other_app_view", Definition: "SELECT 2"},
 	}}
-	d := DiffSchemas(exp, act, DiffOptions{IgnoreExtras: true})
+	d := Schemas(exp, act, Options{IgnoreExtras: true})
 	if len(d.ViewsExtra) != 0 {
 		t.Errorf("ViewsExtra = %v; want empty under IgnoreExtras", d.ViewsExtra)
 	}
 }
 
-// TestDiffSchemas_ViewsMismatched_DefinitionDrift covers the trim-
+// TestSchemas_ViewsMismatched_DefinitionDrift covers the trim-
 // and-equal definition comparison. A view whose body changes
 // (whitespace-insensitive) surfaces in ViewsMismatched.
-func TestDiffSchemas_ViewsMismatched_DefinitionDrift(t *testing.T) {
+func TestSchemas_ViewsMismatched_DefinitionDrift(t *testing.T) {
 	exp := &ir.Schema{Views: []*ir.View{
 		{Name: "v1", Definition: "SELECT id, email FROM users"},
 	}}
 	act := &ir.Schema{Views: []*ir.View{
 		{Name: "v1", Definition: "SELECT id FROM users"},
 	}}
-	d := DiffSchemas(exp, act, DiffOptions{})
+	d := Schemas(exp, act, Options{})
 	if len(d.ViewsMismatched) != 1 {
 		t.Fatalf("ViewsMismatched len = %d; want 1", len(d.ViewsMismatched))
 	}
@@ -892,17 +892,17 @@ func TestDiffSchemas_ViewsMismatched_DefinitionDrift(t *testing.T) {
 	}
 }
 
-// TestDiffSchemas_ViewsMismatched_MaterializedFlag covers the
+// TestSchemas_ViewsMismatched_MaterializedFlag covers the
 // materialized-flag drift case: same body, different materialized
 // flag.
-func TestDiffSchemas_ViewsMismatched_MaterializedFlag(t *testing.T) {
+func TestSchemas_ViewsMismatched_MaterializedFlag(t *testing.T) {
 	exp := &ir.Schema{Views: []*ir.View{
 		{Name: "v1", Definition: "SELECT 1", Materialized: true},
 	}}
 	act := &ir.Schema{Views: []*ir.View{
 		{Name: "v1", Definition: "SELECT 1", Materialized: false},
 	}}
-	d := DiffSchemas(exp, act, DiffOptions{})
+	d := Schemas(exp, act, Options{})
 	if len(d.ViewsMismatched) != 1 {
 		t.Fatalf("ViewsMismatched len = %d; want 1", len(d.ViewsMismatched))
 	}
@@ -916,9 +916,9 @@ func TestDiffSchemas_ViewsMismatched_MaterializedFlag(t *testing.T) {
 	}
 }
 
-// TestDiffSchemas_ViewsSummary verifies the Summary() rollup picks
+// TestSchemas_ViewsSummary verifies the Summary() rollup picks
 // up view-level drift counts.
-func TestDiffSchemas_ViewsSummary(t *testing.T) {
+func TestSchemas_ViewsSummary(t *testing.T) {
 	exp := &ir.Schema{Views: []*ir.View{
 		{Name: "a", Definition: "SELECT 1"},
 		{Name: "b", Definition: "SELECT 2"},
@@ -927,7 +927,7 @@ func TestDiffSchemas_ViewsSummary(t *testing.T) {
 		{Name: "a", Definition: "SELECT 1 WHERE TRUE"}, // mismatched
 		{Name: "c", Definition: "SELECT 3"},            // extra
 	}}
-	d := DiffSchemas(exp, act, DiffOptions{})
+	d := Schemas(exp, act, Options{})
 	got := d.Summary()
 	for _, want := range []string{"missing view", "extra view", "view mismatch"} {
 		if !strings.Contains(got, want) {

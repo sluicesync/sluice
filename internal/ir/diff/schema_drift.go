@@ -14,10 +14,10 @@ package diff
 // boundary, and the post-DDL `*Table` observed from the CDC
 // projection).
 //
-// DiffTable is intentionally narrower than [DiffSchemas]: it covers
+// TableDrift is intentionally narrower than [Schemas]: it covers
 // the single-table per-boundary delta and is intended for inclusion
 // in refusal error messages, NOT for full schema reconciliation.
-// [DiffSchemas] continues to own the `sluice schema diff` flow.
+// [Schemas] continues to own the `sluice schema diff` flow.
 //
 // Engine-neutrality: the diff structure compares IR struct fields
 // only; no engine-specific knowledge leaks in. When a source's CDC
@@ -78,7 +78,7 @@ type SchemaDriftReport struct {
 
 	// IndexesAdded are named indexes present in post but absent from
 	// pre. Unnamed indexes are excluded by design (same convention as
-	// [DiffSchemas] and the pipeline shape classifier).
+	// [Schemas] and the pipeline shape classifier).
 	IndexesAdded []IndexDriftEntry
 
 	// IndexesDropped are named indexes present in pre but absent
@@ -95,7 +95,7 @@ type SchemaDriftReport struct {
 
 	// ChecksAltered are CHECK constraints with the same Name but
 	// different Expr text. Cross-engine textual comparison limits
-	// apply (see [DiffSchemas]'s notes), but inside CDC-apply the
+	// apply (see [Schemas]'s notes), but inside CDC-apply the
 	// pre and post originate from the SAME source engine, so the
 	// noise floor is much lower than `schema diff`.
 	ChecksAltered []CheckAlterEntry
@@ -238,7 +238,7 @@ func (r SchemaDriftReport) HasChanges() bool {
 		false
 }
 
-// DiffTable computes the per-table drift report between two IR
+// TableDrift computes the per-table drift report between two IR
 // snapshots. Both arguments may be nil — a nil pre is treated as
 // "table absent before" (every post-column surfaces as added), and a
 // nil post is treated as "table dropped" (every pre-column surfaces
@@ -253,7 +253,7 @@ func (r SchemaDriftReport) HasChanges() bool {
 //     dropped+added entries are then omitted from the add/drop slices
 //     (no double-counting).
 //   - Indexes are matched by [ir.Index.Name]; unnamed indexes are
-//     skipped (same convention as [DiffSchemas]).
+//     skipped (same convention as [Schemas]).
 //   - CHECK constraints are matched by [ir.CheckConstraint.Name];
 //     unnamed checks are skipped.
 //   - Foreign keys with non-empty Name match by name; unnamed FKs
@@ -261,7 +261,7 @@ func (r SchemaDriftReport) HasChanges() bool {
 //
 // The function is pure: same inputs → same output, no I/O. Slice
 // orderings are deterministic (alphabetical by identifying name).
-func DiffTable(pre, post *ir.Table) SchemaDriftReport {
+func TableDrift(pre, post *ir.Table) SchemaDriftReport {
 	var report SchemaDriftReport
 	switch {
 	case pre == nil && post == nil:

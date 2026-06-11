@@ -10,7 +10,7 @@ package pipeline
 // source DDL on the CDC stream, the refusal text must surface WHAT
 // changed and WHAT THE OPERATOR SHOULD DO — not just the table name.
 // This file owns the rendering pass; the underlying pure-function
-// diff lives in [irdiff.DiffTable]. The split keeps the engine-neutral
+// diff lives in [irdiff.TableDrift]. The split keeps the engine-neutral
 // diff data structure in `internal/ir/` while the
 // pipeline-specific operator-action wording (drained-model recovery
 // hint, --forward-schema-add-column reference, etc.) stays here in
