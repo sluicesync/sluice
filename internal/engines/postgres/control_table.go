@@ -145,6 +145,18 @@ type shardConsolidationLeaseRow = appliershared.ShardLeaseRow
 // the existing row is takeover-eligible. RETURNING + a follow-up
 // SELECT (under PG's snapshot semantics inside the same tx) gives the
 // caller a consistent view.
+//
+// UTC contract (task #44, the lease-TZ class): lease_expires_at is a
+// naive TIMESTAMP column, and pgx encodes a time.Time parameter as the
+// value's wall-clock digits in its own location. A host running
+// TZ=UTC-7 would therefore store digits seven hours behind the
+// server's clock, making the takeover guard true the instant the
+// lease is written (instantly stealable); a TZ-ahead host gets stuck
+// leases. Every client-supplied expiry is normalized to .UTC() before
+// binding, and the SQL guard compares against timezone('utc', now())
+// — a naive timestamp holding UTC digits — instead of
+// CURRENT_TIMESTAMP, whose timestamptz comparison would coerce the
+// column through the session TimeZone.
 func tryAcquireShardLease(ctx context.Context, db *sql.DB, schema, tableName, streamID string, expires time.Time) (acquired bool, current shardConsolidationLeaseRow, err error) {
 	tableRef := shardLeaseTableRef(schema)
 	// Single-statement upsert; RETURNING gives back whether the
@@ -173,7 +185,7 @@ func tryAcquireShardLease(ctx context.Context, db *sql.DB, schema, tableName, st
 			lease_holder_stream_id = EXCLUDED.lease_holder_stream_id,
 			lease_expires_at       = EXCLUDED.lease_expires_at
 		WHERE
-			` + tableRef + `.lease_expires_at <= CURRENT_TIMESTAMP
+			` + tableRef + `.lease_expires_at <= timezone('utc', now())
 			AND ` + tableRef + `.applied_at IS NULL
 		RETURNING
 			target_table_full_name,
@@ -186,7 +198,7 @@ func tryAcquireShardLease(ctx context.Context, db *sql.DB, schema, tableName, st
 			anchor_position,
 			source_engine`
 	var got shardConsolidationLeaseRow
-	scanErr := appliershared.ScanShardLeaseRow(db.QueryRowContext(ctx, q, tableName, streamID, expires), &got)
+	scanErr := appliershared.ScanShardLeaseRow(db.QueryRowContext(ctx, q, tableName, streamID, expires.UTC()), &got)
 	switch {
 	case errors.Is(scanErr, sql.ErrNoRows):
 		// Conditional upsert WHERE-guard rejected the conflict path:
@@ -218,12 +230,15 @@ func tryAcquireShardLease(ctx context.Context, db *sql.DB, schema, tableName, st
 // NULL. A holder that has already finalized would no-op here, but
 // the heartbeat loop doesn't fire after Apply closes stopCh, so
 // this case shouldn't arise in practice.
+//
+// expires is normalized to .UTC() before binding — same naive-
+// TIMESTAMP contract as tryAcquireShardLease (task #44).
 func heartbeatShardLease(ctx context.Context, db *sql.DB, schema, tableName, streamID string, expires time.Time) (extended bool, err error) {
 	q := "UPDATE " + shardLeaseTableRef(schema) + " SET lease_expires_at = $1 " +
 		"WHERE target_table_full_name = $2 " +
 		"AND lease_holder_stream_id = $3 " +
 		"AND applied_at IS NULL"
-	return appliershared.GuardedExec(ctx, db, controlCfg, "lease heartbeat", q, expires, tableName, streamID)
+	return appliershared.GuardedExec(ctx, db, controlCfg, "lease heartbeat", q, expires.UTC(), tableName, streamID)
 }
 
 // recordShardLeaseDDLText UPDATEs ddl_text for the held lease. Same

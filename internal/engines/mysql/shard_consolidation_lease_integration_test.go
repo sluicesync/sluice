@@ -228,3 +228,82 @@ func TestShardConsolidationLease_TakeoverExpiredRow(t *testing.T) {
 		t.Errorf("prior ddl_text not preserved: got %q, want %q", row.DDLText, priorDDL)
 	}
 }
+
+// TestShardConsolidationLease_HostTZIndependence pins the lease-TZ
+// class (task #44) on the MySQL side: the host process's time zone
+// must not affect lease semantics. Unlike the PG counterpart (which
+// needed a fix — pgx writes a time.Time's own-location wall-clock
+// digits into the naive TIMESTAMP column), MySQL was already correct
+// by construction: parseDSN forces cfg.Loc=UTC (go-sql-driver converts
+// a bound time.Time to cfg.Loc before formatting) plus session
+// time_zone='+00:00', so the stored expiry, the retrieved expiry, and
+// the SELECT CURRENT_TIMESTAMP the acquire path compares against all
+// agree on UTC regardless of host TZ. This pin keeps that contract
+// from regressing: the expiries are deliberately constructed in fixed
+// non-UTC zones — both skew directions — so it fails on any host,
+// including CI's UTC runners, if a DSN/loc change reintroduces the
+// class. (time.In only changes the rendered digits, never the
+// instant.)
+func TestShardConsolidationLease_HostTZIndependence(t *testing.T) {
+	dsn, cleanup := startMySQLForApplier(t)
+	defer cleanup()
+
+	eng := Engine{}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	a, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := a.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+	if err := a.EnsureControlTable(ctx); err != nil {
+		t.Fatalf("EnsureControlTable: %v", err)
+	}
+	applier := a.(*ChangeApplier)
+
+	behindUTC := time.FixedZone("UTC-7", -7*3600)
+	aheadUTC := time.FixedZone("UTC+9", 9*3600)
+
+	// Skew direction 1 (TZ-behind-UTC host → instant steal): a live
+	// 60s lease whose expiry carries UTC-7 wall-clock digits must
+	// still refuse a contended acquire.
+	const heldTable = "users"
+	expires := time.Now().In(behindUTC).Add(60 * time.Second)
+	if _, _, err := applier.TryAcquireLease(ctx, heldTable, "stream-a", expires); err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+	acquired, row, err := applier.TryAcquireLease(ctx, heldTable, "stream-b", time.Now().In(behindUTC).Add(60*time.Second))
+	if err != nil {
+		t.Fatalf("contended acquire: %v", err)
+	}
+	if acquired {
+		t.Fatal("lease-TZ class regression: a just-acquired 60s lease written from a UTC-7 clock was stolen")
+	}
+	if row.LeaseHolderStreamID != "stream-a" {
+		t.Errorf("current holder = %q, want stream-a", row.LeaseHolderStreamID)
+	}
+
+	// Skew direction 2 (TZ-ahead-of-UTC host → stuck lease): an
+	// already-expired lease whose expiry carries UTC+9 wall-clock
+	// digits must still be takeover-eligible.
+	const expiredTable = "orders"
+	pastExpires := time.Now().In(aheadUTC).Add(-1 * time.Second)
+	if _, _, err := applier.TryAcquireLease(ctx, expiredTable, "stream-a", pastExpires); err != nil {
+		t.Fatalf("expired acquire: %v", err)
+	}
+	acquired, row, err = applier.TryAcquireLease(ctx, expiredTable, "stream-b", time.Now().In(aheadUTC).Add(60*time.Second))
+	if err != nil {
+		t.Fatalf("takeover acquire: %v", err)
+	}
+	if !acquired {
+		t.Fatal("lease-TZ class regression: an expired lease written from a UTC+9 clock was not takeover-eligible (stuck lease)")
+	}
+	if row.LeaseHolderStreamID != "stream-b" {
+		t.Errorf("new holder = %q, want stream-b", row.LeaseHolderStreamID)
+	}
+}

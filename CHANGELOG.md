@@ -6,6 +6,24 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **ADR-0054 shard-consolidation leases are now host-TZ-independent on
+  Postgres targets (task #44).** `lease_expires_at` is a naive
+  `TIMESTAMP` column, and pgx encodes a `time.Time` parameter as its own
+  location's wall-clock digits — so a sluice process on a TZ-behind-UTC
+  host (e.g. PDT) wrote an expiry hours in the past, making a
+  just-acquired lease instantly stealable by a peer shard (the
+  cross-shard DDL serialization guarantee was void), while a
+  TZ-ahead-of-UTC host wrote an expiry hours in the future (stuck
+  lease blocking takeover). Lease expiries are now normalized to UTC
+  before binding, and the takeover guard compares against
+  `timezone('utc', now())` instead of `CURRENT_TIMESTAMP`. Rows written
+  by earlier versions from UTC hosts already hold UTC digits and remain
+  compatible; rows from non-UTC hosts were already broken in the same
+  direction this fixes. MySQL targets were unaffected (the driver
+  config pins `loc=UTC` + session `time_zone='+00:00'`); a host-TZ
+  independence pin now covers both engines and both skew directions.
+
 ## [0.99.36] - 2026-06-11
 
 ### Fixed
