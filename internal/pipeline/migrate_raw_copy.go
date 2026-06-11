@@ -23,6 +23,7 @@
 package pipeline
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -232,14 +233,30 @@ func negotiateRawCopyFormat(ctx context.Context, requested ir.RawCopyFormat, exp
 	return ir.RawCopyBinary
 }
 
+// rawCopyPipeBufSize is the bufio.Writer capacity in front of the raw-copy
+// io.Pipe. The PG server emits ONE CopyData message per row on COPY TO
+// STDOUT, and io.Pipe is an unbuffered rendezvous — so without coalescing,
+// every row costs two goroutine context switches (pipe handoff) and one
+// tiny per-row socket write on the import side (pgconn's CopyFrom reads
+// whatever one pipe Write carried and ships it as one unbuffered CopyData
+// frame). Profiling (task #37) attributed ~82% of single-stream CPU to
+// those per-row target writes — the per-stream gap vs pgcopydb's libpq
+// splice, which buffers to 8 KiB internally. Coalescing rows into 64 KiB
+// pipe writes is byte-transparent (the COPY stream has no per-Write
+// framing) and matches pgconn's 64 KiB CopyFrom read buffer.
+const rawCopyPipeBufSize = 64 * 1024
+
 // runRawCopyChunk byte-pipes one table (chunk == nil) or one PK-bounded
 // chunk from the exporter to the importer through an io.Pipe under an
 // errgroup. The exporter writes the source's COPY-TO-STDOUT bytes into
-// the pipe writer in one goroutine; the importer reads them from the
-// pipe reader via COPY-FROM-STDIN in another. The exporter closes the
-// write end on completion (signalling EOF to the reader); an importer
-// error is propagated back to the exporter via pr.CloseWithError so a
-// failed import unblocks a still-writing exporter instead of deadlocking.
+// the pipe writer in one goroutine — through a [rawCopyPipeBufSize]
+// bufio.Writer that coalesces the server's per-row CopyData payloads into
+// large pipe writes (see the constant's comment); the importer reads them
+// from the pipe reader via COPY-FROM-STDIN in another. The exporter
+// flushes and closes the write end on completion (signalling EOF to the
+// reader); an importer error is propagated back to the exporter via
+// pr.CloseWithError so a failed import unblocks a still-writing exporter
+// instead of deadlocking.
 //
 // Returns the server-reported row count from the import side (a byte-pipe
 // has no per-row visibility, so progress is incremented once per chunk).
@@ -265,11 +282,16 @@ func runRawCopyChunk(ctx context.Context, exp ir.RawCopyExporter, imp ir.RawCopy
 		return nil
 	})
 
-	// Exporter: streams source bytes into the pipe writer. Close the
-	// write end on completion so the importer sees EOF; close-with-error
-	// on failure so the importer's read returns the cause.
+	// Exporter: streams source bytes into the (buffered) pipe writer.
+	// Flush the coalescing buffer and close the write end on completion so
+	// the importer sees EOF; close-with-error on failure so the importer's
+	// read returns the cause (no flush then — the partial tail is moot).
 	g.Go(func() error {
-		err := exp.ExportRawCopy(gctx, table, chunk, format, pw)
+		bw := bufio.NewWriterSize(pw, rawCopyPipeBufSize)
+		err := exp.ExportRawCopy(gctx, table, chunk, format, bw)
+		if err == nil {
+			err = bw.Flush()
+		}
 		if err != nil {
 			_ = pw.CloseWithError(err)
 			return err
