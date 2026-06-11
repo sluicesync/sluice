@@ -25,7 +25,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
-	"sluicesync.dev/sluice/internal/ir"
+	irdiff "sluicesync.dev/sluice/internal/ir/diff"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -229,7 +229,7 @@ func TestDiff_PostgresToMySQL(t *testing.T) {
 }
 
 // findTableDiff returns the TableDiff for name, or nil if not present.
-func findTableDiff(d ir.SchemaDiff, name string) *ir.TableDiff {
+func findTableDiff(d irdiff.SchemaDiff, name string) *irdiff.TableDiff {
 	for i := range d.TablesMismatched {
 		if d.TablesMismatched[i].Name == name {
 			return &d.TablesMismatched[i]
@@ -239,7 +239,7 @@ func findTableDiff(d ir.SchemaDiff, name string) *ir.TableDiff {
 }
 
 // findColumnDiff returns the ColumnDiff for name, or nil if not present.
-func findColumnDiff(cds []ir.ColumnDiff, name string) *ir.ColumnDiff {
+func findColumnDiff(cds []irdiff.ColumnDiff, name string) *irdiff.ColumnDiff {
 	for i := range cds {
 		if cds[i].Name == name {
 			return &cds[i]

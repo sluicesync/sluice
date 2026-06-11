@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"sluicesync.dev/sluice/internal/config"
-	"sluicesync.dev/sluice/internal/ir"
+	irdiff "sluicesync.dev/sluice/internal/ir/diff"
 	"sluicesync.dev/sluice/internal/pipeline"
 )
 
@@ -155,10 +155,10 @@ func (d driftError) Error() string {
 	return "drift detected"
 }
 
-// _ enforces that ir.SchemaDiff exposes the Summary() string used
+// _ enforces that irdiff.SchemaDiff exposes the Summary() string used
 // above; a removed/renamed Summary method would fail to build here,
 // catching the API drift at compile time rather than at runtime.
-var _ = (ir.SchemaDiff{}).Summary
+var _ = (irdiff.SchemaDiff{}).Summary
 
 // operationalError signals "we couldn't run the gate" with kong exit
 // code 2 — distinct from drift so CI scripts don't conflate "the

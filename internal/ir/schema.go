@@ -342,7 +342,7 @@ type Column struct {
 	// about how *diff* / *verify* interpret the column on the
 	// consolidated target.
 	//
-	// [DiffSchemas] treats a target-side column with
+	// The schema diff (ir/diff.Schemas) treats a target-side column with
 	// SluiceInjected=true as an *expected* extra rather than drift:
 	// it is suppressed from `ColumnsExtra` when absent on the
 	// source-side expected schema (Shape-A diff against a sharded

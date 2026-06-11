@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"sluicesync.dev/sluice/internal/ir"
+	irdiff "sluicesync.dev/sluice/internal/ir/diff"
 )
 
 // TestDriftError_ExitCode confirms that the drift sentinel reports
@@ -42,13 +42,13 @@ func TestOperationalError_ExitCode(t *testing.T) {
 	}
 }
 
-// TestSchemaDiff_SummaryMatchesCLI exercises the ir.SchemaDiff.Summary
+// TestSchemaDiff_SummaryMatchesCLI exercises the irdiff.SchemaDiff.Summary
 // path the CLI's drift sentinel embeds. A regression on the IR-side
 // rendering would bubble up here before users see it.
 func TestSchemaDiff_SummaryMatchesCLI(t *testing.T) {
-	d := ir.SchemaDiff{
+	d := irdiff.SchemaDiff{
 		TablesMissing: []string{"orders"},
-		TablesMismatched: []ir.TableDiff{
+		TablesMismatched: []irdiff.TableDiff{
 			{Name: "users", ColumnsMissing: []string{"created_at"}},
 		},
 	}

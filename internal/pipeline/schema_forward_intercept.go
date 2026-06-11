@@ -40,6 +40,7 @@ import (
 	"sync/atomic"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irdiff "sluicesync.dev/sluice/internal/ir/diff"
 	"sluicesync.dev/sluice/internal/translate"
 )
 
@@ -288,7 +289,7 @@ func routeForwardBoundary(
 		forwardRecoveryHint(tableName))
 }
 
-// renderDriftForRefusal computes the [ir.SchemaDriftReport] for the
+// renderDriftForRefusal computes the [irdiff.SchemaDriftReport] for the
 // (pre, post) pair and renders it for inclusion in a refuse-loudly
 // error message. Returns the empty string when there are no drift
 // entries to surface (caller's outer message reads naturally without
@@ -300,7 +301,7 @@ func routeForwardBoundary(
 // SPECIFIC columns / indexes / constraints. Both go into the same
 // error so the operator gets a single grep-friendly message.
 func renderDriftForRefusal(pre, post *ir.Table) string {
-	report := ir.DiffTable(pre, post)
+	report := irdiff.TableDrift(pre, post)
 	rendered := RenderSchemaDriftReport(report)
 	if rendered == "" {
 		return ""

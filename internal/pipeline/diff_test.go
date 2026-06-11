@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irdiff "sluicesync.dev/sluice/internal/ir/diff"
 )
 
 func diffSchemaPG() *ir.Schema {
@@ -555,7 +556,7 @@ func (r *failingReader) ReadSchema(_ context.Context) (*ir.Schema, error) { retu
 // inherits DDLDialectMySQL via planetscale's capabilities — under the
 // old name-switch it silently fell into the PG-style default.
 func TestRenderColumnMismatch_DialectDispatch(t *testing.T) {
-	cd := ir.ColumnDiff{Name: "title", ExpectedType: "VARCHAR(64)", ActualType: "TEXT"}
+	cd := irdiff.ColumnDiff{Name: "title", ExpectedType: "VARCHAR(64)", ActualType: "TEXT"}
 
 	var mysqlOut strings.Builder
 	renderColumnMismatch(&mysqlOut, "books", cd, identifierQuoter(ir.DDLDialectMySQL), ir.DDLDialectMySQL)

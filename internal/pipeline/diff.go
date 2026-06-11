@@ -28,6 +28,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/ir"
+	irdiff "sluicesync.dev/sluice/internal/ir/diff"
 	"sluicesync.dev/sluice/internal/translate"
 )
 
@@ -108,7 +109,7 @@ type Differ struct {
 	// InjectShardColumn, when engaged, applies the ADR-0048 Shape A
 	// IR pass to the source-side expected schema BEFORE the diff
 	// comparison runs. Combined with the [ir.Column.SluiceInjected]
-	// suppression in [ir.DiffSchemas], this lets `schema diff`
+	// suppression in [irdiff.Schemas], this lets `schema diff`
 	// against a consolidated Shape-A target report "in sync" rather
 	// than surface the discriminator as drift on every run.
 	InjectShardColumn ShardColumnSpec
@@ -121,7 +122,7 @@ type DiffJSON struct {
 	SourceEngine string         `json:"source_engine"`
 	TargetEngine string         `json:"target_engine"`
 	Summary      DiffJSONCounts `json:"summary"`
-	ir.SchemaDiff
+	irdiff.SchemaDiff
 }
 
 // DiffJSONCounts is the high-level rollup the CI consumer looks at
@@ -148,7 +149,7 @@ type DiffJSONCounts struct {
 // schema, render error) the diff is nil and err describes the
 // failure. The caller's CLI layer maps the (diff, err) tuple onto
 // the ADR-0029 exit codes.
-func (d *Differ) Run(ctx context.Context) (*ir.SchemaDiff, error) {
+func (d *Differ) Run(ctx context.Context) (*irdiff.SchemaDiff, error) {
 	if err := d.validate(); err != nil {
 		return nil, err
 	}
@@ -249,7 +250,7 @@ func (d *Differ) Run(ctx context.Context) (*ir.SchemaDiff, error) {
 	}
 
 	// ---- 3. Compute the diff. ----
-	diff := ir.DiffSchemas(expected, actual, ir.DiffOptions{
+	diff := irdiff.Schemas(expected, actual, irdiff.Options{
 		IgnoreExtras:           d.IgnoreExtras,
 		IgnoreCharsetCollation: d.IgnoreCharsetCollation,
 	})
@@ -312,7 +313,7 @@ type diffBundle struct {
 	srcEngine  string
 	tgtEngine  string
 	tgtDialect ir.DDLDialect // target's declared DDL-suggestion dialect
-	diff       ir.SchemaDiff
+	diff       irdiff.SchemaDiff
 	missingDDL map[string][]ir.DDLStatement // table name -> CREATE TABLE / CREATE INDEX statements
 
 	// missingColDDL maps "<table>.<column>" -> the target engine's
@@ -349,7 +350,7 @@ type diffRenderOpts struct {
 // ([ir.DDLPreviewer] / [ir.ColumnDDLPreviewer]); the renderer falls
 // back to placeholder output in those cases. Errors from the
 // underlying preview calls are returned verbatim.
-func previewMissingDDL(ctx context.Context, target ir.Engine, dsn, targetSchema string, enabledExtensions []string, expected *ir.Schema, diff ir.SchemaDiff) (tableDDL map[string][]ir.DDLStatement, columnDDL map[string]string, err error) {
+func previewMissingDDL(ctx context.Context, target ir.Engine, dsn, targetSchema string, enabledExtensions []string, expected *ir.Schema, diff irdiff.SchemaDiff) (tableDDL map[string][]ir.DDLStatement, columnDDL map[string]string, err error) {
 	missingTables := diff.TablesMissing
 	missingCols := collectMissingColumns(diff)
 	if len(missingTables) == 0 && len(missingCols) == 0 {
@@ -381,9 +382,9 @@ func previewMissingDDL(ctx context.Context, target ir.Engine, dsn, targetSchema 
 
 // collectMissingColumns returns the per-table list of columns absent
 // from the target. Map key is table name, value is the slice of
-// missing column names (in the same alphabetic order DiffSchemas
+// missing column names (in the same alphabetic order irdiff.Schemas
 // returned them).
-func collectMissingColumns(diff ir.SchemaDiff) map[string][]string {
+func collectMissingColumns(diff irdiff.SchemaDiff) map[string][]string {
 	out := make(map[string][]string, len(diff.TablesMismatched))
 	for _, td := range diff.TablesMismatched {
 		if len(td.ColumnsMissing) == 0 {
@@ -712,7 +713,7 @@ func lookupCheckExpr(s *ir.Schema, tableName, checkName string) string {
 // the target engine's declared [ir.Capabilities.DDLDialect] asks for.
 // Operators copy-paste these as a starting point — they're not
 // guaranteed verified migration scripts.
-func renderColumnMismatch(sb *strings.Builder, table string, cd ir.ColumnDiff, quote func(string) string, dialect ir.DDLDialect) {
+func renderColumnMismatch(sb *strings.Builder, table string, cd irdiff.ColumnDiff, quote func(string) string, dialect ir.DDLDialect) {
 	switch dialect {
 	case ir.DDLDialectMySQL:
 		if cd.ExpectedType != "" {
@@ -766,7 +767,7 @@ func renderColumnMismatch(sb *strings.Builder, table string, cd ir.ColumnDiff, q
 // PG uses `ALTER COLUMN ... TYPE ... COLLATE "..."`. Suggestions are
 // hint comments — the precise type still needs filling in by the
 // operator.
-func renderCharsetCollationMismatch(sb *strings.Builder, table string, cd ir.ColumnDiff, quote func(string) string, dialect ir.DDLDialect) {
+func renderCharsetCollationMismatch(sb *strings.Builder, table string, cd irdiff.ColumnDiff, quote func(string) string, dialect ir.DDLDialect) {
 	if cd.ExpectedCharset == "" && cd.ActualCharset == "" &&
 		cd.ExpectedCollation == "" && cd.ActualCollation == "" {
 		return
@@ -799,7 +800,7 @@ func renderCharsetCollationMismatch(sb *strings.Builder, table string, cd ir.Col
 // preceded by a `-- (default may differ across engines)` hint so the
 // operator knows to verify the rendering against the actual source-
 // side spelling before applying.
-func renderDefaultMismatchPG(sb *strings.Builder, table string, cd ir.ColumnDiff, quote func(string) string) {
+func renderDefaultMismatchPG(sb *strings.Builder, table string, cd irdiff.ColumnDiff, quote func(string) string) {
 	if cd.DefaultLowConfidence {
 		fmt.Fprintf(sb, "-- (default on %s may differ across engines; verify before applying)\n",
 			quote(cd.Name))
@@ -822,7 +823,7 @@ func renderDefaultMismatchPG(sb *strings.Builder, table string, cd ir.ColumnDiff
 // ALTER COLUMN ... SET/DROP DEFAULT in 8.0+); we use the latter form
 // because it's narrower (doesn't require the operator to retype the
 // column type) and works on both 5.7+ and 8.0+.
-func renderDefaultMismatchMySQL(sb *strings.Builder, table string, cd ir.ColumnDiff, quote func(string) string) {
+func renderDefaultMismatchMySQL(sb *strings.Builder, table string, cd irdiff.ColumnDiff, quote func(string) string) {
 	if cd.DefaultLowConfidence {
 		fmt.Fprintf(sb, "-- (default on %s may differ across engines; verify before applying)\n",
 			quote(cd.Name))
@@ -896,7 +897,7 @@ func oneLine(s string) string {
 // column to change a STORED generated expression, which is
 // destructive enough that the operator should run the migration
 // hand-edited rather than copy-pasting from a diff suggestion.
-func renderGeneratedExprMismatch(sb *strings.Builder, table string, cd ir.ColumnDiff, quote func(string) string) {
+func renderGeneratedExprMismatch(sb *strings.Builder, table string, cd irdiff.ColumnDiff, quote func(string) string) {
 	fmt.Fprintf(sb, "-- generated expression drift on %s.%s: target=%q expected=%q\n",
 		quote(table), quote(cd.Name), cd.ActualGeneratedExpr, cd.ExpectedGeneratedExpr)
 	fmt.Fprintln(sb, "-- ^ engines require DROP + ADD COLUMN to change a generated expression; review carefully")
@@ -925,7 +926,7 @@ func countTables(s *ir.Schema) int {
 }
 
 // summarise rolls per-table counts up into the header summary line.
-func summarise(d ir.SchemaDiff) DiffJSONCounts {
+func summarise(d irdiff.SchemaDiff) DiffJSONCounts {
 	c := DiffJSONCounts{
 		TablesMissing:    len(d.TablesMissing),
 		TablesExtra:      len(d.TablesExtra),
@@ -948,9 +949,9 @@ func summarise(d ir.SchemaDiff) DiffJSONCounts {
 }
 
 // renderDiffJSON writes the structured diff to w. The shape mirrors
-// ir.SchemaDiff with a summary block prepended and the engine names
+// irdiff.SchemaDiff with a summary block prepended and the engine names
 // recorded alongside.
-func renderDiffJSON(w io.Writer, srcEngine, tgtEngine string, diff ir.SchemaDiff) error {
+func renderDiffJSON(w io.Writer, srcEngine, tgtEngine string, diff irdiff.SchemaDiff) error {
 	out := DiffJSON{
 		SourceEngine: srcEngine,
 		TargetEngine: tgtEngine,
@@ -958,7 +959,7 @@ func renderDiffJSON(w io.Writer, srcEngine, tgtEngine string, diff ir.SchemaDiff
 		SchemaDiff:   diff,
 	}
 	// Stable nested ordering: the fields inside SchemaDiff are already
-	// sorted by DiffSchemas; this defensive sort is a no-op today but
+	// sorted by irdiff.Schemas; this defensive sort is a no-op today but
 	// keeps the JSON renderer's output deterministic if a future caller
 	// constructs SchemaDiff some other way.
 	sort.Strings(out.TablesMissing)
