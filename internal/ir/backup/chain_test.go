@@ -232,3 +232,66 @@ func TestManifestRoundTrip_LegacyFullCompat(t *testing.T) {
 		t.Errorf("ComputeBackupID on legacy manifest = empty; want non-empty")
 	}
 }
+
+// TestComputeSchemaHash_StableAcrossManifestRoundTrip pins task #49:
+// the fingerprint of a reader-fresh schema (nil Column.Default) equals
+// the fingerprint of the SAME schema after a manifest JSON round-trip
+// (whose decode hooks materialize an explicit DefaultNone). Before the
+// canonical-view normalization, the pipeline's resume drift guard had
+// to JSON-round-trip the fresh side itself or every resume would
+// false-positive as drift.
+func TestComputeSchemaHash_StableAcrossManifestRoundTrip(t *testing.T) {
+	fresh := &ir.Schema{Tables: []*ir.Table{{
+		Name: "users",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}}, // nil Default — the normalized class
+			{Name: "n", Type: ir.Integer{Width: 32}, Default: ir.DefaultNone{}},
+			{Name: "email", Type: ir.Varchar{Length: 255}, Default: ir.DefaultLiteral{Value: "x"}},
+		},
+	}}}
+
+	raw, err := json.Marshal(fresh)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var roundTripped ir.Schema
+	if err := json.Unmarshal(raw, &roundTripped); err != nil {
+		t.Fatalf("round-trip decode: %v", err)
+	}
+
+	hFresh, err := ComputeSchemaHash(fresh)
+	if err != nil {
+		t.Fatalf("hash fresh: %v", err)
+	}
+	hRT, err := ComputeSchemaHash(&roundTripped)
+	if err != nil {
+		t.Fatalf("hash round-tripped: %v", err)
+	}
+	if hFresh != hRT {
+		t.Errorf("hash not stable across manifest round-trip:\n fresh=%s\n rt   =%s", hFresh, hRT)
+	}
+
+	// Hashing must not mutate the input: the fresh schema's nil
+	// Default stays nil (manifests record schemas exactly as read).
+	if fresh.Tables[0].Columns[0].Default != nil {
+		t.Error("ComputeSchemaHash mutated the input schema's nil Default")
+	}
+
+	// A REAL default difference must still change the hash — the
+	// normalization only collapses nil vs explicit-None.
+	changed := &ir.Schema{Tables: []*ir.Table{{
+		Name: "users",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}, Default: ir.DefaultLiteral{Value: "0"}},
+			{Name: "n", Type: ir.Integer{Width: 32}, Default: ir.DefaultNone{}},
+			{Name: "email", Type: ir.Varchar{Length: 255}, Default: ir.DefaultLiteral{Value: "x"}},
+		},
+	}}}
+	hChanged, err := ComputeSchemaHash(changed)
+	if err != nil {
+		t.Fatalf("hash changed: %v", err)
+	}
+	if hChanged == hFresh {
+		t.Error("a real Default change did NOT change the hash")
+	}
+}

@@ -35,6 +35,14 @@ import (
 // in different orders (task #41 — catalog reads historically drained
 // these through randomized map iteration). Table order and column
 // order ARE semantic (DDL position) and hash as-is.
+//
+// The canonical view also normalizes a nil Column.Default to
+// [ir.DefaultNone] (task #49): the two are operationally equivalent
+// ("no default"), but [ir.Column.UnmarshalJSON] materializes an
+// explicit DefaultNone for an absent wire field, so without the
+// normalization a reader-fresh schema and the SAME schema re-read
+// from a manifest would fingerprint differently. The hash is thereby
+// stable across manifest JSON round-trips.
 func ComputeSchemaHash(s *ir.Schema) (string, error) {
 	if s == nil {
 		h := sha256.Sum256([]byte("schema:nil"))
@@ -49,9 +57,10 @@ func ComputeSchemaHash(s *ir.Schema) (string, error) {
 }
 
 // canonicalSchemaForHash returns a shallow copy of s whose per-table
-// non-semantic collections are name-sorted copies. The input is never
-// mutated — manifests must record schemas exactly as the reader
-// produced them; only the FINGERPRINT is order-insensitive.
+// non-semantic collections are name-sorted copies and whose columns
+// carry the round-trip-stable default normalization. The input is
+// never mutated — manifests must record schemas exactly as the reader
+// produced them; only the FINGERPRINT is canonical.
 func canonicalSchemaForHash(s *ir.Schema) *ir.Schema {
 	out := *s
 	out.Tables = make([]*ir.Table, len(s.Tables))
@@ -60,6 +69,7 @@ func canonicalSchemaForHash(s *ir.Schema) *ir.Schema {
 			continue
 		}
 		ct := *t
+		ct.Columns = canonicalColumnsForHash(t.Columns)
 		ct.Indexes = sortedByName(t.Indexes, func(x *ir.Index) string { return x.Name })
 		ct.ForeignKeys = sortedByName(t.ForeignKeys, func(x *ir.ForeignKey) string { return x.Name })
 		ct.CheckConstraints = sortedByName(t.CheckConstraints, func(x *ir.CheckConstraint) string { return x.Name })
@@ -68,6 +78,35 @@ func canonicalSchemaForHash(s *ir.Schema) *ir.Schema {
 		out.Tables[i] = &ct
 	}
 	return &out
+}
+
+// canonicalColumnsForHash returns columns with a nil Default
+// normalized to [ir.DefaultNone] — copying only the columns it
+// changes, and returning the input slice untouched when nothing needs
+// normalizing (the common round-tripped case). Column ORDER is
+// semantic and preserved as-is.
+func canonicalColumnsForHash(in []*ir.Column) []*ir.Column {
+	normalize := false
+	for _, c := range in {
+		if c != nil && c.Default == nil {
+			normalize = true
+			break
+		}
+	}
+	if !normalize {
+		return in
+	}
+	out := make([]*ir.Column, len(in))
+	for i, c := range in {
+		if c == nil || c.Default != nil {
+			out[i] = c
+			continue
+		}
+		cc := *c
+		cc.Default = ir.DefaultNone{}
+		out[i] = &cc
+	}
+	return out
 }
 
 // sortedByName returns a name-sorted copy of in (nil stays nil; the

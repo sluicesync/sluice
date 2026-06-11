@@ -1282,29 +1282,18 @@ func refuseAnchoredResumeOnSchemaDrift(current, prior *ir.Schema) error {
 	)
 }
 
-// manifestSchemaFingerprint hashes s in the MANIFEST's domain: it
-// JSON-round-trips the schema before hashing. Named wart: the IR's
-// decode hooks materialize concrete zero values for fields a freshly-
-// read schema leaves nil (e.g. a nil Column.Default decodes to an
-// explicit kind=None value that re-marshals non-empty), so
-// [irbackup.ComputeSchemaHash] over a reader-fresh schema does NOT equal the
-// hash of the same schema after it has been stored in (and re-read
-// from) a manifest. The drift guard compares a fresh read against
-// prior.Schema — which IS round-tripped — so both sides must be
-// normalized into the round-tripped domain first or every resume would
-// false-positive as drift. Pinned by
-// [TestBackup_ResumeAdoptsPriorAnchor] (identical schema across
-// attempts must not refuse).
+// manifestSchemaFingerprint hashes s for the resume drift guard,
+// which compares a reader-fresh schema against prior.Schema — a
+// schema that has been stored in (and re-read from) a manifest.
+// [irbackup.ComputeSchemaHash] is stable across that manifest JSON
+// round-trip (task #49: its canonical view normalizes nil
+// Column.Default to the explicit DefaultNone the decode hooks
+// materialize), so the plain hash serves both domains; this wrapper
+// used to JSON-round-trip s itself to paper over the asymmetry.
+// Pinned by [TestBackup_ResumeAdoptsPriorAnchor] (identical schema
+// across attempts must not refuse).
 func manifestSchemaFingerprint(s *ir.Schema) (string, error) {
-	raw, err := json.Marshal(s)
-	if err != nil {
-		return "", fmt.Errorf("marshal: %w", err)
-	}
-	var rt ir.Schema
-	if err := json.Unmarshal(raw, &rt); err != nil {
-		return "", fmt.Errorf("round-trip decode: %w", err)
-	}
-	return irbackup.ComputeSchemaHash(&rt)
+	return irbackup.ComputeSchemaHash(s)
 }
 
 // refuseKeylessRestreamOnAnchoredResume refuses an anchored resume when
