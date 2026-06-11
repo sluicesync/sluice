@@ -22,15 +22,18 @@ the pipeline, into storage the operator owns.
 
 ## TL;DR
 
-- **The parallelism gap is closed (ADR-0084, measured below): sluice now
-  sits ~3.1–3.2× behind the `pg_dump`/`pg_restore -j8` specialists on both
-  legs, with defaults.** The original measurements on this corpus were
-  10.2× (backup) and ~11.5× (restore) — almost entirely a *parallelism*
-  difference. Cross-table pools on both sides (the ADR-0076 migrate-pool
-  shape) cut backup 2367 s → **881 s** and restore from a projected ~3 h to
-  **2810 s**, zero-loss, one flag (`--table-parallelism`, default auto=4).
-  The remaining ~3× is per-row cost — the price of cross-engine
-  restorability and per-chunk verifiability (profiling tracked separately).
+- **Both structural gaps are now closed (measured below): sluice sits
+  1.8× (backup) / 1.5× (restore) behind the `pg_dump`/`pg_restore -j8`
+  specialists, with defaults.** The original measurements on this corpus
+  were 10.2× and ~11.5× — first the *parallelism* share fell (ADR-0084
+  cross-table pools: 2367 s → 881 s backup, projected ~3 h → 2810 s
+  restore), then the *per-row* share (the v0.99.39 fast row codec, tasks
+  #51/#52: profiling showed reflection-based JSON encode/decode was 49%
+  of backup CPU and 69% of restore CPU) cut both legs roughly in half
+  again: backup **435 s**, restore **1390 s**, zero-loss. What remains
+  (~1.5–1.8×) is dominated by zstd compression of the bulkier
+  self-describing JSONL format plus per-chunk SHA-256 — the direct price
+  of cross-engine restorability and independent chunk verifiability.
 - **Incrementals are the structural reason to pick sluice.** `pg_dump` has
   no incremental story — its only refresh is a full re-dump (232–273 s +
   16 GB every cycle, on our corpus). `sluice backup incremental` captured a
@@ -60,7 +63,8 @@ the portable part.
 | pg_dump -Fd -j1 --compress=zstd:3 | 798 s | 16 GB | single worker |
 | sluice backup full — pre-ADR-0084 | 2367 s | 22 GB | sequential per table |
 | sluice backup full (non-anchored fallback) | 2398 s | 22 GB | `wal_level=replica` source |
-| **sluice backup full — ADR-0084 defaults** | **881 s** | 22 GB | parallel sweep engaged (`table_parallelism=4`), snapshot-anchored, same exported snapshot across all readers; corpus-matched `pg_dump -j8` re-run: 273 s → **3.2× gap** |
+| sluice backup full — ADR-0084 defaults | 881 s | 22 GB | parallel sweep engaged (`table_parallelism=4`), snapshot-anchored, same exported snapshot across all readers; corpus-matched `pg_dump -j8` re-run: 273 s → 3.2× gap |
+| **sluice backup full — v0.99.39 defaults (fast row codec #51 + O(1) sidecar checkpoints ADR-0086)** | **435 s** | 22 GB | same parallel sweep; corpus-matched `pg_dump -j8` re-run: 238 s → **1.83× gap** |
 
 Read-outs:
 
@@ -87,7 +91,8 @@ Read-outs:
 |---|---|---|
 | **pg_restore -j8** | **917 s** | all 422M rows + all 172 indexes, verified |
 | sluice restore — pre-ADR-0084 | **cut off at 5278 s** with 2/43 tables done | sequential; each 94M-row table took ~41 min; projected ~3 h+ |
-| **sluice restore — ADR-0084 defaults** | **2810 s** | parallel apply engaged (`table_parallelism=4`); all 43 tables + 172 indexes verified; corpus-matched `pg_restore -j8` re-run: 896 s → **3.1× gap** |
+| sluice restore — ADR-0084 defaults | 2810 s | parallel apply engaged (`table_parallelism=4`); all 43 tables + 172 indexes verified; corpus-matched `pg_restore -j8` re-run: 896 s → 3.1× gap |
+| **sluice restore — v0.99.39 defaults (fast row codec #52)** | **1390 s** | same parallel apply; all 43 tables verified; corpus-matched `pg_restore -j8` re-run: 918 s → **1.51× gap** |
 
 Restore matters *more* than backup speed — restore time is your recovery
 time objective. Pre-ADR-0084 the projection was ~11.5× behind
@@ -97,15 +102,26 @@ brings it to ~3.1× with defaults.
 
 ### The before/after read-out
 
-Both legs landed at ~3.1–3.2× of their PostgreSQL-native counterpart —
-almost exactly the ~3.0× per-row residual the j1 decomposition below
-predicted. That is the satisfying confirmation of the decomposition: the
-parallelism share of both gaps is now closed, and what remains is the
-per-stream IR decode/encode + per-chunk SHA-256 cost — the price of
-cross-engine restorability and verifiability, and the same per-stream
-frontier already characterized on the migrate path. (After-numbers were
-measured on the post-burst corpus: 136 GB / 431M rows, ~2 % larger than
-the original 133 GB / 422M — the comparators were re-run corpus-matched.)
+The gap closed in two measured stages, each confirming its decomposition:
+
+1. **ADR-0084 (parallelism):** both legs landed at ~3.1–3.2× of their
+   PostgreSQL-native counterpart — almost exactly the ~3.0× per-row
+   residual the j1 decomposition below predicted.
+2. **v0.99.39 (the per-row residual itself):** CPU profiles on this
+   corpus showed the residual was mostly *codec*, not IR: the
+   reflection-based `encoding/json` round trip of each row map was 49%
+   of backup CPU and 69% of restore CPU. The fast row codec (tasks
+   #51/#52 — same wire bytes, direct buffer append/parse, legacy path
+   kept as the semantic oracle) plus the O(1) sidecar checkpoints
+   (ADR-0086, task #54) cut both legs ~51%: backup 881→435 s, restore
+   2810→1390 s. Post-codec profiles show zstd encode and the PG
+   read/write itself as the new frontier — the remaining 1.5–1.8× is
+   format cost (bulkier self-describing JSONL into zstd + per-chunk
+   SHA-256), not codec overhead.
+
+(All after-numbers measured on the post-burst corpus: 136 GB / 431M
+rows, ~2 % larger than the original 133 GB / 422M — comparators re-run
+corpus-matched the same day on the same host.)
 
 ## Incremental — the structural win
 
@@ -166,7 +182,9 @@ physical-tool throughput context are the comparison program's next phases.
 - Single host, shared NVMe (~100–120 MB/s effective under contention);
   containerized peers on one Docker network; `postgres:16` source tuned
   `shared_buffers=2GB`, `max_wal_size=16GB`, `wal_level=logical`.
-- sluice = dev build at the v0.99.34 tag commit. `pg_dump`/`pg_restore` 16.x.
+- sluice = dev build at the v0.99.34 tag commit for the ADR-0084 rows;
+  the v0.99.39 rows = main at `597fad4` (the v0.99.39 content).
+  `pg_dump`/`pg_restore` 16.x.
 - The incremental was measured on a chain rooted in a *scoped* full
   (7 tables, 143 s) because the original chain's anchor predated the
   publication (the historic-catalog trap described above — the measurement

@@ -6,6 +6,8 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.39] - 2026-06-11
+
 ### Performance
 - **Backup/restore per-row JSON codec rewritten as a direct
   buffer-append fast path (tasks #51/#52).** Profiling the 136 GB
@@ -20,7 +22,12 @@ project follows [Semantic Versioning](https://semver.org/).
   decode 189→27). Any value or line outside the canonical shapes
   falls back to the legacy path, which remains the semantic and
   error oracle; differential sweeps plus two fuzz targets pin the
-  two paths equivalent on arbitrary input.
+  two paths equivalent on arbitrary input. Measured end-to-end on the
+  136 GB / 431M-row bench corpus (together with the O(1) checkpoint
+  fix below): `backup full` 881 s → 435 s and `restore` 2810 s →
+  1390 s — both legs −51%, zero-loss, shrinking the gap to the
+  `pg_dump`/`pg_restore -j8` specialists from ~3.1–3.2× to 1.83× /
+  1.51× (see `docs/comparison-backup.md`).
 - **Backup checkpoints are now O(1) per event — the manifest is no
   longer rewritten per chunk/table (task #54, ADR-0086).** Every
   per-chunk / per-table checkpoint during `backup full` used to
