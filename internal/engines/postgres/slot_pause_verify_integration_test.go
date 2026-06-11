@@ -296,7 +296,7 @@ func verifyH2_TempSlotSnapshotCapturesPrePublicationAddRows(
 	}
 	defer func() { _ = tempSlotConn.Close(context.Background()) }()
 	const tempSlot = "h2_temp"
-	consistentPoint, snapshotName, err := createSlotViaPglogrepl(ctx, tempSlotConn, tempSlot, true)
+	consistentPoint, snapshotName, err := createSlotViaPglogrepl(ctx, tempSlotConn, tempSlot, slotCreateOptions{exportSnapshot: true})
 	if err != nil {
 		t.Fatalf("verifyH2: create temp slot: %v", err)
 	}

@@ -15,18 +15,47 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
+// slotCreateOptions selects the optional CREATE_REPLICATION_SLOT
+// behaviours. A zero value creates a plain persistent slot with no
+// exported snapshot (the cold-start CDC shape).
+type slotCreateOptions struct {
+	// exportSnapshot includes the snapshot-export option in the
+	// protocol command so the server returns a snapshot_name the
+	// caller can pin a SQL transaction to. Pass true from the
+	// snapshot+CDC handoff path (cdc_snapshot.go) and the backup-
+	// anchor path (backup_snapshot.go); false from the cold-start
+	// path (cdc_reader.go) where the snapshot isn't needed.
+	exportSnapshot bool
+
+	// temporary creates the slot with the protocol-level TEMPORARY
+	// keyword: the server drops it automatically when the creating
+	// replication connection closes — INCLUDING on hard process death
+	// (SIGKILL, OOM, power loss). This is the Bug 137 fix shape for
+	// the backup anchor slot: its only job is to pin the exported
+	// snapshot for the run's lifetime, so tying it to the session is
+	// exactly right and a crashed run can no longer leak a persistent
+	// slot that pins WAL forever.
+	//
+	// TEMPORARY excludes FAILOVER: the server refuses the combination
+	// ("cannot enable failover for a temporary replication slot"),
+	// and a slot that dies with its session has nothing to carry
+	// across a failover anyway. The PG 17+ raw-protocol path omits
+	// FAILOVER when temporary is set, and the PG ≤ 16 "slot won't
+	// survive failover" stderr warning is suppressed — that's the
+	// temporary slot's contract, not a hazard.
+	temporary bool
+}
+
 // createLogicalReplicationSlot creates a logical replication slot
 // using the pgoutput plugin, opting into the FAILOVER flag on
-// PG 17+ servers and falling back to the FAILOVER-less path on PG
-// ≤ 16. The exportSnapshot flag controls whether EXPORT_SNAPSHOT is
-// included in the protocol-level command — pass true from the
-// snapshot+CDC handoff path (cdc_snapshot.go) and false from the
-// cold-start path (cdc_reader.go) where the snapshot isn't needed.
+// PG 17+ servers (persistent slots only — see
+// [slotCreateOptions.temporary]) and falling back to the
+// FAILOVER-less pglogrepl path on PG ≤ 16.
 //
 // Returns (consistentPoint, snapshotName, err). snapshotName is
-// always empty when exportSnapshot is false, and may be empty even
-// when true if the server didn't return one. consistentPoint is the
-// LSN string the server reports as the slot's
+// always empty when opts.exportSnapshot is false, and may be empty
+// even when true if the server didn't return one. consistentPoint is
+// the LSN string the server reports as the slot's
 // consistent_point — the caller parses it via pglogrepl.ParseLSN
 // when a typed LSN is needed.
 //
@@ -65,6 +94,13 @@ import (
 //
 //	CREATE_REPLICATION_SLOT "slotname" LOGICAL pgoutput (FAILOVER true)
 //	CREATE_REPLICATION_SLOT "slotname" LOGICAL pgoutput (SNAPSHOT 'export', FAILOVER true)
+//	CREATE_REPLICATION_SLOT "slotname" TEMPORARY LOGICAL pgoutput (SNAPSHOT 'export')
+//
+// The TEMPORARY keyword sits BEFORE LOGICAL (it's part of the
+// command grammar `CREATE_REPLICATION_SLOT slot_name [ TEMPORARY ]
+// { PHYSICAL | LOGICAL output_plugin } [ ( option [, ...] ) ]`, not
+// an option-list entry), and FAILOVER is omitted for temporary slots
+// — the server rejects the combination.
 //
 // Options inside the parens-list are comma-separated. The snapshot
 // option is the named form `SNAPSHOT 'export'` (or 'use' / 'nothing')
@@ -89,7 +125,7 @@ func createLogicalReplicationSlot(
 	db *sql.DB,
 	replConn *pgconn.PgConn,
 	slotName string,
-	exportSnapshot bool,
+	opts slotCreateOptions,
 ) (consistentPoint, snapshotName string, err error) {
 	version, err := serverVersionNum(ctx, db)
 	if err != nil {
@@ -97,46 +133,74 @@ func createLogicalReplicationSlot(
 	}
 
 	if version >= pgVersionFailoverSupport {
-		return createSlotWithFailover(ctx, replConn, slotName, exportSnapshot)
+		return createSlotRawProtocol(ctx, replConn, slotName, opts)
 	}
 
-	warnNoFailoverSupport(slotName, version)
-	return createSlotViaPglogrepl(ctx, replConn, slotName, exportSnapshot)
+	if !opts.temporary {
+		// The warning is about slot survival across failover — moot
+		// for a slot whose contract is "dies with this session".
+		warnNoFailoverSupport(slotName, version)
+	}
+	return createSlotViaPglogrepl(ctx, replConn, slotName, opts)
 }
 
-// createSlotWithFailover sends the raw CREATE_REPLICATION_SLOT
-// protocol command including FAILOVER true. Only safe on PG 17+;
-// older servers reject FAILOVER as an unknown option.
-func createSlotWithFailover(
-	ctx context.Context,
-	conn *pgconn.PgConn,
-	slotName string,
-	exportSnapshot bool,
-) (consistentPoint, snapshotName string, err error) {
+// buildCreateReplicationSlotCommand renders the raw PG 17+
+// CREATE_REPLICATION_SLOT protocol command for the given options.
+// Split out as a pure function so the unit test pins the exact wire
+// string (the format is small and load-bearing — a typo would fall
+// through to the server as a confusing parser error downstream).
+func buildCreateReplicationSlotCommand(slotName string, opts slotCreateOptions) string {
 	// Build the parens-list option string. Order doesn't matter to
 	// the server, but we put SNAPSHOT first to match the order in
 	// the PG 17 protocol-replication docs.
-	opts := []string{}
-	if exportSnapshot {
+	optList := []string{}
+	if opts.exportSnapshot {
 		// PG 17+ uses the named-option form: SNAPSHOT 'export'. The
 		// bare EXPORT_SNAPSHOT keyword (pre-PG-17 syntax) is rejected
 		// inside an option-list with "ERROR: unrecognized option:
 		// export_snapshot" — observed against PlanetScale Postgres
 		// during v0.2.0 testing.
-		opts = append(opts, "SNAPSHOT 'export'")
+		optList = append(optList, "SNAPSHOT 'export'")
 	}
-	opts = append(opts, "FAILOVER true")
+	keyword := ""
+	if opts.temporary {
+		// TEMPORARY is grammar, not an option — it goes before
+		// LOGICAL. It excludes FAILOVER (server-refused combination;
+		// see slotCreateOptions.temporary).
+		keyword = " TEMPORARY"
+	} else {
+		optList = append(optList, "FAILOVER true")
+	}
 
 	// quoteIdent doubles embedded double-quotes; the default slot
 	// name "sluice_slot" is unaffected, but a custom slot name with
 	// quotes would otherwise corrupt the command.
-	cmd := fmt.Sprintf("CREATE_REPLICATION_SLOT %s LOGICAL pgoutput (%s)",
-		quoteIdent(slotName), strings.Join(opts, ", "))
+	cmd := fmt.Sprintf("CREATE_REPLICATION_SLOT %s%s LOGICAL pgoutput",
+		quoteIdent(slotName), keyword)
+	if len(optList) > 0 {
+		cmd += " (" + strings.Join(optList, ", ") + ")"
+	}
+	return cmd
+}
+
+// createSlotRawProtocol sends the raw CREATE_REPLICATION_SLOT
+// protocol command — FAILOVER true for persistent slots, the
+// TEMPORARY keyword (and no FAILOVER) for temporary ones. Only safe
+// on PG 17+; older servers reject FAILOVER as an unknown option, so
+// the version dispatch in createLogicalReplicationSlot routes PG ≤ 16
+// through pglogrepl instead.
+func createSlotRawProtocol(
+	ctx context.Context,
+	conn *pgconn.PgConn,
+	slotName string,
+	opts slotCreateOptions,
+) (consistentPoint, snapshotName string, err error) {
+	cmd := buildCreateReplicationSlotCommand(slotName, opts)
 
 	mrr := conn.Exec(ctx, cmd)
 	results, err := mrr.ReadAll()
 	if err != nil {
-		return "", "", fmt.Errorf("postgres: create replication slot %q (FAILOVER): %w", slotName, err)
+		return "", "", fmt.Errorf("postgres: create replication slot %q (raw protocol): %w", slotName, err)
 	}
 	if len(results) != 1 {
 		return "", "", fmt.Errorf("postgres: create replication slot %q: expected 1 result set, got %d", slotName, len(results))
@@ -157,21 +221,24 @@ func createSlotWithFailover(
 }
 
 // createSlotViaPglogrepl is the PG ≤ 16 fallback. Identical to the
-// pre-existing call sites; preserves the EXPORT_SNAPSHOT vs
-// default behaviour through SnapshotAction.
+// pre-existing call sites; preserves the EXPORT_SNAPSHOT vs default
+// behaviour through SnapshotAction, and maps opts.temporary onto
+// pglogrepl's Temporary flag (the legacy `CREATE_REPLICATION_SLOT
+// slot TEMPORARY LOGICAL …` grammar, supported since PG 10).
 func createSlotViaPglogrepl(
 	ctx context.Context,
 	conn *pgconn.PgConn,
 	slotName string,
-	exportSnapshot bool,
+	opts slotCreateOptions,
 ) (consistentPoint, snapshotName string, err error) {
-	opts := pglogrepl.CreateReplicationSlotOptions{
-		Mode: pglogrepl.LogicalReplication,
+	createOpts := pglogrepl.CreateReplicationSlotOptions{
+		Mode:      pglogrepl.LogicalReplication,
+		Temporary: opts.temporary,
 	}
-	if exportSnapshot {
-		opts.SnapshotAction = "EXPORT_SNAPSHOT"
+	if opts.exportSnapshot {
+		createOpts.SnapshotAction = "EXPORT_SNAPSHOT"
 	}
-	result, err := pglogrepl.CreateReplicationSlot(ctx, conn, slotName, "pgoutput", opts)
+	result, err := pglogrepl.CreateReplicationSlot(ctx, conn, slotName, "pgoutput", createOpts)
 	if err != nil {
 		return "", "", fmt.Errorf("postgres: create replication slot %q: %w", slotName, err)
 	}

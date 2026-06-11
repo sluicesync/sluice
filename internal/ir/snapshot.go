@@ -269,6 +269,33 @@ type BackupSnapshotOptions struct {
 	PersistChainSlot bool
 }
 
+// BackupAnchorSweeper is the OPTIONAL engine surface the full-backup
+// orchestrator invokes when it RESUMES an in-progress backup, to
+// clean up anchor-slot debris a previously crashed run may have left
+// on the source (Bug 137).
+//
+// New binaries create the backup anchor slot protocol-TEMPORARY, so
+// a hard-killed run leaks nothing — but backups crashed under
+// pre-fix binaries left a PERSISTENT timestamped anchor slot behind,
+// each one silently pinning WAL at its restart_lsn until the source
+// disk fills. The resume run is the natural moment to sweep those:
+// it proves a prior run died mid-flight, and the operator is already
+// watching the logs.
+//
+// Implementations must be conservative — drop only slots they can
+// prove are sluice backup anchors that no live run could still be
+// using (Postgres: the `sluice_backup_anchor_<unixnano>` name shape,
+// inactive, non-temporary, older than a safety margin) and WARN-log
+// each slot dropped (and each suspected orphan deliberately left
+// alone) so the operator sees the slot lifecycle explicitly.
+//
+// The sweep is hygiene, not correctness: the orchestrator calls it
+// best-effort and a sweep failure must not fail the resume. Engines
+// without server-side slot state (MySQL) simply don't implement it.
+type BackupAnchorSweeper interface {
+	SweepOrphanedBackupAnchors(ctx context.Context, dsn string) error
+}
+
 // ChainResumePreflighter is the OPTIONAL engine surface the
 // incremental-backup orchestrator uses to verify, BEFORE opening CDC,
 // that the engine can actually serve the chain from the parent

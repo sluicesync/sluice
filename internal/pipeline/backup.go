@@ -311,6 +311,22 @@ func (b *Backup) Run(ctx context.Context) error {
 				slog.Int("tables_in_prior_manifest", len(prior.Tables)),
 				slog.Time("prior_created_at", prior.CreatedAt),
 			)
+			// Bug 137: an in-progress manifest proves a prior run died
+			// mid-flight. Backups crashed under pre-fix binaries left a
+			// persistent anchor replication slot on the source, each one
+			// silently pinning WAL until the disk fills — give the
+			// engine its chance to sweep that debris now. Best-effort
+			// hygiene via the optional [ir.BackupAnchorSweeper] surface:
+			// a sweep failure must not fail the resume itself.
+			if sweeper, ok := b.Source.(ir.BackupAnchorSweeper); ok {
+				if err := sweeper.SweepOrphanedBackupAnchors(ctx, b.SourceDSN); err != nil {
+					slog.WarnContext(
+						ctx, "backup: orphaned-anchor sweep failed; stale anchor slots may still be retaining WAL on the source",
+						slog.String("engine", b.Source.Name()),
+						slog.String("err", err.Error()),
+					)
+				}
+			}
 		case ir.BackupStateComplete, "":
 			if !b.ForceOverwrite {
 				return fmt.Errorf("backup: a completed backup already exists at this destination (created %s); pass --force-overwrite to replace it",

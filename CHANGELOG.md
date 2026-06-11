@@ -23,6 +23,22 @@ project follows [Semantic Versioning](https://semver.org/).
   direction this fixes. MySQL targets were unaffected (the driver
   config pins `loc=UTC` + session `time_zone='+00:00'`); a host-TZ
   independence pin now covers both engines and both skew directions.
+- **Bug 137: a hard-killed Postgres-source `backup full` no longer leaks
+  its snapshot-anchor replication slot.** The default-shape (non
+  `--chain-slot`) anchor (`sluice_backup_anchor_<timestamp>`) was created
+  as a persistent slot and dropped only on graceful close — so every
+  SIGKILLed/crashed backup left an inactive slot behind, each one silently
+  pinning WAL at its `restart_lsn` until the source disk filled. Two-part
+  fix: (1) the anchor is now created protocol-`TEMPORARY`, so the server
+  itself reclaims it when the backup's replication connection dies —
+  including on hard process death; (2) when a backup RESUMES an
+  in-progress run, the engine sweeps persistent anchor slots leaked by
+  pre-fix binaries (inactive, non-temporary, anchor-named, older than a
+  one-hour safety margin), WARN-logging each slot dropped and each
+  too-young suspect deliberately left alone. `--chain-slot` runs are
+  unaffected by design: the persistent chain slot is the deliverable, and
+  a crashed run's leftover is surfaced loudly by the already-exists
+  refusal on retry.
 
 ## [0.99.36] - 2026-06-11
 

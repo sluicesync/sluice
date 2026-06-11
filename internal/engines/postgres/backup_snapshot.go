@@ -18,8 +18,12 @@ import (
 // backupSnapshotSlotPrefix is the prefix the backup-anchor temporary
 // slot is named with. Each call appends a Unix-nanosecond timestamp so
 // concurrent backups against the same source don't fight for the same
-// slot name. The slot is dropped on the snapshot's Close, so the
-// timestamp is purely for collision-avoidance during the run.
+// slot name. The slot is protocol-TEMPORARY (Bug 137) — the server
+// drops it when the creating replication conn closes, including on
+// hard process death — so the timestamp is purely for
+// collision-avoidance during the run. The timestamp doubles as the
+// age signal the resume-time orphan sweep uses to clean up persistent
+// anchors leaked by pre-fix binaries (see backup_anchor_sweep.go).
 const backupSnapshotSlotPrefix = "sluice_backup_anchor_"
 
 // OpenBackupSnapshot implements [ir.BackupSnapshotOpener]. It captures
@@ -29,9 +33,17 @@ const backupSnapshotSlotPrefix = "sluice_backup_anchor_"
 //
 // Two anchor shapes, selected by opts.PersistChainSlot:
 //
-//   - Default (false): the anchor slot is TEMPORARY-shape (named with
-//     a timestamp prefix and dropped on Close) — distinct from the
-//     chain-handoff slot recorded in the manifest's EndPosition. The
+//   - Default (false): the anchor slot is protocol-TEMPORARY (named
+//     with a timestamp prefix; the server drops it when the creating
+//     replication conn closes — graceful Close AND hard process death
+//     both qualify, which is the Bug 137 fix: a SIGKILLed backup can
+//     no longer leak a persistent slot that pins WAL forever) —
+//     distinct from the chain-handoff slot recorded in the manifest's
+//     EndPosition. The exported snapshot only needs the replication
+//     conn alive until the SQL conn below has run SET TRANSACTION
+//     SNAPSHOT; after that the pinned tx stands alone, and nothing
+//     ever consumes the anchor slot — so tying the slot's life to the
+//     session costs nothing. The
 //     chain-handoff slot is the operator's responsibility to maintain
 //     (created via `sluice sync start` or manually, BEFORE this
 //     backup — a slot created after it cannot serve the WAL in
@@ -70,11 +82,26 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts ir.Back
 	}
 
 	// Resolve the anchor slot. Default shape: a fresh timestamped
-	// temporary anchor, dropped on Close. --chain-slot shape: the
-	// persistent chain slot itself.
+	// protocol-TEMPORARY anchor, auto-dropped when its replication
+	// conn closes. --chain-slot shape: the persistent chain slot
+	// itself.
 	anchorSlot := fmt.Sprintf("%s%d", backupSnapshotSlotPrefix, time.Now().UnixNano())
+	anchorIsTemporary := !opts.PersistChainSlot
 	if opts.PersistChainSlot {
 		anchorSlot = chainSlotName
+	}
+
+	// dropAnchorBestEffort cleans up a half-created PERSISTENT anchor
+	// on the open-failure paths below. A temporary anchor needs no SQL
+	// drop — the closeReplConnGraceful that always follows releases it
+	// server-side (and a cross-session pg_drop_replication_slot on a
+	// temporary slot would fail anyway: temporary slots stay owned by
+	// their creating session for their whole life).
+	dropAnchorBestEffort := func() {
+		if anchorIsTemporary {
+			return
+		}
+		_, _ = db.ExecContext(ctx, "SELECT pg_drop_replication_slot($1)", anchorSlot)
 	}
 
 	// A pre-existing slot at the anchor name is refused loudly. For
@@ -131,12 +158,17 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts ir.Back
 	}
 
 	// EXPORT_SNAPSHOT under createLogicalReplicationSlot's PG-version-
-	// adaptive helper (FAILOVER true on PG 17+). The anchor slot
-	// doesn't strictly need FAILOVER on the default (temporary) shape,
-	// but the helper is the single source of truth — and on the
-	// --chain-slot shape the slot is intended to live across
-	// failovers, so FAILOVER is exactly right there.
-	consistentPoint, snapshotName, err := createLogicalReplicationSlot(ctx, db, replConn, anchorSlot, true)
+	// adaptive helper. Default shape: protocol-TEMPORARY (Bug 137) —
+	// the slot's only job is to pin the exported snapshot for this
+	// run, and the server auto-drops it with the replication conn, so
+	// a hard-killed run leaves nothing behind. --chain-slot shape:
+	// persistent + FAILOVER true on PG 17+ — that slot is intended to
+	// live across failovers, so FAILOVER is exactly right there (and
+	// the server refuses TEMPORARY+FAILOVER combined anyway).
+	consistentPoint, snapshotName, err := createLogicalReplicationSlot(ctx, db, replConn, anchorSlot, slotCreateOptions{
+		exportSnapshot: true,
+		temporary:      anchorIsTemporary,
+	})
 	if err != nil {
 		closeReplConnGraceful(replConn)
 		_ = db.Close()
@@ -144,7 +176,7 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts ir.Back
 	}
 	if snapshotName == "" {
 		// Drop the slot we just made so we don't leak it.
-		_, _ = db.ExecContext(ctx, "SELECT pg_drop_replication_slot($1)", anchorSlot)
+		dropAnchorBestEffort()
 		closeReplConnGraceful(replConn)
 		_ = db.Close()
 		return nil, errors.New("postgres: backup snapshot: server returned empty snapshot_name; expected EXPORT_SNAPSHOT to populate it")
@@ -155,14 +187,14 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts ir.Back
 	// BEGIN — the docs are explicit about this.
 	conn, err := db.Conn(ctx)
 	if err != nil {
-		_, _ = db.ExecContext(ctx, "SELECT pg_drop_replication_slot($1)", anchorSlot)
+		dropAnchorBestEffort()
 		closeReplConnGraceful(replConn)
 		_ = db.Close()
 		return nil, fmt.Errorf("postgres: backup snapshot: pin sql conn: %w", err)
 	}
 	if _, err := conn.ExecContext(ctx, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"); err != nil {
 		_ = conn.Close()
-		_, _ = db.ExecContext(ctx, "SELECT pg_drop_replication_slot($1)", anchorSlot)
+		dropAnchorBestEffort()
 		closeReplConnGraceful(replConn)
 		_ = db.Close()
 		return nil, fmt.Errorf("postgres: backup snapshot: BEGIN: %w", err)
@@ -170,7 +202,7 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts ir.Back
 	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET TRANSACTION SNAPSHOT '%s'", quoteSnapshotName(snapshotName))); err != nil {
 		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
 		_ = conn.Close()
-		_, _ = db.ExecContext(ctx, "SELECT pg_drop_replication_slot($1)", anchorSlot)
+		dropAnchorBestEffort()
 		closeReplConnGraceful(replConn)
 		_ = db.Close()
 		return nil, fmt.Errorf("postgres: backup snapshot: SET TRANSACTION SNAPSHOT: %w", err)
@@ -188,7 +220,7 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts ir.Back
 	if err != nil {
 		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
 		_ = conn.Close()
-		_, _ = db.ExecContext(ctx, "SELECT pg_drop_replication_slot($1)", anchorSlot)
+		dropAnchorBestEffort()
 		closeReplConnGraceful(replConn)
 		_ = db.Close()
 		return nil, fmt.Errorf("postgres: backup snapshot: encode position: %w", err)
@@ -233,7 +265,16 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts ir.Back
 		if err := conn.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
-		if committed {
+		if anchorIsTemporary {
+			// Protocol-TEMPORARY anchor (Bug 137): the server drops the
+			// slot itself when replConn closes below — including on hard
+			// process death, which is the entire point. No explicit SQL
+			// drop is attempted: a temporary slot stays owned (active)
+			// by its creating session for its whole life, so a
+			// cross-session pg_drop_replication_slot here would fail
+			// with "replication slot is active for PID …" rather than
+			// drop anything.
+		} else if committed {
 			// --chain-slot run that completed: the chain slot is now a
 			// durable resource anchored at this backup's EndPosition —
 			// keeping it is the entire point. Skip the drop.

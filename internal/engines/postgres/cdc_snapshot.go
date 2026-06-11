@@ -179,7 +179,7 @@ func (e Engine) openSnapshotStreamShared(ctx context.Context, dsn, slotName stri
 	// stating it explicitly documents intent. The helper layers
 	// FAILOVER true on PG 17+ (see slot_create.go) so the slot
 	// survives Patroni / sync_replication_slots failover events.
-	consistentPoint, snapshotName, err := createLogicalReplicationSlot(ctx, db, replConn, slotName, true)
+	consistentPoint, snapshotName, err := createLogicalReplicationSlot(ctx, db, replConn, slotName, slotCreateOptions{exportSnapshot: true})
 	if err != nil {
 		closeReplConnGraceful(replConn)
 		_ = db.Close()
