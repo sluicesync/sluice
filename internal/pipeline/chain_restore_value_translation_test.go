@@ -36,7 +36,7 @@ import (
 // chunk under chunkPath in store. Returns the chunk's recorded
 // SHA-256 so the test can construct a manifest the chain restorer can
 // verify.
-func writeOneChangeChunk(t *testing.T, store irbackup.BackupStore, chunkPath string, changes []ir.Change) (sha string, rowCount int64) {
+func writeOneChangeChunk(t *testing.T, store irbackup.Store, chunkPath string, changes []ir.Change) (sha string, rowCount int64) {
 	t.Helper()
 	var buf bytes.Buffer
 	// DefaultCodec so encode here agrees with the restore read-default

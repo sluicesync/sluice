@@ -6,7 +6,7 @@ package backup
 import "sluicesync.dev/sluice/internal/ir"
 
 // TableReplayIdempotent reports whether replaying a chain window of
-// [Change] events onto table converges regardless of overlap — i.e.
+// [ir.Change] events onto table converges regardless of overlap — i.e.
 // whether the engines' idempotent applier path (ADR-0010: INSERT
 // upserts on a key; UPDATE/DELETE tolerate zero affected rows) has a
 // key to collide on. True when the table declares a PRIMARY KEY or

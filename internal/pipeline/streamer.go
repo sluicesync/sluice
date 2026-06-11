@@ -467,7 +467,7 @@ type Streamer struct {
 	// non-nil and non-empty.
 	Redactor *redact.Registry
 
-	// PositionFromManifestStore is the [irbackup.BackupStore] the chain
+	// PositionFromManifestStore is the [irbackup.Store] the chain
 	// terminal position is read from when the operator passes
 	// `--position-from-manifest=<chain-url>`. The Streamer uses the
 	// store's terminal manifest's [irbackup.Manifest.EndPosition] as the
@@ -478,7 +478,7 @@ type Streamer struct {
 	//
 	// nil means the field is not in use (the legacy resume path runs
 	// unchanged).
-	PositionFromManifestStore irbackup.BackupStore
+	PositionFromManifestStore irbackup.Store
 
 	// StrictPreflight, when true, promotes the soft warnings emitted
 	// by the Phase 3.3.C pre-flight checks (PG `wal_keep_size`

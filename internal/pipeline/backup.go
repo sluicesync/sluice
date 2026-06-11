@@ -5,7 +5,7 @@ package pipeline
 
 // Backup orchestrator. Phase 1 of the logical-backup feature
 // (`docs/dev/design/logical-backups.md`): full snapshot to a
-// [irbackup.BackupStore], one chunk file per N rows per table, plus a
+// [irbackup.Store], one chunk file per N rows per table, plus a
 // JSON manifest that lists schema + chunks + per-chunk SHA-256.
 //
 // Shape mirrors [Migrator]:
@@ -193,9 +193,9 @@ type Backup struct {
 	// Required.
 	SourceDSN string
 
-	// Store is the [irbackup.BackupStore] backup chunks and manifest are
+	// Store is the [irbackup.Store] backup chunks and manifest are
 	// written to. Required.
-	Store irbackup.BackupStore
+	Store irbackup.Store
 
 	// Filter selects which source tables participate in the backup.
 	// Empty filter (zero value) keeps every table the schema reader
@@ -238,7 +238,7 @@ type Backup struct {
 	// in-progress manifest durably records the anchor; after that it
 	// is kept even across a failure — it is the WAL-retention
 	// guarantee a resumed run adopts (task #42, ADR-0085). See
-	// [irbackup.BackupSnapshotOptions].
+	// [irbackup.SnapshotOptions].
 	ChainSlot bool
 
 	// TableParallelism caps how many tables stream CONCURRENTLY during
@@ -380,7 +380,7 @@ func (b *Backup) Run(ctx context.Context) error {
 	// table reads to a cross-table consistent view, closing the
 	// during-backup write-window gap that v0.17.x's basic OpenRowReader
 	// path leaves open. Engines that don't implement
-	// [irbackup.BackupSnapshotOpener] — OR engines that implement it but
+	// [irbackup.SnapshotOpener] — OR engines that implement it but
 	// whose OpenBackupSnapshot returns an error (e.g. PG without
 	// `wal_level=logical`) — fall through to the v0.17.x shape with a
 	// soft warning so operators know the chain rooted in this full will
@@ -588,7 +588,7 @@ func (b *Backup) Run(ctx context.Context) error {
 	//     The during-backup window gap is closed.
 	//   - v0.17.x fallback: the engine doesn't implement
 	//     BackupSnapshotOpener so we capture the position now,
-	//     post-sweep, via the optional [irbackup.BackupPositionCapturer].
+	//     post-sweep, via the optional [irbackup.PositionCapturer].
 	//     This is the v0.17.2 shape with the documented during-backup
 	//     write-window gap; the openSnapshotOrFallback step has
 	//     already logged a WARN line so operators know.
@@ -718,9 +718,9 @@ func (b *Backup) resolveResumeState(ctx context.Context) (prior *irbackup.Manife
 		// persistent anchor replication slot on the source, each one
 		// silently pinning WAL until the disk fills — give the engine
 		// its chance to sweep that debris now. Best-effort hygiene via
-		// the optional [irbackup.BackupAnchorSweeper] surface: a sweep
+		// the optional [irbackup.AnchorSweeper] surface: a sweep
 		// failure must not fail the resume itself.
-		if sweeper, ok := b.Source.(irbackup.BackupAnchorSweeper); ok {
+		if sweeper, ok := b.Source.(irbackup.AnchorSweeper); ok {
 			if err := sweeper.SweepOrphanedBackupAnchors(ctx, b.SourceDSN); err != nil {
 				slog.WarnContext(
 					ctx, "backup: orphaned-anchor sweep failed; stale anchor slots may still be retaining WAL on the source",
@@ -761,7 +761,7 @@ func (b *Backup) resolveResumeState(ctx context.Context) (prior *irbackup.Manife
 // the table sweep against, plus an optional snapshot-anchored
 // EndPosition captured at snapshot start.
 //
-// v0.18.0: when the engine implements [irbackup.BackupSnapshotOpener], we
+// v0.18.0: when the engine implements [irbackup.SnapshotOpener], we
 // open a backup-scoped consistent snapshot. The returned RowReader is
 // pinned to the snapshot view (cross-table consistency holds) and the
 // returned position is the snapshot's anchor LSN/GTID — recorded on
@@ -786,7 +786,7 @@ func (b *Backup) resolveResumeState(ctx context.Context) (prior *irbackup.Manife
 //
 // Either way, the fallback gets a basic OpenRowReader (no shared
 // snapshot, no cross-table consistency) plus a post-sweep
-// [irbackup.BackupPositionCapturer] capture (later, in
+// [irbackup.PositionCapturer] capture (later, in
 // [Backup.captureEndPosition]).
 //
 // Returns (reader, snapshotPos, cleanup, err). When snapshotPos is
@@ -798,7 +798,7 @@ func (b *Backup) resolveResumeState(ctx context.Context) (prior *irbackup.Manife
 // openBackupSnapshotScoped opens a backup-scoped consistent snapshot,
 // preferring the table-scoped surface when a table scope is in effect.
 // It is the backup-path sibling of [openSnapshotStreamScoped] (the
-// cold-start dispatcher) — same selection logic, [irbackup.BackupSnapshot]
+// cold-start dispatcher) — same selection logic, [irbackup.Snapshot]
 // shape.
 //
 //   - source implements [irbackup.TableScopedBackupSnapshotOpener] AND there
@@ -806,7 +806,7 @@ func (b *Backup) resolveResumeState(ctx context.Context) (prior *irbackup.Manife
 //     so a PlanetScale backup scopes its VStream COPY to the included
 //     tables (avoids the ADR-0071 over-stream/buffer-overflow on a large
 //     unrelated keyspace table).
-//   - else source implements [irbackup.BackupSnapshotOpener] → OpenBackupSnapshot
+//   - else source implements [irbackup.SnapshotOpener] → OpenBackupSnapshot
 //     (unchanged whole-snapshot path — PG, vanilla MySQL via base).
 //   - else → not implemented (ok=false); the caller takes the v0.17.x
 //     non-snapshot fallback.
@@ -823,8 +823,8 @@ func (b *Backup) resolveResumeState(ctx context.Context) (prior *irbackup.Manife
 // chain slot (task #42, ADR-0085) and opens this run's snapshot in the
 // temporary-anchor shape so the adopted slot is never re-created — and
 // never dropped by this run's failure path.
-func (b *Backup) openBackupSnapshotScoped(ctx context.Context, schema *ir.Schema, persistChainSlot bool) (snap *irbackup.BackupSnapshot, implemented bool, err error) {
-	opts := irbackup.BackupSnapshotOptions{
+func (b *Backup) openBackupSnapshotScoped(ctx context.Context, schema *ir.Schema, persistChainSlot bool) (snap *irbackup.Snapshot, implemented bool, err error) {
+	opts := irbackup.SnapshotOptions{
 		SlotName:         b.SlotName,
 		PersistChainSlot: persistChainSlot,
 	}
@@ -835,14 +835,14 @@ func (b *Backup) openBackupSnapshotScoped(ctx context.Context, schema *ir.Schema
 			return snap, true, err
 		}
 	}
-	if opener, ok := b.Source.(irbackup.BackupSnapshotOpener); ok {
+	if opener, ok := b.Source.(irbackup.SnapshotOpener); ok {
 		snap, err = opener.OpenBackupSnapshot(ctx, b.SourceDSN, opts)
 		return snap, true, err
 	}
 	return nil, false, nil
 }
 
-func (b *Backup) openSnapshotOrFallback(ctx context.Context, schema *ir.Schema, persistChainSlot bool) (ir.RowReader, *ir.Position, *irbackup.BackupSnapshot, func(), error) {
+func (b *Backup) openSnapshotOrFallback(ctx context.Context, schema *ir.Schema, persistChainSlot bool) (ir.RowReader, *ir.Position, *irbackup.Snapshot, func(), error) {
 	if snap, ok, err := b.openBackupSnapshotScoped(ctx, schema, persistChainSlot); ok {
 		if err == nil {
 			slog.InfoContext(
@@ -917,13 +917,13 @@ func (b *Backup) openSnapshotOrFallback(ctx context.Context, schema *ir.Schema, 
 // captureEndPosition queries the source for its current CDC position
 // and stores it on manifest.EndPosition. v0.18.0: this path is the
 // FALLBACK shape used only when the engine doesn't implement
-// [irbackup.BackupSnapshotOpener] — engines that do (PG, MySQL in v0.18.0+)
+// [irbackup.SnapshotOpener] — engines that do (PG, MySQL in v0.18.0+)
 // route through [openSnapshotOrFallback] instead and capture the
 // position at snapshot START rather than post-sweep.
 //
 // Engines that don't support CDC (Capabilities.CDC == ir.CDCNone) skip
 // the capture; engines that do but don't implement
-// [irbackup.BackupPositionCapturer] also skip with a debug log line so the
+// [irbackup.PositionCapturer] also skip with a debug log line so the
 // gap is visible to operators running with --log-level=debug.
 //
 // In the fallback shape the capture happens AFTER the per-table row
@@ -951,7 +951,7 @@ func (b *Backup) captureEndPosition(ctx context.Context, manifest *irbackup.Mani
 	}
 	defer closeIf(sr)
 
-	capturer, ok := sr.(irbackup.BackupPositionCapturer)
+	capturer, ok := sr.(irbackup.PositionCapturer)
 	if !ok {
 		slog.DebugContext(
 			ctx, "backup: source SchemaReader does not implement BackupPositionCapturer; manifest EndPosition will be empty",
@@ -1208,7 +1208,7 @@ func nonGeneratedTableColumns(table *ir.Table) []*ir.Column {
 // writeManifest serialises manifest as JSON (indented for human
 // readability) and writes it to the store. The manifest is the
 // public contract; readability matters.
-func writeManifest(ctx context.Context, store irbackup.BackupStore, manifest *irbackup.Manifest) error {
+func writeManifest(ctx context.Context, store irbackup.Store, manifest *irbackup.Manifest) error {
 	b, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal manifest: %w", err)
@@ -1221,7 +1221,7 @@ func writeManifest(ctx context.Context, store irbackup.BackupStore, manifest *ir
 // [readManifest] which surfaces a NotFound as an error: resume code
 // needs to distinguish "no prior backup" (fresh start) from "prior
 // manifest is unreadable" (operator-actionable failure).
-func readManifestIfPresent(ctx context.Context, store irbackup.BackupStore) (*irbackup.Manifest, error) {
+func readManifestIfPresent(ctx context.Context, store irbackup.Store) (*irbackup.Manifest, error) {
 	exists, err := store.Exists(ctx, ManifestFileName)
 	if err != nil {
 		return nil, err
@@ -1338,9 +1338,9 @@ func refuseKeylessRestreamOnAnchoredResume(tasks []backupTableTask) error {
 // backupStoreDescriptor returns a short human-readable identifier of
 // the destination store for log lines. LocalStore reports the absolute
 // root directory; BlobStore reports the (annotated) URL with credentials
-// stripped. Other implementations of [irbackup.BackupStore] fall back to
+// stripped. Other implementations of [irbackup.Store] fall back to
 // `<unknown-store>` so log shape is stable.
-func backupStoreDescriptor(s irbackup.BackupStore) string {
+func backupStoreDescriptor(s irbackup.Store) string {
 	type rooted interface{ Root() string }
 	type urled interface{ URL() string }
 	if r, ok := s.(rooted); ok {
@@ -1358,7 +1358,7 @@ func backupStoreDescriptor(s irbackup.BackupStore) string {
 // who manually deleted chunks between runs trip this and the table
 // gets re-streamed instead of silently appearing in the manifest with
 // no actual data behind it.
-func tableChunksAllPresent(ctx context.Context, store irbackup.BackupStore, entry *irbackup.TableManifest) (bool, error) {
+func tableChunksAllPresent(ctx context.Context, store irbackup.Store, entry *irbackup.TableManifest) (bool, error) {
 	for _, c := range entry.Chunks {
 		exists, err := store.Exists(ctx, c.File)
 		if err != nil {
@@ -1383,7 +1383,7 @@ func tableChunksAllPresent(ctx context.Context, store irbackup.BackupStore, entr
 // boundaries, so the default is correct); (2) every chunk listed is
 // still present on the store (an operator who manually deleted chunks
 // between runs forces a re-stream).
-func tableManifestFullyComplete(ctx context.Context, store irbackup.BackupStore, entry *irbackup.TableManifest) (bool, error) {
+func tableManifestFullyComplete(ctx context.Context, store irbackup.Store, entry *irbackup.TableManifest) (bool, error) {
 	if entry.Partial {
 		return false, nil
 	}
@@ -1399,7 +1399,7 @@ func tableManifestFullyComplete(ctx context.Context, store irbackup.BackupStore,
 // The fetch-and-hash cost is bounded to chunk size (default 100k rows,
 // typically a few MB compressed); cheap relative to a full re-upload
 // of the same chunk over a slow link.
-func chunkAlreadyMatches(ctx context.Context, store irbackup.BackupStore, key, expectedSHA256 string) (bool, error) {
+func chunkAlreadyMatches(ctx context.Context, store irbackup.Store, key, expectedSHA256 string) (bool, error) {
 	exists, err := store.Exists(ctx, key)
 	if err != nil {
 		return false, err
@@ -1425,7 +1425,7 @@ func chunkAlreadyMatches(ctx context.Context, store irbackup.BackupStore, key, e
 // encryption header before constructing a restore-side envelope).
 //
 // Distinct from [readManifest] which surfaces a NotFound as an error.
-func ReadRootManifest(ctx context.Context, store irbackup.BackupStore) (*irbackup.Manifest, error) {
+func ReadRootManifest(ctx context.Context, store irbackup.Store) (*irbackup.Manifest, error) {
 	return readManifestIfPresent(ctx, store)
 }
 
@@ -1441,7 +1441,7 @@ func ReadRootManifest(ctx context.Context, store irbackup.BackupStore) (*irbacku
 // already handles a nil ChainEncryption shape gracefully and a noisy
 // store read at this point would mask the simpler "parent is
 // plaintext" path.
-func chainRootEncryption(ctx context.Context, store irbackup.BackupStore, parent *irbackup.Manifest) *irbackup.ChainEncryption {
+func chainRootEncryption(ctx context.Context, store irbackup.Store, parent *irbackup.Manifest) *irbackup.ChainEncryption {
 	if parent != nil && parent.ChainEncryption != nil {
 		return parent.ChainEncryption
 	}
@@ -1454,7 +1454,7 @@ func chainRootEncryption(ctx context.Context, store irbackup.BackupStore, parent
 
 // readManifest loads and decodes the manifest from store. Used by
 // both restore and `sluice backup verify`.
-func readManifest(ctx context.Context, store irbackup.BackupStore) (*irbackup.Manifest, error) {
+func readManifest(ctx context.Context, store irbackup.Store) (*irbackup.Manifest, error) {
 	rc, err := store.Get(ctx, ManifestFileName)
 	if err != nil {
 		return nil, fmt.Errorf("read manifest: %w", err)

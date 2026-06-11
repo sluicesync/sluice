@@ -27,7 +27,7 @@ var (
 	// Engine-level optional openers / orderers (value type — the
 	// registry holds Engine values, see init()).
 	_ ir.Engine                                = Engine{}
-	_ irbackup.BackupSnapshotOpener            = Engine{}
+	_ irbackup.SnapshotOpener                  = Engine{}
 	_ ir.CDCSchemaSnapshotNormalizer           = Engine{}
 	_ ir.DatabaseDSNDeriver                    = Engine{}
 	_ ir.DatabaseLister                        = Engine{}
@@ -42,14 +42,14 @@ var (
 	_ ir.TableScopedSnapshotOpener             = Engine{}
 
 	// SchemaReader optional surfaces.
-	_ irbackup.BackupPositionCapturer = (*SchemaReader)(nil)
-	_ ir.DiagnoseProber               = (*SchemaReader)(nil)
-	_ ir.HealthReporter               = (*SchemaReader)(nil)
-	_ ir.HeartbeatWriter              = (*SchemaReader)(nil)
-	_ ir.MultiDatabaseScoper          = (*SchemaReader)(nil)
-	_ ir.SampleVerifier               = (*SchemaReader)(nil)
-	_ ir.SequenceStateReader          = (*SchemaReader)(nil)
-	_ ir.Verifier                     = (*SchemaReader)(nil)
+	_ irbackup.PositionCapturer = (*SchemaReader)(nil)
+	_ ir.DiagnoseProber         = (*SchemaReader)(nil)
+	_ ir.HealthReporter         = (*SchemaReader)(nil)
+	_ ir.HeartbeatWriter        = (*SchemaReader)(nil)
+	_ ir.MultiDatabaseScoper    = (*SchemaReader)(nil)
+	_ ir.SampleVerifier         = (*SchemaReader)(nil)
+	_ ir.SequenceStateReader    = (*SchemaReader)(nil)
+	_ ir.Verifier               = (*SchemaReader)(nil)
 
 	// SchemaWriter optional surfaces.
 	_ ir.ColumnDDLPreviewer      = (*SchemaWriter)(nil)

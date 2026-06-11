@@ -11,7 +11,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
-// CaptureBackupPosition implements [irbackup.BackupPositionCapturer]. Returns
+// CaptureBackupPosition implements [irbackup.PositionCapturer]. Returns
 // the source's current binlog cursor — `@@global.gtid_executed` when
 // GTID mode is on, or `(file, position)` otherwise — encoded the same
 // way the CDC reader emits via [encodeBinlogPos]. Phase 3.3: the full

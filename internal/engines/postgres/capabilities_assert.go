@@ -27,7 +27,7 @@ var (
 	// Engine-level optional openers / probers (value type — the
 	// registry holds an Engine value, see init()).
 	_ ir.Engine                         = Engine{}
-	_ irbackup.BackupSnapshotOpener     = Engine{}
+	_ irbackup.SnapshotOpener           = Engine{}
 	_ ir.CDCReaderWithSlotOpener        = Engine{}
 	_ ir.CDCSchemaSnapshotNormalizer    = Engine{}
 	_ ir.ConnectionSlotClassifier       = Engine{}
@@ -46,7 +46,7 @@ var (
 	_ ir.TargetStaleBackendReaper       = Engine{}
 
 	// SchemaReader optional surfaces.
-	_ irbackup.BackupPositionCapturer        = (*SchemaReader)(nil)
+	_ irbackup.PositionCapturer              = (*SchemaReader)(nil)
 	_ ir.BytesLagReporter                    = (*SchemaReader)(nil)
 	_ ir.DiagnoseProber                      = (*SchemaReader)(nil)
 	_ ir.ExtensionAware                      = (*SchemaReader)(nil)

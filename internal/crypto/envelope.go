@@ -270,7 +270,7 @@ func GenerateCEK() ([]byte, error) {
 // [CEKLen] bytes; nonce is generated fresh per call via [crypto/rand].
 //
 // The composed shape is what the chunk writer hands to
-// [backup.BackupStore.Put]; the chunk reader splits it back into
+// [backup.Store.Put]; the chunk reader splits it back into
 // nonce + ciphertext on the way out.
 func EncryptChunk(plaintext, cek []byte) ([]byte, error) {
 	if len(cek) != CEKLen {

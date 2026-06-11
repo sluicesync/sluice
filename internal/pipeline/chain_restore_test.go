@@ -39,7 +39,7 @@ func makeManifest(t *testing.T, kind string, parent *irbackup.Manifest, lsn stri
 // seedSegment writes a single segment's full + incrementals into a
 // per-segment store and returns the LineageSegment describing it. dir
 // == "" is the root (one-segment) layout.
-func seedSegment(t *testing.T, root irbackup.BackupStore, dir string, full *irbackup.Manifest, incrs []*irbackup.Manifest, codec Codec) LineageSegment {
+func seedSegment(t *testing.T, root irbackup.Store, dir string, full *irbackup.Manifest, incrs []*irbackup.Manifest, codec Codec) LineageSegment {
 	t.Helper()
 	ss := newPrefixedStore(root, dir)
 	if err := writeManifestAt(context.Background(), ss, ManifestFileName, full); err != nil {

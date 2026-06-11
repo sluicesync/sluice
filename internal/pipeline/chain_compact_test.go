@@ -397,12 +397,12 @@ func TestCompactChain_StaleStagingCleanup(t *testing.T) {
 
 // --- seed helpers ---
 
-func seedTwoSegmentLineage(t *testing.T, store irbackup.BackupStore, now time.Time, gap time.Duration) {
+func seedTwoSegmentLineage(t *testing.T, store irbackup.Store, now time.Time, gap time.Duration) {
 	t.Helper()
 	seedSegmentsWithGaps(t, store, now, []time.Duration{gap})
 }
 
-func seedNSegmentLineage(t *testing.T, store irbackup.BackupStore, now time.Time, gap time.Duration, n int) {
+func seedNSegmentLineage(t *testing.T, store irbackup.Store, now time.Time, gap time.Duration, n int) {
 	t.Helper()
 	if n < 1 {
 		t.Fatalf("n must be >= 1; got %d", n)
@@ -422,7 +422,7 @@ func seedNSegmentLineage(t *testing.T, store irbackup.BackupStore, now time.Time
 //   - No ChainEncryption on the full manifests (plaintext keyset).
 //
 // Returns nothing; the caller asserts on the on-disk state.
-func seedSegmentsWithGaps(t *testing.T, store irbackup.BackupStore, base time.Time, gaps []time.Duration) {
+func seedSegmentsWithGaps(t *testing.T, store irbackup.Store, base time.Time, gaps []time.Duration) {
 	t.Helper()
 	seedSegmentsWithGapsOpts(t, store, base, gaps, segmentSeedOpts{})
 }
@@ -447,7 +447,7 @@ type segmentSeedOpts struct {
 	rotatedOverlap bool
 }
 
-func seedSegmentsWithGapsOpts(t *testing.T, store irbackup.BackupStore, base time.Time, gaps []time.Duration, opts segmentSeedOpts) {
+func seedSegmentsWithGapsOpts(t *testing.T, store irbackup.Store, base time.Time, gaps []time.Duration, opts segmentSeedOpts) {
 	t.Helper()
 	n := len(gaps) + 1
 	cumulative := time.Duration(0)
@@ -594,21 +594,21 @@ func lsnToken(lsn uint64) string {
 	return fmt.Sprintf(`{"slot":"s","lsn":"0/%X"}`, lsn)
 }
 
-func seedTwoSegmentLineageWithEncryption(t *testing.T, store irbackup.BackupStore, now time.Time, encA, encB *irbackup.ChainEncryption) {
+func seedTwoSegmentLineageWithEncryption(t *testing.T, store irbackup.Store, now time.Time, encA, encB *irbackup.ChainEncryption) {
 	t.Helper()
 	seedSegmentsWithGapsOpts(t, store, now, []time.Duration{time.Hour}, segmentSeedOpts{
 		encPerSegment: []*irbackup.ChainEncryption{encA, encB},
 	})
 }
 
-func seedTwoSegmentLineageWithCodecs(t *testing.T, store irbackup.BackupStore, now time.Time, codecA, codecB Codec) {
+func seedTwoSegmentLineageWithCodecs(t *testing.T, store irbackup.Store, now time.Time, codecA, codecB Codec) {
 	t.Helper()
 	seedSegmentsWithGapsOpts(t, store, now, []time.Duration{time.Hour}, segmentSeedOpts{
 		codecsPerSegment: []Codec{codecA, codecB},
 	})
 }
 
-func seedTwoSegmentLineageWithGap(t *testing.T, store irbackup.BackupStore, now time.Time) {
+func seedTwoSegmentLineageWithGap(t *testing.T, store irbackup.Store, now time.Time) {
 	t.Helper()
 	seedSegmentsWithGapsOpts(t, store, now, []time.Duration{time.Hour}, segmentSeedOpts{
 		gapBetweenBoundaries: true,

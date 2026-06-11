@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Unit tests for the Bug 137 resume-time orphan sweep dispatch: when
-// the source engine implements the optional [irbackup.BackupAnchorSweeper]
+// the source engine implements the optional [irbackup.AnchorSweeper]
 // surface, the full-backup orchestrator invokes it exactly when a
 // resume is detected (an in-progress prior manifest) — never on a
 // fresh run — and a sweep failure is hygiene, not a run failure.
@@ -20,7 +20,7 @@ import (
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
-// sweepingBackupEngine layers [irbackup.BackupAnchorSweeper] onto the
+// sweepingBackupEngine layers [irbackup.AnchorSweeper] onto the
 // package's stock backup test engine, recording each invocation.
 type sweepingBackupEngine struct {
 	*backupRecorderEngine
@@ -36,7 +36,7 @@ func (e *sweepingBackupEngine) SweepOrphanedBackupAnchors(_ context.Context, dsn
 	return e.sweepErr
 }
 
-var _ irbackup.BackupAnchorSweeper = (*sweepingBackupEngine)(nil)
+var _ irbackup.AnchorSweeper = (*sweepingBackupEngine)(nil)
 
 // anchorSweepFixture returns a schema + rows pair small enough that
 // the backup completes instantly but real enough to exercise the
@@ -53,7 +53,7 @@ func anchorSweepFixture() (schema *ir.Schema, rows map[string][]ir.Row) {
 
 // writeInProgressManifest seeds the store with the minimal manifest
 // shape that flips the orchestrator onto the resume path.
-func writeInProgressManifest(t *testing.T, store irbackup.BackupStore, schema *ir.Schema) {
+func writeInProgressManifest(t *testing.T, store irbackup.Store, schema *ir.Schema) {
 	t.Helper()
 	partial := &irbackup.Manifest{
 		FormatVersion: irbackup.BackupFormatVersion,

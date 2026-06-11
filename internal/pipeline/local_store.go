@@ -3,7 +3,7 @@
 
 package pipeline
 
-// Local-filesystem implementation of [irbackup.BackupStore].
+// Local-filesystem implementation of [irbackup.Store].
 //
 // This is the Phase 1 reference backend. Pure stdlib (`os` +
 // `path/filepath` + `io.fs`); zero external dependencies. Phase 2 cloud
@@ -36,7 +36,7 @@ import (
 )
 
 // LocalStore is the local-filesystem implementation of
-// [irbackup.BackupStore]. Construct with [NewLocalStore].
+// [irbackup.Store]. Construct with [NewLocalStore].
 //
 // Concurrent Put / Get on the same path is unsafe (the underlying
 // `os.Create` truncates); Phase 1 backup orchestrator is sequential
@@ -75,7 +75,7 @@ func NewLocalStore(root string) (*LocalStore, error) {
 // Useful for log lines and tests.
 func (s *LocalStore) Root() string { return s.root }
 
-// Put implements [irbackup.BackupStore.Put]. The path is created relative
+// Put implements [irbackup.Store.Put]. The path is created relative
 // to the store root; intermediate directories are created as needed.
 // Existing content at the path is overwritten.
 //
@@ -122,7 +122,7 @@ func (s *LocalStore) Put(ctx context.Context, path string, r io.Reader) error {
 	return nil
 }
 
-// Get implements [irbackup.BackupStore.Get].
+// Get implements [irbackup.Store.Get].
 func (s *LocalStore) Get(ctx context.Context, path string) (io.ReadCloser, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -138,7 +138,7 @@ func (s *LocalStore) Get(ctx context.Context, path string) (io.ReadCloser, error
 	return f, nil
 }
 
-// List implements [irbackup.BackupStore.List]. Walks the directory rooted
+// List implements [irbackup.Store.List]. Walks the directory rooted
 // at the store's root and returns every regular file whose path
 // (forward-slash separated, relative to root) starts with prefix.
 //
@@ -179,7 +179,7 @@ func (s *LocalStore) List(ctx context.Context, prefix string) ([]string, error) 
 	return out, nil
 }
 
-// Exists implements [irbackup.BackupStore.Exists]. Reports whether a regular
+// Exists implements [irbackup.Store.Exists]. Reports whether a regular
 // file is present at path within the store root. Used by the resumable
 // backup writer to skip re-uploading already-completed chunks.
 func (s *LocalStore) Exists(ctx context.Context, path string) (bool, error) {
@@ -203,7 +203,7 @@ func (s *LocalStore) Exists(ctx context.Context, path string) (bool, error) {
 	return true, nil
 }
 
-// Delete implements [irbackup.BackupStore.Delete]. Idempotent — a missing
+// Delete implements [irbackup.Store.Delete]. Idempotent — a missing
 // path returns nil rather than an error.
 func (s *LocalStore) Delete(ctx context.Context, path string) error {
 	if err := ctx.Err(); err != nil {
@@ -250,5 +250,5 @@ func (s *LocalStore) absPath(path string) (string, error) {
 	return abs, nil
 }
 
-// Compile-time check that LocalStore satisfies irbackup.BackupStore.
-var _ irbackup.BackupStore = (*LocalStore)(nil)
+// Compile-time check that LocalStore satisfies irbackup.Store.
+var _ irbackup.Store = (*LocalStore)(nil)

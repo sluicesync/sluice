@@ -87,7 +87,7 @@ func TestValidateFirstIncrementalBoundary(t *testing.T) {
 // incremental starting at P_N (the kept overlap). firstIncrStart lets a
 // caller inject a forward-gap (start AHEAD of the full) for the refusal
 // pin. Returns the store + a comparator ranking the LSNs.
-func rotatedSecondSegment(t *testing.T, firstIncrLSN, coverageLSN string) (irbackup.BackupStore, ir.PositionMonotonicChecker) {
+func rotatedSecondSegment(t *testing.T, firstIncrLSN, coverageLSN string) (irbackup.Store, ir.PositionMonotonicChecker) {
 	t.Helper()
 	dir := t.TempDir()
 	store, _ := NewLocalStore(dir)

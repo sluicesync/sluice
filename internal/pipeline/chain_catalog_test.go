@@ -282,7 +282,7 @@ func TestParseCompression(t *testing.T) {
 	}
 }
 
-func mustWriteManifest(t *testing.T, store irbackup.BackupStore, path string, m *irbackup.Manifest) {
+func mustWriteManifest(t *testing.T, store irbackup.Store, path string, m *irbackup.Manifest) {
 	t.Helper()
 	if err := writeManifestAt(context.Background(), store, path, m); err != nil {
 		t.Fatalf("writeManifestAt(%q): %v", path, err)

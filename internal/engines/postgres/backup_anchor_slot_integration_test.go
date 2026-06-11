@@ -101,7 +101,7 @@ func assertTemporaryAnchorAutoDropsOnKill(t *testing.T, dsn string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	snap, err := eng.OpenBackupSnapshot(ctx, dsn, irbackup.BackupSnapshotOptions{})
+	snap, err := eng.OpenBackupSnapshot(ctx, dsn, irbackup.SnapshotOptions{})
 	if err != nil {
 		t.Fatalf("OpenBackupSnapshot: %v", err)
 	}
@@ -175,7 +175,7 @@ func TestBackupSnapshot_TemporaryAnchorDroppedOnGracefulClose(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	snap, err := eng.OpenBackupSnapshot(ctx, dsn, irbackup.BackupSnapshotOptions{})
+	snap, err := eng.OpenBackupSnapshot(ctx, dsn, irbackup.SnapshotOptions{})
 	if err != nil {
 		t.Fatalf("OpenBackupSnapshot: %v", err)
 	}

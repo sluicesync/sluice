@@ -26,7 +26,7 @@ import (
 // anchors leaked by pre-fix binaries (see backup_anchor_sweep.go).
 const backupSnapshotSlotPrefix = "sluice_backup_anchor_"
 
-// OpenBackupSnapshot implements [irbackup.BackupSnapshotOpener]. It captures
+// OpenBackupSnapshot implements [irbackup.SnapshotOpener]. It captures
 // a consistent Postgres snapshot anchored at a logical-replication
 // slot's `consistent_point` LSN, returning a snapshot-pinned RowReader
 // the full-backup orchestrator drives the table sweep against.
@@ -52,7 +52,7 @@ const backupSnapshotSlotPrefix = "sluice_backup_anchor_"
 //     opts.SlotName) is created and used as the anchor, so its
 //     consistent point IS the recorded EndPosition and `backup
 //     incremental` chains with zero gap by construction. The slot is
-//     kept only when the orchestrator calls [irbackup.BackupSnapshot.Commit]
+//     kept only when the orchestrator calls [irbackup.Snapshot.Commit]
 //     — since task #42 (ADR-0085) that happens once the run's
 //     in-progress manifest durably records the anchor, so an
 //     interrupted-but-resumable run keeps the slot for resume adoption;
@@ -65,7 +65,7 @@ const backupSnapshotSlotPrefix = "sluice_backup_anchor_"
 // Caller closes the returned snapshot to release the snapshot tx, the
 // pinned SQL conn(s), the slot-creation replication conn, the anchor
 // slot (unless committed), and the underlying DB pool.
-func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts irbackup.BackupSnapshotOptions) (*irbackup.BackupSnapshot, error) {
+func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts irbackup.SnapshotOptions) (*irbackup.Snapshot, error) {
 	chainSlotName := opts.SlotName
 	if chainSlotName == "" {
 		chainSlotName = defaultSlot
@@ -318,7 +318,7 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts irbacku
 		return firstErr
 	}
 
-	snap := &irbackup.BackupSnapshot{
+	snap := &irbackup.Snapshot{
 		Position:     position,
 		Rows:         rowReader,
 		CloseFn:      closeFn,

@@ -13,7 +13,7 @@ import (
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
-// OpenBackupSnapshot implements [irbackup.BackupSnapshotOpener]. It captures
+// OpenBackupSnapshot implements [irbackup.SnapshotOpener]. It captures
 // a consistent MySQL snapshot via `START TRANSACTION WITH CONSISTENT
 // SNAPSHOT` on a single pinned connection, returning a snapshot-pinned
 // RowReader the full-backup orchestrator drives the table sweep
@@ -28,7 +28,7 @@ import (
 // at the snapshot's start point — closing the during-backup write-
 // window gap.
 //
-// opts.SlotName is accepted for [irbackup.BackupSnapshotOpener] interface
+// opts.SlotName is accepted for [irbackup.SnapshotOpener] interface
 // uniformity and ignored — MySQL has no slot concept on the source
 // side. opts.PersistChainSlot is a loud no-op for the same reason
 // (binlog retention is server-configured via
@@ -51,7 +51,7 @@ import (
 // the data-read sense — operators couldn't actually chain
 // incrementals onto those backups because the encoded position
 // shape was wrong.
-func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts irbackup.BackupSnapshotOptions) (*irbackup.BackupSnapshot, error) {
+func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts irbackup.SnapshotOptions) (*irbackup.Snapshot, error) {
 	if e.Capabilities().CDC == ir.CDCNone {
 		return nil, fmt.Errorf("%s: backup snapshot not supported by this flavor: %w", e.Name(), ErrNotImplemented)
 	}
@@ -132,7 +132,7 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts irbacku
 		return firstErr
 	}
 
-	return &irbackup.BackupSnapshot{
+	return &irbackup.Snapshot{
 		Position: position,
 		Rows:     rowReader,
 		CloseFn:  closeFn,
@@ -156,7 +156,7 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts irbacku
 //     Its per-table pinned-conn reader reads one table at a time and
 //     never over-streams, so the table scope is a no-op there (mirrors
 //     the OpenSnapshotStreamForTables comment).
-func (e Engine) OpenBackupSnapshotForTables(ctx context.Context, dsn string, opts irbackup.BackupSnapshotOptions, tables []string) (*irbackup.BackupSnapshot, error) {
+func (e Engine) OpenBackupSnapshotForTables(ctx context.Context, dsn string, opts irbackup.SnapshotOptions, tables []string) (*irbackup.Snapshot, error) {
 	if e.Capabilities().CDC == ir.CDCNone {
 		return nil, fmt.Errorf("%s: backup snapshot not supported by this flavor: %w", e.Name(), ErrNotImplemented)
 	}
@@ -175,7 +175,7 @@ func (e Engine) OpenBackupSnapshotForTables(ctx context.Context, dsn string, opt
 // story on MySQL needs no provisioning — the binlog IS the retention
 // mechanism — but silently accepting the flag would let an operator
 // believe something was set up.
-func warnChainSlotNoOp(ctx context.Context, e Engine, opts irbackup.BackupSnapshotOptions) {
+func warnChainSlotNoOp(ctx context.Context, e Engine, opts irbackup.SnapshotOptions) {
 	if !opts.PersistChainSlot {
 		return
 	}

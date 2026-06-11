@@ -404,7 +404,7 @@ var errBackupPoolNoImporter = errors.New("pipeline: backup table pool: source en
 // mutex is it. The data-plane chunk Puts (distinct keys) stay outside.
 type manifestCommitter struct {
 	mu       sync.Mutex
-	store    irbackup.BackupStore
+	store    irbackup.Store
 	manifest *irbackup.Manifest
 }
 

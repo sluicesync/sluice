@@ -56,8 +56,8 @@ type ChainRestore struct {
 	// TargetDSN is the target-engine-native connection string. Required.
 	TargetDSN string
 
-	// Store is the [irbackup.BackupStore] the chain lives in. Required.
-	Store irbackup.BackupStore
+	// Store is the [irbackup.Store] the chain lives in. Required.
+	Store irbackup.Store
 
 	// Filter selects which tables from the chain participate.
 	Filter TableFilter
@@ -708,7 +708,7 @@ func (r *ChainRestore) streamSchemaHistorySnapshots(
 // sniffed from the bytes — ADR-0046 §5).
 func (r *ChainRestore) streamOneChangeChunk(
 	ctx context.Context,
-	segStore irbackup.BackupStore,
+	segStore irbackup.Store,
 	codec Codec,
 	chunk *irbackup.ChunkInfo,
 	out chan<- ir.Change,
@@ -904,7 +904,7 @@ func validateFirstIncrementalBoundary(cmp ir.PositionMonotonicChecker, fullEnd, 
 // inter-segment no-regression check; nil degrades to the structural
 // same-engine guarantee (the rotation FSM already hard-asserted
 // S>=P_N at write time via the live source engine).
-func buildLineageChain(ctx context.Context, store irbackup.BackupStore, cmp ir.PositionMonotonicChecker) ([]segmentRecord, error) {
+func buildLineageChain(ctx context.Context, store irbackup.Store, cmp ir.PositionMonotonicChecker) ([]segmentRecord, error) {
 	cat, err := resolveLineage(ctx, store)
 	if err != nil {
 		return nil, err
@@ -1014,7 +1014,7 @@ func buildLineageChain(ctx context.Context, store irbackup.BackupStore, cmp ir.P
 // the authoritative monotonicity gate). Best-effort: a lineage-read
 // hiccup yields nil rather than failing the restore here (the
 // subsequent buildLineageChain surfaces real lineage errors).
-func sameEngineComparator(ctx context.Context, store irbackup.BackupStore, eng ir.Engine) ir.PositionMonotonicChecker {
+func sameEngineComparator(ctx context.Context, store irbackup.Store, eng ir.Engine) ir.PositionMonotonicChecker {
 	chk, ok := eng.(ir.PositionMonotonicChecker)
 	if !ok {
 		return nil
@@ -1046,7 +1046,7 @@ func sameEngineComparator(ctx context.Context, store irbackup.BackupStore, eng i
 // Broker call sites reach this through [brokerChainCache], which
 // memoizes the walk across ticks so an idle tick is O(1) store GETs
 // instead of O(chain-length).
-func buildBrokerChain(ctx context.Context, store irbackup.BackupStore) ([]segmentRecord, error) {
+func buildBrokerChain(ctx context.Context, store irbackup.Store) ([]segmentRecord, error) {
 	return buildLineageChain(ctx, store, nil)
 }
 

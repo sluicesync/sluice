@@ -188,7 +188,7 @@ type rotateInputs struct {
 // rotateResult is what the rollover loop needs to continue on the new
 // segment after a committed rotation.
 type rotateResult struct {
-	newSegStore irbackup.BackupStore
+	newSegStore irbackup.Store
 	newSegCodec Codec
 	newSegDir   string
 	newFull     *irbackup.Manifest
@@ -492,7 +492,7 @@ func (b *BackupStream) discardProvisional(ctx context.Context, dir string) {
 //
 // Either way the marker is cleared. Called once at BackupStream.Run
 // start, before streaming.
-func recoverRotationState(ctx context.Context, store irbackup.BackupStore) error {
+func recoverRotationState(ctx context.Context, store irbackup.Store) error {
 	exists, err := store.Exists(ctx, RotationStateFileName)
 	if err != nil {
 		return fmt.Errorf("inspect %q: %w", RotationStateFileName, err)
@@ -573,7 +573,7 @@ func recoverRotationState(ctx context.Context, store irbackup.BackupStore) error
 
 // writeRotationState writes the crash-recovery marker via a single
 // Put (atomic at the storage layer).
-func writeRotationState(ctx context.Context, store irbackup.BackupStore, st *rotationState) error {
+func writeRotationState(ctx context.Context, store irbackup.Store, st *rotationState) error {
 	b, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal rotation_state: %w", err)

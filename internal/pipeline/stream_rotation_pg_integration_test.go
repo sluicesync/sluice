@@ -41,7 +41,7 @@ import (
 // rotationSeedFull takes the initial full backup and patches its
 // EndPosition to the freshly-created slot LSN so the stream chains
 // off it (mirrors the existing stream PG tests' setup).
-func rotationSeedFull(t *testing.T, store irbackup.BackupStore, eng ir.Engine, sourceDSN, slotLSN string) *irbackup.Manifest {
+func rotationSeedFull(t *testing.T, store irbackup.Store, eng ir.Engine, sourceDSN, slotLSN string) *irbackup.Manifest {
 	t.Helper()
 	if err := (&Backup{Source: eng, SourceDSN: sourceDSN, Store: store, SluiceVersion: "test"}).
 		Run(context.Background()); err != nil {

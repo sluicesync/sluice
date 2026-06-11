@@ -17,19 +17,19 @@ import (
 // Used to prove the cache's idle-tick GET count is constant in chain
 // length (repo-audit M2.4: an idle tick was O(chain) GETs).
 type countingGetStore struct {
-	irbackup.BackupStore
+	irbackup.Store
 	gets int
 }
 
 func (s *countingGetStore) Get(ctx context.Context, path string) (io.ReadCloser, error) {
 	s.gets++
-	return s.BackupStore.Get(ctx, path)
+	return s.Store.Get(ctx, path)
 }
 
 // seedLinearLineage writes a one-segment lineage with n chained
 // incrementals plus its lineage.json, returning the manifests in
 // chain order (full first).
-func seedLinearLineage(t *testing.T, store irbackup.BackupStore, n int) []*irbackup.Manifest {
+func seedLinearLineage(t *testing.T, store irbackup.Store, n int) []*irbackup.Manifest {
 	t.Helper()
 	full := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
 	manifests := []*irbackup.Manifest{full}
@@ -59,7 +59,7 @@ func TestBrokerChainCache_IdleTickGETsConstant(t *testing.T) {
 		t.Run(fmt.Sprintf("links=%d", chainLinks), func(t *testing.T) {
 			mem := newMemStore()
 			manifests := seedLinearLineage(t, mem, chainLinks-1)
-			store := &countingGetStore{BackupStore: mem}
+			store := &countingGetStore{Store: mem}
 			var cache brokerChainCache
 
 			// Warm walk: O(chain) GETs, by design.

@@ -57,7 +57,7 @@ type brokerChainCache struct {
 // is byte-identical to the cached one. An idle hit costs exactly two
 // store GETs regardless of chain length; any mismatch rebuilds the
 // whole chain via [buildBrokerChain].
-func (c *brokerChainCache) get(ctx context.Context, store irbackup.BackupStore) ([]segmentRecord, error) {
+func (c *brokerChainCache) get(ctx context.Context, store irbackup.Store) ([]segmentRecord, error) {
 	catalogBytes, tailBytes, identified := readChainIdentity(ctx, store)
 	if identified && c.chain != nil &&
 		bytes.Equal(catalogBytes, c.catalogBytes) && bytes.Equal(tailBytes, c.tailBytes) {
@@ -87,7 +87,7 @@ func (c *brokerChainCache) invalidate() {
 // walk-discovered with no single head object, and an unreadable
 // catalog must flow through [buildBrokerChain]'s loud refusal rather
 // than a cache decision.
-func readChainIdentity(ctx context.Context, store irbackup.BackupStore) (catalogBytes, tailBytes []byte, identified bool) {
+func readChainIdentity(ctx context.Context, store irbackup.Store) (catalogBytes, tailBytes []byte, identified bool) {
 	catalogBytes, err := readAllAt(ctx, store, LineageCatalogFileName)
 	if err != nil {
 		return nil, nil, false
@@ -110,7 +110,7 @@ func readChainIdentity(ctx context.Context, store irbackup.BackupStore) (catalog
 
 // readAllAt reads the whole object at path. Callers here treat any
 // failure (including a missing object) as "no identity available".
-func readAllAt(ctx context.Context, store irbackup.BackupStore, path string) ([]byte, error) {
+func readAllAt(ctx context.Context, store irbackup.Store, path string) ([]byte, error) {
 	rc, err := store.Get(ctx, path)
 	if err != nil {
 		return nil, err

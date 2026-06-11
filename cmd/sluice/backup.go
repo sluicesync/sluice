@@ -503,7 +503,7 @@ func (b *BackupFullCmd) Run(g *Globals) error {
 	return backup.Run(ctx)
 }
 
-// openBackupStore opens the right [irbackup.BackupStore] for the operator's
+// openBackupStore opens the right [irbackup.Store] for the operator's
 // flag combination. Returns the store, a human-readable destination
 // description (for log lines), and an optional closer for backends
 // that need cleanup. The S3-only options are validated against the
@@ -512,7 +512,7 @@ func openBackupStore(
 	ctx context.Context,
 	outputDir, target string,
 	opts pipeline.BlobStoreOptions,
-) (store irbackup.BackupStore, description string, closer func() error, err error) {
+) (store irbackup.Store, description string, closer func() error, err error) {
 	switch {
 	case outputDir != "":
 		s, err := pipeline.NewLocalStore(outputDir)

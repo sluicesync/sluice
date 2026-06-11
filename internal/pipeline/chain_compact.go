@@ -274,7 +274,7 @@ type plannedGroup struct {
 // boundary, codec mismatch, gap-between-segments) is a wrapped error.
 //
 //nolint:funlen // ratchet: pre-existing 234-line accretion; split when next touched (hold-the-line note in .golangci.yml)
-func CompactChain(ctx context.Context, store irbackup.BackupStore, opts CompactOpts) (*CompactResult, error) {
+func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (*CompactResult, error) {
 	if opts.MergeWindow <= 0 {
 		return nil, errors.New("backup compact: --merge-window is required (positive duration)")
 	}
@@ -558,7 +558,7 @@ func CompactChain(ctx context.Context, store irbackup.BackupStore, opts CompactO
 
 // segmentByteTotal sums every chunk's byte length across the segment's
 // full + every incremental.
-func segmentByteTotal(ctx context.Context, ss irbackup.BackupStore, seg *LineageSegment, fullMani *irbackup.Manifest) (int64, error) {
+func segmentByteTotal(ctx context.Context, ss irbackup.Store, seg *LineageSegment, fullMani *irbackup.Manifest) (int64, error) {
 	var total int64
 	for _, t := range fullMani.Tables {
 		for _, ch := range t.Chunks {
@@ -589,7 +589,7 @@ func segmentByteTotal(ctx context.Context, ss irbackup.BackupStore, seg *Lineage
 // streaming Get + io.Copy into io.Discard. Naive but correct;
 // BackupStore has no Stat. Compact's reporting path is not a hot path
 // (operator-explicit op).
-func readByteSize(ctx context.Context, store irbackup.BackupStore, path string) (int64, error) {
+func readByteSize(ctx context.Context, store irbackup.Store, path string) (int64, error) {
 	rc, err := store.Get(ctx, path)
 	if err != nil {
 		return 0, fmt.Errorf("get %q: %w", path, err)
@@ -743,7 +743,7 @@ func generateMergedSegmentID() string {
 // reads them.
 func executeMergeGroup(
 	ctx context.Context,
-	store irbackup.BackupStore,
+	store irbackup.Store,
 	eligible []LineageSegment,
 	pg *plannedGroup,
 ) error {
@@ -831,7 +831,7 @@ func executeMergeGroup(
 // copyFile reads src.path → dst.path through the store-level Get/Put
 // primitives. Idempotent: a re-run after a partial copy overwrites the
 // destination cleanly (BackupStore.Put is overwrite semantics).
-func copyFile(ctx context.Context, src, dst irbackup.BackupStore, srcPath, dstPath string) error {
+func copyFile(ctx context.Context, src, dst irbackup.Store, srcPath, dstPath string) error {
 	rc, err := src.Get(ctx, srcPath)
 	if err != nil {
 		return fmt.Errorf("get %q: %w", srcPath, err)
@@ -855,7 +855,7 @@ func copyFile(ctx context.Context, src, dst irbackup.BackupStore, srcPath, dstPa
 // partially populated and the catalog still pointing at the sources,
 // so the next compact run's stale-staging-dir cleanup + catalog-
 // driven sweep cleans both.
-func renameStagingToFinal(ctx context.Context, store irbackup.BackupStore, stagingDir, finalDir string) error {
+func renameStagingToFinal(ctx context.Context, store irbackup.Store, stagingDir, finalDir string) error {
 	paths, err := store.List(ctx, stagingDir+"/")
 	if err != nil {
 		return fmt.Errorf("list staging %q: %w", stagingDir, err)
@@ -875,7 +875,7 @@ func renameStagingToFinal(ctx context.Context, store irbackup.BackupStore, stagi
 
 // cleanupStagingDirs sweeps any leftover `.compact-staging-*` files
 // from prior crashed runs.
-func cleanupStagingDirs(ctx context.Context, store irbackup.BackupStore) error {
+func cleanupStagingDirs(ctx context.Context, store irbackup.Store) error {
 	paths, err := store.List(ctx, compactStagingDirPrefix)
 	if err != nil {
 		return fmt.Errorf("list staging dirs: %w", err)
@@ -892,7 +892,7 @@ func cleanupStagingDirs(ctx context.Context, store irbackup.BackupStore) error {
 // the lineage root that belong to a merged source. After compact the
 // merged segment lives under its own sub-dir, so the root manifest +
 // root incrementals + root chunks are orphans.
-func sweepRootSegmentArtifacts(ctx context.Context, store irbackup.BackupStore, seg *LineageSegment) error {
+func sweepRootSegmentArtifacts(ctx context.Context, store irbackup.Store, seg *LineageSegment) error {
 	_ = store.Delete(ctx, ManifestFileName)
 	for _, ip := range seg.Incrementals {
 		_ = store.Delete(ctx, ip)
@@ -908,7 +908,7 @@ func sweepRootSegmentArtifacts(ctx context.Context, store irbackup.BackupStore, 
 // sweepSegmentSubdir deletes every file under a (no-longer-referenced)
 // segment sub-directory. Used to GC merged sources' original dirs
 // after the catalog swap committed them out of authority.
-func sweepSegmentSubdir(ctx context.Context, store irbackup.BackupStore, dir string) error {
+func sweepSegmentSubdir(ctx context.Context, store irbackup.Store, dir string) error {
 	paths, err := store.List(ctx, dir+"/")
 	if err != nil {
 		return err

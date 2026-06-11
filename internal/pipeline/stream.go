@@ -127,9 +127,9 @@ type BackupStream struct {
 	// Required.
 	SourceDSN string
 
-	// Store is the [irbackup.BackupStore] the parent manifest lives in and
+	// Store is the [irbackup.Store] the parent manifest lives in and
 	// every rolled manifest + chunks are written to. Required.
-	Store irbackup.BackupStore
+	Store irbackup.Store
 
 	// ParentRef identifies the parent backup the stream chains off.
 	// Either a [irbackup.Manifest.BackupID] (e.g. "abc123def4567890") or the
@@ -285,7 +285,7 @@ type BackupStream struct {
 	// the open segment's Dir; a no-op wrap for the common one-segment
 	// shape). Manifest + chunk writes go here. Repointed by the
 	// rotation FSM's COMMIT to the freshly-opened segment. Set by Run.
-	segStore irbackup.BackupStore
+	segStore irbackup.Store
 
 	// segCodec is the codec of the open segment, threaded into the
 	// change-chunk writer. Set by Run; repointed by rotation.

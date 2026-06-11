@@ -271,11 +271,11 @@ func TestBackup_ChainSlot_UncommittedCloseDropsSlot(t *testing.T) {
 	applyDDL(t, sourceDSN, chainSeedDDL)
 
 	pgEng, _ := engines.Get("postgres")
-	opener, ok := pgEng.(irbackup.BackupSnapshotOpener)
+	opener, ok := pgEng.(irbackup.SnapshotOpener)
 	if !ok {
 		t.Fatal("postgres engine does not implement BackupSnapshotOpener")
 	}
-	opts := irbackup.BackupSnapshotOptions{PersistChainSlot: true}
+	opts := irbackup.SnapshotOptions{PersistChainSlot: true}
 
 	// Failure shape: open → Close (no Commit) → slot gone.
 	snap, err := opener.OpenBackupSnapshot(context.Background(), sourceDSN, opts)

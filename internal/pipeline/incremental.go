@@ -122,9 +122,9 @@ type IncrementalBackup struct {
 	// Required.
 	SourceDSN string
 
-	// Store is the [irbackup.BackupStore] the parent manifest lives in and
+	// Store is the [irbackup.Store] the parent manifest lives in and
 	// the new incremental manifest + chunks are written to. Required.
-	Store irbackup.BackupStore
+	Store irbackup.Store
 
 	// ParentRef identifies the parent backup the incremental chains
 	// off. Either a [BackupID] (e.g. "abc123def4567890") or the empty
@@ -182,7 +182,7 @@ type IncrementalBackup struct {
 	// the open segment's Dir; a no-op wrap for the common one-segment
 	// shape). Manifest + chunk writes go here; the lineage update goes
 	// to the root b.Store. Set by Run.
-	segStore irbackup.BackupStore
+	segStore irbackup.Store
 
 	// Now, when set, overrides the wall-clock-time source for
 	// [irbackup.Manifest.CreatedAt]. Used by tests to pin timestamps; in
@@ -561,7 +561,7 @@ func refuseInProgressParent(m *irbackup.Manifest, path string) error {
 // a segment sub-dir); recs and the segment Incrementals paths are
 // both relative to the open segment's Dir, so they match by path.
 // recs must be non-empty (callers check len == 0 first).
-func chainTailManifest(ctx context.Context, rootStore irbackup.BackupStore, recs []manifestRecord) manifestRecord {
+func chainTailManifest(ctx context.Context, rootStore irbackup.Store, recs []manifestRecord) manifestRecord {
 	cat, ok, err := loadLineageCatalog(ctx, rootStore)
 	if err == nil && ok && len(cat.Segments) > 0 {
 		seg := &cat.Segments[len(cat.Segments)-1] // open segment
@@ -925,7 +925,7 @@ func buildIncrementalManifestPath(m *irbackup.Manifest) string {
 // writeManifestAt is [writeManifest] generalised to a caller-supplied
 // path. The full-backup writer's [writeManifest] hard-codes
 // [ManifestFileName]; the incremental writer needs an arbitrary path.
-func writeManifestAt(ctx context.Context, store irbackup.BackupStore, path string, manifest *irbackup.Manifest) error {
+func writeManifestAt(ctx context.Context, store irbackup.Store, path string, manifest *irbackup.Manifest) error {
 	b, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal manifest: %w", err)
@@ -959,7 +959,7 @@ type manifestRecord struct {
 // (the open-segment parent resolve in incremental/stream, and the
 // one-segment legacy / rebuild paths). It does NOT cross segment
 // sub-dirs by design.
-func listAllManifestsViaWalk(ctx context.Context, store irbackup.BackupStore) ([]manifestRecord, error) {
+func listAllManifestsViaWalk(ctx context.Context, store irbackup.Store) ([]manifestRecord, error) {
 	var out []manifestRecord
 
 	// Full's manifest at the legacy path.
@@ -997,7 +997,7 @@ func listAllManifestsViaWalk(ctx context.Context, store irbackup.BackupStore) ([
 
 // readManifestAt is [readManifest] generalised to a caller-supplied
 // path. Same format-version gating as the legacy helper.
-func readManifestAt(ctx context.Context, store irbackup.BackupStore, path string) (*irbackup.Manifest, error) {
+func readManifestAt(ctx context.Context, store irbackup.Store, path string) (*irbackup.Manifest, error) {
 	rc, err := store.Get(ctx, path)
 	if err != nil {
 		return nil, fmt.Errorf("get %q: %w", path, err)

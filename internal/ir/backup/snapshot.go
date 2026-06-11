@@ -9,11 +9,11 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
-// BackupSnapshot is the lighter-weight cousin of [SnapshotStream] used
+// Snapshot is the lighter-weight cousin of [ir.SnapshotStream] used
 // by the full-backup orchestrator (v0.18.0, "snapshot-anchored
-// EndPosition"). Whereas [SnapshotStream] pairs a snapshot-pinned
+// EndPosition"). Whereas [ir.SnapshotStream] pairs a snapshot-pinned
 // RowReader with a CDCReader for the migrate / sync-start cold-start
-// path, [BackupSnapshot] only provides the snapshot-pinned RowReader
+// path, [Snapshot] only provides the snapshot-pinned RowReader
 // — backups don't open CDC, they just need consistent reads across
 // every table plus the snapshot's anchor position.
 //
@@ -33,7 +33,7 @@ import (
 //   - Postgres: a separate temporary replication slot creates an
 //     exported snapshot; one or more pinned `*sql.Conn` values
 //     `SET TRANSACTION SNAPSHOT '<name>'` to import the same view.
-//     N-conn parallel reads ride [SnapshotImporter] against the
+//     N-conn parallel reads ride [ir.SnapshotImporter] against the
 //     exported SnapshotName (ADR-0084).
 //   - MySQL: a single pinned `*sql.Conn` running
 //     `START TRANSACTION WITH CONSISTENT SNAPSHOT`. All table reads
@@ -45,21 +45,21 @@ import (
 // temporary slot (PG), commits the snapshot tx, closes the pinned
 // conn(s), and closes the underlying DB pool. The orchestrator calls
 // it via Close once the row sweep completes.
-type BackupSnapshot struct {
+type Snapshot struct {
 	Position ir.Position
 	Rows     ir.RowReader
 	CloseFn  func() error
 
 	// SnapshotName is the engine's SHAREABLE exported-snapshot name —
 	// the handle other connections pass to the engine's
-	// [SnapshotImporter] to observe the EXACT same consistent view as
+	// [ir.SnapshotImporter] to observe the EXACT same consistent view as
 	// Rows. Postgres populates it from CREATE_REPLICATION_SLOT …
 	// EXPORT_SNAPSHOT (the `snapshot_name`); MySQL leaves it empty
 	// because its snapshot is per-session and not shareable across
 	// connections.
 	//
 	// It is the capability gate for the parallel per-table backup
-	// reads (ADR-0084, mirroring [SnapshotStream.SnapshotName]'s role
+	// reads (ADR-0084, mirroring [ir.SnapshotStream.SnapshotName]'s role
 	// in ADR-0079): an empty value means "not shareable → the backup
 	// row sweep stays serial". Additive, optional — readers that don't
 	// recognise it ignore it.
@@ -84,7 +84,7 @@ type BackupSnapshot struct {
 
 // Close releases the snapshot transaction and the underlying
 // connections. After Close, Rows is unusable.
-func (s *BackupSnapshot) Close() error {
+func (s *Snapshot) Close() error {
 	if s == nil || s.CloseFn == nil {
 		return nil
 	}
@@ -94,28 +94,28 @@ func (s *BackupSnapshot) Close() error {
 // Commit persists run-scoped resources that should outlive a
 // successful backup (see CommitFn). Safe to call when no CommitFn is
 // set (no-op).
-func (s *BackupSnapshot) Commit(ctx context.Context) error {
+func (s *Snapshot) Commit(ctx context.Context) error {
 	if s == nil || s.CommitFn == nil {
 		return nil
 	}
 	return s.CommitFn(ctx)
 }
 
-// BackupSnapshotOpener is the optional engine surface for opening a
+// SnapshotOpener is the optional engine surface for opening a
 // backup-scoped consistent snapshot. The full-backup orchestrator
 // type-asserts on this method when starting a run; engines that
 // implement it get cross-table snapshot consistency plus a
 // snapshot-anchored [Manifest.EndPosition], engines that don't fall
 // back to the v0.17.x shape (per-table independent reads + end-of-
-// backup [BackupPositionCapturer] capture) with a soft warning about
+// backup [PositionCapturer] capture) with a soft warning about
 // the during-backup write-window gap.
 //
-// Lives in the [ir] package so engine packages can implement it
+// Lives in the ir/backup package so engine packages can implement it
 // without forming an import cycle through the pipeline package's
 // integration tests. The full-backup orchestrator's only direct
 // dependency on the engine surface is this interface — engines wire
 // the implementation onto whichever value is convenient (today: the
-// engine struct itself, parallel to [Engine.OpenSnapshotStream]).
+// engine struct itself, parallel to [ir.Engine.OpenSnapshotStream]).
 //
 // The options' SlotName is honoured by engines with a slot concept
 // (Postgres: by default a temporary anchor slot — distinct from the
@@ -124,14 +124,14 @@ func (s *BackupSnapshot) Commit(ctx context.Context) error {
 // against this manifest opens CDC against the correct chain-handoff
 // slot, even though the temporary backup slot has long been dropped).
 // MySQL ignores it — the binlog stream is the slot.
-type BackupSnapshotOpener interface {
-	OpenBackupSnapshot(ctx context.Context, dsn string, opts BackupSnapshotOptions) (*BackupSnapshot, error)
+type SnapshotOpener interface {
+	OpenBackupSnapshot(ctx context.Context, dsn string, opts SnapshotOptions) (*Snapshot, error)
 }
 
-// BackupSnapshotOptions carries the engine-facing knobs for opening a
+// SnapshotOptions carries the engine-facing knobs for opening a
 // backup snapshot. A zero value preserves the historical defaults
 // (engine default slot name, temporary anchor slot dropped at Close).
-type BackupSnapshotOptions struct {
+type SnapshotOptions struct {
 	// SlotName is the chain-handoff replication-slot name recorded on
 	// the snapshot Position for engines with a slot concept. Empty
 	// falls back to the engine default (`sluice_slot` on Postgres).
@@ -141,7 +141,7 @@ type BackupSnapshotOptions struct {
 	// PersistChainSlot, when true on engines with a slot concept,
 	// anchors the snapshot on the PERSISTENT chain slot itself
 	// (named SlotName) instead of a temporary anchor slot, and keeps
-	// it once the backup commits ([BackupSnapshot.CommitFn]). The
+	// it once the backup commits ([Snapshot.CommitFn]). The
 	// slot's consistent point then IS the manifest's EndPosition, so
 	// `backup incremental` chains with zero gap by construction —
 	// without it, the operator must create and maintain the chain
@@ -155,7 +155,7 @@ type BackupSnapshotOptions struct {
 	PersistChainSlot bool
 }
 
-// BackupAnchorSweeper is the OPTIONAL engine surface the full-backup
+// AnchorSweeper is the OPTIONAL engine surface the full-backup
 // orchestrator invokes when it RESUMES an in-progress backup, to
 // clean up anchor-slot debris a previously crashed run may have left
 // on the source (Bug 137).
@@ -178,7 +178,7 @@ type BackupSnapshotOptions struct {
 // The sweep is hygiene, not correctness: the orchestrator calls it
 // best-effort and a sweep failure must not fail the resume. Engines
 // without server-side slot state (MySQL) simply don't implement it.
-type BackupAnchorSweeper interface {
+type AnchorSweeper interface {
 	SweepOrphanedBackupAnchors(ctx context.Context, dsn string) error
 }
 
@@ -206,24 +206,24 @@ type ChainResumePreflighter interface {
 
 // TableScopedBackupSnapshotOpener is the OPTIONAL engine surface for
 // opening a backup-scoped consistent snapshot whose snapshot COPY is
-// restricted to a table allowlist. It is to [BackupSnapshotOpener] what
-// [TableScopedSnapshotOpener] is to [Engine.OpenSnapshotStream]: the same
+// restricted to a table allowlist. It is to [SnapshotOpener] what
+// [ir.TableScopedSnapshotOpener] is to [ir.Engine.OpenSnapshotStream]: the same
 // snapshot contract, but with the COPY scoped to the included tables.
 //
 // An empty/nil tables slice means "all tables" — identical behaviour to
-// [BackupSnapshotOpener.OpenBackupSnapshot]. A non-empty slice scopes the
+// [SnapshotOpener.OpenBackupSnapshot]. A non-empty slice scopes the
 // backup snapshot's VStream COPY filter to those UNQUALIFIED table names,
 // so a large unrelated table in the same keyspace is never streamed or
 // buffered (the ADR-0071 multi-table-interleaving buffer overflow). The
-// semantics match [TableScopedSnapshotOpener.OpenSnapshotStreamForTables]
+// semantics match [ir.TableScopedSnapshotOpener.OpenSnapshotStreamForTables]
 // exactly.
 //
 // Only engines that over-stream by default need to implement it (today:
 // the MySQL PlanetScale/VStream flavor). The full-backup orchestrator
 // type-asserts on this surface and prefers it when a table scope is in
 // effect; engines that don't implement it fall back to the base
-// [BackupSnapshotOpener.OpenBackupSnapshot] (Postgres and vanilla MySQL
+// [SnapshotOpener.OpenBackupSnapshot] (Postgres and vanilla MySQL
 // read per-table and never over-stream, so the scope is a no-op there).
 type TableScopedBackupSnapshotOpener interface {
-	OpenBackupSnapshotForTables(ctx context.Context, dsn string, opts BackupSnapshotOptions, tables []string) (*BackupSnapshot, error)
+	OpenBackupSnapshotForTables(ctx context.Context, dsn string, opts SnapshotOptions, tables []string) (*Snapshot, error)
 }

@@ -112,11 +112,11 @@ type SyncFromBackup struct {
 	// Required.
 	TargetDSN string
 
-	// Store is the [irbackup.BackupStore] the chain lives in. The broker
+	// Store is the [irbackup.Store] the chain lives in. The broker
 	// reads manifests + change chunks from it but never writes;
 	// brokers are read-only consumers (acceptance criterion 10).
 	// Required.
-	Store irbackup.BackupStore
+	Store irbackup.Store
 
 	// ChainURL is the operator-visible URL of the chain store.
 	// Recorded in the position token and in log lines so monitoring
@@ -1062,7 +1062,7 @@ func (b *SyncFromBackup) streamIncrementalWithPosition(
 // segStore/codec come from the chunk's segment (recorded, not sniffed).
 func (b *SyncFromBackup) streamOneChunkWithPosition(
 	ctx context.Context,
-	segStore irbackup.BackupStore,
+	segStore irbackup.Store,
 	codec Codec,
 	chunk *irbackup.ChunkInfo,
 	pos ir.Position,

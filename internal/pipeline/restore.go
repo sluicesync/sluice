@@ -47,9 +47,9 @@ type Restore struct {
 	// Required.
 	TargetDSN string
 
-	// Store is the [irbackup.BackupStore] to read manifest + chunks from.
+	// Store is the [irbackup.Store] to read manifest + chunks from.
 	// Required.
-	Store irbackup.BackupStore
+	Store irbackup.Store
 
 	// Filter selects which tables from the manifest participate.
 	// Empty (zero value) restores every table.
@@ -720,7 +720,7 @@ type VerifyOptions struct {
 // backward compatibility (all existing tests rely on this signature).
 // Operators wanting the Bug 117 decrypt probe pass a non-nil
 // VerifyOptions.Envelope via [VerifyBackupWith].
-func VerifyBackup(ctx context.Context, store irbackup.BackupStore) (total, failed int, err error) {
+func VerifyBackup(ctx context.Context, store irbackup.Store) (total, failed int, err error) {
 	return VerifyBackupWith(ctx, store, VerifyOptions{})
 }
 
@@ -729,7 +729,7 @@ func VerifyBackup(ctx context.Context, store irbackup.BackupStore) (total, faile
 // unwrapped against the supplied envelope so a passphrase rotation
 // mid-chain (Bug 117) surfaces at verify-time instead of partial-failing
 // the restore.
-func VerifyBackupWith(ctx context.Context, store irbackup.BackupStore, opts VerifyOptions) (total, failed int, err error) {
+func VerifyBackupWith(ctx context.Context, store irbackup.Store, opts VerifyOptions) (total, failed int, err error) {
 	records, err := listAllSegmentManifests(ctx, store)
 	if err != nil {
 		return 0, 0, fmt.Errorf("verify: %w", err)
@@ -856,7 +856,7 @@ func probeChunkDecrypt(env crypto.EnvelopeEncryption, chunk *irbackup.ChunkInfo)
 
 // verifyChunk fetches a chunk and recomputes its SHA-256, returning
 // nil on match or a wrapped [ErrChunkHashMismatch] on mismatch.
-func verifyChunk(ctx context.Context, store irbackup.BackupStore, chunk *irbackup.ChunkInfo) error {
+func verifyChunk(ctx context.Context, store irbackup.Store, chunk *irbackup.ChunkInfo) error {
 	src, err := store.Get(ctx, chunk.File)
 	if err != nil {
 		return fmt.Errorf("open: %w", err)

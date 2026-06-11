@@ -4,7 +4,7 @@
 package pipeline
 
 // Phase 3.3.B helper: load the chain's terminal CDC position from a
-// backup chain stored in an [irbackup.BackupStore]. Used by `sluice sync
+// backup chain stored in an [irbackup.Store]. Used by `sluice sync
 // start --position-from-manifest=<chain-url>` so a sync stream that
 // just had a chain restored into its target can resume CDC from the
 // chain's terminal position without re-bulking.
@@ -41,7 +41,7 @@ import (
 //   - the chain's terminal manifest carries an empty EndPosition (a
 //     pre-Phase-3.3 v0.16.x or v0.17.0 full with no recorded position;
 //     the chain handoff path has nowhere to start)
-func LoadChainTerminalPosition(ctx context.Context, store irbackup.BackupStore) (ir.Position, error) {
+func LoadChainTerminalPosition(ctx context.Context, store irbackup.Store) (ir.Position, error) {
 	// nil comparator: position-from-manifest only reads the terminal
 	// position; the structural + write-time guarantees suffice (no
 	// source engine instance available here without breaking the

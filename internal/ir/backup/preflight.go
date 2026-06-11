@@ -12,8 +12,8 @@ import (
 // PositionFromManifestPreflight is the optional engine-side surface
 // for the Phase 3.3.C pre-flight checks fired before
 // `sluice sync start --position-from-manifest` opens CDC. PG
-// implements it on the engine's [SchemaReader] (parallel to
-// [HealthReporter] / [BackupPositionCapturer]); engines without
+// implements it on the engine's [ir.SchemaReader] (parallel to
+// [ir.HealthReporter] / [PositionCapturer]); engines without
 // operator-attention surfaces simply omit the method.
 //
 // The contract: implementations inspect the source's slot/WAL state
@@ -23,7 +23,7 @@ import (
 // run-aborting errors; warnings turn into refusals when
 // `--strict-preflight` is set.
 //
-// Lives in the ir package (not pipeline) so engine packages can
+// Lives in the ir/backup package (not pipeline) so engine packages can
 // reference it without forming an import cycle through pipeline's
 // integration tests.
 type PositionFromManifestPreflight interface {
@@ -52,10 +52,10 @@ type PreflightReport struct {
 	Refusal string
 }
 
-// BackupPositionCapturer is the optional engine surface for capturing
+// PositionCapturer is the optional engine surface for capturing
 // the source's current CDC position from a one-shot query. Used by
 // the full-backup orchestrator as a v0.18.0 fallback when the engine
-// does NOT implement [BackupSnapshotOpener] — the snapshot-anchored
+// does NOT implement [SnapshotOpener] — the snapshot-anchored
 // path is the preferred shape because it closes the during-backup
 // write-window gap that this fallback path leaves open.
 //
@@ -71,17 +71,17 @@ type PreflightReport struct {
 // as a known caveat with the workaround "pair backups with
 // continuous `sluice sync start`."
 //
-// In v0.18.0 the gap is closed via [BackupSnapshotOpener]: engines
+// In v0.18.0 the gap is closed via [SnapshotOpener]: engines
 // that implement it capture EndPosition at snapshot START (the
 // source position at which a cross-table consistent read view is
 // pinned) and the orchestrator never calls CaptureBackupPosition.
-// Engines that DON'T implement BackupSnapshotOpener fall through to
+// Engines that DON'T implement SnapshotOpener fall through to
 // this surface with a WARN log line so operators know the chain
 // rooted in this full will carry the v0.17.x during-backup write-
 // window gap.
 //
-// Engines wire this on their [SchemaReader] (parallel to
-// [HealthReporter]) so the full-backup orchestrator can type-assert
+// Engines wire this on their [ir.SchemaReader] (parallel to
+// [ir.HealthReporter]) so the full-backup orchestrator can type-assert
 // on a value it already opens. The captured position's encoding is
 // engine-specific:
 //
@@ -98,12 +98,12 @@ type PreflightReport struct {
 // (matches the v0.16.x shape; first incremental against such a manifest
 // surfaces a clear "parent has no EndPosition; chain will start from
 // CDC's current position" warning).
-type BackupPositionCapturer interface {
+type PositionCapturer interface {
 	// CaptureBackupPosition returns the source's current CDC position.
 	// The slotName argument is honoured by engines with a slot concept
 	// (Postgres) and ignored by others (MySQL); empty falls back to the
 	// engine's default. The returned position is suitable for storage
-	// in [Manifest.EndPosition] and as a [Position] argument to the
+	// in [Manifest.EndPosition] and as a [ir.Position] argument to the
 	// engine's CDC reader.
 	CaptureBackupPosition(ctx context.Context, slotName string) (ir.Position, error)
 }

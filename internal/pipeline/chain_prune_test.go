@@ -191,7 +191,7 @@ func TestPruneLineage_MultiSegmentDropsLeadingWholeSegment(t *testing.T) {
 
 // --- seed helpers ---
 
-func seedFull(t *testing.T, root irbackup.BackupStore, dir, startLSN, lsn string, created time.Time) *irbackup.Manifest {
+func seedFull(t *testing.T, root irbackup.Store, dir, startLSN, lsn string, created time.Time) *irbackup.Manifest {
 	t.Helper()
 	m := &irbackup.Manifest{
 		FormatVersion: irbackup.BackupFormatVersion, SourceEngine: "postgres",
@@ -207,7 +207,7 @@ func seedFull(t *testing.T, root irbackup.BackupStore, dir, startLSN, lsn string
 	return m
 }
 
-func seedIncr(t *testing.T, root irbackup.BackupStore, dir, _id, parent, startLSN, lsn string, created time.Time) *irbackup.Manifest {
+func seedIncr(t *testing.T, root irbackup.Store, dir, _id, parent, startLSN, lsn string, created time.Time) *irbackup.Manifest {
 	t.Helper()
 	m := &irbackup.Manifest{
 		FormatVersion: irbackup.BackupFormatVersion, SourceEngine: "postgres",
@@ -325,7 +325,7 @@ func TestSchemaHistoryRetentionFloor_Incomparable(t *testing.T) {
 	}
 }
 
-func seedLineageChain(t *testing.T, store irbackup.BackupStore, incrementals int) time.Time {
+func seedLineageChain(t *testing.T, store irbackup.Store, incrementals int) time.Time {
 	t.Helper()
 	base := time.Date(2026, 5, 16, 0, 0, 0, 0, time.UTC)
 	full := &irbackup.Manifest{

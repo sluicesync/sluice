@@ -76,7 +76,7 @@ type brokerState struct {
 // readBrokerState loads the state file at path from store. Returns
 // (nil, nil) when the file doesn't exist (the cold-start case);
 // (nil, err) when the file exists but can't be decoded.
-func readBrokerState(ctx context.Context, store irbackup.BackupStore, path string) (*brokerState, error) {
+func readBrokerState(ctx context.Context, store irbackup.Store, path string) (*brokerState, error) {
 	exists, err := store.Exists(ctx, path)
 	if err != nil {
 		return nil, fmt.Errorf("broker state: exists %q: %w", path, err)
@@ -109,7 +109,7 @@ func readBrokerState(ctx context.Context, store irbackup.BackupStore, path strin
 // Heartbeat writes use [writeBrokerStateMergeHeartbeat] to preserve
 // any concurrent stop_requested_at the operator wrote in the race
 // window between the broker's read-poll and write-heartbeat.
-func writeBrokerState(ctx context.Context, store irbackup.BackupStore, path string, s *brokerState) error {
+func writeBrokerState(ctx context.Context, store irbackup.Store, path string, s *brokerState) error {
 	body, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return fmt.Errorf("broker state: marshal: %w", err)
@@ -129,7 +129,7 @@ func writeBrokerState(ctx context.Context, store irbackup.BackupStore, path stri
 // in-process channel registry ([brokerStopRegistry]) closes the
 // same-process case entirely; the remaining cross-process window is
 // bounded by one state-file flush.
-func writeBrokerStateMergeHeartbeat(ctx context.Context, store irbackup.BackupStore, path string, s *brokerState) (stopObserved bool, err error) {
+func writeBrokerStateMergeHeartbeat(ctx context.Context, store irbackup.Store, path string, s *brokerState) (stopObserved bool, err error) {
 	prior, err := readBrokerState(ctx, store, path)
 	if err != nil {
 		return false, err
@@ -148,7 +148,7 @@ func writeBrokerStateMergeHeartbeat(ctx context.Context, store irbackup.BackupSt
 // the state file, or nil if the file doesn't exist or doesn't carry a
 // stop request. Errors from the store surface to the caller; missing
 // file is (nil, nil).
-func readBrokerStopRequested(ctx context.Context, store irbackup.BackupStore, path string) (*time.Time, error) {
+func readBrokerStopRequested(ctx context.Context, store irbackup.Store, path string) (*time.Time, error) {
 	s, err := readBrokerState(ctx, store, path)
 	if err != nil {
 		return nil, err
@@ -170,14 +170,14 @@ func readBrokerStopRequested(ctx context.Context, store irbackup.BackupStore, pa
 // Returns (nil, error) when the state file is absent — there's no
 // running broker to stop. The caller's error message names the
 // "no broker is running" case explicitly.
-func RequestSyncFromBackupStop(ctx context.Context, store irbackup.BackupStore, now time.Time) (*brokerState, error) {
+func RequestSyncFromBackupStop(ctx context.Context, store irbackup.Store, now time.Time) (*brokerState, error) {
 	return requestBrokerStopAt(ctx, store, DefaultBrokerStateFilename, now)
 }
 
 // requestBrokerStopAt is [RequestSyncFromBackupStop] generalised to a
 // caller-supplied path. Tests pin a deterministic path; production
 // callers route through RequestSyncFromBackupStop.
-func requestBrokerStopAt(ctx context.Context, store irbackup.BackupStore, path string, now time.Time) (*brokerState, error) {
+func requestBrokerStopAt(ctx context.Context, store irbackup.Store, path string, now time.Time) (*brokerState, error) {
 	prior, err := readBrokerState(ctx, store, path)
 	if err != nil {
 		return nil, fmt.Errorf("broker stop: read state file: %w", err)

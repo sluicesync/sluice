@@ -57,7 +57,7 @@ func TestIncrementalAlignEncryption_PerChunkDecryptProbe_Bug117_Ingestion(t *tes
 		},
 	}
 
-	runBackup := func(t *testing.T, mode string, env crypto.EnvelopeEncryption) irbackup.BackupStore {
+	runBackup := func(t *testing.T, mode string, env crypto.EnvelopeEncryption) irbackup.Store {
 		t.Helper()
 		dir := t.TempDir()
 		store, err := NewLocalStore(dir)
@@ -93,7 +93,7 @@ func TestIncrementalAlignEncryption_PerChunkDecryptProbe_Bug117_Ingestion(t *tes
 		return env
 	}
 
-	rebindForChain := func(t *testing.T, store irbackup.BackupStore, pass string) crypto.EnvelopeEncryption {
+	rebindForChain := func(t *testing.T, store irbackup.Store, pass string) crypto.EnvelopeEncryption {
 		t.Helper()
 		m, err := ReadRootManifest(context.Background(), store)
 		if err != nil {
@@ -117,7 +117,7 @@ func TestIncrementalAlignEncryption_PerChunkDecryptProbe_Bug117_Ingestion(t *tes
 		return env
 	}
 
-	readRoot := func(t *testing.T, store irbackup.BackupStore) *irbackup.Manifest {
+	readRoot := func(t *testing.T, store irbackup.Store) *irbackup.Manifest {
 		t.Helper()
 		m, err := ReadRootManifest(context.Background(), store)
 		if err != nil {

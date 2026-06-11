@@ -57,7 +57,7 @@ func newTestPassphraseEnvelope(t *testing.T, passphrase string) *crypto.Passphra
 // recorded Argon2id params, and builds a restore-side
 // PassphraseEnvelope using the supplied passphrase. Mirrors the CLI
 // path's "read manifest, build envelope from recorded params" flow.
-func envelopeFromManifest(t *testing.T, store irbackup.BackupStore, passphrase string) crypto.EnvelopeEncryption {
+func envelopeFromManifest(t *testing.T, store irbackup.Store, passphrase string) crypto.EnvelopeEncryption {
 	t.Helper()
 	root, err := ReadRootManifest(context.Background(), store)
 	if err != nil {
@@ -84,7 +84,7 @@ func envelopeFromManifest(t *testing.T, store irbackup.BackupStore, passphrase s
 // chunkContainsPlaintext reads a chunk file's bytes off disk and
 // returns true if any of the supplied substrings appears as plaintext.
 // Used by the round-trip test to confirm encryption actually happened.
-func chunkContainsPlaintext(t *testing.T, store irbackup.BackupStore, chunkPath string, substrs ...string) bool {
+func chunkContainsPlaintext(t *testing.T, store irbackup.Store, chunkPath string, substrs ...string) bool {
 	t.Helper()
 	rc, err := store.Get(context.Background(), chunkPath)
 	if err != nil {

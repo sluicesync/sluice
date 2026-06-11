@@ -718,7 +718,7 @@ func isPerRowEvent(c ir.Change) bool {
 // Returns the aggregated per-group tally for the CompactPlanGroup.
 func applySmartCompactionToStagedGroup(
 	ctx context.Context,
-	stagingStore irbackup.BackupStore,
+	stagingStore irbackup.Store,
 	pg *plannedGroup,
 	codec Codec,
 	cek []byte,
@@ -763,7 +763,7 @@ func applySmartCompactionToStagedGroup(
 // header + EOF; the reader treats it as an empty stream).
 func applySmartCompactionToIncremental(
 	ctx context.Context,
-	store irbackup.BackupStore,
+	store irbackup.Store,
 	im *irbackup.Manifest,
 	codec Codec,
 	cek []byte,

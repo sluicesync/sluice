@@ -159,14 +159,14 @@ func TestCompactChain_SmartCompactionOff_NaiveBehaviorUnchanged(t *testing.T) {
 // segment's two incrementals carry a synthetic INSERT+UPDATE chain
 // on the same PK — designed to collapse heavily under smart
 // compaction.
-func seedSmartCompactLineage(t *testing.T, store irbackup.BackupStore, base time.Time) {
+func seedSmartCompactLineage(t *testing.T, store irbackup.Store, base time.Time) {
 	t.Helper()
 	seedSmartCompactLineageWithSchemaAndEnc(t, store, base, usersSchema(), nil, smartCompactRowsHappyPath)
 }
 
 // seedSmartCompactLineageNoPK seeds a lineage whose schema has a
 // table WITHOUT a declared PK; smart compaction skips it.
-func seedSmartCompactLineageNoPK(t *testing.T, store irbackup.BackupStore, base time.Time) {
+func seedSmartCompactLineageNoPK(t *testing.T, store irbackup.Store, base time.Time) {
 	t.Helper()
 	seedSmartCompactLineageWithSchemaAndEnc(t, store, base, noPKSchema(), nil, smartCompactRowsNoPKTable)
 }
@@ -174,7 +174,7 @@ func seedSmartCompactLineageNoPK(t *testing.T, store irbackup.BackupStore, base 
 // seedSmartCompactLineageEncrypted seeds a lineage whose full
 // manifests carry a ChainEncryption marker (so smart compact
 // refuses).
-func seedSmartCompactLineageEncrypted(t *testing.T, store irbackup.BackupStore, base time.Time) {
+func seedSmartCompactLineageEncrypted(t *testing.T, store irbackup.Store, base time.Time) {
 	t.Helper()
 	enc := &irbackup.ChainEncryption{
 		Algorithm: "AES-256-GCM",
@@ -251,7 +251,7 @@ func smartCompactRowsNoPKTable(startLSN uint64, incrIdx int) (events []ir.Change
 // so the §14d position-gap pre-flight stays green.
 func seedSmartCompactLineageWithSchemaAndEnc(
 	t *testing.T,
-	store irbackup.BackupStore,
+	store irbackup.Store,
 	base time.Time,
 	schema *ir.Schema,
 	enc *irbackup.ChainEncryption,

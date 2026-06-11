@@ -55,7 +55,7 @@ func TestVerifyBackupWith_DecryptProbe_Bug117(t *testing.T) {
 		},
 	}
 
-	runBackup := func(t *testing.T, mode string, env crypto.EnvelopeEncryption) irbackup.BackupStore {
+	runBackup := func(t *testing.T, mode string, env crypto.EnvelopeEncryption) irbackup.Store {
 		t.Helper()
 		dir := t.TempDir()
 		store, err := NewLocalStore(dir)
@@ -94,7 +94,7 @@ func TestVerifyBackupWith_DecryptProbe_Bug117(t *testing.T) {
 	// Re-derive an envelope against a chain's recorded Argon2id params
 	// (the same shape buildReadEnvelope uses). Required so the read
 	// envelope unwraps the chain's WrappedCEK.
-	rebindForChain := func(t *testing.T, store irbackup.BackupStore, pass string) crypto.EnvelopeEncryption {
+	rebindForChain := func(t *testing.T, store irbackup.Store, pass string) crypto.EnvelopeEncryption {
 		t.Helper()
 		m, err := ReadRootManifest(context.Background(), store)
 		if err != nil {

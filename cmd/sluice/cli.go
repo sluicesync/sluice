@@ -989,7 +989,7 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 	// position source, replacing the default sluice_cdc_state lookup.
 	// Mutually exclusive with --reset-target-data (different recovery
 	// shapes; both override the persisted position).
-	var manifestStore irbackup.BackupStore
+	var manifestStore irbackup.Store
 	var manifestStoreCloser func() error
 	if s.PositionFromManifest != "" {
 		ctx := kongContext()

@@ -49,8 +49,8 @@ import (
 // nobody can chain anyway).
 //
 // v0.94.1 introduces FormatVersion=2 to close Bug 116: schema-
-// metadata fields ([Table.RLSEnabled], [Table.RLSForced],
-// [Table.Policies], [Table.ExcludeConstraints]) added under the
+// metadata fields ([ir.Table.RLSEnabled], [ir.Table.RLSForced],
+// [ir.Table.Policies], [ir.Table.ExcludeConstraints]) added under the
 // FormatVersion=1 "field-additions are forward-compatible" policy were
 // silently dropped by older binaries reading manifests written by
 // newer binaries — a CRITICAL silent-loss class for security policies
@@ -129,7 +129,7 @@ const (
 	BackupKindFull = "full"
 
 	// BackupKindIncremental marks a manifest produced by `sluice
-	// backup incremental` — a window of [Change] events sourced from
+	// backup incremental` — a window of [ir.Change] events sourced from
 	// the engine's CDC pump, replayed at restore time on top of a
 	// parent (full or earlier incremental). Phase 3 of the logical-
 	// backup feature; see `docs/dev/design/logical-backups-phase-3.md`.
@@ -192,7 +192,7 @@ type SchemaDeltaEntry struct {
 // version observed during an incremental backup's window. Restore-side
 // replay seeds the target's sluice_cdc_schema_history with these so a
 // stream resumed at the backup's EndPosition can resolve the schema in
-// effect there via [ResolveSchemaVersion]. Append-only — older readers
+// effect there via [ir.ResolveSchemaVersion]. Append-only — older readers
 // ignore unknown fields (the documented pre-Chunk-D state: a restore +
 // resume falls to the loud ADR-0022 cold-start floor, never silent).
 type SchemaHistoryEntry struct {
@@ -206,13 +206,13 @@ type SchemaHistoryEntry struct {
 	Table          string      `json:"table"`
 	AnchorPosition ir.Position `json:"anchor_position"`
 
-	// TableJSON is the post-DDL ir.Table serialised via [MarshalTable]
+	// TableJSON is the post-DDL ir.Table serialised via [ir.MarshalTable]
 	// — byte-identical to what the engine stores in
 	// sluice_cdc_schema_history.ir_schema_json (locked decision #1).
 	TableJSON []byte `json:"table_json"`
 }
 
-// BackupStore is the storage abstraction for logical backups. Phase 1
+// Store is the storage abstraction for logical backups. Phase 1
 // ships a single implementation ([pipeline.LocalStore]) backed by the
 // local filesystem; Phase 2 will add S3, GCS, and Azure Blob backends
 // behind the same interface so the writer / restore paths don't change.
@@ -227,7 +227,7 @@ type SchemaHistoryEntry struct {
 // `--from-dir` / `s3://bucket/prefix/`). The store is responsible for
 // translating to backend-native conventions (Windows backslashes for
 // LocalStore, object keys for S3, etc.).
-type BackupStore interface {
+type Store interface {
 	// Put writes the contents of r to the named path within the store.
 	// Implementations buffer / stream as appropriate; callers SHOULD
 	// pass a reader that doesn't require seeking. Existing content at
@@ -388,7 +388,7 @@ type Manifest struct {
 	// chain-walk treats them as orphan fulls.
 	EndPosition ir.Position `json:"end_position,omitempty"`
 
-	// SchemaHash is a deterministic fingerprint of [Schema] at the
+	// SchemaHash is a deterministic fingerprint of [ir.Schema] at the
 	// point the manifest was written. Computed via SHA-256 over the
 	// canonical JSON serialisation (encoding/json with the existing
 	// IR marshalling). Used by chain-restore as a sanity check that
@@ -413,7 +413,7 @@ type Manifest struct {
 	SchemaHistory []*SchemaHistoryEntry `json:"schema_history,omitempty"`
 
 	// ChangeChunks lists the chunk files containing serialised
-	// [Change] events for an incremental backup. Empty for full
+	// [ir.Change] events for an incremental backup. Empty for full
 	// manifests; populated for incrementals as the writer rolls
 	// chunks during the window. Path conventions mirror full
 	// backups' table chunks but live under `chunks/_changes/`.
