@@ -297,7 +297,7 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 		// returned error so it isn't silent, but never replaces the
 		// primary cause.
 		dropErr := dropReplicationSlot(ctx, conn, r.slotName)
-		_ = conn.Close(ctx)
+		closeReplConnGraceful(conn)
 		r.replConn = nil
 		if dropErr != nil {
 			fmt.Fprintf(os.Stderr,
@@ -313,7 +313,7 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 	startLSN, err := r.resolveStartPosition(ctx, conn, from, &slotJustCreated)
 	if err != nil {
 		if !slotJustCreated {
-			_ = conn.Close(ctx)
+			closeReplConnGraceful(conn)
 			r.replConn = nil
 		}
 		return nil, err
@@ -325,7 +325,7 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 	}
 	if err := r.startReplicationWithSlotActiveRetry(ctx, conn, startLSN, pluginArgs); err != nil {
 		if !slotJustCreated {
-			_ = conn.Close(ctx)
+			closeReplConnGraceful(conn)
 			r.replConn = nil
 		}
 		return nil, fmt.Errorf("postgres: START_REPLICATION: %w", err)
@@ -630,7 +630,7 @@ func checkSourceIdentity(ctx context.Context, slotName, persistedSysID string, p
 // via the [pipeline.Streamer].
 func (r *CDCReader) pump(ctx context.Context, conn *pgconn.PgConn, startLSN pglogrepl.LSN, out chan<- ir.Change) {
 	defer close(out)
-	defer func() { _ = conn.Close(ctx) }()
+	defer closeReplConnGraceful(conn)
 
 	relations := map[uint32]*relationCacheEntry{}
 	// snapshotSig is the per-relation structural fingerprint of the
@@ -2042,6 +2042,30 @@ func slotInfo(ctx context.Context, db *sql.DB, name string) (*slotState, error) 
 		return nil, fmt.Errorf("postgres: check slot: %w", err)
 	}
 	return &s, nil
+}
+
+// closeReplConnGraceful closes a replication-mode pgconn under a
+// FRESH bounded context — never the stream's own (usually already
+// cancelled) context.
+//
+// Why this matters (the StopRestartNoLoss 55006-past-retry-budget
+// stall, observed twice in CI at an identical ~70.9 s): pgconn.Close
+// with an already-cancelled ctx skips the graceful Terminate ('X')
+// message and hard-closes the socket. The server-side walsender then
+// keeps the slot marked active until it next touches the dead socket
+// or `wal_sender_timeout` (default 60 s) reaps it — LONGER than the
+// v0.99.34 slot-active retry budget (~40 s of backoff), so a
+// stop-then-restart hit "slot is active for PID N" through the entire
+// retry window and failed. With Terminate sent, the walsender exits
+// immediately and the slot releases in milliseconds. The 5 s bound
+// keeps a wedged socket from blocking teardown.
+func closeReplConnGraceful(conn *pgconn.PgConn) {
+	if conn == nil {
+		return
+	}
+	closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = conn.Close(closeCtx)
 }
 
 // dropReplicationSlot drops the named slot via the replication
