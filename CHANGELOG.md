@@ -6,19 +6,7 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Fixed
-- **DDL-free incrementals no longer record phantom `alter_table` schema
-  deltas.** Schema readers drained indexes and foreign keys through Go
-  map iteration (randomized order), so two reads of the *same* schema
-  could be structurally unequal — a recorded parent manifest vs the
-  end-of-window catalog read then diffed as spurious `alter_table`
-  entries (observed: 6 phantom deltas on a DDL-free incremental), and
-  `ComputeSchemaHash` fingerprints diverged for identical schemas. Both
-  engines' readers now drain in sorted (table, name) order; the
-  incremental schema diff compares indexes as a name-keyed set (so
-  chains rooted in pre-fix manifests stop false-alarming too); and the
-  schema hash fingerprints a canonical view (non-semantic collections
-  name-sorted; table and column order stay semantic).
+## [0.99.35] - 2026-06-11
 
 ### Added
 - **`backup full --chain-slot` — one-flag incremental-chain provisioning
@@ -54,6 +42,27 @@ project follows [Semantic Versioning](https://semver.org/).
   at the stream start and release it only to durably committed window ends;
   on `backup stream` this also bounds source WAL retention to ~one rollover
   window.
+- **DDL-free incrementals no longer record phantom `alter_table` schema
+  deltas.** Schema readers drained indexes and foreign keys through Go
+  map iteration (randomized order), so two reads of the *same* schema
+  could be structurally unequal — a recorded parent manifest vs the
+  end-of-window catalog read then diffed as spurious `alter_table`
+  entries (observed: 6 phantom deltas on a DDL-free incremental), and
+  `ComputeSchemaHash` fingerprints diverged for identical schemas. Both
+  engines' readers now drain in sorted (table, name) order; the
+  incremental schema diff compares indexes as a name-keyed set (so
+  chains rooted in pre-fix manifests stop false-alarming too); and the
+  schema hash fingerprints a canonical view (non-semantic collections
+  name-sorted; table and column order stay semantic).
+- **Stop-then-restart no longer stalls on a lingering walsender.** Closing
+  a replication connection with an already-cancelled context skipped the
+  protocol's graceful `Terminate` message, so the server-side walsender
+  kept the slot marked active until `wal_sender_timeout` (60 s default)
+  reaped it — longer than the v0.99.34 slot-active retry budget, producing
+  `slot is active for PID N` refusals on immediate restarts. Every
+  replication-conn close now runs under a fresh bounded context so
+  `Terminate` is always sent and the slot releases in milliseconds; the
+  retry stays as defense in depth.
 
 ### Performance
 - **`backup full` reads tables in parallel on Postgres sources
@@ -68,7 +77,9 @@ project follows [Semantic Versioning](https://semver.org/).
   non-snapshot fallback. Manifest table order and resume semantics are
   unchanged-by-construction: entries are pre-staged in schema order and a
   crashed run leaves at most `--table-parallelism` tables with partial
-  chunk lists, which the existing resume path already handles.
+  chunk lists, which the existing resume path already handles. **Measured
+  on the benchmark corpus: 2367 s → 881 s (2.7×) with defaults**, closing
+  the gap vs `pg_dump -j8` from 10.2× to 3.2× (`docs/comparison-backup.md`).
 - **`restore` bulk-applies tables in parallel on EVERY target
   (`--table-parallelism`, ADR-0084 restore side).** The restore chunk-apply
   phase now fans out across a bounded writer pool (default 4 tables at
@@ -81,6 +92,8 @@ project follows [Semantic Versioning](https://semver.org/).
   verification, and chain restores' ordered incremental replay are
   unchanged; chain restores parallelize each segment full's bulk-apply via
   the same flag. Copy/index overlap on restore is deliberately deferred.
+  **Measured: a projected ~3 h serial restore completes in 2810 s (≥3.8×)
+  with defaults**, closing the gap vs `pg_restore -j8` from ~11.5× to 3.1×.
 
 ## [0.99.34] - 2026-06-10
 
