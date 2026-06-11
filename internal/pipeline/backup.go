@@ -15,9 +15,11 @@ package pipeline
 //   - Errors are wrapped with phase names so a failed run pinpoints
 //     where it failed without parsing strings.
 //
-// The orchestrator is sequential per table (Phase 2 will add
-// parallel reads — same shape as the parallel bulk-copy path —
-// once cloud backends with multipart upload land).
+// The row sweep fans out across tables through a bounded worker pool
+// (ADR-0084, `backup_table_pool.go`) when the source surfaces a
+// SHAREABLE exported snapshot (Postgres); MySQL's per-session snapshot
+// and the v0.17.x non-snapshot fallback stay sequential, each with a
+// loud INFO naming the reason.
 //
 // # Resumable backups (Phase 2)
 //
@@ -40,7 +42,8 @@ package pipeline
 //     the prior bytes as a corrupted partial upload).
 //
 // The manifest is committed to the store after every table completes,
-// so a crashed run leaves at most one table's worth of work to redo.
+// so a crashed run leaves at most tableParallelism tables' worth of
+// in-flight work to redo (one table's, when the sweep runs serial).
 
 import (
 	"bytes"
@@ -212,6 +215,18 @@ type Backup struct {
 	// no-op. The slot is dropped if the backup fails, so retries
 	// start clean. See [ir.BackupSnapshotOptions].
 	ChainSlot bool
+
+	// TableParallelism caps how many tables stream CONCURRENTLY during
+	// the row sweep (ADR-0084, the backup sibling of migrate's
+	// --table-parallelism / ADR-0076). 0 = auto (4, pgcopydb
+	// --table-jobs parity); 1 = serial (the pre-ADR-0084 behaviour).
+	// Only engages when the source surfaces a shareable exported
+	// snapshot AND implements [ir.SnapshotImporterOpener]
+	// ([backupParallelEligible]); otherwise the sweep stays serial with
+	// a loud INFO naming the reason. The resolved value is further
+	// bounded by the SOURCE's measured connection budget, reserving one
+	// slot for the snapshot's slot-creation replication conn.
+	TableParallelism int
 
 	// ForceOverwrite, when true, lets a re-run replace a previously-
 	// completed backup at the same destination. Without it, finding a
@@ -443,54 +458,36 @@ func (b *Backup) Run(ctx context.Context) error {
 		)
 	}
 
-	for _, table := range schema.Tables {
-		key := manifestTableKey(table.Schema, table.Name)
-		var priorTable *ir.TableManifest
-		if existing, ok := priorTables[key]; ok {
-			full, err := tableManifestFullyComplete(ctx, b.Store, existing)
-			if err != nil {
-				return fmt.Errorf("backup: re-validate prior table %q: %w", table.Name, err)
-			}
-			if full {
-				slog.InfoContext(
-					ctx, "skipping table — already complete in partial backup",
-					slog.String("table", table.Name),
-					slog.Int64("rows", existing.RowCount),
-					slog.Int("chunks", len(existing.Chunks)),
-				)
-				manifest.Tables = append(manifest.Tables, existing)
-				continue
-			}
-			// Partial: pass the prior entry through so backupTable can
-			// per-chunk-skip already-uploaded chunks (Bug 34b).
-			priorTable = existing
-			slog.InfoContext(
-				ctx, "resuming table mid-stream — partial chunks present in prior backup",
-				slog.String("table", table.Name),
-				slog.Int("prior_chunks", len(existing.Chunks)),
-				slog.Bool("prior_partial_flag", existing.Partial),
-			)
-		}
-		// backupTable stages its returned entry into manifest.Tables
-		// up-front so per-chunk checkpoints record progress as it
-		// accrues (Bug 34b's per-chunk granularity). The orchestrator
-		// must NOT append again here.
-		if _, err := b.backupTable(ctx, rr, table, chunkRows, priorTable, manifest, chainCEK); err != nil {
-			return wrapWithHint(PhaseBulkCopy, fmt.Errorf("backup: table %q: %w", table.Name, err))
-		}
+	// Pre-stage every table's manifest entry in schema order, then sweep
+	// the non-complete ones through the bounded cross-table pool
+	// (ADR-0084). Pre-staging keeps the manifest's table order
+	// deterministic (== schema order) regardless of worker completion
+	// order; the committer serializes every entry mutation + manifest
+	// Put. Per-chunk + per-table checkpoints live inside backupTable /
+	// the committer now — a crash leaves at most tableParallelism tables
+	// with partial chunk lists to redo.
+	committer := &manifestCommitter{store: b.Store, manifest: manifest}
+	tasks, err := b.stageBackupTables(ctx, committer, schema, priorTables)
+	if err != nil {
+		return err
+	}
 
-		// Per-table checkpoint: commit the manifest with PartialState
-		// = "in_progress" after each table so a crash before the next
-		// table loses at most one table of work. (Per-chunk checkpoints
-		// inside backupTable already capture sub-table progress; this
-		// final per-table commit ensures the manifest is up to date
-		// once the table fully closes — the per-chunk checkpoint after
-		// the last chunk usually has the same effect, but empty-table
-		// runs and tables whose row count is an exact chunk multiple
-		// rely on this final write.)
-		if err := writeManifest(ctx, b.Store, manifest); err != nil {
-			return fmt.Errorf("backup: checkpoint manifest after %q: %w", table.Name, err)
-		}
+	snapshotName := ""
+	if snap != nil {
+		snapshotName = snap.SnapshotName
+	}
+	tableParallelism, err := b.resolveBackupTableParallelism(ctx, snapshotName, len(tasks))
+	if err != nil {
+		return err
+	}
+	factory, factoryCleanup, err := b.openBackupReaderFactory(ctx, snapshotName, tableParallelism)
+	if err != nil {
+		return err
+	}
+	defer factoryCleanup()
+
+	if err := b.runBackupTablePool(ctx, tasks, rr, factory, tableParallelism, chunkRows, committer, chainCEK); err != nil {
+		return err
 	}
 
 	// 4.5. Record EndPosition. Two paths:
@@ -524,9 +521,11 @@ func (b *Backup) Run(ctx context.Context) error {
 	// carries the same id the incremental would compute when chaining.
 	manifest.BackupID = ir.ComputeBackupID(manifest)
 
-	// 5. Final manifest write — flip to complete.
+	// 5. Final manifest write — flip to complete. Routed through the
+	// committer like every other manifest Put this run (the pool has
+	// drained, so this is single-threaded; one code path regardless).
 	manifest.PartialState = ir.BackupStateComplete
-	if err := writeManifest(ctx, b.Store, manifest); err != nil {
+	if err := committer.commit(ctx); err != nil {
 		return fmt.Errorf("backup: write final manifest: %w", err)
 	}
 	// The backup is durable from here — persist run-scoped chain
@@ -781,9 +780,18 @@ func (b *Backup) validate() error {
 	return nil
 }
 
-// backupTable streams every row of table from rr through one or more
-// chunk files in the Store, returning the manifest entry that
-// describes them.
+// backupTable streams every row of task.table from rr through one or
+// more chunk files in the Store, filling in the table's pre-staged
+// manifest entry (task.entry) through the committer.
+//
+// Concurrency (ADR-0084): backupTable runs on a pool worker, possibly
+// alongside peers streaming other tables. Everything it touches is
+// worker-local — rr, the chunk writer, the row cursor — EXCEPT the
+// manifest entry, whose every mutation (and every manifest checkpoint)
+// is routed through the committer's mutex. The per-chunk CEK path
+// ([Backup.resolveChunkCEK]) is safe concurrently: every envelope's
+// WrapCEK is read-only on envelope state and crypto/rand is
+// goroutine-safe.
 //
 // One subtle point worth flagging: the chunk-roll boundary is checked
 // AFTER each row write. A table whose row count is an exact multiple
@@ -791,45 +799,32 @@ func (b *Backup) validate() error {
 // chunk. Empty tables produce zero chunks (the manifest entry has
 // RowCount=0 and Chunks=nil) — keeps the storage layout tidy.
 //
-// Bug 34b: when priorTable is non-nil, its chunk entries are checked
-// before each new chunk gets a writer. If chunk N's prior info exists,
-// the recorded chunk is still on the store, AND its on-store SHA-256
-// matches the manifest's recorded SHA-256, the chunk is skipped — the
-// orchestrator advances the row cursor by chunk N's recorded RowCount
-// (reading-and-discarding) without opening a writer or hitting Put.
-// fullManifest, when non-nil, is the in-flight manifest to checkpoint
-// after each newly-written chunk so a mid-table crash leaves a manifest
-// recording exactly which chunks completed.
+// Bug 34b: when task.priorTable is non-nil, its chunk entries are
+// checked before each new chunk gets a writer. If chunk N's prior info
+// exists, the recorded chunk is still on the store, AND its on-store
+// SHA-256 matches the manifest's recorded SHA-256, the chunk is
+// skipped — the orchestrator advances the row cursor by chunk N's
+// recorded RowCount (reading-and-discarding) without opening a writer
+// or hitting Put. Each newly-written chunk checkpoints the manifest so
+// a mid-table crash leaves a record of exactly which chunks completed.
 func (b *Backup) backupTable(
 	ctx context.Context,
 	rr ir.RowReader,
-	table *ir.Table,
+	task backupTableTask,
 	chunkRows int,
-	priorTable *ir.TableManifest,
-	fullManifest *ir.Manifest,
+	committer *manifestCommitter,
 	chainCEK []byte,
-) (*ir.TableManifest, error) {
+) error {
+	table, entry, priorTable := task.table, task.entry, task.priorTable
 	rows, err := rr.ReadRows(ctx, table)
 	if err != nil {
-		return nil, fmt.Errorf("read rows: %w", err)
+		return fmt.Errorf("read rows: %w", err)
 	}
 
 	cols := nonGeneratedTableColumns(table)
 	colNames := make([]string, len(cols))
 	for i, c := range cols {
 		colNames[i] = c.Name
-	}
-
-	entry := &ir.TableManifest{
-		Schema:  table.Schema,
-		Name:    table.Name,
-		Partial: true, // flips to false on natural EOF; per-chunk checkpoints persist it as true
-	}
-	// Stage the entry into the in-flight manifest now so per-chunk
-	// checkpoints capture progress as it accrues. The same pointer is
-	// returned to the orchestrator at the end.
-	if fullManifest != nil {
-		fullManifest.Tables = append(fullManifest.Tables, entry)
 	}
 
 	var (
@@ -876,20 +871,18 @@ func (b *Backup) backupTable(
 				WrappedCEK: curWrappedCEK, // empty for per-chain mode
 			}
 		}
-		entry.Chunks = append(entry.Chunks, ci)
 		writer = nil
 		buf = nil
 		curWrappedCEK = nil
 		chunkIdx++
-		// Per-chunk checkpoint: commit the manifest now so a mid-table
-		// crash (or kill) before the next table starts leaves an
-		// up-to-date record of exactly which chunks completed. The cost
-		// is one extra Put per chunk; benefit is the per-chunk skip on
-		// resume sees the right state. Bug 34b.
-		if fullManifest != nil {
-			if err := writeManifest(ctx, b.Store, fullManifest); err != nil {
-				return fmt.Errorf("checkpoint manifest after chunk %d: %w", chunkIdx-1, err)
-			}
+		// Record the chunk + per-chunk checkpoint: commit the manifest
+		// now so a mid-table crash (or kill) leaves an up-to-date record
+		// of exactly which chunks completed. The cost is one extra Put
+		// per chunk; benefit is the per-chunk skip on resume sees the
+		// right state. Bug 34b. The committer serializes the entry
+		// mutation + the same-key manifest Put against peer tables.
+		if err := committer.appendChunk(ctx, entry, ci, true); err != nil {
+			return fmt.Errorf("checkpoint manifest after chunk %d: %w", chunkIdx-1, err)
 		}
 		return nil
 	}
@@ -931,8 +924,13 @@ func (b *Backup) backupTable(
 			}
 			return false, nil
 		}
-		// Reuse the prior entry verbatim and advance the cursor.
-		entry.Chunks = append(entry.Chunks, priorChunk)
+		// Reuse the prior entry verbatim and advance the cursor. No
+		// checkpoint — the chunk is already on the store and recorded in
+		// the prior manifest; the next written chunk's checkpoint
+		// captures it (matching the pre-ADR-0084 skip behaviour).
+		if err := committer.appendChunk(ctx, entry, priorChunk, false); err != nil {
+			return false, err
+		}
 		// Discard the rows the skipped chunk covered so the row stream
 		// stays aligned with the chunk index. The chunk-row-range is
 		// deterministic ([N*chunkRows, (N+1)*chunkRows) in PK order),
@@ -978,45 +976,51 @@ func (b *Backup) backupTable(
 	}
 
 	if err := skipUntilWrite(); err != nil {
-		return nil, err
+		return err
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return ctx.Err()
 		case row, ok := <-rows:
 			if !ok {
 				if err := flush(); err != nil {
-					return nil, err
+					return err
 				}
 				// Surface any sticky error captured by the reader's
 				// streaming goroutine (Bug 68 loud-failure gate; now a
 				// first-class [ir.RowReader.Err] surface, no longer an
 				// optional type assertion).
 				if err := readerStreamErr(rr, table); err != nil {
-					return nil, err
+					return err
 				}
-				entry.RowCount = rowsTotal
-				entry.Partial = false // table EOF reached naturally; flip the partial flag off
+				// Per-table checkpoint: flip the entry to its terminal
+				// state (natural EOF) and commit. Empty tables and tables
+				// whose row count is an exact chunk multiple rely on this
+				// commit — their last per-chunk checkpoint (if any)
+				// doesn't carry the Partial=false flip.
+				if err := committer.finishTable(ctx, entry, rowsTotal); err != nil {
+					return fmt.Errorf("checkpoint manifest after table: %w", err)
+				}
 				slog.InfoContext(
 					ctx, "backup: table complete",
 					slog.String("table", table.Name),
 					slog.Int64("rows", rowsTotal),
 					slog.Int("chunks", len(entry.Chunks)),
 				)
-				return entry, nil
+				return nil
 			}
 			if writer == nil {
 				buf = &bytes.Buffer{}
 				cek, wrapped, err := b.resolveChunkCEK(chainCEK)
 				if err != nil {
-					return nil, fmt.Errorf("resolve chunk cek: %w", err)
+					return fmt.Errorf("resolve chunk cek: %w", err)
 				}
 				curWrappedCEK = wrapped
 				w, err := newChunkWriter(buf, colNames, cek, b.Codec)
 				if err != nil {
-					return nil, fmt.Errorf("open chunk: %w", err)
+					return fmt.Errorf("open chunk: %w", err)
 				}
 				writer = w
 			}
@@ -1031,20 +1035,20 @@ func (b *Backup) backupTable(
 			// redacted values. pkColumns from the table descriptor gates
 			// randomize:* on no-PK tables (the strategy refuses cleanly).
 			if err := redactRow(b.Redactor, table.Schema, table.Name, row, cols, tablePKColumns(table), ""); err != nil {
-				return nil, fmt.Errorf("redact row: %w", err)
+				return fmt.Errorf("redact row: %w", err)
 			}
 			if err := writer.WriteRow(row, cols); err != nil {
-				return nil, fmt.Errorf("write row: %w", err)
+				return fmt.Errorf("write row: %w", err)
 			}
 			rowsTotal++
 			if writer.RowCount() >= int64(chunkRows) {
 				if err := flush(); err != nil {
-					return nil, err
+					return err
 				}
 				// After flushing, the next chunk index might also have
 				// been pre-uploaded in a prior run — try to skip again.
 				if err := skipUntilWrite(); err != nil {
-					return nil, err
+					return err
 				}
 			}
 		}

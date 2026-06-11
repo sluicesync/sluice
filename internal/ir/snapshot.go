@@ -122,7 +122,8 @@ func (s *SnapshotStream) ReleaseRows() error {
 //   - Postgres: a separate temporary replication slot creates an
 //     exported snapshot; one or more pinned `*sql.Conn` values
 //     `SET TRANSACTION SNAPSHOT '<name>'` to import the same view.
-//     N-conn parallel reads are possible here in a future revision.
+//     N-conn parallel reads ride [SnapshotImporter] against the
+//     exported SnapshotName (ADR-0084).
 //   - MySQL: a single pinned `*sql.Conn` running
 //     `START TRANSACTION WITH CONSISTENT SNAPSHOT`. All table reads
 //     run on this one connection sequentially — MySQL's snapshot is
@@ -137,6 +138,21 @@ type BackupSnapshot struct {
 	Position Position
 	Rows     RowReader
 	CloseFn  func() error
+
+	// SnapshotName is the engine's SHAREABLE exported-snapshot name —
+	// the handle other connections pass to the engine's
+	// [SnapshotImporter] to observe the EXACT same consistent view as
+	// Rows. Postgres populates it from CREATE_REPLICATION_SLOT …
+	// EXPORT_SNAPSHOT (the `snapshot_name`); MySQL leaves it empty
+	// because its snapshot is per-session and not shareable across
+	// connections.
+	//
+	// It is the capability gate for the parallel per-table backup
+	// reads (ADR-0084, mirroring [SnapshotStream.SnapshotName]'s role
+	// in ADR-0079): an empty value means "not shareable → the backup
+	// row sweep stays serial". Additive, optional — readers that don't
+	// recognise it ignore it.
+	SnapshotName string
 
 	// CommitFn, when non-nil, is called by the orchestrator exactly
 	// once after the backup's final manifest commit succeeds — i.e.

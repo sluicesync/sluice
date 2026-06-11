@@ -266,9 +266,10 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts ir.Back
 	}
 
 	snap := &ir.BackupSnapshot{
-		Position: position,
-		Rows:     rowReader,
-		CloseFn:  closeFn,
+		Position:     position,
+		Rows:         rowReader,
+		CloseFn:      closeFn,
+		SnapshotName: snapshotName,
 	}
 	if opts.PersistChainSlot {
 		snap.CommitFn = func(context.Context) error {

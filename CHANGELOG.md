@@ -41,6 +41,22 @@ project follows [Semantic Versioning](https://semver.org/).
   on `backup stream` this also bounds source WAL retention to ~one rollover
   window.
 
+### Performance
+- **`backup full` reads tables in parallel on Postgres sources
+  (`--table-parallelism`, ADR-0084).** The full-backup row sweep now fans
+  out across a bounded worker pool (default 4 tables at once, pgcopydb
+  `--table-jobs` parity), every reader pinned to the SAME exported snapshot
+  via `SET TRANSACTION SNAPSHOT` — cross-table consistency is identical to
+  the serial sweep. Motivated by the 2026-06-10 benchmark (133 GB /
+  43 tables: 2367 s vs `pg_dump -j8`'s 232 s; ~3.4× of that gap is pure
+  cross-table parallelism). MySQL backups stay serial (per-session
+  snapshot, not shareable — an INFO log names the reason), as does the
+  non-snapshot fallback. Manifest table order and resume semantics are
+  unchanged-by-construction: entries are pre-staged in schema order and a
+  crashed run leaves at most `--table-parallelism` tables with partial
+  chunk lists, which the existing resume path already handles. The restore
+  side lands separately.
+
 ## [0.99.34] - 2026-06-10
 
 ### Fixed

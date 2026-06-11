@@ -392,6 +392,8 @@ type BackupFullCmd struct {
 
 	ChunkSize int `help:"Maximum rows per chunk file. The writer rolls over to a new file whenever the current chunk hits this row count. Smaller chunks restore faster (per-chunk SHA-256 verification can fail-fast on the smallest possible unit) but inflate the manifest. Default 100000." default:"100000" placeholder:"N"`
 
+	TableParallelism int `help:"Number of tables read CONCURRENTLY during the backup row sweep (the read-side analog of pg_dump -j / migrate --table-parallelism). Engages only when the source surfaces a SHAREABLE exported snapshot (Postgres) — every parallel reader is pinned to the ONE snapshot, so cross-table consistency is identical to the serial sweep. MySQL's snapshot is per-session, so MySQL backups stay serial (an INFO log names the reason). The resolved value is bounded by the source's connection budget, reserving one slot for the snapshot's replication conn. 0 (default) = auto: 4. 1 disables cross-table concurrency. See ADR-0084." default:"0" placeholder:"N"`
+
 	Compression string `help:"Per-segment chunk compression codec: none | gzip | zstd. Default zstd (klauspost/compress at SpeedDefault — 55-85% faster restore, the DR-critical axis; ~1-5% larger than gzip on representative data). 'none' leaves chunks as human-readable .jsonl on a local-FS target; 'gzip' is the pre-v0.67.0 codec. Recorded in lineage.json and read back from there on restore (never inferred from bytes)." default:"zstd" enum:"none,gzip,zstd" placeholder:"CODEC"`
 
 	SlotName string `help:"Replication-slot name suffix on engines with a slot concept (Postgres). Used to label the EndPosition recorded on the manifest so a Phase 3 incremental chained off this full opens CDC against a slot of the same name. Default 'sluice_slot'. Engines without slots (MySQL: binlog stream is the slot) ignore this flag." placeholder:"NAME"`
@@ -462,17 +464,18 @@ func (b *BackupFullCmd) Run(g *Globals) error {
 		return err
 	}
 	backup := &pipeline.Backup{
-		Source:         source,
-		SourceDSN:      b.Source,
-		Store:          store,
-		Filter:         filter,
-		ChunkRows:      b.ChunkSize,
-		SluiceVersion:  version,
-		SlotName:       pipeline.ResolveSlotName(b.SlotName),
-		ChainSlot:      b.ChainSlot,
-		ForceOverwrite: b.ForceOverwrite,
-		Encryption:     encConfig,
-		Codec:          codec,
+		Source:           source,
+		SourceDSN:        b.Source,
+		Store:            store,
+		Filter:           filter,
+		ChunkRows:        b.ChunkSize,
+		SluiceVersion:    version,
+		SlotName:         pipeline.ResolveSlotName(b.SlotName),
+		ChainSlot:        b.ChainSlot,
+		TableParallelism: b.TableParallelism,
+		ForceOverwrite:   b.ForceOverwrite,
+		Encryption:       encConfig,
+		Codec:            codec,
 	}
 	keysetSource := b.KeysetSource
 	if keysetSource == "" {
