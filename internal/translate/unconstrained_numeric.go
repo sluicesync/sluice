@@ -99,10 +99,15 @@ func ScanUnconstrainedNumericNotices(schema *ir.Schema, sourceEngine, targetEngi
 // isMySQLTarget reports whether engine is a MySQL-family target name.
 // PlanetScale is MySQL-wire-compatible and shares the same DECIMAL
 // precision ceiling, so it's covered too — mirrors isMySQLSource's
-// intent on the target side.
+// intent on the target side. The self-hosted `vitess` flavor shares
+// PlanetScale's engine code and capabilities verbatim (ADR-0073(a)),
+// so every MySQL-target translation policy applies to it identically;
+// the list mirrors the pipeline package's isMySQLFamilyEngine and the
+// two must stay in lock-step with the engine registrations.
 func isMySQLTarget(engine string) bool {
 	return strings.EqualFold(engine, "mysql") ||
-		strings.EqualFold(engine, "planetscale")
+		strings.EqualFold(engine, "planetscale") ||
+		strings.EqualFold(engine, "vitess")
 }
 
 // UnconstrainedNumericNoticeError renders an advisory (non-fatal) error

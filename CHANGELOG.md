@@ -7,6 +7,33 @@ project follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **Bug 136: PG → MySQL with an index on a `text`/`bytea`/JSON-landing
+  column now refuses EARLY — before any DDL or rows move — instead of
+  dying with MySQL Error 1170 at create-indexes, after the full bulk
+  copy.** MySQL cannot index a TEXT/BLOB column without an explicit key
+  length (and JSON columns cannot be key parts at all); a PG source
+  never carries prefix lengths, so a UNIQUE or secondary index on such
+  a column emitted invalid index DDL that failed at the latest possible
+  moment, and `sluice schema preview` rendered it with no advisory.
+  sluice deliberately does NOT auto-emit a prefix key length — a prefix
+  index (above all a UNIQUE one) silently changes matching/uniqueness
+  semantics. The refusal fires at the shared cross-engine pre-flight
+  (migrate, chain restore, restore, and incremental schema-deltas all
+  go through it), names every offending `table.column` + index, and
+  spells out the `--type-override TABLE.COL=varchar(N)` escape hatch —
+  which keeps working end-to-end (indexes build, UNIQUE semantics
+  preserved on the full value). `schema preview` now renders a
+  dedicated "migrate WILL REFUSE" section (text) and a
+  `text_index_refusals` JSON list. The scan covers the full
+  no-key-length family per the Bug 74 doctrine — every TEXT tier, every
+  BLOB tier, the Bug 72 wide-`varchar(N)` down-map tiers, JSON/arrays/
+  hstore, and DOMAINs over any of those — × {UNIQUE, plain secondary,
+  composite member, PRIMARY KEY}. Same-engine MySQL → MySQL
+  prefix-indexed TEXT sources are unaffected (the prefix length
+  round-trips as before), as is PG → PG. The MySQL-family target gate
+  in the translation-notice scans now also recognizes the self-hosted
+  `vitess` flavor (previously only `mysql`/`planetscale`), so the Bug
+  69/72 advisories and this refusal fire for vitess targets too.
 - **ADR-0054 shard-consolidation leases are now host-TZ-independent on
   Postgres targets (task #44).** `lease_expires_at` is a naive
   `TIMESTAMP` column, and pgx encodes a `time.Time` parameter as its own

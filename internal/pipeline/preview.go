@@ -144,6 +144,15 @@ type PreviewJSON struct {
 	// and when no wide-varchar column is present. Advisory only —
 	// sluice does not refuse.
 	WideVarcharDownmaps []PreviewJSONWideVarchar `json:"wide_varchar_downmaps,omitempty"`
+	// TextIndexRefusals is the Bug 136 list of index key parts on
+	// columns that land on MySQL as TEXT/BLOB/JSON — types MySQL cannot
+	// use as an index key part without a prefix length (Error 1170;
+	// JSON not at all). Omitted for non-PG→MySQL pairs and when no such
+	// key part is present. Unlike the advisory lists above, a non-empty
+	// list means `migrate` WILL REFUSE this schema; preview renders it
+	// so the operator sees the refusal (and the `--type-override`
+	// escape hatch) before running anything.
+	TextIndexRefusals []PreviewJSONTextIndex `json:"text_index_refusals,omitempty"`
 }
 
 // PreviewJSONUnsignedBigint is one MySQL `bigint unsigned` → PG
@@ -167,6 +176,19 @@ type PreviewJSONWideVarchar struct {
 	Table  string `json:"table"`
 	Column string `json:"column"`
 	Length int    `json:"length"`
+}
+
+// PreviewJSONTextIndex is one Bug 136 index key part on a column whose
+// MySQL type has no inline key length. Stable shape for tooling
+// consumers; `migrate` refuses any schema producing a non-empty list.
+type PreviewJSONTextIndex struct {
+	Table      string `json:"table"`
+	Index      string `json:"index"`
+	Column     string `json:"column"`
+	SourceType string `json:"source_type"`
+	TargetType string `json:"target_type"`
+	Unique     bool   `json:"unique"`
+	PrimaryKey bool   `json:"primary_key"`
 }
 
 // PreviewJSONTranslatorGap is one detected MySQL → PG translator
@@ -379,6 +401,20 @@ func (p *Previewer) Run(ctx context.Context) error {
 		tgtSchema, p.Source.Name(), p.Target.Name(),
 	)
 
+	// ---- 3.9. Un-indexable TEXT/BLOB/JSON index key parts (Bug 136) ----
+	// Advisory AT PREVIEW, refusal at `migrate`: an index key part on a
+	// column that lands on MySQL as TEXT/BLOB/JSON has no inline key
+	// length (Error 1170; JSON not at all), and sluice deliberately does
+	// not auto-emit a prefix length (a prefix UNIQUE index silently
+	// changes uniqueness semantics). Preview still renders the DDL —
+	// operators need to see the full shape — but the dedicated section
+	// below says, loudly, that `migrate` will refuse and names the
+	// `--type-override` escape hatch. Scanned on the post-override
+	// schema so an applied override suppresses the entry.
+	textIndexNotices := translate.ScanTextIndexNotices(
+		tgtSchema, p.Source.Name(), p.Target.Name(),
+	)
+
 	// ---- 4. Open the target schema writer; type-assert for preview. ----
 	sw, err := p.Target.OpenSchemaWriter(ctx, p.TargetDSN)
 	if err != nil {
@@ -425,6 +461,7 @@ func (p *Previewer) Run(ctx context.Context) error {
 		unsignedBigintNotices:       unsignedBigintNotices,
 		unconstrainedNumericNotices: unconstrainedNumericNotices,
 		wideVarcharNotices:          wideVarcharNotices,
+		textIndexNotices:            textIndexNotices,
 		redactor:                    p.Redactor,
 	}
 
@@ -477,7 +514,11 @@ type previewBundle struct {
 	// TEXT-tier down-map advisory list (nil for non-PG→MySQL pairs or
 	// when no wide-varchar column is present).
 	wideVarcharNotices []translate.WideVarcharNotice
-	redactor           *redact.Registry // PII Phase 1.5 (v0.55.0) — nil/empty disables annotation
+	// textIndexNotices is the Bug 136 list of index key parts on
+	// columns that land on MySQL as TEXT/BLOB/JSON (no inline key
+	// length). Non-empty means `migrate` will REFUSE this schema.
+	textIndexNotices []translate.TextIndexNotice
+	redactor         *redact.Registry // PII Phase 1.5 (v0.55.0) — nil/empty disables annotation
 }
 
 // enabledExtensionSet converts the operator's `--enable-pg-extension`
@@ -657,6 +698,9 @@ func renderPreviewText(w io.Writer, bundle previewBundle) error {
 	if n := len(bundle.wideVarcharNotices); n > 0 {
 		fmt.Fprintf(&sb, "-- wide-varchar down-maps: %d (see section below)\n", n)
 	}
+	if n := len(bundle.textIndexNotices); n > 0 {
+		fmt.Fprintf(&sb, "-- un-indexable TEXT/BLOB key parts: %d — migrate WILL REFUSE (see section below)\n", n)
+	}
 	sb.WriteByte('\n')
 
 	if len(bundle.translatorGaps) > 0 {
@@ -673,6 +717,10 @@ func renderPreviewText(w io.Writer, bundle previewBundle) error {
 
 	if len(bundle.wideVarcharNotices) > 0 {
 		writeWideVarcharSection(&sb, bundle.wideVarcharNotices)
+	}
+
+	if len(bundle.textIndexNotices) > 0 {
+		writeTextIndexSection(&sb, bundle.textIndexNotices)
 	}
 
 	for _, t := range bundle.tables {
@@ -800,6 +848,51 @@ func writeWideVarcharSection(sb *strings.Builder, notices []translate.WideVarcha
 		fmt.Fprintf(sb, "-- %s.%s: varchar(%d) -> TEXT family\n", n.Table, n.Column, n.Length)
 	}
 	sb.WriteByte('\n')
+}
+
+// writeTextIndexSection appends the Bug 136 un-indexable TEXT/BLOB/JSON
+// index-key-part block to sb. Unlike the advisory sections above this
+// one announces a REFUSAL: `schema preview` still exits 0 and renders
+// the DDL (the operator needs to see the full shape), but `migrate`
+// will refuse the same schema before any data moves. The DDL preview
+// for these indexes is what MySQL rejects with Error 1170 — surfaced
+// here so the operator never discovers it mid-run. Wording mirrors the
+// `migrate` refusal.
+func writeTextIndexSection(sb *strings.Builder, notices []translate.TextIndexNotice) {
+	sb.WriteString("-- ============================================================\n")
+	sb.WriteString("-- Un-indexable TEXT/BLOB index key parts (Postgres -> MySQL)\n")
+	sb.WriteString("-- *** sluice migrate WILL REFUSE this schema ***\n")
+	sb.WriteString("-- ============================================================\n")
+	sb.WriteString("-- The index key parts below cover columns that land on MySQL as\n")
+	sb.WriteString("-- TEXT/BLOB/JSON; MySQL cannot index these without an explicit\n")
+	sb.WriteString("-- key length (Error 1170; JSON columns cannot be key parts at\n")
+	sb.WriteString("-- all). sluice does not auto-emit a prefix key length — a prefix\n")
+	sb.WriteString("-- index (above all a UNIQUE one) silently changes the index's\n")
+	sb.WriteString("-- matching and uniqueness semantics. The DDL below is rendered\n")
+	sb.WriteString("-- for inspection but is NOT valid on the target as-is.\n")
+	sb.WriteString("-- Recovery: bound each column with\n")
+	sb.WriteString("-- `--type-override TABLE.COL=varchar(N)` (choose N >= the\n")
+	sb.WriteString("-- column's longest value), or drop / redefine the index on the\n")
+	sb.WriteString("-- source before migrating.\n")
+	sb.WriteString("--\n")
+	for _, n := range notices {
+		fmt.Fprintf(sb, "-- %s.%s (%s -> %s) — %s\n",
+			n.Table, n.Column, n.SourceType, n.TargetType, describePreviewTextIndex(n))
+	}
+	sb.WriteByte('\n')
+}
+
+// describePreviewTextIndex renders the index half of a Bug 136 notice
+// line. Mirrors the `migrate` refusal's wording.
+func describePreviewTextIndex(n translate.TextIndexNotice) string {
+	switch {
+	case n.PrimaryKey:
+		return "PRIMARY KEY"
+	case n.Unique:
+		return fmt.Sprintf("UNIQUE index %q", n.Index)
+	default:
+		return fmt.Sprintf("index %q", n.Index)
+	}
 }
 
 // writeTableSection appends one table's preview block to sb. The
@@ -1067,6 +1160,17 @@ func renderPreviewJSON(w io.Writer, bundle previewBundle) error {
 			Table:  n.Table,
 			Column: n.Column,
 			Length: n.Length,
+		})
+	}
+	for _, n := range bundle.textIndexNotices {
+		out.TextIndexRefusals = append(out.TextIndexRefusals, PreviewJSONTextIndex{
+			Table:      n.Table,
+			Index:      n.Index,
+			Column:     n.Column,
+			SourceType: n.SourceType,
+			TargetType: n.TargetType,
+			Unique:     n.Unique,
+			PrimaryKey: n.PrimaryKey,
 		})
 	}
 	enc := json.NewEncoder(w)

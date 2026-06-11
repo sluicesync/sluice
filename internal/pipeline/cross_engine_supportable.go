@@ -23,6 +23,7 @@ import (
 	"fmt"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/translate"
 )
 
 // checkCrossEngineSupportable scans the schema for column types that
@@ -123,7 +124,19 @@ func checkCrossEngineSupportable(
 			)
 		}
 	}
-	return nil
+	// Bug 136: an index key part (UNIQUE, secondary, composite member,
+	// or PRIMARY KEY) on a column whose MySQL type is TEXT/BLOB/JSON-
+	// class has no inline key length — MySQL rejects the index DDL with
+	// Error 1170 (3152 for JSON) at the create-indexes step, AFTER all
+	// rows have copied. sluice deliberately does NOT auto-emit a prefix
+	// key length (a prefix UNIQUE index silently changes uniqueness
+	// semantics); the refusal fires here — the same pre-DDL chokepoint
+	// as the refusals above, shared by migrate, chain restore, and
+	// restore — and names every offending key part plus the
+	// `--type-override TABLE.COL=varchar(N)` escape hatch. The check
+	// runs after ApplyMappings on the migrate path, so an applied
+	// override suppresses it naturally.
+	return translate.TextIndexRefusalError(schema, sourceEngine, targetEngine, contextID)
 }
 
 // unsupportablePGIndexToMySQL scans a table's indexes (including
