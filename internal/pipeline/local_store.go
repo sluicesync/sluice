@@ -122,6 +122,46 @@ func (s *LocalStore) Put(ctx context.Context, path string, r io.Reader) error {
 	return nil
 }
 
+// Append implements [irbackup.Appender] — the optional store
+// capability the ADR-0086 progress-sidecar checkpoints ride on. The
+// payload (one whole JSONL line per call, by the Appender contract) is
+// appended via O_APPEND in a single write and fsynced, so each
+// checkpoint is durable and O(1); a crash mid-call tears at most the
+// final line, which [irbackup.ReplayProgress] tolerates by design.
+//
+// Deliberately NOT tmp+rename like Put: append-then-rename would
+// re-copy the whole file per call — the exact O(N²) shape the sidecar
+// exists to remove.
+func (s *LocalStore) Append(ctx context.Context, path string, r io.Reader) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	abs, err := s.absPath(path)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
+		return fmt.Errorf("local store: mkdir for %q: %w", path, err)
+	}
+	// 0600 like Put — see the NewLocalStore doc comment.
+	f, err := os.OpenFile(abs, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	if err != nil {
+		return fmt.Errorf("local store: open for append %q: %w", path, err)
+	}
+	if _, err := io.Copy(f, r); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("local store: append %q: %w", path, err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("local store: sync %q: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("local store: close %q: %w", path, err)
+	}
+	return nil
+}
+
 // Get implements [irbackup.Store.Get].
 func (s *LocalStore) Get(ctx context.Context, path string) (io.ReadCloser, error) {
 	if err := ctx.Err(); err != nil {
@@ -250,5 +290,9 @@ func (s *LocalStore) absPath(path string) (string, error) {
 	return abs, nil
 }
 
-// Compile-time check that LocalStore satisfies irbackup.Store.
-var _ irbackup.Store = (*LocalStore)(nil)
+// Compile-time checks that LocalStore satisfies irbackup.Store and the
+// optional append capability the progress sidecar rides on.
+var (
+	_ irbackup.Store    = (*LocalStore)(nil)
+	_ irbackup.Appender = (*LocalStore)(nil)
+)

@@ -66,7 +66,21 @@ import (
 // or behaviorally-idempotent additions (e.g. annotations, statistics
 // hints) can stay under the field-additions-are-forward-compatible
 // rule.
-const BackupFormatVersion = 2
+//
+// v0.99.39+ introduces FormatVersion=3 for IN-PROGRESS full-backup
+// manifests written in the sidecar-checkpoint layout (ADR-0086, the
+// task-#54 O(N²) manifest-rewrite fix): the base manifest is written
+// once and per-chunk / per-table progress accrues as appended JSONL
+// deltas in [ProgressSidecarRef.File]. The truth about a crashed run
+// is base + sidecar replay; an older binary reading only the base
+// would silently treat completed tables as not-started and — worse —
+// finish a resume while leaving the new layout's sidecar behind. The
+// version bump makes the older binary refuse LOUDLY at the manifest
+// preflight instead (the ADR-0082 one-way-sentinel posture). The bump
+// is proportional, mirroring Bug 116: FINALIZED manifests are
+// re-stamped with [FormatVersionFor] (1 or 2) and carry no sidecar
+// reference, so successful backups remain readable by older binaries.
+const BackupFormatVersion = 3
 
 // FormatVersionLegacy / FormatVersionSecurityMetadata name the
 // historically-recorded values so callers don't sprinkle bare ints
@@ -81,6 +95,16 @@ const (
 	// on manifests whose schema uses security or correctness fields
 	// older binaries would silently drop. Bug 116 closure.
 	FormatVersionSecurityMetadata = 2
+
+	// FormatVersionProgressSidecar is the v0.99.39+ version stamped on
+	// IN-PROGRESS full-backup manifests whose per-chunk / per-table
+	// progress lives in the appended JSONL sidecar
+	// ([Manifest.ProgressSidecar]) rather than in the base manifest
+	// itself (ADR-0086). Older binaries refuse it loudly instead of
+	// mis-resuming off a base that under-reports progress. Never
+	// stamped on finalized manifests — those re-stamp with
+	// [FormatVersionFor] and stay readable by older binaries.
+	FormatVersionProgressSidecar = 3
 )
 
 // chooseFormatVersion returns the smallest manifest format version
@@ -313,6 +337,18 @@ type Manifest struct {
 	//     table; chunks already present on the store with matching
 	//     SHA-256 are skipped, mismatched ones are overwritten.
 	PartialState string `json:"partial_state,omitempty"`
+
+	// ProgressSidecar, when non-nil on an "in_progress" manifest,
+	// declares that this base manifest's per-chunk / per-table progress
+	// lives in the named append-only JSONL sidecar (ADR-0086): the
+	// truth about the crashed run is base + replay of the sidecar's
+	// matching-attempt events ([ReplayProgress]). Readers that skip the
+	// replay under-report progress, which is why manifests carrying
+	// this field are stamped [FormatVersionProgressSidecar] — older
+	// binaries refuse loudly. Always nil on finalized manifests (the
+	// final write folds the progress back into Tables, clears this
+	// field, and deletes the sidecar).
+	ProgressSidecar *ProgressSidecarRef `json:"progress_sidecar,omitempty"`
 
 	// BackupID is a deterministic identifier for this manifest,
 	// derived from CreatedAt + SourceEngine + Kind + (for incrementals)

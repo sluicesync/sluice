@@ -76,15 +76,14 @@ func TestBackup_ResumeSkipsAlreadyCompletedTables(t *testing.T) {
 	}
 	src := newBackupRecorderEngine("postgres", schema, rows)
 
-	// First run: fail on the 5th Put. Order of Puts (v0.16.1+ — Bug 34b
-	// added the per-chunk checkpoint; task #42/ADR-0085 added the
-	// pre-sweep in-progress manifest write) is:
-	//   1: pre-sweep in-progress manifest (anchor-stamped when present)
-	//   2: users chunk 0
-	//   3: per-chunk checkpoint after users chunk 0 (users.Partial=true)
-	//   4: per-table checkpoint after users completes (users.Partial=false)
-	//   5: posts chunk 0  ← fails here
-	failing := newFailOnNthPutStore(inner, 5)
+	// First run: fail on the 3rd Put. Order of Puts (task #42/ADR-0085
+	// added the pre-sweep in-progress manifest write; ADR-0086 turned
+	// the per-chunk / per-table checkpoints into sidecar APPENDS, so
+	// they no longer Put) is:
+	//   1: pre-sweep in-progress base manifest
+	//   2: users chunk 0 (+ appended chunk + table-complete events)
+	//   3: posts chunk 0  ← fails here
+	failing := newFailOnNthPutStore(inner, 3)
 	b1 := &Backup{
 		Source: src, SourceDSN: "src", Store: failing,
 		ChunkRows: 100, // one chunk per table
@@ -151,23 +150,20 @@ func TestBackup_ResumeSkipsAlreadyCompletedTables(t *testing.T) {
 
 	// The resume run should have done EXACTLY the work the second
 	// table required:
-	//   - 1 manifest Put for the pre-sweep in-progress manifest
+	//   - 1 manifest Put for the pre-sweep in-progress base manifest
 	//     (task #42/ADR-0085 — written before the sweep so a crash
 	//     always leaves a resumable, anchor-stamped record)
 	//   - 1 chunk Put for posts chunk 0
-	//   - 1 manifest Put for the per-chunk checkpoint after posts chunk 0
-	//     (Bug 34b: per-chunk granularity, v0.16.1+)
-	//   - 1 manifest Put for the per-table checkpoint after posts
 	//   - 1 manifest Put for the final flip-to-complete
-	//   - 1 chain.json Put on the final manifest write (GitHub #20,
-	//     v0.47.0 — only the final write triggers the catalog because
-	//     per-chunk / per-table checkpoint manifests are written with
-	//     an empty BackupID, which updateChainCatalog skips)
-	// = 6 Puts. The users chunk is not in that count — it was already
-	// on disk from the first run and trySkipChunk short-circuited the
-	// upload (no row read, no Put).
-	if counting.puts != 6 {
-		t.Errorf("resume Put count = %d; want 6 (1 chunk + 4 manifest checkpoints + 1 chain.json)", counting.puts)
+	//   - 1 lineage Put on the final manifest write (GitHub #20 /
+	//     ADR-0046 — only the final write triggers the catalog)
+	// = 4 Puts. The per-chunk / per-table checkpoints are sidecar
+	// APPENDS under ADR-0086 (O(1) — the task-#54 fix), not manifest
+	// Puts; the users chunk is not in the count either — it was already
+	// on disk from the first run and the content-addressed skip
+	// short-circuited the upload.
+	if counting.puts != 4 {
+		t.Errorf("resume Put count = %d; want 4 (1 base manifest + 1 chunk + 1 final manifest + 1 lineage)", counting.puts)
 	}
 
 	// Verify the backup overall.

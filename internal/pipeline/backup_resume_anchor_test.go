@@ -77,17 +77,17 @@ var (
 
 // crashAfterFirstTable runs a backup over schema that fails uploading
 // the SECOND table's first chunk — the first table completes, the rest
-// never start. Put order on the snapshot path (serial sweep):
+// never start. Put order on the snapshot path (serial sweep; the
+// per-chunk / per-table checkpoints are sidecar APPENDS under
+// ADR-0086, not Puts):
 //
-//	1: pre-sweep in-progress manifest (anchor-stamped)
-//	2: first table chunk 0
-//	3: per-chunk checkpoint
-//	4: per-table checkpoint (first table Partial=false)
-//	5: second table chunk 0  ← injected failure
+//	1: pre-sweep in-progress base manifest (anchor-stamped)
+//	2: first table chunk 0 (+ appended chunk + table-complete events)
+//	3: second table chunk 0  ← injected failure
 func crashAfterFirstTable(t *testing.T, store *LocalStore, src *snapshotOpeningEngine, chainSlot bool) {
 	t.Helper()
 	b := &Backup{
-		Source: src, SourceDSN: "src", Store: newFailOnNthPutStore(store, 5),
+		Source: src, SourceDSN: "src", Store: newFailOnNthPutStore(store, 3),
 		ChunkRows: 100, ChainSlot: chainSlot,
 	}
 	if err := b.Run(context.Background()); err == nil {
