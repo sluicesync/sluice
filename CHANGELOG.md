@@ -6,6 +6,8 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.36] - 2026-06-11
+
 ### Fixed
 - **CRITICAL (Bug 135, v0.99.35 regression, caught by the post-release
   battle-test): resuming an interrupted backup no longer silently
