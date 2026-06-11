@@ -59,6 +59,16 @@ type Restore struct {
 	// Zero means "no cap".
 	MaxBufferBytes int64
 
+	// TableParallelism caps how many tables bulk-apply CONCURRENTLY
+	// during the chunk-restore phase (ADR-0084 restore side). 0 = auto
+	// (4, pgcopydb --table-jobs parity); 1 = serial (the pre-ADR-0084
+	// behaviour). Engine-generic: parallel restore needs no shared
+	// snapshot — each concurrent table writes through its own dedicated
+	// row-writer connection, so it engages for EVERY target (PG and
+	// MySQL). The resolved value is bounded by the target's measured
+	// connection budget and clamped to the table count.
+	TableParallelism int
+
 	// SkipChainDispatch, when true, suppresses the chain-detection
 	// branch in [Restore.Run]. Used internally by [ChainRestore] so
 	// that re-entering Restore for the full-application step doesn't
@@ -175,13 +185,14 @@ func (r *Restore) Run(ctx context.Context) error {
 		}
 		if multi {
 			chain := &ChainRestore{
-				Target:         r.Target,
-				TargetDSN:      r.TargetDSN,
-				Store:          r.Store,
-				Filter:         r.Filter,
-				MaxBufferBytes: r.MaxBufferBytes,
-				Envelope:       r.Envelope,
-				TargetSchema:   r.TargetSchema,
+				Target:           r.Target,
+				TargetDSN:        r.TargetDSN,
+				Store:            r.Store,
+				Filter:           r.Filter,
+				MaxBufferBytes:   r.MaxBufferBytes,
+				TableParallelism: r.TableParallelism,
+				Envelope:         r.Envelope,
+				TargetSchema:     r.TargetSchema,
 			}
 			return chain.Run(ctx)
 		}
@@ -284,12 +295,10 @@ func (r *Restore) Run(ctx context.Context) error {
 	applyTargetSchema(sw, r.TargetSchema)
 	defer closeIf(sw)
 
-	rw, err := r.Target.OpenRowWriter(ctx, r.TargetDSN)
+	rw, err := r.openTargetRowWriter(ctx)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("restore: open target row writer: %w", err))
+		return err
 	}
-	applyMaxBufferBytes(rw, r.MaxBufferBytes)
-	applyTargetSchema(rw, r.TargetSchema)
 	defer closeIf(rw)
 
 	// 5. Phase 1: tables. Skipped in DataOnly mode (a later
@@ -303,10 +312,14 @@ func (r *Restore) Run(ctx context.Context) error {
 		slog.InfoContext(ctx, "restore: tables created", slog.Int("count", len(schema.Tables)))
 	}
 
-	// 6. Phase 2: bulk-copy from chunks. DataOnly uses an idempotent
-	//    upsert so re-applying a later segment's snapshot over the
-	//    prior segment's restored state converges (no PK-collision).
+	// 6. Phase 2: bulk-copy from chunks, fanned across a bounded
+	//    cross-table writer pool (ADR-0084; tableParallelism=1 runs the
+	//    same pool serially — the pre-ADR behaviour). DataOnly uses an
+	//    idempotent upsert so re-applying a later segment's snapshot
+	//    over the prior segment's restored state converges (no
+	//    PK-collision); the writer selection is per-worker.
 	tablesByName := indexManifestTables(manifest.Tables)
+	tasks := make([]restoreTableTask, 0, len(schema.Tables))
 	for _, table := range schema.Tables {
 		key := manifestTableKey(table.Schema, table.Name)
 		entry, ok := tablesByName[key]
@@ -315,9 +328,18 @@ func (r *Restore) Run(ctx context.Context) error {
 				slog.String("table", table.Name))
 			continue
 		}
-		if err := r.restoreTable(ctx, rw, table, entry); err != nil {
-			return wrapWithHint(PhaseBulkCopy, fmt.Errorf("restore: table %q: %w", table.Name, err))
-		}
+		tasks = append(tasks, restoreTableTask{table: table, entry: entry})
+	}
+	tableParallelism, err := r.resolveRestoreTableParallelism(ctx, len(tasks))
+	if err != nil {
+		return err
+	}
+	var factory restoreWriterFactory
+	if tableParallelism > 1 {
+		factory = r.openTargetRowWriter
+	}
+	if err := r.runRestoreTablePool(ctx, tasks, rw, factory, tableParallelism); err != nil {
+		return err
 	}
 
 	if r.DataOnly {
@@ -361,6 +383,22 @@ func (r *Restore) validate() error {
 		return errors.New("restore: Store is nil")
 	}
 	return nil
+}
+
+// openTargetRowWriter opens one fully-configured row writer against
+// the target: OpenRowWriter + the buffer cap + the target-schema
+// routing. The SINGLE construction point for restore row writers —
+// Run's primary writer and the pool's dedicated per-table writers
+// (ADR-0084) both come through here, so the two setups can never
+// drift.
+func (r *Restore) openTargetRowWriter(ctx context.Context) (ir.RowWriter, error) {
+	rw, err := r.Target.OpenRowWriter(ctx, r.TargetDSN)
+	if err != nil {
+		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("restore: open target row writer: %w", err))
+	}
+	applyMaxBufferBytes(rw, r.MaxBufferBytes)
+	applyTargetSchema(rw, r.TargetSchema)
+	return rw, nil
 }
 
 // restoreTable bulk-copies every chunk's rows into the target via the
