@@ -75,7 +75,8 @@ sluice/
 │   │   ├── types.go            # core IR types (universal)
 │   │   ├── extension_types.go  # extension IR types (per-engine optional)
 │   │   ├── capabilities.go     # engine capability declarations
-│   │   └── change.go
+│   │   ├── change.go
+│   │   └── diff/               # pure-function schema diff + per-table drift reports
 │   ├── translate/              # IR ↔ IR transformations and policies
 │   │   ├── policy.go
 │   │   └── translate.go
@@ -93,7 +94,7 @@ sluice/
     └── sqllogic/               # Curated semantic-equivalence corpus
 ```
 
-The `internal/ir` package has no dependencies on any other package in the project. The `translate` package depends only on `ir`. Each engine package under `internal/engines/<name>/` depends on `ir` plus its database driver — never on another engine package, never on `pipeline` or `apply`. This dependency direction is enforced; anything else is a code smell and a review-flag.
+The `internal/ir` package has no dependencies on any other package in the project. Pure-function helpers over the IR split into sub-packages under `internal/ir` (today `ir/diff` — the schema diff behind `sluice schema diff` and the per-table drift report behind CDC refuse-loudly messages); sub-packages depend only on core `ir`, never the reverse. The `translate` package depends only on `ir`. Each engine package under `internal/engines/<name>/` depends on `ir` plus its database driver — never on another engine package, never on `pipeline` or `apply`. This dependency direction is enforced; anything else is a code smell and a review-flag.
 
 Each engine package bundles everything that knows about a specific database: schema reader, schema writer, row reader, row writer, CDC reader (if applicable), change applier (if applicable), and a `Capabilities` declaration. Co-locating these means the knowledge of "what MySQL is and how to talk to it" lives in exactly one place.
 
