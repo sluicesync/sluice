@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -26,21 +27,69 @@ import (
 // nil schemas hash to a stable sentinel ("schema:nil") rather than an
 // empty string so a nil-vs-empty-Schema distinction stays visible in
 // the manifest. The marshaller is the standard encoding/json (with
-// the IR's MarshalJSON hooks for sealed interfaces), so the same
-// schema always produces the same bytes — operators inspecting two
-// chain manifests with matching SchemaHash can rely on the schemas
-// being byte-equal under the IR's wire shape.
+// the IR's MarshalJSON hooks for sealed interfaces) over a CANONICAL
+// view of the schema: per-table collections whose order is not
+// semantic (indexes, foreign keys, check/exclude constraints,
+// policies) are sorted by name first, so two semantically-identical
+// schemas hash identically even when their collections were gathered
+// in different orders (task #41 — catalog reads historically drained
+// these through randomized map iteration). Table order and column
+// order ARE semantic (DDL position) and hash as-is.
 func ComputeSchemaHash(s *Schema) (string, error) {
 	if s == nil {
 		h := sha256.Sum256([]byte("schema:nil"))
 		return hex.EncodeToString(h[:]), nil
 	}
-	b, err := json.Marshal(s)
+	b, err := json.Marshal(canonicalSchemaForHash(s))
 	if err != nil {
 		return "", fmt.Errorf("ir: compute schema hash: marshal: %w", err)
 	}
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:]), nil
+}
+
+// canonicalSchemaForHash returns a shallow copy of s whose per-table
+// non-semantic collections are name-sorted copies. The input is never
+// mutated — manifests must record schemas exactly as the reader
+// produced them; only the FINGERPRINT is order-insensitive.
+func canonicalSchemaForHash(s *Schema) *Schema {
+	out := *s
+	out.Tables = make([]*Table, len(s.Tables))
+	for i, t := range s.Tables {
+		if t == nil {
+			continue
+		}
+		ct := *t
+		ct.Indexes = sortedByName(t.Indexes, func(x *Index) string { return x.Name })
+		ct.ForeignKeys = sortedByName(t.ForeignKeys, func(x *ForeignKey) string { return x.Name })
+		ct.CheckConstraints = sortedByName(t.CheckConstraints, func(x *CheckConstraint) string { return x.Name })
+		ct.ExcludeConstraints = sortedByName(t.ExcludeConstraints, func(x *ExcludeConstraint) string { return x.Name })
+		ct.Policies = sortedByName(t.Policies, func(x *Policy) string { return x.Name })
+		out.Tables[i] = &ct
+	}
+	return &out
+}
+
+// sortedByName returns a name-sorted copy of in (nil stays nil; the
+// input slice is not mutated). Nil elements sort first, keeping the
+// function total over whatever shape a decoded manifest carries.
+func sortedByName[T any](in []*T, name func(*T) string) []*T {
+	if len(in) == 0 {
+		return in
+	}
+	out := make([]*T, len(in))
+	copy(out, in)
+	sort.SliceStable(out, func(i, j int) bool {
+		switch {
+		case out[i] == nil:
+			return out[j] != nil
+		case out[j] == nil:
+			return false
+		default:
+			return name(out[i]) < name(out[j])
+		}
+	})
+	return out
 }
 
 // ComputeBackupID derives a deterministic identifier for a manifest

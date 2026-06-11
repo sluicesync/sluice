@@ -356,8 +356,7 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 	defer rows.Close()
 
 	// Group rows by (table, index_name).
-	type key struct{ table, name string }
-	collected := map[key]*ir.Index{}
+	collected := map[tableObjectKey]*ir.Index{}
 
 	for rows.Next() {
 		var (
@@ -381,7 +380,7 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			continue
 		}
 
-		k := key{table: tableName, name: indexName}
+		k := tableObjectKey{table: tableName, name: indexName}
 		idx, ok := collected[k]
 		if !ok {
 			idx = &ir.Index{
@@ -418,7 +417,10 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 	}
 
 	// Attach indexes to their tables; PRIMARY becomes Table.PrimaryKey.
-	for k, idx := range collected {
+	// Sorted drain, not map order — see [sortedTableObjectKeys]
+	// (task #41 determinism requirement).
+	for _, k := range sortedTableObjectKeys(collected) {
+		idx := collected[k]
 		t := tables[k.table]
 		if k.name == "PRIMARY" {
 			t.PrimaryKey = idx
@@ -456,8 +458,7 @@ func (r *SchemaReader) populateForeignKeys(ctx context.Context, tables map[strin
 	}
 	defer rows.Close()
 
-	type key struct{ table, name string }
-	collected := map[key]*ir.ForeignKey{}
+	collected := map[tableObjectKey]*ir.ForeignKey{}
 
 	for rows.Next() {
 		var (
@@ -476,7 +477,7 @@ func (r *SchemaReader) populateForeignKeys(ctx context.Context, tables map[strin
 		if _, ok := tables[tableName]; !ok {
 			continue
 		}
-		k := key{table: tableName, name: name}
+		k := tableObjectKey{table: tableName, name: name}
 		fk, ok := collected[k]
 		if !ok {
 			// Flat-scope carve-out (ADR-0074). MySQL has a flat scope:
@@ -536,9 +537,11 @@ func (r *SchemaReader) populateForeignKeys(ctx context.Context, tables map[strin
 		return err
 	}
 
-	for k, fk := range collected {
+	// Sorted drain, not map order — see [sortedTableObjectKeys]
+	// (task #41 determinism requirement).
+	for _, k := range sortedTableObjectKeys(collected) {
 		t := tables[k.table]
-		t.ForeignKeys = append(t.ForeignKeys, fk)
+		t.ForeignKeys = append(t.ForeignKeys, collected[k])
 	}
 	return nil
 }
