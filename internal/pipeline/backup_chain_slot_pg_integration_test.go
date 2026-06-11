@@ -26,7 +26,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
-	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -271,11 +271,11 @@ func TestBackup_ChainSlot_UncommittedCloseDropsSlot(t *testing.T) {
 	applyDDL(t, sourceDSN, chainSeedDDL)
 
 	pgEng, _ := engines.Get("postgres")
-	opener, ok := pgEng.(ir.BackupSnapshotOpener)
+	opener, ok := pgEng.(irbackup.BackupSnapshotOpener)
 	if !ok {
 		t.Fatal("postgres engine does not implement BackupSnapshotOpener")
 	}
-	opts := ir.BackupSnapshotOptions{PersistChainSlot: true}
+	opts := irbackup.BackupSnapshotOptions{PersistChainSlot: true}
 
 	// Failure shape: open → Close (no Commit) → slot gone.
 	snap, err := opener.OpenBackupSnapshot(context.Background(), sourceDSN, opts)

@@ -109,7 +109,7 @@ type chunkWriter struct {
 }
 
 // newChunkWriter wraps out (the destination — typically a pipe to
-// [ir.BackupStore.Put]) with gzip + JSON-Lines machinery and writes
+// [irbackup.BackupStore.Put]) with gzip + JSON-Lines machinery and writes
 // the format header. Caller must call Close to flush.
 //
 // When cek is non-nil, encryption is applied at Close time (see

@@ -1,12 +1,14 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package ir
+package backup
 
 import (
 	"encoding/json"
 	"testing"
 	"time"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestComputeSchemaHash_DeterministicAndDistinguishing pins the
@@ -14,19 +16,19 @@ import (
 // two schemas with the same shape produce the same hash, two
 // distinct schemas produce different hashes.
 func TestComputeSchemaHash_DeterministicAndDistinguishing(t *testing.T) {
-	a := &Schema{Tables: []*Table{{
+	a := &ir.Schema{Tables: []*ir.Table{{
 		Name:    "users",
-		Columns: []*Column{{Name: "id", Type: Integer{Width: 64}}},
+		Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
 	}}}
-	b := &Schema{Tables: []*Table{{
+	b := &ir.Schema{Tables: []*ir.Table{{
 		Name:    "users",
-		Columns: []*Column{{Name: "id", Type: Integer{Width: 64}}},
+		Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
 	}}}
-	c := &Schema{Tables: []*Table{{
+	c := &ir.Schema{Tables: []*ir.Table{{
 		Name: "users",
-		Columns: []*Column{
-			{Name: "id", Type: Integer{Width: 64}},
-			{Name: "email", Type: Varchar{Length: 255}},
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "email", Type: ir.Varchar{Length: 255}},
 		},
 	}}}
 
@@ -65,7 +67,7 @@ func TestComputeSchemaHash_NilStable(t *testing.T) {
 		t.Errorf("nil hash unstable: %s vs %s", h1, h2)
 	}
 	// nil hash should not collide with any real schema's hash.
-	hReal, _ := ComputeSchemaHash(&Schema{})
+	hReal, _ := ComputeSchemaHash(&ir.Schema{})
 	if h1 == hReal {
 		t.Errorf("nil schema hash collides with empty-schema hash: %s", h1)
 	}
@@ -82,13 +84,13 @@ func TestComputeBackupID_DeterministicAndDistinguishing(t *testing.T) {
 		CreatedAt:    t1,
 		SourceEngine: "postgres",
 		Kind:         BackupKindIncremental,
-		EndPosition:  Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/16B7350"}`},
+		EndPosition:  ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/16B7350"}`},
 	}
 	m2 := &Manifest{
 		CreatedAt:    t1,
 		SourceEngine: "postgres",
 		Kind:         BackupKindIncremental,
-		EndPosition:  Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/16B7350"}`},
+		EndPosition:  ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/16B7350"}`},
 	}
 	// Same content → same ID.
 	if id1, id2 := ComputeBackupID(m1), ComputeBackupID(m2); id1 != id2 {
@@ -102,7 +104,7 @@ func TestComputeBackupID_DeterministicAndDistinguishing(t *testing.T) {
 	}
 	// Different end position → different ID.
 	m4 := *m1
-	m4.EndPosition = Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/16B7400"}`}
+	m4.EndPosition = ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/16B7400"}`}
 	if id1, id4 := ComputeBackupID(m1), ComputeBackupID(&m4); id1 == id4 {
 		t.Errorf("distinct end-positions produced same ID: %s", id1)
 	}
@@ -128,30 +130,30 @@ func TestManifestRoundTrip_Phase3Fields(t *testing.T) {
 		SluiceVersion: "v0.17.0-test",
 		CreatedAt:     time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC),
 		SourceEngine:  "postgres",
-		Schema: &Schema{Tables: []*Table{{
+		Schema: &ir.Schema{Tables: []*ir.Table{{
 			Name:    "users",
-			Columns: []*Column{{Name: "id", Type: Integer{Width: 64}}},
+			Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
 		}}},
 		PartialState:   BackupStateComplete,
 		BackupID:       "abc123def4567890",
 		Kind:           BackupKindIncremental,
 		ParentBackupID: "0011223344556677",
-		StartPosition:  Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/16B7000"}`},
-		EndPosition:    Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/16B7800"}`},
+		StartPosition:  ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/16B7000"}`},
+		EndPosition:    ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/16B7800"}`},
 		SchemaHash:     "deadbeef",
 		SchemaDelta: []*SchemaDeltaEntry{
 			{
 				Kind:  SchemaDeltaAlterTable,
 				Table: "users",
-				Before: &Table{
+				Before: &ir.Table{
 					Name:    "users",
-					Columns: []*Column{{Name: "id", Type: Integer{Width: 64}}},
+					Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
 				},
-				After: &Table{
+				After: &ir.Table{
 					Name: "users",
-					Columns: []*Column{
-						{Name: "id", Type: Integer{Width: 64}},
-						{Name: "email", Type: Varchar{Length: 255}},
+					Columns: []*ir.Column{
+						{Name: "id", Type: ir.Integer{Width: 64}},
+						{Name: "email", Type: ir.Varchar{Length: 255}},
 					},
 				},
 			},

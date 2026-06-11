@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // failOnNthPutStore wraps a [LocalStore] and returns ErrInjected on the
@@ -98,8 +99,8 @@ func TestBackup_ResumeSkipsAlreadyCompletedTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readManifest after partial: %v", err)
 	}
-	if m1.PartialState != ir.BackupStateInProgress {
-		t.Errorf("PartialState = %q; want %q", m1.PartialState, ir.BackupStateInProgress)
+	if m1.PartialState != irbackup.BackupStateInProgress {
+		t.Errorf("PartialState = %q; want %q", m1.PartialState, irbackup.BackupStateInProgress)
 	}
 	// ADR-0084 pre-staging: every table's entry is staged into the
 	// manifest in schema order BEFORE the sweep starts, so the crashed
@@ -135,8 +136,8 @@ func TestBackup_ResumeSkipsAlreadyCompletedTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readManifest after resume: %v", err)
 	}
-	if m2.PartialState != ir.BackupStateComplete {
-		t.Errorf("final PartialState = %q; want %q", m2.PartialState, ir.BackupStateComplete)
+	if m2.PartialState != irbackup.BackupStateComplete {
+		t.Errorf("final PartialState = %q; want %q", m2.PartialState, irbackup.BackupStateComplete)
 	}
 	if len(m2.Tables) != 2 {
 		t.Fatalf("final tables = %d; want 2", len(m2.Tables))
@@ -350,17 +351,17 @@ func TestBackup_ResumeRestreamsPartialTableWithContentAddressedUploadSkip(t *tes
 	// match the prior; the loop continues to chunk 2). Partial=true
 	// signals to the orchestrator that this is a mid-stream entry, not
 	// a fully-completed table.
-	partial := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	partial := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		SourceEngine:  "postgres",
 		Schema:        schema,
-		PartialState:  ir.BackupStateInProgress,
-		Tables: []*ir.TableManifest{
+		PartialState:  irbackup.BackupStateInProgress,
+		Tables: []*irbackup.TableManifest{
 			{
 				Name:     "events",
 				RowCount: 4, // chunks 0+1 hold 4 of the 5 rows
 				Partial:  true,
-				Chunks: []*ir.ChunkInfo{
+				Chunks: []*irbackup.ChunkInfo{
 					full.Tables[0].Chunks[0],
 					full.Tables[0].Chunks[1],
 				},
@@ -393,7 +394,7 @@ func TestBackup_ResumeRestreamsPartialTableWithContentAddressedUploadSkip(t *tes
 	if err != nil {
 		t.Fatalf("readManifest final: %v", err)
 	}
-	if final.PartialState != ir.BackupStateComplete {
+	if final.PartialState != irbackup.BackupStateComplete {
 		t.Errorf("PartialState = %q; want complete", final.PartialState)
 	}
 	if len(final.Tables) != 1 || len(final.Tables[0].Chunks) != 3 {
@@ -467,16 +468,16 @@ func TestBackup_ResumeWithMissingPriorChunksReruns(t *testing.T) {
 	// Stage 1: write a manifest with "in_progress" + one table entry,
 	// but don't actually create the chunk file. (Simulates a partial
 	// run whose chunk got deleted out from under us.)
-	priorManifest := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	priorManifest := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		SourceEngine:  "postgres",
 		Schema:        schema,
-		PartialState:  ir.BackupStateInProgress,
-		Tables: []*ir.TableManifest{
+		PartialState:  irbackup.BackupStateInProgress,
+		Tables: []*irbackup.TableManifest{
 			{
 				Name:     "t",
 				RowCount: 1,
-				Chunks: []*ir.ChunkInfo{
+				Chunks: []*irbackup.ChunkInfo{
 					{File: "chunks/t/t-0.jsonl.gz", RowCount: 1, SHA256: "abc"},
 				},
 			},
@@ -494,7 +495,7 @@ func TestBackup_ResumeWithMissingPriorChunksReruns(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	final, _ := readManifest(context.Background(), store)
-	if final.PartialState != ir.BackupStateComplete {
+	if final.PartialState != irbackup.BackupStateComplete {
 		t.Errorf("PartialState = %q; want complete", final.PartialState)
 	}
 	if len(final.Tables) != 1 {

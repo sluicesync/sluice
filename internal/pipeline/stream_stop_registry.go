@@ -20,7 +20,7 @@ package pipeline
 // registry is opportunistic; the file remains the rendezvous of
 // record.
 //
-// Registry shape: a map of [ir.BackupStore] → chan struct{}, keyed
+// Registry shape: a map of [irbackup.BackupStore] → chan struct{}, keyed
 // by store identity. `LocalStore` and `BlobStore` are pointer types,
 // so distinct store instances pointing at the same destination get
 // distinct keys — that's intentional: the channel signals a SPECIFIC
@@ -30,11 +30,11 @@ package pipeline
 import (
 	"sync"
 
-	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // streamStopRegistry tracks running [BackupStream] instances by their
-// [ir.BackupStore]. Each entry's channel is closed exactly once when
+// [irbackup.BackupStore]. Each entry's channel is closed exactly once when
 // either the operator's RequestStreamStop fires or the stream's Run
 // returns and unregisters itself. Closing-instead-of-sending lets
 // multiple captureWindow iterations safely consume the signal via the
@@ -47,8 +47,8 @@ var streamStopRegistry = struct {
 	// natural identity. Map keys are interface-typed; equality
 	// works because both sides of the comparison have pointer
 	// dynamic types.
-	chans map[ir.BackupStore]chan struct{}
-}{chans: map[ir.BackupStore]chan struct{}{}}
+	chans map[irbackup.BackupStore]chan struct{}
+}{chans: map[irbackup.BackupStore]chan struct{}{}}
 
 // registerStreamStopChan creates and registers an in-process stop
 // channel for store. Returns the channel + a deregister closure the
@@ -59,7 +59,7 @@ var streamStopRegistry = struct {
 //
 // The returned deregister closure is the only safe way to remove the
 // entry; calling it more than once is a no-op (sync.Once-guarded).
-func registerStreamStopChan(store ir.BackupStore) (stopCh chan struct{}, deregister func()) {
+func registerStreamStopChan(store irbackup.BackupStore) (stopCh chan struct{}, deregister func()) {
 	ch := make(chan struct{})
 	streamStopRegistry.mu.Lock()
 	streamStopRegistry.chans[store] = ch
@@ -99,7 +99,7 @@ func registerStreamStopChan(store ir.BackupStore) (stopCh chan struct{}, deregis
 // Safe to call when no stream is registered (cross-process case): the
 // function is a no-op and the file write remains the cross-machine
 // rendezvous.
-func notifyStreamStop(store ir.BackupStore) bool {
+func notifyStreamStop(store irbackup.BackupStore) bool {
 	streamStopRegistry.mu.Lock()
 	ch, ok := streamStopRegistry.chans[store]
 	streamStopRegistry.mu.Unlock()

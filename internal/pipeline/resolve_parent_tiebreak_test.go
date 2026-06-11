@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // TestResolveParent_CreatedAtTieDoesNotBranchChain pins the ADR-0046
@@ -42,49 +43,49 @@ func TestResolveParent_CreatedAtTieDoesNotBranchChain(t *testing.T) {
 
 	tie := time.Date(2026, 5, 16, 12, 0, 0, 0, time.UTC)
 
-	full := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	full := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		CreatedAt:     tie.Add(-2 * time.Second),
 		SourceEngine:  "postgres",
 		Schema:        schema,
-		Kind:          ir.BackupKindFull,
+		Kind:          irbackup.BackupKindFull,
 		EndPosition:   ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"0/100"}`},
-		PartialState:  ir.BackupStateComplete,
+		PartialState:  irbackup.BackupStateComplete,
 	}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
 		t.Fatalf("write full: %v", err)
 	}
 
 	// incr1 chains off the full.
-	incr1 := &ir.Manifest{
-		FormatVersion:  ir.BackupFormatVersion,
+	incr1 := &irbackup.Manifest{
+		FormatVersion:  irbackup.BackupFormatVersion,
 		CreatedAt:      tie, // SAME instant as incr2 — the timing tie.
 		SourceEngine:   "postgres",
 		Schema:         schema,
-		Kind:           ir.BackupKindIncremental,
+		Kind:           irbackup.BackupKindIncremental,
 		ParentBackupID: full.BackupID,
 		StartPosition:  full.EndPosition,
 		EndPosition:    ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"0/200"}`},
-		PartialState:   ir.BackupStateComplete,
+		PartialState:   irbackup.BackupStateComplete,
 	}
-	incr1.BackupID = ir.ComputeBackupID(incr1)
+	incr1.BackupID = irbackup.ComputeBackupID(incr1)
 	// incr2 chains off incr1 — it is the chain TAIL a restart must
 	// continue from. Lower lexical path than incr1 so the buggy
 	// strict-`.After()` max-scan (which keeps the FIRST element on a
 	// tie) would wrongly return incr1.
-	incr2 := &ir.Manifest{
-		FormatVersion:  ir.BackupFormatVersion,
+	incr2 := &irbackup.Manifest{
+		FormatVersion:  irbackup.BackupFormatVersion,
 		CreatedAt:      tie, // tie with incr1.
 		SourceEngine:   "postgres",
 		Schema:         schema,
-		Kind:           ir.BackupKindIncremental,
+		Kind:           irbackup.BackupKindIncremental,
 		ParentBackupID: incr1.BackupID,
 		StartPosition:  incr1.EndPosition,
 		EndPosition:    ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"0/300"}`},
-		PartialState:   ir.BackupStateComplete,
+		PartialState:   irbackup.BackupStateComplete,
 	}
-	incr2.BackupID = ir.ComputeBackupID(incr2)
+	incr2.BackupID = irbackup.ComputeBackupID(incr2)
 
 	// Write in chain order; the manifest path encodes a strictly
 	// increasing unix-millis so List() returns them chain-ordered

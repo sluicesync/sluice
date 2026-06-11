@@ -14,7 +14,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/crypto"
-	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline"
 	"sluicesync.dev/sluice/internal/redact"
 )
@@ -238,8 +238,8 @@ func azureKMSOpts(wrapAlgorithm string) []crypto.AzureKMSOption {
 // Mirrors the read-side pattern in [EncryptionFlags.buildReadEnvelope]:
 // load the recorded params from the chain root, hand the operator's
 // passphrase + those params to [crypto.NewPassphraseEnvelope].
-func passphraseRebuildForChain(passphrase string) func(*ir.Argon2idParams) (crypto.EnvelopeEncryption, error) {
-	return func(p *ir.Argon2idParams) (crypto.EnvelopeEncryption, error) {
+func passphraseRebuildForChain(passphrase string) func(*irbackup.Argon2idParams) (crypto.EnvelopeEncryption, error) {
+	return func(p *irbackup.Argon2idParams) (crypto.EnvelopeEncryption, error) {
 		if p == nil {
 			return nil, errors.New("rebuild envelope: chain has no recorded Argon2id params")
 		}
@@ -270,7 +270,7 @@ func passphraseRebuildForChain(passphrase string) func(*ir.Argon2idParams) (cryp
 // from the manifest).
 //
 // Returns nil when --encrypt is false (plaintext chain expected).
-func (e *EncryptionFlags) buildReadEnvelope(rootManifest *ir.Manifest) (crypto.EnvelopeEncryption, error) {
+func (e *EncryptionFlags) buildReadEnvelope(rootManifest *irbackup.Manifest) (crypto.EnvelopeEncryption, error) {
 	if !e.Encrypt {
 		// Sanity: chain is encrypted but operator didn't pass
 		// --encrypt? The pipeline's preflight returns a clearer error
@@ -503,7 +503,7 @@ func (b *BackupFullCmd) Run(g *Globals) error {
 	return backup.Run(ctx)
 }
 
-// openBackupStore opens the right [ir.BackupStore] for the operator's
+// openBackupStore opens the right [irbackup.BackupStore] for the operator's
 // flag combination. Returns the store, a human-readable destination
 // description (for log lines), and an optional closer for backends
 // that need cleanup. The S3-only options are validated against the
@@ -512,7 +512,7 @@ func openBackupStore(
 	ctx context.Context,
 	outputDir, target string,
 	opts pipeline.BlobStoreOptions,
-) (store ir.BackupStore, description string, closer func() error, err error) {
+) (store irbackup.BackupStore, description string, closer func() error, err error) {
 	switch {
 	case outputDir != "":
 		s, err := pipeline.NewLocalStore(outputDir)

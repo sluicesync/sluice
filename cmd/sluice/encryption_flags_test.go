@@ -11,7 +11,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/crypto"
-	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 func TestEncryptionFlags_ResolvePassphrase_Direct(t *testing.T) {
@@ -217,7 +217,7 @@ func TestEncryptionFlags_BuildBackupEncryption_RebuildForChain(t *testing.T) {
 
 	// Step 4: invoke RebuildForChain with the chain's recorded
 	// params; the returned envelope must unwrap cleanly.
-	recordedParams := &ir.Argon2idParams{
+	recordedParams := &irbackup.Argon2idParams{
 		Salt:        chainParams.Salt,
 		Memory:      chainParams.Memory,
 		Iterations:  chainParams.Iterations,

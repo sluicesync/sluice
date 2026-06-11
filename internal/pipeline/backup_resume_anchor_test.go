@@ -33,6 +33,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // keyedTable builds a one-PK-column table descriptor; anchored resumes
@@ -113,7 +114,7 @@ func TestBackup_InProgressManifestCarriesAnchor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readManifest: %v", err)
 	}
-	if m.PartialState != ir.BackupStateInProgress {
+	if m.PartialState != irbackup.BackupStateInProgress {
 		t.Fatalf("PartialState = %q; want in_progress", m.PartialState)
 	}
 	if m.EndPosition != anchorPosA1 {
@@ -162,7 +163,7 @@ func TestBackup_ResumeAdoptsPriorAnchor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readManifest final: %v", err)
 	}
-	if final.PartialState != ir.BackupStateComplete {
+	if final.PartialState != irbackup.BackupStateComplete {
 		t.Errorf("PartialState = %q; want complete", final.PartialState)
 	}
 	if final.EndPosition != anchorPosA1 {
@@ -402,7 +403,7 @@ func TestBackup_ForceOverwriteDiscardsInProgressPrior(t *testing.T) {
 	}
 }
 
-// chainResumeBackupEngine adds [ir.ChainResumePreflighter] on top of
+// chainResumeBackupEngine adds [irbackup.ChainResumePreflighter] on top of
 // the snapshot-opening stub so the --chain-slot resume-adoption
 // dispatch is observable.
 type chainResumeBackupEngine struct {

@@ -36,7 +36,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
-	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -249,13 +249,13 @@ func TestBackup_OpenBackupSnapshot_PostgresPositionShape(t *testing.T) {
 	`)
 
 	pgEng, _ := engines.Get("postgres")
-	opener, ok := pgEng.(ir.BackupSnapshotOpener)
+	opener, ok := pgEng.(irbackup.BackupSnapshotOpener)
 	if !ok {
 		t.Fatal("postgres engine does not implement BackupSnapshotOpener")
 	}
 
 	const chainSlot = "sluice_chain_test_slot"
-	snap, err := opener.OpenBackupSnapshot(context.Background(), sourceDSN, ir.BackupSnapshotOptions{SlotName: chainSlot})
+	snap, err := opener.OpenBackupSnapshot(context.Background(), sourceDSN, irbackup.BackupSnapshotOptions{SlotName: chainSlot})
 	if err != nil {
 		t.Fatalf("OpenBackupSnapshot: %v", err)
 	}

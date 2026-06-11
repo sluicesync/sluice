@@ -10,14 +10,15 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // Compile-time assertion: the PlanetScale flavor satisfies the optional
-// [ir.TableScopedBackupSnapshotOpener] surface, so the backup orchestrator
+// [irbackup.TableScopedBackupSnapshotOpener] surface, so the backup orchestrator
 // can scope a PlanetScale backup's VStream COPY to --include-table (the
 // backup-path counterpart to ir.TableScopedSnapshotOpener on the cold-
 // start path). Engine implements it value-receiver, so a value satisfies it.
-var _ ir.TableScopedBackupSnapshotOpener = Engine{Flavor: FlavorPlanetScale}
+var _ irbackup.TableScopedBackupSnapshotOpener = Engine{Flavor: FlavorPlanetScale}
 
 // Compile-time assertion: the engine satisfies the optional
 // [ir.ServerCDCReaderOpener] surface (ADR-0074 Phase 1b.3). The
@@ -111,7 +112,7 @@ func TestEngine_OpenBackupSnapshot_FlavorBranchRoutes(t *testing.T) {
 			cancel() // pre-cancel so dial fails fast
 			eng := Engine{Flavor: c.flavor}
 			// Use a DSN that parses but can't reach a real endpoint.
-			_, err := eng.OpenBackupSnapshot(ctx, "user:pw@tcp(127.0.0.1:1)/db", ir.BackupSnapshotOptions{})
+			_, err := eng.OpenBackupSnapshot(ctx, "user:pw@tcp(127.0.0.1:1)/db", irbackup.BackupSnapshotOptions{})
 			if err == nil {
 				t.Fatalf("expected error from unreachable DSN; got nil")
 			}
@@ -131,7 +132,7 @@ func TestEngine_OpenBackupSnapshot_VanillaDoesNotUseVStream(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	eng := Engine{Flavor: FlavorVanilla}
-	_, err := eng.OpenBackupSnapshot(ctx, "user:pw@tcp(127.0.0.1:1)/db", ir.BackupSnapshotOptions{})
+	_, err := eng.OpenBackupSnapshot(ctx, "user:pw@tcp(127.0.0.1:1)/db", irbackup.BackupSnapshotOptions{})
 	if err == nil {
 		t.Fatalf("expected error from unreachable DSN; got nil")
 	}
@@ -150,7 +151,7 @@ func TestEngine_OpenBackupSnapshotForTables_VanillaDoesNotUseVStream(t *testing.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	eng := Engine{Flavor: FlavorVanilla}
-	_, err := eng.OpenBackupSnapshotForTables(ctx, "user:pw@tcp(127.0.0.1:1)/db", ir.BackupSnapshotOptions{}, []string{"small_t", "other"})
+	_, err := eng.OpenBackupSnapshotForTables(ctx, "user:pw@tcp(127.0.0.1:1)/db", irbackup.BackupSnapshotOptions{}, []string{"small_t", "other"})
 	if err == nil {
 		t.Fatalf("expected error from unreachable DSN; got nil")
 	}
@@ -166,7 +167,7 @@ func TestEngine_OpenBackupSnapshotForTables_PlanetScaleRoutesToVStream(t *testin
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	eng := Engine{Flavor: FlavorPlanetScale}
-	_, err := eng.OpenBackupSnapshotForTables(ctx, "user:pw@tcp(127.0.0.1:1)/db", ir.BackupSnapshotOptions{}, []string{"small_t"})
+	_, err := eng.OpenBackupSnapshotForTables(ctx, "user:pw@tcp(127.0.0.1:1)/db", irbackup.BackupSnapshotOptions{}, []string{"small_t"})
 	if err == nil {
 		t.Fatalf("expected error from unreachable DSN; got nil")
 	}

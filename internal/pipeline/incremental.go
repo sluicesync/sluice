@@ -19,7 +19,7 @@ package pipeline
 // Schema deltas: rather than parsing DDL events out of the CDC stream
 // (engine-specific, fiddly), v1 captures the schema at the start and
 // end of the window and diffs them. The diff produces
-// [ir.SchemaDeltaEntry] entries that record AddTable / DropTable /
+// [irbackup.SchemaDeltaEntry] entries that record AddTable / DropTable /
 // AlterTable shapes with full before/after table values. Restore-side
 // applies these via existing schema-writer surfaces. This is a
 // deliberate v1 simplification — DDL emitted mid-window without
@@ -47,6 +47,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // DefaultIncrementalWindow is the default value of
@@ -121,9 +122,9 @@ type IncrementalBackup struct {
 	// Required.
 	SourceDSN string
 
-	// Store is the [ir.BackupStore] the parent manifest lives in and
+	// Store is the [irbackup.BackupStore] the parent manifest lives in and
 	// the new incremental manifest + chunks are written to. Required.
-	Store ir.BackupStore
+	Store irbackup.BackupStore
 
 	// ParentRef identifies the parent backup the incremental chains
 	// off. Either a [BackupID] (e.g. "abc123def4567890") or the empty
@@ -181,10 +182,10 @@ type IncrementalBackup struct {
 	// the open segment's Dir; a no-op wrap for the common one-segment
 	// shape). Manifest + chunk writes go here; the lineage update goes
 	// to the root b.Store. Set by Run.
-	segStore ir.BackupStore
+	segStore irbackup.BackupStore
 
 	// Now, when set, overrides the wall-clock-time source for
-	// [ir.Manifest.CreatedAt]. Used by tests to pin timestamps; in
+	// [irbackup.Manifest.CreatedAt]. Used by tests to pin timestamps; in
 	// production callers leave it nil and the default uses time.Now.
 	Now func() time.Time
 
@@ -258,7 +259,7 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	//    before this read), making the diff useless. SchemaHash is
 	//    computed from the same baseline.
 	beforeSchema := parent.Schema
-	beforeHash, err := ir.ComputeSchemaHash(beforeSchema)
+	beforeHash, err := irbackup.ComputeSchemaHash(beforeSchema)
 	if err != nil {
 		return fmt.Errorf("incremental: hash source schema (start): %w", err)
 	}
@@ -346,17 +347,17 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 		chunkSize = DefaultIncrementalChunkChanges
 	}
 
-	manifest := &ir.Manifest{
+	manifest := &irbackup.Manifest{
 		// Bug 116 closure: stamp the smallest format version safe for
 		// this incremental's schema. Same proportional rule as fulls.
-		FormatVersion:  ir.FormatVersionFor(beforeSchema),
+		FormatVersion:  irbackup.FormatVersionFor(beforeSchema),
 		SluiceVersion:  b.SluiceVersion,
 		CreatedAt:      now().UTC(),
 		SourceEngine:   b.Source.Name(),
 		Schema:         beforeSchema,
 		Tables:         nil, // incrementals don't carry table-level row chunks
-		PartialState:   ir.BackupStateInProgress,
-		Kind:           ir.BackupKindIncremental,
+		PartialState:   irbackup.BackupStateInProgress,
+		Kind:           irbackup.BackupKindIncremental,
 		ParentBackupID: parent.BackupID,
 		StartPosition:  startPos,
 		SchemaHash:     beforeHash,
@@ -368,11 +369,11 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	// (e.g. with the v0.17.0 backup-full path) doesn't break the
 	// chain.
 	if manifest.ParentBackupID == "" {
-		manifest.ParentBackupID = ir.ComputeBackupID(parent)
+		manifest.ParentBackupID = irbackup.ComputeBackupID(parent)
 	}
 
 	// Phase 6.1: align this incremental's encryption with the chain
-	// root. The parent full's [ir.ChainEncryption] dictates the chain's
+	// root. The parent full's [irbackup.ChainEncryption] dictates the chain's
 	// shape; mismatched runs (encrypt mid-chain or vice versa) are
 	// refused at chain-restore time anyway, so reject early here.
 	chainCEK, err := b.alignEncryption(ctx, parent)
@@ -401,7 +402,7 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 		// targeting than the start-state. Swap it in so the manifest's
 		// recorded Schema reflects the post-window source shape.
 		manifest.Schema = afterSchema
-		afterHash, err := ir.ComputeSchemaHash(afterSchema)
+		afterHash, err := irbackup.ComputeSchemaHash(afterSchema)
 		if err != nil {
 			return fmt.Errorf("incremental: hash source schema (end): %w", err)
 		}
@@ -413,8 +414,8 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	}
 
 	// 6. Compute BackupID and finalise.
-	manifest.BackupID = ir.ComputeBackupID(manifest)
-	manifest.PartialState = ir.BackupStateComplete
+	manifest.BackupID = irbackup.ComputeBackupID(manifest)
+	manifest.PartialState = irbackup.BackupStateComplete
 
 	manifestPath := buildIncrementalManifestPath(manifest)
 	if err := writeManifestAt(ctx, b.segStore, manifestPath, manifest); err != nil {
@@ -471,7 +472,7 @@ func (b *IncrementalBackup) validate() error {
 //
 // Returns the parent manifest, the relative path it was loaded from,
 // and an error.
-func (b *IncrementalBackup) resolveParent(ctx context.Context) (*ir.Manifest, string, error) {
+func (b *IncrementalBackup) resolveParent(ctx context.Context) (*irbackup.Manifest, string, error) {
 	// An incremental chains off a manifest in the OPEN segment. Walk
 	// the open segment's manifests (b.segStore is already narrowed to
 	// its Dir).
@@ -486,7 +487,7 @@ func (b *IncrementalBackup) resolveParent(ctx context.Context) (*ir.Manifest, st
 		for _, m := range manifests {
 			id := m.manifest.BackupID
 			if id == "" {
-				id = ir.ComputeBackupID(m.manifest)
+				id = irbackup.ComputeBackupID(m.manifest)
 			}
 			if id == b.ParentRef {
 				if err := refuseInProgressParent(m.manifest, m.path); err != nil {
@@ -516,8 +517,8 @@ func (b *IncrementalBackup) resolveParent(ctx context.Context) (*ir.Manifest, st
 // tables while exiting 0. (Incremental/stream manifests are only ever
 // persisted in their complete state, so in practice this fires only on
 // a crashed full at the chain root.)
-func refuseInProgressParent(m *ir.Manifest, path string) error {
-	if m == nil || m.PartialState != ir.BackupStateInProgress {
+func refuseInProgressParent(m *irbackup.Manifest, path string) error {
+	if m == nil || m.PartialState != irbackup.BackupStateInProgress {
 		return nil
 	}
 	return fmt.Errorf(
@@ -543,7 +544,7 @@ func refuseInProgressParent(m *ir.Manifest, path string) error {
 // the full if the segment has none).
 //
 // This replaced a max(CreatedAt) selection that branched the lineage
-// on a CreatedAt tie: ir.Manifest.CreatedAt is wall-clock with
+// on a CreatedAt tie: irbackup.Manifest.CreatedAt is wall-clock with
 // platform-dependent resolution, not unique nor strictly monotonic
 // with chain order, so two back-to-back rollovers landing in the
 // same millisecond made a post-restart resolveParent resume off the
@@ -560,7 +561,7 @@ func refuseInProgressParent(m *ir.Manifest, path string) error {
 // a segment sub-dir); recs and the segment Incrementals paths are
 // both relative to the open segment's Dir, so they match by path.
 // recs must be non-empty (callers check len == 0 first).
-func chainTailManifest(ctx context.Context, rootStore ir.BackupStore, recs []manifestRecord) manifestRecord {
+func chainTailManifest(ctx context.Context, rootStore irbackup.BackupStore, recs []manifestRecord) manifestRecord {
 	cat, ok, err := loadLineageCatalog(ctx, rootStore)
 	if err == nil && ok && len(cat.Segments) > 0 {
 		seg := &cat.Segments[len(cat.Segments)-1] // open segment
@@ -650,7 +651,7 @@ func (b *IncrementalBackup) captureWindow(
 	ctx context.Context,
 	cdc ir.CDCReader,
 	changesCh <-chan ir.Change,
-	manifest *ir.Manifest,
+	manifest *irbackup.Manifest,
 	chunkSize int,
 	deadline time.Time,
 	maxChanges int,
@@ -714,7 +715,7 @@ func (b *IncrementalBackup) captureWindow(
 				return fmt.Errorf("marshal schema-history table %s.%s: %w",
 					s.Schema, s.Table, err)
 			}
-			manifest.SchemaHistory = append(manifest.SchemaHistory, &ir.SchemaHistoryEntry{
+			manifest.SchemaHistory = append(manifest.SchemaHistory, &irbackup.SchemaHistoryEntry{
 				// StreamID stays empty at backup time; restore-side
 				// substitutes ChainRestoreStreamID. See drainSnapshots
 				// doc above.
@@ -746,13 +747,13 @@ func (b *IncrementalBackup) captureWindow(
 		if err := b.segStore.Put(ctx, path, buf); err != nil {
 			return fmt.Errorf("store put %q: %w", path, err)
 		}
-		ci := &ir.ChunkInfo{
+		ci := &irbackup.ChunkInfo{
 			File:     path,
 			RowCount: writer.ChangeCount(),
 			SHA256:   hash,
 		}
 		if b.Encryption != nil {
-			ci.Encryption = &ir.ChunkEncryption{
+			ci.Encryption = &irbackup.ChunkEncryption{
 				Algorithm:  crypto.AlgorithmAESGCM,
 				NonceLen:   crypto.NonceLen,
 				AuthTagLen: crypto.AuthTagLen,
@@ -898,7 +899,7 @@ func changeChunkPath(runNamespace string, idx int) string {
 // Two Run() invocations colliding on UnixMilli is implausible: a Run
 // constructs a manifest, then opens a CDC stream, then writes chunks —
 // not two such pipelines fit in one millisecond on real hardware.
-func changeChunkRunNamespace(m *ir.Manifest) string {
+func changeChunkRunNamespace(m *irbackup.Manifest) string {
 	return fmt.Sprintf("%013d", m.CreatedAt.UTC().UnixMilli())
 }
 
@@ -908,7 +909,7 @@ func changeChunkRunNamespace(m *ir.Manifest) string {
 // short BackupID for disambiguation when two incrementals are taken
 // in the same millisecond on the same source (rare but possible
 // under load).
-func buildIncrementalManifestPath(m *ir.Manifest) string {
+func buildIncrementalManifestPath(m *irbackup.Manifest) string {
 	short := m.BackupID
 	if len(short) > 8 {
 		short = short[:8]
@@ -924,7 +925,7 @@ func buildIncrementalManifestPath(m *ir.Manifest) string {
 // writeManifestAt is [writeManifest] generalised to a caller-supplied
 // path. The full-backup writer's [writeManifest] hard-codes
 // [ManifestFileName]; the incremental writer needs an arbitrary path.
-func writeManifestAt(ctx context.Context, store ir.BackupStore, path string, manifest *ir.Manifest) error {
+func writeManifestAt(ctx context.Context, store irbackup.BackupStore, path string, manifest *irbackup.Manifest) error {
 	b, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal manifest: %w", err)
@@ -935,8 +936,8 @@ func writeManifestAt(ctx context.Context, store ir.BackupStore, path string, man
 // unmarshalManifest decodes a manifest body. Pulled out so the
 // chain-walk path and the legacy single-manifest path share one
 // implementation.
-func unmarshalManifest(body []byte) (*ir.Manifest, error) {
-	var m ir.Manifest
+func unmarshalManifest(body []byte) (*irbackup.Manifest, error) {
+	var m irbackup.Manifest
 	if err := json.Unmarshal(body, &m); err != nil {
 		return nil, fmt.Errorf("decode manifest: %w", err)
 	}
@@ -947,7 +948,7 @@ func unmarshalManifest(body []byte) (*ir.Manifest, error) {
 // from. Used by chain-walk and parent-resolve logic.
 type manifestRecord struct {
 	path     string
-	manifest *ir.Manifest
+	manifest *irbackup.Manifest
 }
 
 // listAllManifestsViaWalk is the [store.List] + per-manifest
@@ -958,7 +959,7 @@ type manifestRecord struct {
 // (the open-segment parent resolve in incremental/stream, and the
 // one-segment legacy / rebuild paths). It does NOT cross segment
 // sub-dirs by design.
-func listAllManifestsViaWalk(ctx context.Context, store ir.BackupStore) ([]manifestRecord, error) {
+func listAllManifestsViaWalk(ctx context.Context, store irbackup.BackupStore) ([]manifestRecord, error) {
 	var out []manifestRecord
 
 	// Full's manifest at the legacy path.
@@ -996,7 +997,7 @@ func listAllManifestsViaWalk(ctx context.Context, store ir.BackupStore) ([]manif
 
 // readManifestAt is [readManifest] generalised to a caller-supplied
 // path. Same format-version gating as the legacy helper.
-func readManifestAt(ctx context.Context, store ir.BackupStore, path string) (*ir.Manifest, error) {
+func readManifestAt(ctx context.Context, store irbackup.BackupStore, path string) (*irbackup.Manifest, error) {
 	rc, err := store.Get(ctx, path)
 	if err != nil {
 		return nil, fmt.Errorf("get %q: %w", path, err)
@@ -1010,9 +1011,9 @@ func readManifestAt(ctx context.Context, store ir.BackupStore, path string) (*ir
 	if err != nil {
 		return nil, err
 	}
-	if m.FormatVersion > ir.BackupFormatVersion {
+	if m.FormatVersion > irbackup.BackupFormatVersion {
 		return nil, fmt.Errorf("manifest %q format version %d is newer than this build supports (%d); upgrade sluice",
-			path, m.FormatVersion, ir.BackupFormatVersion)
+			path, m.FormatVersion, irbackup.BackupFormatVersion)
 	}
 	return m, nil
 }
@@ -1024,7 +1025,7 @@ func manifestSummary(records []manifestRecord) string {
 	for _, r := range records {
 		id := r.manifest.BackupID
 		if id == "" {
-			id = ir.ComputeBackupID(r.manifest) + " (computed)"
+			id = irbackup.ComputeBackupID(r.manifest) + " (computed)"
 		}
 		parts = append(parts, fmt.Sprintf("%s (%s, %s)", id, r.manifest.Kind, r.path))
 	}
@@ -1057,7 +1058,7 @@ func joinComma(parts []string) string {
 //   - Parent's chain is encrypted but b.Encryption is nil → refuse.
 //   - Parent's chain is plaintext but b.Encryption is non-nil →
 //     refuse (would create a mixed-mode chain).
-//   - Parent's chain root carries [ir.ChainEncryption] but the
+//   - Parent's chain root carries [irbackup.ChainEncryption] but the
 //     supplied envelope's Mode() doesn't match → refuse.
 //
 // Bug 43 (v0.22.1): when the parent's chain encryption records
@@ -1068,7 +1069,7 @@ func joinComma(parts []string) string {
 // unwrap fails with `aes-gcm open: cipher: message authentication
 // failed`. Tests that pre-build envelopes with the chain's known salt
 // don't supply RebuildForChain and pass through the cold-start path.
-func (b *IncrementalBackup) alignEncryption(ctx context.Context, parent *ir.Manifest) ([]byte, error) {
+func (b *IncrementalBackup) alignEncryption(ctx context.Context, parent *irbackup.Manifest) ([]byte, error) {
 	parentEnc := chainRootEncryption(ctx, b.segStore, parent)
 	switch {
 	case parentEnc == nil && b.Encryption == nil:
@@ -1131,7 +1132,7 @@ func (b *IncrementalBackup) alignEncryption(ctx context.Context, parent *ir.Mani
 // shape, where the chain root holds bulk-copy chunks) then ChangeChunks
 // (the incremental-manifest shape). Returns nil when the parent carries
 // no probe-able chunks; the caller then falls through without probing.
-func firstPerChunkProbe(m *ir.Manifest) *ir.ChunkInfo {
+func firstPerChunkProbe(m *irbackup.Manifest) *irbackup.ChunkInfo {
 	if m == nil {
 		return nil
 	}

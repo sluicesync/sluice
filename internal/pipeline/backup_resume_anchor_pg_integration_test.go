@@ -37,7 +37,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
-	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -203,7 +203,7 @@ func runAnchoredResumeChainGapFlow(t *testing.T, chainSlot bool) {
 	if err != nil {
 		t.Fatalf("readManifest (in-progress): %v", err)
 	}
-	if inProgress.PartialState != ir.BackupStateInProgress {
+	if inProgress.PartialState != irbackup.BackupStateInProgress {
 		t.Fatalf("PartialState = %q; want in_progress", inProgress.PartialState)
 	}
 	anchorA1 := inProgress.EndPosition
@@ -233,7 +233,7 @@ func runAnchoredResumeChainGapFlow(t *testing.T, chainSlot bool) {
 	if err != nil {
 		t.Fatalf("readManifest (final): %v", err)
 	}
-	if final.PartialState != ir.BackupStateComplete {
+	if final.PartialState != irbackup.BackupStateComplete {
 		t.Fatalf("PartialState = %q; want complete", final.PartialState)
 	}
 	if final.EndPosition != anchorA1 {

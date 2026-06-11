@@ -16,7 +16,7 @@ type tableObjectKey struct{ table, name string }
 // randomized, and an unordered Indexes/ForeignKeys slice makes two
 // reads of the SAME schema structurally unequal — recorded manifests
 // then diff against fresh reads as phantom alter_table deltas, and
-// [ir.ComputeSchemaHash] fingerprints diverge for identical schemas
+// [backup.ComputeSchemaHash] fingerprints diverge for identical schemas
 // (task #41; observed live as schema_deltas=6 on a DDL-free
 // incremental in the 2026-06-10 backup benchmark).
 func sortedTableObjectKeys[V any](m map[tableObjectKey]V) []tableObjectKey {

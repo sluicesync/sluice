@@ -29,7 +29,7 @@ import (
 	kmstypes "github.com/aws/aws-sdk-go-v2/service/kms/types"
 
 	"sluicesync.dev/sluice/internal/crypto"
-	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // stubKMS is a deterministic in-process [crypto.KMSAPI] implementation
@@ -82,7 +82,7 @@ func TestBackup_SetupChainEncryption_KMS(t *testing.T) {
 	const arn = "arn:aws:kms:us-east-1:111111111111:key/setup-test"
 	env, stub := newStubKMSEnvelope(t, arn)
 
-	manifest := &ir.Manifest{}
+	manifest := &irbackup.Manifest{}
 	b := &Backup{
 		Encryption: &BackupEncryption{
 			Envelope: env,
@@ -138,8 +138,8 @@ func TestRestore_PreflightEncryption_KMS_PerChainCaching(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WrapCEK: %v", err)
 	}
-	manifest := &ir.Manifest{
-		ChainEncryption: &ir.ChainEncryption{
+	manifest := &irbackup.Manifest{
+		ChainEncryption: &irbackup.ChainEncryption{
 			Algorithm:  crypto.AlgorithmAESGCM,
 			Mode:       crypto.EncryptModePerChain,
 			KEKMode:    crypto.KEKModeAWSKMS,
@@ -159,8 +159,8 @@ func TestRestore_PreflightEncryption_KMS_PerChainCaching(t *testing.T) {
 	}
 	// Simulate 100 chunk reads. preflight has cached r.chainCEK; each
 	// chunkCEK call returns the cached value with zero KMS roundtrips.
-	chunkInfo := &ir.ChunkInfo{
-		Encryption: &ir.ChunkEncryption{
+	chunkInfo := &irbackup.ChunkInfo{
+		Encryption: &irbackup.ChunkEncryption{
 			Algorithm:  crypto.AlgorithmAESGCM,
 			NonceLen:   crypto.NonceLen,
 			AuthTagLen: crypto.AuthTagLen,
@@ -190,8 +190,8 @@ func TestRestore_PreflightEncryption_KMS_WrongKey(t *testing.T) {
 	writeEnv, _ := newStubKMSEnvelope(t, arnA)
 	cek, _ := crypto.GenerateCEK()
 	wrapped, _ := writeEnv.WrapCEK(cek)
-	manifest := &ir.Manifest{
-		ChainEncryption: &ir.ChainEncryption{
+	manifest := &irbackup.Manifest{
+		ChainEncryption: &irbackup.ChainEncryption{
 			Algorithm:  crypto.AlgorithmAESGCM,
 			Mode:       crypto.EncryptModePerChain,
 			KEKMode:    crypto.KEKModeAWSKMS,
@@ -211,8 +211,8 @@ func TestRestore_PreflightEncryption_KMS_WrongKey(t *testing.T) {
 // envelope refuses with operator-actionable error citing the chain's
 // KEKMode + KEKRef so the operator knows what to supply.
 func TestRestore_PreflightEncryption_KMS_MissingEnvelope(t *testing.T) {
-	manifest := &ir.Manifest{
-		ChainEncryption: &ir.ChainEncryption{
+	manifest := &irbackup.Manifest{
+		ChainEncryption: &irbackup.ChainEncryption{
 			Algorithm: crypto.AlgorithmAESGCM,
 			Mode:      crypto.EncryptModePerChain,
 			KEKMode:   crypto.KEKModeAWSKMS,
@@ -238,8 +238,8 @@ func TestRestore_PreflightEncryption_KMS_MissingEnvelope(t *testing.T) {
 // mode but restored with a passphrase envelope fails with a clear
 // operator-facing message rather than a cryptic auth-tag mismatch.
 func TestRestore_PreflightEncryption_KMS_ModeMismatch(t *testing.T) {
-	manifest := &ir.Manifest{
-		ChainEncryption: &ir.ChainEncryption{
+	manifest := &irbackup.Manifest{
+		ChainEncryption: &irbackup.ChainEncryption{
 			Algorithm: crypto.AlgorithmAESGCM,
 			Mode:      crypto.EncryptModePerChain,
 			KEKMode:   crypto.KEKModeAWSKMS,

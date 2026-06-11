@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // TestCompactChain_TwoSegmentGroup_Merges: a 2-segment in-window group
@@ -169,8 +170,8 @@ func TestCompactChain_KeysetBoundary_RefusesLoudly(t *testing.T) {
 	now := time.Date(2026, 5, 16, 0, 0, 0, 0, time.UTC)
 	seedTwoSegmentLineageWithEncryption(
 		t, store, now,
-		&ir.ChainEncryption{Algorithm: "AES-256-GCM", Mode: "per-chain", KEKMode: "passphrase-argon2id", KEKRef: "", Argon2id: &ir.Argon2idParams{Salt: []byte("salt-A")}},
-		&ir.ChainEncryption{Algorithm: "AES-256-GCM", Mode: "per-chain", KEKMode: "passphrase-argon2id", KEKRef: "", Argon2id: &ir.Argon2idParams{Salt: []byte("salt-B")}},
+		&irbackup.ChainEncryption{Algorithm: "AES-256-GCM", Mode: "per-chain", KEKMode: "passphrase-argon2id", KEKRef: "", Argon2id: &irbackup.Argon2idParams{Salt: []byte("salt-A")}},
+		&irbackup.ChainEncryption{Algorithm: "AES-256-GCM", Mode: "per-chain", KEKMode: "passphrase-argon2id", KEKRef: "", Argon2id: &irbackup.Argon2idParams{Salt: []byte("salt-B")}},
 	)
 
 	_, err := CompactChain(context.Background(), store, CompactOpts{
@@ -396,12 +397,12 @@ func TestCompactChain_StaleStagingCleanup(t *testing.T) {
 
 // --- seed helpers ---
 
-func seedTwoSegmentLineage(t *testing.T, store ir.BackupStore, now time.Time, gap time.Duration) {
+func seedTwoSegmentLineage(t *testing.T, store irbackup.BackupStore, now time.Time, gap time.Duration) {
 	t.Helper()
 	seedSegmentsWithGaps(t, store, now, []time.Duration{gap})
 }
 
-func seedNSegmentLineage(t *testing.T, store ir.BackupStore, now time.Time, gap time.Duration, n int) {
+func seedNSegmentLineage(t *testing.T, store irbackup.BackupStore, now time.Time, gap time.Duration, n int) {
 	t.Helper()
 	if n < 1 {
 		t.Fatalf("n must be >= 1; got %d", n)
@@ -421,7 +422,7 @@ func seedNSegmentLineage(t *testing.T, store ir.BackupStore, now time.Time, gap 
 //   - No ChainEncryption on the full manifests (plaintext keyset).
 //
 // Returns nothing; the caller asserts on the on-disk state.
-func seedSegmentsWithGaps(t *testing.T, store ir.BackupStore, base time.Time, gaps []time.Duration) {
+func seedSegmentsWithGaps(t *testing.T, store irbackup.BackupStore, base time.Time, gaps []time.Duration) {
 	t.Helper()
 	seedSegmentsWithGapsOpts(t, store, base, gaps, segmentSeedOpts{})
 }
@@ -431,7 +432,7 @@ type segmentSeedOpts struct {
 	codecsPerSegment []Codec
 	// encPerSegment, when len > 0, attaches ChainEncryption to each
 	// segment's full.
-	encPerSegment []*ir.ChainEncryption
+	encPerSegment []*irbackup.ChainEncryption
 	// gapBetweenBoundaries, when true, deliberately advances each
 	// segment's StartPosition past the prior's EndPosition (creating
 	// the contiguity-violation shape).
@@ -446,7 +447,7 @@ type segmentSeedOpts struct {
 	rotatedOverlap bool
 }
 
-func seedSegmentsWithGapsOpts(t *testing.T, store ir.BackupStore, base time.Time, gaps []time.Duration, opts segmentSeedOpts) {
+func seedSegmentsWithGapsOpts(t *testing.T, store irbackup.BackupStore, base time.Time, gaps []time.Duration, opts segmentSeedOpts) {
 	t.Helper()
 	n := len(gaps) + 1
 	cumulative := time.Duration(0)
@@ -472,7 +473,7 @@ func seedSegmentsWithGapsOpts(t *testing.T, store ir.BackupStore, base time.Time
 		if i < len(opts.codecsPerSegment) {
 			codec = opts.codecsPerSegment[i]
 		}
-		var chainEnc *ir.ChainEncryption
+		var chainEnc *irbackup.ChainEncryption
 		if i < len(opts.encPerSegment) {
 			chainEnc = opts.encPerSegment[i]
 		}
@@ -513,7 +514,7 @@ func seedSegmentsWithGapsOpts(t *testing.T, store ir.BackupStore, base time.Time
 			if err := segStore.Put(context.Background(), chunkPath, bytes.NewReader(body)); err != nil {
 				t.Fatalf("seed change chunk: %v", err)
 			}
-			im.ChangeChunks = []*ir.ChunkInfo{{File: chunkPath, RowCount: 1, SHA256: ""}}
+			im.ChangeChunks = []*irbackup.ChunkInfo{{File: chunkPath, RowCount: 1, SHA256: ""}}
 			if err := writeManifestAt(context.Background(), segStore, ip, im); err != nil {
 				t.Fatalf("seed incr (%d,%d): %v", i, j, err)
 			}
@@ -557,35 +558,35 @@ func seedSegmentsWithGapsOpts(t *testing.T, store ir.BackupStore, base time.Time
 	}
 }
 
-func compactSeedFullManifest(t *testing.T, createdAt time.Time, lsn uint64, enc *ir.ChainEncryption) *ir.Manifest {
+func compactSeedFullManifest(t *testing.T, createdAt time.Time, lsn uint64, enc *irbackup.ChainEncryption) *irbackup.Manifest {
 	t.Helper()
-	m := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	m := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		SourceEngine:  "postgres",
 		CreatedAt:     createdAt,
-		Kind:          ir.BackupKindFull,
+		Kind:          irbackup.BackupKindFull,
 		EndPosition:   ir.Position{Engine: "postgres", Token: lsnToken(lsn)},
-		PartialState:  ir.BackupStateComplete,
+		PartialState:  irbackup.BackupStateComplete,
 	}
 	if enc != nil {
 		m.ChainEncryption = enc
 	}
-	m.BackupID = ir.ComputeBackupID(m)
+	m.BackupID = irbackup.ComputeBackupID(m)
 	return m
 }
 
-func compactSeedIncrementalManifest(t *testing.T, createdAt time.Time, startLSN, endLSN uint64) *ir.Manifest {
+func compactSeedIncrementalManifest(t *testing.T, createdAt time.Time, startLSN, endLSN uint64) *irbackup.Manifest {
 	t.Helper()
-	m := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	m := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		SourceEngine:  "postgres",
 		CreatedAt:     createdAt,
-		Kind:          ir.BackupKindIncremental,
+		Kind:          irbackup.BackupKindIncremental,
 		StartPosition: ir.Position{Engine: "postgres", Token: lsnToken(startLSN)},
 		EndPosition:   ir.Position{Engine: "postgres", Token: lsnToken(endLSN)},
-		PartialState:  ir.BackupStateComplete,
+		PartialState:  irbackup.BackupStateComplete,
 	}
-	m.BackupID = ir.ComputeBackupID(m)
+	m.BackupID = irbackup.ComputeBackupID(m)
 	return m
 }
 
@@ -593,21 +594,21 @@ func lsnToken(lsn uint64) string {
 	return fmt.Sprintf(`{"slot":"s","lsn":"0/%X"}`, lsn)
 }
 
-func seedTwoSegmentLineageWithEncryption(t *testing.T, store ir.BackupStore, now time.Time, encA, encB *ir.ChainEncryption) {
+func seedTwoSegmentLineageWithEncryption(t *testing.T, store irbackup.BackupStore, now time.Time, encA, encB *irbackup.ChainEncryption) {
 	t.Helper()
 	seedSegmentsWithGapsOpts(t, store, now, []time.Duration{time.Hour}, segmentSeedOpts{
-		encPerSegment: []*ir.ChainEncryption{encA, encB},
+		encPerSegment: []*irbackup.ChainEncryption{encA, encB},
 	})
 }
 
-func seedTwoSegmentLineageWithCodecs(t *testing.T, store ir.BackupStore, now time.Time, codecA, codecB Codec) {
+func seedTwoSegmentLineageWithCodecs(t *testing.T, store irbackup.BackupStore, now time.Time, codecA, codecB Codec) {
 	t.Helper()
 	seedSegmentsWithGapsOpts(t, store, now, []time.Duration{time.Hour}, segmentSeedOpts{
 		codecsPerSegment: []Codec{codecA, codecB},
 	})
 }
 
-func seedTwoSegmentLineageWithGap(t *testing.T, store ir.BackupStore, now time.Time) {
+func seedTwoSegmentLineageWithGap(t *testing.T, store irbackup.BackupStore, now time.Time) {
 	t.Helper()
 	seedSegmentsWithGapsOpts(t, store, now, []time.Duration{time.Hour}, segmentSeedOpts{
 		gapBetweenBoundaries: true,

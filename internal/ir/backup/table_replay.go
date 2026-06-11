@@ -1,7 +1,9 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package ir
+package backup
+
+import "sluicesync.dev/sluice/internal/ir"
 
 // TableReplayIdempotent reports whether replaying a chain window of
 // [Change] events onto table converges regardless of overlap — i.e.
@@ -27,7 +29,7 @@ package ir
 // Used by the backup orchestrator's anchored-resume guard (task #42,
 // ADR-0085): a resumed full's re-streamed tables overlap the chain's
 // replay window, which is sound only for tables this reports true for.
-func TableReplayIdempotent(table *Table) bool {
+func TableReplayIdempotent(table *ir.Table) bool {
 	if table == nil {
 		return false
 	}

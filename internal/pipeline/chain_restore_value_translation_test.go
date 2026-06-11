@@ -29,13 +29,14 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // writeOneChangeChunk encodes the supplied changes into a change
 // chunk under chunkPath in store. Returns the chunk's recorded
 // SHA-256 so the test can construct a manifest the chain restorer can
 // verify.
-func writeOneChangeChunk(t *testing.T, store ir.BackupStore, chunkPath string, changes []ir.Change) (sha string, rowCount int64) {
+func writeOneChangeChunk(t *testing.T, store irbackup.BackupStore, chunkPath string, changes []ir.Change) (sha string, rowCount int64) {
 	t.Helper()
 	var buf bytes.Buffer
 	// DefaultCodec so encode here agrees with the restore read-default
@@ -78,15 +79,15 @@ func TestChainRestore_CrossEngine_UUIDValuePreserved(t *testing.T) {
 	}}}
 
 	pos := ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/100"}`}
-	full := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	full := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		CreatedAt:     time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC),
 		SourceEngine:  "postgres",
-		Kind:          ir.BackupKindFull,
+		Kind:          irbackup.BackupKindFull,
 		Schema:        schema,
 		EndPosition:   pos,
 	}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
 		t.Fatalf("write full: %v", err)
 	}
@@ -103,19 +104,19 @@ func TestChainRestore_CrossEngine_UUIDValuePreserved(t *testing.T) {
 	sha, rowCount := writeOneChangeChunk(t, store, "chunks/_changes/changes-0.jsonl.gz", changes)
 
 	incrPos := ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/200"}`}
-	incr := &ir.Manifest{
-		FormatVersion:  ir.BackupFormatVersion,
+	incr := &irbackup.Manifest{
+		FormatVersion:  irbackup.BackupFormatVersion,
 		CreatedAt:      time.Date(2026, 5, 8, 11, 0, 0, 0, time.UTC),
 		SourceEngine:   "postgres",
-		Kind:           ir.BackupKindIncremental,
+		Kind:           irbackup.BackupKindIncremental,
 		ParentBackupID: full.BackupID,
 		StartPosition:  pos,
 		EndPosition:    incrPos,
-		ChangeChunks: []*ir.ChunkInfo{{
+		ChangeChunks: []*irbackup.ChunkInfo{{
 			File: "chunks/_changes/changes-0.jsonl.gz", SHA256: sha, RowCount: rowCount,
 		}},
 	}
-	incr.BackupID = ir.ComputeBackupID(incr)
+	incr.BackupID = irbackup.ComputeBackupID(incr)
 	if err := writeManifestAt(context.Background(), store, "manifests/incr-0001.json", incr); err != nil {
 		t.Fatalf("write incr: %v", err)
 	}
@@ -160,12 +161,12 @@ func TestChainRestore_CrossEngine_JSONbytesPreserved(t *testing.T) {
 		},
 	}}}
 	pos := ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/100"}`}
-	full := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion, CreatedAt: time.Now().UTC(),
-		SourceEngine: "postgres", Kind: ir.BackupKindFull,
+	full := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion, CreatedAt: time.Now().UTC(),
+		SourceEngine: "postgres", Kind: irbackup.BackupKindFull,
 		Schema: schema, EndPosition: pos,
 	}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
 		t.Fatalf("write full: %v", err)
 	}
@@ -177,16 +178,16 @@ func TestChainRestore_CrossEngine_JSONbytesPreserved(t *testing.T) {
 		ir.TxCommit{Position: pos},
 	}
 	sha, rowCount := writeOneChangeChunk(t, store, "chunks/_changes/changes-0.jsonl.gz", changes)
-	incr := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion, CreatedAt: time.Now().UTC(),
-		SourceEngine: "postgres", Kind: ir.BackupKindIncremental,
+	incr := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion, CreatedAt: time.Now().UTC(),
+		SourceEngine: "postgres", Kind: irbackup.BackupKindIncremental,
 		ParentBackupID: full.BackupID, StartPosition: pos,
 		EndPosition: ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/200"}`},
-		ChangeChunks: []*ir.ChunkInfo{{
+		ChangeChunks: []*irbackup.ChunkInfo{{
 			File: "chunks/_changes/changes-0.jsonl.gz", SHA256: sha, RowCount: rowCount,
 		}},
 	}
-	incr.BackupID = ir.ComputeBackupID(incr)
+	incr.BackupID = irbackup.ComputeBackupID(incr)
 	if err := writeManifestAt(context.Background(), store, "manifests/incr-0001.json", incr); err != nil {
 		t.Fatalf("write incr: %v", err)
 	}
@@ -231,12 +232,12 @@ func TestChainRestore_CrossEngine_TimestampPreserved(t *testing.T) {
 		},
 	}}}
 	pos := ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/100"}`}
-	full := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion, CreatedAt: time.Now().UTC(),
-		SourceEngine: "postgres", Kind: ir.BackupKindFull,
+	full := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion, CreatedAt: time.Now().UTC(),
+		SourceEngine: "postgres", Kind: irbackup.BackupKindFull,
 		Schema: schema, EndPosition: pos,
 	}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
 		t.Fatalf("write full: %v", err)
 	}
@@ -248,16 +249,16 @@ func TestChainRestore_CrossEngine_TimestampPreserved(t *testing.T) {
 		ir.TxCommit{Position: pos},
 	}
 	sha, rowCount := writeOneChangeChunk(t, store, "chunks/_changes/changes-0.jsonl.gz", changes)
-	incr := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion, CreatedAt: time.Now().UTC(),
-		SourceEngine: "postgres", Kind: ir.BackupKindIncremental,
+	incr := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion, CreatedAt: time.Now().UTC(),
+		SourceEngine: "postgres", Kind: irbackup.BackupKindIncremental,
 		ParentBackupID: full.BackupID, StartPosition: pos,
 		EndPosition: ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/200"}`},
-		ChangeChunks: []*ir.ChunkInfo{{
+		ChangeChunks: []*irbackup.ChunkInfo{{
 			File: "chunks/_changes/changes-0.jsonl.gz", SHA256: sha, RowCount: rowCount,
 		}},
 	}
-	incr.BackupID = ir.ComputeBackupID(incr)
+	incr.BackupID = irbackup.ComputeBackupID(incr)
 	if err := writeManifestAt(context.Background(), store, "manifests/incr-0001.json", incr); err != nil {
 		t.Fatalf("write incr: %v", err)
 	}
@@ -299,12 +300,12 @@ func TestChainRestore_CrossEngine_BoolValuePreserved(t *testing.T) {
 		},
 	}}}
 	pos := ir.Position{Engine: "mysql", Token: `gtid:abc:1`}
-	full := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion, CreatedAt: time.Now().UTC(),
-		SourceEngine: "mysql", Kind: ir.BackupKindFull,
+	full := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion, CreatedAt: time.Now().UTC(),
+		SourceEngine: "mysql", Kind: irbackup.BackupKindFull,
 		Schema: schema, EndPosition: pos,
 	}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
 		t.Fatalf("write full: %v", err)
 	}
@@ -319,16 +320,16 @@ func TestChainRestore_CrossEngine_BoolValuePreserved(t *testing.T) {
 		ir.TxCommit{Position: pos},
 	}
 	sha, rowCount := writeOneChangeChunk(t, store, "chunks/_changes/changes-0.jsonl.gz", changes)
-	incr := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion, CreatedAt: time.Now().UTC(),
-		SourceEngine: "mysql", Kind: ir.BackupKindIncremental,
+	incr := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion, CreatedAt: time.Now().UTC(),
+		SourceEngine: "mysql", Kind: irbackup.BackupKindIncremental,
 		ParentBackupID: full.BackupID, StartPosition: pos,
 		EndPosition: ir.Position{Engine: "mysql", Token: `gtid:abc:2`},
-		ChangeChunks: []*ir.ChunkInfo{{
+		ChangeChunks: []*irbackup.ChunkInfo{{
 			File: "chunks/_changes/changes-0.jsonl.gz", SHA256: sha, RowCount: rowCount,
 		}},
 	}
-	incr.BackupID = ir.ComputeBackupID(incr)
+	incr.BackupID = irbackup.ComputeBackupID(incr)
 	if err := writeManifestAt(context.Background(), store, "manifests/incr-0001.json", incr); err != nil {
 		t.Fatalf("write incr: %v", err)
 	}

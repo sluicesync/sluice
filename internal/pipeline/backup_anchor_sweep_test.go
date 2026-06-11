@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Unit tests for the Bug 137 resume-time orphan sweep dispatch: when
-// the source engine implements the optional [ir.BackupAnchorSweeper]
+// the source engine implements the optional [irbackup.BackupAnchorSweeper]
 // surface, the full-backup orchestrator invokes it exactly when a
 // resume is detected (an in-progress prior manifest) — never on a
 // fresh run — and a sweep failure is hygiene, not a run failure.
@@ -17,9 +17,10 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
-// sweepingBackupEngine layers [ir.BackupAnchorSweeper] onto the
+// sweepingBackupEngine layers [irbackup.BackupAnchorSweeper] onto the
 // package's stock backup test engine, recording each invocation.
 type sweepingBackupEngine struct {
 	*backupRecorderEngine
@@ -35,7 +36,7 @@ func (e *sweepingBackupEngine) SweepOrphanedBackupAnchors(_ context.Context, dsn
 	return e.sweepErr
 }
 
-var _ ir.BackupAnchorSweeper = (*sweepingBackupEngine)(nil)
+var _ irbackup.BackupAnchorSweeper = (*sweepingBackupEngine)(nil)
 
 // anchorSweepFixture returns a schema + rows pair small enough that
 // the backup completes instantly but real enough to exercise the
@@ -52,13 +53,13 @@ func anchorSweepFixture() (schema *ir.Schema, rows map[string][]ir.Row) {
 
 // writeInProgressManifest seeds the store with the minimal manifest
 // shape that flips the orchestrator onto the resume path.
-func writeInProgressManifest(t *testing.T, store ir.BackupStore, schema *ir.Schema) {
+func writeInProgressManifest(t *testing.T, store irbackup.BackupStore, schema *ir.Schema) {
 	t.Helper()
-	partial := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	partial := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		SourceEngine:  "postgres",
 		Schema:        schema,
-		PartialState:  ir.BackupStateInProgress,
+		PartialState:  irbackup.BackupStateInProgress,
 	}
 	if err := writeManifest(context.Background(), store, partial); err != nil {
 		t.Fatalf("writeManifest partial: %v", err)
@@ -139,7 +140,7 @@ func TestBackup_ResumeSweepFailureDoesNotFailRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readManifest: %v", err)
 	}
-	if final.PartialState != ir.BackupStateComplete {
+	if final.PartialState != irbackup.BackupStateComplete {
 		t.Errorf("PartialState = %q; want complete", final.PartialState)
 	}
 }

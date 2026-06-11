@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // TestLoadChainTerminalPosition_FullOnly pins the simplest chain
@@ -23,16 +24,16 @@ func TestLoadChainTerminalPosition_FullOnly(t *testing.T) {
 		Engine: "postgres",
 		Token:  `{"slot":"sluice_slot","lsn":"1/200"}`,
 	}
-	full := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	full := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		CreatedAt:     time.Date(2026, 5, 7, 10, 0, 0, 0, time.UTC),
 		SourceEngine:  "postgres",
 		Schema:        &ir.Schema{},
-		Kind:          ir.BackupKindFull,
+		Kind:          irbackup.BackupKindFull,
 		EndPosition:   endPos,
-		PartialState:  ir.BackupStateComplete,
+		PartialState:  irbackup.BackupStateComplete,
 	}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
 		t.Fatalf("write parent: %v", err)
 	}
@@ -53,48 +54,48 @@ func TestLoadChainTerminalPosition_FullPlusIncrementals(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := NewLocalStore(dir)
 
-	full := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	full := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		CreatedAt:     time.Date(2026, 5, 7, 10, 0, 0, 0, time.UTC),
 		SourceEngine:  "postgres",
 		Schema:        &ir.Schema{},
-		Kind:          ir.BackupKindFull,
+		Kind:          irbackup.BackupKindFull,
 		EndPosition:   ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"1/100"}`},
-		PartialState:  ir.BackupStateComplete,
+		PartialState:  irbackup.BackupStateComplete,
 	}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
 		t.Fatalf("write full: %v", err)
 	}
 
-	incr1 := &ir.Manifest{
-		FormatVersion:  ir.BackupFormatVersion,
+	incr1 := &irbackup.Manifest{
+		FormatVersion:  irbackup.BackupFormatVersion,
 		CreatedAt:      time.Date(2026, 5, 7, 11, 0, 0, 0, time.UTC),
 		SourceEngine:   "postgres",
 		Schema:         &ir.Schema{},
-		Kind:           ir.BackupKindIncremental,
+		Kind:           irbackup.BackupKindIncremental,
 		ParentBackupID: full.BackupID,
 		StartPosition:  full.EndPosition,
 		EndPosition:    ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"1/200"}`},
-		PartialState:   ir.BackupStateComplete,
+		PartialState:   irbackup.BackupStateComplete,
 	}
-	incr1.BackupID = ir.ComputeBackupID(incr1)
+	incr1.BackupID = irbackup.ComputeBackupID(incr1)
 	if err := writeManifestAt(context.Background(), store, "manifests/incr-001.json", incr1); err != nil {
 		t.Fatalf("write incr1: %v", err)
 	}
 
-	incr2 := &ir.Manifest{
-		FormatVersion:  ir.BackupFormatVersion,
+	incr2 := &irbackup.Manifest{
+		FormatVersion:  irbackup.BackupFormatVersion,
 		CreatedAt:      time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC),
 		SourceEngine:   "postgres",
 		Schema:         &ir.Schema{},
-		Kind:           ir.BackupKindIncremental,
+		Kind:           irbackup.BackupKindIncremental,
 		ParentBackupID: incr1.BackupID,
 		StartPosition:  incr1.EndPosition,
 		EndPosition:    ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"1/300"}`},
-		PartialState:   ir.BackupStateComplete,
+		PartialState:   irbackup.BackupStateComplete,
 	}
-	incr2.BackupID = ir.ComputeBackupID(incr2)
+	incr2.BackupID = irbackup.ComputeBackupID(incr2)
 	if err := writeManifestAt(context.Background(), store, "manifests/incr-002.json", incr2); err != nil {
 		t.Fatalf("write incr2: %v", err)
 	}
@@ -117,14 +118,14 @@ func TestLoadChainTerminalPosition_EmptyEndPosition(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := NewLocalStore(dir)
 
-	full := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	full := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		CreatedAt:     time.Date(2026, 5, 7, 10, 0, 0, 0, time.UTC),
 		SourceEngine:  "postgres",
 		Schema:        &ir.Schema{},
-		Kind:          ir.BackupKindFull,
+		Kind:          irbackup.BackupKindFull,
 		// No EndPosition.
-		PartialState: ir.BackupStateComplete,
+		PartialState: irbackup.BackupStateComplete,
 	}
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
 		t.Fatalf("write full: %v", err)

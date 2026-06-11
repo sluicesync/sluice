@@ -68,6 +68,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/translate"
 )
 
@@ -111,11 +112,11 @@ type SyncFromBackup struct {
 	// Required.
 	TargetDSN string
 
-	// Store is the [ir.BackupStore] the chain lives in. The broker
+	// Store is the [irbackup.BackupStore] the chain lives in. The broker
 	// reads manifests + change chunks from it but never writes;
 	// brokers are read-only consumers (acceptance criterion 10).
 	// Required.
-	Store ir.BackupStore
+	Store irbackup.BackupStore
 
 	// ChainURL is the operator-visible URL of the chain store.
 	// Recorded in the position token and in log lines so monitoring
@@ -166,7 +167,7 @@ type SyncFromBackup struct {
 
 	// Envelope, when non-nil, is the [crypto.EnvelopeEncryption] used
 	// to unwrap CEKs from encrypted manifests. Required when the chain
-	// the broker is consuming carries [ir.ChainEncryption]. A nil
+	// the broker is consuming carries [irbackup.ChainEncryption]. A nil
 	// Envelope against an encrypted chain produces a clear refusal at
 	// chain-walk time naming the missing key.
 	Envelope crypto.EnvelopeEncryption
@@ -429,7 +430,7 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 	}
 
 	// Phase 6.1: chain-encryption preflight. When the chain root
-	// carries [ir.ChainEncryption], the broker must have an envelope
+	// carries [irbackup.ChainEncryption], the broker must have an envelope
 	// + the unwrapped chain CEK ready (per-chain mode) before the
 	// first tick attempts to decrypt a change chunk. preflightChainEncryption
 	// is a no-op for plaintext chains.
@@ -834,7 +835,7 @@ func (b *SyncFromBackup) replayNewIncrementals(
 		// Skip the full's manifest (i==0) when no last-applied is
 		// set; that case shouldn't happen on the warm-resume path
 		// but is harmless to guard.
-		if link.manifest.Kind == ir.BackupKindFull || link.manifest.Kind == "" {
+		if link.manifest.Kind == irbackup.BackupKindFull || link.manifest.Kind == "" {
 			continue
 		}
 		bytesApplied, applyErr := b.applyIncremental(ctx, applier, link, batchSize)
@@ -975,7 +976,7 @@ func (b *SyncFromBackup) applySchemaDeltas(ctx context.Context, link *segmentRec
 	deltaApplier, _ := sw.(ir.SchemaDeltaApplier)
 	for _, d := range link.manifest.SchemaDelta {
 		switch d.Kind {
-		case ir.SchemaDeltaAddTable:
+		case irbackup.SchemaDeltaAddTable:
 			if d.After == nil {
 				continue
 			}
@@ -991,7 +992,7 @@ func (b *SyncFromBackup) applySchemaDeltas(ctx context.Context, link *segmentRec
 				slog.String("stream_id", b.StreamID),
 				slog.String("table", d.Table),
 			)
-		case ir.SchemaDeltaAlterTable:
+		case irbackup.SchemaDeltaAlterTable:
 			if d.Before == nil || d.After == nil {
 				continue
 			}
@@ -1023,7 +1024,7 @@ func (b *SyncFromBackup) applySchemaDeltas(ctx context.Context, link *segmentRec
 				slog.String("table", d.Table),
 				slog.Int("added_columns", len(added)),
 			)
-		case ir.SchemaDeltaDropTable:
+		case irbackup.SchemaDeltaDropTable:
 			slog.WarnContext(
 				ctx, "broker: schema delta — drop ignored (v1 does not auto-DROP)",
 				slog.String("stream_id", b.StreamID),
@@ -1061,9 +1062,9 @@ func (b *SyncFromBackup) streamIncrementalWithPosition(
 // segStore/codec come from the chunk's segment (recorded, not sniffed).
 func (b *SyncFromBackup) streamOneChunkWithPosition(
 	ctx context.Context,
-	segStore ir.BackupStore,
+	segStore irbackup.BackupStore,
 	codec Codec,
-	chunk *ir.ChunkInfo,
+	chunk *irbackup.ChunkInfo,
 	pos ir.Position,
 	out chan<- ir.Change,
 ) error {
@@ -1240,7 +1241,7 @@ func (b *SyncFromBackup) preflightChainEncryption(ctx context.Context) error {
 
 // chunkCEK resolves the per-change-chunk CEK using the broker's
 // envelope + cached chain CEK. Mirrors [ChainRestore.changeChunkCEK].
-func (b *SyncFromBackup) chunkCEK(chunk *ir.ChunkInfo) ([]byte, error) {
+func (b *SyncFromBackup) chunkCEK(chunk *irbackup.ChunkInfo) ([]byte, error) {
 	if chunk.Encryption == nil {
 		return nil, nil
 	}

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // TestStreamer_PositionFromManifest_BypassesAppliedReadPosition pins
@@ -31,16 +32,16 @@ func TestStreamer_PositionFromManifest_BypassesAppliedReadPosition(t *testing.T)
 		Engine: "postgres",
 		Token:  `{"slot":"sluice_slot","lsn":"1/300"}`,
 	}
-	full := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	full := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		CreatedAt:     time.Date(2026, 5, 7, 10, 0, 0, 0, time.UTC),
 		SourceEngine:  "postgres",
 		Schema:        &ir.Schema{},
-		Kind:          ir.BackupKindFull,
+		Kind:          irbackup.BackupKindFull,
 		EndPosition:   chainTerminal,
-		PartialState:  ir.BackupStateComplete,
+		PartialState:  irbackup.BackupStateComplete,
 	}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
 		t.Fatalf("write manifest: %v", err)
 	}
@@ -103,14 +104,14 @@ func TestStreamer_PositionFromManifest_BypassesAppliedReadPosition(t *testing.T)
 func TestStreamer_PositionFromManifest_EmptyEndPosition(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := NewLocalStore(dir)
-	full := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	full := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		CreatedAt:     time.Date(2026, 5, 7, 10, 0, 0, 0, time.UTC),
 		SourceEngine:  "postgres",
 		Schema:        &ir.Schema{},
-		Kind:          ir.BackupKindFull,
+		Kind:          irbackup.BackupKindFull,
 		// No EndPosition.
-		PartialState: ir.BackupStateComplete,
+		PartialState: irbackup.BackupStateComplete,
 	}
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
 		t.Fatalf("write manifest: %v", err)
@@ -149,16 +150,16 @@ func TestStreamer_PositionFromManifest_StrictPreflightWarningsRefuse(t *testing.
 		Engine: "postgres",
 		Token:  `{"slot":"sluice_slot","lsn":"1/300"}`,
 	}
-	full := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	full := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		CreatedAt:     time.Date(2026, 5, 7, 10, 0, 0, 0, time.UTC),
 		SourceEngine:  "postgres",
 		Schema:        &ir.Schema{},
-		Kind:          ir.BackupKindFull,
+		Kind:          irbackup.BackupKindFull,
 		EndPosition:   chainTerminal,
-		PartialState:  ir.BackupStateComplete,
+		PartialState:  irbackup.BackupStateComplete,
 	}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
 		t.Fatalf("write manifest: %v", err)
 	}
@@ -202,16 +203,16 @@ func TestStreamer_PositionFromManifest_PreflightRefusalAlwaysRefuses(t *testing.
 		Engine: "postgres",
 		Token:  `{"slot":"sluice_slot","lsn":"1/300"}`,
 	}
-	full := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	full := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		CreatedAt:     time.Date(2026, 5, 7, 10, 0, 0, 0, time.UTC),
 		SourceEngine:  "postgres",
 		Schema:        &ir.Schema{},
-		Kind:          ir.BackupKindFull,
+		Kind:          irbackup.BackupKindFull,
 		EndPosition:   chainTerminal,
-		PartialState:  ir.BackupStateComplete,
+		PartialState:  irbackup.BackupStateComplete,
 	}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
 		t.Fatalf("write manifest: %v", err)
 	}

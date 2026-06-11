@@ -13,10 +13,11 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // capturingSchemaReader is a [ir.SchemaReader] that also implements
-// [ir.BackupPositionCapturer]. Used by the EndPosition tests to verify
+// [irbackup.BackupPositionCapturer]. Used by the EndPosition tests to verify
 // the full-backup orchestrator threads the captured position into the
 // manifest. Returning a sentinel position lets the test pin the wire
 // shape without standing up real engine machinery.
@@ -119,8 +120,8 @@ func TestBackup_RecordsEndPosition(t *testing.T) {
 	if reader.gotSlotName != "sluice_chain_slot" {
 		t.Errorf("CaptureBackupPosition slotName = %q; want %q", reader.gotSlotName, "sluice_chain_slot")
 	}
-	if got.Kind != ir.BackupKindFull {
-		t.Errorf("Kind = %q; want %q", got.Kind, ir.BackupKindFull)
+	if got.Kind != irbackup.BackupKindFull {
+		t.Errorf("Kind = %q; want %q", got.Kind, irbackup.BackupKindFull)
 	}
 	if got.BackupID == "" {
 		t.Error("BackupID is empty; want non-empty after EndPosition recording")
@@ -164,7 +165,7 @@ func TestBackup_NoCDCSkipsEndPosition(t *testing.T) {
 }
 
 // snapshotOpeningEngine wraps capturingBackupEngine to also implement
-// [ir.BackupSnapshotOpener] — exercising the v0.18.0 snapshot-anchored
+// [irbackup.BackupSnapshotOpener] — exercising the v0.18.0 snapshot-anchored
 // EndPosition path. The snapshot is fed a sentinel position; the test
 // verifies the orchestrator records that position on the manifest
 // rather than calling the post-sweep CaptureBackupPosition fallback.
@@ -181,10 +182,10 @@ type snapshotOpeningEngine struct {
 	snapshotRowsHook    func() ir.RowReader
 }
 
-// OpenBackupSnapshot implements [ir.BackupSnapshotOpener]. Mirrors the
+// OpenBackupSnapshot implements [irbackup.BackupSnapshotOpener]. Mirrors the
 // Postgres engine's CommitFn contract: the commit hook is set only on
 // the PersistChainSlot shape.
-func (e *snapshotOpeningEngine) OpenBackupSnapshot(_ context.Context, _ string, opts ir.BackupSnapshotOptions) (*ir.BackupSnapshot, error) {
+func (e *snapshotOpeningEngine) OpenBackupSnapshot(_ context.Context, _ string, opts irbackup.BackupSnapshotOptions) (*irbackup.BackupSnapshot, error) {
 	e.snapshotCalls++
 	e.gotSnapshotSlot = opts.SlotName
 	e.gotPersistChainSlot = opts.PersistChainSlot
@@ -197,7 +198,7 @@ func (e *snapshotOpeningEngine) OpenBackupSnapshot(_ context.Context, _ string, 
 	} else {
 		rows = &fakeRowReader{rows: e.rows}
 	}
-	snap := &ir.BackupSnapshot{
+	snap := &irbackup.BackupSnapshot{
 		Position: e.snapshotPos,
 		Rows:     rows,
 		CloseFn: func() error {
@@ -214,8 +215,8 @@ func (e *snapshotOpeningEngine) OpenBackupSnapshot(_ context.Context, _ string, 
 	return snap, nil
 }
 
-// scopedSnapshotOpeningEngine implements BOTH [ir.BackupSnapshotOpener]
-// and [ir.TableScopedBackupSnapshotOpener] — the shape a PlanetScale
+// scopedSnapshotOpeningEngine implements BOTH [irbackup.BackupSnapshotOpener]
+// and [irbackup.TableScopedBackupSnapshotOpener] — the shape a PlanetScale
 // source presents (#2b). It records which surface the orchestrator chose
 // and the table allowlist it threaded in, so the test can pin that a
 // table-scoped backup prefers OpenBackupSnapshotForTables and never calls
@@ -230,8 +231,8 @@ type scopedSnapshotOpeningEngine struct {
 	closes          int
 }
 
-func (e *scopedSnapshotOpeningEngine) makeSnapshot() *ir.BackupSnapshot {
-	return &ir.BackupSnapshot{
+func (e *scopedSnapshotOpeningEngine) makeSnapshot() *irbackup.BackupSnapshot {
+	return &irbackup.BackupSnapshot{
 		Position: e.snapshotPos,
 		Rows:     &fakeRowReader{rows: e.rows},
 		CloseFn: func() error {
@@ -241,15 +242,15 @@ func (e *scopedSnapshotOpeningEngine) makeSnapshot() *ir.BackupSnapshot {
 	}
 }
 
-// OpenBackupSnapshot implements [ir.BackupSnapshotOpener] (the base,
+// OpenBackupSnapshot implements [irbackup.BackupSnapshotOpener] (the base,
 // whole-keyspace surface). The scoped test asserts this is NOT called.
-func (e *scopedSnapshotOpeningEngine) OpenBackupSnapshot(_ context.Context, _ string, _ ir.BackupSnapshotOptions) (*ir.BackupSnapshot, error) {
+func (e *scopedSnapshotOpeningEngine) OpenBackupSnapshot(_ context.Context, _ string, _ irbackup.BackupSnapshotOptions) (*irbackup.BackupSnapshot, error) {
 	e.baseCalls++
 	return e.makeSnapshot(), nil
 }
 
-// OpenBackupSnapshotForTables implements [ir.TableScopedBackupSnapshotOpener].
-func (e *scopedSnapshotOpeningEngine) OpenBackupSnapshotForTables(_ context.Context, _ string, opts ir.BackupSnapshotOptions, tables []string) (*ir.BackupSnapshot, error) {
+// OpenBackupSnapshotForTables implements [irbackup.TableScopedBackupSnapshotOpener].
+func (e *scopedSnapshotOpeningEngine) OpenBackupSnapshotForTables(_ context.Context, _ string, opts irbackup.BackupSnapshotOptions, tables []string) (*irbackup.BackupSnapshot, error) {
 	e.scopedCalls++
 	e.gotScopedSlot = opts.SlotName
 	e.gotScopedTables = tables
@@ -258,7 +259,7 @@ func (e *scopedSnapshotOpeningEngine) OpenBackupSnapshotForTables(_ context.Cont
 
 // TestBackup_TableScopedSnapshotPrefersScopedOpener pins the #2b
 // backup-path symmetry: when the source implements
-// [ir.TableScopedBackupSnapshotOpener] AND the filtered schema has tables,
+// [irbackup.TableScopedBackupSnapshotOpener] AND the filtered schema has tables,
 // the orchestrator opens the snapshot via OpenBackupSnapshotForTables
 // (threading the filtered table names) and NEVER calls the whole-keyspace
 // OpenBackupSnapshot. This is what stops a scoped PlanetScale backup from
@@ -337,7 +338,7 @@ func TestBackup_TableScopedSnapshotPrefersScopedOpener(t *testing.T) {
 }
 
 // TestBackup_BaseOnlySnapshotOpenerStillRoutesToBase pins the no-regression
-// case: a source that implements ONLY the base [ir.BackupSnapshotOpener]
+// case: a source that implements ONLY the base [irbackup.BackupSnapshotOpener]
 // (NOT the table-scoped surface — PG, vanilla-via-base) still routes to
 // OpenBackupSnapshot even when the filtered schema has tables. The #2b
 // dispatch must be byte-identical for non-implementers of the new
@@ -356,7 +357,7 @@ func TestBackup_BaseOnlySnapshotOpenerStillRoutesToBase(t *testing.T) {
 	}
 	snapshotPos := ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"0/BASE00"}`}
 	reader := &capturingSchemaReader{schema: schema}
-	// snapshotOpeningEngine implements ONLY ir.BackupSnapshotOpener.
+	// snapshotOpeningEngine implements ONLY irbackup.BackupSnapshotOpener.
 	src := &snapshotOpeningEngine{
 		capturingBackupEngine: &capturingBackupEngine{
 			backupRecorderEngine: newBackupRecorderEngine("postgres", schema, map[string][]ir.Row{
@@ -369,7 +370,7 @@ func TestBackup_BaseOnlySnapshotOpenerStillRoutesToBase(t *testing.T) {
 	}
 	// Compile-time guard: this stub must NOT satisfy the table-scoped
 	// surface, or the test would be vacuous.
-	if _, ok := interface{}(src).(ir.TableScopedBackupSnapshotOpener); ok {
+	if _, ok := interface{}(src).(irbackup.TableScopedBackupSnapshotOpener); ok {
 		t.Fatal("snapshotOpeningEngine must NOT implement TableScopedBackupSnapshotOpener for this test")
 	}
 
@@ -400,7 +401,7 @@ func TestBackup_BaseOnlySnapshotOpenerStillRoutesToBase(t *testing.T) {
 
 // TestBackup_RecordsSnapshotAnchoredEndPosition pins the v0.18.0
 // snapshot-anchored EndPosition path: when the source engine
-// implements [ir.BackupSnapshotOpener], the orchestrator opens a
+// implements [irbackup.BackupSnapshotOpener], the orchestrator opens a
 // backup snapshot, threads its Position onto manifest.EndPosition,
 // and never calls the post-sweep CaptureBackupPosition fallback.
 func TestBackup_RecordsSnapshotAnchoredEndPosition(t *testing.T) {
@@ -474,7 +475,7 @@ func TestBackup_RecordsSnapshotAnchoredEndPosition(t *testing.T) {
 
 // TestBackup_SnapshotOpenerErrorFallsBackToCapturer pins the v0.18.0
 // graceful-fallback shape: when the engine implements
-// [ir.BackupSnapshotOpener] but the call returns an error (e.g. PG
+// [irbackup.BackupSnapshotOpener] but the call returns an error (e.g. PG
 // without `wal_level=logical` can't create the temporary anchor slot),
 // the orchestrator MUST NOT fail the run. It falls through to the
 // v0.17.x path — basic OpenRowReader + post-sweep BackupPositionCapturer
@@ -567,7 +568,7 @@ func TestBackup_SnapshotOpenerErrorFallsBackToCapturer(t *testing.T) {
 
 // TestBackup_FallbackWhenNoSnapshotOpener pins the v0.17.x-shape
 // fallback path: when the engine doesn't implement
-// [ir.BackupSnapshotOpener], the orchestrator routes through the
+// [irbackup.BackupSnapshotOpener], the orchestrator routes through the
 // post-sweep CaptureBackupPosition fallback. The during-backup
 // write-window gap is documented; this test pins the dispatch.
 func TestBackup_FallbackWhenNoSnapshotOpener(t *testing.T) {

@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // bug136Schema is a PG-shaped schema with a UNIQUE index on an
@@ -103,8 +104,8 @@ func TestCheckCrossEngineSupportable_PGtoMySQL_OverriddenTextIndexAllowed(t *tes
 // table) trips the same refusal — chain restore's cross-engine deltas
 // share the chokepoint.
 func TestCheckCrossEngineDeltaSupportable_TextIndexRefuses(t *testing.T) {
-	deltas := []*ir.SchemaDeltaEntry{{
-		Kind:  ir.SchemaDeltaAddTable,
+	deltas := []*irbackup.SchemaDeltaEntry{{
+		Kind:  irbackup.SchemaDeltaAddTable,
 		Table: "users",
 		After: bug136Schema().Tables[0],
 	}}

@@ -4,7 +4,7 @@
 package pipeline
 
 // Phase 3 schema-delta diff: turns a (before, after) pair of source
-// schemas into the [ir.SchemaDeltaEntry] slice that lands on the
+// schemas into the [irbackup.SchemaDeltaEntry] slice that lands on the
 // incremental manifest. Distinct from the ir/diff package's Schemas (which powers
 // `sluice schema diff` and produces a richer drift shape with names
 // + low-confidence flags) — incrementals only need the simple
@@ -23,6 +23,7 @@ import (
 	"reflect"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // diffSchemas returns the structural delta from before to after.
@@ -34,11 +35,11 @@ import (
 // applier safe), then adds, then alters. Within each group, ordering
 // is the after-schema's table order (or before-schema's for drops),
 // which is stable across runs.
-func diffSchemas(before, after *ir.Schema) []*ir.SchemaDeltaEntry {
+func diffSchemas(before, after *ir.Schema) []*irbackup.SchemaDeltaEntry {
 	var (
-		drops  []*ir.SchemaDeltaEntry
-		adds   []*ir.SchemaDeltaEntry
-		alters []*ir.SchemaDeltaEntry
+		drops  []*irbackup.SchemaDeltaEntry
+		adds   []*irbackup.SchemaDeltaEntry
+		alters []*irbackup.SchemaDeltaEntry
 	)
 
 	beforeIdx := indexTablesByQualifiedName(before)
@@ -51,8 +52,8 @@ func diffSchemas(before, after *ir.Schema) []*ir.SchemaDeltaEntry {
 			if _, ok := afterIdx[key]; ok {
 				continue
 			}
-			drops = append(drops, &ir.SchemaDeltaEntry{
-				Kind:   ir.SchemaDeltaDropTable,
+			drops = append(drops, &irbackup.SchemaDeltaEntry{
+				Kind:   irbackup.SchemaDeltaDropTable,
 				Schema: t.Schema,
 				Table:  t.Name,
 				Before: t,
@@ -67,8 +68,8 @@ func diffSchemas(before, after *ir.Schema) []*ir.SchemaDeltaEntry {
 			key := qualifiedTableKey(tAfter.Schema, tAfter.Name)
 			tBefore, ok := beforeIdx[key]
 			if !ok {
-				adds = append(adds, &ir.SchemaDeltaEntry{
-					Kind:   ir.SchemaDeltaAddTable,
+				adds = append(adds, &irbackup.SchemaDeltaEntry{
+					Kind:   irbackup.SchemaDeltaAddTable,
 					Schema: tAfter.Schema,
 					Table:  tAfter.Name,
 					After:  tAfter,
@@ -76,8 +77,8 @@ func diffSchemas(before, after *ir.Schema) []*ir.SchemaDeltaEntry {
 				continue
 			}
 			if !tablesEqual(tBefore, tAfter) {
-				alters = append(alters, &ir.SchemaDeltaEntry{
-					Kind:   ir.SchemaDeltaAlterTable,
+				alters = append(alters, &irbackup.SchemaDeltaEntry{
+					Kind:   irbackup.SchemaDeltaAlterTable,
 					Schema: tAfter.Schema,
 					Table:  tAfter.Name,
 					Before: tBefore,
@@ -87,7 +88,7 @@ func diffSchemas(before, after *ir.Schema) []*ir.SchemaDeltaEntry {
 		}
 	}
 
-	out := make([]*ir.SchemaDeltaEntry, 0, len(drops)+len(adds)+len(alters))
+	out := make([]*irbackup.SchemaDeltaEntry, 0, len(drops)+len(adds)+len(alters))
 	out = append(out, drops...)
 	out = append(out, adds...)
 	out = append(out, alters...)

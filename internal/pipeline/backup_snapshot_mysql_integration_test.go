@@ -25,7 +25,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
-	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 )
@@ -187,12 +187,12 @@ func TestBackup_OpenBackupSnapshot_MySQLPositionShape(t *testing.T) {
 	`)
 
 	mysqlEng, _ := engines.Get("mysql")
-	opener, ok := mysqlEng.(ir.BackupSnapshotOpener)
+	opener, ok := mysqlEng.(irbackup.BackupSnapshotOpener)
 	if !ok {
 		t.Fatal("mysql engine does not implement BackupSnapshotOpener")
 	}
 
-	snap, err := opener.OpenBackupSnapshot(context.Background(), sourceDSN, ir.BackupSnapshotOptions{})
+	snap, err := opener.OpenBackupSnapshot(context.Background(), sourceDSN, irbackup.BackupSnapshotOptions{})
 	if err != nil {
 		t.Fatalf("OpenBackupSnapshot: %v", err)
 	}

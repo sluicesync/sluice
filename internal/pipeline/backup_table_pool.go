@@ -56,6 +56,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // backupDispatchObserver is a TEST-ONLY seam: when non-nil it fires
@@ -106,7 +107,7 @@ func backupParallelEligible(snapshotName string, source ir.Engine, tableParallel
 // [Backup.backupTable]'s doc comment).
 type backupTableTask struct {
 	table *ir.Table
-	entry *ir.TableManifest
+	entry *irbackup.TableManifest
 }
 
 // backupReaderFactory mints one additional snapshot-pinned
@@ -238,7 +239,7 @@ func (b *Backup) stageBackupTables(
 	ctx context.Context,
 	committer *manifestCommitter,
 	schema *ir.Schema,
-	priorTables map[string]*ir.TableManifest,
+	priorTables map[string]*irbackup.TableManifest,
 ) ([]backupTableTask, error) {
 	tasks := make([]backupTableTask, 0, len(schema.Tables))
 	for _, table := range schema.Tables {
@@ -264,7 +265,7 @@ func (b *Backup) stageBackupTables(
 				slog.Int("discarded_prior_chunks", len(existing.Chunks)),
 			)
 		}
-		entry := &ir.TableManifest{
+		entry := &irbackup.TableManifest{
 			Schema:  table.Schema,
 			Name:    table.Name,
 			Partial: true, // flips to false on natural EOF; checkpoints persist it as true until then
@@ -397,14 +398,14 @@ var errBackupPoolNoImporter = errors.New("pipeline: backup table pool: source en
 // manifestCommitter serializes every in-flight-manifest mutation and
 // store commit for the backup row sweep (ADR-0084). With peer tables
 // checkpointing concurrently, both the manifest's Go structures (each
-// worker mutating its own *ir.TableManifest while a peer marshals the
+// worker mutating its own *irbackup.TableManifest while a peer marshals the
 // WHOLE manifest) and the same-key `manifest.json` Puts (load-bearing
 // on stores without atomic rename) need one serialization point — this
 // mutex is it. The data-plane chunk Puts (distinct keys) stay outside.
 type manifestCommitter struct {
 	mu       sync.Mutex
-	store    ir.BackupStore
-	manifest *ir.Manifest
+	store    irbackup.BackupStore
+	manifest *irbackup.Manifest
 }
 
 // stageTable appends one table's entry to manifest.Tables. The
@@ -418,7 +419,7 @@ type manifestCommitter struct {
 // Called single-threaded (pre-pool); no lock strictly needed, but
 // taking it keeps the invariant trivially auditable: every manifest
 // mutation in this file happens under mu.
-func (c *manifestCommitter) stageTable(entry *ir.TableManifest) {
+func (c *manifestCommitter) stageTable(entry *irbackup.TableManifest) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.manifest.Tables = append(c.manifest.Tables, entry)
@@ -429,7 +430,7 @@ func (c *manifestCommitter) stageTable(entry *ir.TableManifest) {
 // which chunks completed — progress observability, plus it keeps
 // flush's content-addressed same-path upload skip effective across a
 // re-run. Resume never REUSES partial chunk lists (Bug 135).
-func (c *manifestCommitter) appendChunk(ctx context.Context, entry *ir.TableManifest, ci *ir.ChunkInfo) error {
+func (c *manifestCommitter) appendChunk(ctx context.Context, entry *irbackup.TableManifest, ci *irbackup.ChunkInfo) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry.Chunks = append(entry.Chunks, ci)
@@ -441,7 +442,7 @@ func (c *manifestCommitter) appendChunk(ctx context.Context, entry *ir.TableMani
 // tables and tables whose row count is an exact chunk multiple rely on
 // this commit (their last appendChunk checkpoint doesn't carry the
 // Partial=false flip).
-func (c *manifestCommitter) finishTable(ctx context.Context, entry *ir.TableManifest, rowCount int64) error {
+func (c *manifestCommitter) finishTable(ctx context.Context, entry *irbackup.TableManifest, rowCount int64) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry.RowCount = rowCount

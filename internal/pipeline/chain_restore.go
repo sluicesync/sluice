@@ -36,6 +36,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/translate"
 )
 
@@ -55,8 +56,8 @@ type ChainRestore struct {
 	// TargetDSN is the target-engine-native connection string. Required.
 	TargetDSN string
 
-	// Store is the [ir.BackupStore] the chain lives in. Required.
-	Store ir.BackupStore
+	// Store is the [irbackup.BackupStore] the chain lives in. Required.
+	Store irbackup.BackupStore
 
 	// Filter selects which tables from the chain participate.
 	Filter TableFilter
@@ -138,7 +139,7 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	root := links[0]
 	incrementalCount := 0
 	for _, l := range links {
-		if canonicalKind(l.manifest.Kind) == ir.BackupKindIncremental {
+		if canonicalKind(l.manifest.Kind) == irbackup.BackupKindIncremental {
 			incrementalCount++
 		}
 	}
@@ -219,7 +220,7 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	for i := range links {
 		link := &links[i]
 		switch canonicalKind(link.manifest.Kind) {
-		case ir.BackupKindFull:
+		case irbackup.BackupKindFull:
 			// Segment 0's full establishes the schema + indexes; every
 			// LATER segment full is a fresh snapshot of the same
 			// (DDL-evolved) schema and must NOT re-run the
@@ -239,7 +240,7 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 					manifestBackupID(link.manifest), err))
 			}
 			firstFullApplied = true
-		case ir.BackupKindIncremental:
+		case irbackup.BackupKindIncremental:
 			slog.InfoContext(
 				ctx, "chain restore: applying incremental",
 				slog.Int("link", i),
@@ -325,7 +326,7 @@ func (r *ChainRestore) applyFull(ctx context.Context, full *segmentRecord, dataO
 // [Restore.preflightEncryption] but the cached CEK is consumed by the
 // incremental change-chunk walk rather than the full's bulk-copy
 // path.
-func (r *ChainRestore) preflightEncryption(rootManifest *ir.Manifest) error {
+func (r *ChainRestore) preflightEncryption(rootManifest *irbackup.Manifest) error {
 	if rootManifest == nil || rootManifest.ChainEncryption == nil {
 		return nil
 	}
@@ -369,7 +370,7 @@ func (r *ChainRestore) checkMixedModeChain(chain []segmentRecord) error {
 	segEnc := false // current segment's full's encryption shape
 	var segFullID string
 	for _, link := range chain {
-		if canonicalKind(link.manifest.Kind) == ir.BackupKindFull {
+		if canonicalKind(link.manifest.Kind) == irbackup.BackupKindFull {
 			segEnc = link.manifest.ChainEncryption != nil
 			segFullID = manifestBackupID(link.manifest)
 			continue
@@ -510,11 +511,11 @@ func (r *ChainRestore) applySchemaDeltas(ctx context.Context, link *segmentRecor
 	)
 	for _, d := range link.manifest.SchemaDelta {
 		switch d.Kind {
-		case ir.SchemaDeltaAddTable:
+		case irbackup.SchemaDeltaAddTable:
 			adds++
-		case ir.SchemaDeltaDropTable:
+		case irbackup.SchemaDeltaDropTable:
 			drops++
-		case ir.SchemaDeltaAlterTable:
+		case irbackup.SchemaDeltaAlterTable:
 			alters++
 		default:
 			return fmt.Errorf("unknown schema delta kind %q on table %q", d.Kind, d.Table)
@@ -538,7 +539,7 @@ func (r *ChainRestore) applySchemaDeltas(ctx context.Context, link *segmentRecor
 	if adds > 0 {
 		newTables := make([]*ir.Table, 0, adds)
 		for _, d := range link.manifest.SchemaDelta {
-			if d.Kind == ir.SchemaDeltaAddTable && d.After != nil {
+			if d.Kind == irbackup.SchemaDeltaAddTable && d.After != nil {
 				newTables = append(newTables, d.After)
 			}
 		}
@@ -562,7 +563,7 @@ func (r *ChainRestore) applySchemaDeltas(ctx context.Context, link *segmentRecor
 	if alters > 0 {
 		applier, _ := sw.(ir.SchemaDeltaApplier)
 		for _, d := range link.manifest.SchemaDelta {
-			if d.Kind != ir.SchemaDeltaAlterTable || d.Before == nil || d.After == nil {
+			if d.Kind != irbackup.SchemaDeltaAlterTable || d.Before == nil || d.After == nil {
 				continue
 			}
 			added := addedColumns(d.Before, d.After)
@@ -707,9 +708,9 @@ func (r *ChainRestore) streamSchemaHistorySnapshots(
 // sniffed from the bytes — ADR-0046 §5).
 func (r *ChainRestore) streamOneChangeChunk(
 	ctx context.Context,
-	segStore ir.BackupStore,
+	segStore irbackup.BackupStore,
 	codec Codec,
-	chunk *ir.ChunkInfo,
+	chunk *irbackup.ChunkInfo,
 	out chan<- ir.Change,
 ) error {
 	src, err := segStore.Get(ctx, chunk.File)
@@ -903,7 +904,7 @@ func validateFirstIncrementalBoundary(cmp ir.PositionMonotonicChecker, fullEnd, 
 // inter-segment no-regression check; nil degrades to the structural
 // same-engine guarantee (the rotation FSM already hard-asserted
 // S>=P_N at write time via the live source engine).
-func buildLineageChain(ctx context.Context, store ir.BackupStore, cmp ir.PositionMonotonicChecker) ([]segmentRecord, error) {
+func buildLineageChain(ctx context.Context, store irbackup.BackupStore, cmp ir.PositionMonotonicChecker) ([]segmentRecord, error) {
 	cat, err := resolveLineage(ctx, store)
 	if err != nil {
 		return nil, err
@@ -927,7 +928,7 @@ func buildLineageChain(ctx context.Context, store ir.BackupStore, cmp ir.Positio
 		if err != nil {
 			return nil, fmt.Errorf("segment %d (%s) full %q: %w", si, seg.SegmentID, seg.FullManifestPath, err)
 		}
-		if k := canonicalKind(fm.Kind); k != ir.BackupKindFull {
+		if k := canonicalKind(fm.Kind); k != irbackup.BackupKindFull {
 			return nil, fmt.Errorf("segment %d (%s) full manifest %q has kind %q; expected full",
 				si, seg.SegmentID, seg.FullManifestPath, fm.Kind)
 		}
@@ -961,7 +962,7 @@ func buildLineageChain(ctx context.Context, store ir.BackupStore, cmp ir.Positio
 			if err != nil {
 				return nil, fmt.Errorf("segment %d (%s) incremental %q: %w", si, seg.SegmentID, ip, err)
 			}
-			if k := canonicalKind(im.Kind); k != ir.BackupKindIncremental {
+			if k := canonicalKind(im.Kind); k != irbackup.BackupKindIncremental {
 				return nil, fmt.Errorf("segment %d incremental %q has kind %q; expected incremental",
 					si, ip, im.Kind)
 			}
@@ -1013,7 +1014,7 @@ func buildLineageChain(ctx context.Context, store ir.BackupStore, cmp ir.Positio
 // the authoritative monotonicity gate). Best-effort: a lineage-read
 // hiccup yields nil rather than failing the restore here (the
 // subsequent buildLineageChain surfaces real lineage errors).
-func sameEngineComparator(ctx context.Context, store ir.BackupStore, eng ir.Engine) ir.PositionMonotonicChecker {
+func sameEngineComparator(ctx context.Context, store irbackup.BackupStore, eng ir.Engine) ir.PositionMonotonicChecker {
 	chk, ok := eng.(ir.PositionMonotonicChecker)
 	if !ok {
 		return nil
@@ -1045,7 +1046,7 @@ func sameEngineComparator(ctx context.Context, store ir.BackupStore, eng ir.Engi
 // Broker call sites reach this through [brokerChainCache], which
 // memoizes the walk across ticks so an idle tick is O(1) store GETs
 // instead of O(chain-length).
-func buildBrokerChain(ctx context.Context, store ir.BackupStore) ([]segmentRecord, error) {
+func buildBrokerChain(ctx context.Context, store irbackup.BackupStore) ([]segmentRecord, error) {
 	return buildLineageChain(ctx, store, nil)
 }
 
@@ -1053,9 +1054,9 @@ func buildBrokerChain(ctx context.Context, store ir.BackupStore) ([]segmentRecor
 // contains a clearly unsupportable pattern (today: drop+add of the
 // same column name within a single incremental, which the design
 // doc names as ambiguous and recommends "force fresh full").
-func detectAmbiguousDeltas(deltas []*ir.SchemaDeltaEntry) error {
+func detectAmbiguousDeltas(deltas []*irbackup.SchemaDeltaEntry) error {
 	for _, d := range deltas {
-		if d.Kind != ir.SchemaDeltaAlterTable {
+		if d.Kind != irbackup.SchemaDeltaAlterTable {
 			continue
 		}
 		if d.Before == nil || d.After == nil {
@@ -1127,20 +1128,20 @@ func addedColumns(before, after *ir.Table) []*ir.Column {
 // manifestBackupID returns m's stored or computed BackupID. Pre-
 // Phase-3 manifests have an empty BackupID; we compute it on demand
 // so chain code can identify links uniformly.
-func manifestBackupID(m *ir.Manifest) string {
+func manifestBackupID(m *irbackup.Manifest) string {
 	if m == nil {
 		return ""
 	}
 	if m.BackupID != "" {
 		return m.BackupID
 	}
-	return ir.ComputeBackupID(m)
+	return irbackup.ComputeBackupID(m)
 }
 
 // changeChunkCEK resolves the CEK for a change chunk: per-chain mode
 // returns the cached r.chainCEK; per-chunk mode unwraps the chunk's
 // own wrapped CEK; plaintext returns nil.
-func (r *ChainRestore) changeChunkCEK(chunk *ir.ChunkInfo) ([]byte, error) {
+func (r *ChainRestore) changeChunkCEK(chunk *irbackup.ChunkInfo) ([]byte, error) {
 	if chunk.Encryption == nil {
 		return nil, nil
 	}

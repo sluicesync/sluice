@@ -11,6 +11,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // TestVerifyBackupWith_DecryptProbe_Bug117 pins the Bug 117 (v0.94.1)
@@ -54,7 +55,7 @@ func TestVerifyBackupWith_DecryptProbe_Bug117(t *testing.T) {
 		},
 	}
 
-	runBackup := func(t *testing.T, mode string, env crypto.EnvelopeEncryption) ir.BackupStore {
+	runBackup := func(t *testing.T, mode string, env crypto.EnvelopeEncryption) irbackup.BackupStore {
 		t.Helper()
 		dir := t.TempDir()
 		store, err := NewLocalStore(dir)
@@ -93,7 +94,7 @@ func TestVerifyBackupWith_DecryptProbe_Bug117(t *testing.T) {
 	// Re-derive an envelope against a chain's recorded Argon2id params
 	// (the same shape buildReadEnvelope uses). Required so the read
 	// envelope unwraps the chain's WrappedCEK.
-	rebindForChain := func(t *testing.T, store ir.BackupStore, pass string) crypto.EnvelopeEncryption {
+	rebindForChain := func(t *testing.T, store irbackup.BackupStore, pass string) crypto.EnvelopeEncryption {
 		t.Helper()
 		m, err := ReadRootManifest(context.Background(), store)
 		if err != nil {
@@ -231,16 +232,16 @@ func TestProbeChunkDecrypt_NilSafe(t *testing.T) {
 	if err := probeChunkDecrypt(nil, nil); err != nil {
 		t.Errorf("nil env + nil chunk: %v", err)
 	}
-	if err := probeChunkDecrypt(nil, &ir.ChunkInfo{}); err != nil {
+	if err := probeChunkDecrypt(nil, &irbackup.ChunkInfo{}); err != nil {
 		t.Errorf("nil env + non-nil chunk: %v", err)
 	}
 	env := &modeStubEnvelope{mode: "test"}
-	if err := probeChunkDecrypt(env, &ir.ChunkInfo{}); err != nil {
+	if err := probeChunkDecrypt(env, &irbackup.ChunkInfo{}); err != nil {
 		t.Errorf("env + plaintext chunk (Encryption nil): %v", err)
 	}
 	// Per-chain mode chunk: Encryption non-nil but WrappedCEK empty
 	// → probe is a no-op (chain-level probe covers it).
-	if err := probeChunkDecrypt(env, &ir.ChunkInfo{Encryption: &ir.ChunkEncryption{}}); err != nil {
+	if err := probeChunkDecrypt(env, &irbackup.ChunkInfo{Encryption: &irbackup.ChunkEncryption{}}); err != nil {
 		t.Errorf("env + per-chain-mode chunk (empty WrappedCEK): %v", err)
 	}
 }

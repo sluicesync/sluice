@@ -13,7 +13,7 @@
 //     (snapshot open error / engine without an opener) instead of
 //     silently degrading into a chain that cannot exist,
 //   - the incremental orchestrator runs the engine's
-//     [ir.ChainResumePreflighter] before opening CDC and surfaces its
+//     [irbackup.ChainResumePreflighter] before opening CDC and surfaces its
 //     refusal verbatim.
 //
 // The Postgres-side behaviour (slot actually kept/dropped, the
@@ -29,6 +29,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 func chainSlotTestEngine(t *testing.T) (*snapshotOpeningEngine, *ir.Schema) {
@@ -131,7 +132,7 @@ func TestBackup_ChainSlot_CommitTimingOnFailedRun(t *testing.T) {
 		if err != nil {
 			t.Fatalf("readManifest: %v", err)
 		}
-		if m.PartialState != ir.BackupStateInProgress {
+		if m.PartialState != irbackup.BackupStateInProgress {
 			t.Errorf("PartialState = %q; want in_progress", m.PartialState)
 		}
 		if m.EndPosition != src.snapshotPos {
@@ -197,7 +198,7 @@ func TestBackup_ChainSlot_RefusesSnapshotFallback(t *testing.T) {
 	})
 }
 
-// preflightingBackupEngine implements [ir.ChainResumePreflighter] on
+// preflightingBackupEngine implements [irbackup.ChainResumePreflighter] on
 // top of the standard recorder engine so the incremental orchestrator
 // discovers and runs the preflight.
 type preflightingBackupEngine struct {

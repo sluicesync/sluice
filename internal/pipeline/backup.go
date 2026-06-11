@@ -5,7 +5,7 @@ package pipeline
 
 // Backup orchestrator. Phase 1 of the logical-backup feature
 // (`docs/dev/design/logical-backups.md`): full snapshot to a
-// [ir.BackupStore], one chunk file per N rows per table, plus a
+// [irbackup.BackupStore], one chunk file per N rows per table, plus a
 // JSON manifest that lists schema + chunks + per-chunk SHA-256.
 //
 // Shape mirrors [Migrator]:
@@ -79,6 +79,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/redact"
 )
 
@@ -91,9 +92,9 @@ import (
 // The orchestrator generates the per-chain CEK on first use (per-chain
 // mode; the default), wraps it via the envelope, and records the
 // wrapped CEK + Argon2id params (passphrase mode) in the chain
-// manifest's [ir.ChainEncryption] field. Per-chunk mode generates a
+// manifest's [irbackup.ChainEncryption] field. Per-chunk mode generates a
 // fresh CEK + wrap per chunk; the wrapped CEK lands in
-// [ir.ChunkEncryption.WrappedCEK].
+// [irbackup.ChunkEncryption.WrappedCEK].
 type BackupEncryption struct {
 	// Envelope is the [crypto.EnvelopeEncryption] implementation used
 	// to wrap CEKs. Phase 6.1: a *crypto.PassphraseEnvelope. Required
@@ -101,11 +102,11 @@ type BackupEncryption struct {
 	//
 	// Cold-start path: the orchestrator uses Envelope as-is to wrap a
 	// fresh chain CEK and stamps the envelope's params on the chain
-	// root's [ir.ChainEncryption].
+	// root's [irbackup.ChainEncryption].
 	//
 	// Chain-extension path: when the orchestrator detects an existing
 	// chain root (or in-progress full's prior manifest) carrying
-	// recorded [ir.Argon2idParams], it rebuilds the envelope via
+	// recorded [irbackup.Argon2idParams], it rebuilds the envelope via
 	// [BackupEncryption.RebuildForChain] (when supplied) so the KEK
 	// derives against the chain's salt rather than a freshly-minted
 	// one. Without RebuildForChain, the orchestrator uses Envelope
@@ -119,7 +120,7 @@ type BackupEncryption struct {
 	// when extending an existing encrypted chain (incremental / stream
 	// against a chain with recorded Argon2id params, or backup-full
 	// resume against an in-progress encrypted manifest). The supplied
-	// params are the chain root's recorded [ir.Argon2idParams] (the
+	// params are the chain root's recorded [irbackup.Argon2idParams] (the
 	// salt that was used to derive the chain's KEK). Implementations
 	// should rebuild a [crypto.EnvelopeEncryption] tied to that salt
 	// + the operator's passphrase / KMS key.
@@ -130,14 +131,14 @@ type BackupEncryption struct {
 	// Phase 6.1: passphrase mode populates this with a closure over
 	// the operator's passphrase. KMS modes (Phase 6.2/6.3) leave it
 	// nil — KMS unwrap doesn't depend on a chain-recorded salt.
-	RebuildForChain func(parentParams *ir.Argon2idParams) (crypto.EnvelopeEncryption, error)
+	RebuildForChain func(parentParams *irbackup.Argon2idParams) (crypto.EnvelopeEncryption, error)
 
 	// Mode is "per-chain" (default) or "per-chunk". See
 	// `docs/dev/design/logical-backups-phase-6.md` for the trade-off.
 	Mode string
 
 	// KEKRef is the operator-visible reference recorded in
-	// [ir.ChainEncryption.KEKRef]. Empty for passphrase mode (the
+	// [irbackup.ChainEncryption.KEKRef]. Empty for passphrase mode (the
 	// salt + Argon2id params are the reference); KMS modes record the
 	// key ARN / resource name.
 	KEKRef string
@@ -156,7 +157,7 @@ type BackupEncryption struct {
 // [EncryptionFlags.buildReadEnvelope] pattern: detect chain extension
 // via recorded Argon2id params, rebuild the envelope tied to those
 // params before any CEK unwrap.
-func (e *BackupEncryption) rebindForChain(parentParams *ir.Argon2idParams) error {
+func (e *BackupEncryption) rebindForChain(parentParams *irbackup.Argon2idParams) error {
 	if e == nil || parentParams == nil || e.RebuildForChain == nil {
 		return nil
 	}
@@ -192,9 +193,9 @@ type Backup struct {
 	// Required.
 	SourceDSN string
 
-	// Store is the [ir.BackupStore] backup chunks and manifest are
+	// Store is the [irbackup.BackupStore] backup chunks and manifest are
 	// written to. Required.
-	Store ir.BackupStore
+	Store irbackup.BackupStore
 
 	// Filter selects which source tables participate in the backup.
 	// Empty filter (zero value) keeps every table the schema reader
@@ -212,7 +213,7 @@ type Backup struct {
 	SluiceVersion string
 
 	// SlotName is the source-side replication-slot name to record on
-	// the manifest's [ir.Manifest.EndPosition] for engines with a slot
+	// the manifest's [irbackup.Manifest.EndPosition] for engines with a slot
 	// concept (Postgres). Phase 3.3: the captured EndPosition pairs the
 	// slot name with the source's current LSN at end-of-backup so a
 	// subsequent incremental can resume CDC from that LSN against a
@@ -237,7 +238,7 @@ type Backup struct {
 	// in-progress manifest durably records the anchor; after that it
 	// is kept even across a failure — it is the WAL-retention
 	// guarantee a resumed run adopts (task #42, ADR-0085). See
-	// [ir.BackupSnapshotOptions].
+	// [irbackup.BackupSnapshotOptions].
 	ChainSlot bool
 
 	// TableParallelism caps how many tables stream CONCURRENTLY during
@@ -379,7 +380,7 @@ func (b *Backup) Run(ctx context.Context) error {
 	// table reads to a cross-table consistent view, closing the
 	// during-backup write-window gap that v0.17.x's basic OpenRowReader
 	// path leaves open. Engines that don't implement
-	// [ir.BackupSnapshotOpener] — OR engines that implement it but
+	// [irbackup.BackupSnapshotOpener] — OR engines that implement it but
 	// whose OpenBackupSnapshot returns an error (e.g. PG without
 	// `wal_level=logical`) — fall through to the v0.17.x shape with a
 	// soft warning so operators know the chain rooted in this full will
@@ -411,20 +412,20 @@ func (b *Backup) Run(ctx context.Context) error {
 	// Pre-build the in-progress manifest with the schema. Tables get
 	// appended (or copied from the prior run) as they finish; the
 	// manifest is committed after each table completes.
-	manifest := &ir.Manifest{
+	manifest := &irbackup.Manifest{
 		// Bug 116 closure: stamp the smallest format version safe for
 		// this schema. Schemas using RLS / policies / exclude
 		// constraints get FormatVersion=2 so older binaries refuse
 		// rather than silently drop those fields; innocent schemas
 		// stay on FormatVersion=1 for max backward compatibility.
-		FormatVersion: ir.FormatVersionFor(schema),
+		FormatVersion: irbackup.FormatVersionFor(schema),
 		SluiceVersion: b.SluiceVersion,
 		CreatedAt:     now().UTC(),
 		SourceEngine:  b.Source.Name(),
 		Schema:        schema,
-		Tables:        make([]*ir.TableManifest, 0, len(schema.Tables)),
-		PartialState:  ir.BackupStateInProgress,
-		Kind:          ir.BackupKindFull,
+		Tables:        make([]*irbackup.TableManifest, 0, len(schema.Tables)),
+		PartialState:  irbackup.BackupStateInProgress,
+		Kind:          irbackup.BackupKindFull,
 	}
 	if prior != nil {
 		// Preserve the original CreatedAt across resume so the
@@ -447,7 +448,7 @@ func (b *Backup) Run(ctx context.Context) error {
 
 	// Phase 6.1: when encryption is enabled, generate the chain-level
 	// CEK (per-chain mode) up-front, wrap it via the envelope, and
-	// stamp the manifest's [ir.ChainEncryption] header. Per-chunk
+	// stamp the manifest's [irbackup.ChainEncryption] header. Per-chunk
 	// mode leaves the chain-level WrappedCEK empty; each chunk
 	// generates its own CEK at write time.
 	chainCEK, err := b.setupChainEncryption(manifest, prior)
@@ -483,7 +484,7 @@ func (b *Backup) Run(ctx context.Context) error {
 	// with pre-v0.16.1 manifests) AND all its chunks still on the store
 	// is a "fully complete" table (skip whole table). Partial=true with
 	// some chunks present falls into the per-chunk resume path.
-	if prior != nil && prior.PartialState == ir.BackupStateInProgress {
+	if prior != nil && prior.PartialState == irbackup.BackupStateInProgress {
 		var alreadyComplete, toResume []string
 		for _, table := range schema.Tables {
 			key := manifestTableKey(table.Schema, table.Name)
@@ -587,7 +588,7 @@ func (b *Backup) Run(ctx context.Context) error {
 	//     The during-backup window gap is closed.
 	//   - v0.17.x fallback: the engine doesn't implement
 	//     BackupSnapshotOpener so we capture the position now,
-	//     post-sweep, via the optional [ir.BackupPositionCapturer].
+	//     post-sweep, via the optional [irbackup.BackupPositionCapturer].
 	//     This is the v0.17.2 shape with the documented during-backup
 	//     write-window gap; the openSnapshotOrFallback step has
 	//     already logged a WARN line so operators know.
@@ -622,12 +623,12 @@ func (b *Backup) Run(ctx context.Context) error {
 	// fulls leave it empty, which the chain-restore walker tolerates by
 	// computing on demand. Filling it in here means the full's manifest
 	// carries the same id the incremental would compute when chaining.
-	manifest.BackupID = ir.ComputeBackupID(manifest)
+	manifest.BackupID = irbackup.ComputeBackupID(manifest)
 
 	// 5. Final manifest write — flip to complete. Routed through the
 	// committer like every other manifest Put this run (the pool has
 	// drained, so this is single-threaded; one code path regardless).
-	manifest.PartialState = ir.BackupStateComplete
+	manifest.PartialState = irbackup.BackupStateComplete
 	if err := committer.commit(ctx); err != nil {
 		return fmt.Errorf("backup: write final manifest: %w", err)
 	}
@@ -680,7 +681,7 @@ func (b *Backup) Run(ctx context.Context) error {
 // committed, or dropped by the resumed run: its snapshot opens in the
 // temporary-anchor shape (PersistChainSlot=false), so even a failed
 // resume leaves the chain slot standing.
-func (b *Backup) resolveResumeState(ctx context.Context) (prior *ir.Manifest, resumeAnchor ir.Position, err error) {
+func (b *Backup) resolveResumeState(ctx context.Context) (prior *irbackup.Manifest, resumeAnchor ir.Position, err error) {
 	prior, err = readManifestIfPresent(ctx, b.Store)
 	if err != nil {
 		return nil, ir.Position{}, fmt.Errorf("backup: inspect existing manifest: %w", err)
@@ -689,7 +690,7 @@ func (b *Backup) resolveResumeState(ctx context.Context) (prior *ir.Manifest, re
 		return nil, ir.Position{}, nil
 	}
 	switch prior.PartialState {
-	case ir.BackupStateInProgress:
+	case irbackup.BackupStateInProgress:
 		if b.ForceOverwrite {
 			// Task #42 (ADR-0085): --force-overwrite now also discards
 			// an in-progress prior — it is the escape hatch the resume
@@ -717,9 +718,9 @@ func (b *Backup) resolveResumeState(ctx context.Context) (prior *ir.Manifest, re
 		// persistent anchor replication slot on the source, each one
 		// silently pinning WAL until the disk fills — give the engine
 		// its chance to sweep that debris now. Best-effort hygiene via
-		// the optional [ir.BackupAnchorSweeper] surface: a sweep
+		// the optional [irbackup.BackupAnchorSweeper] surface: a sweep
 		// failure must not fail the resume itself.
-		if sweeper, ok := b.Source.(ir.BackupAnchorSweeper); ok {
+		if sweeper, ok := b.Source.(irbackup.BackupAnchorSweeper); ok {
 			if err := sweeper.SweepOrphanedBackupAnchors(ctx, b.SourceDSN); err != nil {
 				slog.WarnContext(
 					ctx, "backup: orphaned-anchor sweep failed; stale anchor slots may still be retaining WAL on the source",
@@ -729,7 +730,7 @@ func (b *Backup) resolveResumeState(ctx context.Context) (prior *ir.Manifest, re
 			}
 		}
 		resumeAnchor = prior.EndPosition
-	case ir.BackupStateComplete, "":
+	case irbackup.BackupStateComplete, "":
 		if !b.ForceOverwrite {
 			return nil, ir.Position{}, fmt.Errorf("backup: a completed backup already exists at this destination (created %s); pass --force-overwrite to replace it",
 				prior.CreatedAt.UTC().Format(time.RFC3339))
@@ -760,7 +761,7 @@ func (b *Backup) resolveResumeState(ctx context.Context) (prior *ir.Manifest, re
 // the table sweep against, plus an optional snapshot-anchored
 // EndPosition captured at snapshot start.
 //
-// v0.18.0: when the engine implements [ir.BackupSnapshotOpener], we
+// v0.18.0: when the engine implements [irbackup.BackupSnapshotOpener], we
 // open a backup-scoped consistent snapshot. The returned RowReader is
 // pinned to the snapshot view (cross-table consistency holds) and the
 // returned position is the snapshot's anchor LSN/GTID — recorded on
@@ -785,7 +786,7 @@ func (b *Backup) resolveResumeState(ctx context.Context) (prior *ir.Manifest, re
 //
 // Either way, the fallback gets a basic OpenRowReader (no shared
 // snapshot, no cross-table consistency) plus a post-sweep
-// [ir.BackupPositionCapturer] capture (later, in
+// [irbackup.BackupPositionCapturer] capture (later, in
 // [Backup.captureEndPosition]).
 //
 // Returns (reader, snapshotPos, cleanup, err). When snapshotPos is
@@ -797,15 +798,15 @@ func (b *Backup) resolveResumeState(ctx context.Context) (prior *ir.Manifest, re
 // openBackupSnapshotScoped opens a backup-scoped consistent snapshot,
 // preferring the table-scoped surface when a table scope is in effect.
 // It is the backup-path sibling of [openSnapshotStreamScoped] (the
-// cold-start dispatcher) — same selection logic, [ir.BackupSnapshot]
+// cold-start dispatcher) — same selection logic, [irbackup.BackupSnapshot]
 // shape.
 //
-//   - source implements [ir.TableScopedBackupSnapshotOpener] AND there
+//   - source implements [irbackup.TableScopedBackupSnapshotOpener] AND there
 //     are filtered tables (len(tables) > 0) → OpenBackupSnapshotForTables,
 //     so a PlanetScale backup scopes its VStream COPY to the included
 //     tables (avoids the ADR-0071 over-stream/buffer-overflow on a large
 //     unrelated keyspace table).
-//   - else source implements [ir.BackupSnapshotOpener] → OpenBackupSnapshot
+//   - else source implements [irbackup.BackupSnapshotOpener] → OpenBackupSnapshot
 //     (unchanged whole-snapshot path — PG, vanilla MySQL via base).
 //   - else → not implemented (ok=false); the caller takes the v0.17.x
 //     non-snapshot fallback.
@@ -822,26 +823,26 @@ func (b *Backup) resolveResumeState(ctx context.Context) (prior *ir.Manifest, re
 // chain slot (task #42, ADR-0085) and opens this run's snapshot in the
 // temporary-anchor shape so the adopted slot is never re-created — and
 // never dropped by this run's failure path.
-func (b *Backup) openBackupSnapshotScoped(ctx context.Context, schema *ir.Schema, persistChainSlot bool) (snap *ir.BackupSnapshot, implemented bool, err error) {
-	opts := ir.BackupSnapshotOptions{
+func (b *Backup) openBackupSnapshotScoped(ctx context.Context, schema *ir.Schema, persistChainSlot bool) (snap *irbackup.BackupSnapshot, implemented bool, err error) {
+	opts := irbackup.BackupSnapshotOptions{
 		SlotName:         b.SlotName,
 		PersistChainSlot: persistChainSlot,
 	}
 	tables := tableNamesForPublication(schema)
 	if len(tables) > 0 {
-		if scoped, ok := b.Source.(ir.TableScopedBackupSnapshotOpener); ok {
+		if scoped, ok := b.Source.(irbackup.TableScopedBackupSnapshotOpener); ok {
 			snap, err = scoped.OpenBackupSnapshotForTables(ctx, b.SourceDSN, opts, tables)
 			return snap, true, err
 		}
 	}
-	if opener, ok := b.Source.(ir.BackupSnapshotOpener); ok {
+	if opener, ok := b.Source.(irbackup.BackupSnapshotOpener); ok {
 		snap, err = opener.OpenBackupSnapshot(ctx, b.SourceDSN, opts)
 		return snap, true, err
 	}
 	return nil, false, nil
 }
 
-func (b *Backup) openSnapshotOrFallback(ctx context.Context, schema *ir.Schema, persistChainSlot bool) (ir.RowReader, *ir.Position, *ir.BackupSnapshot, func(), error) {
+func (b *Backup) openSnapshotOrFallback(ctx context.Context, schema *ir.Schema, persistChainSlot bool) (ir.RowReader, *ir.Position, *irbackup.BackupSnapshot, func(), error) {
 	if snap, ok, err := b.openBackupSnapshotScoped(ctx, schema, persistChainSlot); ok {
 		if err == nil {
 			slog.InfoContext(
@@ -916,13 +917,13 @@ func (b *Backup) openSnapshotOrFallback(ctx context.Context, schema *ir.Schema, 
 // captureEndPosition queries the source for its current CDC position
 // and stores it on manifest.EndPosition. v0.18.0: this path is the
 // FALLBACK shape used only when the engine doesn't implement
-// [ir.BackupSnapshotOpener] — engines that do (PG, MySQL in v0.18.0+)
+// [irbackup.BackupSnapshotOpener] — engines that do (PG, MySQL in v0.18.0+)
 // route through [openSnapshotOrFallback] instead and capture the
 // position at snapshot START rather than post-sweep.
 //
 // Engines that don't support CDC (Capabilities.CDC == ir.CDCNone) skip
 // the capture; engines that do but don't implement
-// [ir.BackupPositionCapturer] also skip with a debug log line so the
+// [irbackup.BackupPositionCapturer] also skip with a debug log line so the
 // gap is visible to operators running with --log-level=debug.
 //
 // In the fallback shape the capture happens AFTER the per-table row
@@ -932,7 +933,7 @@ func (b *Backup) openSnapshotOrFallback(ctx context.Context, schema *ir.Schema, 
 // (no shared snapshot) and NOT covered by the chain's next link's
 // `--since=<full>.EndPosition` window (those LSNs are before this
 // captured EndPosition) — the documented v0.17.2 caveat.
-func (b *Backup) captureEndPosition(ctx context.Context, manifest *ir.Manifest) error {
+func (b *Backup) captureEndPosition(ctx context.Context, manifest *irbackup.Manifest) error {
 	if b.Source.Capabilities().CDC == ir.CDCNone {
 		slog.DebugContext(
 			ctx, "backup: source does not support CDC; skipping EndPosition capture",
@@ -950,7 +951,7 @@ func (b *Backup) captureEndPosition(ctx context.Context, manifest *ir.Manifest) 
 	}
 	defer closeIf(sr)
 
-	capturer, ok := sr.(ir.BackupPositionCapturer)
+	capturer, ok := sr.(irbackup.BackupPositionCapturer)
 	if !ok {
 		slog.DebugContext(
 			ctx, "backup: source SchemaReader does not implement BackupPositionCapturer; manifest EndPosition will be empty",
@@ -1071,13 +1072,13 @@ func (b *Backup) backupTable(
 				return fmt.Errorf("store put %q: %w", chunkPath, err)
 			}
 		}
-		ci := &ir.ChunkInfo{
+		ci := &irbackup.ChunkInfo{
 			File:     chunkPath,
 			RowCount: writer.RowCount(),
 			SHA256:   hash,
 		}
 		if b.Encryption != nil {
-			ci.Encryption = &ir.ChunkEncryption{
+			ci.Encryption = &irbackup.ChunkEncryption{
 				Algorithm:  crypto.AlgorithmAESGCM,
 				NonceLen:   crypto.NonceLen,
 				AuthTagLen: crypto.AuthTagLen,
@@ -1207,7 +1208,7 @@ func nonGeneratedTableColumns(table *ir.Table) []*ir.Column {
 // writeManifest serialises manifest as JSON (indented for human
 // readability) and writes it to the store. The manifest is the
 // public contract; readability matters.
-func writeManifest(ctx context.Context, store ir.BackupStore, manifest *ir.Manifest) error {
+func writeManifest(ctx context.Context, store irbackup.BackupStore, manifest *irbackup.Manifest) error {
 	b, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal manifest: %w", err)
@@ -1220,7 +1221,7 @@ func writeManifest(ctx context.Context, store ir.BackupStore, manifest *ir.Manif
 // [readManifest] which surfaces a NotFound as an error: resume code
 // needs to distinguish "no prior backup" (fresh start) from "prior
 // manifest is unreadable" (operator-actionable failure).
-func readManifestIfPresent(ctx context.Context, store ir.BackupStore) (*ir.Manifest, error) {
+func readManifestIfPresent(ctx context.Context, store irbackup.BackupStore) (*irbackup.Manifest, error) {
 	exists, err := store.Exists(ctx, ManifestFileName)
 	if err != nil {
 		return nil, err
@@ -1245,8 +1246,8 @@ func readManifestIfPresent(ctx context.Context, store ir.BackupStore) (*ir.Manif
 // Renamed from priorCompletedTables in v0.16.1: per-chunk-resume needs
 // partial-table entries too, not just fully-completed-tables. Callers
 // must check chunk-level state themselves before reusing entries.
-func priorResumableTables(prior *ir.Manifest) []*ir.TableManifest {
-	if prior == nil || prior.PartialState != ir.BackupStateInProgress {
+func priorResumableTables(prior *irbackup.Manifest) []*irbackup.TableManifest {
+	if prior == nil || prior.PartialState != irbackup.BackupStateInProgress {
 		return nil
 	}
 	return prior.Tables
@@ -1286,7 +1287,7 @@ func refuseAnchoredResumeOnSchemaDrift(current, prior *ir.Schema) error {
 // decode hooks materialize concrete zero values for fields a freshly-
 // read schema leaves nil (e.g. a nil Column.Default decodes to an
 // explicit kind=None value that re-marshals non-empty), so
-// [ir.ComputeSchemaHash] over a reader-fresh schema does NOT equal the
+// [irbackup.ComputeSchemaHash] over a reader-fresh schema does NOT equal the
 // hash of the same schema after it has been stored in (and re-read
 // from) a manifest. The drift guard compares a fresh read against
 // prior.Schema — which IS round-tripped — so both sides must be
@@ -1303,13 +1304,13 @@ func manifestSchemaFingerprint(s *ir.Schema) (string, error) {
 	if err := json.Unmarshal(raw, &rt); err != nil {
 		return "", fmt.Errorf("round-trip decode: %w", err)
 	}
-	return ir.ComputeSchemaHash(&rt)
+	return irbackup.ComputeSchemaHash(&rt)
 }
 
 // refuseKeylessRestreamOnAnchoredResume refuses an anchored resume when
 // any table that must be (re-)streamed THIS run is truly keyless — no
 // PRIMARY KEY and no all-NOT-NULL plain-column UNIQUE index
-// ([ir.TableReplayIdempotent]). Such a table's chunks are read at this
+// ([irbackup.TableReplayIdempotent]). Such a table's chunks are read at this
 // run's later snapshot and therefore OVERLAP the chain's replay window
 // (adopted anchor, stop]; the chain appliers' keyless fallback is plain
 // INSERT (ADR-0010), so the overlap would duplicate rows silently.
@@ -1318,7 +1319,7 @@ func manifestSchemaFingerprint(s *ir.Schema) (string, error) {
 func refuseKeylessRestreamOnAnchoredResume(tasks []backupTableTask) error {
 	var keyless []string
 	for _, task := range tasks {
-		if !ir.TableReplayIdempotent(task.table) {
+		if !irbackup.TableReplayIdempotent(task.table) {
 			keyless = append(keyless, task.table.Name)
 		}
 	}
@@ -1337,9 +1338,9 @@ func refuseKeylessRestreamOnAnchoredResume(tasks []backupTableTask) error {
 // backupStoreDescriptor returns a short human-readable identifier of
 // the destination store for log lines. LocalStore reports the absolute
 // root directory; BlobStore reports the (annotated) URL with credentials
-// stripped. Other implementations of [ir.BackupStore] fall back to
+// stripped. Other implementations of [irbackup.BackupStore] fall back to
 // `<unknown-store>` so log shape is stable.
-func backupStoreDescriptor(s ir.BackupStore) string {
+func backupStoreDescriptor(s irbackup.BackupStore) string {
 	type rooted interface{ Root() string }
 	type urled interface{ URL() string }
 	if r, ok := s.(rooted); ok {
@@ -1357,7 +1358,7 @@ func backupStoreDescriptor(s ir.BackupStore) string {
 // who manually deleted chunks between runs trip this and the table
 // gets re-streamed instead of silently appearing in the manifest with
 // no actual data behind it.
-func tableChunksAllPresent(ctx context.Context, store ir.BackupStore, entry *ir.TableManifest) (bool, error) {
+func tableChunksAllPresent(ctx context.Context, store irbackup.BackupStore, entry *irbackup.TableManifest) (bool, error) {
 	for _, c := range entry.Chunks {
 		exists, err := store.Exists(ctx, c.File)
 		if err != nil {
@@ -1382,7 +1383,7 @@ func tableChunksAllPresent(ctx context.Context, store ir.BackupStore, entry *ir.
 // boundaries, so the default is correct); (2) every chunk listed is
 // still present on the store (an operator who manually deleted chunks
 // between runs forces a re-stream).
-func tableManifestFullyComplete(ctx context.Context, store ir.BackupStore, entry *ir.TableManifest) (bool, error) {
+func tableManifestFullyComplete(ctx context.Context, store irbackup.BackupStore, entry *irbackup.TableManifest) (bool, error) {
 	if entry.Partial {
 		return false, nil
 	}
@@ -1398,7 +1399,7 @@ func tableManifestFullyComplete(ctx context.Context, store ir.BackupStore, entry
 // The fetch-and-hash cost is bounded to chunk size (default 100k rows,
 // typically a few MB compressed); cheap relative to a full re-upload
 // of the same chunk over a slow link.
-func chunkAlreadyMatches(ctx context.Context, store ir.BackupStore, key, expectedSHA256 string) (bool, error) {
+func chunkAlreadyMatches(ctx context.Context, store irbackup.BackupStore, key, expectedSHA256 string) (bool, error) {
 	exists, err := store.Exists(ctx, key)
 	if err != nil {
 		return false, err
@@ -1424,11 +1425,11 @@ func chunkAlreadyMatches(ctx context.Context, store ir.BackupStore, key, expecte
 // encryption header before constructing a restore-side envelope).
 //
 // Distinct from [readManifest] which surfaces a NotFound as an error.
-func ReadRootManifest(ctx context.Context, store ir.BackupStore) (*ir.Manifest, error) {
+func ReadRootManifest(ctx context.Context, store irbackup.BackupStore) (*irbackup.Manifest, error) {
 	return readManifestIfPresent(ctx, store)
 }
 
-// chainRootEncryption returns the chain-root's [ir.ChainEncryption]
+// chainRootEncryption returns the chain-root's [irbackup.ChainEncryption]
 // when an extending writer (incremental / stream) needs to align its
 // envelope. parent's ChainEncryption is returned directly when set
 // (the common case: parent is a full carrying the chain header).
@@ -1440,7 +1441,7 @@ func ReadRootManifest(ctx context.Context, store ir.BackupStore) (*ir.Manifest, 
 // already handles a nil ChainEncryption shape gracefully and a noisy
 // store read at this point would mask the simpler "parent is
 // plaintext" path.
-func chainRootEncryption(ctx context.Context, store ir.BackupStore, parent *ir.Manifest) *ir.ChainEncryption {
+func chainRootEncryption(ctx context.Context, store irbackup.BackupStore, parent *irbackup.Manifest) *irbackup.ChainEncryption {
 	if parent != nil && parent.ChainEncryption != nil {
 		return parent.ChainEncryption
 	}
@@ -1453,7 +1454,7 @@ func chainRootEncryption(ctx context.Context, store ir.BackupStore, parent *ir.M
 
 // readManifest loads and decodes the manifest from store. Used by
 // both restore and `sluice backup verify`.
-func readManifest(ctx context.Context, store ir.BackupStore) (*ir.Manifest, error) {
+func readManifest(ctx context.Context, store irbackup.BackupStore) (*irbackup.Manifest, error) {
 	rc, err := store.Get(ctx, ManifestFileName)
 	if err != nil {
 		return nil, fmt.Errorf("read manifest: %w", err)
@@ -1463,18 +1464,18 @@ func readManifest(ctx context.Context, store ir.BackupStore) (*ir.Manifest, erro
 	if err != nil {
 		return nil, fmt.Errorf("read manifest body: %w", err)
 	}
-	var m ir.Manifest
+	var m irbackup.Manifest
 	if err := json.Unmarshal(b, &m); err != nil {
 		return nil, fmt.Errorf("decode manifest: %w", err)
 	}
-	if m.FormatVersion > ir.BackupFormatVersion {
+	if m.FormatVersion > irbackup.BackupFormatVersion {
 		return nil, fmt.Errorf("backup: manifest format version %d is newer than this build supports (%d); upgrade sluice",
-			m.FormatVersion, ir.BackupFormatVersion)
+			m.FormatVersion, irbackup.BackupFormatVersion)
 	}
 	return &m, nil
 }
 
-// setupChainEncryption configures the manifest's [ir.ChainEncryption]
+// setupChainEncryption configures the manifest's [irbackup.ChainEncryption]
 // header and returns the chain-level CEK (per-chain mode) or nil
 // (per-chunk mode). When encryption is disabled (b.Encryption == nil),
 // returns nil with no manifest mutation.
@@ -1485,7 +1486,7 @@ func readManifest(ctx context.Context, store ir.BackupStore) (*ir.Manifest, erro
 // additional chunks against the same CEK as the original run. This is
 // the load-bearing equivalent of "open the prior CEK to keep encrypting
 // consistently with the chain so far."
-func (b *Backup) setupChainEncryption(manifest, prior *ir.Manifest) ([]byte, error) {
+func (b *Backup) setupChainEncryption(manifest, prior *irbackup.Manifest) ([]byte, error) {
 	if b.Encryption == nil {
 		return nil, nil
 	}
@@ -1497,7 +1498,7 @@ func (b *Backup) setupChainEncryption(manifest, prior *ir.Manifest) ([]byte, err
 	if mode == "" {
 		mode = crypto.EncryptModePerChain
 	}
-	chainEnc := &ir.ChainEncryption{
+	chainEnc := &irbackup.ChainEncryption{
 		Algorithm: crypto.AlgorithmAESGCM,
 		Mode:      mode,
 		KEKMode:   enc.Envelope.Mode(),
@@ -1507,7 +1508,7 @@ func (b *Backup) setupChainEncryption(manifest, prior *ir.Manifest) ([]byte, err
 	// envelope can re-derive the same KEK.
 	if pe, ok := enc.Envelope.(*crypto.PassphraseEnvelope); ok {
 		p := pe.Params()
-		chainEnc.Argon2id = &ir.Argon2idParams{
+		chainEnc.Argon2id = &irbackup.Argon2idParams{
 			Salt:        p.Salt,
 			Memory:      p.Memory,
 			Iterations:  p.Iterations,

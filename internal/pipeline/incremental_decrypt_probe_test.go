@@ -10,6 +10,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // TestIncrementalAlignEncryption_PerChunkDecryptProbe_Bug117_Ingestion
@@ -56,7 +57,7 @@ func TestIncrementalAlignEncryption_PerChunkDecryptProbe_Bug117_Ingestion(t *tes
 		},
 	}
 
-	runBackup := func(t *testing.T, mode string, env crypto.EnvelopeEncryption) ir.BackupStore {
+	runBackup := func(t *testing.T, mode string, env crypto.EnvelopeEncryption) irbackup.BackupStore {
 		t.Helper()
 		dir := t.TempDir()
 		store, err := NewLocalStore(dir)
@@ -92,7 +93,7 @@ func TestIncrementalAlignEncryption_PerChunkDecryptProbe_Bug117_Ingestion(t *tes
 		return env
 	}
 
-	rebindForChain := func(t *testing.T, store ir.BackupStore, pass string) crypto.EnvelopeEncryption {
+	rebindForChain := func(t *testing.T, store irbackup.BackupStore, pass string) crypto.EnvelopeEncryption {
 		t.Helper()
 		m, err := ReadRootManifest(context.Background(), store)
 		if err != nil {
@@ -116,7 +117,7 @@ func TestIncrementalAlignEncryption_PerChunkDecryptProbe_Bug117_Ingestion(t *tes
 		return env
 	}
 
-	readRoot := func(t *testing.T, store ir.BackupStore) *ir.Manifest {
+	readRoot := func(t *testing.T, store irbackup.BackupStore) *irbackup.Manifest {
 		t.Helper()
 		m, err := ReadRootManifest(context.Background(), store)
 		if err != nil {
@@ -211,10 +212,10 @@ func TestIncrementalAlignEncryption_PerChunkDecryptProbe_Bug117_Ingestion(t *tes
 // the helper regresses (e.g. forgets ChangeChunks or table iteration),
 // the ingestion-path probe silently no-ops and Bug 117 reopens.
 func TestFirstPerChunkProbe(t *testing.T) {
-	chunk := func(wrapped string) *ir.ChunkInfo {
-		return &ir.ChunkInfo{
+	chunk := func(wrapped string) *irbackup.ChunkInfo {
+		return &irbackup.ChunkInfo{
 			File: "chunks/_table_users/0.gz",
-			Encryption: &ir.ChunkEncryption{
+			Encryption: &irbackup.ChunkEncryption{
 				WrappedCEK: []byte(wrapped),
 			},
 		}
@@ -227,9 +228,9 @@ func TestFirstPerChunkProbe(t *testing.T) {
 	})
 
 	t.Run("full manifest with per-chunk-mode table chunks", func(t *testing.T) {
-		m := &ir.Manifest{
-			Tables: []*ir.TableManifest{
-				{Name: "users", Chunks: []*ir.ChunkInfo{chunk("wrapped-cek-bytes")}},
+		m := &irbackup.Manifest{
+			Tables: []*irbackup.TableManifest{
+				{Name: "users", Chunks: []*irbackup.ChunkInfo{chunk("wrapped-cek-bytes")}},
 			},
 		}
 		got := firstPerChunkProbe(m)
@@ -239,8 +240,8 @@ func TestFirstPerChunkProbe(t *testing.T) {
 	})
 
 	t.Run("incremental manifest with ChangeChunks fallback", func(t *testing.T) {
-		m := &ir.Manifest{
-			ChangeChunks: []*ir.ChunkInfo{chunk("incremental-cek")},
+		m := &irbackup.Manifest{
+			ChangeChunks: []*irbackup.ChunkInfo{chunk("incremental-cek")},
 		}
 		got := firstPerChunkProbe(m)
 		if got == nil || string(got.Encryption.WrappedCEK) != "incremental-cek" {
@@ -249,9 +250,9 @@ func TestFirstPerChunkProbe(t *testing.T) {
 	})
 
 	t.Run("per-chain-mode chunks (empty WrappedCEK) skipped", func(t *testing.T) {
-		m := &ir.Manifest{
-			Tables: []*ir.TableManifest{
-				{Name: "users", Chunks: []*ir.ChunkInfo{{File: "x", Encryption: &ir.ChunkEncryption{WrappedCEK: nil}}}},
+		m := &irbackup.Manifest{
+			Tables: []*irbackup.TableManifest{
+				{Name: "users", Chunks: []*irbackup.ChunkInfo{{File: "x", Encryption: &irbackup.ChunkEncryption{WrappedCEK: nil}}}},
 			},
 		}
 		if got := firstPerChunkProbe(m); got != nil {
@@ -260,9 +261,9 @@ func TestFirstPerChunkProbe(t *testing.T) {
 	})
 
 	t.Run("plaintext chunks (nil Encryption) skipped", func(t *testing.T) {
-		m := &ir.Manifest{
-			Tables: []*ir.TableManifest{
-				{Name: "users", Chunks: []*ir.ChunkInfo{{File: "x"}}},
+		m := &irbackup.Manifest{
+			Tables: []*irbackup.TableManifest{
+				{Name: "users", Chunks: []*irbackup.ChunkInfo{{File: "x"}}},
 			},
 		}
 		if got := firstPerChunkProbe(m); got != nil {
@@ -271,17 +272,17 @@ func TestFirstPerChunkProbe(t *testing.T) {
 	})
 
 	t.Run("empty manifest → nil (caller falls through)", func(t *testing.T) {
-		if got := firstPerChunkProbe(&ir.Manifest{}); got != nil {
+		if got := firstPerChunkProbe(&irbackup.Manifest{}); got != nil {
 			t.Errorf("firstPerChunkProbe(empty) = %v; want nil", got)
 		}
 	})
 
 	t.Run("Tables before ChangeChunks (full-manifest precedence)", func(t *testing.T) {
-		m := &ir.Manifest{
-			Tables: []*ir.TableManifest{
-				{Name: "users", Chunks: []*ir.ChunkInfo{chunk("table-cek")}},
+		m := &irbackup.Manifest{
+			Tables: []*irbackup.TableManifest{
+				{Name: "users", Chunks: []*irbackup.ChunkInfo{chunk("table-cek")}},
 			},
-			ChangeChunks: []*ir.ChunkInfo{chunk("change-cek")},
+			ChangeChunks: []*irbackup.ChunkInfo{chunk("change-cek")},
 		}
 		got := firstPerChunkProbe(m)
 		if got == nil || string(got.Encryption.WrappedCEK) != "table-cek" {

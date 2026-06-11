@@ -61,6 +61,7 @@ import (
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // PKStrategy controls how smart-compact identifies "the same row"
@@ -717,7 +718,7 @@ func isPerRowEvent(c ir.Change) bool {
 // Returns the aggregated per-group tally for the CompactPlanGroup.
 func applySmartCompactionToStagedGroup(
 	ctx context.Context,
-	stagingStore ir.BackupStore,
+	stagingStore irbackup.BackupStore,
 	pg *plannedGroup,
 	codec Codec,
 	cek []byte,
@@ -762,8 +763,8 @@ func applySmartCompactionToStagedGroup(
 // header + EOF; the reader treats it as an empty stream).
 func applySmartCompactionToIncremental(
 	ctx context.Context,
-	store ir.BackupStore,
-	im *ir.Manifest,
+	store irbackup.BackupStore,
+	im *irbackup.Manifest,
 	codec Codec,
 	cek []byte,
 	pkStrategy PKStrategy,

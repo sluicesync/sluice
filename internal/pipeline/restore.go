@@ -31,6 +31,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/translate"
 )
 
@@ -46,9 +47,9 @@ type Restore struct {
 	// Required.
 	TargetDSN string
 
-	// Store is the [ir.BackupStore] to read manifest + chunks from.
+	// Store is the [irbackup.BackupStore] to read manifest + chunks from.
 	// Required.
-	Store ir.BackupStore
+	Store irbackup.BackupStore
 
 	// Filter selects which tables from the manifest participate.
 	// Empty (zero value) restores every table.
@@ -106,7 +107,7 @@ type Restore struct {
 
 	// Envelope, when non-nil, is the [crypto.EnvelopeEncryption] used
 	// to unwrap CEKs from encrypted manifests. Required when the
-	// chain's full manifest carries [ir.ChainEncryption]. A nil
+	// chain's full manifest carries [irbackup.ChainEncryption]. A nil
 	// Envelope against an encrypted chain produces a clear refusal
 	// at chain-walk time naming the missing key — no partial data
 	// lands on the target.
@@ -265,7 +266,7 @@ func (r *Restore) Run(ctx context.Context) error {
 	}
 
 	// 1.5. Encryption pre-flight. If the chain root manifest carries
-	// [ir.ChainEncryption], the operator MUST have supplied an
+	// [irbackup.ChainEncryption], the operator MUST have supplied an
 	// envelope that can unwrap the chain's CEK. A missing envelope
 	// against an encrypted chain refuses up-front so no partial data
 	// lands on the target.
@@ -415,7 +416,7 @@ func (r *Restore) restoreTable(
 	ctx context.Context,
 	rw ir.RowWriter,
 	table *ir.Table,
-	entry *ir.TableManifest,
+	entry *irbackup.TableManifest,
 ) error {
 	if len(entry.Chunks) == 0 {
 		slog.InfoContext(ctx, "restore: empty table; no chunks to apply",
@@ -512,7 +513,7 @@ func (r *Restore) restoreTable(
 // the manifest entry's RowCount for layer-2 verification.
 func (r *Restore) streamChunkRows(
 	ctx context.Context,
-	chunk *ir.ChunkInfo,
+	chunk *irbackup.ChunkInfo,
 	rowCh chan<- ir.Row,
 ) (int64, error) {
 	src, err := r.Store.Get(ctx, chunk.File)
@@ -563,7 +564,7 @@ func (r *Restore) streamChunkRows(
 // filterManifestTables filters the manifest's table list against the
 // supplied filter, mirroring the schema-side filtering. Empty filter
 // returns the input unchanged.
-func filterManifestTables(in []*ir.TableManifest, filter TableFilter) []*ir.TableManifest {
+func filterManifestTables(in []*irbackup.TableManifest, filter TableFilter) []*irbackup.TableManifest {
 	if filter.IsEmpty() {
 		return in
 	}
@@ -581,8 +582,8 @@ func filterManifestTables(in []*ir.TableManifest, filter TableFilter) []*ir.Tabl
 
 // indexManifestTables returns a "schema.name" → entry map. Used by
 // [Restore.Run] to look up each schema-table's manifest entry in O(1).
-func indexManifestTables(tables []*ir.TableManifest) map[string]*ir.TableManifest {
-	out := make(map[string]*ir.TableManifest, len(tables))
+func indexManifestTables(tables []*irbackup.TableManifest) map[string]*irbackup.TableManifest {
+	out := make(map[string]*irbackup.TableManifest, len(tables))
 	for _, t := range tables {
 		if t == nil {
 			continue
@@ -599,7 +600,7 @@ func manifestTableKey(schema, name string) string {
 	return schema + "." + name
 }
 
-// preflightEncryption inspects the manifest for [ir.ChainEncryption]
+// preflightEncryption inspects the manifest for [irbackup.ChainEncryption]
 // and, when present, validates that an envelope is supplied and that
 // it can unwrap the chain's CEK. Caches the chain-level CEK on
 // r.chainCEK for per-chain mode so subsequent chunk reads pay no
@@ -609,7 +610,7 @@ func manifestTableKey(schema, name string) string {
 // envelope, it returns an operator-actionable error naming the chain's
 // KEKMode and (where relevant) KEKRef so the operator knows what they
 // need to supply.
-func (r *Restore) preflightEncryption(manifest *ir.Manifest) error {
+func (r *Restore) preflightEncryption(manifest *irbackup.Manifest) error {
 	if manifest == nil || manifest.ChainEncryption == nil {
 		return nil
 	}
@@ -640,13 +641,13 @@ func (r *Restore) preflightEncryption(manifest *ir.Manifest) error {
 }
 
 // chunkCEK returns the per-chunk CEK for chunk based on the chunk's
-// recorded [ir.ChunkEncryption]. Per-chain mode returns r.chainCEK;
-// per-chunk mode unwraps the chunk's own [ir.ChunkEncryption.WrappedCEK]
+// recorded [irbackup.ChunkEncryption]. Per-chain mode returns r.chainCEK;
+// per-chunk mode unwraps the chunk's own [irbackup.ChunkEncryption.WrappedCEK]
 // via the envelope.
 //
 // Returns nil for plaintext chunks (Encryption == nil) — caller passes
 // nil cek to newChunkReader for the legacy plaintext read path.
-func (r *Restore) chunkCEK(chunk *ir.ChunkInfo) ([]byte, error) {
+func (r *Restore) chunkCEK(chunk *irbackup.ChunkInfo) ([]byte, error) {
 	if chunk.Encryption == nil {
 		return nil, nil
 	}
@@ -719,7 +720,7 @@ type VerifyOptions struct {
 // backward compatibility (all existing tests rely on this signature).
 // Operators wanting the Bug 117 decrypt probe pass a non-nil
 // VerifyOptions.Envelope via [VerifyBackupWith].
-func VerifyBackup(ctx context.Context, store ir.BackupStore) (total, failed int, err error) {
+func VerifyBackup(ctx context.Context, store irbackup.BackupStore) (total, failed int, err error) {
 	return VerifyBackupWith(ctx, store, VerifyOptions{})
 }
 
@@ -728,7 +729,7 @@ func VerifyBackup(ctx context.Context, store ir.BackupStore) (total, failed int,
 // unwrapped against the supplied envelope so a passphrase rotation
 // mid-chain (Bug 117) surfaces at verify-time instead of partial-failing
 // the restore.
-func VerifyBackupWith(ctx context.Context, store ir.BackupStore, opts VerifyOptions) (total, failed int, err error) {
+func VerifyBackupWith(ctx context.Context, store irbackup.BackupStore, opts VerifyOptions) (total, failed int, err error) {
 	records, err := listAllSegmentManifests(ctx, store)
 	if err != nil {
 		return 0, 0, fmt.Errorf("verify: %w", err)
@@ -840,7 +841,7 @@ func VerifyBackupWith(ctx context.Context, store ir.BackupStore, opts VerifyOpti
 // already covered it). Returns a wrapping error on unwrap failure so
 // the caller can surface "wrong passphrase for THIS chunk" — the
 // Bug 117 signal.
-func probeChunkDecrypt(env crypto.EnvelopeEncryption, chunk *ir.ChunkInfo) error {
+func probeChunkDecrypt(env crypto.EnvelopeEncryption, chunk *irbackup.ChunkInfo) error {
 	if env == nil || chunk == nil || chunk.Encryption == nil {
 		return nil
 	}
@@ -855,7 +856,7 @@ func probeChunkDecrypt(env crypto.EnvelopeEncryption, chunk *ir.ChunkInfo) error
 
 // verifyChunk fetches a chunk and recomputes its SHA-256, returning
 // nil on match or a wrapped [ErrChunkHashMismatch] on mismatch.
-func verifyChunk(ctx context.Context, store ir.BackupStore, chunk *ir.ChunkInfo) error {
+func verifyChunk(ctx context.Context, store irbackup.BackupStore, chunk *irbackup.ChunkInfo) error {
 	src, err := store.Get(ctx, chunk.File)
 	if err != nil {
 		return fmt.Errorf("open: %w", err)

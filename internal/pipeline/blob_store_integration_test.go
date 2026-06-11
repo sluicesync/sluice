@@ -29,6 +29,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 
 	// Both engines registered for the cross-engine test.
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
@@ -442,7 +443,7 @@ func TestBlobStore_MinIO_ResumableBackup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readManifest: %v", err)
 	}
-	if final.PartialState != ir.BackupStateComplete {
+	if final.PartialState != irbackup.BackupStateComplete {
 		t.Errorf("PartialState = %q; want complete", final.PartialState)
 	}
 	if len(final.Tables) != 2 {

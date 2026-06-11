@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 
-	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // # PlanetScale backup snapshot via VStream COPY mode (GitHub issue #16)
@@ -51,7 +51,7 @@ import (
 //   - This function calls [Engine.openVStreamSnapshotStream] — the
 //     same code path the live-sync orchestrator uses. The returned
 //     SnapshotStream's Position, Rows, and CloseFn are everything
-//     [ir.BackupSnapshot] needs; the Changes channel is ignored
+//     [irbackup.BackupSnapshot] needs; the Changes channel is ignored
 //     (backup doesn't consume CDC, it just records the position so
 //     a downstream incremental can resume from there).
 //   - The gRPC stream stays open until BackupSnapshot.Close fires
@@ -75,7 +75,7 @@ import (
 // of [Engine.OpenBackupSnapshot] / [Engine.OpenBackupSnapshotForTables].
 // Opens a VStream COPY-mode snapshot stream (the same mechanism the
 // live-sync coldStart path uses), drains the COPY phase synchronously,
-// and wraps the result in an [ir.BackupSnapshot] for the backup
+// and wraps the result in an [irbackup.BackupSnapshot] for the backup
 // orchestrator.
 //
 // There is no slotName parameter — VStream doesn't expose a slot concept
@@ -101,7 +101,7 @@ import (
 // counterpart to the cold-start [Engine.OpenSnapshotStreamForTables]
 // scope — both seed a fresh scoped snapshot via
 // [openVStreamSnapshotStreamFrom] with a nil start cursor.
-func (e Engine) openBackupSnapshotVStream(ctx context.Context, dsn string, tables []string) (*ir.BackupSnapshot, error) {
+func (e Engine) openBackupSnapshotVStream(ctx context.Context, dsn string, tables []string) (*irbackup.BackupSnapshot, error) {
 	if len(tables) > 0 {
 		slog.InfoContext(ctx, "mysql/vstream: backup snapshot: scoping COPY to included tables",
 			slog.Int("table_count", len(tables)))
@@ -119,7 +119,7 @@ func (e Engine) openBackupSnapshotVStream(ctx context.Context, dsn string, table
 	// underlying gRPC stream stays open (the pump goroutine never
 	// starts since startPump is only called via Changes.StreamChanges),
 	// and CloseFn cleans it up when BackupSnapshot.Close fires.
-	return &ir.BackupSnapshot{
+	return &irbackup.BackupSnapshot{
 		Position: snap.Position,
 		Rows:     snap.Rows,
 		CloseFn:  snap.CloseFn,

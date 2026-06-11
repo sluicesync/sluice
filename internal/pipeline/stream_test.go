@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // TestBackupStream_Validate covers the same validation surface as
@@ -69,16 +70,16 @@ func TestBackupStream_RolloverOnMaxChanges(t *testing.T) {
 		Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
 	}}}
 
-	parent := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	parent := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		CreatedAt:     time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC),
 		SourceEngine:  "postgres",
 		Schema:        schema,
-		Kind:          ir.BackupKindFull,
+		Kind:          irbackup.BackupKindFull,
 		EndPosition:   ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/100"}`},
-		PartialState:  ir.BackupStateComplete,
+		PartialState:  irbackup.BackupStateComplete,
 	}
-	parent.BackupID = ir.ComputeBackupID(parent)
+	parent.BackupID = irbackup.ComputeBackupID(parent)
 	writeParentFullManifest(t, store, parent)
 
 	// 30 changes structured as 5 transactions each carrying 4 inserts
@@ -139,9 +140,9 @@ func TestBackupStream_RolloverOnMaxChanges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listAllManifestsViaWalk: %v", err)
 	}
-	var incrementals []*ir.Manifest
+	var incrementals []*irbackup.Manifest
 	for _, r := range records {
-		if r.manifest.Kind == ir.BackupKindIncremental {
+		if r.manifest.Kind == irbackup.BackupKindIncremental {
 			incrementals = append(incrementals, r.manifest)
 		}
 	}
@@ -192,15 +193,15 @@ func TestBackupStream_SkipEmptyRollover_OnChannelClose(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := NewLocalStore(dir)
 
-	parent := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	parent := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		CreatedAt:     time.Now().UTC(),
 		SourceEngine:  "postgres",
 		Schema:        &ir.Schema{},
-		Kind:          ir.BackupKindFull,
+		Kind:          irbackup.BackupKindFull,
 		EndPosition:   ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/100"}`},
 	}
-	parent.BackupID = ir.ComputeBackupID(parent)
+	parent.BackupID = irbackup.ComputeBackupID(parent)
 	writeParentFullManifest(t, store, parent)
 
 	src := &fakeCDCEngine{
@@ -224,7 +225,7 @@ func TestBackupStream_SkipEmptyRollover_OnChannelClose(t *testing.T) {
 	}
 	records, _ := listAllManifestsViaWalk(context.Background(), store)
 	for _, r := range records {
-		if r.manifest.Kind == ir.BackupKindIncremental {
+		if r.manifest.Kind == irbackup.BackupKindIncremental {
 			t.Errorf("unexpected incremental manifest committed for empty rollover: %+v", r.manifest)
 		}
 	}
@@ -237,15 +238,15 @@ func TestBackupStream_IncludeEmptyRollover_WritesManifest(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := NewLocalStore(dir)
 
-	parent := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	parent := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		CreatedAt:     time.Now().UTC(),
 		SourceEngine:  "postgres",
 		Schema:        &ir.Schema{},
-		Kind:          ir.BackupKindFull,
+		Kind:          irbackup.BackupKindFull,
 		EndPosition:   ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/100"}`},
 	}
-	parent.BackupID = ir.ComputeBackupID(parent)
+	parent.BackupID = irbackup.ComputeBackupID(parent)
 	writeParentFullManifest(t, store, parent)
 
 	src := &fakeCDCEngine{
@@ -269,7 +270,7 @@ func TestBackupStream_IncludeEmptyRollover_WritesManifest(t *testing.T) {
 	records, _ := listAllManifestsViaWalk(context.Background(), store)
 	var sawIncr bool
 	for _, r := range records {
-		if r.manifest.Kind == ir.BackupKindIncremental {
+		if r.manifest.Kind == irbackup.BackupKindIncremental {
 			sawIncr = true
 			// Empty rollover's EndPosition should fall back to
 			// StartPosition (= parent's EndPosition).
@@ -291,15 +292,15 @@ func TestBackupStream_PositionInvalid_LoudFailure(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := NewLocalStore(dir)
 
-	parent := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	parent := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		CreatedAt:     time.Now().UTC(),
 		SourceEngine:  "postgres",
 		Schema:        &ir.Schema{},
-		Kind:          ir.BackupKindFull,
+		Kind:          irbackup.BackupKindFull,
 		EndPosition:   ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/100"}`},
 	}
-	parent.BackupID = ir.ComputeBackupID(parent)
+	parent.BackupID = irbackup.ComputeBackupID(parent)
 	writeParentFullManifest(t, store, parent)
 
 	src := &fakeCDCEngine{
@@ -336,15 +337,15 @@ func TestBackupStream_ContextCancel_DuringRollover_CleanExit(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := NewLocalStore(dir)
 
-	parent := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	parent := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		CreatedAt:     time.Now().UTC(),
 		SourceEngine:  "postgres",
 		Schema:        &ir.Schema{},
-		Kind:          ir.BackupKindFull,
+		Kind:          irbackup.BackupKindFull,
 		EndPosition:   ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/100"}`},
 	}
-	parent.BackupID = ir.ComputeBackupID(parent)
+	parent.BackupID = irbackup.ComputeBackupID(parent)
 	writeParentFullManifest(t, store, parent)
 
 	src := &blockingCDCEngine{name: "postgres", schemaSequence: []*ir.Schema{{}}}
@@ -440,19 +441,19 @@ func (r *blockingCDCReader) Close() error { return nil }
 // stream tests where two rollovers commit in the same UnixMilli (the
 // test's pinned clock pins CreatedAt) so the lexically-sorted file
 // ordering doesn't match chain order.
-func sortIncrementalsByChain(t *testing.T, incrs []*ir.Manifest, rootParent string) {
+func sortIncrementalsByChain(t *testing.T, incrs []*irbackup.Manifest, rootParent string) {
 	t.Helper()
 	if len(incrs) == 0 {
 		return
 	}
-	byID := make(map[string]*ir.Manifest, len(incrs))
+	byID := make(map[string]*irbackup.Manifest, len(incrs))
 	for _, m := range incrs {
 		byID[m.BackupID] = m
 	}
-	ordered := make([]*ir.Manifest, 0, len(incrs))
+	ordered := make([]*irbackup.Manifest, 0, len(incrs))
 	parentID := rootParent
 	for {
-		var next *ir.Manifest
+		var next *irbackup.Manifest
 		for _, m := range incrs {
 			if m.ParentBackupID == parentID {
 				next = m

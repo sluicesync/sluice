@@ -50,6 +50,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // LineageCatalogFileName is the filename of the lineage catalog within
@@ -207,10 +208,10 @@ func (s *LineageSegment) incrementalCoverageStartOrStart() ir.Position {
 // open reports whether this is the open (last, uncapped) segment.
 func (s *LineageSegment) open() bool { return s.CappedAt == nil || s.CappedAt.IsZero() }
 
-// store returns the per-segment [ir.BackupStore] view: the lineage
+// store returns the per-segment [irbackup.BackupStore] view: the lineage
 // store narrowed to the segment's Dir (a no-op wrap when Dir == "",
 // the common one-segment / root-segment shape).
-func (s *LineageSegment) store(root ir.BackupStore) ir.BackupStore {
+func (s *LineageSegment) store(root irbackup.BackupStore) irbackup.BackupStore {
 	return newPrefixedStore(root, s.Dir)
 }
 
@@ -219,7 +220,7 @@ func (s *LineageSegment) store(root ir.BackupStore) ir.BackupStore {
 // absent; (nil, false, err) for I/O / parse / version failures. The
 // "absent" case is the legacy one-segment fall-through callers handle
 // by synthesising a single root segment over the conventional layout.
-func loadLineageCatalog(ctx context.Context, store ir.BackupStore) (*LineageCatalog, bool, error) {
+func loadLineageCatalog(ctx context.Context, store irbackup.BackupStore) (*LineageCatalog, bool, error) {
 	exists, err := store.Exists(ctx, LineageCatalogFileName)
 	if err != nil {
 		return nil, false, fmt.Errorf("inspect %q: %w", LineageCatalogFileName, err)
@@ -258,7 +259,7 @@ func loadLineageCatalog(ctx context.Context, store ir.BackupStore) (*LineageCata
 // no window in which the lineage is non-authoritative. Atomic at the
 // storage layer from any reader's perspective (object stores: a Put is
 // all-or-nothing; local FS: write-tmp + rename inside LocalStore).
-func writeLineageCatalog(ctx context.Context, store ir.BackupStore, cat *LineageCatalog) error {
+func writeLineageCatalog(ctx context.Context, store irbackup.BackupStore, cat *LineageCatalog) error {
 	cat.FormatVersion = lineageCatalogFormatVersion
 	b, err := json.MarshalIndent(cat, "", "  ")
 	if err != nil {
@@ -290,7 +291,7 @@ type segmentRecord struct {
 // LOUD refusal, never a silent root-only partial (Bug 66 — the absent
 // case does NOT auto-surface from loadLineageCatalog the way the
 // unreadable case does, so resolveLineage must guard it here).
-func resolveLineage(ctx context.Context, store ir.BackupStore) (*LineageCatalog, error) {
+func resolveLineage(ctx context.Context, store irbackup.BackupStore) (*LineageCatalog, error) {
 	cat, ok, err := loadLineageCatalog(ctx, store)
 	if err != nil {
 		return nil, fmt.Errorf("lineage catalog: %w", err)
@@ -369,7 +370,7 @@ func resolveLineage(ctx context.Context, store ir.BackupStore) (*LineageCatalog,
 // callers know which per-segment store + codec to use. Replaces the
 // pre-ADR [listAllManifests] catalog/walk dispatch — the lineage is
 // the single dispatch point now.
-func listAllSegmentManifests(ctx context.Context, store ir.BackupStore) ([]segmentRecord, error) {
+func listAllSegmentManifests(ctx context.Context, store irbackup.BackupStore) ([]segmentRecord, error) {
 	cat, err := resolveLineage(ctx, store)
 	if err != nil {
 		return nil, err
@@ -418,8 +419,8 @@ func listAllSegmentManifests(ctx context.Context, store ir.BackupStore) ([]segme
 // first write and never changes mid-segment.
 func updateLineageForManifestBestEffort(
 	ctx context.Context,
-	store ir.BackupStore,
-	manifest *ir.Manifest,
+	store irbackup.BackupStore,
+	manifest *irbackup.Manifest,
 	manifestPath string,
 	codec Codec,
 ) {
@@ -434,8 +435,8 @@ func updateLineageForManifestBestEffort(
 
 func updateLineageForManifest(
 	ctx context.Context,
-	store ir.BackupStore,
-	manifest *ir.Manifest,
+	store irbackup.BackupStore,
+	manifest *irbackup.Manifest,
 	manifestPath string,
 	codec Codec,
 ) error {
@@ -465,7 +466,7 @@ func updateLineageForManifest(
 	}
 	seg := &cat.Segments[len(cat.Segments)-1] // the open segment
 	switch canonicalKind(manifest.Kind) {
-	case ir.BackupKindFull:
+	case irbackup.BackupKindFull:
 		seg.FullManifestPath = manifestPath
 		seg.SegmentID = manifestBackupID(manifest)
 		seg.StartPosition = manifest.EndPosition
@@ -480,7 +481,7 @@ func updateLineageForManifest(
 		// stays nil for every non-verbatim backup so the field is
 		// absent in the common case (and legacy readers ignore it).
 		seg.VerbatimExtensionColumns = verbatimExtensionColumnsIn(manifest.Schema)
-	case ir.BackupKindIncremental:
+	case irbackup.BackupKindIncremental:
 		// ADR-0067: the FIRST incremental's StartPosition defines the
 		// segment's earliest incremental coverage. Record it ONLY when it
 		// differs from the full anchor (StartPosition) — i.e. a rotation
@@ -535,7 +536,7 @@ func updateLineageForManifest(
 // incremental into a never-catalogued backup). When the lineage exists
 // the recorded codec wins (codec is recorded, never re-chosen
 // mid-segment — a segment is single-codec by construction).
-func openSegmentStore(ctx context.Context, store ir.BackupStore, writeCodec Codec) (ir.BackupStore, Codec, error) {
+func openSegmentStore(ctx context.Context, store irbackup.BackupStore, writeCodec Codec) (irbackup.BackupStore, Codec, error) {
 	cat, ok, err := loadLineageCatalog(ctx, store)
 	if err != nil {
 		return nil, "", err
@@ -559,7 +560,7 @@ func openSegmentStore(ctx context.Context, store ir.BackupStore, writeCodec Code
 // doesn't pull in unexported ir helpers.
 func canonicalKind(kind string) string {
 	if kind == "" {
-		return ir.BackupKindFull
+		return irbackup.BackupKindFull
 	}
 	return kind
 }
@@ -572,7 +573,7 @@ func canonicalKind(kind string) string {
 // rotated lineage's sub-dir structure is not recoverable without the
 // catalog, by design (the catalog IS the structural record for a
 // rotated backup). Returns the segment + manifest count.
-func RebuildLineageCatalogAt(ctx context.Context, store ir.BackupStore) (segments, manifests int, err error) {
+func RebuildLineageCatalogAt(ctx context.Context, store irbackup.BackupStore) (segments, manifests int, err error) {
 	recs, err := listAllManifestsViaWalk(ctx, store)
 	if err != nil {
 		return 0, 0, err
@@ -588,13 +589,13 @@ func RebuildLineageCatalogAt(ctx context.Context, store ir.BackupStore) (segment
 	}
 	for _, r := range recs {
 		switch canonicalKind(r.manifest.Kind) {
-		case ir.BackupKindFull:
+		case irbackup.BackupKindFull:
 			root.SegmentID = manifestBackupID(r.manifest)
 			root.StartPosition = r.manifest.EndPosition
 			if root.EndPosition.Engine == "" && root.EndPosition.Token == "" {
 				root.EndPosition = r.manifest.EndPosition
 			}
-		case ir.BackupKindIncremental:
+		case irbackup.BackupKindIncremental:
 			root.Incrementals = append(root.Incrementals, r.path)
 			root.EndPosition = r.manifest.EndPosition
 		}
@@ -642,7 +643,7 @@ func RebuildLineageCatalogAt(ctx context.Context, store ir.BackupStore) (segment
 // chain off the full (a parentless incremental, a branch, or an
 // unreachable manifest) — those are left for restore's strict check to
 // surface rather than masked by a heuristic repair.
-func reconcileOpenSegmentCatalog(ctx context.Context, rootStore, segStore ir.BackupStore) error {
+func reconcileOpenSegmentCatalog(ctx context.Context, rootStore, segStore irbackup.BackupStore) error {
 	cat, ok, err := loadLineageCatalog(ctx, rootStore)
 	if err != nil || !ok || len(cat.Segments) == 0 {
 		return err // nothing catalogued yet — fresh start, nothing to heal
@@ -659,9 +660,9 @@ func reconcileOpenSegmentCatalog(ctx context.Context, rootStore, segStore ir.Bac
 	var fullID string
 	for _, r := range recs {
 		switch canonicalKind(r.manifest.Kind) {
-		case ir.BackupKindFull:
+		case irbackup.BackupKindFull:
 			fullID = manifestBackupID(r.manifest)
-		case ir.BackupKindIncremental:
+		case irbackup.BackupKindIncremental:
 			pid := r.manifest.ParentBackupID
 			if pid == "" {
 				return nil // can't chain deterministically — stay strict

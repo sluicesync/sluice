@@ -13,14 +13,15 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // makeManifest returns a manifest with deterministic CreatedAt and
 // position for chain-walk test fixtures.
-func makeManifest(t *testing.T, kind string, parent *ir.Manifest, lsn string) *ir.Manifest {
+func makeManifest(t *testing.T, kind string, parent *irbackup.Manifest, lsn string) *irbackup.Manifest {
 	t.Helper()
-	m := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	m := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		CreatedAt:     time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC),
 		SourceEngine:  "postgres",
 		Schema:        &ir.Schema{Tables: []*ir.Table{{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}}},
@@ -31,14 +32,14 @@ func makeManifest(t *testing.T, kind string, parent *ir.Manifest, lsn string) *i
 		m.ParentBackupID = manifestBackupID(parent)
 		m.StartPosition = parent.EndPosition
 	}
-	m.BackupID = ir.ComputeBackupID(m)
+	m.BackupID = irbackup.ComputeBackupID(m)
 	return m
 }
 
 // seedSegment writes a single segment's full + incrementals into a
 // per-segment store and returns the LineageSegment describing it. dir
 // == "" is the root (one-segment) layout.
-func seedSegment(t *testing.T, root ir.BackupStore, dir string, full *ir.Manifest, incrs []*ir.Manifest, codec Codec) LineageSegment {
+func seedSegment(t *testing.T, root irbackup.BackupStore, dir string, full *irbackup.Manifest, incrs []*irbackup.Manifest, codec Codec) LineageSegment {
 	t.Helper()
 	ss := newPrefixedStore(root, dir)
 	if err := writeManifestAt(context.Background(), ss, ManifestFileName, full); err != nil {
@@ -66,7 +67,7 @@ func seedSegment(t *testing.T, root ir.BackupStore, dir string, full *ir.Manifes
 func TestBuildLineageChain_SingleSegmentNoIncrementals(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := NewLocalStore(dir)
-	full := makeManifest(t, ir.BackupKindFull, nil, "0/100")
+	full := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
 	_ = writeManifestAt(context.Background(), store, ManifestFileName, full)
 	// No lineage.json — resolveLineage synthesises a one-segment
 	// lineage; behaviour byte-identical to a pre-ADR single full.
@@ -74,7 +75,7 @@ func TestBuildLineageChain_SingleSegmentNoIncrementals(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildLineageChain: %v", err)
 	}
-	if len(chain) != 1 || canonicalKind(chain[0].manifest.Kind) != ir.BackupKindFull {
+	if len(chain) != 1 || canonicalKind(chain[0].manifest.Kind) != irbackup.BackupKindFull {
 		t.Errorf("chain = %+v; want one full link", chain)
 	}
 }
@@ -82,10 +83,10 @@ func TestBuildLineageChain_SingleSegmentNoIncrementals(t *testing.T) {
 func TestBuildLineageChain_LinearOK(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := NewLocalStore(dir)
-	full := makeManifest(t, ir.BackupKindFull, nil, "0/100")
-	incr1 := makeManifest(t, ir.BackupKindIncremental, full, "0/200")
-	incr2 := makeManifest(t, ir.BackupKindIncremental, incr1, "0/300")
-	seg := seedSegment(t, store, "", full, []*ir.Manifest{incr1, incr2}, CodecGzip)
+	full := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
+	incr1 := makeManifest(t, irbackup.BackupKindIncremental, full, "0/200")
+	incr2 := makeManifest(t, irbackup.BackupKindIncremental, incr1, "0/300")
+	seg := seedSegment(t, store, "", full, []*irbackup.Manifest{incr1, incr2}, CodecGzip)
 	cat := &LineageCatalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []LineageSegment{seg}}
 	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
 		t.Fatal(err)
@@ -107,21 +108,21 @@ func TestBuildLineageChain_LinearOK(t *testing.T) {
 func TestBuildLineageChain_MultiSegmentBoundaryOK(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := NewLocalStore(dir)
-	f0 := makeManifest(t, ir.BackupKindFull, nil, "0/100")
-	i0 := makeManifest(t, ir.BackupKindIncremental, f0, "0/200")
-	s0 := seedSegment(t, store, "", f0, []*ir.Manifest{i0}, CodecGzip)
+	f0 := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
+	i0 := makeManifest(t, irbackup.BackupKindIncremental, f0, "0/200")
+	s0 := seedSegment(t, store, "", f0, []*irbackup.Manifest{i0}, CodecGzip)
 
 	// seg1 full's StartPosition == seg0.end (0/200). makeManifest sets
 	// EndPosition from the lsn arg; force StartPosition = prior end.
-	f1 := makeManifest(t, ir.BackupKindFull, nil, "0/300")
+	f1 := makeManifest(t, irbackup.BackupKindFull, nil, "0/300")
 	f1.StartPosition = i0.EndPosition
-	f1.BackupID = ir.ComputeBackupID(f1)
-	i1 := makeManifest(t, ir.BackupKindIncremental, f1, "0/400")
-	s1 := seedSegment(t, store, "seg-1", f1, []*ir.Manifest{i1}, CodecNone)
+	f1.BackupID = irbackup.ComputeBackupID(f1)
+	i1 := makeManifest(t, irbackup.BackupKindIncremental, f1, "0/400")
+	s1 := seedSegment(t, store, "seg-1", f1, []*irbackup.Manifest{i1}, CodecNone)
 
-	f2 := makeManifest(t, ir.BackupKindFull, nil, "0/500")
+	f2 := makeManifest(t, irbackup.BackupKindFull, nil, "0/500")
 	f2.StartPosition = i1.EndPosition
-	f2.BackupID = ir.ComputeBackupID(f2)
+	f2.BackupID = irbackup.ComputeBackupID(f2)
 	s2 := seedSegment(t, store, "seg-2", f2, nil, CodecZstd)
 
 	capt := time.Now().UTC()
@@ -169,19 +170,19 @@ func TestBuildBrokerChain_MultiSegmentFollows(t *testing.T) {
 
 	// 3-segment lineage, same shape as
 	// TestBuildLineageChain_MultiSegmentBoundaryOK.
-	f0 := makeManifest(t, ir.BackupKindFull, nil, "0/100")
-	i0 := makeManifest(t, ir.BackupKindIncremental, f0, "0/200")
-	s0 := seedSegment(t, store, "", f0, []*ir.Manifest{i0}, CodecGzip)
+	f0 := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
+	i0 := makeManifest(t, irbackup.BackupKindIncremental, f0, "0/200")
+	s0 := seedSegment(t, store, "", f0, []*irbackup.Manifest{i0}, CodecGzip)
 
-	f1 := makeManifest(t, ir.BackupKindFull, nil, "0/300")
+	f1 := makeManifest(t, irbackup.BackupKindFull, nil, "0/300")
 	f1.StartPosition = i0.EndPosition
-	f1.BackupID = ir.ComputeBackupID(f1)
-	i1 := makeManifest(t, ir.BackupKindIncremental, f1, "0/400")
-	s1 := seedSegment(t, store, "seg-1", f1, []*ir.Manifest{i1}, CodecNone)
+	f1.BackupID = irbackup.ComputeBackupID(f1)
+	i1 := makeManifest(t, irbackup.BackupKindIncremental, f1, "0/400")
+	s1 := seedSegment(t, store, "seg-1", f1, []*irbackup.Manifest{i1}, CodecNone)
 
-	f2 := makeManifest(t, ir.BackupKindFull, nil, "0/500")
+	f2 := makeManifest(t, irbackup.BackupKindFull, nil, "0/500")
 	f2.StartPosition = i1.EndPosition
-	f2.BackupID = ir.ComputeBackupID(f2)
+	f2.BackupID = irbackup.ComputeBackupID(f2)
 	s2 := seedSegment(t, store, "seg-2", f2, nil, CodecZstd)
 
 	capt := time.Now().UTC()
@@ -204,9 +205,9 @@ func TestBuildBrokerChain_MultiSegmentFollows(t *testing.T) {
 	// Verify chain ordering: full → incrementals within each segment,
 	// segments in lineage order.
 	expectedKinds := []string{
-		ir.BackupKindFull, ir.BackupKindIncremental, // seg0
-		ir.BackupKindFull, ir.BackupKindIncremental, // seg1
-		ir.BackupKindFull, // seg2 (no incrementals)
+		irbackup.BackupKindFull, irbackup.BackupKindIncremental, // seg0
+		irbackup.BackupKindFull, irbackup.BackupKindIncremental, // seg1
+		irbackup.BackupKindFull, // seg2 (no incrementals)
 	}
 	for i, want := range expectedKinds {
 		got := canonicalKind(chain[i].manifest.Kind)
@@ -227,11 +228,11 @@ func TestBuildBrokerChain_DeferralRemoved(t *testing.T) {
 	store, _ := NewLocalStore(dir)
 
 	// Minimal 2-segment lineage to trigger the prior multi-segment path.
-	f0 := makeManifest(t, ir.BackupKindFull, nil, "0/100")
+	f0 := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
 	s0 := seedSegment(t, store, "", f0, nil, CodecGzip)
-	f1 := makeManifest(t, ir.BackupKindFull, nil, "0/200")
+	f1 := makeManifest(t, irbackup.BackupKindFull, nil, "0/200")
 	f1.StartPosition = f0.EndPosition
-	f1.BackupID = ir.ComputeBackupID(f1)
+	f1.BackupID = irbackup.ComputeBackupID(f1)
 	s1 := seedSegment(t, store, "seg-1", f1, nil, CodecNone)
 	capt := time.Now().UTC()
 	s0.CappedAt, s0.CapReason = &capt, rotationReasonAge
@@ -296,9 +297,9 @@ func TestValidateBoundary_SameCodePathIntraAndInter(t *testing.T) {
 func TestBuildLineageChain_SegmentBoundaryRegressionRefuses(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := NewLocalStore(dir)
-	f0 := makeManifest(t, ir.BackupKindFull, nil, "END0")
+	f0 := makeManifest(t, irbackup.BackupKindFull, nil, "END0")
 	s0 := seedSegment(t, store, "", f0, nil, CodecGzip)
-	f1 := makeManifest(t, ir.BackupKindFull, nil, "END1")
+	f1 := makeManifest(t, irbackup.BackupKindFull, nil, "END1")
 	s1 := seedSegment(t, store, "seg-1", f1, nil, CodecGzip)
 	// seg1's RECORDED StartPosition REGRESSES before seg0's end
 	// (a tampered / corrupt lineage.json — DR data).
@@ -325,11 +326,11 @@ func TestBuildLineageChain_SegmentBoundaryRegressionRefuses(t *testing.T) {
 func TestBuildLineageChain_IntraSegmentMismatchRefuses(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := NewLocalStore(dir)
-	full := makeManifest(t, ir.BackupKindFull, nil, "0/100")
-	tampered := makeManifest(t, ir.BackupKindIncremental, full, "0/200")
+	full := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
+	tampered := makeManifest(t, irbackup.BackupKindIncremental, full, "0/200")
 	tampered.StartPosition = ir.Position{Engine: "postgres", Token: `{"slot":"x","lsn":"WRONG"}`}
-	tampered.BackupID = ir.ComputeBackupID(tampered)
-	seg := seedSegment(t, store, "", full, []*ir.Manifest{tampered}, CodecGzip)
+	tampered.BackupID = irbackup.ComputeBackupID(tampered)
+	seg := seedSegment(t, store, "", full, []*irbackup.Manifest{tampered}, CodecGzip)
 	cat := &LineageCatalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []LineageSegment{seg}}
 	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
 		t.Fatal(err)
@@ -359,9 +360,9 @@ func TestBuildLineageChain_MissingFullRefuses(t *testing.T) {
 }
 
 func TestDetectAmbiguousDeltas_RenameRefuses(t *testing.T) {
-	deltas := []*ir.SchemaDeltaEntry{
+	deltas := []*irbackup.SchemaDeltaEntry{
 		{
-			Kind:  ir.SchemaDeltaAlterTable,
+			Kind:  irbackup.SchemaDeltaAlterTable,
 			Table: "users",
 			Before: &ir.Table{Name: "users", Columns: []*ir.Column{
 				{Name: "id", Type: ir.Integer{Width: 64}},
@@ -379,9 +380,9 @@ func TestDetectAmbiguousDeltas_RenameRefuses(t *testing.T) {
 }
 
 func TestDetectAmbiguousDeltas_AddOnlyOK(t *testing.T) {
-	deltas := []*ir.SchemaDeltaEntry{
+	deltas := []*irbackup.SchemaDeltaEntry{
 		{
-			Kind:  ir.SchemaDeltaAlterTable,
+			Kind:  irbackup.SchemaDeltaAlterTable,
 			Table: "users",
 			Before: &ir.Table{Name: "users", Columns: []*ir.Column{
 				{Name: "id", Type: ir.Integer{Width: 64}},
@@ -469,9 +470,9 @@ func TestChainRestore_FullPlusOneIncremental_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read full manifest: %v", err)
 	}
-	full.Kind = ir.BackupKindFull
+	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/100"}`}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
 		t.Fatalf("rewrite full manifest: %v", err)
 	}
@@ -578,18 +579,18 @@ func TestChainRestore_SchemaHistoryReplayed(t *testing.T) {
 	}
 
 	// Full manifest at 0/100.
-	full := makeManifest(t, ir.BackupKindFull, nil, "0/100")
+	full := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
 	full.Schema = schema
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
 		t.Fatalf("write full: %v", err)
 	}
 	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, CodecGzip)
 
 	// Incremental: carries SchemaHistory + a single Insert event.
-	incr := makeManifest(t, ir.BackupKindIncremental, full, "0/200")
+	incr := makeManifest(t, irbackup.BackupKindIncremental, full, "0/200")
 	incr.Schema = &ir.Schema{Tables: []*ir.Table{postDDL}}
-	incr.SchemaHistory = []*ir.SchemaHistoryEntry{
+	incr.SchemaHistory = []*irbackup.SchemaHistoryEntry{
 		{
 			StreamID:       "",
 			Schema:         "",
@@ -620,12 +621,12 @@ func TestChainRestore_SchemaHistoryReplayed(t *testing.T) {
 	if err := store.Put(context.Background(), chunkPath, buf); err != nil {
 		t.Fatalf("store.Put: %v", err)
 	}
-	incr.ChangeChunks = []*ir.ChunkInfo{{
+	incr.ChangeChunks = []*irbackup.ChunkInfo{{
 		File:     chunkPath,
 		RowCount: 1,
 		SHA256:   cw.Hash(),
 	}}
-	incr.BackupID = ir.ComputeBackupID(incr)
+	incr.BackupID = irbackup.ComputeBackupID(incr)
 	incrPath := "manifests/incr-0001.json"
 	if err := writeManifestAt(context.Background(), store, incrPath, incr); err != nil {
 		t.Fatalf("write incr: %v", err)
@@ -693,17 +694,17 @@ func TestChainRestore_SchemaHistoryOnlyManifestReplayed(t *testing.T) {
 	}
 	postDDLPayload, _ := ir.MarshalTable(postDDL)
 
-	full := makeManifest(t, ir.BackupKindFull, nil, "0/100")
+	full := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
 	full.Schema = schema
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
 		t.Fatalf("write full: %v", err)
 	}
 	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, CodecGzip)
 
-	incr := makeManifest(t, ir.BackupKindIncremental, full, "0/200")
+	incr := makeManifest(t, irbackup.BackupKindIncremental, full, "0/200")
 	incr.Schema = &ir.Schema{Tables: []*ir.Table{postDDL}}
-	incr.SchemaHistory = []*ir.SchemaHistoryEntry{
+	incr.SchemaHistory = []*irbackup.SchemaHistoryEntry{
 		{
 			Schema:         "",
 			Table:          "users",
@@ -712,7 +713,7 @@ func TestChainRestore_SchemaHistoryOnlyManifestReplayed(t *testing.T) {
 		},
 	}
 	incr.ChangeChunks = nil // no DML
-	incr.BackupID = ir.ComputeBackupID(incr)
+	incr.BackupID = irbackup.ComputeBackupID(incr)
 	incrPath := "manifests/incr-0001.json"
 	if err := writeManifestAt(context.Background(), store, incrPath, incr); err != nil {
 		t.Fatalf("write incr: %v", err)
@@ -749,17 +750,17 @@ func TestChainRestore_SchemaHistoryDecodeFailureIsLoud(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := NewLocalStore(dir)
 
-	full := makeManifest(t, ir.BackupKindFull, nil, "0/100")
-	full.BackupID = ir.ComputeBackupID(full)
+	full := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
+	full.BackupID = irbackup.ComputeBackupID(full)
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
 		t.Fatalf("write full: %v", err)
 	}
 	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, CodecGzip)
 
-	incr := makeManifest(t, ir.BackupKindIncremental, full, "0/200")
+	incr := makeManifest(t, irbackup.BackupKindIncremental, full, "0/200")
 	// Corrupt SchemaHistory entry: TableJSON is "null" → UnmarshalTable
 	// returns (nil, nil); orchestrator must refuse loudly.
-	incr.SchemaHistory = []*ir.SchemaHistoryEntry{
+	incr.SchemaHistory = []*irbackup.SchemaHistoryEntry{
 		{
 			Schema:         "",
 			Table:          "users",
@@ -767,7 +768,7 @@ func TestChainRestore_SchemaHistoryDecodeFailureIsLoud(t *testing.T) {
 			TableJSON:      []byte("null"),
 		},
 	}
-	incr.BackupID = ir.ComputeBackupID(incr)
+	incr.BackupID = irbackup.ComputeBackupID(incr)
 	incrPath := "manifests/incr-0001.json"
 	if err := writeManifestAt(context.Background(), store, incrPath, incr); err != nil {
 		t.Fatalf("write incr: %v", err)
@@ -805,15 +806,15 @@ func TestChainRestore_PreChunkDManifest_BackwardCompat(t *testing.T) {
 		Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
 	}}}
 
-	full := makeManifest(t, ir.BackupKindFull, nil, "0/100")
+	full := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
 	full.Schema = schema
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
 		t.Fatalf("write full: %v", err)
 	}
 	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, CodecGzip)
 
-	incr := makeManifest(t, ir.BackupKindIncremental, full, "0/200")
+	incr := makeManifest(t, irbackup.BackupKindIncremental, full, "0/200")
 	incr.Schema = schema
 	// SchemaHistory deliberately nil (pre-Chunk-D shape).
 	incr.SchemaHistory = nil
@@ -827,12 +828,12 @@ func TestChainRestore_PreChunkDManifest_BackwardCompat(t *testing.T) {
 	_ = cw.Close()
 	chunkPath := "chunks/_changes/preD/changes-0.jsonl.gz"
 	_ = store.Put(context.Background(), chunkPath, buf)
-	incr.ChangeChunks = []*ir.ChunkInfo{{
+	incr.ChangeChunks = []*irbackup.ChunkInfo{{
 		File:     chunkPath,
 		RowCount: 1,
 		SHA256:   cw.Hash(),
 	}}
-	incr.BackupID = ir.ComputeBackupID(incr)
+	incr.BackupID = irbackup.ComputeBackupID(incr)
 	incrPath := "manifests/incr-0001.json"
 	_ = writeManifestAt(context.Background(), store, incrPath, incr)
 	updateLineageForManifestBestEffort(context.Background(), store, incr, incrPath, CodecGzip)
@@ -872,15 +873,15 @@ func TestChainRestore_CrossEngineWithIncrementalsSucceeds(t *testing.T) {
 	store, _ := NewLocalStore(dir)
 
 	// Full manifest: source_engine=postgres.
-	full := makeManifest(t, ir.BackupKindFull, nil, "0/100")
+	full := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
 	full.SourceEngine = "postgres"
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
 		t.Fatalf("write full: %v", err)
 	}
-	incr := makeManifest(t, ir.BackupKindIncremental, full, "0/200")
+	incr := makeManifest(t, irbackup.BackupKindIncremental, full, "0/200")
 	incr.SourceEngine = "postgres"
-	incr.BackupID = ir.ComputeBackupID(incr)
+	incr.BackupID = irbackup.ComputeBackupID(incr)
 	if err := writeManifestAt(context.Background(), store, "manifests/incr-0001.json", incr); err != nil {
 		t.Fatalf("write incr: %v", err)
 	}
@@ -932,7 +933,7 @@ func TestChainRestore_DispatchFromRestore_Run(t *testing.T) {
 	// Patch the full with an EndPosition.
 	full, _ := readManifest(context.Background(), store)
 	full.EndPosition = ir.Position{Engine: "postgres", Token: `{"slot":"x","lsn":"0/100"}`}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	_ = writeManifestAt(context.Background(), store, ManifestFileName, full)
 
 	// Add an empty incremental so the dispatch fires.

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // fakeMonotonicEngine is a fakeCDCEngine that also implements
@@ -107,13 +108,13 @@ func TestShouldRotate_LengthFires(t *testing.T) {
 func TestShouldRotate_AgeFromOpenSegmentFull(t *testing.T) {
 	store := newMemStore()
 	created := time.Date(2026, 5, 16, 0, 0, 0, 0, time.UTC)
-	full := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion, CreatedAt: created,
-		SourceEngine: "postgres", Kind: ir.BackupKindFull,
+	full := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion, CreatedAt: created,
+		SourceEngine: "postgres", Kind: irbackup.BackupKindFull,
 		EndPosition:  ir.Position{Engine: "postgres", Token: "0/100"},
-		PartialState: ir.BackupStateComplete,
+		PartialState: irbackup.BackupStateComplete,
 	}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	mustWriteManifest(t, store, ManifestFileName, full)
 	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, CodecGzip)
 

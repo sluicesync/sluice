@@ -30,6 +30,7 @@ import (
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -248,12 +249,12 @@ func TestChainRestoreParallel_PG_FullPlusIncremental(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readManifest: %v", err)
 	}
-	full.Kind = ir.BackupKindFull
+	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{
 		Engine: "postgres",
 		Token:  fmt.Sprintf(`{"slot":"sluice_slot","lsn":%q}`, slotLSN),
 	}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
 		t.Fatalf("rewrite full: %v", err)
 	}

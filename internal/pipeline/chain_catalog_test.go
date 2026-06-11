@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // TestLineage_LoadAbsent: a store without lineage.json reports
@@ -28,13 +29,13 @@ func TestLineage_LoadAbsent(t *testing.T) {
 
 	// With a conventional full present, resolveLineage synthesises a
 	// one-segment lineage (Dir == "", DefaultCodec).
-	full := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion, CreatedAt: time.Now().UTC(),
-		SourceEngine: "postgres", Kind: ir.BackupKindFull,
+	full := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion, CreatedAt: time.Now().UTC(),
+		SourceEngine: "postgres", Kind: irbackup.BackupKindFull,
 		EndPosition:  ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"0/100"}`},
-		PartialState: ir.BackupStateComplete,
+		PartialState: irbackup.BackupStateComplete,
 	}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	mustWriteManifest(t, store, ManifestFileName, full)
 	rl, err := resolveLineage(context.Background(), store)
 	if err != nil {
@@ -129,9 +130,9 @@ func TestLineage_RoundTrip_MixedCodec(t *testing.T) {
 func TestUpdateLineageForManifest_RecordsVerbatimMarker(t *testing.T) {
 	t.Run("verbatim full → marker recorded", func(t *testing.T) {
 		store := newMemStore()
-		m := &ir.Manifest{
+		m := &irbackup.Manifest{
 			SourceEngine: "postgres",
-			Kind:         ir.BackupKindFull,
+			Kind:         irbackup.BackupKindFull,
 			Schema: &ir.Schema{Tables: []*ir.Table{{
 				Schema: "public", Name: "docs",
 				Columns: []*ir.Column{
@@ -159,9 +160,9 @@ func TestUpdateLineageForManifest_RecordsVerbatimMarker(t *testing.T) {
 
 	t.Run("non-verbatim full → marker absent (omitempty)", func(t *testing.T) {
 		store := newMemStore()
-		m := &ir.Manifest{
+		m := &irbackup.Manifest{
 			SourceEngine: "postgres",
-			Kind:         ir.BackupKindFull,
+			Kind:         irbackup.BackupKindFull,
 			Schema: &ir.Schema{Tables: []*ir.Table{{
 				Name:    "users",
 				Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
@@ -205,28 +206,28 @@ func TestLineage_ZeroSegmentsRefused(t *testing.T) {
 // pinned codec.
 func TestUpdateLineageForManifest_SeedsAndAppends(t *testing.T) {
 	store := newMemStore()
-	full := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion, CreatedAt: time.Now().UTC(),
-		SourceEngine: "postgres", Kind: ir.BackupKindFull,
+	full := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion, CreatedAt: time.Now().UTC(),
+		SourceEngine: "postgres", Kind: irbackup.BackupKindFull,
 		EndPosition:  ir.Position{Engine: "postgres", Token: "0/100"},
-		PartialState: ir.BackupStateComplete,
+		PartialState: irbackup.BackupStateComplete,
 	}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, CodecZstd)
 	cat, ok, _ := loadLineageCatalog(context.Background(), store)
 	if !ok || len(cat.Segments) != 1 || cat.Segments[0].codecOrDefault() != CodecZstd {
 		t.Fatalf("after full: %+v; want one zstd segment", cat)
 	}
 
-	incr := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion, CreatedAt: time.Now().UTC(),
-		SourceEngine: "postgres", Kind: ir.BackupKindIncremental,
+	incr := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion, CreatedAt: time.Now().UTC(),
+		SourceEngine: "postgres", Kind: irbackup.BackupKindIncremental,
 		ParentBackupID: full.BackupID,
 		StartPosition:  ir.Position{Engine: "postgres", Token: "0/100"},
 		EndPosition:    ir.Position{Engine: "postgres", Token: "0/200"},
-		PartialState:   ir.BackupStateComplete,
+		PartialState:   irbackup.BackupStateComplete,
 	}
-	incr.BackupID = ir.ComputeBackupID(incr)
+	incr.BackupID = irbackup.ComputeBackupID(incr)
 	updateLineageForManifestBestEffort(context.Background(), store, incr, "manifests/incr-1.json", CodecZstd)
 	cat, _, _ = loadLineageCatalog(context.Background(), store)
 	if len(cat.Segments) != 1 || len(cat.Segments[0].Incrementals) != 1 ||
@@ -281,7 +282,7 @@ func TestParseCompression(t *testing.T) {
 	}
 }
 
-func mustWriteManifest(t *testing.T, store ir.BackupStore, path string, m *ir.Manifest) {
+func mustWriteManifest(t *testing.T, store irbackup.BackupStore, path string, m *irbackup.Manifest) {
 	t.Helper()
 	if err := writeManifestAt(context.Background(), store, path, m); err != nil {
 		t.Fatalf("writeManifestAt(%q): %v", path, err)
@@ -289,18 +290,18 @@ func mustWriteManifest(t *testing.T, store ir.BackupStore, path string, m *ir.Ma
 }
 
 // pgIncr builds a complete incremental manifest chained off parent.
-func pgIncr(parent, startLSN, endLSN string) *ir.Manifest {
-	m := &ir.Manifest{
-		FormatVersion:  ir.BackupFormatVersion,
+func pgIncr(parent, startLSN, endLSN string) *irbackup.Manifest {
+	m := &irbackup.Manifest{
+		FormatVersion:  irbackup.BackupFormatVersion,
 		CreatedAt:      time.Now().UTC(),
 		SourceEngine:   "postgres",
-		Kind:           ir.BackupKindIncremental,
+		Kind:           irbackup.BackupKindIncremental,
 		ParentBackupID: parent,
 		StartPosition:  ir.Position{Engine: "postgres", Token: startLSN},
 		EndPosition:    ir.Position{Engine: "postgres", Token: endLSN},
-		PartialState:   ir.BackupStateComplete,
+		PartialState:   irbackup.BackupStateComplete,
 	}
-	m.BackupID = ir.ComputeBackupID(m)
+	m.BackupID = irbackup.ComputeBackupID(m)
 	return m
 }
 
@@ -318,14 +319,14 @@ func TestReconcileOpenSegmentCatalog_HealsHeadOrphan(t *testing.T) {
 	root := newMemStore()
 
 	// seg0: capped root segment (Dir == "").
-	full0 := bug66Manifest(ir.BackupKindFull, "0/100")
+	full0 := bug66Manifest(irbackup.BackupKindFull, "0/100")
 	mustWriteManifest(t, root, ManifestFileName, full0)
 
 	// seg1: rotation-opened sub-dir segment. Anchor S = 0/900; the first
 	// incremental A starts at the prior segment's end P_N = 0/250 (the
 	// kept overlap), so A.start != seg1.StartPosition.
 	seg1 := newPrefixedStore(root, "seg-1")
-	full1 := bug66Manifest(ir.BackupKindFull, "0/900")
+	full1 := bug66Manifest(irbackup.BackupKindFull, "0/900")
 	mustWriteManifest(t, seg1, ManifestFileName, full1)
 	a := pgIncr(full1.BackupID, "0/250", "0/300")
 	b := pgIncr(a.BackupID, "0/300", "0/400")
@@ -392,7 +393,7 @@ func TestReconcileOpenSegmentCatalog_HealsHeadOrphan(t *testing.T) {
 func TestReconcileOpenSegmentCatalog_NoOpWhenConsistent(t *testing.T) {
 	ctx := context.Background()
 	root := newMemStore()
-	full := bug66Manifest(ir.BackupKindFull, "0/100")
+	full := bug66Manifest(irbackup.BackupKindFull, "0/100")
 	mustWriteManifest(t, root, ManifestFileName, full)
 	a := pgIncr(full.BackupID, "0/100", "0/200")
 	pathA := "manifests/incr-1000000000001-aaaaaaaa.json"
@@ -420,7 +421,7 @@ func TestReconcileOpenSegmentCatalog_NoOpWhenConsistent(t *testing.T) {
 func TestReconcileOpenSegmentCatalog_RefusesToGuessOnBranch(t *testing.T) {
 	ctx := context.Background()
 	root := newMemStore()
-	full := bug66Manifest(ir.BackupKindFull, "0/100")
+	full := bug66Manifest(irbackup.BackupKindFull, "0/100")
 	mustWriteManifest(t, root, ManifestFileName, full)
 	// Two children both parent off the full -> branch.
 	b1 := pgIncr(full.BackupID, "0/100", "0/200")
@@ -510,16 +511,16 @@ func (e *storeNotFoundErr) Error() string { return "memstore: not found: " + e.p
 
 // bug66Manifest builds a minimal complete full/incremental manifest for
 // the resolveLineage missing-catalog pins.
-func bug66Manifest(kind, lsn string) *ir.Manifest {
-	m := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+func bug66Manifest(kind, lsn string) *irbackup.Manifest {
+	m := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		CreatedAt:     time.Now().UTC(),
 		SourceEngine:  "postgres",
 		Kind:          kind,
 		EndPosition:   ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"` + lsn + `"}`},
-		PartialState:  ir.BackupStateComplete,
+		PartialState:  irbackup.BackupStateComplete,
 	}
-	m.BackupID = ir.ComputeBackupID(m)
+	m.BackupID = irbackup.ComputeBackupID(m)
 	return m
 }
 
@@ -534,12 +535,12 @@ func bug66Manifest(kind, lsn string) *ir.Manifest {
 func TestResolveLineage_MissingCatalogMultiSegmentRefused(t *testing.T) {
 	store := newMemStore()
 	// Root (segment 0) conventional layout.
-	mustWriteManifest(t, store, ManifestFileName, bug66Manifest(ir.BackupKindFull, "0/100"))
-	mustWriteManifest(t, store, "manifests/incr-0000000000001-aaaa.json", bug66Manifest(ir.BackupKindIncremental, "0/200"))
+	mustWriteManifest(t, store, ManifestFileName, bug66Manifest(irbackup.BackupKindFull, "0/100"))
+	mustWriteManifest(t, store, "manifests/incr-0000000000001-aaaa.json", bug66Manifest(irbackup.BackupKindIncremental, "0/200"))
 	// Rotation-opened segment evidence (seg-<unix-millis>/...), but NO
 	// lineage.json — the catalog that is the only structural record of
 	// the rotated segments.
-	mustWriteManifest(t, store, rotationSegmentDirPrefix+"0000000000002/manifest.json", bug66Manifest(ir.BackupKindFull, "0/300"))
+	mustWriteManifest(t, store, rotationSegmentDirPrefix+"0000000000002/manifest.json", bug66Manifest(irbackup.BackupKindFull, "0/300"))
 
 	_, err := resolveLineage(context.Background(), store)
 	if err == nil {
@@ -559,8 +560,8 @@ func TestResolveLineage_MissingCatalogMultiSegmentRefused(t *testing.T) {
 // must not break.
 func TestResolveLineage_MissingCatalogLegacySingleSegmentStillResolves(t *testing.T) {
 	store := newMemStore()
-	mustWriteManifest(t, store, ManifestFileName, bug66Manifest(ir.BackupKindFull, "0/100"))
-	mustWriteManifest(t, store, "manifests/incr-0000000000001-bbbb.json", bug66Manifest(ir.BackupKindIncremental, "0/200"))
+	mustWriteManifest(t, store, ManifestFileName, bug66Manifest(irbackup.BackupKindFull, "0/100"))
+	mustWriteManifest(t, store, "manifests/incr-0000000000001-bbbb.json", bug66Manifest(irbackup.BackupKindIncremental, "0/200"))
 
 	cat, err := resolveLineage(context.Background(), store)
 	if err != nil {

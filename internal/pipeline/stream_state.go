@@ -31,7 +31,7 @@ import (
 	"log/slog"
 	"time"
 
-	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // streamState is the on-disk shape of `stream_state.json`. Lives at
@@ -69,7 +69,7 @@ type streamState struct {
 // readStreamState loads the state file at path from store. Returns
 // (nil, nil) when the file doesn't exist (the common cold-start case);
 // (nil, err) when the file exists but can't be decoded.
-func readStreamState(ctx context.Context, store ir.BackupStore, path string) (*streamState, error) {
+func readStreamState(ctx context.Context, store irbackup.BackupStore, path string) (*streamState, error) {
 	exists, err := store.Exists(ctx, path)
 	if err != nil {
 		return nil, fmt.Errorf("stream state: exists %q: %w", path, err)
@@ -111,7 +111,7 @@ func readStreamState(ctx context.Context, store ir.BackupStore, path string) (*s
 // The plain writeStreamState is reserved for paths that legitimately
 // own the entire file content (initial Run setup, takeover with
 // --force).
-func writeStreamState(ctx context.Context, store ir.BackupStore, path string, s *streamState) error {
+func writeStreamState(ctx context.Context, store irbackup.BackupStore, path string, s *streamState) error {
 	body, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return fmt.Errorf("stream state: marshal: %w", err)
@@ -142,7 +142,7 @@ func writeStreamState(ctx context.Context, store ir.BackupStore, path string, s 
 // remaining tiny TOCTOU window is bounded by the read/write latency
 // of a single state-file flush; the next rollover-boundary heartbeat
 // gets another chance.
-func writeStreamStateMergeHeartbeat(ctx context.Context, store ir.BackupStore, path string, s *streamState) (stopObserved bool, err error) {
+func writeStreamStateMergeHeartbeat(ctx context.Context, store irbackup.BackupStore, path string, s *streamState) (stopObserved bool, err error) {
 	prior, err := readStreamState(ctx, store, path)
 	if err != nil {
 		return false, err
@@ -161,7 +161,7 @@ func writeStreamStateMergeHeartbeat(ctx context.Context, store ir.BackupStore, p
 // the state file, or nil if the file doesn't exist or doesn't carry a
 // stop request. Errors from the store surface to the caller; missing
 // file is (nil, nil).
-func readStreamStopRequested(ctx context.Context, store ir.BackupStore, path string) (*time.Time, error) {
+func readStreamStopRequested(ctx context.Context, store irbackup.BackupStore, path string) (*time.Time, error) {
 	s, err := readStreamState(ctx, store, path)
 	if err != nil {
 		return nil, err
@@ -260,14 +260,14 @@ func (b *BackupStream) preflightStreamState(ctx context.Context, path string, wi
 // Returns (nil, error) when the state file is absent — there's no
 // running stream to stop. The caller's error message names the
 // "no stream is running" case explicitly.
-func RequestStreamStop(ctx context.Context, store ir.BackupStore, now time.Time) (*streamState, error) {
+func RequestStreamStop(ctx context.Context, store irbackup.BackupStore, now time.Time) (*streamState, error) {
 	return requestStreamStopAt(ctx, store, DefaultStreamStateFilename, now)
 }
 
 // requestStreamStopAt is [RequestStreamStop] generalised to a caller-
 // supplied path. Tests pin a deterministic path; production callers
 // route through RequestStreamStop.
-func requestStreamStopAt(ctx context.Context, store ir.BackupStore, path string, now time.Time) (*streamState, error) {
+func requestStreamStopAt(ctx context.Context, store irbackup.BackupStore, path string, now time.Time) (*streamState, error) {
 	prior, err := readStreamState(ctx, store, path)
 	if err != nil {
 		return nil, fmt.Errorf("stream stop: read state file: %w", err)

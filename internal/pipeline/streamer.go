@@ -15,6 +15,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/redact"
 )
 
@@ -466,10 +467,10 @@ type Streamer struct {
 	// non-nil and non-empty.
 	Redactor *redact.Registry
 
-	// PositionFromManifestStore is the [ir.BackupStore] the chain
+	// PositionFromManifestStore is the [irbackup.BackupStore] the chain
 	// terminal position is read from when the operator passes
 	// `--position-from-manifest=<chain-url>`. The Streamer uses the
-	// store's terminal manifest's [ir.Manifest.EndPosition] as the
+	// store's terminal manifest's [irbackup.Manifest.EndPosition] as the
 	// resume position, bypassing the per-target [sluice_cdc_state]
 	// row read (which a fresh-restored target wouldn't have). Phase
 	// 3.3.B; mutually exclusive with the resume-from-control-table
@@ -477,7 +478,7 @@ type Streamer struct {
 	//
 	// nil means the field is not in use (the legacy resume path runs
 	// unchanged).
-	PositionFromManifestStore ir.BackupStore
+	PositionFromManifestStore irbackup.BackupStore
 
 	// StrictPreflight, when true, promotes the soft warnings emitted
 	// by the Phase 3.3.C pre-flight checks (PG `wal_keep_size`

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // TestCompactChain_SmartCompaction_CollapsesAcrossGroup pins the
@@ -158,14 +159,14 @@ func TestCompactChain_SmartCompactionOff_NaiveBehaviorUnchanged(t *testing.T) {
 // segment's two incrementals carry a synthetic INSERT+UPDATE chain
 // on the same PK — designed to collapse heavily under smart
 // compaction.
-func seedSmartCompactLineage(t *testing.T, store ir.BackupStore, base time.Time) {
+func seedSmartCompactLineage(t *testing.T, store irbackup.BackupStore, base time.Time) {
 	t.Helper()
 	seedSmartCompactLineageWithSchemaAndEnc(t, store, base, usersSchema(), nil, smartCompactRowsHappyPath)
 }
 
 // seedSmartCompactLineageNoPK seeds a lineage whose schema has a
 // table WITHOUT a declared PK; smart compaction skips it.
-func seedSmartCompactLineageNoPK(t *testing.T, store ir.BackupStore, base time.Time) {
+func seedSmartCompactLineageNoPK(t *testing.T, store irbackup.BackupStore, base time.Time) {
 	t.Helper()
 	seedSmartCompactLineageWithSchemaAndEnc(t, store, base, noPKSchema(), nil, smartCompactRowsNoPKTable)
 }
@@ -173,14 +174,14 @@ func seedSmartCompactLineageNoPK(t *testing.T, store ir.BackupStore, base time.T
 // seedSmartCompactLineageEncrypted seeds a lineage whose full
 // manifests carry a ChainEncryption marker (so smart compact
 // refuses).
-func seedSmartCompactLineageEncrypted(t *testing.T, store ir.BackupStore, base time.Time) {
+func seedSmartCompactLineageEncrypted(t *testing.T, store irbackup.BackupStore, base time.Time) {
 	t.Helper()
-	enc := &ir.ChainEncryption{
+	enc := &irbackup.ChainEncryption{
 		Algorithm: "AES-256-GCM",
 		Mode:      "per-chain",
 		KEKMode:   "passphrase-argon2id",
 		KEKRef:    "",
-		Argon2id:  &ir.Argon2idParams{Salt: []byte("salt-test")},
+		Argon2id:  &irbackup.Argon2idParams{Salt: []byte("salt-test")},
 	}
 	seedSmartCompactLineageWithSchemaAndEnc(t, store, base, usersSchema(), enc, smartCompactRowsHappyPath)
 }
@@ -250,10 +251,10 @@ func smartCompactRowsNoPKTable(startLSN uint64, incrIdx int) (events []ir.Change
 // so the §14d position-gap pre-flight stays green.
 func seedSmartCompactLineageWithSchemaAndEnc(
 	t *testing.T,
-	store ir.BackupStore,
+	store irbackup.BackupStore,
 	base time.Time,
 	schema *ir.Schema,
-	enc *ir.ChainEncryption,
+	enc *irbackup.ChainEncryption,
 	rowsFn smartCompactRowsFn,
 ) {
 	t.Helper()
@@ -277,19 +278,19 @@ func seedSmartCompactLineageWithSchemaAndEnc(
 
 		// Full at startLSN = prior segment's end.
 		startLSN := curLSN
-		full := &ir.Manifest{
-			FormatVersion: ir.BackupFormatVersion,
+		full := &irbackup.Manifest{
+			FormatVersion: irbackup.BackupFormatVersion,
 			SourceEngine:  "postgres",
 			CreatedAt:     segCreatedAt,
-			Kind:          ir.BackupKindFull,
+			Kind:          irbackup.BackupKindFull,
 			EndPosition:   pos(startLSN),
-			PartialState:  ir.BackupStateComplete,
+			PartialState:  irbackup.BackupStateComplete,
 			Schema:        schema,
 		}
 		if enc != nil {
 			full.ChainEncryption = enc
 		}
-		full.BackupID = ir.ComputeBackupID(full)
+		full.BackupID = irbackup.ComputeBackupID(full)
 		if err := writeManifestAt(context.Background(), segStore, ManifestFileName, full); err != nil {
 			t.Fatalf("seed full %d: %v", i, err)
 		}
@@ -320,20 +321,20 @@ func seedSmartCompactLineageWithSchemaAndEnc(
 				t.Fatalf("put chunk: %v", err)
 			}
 
-			im := &ir.Manifest{
-				FormatVersion: ir.BackupFormatVersion,
+			im := &irbackup.Manifest{
+				FormatVersion: irbackup.BackupFormatVersion,
 				SourceEngine:  "postgres",
 				CreatedAt:     incrCreatedAt,
-				Kind:          ir.BackupKindIncremental,
+				Kind:          irbackup.BackupKindIncremental,
 				StartPosition: pos(curLSN),
 				EndPosition:   pos(nextLSN),
-				PartialState:  ir.BackupStateComplete,
+				PartialState:  irbackup.BackupStateComplete,
 				Schema:        schema,
-				ChangeChunks: []*ir.ChunkInfo{
+				ChangeChunks: []*irbackup.ChunkInfo{
 					{File: chunkPath, RowCount: cw.ChangeCount(), SHA256: cw.Hash()},
 				},
 			}
-			im.BackupID = ir.ComputeBackupID(im)
+			im.BackupID = irbackup.ComputeBackupID(im)
 			ip := fmt.Sprintf("manifests/incr-%05d-seg%d-%d.json", j, i, j)
 			if err := writeManifestAt(context.Background(), segStore, ip, im); err != nil {
 				t.Fatalf("seed incremental: %v", err)

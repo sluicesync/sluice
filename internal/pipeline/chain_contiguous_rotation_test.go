@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // ADR-0067 unit pins: contiguous-segment rotation handoff. A
@@ -86,23 +87,23 @@ func TestValidateFirstIncrementalBoundary(t *testing.T) {
 // incremental starting at P_N (the kept overlap). firstIncrStart lets a
 // caller inject a forward-gap (start AHEAD of the full) for the refusal
 // pin. Returns the store + a comparator ranking the LSNs.
-func rotatedSecondSegment(t *testing.T, firstIncrLSN, coverageLSN string) (ir.BackupStore, ir.PositionMonotonicChecker) {
+func rotatedSecondSegment(t *testing.T, firstIncrLSN, coverageLSN string) (irbackup.BackupStore, ir.PositionMonotonicChecker) {
 	t.Helper()
 	dir := t.TempDir()
 	store, _ := NewLocalStore(dir)
 
-	f0 := makeManifest(t, ir.BackupKindFull, nil, "0/100")
-	i0 := makeManifest(t, ir.BackupKindIncremental, f0, "0/200") // P_N = 0/200
-	s0 := seedSegment(t, store, "", f0, []*ir.Manifest{i0}, CodecGzip)
+	f0 := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
+	i0 := makeManifest(t, irbackup.BackupKindIncremental, f0, "0/200") // P_N = 0/200
+	s0 := seedSegment(t, store, "", f0, []*irbackup.Manifest{i0}, CodecGzip)
 
 	// seg1 full anchored at S = 0/300 (> P_N).
-	f1 := makeManifest(t, ir.BackupKindFull, nil, "0/300")
+	f1 := makeManifest(t, irbackup.BackupKindFull, nil, "0/300")
 	// seg1 first incremental starts at firstIncrLSN (P_N for the overlap
 	// case) and chains off the full.
-	i1 := makeManifest(t, ir.BackupKindIncremental, f1, "0/350")
+	i1 := makeManifest(t, irbackup.BackupKindIncremental, f1, "0/350")
 	i1.StartPosition = pgPos(firstIncrLSN)
-	i1.BackupID = ir.ComputeBackupID(i1)
-	s1 := seedSegment(t, store, "seg-1", f1, []*ir.Manifest{i1}, CodecNone)
+	i1.BackupID = irbackup.ComputeBackupID(i1)
+	s1 := seedSegment(t, store, "seg-1", f1, []*irbackup.Manifest{i1}, CodecNone)
 	// ADR-0067: record the kept-overlap coverage start.
 	s1.IncrementalCoverageStart = pgPos(coverageLSN)
 

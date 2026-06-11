@@ -30,6 +30,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -83,12 +84,12 @@ func TestChainRestore_PostgresToMySQL_CrossEngine(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readManifest: %v", err)
 	}
-	full.Kind = ir.BackupKindFull
+	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{
 		Engine: "postgres",
 		Token:  fmt.Sprintf(`{"slot":"sluice_slot","lsn":%q}`, slotLSN),
 	}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
 		t.Fatalf("rewrite full: %v", err)
 	}
@@ -181,12 +182,12 @@ func TestChainRestore_MySQLToPostgres_CrossEngine(t *testing.T) {
 	}
 	binlogFile, binlogPos := readMySQLBinlogPos(t, mysqlSourceDSN)
 	full, _ := readManifest(context.Background(), store)
-	full.Kind = ir.BackupKindFull
+	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{
 		Engine: "mysql",
 		Token:  fmt.Sprintf(`{"mode":"file_pos","file":%q,"pos":%d}`, binlogFile, binlogPos),
 	}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
 		t.Fatalf("rewrite full: %v", err)
 	}
@@ -288,12 +289,12 @@ func TestSyncFromBackup_CrossEngine_SchemaEvolution(t *testing.T) {
 		t.Fatalf("Backup.Run: %v", err)
 	}
 	full, _ := readManifest(context.Background(), store)
-	full.Kind = ir.BackupKindFull
+	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{
 		Engine: "postgres",
 		Token:  fmt.Sprintf(`{"slot":"sluice_slot","lsn":%q}`, slotLSN),
 	}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
 		t.Fatalf("rewrite full: %v", err)
 	}

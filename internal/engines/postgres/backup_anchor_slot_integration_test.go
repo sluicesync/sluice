@@ -32,7 +32,7 @@ import (
 	"testing"
 	"time"
 
-	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // anchorSlotRow is the pg_replication_slots projection the pins
@@ -101,7 +101,7 @@ func assertTemporaryAnchorAutoDropsOnKill(t *testing.T, dsn string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	snap, err := eng.OpenBackupSnapshot(ctx, dsn, ir.BackupSnapshotOptions{})
+	snap, err := eng.OpenBackupSnapshot(ctx, dsn, irbackup.BackupSnapshotOptions{})
 	if err != nil {
 		t.Fatalf("OpenBackupSnapshot: %v", err)
 	}
@@ -175,7 +175,7 @@ func TestBackupSnapshot_TemporaryAnchorDroppedOnGracefulClose(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	snap, err := eng.OpenBackupSnapshot(ctx, dsn, ir.BackupSnapshotOptions{})
+	snap, err := eng.OpenBackupSnapshot(ctx, dsn, irbackup.BackupSnapshotOptions{})
 	if err != nil {
 		t.Fatalf("OpenBackupSnapshot: %v", err)
 	}

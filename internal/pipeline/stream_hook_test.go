@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // TestRolloverHook_FiresWithEnvVars verifies the post-rollover hook
@@ -23,15 +24,15 @@ func TestRolloverHook_FiresWithEnvVars(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := NewLocalStore(dir)
 
-	parent := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	parent := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		CreatedAt:     time.Now().UTC(),
 		SourceEngine:  "postgres",
 		Schema:        &ir.Schema{},
-		Kind:          ir.BackupKindFull,
+		Kind:          irbackup.BackupKindFull,
 		EndPosition:   ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/100"}`},
 	}
-	parent.BackupID = ir.ComputeBackupID(parent)
+	parent.BackupID = irbackup.ComputeBackupID(parent)
 	writeParentFullManifest(t, store, parent)
 
 	// Drive a single tx-commit-bounded rollover.
@@ -131,15 +132,15 @@ func TestRolloverHook_FailureIsWarned(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := NewLocalStore(dir)
 
-	parent := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	parent := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		CreatedAt:     time.Now().UTC(),
 		SourceEngine:  "postgres",
 		Schema:        &ir.Schema{},
-		Kind:          ir.BackupKindFull,
+		Kind:          irbackup.BackupKindFull,
 		EndPosition:   ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/100"}`},
 	}
-	parent.BackupID = ir.ComputeBackupID(parent)
+	parent.BackupID = irbackup.ComputeBackupID(parent)
 	writeParentFullManifest(t, store, parent)
 
 	src := &fakeCDCEngine{
@@ -173,7 +174,7 @@ func TestRolloverHook_FailureIsWarned(t *testing.T) {
 	records, _ := listAllManifestsViaWalk(context.Background(), store)
 	var sawIncr bool
 	for _, r := range records {
-		if r.manifest.Kind == ir.BackupKindIncremental {
+		if r.manifest.Kind == irbackup.BackupKindIncremental {
 			sawIncr = true
 		}
 	}

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // # `sluice backup prune` — lineage retention pruning (ADR-0046 §4)
@@ -96,13 +97,13 @@ type lineageIncr struct {
 	segIdx   int
 	inSegIdx int
 	path     string
-	manifest *ir.Manifest
+	manifest *irbackup.Manifest
 }
 
 // PruneChain executes a retention prune against the lineage in store.
 // See package doc for semantics. Returns the summary or a wrapped
 // error on any pre-flight refusal / I/O failure.
-func PruneChain(ctx context.Context, store ir.BackupStore, opts PruneOpts) (*PruneResult, error) {
+func PruneChain(ctx context.Context, store irbackup.BackupStore, opts PruneOpts) (*PruneResult, error) {
 	if (opts.KeepIncrementals > 0) == (opts.KeepDuration > 0) {
 		return nil, errors.New("prune: exactly one of KeepIncrementals or KeepDuration is required")
 	}
@@ -319,7 +320,7 @@ func PruneChain(ctx context.Context, store ir.BackupStore, opts PruneOpts) (*Pru
 
 // r0 is the "nothing to prune" early return: report the full kept set
 // without mutating anything.
-func r0(cat *LineageCatalog, store ir.BackupStore, ctx context.Context, why string) (*PruneResult, error) {
+func r0(cat *LineageCatalog, store irbackup.BackupStore, ctx context.Context, why string) (*PruneResult, error) {
 	res := &PruneResult{}
 	for si := cat.RestorableFromSegment; si < len(cat.Segments); si++ {
 		seg := &cat.Segments[si]
@@ -382,7 +383,7 @@ func appendChunk(res *PruneResult, file string) []string {
 // that ensures the floor is never above the backup-resume needs.
 func SchemaHistoryRetentionFloor(
 	ctx context.Context,
-	store ir.BackupStore,
+	store irbackup.BackupStore,
 	liveSafePoint ir.Position,
 	orderer ir.PositionOrderer,
 ) (floor ir.Position, ok bool, err error) {
@@ -446,7 +447,7 @@ func SchemaHistoryRetentionFloor(
 // The "oldest retained" chain is the one at the lineage catalog's
 // [LineageCatalog.RestorableFromSegment] index (the first segment the
 // lineage considers restorable post-prune).
-func oldestRetainedBackupResumePosition(ctx context.Context, store ir.BackupStore) (ir.Position, bool, error) {
+func oldestRetainedBackupResumePosition(ctx context.Context, store irbackup.BackupStore) (ir.Position, bool, error) {
 	cat, ok, err := loadLineageCatalog(ctx, store)
 	if err != nil {
 		return ir.Position{}, false, fmt.Errorf("load lineage: %w", err)

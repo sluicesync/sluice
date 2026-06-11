@@ -18,6 +18,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 )
@@ -64,12 +65,12 @@ func TestIncrementalBackup_MySQLChainRestore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readManifest: %v", err)
 	}
-	full.Kind = ir.BackupKindFull
+	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{
 		Engine: "mysql",
 		Token:  fmt.Sprintf(`{"mode":"file_pos","file":%q,"pos":%d}`, binlogFile, binlogPos),
 	}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
 		t.Fatalf("rewrite full manifest: %v", err)
 	}
