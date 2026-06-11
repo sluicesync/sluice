@@ -1,7 +1,7 @@
 # sluice v0.99.35
 
-> ⚠️ **KNOWN ISSUE (Bug 135, found by the post-release battle-test; fix in
-> progress for v0.99.36): do NOT `--resume` a crashed/killed PARALLEL
+> ⚠️ **KNOWN ISSUE (Bug 135, found by the post-release battle-test; FIXED in
+> **v0.99.36** — upgrade): do NOT `--resume` a crashed/killed PARALLEL
 > `backup full` on this version.** Resuming a backup that was interrupted
 > while running with the new parallel sweep (the v0.99.35 default) can
 > produce a backup containing duplicate and missing rows while exiting 0
