@@ -6,6 +6,18 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- **Schema fingerprints are now stable across manifest JSON
+  round-trips (task #49).** `ComputeSchemaHash`'s canonical view
+  normalizes a nil `Column.Default` to the explicit `DefaultNone` the
+  manifest decode hooks materialize, so a reader-fresh schema and the
+  same schema re-read from a manifest fingerprint identically; the
+  backup resume drift guard no longer JSON-round-trips the fresh side
+  to compensate. Recorded `schema_hash` values change for schemas
+  with columns that have no default — harmless: manifests' stored
+  hashes are write-only today (nothing compares against a previously
+  stored value), and the drift guard always recomputes both sides.
+
 ## [0.99.38] - 2026-06-11
 
 ### Fixed

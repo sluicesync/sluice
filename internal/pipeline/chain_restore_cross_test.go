@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // schemaDeltaRecorderEngine: an [ir.Engine] whose schema writer
@@ -133,12 +134,12 @@ func TestApplySchemaDeltas_CrossEngine_AddColumnUUIDtoChar36(t *testing.T) {
 	}
 	link := &segmentRecord{segment: &LineageSegment{Codec: CodecGzip}, manifestRecord: manifestRecord{
 		path: "manifests/incr-0001.json",
-		manifest: &ir.Manifest{
+		manifest: &irbackup.Manifest{
 			BackupID:     "incr-0001",
 			SourceEngine: "postgres",
-			Kind:         ir.BackupKindIncremental,
-			SchemaDelta: []*ir.SchemaDeltaEntry{{
-				Kind:  ir.SchemaDeltaAlterTable,
+			Kind:         irbackup.BackupKindIncremental,
+			SchemaDelta: []*irbackup.SchemaDeltaEntry{{
+				Kind:  irbackup.SchemaDeltaAlterTable,
 				Table: "users",
 				Before: &ir.Table{
 					Name: "users",
@@ -181,12 +182,12 @@ func TestApplySchemaDeltas_SameEngine_NoRetarget_TINYINTpassthrough(t *testing.T
 	cr := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: &LocalStore{}}
 	link := &segmentRecord{segment: &LineageSegment{Codec: CodecGzip}, manifestRecord: manifestRecord{
 		path: "manifests/incr-0001.json",
-		manifest: &ir.Manifest{
+		manifest: &irbackup.Manifest{
 			BackupID:     "incr-0001",
 			SourceEngine: "mysql",
-			Kind:         ir.BackupKindIncremental,
-			SchemaDelta: []*ir.SchemaDeltaEntry{{
-				Kind:  ir.SchemaDeltaAlterTable,
+			Kind:         irbackup.BackupKindIncremental,
+			SchemaDelta: []*irbackup.SchemaDeltaEntry{{
+				Kind:  irbackup.SchemaDeltaAlterTable,
 				Table: "users",
 				Before: &ir.Table{
 					Name: "users",
@@ -231,12 +232,12 @@ func TestApplySchemaDeltas_CrossEngine_AddTableUUID_RetargetsCol(t *testing.T) {
 	cr := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: &LocalStore{}}
 	link := &segmentRecord{segment: &LineageSegment{Codec: CodecGzip}, manifestRecord: manifestRecord{
 		path: "manifests/incr-0001.json",
-		manifest: &ir.Manifest{
+		manifest: &irbackup.Manifest{
 			BackupID:     "incr-0001",
 			SourceEngine: "postgres",
-			Kind:         ir.BackupKindIncremental,
-			SchemaDelta: []*ir.SchemaDeltaEntry{{
-				Kind:  ir.SchemaDeltaAddTable,
+			Kind:         irbackup.BackupKindIncremental,
+			SchemaDelta: []*irbackup.SchemaDeltaEntry{{
+				Kind:  irbackup.SchemaDeltaAddTable,
 				Table: "tokens",
 				After: &ir.Table{
 					Name: "tokens",
@@ -276,12 +277,12 @@ func TestApplySchemaDeltas_AlterAddColumnError_Propagates(t *testing.T) {
 	cr := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: &LocalStore{}}
 	link := &segmentRecord{segment: &LineageSegment{Codec: CodecGzip}, manifestRecord: manifestRecord{
 		path: "manifests/incr-0001.json",
-		manifest: &ir.Manifest{
+		manifest: &irbackup.Manifest{
 			BackupID:     "incr-0001",
 			SourceEngine: "postgres",
-			Kind:         ir.BackupKindIncremental,
-			SchemaDelta: []*ir.SchemaDeltaEntry{{
-				Kind:   ir.SchemaDeltaAlterTable,
+			Kind:         irbackup.BackupKindIncremental,
+			SchemaDelta: []*irbackup.SchemaDeltaEntry{{
+				Kind:   irbackup.SchemaDeltaAlterTable,
 				Table:  "users",
 				Before: &ir.Table{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
 				After: &ir.Table{Name: "users", Columns: []*ir.Column{

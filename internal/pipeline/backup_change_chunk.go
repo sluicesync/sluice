@@ -76,7 +76,7 @@ type changeChunkWriter struct {
 }
 
 // newChangeChunkWriter wraps out (typically a pipe-buffer destined
-// for [ir.BackupStore.Put]) with the gzip + JSONL machinery and
+// for [irbackup.Store.Put]) with the gzip + JSONL machinery and
 // writes the chunk header. Caller must call Close to flush.
 //
 // When cek is non-nil, the gzipped JSONL bytes are buffered in memory

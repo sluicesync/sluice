@@ -12,7 +12,7 @@ package crypto
 //
 // Same [EnvelopeEncryption] seam Phase 6.1 introduced — the chunk
 // writer/reader paths don't change. The only Phase-6.3-Azure-specific
-// bits are recorded in the manifest's [ir.ChainEncryption]: KEKMode
+// bits are recorded in the manifest's [backup.ChainEncryption]: KEKMode
 // is "azure-kms", KEKRef is the operator's Key Vault key identifier
 // URL, and Argon2id is left nil.
 //
@@ -43,7 +43,7 @@ import (
 )
 
 // KEKModeAzureKMS is the KEKMode tag recorded in
-// [ir.ChainEncryption.KEKMode] when the chain was encrypted under an
+// [backup.ChainEncryption.KEKMode] when the chain was encrypted under an
 // Azure Key Vault key. Restore-side validation matches it against
 // the supplied envelope's Mode().
 //
@@ -228,12 +228,12 @@ func NewAzureKMSEnvelope(ctx context.Context, keyID string, opts ...AzureKMSOpti
 }
 
 // Mode returns [KEKModeAzureKMS] — the tag recorded in
-// [ir.ChainEncryption.KEKMode] for Azure-KMS-encrypted chains.
+// [backup.ChainEncryption.KEKMode] for Azure-KMS-encrypted chains.
 func (e *AzureKMSEnvelope) Mode() string { return KEKModeAzureKMS }
 
 // KeyID returns the full Key Vault key identifier URL the envelope
 // was constructed with. Exposed so callers (orchestrator's
-// [ir.ChainEncryption.KEKRef] populater) can record it on the
+// [backup.ChainEncryption.KEKRef] populater) can record it on the
 // manifest without re-asking the operator.
 func (e *AzureKMSEnvelope) KeyID() string { return e.keyID }
 

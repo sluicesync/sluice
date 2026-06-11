@@ -24,7 +24,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
-	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -128,7 +128,7 @@ func TestBackup_ResumeSweepsOrphanedAnchorSlot_Postgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readManifest: %v", err)
 	}
-	manifest.PartialState = ir.BackupStateInProgress
+	manifest.PartialState = irbackup.BackupStateInProgress
 	if err := writeManifest(context.Background(), store, manifest); err != nil {
 		t.Fatalf("writeManifest in-progress: %v", err)
 	}

@@ -32,11 +32,11 @@ package pipeline
 import (
 	"sync"
 
-	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // brokerStopRegistry tracks running [SyncFromBackup] instances by
-// their [ir.BackupStore]. Each entry's channel is closed exactly once
+// their [irbackup.Store]. Each entry's channel is closed exactly once
 // when either the operator's RequestSyncFromBackupStop fires or the
 // broker's Run returns and unregisters itself. Closing-instead-of-
 // sending lets multiple poll iterations safely consume the signal via
@@ -48,8 +48,8 @@ var brokerStopRegistry = struct {
 	// already, so the interface value's underlying pointer is the
 	// natural identity. Map keys are interface-typed; equality works
 	// because both sides of the comparison have pointer dynamic types.
-	chans map[ir.BackupStore]chan struct{}
-}{chans: map[ir.BackupStore]chan struct{}{}}
+	chans map[irbackup.Store]chan struct{}
+}{chans: map[irbackup.Store]chan struct{}{}}
 
 // registerBrokerStopChan creates and registers an in-process stop
 // channel for store. Returns the channel + a deregister closure the
@@ -60,7 +60,7 @@ var brokerStopRegistry = struct {
 //
 // The returned deregister closure is the only safe way to remove the
 // entry; calling it more than once is a no-op (sync.Once-guarded).
-func registerBrokerStopChan(store ir.BackupStore) (stopCh chan struct{}, deregister func()) {
+func registerBrokerStopChan(store irbackup.Store) (stopCh chan struct{}, deregister func()) {
 	ch := make(chan struct{})
 	brokerStopRegistry.mu.Lock()
 	brokerStopRegistry.chans[store] = ch
@@ -100,7 +100,7 @@ func registerBrokerStopChan(store ir.BackupStore) (stopCh chan struct{}, deregis
 // Safe to call when no broker is registered (cross-process case): the
 // function is a no-op and the file write remains the cross-machine
 // rendezvous.
-func notifyBrokerStop(store ir.BackupStore) bool {
+func notifyBrokerStop(store irbackup.Store) bool {
 	brokerStopRegistry.mu.Lock()
 	ch, ok := brokerStopRegistry.chans[store]
 	brokerStopRegistry.mu.Unlock()

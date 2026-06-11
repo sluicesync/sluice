@@ -10,33 +10,33 @@ import (
 	"testing"
 	"time"
 
-	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // countingGetStore counts every Get the broker chain code issues.
 // Used to prove the cache's idle-tick GET count is constant in chain
 // length (repo-audit M2.4: an idle tick was O(chain) GETs).
 type countingGetStore struct {
-	ir.BackupStore
+	irbackup.Store
 	gets int
 }
 
 func (s *countingGetStore) Get(ctx context.Context, path string) (io.ReadCloser, error) {
 	s.gets++
-	return s.BackupStore.Get(ctx, path)
+	return s.Store.Get(ctx, path)
 }
 
 // seedLinearLineage writes a one-segment lineage with n chained
 // incrementals plus its lineage.json, returning the manifests in
 // chain order (full first).
-func seedLinearLineage(t *testing.T, store ir.BackupStore, n int) []*ir.Manifest {
+func seedLinearLineage(t *testing.T, store irbackup.Store, n int) []*irbackup.Manifest {
 	t.Helper()
-	full := makeManifest(t, ir.BackupKindFull, nil, "0/100")
-	manifests := []*ir.Manifest{full}
-	incrs := make([]*ir.Manifest, 0, n)
+	full := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
+	manifests := []*irbackup.Manifest{full}
+	incrs := make([]*irbackup.Manifest, 0, n)
 	prev := full
 	for i := 0; i < n; i++ {
-		m := makeManifest(t, ir.BackupKindIncremental, prev, fmt.Sprintf("0/%d", 200+i*100))
+		m := makeManifest(t, irbackup.BackupKindIncremental, prev, fmt.Sprintf("0/%d", 200+i*100))
 		incrs = append(incrs, m)
 		manifests = append(manifests, m)
 		prev = m
@@ -59,7 +59,7 @@ func TestBrokerChainCache_IdleTickGETsConstant(t *testing.T) {
 		t.Run(fmt.Sprintf("links=%d", chainLinks), func(t *testing.T) {
 			mem := newMemStore()
 			manifests := seedLinearLineage(t, mem, chainLinks-1)
-			store := &countingGetStore{BackupStore: mem}
+			store := &countingGetStore{Store: mem}
 			var cache brokerChainCache
 
 			// Warm walk: O(chain) GETs, by design.
@@ -115,7 +115,7 @@ func TestBrokerChainCache_AppendInvalidates(t *testing.T) {
 	// Append incr-3 the way the stream does: durable manifest first,
 	// then the lineage.json catalog update.
 	tail := manifests[len(manifests)-1]
-	next := makeManifest(t, ir.BackupKindIncremental, tail, "0/900")
+	next := makeManifest(t, irbackup.BackupKindIncremental, tail, "0/900")
 	const nextPath = "manifests/incr-0003.json"
 	mustWriteManifest(t, mem, nextPath, next)
 	if err := updateLineageForManifest(ctx, mem, next, nextPath, CodecGzip); err != nil {
@@ -158,7 +158,7 @@ func TestBrokerChainCache_TailCheckpointRewriteInvalidates(t *testing.T) {
 	// deliberately WITHOUT touching lineage.json — the failed
 	// best-effort catalog-update shape.
 	tail := manifests[2]
-	tail.ChangeChunks = append(tail.ChangeChunks, &ir.ChunkInfo{File: "changes/c1.bin", RowCount: 3})
+	tail.ChangeChunks = append(tail.ChangeChunks, &irbackup.ChunkInfo{File: "changes/c1.bin", RowCount: 3})
 	mustWriteManifest(t, mem, "manifests/incr-0001.json", tail)
 
 	chain, err = cache.get(ctx, mem)
@@ -176,9 +176,9 @@ func TestBrokerChainCache_TailCheckpointRewriteInvalidates(t *testing.T) {
 func TestBrokerChainCache_RotationInvalidates(t *testing.T) {
 	ctx := context.Background()
 	mem := newMemStore()
-	f0 := makeManifest(t, ir.BackupKindFull, nil, "0/100")
-	i0 := makeManifest(t, ir.BackupKindIncremental, f0, "0/200")
-	s0 := seedSegment(t, mem, "", f0, []*ir.Manifest{i0}, CodecGzip)
+	f0 := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
+	i0 := makeManifest(t, irbackup.BackupKindIncremental, f0, "0/200")
+	s0 := seedSegment(t, mem, "", f0, []*irbackup.Manifest{i0}, CodecGzip)
 	cat := &LineageCatalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []LineageSegment{s0}}
 	if err := writeLineageCatalog(ctx, mem, cat); err != nil {
 		t.Fatal(err)
@@ -194,9 +194,9 @@ func TestBrokerChainCache_RotationInvalidates(t *testing.T) {
 
 	// Rotate: cap segment 0, append segment 1 with its own full,
 	// commit via the catalog rewrite (the FSM's linearization point).
-	f1 := makeManifest(t, ir.BackupKindFull, nil, "0/300")
+	f1 := makeManifest(t, irbackup.BackupKindFull, nil, "0/300")
 	f1.StartPosition = i0.EndPosition
-	f1.BackupID = ir.ComputeBackupID(f1)
+	f1.BackupID = irbackup.ComputeBackupID(f1)
 	s1 := seedSegment(t, mem, "seg-1", f1, nil, CodecZstd)
 	capt := time.Now().UTC()
 	s0.CappedAt, s0.CapReason = &capt, rotationReasonAge
@@ -224,14 +224,14 @@ func TestBrokerChainCache_RotationInvalidates(t *testing.T) {
 func TestBrokerChainCache_PruneFloorAdvanceInvalidates(t *testing.T) {
 	ctx := context.Background()
 	mem := newMemStore()
-	f0 := makeManifest(t, ir.BackupKindFull, nil, "0/100")
-	i0 := makeManifest(t, ir.BackupKindIncremental, f0, "0/200")
-	s0 := seedSegment(t, mem, "", f0, []*ir.Manifest{i0}, CodecGzip)
-	f1 := makeManifest(t, ir.BackupKindFull, nil, "0/300")
+	f0 := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
+	i0 := makeManifest(t, irbackup.BackupKindIncremental, f0, "0/200")
+	s0 := seedSegment(t, mem, "", f0, []*irbackup.Manifest{i0}, CodecGzip)
+	f1 := makeManifest(t, irbackup.BackupKindFull, nil, "0/300")
 	f1.StartPosition = i0.EndPosition
-	f1.BackupID = ir.ComputeBackupID(f1)
-	i1 := makeManifest(t, ir.BackupKindIncremental, f1, "0/400")
-	s1 := seedSegment(t, mem, "seg-1", f1, []*ir.Manifest{i1}, CodecZstd)
+	f1.BackupID = irbackup.ComputeBackupID(f1)
+	i1 := makeManifest(t, irbackup.BackupKindIncremental, f1, "0/400")
+	s1 := seedSegment(t, mem, "seg-1", f1, []*irbackup.Manifest{i1}, CodecZstd)
 	capt := time.Now().UTC()
 	s0.CappedAt, s0.CapReason = &capt, rotationReasonAge
 	cat := &LineageCatalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []LineageSegment{s0, s1}}
@@ -270,9 +270,9 @@ func TestBrokerChainCache_PruneFloorAdvanceInvalidates(t *testing.T) {
 func TestBrokerChainCache_LegacyCatalogAbsentBypassesCache(t *testing.T) {
 	ctx := context.Background()
 	mem := newMemStore()
-	full := makeManifest(t, ir.BackupKindFull, nil, "0/100")
+	full := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
 	mustWriteManifest(t, mem, ManifestFileName, full)
-	i0 := makeManifest(t, ir.BackupKindIncremental, full, "0/200")
+	i0 := makeManifest(t, irbackup.BackupKindIncremental, full, "0/200")
 	mustWriteManifest(t, mem, "manifests/incr-0001.json", i0)
 
 	var cache brokerChainCache
@@ -289,7 +289,7 @@ func TestBrokerChainCache_LegacyCatalogAbsentBypassesCache(t *testing.T) {
 
 	// A new incremental written under the legacy layout must show up
 	// on the very next get (no catalog write happens here).
-	i1 := makeManifest(t, ir.BackupKindIncremental, i0, "0/300")
+	i1 := makeManifest(t, irbackup.BackupKindIncremental, i0, "0/300")
 	mustWriteManifest(t, mem, "manifests/incr-0002.json", i1)
 	chain, err = cache.get(ctx, mem)
 	if err != nil {

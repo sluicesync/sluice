@@ -23,6 +23,7 @@ import (
 	"fmt"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/translate"
 )
 
@@ -371,7 +372,7 @@ func checkShardColumnSupport(target any, shard ShardColumnSpec, contextID string
 // portable-type concern). Returns nil for same-engine pairs and unknown
 // engine pairs; a wrapped error naming the offending column otherwise.
 func checkCrossEngineDeltaSupportable(
-	deltas []*ir.SchemaDeltaEntry,
+	deltas []*irbackup.SchemaDeltaEntry,
 	sourceEngine, targetEngine, backupID string,
 ) error {
 	if sourceEngine == targetEngine || sourceEngine == "" {
@@ -382,7 +383,7 @@ func checkCrossEngineDeltaSupportable(
 			continue
 		}
 		switch d.Kind {
-		case ir.SchemaDeltaAddTable, ir.SchemaDeltaAlterTable:
+		case irbackup.SchemaDeltaAddTable, irbackup.SchemaDeltaAlterTable:
 			tbl := &ir.Schema{Tables: []*ir.Table{d.After}}
 			ctxID := fmt.Sprintf("chain restore: incremental %s schema delta on table %q",
 				backupID, d.Table)

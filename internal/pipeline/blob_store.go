@@ -3,7 +3,7 @@
 
 package pipeline
 
-// Cloud-blob implementation of [ir.BackupStore] over `gocloud.dev/blob`.
+// Cloud-blob implementation of [irbackup.Store] over `gocloud.dev/blob`.
 //
 // Phase 2 of the logical-backup feature (`docs/dev/design/logical-backups.md`
 // + `docs/dev/design/logical-backups-phase-2.md`). Mirrors [LocalStore]'s
@@ -42,10 +42,10 @@ import (
 	_ "gocloud.dev/blob/gcsblob"
 	_ "gocloud.dev/blob/s3blob"
 
-	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
-// BlobStore is the cloud-backend implementation of [ir.BackupStore].
+// BlobStore is the cloud-backend implementation of [irbackup.Store].
 // Construct with [OpenBlobStore].
 type BlobStore struct {
 	bucket *blob.Bucket
@@ -175,7 +175,7 @@ func (s *BlobStore) Close() error {
 	return s.bucket.Close()
 }
 
-// Put implements [ir.BackupStore.Put]. Streams r to the named key
+// Put implements [irbackup.Store.Put]. Streams r to the named key
 // within the bucket. gocloud's s3blob driver negotiates multipart
 // upload automatically based on stream size; no extra coordination
 // is needed.
@@ -202,7 +202,7 @@ func (s *BlobStore) Put(ctx context.Context, path string, r io.Reader) error {
 	return nil
 }
 
-// Get implements [ir.BackupStore.Get]. Returns a streaming reader for
+// Get implements [irbackup.Store.Get]. Returns a streaming reader for
 // the contents of path; caller closes.
 func (s *BlobStore) Get(ctx context.Context, path string) (io.ReadCloser, error) {
 	if err := ctx.Err(); err != nil {
@@ -220,7 +220,7 @@ func (s *BlobStore) Get(ctx context.Context, path string) (io.ReadCloser, error)
 	return rc, nil
 }
 
-// List implements [ir.BackupStore.List]. Returns every key whose name
+// List implements [irbackup.Store.List]. Returns every key whose name
 // starts with prefix, in unspecified order. Paths in the result are
 // relative to the BlobStore's configured prefix — matching
 // [LocalStore]'s contract.
@@ -255,7 +255,7 @@ func (s *BlobStore) List(ctx context.Context, prefix string) ([]string, error) {
 	return out, nil
 }
 
-// Delete implements [ir.BackupStore.Delete]. Idempotent: a missing key
+// Delete implements [irbackup.Store.Delete]. Idempotent: a missing key
 // returns nil to match [LocalStore]'s contract.
 func (s *BlobStore) Delete(ctx context.Context, path string) error {
 	if err := ctx.Err(); err != nil {
@@ -275,7 +275,7 @@ func (s *BlobStore) Delete(ctx context.Context, path string) error {
 	return nil
 }
 
-// Exists implements [ir.BackupStore.Exists]. Returns true iff a blob
+// Exists implements [irbackup.Store.Exists]. Returns true iff a blob
 // exists at path. Used by the resumable backup writer to skip already-
 // uploaded chunks. NotFound is the false-without-error case; any other
 // gcerrors code surfaces as a wrapped error.
@@ -384,5 +384,5 @@ func wrapBlobErr(op, path string, err error) error {
 	}
 }
 
-// Compile-time check that BlobStore satisfies ir.BackupStore.
-var _ ir.BackupStore = (*BlobStore)(nil)
+// Compile-time check that BlobStore satisfies irbackup.Store.
+var _ irbackup.Store = (*BlobStore)(nil)

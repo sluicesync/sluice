@@ -8,6 +8,7 @@ import (
 	"log/slog"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // chainAckController is the structural seam to the engine CDC reader's
@@ -32,7 +33,7 @@ type chainAckController interface {
 	ReleaseSlotAckTo(pos ir.Position) error
 }
 
-// preflightChainResume runs the engine's [ir.ChainResumePreflighter]
+// preflightChainResume runs the engine's [irbackup.ChainResumePreflighter]
 // (when implemented) against the chain's resume position before any
 // CDC stream opens. Shared by [IncrementalBackup.Run] and
 // [BackupStream.Run] — the refusal semantics are identical: a slot
@@ -41,7 +42,7 @@ type chainAckController interface {
 // WAL in between. The zero position (a "from now" chain start) skips
 // the check; engines without the surface (MySQL) skip it too.
 func preflightChainResume(ctx context.Context, source ir.Engine, dsn string, from ir.Position) error {
-	pf, ok := source.(ir.ChainResumePreflighter)
+	pf, ok := source.(irbackup.ChainResumePreflighter)
 	if !ok || (from.Engine == "" && from.Token == "") {
 		return nil
 	}

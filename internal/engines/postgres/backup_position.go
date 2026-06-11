@@ -11,11 +11,11 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
-// CaptureBackupPosition implements [ir.BackupPositionCapturer]. Returns
+// CaptureBackupPosition implements [irbackup.PositionCapturer]. Returns
 // the source's current WAL position paired with the supplied slot name,
 // encoded into the same JSON envelope shape the CDC reader emits via
 // [encodePGPos]. Phase 3.3 of the logical-backup feature: the full
-// backup orchestrator records this on [ir.Manifest.EndPosition] so a
+// backup orchestrator records this on [irbackup.Manifest.EndPosition] so a
 // subsequent incremental can resume CDC from the LSN at end-of-backup.
 //
 // The recorded position semantically marks the source's cursor at the

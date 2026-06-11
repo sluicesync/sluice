@@ -3,7 +3,10 @@
 
 package postgres
 
-import "sluicesync.dev/sluice/internal/ir"
+import (
+	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+)
 
 // Compile-time declarations of the OPTIONAL ir interfaces this
 // engine's concrete types intentionally implement.
@@ -24,7 +27,7 @@ var (
 	// Engine-level optional openers / probers (value type — the
 	// registry holds an Engine value, see init()).
 	_ ir.Engine                         = Engine{}
-	_ ir.BackupSnapshotOpener           = Engine{}
+	_ irbackup.SnapshotOpener           = Engine{}
 	_ ir.CDCReaderWithSlotOpener        = Engine{}
 	_ ir.CDCSchemaSnapshotNormalizer    = Engine{}
 	_ ir.ConnectionSlotClassifier       = Engine{}
@@ -43,22 +46,22 @@ var (
 	_ ir.TargetStaleBackendReaper       = Engine{}
 
 	// SchemaReader optional surfaces.
-	_ ir.BackupPositionCapturer        = (*SchemaReader)(nil)
-	_ ir.BytesLagReporter              = (*SchemaReader)(nil)
-	_ ir.DiagnoseProber                = (*SchemaReader)(nil)
-	_ ir.ExtensionAware                = (*SchemaReader)(nil)
-	_ ir.HealthReporter                = (*SchemaReader)(nil)
-	_ ir.HeartbeatWriter               = (*SchemaReader)(nil)
-	_ ir.MultiDatabaseScoper           = (*SchemaReader)(nil)
-	_ ir.PositionFromManifestPreflight = (*SchemaReader)(nil)
-	_ ir.SampleVerifier                = (*SchemaReader)(nil)
-	_ ir.SchemaSetter                  = (*SchemaReader)(nil)
-	_ ir.SequenceStateReader           = (*SchemaReader)(nil)
-	_ ir.SlotHealthReporter            = (*SchemaReader)(nil)
-	_ ir.SlotSpillReporter             = (*SchemaReader)(nil)
-	_ ir.TableScoper                   = (*SchemaReader)(nil)
-	_ ir.VerbatimExtensionAware        = (*SchemaReader)(nil)
-	_ ir.Verifier                      = (*SchemaReader)(nil)
+	_ irbackup.PositionCapturer              = (*SchemaReader)(nil)
+	_ ir.BytesLagReporter                    = (*SchemaReader)(nil)
+	_ ir.DiagnoseProber                      = (*SchemaReader)(nil)
+	_ ir.ExtensionAware                      = (*SchemaReader)(nil)
+	_ ir.HealthReporter                      = (*SchemaReader)(nil)
+	_ ir.HeartbeatWriter                     = (*SchemaReader)(nil)
+	_ ir.MultiDatabaseScoper                 = (*SchemaReader)(nil)
+	_ irbackup.PositionFromManifestPreflight = (*SchemaReader)(nil)
+	_ ir.SampleVerifier                      = (*SchemaReader)(nil)
+	_ ir.SchemaSetter                        = (*SchemaReader)(nil)
+	_ ir.SequenceStateReader                 = (*SchemaReader)(nil)
+	_ ir.SlotHealthReporter                  = (*SchemaReader)(nil)
+	_ ir.SlotSpillReporter                   = (*SchemaReader)(nil)
+	_ ir.TableScoper                         = (*SchemaReader)(nil)
+	_ ir.VerbatimExtensionAware              = (*SchemaReader)(nil)
+	_ ir.Verifier                            = (*SchemaReader)(nil)
 
 	// SchemaWriter optional surfaces.
 	_ ir.ColumnDDLPreviewer      = (*SchemaWriter)(nil)

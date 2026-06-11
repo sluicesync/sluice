@@ -18,6 +18,7 @@ import (
 	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline"
 	"sluicesync.dev/sluice/internal/redact"
 )
@@ -988,7 +989,7 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 	// position source, replacing the default sluice_cdc_state lookup.
 	// Mutually exclusive with --reset-target-data (different recovery
 	// shapes; both override the persisted position).
-	var manifestStore ir.BackupStore
+	var manifestStore irbackup.Store
 	var manifestStoreCloser func() error
 	if s.PositionFromManifest != "" {
 		ctx := kongContext()

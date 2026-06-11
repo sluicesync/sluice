@@ -1,9 +1,13 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package ir
+package backup
 
-import "testing"
+import (
+	"testing"
+
+	"sluicesync.dev/sluice/internal/ir"
+)
 
 // TestChooseFormatVersion_Bug116 pins the v0.94.1 Bug 116 closure:
 // manifests whose schema carries security-relevant fields older
@@ -17,7 +21,7 @@ import "testing"
 func TestChooseFormatVersion_Bug116(t *testing.T) {
 	cases := []struct {
 		name   string
-		schema *Schema
+		schema *ir.Schema
 		want   int
 	}{
 		{
@@ -27,22 +31,22 @@ func TestChooseFormatVersion_Bug116(t *testing.T) {
 		},
 		{
 			name:   "empty schema → legacy",
-			schema: &Schema{},
+			schema: &ir.Schema{},
 			want:   FormatVersionLegacy,
 		},
 		{
 			name: "innocent table (no security fields) → legacy",
-			schema: &Schema{
-				Tables: []*Table{
-					{Name: "users", Columns: []*Column{{Name: "id", Type: Integer{Width: 64}}}},
+			schema: &ir.Schema{
+				Tables: []*ir.Table{
+					{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
 				},
 			},
 			want: FormatVersionLegacy,
 		},
 		{
 			name: "table with RLSEnabled → security-metadata",
-			schema: &Schema{
-				Tables: []*Table{
+			schema: &ir.Schema{
+				Tables: []*ir.Table{
 					{Name: "tenants", RLSEnabled: true},
 				},
 			},
@@ -50,8 +54,8 @@ func TestChooseFormatVersion_Bug116(t *testing.T) {
 		},
 		{
 			name: "table with RLSForced (but not Enabled) → security-metadata",
-			schema: &Schema{
-				Tables: []*Table{
+			schema: &ir.Schema{
+				Tables: []*ir.Table{
 					{Name: "audit", RLSForced: true},
 				},
 			},
@@ -59,26 +63,26 @@ func TestChooseFormatVersion_Bug116(t *testing.T) {
 		},
 		{
 			name: "table with Policies → security-metadata",
-			schema: &Schema{
-				Tables: []*Table{
-					{Name: "events", Policies: []*Policy{{Name: "tenant_isolation"}}},
+			schema: &ir.Schema{
+				Tables: []*ir.Table{
+					{Name: "events", Policies: []*ir.Policy{{Name: "tenant_isolation"}}},
 				},
 			},
 			want: FormatVersionSecurityMetadata,
 		},
 		{
 			name: "table with ExcludeConstraints → security-metadata",
-			schema: &Schema{
-				Tables: []*Table{
-					{Name: "schedule", ExcludeConstraints: []*ExcludeConstraint{{Name: "no_overlap"}}},
+			schema: &ir.Schema{
+				Tables: []*ir.Table{
+					{Name: "schedule", ExcludeConstraints: []*ir.ExcludeConstraint{{Name: "no_overlap"}}},
 				},
 			},
 			want: FormatVersionSecurityMetadata,
 		},
 		{
 			name: "multi-table: one innocent, one with RLS → security-metadata (first hit wins)",
-			schema: &Schema{
-				Tables: []*Table{
+			schema: &ir.Schema{
+				Tables: []*ir.Table{
 					{Name: "users"},
 					{Name: "tenants", RLSEnabled: true},
 				},
@@ -87,8 +91,8 @@ func TestChooseFormatVersion_Bug116(t *testing.T) {
 		},
 		{
 			name: "nil-element-tolerance: nil *Table in slice is skipped",
-			schema: &Schema{
-				Tables: []*Table{
+			schema: &ir.Schema{
+				Tables: []*ir.Table{
 					{Name: "users"},
 					nil,
 				},
@@ -97,8 +101,8 @@ func TestChooseFormatVersion_Bug116(t *testing.T) {
 		},
 		{
 			name: "BackupFormatVersion constant is the security-metadata version (v0.94.1+ default ceiling)",
-			schema: &Schema{
-				Tables: []*Table{{Name: "x", RLSEnabled: true}},
+			schema: &ir.Schema{
+				Tables: []*ir.Table{{Name: "x", RLSEnabled: true}},
 			},
 			want: BackupFormatVersion,
 		},

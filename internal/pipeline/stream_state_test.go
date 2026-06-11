@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // TestStreamState_RoundTrip verifies the JSON round-trip of the state
@@ -335,15 +336,15 @@ func TestBackupStream_Run_RefusesFreshConcurrentWriter(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := NewLocalStore(dir)
 
-	parent := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	parent := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		CreatedAt:     time.Now().UTC(),
 		SourceEngine:  "postgres",
 		Schema:        &ir.Schema{},
-		Kind:          ir.BackupKindFull,
+		Kind:          irbackup.BackupKindFull,
 		EndPosition:   ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/100"}`},
 	}
-	parent.BackupID = ir.ComputeBackupID(parent)
+	parent.BackupID = irbackup.ComputeBackupID(parent)
 	writeParentFullManifest(t, store, parent)
 
 	now := time.Now().UTC()

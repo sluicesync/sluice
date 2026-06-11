@@ -11,7 +11,7 @@ package crypto
 //
 // Same `EnvelopeEncryption` seam Phase 6.1 introduced — the chunk
 // writer/reader paths don't change. The only Phase-6.2-specific bits
-// are recorded in the manifest's [ir.ChainEncryption]: KEKMode is
+// are recorded in the manifest's [backup.ChainEncryption]: KEKMode is
 // "aws-kms", KEKRef is the operator's key ARN, and Argon2id is left
 // nil (KMS handles its own key state via cloud-provider mechanisms).
 
@@ -29,7 +29,7 @@ import (
 )
 
 // KEKModeAWSKMS is the KEKMode tag recorded in
-// [ir.ChainEncryption.KEKMode] when the chain was encrypted under an
+// [backup.ChainEncryption.KEKMode] when the chain was encrypted under an
 // AWS KMS key. Restore-side validation matches it against the
 // supplied envelope's Mode().
 //
@@ -164,11 +164,11 @@ func NewKMSEnvelope(ctx context.Context, keyARN string, opts ...KMSOption) (*KMS
 }
 
 // Mode returns [KEKModeAWSKMS] — the tag recorded in
-// [ir.ChainEncryption.KEKMode] for KMS-encrypted chains.
+// [backup.ChainEncryption.KEKMode] for KMS-encrypted chains.
 func (e *KMSEnvelope) Mode() string { return KEKModeAWSKMS }
 
 // KeyARN returns the ARN the envelope was constructed with. Exposed so
-// callers (orchestrator's [ir.ChainEncryption.KEKRef] populater) can
+// callers (orchestrator's [backup.ChainEncryption.KEKRef] populater) can
 // record it on the manifest without re-asking the operator.
 func (e *KMSEnvelope) KeyARN() string { return e.keyARN }
 
@@ -176,8 +176,8 @@ func (e *KMSEnvelope) KeyARN() string { return e.keyARN }
 // envelope's key ARN. The returned bytes are the KMS CiphertextBlob —
 // an opaque byte slice that KMS Decrypt round-trips back to the
 // original plaintext. Recorded in the manifest's
-// [ir.ChainEncryption.WrappedCEK] (per-chain mode) or
-// [ir.ChunkEncryption.WrappedCEK] (per-chunk mode).
+// [backup.ChainEncryption.WrappedCEK] (per-chain mode) or
+// [backup.ChunkEncryption.WrappedCEK] (per-chunk mode).
 //
 // Uses a background context internally because the
 // [EnvelopeEncryption] interface is context-free. KMS calls in

@@ -25,6 +25,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 func TestBackup_ResumeAfterScanOrderChange_NoDuplicatesNoHoles(t *testing.T) {
@@ -67,16 +68,16 @@ func TestBackup_ResumeAfterScanOrderChange_NoDuplicatesNoHoles(t *testing.T) {
 	// chunks 0 and 1 (rows 1..4 in run 1's order), Partial=true. The
 	// chunk FILES for 2 and 3 stay on the store, as they would after a
 	// hard kill that died between chunk upload and manifest checkpoint.
-	partial := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	partial := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		SourceEngine:  "postgres",
 		Schema:        schema,
-		PartialState:  ir.BackupStateInProgress,
-		Tables: []*ir.TableManifest{{
+		PartialState:  irbackup.BackupStateInProgress,
+		Tables: []*irbackup.TableManifest{{
 			Name:     "events",
 			RowCount: 4,
 			Partial:  true,
-			Chunks:   []*ir.ChunkInfo{full.Tables[0].Chunks[0], full.Tables[0].Chunks[1]},
+			Chunks:   []*irbackup.ChunkInfo{full.Tables[0].Chunks[0], full.Tables[0].Chunks[1]},
 		}},
 	}
 	if err := writeManifest(context.Background(), store, partial); err != nil {

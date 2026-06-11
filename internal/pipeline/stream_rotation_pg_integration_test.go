@@ -33,6 +33,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -40,19 +41,19 @@ import (
 // rotationSeedFull takes the initial full backup and patches its
 // EndPosition to the freshly-created slot LSN so the stream chains
 // off it (mirrors the existing stream PG tests' setup).
-func rotationSeedFull(t *testing.T, store ir.BackupStore, eng ir.Engine, sourceDSN, slotLSN string) *ir.Manifest {
+func rotationSeedFull(t *testing.T, store irbackup.Store, eng ir.Engine, sourceDSN, slotLSN string) *irbackup.Manifest {
 	t.Helper()
 	if err := (&Backup{Source: eng, SourceDSN: sourceDSN, Store: store, SluiceVersion: "test"}).
 		Run(context.Background()); err != nil {
 		t.Fatalf("seed Backup.Run: %v", err)
 	}
 	full, _ := readManifest(context.Background(), store)
-	full.Kind = ir.BackupKindFull
+	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{
 		Engine: "postgres",
 		Token:  fmt.Sprintf(`{"slot":"sluice_slot","lsn":%q}`, slotLSN),
 	}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
 		t.Fatalf("rewrite seed full: %v", err)
 	}
@@ -484,13 +485,13 @@ func TestADR0046_MixedCodecLineageRestores_PG(t *testing.T) {
 			t.Fatalf("seg %d (%s) backup: %v", i, c, err)
 		}
 		fm, _ := readManifestAt(context.Background(), segStore, ManifestFileName)
-		fm.Kind = ir.BackupKindFull
+		fm.Kind = irbackup.BackupKindFull
 		// Synthetic contiguous boundary tokens so the lineage-walk's
 		// single monotonicity validator passes (these segments were
 		// independent backups; we assert codec handling, not CDC).
 		fm.StartPosition = ir.Position{Engine: "postgres", Token: fmt.Sprintf("0/%d00", i)}
 		fm.EndPosition = ir.Position{Engine: "postgres", Token: fmt.Sprintf("0/%d00", i+1)}
-		fm.BackupID = ir.ComputeBackupID(fm)
+		fm.BackupID = irbackup.ComputeBackupID(fm)
 		_ = writeManifestAt(context.Background(), segStore, ManifestFileName, fm)
 		seg := LineageSegment{
 			SegmentID: fm.BackupID, Dir: segDir, FullManifestPath: ManifestFileName,
@@ -549,8 +550,8 @@ func TestADR0046_UnknownRecordedCodecRefused_PG(t *testing.T) {
 		t.Fatalf("backup: %v", err)
 	}
 	fm, _ := readManifest(context.Background(), store)
-	fm.Kind = ir.BackupKindFull
-	fm.BackupID = ir.ComputeBackupID(fm)
+	fm.Kind = irbackup.BackupKindFull
+	fm.BackupID = irbackup.ComputeBackupID(fm)
 	_ = writeManifestAt(context.Background(), store, ManifestFileName, fm)
 	cat := &LineageCatalog{
 		FormatVersion: 1, SourceEngine: "postgres",

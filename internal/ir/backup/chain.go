@@ -1,12 +1,10 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package ir
+package backup
 
 // Phase 3 helpers for the logical-backup chain feature: schema
-// fingerprinting and manifest identity. Lives next to the rest of
-// the manifest types in [internal/ir/backup.go]; split into its own
-// file to keep the manifest-types diff in v0.17.0 contained.
+// fingerprinting and manifest identity.
 
 import (
 	"crypto/sha256"
@@ -16,6 +14,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // ComputeSchemaHash returns a deterministic hex-encoded SHA-256 over
@@ -35,39 +35,78 @@ import (
 // in different orders (task #41 — catalog reads historically drained
 // these through randomized map iteration). Table order and column
 // order ARE semantic (DDL position) and hash as-is.
-func ComputeSchemaHash(s *Schema) (string, error) {
+//
+// The canonical view also normalizes a nil Column.Default to
+// [ir.DefaultNone] (task #49): the two are operationally equivalent
+// ("no default"), but [ir.Column.UnmarshalJSON] materializes an
+// explicit DefaultNone for an absent wire field, so without the
+// normalization a reader-fresh schema and the SAME schema re-read
+// from a manifest would fingerprint differently. The hash is thereby
+// stable across manifest JSON round-trips.
+func ComputeSchemaHash(s *ir.Schema) (string, error) {
 	if s == nil {
 		h := sha256.Sum256([]byte("schema:nil"))
 		return hex.EncodeToString(h[:]), nil
 	}
 	b, err := json.Marshal(canonicalSchemaForHash(s))
 	if err != nil {
-		return "", fmt.Errorf("ir: compute schema hash: marshal: %w", err)
+		return "", fmt.Errorf("backup: compute schema hash: marshal: %w", err)
 	}
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:]), nil
 }
 
 // canonicalSchemaForHash returns a shallow copy of s whose per-table
-// non-semantic collections are name-sorted copies. The input is never
-// mutated — manifests must record schemas exactly as the reader
-// produced them; only the FINGERPRINT is order-insensitive.
-func canonicalSchemaForHash(s *Schema) *Schema {
+// non-semantic collections are name-sorted copies and whose columns
+// carry the round-trip-stable default normalization. The input is
+// never mutated — manifests must record schemas exactly as the reader
+// produced them; only the FINGERPRINT is canonical.
+func canonicalSchemaForHash(s *ir.Schema) *ir.Schema {
 	out := *s
-	out.Tables = make([]*Table, len(s.Tables))
+	out.Tables = make([]*ir.Table, len(s.Tables))
 	for i, t := range s.Tables {
 		if t == nil {
 			continue
 		}
 		ct := *t
-		ct.Indexes = sortedByName(t.Indexes, func(x *Index) string { return x.Name })
-		ct.ForeignKeys = sortedByName(t.ForeignKeys, func(x *ForeignKey) string { return x.Name })
-		ct.CheckConstraints = sortedByName(t.CheckConstraints, func(x *CheckConstraint) string { return x.Name })
-		ct.ExcludeConstraints = sortedByName(t.ExcludeConstraints, func(x *ExcludeConstraint) string { return x.Name })
-		ct.Policies = sortedByName(t.Policies, func(x *Policy) string { return x.Name })
+		ct.Columns = canonicalColumnsForHash(t.Columns)
+		ct.Indexes = sortedByName(t.Indexes, func(x *ir.Index) string { return x.Name })
+		ct.ForeignKeys = sortedByName(t.ForeignKeys, func(x *ir.ForeignKey) string { return x.Name })
+		ct.CheckConstraints = sortedByName(t.CheckConstraints, func(x *ir.CheckConstraint) string { return x.Name })
+		ct.ExcludeConstraints = sortedByName(t.ExcludeConstraints, func(x *ir.ExcludeConstraint) string { return x.Name })
+		ct.Policies = sortedByName(t.Policies, func(x *ir.Policy) string { return x.Name })
 		out.Tables[i] = &ct
 	}
 	return &out
+}
+
+// canonicalColumnsForHash returns columns with a nil Default
+// normalized to [ir.DefaultNone] — copying only the columns it
+// changes, and returning the input slice untouched when nothing needs
+// normalizing (the common round-tripped case). Column ORDER is
+// semantic and preserved as-is.
+func canonicalColumnsForHash(in []*ir.Column) []*ir.Column {
+	normalize := false
+	for _, c := range in {
+		if c != nil && c.Default == nil {
+			normalize = true
+			break
+		}
+	}
+	if !normalize {
+		return in
+	}
+	out := make([]*ir.Column, len(in))
+	for i, c := range in {
+		if c == nil || c.Default != nil {
+			out[i] = c
+			continue
+		}
+		cc := *c
+		cc.Default = ir.DefaultNone{}
+		out[i] = &cc
+	}
+	return out
 }
 
 // sortedByName returns a name-sorted copy of in (nil stays nil; the

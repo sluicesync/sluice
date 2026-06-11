@@ -75,7 +75,7 @@ const (
 	SaltLen = 16
 )
 
-// KEK-mode strings recorded in [ir.ChainEncryption.KEKMode]. String
+// KEK-mode strings recorded in [backup.ChainEncryption.KEKMode]. String
 // literals are part of the on-disk format; renaming requires a manifest
 // format-version bump.
 const (
@@ -85,12 +85,12 @@ const (
 	KEKModePassphrase = "passphrase-argon2id"
 
 	// AlgorithmAESGCM is the bulk-cipher algorithm tag used in both
-	// [ir.ChainEncryption] and [ir.ChunkEncryption]. Phase 6.1 ships
+	// [backup.ChainEncryption] and [backup.ChunkEncryption]. Phase 6.1 ships
 	// only this algorithm; future revisions may add ChaCha20-Poly1305.
 	AlgorithmAESGCM = "AES-256-GCM"
 )
 
-// Encryption-mode strings recorded in [ir.ChainEncryption.Mode].
+// Encryption-mode strings recorded in [backup.ChainEncryption.Mode].
 const (
 	// EncryptModePerChain wraps a single CEK into the chain manifest;
 	// every chunk in the chain uses the same CEK with its own random
@@ -98,16 +98,16 @@ const (
 	EncryptModePerChain = "per-chain"
 
 	// EncryptModePerChunk wraps a fresh CEK per chunk; each chunk's
-	// [ir.ChunkEncryption.WrappedCEK] carries its own wrap. Opt-in via
+	// [backup.ChunkEncryption.WrappedCEK] carries its own wrap. Opt-in via
 	// `--encrypt-mode=per-chunk`. Costs one wrap-per-chunk.
 	EncryptModePerChunk = "per-chunk"
 )
 
-// Argon2idParams matches `ir.Argon2idParams` shape verbatim. Re-declared
+// Argon2idParams matches `backup.Argon2idParams` shape verbatim. Re-declared
 // here so the crypto package doesn't depend on the manifest IR (avoids
 // an import cycle: the manifest IR imports nothing in this package, but
 // future phases may flip that). Marshalled into the manifest's
-// [ir.ChainEncryption] field on backup write; re-read on restore.
+// [backup.ChainEncryption] field on backup write; re-read on restore.
 type Argon2idParams struct {
 	Salt        []byte `json:"salt"`
 	Memory      uint32 `json:"memory_kib"`
@@ -159,7 +159,7 @@ type EnvelopeEncryption interface {
 
 	// Mode returns a tag identifying the implementation —
 	// "passphrase-argon2id" / "aws-kms" / etc. — for recording in the
-	// manifest's [ir.ChainEncryption.KEKMode] field. Operators
+	// manifest's [backup.ChainEncryption.KEKMode] field. Operators
 	// inspecting an encrypted manifest see this value; restore-side
 	// validation matches it against the supplied envelope's Mode().
 	Mode() string
@@ -226,13 +226,13 @@ func (e *PassphraseEnvelope) Mode() string { return KEKModePassphrase }
 
 // Params returns the Argon2id params the envelope was built with.
 // Callers (chain writer) use this to populate
-// [ir.ChainEncryption.Argon2id] in the manifest.
+// [backup.ChainEncryption.Argon2id] in the manifest.
 func (e *PassphraseEnvelope) Params() Argon2idParams { return e.params }
 
 // WrapCEK encrypts cek with the cached KEK via AES-256-GCM. The
 // returned bytes are `[nonce | ciphertext | authtag]` and are what the
-// caller records in the manifest's [ir.ChainEncryption.WrappedCEK] (or
-// [ir.ChunkEncryption.WrappedCEK] for per-chunk mode).
+// caller records in the manifest's [backup.ChainEncryption.WrappedCEK] (or
+// [backup.ChunkEncryption.WrappedCEK] for per-chunk mode).
 func (e *PassphraseEnvelope) WrapCEK(cek []byte) ([]byte, error) {
 	if len(cek) != CEKLen {
 		return nil, fmt.Errorf("crypto: wrap cek length %d != %d", len(cek), CEKLen)
@@ -270,7 +270,7 @@ func GenerateCEK() ([]byte, error) {
 // [CEKLen] bytes; nonce is generated fresh per call via [crypto/rand].
 //
 // The composed shape is what the chunk writer hands to
-// [ir.BackupStore.Put]; the chunk reader splits it back into
+// [backup.Store.Put]; the chunk reader splits it back into
 // nonce + ciphertext on the way out.
 func EncryptChunk(plaintext, cek []byte) ([]byte, error) {
 	if len(cek) != CEKLen {

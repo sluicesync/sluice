@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // TestBackup_FormatVersion_Bug116 pins the v0.94.1 Bug 116 closure at
@@ -19,9 +20,9 @@ import (
 // binaries.
 //
 // This pins the proportional version-stamp behaviour at the pipeline
-// boundary (not just at ir.FormatVersionFor, which is unit-pinned in
+// boundary (not just at irbackup.FormatVersionFor, which is unit-pinned in
 // internal/ir/format_version_bug116_test.go). The orchestrator paths
-// pinned here are the three that construct *ir.Manifest with
+// pinned here are the three that construct *irbackup.Manifest with
 // FormatVersion set: Backup (full), IncrementalBackup, and Streamer's
 // per-rollover manifest constructor.
 func TestBackup_FormatVersion_Bug116(t *testing.T) {
@@ -42,7 +43,7 @@ func TestBackup_FormatVersion_Bug116(t *testing.T) {
 					},
 				},
 			},
-			want: ir.FormatVersionLegacy,
+			want: irbackup.FormatVersionLegacy,
 		},
 		{
 			name: "schema with RLSEnabled → security-metadata (older binaries refuse loudly)",
@@ -57,7 +58,7 @@ func TestBackup_FormatVersion_Bug116(t *testing.T) {
 					},
 				},
 			},
-			want: ir.FormatVersionSecurityMetadata,
+			want: irbackup.FormatVersionSecurityMetadata,
 		},
 		{
 			name: "schema with Policies → security-metadata",
@@ -72,7 +73,7 @@ func TestBackup_FormatVersion_Bug116(t *testing.T) {
 					},
 				},
 			},
-			want: ir.FormatVersionSecurityMetadata,
+			want: irbackup.FormatVersionSecurityMetadata,
 		},
 		{
 			name: "schema with EXCLUDE constraint → security-metadata",
@@ -87,7 +88,7 @@ func TestBackup_FormatVersion_Bug116(t *testing.T) {
 					},
 				},
 			},
-			want: ir.FormatVersionSecurityMetadata,
+			want: irbackup.FormatVersionSecurityMetadata,
 		},
 	}
 	for _, c := range cases {

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 func diffOrderTestTable() *ir.Table {
@@ -50,7 +51,7 @@ func TestDiffSchemas_IndexOrderIsNotAnAlter(t *testing.T) {
 	altered := &ir.Schema{Tables: []*ir.Table{diffOrderTestTable()}}
 	altered.Tables[0].Indexes[1].Unique = true
 	deltas := diffSchemas(before, altered)
-	if len(deltas) != 1 || deltas[0].Kind != ir.SchemaDeltaAlterTable {
+	if len(deltas) != 1 || deltas[0].Kind != irbackup.SchemaDeltaAlterTable {
 		t.Errorf("real index change: deltas = %+v; want exactly one alter_table", deltas)
 	}
 
@@ -60,7 +61,7 @@ func TestDiffSchemas_IndexOrderIsNotAnAlter(t *testing.T) {
 	renamed := &ir.Schema{Tables: []*ir.Table{diffOrderTestTable()}}
 	renamed.Tables[0].Indexes[0].Name = "medium_11_other_idx"
 	deltas = diffSchemas(before, renamed)
-	if len(deltas) != 1 || deltas[0].Kind != ir.SchemaDeltaAlterTable {
+	if len(deltas) != 1 || deltas[0].Kind != irbackup.SchemaDeltaAlterTable {
 		t.Errorf("index rename: deltas = %+v; want exactly one alter_table", deltas)
 	}
 }

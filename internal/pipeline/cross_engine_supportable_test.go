@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 func TestCheckCrossEngineSupportable_SameEngineNil(t *testing.T) {
@@ -129,9 +130,9 @@ func TestCheckCrossEngineSupportable_PGtoPG_ExcludeAllowed(t *testing.T) {
 // asserts the post-ADR-0035 behaviour: an incremental that adds a
 // table with a geometry column no longer refuses PG → MySQL.
 func TestCheckCrossEngineDeltaSupportable_AddTableWithPostGISAllowed(t *testing.T) {
-	deltas := []*ir.SchemaDeltaEntry{
+	deltas := []*irbackup.SchemaDeltaEntry{
 		{
-			Kind:  ir.SchemaDeltaAddTable,
+			Kind:  irbackup.SchemaDeltaAddTable,
 			Table: "places",
 			After: &ir.Table{
 				Name: "places",
@@ -150,9 +151,9 @@ func TestCheckCrossEngineDeltaSupportable_AddTableWithPostGISAllowed(t *testing.
 // TestCheckCrossEngineDeltaSupportable_AlterTableAddPostGISAllowed
 // asserts the post-ADR-0035 behaviour for ALTER TABLE deltas.
 func TestCheckCrossEngineDeltaSupportable_AlterTableAddPostGISAllowed(t *testing.T) {
-	deltas := []*ir.SchemaDeltaEntry{
+	deltas := []*irbackup.SchemaDeltaEntry{
 		{
-			Kind:  ir.SchemaDeltaAlterTable,
+			Kind:  irbackup.SchemaDeltaAlterTable,
 			Table: "places",
 			Before: &ir.Table{
 				Name: "places",
@@ -176,8 +177,8 @@ func TestCheckCrossEngineDeltaSupportable_AlterTableAddPostGISAllowed(t *testing
 
 func TestCheckCrossEngineDeltaSupportable_DropTableNoCheck(t *testing.T) {
 	// DropTable carries no After-shape — skipped.
-	deltas := []*ir.SchemaDeltaEntry{
-		{Kind: ir.SchemaDeltaDropTable, Table: "old"},
+	deltas := []*irbackup.SchemaDeltaEntry{
+		{Kind: irbackup.SchemaDeltaDropTable, Table: "old"},
 	}
 	if err := checkCrossEngineDeltaSupportable(deltas, "postgres", "mysql", "incr-0001"); err != nil {
 		t.Errorf("err = %v; want nil for drop-only delta", err)
@@ -655,9 +656,9 @@ func TestCheckCrossEngineSupportable_PGTriggerToPGTrigger_ExcludeAllowed(t *test
 // post-ADR-0035, so this asserts the no-refuse case — proving the trigger
 // source is routed through the same delta gate as postgres.
 func TestCheckCrossEngineDeltaSupportable_PGTriggerAddTableGeometryAllowed(t *testing.T) {
-	deltas := []*ir.SchemaDeltaEntry{
+	deltas := []*irbackup.SchemaDeltaEntry{
 		{
-			Kind:  ir.SchemaDeltaAddTable,
+			Kind:  irbackup.SchemaDeltaAddTable,
 			Table: "places",
 			After: &ir.Table{
 				Name: "places",
@@ -678,9 +679,9 @@ func TestCheckCrossEngineDeltaSupportable_PGTriggerAddTableGeometryAllowed(t *te
 // table with an uncatalogued ExtensionType column must refuse the same as a
 // postgres source would.
 func TestCheckCrossEngineDeltaSupportable_PGTriggerAddTableExtensionRefuses(t *testing.T) {
-	deltas := []*ir.SchemaDeltaEntry{
+	deltas := []*irbackup.SchemaDeltaEntry{
 		{
-			Kind:  ir.SchemaDeltaAddTable,
+			Kind:  irbackup.SchemaDeltaAddTable,
 			Table: "items",
 			After: &ir.Table{
 				Name: "items",

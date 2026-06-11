@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // importerStubEngine is a stubEngine that additionally satisfies
@@ -174,7 +175,7 @@ func poolTestFixture(t *testing.T, nTables int) (*Backup, *manifestCommitter, []
 		t.Fatalf("NewLocalStore: %v", err)
 	}
 	b := &Backup{Source: stubEngine{}, SourceDSN: "dsn", Store: store}
-	manifest := &ir.Manifest{PartialState: ir.BackupStateInProgress, Kind: ir.BackupKindFull}
+	manifest := &irbackup.Manifest{PartialState: irbackup.BackupStateInProgress, Kind: irbackup.BackupKindFull}
 	committer := &manifestCommitter{store: store, manifest: manifest}
 	rows := map[string][]ir.Row{}
 	tasks := make([]backupTableTask, 0, nTables)
@@ -185,7 +186,7 @@ func poolTestFixture(t *testing.T, nTables int) (*Backup, *manifestCommitter, []
 			Name:    name,
 			Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
 		}
-		entry := &ir.TableManifest{Name: name, Partial: true}
+		entry := &irbackup.TableManifest{Name: name, Partial: true}
 		committer.stageTable(entry)
 		tasks = append(tasks, backupTableTask{table: table, entry: entry})
 	}
@@ -259,7 +260,7 @@ func TestBackupTablePool_FirstErrorCancelsPeers(t *testing.T) {
 			Name:    base,
 			Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
 		}
-		entry := &ir.TableManifest{Name: name, Partial: true}
+		entry := &irbackup.TableManifest{Name: name, Partial: true}
 		committer.stageTable(entry)
 		tasks = append(tasks, backupTableTask{table: table, entry: entry})
 	}
@@ -306,14 +307,14 @@ func TestManifestCommitter_ConcurrentCheckpointsKeepSchemaOrder(t *testing.T) {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
 	const nTables, nChunks = 8, 5
-	manifest := &ir.Manifest{PartialState: ir.BackupStateInProgress}
+	manifest := &irbackup.Manifest{PartialState: irbackup.BackupStateInProgress}
 	committer := &manifestCommitter{store: store, manifest: manifest}
 
-	entries := make([]*ir.TableManifest, nTables)
+	entries := make([]*irbackup.TableManifest, nTables)
 	wantOrder := make([]string, nTables)
 	for i := range entries {
 		name := fmt.Sprintf("table-%02d", i)
-		entries[i] = &ir.TableManifest{Name: name, Partial: true}
+		entries[i] = &irbackup.TableManifest{Name: name, Partial: true}
 		wantOrder[i] = name
 		committer.stageTable(entries[i])
 	}
@@ -321,10 +322,10 @@ func TestManifestCommitter_ConcurrentCheckpointsKeepSchemaOrder(t *testing.T) {
 	var wg sync.WaitGroup
 	for _, entry := range entries {
 		wg.Add(1)
-		go func(entry *ir.TableManifest) {
+		go func(entry *irbackup.TableManifest) {
 			defer wg.Done()
 			for c := 0; c < nChunks; c++ {
-				ci := &ir.ChunkInfo{
+				ci := &irbackup.ChunkInfo{
 					File:     fmt.Sprintf("chunks/%s/%s-%d.jsonl.gz", entry.Name, entry.Name, c),
 					RowCount: 1,
 					SHA256:   "deadbeef",
@@ -350,7 +351,7 @@ func TestManifestCommitter_ConcurrentCheckpointsKeepSchemaOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read manifest: %v", err)
 	}
-	var got ir.Manifest
+	var got irbackup.Manifest
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatalf("final manifest is not well-formed JSON: %v", err)
 	}

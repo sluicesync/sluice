@@ -31,6 +31,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -80,12 +81,12 @@ func TestBackupStream_Postgres_RolloverByMaxChanges(t *testing.T) {
 		t.Fatalf("Backup.Run: %v", err)
 	}
 	full, _ := readManifest(context.Background(), store)
-	full.Kind = ir.BackupKindFull
+	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{
 		Engine: "postgres",
 		Token:  fmt.Sprintf(`{"slot":"sluice_slot","lsn":%q}`, slotLSN),
 	}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
 		t.Fatalf("rewrite full: %v", err)
 	}
@@ -134,7 +135,7 @@ func TestBackupStream_Postgres_RolloverByMaxChanges(t *testing.T) {
 		records, _ := listAllManifestsViaWalk(context.Background(), store)
 		var incrCount int
 		for _, r := range records {
-			if r.manifest.Kind == ir.BackupKindIncremental {
+			if r.manifest.Kind == irbackup.BackupKindIncremental {
 				incrCount++
 			}
 		}
@@ -162,9 +163,9 @@ func TestBackupStream_Postgres_RolloverByMaxChanges(t *testing.T) {
 
 	// Inspect manifests; expect at least 2 incrementals.
 	records, _ := listAllManifestsViaWalk(context.Background(), store)
-	var incrementals []*ir.Manifest
+	var incrementals []*irbackup.Manifest
 	for _, r := range records {
-		if r.manifest.Kind == ir.BackupKindIncremental {
+		if r.manifest.Kind == irbackup.BackupKindIncremental {
 			incrementals = append(incrementals, r.manifest)
 		}
 	}
@@ -249,12 +250,12 @@ func TestBackupStream_Postgres_StopCommandRequestsExit(t *testing.T) {
 		t.Fatalf("Backup.Run: %v", err)
 	}
 	full, _ := readManifest(context.Background(), store)
-	full.Kind = ir.BackupKindFull
+	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{
 		Engine: "postgres",
 		Token:  fmt.Sprintf(`{"slot":"sluice_slot","lsn":%q}`, slotLSN),
 	}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	_ = writeManifestAt(context.Background(), store, ManifestFileName, full)
 
 	stream := &BackupStream{
@@ -328,12 +329,12 @@ func TestBackupStream_Postgres_ConcurrentWriterRefused(t *testing.T) {
 		t.Fatalf("Backup.Run: %v", err)
 	}
 	full, _ := readManifest(context.Background(), store)
-	full.Kind = ir.BackupKindFull
+	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{
 		Engine: "postgres",
 		Token:  fmt.Sprintf(`{"slot":"sluice_slot","lsn":%q}`, slotLSN),
 	}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	_ = writeManifestAt(context.Background(), store, ManifestFileName, full)
 
 	// Pre-seed a fresh stream_state.json mimicking another running
@@ -434,12 +435,12 @@ func TestBackupStream_Postgres_QuietSourceTimeBoundRollover(t *testing.T) {
 		t.Fatalf("Backup.Run: %v", err)
 	}
 	full, _ := readManifest(context.Background(), store)
-	full.Kind = ir.BackupKindFull
+	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{
 		Engine: "postgres",
 		Token:  fmt.Sprintf(`{"slot":"sluice_slot","lsn":%q}`, slotLSN),
 	}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	_ = writeManifestAt(context.Background(), store, ManifestFileName, full)
 
 	stream := &BackupStream{
@@ -473,7 +474,7 @@ func TestBackupStream_Postgres_QuietSourceTimeBoundRollover(t *testing.T) {
 	records, _ := listAllManifestsViaWalk(context.Background(), store)
 	var emptyRollovers int
 	for _, r := range records {
-		if r.manifest.Kind == ir.BackupKindIncremental && len(r.manifest.ChangeChunks) == 0 {
+		if r.manifest.Kind == irbackup.BackupKindIncremental && len(r.manifest.ChangeChunks) == 0 {
 			emptyRollovers++
 		}
 	}
@@ -518,12 +519,12 @@ func TestBackupStream_Postgres_SignalDrainExitsClean(t *testing.T) {
 		t.Fatalf("Backup.Run: %v", err)
 	}
 	full, _ := readManifest(context.Background(), store)
-	full.Kind = ir.BackupKindFull
+	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{
 		Engine: "postgres",
 		Token:  fmt.Sprintf(`{"slot":"sluice_slot","lsn":%q}`, slotLSN),
 	}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	_ = writeManifestAt(context.Background(), store, ManifestFileName, full)
 
 	// Drive concurrent inserts so the stream is mid-rollover when ctx

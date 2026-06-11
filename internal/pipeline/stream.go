@@ -61,6 +61,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // DefaultRolloverWindow is the wall-clock cadence each rollover commits
@@ -126,12 +127,12 @@ type BackupStream struct {
 	// Required.
 	SourceDSN string
 
-	// Store is the [ir.BackupStore] the parent manifest lives in and
+	// Store is the [irbackup.Store] the parent manifest lives in and
 	// every rolled manifest + chunks are written to. Required.
-	Store ir.BackupStore
+	Store irbackup.Store
 
 	// ParentRef identifies the parent backup the stream chains off.
-	// Either a [ir.Manifest.BackupID] (e.g. "abc123def4567890") or the
+	// Either a [irbackup.Manifest.BackupID] (e.g. "abc123def4567890") or the
 	// empty string to chain off the most recent manifest in Store.
 	// Required for clean chains.
 	ParentRef string
@@ -259,7 +260,7 @@ type BackupStream struct {
 	Codec Codec
 
 	// Now, when set, overrides the wall-clock-time source for
-	// [ir.Manifest.CreatedAt] and `stream_state.json` timestamps. Used
+	// [irbackup.Manifest.CreatedAt] and `stream_state.json` timestamps. Used
 	// by tests to pin timestamps; in production callers leave it nil
 	// and the default uses time.Now.
 	Now func() time.Time
@@ -284,7 +285,7 @@ type BackupStream struct {
 	// the open segment's Dir; a no-op wrap for the common one-segment
 	// shape). Manifest + chunk writes go here. Repointed by the
 	// rotation FSM's COMMIT to the freshly-opened segment. Set by Run.
-	segStore ir.BackupStore
+	segStore irbackup.Store
 
 	// segCodec is the codec of the open segment, threaded into the
 	// change-chunk writer. Set by Run; repointed by rotation.
@@ -850,7 +851,7 @@ func (b *BackupStream) validate() error {
 // resolveParent finds the parent manifest in the store. Mirrors
 // [IncrementalBackup.resolveParent] but doesn't return the path
 // because the stream doesn't need it post-resolve.
-func (b *BackupStream) resolveParent(ctx context.Context) (*ir.Manifest, string, error) {
+func (b *BackupStream) resolveParent(ctx context.Context) (*irbackup.Manifest, string, error) {
 	// A stream chains off a manifest in the OPEN segment (b.segStore
 	// is already narrowed to its Dir).
 	manifests, err := listAllManifestsViaWalk(ctx, b.segStore)
@@ -864,7 +865,7 @@ func (b *BackupStream) resolveParent(ctx context.Context) (*ir.Manifest, string,
 		for _, m := range manifests {
 			id := m.manifest.BackupID
 			if id == "" {
-				id = ir.ComputeBackupID(m.manifest)
+				id = irbackup.ComputeBackupID(m.manifest)
 			}
 			if id == b.ParentRef {
 				// Task #42 (ADR-0085): an in-progress parent (crashed
@@ -900,7 +901,7 @@ func (b *BackupStream) resolveParent(ctx context.Context) (*ir.Manifest, string,
 // captured AND IncludeEmptyRollovers is false ("skip the manifest
 // write").
 type rolloverOutcome struct {
-	Manifest      *ir.Manifest
+	Manifest      *irbackup.Manifest
 	TotalChanges  int64
 	TotalBytes    int64
 	SourceClosed  bool
@@ -918,7 +919,7 @@ func (b *BackupStream) runRollover(
 	ctx context.Context,
 	cdc ir.CDCReader,
 	changesCh <-chan ir.Change,
-	parent *ir.Manifest,
+	parent *irbackup.Manifest,
 	startPos ir.Position,
 	window time.Duration,
 	maxChanges int,
@@ -931,29 +932,29 @@ func (b *BackupStream) runRollover(
 	chainCEK []byte,
 ) (rolloverOutcome, error) {
 	beforeSchema := parent.Schema
-	beforeHash, hashErr := ir.ComputeSchemaHash(beforeSchema)
+	beforeHash, hashErr := irbackup.ComputeSchemaHash(beforeSchema)
 	if hashErr != nil {
 		return rolloverOutcome{}, fmt.Errorf("hash source schema: %w", hashErr)
 	}
 
-	manifest := &ir.Manifest{
+	manifest := &irbackup.Manifest{
 		// Bug 116 closure: same proportional version-stamp rule as
 		// other manifest constructors. Streaming incrementals inherit
 		// the parent's effective schema; if it carries security
 		// metadata, the streamed manifest is stamped FormatVersion=2.
-		FormatVersion:  ir.FormatVersionFor(beforeSchema),
+		FormatVersion:  irbackup.FormatVersionFor(beforeSchema),
 		SluiceVersion:  b.SluiceVersion,
 		CreatedAt:      now().UTC(),
 		SourceEngine:   b.Source.Name(),
 		Schema:         beforeSchema,
-		PartialState:   ir.BackupStateInProgress,
-		Kind:           ir.BackupKindIncremental,
+		PartialState:   irbackup.BackupStateInProgress,
+		Kind:           irbackup.BackupKindIncremental,
 		ParentBackupID: parent.BackupID,
 		StartPosition:  startPos,
 		SchemaHash:     beforeHash,
 	}
 	if manifest.ParentBackupID == "" {
-		manifest.ParentBackupID = ir.ComputeBackupID(parent)
+		manifest.ParentBackupID = irbackup.ComputeBackupID(parent)
 	}
 
 	deadline := clockNow().Add(window)
@@ -1012,14 +1013,14 @@ func (b *BackupStream) runRollover(
 		}
 	}
 
-	manifest.BackupID = ir.ComputeBackupID(manifest)
-	manifest.PartialState = ir.BackupStateComplete
+	manifest.BackupID = irbackup.ComputeBackupID(manifest)
+	manifest.PartialState = irbackup.BackupStateComplete
 	out.Manifest = manifest
 	return out, captureErr
 }
 
 // refreshSchemaAndAttachDelta re-reads the source schema, diffs it
-// against the parent's schema, and attaches any [ir.SchemaDeltaEntry]
+// against the parent's schema, and attaches any [irbackup.SchemaDeltaEntry]
 // entries to manifest. When the diff is empty the manifest's recorded
 // Schema stays as the parent's; when entries are produced, the
 // manifest's Schema is replaced with the post-window source shape +
@@ -1031,7 +1032,7 @@ func (b *BackupStream) runRollover(
 // loud-failure beats silent stale-manifest. Bug 38 fix (v0.20.1).
 func (b *BackupStream) refreshSchemaAndAttachDelta(
 	ctx context.Context,
-	manifest *ir.Manifest,
+	manifest *irbackup.Manifest,
 	beforeSchema *ir.Schema,
 ) error {
 	sr, err := b.Source.OpenSchemaReader(ctx, b.SourceDSN)
@@ -1049,7 +1050,7 @@ func (b *BackupStream) refreshSchemaAndAttachDelta(
 	}
 	manifest.SchemaDelta = delta
 	manifest.Schema = afterSchema
-	afterHash, err := ir.ComputeSchemaHash(afterSchema)
+	afterHash, err := irbackup.ComputeSchemaHash(afterSchema)
 	if err != nil {
 		return fmt.Errorf("rollover: hash post-window schema: %w", err)
 	}
@@ -1119,7 +1120,7 @@ func (b *BackupStream) captureWindow(
 	ctx context.Context,
 	cdc ir.CDCReader,
 	changesCh <-chan ir.Change,
-	manifest *ir.Manifest,
+	manifest *irbackup.Manifest,
 	chunkSize int,
 	deadline time.Time,
 	maxChanges int,
@@ -1153,13 +1154,13 @@ func (b *BackupStream) captureWindow(
 		if err := b.segStore.Put(putCtx, path, buf); err != nil {
 			return fmt.Errorf("store put %q: %w", path, err)
 		}
-		ci := &ir.ChunkInfo{
+		ci := &irbackup.ChunkInfo{
 			File:     path,
 			RowCount: writer.ChangeCount(),
 			SHA256:   hash,
 		}
 		if b.Encryption != nil {
-			ci.Encryption = &ir.ChunkEncryption{
+			ci.Encryption = &irbackup.ChunkEncryption{
 				Algorithm:  crypto.AlgorithmAESGCM,
 				NonceLen:   crypto.NonceLen,
 				AuthTagLen: crypto.AuthTagLen,
@@ -1404,7 +1405,7 @@ func openCDCReaderWithSlot(ctx context.Context, source ir.Engine, dsn, slotName 
 // The hook is wrapped in a 30 s timeout (DefaultRolloverHookTimeout)
 // derived from the parent ctx. A long-running hook delays the next
 // rollover-tick by up to that timeout.
-func runRolloverHook(ctx context.Context, hookCmd string, manifest *ir.Manifest, manifestPath string, changes, bytesWritten int64, elapsed time.Duration) {
+func runRolloverHook(ctx context.Context, hookCmd string, manifest *irbackup.Manifest, manifestPath string, changes, bytesWritten int64, elapsed time.Duration) {
 	hookCtx, cancel := context.WithTimeout(ctx, DefaultRolloverHookTimeout)
 	defer cancel()
 
@@ -1465,7 +1466,7 @@ func newShellCommand(ctx context.Context, cmdStr string) *exec.Cmd {
 // salt the CLI started the run with. Without this rebind, the unwrap
 // of the parent's WrappedCEK fails with `aes-gcm open: cipher:
 // message authentication failed`.
-func (b *BackupStream) alignEncryption(ctx context.Context, parent *ir.Manifest) ([]byte, error) {
+func (b *BackupStream) alignEncryption(ctx context.Context, parent *irbackup.Manifest) ([]byte, error) {
 	parentEnc := chainRootEncryption(ctx, b.segStore, parent)
 	switch {
 	case parentEnc == nil && b.Encryption == nil:

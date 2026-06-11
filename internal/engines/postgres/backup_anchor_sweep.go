@@ -12,12 +12,12 @@ import (
 	"strings"
 	"time"
 
-	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // The full-backup orchestrator discovers the sweep via this optional
 // surface on resume; keep the implementation pinned to the interface.
-var _ ir.BackupAnchorSweeper = Engine{}
+var _ irbackup.AnchorSweeper = Engine{}
 
 // backupAnchorOrphanMinAge is the safety margin the resume-time sweep
 // applies before dropping a persistent backup-anchor slot: only
@@ -35,7 +35,7 @@ var _ ir.BackupAnchorSweeper = Engine{}
 // running.
 const backupAnchorOrphanMinAge = time.Hour
 
-// SweepOrphanedBackupAnchors implements [ir.BackupAnchorSweeper]: it
+// SweepOrphanedBackupAnchors implements [irbackup.AnchorSweeper]: it
 // drops persistent `sluice_backup_anchor_<unixnano>` replication
 // slots that a backup crashed under a pre-Bug-137 binary left on the
 // source. New binaries create the anchor protocol-TEMPORARY (the

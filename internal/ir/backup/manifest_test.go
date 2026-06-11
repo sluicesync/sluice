@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package ir
+package backup
 
 import (
 	"bytes"
@@ -9,195 +9,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
-
-// Type round-trip exhaustively covers every concrete IR type so a
-// future addition to the IR catches at the test boundary if the
-// MarshalType/UnmarshalType branches drift apart.
-func TestMarshalType_RoundTrip(t *testing.T) {
-	cases := []struct {
-		name string
-		in   Type
-	}{
-		{"Boolean", Boolean{}},
-		{"Integer 64 signed autoinc", Integer{Width: 64, AutoIncrement: true}},
-		{"Integer 32 unsigned", Integer{Width: 32, Unsigned: true}},
-		{"Decimal", Decimal{Precision: 19, Scale: 4}},
-		{"Float single", Float{Precision: FloatSingle}},
-		{"Float double", Float{Precision: FloatDouble}},
-		{"Char", Char{Length: 36, Charset: "utf8mb4", Collation: "utf8mb4_general_ci"}},
-		{"Varchar", Varchar{Length: 255}},
-		{"Text long", Text{Size: TextLong}},
-		{"Binary", Binary{Length: 16}},
-		{"Varbinary", Varbinary{Length: 64}},
-		{"Blob medium", Blob{Size: BlobMedium}},
-		{"Date", Date{}},
-		{"Interval", Interval{}},
-		{"Time precision 6", Time{Precision: 6}},
-		{"DateTime precision 3", DateTime{Precision: 3}},
-		{"Timestamp tz", Timestamp{Precision: 6, WithTimeZone: true}},
-		{"JSON binary", JSON{Binary: true}},
-		{"JSON text", JSON{Binary: false}},
-		{"Enum", Enum{Values: []string{"a", "b", "c"}}},
-		{"Set", Set{Values: []string{"r", "w", "x"}}},
-		{"UUID", UUID{}},
-		{"Inet", Inet{}},
-		{"Cidr", Cidr{}},
-		{"Macaddr", Macaddr{}},
-		{"Geometry point SRID", Geometry{Subtype: GeometryPoint, SRID: 4326}},
-		{"Geography point SRID 4326", Geometry{Subtype: GeometryPoint, SRID: 4326, IsGeography: true}},
-		{"Geography polygon", Geometry{Subtype: GeometryPolygon, SRID: 4326, IsGeography: true}},
-		{"Geometry POINTZ", Geometry{Subtype: GeometryPoint, SRID: 4326, HasZ: true}},
-		{"Geometry POINTZM", Geometry{Subtype: GeometryPoint, SRID: 4326, HasZ: true, HasM: true}},
-		{"Geography POLYGONZM", Geometry{Subtype: GeometryPolygon, SRID: 4326, IsGeography: true, HasZ: true, HasM: true}},
-		{"Array of Integer", Array{Element: Integer{Width: 32}}},
-		{"Array of UUID", Array{Element: UUID{}}},
-		{"Array of nil element", Array{Element: nil}},
-		// ADR-0047 verbatim (uncatalogued) PG extension type.
-		{"VerbatimType ltree", VerbatimType{Definition: "ltree"}},
-		{"VerbatimType cube", VerbatimType{Definition: "cube"}},
-		{"VerbatimType schema-qualified", VerbatimType{Definition: "public.mytype"}},
-		{"VerbatimType with modifier spelling", VerbatimType{Definition: "geometry(Point,4326)"}},
-		// ADR-0049 Chunk B/C prerequisite: Bit (catalog Bug 62/77) +
-		// ADR-0032 catalogued ExtensionType. Pin the class — fixed vs
-		// varying bit; ext with and without modifiers.
-		{"Bit fixed", Bit{Length: 8}},
-		{"Bit varying", Bit{Length: 16, Varying: true}},
-		{"ExtensionType no mods", ExtensionType{Extension: "uuid-ossp", Name: "uuid"}},
-		{"ExtensionType vector with mods", ExtensionType{Extension: "vector", Name: "vector", Modifiers: []int{1536}}},
-		{"ExtensionType postgis multi-mod", ExtensionType{Extension: "postgis", Name: "geometry", Modifiers: []int{4326, 2}}},
-	}
-	for _, c := range cases {
-		c := c
-		t.Run(c.name, func(t *testing.T) {
-			b, err := MarshalType(c.in)
-			if err != nil {
-				t.Fatalf("MarshalType(%v): %v", c.in, err)
-			}
-			out, err := UnmarshalType(b)
-			if err != nil {
-				t.Fatalf("UnmarshalType(%s): %v", b, err)
-			}
-			if got, want := out.String(), c.in.String(); got != want {
-				t.Errorf("round-trip String() = %q; want %q (json=%s)", got, want, b)
-			}
-		})
-	}
-}
-
-func TestUnmarshalType_NullAndUnknownKind(t *testing.T) {
-	got, err := UnmarshalType([]byte("null"))
-	if err != nil {
-		t.Fatalf("null: %v", err)
-	}
-	if got != nil {
-		t.Errorf("null type = %v; want nil", got)
-	}
-
-	got, err = UnmarshalType([]byte(`{"kind":"WatNotReal"}`))
-	if err == nil {
-		t.Fatalf("expected error on unknown kind; got %v", got)
-	}
-}
-
-func TestMarshalDefault_RoundTrip(t *testing.T) {
-	cases := []struct {
-		name string
-		in   DefaultValue
-	}{
-		{"None", DefaultNone{}},
-		{"Literal", DefaultLiteral{Value: "0"}},
-		{"Expression", DefaultExpression{Expr: "CURRENT_TIMESTAMP", Dialect: "postgres"}},
-	}
-	for _, c := range cases {
-		c := c
-		t.Run(c.name, func(t *testing.T) {
-			b, err := MarshalDefault(c.in)
-			if err != nil {
-				t.Fatalf("MarshalDefault: %v", err)
-			}
-			out, err := UnmarshalDefault(b)
-			if err != nil {
-				t.Fatalf("UnmarshalDefault: %v", err)
-			}
-			// Compare via stringification: each variant has a distinct
-			// shape. This doubles as an interface-implementation check.
-			if got, want := defaultDescribe(out), defaultDescribe(c.in); got != want {
-				t.Errorf("round-trip = %s; want %s (json=%s)", got, want, b)
-			}
-		})
-	}
-}
-
-func defaultDescribe(d DefaultValue) string {
-	switch v := d.(type) {
-	case DefaultNone:
-		return "None"
-	case DefaultLiteral:
-		return "Literal:" + v.Value
-	case DefaultExpression:
-		return "Expr:" + v.Expr + "/" + v.Dialect
-	}
-	return "?"
-}
-
-// Schema round-trip via Column's custom MarshalJSON: the serialised
-// JSON must decode back to a Column whose Type / Default match. This
-// is the load-bearing path the manifest writer + restore reader rely
-// on; a regression here means cross-engine restore can't survive a
-// round-trip through the manifest.
-func TestColumnJSON_RoundTrip(t *testing.T) {
-	original := &Column{
-		Name:     "id",
-		Type:     Integer{Width: 64, AutoIncrement: true},
-		Nullable: false,
-		Default:  DefaultExpression{Expr: "nextval('seq')", Dialect: "postgres"},
-		Comment:  "primary key",
-	}
-	b, err := json.Marshal(original)
-	if err != nil {
-		t.Fatalf("Marshal: %v", err)
-	}
-	var got Column
-	if err := json.Unmarshal(b, &got); err != nil {
-		t.Fatalf("Unmarshal: %v", err)
-	}
-	if got.Name != original.Name {
-		t.Errorf("Name: got %q want %q", got.Name, original.Name)
-	}
-	if got.Type == nil || got.Type.String() != original.Type.String() {
-		t.Errorf("Type: got %v want %v", got.Type, original.Type)
-	}
-	if got.Default == nil {
-		t.Fatal("Default is nil")
-	}
-	if d, ok := got.Default.(DefaultExpression); !ok {
-		t.Errorf("Default not DefaultExpression: got %T", got.Default)
-	} else if d.Expr != "nextval('seq')" {
-		t.Errorf("Default.Expr: got %q", d.Expr)
-	}
-	if got.Comment != original.Comment {
-		t.Errorf("Comment: got %q want %q", got.Comment, original.Comment)
-	}
-}
-
-// A Column with no default decodes to DefaultNone — both for absent-
-// field (manifest emitted with omitempty) and for the explicit None
-// envelope.
-func TestColumnJSON_NoDefault(t *testing.T) {
-	col := &Column{Name: "name", Type: Varchar{Length: 100}}
-	b, err := json.Marshal(col)
-	if err != nil {
-		t.Fatalf("Marshal: %v", err)
-	}
-	var got Column
-	if err := json.Unmarshal(b, &got); err != nil {
-		t.Fatalf("Unmarshal: %v", err)
-	}
-	if _, ok := got.Default.(DefaultNone); !ok {
-		t.Errorf("Default = %T; want DefaultNone", got.Default)
-	}
-}
 
 // Manifest round-trip via standard json.Marshal. Validates that the
 // public-contract type is JSON-stable end-to-end. Includes a Schema
@@ -209,13 +23,13 @@ func TestManifestJSON_RoundTrip(t *testing.T) {
 		SluiceVersion: "0.14.1",
 		CreatedAt:     now,
 		SourceEngine:  "postgres",
-		Schema: &Schema{
-			Tables: []*Table{
+		Schema: &ir.Schema{
+			Tables: []*ir.Table{
 				{
 					Name: "users",
-					Columns: []*Column{
-						{Name: "id", Type: Integer{Width: 64, AutoIncrement: true}},
-						{Name: "email", Type: Varchar{Length: 255}, Nullable: true},
+					Columns: []*ir.Column{
+						{Name: "id", Type: ir.Integer{Width: 64, AutoIncrement: true}},
+						{Name: "email", Type: ir.Varchar{Length: 255}, Nullable: true},
 					},
 				},
 			},
@@ -272,23 +86,6 @@ func TestManifestJSON_RoundTrip(t *testing.T) {
 	}
 }
 
-// A nested Array(Element=Array(Element=Varchar)) ensures recursive
-// type encoding works — multi-dimensional PG arrays are real.
-func TestMarshalType_NestedArray(t *testing.T) {
-	in := Array{Element: Array{Element: Varchar{Length: 10}}}
-	b, err := MarshalType(in)
-	if err != nil {
-		t.Fatalf("Marshal: %v", err)
-	}
-	out, err := UnmarshalType(b)
-	if err != nil {
-		t.Fatalf("Unmarshal: %v", err)
-	}
-	if out.String() != in.String() {
-		t.Errorf("got %v want %v", out, in)
-	}
-}
-
 // Phase 6: encrypted manifests round-trip through JSON without losing
 // any of the new fields. Plaintext (no Encryption set) manifests stay
 // shaped as before — verified via byte-comparison of marshalled JSON
@@ -298,7 +95,7 @@ func TestManifest_EncryptedRoundTrip(t *testing.T) {
 	in := &Manifest{
 		FormatVersion: BackupFormatVersion,
 		SourceEngine:  "postgres",
-		Schema:        &Schema{Tables: []*Table{{Name: "users", Columns: []*Column{{Name: "id", Type: Integer{Width: 64}}}}}},
+		Schema:        &ir.Schema{Tables: []*ir.Table{{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}}},
 		Tables: []*TableManifest{
 			{
 				Name:     "users",
@@ -382,7 +179,7 @@ func TestManifest_PlaintextStaysPlaintext(t *testing.T) {
 	in := &Manifest{
 		FormatVersion: BackupFormatVersion,
 		SourceEngine:  "postgres",
-		Schema:        &Schema{Tables: []*Table{}},
+		Schema:        &ir.Schema{Tables: []*ir.Table{}},
 		Tables: []*TableManifest{
 			{
 				Name:     "users",
@@ -422,35 +219,35 @@ func TestManifest_PlaintextStaysPlaintext(t *testing.T) {
 // supports is exercised, not one representative), round-trip
 // through encoding/json, and assert deep-equal recovery.
 func TestManifest_SchemaHistory_RoundTrip(t *testing.T) {
-	tblA := &Table{
+	tblA := &ir.Table{
 		Schema: "public",
 		Name:   "users",
-		Columns: []*Column{
-			{Name: "id", Type: Integer{Width: 64}},
-			{Name: "email", Type: Varchar{Length: 255}, Nullable: true},
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "email", Type: ir.Varchar{Length: 255}, Nullable: true},
 		},
 	}
-	tblB := &Table{
+	tblB := &ir.Table{
 		Schema: "public",
 		Name:   "events",
-		Columns: []*Column{
-			{Name: "id", Type: Integer{Width: 64}},
-			{Name: "tags", Type: Array{Element: Varchar{Length: 64}}, Nullable: true},
-			{Name: "ts", Type: Timestamp{Precision: 6, WithTimeZone: true}},
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "tags", Type: ir.Array{Element: ir.Varchar{Length: 64}}, Nullable: true},
+			{Name: "ts", Type: ir.Timestamp{Precision: 6, WithTimeZone: true}},
 		},
 	}
-	tblC := &Table{
+	tblC := &ir.Table{
 		Schema: "public",
 		Name:   "geo",
-		Columns: []*Column{
-			{Name: "id", Type: Integer{Width: 64}},
-			{Name: "loc", Type: Geometry{Subtype: GeometryPoint, SRID: 4326, IsGeography: true}},
-			{Name: "tags", Type: ExtensionType{Extension: "vector", Name: "vector", Modifiers: []int{1536}}},
-			{Name: "flags", Type: Bit{Length: 8}},
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "loc", Type: ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326, IsGeography: true}},
+			{Name: "tags", Type: ir.ExtensionType{Extension: "vector", Name: "vector", Modifiers: []int{1536}}},
+			{Name: "flags", Type: ir.Bit{Length: 8}},
 		},
 	}
-	mkEntry := func(streamID, schema, table, anchorToken string, tbl *Table) *SchemaHistoryEntry {
-		payload, err := MarshalTable(tbl)
+	mkEntry := func(streamID, schema, table, anchorToken string, tbl *ir.Table) *SchemaHistoryEntry {
+		payload, err := ir.MarshalTable(tbl)
 		if err != nil {
 			panic(err)
 		}
@@ -458,14 +255,14 @@ func TestManifest_SchemaHistory_RoundTrip(t *testing.T) {
 			StreamID:       streamID,
 			Schema:         schema,
 			Table:          table,
-			AnchorPosition: Position{Engine: "postgres", Token: anchorToken},
+			AnchorPosition: ir.Position{Engine: "postgres", Token: anchorToken},
 			TableJSON:      payload,
 		}
 	}
 	in := &Manifest{
 		FormatVersion: BackupFormatVersion,
 		SourceEngine:  "postgres",
-		Schema:        &Schema{Tables: []*Table{tblA, tblB, tblC}},
+		Schema:        &ir.Schema{Tables: []*ir.Table{tblA, tblB, tblC}},
 		Kind:          BackupKindIncremental,
 		SchemaHistory: []*SchemaHistoryEntry{
 			mkEntry("", "public", "users", "0/1000000", tblA),
@@ -497,12 +294,12 @@ func TestManifest_SchemaHistory_RoundTrip(t *testing.T) {
 		if gotE.AnchorPosition != want.AnchorPosition {
 			t.Errorf("[%d] anchor mismatch: got %+v want %+v", i, gotE.AnchorPosition, want.AnchorPosition)
 		}
-		gotT, err := UnmarshalTable(gotE.TableJSON)
+		gotT, err := ir.UnmarshalTable(gotE.TableJSON)
 		if err != nil {
 			t.Errorf("[%d] UnmarshalTable: %v", i, err)
 			continue
 		}
-		wantT, err := UnmarshalTable(want.TableJSON)
+		wantT, err := ir.UnmarshalTable(want.TableJSON)
 		if err != nil {
 			t.Errorf("[%d] UnmarshalTable want: %v", i, err)
 			continue
@@ -556,12 +353,12 @@ func TestManifest_SchemaHistory_BackwardCompat_NoField(t *testing.T) {
 
 // typesEqualForTest compares two IR Types by their codec form to
 // avoid sealed-interface DeepEqual pitfalls on equivalent shapes.
-func typesEqualForTest(a, b Type) bool {
-	ab, err := MarshalType(a)
+func typesEqualForTest(a, b ir.Type) bool {
+	ab, err := ir.MarshalType(a)
 	if err != nil {
 		return false
 	}
-	bb, err := MarshalType(b)
+	bb, err := ir.MarshalType(b)
 	if err != nil {
 		return false
 	}

@@ -41,6 +41,7 @@ import (
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -50,8 +51,8 @@ import (
 // returns a builder that derives an envelope from any supplied
 // Argon2id params. Used to simulate what `buildBackupEncryption`
 // produces.
-func passphraseRebuildHook(passphrase string) func(*ir.Argon2idParams) (crypto.EnvelopeEncryption, error) {
-	return func(p *ir.Argon2idParams) (crypto.EnvelopeEncryption, error) {
+func passphraseRebuildHook(passphrase string) func(*irbackup.Argon2idParams) (crypto.EnvelopeEncryption, error) {
+	return func(p *irbackup.Argon2idParams) (crypto.EnvelopeEncryption, error) {
 		if p == nil {
 			return nil, fmt.Errorf("rebuild envelope: chain has no recorded Argon2id params")
 		}
@@ -138,12 +139,12 @@ func TestBackup_EncryptedChainExtension_Incremental_PG(t *testing.T) {
 	// Stamp EndPosition + recompute BackupID so the incremental can
 	// chain off the full (mirrors the pattern in incremental_pg
 	// integration tests; v0.16.x fulls didn't record EndPosition).
-	full.Kind = ir.BackupKindFull
+	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{
 		Engine: "postgres",
 		Token:  fmt.Sprintf(`{"slot":"sluice_slot","lsn":%q}`, slotLSN),
 	}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
 		t.Fatalf("rewrite full manifest: %v", err)
 	}
@@ -283,12 +284,12 @@ func TestBackup_EncryptedChainExtension_NoRebuildHook_Fails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readManifest: %v", err)
 	}
-	full.Kind = ir.BackupKindFull
+	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{
 		Engine: "postgres",
 		Token:  fmt.Sprintf(`{"slot":"sluice_slot","lsn":%q}`, slotLSN),
 	}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
 		t.Fatalf("rewrite full manifest: %v", err)
 	}

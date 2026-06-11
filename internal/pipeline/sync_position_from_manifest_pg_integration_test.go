@@ -31,6 +31,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 
@@ -89,8 +90,8 @@ func TestBackup_RecordsEndPosition_PostgresIntegration(t *testing.T) {
 	if full.BackupID == "" {
 		t.Error("BackupID empty after EndPosition recording")
 	}
-	if full.Kind != ir.BackupKindFull {
-		t.Errorf("Kind = %q; want %q", full.Kind, ir.BackupKindFull)
+	if full.Kind != irbackup.BackupKindFull {
+		t.Errorf("Kind = %q; want %q", full.Kind, irbackup.BackupKindFull)
 	}
 }
 

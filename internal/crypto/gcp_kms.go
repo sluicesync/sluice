@@ -11,7 +11,7 @@ package crypto
 //
 // Same [EnvelopeEncryption] seam Phase 6.1 introduced — the chunk
 // writer/reader paths don't change. The only Phase-6.3-GCP-specific
-// bits are recorded in the manifest's [ir.ChainEncryption]: KEKMode
+// bits are recorded in the manifest's [backup.ChainEncryption]: KEKMode
 // is "gcp-kms", KEKRef is the operator's crypto-key resource name,
 // and Argon2id is left nil (the cloud KMS service handles its own
 // key state).
@@ -34,7 +34,7 @@ import (
 )
 
 // KEKModeGCPKMS is the KEKMode tag recorded in
-// [ir.ChainEncryption.KEKMode] when the chain was encrypted under a
+// [backup.ChainEncryption.KEKMode] when the chain was encrypted under a
 // GCP Cloud KMS key. Restore-side validation matches it against the
 // supplied envelope's Mode().
 //
@@ -179,11 +179,11 @@ func (c gcpRealClient) GetCryptoKey(ctx context.Context, req *kmspb.GetCryptoKey
 }
 
 // Mode returns [KEKModeGCPKMS] — the tag recorded in
-// [ir.ChainEncryption.KEKMode] for GCP-KMS-encrypted chains.
+// [backup.ChainEncryption.KEKMode] for GCP-KMS-encrypted chains.
 func (e *GCPKMSEnvelope) Mode() string { return KEKModeGCPKMS }
 
 // KeyResource returns the resource name the envelope was constructed
-// with. Exposed so callers (orchestrator's [ir.ChainEncryption.KEKRef]
+// with. Exposed so callers (orchestrator's [backup.ChainEncryption.KEKRef]
 // populater) can record it on the manifest without re-asking the
 // operator.
 func (e *GCPKMSEnvelope) KeyResource() string { return e.keyResource }
@@ -192,8 +192,8 @@ func (e *GCPKMSEnvelope) KeyResource() string { return e.keyResource }
 // RPC against the envelope's crypto-key. The returned bytes are the
 // service's Ciphertext field — an opaque byte slice that Decrypt
 // round-trips back to the original plaintext. Recorded in the
-// manifest's [ir.ChainEncryption.WrappedCEK] (per-chain mode) or
-// [ir.ChunkEncryption.WrappedCEK] (per-chunk mode).
+// manifest's [backup.ChainEncryption.WrappedCEK] (per-chain mode) or
+// [backup.ChunkEncryption.WrappedCEK] (per-chunk mode).
 //
 // Uses a background context internally because the
 // [EnvelopeEncryption] interface is context-free. KMS calls in

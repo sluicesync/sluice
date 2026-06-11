@@ -17,6 +17,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 )
@@ -59,12 +60,12 @@ func TestBackupStream_MySQL_RolloverByMaxChanges(t *testing.T) {
 	}
 	binlogFile, binlogPos := readMySQLBinlogPos(t, sourceDSN)
 	full, _ := readManifest(context.Background(), store)
-	full.Kind = ir.BackupKindFull
+	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{
 		Engine: "mysql",
 		Token:  fmt.Sprintf(`{"mode":"file_pos","file":%q,"pos":%d}`, binlogFile, binlogPos),
 	}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
 		t.Fatalf("rewrite full: %v", err)
 	}
@@ -111,7 +112,7 @@ func TestBackupStream_MySQL_RolloverByMaxChanges(t *testing.T) {
 		records, _ := listAllManifestsViaWalk(context.Background(), store)
 		var incrCount int
 		for _, r := range records {
-			if r.manifest.Kind == ir.BackupKindIncremental {
+			if r.manifest.Kind == irbackup.BackupKindIncremental {
 				incrCount++
 			}
 		}
@@ -138,9 +139,9 @@ func TestBackupStream_MySQL_RolloverByMaxChanges(t *testing.T) {
 	}
 
 	records, _ := listAllManifestsViaWalk(context.Background(), store)
-	var incrementals []*ir.Manifest
+	var incrementals []*irbackup.Manifest
 	for _, r := range records {
-		if r.manifest.Kind == ir.BackupKindIncremental {
+		if r.manifest.Kind == irbackup.BackupKindIncremental {
 			incrementals = append(incrementals, r.manifest)
 		}
 	}

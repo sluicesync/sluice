@@ -32,6 +32,7 @@ import (
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -141,7 +142,7 @@ func TestBackupParallel_PG_RoundTripChecksums(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readManifest: %v", err)
 	}
-	if m.PartialState != ir.BackupStateComplete {
+	if m.PartialState != irbackup.BackupStateComplete {
 		t.Fatalf("PartialState = %q; want complete", m.PartialState)
 	}
 	// Manifest table order must equal schema order (pre-staging
@@ -223,7 +224,7 @@ func TestBackupParallel_PG_CancelBoundsPartialsAndResumeCompletes(t *testing.T) 
 	if err != nil {
 		t.Fatalf("readManifest after cancel: %v", err)
 	}
-	if m.PartialState != ir.BackupStateInProgress {
+	if m.PartialState != irbackup.BackupStateInProgress {
 		t.Fatalf("PartialState = %q; want in_progress", m.PartialState)
 	}
 	if len(m.Tables) != nTables {
@@ -258,7 +259,7 @@ func TestBackupParallel_PG_CancelBoundsPartialsAndResumeCompletes(t *testing.T) 
 	if err != nil {
 		t.Fatalf("readManifest after resume: %v", err)
 	}
-	if m2.PartialState != ir.BackupStateComplete {
+	if m2.PartialState != irbackup.BackupStateComplete {
 		t.Fatalf("resumed PartialState = %q; want complete", m2.PartialState)
 	}
 
@@ -342,7 +343,7 @@ func TestBackupParallel_PG_ManifestDeterminism(t *testing.T) {
 	seedParallelBackupTables(t, sourceDSN, 5, 130)
 	pgEng, _ := engines.Get("postgres")
 
-	runOne := func(tableParallelism int) *ir.Manifest {
+	runOne := func(tableParallelism int) *irbackup.Manifest {
 		t.Helper()
 		store, err := NewLocalStore(t.TempDir())
 		if err != nil {
@@ -367,7 +368,7 @@ func TestBackupParallel_PG_ManifestDeterminism(t *testing.T) {
 	serial := runOne(1)
 	parallel := runOne(4)
 
-	normalize := func(m *ir.Manifest) string {
+	normalize := func(m *irbackup.Manifest) string {
 		m.CreatedAt = time.Time{}
 		m.BackupID = ""
 		m.EndPosition = ir.Position{}

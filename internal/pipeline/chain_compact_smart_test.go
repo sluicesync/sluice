@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // ADR-0064 §14e smart-compaction unit pin matrix.
@@ -650,13 +651,13 @@ func TestSmart_ChunkRewrite_RoundTrip(t *testing.T) {
 		t.Fatalf("put chunk: %v", err)
 	}
 
-	im := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	im := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		SourceEngine:  "postgres",
 		CreatedAt:     time.Now().UTC(),
-		Kind:          ir.BackupKindIncremental,
+		Kind:          irbackup.BackupKindIncremental,
 		Schema:        usersSchema(),
-		ChangeChunks: []*ir.ChunkInfo{
+		ChangeChunks: []*irbackup.ChunkInfo{
 			{File: chunkPath, RowCount: cw.ChangeCount(), SHA256: cw.Hash()},
 		},
 	}

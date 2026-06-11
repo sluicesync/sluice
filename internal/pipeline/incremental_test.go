@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // fakeCDCEngine is a backup-recorder analogue for incremental tests:
@@ -101,7 +102,7 @@ func (r *fakeCDCReader) Close() error { return nil }
 
 // helper: write a fake "parent full" manifest into the store so the
 // incremental orchestrator has something to chain off.
-func writeParentFullManifest(t *testing.T, store *LocalStore, parent *ir.Manifest) {
+func writeParentFullManifest(t *testing.T, store *LocalStore, parent *irbackup.Manifest) {
 	t.Helper()
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, parent); err != nil {
 		t.Fatalf("write parent: %v", err)
@@ -196,16 +197,16 @@ func TestIncrementalBackup_RoundTrip(t *testing.T) {
 
 	// Parent full: written as a Phase-3 manifest with a recorded
 	// EndPosition so the incremental opens at the right LSN.
-	parent := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	parent := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		CreatedAt:     time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC),
 		SourceEngine:  "postgres",
 		Schema:        schema,
-		Kind:          ir.BackupKindFull,
+		Kind:          irbackup.BackupKindFull,
 		EndPosition:   ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/100"}`},
-		PartialState:  ir.BackupStateComplete,
+		PartialState:  irbackup.BackupStateComplete,
 	}
-	parent.BackupID = ir.ComputeBackupID(parent)
+	parent.BackupID = irbackup.ComputeBackupID(parent)
 	writeParentFullManifest(t, store, parent)
 
 	// CDC stream: a Begin + Insert + Commit.
@@ -260,10 +261,10 @@ func TestIncrementalBackup_RoundTrip(t *testing.T) {
 	if len(records) != 2 {
 		t.Fatalf("manifests in store = %d; want 2 (full + 1 incremental)", len(records))
 	}
-	var incr *ir.Manifest
+	var incr *irbackup.Manifest
 	var incrPath string
 	for _, r := range records {
-		if r.manifest.Kind == ir.BackupKindIncremental {
+		if r.manifest.Kind == irbackup.BackupKindIncremental {
 			incr = r.manifest
 			incrPath = r.path
 		}
@@ -276,10 +277,10 @@ func TestIncrementalBackup_RoundTrip(t *testing.T) {
 	if incr.ParentBackupID != parent.BackupID {
 		t.Errorf("ParentBackupID = %q; want %q", incr.ParentBackupID, parent.BackupID)
 	}
-	if incr.Kind != ir.BackupKindIncremental {
+	if incr.Kind != irbackup.BackupKindIncremental {
 		t.Errorf("Kind = %q; want incremental", incr.Kind)
 	}
-	if incr.PartialState != ir.BackupStateComplete {
+	if incr.PartialState != irbackup.BackupStateComplete {
 		t.Errorf("PartialState = %q; want complete", incr.PartialState)
 	}
 	// StartPosition = parent's EndPosition.
@@ -347,16 +348,16 @@ func TestIncrementalBackup_SchemaHistoryCapture(t *testing.T) {
 		},
 	}}}
 
-	parent := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	parent := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		CreatedAt:     time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC),
 		SourceEngine:  "postgres",
 		Schema:        schemaBefore,
-		Kind:          ir.BackupKindFull,
+		Kind:          irbackup.BackupKindFull,
 		EndPosition:   ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/100"}`},
-		PartialState:  ir.BackupStateComplete,
+		PartialState:  irbackup.BackupStateComplete,
 	}
-	parent.BackupID = ir.ComputeBackupID(parent)
+	parent.BackupID = irbackup.ComputeBackupID(parent)
 	writeParentFullManifest(t, store, parent)
 
 	postDDLTable := schemaAfter.Tables[0]
@@ -403,9 +404,9 @@ func TestIncrementalBackup_SchemaHistoryCapture(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listAllManifestsViaWalk: %v", err)
 	}
-	var incr *ir.Manifest
+	var incr *irbackup.Manifest
 	for _, r := range records {
-		if r.manifest.Kind == ir.BackupKindIncremental {
+		if r.manifest.Kind == irbackup.BackupKindIncremental {
 			incr = r.manifest
 		}
 	}
@@ -443,7 +444,7 @@ func TestIncrementalBackup_SchemaHistoryCapture(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
 	}
-	var rt ir.Manifest
+	var rt irbackup.Manifest
 	if err := json.Unmarshal(body, &rt); err != nil {
 		t.Fatalf("Unmarshal: %v", err)
 	}
@@ -459,15 +460,15 @@ func TestIncrementalBackup_PositionInvalid_LoudFailure(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := NewLocalStore(dir)
 
-	parent := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	parent := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		CreatedAt:     time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC),
 		SourceEngine:  "postgres",
 		Schema:        &ir.Schema{},
-		Kind:          ir.BackupKindFull,
+		Kind:          irbackup.BackupKindFull,
 		EndPosition:   ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/100"}`},
 	}
-	parent.BackupID = ir.ComputeBackupID(parent)
+	parent.BackupID = irbackup.ComputeBackupID(parent)
 	writeParentFullManifest(t, store, parent)
 
 	src := &fakeCDCEngine{
@@ -512,15 +513,15 @@ func TestIncrementalBackup_SchemaDelta_AddColumn(t *testing.T) {
 		},
 	}}}
 
-	parent := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	parent := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		CreatedAt:     time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC),
 		SourceEngine:  "postgres",
 		Schema:        beforeSchema,
-		Kind:          ir.BackupKindFull,
+		Kind:          irbackup.BackupKindFull,
 		EndPosition:   ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/100"}`},
 	}
-	parent.BackupID = ir.ComputeBackupID(parent)
+	parent.BackupID = irbackup.ComputeBackupID(parent)
 	writeParentFullManifest(t, store, parent)
 
 	// The source schema reader is called once at window-end (the
@@ -546,9 +547,9 @@ func TestIncrementalBackup_SchemaDelta_AddColumn(t *testing.T) {
 	}
 
 	records, _ := listAllManifestsViaWalk(context.Background(), store)
-	var incr *ir.Manifest
+	var incr *irbackup.Manifest
 	for _, r := range records {
-		if r.manifest.Kind == ir.BackupKindIncremental {
+		if r.manifest.Kind == irbackup.BackupKindIncremental {
 			incr = r.manifest
 		}
 	}
@@ -559,7 +560,7 @@ func TestIncrementalBackup_SchemaDelta_AddColumn(t *testing.T) {
 		t.Fatalf("SchemaDelta len = %d; want 1", len(incr.SchemaDelta))
 	}
 	d := incr.SchemaDelta[0]
-	if d.Kind != ir.SchemaDeltaAlterTable || d.Table != "users" {
+	if d.Kind != irbackup.SchemaDeltaAlterTable || d.Table != "users" {
 		t.Errorf("SchemaDelta = %+v; want alter_table on users", d)
 	}
 	if d.Before == nil || d.After == nil {
@@ -591,9 +592,9 @@ func TestDiffSchemas_AddDropAlter(t *testing.T) {
 		kinds[d.Kind+":"+d.Table]++
 	}
 	want := map[string]int{
-		ir.SchemaDeltaDropTable + ":to_drop":    1,
-		ir.SchemaDeltaAddTable + ":fresh_table": 1,
-		ir.SchemaDeltaAlterTable + ":users":     1,
+		irbackup.SchemaDeltaDropTable + ":to_drop":    1,
+		irbackup.SchemaDeltaAddTable + ":fresh_table": 1,
+		irbackup.SchemaDeltaAlterTable + ":users":     1,
 	}
 	for k, v := range want {
 		if kinds[k] != v {
@@ -631,14 +632,14 @@ func TestIncrementalBackup_NoParent(t *testing.T) {
 func TestIncrementalBackup_UnknownParentRef(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := NewLocalStore(dir)
-	parent := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	parent := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		CreatedAt:     time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC),
 		SourceEngine:  "postgres",
 		Schema:        &ir.Schema{},
-		Kind:          ir.BackupKindFull,
+		Kind:          irbackup.BackupKindFull,
 	}
-	parent.BackupID = ir.ComputeBackupID(parent)
+	parent.BackupID = irbackup.ComputeBackupID(parent)
 	writeParentFullManifest(t, store, parent)
 
 	src := &fakeCDCEngine{name: "postgres", schemaSequence: []*ir.Schema{{}}}
@@ -677,22 +678,22 @@ func TestIncrementalBackup_TwoIncrementals_NoChunkCollision(t *testing.T) {
 		Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
 	}}}
 
-	parent := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+	parent := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
 		CreatedAt:     time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC),
 		SourceEngine:  "postgres",
 		Schema:        schema,
-		Kind:          ir.BackupKindFull,
+		Kind:          irbackup.BackupKindFull,
 		EndPosition:   ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/100"}`},
-		PartialState:  ir.BackupStateComplete,
+		PartialState:  irbackup.BackupStateComplete,
 	}
-	parent.BackupID = ir.ComputeBackupID(parent)
+	parent.BackupID = irbackup.ComputeBackupID(parent)
 	writeParentFullManifest(t, store, parent)
 
 	// Helper: drive one incremental against `store`, parented on
 	// `parentID`, with a single insert at the given LSN and a pinned
 	// CreatedAt so the run namespace is deterministic per-call.
-	runIncr := func(t *testing.T, parentID, lsn string, createdAt time.Time) *ir.Manifest {
+	runIncr := func(t *testing.T, parentID, lsn string, createdAt time.Time) *irbackup.Manifest {
 		t.Helper()
 		src := &fakeCDCEngine{
 			name:           "postgres",
@@ -724,9 +725,9 @@ func TestIncrementalBackup_TwoIncrementals_NoChunkCollision(t *testing.T) {
 			t.Fatalf("listAllManifestsViaWalk: %v", err)
 		}
 		// Pick the most recent incremental.
-		var newest *ir.Manifest
+		var newest *irbackup.Manifest
 		for _, r := range records {
-			if r.manifest.Kind != ir.BackupKindIncremental {
+			if r.manifest.Kind != irbackup.BackupKindIncremental {
 				continue
 			}
 			if newest == nil || r.manifest.CreatedAt.After(newest.CreatedAt) {
@@ -765,7 +766,7 @@ func TestIncrementalBackup_TwoIncrementals_NoChunkCollision(t *testing.T) {
 	// Both files exist on the store and their recorded SHA-256 matches
 	// the bytes on disk. Pre-fix, path1 == path2 and the file's content
 	// was incr2's, so incr1's recorded SHA-256 mismatched what was on disk.
-	for label, info := range map[string]*ir.ChunkInfo{"incr1": incr1.ChangeChunks[0], "incr2": incr2.ChangeChunks[0]} {
+	for label, info := range map[string]*irbackup.ChunkInfo{"incr1": incr1.ChangeChunks[0], "incr2": incr2.ChangeChunks[0]} {
 		exists, err := store.Exists(context.Background(), info.File)
 		if err != nil {
 			t.Fatalf("%s: store.Exists(%q): %v", label, info.File, err)
@@ -795,7 +796,7 @@ func TestIncrementalBackup_TwoIncrementals_NoChunkCollision(t *testing.T) {
 // shape so a future refactor that drops it accidentally re-opens
 // Bug 35.
 func TestChangeChunkPath_RunNamespaceShape(t *testing.T) {
-	m := &ir.Manifest{CreatedAt: time.Date(2026, 5, 8, 11, 0, 0, 0, time.UTC)}
+	m := &irbackup.Manifest{CreatedAt: time.Date(2026, 5, 8, 11, 0, 0, 0, time.UTC)}
 	ns := changeChunkRunNamespace(m)
 	got := changeChunkPath(ns, 0)
 	want := "chunks/_changes/" + ns + "/changes-0.jsonl.gz"
@@ -803,7 +804,7 @@ func TestChangeChunkPath_RunNamespaceShape(t *testing.T) {
 		t.Errorf("changeChunkPath = %q; want %q", got, want)
 	}
 	// Two manifests with distinct CreatedAt produce distinct namespaces.
-	m2 := &ir.Manifest{CreatedAt: m.CreatedAt.Add(1 * time.Millisecond)}
+	m2 := &irbackup.Manifest{CreatedAt: m.CreatedAt.Add(1 * time.Millisecond)}
 	if changeChunkRunNamespace(m2) == ns {
 		t.Errorf("manifests one millisecond apart collide on namespace %q", ns)
 	}

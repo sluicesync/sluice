@@ -30,6 +30,7 @@ import (
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // PatroniMode constants for [Streamer.PatroniMode]. The flag is a
@@ -80,14 +81,14 @@ const patroniWarningPrefix = "this PG cluster is HA-managed"
 type (
 	// PositionFromManifestPreflight is re-exported from ir for
 	// streamer-side access. Engines should reference
-	// [ir.PositionFromManifestPreflight] directly to keep their
+	// [irbackup.PositionFromManifestPreflight] directly to keep their
 	// imports minimal.
-	PositionFromManifestPreflight = ir.PositionFromManifestPreflight
+	PositionFromManifestPreflight = irbackup.PositionFromManifestPreflight
 
 	// PreflightReport is re-exported from ir for streamer-side
 	// access. Engines populate this struct value as the return of
 	// PreflightPositionFromManifest.
-	PreflightReport = ir.PreflightReport
+	PreflightReport = irbackup.PreflightReport
 )
 
 // runPositionFromManifestPreflight runs the source-side pre-flight

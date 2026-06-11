@@ -65,6 +65,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // restoreDispatchObserver is a TEST-ONLY seam: when non-nil it fires
@@ -81,7 +82,7 @@ var restoreDispatchObserver func(tableParallelism int, reason string)
 // historical "skipping bulk-copy" INFO).
 type restoreTableTask struct {
 	table *ir.Table
-	entry *ir.TableManifest
+	entry *irbackup.TableManifest
 }
 
 // restoreWriterFactory opens one additional fully-configured

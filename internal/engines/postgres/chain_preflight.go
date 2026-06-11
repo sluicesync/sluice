@@ -14,7 +14,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
-// PreflightChainResume implements [ir.ChainResumePreflighter]: before
+// PreflightChainResume implements [irbackup.ChainResumePreflighter]: before
 // the incremental-backup orchestrator opens CDC at the parent
 // manifest's terminal position, verify the named slot can actually
 // serve the chain from that LSN. Two loud refusals replace two bad

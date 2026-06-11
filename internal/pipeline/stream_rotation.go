@@ -62,6 +62,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 const (
@@ -166,7 +167,7 @@ func crashAt(edge string) error {
 // rotateInputs bundles the rollover loop's state the FSM needs.
 type rotateInputs struct {
 	reason        string
-	lastCommitted *ir.Manifest // the prior segment's last committed manifest (P_N source)
+	lastCommitted *irbackup.Manifest // the prior segment's last committed manifest (P_N source)
 	// changesCh is the SAME in-flight CDC channel the rollover loop is
 	// consuming. ADR-0046 step 5: CDC continues on the SAME handle --
 	// the FSM does NOT re-open / re-position the pump (the engine's
@@ -187,10 +188,10 @@ type rotateInputs struct {
 // rotateResult is what the rollover loop needs to continue on the new
 // segment after a committed rotation.
 type rotateResult struct {
-	newSegStore ir.BackupStore
+	newSegStore irbackup.Store
 	newSegCodec Codec
 	newSegDir   string
-	newFull     *ir.Manifest
+	newFull     *irbackup.Manifest
 	resumePos   ir.Position // S -- the new segment's full anchor
 	// priorEnd is P_N, the prior segment's EndPosition. ADR-0067: the
 	// rollover loop sets skipThrough = priorEnd (NOT S) so the new
@@ -491,7 +492,7 @@ func (b *BackupStream) discardProvisional(ctx context.Context, dir string) {
 //
 // Either way the marker is cleared. Called once at BackupStream.Run
 // start, before streaming.
-func recoverRotationState(ctx context.Context, store ir.BackupStore) error {
+func recoverRotationState(ctx context.Context, store irbackup.Store) error {
 	exists, err := store.Exists(ctx, RotationStateFileName)
 	if err != nil {
 		return fmt.Errorf("inspect %q: %w", RotationStateFileName, err)
@@ -572,7 +573,7 @@ func recoverRotationState(ctx context.Context, store ir.BackupStore) error {
 
 // writeRotationState writes the crash-recovery marker via a single
 // Put (atomic at the storage layer).
-func writeRotationState(ctx context.Context, store ir.BackupStore, st *rotationState) error {
+func writeRotationState(ctx context.Context, store irbackup.Store, st *rotationState) error {
 	b, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal rotation_state: %w", err)

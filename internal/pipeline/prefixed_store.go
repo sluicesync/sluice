@@ -9,10 +9,10 @@ import (
 	"path"
 	"strings"
 
-	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
-// prefixedStore wraps an [ir.BackupStore] with a path prefix that's
+// prefixedStore wraps an [irbackup.Store] with a path prefix that's
 // transparently prepended to every operation. Used by the rotate-at
 // rotation (GitHub #20 chunk 14b) so a new chain landing in
 // `<output-dir>/rotated-<unix-ms>/` can reuse the existing
@@ -30,14 +30,14 @@ import (
 // (no leading/trailing slashes) and an empty prefix degenerates to
 // the wrapped store unchanged.
 type prefixedStore struct {
-	inner  ir.BackupStore
+	inner  irbackup.Store
 	prefix string // canonical form: no leading/trailing "/", may be empty
 }
 
 // newPrefixedStore wraps inner with a path prefix. An empty / "/" /
 // "." prefix returns the inner store directly (no wrapping cost
 // when the rotation is at chain root).
-func newPrefixedStore(inner ir.BackupStore, prefix string) ir.BackupStore {
+func newPrefixedStore(inner irbackup.Store, prefix string) irbackup.Store {
 	canon := strings.Trim(path.Clean(prefix), "/")
 	if canon == "" || canon == "." {
 		return inner
@@ -47,7 +47,7 @@ func newPrefixedStore(inner ir.BackupStore, prefix string) ir.BackupStore {
 
 // fullPath joins the wrapper's prefix with the caller's path.
 // Always returns a forward-slash-separated string per the
-// [ir.BackupStore] path convention.
+// [irbackup.Store] path convention.
 func (s *prefixedStore) fullPath(p string) string {
 	if p == "" {
 		return s.prefix

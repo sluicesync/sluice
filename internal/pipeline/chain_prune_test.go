@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // TestPruneLineage_KeepIncrementalsDropsOldest: 1 full + 5
@@ -109,9 +110,9 @@ func TestPruneLineage_RefusesNeitherFlag(t *testing.T) {
 
 func TestPruneLineage_RefusesWhenCatalogAbsent(t *testing.T) {
 	store := newMemStore()
-	mustWriteManifest(t, store, ManifestFileName, &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion, SourceEngine: "postgres",
-		BackupID: "full000", Kind: ir.BackupKindFull, CreatedAt: time.Now().UTC(),
+	mustWriteManifest(t, store, ManifestFileName, &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion, SourceEngine: "postgres",
+		BackupID: "full000", Kind: irbackup.BackupKindFull, CreatedAt: time.Now().UTC(),
 	})
 	_, err := PruneChain(context.Background(), store, PruneOpts{KeepIncrementals: 1})
 	if err == nil || !strings.Contains(err.Error(), "lineage.json not found") {
@@ -190,32 +191,32 @@ func TestPruneLineage_MultiSegmentDropsLeadingWholeSegment(t *testing.T) {
 
 // --- seed helpers ---
 
-func seedFull(t *testing.T, root ir.BackupStore, dir, startLSN, lsn string, created time.Time) *ir.Manifest {
+func seedFull(t *testing.T, root irbackup.Store, dir, startLSN, lsn string, created time.Time) *irbackup.Manifest {
 	t.Helper()
-	m := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion, SourceEngine: "postgres",
-		Kind: ir.BackupKindFull, CreatedAt: created,
+	m := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion, SourceEngine: "postgres",
+		Kind: irbackup.BackupKindFull, CreatedAt: created,
 		StartPosition: ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"` + startLSN + `"}`},
 		EndPosition:   ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"` + lsn + `"}`},
-		PartialState:  ir.BackupStateComplete,
+		PartialState:  irbackup.BackupStateComplete,
 	}
-	m.BackupID = ir.ComputeBackupID(m)
+	m.BackupID = irbackup.ComputeBackupID(m)
 	if err := writeManifestAt(context.Background(), newPrefixedStore(root, dir), ManifestFileName, m); err != nil {
 		t.Fatalf("seed full: %v", err)
 	}
 	return m
 }
 
-func seedIncr(t *testing.T, root ir.BackupStore, dir, _id, parent, startLSN, lsn string, created time.Time) *ir.Manifest {
+func seedIncr(t *testing.T, root irbackup.Store, dir, _id, parent, startLSN, lsn string, created time.Time) *irbackup.Manifest {
 	t.Helper()
-	m := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion, SourceEngine: "postgres",
-		Kind: ir.BackupKindIncremental, CreatedAt: created, ParentBackupID: parent,
+	m := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion, SourceEngine: "postgres",
+		Kind: irbackup.BackupKindIncremental, CreatedAt: created, ParentBackupID: parent,
 		StartPosition: ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"` + startLSN + `"}`},
 		EndPosition:   ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"` + lsn + `"}`},
-		PartialState:  ir.BackupStateComplete,
+		PartialState:  irbackup.BackupStateComplete,
 	}
-	m.BackupID = ir.ComputeBackupID(m)
+	m.BackupID = irbackup.ComputeBackupID(m)
 	p := "manifests/incr-" + strings.TrimPrefix(_id, "incr") + ".json"
 	if err := writeManifestAt(context.Background(), newPrefixedStore(root, dir), p, m); err != nil {
 		t.Fatalf("seed incr: %v", err)
@@ -304,13 +305,13 @@ func TestSchemaHistoryRetentionFloor_NoBackup_NoLive(t *testing.T) {
 func TestSchemaHistoryRetentionFloor_Incomparable(t *testing.T) {
 	store := newMemStore()
 	// Custom lineage with an "incomparable:A" token.
-	full := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion, SourceEngine: "postgres",
-		Kind: ir.BackupKindFull, CreatedAt: time.Now(),
+	full := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion, SourceEngine: "postgres",
+		Kind: irbackup.BackupKindFull, CreatedAt: time.Now(),
 		EndPosition:  ir.Position{Engine: "postgres", Token: "incomparable:A"},
-		PartialState: ir.BackupStateComplete,
+		PartialState: irbackup.BackupStateComplete,
 	}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	mustWriteManifest(t, store, ManifestFileName, full)
 	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, CodecGzip)
 
@@ -324,29 +325,29 @@ func TestSchemaHistoryRetentionFloor_Incomparable(t *testing.T) {
 	}
 }
 
-func seedLineageChain(t *testing.T, store ir.BackupStore, incrementals int) time.Time {
+func seedLineageChain(t *testing.T, store irbackup.Store, incrementals int) time.Time {
 	t.Helper()
 	base := time.Date(2026, 5, 16, 0, 0, 0, 0, time.UTC)
-	full := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion, SourceEngine: "postgres",
-		Kind: ir.BackupKindFull, CreatedAt: base,
+	full := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion, SourceEngine: "postgres",
+		Kind: irbackup.BackupKindFull, CreatedAt: base,
 		EndPosition:  ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"0/100"}`},
-		PartialState: ir.BackupStateComplete,
+		PartialState: irbackup.BackupStateComplete,
 	}
-	full.BackupID = ir.ComputeBackupID(full)
+	full.BackupID = irbackup.ComputeBackupID(full)
 	mustWriteManifest(t, store, ManifestFileName, full)
 	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, CodecGzip)
 	parent := full.BackupID
 	for i := 1; i <= incrementals; i++ {
-		m := &ir.Manifest{
-			FormatVersion: ir.BackupFormatVersion, SourceEngine: "postgres",
-			Kind: ir.BackupKindIncremental, ParentBackupID: parent,
+		m := &irbackup.Manifest{
+			FormatVersion: irbackup.BackupFormatVersion, SourceEngine: "postgres",
+			Kind: irbackup.BackupKindIncremental, ParentBackupID: parent,
 			CreatedAt:     base.Add(time.Duration(i) * time.Hour),
 			StartPosition: ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"0/100"}`},
 			EndPosition:   ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"0/100"}`},
-			PartialState:  ir.BackupStateComplete,
+			PartialState:  irbackup.BackupStateComplete,
 		}
-		m.BackupID = ir.ComputeBackupID(m)
+		m.BackupID = irbackup.ComputeBackupID(m)
 		path := "manifests/incr-000" + string(rune('0'+i)) + ".json"
 		mustWriteManifest(t, store, path, m)
 		updateLineageForManifestBestEffort(context.Background(), store, m, path, CodecGzip)
