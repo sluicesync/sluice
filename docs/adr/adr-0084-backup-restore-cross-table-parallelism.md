@@ -1,7 +1,7 @@
-# ADR-0084: Cross-table parallelism for backup (and, forthcoming, restore)
+# ADR-0084: Cross-table parallelism for backup and restore
 
-- **Status:** Accepted (backup side implemented; task #39 PR 1 — the
-  restore side is PR 2, forthcoming)
+- **Status:** Accepted (backup side implemented in task #39 PR 1;
+  restore side implemented in PR 2)
 - **Date:** 2026-06-10
 - **Relates to:** ADR-0076 (cross-table copy worker pool), ADR-0079
   (fast parallel cold-start for the sync path; the capability-gate +
@@ -121,12 +121,65 @@ unit test was updated to pin the new shape.
   spanning reader exists only on the sync cold-start path and never
   reaches the backup orchestrator.)
 
+### 5. Restore side (PR 2): same pool, no gate, writer-per-table
+
+`internal/pipeline/restore_table_pool.go` mirrors the backup pool with
+one structural simplification: **no capability gate**. The backup side
+gates on a shareable exported snapshot because parallel READERS must
+observe one consistent view; parallel WRITERS have no such constraint —
+each table's rows land through an independent row-writer connection
+and tables are independent during the bulk-apply phase (indexes /
+constraints are later phases). Restore parallelism is therefore
+**engine-generic**: it engages for every target, PG and MySQL alike.
+The motivating measurement: the same 133 GB / 43-table corpus restored
+serially was cut off at 5278 s with 2/43 tables done (projected ~3 h)
+vs `pg_restore -j8` = 917 s — and restore wall time is the operator's
+recovery-time objective.
+
+Shape: a free-writer 1-slot channel seeds the pool with the
+orchestrator's already-open writer; peers open dedicated writers
+through `Restore.openTargetRowWriter` — the SINGLE construction point
+(OpenRowWriter + buffer cap + target-schema routing) shared with the
+primary open, so the two setups can never drift. Dedicated writers
+close deterministically on release; the primary's lifecycle stays with
+the orchestrator. `restoreTable` is called UNCHANGED: its producer
+goroutine streams the table's chunks IN ORDER through one channel into
+one WriteRows call (per-table chunk ordering preserved by
+construction), and the Bug-40b cancel-on-writer-error shape inside it
+is per-call-local. DataOnly segment fulls parallelize identically —
+the idempotent-writer selection type-asserts each worker's OWN writer.
+
+Knob: `restore --table-parallelism` (`Restore.TableParallelism`,
+threaded through `ChainRestore.TableParallelism` into every segment
+full's re-entrant Restore), 0 = auto = 4, 1 = serial. Budget
+chokepoint: `resolveTargetCopyParallelism` against the TARGET DSN —
+restore opens exactly one writer connection per concurrent table, so
+the budget-capped value IS the table parallelism; non-prober targets
+(MySQL) pass through unclamped, same as migrate. Clamped to the table
+count; serial collapse logs a loud INFO naming the reason.
+
+Read-side shared state was audited (not assumed): `chainCEK` and
+`segCodec` are set pre-pool and read-only after; per-chunk-mode
+`Envelope.UnwrapCEK` is read-only on envelope state across all four
+implementations (the mirror of §4's WrapCEK audit); `chunkReader` is
+per-chunk-local. The incremental change-replay path of a chain restore
+is untouched — change ordering is load-bearing there.
+
+**Deliberately deferred: restore copy/index overlap.** Index creation
+stays a strictly-after phase (PG's `CreateIndexes` already runs its
+own internal concurrent pool; ADR-0077's overlap machinery exists on
+the migrate path). Overlapping it with the restore bulk-apply is a
+separate budget-split decision and was excluded from PR 2's scope.
+
 ### Measured expectation
 
 pg_dump's j1→j8 = 3.4× on the motivating corpus is the ceiling for
-this chunk; the remaining gap (format/encoding work per row — JSONL +
-gzip/zstd vs pg_dump's COPY format) is separate work. To be
-re-benchmarked after PR 2 (restore side) lands.
+the backup chunk; the remaining gap (format/encoding work per row —
+JSONL + gzip/zstd vs pg_dump's COPY format) is separate work. The
+restore side's ceiling is pg_restore's j1→j8 on the same corpus
+(~11.5× observed end-to-end, of which the cross-table axis is the
+dominant share for a many-large-table schema). To be re-benchmarked
+now that both sides have landed.
 
 ## Alternatives rejected
 
@@ -148,7 +201,12 @@ re-benchmarked after PR 2 (restore side) lands.
   sync path has no counterpart inside a one-shot full backup. Serial
   is the correct MySQL shape until something like a FTWRL-coordinated
   multi-session snapshot is deemed worth its locking cost.
-- **Restore-side parallelism in this PR.** Deliberately split (PR 2):
-  restore writes through a different orchestrator with its own
-  ordering constraints (schema → rows → indexes/constraints) and
-  deserves its own review.
+- **Restore-side parallelism in PR 1.** Deliberately split (landed as
+  PR 2, §5): restore writes through a different orchestrator with its
+  own ordering constraints (schema → rows → indexes/constraints) and
+  deserved its own review.
+- **A restore eligibility gate mirroring the backup gate.** Considered
+  for symmetry, rejected as wrong: the gate exists to protect READ
+  consistency under a shared snapshot; restore writers have no
+  consistency coupling to protect. Gating would have silently kept
+  MySQL targets serial for no reason.

@@ -54,8 +54,19 @@ project follows [Semantic Versioning](https://semver.org/).
   non-snapshot fallback. Manifest table order and resume semantics are
   unchanged-by-construction: entries are pre-staged in schema order and a
   crashed run leaves at most `--table-parallelism` tables with partial
-  chunk lists, which the existing resume path already handles. The restore
-  side lands separately.
+  chunk lists, which the existing resume path already handles.
+- **`restore` bulk-applies tables in parallel on EVERY target
+  (`--table-parallelism`, ADR-0084 restore side).** The restore chunk-apply
+  phase now fans out across a bounded writer pool (default 4 tables at
+  once), one dedicated row-writer connection per concurrent table —
+  engine-generic, since parallel writers need no shared snapshot (PG and
+  MySQL targets alike), bounded by the target's connection budget.
+  Motivated by the same 2026-06-10 benchmark (serial restore projected ~3 h
+  vs `pg_restore -j8`'s 917 s); restore wall time is the operator's
+  recovery-time objective. Per-table chunk ordering, per-chunk SHA-256
+  verification, and chain restores' ordered incremental replay are
+  unchanged; chain restores parallelize each segment full's bulk-apply via
+  the same flag. Copy/index overlap on restore is deliberately deferred.
 
 ## [0.99.34] - 2026-06-10
 

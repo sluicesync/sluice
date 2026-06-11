@@ -65,6 +65,13 @@ type ChainRestore struct {
 	// memory. Same semantics as [Migrator.MaxBufferBytes].
 	MaxBufferBytes int64
 
+	// TableParallelism caps how many tables bulk-apply CONCURRENTLY
+	// during each segment full's chunk restore (ADR-0084 restore
+	// side). Threaded into the re-entrant [Restore] for every segment
+	// full; the incremental change-replay path is untouched (ordered
+	// by construction). Same semantics as [Restore.TableParallelism].
+	TableParallelism int
+
 	// ApplyBatchSize is the upper bound on changes per target
 	// transaction during incremental replay. Same shape as
 	// [Streamer.ApplyBatchSize]. Zero falls back to 100 — chain
@@ -303,6 +310,7 @@ func (r *ChainRestore) applyFull(ctx context.Context, full *segmentRecord, dataO
 		Store:             full.segment.store(r.Store),
 		Filter:            r.Filter,
 		MaxBufferBytes:    r.MaxBufferBytes,
+		TableParallelism:  r.TableParallelism,
 		SkipChainDispatch: true,
 		DataOnly:          dataOnly,
 		Envelope:          r.Envelope,
