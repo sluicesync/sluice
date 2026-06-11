@@ -245,15 +245,19 @@ What the matrix says:
    per-chunk session setup + budget contention that pays for itself against
    disk latency is overhead at RAM speed. The knobs already exist; the default
    stays disk-tuned because real targets have disks.
-3. **The remaining frontier is per-stream rate, not format and not structure.**
-   Binary COPY moved nothing (server-side parse isn't the cost), and pgcopydb
-   saturates with *four* streams where sluice needs eight to reach a lower
-   aggregate — i.e. pgcopydb's per-stream pipe is still roughly 2× leaner even
-   against sluice's raw passthrough lane (confirmed engaged via debug logs,
-   `raw_copy=true` on every chunk). The suspects are the Go-side plumbing of
-   the byte pipe (`io.Pipe` copy + goroutine handoff between `CopyTo` and
-   `CopyFrom`, per-chunk connection setup) vs pgcopydb's direct libpq splice —
-   profiling that path on a RAM run is the next parity item.
+3. **The per-stream frontier was found and closed (2026-06-11).** At the time
+   of this matrix, pgcopydb's per-stream pipe was roughly 2× leaner even
+   against sluice's raw passthrough lane. Profiling the lane found the whole
+   gap in one place: PostgreSQL emits one CopyData message *per row* on
+   `COPY TO STDOUT`, and the unbuffered pipe between `CopyTo` and `CopyFrom`
+   shipped each as its own ~265-byte socket write — one syscall per row
+   (81.8% of single-stream CPU), where libpq buffers to 8 KiB internally. A
+   64 KiB buffer on the exporter side of the pipe (31 lines) measured
+   **4.9× single-stream** (14 → ~73 MB/s on a 4M-row / 1 GB table,
+   checksum-identical). The matrix above predates the fix; a re-measure on
+   the RAM rig would show materially different stream-shape economics — at
+   ~73 MB/s/stream, sluice's per-stream rate now exceeds the ~44 MB/s/stream
+   pgcopydb showed at its 4-stream saturation point here.
 
 ## Where pgcopydb is strictly better
 
