@@ -9,7 +9,6 @@
 package postgres
 
 import (
-	"strings"
 	"testing"
 )
 
@@ -61,65 +60,64 @@ func TestWarnNoFailoverSupport_OncePerSlot(t *testing.T) {
 	}
 }
 
-// TestCreateSlotWithFailover_CommandShape is a defensive
-// sanity-check on the protocol-command string we send. We can't
-// actually run the command here without a server, but the format
-// string is small and load-bearing — a typo would silently fall
-// through to the server and surface as a confusing parser error
-// downstream.
+// TestBuildCreateReplicationSlotCommand_Shape pins the raw PG 17+
+// protocol-command string we send. The format is small and
+// load-bearing — a typo would silently fall through to the server
+// and surface as a confusing parser error downstream.
 //
-// Specifically, this test pins the snapshot-option spelling: PG 17+
-// requires the *named* form `SNAPSHOT 'export'` inside an
-// option-list, not the bare keyword `EXPORT_SNAPSHOT` (which is the
-// pre-PG-17 syntax). PlanetScale Postgres rejected the bare-keyword
-// form in v0.2.0 with "ERROR: unrecognized option: export_snapshot"
-// — this test guards against the regression coming back.
+// Two spellings this test exists to guard:
 //
-// Strategy: build the command exactly the way createSlotWithFailover
-// does, and assert the substring the server will see. The two
-// shapes (with/without snapshot export) are both covered.
-func TestCreateSlotWithFailover_CommandShape(t *testing.T) {
-	// Mirror the format used inside createSlotWithFailover. If the
-	// helper changes, this test guards against accidental drift.
-	build := func(slot string, exportSnapshot bool) string {
-		opts := []string{}
-		if exportSnapshot {
-			opts = append(opts, "SNAPSHOT 'export'")
-		}
-		opts = append(opts, "FAILOVER true")
-		// Use the same quoteIdent path the helper uses.
-		return "CREATE_REPLICATION_SLOT " + quoteIdent(slot) +
-			" LOGICAL pgoutput (" + strings.Join(opts, ", ") + ")"
-	}
-
+//   - The snapshot-option form: PG 17+ requires the *named*
+//     `SNAPSHOT 'export'` inside an option-list, not the bare
+//     keyword `EXPORT_SNAPSHOT` (pre-PG-17 syntax). PlanetScale
+//     Postgres rejected the bare-keyword form in v0.2.0 with
+//     "ERROR: unrecognized option: export_snapshot".
+//   - The TEMPORARY placement and the TEMPORARY×FAILOVER exclusion
+//     (Bug 137): TEMPORARY is command grammar that goes BEFORE
+//     LOGICAL — not an option-list entry — and the server refuses
+//     "cannot enable failover for a temporary replication slot", so
+//     FAILOVER must be absent on the temporary shape.
+func TestBuildCreateReplicationSlotCommand_Shape(t *testing.T) {
 	cases := []struct {
-		name           string
-		slot           string
-		exportSnapshot bool
-		want           string
+		name string
+		slot string
+		opts slotCreateOptions
+		want string
 	}{
 		{
-			name:           "cold-start without snapshot",
-			slot:           "sluice_slot",
-			exportSnapshot: false,
-			want:           `CREATE_REPLICATION_SLOT "sluice_slot" LOGICAL pgoutput (FAILOVER true)`,
+			name: "persistent cold-start without snapshot",
+			slot: "sluice_slot",
+			opts: slotCreateOptions{},
+			want: `CREATE_REPLICATION_SLOT "sluice_slot" LOGICAL pgoutput (FAILOVER true)`,
 		},
 		{
-			name:           "snapshot-and-CDC handoff uses named SNAPSHOT 'export'",
-			slot:           "sluice_slot",
-			exportSnapshot: true,
-			want:           `CREATE_REPLICATION_SLOT "sluice_slot" LOGICAL pgoutput (SNAPSHOT 'export', FAILOVER true)`,
+			name: "persistent snapshot-and-CDC handoff uses named SNAPSHOT 'export'",
+			slot: "sluice_slot",
+			opts: slotCreateOptions{exportSnapshot: true},
+			want: `CREATE_REPLICATION_SLOT "sluice_slot" LOGICAL pgoutput (SNAPSHOT 'export', FAILOVER true)`,
 		},
 		{
-			name:           "slot name with embedded quote escapes",
-			slot:           `weird"name`,
-			exportSnapshot: false,
-			want:           `CREATE_REPLICATION_SLOT "weird""name" LOGICAL pgoutput (FAILOVER true)`,
+			name: "temporary backup anchor: TEMPORARY before LOGICAL, no FAILOVER",
+			slot: "sluice_backup_anchor_123",
+			opts: slotCreateOptions{exportSnapshot: true, temporary: true},
+			want: `CREATE_REPLICATION_SLOT "sluice_backup_anchor_123" TEMPORARY LOGICAL pgoutput (SNAPSHOT 'export')`,
+		},
+		{
+			name: "temporary without snapshot omits the option-list entirely",
+			slot: "sluice_backup_anchor_123",
+			opts: slotCreateOptions{temporary: true},
+			want: `CREATE_REPLICATION_SLOT "sluice_backup_anchor_123" TEMPORARY LOGICAL pgoutput`,
+		},
+		{
+			name: "slot name with embedded quote escapes",
+			slot: `weird"name`,
+			opts: slotCreateOptions{},
+			want: `CREATE_REPLICATION_SLOT "weird""name" LOGICAL pgoutput (FAILOVER true)`,
 		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := build(c.slot, c.exportSnapshot)
+			got := buildCreateReplicationSlotCommand(c.slot, c.opts)
 			if got != c.want {
 				t.Errorf("command:\n got: %q\nwant: %q", got, c.want)
 			}

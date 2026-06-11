@@ -507,7 +507,7 @@ func (r *CDCReader) resolveStartPosition(
 		// (it's a replication-protocol command), not on the *sql.DB.
 		// The helper opts into FAILOVER on PG 17+ and warns on
 		// PG ≤ 16 (see slot_create.go for the rationale).
-		if _, _, err := createLogicalReplicationSlot(ctx, r.db, conn, r.slotName, false); err != nil {
+		if _, _, err := createLogicalReplicationSlot(ctx, r.db, conn, r.slotName, slotCreateOptions{}); err != nil {
 			return 0, err
 		}
 		*slotJustCreated = true
