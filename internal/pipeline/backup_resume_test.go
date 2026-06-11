@@ -99,8 +99,19 @@ func TestBackup_ResumeSkipsAlreadyCompletedTables(t *testing.T) {
 	if m1.PartialState != ir.BackupStateInProgress {
 		t.Errorf("PartialState = %q; want %q", m1.PartialState, ir.BackupStateInProgress)
 	}
-	if len(m1.Tables) != 1 || m1.Tables[0].Name != "users" {
-		t.Errorf("partial manifest tables = %+v; want one entry for 'users'", m1.Tables)
+	// ADR-0084 pre-staging: every table's entry is staged into the
+	// manifest in schema order BEFORE the sweep starts, so the crashed
+	// manifest carries BOTH tables — users finished (Partial=false,
+	// chunks recorded) and posts not-yet-started (Partial=true, zero
+	// chunks; the resume classifier re-streams it from scratch).
+	if len(m1.Tables) != 2 || m1.Tables[0].Name != "users" || m1.Tables[1].Name != "posts" {
+		t.Fatalf("partial manifest tables = %+v; want staged entries for [users posts]", m1.Tables)
+	}
+	if m1.Tables[0].Partial {
+		t.Error("users entry Partial = true after natural EOF; want false")
+	}
+	if !m1.Tables[1].Partial || len(m1.Tables[1].Chunks) != 0 {
+		t.Errorf("posts entry = %+v; want pre-staged Partial=true with zero chunks", m1.Tables[1])
 	}
 
 	// Track how many Puts the resume run does: it should NOT re-upload
