@@ -195,6 +195,59 @@ func (r *SchemaReader) SetSchema(name string) {
 	r.schema = name
 }
 
+// catalogRows couples a catalog query's result rows to the read-only
+// transaction carrying their SET LOCAL; Close releases both.
+type catalogRows struct {
+	*sql.Rows
+	tx *sql.Tx
+}
+
+// Close closes the rows, then ends the read-only transaction
+// (Rollback is the unconditional release path — nothing to commit).
+func (cr *catalogRows) Close() error {
+	err := cr.Rows.Close()
+	_ = cr.tx.Rollback()
+	return err
+}
+
+// catalogQuery runs one catalog metadata query inside its own
+// read-only transaction with parallel execution disabled — every
+// SchemaReader catalog read goes through here (task #55, found by the
+// #38 scale probe).
+//
+// Why: at ≥50k-table catalog sizes the planner picks parallel hash
+// joins for several of these queries' join shapes, and parallel
+// workers allocate their shared hash tables as dynamic shared memory
+// segments in /dev/shm — which on container-default 64 MB shm
+// exhausts with SQLSTATE 53100 ("could not resize shared memory
+// segment"). Serial plans build their hash tables in process-local
+// work_mem and cannot hit that wall; on catalog reads the parallelism
+// buys ~nothing (validated: the full 50k-table schema read completes
+// in seconds either way). The probe caught the index sweep first, but
+// the 100%-full-shm repro showed the whole catalog-read CLASS shares
+// the failure shape — hence the chokepoint here rather than a fix at
+// the one query. SET LOCAL scopes the setting to this transaction, so
+// pooled connections return clean.
+func (r *SchemaReader) catalogQuery(ctx context.Context, q string, args ...any) (*catalogRows, error) {
+	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("postgres: begin catalog read: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, "SET LOCAL max_parallel_workers_per_gather = 0"); err != nil {
+		_ = tx.Rollback()
+		return nil, fmt.Errorf("postgres: disable parallel plan for catalog read: %w", err)
+	}
+	// The rows escape through the catalogRows wrapper; every caller
+	// iterates and checks Err via the embedded *sql.Rows, but the
+	// linter can't see through the wrapper boundary.
+	rows, err := tx.QueryContext(ctx, q, args...) //nolint:rowserrcheck
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, err
+	}
+	return &catalogRows{Rows: rows, tx: tx}, nil
+}
+
 // EnableExtensions implements [ir.ExtensionAware] for PG (ADR-0032).
 // Validates each requested extension name against pgExtensionCatalog
 // (refusing unknown names with the recognised set listed) and
@@ -345,7 +398,7 @@ func (r *SchemaReader) extensionMemberRelations(ctx context.Context) (map[string
 		  AND  d.refclassid = 'pg_extension'::regclass
 		  AND  d.deptype    = 'e'
 		  AND  n.nspname    = $1`
-	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	rows, err := r.catalogQuery(ctx, q, r.schema)
 	if err != nil {
 		return nil, err
 	}
@@ -386,7 +439,7 @@ func (r *SchemaReader) PartitionedTables(ctx context.Context) ([]string, error) 
 		JOIN   pg_namespace         n ON n.oid = c.relnamespace
 		WHERE  n.nspname = $1
 		ORDER  BY c.relname`
-	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	rows, err := r.catalogQuery(ctx, q, r.schema)
 	if err != nil {
 		return nil, err
 	}
@@ -417,7 +470,7 @@ func (r *SchemaReader) readViews(ctx context.Context) ([]*ir.View, error) {
 		WHERE  schemaname = $1
 		ORDER  BY name`
 
-	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	rows, err := r.catalogQuery(ctx, q, r.schema)
 	if err != nil {
 		return nil, err
 	}
@@ -489,7 +542,7 @@ func (r *SchemaReader) readTables(ctx context.Context) (map[string]*ir.Table, er
 		       )
 		ORDER  BY table_name`
 
-	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	rows, err := r.catalogQuery(ctx, q, r.schema)
 	if err != nil {
 		return nil, err
 	}
@@ -533,7 +586,7 @@ func (r *SchemaReader) readEnumValues(ctx context.Context) (map[string][]string,
 		WHERE  n.nspname = $1
 		ORDER  BY t.typname, e.enumsortorder`
 
-	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	rows, err := r.catalogQuery(ctx, q, r.schema)
 	if err != nil {
 		return nil, err
 	}
@@ -578,7 +631,7 @@ func (r *SchemaReader) readDomainChecks(ctx context.Context) (map[string][]ir.Do
 		  AND  t.typtype = 'd'
 		ORDER  BY t.typname, con.conname`
 
-	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	rows, err := r.catalogQuery(ctx, q, r.schema)
 	if err != nil {
 		return nil, err
 	}
@@ -629,7 +682,7 @@ func (r *SchemaReader) readGeometryColumnInfo(ctx context.Context) (map[string]g
 		FROM   geometry_columns
 		WHERE  f_table_schema = $1`
 
-	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	rows, err := r.catalogQuery(ctx, q, r.schema)
 	if err != nil {
 		// PostGIS not installed → relation doesn't exist. Treat as
 		// "no geometry info" rather than escalating; the translator
@@ -715,7 +768,7 @@ func (r *SchemaReader) readGeographyColumnInfo(ctx context.Context) (map[string]
 		FROM   geography_columns
 		WHERE  f_table_schema = $1`
 
-	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	rows, err := r.catalogQuery(ctx, q, r.schema)
 	if err != nil {
 		if isUndefinedRelationErr(err) {
 			return nil, nil
@@ -836,7 +889,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 		WHERE  c.table_schema = $1
 		ORDER  BY c.table_name, c.ordinal_position`
 
-	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	rows, err := r.catalogQuery(ctx, q, r.schema)
 	if err != nil {
 		return err
 	}
@@ -1173,7 +1226,7 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 		  AND  cl.relkind = 'r'
 		ORDER  BY cl.relname, i.relname, u.ord`
 
-	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	rows, err := r.catalogQuery(ctx, q, r.schema)
 	if err != nil {
 		return err
 	}
@@ -1464,7 +1517,7 @@ func (r *SchemaReader) populateForeignKeys(ctx context.Context, tables map[strin
 		  AND  con.contype = 'f'
 		ORDER  BY cl.relname, con.conname, u.ord`
 
-	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	rows, err := r.catalogQuery(ctx, q, r.schema)
 	if err != nil {
 		return err
 	}
@@ -1569,7 +1622,7 @@ func (r *SchemaReader) populateCheckConstraints(ctx context.Context, tables map[
 		  AND  con.contype  = 'c'
 		ORDER  BY cl.relname, con.conname`
 
-	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	rows, err := r.catalogQuery(ctx, q, r.schema)
 	if err != nil {
 		return err
 	}
@@ -1623,7 +1676,7 @@ func (r *SchemaReader) populateExcludeConstraints(ctx context.Context, tables ma
 		  AND  con.contype  = 'x'
 		ORDER  BY cl.relname, con.conname`
 
-	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	rows, err := r.catalogQuery(ctx, q, r.schema)
 	if err != nil {
 		return err
 	}
@@ -1699,7 +1752,7 @@ func (r *SchemaReader) populateRLSTableFlags(ctx context.Context, tables map[str
 		JOIN   pg_namespace n ON n.oid = cl.relnamespace
 		WHERE  n.nspname  = $1
 		  AND  cl.relkind = 'r'`
-	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	rows, err := r.catalogQuery(ctx, q, r.schema)
 	if err != nil {
 		return err
 	}
@@ -1751,7 +1804,7 @@ func (r *SchemaReader) populateRLSPolicies(ctx context.Context, tables map[strin
 		FROM   pg_policies
 		WHERE  schemaname = $1
 		ORDER  BY tablename, policyname`
-	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	rows, err := r.catalogQuery(ctx, q, r.schema)
 	if err != nil {
 		return err
 	}
@@ -1823,7 +1876,7 @@ func (r *SchemaReader) populateComments(ctx context.Context, tables map[string]*
 		  AND  cl.relkind = 'r'
 		  AND  obj_description(cl.oid, 'pg_class') IS NOT NULL`
 
-	rows, err := r.db.QueryContext(ctx, tableQ, r.schema)
+	rows, err := r.catalogQuery(ctx, tableQ, r.schema)
 	if err != nil {
 		return err
 	}
@@ -1853,7 +1906,7 @@ func (r *SchemaReader) populateComments(ctx context.Context, tables map[string]*
 		  AND  NOT a.attisdropped
 		  AND  col_description(cl.oid, a.attnum) IS NOT NULL`
 
-	crows, err := r.db.QueryContext(ctx, colQ, r.schema)
+	crows, err := r.catalogQuery(ctx, colQ, r.schema)
 	if err != nil {
 		return err
 	}

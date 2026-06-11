@@ -40,6 +40,24 @@ project follows [Semantic Versioning](https://semver.org/).
   primitive (S3/GCS/Azure blob stores) keep the previous full-rewrite
   checkpoints, named loudly on large corpora.
 
+### Fixed
+- **PG schema reads no longer die with SQLSTATE 53100 on huge
+  catalogs under small `/dev/shm` (task #55, found by the #38 scale
+  probe).** At ≥50k-table catalog sizes Postgres planned parallel
+  hash joins for several of sluice's catalog metadata queries;
+  parallel workers allocate their shared hash tables as dynamic
+  shared memory segments in `/dev/shm`, which on container-default
+  64 MB shm exhausts with `could not resize shared memory segment …
+  No space left on device (SQLSTATE 53100)`. Every PG SchemaReader
+  catalog query now runs in its own read-only transaction with `SET
+  LOCAL max_parallel_workers_per_gather = 0` — serial plans build
+  hash tables in process-local `work_mem` and cannot hit the wall,
+  and parallelism buys nothing on catalog reads (validated: a
+  50k-table / 150k-index schema read completes in ~15 s either way,
+  and the fixed binary succeeds even with `/dev/shm` 100% full where
+  the previous one failed). No operator action or `--shm-size`
+  tuning needed.
+
 ### Changed
 - **Schema fingerprints are now stable across manifest JSON
   round-trips (task #49).** `ComputeSchemaHash`'s canonical view
