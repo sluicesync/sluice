@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -26,12 +27,14 @@ import (
 // at the snapshot's start point — closing the during-backup write-
 // window gap.
 //
-// slotName is accepted for [ir.BackupSnapshotOpener] interface
+// opts.SlotName is accepted for [ir.BackupSnapshotOpener] interface
 // uniformity and ignored — MySQL has no slot concept on the source
-// side. The captured EndPosition is `@@global.gtid_executed` (when
-// GTID mode is on) or `(file, pos)` (when off), captured INSIDE the
-// snapshot transaction so the recorded position refers to the
-// snapshot's logical clock.
+// side. opts.PersistChainSlot is a loud no-op for the same reason
+// (binlog retention is server-configured via
+// binlog_expire_logs_seconds, not a per-consumer slot). The captured
+// EndPosition is `@@global.gtid_executed` (when GTID mode is on) or
+// `(file, pos)` (when off), captured INSIDE the snapshot transaction
+// so the recorded position refers to the snapshot's logical clock.
 //
 // Caller closes the returned snapshot to commit the snapshot tx,
 // release the pinned conn, and close the underlying DB pool.
@@ -47,16 +50,16 @@ import (
 // the data-read sense — operators couldn't actually chain
 // incrementals onto those backups because the encoded position
 // shape was wrong.
-func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn, slotName string) (*ir.BackupSnapshot, error) {
+func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts ir.BackupSnapshotOptions) (*ir.BackupSnapshot, error) {
 	if e.Capabilities().CDC == ir.CDCNone {
 		return nil, fmt.Errorf("%s: backup snapshot not supported by this flavor: %w", e.Name(), ErrNotImplemented)
 	}
+	warnChainSlotNoOp(ctx, e, opts)
 	if e.Flavor.usesVStream() {
 		// Whole-keyspace COPY (nil tables). The table-scoped variant lives
 		// on OpenBackupSnapshotForTables (ir.TableScopedBackupSnapshotOpener).
 		return e.openBackupSnapshotVStream(ctx, dsn, nil)
 	}
-	_ = slotName // accepted for interface uniformity; ignored on the binlog-snapshot path
 	cfg, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err
@@ -152,17 +155,34 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn, slotName string) (*
 //     Its per-table pinned-conn reader reads one table at a time and
 //     never over-streams, so the table scope is a no-op there (mirrors
 //     the OpenSnapshotStreamForTables comment).
-func (e Engine) OpenBackupSnapshotForTables(ctx context.Context, dsn, slotName string, tables []string) (*ir.BackupSnapshot, error) {
+func (e Engine) OpenBackupSnapshotForTables(ctx context.Context, dsn string, opts ir.BackupSnapshotOptions, tables []string) (*ir.BackupSnapshot, error) {
 	if e.Capabilities().CDC == ir.CDCNone {
 		return nil, fmt.Errorf("%s: backup snapshot not supported by this flavor: %w", e.Name(), ErrNotImplemented)
 	}
 	if e.Flavor.usesVStream() {
+		warnChainSlotNoOp(ctx, e, opts)
 		return e.openBackupSnapshotVStream(ctx, dsn, tables)
 	}
 	// Vanilla/binlog flavor: its snapshot RowReader already reads per-table,
 	// so it never over-streams; the table scope is a no-op there. Delegate
-	// to the base whole-snapshot path (slotName is ignored there too).
-	return e.OpenBackupSnapshot(ctx, dsn, slotName)
+	// to the base whole-snapshot path (opts are ignored there too).
+	return e.OpenBackupSnapshot(ctx, dsn, opts)
+}
+
+// warnChainSlotNoOp surfaces --chain-slot as a loud no-op on engines
+// without a slot concept (the #26 loud-no-op discipline): the chain
+// story on MySQL needs no provisioning — the binlog IS the retention
+// mechanism — but silently accepting the flag would let an operator
+// believe something was set up.
+func warnChainSlotNoOp(ctx context.Context, e Engine, opts ir.BackupSnapshotOptions) {
+	if !opts.PersistChainSlot {
+		return
+	}
+	slog.WarnContext(
+		ctx, "backup: --chain-slot is a no-op on this engine — there is no replication-slot concept; incremental chaining rides the binlog directly",
+		slog.String("engine", e.Name()),
+		slog.String("note", "ensure binlog retention (binlog_expire_logs_seconds) covers your incremental cadence"),
+	)
 }
 
 // captureBackupPositionInTx queries the source-side cursor against the

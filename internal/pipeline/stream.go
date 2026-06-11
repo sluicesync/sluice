@@ -418,6 +418,11 @@ func (b *BackupStream) Run(ctx context.Context) error {
 		return fmt.Errorf("stream: encryption: %w", err)
 	}
 
+	// 2.5. Chain-resume preflight (see [preflightChainResume]).
+	if err := preflightChainResume(ctx, b.Source, b.SourceDSN, startPos); err != nil {
+		return wrapWithHint(PhaseCDC, fmt.Errorf("stream: chain preflight: %w", err))
+	}
+
 	// 3. Open CDC pump for the lifetime of the stream. The handle is
 	// closed at function exit via a closure-captured defer so the
 	// transient-retry path (GitHub #22) can swap it for a fresh
@@ -427,6 +432,13 @@ func (b *BackupStream) Run(ctx context.Context) error {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("stream: open cdc reader: %w", err))
 	}
 	defer func() { closeIf(cdc) }()
+
+	// Chain-consumer ack mode (see [chainAckController]): the stream
+	// has no applier tracker, so without the hold the keepalive acks
+	// streamed-but-not-yet-committed positions; each rollover commit
+	// below releases its window via releaseChainAckTo, bounding source
+	// WAL retention to ~one rollover window.
+	holdChainAck(cdc)
 
 	changesCh, err := cdc.StreamChanges(ctx, startPos)
 	if err != nil {
@@ -582,6 +594,9 @@ func (b *BackupStream) Run(ctx context.Context) error {
 				if err != nil {
 					return wrapWithHint(PhaseConnect, fmt.Errorf("stream: reopen cdc reader after transient: %w", err))
 				}
+				// The fresh pump needs chain-consumer ack mode re-armed
+				// (it's per-reader state, set before StreamChanges).
+				holdChainAck(cdc)
 				resumeFrom := currentParent.EndPosition
 				changesCh, err = cdc.StreamChanges(ctx, resumeFrom)
 				if err != nil {
@@ -670,6 +685,11 @@ func (b *BackupStream) Run(ctx context.Context) error {
 		// ADR-0046: append this rollover to the open segment in
 		// lineage.json (best-effort for the non-rotation path).
 		updateLineageForManifestBestEffort(ctx, b.Store, roll.Manifest, manifestPath, b.segCodec)
+		// The rollover is durable — let the slot release its window's
+		// WAL (the chain-consumer ack holds everything else back; this
+		// is what bounds source WAL retention to ~one rollover window
+		// on a long-lived stream).
+		releaseChainAckTo(ctx, cdc, roll.Manifest.EndPosition)
 
 		if roll.StopRequested {
 			// Stop observed during the window: commit the in-flight

@@ -255,7 +255,7 @@ func TestBackup_OpenBackupSnapshot_PostgresPositionShape(t *testing.T) {
 	}
 
 	const chainSlot = "sluice_chain_test_slot"
-	snap, err := opener.OpenBackupSnapshot(context.Background(), sourceDSN, chainSlot)
+	snap, err := opener.OpenBackupSnapshot(context.Background(), sourceDSN, ir.BackupSnapshotOptions{SlotName: chainSlot})
 	if err != nil {
 		t.Fatalf("OpenBackupSnapshot: %v", err)
 	}

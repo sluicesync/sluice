@@ -6,6 +6,41 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **`backup full --chain-slot` — one-flag incremental-chain provisioning
+  (Postgres, ADR-0083).** The persistent chain slot (named by `--slot-name`)
+  is created *as* the snapshot anchor — its consistent point IS the
+  manifest's recorded EndPosition — and the pgoutput publication is ensured
+  *before* the anchor, so `backup incremental` chains with zero gap and zero
+  manual setup. Previously the operator had to create both objects by hand
+  *before* the full (the manifest pointed at a slot that might not exist);
+  pgoutput's historic-catalog rule means a late-created publication can
+  never decode the chain's first window, observed live in benchmarking. The
+  slot is kept only when the backup completes — a failed run drops it so
+  retries start clean — and an already-existing slot is refused loudly.
+  Engines without a slot concept (MySQL) log a loud no-op.
+
+### Fixed
+- **Silent-loss class closed: an incremental against a late-created or
+  foreign-advanced slot now refuses loudly instead of silently gapping the
+  chain.** A replication slot created (or advanced by another consumer)
+  *after* the parent backup cannot serve the WAL in between — PostgreSQL
+  silently fast-forwards `START_REPLICATION` to the slot's
+  `confirmed_flush_lsn`, so `backup incremental` used to SUCCEED while the
+  chain silently missed every write in the gap. A new chain-resume
+  preflight refuses with the exact positions and the recovery
+  (`backup full --chain-slot`). The slot-missing refusal also now says the
+  slot may never have existed (the old message blamed WAL pruning).
+- **Backup chains no longer ack streamed-but-uncommitted positions.**
+  `backup incremental` / `backup stream` have no applier, so the CDC
+  reader's keepalive fell back to acking the *streamed* LSN — events parsed
+  by the pump but discarded at window close could advance
+  `confirmed_flush_lsn` past the recorded EndPosition, silently gapping the
+  next link (timing-dependent). The chain consumers now hold the slot ack
+  at the stream start and release it only to durably committed window ends;
+  on `backup stream` this also bounds source WAL retention to ~one rollover
+  window.
+
 ## [0.99.34] - 2026-06-10
 
 ### Fixed

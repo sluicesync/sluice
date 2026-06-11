@@ -396,6 +396,8 @@ type BackupFullCmd struct {
 
 	SlotName string `help:"Replication-slot name suffix on engines with a slot concept (Postgres). Used to label the EndPosition recorded on the manifest so a Phase 3 incremental chained off this full opens CDC against a slot of the same name. Default 'sluice_slot'. Engines without slots (MySQL: binlog stream is the slot) ignore this flag." placeholder:"NAME"`
 
+	ChainSlot bool `help:"Provision incremental-chain prerequisites at backup time (Postgres): create the PERSISTENT replication slot (named by --slot-name) as the snapshot anchor — kept on success, dropped on failure — and ensure the pgoutput publication exists before the anchor. 'backup incremental' then chains with zero gap, no manual slot management. Costs source-side WAL retention until the next incremental consumes the slot (drop via 'sluice slot drop' to abandon the chain). Refuses if the slot already exists. Loud no-op on engines without slots (MySQL)."`
+
 	ForceOverwrite bool `help:"Replace an existing completed backup at the destination. By default 'sluice backup full' refuses to overwrite a successful prior backup; pass this to discard the prior contents and start fresh. Partial (in-progress) backups always resume regardless of this flag."`
 
 	Redact       []string `help:"Redact a PII column in backup chunks (repeatable). Format: '[schema.]table.column=STRATEGY[:options]'. Strategies: null, static:<v>, hash:sha256, hash:hmac-sha256[:<keyname>], truncate:<n>, mask:inner:<m1>,<m2>[,<char>], mask:outer:<m1>,<m2>[,<char>], mask:ssn, mask:pan, mask:pan-relaxed, mask:email, mask:ca-sin, mask:uk-nin, mask:iban, mask:uuid, randomize:int:<min>,<max>, randomize:email, randomize:us-phone, randomize:uuid, randomize:ssn, randomize:pan[:<brand>], randomize:ca-sin, randomize:uk-nin, randomize:iban[:<country-code>], randomize:dict:<name>, tokenize:dict:<name>[:<keyname>] (Phase 3 v0.61.0+, keyset-sourced Phase 4 v0.62.0+; dictionaries declared in YAML) — same set as 'sluice migrate --redact'. PII Phase 1.5 (v0.55.0+): redaction applies during chunk write, so the on-disk backup is PII-clean. Restore from a redacted chain produces the same redacted shape; restore does NOT re-apply redactions (they were applied at backup time). See docs/dev/notes/prep-pii-redaction-phase-1.md." placeholder:"RULE" sep:"none"`
@@ -467,6 +469,7 @@ func (b *BackupFullCmd) Run(g *Globals) error {
 		ChunkRows:      b.ChunkSize,
 		SluiceVersion:  version,
 		SlotName:       pipeline.ResolveSlotName(b.SlotName),
+		ChainSlot:      b.ChainSlot,
 		ForceOverwrite: b.ForceOverwrite,
 		Encryption:     encConfig,
 		Codec:          codec,

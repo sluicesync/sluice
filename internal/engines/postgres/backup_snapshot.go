@@ -27,23 +27,31 @@ const backupSnapshotSlotPrefix = "sluice_backup_anchor_"
 // slot's `consistent_point` LSN, returning a snapshot-pinned RowReader
 // the full-backup orchestrator drives the table sweep against.
 //
-// The slot used to anchor the snapshot is a TEMPORARY-shape (named
-// with a timestamp prefix and dropped on Close) — distinct from the
-// chain-handoff slot recorded in the manifest's EndPosition. The
-// chain-handoff slot is the operator's responsibility to maintain
-// (created via `sluice sync start` or manually); this anchor slot
-// only exists for the duration of the backup run.
+// Two anchor shapes, selected by opts.PersistChainSlot:
+//
+//   - Default (false): the anchor slot is TEMPORARY-shape (named with
+//     a timestamp prefix and dropped on Close) — distinct from the
+//     chain-handoff slot recorded in the manifest's EndPosition. The
+//     chain-handoff slot is the operator's responsibility to maintain
+//     (created via `sluice sync start` or manually, BEFORE this
+//     backup — a slot created after it cannot serve the WAL in
+//     between; see [Engine.PreflightChainResume]).
+//   - --chain-slot (true): the PERSISTENT chain slot itself (named
+//     opts.SlotName) is created and used as the anchor, so its
+//     consistent point IS the recorded EndPosition and `backup
+//     incremental` chains with zero gap by construction. The slot is
+//     kept only when the orchestrator calls [ir.BackupSnapshot.Commit]
+//     (backup completed); a failed run's Close drops it so retries
+//     start clean. The publication the CDC reader decodes through is
+//     ensured here too — pgoutput evaluates publication membership
+//     with a HISTORIC catalog snapshot, so a publication created
+//     after the anchor cannot decode the chain's first window.
 //
 // Caller closes the returned snapshot to release the snapshot tx, the
 // pinned SQL conn(s), the slot-creation replication conn, the anchor
-// slot (DROP), and the underlying DB pool.
-//
-// chainSlotName is the slot name to record on the returned Position so
-// a Phase 3 incremental chained off this manifest opens CDC against
-// the right slot. Empty falls back to [defaultSlot]. The chain slot
-// need not exist at backup time — Phase 3.3's `--position-from-manifest`
-// pre-flights slot state before resuming CDC.
-func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn, chainSlotName string) (*ir.BackupSnapshot, error) {
+// slot (unless committed), and the underlying DB pool.
+func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts ir.BackupSnapshotOptions) (*ir.BackupSnapshot, error) {
+	chainSlotName := opts.SlotName
 	if chainSlotName == "" {
 		chainSlotName = defaultSlot
 	}
@@ -61,14 +69,20 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn, chainSlotName strin
 		return nil, err
 	}
 
-	// Generate a fresh anchor-slot name. The orchestrator drops it on
-	// Close; the timestamp suffix protects against collisions when two
-	// backups race against the same source.
+	// Resolve the anchor slot. Default shape: a fresh timestamped
+	// temporary anchor, dropped on Close. --chain-slot shape: the
+	// persistent chain slot itself.
 	anchorSlot := fmt.Sprintf("%s%d", backupSnapshotSlotPrefix, time.Now().UnixNano())
+	if opts.PersistChainSlot {
+		anchorSlot = chainSlotName
+	}
 
-	// A pre-existing anchor slot at this exact name is implausible
-	// (timestamped) but the failure mode would silently inherit a
-	// stale consistent_point — refuse explicitly if one is found.
+	// A pre-existing slot at the anchor name is refused loudly. For
+	// the timestamped default this is near-impossible and indicates a
+	// stale leak; for --chain-slot it is the load-bearing guard: an
+	// existing slot's consistent point is NOT this backup's anchor, so
+	// silently reusing it would record a position the slot may not be
+	// able to serve gap-free.
 	info, err := slotInfo(ctx, db, anchorSlot)
 	if err != nil {
 		_ = db.Close()
@@ -76,10 +90,34 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn, chainSlotName strin
 	}
 	if info != nil {
 		_ = db.Close()
+		if opts.PersistChainSlot {
+			return nil, fmt.Errorf(
+				"postgres: backup snapshot: --chain-slot: replication slot %q already exists. "+
+					"It may belong to a running `sluice sync` (which already retains WAL for chaining — omit --chain-slot and chain off its position), "+
+					"a previous crashed --chain-slot backup (drop it via `sluice slot drop %s` and retry), "+
+					"or another consumer (pass a different --slot-name)",
+				anchorSlot, anchorSlot,
+			)
+		}
 		return nil, fmt.Errorf(
 			"postgres: backup snapshot: anchor slot %q already exists; this should be impossible (timestamped name) — drop manually and retry",
 			anchorSlot,
 		)
+	}
+
+	// --chain-slot: ensure the publication the chain's incrementals
+	// will decode through exists BEFORE the slot is created. pgoutput
+	// resolves publication membership with a historic catalog snapshot
+	// at each WAL record's LSN, so the publication must predate the
+	// anchor or the chain's first window cannot be decoded (loud
+	// "publication does not exist" at incremental time — observed live
+	// in the 2026-06-10 backup benchmark). FOR ALL TABLES matches the
+	// CDC reader's own no-scope ensure and is superset-safe.
+	if opts.PersistChainSlot {
+		if err := ensureAllTablesPublication(ctx, db, defaultPublication); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("postgres: backup snapshot: --chain-slot: ensure publication: %w", err)
+		}
 	}
 
 	// Open a replication connection dedicated to slot creation. We
@@ -93,13 +131,11 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn, chainSlotName strin
 	}
 
 	// EXPORT_SNAPSHOT under createLogicalReplicationSlot's PG-version-
-	// adaptive helper (FAILOVER true on PG 17+). We don't strictly need
-	// FAILOVER on the anchor slot since it lives only for the duration
-	// of the backup, but the helper is the single source of truth and
-	// the cost on PG ≤ 16 is one stderr warning per slot name (which
-	// our timestamp suffix uniques anyway, so each backup run gets one
-	// warning — acceptable noise for the benefit of unified slot-
-	// creation code).
+	// adaptive helper (FAILOVER true on PG 17+). The anchor slot
+	// doesn't strictly need FAILOVER on the default (temporary) shape,
+	// but the helper is the single source of truth — and on the
+	// --chain-slot shape the slot is intended to live across
+	// failovers, so FAILOVER is exactly right there.
 	consistentPoint, snapshotName, err := createLogicalReplicationSlot(ctx, db, replConn, anchorSlot, true)
 	if err != nil {
 		_ = replConn.Close(ctx)
@@ -142,8 +178,9 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn, chainSlotName strin
 
 	// Encode the position with the CHAIN-HANDOFF slot name (not the
 	// anchor slot) so a Phase 3 incremental against this manifest
-	// opens CDC against the slot the operator manages, even though
-	// the anchor slot is long gone. The recorded LSN is the snapshot's
+	// opens CDC against the slot the operator manages. On the
+	// --chain-slot shape the two are the same slot, so the recorded
+	// name is right either way. The recorded LSN is the snapshot's
 	// consistent_point: every write before that LSN is captured by the
 	// row sweep; every write after it is captured by the chain's next
 	// link's CDC stream from this LSN forward.
@@ -157,6 +194,18 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn, chainSlotName strin
 		return nil, fmt.Errorf("postgres: backup snapshot: encode position: %w", err)
 	}
 
+	if !opts.PersistChainSlot {
+		// The chain prerequisites (standing slot + publication) are NOT
+		// provisioned on this shape — say so once, at the moment the
+		// operator can still act on it, instead of letting the first
+		// `backup incremental` discover it the hard way.
+		slog.InfoContext(
+			ctx, "backup: snapshot anchor slot is temporary; to chain incrementals off this backup, the chain slot must retain WAL from this point",
+			slog.String("chain_slot", chainSlotName),
+			slog.String("hint", "re-run with --chain-slot to provision it at the anchor, or run continuous `sluice sync start`"),
+		)
+	}
+
 	rowReader := &RowReader{
 		q:      conn,
 		schema: cfg.schema,
@@ -164,6 +213,7 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn, chainSlotName strin
 	}
 
 	closed := false
+	committed := false
 	closeFn := func() error {
 		if closed {
 			return nil
@@ -183,7 +233,17 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn, chainSlotName strin
 		if err := conn.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
-		if _, err := db.ExecContext(context.Background(), "SELECT pg_drop_replication_slot($1)", anchorSlot); err != nil {
+		if committed {
+			// --chain-slot run that completed: the chain slot is now a
+			// durable resource anchored at this backup's EndPosition —
+			// keeping it is the entire point. Skip the drop.
+			slog.InfoContext(
+				context.Background(), "postgres: backup snapshot: chain slot persisted at the backup's anchor position",
+				slog.String("slot", anchorSlot),
+				slog.String("consistent_point", consistentPoint),
+				slog.String("note", "the slot retains WAL until the next `backup incremental` consumes it; drop via `sluice slot drop` if you abandon the chain"),
+			)
+		} else if _, err := db.ExecContext(context.Background(), "SELECT pg_drop_replication_slot($1)", anchorSlot); err != nil {
 			// Slot drop failure is logged but doesn't escalate — the
 			// backup itself is durable, and a leaked anchor slot is
 			// recoverable via `sluice slot drop` or manual SQL.
@@ -205,11 +265,18 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn, chainSlotName strin
 		return firstErr
 	}
 
-	return &ir.BackupSnapshot{
+	snap := &ir.BackupSnapshot{
 		Position: position,
 		Rows:     rowReader,
 		CloseFn:  closeFn,
-	}, nil
+	}
+	if opts.PersistChainSlot {
+		snap.CommitFn = func(context.Context) error {
+			committed = true
+			return nil
+		}
+	}
+	return snap, nil
 }
 
 // isSlotAlreadyGoneErr reports whether err is a "slot does not exist"

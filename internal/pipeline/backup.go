@@ -199,6 +199,20 @@ type Backup struct {
 	// state before resuming CDC.
 	SlotName string
 
+	// ChainSlot, when true, asks the engine to provision the chain
+	// prerequisites at backup time: the PERSISTENT chain slot (named
+	// SlotName) is created and used as the snapshot anchor — its
+	// consistent point IS the recorded EndPosition — and kept once
+	// the backup completes, so `backup incremental` chains with zero
+	// gap by construction. Postgres also ensures the publication the
+	// chain's CDC decodes through exists before the anchor (pgoutput
+	// resolves publications with a historic catalog snapshot, so a
+	// later-created publication cannot decode the chain's first
+	// window). Engines without a slot concept (MySQL) log a loud
+	// no-op. The slot is dropped if the backup fails, so retries
+	// start clean. See [ir.BackupSnapshotOptions].
+	ChainSlot bool
+
 	// ForceOverwrite, when true, lets a re-run replace a previously-
 	// completed backup at the same destination. Without it, finding a
 	// `partial_state == "complete"` manifest at the destination is an
@@ -340,7 +354,7 @@ func (b *Backup) Run(ctx context.Context) error {
 	// carry the during-backup write-window gap. One-shot full backups
 	// without CDC are still legitimate; chain correctness is the only
 	// thing that needs the snapshot path.
-	rr, snapshotPos, snapshotCloser, err := b.openSnapshotOrFallback(ctx, schema)
+	rr, snapshotPos, snap, snapshotCloser, err := b.openSnapshotOrFallback(ctx, schema)
 	if err != nil {
 		return err
 	}
@@ -515,6 +529,14 @@ func (b *Backup) Run(ctx context.Context) error {
 	if err := writeManifest(ctx, b.Store, manifest); err != nil {
 		return fmt.Errorf("backup: write final manifest: %w", err)
 	}
+	// The backup is durable from here — persist run-scoped chain
+	// resources (--chain-slot: keep the slot anchored at EndPosition).
+	// A commit failure is loud: the backup itself is complete, but the
+	// chain the operator asked for was not provisioned, and the
+	// deferred Close will drop the un-committed slot.
+	if err := snap.Commit(ctx); err != nil {
+		return fmt.Errorf("backup: persist chain resources: %w", err)
+	}
 	// ADR-0046: seed / update lineage.json. A full backup is segment 0
 	// of a one-segment lineage at the conventional root (Dir == "").
 	// Best-effort — the manifest file is authoritative for the
@@ -598,21 +620,25 @@ func (b *Backup) Run(ctx context.Context) error {
 // the v0.17.x path on a non-nil err exactly as the base OpenBackupSnapshot
 // error path does — a scoped-open error is NOT a different failure mode).
 func (b *Backup) openBackupSnapshotScoped(ctx context.Context, schema *ir.Schema) (snap *ir.BackupSnapshot, implemented bool, err error) {
+	opts := ir.BackupSnapshotOptions{
+		SlotName:         b.SlotName,
+		PersistChainSlot: b.ChainSlot,
+	}
 	tables := tableNamesForPublication(schema)
 	if len(tables) > 0 {
 		if scoped, ok := b.Source.(ir.TableScopedBackupSnapshotOpener); ok {
-			snap, err = scoped.OpenBackupSnapshotForTables(ctx, b.SourceDSN, b.SlotName, tables)
+			snap, err = scoped.OpenBackupSnapshotForTables(ctx, b.SourceDSN, opts, tables)
 			return snap, true, err
 		}
 	}
 	if opener, ok := b.Source.(ir.BackupSnapshotOpener); ok {
-		snap, err = opener.OpenBackupSnapshot(ctx, b.SourceDSN, b.SlotName)
+		snap, err = opener.OpenBackupSnapshot(ctx, b.SourceDSN, opts)
 		return snap, true, err
 	}
 	return nil, false, nil
 }
 
-func (b *Backup) openSnapshotOrFallback(ctx context.Context, schema *ir.Schema) (ir.RowReader, *ir.Position, func(), error) {
+func (b *Backup) openSnapshotOrFallback(ctx context.Context, schema *ir.Schema) (ir.RowReader, *ir.Position, *ir.BackupSnapshot, func(), error) {
 	if snap, ok, err := b.openBackupSnapshotScoped(ctx, schema); ok {
 		if err == nil {
 			slog.InfoContext(
@@ -629,7 +655,14 @@ func (b *Backup) openSnapshotOrFallback(ctx context.Context, schema *ir.Schema) 
 					)
 				}
 			}
-			return snap.Rows, &pos, cleanup, nil
+			return snap.Rows, &pos, snap, cleanup, nil
+		}
+		// --chain-slot is an explicit request for chain provisioning;
+		// the v0.17.x fallback cannot honour it (no snapshot anchor →
+		// no slot to persist → the chain the operator asked for would
+		// silently not exist). Refuse instead of degrading.
+		if b.ChainSlot {
+			return nil, nil, nil, func() {}, fmt.Errorf("backup: --chain-slot requested but the snapshot-anchored path is unavailable: %w", err)
 		}
 		// Snapshot open failed (e.g. PG without `wal_level=logical`
 		// can't create the temporary anchor slot). v0.17.x's
@@ -648,12 +681,18 @@ func (b *Backup) openSnapshotOrFallback(ctx context.Context, schema *ir.Schema) 
 			slog.String("see_also", "v0.17.2 release notes; docs/dev/design/logical-backups-phase-3.md"),
 		)
 	} else {
-		// Engine doesn't implement BackupSnapshotOpener at all.
-		// Surface the gap loudly — operators consuming the chain
-		// need to know writes during the backup window are not
-		// guaranteed to be captured. The recommended mitigation
-		// (pair backups with continuous `sluice sync start`) is the
-		// same one the v0.17.2 release notes called out.
+		// Engine doesn't implement BackupSnapshotOpener at all. With
+		// --chain-slot that's a refusal (chain provisioning is
+		// impossible — degrading silently would betray the explicit
+		// intent); without it, surface the gap loudly — operators
+		// consuming the chain need to know writes during the backup
+		// window are not guaranteed to be captured. The recommended
+		// mitigation (pair backups with continuous `sluice sync
+		// start`) is the same one the v0.17.2 release notes called
+		// out.
+		if b.ChainSlot {
+			return nil, nil, nil, func() {}, fmt.Errorf("backup: --chain-slot requested but engine %q does not implement the snapshot-anchored backup path", b.Source.Name())
+		}
 		slog.WarnContext(
 			ctx, "backup: engine does not implement BackupSnapshotOpener; falling back to non-snapshot row reads",
 			slog.String("engine", b.Source.Name()),
@@ -665,10 +704,10 @@ func (b *Backup) openSnapshotOrFallback(ctx context.Context, schema *ir.Schema) 
 
 	rr, err := b.Source.OpenRowReader(ctx, b.SourceDSN)
 	if err != nil {
-		return nil, nil, func() {}, wrapWithHint(PhaseConnect, fmt.Errorf("backup: open source row reader: %w", err))
+		return nil, nil, nil, func() {}, wrapWithHint(PhaseConnect, fmt.Errorf("backup: open source row reader: %w", err))
 	}
 	cleanup := func() { closeIf(rr) }
-	return rr, nil, cleanup, nil
+	return rr, nil, nil, cleanup, nil
 }
 
 // captureEndPosition queries the source for its current CDC position

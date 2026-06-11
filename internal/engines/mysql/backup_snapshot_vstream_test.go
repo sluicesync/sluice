@@ -111,7 +111,7 @@ func TestEngine_OpenBackupSnapshot_FlavorBranchRoutes(t *testing.T) {
 			cancel() // pre-cancel so dial fails fast
 			eng := Engine{Flavor: c.flavor}
 			// Use a DSN that parses but can't reach a real endpoint.
-			_, err := eng.OpenBackupSnapshot(ctx, "user:pw@tcp(127.0.0.1:1)/db", "")
+			_, err := eng.OpenBackupSnapshot(ctx, "user:pw@tcp(127.0.0.1:1)/db", ir.BackupSnapshotOptions{})
 			if err == nil {
 				t.Fatalf("expected error from unreachable DSN; got nil")
 			}
@@ -131,7 +131,7 @@ func TestEngine_OpenBackupSnapshot_VanillaDoesNotUseVStream(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	eng := Engine{Flavor: FlavorVanilla}
-	_, err := eng.OpenBackupSnapshot(ctx, "user:pw@tcp(127.0.0.1:1)/db", "")
+	_, err := eng.OpenBackupSnapshot(ctx, "user:pw@tcp(127.0.0.1:1)/db", ir.BackupSnapshotOptions{})
 	if err == nil {
 		t.Fatalf("expected error from unreachable DSN; got nil")
 	}
@@ -150,7 +150,7 @@ func TestEngine_OpenBackupSnapshotForTables_VanillaDoesNotUseVStream(t *testing.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	eng := Engine{Flavor: FlavorVanilla}
-	_, err := eng.OpenBackupSnapshotForTables(ctx, "user:pw@tcp(127.0.0.1:1)/db", "", []string{"small_t", "other"})
+	_, err := eng.OpenBackupSnapshotForTables(ctx, "user:pw@tcp(127.0.0.1:1)/db", ir.BackupSnapshotOptions{}, []string{"small_t", "other"})
 	if err == nil {
 		t.Fatalf("expected error from unreachable DSN; got nil")
 	}
@@ -166,7 +166,7 @@ func TestEngine_OpenBackupSnapshotForTables_PlanetScaleRoutesToVStream(t *testin
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	eng := Engine{Flavor: FlavorPlanetScale}
-	_, err := eng.OpenBackupSnapshotForTables(ctx, "user:pw@tcp(127.0.0.1:1)/db", "", []string{"small_t"})
+	_, err := eng.OpenBackupSnapshotForTables(ctx, "user:pw@tcp(127.0.0.1:1)/db", ir.BackupSnapshotOptions{}, []string{"small_t"})
 	if err == nil {
 		t.Fatalf("expected error from unreachable DSN; got nil")
 	}
