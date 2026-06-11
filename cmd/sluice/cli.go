@@ -17,7 +17,6 @@ import (
 
 	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/engines"
-	"sluicesync.dev/sluice/internal/engines/postgres"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline"
 	"sluicesync.dev/sluice/internal/redact"
@@ -302,12 +301,13 @@ func (m *MigrateCmd) Run(g *Globals) error {
 		return err
 	}
 
-	// connection-resilience (1): label every Postgres connection sluice
-	// opens with application_name=sluice/<migration-id>/<role> so the
-	// operator can find sluice's sessions in pg_stat_activity. Set once
-	// here, before any engine opens a connection. Empty --migration-id
-	// is normalised to the "-" fallback inside SetApplicationID.
-	postgres.SetApplicationID(m.MigrationID)
+	// connection-resilience (1): label every connection sluice opens
+	// with the run's id (PG: application_name=sluice/<role>/<id>) so
+	// the operator can find sluice's sessions in pg_stat_activity.
+	// Applied once here, before any engine opens a connection; the
+	// engine normalises an empty --migration-id to the "-" fallback.
+	source = labelEngine(source, m.MigrationID)
+	target = labelEngine(target, m.MigrationID)
 
 	mig := &pipeline.Migrator{
 		Source:                source,
@@ -436,6 +436,19 @@ func resolveEngine(name string) (ir.Engine, error) {
 		return nil, fmt.Errorf("unknown engine %q (registered: %v)", name, engines.Names())
 	}
 	return e, nil
+}
+
+// labelEngine returns e configured to stamp its connections with the
+// run's stream-/migration-id when the engine supports connection
+// labeling ([ir.ConnectionLabeler] — PG carries it in application_name);
+// engines without a per-connection label pass through unchanged. The
+// labeled copy is local to this run — the registry's engine value stays
+// label-free.
+func labelEngine(e ir.Engine, id string) ir.Engine {
+	if l, ok := e.(ir.ConnectionLabeler); ok {
+		return l.WithConnectionLabel(id)
+	}
+	return e
 }
 
 // SyncCmd groups the continuous-sync subcommands. Continuous sync is
@@ -1025,12 +1038,13 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		}
 	}
 
-	// connection-resilience (1): label every Postgres connection sluice
-	// opens with application_name=sluice/<role>/<stream-id> so the
-	// operator can find sluice's sessions in pg_stat_activity. Set once
-	// here, before any engine opens a connection. Empty --stream-id is
-	// normalised to the "-" fallback inside SetApplicationID.
-	postgres.SetApplicationID(s.StreamID)
+	// connection-resilience (1): label every connection sluice opens
+	// with the run's id (PG: application_name=sluice/<role>/<id>) so
+	// the operator can find sluice's sessions in pg_stat_activity.
+	// Applied once here, before any engine opens a connection; the
+	// engine normalises an empty --stream-id to the "-" fallback.
+	source = labelEngine(source, s.StreamID)
+	target = labelEngine(target, s.StreamID)
 
 	streamer := &pipeline.Streamer{
 		Source:                 source,

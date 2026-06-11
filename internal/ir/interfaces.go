@@ -2109,6 +2109,29 @@ type Engine interface {
 	OpenSnapshotStream(ctx context.Context, dsn string) (*SnapshotStream, error)
 }
 
+// ConnectionLabeler is the optional engine surface for engines that can
+// stamp every connection they open with an operator-visible label
+// carrying the run's stream-/migration-id, so operators can find a
+// specific run's sessions in the server's activity views. The CLI
+// type-asserts on it right after engine lookup and, when implemented,
+// swaps in the labeled copy for the rest of the run; engines without a
+// per-connection label concept simply omit the method.
+//
+// The label's wire form is engine-specific. Postgres carries it in
+// application_name (`sluice/<role>/<id>`, visible in pg_stat_activity
+// and matched by the stale-backend probe); a future engine may use its
+// own connection attribute (e.g. MySQL's performance_schema
+// session_connect_attrs).
+//
+// WithConnectionLabel returns a configured copy rather than mutating —
+// engines are registered once and shared, so the registry's value must
+// stay label-free for the next caller. An empty id is normalised by the
+// engine to a stable fallback (Postgres: `sluice/<role>/-`) so the
+// label format stays well-formed and greppable.
+type ConnectionLabeler interface {
+	WithConnectionLabel(id string) Engine
+}
+
 // CDCReaderWithSlotOpener is the optional engine surface for engines
 // whose CDC implementation can be configured with a non-default
 // replication-slot name (today: Postgres). When the orchestrator has

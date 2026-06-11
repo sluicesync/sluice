@@ -90,6 +90,12 @@ type CDCReader struct {
 	// replication mode.
 	dsn string
 
+	// appID is the stream-/migration-id segment of the application_name
+	// label, stashed alongside dsn so the replication-mode connection
+	// [StreamChanges] opens carries the same `sluice/cdc-reader/<id>`
+	// label as the reader's catalog pool (empty → the "-" fallback).
+	appID string
+
 	// publication is the PUBLICATION name to stream from. Created
 	// on demand (FOR ALL TABLES) when missing.
 	publication string
@@ -275,7 +281,7 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 		return nil, err
 	}
 
-	conn, err := openReplicationConn(ctx, r.dsn)
+	conn, err := openReplicationConn(ctx, r.dsn, r.appID)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: open replication connection: %w", err)
 	}
@@ -2078,8 +2084,10 @@ func dropReplicationSlot(ctx context.Context, conn *pgconn.PgConn, name string) 
 // openReplicationConn opens a pgconn.PgConn in replication=database
 // mode. The caller-supplied DSN (which may already contain query
 // parameters) is augmented with the replication parameter; existing
-// values are preserved.
-func openReplicationConn(ctx context.Context, dsn string) (*pgconn.PgConn, error) {
+// values are preserved. appID is the stream-/migration-id segment of
+// the application_name label, threaded from the opening engine's
+// config (empty → the "-" fallback).
+func openReplicationConn(ctx context.Context, dsn, appID string) (*pgconn.PgConn, error) {
 	withRepl, err := withReplicationParam(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: prepare replication DSN: %w", err)
@@ -2088,7 +2096,7 @@ func openReplicationConn(ctx context.Context, dsn string) (*pgconn.PgConn, error
 	// longest-lived, most idle-prone connection sluice holds — gets the
 	// shared TCP keep-alive policy on its dial path (see [netkeepalive])
 	// and the cdc-reader application_name label (see [withApplicationName]).
-	connConfig, err := pgconn.ParseConfig(withApplicationName(withRepl, roleCDCReader))
+	connConfig, err := pgconn.ParseConfig(withApplicationName(withRepl, roleCDCReader, appID))
 	if err != nil {
 		return nil, fmt.Errorf("postgres: parse replication DSN: %w", err)
 	}

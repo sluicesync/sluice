@@ -97,7 +97,7 @@ func TestSlotPause_Verify_RetainedWALReDecodesWithUpdatedPublication(t *testing.
 	defer func() { _ = db.Close() }()
 
 	// Open a replication connection just to create the slot.
-	slotConn, err := openReplicationConn(ctx, dsn)
+	slotConn, err := openReplicationConn(ctx, dsn, "-")
 	if err != nil {
 		t.Fatalf("open slot replication conn: %v", err)
 	}
@@ -259,7 +259,7 @@ func verifyH2_TempSlotSnapshotCapturesPrePublicationAddRows(
 	// Create a "main slot" so WAL retention applies — the test
 	// faithfully models v0.24.0's runtime where an active stream
 	// already has a slot with progress.
-	mainSlotConn, err := openReplicationConn(ctx, dsn)
+	mainSlotConn, err := openReplicationConn(ctx, dsn, "-")
 	if err != nil {
 		t.Fatalf("verifyH2: open main slot conn: %v", err)
 	}
@@ -290,7 +290,7 @@ func verifyH2_TempSlotSnapshotCapturesPrePublicationAddRows(
 	// AddTable.LiveMode does after the publication-add. The slot is
 	// created with EXPORT_SNAPSHOT so we can read the snapshot view
 	// from a regular SQL connection.
-	tempSlotConn, err := openReplicationConn(ctx, dsn)
+	tempSlotConn, err := openReplicationConn(ctx, dsn, "-")
 	if err != nil {
 		t.Fatalf("verifyH2: open temp slot conn: %v", err)
 	}
@@ -379,7 +379,7 @@ func streamingPass(
 ) streamingPassResult {
 	t.Helper()
 
-	conn, err := openReplicationConn(ctx, dsn)
+	conn, err := openReplicationConn(ctx, dsn, "-")
 	if err != nil {
 		t.Fatalf("streamingPass: open conn: %v", err)
 	}

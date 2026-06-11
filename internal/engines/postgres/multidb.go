@@ -71,8 +71,8 @@ func isSystemSchema(name string) bool {
 // logical slot cannot span databases). The system namespaces
 // (pg_catalog, information_schema, pg_toast, pg_temp*, pg_toast_temp*)
 // are filtered out unconditionally per the ADR.
-func (Engine) ListDatabases(ctx context.Context, dsn string) ([]string, error) {
-	cfg, err := parseDSN(dsn)
+func (e Engine) ListDatabases(ctx context.Context, dsn string) ([]string, error) {
+	cfg, err := e.parseDSN(dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -165,11 +165,11 @@ func withSchemaKV(dsn, schema string) string {
 // The schema identifier is double-quoted via [quoteIdent] so a name with
 // reserved-word or special-character shape is safe; embedded quotes are
 // doubled by quoteIdent.
-func (Engine) EnsureDatabase(ctx context.Context, dsn, schema string) error {
+func (e Engine) EnsureDatabase(ctx context.Context, dsn, schema string) error {
 	if schema == "" {
 		return errors.New("postgres: EnsureDatabase: schema name is empty")
 	}
-	cfg, err := parseDSN(dsn)
+	cfg, err := e.parseDSN(dsn)
 	if err != nil {
 		return err
 	}

@@ -72,7 +72,7 @@ func TestWithDatabaseURI(t *testing.T) {
 		t.Errorf("database path changed = %q; want /appdb", u.Path)
 	}
 	// parseDSN must round-trip the schema back out.
-	cfg, err := parseDSN(got)
+	cfg, err := Engine{}.parseDSN(got)
 	if err != nil {
 		t.Fatalf("parseDSN(result): %v", err)
 	}
@@ -113,7 +113,7 @@ func TestWithDatabaseKV(t *testing.T) {
 			if err != nil {
 				t.Fatalf("WithDatabase: %v", err)
 			}
-			cfg, err := parseDSN(got)
+			cfg, err := Engine{}.parseDSN(got)
 			if err != nil {
 				t.Fatalf("parseDSN(result %q): %v", got, err)
 			}

@@ -55,7 +55,7 @@ func TestSlotManager_DropExisting(t *testing.T) {
 	// Open a replication connection just to create the slot. We
 	// don't keep a CDC reader running — the slot is what we want
 	// to manage from outside.
-	replConn, err := openReplicationConn(ctx, dsn)
+	replConn, err := openReplicationConn(ctx, dsn, "-")
 	if err != nil {
 		t.Fatalf("openReplicationConn: %v", err)
 	}
@@ -229,7 +229,7 @@ func TestCDCReader_PreExistingSlotPreservedOnFailure(t *testing.T) {
 	defer cancel()
 
 	// Pre-create the slot via a separate replication connection.
-	replConn, err := openReplicationConn(ctx, dsn)
+	replConn, err := openReplicationConn(ctx, dsn, "-")
 	if err != nil {
 		t.Fatalf("openReplicationConn: %v", err)
 	}

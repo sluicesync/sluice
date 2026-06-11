@@ -104,7 +104,7 @@ func (e Engine) openSnapshotStreamShared(ctx context.Context, dsn, slotName stri
 	if slotName == "" {
 		slotName = defaultSlot
 	}
-	cfg, err := parseDSN(dsn)
+	cfg, err := e.parseDSN(dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -169,7 +169,7 @@ func (e Engine) openSnapshotStreamShared(ctx context.Context, dsn, slotName stri
 	// exported snapshot stays valid through the bulk-copy phase. The
 	// CDCReader opens its OWN replication connection later (during
 	// StreamChanges) for the actual streaming.
-	replConn, err := openReplicationConn(ctx, cfg.dsn)
+	replConn, err := openReplicationConn(ctx, cfg.dsn, cfg.appID)
 	if err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("postgres: snapshot: open replication conn: %w", err)
@@ -257,7 +257,8 @@ func (e Engine) openSnapshotStreamShared(ctx context.Context, dsn, slotName stri
 		// without the DSN it would report "no estimate" and single-stream.
 		// cfg.dsn is the driver-ready DSN (schema stripped) — reltuples is
 		// snapshot-insensitive, so the off-conn read is correct.
-		estimatorDSN: cfg.dsn,
+		estimatorDSN:   cfg.dsn,
+		estimatorAppID: cfg.appID,
 	}
 
 	stream := &ir.SnapshotStream{

@@ -123,7 +123,7 @@ func TestSlotSpillStats_DecodeProducesNonZeroBytes(t *testing.T) {
 
 	// Create the slot via the replication protocol — same code path
 	// the CDC reader takes during cold-start.
-	replConn, err := openReplicationConn(ctx, dsn)
+	replConn, err := openReplicationConn(ctx, dsn, "-")
 	if err != nil {
 		t.Fatalf("openReplicationConn: %v", err)
 	}

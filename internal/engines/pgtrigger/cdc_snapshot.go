@@ -54,7 +54,7 @@ func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.Snapsho
 	// Dedicated pool for the snapshot read. The CDC poller opens its
 	// OWN pool (via openCDCReader below) so the snapshot pool can be
 	// released by ReleaseRows independently of the CDC lifetime.
-	db, err := postgres.OpenPgxDB(cfg.dsn)
+	db, err := postgres.OpenPgxDB(cfg.dsn, e.appID)
 	if err != nil {
 		return nil, fmt.Errorf("pgtrigger: snapshot: open: %w", err)
 	}
@@ -122,7 +122,7 @@ func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.Snapsho
 	// Changes: the trigger poller, resuming from the anchor. It opens
 	// its OWN *sql.DB pool and NEVER creates or uses a replication slot
 	// (it scans sluice_change_log via the §2 xmin safety-lag predicate).
-	cdcReader, err := openCDCReader(ctx, dsn)
+	cdcReader, err := openCDCReader(ctx, dsn, e.appID)
 	if err != nil {
 		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
 		_ = conn.Close()

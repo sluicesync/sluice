@@ -114,7 +114,7 @@ func TestMigrationStateStore_LegacyBlobUpgrade(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	cfg, err := parseDSN(dsn)
+	cfg, err := Engine{}.parseDSN(dsn)
 	if err != nil {
 		t.Fatalf("parseDSN: %v", err)
 	}

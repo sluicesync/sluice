@@ -264,7 +264,7 @@ func TestHeartbeat_AdvancesSlotPosition(t *testing.T) {
 
 	// Create a slot so the test mirrors the production shape.
 	const slotName = "f17_heartbeat_slot"
-	replConn, err := openReplicationConn(ctx, dsn)
+	replConn, err := openReplicationConn(ctx, dsn, "-")
 	if err != nil {
 		t.Fatalf("openReplicationConn: %v", err)
 	}

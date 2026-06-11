@@ -49,7 +49,7 @@ func TestMigrationStateCheckpointCost_Measure10k(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	cfg, err := parseDSN(dsn)
+	cfg, err := Engine{}.parseDSN(dsn)
 	if err != nil {
 		t.Fatalf("parseDSN: %v", err)
 	}

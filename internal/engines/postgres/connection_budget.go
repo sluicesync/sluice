@@ -195,8 +195,8 @@ func probeConnectionBudget(ctx context.Context, db *sql.DB) (connectionBudgetPro
 // blind requested value. Only a connection-open failure surfaces as a
 // non-nil error (the operator's own DSN is wrong — that's worth failing
 // on, the same as every other Open*).
-func (Engine) ProbeTargetConnectionBudget(ctx context.Context, dsn string, requested, ceiling int) (ir.ConnectionBudget, error) {
-	cfg, err := parseDSN(dsn)
+func (e Engine) ProbeTargetConnectionBudget(ctx context.Context, dsn string, requested, ceiling int) (ir.ConnectionBudget, error) {
+	cfg, err := e.parseDSN(dsn)
 	if err != nil {
 		return ir.ConnectionBudget{}, err
 	}

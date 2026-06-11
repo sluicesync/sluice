@@ -36,8 +36,15 @@ type pgKeysetStore struct {
 // openKeysetStore opens a *sql.DB against the keyset DSN and pings
 // it. The DSN's `schema` query parameter (default "public") selects
 // the namespace, identically to the rest of the PG engine.
+//
+// The redact registry hands this opener a bare DSN with no engine
+// instance attached, so the zero-value Engine parses it and the
+// store's roleControl connections keep the `sluice/control/-` fallback
+// label rather than the run's stream-/migration-id. Accepted residual:
+// the keyset store is a short-lived control surface, not a per-stream
+// session worth attributing in pg_stat_activity.
 func openKeysetStore(ctx context.Context, dsn string) (redact.KeysetStore, error) {
-	cfg, err := parseDSN(dsn)
+	cfg, err := Engine{}.parseDSN(dsn)
 	if err != nil {
 		return nil, err
 	}

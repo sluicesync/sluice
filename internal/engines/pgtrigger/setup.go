@@ -199,7 +199,9 @@ func Setup(ctx context.Context, dsn string, opts SetupOptions) (*Plan, error) {
 		opts.Schema = cfg.schema
 	}
 
-	db, err := postgres.OpenPgxDB(cfg.dsn)
+	// One-shot CLI operation with no stream-id in play; the empty
+	// label gets the `sluice/control/-` fallback application_name.
+	db, err := postgres.OpenPgxDB(cfg.dsn, "")
 	if err != nil {
 		return nil, fmt.Errorf("pgtrigger: setup: open: %w", err)
 	}
@@ -299,7 +301,9 @@ func Teardown(ctx context.Context, dsn string, opts TeardownOptions) (*Plan, err
 		opts.Schema = cfg.schema
 	}
 
-	db, err := postgres.OpenPgxDB(cfg.dsn)
+	// One-shot CLI operation with no stream-id in play; the empty
+	// label gets the `sluice/control/-` fallback application_name.
+	db, err := postgres.OpenPgxDB(cfg.dsn, "")
 	if err != nil {
 		return nil, fmt.Errorf("pgtrigger: teardown: open: %w", err)
 	}

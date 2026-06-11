@@ -44,7 +44,7 @@ import (
 // still retained, PostgreSQL replays from the requested LSN, and the
 // chunk writer's dedup is not needed because the recorded EndPosition
 // is what the orchestrator restarts from).
-func (Engine) PreflightChainResume(ctx context.Context, dsn string, from ir.Position) error {
+func (e Engine) PreflightChainResume(ctx context.Context, dsn string, from ir.Position) error {
 	decoded, ok, err := decodePGPos(from)
 	if err != nil {
 		return fmt.Errorf("postgres: chain preflight: %w", err)
@@ -55,7 +55,7 @@ func (Engine) PreflightChainResume(ctx context.Context, dsn string, from ir.Posi
 		return nil
 	}
 
-	cfg, err := parseDSN(dsn)
+	cfg, err := e.parseDSN(dsn)
 	if err != nil {
 		return err
 	}

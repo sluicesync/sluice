@@ -36,39 +36,6 @@ const (
 	roleControl connRole = "control"
 )
 
-// applicationID is the stream- or migration-id segment sluice embeds in
-// the application_name it stamps on every Postgres connection. It is
-// process-global state set once at startup by [SetApplicationID] (called
-// from main.go with the resolved --stream-id / --migration-id), mirroring
-// the [SetSessionSQLMode] pattern the mysql engine uses to thread a
-// CLI-level value into the connection layer without routing it through
-// every ir.Engine.Open* signature.
-//
-// Empty (the default) is the stable fallback: connections are labelled
-// `sluice/<role>/-`. Paths that never go through main() (a bare
-// `go test ./...`, direct Go-API callers) get that fallback rather than
-// no label at all.
-var applicationID = "-"
-
-// SetApplicationID sets the stream/migration-id segment of the
-// application_name sluice stamps on every Postgres connection. main.go
-// calls this once at startup, before any engine opens a connection, with
-// the operator's resolved --stream-id (sync) or --migration-id (migrate).
-//
-// An empty id is normalised to "-" so the application_name format
-// (`sluice/<role>/<id>`) stays well-formed and greppable even when no id
-// is available.
-//
-// Concurrency: this is process-wide global state set once at startup,
-// before any engine opens a connection. Don't call it from long-lived
-// goroutines.
-func SetApplicationID(id string) {
-	if id == "" {
-		id = "-"
-	}
-	applicationID = id
-}
-
 // maxAppNameBytes is PostgreSQL's effective application_name limit:
 // pg_stat_activity holds it in a NAMEDATALEN (64) byte buffer and silently
 // truncates anything past NAMEDATALEN-1 = 63 bytes (replacing non-printable
@@ -103,13 +70,19 @@ func clampUTF8(s string, maxBytes int) string {
 }
 
 // withApplicationName returns dsn with sluice's application_name added
-// for the given role, unless the operator already set application_name
-// in the DSN — an operator-supplied value is never clobbered (they may
-// be coordinating with their own pg_stat_activity tooling).
+// for the given role and stream-/migration-id, unless the operator
+// already set application_name in the DSN — an operator-supplied value
+// is never clobbered (they may be coordinating with their own
+// pg_stat_activity tooling).
 //
-// The stamped value is `sluice/<role>/<applicationID>` (clamped to 63
-// bytes, see [buildApplicationName]). Both DSN forms are handled,
-// mirroring [parseDSN]:
+// The stamped value is `sluice/<role>/<id>` (clamped to 63 bytes, see
+// [buildApplicationName]). The id is threaded down from
+// [Engine.WithConnectionLabel] via [pgConfig.appID]; an empty id (a
+// bare Go-API caller on the zero-value Engine, a path with no id to
+// carry) is normalised here — the single choke point every connection
+// funnels through — to the stable "-" fallback, so the label format
+// stays well-formed and greppable. Both DSN forms are handled,
+// mirroring [Engine.parseDSN]:
 //
 //   - URI: postgres://…?application_name=sluice/snapshot/mystream
 //   - libpq KV: host=… application_name=sluice/snapshot/mystream
@@ -117,8 +90,11 @@ func clampUTF8(s string, maxBytes int) string {
 // A DSN that fails to parse as a URI is returned unchanged; the driver's
 // own parse step will surface the malformed-DSN error with a better
 // message than anything we could synthesise here.
-func withApplicationName(dsn string, role connRole) string {
-	appName := buildApplicationName(role, applicationID)
+func withApplicationName(dsn string, role connRole, id string) string {
+	if id == "" {
+		id = "-"
+	}
+	appName := buildApplicationName(role, id)
 
 	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
 		u, err := url.Parse(dsn)
