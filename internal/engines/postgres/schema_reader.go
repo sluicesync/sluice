@@ -1179,8 +1179,7 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 	}
 	defer func() { _ = rows.Close() }()
 
-	type key struct{ table, name string }
-	collected := map[key]*ir.Index{}
+	collected := map[tableObjectKey]*ir.Index{}
 	primary := map[string]string{} // table → primary index name
 
 	for rows.Next() {
@@ -1227,7 +1226,7 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			continue
 		}
 
-		k := key{table: tableName, name: indexName}
+		k := tableObjectKey{table: tableName, name: indexName}
 		idx, ok := collected[k]
 		if !ok {
 			kind := indexKindFrom(method)
@@ -1412,7 +1411,13 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 		return err
 	}
 
-	for k, idx := range collected {
+	// Drain in sorted key order, not map order: Go map iteration is
+	// randomized, and an unordered Indexes slice makes two reads of the
+	// SAME schema structurally unequal — recorded manifests then diff
+	// against fresh reads as phantom alter_table deltas (task #41,
+	// observed live as schema_deltas=6 on a DDL-free incremental).
+	for _, k := range sortedTableObjectKeys(collected) {
+		idx := collected[k]
 		t := tables[k.table]
 		if primary[k.table] == idx.Name {
 			t.PrimaryKey = idx
@@ -1465,8 +1470,7 @@ func (r *SchemaReader) populateForeignKeys(ctx context.Context, tables map[strin
 	}
 	defer func() { _ = rows.Close() }()
 
-	type key struct{ table, name string }
-	collected := map[key]*ir.ForeignKey{}
+	collected := map[tableObjectKey]*ir.ForeignKey{}
 
 	for rows.Next() {
 		var (
@@ -1486,7 +1490,7 @@ func (r *SchemaReader) populateForeignKeys(ctx context.Context, tables map[strin
 			continue
 		}
 
-		k := key{table: tableName, name: name}
+		k := tableObjectKey{table: tableName, name: name}
 		fk, ok := collected[k]
 		if !ok {
 			// Cross-schema carve-out (ADR-0075). PG always namespaces, so
@@ -1527,8 +1531,10 @@ func (r *SchemaReader) populateForeignKeys(ctx context.Context, tables map[strin
 		return err
 	}
 
-	for k, fk := range collected {
-		tables[k.table].ForeignKeys = append(tables[k.table].ForeignKeys, fk)
+	// Sorted drain — same determinism requirement as the index drain
+	// (task #41): map order would scramble ForeignKeys across reads.
+	for _, k := range sortedTableObjectKeys(collected) {
+		tables[k.table].ForeignKeys = append(tables[k.table].ForeignKeys, collected[k])
 	}
 	return nil
 }

@@ -6,6 +6,20 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **DDL-free incrementals no longer record phantom `alter_table` schema
+  deltas.** Schema readers drained indexes and foreign keys through Go
+  map iteration (randomized order), so two reads of the *same* schema
+  could be structurally unequal — a recorded parent manifest vs the
+  end-of-window catalog read then diffed as spurious `alter_table`
+  entries (observed: 6 phantom deltas on a DDL-free incremental), and
+  `ComputeSchemaHash` fingerprints diverged for identical schemas. Both
+  engines' readers now drain in sorted (table, name) order; the
+  incremental schema diff compares indexes as a name-keyed set (so
+  chains rooted in pre-fix manifests stop false-alarming too); and the
+  schema hash fingerprints a canonical view (non-semantic collections
+  name-sorted; table and column order stay semantic).
+
 ### Added
 - **`backup full --chain-slot` — one-flag incremental-chain provisioning
   (Postgres, ADR-0083).** The persistent chain slot (named by `--slot-name`)

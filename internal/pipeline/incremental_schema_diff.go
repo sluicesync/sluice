@@ -156,8 +156,25 @@ func tablesEqual(a, b *ir.Table) bool {
 	if len(a.Indexes) != len(b.Indexes) {
 		return false
 	}
-	for i, ia := range a.Indexes {
-		if !indicesEqual(ia, b.Indexes[i]) {
+	// Compare indexes as a name-keyed SET, not positionally: index
+	// order is not semantic, and pre-task-#41 manifests recorded
+	// Indexes in randomized map-iteration order — so a recorded parent
+	// schema vs a fresh (now-deterministic) catalog read can present
+	// the identical index set in different order. Positional comparison
+	// turned that into phantom alter_table deltas (observed live:
+	// schema_deltas=6 on a DDL-free incremental, 2026-06-10 benchmark).
+	byName := make(map[string]*ir.Index, len(b.Indexes))
+	for _, ib := range b.Indexes {
+		if ib != nil {
+			byName[ib.Name] = ib
+		}
+	}
+	for _, ia := range a.Indexes {
+		if ia == nil {
+			return false
+		}
+		ib, ok := byName[ia.Name]
+		if !ok || !indicesEqual(ia, ib) {
 			return false
 		}
 	}
