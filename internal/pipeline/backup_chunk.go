@@ -23,6 +23,15 @@ package pipeline
 //   - `{"_t":"u64","v":"<decimal-string>"}` for uint64 (string-encoded
 //     to avoid precision loss above 2^53).
 //   - `{"_t":"f64","v":<number>}` for explicit float64.
+//   - `{"_t":"f64s","v":"NaN"|"+Inf"|"-Inf"}` for non-finite floats
+//     (IEEE specials JSON cannot carry as numbers — Bug 138; PG
+//     float4/float8 columns hold them legally and `migrate` carries
+//     them, so backup must too). ±Inf round-trips sign-exact; NaN
+//     payload bits are not representable in the sentinel, so every
+//     NaN decodes to the IEEE-canonical quiet NaN — the same
+//     canonicalization PG's own text format performs. Additive tag:
+//     binaries older than the tag refuse a chunk containing one
+//     LOUDLY ("unknown value tag"), never silently.
 //
 // Why JSON Lines + gzip rather than gob: JSON Lines is debuggable
 // (`zcat users-0.jsonl.gz | head -3 | jq .`), engine-portable (Phase 2
@@ -50,6 +59,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"math"
 	"strconv"
 	"time"
 
@@ -555,7 +565,17 @@ func encodeValue(v any) any {
 	switch x := v.(type) {
 	case nil:
 		return nil
-	case string, bool, float64, float32:
+	case float64:
+		if math.IsNaN(x) || math.IsInf(x, 0) {
+			return map[string]any{"_t": "f64s", "v": nonFiniteString(x)}
+		}
+		return x
+	case float32:
+		if f := float64(x); math.IsNaN(f) || math.IsInf(f, 0) {
+			return map[string]any{"_t": "f64s", "v": nonFiniteString(f)}
+		}
+		return x
+	case string, bool:
 		return x
 	case []byte:
 		return map[string]any{"_t": "bytes", "v": base64.StdEncoding.EncodeToString(x)}
@@ -610,6 +630,42 @@ func encodeValue(v any) any {
 	// surface as a marshal error if they aren't JSON-safe — preferable
 	// to silently dropping them.
 	return v
+}
+
+// nonFiniteString renders a non-finite float64 as its f64s-envelope
+// sentinel. Callers guarantee f is NaN or ±Inf.
+func nonFiniteString(f float64) string {
+	switch {
+	case math.IsInf(f, 1):
+		return "+Inf"
+	case math.IsInf(f, -1):
+		return "-Inf"
+	default:
+		return "NaN"
+	}
+}
+
+// canonicalNaN is the IEEE-754 canonical quiet NaN (0x7FF8…0000) —
+// the bit pattern PG itself produces when parsing 'NaN', so a sluice
+// restore is float8send-bit-identical to a pg_dump/pg_restore round
+// trip. Go's math.NaN() is 0x7FF8…0001, one payload bit off; payload
+// bits don't survive the string sentinel either way (documented
+// canonicalization), so emit the pattern the ecosystem standardizes
+// on.
+var canonicalNaN = math.Float64frombits(0x7ff8000000000000)
+
+// nonFiniteFromString is the strict inverse of [nonFiniteString].
+func nonFiniteFromString(s string) (float64, error) {
+	switch s {
+	case "NaN":
+		return canonicalNaN, nil
+	case "+Inf":
+		return math.Inf(1), nil
+	case "-Inf":
+		return math.Inf(-1), nil
+	default:
+		return 0, fmt.Errorf("f64s payload %q is not one of NaN/+Inf/-Inf", s)
+	}
 }
 
 // decodeValue is the inverse of [encodeValue]. Bare JSON values pass
@@ -698,6 +754,19 @@ func decodeTaggedValue(tag string, payload json.RawMessage) (any, error) {
 		var f float64
 		if err := json.Unmarshal(payload, &f); err != nil {
 			return nil, fmt.Errorf("f64 payload: %w", err)
+		}
+		return f, nil
+	case "f64s":
+		// Non-finite float sentinel (Bug 138). Strict: exactly the
+		// three strings the encoder emits; anything else is corruption
+		// and fails loudly.
+		var s string
+		if err := json.Unmarshal(payload, &s); err != nil {
+			return nil, fmt.Errorf("f64s payload: %w", err)
+		}
+		f, err := nonFiniteFromString(s)
+		if err != nil {
+			return nil, err
 		}
 		return f, nil
 	case "list":

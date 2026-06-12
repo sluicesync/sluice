@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"math"
 	"reflect"
 	"testing"
 	"time"
@@ -261,5 +262,84 @@ func TestChangeChunk_SchemaSnapshot_CollectedNotEncoded(t *testing.T) {
 	// Snapshot count does NOT grow with an Insert.
 	if len(w.Snapshots()) != 1 {
 		t.Fatalf("Snapshots() must not grow with a row-shaped change; got %d entries", len(w.Snapshots()))
+	}
+}
+
+// TestChangeChunk_NonFiniteFloats is the Bug-138 pin for the CDC
+// change-chunk path: WriteChange's own record marshal was equally
+// refused by encoding/json on NaN/±Inf — and this path runs LIVE
+// during `sync` streaming and `backup incremental`, not just full
+// backups. Shapes: scalar row value, list element, plus the f32
+// width and the numeric-as-string control. Bit assertions because
+// NaN != NaN under ==.
+func TestChangeChunk_NonFiniteFloats(t *testing.T) {
+	in := ir.Insert{
+		Position: ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"0/200"}`},
+		Schema:   "public",
+		Table:    "specials",
+		Row: ir.Row{
+			"f8nan":  math.NaN(),
+			"f8pinf": math.Inf(1),
+			"f8ninf": math.Inf(-1),
+			"f4nan":  float32(math.NaN()),
+			"inlist": []any{math.Inf(1), math.NaN()},
+			"numstr": "NaN", // numeric-as-string control: must stay a string
+		},
+	}
+
+	buf := &bytes.Buffer{}
+	w, err := newChangeChunkWriter(buf, nil, CodecGzip)
+	if err != nil {
+		t.Fatalf("newChangeChunkWriter: %v", err)
+	}
+	if err := w.WriteChange(in); err != nil {
+		t.Fatalf("WriteChange refused the non-finite row (the Bug-138 shape on the CDC path): %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	r, err := newChangeChunkReader(nopReadCloserFromBytes(buf.Bytes()), w.Hash(), nil, CodecGzip)
+	if err != nil {
+		t.Fatalf("newChangeChunkReader: %v", err)
+	}
+	c, err := r.ReadChange()
+	if err != nil {
+		t.Fatalf("ReadChange: %v", err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	row := c.(ir.Insert).Row
+
+	bits := func(label string, v any) uint64 {
+		t.Helper()
+		f, ok := v.(float64)
+		if !ok {
+			t.Fatalf("%s: got %T (%#v); want float64", label, v, v)
+		}
+		return math.Float64bits(f)
+	}
+	if got := bits("f8nan", row["f8nan"]); got != math.Float64bits(canonicalNaN) {
+		t.Fatalf("f8nan bits = %x; want canonical NaN", got)
+	}
+	if got := bits("f8pinf", row["f8pinf"]); got != math.Float64bits(math.Inf(1)) {
+		t.Fatalf("f8pinf bits = %x; want +Inf", got)
+	}
+	if got := bits("f8ninf", row["f8ninf"]); got != math.Float64bits(math.Inf(-1)) {
+		t.Fatalf("f8ninf bits = %x; want -Inf", got)
+	}
+	if got := bits("f4nan", row["f4nan"]); got != math.Float64bits(canonicalNaN) {
+		t.Fatalf("f4nan bits = %x; want canonical NaN (f32 widens through the same sentinel)", got)
+	}
+	lst := row["inlist"].([]any)
+	if got := bits("inlist[0]", lst[0]); got != math.Float64bits(math.Inf(1)) {
+		t.Fatalf("inlist[0] bits = %x; want +Inf", got)
+	}
+	if got := bits("inlist[1]", lst[1]); got != math.Float64bits(canonicalNaN) {
+		t.Fatalf("inlist[1] bits = %x; want canonical NaN", got)
+	}
+	if s, ok := row["numstr"].(string); !ok || s != "NaN" {
+		t.Fatalf("numstr: got %T %#v; want the literal string \"NaN\"", row["numstr"], row["numstr"])
 	}
 }

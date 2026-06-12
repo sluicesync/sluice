@@ -102,8 +102,14 @@ func appendEncodedValue(dst []byte, v any, depth int) ([]byte, bool) {
 	case bool:
 		return strconv.AppendBool(dst, x), true
 	case float64:
+		if math.IsNaN(x) || math.IsInf(x, 0) {
+			return appendF64sEnvelope(dst, x), true
+		}
 		return appendJSONFloat(dst, x, 64)
 	case float32:
+		if f := float64(x); math.IsNaN(f) || math.IsInf(f, 0) {
+			return appendF64sEnvelope(dst, f), true
+		}
 		return appendJSONFloat(dst, float64(x), 32)
 	case []byte:
 		dst = append(dst, `{"_t":"bytes","v":"`...)
@@ -200,6 +206,14 @@ func appendI64Envelope(dst []byte, n int64) []byte {
 func appendU64Envelope(dst []byte, u uint64) []byte {
 	dst = append(dst, `{"_t":"u64","v":"`...)
 	dst = strconv.AppendUint(dst, u, 10)
+	return append(dst, `"}`...)
+}
+
+// appendF64sEnvelope emits the non-finite float sentinel envelope
+// (Bug 138) — byte-identical to the legacy map marshal.
+func appendF64sEnvelope(dst []byte, f float64) []byte {
+	dst = append(dst, `{"_t":"f64s","v":"`...)
+	dst = append(dst, nonFiniteString(f)...)
 	return append(dst, `"}`...)
 }
 
@@ -546,6 +560,8 @@ func (p *fastParser) parseEnvelope(depth int) (any, bool) {
 		tag = "u64"
 	case "f64":
 		tag = "f64"
+	case "f64s":
+		tag = "f64s"
 	case "list":
 		tag = "list"
 	case "list_str":
@@ -622,6 +638,17 @@ func (p *fastParser) parseEnvelopePayload(tag string, depth int) (any, bool) {
 			return nil, false
 		}
 		return u, true
+	case "f64s":
+		sb, ok := p.parseStringBytes()
+		if !ok {
+			return nil, false
+		}
+		f, err := nonFiniteFromString(string(sb))
+		if err != nil {
+			// Alien sentinel — bail; legacy owns the loud error.
+			return nil, false
+		}
+		return f, true
 	case "f64":
 		nb, ok := p.parseNumberBytes()
 		if !ok {
