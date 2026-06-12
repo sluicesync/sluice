@@ -6,6 +6,8 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.40] - 2026-06-12
+
 ### Fixed
 - **`backup compact --strategy=smart` leaked one open file handle per
   compacted change chunk (task #9).** The decode pass wrapped its
