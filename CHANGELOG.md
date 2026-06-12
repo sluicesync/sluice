@@ -6,6 +6,19 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **`backup compact --strategy=smart` leaked one open file handle per
+  compacted change chunk (task #9).** The decode pass wrapped its
+  store reader in `io.NopCloser`, so the handle opened by `Get` was
+  never released on the success path. On Linux the leaked descriptor
+  merely lingered until process exit; on Windows it was fatal — the
+  rewrite step renames over the very path the leaked handle still
+  holds open, failing loudly with `Access is denied`. The byte-count
+  wrapper now owns the store handle so the chunk reader's `Close`
+  releases it; pinned by a platform-neutral handle-tracking test
+  (revert-verified: the old code leaks exactly one handle per chunk)
+  and by the previously-failing Windows integration repro now passing.
+
 ## [0.99.39] - 2026-06-11
 
 ### Performance
