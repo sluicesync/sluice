@@ -25,8 +25,10 @@ That happens on two ordinary paths:
 
 - **Idle stop (the common operator workflow).** Rotate on a timer, then stop
   the stream while the source is idle. The rotation snapshot `S` is taken at
-  a quiesced position (`S == P_N`, empty overlap), the freshly-opened segment
-  receives no rollover, and a graceful stop leaves it zero-incremental.
+  a quiesced boundary but still lands a few WAL bytes PAST `P_N` (slot /
+  snapshot bookkeeping records — the inevitable position delta), with no user
+  events in `(P_N, S]`; the freshly-opened segment receives no rollover, and
+  a graceful stop leaves it zero-incremental.
 - **Crash/end at the rotation boundary.** A process death between the
   rotation COMMIT and the first overlap incremental leaves the same shape.
 

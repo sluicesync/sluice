@@ -52,10 +52,11 @@ func bug139Read(t *testing.T, dsn string) bug139Sums {
 
 // driveIdleStopRotationChain produces the exact Bug-139 idle-stop shape:
 // an AGE-based rotation fires on the drain rollover AFTER the source has
-// gone idle, so the rotation snapshot S is taken at a quiesced position
-// (S == P_N, empty (P_N, S] overlap) and the freshly-opened segment
-// receives NO rollover before the graceful stop — leaving a trailing
-// zero-incremental rotation-born segment.
+// gone idle, so the rotation snapshot S is taken at a quiesced boundary —
+// still a few WAL bytes past P_N (slot/snapshot bookkeeping records), but
+// with no user events in (P_N, S] — and the freshly-opened segment
+// receives NO rollover before the graceful stop, leaving a trailing
+// zero-incremental rotation-born segment whose boundary reads as a gap.
 //
 // The timing must keep age rotation from firing WHILE writes still flow
 // (which would make S > P_N and commit an overlap incremental into the new
@@ -75,7 +76,7 @@ func driveIdleStopRotationChain(t *testing.T, sourceDSN string, store *LocalStor
 		RolloverWindow: 600 * time.Millisecond,
 		// Age-based rotation: a segment older than 3s rotates on its next
 		// COMMITTED rollover. We engineer that committed rollover to be a
-		// post-idle trailing write, so S == P_N.
+		// post-idle trailing write, so no user events land in (P_N, S].
 		RetainRotateAt:     3 * time.Second,
 		RolloverMaxChanges: 100,
 		RolloverMaxBytes:   1 << 30,
@@ -106,9 +107,10 @@ func driveIdleStopRotationChain(t *testing.T, sourceDSN string, store *LocalStor
 
 	// Phase 3: a single trailing write. The next committed rollover drains
 	// it; segment 0 is now > 3s old, so the age check rotates — and because
-	// no writes follow, the rotation snapshot S == P_N (the just-committed
-	// position), giving an empty (P_N, S] overlap and a zero-incremental
-	// new segment.
+	// no writes follow, the (P_N, S] window holds no user events (S still
+	// lands a few WAL bytes past P_N from slot/snapshot bookkeeping, which
+	// is exactly why the boundary reads as a coverage gap), leaving a
+	// zero-incremental new segment.
 	applyDDL(t, sourceDSN, `UPDATE accounts SET balance = balance + 1 WHERE id = 1;`)
 
 	// Phase 4: stay idle a few rollover windows so the rotation fires and
