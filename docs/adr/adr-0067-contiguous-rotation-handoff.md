@@ -2,6 +2,17 @@
 
 ## Status
 
+> **Amended by ADR-0087 (Bug 139):** the honest-stamp rule below (record
+> `IncrementalCoverageStart` from the *actual* first incremental, never at
+> rotation COMMIT) is correct but creates a case it doesn't cover — a
+> rotation-born segment whose creating session never commits an incremental
+> (idle stop or crash at the boundary) stays stamp-less and resolves to its
+> full anchor `S`, a gap past `P_N`. ADR-0087 makes `compact` SPLIT at such a
+> gap instead of refusing the whole run, and makes the next resume replay from
+> `P_N` so the segment heals honestly. It explicitly REJECTS creation-time
+> stamping / resume-backfill as silent-DR-loss hazards. See
+> [ADR-0087](adr-0087-compact-group-split-and-rotation-boundary-resume.md).
+
 **Proposed (2026-05-29) — pending owner sign-off before implementation.**
 Driven by Bug 95 (project's internal regression catalog): `sluice backup
 compact --smart-compaction` can never merge across a rotation boundary

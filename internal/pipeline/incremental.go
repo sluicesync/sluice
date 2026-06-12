@@ -250,6 +250,27 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 		)
 	}
 
+	// 1.1. ADR-0087 rotation-boundary resume heal (Bug 139) — symmetric
+	//    with `backup stream`'s resume path. A one-shot `backup incremental`
+	//    extending a chain whose open segment is rotation-born and has zero
+	//    committed incrementals (the prior stream/incremental session stopped
+	//    or crashed at the rotation boundary) must resume from the prior
+	//    segment's EndPosition (P_N), not the open segment's full anchor S, so
+	//    the first incremental starts at P_N, stamps IncrementalCoverageStart
+	//    = P_N, and the lineage is born-contiguous + compactable. See
+	//    [rotationBoundaryResumeStart].
+	if healed, priorEnd, ok := rotationBoundaryResumeStart(ctx, b.Store, startPos); ok {
+		slog.InfoContext(
+			ctx, "incremental: resuming a rotation-born segment from the prior segment's EndPosition (P_N) "+
+				"to re-establish ADR-0067 overlap coverage — the creating session stopped/crashed before "+
+				"committing this segment's first incremental (Bug 139)",
+			slog.String("parent_path", parentPath),
+			slog.String("prior_end_pN", priorEnd.Token),
+			slog.String("full_anchor_S", startPos.Token),
+		)
+		startPos = healed
+	}
+
 	// 2. The "before" baseline for SchemaDelta is the parent
 	//    manifest's recorded schema — that's the source's shape at
 	//    the parent's terminal CDC position, which is exactly the

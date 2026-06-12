@@ -146,6 +146,16 @@ type LineageSegment struct {
 	// [LineageSegment.incrementalCoverageStartOrStart] — the pre-ADR-0067
 	// behavior (never-rotated segments, segment 0, and every backup
 	// written before this field existed; additive, no format bump).
+	//
+	// ADR-0087 (Bug 139): a rotation-born segment whose creating session
+	// stopped or crashed at the boundary BEFORE committing its first
+	// incremental stays empty here (no incremental ever proved the
+	// overlap) — which previously left it un-compactable across the prior
+	// boundary forever. Two things now heal that: compact subdivides at
+	// the gap instead of refusing the run, and the next stream/incremental
+	// resume of such a segment ([rotationBoundaryResumeStart]) replays from
+	// the prior segment's EndPosition (P_N), so the first post-resume
+	// commit stamps this field = P_N and the segment becomes contiguous.
 	IncrementalCoverageStart ir.Position `json:"incremental_coverage_start,omitempty"`
 
 	// CappedAt is the instant the rotation FSM's COMMIT closed this

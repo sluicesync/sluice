@@ -411,6 +411,35 @@ func (b *BackupStream) Run(ctx context.Context) error {
 		)
 	}
 
+	// 2.1. ADR-0087 rotation-boundary resume heal (Bug 139). When this
+	//    resume lands on a rotation-born OPEN segment that never committed
+	//    an incremental in its creating session (source idle at the prior
+	//    stream stop, or a crash/end at the rotation boundary), the parent
+	//    is the segment's full and startPos == the full's anchor S. Resuming
+	//    from S would make the first incremental start at S, leaving the
+	//    segment permanently stamp-less and the (P_N, S] window forever
+	//    uncovered by any incremental — an un-compactable boundary. Instead
+	//    resume from the prior segment's EndPosition (P_N), exactly
+	//    reconstructing the creating session's post-COMMIT state (currentParent
+	//    = the segment's full, startPos = P_N): the first incremental then
+	//    starts at P_N, updateLineageForManifest stamps IncrementalCoverageStart
+	//    = P_N, and the lineage becomes born-contiguous and compactable. The
+	//    (P_N, S] overlap re-applies idempotently on restore (ADR-0010 / the
+	//    snapshot->CDC handoff dedup). No skipThrough is needed: a fresh
+	//    StreamChanges(P_N) resumes strictly-after P_N like any normal resume.
+	if healed, priorEnd, ok := rotationBoundaryResumeStart(ctx, b.Store, startPos); ok {
+		slog.InfoContext(
+			ctx, "stream: resuming a rotation-born segment from the prior segment's EndPosition (P_N) "+
+				"to re-establish ADR-0067 overlap coverage — the creating session stopped/crashed before "+
+				"committing this segment's first incremental, so the (P_N, S] window is replayed now and "+
+				"the segment's IncrementalCoverageStart is stamped on the first commit (Bug 139)",
+			slog.String("parent_path", parentPath),
+			slog.String("prior_end_pN", priorEnd.Token),
+			slog.String("full_anchor_S", startPos.Token),
+		)
+		startPos = healed
+	}
+
 	// 2.5. Phase 6.1: align with chain encryption. Refuses early if
 	// the parent's chain encryption shape doesn't match the operator's
 	// supplied envelope (or vice versa).
@@ -846,6 +875,56 @@ func (b *BackupStream) validate() error {
 		return fmt.Errorf("stream: source engine %q does not declare CDC support", b.Source.Name())
 	}
 	return nil
+}
+
+// rotationBoundaryResumeStart implements the ADR-0087 Bug-139 resume
+// heal. It returns (P_N, P_N, true) — telling a resuming chain extender
+// (`backup stream` or one-shot `backup incremental`) to resume from the
+// prior segment's EndPosition instead of the open segment's full anchor
+// S — when ALL of these hold:
+//
+//   - lineage.json exists with >= 2 segments (the open segment is
+//     rotation-born: a prior segment exists);
+//   - the open (last) segment has ZERO recorded incrementals (its
+//     creating session never committed a rollover into it);
+//   - the resolved parent is that segment's full, i.e. startPos (==
+//     parent.EndPosition) equals the segment's StartPosition (S);
+//   - the prior segment's EndPosition (P_N) is non-empty.
+//
+// Returning P_N reconstructs the creating session's post-COMMIT state
+// (currentParent = the segment's full @ S, startPos = P_N): the first
+// incremental then begins at P_N, [updateLineageForManifest] stamps
+// IncrementalCoverageStart = P_N, and the lineage becomes
+// born-contiguous and compactable. The source still retains everything
+// after P_N because the slot's ack ceiling was only ever released
+// through committed incremental ends <= P_N (releaseChainAckTo), so the
+// (P_N, S] overlap is replayable; it re-applies idempotently on restore
+// (ADR-0010). Any negative case (segment 0, the open segment already has
+// incrementals, parent isn't the full, or an empty prior end) returns
+// ok=false and the caller keeps today's behaviour. Best-effort: a
+// transient catalog read error returns ok=false (no heal) rather than
+// failing the chain extension.
+func rotationBoundaryResumeStart(ctx context.Context, store irbackup.Store, startPos ir.Position) (resumeStart, priorEnd ir.Position, ok bool) {
+	cat, found, err := loadLineageCatalog(ctx, store)
+	if err != nil || !found || len(cat.Segments) < 2 {
+		return ir.Position{}, ir.Position{}, false
+	}
+	open := &cat.Segments[len(cat.Segments)-1]
+	if len(open.Incrementals) != 0 {
+		return ir.Position{}, ir.Position{}, false
+	}
+	// Resolved parent must be the segment's full (startPos == its anchor
+	// S). parent.EndPosition is startPos here; comparing startPos to the
+	// segment's StartPosition is the same test and survives a parent that
+	// happens to carry no BackupID.
+	if startPos != open.StartPosition {
+		return ir.Position{}, ir.Position{}, false
+	}
+	prior := &cat.Segments[len(cat.Segments)-2]
+	if prior.EndPosition.Engine == "" && prior.EndPosition.Token == "" {
+		return ir.Position{}, ir.Position{}, false
+	}
+	return prior.EndPosition, prior.EndPosition, true
 }
 
 // resolveParent finds the parent manifest in the store. Mirrors

@@ -377,14 +377,19 @@ func (b *BackupStream) performRotation(ctx context.Context, in rotateInputs) (ro
 		// replaying CDC from P_N (skipThrough = P_N in the rollover loop),
 		// so its first incremental normally starts at P_N. But skipThrough
 		// is in-process state: a crash between this COMMIT and the first
-		// overlap incremental resumes at S (the new full's anchor), NOT
-		// P_N. So P_N is only the INTENDED coverage start here, not a
-		// durable fact. The field is recorded from the ACTUAL first
-		// incremental when it commits (updateLineageForManifest) — P_N in
-		// the normal case, S after a post-COMMIT crash-recovery resume.
-		// That keeps the recorded coverage honest across crashes; an unset
-		// field resolves to StartPosition (S) until the first incremental
-		// proves an overlap.
+		// overlap incremental — or a graceful stop while the source is idle
+		// at the rotation boundary — leaves the segment with NO incremental
+		// and an unset stamp (resolving to StartPosition = S). So P_N is
+		// only the INTENDED coverage start here, not a durable fact. The
+		// field is recorded from the ACTUAL first incremental when it
+		// commits (updateLineageForManifest) — P_N in the normal case.
+		// ADR-0087 (Bug 139): the next stream/incremental RESUME of such a
+		// stamp-less rotation-born open segment detects this shape
+		// (rotationBoundaryResumeStart) and resumes from P_N rather than S,
+		// so the abandoned (P_N, S] coverage intent is re-established on the
+		// first post-resume commit — a crash or idle-stop at the boundary no
+		// longer permanently strands the overlap (which previously left the
+		// segment un-compactable forever).
 		Codec: segCodec,
 	})
 	cat.UpdatedAt = cappedAt

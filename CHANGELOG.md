@@ -6,6 +6,31 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **`backup compact` no longer refuses an ordinary rotated chain when a
+  rotation-born segment never received a rollover commit in its creating
+  session (Bug 139, ADR-0087).** The "rotate on a timer, stop when idle"
+  workflow (and a crash/end at a rotation boundary) leaves a
+  rotation-born segment with no committed incremental, so it carries no
+  `incremental_coverage_start` stamp and resolves to its full's snapshot
+  anchor `S` — a few WAL bytes past the prior segment's `end_position`.
+  Compact saw that as a position gap and refused the WHOLE run with a
+  message blaming "a pre-ADR-0067, imported, or corrupted lineage" — for
+  a chain its own rotation produced (loud, zero data loss, but the
+  compact DR-maintenance feature became unusable across that boundary).
+  Now compact **splits** the merge group at the gap instead: the
+  stamp-less segment stays in its own group (one WARN naming the
+  boundary; no data lost, chain fully restorable) while every contiguous
+  run around it still merges — both naive and `--smart-compaction`,
+  including `--dry-run`. Separately, the next `backup stream` / `backup
+  incremental` resume of such a segment now replays from the prior
+  segment's `end_position` (`P_N`), so its first incremental stamps
+  `incremental_coverage_start = P_N` and the boundary heals and compacts
+  fully. The affected range is pre-existing since rotation/compact
+  shipped (byte-identical refusal on prior releases and with
+  `--smart-compaction-off`); the fix never stamps coverage no committed
+  incremental proves, so no silent-loss surface is introduced.
+
 ## [0.99.40] - 2026-06-12
 
 ### Fixed
