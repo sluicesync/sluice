@@ -37,6 +37,10 @@ on:
         description: "Master seed (SLUICE_FUZZ_SEED); empty = this run's id"
         required: false
         default: ""
+      codecFuzztime:
+        description: "Per-target -fuzztime for the codec differential fuzzers"
+        required: false
+        default: "20m"
 
 permissions:
   contents: read
@@ -88,4 +92,50 @@ jobs:
         with:
           name: fuzz-failures-seed-${{ github.event.inputs.seed || github.run_id }}
           path: internal/pipeline/testdata/fuzz-failures/
+          if-no-files-found: ignore
+
+  # Go-native differential fuzz of the fast chunk row codec
+  # (backup_chunk_fast.go, tasks #51/#52). The two targets assert the
+  # fast encoder/decoder is equivalent to the legacy reflection path —
+  # byte-identical encode output, decode-or-bail vs the legacy oracle —
+  # on generated rows and on arbitrary line bytes. PR CI only replays
+  # their seed corpus; this job is where new inputs get explored. No
+  # Docker, no build tags, no -race (the codec is single-goroutine by
+  # construction; raw throughput explores more inputs per minute).
+  # A crasher is written to internal/pipeline/testdata/fuzz/<target>/
+  # and uploaded — committing that file to the repo pins the regression.
+  codec-fuzz:
+    name: Codec differential fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: "go.mod"
+      - run: go mod download
+
+      - name: Fuzz encode differential
+        env:
+          FUZZTIME: ${{ github.event.inputs.codecFuzztime || '20m' }}
+        run: |
+          go test -run NoMatch -fuzz '^FuzzFastRowEncodeDifferential$' \
+            -fuzztime "$FUZZTIME" ./internal/pipeline/
+
+      - name: Fuzz decode differential
+        # Run even if the encode fuzzer found something — the two
+        # targets cover independent directions.
+        if: success() || failure()
+        env:
+          FUZZTIME: ${{ github.event.inputs.codecFuzztime || '20m' }}
+        run: |
+          go test -run NoMatch -fuzz '^FuzzFastRowDecodeDifferential$' \
+            -fuzztime "$FUZZTIME" ./internal/pipeline/
+
+      - name: Upload crasher corpus
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: codec-fuzz-crashers-${{ github.run_id }}
+          path: internal/pipeline/testdata/fuzz/
           if-no-files-found: ignore
