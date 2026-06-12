@@ -68,7 +68,7 @@ fits.
 sluice backup full \
     --source-driver postgres \
     --source 'postgres://...source...' \
-    --store local:/var/backups/myapp
+    --output-dir /var/backups/myapp
 ```
 
 This lands one full backup chain root in the store. The consumer's
@@ -81,7 +81,7 @@ bulk-copy.
 sluice backup stream run \
     --source-driver postgres \
     --source 'postgres://...source...' \
-    --store local:/var/backups/myapp \
+    --output-dir /var/backups/myapp \
     --rollover-window 10s \
     --retain-rotate-at-chain-length 20 \
     --stream-id myapp-producer
@@ -98,7 +98,7 @@ keeping individual segments compact for `backup prune` operations).
 
 ```sh
 sluice restore \
-    --store local:/var/backups/myapp \
+    --from-dir /var/backups/myapp \
     --target-driver postgres \
     --target 'postgres://...target...'
 ```
@@ -112,7 +112,7 @@ point forward.
 
 ```sh
 sluice sync from-backup run \
-    --store local:/var/backups/myapp \
+    --backup-dir /var/backups/myapp \
     --target-driver postgres \
     --target 'postgres://...target...' \
     --stream-id myapp-broker \
@@ -153,7 +153,7 @@ once on first launch; subsequent broker restarts read from
 ```sh
 # First launch after a fresh restore:
 sluice sync from-backup run \
-    --store local:/var/backups/myapp \
+    --backup-dir /var/backups/myapp \
     --target-driver postgres \
     --target 'postgres://...target...' \
     --stream-id myapp-broker \
@@ -162,7 +162,7 @@ sluice sync from-backup run \
 
 # Subsequent restarts (warm-resume from sluice_cdc_state):
 sluice sync from-backup run \
-    --store local:/var/backups/myapp \
+    --backup-dir /var/backups/myapp \
     --target-driver postgres \
     --target 'postgres://...target...' \
     --stream-id myapp-broker \
@@ -205,7 +205,7 @@ The broker is designed for restart resilience on both sides.
 # Kill it however it died (oom, process restart, k8s eviction).
 # Restart it with the same --stream-id:
 sluice sync from-backup run \
-    --store local:/var/backups/myapp \
+    --backup-dir /var/backups/myapp \
     --target-driver postgres \
     --target 'postgres://...target...' \
     --stream-id myapp-broker \
@@ -224,7 +224,7 @@ forward. No re-application, no skipping. The idempotent applier
 sluice backup stream run \
     --source-driver postgres \
     --source 'postgres://...source...' \
-    --store local:/var/backups/myapp \
+    --output-dir /var/backups/myapp \
     --rollover-window 10s \
     --retain-rotate-at-chain-length 20 \
     --stream-id myapp-producer \

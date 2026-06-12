@@ -155,7 +155,7 @@ If you try to restore a `FormatVersion=2` chain with a pre-v0.94.1
 sluice, you'll see the documented message:
 
 ```
-$ ./sluice restore --store local:/var/backups/myapp ...
+$ ./sluice restore --from-dir /var/backups/myapp ...
 restore: read root manifest: backup: manifest format version 2 is
 newer than this build supports (1); upgrade sluice
 exit status 1

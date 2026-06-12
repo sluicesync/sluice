@@ -31,13 +31,18 @@ recipe still works.
 
 ## Step 1: full backup
 
+On a Postgres source, add `--chain-slot` to the full: it provisions the
+persistent replication slot (named by `--slot-name`) as the snapshot
+anchor and ensures the publication, so step 2's incrementals chain with
+zero gap and no manual slot setup.
+
 ### Passphrase mode
 
 ```sh
 sluice backup full \
     --source-driver postgres \
     --source ... \
-    --store local:/var/backups/myapp \
+    --output-dir /var/backups/myapp \
     --encrypt --encryption-passphrase 'pick-a-real-passphrase'
 ```
 
@@ -52,7 +57,7 @@ remember the salt, only the passphrase.
 sluice backup full \
     --source-driver postgres \
     --source ... \
-    --store local:/var/backups/myapp \
+    --output-dir /var/backups/myapp \
     --encrypt --encrypt-kek-mode=kms --encrypt-kek-ref='arn:aws:kms:us-east-1:...:key/...'
 ```
 
@@ -87,7 +92,7 @@ catching rotation typos at backup time rather than at restore time.
 sluice backup stream run \
     --source-driver postgres \
     --source ... \
-    --store local:/var/backups/myapp \
+    --output-dir /var/backups/myapp \
     --encrypt --encryption-passphrase 'pick-a-real-passphrase' \
     --retain-rotate-at-chain-length 50 \
     --retain-rotate-on-age 24h \
@@ -113,7 +118,7 @@ per-feature docs.
 
 ```sh
 sluice backup verify \
-    --store local:/var/backups/myapp \
+    --from-dir /var/backups/myapp \
     --encrypt --encryption-passphrase 'pick-a-real-passphrase'
 ```
 
@@ -132,7 +137,7 @@ common.
 
 ```sh
 sluice restore \
-    --store local:/var/backups/myapp \
+    --from-dir /var/backups/myapp \
     --target-driver postgres \
     --target ... \
     --encrypt --encryption-passphrase 'pick-a-real-passphrase'
@@ -165,13 +170,13 @@ constraints) rather than silently dropping them.
 
 - **Multi-store fan-out** (writing the same backup to multiple
   stores). Run multiple `backup stream run` processes against
-  different `--store` URIs.
+  different destinations (`--output-dir` / `--target`).
 - **Compaction of older segments.** See `sluice backup prune` and the
   `--smart-compaction` mode in the backup-chain docs.
-- **The cloud-store backends** (S3, GCS, Azure Blob). The `--store`
-  URI accepts `s3://bucket/prefix`, `gs://bucket/prefix`, and
-  `azure://container/prefix` with the appropriate environment
-  credentials.
+- **The cloud-store backends** (S3, GCS, Azure Blob). The write-side
+  `--target` and read-side `--from` URLs accept `s3://bucket/prefix`,
+  `gs://bucket/prefix`, and `azblob://container/prefix` with the
+  appropriate environment credentials.
 
 ## See also
 
