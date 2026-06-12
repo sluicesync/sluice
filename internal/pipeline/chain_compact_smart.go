@@ -781,10 +781,17 @@ func applySmartCompactionToIncremental(
 		if err != nil {
 			return nil, fmt.Errorf("read chunk %q: %w", ch.File, err)
 		}
-		// Track raw byte count via a side reader.
+		// Track raw byte count via a side reader. The counter OWNS rc
+		// (its Close closes through) so ccr.Close releases the store
+		// handle. This used to wrap the counter in io.NopCloser, which
+		// leaked the handle on every success path — invisible on Linux
+		// (the FD lingered until process exit) but fatal on Windows,
+		// where step 3's Put renames over this very path and a
+		// rename-replace target with an open handle fails loudly with
+		// "Access is denied" (task #9; TestADR0064 on this exact shape).
 		var size int64
 		counter := &countingReader{src: rc, n: &size}
-		ccr, err := newChangeChunkReader(io.NopCloser(counter), "", cek, codec)
+		ccr, err := newChangeChunkReader(counter, "", cek, codec)
 		if err != nil {
 			_ = rc.Close()
 			return nil, fmt.Errorf("open chunk %q: %w", ch.File, err)

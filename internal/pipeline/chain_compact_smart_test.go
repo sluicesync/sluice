@@ -6,7 +6,9 @@ package pipeline
 import (
 	"bytes"
 	"context"
+	"io"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -722,5 +724,99 @@ func TestSmart_ChunkRewrite_RoundTrip(t *testing.T) {
 		// TxCommit pair stays.
 		t.Logf("post-compact RowCount = %d (input had %d total entries; %d row events collapsed)",
 			im.ChangeChunks[0].RowCount, cw.ChangeCount(), expectedBefore-expectedAfter)
+	}
+}
+
+// handleTrackingStore wraps a Store and counts Get handles that were
+// never closed. The task-#9 leak pin: smart-compact's decode pass used
+// to wrap its source reader in io.NopCloser, leaking one store handle
+// per chunk — invisible on Linux (the FD lingered until process exit),
+// fatal on Windows where the rewrite Put renames over the still-open
+// path ("Access is denied"; TestADR0064's flake shape).
+type handleTrackingStore struct {
+	irbackup.Store
+	openHandles atomic.Int64
+}
+
+func (s *handleTrackingStore) Get(ctx context.Context, path string) (io.ReadCloser, error) {
+	rc, err := s.Store.Get(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	s.openHandles.Add(1)
+	return &handleTrackingReadCloser{ReadCloser: rc, open: &s.openHandles}, nil
+}
+
+type handleTrackingReadCloser struct {
+	io.ReadCloser
+	open   *atomic.Int64
+	closed bool
+}
+
+func (h *handleTrackingReadCloser) Close() error {
+	if !h.closed {
+		h.closed = true
+		h.open.Add(-1)
+	}
+	return h.ReadCloser.Close()
+}
+
+// TestSmart_ChunkRewrite_ClosesSourceHandles pins that the smart-
+// compact decode+rewrite pass closes every store handle it opens — on
+// Windows, an unclosed handle makes the same-path rewrite rename fail
+// loudly, so this pin is the platform-neutral form of that failure.
+func TestSmart_ChunkRewrite_ClosesSourceHandles(t *testing.T) {
+	store := &handleTrackingStore{Store: newMemStore()}
+
+	// Two chunks so the pin covers both the events-carrying first
+	// chunk and an emptied trailing chunk.
+	paths := []string{
+		"chunks/_changes/leak-0.jsonl.gz",
+		"chunks/_changes/leak-1.jsonl.gz",
+	}
+	chunks := make([]*irbackup.ChunkInfo, 0, len(paths))
+	var lsn uint64 = 100
+	for _, p := range paths {
+		buf := &bytes.Buffer{}
+		cw, err := newChangeChunkWriter(buf, nil, CodecGzip)
+		if err != nil {
+			t.Fatalf("writer: %v", err)
+		}
+		for i := 0; i < 5; i++ {
+			if err := cw.WriteChange(ir.Update{
+				Position: pos(lsn),
+				Schema:   "public",
+				Table:    "users",
+				Before:   ir.Row{"id": int64(i)},
+				After:    ir.Row{"id": int64(i), "name": "v"},
+			}); err != nil {
+				t.Fatalf("update: %v", err)
+			}
+			lsn++
+		}
+		if err := cw.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+		if err := store.Put(context.Background(), p, bytes.NewReader(buf.Bytes())); err != nil {
+			t.Fatalf("put: %v", err)
+		}
+		chunks = append(chunks, &irbackup.ChunkInfo{File: p, RowCount: cw.ChangeCount(), SHA256: cw.Hash()})
+	}
+
+	im := &irbackup.Manifest{
+		FormatVersion: irbackup.BackupFormatVersion,
+		SourceEngine:  "postgres",
+		CreatedAt:     time.Now().UTC(),
+		Kind:          irbackup.BackupKindIncremental,
+		Schema:        usersSchema(),
+		ChangeChunks:  chunks,
+	}
+	if _, err := applySmartCompactionToIncremental(
+		context.Background(), store, im, CodecGzip, nil, PKStrategyPK,
+	); err != nil {
+		t.Fatalf("applySmartCompactionToIncremental: %v", err)
+	}
+	if n := store.openHandles.Load(); n != 0 {
+		t.Fatalf("smart-compact leaked %d store handle(s) — on Windows the same-path rewrite rename fails on these", n)
 	}
 }
