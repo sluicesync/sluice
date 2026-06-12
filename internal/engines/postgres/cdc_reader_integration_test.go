@@ -15,6 +15,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -112,7 +113,52 @@ func startPostgresForCDCImage(t *testing.T, image string) (dsn string, cleanup f
 		terminate()
 		t.Fatalf("connection string: %v", err)
 	}
+
+	// First-connect settle gate (the PG17 connect-EOF flake, 3rd
+	// firing 2026-06-11 — runs 27382148408 and two prior
+	// TestServerVersionNum_PG17 firings): the postgres module's
+	// BasicWaitStrategies (ready-log ×2 + port) can pass while the
+	// just-restarted server still resets the first real connection
+	// ("failed to receive message: unexpected EOF") on a loaded CI
+	// runner. The shared TestMain container absorbs this with its
+	// 5-attempt boot retry; per-test boots returned immediately and
+	// handed the flake to whichever test connected first. Ping with a
+	// bounded retry before handing the DSN out, so callers only ever
+	// see a server that has actually accepted a connection.
+	if err := waitPGFirstConnect(ctx, srcConn); err != nil {
+		terminate()
+		t.Fatalf("postgres container never accepted a connection after boot: %v", err)
+	}
 	return srcConn, terminate
+}
+
+// waitPGFirstConnect pings dsn until the server accepts a real
+// connection or ctx expires. Every error class retries — during the
+// settle window the failure shapes vary (EOF, reset, startup refusal)
+// and distinguishing them buys nothing; the bounded ctx is the loud
+// failure path.
+func waitPGFirstConnect(ctx context.Context, dsn string) error {
+	var lastErr error
+	for {
+		db, err := sql.Open("pgx", dsn)
+		if err != nil {
+			lastErr = err
+		} else {
+			pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			err = db.PingContext(pingCtx)
+			cancel()
+			_ = db.Close()
+			if err == nil {
+				return nil
+			}
+			lastErr = err
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%w (last attempt: %w)", ctx.Err(), lastErr)
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
 }
 
 // applyPGSQL runs a possibly-multi-statement script against the DSN.
