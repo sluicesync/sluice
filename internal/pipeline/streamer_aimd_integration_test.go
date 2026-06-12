@@ -82,6 +82,15 @@ func TestStreamer_AIMDController_PostgresToPostgres_Engages(t *testing.T) {
 		MetricsListen:  metricsAddr,
 	}
 
+	// Capture the streamer's slog at DEBUG so the slot-creation gate can
+	// dump it on failure (Phase-A trap for the recurring slot-creation
+	// flake — CI run 27324287473, 2026-06-11: the gate timed out at the
+	// full 120s with ZERO log lines for this stream id, so the generic
+	// "cold-start never reached slot creation" message couldn't tell a
+	// genuinely-starved process from a Run that errored early; the
+	// diagnosis was discarded). See [waitForSourceSlotWatching].
+	logs := captureSlog(t)
+
 	streamCtx, streamCancel := context.WithCancel(context.Background())
 	defer streamCancel()
 
@@ -98,7 +107,12 @@ func TestStreamer_AIMDController_PostgresToPostgres_Engages(t *testing.T) {
 	// worst-case shard contention — slow-but-correct, and the gate's
 	// loud message diagnosed it precisely. Matches the catch-up
 	// window's tolerance below.
-	waitForSourceSlot(t, sourceDSN, 120*time.Second)
+	//
+	// Watching variant: concurrently watches runErr + dumps the captured
+	// streamer log on early-return or timeout, so the NEXT firing of this
+	// flake is self-diagnosing (was Run starved, or did it error out
+	// before slot creation?) instead of costing another blind rerun.
+	waitForSourceSlotWatching(t, sourceDSN, 120*time.Second, runErr, logs)
 
 	srcDB, err := sql.Open("pgx", sourceDSN)
 	if err != nil {
