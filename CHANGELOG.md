@@ -4,7 +4,7 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.99.41] - 2026-06-12
 
 ### Fixed
 - **`backup compact` no longer refuses an ordinary rotated chain when a
@@ -26,10 +26,15 @@ project follows [Semantic Versioning](https://semver.org/).
   incremental` resume of such a segment now replays from the prior
   segment's `end_position` (`P_N`), so its first incremental stamps
   `incremental_coverage_start = P_N` and the boundary heals and compacts
-  fully. The affected range is pre-existing since rotation/compact
-  shipped (byte-identical refusal on prior releases and with
-  `--smart-compaction-off`); the fix never stamps coverage no committed
-  incremental proves, so no silent-loss surface is introduced.
+  fully (N→1). Neither half ever stamps coverage no committed incremental
+  proves — creation-time stamping and resume-backfill were rejected as
+  silent-DR-loss hazards. Affected releases: v0.88.0 through v0.99.40 —
+  the strict contiguous-rotation handoff that produces the `S > P_N`
+  boundary shipped with ADR-0067 (Bug 95) at v0.88.0; before that,
+  rotated chains were refused by design, not by this false positive.
+  Pinned by the compact-split unit matrix, the resume-rule unit test,
+  and a PG idle-stop integration repro (split + restore == oracle;
+  resume-heal → whole-chain N→1 + restore == oracle).
 
 ## [0.99.40] - 2026-06-12
 
