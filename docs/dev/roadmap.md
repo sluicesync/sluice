@@ -384,6 +384,49 @@ Closed by ADR-0035 — VStream's `query.Type_GEOMETRY` cell decoder now strips t
 
 For continuity when a chunk references "the previous work":
 
+### Repo-audit remediation arc (v0.99.31 → v0.99.39)
+
+The 2026-06-09 four-phase repo audit (`workspace/repo-audit-2026-06-09.md`,
+gitignored point-in-time artifact) converted into shipped work — all
+milestones complete as of v0.99.41:
+
+- **Safety net:** pgtrigger joined the integration shard matrix with a
+  shard-coverage CI guard; the tags-vet matrix (`scripts/vet-tags.sh`)
+  type-checks every `//go:build` combo in Lint + pre-commit; weekly
+  fresh-seed fuzz (`fuzz-roundtrip.yml`); `extended-suites.yml` for the
+  chaos/reshard/kmsverify suites; `timeout-minutes` everywhere; govulncheck.
+- **Applier control-plane extraction** ([ADR-0081](adr/adr-0081-applier-control-plane-extraction.md),
+  tiers a–d, PRs #170/#173/#176/#177): the engines' ≥85%-identical
+  batch/control-table/lease tier now lives once in `internal/appliershared`.
+- **O(1) migration-state checkpoints** ([ADR-0082](adr/adr-0082-per-table-migration-state-rows.md),
+  `internal/migratestate`): per-table rows replace the O(N²) whole-blob
+  rewrite; broker lineage-chain cache made idle ticks O(1).
+- **Capabilities re-anchoring:** engine-name string branches in the
+  orchestrator cut ~18 → 2; per-engine compile-time interface blocks.
+- **Structure:** `streamer.go` 3,191 → ~1,200 lines (named phase methods);
+  `internal/ir/diff` + `internal/ir/backup` sub-packages split out pre-1.0;
+  rapid-based sync-convergence property test; SHA-pinned release actions;
+  backup files 0600/0700; the source-trust boundary documented in
+  SECURITY.md; `--log-format=json` (v0.99.31).
+
+### Backup at-scale + correctness arc (v0.99.33 → v0.99.41)
+
+- **Chain provisioning** `backup full --chain-slot` ([ADR-0083](adr/adr-0083-backup-chain-provisioning.md));
+  **cross-table parallelism** for `backup full` + `restore`
+  `--table-parallelism` ([ADR-0084](adr/adr-0084-backup-restore-cross-table-parallelism.md), v0.99.35);
+  **crash-resume anchor adoption** ([ADR-0085](adr/adr-0085-resume-anchor-adoption.md), v0.99.38).
+- **Fast per-row chunk codec** (#51/#52, v0.99.39): byte-identical wire,
+  bail-to-legacy oracle; backup 881→435 s and restore 2810→1390 s on the
+  136 GB corpus (−51% both legs; gaps vs pg_dump/pg_restore -j8 now
+  1.83×/1.51× — `docs/comparison-backup.md`). **O(1) sidecar checkpoints**
+  ([ADR-0086](adr/adr-0086-backup-manifest-progress-sidecar.md), v0.99.39).
+  PG catalog-query 53100 fix on huge catalogs (#55, v0.99.39).
+- **Correctness:** Bug 135 parallel-resume re-stream (v0.99.36); Bug 136
+  TEXT-index preflight refusal (v0.99.37); Bug 137 TEMPORARY anchor slot +
+  orphan sweep (v0.99.37); Bug 138 non-finite-float codec envelope
+  (v0.99.40); Bug 139 compact group-split at rotation-boundary coverage
+  gaps + P_N resume-replay ([ADR-0087](adr/adr-0087-compact-group-split-and-rotation-boundary-resume.md), v0.99.41).
+
 ### Roadmap "Next up" items shipped
 
 Numbered "Next up" items that have shipped, condensed (gaps in the numbering are intentional — they mark items that moved here; surviving forward-looking items keep their original numbers under "## Next up"):

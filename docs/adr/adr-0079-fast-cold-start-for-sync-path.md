@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted — design. Roadmap item 3d. Implementation notes filled in as the chunk lands.
+Accepted — design. Roadmap item 3d. v1 shipped v0.99.29; v1.1 (within-table chunking, CORRECTION addendum) shipped v0.99.30. Implementation notes below.
 
 ### Implementation notes (what landed)
 
