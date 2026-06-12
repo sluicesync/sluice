@@ -427,6 +427,31 @@ milestones complete as of v0.99.41:
   (v0.99.40); Bug 139 compact group-split at rotation-boundary coverage
   gaps + P_N resume-replay ([ADR-0087](adr/adr-0087-compact-group-split-and-rotation-boundary-resume.md), v0.99.41).
 
+### Performance frontier (2026-06-12 profiling round — where the remaining time actually goes)
+
+Two evidence rounds on v0.99.41-era main; profiles under `workspace/pprof-migrate-v09941/`
+(gitignored), experiment logs in sluice-testing `workspace/perfB/`:
+
+- **PG→PG migrate (raw-copy lane) is wire-bound, not compute-bound.** pprof on
+  the 136 GB rig: sluice on-CPU ~6% of wall; the ADR-0078 passthrough does zero
+  per-row work (0 flat samples in sluice functions; no steady-state allocs; no
+  lock contention; `--table-parallelism=1` has the identical CPU shape). The
+  only sluice-reducible item is the reader→writer `io.Pipe` memmove at <0.5% of
+  wall. **Consequence: the positional-`ir.Row` rewrite (repo-audit P3) is NOT
+  justified by this lane** — if it pays anywhere it's the cross-engine typed
+  lane (TOAST/wide-row corpus differential is the test that would decide).
+- **MySQL-target migrate sits at the InnoDB server floor.** sluice's LOAD DATA
+  path (already 8-way parallel within-table via ADR-0019 chunking) matches a
+  hand-run `LOAD DATA LOCAL INFILE` to rig noise (~95k vs ~98k rows/s on the
+  1M-row anchor); InnoDB single-table clustered-PK ingest does not parallelize
+  (1×/4×/8× concurrent loaders all ≈100k) and is ingest-bound, not commit-bound
+  (`innodb_flush_log_at_trx_commit=2` ≈ +5%). **No Go-side or parallelism lever
+  moves this number; myloader faces the same wall.** Per-direction tracking +
+  the full numbers: sluice-testing `THROUGHPUT.md` (#34).
+- Remaining measured frontiers worth future chunks: backup-path zstd (32% of
+  backup CPU post-codec) and the cross-engine typed-lane corpus differentials
+  (TOAST/bytea, very-wide, 10k-tiny-tables — also decides #56).
+
 ### Roadmap "Next up" items shipped
 
 Numbered "Next up" items that have shipped, condensed (gaps in the numbering are intentional — they mark items that moved here; surviving forward-looking items keep their original numbers under "## Next up"):
