@@ -18,6 +18,22 @@ project follows [Semantic Versioning](https://semver.org/).
   releases it; pinned by a platform-neutral handle-tracking test
   (revert-verified: the old code leaks exactly one handle per chunk)
   and by the previously-failing Windows integration repro now passing.
+- **`backup full` no longer refuses tables containing float `NaN` /
+  `±Infinity` (Bug 138).** PG `float4`/`float8` columns legally hold
+  IEEE specials and `migrate` carries them exactly — but the chunk
+  codec rendered floats as JSON numbers, which cannot represent them,
+  so one NaN row made the whole database un-backupable (loud refusal:
+  `json: unsupported value: NaN`). Non-finite floats now ride a new
+  additive tagged envelope (`{"_t":"f64s","v":"NaN"|"+Inf"|"-Inf"}`),
+  on both the fast and legacy codec paths. Restores are
+  `float8send`-bit-identical to a `pg_dump` round trip: ±Inf exact,
+  every NaN canonicalized to the IEEE quiet NaN exactly as PG's own
+  text format does (NaN payload bits are not representable in either
+  format). Compatibility: chunks WITHOUT non-finite floats are
+  byte-unchanged; a chunk that DOES contain one is refused loudly
+  ("unknown value tag") by v0.99.39-and-older binaries — additive-tag
+  forward compatibility, never silent. Numeric (`numeric`-typed)
+  `NaN` was always fine and is untouched.
 
 ## [0.99.39] - 2026-06-11
 

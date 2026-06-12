@@ -259,8 +259,40 @@ func checkDecodeDifferential(t *testing.T, line []byte) {
 	if err != nil {
 		t.Fatalf("fast decoder accepted a line the legacy decoder rejects: %v\nline: %s", err, line)
 	}
-	if !reflect.DeepEqual(fastRow, legacyRow) {
+	if !reflect.DeepEqual(normalizeFloats(fastRow), normalizeFloats(legacyRow)) {
 		t.Fatalf("fast/legacy decode divergence\nline:   %s\nfast:   %#v\nlegacy: %#v", line, fastRow, legacyRow)
+	}
+}
+
+// normalizeFloats deep-copies v with every float64 replaced by its
+// IEEE bit pattern, so reflect.DeepEqual can compare structures
+// containing NaN (NaN != NaN under ==, and DeepEqual uses ==). Bit
+// equality is STRICTER than ==: it also distinguishes -0 from 0,
+// which the codec contract preserves.
+func normalizeFloats(v any) any {
+	switch x := v.(type) {
+	case float64:
+		return math.Float64bits(x)
+	case ir.Row:
+		out := make(map[string]any, len(x))
+		for k, e := range x {
+			out[k] = normalizeFloats(e)
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(x))
+		for k, e := range x {
+			out[k] = normalizeFloats(e)
+		}
+		return out
+	case []any:
+		out := make([]any, len(x))
+		for i, e := range x {
+			out[i] = normalizeFloats(e)
+		}
+		return out
+	default:
+		return v
 	}
 }
 
@@ -438,6 +470,129 @@ func TestFastRowCodec_FamilyMatrixRoundTrip(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+// TestChunkCodec_NonFiniteFloats is the Bug-138 pin: every IEEE
+// special × float width × shape must survive the chunk writer→reader
+// round trip (the pre-fix codec REFUSED the whole table with
+// "json: unsupported value: NaN" — loud, but it made any database
+// holding one NaN row un-backupable while `migrate` carried the same
+// value fine). Per the Bug-74 lesson the matrix covers every family ×
+// shape, not one representative. Bit-pattern assertions (NaN != NaN
+// under ==), and a numeric-NaN STRING must stay a string — the
+// sentinel envelope must never capture it.
+func TestChunkCodec_NonFiniteFloats(t *testing.T) {
+	specials := map[string]float64{
+		"nan":     math.NaN(),
+		"posinf":  math.Inf(1),
+		"neginf":  math.Inf(-1),
+		"neg0":    math.Copysign(0, -1), // finite control: bare number path
+		"finite1": 6.25,                 // finite control
+	}
+	for name, f := range specials {
+		for _, width := range []string{"f64", "f32"} {
+			t.Run(name+"_"+width, func(t *testing.T) {
+				var v any = f
+				want := f
+				if width == "f32" {
+					v = float32(f)
+					want = float64(float32(f))
+				}
+				if math.IsNaN(want) {
+					// The "NaN" sentinel cannot carry payload bits, so
+					// every NaN round-trips to the IEEE-canonical quiet
+					// NaN — the same bit pattern PG's own text format
+					// produces, keeping sluice restores float8send-
+					// identical to pg_restore. ±Inf and finite values
+					// stay bit-exact.
+					want = canonicalNaN
+				}
+				row := ir.Row{
+					"scalar":  v,
+					"inlist":  []any{v},
+					"inmap":   map[string]any{"x": v},
+					"numstr":  "NaN", // numeric-as-string control
+					"sibling": int64(7),
+				}
+				cols := []*ir.Column{
+					{Name: "scalar"},
+					{Name: "inlist"},
+					{Name: "inmap"},
+					{Name: "numstr"},
+					{Name: "sibling"},
+				}
+				var buf bytes.Buffer
+				w, err := newChunkWriter(&buf, []string{"scalar", "inlist", "inmap", "numstr", "sibling"}, nil, CodecGzip)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := w.WriteRow(row, cols); err != nil {
+					t.Fatalf("WriteRow refused the row (the Bug-138 shape): %v", err)
+				}
+				if err := w.Close(); err != nil {
+					t.Fatal(err)
+				}
+				r, err := newChunkReader(io.NopCloser(bytes.NewReader(buf.Bytes())), w.Hash(), nil, CodecGzip)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := r.ReadRow()
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertBits := func(label string, gv any) {
+					t.Helper()
+					gf, ok := gv.(float64)
+					if !ok {
+						t.Fatalf("%s: got %T (%#v); want float64", label, gv, gv)
+					}
+					if math.Float64bits(gf) != math.Float64bits(want) {
+						t.Fatalf("%s: got %v (bits %x); want %v (bits %x)",
+							label, gf, math.Float64bits(gf), want, math.Float64bits(want))
+					}
+				}
+				assertBits("scalar", got["scalar"])
+				assertBits("inlist[0]", got["inlist"].([]any)[0])
+				assertBits("inmap.x", got["inmap"].(map[string]any)["x"])
+				if s, ok := got["numstr"].(string); !ok || s != "NaN" {
+					t.Fatalf("numstr: got %T %#v; want the literal string \"NaN\"", got["numstr"], got["numstr"])
+				}
+				if err := r.Close(); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+	}
+}
+
+// TestChunkCodec_F64sStrictDecode pins the loud-failure ladder of the
+// sentinel: an alien payload is corruption, not a zero.
+func TestChunkCodec_F64sStrictDecode(t *testing.T) {
+	for _, line := range []string{
+		`{"a":{"_t":"f64s","v":"nan"}}`,      // wrong case
+		`{"a":{"_t":"f64s","v":"Infinity"}}`, // wrong spelling
+		`{"a":{"_t":"f64s","v":1}}`,          // wrong type
+		`{"a":{"_t":"f64s","v":""}}`,
+	} {
+		if _, err := readRowLegacy([]byte(line)); err == nil {
+			t.Fatalf("legacy decoder accepted alien f64s payload: %s", line)
+		}
+		var dec fastRowDecoder
+		if _, ok := dec.decodeRow([]byte(line)); ok {
+			t.Fatalf("fast decoder accepted alien f64s payload instead of bailing: %s", line)
+		}
+		checkDecodeDifferential(t, []byte(line))
+	}
+	// And the three canonical sentinels decode on the FAST path (the
+	// canonical-accept guarantee for encoder-produced lines).
+	for _, line := range []string{
+		`{"a":{"_t":"f64s","v":"NaN"}}`,
+		`{"a":{"_t":"f64s","v":"+Inf"}}`,
+		`{"a":{"_t":"f64s","v":"-Inf"}}`,
+	} {
+		checkFastDecodesCanonical(t, []byte(line))
+		checkDecodeDifferential(t, []byte(line))
 	}
 }
 
