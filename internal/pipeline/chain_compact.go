@@ -29,6 +29,23 @@ import (
 // run is operator-initiated; sluice never auto-compacts on a write or
 // rotation path.
 //
+// ## Coverage-gap subdivision (ADR-0087)
+//
+// After the CreatedAt-window grouping, each group is SUBDIVIDED at every
+// boundary where the prior segment's EndPosition does not equal the
+// next segment's incremental coverage start ([subdivideAtCoverageGaps]).
+// Such a gap appears when a rotation-born segment never committed an
+// incremental in its creating session (Bug 139: source idle at stream
+// stop, or a crash/end at the rotation boundary) — it carries no
+// IncrementalCoverageStart stamp and falls back to its full's anchor S,
+// a few WAL bytes past the prior segment's P_N. The (P_N, S] window then
+// lives ONLY in that segment's full snapshot, which a byte-level merge
+// would drop. Subdivision keeps such a segment in its own merge group
+// (with a WARN naming the boundary), so the surrounding contiguous runs
+// still merge while NO data is lost and the chain stays restorable. This
+// replaces the pre-ADR-0087 behaviour of refusing the WHOLE compact run
+// with a corruption-blaming message.
+//
 // ## What "naive" means (and what it does NOT mean)
 //
 // Naive = STRUCTURAL byte-level concat. N consecutive segments in a
@@ -175,8 +192,10 @@ type CompactResult struct {
 
 	// Plan is the per-group breakdown — populated under DryRun (the
 	// reporting-only path) AND under real compact (so callers can log
-	// what actually happened). One entry per CONSIDERED group; size-1
-	// groups carry MergedSegmentID == "" and no merged dir.
+	// what actually happened). One entry per CONSIDERED group AFTER the
+	// ADR-0087 coverage-gap subdivision (a CreatedAt-window group split
+	// at a rotation-boundary gap yields multiple entries); size-1 groups
+	// carry MergedSegmentID == "" and no merged dir.
 	Plan []CompactPlanGroup
 }
 
@@ -260,6 +279,12 @@ type segMeta struct {
 	byteTotal int64
 }
 
+// groupRange is a half-open [start, end) span within the `metas` slice
+// describing one merge group's source segments. Used by both the
+// CreatedAt-window grouping pass and the ADR-0087 coverage-gap
+// subdivision pass.
+type groupRange struct{ start, end int }
+
 // plannedGroup is one pre-flighted merge group ready for the staging
 // phase. dir == "" marks a size-1 (no-op) group.
 type plannedGroup struct {
@@ -269,9 +294,12 @@ type plannedGroup struct {
 }
 
 // CompactChain executes a naive segment-compaction pass against the
-// lineage in store. See package doc + ADR-0046 §14d. Returns the
-// summary on success; any pre-flight refusal (encryption-keyset
-// boundary, codec mismatch, gap-between-segments) is a wrapped error.
+// lineage in store. See package doc + ADR-0046 §14d + ADR-0087. Returns
+// the summary on success; the loud pre-flight refusals (encryption-
+// keyset boundary, codec mismatch) are wrapped errors. A coverage-gap
+// boundary (ADR-0087) is NOT a refusal: the group is subdivided so the
+// stamp-less rotation-born segment stays in its own merge group (WARN-
+// named), and the run still succeeds.
 //
 //nolint:funlen // ratchet: pre-existing 234-line accretion; split when next touched (hold-the-line note in .golangci.yml)
 func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (*CompactResult, error) {
@@ -329,7 +357,6 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 	// Pairwise greedy grouping by CreatedAt distance. Cut a new group
 	// whenever the gap to the prior element exceeds MergeWindow.
 	// Size-1 groups are no-ops (still reported in the Plan).
-	type groupRange struct{ start, end int } // half-open within metas
 	var groups []groupRange
 	{
 		g := groupRange{start: 0, end: 1}
@@ -344,6 +371,24 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 		}
 		groups = append(groups, g)
 	}
+
+	// ADR-0087: subdivide each CreatedAt-window group at every
+	// coverage-gap boundary (prev.EndPosition != cur's incremental
+	// coverage start). A rotation-born segment that never committed an
+	// incremental in its creating session (source idle at stream stop,
+	// or a crash/end at the rotation boundary) carries no
+	// IncrementalCoverageStart stamp, so it falls back to its full's
+	// snapshot anchor S — a few WAL bytes past the prior segment's
+	// EndPosition (P_N). The (P_N, S] window then lives ONLY in this
+	// segment's full snapshot, which a merge would drop. Rather than
+	// REFUSE the whole compact run (the pre-ADR-0087 behaviour, which
+	// blamed lineage corruption on a chain this binary's own rotation
+	// produced), we split the group so each such segment stays in its
+	// own merge group — losing nothing, keeping the chain fully
+	// restorable, and still merging every contiguous run around it.
+	// Runs BEFORE the naive/smart branch so both modes (and --dry-run)
+	// see the same subdivided plan + WARNs.
+	groups = subdivideAtCoverageGaps(ctx, eligible, metas, groups)
 
 	res := &CompactResult{}
 	planned := make([]plannedGroup, 0, len(groups))
@@ -645,41 +690,97 @@ func assertGroupEncryptionKeysetUniform(eligible []LineageSegment, span []segMet
 	return nil
 }
 
-// assertGroupBoundaryContiguous refuses LOUDLY when there's a real
-// position gap between consecutive sources in a merge group: the prior
-// segment's EndPosition does not equal the next segment's earliest
-// incremental coverage. The comparison is against
-// [LineageSegment.incrementalCoverageStartOrStart] (ADR-0067), NOT
-// StartPosition: a rotation-opened segment keeps the (P_N, S] overlap
-// in its incrementals and records IncrementalCoverageStart = P_N ==
-// the prior segment's EndPosition, so a rotated lineage is contiguous
-// by construction and this check passes. (For a never-rotated /
-// pre-ADR-0067 segment the resolver falls back to StartPosition — the
-// historical comparison.)
-//
-// A strict inequality therefore means a GENUINE gap: events between
-// prev.End and cur's coverage start would live ONLY in cur's full
-// snapshot, which naive compact is about to drop. Post-ADR-0067 that
-// can only arise on a pre-0067, imported, or corrupted lineage —
-// refuse LOUDLY rather than silently lose them. We compare via raw
-// engine + token equality (positions across a rotation handoff share
-// an engine, so JSON-string equality is a sufficient, conservative
-// discriminator).
+// boundaryHasCoverageGap reports whether there is a position gap
+// between two consecutive sources: the prior segment's EndPosition does
+// not equal the next segment's earliest incremental coverage. The
+// comparison is against [LineageSegment.incrementalCoverageStartOrStart]
+// (ADR-0067), NOT StartPosition: a rotation-opened segment that DID
+// commit an incremental in its creating session keeps the (P_N, S]
+// overlap in its incrementals and records IncrementalCoverageStart =
+// P_N == the prior segment's EndPosition, so that boundary is
+// contiguous. A rotation-born segment that never committed an
+// incremental (Bug 139 — source idle at stream stop, or a crash/end at
+// the rotation boundary) has no stamp and falls back to StartPosition
+// (S), a few WAL bytes past P_N — a gap. We compare via raw engine +
+// token equality (positions across a rotation handoff share an engine,
+// so JSON-string equality is a sufficient, conservative discriminator).
+func boundaryHasCoverageGap(prev, cur *LineageSegment) bool {
+	curStart := cur.incrementalCoverageStartOrStart()
+	return prev.EndPosition.Token != curStart.Token ||
+		prev.EndPosition.Engine != curStart.Engine
+}
+
+// assertGroupBoundaryContiguous is a DEFENSIVE internal invariant run in
+// the per-group preflight: every consecutive pair within a planned merge
+// group must be boundary-contiguous. ADR-0087 made this UNREACHABLE in
+// the normal path — [subdivideAtCoverageGaps] already split every
+// coverage-gap boundary into a separate group before preflight, so a
+// surviving size-≥-2 group is contiguous by construction. If this fires
+// it is therefore a SUBDIVISION BUG (the split pass missed a gap),
+// caught loudly here before any byte-level merge drops the (P_N, S]
+// window — never silently lose DR data.
 func assertGroupBoundaryContiguous(eligible []LineageSegment, span []segMeta) error {
 	for i := 1; i < len(span); i++ {
 		prev := &eligible[span[i-1].idx]
 		cur := &eligible[span[i].idx]
-		curStart := cur.incrementalCoverageStartOrStart()
-		if prev.EndPosition.Token != curStart.Token ||
-			prev.EndPosition.Engine != curStart.Engine {
+		if boundaryHasCoverageGap(prev, cur) {
 			return fmt.Errorf(
-				"backup compact: merge group has a position gap between segment %s (end=%+v) and segment %s (incremental coverage starts at %+v): events in that range live only in the later segment's full snapshot, which compaction drops — refusing to silently lose them (DR data). Rotated chains are contiguous and compactable (ADR-0067); a gap here indicates a pre-ADR-0067, imported, or corrupted lineage",
+				"backup compact: internal invariant violated — a planned merge group has a position gap between segment %s (end=%+v) and segment %s (incremental coverage starts at %+v) that the ADR-0087 coverage-gap subdivision should have split. This is a sluice bug; refusing to merge (a byte-level merge would drop the events in that range, which live only in the later segment's full snapshot — DR data)",
 				prev.SegmentID, prev.EndPosition,
-				cur.SegmentID, curStart,
+				cur.SegmentID, cur.incrementalCoverageStartOrStart(),
 			)
 		}
 	}
 	return nil
+}
+
+// subdivideAtCoverageGaps (ADR-0087) splits each CreatedAt-window group
+// at every coverage-gap boundary so a byte-level merge never drops the
+// (P_N, S] window that lives only in a stamp-less rotation-born
+// segment's full snapshot. Each split boundary emits ONE operator-
+// accurate WARN. Size-1 subgroups are the existing size-1 no-op shape.
+// Pure (no storage I/O); safe to call on the --dry-run path so plans
+// carry the same subdivision + WARNs as a real run.
+func subdivideAtCoverageGaps(ctx context.Context, eligible []LineageSegment, metas []segMeta, groups []groupRange) []groupRange {
+	out := make([]groupRange, 0, len(groups))
+	for _, g := range groups {
+		start := g.start
+		for i := g.start + 1; i < g.end; i++ {
+			prev := &eligible[metas[i-1].idx]
+			cur := &eligible[metas[i].idx]
+			if !boundaryHasCoverageGap(prev, cur) {
+				continue
+			}
+			warnCoverageGapSplit(ctx, prev, cur)
+			out = append(out, groupRange{start: start, end: i})
+			start = i
+		}
+		out = append(out, groupRange{start: start, end: g.end})
+	}
+	return out
+}
+
+// warnCoverageGapSplit emits the single operator-accurate WARN for one
+// ADR-0087 subdivision boundary, naming both segments + the position
+// delta and explaining (in operator terms) WHY the boundary cannot
+// merge and that NO data is lost.
+func warnCoverageGapSplit(ctx context.Context, prev, cur *LineageSegment) {
+	curStart := cur.incrementalCoverageStartOrStart()
+	curRotationBorn := cur.Dir != "" || cur.CapReason != "" || cur.open()
+	slog.WarnContext(
+		ctx, "backup compact: merge group split at a rotation-boundary coverage gap — "+
+			"the later segment was born by a rotation and never committed an incremental in its "+
+			"creating session (source idle at stream stop, or the stream ended/crashed at the "+
+			"rotation boundary), so the window between the two segments exists ONLY in the later "+
+			"segment's full snapshot, which merging would drop. The segments stay in separate merge "+
+			"groups; NO data is lost and the chain remains fully restorable.",
+		slog.String("prev_segment_id", prev.SegmentID),
+		slog.String("cur_segment_id", cur.SegmentID),
+		slog.String("prev_end_position", prev.EndPosition.Token),
+		slog.String("cur_coverage_start_position", curStart.Token),
+		slog.Bool("cur_zero_incrementals", len(cur.Incrementals) == 0),
+		slog.Bool("cur_rotation_born", curRotationBorn),
+	)
 }
 
 // encryptionFingerprint returns a stable string identifier for a

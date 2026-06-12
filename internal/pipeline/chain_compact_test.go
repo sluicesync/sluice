@@ -213,32 +213,237 @@ func TestCompactChain_CodecBoundary_RefusesLoudly(t *testing.T) {
 	}
 }
 
-// TestCompactChain_PositionGap_RefusesLoudly: a 2-segment group where
-// seg[i+1].StartPosition != seg[i].EndPosition refuses loudly to
-// avoid silent event loss.
-func TestCompactChain_PositionGap_RefusesLoudly(t *testing.T) {
+// TestCompactChain_PositionGap_SplitsNotRefuses (ADR-0087, replaces the
+// pre-ADR-0087 TestCompactChain_PositionGap_RefusesLoudly): a 2-segment
+// lineage where seg[1] is the stamp-less rotation-born Bug-139 shape
+// (seg[1] resolves to its full anchor S, a gap past seg[0]'s EndPosition)
+// is no longer a whole-run refusal. Compact SPLITS at the gap: seg[0] is
+// its own size-1 group (a no-op), seg[1] is its own size-1 group, nothing
+// merges, no error, and the run succeeds.
+func TestCompactChain_PositionGap_SplitsNotRefuses(t *testing.T) {
 	store := newMemStore()
 	now := time.Date(2026, 5, 16, 0, 0, 0, 0, time.UTC)
-	seedTwoSegmentLineageWithGap(t, store, now)
+	// seg1 is the trailing zero-incremental rotation-born OPEN segment.
+	seedSegmentsWithGapsOpts(t, store, now, []time.Duration{time.Hour}, segmentSeedOpts{
+		zeroIncrStampless: map[int]bool{1: true},
+		openLastSegment:   true,
+	})
 
-	_, err := CompactChain(context.Background(), store, CompactOpts{
+	res, err := CompactChain(context.Background(), store, CompactOpts{
 		MergeWindow: 2 * time.Hour,
 	})
-	if err == nil {
-		t.Fatal("CompactChain across a position gap: nil error; want loud refusal")
+	if err != nil {
+		t.Fatalf("CompactChain across a coverage gap: %v; want a clean split (ADR-0087), not a refusal", err)
 	}
-	if !strings.Contains(err.Error(), "position gap") {
-		t.Errorf("err = %q; want position-gap refusal", err.Error())
+	if res.GroupsMerged != 0 {
+		t.Errorf("GroupsMerged = %d; want 0 (the gap splits seg0 and seg1 into separate size-1 groups)", res.GroupsMerged)
+	}
+	// The lineage is untouched (both segments survive, nothing merged).
+	cat, _, _ := loadLineageCatalog(context.Background(), store)
+	if len(cat.Segments) != 2 {
+		t.Errorf("post-compact segments = %d; want 2 (no merge across the gap)", len(cat.Segments))
+	}
+}
+
+// TestCompactChain_Bug139_GapSplit is the table-driven Bug-139 pin
+// (ADR-0087): every lineage shape that carries a coverage-gap boundary
+// (a stamp-less rotation-born segment) compacts by SPLITTING at the gap
+// rather than refusing the whole run, and the merged content/plan are
+// correct. It pins the class — trailing OPEN, trailing CAPPED, mid-chain
+// stamp-less-with-incrementals, and multiple gaps — not one shape.
+func TestCompactChain_Bug139_GapSplit(t *testing.T) {
+	now := time.Date(2026, 5, 16, 0, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name string
+		// gaps between consecutive segments (len == segments-1).
+		gaps []time.Duration
+		opts segmentSeedOpts
+		// wantMerged is the expected GroupsMerged.
+		wantMerged int
+		// wantSegmentsAfter is the expected post-compact segment count.
+		wantSegmentsAfter int
+	}{
+		{
+			// The exact idle-stop shape: a trailing zero-incremental
+			// rotation-born OPEN segment. seg0+seg1+seg2 would window
+			// together, but seg2 (the stamp-less open segment) splits off:
+			// seg0+seg1 merge (2→1), seg2 stays its own group.
+			name: "trailing zero-incr rotation-born OPEN",
+			gaps: []time.Duration{time.Hour, time.Hour},
+			opts: segmentSeedOpts{
+				zeroIncrStampless: map[int]bool{2: true},
+				openLastSegment:   true,
+			},
+			wantMerged:        1,
+			wantSegmentsAfter: 2, // merged(seg0,seg1) + seg2
+		},
+		{
+			// Same, but the trailing stamp-less segment is CAPPED (a
+			// later session capped it without committing into it). Same
+			// split outcome.
+			name: "trailing zero-incr rotation-born CAPPED",
+			gaps: []time.Duration{time.Hour, time.Hour},
+			opts: segmentSeedOpts{
+				zeroIncrStampless: map[int]bool{2: true},
+			},
+			wantMerged:        1,
+			wantSegmentsAfter: 2,
+		},
+		{
+			// Two stamp-less gap boundaries in one window group: seg1 and
+			// seg3 are both stamp-less rotation-born. The gaps sit BEFORE
+			// seg1 and BEFORE seg3, so the window splits as
+			// {seg0} | {seg1, seg2} | {seg3}: seg1→seg2 is itself
+			// contiguous, so that middle group merges (2→1); seg0 and seg3
+			// stay size-1. One merge, three post-compact segments.
+			name: "multiple gap boundaries in one window",
+			gaps: []time.Duration{time.Hour, time.Hour, time.Hour},
+			opts: segmentSeedOpts{
+				zeroIncrStampless: map[int]bool{1: true, 3: true},
+				openLastSegment:   true,
+			},
+			wantMerged:        1,
+			wantSegmentsAfter: 3,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newMemStore()
+			seedSegmentsWithGapsOpts(t, store, now, tc.gaps, tc.opts)
+			res, err := CompactChain(context.Background(), store, CompactOpts{
+				MergeWindow: 24 * time.Hour, // window captures every segment
+				Now:         func() time.Time { return now.Add(100 * time.Hour) },
+			})
+			if err != nil {
+				t.Fatalf("CompactChain: %v; want a clean split (ADR-0087)", err)
+			}
+			if res.GroupsMerged != tc.wantMerged {
+				t.Errorf("GroupsMerged = %d; want %d", res.GroupsMerged, tc.wantMerged)
+			}
+			cat, _, _ := loadLineageCatalog(context.Background(), store)
+			if len(cat.Segments) != tc.wantSegmentsAfter {
+				t.Errorf("post-compact segments = %d; want %d", len(cat.Segments), tc.wantSegmentsAfter)
+			}
+			// The post-compact lineage must still restore-walk cleanly.
+			if _, err := buildLineageChain(context.Background(), store, nil); err != nil {
+				t.Errorf("post-compact buildLineageChain: %v", err)
+			}
+		})
+	}
+}
+
+// TestCompactChain_Bug139_MidChainStampless_SplitsAroundBoundary: the
+// bd0c5e94 rig shape — a mid-chain stamp-less segment that DOES carry
+// incrementals (a later resumed session committed rollovers into it and
+// even capped it), but those incrementals start at S (the full anchor),
+// not P_N, so no IncrementalCoverageStart was ever stamped. The boundary
+// before it is a gap; compact splits into two merged groups around it.
+//
+// seg0 ─┬─ contiguous ─ seg1 ── GAP ── seg2 ─ contiguous ─ seg3
+// expect: {seg0,seg1} merge, {seg2,seg3} merge → 2 merged groups, 2 segments.
+func TestCompactChain_Bug139_MidChainStampless_SplitsAroundBoundary(t *testing.T) {
+	store := newMemStore()
+	now := time.Date(2026, 5, 16, 0, 0, 0, 0, time.UTC)
+	// seg2 is rotation-born + has incrementals but no stamp: model it with
+	// gapBetweenBoundaries on index 2 only. gapBetweenBoundaries advances
+	// BOTH the full anchor AND the incrementals past P_N and records no
+	// stamp — exactly the "incrementals start at S, no stamp" shape.
+	seedSegmentsWithGapsOpts(t, store, now, []time.Duration{time.Hour, time.Hour, time.Hour}, segmentSeedOpts{
+		gapAtSegment: map[int]bool{2: true},
+	})
+	res, err := CompactChain(context.Background(), store, CompactOpts{
+		MergeWindow: 24 * time.Hour,
+		Now:         func() time.Time { return now.Add(100 * time.Hour) },
+	})
+	if err != nil {
+		t.Fatalf("CompactChain: %v; want a clean split into two merged groups", err)
+	}
+	if res.GroupsMerged != 2 {
+		t.Errorf("GroupsMerged = %d; want 2 (one merged group each side of the gap)", res.GroupsMerged)
+	}
+	cat, _, _ := loadLineageCatalog(context.Background(), store)
+	if len(cat.Segments) != 2 {
+		t.Errorf("post-compact segments = %d; want 2", len(cat.Segments))
+	}
+	if _, err := buildLineageChain(context.Background(), store, nil); err != nil {
+		t.Errorf("post-compact buildLineageChain: %v", err)
+	}
+}
+
+// TestCompactChain_FullyContiguousRotated_MergesExactly: a fully
+// contiguous (stamped) rotated 4-segment chain merges 4→1 exactly as
+// pre-ADR-0087 — no split, no WARN. This is the no-regression guard for
+// the ADR-0067 happy path.
+func TestCompactChain_FullyContiguousRotated_MergesExactly(t *testing.T) {
+	store := newMemStore()
+	now := time.Date(2026, 5, 16, 0, 0, 0, 0, time.UTC)
+	seedSegmentsWithGapsOpts(t, store, now, []time.Duration{time.Hour, time.Hour, time.Hour}, segmentSeedOpts{
+		rotatedOverlap: true,
+	})
+	res, err := CompactChain(context.Background(), store, CompactOpts{
+		MergeWindow: 24 * time.Hour,
+		Now:         func() time.Time { return now.Add(100 * time.Hour) },
+	})
+	if err != nil {
+		t.Fatalf("CompactChain on a fully-contiguous rotated chain: %v", err)
+	}
+	if res.GroupsMerged != 1 || res.SegmentsRemoved != 3 {
+		t.Errorf("GroupsMerged=%d SegmentsRemoved=%d; want 1,3 (4→1 exact merge)",
+			res.GroupsMerged, res.SegmentsRemoved)
+	}
+	cat, _, _ := loadLineageCatalog(context.Background(), store)
+	if len(cat.Segments) != 1 {
+		t.Errorf("post-compact segments = %d; want 1", len(cat.Segments))
+	}
+}
+
+// TestCompactChain_Bug139_DryRunSplits: --dry-run produces the same
+// subdivided plan (no merge across the gap) without touching storage.
+func TestCompactChain_Bug139_DryRunSplits(t *testing.T) {
+	store := newMemStore()
+	now := time.Date(2026, 5, 16, 0, 0, 0, 0, time.UTC)
+	seedSegmentsWithGapsOpts(t, store, now, []time.Duration{time.Hour, time.Hour}, segmentSeedOpts{
+		zeroIncrStampless: map[int]bool{2: true},
+		openLastSegment:   true,
+	})
+	res, err := CompactChain(context.Background(), store, CompactOpts{
+		MergeWindow: 24 * time.Hour,
+		DryRun:      true,
+	})
+	if err != nil {
+		t.Fatalf("CompactChain dry-run: %v", err)
+	}
+	if res.GroupsMerged != 1 {
+		t.Errorf("dry-run GroupsMerged = %d; want 1 (seg0+seg1 merge; seg2 split off)", res.GroupsMerged)
+	}
+	// The plan reflects the subdivision: one size-2 mergeable group and
+	// one size-1 (skipped) group for the stamp-less segment.
+	var size1, size2 int
+	for _, g := range res.Plan {
+		switch len(g.SourceSegmentIDs) {
+		case 1:
+			size1++
+		case 2:
+			size2++
+		}
+	}
+	if size2 != 1 || size1 != 1 {
+		t.Errorf("dry-run plan groups: size2=%d size1=%d; want 1 size-2 (merge) + 1 size-1 (split-off)", size2, size1)
+	}
+	// Dry-run touched nothing: both segments survive on disk.
+	cat, _, _ := loadLineageCatalog(context.Background(), store)
+	if len(cat.Segments) != 3 {
+		t.Errorf("post-dry-run segments = %d; want 3 (untouched)", len(cat.Segments))
 	}
 }
 
 // TestCompactChain_RotatedOverlap_Merges is the unit-level Bug 95 pin:
 // a chain rotated in the ADR-0067 shape (each non-root segment keeps the
 // (P_N, S] overlap and records IncrementalCoverageStart = P_N) is
-// CONTIGUOUS and so MERGES — where the pre-ADR-0067 gap shape
-// (TestCompactChain_PositionGap_RefusesLoudly) correctly refused. Pins
-// that the contiguity check keys off IncrementalCoverageStart, and that
-// the merged lineage still walks (restore-build) cleanly.
+// CONTIGUOUS and so MERGES — where the pre-ADR-0087 gap shape
+// (TestCompactChain_PositionGap_SplitsNotRefuses) now splits instead.
+// Pins that the contiguity check keys off IncrementalCoverageStart, and
+// that the merged lineage still walks (restore-build) cleanly.
 func TestCompactChain_RotatedOverlap_Merges(t *testing.T) {
 	store := newMemStore()
 	now := time.Date(2026, 5, 16, 0, 0, 0, 0, time.UTC)
@@ -437,6 +642,13 @@ type segmentSeedOpts struct {
 	// segment's StartPosition past the prior's EndPosition (creating
 	// the contiguity-violation shape).
 	gapBetweenBoundaries bool
+	// gapAtSegment marks the SPECIFIC non-root segment indices that take
+	// the gap shape (full anchor AND incrementals advanced past P_N, no
+	// stamp) — models a mid-chain rotation-born segment that received
+	// incrementals starting at S but was never stamped (the bd0c5e94 rig
+	// shape). Unlike gapBetweenBoundaries (every boundary), this gaps only
+	// the listed segments.
+	gapAtSegment map[int]bool
 	// rotatedOverlap, when true, produces the ADR-0067 rotation shape for
 	// each non-root segment: the full is anchored at S = prior.End + 50
 	// (a gap, like gapBetweenBoundaries), BUT the segment's incrementals
@@ -445,6 +657,19 @@ type segmentSeedOpts struct {
 	// is contiguous (prior.End == cur.IncrementalCoverageStart) and so
 	// compactable, unlike the gapBetweenBoundaries shape.
 	rotatedOverlap bool
+
+	// zeroIncrStampless, when non-nil, marks segment indices that take
+	// the exact Bug-139 shape: rotation-born (full anchored at S =
+	// prior.End + 50), ZERO incrementals, and NO IncrementalCoverageStart
+	// stamp — so the segment resolves to its full anchor S, a gap past the
+	// prior segment's P_N. Such a segment's EndPosition stays at S (== its
+	// StartPosition). Only valid on non-root segments (i > 0).
+	zeroIncrStampless map[int]bool
+
+	// openLastSegment, when true, leaves the LAST segment uncapped (the
+	// lineage's open segment). Used with zeroIncrStampless to model the
+	// trailing idle-stop OPEN segment.
+	openLastSegment bool
 }
 
 func seedSegmentsWithGapsOpts(t *testing.T, store irbackup.Store, base time.Time, gaps []time.Duration, opts segmentSeedOpts) {
@@ -487,11 +712,17 @@ func seedSegmentsWithGapsOpts(t *testing.T, store irbackup.Store, base time.Time
 		pN := prevEndLSN
 		fullAnchorLSN := pN
 		incrStartLSN := pN
+		stampless := i > 0 && opts.zeroIncrStampless[i]
 		switch {
-		case i > 0 && opts.gapBetweenBoundaries:
+		case i > 0 && (opts.gapBetweenBoundaries || opts.gapAtSegment[i]):
 			fullAnchorLSN, incrStartLSN = pN+50, pN+50
 		case i > 0 && opts.rotatedOverlap:
 			fullAnchorLSN, incrStartLSN = pN+50, pN
+		case stampless:
+			// Bug-139 shape: rotation-born full anchored at S = P_N+50,
+			// but the segment never received an incremental in its
+			// creating session — so no stamp and no incrementals.
+			fullAnchorLSN, incrStartLSN = pN+50, pN+50
 		}
 		// Full is a snapshot at fullAnchorLSN: Start == End == fullAnchorLSN.
 		full := compactSeedFullManifest(t, segCreatedAt, fullAnchorLSN, chainEnc)
@@ -499,27 +730,30 @@ func seedSegmentsWithGapsOpts(t *testing.T, store irbackup.Store, base time.Time
 		if err := writeManifestAt(context.Background(), segStore, ManifestFileName, full); err != nil {
 			t.Fatalf("seed full %d: %v", i, err)
 		}
-		// Two incrementals stepping LSN forward by 50 each.
+		// Two incrementals stepping LSN forward by 50 each — unless this is
+		// the stamp-less zero-incremental Bug-139 segment, which has none.
 		incrPaths := []string{}
 		curLSN := incrStartLSN
-		for j := 1; j <= 2; j++ {
-			incrCreatedAt := segCreatedAt.Add(time.Duration(j) * 10 * time.Minute)
-			nextLSN := curLSN + 50
-			ip := fmt.Sprintf("manifests/incr-%05d-seg%d-%d.json", j, i, j)
-			im := compactSeedIncrementalManifest(t, incrCreatedAt, curLSN, nextLSN)
-			// Seed a tiny change chunk file the manifest references,
-			// so segmentByteTotal has something to read.
-			chunkPath := fmt.Sprintf("chunks/_changes/seg%d-incr%d.jsonl.gz", i, j)
-			body := []byte(fmt.Sprintf("seg%d-incr%d-body", i, j))
-			if err := segStore.Put(context.Background(), chunkPath, bytes.NewReader(body)); err != nil {
-				t.Fatalf("seed change chunk: %v", err)
+		if !stampless {
+			for j := 1; j <= 2; j++ {
+				incrCreatedAt := segCreatedAt.Add(time.Duration(j) * 10 * time.Minute)
+				nextLSN := curLSN + 50
+				ip := fmt.Sprintf("manifests/incr-%05d-seg%d-%d.json", j, i, j)
+				im := compactSeedIncrementalManifest(t, incrCreatedAt, curLSN, nextLSN)
+				// Seed a tiny change chunk file the manifest references,
+				// so segmentByteTotal has something to read.
+				chunkPath := fmt.Sprintf("chunks/_changes/seg%d-incr%d.jsonl.gz", i, j)
+				body := []byte(fmt.Sprintf("seg%d-incr%d-body", i, j))
+				if err := segStore.Put(context.Background(), chunkPath, bytes.NewReader(body)); err != nil {
+					t.Fatalf("seed change chunk: %v", err)
+				}
+				im.ChangeChunks = []*irbackup.ChunkInfo{{File: chunkPath, RowCount: 1, SHA256: ""}}
+				if err := writeManifestAt(context.Background(), segStore, ip, im); err != nil {
+					t.Fatalf("seed incr (%d,%d): %v", i, j, err)
+				}
+				incrPaths = append(incrPaths, ip)
+				curLSN = nextLSN
 			}
-			im.ChangeChunks = []*irbackup.ChunkInfo{{File: chunkPath, RowCount: 1, SHA256: ""}}
-			if err := writeManifestAt(context.Background(), segStore, ip, im); err != nil {
-				t.Fatalf("seed incr (%d,%d): %v", i, j, err)
-			}
-			incrPaths = append(incrPaths, ip)
-			curLSN = nextLSN
 		}
 		prevEndLSN = curLSN
 
@@ -541,9 +775,13 @@ func seedSegmentsWithGapsOpts(t *testing.T, store irbackup.Store, base time.Time
 		// Cap every segment except the last (the lineage's open
 		// segment). For compact tests we mostly want closed segments
 		// — but a never-rotated last segment is fine; the eligibility
-		// floor allows compact across any retained range.
-		if i < n-1 {
-			cappedAt = segCreatedAt.Add(gaps[i] - time.Minute)
+		// floor allows compact across any retained range. openLastSegment
+		// leaves the trailing segment uncapped (the idle-stop OPEN shape).
+		if i < n-1 || (i == n-1 && !opts.openLastSegment && stampless) {
+			cappedAt = segCreatedAt.Add(time.Hour)
+			if i < len(gaps) {
+				cappedAt = segCreatedAt.Add(gaps[i] - time.Minute)
+			}
 			segEntry.CappedAt = &cappedAt
 			segEntry.CapReason = rotationReasonAge
 		}
@@ -605,12 +843,5 @@ func seedTwoSegmentLineageWithCodecs(t *testing.T, store irbackup.Store, now tim
 	t.Helper()
 	seedSegmentsWithGapsOpts(t, store, now, []time.Duration{time.Hour}, segmentSeedOpts{
 		codecsPerSegment: []Codec{codecA, codecB},
-	})
-}
-
-func seedTwoSegmentLineageWithGap(t *testing.T, store irbackup.Store, now time.Time) {
-	t.Helper()
-	seedSegmentsWithGapsOpts(t, store, now, []time.Duration{time.Hour}, segmentSeedOpts{
-		gapBetweenBoundaries: true,
 	})
 }
