@@ -15,6 +15,7 @@ package pipeline
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"testing"
 	"time"
 
@@ -218,6 +219,63 @@ func waitForSourceSlot(t *testing.T, sourceDSN string, timeout time.Duration) {
 		time.Sleep(200 * time.Millisecond)
 	}
 	t.Fatalf("waitForSourceSlot: no sluice replication slot on the source after %s — cold-start never reached slot creation", timeout)
+}
+
+// waitForSourceSlotWatching is the self-diagnosing variant of
+// [waitForSourceSlot]. It is identical except it concurrently watches
+// the streamer's runErr channel and, on either an early Run return OR a
+// slot-creation timeout, dumps the captured streamer slog (logs) before
+// failing.
+//
+// Why this exists (three-phase protocol, Phase B for the AIMD
+// slot-creation flake, CI run 27324287473, 2026-06-11): the plain
+// waitForSourceSlot is a BLIND wait — it polls pg_replication_slots and
+// never consults runErr. When that run timed out at the full 120s, the
+// whole shard log contained ZERO lines for the aimd-integration stream
+// (the streamer's Run produced no `stream starting` line at all), so the
+// generic "cold-start never reached slot creation" message could not
+// distinguish a genuinely starved process from a Run that errored out
+// early — the diagnosis was discarded, exactly the trap e1c586d armed
+// for the bug15 warm-resume stall. This variant captures that diagnosis:
+// an early Run return fails immediately with the real error, and the
+// timeout path dumps the captured streamer log. Test-only; arms the trap
+// for the next firing instead of guessing a fix for a host-contention
+// flake that reproduces 0/12 in isolation (~2s, 60x under the gate).
+func waitForSourceSlotWatching(t *testing.T, sourceDSN string, timeout time.Duration, runErr <-chan error, logs fmt.Stringer) {
+	t.Helper()
+	db, err := sql.Open("pgx", sourceDSN)
+	if err != nil {
+		t.Fatalf("waitForSourceSlotWatching: open source: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		var n int
+		qErr := db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM pg_replication_slots WHERE slot_name LIKE 'sluice%'`).Scan(&n)
+		cancel()
+		if qErr == nil && n > 0 {
+			return
+		}
+		// Watch runErr concurrently: if Run returns BEFORE the slot
+		// appears, the cold-start failed (or exited) — surface its error
+		// + the captured streamer log immediately rather than sitting
+		// blind until the deadline and reporting the generic timeout.
+		select {
+		case rErr := <-runErr:
+			if logs != nil {
+				t.Logf("captured streamer log:\n%s", logs.String())
+			}
+			t.Fatalf("waitForSourceSlotWatching: streamer Run returned BEFORE slot creation: %v", rErr)
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	if logs != nil {
+		t.Logf("captured streamer log:\n%s", logs.String())
+	}
+	t.Fatalf("waitForSourceSlotWatching: no sluice replication slot on the source after %s — cold-start never reached slot creation (streamer Run still running; see captured log above for where it stalled)", timeout)
 }
 
 // readPersistedPosition reads the source_position column for streamID
