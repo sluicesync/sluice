@@ -185,39 +185,31 @@ Honest framing for evaluators choosing a *primary* backup strategy:
 
 ### MySQL-side fair fight (measured): sluice vs `mysqldump` vs `mydumper`
 
-A single MySQL → MySQL logical dump+reload of a 35.9 GB corpus (12 tables /
-6.72 M rows — 4 large ~8 GB + 8 medium; bigint PK, varchar, `decimal(18,6)`,
-`datetime(6)`, JSON, a 1–4 KB high-entropy TEXT payload, 3 secondary indexes
-per table). Source InnoDB buffer pool 18 GB (< corpus, so reads are
-disk-bound — production-realistic, not RAM-cached). Median of 2 timed backup
-runs after a discarded warm-up; restore into a freshly-dropped database. All
-three tools **zero-loss verified** (per-table rowcounts src==dst on all 12
-tables, `CHECKSUM TABLE … EXTENDED` byte-identical, a BIT_XOR-of-row-MD5 value
-digest matched). `voc-m-8c-64gb` (lax), container-to-container.
+A single MySQL → MySQL logical dump+reload of a **16.25 GB InnoDB corpus**
+(5 tables / 33.2 M rows; bigint PK, int, double, and an honest pseudo-random
+200–600-char alphanumeric TEXT payload — NOT `REPEAT()`-inflated, so the
+compression ratio is realistic). `mysql:8` (server 8.4.9),
+`innodb_buffer_pool_size=4G`, `local_infile=ON`. Steady warm value of 2 runs;
+restore into a freshly-dropped database. All four runs **zero-loss verified**
+(per-table rowcounts src==dst + `BIT_XOR(CRC32)` over all columns matched).
+`vhf-8c-32gb` (lax, 8 vCPU), container-to-container. The two sluice rows are
+the **same binary** (main incl. ADR-0088), the only variable the
+`--table-parallelism` flag — a clean isolation of ADR-0088's effect. (This
+supersedes an earlier serial-only measurement that used a compression-inflating
+synthetic corpus; the absolute numbers are not comparable across the two.)
 
 | Tool | Backup | Restore | Artifact | Ratio |
 |---|---|---|---|---|
-| **sluice** `backup full` → `restore` | 250.9 s | **145.0 s** | **8.42 GB** (zstd) | **4.26:1** |
-| `mysqldump --single-transaction` | 129.1 s | 460.6 s | 16.67 GB (.sql) | 2.15:1 |
-| `mydumper --threads 8` / `myloader -j8` | **18.4 s** | 95.6 s | 16.82 GB (raw) | 2.14:1 |
+| sluice `--table-parallelism=1` (serial, pre-ADR-0088 path) | 184 s | 404 s | 11.97 GB (zstd) | 1.36:1 |
+| **sluice `--table-parallelism=8` (ADR-0088 coordinated parallel)** | **70 s** | **179 s** | **11.97 GB** (zstd) | **1.36:1** |
+| `mysqldump --single-transaction` | 119 s | 591 s | 15.53 GB (.sql) | ~1.05:1 |
+| `mydumper --threads 8` / `myloader -j8` | **32 s** | **120 s** | 15.56 GB (raw) | ~1.05:1 |
 
 **The honest read:**
 
-- **mydumper wins raw dump+reload, decisively** (≈18 s dump vs sluice's ≈251 s).
-  The cause is structural and visible in sluice's own log: `cross-table parallel
-  reads not engaged; sweeping tables serially — source snapshot is not shareable
-  (per-session)`. MySQL's snapshot is per-session (unlike Postgres's shareable
-  snapshot — which is why the PG→PG `--table-parallelism` path above *does*
-  overlap table reads), so sluice's MySQL backup sweep is **serial**, and it also
-  pays zstd on every chunk. mydumper does neither — parallel uncompressed
-  per-table files. On the one job a purpose-built parallel dumper exists for, it
-  should win, and it does.
-- **sluice's restore is 3.2× faster than `mysqldump`'s** (145 s vs 461 s —
-  parallel apply, `table_parallelism=4`); single-threaded SQL replay is
-  `mysqldump`'s weak point. sluice's artifact is also **~2× smaller** (always-on
-  zstd) — and 4.26:1 here is *conservative*: the synthetic payload is
-  high-entropy, so real data compresses further, widening sluice's size lead over
-  the uncompressed dumpers.
+- **ADR-0088 made sluice's MySQL backup parallel — dump 2.63× / restore 2.26× faster** (184→70 s, 404→179 s on this corpus/box). The old "serial sweep — source snapshot is not shareable (per-session)" limitation is **closed**: under `--table-parallelism > 1` on a vanilla MySQL source, sluice opens N reader transactions whose consistent snapshots COINCIDE under a brief `FLUSH TABLES WITH READ LOCK` window (mydumper's own mechanism), so cross-table reads now overlap. It clamps to the table count (here 8 → 5 readers, exactly as `mydumper -t8` clamps to 5 threads), and falls back to the serial single-reader path — loudly — if the source role lacks `RELOAD`. (Engaged-path log: `opened coordinated parallel consistent view (FTWRL-aligned) readers=5`.) PlanetScale/Vitess sources are unaffected — they keep the separate VStream-COPY path.
+- **mydumper still wins the raw drag race** (32 s dump / 120 s restore) — a purpose-built parallel dumper writing uncompressed per-table files. But sluice now lands within ~2× on dump and ~1.5× on restore, with a **~23 % smaller** artifact (always-on zstd, 11.97 GB vs ~15.5 GB) and verified zero-loss. On the honest (high-entropy) payload the ratio is a realistic 1.36:1; structured/low-entropy data compresses further, widening sluice's size lead.
+- **sluice's restore is ~3.3× faster than `mysqldump`'s** (179 s vs 591 s — parallel apply, `table_parallelism`); single-threaded extended-INSERT replay is `mysqldump`'s weak point.
 - **The capability axes are the real differentiator, not the drag race.** On a
   single MySQL→MySQL full dump, mydumper is the faster way to copy bytes; sluice's
   value is the axes the single-purpose dumpers don't have at all: **incremental
