@@ -448,9 +448,25 @@ Two evidence rounds on v0.99.41-era main; profiles under `workspace/pprof-migrat
   (`innodb_flush_log_at_trx_commit=2` ≈ +5%). **No Go-side or parallelism lever
   moves this number; myloader faces the same wall.** Per-direction tracking +
   the full numbers: sluice-testing `THROUGHPUT.md` (#34).
-- Remaining measured frontiers worth future chunks: backup-path zstd (32% of
-  backup CPU post-codec) and the cross-engine typed-lane corpus differentials
-  (TOAST/bytea, very-wide, 10k-tiny-tables — also decides #56).
+- **10k-tiny-tables (decides #56, measured 2026-06-12 — sluice-testing
+  `workspace/perfC/VERDICTS.md`): sluice ≈13 ms/table vs pgcopydb ≈128 ms/table
+  on the same corpus — sluice is ~10× AHEAD on this shape**, so the tiny-table
+  batch lane is demand-gated, not perf-gated: do not build without a real user
+  hitting it. The future lever, should demand appear, is precise: ~80% of wall
+  is the serial CREATE TABLE phase (one network round-trip per table,
+  `internal/engines/postgres/schema_writer.go:288-296`, flat across
+  `--table-parallelism` which only governs bulk_copy) — a batch lane must
+  batch DDL statements per round-trip, not COPY.
+- **Wide-row typed lane (decides positional-`ir.Row`, audit P3 — same round):
+  do NOT schedule the XL rewrite.** On a 750k × ~4.2 KB/row MySQL→PG copy
+  (~200 MB/s, 8-way), the typed lane is 22.5% on-CPU and driver-dominated:
+  pgx binary COPY-encode 42%, read/scan ~30%, sluice-owned typed-lane ~15% of
+  which the `ir.Row` map cost (`copy_source.go:68` per-column lookup + value
+  boxing) is ~8-9%. A perfect positional rewrite addresses single-digit CPU —
+  far below the XL bar. Re-open only on separately-measured GC pressure at
+  high concurrency.
+- Remaining measured frontier worth a future chunk: backup-path zstd (32% of
+  backup CPU post-codec — level sweep / parallel chunk compression).
 
 ### Roadmap "Next up" items shipped
 
