@@ -42,6 +42,62 @@
 // engine-semantics rabbit hole orthogonal to op interleaving; NUMERIC
 // /DECIMAL covers the numeric family exactly).
 //
+// ---- Cross-engine convergence: a named wart ----
+//
+// The property runs in four directions: PG→PG, MySQL→MySQL (same
+// engine) and PG→MySQL, MySQL→PG (cross engine). A convDirection
+// carries the source AND target engine separately: the source engine
+// drives the DDL/literal/CDC dialect; the target engine drives the
+// canonical dump on the convergence side.
+//
+// Same-engine convergence compares source-dump == target-dump for
+// EXACT byte equality, because both sides render through the identical
+// server codec. Cross-engine CANNOT use byte equality: PG and MySQL
+// render the same logical value to different text (PG `boolean`→"true"
+// vs MySQL `tinyint(1)`→"1"; PG drops trailing-zero fractional seconds
+// while MySQL DATETIME(6) keeps them; bytea hex vs raw; array→JSON;
+// etc.). Asserting raw text-equality across engines would FAIL a
+// faithful sync — the v0.69.0 #16 false-positive-refusal class the
+// project forbids (see fuzzgen_oracle's Phase-1 scope note).
+//
+// Two design decisions contain this (both deliberately per-DIRECTION
+// so the same-engine directions keep their richer surface unchanged):
+//
+//  1. SAFE-TYPE SUBSET (cross-engine only). The cross-engine column
+//     type set is restricted to the families whose value round-trips
+//     and CANONICALISES identically on both engines per
+//     docs/value-types.md: int (BIGINT↔BIGINT, int64), text
+//     (VARCHAR↔VARCHAR, string), numeric (NUMERIC(12,4)↔DECIMAL(12,4),
+//     fixed-scale decimal string) and timestamp without time zone
+//     (TIMESTAMP(6)↔DATETIME(6), wall-clock, no tz ambiguity). BOOL is
+//     EXCLUDED cross-engine: PG `boolean::text` is "true"/"false" but
+//     MySQL `tinyint(1)` is "1"/"0" — a representational, not lossy,
+//     difference that no value-preserving canonicaliser should have to
+//     paper over. Binary-float stays excluded everywhere (as above).
+//     Same-engine keeps the full set INCLUDING bool. The subset lives
+//     on convDirection.familySet so the generator picks it per
+//     direction; convCrossEngineSafe is the single source of truth.
+//
+//  2. VALUE-SEMANTIC (not byte) COMPARE (cross-engine only). Each side
+//     is rendered to per-engine canonical text on the SERVER (the
+//     existing ::text / CAST AS CHAR dump), then a per-family Go-side
+//     normaliser (convCanonField) folds the two engines' residual
+//     spelling differences inside the safe set to ONE common form:
+//     numeric "-0.0000"→"0.0000" (PG keeps the sign bit on a zero
+//     magnitude; MySQL does not) and timestamp trailing-zero-fraction
+//     stripping ("…05.000000"→"…05", since PG drops an all-zero
+//     fractional part in ::text while MySQL DATETIME(6) renders the
+//     full six digits). int and text need no normalisation — their
+//     canonical text is already byte-identical across engines. The
+//     normalised dumps are then compared for EXACT equality, so the
+//     property is still "target == source's final ordered content",
+//     just measured in a cross-engine-canonical space rather than raw
+//     server text. Why normalise rather than widen the safe set with a
+//     richer SQL projection: the residual differences are few and
+//     value-preserving, and a Go-side normaliser is auditable in one
+//     place (convCanonField) instead of scattered across two dialect
+//     SELECTs.
+//
 // No build tag: pure logic, unit-tested by converge_gen_test.go.
 
 package pipeline
@@ -130,6 +186,56 @@ func (f convFamily) columnDDL(eng engineKind) string {
 	}
 	return ""
 }
+
+// convCrossEngineSafe reports whether a family canonicalises
+// identically across PG and MySQL and so may appear in a CROSS-engine
+// case (design decision #1 — see the header). The same-engine
+// directions use every family regardless. bool is the only family the
+// same-engine set carries that the cross-engine set drops (PG "true"
+// vs MySQL "1"); binary-float is excluded everywhere upstream of this.
+func convCrossEngineSafe(f convFamily) bool {
+	switch f {
+	case convFamInt, convFamText, convFamNumeric, convFamTimestamp:
+		return true
+	default:
+		return false
+	}
+}
+
+// convDirection is an ordered (source, target) engine pair. The source
+// engine drives DDL/literal/CDC dialect; the target engine drives the
+// convergence-side canonical dump. crossEngine() being true selects
+// the safe-type subset and the value-semantic (normalised) compare.
+type convDirection struct {
+	src, dst engineKind
+}
+
+func (d convDirection) String() string { return d.src.String() + "->" + d.dst.String() }
+
+func (d convDirection) crossEngine() bool { return d.src != d.dst }
+
+// families lists, in family order, the families this direction may
+// generate: the full set for same-engine, the cross-engine-safe subset
+// for cross-engine (design decision #1).
+func (d convDirection) families() []convFamily {
+	out := make([]convFamily, 0, convFamCount)
+	for f := convFamily(0); f < convFamCount; f++ {
+		if d.crossEngine() && !convCrossEngineSafe(f) {
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
+// convDirPGToPG and friends name the four directions the property
+// exercises.
+var (
+	convDirPGToPG       = convDirection{enginePG, enginePG}
+	convDirMySQLToMySQL = convDirection{engineMySQL, engineMySQL}
+	convDirPGToMySQL    = convDirection{enginePG, engineMySQL}
+	convDirMySQLToPG    = convDirection{engineMySQL, enginePG}
+)
 
 // convColumn is one generated non-PK column. The id BIGINT PK is
 // implicit on every table.
@@ -251,14 +357,20 @@ type convTx struct {
 	ops     []convOp
 }
 
-// convCase is one fully-drawn property case: the table shape, the
-// rows present before the stream attaches (delivered by bulk-copy),
-// the mid-stream transactions (delivered by CDC), and the applier
-// batch size the stream runs with. The case carries no table name —
-// rendering takes one as a parameter so the live harness can use a
-// per-check unique name while the determinism pin renders against a
+// convCase is one fully-drawn property case: the direction, the table
+// shape, the rows present before the stream attaches (delivered by
+// bulk-copy), the mid-stream transactions (delivered by CDC), and the
+// applier batch size the stream runs with. The case carries no table
+// name — rendering takes one as a parameter so the live harness can use
+// a per-check unique name while the determinism pin renders against a
 // fixed placeholder.
+//
+// eng is the SOURCE engine (dir.src): all literal/DDL rendering is
+// source-side. dir additionally carries the target engine and the
+// cross-engine flag, which the live harness uses to pick the
+// convergence-side dump dialect and the value-semantic compare.
 type convCase struct {
+	dir        convDirection
 	eng        engineKind
 	cols       []convColumn
 	initial    []convOp // insert ops applied before the stream starts
@@ -456,15 +568,18 @@ func convValueGen(f convFamily) *rapid.Generator[convValue] {
 	})
 }
 
-// convColsGen draws the table shape. Every family is ALWAYS present
-// at least once — pin the class, not the representative: the smoke
-// budget runs only a few checks, so per-family coverage must hold in
-// every check, not just in expectation. The randomness is in the
-// per-family column count (1..2) and the column order.
-func convColsGen() *rapid.Generator[[]convColumn] {
+// convColsGen draws the table shape for one direction. Every family in
+// the direction's family set is ALWAYS present at least once — pin the
+// class, not the representative: the smoke budget runs only a few
+// checks, so per-family coverage must hold in every check, not just in
+// expectation. For a cross-engine direction the set is the safe subset
+// (no bool); same-engine carries the full set. The randomness is in
+// the per-family column count (1..2) and the column order.
+func convColsGen(dir convDirection) *rapid.Generator[[]convColumn] {
+	fams := dir.families()
 	return rapid.Custom(func(t *rapid.T) []convColumn {
 		var cols []convColumn
-		for f := convFamily(0); f < convFamCount; f++ {
+		for _, f := range fams {
 			n := rapid.IntRange(1, 2).Draw(t, "ncols_"+f.String())
 			for i := 0; i < n; i++ {
 				cols = append(cols, convColumn{fam: f})
@@ -649,18 +764,19 @@ func convTxGen(t *rapid.T, label string, m *convModel, cols []convColumn) convTx
 	return tx
 }
 
-// convCaseGen builds the full random case for one source dialect.
-// maxTxs is the op budget (SLUICE_CONVERGE_OPS at the live harness;
-// fixed small constants in the unit pins — note a replay must use the
-// SAME budget, since it shapes the draw sequence). At least one
-// initial row is always drawn so the live harness can observe
-// bulk-copy completion via the target row count before it starts the
-// finite op burst.
-func convCaseGen(eng engineKind, maxTxs int) *rapid.Generator[convCase] {
+// convCaseGen builds the full random case for one direction. The
+// direction selects the source dialect (rendering) AND the column
+// family set (the cross-engine-safe subset vs the full set). maxTxs is
+// the op budget (SLUICE_CONVERGE_OPS at the live harness; fixed small
+// constants in the unit pins — note a replay must use the SAME budget,
+// since it shapes the draw sequence). At least one initial row is
+// always drawn so the live harness can observe bulk-copy completion
+// via the target row count before it starts the finite op burst.
+func convCaseGen(dir convDirection, maxTxs int) *rapid.Generator[convCase] {
 	return rapid.Custom(func(t *rapid.T) convCase {
-		cols := convColsGen().Draw(t, "cols")
+		cols := convColsGen(dir).Draw(t, "cols")
 		m := newConvModel()
-		c := convCase{eng: eng, cols: cols}
+		c := convCase{dir: dir, eng: dir.src, cols: cols}
 
 		nInit := rapid.IntRange(1, convMaxInitRows).Draw(t, "ninit")
 		for i := 0; i < nInit; i++ {
@@ -785,4 +901,69 @@ func (c *convCase) renderScript(table string) string {
 	return c.renderSetup(table) +
 		"-- >>> sluice sync stream attaches here <<<\n" +
 		c.renderOps(table)
+}
+
+// ---- cross-engine value-semantic canonicalisation (design #2) ----
+//
+// convCanonField folds the residual per-engine spelling differences of
+// ONE field (already server-rendered to canonical text via ::text /
+// CAST AS CHAR) inside the cross-engine-safe family set down to a
+// single common form, so two engines' dumps of the same logical value
+// compare EXACTLY equal. It is applied to BOTH the source and target
+// dump cross-engine; for same-engine the dumps already match byte for
+// byte and this is not used (the live harness keeps the exact-equality
+// path there). NULL is signalled by the caller (valid=false) and never
+// reaches here.
+//
+// Per family:
+//
+//   - int / text: no normalisation. BIGINT renders "123" on both
+//     engines; VARCHAR text content is identical.
+//   - numeric: strip a leading "-" when the magnitude is all zeros. PG
+//     `numeric` preserves the sign bit of a negative zero ("-0.0000")
+//     while MySQL `decimal` renders "0.0000"; the values are equal.
+//     Both engines already pad to the declared scale (4), so no scale
+//     normalisation is needed.
+//   - timestamp: strip a trailing all-zero fractional part (and the
+//     lone "."). PG `timestamp(6)::text` drops an all-zero fraction
+//     ("2020-01-02 03:04:05") whereas MySQL `DATETIME(6)` CAST renders
+//     the full six digits ("2020-01-02 03:04:05.000000"). A non-zero
+//     fraction renders identically (six digits) on both engines.
+func convCanonField(f convFamily, text string) string {
+	switch f {
+	case convFamNumeric:
+		return convCanonNumeric(text)
+	case convFamTimestamp:
+		return convCanonTimestamp(text)
+	default:
+		return text
+	}
+}
+
+// convCanonNumeric normalises "-0", "-0.0000" → "0", "0.0000": a
+// leading minus on an all-zero magnitude is dropped. Any non-zero
+// digit leaves the value untouched.
+func convCanonNumeric(text string) string {
+	if !strings.HasPrefix(text, "-") {
+		return text
+	}
+	if strings.ContainsAny(text[1:], "123456789") {
+		return text // genuinely non-zero negative
+	}
+	return text[1:] // all-zero magnitude — drop the sign
+}
+
+// convCanonTimestamp strips a trailing all-zero fractional-second part
+// so PG's "…05" and MySQL's "…05.000000" coincide. A non-zero fraction
+// is preserved verbatim.
+func convCanonTimestamp(text string) string {
+	dot := strings.LastIndexByte(text, '.')
+	if dot < 0 {
+		return text // no fractional part (PG form)
+	}
+	frac := text[dot+1:]
+	if strings.ContainsAny(frac, "123456789") {
+		return text // a real sub-second value — keep it
+	}
+	return text[:dot] // all-zero fraction — drop it and the dot
 }
