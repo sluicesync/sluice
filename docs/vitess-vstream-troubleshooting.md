@@ -39,6 +39,13 @@ refusing to resume. Each manifests differently.
 
 ## Causes you can do something about
 
+> **Measured (2026-06-13, default-config Vitess v24.0.1, lag metric / 5s threshold).** We drove realistic load against a primary+replica cluster and watched an external `sluice sync` for stalls. The findings, which should reset intuition:
+> - **The #1 real-world trigger is a *co-tenant* VReplication migration on the same keyspace, not your own write rate.** A routine `OnlineDDL ddl-strategy=vitess` ALTER on a ~1 M-row table drove shard lag **0 → 251 s** and held `vstreamer THRESHOLD_EXCEEDED` for the entire ~4-minute copy phase — **totally stalling an unrelated external sluice stream** the whole time. The migration's vreplication copy moves the *shared* shard-lag metric, which gates every other app (including your VStream). Migration size ≈ stall duration.
+> - **A second cause is a contended/under-resourced replica** (CPU/IO-starved) — lag climbs, the stream stalls.
+> - **Write-heavy primary *alone* does NOT trip the default lag throttler** on a healthy cluster — vttablet caps transaction concurrency before the replica can fall behind (we held ~900 tps + bulk binlog at ~1 s lag). So "my app got busy" is rarely the cause by itself.
+> - **vtgate/connection load doesn't move the lag metric** (a custom `threads_running` throttle *can* be configured to gate on concurrency, but it's not the default), and the **idle heartbeat-staleness artifact self-heals** the instant a stream leases on-demand heartbeats.
+> - **No data is ever lost** — every cleared throttle saw lag collapse and the target catch up within ~one poll; the stall is pure latency/availability. (Full quantified guide: roadmap item 19(d).)
+
 ### 1. Replica replication-lag on the chosen tablet
 
 `vstreamCDCReader` opens against `TabletType_REPLICA` (in

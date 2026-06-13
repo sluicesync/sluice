@@ -4,9 +4,24 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.99.43] - 2026-06-13
 
 ### Added
+- **MySQL `backup full`: coordinated parallel backup snapshot — ~2.6× faster
+  dump, ~2.3× faster restore (ADR-0088).** sluice's MySQL backup table sweep
+  was serial (one `START TRANSACTION WITH CONSISTENT SNAPSHOT` connection)
+  because MySQL — unlike Postgres — has no shareable *exported* snapshot to
+  lazily import onto parallel readers. It now opens N reader transactions
+  whose consistent snapshots **coincide** under a brief `FLUSH TABLES WITH
+  READ LOCK` window (mydumper's own mechanism), so `--table-parallelism > 1`
+  (default auto = 4) overlaps cross-table reads on a vanilla MySQL source.
+  Measured on a 16.25 GB / 33 M-row corpus: **dump 184 s → 70 s (2.63×),
+  restore 404 s → 179 s (2.26×)**, artifact unchanged. Cross-table
+  consistency and the anchored `EndPosition` are preserved (the N snapshots
+  are identical by construction). Falls back — loudly — to the serial
+  single-reader path when the source role lacks `RELOAD` (most managed
+  tiers); PlanetScale/Vitess sources are unaffected (they keep the
+  VStream-COPY path). See `docs/comparison-backup.md` for the fair-fight.
 - **MySQL/Vitess CDC: surface a throttled-or-idle VStream stall instead of
   hanging silently (observability; roadmap item 19(a)).** When a Vitess
   source's tablet throttler engages mid-stream, vtgate withholds ROW/change
@@ -26,6 +41,15 @@ project follows [Semantic Versioning](https://semver.org/).
   only; the hard liveness/progress guards are unaffected). The soft-window
   timer lives entirely in the single watchdog goroutine (the race-free
   pattern). Docs: `docs/vitess-vstream-troubleshooting.md` §2 + Detection.
+
+### Compatibility
+- **Drop-in from v0.99.42 — no format or breaking changes.** On a vanilla
+  MySQL `backup full`, `--table-parallelism > 1` (default auto = 4) now
+  engages the ADR-0088 coordinated FTWRL path instead of sweeping serially;
+  the artifact is byte-equivalent and the recorded position is unchanged.
+  The new `vstream_idle_warn_timeout` DSN param defaults to 30s (`0` disables
+  the idle WARN only). `migrate`, the Postgres paths, and cross-engine
+  behavior are untouched.
 
 ## [0.99.42] - 2026-06-13
 
