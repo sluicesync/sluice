@@ -1257,9 +1257,10 @@ func (f *fakeLivenessTimer) awaitStop(t *testing.T) {
 // from stream-open elapses and fires. THIS MUST NOT REGRESS.
 func TestVStreamLiveness_Phase1_FiresOnHeartbeatsOnly(t *testing.T) {
 	p1 := make(chan struct{}, 1)
-	live := startVStreamLiveness(context.Background(), 60*time.Millisecond, 500*time.Millisecond,
+	live := startVStreamLiveness(context.Background(), 60*time.Millisecond, 500*time.Millisecond, 0,
 		func() { p1 <- struct{}{} },
-		failingTimeout(t, "phase-2"))
+		failingTimeout(t, "phase-2"),
+		nil)
 	defer live.stop()
 
 	// Drip heartbeat-only observations faster than the Phase-1 window from
@@ -1294,9 +1295,10 @@ func TestVStreamLiveness_Phase1_FiresOnHeartbeatsOnly(t *testing.T) {
 // at all the Phase-1 callback still fires (the dead-from-open stream).
 func TestVStreamLiveness_Phase1_FiresOnNoEvent(t *testing.T) {
 	p1 := make(chan struct{}, 1)
-	live := startVStreamLiveness(context.Background(), 30*time.Millisecond, time.Second,
+	live := startVStreamLiveness(context.Background(), 30*time.Millisecond, time.Second, 0,
 		func() { p1 <- struct{}{} },
-		failingTimeout(t, "phase-2"))
+		failingTimeout(t, "phase-2"),
+		nil)
 	defer live.stop()
 	select {
 	case <-p1:
@@ -1314,9 +1316,10 @@ func TestVStreamLiveness_Phase1_FiresOnNoEvent(t *testing.T) {
 func TestVStreamLiveness_ServingProofTransitionsToPhase2(t *testing.T) {
 	ft := newFakeLivenessTimer()
 	p2 := make(chan struct{}, 1)
-	live := startVStreamLivenessWithTimer(context.Background(), time.Minute, time.Second,
+	live := startVStreamLivenessWithTimer(context.Background(), time.Minute, time.Second, 0,
 		failingTimeout(t, "phase-1"),
 		func() { p2 <- struct{}{} },
+		nil,
 		ft.factory())
 	defer live.stop()
 
@@ -1340,9 +1343,10 @@ func TestVStreamLiveness_Phase2_FiresOnTotalSilence(t *testing.T) {
 	// Real-clock fire test (kept deliberately: it exercises the real
 	// time.Timer integration). The Phase-1 window is an hour so a starved
 	// runner can't fire Phase 1 before the observe(true) below lands.
-	live := startVStreamLiveness(context.Background(), time.Hour, 40*time.Millisecond,
+	live := startVStreamLiveness(context.Background(), time.Hour, 40*time.Millisecond, 0,
 		failingTimeout(t, "phase-1"),
-		func() { p2 <- struct{}{} })
+		func() { p2 <- struct{}{} },
+		nil)
 	defer live.stop()
 	live.observe(true) // serving proven; now go silent
 	select {
@@ -1361,11 +1365,12 @@ func TestVStreamLiveness_Phase2_FiresOnTotalSilence(t *testing.T) {
 // fires it, so the failing callbacks guard against any spurious path.
 func TestVStreamLiveness_Phase2_HeartbeatsKeepAlive(t *testing.T) {
 	ft := newFakeLivenessTimer()
-	live := startVStreamLivenessWithTimer(context.Background(), time.Minute, time.Second,
+	live := startVStreamLivenessWithTimer(context.Background(), time.Minute, time.Second, 0,
 		failingTimeout(t, "phase-1"),
 		func() {
 			t.Error("Phase-2 fired despite heartbeats re-arming it — would false-time-out a healthy idle stream")
 		},
+		nil,
 		ft.factory())
 	defer live.stop()
 
@@ -1386,9 +1391,10 @@ func TestVStreamLiveness_Phase2_HeartbeatsKeepAlive(t *testing.T) {
 // now awaited explicitly — a deterministic count of 20.
 func TestVStreamLiveness_Phase2_ReArmsAcrossManyEvents(t *testing.T) {
 	ft := newFakeLivenessTimer()
-	live := startVStreamLivenessWithTimer(context.Background(), time.Minute, time.Second,
+	live := startVStreamLivenessWithTimer(context.Background(), time.Minute, time.Second, 0,
 		failingTimeout(t, "phase-1"),
 		func() { t.Error("Phase-2 fired despite continuous events re-arming it") },
+		nil,
 		ft.factory())
 	defer live.stop()
 
@@ -1406,9 +1412,10 @@ func TestVStreamLiveness_Phase2_ReArmsAcrossManyEvents(t *testing.T) {
 // the watchdog stays quiescent but keeps servicing observations.
 func TestVStreamLiveness_Phase2Disabled(t *testing.T) {
 	ft := newFakeLivenessTimer()
-	live := startVStreamLivenessWithTimer(context.Background(), time.Minute, 0,
+	live := startVStreamLivenessWithTimer(context.Background(), time.Minute, 0, 0,
 		failingTimeout(t, "phase-1"),
 		func() { t.Error("Phase-2 fired despite being disabled (progressWindow=0)") },
+		nil,
 		ft.factory())
 	defer live.stop()
 
@@ -1433,9 +1440,10 @@ func TestVStreamLiveness_Phase2Disabled(t *testing.T) {
 // disables the whole watchdog: no goroutine, no callback ever fires,
 // observe/stop are safe no-ops.
 func TestVStreamLiveness_DisabledWindow(t *testing.T) {
-	live := startVStreamLiveness(context.Background(), 0, time.Second,
+	live := startVStreamLiveness(context.Background(), 0, time.Second, 0,
 		failingTimeout(t, "phase-1"),
-		failingTimeout(t, "phase-2"))
+		failingTimeout(t, "phase-2"),
+		nil)
 	live.observe(true)
 	live.observe(false)
 	live.stop()
@@ -1451,9 +1459,10 @@ func TestVStreamLiveness_DisabledWindow(t *testing.T) {
 // be ready in the same select and the random pick fired the callback.
 func TestVStreamLiveness_StopBeforeFire(t *testing.T) {
 	ft := newFakeLivenessTimer()
-	live := startVStreamLivenessWithTimer(context.Background(), time.Minute, time.Minute,
+	live := startVStreamLivenessWithTimer(context.Background(), time.Minute, time.Minute, 0,
 		failingTimeout(t, "phase-1"),
 		failingTimeout(t, "phase-2"),
+		nil,
 		ft.factory())
 	live.stop()
 	ft.awaitStop(t) // the deferred timer.Stop ⇒ the goroutine has exited
@@ -1468,7 +1477,15 @@ func TestVStreamLiveness_StopBeforeFire(t *testing.T) {
 func TestVStreamLivenessTimeoutError_Actionable(t *testing.T) {
 	err := vstreamLivenessTimeoutError(30*time.Second, topodata.TabletType_REPLICA, "main", []string{"0"})
 	msg := err.Error()
-	for _, want := range []string{"no events within", "REPLICA", `"main"`, "vstream_tablet_type=primary"} {
+	// Both candidate causes must be named: the primary-only topology wedge
+	// AND the source-tablet throttler (item 19(a) change 1) — a Phase-1
+	// timeout can be either, and naming only topology mis-diagnoses a
+	// throttle as a missing tablet.
+	for _, want := range []string{
+		"no events within", "REPLICA", `"main"`,
+		"vstream_tablet_type=primary",
+		"throttler", "SHOW VITESS_THROTTLED_APPS",
+	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("error missing %q: %v", want, msg)
 		}
@@ -1484,6 +1501,187 @@ func TestVStreamProgressTimeoutError_Actionable(t *testing.T) {
 	for _, want := range []string{"no events for", "PRIMARY", `"main"`, "failover", "reparent"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("error missing %q: %v", want, msg)
+		}
+	}
+}
+
+// fakeTimerPair hands the watchdog two distinct fake timers via [factory]:
+// the FIRST newTimer call (the hard phase timer) gets hard, the SECOND (the
+// soft idle-WARN timer) gets soft. The existing single-fake [fakeLivenessTimer]
+// can't drive the soft-window tests because [vstreamLiveness.run] owns BOTH
+// timers and would otherwise alias them to one instance. The factory is
+// call-order-deterministic: run() always creates the hard timer first, then
+// (only if softEnabled) the soft timer.
+type fakeTimerPair struct {
+	hard *fakeLivenessTimer
+	soft *fakeLivenessTimer
+	n    int
+}
+
+func newFakeTimerPair() *fakeTimerPair {
+	return &fakeTimerPair{hard: newFakeLivenessTimer(), soft: newFakeLivenessTimer()}
+}
+
+func (p *fakeTimerPair) factory() func(time.Duration) livenessTimer {
+	return func(time.Duration) livenessTimer {
+		p.n++
+		if p.n == 1 {
+			return p.hard
+		}
+		return p.soft
+	}
+}
+
+// TestVStreamLiveness_SoftIdle_FiresOnceOnHeartbeatSpell pins item 19(a)
+// change 2: in Phase 2, a spell of heartbeat-only observations lets the
+// SOFT timer elapse and fires the idle WARN — and a heartbeat re-arms the
+// HARD timer (the stream stays alive) but does NOT re-arm the soft timer,
+// which is exactly why the spell is detectable. The WARN fires AT MOST ONCE
+// per spell (the latch): a second soft fire without an intervening real
+// event is swallowed.
+func TestVStreamLiveness_SoftIdle_FiresOnceOnHeartbeatSpell(t *testing.T) {
+	ft := newFakeTimerPair()
+	warns := make(chan struct{}, 8)
+	live := startVStreamLivenessWithTimer(context.Background(), time.Minute, time.Second, 100*time.Millisecond,
+		failingTimeout(t, "phase-1"),
+		failingTimeout(t, "phase-2"), // hard Phase-2 must NOT fire — soft is observability only
+		func() { warns <- struct{}{} },
+		ft.factory())
+	defer live.stop()
+
+	live.observe(true)                          // serving proof → Phase 2
+	ft.hard.awaitReset(t, time.Second)          // hard re-armed with phase2Window
+	ft.soft.awaitReset(t, 100*time.Millisecond) // soft armed on the transition
+
+	// Heartbeat-only: hard re-arms (stream alive), soft does NOT — this is
+	// the throttle/idle signature.
+	live.observe(false)
+	ft.hard.awaitReset(t, time.Second)
+	select {
+	case d := <-ft.soft.resets:
+		t.Fatalf("heartbeat-only re-armed the SOFT timer to %v; it must not — that would hide the idle spell", d)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Fire the soft timer: the WARN fires once.
+	ft.soft.fire <- time.Now()
+	select {
+	case <-warns:
+	case <-time.After(2 * time.Second):
+		t.Fatal("soft idle WARN did not fire on a heartbeat-only spell")
+	}
+
+	// A SECOND soft fire without an intervening real event is latched off.
+	ft.soft.fire <- time.Now()
+	select {
+	case <-warns:
+		t.Fatal("soft idle WARN fired twice in one quiet spell — the once-per-spell latch is broken")
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+// TestVStreamLiveness_SoftIdle_RealEventReArmsAndReLatches pins that a REAL
+// (non-heartbeat) event re-arms the soft timer AND clears the warn latch,
+// so a stream that resumes progress can WARN again on the NEXT idle spell.
+func TestVStreamLiveness_SoftIdle_RealEventReArmsAndReLatches(t *testing.T) {
+	ft := newFakeTimerPair()
+	warns := make(chan struct{}, 8)
+	live := startVStreamLivenessWithTimer(context.Background(), time.Minute, time.Second, 100*time.Millisecond,
+		failingTimeout(t, "phase-1"),
+		failingTimeout(t, "phase-2"),
+		func() { warns <- struct{}{} },
+		ft.factory())
+	defer live.stop()
+
+	live.observe(true) // Phase 2
+	ft.hard.awaitReset(t, time.Second)
+	ft.soft.awaitReset(t, 100*time.Millisecond)
+
+	// First spell → WARN.
+	ft.soft.fire <- time.Now()
+	<-warns
+
+	// A real event re-arms the soft timer and clears the latch.
+	live.observe(true)
+	ft.hard.awaitReset(t, time.Second)
+	ft.soft.awaitReset(t, 100*time.Millisecond)
+
+	// Second spell → WARN fires AGAIN (latch was cleared by the real event).
+	ft.soft.fire <- time.Now()
+	select {
+	case <-warns:
+	case <-time.After(2 * time.Second):
+		t.Fatal("soft idle WARN did not re-fire after a real event cleared the latch")
+	}
+}
+
+// TestVStreamLiveness_SoftIdle_NeverDuringPhase1 pins that the soft WARN is
+// strictly a Phase-2 concept: while Phase 1 is un-cleared the soft timer is
+// disarmed, and even a stale soft fire before serving is proven must not
+// warn (the phase2 guard in the soft-fire branch).
+func TestVStreamLiveness_SoftIdle_NeverDuringPhase1(t *testing.T) {
+	ft := newFakeTimerPair()
+	live := startVStreamLivenessWithTimer(context.Background(), time.Minute, time.Second, 100*time.Millisecond,
+		failingTimeout(t, "phase-1"),
+		failingTimeout(t, "phase-2"),
+		func() { t.Error("soft idle WARN fired during Phase 1 — it must be Phase-2 only") },
+		ft.factory())
+	defer live.stop()
+
+	// The soft timer is created then immediately Stop()ped (disarmed) at
+	// construction; pin that bare Stop landed and no arm/reset happened.
+	ft.soft.awaitStop(t)
+	select {
+	case d := <-ft.soft.resets:
+		t.Fatalf("soft timer was armed (%v) during Phase 1; it must stay disarmed until serving is proven", d)
+	default:
+	}
+
+	// A stale soft fire while still in Phase 1 must not reach the WARN.
+	ft.soft.fire <- time.Now()
+	live.observe(false) // heartbeat-only; still Phase 1, soft stays disarmed
+	time.Sleep(100 * time.Millisecond)
+}
+
+// TestVStreamLiveness_SoftIdle_DisabledByZeroWindow pins that softWindow<=0
+// disables the soft WARN entirely: no soft timer is ever created, and the
+// hard phases behave exactly as before. (Pinned via the fake: only ONE
+// timer — the hard one — is ever requested from the factory.)
+func TestVStreamLiveness_SoftIdle_DisabledByZeroWindow(t *testing.T) {
+	ft := newFakeTimerPair()
+	live := startVStreamLivenessWithTimer(context.Background(), time.Minute, time.Second, 0,
+		failingTimeout(t, "phase-1"),
+		failingTimeout(t, "phase-2"),
+		func() { t.Error("soft idle WARN fired with softWindow=0 — it must be disabled") },
+		ft.factory())
+	defer live.stop()
+
+	live.observe(true) // Phase 2
+	ft.hard.awaitReset(t, time.Second)
+
+	// The soft timer was never requested (factory call count stays 1).
+	if ft.n != 1 {
+		t.Fatalf("factory called %d times with softWindow=0; want exactly 1 (hard timer only)", ft.n)
+	}
+	// And the soft fake never saw any activity.
+	select {
+	case d := <-ft.soft.resets:
+		t.Fatalf("soft timer was armed (%v) with softWindow=0", d)
+	default:
+	}
+}
+
+// TestVStreamIdleWarnMessage_Actionable pins that the heads-up names the
+// keyspace, names BOTH causes (throttled or idle), and points at the
+// out-of-band primary check — the operator-facing contract for item 19(a).
+func TestVStreamIdleWarnMessage_Actionable(t *testing.T) {
+	msg := vstreamIdleWarnMessage(30*time.Second, "main", []string{"0"})
+	for _, want := range []string{
+		"heartbeats flowing", "NO change events", `"main"`,
+		"throttled", "idle", "SHOW VITESS_THROTTLED_APPS",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("idle-warn message missing %q: %v", want, msg)
 		}
 	}
 }

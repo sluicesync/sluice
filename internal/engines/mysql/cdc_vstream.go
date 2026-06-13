@@ -111,6 +111,14 @@ type vstreamCDCReader struct {
 	// vstream_progress_timeout DSN param; 0 disables Phase 2 only.
 	progressWindow time.Duration
 
+	// idleWarnWindow is the Phase-2 SOFT idle-WARN sub-window (item 19(a)):
+	// how long a proven stream may receive only heartbeats (no change
+	// events) before the watchdog emits a single rate-limited WARN per quiet
+	// spell — the throttle/idle heads-up. OBSERVABILITY ONLY; never fails
+	// the stream. From the vstream_idle_warn_timeout DSN param; 0 disables
+	// the soft WARN only.
+	idleWarnWindow time.Duration
+
 	// conn is the underlying gRPC client connection. Held for the
 	// reader's lifetime so multiple StreamChanges calls (currently
 	// disallowed; reserved for a future API change) would share it.
@@ -301,6 +309,11 @@ func openVStreamReader(ctx context.Context, dsn string, flavor Flavor) (ir.CDCRe
 		return nil, err
 	}
 
+	idleWarnWindow, err := vstreamIdleWarnWindowFromDSN(cfg)
+	if err != nil {
+		return nil, err
+	}
+
 	conn, err := grpc.NewClient(endpoint, dialOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("mysql/vstream: dial %s: %w", endpoint, err)
@@ -314,6 +327,7 @@ func openVStreamReader(ctx context.Context, dsn string, flavor Flavor) (ir.CDCRe
 		tabletType:     tabletType,
 		livenessWindow: livenessWindow,
 		progressWindow: progressWindow,
+		idleWarnWindow: idleWarnWindow,
 		conn:           conn,
 		client:         vtgateservice.NewVitessClient(conn),
 		fields:         make(map[string][]*query.Field),
@@ -752,7 +766,7 @@ func (r *vstreamCDCReader) pump(
 ) {
 	defer close(out)
 
-	live := startVStreamLiveness(ctx, r.livenessWindow, r.progressWindow,
+	live := startVStreamLiveness(ctx, r.livenessWindow, r.progressWindow, r.idleWarnWindow,
 		func() {
 			r.setErr(vstreamLivenessTimeoutError(r.livenessWindow, tabletType, r.keyspace, r.shards))
 			cancel()
@@ -760,6 +774,13 @@ func (r *vstreamCDCReader) pump(
 		func() {
 			r.setErr(vstreamProgressTimeoutError(r.progressWindow, tabletType, r.keyspace, r.shards))
 			cancel()
+		},
+		func() {
+			// SOFT idle-WARN (item 19(a)): heartbeats flowing but no change
+			// events for the soft window. OBSERVABILITY ONLY — do NOT setErr,
+			// do NOT cancel; the stream stays resilient and catches up when
+			// events resume.
+			slog.WarnContext(ctx, vstreamIdleWarnMessage(r.idleWarnWindow, r.keyspace, r.shards))
 		})
 	defer live.stop()
 

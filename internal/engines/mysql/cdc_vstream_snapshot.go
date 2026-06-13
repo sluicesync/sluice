@@ -162,6 +162,11 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 		_ = conn.Close()
 		return nil, err
 	}
+	idleWarnWindow, err := vstreamIdleWarnWindowFromDSN(cfg)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
 	client := vtgateservice.NewVitessClient(conn)
 
 	// The gRPC stream lives for the lifetime of the SnapshotStream:
@@ -236,6 +241,7 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 		livenessWindow:       livenessWindow,
 		progressWindow:       progressWindow,
 		copyProgressWindow:   copyProgressWindow,
+		idleWarnWindow:       idleWarnWindow,
 		conn:                 conn,
 		grpcStream:           grpcStream,
 		grpcCancel:           streamCancel,
@@ -367,6 +373,14 @@ type vstreamSnapshotStream struct {
 	// attach VGTID, which proves serving and arms Phase 2). From
 	// vstream_copy_progress_timeout; 0 disables Phase 2 on the COPY pump.
 	copyProgressWindow time.Duration
+
+	// idleWarnWindow is the Phase-2 SOFT idle-WARN sub-window (item 19(a))
+	// for BOTH pumps: how long a proven stream may receive only heartbeats
+	// (no change events) before the watchdog emits a single rate-limited
+	// WARN per quiet spell — the throttle/idle heads-up. OBSERVABILITY ONLY;
+	// never fails the stream. From vstream_idle_warn_timeout; 0 disables the
+	// soft WARN only.
+	idleWarnWindow time.Duration
 
 	// fields caches column metadata keyed by [fieldCacheKey]. Shared
 	// between COPY-phase row decoding and post-COPY change decoding —
@@ -596,7 +610,7 @@ func (s *vstreamSnapshotStream) copyPump(ctx context.Context, cancel context.Can
 	//
 	// Either fire cancels the stream so the parked Recv unblocks rather
 	// than hanging the cold-start forever.
-	live := startVStreamLiveness(ctx, s.livenessWindow, s.copyProgressWindow,
+	live := startVStreamLiveness(ctx, s.livenessWindow, s.copyProgressWindow, s.idleWarnWindow,
 		func() {
 			s.failCopy(vstreamLivenessTimeoutError(s.livenessWindow, topodata.TabletType_PRIMARY, s.keyspace, s.shards))
 			cancel()
@@ -604,6 +618,14 @@ func (s *vstreamSnapshotStream) copyPump(ctx context.Context, cancel context.Can
 		func() {
 			s.failCopy(vstreamProgressTimeoutError(s.copyProgressWindow, topodata.TabletType_PRIMARY, s.keyspace, s.shards))
 			cancel()
+		},
+		func() {
+			// SOFT idle-WARN (item 19(a)): heartbeats flowing but no change
+			// events for the soft window during COPY. OBSERVABILITY ONLY — do
+			// NOT failCopy, do NOT cancel; the COPY stays resilient. On the
+			// COPY pump this also flags a legitimately long warmup, which is
+			// harmless heads-up noise the operator can ignore.
+			slog.WarnContext(ctx, vstreamIdleWarnMessage(s.idleWarnWindow, s.keyspace, s.shards))
 		})
 	defer live.stop()
 
@@ -1229,7 +1251,7 @@ func (s *vstreamSnapshotStream) startPump(ctx context.Context) (<-chan ir.Change
 func (s *vstreamSnapshotStream) pump(ctx context.Context, out chan<- ir.Change) {
 	defer close(out)
 
-	live := startVStreamLiveness(ctx, s.livenessWindow, s.progressWindow,
+	live := startVStreamLiveness(ctx, s.livenessWindow, s.progressWindow, s.idleWarnWindow,
 		func() {
 			s.setErr(vstreamLivenessTimeoutError(s.livenessWindow, topodata.TabletType_PRIMARY, s.keyspace, s.shards))
 			s.cancelGRPCStream()
@@ -1237,6 +1259,13 @@ func (s *vstreamSnapshotStream) pump(ctx context.Context, out chan<- ir.Change) 
 		func() {
 			s.setErr(vstreamProgressTimeoutError(s.progressWindow, topodata.TabletType_PRIMARY, s.keyspace, s.shards))
 			s.cancelGRPCStream()
+		},
+		func() {
+			// SOFT idle-WARN (item 19(a)): heartbeats flowing but no change
+			// events for the soft window on the post-COPY CDC tail.
+			// OBSERVABILITY ONLY — do NOT setErr, do NOT cancel; the tail
+			// stays resilient and catches up when events resume.
+			slog.WarnContext(ctx, vstreamIdleWarnMessage(s.idleWarnWindow, s.keyspace, s.shards))
 		})
 	defer live.stop()
 
