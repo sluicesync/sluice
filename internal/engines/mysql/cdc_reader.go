@@ -1322,7 +1322,7 @@ func splitQualified(qn string) (schema, table string) {
 // the only thing the operator loses is a typed ir.Truncate event,
 // not correctness.
 func parseTruncateTable(query string) (schema, table string, ok bool) {
-	q := strings.TrimSpace(query)
+	q := strings.TrimSpace(stripLeadingSQLComments(query))
 	upper := strings.ToUpper(q)
 
 	const truncateKW = "TRUNCATE"
@@ -1380,6 +1380,61 @@ func parseTruncateTable(query string) (schema, table string, ok bool) {
 		return "", "", false
 	}
 	return schema, table, true
+}
+
+// stripLeadingSQLComments removes leading whitespace and SQL comments
+// from a statement so the keyword scan in [parseTruncateTable] sees the
+// actual command verb. MySQL preserves leading comments verbatim in the
+// binlog QUERY_EVENT body (only the trailing statement delimiter is
+// stripped), so a commented TRUNCATE arrives here with the comment
+// still attached — e.g. a hand-written migration `-- clear staging\n
+// TRUNCATE TABLE staging`, or an APM/ORM query tag `/* trace=… */
+// TRUNCATE …`. Without this strip the HasPrefix("TRUNCATE") check
+// fails, the statement falls through to generic DDL handling, and the
+// typed [ir.Truncate] is never emitted — the target silently retains
+// the rows the source truncated (Bug 140, a HIGH silent-divergence
+// regression the sync-convergence property surfaced on MySQL→MySQL).
+//
+// Recognised leading-comment forms (MySQL comment syntax):
+//
+//	-- to end of line   (the "--" must be followed by whitespace/EOL)
+//	#  to end of line
+//	/* … */             block comment
+//
+// Executable comments (`/*! …` version-gated, `/*+ …` optimizer hints)
+// are deliberately NOT stripped: removing them could discard
+// conditionally-executed SQL, and a statement led by one simply falls
+// through to generic DDL handling exactly as before — no typed event,
+// but no incorrectness. Trailing comments are likewise out of scope:
+// a TRUNCATE with a trailing comment fails the table-name parse and
+// falls through to a loud apply-side error, not the silent loss this
+// fixes.
+func stripLeadingSQLComments(q string) string {
+	for {
+		q = strings.TrimLeft(q, " \t\r\n\f\v")
+		switch {
+		case strings.HasPrefix(q, "--") && (len(q) == 2 || q[2] == ' ' || q[2] == '\t' || q[2] == '\r' || q[2] == '\n'):
+			i := strings.IndexAny(q, "\r\n")
+			if i < 0 {
+				return ""
+			}
+			q = q[i+1:]
+		case strings.HasPrefix(q, "#"):
+			i := strings.IndexAny(q, "\r\n")
+			if i < 0 {
+				return ""
+			}
+			q = q[i+1:]
+		case strings.HasPrefix(q, "/*") && !strings.HasPrefix(q, "/*!") && !strings.HasPrefix(q, "/*+"):
+			i := strings.Index(q[2:], "*/")
+			if i < 0 {
+				return "" // unterminated block comment — nothing usable follows
+			}
+			q = q[2+i+2:]
+		default:
+			return q
+		}
+	}
 }
 
 // splitTruncateRef splits a table reference on the first dot that
