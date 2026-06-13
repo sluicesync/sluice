@@ -183,8 +183,49 @@ Honest framing for evaluators choosing a *primary* backup strategy:
 - Many production setups reasonably run **both**: physical for DR of the
   primary, sluice chains for the cross-engine/off-vendor/compliance copy.
 
-Measured MySQL-side fair fights (`mysqldump`, `mydumper/myloader`) and the
-physical-tool throughput context are the comparison program's next phases.
+### MySQL-side fair fight (measured): sluice vs `mysqldump` vs `mydumper`
+
+A single MySQL → MySQL logical dump+reload of a 35.9 GB corpus (12 tables /
+6.72 M rows — 4 large ~8 GB + 8 medium; bigint PK, varchar, `decimal(18,6)`,
+`datetime(6)`, JSON, a 1–4 KB high-entropy TEXT payload, 3 secondary indexes
+per table). Source InnoDB buffer pool 18 GB (< corpus, so reads are
+disk-bound — production-realistic, not RAM-cached). Median of 2 timed backup
+runs after a discarded warm-up; restore into a freshly-dropped database. All
+three tools **zero-loss verified** (per-table rowcounts src==dst on all 12
+tables, `CHECKSUM TABLE … EXTENDED` byte-identical, a BIT_XOR-of-row-MD5 value
+digest matched). `voc-m-8c-64gb` (lax), container-to-container.
+
+| Tool | Backup | Restore | Artifact | Ratio |
+|---|---|---|---|---|
+| **sluice** `backup full` → `restore` | 250.9 s | **145.0 s** | **8.42 GB** (zstd) | **4.26:1** |
+| `mysqldump --single-transaction` | 129.1 s | 460.6 s | 16.67 GB (.sql) | 2.15:1 |
+| `mydumper --threads 8` / `myloader -j8` | **18.4 s** | 95.6 s | 16.82 GB (raw) | 2.14:1 |
+
+**The honest read:**
+
+- **mydumper wins raw dump+reload, decisively** (≈18 s dump vs sluice's ≈251 s).
+  The cause is structural and visible in sluice's own log: `cross-table parallel
+  reads not engaged; sweeping tables serially — source snapshot is not shareable
+  (per-session)`. MySQL's snapshot is per-session (unlike Postgres's shareable
+  snapshot — which is why the PG→PG `--table-parallelism` path above *does*
+  overlap table reads), so sluice's MySQL backup sweep is **serial**, and it also
+  pays zstd on every chunk. mydumper does neither — parallel uncompressed
+  per-table files. On the one job a purpose-built parallel dumper exists for, it
+  should win, and it does.
+- **sluice's restore is 3.2× faster than `mysqldump`'s** (145 s vs 461 s —
+  parallel apply, `table_parallelism=4`); single-threaded SQL replay is
+  `mysqldump`'s weak point. sluice's artifact is also **~2× smaller** (always-on
+  zstd) — and 4.26:1 here is *conservative*: the synthetic payload is
+  high-entropy, so real data compresses further, widening sluice's size lead over
+  the uncompressed dumpers.
+- **The capability axes are the real differentiator, not the drag race.** On a
+  single MySQL→MySQL full dump, mydumper is the faster way to copy bytes; sluice's
+  value is the axes the single-purpose dumpers don't have at all: **incremental
+  backup chains** (rolling stream + compaction vs re-dump-everything),
+  **cross-engine restore** (MySQL backup → Postgres target via the IR), **PII
+  redaction**, **envelope encryption** (AWS/GCP/Azure KMS), **off-vendor object
+  storage** (S3/GCS/Azure/MinIO/R2/B2), and chunk-level integrity verification.
+  mysqldump/mydumper are faster byte-copiers; sluice is a backup *system*.
 
 ## Methodology & caveats
 
@@ -205,10 +246,15 @@ physical-tool throughput context are the comparison program's next phases.
   loaded at cutoff. Backup-side outputs were not separately
   checksum-verified against the source in this round (the migrate-path
   benchmarks and the chain integration suite carry the zero-loss pins).
+- The MySQL fair-fight section above (sluice vs mysqldump vs mydumper, phase 2)
+  was measured on a separate `voc-m-8c-64gb` lax box (8 vCPU / 64 GB / NVMe,
+  container-to-container, 35.9 GB corpus, source pool 18 GB < corpus); its
+  absolute seconds are box-specific — the durable signal is the tool ratios.
 - Not measured here: `--follow`-style continuous sync (different surface,
   see `comparison-bucardo.md`), encrypted-chain overhead, S3-target
-  throughput, mydumper/mysqldump (phase 2), physical tools (phase 3),
-  vtbackup (phase 4).
+  throughput, and the physical tools (pgBackRest / WAL-G / vtbackup — phases
+  3/4) which are positioned qualitatively above rather than raced (different
+  category — physical bytes, not logical rows).
 
 See also: [`comparison-pgcopydb.md`](comparison-pgcopydb.md) (the bulk-copy
 fair fight on the same corpus), [`backup-format-versioning.md`](backup-format-versioning.md)
