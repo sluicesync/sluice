@@ -318,12 +318,42 @@ func TestConvergeGen_CrossEngineCanonField(t *testing.T) {
 		{"numeric small negative", convFamNumeric, "-0.0001", "-0.0001"},
 		{"ts no-frac (PG form)", convFamTimestamp, "2020-01-02 03:04:05", "2020-01-02 03:04:05"},
 		{"ts zero-frac (MySQL form)", convFamTimestamp, "2020-01-02 03:04:05.000000", "2020-01-02 03:04:05"},
-		{"ts real frac kept", convFamTimestamp, "2020-01-02 03:04:05.000006", "2020-01-02 03:04:05.000006"},
-		{"ts real frac trailing zeros kept", convFamTimestamp, "2020-01-02 03:04:05.100000", "2020-01-02 03:04:05.100000"},
+		{"ts full-precision frac kept", convFamTimestamp, "2020-01-02 03:04:05.000006", "2020-01-02 03:04:05.000006"},
+		// Partial fractions: MySQL DATETIME(6) renders six digits, PG
+		// ::text trims trailing zeros. The fold must match PG (strip
+		// trailing zeros), NOT keep MySQL's padding — otherwise PG's
+		// "…05.1" and MySQL's "…05.100000" stay divergent and a faithful
+		// sync of microsecond 100000 spuriously fails to converge.
+		{"ts trailing-zero frac (MySQL form) folds to PG", convFamTimestamp, "2020-01-02 03:04:05.100000", "2020-01-02 03:04:05.1"},
+		{"ts already-trimmed frac (PG form) is stable", convFamTimestamp, "2020-01-02 03:04:05.1", "2020-01-02 03:04:05.1"},
+		{"ts mid trailing zeros (MySQL form)", convFamTimestamp, "2020-01-02 03:04:05.123000", "2020-01-02 03:04:05.123"},
 	}
 	for _, c := range cases {
 		if got := convCanonField(c.fam, c.in); got != c.want {
 			t.Errorf("%s: convCanonField(%s, %q) = %q; want %q", c.name, c.fam, c.in, got, c.want)
+		}
+	}
+
+	// The cross-engine invariant the fold exists to guarantee: a value's
+	// PG canonical text and its MySQL canonical text must normalise to
+	// the SAME string, for every shape in the safe set. (Pinning the two
+	// dialects' renderings of one logical microsecond value side by side
+	// — the gap the "keep trailing zeros" form missed.)
+	crossPairs := []struct {
+		name           string
+		fam            convFamily
+		pgText, myText string
+	}{
+		{"ts microsecond 100000", convFamTimestamp, "2020-01-02 03:04:05.1", "2020-01-02 03:04:05.100000"},
+		{"ts microsecond 6", convFamTimestamp, "2020-01-02 03:04:05.000006", "2020-01-02 03:04:05.000006"},
+		{"ts integer second", convFamTimestamp, "2020-01-02 03:04:05", "2020-01-02 03:04:05.000000"},
+		{"numeric neg zero", convFamNumeric, "-0.0000", "0.0000"},
+		{"numeric value", convFamNumeric, "12.3400", "12.3400"},
+	}
+	for _, c := range crossPairs {
+		pg, my := convCanonField(c.fam, c.pgText), convCanonField(c.fam, c.myText)
+		if pg != my {
+			t.Errorf("%s: cross-engine fold mismatch: PG %q→%q vs MySQL %q→%q", c.name, c.pgText, pg, c.myText, my)
 		}
 	}
 

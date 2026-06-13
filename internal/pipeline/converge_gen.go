@@ -85,9 +85,10 @@
 //     spelling differences inside the safe set to ONE common form:
 //     numeric "-0.0000"→"0.0000" (PG keeps the sign bit on a zero
 //     magnitude; MySQL does not) and timestamp trailing-zero-fraction
-//     stripping ("…05.000000"→"…05", since PG drops an all-zero
-//     fractional part in ::text while MySQL DATETIME(6) renders the
-//     full six digits). int and text need no normalisation — their
+//     stripping ("…05.000000"→"…05", "…05.100000"→"…05.1", since PG
+//     renders the minimal fraction in ::text — all-zero disappears,
+//     partial drops trailing zeros — while MySQL DATETIME(6) always
+//     renders the full six digits). int and text need no normalisation — their
 //     canonical text is already byte-identical across engines. The
 //     normalised dumps are then compared for EXACT equality, so the
 //     property is still "target == source's final ordered content",
@@ -924,11 +925,17 @@ func (c *convCase) renderScript(table string) string {
 //     while MySQL `decimal` renders "0.0000"; the values are equal.
 //     Both engines already pad to the declared scale (4), so no scale
 //     normalisation is needed.
-//   - timestamp: strip a trailing all-zero fractional part (and the
-//     lone "."). PG `timestamp(6)::text` drops an all-zero fraction
-//     ("2020-01-02 03:04:05") whereas MySQL `DATETIME(6)` CAST renders
-//     the full six digits ("2020-01-02 03:04:05.000000"). A non-zero
-//     fraction renders identically (six digits) on both engines.
+//   - timestamp: strip ALL trailing zeros from the fractional part
+//     (and the lone "." when the whole fraction was zero), folding both
+//     engines to PG's form. PG `timestamp(6)::text` renders the minimal
+//     fraction — an all-zero fraction disappears ("…05"), and a partial
+//     one drops its trailing zeros (".100000"→".1", ".123000"→".123") —
+//     whereas MySQL `DATETIME(6)` CAST always renders the full six
+//     digits ("…05.000000", "…05.100000"). Stripping trailing zeros on
+//     both sides makes them coincide. (The earlier "all-zero only" form
+//     was wrong: it left ".100000" vs ".1" divergent, so a faithful
+//     cross-engine sync of a sub-second value ending in a zero — e.g.
+//     microsecond 100000 — would spuriously fail to "converge".)
 func convCanonField(f convFamily, text string) string {
 	switch f {
 	case convFamNumeric:
@@ -953,17 +960,21 @@ func convCanonNumeric(text string) string {
 	return text[1:] // all-zero magnitude — drop the sign
 }
 
-// convCanonTimestamp strips a trailing all-zero fractional-second part
-// so PG's "…05" and MySQL's "…05.000000" coincide. A non-zero fraction
-// is preserved verbatim.
+// convCanonTimestamp strips ALL trailing zeros from the fractional-
+// second part, folding both engines to PG's minimal rendering: PG's
+// "…05" / "…05.1" and MySQL's "…05.000000" / "…05.100000" coincide.
+// MySQL `DATETIME(6)` always renders six fractional digits; PG
+// `timestamp(6)::text` trims trailing zeros (and the whole fraction
+// when it is all zero), so the fold must match PG, not merely drop the
+// all-zero case.
 func convCanonTimestamp(text string) string {
 	dot := strings.LastIndexByte(text, '.')
 	if dot < 0 {
-		return text // no fractional part (PG form)
+		return text // no fractional part (PG integer-second form)
 	}
-	frac := text[dot+1:]
-	if strings.ContainsAny(frac, "123456789") {
-		return text // a real sub-second value — keep it
+	frac := strings.TrimRight(text[dot+1:], "0")
+	if frac == "" {
+		return text[:dot] // all-zero fraction — drop it and the dot
 	}
-	return text[:dot] // all-zero fraction — drop it and the dot
+	return text[:dot+1] + frac // partial fraction — trailing zeros trimmed
 }
