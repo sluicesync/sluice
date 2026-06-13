@@ -72,31 +72,42 @@ import (
 // [coldStartDispatchObserver].
 var backupDispatchObserver func(tableParallelism int, reason string)
 
-// backupParallelEligible is the ADR-0084 capability gate: it decides
-// whether the backup row sweep may fan out across tables. It returns
-// (true, "") only when EVERY precondition holds; otherwise
+// backupParallelEligible is the ADR-0084 / ADR-0088 capability gate: it
+// decides whether the backup row sweep may fan out across tables. It
+// returns (true, "") only when the parallelism request holds AND the
+// snapshot supplies a way to read N tables concurrently; otherwise
 // (false, reason) where reason is a single operator-facing clause for
 // the loud INFO log. Mirrors [coldStartFastEligible] (ADR-0079) —
 // presence-driven, never an engine-name string.
 //
-// The three predicates, in order:
-//   - snapshotName != "" — the source surfaced a SHAREABLE exported
-//     snapshot (Postgres does; MySQL and the v0.17.x non-snapshot
-//     fallback leave it empty).
-//   - source implements [ir.SnapshotImporterOpener] — the engine can
-//     mint additional readers pinned to that snapshot.
-//   - tableParallelism > 1 — the operator didn't ask for serial.
+// Two ways the snapshot can supply parallel readers, EITHER suffices:
+//   - LAZY (Postgres, ADR-0084): a SHAREABLE exported snapshot
+//     (snap.SnapshotName != "") plus a source that implements
+//     [ir.SnapshotImporterOpener] to mint additional readers pinned to
+//     it. The v0.17.x non-snapshot fallback has neither.
+//   - EAGER (MySQL vanilla, ADR-0088): the snapshot already opened N
+//     coincident readers under a FTWRL window and handed back the
+//     extras on snap.ExtraReaders. FTWRL-denied / serial MySQL leaves
+//     it empty.
 //
-// Pure and table-unit-testable: no I/O, no state mutation.
-func backupParallelEligible(snapshotName string, source ir.Engine, tableParallelism int) (ok bool, reason string) {
+// tableParallelism > 1 is always required (the operator didn't ask for
+// serial). Pure and table-unit-testable: no I/O, no state mutation.
+func backupParallelEligible(snap *irbackup.Snapshot, source ir.Engine, tableParallelism int) (ok bool, reason string) {
+	if tableParallelism <= 1 {
+		return false, "cross-table parallelism disabled (--table-parallelism=1)"
+	}
+	if snap != nil && len(snap.ExtraReaders) > 0 {
+		return true, "" // eager coordinated readers (MySQL FTWRL-aligned)
+	}
+	snapshotName := ""
+	if snap != nil {
+		snapshotName = snap.SnapshotName
+	}
 	if snapshotName == "" {
 		return false, "source snapshot is not shareable (per-session / single-stream / non-snapshot fallback)"
 	}
 	if _, ok := source.(ir.SnapshotImporterOpener); !ok {
 		return false, "source engine has no snapshot importer"
-	}
-	if tableParallelism <= 1 {
-		return false, "cross-table parallelism disabled (--table-parallelism=1)"
 	}
 	return true, ""
 }
@@ -125,11 +136,16 @@ type backupReaderFactory func(ctx context.Context) (ir.RowReader, error)
 // turn).
 //
 // primary is the orchestrator's already-open reader (the snapshot's
-// pinned conn, or the v0.17.x fallback reader) — the "free reader".
-// Exactly one running table uses it at a time (claimed via a 1-slot
-// channel); peers mint their own via factory and close it when done.
-// The free reader is NOT closed here (the caller owns its lifecycle
-// through the deferred snapshot/reader cleanup).
+// pinned conn, or the v0.17.x fallback reader). peers are the EAGER
+// pre-opened coordinated readers (MySQL ADR-0088; nil for the PG lazy
+// path and the serial/fallback paths). primary + peers form a reusable
+// free-reader pool: a running table claims one (non-blocking) and
+// returns it on completion; a table that finds the pool empty mints its
+// own via factory (the PG lazy importer path) and closes it when done.
+// None of the seeded readers (primary or peers) are closed here — the
+// caller owns their lifecycle through the deferred snapshot cleanup
+// (for MySQL coordinated, the snapshot's CloseFn commits/closes every
+// reader conn exactly once).
 //
 // The errgroup's derived ctx cancels on the first table's error so
 // peers unwind promptly; tg.Wait returns the first error.
@@ -137,6 +153,7 @@ func (b *Backup) runBackupTablePool(
 	ctx context.Context,
 	tasks []backupTableTask,
 	primary ir.RowReader,
+	peers []ir.RowReader,
 	factory backupReaderFactory,
 	tableParallelism int,
 	chunkRows int,
@@ -148,14 +165,18 @@ func (b *Backup) runBackupTablePool(
 		limit = 1
 	}
 
-	// freeReader is a 1-slot pool holding the orchestrator's pinned
-	// reader. A table goroutine tries a non-blocking receive; the winner
-	// reuses the free reader (and returns it on completion so a later
-	// table can claim it), every other concurrent table mints its own.
-	// This mirrors the migrate pool's free-pair channel at the
-	// reader-only granularity backups need (no writer side).
-	freeReader := make(chan ir.RowReader, 1)
+	// freeReader is the reusable reader pool: the orchestrator's pinned
+	// primary plus any eager pre-opened peers (MySQL coordinated). A
+	// table goroutine tries a non-blocking receive; the winner reuses the
+	// reader (and returns it on completion so a later table can claim
+	// it), every other concurrent table mints its own via factory (PG
+	// lazy importer). This mirrors the migrate pool's free-pair channel at
+	// the reader-only granularity backups need (no writer side).
+	freeReader := make(chan ir.RowReader, 1+len(peers))
 	freeReader <- primary
+	for _, p := range peers {
+		freeReader <- p
+	}
 
 	tg, tctx := errgroup.WithContext(ctx)
 	tg.SetLimit(limit)
@@ -178,14 +199,15 @@ func (b *Backup) runBackupTablePool(
 
 // acquireBackupReader returns the reader a table goroutine should
 // stream through, plus a release function the caller defers. It first
-// tries to claim the free reader (non-blocking); if another table
-// already holds it, it mints a dedicated snapshot-pinned reader via
-// factory.
+// tries to claim a reader from the free-reader pool (non-blocking); if
+// every pooled reader is in use, it mints a dedicated snapshot-pinned
+// reader via factory (the PG lazy importer path).
 //
-// The release function returns the free reader to the pool (so a later
-// table can reuse it) or closes a dedicated one. It never closes the
-// free reader — the orchestrator owns that lifecycle. Mirrors
-// [acquireTablePair].
+// The release function returns a pooled reader to the pool (so a later
+// table can reuse it) or closes a dedicated minted one. It never closes
+// a pooled reader — the orchestrator owns those lifecycles (the MySQL
+// coordinated readers and the primary are committed/closed exactly once
+// by the snapshot's CloseFn). Mirrors [acquireTablePair].
 func acquireBackupReader(
 	ctx context.Context,
 	freeReader chan ir.RowReader,
@@ -193,13 +215,17 @@ func acquireBackupReader(
 ) (ir.RowReader, func(), error) {
 	select {
 	case r := <-freeReader:
-		// Won the free reader; return it to the pool on release.
+		// Won a pooled reader; return it to the pool on release.
 		return r, func() { freeReader <- r }, nil
 	default:
-		// Free reader is in use by a peer table; mint a dedicated one.
+		// Every pooled reader is in use by a peer table; mint a dedicated
+		// one (PG lazy importer). For the serial path (limit 1) and the
+		// MySQL eager path (pool sized to limit) this branch is
+		// unreachable — the pool always has a free reader.
 		if factory == nil {
 			// Unreachable: a nil factory means the pool runs serial
-			// (limit 1), where the free reader is always available. Loud
+			// (limit 1) or all readers are pooled (MySQL eager); a free
+			// reader is always available. Loud
 			// rather than a silent nil-func call.
 			return nil, func() {}, errBackupPoolNoFactory
 		}
@@ -278,53 +304,42 @@ func (b *Backup) stageBackupTables(
 	return tasks, nil
 }
 
-// resolveBackupTableParallelism resolves the effective cross-table
-// fan-out for the row sweep: the operator's requested value (0 = auto
-// = 4, [resolveTableParallelism]) gated by [backupParallelEligible]
-// and bounded by the SOURCE's measured connection budget. Not-eligible
-// (or ≤1 tables to sweep) collapses to 1 — the same pool runs serial —
-// with a loud INFO naming the reason (the ADR-0079 disposition: a
-// silent fallback would leave operators wondering why the knob did
-// nothing).
+// resolveRequestedReaderParallelism is the pre-snapshot-open half of
+// the parallelism resolution (ADR-0088): the operator's requested
+// value (0 = auto = 4, [resolveTableParallelism]) bounded by the table
+// count and by the SOURCE's measured connection budget — but WITHOUT
+// the [backupParallelEligible] gate and WITHOUT firing the dispatch
+// observer. The orchestrator calls it before the snapshot opens so an
+// engine that opens coincident readers eagerly (MySQL vanilla, under a
+// FTWRL window) knows how many readers to open; the gated, observed
+// decision is made post-staging by [resolveBackupTableParallelism].
 //
 // The budget chokepoint reuses [resolveTargetCopyParallelism] against
 // the SOURCE DSN (backups open reader connections there; the prober is
-// engine-optional — MySQL never reaches this, its gate fails first),
-// then RESERVES one slot for the snapshot's slot-creation replication
-// conn, which stays open for the whole sweep (the ADR-0079 CDC-conn
-// reservation pattern).
-func (b *Backup) resolveBackupTableParallelism(ctx context.Context, snapshotName string, taskCount int) (int, error) {
+// engine-optional — MySQL has none, so its request stands unbounded by
+// this step, and the coordinator+N-reader bound is the operator's
+// request itself), then RESERVES one slot for the coordinator /
+// slot-creation conn that stays open during the open window (the
+// ADR-0079 CDC-conn reservation pattern).
+func (b *Backup) resolveRequestedReaderParallelism(ctx context.Context, taskCount int) (int, error) {
 	requested := resolveTableParallelism(b.TableParallelism)
 	if requested > taskCount {
 		requested = taskCount // never fan out wider than there are tables to sweep
 	}
-	ok, reason := backupParallelEligible(snapshotName, b.Source, requested)
-	if !ok {
-		if taskCount <= 1 {
-			reason = "at most one table to sweep"
-		}
-		slog.InfoContext(
-			ctx, "backup: cross-table parallel reads not engaged; sweeping tables serially",
-			slog.String("reason", reason),
-			slog.Int("requested_table_parallelism", requested),
-		)
-		if backupDispatchObserver != nil {
-			backupDispatchObserver(1, reason)
-		}
-		return 1, nil
+	if requested <= 1 {
+		return requested, nil
 	}
-
 	effective, report, err := resolveTargetCopyParallelism(ctx, b.Source, b.SourceDSN, requested, 0)
 	if err != nil {
 		return 0, err
 	}
 	if report.CopyBudget >= 1 {
-		budget := report.CopyBudget - 1 // reserve the replication conn's slot
+		budget := report.CopyBudget - 1 // reserve the coordinator/repl conn's slot
 		if budget < 1 {
-			// A budget of exactly 1 left only the repl-conn slot; the
-			// sweep still needs at least one reader. Floor at 1 — the
-			// loud refusal in resolveTargetCopyParallelism already fired
-			// if the source had truly zero free slots.
+			// A budget of exactly 1 left only the reserved slot; the sweep
+			// still needs at least one reader. Floor at 1 — the loud
+			// refusal in resolveTargetCopyParallelism already fired if the
+			// source had truly zero free slots.
 			budget = 1
 		}
 		if effective > budget {
@@ -334,10 +349,52 @@ func (b *Backup) resolveBackupTableParallelism(ctx context.Context, snapshotName
 	if effective < 1 {
 		effective = 1
 	}
+	return effective, nil
+}
+
+// resolveBackupTableParallelism resolves the EFFECTIVE cross-table
+// fan-out for the row sweep, post-staging: the requested value
+// ([resolveRequestedReaderParallelism]) gated by
+// [backupParallelEligible] against the actual snapshot. Not-eligible
+// (or ≤1 tables to sweep) collapses to 1 — the same pool runs serial —
+// with a loud INFO naming the reason (the ADR-0079 disposition: a
+// silent fallback would leave operators wondering why the knob did
+// nothing). The dispatch observer (test seam) fires with the decision.
+//
+// For the EAGER MySQL path the snapshot has already opened
+// len(snap.ExtraReaders)+1 readers at the requested count, so the
+// effective value here is bounded by what was opened — it never
+// exceeds 1+len(ExtraReaders) because both were derived from the same
+// requested number bounded by the (≥ this run's) schema table count.
+func (b *Backup) resolveBackupTableParallelism(ctx context.Context, snap *irbackup.Snapshot, taskCount int) (int, error) {
+	effective, err := b.resolveRequestedReaderParallelism(ctx, taskCount)
+	if err != nil {
+		return 0, err
+	}
+	ok, reason := backupParallelEligible(snap, b.Source, effective)
+	if !ok {
+		if taskCount <= 1 {
+			reason = "at most one table to sweep"
+		}
+		slog.InfoContext(
+			ctx, "backup: cross-table parallel reads not engaged; sweeping tables serially",
+			slog.String("reason", reason),
+			slog.Int("requested_table_parallelism", effective),
+		)
+		if backupDispatchObserver != nil {
+			backupDispatchObserver(1, reason)
+		}
+		return 1, nil
+	}
+	// Never fan out wider than the eager readers actually opened (the
+	// gate proved at least 1 extra when SnapshotName is empty).
+	if snap != nil && len(snap.ExtraReaders) > 0 && effective > len(snap.ExtraReaders)+1 {
+		effective = len(snap.ExtraReaders) + 1
+	}
 	slog.InfoContext(
-		ctx, "backup: cross-table parallel reads engaged (ADR-0084)",
+		ctx, "backup: cross-table parallel reads engaged (ADR-0084/ADR-0088)",
 		slog.Int("table_parallelism", effective),
-		slog.String("snapshot", snapshotName),
+		slog.Bool("eager_readers", snap != nil && len(snap.ExtraReaders) > 0),
 	)
 	if backupDispatchObserver != nil {
 		backupDispatchObserver(effective, "")
@@ -345,29 +402,38 @@ func (b *Backup) resolveBackupTableParallelism(ctx context.Context, snapshotName
 	return effective, nil
 }
 
-// openBackupReaderFactory opens the source's [ir.SnapshotImporter] and
-// returns a [backupReaderFactory] that mints one snapshot-pinned
-// reader per call, plus a cleanup closing the importer once the pool
-// has drained (the minted readers are closed individually by the
-// pool's release path). The factory is the ADR-0079 shape: every
-// reader runs `SET TRANSACTION SNAPSHOT '<name>'` inside its own
-// REPEATABLE READ tx, so it observes the EXACT view the snapshot's
-// pinned primary reader does — valid for as long as the slot-creation
-// replication conn lives (closed by the orchestrator's deferred
-// snapshot cleanup, after the pool).
+// openBackupReaderFactory returns a [backupReaderFactory] that mints
+// one ADDITIONAL peer reader per call, plus a cleanup the orchestrator
+// defers. It is the LAZY (Postgres, ADR-0084) path only: the EAGER
+// (MySQL vanilla, ADR-0088) path opens its peers up front under the
+// FTWRL window and the orchestrator seeds them straight into the pool's
+// reusable free-reader channel (see [Backup.runBackupTablePool]'s peers
+// argument), so this returns a nil factory for it — there is nothing to
+// mint on demand.
 //
-// Importer-minted readers are single-schema, bound to the DSN's
-// schema — the SAME binding the snapshot's primary reader carries
-// (`&RowReader{q: conn, schema: cfg.schema}`), so the parallel sweep
-// reads exactly what the serial sweep would.
+// LAZY shape: open the source's [ir.SnapshotImporter] and mint one
+// reader per call via `SET TRANSACTION SNAPSHOT '<name>'` in its own
+// REPEATABLE READ tx (the ADR-0079 shape) — same view as the snapshot's
+// primary, valid as long as the slot-creation conn lives. Each minted
+// reader is owned by the pool and closed on its release path. The minted
+// reader is single-schema, bound to the DSN's schema — the SAME binding
+// the primary reader carries — so the parallel sweep reads exactly what
+// the serial sweep would.
 //
-// tableParallelism <= 1 returns a nil factory with a no-op cleanup:
-// the serial pool's single worker always wins the free reader, so no
-// importer is needed (and the v0.17.x fallback path has none to open).
-func (b *Backup) openBackupReaderFactory(ctx context.Context, snapshotName string, tableParallelism int) (backupReaderFactory, func(), error) {
+// tableParallelism <= 1, or an eager snapshot, returns a nil factory
+// with a no-op cleanup: the serial pool's single worker always wins the
+// free reader, and the eager pool's peers all live in the free-reader
+// channel, so no on-demand minting is ever needed.
+func (b *Backup) openBackupReaderFactory(ctx context.Context, snap *irbackup.Snapshot, tableParallelism int) (backupReaderFactory, func(), error) {
 	if tableParallelism <= 1 {
 		return nil, func() {}, nil
 	}
+	// Eager (MySQL coordinated) readers are seeded into the pool's
+	// free-reader channel by the orchestrator; no factory is needed.
+	if snap != nil && len(snap.ExtraReaders) > 0 {
+		return nil, func() {}, nil
+	}
+
 	opener, ok := b.Source.(ir.SnapshotImporterOpener)
 	if !ok {
 		// Unreachable: backupParallelEligible already asserted this.
@@ -383,6 +449,7 @@ func (b *Backup) openBackupReaderFactory(ctx context.Context, snapshotName strin
 			_ = c.Close()
 		}
 	}
+	snapshotName := snap.SnapshotName
 	factory := func(rctx context.Context) (ir.RowReader, error) {
 		readers, err := importer.ImportSnapshot(rctx, snapshotName, 1)
 		if err != nil {

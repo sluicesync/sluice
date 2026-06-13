@@ -36,19 +36,49 @@ import (
 //     N-conn parallel reads ride [ir.SnapshotImporter] against the
 //     exported SnapshotName (ADR-0084).
 //   - MySQL: a single pinned `*sql.Conn` running
-//     `START TRANSACTION WITH CONSISTENT SNAPSHOT`. All table reads
-//     run on this one connection sequentially — MySQL's snapshot is
-//     per-session and not shareable, so multi-conn parallel reads
-//     are not available on this path.
+//     `START TRANSACTION WITH CONSISTENT SNAPSHOT`. MySQL's snapshot
+//     is per-session and not shareable across connections, so it
+//     cannot be lazily IMPORTED the way PG's exported snapshot is.
+//     But N independent snapshots can be made to COINCIDE under a
+//     brief `FLUSH TABLES WITH READ LOCK` window (mydumper's
+//     mechanism): when [SnapshotOptions.ReaderParallelism] > 1 on a
+//     vanilla source, the engine opens N reader transactions whose
+//     read views are byte-identical and returns the extras on
+//     [Snapshot.ExtraReaders] (ADR-0088). With ReaderParallelism <= 1,
+//     or on FTWRL-denied / Vitess sources, all table reads run on the
+//     one pinned connection sequentially.
 //
 // CloseFn is the engine-supplied cleanup closure: drops the
 // temporary slot (PG), commits the snapshot tx, closes the pinned
-// conn(s), and closes the underlying DB pool. The orchestrator calls
-// it via Close once the row sweep completes.
+// conn(s) — INCLUDING every reader handed back on ExtraReaders — and
+// closes the underlying DB pool. The orchestrator calls it via Close
+// once the row sweep completes.
 type Snapshot struct {
 	Position ir.Position
 	Rows     ir.RowReader
 	CloseFn  func() error
+
+	// ExtraReaders are the N-1 additional snapshot-pinned readers a
+	// MySQL coordinated parallel backup opens (ADR-0088): each is a
+	// dedicated connection whose `START TRANSACTION WITH CONSISTENT
+	// SNAPSHOT` ran inside the same `FLUSH TABLES WITH READ LOCK`
+	// window as Rows, so every reader observes the byte-identical
+	// consistent view at Position. The orchestrator seeds them into the
+	// cross-table backup pool (the EAGER counterpart to PG's LAZY
+	// [ir.SnapshotImporter] minting) — when non-empty, it is the
+	// presence-driven parallel-eligibility signal for
+	// `backupParallelEligible`, just as a non-empty SnapshotName is for
+	// the PG path.
+	//
+	// nil for PG (lazy import via SnapshotName), for serial MySQL
+	// (ReaderParallelism <= 1 / FTWRL-denied / coordinated-open
+	// failure), and for the Vitess/PlanetScale VStream path. Additive,
+	// optional — readers that don't recognise it ignore it.
+	//
+	// Ownership: these readers are owned by the Snapshot lifecycle —
+	// CloseFn closes every one. The pool that pops them MUST NOT close a
+	// popped reader (mirrors the PG importer-reader ownership note).
+	ExtraReaders []ir.RowReader
 
 	// SnapshotName is the engine's SHAREABLE exported-snapshot name —
 	// the handle other connections pass to the engine's
@@ -153,6 +183,25 @@ type SnapshotOptions struct {
 	// retains WAL until the next incremental advances it. Engines
 	// without a slot concept log a loud no-op and ignore the field.
 	PersistChainSlot bool
+
+	// ReaderParallelism is the cross-table fan-out the orchestrator
+	// wants snapshot-pinned readers for — the already-resolved
+	// (budget-bounded) requested parallelism, computed BEFORE the
+	// snapshot opens (ADR-0088). It lets an engine that can open
+	// multiple coincident readers do so eagerly, at snapshot-open time,
+	// while it still holds whatever short-lived coordination its
+	// consistency mechanism requires.
+	//
+	// MySQL vanilla honours it: with ReaderParallelism > 1 it opens N
+	// reader transactions under a brief `FLUSH TABLES WITH READ LOCK`
+	// window and returns the N-1 extras on [Snapshot.ExtraReaders]. PG
+	// ignores it — its readers are minted LAZILY from the exported
+	// SnapshotName via [ir.SnapshotImporter], so there is nothing to
+	// pre-open. The Vitess/PlanetScale VStream path ignores it too.
+	//
+	// nil/0 (and 1) preserve today's single-reader behaviour on every
+	// engine — the field is purely additive.
+	ReaderParallelism int
 }
 
 // AnchorSweeper is the OPTIONAL engine surface the full-backup

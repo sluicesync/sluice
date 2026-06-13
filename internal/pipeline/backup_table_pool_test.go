@@ -36,47 +36,74 @@ func (importerStubEngine) OpenSnapshotImporter(context.Context, string) (ir.Snap
 }
 
 func TestBackupParallelEligible(t *testing.T) {
+	withName := func(name string) *irbackup.Snapshot { return &irbackup.Snapshot{SnapshotName: name} }
+	withExtras := func(n int) *irbackup.Snapshot {
+		extras := make([]ir.RowReader, n)
+		for i := range extras {
+			extras[i] = &backupPoolFakeReader{}
+		}
+		return &irbackup.Snapshot{ExtraReaders: extras}
+	}
 	cases := []struct {
 		name             string
-		snapshotName     string
+		snap             *irbackup.Snapshot
 		source           ir.Engine
 		tableParallelism int
 		wantOK           bool
 		wantReason       string
 	}{
 		{
-			name:             "no shareable snapshot (MySQL / v0.17.x fallback)",
-			snapshotName:     "",
+			name:             "no shareable snapshot (MySQL serial / v0.17.x fallback)",
+			snap:             withName(""),
 			source:           importerStubEngine{},
 			tableParallelism: 4,
 			wantReason:       "not shareable",
 		},
 		{
 			name:             "no snapshot importer",
-			snapshotName:     "00000003-0000001B-1",
+			snap:             withName("00000003-0000001B-1"),
 			source:           stubEngine{},
 			tableParallelism: 4,
 			wantReason:       "no snapshot importer",
 		},
 		{
 			name:             "operator requested serial",
-			snapshotName:     "00000003-0000001B-1",
+			snap:             withName("00000003-0000001B-1"),
 			source:           importerStubEngine{},
 			tableParallelism: 1,
 			wantReason:       "--table-parallelism=1",
 		},
 		{
-			name:             "eligible",
-			snapshotName:     "00000003-0000001B-1",
+			name:             "eligible via lazy exported snapshot (PG)",
+			snap:             withName("00000003-0000001B-1"),
 			source:           importerStubEngine{},
 			tableParallelism: 4,
 			wantOK:           true,
+		},
+		{
+			// ADR-0088: eager coordinated readers qualify on a source with
+			// NO snapshot importer and NO shareable name — presence of
+			// ExtraReaders is the EAGER eligibility signal (MySQL FTWRL).
+			name:             "eligible via eager coordinated readers (MySQL)",
+			snap:             withExtras(3),
+			source:           stubEngine{},
+			tableParallelism: 4,
+			wantOK:           true,
+		},
+		{
+			// Eager readers present but operator asked for serial: still
+			// not eligible (the request gate is checked first).
+			name:             "eager readers but serial requested",
+			snap:             withExtras(3),
+			source:           stubEngine{},
+			tableParallelism: 1,
+			wantReason:       "--table-parallelism=1",
 		},
 	}
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			ok, reason := backupParallelEligible(c.snapshotName, c.source, c.tableParallelism)
+			ok, reason := backupParallelEligible(c.snap, c.source, c.tableParallelism)
 			if ok != c.wantOK {
 				t.Errorf("ok = %v; want %v (reason %q)", ok, c.wantOK, reason)
 			}
@@ -93,7 +120,7 @@ func TestBackupParallelEligible(t *testing.T) {
 // would otherwise engage.
 func TestResolveBackupTableParallelism_TaskCountClamp(t *testing.T) {
 	b := &Backup{Source: importerStubEngine{}, SourceDSN: "dsn", Store: &LocalStore{}}
-	got, err := b.resolveBackupTableParallelism(context.Background(), "snap-1", 1)
+	got, err := b.resolveBackupTableParallelism(context.Background(), &irbackup.Snapshot{SnapshotName: "snap-1"}, 1)
 	if err != nil {
 		t.Fatalf("resolveBackupTableParallelism: %v", err)
 	}
@@ -107,7 +134,7 @@ func TestResolveBackupTableParallelism_TaskCountClamp(t *testing.T) {
 // (no measured ceiling → the requested value stands).
 func TestResolveBackupTableParallelism_AutoDefault(t *testing.T) {
 	b := &Backup{Source: importerStubEngine{}, SourceDSN: "dsn", Store: &LocalStore{}}
-	got, err := b.resolveBackupTableParallelism(context.Background(), "snap-1", 10)
+	got, err := b.resolveBackupTableParallelism(context.Background(), &irbackup.Snapshot{SnapshotName: "snap-1"}, 10)
 	if err != nil {
 		t.Fatalf("resolveBackupTableParallelism: %v", err)
 	}
@@ -205,7 +232,7 @@ func TestBackupTablePool_SerialCollapseNeverMintsReaders(t *testing.T) {
 		factoryCalls.Add(1)
 		return nil, errors.New("factory must not be called on the serial path")
 	}
-	if err := b.runBackupTablePool(context.Background(), tasks, primary, factory, 1, 100, committer, nil); err != nil {
+	if err := b.runBackupTablePool(context.Background(), tasks, primary, nil, factory, 1, 100, committer, nil); err != nil {
 		t.Fatalf("runBackupTablePool: %v", err)
 	}
 	if n := factoryCalls.Load(); n != 0 {
@@ -231,7 +258,7 @@ func TestBackupTablePool_DedicatedReadersClosed(t *testing.T) {
 		minted.Add(1)
 		return &backupPoolFakeReader{rows: rows, closes: &dedicatedCloses}, nil
 	}
-	if err := b.runBackupTablePool(context.Background(), tasks, primary, factory, 4, 100, committer, nil); err != nil {
+	if err := b.runBackupTablePool(context.Background(), tasks, primary, nil, factory, 4, 100, committer, nil); err != nil {
 		t.Fatalf("runBackupTablePool: %v", err)
 	}
 	if primaryCloses.Load() != 0 {
@@ -239,6 +266,43 @@ func TestBackupTablePool_DedicatedReadersClosed(t *testing.T) {
 	}
 	if m, c := minted.Load(), dedicatedCloses.Load(); m != c {
 		t.Errorf("minted %d dedicated readers but closed %d; want equal", m, c)
+	}
+}
+
+// TestBackupTablePool_EagerPeersReusedNeverMinted pins the ADR-0088
+// eager path: the pre-opened coordinated peers seed the reusable
+// free-reader pool, so with more tables than (primary + peers) the
+// factory is NEVER called (there is nothing to mint — MySQL can't open
+// fresh coincident readers after the FTWRL window) and no peer is closed
+// by the pool (the snapshot's CloseFn owns every reader). Sweeping 8
+// tables through a pool of 1 primary + 3 peers at parallelism 4 proves
+// the pool reuses peers across tables.
+func TestBackupTablePool_EagerPeersReusedNeverMinted(t *testing.T) {
+	b, committer, tasks, rows := poolTestFixture(t, 8)
+	var primaryCloses, peerCloses atomic.Int64
+	primary := &backupPoolFakeReader{rows: rows, closes: &primaryCloses}
+	peers := make([]ir.RowReader, 3)
+	for i := range peers {
+		peers[i] = &backupPoolFakeReader{rows: rows, closes: &peerCloses}
+	}
+	var factoryCalls atomic.Int64
+	factory := func(context.Context) (ir.RowReader, error) {
+		factoryCalls.Add(1)
+		return nil, errors.New("factory must not be called on the eager path")
+	}
+	if err := b.runBackupTablePool(context.Background(), tasks, primary, peers, factory, 4, 100, committer, nil); err != nil {
+		t.Fatalf("runBackupTablePool: %v", err)
+	}
+	if n := factoryCalls.Load(); n != 0 {
+		t.Errorf("factory called %d times on the eager path; want 0 (peers seed the pool)", n)
+	}
+	if c := primaryCloses.Load() + peerCloses.Load(); c != 0 {
+		t.Errorf("pool closed %d pooled readers; want 0 (snapshot CloseFn owns them)", c)
+	}
+	for _, task := range tasks {
+		if task.entry.Partial {
+			t.Errorf("table %s still Partial after eager pool", task.table.Name)
+		}
 	}
 }
 
@@ -271,7 +335,7 @@ func TestBackupTablePool_FirstErrorCancelsPeers(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- b.runBackupTablePool(context.Background(), tasks, primary, factory, 4, 100, committer, nil)
+		done <- b.runBackupTablePool(context.Background(), tasks, primary, nil, factory, 4, 100, committer, nil)
 	}()
 	select {
 	case err := <-done:

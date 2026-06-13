@@ -404,6 +404,7 @@ func (b *Backup) Run(ctx context.Context) error {
 	// (it already exists at the adopted anchor — see the adoption
 	// preflight above): the snapshot opens in the temporary-anchor
 	// shape, serving only read consistency for tables streamed THIS run.
+	//
 	rr, snapshotPos, snap, snapshotCloser, err := b.openSnapshotOrFallback(ctx, schema, b.ChainSlot && !adopting)
 	if err != nil {
 		return err
@@ -572,21 +573,26 @@ func (b *Backup) Run(ctx context.Context) error {
 		return fmt.Errorf("backup: persist chain resources: %w", err)
 	}
 
-	snapshotName := ""
-	if snap != nil {
-		snapshotName = snap.SnapshotName
-	}
-	tableParallelism, err := b.resolveBackupTableParallelism(ctx, snapshotName, len(tasks))
+	tableParallelism, err := b.resolveBackupTableParallelism(ctx, snap, len(tasks))
 	if err != nil {
 		return err
 	}
-	factory, factoryCleanup, err := b.openBackupReaderFactory(ctx, snapshotName, tableParallelism)
+	factory, factoryCleanup, err := b.openBackupReaderFactory(ctx, snap, tableParallelism)
 	if err != nil {
 		return err
 	}
 	defer factoryCleanup()
 
-	if err := b.runBackupTablePool(ctx, tasks, rr, factory, tableParallelism, chunkRows, committer, chainCEK); err != nil {
+	// EAGER (MySQL ADR-0088) peers seed the pool's reusable free-reader
+	// channel; the LAZY (PG) path leaves them nil and mints via factory.
+	// Only when parallelism actually engaged — a collapsed-to-serial
+	// gate runs one reader (the primary).
+	var peers []ir.RowReader
+	if tableParallelism > 1 && snap != nil {
+		peers = snap.ExtraReaders
+	}
+
+	if err := b.runBackupTablePool(ctx, tasks, rr, peers, factory, tableParallelism, chunkRows, committer, chainCEK); err != nil {
 		return err
 	}
 
@@ -844,10 +850,11 @@ func (b *Backup) resolveResumeState(ctx context.Context) (prior *irbackup.Manife
 // chain slot (task #42, ADR-0085) and opens this run's snapshot in the
 // temporary-anchor shape so the adopted slot is never re-created — and
 // never dropped by this run's failure path.
-func (b *Backup) openBackupSnapshotScoped(ctx context.Context, schema *ir.Schema, persistChainSlot bool) (snap *irbackup.Snapshot, implemented bool, err error) {
+func (b *Backup) openBackupSnapshotScoped(ctx context.Context, schema *ir.Schema, persistChainSlot bool, requestedReaders int) (snap *irbackup.Snapshot, implemented bool, err error) {
 	opts := irbackup.SnapshotOptions{
-		SlotName:         b.SlotName,
-		PersistChainSlot: persistChainSlot,
+		SlotName:          b.SlotName,
+		PersistChainSlot:  persistChainSlot,
+		ReaderParallelism: requestedReaders,
 	}
 	tables := tableNamesForPublication(schema)
 	if len(tables) > 0 {
@@ -864,7 +871,18 @@ func (b *Backup) openBackupSnapshotScoped(ctx context.Context, schema *ir.Schema
 }
 
 func (b *Backup) openSnapshotOrFallback(ctx context.Context, schema *ir.Schema, persistChainSlot bool) (ir.RowReader, *ir.Position, *irbackup.Snapshot, func(), error) {
-	if snap, ok, err := b.openBackupSnapshotScoped(ctx, schema, persistChainSlot); ok {
+	// ADR-0088: resolve the REQUESTED cross-table parallelism BEFORE the
+	// snapshot opens, so an engine that opens coincident readers eagerly
+	// (MySQL vanilla, under a brief FTWRL window) knows how many to open.
+	// PG ignores it (its readers are minted lazily from the exported
+	// snapshot name). The number is re-resolved against the actual task
+	// count after staging (resolveBackupTableParallelism) — this is only
+	// the snapshot-open hint.
+	requestedReaders, err := b.resolveRequestedReaderParallelism(ctx, len(schema.Tables))
+	if err != nil {
+		return nil, nil, nil, func() {}, err
+	}
+	if snap, ok, err := b.openBackupSnapshotScoped(ctx, schema, persistChainSlot, requestedReaders); ok {
 		if err == nil {
 			slog.InfoContext(
 				ctx, "backup: opened snapshot-anchored consistent view",
