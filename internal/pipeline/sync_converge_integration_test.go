@@ -199,7 +199,11 @@ func convDump(db *sql.DB, eng engineKind, table string, cols []convColumn, canon
 	}
 	defer func() { _ = rows.Close() }()
 
-	var b strings.Builder
+	type dumpRow struct {
+		pk   int64
+		line string
+	}
+	var dumped []dumpRow
 	for rows.Next() {
 		vals := make([]sql.NullString, len(cols)+1)
 		dest := make([]any, len(vals))
@@ -213,22 +217,52 @@ func convDump(db *sql.DB, eng engineKind, table string, cols []convColumn, canon
 		if err != nil {
 			return "", nil, fmt.Errorf("non-integer id %q: %w", vals[0].String, err)
 		}
-		pks = append(pks, pk)
-		fmt.Fprintf(&b, "id=%s", vals[0].String)
+		var line strings.Builder
+		fmt.Fprintf(&line, "id=%s", vals[0].String)
 		for i, c := range cols {
 			switch {
 			case !vals[i+1].Valid:
-				fmt.Fprintf(&b, " %s=NULL", c.name)
+				fmt.Fprintf(&line, " %s=NULL", c.name)
 			case canon:
-				fmt.Fprintf(&b, " %s=%q", c.name, convCanonField(c.fam, vals[i+1].String))
+				fmt.Fprintf(&line, " %s=%q", c.name, convCanonField(c.fam, vals[i+1].String))
 			default:
-				fmt.Fprintf(&b, " %s=%q", c.name, vals[i+1].String)
+				fmt.Fprintf(&line, " %s=%q", c.name, vals[i+1].String)
 			}
 		}
-		b.WriteByte('\n')
+		dumped = append(dumped, dumpRow{pk: pk, line: line.String()})
 	}
 	if err := rows.Err(); err != nil {
 		return "", nil, err
+	}
+
+	// Sort by NUMERIC pk in Go, NOT via the SQL ORDER BY. The two
+	// engines disagree on what `ORDER BY id` means once id is also
+	// projected as text: PG binds ORDER BY to the `id::text` OUTPUT
+	// column (lexicographic — "12" < "4"), while MySQL binds it to the
+	// bigint TABLE column (numeric). A server-side ORDER BY is therefore
+	// NOT cross-engine-consistent, so two engines would emit byte-
+	// different dumps of IDENTICAL content purely from row order — a
+	// false non-convergence. Sorting here makes the ordering engine-
+	// agnostic, so the dump-vs-dump string equality measures content,
+	// not each dialect's ORDER BY name-resolution quirk. (Same-engine
+	// was unaffected — both sides shared the quirk — which is why this
+	// hid until the cross-engine directions ran.)
+	slices.SortFunc(dumped, func(a, b dumpRow) int {
+		switch {
+		case a.pk < b.pk:
+			return -1
+		case a.pk > b.pk:
+			return 1
+		default:
+			return 0
+		}
+	})
+	var b strings.Builder
+	pks = make([]int64, 0, len(dumped))
+	for _, d := range dumped {
+		b.WriteString(d.line)
+		b.WriteByte('\n')
+		pks = append(pks, d.pk)
 	}
 	return b.String(), pks, nil
 }
