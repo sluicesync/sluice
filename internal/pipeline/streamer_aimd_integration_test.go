@@ -28,6 +28,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -68,9 +69,16 @@ func TestStreamer_AIMDController_PostgresToPostgres_Engages(t *testing.T) {
 	const totalRows = 250
 	const streamID = "aimd-integration"
 
-	// Use a fixed-port metrics listener so the test can scrape; pick a
-	// high port that's unlikely to collide.
-	const metricsAddr = "127.0.0.1:39052"
+	// Metrics listener the test scrapes. Allocated dynamically rather
+	// than hardcoded: the old fixed 127.0.0.1:39052 sat INSIDE Linux's
+	// ephemeral port range (32768-60999), so under the connection-heavy
+	// parallel -race suite a concurrent outbound socket could transiently
+	// own it and the streamer's metrics bind failed with "address already
+	// in use" — Run returned before slot creation and the test flaked
+	// (caught precisely by the slot-creation gate's early-return dump on
+	// a Vultr -race run, 2026-06-13; 0/12 in isolation because isolation
+	// has no concurrent port pressure).
+	metricsAddr := freeLoopbackAddr(t)
 	streamer := &Streamer{
 		Source:         pgEng,
 		Target:         pgEng,
@@ -188,4 +196,24 @@ func TestStreamer_AIMDController_PostgresToPostgres_Engages(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("Streamer.Run did not return after ctx cancel")
 	}
+}
+
+// freeLoopbackAddr asks the OS for an unused loopback TCP port and
+// returns it as "127.0.0.1:PORT". Preferred over a hardcoded port for
+// a metrics listener under the parallel -race suite: a fixed port in
+// the ephemeral range can be transiently held by a concurrent outbound
+// socket (the 39052 flake). There is a small window between closing
+// this probe listener and the metrics server re-binding the port, but
+// the OS does not immediately reassign a just-released port, so a
+// collision here is vanishingly unlikely compared with a port left
+// "exposed" for the whole test setup.
+func freeLoopbackAddr(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("freeLoopbackAddr: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	return addr
 }
