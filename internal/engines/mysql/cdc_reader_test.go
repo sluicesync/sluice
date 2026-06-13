@@ -455,6 +455,29 @@ func TestParseTruncateTable(t *testing.T) {
 		// must NOT mistakenly strip "TABLE" as a keyword without a
 		// whitespace separator.
 		{"TABLEFOO is a valid table name", "TRUNCATE TABLEFOO", "", "TABLEFOO", true},
+
+		// Bug 140: MySQL preserves leading comments verbatim in the
+		// binlog QUERY_EVENT, so a commented TRUNCATE must still be
+		// recognised — otherwise it falls through to generic DDL
+		// handling and the typed ir.Truncate is silently never emitted
+		// (the target keeps the rows the source truncated).
+		{"leading line comment", "-- clear staging\nTRUNCATE TABLE foo", "", "foo", true},
+		{"leading line comment crlf", "-- clear staging\r\nTRUNCATE TABLE foo", "", "foo", true},
+		{"leading hash comment", "# clear staging\nTRUNCATE foo", "", "foo", true},
+		{"leading block comment (query tag)", "/* trace=abc */ TRUNCATE TABLE db.foo", "db", "foo", true},
+		{"leading block comment no space", "/*trace*/TRUNCATE TABLE `foo`", "", "foo", true},
+		{"stacked comments then truncate", "-- a\n/* b */ # c\nTRUNCATE TABLE foo", "", "foo", true},
+		{"comment with whitespace before truncate", "  /* x */\n\tTRUNCATE foo", "", "foo", true},
+		// "--" without a trailing space is the MySQL minus-minus
+		// operator, not a comment; such a body is not a TRUNCATE we
+		// recognise, so it stays ok=false (falls through harmlessly).
+		{"double-dash no space is not a comment", "--TRUNCATE TABLE foo", "", "", false},
+		// Executable comments are left in place (could gate real SQL);
+		// they fall through to generic DDL handling, not a typed event.
+		{"executable comment not stripped", "/*! 50000 TRUNCATE */ TABLE foo", "", "", false},
+		// A comment that is the entire body has nothing to parse.
+		{"comment only", "-- just a note", "", "", false},
+		{"unterminated block comment", "/* nope TRUNCATE TABLE foo", "", "", false},
 	}
 
 	for _, c := range cases {

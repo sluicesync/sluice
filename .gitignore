@@ -61,6 +61,15 @@ test/integration/dumps/
 # commit the raw dump dir).
 internal/pipeline/testdata/fuzz-failures/
 
+# Sync-convergence property — same convention: the human-readable
+# failing-case .sql dump and rapid's own replay failfile are transient
+# repro artifacts (regenerated on failure, replayable from the printed
+# seed/failfile). Promote a confirmed bug to a permanent named pin by
+# hand (e.g. bug140_truncate_mysql_integration_test.go); don't commit
+# the raw dump dirs.
+internal/pipeline/testdata/converge-failures/
+internal/pipeline/testdata/rapid/
+
 # Real-world schema corpus (Idea 3, prep-new-test-surfaces.md): fetched
 # upstream DDL is large + upstream-owned — fetch-on-demand, do not
 # vendor the dumps. The committed MANIFEST.md (provenance: source /
