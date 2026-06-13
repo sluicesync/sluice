@@ -95,6 +95,50 @@ and latency metrics
 plus topology-watch propagation of config. Self-hosted Vitess 24
 operators get much-improved visibility.
 
+**The silent-stall gap (verified).** When the throttler engages
+against a tablet whose VStream sluice is consuming, the tablet's
+vstreamer *does* signal it in-band (`VEvent.throttled` /
+`throttled_reason`) — but **vtgate strips those fields**: it
+filters out the tablet's heartbeats and synthesizes its own
+throttle-blind ones. So an external gRPC consumer like sluice sees
+a mid-stream throttle as **content-free heartbeats + zero ROW
+events + no gRPC error**. The `ResourceExhausted` retry classifier
+never fires (no error arrives), the mid-stream progress watchdog
+stays re-armed by the heartbeats (correct — the stream is alive and
+*will* catch up when the throttle clears), and without the WARN
+below it would be **silent**: unbounded lag, zero diagnostic. The
+clean in-band fix is gated on a vtgate change to propagate
+`throttled` onto its synthesized heartbeat (the external-consumer
+analog of the vplayer fix in vitessio/vitess#16575/#16577).
+
+**What sluice surfaces (observability, no behavior change).** Since
+sluice can't see the in-band flag, it surfaces the *symptom*
+loudly:
+
+- **At stream open**, a throttle that denies the stream before the
+  first event trips the Phase-1 liveness timeout, whose error now
+  names the throttler as a candidate cause alongside the
+  primary-only topology wedge ("...or the source tablet throttler
+  is denying the stream — check `SHOW VITESS_THROTTLED_APPS` on the
+  primary").
+- **Mid-stream**, once data has flowed, a spell of heartbeats-only
+  for ~30s (the soft idle window) emits a rate-limited WARN —
+  *"alive (heartbeats flowing) but NO change events for Ns ... the
+  source may be throttled or genuinely idle; check `SHOW
+  VITESS_THROTTLED_APPS` on the primary tablet"* — once per quiet
+  spell, cleared by the next real change event. This is **purely a
+  heads-up**: the stream stays connected and resilient and catches
+  up when events resume. The soft window is tunable per-DSN via
+  `vstream_idle_warn_timeout` (a Go duration; `0` disables the WARN
+  only — the hard liveness/progress guards are unaffected).
+
+`SHOW VITESS_THROTTLED_APPS` (on a primary-routed connection) is
+the right out-of-band check, but note it only reflects an
+**explicit per-app deny** (it lists `vstreamer`/`rowstreamer`/
+`vreplication` with expiry + ratio); it does **not** reflect the
+common **threshold/lag-metric** throttle, whose live verdict lives
+only on the gRPC `CheckThrottler` control plane.
+
 **What you can do:**
 
 - Self-hosted Vitess: `vtctldclient GetThrottlerStatus <tablet>`
@@ -244,6 +288,16 @@ For the field-cache failure (cause #4), watch sluice's logs for
 `row event for "X" without preceding FIELD event` and correlate
 with PS deploy timestamps.
 
+For a mid-stream throttle/idle stall (cause #2), watch for the
+rate-limited WARN `alive (heartbeats flowing) but NO change events
+for Ns` — it fires once per quiet spell when heartbeats keep
+arriving but no change events do. Pair it with `sluice_lag_seconds`
+climbing while `sluice_seconds_since_last_event` stays low (< 6s,
+heartbeats arriving): that combination is the throttle/idle
+signature, because vtgate strips the in-band `throttled` flag (see
+cause #2). A genuinely idle source produces the same WARN — check
+`SHOW VITESS_THROTTLED_APPS` on the primary to tell them apart.
+
 ## Targeting a PlanetScale branch (control-table DDL needs an `admin`-role password)
 
 When a **PlanetScale branch is the sluice _target_** (`--target-driver=planetscale`),
@@ -352,6 +406,10 @@ proto-ADR in `docs/dev/design/sync-health-monitoring.md`.
   `MinimizeSkew`, `StopOnReshard`, 5s heartbeat), `pump` /
   `dispatch` / `dispatchRow` / `dispatchDDL`, `Reopen`,
   `ShardLayoutChangedError` / `ErrShardLayoutChanged`.
+- `internal/engines/mysql/cdc_vstream_liveness.go` — the two-phase
+  progress watchdog: Phase 1 (first serving-proof event), Phase 2
+  (mid-stream total-silence guard), and the Phase-2 SOFT idle-WARN
+  sub-window (`vstreamIdleWarnMessage`, the throttle/idle heads-up).
 - `internal/engines/mysql/cdc_vstream_position.go` — VGtid
   encode/decode for the persisted CDC position.
 - `internal/engines/mysql/cdc_vstream_snapshot.go` — VStream COPY

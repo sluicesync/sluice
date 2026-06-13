@@ -83,6 +83,34 @@ const defaultVStreamLivenessWindow = 30 * time.Second
 // first event). Absent ⇒ this default.
 const defaultVStreamProgressWindow = 45 * time.Second
 
+// defaultVStreamIdleWarnWindow is the Phase-2 SOFT sub-window: how long a
+// PROVEN stream may receive ONLY heartbeat-only observations (heartbeats
+// flowing, zero change events) before the watchdog emits a single
+// rate-limited WARN per quiet spell. It is OBSERVABILITY ONLY — it never
+// fails the stream, never fires the hard Phase-2 timeout, and never alters
+// the resilient wait. It exists because of the verified Vitess throttle
+// gap (roadmap item 19(a)): when a source tablet's throttler engages
+// mid-stream, vtgate withholds ROW/change events but keeps sending its ~5s
+// synthesized heartbeats AND strips the tablet's in-band `VEvent.throttled`
+// flag — so the hard Phase-2 watchdog stays re-armed by the heartbeats
+// (correctly resilient) and the stall is SILENT: unbounded lag, zero
+// diagnostic. This soft WARN turns that into a loud heads-up ("alive but no
+// change events — the source may be throttled or genuinely idle") without
+// disturbing the resilient behavior.
+//
+// Sizing: 30s ≈ 6× the 5s heartbeat cadence and well under the 45s hard
+// CDC-tail Phase-2 window, so the heads-up always precedes the (different,
+// failover-shaped) hard timeout on the tail; on the COPY pump (10-min hard
+// window) it is purely an informational heads-up during a legitimately long
+// warmup. Re-armed and its warn-latch cleared by the next REAL
+// (non-heartbeat) event, so a stream that resumes progress goes quiet
+// again until the next spell.
+//
+// Overridable per-DSN via vstream_idle_warn_timeout (a Go duration string);
+// 0 or negative disables the soft WARN only (both hard phases unaffected).
+// Absent ⇒ this default.
+const defaultVStreamIdleWarnWindow = 30 * time.Second
+
 // defaultVStreamCopyProgressWindow is the Phase-2 window for the snapshot
 // COPY pump specifically — DELIBERATELY far more generous than the
 // CDC-tail Phase-2 window.
@@ -162,6 +190,17 @@ func eventsProveLiveness(evs []*binlogdata.VEvent) bool {
 //     whose ~5s heartbeats keep arriving — stays alive indefinitely; only
 //     genuine silence trips it.
 //
+//   - PHASE-2 SOFT sub-window (softWindow) — a SECOND, shorter deadline
+//     that runs alongside the hard Phase-2 timer and is OBSERVABILITY ONLY.
+//     Heartbeat-only observations re-arm the hard Phase-2 timer (keeping
+//     the stream alive — correct) but DO NOT re-arm the soft timer, so a
+//     spell of "heartbeats flowing, zero change events" — the verified
+//     throttle/idle signature (item 19(a)) — lets the soft timer elapse and
+//     fires onSoftIdle ONCE per spell (latched). A REAL (non-heartbeat)
+//     event re-arms the soft timer and clears the latch. onSoftIdle MUST
+//     NOT fail or cancel the stream — it only emits a WARN; the hard
+//     Phase-2 timer is the only path that ever errors.
+//
 // Windows:
 //   - phase1Window <= 0 disables the WHOLE watchdog (no goroutine; observe
 //     and stop are safe no-ops). The explicit opt-out.
@@ -169,6 +208,9 @@ func eventsProveLiveness(evs []*binlogdata.VEvent) bool {
 //     first event, but once it clears the watchdog goes quiescent (a
 //     proven stream is never timed out mid-stream). Lets an operator keep
 //     the primary-only guard while opting out of the progress guard.
+//   - softWindow <= 0 disables the SOFT WARN only (both hard phases
+//     unaffected). softWindow is ignored entirely while Phase 1 is
+//     un-cleared (the soft window is a Phase-2 concept).
 type vstreamLiveness struct {
 	// events carries observations from the pump to the watchdog goroutine.
 	// A bool payload: true == this batch proved a serving tablet (a
@@ -218,21 +260,29 @@ func newRealLivenessTimer(d time.Duration) livenessTimer {
 //     primary-only / dead-stream-from-open wedge).
 //   - onPhase2Timeout — total silence within phase2Window after a serving
 //     tablet was proven (the mid-stream / post-failover wedge).
+//   - onSoftIdle — a Phase-2 spell of heartbeat-only observations outlasted
+//     softWindow (the throttle/idle heads-up; item 19(a)). OBSERVABILITY
+//     ONLY: it WARNs, it must NOT fail or cancel the stream. Fires once per
+//     quiet spell; a real event re-arms and re-latches it.
 //
 // Windows:
 //   - phase1Window <= 0 disables the whole watchdog (returns a no-op whose
 //     observe/stop are safe to call).
 //   - phase2Window <= 0 keeps Phase 1 but disables Phase 2 (a proven
-//     stream is never timed out mid-stream).
-func startVStreamLiveness(ctx context.Context, phase1Window, phase2Window time.Duration, onPhase1Timeout, onPhase2Timeout func()) *vstreamLiveness {
-	return startVStreamLivenessWithTimer(ctx, phase1Window, phase2Window, onPhase1Timeout, onPhase2Timeout, newRealLivenessTimer)
+//     stream is never timed out mid-stream). The soft WARN still runs if
+//     softWindow > 0 — they are independent.
+//   - softWindow <= 0 (or onSoftIdle nil) disables the soft WARN only.
+func startVStreamLiveness(ctx context.Context, phase1Window, phase2Window, softWindow time.Duration, onPhase1Timeout, onPhase2Timeout, onSoftIdle func()) *vstreamLiveness {
+	return startVStreamLivenessWithTimer(ctx, phase1Window, phase2Window, softWindow, onPhase1Timeout, onPhase2Timeout, onSoftIdle, newRealLivenessTimer)
 }
 
 // startVStreamLivenessWithTimer is the test seam behind
 // [startVStreamLiveness]: identical semantics, with the timer factory
 // injectable. Only the unit tests ever pass anything other than
-// [newRealLivenessTimer].
-func startVStreamLivenessWithTimer(ctx context.Context, phase1Window, phase2Window time.Duration, onPhase1Timeout, onPhase2Timeout func(), newTimer func(time.Duration) livenessTimer) *vstreamLiveness {
+// [newRealLivenessTimer]. The factory is called once per timer the watchdog
+// owns (the hard phase timer and, when the soft WARN is enabled, the soft
+// timer), each with its initial duration.
+func startVStreamLivenessWithTimer(ctx context.Context, phase1Window, phase2Window, softWindow time.Duration, onPhase1Timeout, onPhase2Timeout, onSoftIdle func(), newTimer func(time.Duration) livenessTimer) *vstreamLiveness {
 	l := &vstreamLiveness{}
 	if phase1Window <= 0 {
 		// Disabled: nil channels make observe/stop no-ops; no goroutine.
@@ -242,47 +292,95 @@ func startVStreamLivenessWithTimer(ctx context.Context, phase1Window, phase2Wind
 	// number of them, and the watchdog drains one per loop iteration.
 	l.events = make(chan bool, 1)
 	l.done = make(chan struct{})
-	go l.run(ctx, phase1Window, phase2Window, onPhase1Timeout, onPhase2Timeout, newTimer)
+	go l.run(ctx, phase1Window, phase2Window, softWindow, onPhase1Timeout, onPhase2Timeout, onSoftIdle, newTimer)
 	return l
 }
 
-// run is the watchdog goroutine: the SOLE owner of the timer and the
-// phase state. It starts in Phase 1 with phase1Window armed and loops on
-// {observation, timer, done, ctx}. The first serving-proof observation
-// transitions to Phase 2 (re-arming with phase2Window, or going quiescent
-// if Phase 2 is disabled); thereafter every observation re-arms the
-// Phase-2 timer. A timer fire calls the active phase's callback once and
-// returns.
-func (l *vstreamLiveness) run(ctx context.Context, phase1Window, phase2Window time.Duration, onPhase1Timeout, onPhase2Timeout func(), newTimer func(time.Duration) livenessTimer) {
+// run is the watchdog goroutine: the SOLE owner of BOTH timers (the hard
+// phase timer and the soft idle-WARN timer) and ALL phase state. The pump
+// never touches a timer — keeping every timer single-goroutine is the
+// race-free pattern (the re-arm is exactly where a pump/watchdog race would
+// hide). It starts in Phase 1 with phase1Window armed and loops on
+// {observation, hard timer, soft timer, done, ctx}.
+//
+// The first serving-proof observation transitions to Phase 2 (re-arming the
+// hard timer with phase2Window, or going quiescent if Phase 2 is disabled,
+// AND arming the soft timer if softWindow>0); thereafter every observation
+// re-arms the hard Phase-2 timer, while only a REAL (non-heartbeat) event
+// re-arms the soft timer and clears the soft-warn latch. A hard-timer fire
+// calls the active phase's callback once and RETURNS (terminal); a
+// soft-timer fire emits the WARN callback once per quiet spell and KEEPS
+// LOOPING (observability only — never terminal).
+func (l *vstreamLiveness) run(ctx context.Context, phase1Window, phase2Window, softWindow time.Duration, onPhase1Timeout, onPhase2Timeout, onSoftIdle func(), newTimer func(time.Duration) livenessTimer) {
 	timer := newTimer(phase1Window)
 	defer timer.Stop()
 
+	// The soft timer is only created when the soft WARN is enabled
+	// (softWindow>0 AND a callback is provided). When disabled it stays nil
+	// and every soft-path branch below is a guarded no-op — softEnabled is
+	// the single gate.
+	softEnabled := softWindow > 0 && onSoftIdle != nil
+	var softTimer livenessTimer
+	if softEnabled {
+		// Created disarmed (the soft window is a Phase-2 concept; nothing to
+		// warn about until a serving tablet is proven). Stop()ped at once so
+		// it does not fire during Phase 1.
+		softTimer = newTimer(softWindow)
+		softTimer.Stop()
+		defer softTimer.Stop()
+	}
+
 	// phase2 tracks whether a serving tablet has been proven (Phase 1
-	// cleared). armed tracks whether the timer is currently a live
+	// cleared). armed tracks whether the hard timer is currently a live
 	// deadline — once Phase 2 is disabled (phase2Window<=0) and Phase 1
-	// has cleared, the watchdog is quiescent and timer fires are ignored.
+	// has cleared, the watchdog is quiescent and hard-timer fires are
+	// ignored. softWarned latches a fired soft WARN so it fires at most
+	// once per quiet spell; a real event clears it.
 	phase2 := false
 	armed := true
+	softWarned := false
 
-	// reset stops+drains the timer and re-arms it for d, leaving it
-	// disarmed (quiescent) when d<=0. Single-goroutine ownership makes the
-	// stop/drain/reset sequence race-free.
-	reset := func(d time.Duration) {
-		if !timer.Stop() {
+	// resetTimer stops+drains t and re-arms it for d, leaving it disarmed
+	// when d<=0. Single-goroutine ownership makes the stop/drain/reset
+	// sequence race-free. The drain reads from t's OWN channel (passed in)
+	// so the same helper serves both timers.
+	resetTimer := func(t livenessTimer, d time.Duration) bool {
+		if !t.Stop() {
 			// Drain a possibly-already-fired timer so the next Reset is
 			// clean. Non-blocking: the value may have already been
 			// consumed by the select below.
 			select {
-			case <-timer.C():
+			case <-t.C():
 			default:
 			}
 		}
 		if d > 0 {
-			timer.Reset(d)
-			armed = true
+			t.Reset(d)
+			return true
+		}
+		return false
+	}
+
+	// reset re-arms the HARD phase timer and tracks armed.
+	reset := func(d time.Duration) { armed = resetTimer(timer, d) }
+
+	// armSoft re-arms the SOFT timer (Phase-2 only) and clears the warn
+	// latch — called on a real event and on the Phase-1→2 transition.
+	armSoft := func() {
+		if !softEnabled {
 			return
 		}
-		armed = false
+		resetTimer(softTimer, softWindow)
+		softWarned = false
+	}
+
+	// softC is the soft timer's fire channel, or nil when disabled so the
+	// select arm is statically dead (a nil channel never becomes ready).
+	softC := func() <-chan time.Time {
+		if softEnabled {
+			return softTimer.C()
+		}
+		return nil
 	}
 
 	for {
@@ -294,12 +392,23 @@ func (l *vstreamLiveness) run(ctx context.Context, phase1Window, phase2Window ti
 		case proof := <-l.events:
 			switch {
 			case !phase2 && proof:
-				// First serving proof: clear Phase 1, enter Phase 2.
+				// First serving proof: clear Phase 1, enter Phase 2. Arm
+				// both the hard progress timer and the soft idle-WARN timer.
 				phase2 = true
 				reset(phase2Window)
+				armSoft()
+			case phase2 && proof:
+				// Mid-stream REAL event: re-arm the hard progress deadline
+				// AND the soft timer, clearing any prior idle WARN latch —
+				// progress resumed, so the next idle spell starts fresh.
+				reset(phase2Window)
+				armSoft()
 			case phase2:
-				// Mid-stream: any event (data OR heartbeat) re-arms the
-				// Phase-2 progress deadline.
+				// Mid-stream HEARTBEAT-ONLY: re-arm the hard progress
+				// deadline (the stream is still alive — stay resilient) but
+				// DELIBERATELY do NOT touch the soft timer. A sustained
+				// heartbeat-only spell is exactly what the soft WARN exists
+				// to surface (the throttle/idle signature, item 19(a)).
 				reset(phase2Window)
 			default:
 				// Phase 1, heartbeat-only observation: does NOT re-arm.
@@ -319,6 +428,17 @@ func (l *vstreamLiveness) run(ctx context.Context, phase1Window, phase2Window ti
 				onPhase1Timeout()
 			}
 			return
+		case <-softC():
+			// Soft idle-WARN fire: a Phase-2 spell of heartbeat-only (or no)
+			// observations outlasted softWindow. Emit the heads-up ONCE per
+			// spell and KEEP LOOPING — observability only, never terminal,
+			// never re-armed here (the latch holds until a real event clears
+			// it via armSoft). Guard on phase2 so a stale fire racing the
+			// Phase-1→2 transition can't warn before serving is proven.
+			if phase2 && !softWarned {
+				softWarned = true
+				onSoftIdle()
+			}
 		}
 	}
 }
@@ -379,15 +499,25 @@ func (l *vstreamLiveness) stop() {
 
 // vstreamLivenessTimeoutError builds the loud, actionable error the
 // watchdog records when no serving-proof event flows within the PHASE-1
-// window. It names the tablet type, the keyspace, and the remediation
-// (vstream_tablet_type) so an operator hitting the primary-only wedge
-// gets a one-line fix rather than a silent hang. Terminal by construction
-// (not wrapped as an ir.RetriableError): a missing tablet does not heal on
-// retry.
+// window. It names the tablet type, the keyspace, and BOTH candidate causes
+// with their one-line remedies so an operator gets an actionable diagnosis
+// rather than a silent hang:
+//
+//   - the primary-only wedge (no serving REPLICA tablet) → set
+//     vstream_tablet_type=primary in the DSN (ADR-0073 (b2)); and
+//   - a source-tablet throttler denying the stream at open (item 19(a)) →
+//     check `SHOW VITESS_THROTTLED_APPS` on the primary. The throttler
+//     suppresses ROW/change events while vtgate still heartbeats, which is
+//     exactly the no-serving-proof-event signature Phase 1 keys on, so it
+//     is a genuine candidate cause for this timeout — not only topology.
+//
+// Terminal by construction (not wrapped as an ir.RetriableError): neither a
+// missing tablet nor a sustained throttle heals within a single retry.
 func vstreamLivenessTimeoutError(window time.Duration, tabletType topodata.TabletType, keyspace string, shards []string) error {
 	return fmt.Errorf(
 		"mysql/vstream: no events within %s of opening the stream; vtgate may have no %s tablet for keyspace %q shards %v "+
-			"(if the cluster is primary-only — e.g. a PlanetScale dev branch or a minimal self-hosted Vitess — set vstream_tablet_type=primary in the DSN)",
+			"(if the cluster is primary-only — e.g. a PlanetScale dev branch or a minimal self-hosted Vitess — set vstream_tablet_type=primary in the DSN), "+
+			"or the source tablet throttler is denying the stream — check `SHOW VITESS_THROTTLED_APPS` on the primary",
 		window, tabletType, keyspace, shards,
 	)
 }
@@ -409,6 +539,32 @@ func vstreamProgressTimeoutError(window time.Duration, tabletType topodata.Table
 	)
 }
 
+// vstreamIdleWarnMessage builds the loud, rate-limited heads-up the
+// watchdog logs when a PROVEN stream receives only heartbeats — no change
+// events — for the SOFT window (item 19(a)). It is OBSERVABILITY ONLY: the
+// stream stays alive (the hard Phase-2 timer is still re-armed by the
+// heartbeats). It names BOTH plausible causes (the source may be throttled
+// OR genuinely idle — heartbeats alone can't tell them apart, because
+// vtgate strips the tablet's in-band `VEvent.throttled` flag) and points
+// the operator at the out-of-band check on the PRIMARY.
+//
+// (item 19(a) part 3, DEFERRED): a best-effort `SHOW VITESS_THROTTLED_APPS`
+// poll on a primary-routed connection could name the specific denied
+// streamer app (vstreamer/rowstreamer/vreplication) here — but the verified
+// finding is that it only reflects an EXPLICIT app-deny, NOT the common
+// threshold/lag throttle, so it is an enrichment, not the primary signal.
+// It needs a DB connection threaded into the watchdog (which today owns no
+// conn), so it is left out to keep the watchdog dependency-free; the
+// heuristic WARN is the core deliverable and stands alone.
+func vstreamIdleWarnMessage(window time.Duration, keyspace string, shards []string) string {
+	return fmt.Sprintf(
+		"mysql/vstream: alive (heartbeats flowing) but NO change events for %s on keyspace %q shards %v — "+
+			"the source may be throttled or genuinely idle; check `SHOW VITESS_THROTTLED_APPS` on the primary tablet "+
+			"(the stream stays connected and will catch up when events resume)",
+		window, keyspace, shards,
+	)
+}
+
 // vstreamLivenessWindowFromDSN reads the optional vstream_liveness_timeout
 // DSN parameter (a Go duration string, e.g. "45s") — the PHASE-1 window.
 // Absent ⇒ the default window. A 0/negative duration disables the
@@ -426,6 +582,15 @@ func vstreamLivenessWindowFromDSN(cfg *gomysql.Config) (time.Duration, error) {
 // only (Phase 1 still guards the first event). Malformed ⇒ loud error.
 func vstreamProgressWindowFromDSN(cfg *gomysql.Config) (time.Duration, error) {
 	return vstreamDurationParam(cfg, "vstream_progress_timeout", defaultVStreamProgressWindow)
+}
+
+// vstreamIdleWarnWindowFromDSN reads the optional vstream_idle_warn_timeout
+// DSN parameter (a Go duration string) — the Phase-2 SOFT idle-WARN
+// sub-window (item 19(a)). Absent ⇒ [defaultVStreamIdleWarnWindow]. A
+// 0/negative duration disables the soft WARN only (both hard phases
+// unaffected). Malformed ⇒ loud error.
+func vstreamIdleWarnWindowFromDSN(cfg *gomysql.Config) (time.Duration, error) {
+	return vstreamDurationParam(cfg, "vstream_idle_warn_timeout", defaultVStreamIdleWarnWindow)
 }
 
 // vstreamCopyProgressWindowFromDSN reads the optional

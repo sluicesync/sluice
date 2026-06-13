@@ -4,6 +4,29 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **MySQL/Vitess CDC: surface a throttled-or-idle VStream stall instead of
+  hanging silently (observability; roadmap item 19(a)).** When a Vitess
+  source's tablet throttler engages mid-stream, vtgate withholds ROW/change
+  events but keeps sending ~5s heartbeats *and strips the tablet's in-band
+  `VEvent.throttled` flag* — so the stream stays alive (the progress
+  watchdog re-arms on heartbeats, correctly resilient) but the stall was
+  **silent**: unbounded lag, zero diagnostic. Three observability-only
+  changes (no change to the resilient streaming behavior): (1) the
+  at-stream-open Phase-1 liveness error now names the source throttler as a
+  candidate cause alongside the primary-only topology wedge ("...or the
+  source tablet throttler is denying the stream — check `SHOW
+  VITESS_THROTTLED_APPS` on the primary"); (2) a new Phase-2 SOFT idle
+  sub-window emits a rate-limited WARN — *"alive (heartbeats flowing) but NO
+  change events for Ns — the source may be throttled or genuinely idle"* —
+  once per quiet spell, cleared by the next real change event, default 30s
+  and tunable per-DSN via `vstream_idle_warn_timeout` (`0` disables the WARN
+  only; the hard liveness/progress guards are unaffected). The soft-window
+  timer lives entirely in the single watchdog goroutine (the race-free
+  pattern). Docs: `docs/vitess-vstream-troubleshooting.md` §2 + Detection.
+
 ## [0.99.42] - 2026-06-13
 
 ### Fixed
