@@ -4,6 +4,43 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [0.99.42] - 2026-06-13
+
+### Fixed
+- **MySQL CDC: a source-side `TRUNCATE TABLE` carrying a leading SQL
+  comment is no longer silently dropped (Bug 140).** MySQL preserves a
+  statement's leading comment verbatim in the binlog `QUERY_EVENT`
+  (only the trailing delimiter is stripped), but the CDC reader's
+  truncate detection (`parseTruncateTable`) required the statement to
+  *start* with `TRUNCATE`. A commented truncate — a hand-written
+  migration (`-- clear staging\nTRUNCATE TABLE t`) or an APM/ORM query
+  tag (`/* trace=… */ TRUNCATE …`) — therefore fell through to generic
+  DDL handling and never emitted a typed `ir.Truncate`, so on a live
+  MySQL → {MySQL, Postgres} sync the **target silently retained every
+  row the source truncated** and the stream never converged (no error,
+  no lag-clearing signal): a HIGH silent-divergence class on a routine
+  operation. The reader now strips leading SQL comments (`--`, `#`,
+  `/* */`) before recognising the verb; executable comments (`/*! */`,
+  `/*+ */`) are deliberately left in place (stripping them could discard
+  conditionally-run SQL — they fall through harmlessly as before).
+  Postgres sources were never affected (pgoutput emits a typed truncate
+  message; no query-string parse). Pinned by unit comment-variant cases
+  and a new MySQL-source truncate-propagation integration test (the only
+  prior truncate integration test was Postgres-only).
+
+### Internal
+- Extended the random-op sync-convergence property to the **cross-engine
+  directions (PG↔MySQL)** with a value-semantic canonical compare,
+  alongside the existing same-engine pair. Running the new leg surfaced
+  and fixed two harness-side cross-engine canonicalisation edges
+  (timestamp trailing-zero fractions: PG `::text` renders the minimal
+  fraction while MySQL `DATETIME(6)` pads to six digits; and dump row
+  ordering: `ORDER BY id` binds to the text projection on PG but the
+  bigint column on MySQL). Test-only.
+- CI: stabilised a flaky AIMD-controller integration test by binding the
+  metrics listener to a dynamically-allocated port instead of a
+  hardcoded one inside Linux's ephemeral range. Test-only.
+
 ## [0.99.41] - 2026-06-12
 
 ### Fixed
