@@ -114,10 +114,19 @@ The gap closed in two measured stages, each confirming its decomposition:
    #51/#52 — same wire bytes, direct buffer append/parse, legacy path
    kept as the semantic oracle) plus the O(1) sidecar checkpoints
    (ADR-0086, task #54) cut both legs ~51%: backup 881→435 s, restore
-   2810→1390 s. Post-codec profiles show zstd encode and the PG
-   read/write itself as the new frontier — the remaining 1.5–1.8× is
-   format cost (bulkier self-describing JSONL into zstd + per-chunk
-   SHA-256), not codec overhead.
+   2810→1390 s. The remaining 1.5–1.8× is **read throughput and the
+   bulkier self-describing JSONL format**, not codec choice.
+3. **zstd tuning was measured and rejected as a lever (2026-06-12).**
+   Although zstd is ~24% of backup CPU, the full backup runs at under
+   2 of 8 cores — it is PG-read-bound, not compression-bound — so
+   dropping to `SpeedFastest` moved the zstd CPU share 24%→17% but
+   bought only −4% backup wall at +0.7% artifact size and +2% restore
+   (a wash), while `SpeedBetterCompression` cost +76% wall for −2% size
+   and lowering encoder concurrency only serialized the long-pole table.
+   `SpeedDefault` (klauspost default concurrency = GOMAXPROCS) is the
+   right operating point; no `--compression-level` knob is warranted
+   (every non-default setting measured was a net loss). The frontier
+   that remains is read throughput, not codec CPU.
 
 (All after-numbers measured on the post-burst corpus: 136 GB / 431M
 rows, ~2 % larger than the original 133 GB / 422M — comparators re-run
