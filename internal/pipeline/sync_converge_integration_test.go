@@ -124,12 +124,15 @@ func convConvergeTimeout() time.Duration {
 	return time.Duration(fuzzEnvInt("SLUICE_CONVERGE_TIMEOUT", 60)) * time.Second
 }
 
-// convLiveEnv binds one direction's booted containers + engines to
-// the engine-specific helpers the harness needs. A cross-engine
-// direction later is a new constructor (plus a cross-engine
-// canonical-dump equivalence), not a harness rewrite.
+// convLiveEnv binds one direction's booted containers + engines to the
+// engine-specific helpers the harness needs. dir carries the source and
+// target engine kinds separately — the source side drives DDL/literal/
+// CDC dialect and its dump; the target side drives the convergence dump.
+// For a cross-engine direction the two sides differ in driver, dialect,
+// and canonicalisation; convCrossEngine() flips the value-semantic
+// compare on (design #2).
 type convLiveEnv struct {
-	eng            engineKind
+	dir            convDirection
 	srcDSN, dstDSN string
 	source, target ir.Engine
 
@@ -138,16 +141,25 @@ type convLiveEnv struct {
 	checks, maxTxs int
 }
 
-func (e *convLiveEnv) driver() string {
-	if e.eng == enginePG {
+func (e *convLiveEnv) crossEngine() bool { return e.dir.crossEngine() }
+
+func engineDriver(eng engineKind) string {
+	if eng == enginePG {
 		return "pgx"
 	}
 	return "mysql"
 }
 
+func (e *convLiveEnv) srcDriver() string { return engineDriver(e.dir.src) }
+
+func (e *convLiveEnv) dstDriver() string { return engineDriver(e.dir.dst) }
+
+// applySQL applies a source-dialect script to the source. The script is
+// always rendered in the source dialect (convCase.eng == dir.src), so
+// only the source engine ever runs harness-generated SQL.
 func (e *convLiveEnv) applySQL(t *testing.T, dsn, script string) {
 	t.Helper()
-	if e.eng == enginePG {
+	if e.dir.src == enginePG {
 		applyDDL(t, dsn, script)
 	} else {
 		applyDDLMySQL(t, dsn, script)
@@ -157,11 +169,14 @@ func (e *convLiveEnv) applySQL(t *testing.T, dsn, script string) {
 // convDump reads the table's full ordered content in the engine's
 // server-side canonical text form: every column CAST to text ON THE
 // SERVER (driver-side scanning of native types into strings is not
-// portable), ORDER BY id. Same-engine source and target render
-// identically, so string equality of two dumps IS content equality.
-// Errors are returned, not fataled — during the convergence poll the
-// target table legitimately doesn't exist yet.
-func convDump(db *sql.DB, eng engineKind, table string, cols []convColumn) (dump string, pks []int64, err error) {
+// portable), ORDER BY id (numeric — id is BIGINT — so the row order is
+// identical across engines). When canon is true the per-family Go-side
+// normaliser (convCanonField, design #2) folds the two engines'
+// residual spelling differences inside the safe set to a common form;
+// when false the dump is verbatim and two same-engine dumps compare
+// byte for byte. Errors are returned, not fataled — during the
+// convergence poll the target table legitimately doesn't exist yet.
+func convDump(db *sql.DB, eng engineKind, table string, cols []convColumn, canon bool) (dump string, pks []int64, err error) {
 	sel := make([]string, 0, len(cols)+1)
 	if eng == enginePG {
 		sel = append(sel, "id::text")
@@ -184,7 +199,11 @@ func convDump(db *sql.DB, eng engineKind, table string, cols []convColumn) (dump
 	}
 	defer func() { _ = rows.Close() }()
 
-	var b strings.Builder
+	type dumpRow struct {
+		pk   int64
+		line string
+	}
+	var dumped []dumpRow
 	for rows.Next() {
 		vals := make([]sql.NullString, len(cols)+1)
 		dest := make([]any, len(vals))
@@ -198,19 +217,52 @@ func convDump(db *sql.DB, eng engineKind, table string, cols []convColumn) (dump
 		if err != nil {
 			return "", nil, fmt.Errorf("non-integer id %q: %w", vals[0].String, err)
 		}
-		pks = append(pks, pk)
-		fmt.Fprintf(&b, "id=%s", vals[0].String)
+		var line strings.Builder
+		fmt.Fprintf(&line, "id=%s", vals[0].String)
 		for i, c := range cols {
-			if vals[i+1].Valid {
-				fmt.Fprintf(&b, " %s=%q", c.name, vals[i+1].String)
-			} else {
-				fmt.Fprintf(&b, " %s=NULL", c.name)
+			switch {
+			case !vals[i+1].Valid:
+				fmt.Fprintf(&line, " %s=NULL", c.name)
+			case canon:
+				fmt.Fprintf(&line, " %s=%q", c.name, convCanonField(c.fam, vals[i+1].String))
+			default:
+				fmt.Fprintf(&line, " %s=%q", c.name, vals[i+1].String)
 			}
 		}
-		b.WriteByte('\n')
+		dumped = append(dumped, dumpRow{pk: pk, line: line.String()})
 	}
 	if err := rows.Err(); err != nil {
 		return "", nil, err
+	}
+
+	// Sort by NUMERIC pk in Go, NOT via the SQL ORDER BY. The two
+	// engines disagree on what `ORDER BY id` means once id is also
+	// projected as text: PG binds ORDER BY to the `id::text` OUTPUT
+	// column (lexicographic — "12" < "4"), while MySQL binds it to the
+	// bigint TABLE column (numeric). A server-side ORDER BY is therefore
+	// NOT cross-engine-consistent, so two engines would emit byte-
+	// different dumps of IDENTICAL content purely from row order — a
+	// false non-convergence. Sorting here makes the ordering engine-
+	// agnostic, so the dump-vs-dump string equality measures content,
+	// not each dialect's ORDER BY name-resolution quirk. (Same-engine
+	// was unaffected — both sides shared the quirk — which is why this
+	// hid until the cross-engine directions ran.)
+	slices.SortFunc(dumped, func(a, b dumpRow) int {
+		switch {
+		case a.pk < b.pk:
+			return -1
+		case a.pk > b.pk:
+			return 1
+		default:
+			return 0
+		}
+	})
+	var b strings.Builder
+	pks = make([]int64, 0, len(dumped))
+	for _, d := range dumped {
+		b.WriteString(d.line)
+		b.WriteByte('\n')
+		pks = append(pks, d.pk)
 	}
 	return b.String(), pks, nil
 }
@@ -258,8 +310,15 @@ func convDropPGSlot(t *testing.T, dsn, slot string) {
 // check's names are unique).
 func convDropTable(t *testing.T, env *convLiveEnv, table string) {
 	t.Helper()
-	for _, dsn := range []string{env.srcDSN, env.dstDSN} {
-		db, err := sql.Open(env.driver(), dsn)
+	sides := []struct {
+		dsn    string
+		driver string
+	}{
+		{env.srcDSN, env.srcDriver()},
+		{env.dstDSN, env.dstDriver()},
+	}
+	for _, s := range sides {
+		db, err := sql.Open(s.driver, s.dsn)
 		if err != nil {
 			continue
 		}
@@ -288,10 +347,10 @@ func convDumpFixture(t *testing.T, env *convLiveEnv, c *convCase, table string) 
 	p := filepath.Join(convFixturesPath, strings.ReplaceAll(t.Name(), "/", "_")+".sql")
 	header := fmt.Sprintf(
 		"-- SYNC-CONVERGENCE FAILURE — minimal shrunk case (overwritten per shrink attempt)\n"+
-			"-- test=%s engine=%s apply-batch=%d\n"+
+			"-- test=%s direction=%s apply-batch=%d\n"+
 			"-- replay: SLUICE_CONVERGE_SEED=%d SLUICE_CONVERGE_ITERS=%d SLUICE_CONVERGE_OPS=%d go test -tags=integration -run '^%s$' ./internal/pipeline\n"+
 			"-- (or the -rapid.failfile command rapid prints; raise -rapid.shrinktime for a smaller script)\n\n",
-		t.Name(), env.eng, c.applyBatch, env.seed, env.checks, env.maxTxs, t.Name(),
+		t.Name(), env.dir, c.applyBatch, env.seed, env.checks, env.maxTxs, t.Name(),
 	)
 	if err := os.WriteFile(p, []byte(header+c.renderScript(table)), 0o600); err != nil {
 		t.Logf("could not write fixture %s: %v", p, err)
@@ -334,7 +393,7 @@ func runConvCheck(rt *rapid.T, t *testing.T, env *convLiveEnv, c *convCase) {
 		case <-time.After(20 * time.Second):
 			t.Errorf("converge check %d: streamer did not exit within 20s of cancel", idx)
 		}
-		if env.eng == enginePG {
+		if env.dir.src == enginePG {
 			convDropPGSlot(t, env.srcDSN, slotName)
 		}
 		convDropTable(t, env, table)
@@ -343,15 +402,20 @@ func runConvCheck(rt *rapid.T, t *testing.T, env *convLiveEnv, c *convCase) {
 	// Capture-guarantee gates before the finite op burst (the AIMD
 	// "dest only saw 0/250" flake class): bulk-copy completion implies
 	// the source position/slot was pinned strictly earlier, so every
-	// commit from here on is captured by snapshot or CDC. PG
+	// commit from here on is captured by snapshot or CDC. A PG SOURCE
 	// additionally waits on slot existence — the named guarantee (see
-	// waitForSourceSlot's doc).
-	if env.eng == enginePG {
+	// waitForSourceSlot's doc). The bulk-copy completion gate runs on
+	// the TARGET, so its row-count helper is keyed on dir.dst.
+	if env.dir.src == enginePG {
 		waitForSourceSlot(t, env.srcDSN, 60*time.Second)
-		if !waitForRowCount(t, env.dstDSN, table, len(c.initial), 60*time.Second) {
-			rt.Fatalf("bulk copy never delivered the %d initial rows of %s", len(c.initial), table)
-		}
-	} else if !waitForRowCountMySQL(t, env.dstDSN, table, len(c.initial), 60*time.Second) {
+	}
+	bulkCopied := false
+	if env.dir.dst == enginePG {
+		bulkCopied = waitForRowCount(t, env.dstDSN, table, len(c.initial), 60*time.Second)
+	} else {
+		bulkCopied = waitForRowCountMySQL(t, env.dstDSN, table, len(c.initial), 60*time.Second)
+	}
+	if !bulkCopied {
 		rt.Fatalf("bulk copy never delivered the %d initial rows of %s", len(c.initial), table)
 	}
 
@@ -368,18 +432,19 @@ func runConvCheck(rt *rapid.T, t *testing.T, env *convLiveEnv, c *convCase) {
 		t.Fatalf("HARNESS BUG: generated case is model-invalid: %v", err)
 	}
 
-	srcDB, err := sql.Open(env.driver(), env.srcDSN)
+	srcDB, err := sql.Open(env.srcDriver(), env.srcDSN)
 	if err != nil {
 		t.Fatalf("open source: %v", err)
 	}
 	defer func() { _ = srcDB.Close() }()
-	dstDB, err := sql.Open(env.driver(), env.dstDSN)
+	dstDB, err := sql.Open(env.dstDriver(), env.dstDSN)
 	if err != nil {
 		t.Fatalf("open target: %v", err)
 	}
 	defer func() { _ = dstDB.Close() }()
 
-	srcDump, srcPKs, err := convDump(srcDB, env.eng, table, c.cols)
+	canon := env.crossEngine()
+	srcDump, srcPKs, err := convDump(srcDB, env.dir.src, table, c.cols, canon)
 	if err != nil {
 		t.Fatalf("read source dump: %v", err)
 	}
@@ -405,16 +470,19 @@ func runConvCheck(rt *rapid.T, t *testing.T, env *convLiveEnv, c *convCase) {
 	// still in flight) must not pass. The criterion cannot false-pass:
 	// equality against the quiesced source's final dump IS the
 	// property, and the stability re-check closes the
-	// equal-then-diverges hole.
+	// equal-then-diverges hole. The target dump renders in the TARGET
+	// dialect and, cross-engine, is value-semantically canonicalised
+	// (design #2) so it compares equal to the canonicalised source dump
+	// even though raw server text differs by engine.
 	timeout := convConvergeTimeout()
 	deadline := time.Now().Add(timeout)
 	var dstDump string
 	for {
 		var derr error
-		dstDump, _, derr = convDump(dstDB, env.eng, table, c.cols)
+		dstDump, _, derr = convDump(dstDB, env.dir.dst, table, c.cols, canon)
 		if derr == nil && dstDump == srcDump {
 			time.Sleep(convStableGrace)
-			again, _, aerr := convDump(dstDB, env.eng, table, c.cols)
+			again, _, aerr := convDump(dstDB, env.dir.dst, table, c.cols, canon)
 			if aerr == nil && again == srcDump {
 				return // converged, stably
 			}
@@ -435,6 +503,30 @@ func runConvCheck(rt *rapid.T, t *testing.T, env *convLiveEnv, c *convCase) {
 	}
 }
 
+// convMustEngine fetches a registered engine or fails the test.
+func convMustEngine(t *testing.T, name string) ir.Engine {
+	t.Helper()
+	eng, ok := engines.Get(name)
+	if !ok {
+		t.Fatalf("%s engine not registered", name)
+	}
+	return eng
+}
+
+// convRunDirection is the shared driver for all four directions: apply
+// the budget, build the env, log, and run the rapid property over a
+// per-direction generator. The boot is supplied by the caller (the
+// only per-direction difference besides the direction itself).
+func convRunDirection(t *testing.T, dir convDirection, env *convLiveEnv) {
+	t.Logf("sync-convergence property [%s]: seed=%d checks=%d max-txs=%d",
+		dir, env.seed, env.checks, env.maxTxs)
+	gen := convCaseGen(dir, env.maxTxs)
+	rapid.Check(t, func(rt *rapid.T) {
+		c := gen.Draw(rt, "case")
+		runConvCheck(rt, t, env, &c)
+	})
+}
+
 // TestSyncConverges_PGToPG runs the property over the slot-based PG
 // CDC path — the historical bug surface (bug13/15, AIMD, rotation).
 func TestSyncConverges_PGToPG(t *testing.T) {
@@ -442,22 +534,13 @@ func TestSyncConverges_PGToPG(t *testing.T) {
 	srcDSN, dstDSN, cleanup := startPostgresLogical(t)
 	defer cleanup()
 
-	pgEng, ok := engines.Get("postgres")
-	if !ok {
-		t.Fatal("postgres engine not registered")
-	}
+	pgEng := convMustEngine(t, "postgres")
 	env := &convLiveEnv{
-		eng: enginePG, srcDSN: srcDSN, dstDSN: dstDSN,
+		dir: convDirPGToPG, srcDSN: srcDSN, dstDSN: dstDSN,
 		source: pgEng, target: pgEng,
 		seed: seed, checks: checks, maxTxs: maxTxs,
 	}
-	t.Logf("sync-convergence property: seed=%d checks=%d max-txs=%d", seed, checks, maxTxs)
-
-	gen := convCaseGen(enginePG, maxTxs)
-	rapid.Check(t, func(rt *rapid.T) {
-		c := gen.Draw(rt, "case")
-		runConvCheck(rt, t, env, &c)
-	})
+	convRunDirection(t, convDirPGToPG, env)
 }
 
 // TestSyncConverges_MySQLToMySQL runs the property over the binlog
@@ -467,20 +550,57 @@ func TestSyncConverges_MySQLToMySQL(t *testing.T) {
 	srcDSN, dstDSN, cleanup := startMySQLBinlog(t)
 	defer cleanup()
 
-	myEng, ok := engines.Get("mysql")
-	if !ok {
-		t.Fatal("mysql engine not registered")
-	}
+	myEng := convMustEngine(t, "mysql")
 	env := &convLiveEnv{
-		eng: engineMySQL, srcDSN: srcDSN, dstDSN: dstDSN,
+		dir: convDirMySQLToMySQL, srcDSN: srcDSN, dstDSN: dstDSN,
 		source: myEng, target: myEng,
 		seed: seed, checks: checks, maxTxs: maxTxs,
 	}
-	t.Logf("sync-convergence property: seed=%d checks=%d max-txs=%d", seed, checks, maxTxs)
+	convRunDirection(t, convDirMySQLToMySQL, env)
+}
 
-	gen := convCaseGen(engineMySQL, maxTxs)
-	rapid.Check(t, func(rt *rapid.T) {
-		c := gen.Draw(rt, "case")
-		runConvCheck(rt, t, env, &c)
-	})
+// TestSyncConverges_PGToMySQL runs the property CROSS-ENGINE: a PG
+// source (slot-based CDC) streaming into a MySQL target. The generator
+// emits only the cross-engine-safe column families (no bool) and the
+// convergence compare is value-semantic (per-family canonicalisation),
+// not byte-level — see converge_gen.go's cross-engine wart note.
+//
+// Boot: a PG-logical pair (source_db is the CDC source) and a
+// MySQL-binlog pair (its target_db receives the applies). Only the PG
+// source_db and the MySQL target_db are used; the unused sibling DBs
+// just ride along on the already-booted containers.
+func TestSyncConverges_PGToMySQL(t *testing.T) {
+	seed, checks, maxTxs := convApplyRapidBudget(t)
+	pgSrc, _, pgCleanup := startPostgresLogical(t)
+	defer pgCleanup()
+	_, myDst, myCleanup := startMySQLBinlog(t)
+	defer myCleanup()
+
+	env := &convLiveEnv{
+		dir: convDirPGToMySQL, srcDSN: pgSrc, dstDSN: myDst,
+		source: convMustEngine(t, "postgres"), target: convMustEngine(t, "mysql"),
+		seed: seed, checks: checks, maxTxs: maxTxs,
+	}
+	convRunDirection(t, convDirPGToMySQL, env)
+}
+
+// TestSyncConverges_MySQLToPG runs the property CROSS-ENGINE: a MySQL
+// source (binlog CDC) streaming into a PG target. Same safe-subset +
+// value-semantic-compare discipline as PGToMySQL, mirrored.
+//
+// Boot: a MySQL-binlog pair (source_db is the CDC source) and a
+// PG-logical pair (its target_db receives the applies).
+func TestSyncConverges_MySQLToPG(t *testing.T) {
+	seed, checks, maxTxs := convApplyRapidBudget(t)
+	mySrc, _, myCleanup := startMySQLBinlog(t)
+	defer myCleanup()
+	_, pgDst, pgCleanup := startPostgresLogical(t)
+	defer pgCleanup()
+
+	env := &convLiveEnv{
+		dir: convDirMySQLToPG, srcDSN: mySrc, dstDSN: pgDst,
+		source: convMustEngine(t, "mysql"), target: convMustEngine(t, "postgres"),
+		seed: seed, checks: checks, maxTxs: maxTxs,
+	}
+	convRunDirection(t, convDirMySQLToPG, env)
 }

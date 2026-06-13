@@ -99,17 +99,33 @@ func TestConvergeGen_ModelRejectsInvalidOps(t *testing.T) {
 	}
 }
 
+// convTestDirections is the full four-direction matrix the unit pins
+// iterate (mirrors the live harness's four TestSyncConverges_*).
+var convTestDirections = []convDirection{
+	convDirPGToPG, convDirMySQLToMySQL, convDirPGToMySQL, convDirMySQLToPG,
+}
+
 // TestConvergeGen_GeneratedOpsAreModelValid pins the generator's
-// by-construction validity: every drawn case (any shrink of it goes
-// through the same generator, so this covers shrunk cases too)
-// replays cleanly through a fresh model, carries every column family,
-// and respects the structural invariants the live harness relies on.
+// by-construction validity, per direction: every drawn case (any
+// shrink of it goes through the same generator, so this covers shrunk
+// cases too) replays cleanly through a fresh model, carries every
+// column family in the DIRECTION's family set (the full set
+// same-engine; the cross-engine-safe subset cross-engine), carries NO
+// family outside it, and respects the structural invariants the live
+// harness relies on.
 func TestConvergeGen_GeneratedOpsAreModelValid(t *testing.T) {
-	for _, eng := range []engineKind{enginePG, engineMySQL} {
-		gen := convCaseGen(eng, 8)
-		t.Run(eng.String(), func(t *testing.T) {
+	for _, dir := range convTestDirections {
+		gen := convCaseGen(dir, 8)
+		want := map[convFamily]bool{}
+		for _, f := range dir.families() {
+			want[f] = true
+		}
+		t.Run(dir.String(), func(t *testing.T) {
 			rapid.Check(t, func(rt *rapid.T) {
 				c := gen.Draw(rt, "case")
+				if c.dir != dir {
+					rt.Fatalf("case direction = %s; want %s", c.dir, dir)
+				}
 				if _, err := c.finalModel(); err != nil {
 					rt.Fatalf("generated case is model-invalid: %v", err)
 				}
@@ -118,9 +134,12 @@ func TestConvergeGen_GeneratedOpsAreModelValid(t *testing.T) {
 				}
 				seen := map[convFamily]bool{}
 				for _, col := range c.cols {
+					if !want[col.fam] {
+						rt.Fatalf("family %s emitted for direction %s but is not in its safe set", col.fam, dir)
+					}
 					seen[col.fam] = true
 				}
-				for f := convFamily(0); f < convFamCount; f++ {
+				for f := range want {
 					if !seen[f] {
 						rt.Fatalf("family %s missing from the table shape (pin the class)", f)
 					}
@@ -146,18 +165,51 @@ func TestConvergeGen_GeneratedOpsAreModelValid(t *testing.T) {
 	}
 }
 
+// TestConvergeGen_CrossEngineUsesSafeSubsetOnly pins design decision #1
+// directly: a cross-engine direction's family set is exactly the safe
+// subset (int/text/numeric/timestamp — bool EXCLUDED), while a
+// same-engine direction carries every family including bool.
+func TestConvergeGen_CrossEngineUsesSafeSubsetOnly(t *testing.T) {
+	for _, dir := range convTestDirections {
+		got := map[convFamily]bool{}
+		for _, f := range dir.families() {
+			got[f] = true
+		}
+		if dir.crossEngine() {
+			if got[convFamBool] {
+				t.Errorf("%s (cross-engine): bool must be excluded from the safe subset", dir)
+			}
+			for _, f := range []convFamily{convFamInt, convFamText, convFamNumeric, convFamTimestamp} {
+				if !got[f] {
+					t.Errorf("%s (cross-engine): safe family %s missing", dir, f)
+				}
+			}
+			if len(got) != 4 {
+				t.Errorf("%s (cross-engine): family set size = %d; want exactly 4 (the safe subset)", dir, len(got))
+			}
+		} else {
+			for f := convFamily(0); f < convFamCount; f++ {
+				if !got[f] {
+					t.Errorf("%s (same-engine): family %s must be present (full set)", dir, f)
+				}
+			}
+		}
+	}
+}
+
 // TestConvergeGen_SameSeedRegeneratesByteIdenticalScript is the
-// deterministic-regeneration pin: a failure's replay instructions are
-// only honest if (seed, budget) regenerates the exact same op script.
+// deterministic-regeneration pin, per direction: a failure's replay
+// instructions are only honest if (direction, seed, budget)
+// regenerates the exact same op script.
 func TestConvergeGen_SameSeedRegeneratesByteIdenticalScript(t *testing.T) {
-	for _, eng := range []engineKind{enginePG, engineMySQL} {
-		gen := convCaseGen(eng, 8)
+	for _, dir := range convTestDirections {
+		gen := convCaseGen(dir, 8)
 		for seed := 1; seed <= 10; seed++ {
 			a := gen.Example(seed)
 			b := gen.Example(seed)
 			sa, sb := a.renderScript("conv_pin"), b.renderScript("conv_pin")
 			if sa != sb {
-				t.Fatalf("non-deterministic generation [%s seed %d]:\n--- A ---\n%s\n--- B ---\n%s", eng, seed, sa, sb)
+				t.Fatalf("non-deterministic generation [%s seed %d]:\n--- A ---\n%s\n--- B ---\n%s", dir, seed, sa, sb)
 			}
 		}
 	}
@@ -170,7 +222,7 @@ func TestConvergeGen_SameSeedRegeneratesByteIdenticalScript(t *testing.T) {
 // them, this trips. (Generation is dialect-independent — the engine
 // only affects rendering — so one engine's sample suffices.)
 func TestConvergeGen_NastyInterleavingsGenerated(t *testing.T) {
-	gen := convCaseGen(enginePG, 8)
+	gen := convCaseGen(convDirPGToPG, 8)
 	patterns := map[convTxPattern]int{}
 	pkUpdates, pkReuses, nulls := 0, 0, 0
 	for seed := 0; seed < 200; seed++ {
@@ -234,6 +286,84 @@ func TestConvergeGen_StringLiteralEscaping(t *testing.T) {
 	}
 	if got, want := quoteConvString(in, engineMySQL), `'it''s c:\\tmp'`; got != want {
 		t.Errorf("MySQL quote = %s; want %s", got, want)
+	}
+}
+
+// TestConvergeGen_CrossEngineCanonField pins design decision #2: the
+// per-family normaliser folds the two engines' residual canonical-text
+// differences (inside the safe subset) to a common form so a faithful
+// cross-engine sync compares equal. The cases are the exact divergence
+// shapes documented in convCanonField: numeric negative-zero (PG keeps
+// the sign, MySQL drops it) and timestamp trailing-zero fraction (PG
+// drops it in ::text, MySQL DATETIME(6) keeps six digits). int and
+// text are pass-through (already byte-identical across engines).
+func TestConvergeGen_CrossEngineCanonField(t *testing.T) {
+	cases := []struct {
+		name string
+		fam  convFamily
+		in   string
+		want string
+	}{
+		{"int passthrough", convFamInt, "123", "123"},
+		{"int negative", convFamInt, "-9223372036854775808", "-9223372036854775808"},
+		{"text passthrough", convFamText, `a "b" \c`, `a "b" \c`},
+		{"text empty", convFamText, "", ""},
+		{"numeric plain", convFamNumeric, "12.3400", "12.3400"},
+		{"numeric negative", convFamNumeric, "-12.3400", "-12.3400"},
+		{"numeric negzero scaled (PG form)", convFamNumeric, "-0.0000", "0.0000"},
+		{"numeric negzero int (PG form)", convFamNumeric, "-0", "0"},
+		{"numeric positive zero", convFamNumeric, "0.0000", "0.0000"},
+		// A negative value whose integer part is zero but fraction is not
+		// must KEEP its sign.
+		{"numeric small negative", convFamNumeric, "-0.0001", "-0.0001"},
+		{"ts no-frac (PG form)", convFamTimestamp, "2020-01-02 03:04:05", "2020-01-02 03:04:05"},
+		{"ts zero-frac (MySQL form)", convFamTimestamp, "2020-01-02 03:04:05.000000", "2020-01-02 03:04:05"},
+		{"ts full-precision frac kept", convFamTimestamp, "2020-01-02 03:04:05.000006", "2020-01-02 03:04:05.000006"},
+		// Partial fractions: MySQL DATETIME(6) renders six digits, PG
+		// ::text trims trailing zeros. The fold must match PG (strip
+		// trailing zeros), NOT keep MySQL's padding — otherwise PG's
+		// "…05.1" and MySQL's "…05.100000" stay divergent and a faithful
+		// sync of microsecond 100000 spuriously fails to converge.
+		{"ts trailing-zero frac (MySQL form) folds to PG", convFamTimestamp, "2020-01-02 03:04:05.100000", "2020-01-02 03:04:05.1"},
+		{"ts already-trimmed frac (PG form) is stable", convFamTimestamp, "2020-01-02 03:04:05.1", "2020-01-02 03:04:05.1"},
+		{"ts mid trailing zeros (MySQL form)", convFamTimestamp, "2020-01-02 03:04:05.123000", "2020-01-02 03:04:05.123"},
+	}
+	for _, c := range cases {
+		if got := convCanonField(c.fam, c.in); got != c.want {
+			t.Errorf("%s: convCanonField(%s, %q) = %q; want %q", c.name, c.fam, c.in, got, c.want)
+		}
+	}
+
+	// The cross-engine invariant the fold exists to guarantee: a value's
+	// PG canonical text and its MySQL canonical text must normalise to
+	// the SAME string, for every shape in the safe set. (Pinning the two
+	// dialects' renderings of one logical microsecond value side by side
+	// — the gap the "keep trailing zeros" form missed.)
+	crossPairs := []struct {
+		name           string
+		fam            convFamily
+		pgText, myText string
+	}{
+		{"ts microsecond 100000", convFamTimestamp, "2020-01-02 03:04:05.1", "2020-01-02 03:04:05.100000"},
+		{"ts microsecond 6", convFamTimestamp, "2020-01-02 03:04:05.000006", "2020-01-02 03:04:05.000006"},
+		{"ts integer second", convFamTimestamp, "2020-01-02 03:04:05", "2020-01-02 03:04:05.000000"},
+		{"numeric neg zero", convFamNumeric, "-0.0000", "0.0000"},
+		{"numeric value", convFamNumeric, "12.3400", "12.3400"},
+	}
+	for _, c := range crossPairs {
+		pg, my := convCanonField(c.fam, c.pgText), convCanonField(c.fam, c.myText)
+		if pg != my {
+			t.Errorf("%s: cross-engine fold mismatch: PG %q→%q vs MySQL %q→%q", c.name, c.pgText, pg, c.myText, my)
+		}
+	}
+
+	// Bool is NOT in the cross-engine safe set, so convCanonField is
+	// never called on it cross-engine; but if it were, it would be
+	// pass-through (no normalisation) — pin that it does not silently
+	// "fix" the true/false vs 1/0 divergence, which is exactly why bool
+	// is excluded rather than canonicalised.
+	if got := convCanonField(convFamBool, "true"); got != "true" {
+		t.Errorf("convCanonField(bool, true) = %q; want pass-through %q", got, "true")
 	}
 }
 
