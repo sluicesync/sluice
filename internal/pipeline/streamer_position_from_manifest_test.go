@@ -70,6 +70,7 @@ func TestStreamer_PositionFromManifest_BypassesAppliedReadPosition(t *testing.T)
 		SourceDSN:                 "src",
 		TargetDSN:                 "tgt",
 		StreamID:                  "test-stream",
+		SchemaChanges:             "refuse", // ADR-0091: dispatch test, not exercising DDL forwarding
 		Applier:                   applier,
 		PositionFromManifestStore: store,
 	}
@@ -127,6 +128,7 @@ func TestStreamer_PositionFromManifest_EmptyEndPosition(t *testing.T) {
 		SourceDSN:                 "src",
 		TargetDSN:                 "tgt",
 		StreamID:                  "test-stream",
+		SchemaChanges:             "refuse", // ADR-0091: dispatch test, not exercising DDL forwarding
 		Applier:                   applier,
 		PositionFromManifestStore: store,
 	}
@@ -180,6 +182,7 @@ func TestStreamer_PositionFromManifest_StrictPreflightWarningsRefuse(t *testing.
 		SourceDSN:                 "src",
 		TargetDSN:                 "tgt",
 		StreamID:                  "test-stream",
+		SchemaChanges:             "refuse", // ADR-0091: dispatch test, not exercising DDL forwarding
 		Applier:                   applier,
 		PositionFromManifestStore: store,
 		StrictPreflight:           true,
@@ -233,6 +236,7 @@ func TestStreamer_PositionFromManifest_PreflightRefusalAlwaysRefuses(t *testing.
 		SourceDSN:                 "src",
 		TargetDSN:                 "tgt",
 		StreamID:                  "test-stream",
+		SchemaChanges:             "refuse", // ADR-0091: dispatch test, not exercising DDL forwarding
 		Applier:                   applier,
 		PositionFromManifestStore: store,
 		// StrictPreflight: false  -- refusal must trip regardless.

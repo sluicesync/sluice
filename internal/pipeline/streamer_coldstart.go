@@ -273,7 +273,7 @@ func (s *Streamer) coldStartPrepareSchema(schema *ir.Schema) (*ir.Schema, error)
 	// RelationMessage on first-touch (before any DDL); MySQL's binlog
 	// has no first-touch equivalent.
 	if (s.InjectShardColumn.Engaged() && s.CoordinateLiveDDL) ||
-		(s.ForwardSchemaAddColumn && !s.InjectShardColumn.Engaged()) {
+		(s.forwardSchemaEnabled() && !s.InjectShardColumn.Engaged()) {
 		s.coldStartSeedSnapshots = synthesizeColdStartSeedSnapshots(schema, s.Source)
 	}
 

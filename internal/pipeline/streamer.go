@@ -589,22 +589,32 @@ type Streamer struct {
 	// engaged.
 	ShardCoordinationLease LeaseConfig
 
-	// ForwardSchemaAddColumn is the ADR-0058 single-stream forward-
-	// add-column toggle. When true AND [InjectShardColumn] is NOT
-	// engaged, the streamer wraps the CDC change channel with the
-	// [interceptAddColumnForward] intercept: observed ADD COLUMN
-	// shapes on the source forward to the target via
-	// [ir.SchemaDeltaApplier.AlterAddColumn]; every other recognized
-	// shape (DROP / ALTER TYPE / RENAME / index / multi-shape combo)
-	// refuses loudly with the drained-model recovery hint.
+	// SchemaChanges is the ADR-0091 single-stream schema-change-
+	// forwarding mode: "forward" (the default) or "refuse". When
+	// "forward" AND [InjectShardColumn] is NOT engaged, the streamer
+	// wraps the CDC change channel with the [interceptAddColumnForward]
+	// intercept: every unambiguous source DDL shape (ADD / DROP COLUMN,
+	// ALTER COLUMN TYPE / NULLABILITY, CREATE / DROP INDEX, ADD / DROP /
+	// MODIFY CHECK) forwards to the target via [ir.ShapeDeltaApplier];
+	// RENAME COLUMN, multi-shape combos, and computed-DEFAULT ADD
+	// COLUMN refuse loudly with the drained-model recovery hint. When
+	// "refuse", any source DDL refuses loudly (the conservative
+	// pre-ADR-0091 behavior).
 	//
-	// Default false — pre-v0.79.0 behavior is preserved (ADD COLUMN
-	// on source surfaces as `column does not exist` on the next row
-	// event). Wired via the `--forward-schema-add-column` CLI flag.
+	// Empty string is treated as "forward" (the default) so
+	// zero-valued Streamer configs in tests and older callers get the
+	// shipping default. Wired via the `--schema-changes` CLI flag.
 	//
 	// No-op when [InjectShardColumn] is engaged: Shape A's
 	// [BoundaryRouter] already handles every recognized shape via
 	// the lease (ADR-0054 DP-E).
+	SchemaChanges string
+
+	// ForwardSchemaAddColumn is the DEPRECATED ADR-0058 ADD-COLUMN-only
+	// opt-in, subsumed by [SchemaChanges] (ADR-0091). When set it
+	// triggers a one-time deprecation WARN; it does NOT change behavior
+	// (forwarding is on by default via SchemaChanges). Kept for one
+	// deprecation cycle so existing configs/flags keep working.
 	ForwardSchemaAddColumn bool
 
 	// BackfillAddedColumn enables source-side bounded backfill of

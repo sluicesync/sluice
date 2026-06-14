@@ -697,8 +697,8 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 	// SchemaSnapshot only AFTER DDL — so the first ALTER silently
 	// passes through as the anchor rather than being classified and
 	// forwarded.
-	if s.ForwardSchemaAddColumn && s.boundaryRouter == nil && s.addColumnForwardWriter != nil {
-		if deltaApplier, ok := s.addColumnForwardWriter.(ir.SchemaDeltaApplier); ok {
+	if s.forwardSchemaEnabled() && s.boundaryRouter == nil && s.addColumnForwardWriter != nil {
+		if deltaApplier, ok := s.addColumnForwardWriter.(ir.ShapeDeltaApplier); ok {
 			deps := schemaForwardDeps{
 				applier:          deltaApplier,
 				sourceEngineName: s.Source.Name(),

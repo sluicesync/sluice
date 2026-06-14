@@ -190,12 +190,13 @@ func TestStreamer_WarmResume_CrossEngine_Retag(t *testing.T) {
 			defer cancel()
 
 			s := &Streamer{
-				Source:    source,
-				Target:    target,
-				SourceDSN: "src",
-				TargetDSN: "tgt",
-				StreamID:  "test-stream",
-				Applier:   applier,
+				Source:        source,
+				Target:        target,
+				SourceDSN:     "src",
+				TargetDSN:     "tgt",
+				StreamID:      "test-stream",
+				SchemaChanges: "refuse", // ADR-0091: dispatch test, not exercising DDL forwarding
+				Applier:       applier,
 			}
 			// Run will block in dispatchApply on the empty change channel
 			// returned by capturingCDCReader; cancel the context to
@@ -346,12 +347,13 @@ func TestStreamer_ClosesCDCReader_BeforeRunReturns(t *testing.T) {
 	defer cancel()
 
 	s := &Streamer{
-		Source:    source,
-		Target:    target,
-		SourceDSN: "src",
-		TargetDSN: "tgt",
-		StreamID:  "test-stream",
-		Applier:   applier,
+		Source:        source,
+		Target:        target,
+		SourceDSN:     "src",
+		TargetDSN:     "tgt",
+		StreamID:      "test-stream",
+		SchemaChanges: "refuse", // ADR-0091: dispatch test, not exercising DDL forwarding
+		Applier:       applier,
 	}
 	runErr := make(chan error, 1)
 	go func() { runErr <- s.Run(ctx) }()

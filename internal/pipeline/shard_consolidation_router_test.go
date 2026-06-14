@@ -31,6 +31,14 @@ func (f *fakeShapeApplier) record(name string) error {
 	return f.injectErr
 }
 
+// callNames returns a copy of the recorded applier-method call names,
+// safe to read after the intercept goroutine has finished.
+func (f *fakeShapeApplier) callNames() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.calls...)
+}
+
 func (f *fakeShapeApplier) AlterAddColumn(_ context.Context, _ *ir.Table, _ []*ir.Column) error {
 	f.mu.Lock()
 	f.addColCalls++

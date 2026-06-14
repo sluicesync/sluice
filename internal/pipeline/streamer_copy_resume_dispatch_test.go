@@ -58,12 +58,13 @@ func TestStreamer_InterruptedColdStart_RoutesToBulkResume(t *testing.T) {
 	defer cancel()
 
 	s := &Streamer{
-		Source:    source,
-		Target:    target,
-		SourceDSN: "src",
-		TargetDSN: "tgt",
-		StreamID:  "test-stream",
-		Applier:   applier,
+		Source:        source,
+		Target:        target,
+		SourceDSN:     "src",
+		TargetDSN:     "tgt",
+		StreamID:      "test-stream",
+		SchemaChanges: "refuse", // ADR-0091: dispatch test, not exercising DDL forwarding
+		Applier:       applier,
 	}
 	err := s.Run(ctx)
 
@@ -116,12 +117,13 @@ func TestStreamer_CompletedColdStart_StaysOnPlainCDC(t *testing.T) {
 	defer cancel()
 
 	s := &Streamer{
-		Source:    source,
-		Target:    target,
-		SourceDSN: "src",
-		TargetDSN: "tgt",
-		StreamID:  "test-stream",
-		Applier:   applier,
+		Source:        source,
+		Target:        target,
+		SourceDSN:     "src",
+		TargetDSN:     "tgt",
+		StreamID:      "test-stream",
+		SchemaChanges: "refuse", // ADR-0091: dispatch test, not exercising DDL forwarding
+		Applier:       applier,
 	}
 	runErr := make(chan error, 1)
 	go func() { runErr <- s.Run(ctx) }()
@@ -176,6 +178,7 @@ func TestStreamer_RestartFromScratch_ForcesColdStart(t *testing.T) {
 		SourceDSN:          "src",
 		TargetDSN:          "tgt",
 		StreamID:           "test-stream",
+		SchemaChanges:      "refuse", // ADR-0091: dispatch test, not exercising DDL forwarding
 		Applier:            applier,
 		RestartFromScratch: true,
 	}

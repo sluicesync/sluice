@@ -15,9 +15,22 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
+
+// forwardSchemaEnabled reports whether ADR-0091 single-stream schema-
+// change forwarding is active for this stream. Forwarding is ON by
+// default; only an explicit --schema-changes=refuse turns it off (the
+// empty zero-value is treated as "forward" so older callers and tests
+// get the shipping default). The deprecated --forward-schema-add-column
+// does NOT change this — forwarding is already on by default — it only
+// triggers a deprecation WARN at engage time.
+func (s *Streamer) forwardSchemaEnabled() bool {
+	return !strings.EqualFold(s.SchemaChanges, "refuse")
+}
 
 // engageAddColumnForward opens the target SchemaWriter the ADR-0058
 // intercept uses for ALTER TABLE … ADD COLUMN, and (when backfill is
@@ -43,7 +56,14 @@ import (
 // Idempotent: re-running with already-set fields is a no-op (the
 // existing fields are reused; no double-close in cleanup).
 func (s *Streamer) engageAddColumnForward(ctx context.Context) error {
-	if !s.ForwardSchemaAddColumn {
+	if s.ForwardSchemaAddColumn {
+		slog.WarnContext(ctx,
+			"--forward-schema-add-column is deprecated (ADR-0091): schema-change "+
+				"forwarding is now on by default and covers every unambiguous shape. "+
+				"Use --schema-changes=refuse to restore loud-refuse-on-DDL; the flag "+
+				"will be removed in a future release.")
+	}
+	if !s.forwardSchemaEnabled() {
 		return nil
 	}
 	if s.InjectShardColumn.Engaged() {
@@ -63,9 +83,11 @@ func (s *Streamer) engageAddColumnForward(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("pipeline: engage add-column-forward: open schema writer: %w", err)
 		}
-		if _, ok := sw.(ir.SchemaDeltaApplier); !ok {
+		if _, ok := sw.(ir.ShapeDeltaApplier); !ok {
 			_ = closeIfErrIgnored(sw)
-			return s.refuseEngineMissingAddColumnForward("schema delta applier (AlterAddColumn)")
+			return s.refuseEngineMissingAddColumnForward(
+				"shape delta applier (AlterAddColumn / AlterDropColumn / AlterColumnType / ...)",
+			)
 		}
 		// Honor --target-schema if set so DDL emits to the right
 		// namespace. Mirrors the Shape A engage path.

@@ -224,37 +224,91 @@ func TestForwardAddColumn_SeededPre_BareName_FallbackResolves(t *testing.T) {
 	}
 }
 
-// TestForwardAddColumn_DropColumnShape_RefuseLoudly verifies that
-// every non-ADD-COLUMN shape refuses loudly. Drop is the canonical
-// representative; the switch in routeForwardBoundary handles each
-// case identically.
-func TestForwardAddColumn_DropColumnShape_RefuseLoudly(t *testing.T) {
+// TestForwardSchema_ForwardsUnambiguousShapes verifies ADR-0091: every
+// unambiguous source schema change forwards to the target via the
+// matching [ir.ShapeDeltaApplier] method (NOT refuse-loudly as in the
+// ADR-0058 ADD-only era). Drop / alter-type / alter-nullability are the
+// column-shape representatives; the index + CHECK shapes share the same
+// applyShapeDelta dispatch (pinned by the router tests) and the
+// cross-engine integration matrix.
+func TestForwardSchema_ForwardsUnambiguousShapes(t *testing.T) {
+	cases := []struct {
+		name     string
+		pre      *ir.Table
+		post     *ir.Table
+		wantCall string
+	}{
+		{
+			name:     "drop-column",
+			pre:      addColForwardTable("users", &ir.Column{Name: "nickname", Type: ir.Varchar{Length: 100}, Nullable: true}),
+			post:     addColForwardTable("users"),
+			wantCall: "AlterDropColumn",
+		},
+		{
+			name:     "alter-column-type",
+			pre:      addColForwardTable("users", &ir.Column{Name: "n", Type: ir.Integer{Width: 32}, Nullable: true}),
+			post:     addColForwardTable("users", &ir.Column{Name: "n", Type: ir.Integer{Width: 64}, Nullable: true}),
+			wantCall: "AlterColumnType",
+		},
+		{
+			name:     "alter-column-nullability",
+			pre:      addColForwardTable("users", &ir.Column{Name: "n", Type: ir.Integer{Width: 32}, Nullable: true}),
+			post:     addColForwardTable("users", &ir.Column{Name: "n", Type: ir.Integer{Width: 32}, Nullable: false}),
+			wantCall: "AlterColumnNullability",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			in := make(chan ir.Change, 2)
+			applier := &fakeShapeApplier{}
+			in <- addColForwardSnap(tc.pre)
+			in <- addColForwardSnap(tc.post)
+			close(in)
+			errStore := &atomic.Pointer[error]{}
+			out := interceptAddColumnForward(ctx, in, nil, schemaForwardDeps{
+				applier:          applier,
+				sourceEngineName: "postgres",
+				targetEngineName: "postgres",
+			}, errStore)
+			_ = drainChannel(t, out, time.Second)
+			if ePtr := errStore.Load(); ePtr != nil {
+				t.Fatalf("expected forward (no error); got %v", *ePtr)
+			}
+			calls := applier.callNames()
+			if len(calls) != 1 || calls[0] != tc.wantCall {
+				t.Errorf("applier calls = %v; want exactly [%s]", calls, tc.wantCall)
+			}
+		})
+	}
+}
+
+// TestForwardSchema_RefusesAmbiguousShapes pins the ADR-0091 §2/§3
+// refuse-loudly catalog under the default forward mode: RENAME COLUMN
+// (indistinguishable from drop+add of a same-type column — forwarding
+// the wrong guess risks silent data loss) and a multi-shape combo (a
+// drop + an add of a DIFFERENT type) both refuse and emit NO DDL.
+func TestForwardSchema_RefusesAmbiguousShapes(t *testing.T) {
 	cases := []struct {
 		name   string
 		pre    *ir.Table
 		post   *ir.Table
-		wantIn string // substring expected in the refusal message
+		wantIn string
 	}{
-		{
-			name:   "drop-column",
-			pre:    addColForwardTable("users", &ir.Column{Name: "nickname", Type: ir.Varchar{Length: 100}, Nullable: true}),
-			post:   addColForwardTable("users"),
-			wantIn: "drop-column",
-		},
 		{
 			name:   "rename-column",
 			pre:    addColForwardTable("users", &ir.Column{Name: "old", Type: ir.Varchar{Length: 100}, Nullable: true}),
 			post:   addColForwardTable("users", &ir.Column{Name: "new", Type: ir.Varchar{Length: 100}, Nullable: true}),
-			wantIn: "rename-column",
+			wantIn: "RENAME COLUMN",
 		},
 		{
-			name: "alter-column-type",
-			pre:  addColForwardTable("users", &ir.Column{Name: "n", Type: ir.Integer{Width: 32}, Nullable: true}),
-			post: addColForwardTable("users", &ir.Column{Name: "n", Type: ir.Integer{Width: 64}, Nullable: true}),
-			// classifier may return either alter-column-type or unrecognized
-			// depending on Type equality; the refusal substring covers both
-			// canonical forms ("alter-column" matches both).
-			wantIn: "alter-column",
+			// drop "a" + add "b" of a DIFFERENT type → two delta classes
+			// → ShapeKindUnrecognized → classify-error refusal.
+			name:   "multi-shape-combo",
+			pre:    addColForwardTable("users", &ir.Column{Name: "a", Type: ir.Integer{Width: 32}, Nullable: true}),
+			post:   addColForwardTable("users", &ir.Column{Name: "b", Type: ir.Varchar{Length: 50}, Nullable: true}),
+			wantIn: "multi-shape combo",
 		},
 	}
 	for _, tc := range cases {
@@ -278,10 +332,10 @@ func TestForwardAddColumn_DropColumnShape_RefuseLoudly(t *testing.T) {
 				t.Fatalf("expected refuse-loudly error; got nil")
 			}
 			if !strings.Contains((*ePtr).Error(), tc.wantIn) {
-				t.Errorf("error %q does not contain shape name %q", (*ePtr).Error(), tc.wantIn)
+				t.Errorf("error %q does not contain %q", (*ePtr).Error(), tc.wantIn)
 			}
-			if applier.addColCalls != 0 {
-				t.Errorf("AlterAddColumn called %d times on refuse-loudly path; want 0", applier.addColCalls)
+			if calls := applier.callNames(); len(calls) != 0 {
+				t.Errorf("applier made %v calls on refuse-loudly path; want none", calls)
 			}
 		})
 	}

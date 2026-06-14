@@ -22,8 +22,9 @@ func TestRenderSchemaDriftReport_Empty(t *testing.T) {
 
 // TestRenderSchemaDriftReport_ColumnAdded verifies that the rendered
 // "column-added" line includes the type, nullability, AND the
-// operator-action hint that points to --forward-schema-add-column.
-// F11's operator-action contract.
+// operator-action hint. Under ADR-0091 a standalone ADD COLUMN
+// auto-forwards, so this line appears only in a multi-shape combo
+// refusal; the hint points to drained recovery for the whole combo.
 func TestRenderSchemaDriftReport_ColumnAdded(t *testing.T) {
 	r := irdiff.SchemaDriftReport{
 		ColumnsAdded: []irdiff.ColumnDriftEntry{
@@ -37,8 +38,8 @@ func TestRenderSchemaDriftReport_ColumnAdded(t *testing.T) {
 		"Timestamp",
 		"NULL",
 		"drained schema migrate",
-		"--forward-schema-add-column",
-		"ADR-0058",
+		"auto-forwards by default",
+		"ADR-0091",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("rendered %q missing %q", got, want)
