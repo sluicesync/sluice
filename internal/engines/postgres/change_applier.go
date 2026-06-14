@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jackc/pglogrepl"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"sluicesync.dev/sluice/internal/appliershared"
@@ -212,6 +213,20 @@ type ChangeApplier struct {
 	// applier's colTypeCache (repo-audit M2.1 convergence). Populated
 	// lazily on the first sight of a table — same shape as pkCache.
 	colTypeCache map[string]map[string]*ir.Column
+
+	// schemaDirtyTables marks (routed) qualified table names that have
+	// crossed a forwarded schema boundary in THIS applier's lifetime
+	// (ADR-0091 F7a GAP #3). DML on a dirty table is executed with
+	// pgx's QueryExecModeExec so pgx re-describes the statement's
+	// parameter OIDs each call instead of reusing its per-connection
+	// prepared-statement cache — which, keyed by the byte-identical SQL
+	// text, would otherwise keep binding a widened column (int4→bigint)
+	// against the stale pre-DDL OID and fail to encode an out-of-old-
+	// range value. Steady-state (no DDL) tables stay on the cached fast
+	// path. Set in [ChangeApplier.invalidateTargetCachesForBoundary];
+	// read in the INSERT/UPDATE/DELETE dispatch arms. Applier-goroutine-
+	// owned (same single-goroutine contract as the other caches).
+	schemaDirtyTables map[string]bool
 
 	// lsnFeedback is the slot-ack-after-apply tracker (Bug 15,
 	// ADR-0020). The applier reports the LSN of each successfully-
@@ -539,6 +554,25 @@ func (a *ChangeApplier) forceSynchronousCommitOn(ctx context.Context, tx *sql.Tx
 		return fmt.Errorf("postgres: applier: force synchronous_commit=on: %w", err)
 	}
 	return nil
+}
+
+// execDMLArgs prepends pgx.QueryExecModeExec to args when the routed
+// table has crossed a forwarded schema boundary in this applier's
+// lifetime (ADR-0091 F7a GAP #3). pgx's stdlib path treats a leading
+// QueryExecMode as a per-call mode override; QueryExecModeExec skips
+// the per-connection prepared-statement cache so the just-altered
+// column's parameter OID is re-described from the live catalog rather
+// than reused from the stale pre-DDL cache entry (which is keyed by the
+// byte-identical SQL text and would otherwise keep encoding e.g. a
+// widened bigint value against the cached int4 OID). Steady-state
+// (never-altered) tables keep the cached fast path.
+func (a *ChangeApplier) execDMLArgs(routedSchema, table string, args []any) []any {
+	if !a.schemaDirtyTables[schemaTableKey(routedSchema, table)] {
+		return args
+	}
+	out := make([]any, 0, len(args)+1)
+	out = append(out, pgx.QueryExecModeExec)
+	return append(out, args...)
 }
 
 // txExec wraps tx.ExecContext with the applier's per-exec timeout
@@ -1104,7 +1138,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return fmt.Errorf("postgres: applier: build insert for %s.%s: %w", schema, v.Table, err)
 		}
-		if _, err := a.txExec(ctx, tx, stmt, args...); err != nil {
+		if _, err := a.txExec(ctx, tx, stmt, a.execDMLArgs(schema, v.Table, args)...); err != nil {
 			return fmt.Errorf("postgres: applier: insert into %s.%s: %w", schema, v.Table, err)
 		}
 		return nil
@@ -1127,7 +1161,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		// idempotency; the same caveat as MySQL applies — see the
 		// MySQL applier's dispatch comment for the rationale and the
 		// debug-log defence-in-depth.
-		res, err := a.txExec(ctx, tx, stmt, args...)
+		res, err := a.txExec(ctx, tx, stmt, a.execDMLArgs(schema, v.Table, args)...)
 		if err != nil {
 			return fmt.Errorf("postgres: applier: update %s.%s: %w", schema, v.Table, err)
 		}
@@ -1148,7 +1182,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return fmt.Errorf("postgres: applier: build delete for %s.%s: %w", schema, v.Table, err)
 		}
-		res, err := a.txExec(ctx, tx, stmt, args...)
+		res, err := a.txExec(ctx, tx, stmt, a.execDMLArgs(schema, v.Table, args)...)
 		if err != nil {
 			return fmt.Errorf("postgres: applier: delete from %s.%s: %w", schema, v.Table, err)
 		}

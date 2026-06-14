@@ -270,6 +270,89 @@ func TestApplier_ActiveSchema_NotConfusedByUnknownSchema(t *testing.T) {
 	}
 }
 
+// TestApplier_CacheAfterCommit_InvalidatesTargetCaches pins the
+// ADR-0091 F7a GAP #3 fix: when a SchemaSnapshot boundary commits, the
+// applier's target-side per-table metadata caches (colTypeCache /
+// pkCache / conflictKeyCache) for that table are dropped, so the next
+// DML re-reads the live post-DDL catalog rather than encoding against
+// the stale pre-DDL column type/OID.
+func TestApplier_CacheAfterCommit_InvalidatesTargetCaches(t *testing.T) {
+	a := &ChangeApplier{
+		schema:           "public",
+		streamID:         "s1",
+		activeSchema:     make(map[string]activeSchemaVersion),
+		colTypeCache:     make(map[string]map[string]*ir.Column),
+		pkCache:          make(map[string][]string),
+		conflictKeyCache: make(map[string][]string),
+	}
+	// Seed the stale pre-DDL caches under the target key the DML path
+	// uses (public.widgets) — counter cached as the OLD int4 width.
+	const qn = "public.widgets"
+	a.colTypeCache[qn] = map[string]*ir.Column{
+		"id":      {Name: "id", Type: ir.Integer{Width: 64}},
+		"counter": {Name: "counter", Type: ir.Integer{Width: 32}},
+	}
+	a.pkCache[qn] = []string{"id"}
+	a.conflictKeyCache[qn] = []string{"id"}
+
+	// The ALTER COLUMN TYPE boundary commits, carrying the post-DDL IR.
+	a.cacheActiveSchemaAfterCommit(ir.SchemaSnapshot{
+		Position: ir.Position{Engine: engineNamePostgres, Token: "0/200"},
+		Schema:   "public", Table: "widgets",
+		IR: &ir.Table{Name: "widgets", Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "counter", Type: ir.Integer{Width: 64}},
+		}},
+	})
+
+	if _, ok := a.colTypeCache[qn]; ok {
+		t.Errorf("colTypeCache[%q] not invalidated after boundary — next DML would encode against the stale int4 width (GAP #3)", qn)
+	}
+	if _, ok := a.pkCache[qn]; ok {
+		t.Errorf("pkCache[%q] not invalidated after boundary", qn)
+	}
+	if _, ok := a.conflictKeyCache[qn]; ok {
+		t.Errorf("conflictKeyCache[%q] not invalidated after boundary", qn)
+	}
+}
+
+// TestApplier_CacheAfterCommit_InvalidatesUnderRoutedSchema pins the
+// cross-engine variant: a MySQL→PG SchemaSnapshot carries the SOURCE
+// schema ("source_db"), but the target-side caches live under the
+// ROUTED target schema ("public"), so the invalidation must route the
+// snapshot's schema before deleting — the exact mismatch behind GAP #3.
+func TestApplier_CacheAfterCommit_InvalidatesUnderRoutedSchema(t *testing.T) {
+	a := &ChangeApplier{
+		schema:           "public", // target's bound schema
+		streamID:         "s1",
+		activeSchema:     make(map[string]activeSchemaVersion),
+		colTypeCache:     make(map[string]map[string]*ir.Column),
+		pkCache:          make(map[string][]string),
+		conflictKeyCache: make(map[string][]string),
+	}
+	const routedQN = "public.widgets" // where the DML insert path caches it
+	a.colTypeCache[routedQN] = map[string]*ir.Column{
+		"counter": {Name: "counter", Type: ir.Integer{Width: 32}},
+	}
+	a.pkCache[routedQN] = []string{"id"}
+
+	// SchemaSnapshot carries the SOURCE (MySQL) database name.
+	a.cacheActiveSchemaAfterCommit(ir.SchemaSnapshot{
+		Position: ir.Position{Engine: "mysql", Token: "gtid"},
+		Schema:   "source_db", Table: "widgets",
+		IR: &ir.Table{Name: "widgets", Columns: []*ir.Column{
+			{Name: "counter", Type: ir.Integer{Width: 64}},
+		}},
+	})
+
+	if _, ok := a.colTypeCache[routedQN]; ok {
+		t.Errorf("colTypeCache[%q] not invalidated — invalidation keyed by source schema instead of routed target schema (GAP #3 root mismatch)", routedQN)
+	}
+	if _, ok := a.pkCache[routedQN]; ok {
+		t.Errorf("pkCache[%q] not invalidated under routed schema", routedQN)
+	}
+}
+
 func TestApplier_PrimeErrorWrapping(t *testing.T) {
 	a := &ChangeApplier{}
 	err := a.PrimeSchemaHistoryCache(context.Background(), "", ir.Position{Engine: engineNamePostgres, Token: "0/100"})
