@@ -200,6 +200,58 @@ func TestRunOneBatch_RowCapFlushes(t *testing.T) {
 	})
 }
 
+// TestRunOneBatch_KeylessFirstChangeFlushesAlone pins the ADR-0089
+// keyless guard on the first-change path: a change to a truly-keyless
+// table commits as a batch of 1 (even though maxBatchSize is 100 and
+// more changes are queued), so its crash-replay blast radius stays at
+// one row. The next change is left on the channel for the following
+// batch.
+func TestRunOneBatch_KeylessFirstChangeFlushesAlone(t *testing.T) {
+	rec := &recorder{}
+	cfg := testConfig(t, rec, false)
+	cfg.IsKeylessTable = func(_ context.Context, c ir.Change) bool {
+		return c.Pos().Token == "p1"
+	}
+
+	ch := feed(false, insertAt("p1"), insertAt("p2"))
+	n, lastPos, closed, err := RunOneBatch(context.Background(), cfg, "stream", ch, 100)
+	if err != nil {
+		t.Fatalf("RunOneBatch: %v", err)
+	}
+	if n != 1 || lastPos.Token != "p1" || closed {
+		t.Fatalf("n=%d lastPos=%q closed=%v; want n=1 lastPos=p1 closed=false", n, lastPos.Token, closed)
+	}
+	assertEvents(t, rec, []string{
+		"begin", "dispatch:p1", "writePosition:p1", "commit",
+	})
+}
+
+// TestRunOneBatch_KeylessMidBatchFlushesIncludingIt pins the ADR-0089
+// keyless guard on the mid-batch path: a keyed change (p1) accumulates,
+// then a keyless change (p2) is dispatched and forces an immediate
+// commit that INCLUDES it — so on replay only p2 (the non-idempotent
+// one) could duplicate (blast radius 1), while p1 replays idempotently.
+// p3 is left for the next batch.
+func TestRunOneBatch_KeylessMidBatchFlushesIncludingIt(t *testing.T) {
+	rec := &recorder{}
+	cfg := testConfig(t, rec, false)
+	cfg.IsKeylessTable = func(_ context.Context, c ir.Change) bool {
+		return c.Pos().Token == "p2"
+	}
+
+	ch := feed(false, insertAt("p1"), insertAt("p2"), insertAt("p3"))
+	n, lastPos, closed, err := RunOneBatch(context.Background(), cfg, "stream", ch, 100)
+	if err != nil {
+		t.Fatalf("RunOneBatch: %v", err)
+	}
+	if n != 2 || lastPos.Token != "p2" || closed {
+		t.Fatalf("n=%d lastPos=%q closed=%v; want n=2 lastPos=p2 closed=false", n, lastPos.Token, closed)
+	}
+	assertEvents(t, rec, []string{
+		"begin", "dispatch:p1", "dispatch:p2", "writePosition:p2", "commit",
+	})
+}
+
 // TestRunOneBatch_IdleFlushCommitsPartial pins the item-18 Fix B
 // shape at the seam: a partial batch on a quiet channel commits
 // within the short idle grace, not the pre-fix 5s. The engine

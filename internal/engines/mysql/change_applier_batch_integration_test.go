@@ -23,11 +23,47 @@ package mysql
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
+
+// batchSizeRecorder is a test ir.BatchObserver that records the row
+// count of every committed batch — a reliable, in-process way to assert
+// that the ADR-0089 keyless guard commits keyless changes one-per-tx.
+type batchSizeRecorder struct {
+	mu   sync.Mutex
+	rows []int
+}
+
+func (r *batchSizeRecorder) ObserveBatch(_ context.Context, _ time.Duration, rows int, _ error) {
+	if rows <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rows = append(r.rows, rows)
+}
+
+func (r *batchSizeRecorder) maxRows() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	m := 0
+	for _, n := range r.rows {
+		if n > m {
+			m = n
+		}
+	}
+	return m
+}
+
+func (r *batchSizeRecorder) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.rows)
+}
 
 // pumpBatchedChanges feeds a slice of changes through ApplyBatch.
 // Mirrors the per-change pumpChanges helper.
@@ -102,6 +138,70 @@ func TestChangeApplier_ApplyBatch_IdempotentReplay(t *testing.T) {
 	pumpBatchedChanges(t, ctx, applier, events, batchSize)
 	if got := countAllRows(t, dsn, "target_db", "users"); got != totalRows {
 		t.Errorf("after replay: rows = %d; want %d (idempotency violated)", got, totalRows)
+	}
+}
+
+// TestChangeApplier_ApplyBatch_KeylessTableNotBatched pins the ADR-0089
+// keyless guard on MySQL: a table with NO PRIMARY KEY and NO UNIQUE
+// index makes ON DUPLICATE KEY UPDATE inert (effective plain,
+// non-idempotent INSERT), so the batch loop must commit each such change
+// in its own transaction even at a large batch size — otherwise a
+// crash-replay would amplify duplicates from 1 to up to N. Asserted via a
+// BatchObserver: every committed batch has exactly 1 row.
+func TestChangeApplier_ApplyBatch_KeylessTableNotBatched(t *testing.T) {
+	dsn, cleanup := startMySQLForApplier(t)
+	defer cleanup()
+
+	// No PRIMARY KEY and no UNIQUE index → truly keyless (Bug 125 class 3).
+	applyMySQLApplier(t, dsn, `
+		CREATE TABLE events_log (
+			kind    VARCHAR(32)  NOT NULL,
+			payload VARCHAR(255)
+		);
+	`)
+
+	eng := Engine{}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	applier, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+
+	rec := &batchSizeRecorder{}
+	applier.(ir.BatchObserverSetter).SetBatchObserver(rec)
+
+	const totalRows = 40
+	const batchSize = 1000 // would batch ALL rows in one tx if unguarded
+	events := make([]ir.Change, 0, totalRows)
+	for i := int64(1); i <= totalRows; i++ {
+		events = append(events, ir.Insert{
+			Position: ir.Position{Engine: engineNameMySQL, Token: fmt.Sprintf("token-%d", i)},
+			Schema:   "target_db",
+			Table:    "events_log",
+			Row:      ir.Row{"kind": "k", "payload": fmt.Sprintf("p%d", i)},
+		})
+	}
+
+	pumpBatchedChanges(t, ctx, applier, events, batchSize)
+
+	// The guard must force every keyless change into its own batch: max
+	// observed batch size is 1, one batch per row. Without the guard,
+	// batchSize=1000 would yield a single 40-row batch (maxRows=40).
+	if got := rec.maxRows(); got != 1 {
+		t.Errorf("max batch rows = %d; want 1 (keyless table must NOT batch — ADR-0089)", got)
+	}
+	if got := rec.count(); got != totalRows {
+		t.Errorf("committed batches = %d; want %d (one keyless change per batch)", got, totalRows)
+	}
+	if got := countAllRows(t, dsn, "target_db", "events_log"); got != totalRows {
+		t.Errorf("after keyless apply: rows = %d; want %d", got, totalRows)
 	}
 }
 

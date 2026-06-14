@@ -184,6 +184,14 @@ type ChangeApplier struct {
 	// Insert falls back to plain INSERT (see the package comment).
 	pkCache map[string][]string
 
+	// keylessCache maps "schema.table" → whether the table has NO
+	// PRIMARY KEY and NO UNIQUE index (the ADR-0089 keyless guard's
+	// "truly-keyless" verdict). Populated lazily via one
+	// information_schema probe per table. warnedKeyless tracks tables
+	// already WARNed about so the guard logs at most once per table.
+	keylessCache  map[string]bool
+	warnedKeyless map[string]bool
+
 	// colTypeCache maps "schema.table" → column-name → *ir.Column. It
 	// is the input to prepareValue for every value the applier
 	// binds: see the file-header comment for the JSON-column bug

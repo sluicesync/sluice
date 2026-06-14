@@ -193,6 +193,24 @@ type BatchConfig struct {
 	// tx). On the TransactionalDDL=false path the snapshot routes
 	// through ApplyOne, which owns the cache update itself.
 	CacheSchemaSnapshot func(snap ir.SchemaSnapshot)
+
+	// IsKeylessTable, when non-nil, reports whether a row-bearing change
+	// targets a TRULY-KEYLESS table — one with no PRIMARY KEY and no
+	// usable unique index, so the engine's Insert falls back to a plain
+	// (non-idempotent) INSERT (ADR-0010 / Bug 125 class 3). Such a change
+	// is treated as a flush boundary (ADR-0089 keyless guard): it is
+	// dispatched and then the batch commits immediately, so a keyless
+	// table's crash-replay blast radius stays at exactly 1 duplicate per
+	// change — identical to --apply-batch-size=1 — even when the default
+	// adaptive batch size would otherwise group many changes. PK and
+	// unique-keyed tables (idempotent) are unaffected and batch normally.
+	// nil (or an engine without the signal) means "never keyless" — no
+	// flush boundary, behaviour unchanged. The predicate is consulted
+	// only for row-bearing changes, AFTER they dispatch (so an engine
+	// that populates its key cache during dispatch sees a cache hit); ctx
+	// is supplied because an engine without a dispatch-populated signal
+	// (MySQL) may run a one-time metadata query to classify the table.
+	IsKeylessTable func(ctx context.Context, c ir.Change) bool
 }
 
 // RunBatchLoop is the shared ApplyBatch outer loop: consult the AIMD
@@ -379,6 +397,15 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 		}
 	}
 
+	// ADR-0089 keyless guard: a change to a truly-keyless (non-idempotent)
+	// table must not batch — flush it as a batch of 1 so a crash-replay
+	// can't amplify duplicates past the single-row baseline. `first` is a
+	// row-bearing change here (schema events returned above) and has just
+	// dispatched, so the engine's key cache is populated for the lookup.
+	if cfg.IsKeylessTable != nil && cfg.IsKeylessTable(ctx, first) {
+		return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n)
+	}
+
 	// Idle-flush timer: commit a partial batch if no further change
 	// arrives within DefaultIdleFlushPeriod, so the persisted
 	// source_position keeps current on quiet streams (item 18 Fix B;
@@ -465,6 +492,16 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 					cfg.CacheSchemaSnapshot(snap)
 					return n, lastPos, false, nil
 				}
+			}
+			// ADR-0089 keyless guard (mid-batch): flush the batch
+			// (including the just-dispatched keyless change `c`) so a
+			// keyless table never rides a multi-change replay window. The
+			// prior in-batch changes are PK/unique-keyed (idempotent on
+			// replay); only `c` could duplicate, bounding the blast radius
+			// to 1 — the same as --apply-batch-size=1. See the first-change
+			// branch above.
+			if cfg.IsKeylessTable != nil && cfg.IsKeylessTable(ctx, c) {
+				return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n)
 			}
 			// Byte-cap flush (ADR-0028): bounds the in-flight tx's
 			// buffered parameter memory on wide-row streams. Checked

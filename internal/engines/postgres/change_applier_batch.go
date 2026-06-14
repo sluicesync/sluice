@@ -54,6 +54,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
@@ -157,5 +158,54 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 		// reader's keepalive will keep ack'ing the previous floor.
 		AfterCommit:         a.reportAppliedToken,
 		CacheSchemaSnapshot: a.cacheActiveSchemaAfterCommit,
+		IsKeylessTable:      a.isKeylessInsert,
 	}
+}
+
+// isKeylessInsert is the ADR-0089 keyless-guard predicate the shared
+// batch loop consults to decide whether a change must apply as a batch
+// of 1. It returns true only for an Insert into a TRULY-KEYLESS table —
+// no PRIMARY KEY and no usable non-null UNIQUE index — for which the
+// dispatch path falls back to a plain, non-idempotent INSERT
+// (conflictKeyFor → empty key; Bug 125 class 3). Only Inserts are gated:
+// Update/Delete on a keyless table do not create duplicate rows on
+// replay, so they need no flush boundary.
+//
+// The loop calls this AFTER the change has dispatched, and the Insert
+// dispatch always populates conflictKeyCache via conflictKeyFor, so this
+// is a plain map read keyed identically to the dispatch site
+// (routedSchema(Schema)+"."+Table). An unexpected cache miss returns
+// false (do not flush): the change already applied, and a missing entry
+// cannot prove keylessness, so the safe-by-omission choice is to not
+// special-case it.
+func (a *ChangeApplier) isKeylessInsert(ctx context.Context, c ir.Change) bool {
+	ins, ok := c.(ir.Insert)
+	if !ok {
+		return false
+	}
+	qn := a.routedSchema(ins.Schema) + "." + ins.Table
+	key, ok := a.conflictKeyCache[qn]
+	if !ok || len(key) > 0 {
+		return false
+	}
+	a.warnKeylessOnce(ctx, qn)
+	return true
+}
+
+// warnKeylessOnce logs a single WARN per keyless table the first time the
+// ADR-0089 guard holds it at single-row apply, so an operator sees why
+// that table is not getting batched throughput.
+func (a *ChangeApplier) warnKeylessOnce(ctx context.Context, qn string) {
+	if a.warnedKeyless == nil {
+		a.warnedKeyless = make(map[string]bool)
+	}
+	if a.warnedKeyless[qn] {
+		return
+	}
+	a.warnedKeyless[qn] = true
+	slog.WarnContext(ctx,
+		"postgres: applier: table has no PRIMARY KEY or usable unique index — applying its "+
+			"changes one row per transaction (not batched) so crash-replay cannot duplicate rows; "+
+			"add a PRIMARY KEY to enable batched throughput (ADR-0089)",
+		slog.String("table", qn))
 }

@@ -192,6 +192,11 @@ type ChangeApplier struct {
 	// reading the true PK.
 	conflictKeyCache map[string][]string
 
+	// warnedKeyless tracks tables for which the ADR-0089 keyless guard
+	// has already logged its one-time WARN (a table with no PK and no
+	// usable unique index, held at single-row apply). Lazily allocated.
+	warnedKeyless map[string]bool
+
 	// colTypeCache maps "schema.table" → column-name → *ir.Column. It
 	// is the input to prepareValue for every value the applier
 	// binds; see the file-header comment for the JSON-column bug
