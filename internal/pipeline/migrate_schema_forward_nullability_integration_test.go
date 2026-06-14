@@ -33,12 +33,15 @@ import (
 // TestStreamer_SchemaForward_DropNotNull_PG forwards an ALTER COLUMN …
 // DROP NOT NULL on PG → PG; the post-ALTER INSERT carries a NULL.
 func TestStreamer_SchemaForward_DropNotNull_PG(t *testing.T) {
-	// BLOCKED — F7a GAP #2 (nullability change never produces a CDC
-	// boundary). pgoutput's RelationMessage carries no nullability flag, so
-	// a DROP NOT NULL is invisible to the PG CDC projection and classifies
-	// as ShapeKindNone — never forwarded. (On a MySQL source the same shape
-	// is also dropped, for a different reason; see the MySQL test below.)
-	t.Skip("BLOCKED: F7a GAP #2 — nullability is not in the PG CDC projection; DROP NOT NULL never forwards (see report)")
+	// DOCUMENTED LIMITATION (ADR-0091 §1d footnote 2), not a TODO:
+	// pgoutput's RelationMessage carries no nullability flag, so a
+	// DROP NOT NULL on a PG source produces no CDC boundary and cannot be
+	// forwarded without a separate out-of-band catalog subscription
+	// (future F47-class work). A resulting incompatibility surfaces as a
+	// loud apply error, never silent corruption. The MySQL-source case
+	// (below) DOES forward — GAP #2 — because MySQL's information_schema
+	// re-read carries nullability. This skip pins the asymmetry.
+	t.Skip("documented limitation (ADR-0091 §1d): PG pgoutput omits the nullability flag — DROP NOT NULL cannot be forwarded on a PG source; MySQL source forwards it")
 
 	sourceDSN, targetDSN, cleanup := startPostgresLogical(t)
 	defer cleanup()
