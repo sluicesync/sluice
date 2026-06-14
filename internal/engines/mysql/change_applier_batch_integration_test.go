@@ -22,36 +22,47 @@ package mysql
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
-	"strconv"
+	"sync"
 	"testing"
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
 
-// readComCommit returns the server's global Com_commit counter (the
-// number of explicit COMMIT statements executed). Used to prove the
-// ADR-0089 keyless guard commits one-per-tx: a lower-bound check is
-// robust against the counter being global (concurrent activity only
-// ADDS commits, so `delta >= N` cannot false-pass a batched apply).
-func readComCommit(t *testing.T, dsn string) int64 {
-	t.Helper()
-	db, err := sql.Open("mysql", dsn)
-	if err != nil {
-		t.Fatalf("readComCommit: open: %v", err)
+// batchSizeRecorder is a test ir.BatchObserver that records the row
+// count of every committed batch — a reliable, in-process way to assert
+// that the ADR-0089 keyless guard commits keyless changes one-per-tx.
+type batchSizeRecorder struct {
+	mu   sync.Mutex
+	rows []int
+}
+
+func (r *batchSizeRecorder) ObserveBatch(_ context.Context, _ time.Duration, rows int, _ error) {
+	if rows <= 0 {
+		return
 	}
-	defer func() { _ = db.Close() }()
-	var name, val string
-	if err := db.QueryRow("SHOW GLOBAL STATUS LIKE 'Com_commit'").Scan(&name, &val); err != nil {
-		t.Fatalf("readComCommit: query: %v", err)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rows = append(r.rows, rows)
+}
+
+func (r *batchSizeRecorder) maxRows() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	m := 0
+	for _, n := range r.rows {
+		if n > m {
+			m = n
+		}
 	}
-	n, err := strconv.ParseInt(val, 10, 64)
-	if err != nil {
-		t.Fatalf("readComCommit: parse %q: %v", val, err)
-	}
-	return n
+	return m
+}
+
+func (r *batchSizeRecorder) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.rows)
 }
 
 // pumpBatchedChanges feeds a slice of changes through ApplyBatch.
@@ -135,9 +146,8 @@ func TestChangeApplier_ApplyBatch_IdempotentReplay(t *testing.T) {
 // index makes ON DUPLICATE KEY UPDATE inert (effective plain,
 // non-idempotent INSERT), so the batch loop must commit each such change
 // in its own transaction even at a large batch size — otherwise a
-// crash-replay would amplify duplicates from 1 to up to N. Proven via the
-// Com_commit delta: with the guard, N keyless inserts produce >= N
-// commits; without it, batchSize=1000 would commit all in one.
+// crash-replay would amplify duplicates from 1 to up to N. Asserted via a
+// BatchObserver: every committed batch has exactly 1 row.
 func TestChangeApplier_ApplyBatch_KeylessTableNotBatched(t *testing.T) {
 	dsn, cleanup := startMySQLForApplier(t)
 	defer cleanup()
@@ -164,6 +174,9 @@ func TestChangeApplier_ApplyBatch_KeylessTableNotBatched(t *testing.T) {
 		}
 	}()
 
+	rec := &batchSizeRecorder{}
+	applier.(ir.BatchObserverSetter).SetBatchObserver(rec)
+
 	const totalRows = 40
 	const batchSize = 1000 // would batch ALL rows in one tx if unguarded
 	events := make([]ir.Change, 0, totalRows)
@@ -176,15 +189,16 @@ func TestChangeApplier_ApplyBatch_KeylessTableNotBatched(t *testing.T) {
 		})
 	}
 
-	start := readComCommit(t, dsn)
 	pumpBatchedChanges(t, ctx, applier, events, batchSize)
-	delta := readComCommit(t, dsn) - start
 
-	// With the keyless guard each insert commits alone → delta >= totalRows.
-	// Lower-bound is robust to the global counter (noise only adds commits);
-	// an unguarded batched apply would be ~1 commit and fail this loudly.
-	if delta < totalRows {
-		t.Errorf("Com_commit delta = %d; want >= %d (keyless table must NOT batch — ADR-0089)", delta, totalRows)
+	// The guard must force every keyless change into its own batch: max
+	// observed batch size is 1, one batch per row. Without the guard,
+	// batchSize=1000 would yield a single 40-row batch (maxRows=40).
+	if got := rec.maxRows(); got != 1 {
+		t.Errorf("max batch rows = %d; want 1 (keyless table must NOT batch — ADR-0089)", got)
+	}
+	if got := rec.count(); got != totalRows {
+		t.Errorf("committed batches = %d; want %d (one keyless change per batch)", got, totalRows)
 	}
 	if got := countAllRows(t, dsn, "target_db", "events_log"); got != totalRows {
 		t.Errorf("after keyless apply: rows = %d; want %d", got, totalRows)

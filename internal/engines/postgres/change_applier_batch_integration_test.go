@@ -27,6 +27,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -165,13 +166,49 @@ func TestChangeApplier_ApplyBatch_FewerCommits(t *testing.T) {
 	}
 }
 
+// batchSizeRecorder is a test ir.BatchObserver that records the row
+// count of every committed batch — a reliable, in-process way to assert
+// batch sizes (unlike pg_stat_database.xact_commit, whose PG15+ stat
+// reporting throttles a single backend's rapid commits and undercounts
+// many small batches).
+type batchSizeRecorder struct {
+	mu   sync.Mutex
+	rows []int
+}
+
+func (r *batchSizeRecorder) ObserveBatch(_ context.Context, _ time.Duration, rows int, _ error) {
+	if rows <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rows = append(r.rows, rows)
+}
+
+func (r *batchSizeRecorder) maxRows() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	m := 0
+	for _, n := range r.rows {
+		if n > m {
+			m = n
+		}
+	}
+	return m
+}
+
+func (r *batchSizeRecorder) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.rows)
+}
+
 // TestChangeApplier_ApplyBatch_KeylessTableNotBatched pins the ADR-0089
 // keyless guard: a table with NO primary key and NO unique index falls
 // back to a plain (non-idempotent) INSERT, so the batch loop must commit
 // each such change in its own transaction even at a large batch size —
 // otherwise a crash-replay would amplify duplicates from 1 to up to N.
-// The contrast is TestChangeApplier_ApplyBatch_FewerCommits, where a
-// PK table at the same batch size produces ~N/batchSize commits.
+// Asserted via a BatchObserver: every committed batch has exactly 1 row.
 func TestChangeApplier_ApplyBatch_KeylessTableNotBatched(t *testing.T) {
 	dsn, cleanup := startPostgresForApplier(t)
 	defer cleanup()
@@ -198,6 +235,9 @@ func TestChangeApplier_ApplyBatch_KeylessTableNotBatched(t *testing.T) {
 		}
 	}()
 
+	rec := &batchSizeRecorder{}
+	applier.(ir.BatchObserverSetter).SetBatchObserver(rec)
+
 	const totalRows = 60
 	const batchSize = 1000 // large enough to batch ALL rows in one tx if unguarded
 	events := make([]ir.Change, 0, totalRows)
@@ -210,16 +250,17 @@ func TestChangeApplier_ApplyBatch_KeylessTableNotBatched(t *testing.T) {
 		})
 	}
 
-	startCommits := readXactCommit(t, dsn)
 	pumpBatchedChanges(t, ctx, applier, events, batchSize)
-	time.Sleep(300 * time.Millisecond)
-	delta := readXactCommit(t, dsn) - startCommits
 
-	// With the keyless guard each insert commits alone → delta >= totalRows.
-	// Without it, batchSize=1000 would commit all 60 rows in a SINGLE batch
-	// (delta ~1), so this inequality fails loudly on a guard regression.
-	if delta < totalRows {
-		t.Errorf("commit delta = %d; want >= %d (keyless table must NOT batch — ADR-0089)", delta, totalRows)
+	// The guard must force every keyless change into its own batch: max
+	// observed batch size is 1, and there is one batch per row. Without
+	// the guard, batchSize=1000 would yield a single 60-row batch (maxRows
+	// = 60), failing this loudly.
+	if got := rec.maxRows(); got != 1 {
+		t.Errorf("max batch rows = %d; want 1 (keyless table must NOT batch — ADR-0089)", got)
+	}
+	if got := rec.count(); got != totalRows {
+		t.Errorf("committed batches = %d; want %d (one keyless change per batch)", got, totalRows)
 	}
 	if got := countAllRows(t, dsn, "events_log"); got != totalRows {
 		t.Errorf("after keyless apply: rows = %d; want %d", got, totalRows)
