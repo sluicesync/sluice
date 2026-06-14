@@ -1498,9 +1498,31 @@ func TestVStreamLivenessTimeoutError_Actionable(t *testing.T) {
 func TestVStreamProgressTimeoutError_Actionable(t *testing.T) {
 	err := vstreamProgressTimeoutError(45*time.Second, topodata.TabletType_PRIMARY, "main", []string{"0"})
 	msg := err.Error()
-	for _, want := range []string{"no events for", "PRIMARY", `"main"`, "failover", "reparent"} {
+	// Both real causes must be named (Bug 141): failover/reparent AND a
+	// sustained throttle / large-transaction stall — they're indistinguishable
+	// from the stream alone, so naming only failover mis-diagnoses a throttle.
+	for _, want := range []string{"no events for", "PRIMARY", `"main"`, "failover", "reparent", "throttle"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("error missing %q: %v", want, msg)
+		}
+	}
+}
+
+// TestVStreamWatchdogTimeouts_AreRetriable pins the Bug 141 fix: both
+// watchdog timeout errors satisfy ir.RetriableError, so the pipeline's
+// ADR-0038 bounded exponential-backoff retry rides out a transient
+// throttle / failover IN-PROCESS (reconnecting from the last position)
+// instead of exiting — which, under a process supervisor, turned a
+// transient source throttle into a tight, non-converging crash-loop.
+func TestVStreamWatchdogTimeouts_AreRetriable(t *testing.T) {
+	errs := map[string]error{
+		"liveness(Phase-1)": vstreamLivenessTimeoutError(30*time.Second, topodata.TabletType_REPLICA, "main", []string{"0"}),
+		"progress(Phase-2)": vstreamProgressTimeoutError(45*time.Second, topodata.TabletType_PRIMARY, "main", []string{"0"}),
+	}
+	for name, err := range errs {
+		var re ir.RetriableError
+		if !errors.As(err, &re) || !re.Retriable() {
+			t.Errorf("%s: want ir.RetriableError with Retriable()==true; got %T %v", name, err, err)
 		}
 	}
 }

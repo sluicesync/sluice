@@ -511,32 +511,47 @@ func (l *vstreamLiveness) stop() {
 //     exactly the no-serving-proof-event signature Phase 1 keys on, so it
 //     is a genuine candidate cause for this timeout — not only topology.
 //
-// Terminal by construction (not wrapped as an ir.RetriableError): neither a
-// missing tablet nor a sustained throttle heals within a single retry.
+// RETRIABLE (Bug 141, ADR-0038): wrapped as an [ir.RetriableError] so the
+// pipeline's bounded exponential-backoff retry rides it out IN-PROCESS
+// instead of exiting (which, under a process supervisor like systemd,
+// turned a transient source-tablet throttle into a tight crash-loop that
+// never converged — the headline finding of the first real PlanetScale
+// soak). The dominant real cause at stream-open is a source-tablet
+// throttle (item 19(a)), which heals on release within a few backed-off
+// reconnects; the primary-only-wedge case does NOT heal, but the retry
+// budget is bounded, so it still fails loud after exhaustion — just not in
+// a tight loop. The actionable message (both candidate causes + remedies)
+// is preserved for that terminal-after-budget failure.
 func vstreamLivenessTimeoutError(window time.Duration, tabletType topodata.TabletType, keyspace string, shards []string) error {
-	return fmt.Errorf(
+	return &retriableMySQLError{err: fmt.Errorf(
 		"mysql/vstream: no events within %s of opening the stream; vtgate may have no %s tablet for keyspace %q shards %v "+
 			"(if the cluster is primary-only — e.g. a PlanetScale dev branch or a minimal self-hosted Vitess — set vstream_tablet_type=primary in the DSN), "+
 			"or the source tablet throttler is denying the stream — check `SHOW VITESS_THROTTLED_APPS` on the primary",
 		window, tabletType, keyspace, shards,
-	)
+	)}
 }
 
 // vstreamProgressTimeoutError builds the loud, actionable error the
 // watchdog records when a PROVEN stream then goes totally silent for the
-// PHASE-2 window — the mid-stream wedge (ADR-0073 (F3)). Unlike the
-// Phase-1 error it names the likely cause: a tablet failover / reparent
-// that left the gRPC Recv hung (no data, no error, no heartbeats). The
-// loud failure is the contract — it flips the silent partial to
-// Err()!=nil — and a `sync` run's outer retry treats a fresh
-// StreamChanges from the last position as the recovery (reconnecting to
-// the new primary).
+// PHASE-2 window — the mid-stream wedge (ADR-0073 (F3)). Two real causes,
+// indistinguishable from the stream alone (vtgate erases the in-band
+// throttle signal — item 19(a)): a tablet failover/reparent that left the
+// gRPC Recv hung, OR a sustained source-tablet throttle / large-transaction
+// stall that withholds events past the window.
+//
+// RETRIABLE (Bug 141, ADR-0038): wrapped as an [ir.RetriableError] so the
+// pipeline's bounded exponential-backoff retry reconnects from the last
+// position IN-PROCESS — the right recovery for BOTH causes (a fresh
+// StreamChanges reconnects to the new primary after a failover, and rides
+// out a throttle until it clears). This replaces the prior terminal exit,
+// which under a supervisor became a tight crash-loop that never converged.
 func vstreamProgressTimeoutError(window time.Duration, tabletType topodata.TabletType, keyspace string, shards []string) error {
-	return fmt.Errorf(
+	return &retriableMySQLError{err: fmt.Errorf(
 		"mysql/vstream: stream produced no events for %s after data had been flowing; the %s stream for keyspace %q shards %v "+
-			"may have hung after a tablet failover/reparent (EmergencyReparentShard / PlannedReparentShard) — failing loudly so the sync retry can reconnect",
+			"may have hung after a tablet failover/reparent (EmergencyReparentShard / PlannedReparentShard), or a sustained "+
+			"source-tablet throttle / large-transaction stall is withholding events — reconnecting from the last position",
 		window, tabletType, keyspace, shards,
-	)
+	)}
 }
 
 // vstreamIdleWarnMessage builds the loud, rate-limited heads-up the
