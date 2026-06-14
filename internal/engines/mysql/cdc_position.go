@@ -96,11 +96,21 @@ type binlogPos struct {
 // family.
 const engineNameMySQL = "mysql"
 
+// engineNameVitess is the self-hosted Vitess flavor's engine name
+// (FlavorVitess.Name()). Like "planetscale" it produces VStream-shape
+// positions through this package's CDC paths, so it MUST be in the
+// decode-accept family — otherwise [retagPositionForSource] stamps a
+// resumed position Engine="vitess" and the next decode rejects it,
+// crash-looping every restart of a --source-driver=vitess continuous
+// sync (Bug 142). PlanetScale never hit this because its flavor name is
+// "planetscale".
+const engineNameVitess = "vitess"
+
 // isMySQLFamilyEngine returns true for the engine-name strings the
 // MySQL package's two CDC paths (binlog and VStream) accept on
 // decode. See [engineNameMySQL] for the rationale.
 func isMySQLFamilyEngine(name string) bool {
-	return name == engineNameMySQL || name == engineNameVStream
+	return name == engineNameMySQL || name == engineNameVStream || name == engineNameVitess
 }
 
 // encodeBinlogPos marshals p into an [ir.Position] suitable for
@@ -141,8 +151,8 @@ func decodeBinlogPos(p ir.Position) (decoded binlogPos, ok bool, err error) {
 	}
 	if !isMySQLFamilyEngine(p.Engine) {
 		return binlogPos{}, false, fmt.Errorf(
-			"mysql: decode binlog position: engine = %q; want %q or %q",
-			p.Engine, engineNameMySQL, engineNameVStream,
+			"mysql: decode binlog position: engine = %q; want %q, %q, or %q",
+			p.Engine, engineNameMySQL, engineNameVStream, engineNameVitess,
 		)
 	}
 	if p.Token == "" {

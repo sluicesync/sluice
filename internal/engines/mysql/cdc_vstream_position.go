@@ -196,8 +196,8 @@ func decodeVStreamPos(p ir.Position) (shards []shardGtid, ok bool, err error) {
 		return nil, false, nil
 	}
 	if !isMySQLFamilyEngine(p.Engine) {
-		return nil, false, fmt.Errorf("mysql: vstream position: wrong engine %q; want %q or %q",
-			p.Engine, engineNameMySQL, engineNameVStream)
+		return nil, false, fmt.Errorf("mysql: vstream position: wrong engine %q; want %q, %q, or %q",
+			p.Engine, engineNameMySQL, engineNameVStream, engineNameVitess)
 	}
 	if p.Token == "" {
 		return nil, false, errors.New("mysql: vstream position: empty token with non-empty engine")

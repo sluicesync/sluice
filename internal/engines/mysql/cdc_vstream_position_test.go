@@ -410,6 +410,50 @@ func TestDecodeVStreamPos_AcceptsMySQLEngineAlias(t *testing.T) {
 	}
 }
 
+// TestDecodeVStreamPos_AcceptsVitessEngineName pins Bug 142: the
+// self-hosted "vitess" flavor's Name() is "vitess", and
+// retagPositionForSource stamps a resumed position Engine="vitess".
+// decodeVStreamPos MUST accept it — without this, every restart of a
+// --source-driver=vitess continuous sync crash-loops with
+// `wrong engine "vitess"; want ...`. (PlanetScale's flavor name is
+// "planetscale", so it never hit this.)
+func TestDecodeVStreamPos_AcceptsVitessEngineName(t *testing.T) {
+	want := []shardGtid{
+		{Keyspace: "main", Shard: "-", Gtid: "MySQL56/abcd:1-100"},
+	}
+	pos := ir.Position{
+		Engine: engineNameVitess,
+		Token:  `[{"keyspace":"main","shard":"-","gtid":"MySQL56/abcd:1-100"}]`,
+	}
+	got, ok, err := decodeVStreamPos(pos)
+	if err != nil {
+		t.Fatalf("expected vitess-tagged VStream position to decode cleanly (Bug 142); got err: %v", err)
+	}
+	if !ok {
+		t.Fatal("ok=false; want true (this is a real position, not the from-now sentinel)")
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("\n got:  %#v\nwant: %#v", got, want)
+	}
+}
+
+// TestIsMySQLFamilyEngine_AcceptsVitess pins the Bug 142 fix at the
+// predicate level: the decode-accept family must include the
+// self-hosted "vitess" flavor name alongside "mysql"/"planetscale",
+// and still reject foreign engines.
+func TestIsMySQLFamilyEngine_AcceptsVitess(t *testing.T) {
+	for _, name := range []string{engineNameMySQL, engineNameVStream, engineNameVitess} {
+		if !isMySQLFamilyEngine(name) {
+			t.Errorf("isMySQLFamilyEngine(%q) = false; want true", name)
+		}
+	}
+	for _, name := range []string{"postgres", "", "mongo"} {
+		if isMySQLFamilyEngine(name) {
+			t.Errorf("isMySQLFamilyEngine(%q) = true; want false", name)
+		}
+	}
+}
+
 // TestSentinelHelpers confirms fromNow / fromBeginning produce the
 // canonical Vitess sentinel strings that VStream recognises.
 func TestSentinelHelpers(t *testing.T) {
