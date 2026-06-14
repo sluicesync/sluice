@@ -22,12 +22,37 @@ package mysql
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
+
+// readComCommit returns the server's global Com_commit counter (the
+// number of explicit COMMIT statements executed). Used to prove the
+// ADR-0089 keyless guard commits one-per-tx: a lower-bound check is
+// robust against the counter being global (concurrent activity only
+// ADDS commits, so `delta >= N` cannot false-pass a batched apply).
+func readComCommit(t *testing.T, dsn string) int64 {
+	t.Helper()
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("readComCommit: open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	var name, val string
+	if err := db.QueryRow("SHOW GLOBAL STATUS LIKE 'Com_commit'").Scan(&name, &val); err != nil {
+		t.Fatalf("readComCommit: query: %v", err)
+	}
+	n, err := strconv.ParseInt(val, 10, 64)
+	if err != nil {
+		t.Fatalf("readComCommit: parse %q: %v", val, err)
+	}
+	return n
+}
 
 // pumpBatchedChanges feeds a slice of changes through ApplyBatch.
 // Mirrors the per-change pumpChanges helper.
@@ -102,6 +127,67 @@ func TestChangeApplier_ApplyBatch_IdempotentReplay(t *testing.T) {
 	pumpBatchedChanges(t, ctx, applier, events, batchSize)
 	if got := countAllRows(t, dsn, "target_db", "users"); got != totalRows {
 		t.Errorf("after replay: rows = %d; want %d (idempotency violated)", got, totalRows)
+	}
+}
+
+// TestChangeApplier_ApplyBatch_KeylessTableNotBatched pins the ADR-0089
+// keyless guard on MySQL: a table with NO PRIMARY KEY and NO UNIQUE
+// index makes ON DUPLICATE KEY UPDATE inert (effective plain,
+// non-idempotent INSERT), so the batch loop must commit each such change
+// in its own transaction even at a large batch size — otherwise a
+// crash-replay would amplify duplicates from 1 to up to N. Proven via the
+// Com_commit delta: with the guard, N keyless inserts produce >= N
+// commits; without it, batchSize=1000 would commit all in one.
+func TestChangeApplier_ApplyBatch_KeylessTableNotBatched(t *testing.T) {
+	dsn, cleanup := startMySQLForApplier(t)
+	defer cleanup()
+
+	// No PRIMARY KEY and no UNIQUE index → truly keyless (Bug 125 class 3).
+	applyMySQLApplier(t, dsn, `
+		CREATE TABLE events_log (
+			kind    VARCHAR(32)  NOT NULL,
+			payload VARCHAR(255)
+		);
+	`)
+
+	eng := Engine{}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	applier, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+
+	const totalRows = 40
+	const batchSize = 1000 // would batch ALL rows in one tx if unguarded
+	events := make([]ir.Change, 0, totalRows)
+	for i := int64(1); i <= totalRows; i++ {
+		events = append(events, ir.Insert{
+			Position: ir.Position{Engine: engineNameMySQL, Token: fmt.Sprintf("token-%d", i)},
+			Schema:   "target_db",
+			Table:    "events_log",
+			Row:      ir.Row{"kind": "k", "payload": fmt.Sprintf("p%d", i)},
+		})
+	}
+
+	start := readComCommit(t, dsn)
+	pumpBatchedChanges(t, ctx, applier, events, batchSize)
+	delta := readComCommit(t, dsn) - start
+
+	// With the keyless guard each insert commits alone → delta >= totalRows.
+	// Lower-bound is robust to the global counter (noise only adds commits);
+	// an unguarded batched apply would be ~1 commit and fail this loudly.
+	if delta < totalRows {
+		t.Errorf("Com_commit delta = %d; want >= %d (keyless table must NOT batch — ADR-0089)", delta, totalRows)
+	}
+	if got := countAllRows(t, dsn, "target_db", "events_log"); got != totalRows {
+		t.Errorf("after keyless apply: rows = %d; want %d", got, totalRows)
 	}
 }
 

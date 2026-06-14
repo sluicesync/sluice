@@ -165,6 +165,67 @@ func TestChangeApplier_ApplyBatch_FewerCommits(t *testing.T) {
 	}
 }
 
+// TestChangeApplier_ApplyBatch_KeylessTableNotBatched pins the ADR-0089
+// keyless guard: a table with NO primary key and NO unique index falls
+// back to a plain (non-idempotent) INSERT, so the batch loop must commit
+// each such change in its own transaction even at a large batch size —
+// otherwise a crash-replay would amplify duplicates from 1 to up to N.
+// The contrast is TestChangeApplier_ApplyBatch_FewerCommits, where a
+// PK table at the same batch size produces ~N/batchSize commits.
+func TestChangeApplier_ApplyBatch_KeylessTableNotBatched(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+
+	// No PRIMARY KEY and no UNIQUE index → truly keyless (Bug 125 class 3).
+	applyPGApplier(t, dsn, `
+		CREATE TABLE events_log (
+			kind    TEXT NOT NULL,
+			payload TEXT
+		);
+	`)
+
+	eng := Engine{}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	applier, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+
+	const totalRows = 60
+	const batchSize = 1000 // large enough to batch ALL rows in one tx if unguarded
+	events := make([]ir.Change, 0, totalRows)
+	for i := int64(1); i <= totalRows; i++ {
+		events = append(events, ir.Insert{
+			Position: ir.Position{Engine: engineNamePostgres, Token: tokenForInt(i)},
+			Schema:   "public",
+			Table:    "events_log",
+			Row:      ir.Row{"kind": "k", "payload": emailForInt(i)},
+		})
+	}
+
+	startCommits := readXactCommit(t, dsn)
+	pumpBatchedChanges(t, ctx, applier, events, batchSize)
+	time.Sleep(300 * time.Millisecond)
+	delta := readXactCommit(t, dsn) - startCommits
+
+	// With the keyless guard each insert commits alone → delta >= totalRows.
+	// Without it, batchSize=1000 would commit all 60 rows in a SINGLE batch
+	// (delta ~1), so this inequality fails loudly on a guard regression.
+	if delta < totalRows {
+		t.Errorf("commit delta = %d; want >= %d (keyless table must NOT batch — ADR-0089)", delta, totalRows)
+	}
+	if got := countAllRows(t, dsn, "events_log"); got != totalRows {
+		t.Errorf("after keyless apply: rows = %d; want %d", got, totalRows)
+	}
+}
+
 // TestChangeApplier_ApplyBatch_TruncateFlushesBatch verifies that a
 // Truncate event mid-stream flushes the in-flight batch (so prior
 // changes are durable) and applies alone (so the truncate doesn't

@@ -51,6 +51,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
@@ -139,5 +140,74 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 		// slot-ack tracker, and SchemaSnapshots route through applyOne
 		// (TransactionalDDL=false), which owns the ADR-0049
 		// cache-after-commit update itself.
+		IsKeylessTable: a.isKeylessInsert,
 	}
+}
+
+// isKeylessInsert is the ADR-0089 keyless-guard predicate (MySQL). It
+// returns true for an Insert into a TRULY-KEYLESS table — no PRIMARY KEY
+// and no UNIQUE index — for which MySQL's ON DUPLICATE KEY UPDATE clause
+// is inert and the Insert is effectively a plain, non-idempotent INSERT
+// (Bug 125 class 3); such a change must apply as a batch of 1 so a
+// crash-replay cannot amplify duplicates. Only Inserts are gated —
+// Update/Delete on a keyless table do not create duplicate rows on
+// replay. Unlike Postgres (which computes a conflict key during
+// dispatch), MySQL does not, so this runs a one-time information_schema
+// probe per table, cached.
+func (a *ChangeApplier) isKeylessInsert(ctx context.Context, c ir.Change) bool {
+	ins, ok := c.(ir.Insert)
+	if !ok {
+		return false
+	}
+	schema := a.routedSchema(ins.Schema)
+	keyless := a.tableIsKeyless(ctx, schema, ins.Table)
+	if keyless {
+		a.warnKeylessOnce(ctx, qualifiedName(schema, ins.Table))
+	}
+	return keyless
+}
+
+// tableIsKeyless reports whether the table has neither a PRIMARY KEY nor
+// any UNIQUE index (information_schema.statistics has no non_unique=0
+// index for it), caching the verdict per qualified name. A probe error
+// returns true (conservative — apply single-row rather than risk a
+// batched keyless replay) and is NOT cached, so a later probe can correct
+// it once the transient condition clears.
+func (a *ChangeApplier) tableIsKeyless(ctx context.Context, schema, table string) bool {
+	qn := qualifiedName(schema, table)
+	if a.keylessCache == nil {
+		a.keylessCache = make(map[string]bool)
+	}
+	if v, ok := a.keylessCache[qn]; ok {
+		return v
+	}
+	const q = `SELECT COUNT(*) FROM information_schema.statistics
+		WHERE table_schema = ? AND table_name = ? AND non_unique = 0`
+	var n int
+	if err := a.db.QueryRowContext(ctx, q, schema, table).Scan(&n); err != nil {
+		slog.DebugContext(ctx, "mysql: applier: keyless probe failed; applying single-row (ADR-0089)",
+			slog.String("table", qn), slog.String("err", err.Error()))
+		return true
+	}
+	keyless := n == 0
+	a.keylessCache[qn] = keyless
+	return keyless
+}
+
+// warnKeylessOnce logs a single WARN per keyless table the first time the
+// ADR-0089 guard holds it at single-row apply, so an operator sees why
+// that table is not getting batched throughput.
+func (a *ChangeApplier) warnKeylessOnce(ctx context.Context, qn string) {
+	if a.warnedKeyless == nil {
+		a.warnedKeyless = make(map[string]bool)
+	}
+	if a.warnedKeyless[qn] {
+		return
+	}
+	a.warnedKeyless[qn] = true
+	slog.WarnContext(ctx,
+		"mysql: applier: table has no PRIMARY KEY or unique index — applying its changes one "+
+			"row per transaction (not batched) so crash-replay cannot duplicate rows; add a "+
+			"PRIMARY KEY (or a UNIQUE index) to enable batched throughput (ADR-0089)",
+		slog.String("table", qn))
 }
