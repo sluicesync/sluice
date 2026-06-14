@@ -13,14 +13,29 @@ forwarded ADD COLUMN only and refused DROP / ALTER TYPE / RENAME /
 index / CHECK loudly). The reversal is intentional and operator-
 driven; the *why* is in §1 below.
 
-Codename F7. Shipped in two parts:
+Codename F7. The intercept dispatch can forward every shape, but the
+**actual end-to-end reach is bounded by what each source engine's CDC
+projection carries on the wire** — pgoutput omits a great deal that the
+MySQL information_schema re-read does not. The honest, ground-truthed
+matrix is in **§1d**; read it before assuming a shape forwards. Do not
+restate "forwards every unambiguous shape" without that qualifier — an
+earlier draft of this ADR did, and end-to-end validation proved it
+false (the gaps in §1d's footnotes).
 
-- **F7a (this ADR):** the tristate flag + default flip + forwarding
-  of every *unambiguous* shape — ADD / DROP / ALTER TYPE / ALTER
-  NULLABILITY / CREATE INDEX / DROP INDEX / ADD CHECK / DROP CHECK /
-  MODIFY CHECK. RENAME COLUMN refuses loudly on **both** engines (see
-  §3 — it is the one ambiguous shape and needs a stable-identity
-  proof neither engine's CDC projection carries yet).
+Shipped in parts:
+
+- **F7a (this ADR):** the tristate flag + default flip + the
+  forwarding that actually works end-to-end per §1d — ADD / DROP
+  COLUMN and ALTER COLUMN TYPE on **both** source engines (DROP/ALTER
+  on a PG source required relaxing the reader gate, GAP #1; cross-engine
+  ALTER TYPE required applier-cache invalidation, GAP #3), plus ALTER
+  NULLABILITY on a **MySQL** source (GAP #2). RENAME COLUMN refuses
+  loudly on both engines (§3).
+- **Documented limitations (not forwarded; §1d footnotes):** all
+  PG-source nullability/index/check (pgoutput omits the metadata);
+  MySQL-source index/check (would need a new reader-side catalog
+  projection — perf-only for indexes, cross-engine-expr-hazardous for
+  checks). These need a future catalog-subscription path, not a tweak.
 - **F7b (follow-up ADR):** PG attnum-proven RENAME forwarding;
   MySQL RENAME stays refuse (no stable column id).
 
@@ -124,6 +139,61 @@ is redundant. When set, the streamer logs a deprecation WARN naming
 regardless). `--backfill-added-column` is unchanged — it remains a
 meaningful modifier of the ADD-COLUMN forward path (source-side
 backfill of already-shipped rows).
+
+#### 1d. The real forwarding matrix (what actually forwards, by source engine)
+
+The intercept's per-shape dispatch (§5) can emit any shape's DDL, but a
+shape only forwards end-to-end if **(a)** the source CDC reader produces
+a boundary for it and **(b)** that boundary's IR carries the shape's
+detail. pgoutput (PG logical replication) carries far less than MySQL's
+information_schema re-read, which bounds the matrix:
+
+| Shape | MySQL source | PG source |
+|---|---|---|
+| ADD COLUMN | ✅ forward | ✅ forward |
+| DROP COLUMN | ✅ forward | ✅ forward (GAP #1) |
+| ALTER COLUMN TYPE (same-engine) | ✅ forward | ✅ forward (GAP #1) |
+| ALTER COLUMN TYPE (cross-engine) | ✅ forward (GAP #3) | ✅ forward (GAP #1/#3) |
+| ALTER NULLABILITY | ✅ forward (GAP #2)¹ | ❌ refuse² |
+| REORDER | ✅ no-op (name-based decode) | ✅ no-op |
+| CREATE / DROP INDEX | ❌ refuse³ | ❌ refuse² |
+| ADD / DROP / MODIFY CHECK | ❌ refuse³ | ❌ refuse² |
+| RENAME COLUMN | ❌ refuse (§3) | ❌ refuse (§3) |
+| RENAME TABLE / multi-shape combo | ❌ refuse | ❌ refuse |
+
+Footnotes (the documented limitations, each a future catalog-poll
+subscription rather than a tweak):
+
+1. **MySQL ALTER NULLABILITY (GAP #2):** the reader's emission gate is
+   true-delta'd on `SchemaSignatureOf` (name+type), which excludes
+   nullability; forward mode widens the gate to also emit on a
+   nullability delta (the data is already in `tableSchema.Columns`).
+2. **All PG-source nullability / index / check:** pgoutput's
+   RelationMessage carries columns (name+type) + the replica-identity
+   key-flag and nothing else — no nullability flag, no secondary-index
+   metadata, no constraint metadata, no generated columns. The wire
+   never signals these, so they produce **no boundary** on a PG source
+   and are invisible to forwarding (the §5b normalizer correctly strips
+   them from the cold-start seed too, so they don't surface as phantom
+   drops). Detecting them would need a separate out-of-band catalog
+   subscription (future work, F47-class). This is **not** silent
+   corruption: a resulting incompatibility (a source DROP NOT NULL or
+   DROP CHECK the target still enforces) surfaces as a **loud apply
+   error** on the next affected row, honoring the loud-failure tenet;
+   a benign one (CREATE INDEX, an ADD CHECK that the source's
+   already-accepted rows satisfy) simply leaves the target without that
+   object.
+3. **MySQL-source index / check:** the MySQL CDC reader's `tableSchema`
+   projects only `{Schema, Name, Columns, PrimaryKey}` — it does not
+   read secondary indexes or CHECK constraints on a DDL boundary.
+   Forwarding them would need a new reader-side catalog projection
+   (and, for CHECK, a cross-engine expression-translation path). The
+   value is perf-only for indexes and cross-engine-hazardous for
+   checks, so both are deferred, not built.
+
+This matrix is the **source of truth** for operator docs and for any
+"does shape X forward?" question. The Consequences section's "behavior
+change on upgrade" applies only to the ✅ rows.
 
 ### 2. Refuse-loudly catalog (the only cases that stop the sync)
 
