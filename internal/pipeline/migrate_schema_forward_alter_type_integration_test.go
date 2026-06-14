@@ -199,20 +199,14 @@ func TestStreamer_SchemaForward_AlterType_MySQL(t *testing.T) {
 // retarget (ADR-0091 §5): the source MySQL BIGINT is translated to the
 // PG dialect before the target ALTER is issued.
 func TestStreamer_SchemaForward_AlterType_Cross_MySQLToPG(t *testing.T) {
-	// BLOCKED — F7a GAP #3 (CRITICAL, cross-engine ALTER TYPE convergence).
-	// On MySQL→PG the intercept logs "schema-forward: target DDL applied
-	// shape=alter-column-type", but the PG target column does NOT actually
-	// widen — it stays int4. The post-ALTER row carrying a >32-bit value
-	// then fails to apply with a LOUD encode error:
-	//   "unable to encode 5000000000 into binary format for int4 (OID 23):
-	//    5000000000 is greater than maximum value for int4"
-	// So the cross-engine ALTER TYPE retarget/apply (ADR-0091 §5,
-	// translate.RetargetForEngine + AlterColumnType on the PG SchemaWriter)
-	// reports success while the target schema diverges. The loud row-encode
-	// failure prevents silent corruption (good), but the DDL forward is a
-	// false-success. The same-engine MySQL→MySQL ALTER TYPE converges, so
-	// the defect is in the cross-engine retarget/apply path. This test pins
-	// the convergence + the >32-bit value landing; un-skip when fixed.
+	// Regression pin for F7a GAP #3 (cross-engine ALTER TYPE convergence).
+	// This previously false-succeeded: the intercept logged the ALTER as
+	// applied, but the PG target column stayed int4, so the post-ALTER
+	// >32-bit row failed to encode. Root cause was a stale applier
+	// colTypeCache + pgx prepared-statement OID cache not refreshed on the
+	// boundary (NOT the retarget). Fixed by invalidateTargetCachesForBoundary
+	// + QueryExecModeExec re-describe on an actual signature change. This
+	// test pins that the column truly widens and the >32-bit value lands.
 
 	mysqlDSN, _, mysqlCleanup := startMySQLBinlog(t)
 	defer mysqlCleanup()
