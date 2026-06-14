@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"time"
@@ -91,6 +92,20 @@ func classifyApplierError(err error) error {
 		case "40001", "40P01",
 			"57P01", "57P02", "57P03":
 			return &retriablePGError{err: err}
+		case "42703", "42P01":
+			// Schema drift (Bug F8): 42703 undefined_column / 42P01
+			// undefined_table — the source has a column/table the target
+			// lacks (sluice does not auto-apply DDL). Treat as retriable
+			// so the ADR-0038 backoff rides it out instead of a terminal
+			// exit → supervisor tight-restart crash-loop; it self-heals
+			// the moment the operator adds the column/table on the
+			// target. The wrap names the remedy and keeps the underlying
+			// *pgconn.PgError reachable via errors.As (the offending
+			// column stays visible every retry). NOT silent — each
+			// attempt logs loudly through the retry loop.
+			return &retriablePGError{err: fmt.Errorf(
+				"schema drift: the target is missing a column/table the source has — add it on the target to resume (sluice does not auto-apply DDL): %w", err,
+			)}
 		case "23505":
 			// Explicit non-retriable per ADR-0038 — fall through
 			// to the bare return.

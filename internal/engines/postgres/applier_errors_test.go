@@ -38,7 +38,6 @@ func TestClassifyApplierError_NonRetriableUnchanged(t *testing.T) {
 		{"foreign key violation", &pgconn.PgError{Code: "23503", Message: "insert or update on table violates foreign key constraint"}},
 		{"check violation", &pgconn.PgError{Code: "23514", Message: "new row violates check constraint"}},
 		{"syntax error", &pgconn.PgError{Code: "42601", Message: "syntax error at or near \"FOO\""}},
-		{"undefined column", &pgconn.PgError{Code: "42703", Message: `column "foo" does not exist`}},
 		{"428C9 (generated column non-DEFAULT)", &pgconn.PgError{Code: "428C9", Message: `cannot insert a non-DEFAULT value into column "margin"`}},
 	}
 	for _, c := range cases {
@@ -77,6 +76,8 @@ func TestClassifyApplierError_RetriableShapes(t *testing.T) {
 		{"connection_does_not_exist 08003", &pgconn.PgError{Code: "08003", Message: "connection does not exist"}},
 		{"connection_failure 08006", &pgconn.PgError{Code: "08006", Message: "connection failure"}},
 		{"sqlclient_unable_to_establish_sqlconnection 08001", &pgconn.PgError{Code: "08001", Message: "sqlclient unable to establish"}},
+		{"schema drift: undefined_column 42703 (Bug F8)", &pgconn.PgError{Code: "42703", Message: `column "soak_extra" of relation "soak_events" does not exist`}},
+		{"schema drift: undefined_table 42P01 (Bug F8)", &pgconn.PgError{Code: "42P01", Message: `relation "new_table" does not exist`}},
 		{"driver.ErrBadConn", driver.ErrBadConn},
 		{"io.EOF", io.EOF},
 		{"wrapped driver.ErrBadConn", fmt.Errorf("query: %w", driver.ErrBadConn)},
@@ -112,7 +113,6 @@ func TestClassifyApplierError_RetriableShapes(t *testing.T) {
 // non-retriable so a previously-fail-fast error stays fail-fast.
 func TestClassifyApplierError_UnknownSQLSTATENotRetriable(t *testing.T) {
 	cases := []string{
-		"42P01", // undefined_table
 		"42501", // insufficient_privilege
 		"22P02", // invalid_text_representation
 		"54000", // program_limit_exceeded
