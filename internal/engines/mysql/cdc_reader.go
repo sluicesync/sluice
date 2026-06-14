@@ -167,6 +167,23 @@ type CDCReader struct {
 	// schemaCache clear is conservative, the snapshot is precise.
 	snapshotSig map[string]ir.SchemaSignature
 
+	// schemaForward enables ADR-0091 F7a single-stream schema-change
+	// forwarding. When true, maybeSnapshotSchemaB1 ALSO emits a
+	// SchemaSnapshot on a per-column NULLABILITY-only change (GAP #2),
+	// even though ir.SchemaSignatureOf (name + ordered type, the ADR-0049
+	// decode contract) is unchanged. The zero value (false) preserves the
+	// pre-ADR-0091 behavior: only a signature delta emits a boundary. Set
+	// by [CDCReader.SetSchemaForward] before StreamChanges; read only on
+	// the pump goroutine.
+	schemaForward bool
+
+	// forwardNullSig tracks, per qualified table, the last-emitted
+	// per-column nullability vector — the SEPARATE forward-delta signal
+	// for GAP #2. It is intentionally NOT folded into snapshotSig (which
+	// must stay the pure ADR-0049 decode/history signature); a
+	// nullability change moves forwardNullSig without touching snapshotSig.
+	forwardNullSig map[string]string
+
 	// posMode and gtidSet track the current resume position. In GTID
 	// mode, gtidSet accumulates committed GTIDs and is encoded into
 	// each emitted Change. In file/pos mode, currentFile and the
@@ -236,6 +253,25 @@ func (r *CDCReader) SetCDCDatabaseScope(inScope func(database string) bool) {
 		return
 	}
 	r.cdcDBInScope = inScope
+}
+
+// SetSchemaForward enables ADR-0091 F7a single-stream schema-change
+// forwarding for this reader. GAP #2 (this method): when true,
+// maybeSnapshotSchemaB1 ALSO emits an ir.SchemaSnapshot on a per-column
+// NULLABILITY-only change — a MODIFY … NULL / NOT NULL that does not move
+// ir.SchemaSignatureOf (name + ordered type) and so would otherwise be
+// swallowed by the ADR-0049 true-delta gate. That boundary lets the
+// pipeline forward intercept classify ShapeKindAlterColumnNullability and
+// carry the operator's DDL to the target. ADD / DROP / TYPE changes move
+// the signature and already emit; this only widens the nullability case.
+//
+// The zero value (false) — non-streamer callers, or --schema-changes=
+// refuse — preserves the exact pre-ADR-0091 behavior: only a signature
+// delta emits a boundary, so a nullability-only ALTER produces no extra
+// boundary. Must be called before [StreamChanges]; read on the pump
+// goroutine. Implements pipeline.schemaForwardModeSetter.
+func (r *CDCReader) SetSchemaForward(enabled bool) {
+	r.schemaForward = enabled
 }
 
 // databaseInScope reports whether events from the given source database
@@ -885,9 +921,37 @@ func (r *CDCReader) maybeSnapshotSchemaB1(ctx context.Context, qn string, tbl *t
 		irTbl.PrimaryKey = &ir.Index{Columns: pkCols}
 	}
 	sig := ir.SchemaSignatureOf(irTbl)
-	if prev, ok := r.snapshotSig[qn]; ok && prev.Equal(sig) {
+	sigPrev, hadSig := r.snapshotSig[qn]
+	sigDelta := !hadSig || !sigPrev.Equal(sig)
+
+	// ADR-0091 F7a GAP #2: a per-column NULLABILITY change does NOT move
+	// ir.SchemaSignatureOf (name + ordered type — the ADR-0049 decode
+	// contract deliberately excludes nullability). So a MODIFY … NULL /
+	// NOT NULL on its own would skip emission below and never reach the
+	// pipeline forward intercept. When schema-change forwarding is on we
+	// add a SEPARATE forward signal: emit a boundary when the nullability
+	// vector changed even if the decode signature did not. forwardNullSig
+	// is tracked independently of snapshotSig precisely so this does NOT
+	// perturb the value-fidelity-critical decode/history contract.
+	nullSig := nullabilitySignature(tbl)
+	if r.forwardNullSig == nil {
+		// Lazy-init: the production constructor seeds this map, but unit
+		// readers built as a struct literal may omit it.
+		r.forwardNullSig = make(map[string]string)
+	}
+	nullDelta := false
+	if r.schemaForward {
+		nsPrev, hadNS := r.forwardNullSig[qn]
+		nullDelta = hadNS && nsPrev != nullSig
+	}
+
+	if !sigDelta && !nullDelta {
 		// This table's decode contract didn't change across the DDL
-		// (blanket-clear was conservative) — not a true delta.
+		// (blanket-clear was conservative) — not a true delta — and (in
+		// forward mode) its nullability is unchanged too. Not a boundary.
+		// Keep the nullability tracker warm so the FIRST nullability change
+		// after this point is detected.
+		r.forwardNullSig[qn] = nullSig
 		return nil
 	}
 	if err := send(ctx, out, ir.SchemaSnapshot{
@@ -898,8 +962,34 @@ func (r *CDCReader) maybeSnapshotSchemaB1(ctx context.Context, qn string, tbl *t
 	}); err != nil {
 		return err
 	}
-	r.snapshotSig[qn] = sig
+	// Advance the decode signature only on a real signature delta — the
+	// ADR-0049 history true-delta gate stays exactly as before. Always
+	// advance the separate nullability tracker.
+	if sigDelta {
+		r.snapshotSig[qn] = sig
+	}
+	r.forwardNullSig[qn] = nullSig
 	return nil
+}
+
+// nullabilitySignature renders a stable per-column NULLABLE vector for a
+// table — the ADR-0091 F7a GAP #2 forward-delta signal. It is kept
+// SEPARATE from ir.SchemaSignatureOf (the ADR-0049 decode contract, which
+// must remain name + ordered type only); a change here drives a forward
+// boundary without perturbing the decode/history signature. Column order
+// is the post-DDL information_schema order, which both compared snapshots
+// share, so a pure nullability flip changes exactly one entry.
+func nullabilitySignature(tbl *tableSchema) string {
+	var b strings.Builder
+	for _, c := range tbl.Columns {
+		b.WriteString(c.Name)
+		if c.Nullable {
+			b.WriteString("=1;")
+		} else {
+			b.WriteString("=0;")
+		}
+	}
+	return b.String()
 }
 
 // positionFor builds the [ir.Position] to attach to events emitted from

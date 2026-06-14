@@ -259,16 +259,17 @@ func openBinlogCDCReaderShared(ctx context.Context, dsn string, serverScope bool
 		return nil, fmt.Errorf("mysql: parse host/port: %w", err)
 	}
 	return &CDCReader{
-		db:          db,
-		schema:      cfg.DBName,
-		host:        host,
-		port:        port,
-		user:        cfg.User,
-		password:    cfg.Passwd,
-		serverID:    generateServerID(),
-		tableMap:    make(map[uint64]string),
-		schemaCache: make(map[string]*tableSchema),
-		snapshotSig: make(map[string]ir.SchemaSignature),
+		db:             db,
+		schema:         cfg.DBName,
+		host:           host,
+		port:           port,
+		user:           cfg.User,
+		password:       cfg.Passwd,
+		serverID:       generateServerID(),
+		tableMap:       make(map[uint64]string),
+		schemaCache:    make(map[string]*tableSchema),
+		snapshotSig:    make(map[string]ir.SchemaSignature),
+		forwardNullSig: make(map[string]string),
 	}, nil
 }
 

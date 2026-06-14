@@ -664,12 +664,14 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 			setter.SetPollInterval(s.PollInterval)
 		}
 	}
-	// ADR-0091 F7a GAP #1 (cold-start mirror of warmResume): relax the
-	// reader's mid-stream schema-change gate for DROP COLUMN / ALTER COLUMN
-	// TYPE when single-stream forwarding is active, so those shapes reach
-	// the forward intercept rather than being refused at the source-read
-	// level. Same type-assert/silent-ignore shape as the poll-interval
-	// setter above; only the PG pgoutput reader implements it.
+	// ADR-0091 F7a (cold-start mirror of warmResume): relax the reader's
+	// mid-stream schema-change gate when single-stream forwarding is active
+	// so the unambiguous shapes reach the forward intercept rather than
+	// being refused / swallowed at the source-read level. Same type-assert/
+	// silent-ignore shape as the poll-interval setter above. PG implements
+	// it for DROP COLUMN / ALTER COLUMN TYPE (GAP #1); MySQL implements it
+	// for ALTER COLUMN NULLABILITY (GAP #2 — the nullability-only change
+	// that does not move the decode signature).
 	if setter, ok := stream.Changes.(schemaForwardModeSetter); ok {
 		setter.SetSchemaForward(s.singleStreamSchemaForwardActive())
 	}
