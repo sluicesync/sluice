@@ -4,6 +4,40 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [0.99.44] - 2026-06-14
+
+### Changed
+- **`sluice sync --apply-batch-size` now defaults to `auto` (ADR-0089) — >10×
+  CDC apply throughput out of the box.** The ADR-0052 AIMD batch-size
+  controller has shipped since v0.72.0, but the conservative default
+  `--apply-batch-size=1` made its cap equal its floor, leaving it dormant for
+  every default user. The first real PlanetScale soak measured single-row apply
+  at ~240 rows/s vs ~6,500 at `auto` (>10×). The default is now `auto` (engine
+  ceiling 1000 mysql/postgres, 100 planetscale; AIMD adapts within `[1,
+  ceiling]`). Safety guard: a table with no PRIMARY KEY and no usable unique
+  index (non-idempotent plain INSERT on replay — Bug 125 class 3) is never
+  batched — each change commits alone (crash-replay duplicate blast radius stays
+  at 1), with a one-time WARN; PK/unique tables batch and adapt. Restore the old
+  behavior with `--apply-batch-size=1` or `--no-auto-tune`.
+
+### Fixed
+- **VStream throttle/large-transaction stalls no longer crash-loop a continuous
+  sync (Bug 141 / ADR-0090).** A transient source-tablet throttle (vtgate
+  withholds change events and, near its 10-min tolerance, heartbeats) made the
+  liveness/progress watchdog fire and misdiagnose the throttle as a failover;
+  the terminal error exited the process → a supervisor restarted it → it
+  warm-resumed to the same throttled position and re-stalled → a tight,
+  non-converging crash-loop. The watchdog timeouts are now `ir.RetriableError`,
+  so the ADR-0038 backoff retry reconnects from the last position in-process and
+  rides out the throttle (correct for a real failover too); a genuinely
+  non-healing wedge still fails loud after the bounded retry budget. Found +
+  root-caused on the soak and a self-hosted Vitess-24 reproduction.
+- **Self-hosted `--source-driver=vitess` can now warm-resume (Bug 142).** The
+  `vitess` flavor's engine name wasn't in the position-decode accept set, so a
+  resumed position stamped `Engine="vitess"` was rejected and every restart
+  crash-looped with `wrong engine "vitess"`. Unconditional; PlanetScale
+  (flavor `"planetscale"`) was unaffected. The decoder now accepts `"vitess"`.
+
 ## [0.99.43] - 2026-06-13
 
 ### Added
