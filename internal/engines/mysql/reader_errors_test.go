@@ -67,6 +67,64 @@ func TestClassifyReaderError_DelegatesToApplierClassifier(t *testing.T) {
 	}
 }
 
+// TestClassifyReaderError_SchemaResolution pins the source-side
+// schema-resolution carve-out (Bug F9): the vstreamer's "can't resolve
+// this table's schema at the replay position" shapes arrive as free-text
+// (no gRPC status, no 1105 wrapper) right after a DDL cutover or when the
+// Vitess historian is off, and used to fall through TERMINAL — killing
+// the stream on a window that clears itself. They must classify retriable
+// so the ADR-0038 backoff rides out the cutover window.
+//
+// Pin-the-class: both known wordings are asserted retriable (each wrapped
+// as the pump wraps it), the underlying error stays reachable, and a
+// near-miss ("unknown table" with no "in schema", which is a genuine
+// terminal DROP/typo) is asserted to STAY terminal so the substring match
+// can't widen into masking real schema errors.
+func TestClassifyReaderError_SchemaResolution(t *testing.T) {
+	cases := []struct {
+		name      string
+		err       error
+		retriable bool
+	}{
+		{
+			"unknown table in schema (historian gap)",
+			errors.New("unknown table soak_events in schema"),
+			true,
+		},
+		{
+			"no schema found for table (reload race)",
+			errors.New("vstreamer: no schema found for table soak_events"),
+			true,
+		},
+		{
+			// Near-miss: a bare "unknown table" with no "in schema" is the
+			// terminal shape (DROP / typo on the source) and must NOT be
+			// swept into the retriable carve-out.
+			"bare unknown table stays terminal",
+			errors.New("Error 1146: Table 'db.gone' doesn't exist: unknown table gone"),
+			false,
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			// Wrap as the VStream pump does.
+			wrapped := fmt.Errorf("mysql/vstream: recv: %w", c.err)
+			got := classifyReaderError(wrapped)
+
+			var re ir.RetriableError
+			gotRetriable := errors.As(got, &re)
+			if gotRetriable != c.retriable {
+				t.Errorf("classifyReaderError(%q) retriable=%v, want %v", c.name, gotRetriable, c.retriable)
+			}
+			// The underlying error must stay reachable on the chain.
+			if !errors.Is(got, c.err) {
+				t.Errorf("classifyReaderError(%q) lost the underlying error from the chain", c.name)
+			}
+		})
+	}
+}
+
 // TestClassifyReaderError_GRPCStatusCodes pins the gRPC-status branch
 // the reader classifier adds on top of the SQL-path delegation — the
 // reader-only shape a VStream stream Recv produces on a connection
