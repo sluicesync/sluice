@@ -32,6 +32,22 @@ func (s *Streamer) forwardSchemaEnabled() bool {
 	return !strings.EqualFold(s.SchemaChanges, "refuse")
 }
 
+// singleStreamSchemaForwardActive reports whether the ADR-0091
+// single-stream forward intercept is the active schema-change path for
+// this stream — forwarding ON, Shape A NOT engaged (its boundary router
+// handles every shape via the lease), and NOT multi-database (forwarding
+// is single-database only; see [engageAddColumnForward]). This is the
+// exact condition under which [interceptAddColumnForward] wraps the change
+// channel and under which the cold-start seed is synthesized; the F7a
+// GAP #1 reader-gate relaxation must use the SAME condition so the PG CDC
+// reader only emits (rather than refuses) destructive/altering shapes when
+// the intercept downstream is actually present to forward them.
+func (s *Streamer) singleStreamSchemaForwardActive() bool {
+	return s.forwardSchemaEnabled() &&
+		!s.InjectShardColumn.Engaged() &&
+		!s.multiDatabaseMode()
+}
+
 // engageAddColumnForward opens the target SchemaWriter the ADR-0058
 // intercept uses for ALTER TABLE … ADD COLUMN, and (when backfill is
 // requested) the source RowReader for the bounded backfill SELECT.

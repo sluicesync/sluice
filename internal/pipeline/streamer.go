@@ -85,6 +85,27 @@ type pollIntervalSetter interface {
 	SetPollInterval(d time.Duration)
 }
 
+// schemaForwardModeSetter is the optional CDC-reader-side surface for
+// engines whose reader enforces a mid-stream schema-change gate that must
+// be relaxed when ADR-0091 forwarding is enabled. Today only the Postgres
+// pgoutput reader implements it: its [postgres.CDCReader] hard-refuses
+// DROP COLUMN / ALTER COLUMN TYPE mid-stream (Bug 112/119/120 closure) at
+// the source-read level, BEFORE the boundary reaches the ADR-0091 forward
+// intercept (F7a GAP #1). With forwarding on, those unambiguous shapes
+// must instead be emitted as SchemaSnapshots so the intercept can forward
+// them (the GAP #3 applier-cache invalidation keeps decode correct);
+// RENAME TABLE / DROP+CREATE / RENAME COLUMN stay refused at the reader.
+//
+// MySQL's binlog reader re-reads information_schema on a DDL boundary and
+// never gated destructive column shapes, so it does not implement this —
+// the type-assertion silently no-ops. The streamer calls SetSchemaForward
+// once per stream, between [ir.CDCReader] open and
+// [ir.CDCReader.StreamChanges], so the reader captures the mode before the
+// first RelationMessage is parsed.
+type schemaForwardModeSetter interface {
+	SetSchemaForward(enabled bool)
+}
+
 // targetSchemaSetter is the optional applier-side surface for
 // engines that record the operator-supplied `--target-schema NAME`
 // on the per-target control table (Bug 46, ADR-0031). PG implements;

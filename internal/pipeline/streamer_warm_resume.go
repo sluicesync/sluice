@@ -63,6 +63,15 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position, lsnTra
 			setter.SetPollInterval(s.PollInterval)
 		}
 	}
+	// ADR-0091 F7a GAP #1: when single-stream forwarding is active, tell
+	// the reader to relax its mid-stream schema-change gate for the
+	// unambiguous shapes (DROP COLUMN / ALTER COLUMN TYPE) so they reach
+	// the forward intercept as SchemaSnapshots instead of being refused at
+	// the source-read level. Push-based MySQL readers don't implement the
+	// setter and silently ignore.
+	if setter, ok := cdc.(schemaForwardModeSetter); ok {
+		setter.SetSchemaForward(s.singleStreamSchemaForwardActive())
+	}
 	changes, err = cdc.StreamChanges(ctx, persisted)
 	if err != nil {
 		closeIf(cdc)

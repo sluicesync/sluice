@@ -39,12 +39,12 @@ const bigVal int64 = 5_000_000_000
 // on PG → PG and verifies the target column type changed and a
 // post-ALTER row with a >32-bit value lands.
 func TestStreamer_SchemaForward_AlterType_PG(t *testing.T) {
-	// BLOCKED — F7a GAP #1 (PG source). The PG CDC reader's checkSchemaRace
-	// refuses ALTER COLUMN TYPE (existing column OID changed) before the
-	// boundary reaches the ADR-0091 intercept (same root cause as
-	// TestStreamer_SchemaForward_DropColumn_PG).
-	t.Skip("BLOCKED: F7a GAP #1 — PG CDC checkSchemaRace refuses ALTER COLUMN TYPE before the ADR-0091 intercept (see report)")
-
+	// ADR-0091 F7a GAP #1 (fixed): the PG CDC reader now lets ALTER COLUMN
+	// TYPE pass through to the forward intercept under
+	// --schema-changes=forward. The post-ALTER INSERT carries a >32-bit
+	// value that only fits BIGINT, proving the target column genuinely
+	// widened (GAP #3 cache invalidation re-describes the column OID so the
+	// pgx encode path uses the new int8 width).
 	sourceDSN, targetDSN, cleanup := startPostgresLogical(t)
 	defer cleanup()
 
