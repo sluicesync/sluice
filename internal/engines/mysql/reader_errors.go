@@ -4,6 +4,9 @@
 package mysql
 
 import (
+	"fmt"
+	"strings"
+
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -66,6 +69,25 @@ func classifyReaderError(err error) error {
 	if err == nil {
 		return nil
 	}
+	// Source-side schema-resolution gap (Bug F9). The vstreamer
+	// resolves each row event against the table schema for the replay
+	// position; right after a DDL cutover (or when the Vitess schema
+	// historian is off — `track_schema_versions` is disabled by
+	// default on PlanetScale), that lookup can transiently miss with
+	// `unknown table <t> in schema` / `no schema found for table`.
+	// This arrives as a plain VStream error string (NOT a gRPC status,
+	// NOT a 1105 wrapper), so neither the gRPC-code check below nor the
+	// applier classifier catches it — it fell through TERMINAL and
+	// killed the stream on a window that clears itself once the
+	// historian catches up. Classify it retriable with an actionable
+	// message so the ADR-0038 backoff rides out the cutover window in
+	// process. sluice's own ADR-0049 CDC schema history covers the
+	// decode/apply side; this is purely the source-reader error shape.
+	if isVStreamSchemaResolutionError(err) {
+		return &retriableMySQLError{err: fmt.Errorf(
+			"source vstream could not resolve a table's schema for the replay position (likely a DDL cutover, or the Vitess schema historian / track_schema_versions is off) — retrying from the last position; if it persists, resume from current (cold-start) to skip the unresolvable window: %w", err,
+		)}
+	}
 	// status.FromError reports ok=true only when err is — or wraps
 	// (errors.As, so the pump's `recv: %w` wrap resolves) — a real
 	// gRPC status. A non-gRPC error yields ok=false and falls through
@@ -74,6 +96,25 @@ func classifyReaderError(err error) error {
 		return &retriableMySQLError{err: err}
 	}
 	return classifyApplierError(err)
+}
+
+// isVStreamSchemaResolutionError reports whether err is the source
+// vstreamer's "can't resolve this table's schema at the replay
+// position" shape. These surface as free-text errors from the VStream
+// pump (no gRPC status, no MySQL 1105 code), so the match is
+// substring-based on the two known wordings:
+//
+//	"unknown table <name> in schema"  — historian has no row for the
+//	                                    position's schema version yet
+//	"no schema found for table <name>" — schema engine reload race
+//
+// Kept as a named helper (not inlined) so [TestClassifyReaderError_SchemaResolution]
+// pins the exact wording set — a vstreamer wording change then fails
+// the pin rather than silently reverting to TERMINAL.
+func isVStreamSchemaResolutionError(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return (strings.Contains(msg, "unknown table") && strings.Contains(msg, "in schema")) ||
+		strings.Contains(msg, "no schema found for table")
 }
 
 // isRetriableGRPCCode reports whether a gRPC status code is one of the
