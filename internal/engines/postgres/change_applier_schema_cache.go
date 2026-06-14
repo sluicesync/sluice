@@ -97,11 +97,27 @@ func (a *ChangeApplier) cacheActiveSchemaAfterCommit(s ir.SchemaSnapshot) {
 	if a.activeSchema == nil {
 		a.activeSchema = make(map[string]activeSchemaVersion)
 	}
-	a.activeSchema[schemaTableKey(s.Schema, s.Table)] = activeSchemaVersion{
+	key := schemaTableKey(s.Schema, s.Table)
+	prior, hadPrior := a.activeSchema[key]
+	a.activeSchema[key] = activeSchemaVersion{
 		Anchor: s.Position,
 		IR:     s.IR,
 	}
-	a.invalidateTargetCachesForBoundary(s)
+	// Only bust the target-side caches on an ACTUAL schema change — a
+	// prior version existed AND its decode signature differs from the new
+	// one (F7a GAP #3). The first SchemaSnapshot a table sees is the
+	// baseline (cold-start first-touch relation / warm-resume re-send),
+	// not a DDL boundary: invalidating there would needlessly mark every
+	// table schema-dirty and force every DML onto the slow per-call
+	// QueryExecModeExec re-describe path for the life of the stream — a
+	// throughput regression that timed out a CDC-congruence test in CI.
+	// A signature change (column added/dropped/retyped) is exactly the set
+	// that affects the cached column OIDs; nullability/comment-only
+	// re-sends correctly skip.
+	if hadPrior && prior.IR != nil && s.IR != nil &&
+		!ir.SchemaSignatureOf(prior.IR).Equal(ir.SchemaSignatureOf(s.IR)) {
+		a.invalidateTargetCachesForBoundary(s)
+	}
 }
 
 // invalidateTargetCachesForBoundary drops the target-side per-table

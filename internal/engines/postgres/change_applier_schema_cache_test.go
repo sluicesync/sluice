@@ -285,6 +285,18 @@ func TestApplier_CacheAfterCommit_InvalidatesTargetCaches(t *testing.T) {
 		pkCache:          make(map[string][]string),
 		conflictKeyCache: make(map[string][]string),
 	}
+	// Establish the PRE-DDL baseline version (counter int4). The first
+	// snapshot for a table is the baseline, not a boundary, so it must
+	// NOT invalidate (see TestApplier_CacheAfterCommit_BaselineDoesNotInvalidate).
+	a.cacheActiveSchemaAfterCommit(ir.SchemaSnapshot{
+		Position: ir.Position{Engine: engineNamePostgres, Token: "0/100"},
+		Schema:   "public", Table: "widgets",
+		IR: &ir.Table{Name: "widgets", Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "counter", Type: ir.Integer{Width: 32}},
+		}},
+	})
+
 	// Seed the stale pre-DDL caches under the target key the DML path
 	// uses (public.widgets) — counter cached as the OLD int4 width.
 	const qn = "public.widgets"
@@ -295,7 +307,8 @@ func TestApplier_CacheAfterCommit_InvalidatesTargetCaches(t *testing.T) {
 	a.pkCache[qn] = []string{"id"}
 	a.conflictKeyCache[qn] = []string{"id"}
 
-	// The ALTER COLUMN TYPE boundary commits, carrying the post-DDL IR.
+	// The ALTER COLUMN TYPE boundary commits, carrying the post-DDL IR —
+	// a real change (signature differs from the baseline) → invalidate.
 	a.cacheActiveSchemaAfterCommit(ir.SchemaSnapshot{
 		Position: ir.Position{Engine: engineNamePostgres, Token: "0/200"},
 		Schema:   "public", Table: "widgets",
@@ -316,6 +329,56 @@ func TestApplier_CacheAfterCommit_InvalidatesTargetCaches(t *testing.T) {
 	}
 }
 
+// TestApplier_CacheAfterCommit_BaselineDoesNotInvalidate pins the GAP #3
+// over-reach fix: the FIRST SchemaSnapshot a table sees (the cold-start
+// first-touch baseline, no prior version) must NOT invalidate the target
+// caches or mark the table schema-dirty. The original GAP #3 code
+// invalidated on every snapshot, so every table on a PG stream got
+// marked dirty and every DML took the slow per-call QueryExecModeExec
+// re-describe path — a throughput regression that timed out a CDC
+// congruence test in CI. A re-sent IDENTICAL snapshot (same signature)
+// likewise must not invalidate.
+func TestApplier_CacheAfterCommit_BaselineDoesNotInvalidate(t *testing.T) {
+	a := &ChangeApplier{
+		schema:           "public",
+		streamID:         "s1",
+		activeSchema:     make(map[string]activeSchemaVersion),
+		colTypeCache:     make(map[string]map[string]*ir.Column),
+		pkCache:          make(map[string][]string),
+		conflictKeyCache: make(map[string][]string),
+	}
+	const qn = "public.widgets"
+	seed := func() {
+		a.colTypeCache[qn] = map[string]*ir.Column{"counter": {Name: "counter", Type: ir.Integer{Width: 32}}}
+		a.pkCache[qn] = []string{"id"}
+	}
+	snap := ir.SchemaSnapshot{
+		Position: ir.Position{Engine: engineNamePostgres, Token: "0/100"},
+		Schema:   "public", Table: "widgets",
+		IR: &ir.Table{Name: "widgets", Columns: []*ir.Column{{Name: "counter", Type: ir.Integer{Width: 32}}}},
+	}
+
+	// Baseline (no prior) → must NOT invalidate.
+	seed()
+	a.cacheActiveSchemaAfterCommit(snap)
+	if _, ok := a.colTypeCache[qn]; !ok {
+		t.Errorf("baseline first-touch snapshot invalidated colTypeCache — it must not (GAP #3 over-reach)")
+	}
+	if a.schemaDirtyTables[qn] {
+		t.Errorf("baseline first-touch snapshot marked %q schema-dirty — it must not (forces slow re-describe path)", qn)
+	}
+
+	// Identical re-send (prior exists, same signature) → must NOT invalidate.
+	seed()
+	a.cacheActiveSchemaAfterCommit(snap)
+	if _, ok := a.colTypeCache[qn]; !ok {
+		t.Errorf("identical re-sent snapshot invalidated colTypeCache — same signature must skip")
+	}
+	if a.schemaDirtyTables[qn] {
+		t.Errorf("identical re-sent snapshot marked %q schema-dirty — same signature must skip", qn)
+	}
+}
+
 // TestApplier_CacheAfterCommit_InvalidatesUnderRoutedSchema pins the
 // cross-engine variant: a MySQL→PG SchemaSnapshot carries the SOURCE
 // schema ("source_db"), but the target-side caches live under the
@@ -331,12 +394,21 @@ func TestApplier_CacheAfterCommit_InvalidatesUnderRoutedSchema(t *testing.T) {
 		conflictKeyCache: make(map[string][]string),
 	}
 	const routedQN = "public.widgets" // where the DML insert path caches it
+	// Pre-DDL baseline (counter int4) under the SOURCE schema key.
+	a.cacheActiveSchemaAfterCommit(ir.SchemaSnapshot{
+		Position: ir.Position{Engine: "mysql", Token: "gtid0"},
+		Schema:   "source_db", Table: "widgets",
+		IR: &ir.Table{Name: "widgets", Columns: []*ir.Column{
+			{Name: "counter", Type: ir.Integer{Width: 32}},
+		}},
+	})
 	a.colTypeCache[routedQN] = map[string]*ir.Column{
 		"counter": {Name: "counter", Type: ir.Integer{Width: 32}},
 	}
 	a.pkCache[routedQN] = []string{"id"}
 
-	// SchemaSnapshot carries the SOURCE (MySQL) database name.
+	// SchemaSnapshot carries the SOURCE (MySQL) database name; the ALTER
+	// widens counter → signature differs from the baseline → invalidate.
 	a.cacheActiveSchemaAfterCommit(ir.SchemaSnapshot{
 		Position: ir.Position{Engine: "mysql", Token: "gtid"},
 		Schema:   "source_db", Table: "widgets",

@@ -88,11 +88,20 @@ func (a *ChangeApplier) cacheActiveSchemaAfterCommit(s ir.SchemaSnapshot) {
 	if a.activeSchema == nil {
 		a.activeSchema = make(map[string]activeSchemaVersion)
 	}
-	a.activeSchema[qualifiedName(s.Schema, s.Table)] = activeSchemaVersion{
+	key := qualifiedName(s.Schema, s.Table)
+	prior, hadPrior := a.activeSchema[key]
+	a.activeSchema[key] = activeSchemaVersion{
 		Anchor: s.Position,
 		IR:     s.IR,
 	}
-	a.invalidateTargetCachesForBoundary(s)
+	// Only invalidate on an ACTUAL schema change (prior version existed
+	// AND its decode signature differs) — not on the first-touch baseline
+	// or an identical re-send. Symmetric to the PG applier's GAP #3 fix;
+	// keeps steady-state DML on the cached fast path.
+	if hadPrior && prior.IR != nil && s.IR != nil &&
+		!ir.SchemaSignatureOf(prior.IR).Equal(ir.SchemaSignatureOf(s.IR)) {
+		a.invalidateTargetCachesForBoundary(s)
+	}
 }
 
 // invalidateTargetCachesForBoundary drops the target-side per-table

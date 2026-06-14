@@ -388,13 +388,23 @@ func TestApplier_CacheAfterCommit_InvalidatesTargetCaches(t *testing.T) {
 		pkCache:      make(map[string][]string),
 	}
 	const qn = "app.widgets"
+	// Pre-DDL baseline (counter int4). First snapshot is the baseline, not
+	// a boundary → must NOT invalidate (symmetric to the PG over-reach fix).
+	a.cacheActiveSchemaAfterCommit(ir.SchemaSnapshot{
+		Position: ir.Position{Engine: engineNameMySQL, Token: "gtid0"},
+		Schema:   "source_db", Table: "widgets",
+		IR: &ir.Table{Name: "widgets", Columns: []*ir.Column{
+			{Name: "counter", Type: ir.Integer{Width: 32}},
+		}},
+	})
 	a.colTypeCache[qn] = map[string]*ir.Column{
 		"counter": {Name: "counter", Type: ir.Integer{Width: 32}},
 	}
 	a.pkCache[qn] = []string{"id"}
 
 	// A boundary carrying the SOURCE schema name — single-DB routedSchema
-	// maps it back to the applier's bound schema ("app").
+	// maps it back to the applier's bound schema ("app"); the widen is a
+	// real change (signature differs) → invalidate.
 	a.cacheActiveSchemaAfterCommit(ir.SchemaSnapshot{
 		Position: ir.Position{Engine: engineNameMySQL, Token: "gtid"},
 		Schema:   "source_db", Table: "widgets",
