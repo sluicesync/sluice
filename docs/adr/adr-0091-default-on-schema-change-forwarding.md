@@ -225,6 +225,63 @@ No new type-mapping code: this reuses `RetargetForEngine` wholesale.
 The retarget correctness for ALTER TYPE is the same translation
 already proven for cold-start CREATE of the same column.
 
+### 5b. Projection-fidelity hazard and the seed-guard (the critical safety mechanism)
+
+The cold-start **seed** (a full `SchemaReader` read) and a **CDC
+SchemaSnapshot** are *not* the same fidelity. A CDC projection carries
+only what the wire protocol delivers:
+
+- **pgoutput** (`projectRelation`) carries columns (name+type) + the
+  replica-identity key-flag. It **omits** generated columns (pre-PG18
+  they're unpublished), secondary indexes, CHECK constraints,
+  nullability, defaults, comments.
+- MySQL's binlog path re-reads `information_schema` on a DDL boundary,
+  so its CDC projection is full-fidelity (matches the cold-start read).
+
+`pipeline.ClassifyShape(seed, firstCDCSnapshot)` therefore sees the
+fields the CDC projection drops as a **phantom delta**: a PG generated
+column present in the seed but absent from pgoutput diffs as a phantom
+`DropColumn`; a secondary index as a phantom `DropIndex`; a residual
+type-precision asymmetry as a phantom `AlterColumnType`. Under
+ADR-0058's ADD-only path these phantoms were *refused* (harmless noise);
+under ADR-0091's default-on forwarding a phantom drop/alter would
+**forward destructive DDL and silently corrupt the target** — caught by
+the `Generated` and `PGToMySQL` convergence integration tests on the
+first CI run of this change.
+
+Two layers close this:
+
+1. **`CDCSchemaSnapshotNormalizer` (the PG normalizer).** The seed is
+   normalized to match pgoutput's fidelity before comparison — Bug
+   84/86/ADR-0065 already strip type-detail / nullability / default /
+   comment / CHECK constraints; ADR-0091 extends it to also drop
+   **generated columns** and **secondary indexes**. This makes the
+   steady-state seed→firstCDC diff `ShapeKindNone`.
+2. **The seed-guard (defense-in-depth).** The normalizer cannot be
+   *proven* complete (Bug 84/86 were found incrementally). So a
+   **destructive/mutating** shape (DROP / ALTER TYPE / ALTER
+   NULLABILITY / DROP INDEX / DROP+MODIFY CHECK) is **never forwarded
+   when classified against a seed-sourced pre** — only against a genuine
+   CDC→CDC boundary, where both sides share projection fidelity and a
+   phantom cannot arise. Additive shapes (ADD COLUMN / CREATE INDEX /
+   ADD CHECK) pass, since a phantom of them cannot occur against the
+   seed (the CDC projection is a subset of the seed's fidelity).
+
+The seed-guard's cost: a real DROP/ALTER that lands as the *very first*
+post-cold-start boundary won't forward at that one boundary (the target
+keeps the column — a safe, non-destructive divergence; subsequent
+CDC→CDC boundaries forward normally). The benefit: no residual fidelity
+gap can ever forward a phantom destructive DDL. This is the
+value-fidelity discipline (CLAUDE.md "loud failure / no silent loss")
+applied to schema forwarding: when in doubt, do **not** destroy.
+
+**Engine limitation that follows:** because pgoutput carries no
+secondary-index / generated-column / CHECK metadata, those shapes
+**cannot be forwarded on a PG source via CDC at all** (the wire never
+signals them). They forward on a **MySQL source** (full-fidelity
+`information_schema` re-read). This is documented, not a bug — the wire
+doesn't carry the signal.
+
 ### 6. Shape A unaffected
 
 `--schema-changes` is a no-op when `--inject-shard-column` is set:

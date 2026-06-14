@@ -83,9 +83,30 @@ func (Engine) NormalizeForCDCComparison(t *ir.Table) *ir.Table {
 		return nil
 	}
 	out := *t
-	out.Columns = make([]*ir.Column, len(t.Columns))
-	for i, col := range t.Columns {
+	// ADR-0091: drop STORED generated columns. pgoutput's
+	// RelationMessage EXCLUDES generated columns (pre-PG18 they are not
+	// published over logical replication at all), so [projectRelation]
+	// never sees them and the CDC-projected IR omits them entirely. The
+	// cold-start SchemaReader reads them from pg_attribute, so without
+	// this filter the classifier's [diffColumns] sees the generated
+	// column as present-in-pre / absent-in-post → a phantom
+	// ShapeKindDropColumn. Under ADR-0058's ADD-only path that phantom
+	// drop was refused loudly; under ADR-0091's default-on forwarding it
+	// would forward an AlterDropColumn and SILENTLY DESTROY the
+	// generated column on the target (the Generated-CDC integration
+	// failure). A genuine generated-column drop cannot be detected via
+	// pgoutput anyway, so excluding them from the comparison just makes
+	// the wire's existing limitation explicit (same rationale as the
+	// CheckConstraints / Indexes cases below). The discriminator is
+	// GeneratedExpr (a non-empty expression) — IDENTITY / SERIAL columns
+	// carry AutoIncrement, not GeneratedExpr, and ARE published, so they
+	// are NOT filtered here.
+	out.Columns = make([]*ir.Column, 0, len(t.Columns))
+	for _, col := range t.Columns {
 		if col == nil {
+			continue
+		}
+		if col.GeneratedExpr != "" {
 			continue
 		}
 		newCol := *col
@@ -100,7 +121,7 @@ func (Engine) NormalizeForCDCComparison(t *ir.Table) *ir.Table {
 		newCol.Nullable = false
 		newCol.Default = nil
 		newCol.Comment = ""
-		out.Columns[i] = &newCol
+		out.Columns = append(out.Columns, &newCol)
 	}
 	// ADR-0065 (task #22 CHECK sub-shape): pgoutput's RelationMessage
 	// carries no constraint metadata, so the CDC-projected IR
@@ -119,6 +140,20 @@ func (Engine) NormalizeForCDCComparison(t *ir.Table) *ir.Table {
 	// refuses at INSERT/UPDATE time. ADR-0065 documents this
 	// trade-off explicitly under "What's deferred".
 	out.CheckConstraints = nil
+	// ADR-0091: drop secondary indexes for the same reason as
+	// CheckConstraints — pgoutput's RelationMessage carries no secondary
+	// index metadata (only the replica-identity / PK key-flag, which
+	// [projectRelation] surfaces as PrimaryKey), so the CDC-projected IR
+	// always leaves Indexes nil. Without this, [diffIndexes] fires a
+	// phantom ShapeKindDropIndex on every CDC boundary for any table
+	// carrying a secondary index; under ADR-0091's default-on forwarding
+	// that would forward a DropShapeIndex and drop the index on the
+	// target. PrimaryKey is intentionally preserved (projectRelation
+	// carries it from the key-flag). CREATE/DROP INDEX therefore cannot
+	// be forwarded on PG via pgoutput — a documented limitation; MySQL's
+	// information_schema re-read CDC projection carries indexes and does
+	// forward them.
+	out.Indexes = nil
 	return &out
 }
 

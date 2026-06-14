@@ -171,6 +171,21 @@ func interceptAddColumnForward(
 	}
 	out := make(chan ir.Change)
 	cache := map[string]*ir.Table{}
+	// seedSourced marks cache entries whose pre-state came from the
+	// cold-start seed (a full SchemaReader read) rather than a prior CDC
+	// snapshot. ADR-0091 §3: a seed's IR fidelity differs from the CDC
+	// projection's (pgoutput omits generated columns, secondary indexes,
+	// check constraints, nullability, …), so a seed-vs-firstCDC diff can
+	// surface a PHANTOM destructive/mutating shape. The normalizer
+	// (CDCSchemaSnapshotNormalizer) closes the known asymmetries, but it
+	// cannot be proven complete (Bug 84/86 found gaps incrementally). So
+	// destructive/mutating shapes are NEVER forwarded against a
+	// seed-sourced pre — only against a genuine CDC→CDC boundary where
+	// both sides share projection fidelity. The cost is a missed
+	// first-post-coldstart DROP/ALTER (rare, and a SAFE non-destructive
+	// divergence — the target keeps the column); the benefit is that no
+	// residual fidelity gap can ever forward a phantom drop/alter.
+	seedSourced := map[string]bool{}
 	// Pre-populate the cache from the cold-start seed BEFORE consuming
 	// from `in`. The seed is keyed under whatever QualifiedName() the
 	// SchemaReader produced (MySQL: bare table name because the reader
@@ -183,6 +198,7 @@ func interceptAddColumnForward(
 			continue
 		}
 		cache[snap.QualifiedName()] = snap.IR
+		seedSourced[snap.QualifiedName()] = true
 		slog.DebugContext(
 			ctx, "forward-add-column intercept: seeded from cold-start handoff",
 			"table", snap.QualifiedName(),
@@ -205,13 +221,19 @@ func interceptAddColumnForward(
 				}
 				key := snap.QualifiedName()
 				pre, hadPre, preKey := lookupSeedCache(cache, key, snap.Table)
+				preIsSeed := hadPre && seedSourced[preKey]
 				// Promote a bare-name seed hit to the qualified key so
 				// subsequent snapshots resolve directly (mirrors the
 				// Shape A intercept's behaviour).
 				if hadPre && preKey != key {
 					delete(cache, preKey)
+					delete(seedSourced, preKey)
 				}
 				cache[key] = snap.IR
+				// This snapshot's IR is now the pre-state for the NEXT
+				// boundary, and it came from CDC — so the next comparison
+				// is CDC→CDC (full guard lifts).
+				delete(seedSourced, key)
 				if !hadPre {
 					slog.DebugContext(
 						ctx, "forward-add-column intercept: seeded table cache",
@@ -222,7 +244,7 @@ func interceptAddColumnForward(
 					}
 					continue
 				}
-				if err := routeForwardBoundary(ctx, deps, key, pre, snap, out); err != nil {
+				if err := routeForwardBoundary(ctx, deps, key, pre, snap, preIsSeed, out); err != nil {
 					slog.ErrorContext(
 						ctx, "forward-add-column intercept: refuse",
 						"table", key,
@@ -231,6 +253,9 @@ func interceptAddColumnForward(
 					// Rewind the cache so a retry replays the same
 					// boundary from the same pre-state.
 					cache[key] = pre
+					if preIsSeed {
+						seedSourced[key] = true
+					}
 					wrapped := fmt.Errorf("pipeline: forward schema add-column: %w", err)
 					errStore.Store(&wrapped)
 					return
@@ -271,6 +296,7 @@ func routeForwardBoundary(
 	tableName string,
 	pre *ir.Table,
 	snap ir.SchemaSnapshot,
+	preIsSeed bool,
 	out chan<- ir.Change,
 ) error {
 	shape, err := ClassifyShape(pre, snap.IR)
@@ -283,6 +309,28 @@ func routeForwardBoundary(
 		return fmt.Errorf("classify shape on %q: %w.%s %s",
 			tableName, err, renderDriftForRefusal(pre, snap.IR),
 			forwardRecoveryHint(tableName))
+	}
+	// ADR-0091 §3 seed-guard: never forward a destructive/mutating shape
+	// classified against a cold-start seed pre-state — the seed's
+	// fidelity differs from the CDC projection, so such a delta may be a
+	// phantom (e.g. a residual type asymmetry surfaces as a phantom ALTER
+	// that is an idempotent no-op same-engine but a real, harmful MODIFY
+	// cross-engine). Skip it as a no-op (the column/index stays on the
+	// target, a safe non-destructive outcome); the next CDC→CDC boundary
+	// is unguarded. ADD / CREATE INDEX / ADD CHECK are non-destructive
+	// and a phantom of them cannot arise against the seed (the CDC
+	// projection is a subset of the seed's fidelity), so they pass.
+	if preIsSeed && shapeIsDestructiveOrMutating(shape.Kind) {
+		slog.InfoContext(
+			ctx,
+			"schema-forward: skipping a destructive/mutating shape at the "+
+				"first post-cold-start boundary (classified against the "+
+				"cold-start seed, whose fidelity differs from the CDC "+
+				"projection — not forwarding to avoid a phantom; ADR-0091 §3)",
+			"table", tableName,
+			"shape", shape.Kind.String(),
+		)
+		return nil
 	}
 	switch shape.Kind {
 	case ShapeKindNone:
@@ -401,6 +449,26 @@ func forwardRecoveryHint(tableName string) string {
 			"default for any subsequent source DDL.",
 		tableName,
 	)
+}
+
+// shapeIsDestructiveOrMutating reports whether a shape removes or
+// rewrites existing target state (vs. purely adding new state). These
+// are the shapes the ADR-0091 §3 seed-guard refuses to forward against
+// a cold-start seed pre, because a phantom of one (from seed-vs-CDC
+// fidelity asymmetry) would be destructive. ADD COLUMN / CREATE INDEX /
+// ADD CHECK are additive and excluded.
+func shapeIsDestructiveOrMutating(kind ShapeKind) bool {
+	switch kind {
+	case ShapeKindDropColumn,
+		ShapeKindDropIndex,
+		ShapeKindDropCheck,
+		ShapeKindAlterColumnType,
+		ShapeKindAlterColumnNullability,
+		ShapeKindModifyCheck:
+		return true
+	default:
+		return false
+	}
 }
 
 // applyShapeForward forwards a single unambiguous schema-change shape

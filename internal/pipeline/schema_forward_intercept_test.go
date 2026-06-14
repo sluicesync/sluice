@@ -178,6 +178,44 @@ func TestForwardAddColumn_SeededPre_ClassifiesFirstCDCSnapshot(t *testing.T) {
 	}
 }
 
+// TestForwardSchema_SeedGuard_SkipsDestructiveAgainstSeed pins the
+// ADR-0091 §3 seed-guard: a destructive/mutating shape classified
+// against a cold-start SEED pre-state is NOT forwarded (it may be a
+// phantom from seed-vs-CDC fidelity asymmetry — e.g. a PG generated
+// column or secondary index pgoutput omits), it is skipped as a no-op.
+// The same shape on a CDC→CDC boundary forwards (covered by
+// TestForwardSchema_ForwardsUnambiguousShapes).
+func TestForwardSchema_SeedGuard_SkipsDestructiveAgainstSeed(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	in := make(chan ir.Change, 1)
+	applier := &fakeShapeApplier{}
+	// Seed has the column; the first (and only) CDC snapshot lacks it —
+	// looks like a DROP against the seed. Under the guard this is skipped.
+	seedTable := addColForwardTable("users", &ir.Column{Name: "phantom", Type: ir.Varchar{Length: 100}, Nullable: true})
+	cdcTable := addColForwardTable("users")
+	in <- addColForwardSnap(cdcTable)
+	close(in)
+	errStore := &atomic.Pointer[error]{}
+	seed := []ir.SchemaSnapshot{addColForwardSnap(seedTable)}
+	out := interceptAddColumnForward(ctx, in, seed, schemaForwardDeps{
+		applier:          applier,
+		sourceEngineName: "postgres",
+		targetEngineName: "postgres",
+	}, errStore)
+	got := drainChannel(t, out, time.Second)
+	if e := errStore.Load(); e != nil {
+		t.Fatalf("seed-guard must skip silently, not error; got %v", *e)
+	}
+	if calls := applier.callNames(); len(calls) != 0 {
+		t.Errorf("applier called %v on a destructive shape against the seed; want none (seed-guard skip)", calls)
+	}
+	// The snapshot is still forwarded downstream (schema-history records).
+	if len(got) != 1 {
+		t.Errorf("got %d changes downstream; want 1 (snapshot still forwarded after skip)", len(got))
+	}
+}
+
 // TestForwardAddColumn_SeededPre_BareName_FallbackResolves pins the
 // MySQL Bug-83-equivalent for the ADR-0058 intercept: the cold-start
 // seed's QualifiedName() is the bare table name (MySQL SchemaReader

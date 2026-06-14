@@ -294,6 +294,51 @@ func TestNormalizeForCDCComparison_PG(t *testing.T) {
 		}
 	})
 
+	t.Run("generated_column_dropped_adr0091", func(t *testing.T) {
+		// pgoutput's RelationMessage EXCLUDES generated columns (pre-PG18
+		// they are not published), so projectRelation never sees them. A
+		// seed that keeps a generated column would diff as a phantom
+		// ShapeKindDropColumn — silent destruction under ADR-0091's
+		// default-on forwarding. The normalizer must drop generated
+		// columns; IDENTITY columns (AutoIncrement, not GeneratedExpr)
+		// are published and must NOT be dropped.
+		in := &ir.Table{
+			Columns: []*ir.Column{
+				{Name: "id", Type: ir.Integer{Width: 64, AutoIncrement: true}},
+				{Name: "qty", Type: ir.Integer{Width: 32}},
+				{Name: "total", Type: ir.Decimal{Precision: 20, Scale: 2}, GeneratedExpr: "qty * price", GeneratedStored: true},
+			},
+		}
+		out := eng.NormalizeForCDCComparison(in)
+		names := make([]string, 0, len(out.Columns))
+		for _, c := range out.Columns {
+			names = append(names, c.Name)
+		}
+		if len(out.Columns) != 2 || names[0] != "id" || names[1] != "qty" {
+			t.Errorf("columns = %v; want [id qty] (generated 'total' must be dropped; IDENTITY 'id' kept)", names)
+		}
+	})
+
+	t.Run("secondary_indexes_dropped_adr0091", func(t *testing.T) {
+		// pgoutput's RelationMessage carries no secondary index metadata
+		// (only the replica-identity key-flag), so projectRelation leaves
+		// Indexes nil. A seed that keeps secondary indexes would diff as a
+		// phantom ShapeKindDropIndex. PrimaryKey is preserved (the
+		// key-flag carries it).
+		in := &ir.Table{
+			Columns:    []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}, {Name: "email", Type: ir.Varchar{Length: 100}}},
+			PrimaryKey: &ir.Index{Name: "pk", Columns: []ir.IndexColumn{{Column: "id"}}},
+			Indexes:    []*ir.Index{{Name: "ix_email", Columns: []ir.IndexColumn{{Column: "email"}}}},
+		}
+		out := eng.NormalizeForCDCComparison(in)
+		if out.Indexes != nil {
+			t.Errorf("Indexes = %v; want nil (pgoutput carries no secondary index metadata)", out.Indexes)
+		}
+		if out.PrimaryKey == nil {
+			t.Errorf("PrimaryKey was dropped; want preserved (carried via the replica-identity key-flag)")
+		}
+	})
+
 	t.Run("nil_table", func(t *testing.T) {
 		if got := eng.NormalizeForCDCComparison(nil); got != nil {
 			t.Errorf("NormalizeForCDCComparison(nil) = %v; want nil", got)

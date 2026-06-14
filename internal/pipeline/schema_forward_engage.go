@@ -72,6 +72,20 @@ func (s *Streamer) engageAddColumnForward(ctx context.Context) error {
 		// log so the operator notices the redundant flag.
 		return nil
 	}
+	if s.multiDatabaseMode() {
+		// ADR-0091: schema-change forwarding is single-database only.
+		// A multi-database stream spans several source databases under
+		// one server-level DSN, so a single SchemaWriter / SchemaReader
+		// (which bind to one database) can't serve every routed target
+		// namespace. Skip the intercept rather than open a mis-bound
+		// writer; multi-database forwarding is a follow-up. The stream
+		// keeps the refuse-on-DDL behavior for its databases.
+		slog.InfoContext(ctx,
+			"schema-change forwarding skipped: multi-database streams do not "+
+				"forward source DDL (ADR-0091, single-database only); source DDL "+
+				"refuses loudly — use the drained model to apply it on the target")
+		return nil
+	}
 	if s.Target == nil {
 		return fmt.Errorf("pipeline: engage add-column-forward: nil target engine")
 	}
