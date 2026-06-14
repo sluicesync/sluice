@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"time"
@@ -134,6 +135,21 @@ func classifyApplierError(err error) error {
 		case 1062:
 			// Explicit non-retriable: don't wrap. Falls through to
 			// the bare return below.
+		case 1054, 1146:
+			// Schema drift (Bug F8): 1054 ER_BAD_FIELD_ERROR (unknown
+			// column) / 1146 ER_NO_SUCH_TABLE — the source has a
+			// column/table the target lacks (sluice does not auto-apply
+			// DDL). Symmetric to the PG 42703/42P01 case, so a
+			// MySQL→MySQL (incl. PlanetScale→PlanetScale) sync gets the
+			// same self-healing behavior instead of a terminal exit →
+			// supervisor tight-restart crash-loop. Retriable so the
+			// ADR-0038 backoff rides it out; heals when the operator adds
+			// the column/table on the target. The wrap names the remedy
+			// and keeps the underlying *MySQLError reachable via
+			// errors.As. NOT silent — each attempt logs loudly.
+			return &retriableMySQLError{err: fmt.Errorf(
+				"schema drift: the target is missing a column/table the source has — add it on the target to resume (sluice does not auto-apply DDL): %w", err,
+			)}
 		}
 	}
 

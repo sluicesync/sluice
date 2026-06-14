@@ -63,7 +63,6 @@ func TestClassifyApplierError_NonRetriableUnchanged(t *testing.T) {
 		{"duplicate key (explicit non-retriable per ADR-0038)", &gomysql.MySQLError{Number: 1062, Message: "Duplicate entry '1179' for key 'events.PRIMARY'"}},
 		{"foreign key violation", &gomysql.MySQLError{Number: 1452, Message: "Cannot add or update a child row"}},
 		{"syntax error", &gomysql.MySQLError{Number: 1064, Message: "You have an error in your SQL syntax"}},
-		{"unknown column", &gomysql.MySQLError{Number: 1054, Message: "Unknown column 'foo' in 'field list'"}},
 	}
 	for _, c := range cases {
 		c := c
@@ -103,6 +102,8 @@ func TestClassifyApplierError_RetriableShapes(t *testing.T) {
 		{"Vitess Unknown (Error 1105)", &gomysql.MySQLError{Number: 1105, Message: "vttablet: rpc error: code = Unknown desc = caller id churn"}},
 		{"Vitess Unavailable (Error 1105)", &gomysql.MySQLError{Number: 1105, Message: "vttablet: rpc error: code = Unavailable desc = tablet not serving"}},
 		{"Vitess ResourceExhausted (Error 1105)", &gomysql.MySQLError{Number: 1105, Message: "vttablet: rpc error: code = ResourceExhausted desc = throttler engaged"}},
+		{"schema drift: unknown column 1054 (Bug F8)", &gomysql.MySQLError{Number: 1054, Message: "Unknown column 'soak_extra' in 'field list'"}},
+		{"schema drift: no such table 1146 (Bug F8)", &gomysql.MySQLError{Number: 1146, Message: "Table 'soak.new_table' doesn't exist"}},
 		{"driver.ErrBadConn", driver.ErrBadConn},
 		{"io.EOF", io.EOF},
 		{"gomysql.ErrInvalidConn (GitHub #21)", gomysql.ErrInvalidConn},
