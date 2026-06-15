@@ -355,6 +355,35 @@ type Column struct {
 	// Source-side schema readers leave this false; only translation
 	// passes that *add* a column set it to true.
 	SluiceInjected bool
+
+	// StableID is an OPTIONAL, engine-supplied identifier for the
+	// column that survives a RENAME of the column's name. It is
+	// METADATA, not a schema attribute: it does NOT participate in the
+	// decode contract ([SchemaSignatureOf] / [SchemaSignature.Equal])
+	// nor in alter-detection ([pipeline] diffAlteredColumn). Two columns
+	// that differ ONLY in StableID are the SAME column for every
+	// schema-identity purpose.
+	//
+	// Its single load-bearing use is ADR-0091 F7b: proving that a
+	// `DROP x + ADD y (same type)` IR delta is actually a RENAME (same
+	// StableID + different name = proven rename, safe to forward and
+	// preserve data) versus a genuine drop+add (different StableID =
+	// refuse). The proof is definitive, so a bug can only ever REFUSE
+	// (safe), never mis-forward.
+	//
+	// Producers:
+	//   - Postgres CDC reader: pg_attribute.attnum (stable across
+	//     RENAME COLUMN; attnum > 0 for live, non-dropped columns).
+	//   - Everyone else (MySQL, hand-built IR, the cold-start
+	//     SchemaReader/seed): 0 ("unknown"). MySQL has no stable
+	//     column id, so a MySQL-source rename stays unprovable (refuse).
+	//
+	// 0 means "unknown" — never a valid attnum. Because it is pure
+	// metadata it is deliberately NOT serialized by the schema-history /
+	// backup codec ([schema_wire.go]): a persisted snapshot's StableID
+	// would be meaningless on resume (it is only ever compared between
+	// two live CDC projections within one stream).
+	StableID int
 }
 
 // IsGenerated reports whether the column is a generated/computed

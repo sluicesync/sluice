@@ -804,6 +804,9 @@ func (r *CDCReader) dispatchWAL(
 		if err := r.resolveIdentityKeyCols(ctx, entry); err != nil {
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
+		if err := r.resolveColumnStableIDs(ctx, entry); err != nil {
+			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
+		}
 		if err := checkSchemaRace(relations, m.RelationID, entry, r.schemaForward); err != nil {
 			return err
 		}
@@ -830,6 +833,9 @@ func (r *CDCReader) dispatchWAL(
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
 		if err := r.resolveIdentityKeyCols(ctx, entry); err != nil {
+			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
+		}
+		if err := r.resolveColumnStableIDs(ctx, entry); err != nil {
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
 		if err := checkSchemaRace(relations, m.RelationID, entry, r.schemaForward); err != nil {
@@ -1638,6 +1644,37 @@ func (r *CDCReader) resolveIdentityKeyCols(ctx context.Context, entry *relationC
 	return nil
 }
 
+// resolveColumnStableIDs populates entry.Columns[i].StableID with each
+// column's pg_attribute.attnum (ADR-0091 F7b). attnum is STABLE across a
+// RENAME COLUMN — a rename rewrites attname, never attnum — so the
+// pipeline's rename intercept can prove a `DROP x + ADD y (same type)`
+// IR delta is a real rename (same attnum, new name → forward, preserve
+// data) versus a genuine drop+add (different attnum → refuse). pgoutput's
+// RelationMessage carries name/OID/typmod/key-flag but NOT attnum, hence
+// this catalog round-trip — run once per RelationMessage (first-touch +
+// DDL boundaries only), the same off-hot-path place identity-key cols are
+// resolved.
+//
+// A nil r.db (hand-built reader in unit paths) leaves every StableID 0;
+// the intercept treats 0 as "unproven" and refuses, which is the safe
+// direction. A column whose attname has no live attnum (should not happen
+// for a freshly-projected RelationMessage) likewise stays 0.
+func (r *CDCReader) resolveColumnStableIDs(ctx context.Context, entry *relationCacheEntry) error {
+	if r.db == nil {
+		return nil
+	}
+	attnums, err := columnAttnumsFromCatalog(ctx, r.db, entry.Schema, entry.Name)
+	if err != nil {
+		return fmt.Errorf("resolve column attnums (stable ids): %w", err)
+	}
+	for i := range entry.Columns {
+		if n, ok := attnums[entry.Columns[i].Name]; ok {
+			entry.Columns[i].StableID = n
+		}
+	}
+	return nil
+}
+
 // primaryKeyColumnsFromCatalog returns the ordered PRIMARY KEY column
 // names for schema.table by querying the live catalog (pg_index), or an
 // empty slice if the table has no PRIMARY KEY. The ordering follows the
@@ -1682,6 +1719,47 @@ func primaryKeyColumnsFromCatalog(ctx context.Context, db *sql.DB, schema, table
 		return nil, err
 	}
 	return cols, nil
+}
+
+// columnAttnumsFromCatalog returns the live attname → attnum map for
+// schema.table (ADR-0091 F7b stable-id capture). Only user columns are
+// returned: attnum > 0 excludes system columns (ctid, xmin, …, which
+// have negative attnums) and attisdropped excludes tombstoned columns
+// (a dropped column keeps its attnum slot in the catalog but must not be
+// surfaced). attnum is stable across RENAME COLUMN, which is the whole
+// point — see [CDCReader.resolveColumnStableIDs].
+func columnAttnumsFromCatalog(ctx context.Context, db *sql.DB, schema, table string) (map[string]int, error) {
+	const q = `
+		SELECT a.attname, a.attnum
+		FROM   pg_attribute a
+		JOIN   pg_class      cl ON cl.oid = a.attrelid
+		JOIN   pg_namespace  n  ON n.oid  = cl.relnamespace
+		WHERE  n.nspname  = $1
+		  AND  cl.relname = $2
+		  AND  cl.relkind = 'r'
+		  AND  a.attnum   > 0
+		  AND  NOT a.attisdropped`
+	rows, err := db.QueryContext(ctx, q, schema, table)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := map[string]int{}
+	for rows.Next() {
+		var (
+			name   string
+			attnum int
+		)
+		if err := rows.Scan(&name, &attnum); err != nil {
+			return nil, err
+		}
+		out[name] = attnum
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // decodeTuple turns a pgoutput TupleData (positional, parallel to the

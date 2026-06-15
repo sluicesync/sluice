@@ -36,8 +36,13 @@ Shipped in parts:
   MySQL-source index/check (would need a new reader-side catalog
   projection — perf-only for indexes, cross-engine-expr-hazardous for
   checks). These need a future catalog-subscription path, not a tweak.
-- **F7b (follow-up ADR):** PG attnum-proven RENAME forwarding;
-  MySQL RENAME stays refuse (no stable column id).
+- **F7b (this ADR — SHIPPED):** PG attnum-proven RENAME COLUMN
+  forwarding. `ir.Column.StableID` carries `pg_attribute.attnum` (stable
+  across RENAME) from the PG CDC reader; the rename intercept forwards
+  iff before & after carry the SAME non-zero StableID (proven rename,
+  data preserved) and refuses otherwise (a different attnum is a real
+  drop+add; a zero attnum is unprovable). MySQL RENAME stays refuse
+  permanently (no stable column id). See §3.
 
 ## Context
 
@@ -158,7 +163,7 @@ information_schema re-read, which bounds the matrix:
 | REORDER | ✅ no-op (name-based decode) | ✅ no-op |
 | CREATE / DROP INDEX | ❌ refuse³ | ❌ refuse² |
 | ADD / DROP / MODIFY CHECK | ❌ refuse³ | ❌ refuse² |
-| RENAME COLUMN | ❌ refuse (§3) | ❌ refuse (§3) |
+| RENAME COLUMN | ❌ refuse (§3) | ✅ forward via attnum (F7b, §3) |
 | RENAME TABLE / multi-shape combo | ❌ refuse | ❌ refuse |
 
 Footnotes (the documented limitations, each a future catalog-poll
@@ -203,8 +208,11 @@ Under `--schema-changes=forward`, the sync still refuses loudly on:
   structural change in a single boundary. The IR delta cannot
   unambiguously order/separate them; the operator coordinates via the
   drained model.
-- **RENAME COLUMN** (`ShapeKindRenameColumn`) — the one ambiguous
-  single shape; see §3.
+- **RENAME COLUMN that cannot be PROVEN** (`ShapeKindRenameColumn`
+  without a stable column id) — a MySQL-source rename, or any rename
+  whose before/after columns lack a matching non-zero
+  `ir.Column.StableID`. A PG-source rename IS proven via attnum and
+  forwards (F7b); see §3.
 - **ADD COLUMN with a volatile/stateful computed DEFAULT** (ADR-0058
   §2a, Bug 90) — `NOW()` / `nextval` / `random` / unknown function.
   Target-session evaluation diverges from the source's per-row insert
@@ -217,7 +225,7 @@ Each refusal names the table, the shape, the per-change drift
 (ADR-0060 / F11 rendering), and the drained-model recovery hint —
 unchanged from ADR-0058's loud-failure contract.
 
-### 3. RENAME COLUMN refuses loudly on both engines (F7a); the
+### 3. RENAME COLUMN: PG forwards via attnum (F7b); MySQL refuses; the
 data-loss reasoning
 
 A column RENAME and a `DROP x + ADD y (same type)` are
@@ -238,27 +246,53 @@ survives a rename:
 
 - **Postgres** has it: `pg_attribute.attnum` is stable across RENAME.
   Same attnum + different name = proven RENAME; different attnum =
-  proven DROP+ADD. This makes PG RENAME forwarding *safe* — but it
-  requires the PG CDC schema projection to carry attnum into the IR,
-  which it does **not** today (`attnum` is read only for index/
-  constraint column resolution, never as a per-column identity).
+  proven DROP+ADD. **F7b plumbs this through:** the PG CDC reader
+  resolves each column's attnum on the relation boundary (the same
+  off-hot-path round-trip that resolves identity-key columns) and
+  carries it into `ir.Column.StableID`; the rename intercept forwards
+  iff `before.StableID == after.StableID && before.StableID != 0`.
+  Ground-truthed on a live PG 16: a real `RENAME old_label TO
+  new_label` arrives as before/after attnum `3/3` (proven → forward,
+  data preserved); a `DROP gone, ADD fresh (same type)` arrives as
+  `3/5` (different attnum → refuse). The proof is definitive, so a bug
+  can only ever REFUSE (safe), never mis-forward.
 - **MySQL** has no equivalent. `INFORMATION_SCHEMA.COLUMNS` exposes
   `ORDINAL_POSITION` (changes on reorder, not stable) and no creation
   id. A MySQL RENAME is **fundamentally unprovable** from catalog
   state; the heuristic is the only signal, and it is not safe enough
-  to drive a destructive auto-DROP.
+  to drive a destructive auto-DROP. MySQL columns carry
+  `StableID == 0` (unknown), so a MySQL-source rename stays unprovable
+  → refuse, permanently.
 
-Therefore F7a refuses RENAME loudly on **both** engines: the safe PG
-path needs attnum plumbing not yet built, and the MySQL path is
-unprovable in principle. The refuse message explains the ambiguity and
-the data-loss risk explicitly (not the generic "out of scope" wording)
-and points to drained recovery.
+**StableID is METADATA, not a schema attribute.** It does NOT
+participate in the decode contract (`ir.SchemaSignatureOf` /
+`SchemaSignature.Equal` — name + ordered type only) nor in
+alter-detection (`pipeline.diffAlteredColumn`), and it is deliberately
+NOT serialized by the schema-history / backup codec (a persisted
+attnum would be meaningless on resume — it is only ever compared
+between two live CDC projections within one stream). A seed
+(StableID=0) vs the first CDC snapshot (StableID=attnum) for an
+unchanged column therefore does NOT diff as altered and shares a
+signature.
 
-**F7b** (separate ADR) adds the PG attnum-into-IR plumbing and an
-attnum-aware rename classifier, at which point PG RENAME forwards
-safely; MySQL RENAME stays refuse permanently (the operator drains and
-renames on both ends explicitly — the one shape where explicit
-coordination is genuinely required, not merely conservative).
+**Seed-guard interaction (§5b):** RENAME is treated as a
+destructive/mutating shape by the seed-guard, so a rename classified
+against the cold-start SEED (no attnum on the seed side → never
+provable at that boundary) is SKIPPED, not forwarded — a safe
+non-destructive divergence (the column keeps its old name on the
+target). A real PG rename only forwards on a genuine CDC→CDC boundary
+where both sides carry attnum. For PG the first-touch RelationMessage
+primes the cache before any DDL, so a real rename is always a CDC→CDC
+boundary.
+
+The PG forward reuses the same per-shape dispatch
+(`applyShapeForward` → `applyShapeDelta` → `AlterRenameColumn`) and
+cross-engine retarget/scrub every other shape uses, so a PG-source
+rename also forwards to a **MySQL** target — the proof is the
+PG-source attnum, independent of the target engine. MySQL RENAME stays
+refuse permanently (the operator drains and renames on both ends
+explicitly — the one shape where explicit coordination is genuinely
+required, not merely conservative).
 
 ### 4. REORDER is a no-op (name-based decode)
 

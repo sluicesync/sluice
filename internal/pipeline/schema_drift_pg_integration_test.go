@@ -37,12 +37,18 @@ import (
 // the intercept now FORWARDS drop-column / alter-column-type (so they
 // no longer produce a refusal to assert against), and the seed-guard
 // SKIPS a destructive shape at the first post-cold-start boundary
-// anyway. RENAME COLUMN remains the canonical refuse-loudly shape (it
-// is ambiguous with drop+add — data-loss risk — and is never
-// seed-guarded), so it is the F11 drift-report-in-refusal pin here.
-// Drop/alter/index/check FORWARDING is covered by the per-shape
-// forward integration matrix; multi-shape combos by the unit drift
-// tests.
+// anyway. ADR-0091 F7b further narrowed it: a PG-source RENAME COLUMN is
+// now PROVEN via pg_attribute.attnum and FORWARDS (see
+// migrate_schema_forward_rename_integration_test.go), so it is no longer
+// a refuse-loudly shape on PG — a MySQL-source rename still refuses
+// (no stable id), pinned separately. The canonical PG-source
+// refuse-loudly shape that still surfaces a drift report is therefore a
+// MULTI-SHAPE COMBO (more than one structural change in one boundary —
+// genuinely un-orderable from the stream), which ClassifyShape refuses
+// BEFORE the seed-guard switch, so it fires even at the first boundary
+// (no prime needed). Drop/alter/rename FORWARDING is covered by the
+// per-shape forward integration matrix; multi-shape combos by the unit
+// drift tests too.
 //
 // Known limitation: CREATE INDEX / DROP INDEX produce no pgoutput
 // RelationMessage (no column-shape change), so the intercept never
@@ -57,23 +63,29 @@ func TestStreamer_SchemaDrift_PG_RefuseLoudlyIncludesDriftReport(t *testing.T) {
 		// shape).
 		preDDL string
 		// driftDDL is the source-side change that triggers refuse-
-		// loudly mid-stream. Must be a shape ADR-0091 still refuses
-		// (RENAME or a multi-shape combo).
+		// loudly mid-stream. Must be a shape ADR-0091 still refuses on a
+		// PG source (a multi-shape combo — RENAME now forwards via
+		// attnum, F7b).
 		driftDDL string
 		// Substrings that MUST appear in the surfaced error: the
 		// shape name + the rendered drift entries (ADR-0060 contract).
 		wantSubstrs []string
 	}{
 		{
-			name:   "rename-column",
-			preDDL: "ALTER TABLE widgets ADD COLUMN old_label VARCHAR(100);",
-			driftDDL: `ALTER TABLE widgets RENAME COLUMN old_label TO new_label;
-INSERT INTO widgets (id, name, new_label) VALUES (10, 'post-rename', 'lbl');`,
+			// A drop + add of DIFFERENT types in one boundary: not a
+			// rename (types differ), and more than one structural change,
+			// so it is a multi-shape combo refusal that still surfaces the
+			// per-column drift report (F11 contract).
+			name:   "multi-shape-combo",
+			preDDL: "ALTER TABLE widgets ADD COLUMN legacy_col VARCHAR(100);",
+			driftDDL: `ALTER TABLE widgets DROP COLUMN legacy_col, ADD COLUMN counter INT;
+INSERT INTO widgets (id, name, counter) VALUES (10, 'post-combo', 7);`,
 			wantSubstrs: []string{
-				"RENAME COLUMN",
-				"[column-renamed]",
-				"old_label",
-				"new_label",
+				"multi-shape combo",
+				"[column-dropped]",
+				"legacy_col",
+				"[column-added]",
+				"counter",
 				"drained model",
 			},
 		},
@@ -103,8 +115,9 @@ INSERT INTO widgets (id, name, new_label) VALUES (10, 'post-rename', 'lbl');`,
 			}
 
 			// Default-on forwarding (ADR-0091) engages the intercept;
-			// the refuse-loudly path is taken because RENAME is the one
-			// shape the intercept refuses (data-loss-ambiguous).
+			// the refuse-loudly path is taken because a multi-shape combo
+			// cannot be unambiguously ordered from the stream (ADR-0091
+			// §2) — it refuses BEFORE the seed-guard, so no prime needed.
 			streamer := &Streamer{
 				Source:    pgEng,
 				Target:    pgEng,
