@@ -380,14 +380,16 @@ func diffRenameColumn(added, dropped []*ir.Column) (before, after *ir.Column, ok
 	aCopy.SluiceInjected = false
 	dCopy.SluiceInjected = false
 	// StableID (ADR-0091 F7b: PG attnum) is METADATA, not a load-bearing
-	// column attribute — a rename CHANGES the attnum's name binding but
-	// not its value, while a drop+add gives a DIFFERENT attnum. Either way
-	// the value differs between the dropped and added column, so leaving it
-	// in the equality lens would make the same-type heuristic NEVER fire on
-	// a PG CDC boundary (which is exactly where F7b needs it to fire). Zero
-	// it for the same-type match; the REAL StableIDs are carried out on the
-	// returned before/after columns (d, a) below, where the intercept reads
-	// them to prove rename-vs-drop+add (refuseRenameAmbiguous gate).
+	// column attribute, so it is zeroed here for the same-type match — the
+	// heuristic's job is only to recognize the one-drop+one-add-of-same-
+	// type SHAPE; the rename-vs-drop+add PROOF is the intercept's job. We
+	// zero it (rather than leave it in the lens) so this classifier stays
+	// engine-agnostic: it fires uniformly for a real rename (dropped/added
+	// share the same attnum) AND for a genuine drop+add (different attnums)
+	// AND for MySQL (attnum 0 both). The REAL StableIDs are carried out
+	// unmodified on the returned before/after columns (d, a) below, where
+	// routeRenameColumn proves a rename (same non-zero StableID → forward)
+	// vs a drop+add / unprovable (different or zero → refuse).
 	aCopy.StableID = 0
 	dCopy.StableID = 0
 	// Normalize Default: the cold-start SchemaReader populates
