@@ -401,7 +401,12 @@ type vstreamSnapshotStream struct {
 	// post-DDL ROW decodes with the new column but the target schema is
 	// never altered: SQLSTATE 42703 / MySQL 1054). Lazily initialised on
 	// first post-COPY FIELD so COPY-phase FIELD caching is untouched.
-	// Guarded by mu.
+	//
+	// Unlike the sibling fields above, this is touched ONLY by the single
+	// post-COPY CDC pump goroutine (in maybeSnapshotSchemaCDC) — by then
+	// the COPY pump that shares mu has exited — so it needs no lock. (The
+	// CDC pump is the sole writer; the -race Integration gate guards this
+	// contract.)
 	snapshotSig map[string]ir.SchemaSignature
 
 	// currentVgtid is the latest VGTID observed on the stream. When the
