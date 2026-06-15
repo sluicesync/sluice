@@ -4,6 +4,42 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [0.99.49] - 2026-06-15
+
+### Changed
+- **Postgres CDC apply is now pipelined (ADR-0092) — ~70× higher apply
+  throughput on latency-bound (cross-region/cross-cloud) links.** The batch
+  apply path used to send a batch of N changes as N serial `Exec` round trips
+  inside one transaction, plus a position upsert and a commit (N+2 round trips).
+  Batching (ADR-0017/ADR-0089) amortized the commit fsync but did nothing for
+  the N data round trips — they stayed serial, so steady-state apply throughput
+  was bounded by `1 / per_row_exec_latency`, which on any non-co-located link is
+  dominated by network RTT. The data statements **and** the position upsert are
+  now queued onto a single `pgx.Batch` and sent in one pipelined flush; round
+  trips per batch drop from N+2 to O(1) (begin + flush + commit), independent of
+  N, so throughput becomes bounded by the server's execution rate rather than
+  `N × RTT`. Measured on a live PlanetScale soak, apply was pinned at ~90 rows/s
+  on a ~7 ms cross-cloud link and a PS-10 → PS-80 database upsize moved it 0%
+  (the bottleneck was the wire, not the DB); pipelining lifts that ~70×. The win
+  scales with RTT — co-located/low-latency targets were already fast (batching
+  amortized the commit) and see a smaller gain, never a regression. Default-on
+  for the batch apply path (`--apply-batch-size` > 1, the `auto` default);
+  `--apply-batch-size=1` keeps the serial per-change path verbatim. Value
+  encoding is byte-identical to the prior path: the pipelined pool runs in pgx
+  `QueryExecModeDescribeExec` (real described OID, BINARY format, same per-OID
+  codecs), reusing the existing `buildInsertSQL`/`buildUpdateSQL`/`buildDeleteSQL`
+  builders and `prepareValue` codec path byte-for-byte — pipelining changes
+  *when* statements are sent, never *how a value is encoded*. Durability and
+  atomicity are unchanged (position rides the same tx, `synchronous_commit = on`
+  pinned, crash before the single commit rolls back both — ADR-0007 holds).
+  Postgres-only; MySQL apply is unchanged (the ADR-0081 seam was generalized so
+  MySQL can adopt pipelining later). If the raw pgx-conn escape is ever
+  unavailable it falls back to serial `*sql.Tx` exec with a one-time WARN — loud,
+  never silent. Pre-existing, unchanged limitation: geometry over CDC is refused
+  loudly on the applier path (no binary geometry codec yet), identically on the
+  serial and pipelined paths; the snapshot/migration COPY path handles geometry
+  fine.
+
 ## [0.99.48] - 2026-06-15
 
 ### Fixed
