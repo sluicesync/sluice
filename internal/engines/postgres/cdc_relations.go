@@ -403,6 +403,13 @@ func oidToType(oid uint32, typmod int32) (ir.Type, error) {
 		return ir.Varchar{Length: l}, nil
 	case pgtype.BPCharOID:
 		return ir.Char{Length: charTypmod(typmod)}, nil
+	case pgtype.QCharOID:
+		// PG's internal single-byte "char" type (distinct from CHARACTER(n)).
+		// Mirrors the schema reader's `_char` → "character" mapping
+		// (builtinArrayElement) so a "char"[] array element — and a scalar
+		// "char" column — resolves instead of falling through to the
+		// unsupported-OID refusal. Length 1: the type holds one byte.
+		return ir.Char{Length: 1}, nil
 	case pgtype.TextOID:
 		return ir.Text{Size: ir.TextLong}, nil
 
@@ -452,10 +459,65 @@ func oidToType(oid uint32, typmod int32) (ir.Type, error) {
 	// reconciles the two for every verbatim family. Cross-engine
 	// safety is preserved by the orchestrator's `ir.VerbatimType`
 	// refusal in cross_engine_supportable.go.
+	// ---- Array families (Bug 144) ----
+	// pgoutput carries an array column under its array OID (e.g. _int4 = 1007).
+	// The element type is resolved by recursing oidToType on the element OID, so
+	// an array element decodes BYTE-IDENTICALLY to the same scalar column — the
+	// shared value_decode.decodeArray path (reached via the ir.Array arm of
+	// decodeValue) consumes the resulting ir.Array. The element-OID table MUST
+	// stay in family-parity with the schema reader's text-keyed
+	// builtinArrayElement (the Bug 97/118 dual-registry-drift lesson — a family
+	// supported at schema-read but missing here crashes the stream on the first
+	// array DML); TestOIDToType_ArrayParity pins that.
+	if elemOID, ok := pgArrayElementOID[oid]; ok {
+		elem, err := oidToType(elemOID, -1)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: cdc: array OID %d element OID %d: %w", oid, elemOID, err)
+		}
+		return ir.Array{Element: elem}, nil
+	}
 	if name, ok := coreVerbatimCDCOIDs[oid]; ok {
 		return ir.VerbatimType{Definition: name}, nil
 	}
 	return nil, fmt.Errorf("postgres: cdc: unsupported column type OID %d (typmod %d)", oid, typmod)
+}
+
+// macaddr8ArrayOID is PG's `_macaddr8` array type OID. pgx's pgtype exposes
+// Macaddr8OID (774, the scalar) but not the array constant; 775 is the stable
+// pg_catalog OID for its array (array OIDs sit directly above their element).
+const macaddr8ArrayOID = 775
+
+// pgArrayElementOID maps a Postgres built-in array type OID to its element type
+// OID, for CDC array support (Bug 144). oidToType recurses on the element OID so
+// each array element decodes identically to the same scalar column. This is the
+// OID-keyed CDC mirror of the schema reader's text-keyed builtinArrayElement;
+// the two MUST cover the same element families (TestOIDToType_ArrayParity is the
+// drift guard — see the Bug 97/118 write-up above on coreVerbatimCDCOIDs).
+var pgArrayElementOID = map[uint32]uint32{
+	pgtype.BoolArrayOID:        pgtype.BoolOID,
+	pgtype.Int2ArrayOID:        pgtype.Int2OID,
+	pgtype.Int4ArrayOID:        pgtype.Int4OID,
+	pgtype.Int8ArrayOID:        pgtype.Int8OID,
+	pgtype.Float4ArrayOID:      pgtype.Float4OID,
+	pgtype.Float8ArrayOID:      pgtype.Float8OID,
+	pgtype.NumericArrayOID:     pgtype.NumericOID,
+	pgtype.TextArrayOID:        pgtype.TextOID,
+	pgtype.VarcharArrayOID:     pgtype.VarcharOID,
+	pgtype.BPCharArrayOID:      pgtype.BPCharOID,
+	pgtype.QCharArrayOID:       pgtype.QCharOID,
+	pgtype.ByteaArrayOID:       pgtype.ByteaOID,
+	pgtype.DateArrayOID:        pgtype.DateOID,
+	pgtype.TimeArrayOID:        pgtype.TimeOID,
+	pgtype.TimetzArrayOID:      pgtype.TimetzOID,
+	pgtype.TimestampArrayOID:   pgtype.TimestampOID,
+	pgtype.TimestamptzArrayOID: pgtype.TimestamptzOID,
+	pgtype.JSONArrayOID:        pgtype.JSONOID,
+	pgtype.JSONBArrayOID:       pgtype.JSONBOID,
+	pgtype.UUIDArrayOID:        pgtype.UUIDOID,
+	pgtype.InetArrayOID:        pgtype.InetOID,
+	pgtype.CIDRArrayOID:        pgtype.CIDROID,
+	pgtype.MacaddrArrayOID:     pgtype.MacaddrOID,
+	macaddr8ArrayOID:           pgtype.Macaddr8OID,
 }
 
 // coreVerbatimCDCOIDs is the CDC-side mirror of the schema reader's
