@@ -345,12 +345,18 @@ func routeForwardBoundary(
 		// backfill of already-shipped rows.
 		return applyAddColumnForward(ctx, deps, tableName, snap, shape, out)
 	case ShapeKindRenameColumn:
-		// ADR-0091 §3 — RENAME is the one ambiguous single shape: a
-		// rename and a drop+add-of-same-type are indistinguishable from
-		// the IR delta, and guessing wrong silently drops the column's
-		// data on the target. Refuse loudly on both engines until F7b
-		// adds PG attnum-proven rename detection.
-		return refuseRenameAmbiguous(tableName, shape, pre, snap.IR)
+		// ADR-0091 §3 + F7b — a rename and a drop+add-of-same-type are
+		// indistinguishable from the IR delta ALONE, and guessing wrong
+		// silently drops the column's data on the target. The ONLY safe
+		// disambiguation is a stable column identity that survives a
+		// rename: PG's pg_attribute.attnum (carried as ir.Column.StableID
+		// by the PG CDC reader). Same non-zero StableID on before & after
+		// = PROVEN rename → forward (data preserved). Anything else
+		// (different attnum = real drop+add; or StableID==0 = MySQL / no
+		// stable id = unprovable) → refuse loudly. The proof is
+		// definitive, so this can only ever REFUSE safely, never
+		// mis-forward (ADR-0091 §3, F7b).
+		return routeRenameColumn(ctx, deps, tableName, snap, shape, pre)
 	case ShapeKindDropColumn,
 		ShapeKindCreateIndex,
 		ShapeKindDropIndex,
@@ -392,6 +398,71 @@ func renderDriftForRefusal(pre, post *ir.Table) string {
 	// Lead with " observed drift:" so the rendered block reads as a
 	// natural continuation of the outer error sentence.
 	return " observed drift:" + rendered + "\n"
+}
+
+// routeRenameColumn decides a RENAME COLUMN boundary using the
+// attnum-proof (ADR-0091 F7b). The classifier already established the
+// drop+add-of-same-type pattern and carried the real per-column
+// StableIDs out on shape.RenamedColumnBefore/After. A rename PROVES
+// itself when both sides carry the SAME non-zero StableID
+// (pg_attribute.attnum is stable across RENAME COLUMN); a different
+// attnum is a genuine drop+add, and a zero attnum (MySQL source, or an
+// unresolved PG lookup) is unprovable. Only a proven rename forwards —
+// via the same per-shape applyShapeForward dispatch (retarget + Schema
+// scrub) every other forwarded shape uses, reaching
+// ir.ShapeDeltaApplier.AlterRenameColumn on the target. Everything else
+// refuses loudly. Because the proof is definitive, a bug here can only
+// ever REFUSE (safe), never mis-forward a real drop+add as a rename.
+func routeRenameColumn(
+	ctx context.Context,
+	deps schemaForwardDeps,
+	tableName string,
+	snap ir.SchemaSnapshot,
+	shape Shape,
+	pre *ir.Table,
+) error {
+	var beforeID, afterID int
+	if shape.RenamedColumnBefore != nil {
+		beforeID = shape.RenamedColumnBefore.StableID
+	}
+	if shape.RenamedColumnAfter != nil {
+		afterID = shape.RenamedColumnAfter.StableID
+	}
+	proven := beforeID != 0 && beforeID == afterID
+	// DEBUG diagnostic (gated behind --log-level=debug): logs the
+	// captured attnums + verdict at the decision point so an operator can
+	// confirm same-attnum (rename→forward) vs different-attnum
+	// (drop+add→refuse) without re-deriving it. Not INFO — this fires on
+	// every rename boundary.
+	slog.DebugContext(
+		ctx, "schema-forward: rename-column intercept decision (stable-id proof)",
+		"table", tableName,
+		"before_name", renamedName(shape.RenamedColumnBefore),
+		"after_name", renamedName(shape.RenamedColumnAfter),
+		"before_stable_id", beforeID,
+		"after_stable_id", afterID,
+		"proven", proven,
+	)
+	if !proven {
+		return refuseRenameAmbiguous(tableName, shape, pre, snap.IR)
+	}
+	slog.InfoContext(
+		ctx, "schema-forward: RENAME COLUMN proven via stable id (PG attnum); forwarding",
+		"table", tableName,
+		"before", renamedName(shape.RenamedColumnBefore),
+		"after", renamedName(shape.RenamedColumnAfter),
+		"stable_id", beforeID,
+	)
+	return applyShapeForward(ctx, deps, tableName, snap, shape)
+}
+
+// renamedName returns a column's Name for log lines, or "?" when the
+// column pointer is nil.
+func renamedName(c *ir.Column) string {
+	if c == nil {
+		return "?"
+	}
+	return c.Name
 }
 
 // refuseRenameAmbiguous is the operator-actionable refusal for a
@@ -457,6 +528,16 @@ func forwardRecoveryHint(tableName string) string {
 // a cold-start seed pre, because a phantom of one (from seed-vs-CDC
 // fidelity asymmetry) would be destructive. ADD COLUMN / CREATE INDEX /
 // ADD CHECK are additive and excluded.
+//
+// RENAME COLUMN (F7b) is included: against the cold-start SEED there is
+// no attnum on the seed side (the SchemaReader leaves StableID=0), so the
+// rename can never be PROVEN at the first boundary and forwarding the
+// drop+add guess would risk silent data loss. Skipping it at the seed
+// boundary (no-op — the column keeps its old name on the target, a safe
+// non-destructive divergence) means a real PG rename only forwards on a
+// genuine CDC→CDC boundary where both sides carry attnum. For PG the
+// first-touch RelationMessage primes the cache before any DDL, so a real
+// rename is always a CDC→CDC boundary.
 func shapeIsDestructiveOrMutating(kind ShapeKind) bool {
 	switch kind {
 	case ShapeKindDropColumn,
@@ -464,7 +545,8 @@ func shapeIsDestructiveOrMutating(kind ShapeKind) bool {
 		ShapeKindDropCheck,
 		ShapeKindAlterColumnType,
 		ShapeKindAlterColumnNullability,
-		ShapeKindModifyCheck:
+		ShapeKindModifyCheck,
+		ShapeKindRenameColumn:
 		return true
 	default:
 		return false
@@ -472,16 +554,20 @@ func shapeIsDestructiveOrMutating(kind ShapeKind) bool {
 }
 
 // applyShapeForward forwards a single unambiguous schema-change shape
-// (DROP / ALTER TYPE / NULLABILITY / CREATE/DROP INDEX / CHECK) to the
-// target via the shared [applyShapeDelta] dispatch — the same per-shape
-// apply path Shape A's boundary router uses (ADR-0091 §1). Before
-// dispatch the post IR is retargeted to the target dialect and its
-// Schema field scrubbed (ADR-0091 §5): the CDC-emitted IR carries the
-// SOURCE engine's column types and database name, neither of which the
-// target SchemaWriter can consume directly.
+// (DROP / ALTER TYPE / NULLABILITY / CREATE/DROP INDEX / CHECK, and a
+// PG-attnum-PROVEN RENAME COLUMN — F7b) to the target via the shared
+// [applyShapeDelta] dispatch — the same per-shape apply path Shape A's
+// boundary router uses (ADR-0091 §1). Before dispatch the post IR is
+// retargeted to the target dialect and its Schema field scrubbed
+// (ADR-0091 §5): the CDC-emitted IR carries the SOURCE engine's column
+// types and database name, neither of which the target SchemaWriter can
+// consume directly.
 //
-// ADD COLUMN and RENAME do NOT route here — ADD has its own
-// volatility/backfill path and RENAME refuses (ADR-0091 §3).
+// ADD COLUMN does NOT route here — it has its own volatility/backfill
+// path. RENAME routes here only AFTER routeRenameColumn proves it via
+// stable id (an unproven rename refuses; ADR-0091 §3, F7b); the rename
+// arm of [applyShapeDelta] consumes only the before/after column NAMES,
+// so the retargeted post table suffices for qualifyTable.
 func applyShapeForward(
 	ctx context.Context,
 	deps schemaForwardDeps,

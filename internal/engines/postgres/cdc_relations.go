@@ -74,6 +74,20 @@ type relationColumn struct {
 	TypeMod   int32
 	Type      ir.Type
 	KeyColumn bool // RelationMessageColumn.Flags & 1
+
+	// StableID is pg_attribute.attnum for this column — the catalog's
+	// per-relation column ordinal that is STABLE across a RENAME COLUMN
+	// (a rename changes attname, never attnum). Resolved by
+	// [CDCReader.resolveColumnStableIDs] on each RelationMessage (the
+	// same relation-boundary round-trip that resolves identity-key
+	// cols), then carried into [ir.Column.StableID] by [projectRelation]
+	// so the pipeline's ADR-0091 F7b rename intercept can PROVE a
+	// rename (same attnum + new name) versus a drop+add (different
+	// attnum). 0 = unresolved (no live pool, or column not found —
+	// either way the intercept treats 0 as "unproven" and refuses,
+	// which is the safe direction). pgoutput's RelationMessage does NOT
+	// carry attnum, hence the catalog lookup.
+	StableID int
 }
 
 // detectIncompatibleRelationChange compares a previously-cached relation
@@ -313,7 +327,11 @@ const schemaRaceRecoveryHint = "sluice does not support this DDL shape mid-strea
 func projectRelation(rel *relationCacheEntry) *ir.Table {
 	cols := make([]*ir.Column, len(rel.Columns))
 	for i, c := range rel.Columns {
-		cols[i] = &ir.Column{Name: c.Name, Type: c.Type}
+		// StableID carries pg_attribute.attnum (ADR-0091 F7b) so the
+		// pipeline rename intercept can prove rename-vs-drop+add. It is
+		// METADATA only — SchemaSignatureOf / diffAlteredColumn ignore it,
+		// so it does not perturb the decode contract or alter-detection.
+		cols[i] = &ir.Column{Name: c.Name, Type: c.Type, StableID: c.StableID}
 	}
 	tbl := &ir.Table{Schema: rel.Schema, Name: rel.Name, Columns: cols}
 	// Bug 89: surface PK column names from the RelationMessage's
