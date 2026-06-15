@@ -74,20 +74,26 @@ read loop for >5 s. Tracked separately (see *Follow-ups*); not in scope here.
 Add a **pipelined apply path** for engines whose driver supports request pipelining, and
 adopt it for **Postgres** via `pgx`'s batch protocol. Instead of N serial round trips, the
 batch's data statements **and** the position upsert are queued onto a single `pgx.Batch`
-and sent in **one** network flush; the server executes them in order and the results are
-read back together, then the transaction commits:
+and flushed via `SendBatch`; the server executes them in order and the results are read
+back together, then the transaction commits:
 
 ```
 BEGIN
-  SendBatch[ Exec(change₁), …, Exec(changeₙ), Exec(position upsert) ]   ← ONE flush
+  SendBatch[ Exec(change₁), …, Exec(changeₙ), Exec(position upsert) ]   ← pipelined flush
   read N+1 results
 COMMIT
 ```
 
-Round trips per batch drop from **N+2** to **~3** (begin, the single batched flush,
-commit), independent of N. Throughput becomes bounded by the *server's* execution rate
-rather than `N × RTT`. The win scales with RTT: ~70× on the soak's 7 ms link, smaller but
-still real (collapses the serial-exec span to one flush) on a local link.
+Round trips per batch drop from **N+2** to **O(1)** (begin, the pipelined flush, commit),
+independent of N. Under the `QueryExecModeDescribeExec` mode the pool runs in (see
+*Mechanism*), the pipelined flush is itself **~2 round trips** — one describe/prepare flush
+for the *distinct* statement templates in the batch, then one execute flush for all N — so
+a batch costs roughly begin + 2 + commit, still O(1) in N rather than N+2. Throughput
+becomes bounded by the *server's* execution rate rather than `N × RTT`. The win scales with
+RTT: ~70× on the soak's 7 ms link, smaller but still real (collapses the serial-exec span
+to a fixed handful of flushes) on a local link. The one extra round trip vs. a single flush
+is the price of describing each statement fresh — bought deliberately, for value fidelity
+(see *Mechanism*).
 
 ### Mechanism — generalize the [ADR-0081] seam's transaction handle
 
@@ -120,12 +126,40 @@ returns a `*pgxBatchTx` handle that:
   every result (surfacing the first per-statement error with its change's context), then
   commits the `pgx.Tx`.
 
+The dedicated pipelined pool runs in pgx's **`QueryExecModeDescribeExec`**, and this is what
+makes "never *how a value is encoded*" literally true. Under `DescribeExec`, `SendBatch`
+describes each **distinct** queued statement **fresh** via an unnamed prepare — pgx passes a
+**nil** statement-description cache, so there is *no* client-side cache and never a stale OID
+— then binds + executes every statement with the **real described parameter OID in BINARY
+format**. That is byte-identical value encoding to the serial `CacheStatement` path the
+applier's primary pool uses, so the pipelined path inherits the already-trusted per-OID
+binary codecs (including the geometry / pgvector / hstore / timetz cases) rather than
+re-deriving them. The rejected-here alternative was `QueryExecModeExec`, which sends
+parameters as **OID 0 / TEXT** (server-inferred types) — a *different* wire encoding that
+happens to round-trip for most scalars but leaves the extension/geometry families on an
+unverified text path; `DescribeExec` eliminates that risk surface at the cost of the one
+extra describe round trip noted above.
+
 `Dispatch` becomes a type-switch on the `BatchTx`: a `*pgxBatchTx` → queue; a `*sql.Tx`
 (the per-change `Apply` path and any non-pipelined fall-back) → execute as before. Every
 other invariant — AIMD consult/observe timing (item 18), the keyless-table flush boundary
 ([ADR-0089]), byte-cap flush ([ADR-0028]), source-tx-boundary alignment ([ADR-0027]),
 schema-event handling ([ADR-0049]), and the position-then-commit ordering — is untouched,
 because they all operate above the exec/queue seam.
+
+### GAP #3 ([ADR-0091]) is subsumed by the live re-describe
+
+[ADR-0091]'s F7a GAP #3 (a forwarded `ALTER TYPE int4→bigint` followed by an
+out-of-old-range value) needs the applier to bind the widened column against the *live*
+post-DDL OID, not a stale cached pre-DDL OID. On the serial path that is handled by marking
+the table dirty and forcing `QueryExecModeExec` for its DML (so pgx re-describes instead of
+reusing its prepared-statement cache). The pipelined path needs **no** such special-casing:
+`DescribeExec` already re-describes every distinct statement fresh against the live catalog
+on every flush and caches nothing, so a widened column is always bound against the live OID.
+(`pgx.Batch` honours only the connection's default exec mode, not a per-query override — so
+the serial path's `execDMLArgs` mode-prepend is intentionally *not* queued here; the pool's
+`DescribeExec` default governs the whole flush.) `TestPipelined_GAP3_AlterTypeWiden` pins
+this through the pipelined batch.
 
 ### Error semantics
 
@@ -178,7 +212,19 @@ rollback + reclassify + retry) is identical.
   from the prior boundary reproduces the batch idempotently (PK/unique) and the keyless
   guard still clamps class-3 to batch-1 blast radius.
 - **Equivalence:** for a given change stream, the pipelined path and the serial `*sql.Tx`
-  path must produce byte-identical target state (a differential pin).
+  path must produce byte-identical target state (a differential pin). This is also how the
+  extension/geometry families are pinned: pgvector, hstore and PostGIS `geometry` are
+  exercised through the pipelined batch and compared to the serial outcome. pgvector and
+  hstore round-trip identically on both paths (the extension OID has no client codec, so
+  both paths text-encode the canonical string PostGIS/hstore parse). **PostGIS `geometry`
+  surfaced a PRE-EXISTING applier gap** (independent of ADR-0092): the CDC applier registers
+  no binary geometry codec, so `prepareValue`'s EWKB bytes are shipped in TEXT format and
+  PostGIS refuses them (`parse error - invalid geometry`) — *identically on the serial and
+  pipelined paths*. The COPY snapshot path is unaffected (it writes EWKB in COPY-binary).
+  The differential pin asserts the pipelined path does not diverge from serial (and never
+  silently corrupts); fixing geometry-over-CDC (register a geometry binary codec on the
+  applier conns) is tracked as a separate follow-up, after which the same pin flips to
+  asserting a successful identical round-trip.
 - **`-race` integration before tag** — this touches the apply hot path and the
   conn-escape/tx lifecycle (concurrency-adjacent), so the `-race` integration gate runs
   before the tag is cut (per the project's `-race`-before-tag rule).
@@ -189,6 +235,15 @@ rollback + reclassify + retry) is identical.
   `Exec`): one round trip, but the simple protocol forces literal-inlined values, which
   discards `prepareValue` + the per-OID binary codecs and reintroduces escaping / type-
   fidelity risk. Unacceptable for a value-fidelity-critical tool. **Rejected.**
+- **Run the pipelined pool in `QueryExecModeExec` instead of `DescribeExec`** (one flush vs.
+  two): `Exec` sends every parameter as OID 0 / TEXT with server-inferred types — a wire
+  encoding *different* from the serial `CacheStatement` path's binary real-OID encoding. It
+  round-trips for most scalars but leaves geometry / PostGIS / pgvector / hstore / timetz on
+  an unverified text path, and it would make the ADR's "byte-identical encoding, only
+  pipelined" claim false. `DescribeExec` costs one extra describe round trip per batch (still
+  O(1) in N) and in exchange gives byte-identical binary encoding to the serial path and
+  subsumes GAP #3 via the live re-describe. The extra round trip is negligible against the
+  N+2→O(1) win and correct to pay for fidelity. **Rejected** (`DescribeExec` chosen).
 - **Multi-row `INSERT … VALUES (…),(…)` collapse:** helps insert-heavy runs but not mixed
   I/U/D streams, complicates `ON CONFLICT` arbitration, and still needs a separate path for
   UPDATE/DELETE. `pgx.Batch` pipelines *all* statement shapes uniformly. **Rejected** as the

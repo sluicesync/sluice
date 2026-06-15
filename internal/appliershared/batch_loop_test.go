@@ -90,7 +90,7 @@ func testConfig(t *testing.T, rec *recorder, transactionalDDL bool) *BatchConfig
 		EngineName:       "fake",
 		TransactionalDDL: transactionalDDL,
 		ByteCap:          1 << 30,
-		BeginTx: func(ctx context.Context) (*sql.Tx, error) {
+		BeginTx: func(ctx context.Context) (BatchTx, error) {
 			tx, err := db.BeginTx(ctx, nil)
 			if err != nil {
 				return nil, fmt.Errorf("fake: applier: begin tx: %w", err)
@@ -98,7 +98,7 @@ func testConfig(t *testing.T, rec *recorder, transactionalDDL bool) *BatchConfig
 			rec.add("begin")
 			return tx, nil
 		},
-		Dispatch: func(_ context.Context, _ *sql.Tx, _ string, c ir.Change) error {
+		Dispatch: func(_ context.Context, _ BatchTx, _ string, c ir.Change) error {
 			rec.add("dispatch:" + c.Pos().Token)
 			return nil
 		},
@@ -109,13 +109,13 @@ func testConfig(t *testing.T, rec *recorder, transactionalDDL bool) *BatchConfig
 		Redact:     func(context.Context, ir.Change) error { return nil },
 		StampShard: func(ir.Change) {},
 		Classify:   func(err error) error { return fmt.Errorf("classified: %w", err) },
-		WritePosition: func(_ context.Context, _ *sql.Tx, _ string, token string) error {
+		WritePosition: func(_ context.Context, _ BatchTx, _ string, token string) error {
 			rec.add("writePosition:" + token)
 			return nil
 		},
-		Commit: func(tx *sql.Tx) error {
+		Commit: func(tx BatchTx) error {
 			rec.add("commit")
-			return tx.Commit()
+			return tx.(*sql.Tx).Commit()
 		},
 	}
 }
@@ -406,7 +406,7 @@ func TestRunOneBatch_DispatchErrorRollsBackAndClassifies(t *testing.T) {
 	rec := &recorder{}
 	cfg := testConfig(t, rec, false)
 	boom := errors.New("boom")
-	cfg.Dispatch = func(_ context.Context, _ *sql.Tx, _ string, c ir.Change) error {
+	cfg.Dispatch = func(_ context.Context, _ BatchTx, _ string, c ir.Change) error {
 		if c.Pos().Token == "p2" {
 			return boom
 		}

@@ -142,6 +142,37 @@ func openPgxDBAs(dsn string, role connRole, appID string) (*sql.DB, error) {
 	return stdlib.OpenDB(*connConfig), nil
 }
 
+// openPgxDBDescribeExec opens a lazy *sql.DB whose backends default to
+// pgx's [pgx.QueryExecModeDescribeExec] instead of the usual
+// prepared-statement cache. The CDC pipelined-apply path (ADR-0092) uses
+// this pool because its SendBatch flush, under this mode, describes each
+// DISTINCT queued statement FRESH via an unnamed prepare (pgx passes a nil
+// statement-description cache, so there is no client-side cache and never a
+// stale pre-DDL OID), then binds + executes every statement with the real
+// described parameter OID in BINARY format — byte-IDENTICAL value encoding
+// to the serial CacheStatement path the applier's primary pool uses. That
+// is what makes the "pipelining changes only WHEN statements are sent,
+// never HOW a value is encoded" invariant literally true (an Exec-mode
+// pool would instead send OID-0 TEXT, a different wire encoding), and it
+// subsumes the ADR-0091 GAP #3 stale-OID hazard via the live re-describe (a
+// widened column is re-described, never bound against a cached pre-DDL OID)
+// without any per-statement special-casing. The cost is ~2 round trips per
+// batch (one describe/prepare flush for the distinct statement templates,
+// one execute flush for all N) — still O(1) in N, so the throughput win
+// over N+2 serial round trips is preserved. Same role/label/keep-alive
+// shape as [openPgxDBAs]; only the exec mode differs, and only for this
+// dedicated pool — the applier's primary pool (per-change Apply path) keeps
+// the cached fast path.
+func openPgxDBDescribeExec(dsn string, role connRole, appID string) (*sql.DB, error) {
+	connConfig, err := pgx.ParseConfig(withApplicationName(dsn, role, appID))
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse dsn: %w", err)
+	}
+	connConfig.DialFunc = netkeepalive.Dialer().DialContext
+	connConfig.DefaultQueryExecMode = pgx.QueryExecModeDescribeExec
+	return stdlib.OpenDB(*connConfig), nil
+}
+
 // openDB opens a *sql.DB against the Postgres server and pings to
 // confirm the connection is usable. The connection is labelled with the
 // [roleControl] application_name; callers that know their subsystem use

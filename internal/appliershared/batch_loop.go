@@ -43,13 +43,29 @@ package appliershared
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"log/slog"
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
+
+// BatchTx is the minimal transaction handle the shared batch loop needs:
+// it opens a tx (via [BatchConfig.BeginTx]), dispatches writes onto it,
+// writes the position + commits via [BatchConfig.WritePosition] /
+// [BatchConfig.Commit], and rolls it back on any error. The loop itself
+// touches the handle ONLY to roll it back — every other operation is
+// delegated to the engine's closures, which know the concrete type.
+//
+// ADR-0092: generalizing the seam from a concrete `*sql.Tx` to this
+// interface is what lets the Postgres engine return a pipelined
+// `*pgxBatchTx` (accumulating onto a pgx.Batch flushed in one round trip
+// at commit) while MySQL and the PG non-pipelined fall-back keep using
+// `*sql.Tx`. `*sql.Tx` already satisfies BatchTx, so the existing engines
+// type-assert inside their closures with zero behaviour change.
+type BatchTx interface {
+	Rollback() error
+}
 
 // DefaultIdleFlushPeriod is the maximum time a partial batch
 // (n < maxBatchSize) waits after the last applied change before it
@@ -142,12 +158,14 @@ type BatchConfig struct {
 	// engine requires; the loop does not rollback or re-wrap). PG's
 	// hook also pins `SET LOCAL synchronous_commit = on` (F7) so the
 	// ADR-0007 durability contract holds per-tx.
-	BeginTx func(ctx context.Context) (*sql.Tx, error)
+	BeginTx func(ctx context.Context) (BatchTx, error)
 
 	// Dispatch routes one change to its SQL form on the open tx — the
 	// engine's existing dispatch method. The loop owns rollback,
-	// logging, and classification of a dispatch failure.
-	Dispatch func(ctx context.Context, tx *sql.Tx, streamID string, c ir.Change) error
+	// logging, and classification of a dispatch failure. The engine
+	// type-asserts the concrete tx (e.g. *sql.Tx or *pgxBatchTx) it
+	// returned from BeginTx.
+	Dispatch func(ctx context.Context, tx BatchTx, streamID string, c ir.Change) error
 
 	// ApplyOne is the engine's per-change apply path (own tx, position
 	// write included). The loop calls it only on the
@@ -174,11 +192,13 @@ type BatchConfig struct {
 	// per-exec timeout; errors come back unwrapped (the loop returns
 	// them as-is after rolling back, matching the pre-extraction
 	// loops).
-	WritePosition func(ctx context.Context, tx *sql.Tx, streamID, token string) error
+	WritePosition func(ctx context.Context, tx BatchTx, streamID, token string) error
 
 	// Commit commits the batch tx under the engine's Bug-56 watchdog
-	// (commitWithTimeout).
-	Commit func(tx *sql.Tx) error
+	// (commitWithTimeout). For the PG pipelined path, Commit is where
+	// the accumulated pgx.Batch is flushed in a single round trip
+	// (ADR-0092) before the underlying pgx.Tx commits.
+	Commit func(tx BatchTx) error
 
 	// AfterCommit, when non-nil, runs after a successful commit with
 	// the batch's position token — PG's slot-ack feedback report
@@ -555,7 +575,7 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 // Returns a wrapped error on either failure with a rollback already
 // attempted on the position-write path. This ordering IS the ADR-0007
 // position-and-data atomicity contract; do not reorder.
-func commitBatch(ctx context.Context, cfg *BatchConfig, tx *sql.Tx, streamID, token string, rows int) error {
+func commitBatch(ctx context.Context, cfg *BatchConfig, tx BatchTx, streamID, token string, rows int) error {
 	if err := cfg.WritePosition(ctx, tx, streamID, token); err != nil {
 		_ = tx.Rollback()
 		slog.WarnContext(

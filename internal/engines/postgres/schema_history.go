@@ -127,31 +127,44 @@ func ensureSchemaHistoryTable(ctx context.Context, db *sql.DB, schema string) er
 // without the integration tag) can't see — same documented pattern as
 // control_table.go's readStopRequested.
 func writeSchemaVersion(ctx context.Context, exec schemaHistoryExecer, schema, streamID, schemaName, table string, anchor ir.Position, t *ir.Table) error {
+	q, args, err := buildWriteSchemaVersionSQL(schema, streamID, schemaName, table, anchor, t)
+	if err != nil {
+		return err
+	}
+	if _, err := exec.ExecContext(ctx, q, args...); err != nil {
+		return fmt.Errorf("postgres: write schema version: %w", err)
+	}
+	return nil
+}
+
+// buildWriteSchemaVersionSQL returns the schema-history upsert (sql, args)
+// shared by the serial exec path ([writeSchemaVersion]) and the ADR-0092
+// pipelined queue path ([writeSchemaVersionPgx]). Single-sourcing the
+// build keeps the ADR-0049 row shape + COALESCE-on-source_engine semantics
+// identical across the two callers.
+//
+// source_engine carries anchor.Engine — the engine identity of the anchor
+// token's producer. NULLIF on empty preserves the legacy (pre-Bug-78) NULL
+// shape for any future caller that omits the engine tag; today the applier
+// dispatch always passes a populated anchor (from the in-stream
+// SchemaSnapshot's Position.Engine), so the empty case is defensive.
+func buildWriteSchemaVersionSQL(schema, streamID, schemaName, table string, anchor ir.Position, t *ir.Table) (stmt string, args []any, err error) {
 	if t == nil {
-		return errors.New("postgres: write schema version: table is nil")
+		return "", nil, errors.New("postgres: write schema version: table is nil")
 	}
 	payload, err := ir.MarshalTable(t)
 	if err != nil {
-		return fmt.Errorf("postgres: write schema version: marshal table: %w", err)
+		return "", nil, fmt.Errorf("postgres: write schema version: marshal table: %w", err)
 	}
 	tableRef := quoteIdent(schema) + "." + quoteIdent(schemaHistoryTableName)
 	vk := ir.SchemaVersionKey(streamID, schemaName, table, anchor.Token)
-	// source_engine carries anchor.Engine — the engine identity of the
-	// anchor token's producer. NULLIF on empty preserves the legacy
-	// (pre-Bug-78) NULL shape for any future caller that omits the
-	// engine tag; today the applier dispatch always passes a populated
-	// anchor (from the in-stream SchemaSnapshot's Position.Engine), so
-	// the empty case is defensive.
 	q := "INSERT INTO " + tableRef + " " +
 		"(version_key, stream_id, schema_name, table_name, anchor_position, ir_schema_json, source_engine) " +
 		"VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, '')) " +
 		"ON CONFLICT (version_key) DO UPDATE SET " +
 		"ir_schema_json = EXCLUDED.ir_schema_json, " +
 		"source_engine = COALESCE(EXCLUDED.source_engine, " + tableRef + ".source_engine)"
-	if _, err := exec.ExecContext(ctx, q, vk, streamID, schemaName, table, anchor.Token, string(payload), anchor.Engine); err != nil {
-		return fmt.Errorf("postgres: write schema version: %w", err)
-	}
-	return nil
+	return q, []any{vk, streamID, schemaName, table, anchor.Token, string(payload), anchor.Engine}, nil
 }
 
 // loadRetainedSchemaVersions reads every retained

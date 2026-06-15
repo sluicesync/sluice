@@ -96,6 +96,26 @@ import (
 // ordering. Concurrent calls on the same applier are not supported.
 type ChangeApplier struct {
 	db *sql.DB
+
+	// pipelineDB is the dedicated ADR-0092 pipelined-apply pool: a lazy
+	// *sql.DB opened on first use ([pipelinePool]) from pipelineCfg with
+	// pgx's QueryExecModeDescribeExec default, so every distinct statement
+	// queued onto a pgx.Batch is re-described fresh against the live catalog
+	// (no client cache) and bound in BINARY with the real OID inside the
+	// SendBatch flush — byte-identical encoding to the serial path, GAP #3
+	// subsumed. Separate from db so the per-change Apply path keeps the
+	// cached fast path. nil until the first pipelined BeginTx; nil
+	// pipelineCfg (direct API constructions / unit tests) disables the
+	// pipelined path and falls back to serial *sql.Tx exec with a one-time
+	// WARN.
+	pipelineDB  *sql.DB
+	pipelineCfg *pgConfig
+
+	// pipelineWarnedFallback records that the one-time "pipelined apply
+	// unavailable, falling back to serial exec" WARN has fired, so a
+	// persistent escape/open failure logs once, not once per batch.
+	pipelineWarnedFallback bool
+
 	// schema is the namespace user-data INSERT/UPDATE/DELETE / TRUNCATE
 	// land in. Defaults to the DSN's `schema` query parameter (typically
 	// `public`); operator-overridable at startup via [SetSchema] when
@@ -659,12 +679,21 @@ func (a *ChangeApplier) reportAppliedToken(ctx context.Context, token string) {
 // helper around).
 var _ pglogrepl.LSN
 
-// Close releases the underlying connection pool.
+// Close releases the underlying connection pool(s) — both the
+// per-change pool and the lazily-opened ADR-0092 pipelined pool.
 func (a *ChangeApplier) Close() error {
-	if a.db == nil {
-		return nil
+	var firstErr error
+	if a.pipelineDB != nil {
+		if err := a.pipelineDB.Close(); err != nil {
+			firstErr = err
+		}
 	}
-	return a.db.Close()
+	if a.db != nil {
+		if err := a.db.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // EnsureControlTable creates the per-target sluice_cdc_state table
