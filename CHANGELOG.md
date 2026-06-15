@@ -4,6 +4,68 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [0.99.45] - 2026-06-15
+
+### Added
+- **Default-on schema-change forwarding for single-stream CDC (ADR-0091,
+  F7a).** New tristate `--schema-changes=forward|refuse` (default `forward`)
+  replaces the opt-in ADD-COLUMN-only path: an unambiguous source DDL change
+  is now retargeted to the target dialect and applied in-line on the CDC
+  boundary, keeping the sync online instead of refusing and forcing a manual
+  drain-and-DDL. Real forwarding matrix (ADR-0091 §1d is the source of truth):
+  ADD COLUMN / DROP COLUMN / ALTER COLUMN TYPE forward on **both** source
+  engines, same-engine and cross-engine (MySQL↔PG; DROP COLUMN auto-applies on
+  the target); ALTER NULLABILITY forwards on a **MySQL source only** (PG's
+  pgoutput carries no nullability flag); REORDER is a no-op (name-based
+  decode); RENAME COLUMN **refuses loudly on both engines** (indistinguishable
+  from drop+add from the stream — data-loss risk; PG attnum-proven rename is
+  follow-up F7b); multi-shape combos and volatile/computed DEFAULT on ADD
+  still refuse. Documented limitations (the wire doesn't carry the metadata,
+  so no boundary is produced): PG-source nullability/index/check and
+  MySQL-source index/check are **not** forwarded — any resulting
+  incompatibility surfaces as a **loud apply error**, never silent corruption.
+  Safety: a seed-guard never forwards a destructive shape classified against
+  the cold-start baseline (only on a genuine CDC→CDC boundary), and the PG
+  normalizer strips the generated columns + secondary indexes pgoutput omits,
+  so a phantom-destructive forward can't be synthesized (a CRITICAL regression
+  CI caught on the flip and fixed before ship). `--forward-schema-add-column`
+  is **deprecated** (warns, still forwards — subsumed). **Behavior change on
+  upgrade** — see Changed. Pin the old conservative behavior with
+  `--schema-changes=refuse`.
+
+### Changed
+- **`sluice sync` now forwards source schema changes by default
+  (`--schema-changes=forward`).** A stream that previously **refused loudly**
+  on source DDL now **forwards it by default** — including DROP COLUMN, which
+  auto-applies on the target. Restore the exact pre-v0.99.45 halt-on-DDL
+  behavior with `--schema-changes=refuse`. Refused shapes (RENAME, multi-shape,
+  volatile DEFAULT) still refuse loudly. No on-disk/format change; `migrate`
+  and the cold-start copy path are untouched.
+
+### Fixed
+- **Source-side Vitess schema-resolution errors are now retriable, not
+  terminal (F9).** Right after a DDL cutover — or when the Vitess schema
+  historian is off (`track_schema_versions` is default-disabled on
+  PlanetScale) — the source vstreamer transiently misses with `unknown table
+  <t> in schema` / `no schema found for table <t>`. These arrive as free-text
+  VStream errors with no gRPC status or MySQL wrapper, so they fell through to
+  **terminal** and killed the stream on a window that self-clears. They are now
+  `ir.RetriableError`, so the ADR-0038 backoff rides out the cutover in-process;
+  substring-matched and pinned, with a near-miss guard so a bare "unknown
+  table" (real DROP/typo) stays terminal.
+- **Target schema-drift apply errors no longer tight-restart crash-loop; the
+  sync self-heals (F8).** A source ADD COLUMN (or new table) not yet created on
+  the target made the apply fail terminal — PG 42703 / 42P01, MySQL 1054 /
+  1146 — exiting the process; under a supervisor this became a tight-restart
+  loop (the soak observed `NRestarts=1821`). These codes are now
+  `ir.RetriableError` with a remedy-named message, so the ADR-0038 backoff
+  rides them out in-process and the sync **self-heals the moment the operator
+  adds the missing column/table on the target**. The wrap keeps the underlying
+  `*PgError`/`*MySQLError` reachable via `errors.As` so the offending column
+  stays named on every (loud) retry. Covers MySQL→MySQL (incl.
+  PlanetScale→PlanetScale) and PG targets symmetrically. Scope: ADD COLUMN /
+  missing-table only.
+
 ## [0.99.44] - 2026-06-14
 
 ### Changed
