@@ -4,6 +4,31 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [0.99.46] - 2026-06-15
+
+### Added
+- **PostgreSQL-source `RENAME COLUMN` forwarding (ADR-0091, F7b).** Completes the
+  default-on schema-change forwarding from v0.99.45 — the one shape it still
+  refused. Under `--schema-changes=forward` (default), a column rename on a
+  PostgreSQL source now forwards to the target (`ALTER TABLE … RENAME COLUMN`,
+  data preserved), **but only when provable.** A rename and a `DROP x + ADD y` of
+  the same type are indistinguishable from the replication stream's row shape, so
+  sluice proves the distinction with `pg_attribute.attnum` — the column's catalog
+  identity, stable across a rename: same attnum + different name = real rename
+  (forward); different attnum = genuine drop+add (refuse). The proof is
+  definitive, so this can only forward a true rename or refuse — never mis-forward
+  a drop+add into data loss. Same-engine (PG→PG) and cross-engine (PG→MySQL). A
+  new optional `ir.Column.StableID` carries the proof; it is pure metadata
+  (excluded from the schema-decode signature, alter-detection, and the
+  schema-history/backup codec). A **MySQL source** has no stable column id, so a
+  MySQL-source rename continues to refuse loudly — unchanged.
+
+### Changed
+- **PostgreSQL-source renames now forward by default** (extends the v0.99.45
+  default-on forwarding to the rename shape). Set `--schema-changes=refuse` to
+  keep the conservative halt-on-DDL behavior for all shapes. No on-disk/format
+  change.
+
 ## [0.99.45] - 2026-06-15
 
 ### Added
