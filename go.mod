@@ -14,7 +14,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/kms v1.53.2
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.103.1
 	github.com/aws/smithy-go v1.27.0
-	github.com/bytedance/sonic v1.15.1
+	github.com/bytedance/sonic v1.15.2
 	github.com/docker/go-units v0.5.0
 	github.com/go-json-experiment/json v0.0.0-20260505212615-e40f80bf6836
 	github.com/go-mysql-org/go-mysql v1.15.0
