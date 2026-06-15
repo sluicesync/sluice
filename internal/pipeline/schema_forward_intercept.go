@@ -3,32 +3,43 @@
 
 package pipeline
 
-// ADR-0058 — Online ADD COLUMN forwarding for single-stream (non-Shape-A)
-// CDC apply.
+// ADR-0091 — Default-on online schema-change forwarding for single-
+// stream (non-Shape-A) CDC apply. (Extends ADR-0058, which shipped the
+// opt-in ADD-COLUMN-only form this file originally implemented.)
 //
-// The Shape A multi-shard path (ADR-0054) already handles every
+// The Shape A multi-shard path (ADR-0054) already forwards every
 // recognized shape via the lease + boundary router
 // (shard_consolidation_router.go). This file fills the single-stream
-// gap: when --forward-schema-add-column is set, observed source ADD
-// COLUMN events forward to the target via
-// [ir.SchemaDeltaApplier.AlterAddColumn], with an optional source-side
-// bounded backfill of already-shipped rows when
-// --backfill-added-column is also set.
+// gap: when --schema-changes=forward (the default), observed source
+// DDL forwards to the target via [ir.ShapeDeltaApplier] using the same
+// per-shape dispatch (applyShapeDelta) the boundary router uses.
 //
-// Refuse-loudly catalog (every other shape):
-//   - DROP COLUMN, ALTER COLUMN TYPE, ALTER COLUMN NULLABILITY,
-//     RENAME COLUMN, CREATE INDEX, DROP INDEX, multi-shape combos →
-//     refuse with the drained-model recovery hint.
-//   - ADD COLUMN with [ir.DefaultExpression] → refuse (computed defaults
-//     have target-session evaluation semantics that diverge from the
-//     source's per-row insert values; ADR-0058 §2a).
+// Forwarded shapes (every unambiguous one):
+//   - ADD COLUMN — via [ir.SchemaDeltaApplier.AlterAddColumn], with an
+//     optional source-side bounded backfill of already-shipped rows
+//     when --backfill-added-column is set, and a computed-DEFAULT
+//     volatility refusal (ADR-0058 §2a).
+//   - DROP COLUMN, ALTER COLUMN TYPE / NULLABILITY, CREATE / DROP
+//     INDEX, ADD / DROP / MODIFY CHECK — via applyShapeForward, after
+//     retargeting the post IR to the target dialect + scrubbing its
+//     Schema (ADR-0091 §5).
+//   - column reorder (ShapeKindNone) — no DDL; sluice decodes by name.
+//
+// Refuse-loudly catalog:
+//   - RENAME COLUMN — indistinguishable from drop+add of a same-type
+//     column from the stream alone; forwarding the wrong guess risks
+//     silent data loss (ADR-0091 §3; F7b adds PG attnum-proven rename).
+//   - Multi-shape combo (ShapeKindUnrecognized) — can't be ordered
+//     unambiguously.
+//   - ADD COLUMN with a volatile/computed DEFAULT (ADR-0058 §2a).
 //
 // The intercept activates when:
-//   - Streamer.ForwardSchemaAddColumn is true, AND
+//   - Streamer schema-change forwarding is enabled (the --schema-changes
+//     mode is not "refuse"; see Streamer.forwardSchemaEnabled), AND
 //   - Streamer.boundaryRouter is nil (i.e. not Shape A — Shape A's
-//     intercept already covers ADD COLUMN via the lease).
+//     intercept already forwards every shape via the lease).
 //
-// When both are set, this file's intercept replaces the pass-through
+// When both hold, this file's intercept replaces the pass-through
 // branch in [interceptSchemaSnapshotsForCoordination]'s nil-router
 // case.
 
@@ -48,10 +59,13 @@ import (
 // [interceptAddColumnForward] needs. Plumbed by the Streamer's apply
 // loop; the test harness constructs a minimal one with fakes.
 type schemaForwardDeps struct {
-	// applier issues ALTER TABLE … ADD COLUMN on the target. Both PG
-	// and MySQL SchemaWriters implement this; the Streamer opens one
-	// alongside the existing apply-side resources.
-	applier ir.SchemaDeltaApplier
+	// applier issues the per-shape ALTER/CREATE/DROP DDL on the target
+	// (ADR-0091). Both PG and MySQL SchemaWriters implement the full
+	// [ir.ShapeDeltaApplier] surface; the Streamer opens one alongside
+	// the existing apply-side resources. The ADD COLUMN branch uses
+	// the embedded [ir.SchemaDeltaApplier.AlterAddColumn]; the other
+	// forwarded shapes use the extended methods via [applyShapeDelta].
+	applier ir.ShapeDeltaApplier
 
 	// sourceEngineName is the source engine's [ir.Engine.Name] for the
 	// translate.RetargetForEngine call (cross-engine type rewrite on
@@ -157,6 +171,21 @@ func interceptAddColumnForward(
 	}
 	out := make(chan ir.Change)
 	cache := map[string]*ir.Table{}
+	// seedSourced marks cache entries whose pre-state came from the
+	// cold-start seed (a full SchemaReader read) rather than a prior CDC
+	// snapshot. ADR-0091 §3: a seed's IR fidelity differs from the CDC
+	// projection's (pgoutput omits generated columns, secondary indexes,
+	// check constraints, nullability, …), so a seed-vs-firstCDC diff can
+	// surface a PHANTOM destructive/mutating shape. The normalizer
+	// (CDCSchemaSnapshotNormalizer) closes the known asymmetries, but it
+	// cannot be proven complete (Bug 84/86 found gaps incrementally). So
+	// destructive/mutating shapes are NEVER forwarded against a
+	// seed-sourced pre — only against a genuine CDC→CDC boundary where
+	// both sides share projection fidelity. The cost is a missed
+	// first-post-coldstart DROP/ALTER (rare, and a SAFE non-destructive
+	// divergence — the target keeps the column); the benefit is that no
+	// residual fidelity gap can ever forward a phantom drop/alter.
+	seedSourced := map[string]bool{}
 	// Pre-populate the cache from the cold-start seed BEFORE consuming
 	// from `in`. The seed is keyed under whatever QualifiedName() the
 	// SchemaReader produced (MySQL: bare table name because the reader
@@ -169,6 +198,7 @@ func interceptAddColumnForward(
 			continue
 		}
 		cache[snap.QualifiedName()] = snap.IR
+		seedSourced[snap.QualifiedName()] = true
 		slog.DebugContext(
 			ctx, "forward-add-column intercept: seeded from cold-start handoff",
 			"table", snap.QualifiedName(),
@@ -191,13 +221,19 @@ func interceptAddColumnForward(
 				}
 				key := snap.QualifiedName()
 				pre, hadPre, preKey := lookupSeedCache(cache, key, snap.Table)
+				preIsSeed := hadPre && seedSourced[preKey]
 				// Promote a bare-name seed hit to the qualified key so
 				// subsequent snapshots resolve directly (mirrors the
 				// Shape A intercept's behaviour).
 				if hadPre && preKey != key {
 					delete(cache, preKey)
+					delete(seedSourced, preKey)
 				}
 				cache[key] = snap.IR
+				// This snapshot's IR is now the pre-state for the NEXT
+				// boundary, and it came from CDC — so the next comparison
+				// is CDC→CDC (full guard lifts).
+				delete(seedSourced, key)
 				if !hadPre {
 					slog.DebugContext(
 						ctx, "forward-add-column intercept: seeded table cache",
@@ -208,7 +244,7 @@ func interceptAddColumnForward(
 					}
 					continue
 				}
-				if err := routeForwardBoundary(ctx, deps, key, pre, snap, out); err != nil {
+				if err := routeForwardBoundary(ctx, deps, key, pre, snap, preIsSeed, out); err != nil {
 					slog.ErrorContext(
 						ctx, "forward-add-column intercept: refuse",
 						"table", key,
@@ -217,6 +253,9 @@ func interceptAddColumnForward(
 					// Rewind the cache so a retry replays the same
 					// boundary from the same pre-state.
 					cache[key] = pre
+					if preIsSeed {
+						seedSourced[key] = true
+					}
 					wrapped := fmt.Errorf("pipeline: forward schema add-column: %w", err)
 					errStore.Store(&wrapped)
 					return
@@ -257,6 +296,7 @@ func routeForwardBoundary(
 	tableName string,
 	pre *ir.Table,
 	snap ir.SchemaSnapshot,
+	preIsSeed bool,
 	out chan<- ir.Change,
 ) error {
 	shape, err := ClassifyShape(pre, snap.IR)
@@ -270,19 +310,62 @@ func routeForwardBoundary(
 			tableName, err, renderDriftForRefusal(pre, snap.IR),
 			forwardRecoveryHint(tableName))
 	}
+	// ADR-0091 §3 seed-guard: never forward a destructive/mutating shape
+	// classified against a cold-start seed pre-state — the seed's
+	// fidelity differs from the CDC projection, so such a delta may be a
+	// phantom (e.g. a residual type asymmetry surfaces as a phantom ALTER
+	// that is an idempotent no-op same-engine but a real, harmful MODIFY
+	// cross-engine). Skip it as a no-op (the column/index stays on the
+	// target, a safe non-destructive outcome); the next CDC→CDC boundary
+	// is unguarded. ADD / CREATE INDEX / ADD CHECK are non-destructive
+	// and a phantom of them cannot arise against the seed (the CDC
+	// projection is a subset of the seed's fidelity), so they pass.
+	if preIsSeed && shapeIsDestructiveOrMutating(shape.Kind) {
+		slog.InfoContext(
+			ctx,
+			"schema-forward: skipping a destructive/mutating shape at the "+
+				"first post-cold-start boundary (classified against the "+
+				"cold-start seed, whose fidelity differs from the CDC "+
+				"projection — not forwarding to avoid a phantom; ADR-0091 §3)",
+			"table", tableName,
+			"shape", shape.Kind.String(),
+		)
+		return nil
+	}
 	switch shape.Kind {
 	case ShapeKindNone:
+		// No structural delta (incl. a pure column reorder — sluice
+		// decodes rows by name, so the target's physical column order
+		// is irrelevant; ADR-0091 §4). Forward the snapshot so the
+		// ADR-0049 schema-history row records; no DDL.
 		return nil
 	case ShapeKindAddColumn:
+		// ADD COLUMN keeps its dedicated path: computed-DEFAULT
+		// volatility refusal (ADR-0058 §2a) + optional source-side
+		// backfill of already-shipped rows.
 		return applyAddColumnForward(ctx, deps, tableName, snap, shape, out)
+	case ShapeKindRenameColumn:
+		// ADR-0091 §3 — RENAME is the one ambiguous single shape: a
+		// rename and a drop+add-of-same-type are indistinguishable from
+		// the IR delta, and guessing wrong silently drops the column's
+		// data on the target. Refuse loudly on both engines until F7b
+		// adds PG attnum-proven rename detection.
+		return refuseRenameAmbiguous(tableName, shape, pre, snap.IR)
 	case ShapeKindDropColumn,
 		ShapeKindCreateIndex,
 		ShapeKindDropIndex,
 		ShapeKindAlterColumnType,
 		ShapeKindAlterColumnNullability,
-		ShapeKindRenameColumn,
-		ShapeKindUnrecognized:
-		return refuseShapeOutOfV1Scope(tableName, shape, pre, snap.IR)
+		ShapeKindAddCheck,
+		ShapeKindDropCheck,
+		ShapeKindModifyCheck:
+		// Every unambiguous shape forwards via the same proven
+		// per-shape dispatch Shape A uses (ADR-0091 §1).
+		return applyShapeForward(ctx, deps, tableName, snap, shape)
+	case ShapeKindUnrecognized:
+		// Multi-shape combo — already returned as a classify error
+		// above; this arm is defensive.
+		return refuseShapeMultiCombo(tableName, shape, pre, snap.IR)
 	}
 	return fmt.Errorf("unrecognized shape kind %v on %q.%s %s",
 		shape.Kind, tableName, renderDriftForRefusal(pre, snap.IR),
@@ -311,16 +394,41 @@ func renderDriftForRefusal(pre, post *ir.Table) string {
 	return " observed drift:" + rendered + "\n"
 }
 
-// refuseShapeOutOfV1Scope is the operator-actionable refusal shape for
-// every recognized-but-not-forwarded shape (DROP / ALTER TYPE /
-// NULLABILITY / RENAME / CREATE/DROP INDEX / multi-shape combo). Names
-// the table, the shape, the per-change drift (ADR-0060 / F11), and
-// the drained-recovery hint per ADR-0058 §1a.
-func refuseShapeOutOfV1Scope(tableName string, shape Shape, pre, post *ir.Table) error {
+// refuseRenameAmbiguous is the operator-actionable refusal for a
+// RENAME COLUMN boundary (ADR-0091 §3). A rename and a drop+add of a
+// same-type column are indistinguishable from the IR delta; forwarding
+// the wrong guess silently drops the renamed column's data on the
+// target (or leaves stale data under the new name). Refuse loudly on
+// both engines until F7b adds PG attnum-proven rename detection. Names
+// the table, the inferred old→new pair, the per-change drift
+// (ADR-0060 / F11), and the drained-recovery hint.
+func refuseRenameAmbiguous(tableName string, shape Shape, pre, post *ir.Table) error {
+	oldName, newName := "?", "?"
+	if shape.RenamedColumnBefore != nil {
+		oldName = shape.RenamedColumnBefore.Name
+	}
+	if shape.RenamedColumnAfter != nil {
+		newName = shape.RenamedColumnAfter.Name
+	}
 	return fmt.Errorf(
-		"shape %s on %q is out of --forward-schema-add-column scope "+
-			"(v0.79.0 forwards ADD COLUMN only; ADR-0058 §1a documents the "+
-			"scope split).%s %s",
+		"RENAME COLUMN %q→%q on %q cannot be auto-forwarded: a rename is "+
+			"indistinguishable from a drop+add of a same-type column from the "+
+			"replication stream alone, and forwarding the wrong guess risks "+
+			"silently dropping the column's data on the target (ADR-0091 §3). "+
+			"Rename on the target manually via the drained model.%s %s",
+		oldName, newName, tableName, renderDriftForRefusal(pre, post),
+		forwardRecoveryHint(tableName),
+	)
+}
+
+// refuseShapeMultiCombo is the refusal for a multi-shape combo boundary
+// (more than one structural change in one boundary; ShapeKindUnrecognized).
+// ClassifyShape returns this as an error that routeForwardBoundary
+// surfaces before the dispatch switch, so this is a defensive arm.
+func refuseShapeMultiCombo(tableName string, shape Shape, pre, post *ir.Table) error {
+	return fmt.Errorf(
+		"shape %s on %q is a multi-shape combo that cannot be unambiguously "+
+			"ordered from the replication stream (ADR-0091 §2).%s %s",
 		shape.Kind, tableName, renderDriftForRefusal(pre, post),
 		forwardRecoveryHint(tableName),
 	)
@@ -337,10 +445,170 @@ func forwardRecoveryHint(tableName string) string {
 		"recovery: drained model — run 'sluice sync stop --wait', "+
 			"then run schema migrate (manual or 'sluice schema migrate') "+
 			"against %q, then resume via 'sluice sync start --resume'. "+
-			"Drop --forward-schema-add-column to keep the drained model "+
-			"as the default for any subsequent source DDL.",
+			"Set --schema-changes=refuse to keep the drained model as the "+
+			"default for any subsequent source DDL.",
 		tableName,
 	)
+}
+
+// shapeIsDestructiveOrMutating reports whether a shape removes or
+// rewrites existing target state (vs. purely adding new state). These
+// are the shapes the ADR-0091 §3 seed-guard refuses to forward against
+// a cold-start seed pre, because a phantom of one (from seed-vs-CDC
+// fidelity asymmetry) would be destructive. ADD COLUMN / CREATE INDEX /
+// ADD CHECK are additive and excluded.
+func shapeIsDestructiveOrMutating(kind ShapeKind) bool {
+	switch kind {
+	case ShapeKindDropColumn,
+		ShapeKindDropIndex,
+		ShapeKindDropCheck,
+		ShapeKindAlterColumnType,
+		ShapeKindAlterColumnNullability,
+		ShapeKindModifyCheck:
+		return true
+	default:
+		return false
+	}
+}
+
+// applyShapeForward forwards a single unambiguous schema-change shape
+// (DROP / ALTER TYPE / NULLABILITY / CREATE/DROP INDEX / CHECK) to the
+// target via the shared [applyShapeDelta] dispatch — the same per-shape
+// apply path Shape A's boundary router uses (ADR-0091 §1). Before
+// dispatch the post IR is retargeted to the target dialect and its
+// Schema field scrubbed (ADR-0091 §5): the CDC-emitted IR carries the
+// SOURCE engine's column types and database name, neither of which the
+// target SchemaWriter can consume directly.
+//
+// ADD COLUMN and RENAME do NOT route here — ADD has its own
+// volatility/backfill path and RENAME refuses (ADR-0091 §3).
+func applyShapeForward(
+	ctx context.Context,
+	deps schemaForwardDeps,
+	tableName string,
+	snap ir.SchemaSnapshot,
+	shape Shape,
+) error {
+	rtTable, rtShape := retargetShapeForTarget(
+		snap.IR, shape, deps.sourceEngineName, deps.targetEngineName,
+	)
+	if err := applyShapeDelta(ctx, deps.applier, rtTable, rtShape); err != nil {
+		return fmt.Errorf("apply %s on %q: %w. %s",
+			shape.Kind, tableName, err, forwardRecoveryHint(tableName))
+	}
+	slog.InfoContext(
+		ctx, "schema-forward: target DDL applied",
+		"table", tableName,
+		"shape", shape.Kind.String(),
+	)
+	return nil
+}
+
+// retargetShapeForTarget retargets the post table to the target
+// engine's dialect (via [translate.RetargetForEngine]) and re-resolves
+// the shape's type-bearing payloads — AddedColumns, AlteredColumn,
+// AddedChecks, ModifiedCheckAfter — against the retargeted table by
+// name, so the applier emits target-dialect column/constraint
+// definitions. Name-only payloads (DroppedColumns, dropped/created
+// indexes, dropped/modified-before checks) keep their original pointers
+// — the applier consumes only their names. The returned table has its
+// Schema scrubbed (Bug 89 fix generalized; ADR-0091 §5).
+//
+// Same-engine pairs are a [translate.RetargetForEngine] pass-through,
+// so the re-resolution is a cheap by-name lookup that returns the
+// identical column definitions.
+func retargetShapeForTarget(post *ir.Table, shape Shape, sourceEngine, targetEngine string) (*ir.Table, Shape) {
+	rt := retargetTableScrub(post, sourceEngine, targetEngine)
+
+	colByName := make(map[string]*ir.Column, len(rt.Columns))
+	for _, c := range rt.Columns {
+		if c != nil {
+			colByName[c.Name] = c
+		}
+	}
+	checkByName := make(map[string]*ir.CheckConstraint, len(rt.CheckConstraints))
+	for _, ck := range rt.CheckConstraints {
+		if ck != nil {
+			checkByName[ck.Name] = ck
+		}
+	}
+
+	out := shape // value copy; pointer/slice fields reassigned below
+	if len(shape.AddedColumns) > 0 {
+		out.AddedColumns = resolveColumnsByName(shape.AddedColumns, colByName)
+	}
+	if shape.AlteredColumn != nil {
+		if c, ok := colByName[shape.AlteredColumn.Name]; ok {
+			out.AlteredColumn = c
+		}
+	}
+	if len(shape.AddedChecks) > 0 {
+		out.AddedChecks = resolveChecksByName(shape.AddedChecks, checkByName)
+	}
+	if shape.ModifiedCheckAfter != nil {
+		if ck, ok := checkByName[shape.ModifiedCheckAfter.Name]; ok {
+			out.ModifiedCheckAfter = ck
+		}
+	}
+	return rt, out
+}
+
+// retargetTableScrub runs [translate.RetargetForEngine] on a single-
+// table schema and returns the retargeted table with its Schema field
+// scrubbed so the target SchemaWriter's qualifyTable falls back to its
+// own DSN-bound database. Mirrors the retarget+scrub in
+// [retargetAddedColumns]; factored so every shape's forward path shares
+// it (ADR-0091 §5).
+func retargetTableScrub(post *ir.Table, sourceEngine, targetEngine string) *ir.Table {
+	retargeted := translate.RetargetForEngine(
+		&ir.Schema{Tables: []*ir.Table{post}},
+		sourceEngine, targetEngine,
+	)
+	if len(retargeted.Tables) == 0 {
+		scrubbed := *post
+		scrubbed.Schema = ""
+		return &scrubbed
+	}
+	rt := retargeted.Tables[0]
+	rt.Schema = ""
+	return rt
+}
+
+// resolveColumnsByName maps each column in src to the same-named column
+// in byName, falling back to the original pointer when absent
+// (defensive — added/altered columns exist in the post table by
+// construction).
+func resolveColumnsByName(src []*ir.Column, byName map[string]*ir.Column) []*ir.Column {
+	out := make([]*ir.Column, len(src))
+	for i, c := range src {
+		if c == nil {
+			continue
+		}
+		if rt, ok := byName[c.Name]; ok {
+			out[i] = rt
+		} else {
+			out[i] = c
+		}
+	}
+	return out
+}
+
+// resolveChecksByName maps each CHECK constraint in src to the
+// same-named constraint in byName, falling back to the original pointer
+// when absent.
+func resolveChecksByName(src []*ir.CheckConstraint, byName map[string]*ir.CheckConstraint) []*ir.CheckConstraint {
+	out := make([]*ir.CheckConstraint, len(src))
+	for i, ck := range src {
+		if ck == nil {
+			continue
+		}
+		if rt, ok := byName[ck.Name]; ok {
+			out[i] = rt
+		} else {
+			out[i] = ck
+		}
+	}
+	return out
 }
 
 // applyAddColumnForward executes the ADD COLUMN forward — the load-

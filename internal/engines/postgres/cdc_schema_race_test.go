@@ -166,7 +166,7 @@ func TestCheckSchemaRace_DROPCREATESameNameDifferentOID(t *testing.T) {
 		Schema: "public", Name: "events",
 		Columns: []relationColumn{{Name: "id", OID: 23}, {Name: "payload", OID: 3802}}, // jsonb
 	}
-	err := checkSchemaRace(relations, 16500, current)
+	err := checkSchemaRace(relations, 16500, current, false)
 	if err == nil {
 		t.Fatal("expected schema-race refusal for DROP+CREATE same name different OID; got nil")
 	}
@@ -198,7 +198,7 @@ func TestCheckSchemaRace_SameOIDReentryIsBenign(t *testing.T) {
 		Schema: "public", Name: "users",
 		Columns: []relationColumn{{Name: "id", OID: 23}, {Name: "email", OID: 25}},
 	}
-	if err := checkSchemaRace(relations, 16400, current); err != nil {
+	if err := checkSchemaRace(relations, 16400, current, false); err != nil {
 		t.Errorf("identical re-send of RelationMessage should be benign; got: %v", err)
 	}
 }
@@ -222,9 +222,124 @@ func TestCheckSchemaRace_ADDColumnIsCompatible(t *testing.T) {
 			{Name: "created_at", OID: 1184},
 		},
 	}
-	if err := checkSchemaRace(relations, 16400, current); err != nil {
+	if err := checkSchemaRace(relations, 16400, current, false); err != nil {
 		t.Errorf("ADD COLUMN at end should be compatible with ADR-0058 forwarding; got: %v", err)
 	}
+}
+
+// TestCheckSchemaRace_ForwardMode pins the ADR-0091 F7a GAP #1 policy:
+// under schemaForward=true the unambiguous / intercept-routable shapes
+// (DROP COLUMN, ALTER COLUMN TYPE, RENAME COLUMN) PASS the reader gate so
+// they surface as SchemaSnapshots for the forward intercept, while RENAME
+// TABLE and DROP+CREATE-same-name still REFUSE loudly. This is the mirror
+// of the refuse-mode tests above; both modes are pinned so neither can
+// regress silently.
+func TestCheckSchemaRace_ForwardMode(t *testing.T) {
+	base := func() *relationCacheEntry {
+		return &relationCacheEntry{
+			Schema: "public", Name: "users",
+			Columns: []relationColumn{
+				{Name: "id", OID: 23},    // int4
+				{Name: "email", OID: 25}, // text
+			},
+		}
+	}
+
+	t.Run("DROP COLUMN passes under forward", func(t *testing.T) {
+		relations := map[uint32]*relationCacheEntry{16400: base()}
+		current := &relationCacheEntry{
+			Schema: "public", Name: "users",
+			Columns: []relationColumn{{Name: "id", OID: 23}},
+		}
+		if err := checkSchemaRace(relations, 16400, current, true); err != nil {
+			t.Errorf("DROP COLUMN must pass under forward mode; got: %v", err)
+		}
+		// And still refuses under refuse mode (the Bug 119 behavior).
+		if err := checkSchemaRace(relations, 16400, current, false); err == nil {
+			t.Error("DROP COLUMN must refuse under refuse mode")
+		}
+	})
+
+	t.Run("ALTER COLUMN TYPE passes under forward", func(t *testing.T) {
+		relations := map[uint32]*relationCacheEntry{16400: base()}
+		current := &relationCacheEntry{
+			Schema: "public", Name: "users",
+			Columns: []relationColumn{
+				{Name: "id", OID: 23},
+				{Name: "email", OID: 1043}, // varchar (was text=25)
+			},
+		}
+		if err := checkSchemaRace(relations, 16400, current, true); err != nil {
+			t.Errorf("ALTER COLUMN TYPE must pass under forward mode; got: %v", err)
+		}
+		if err := checkSchemaRace(relations, 16400, current, false); err == nil {
+			t.Error("ALTER COLUMN TYPE must refuse under refuse mode")
+		}
+	})
+
+	t.Run("RENAME COLUMN passes under forward (intercept refuses with the better message)", func(t *testing.T) {
+		relations := map[uint32]*relationCacheEntry{16400: base()}
+		current := &relationCacheEntry{
+			Schema: "public", Name: "users",
+			Columns: []relationColumn{
+				{Name: "id", OID: 23},
+				{Name: "email_address", OID: 25}, // was "email"
+			},
+		}
+		if err := checkSchemaRace(relations, 16400, current, true); err != nil {
+			t.Errorf("RENAME COLUMN must pass the reader gate under forward mode "+
+				"(the intercept's ADR-0091 §3 refusal fires downstream); got: %v", err)
+		}
+		if err := checkSchemaRace(relations, 16400, current, false); err == nil {
+			t.Error("RENAME COLUMN must refuse at the reader under refuse mode")
+		}
+	})
+
+	t.Run("RENAME TABLE refuses even under forward", func(t *testing.T) {
+		relations := map[uint32]*relationCacheEntry{16400: base()}
+		current := &relationCacheEntry{
+			Schema: "public", Name: "members", // table renamed
+			Columns: base().Columns,
+		}
+		if err := checkSchemaRace(relations, 16400, current, true); err == nil {
+			t.Error("RENAME TABLE must refuse even under forward mode (genuinely ambiguous)")
+		}
+	})
+
+	t.Run("DROP+CREATE same name refuses even under forward", func(t *testing.T) {
+		relations := map[uint32]*relationCacheEntry{
+			16400: {Schema: "public", Name: "events", Columns: []relationColumn{{Name: "id", OID: 23}}},
+		}
+		current := &relationCacheEntry{
+			Schema: "public", Name: "events",
+			Columns: []relationColumn{{Name: "id", OID: 23}, {Name: "payload", OID: 3802}},
+		}
+		err := checkSchemaRace(relations, 16500, current, true)
+		if err == nil {
+			t.Fatal("DROP+CREATE same name different OID must refuse even under forward mode")
+		}
+		if !strings.Contains(err.Error(), "DROP+CREATE") {
+			t.Errorf("expected DROP+CREATE refusal; got: %v", err)
+		}
+	})
+
+	t.Run("ADD COLUMN passes under both modes", func(t *testing.T) {
+		relations := map[uint32]*relationCacheEntry{16400: base()}
+		current := &relationCacheEntry{
+			Schema: "public", Name: "users",
+			Columns: []relationColumn{
+				{Name: "id", OID: 23},
+				{Name: "email", OID: 25},
+				{Name: "created_at", OID: 1184},
+			},
+		}
+		if err := checkSchemaRace(relations, 16400, current, true); err != nil {
+			t.Errorf("ADD COLUMN must pass under forward mode; got: %v", err)
+		}
+		if err := checkSchemaRace(relations, 16400, current, false); err != nil {
+			t.Errorf("ADD COLUMN must pass under refuse mode too; got: %v", err)
+		}
+	})
 }
 
 // _ ensures the ir import stays meaningful in this file even if a

@@ -97,10 +97,68 @@ func (a *ChangeApplier) cacheActiveSchemaAfterCommit(s ir.SchemaSnapshot) {
 	if a.activeSchema == nil {
 		a.activeSchema = make(map[string]activeSchemaVersion)
 	}
-	a.activeSchema[schemaTableKey(s.Schema, s.Table)] = activeSchemaVersion{
+	key := schemaTableKey(s.Schema, s.Table)
+	prior, hadPrior := a.activeSchema[key]
+	a.activeSchema[key] = activeSchemaVersion{
 		Anchor: s.Position,
 		IR:     s.IR,
 	}
+	// Only bust the target-side caches on an ACTUAL schema change — a
+	// prior version existed AND its decode signature differs from the new
+	// one (F7a GAP #3). The first SchemaSnapshot a table sees is the
+	// baseline (cold-start first-touch relation / warm-resume re-send),
+	// not a DDL boundary: invalidating there would needlessly mark every
+	// table schema-dirty and force every DML onto the slow per-call
+	// QueryExecModeExec re-describe path for the life of the stream — a
+	// throughput regression that timed out a CDC-congruence test in CI.
+	// A signature change (column added/dropped/retyped) is exactly the set
+	// that affects the cached column OIDs; nullability/comment-only
+	// re-sends correctly skip.
+	if hadPrior && prior.IR != nil && s.IR != nil &&
+		!ir.SchemaSignatureOf(prior.IR).Equal(ir.SchemaSignatureOf(s.IR)) {
+		a.invalidateTargetCachesForBoundary(s)
+	}
+}
+
+// invalidateTargetCachesForBoundary drops the target-side per-table
+// metadata caches (colTypeCache / pkCache / conflictKeyCache) for the
+// table named by the just-committed SchemaSnapshot, so the next DML on
+// that table re-reads the live (post-DDL) catalog rather than encoding
+// against the stale pre-DDL view.
+//
+// Why this is load-bearing (F7a GAP #3): when a SchemaSnapshot forwards
+// a DDL — e.g. ALTER COLUMN counter TYPE BIGINT — the target column's
+// type/OID changes, but colTypeCache was populated lazily on first sight
+// of the table and is keyed by qualified name, never refreshed. The pgx
+// binary-encode path picks the wire format from the cached column's OID,
+// so a post-ALTER value that overflows the OLD type (e.g. 5e9 into the
+// cached int4) fails to encode — a false-success: the DDL applied
+// correctly but the applier still encodes against the pre-DDL type. The
+// batch path already flushes a schema event as its own transaction
+// ("everything before is durable; the schema event is its own tx;
+// everything after is a fresh batch", change_applier_batch.go) precisely
+// so this invalidation is safe to do here, after the boundary commits.
+//
+// The caches are keyed by the ROUTED (target) schema — the same key the
+// DML insert/update/delete paths use via [ChangeApplier.routedSchema] —
+// while the SchemaSnapshot carries the SOURCE schema, so we must route
+// it before deleting (a cross-engine MySQL→PG snapshot carries
+// "source_db" but the DML, and the cache, live under "public").
+func (a *ChangeApplier) invalidateTargetCachesForBoundary(s ir.SchemaSnapshot) {
+	qn := schemaTableKey(a.routedSchema(s.Schema), s.Table)
+	delete(a.colTypeCache, qn)
+	delete(a.pkCache, qn)
+	delete(a.conflictKeyCache, qn)
+	// Mark the table schema-dirty so subsequent DML re-describes its
+	// parameter OIDs instead of reusing pgx's stale per-connection
+	// prepared-statement cache (the second half of the GAP #3 fix — the
+	// cache above busts sluice's own value-prep; this busts pgx's wire-
+	// level OID inference, which is keyed by the byte-identical SQL text
+	// and survives a colTypeCache reload).
+	if a.schemaDirtyTables == nil {
+		a.schemaDirtyTables = make(map[string]bool)
+	}
+	a.schemaDirtyTables[qn] = true
 }
 
 // distinctSchemaTablesForStream returns the unique (schema, table)

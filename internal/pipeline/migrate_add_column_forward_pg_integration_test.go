@@ -255,12 +255,12 @@ func TestStreamer_AddColumnForward_PG_Backfill_PopulatesPriorRows(t *testing.T) 
 	}
 }
 
-// TestStreamer_AddColumnForward_PG_FlagOff_RefusesLoudly pins the negative
-// case: with --forward-schema-add-column UNSET (default), the
-// post-ALTER INSERT errors the streamer. This is the pre-v0.79.0
-// behavior; the test guards against accidental default-on changes
-// that would silently shift operator-visible semantics.
-func TestStreamer_AddColumnForward_PG_FlagOff_RefusesLoudly(t *testing.T) {
+// TestStreamer_AddColumnForward_PG_RefuseMode_RefusesLoudly pins the
+// negative case: with --schema-changes=refuse, the post-ALTER INSERT
+// errors the streamer (the conservative pre-ADR-0091 behavior). Under
+// the default (forward) the ALTER would auto-forward; this test guards
+// the opt-out path so operators who set refuse keep loud-refuse-on-DDL.
+func TestStreamer_AddColumnForward_PG_RefuseMode_RefusesLoudly(t *testing.T) {
 	sourceDSN, targetDSN, cleanup := startPostgresLogical(t)
 	defer cleanup()
 
@@ -284,8 +284,9 @@ func TestStreamer_AddColumnForward_PG_FlagOff_RefusesLoudly(t *testing.T) {
 		SourceDSN: sourceDSN,
 		TargetDSN: targetDSN,
 		StreamID:  "test-addcol-fwd-pg-off",
-		// ForwardSchemaAddColumn deliberately unset — pre-v0.79.0
-		// behavior is preserved.
+		// --schema-changes=refuse — opt out of the default-on
+		// forwarding so the post-ALTER INSERT refuses loudly (ADR-0091).
+		SchemaChanges: "refuse",
 	}
 
 	streamCtx, streamCancel := context.WithCancel(context.Background())
@@ -303,7 +304,7 @@ func TestStreamer_AddColumnForward_PG_FlagOff_RefusesLoudly(t *testing.T) {
 		INSERT INTO widgets (id, name, price) VALUES (2, 'beta', 1.99);
 	`)
 
-	// Without the forward flag, the post-ALTER INSERT errors the
+	// With --schema-changes=refuse, the post-ALTER INSERT errors the
 	// applier; the stream surfaces a retry-loop error. Wait briefly
 	// for the failure shape (target row count stays at 1).
 	stuck := !waitForPGRowCount(t, targetDSN, "widgets", 2, 10*time.Second)

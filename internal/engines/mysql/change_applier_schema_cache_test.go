@@ -374,6 +374,53 @@ func TestApplier_ActiveSchema_NotConfusedByUnknownSchema(t *testing.T) {
 // The shape of the wrap is verified separately on a real engine (the
 // integration sibling); here we only assert that the empty-streamID
 // branch's error message wraps the call site.
+// TestApplier_CacheAfterCommit_InvalidatesTargetCaches pins the
+// ADR-0091 F7a fix (symmetric to the PG GAP #3 fix): a committed
+// SchemaSnapshot boundary drops the applier's target-side per-table
+// caches (colTypeCache / pkCache) for that table, keyed by the ROUTED
+// target schema, so the next DML re-reads the live post-DDL catalog.
+func TestApplier_CacheAfterCommit_InvalidatesTargetCaches(t *testing.T) {
+	a := &ChangeApplier{
+		schema:       "app",
+		streamID:     "s1",
+		activeSchema: make(map[string]activeSchemaVersion),
+		colTypeCache: make(map[string]map[string]*ir.Column),
+		pkCache:      make(map[string][]string),
+	}
+	const qn = "app.widgets"
+	// Pre-DDL baseline (counter int4). First snapshot is the baseline, not
+	// a boundary → must NOT invalidate (symmetric to the PG over-reach fix).
+	a.cacheActiveSchemaAfterCommit(ir.SchemaSnapshot{
+		Position: ir.Position{Engine: engineNameMySQL, Token: "gtid0"},
+		Schema:   "source_db", Table: "widgets",
+		IR: &ir.Table{Name: "widgets", Columns: []*ir.Column{
+			{Name: "counter", Type: ir.Integer{Width: 32}},
+		}},
+	})
+	a.colTypeCache[qn] = map[string]*ir.Column{
+		"counter": {Name: "counter", Type: ir.Integer{Width: 32}},
+	}
+	a.pkCache[qn] = []string{"id"}
+
+	// A boundary carrying the SOURCE schema name — single-DB routedSchema
+	// maps it back to the applier's bound schema ("app"); the widen is a
+	// real change (signature differs) → invalidate.
+	a.cacheActiveSchemaAfterCommit(ir.SchemaSnapshot{
+		Position: ir.Position{Engine: engineNameMySQL, Token: "gtid"},
+		Schema:   "source_db", Table: "widgets",
+		IR: &ir.Table{Name: "widgets", Columns: []*ir.Column{
+			{Name: "counter", Type: ir.Integer{Width: 64}},
+		}},
+	})
+
+	if _, ok := a.colTypeCache[qn]; ok {
+		t.Errorf("colTypeCache[%q] not invalidated after boundary", qn)
+	}
+	if _, ok := a.pkCache[qn]; ok {
+		t.Errorf("pkCache[%q] not invalidated after boundary", qn)
+	}
+}
+
 func TestApplier_PrimeErrorWrapping(t *testing.T) {
 	a := &ChangeApplier{}
 	err := a.PrimeSchemaHistoryCache(context.Background(), "", ir.Position{Engine: engineNameMySQL, Token: "x"})

@@ -104,17 +104,18 @@ func nullableLabel(n bool) string {
 	return "NOT NULL"
 }
 
-// renderColumnAddedLine formats a single ColumnsAdded entry. Includes
-// the type/nullable/default and the canonical operator-action hint:
-// either run drained schema migrate, or restart with
-// --forward-schema-add-column to opt into auto-forwarding.
+// renderColumnAddedLine formats a single ColumnsAdded entry. A
+// standalone ADD COLUMN auto-forwards by default under ADR-0091, so
+// this line only appears inside a multi-shape combo refusal (where
+// nothing auto-forwards); the hint therefore points to drained
+// recovery for the whole combo.
 func renderColumnAddedLine(c irdiff.ColumnDriftEntry) string {
 	base := "[column-added] " + c.Name + " " + c.Type + " " + nullableLabel(c.Nullable)
 	if c.Default != "<none>" {
 		base += " DEFAULT " + c.Default
 	}
-	base += " — drained schema migrate to add this column on the target before resuming; " +
-		"OR restart with --forward-schema-add-column to auto-forward future ADD COLUMN events (ADR-0058)"
+	base += " — drained schema migrate to add this column on the target before resuming " +
+		"(a standalone ADD COLUMN auto-forwards by default; this appears here as part of a multi-shape combo, ADR-0091)"
 	return base
 }
 
@@ -134,7 +135,7 @@ func renderColumnDroppedLine(c irdiff.ColumnDriftEntry) string {
 func renderColumnRenamedLine(c irdiff.ColumnRenameEntry) string {
 	return "[column-renamed] " + c.OldName + " → " + c.NewName + " " + c.Type +
 		" — drained schema migrate to RENAME on the target before resuming; " +
-		"RENAME COLUMN is not auto-forwarded (ADR-0058 v1 scope)"
+		"RENAME COLUMN is not auto-forwarded — it is ambiguous with drop+add (data-loss risk), ADR-0091 §3"
 }
 
 // renderColumnAlteredLine formats a ColumnAltered entry. Lists every

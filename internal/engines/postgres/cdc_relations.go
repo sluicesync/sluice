@@ -104,34 +104,125 @@ type relationColumn struct {
 // allocates a fresh OID for the new relation and this function only
 // sees one OID at a time.
 func detectIncompatibleRelationChange(prev, current *relationCacheEntry) string {
+	change := classifyRelationChange(prev, current)
+	return change.Description
+}
+
+// relationChangeKind enumerates the mid-stream same-OID relation shapes
+// the CDC reader distinguishes. ADR-0091 F7a GAP #1 made the
+// forward-vs-refuse decision per-shape (rather than refuse-everything-but-
+// ADD), so the detector now classifies the shape and lets [checkSchemaRace]
+// apply the policy:
+//
+//   - relationChangeNone / relationChangeAddColumn always pass.
+//   - relationChangeDropColumn / relationChangeAlterColumnType pass when
+//     --schema-changes=forward (the ADR-0091 default): they reach the
+//     forward intercept as SchemaSnapshots, and the GAP #3 applier-cache
+//     invalidation keeps decode correct. They refuse under
+//     --schema-changes=refuse (the Bug 112/119/120 behavior, preserved).
+//   - relationChangeRenameTable always refuses — a table rename (or schema
+//     move) is genuinely ambiguous mid-stream.
+//   - relationChangeRenameColumn passes to the intercept under forward (so
+//     the intercept's ADR-0091 §3 attnum-unprovable data-loss refusal
+//     fires with the specific message); refuses at the reader otherwise.
+type relationChangeKind int
+
+const (
+	relationChangeNone relationChangeKind = iota
+	relationChangeAddColumn
+	relationChangeDropColumn
+	relationChangeAlterColumnType
+	relationChangeRenameColumn
+	relationChangeRenameTable
+)
+
+// relationChange is the classified result of comparing a cached relation
+// against a freshly-received one for the same OID. Description is the
+// human-readable shape text used in the refuse-loudly error (empty for
+// None / AddColumn, which never refuse).
+type relationChange struct {
+	Kind        relationChangeKind
+	Description string
+}
+
+// classifyRelationChange compares a previously-cached relation against a
+// newly-received one for the same OID and classifies the shape. A nil
+// prev (first-touch) or an identical re-send (pgoutput reconnect) is
+// relationChangeNone. ADD COLUMN (existing columns unchanged in order,
+// name and OID; new columns appended) is relationChangeAddColumn. The
+// remaining shapes — table rename, column drop, column rename, column
+// type change — each get a distinct kind so the forward-vs-refuse policy
+// can be applied per-shape (ADR-0091 F7a GAP #1).
+func classifyRelationChange(prev, current *relationCacheEntry) relationChange {
 	if prev == nil {
-		return ""
+		return relationChange{Kind: relationChangeNone}
 	}
 	if prev.Schema != current.Schema || prev.Name != current.Name {
-		return fmt.Sprintf("RENAME %s.%s → %s.%s",
-			prev.Schema, prev.Name, current.Schema, current.Name)
+		return relationChange{
+			Kind: relationChangeRenameTable,
+			Description: fmt.Sprintf("RENAME %s.%s → %s.%s",
+				prev.Schema, prev.Name, current.Schema, current.Name),
+		}
 	}
-	// Existing columns must remain identical in order, name, and OID.
-	// Type-OID change (ALTER COLUMN TYPE) is a forward-incompatible
-	// shape. New columns appended at the end (ADD COLUMN) is the only
-	// compatible shape — the existing ADR-0058 forwarding path handles
-	// the propagation when --forward-schema-add-column is set.
+	// A shorter column list is a DROP COLUMN. (A middle-column drop also
+	// shortens the list, so it classifies here as DROP rather than as the
+	// ordinal-mismatch RENAME COLUMN below — the correct call, since the
+	// net effect is a removed column.)
 	if len(current.Columns) < len(prev.Columns) {
-		return fmt.Sprintf("DROP COLUMN (column count %d → %d)",
-			len(prev.Columns), len(current.Columns))
+		return relationChange{
+			Kind: relationChangeDropColumn,
+			Description: fmt.Sprintf("DROP COLUMN (column count %d → %d)",
+				len(prev.Columns), len(current.Columns)),
+		}
 	}
 	for i, col := range prev.Columns {
 		nc := current.Columns[i]
 		if col.Name != nc.Name {
-			return fmt.Sprintf("RENAME COLUMN %s → %s (ordinal %d)",
-				col.Name, nc.Name, i)
+			return relationChange{
+				Kind: relationChangeRenameColumn,
+				Description: fmt.Sprintf("RENAME COLUMN %s → %s (ordinal %d)",
+					col.Name, nc.Name, i),
+			}
 		}
 		if col.OID != nc.OID {
-			return fmt.Sprintf("ALTER COLUMN TYPE %s (type OID %d → %d, ordinal %d)",
-				col.Name, col.OID, nc.OID, i)
+			return relationChange{
+				Kind: relationChangeAlterColumnType,
+				Description: fmt.Sprintf("ALTER COLUMN TYPE %s (type OID %d → %d, ordinal %d)",
+					col.Name, col.OID, nc.OID, i),
+			}
 		}
 	}
-	return ""
+	// Existing columns identical; either no change or new columns
+	// appended (ADD COLUMN). Both pass.
+	if len(current.Columns) > len(prev.Columns) {
+		return relationChange{Kind: relationChangeAddColumn}
+	}
+	return relationChange{Kind: relationChangeNone}
+}
+
+// passesUnderSchemaForward reports whether a classified relation change is
+// allowed to reach the ADR-0091 forward intercept (i.e. the reader emits a
+// SchemaSnapshot rather than refusing) when --schema-changes=forward.
+//
+// DROP COLUMN and ALTER COLUMN TYPE pass: the GAP #3 applier-cache
+// invalidation (invalidateTargetCachesForBoundary) refreshes the target
+// decode path on the SchemaSnapshot boundary, closing the Bug 119 silent-
+// drift root cause the original gate guarded against. RENAME COLUMN also
+// passes — but only so the intercept's ADR-0091 §3 data-loss refusal
+// (refuseRenameAmbiguous) fires with its specific, attnum-unprovable
+// message instead of the generic reader error; the rename is still
+// refused, just one layer down with a better diagnostic. RENAME TABLE
+// (and the DROP+CREATE-same-name case handled separately in
+// checkSchemaRace) is never forwardable — it stays a loud reader refusal.
+func (k relationChangeKind) passesUnderSchemaForward() bool {
+	switch k {
+	case relationChangeDropColumn,
+		relationChangeAlterColumnType,
+		relationChangeRenameColumn:
+		return true
+	default:
+		return false
+	}
 }
 
 // checkSchemaRace surfaces incompatible-DDL situations as a loud
@@ -147,21 +238,37 @@ func detectIncompatibleRelationChange(prev, current *relationCacheEntry) string 
 //     OID for the new relation, so the old entry is orphaned in the
 //     map but still detectable.
 //
-// Returns nil when no race is detected, or when the change is a pure
-// ADD COLUMN (the [detectIncompatibleRelationChange] contract — the
-// existing ADR-0058 forwarding path handles that shape when
-// `--forward-schema-add-column` is set).
+// Returns nil when no race is detected, when the change is a pure
+// ADD COLUMN, or — when schemaForward is true (--schema-changes=forward,
+// the ADR-0091 default) — when the change is a DROP COLUMN / ALTER COLUMN
+// TYPE / RENAME COLUMN, which then reach the forward intercept as
+// SchemaSnapshots (F7a GAP #1; the intercept forwards DROP/ALTER and
+// refuses RENAME COLUMN with its specific data-loss message). RENAME TABLE
+// and DROP+CREATE-same-name always refuse, regardless of schemaForward.
+//
+// schemaForward=false preserves the EXACT pre-ADR-0091 behavior: every
+// shape but ADD COLUMN refuses loudly (Bug 112/119/120 closure).
 //
 // Bug 112 (RENAME silent drop) / Bug 119 (DROP COLUMN silent drift) /
-// Bug 120 (DROP+CREATE silent drop) v0.93.0 closure.
-func checkSchemaRace(relations map[uint32]*relationCacheEntry, relationID uint32, current *relationCacheEntry) error {
-	if race := detectIncompatibleRelationChange(relations[relationID], current); race != "" {
+// Bug 120 (DROP+CREATE silent drop) v0.93.0 closure; relaxed for the
+// forward-mode shapes by ADR-0091 F7a GAP #1.
+func checkSchemaRace(relations map[uint32]*relationCacheEntry, relationID uint32, current *relationCacheEntry, schemaForward bool) error {
+	change := classifyRelationChange(relations[relationID], current)
+	// A non-empty Description means a shape was detected. Under forward mode
+	// the unambiguous / intercept-routable shapes pass through to the
+	// SchemaSnapshot path; everything else (and everything under refuse
+	// mode) is a loud reader refusal.
+	forwarded := schemaForward && change.Kind.passesUnderSchemaForward()
+	if change.Description != "" && !forwarded {
 		return fmt.Errorf("postgres: cdc: incompatible schema change mid-stream on %s.%s (OID %d): %s. %s",
-			current.Schema, current.Name, relationID, race, schemaRaceRecoveryHint)
+			current.Schema, current.Name, relationID, change.Description, schemaRaceRecoveryHint)
 	}
 	// DROP+CREATE-same-name (Bug 120): a different OID claims the same
 	// (Schema, Name). pgoutput re-issues RelationMessage for the new
 	// relation; the old OID's entry is now orphaned but still cached.
+	// This is genuinely ambiguous (the new relation is a fresh table that
+	// merely reuses the name) and is never forwardable, so it refuses
+	// regardless of schemaForward.
 	for otherOID, other := range relations {
 		if otherOID == relationID {
 			continue

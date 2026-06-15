@@ -29,28 +29,26 @@ import (
 )
 
 // TestStreamer_SchemaDrift_PG_RefuseLoudlyIncludesDriftReport pins
-// the F11 contract end-to-end on PG → PG: each refused-shape
-// scenario surfaces an error message that NAMES the specific column
-// / index / constraint that drifted, with the operator-action hint
-// inline.
+// the F11 contract end-to-end on PG → PG: a refused-shape scenario
+// surfaces an error message that NAMES the specific column that
+// drifted, with the operator-action hint inline.
 //
-// Bug 74 class-pin: one subtest per refused-shape category from the
-// ADR-0058 catalog that the F11 intercept can actually observe —
-// drop-column, rename-column, alter-column-type. A single
-// representative would only prove the wiring exists; per-category
-// coverage proves every category's rendered output is correct.
+// ADR-0091 narrowed the refusal catalog: under default-on forwarding
+// the intercept now FORWARDS drop-column / alter-column-type (so they
+// no longer produce a refusal to assert against), and the seed-guard
+// SKIPS a destructive shape at the first post-cold-start boundary
+// anyway. RENAME COLUMN remains the canonical refuse-loudly shape (it
+// is ambiguous with drop+add — data-loss risk — and is never
+// seed-guarded), so it is the F11 drift-report-in-refusal pin here.
+// Drop/alter/index/check FORWARDING is covered by the per-shape
+// forward integration matrix; multi-shape combos by the unit drift
+// tests.
 //
-// Known limitation (ADR-0060 §6 — "Known limitation: index-only DDL
-// not detected via F11"): CREATE INDEX and DROP INDEX are
-// deliberately NOT exercised here. The F11 intercept fires off
-// [ir.SchemaSnapshot] events, which the PG CDC reader emits only in
-// response to a pgoutput RelationMessage. RelationMessage describes
-// column shape only; CREATE INDEX / DROP INDEX do not change column
-// shape and therefore do not trigger one. The follow-up INSERT also
-// passes through cleanly because the cached IR matches the post-DDL
-// projection. Live detection of index-only drift is future work
-// (see ADR-0060 §6 — F47 schema-drift catalog will need a separate
-// subscription path).
+// Known limitation: CREATE INDEX / DROP INDEX produce no pgoutput
+// RelationMessage (no column-shape change), so the intercept never
+// classifies them on PG via CDC — see [Engine.NormalizeForCDCComparison]
+// (ADR-0091) which strips secondary indexes from the comparison for
+// exactly this reason.
 func TestStreamer_SchemaDrift_PG_RefuseLoudlyIncludesDriftReport(t *testing.T) {
 	scenarios := []struct {
 		name string
@@ -59,60 +57,26 @@ func TestStreamer_SchemaDrift_PG_RefuseLoudlyIncludesDriftReport(t *testing.T) {
 		// shape).
 		preDDL string
 		// driftDDL is the source-side change that triggers refuse-
-		// loudly mid-stream. Must be a DDL the ADR-0058 catalog
-		// refuses (NOT plain ADD COLUMN).
+		// loudly mid-stream. Must be a shape ADR-0091 still refuses
+		// (RENAME or a multi-shape combo).
 		driftDDL string
-		// Substrings that MUST appear in the surfaced error. The
-		// shape-name (existing ADR-0058 contract) and the rendered
-		// drift entries (new ADR-0060 contract).
+		// Substrings that MUST appear in the surfaced error: the
+		// shape name + the rendered drift entries (ADR-0060 contract).
 		wantSubstrs []string
 	}{
-		{
-			name:   "drop-column",
-			preDDL: "ALTER TABLE widgets ADD COLUMN legacy_col VARCHAR(100);",
-			driftDDL: `ALTER TABLE widgets DROP COLUMN legacy_col;
-INSERT INTO widgets (id, name) VALUES (10, 'post-drop');`,
-			wantSubstrs: []string{
-				"drop-column",
-				"[column-dropped]",
-				"legacy_col",
-				"destructive",
-				"drained model",
-			},
-		},
 		{
 			name:   "rename-column",
 			preDDL: "ALTER TABLE widgets ADD COLUMN old_label VARCHAR(100);",
 			driftDDL: `ALTER TABLE widgets RENAME COLUMN old_label TO new_label;
 INSERT INTO widgets (id, name, new_label) VALUES (10, 'post-rename', 'lbl');`,
 			wantSubstrs: []string{
-				"rename-column",
+				"RENAME COLUMN",
 				"[column-renamed]",
 				"old_label",
 				"new_label",
 				"drained model",
 			},
 		},
-		{
-			name:   "alter-column-type",
-			preDDL: "ALTER TABLE widgets ADD COLUMN score INTEGER;",
-			driftDDL: `ALTER TABLE widgets ALTER COLUMN score TYPE BIGINT;
-INSERT INTO widgets (id, name, score) VALUES (10, 'post-alter', 99);`,
-			wantSubstrs: []string{
-				"alter-column",
-				"[column-altered]",
-				"score",
-				"drained model",
-			},
-		},
-		// NOTE: create-index and drop-index scenarios were removed
-		// here — see the function comment block above for the F11
-		// limitation. The scenarios were timing out at 60s because
-		// the streamer never surfaces a refusal: pgoutput emits no
-		// RelationMessage for index-only DDL, so the F11 intercept
-		// has nothing to classify. Reintroduce these only when F47
-		// adds a separate subscription path that observes index
-		// catalog mutations.
 	}
 	for _, sc := range scenarios {
 		t.Run(sc.name, func(t *testing.T) {
@@ -138,16 +102,15 @@ INSERT INTO widgets (id, name, score) VALUES (10, 'post-alter', 99);`,
 				t.Fatal("postgres engine not registered")
 			}
 
-			// ForwardSchemaAddColumn=true engages the intercept; the
-			// refuse-loudly path is then taken because the drift is
-			// NOT an ADD COLUMN.
+			// Default-on forwarding (ADR-0091) engages the intercept;
+			// the refuse-loudly path is taken because RENAME is the one
+			// shape the intercept refuses (data-loss-ambiguous).
 			streamer := &Streamer{
-				Source:                 pgEng,
-				Target:                 pgEng,
-				SourceDSN:              sourceDSN,
-				TargetDSN:              targetDSN,
-				StreamID:               "test-drift-pg-" + sc.name,
-				ForwardSchemaAddColumn: true,
+				Source:    pgEng,
+				Target:    pgEng,
+				SourceDSN: sourceDSN,
+				TargetDSN: targetDSN,
+				StreamID:  "test-drift-pg-" + sc.name,
 			}
 
 			streamCtx, streamCancel := context.WithCancel(context.Background())

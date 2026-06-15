@@ -88,10 +88,45 @@ func (a *ChangeApplier) cacheActiveSchemaAfterCommit(s ir.SchemaSnapshot) {
 	if a.activeSchema == nil {
 		a.activeSchema = make(map[string]activeSchemaVersion)
 	}
-	a.activeSchema[qualifiedName(s.Schema, s.Table)] = activeSchemaVersion{
+	key := qualifiedName(s.Schema, s.Table)
+	prior, hadPrior := a.activeSchema[key]
+	a.activeSchema[key] = activeSchemaVersion{
 		Anchor: s.Position,
 		IR:     s.IR,
 	}
+	// Only invalidate on an ACTUAL schema change (prior version existed
+	// AND its decode signature differs) — not on the first-touch baseline
+	// or an identical re-send. Symmetric to the PG applier's GAP #3 fix;
+	// keeps steady-state DML on the cached fast path.
+	if hadPrior && prior.IR != nil && s.IR != nil &&
+		!ir.SchemaSignatureOf(prior.IR).Equal(ir.SchemaSignatureOf(s.IR)) {
+		a.invalidateTargetCachesForBoundary(s)
+	}
+}
+
+// invalidateTargetCachesForBoundary drops the target-side per-table
+// metadata caches (colTypeCache / pkCache) for the table named by the
+// just-committed SchemaSnapshot, so the next DML on that table re-reads
+// the live (post-DDL) catalog rather than binding against the stale
+// pre-DDL view (ADR-0091 F7a — the symmetric fix to the PG applier's
+// GAP #3). MySQL's text-protocol bind tolerates a stale numeric width
+// for a widened column, so this is defense-in-depth on the MySQL side
+// (a stale generated-column flag or a dropped column after a DDL
+// boundary is the live hazard it forecloses); on PG the same gap is a
+// hard encode failure.
+//
+// The batch path flushes a schema event as its own transaction, so this
+// invalidation after the boundary commits is safe: everything before is
+// durable, the schema event is its own tx, everything after is a fresh
+// batch.
+//
+// The caches are keyed by the ROUTED (target) schema — the key the DML
+// dispatch paths use via [ChangeApplier.routedSchema] — while the
+// SchemaSnapshot carries the SOURCE schema, so route it before deleting.
+func (a *ChangeApplier) invalidateTargetCachesForBoundary(s ir.SchemaSnapshot) {
+	qn := qualifiedName(a.routedSchema(s.Schema), s.Table)
+	delete(a.colTypeCache, qn)
+	delete(a.pkCache, qn)
 }
 
 // distinctSchemaTablesForStream returns the unique (schema, table)

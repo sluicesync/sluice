@@ -43,9 +43,14 @@ package postgres
 // apply alone so the applier's column-type cache invalidation stays
 // contained: "everything before the schema event is durable; the
 // schema event itself is its own transaction; everything after is a
-// fresh batch". The cache is keyed per qualified table name and is
-// *not* invalidated mid-stream, so a Truncate followed by INSERTs
-// into a redefined table is the operator's problem to coordinate.
+// fresh batch". After a SchemaSnapshot boundary commits, the per-table
+// target-side caches (colType / pk / conflict-key) are invalidated for
+// that table (invalidateTargetCachesForBoundary) so the next DML
+// re-reads the live post-DDL catalog — without that, a forwarded ALTER
+// COLUMN TYPE applies the DDL but the applier keeps encoding against the
+// stale pre-DDL column OID (ADR-0091 F7a GAP #3). A bare Truncate
+// carries no schema delta, so its post-redefinition coordination remains
+// the operator's responsibility.
 //
 // See ADR-0017 for the original design choice.
 

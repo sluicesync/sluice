@@ -151,6 +151,121 @@ func TestB1_MaybeSnapshot_TrueDeltaAndAnchor(t *testing.T) {
 	}
 }
 
+// TestB1_MaybeSnapshot_NullabilityForward is the ADR-0091 F7a GAP #2 unit
+// pin: a per-column NULLABILITY-only change (which does NOT move
+// ir.SchemaSignatureOf — name + ordered type — the ADR-0049 decode
+// contract) must produce a boundary when schemaForward=true, and must NOT
+// produce an extra boundary when schemaForward=false (refuse mode keeps
+// today's behavior). A genuine signature delta (ADD COLUMN) must still
+// emit in BOTH modes. This locks the "separate forward signal, untouched
+// decode contract" fix shape so the gate can't regress silently.
+func TestB1_MaybeSnapshot_NullabilityForward(t *testing.T) {
+	anchor := ir.Position{Engine: engineNameMySQL, Token: "ddl-anchor-token"}
+
+	// notNull / dropNotNull differ ONLY in label's Nullable flag; same
+	// names + ordered types, so ir.SchemaSignatureOf is identical.
+	notNull := func() *tableSchema {
+		return &tableSchema{Schema: "app", Name: "widgets", Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "label", Type: ir.Varchar{Length: 64}, Nullable: false},
+		}}
+	}
+	dropNotNull := func() *tableSchema {
+		return &tableSchema{Schema: "app", Name: "widgets", Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "label", Type: ir.Varchar{Length: 64}, Nullable: true},
+		}}
+	}
+	// addCol is a real signature delta on top of dropNotNull.
+	addCol := func() *tableSchema {
+		return &tableSchema{Schema: "app", Name: "widgets", Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "label", Type: ir.Varchar{Length: 64}, Nullable: true},
+			{Name: "extra", Type: ir.Integer{Width: 32}},
+		}}
+	}
+
+	drain := func(out chan ir.Change) int {
+		close(out)
+		n := 0
+		for c := range out {
+			if _, ok := c.(ir.SchemaSnapshot); ok {
+				n++
+			}
+		}
+		return n
+	}
+
+	// Ground-truth that the two nullability shapes share a signature, so
+	// the test is actually exercising the nullability-only path and not a
+	// latent signature difference.
+	sigNN := ir.SchemaSignatureOf(&ir.Table{Schema: "app", Name: "widgets", Columns: notNull().Columns})
+	sigDN := ir.SchemaSignatureOf(&ir.Table{Schema: "app", Name: "widgets", Columns: dropNotNull().Columns})
+	if !sigNN.Equal(sigDN) {
+		t.Fatalf("test premise broken: notNull and dropNotNull have different signatures; the nullability-only path isn't being exercised")
+	}
+
+	newReader := func(forward bool) *CDCReader {
+		return &CDCReader{
+			schema:           "app",
+			snapshotSig:      map[string]ir.SchemaSignature{},
+			forwardNullSig:   map[string]string{},
+			pendingDDLActive: true,
+			pendingDDLAnchor: anchor,
+			schemaForward:    forward,
+		}
+	}
+
+	ctx := context.Background()
+
+	t.Run("forward=true emits on nullability-only delta", func(t *testing.T) {
+		r := newReader(true)
+		out := make(chan ir.Change, 8)
+		// Prime boundary (establishes both trackers).
+		if err := r.maybeSnapshotSchemaB1(ctx, "app.widgets", notNull(), out); err != nil {
+			t.Fatalf("prime: %v", err)
+		}
+		// Nullability-only flip: same signature, label NOT NULL → NULL.
+		if err := r.maybeSnapshotSchemaB1(ctx, "app.widgets", dropNotNull(), out); err != nil {
+			t.Fatalf("nullability flip: %v", err)
+		}
+		if got := drain(out); got != 2 {
+			t.Fatalf("forward=true: want 2 boundaries (prime + nullability), got %d", got)
+		}
+	})
+
+	t.Run("forward=false does NOT emit on nullability-only delta", func(t *testing.T) {
+		r := newReader(false)
+		out := make(chan ir.Change, 8)
+		if err := r.maybeSnapshotSchemaB1(ctx, "app.widgets", notNull(), out); err != nil {
+			t.Fatalf("prime: %v", err)
+		}
+		if err := r.maybeSnapshotSchemaB1(ctx, "app.widgets", dropNotNull(), out); err != nil {
+			t.Fatalf("nullability flip: %v", err)
+		}
+		if got := drain(out); got != 1 {
+			t.Fatalf("forward=false: want 1 boundary (prime only — nullability swallowed, pre-ADR-0091 behavior), got %d", got)
+		}
+	})
+
+	t.Run("signature delta still emits in both modes", func(t *testing.T) {
+		for _, forward := range []bool{true, false} {
+			r := newReader(forward)
+			out := make(chan ir.Change, 8)
+			if err := r.maybeSnapshotSchemaB1(ctx, "app.widgets", dropNotNull(), out); err != nil {
+				t.Fatalf("forward=%t prime: %v", forward, err)
+			}
+			// Real ADD COLUMN — signature changes.
+			if err := r.maybeSnapshotSchemaB1(ctx, "app.widgets", addCol(), out); err != nil {
+				t.Fatalf("forward=%t add column: %v", forward, err)
+			}
+			if got := drain(out); got != 2 {
+				t.Fatalf("forward=%t: signature delta must emit; want 2 boundaries, got %d", forward, got)
+			}
+		}
+	})
+}
+
 // TestB1_MaybeSnapshot_InactiveIsNoOp: with no DDL pending, the
 // emitter is a pure no-op (steady-state rows must not write versions).
 func TestB1_MaybeSnapshot_InactiveIsNoOp(t *testing.T) {

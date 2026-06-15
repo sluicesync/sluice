@@ -223,36 +223,60 @@ func (r *BoundaryRouter) handleHeldLease(
 }
 
 // applyShape dispatches the IR-delta-derived shape to the engine's
-// ir.ShapeDeltaApplier. Each branch maps Shape.Kind to the matching
-// engine method.
+// ir.ShapeDeltaApplier. Thin method wrapper over the shared
+// [applyShapeDelta] free function so the Shape A boundary router and
+// the single-stream ADR-0091 forwarding intercept use the identical
+// proven dispatch.
 func (r *BoundaryRouter) applyShape(ctx context.Context, post *ir.Table, shape Shape) error {
+	return applyShapeDelta(ctx, r.applier, post, shape)
+}
+
+// applyShapeDelta maps a classified [Shape] to the matching
+// [ir.ShapeDeltaApplier] method against post. It is the single source
+// of truth for per-shape DDL dispatch, shared by the Shape A boundary
+// router (ADR-0054) and the single-stream forwarding intercept
+// (ADR-0091). All branches are catalog-only DDL and idempotent on the
+// post-state (the applier methods use IF [NOT] EXISTS / detect-then-
+// emit), so a retry that replays the boundary is safe.
+//
+// post must already be retargeted to the target engine's dialect and
+// have its Schema scrubbed by the caller when the source IR carries a
+// different engine's types / database name (the single-stream CDC
+// caller does this via retargetShapeForTarget; the Shape A caller's
+// manifest-derived tables are already target-shaped).
+//
+// ShapeKindRenameColumn is dispatched here for the Shape A path (whose
+// lease + catalog make the rename unambiguous); the single-stream
+// caller refuses rename BEFORE reaching this function (ADR-0091 §3 —
+// it cannot prove rename-vs-drop+add without a stable column id).
+func applyShapeDelta(ctx context.Context, applier ir.ShapeDeltaApplier, post *ir.Table, shape Shape) error {
 	switch shape.Kind {
 	case ShapeKindAddColumn:
-		return r.applier.AlterAddColumn(ctx, post, shape.AddedColumns)
+		return applier.AlterAddColumn(ctx, post, shape.AddedColumns)
 	case ShapeKindDropColumn:
-		return r.applier.AlterDropColumn(ctx, post, shape.DroppedColumns)
+		return applier.AlterDropColumn(ctx, post, shape.DroppedColumns)
 	case ShapeKindCreateIndex:
-		return r.applier.CreateShapeIndex(ctx, post, shape.CreatedIndexes)
+		return applier.CreateShapeIndex(ctx, post, shape.CreatedIndexes)
 	case ShapeKindDropIndex:
-		return r.applier.DropShapeIndex(ctx, post, shape.DroppedIndexes)
+		return applier.DropShapeIndex(ctx, post, shape.DroppedIndexes)
 	case ShapeKindAlterColumnType:
-		return r.applier.AlterColumnType(ctx, post, shape.AlteredColumn)
+		return applier.AlterColumnType(ctx, post, shape.AlteredColumn)
 	case ShapeKindAlterColumnNullability:
-		return r.applier.AlterColumnNullability(ctx, post, shape.AlteredColumn)
+		return applier.AlterColumnNullability(ctx, post, shape.AlteredColumn)
 	case ShapeKindRenameColumn:
 		if shape.RenamedColumnBefore == nil || shape.RenamedColumnAfter == nil {
 			return errors.New("pipeline: apply shape: rename-column shape missing before/after column")
 		}
-		return r.applier.AlterRenameColumn(ctx, post, shape.RenamedColumnBefore.Name, shape.RenamedColumnAfter.Name)
+		return applier.AlterRenameColumn(ctx, post, shape.RenamedColumnBefore.Name, shape.RenamedColumnAfter.Name)
 	case ShapeKindAddCheck:
-		return r.applier.AlterAddCheck(ctx, post, shape.AddedChecks)
+		return applier.AlterAddCheck(ctx, post, shape.AddedChecks)
 	case ShapeKindDropCheck:
-		return r.applier.AlterDropCheck(ctx, post, shape.DroppedChecks)
+		return applier.AlterDropCheck(ctx, post, shape.DroppedChecks)
 	case ShapeKindModifyCheck:
 		if shape.ModifiedCheckBefore == nil || shape.ModifiedCheckAfter == nil {
 			return errors.New("pipeline: apply shape: modify-check shape missing before/after constraint")
 		}
-		return r.applier.AlterModifyCheck(ctx, post, shape.ModifiedCheckBefore, shape.ModifiedCheckAfter)
+		return applier.AlterModifyCheck(ctx, post, shape.ModifiedCheckBefore, shape.ModifiedCheckAfter)
 	case ShapeKindNone:
 		return nil
 	}

@@ -156,10 +156,39 @@ type CDCReader struct {
 	systemID string
 	timeline int32
 
+	// schemaForward relaxes the mid-stream schema-change gate
+	// (checkSchemaRace) for the ADR-0091 forward-routable shapes (DROP
+	// COLUMN / ALTER COLUMN TYPE / RENAME COLUMN) so they surface as
+	// SchemaSnapshots for the pipeline forward intercept instead of being
+	// refused at the source-read level (F7a GAP #1). Set by
+	// [CDCReader.SetSchemaForward] BEFORE StreamChanges, then read only on
+	// the pump goroutine. The zero value (false) is the pre-ADR-0091
+	// refuse-everything-but-ADD behavior, so non-streamer callers (backup
+	// chain consumers, cdc-snapshot test paths) keep the conservative
+	// gate.
+	schemaForward bool
+
 	// mu guards err. The pump writes; callers read via Err after
 	// the channel closes.
 	mu  sync.Mutex
 	err error
+}
+
+// SetSchemaForward enables ADR-0091 single-stream schema-change
+// forwarding for this reader (F7a GAP #1). When true, the reader stops
+// refusing DROP COLUMN / ALTER COLUMN TYPE / RENAME COLUMN mid-stream at
+// the source-read level and instead emits them as SchemaSnapshots so the
+// pipeline's forward intercept can carry the operator's DDL to the target
+// (the intercept forwards DROP/ALTER and refuses RENAME COLUMN with its
+// own ADR-0091 §3 data-loss message). RENAME TABLE and DROP+CREATE-same-
+// name stay refused at the reader regardless.
+//
+// Must be called before [StreamChanges]; the flag is read on the pump
+// goroutine. The streamer calls this once per stream between open and
+// StreamChanges (see pipeline.schemaForwardModeSetter); a false value (or
+// never calling it) preserves the pre-ADR-0091 refuse-on-DDL gate.
+func (r *CDCReader) SetSchemaForward(enabled bool) {
+	r.schemaForward = enabled
 }
 
 // AttachLSNTracker installs an applied-LSN feedback channel from
@@ -775,9 +804,12 @@ func (r *CDCReader) dispatchWAL(
 		if err := r.resolveIdentityKeyCols(ctx, entry); err != nil {
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
-		if err := checkSchemaRace(relations, m.RelationID, entry); err != nil {
+		if err := checkSchemaRace(relations, m.RelationID, entry, r.schemaForward); err != nil {
 			return err
 		}
+		// Replace the cache entry with the new shape so subsequent DML on
+		// this OID decodes against the post-DDL column set (the gate
+		// passed, so the boundary is forwarded downstream).
 		relations[m.RelationID] = entry
 		// ADR-0036 M3: log RelationMessage arrivals so the diagnostic
 		// run can correlate them with the publication-add LSN.
@@ -800,9 +832,11 @@ func (r *CDCReader) dispatchWAL(
 		if err := r.resolveIdentityKeyCols(ctx, entry); err != nil {
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
-		if err := checkSchemaRace(relations, m.RelationID, entry); err != nil {
+		if err := checkSchemaRace(relations, m.RelationID, entry, r.schemaForward); err != nil {
 			return err
 		}
+		// Replace the cache entry with the new shape so subsequent DML on
+		// this OID decodes against the post-DDL column set.
 		relations[m.RelationID] = entry
 		slog.DebugContext(
 			ctx, "cdc.diag: relation message",

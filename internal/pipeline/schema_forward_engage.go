@@ -15,9 +15,38 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
+
+// forwardSchemaEnabled reports whether ADR-0091 single-stream schema-
+// change forwarding is active for this stream. Forwarding is ON by
+// default; only an explicit --schema-changes=refuse turns it off (the
+// empty zero-value is treated as "forward" so older callers and tests
+// get the shipping default). The deprecated --forward-schema-add-column
+// does NOT change this — forwarding is already on by default — it only
+// triggers a deprecation WARN at engage time.
+func (s *Streamer) forwardSchemaEnabled() bool {
+	return !strings.EqualFold(s.SchemaChanges, "refuse")
+}
+
+// singleStreamSchemaForwardActive reports whether the ADR-0091
+// single-stream forward intercept is the active schema-change path for
+// this stream — forwarding ON, Shape A NOT engaged (its boundary router
+// handles every shape via the lease), and NOT multi-database (forwarding
+// is single-database only; see [engageAddColumnForward]). This is the
+// exact condition under which [interceptAddColumnForward] wraps the change
+// channel and under which the cold-start seed is synthesized; the F7a
+// GAP #1 reader-gate relaxation must use the SAME condition so the PG CDC
+// reader only emits (rather than refuses) destructive/altering shapes when
+// the intercept downstream is actually present to forward them.
+func (s *Streamer) singleStreamSchemaForwardActive() bool {
+	return s.forwardSchemaEnabled() &&
+		!s.InjectShardColumn.Engaged() &&
+		!s.multiDatabaseMode()
+}
 
 // engageAddColumnForward opens the target SchemaWriter the ADR-0058
 // intercept uses for ALTER TABLE … ADD COLUMN, and (when backfill is
@@ -43,13 +72,34 @@ import (
 // Idempotent: re-running with already-set fields is a no-op (the
 // existing fields are reused; no double-close in cleanup).
 func (s *Streamer) engageAddColumnForward(ctx context.Context) error {
-	if !s.ForwardSchemaAddColumn {
+	if s.ForwardSchemaAddColumn {
+		slog.WarnContext(ctx,
+			"--forward-schema-add-column is deprecated (ADR-0091): schema-change "+
+				"forwarding is now on by default and covers every unambiguous shape. "+
+				"Use --schema-changes=refuse to restore loud-refuse-on-DDL; the flag "+
+				"will be removed in a future release.")
+	}
+	if !s.forwardSchemaEnabled() {
 		return nil
 	}
 	if s.InjectShardColumn.Engaged() {
 		// Shape A's intercept already forwards ADD COLUMN via the
 		// lease. The forward flag is a no-op in this combination;
 		// log so the operator notices the redundant flag.
+		return nil
+	}
+	if s.multiDatabaseMode() {
+		// ADR-0091: schema-change forwarding is single-database only.
+		// A multi-database stream spans several source databases under
+		// one server-level DSN, so a single SchemaWriter / SchemaReader
+		// (which bind to one database) can't serve every routed target
+		// namespace. Skip the intercept rather than open a mis-bound
+		// writer; multi-database forwarding is a follow-up. The stream
+		// keeps the refuse-on-DDL behavior for its databases.
+		slog.InfoContext(ctx,
+			"schema-change forwarding skipped: multi-database streams do not "+
+				"forward source DDL (ADR-0091, single-database only); source DDL "+
+				"refuses loudly — use the drained model to apply it on the target")
 		return nil
 	}
 	if s.Target == nil {
@@ -63,9 +113,11 @@ func (s *Streamer) engageAddColumnForward(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("pipeline: engage add-column-forward: open schema writer: %w", err)
 		}
-		if _, ok := sw.(ir.SchemaDeltaApplier); !ok {
+		if _, ok := sw.(ir.ShapeDeltaApplier); !ok {
 			_ = closeIfErrIgnored(sw)
-			return s.refuseEngineMissingAddColumnForward("schema delta applier (AlterAddColumn)")
+			return s.refuseEngineMissingAddColumnForward(
+				"shape delta applier (AlterAddColumn / AlterDropColumn / AlterColumnType / ...)",
+			)
 		}
 		// Honor --target-schema if set so DDL emits to the right
 		// namespace. Mirrors the Shape A engage path.
