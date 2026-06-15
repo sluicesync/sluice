@@ -99,13 +99,15 @@ type ChangeApplier struct {
 
 	// pipelineDB is the dedicated ADR-0092 pipelined-apply pool: a lazy
 	// *sql.DB opened on first use ([pipelinePool]) from pipelineCfg with
-	// pgx's QueryExecModeExec default, so every statement queued onto a
-	// pgx.Batch is described against the live catalog inside the single
-	// SendBatch flush (GAP #3 subsumed). Separate from db so the
-	// per-change Apply path keeps the cached fast path. nil until the
-	// first pipelined BeginTx; nil pipelineCfg (direct API constructions
-	// / unit tests) disables the pipelined path and falls back to serial
-	// *sql.Tx exec with a one-time WARN.
+	// pgx's QueryExecModeDescribeExec default, so every distinct statement
+	// queued onto a pgx.Batch is re-described fresh against the live catalog
+	// (no client cache) and bound in BINARY with the real OID inside the
+	// SendBatch flush — byte-identical encoding to the serial path, GAP #3
+	// subsumed. Separate from db so the per-change Apply path keeps the
+	// cached fast path. nil until the first pipelined BeginTx; nil
+	// pipelineCfg (direct API constructions / unit tests) disables the
+	// pipelined path and falls back to serial *sql.Tx exec with a one-time
+	// WARN.
 	pipelineDB  *sql.DB
 	pipelineCfg *pgConfig
 

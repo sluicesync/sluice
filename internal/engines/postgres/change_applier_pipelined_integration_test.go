@@ -28,8 +28,8 @@
 //     prior boundary reproduces the batch idempotently.
 //   - TestPipelined_GAP3_AlterTypeWiden pins that a forwarded ALTER TYPE
 //     int4→bigint followed by an out-of-old-range value applies through
-//     the pipelined batch (no stale-OID encode failure — the Exec-mode
-//     pool re-describes each statement).
+//     the pipelined batch (no stale-OID encode failure — the DescribeExec
+//     pool re-describes each distinct statement fresh, caching nothing).
 
 package postgres
 
@@ -37,6 +37,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -95,10 +97,13 @@ func TestPipelined_ValueFidelity_Matrix(t *testing.T) {
 		{"a_int1", "INTEGER[]", []any{int64(1), int64(2), int64(3)}, "[1:3]", "{1,2,3}"},
 		{"a_int2", "INTEGER[]", []any{[]any{int64(1), int64(2)}, []any{int64(3), int64(4)}}, "[1:2][1:2]", "{{1,2},{3,4}}"},
 		{"a_intn", "INTEGER[]", []any{int64(1), nil, int64(3)}, "[1:3]", "{1,NULL,3}"},
+		{"a_intnn", "INTEGER[]", []any{[]any{int64(1), nil}, []any{nil, int64(4)}}, "[1:2][1:2]", "{{1,NULL},{NULL,4}}"},
 		{"a_flt1", "DOUBLE PRECISION[]", []any{1.5, 2.5}, "[1:2]", "{1.5,2.5}"},
 		{"a_flt2", "DOUBLE PRECISION[]", []any{[]any{1.5, 2.5}, []any{3.5, 4.5}}, "[1:2][1:2]", "{{1.5,2.5},{3.5,4.5}}"},
+		{"a_fltn", "DOUBLE PRECISION[]", []any{1.5, nil, 3.5}, "[1:3]", "{1.5,NULL,3.5}"},
 		{"a_bool1", "BOOLEAN[]", []any{true, false}, "[1:2]", "{t,f}"},
 		{"a_bool2", "BOOLEAN[]", []any{[]any{true, false}, []any{false, true}}, "[1:2][1:2]", "{{t,f},{f,t}}"},
+		{"a_booln", "BOOLEAN[]", []any{true, nil, false}, "[1:3]", "{t,NULL,f}"},
 
 		// --- string-leaf element families ---
 		{"a_txt1", "TEXT[]", []any{"a", "b"}, "[1:2]", "{a,b}"},
@@ -107,20 +112,38 @@ func TestPipelined_ValueFidelity_Matrix(t *testing.T) {
 		{"a_vc1", "VARCHAR(16)[]", []any{"x", "y"}, "[1:2]", "{x,y}"},
 		{"a_uuid1", "UUID[]", []any{"00000000-0000-0000-0000-000000000001", "00000000-0000-0000-0000-000000000002"}, "[1:2]", "{00000000-0000-0000-0000-000000000001,00000000-0000-0000-0000-000000000002}"},
 		{"a_uuid2", "UUID[]", []any{[]any{"00000000-0000-0000-0000-000000000001", "00000000-0000-0000-0000-000000000002"}, []any{"00000000-0000-0000-0000-000000000003", "00000000-0000-0000-0000-000000000004"}}, "[1:2][1:2]", "{{00000000-0000-0000-0000-000000000001,00000000-0000-0000-0000-000000000002},{00000000-0000-0000-0000-000000000003,00000000-0000-0000-0000-000000000004}}"},
+		{"a_uuidn", "UUID[]", []any{"00000000-0000-0000-0000-000000000001", nil, "00000000-0000-0000-0000-000000000003"}, "[1:3]", "{00000000-0000-0000-0000-000000000001,NULL,00000000-0000-0000-0000-000000000003}"},
 		{"a_inet1", "INET[]", []any{"10.0.0.1", "10.0.0.2"}, "[1:2]", "{10.0.0.1,10.0.0.2}"},
 		{"a_inet2", "INET[]", []any{[]any{"10.0.0.1", "10.0.0.2"}, []any{"10.0.0.3", "10.0.0.4"}}, "[1:2][1:2]", "{{10.0.0.1,10.0.0.2},{10.0.0.3,10.0.0.4}}"},
+		{"a_inetn", "INET[]", []any{"10.0.0.1", nil, "10.0.0.3"}, "[1:3]", "{10.0.0.1,NULL,10.0.0.3}"},
 		{"a_cidr1", "CIDR[]", []any{"10.0.0.0/24", "10.1.0.0/24"}, "[1:2]", "{10.0.0.0/24,10.1.0.0/24}"},
 		{"a_cidr2", "CIDR[]", []any{[]any{"10.0.0.0/24", "10.1.0.0/24"}, []any{"10.2.0.0/24", "10.3.0.0/24"}}, "[1:2][1:2]", "{{10.0.0.0/24,10.1.0.0/24},{10.2.0.0/24,10.3.0.0/24}}"},
+		{"a_cidrn", "CIDR[]", []any{"10.0.0.0/24", nil, "10.2.0.0/24"}, "[1:3]", "{10.0.0.0/24,NULL,10.2.0.0/24}"},
 		{"a_mac1", "MACADDR[]", []any{"08:00:2b:01:02:03", "08:00:2b:01:02:04"}, "[1:2]", "{08:00:2b:01:02:03,08:00:2b:01:02:04}"},
 		{"a_dec1", "NUMERIC(20,4)[]", []any{"1.2500", "2.5000"}, "[1:2]", "{1.2500,2.5000}"},
 		{"a_dec2", "NUMERIC(20,4)[]", []any{[]any{"1.2500", "2.5000"}, []any{"3.7500", "4.0000"}}, "[1:2][1:2]", "{{1.2500,2.5000},{3.7500,4.0000}}"},
+		// numeric NULL-element (1-D + 2-D): numeric was the literal Bug-74
+		// silent-flatten victim, and the NULL-element shape is the one the
+		// matrix otherwise omits — highest-value pin. A per-OID array-codec
+		// regression on numeric would surface here as a wrong array_dims.
+		{"a_decn", "NUMERIC(20,4)[]", []any{"1.2500", nil, "3.7500"}, "[1:3]", "{1.2500,NULL,3.7500}"},
+		{"a_decnn", "NUMERIC(20,4)[]", []any{[]any{"1.2500", nil}, []any{nil, "4.0000"}}, "[1:2][1:2]", "{{1.2500,NULL},{NULL,4.0000}}"},
 
 		// --- temporal element families ---
 		{"a_date1", "DATE[]", []any{mustDate("2024-01-02"), mustDate("2024-03-04")}, "[1:2]", "{2024-01-02,2024-03-04}"},
 		{"a_date2", "DATE[]", []any{[]any{mustDate("2024-01-02"), mustDate("2024-03-04")}, []any{mustDate("2025-05-06"), mustDate("2025-07-08")}}, "[1:2][1:2]", "{{2024-01-02,2024-03-04},{2025-05-06,2025-07-08}}"},
+		{"a_daten", "DATE[]", []any{mustDate("2024-01-02"), nil, mustDate("2024-03-04")}, "[1:3]", "{2024-01-02,NULL,2024-03-04}"},
 		{"a_ts1", "TIMESTAMP[]", []any{mustTS("2024-01-02 03:04:05"), mustTS("2024-06-07 08:09:10")}, "[1:2]", `{"2024-01-02 03:04:05","2024-06-07 08:09:10"}`},
 		{"a_ts2", "TIMESTAMP[]", []any{[]any{mustTS("2024-01-02 03:04:05"), mustTS("2024-06-07 08:09:10")}, []any{mustTS("2025-01-02 03:04:05"), mustTS("2025-06-07 08:09:10")}}, "[1:2][1:2]", `{{"2024-01-02 03:04:05","2024-06-07 08:09:10"},{"2025-01-02 03:04:05","2025-06-07 08:09:10"}}`},
+		{"a_tsn", "TIMESTAMP[]", []any{mustTS("2024-01-02 03:04:05"), nil, mustTS("2024-06-07 08:09:10")}, "[1:3]", `{"2024-01-02 03:04:05",NULL,"2024-06-07 08:09:10"}`},
 		{"a_tstz1", "TIMESTAMPTZ[]", []any{time.Date(2024, 1, 2, 3, 4, 5, 0, tz)}, "[1:1]", `{"2024-01-01 21:34:05+00"}`},
+		// TIME (without time zone) array — the whole `time` element family was
+		// absent from the matrix; convertArray emits the time-of-day from the
+		// IR canonical string. (1-D, 2-D, NULL-element.) The tz-aware sibling
+		// `timetz[]` is loud-refused, pinned separately below.
+		{"a_time1", "TIME[]", []any{"01:02:03", "04:05:06"}, "[1:2]", "{01:02:03,04:05:06}"},
+		{"a_time2", "TIME[]", []any{[]any{"01:02:03", "04:05:06"}, []any{"07:08:09", "10:11:12"}}, "[1:2][1:2]", "{{01:02:03,04:05:06},{07:08:09,10:11:12}}"},
+		{"a_timen", "TIME[]", []any{"01:02:03", nil, "07:08:09"}, "[1:3]", "{01:02:03,NULL,07:08:09}"},
 	}
 
 	// Build + apply the seed DDL (one wide table holding every column).
@@ -184,6 +207,138 @@ func mustTS(s string) time.Time {
 		panic(err)
 	}
 	return t
+}
+
+// TestPipelined_TimetzArray_LoudRefusal pins that the loud refusal for a
+// `timetz[]` (TIME WITH TIME ZONE array) column — which has no faithful
+// binary array leaf, see convertArray / row_writer.go — fires THROUGH the
+// pipelined dispatch (it builds the SQL via the same prepareValue codec
+// path, so the refusal must surface as an ApplyBatch error, never a silent
+// pass / corrupt write). This is the loud-failure tenet under pipelining:
+// a refused row beats a silently flattened one.
+func TestPipelined_TimetzArray_LoudRefusal(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+
+	applyPGApplier(t, dsn, `CREATE TABLE tz (id BIGINT PRIMARY KEY, ts TIMETZ[]);`)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	applier := openPipelinedApplier(t, ctx, dsn)
+	defer func() { _ = applier.Close() }()
+	if err := applier.EnsureControlTable(ctx); err != nil {
+		t.Fatalf("EnsureControlTable: %v", err)
+	}
+
+	bad := []ir.Change{
+		ir.Insert{Position: pos2("tz1"), Schema: "public", Table: "tz", Row: ir.Row{"id": int64(1), "ts": []any{"01:02:03+05"}}},
+	}
+	ch := make(chan ir.Change, len(bad))
+	for _, e := range bad {
+		ch <- e
+	}
+	close(ch)
+	err := applier.ApplyBatch(ctx, testStreamID, ch, 100)
+	if err == nil {
+		t.Fatal("ApplyBatch: expected a loud refusal for the timetz[] column through the pipelined path; got nil (silent pass = corruption)")
+	}
+	if !strings.Contains(err.Error(), "timetz") {
+		t.Errorf("ApplyBatch error %q should name timetz (loud, row-attributable refusal)", err)
+	}
+
+	// And nothing landed — the refused batch rolled back / never wrote.
+	if got := countAllRows(t, dsn, "tz"); got != 0 {
+		t.Errorf("after refused timetz[] batch: rows = %d; want 0", got)
+	}
+}
+
+// scalarCol is one (column, PG type, IR value, expected ::text) entry in
+// the pipelined scalar-rich-families matrix. The whole array matrix is, by
+// construction, arrays; this exercises the SCALAR leaf codecs through the
+// pipelined batch (float specials, bytea with NUL, JSON/JSONB, non-UTC
+// timestamptz, wide NUMERIC, TIME, bit/varbit) so a DescribeExec binary
+// re-encode that diverged from the serial path on a scalar OID is caught.
+type scalarCol struct {
+	name    string
+	pgType  string
+	value   any
+	wantTxt string // expected col::text on the real target
+}
+
+// TestPipelined_ScalarRichFamilies pins the scalar leaf codecs through the
+// pipelined (DescribeExec) batch. src==dst ground-truthed via col::text on
+// the real target. Float specials, a bytea carrying an embedded NUL, JSON
+// and JSONB, a non-UTC-source timestamptz, a wide NUMERIC, a TIME scalar,
+// and bit/varbit — the families the all-arrays matrix never touched.
+func TestPipelined_ScalarRichFamilies(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+
+	tz := time.FixedZone("UTC+5:30", int((5*time.Hour+30*time.Minute)/time.Second))
+
+	cols := []scalarCol{
+		// float specials: NaN / +Inf / -Inf / -0 must round-trip exactly.
+		{"f_nan", "DOUBLE PRECISION", math.NaN(), "NaN"},
+		{"f_pinf", "DOUBLE PRECISION", math.Inf(1), "Infinity"},
+		{"f_ninf", "DOUBLE PRECISION", math.Inf(-1), "-Infinity"},
+		{"f_nzero", "DOUBLE PRECISION", math.Copysign(0, -1), "-0"},
+		// bytea with an embedded NUL byte (bytea holds arbitrary bytes; the
+		// text-type NUL refusal does NOT apply here).
+		{"b_nul", "BYTEA", []byte{0x00, 0x01, 0x00, 0xff}, `\x000100ff`},
+		// JSON / JSONB carried as the canonical text the readers emit.
+		{"j_json", "JSON", `{"a": 1, "b": [2, 3]}`, `{"a": 1, "b": [2, 3]}`},
+		{"j_jsonb", "JSONB", `{"b":[2,3],"a":1}`, `{"a": 1, "b": [2, 3]}`}, // jsonb re-canonicalizes key order/space
+		// timestamptz from a non-UTC source zone → stored as the UTC instant.
+		{"t_tstz", "TIMESTAMPTZ", time.Date(2024, 1, 2, 3, 4, 5, 0, tz), "2024-01-01 21:34:05+00"},
+		// wide NUMERIC scalar (canonical numeric string).
+		{"n_wide", "NUMERIC(40,10)", "123456789012345678.1234567890", "123456789012345678.1234567890"},
+		// TIME (without tz) scalar — IR canonical "HH:MM:SS" string.
+		{"tm_time", "TIME", "13:14:15", "13:14:15"},
+		// bit / varbit — IR canonical bit-string ('0'/'1') form.
+		{"bt_fixed", "BIT(8)", "10110001", "10110001"},
+		{"bt_var", "BIT VARYING(16)", "1011", "1011"},
+	}
+
+	var ddl string
+	ddl = "CREATE TABLE s (id BIGINT PRIMARY KEY"
+	for _, c := range cols {
+		ddl += fmt.Sprintf(", %s %s", c.name, c.pgType)
+	}
+	ddl += ");"
+	applyPGApplier(t, dsn, ddl)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	applier := openPipelinedApplier(t, ctx, dsn)
+	defer func() { _ = applier.Close() }()
+
+	row := ir.Row{"id": int64(1)}
+	for _, c := range cols {
+		row[c.name] = c.value
+	}
+	events := []ir.Change{
+		ir.Insert{Position: ir.Position{Engine: engineNamePostgres, Token: "s1"}, Schema: "public", Table: "s", Row: row},
+	}
+	pumpBatchedChanges(t, ctx, applier, events, 100)
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open verify db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	for _, c := range cols {
+		var text string
+		q := fmt.Sprintf("SELECT %s::text FROM s WHERE id = 1", c.name)
+		if err := db.QueryRowContext(ctx, q).Scan(&text); err != nil {
+			t.Fatalf("verify %s: %v", c.name, err)
+		}
+		if text != c.wantTxt {
+			t.Errorf("%s ::text = %q; want %q (scalar codec diverged under pipelined DescribeExec?)", c.name, text, c.wantTxt)
+		}
+	}
 }
 
 // TestPipelined_EquivalenceWithSerial drives one mixed change stream
@@ -341,13 +496,14 @@ func TestPipelined_AtomicityMidBatchError(t *testing.T) {
 }
 
 // TestPipelined_GAP3_AlterTypeWiden pins the ADR-0091 GAP #3 interaction
-// (ADR-0092 §"Critical sharp edge"): a forwarded ALTER TYPE int4→bigint,
-// then an INSERT carrying a value out of the OLD int4 range, must apply
-// through the pipelined batch. The Exec-mode pool re-describes every
-// statement within the SendBatch flush, so the widened column's parameter
-// OID is taken from the live catalog — never bound against a stale cached
-// int4 OID. Pre-fix (or under the default CacheStatement mode) this would
-// fail to encode the out-of-old-range value.
+// (ADR-0092 §"GAP #3 is subsumed by the live re-describe"): a forwarded
+// ALTER TYPE int4→bigint, then an INSERT carrying a value out of the OLD
+// int4 range, must apply through the pipelined batch. The DescribeExec pool
+// re-describes every distinct statement fresh within the SendBatch flush
+// (caching nothing), so the widened column's parameter OID is taken from the
+// live catalog — never bound against a stale cached int4 OID. Pre-fix (or
+// under the default CacheStatement mode) this would fail to encode the
+// out-of-old-range value.
 //
 // The forwarded boundary is delivered as a SchemaSnapshot (which the
 // applier persists + uses to invalidate its per-table caches), then the

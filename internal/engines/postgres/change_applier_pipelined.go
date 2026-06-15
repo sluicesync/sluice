@@ -22,19 +22,28 @@ package postgres
 // The load-bearing correctness invariant: pipelining changes WHEN
 // statements are sent, never HOW a value is encoded. Every queued
 // statement is built by the SAME build{Insert,Update,Delete}SQL builders
-// and prepareApplierValue codec path the serial exec path uses, so
-// per-statement parameter binding and per-OID codec fidelity are
-// byte-identical to today. The differential/value-fidelity pins
-// (change_applier_pipelined_integration_test.go) are the oracle.
+// and prepareApplierValue codec path the serial exec path uses; and the
+// pipelined pool runs in pgx's QueryExecModeDescribeExec (see
+// [openPgxDBDescribeExec]), under which SendBatch describes each DISTINCT
+// queued statement FRESH via an unnamed prepare (pgx passes a nil
+// statement-description cache → no client cache, never a stale OID), then
+// binds + executes every statement with the real described parameter OID in
+// BINARY — byte-IDENTICAL value encoding to the serial CacheStatement path
+// the applier's primary pool uses. (An Exec-mode pool would instead send
+// OID-0 TEXT, a *different* wire encoding; DescribeExec is what makes the
+// "only WHEN, never HOW" claim literally true and inherits the serial
+// path's already-trusted per-OID binary codecs.) The
+// differential/value-fidelity pins (change_applier_pipelined_integration_test.go)
+// are the oracle.
 //
-// GAP #3 (ADR-0091) interaction: the pipelined pool runs in pgx's
-// QueryExecModeExec (see [openPgxDBExecMode]), so SendBatch describes
-// every queued statement fresh against the live catalog within the single
-// flush. A column widened by a forwarded ALTER TYPE (int4→bigint) is
-// re-described, never bound against a stale cached pre-DDL OID — which
-// subsumes the schemaDirtyTables special-casing the serial path needs (no
-// QueryExecModeExec arg-prepend is queued; pgx.Batch does not honour a
-// per-query exec mode, the connection's default governs the whole flush).
+// GAP #3 (ADR-0091) interaction: because DescribeExec re-describes every
+// distinct statement fresh against the live catalog within the single flush
+// (and caches nothing), a column widened by a forwarded ALTER TYPE
+// (int4→bigint) is bound against the live post-DDL OID, never a stale
+// cached pre-DDL OID — which subsumes the schemaDirtyTables special-casing
+// the serial path needs (no QueryExecModeExec arg-prepend is queued;
+// pgx.Batch does not honour a per-query exec mode, the connection's default
+// DescribeExec governs the whole flush).
 //
 // Conn lifecycle: BeginTx checks out one *sql.Conn from the dedicated
 // pipelined pool and escapes it to the underlying *pgx.Conn exactly as the
@@ -96,7 +105,7 @@ type pgxBatchTx struct {
 }
 
 // beginPipelinedTx opens a pipelined batch transaction: checks out a
-// backend from the Exec-mode pool, escapes it to *pgx.Conn, begins a
+// backend from the DescribeExec-mode pool, escapes it to *pgx.Conn, begins a
 // pgx.Tx, and pins synchronous_commit = on (the ADR-0007 F7 durability
 // pin, preserved). On a usable handle it returns a *pgxBatchTx; on an
 // escape failure it returns (nil, errPipelineUnavailable) so the caller
@@ -165,9 +174,9 @@ func (a *ChangeApplier) beginPipelinedTx(ctx context.Context) (*pgxBatchTx, erro
 // falls back to the serial *sql.Tx path with a one-time WARN.
 var errPipelineUnavailable = errors.New("postgres: applier: pipelined apply unavailable (conn is not pgx)")
 
-// pipelinePool returns the lazily-opened ADR-0092 pipelined pool (Exec
-// mode). nil pipelineCfg (direct-API / unit constructions) yields
-// errPipelineUnavailable so the batch path falls back to serial exec.
+// pipelinePool returns the lazily-opened ADR-0092 pipelined pool
+// (DescribeExec mode). nil pipelineCfg (direct-API / unit constructions)
+// yields errPipelineUnavailable so the batch path falls back to serial exec.
 func (a *ChangeApplier) pipelinePool() (*sql.DB, error) {
 	if a.pipelineDB != nil {
 		return a.pipelineDB, nil
@@ -175,7 +184,7 @@ func (a *ChangeApplier) pipelinePool() (*sql.DB, error) {
 	if a.pipelineCfg == nil {
 		return nil, errPipelineUnavailable
 	}
-	db, err := openPgxDBExecMode(a.pipelineCfg.dsn, roleApplier, a.pipelineCfg.appID)
+	db, err := openPgxDBDescribeExec(a.pipelineCfg.dsn, roleApplier, a.pipelineCfg.appID)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: applier: open pipelined pool: %w", err)
 	}
@@ -224,8 +233,9 @@ func (b *pgxBatchTx) queue(stmt string, args []any, ctxStmt queuedStmt) {
 // prepareApplierValue path, same unknown-table skip — but Queue replaces
 // txExec. The schemaDirtyTables / execDMLArgs QueryExecMode prepend the
 // serial path uses is intentionally NOT applied here: the pipelined pool
-// already runs in QueryExecModeExec, so SendBatch describes every queued
-// statement fresh and GAP #3 is subsumed (see file header).
+// already runs in QueryExecModeDescribeExec, so SendBatch re-describes every
+// distinct statement fresh (binary, live-OID) and GAP #3 is subsumed (see
+// file header).
 func (a *ChangeApplier) dispatchPipelined(ctx context.Context, b *pgxBatchTx, streamID string, c ir.Change) error {
 	switch v := c.(type) {
 	case ir.Insert:
