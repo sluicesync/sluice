@@ -480,7 +480,10 @@ func (e Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeApp
 		return nil, err
 	}
 	return &ChangeApplier{
-		db:               db,
+		db: db,
+		// pipelineCfg carries the parsed DSN so the ADR-0092 pipelined
+		// pool can be opened lazily on the first batch (Exec-mode default).
+		pipelineCfg:      cfg,
 		schema:           cfg.schema,
 		controlSchema:    cfg.schema,
 		pkCache:          make(map[string][]string),

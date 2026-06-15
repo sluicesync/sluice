@@ -118,24 +118,32 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 		ByteCap:           byteCap,
 		BatchSizeProvider: a.batchSizeProvider,
 		BatchObserver:     a.batchObserver,
-		BeginTx: func(ctx context.Context) (*sql.Tx, error) {
+		// MySQL stays on the serial *sql.Tx exec path — pipelining the
+		// mysql driver is out of scope (ADR-0092). The closures
+		// type-assert the *sql.Tx that BeginTx returns; the assertion
+		// is total because this engine never returns any other BatchTx.
+		BeginTx: func(ctx context.Context) (appliershared.BatchTx, error) {
 			tx, err := a.db.BeginTx(ctx, nil)
 			if err != nil {
 				return nil, fmt.Errorf("mysql: applier: begin tx: %w", err)
 			}
 			return tx, nil
 		},
-		Dispatch:   a.dispatch,
+		Dispatch: func(ctx context.Context, tx appliershared.BatchTx, streamID string, c ir.Change) error {
+			return a.dispatch(ctx, tx.(*sql.Tx), streamID, c)
+		},
 		ApplyOne:   a.applyOne,
 		Redact:     a.redactChange,
 		StampShard: a.stampShardChange,
 		Classify:   classifyApplierError,
-		WritePosition: func(ctx context.Context, tx *sql.Tx, streamID, token string) error {
+		WritePosition: func(ctx context.Context, tx appliershared.BatchTx, streamID, token string) error {
 			posCtx, posCancel := a.execTimeoutCtx(ctx)
 			defer posCancel()
-			return writePositionTx(posCtx, tx, streamID, token, a.slotName, a.sourceFingerprint, a.targetSchema)
+			return writePositionTx(posCtx, tx.(*sql.Tx), streamID, token, a.slotName, a.sourceFingerprint, a.targetSchema)
 		},
-		Commit: a.commitWithTimeout,
+		Commit: func(tx appliershared.BatchTx) error {
+			return a.commitWithTimeout(tx.(*sql.Tx))
+		},
 		// AfterCommit and CacheSchemaSnapshot stay nil: MySQL has no
 		// slot-ack tracker, and SchemaSnapshots route through applyOne
 		// (TransactionalDDL=false), which owns the ADR-0049

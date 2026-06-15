@@ -418,12 +418,26 @@ func listStreams(ctx context.Context, db *sql.DB, schema, engineName string) ([]
 // without --target-schema / chain-handoff WritePosition without
 // streamer context).
 func writePositionTx(ctx context.Context, tx *sql.Tx, schema, streamID, token, slotName, sourceFingerprint, targetSchema string) error {
+	q, args := buildWritePositionSQL(schema, streamID, token, slotName, sourceFingerprint, targetSchema)
+	if _, err := tx.ExecContext(ctx, q, args...); err != nil {
+		return fmt.Errorf("postgres: write position: %w", err)
+	}
+	return nil
+}
+
+// buildWritePositionSQL returns the position-upsert (sql, args) shared by
+// both the serial exec path ([writePositionTx]) and the ADR-0092
+// pipelined queue path ([ChangeApplier.writePositionPipelined]). Factoring
+// the build out keeps the ADR-0007/ADR-0010 row shape + COALESCE
+// preservation semantics single-sourced — the two callers cannot drift.
+//
+// COALESCE on the conflict path lets a non-empty slotName /
+// sourceFingerprint / targetSchema overwrite, while an empty value falls
+// back to whichever value the existing row already carries — so a
+// chain-handoff position-write that lacks streamer context doesn't clobber
+// the streamer's previously-recorded values.
+func buildWritePositionSQL(schema, streamID, token, slotName, sourceFingerprint, targetSchema string) (stmt string, args []any) {
 	tableRef := controlTableRef(schema)
-	// COALESCE on the conflict path lets a non-empty slotName /
-	// sourceFingerprint / targetSchema overwrite, while an empty value
-	// falls back to whichever value the existing row already carries —
-	// so a chain-handoff position-write that lacks streamer context
-	// doesn't clobber the streamer's previously-recorded values.
 	q := "INSERT INTO " + tableRef + " (stream_id, source_position, updated_at, slot_name, source_dsn_fingerprint, target_schema) " +
 		"VALUES ($1, $2, CURRENT_TIMESTAMP, NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, '')) " +
 		"ON CONFLICT (stream_id) DO UPDATE SET " +
@@ -432,10 +446,7 @@ func writePositionTx(ctx context.Context, tx *sql.Tx, schema, streamID, token, s
 		"slot_name = COALESCE(EXCLUDED.slot_name, " + tableRef + ".slot_name), " +
 		"source_dsn_fingerprint = COALESCE(EXCLUDED.source_dsn_fingerprint, " + tableRef + ".source_dsn_fingerprint), " +
 		"target_schema = COALESCE(EXCLUDED.target_schema, " + tableRef + ".target_schema)"
-	if _, err := tx.ExecContext(ctx, q, streamID, token, slotName, sourceFingerprint, targetSchema); err != nil {
-		return fmt.Errorf("postgres: write position: %w", err)
-	}
-	return nil
+	return q, []any{streamID, token, slotName, sourceFingerprint, targetSchema}
 }
 
 // readStopRequested returns true when the named stream's row has a

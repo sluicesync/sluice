@@ -142,6 +142,27 @@ func openPgxDBAs(dsn string, role connRole, appID string) (*sql.DB, error) {
 	return stdlib.OpenDB(*connConfig), nil
 }
 
+// openPgxDBExecMode opens a lazy *sql.DB whose backends default to pgx's
+// [pgx.QueryExecModeExec] (unnamed-statement, describe-each) instead of
+// the usual prepared-statement cache. The CDC pipelined-apply path
+// (ADR-0092) uses this pool so every statement queued onto a pgx.Batch
+// is described against the LIVE catalog within the single SendBatch
+// flush — which subsumes the ADR-0091 GAP #3 stale-OID hazard (a widened
+// column is re-described, never bound against a cached pre-DDL OID)
+// without per-statement special-casing, while keeping the whole batch one
+// round trip. Same role/label/keep-alive shape as [openPgxDBAs]; only the
+// exec mode differs, and only for this dedicated pool — the applier's
+// primary pool (per-change Apply path) keeps the cached fast path.
+func openPgxDBExecMode(dsn string, role connRole, appID string) (*sql.DB, error) {
+	connConfig, err := pgx.ParseConfig(withApplicationName(dsn, role, appID))
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse dsn: %w", err)
+	}
+	connConfig.DialFunc = netkeepalive.Dialer().DialContext
+	connConfig.DefaultQueryExecMode = pgx.QueryExecModeExec
+	return stdlib.OpenDB(*connConfig), nil
+}
+
 // openDB opens a *sql.DB against the Postgres server and pings to
 // confirm the connection is usable. The connection is labelled with the
 // [roleControl] application_name; callers that know their subsystem use

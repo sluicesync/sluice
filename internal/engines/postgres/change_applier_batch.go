@@ -124,22 +124,30 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 		ByteCap:           byteCap,
 		BatchSizeProvider: a.batchSizeProvider,
 		BatchObserver:     a.batchObserver,
-		BeginTx: func(ctx context.Context) (*sql.Tx, error) {
-			tx, err := a.db.BeginTx(ctx, nil)
-			if err != nil {
-				return nil, fmt.Errorf("postgres: applier: begin tx: %w", err)
+		// BeginTx returns the ADR-0092 pipelined handle (*pgxBatchTx) for
+		// the batch path; if the raw-conn escape is unavailable it falls
+		// back to the serial *sql.Tx path with a one-time WARN — loud,
+		// never silent, no throughput claim. The Dispatch / WritePosition
+		// / Commit closures below type-switch on which handle came back.
+		BeginTx: func(ctx context.Context) (appliershared.BatchTx, error) {
+			b, err := a.beginPipelinedTx(ctx)
+			if err == nil {
+				return b, nil
 			}
-			// F7: pin synchronous_commit on for the duration of this tx
-			// so a role/db-level default of `off` can't silently break
-			// ADR-0007's "position + data lands durably together"
-			// contract.
-			if err := a.forceSynchronousCommitOn(ctx, tx); err != nil {
-				_ = tx.Rollback()
+			if !errors.Is(err, errPipelineUnavailable) {
+				// A genuine failure (pool acquire / begin / SET) — surface
+				// it classified, exactly as the serial BeginTx would.
 				return nil, classifyApplierError(err)
 			}
-			return tx, nil
+			a.warnPipelineFallbackOnce(ctx, err)
+			return a.beginSerialBatchTx(ctx)
 		},
-		Dispatch: a.dispatch,
+		Dispatch: func(ctx context.Context, tx appliershared.BatchTx, streamID string, c ir.Change) error {
+			if b, ok := tx.(*pgxBatchTx); ok {
+				return a.dispatchPipelined(ctx, b, streamID, c)
+			}
+			return a.dispatch(ctx, tx.(*sql.Tx), streamID, c)
+		},
 		// ApplyOne is unreachable while TransactionalDDL is true (PG
 		// schema events ride the batch tx); filled so the seam stays
 		// total.
@@ -147,12 +155,23 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 		Redact:     a.redactChange,
 		StampShard: a.stampShardChange,
 		Classify:   classifyApplierError,
-		WritePosition: func(ctx context.Context, tx *sql.Tx, streamID, token string) error {
+		WritePosition: func(ctx context.Context, tx appliershared.BatchTx, streamID, token string) error {
+			if b, ok := tx.(*pgxBatchTx); ok {
+				// Queue the position upsert onto the batch; it flushes with
+				// the data in Commit's single SendBatch (ADR-0092).
+				a.writePositionPipelined(b, streamID, token)
+				return nil
+			}
 			posCtx, posCancel := a.execTimeoutCtx(ctx)
 			defer posCancel()
-			return writePositionTx(posCtx, tx, a.controlSchema, streamID, token, a.slotName, a.sourceFingerprint, a.targetSchema)
+			return writePositionTx(posCtx, tx.(*sql.Tx), a.controlSchema, streamID, token, a.slotName, a.sourceFingerprint, a.targetSchema)
 		},
-		Commit: a.commitWithTimeout,
+		Commit: func(tx appliershared.BatchTx) error {
+			if b, ok := tx.(*pgxBatchTx); ok {
+				return a.flushAndCommit(b)
+			}
+			return a.commitWithTimeout(tx.(*sql.Tx))
+		},
 		// AfterCommit reports the just-committed LSN to the slot-ack
 		// feedback tracker (Bug 15, ADR-0020). It runs AFTER tx.Commit
 		// succeeds, so a crash between the data commit and the report
@@ -165,6 +184,26 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 		CacheSchemaSnapshot: a.cacheActiveSchemaAfterCommit,
 		IsKeylessTable:      a.isKeylessInsert,
 	}
+}
+
+// beginSerialBatchTx opens the legacy serial *sql.Tx batch transaction —
+// the ADR-0092 fall-back when the pipelined raw-conn escape is
+// unavailable. Byte-identical to the pre-ADR-0092 PG BeginTx (a tx on the
+// primary pool with the F7 synchronous_commit pin); returned as the
+// [appliershared.BatchTx] the seam now requires.
+func (a *ChangeApplier) beginSerialBatchTx(ctx context.Context) (appliershared.BatchTx, error) {
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: applier: begin tx: %w", err)
+	}
+	// F7: pin synchronous_commit on for the duration of this tx so a
+	// role/db-level default of `off` can't silently break ADR-0007's
+	// "position + data lands durably together" contract.
+	if err := a.forceSynchronousCommitOn(ctx, tx); err != nil {
+		_ = tx.Rollback()
+		return nil, classifyApplierError(err)
+	}
+	return tx, nil
 }
 
 // isKeylessInsert is the ADR-0089 keyless-guard predicate the shared
