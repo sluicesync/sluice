@@ -4,6 +4,25 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [0.99.47] - 2026-06-15
+
+### Fixed
+- **Connection-budget preflight no longer false-refuses on tight managed
+  Postgres (PG 18 / pooled targets).** The target connection-budget
+  preflight computed `in_use` with an unfiltered
+  `SELECT count(*) FROM pg_stat_activity`, which also counts PostgreSQL's
+  background processes — checkpointer, background/wal writer, autovacuum
+  launcher, archiver, logical-replication launcher, and (PG 18+) the async
+  I/O workers. None of those consume a `max_connections` slot, so `in_use`
+  was over-reported by the background-process count (≈9 on a PG-18 managed
+  instance). On a tight target — e.g. a managed Postgres with
+  `max_connections=25` and ~9 background processes — this produced a false
+  `target connection budget exhausted` that blocked **cold start entirely**,
+  even though only ~4 real client backends were in use. The probe now counts
+  `WHERE backend_type = 'client backend'` (PG 10+; sluice's pgoutput CDC
+  already requires PG 10+). The sibling role/database probes already filtered
+  correctly; only the global count was affected.
+
 ## [0.99.46] - 2026-06-15
 
 ### Added
