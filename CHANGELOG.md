@@ -4,6 +4,28 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [0.99.50] - 2026-06-15
+
+### Fixed
+- **Postgres array columns now sync over CDC (Bug 144).** A Postgres source
+  table with any array column (`int4[]`, `text[]`, `numeric[]`, `timestamptz[]`,
+  …) wedged the continuous-sync stream on the first INSERT/UPDATE/DELETE to that
+  table with `unsupported column type OID 1007/1009/1231…`: the pgoutput CDC
+  reader's type resolver (`oidToType`) had no array-OID cases, even though the
+  initial bulk-copy (cold-start) handled arrays fine. Array columns are now
+  resolved to the IR array type by mapping each array OID to its element OID and
+  recursing — so an array element decodes identically to the same scalar column
+  — and the array-value decoder now also accepts the `[]byte` text form that the
+  pgoutput wire delivers (it previously only handled the cold-start `[]any` /
+  `string` shapes, which silently mis-walked the text bytes). Multi-dimensional
+  arrays are preserved (not flattened), NULL elements survive as NULLs, and
+  `numeric[]` keeps full scale. This was a loud failure (the stream stopped with
+  a clear error), never silent data loss. The decode↔write asymmetry is
+  unchanged: `timetz[]`, `bytea[]`, and `json[]`/`jsonb[]` arrays still refuse
+  loudly at apply (no silent acceptance). Same dual-registry-drift class as the
+  earlier Bug 97/118 fix; a parity guard now pins the CDC array registry to the
+  schema reader's so they can't drift again.
+
 ## [0.99.49] - 2026-06-15
 
 ### Changed
