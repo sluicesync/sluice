@@ -470,6 +470,14 @@ func oidToType(oid uint32, typmod int32) (ir.Type, error) {
 	// supported at schema-read but missing here crashes the stream on the first
 	// array DML); TestOIDToType_ArrayParity pins that.
 	if elemOID, ok := pgArrayElementOID[oid]; ok {
+		// Element resolved with typmod -1: pgoutput's RelationMessage carries
+		// the array column's own typmod, not the element's, so element
+		// length/precision (varchar(n)[], numeric(p,s)[], timestamp(p)[]) is
+		// intentionally defaulted here. This does NOT affect VALUE fidelity —
+		// the writer binds the element's text/numeric verbatim and the target
+		// table already carries the precise type from cold-start; only the
+		// in-memory ir.Array.Element metadata is coarser than the cold-start
+		// path's.
 		elem, err := oidToType(elemOID, -1)
 		if err != nil {
 			return nil, fmt.Errorf("postgres: cdc: array OID %d element OID %d: %w", oid, elemOID, err)
@@ -484,7 +492,9 @@ func oidToType(oid uint32, typmod int32) (ir.Type, error) {
 
 // macaddr8ArrayOID is PG's `_macaddr8` array type OID. pgx's pgtype exposes
 // Macaddr8OID (774, the scalar) but not the array constant; 775 is the stable
-// pg_catalog OID for its array (array OIDs sit directly above their element).
+// pg_catalog OID for `_macaddr8` specifically. (Array OIDs are NOT generally
+// element+1 — e.g. macaddr is 829 but _macaddr is 1040 — so this literal is
+// the verified catalog value for this one type, not a derived offset.)
 const macaddr8ArrayOID = 775
 
 // pgArrayElementOID maps a Postgres built-in array type OID to its element type

@@ -19,6 +19,7 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -82,7 +83,8 @@ func TestCDCReader_Arrays_Bug144(t *testing.T) {
 	const dml = `
 		INSERT INTO arr (id,i4,f8,bl,txt,num,uu,ip,tstz,dt) VALUES
 			(1,
-			 '{1,2,3}', '{1.5,2.5}', '{t,f}', '{a,b}', '{1.50,2.25}',
+			 '{1,2,3}', '{1.5,2.5}', '{t,f}',
+			 '{"a, b","he said \"hi\"","brace}{","back\\slash"}', '{1.50,2.25}',
 			 '{11111111-1111-1111-1111-111111111111}', '{10.0.0.1}',
 			 '{2026-01-01 00:00:00+00}', '{2026-01-02}');
 		INSERT INTO arr (id,i4,f8,bl,txt,num,uu,ip,tstz,dt) VALUES
@@ -128,11 +130,18 @@ func TestCDCReader_Arrays_Bug144(t *testing.T) {
 	for _, col := range []struct {
 		name string
 		n    int
-	}{{"i4", 3}, {"f8", 2}, {"bl", 2}, {"txt", 2}, {"num", 2}, {"uu", 1}, {"ip", 1}, {"tstz", 1}, {"dt", 1}} {
+	}{{"i4", 3}, {"f8", 2}, {"bl", 2}, {"txt", 4}, {"num", 2}, {"uu", 1}, {"ip", 1}, {"tstz", 1}, {"dt", 1}} {
 		s := asAnySlice(t, "row1."+col.name, r1[col.name])
 		if len(s) != col.n {
 			t.Errorf("row1.%s: len=%d; want %d (%#v)", col.name, len(s), col.n, s)
 		}
+	}
+	// Text-element escaping over the real pgoutput wire: comma, escaped quote,
+	// braces, and backslash must decode to the literal element values (the
+	// quoted/escaped array text form, not the trivial {a,b} bareword form).
+	wantTxt := []any{"a, b", `he said "hi"`, "brace}{", `back\slash`}
+	if !reflect.DeepEqual(r1["txt"], wantTxt) {
+		t.Errorf("row1.txt = %#v; want %#v (text-element escaping over the wire)", r1["txt"], wantTxt)
 	}
 	// numeric value fidelity (Bug-74 victim family), rendered to text — the
 	// scale-preserving "1.50" (not "1.5") confirms the element decoded through
