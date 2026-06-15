@@ -53,6 +53,27 @@ func TestProbeConnectionBudget_SaneNumbers(t *testing.T) {
 	if p.currentTotal < 1 {
 		t.Errorf("pg_stat_activity count = %d, want >= 1 (our own connection)", p.currentTotal)
 	}
+	// Regression pin: currentTotal must count ONLY client backends, not
+	// the server's background processes (checkpointer, wal/bg writer,
+	// autovacuum launcher, archiver, logical-replication launcher, PG18+
+	// io workers). Those don't consume a max_connections slot; counting
+	// them inflated in_use and produced a FALSE budget-exhausted refusal
+	// on tight managed PG (max_connections=25 + ~9 bg procs). Assert the
+	// probe equals the client-backend count AND that background processes
+	// exist (so the filter is load-bearing, not a no-op).
+	var total, clients int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM pg_stat_activity`).Scan(&total); err != nil {
+		t.Fatalf("total pg_stat_activity count: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend'`).Scan(&clients); err != nil {
+		t.Fatalf("client-backend count: %v", err)
+	}
+	if p.currentTotal != clients {
+		t.Errorf("currentTotal = %d, want %d (client backends only; bg processes must be excluded)", p.currentTotal, clients)
+	}
+	if total <= clients {
+		t.Errorf("expected background processes to exist (total=%d clients=%d); the backend_type filter must be load-bearing", total, clients)
+	}
 	if p.rolConnLimit != unlimited {
 		t.Errorf("default superuser rolconnlimit = %d, want -1 (unlimited)", p.rolConnLimit)
 	}
