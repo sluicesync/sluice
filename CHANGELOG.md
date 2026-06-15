@@ -4,6 +4,29 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [0.99.48] - 2026-06-15
+
+### Fixed
+- **Online schema changes now forward on a PlanetScale / Vitess (VStream)
+  source after a cold start (ADR-0091, F7c).** The default-on schema-change
+  forwarding from v0.99.45–46 did not engage for a VStream source that had
+  cold-started: the VStream cold-start CDC tail (`dispatchCDCEvent`) is a
+  separate dispatch from the standalone reader and its FIELD branch only
+  cached the field list — it never emitted the ADR-0049 `ir.SchemaSnapshot`
+  boundary the forward intercept needs. So an ADD/DROP/ALTER COLUMN on the
+  source after a cold start never forwarded, and the post-DDL row then failed
+  to apply with `42703` (PG) / `1054` (MySQL). (A warm-resumed VStream stream
+  was unaffected.) The cold-start FIELD branch now emits the boundary, exactly
+  as the standalone reader does. Additionally, `NormalizeForCDCComparison` is
+  now flavor-aware: the VStream FIELD projection carries no primary key, no
+  secondary indexes, and not reliably charset/collation, so for VStream
+  flavors those are stripped from the cold-start seed to prevent a phantom
+  PK-index-drop / ALTER-TYPE refusal (vanilla MySQL binlog is unchanged).
+  Documented limitation, in line with the wire's fidelity: CREATE/DROP INDEX
+  and charset-only ALTER cannot forward on a VStream source. With this, the
+  ADR-0091 §1d forwarding matrix holds across all three source paths —
+  MySQL binlog, PG pgoutput, and PlanetScale/Vitess VStream.
+
 ## [0.99.47] - 2026-06-15
 
 ### Fixed
