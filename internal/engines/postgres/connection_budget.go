@@ -42,7 +42,7 @@ var errConnectionBudgetExhausted = errors.New("postgres: target connection budge
 type connectionBudgetProbe struct {
 	maxConnections int // SHOW max_connections
 	reserved       int // SHOW superuser_reserved_connections
-	currentTotal   int // SELECT count(*) FROM pg_stat_activity
+	currentTotal   int // count(*) FROM pg_stat_activity WHERE backend_type='client backend' (bg processes don't consume max_connections)
 
 	rolConnLimit int // pg_roles.rolconnlimit for current_user (-1 = unlimited)
 	roleCurrent  int // count(*) FROM pg_stat_activity WHERE usename = current_user
@@ -143,7 +143,19 @@ func probeConnectionBudget(ctx context.Context, db *sql.DB) (connectionBudgetPro
 	if err := db.QueryRowContext(ctx, `SHOW superuser_reserved_connections`).Scan(&p.reserved); err != nil {
 		return p, fmt.Errorf("probe superuser_reserved_connections: %w", err)
 	}
-	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM pg_stat_activity`).Scan(&p.currentTotal); err != nil {
+	// Count only CLIENT backends — `max_connections` bounds client
+	// connections, NOT the server's background processes. pg_stat_activity
+	// also lists the checkpointer, background/wal writer, autovacuum
+	// launcher, archiver, logical-replication launcher, and (PG 18+) the
+	// async I/O workers; none of those consume a `max_connections` slot
+	// (they have their own limits — max_worker_processes, autovacuum_max_
+	// workers, io_workers). An unfiltered count(*) over-reports in_use by
+	// the background-process count (≈9 on a PG-18 managed instance), which
+	// on a small/tight target (e.g. a managed PG with max_connections=25)
+	// produced a FALSE "connection budget exhausted" that blocked cold
+	// start. backend_type is PG 10+; sluice's pgoutput CDC already
+	// requires PG 10+, so the column is always present.
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend'`).Scan(&p.currentTotal); err != nil {
 		return p, fmt.Errorf("probe pg_stat_activity count: %w", err)
 	}
 	// rolconnlimit for the connecting role. COALESCE guards the
