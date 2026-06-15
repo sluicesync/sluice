@@ -647,6 +647,21 @@ func decodeArray(raw any, elementType ir.Type) (any, error) {
 		return v, nil
 	}
 
+	// (3b) The pgoutput CDC path (Bug 144) delivers the array as its TEXT
+	// encoding in a []byte, not a string (the cold-start path yields []any or
+	// a string). Treat it as the same text form. This is unambiguous: a real
+	// array VALUE never arrives as a raw []byte — bytea is ir.Blob, not
+	// ir.Array — so there is no collision with a byte-slice element. Without
+	// this, the reflect path below would walk the text's bytes and try to
+	// decode each uint8 as an element ("cannot decode uint8 as Integer").
+	if b, ok := raw.([]byte); ok {
+		v, err := decodePGArrayText(string(b), elementType)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: array text parse: %w", err)
+		}
+		return v, nil
+	}
+
 	// (2) Any other slice/array via reflection.
 	rv := reflect.ValueOf(raw)
 	if rv.Kind() != reflect.Slice && rv.Kind() != reflect.Array {

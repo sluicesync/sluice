@@ -218,6 +218,45 @@ func TestDecodeValue(t *testing.T) {
 			[]any{[]any{[]any{int64(1), int64(2)}}, []any{[]any{int64(3), int64(4)}}},
 		},
 
+		// ---- Array []byte text form (Bug 144 — the pgoutput CDC path) ----
+		// pgoutput delivers the array as its TEXT encoding in a []byte (the
+		// cold-start path above yields []any or string). decodeArray case 3b
+		// must route []byte through the SAME decodePGArrayText parser; without
+		// it the reflect path walked the text's bytes and decoded each uint8 as
+		// an element. These twins pin the []byte path on the edge cases (comma,
+		// escaped quote, brace, backslash, 2-D, NULL-element, empty) so it
+		// cannot drift from the string path.
+		{
+			"[]byte int array",
+			[]byte("{10,20,30}"),
+			ir.Array{Element: ir.Integer{Width: 32}},
+			[]any{int64(10), int64(20), int64(30)},
+		},
+		{
+			"[]byte text array with comma/quote/brace/backslash",
+			[]byte(`{"a, b","he said \"hi\"","brace}{","back\\slash"}`),
+			ir.Array{Element: ir.Text{Size: ir.TextLong}},
+			[]any{"a, b", `he said "hi"`, "brace}{", `back\slash`},
+		},
+		{
+			"[]byte int[][] (2-D not flattened)",
+			[]byte("{{1,2},{3,4}}"),
+			ir.Array{Element: ir.Integer{Width: 32}},
+			[]any{[]any{int64(1), int64(2)}, []any{int64(3), int64(4)}},
+		},
+		{
+			"[]byte int array with NULL element",
+			[]byte("{1,NULL,3}"),
+			ir.Array{Element: ir.Integer{Width: 32}},
+			[]any{int64(1), nil, int64(3)},
+		},
+		{
+			"[]byte empty array",
+			[]byte("{}"),
+			ir.Array{Element: ir.Integer{Width: 32}},
+			[]any{},
+		},
+
 		// ---- Scalar string fallbacks ----
 		{"int from numeric string", "42", ir.Integer{Width: 32}, int64(42)},
 		{"float from numeric string", "3.14", ir.Float{Precision: ir.FloatDouble}, 3.14},

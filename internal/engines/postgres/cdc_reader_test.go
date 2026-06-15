@@ -343,6 +343,90 @@ func TestOIDToTypeUnknownErrors(t *testing.T) {
 	}
 }
 
+// arrayFamilies is the canonical correspondence between a PG array type
+// (udt_name as the schema reader sees it, and array OID as pgoutput delivers
+// it) and its element OID. It is the single source of truth both the CDC array
+// map (pgArrayElementOID, OID-keyed) and the schema reader's builtinArrayElement
+// (udt-keyed) must agree with — TestOIDToType_ArrayParity is the Bug 97/118
+// dual-registry-drift guard built on it.
+var arrayFamilies = []struct {
+	udt      string
+	arrayOID uint32
+	elemOID  uint32
+}{
+	{"_bool", pgtype.BoolArrayOID, pgtype.BoolOID},
+	{"_int2", pgtype.Int2ArrayOID, pgtype.Int2OID},
+	{"_int4", pgtype.Int4ArrayOID, pgtype.Int4OID},
+	{"_int8", pgtype.Int8ArrayOID, pgtype.Int8OID},
+	{"_float4", pgtype.Float4ArrayOID, pgtype.Float4OID},
+	{"_float8", pgtype.Float8ArrayOID, pgtype.Float8OID},
+	{"_numeric", pgtype.NumericArrayOID, pgtype.NumericOID},
+	{"_text", pgtype.TextArrayOID, pgtype.TextOID},
+	{"_varchar", pgtype.VarcharArrayOID, pgtype.VarcharOID},
+	{"_bpchar", pgtype.BPCharArrayOID, pgtype.BPCharOID},
+	{"_char", pgtype.QCharArrayOID, pgtype.QCharOID},
+	{"_bytea", pgtype.ByteaArrayOID, pgtype.ByteaOID},
+	{"_date", pgtype.DateArrayOID, pgtype.DateOID},
+	{"_time", pgtype.TimeArrayOID, pgtype.TimeOID},
+	{"_timetz", pgtype.TimetzArrayOID, pgtype.TimetzOID},
+	{"_timestamp", pgtype.TimestampArrayOID, pgtype.TimestampOID},
+	{"_timestamptz", pgtype.TimestamptzArrayOID, pgtype.TimestamptzOID},
+	{"_json", pgtype.JSONArrayOID, pgtype.JSONOID},
+	{"_jsonb", pgtype.JSONBArrayOID, pgtype.JSONBOID},
+	{"_uuid", pgtype.UUIDArrayOID, pgtype.UUIDOID},
+	{"_inet", pgtype.InetArrayOID, pgtype.InetOID},
+	{"_cidr", pgtype.CIDRArrayOID, pgtype.CIDROID},
+	{"_macaddr", pgtype.MacaddrArrayOID, pgtype.MacaddrOID},
+	{"_macaddr8", macaddr8ArrayOID, pgtype.Macaddr8OID},
+}
+
+// TestOIDToType_Arrays pins Bug 144: every supported array OID resolves to
+// ir.Array whose element is exactly what oidToType produces for the element OID
+// — so an array element decodes byte-identically to the same scalar column.
+func TestOIDToType_Arrays(t *testing.T) {
+	for _, f := range arrayFamilies {
+		f := f
+		t.Run(f.udt, func(t *testing.T) {
+			wantElem, err := oidToType(f.elemOID, -1)
+			if err != nil {
+				t.Fatalf("element OID %d (%s) must resolve: %v", f.elemOID, f.udt, err)
+			}
+			got, err := oidToType(f.arrayOID, -1)
+			if err != nil {
+				t.Fatalf("array OID %d (%s) unexpected error: %v", f.arrayOID, f.udt, err)
+			}
+			if !reflect.DeepEqual(got, ir.Array{Element: wantElem}) {
+				t.Errorf("got %#v; want ir.Array{Element: %#v}", got, wantElem)
+			}
+		})
+	}
+}
+
+// TestOIDToType_ArrayParity is the Bug 97/118 dual-registry-drift guard for
+// arrays: the CDC OID-keyed pgArrayElementOID and the schema reader's
+// text-keyed builtinArrayElement MUST cover the SAME element families. A family
+// supported at schema-read but missing from the CDC map crashes the stream on
+// the first array DML (and vice versa wastes a cold-start mapping). Both are
+// pinned to the canonical arrayFamilies list.
+func TestOIDToType_ArrayParity(t *testing.T) {
+	if len(pgArrayElementOID) != len(arrayFamilies) {
+		t.Fatalf("pgArrayElementOID has %d entries; canonical arrayFamilies has %d — update both together",
+			len(pgArrayElementOID), len(arrayFamilies))
+	}
+	if len(builtinArrayElement) != len(arrayFamilies) {
+		t.Fatalf("builtinArrayElement has %d entries; canonical arrayFamilies has %d — update both together",
+			len(builtinArrayElement), len(arrayFamilies))
+	}
+	for _, f := range arrayFamilies {
+		if _, ok := pgArrayElementOID[f.arrayOID]; !ok {
+			t.Errorf("CDC pgArrayElementOID missing array OID %d (%s)", f.arrayOID, f.udt)
+		}
+		if _, ok := builtinArrayElement[f.udt]; !ok {
+			t.Errorf("schema-reader builtinArrayElement missing udt %s", f.udt)
+		}
+	}
+}
+
 func TestBuildRelationCacheEntry(t *testing.T) {
 	// A minimal RelationMessage covering one key column + one
 	// data column. The pglogrepl shape we're projecting from.
