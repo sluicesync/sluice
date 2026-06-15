@@ -389,6 +389,21 @@ type vstreamSnapshotStream struct {
 	// pump both write it; ReadRows never touches it).
 	fields map[string][]*query.Field
 
+	// snapshotSig is the per-table structural fingerprint of the last
+	// ir.SchemaSnapshot emitted on the POST-COPY CDC phase — the
+	// true-delta gate that mirrors [vstreamCDCReader.snapshotSig]
+	// (ADR-0049 Chunk B2). F7c: the cold-start→CDC path
+	// ([dispatchCDCEvent]) must emit the SAME SchemaSnapshot boundary the
+	// standalone reader's FIELD branch does, otherwise an online ADD /
+	// DROP / MODIFY COLUMN that lands after a VStream cold-start never
+	// reaches the ADR-0091 schema-forward intercept (the boundary signal
+	// was silently dropped, leaving only the field-cache update — so the
+	// post-DDL ROW decodes with the new column but the target schema is
+	// never altered: SQLSTATE 42703 / MySQL 1054). Lazily initialised on
+	// first post-COPY FIELD so COPY-phase FIELD caching is untouched.
+	// Guarded by mu.
+	snapshotSig map[string]ir.SchemaSignature
+
 	// currentVgtid is the latest VGTID observed on the stream. When the
 	// COPY pump reaches the global COPY_COMPLETED, this is the snapshot-
 	// consistent position; during the CDC phase it advances with each
@@ -1323,7 +1338,12 @@ func (s *vstreamSnapshotStream) dispatchCDCEvent(ctx context.Context, ev *binlog
 		}
 		key := fieldCacheKey(fe.GetShard(), fe.GetTableName())
 		s.fields[key] = fe.GetFields()
-		return nil
+		// F7c: emit the ADR-0049 SchemaSnapshot boundary on a true-delta
+		// FIELD signature change, exactly as [vstreamCDCReader.dispatch]
+		// does. Without this the cold-start→CDC path silently dropped the
+		// boundary, so an online ADD/DROP/MODIFY COLUMN after a VStream
+		// cold-start never reached the ADR-0091 schema-forward intercept.
+		return s.maybeSnapshotSchemaCDC(ctx, fe, out)
 
 	case binlogdata.VEventType_ROW:
 		return s.dispatchCDCRow(ctx, ev, out)
@@ -1356,6 +1376,88 @@ func (s *vstreamSnapshotStream) dispatchCDCEvent(ctx context.Context, ev *binlog
 		// all bookkeeping. Drop silently.
 		return nil
 	}
+}
+
+// maybeSnapshotSchemaCDC is the post-COPY counterpart to
+// [vstreamCDCReader.maybeSnapshotSchema] (ADR-0049 Chunk B2). On every
+// post-COPY FIELD event it projects the field metadata into an
+// [ir.Table] and emits an [ir.SchemaSnapshot] iff the projected
+// (column-name, ordered-type) signature is a TRUE DELTA against the last
+// one emitted for this (shard, table). VStream re-emits FIELD on stream
+// (re)start / first-touch, so the true-delta gate (snapshotSig) keeps a
+// no-op re-emit from writing a phantom version — the same dedup the
+// standalone reader uses.
+//
+// F7c: this is the boundary signal the cold-start→CDC path was missing.
+// The standalone [vstreamCDCReader] emits it from its FIELD branch, but
+// the snapshot stream's [dispatchCDCEvent] FIELD branch only cached the
+// fields, so an online ADD/DROP/MODIFY COLUMN after a VStream cold-start
+// never produced a SchemaSnapshot — the ADR-0091 schema-forward
+// intercept (and the ADR-0049 schema-history write) never saw it. The
+// post-DDL ROW then decoded with the new field set against a target
+// whose schema was never altered (SQLSTATE 42703 on PG / 1054 on
+// MySQL). The logic here is a faithful mirror of the standalone reader's
+// method, reusing the same projectVStreamFields / SchemaSignatureOf /
+// keyspace-gate machinery rather than duplicating a new projection.
+//
+// The caller (the CDC pump) holds no lock; snapshotSig and fields are
+// touched only by this single pump goroutine in the post-COPY phase, so
+// no additional locking is required here (the COPY pump that shared the
+// mu has already exited by the time the CDC pump runs).
+func (s *vstreamSnapshotStream) maybeSnapshotSchemaCDC(ctx context.Context, fe *binlogdata.FieldEvent, out chan<- ir.Change) error {
+	keyspace := fe.GetKeyspace()
+	if keyspace == "" {
+		keyspace = s.keyspace
+	}
+	// The stream is bound to a single keyspace via the DSN; a FIELD event
+	// for an unrelated keyspace carries no table the applier could host a
+	// schema-history row for. Skip — symmetric with the standalone
+	// reader's keyspace gate.
+	if keyspace != s.keyspace {
+		return nil
+	}
+	table := stripKeyspaceFromTable(fe.GetTableName(), keyspace)
+
+	tbl, err := projectVStreamFields(keyspace, table, fe.GetFields())
+	if err != nil {
+		if errors.Is(err, errFieldMetadataUnavailable) {
+			// Position-anchored metadata absent on this FIELD event —
+			// degrade to the safe floor (no version written). NOT fatal:
+			// the loud ROW-without-FIELD floor (dispatchCDCRow) is
+			// untouched. Mirrors maybeSnapshotSchema.
+			return nil
+		}
+		// A present-but-unmappable ColumnType is a genuine unknown type —
+		// fatal/loud (the loud-failure tenet).
+		return err
+	}
+
+	if s.snapshotSig == nil {
+		s.snapshotSig = make(map[string]ir.SchemaSignature)
+	}
+	cacheKey := fieldCacheKey(fe.GetShard(), fe.GetTableName())
+	sig := ir.SchemaSignatureOf(tbl)
+	if prev, ok := s.snapshotSig[cacheKey]; ok && prev.Equal(sig) {
+		// No-op FIELD re-emit (restart / first-touch / reconnect with no
+		// DDL): not a true delta — do NOT write a new version.
+		return nil
+	}
+
+	pos, err := s.positionFor()
+	if err != nil {
+		return err
+	}
+
+	if err := send(ctx, out, ir.SchemaSnapshot{
+		Position: pos,
+		Schema:   keyspace,
+		Table:    table,
+		IR:       tbl,
+	}); err != nil {
+		return err
+	}
+	s.snapshotSig[cacheKey] = sig
+	return nil
 }
 
 // dispatchCDCRow turns a ROW event into [ir.Insert] / [ir.Update] /
