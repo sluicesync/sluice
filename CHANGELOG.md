@@ -4,6 +4,33 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [0.99.52] - 2026-06-16
+
+### Fixed
+- **MySQL ENUM values now sync correctly over CDC (Bug 145).** The MySQL
+  binlog hands an `ENUM` cell back as its **1-based ordinal index**, not the
+  label, and the CDC value decoder passed that straight through — so a
+  replicated INSERT carried `"2"` instead of `"active"`. A PostgreSQL enum
+  target **rejected** it (`SQLSTATE 22P02 invalid input value for enum`); a
+  MySQL target only appeared to work because it coerces the numeric string by
+  index (fragile, and wrong the moment the value list shifts). The decoder now
+  maps the index to its label via the column's value list; a label string (the
+  snapshot/copy path and the VStream reader both deliver labels) passes through
+  unchanged. Applies to **all** MySQL enum CDC, not just schema-change
+  forwarding.
+- **MySQL ENUM schema changes now forward to a PostgreSQL target (Bug 145).**
+  Two DDL gaps in the forward path: an `ADD COLUMN <enum>` referenced the named
+  PG enum type without creating it (`42704 type does not exist`), and a MySQL
+  `MODIFY … ENUM(...)` that appends a value (which arrives as an
+  alter-column-type) hit an internal "enum DDL requires column context" error.
+  The forward path now creates the enum type first (idempotent `CREATE TYPE`)
+  for an added enum column, and forwards an appended value as
+  `ALTER TYPE … ADD VALUE IF NOT EXISTS`. Appending a value is exact; a value
+  rename/removal on the source leaves the PG enum a superset (no data loss —
+  every value the source can still produce remains valid). Combined with the
+  value fix above, MySQL→PG ENUM now works end-to-end (add column, add value,
+  rows landing by label).
+
 ## [0.99.51] - 2026-06-15
 
 ### Fixed
