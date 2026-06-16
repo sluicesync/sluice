@@ -1206,6 +1206,16 @@ func (w *SchemaWriter) AlterAddColumn(ctx context.Context, table *ir.Table, cols
 		//      backfilled).
 		//
 		// Documented in CHANGELOG v0.73.1.
+		//
+		// Bug 145: an enum column's def renders the named PG enum type
+		// *ident*, not its definition, so the type must exist before the
+		// ADD COLUMN or PG raises 42704 "type does not exist". Cold-start
+		// creates enum types in a dedicated phase
+		// (CreateTablesWithoutConstraints); the forward schema-change path
+		// reaches a live target and must create it here (idempotently).
+		if err := w.ensureEnumType(ctx, table, col); err != nil {
+			return err
+		}
 		emitCol := *col
 		emitCol.Nullable = true
 		def, err := emitColumnDef(table, &emitCol, w.emitOpts())
@@ -1321,6 +1331,15 @@ func (w *SchemaWriter) AlterColumnType(ctx context.Context, table *ir.Table, wan
 	if want == nil {
 		return errors.New("postgres: alter column type: want column is nil")
 	}
+	// Bug 145: a MySQL `MODIFY col ENUM(...)` that adds a value arrives as
+	// an alter-column-type shape, but on PG an enum-definition change is NOT
+	// `ALTER COLUMN ... TYPE` (emitColumnType can't render an enum without
+	// table+column context — it returns the "requires column context"
+	// error) — it's `ALTER TYPE <type> ADD VALUE`. Route enum wants there.
+	// Generated enum columns emit as TEXT + CHECK (Bug 25), no named type.
+	if enum, isEnum := want.Type.(ir.Enum); isEnum && !want.IsGenerated() {
+		return w.alterEnumAddValues(ctx, table, want, enum)
+	}
 	typeStr, err := emitColumnType(want.Type, w.emitOpts())
 	if err != nil {
 		return fmt.Errorf("alter column type: emit %q: %w", want.Name, err)
@@ -1331,6 +1350,60 @@ func (w *SchemaWriter) AlterColumnType(ctx context.Context, table *ir.Table, wan
 	if _, err := w.db.ExecContext(ctx, stmt); err != nil {
 		return fmt.Errorf("alter column type %q on %s.%s: %w",
 			want.Name, table.Schema, table.Name, err)
+	}
+	return nil
+}
+
+// ensureEnumType creates the named PG enum type for an enum column if it
+// is not already present (Bug 145). Cold-start creates enum types in a
+// dedicated phase (CreateTablesWithoutConstraints, which emits one
+// CREATE TYPE per enum in w.schema); the forward schema-change path
+// (AlterAddColumn / AlterColumnType) reaches a LIVE target where the type
+// may be absent (first ADD COLUMN of an enum) or already present (a
+// re-applied delta). PG has no `CREATE TYPE IF NOT EXISTS`, so the CREATE
+// is wrapped in a DO block that swallows duplicate_object — idempotent.
+//
+// Uses w.schema (the same schema cold-start's emitCreateEnumType uses), so
+// the created type matches the ident emitColumnDef renders via
+// qualifiedEnumTypeRef. Generated enum columns emit as TEXT + a CHECK
+// constraint (Bug 25) and need no named type, so they're skipped.
+func (w *SchemaWriter) ensureEnumType(ctx context.Context, table *ir.Table, col *ir.Column) error {
+	enum, ok := col.Type.(ir.Enum)
+	if !ok || col.IsGenerated() {
+		return nil
+	}
+	create := emitCreateEnumType(enum, w.schema, table.Name, col.Name)
+	stmt := fmt.Sprintf("DO $$ BEGIN %s EXCEPTION WHEN duplicate_object THEN NULL; END $$;", create)
+	if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("ensure enum type for %s.%s.%s: %w", w.schema, table.Name, col.Name, err)
+	}
+	return nil
+}
+
+// alterEnumAddValues forwards an enum value-add (Bug 145): ensure the enum
+// type exists, then append each value via `ALTER TYPE ... ADD VALUE IF NOT
+// EXISTS` (idempotent — values already present are skipped, so a re-applied
+// delta is a no-op). This faithfully forwards an APPEND — the common
+// MySQL `MODIFY col ENUM(...)` that adds a value at the end.
+//
+// Documented edge: a value RENAME or REMOVAL on the source leaves the
+// target enum a SUPERSET (ALTER TYPE cannot drop or rename a label, and
+// this path has only the post-state values, not the diff). No data loss —
+// every value the source can still produce remains valid on the target —
+// but the target retains the old label. Reordering is likewise not
+// reflected (ADD VALUE appends). These are rare for a forwarded change and
+// stay loud-safe; the append case (the tested one) is exact.
+func (w *SchemaWriter) alterEnumAddValues(ctx context.Context, table *ir.Table, want *ir.Column, enum ir.Enum) error {
+	if err := w.ensureEnumType(ctx, table, want); err != nil {
+		return err
+	}
+	typeRef := quoteIdent(w.schema) + "." + quoteIdent(resolveEnumTypeName(enum, table.Name, want.Name))
+	for _, v := range enum.Values {
+		stmt := fmt.Sprintf("ALTER TYPE %s ADD VALUE IF NOT EXISTS %s", typeRef, quoteSQLString(v))
+		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("alter enum type %s add value %q on %s.%s: %w",
+				typeRef, v, table.Schema, table.Name, err)
+		}
 	}
 	return nil
 }

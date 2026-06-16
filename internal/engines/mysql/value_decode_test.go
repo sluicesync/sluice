@@ -82,8 +82,16 @@ func TestDecodeValue(t *testing.T) {
 		// ---- JSON ----
 		{"json as bytes", []byte(`{"k":"v"}`), ir.JSON{Binary: true}, []byte(`{"k":"v"}`)},
 
-		// ---- Enum ----
-		{"enum as string", []byte("admin"), ir.Enum{Values: []string{"admin", "user"}}, "admin"},
+		// ---- Enum (Bug 145) ----
+		// Snapshot / VStream hand back the LABEL (string/bytes) — passthrough.
+		{"enum label as bytes", []byte("admin"), ir.Enum{Values: []string{"admin", "user"}}, "admin"},
+		{"enum label as string", "user", ir.Enum{Values: []string{"admin", "user"}}, "user"},
+		// Binlog hands back the 1-based ordinal INDEX (int family) — map to label.
+		{"enum index int64 → label", int64(2), ir.Enum{Values: []string{"admin", "user"}}, "user"},
+		{"enum index uint8 → label", uint8(1), ir.Enum{Values: []string{"admin", "user"}}, "admin"},
+		{"enum index int8 → label", int8(2), ir.Enum{Values: []string{"admin", "user"}}, "user"},
+		// MySQL index 0 is the '' empty/error member.
+		{"enum index 0 → empty member", int64(0), ir.Enum{Values: []string{"admin", "user"}}, ""},
 
 		// ---- Set ----
 		{"set with members", []byte("a,b,c"), ir.Set{Values: []string{"a", "b", "c", "d"}}, []string{"a", "b", "c"}},
@@ -142,6 +150,10 @@ func TestDecodeValueErrors(t *testing.T) {
 		// the schema-cache DSN's parseTime setting (Bug 12).
 		// TestDecodeTimeFromString covers the success path.
 		{"timestamp from unparseable string", "definitely-not-a-date", ir.Timestamp{}},
+		// Bug 145: an ENUM index past the value list, or a wholly
+		// unexpected type, must fail loudly rather than carry a bad value.
+		{"enum index out of range", int64(5), ir.Enum{Values: []string{"admin", "user"}}},
+		{"enum non-int non-string", float64(1), ir.Enum{Values: []string{"admin", "user"}}},
 	}
 	for _, c := range cases {
 		c := c
