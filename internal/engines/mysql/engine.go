@@ -539,6 +539,28 @@ func (e Engine) DefaultExcludePatterns(dsn string) []string {
 	return nil
 }
 
+// DiscoverShards implements [ir.ShardDiscoverer] (Bug 152): it reports
+// the source keyspace's shard layout so the orchestrator's cross-shard-
+// collision preflight can refuse a multi-shard source merging into a
+// single non-discriminated target.
+//
+// Only VStream flavors (PlanetScale / self-hosted Vitess) can be sharded;
+// a non-VStream flavor (vanilla MySQL) returns (nil, nil) WITHOUT
+// connecting, so the guard is free for the common case. For a VStream
+// flavor it queries the vtgate (`SHOW VITESS_SHARDS`) via the same
+// [discoverShards] helper the reader uses to enumerate shards — an
+// unsharded keyspace returns a single shard, a sharded one returns N.
+func (e Engine) DiscoverShards(ctx context.Context, dsn string) ([]string, error) {
+	if !e.Flavor.usesVStream() {
+		return nil, nil
+	}
+	cfg, err := parseDSN(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: discover shards: %w", err)
+	}
+	return discoverShards(ctx, cfg, cfg.DBName)
+}
+
 // planetScaleMySQLHostSuffixes is the closed set of DNS suffixes
 // PlanetScale's MySQL service uses today. Lowercase comparison; the
 // wider PSDB platform may add suffixes (region-specific shards,

@@ -37,6 +37,7 @@ var (
 	_ ir.NamespaceFolder                       = Engine{}
 	_ ir.PositionOrderer                       = Engine{}
 	_ ir.ServerCDCReaderOpener                 = Engine{}
+	_ ir.ShardDiscoverer                       = Engine{}
 	_ ir.SnapshotStreamResumer                 = Engine{}
 	_ irbackup.TableScopedBackupSnapshotOpener = Engine{}
 	_ ir.TableScopedSnapshotOpener             = Engine{}

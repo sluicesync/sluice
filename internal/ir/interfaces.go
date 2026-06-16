@@ -755,6 +755,30 @@ type TableEmptyChecker interface {
 	IsTableEmpty(ctx context.Context, table *Table) (bool, error)
 }
 
+// ShardDiscoverer is the optional surface a source [Engine] can
+// implement to report the source's shard layout. A sharded source — a
+// Vitess/PlanetScale keyspace fronted by vtgate, which transparently
+// merges every shard into one logical stream — returns one entry per
+// shard; a non-sharded source returns nil/empty.
+//
+// The orchestrator's cross-shard-collision preflight (Bug 152) consults
+// it: a source with >1 shard merging into a single non-discriminated
+// target table whose rows can collide on a key would silently overwrite
+// per-shard rows that share a key value. The preflight refuses that
+// configuration unless the operator adds a discriminator
+// (--inject-shard-column, ADR-0048) or explicitly opts in
+// (--allow-cross-shard-merge).
+//
+// Engines that don't implement it are treated as a single logical
+// (non-sharded) source, so the guard is a no-op for vanilla MySQL and
+// Postgres. Implementations connect to the source to enumerate shards;
+// a non-sharded service variant (e.g. the vanilla MySQL flavor) should
+// return (nil, nil) WITHOUT connecting, so the guard stays free for the
+// common case.
+type ShardDiscoverer interface {
+	DiscoverShards(ctx context.Context, dsn string) ([]string, error)
+}
+
 // SnapshotImporter is the optional engine surface for importing a
 // previously-exported snapshot onto N additional connections. Used by
 // the parallel bulk-copy phase when N reader goroutines all need to

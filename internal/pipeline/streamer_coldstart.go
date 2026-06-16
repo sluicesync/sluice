@@ -514,6 +514,17 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 		// --inject-shard-column is set, this is the LOUD replacement
 		// for `--force-cold-start`'s silent skip. No-op when the
 		// flag is unset.
+		// Bug 152: refuse a multi-shard source merging into a single
+		// non-discriminated, collision-capable target (silent cross-shard
+		// overwrite). No-op when --inject-shard-column is set or for a
+		// single-shard/non-sharded source. Runs first for the clearest
+		// diagnostic.
+		if err := preflightCrossShardCollision(ctx, s.Source, s.SourceDSN, schema, s.InjectShardColumn.Engaged(), s.AllowCrossShardMerge); err != nil {
+			closeIf(rw)
+			closeIf(sw)
+			_ = stream.Close()
+			return err
+		}
 		if err := preflightShardConsolidation(ctx, schema, rw, s.InjectShardColumn.Name, s.InjectShardColumn.Value); err != nil {
 			closeIf(rw)
 			closeIf(sw)

@@ -154,6 +154,22 @@ honours by **silently skipping the check entirely** — precisely the
 silent-corruption hazard roadmap §4 gotcha 2 names (a mis-set shard
 value → cross-shard overwrite or mid-copy abort, Bug-9 class).
 
+> **Complementary guard (Bug 152, the `--inject-shard-column`-UNSET case).**
+> `preflightShardConsolidation` below governs the path where the operator
+> opted into a discriminator. The *opposite* mistake — pointing sluice at a
+> multi-shard source with **no** discriminator — is caught by a separate
+> preflight, `preflightCrossShardCollision`: when the source reports >1
+> shard (via the `ir.ShardDiscoverer` capability the Vitess/PlanetScale
+> flavors implement over `SHOW VITESS_SHARDS`) and a target table has a PK
+> or UNIQUE, every shard's rows merge into that one table through vtgate and
+> rows sharing a key value silently overwrite. It refuses unless the
+> operator either adds a discriminator (`--inject-shard-column`, this ADR)
+> or explicitly opts in with `--allow-cross-shard-merge` (keys known
+> globally unique across shards). Keyless tables don't trip it
+> (at-least-once, no overwrite). The two preflights are mutually exclusive
+> by construction (one fires only when the discriminator is set, the other
+> only when it isn't).
+
 Introduce `preflightShardConsolidation`, fired when
 `--inject-shard-column NAME=VALUE` is set AND the target is non-empty.
 It **loudly refuses** unless all three hold, *before any data moves*:

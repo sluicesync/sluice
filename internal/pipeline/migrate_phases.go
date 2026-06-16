@@ -396,6 +396,14 @@ func (m *Migrator) phaseGateColdStart(ctx context.Context, rc resumeContext, sta
 			// (NULL / value-present / composite-PK-lead). When
 			// the flag is unset, this is a no-op and the
 			// existing cold-start preflight is the only gate.
+			// Bug 152: refuse a multi-shard source merging into a single
+			// non-discriminated, collision-capable target (silent
+			// cross-shard overwrite). No-op when --inject-shard-column is
+			// set (it solves the hazard) or for a single-shard/non-sharded
+			// source. Runs first so the clearest diagnostic fires.
+			if err := preflightCrossShardCollision(ctx, m.Source, m.SourceDSN, schema, m.InjectShardColumn.Engaged(), m.AllowCrossShardMerge); err != nil {
+				return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
+			}
 			if err := preflightShardConsolidation(ctx, schema, rw, m.InjectShardColumn.Name, m.InjectShardColumn.Value); err != nil {
 				return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
 			}
