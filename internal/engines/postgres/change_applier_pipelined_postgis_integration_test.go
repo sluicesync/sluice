@@ -51,13 +51,20 @@ import (
 	pgtc "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
-const pipelinedPostGISImage = "postgis/postgis:16-3.4"
+// pipelinedPostGISImage is the pre-baked PostGIS image (Task #68) the CI
+// "Integration (PostGIS)" job pre-pulls — byte-equivalent to upstream
+// postgis/postgis:16-3.4 except its datadir is pre-initialised, so it boots
+// without the initdb cold-start path AND avoids a Docker Hub pull (rate-limit
+// flake) on the runner pool. Mirrors the sibling pgvector pin's
+// pipelinedExtImage. runPGWithRetry appends the single-occurrence wait the
+// pre-baked image needs.
+const pipelinedPostGISImage = "ghcr.io/sluicesync/sluice-postgis:16-3.4-prebaked"
 
 // startPGForPipelinedPostGIS boots a postgis container, enables PostGIS,
 // and returns a DSN + cleanup. runPGWithRetry handles the Docker-provider
-// skip, boot retry, and the wait strategy (correct for the stock postgis
-// image too — the ANDed listen-port check defers past initdb's temp
-// server). Skips cleanly when no Docker provider is available.
+// skip, boot retry, and the wait strategy (the appended single-occurrence
+// log+port wait is correct for the pre-baked image, which logs "ready" once).
+// Skips cleanly when no Docker provider is available.
 func startPGForPipelinedPostGIS(t *testing.T) (dsn string, cleanup func()) {
 	t.Helper()
 
