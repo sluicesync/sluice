@@ -2,6 +2,11 @@
 
 All notable changes to sluice are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project follows [Semantic Versioning](https://semver.org/).
 
+## [0.99.60] - 2026-06-16
+
+### Fixed
+- **PostgreSQL-source `ENUM` columns now replicate over PG→PG CDC (catalog Bug 151).** The `pgoutput` CDC reader's OID-to-type map had no case for a user-defined `ENUM` — its OID is dynamic (assigned at `CREATE TYPE` time), so the static lookup declined it and the first enum `INSERT`/`UPDATE`/`DELETE` wedged the stream with `unsupported column type OID <dyn> (typmod -1)`. Enums cold-started (bulk copy) fine but could not be continuously synced PG→PG. This is the same class as the closed Bug 144 (arrays) and Bug 147 (geometry) reader gaps, and it's fixed the same way: the reader resolves the set of user-defined enum type OIDs (`pg_type.typtype='e'`) at the relation boundary — cumulatively, so a mid-stream `CREATE TYPE` + `ADD COLUMN` is picked up too — and maps a matching column to an enum whose value rides the wire as its text label. A non-enum user-defined type (composite, domain) and enum **arrays** (`enum[]`) stay loudly refused (no silent loss). MySQL→PostgreSQL enum sync and the cold-start path were already correct; this closes the PG-source CDC path.
+
 ## [0.99.59] - 2026-06-16
 
 ### Fixed
