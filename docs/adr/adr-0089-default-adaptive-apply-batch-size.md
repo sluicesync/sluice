@@ -54,9 +54,10 @@ cardinal user-trust violation, so the new default **must not batch class-3 table
 **Mechanism.** A change targeting a *truly-keyless* table is treated as a **flush boundary**
 in the shared batch loop ([ADR-0081] `appliershared.RunBatchLoop`), mirroring the existing
 schema-event ("apply alone") handling: the change is dispatched, then the batch commits
-immediately. This bounds a keyless table's crash-replay blast radius to **exactly 1
-duplicate per keyless change — identical to `--apply-batch-size=1`** — while PK / unique
-tables in the same (mixed) stream continue to batch and adapt. The loop learns "is this
+immediately. This pins a keyless table's crash-replay window to **the same one as
+`--apply-batch-size=1`** — the new adaptive default never makes keyless tables *worse* than
+the old conservative default — while PK / unique tables in the same (mixed) stream continue
+to batch and adapt. The loop learns "is this
 change's table keyless" via a nil-safe `BatchConfig.IsKeylessTable` predicate each engine
 fills from the per-table key knowledge it already computes for its upsert clause
 (PG `conflictKeyCache` empty; MySQL `pkCache` ∧ no usable unique key). A nil predicate
@@ -68,6 +69,33 @@ This deliberately keys on **truly keyless**, not "no primary key": the Bug-125 c
 (no-PK-but-UNIQUE) tables are idempotent and keep batching — the guard penalises only the
 genuinely non-idempotent case.
 
+### Delivery semantics for keyless tables (the guard is not exactly-once — Bug 143)
+
+The guard caps the *batch*, not the *replay window*. **Keyless CDC is at-least-once**, and
+this guard does not — cannot — change that:
+
+- A keyless `INSERT` is non-idempotent (no key to upsert on; [ADR-0010]).
+- Crash-resume granularity is the **source transaction**, not the row: the source position
+  (a GTID for MySQL/Vitess, an LSN for Postgres) only advances at the source transaction's
+  **commit**. For VStream specifically, the `VGTID` event that advances the position arrives
+  *after* every `ROW` event of the transaction, so all of a transaction's keyless rows carry
+  the same *pre-transaction* resume position.
+
+Therefore a hard kill before the in-flight source transaction's commit checkpoint re-streams
+that **entire** transaction on resume, re-inserting **every keyless row in it** — not one.
+The guard's batch-of-1 flush means this is **no worse than `--apply-batch-size=1`** (the only
+case where the blast radius is genuinely 1 is autocommit single-row source transactions,
+where each row *is* its own transaction). Per-row checkpointing cannot fix this — you cannot
+resume from the middle of a source transaction. This matches the long-standing
+[ADR-0010] position ("Insert without PK … replays produce duplicates; tables without PKs are
+not recommended for continuous sync") and is the industry-standard at-least-once guarantee
+for keyless CDC. The operator-facing WARN states this plainly; the durable fix for a user who
+needs exactly-once is to add a PRIMARY KEY (or NOT NULL UNIQUE index).
+
+An earlier revision of this ADR (and the applier WARN) overstated the guard as bounding the
+blast radius to "exactly 1 duplicate per keyless change"; that holds only for the autocommit
+case. Corrected in the Bug 143 pass.
+
 ## Consequences
 
 - **>10× out-of-box throughput** on bulk CDC traffic; the ADR-0052 controller finally engages
@@ -76,7 +104,9 @@ genuinely non-idempotent case.
 - **Larger replay-on-crash window** for PK/unique tables (up to N changes replay in one tx) —
   benign under ADR-0010 idempotency.
 - **No new silent-duplication exposure**: class-3 keyless tables are clamped to batch=1
-  semantics, the same blast radius as before this change.
+  semantics, the same blast radius as before this change. (Keyless CDC remains at-least-once
+  — see "Delivery semantics" above; this change neither introduces nor cures that, and the
+  WARN now states it honestly — Bug 143.)
 - Conservative operators opt back via `--apply-batch-size=1` or `--no-auto-tune`.
 - Reverses the explicit "default unchanged / opt-in" decisions of ADR-0017 and ADR-0052 —
   recorded as superseded-in-part above.

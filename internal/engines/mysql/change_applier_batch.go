@@ -157,7 +157,10 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 // and no UNIQUE index — for which MySQL's ON DUPLICATE KEY UPDATE clause
 // is inert and the Insert is effectively a plain, non-idempotent INSERT
 // (Bug 125 class 3); such a change must apply as a batch of 1 so a
-// crash-replay cannot amplify duplicates. Only Inserts are gated —
+// crash-replay can't amplify the per-source-transaction duplicate
+// window past what `--apply-batch-size=1` already exposes (keyless CDC
+// is at-least-once — the in-flight source transaction's keyless rows
+// still replay on resume; see warnKeylessOnce). Only Inserts are gated —
 // Update/Delete on a keyless table do not create duplicate rows on
 // replay. Unlike Postgres (which computes a conflict key during
 // dispatch), MySQL does not, so this runs a one-time information_schema
@@ -214,8 +217,12 @@ func (a *ChangeApplier) warnKeylessOnce(ctx context.Context, qn string) {
 	}
 	a.warnedKeyless[qn] = true
 	slog.WarnContext(ctx,
-		"mysql: applier: table has no PRIMARY KEY or unique index — applying its changes one "+
-			"row per transaction (not batched) so crash-replay cannot duplicate rows; add a "+
-			"PRIMARY KEY (or a UNIQUE index) to enable batched throughput (ADR-0089)",
+		"mysql: applier: table has no PRIMARY KEY or unique index — its INSERTs are not "+
+			"idempotent, so keyless CDC is at-least-once: a crash before the source "+
+			"transaction's commit checkpoint re-inserts this table's rows from the interrupted "+
+			"transaction on resume (keyed tables are exactly-once). Each change is applied as its "+
+			"own transaction to bound the window, but rows in the same source transaction still "+
+			"replay together. Add a PRIMARY KEY (or a UNIQUE index) for exactly-once, batched "+
+			"throughput (ADR-0089)",
 		slog.String("table", qn))
 }
