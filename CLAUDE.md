@@ -70,6 +70,8 @@ Other recurring lint signals:
 - `gocritic commentedOutCode`: don't leave commented-out code in committed files
 - `errcheck` / `rowserrcheck` / `sqlclosecheck`: when a `*sql.Rows` crosses a goroutine boundary into a streaming channel, the linter can't track the close path; suppress with a focused `//nolint:rowserrcheck,sqlclosecheck` on the specific line and a comment explaining why
 
+**Zero-value-safe config defaults (the v0.99.51 trap).** A `Streamer`/config `bool` that must default *on* needs **opt-out** (`SuppressX` / `NoX`) semantics, never `EnableX`-defaulting-true-by-intent. The CLI sets the field, but **every other construction — all tests, broker/chain paths, future callers — gets the Go zero value (`false`)**. A field named for the on-behavior silently inverts to off for all of them. ADR-0093's first cut shipped `AutoResnapshotOnInvalidPosition` (intended default true); the `-race` integration job caught it as a nil-deref panic because every test Streamer got `false` and took the suppressed branch. Make the zero value the safe/common default.
+
 ## Testing layout
 
 - **Unit tests** (`*_test.go`, no build tag) — shape, dispatch, error paths, with mocks. Pipeline package has `stubEngine` (panics on unexpected calls — catches bypassed validation) and `recordingEngine` (logs phase calls — asserts ordering).

@@ -58,7 +58,7 @@ func decodeValue(raw any, t ir.Type) (any, error) {
 	case ir.JSON:
 		return decodeBytes(raw)
 	case ir.Enum:
-		return decodeString(raw)
+		return decodeEnum(raw, v.Values)
 	case ir.Set:
 		return decodeSet(raw)
 	case ir.Geometry:
@@ -76,6 +76,73 @@ func decodeValue(raw any, t ir.Type) (any, error) {
 		return decodeString(raw)
 	}
 	return nil, fmt.Errorf("mysql: no decoder for IR type %T", t)
+}
+
+// decodeEnum maps a MySQL ENUM value to its canonical LABEL string — the
+// IR contract for an enum value (engine-neutral; a PG target's enum or a
+// MySQL target's ENUM both want the label).
+//
+// The wire shape differs by source path (Bug 145):
+//
+//   - The binlog (go-mysql RowsEvent) hands an ENUM back as its 1-based
+//     ordinal INDEX in the integer family (int8/int64/…), NOT the label.
+//     Passing that through made an INSERT carry "2" instead of "active",
+//     which a PG enum column rejects (SQLSTATE 22P02) and a MySQL ENUM
+//     column silently coerces by index — both wrong/fragile. We map the
+//     index to its label via the column's value list.
+//   - The snapshot (database/sql) path and the VStream reader hand back
+//     the LABEL directly (string / []byte); pass those through.
+//
+// MySQL's index 0 is the special ” empty/error member (a value that
+// failed ENUM validation, e.g. a non-strict-mode bad insert); it carries
+// as the empty string, matching MySQL's own SELECT output.
+func decodeEnum(raw any, values []string) (any, error) {
+	switch v := raw.(type) {
+	case string:
+		return v, nil
+	case []byte:
+		return string(v), nil
+	}
+	idx, ok := enumIndex(raw)
+	if !ok {
+		return nil, fmt.Errorf("mysql: enum value is %T (%v); want an index (int) or a label (string/bytes)", raw, raw)
+	}
+	if idx == 0 {
+		return "", nil
+	}
+	if idx < 0 || idx > int64(len(values)) {
+		return nil, fmt.Errorf("mysql: enum index %d out of range [0,%d]", idx, len(values))
+	}
+	return values[idx-1], nil
+}
+
+// enumIndex coerces the integer-family widths the binlog row source can
+// produce into an int64 ENUM ordinal. Returns ok=false for non-integer
+// inputs (handled by the caller).
+func enumIndex(raw any) (int64, bool) {
+	switch n := raw.(type) {
+	case int64:
+		return n, true
+	case int32:
+		return int64(n), true
+	case int16:
+		return int64(n), true
+	case int8:
+		return int64(n), true
+	case int:
+		return int64(n), true
+	case uint64:
+		return int64(n), true
+	case uint32:
+		return int64(n), true
+	case uint16:
+		return int64(n), true
+	case uint8:
+		return int64(n), true
+	case uint:
+		return int64(n), true
+	}
+	return 0, false
 }
 
 // decodeBoolean accepts the various integer widths the row source can
