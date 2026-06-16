@@ -4,6 +4,28 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [0.99.53] - 2026-06-16
+
+### Fixed
+- **Keyless-table CDC WARN now states at-least-once delivery honestly (Bug
+  143).** The ADR-0089 keyless guard applies each INSERT into a table with no
+  PRIMARY KEY (and no usable unique index) as its own transaction so the
+  adaptive batch default never makes such tables worse than
+  `--apply-batch-size=1`. Its WARN, however, claimed this meant "crash-replay
+  cannot duplicate rows" — which is **false**. A keyless INSERT is not
+  idempotent, and crash-resume granularity is the **source transaction** (the
+  GTID/LSN only advances at its commit; for VStream the position-bearing VGTID
+  arrives *after* every row event of the transaction), so a hard kill before
+  that commit checkpoint re-inserts **every keyless row in the interrupted
+  source transaction** on resume — not one. Keyless CDC is at-least-once;
+  per-row checkpointing cannot change that (you cannot resume mid-source-
+  transaction). This release corrects the WARN (and the matching ADR-0089 /
+  code-comment claims) to state the at-least-once semantics plainly and point
+  at adding a PRIMARY KEY (or NOT NULL UNIQUE index) for exactly-once, batched
+  throughput. **Behaviour is unchanged** — this is a truth-in-logging fix; the
+  long-standing guidance (ADR-0010: tables without a key are not recommended
+  for continuous sync) is unchanged.
+
 ## [0.99.52] - 2026-06-16
 
 ### Fixed
