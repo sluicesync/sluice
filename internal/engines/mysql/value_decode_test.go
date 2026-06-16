@@ -4,12 +4,46 @@
 package mysql
 
 import (
+	"math"
 	"reflect"
+	"strconv"
 	"testing"
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
+
+// TestDecodeSet_64MemberNegativeMask pins the ONLY live path where go-mysql
+// hands back a NEGATIVE int64 for a SET: a 57–64-member SET stored in 8 bytes
+// (length=8) with a high bit set. int64(-1) is all 64 bits → all 64 members;
+// setMask's uint64(int64) preserves the bit pattern and the len==64 guard-skip
+// avoids a false out-of-range (a 64-bit shift would also be UB). The narrow-
+// width unit cases in TestDecodeValue are defensive only — go-mysql sizes a
+// SET cell by storage width and returns int64, so this is the real boundary.
+func TestDecodeSet_64MemberNegativeMask(t *testing.T) {
+	members := make([]string, 64)
+	for i := range members {
+		members[i] = "m" + strconv.Itoa(i)
+	}
+
+	all, err := decodeValue(int64(-1), ir.Set{Values: members})
+	if err != nil {
+		t.Fatalf("all-bits 64-member SET: %v", err)
+	}
+	if !reflect.DeepEqual(all, members) {
+		t.Errorf("int64(-1) 64-member SET = %#v; want all 64 members", all)
+	}
+
+	// Only the high bit (member 63) set → just m63, not a false out-of-range.
+	// math.MinInt64 == 0x8000000000000000 == bit 63 only.
+	hi, err := decodeValue(int64(math.MinInt64), ir.Set{Values: members})
+	if err != nil {
+		t.Fatalf("high-bit-only 64-member SET: %v", err)
+	}
+	if !reflect.DeepEqual(hi, []string{"m63"}) {
+		t.Errorf("bit-63-only SET = %#v; want [m63]", hi)
+	}
+}
 
 func TestDecodeValue(t *testing.T) {
 	now := time.Date(2026, 5, 1, 12, 34, 56, 0, time.UTC)
@@ -93,9 +127,27 @@ func TestDecodeValue(t *testing.T) {
 		// MySQL index 0 is the '' empty/error member.
 		{"enum index 0 → empty member", int64(0), ir.Enum{Values: []string{"admin", "user"}}, ""},
 
-		// ---- Set ----
-		{"set with members", []byte("a,b,c"), ir.Set{Values: []string{"a", "b", "c", "d"}}, []string{"a", "b", "c"}},
-		{"set empty", []byte(""), ir.Set{Values: []string{"a", "b"}}, []string{}},
+		// ---- Set (Bug 148) ----
+		// Snapshot / VStream hand back the comma-joined LABEL text.
+		{"set text as bytes", []byte("a,b,c"), ir.Set{Values: []string{"a", "b", "c", "d"}}, []string{"a", "b", "c"}},
+		{"set text as string", "b,d", ir.Set{Values: []string{"a", "b", "c", "d"}}, []string{"b", "d"}},
+		{"set empty text", []byte(""), ir.Set{Values: []string{"a", "b"}}, []string{}},
+		// Binlog hands back the NUMERIC BITMASK (int family); bit i (LSB) is
+		// the i-th declared member, in declaration order.
+		{"set mask int64 bits 0,2 → members", int64(5), ir.Set{Values: []string{"a", "b", "c", "d"}}, []string{"a", "c"}},
+		{"set mask all bits", int64(15), ir.Set{Values: []string{"a", "b", "c", "d"}}, []string{"a", "b", "c", "d"}},
+		{"set mask 0 → empty", int64(0), ir.Set{Values: []string{"a", "b"}}, []string{}},
+		// Multi-byte mask (SET with > 8 members): bit 9 must map, not overflow.
+		{
+			"set mask multi-byte bits 0,9",
+			int64(1<<0 | 1<<9),
+			ir.Set{Values: []string{"m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8", "m9"}},
+			[]string{"m0", "m9"},
+		},
+		// No sign-extension: int8(-1) is bits 0..7 (mask 0xFF), NOT a 64-bit
+		// all-ones; an 8-member SET decodes to all 8 members, not an
+		// out-of-range error.
+		{"set mask int8 all-8 (no sign-extend)", int8(-1), ir.Set{Values: []string{"a", "b", "c", "d", "e", "f", "g", "h"}}, []string{"a", "b", "c", "d", "e", "f", "g", "h"}},
 
 		// ---- Geometry ----
 		// MySQL on the wire delivers `<srid uint32 LE><wkb>`; the
@@ -154,6 +206,10 @@ func TestDecodeValueErrors(t *testing.T) {
 		// unexpected type, must fail loudly rather than carry a bad value.
 		{"enum index out of range", int64(5), ir.Enum{Values: []string{"admin", "user"}}},
 		{"enum non-int non-string", float64(1), ir.Enum{Values: []string{"admin", "user"}}},
+		// Bug 148: a SET bitmask with a bit past the declared members, or a
+		// wholly unexpected type, must fail loudly rather than carry garbage.
+		{"set bitmask bit beyond members", int64(8), ir.Set{Values: []string{"a", "b"}}},
+		{"set non-int non-string", float64(1), ir.Set{Values: []string{"a", "b"}}},
 	}
 	for _, c := range cases {
 		c := c

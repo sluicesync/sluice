@@ -4,7 +4,6 @@
 package mysql
 
 import (
-	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -60,7 +59,7 @@ func decodeValue(raw any, t ir.Type) (any, error) {
 	case ir.Enum:
 		return decodeEnum(raw, v.Values)
 	case ir.Set:
-		return decodeSet(raw)
+		return decodeSet(raw, v.Values)
 	case ir.Geometry:
 		// MySQL stores geometry on the wire as `<srid uint32 LE><wkb>`.
 		// The IR contract for ir.Geometry values is "raw WKB" (per
@@ -555,14 +554,94 @@ func applyZeroDatePolicy(zd *zeroDateValueError, col *ir.Column) (any, error) {
 // decodeSet converts a MySQL SET value's textual representation into
 // a []string. MySQL formats SET as a comma-separated list of selected
 // members ("a,b,c"). An empty SET returns a non-nil empty slice.
-func decodeSet(raw any) (any, error) {
-	s, err := decodeString(raw)
-	if err != nil {
-		return nil, errors.New("mysql: SET value: " + err.Error())
+// decodeSet maps a MySQL SET value to its member-label slice — the IR
+// contract for a SET value. The wire shape differs by source path (Bug 148,
+// the sibling of the ENUM Bug 145):
+//
+//   - The binlog (go-mysql RowsEvent) hands a SET back as its NUMERIC
+//     BITMASK in the integer family (int64), where bit i (LSB-first) is the
+//     i-th declared member. Passing that through stringified the number
+//     ("5" for bits {0,2}) instead of yielding the members ["a","c"]; worse,
+//     decodeSet wasn't even given the member list, so it could not map it.
+//     We walk the mask against the column's value list.
+//   - The snapshot (database/sql) path and the VStream reader hand back the
+//     canonical comma-joined LABEL text ("a,c"). MySQL SET member names
+//     cannot contain a comma (it is the separator), so splitting on "," is
+//     exact — no quoting/escaping to handle, unlike the ENUM/label case.
+//
+// An empty SET decodes to []string{} (mask 0 / empty text). A mask bit with
+// no declared member is a corruption signal and errors LOUDLY rather than
+// being silently dropped (loud-failure tenet).
+func decodeSet(raw any, values []string) (any, error) {
+	switch v := raw.(type) {
+	case string:
+		return splitSetText(v), nil
+	case []byte:
+		return splitSetText(string(v)), nil
 	}
-	str := s.(string)
-	if str == "" {
+	mask, ok := setMask(raw)
+	if !ok {
+		return nil, fmt.Errorf("mysql: set value is %T (%v); want a bitmask (int) or comma-joined labels (string/bytes)", raw, raw)
+	}
+	if mask == 0 {
 		return []string{}, nil
 	}
-	return strings.Split(str, ","), nil
+	// A bit set beyond the declared members can't be mapped to a label —
+	// surface it loudly. (len(values)==64 is the SET maximum; every bit is
+	// then valid and a 64-bit shift would be undefined, so skip the check.)
+	if len(values) < 64 && mask>>uint(len(values)) != 0 {
+		return nil, fmt.Errorf("mysql: set bitmask %#x has a bit beyond the %d declared members", mask, len(values))
+	}
+	out := make([]string, 0, len(values))
+	for i := range values {
+		if mask&(uint64(1)<<uint(i)) != 0 {
+			out = append(out, values[i])
+		}
+	}
+	return out, nil
+}
+
+// splitSetText splits the canonical comma-joined SET text form into member
+// labels. SET member names cannot contain a comma, so a plain split is exact;
+// the empty string is the empty SET.
+func splitSetText(s string) []string {
+	if s == "" {
+		return []string{}
+	}
+	return strings.Split(s, ",")
+}
+
+// setMask coerces the integer-family widths a row source can produce into a
+// uint64 SET bitmask, preserving the bit pattern (NOT sign-extending — an
+// int8 mask 0x80 is bit 7, not a 64-bit all-ones). go-mysql ALWAYS delivers a
+// SET as int64 (sized by storage width = ceil(members/8) bytes, zero-extended
+// into int64), so the int64 case is the only live one — and it is non-negative
+// for ≤56 members; only a 57–64-member SET with a high bit set yields a
+// negative int64, whose pattern uint64(int64) preserves. The narrower signed
+// widths are handled defensively (no source produces them for SET). Returns
+// ok=false for non-integer inputs (handled by the caller).
+func setMask(raw any) (uint64, bool) {
+	switch n := raw.(type) {
+	case int64:
+		return uint64(n), true
+	case uint64:
+		return n, true
+	case int32:
+		return uint64(uint32(n)), true
+	case uint32:
+		return uint64(n), true
+	case int16:
+		return uint64(uint16(n)), true
+	case uint16:
+		return uint64(n), true
+	case int8:
+		return uint64(uint8(n)), true
+	case uint8:
+		return uint64(n), true
+	case int:
+		return uint64(n), true
+	case uint:
+		return uint64(n), true
+	}
+	return 0, false
 }
