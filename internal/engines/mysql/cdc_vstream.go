@@ -73,6 +73,15 @@ type vstreamCDCReader struct {
 	// keyspace concept maps onto sluice's per-engine schema.
 	keyspace string
 
+	// cfg is the parsed DSN, retained so the reader can open a
+	// short-lived MySQL-protocol connection to vtgate for catalog probes
+	// — currently the Bug 146 purged-GTID pre-flight
+	// ([verifyVStreamPositionReachable]), mirroring discoverShards'
+	// openDB(ctx, cfg) pattern. The gRPC stream uses conn/client; this is
+	// the SQL side. Never mutated — the pre-flight Clone()s it to retarget
+	// DBName at a tablet type.
+	cfg *gomysql.Config
+
 	// boolWarn carries the one-time-per-column TINYINT(1)-out-of-range
 	// WARN (Vector D) for the VStream decode path, mirroring the binlog
 	// reader and the bulk-copy reader. Lazily created on the
@@ -323,6 +332,7 @@ func openVStreamReader(ctx context.Context, dsn string, flavor Flavor) (ir.CDCRe
 		endpoint:       endpoint,
 		authHeader:     authHeader,
 		keyspace:       cfg.DBName,
+		cfg:            cfg,
 		shards:         shards,
 		tabletType:     tabletType,
 		livenessWindow: livenessWindow,
@@ -622,6 +632,25 @@ func (r *vstreamCDCReader) StreamChanges(ctx context.Context, from ir.Position) 
 	if err != nil {
 		return nil, err
 	}
+
+	// Bug 146 (ADR-0093): proactive purged-GTID pre-flight on a CDC-tail
+	// RESUME. A VStream re-opened from a position the source has since purged
+	// does NOT surface a reactive error on Vitess 24 — vtgate idles
+	// (heartbeats only; the dump drops with errno 2013, treated as a clean
+	// end), so reader_errors.go's reactive carve-out can never fire and the
+	// stream retry-loops on a (Bug-141-retriable) liveness timeout instead of
+	// cold-starting. Mirror the binlog reader's verifyGTIDSetReachable: check
+	// gtid_purged ⊆ resume BEFORE opening the stream and return
+	// ir.ErrPositionInvalid so the orchestrator's ADR-0022 fall-through
+	// re-snapshots. Only for a decoded (resumed) position, and only for a
+	// pure CDC tail — a mid-COPY resume (TablePKs cursor present) runs the
+	// ADR-0072 primary-pinned path and is out of scope here.
+	if decoded, ok, derr := decodeVStreamPos(from); derr == nil && ok && !anyTablePKsPresent(decoded) {
+		if err := r.verifyVStreamPositionReachable(ctx, decoded); err != nil {
+			return nil, err
+		}
+	}
+
 	r.currentVgtid = startPos
 
 	req, err := r.buildVStreamRequest(startPos)
@@ -667,6 +696,80 @@ func anyTablePKsPresent(start []shardGtid) bool {
 		}
 	}
 	return false
+}
+
+// verifyVStreamPositionReachable is the VStream counterpart of the binlog
+// reader's verifyGTIDSetReachable (Bug 146 / ADR-0093). For each shard's
+// resume GTID it asks the source whether gtid_purged ⊆ resume; a 0 (the
+// source purged GTIDs the resume set lacks) means the position is no longer
+// streamable and is returned as ir.ErrPositionInvalid so the orchestrator's
+// ADR-0022 fall-through cold-starts.
+//
+// Two findings from the Phase-A local-cluster probe shape this:
+//
+//   - gtid_purged is TABLET-TYPE-ROUTED by vtgate (default → primary). The
+//     CDC tail streams from r.tabletType (default REPLICA on PlanetScale), and
+//     a replica can purge independently of the primary — so the check MUST
+//     read gtid_purged from the SAME tablet type the stream binds to, via
+//     vtgate's "keyspace@<tablettype>" target syntax. Reading the default
+//     (primary) value would validate a tablet the stream never reads.
+//   - The resume Gtid carries the Vitess "<flavor>/" prefix (e.g.
+//     "MySQL56/<uuid>:1-N"); GTID_SUBSET rejects that form (ER 1772), so it
+//     is stripped to the bare set first.
+//
+// Degrade-don't-refuse: if the probe connection/query fails (e.g. vtgate's
+// transient "no healthy tablet" during warmup), log and PROCEED rather than
+// force a spurious cold-start — only a definitive GTID_SUBSET=0 refuses.
+// Mirrors verifySourceInstanceIdentity's degrade philosophy.
+func (r *vstreamCDCReader) verifyVStreamPositionReachable(ctx context.Context, decoded []shardGtid) error {
+	if r.cfg == nil {
+		return nil // direct-API / unit construction: no DSN to probe with.
+	}
+	// Retarget the probe at the SAME tablet type the stream will bind to.
+	c := r.cfg.Clone()
+	c.DBName = r.keyspace + "@" + tabletTypeSuffix(r.tabletType)
+	db, err := openDB(ctx, c)
+	if err != nil {
+		slog.WarnContext(ctx, "mysql/vstream: purged-GTID pre-flight: could not open probe connection; proceeding without the check",
+			slog.String("target", c.DBName), slog.String("err", err.Error()))
+		return nil
+	}
+	defer func() { _ = db.Close() }()
+
+	for _, sg := range decoded {
+		bare := stripGTIDFlavor(sg.Gtid)
+		if strings.TrimSpace(bare) == "" || strings.EqualFold(bare, "current") {
+			continue // not a resumable GTID set — nothing to verify.
+		}
+		var subset int
+		if err := db.QueryRowContext(ctx, "SELECT GTID_SUBSET(@@global.gtid_purged, ?)", bare).Scan(&subset); err != nil {
+			// Couldn't run the check (routing/availability/transient) — don't
+			// turn that into a spurious re-snapshot; the stream open below will
+			// surface any real failure loudly.
+			slog.WarnContext(ctx, "mysql/vstream: purged-GTID pre-flight: GTID_SUBSET probe failed; proceeding without the check",
+				slog.String("target", c.DBName), slog.String("shard", sg.Shard), slog.String("err", err.Error()))
+			return nil
+		}
+		if subset == 0 {
+			return fmt.Errorf("mysql/vstream: source (%s) has purged GTIDs not present in the resume position for shard %q; a cold-start re-snapshot is required (gtid_purged advanced past the saved position — common on PlanetScale's binlog-retention window): %w",
+				c.DBName, sg.Shard, ir.ErrPositionInvalid)
+		}
+	}
+	return nil
+}
+
+// tabletTypeSuffix maps a topodata.TabletType to the vtgate target suffix
+// ("keyspace@<suffix>") that routes a query at that tablet type. Defaults to
+// "replica" for the zero/unknown value — the VStream CDC-tail default.
+func tabletTypeSuffix(t topodata.TabletType) string {
+	switch t {
+	case topodata.TabletType_PRIMARY:
+		return "primary"
+	case topodata.TabletType_RDONLY:
+		return "rdonly"
+	default:
+		return "replica"
+	}
 }
 
 // buildVStreamRequest assembles the gRPC request from the resolved

@@ -3,31 +3,38 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-// ADR-0093: VStream purged-GTID resume → reactive cold-start re-snapshot.
+// ADR-0093 / Bug 146: VStream purged-GTID resume → PROACTIVE pre-flight →
+// cold-start re-snapshot.
 //
-// The self-hosted binlog source recovers from a purged resume position
-// via a PRE-FLIGHT gtid_purged ⊆ resume check (cdc_reader.go) that returns
-// ir.ErrPositionInvalid; the streamer's ADR-0022 fall-through re-enters
-// cold-start. vtgate exposes no single authoritative gtid_purged to
-// pre-flight against, so the VStream path can only discover a purged
-// position REACTIVELY — vtgate rejects the position on the stream and the
-// pump's Recv surfaces "the source/master ... purged required binary
-// logs". ADR-0093 classifies that reactive error as ir.ErrPositionInvalid
-// (reader_errors.go: isVStreamPurgedGTIDError) and routes it to a bounded
-// one-shot cold-start re-snapshot (default), or a loud terminal error
-// under --no-auto-resnapshot.
+// The binlog source recovers from a purged resume position via a pre-flight
+// gtid_purged ⊆ resume check (cdc_reader.go verifyGTIDSetReachable) that
+// returns ir.ErrPositionInvalid; the streamer's ADR-0022 fall-through
+// re-enters cold-start. The VStream path was expected to discover a purged
+// position REACTIVELY (vtgate rejecting the stream with "purged required
+// binary logs", classified by reader_errors.go isVStreamPurgedGTIDError) —
+// but a Phase-A investigation proved Vitess 24 does NOT emit that reactive
+// error: vtgate accepts the (behind) position, mysqld drops the dump with
+// errno 2013, vtgate treats it as a clean end and only heartbeats, so the
+// stream idles into a (Bug-141 retriable) liveness timeout and never
+// cold-starts. Bug 146 closes that with a PROACTIVE pre-flight on the
+// VStream open path (cdc_vstream.go verifyVStreamPositionReachable): before
+// opening the stream, query GTID_SUBSET(@@global.gtid_purged, resume) —
+// routed at the SAME tablet type the stream binds to (gtid_purged is
+// tablet-type-routed by vtgate) — and return ir.ErrPositionInvalid when the
+// resume is unreachable. The reactive classifier remains as defence-in-depth
+// for any source that DOES surface the error.
 //
 // This test boots the REAL multi-process Vitess cluster (the same harness
 // the chaos suite uses), captures a VStream position, advances the
 // underlying primary tablet's gtid_purged PAST that position (FLUSH +
-// PURGE BINARY LOGS on the tablet's mysqld), then re-opens a VStream from
-// the stale position and asserts the reader surfaces an error that
-// errors.Is(ir.ErrPositionInvalid) — proving the classifier carve-out
-// fires against a genuine vtgate purged rejection (not a synthesised
-// string). The streamer-level recovery (re-snapshot vs loud opt-out) is
-// pinned by the unit tests in internal/pipeline (the pipeline package
-// owns Run/runWithRetry); this engine-level test pins the source signal
-// the recovery depends on.
+// PURGE BINARY LOGS on the tablet's mysqld; chaosVStreamDSN streams from the
+// PRIMARY, the tablet purged here), then re-opens a VStream from the stale
+// position and asserts StreamChanges refuses SYNCHRONOUSLY with an error that
+// errors.Is(ir.ErrPositionInvalid) and is NOT retriable — proving the
+// proactive pre-flight fires before the stream opens. The streamer-level
+// recovery (re-snapshot vs loud opt-out) is pinned by the unit tests in
+// internal/pipeline; this engine-level test pins the source signal the
+// recovery depends on.
 
 package mysql
 
@@ -239,81 +246,38 @@ func TestVitessCluster_PurgedGTID_ReactiveColdStart(t *testing.T) {
 		}
 	}()
 
-	changes, err := reader.StreamChanges(ctx, resumePos)
-	if err != nil {
-		// A synchronous rejection here WOULD be the reactive signal ADR-0093
-		// wants. Phase A proved this version doesn't produce one; if a future
-		// version does, assert it carries the carve-out so the intent holds.
-		assertPurgedSignalOrDocumentedGap(t, err)
-		return
-	}
-
-	// Drain until the channel closes (the pump exits when its liveness/
-	// progress watchdog fires and cancels the stream), then read Err().
-	// chaosVStreamDSN sets vstream_progress_timeout=20s; the Phase-1 liveness
-	// window is the default 30s — both well inside this drain budget.
-	drainCtx, drainCancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer drainCancel()
-	drained := false
-	for !drained {
-		select {
-		case _, ok := <-changes:
-			if !ok {
-				drained = true
-			}
-		case <-drainCtx.Done():
-			t.Fatal("purged-position stream neither idled-then-timed-out nor errored within 2m — " +
-				"behavior changed from the Phase-A ground truth; re-investigate")
+	changes, serr := reader.StreamChanges(ctx, resumePos)
+	if serr == nil {
+		// The pre-flight should have refused synchronously. If the stream
+		// opened instead, that's the Bug 146 regression: it would idle into a
+		// retriable liveness timeout and never cold-start. Tear the stream
+		// down so a pump goroutine doesn't linger, then fail.
+		_ = changes
+		if c, ok := reader.(interface{ Close() error }); ok {
+			_ = c.Close()
 		}
+		t.Fatal("purged-position resume OPENED the stream instead of being refused by the " +
+			"gtid_purged pre-flight (Bug 146 regression) — vtgate would idle and the stream " +
+			"would never cold-start")
 	}
-
-	rerr := readerErr(reader)
-	if rerr == nil {
-		t.Fatal("purged-position resume produced NO reader error at all — even the liveness watchdog " +
-			"did not fire; that is a silent-wedge regression (ADR-0073 F3 / loud-failure tenet)")
-	}
-	assertPurgedSignalOrDocumentedGap(t, rerr)
+	assertProactivePurgedRefusal(t, serr)
 }
 
-// assertPurgedSignalOrDocumentedGap encodes the ADR-0093 VStream-purged
-// ground truth as a forward-compatible assertion. Two acceptable outcomes:
-//
-//   - REACTIVE PURGED SIGNAL (the ADR-0093 ideal, what the binlog path and a
-//     future vtgate would give): err wraps ir.ErrPositionInvalid and is NOT
-//     retriable, so the streamer cold-starts. If we ever see this against the
-//     real cluster, the carve-out genuinely fired — assert its full shape.
-//
-//   - THE DOCUMENTED GAP (vitess/lite:v24, mysqld 8.4 — the Phase-A finding):
-//     vtgate idles, so the reader surfaces the liveness/progress timeout
-//     instead. That error is loud (not a silent wedge) and, per Bug 141,
-//     RETRIABLE. We assert it is NOT mis-classified as ErrPositionInvalid
-//     (the carve-out did not spuriously fire) and IS the watchdog timeout —
-//     pinning the gap exactly so it can't drift unnoticed.
-func assertPurgedSignalOrDocumentedGap(t *testing.T, err error) {
+// assertProactivePurgedRefusal asserts the Bug 146 pre-flight refused the
+// purged resume with the cold-start signal: the error wraps
+// ir.ErrPositionInvalid (so the streamer's ADR-0022 fall-through re-snapshots)
+// and is NOT retriable (retrying the same purged position would spin forever).
+func assertProactivePurgedRefusal(t *testing.T, err error) {
 	t.Helper()
-	if errors.Is(err, ir.ErrPositionInvalid) {
-		// The reactive carve-out fired — the ADR-0093 ideal. Hold it to the
-		// full contract: cold-start-recoverable, never retriable-in-place.
-		var re ir.RetriableError
-		if errors.As(err, &re) {
-			t.Fatalf("purged-position error wraps ErrPositionInvalid but is ALSO retriable; "+
-				"retrying the same purged position spins forever: %v", err)
-		}
-		t.Logf("REACTIVE PURGED SIGNAL fired (ADR-0093 ideal): %v", err)
-		return
+	if !errors.Is(err, ir.ErrPositionInvalid) {
+		t.Fatalf("purged-position pre-flight error does not wrap ir.ErrPositionInvalid "+
+			"(ADR-0022 cold-start won't fire): %v", err)
 	}
-	// The documented gap: vtgate idled and the liveness watchdog fired. It
-	// must be the watchdog timeout, not some other terminal error, and it
-	// must be loud (non-nil, already checked by the caller).
-	if !strings.Contains(err.Error(), "no events within") &&
-		!strings.Contains(err.Error(), "produced no events for") {
-		t.Fatalf("purged-position resume surfaced an UNEXPECTED error (neither the ADR-0093 "+
-			"reactive ErrPositionInvalid nor the documented liveness/progress timeout) — "+
-			"behavior changed from Phase-A ground truth, re-investigate: %v", err)
+	var re ir.RetriableError
+	if errors.As(err, &re) {
+		t.Fatalf("purged-position error wraps ErrPositionInvalid but is ALSO retriable; "+
+			"retrying the same purged position spins forever: %v", err)
 	}
-	t.Logf("DOCUMENTED ADR-0093 VSTREAM-PURGED GAP confirmed: vtgate idled on the purged "+
-		"position and the reader surfaced the liveness/progress watchdog timeout (loud, "+
-		"Bug-141 retriable) — NOT ir.ErrPositionInvalid; the reactive carve-out cannot fire "+
-		"on this Vitess version. A proactive gtid_purged pre-flight (binlog-reader parity) "+
-		"is required for true cold-start recovery. Surfaced error: %v", err)
+	t.Logf("Bug 146 proactive pre-flight fired: purged resume refused with the cold-start "+
+		"signal (ir.ErrPositionInvalid, non-retriable): %v", err)
 }
