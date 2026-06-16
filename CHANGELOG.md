@@ -4,6 +4,22 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [0.99.59] - 2026-06-16
+
+### Fixed
+- **A forwarded `DROP COLUMN` of a synthesized ENUM column now drops the
+  per-column PostgreSQL enum type too (Bug 150).** When a MySQL-source `ENUM`
+  column is migrated to PostgreSQL, sluice synthesizes a dedicated
+  `"<table>_<col>_enum"` type for it (MySQL enums carry no type identity). A
+  schema-change-forwarded `DROP COLUMN` dropped the column but left that type
+  behind as an orphan — harmless to existing data, but a later re-add of a
+  same-named column with a *different* value set would have collided with (or
+  silently reused) the stale type. `AlterDropColumn` now also issues
+  `DROP TYPE IF EXISTS "<schema>"."<table>_<col>_enum"`, but **only** for
+  these synthesized per-column types. A preserved/named PostgreSQL enum type
+  (`TypeName` set — which may be shared across columns or tables) is never
+  auto-dropped, so same-engine PG→PG enum sharing is unaffected.
+
 ## [0.99.58] - 2026-06-16
 
 ### Fixed
