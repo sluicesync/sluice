@@ -85,8 +85,8 @@ func TestReactiveResnapshot_SingleAttempt(t *testing.T) {
 		var calls int
 		var sawColdStartOnSecond bool
 		s := &Streamer{
-			StreamID:                        "test-stream",
-			AutoResnapshotOnInvalidPosition: true,
+			StreamID:                                "test-stream",
+			SuppressAutoResnapshotOnInvalidPosition: false,
 		}
 		s.runOnceFn = func(context.Context) error {
 			calls++
@@ -116,8 +116,8 @@ func TestReactiveResnapshot_SingleAttempt(t *testing.T) {
 	t.Run("opt-out: loud terminal error, no re-run", func(t *testing.T) {
 		var calls int
 		s := &Streamer{
-			StreamID:                        "test-stream",
-			AutoResnapshotOnInvalidPosition: false,
+			StreamID:                                "test-stream",
+			SuppressAutoResnapshotOnInvalidPosition: true,
 		}
 		s.runOnceFn = func(context.Context) error {
 			calls++
@@ -146,8 +146,8 @@ func TestReactiveResnapshot_SingleAttempt(t *testing.T) {
 	t.Run("bounded: second consecutive invalid position is terminal", func(t *testing.T) {
 		var calls int
 		s := &Streamer{
-			StreamID:                        "test-stream",
-			AutoResnapshotOnInvalidPosition: true,
+			StreamID:                                "test-stream",
+			SuppressAutoResnapshotOnInvalidPosition: false,
 		}
 		s.runOnceFn = func(context.Context) error {
 			calls++
@@ -176,11 +176,11 @@ func TestReactiveResnapshot_SingleAttempt(t *testing.T) {
 func TestReactiveResnapshot_RetryPath(t *testing.T) {
 	newStreamer := func(auto bool) *Streamer {
 		return &Streamer{
-			StreamID:                        "test-stream",
-			Target:                          resnapshotTargetEngine{},
-			TargetDSN:                       "tgt",
-			ApplyRetryAttempts:              5,
-			AutoResnapshotOnInvalidPosition: auto,
+			StreamID:                                "test-stream",
+			Target:                                  resnapshotTargetEngine{},
+			TargetDSN:                               "tgt",
+			ApplyRetryAttempts:                      5,
+			SuppressAutoResnapshotOnInvalidPosition: !auto,
 		}
 	}
 
@@ -252,7 +252,7 @@ func TestReactiveResnapshot_RetryPath(t *testing.T) {
 // cancellation is NOT mistaken for an invalid-position recovery trigger:
 // the recovery must only fire on a genuine ir.ErrPositionInvalid.
 func TestReactiveResnapshot_IgnoresCtxCancel(t *testing.T) {
-	s := &Streamer{StreamID: "test-stream", AutoResnapshotOnInvalidPosition: true}
+	s := &Streamer{StreamID: "test-stream", SuppressAutoResnapshotOnInvalidPosition: false}
 	var calls int
 	s.runOnceFn = func(context.Context) error {
 		calls++

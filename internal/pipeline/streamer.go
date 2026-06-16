@@ -292,31 +292,30 @@ type Streamer struct {
 	// not perpetually re-cold-start.
 	RestartFromScratch bool
 
-	// AutoResnapshotOnInvalidPosition controls whether a resume from an
-	// invalid/purged source position auto-recovers with a fresh
-	// cold-start re-snapshot (ADR-0093). Default true = parity with the
-	// self-hosted MySQL binlog path, which already falls through to
-	// cold-start on a pre-flight [ir.ErrPositionInvalid] (ADR-0022).
+	// SuppressAutoResnapshotOnInvalidPosition is the OPT-OUT for the
+	// ADR-0093 auto-recovery from a resume against an invalid/purged
+	// source position. Deliberately an opt-out so the ZERO VALUE (false)
+	// is the safe, binlog-parity default — auto-recover — for every
+	// Streamer construction (CLI, tests, future callers) without each
+	// having to set a field. Set true only by `--no-auto-resnapshot`.
 	//
-	// When true, BOTH the pre-flight fall-through (the ADR-0022 sites in
-	// [phaseDispatchStreamStart]) AND the reactive recovery (a
-	// [ir.ErrPositionInvalid] surfaced from the VStream pump's Recv —
-	// see ADR-0093 — routed by [Run] / [runWithRetry]) re-enter
-	// cold-start in the same Run, non-destructively (the idempotent COPY
-	// writer absorbs the overlap; no target drop). The reactive recovery
-	// is bounded to ONE re-snapshot per Run: a second consecutive
-	// [ir.ErrPositionInvalid] after a fresh cold-start is terminal — it
-	// means the source is purging faster than a snapshot completes, which
-	// auto-retry cannot fix and must surface loudly.
+	// Default (false) = auto-recover: BOTH the pre-flight fall-through
+	// (the ADR-0022 sites in [phaseOpenChangeStream]) AND the reactive
+	// recovery (a [ir.ErrPositionInvalid] surfaced from the VStream
+	// pump's Recv — see ADR-0093 — routed by [Run] / [runWithRetry])
+	// re-enter cold-start in the same Run, non-destructively (the
+	// idempotent COPY writer absorbs the overlap; no target drop). The
+	// reactive recovery is bounded to ONE re-snapshot per Run: a second
+	// consecutive [ir.ErrPositionInvalid] after a fresh cold-start is
+	// terminal — the source is purging faster than a snapshot completes,
+	// which auto-retry cannot fix and must surface loudly.
 	//
-	// When false (operator set --no-auto-resnapshot), both paths are
-	// suppressed: [ir.ErrPositionInvalid] surfaces as a loud, actionable
-	// terminal error naming the recovery commands. For operators who
-	// would rather decide a (potentially expensive) full re-snapshot
-	// deliberately than have it happen automatically. The flag is set on
-	// every Streamer construction site; the zero value (false) only
-	// occurs in tests that don't exercise this path.
-	AutoResnapshotOnInvalidPosition bool
+	// True (operator set --no-auto-resnapshot) = both paths suppressed:
+	// [ir.ErrPositionInvalid] surfaces as a loud, actionable terminal
+	// error naming the recovery commands. For operators who would rather
+	// decide a (potentially expensive) full re-snapshot deliberately than
+	// have it happen automatically.
+	SuppressAutoResnapshotOnInvalidPosition bool
 
 	// SchemaAlreadyApplied, when true, declares that the target's
 	// schema (and the `sluice_cdc_state` control table) have been
@@ -950,16 +949,16 @@ func (s *Streamer) isReactiveInvalidPosition(err error) bool {
 // (retry=false, terminalErr) when the position must surface as a loud
 // terminal error.
 //
-//   - AutoResnapshotOnInvalidPosition && !alreadyResnapshotted: log a loud
+//   - auto (default, !Suppress) && !alreadyResnapshotted: log a loud
 //     WARN, set RestartFromScratch so the next attempt re-snapshots
 //     non-destructively, and signal retry.
-//   - AutoResnapshotOnInvalidPosition && alreadyResnapshotted: bounded —
+//   - auto (default, !Suppress) && alreadyResnapshotted: bounded —
 //     a second consecutive invalid position after a fresh cold-start is
 //     terminal (the source is purging faster than a snapshot completes).
-//   - !AutoResnapshotOnInvalidPosition: opt-out — surface the loud,
+//   - SuppressAutoResnapshotOnInvalidPosition: opt-out — surface the loud,
 //     actionable terminal error naming the recovery commands.
 func (s *Streamer) reactiveResnapshotDecision(ctx context.Context, err error, alreadyResnapshotted bool) (bool, error) {
-	if !s.AutoResnapshotOnInvalidPosition {
+	if s.SuppressAutoResnapshotOnInvalidPosition {
 		return false, invalidPositionOptOutError(err)
 	}
 	if alreadyResnapshotted {

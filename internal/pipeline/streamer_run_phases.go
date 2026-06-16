@@ -538,10 +538,13 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, lsnTrac
 				// ADR-0093: --no-auto-resnapshot suppresses the ADR-0022
 				// pre-flight fall-through too (kept consistent with the
 				// reactive path), surfacing a loud actionable terminal error
-				// instead of an automatic re-snapshot.
-				if !s.AutoResnapshotOnInvalidPosition {
+				// instead of an automatic re-snapshot. Close the warmResume
+				// reader here and return a NO-OP stop (NOT nil) — runOnce's
+				// `defer func(){ stop() }()` calls the returned stop, so nil
+				// would panic.
+				if s.SuppressAutoResnapshotOnInvalidPosition {
 					stop()
-					return nil, nil, false, invalidPositionOptOutError(err)
+					return nil, func() {}, false, invalidPositionOptOutError(err)
 				}
 				slog.WarnContext(
 					ctx, "multi-database warm resume: persisted position is no longer valid; falling through to cold start",
@@ -601,10 +604,13 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, lsnTrac
 			// path), surfacing a loud actionable terminal error instead of an
 			// automatic re-snapshot. The PositionFromManifestStore == nil
 			// guard above keeps the backup-chain case on its own
-			// surface-verbatim path regardless of this flag.
-			if !s.AutoResnapshotOnInvalidPosition {
+			// surface-verbatim path regardless of this flag. Close the
+			// warmResume reader here and return a NO-OP stop (NOT nil) —
+			// runOnce's `defer func(){ stop() }()` calls the returned stop,
+			// so nil would panic.
+			if s.SuppressAutoResnapshotOnInvalidPosition {
 				stop()
-				return nil, nil, false, invalidPositionOptOutError(err)
+				return nil, func() {}, false, invalidPositionOptOutError(err)
 			}
 			slog.WarnContext(
 				ctx, "warm resume: persisted position is no longer valid; falling through to cold start",
