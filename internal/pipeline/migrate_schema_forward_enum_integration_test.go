@@ -16,9 +16,10 @@
 //       now routes enum wants to ADD VALUE IF NOT EXISTS.
 //
 // MySQL → PG only: MySQL ENUM is column-inline (the reader projects ir.Enum
-// cleanly), so the bug was purely the PG writer's forward emission. A
-// PG-source enum is a custom catalog OID the CDC reader doesn't resolve —
-// a separate, out-of-scope gap.
+// cleanly), so the bug was purely the PG writer's forward emission. (A
+// PG-source enum over CDC was a separate gap — the reader didn't resolve the
+// dynamic enum OID — closed by catalog Bug 151; see
+// internal/engines/postgres/cdc_reader_enum_integration_test.go.)
 
 package pipeline
 

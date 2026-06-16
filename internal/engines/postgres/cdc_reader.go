@@ -82,6 +82,23 @@ type CDCReader struct {
 	geometryOID     uint32
 	extOIDsResolved bool
 
+	// enumOIDs is the set of the source's user-defined ENUM type OIDs
+	// (pg_type.typtype='e'), resolved from pg_type (catalog Bug 151).
+	// Like geometryOID these are DYNAMIC (assigned at CREATE TYPE time)
+	// so the static [oidToType] table can't carry them; unlike geometry
+	// a database can hold MANY enum types, so this is a set rather than a
+	// scalar. [buildRelationCacheEntry] consults it to map an enum column
+	// to ir.Enum (decoded as its text label — value_decode already has
+	// the ir.Enum arm) instead of loud-refusing the dynamic OID. Resolved
+	// per-RelationMessage via [ensureEnumTypeOIDs] (off the per-row path,
+	// alongside the identity-key / stable-ID lookups) and cached
+	// cumulatively, so a mid-stream CREATE TYPE + ADD COLUMN (ADR-0091
+	// forward) is picked up on its RelationMessage. nil until first lookup.
+	//
+	// Enum ARRAY columns (enum[]) are out of scope and stay loud-refused:
+	// their array OID is neither in pgArrayElementOID nor typtype='e'.
+	enumOIDs map[uint32]bool
+
 	// schema is the Postgres namespace the reader is bound to.
 	// Events for other schemas are dropped during dispatch.
 	schema string
@@ -817,7 +834,10 @@ func (r *CDCReader) dispatchWAL(
 		if err := r.ensureExtensionTypeOIDs(ctx); err != nil {
 			return err
 		}
-		entry, err := buildRelationCacheEntry(m.RelationMessage, r.geometryOID)
+		if err := r.ensureEnumTypeOIDs(ctx, m.Columns); err != nil {
+			return err
+		}
+		entry, err := buildRelationCacheEntry(m.RelationMessage, r.geometryOID, r.enumOIDs)
 		if err != nil {
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
@@ -851,7 +871,10 @@ func (r *CDCReader) dispatchWAL(
 		if err := r.ensureExtensionTypeOIDs(ctx); err != nil {
 			return err
 		}
-		entry, err := buildRelationCacheEntry(*m, r.geometryOID)
+		if err := r.ensureEnumTypeOIDs(ctx, m.Columns); err != nil {
+			return err
+		}
+		entry, err := buildRelationCacheEntry(*m, r.geometryOID, r.enumOIDs)
 		if err != nil {
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
@@ -1615,6 +1638,68 @@ func (r *CDCReader) ensureExtensionTypeOIDs(ctx context.Context) error {
 	return nil
 }
 
+// firstUserOID is PostgreSQL's FirstNormalObjectId — OIDs below it are
+// builtin/system catalog objects, never a user-defined enum (CREATE TYPE
+// always allocates a normal OID at or above it). A column whose type OID
+// is below this can't be an enum, so it's skipped from the enum lookup —
+// which means an enum-free table (all-builtin OIDs) costs no query.
+const firstUserOID = 16384
+
+// ensureEnumTypeOIDs records which of a RelationMessage's column type
+// OIDs are user-defined ENUM types (pg_type.typtype='e') on r.enumOIDs,
+// so [buildRelationCacheEntry] can map an enum column to ir.Enum instead
+// of loud-refusing its dynamic OID (catalog Bug 151 — same class as the
+// Bug 144 array / Bug 147 geometry oidToType gaps). Enum OIDs are dynamic
+// (assigned at CREATE TYPE time) and a database can hold many, so they
+// can't live in the static [oidToType] table.
+//
+// It queries only when the relation carries a user-OID (>= firstUserOID)
+// not already classified, so an all-builtin table costs no round-trip;
+// when it does query it resolves the full enum-OID set in one shot. It is
+// re-checked per RelationMessage (off the per-row path — RelationMessages
+// fire only on first-touch / schema change), which also lets a mid-stream
+// CREATE TYPE + ADD COLUMN (ADR-0091 forward) be picked up. A nil r.db
+// (hand-built unit reader) is a no-op. A user-OID that is NOT an enum
+// (composite type, domain, …) stays unclassified and is correctly
+// loud-refused by buildRelationCacheEntry — which terminates the stream,
+// so the "needsLookup re-fires every RelationMessage for an unclassified
+// user-OID" cost never actually recurs (the relation carrying it never
+// gets a second RelationMessage). No negative cache is needed.
+func (r *CDCReader) ensureEnumTypeOIDs(ctx context.Context, cols []*pglogrepl.RelationMessageColumn) error {
+	if r.db == nil {
+		return nil
+	}
+	needsLookup := false
+	for _, c := range cols {
+		if c != nil && c.DataType >= firstUserOID && !r.enumOIDs[c.DataType] {
+			needsLookup = true
+			break
+		}
+	}
+	if !needsLookup {
+		return nil
+	}
+	rows, err := r.db.QueryContext(ctx, `SELECT oid FROM pg_type WHERE typtype = 'e'`)
+	if err != nil {
+		return fmt.Errorf("postgres: cdc: resolve enum type OIDs: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	if r.enumOIDs == nil {
+		r.enumOIDs = make(map[uint32]bool)
+	}
+	for rows.Next() {
+		var oid uint32
+		if err := rows.Scan(&oid); err != nil {
+			return fmt.Errorf("postgres: cdc: scan enum type OID: %w", err)
+		}
+		r.enumOIDs[oid] = true
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("postgres: cdc: iterate enum type OIDs: %w", err)
+	}
+	return nil
+}
+
 // buildRelationCacheEntry projects a [pglogrepl.RelationMessage] into
 // the IR-typed cache entry. Errors when the relation contains a
 // column whose OID isn't in the static OID-to-IR table — that's the
@@ -1627,14 +1712,24 @@ func (r *CDCReader) ensureExtensionTypeOIDs(ctx context.Context) error {
 // SRID/subtype, so they are left unset — recovered target-side from
 // geometry_columns at apply time (ADR-0035 / #20). geography is intentionally
 // not handled (stays loud-refused — see CDCReader.geometryOID).
-func buildRelationCacheEntry(m pglogrepl.RelationMessage, geomOID uint32) (*relationCacheEntry, error) {
+//
+// enumOIDs is the set of the source's user-defined ENUM type OIDs (catalog
+// Bug 151), also dynamic and resolved at runtime ([ensureEnumTypeOIDs]). A
+// column whose OID is in the set is mapped to a BARE ir.Enum{} after the
+// static lookup declines — the value decodes as its text label (value_decode's
+// ir.Enum arm), and the wire carries no type name / value list, so those are
+// left empty and recovered from the seed side via NormalizeForCDCComparison.
+func buildRelationCacheEntry(m pglogrepl.RelationMessage, geomOID uint32, enumOIDs map[uint32]bool) (*relationCacheEntry, error) {
 	cols := make([]relationColumn, 0, len(m.Columns))
 	for _, c := range m.Columns {
 		t, err := oidToType(c.DataType, c.TypeModifier)
 		if err != nil {
-			if geomOID != 0 && c.DataType == geomOID {
+			switch {
+			case geomOID != 0 && c.DataType == geomOID:
 				t = ir.Geometry{}
-			} else {
+			case enumOIDs[c.DataType]:
+				t = ir.Enum{}
+			default:
 				return nil, fmt.Errorf("column %q: %w", c.Name, err)
 			}
 		}
