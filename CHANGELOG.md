@@ -4,6 +4,20 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [0.99.58] - 2026-06-16
+
+### Fixed
+- **MySQL `SET` columns now replicate to a PostgreSQL `text[]` over CDC
+  (Bug 149).** With v0.99.56's SET fix, a MySQL `SET` decodes to a Go string
+  slice and its PG target is `TEXT[]` — but the CDC applier's array binding
+  required a different internal slice shape and rejected it with a loud
+  `expected []any for Array column, got []string`, halting the stream at apply
+  (no silent loss). The applier's array binding now accepts the string-slice
+  shape and routes it through the same path as a native `text[]`, so a MySQL
+  `SET` lands as its member labels in a PG `text[]` column. (Cold-start
+  migration of `SET` → `text[]` already worked; this closes the continuous-
+  sync apply path.)
+
 ## [0.99.57] - 2026-06-16
 
 ### Fixed
