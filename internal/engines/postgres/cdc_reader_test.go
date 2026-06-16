@@ -441,7 +441,7 @@ func TestBuildRelationCacheEntry(t *testing.T) {
 			{Flags: 0, Name: "email", DataType: pgtype.VarcharOID, TypeModifier: 259},
 		},
 	}
-	got, err := buildRelationCacheEntry(rel, 0)
+	got, err := buildRelationCacheEntry(rel, 0, nil)
 	if err != nil {
 		t.Fatalf("buildRelationCacheEntry: %v", err)
 	}
@@ -474,8 +474,45 @@ func TestBuildRelationCacheEntryUnknownColumnType(t *testing.T) {
 			{Name: "x", DataType: 99999, TypeModifier: -1},
 		},
 	}
-	if _, err := buildRelationCacheEntry(rel, 0); err == nil {
+	if _, err := buildRelationCacheEntry(rel, 0, nil); err == nil {
 		t.Fatal("expected error for unknown column type OID")
+	}
+}
+
+// catalog Bug 151: a column whose dynamic OID is a known user-defined enum
+// (typtype='e', resolved into the enumOIDs set) maps to a bare ir.Enum{}
+// AFTER the static oidToType declines — instead of refusing the OID. A
+// dynamic OID NOT in the set still refuses (a composite / domain / unknown
+// user type stays loud). The value decodes as its text label via the
+// existing ir.Enum arm in value_decode; this pins only the recognition.
+func TestBuildRelationCacheEntry_EnumOID_Bug151(t *testing.T) {
+	const enumOID uint32 = 16450 // a dynamic CREATE TYPE OID
+	rel := pglogrepl.RelationMessage{
+		Namespace:    "public",
+		RelationName: "orders",
+		ColumnNum:    2,
+		Columns: []*pglogrepl.RelationMessageColumn{
+			{Flags: 1, Name: "id", DataType: pgtype.Int8OID, TypeModifier: -1},
+			{Flags: 0, Name: "status", DataType: enumOID, TypeModifier: -1},
+		},
+	}
+
+	// Without the enum OID in the set, the dynamic OID is unknown → refuse.
+	if _, err := buildRelationCacheEntry(rel, 0, nil); err == nil {
+		t.Fatal("expected refusal for an unresolved enum OID")
+	}
+
+	// With it resolved, the column maps to a bare ir.Enum{}.
+	got, err := buildRelationCacheEntry(rel, 0, map[uint32]bool{enumOID: true})
+	if err != nil {
+		t.Fatalf("buildRelationCacheEntry with enum OID: %v", err)
+	}
+	enum, ok := got.Columns[1].Type.(ir.Enum)
+	if !ok {
+		t.Fatalf("col[1].Type = %#v; want ir.Enum", got.Columns[1].Type)
+	}
+	if enum.TypeName != "" || len(enum.Values) != 0 {
+		t.Errorf("enum projection = %#v; want bare ir.Enum{} (wire carries no name/values)", enum)
 	}
 }
 

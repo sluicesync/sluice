@@ -132,21 +132,23 @@ func TestStreamer_PostgresToPostgres_EnumAddValueMidStream_DriftPolicy(t *testin
 					"the stream should either fail loudly OR keep applying; clean exit is silent-loss class.\n"+
 					"err=%v", err)
 			}
-			// LOUD failure path. The first CI on this pin showed the
-			// shape sluice produces today:
+			// LOUD failure path. The error SHAPE shifted with catalog
+			// Bug 151: before it, the PG-source reader wedged at
+			// oidToType ("unsupported column type OID 16390"); now the
+			// reader resolves the dynamic enum OID and decodes 'blue' as
+			// a label, so the LOUD failure moves DOWNSTREAM to the
+			// applier, where PG rejects the unknown label against the
+			// target enum's value set:
 			//
-			//   "pipeline: source cdc reader: postgres: cdc: relation
-			//    public.paint: column \"c\": postgres: cdc: unsupported
-			//    column type OID 16390 (typmod -1)"
+			//   "...: invalid input value for enum color: \"blue\""  (22P02)
 			//
-			// LOUD ✓ (fires within ~200ms, halts the stream, names the
-			// relation + column + OID). The hint quality could be
-			// upgraded (an ideal message would also name the type
-			// "color", mention "ENUM", and point at ALTER TYPE as the
-			// likely cause), but the current shape IS operator-actionable
-			// — an operator can look up OID 16390 in `pg_type` to find
-			// it's the ENUM. The test passes when the error names a
-			// grep-able shape; the hint quality is a logged follow-up.
+			// Both shapes are LOUD ✓ (halt the stream, no silent loss) and
+			// both are accepted below — the assertion takes either the
+			// applier 22P02/enum/label hints OR the pre-151 reader
+			// unsupported-OID shape, so the test is robust across the
+			// transition. (The seed row c='red' applying cleanly through
+			// the full Streamer also makes this the de-facto enum
+			// happy-path apply pin.)
 			errStr := err.Error()
 			t.Logf("LOUD-FAILURE path: streamer surfaced an error within %v\n  err: %v",
 				time.Since(deadline.Add(-window)), errStr)

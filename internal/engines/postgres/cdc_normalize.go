@@ -243,6 +243,22 @@ func normalizeTypeForCDCComparison(t ir.Type) ir.Type {
 		// apply time (ADR-0035 / #20). Same Bug-84/86 class as the temporal
 		// and decimal cases above — geometry was simply missed.
 		return ir.Geometry{IsGeography: v.IsGeography}
+	case ir.Enum:
+		// catalog Bug 151: the cold-start SchemaReader reads pg_type +
+		// pg_enum and populates ir.Enum{TypeName, Values}; the pgoutput
+		// RelationMessage carries only the dynamic enum type OID, so
+		// [buildRelationCacheEntry] projects a BARE ir.Enum{} (the value
+		// rides the wire as its text label — type name and value list are
+		// not carried). Without this, the classifier's [diffAlteredColumn]
+		// reflect.DeepEqual fires a phantom ShapeKindAlterColumnType on
+		// every enum column at the first CDC boundary (and, combined with a
+		// real concurrent ADD COLUMN, a loud multi-shape combo refusal that
+		// wedges a legitimate change). Strip both fields to the bare shape
+		// the wire can carry. Same Bug-84/86/147 class as the temporal,
+		// decimal, and geometry cases above. Cost: an ALTER TYPE ADD VALUE
+		// can't be classifier-detected via CDC — but pgoutput doesn't carry
+		// it anyway, and a new label simply applies as text on the target.
+		return ir.Enum{}
 	}
 	return t
 }

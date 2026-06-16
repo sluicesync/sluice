@@ -136,6 +136,28 @@ func TestNormalizeForCDCComparison_PG(t *testing.T) {
 		}
 	})
 
+	t.Run("Enum_rich_seed_collapsed_bug151", func(t *testing.T) {
+		// catalog Bug 151: cold-start SchemaReader reads pg_type+pg_enum and
+		// populates ir.Enum{TypeName, Values}; the pgoutput CDC projection
+		// emits a bare ir.Enum{} (the value rides the wire as its text label,
+		// no type name / value list). Without normalization the classifier
+		// false-positives an altered-column on every enum column at the first
+		// CDC boundary. Both fields must collapse to the bare shape.
+		in := &ir.Table{
+			Columns: []*ir.Column{
+				{Name: "status", Type: ir.Enum{TypeName: "order_status", Values: []string{"draft", "live", "void"}}},
+			},
+		}
+		out := eng.NormalizeForCDCComparison(in)
+		e, ok := out.Columns[0].Type.(ir.Enum)
+		if !ok {
+			t.Fatalf("enum column type changed: %T", out.Columns[0].Type)
+		}
+		if e.TypeName != "" || len(e.Values) != 0 {
+			t.Errorf("enum seed = %#v; want bare ir.Enum{} (matches CDC projection)", e)
+		}
+	})
+
 	t.Run("DateTime_default_precision_collapsed_bug86", func(t *testing.T) {
 		// PG `TIMESTAMP` (no explicit precision) → SchemaReader reads
 		// information_schema.datetime_precision=6; CDC reads
