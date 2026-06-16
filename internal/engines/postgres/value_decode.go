@@ -4,6 +4,7 @@
 package postgres
 
 import (
+	"bytes"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -128,37 +129,69 @@ func decodeValue(raw any, t ir.Type) (any, error) {
 }
 
 // decodePGGeometry normalises a PostGIS geometry column value into
-// the IR's canonical "raw WKB bytes" form. pgx's stdlib mode hands
-// us either:
+// the IR's canonical "raw WKB bytes" form. It receives the value in
+// one of three shapes depending on the read path:
 //
-//   - a string in EWKB-as-hex text form (the default for unknown
-//     OIDs — `default:` branch in pgx/stdlib's row-value decoder
-//     scans the wire bytes as a string); or
-//   - raw []byte in EWKB or WKB form (defensive — covers any future
-//     codec registration that delivers bytes directly).
+//   - cold-start (pgx stdlib, unknown OID): a `string` in EWKB-as-hex
+//     text form (geometry_out's output), optionally "\x"-prefixed.
+//   - CDC (pgoutput text format, Bug 147): `[]byte` carrying that SAME
+//     hex-EWKB text — decodeTuple hands the wire bytes straight through,
+//     so the bytes are hex ASCII, NOT raw EWKB.
+//   - defensive: raw `[]byte` in EWKB/WKB binary (a future binary codec
+//     delivering bytes directly).
 //
-// In both cases, we end up at [ewkbToWKB] which strips the SRID
-// framing if present and returns raw WKB. Per-row SRID is
-// intentionally dropped — the IR treats SRID as a per-column
-// property captured at schema-translation time (ADR-0035).
+// The []byte hex-vs-binary ambiguity is resolved structurally: hex-EWKB
+// is even-length and entirely ASCII hex digits, whereas raw EWKB begins
+// with a byte-order byte (0x00/0x01) that is never an ASCII hex digit —
+// so isHexASCII cleanly distinguishes them (the Bug-144 []byte-is-text
+// trap, applied to geometry). Both ultimately reach [ewkbToWKB], which
+// strips the SRID framing and returns raw WKB. Per-row SRID is
+// intentionally dropped — the IR treats SRID as a per-column property
+// (ADR-0035), recovered target-side at apply time (#20).
 func decodePGGeometry(raw any) (any, error) {
 	switch v := raw.(type) {
 	case string:
-		// PostGIS canonical text form for binary output: optional
-		// "\x" hex prefix (the bytea-style escape), followed by an
-		// even-length lowercase hex string. PostGIS's geometry_out
-		// emits EWKB-as-hex without the bytea prefix; tolerate both
-		// shapes so the codec is robust to future PG/PostGIS changes.
-		s := strings.TrimPrefix(v, `\x`)
-		ewkb, err := hex.DecodeString(s)
-		if err != nil {
-			return nil, fmt.Errorf("postgres: cannot decode geometry hex %q: %w", v, err)
-		}
-		return ewkbToWKB(ewkb)
+		return decodeGeometryHexOrRaw([]byte(v))
 	case []byte:
-		return ewkbToWKB(v)
+		return decodeGeometryHexOrRaw(v)
 	}
 	return nil, fmt.Errorf("postgres: cannot decode %T as Geometry", raw)
+}
+
+// decodeGeometryHexOrRaw turns a geometry value's bytes into raw WKB,
+// accepting either the hex-EWKB text spelling (cold-start string /
+// pgoutput text-format bytes) or raw binary EWKB. See [decodePGGeometry]
+// for why the two are unambiguous.
+func decodeGeometryHexOrRaw(b []byte) (any, error) {
+	b = bytes.TrimPrefix(b, []byte(`\x`))
+	if isHexASCII(b) {
+		ewkb := make([]byte, hex.DecodedLen(len(b)))
+		if _, err := hex.Decode(ewkb, b); err != nil {
+			return nil, fmt.Errorf("postgres: cannot decode geometry hex %q: %w", b, err)
+		}
+		return ewkbToWKB(ewkb)
+	}
+	return ewkbToWKB(b)
+}
+
+// isHexASCII reports whether b is a non-empty, even-length string of ASCII
+// hex digits — the shape of PostGIS's hex-EWKB text output. Raw binary EWKB
+// fails this (its leading byte-order byte 0x00/0x01 is not a hex digit), so
+// it is the discriminator [decodeGeometryHexOrRaw] uses.
+func isHexASCII(b []byte) bool {
+	if len(b) == 0 || len(b)%2 != 0 {
+		return false
+	}
+	for _, c := range b {
+		switch {
+		case c >= '0' && c <= '9':
+		case c >= 'a' && c <= 'f':
+		case c >= 'A' && c <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // decodeExtensionValue routes an extension-typed column value through

@@ -86,7 +86,9 @@ func (pgGeometryBinaryCodec) PlanEncode(_ *pgtype.Map, _ uint32, format int16, v
 
 // PlanScan / Decode* are implemented for round-trip symmetry (unit tests,
 // and any future applier path that scans geometry back). The CDC applier
-// itself never reads geometry; the CDC reader decodes it on its own path.
+// itself never reads geometry; the CDC READER decodes it on its own path
+// (decodePGGeometry, wired to the dynamic geometry OID in
+// buildRelationCacheEntry — Bug 147).
 func (pgGeometryBinaryCodec) PlanScan(_ *pgtype.Map, _ uint32, _ int16, _ any) pgtype.ScanPlan {
 	return nil
 }

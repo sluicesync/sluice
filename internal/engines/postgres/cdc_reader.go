@@ -65,6 +65,23 @@ type CDCReader struct {
 	// is missing.
 	db *sql.DB
 
+	// geometryOID is the runtime OID of the PostGIS `geometry` type on the
+	// source, resolved once from pg_type (Bug 147). It is DYNAMIC (assigned
+	// at CREATE EXTENSION postgis time), so the static [oidToType] table
+	// cannot carry it; [buildRelationCacheEntry] consults it to map a
+	// geometry column to ir.Geometry. 0 means "not present / not resolved"
+	// (no PostGIS on the source — no geometry columns possible).
+	// extOIDsResolved guards the one-time lookup (off the per-row path).
+	//
+	// PostGIS `geography` is deliberately NOT resolved here: the CDC apply
+	// path has no geography codec yet (#20 registered geometry only), so
+	// geography-over-CDC stays loudly refused at the reader (unknown OID) —
+	// a single clean refusal point rather than reader-accepts/applier-
+	// refuses. Geography end-to-end (reader + applier codec + matrix) is a
+	// tracked follow-up.
+	geometryOID     uint32
+	extOIDsResolved bool
+
 	// schema is the Postgres namespace the reader is bound to.
 	// Events for other schemas are dropped during dispatch.
 	schema string
@@ -797,7 +814,10 @@ func (r *CDCReader) dispatchWAL(
 
 	switch m := logical.(type) {
 	case *pglogrepl.RelationMessageV2:
-		entry, err := buildRelationCacheEntry(m.RelationMessage)
+		if err := r.ensureExtensionTypeOIDs(ctx); err != nil {
+			return err
+		}
+		entry, err := buildRelationCacheEntry(m.RelationMessage, r.geometryOID)
 		if err != nil {
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
@@ -828,7 +848,10 @@ func (r *CDCReader) dispatchWAL(
 		return r.maybeSnapshotSchema(ctx, entry, m.RelationID, xld.WALStart, snapshotSig, out)
 
 	case *pglogrepl.RelationMessage:
-		entry, err := buildRelationCacheEntry(*m)
+		if err := r.ensureExtensionTypeOIDs(ctx); err != nil {
+			return err
+		}
+		entry, err := buildRelationCacheEntry(*m, r.geometryOID)
 		if err != nil {
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
@@ -1563,16 +1586,57 @@ func (r *CDCReader) maybeSnapshotSchema(
 	return nil
 }
 
+// ensureExtensionTypeOIDs resolves the source's runtime PostGIS `geometry`
+// type OID ONCE and caches it on the reader (Bug 147). The OID is dynamic
+// (assigned at CREATE EXTENSION time), so the static [oidToType] table can't
+// carry it; [buildRelationCacheEntry] needs it to map a geometry column to
+// ir.Geometry instead of loud-refusing its unknown OID. A source without
+// PostGIS leaves it at 0 (the type doesn't exist) — no geometry columns can
+// occur, so the reader behaves exactly as before. Idempotent + off the
+// per-row path (guarded by extOIDsResolved; called from handleRelation,
+// which fires only on a RelationMessage). A nil r.db (hand-built unit
+// reader) is a no-op.
+func (r *CDCReader) ensureExtensionTypeOIDs(ctx context.Context) error {
+	if r.extOIDsResolved || r.db == nil {
+		return nil
+	}
+	const q = `SELECT oid FROM pg_type WHERE typname = 'geometry' LIMIT 1`
+	var oid uint32
+	switch err := r.db.QueryRowContext(ctx, q).Scan(&oid); {
+	case errors.Is(err, sql.ErrNoRows):
+		// PostGIS not installed — leave geometryOID 0. No geometry columns
+		// can exist, so the reader behaves exactly as before.
+	case err != nil:
+		return fmt.Errorf("postgres: cdc: resolve PostGIS geometry OID: %w", err)
+	default:
+		r.geometryOID = oid
+	}
+	r.extOIDsResolved = true
+	return nil
+}
+
 // buildRelationCacheEntry projects a [pglogrepl.RelationMessage] into
 // the IR-typed cache entry. Errors when the relation contains a
 // column whose OID isn't in the static OID-to-IR table — that's the
 // loud-failure surface for unknown / custom types.
-func buildRelationCacheEntry(m pglogrepl.RelationMessage) (*relationCacheEntry, error) {
+//
+// geomOID is the source's runtime PostGIS geometry type OID (0 when PostGIS
+// is absent or unresolved). It is DYNAMIC, so it can't live in the static
+// [oidToType] table (Bug 147): a column whose OID matches is mapped to
+// ir.Geometry here, after the static lookup declines. pgoutput carries no
+// SRID/subtype, so they are left unset — recovered target-side from
+// geometry_columns at apply time (ADR-0035 / #20). geography is intentionally
+// not handled (stays loud-refused — see CDCReader.geometryOID).
+func buildRelationCacheEntry(m pglogrepl.RelationMessage, geomOID uint32) (*relationCacheEntry, error) {
 	cols := make([]relationColumn, 0, len(m.Columns))
 	for _, c := range m.Columns {
 		t, err := oidToType(c.DataType, c.TypeModifier)
 		if err != nil {
-			return nil, fmt.Errorf("column %q: %w", c.Name, err)
+			if geomOID != 0 && c.DataType == geomOID {
+				t = ir.Geometry{}
+			} else {
+				return nil, fmt.Errorf("column %q: %w", c.Name, err)
+			}
 		}
 		cols = append(cols, relationColumn{
 			Name:      c.Name,
