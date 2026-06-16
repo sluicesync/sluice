@@ -4,6 +4,39 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [0.99.54] - 2026-06-16
+
+### Added
+- **PostGIS `geometry` columns now sync over CDC to a PostgreSQL target
+  (#20).** Geometry was previously un-appliable over continuous sync: the
+  CDC applier had no codec for PostGIS's (dynamically-assigned) `geometry`
+  type OID, so the EWKB bytes were shipped in text format and PostGIS
+  rejected them (`parse error - invalid geometry`) — a loud refusal on both
+  the serial and pipelined (ADR-0092) apply paths. (Cold-start COPY was
+  unaffected.) A binary geometry codec is now registered on the applier
+  connections and ships EWKB to `geometry_recv`, so an INSERT/UPDATE/DELETE
+  carrying a geometry value applies correctly — every subtype (point / line
+  / polygon / multi* / collection), dimension (2D/Z/M/ZM), and byte order,
+  pinned against a real PostGIS target.
+
+### Fixed
+- **Per-column SRID is now preserved on geometry CDC apply (#20).** The CDC
+  readers strip per-row SRID to raw WKB (the IR carries SRID as a per-column
+  property, ADR-0035), and the applier previously defaulted the column SRID
+  to 0 — so a replicated value into a constrained `geometry(<type>,<srid>)`
+  column lost its SRID. The applier now recovers each geometry column's real
+  SRID (and subtype) from `geometry_columns` / `geography_columns`, so the
+  stored geometry matches the source (verified `ST_AsEWKB` + `ST_SRID`
+  src==dst).
+
+### Compatibility / notes
+- No flag or config change; geometry-over-CDC works by default once the
+  target has PostGIS installed.
+- `geography` columns and `geometry[]` (arrays of geometry) remain **loudly
+  refused** over CDC apply (no silent loss) — separate follow-up work. A
+  per-row SRID stored in an *unconstrained* `geometry` column is still
+  dropped by design (ADR-0035).
+
 ## [0.99.53] - 2026-06-16
 
 ### Fixed
