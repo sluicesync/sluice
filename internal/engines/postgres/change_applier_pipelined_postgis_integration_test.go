@@ -215,25 +215,33 @@ func TestPipelined_PostGIS_GeometryFamilyMatrix(t *testing.T) {
 		name string
 		wkt  string
 		srid int
-		be   bool // feed big-endian raw WKB (exercises wkbToEWKB's BE branch)
+		// mod is the PostGIS subtype+dimension type modifier for the target
+		// column (geometry(<mod>,<srid>)). It MUST match the value's subtype
+		// and dimension: a `geometry(Geometry,...)` (2D) column rejects a Z/M
+		// value with SQLSTATE 22023, exactly as a real sluice-translated
+		// target column would if the schema writer dropped the dimension —
+		// so the modifier here mirrors the dimension-qualified column the
+		// cold-start path emits for the source type.
+		mod string
+		be  bool // feed big-endian raw WKB (exercises wkbToEWKB's BE branch)
 	}{
-		{"point_2d_srid0", "POINT(1 2)", 0, false},
-		{"point_2d_srid4326", "POINT(1 2)", 4326, false},
-		{"point_z", "POINT Z (1 2 3)", 4326, false},
-		{"point_m", "POINT M (1 2 3)", 4326, false},
-		{"point_zm", "POINT ZM (1 2 3 4)", 4326, false},
-		{"linestring", "LINESTRING(0 0, 1 1, 2 2)", 4326, false},
-		{"linestring_z", "LINESTRING Z (0 0 0, 1 1 1)", 4326, false},
-		{"polygon", "POLYGON((0 0, 0 1, 1 1, 1 0, 0 0))", 4326, false},
-		{"polygon_hole", "POLYGON((0 0,0 5,5 5,5 0,0 0),(1 1,1 2,2 2,2 1,1 1))", 4326, false},
-		{"multipoint", "MULTIPOINT((0 0),(1 1))", 4326, false},
-		{"multilinestring", "MULTILINESTRING((0 0,1 1),(2 2,3 3))", 4326, false},
-		{"multipolygon", "MULTIPOLYGON(((0 0,0 1,1 1,1 0,0 0)))", 4326, false},
-		{"geomcollection", "GEOMETRYCOLLECTION(POINT(0 0),LINESTRING(0 0,1 1))", 4326, false},
-		{"point_3857", "POINT(500000 6000000)", 3857, false},
-		{"point_be", "POINT(1 2)", 4326, true},
-		{"polygon_be", "POLYGON((0 0,0 1,1 1,1 0,0 0))", 4326, true},
-		{"point_z_be", "POINT Z (1 2 3)", 4326, true},
+		{"point_2d_srid0", "POINT(1 2)", 0, "Point", false},
+		{"point_2d_srid4326", "POINT(1 2)", 4326, "Point", false},
+		{"point_z", "POINT Z (1 2 3)", 4326, "PointZ", false},
+		{"point_m", "POINT M (1 2 3)", 4326, "PointM", false},
+		{"point_zm", "POINT ZM (1 2 3 4)", 4326, "PointZM", false},
+		{"linestring", "LINESTRING(0 0, 1 1, 2 2)", 4326, "LineString", false},
+		{"linestring_z", "LINESTRING Z (0 0 0, 1 1 1)", 4326, "LineStringZ", false},
+		{"polygon", "POLYGON((0 0, 0 1, 1 1, 1 0, 0 0))", 4326, "Polygon", false},
+		{"polygon_hole", "POLYGON((0 0,0 5,5 5,5 0,0 0),(1 1,1 2,2 2,2 1,1 1))", 4326, "Polygon", false},
+		{"multipoint", "MULTIPOINT((0 0),(1 1))", 4326, "MultiPoint", false},
+		{"multilinestring", "MULTILINESTRING((0 0,1 1),(2 2,3 3))", 4326, "MultiLineString", false},
+		{"multipolygon", "MULTIPOLYGON(((0 0,0 1,1 1,1 0,0 0)))", 4326, "MultiPolygon", false},
+		{"geomcollection", "GEOMETRYCOLLECTION(POINT(0 0),LINESTRING(0 0,1 1))", 4326, "GeometryCollection", false},
+		{"point_3857", "POINT(500000 6000000)", 3857, "Point", false},
+		{"point_be", "POINT(1 2)", 4326, "Point", true},
+		{"polygon_be", "POLYGON((0 0,0 1,1 1,1 0,0 0))", 4326, "Polygon", true},
+		{"point_z_be", "POINT Z (1 2 3)", 4326, "PointZ", true},
 	}
 
 	for _, tc := range cases {
@@ -280,7 +288,7 @@ func TestPipelined_PostGIS_GeometryFamilyMatrix(t *testing.T) {
 			// SRID-constrained column so a recovery regression fails LOUDLY.
 			colType := "geometry"
 			if tc.srid != 0 {
-				colType = "geometry(Geometry," + itoa(tc.srid) + ")"
+				colType = "geometry(" + tc.mod + "," + itoa(tc.srid) + ")"
 			}
 
 			gotHex, gotSRID := applyRawWKBPipelined(t, ctx, dsn, "gm_"+tc.name, colType, rawWKB)
