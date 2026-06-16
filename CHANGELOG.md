@@ -4,6 +4,22 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [0.99.56] - 2026-06-16
+
+### Fixed
+- **MySQL `SET` columns now sync correctly over binlog CDC (Bug 148).** The
+  go-mysql binlog decoder hands a `SET` cell back as its **numeric bitmask**
+  (not the member text), and sluice's CDC value decoder passed that through —
+  so a replicated `SET('a','c')` carried `["5"]` (the mask, stringified)
+  instead of `["a","c"]`. The decoder now maps the bitmask to its member
+  labels via the column's value list (bit *i* → the *i*-th declared member,
+  in declaration order), errors loudly on a bit with no member, and treats
+  mask 0 as the empty set. Comma-joined label text (the snapshot/copy path
+  and the VStream reader) still passes through unchanged. This is the `SET`
+  sibling of the v0.99.52 ENUM fix (Bug 145); it applies to **self-hosted
+  MySQL binlog CDC** (snapshot and PlanetScale/Vitess sync were already
+  correct, as they deliver the label text).
+
 ## [0.99.55] - 2026-06-16
 
 ### Fixed
