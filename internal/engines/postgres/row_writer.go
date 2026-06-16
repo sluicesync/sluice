@@ -773,9 +773,25 @@ func prepareValue(v any, t ir.Type) (any, error) {
 	}
 
 	if arr, isArr := t.(ir.Array); isArr {
-		elems, ok := v.([]any)
-		if !ok {
-			return nil, fmt.Errorf("expected []any for Array column, got %T", v)
+		var elems []any
+		switch vv := v.(type) {
+		case []any:
+			elems = vv
+		case []string:
+			// Bug 149: a MySQL SET decodes to []string, and its PG target is
+			// TEXT[] (ddl_emit), which the CDC applier's loadColumnTypes
+			// resolves as ir.Array{Text} — so the SET value reaches the array
+			// path as []string, not []any. (The cold-start COPY path doesn't
+			// hit this: it carries the SOURCE ir.Set type, which falls through
+			// to the scalar passthrough and pgx encodes the []string as TEXT[]
+			// directly.) Box to []any so it flows through the IDENTICAL array
+			// path as a native text[], closing the applier-side gap.
+			elems = make([]any, len(vv))
+			for i, s := range vv {
+				elems[i] = s
+			}
+		default:
+			return nil, fmt.Errorf("expected []any or []string for Array column, got %T", v)
 		}
 		return convertArray(elems, arr.Element)
 	}
