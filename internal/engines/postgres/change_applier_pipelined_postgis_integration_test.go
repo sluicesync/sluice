@@ -70,7 +70,12 @@ func startPGForPipelinedPostGIS(t *testing.T) (dsn string, cleanup func()) {
 
 	container := runPGWithRetry(
 		t, pipelinedPostGISImage,
-		pgtc.WithDatabase("target_db"),
+		// The pre-baked image's datadir is already initialised, so
+		// pgtc.WithDatabase is a no-op (initdb never runs) — the bake seeds
+		// "source_db" (same as the sibling pgvector/postgres pre-baked
+		// images). Ask for source_db so ConnectionString targets a DB that
+		// exists; the test creates its own tables inside it.
+		pgtc.WithDatabase("source_db"),
 		pgtc.WithUsername("test"),
 		pgtc.WithPassword("test"),
 		pgtc.BasicWaitStrategies(),
