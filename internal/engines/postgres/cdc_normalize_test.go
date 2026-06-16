@@ -113,6 +113,29 @@ func TestNormalizeForCDCComparison_PG(t *testing.T) {
 		}
 	})
 
+	t.Run("Geometry_rich_seed_collapsed_bug147", func(t *testing.T) {
+		// Cold-start SchemaReader reads geometry_columns and populates
+		// Subtype/SRID/HasZ/HasM; the pgoutput CDC projection emits a bare
+		// ir.Geometry{}. Without normalization the classifier false-positives
+		// an altered-column on every geometry column. IsGeography rides the OID
+		// and must be preserved.
+		in := &ir.Table{
+			Columns: []*ir.Column{
+				{Name: "g", Type: ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326, HasZ: true}},
+				{Name: "gg", Type: ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326, IsGeography: true}},
+			},
+		}
+		out := eng.NormalizeForCDCComparison(in)
+		g := out.Columns[0].Type.(ir.Geometry)
+		if g != (ir.Geometry{}) {
+			t.Errorf("geometry seed = %#v; want bare ir.Geometry{} (matches CDC projection)", g)
+		}
+		gg := out.Columns[1].Type.(ir.Geometry)
+		if gg != (ir.Geometry{IsGeography: true}) {
+			t.Errorf("geography seed = %#v; want ir.Geometry{IsGeography:true} (IsGeography rides the OID)", gg)
+		}
+	})
+
 	t.Run("DateTime_default_precision_collapsed_bug86", func(t *testing.T) {
 		// PG `TIMESTAMP` (no explicit precision) → SchemaReader reads
 		// information_schema.datetime_precision=6; CDC reads

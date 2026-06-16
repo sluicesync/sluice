@@ -228,6 +228,21 @@ func normalizeTypeForCDCComparison(t ir.Type) ir.Type {
 			v.Precision = 0
 		}
 		return v
+	case ir.Geometry:
+		// Bug 147: the cold-start SchemaReader reads
+		// geometry_columns/geography_columns and populates
+		// ir.Geometry{Subtype, SRID, HasZ, HasM}; the pgoutput RelationMessage
+		// carries only the dynamic geometry type OID, so [buildRelationCacheEntry]
+		// projects a bare ir.Geometry{}. Without this, the classifier's
+		// [diffAlteredColumn] reflect.DeepEqual fires a phantom
+		// ShapeKindAlterColumnType on every geometry column at the first CDC
+		// boundary (and, combined with a real concurrent ADD COLUMN, a loud
+		// multi-shape combo refusal that wedges a legitimate change). Zero the
+		// fields the wire cannot carry. IsGeography rides the OID (it IS
+		// wire-recoverable), so preserve it; SRID is recovered target-side at
+		// apply time (ADR-0035 / #20). Same Bug-84/86 class as the temporal
+		// and decimal cases above — geometry was simply missed.
+		return ir.Geometry{IsGeography: v.IsGeography}
 	}
 	return t
 }

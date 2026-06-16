@@ -441,7 +441,7 @@ func TestBuildRelationCacheEntry(t *testing.T) {
 			{Flags: 0, Name: "email", DataType: pgtype.VarcharOID, TypeModifier: 259},
 		},
 	}
-	got, err := buildRelationCacheEntry(rel)
+	got, err := buildRelationCacheEntry(rel, 0)
 	if err != nil {
 		t.Fatalf("buildRelationCacheEntry: %v", err)
 	}
@@ -474,7 +474,7 @@ func TestBuildRelationCacheEntryUnknownColumnType(t *testing.T) {
 			{Name: "x", DataType: 99999, TypeModifier: -1},
 		},
 	}
-	if _, err := buildRelationCacheEntry(rel); err == nil {
+	if _, err := buildRelationCacheEntry(rel, 0); err == nil {
 		t.Fatal("expected error for unknown column type OID")
 	}
 }

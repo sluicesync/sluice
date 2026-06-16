@@ -433,11 +433,11 @@ func streamingPass(
 			}
 			switch m := logical.(type) {
 			case *pglogrepl.RelationMessageV2:
-				if entry, err := buildRelationCacheEntry(m.RelationMessage); err == nil {
+				if entry, err := buildRelationCacheEntry(m.RelationMessage, 0); err == nil {
 					relations[m.RelationID] = entry
 				}
 			case *pglogrepl.RelationMessage:
-				if entry, err := buildRelationCacheEntry(*m); err == nil {
+				if entry, err := buildRelationCacheEntry(*m, 0); err == nil {
 					relations[m.RelationID] = entry
 				}
 			case *pglogrepl.InsertMessageV2:
