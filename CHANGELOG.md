@@ -4,11 +4,32 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [0.99.55] - 2026-06-16
+
+### Fixed
+- **PostGIS `geometry` now syncs over CDC from a PostgreSQL *source* too
+  (Bug 147) — completes geometry-over-CDC.** v0.99.54 added the apply-side
+  geometry codec (which made MySQL→PG work); this release fixes the read
+  side. The pgoutput CDC reader's type map had no `geometry` case — its OID
+  is dynamic (assigned at `CREATE EXTENSION postgis`), so it can't be a
+  static entry — so the first geometry change over PG→PG CDC killed the
+  stream with `unsupported column type OID <n> (geometry)`. (Cold-start COPY
+  was unaffected.) The reader now resolves the runtime geometry OID and
+  decodes the value (and correctly treats pgoutput's text-format hex-EWKB
+  bytes as hex, not raw EWKB — a silent-corruption trap caught in review).
+  Pinned across point / polygon / multipolygon / geometrycollection, 2D / Z
+  / M / ZM, SRID 4326 and 0, `POINT EMPTY`, NULL, and UPDATE/DELETE images.
+- `geography` over CDC remains **loudly refused** (no applier codec yet) —
+  tracked as a follow-up; no silent loss.
+
 ## [0.99.54] - 2026-06-16
 
 ### Added
-- **PostGIS `geometry` columns now sync over CDC to a PostgreSQL target
-  (#20).** Geometry was previously un-appliable over continuous sync: the
+- **PostGIS `geometry` columns now apply over CDC to a PostgreSQL target
+  (#20)** — the apply (write) side; combined with the Bug 147 read-side fix
+  in v0.99.55 this makes geometry-over-CDC work in both PG-source and
+  MySQL-source directions. Geometry was previously un-appliable over
+  continuous sync: the
   CDC applier had no codec for PostGIS's (dynamically-assigned) `geometry`
   type OID, so the EWKB bytes were shipped in text format and PostGIS
   rejected them (`parse error - invalid geometry`) — a loud refusal on both
