@@ -4,6 +4,27 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [0.99.57] - 2026-06-16
+
+### Fixed
+- **PlanetScale/Vitess (VStream) resume from a purged GTID position now
+  reliably auto-recovers (Bug 146, ADR-0093 amendment).** v0.99.51 added a
+  *reactive* recovery (classify vtgate's "purged required binary logs" error
+  → cold-start re-snapshot), but a local Vitess-24 cluster reproduction
+  proved vtgate does **not** surface that error on a purged resume — it
+  accepts the stale position, the tablet drops the binlog dump (errno 2013),
+  and vtgate idles on heartbeats, so the stream looped on a retriable
+  liveness timeout and never cold-started. sluice now does a **proactive
+  pre-flight** before opening the stream — `GTID_SUBSET(@@global.gtid_purged,
+  <resume>)`, mirroring the binlog reader — and returns the cold-start signal
+  when the resume position is unreachable. The check is routed at the **same
+  tablet type the stream binds to** (`gtid_purged` is tablet-type-routed by
+  vtgate; a replica can purge independently of the primary), strips the
+  Vitess GTID flavor prefix, and degrades gracefully (proceeds, never a
+  spurious re-snapshot) if the probe can't run. The reactive classifier is
+  retained as defence-in-depth. `--no-auto-resnapshot` still turns the
+  recovery into a loud terminal error.
+
 ## [0.99.56] - 2026-06-16
 
 ### Fixed
