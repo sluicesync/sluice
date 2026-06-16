@@ -1431,6 +1431,17 @@ func loadColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (map
 	if err != nil {
 		return nil, fmt.Errorf("postgres: applier: read enum values: %w", err)
 	}
+	// Per-column PostGIS subtype + SRID, recovered from geometry_columns /
+	// geography_columns (#20). The CDC readers strip per-row SRID to raw WKB
+	// (ADR-0035: SRID is a per-column property), so the applier MUST recover
+	// the column's real SRID here — otherwise prepareValue → wkbToEWKB frames
+	// every replicated geometry with SRID 0 and a constrained
+	// geometry(<type>,<srid>) target column silently loses its SRID. Empty
+	// when PostGIS isn't installed (no geometry columns possible).
+	geomInfo, err := loadGeometryColumnInfo(ctx, db, schema, table)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: applier: read geometry column info: %w", err)
+	}
 
 	// is_generated has been in information_schema.columns since PG 12
 	// (the column itself shipped earlier but the values became reliable
@@ -1520,6 +1531,17 @@ func loadColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (map
 			if values, ok := enumValues[udtName]; ok {
 				meta.EnumValues = values
 			}
+			// #20: hand the translator the column's real PostGIS SRID +
+			// subtype so a replicated geometry re-frames with the true SRID
+			// (see geomInfo above). A missing entry leaves GeometryInfo nil
+			// → translateType degrades to GeometryUnspecified+SRID 0, the
+			// pre-#20 behaviour, which is correct for an un-constrained
+			// `geometry` column (SRID 0 in the catalog).
+			if udtName == "geometry" || udtName == "geography" {
+				if gi, ok := geomInfo[colName]; ok {
+					meta.GeometryInfo = &gi
+				}
+			}
 		}
 		if dataType == "array" || dataType == "ARRAY" {
 			elemDataType, ok := arrayElementDataType(udtName)
@@ -1565,6 +1587,65 @@ func loadColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (map
 		return nil, fmt.Errorf("%w: %s.%s", errUnknownTable, schema, table)
 	}
 	return cols, nil
+}
+
+// loadGeometryColumnInfo loads per-column PostGIS subtype + SRID metadata
+// for schema.table from the geometry_columns and geography_columns views,
+// keyed by column name. It is the applier-side counterpart of
+// SchemaReader.readGeometryColumnInfo / readGeographyColumnInfo, scoped to
+// one table. The applier needs this so a replicated geometry value is
+// re-framed (prepareValue → wkbToEWKB) with the column's REAL SRID — the
+// CDC readers strip per-row SRID to raw WKB (ADR-0035), so without this the
+// applier defaults the SRID to 0 and a constrained geometry(<type>,<srid>)
+// column silently loses its SRID (#20). PostGIS-absent (the views don't
+// exist) is a clean empty map: no geometry columns can exist.
+func loadGeometryColumnInfo(ctx context.Context, db *sql.DB, schema, table string) (map[string]geometryColumnInfo, error) {
+	out := map[string]geometryColumnInfo{}
+	const geomQ = `SELECT f_geometry_column, type, srid, coord_dimension
+		FROM geometry_columns WHERE f_table_schema = $1 AND f_table_name = $2`
+	const geogQ = `SELECT f_geography_column, type, srid, coord_dimension
+		FROM geography_columns WHERE f_table_schema = $1 AND f_table_name = $2`
+	if err := scanGeometryColumnView(ctx, db, geomQ, schema, table, false, out); err != nil {
+		return nil, err
+	}
+	if err := scanGeometryColumnView(ctx, db, geogQ, schema, table, true, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// scanGeometryColumnView runs one of the PostGIS spatial-catalog views
+// (geometry_columns / geography_columns) and merges its rows into out. A
+// missing view (PostGIS not installed, SQLSTATE 42P01) is a clean no-op —
+// the same graceful-degradation the schema reader uses.
+func scanGeometryColumnView(ctx context.Context, db *sql.DB, query, schema, table string, isGeography bool, out map[string]geometryColumnInfo) error {
+	rows, err := db.QueryContext(ctx, query, schema, table)
+	if err != nil {
+		if isUndefinedRelationErr(err) {
+			return nil
+		}
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var (
+			colName, subtype string
+			srid             int64
+			coordDim         int
+		)
+		if err := rows.Scan(&colName, &subtype, &srid, &coordDim); err != nil {
+			return err
+		}
+		hasZ, hasM := dimensionFlagsFromCoordDim(subtype, coordDim)
+		out[colName] = geometryColumnInfo{
+			Subtype:     subtype,
+			SRID:        int(srid),
+			IsGeography: isGeography,
+			HasZ:        hasZ,
+			HasM:        hasM,
+		}
+	}
+	return rows.Err()
 }
 
 // readEnumValuesForSchema is the standalone variant of

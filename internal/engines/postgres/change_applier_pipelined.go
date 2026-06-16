@@ -184,7 +184,12 @@ func (a *ChangeApplier) pipelinePool() (*sql.DB, error) {
 	if a.pipelineCfg == nil {
 		return nil, errPipelineUnavailable
 	}
-	db, err := openPgxDBDescribeExec(a.pipelineCfg.dsn, roleApplier, a.pipelineCfg.appID)
+	// Register the PostGIS geometry codec on every pipelined backend so a
+	// geometry column applies as BINARY EWKB under DescribeExec rather than
+	// being TEXT-refused (see [afterConnectRegisterGeometry]); a no-op when
+	// PostGIS isn't installed on the target.
+	db, err := openPgxDBDescribeExec(a.pipelineCfg.dsn, roleApplier, a.pipelineCfg.appID,
+		stdlib.OptionAfterConnect(afterConnectRegisterGeometry))
 	if err != nil {
 		return nil, fmt.Errorf("postgres: applier: open pipelined pool: %w", err)
 	}

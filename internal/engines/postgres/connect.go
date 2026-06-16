@@ -133,13 +133,13 @@ func OpenPgxDB(dsn, label string) (*sql.DB, error) {
 // openPgxDBAs is the role-aware variant behind [OpenPgxDB]. It stamps
 // the application_name for role and id (unless the operator already
 // set one) before handing the DSN to pgx.
-func openPgxDBAs(dsn string, role connRole, appID string) (*sql.DB, error) {
+func openPgxDBAs(dsn string, role connRole, appID string, opts ...stdlib.OptionOpenDB) (*sql.DB, error) {
 	connConfig, err := pgx.ParseConfig(withApplicationName(dsn, role, appID))
 	if err != nil {
 		return nil, fmt.Errorf("postgres: parse dsn: %w", err)
 	}
 	connConfig.DialFunc = netkeepalive.Dialer().DialContext
-	return stdlib.OpenDB(*connConfig), nil
+	return stdlib.OpenDB(*connConfig, opts...), nil
 }
 
 // openPgxDBDescribeExec opens a lazy *sql.DB whose backends default to
@@ -163,14 +163,14 @@ func openPgxDBAs(dsn string, role connRole, appID string) (*sql.DB, error) {
 // shape as [openPgxDBAs]; only the exec mode differs, and only for this
 // dedicated pool — the applier's primary pool (per-change Apply path) keeps
 // the cached fast path.
-func openPgxDBDescribeExec(dsn string, role connRole, appID string) (*sql.DB, error) {
+func openPgxDBDescribeExec(dsn string, role connRole, appID string, opts ...stdlib.OptionOpenDB) (*sql.DB, error) {
 	connConfig, err := pgx.ParseConfig(withApplicationName(dsn, role, appID))
 	if err != nil {
 		return nil, fmt.Errorf("postgres: parse dsn: %w", err)
 	}
 	connConfig.DialFunc = netkeepalive.Dialer().DialContext
 	connConfig.DefaultQueryExecMode = pgx.QueryExecModeDescribeExec
-	return stdlib.OpenDB(*connConfig), nil
+	return stdlib.OpenDB(*connConfig, opts...), nil
 }
 
 // openDB opens a *sql.DB against the Postgres server and pings to
@@ -186,8 +186,8 @@ func openDB(ctx context.Context, cfg *pgConfig) (*sql.DB, error) {
 // the connection (see [withApplicationName]) so the engine's snapshot /
 // applier / cdc-reader / schema pools are distinguishable in
 // pg_stat_activity.
-func openDBAs(ctx context.Context, cfg *pgConfig, role connRole) (*sql.DB, error) {
-	db, err := openPgxDBAs(cfg.dsn, role, cfg.appID)
+func openDBAs(ctx context.Context, cfg *pgConfig, role connRole, opts ...stdlib.OptionOpenDB) (*sql.DB, error) {
+	db, err := openPgxDBAs(cfg.dsn, role, cfg.appID, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: open: %w", err)
 	}
