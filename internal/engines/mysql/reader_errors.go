@@ -9,6 +9,8 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // # Source-reader error classification (GitHub issue #19)
@@ -69,6 +71,32 @@ func classifyReaderError(err error) error {
 	if err == nil {
 		return nil
 	}
+	// ADR-0093: VStream purged-GTID resume. When the persisted resume
+	// position is older than the source's retained binlogs (gtid_purged
+	// advanced past it — routine on PlanetScale's ~3-day retention
+	// window), vtgate rejects the position REACTIVELY on the stream and
+	// the pump's Recv surfaces it here. The binlog source catches this
+	// with a pre-flight gtid_purged ⊆ resume check that returns
+	// [ir.ErrPositionInvalid]; vtgate exposes no single authoritative
+	// gtid_purged to pre-flight against, so the reactive error is the
+	// only reliable signal. Classify it as [ir.ErrPositionInvalid] so
+	// the streamer routes it to a cold-start re-snapshot (ADR-0022
+	// parity), at the reactive layer the VStream path needs.
+	//
+	// Checked FIRST — before the gRPC-code and applier-classifier
+	// branches: a purged error can arrive carrying codes.Unknown (in the
+	// ADR-0038 retriable set), and retrying the SAME purged position
+	// spins forever. The position is invalid, not transient.
+	if isVStreamPurgedGTIDError(err) {
+		// Both the original error AND ir.ErrPositionInvalid are wrapped
+		// (%w, Go 1.20 multi-error): the streamer routes on
+		// errors.Is(ErrPositionInvalid), while the original vtgate text
+		// stays reachable on the chain for diagnostics and for the
+		// retriable-classifier identity checks.
+		return fmt.Errorf(
+			"source vstream cannot resume: the persisted GTID position is older than the source's retained binlogs (gtid_purged advanced past it — common on PlanetScale's binlog retention window); a fresh cold-start re-snapshot is required: %w (%w)", ir.ErrPositionInvalid, err,
+		)
+	}
 	// Source-side schema-resolution gap (Bug F9). The vstreamer
 	// resolves each row event against the table schema for the replay
 	// position; right after a DDL cutover (or when the Vitess schema
@@ -115,6 +143,24 @@ func isVStreamSchemaResolutionError(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return (strings.Contains(msg, "unknown table") && strings.Contains(msg, "in schema")) ||
 		strings.Contains(msg, "no schema found for table")
+}
+
+// isVStreamPurgedGTIDError reports whether err is the source's
+// "resume position is older than the retained binlogs" shape (ADR-0093).
+// Both wordings sluice can see carry the discriminating substring
+// `purged required binary logs`:
+//
+//	"the master has purged required binary logs ..."  — MySQL error 1236,
+//	                                                    raw binlog stream
+//	"the source purged required binary logs ..."       — Vitess's inclusive
+//	                                                    rewording on vtgate
+//
+// Matching that one substring covers both. Kept as a named helper (not
+// inlined) so [TestClassifyReaderError_PurgedGTID] pins the exact
+// wording — a vtgate wording change then fails the pin rather than
+// silently reverting to a restart loop.
+func isVStreamPurgedGTIDError(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "purged required binary logs")
 }
 
 // isRetriableGRPCCode reports whether a gRPC status code is one of the

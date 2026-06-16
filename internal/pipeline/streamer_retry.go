@@ -91,19 +91,37 @@ func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
 				slog.String("err", err.Error()),
 			)
 		}
-		return s.runOnce(ctx)
+		return s.runOnceWithReactiveResnapshot(ctx)
 	}
 	defer closeIf(posReader)
 
 	streamID := s.resolveStreamID()
 	var consecutive int
+	// ADR-0093: track whether a reactive invalid-position cold-start
+	// re-snapshot has already fired this Run, so the recovery is bounded
+	// to one (a second consecutive ErrPositionInvalid is terminal).
+	resnapshotted := false
 
 	for {
 		beforePos, beforeFound, _ := posReader.ReadPosition(ctx, streamID)
 
-		err := s.runOnce(ctx)
+		err := s.runOnceCall(ctx)
 		if err == nil {
 			return nil
+		}
+		// ADR-0093: a reactive [ir.ErrPositionInvalid] (e.g. a VStream
+		// resume from a purged GTID position surfaced via the pump's Recv)
+		// is NOT retriable — retrying the same purged position spins
+		// forever. Route it to a one-shot cold-start re-snapshot instead.
+		// Checked BEFORE classifyRetriable: the position is invalid, not
+		// transient, so it must never enter the ADR-0038 backoff loop.
+		if s.isReactiveInvalidPosition(err) {
+			retry, rerr := s.reactiveResnapshotDecision(ctx, err, resnapshotted)
+			if !retry {
+				return rerr
+			}
+			resnapshotted = true
+			continue
 		}
 		// Bug 57 fix (v0.52.2): check the retriable wrapper BEFORE the
 		// ctx-Cancel/DeadlineExceeded short-circuit. A wrapped
