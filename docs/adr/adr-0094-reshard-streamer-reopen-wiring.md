@@ -36,7 +36,11 @@ Wire the existing `Reopen` into the Streamer so a reshard is **followed automati
    }
    ```
 
-   The mysql `vstreamCDCReader` implements it by `errors.As`-matching its cached `Err()` to `*ShardLayoutChangedError` and delegating to the existing `Reopen`. Engines without it (binlog MySQL, Postgres) are a silent no-op — reshard is a Vitess-only concept.
+   The capability must be implemented on **both** VStream reader types, because the Streamer is handed a different one per path:
+   - **Warm-resume** uses the standalone `vstreamCDCReader` (`OpenCDCReader`) — it implements `ReopenAfterReshard` by `errors.As`-matching its cached `Err()` to `*ShardLayoutChangedError` and delegating to the existing `Reopen`.
+   - **Cold-start** (the production default — every fresh `sync start` cold-starts) uses `vstreamSnapshotChanges`, the CDC half of the `vstreamSnapshotStream` returned by `OpenSnapshotStream`. This type detected the reshard already (its pump surfaces the typed error) but had **no reopen path**; the initial cut wired only the standalone reader, so the Streamer-level e2e test on a real cluster caught a terminal exit on the cold-start path (the Bug-74 "test the representative, not the class" trap — the unit + reader-level tests both exercised only `vstreamCDCReader`). The fix ports `reopenAfterReshard` to `vstreamSnapshotStream` (mirroring `Reopen`: reuse the gRPC connection, replace the stream from the journal GTIDs under a fresh `streamCtx` so `close` still tears it down) and exposes `ReopenAfterReshard` on the wrapper.
+
+   Engines without the capability (binlog MySQL, Postgres) are a silent no-op — reshard is a Vitess-only concept.
 
 2. **Bounded reopen loop in `runOnce`'s apply phase.** After `dispatchApply` returns on a clean channel close, the Streamer probes the reader for a reshard via `ReopenAfterReshard`. On a successful reopen it re-wires the intercept chain over the **new** channel (no cold-start seed re-injection — a reopen is a continuation, not a fresh stream) and re-enters `dispatchApply`; otherwise it falls through to the existing `phaseSettleDispatch` terminal/retry handling unchanged. The loop is bounded by a reopen-attempt budget so a source that journals repeatedly (or a persistently failing `Reopen`) cannot spin forever — budget exhaustion is a loud terminal error, not a silent stall.
 
@@ -49,7 +53,7 @@ Wire the existing `Reopen` into the Streamer so a reshard is **followed automati
 ### Test strategy
 
 - **Unit (`-race`, required CI — the `Test (ubuntu-latest)` job).** A fake `ir.CDCReader` implementing `ReshardReopener` drives the Streamer's reopen loop: channel close → reopen returns a fresh channel carrying post-reshard events → assert the apply continues over the new channel with no lost/duplicated event; reopen-budget exhaustion → loud terminal; a non-reshard close → unchanged terminal/retry. This is the gating `-race` coverage for the concurrency of the channel swap + intercept-chain re-wrap.
-- **End-to-end (scheduled `extended-suites.yml`, `vitessreshard`).** Add a **Streamer-level** reshard test (the existing one is reader-level) driving a real `vitess/lite` reshard through `pipeline.Streamer` into a target, asserting src==dst exactly-once across the seam. Validated locally on the multi-process Vitess cluster before the tag (the `-race`-before-tag rule applies — this is a concurrency chunk).
+- **End-to-end (scheduled `extended-suites.yml`, `vitessreshard`).** `TestVitessReshard_StreamerFollowsReshardEndToEnd` (`internal/engines/mysql`, `package mysql` so it reuses the cluster + reshard harness, importing `pipeline` to drive the real Streamer) cold-starts a `vitess/lite` keyspace through `pipeline.Streamer`, triggers a live 1→2 reshard mid-stream, writes across the seam, and asserts the Streamer FOLLOWED it (no terminal `ShardLayoutChangedError`) with src COUNT == dst COUNT exactly-once. This test is what caught the cold-start-path gap above; it is the regression pin for the whole feature. Validated locally on the multi-process Vitess cluster before the tag (the `-race`-before-tag rule applies — this is a concurrency chunk).
 
 ## Alternatives considered
 

@@ -107,6 +107,7 @@ var (
 	_ ir.CDCReader               = (*vstreamCDCReader)(nil)
 	_ ir.ReshardReopener         = (*vstreamCDCReader)(nil)
 	_ ir.CDCReader               = (*vstreamSnapshotChanges)(nil)
+	_ ir.ReshardReopener         = (*vstreamSnapshotChanges)(nil)
 	_ ir.CopyCheckpointer        = (*vstreamSnapshotRows)(nil)
 	_ ir.CopyDurableProgressSink = (*vstreamSnapshotRows)(nil)
 	_ ir.IdempotentCopyReader    = (*vstreamSnapshotRows)(nil)

@@ -816,6 +816,80 @@ func (s *vstreamSnapshotStream) reconnectCopy(ctx context.Context, attempt int) 
 	return nil
 }
 
+// reopenAfterReshard rebuilds the post-COPY CDC stream against the new
+// shard layout carried by a [ShardLayoutChangedError] (ADR-0094). It is
+// the cold-start counterpart of [vstreamCDCReader.Reopen]: the production
+// cold-start path hands the Streamer a [vstreamSnapshotChanges] (this
+// stream's CDC half), NOT the standalone reader, so the reshard-follow
+// capability must live here too — otherwise a reshard during a
+// cold-started sync hits the loud-terminal exit ADR-0094 set out to
+// replace (found by the Streamer-level reshard e2e test).
+//
+// Like Reopen it reuses the gRPC CONNECTION and replaces only the STREAM,
+// seeded from the journal-stamped per-shard GTIDs (no gap/overlap at the
+// cut). It cancels the old (dead) stream, installs a fresh streamCtx +
+// grpcCancel so [close] still tears the new stream down, resets the
+// layout/cursor/field-cache/error under mu, and starts a new CDC pump on a
+// fresh channel. The previous pump already closed its channel (that close
+// is what surfaced the reshard), so there is never a second concurrent
+// pump.
+func (s *vstreamSnapshotStream) reopenAfterReshard(ctx context.Context, resh *ShardLayoutChangedError) (<-chan ir.Change, error) {
+	if resh == nil || len(resh.NewShards) == 0 {
+		return nil, errors.New("mysql/vstream: snapshot: reopen: no new shards in journal")
+	}
+
+	// Tear down the old (dead) stream before opening the replacement so
+	// the position bookkeeping never has two streams against one keyspace.
+	s.cancelGRPCStream()
+
+	protoShardGtids, err := toProtoShardGtids(resh.NewShards)
+	if err != nil {
+		return nil, fmt.Errorf("mysql/vstream: snapshot: reopen: build resume position: %w", err)
+	}
+	req := &vtgate.VStreamRequest{
+		TabletType: topodata.TabletType_PRIMARY,
+		Vgtid:      &binlogdata.VGtid{ShardGtids: protoShardGtids},
+		Filter:     &binlogdata.Filter{Rules: vstreamCopyFilterRules(s.copyTables)},
+		Flags: &vtgate.VStreamFlags{
+			MinimizeSkew:      true,
+			StopOnReshard:     true,
+			HeartbeatInterval: 5,
+		},
+	}
+
+	// Fresh streamCtx so CloseFn ([close]) can still cancel the new stream.
+	streamCtx, streamCancel := context.WithCancel(context.Background())
+	grpcStream, err := s.client.VStream(streamCtx, req)
+	if err != nil {
+		streamCancel()
+		return nil, fmt.Errorf("mysql/vstream: snapshot: reopen: open stream: %w", err)
+	}
+
+	newShards := make([]string, 0, len(resh.NewShards))
+	for _, sg := range resh.NewShards {
+		newShards = append(newShards, sg.Shard)
+	}
+	newVgtid := make([]shardGtid, len(resh.NewShards))
+	copy(newVgtid, resh.NewShards)
+
+	s.mu.Lock()
+	s.err = nil // observed via Err(); clearing avoids masking a future failure
+	s.shards = newShards
+	s.currentVgtid = newVgtid
+	clear(s.fields) // post-reshard tablets re-emit FIELD events
+	s.grpcStream = grpcStream
+	s.grpcCancel = streamCancel
+	s.mu.Unlock()
+
+	slog.InfoContext(ctx, "mysql/vstream: snapshot: reopened CDC stream on new shard layout",
+		slog.String("keyspace", s.keyspace),
+		slog.Int("new_shards", len(newShards)))
+
+	out := make(chan ir.Change, vstreamChannelBuffer)
+	go s.pump(ctx, out)
+	return out, nil
+}
+
 // maybeCheckpoint persists the current COPY cursor to the durable
 // control table when the bounded cadence (N rows OR T seconds) is due.
 // Returns the (possibly updated) lastCheckpoint anchor. The pump is the
@@ -1892,6 +1966,27 @@ func (c *vstreamSnapshotChanges) Close() error { return nil }
 // swallowed — the sync appears to stall with no surfaced error. Mirrors the
 // standalone vstreamCDCReader.Err() contract.
 func (c *vstreamSnapshotChanges) Err() error { return c.snap.Err() }
+
+// ReopenAfterReshard implements [ir.ReshardReopener] on the cold-start
+// CDC half (ADR-0094). The production cold-start path hands the Streamer
+// THIS wrapper (not the standalone *vstreamCDCReader), so the reshard-
+// follow capability must be exposed here or the Streamer's
+// `stream.Changes.(ir.ReshardReopener)` probe fails and a reshard during
+// a cold-started sync exits loud-terminal. Inspects the underlying
+// stream's cached Err(); on a reshard signal it rebuilds the stream
+// against the new layout via [vstreamSnapshotStream.reopenAfterReshard],
+// else reports ok=false so the caller settles the error normally.
+func (c *vstreamSnapshotChanges) ReopenAfterReshard(ctx context.Context) (changes <-chan ir.Change, wasReshard bool, err error) {
+	var resh *ShardLayoutChangedError
+	if !errors.As(c.snap.Err(), &resh) {
+		return nil, false, nil
+	}
+	ch, rerr := c.snap.reopenAfterReshard(ctx, resh)
+	if rerr != nil {
+		return nil, true, rerr
+	}
+	return ch, true, nil
+}
 
 // shardScopeKey is the key shape used in
 // [vstreamSnapshotStream.copyCompletedShards]. Combines keyspace and
