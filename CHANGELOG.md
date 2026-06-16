@@ -2,6 +2,14 @@
 
 All notable changes to sluice are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project follows [Semantic Versioning](https://semver.org/).
 
+## [0.99.61] - 2026-06-16
+
+### Added
+- **Cross-shard-collision preflight: a multi-shard Vitess/PlanetScale source with no shard discriminator is now refused before any data moves (Bug 152).** A sharded keyspace fronted by vtgate transparently merges every shard into one logical stream, so a `migrate`/`sync` pointed at a multi-shard source *without* `--inject-shard-column` writes every shard's rows into one target table. If that table has a primary key or a UNIQUE constraint, rows from different shards that share a key value (per-shard auto-increment ranges, tenant-local ids) would silently overwrite each other — an exit-0, fewer-rows-than-source data-loss class. sluice now detects a multi-shard source (via `SHOW VITESS_SHARDS` on the PlanetScale/Vitess flavors) and **loudly refuses** a collision-capable (PK/UNIQUE) target table before any data moves, naming the two ways forward: add a per-shard discriminator with `--inject-shard-column NAME=VALUE` (ADR-0048), or pass the new `--allow-cross-shard-merge` opt-out when the key is globally unique across shards (e.g. Vitess sequences or UUID keys). Keyless tables don't trip it (already at-least-once, no overwrite), and single-shard / non-sharded sources (vanilla MySQL, Postgres) are unaffected. If the shard layout can't be determined the preflight fails closed (refuses) rather than risk a silent overwrite.
+
+### Changed
+- **New flag `--allow-cross-shard-merge`** on `migrate` and `sync start` — the explicit opt-out for the Bug 152 preflight above. Off by default (guard active).
+
 ## [0.99.60] - 2026-06-16
 
 ### Fixed
