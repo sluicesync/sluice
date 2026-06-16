@@ -23,6 +23,7 @@ import (
 	"fmt"
 
 	"github.com/jackc/pglogrepl"
+	"github.com/jackc/pgx/v5/stdlib"
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
@@ -475,7 +476,12 @@ func (e Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeApp
 	if err != nil {
 		return nil, err
 	}
-	db, err := openDBAs(ctx, cfg, roleApplier)
+	// Register the PostGIS geometry codec on every serial applier backend
+	// (the per-change Apply path + the serial batch fall-back) so a geometry
+	// column applies as BINARY EWKB rather than being TEXT-refused (see
+	// [afterConnectRegisterGeometry]); a no-op when PostGIS isn't installed.
+	// The pipelined pool registers it independently in [pipelinePool].
+	db, err := openDBAs(ctx, cfg, roleApplier, stdlib.OptionAfterConnect(afterConnectRegisterGeometry))
 	if err != nil {
 		return nil, err
 	}
