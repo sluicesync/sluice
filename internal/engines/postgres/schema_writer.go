@@ -1257,8 +1257,47 @@ func (w *SchemaWriter) AlterDropColumn(ctx context.Context, table *ir.Table, col
 			return fmt.Errorf("alter drop column %q on %s.%s: %w",
 				col.Name, table.Schema, table.Name, err)
 		}
+		// Bug 150: a forwarded DROP COLUMN of an ENUM column leaves the
+		// per-column enum type sluice synthesized for it orphaned (PG does NOT
+		// cascade DROP COLUMN to a named type), and a later drop-then-readd of
+		// a same-named column would silently reuse that stale type via the
+		// idempotent ensureEnumType. Drop the type too — AFTER the column drop
+		// (so its dependency is gone and a plain RESTRICT DROP TYPE succeeds);
+		// IF EXISTS keeps it idempotent. The guard is load-bearing: see
+		// [orphanedEnumTypeDrop].
+		if dropStmt, ok := w.orphanedEnumTypeDrop(table, col); ok {
+			if _, err := w.db.ExecContext(ctx, dropStmt); err != nil {
+				return fmt.Errorf("drop orphaned enum type for %s.%s.%s: %w",
+					w.schema, table.Name, col.Name, err)
+			}
+		}
 	}
 	return nil
+}
+
+// orphanedEnumTypeDrop returns the `DROP TYPE IF EXISTS` statement for the
+// per-column enum type left behind by a forwarded DROP COLUMN, and whether
+// one should be emitted (Bug 150).
+//
+// It fires ONLY for a sluice-SYNTHESIZED, per-column-dedicated enum type: a
+// MySQL (or any non-PG) source has no enum type identity, so the IR carries
+// ir.Enum.TypeName == "" and sluice named the target type
+// "<table>_<col>_enum" — dedicated to exactly this column, hence safe to drop
+// once the column is gone. A same-engine PG source PRESERVES the original type
+// name (TypeName != ""), which PG allows to be SHARED across columns/tables
+// (catalog Bug 19c) — dropping it on one column's drop could break other
+// users, so those are NEVER auto-dropped here (the source's own DROP TYPE, if
+// any, is the authority). Schema-qualified with w.schema to match the CREATE
+// side (ensureEnumType / emitCreateEnumType); the forward path scrubs
+// table.Schema so w.schema is the namespace both the column and the type live
+// in.
+func (w *SchemaWriter) orphanedEnumTypeDrop(table *ir.Table, col *ir.Column) (string, bool) {
+	enum, ok := col.Type.(ir.Enum)
+	if !ok || enum.TypeName != "" {
+		return "", false
+	}
+	typeRef := quoteIdent(w.schema) + "." + quoteIdent(resolveEnumTypeName(enum, table.Name, col.Name))
+	return "DROP TYPE IF EXISTS " + typeRef, true
 }
 
 // CreateShapeIndex implements [ir.ShapeDeltaApplier] for Postgres
