@@ -4,6 +4,37 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [0.99.51] - 2026-06-15
+
+### Fixed
+- **A PlanetScale / Vitess (VStream) resume from a purged GTID position now
+  auto-recovers instead of restart-looping (ADR-0093).** When a persisted resume
+  position falls behind the source's retained binlogs (`gtid_purged` advanced
+  past it — routine on PlanetScale's binlog-retention window), the stream used to
+  exit with an unclassified error and, on supervisor restart, hit the same purged
+  position again — a restart loop. The self-hosted MySQL binlog source already
+  auto-recovers this via a pre-flight check → cold-start (ADR-0022); the VStream
+  source had no parity because vtgate is a proxy with no single `gtid_purged` to
+  pre-flight, so the condition only surfaces reactively from the stream and was
+  never classified as an invalid position. Now the vtgate "purged required binary
+  logs" error is classified as an invalid position and routed to a **one-shot,
+  non-destructive cold-start re-snapshot** (the idempotent copy absorbs the
+  overlap; the target is not dropped). The recovery is bounded — a second
+  consecutive invalid position after a fresh re-snapshot fails loudly (the source
+  is purging faster than a snapshot can complete, which auto-retry cannot fix).
+  This was always a loud failure, never silent data loss; it now self-heals.
+  Found by cross-referencing PlanetScale's own `fivetran-source` connector.
+
+### Added
+- **`--no-auto-resnapshot`** (`sync start`): opt out of the automatic re-snapshot
+  above. With this flag, a purged/invalid resume position surfaces as a loud,
+  actionable terminal error naming the recovery commands
+  (`--restart-from-scratch` / `--reset-target-data`) instead of auto re-snapshotting
+  — for operators who would rather decide a (potentially expensive) full
+  re-snapshot of very large tables deliberately. The flag gates both the binlog
+  pre-flight fall-through and the new VStream reactive recovery, keeping the two
+  paths consistent. Default (unset) = auto-recover, parity with the binlog path.
+
 ## [0.99.50] - 2026-06-15
 
 ### Fixed
