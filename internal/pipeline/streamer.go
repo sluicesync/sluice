@@ -610,6 +610,12 @@ type Streamer struct {
 	// DP-1 (option (a) — two-surface split) for the design rationale.
 	InjectShardColumn ShardColumnSpec
 
+	// AllowCrossShardMerge opts out of the Bug 152 cross-shard-collision
+	// preflight (CLI: `--allow-cross-shard-merge`). Mirror of
+	// [Migrator.AllowCrossShardMerge]: set only when the key is globally
+	// unique across shards; the safe default is false (guard active).
+	AllowCrossShardMerge bool
+
 	// CoordinateLiveDDL controls ADR-0054 Shape A Phase 2 live
 	// cross-shard DDL coordination. Default true (engaged when
 	// [InjectShardColumn] is engaged; no-op otherwise). Operators on

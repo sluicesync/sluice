@@ -324,6 +324,17 @@ type Migrator struct {
 	// migrate path pays zero cost when Shape A isn't engaged.
 	InjectShardColumn ShardColumnSpec
 
+	// AllowCrossShardMerge opts out of the Bug 152 cross-shard-collision
+	// preflight (CLI: `--allow-cross-shard-merge`). That preflight refuses
+	// a multi-shard Vitess/PlanetScale source merging (via vtgate) into a
+	// single non-discriminated target table whose PK/UNIQUE could collide
+	// across shards — a silent-overwrite hazard. Set this only when the
+	// key is globally unique across shards (Vitess sequences / UUID keys)
+	// so no overwrite can occur; the safe default is false (guard active).
+	// Mutually exclusive in effect with InjectShardColumn, which solves
+	// the same hazard structurally.
+	AllowCrossShardMerge bool
+
 	// MaxTargetConnections is the operator's --max-target-connections
 	// explicit ceiling on the bulk-copy connection pool (connection-
 	// resilience item 4). Zero (the default) means "auto": the

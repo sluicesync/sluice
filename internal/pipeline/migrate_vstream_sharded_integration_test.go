@@ -41,12 +41,14 @@ package pipeline
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sort"
 	"testing"
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/ir"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -372,5 +374,75 @@ func assertOrdersFKExists(t *testing.T, kind, dsn string) {
 		if n < 1 {
 			t.Fatalf("target PG orders has %d FK constraints; want >=1 (sluice FK-DDL phase did not re-create the FK Vitess never enforced)", n)
 		}
+	}
+}
+
+// TestMigrate_VStreamShardedSource_CrossShardCollisionPreflight_Bug152
+// exercises the Bug 152 cross-shard-collision preflight against a REAL
+// 2-shard Vitess source: it asserts (a) the vitess engine's
+// ir.ShardDiscoverer.DiscoverShards runs SHOW VITESS_SHARDS over vtgate and
+// reports both shards, and (b) the wired preflight REFUSES a PK-bearing
+// target with no discriminator, while --allow-cross-shard-merge and
+// --inject-shard-column each let it pass. The unit test
+// (cross_shard_preflight_test.go) covers the decision matrix in isolation;
+// this proves the discovery query + flavor gate work end-to-end on a live
+// sharded keyspace (the integration-critical half).
+func TestMigrate_VStreamShardedSource_CrossShardCollisionPreflight_Bug152(t *testing.T) {
+	const keyspace = "commerce"
+	mysqlDSN, _, _, vtCleanup := startShardedVTTestServer(t, keyspace, 2)
+	defer vtCleanup()
+
+	applySQL(t, mysqlDSN, `
+		CREATE TABLE widget (
+			id   BIGINT       NOT NULL,
+			name VARCHAR(64)  NOT NULL,
+			PRIMARY KEY (id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+	applySQL(t, mysqlDSN, `ALTER VSCHEMA ON commerce.widget ADD VINDEX hash(id) USING hash`)
+	time.Sleep(2 * time.Second) // schema-tracker settle
+
+	// The vitess flavor (usesVStream) is how a real sharded source is
+	// accessed; the vanilla "mysql" engine reports no shards by design.
+	srcEng, ok := engines.Get("vitess")
+	if !ok {
+		t.Fatal("source engine \"vitess\" not registered")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// (a) Real SHOW VITESS_SHARDS over vtgate returns both shards.
+	disc, ok := srcEng.(ir.ShardDiscoverer)
+	if !ok {
+		t.Fatal("vitess engine does not implement ir.ShardDiscoverer")
+	}
+	shards, err := disc.DiscoverShards(ctx, mysqlDSN)
+	if err != nil {
+		t.Fatalf("DiscoverShards: %v", err)
+	}
+	if len(shards) != 2 {
+		t.Fatalf("DiscoverShards = %v; want 2 shards (a 2-shard keyspace)", shards)
+	}
+
+	schema := &ir.Schema{Tables: []*ir.Table{{
+		Name: "widget",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "name", Type: ir.Varchar{Length: 64}},
+		},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+	}}}
+
+	// (b) No discriminator + no opt-out → loud refusal (the silent-loss guard).
+	if err := preflightCrossShardCollision(ctx, srcEng, mysqlDSN, schema, false, false); !errors.Is(err, errCrossShardCollisionRefused) {
+		t.Fatalf("preflight (no discriminator, no opt-out) = %v; want errCrossShardCollisionRefused", err)
+	}
+	// --allow-cross-shard-merge → pass.
+	if err := preflightCrossShardCollision(ctx, srcEng, mysqlDSN, schema, false, true); err != nil {
+		t.Errorf("preflight (--allow-cross-shard-merge) = %v; want nil", err)
+	}
+	// --inject-shard-column engaged → pass.
+	if err := preflightCrossShardCollision(ctx, srcEng, mysqlDSN, schema, true, false); err != nil {
+		t.Errorf("preflight (--inject-shard-column) = %v; want nil", err)
 	}
 }
