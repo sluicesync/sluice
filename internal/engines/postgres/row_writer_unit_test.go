@@ -102,6 +102,36 @@ func TestBuildBatchInsertSchemaQualified(t *testing.T) {
 	}
 }
 
+// TestPrepareValueArrayAcceptsStringSlice pins Bug 149: a MySQL SET decodes
+// to []string and its PG target is TEXT[], so on the CDC applier path the
+// value reaches prepareValue's Array branch as []string (not []any). It must
+// be accepted and produce the IDENTICAL result to the equivalent []any (the
+// native text[] shape), so a SET binds the same as a real text[].
+func TestPrepareValueArrayAcceptsStringSlice(t *testing.T) {
+	arr := ir.Array{Element: ir.Text{}}
+
+	fromStrings, err := prepareValue([]string{"a", "c"}, arr)
+	if err != nil {
+		t.Fatalf("[]string into text[]: %v", err)
+	}
+	fromAny, err := prepareValue([]any{"a", "c"}, arr)
+	if err != nil {
+		t.Fatalf("[]any into text[]: %v", err)
+	}
+	if !reflect.DeepEqual(fromStrings, fromAny) {
+		t.Errorf("[]string path = %#v; want identical to []any path %#v", fromStrings, fromAny)
+	}
+
+	// Empty SET → empty array, no error.
+	if _, err := prepareValue([]string{}, arr); err != nil {
+		t.Errorf("empty []string into text[]: %v", err)
+	}
+	// A wrong shape (neither []any nor []string) still errors loudly.
+	if _, err := prepareValue(42, arr); err == nil {
+		t.Error("expected error for a non-slice value into an Array column")
+	}
+}
+
 func TestPrepareValuePassthrough(t *testing.T) {
 	// Most types pass through unchanged.
 	cases := []struct {
