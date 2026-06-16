@@ -225,6 +225,8 @@ func (s *Streamer) phaseResolveStreamIdentity(ctx context.Context) (string, erro
 	// iteration opens a fresh CDC reader; carrying a stale handle
 	// from a previous attempt would surface an already-handled error.
 	s.sourceErrFn = nil
+	// ADR-0094: same per-attempt reset for the reshard-reopen handle.
+	s.sourceReshard = nil
 
 	// Apply the sluice-prefix convention to the operator-supplied
 	// slot name (v0.10.2). Empty stays empty (engine default);

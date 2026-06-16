@@ -105,6 +105,7 @@ var (
 	// losing any of these silently turns a resumable COPY into a
 	// start-over.
 	_ ir.CDCReader               = (*vstreamCDCReader)(nil)
+	_ ir.ReshardReopener         = (*vstreamCDCReader)(nil)
 	_ ir.CDCReader               = (*vstreamSnapshotChanges)(nil)
 	_ ir.CopyCheckpointer        = (*vstreamSnapshotRows)(nil)
 	_ ir.CopyDurableProgressSink = (*vstreamSnapshotRows)(nil)

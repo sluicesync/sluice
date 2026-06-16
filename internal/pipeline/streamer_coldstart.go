@@ -706,6 +706,11 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 	if errer, ok := stream.Changes.(interface{ Err() error }); ok {
 		s.sourceErrFn = errer.Err
 	}
+	// ADR-0094: capture the reshard-reopen surface (VStream flavors) so
+	// runOnce can follow a source reshard onto the new shard layout.
+	if rr, ok := stream.Changes.(ir.ReshardReopener); ok {
+		s.sourceReshard = rr
+	}
 	// stream stays alive for the rest of Run; the returned stop closure
 	// closes it when Run unwinds, joining the engine-side streaming
 	// goroutine deterministically (no longer left to process-exit

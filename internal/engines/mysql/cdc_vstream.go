@@ -1703,6 +1703,26 @@ func journalToShardLayoutErr(j *binlogdata.Journal) error {
 // directly so the GTIDs don't have to round-trip through the
 // position layer (which canonicalises and could lose information
 // in a future format revision).
+// ReopenAfterReshard implements [ir.ReshardReopener] (ADR-0094): the
+// orchestrator-facing wrapper around [Reopen] that keeps the engine-
+// specific [ShardLayoutChangedError] private. It inspects the reader's own
+// cached [Err]; if that is a reshard signal it drives Reopen against the
+// journal-stamped new layout and returns a fresh change channel (ok=true).
+// A non-reshard terminal error returns ok=false so the Streamer's normal
+// terminal/retry path handles it unchanged. A reshard whose Reopen fails
+// returns ok=true with the error (surfaced loudly, never swallowed).
+func (r *vstreamCDCReader) ReopenAfterReshard(ctx context.Context) (changes <-chan ir.Change, wasReshard bool, err error) {
+	var resh *ShardLayoutChangedError
+	if !errors.As(r.Err(), &resh) {
+		return nil, false, nil
+	}
+	ch, rerr := r.Reopen(ctx, resh)
+	if rerr != nil {
+		return nil, true, rerr
+	}
+	return ch, true, nil
+}
+
 func (r *vstreamCDCReader) Reopen(ctx context.Context, resh *ShardLayoutChangedError) (<-chan ir.Change, error) {
 	if err := r.applyReshardState(resh); err != nil {
 		return nil, err

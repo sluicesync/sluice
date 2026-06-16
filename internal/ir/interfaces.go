@@ -779,6 +779,33 @@ type ShardDiscoverer interface {
 	DiscoverShards(ctx context.Context, dsn string) ([]string, error)
 }
 
+// ReshardReopener is the optional surface a [CDCReader] implements to
+// follow a source reshard (a Vitess shard split / merge / MoveTables)
+// without losing or duplicating events across the seam (ADR-0094).
+//
+// A VStream reader detects a reshard as a vtgate JOURNAL event, stops the
+// stream cleanly, and caches a terminal error carrying the NEW shard
+// layout with journal-stamped GTIDs (no gap / no overlap at the cut).
+// After the change channel closes, the orchestrator calls
+// ReopenAfterReshard, which inspects the reader's own cached [Err]:
+//
+//   - If it is a reshard signal, the reader rebuilds the stream against
+//     the new layout from the journal GTIDs and returns a fresh change
+//     channel with ok=true, err=nil.
+//   - If the terminal error is NOT a reshard, returns ok=false (the
+//     caller handles it as a normal terminal/retriable error, unchanged).
+//   - A reshard whose reopen itself fails returns ok=true with a non-nil
+//     error (the caller surfaces it loudly; it must not be swallowed).
+//
+// Keeping detect-and-reopen behind one call lets the engine-specific
+// typed reshard error stay private to the engine. Engines without it
+// (binlog MySQL, Postgres) are a silent no-op — reshard is a Vitess-only
+// concept. The contract is read-then-act on the reader's own cached
+// state, so it takes no error argument.
+type ReshardReopener interface {
+	ReopenAfterReshard(ctx context.Context) (<-chan Change, bool, error)
+}
+
 // SnapshotImporter is the optional engine surface for importing a
 // previously-exported snapshot onto N additional connections. Used by
 // the parallel bulk-copy phase when N reader goroutines all need to
