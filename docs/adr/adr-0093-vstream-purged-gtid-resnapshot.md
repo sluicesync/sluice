@@ -2,10 +2,16 @@
 
 ## Status
 
-Accepted. Extends [ADR-0022](adr-0022-slot-missing-fall-through.md) (slot-missing /
-invalid-position → cold-start fall-through) to the PlanetScale/Vitess VStream source,
-and adds an operator opt-out. Discovered by cross-referencing PlanetScale's own
-`planetscale/fivetran-source` connector PRs (#69, #73) against sluice's VStream reader.
+Accepted; **amended by Bug 146** (Part 4 below). Extends
+[ADR-0022](adr-0022-slot-missing-fall-through.md) (slot-missing / invalid-position →
+cold-start fall-through) to the PlanetScale/Vitess VStream source, and adds an operator
+opt-out. Discovered by cross-referencing PlanetScale's own `planetscale/fivetran-source`
+connector PRs (#69, #73) against sluice's VStream reader.
+
+**Bug 146 amendment (the load-bearing part for Vitess 24):** the original reactive
+classifier (Part 1) proved insufficient — Vitess 24's vtgate does not surface a reactive
+purged error; it idles. Part 4 adds the **proactive `gtid_purged` pre-flight** that
+actually closes the gap. Read Part 4 with Part 1.
 
 ## Context
 
@@ -92,10 +98,52 @@ expensive and they want to decide deliberately) an explicit off switch, while ke
 resilient, binlog-symmetric behavior as the default. Gating both paths on one flag keeps
 the binlog and VStream behavior consistent under the opt-out.
 
+### 4. Proactive `gtid_purged` pre-flight on the VStream open path (Bug 146 amendment)
+
+**Parts 1–3 assumed the reactive error arrives. On Vitess 24 it does not.** A local
+multi-process Vitess-24 cluster repro (the `vitess-cluster-validator` harness) proved that
+re-opening a VStream from a purged position surfaces **no** `purged required binary logs`
+error: `uvstreamer` accepts a position that is *behind* the tablet, the tablet's mysqld
+drops the binlog dump with errno 2013 (`CRServerLost`), and vtgate treats that as a clean
+stream end — emitting only heartbeats. The stream therefore **idles** into the Phase-1
+liveness watchdog timeout, which (per Bug 141) is **retriable** — so it retry-loops on the
+same purged position and never cold-starts. Part 1's reactive classifier can never fire on
+this version. (PlanetScale's hosted vtgate *may* surface the reactive error — the
+fivetran evidence suggests so — but relying on it is not portable.)
+
+The fix is a **proactive pre-flight** mirroring the binlog reader's `verifyGTIDSetReachable`:
+in `vstreamCDCReader.StreamChanges`, before opening the gRPC stream, for a decoded
+(resumed) CDC-tail position, query `GTID_SUBSET(@@global.gtid_purged, <resume>)` and return
+`ir.ErrPositionInvalid` when the resume is unreachable (subset = 0). The orchestrator's
+ADR-0022 / Part-2 fall-through then cold-starts (or, under `--no-auto-resnapshot`, surfaces
+the loud terminal error). Two findings from the Phase-A probe make it correct:
+
+- **`gtid_purged` is tablet-type-routed by vtgate** (default → primary). The CDC tail
+  streams from the configured `vstream_tablet_type` (default **replica**), and a replica
+  can purge independently of the primary — so the pre-flight MUST read `gtid_purged` from
+  the **same tablet type the stream binds to**, via vtgate's `keyspace@<tablettype>` target
+  syntax (a `cfg.Clone()` with the retargeted `DBName`, opened with the existing
+  `discoverShards` `openDB` pattern). Reading the default (primary) value would validate a
+  tablet the stream never reads — leaving the wedge in place when a replica has purged more.
+- The resume GTID carries the Vitess `<flavor>/` prefix (`MySQL56/…`), which `GTID_SUBSET`
+  rejects (ER 1772); it is stripped (`stripGTIDFlavor`) before the query.
+
+**Degrade, don't refuse:** if the probe connection or query fails (e.g. vtgate's transient
+`no healthy tablet` during warmup), the pre-flight logs and **proceeds** — only a definitive
+`GTID_SUBSET = 0` refuses, so a check that can't run never forces a spurious re-snapshot
+(mirrors `verifySourceInstanceIdentity`'s degrade philosophy). The reactive classifier
+(Part 1) is **retained as defence-in-depth** for any source that does surface the error.
+Scope: the pure CDC-tail resume; a mid-COPY resume (TablePKs cursor) runs the ADR-0072
+primary-pinned path and is out of scope. The cluster integration test (originally written
+to pin the *reactive* path, then the documented gap) now asserts the **proactive** refusal:
+`StreamChanges` returns `ir.ErrPositionInvalid` synchronously, non-retriable.
+
 ## Consequences
 
 - **VStream resume from a purged position auto-recovers** (re-snapshot) by default, the
-  same as the binlog path — no more restart loop on the PlanetScale flavor.
+  same as the binlog path — no more restart loop on the PlanetScale flavor. On Vitess 24
+  this works via the **proactive pre-flight** (Part 4); the reactive classifier (Part 1)
+  remains for sources that surface the error.
 - **One opt-out** for operators who want a deliberate, loud stop instead of an automatic
   re-snapshot. The default favors uptime/resilience; the flag favors control.
 - **No silent data loss either way** — auto-resnapshot re-establishes a consistent full
