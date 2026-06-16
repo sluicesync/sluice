@@ -1,1511 +1,384 @@
 # Changelog
 
-All notable changes to sluice are recorded here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
-project follows [Semantic Versioning](https://semver.org/).
+All notable changes to sluice are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project follows [Semantic Versioning](https://semver.org/).
 
 ## [0.99.59] - 2026-06-16
 
 ### Fixed
-- **A forwarded `DROP COLUMN` of a synthesized ENUM column now drops the
-  per-column PostgreSQL enum type too (Bug 150).** When a MySQL-source `ENUM`
-  column is migrated to PostgreSQL, sluice synthesizes a dedicated
-  `"<table>_<col>_enum"` type for it (MySQL enums carry no type identity). A
-  schema-change-forwarded `DROP COLUMN` dropped the column but left that type
-  behind as an orphan — harmless to existing data, but a later re-add of a
-  same-named column with a *different* value set would have collided with (or
-  silently reused) the stale type. `AlterDropColumn` now also issues
-  `DROP TYPE IF EXISTS "<schema>"."<table>_<col>_enum"`, but **only** for
-  these synthesized per-column types. A preserved/named PostgreSQL enum type
-  (`TypeName` set — which may be shared across columns or tables) is never
-  auto-dropped, so same-engine PG→PG enum sharing is unaffected.
+- **A forwarded `DROP COLUMN` of a synthesized ENUM column now drops the per-column PostgreSQL enum type too (Bug 150).** When a MySQL-source `ENUM` column is migrated to PostgreSQL, sluice synthesizes a dedicated `"<table>_<col>_enum"` type for it (MySQL enums carry no type identity). A schema-change-forwarded `DROP COLUMN` dropped the column but left that type behind as an orphan — harmless to existing data, but a later re-add of a same-named column with a *different* value set would have collided with (or silently reused) the stale type. `AlterDropColumn` now also issues `DROP TYPE IF EXISTS "<schema>"."<table>_<col>_enum"`, but **only** for these synthesized per-column types. A preserved/named PostgreSQL enum type (`TypeName` set — which may be shared across columns or tables) is never auto-dropped, so same-engine PG→PG enum sharing is unaffected.
 
 ## [0.99.58] - 2026-06-16
 
 ### Fixed
-- **MySQL `SET` columns now replicate to a PostgreSQL `text[]` over CDC
-  (Bug 149).** With v0.99.56's SET fix, a MySQL `SET` decodes to a Go string
-  slice and its PG target is `TEXT[]` — but the CDC applier's array binding
-  required a different internal slice shape and rejected it with a loud
-  `expected []any for Array column, got []string`, halting the stream at apply
-  (no silent loss). The applier's array binding now accepts the string-slice
-  shape and routes it through the same path as a native `text[]`, so a MySQL
-  `SET` lands as its member labels in a PG `text[]` column. (Cold-start
-  migration of `SET` → `text[]` already worked; this closes the continuous-
-  sync apply path.)
+- **MySQL `SET` columns now replicate to a PostgreSQL `text[]` over CDC (Bug 149).** With v0.99.56's SET fix, a MySQL `SET` decodes to a Go string slice and its PG target is `TEXT[]` — but the CDC applier's array binding required a different internal slice shape and rejected it with a loud `expected []any for Array column, got []string`, halting the stream at apply (no silent loss). The applier's array binding now accepts the string-slice shape and routes it through the same path as a native `text[]`, so a MySQL `SET` lands as its member labels in a PG `text[]` column. (Cold-start migration of `SET` → `text[]` already worked; this closes the continuous- sync apply path.)
 
 ## [0.99.57] - 2026-06-16
 
 ### Fixed
-- **PlanetScale/Vitess (VStream) resume from a purged GTID position now
-  reliably auto-recovers (Bug 146, ADR-0093 amendment).** v0.99.51 added a
-  *reactive* recovery (classify vtgate's "purged required binary logs" error
-  → cold-start re-snapshot), but a local Vitess-24 cluster reproduction
-  proved vtgate does **not** surface that error on a purged resume — it
-  accepts the stale position, the tablet drops the binlog dump (errno 2013),
-  and vtgate idles on heartbeats, so the stream looped on a retriable
-  liveness timeout and never cold-started. sluice now does a **proactive
-  pre-flight** before opening the stream — `GTID_SUBSET(@@global.gtid_purged,
-  <resume>)`, mirroring the binlog reader — and returns the cold-start signal
-  when the resume position is unreachable. The check is routed at the **same
-  tablet type the stream binds to** (`gtid_purged` is tablet-type-routed by
-  vtgate; a replica can purge independently of the primary), strips the
-  Vitess GTID flavor prefix, and degrades gracefully (proceeds, never a
-  spurious re-snapshot) if the probe can't run. The reactive classifier is
-  retained as defence-in-depth. `--no-auto-resnapshot` still turns the
-  recovery into a loud terminal error.
+- **PlanetScale/Vitess (VStream) resume from a purged GTID position now reliably auto-recovers (Bug 146, ADR-0093 amendment).** v0.99.51 added a *reactive* recovery (classify vtgate's "purged required binary logs" error → cold-start re-snapshot), but a local Vitess-24 cluster reproduction proved vtgate does **not** surface that error on a purged resume — it accepts the stale position, the tablet drops the binlog dump (errno 2013), and vtgate idles on heartbeats, so the stream looped on a retriable liveness timeout and never cold-started. sluice now does a **proactive pre-flight** before opening the stream — `GTID_SUBSET(@@global.gtid_purged, <resume>)`, mirroring the binlog reader — and returns the cold-start signal when the resume position is unreachable. The check is routed at the **same tablet type the stream binds to** (`gtid_purged` is tablet-type-routed by vtgate; a replica can purge independently of the primary), strips the Vitess GTID flavor prefix, and degrades gracefully (proceeds, never a spurious re-snapshot) if the probe can't run. The reactive classifier is retained as defence-in-depth. `--no-auto-resnapshot` still turns the recovery into a loud terminal error.
 
 ## [0.99.56] - 2026-06-16
 
 ### Fixed
-- **MySQL `SET` columns now sync correctly over binlog CDC (Bug 148).** The
-  go-mysql binlog decoder hands a `SET` cell back as its **numeric bitmask**
-  (not the member text), and sluice's CDC value decoder passed that through —
-  so a replicated `SET('a','c')` carried `["5"]` (the mask, stringified)
-  instead of `["a","c"]`. The decoder now maps the bitmask to its member
-  labels via the column's value list (bit *i* → the *i*-th declared member,
-  in declaration order), errors loudly on a bit with no member, and treats
-  mask 0 as the empty set. Comma-joined label text (the snapshot/copy path
-  and the VStream reader) still passes through unchanged. This is the `SET`
-  sibling of the v0.99.52 ENUM fix (Bug 145); it applies to **self-hosted
-  MySQL binlog CDC** (snapshot and PlanetScale/Vitess sync were already
-  correct, as they deliver the label text).
+- **MySQL `SET` columns now sync correctly over binlog CDC (Bug 148).** The go-mysql binlog decoder hands a `SET` cell back as its **numeric bitmask** (not the member text), and sluice's CDC value decoder passed that through — so a replicated `SET('a','c')` carried `["5"]` (the mask, stringified) instead of `["a","c"]`. The decoder now maps the bitmask to its member labels via the column's value list (bit *i* → the *i*-th declared member, in declaration order), errors loudly on a bit with no member, and treats mask 0 as the empty set. Comma-joined label text (the snapshot/copy path and the VStream reader) still passes through unchanged. This is the `SET` sibling of the v0.99.52 ENUM fix (Bug 145); it applies to **self-hosted MySQL binlog CDC** (snapshot and PlanetScale/Vitess sync were already correct, as they deliver the label text).
 
 ## [0.99.55] - 2026-06-16
 
 ### Fixed
-- **PostGIS `geometry` now syncs over CDC from a PostgreSQL *source* too
-  (Bug 147) — completes geometry-over-CDC.** v0.99.54 added the apply-side
-  geometry codec (which made MySQL→PG work); this release fixes the read
-  side. The pgoutput CDC reader's type map had no `geometry` case — its OID
-  is dynamic (assigned at `CREATE EXTENSION postgis`), so it can't be a
-  static entry — so the first geometry change over PG→PG CDC killed the
-  stream with `unsupported column type OID <n> (geometry)`. (Cold-start COPY
-  was unaffected.) The reader now resolves the runtime geometry OID and
-  decodes the value (and correctly treats pgoutput's text-format hex-EWKB
-  bytes as hex, not raw EWKB — a silent-corruption trap caught in review).
-  Pinned across point / polygon / multipolygon / geometrycollection, 2D / Z
-  / M / ZM, SRID 4326 and 0, `POINT EMPTY`, NULL, and UPDATE/DELETE images.
-- `geography` over CDC remains **loudly refused** (no applier codec yet) —
-  tracked as a follow-up; no silent loss.
+- **PostGIS `geometry` now syncs over CDC from a PostgreSQL *source* too (Bug 147) — completes geometry-over-CDC.** v0.99.54 added the apply-side geometry codec (which made MySQL→PG work); this release fixes the read side. The pgoutput CDC reader's type map had no `geometry` case — its OID is dynamic (assigned at `CREATE EXTENSION postgis`), so it can't be a static entry — so the first geometry change over PG→PG CDC killed the stream with `unsupported column type OID <n> (geometry)`. (Cold-start COPY was unaffected.) The reader now resolves the runtime geometry OID and decodes the value (and correctly treats pgoutput's text-format hex-EWKB bytes as hex, not raw EWKB — a silent-corruption trap caught in review). Pinned across point / polygon / multipolygon / geometrycollection, 2D / Z / M / ZM, SRID 4326 and 0, `POINT EMPTY`, NULL, and UPDATE/DELETE images.
+- `geography` over CDC remains **loudly refused** (no applier codec yet) — tracked as a follow-up; no silent loss.
 
 ## [0.99.54] - 2026-06-16
 
 ### Added
-- **PostGIS `geometry` columns now apply over CDC to a PostgreSQL target
-  (#20)** — the apply (write) side; combined with the Bug 147 read-side fix
-  in v0.99.55 this makes geometry-over-CDC work in both PG-source and
-  MySQL-source directions. Geometry was previously un-appliable over
-  continuous sync: the
-  CDC applier had no codec for PostGIS's (dynamically-assigned) `geometry`
-  type OID, so the EWKB bytes were shipped in text format and PostGIS
-  rejected them (`parse error - invalid geometry`) — a loud refusal on both
-  the serial and pipelined (ADR-0092) apply paths. (Cold-start COPY was
-  unaffected.) A binary geometry codec is now registered on the applier
-  connections and ships EWKB to `geometry_recv`, so an INSERT/UPDATE/DELETE
-  carrying a geometry value applies correctly — every subtype (point / line
-  / polygon / multi* / collection), dimension (2D/Z/M/ZM), and byte order,
-  pinned against a real PostGIS target.
+- **PostGIS `geometry` columns now apply over CDC to a PostgreSQL target (#20)** — the apply (write) side; combined with the Bug 147 read-side fix in v0.99.55 this makes geometry-over-CDC work in both PG-source and MySQL-source directions. Geometry was previously un-appliable over continuous sync: the CDC applier had no codec for PostGIS's (dynamically-assigned) `geometry` type OID, so the EWKB bytes were shipped in text format and PostGIS rejected them (`parse error - invalid geometry`) — a loud refusal on both the serial and pipelined (ADR-0092) apply paths. (Cold-start COPY was unaffected.) A binary geometry codec is now registered on the applier connections and ships EWKB to `geometry_recv`, so an INSERT/UPDATE/DELETE carrying a geometry value applies correctly — every subtype (point / line / polygon / multi* / collection), dimension (2D/Z/M/ZM), and byte order, pinned against a real PostGIS target.
 
 ### Fixed
-- **Per-column SRID is now preserved on geometry CDC apply (#20).** The CDC
-  readers strip per-row SRID to raw WKB (the IR carries SRID as a per-column
-  property, ADR-0035), and the applier previously defaulted the column SRID
-  to 0 — so a replicated value into a constrained `geometry(<type>,<srid>)`
-  column lost its SRID. The applier now recovers each geometry column's real
-  SRID (and subtype) from `geometry_columns` / `geography_columns`, so the
-  stored geometry matches the source (verified `ST_AsEWKB` + `ST_SRID`
-  src==dst).
+- **Per-column SRID is now preserved on geometry CDC apply (#20).** The CDC readers strip per-row SRID to raw WKB (the IR carries SRID as a per-column property, ADR-0035), and the applier previously defaulted the column SRID to 0 — so a replicated value into a constrained `geometry(<type>,<srid>)` column lost its SRID. The applier now recovers each geometry column's real SRID (and subtype) from `geometry_columns` / `geography_columns`, so the stored geometry matches the source (verified `ST_AsEWKB` + `ST_SRID` src==dst).
 
 ### Compatibility / notes
-- No flag or config change; geometry-over-CDC works by default once the
-  target has PostGIS installed.
-- `geography` columns and `geometry[]` (arrays of geometry) remain **loudly
-  refused** over CDC apply (no silent loss) — separate follow-up work. A
-  per-row SRID stored in an *unconstrained* `geometry` column is still
-  dropped by design (ADR-0035).
+- No flag or config change; geometry-over-CDC works by default once the target has PostGIS installed.
+- `geography` columns and `geometry[]` (arrays of geometry) remain **loudly refused** over CDC apply (no silent loss) — separate follow-up work. A per-row SRID stored in an *unconstrained* `geometry` column is still dropped by design (ADR-0035).
 
 ## [0.99.53] - 2026-06-16
 
 ### Fixed
-- **Keyless-table CDC WARN now states at-least-once delivery honestly (Bug
-  143).** The ADR-0089 keyless guard applies each INSERT into a table with no
-  PRIMARY KEY (and no usable unique index) as its own transaction so the
-  adaptive batch default never makes such tables worse than
-  `--apply-batch-size=1`. Its WARN, however, claimed this meant "crash-replay
-  cannot duplicate rows" — which is **false**. A keyless INSERT is not
-  idempotent, and crash-resume granularity is the **source transaction** (the
-  GTID/LSN only advances at its commit; for VStream the position-bearing VGTID
-  arrives *after* every row event of the transaction), so a hard kill before
-  that commit checkpoint re-inserts **every keyless row in the interrupted
-  source transaction** on resume — not one. Keyless CDC is at-least-once;
-  per-row checkpointing cannot change that (you cannot resume mid-source-
-  transaction). This release corrects the WARN (and the matching ADR-0089 /
-  code-comment claims) to state the at-least-once semantics plainly and point
-  at adding a PRIMARY KEY (or NOT NULL UNIQUE index) for exactly-once, batched
-  throughput. **Behaviour is unchanged** — this is a truth-in-logging fix; the
-  long-standing guidance (ADR-0010: tables without a key are not recommended
-  for continuous sync) is unchanged.
+- **Keyless-table CDC WARN now states at-least-once delivery honestly (Bug 143).** The ADR-0089 keyless guard applies each INSERT into a table with no PRIMARY KEY (and no usable unique index) as its own transaction so the adaptive batch default never makes such tables worse than `--apply-batch-size=1`. Its WARN, however, claimed this meant "crash-replay cannot duplicate rows" — which is **false**. A keyless INSERT is not idempotent, and crash-resume granularity is the **source transaction** (the GTID/LSN only advances at its commit; for VStream the position-bearing VGTID arrives *after* every row event of the transaction), so a hard kill before that commit checkpoint re-inserts **every keyless row in the interrupted source transaction** on resume — not one. Keyless CDC is at-least-once; per-row checkpointing cannot change that (you cannot resume mid-source- transaction). This release corrects the WARN (and the matching ADR-0089 / code-comment claims) to state the at-least-once semantics plainly and point at adding a PRIMARY KEY (or NOT NULL UNIQUE index) for exactly-once, batched throughput. **Behaviour is unchanged** — this is a truth-in-logging fix; the long-standing guidance (ADR-0010: tables without a key are not recommended for continuous sync) is unchanged.
 
 ## [0.99.52] - 2026-06-16
 
 ### Fixed
-- **MySQL ENUM values now sync correctly over CDC (Bug 145).** The MySQL
-  binlog hands an `ENUM` cell back as its **1-based ordinal index**, not the
-  label, and the CDC value decoder passed that straight through — so a
-  replicated INSERT carried `"2"` instead of `"active"`. A PostgreSQL enum
-  target **rejected** it (`SQLSTATE 22P02 invalid input value for enum`); a
-  MySQL target only appeared to work because it coerces the numeric string by
-  index (fragile, and wrong the moment the value list shifts). The decoder now
-  maps the index to its label via the column's value list; a label string (the
-  snapshot/copy path and the VStream reader both deliver labels) passes through
-  unchanged. Applies to **all** MySQL enum CDC, not just schema-change
-  forwarding.
-- **MySQL ENUM schema changes now forward to a PostgreSQL target (Bug 145).**
-  Two DDL gaps in the forward path: an `ADD COLUMN <enum>` referenced the named
-  PG enum type without creating it (`42704 type does not exist`), and a MySQL
-  `MODIFY … ENUM(...)` that appends a value (which arrives as an
-  alter-column-type) hit an internal "enum DDL requires column context" error.
-  The forward path now creates the enum type first (idempotent `CREATE TYPE`)
-  for an added enum column, and forwards an appended value as
-  `ALTER TYPE … ADD VALUE IF NOT EXISTS`. Appending a value is exact; a value
-  rename/removal on the source leaves the PG enum a superset (no data loss —
-  every value the source can still produce remains valid). Combined with the
-  value fix above, MySQL→PG ENUM now works end-to-end (add column, add value,
-  rows landing by label).
+- **MySQL ENUM values now sync correctly over CDC (Bug 145).** The MySQL binlog hands an `ENUM` cell back as its **1-based ordinal index**, not the label, and the CDC value decoder passed that straight through — so a replicated INSERT carried `"2"` instead of `"active"`. A PostgreSQL enum target **rejected** it (`SQLSTATE 22P02 invalid input value for enum`); a MySQL target only appeared to work because it coerces the numeric string by index (fragile, and wrong the moment the value list shifts). The decoder now maps the index to its label via the column's value list; a label string (the snapshot/copy path and the VStream reader both deliver labels) passes through unchanged. Applies to **all** MySQL enum CDC, not just schema-change forwarding.
+- **MySQL ENUM schema changes now forward to a PostgreSQL target (Bug 145).** Two DDL gaps in the forward path: an `ADD COLUMN <enum>` referenced the named PG enum type without creating it (`42704 type does not exist`), and a MySQL `MODIFY … ENUM(...)` that appends a value (which arrives as an alter-column-type) hit an internal "enum DDL requires column context" error. The forward path now creates the enum type first (idempotent `CREATE TYPE`) for an added enum column, and forwards an appended value as `ALTER TYPE … ADD VALUE IF NOT EXISTS`. Appending a value is exact; a value rename/removal on the source leaves the PG enum a superset (no data loss — every value the source can still produce remains valid). Combined with the value fix above, MySQL→PG ENUM now works end-to-end (add column, add value, rows landing by label).
 
 ## [0.99.51] - 2026-06-15
 
 ### Fixed
-- **A PlanetScale / Vitess (VStream) resume from a purged GTID position now
-  auto-recovers instead of restart-looping (ADR-0093).** When a persisted resume
-  position falls behind the source's retained binlogs (`gtid_purged` advanced
-  past it — routine on PlanetScale's binlog-retention window), the stream used to
-  exit with an unclassified error and, on supervisor restart, hit the same purged
-  position again — a restart loop. The self-hosted MySQL binlog source already
-  auto-recovers this via a pre-flight check → cold-start (ADR-0022); the VStream
-  source had no parity because vtgate is a proxy with no single `gtid_purged` to
-  pre-flight, so the condition only surfaces reactively from the stream and was
-  never classified as an invalid position. Now the vtgate "purged required binary
-  logs" error is classified as an invalid position and routed to a **one-shot,
-  non-destructive cold-start re-snapshot** (the idempotent copy absorbs the
-  overlap; the target is not dropped). The recovery is bounded — a second
-  consecutive invalid position after a fresh re-snapshot fails loudly (the source
-  is purging faster than a snapshot can complete, which auto-retry cannot fix).
-  This was always a loud failure, never silent data loss; it now self-heals.
-  Found by cross-referencing PlanetScale's own `fivetran-source` connector.
+- **A PlanetScale / Vitess (VStream) resume from a purged GTID position now auto-recovers instead of restart-looping (ADR-0093).** When a persisted resume position falls behind the source's retained binlogs (`gtid_purged` advanced past it — routine on PlanetScale's binlog-retention window), the stream used to exit with an unclassified error and, on supervisor restart, hit the same purged position again — a restart loop. The self-hosted MySQL binlog source already auto-recovers this via a pre-flight check → cold-start (ADR-0022); the VStream source had no parity because vtgate is a proxy with no single `gtid_purged` to pre-flight, so the condition only surfaces reactively from the stream and was never classified as an invalid position. Now the vtgate "purged required binary logs" error is classified as an invalid position and routed to a **one-shot, non-destructive cold-start re-snapshot** (the idempotent copy absorbs the overlap; the target is not dropped). The recovery is bounded — a second consecutive invalid position after a fresh re-snapshot fails loudly (the source is purging faster than a snapshot can complete, which auto-retry cannot fix). This was always a loud failure, never silent data loss; it now self-heals. Found by cross-referencing PlanetScale's own `fivetran-source` connector.
 
 ### Added
-- **`--no-auto-resnapshot`** (`sync start`): opt out of the automatic re-snapshot
-  above. With this flag, a purged/invalid resume position surfaces as a loud,
-  actionable terminal error naming the recovery commands
-  (`--restart-from-scratch` / `--reset-target-data`) instead of auto re-snapshotting
-  — for operators who would rather decide a (potentially expensive) full
-  re-snapshot of very large tables deliberately. The flag gates both the binlog
-  pre-flight fall-through and the new VStream reactive recovery, keeping the two
-  paths consistent. Default (unset) = auto-recover, parity with the binlog path.
+- **`--no-auto-resnapshot`** (`sync start`): opt out of the automatic re-snapshot above. With this flag, a purged/invalid resume position surfaces as a loud, actionable terminal error naming the recovery commands (`--restart-from-scratch` / `--reset-target-data`) instead of auto re-snapshotting — for operators who would rather decide a (potentially expensive) full re-snapshot of very large tables deliberately. The flag gates both the binlog pre-flight fall-through and the new VStream reactive recovery, keeping the two paths consistent. Default (unset) = auto-recover, parity with the binlog path.
 
 ## [0.99.50] - 2026-06-15
 
 ### Fixed
-- **Postgres array columns now sync over CDC (Bug 144).** A Postgres source
-  table with any array column (`int4[]`, `text[]`, `numeric[]`, `timestamptz[]`,
-  …) wedged the continuous-sync stream on the first INSERT/UPDATE/DELETE to that
-  table with `unsupported column type OID 1007/1009/1231…`: the pgoutput CDC
-  reader's type resolver (`oidToType`) had no array-OID cases, even though the
-  initial bulk-copy (cold-start) handled arrays fine. Array columns are now
-  resolved to the IR array type by mapping each array OID to its element OID and
-  recursing — so an array element decodes identically to the same scalar column
-  — and the array-value decoder now also accepts the `[]byte` text form that the
-  pgoutput wire delivers (it previously only handled the cold-start `[]any` /
-  `string` shapes, which silently mis-walked the text bytes). Multi-dimensional
-  arrays are preserved (not flattened), NULL elements survive as NULLs, and
-  `numeric[]` keeps full scale. This was a loud failure (the stream stopped with
-  a clear error), never silent data loss. The decode↔write asymmetry is
-  unchanged: `timetz[]`, `bytea[]`, and `json[]`/`jsonb[]` arrays still refuse
-  loudly at apply (no silent acceptance). Same dual-registry-drift class as the
-  earlier Bug 97/118 fix; a parity guard now pins the CDC array registry to the
-  schema reader's so they can't drift again.
+- **Postgres array columns now sync over CDC (Bug 144).** A Postgres source table with any array column (`int4[]`, `text[]`, `numeric[]`, `timestamptz[]`, …) wedged the continuous-sync stream on the first INSERT/UPDATE/DELETE to that table with `unsupported column type OID 1007/1009/1231…`: the pgoutput CDC reader's type resolver (`oidToType`) had no array-OID cases, even though the initial bulk-copy (cold-start) handled arrays fine. Array columns are now resolved to the IR array type by mapping each array OID to its element OID and recursing — so an array element decodes identically to the same scalar column — and the array-value decoder now also accepts the `[]byte` text form that the pgoutput wire delivers (it previously only handled the cold-start `[]any` / `string` shapes, which silently mis-walked the text bytes). Multi-dimensional arrays are preserved (not flattened), NULL elements survive as NULLs, and `numeric[]` keeps full scale. This was a loud failure (the stream stopped with a clear error), never silent data loss. The decode↔write asymmetry is unchanged: `timetz[]`, `bytea[]`, and `json[]`/`jsonb[]` arrays still refuse loudly at apply (no silent acceptance). Same dual-registry-drift class as the earlier Bug 97/118 fix; a parity guard now pins the CDC array registry to the schema reader's so they can't drift again.
 
 ## [0.99.49] - 2026-06-15
 
 ### Changed
-- **Postgres CDC apply is now pipelined (ADR-0092) — ~70× higher apply
-  throughput on latency-bound (cross-region/cross-cloud) links.** The batch
-  apply path used to send a batch of N changes as N serial `Exec` round trips
-  inside one transaction, plus a position upsert and a commit (N+2 round trips).
-  Batching (ADR-0017/ADR-0089) amortized the commit fsync but did nothing for
-  the N data round trips — they stayed serial, so steady-state apply throughput
-  was bounded by `1 / per_row_exec_latency`, which on any non-co-located link is
-  dominated by network RTT. The data statements **and** the position upsert are
-  now queued onto a single `pgx.Batch` and sent in one pipelined flush; round
-  trips per batch drop from N+2 to O(1) (begin + flush + commit), independent of
-  N, so throughput becomes bounded by the server's execution rate rather than
-  `N × RTT`. Measured on a live PlanetScale soak, apply was pinned at ~90 rows/s
-  on a ~7 ms cross-cloud link and a PS-10 → PS-80 database upsize moved it 0%
-  (the bottleneck was the wire, not the DB); pipelining lifts that ~70×. The win
-  scales with RTT — co-located/low-latency targets were already fast (batching
-  amortized the commit) and see a smaller gain, never a regression. Default-on
-  for the batch apply path (`--apply-batch-size` > 1, the `auto` default);
-  `--apply-batch-size=1` keeps the serial per-change path verbatim. Value
-  encoding is byte-identical to the prior path: the pipelined pool runs in pgx
-  `QueryExecModeDescribeExec` (real described OID, BINARY format, same per-OID
-  codecs), reusing the existing `buildInsertSQL`/`buildUpdateSQL`/`buildDeleteSQL`
-  builders and `prepareValue` codec path byte-for-byte — pipelining changes
-  *when* statements are sent, never *how a value is encoded*. Durability and
-  atomicity are unchanged (position rides the same tx, `synchronous_commit = on`
-  pinned, crash before the single commit rolls back both — ADR-0007 holds).
-  Postgres-only; MySQL apply is unchanged (the ADR-0081 seam was generalized so
-  MySQL can adopt pipelining later). If the raw pgx-conn escape is ever
-  unavailable it falls back to serial `*sql.Tx` exec with a one-time WARN — loud,
-  never silent. Pre-existing, unchanged limitation: geometry over CDC is refused
-  loudly on the applier path (no binary geometry codec yet), identically on the
-  serial and pipelined paths; the snapshot/migration COPY path handles geometry
-  fine.
+- **Postgres CDC apply is now pipelined (ADR-0092) — ~70× higher apply throughput on latency-bound (cross-region/cross-cloud) links.** The batch apply path used to send a batch of N changes as N serial `Exec` round trips inside one transaction, plus a position upsert and a commit (N+2 round trips). Batching (ADR-0017/ADR-0089) amortized the commit fsync but did nothing for the N data round trips — they stayed serial, so steady-state apply throughput was bounded by `1 / per_row_exec_latency`, which on any non-co-located link is dominated by network RTT. The data statements **and** the position upsert are now queued onto a single `pgx.Batch` and sent in one pipelined flush; round trips per batch drop from N+2 to O(1) (begin + flush + commit), independent of N, so throughput becomes bounded by the server's execution rate rather than `N × RTT`. Measured on a live PlanetScale soak, apply was pinned at ~90 rows/s on a ~7 ms cross-cloud link and a PS-10 → PS-80 database upsize moved it 0% (the bottleneck was the wire, not the DB); pipelining lifts that ~70×. The win scales with RTT — co-located/low-latency targets were already fast (batching amortized the commit) and see a smaller gain, never a regression. Default-on for the batch apply path (`--apply-batch-size` > 1, the `auto` default); `--apply-batch-size=1` keeps the serial per-change path verbatim. Value encoding is byte-identical to the prior path: the pipelined pool runs in pgx `QueryExecModeDescribeExec` (real described OID, BINARY format, same per-OID codecs), reusing the existing `buildInsertSQL`/`buildUpdateSQL`/`buildDeleteSQL` builders and `prepareValue` codec path byte-for-byte — pipelining changes *when* statements are sent, never *how a value is encoded*. Durability and atomicity are unchanged (position rides the same tx, `synchronous_commit = on` pinned, crash before the single commit rolls back both — ADR-0007 holds). Postgres-only; MySQL apply is unchanged (the ADR-0081 seam was generalized so MySQL can adopt pipelining later). If the raw pgx-conn escape is ever unavailable it falls back to serial `*sql.Tx` exec with a one-time WARN — loud, never silent. Pre-existing, unchanged limitation: geometry over CDC is refused loudly on the applier path (no binary geometry codec yet), identically on the serial and pipelined paths; the snapshot/migration COPY path handles geometry fine.
 
 ## [0.99.48] - 2026-06-15
 
 ### Fixed
-- **Online schema changes now forward on a PlanetScale / Vitess (VStream)
-  source after a cold start (ADR-0091, F7c).** The default-on schema-change
-  forwarding from v0.99.45–46 did not engage for a VStream source that had
-  cold-started: the VStream cold-start CDC tail (`dispatchCDCEvent`) is a
-  separate dispatch from the standalone reader and its FIELD branch only
-  cached the field list — it never emitted the ADR-0049 `ir.SchemaSnapshot`
-  boundary the forward intercept needs. So an ADD/DROP/ALTER COLUMN on the
-  source after a cold start never forwarded, and the post-DDL row then failed
-  to apply with `42703` (PG) / `1054` (MySQL). (A warm-resumed VStream stream
-  was unaffected.) The cold-start FIELD branch now emits the boundary, exactly
-  as the standalone reader does. Additionally, `NormalizeForCDCComparison` is
-  now flavor-aware: the VStream FIELD projection carries no primary key, no
-  secondary indexes, and not reliably charset/collation, so for VStream
-  flavors those are stripped from the cold-start seed to prevent a phantom
-  PK-index-drop / ALTER-TYPE refusal (vanilla MySQL binlog is unchanged).
-  Documented limitation, in line with the wire's fidelity: CREATE/DROP INDEX
-  and charset-only ALTER cannot forward on a VStream source. With this, the
-  ADR-0091 §1d forwarding matrix holds across all three source paths —
-  MySQL binlog, PG pgoutput, and PlanetScale/Vitess VStream.
+- **Online schema changes now forward on a PlanetScale / Vitess (VStream) source after a cold start (ADR-0091, F7c).** The default-on schema-change forwarding from v0.99.45–46 did not engage for a VStream source that had cold-started: the VStream cold-start CDC tail (`dispatchCDCEvent`) is a separate dispatch from the standalone reader and its FIELD branch only cached the field list — it never emitted the ADR-0049 `ir.SchemaSnapshot` boundary the forward intercept needs. So an ADD/DROP/ALTER COLUMN on the source after a cold start never forwarded, and the post-DDL row then failed to apply with `42703` (PG) / `1054` (MySQL). (A warm-resumed VStream stream was unaffected.) The cold-start FIELD branch now emits the boundary, exactly as the standalone reader does. Additionally, `NormalizeForCDCComparison` is now flavor-aware: the VStream FIELD projection carries no primary key, no secondary indexes, and not reliably charset/collation, so for VStream flavors those are stripped from the cold-start seed to prevent a phantom PK-index-drop / ALTER-TYPE refusal (vanilla MySQL binlog is unchanged). Documented limitation, in line with the wire's fidelity: CREATE/DROP INDEX and charset-only ALTER cannot forward on a VStream source. With this, the ADR-0091 §1d forwarding matrix holds across all three source paths — MySQL binlog, PG pgoutput, and PlanetScale/Vitess VStream.
 
 ## [0.99.47] - 2026-06-15
 
 ### Fixed
-- **Connection-budget preflight no longer false-refuses on tight managed
-  Postgres (PG 18 / pooled targets).** The target connection-budget
-  preflight computed `in_use` with an unfiltered
-  `SELECT count(*) FROM pg_stat_activity`, which also counts PostgreSQL's
-  background processes — checkpointer, background/wal writer, autovacuum
-  launcher, archiver, logical-replication launcher, and (PG 18+) the async
-  I/O workers. None of those consume a `max_connections` slot, so `in_use`
-  was over-reported by the background-process count (≈9 on a PG-18 managed
-  instance). On a tight target — e.g. a managed Postgres with
-  `max_connections=25` and ~9 background processes — this produced a false
-  `target connection budget exhausted` that blocked **cold start entirely**,
-  even though only ~4 real client backends were in use. The probe now counts
-  `WHERE backend_type = 'client backend'` (PG 10+; sluice's pgoutput CDC
-  already requires PG 10+). The sibling role/database probes already filtered
-  correctly; only the global count was affected.
+- **Connection-budget preflight no longer false-refuses on tight managed Postgres (PG 18 / pooled targets).** The target connection-budget preflight computed `in_use` with an unfiltered `SELECT count(*) FROM pg_stat_activity`, which also counts PostgreSQL's background processes — checkpointer, background/wal writer, autovacuum launcher, archiver, logical-replication launcher, and (PG 18+) the async I/O workers. None of those consume a `max_connections` slot, so `in_use` was over-reported by the background-process count (≈9 on a PG-18 managed instance). On a tight target — e.g. a managed Postgres with `max_connections=25` and ~9 background processes — this produced a false `target connection budget exhausted` that blocked **cold start entirely**, even though only ~4 real client backends were in use. The probe now counts `WHERE backend_type = 'client backend'` (PG 10+; sluice's pgoutput CDC already requires PG 10+). The sibling role/database probes already filtered correctly; only the global count was affected.
 
 ## [0.99.46] - 2026-06-15
 
 ### Added
-- **PostgreSQL-source `RENAME COLUMN` forwarding (ADR-0091, F7b).** Completes the
-  default-on schema-change forwarding from v0.99.45 — the one shape it still
-  refused. Under `--schema-changes=forward` (default), a column rename on a
-  PostgreSQL source now forwards to the target (`ALTER TABLE … RENAME COLUMN`,
-  data preserved), **but only when provable.** A rename and a `DROP x + ADD y` of
-  the same type are indistinguishable from the replication stream's row shape, so
-  sluice proves the distinction with `pg_attribute.attnum` — the column's catalog
-  identity, stable across a rename: same attnum + different name = real rename
-  (forward); different attnum = genuine drop+add (refuse). The proof is
-  definitive, so this can only forward a true rename or refuse — never mis-forward
-  a drop+add into data loss. Same-engine (PG→PG) and cross-engine (PG→MySQL). A
-  new optional `ir.Column.StableID` carries the proof; it is pure metadata
-  (excluded from the schema-decode signature, alter-detection, and the
-  schema-history/backup codec). A **MySQL source** has no stable column id, so a
-  MySQL-source rename continues to refuse loudly — unchanged.
+- **PostgreSQL-source `RENAME COLUMN` forwarding (ADR-0091, F7b).** Completes the default-on schema-change forwarding from v0.99.45 — the one shape it still refused. Under `--schema-changes=forward` (default), a column rename on a PostgreSQL source now forwards to the target (`ALTER TABLE … RENAME COLUMN`, data preserved), **but only when provable.** A rename and a `DROP x + ADD y` of the same type are indistinguishable from the replication stream's row shape, so sluice proves the distinction with `pg_attribute.attnum` — the column's catalog identity, stable across a rename: same attnum + different name = real rename (forward); different attnum = genuine drop+add (refuse). The proof is definitive, so this can only forward a true rename or refuse — never mis-forward a drop+add into data loss. Same-engine (PG→PG) and cross-engine (PG→MySQL). A new optional `ir.Column.StableID` carries the proof; it is pure metadata (excluded from the schema-decode signature, alter-detection, and the schema-history/backup codec). A **MySQL source** has no stable column id, so a MySQL-source rename continues to refuse loudly — unchanged.
 
 ### Changed
-- **PostgreSQL-source renames now forward by default** (extends the v0.99.45
-  default-on forwarding to the rename shape). Set `--schema-changes=refuse` to
-  keep the conservative halt-on-DDL behavior for all shapes. No on-disk/format
-  change.
+- **PostgreSQL-source renames now forward by default** (extends the v0.99.45 default-on forwarding to the rename shape). Set `--schema-changes=refuse` to keep the conservative halt-on-DDL behavior for all shapes. No on-disk/format change.
 
 ## [0.99.45] - 2026-06-15
 
 ### Added
-- **Default-on schema-change forwarding for single-stream CDC (ADR-0091,
-  F7a).** New tristate `--schema-changes=forward|refuse` (default `forward`)
-  replaces the opt-in ADD-COLUMN-only path: an unambiguous source DDL change
-  is now retargeted to the target dialect and applied in-line on the CDC
-  boundary, keeping the sync online instead of refusing and forcing a manual
-  drain-and-DDL. Real forwarding matrix (ADR-0091 §1d is the source of truth):
-  ADD COLUMN / DROP COLUMN / ALTER COLUMN TYPE forward on **both** source
-  engines, same-engine and cross-engine (MySQL↔PG; DROP COLUMN auto-applies on
-  the target); ALTER NULLABILITY forwards on a **MySQL source only** (PG's
-  pgoutput carries no nullability flag); REORDER is a no-op (name-based
-  decode); RENAME COLUMN **refuses loudly on both engines** (indistinguishable
-  from drop+add from the stream — data-loss risk; PG attnum-proven rename is
-  follow-up F7b); multi-shape combos and volatile/computed DEFAULT on ADD
-  still refuse. Documented limitations (the wire doesn't carry the metadata,
-  so no boundary is produced): PG-source nullability/index/check and
-  MySQL-source index/check are **not** forwarded — any resulting
-  incompatibility surfaces as a **loud apply error**, never silent corruption.
-  Safety: a seed-guard never forwards a destructive shape classified against
-  the cold-start baseline (only on a genuine CDC→CDC boundary), and the PG
-  normalizer strips the generated columns + secondary indexes pgoutput omits,
-  so a phantom-destructive forward can't be synthesized (a CRITICAL regression
-  CI caught on the flip and fixed before ship). `--forward-schema-add-column`
-  is **deprecated** (warns, still forwards — subsumed). **Behavior change on
-  upgrade** — see Changed. Pin the old conservative behavior with
-  `--schema-changes=refuse`.
+- **Default-on schema-change forwarding for single-stream CDC (ADR-0091, F7a).** New tristate `--schema-changes=forward|refuse` (default `forward`) replaces the opt-in ADD-COLUMN-only path: an unambiguous source DDL change is now retargeted to the target dialect and applied in-line on the CDC boundary, keeping the sync online instead of refusing and forcing a manual drain-and-DDL. Real forwarding matrix (ADR-0091 §1d is the source of truth): ADD COLUMN / DROP COLUMN / ALTER COLUMN TYPE forward on **both** source engines, same-engine and cross-engine (MySQL↔PG; DROP COLUMN auto-applies on the target); ALTER NULLABILITY forwards on a **MySQL source only** (PG's pgoutput carries no nullability flag); REORDER is a no-op (name-based decode); RENAME COLUMN **refuses loudly on both engines** (indistinguishable from drop+add from the stream — data-loss risk; PG attnum-proven rename is follow-up F7b); multi-shape combos and volatile/computed DEFAULT on ADD still refuse. Documented limitations (the wire doesn't carry the metadata, so no boundary is produced): PG-source nullability/index/check and MySQL-source index/check are **not** forwarded — any resulting incompatibility surfaces as a **loud apply error**, never silent corruption. Safety: a seed-guard never forwards a destructive shape classified against the cold-start baseline (only on a genuine CDC→CDC boundary), and the PG normalizer strips the generated columns + secondary indexes pgoutput omits, so a phantom-destructive forward can't be synthesized (a CRITICAL regression CI caught on the flip and fixed before ship). `--forward-schema-add-column` is **deprecated** (warns, still forwards — subsumed). **Behavior change on upgrade** — see Changed. Pin the old conservative behavior with `--schema-changes=refuse`.
 
 ### Changed
-- **`sluice sync` now forwards source schema changes by default
-  (`--schema-changes=forward`).** A stream that previously **refused loudly**
-  on source DDL now **forwards it by default** — including DROP COLUMN, which
-  auto-applies on the target. Restore the exact pre-v0.99.45 halt-on-DDL
-  behavior with `--schema-changes=refuse`. Refused shapes (RENAME, multi-shape,
-  volatile DEFAULT) still refuse loudly. No on-disk/format change; `migrate`
-  and the cold-start copy path are untouched.
+- **`sluice sync` now forwards source schema changes by default (`--schema-changes=forward`).** A stream that previously **refused loudly** on source DDL now **forwards it by default** — including DROP COLUMN, which auto-applies on the target. Restore the exact pre-v0.99.45 halt-on-DDL behavior with `--schema-changes=refuse`. Refused shapes (RENAME, multi-shape, volatile DEFAULT) still refuse loudly. No on-disk/format change; `migrate` and the cold-start copy path are untouched.
 
 ### Fixed
-- **Source-side Vitess schema-resolution errors are now retriable, not
-  terminal (F9).** Right after a DDL cutover — or when the Vitess schema
-  historian is off (`track_schema_versions` is default-disabled on
-  PlanetScale) — the source vstreamer transiently misses with `unknown table
-  <t> in schema` / `no schema found for table <t>`. These arrive as free-text
-  VStream errors with no gRPC status or MySQL wrapper, so they fell through to
-  **terminal** and killed the stream on a window that self-clears. They are now
-  `ir.RetriableError`, so the ADR-0038 backoff rides out the cutover in-process;
-  substring-matched and pinned, with a near-miss guard so a bare "unknown
-  table" (real DROP/typo) stays terminal.
-- **Target schema-drift apply errors no longer tight-restart crash-loop; the
-  sync self-heals (F8).** A source ADD COLUMN (or new table) not yet created on
-  the target made the apply fail terminal — PG 42703 / 42P01, MySQL 1054 /
-  1146 — exiting the process; under a supervisor this became a tight-restart
-  loop (the soak observed `NRestarts=1821`). These codes are now
-  `ir.RetriableError` with a remedy-named message, so the ADR-0038 backoff
-  rides them out in-process and the sync **self-heals the moment the operator
-  adds the missing column/table on the target**. The wrap keeps the underlying
-  `*PgError`/`*MySQLError` reachable via `errors.As` so the offending column
-  stays named on every (loud) retry. Covers MySQL→MySQL (incl.
-  PlanetScale→PlanetScale) and PG targets symmetrically. Scope: ADD COLUMN /
-  missing-table only.
+- **Source-side Vitess schema-resolution errors are now retriable, not terminal (F9).** Right after a DDL cutover — or when the Vitess schema historian is off (`track_schema_versions` is default-disabled on PlanetScale) — the source vstreamer transiently misses with `unknown table <t> in schema` / `no schema found for table <t>`. These arrive as free-text VStream errors with no gRPC status or MySQL wrapper, so they fell through to **terminal** and killed the stream on a window that self-clears. They are now `ir.RetriableError`, so the ADR-0038 backoff rides out the cutover in-process; substring-matched and pinned, with a near-miss guard so a bare "unknown table" (real DROP/typo) stays terminal.
+- **Target schema-drift apply errors no longer tight-restart crash-loop; the sync self-heals (F8).** A source ADD COLUMN (or new table) not yet created on the target made the apply fail terminal — PG 42703 / 42P01, MySQL 1054 / 1146 — exiting the process; under a supervisor this became a tight-restart loop (the soak observed `NRestarts=1821`). These codes are now `ir.RetriableError` with a remedy-named message, so the ADR-0038 backoff rides them out in-process and the sync **self-heals the moment the operator adds the missing column/table on the target**. The wrap keeps the underlying `*PgError`/`*MySQLError` reachable via `errors.As` so the offending column stays named on every (loud) retry. Covers MySQL→MySQL (incl. PlanetScale→PlanetScale) and PG targets symmetrically. Scope: ADD COLUMN / missing-table only.
 
 ## [0.99.44] - 2026-06-14
 
 ### Changed
-- **`sluice sync --apply-batch-size` now defaults to `auto` (ADR-0089) — >10×
-  CDC apply throughput out of the box.** The ADR-0052 AIMD batch-size
-  controller has shipped since v0.72.0, but the conservative default
-  `--apply-batch-size=1` made its cap equal its floor, leaving it dormant for
-  every default user. The first real PlanetScale soak measured single-row apply
-  at ~240 rows/s vs ~6,500 at `auto` (>10×). The default is now `auto` (engine
-  ceiling 1000 mysql/postgres, 100 planetscale; AIMD adapts within `[1,
-  ceiling]`). Safety guard: a table with no PRIMARY KEY and no usable unique
-  index (non-idempotent plain INSERT on replay — Bug 125 class 3) is never
-  batched — each change commits alone (crash-replay duplicate blast radius stays
-  at 1), with a one-time WARN; PK/unique tables batch and adapt. Restore the old
-  behavior with `--apply-batch-size=1` or `--no-auto-tune`.
+- **`sluice sync --apply-batch-size` now defaults to `auto` (ADR-0089) — >10× CDC apply throughput out of the box.** The ADR-0052 AIMD batch-size controller has shipped since v0.72.0, but the conservative default `--apply-batch-size=1` made its cap equal its floor, leaving it dormant for every default user. The first real PlanetScale soak measured single-row apply at ~240 rows/s vs ~6,500 at `auto` (>10×). The default is now `auto` (engine ceiling 1000 mysql/postgres, 100 planetscale; AIMD adapts within `[1, ceiling]`). Safety guard: a table with no PRIMARY KEY and no usable unique index (non-idempotent plain INSERT on replay — Bug 125 class 3) is never batched — each change commits alone (crash-replay duplicate blast radius stays at 1), with a one-time WARN; PK/unique tables batch and adapt. Restore the old behavior with `--apply-batch-size=1` or `--no-auto-tune`.
 
 ### Fixed
-- **VStream throttle/large-transaction stalls no longer crash-loop a continuous
-  sync (Bug 141 / ADR-0090).** A transient source-tablet throttle (vtgate
-  withholds change events and, near its 10-min tolerance, heartbeats) made the
-  liveness/progress watchdog fire and misdiagnose the throttle as a failover;
-  the terminal error exited the process → a supervisor restarted it → it
-  warm-resumed to the same throttled position and re-stalled → a tight,
-  non-converging crash-loop. The watchdog timeouts are now `ir.RetriableError`,
-  so the ADR-0038 backoff retry reconnects from the last position in-process and
-  rides out the throttle (correct for a real failover too); a genuinely
-  non-healing wedge still fails loud after the bounded retry budget. Found +
-  root-caused on the soak and a self-hosted Vitess-24 reproduction.
-- **Self-hosted `--source-driver=vitess` can now warm-resume (Bug 142).** The
-  `vitess` flavor's engine name wasn't in the position-decode accept set, so a
-  resumed position stamped `Engine="vitess"` was rejected and every restart
-  crash-looped with `wrong engine "vitess"`. Unconditional; PlanetScale
-  (flavor `"planetscale"`) was unaffected. The decoder now accepts `"vitess"`.
+- **VStream throttle/large-transaction stalls no longer crash-loop a continuous sync (Bug 141 / ADR-0090).** A transient source-tablet throttle (vtgate withholds change events and, near its 10-min tolerance, heartbeats) made the liveness/progress watchdog fire and misdiagnose the throttle as a failover; the terminal error exited the process → a supervisor restarted it → it warm-resumed to the same throttled position and re-stalled → a tight, non-converging crash-loop. The watchdog timeouts are now `ir.RetriableError`, so the ADR-0038 backoff retry reconnects from the last position in-process and rides out the throttle (correct for a real failover too); a genuinely non-healing wedge still fails loud after the bounded retry budget. Found + root-caused on the soak and a self-hosted Vitess-24 reproduction.
+- **Self-hosted `--source-driver=vitess` can now warm-resume (Bug 142).** The `vitess` flavor's engine name wasn't in the position-decode accept set, so a resumed position stamped `Engine="vitess"` was rejected and every restart crash-looped with `wrong engine "vitess"`. Unconditional; PlanetScale (flavor `"planetscale"`) was unaffected. The decoder now accepts `"vitess"`.
 
 ## [0.99.43] - 2026-06-13
 
 ### Added
-- **MySQL `backup full`: coordinated parallel backup snapshot — ~2.6× faster
-  dump, ~2.3× faster restore (ADR-0088).** sluice's MySQL backup table sweep
-  was serial (one `START TRANSACTION WITH CONSISTENT SNAPSHOT` connection)
-  because MySQL — unlike Postgres — has no shareable *exported* snapshot to
-  lazily import onto parallel readers. It now opens N reader transactions
-  whose consistent snapshots **coincide** under a brief `FLUSH TABLES WITH
-  READ LOCK` window (mydumper's own mechanism), so `--table-parallelism > 1`
-  (default auto = 4) overlaps cross-table reads on a vanilla MySQL source.
-  Measured on a 16.25 GB / 33 M-row corpus: **dump 184 s → 70 s (2.63×),
-  restore 404 s → 179 s (2.26×)**, artifact unchanged. Cross-table
-  consistency and the anchored `EndPosition` are preserved (the N snapshots
-  are identical by construction). Falls back — loudly — to the serial
-  single-reader path when the source role lacks `RELOAD` (most managed
-  tiers); PlanetScale/Vitess sources are unaffected (they keep the
-  VStream-COPY path). See `docs/comparison-backup.md` for the fair-fight.
-- **MySQL/Vitess CDC: surface a throttled-or-idle VStream stall instead of
-  hanging silently (observability; roadmap item 19(a)).** When a Vitess
-  source's tablet throttler engages mid-stream, vtgate withholds ROW/change
-  events but keeps sending ~5s heartbeats *and strips the tablet's in-band
-  `VEvent.throttled` flag* — so the stream stays alive (the progress
-  watchdog re-arms on heartbeats, correctly resilient) but the stall was
-  **silent**: unbounded lag, zero diagnostic. Three observability-only
-  changes (no change to the resilient streaming behavior): (1) the
-  at-stream-open Phase-1 liveness error now names the source throttler as a
-  candidate cause alongside the primary-only topology wedge ("...or the
-  source tablet throttler is denying the stream — check `SHOW
-  VITESS_THROTTLED_APPS` on the primary"); (2) a new Phase-2 SOFT idle
-  sub-window emits a rate-limited WARN — *"alive (heartbeats flowing) but NO
-  change events for Ns — the source may be throttled or genuinely idle"* —
-  once per quiet spell, cleared by the next real change event, default 30s
-  and tunable per-DSN via `vstream_idle_warn_timeout` (`0` disables the WARN
-  only; the hard liveness/progress guards are unaffected). The soft-window
-  timer lives entirely in the single watchdog goroutine (the race-free
-  pattern). Docs: `docs/vitess-vstream-troubleshooting.md` §2 + Detection.
+- **MySQL `backup full`: coordinated parallel backup snapshot — ~2.6× faster dump, ~2.3× faster restore (ADR-0088).** sluice's MySQL backup table sweep was serial (one `START TRANSACTION WITH CONSISTENT SNAPSHOT` connection) because MySQL — unlike Postgres — has no shareable *exported* snapshot to lazily import onto parallel readers. It now opens N reader transactions whose consistent snapshots **coincide** under a brief `FLUSH TABLES WITH READ LOCK` window (mydumper's own mechanism), so `--table-parallelism > 1` (default auto = 4) overlaps cross-table reads on a vanilla MySQL source. Measured on a 16.25 GB / 33 M-row corpus: **dump 184 s → 70 s (2.63×), restore 404 s → 179 s (2.26×)**, artifact unchanged. Cross-table consistency and the anchored `EndPosition` are preserved (the N snapshots are identical by construction). Falls back — loudly — to the serial single-reader path when the source role lacks `RELOAD` (most managed tiers); PlanetScale/Vitess sources are unaffected (they keep the VStream-COPY path). See `docs/comparison-backup.md` for the fair-fight.
+- **MySQL/Vitess CDC: surface a throttled-or-idle VStream stall instead of hanging silently (observability; roadmap item 19(a)).** When a Vitess source's tablet throttler engages mid-stream, vtgate withholds ROW/change events but keeps sending ~5s heartbeats *and strips the tablet's in-band `VEvent.throttled` flag* — so the stream stays alive (the progress watchdog re-arms on heartbeats, correctly resilient) but the stall was **silent**: unbounded lag, zero diagnostic. Three observability-only changes (no change to the resilient streaming behavior): (1) the at-stream-open Phase-1 liveness error now names the source throttler as a candidate cause alongside the primary-only topology wedge ("...or the source tablet throttler is denying the stream — check `SHOW VITESS_THROTTLED_APPS` on the primary"); (2) a new Phase-2 SOFT idle sub-window emits a rate-limited WARN — *"alive (heartbeats flowing) but NO change events for Ns — the source may be throttled or genuinely idle"* — once per quiet spell, cleared by the next real change event, default 30s and tunable per-DSN via `vstream_idle_warn_timeout` (`0` disables the WARN only; the hard liveness/progress guards are unaffected). The soft-window timer lives entirely in the single watchdog goroutine (the race-free pattern). Docs: `docs/vitess-vstream-troubleshooting.md` §2 + Detection.
 
 ### Compatibility
-- **Drop-in from v0.99.42 — no format or breaking changes.** On a vanilla
-  MySQL `backup full`, `--table-parallelism > 1` (default auto = 4) now
-  engages the ADR-0088 coordinated FTWRL path instead of sweeping serially;
-  the artifact is byte-equivalent and the recorded position is unchanged.
-  The new `vstream_idle_warn_timeout` DSN param defaults to 30s (`0` disables
-  the idle WARN only). `migrate`, the Postgres paths, and cross-engine
-  behavior are untouched.
+- **Drop-in from v0.99.42 — no format or breaking changes.** On a vanilla MySQL `backup full`, `--table-parallelism > 1` (default auto = 4) now engages the ADR-0088 coordinated FTWRL path instead of sweeping serially; the artifact is byte-equivalent and the recorded position is unchanged. The new `vstream_idle_warn_timeout` DSN param defaults to 30s (`0` disables the idle WARN only). `migrate`, the Postgres paths, and cross-engine behavior are untouched.
 
 ## [0.99.42] - 2026-06-13
 
 ### Fixed
-- **MySQL CDC: a source-side `TRUNCATE TABLE` carrying a leading SQL
-  comment is no longer silently dropped (Bug 140).** MySQL preserves a
-  statement's leading comment verbatim in the binlog `QUERY_EVENT`
-  (only the trailing delimiter is stripped), but the CDC reader's
-  truncate detection (`parseTruncateTable`) required the statement to
-  *start* with `TRUNCATE`. A commented truncate — a hand-written
-  migration (`-- clear staging\nTRUNCATE TABLE t`) or an APM/ORM query
-  tag (`/* trace=… */ TRUNCATE …`) — therefore fell through to generic
-  DDL handling and never emitted a typed `ir.Truncate`, so on a live
-  MySQL → {MySQL, Postgres} sync the **target silently retained every
-  row the source truncated** and the stream never converged (no error,
-  no lag-clearing signal): a HIGH silent-divergence class on a routine
-  operation. The reader now strips leading SQL comments (`--`, `#`,
-  `/* */`) before recognising the verb; executable comments (`/*! */`,
-  `/*+ */`) are deliberately left in place (stripping them could discard
-  conditionally-run SQL — they fall through harmlessly as before).
-  Postgres sources were never affected (pgoutput emits a typed truncate
-  message; no query-string parse). Pinned by unit comment-variant cases
-  and a new MySQL-source truncate-propagation integration test (the only
-  prior truncate integration test was Postgres-only).
+- **MySQL CDC: a source-side `TRUNCATE TABLE` carrying a leading SQL comment is no longer silently dropped (Bug 140).** MySQL preserves a statement's leading comment verbatim in the binlog `QUERY_EVENT` (only the trailing delimiter is stripped), but the CDC reader's truncate detection (`parseTruncateTable`) required the statement to *start* with `TRUNCATE`. A commented truncate — a hand-written migration (`-- clear staging\nTRUNCATE TABLE t`) or an APM/ORM query tag (`/* trace=… */ TRUNCATE …`) — therefore fell through to generic DDL handling and never emitted a typed `ir.Truncate`, so on a live MySQL → {MySQL, Postgres} sync the **target silently retained every row the source truncated** and the stream never converged (no error, no lag-clearing signal): a HIGH silent-divergence class on a routine operation. The reader now strips leading SQL comments (`--`, `#`, `/* */`) before recognising the verb; executable comments (`/*! */`, `/*+ */`) are deliberately left in place (stripping them could discard conditionally-run SQL — they fall through harmlessly as before). Postgres sources were never affected (pgoutput emits a typed truncate message; no query-string parse). Pinned by unit comment-variant cases and a new MySQL-source truncate-propagation integration test (the only prior truncate integration test was Postgres-only).
 
 ### Internal
-- Extended the random-op sync-convergence property to the **cross-engine
-  directions (PG↔MySQL)** with a value-semantic canonical compare,
-  alongside the existing same-engine pair. Running the new leg surfaced
-  and fixed two harness-side cross-engine canonicalisation edges
-  (timestamp trailing-zero fractions: PG `::text` renders the minimal
-  fraction while MySQL `DATETIME(6)` pads to six digits; and dump row
-  ordering: `ORDER BY id` binds to the text projection on PG but the
-  bigint column on MySQL). Test-only.
-- CI: stabilised a flaky AIMD-controller integration test by binding the
-  metrics listener to a dynamically-allocated port instead of a
-  hardcoded one inside Linux's ephemeral range. Test-only.
+- Extended the random-op sync-convergence property to the **cross-engine directions (PG↔MySQL)** with a value-semantic canonical compare, alongside the existing same-engine pair. Running the new leg surfaced and fixed two harness-side cross-engine canonicalisation edges (timestamp trailing-zero fractions: PG `::text` renders the minimal fraction while MySQL `DATETIME(6)` pads to six digits; and dump row ordering: `ORDER BY id` binds to the text projection on PG but the bigint column on MySQL). Test-only.
+- CI: stabilised a flaky AIMD-controller integration test by binding the metrics listener to a dynamically-allocated port instead of a hardcoded one inside Linux's ephemeral range. Test-only.
 
 ## [0.99.41] - 2026-06-12
 
 ### Fixed
-- **`backup compact` no longer refuses an ordinary rotated chain when a
-  rotation-born segment never received a rollover commit in its creating
-  session (Bug 139, ADR-0087).** The "rotate on a timer, stop when idle"
-  workflow (and a crash/end at a rotation boundary) leaves a
-  rotation-born segment with no committed incremental, so it carries no
-  `incremental_coverage_start` stamp and resolves to its full's snapshot
-  anchor `S` — a few WAL bytes past the prior segment's `end_position`.
-  Compact saw that as a position gap and refused the WHOLE run with a
-  message blaming "a pre-ADR-0067, imported, or corrupted lineage" — for
-  a chain its own rotation produced (loud, zero data loss, but the
-  compact DR-maintenance feature became unusable across that boundary).
-  Now compact **splits** the merge group at the gap instead: the
-  stamp-less segment stays in its own group (one WARN naming the
-  boundary; no data lost, chain fully restorable) while every contiguous
-  run around it still merges — both naive and `--smart-compaction`,
-  including `--dry-run`. Separately, the next `backup stream` / `backup
-  incremental` resume of such a segment now replays from the prior
-  segment's `end_position` (`P_N`), so its first incremental stamps
-  `incremental_coverage_start = P_N` and the boundary heals and compacts
-  fully (N→1). Neither half ever stamps coverage no committed incremental
-  proves — creation-time stamping and resume-backfill were rejected as
-  silent-DR-loss hazards. Affected releases: v0.88.0 through v0.99.40 —
-  the strict contiguous-rotation handoff that produces the `S > P_N`
-  boundary shipped with ADR-0067 (Bug 95) at v0.88.0; before that,
-  rotated chains were refused by design, not by this false positive.
-  Pinned by the compact-split unit matrix, the resume-rule unit test,
-  and a PG idle-stop integration repro (split + restore == oracle;
-  resume-heal → whole-chain N→1 + restore == oracle).
+- **`backup compact` no longer refuses an ordinary rotated chain when a rotation-born segment never received a rollover commit in its creating session (Bug 139, ADR-0087).** The "rotate on a timer, stop when idle" workflow (and a crash/end at a rotation boundary) leaves a rotation-born segment with no committed incremental, so it carries no `incremental_coverage_start` stamp and resolves to its full's snapshot anchor `S` — a few WAL bytes past the prior segment's `end_position`. Compact saw that as a position gap and refused the WHOLE run with a message blaming "a pre-ADR-0067, imported, or corrupted lineage" — for a chain its own rotation produced (loud, zero data loss, but the compact DR-maintenance feature became unusable across that boundary). Now compact **splits** the merge group at the gap instead: the stamp-less segment stays in its own group (one WARN naming the boundary; no data lost, chain fully restorable) while every contiguous run around it still merges — both naive and `--smart-compaction`, including `--dry-run`. Separately, the next `backup stream` / `backup incremental` resume of such a segment now replays from the prior segment's `end_position` (`P_N`), so its first incremental stamps `incremental_coverage_start = P_N` and the boundary heals and compacts fully (N→1). Neither half ever stamps coverage no committed incremental proves — creation-time stamping and resume-backfill were rejected as silent-DR-loss hazards. Affected releases: v0.88.0 through v0.99.40 — the strict contiguous-rotation handoff that produces the `S > P_N` boundary shipped with ADR-0067 (Bug 95) at v0.88.0; before that, rotated chains were refused by design, not by this false positive. Pinned by the compact-split unit matrix, the resume-rule unit test, and a PG idle-stop integration repro (split + restore == oracle; resume-heal → whole-chain N→1 + restore == oracle).
 
 ## [0.99.40] - 2026-06-12
 
 ### Fixed
-- **`backup compact --strategy=smart` leaked one open file handle per
-  compacted change chunk (task #9).** The decode pass wrapped its
-  store reader in `io.NopCloser`, so the handle opened by `Get` was
-  never released on the success path. On Linux the leaked descriptor
-  merely lingered until process exit; on Windows it was fatal — the
-  rewrite step renames over the very path the leaked handle still
-  holds open, failing loudly with `Access is denied`. The byte-count
-  wrapper now owns the store handle so the chunk reader's `Close`
-  releases it; pinned by a platform-neutral handle-tracking test
-  (revert-verified: the old code leaks exactly one handle per chunk)
-  and by the previously-failing Windows integration repro now passing.
-- **`backup full` no longer refuses tables containing float `NaN` /
-  `±Infinity` (Bug 138).** PG `float4`/`float8` columns legally hold
-  IEEE specials and `migrate` carries them exactly — but the chunk
-  codec rendered floats as JSON numbers, which cannot represent them,
-  so one NaN row made the whole database un-backupable (loud refusal:
-  `json: unsupported value: NaN`). Non-finite floats now ride a new
-  additive tagged envelope (`{"_t":"f64s","v":"NaN"|"+Inf"|"-Inf"}`),
-  on both the fast and legacy codec paths. Restores are
-  `float8send`-bit-identical to a `pg_dump` round trip: ±Inf exact,
-  every NaN canonicalized to the IEEE quiet NaN exactly as PG's own
-  text format does (NaN payload bits are not representable in either
-  format). Compatibility: chunks WITHOUT non-finite floats are
-  byte-unchanged; a chunk that DOES contain one is refused loudly
-  ("unknown value tag") by v0.99.39-and-older binaries — additive-tag
-  forward compatibility, never silent. Numeric (`numeric`-typed)
-  `NaN` was always fine and is untouched.
+- **`backup compact --strategy=smart` leaked one open file handle per compacted change chunk (task #9).** The decode pass wrapped its store reader in `io.NopCloser`, so the handle opened by `Get` was never released on the success path. On Linux the leaked descriptor merely lingered until process exit; on Windows it was fatal — the rewrite step renames over the very path the leaked handle still holds open, failing loudly with `Access is denied`. The byte-count wrapper now owns the store handle so the chunk reader's `Close` releases it; pinned by a platform-neutral handle-tracking test (revert-verified: the old code leaks exactly one handle per chunk) and by the previously-failing Windows integration repro now passing.
+- **`backup full` no longer refuses tables containing float `NaN` / `±Infinity` (Bug 138).** PG `float4`/`float8` columns legally hold IEEE specials and `migrate` carries them exactly — but the chunk codec rendered floats as JSON numbers, which cannot represent them, so one NaN row made the whole database un-backupable (loud refusal: `json: unsupported value: NaN`). Non-finite floats now ride a new additive tagged envelope (`{"_t":"f64s","v":"NaN"|"+Inf"|"-Inf"}`), on both the fast and legacy codec paths. Restores are `float8send`-bit-identical to a `pg_dump` round trip: ±Inf exact, every NaN canonicalized to the IEEE quiet NaN exactly as PG's own text format does (NaN payload bits are not representable in either format). Compatibility: chunks WITHOUT non-finite floats are byte-unchanged; a chunk that DOES contain one is refused loudly ("unknown value tag") by v0.99.39-and-older binaries — additive-tag forward compatibility, never silent. Numeric (`numeric`-typed) `NaN` was always fine and is untouched.
 
 ## [0.99.39] - 2026-06-11
 
 ### Performance
-- **Backup/restore per-row JSON codec rewritten as a direct
-  buffer-append fast path (tasks #51/#52).** Profiling the 136 GB
-  bench corpus showed the reflection-based `encoding/json` round trip
-  of the per-row map was 49% of `backup full` CPU and 69% of
-  `restore` CPU. The chunk row encode/decode now runs on a
-  specialized codec that emits/parses the SAME wire bytes
-  (byte-identical output for every shape the fast path accepts, no
-  chunk-format change, old and new binaries read each other's
-  chunks): ~10× faster per row in both
-  directions at the microbenchmark level (encode 82→0 allocs/row,
-  decode 189→27). Any value or line outside the canonical shapes
-  falls back to the legacy path, which remains the semantic and
-  error oracle; differential sweeps plus two fuzz targets pin the
-  two paths equivalent on arbitrary input. Measured end-to-end on the
-  136 GB / 431M-row bench corpus (together with the O(1) checkpoint
-  fix below): `backup full` 881 s → 435 s and `restore` 2810 s →
-  1390 s — both legs −51%, zero-loss, shrinking the gap to the
-  `pg_dump`/`pg_restore -j8` specialists from ~3.1–3.2× to 1.83× /
-  1.51× (see `docs/comparison-backup.md`).
-- **PG→PG raw-copy single streams are ~4.9× faster (task #37).** The PG
-  server emits one CopyData message per row on `COPY TO STDOUT`, and each
-  row paid a synchronous unbuffered-pipe rendezvous plus a ~265-byte
-  socket write to the target — 81.8% of single-stream CPU. A 64 KiB
-  buffer ahead of the pipe coalesces the frames (byte-transparent — the
-  COPY stream has no per-Write framing): 72.6 s → 15.0 s on a 4M-row /
-  1040 MB single-stream run (14 → ~73 MB/s), checksum-verified
-  zero-loss.
-- **MySQL `LOAD DATA` bulk writes get the same per-row pipe-rendezvous
-  fix.** The TSV encoder issued one unbuffered pipe write per row; it is
-  now buffered the same way (64 KiB, flushed before close on success,
-  errors still poison the read). Byte-transparent; covered by the
-  existing LOAD DATA zero-loss and warning-probe pins.
-- **Backup checkpoints are now O(1) per event — the manifest is no
-  longer rewritten per chunk/table (task #54, ADR-0086).** Every
-  per-chunk / per-table checkpoint during `backup full` used to
-  re-marshal the ENTIRE manifest (embedded schema included) and re-Put
-  `manifest.json`, making the row sweep quadratic in table count (the
+- **Backup/restore per-row JSON codec rewritten as a direct buffer-append fast path (tasks #51/#52).** Profiling the 136 GB bench corpus showed the reflection-based `encoding/json` round trip of the per-row map was 49% of `backup full` CPU and 69% of `restore` CPU. The chunk row encode/decode now runs on a specialized codec that emits/parses the SAME wire bytes (byte-identical output for every shape the fast path accepts, no chunk-format change, old and new binaries read each other's chunks): ~10× faster per row in both directions at the microbenchmark level (encode 82→0 allocs/row, decode 189→27). Any value or line outside the canonical shapes falls back to the legacy path, which remains the semantic and error oracle; differential sweeps plus two fuzz targets pin the two paths equivalent on arbitrary input. Measured end-to-end on the 136 GB / 431M-row bench corpus (together with the O(1) checkpoint fix below): `backup full` 881 s → 435 s and `restore` 2810 s → 1390 s — both legs −51%, zero-loss, shrinking the gap to the `pg_dump`/`pg_restore -j8` specialists from ~3.1–3.2× to 1.83× / 1.51× (see `docs/comparison-backup.md`).
+- **PG→PG raw-copy single streams are ~4.9× faster (task #37).** The PG server emits one CopyData message per row on `COPY TO STDOUT`, and each row paid a synchronous unbuffered-pipe rendezvous plus a ~265-byte socket write to the target — 81.8% of single-stream CPU. A 64 KiB buffer ahead of the pipe coalesces the frames (byte-transparent — the COPY stream has no per-Write framing): 72.6 s → 15.0 s on a 4M-row / 1040 MB single-stream run (14 → ~73 MB/s), checksum-verified zero-loss.
+- **MySQL `LOAD DATA` bulk writes get the same per-row pipe-rendezvous fix.** The TSV encoder issued one unbuffered pipe write per row; it is now buffered the same way (64 KiB, flushed before close on success, errors still poison the read). Byte-transparent; covered by the existing LOAD DATA zero-loss and warning-probe pins.
+- **Backup checkpoints are now O(1) per event — the manifest is no longer rewritten per chunk/table (task #54, ADR-0086).** Every per-chunk / per-table checkpoint during `backup full` used to re-marshal the ENTIRE manifest (embedded schema included) and re-Put `manifest.json`, making the row sweep quadratic in table count (the
   #38 scale probe measured ~78 hours of pure manifest rewriting at
-  100k tables). The in-progress manifest is now a base written once
-  plus an append-only `manifest.progress.jsonl` sidecar (one JSON line
-  per event); the manifest is marshaled exactly twice per run (base +
-  final), and a successful backup's on-disk layout is unchanged —
-  restore/verify/chain tooling and older binaries read finalized
-  backups exactly as before. In-progress sidecar-layout manifests are
-  stamped format version 3 so an OLDER binary asked to resume a
-  crashed backup refuses loudly ("upgrade sluice") instead of silently
-  resuming off a base that under-reports progress; new binaries resume
-  old-format in-progress backups unchanged. Stores without an append
-  primitive (S3/GCS/Azure blob stores) keep the previous full-rewrite
-  checkpoints, named loudly on large corpora.
+  100k tables). The in-progress manifest is now a base written once plus an append-only `manifest.progress.jsonl` sidecar (one JSON line per event); the manifest is marshaled exactly twice per run (base + final), and a successful backup's on-disk layout is unchanged — restore/verify/chain tooling and older binaries read finalized backups exactly as before. In-progress sidecar-layout manifests are stamped format version 3 so an OLDER binary asked to resume a crashed backup refuses loudly ("upgrade sluice") instead of silently resuming off a base that under-reports progress; new binaries resume old-format in-progress backups unchanged. Stores without an append primitive (S3/GCS/Azure blob stores) keep the previous full-rewrite checkpoints, named loudly on large corpora.
 
 ### Fixed
-- **PG schema reads no longer die with SQLSTATE 53100 on huge
-  catalogs under small `/dev/shm` (task #55, found by the #38 scale
-  probe).** At ≥50k-table catalog sizes Postgres planned parallel
-  hash joins for several of sluice's catalog metadata queries;
-  parallel workers allocate their shared hash tables as dynamic
-  shared memory segments in `/dev/shm`, which on container-default
-  64 MB shm exhausts with `could not resize shared memory segment …
-  No space left on device (SQLSTATE 53100)`. Every PG SchemaReader
-  catalog query now runs in its own read-only transaction with `SET
-  LOCAL max_parallel_workers_per_gather = 0` — serial plans build
-  hash tables in process-local `work_mem` and cannot hit the wall,
-  and parallelism buys nothing on catalog reads (validated: a
-  50k-table / 150k-index schema read completes in ~15 s either way,
-  and the fixed binary succeeds even with `/dev/shm` 100% full where
-  the previous one failed). No operator action or `--shm-size`
-  tuning needed.
+- **PG schema reads no longer die with SQLSTATE 53100 on huge catalogs under small `/dev/shm` (task #55, found by the #38 scale probe).** At ≥50k-table catalog sizes Postgres planned parallel hash joins for several of sluice's catalog metadata queries; parallel workers allocate their shared hash tables as dynamic shared memory segments in `/dev/shm`, which on container-default 64 MB shm exhausts with `could not resize shared memory segment … No space left on device (SQLSTATE 53100)`. Every PG SchemaReader catalog query now runs in its own read-only transaction with `SET LOCAL max_parallel_workers_per_gather = 0` — serial plans build hash tables in process-local `work_mem` and cannot hit the wall, and parallelism buys nothing on catalog reads (validated: a 50k-table / 150k-index schema read completes in ~15 s either way, and the fixed binary succeeds even with `/dev/shm` 100% full where the previous one failed). No operator action or `--shm-size` tuning needed.
 
 ### Changed
-- **Schema fingerprints are now stable across manifest JSON
-  round-trips (task #49).** `ComputeSchemaHash`'s canonical view
-  normalizes a nil `Column.Default` to the explicit `DefaultNone` the
-  manifest decode hooks materialize, so a reader-fresh schema and the
-  same schema re-read from a manifest fingerprint identically; the
-  backup resume drift guard no longer JSON-round-trips the fresh side
-  to compensate. Recorded `schema_hash` values change for schemas
-  with columns that have no default — harmless: manifests' stored
-  hashes are write-only today (nothing compares against a previously
-  stored value), and the drift guard always recomputes both sides.
+- **Schema fingerprints are now stable across manifest JSON round-trips (task #49).** `ComputeSchemaHash`'s canonical view normalizes a nil `Column.Default` to the explicit `DefaultNone` the manifest decode hooks materialize, so a reader-fresh schema and the same schema re-read from a manifest fingerprint identically; the backup resume drift guard no longer JSON-round-trips the fresh side to compensate. Recorded `schema_hash` values change for schemas with columns that have no default — harmless: manifests' stored hashes are write-only today (nothing compares against a previously stored value), and the drift guard always recomputes both sides.
 
 ## [0.99.38] - 2026-06-11
 
 ### Fixed
-- **Silent chain gap on crash-resume of an anchored backup (task #42,
-  ADR-0085) — a CRITICAL silent-loss class.** A resumed `backup full`
-  kept the interrupted attempt's completed tables verbatim (exact
-  as-of the FIRST attempt's snapshot anchor A1) but always opened a
-  fresh snapshot and recorded the NEW anchor A2 as the manifest's
-  `EndPosition` — the in-progress manifest never carried an anchor, so
-  a crashed run's anchor was simply lost. Writes landing on kept
-  tables in (A1, A2] were then in NEITHER the row chunks NOR the next
-  incremental's window: the chain restored cleanly, exit 0, missing
-  those writes. The `--chain-slot` shape compounded it — the
-  slot-already-exists refusal advised `sluice slot drop` + retry as
-  crash recovery, releasing the very WAL that covered the gap. Now:
-  the in-progress manifest carries the anchor from its first write
-  (made durable before the sweep), a resume ADOPTS the prior anchor
-  (the fresh snapshot serves only read consistency; re-streamed
-  tables' overlap with the replay window converges under the
-  idempotent ADR-0010 appliers), and a `--chain-slot` resume
-  preflights and adopts the standing chain slot instead of refusing
-  (the slot now deliberately survives an interrupted run — it is the
-  resume's WAL-retention guarantee — and the refusal message says
-  "re-run the same command", reserving drop + `--force-overwrite` for
-  a deliberate fresh start). Loud refusals close the unsound corners:
-  a truly keyless table that must be (re-)streamed on an anchored
-  resume (overlap replay would duplicate it), schema drift between
-  the attempts, and incrementals/streams chaining off a
-  still-in-progress parent. Pre-fix in-progress manifests (no
-  recorded anchor) re-stream every table. `--force-overwrite` now
-  also discards an in-progress prior, making it the uniform escape
-  hatch.
+- **Silent chain gap on crash-resume of an anchored backup (task #42, ADR-0085) — a CRITICAL silent-loss class.** A resumed `backup full` kept the interrupted attempt's completed tables verbatim (exact as-of the FIRST attempt's snapshot anchor A1) but always opened a fresh snapshot and recorded the NEW anchor A2 as the manifest's `EndPosition` — the in-progress manifest never carried an anchor, so a crashed run's anchor was simply lost. Writes landing on kept tables in (A1, A2] were then in NEITHER the row chunks NOR the next incremental's window: the chain restored cleanly, exit 0, missing those writes. The `--chain-slot` shape compounded it — the slot-already-exists refusal advised `sluice slot drop` + retry as crash recovery, releasing the very WAL that covered the gap. Now: the in-progress manifest carries the anchor from its first write (made durable before the sweep), a resume ADOPTS the prior anchor (the fresh snapshot serves only read consistency; re-streamed tables' overlap with the replay window converges under the idempotent ADR-0010 appliers), and a `--chain-slot` resume preflights and adopts the standing chain slot instead of refusing (the slot now deliberately survives an interrupted run — it is the resume's WAL-retention guarantee — and the refusal message says "re-run the same command", reserving drop + `--force-overwrite` for a deliberate fresh start). Loud refusals close the unsound corners: a truly keyless table that must be (re-)streamed on an anchored resume (overlap replay would duplicate it), schema drift between the attempts, and incrementals/streams chaining off a still-in-progress parent. Pre-fix in-progress manifests (no recorded anchor) re-stream every table. `--force-overwrite` now also discards an in-progress prior, making it the uniform escape hatch.
 
 ## [0.99.37] - 2026-06-11
 
 ### Fixed
-- **Bug 136: PG → MySQL with an index on a `text`/`bytea`/JSON-landing
-  column now refuses EARLY — before any DDL or rows move — instead of
-  dying with MySQL Error 1170 at create-indexes, after the full bulk
-  copy.** MySQL cannot index a TEXT/BLOB column without an explicit key
-  length (and JSON columns cannot be key parts at all); a PG source
-  never carries prefix lengths, so a UNIQUE or secondary index on such
-  a column emitted invalid index DDL that failed at the latest possible
-  moment, and `sluice schema preview` rendered it with no advisory.
-  sluice deliberately does NOT auto-emit a prefix key length — a prefix
-  index (above all a UNIQUE one) silently changes matching/uniqueness
-  semantics. The refusal fires at the shared cross-engine pre-flight
-  (migrate, chain restore, restore, and incremental schema-deltas all
-  go through it), names every offending `table.column` + index, and
-  spells out the `--type-override TABLE.COL=varchar(N)` escape hatch —
-  which keeps working end-to-end (indexes build, UNIQUE semantics
-  preserved on the full value). `schema preview` now renders a
-  dedicated "migrate WILL REFUSE" section (text) and a
-  `text_index_refusals` JSON list. The scan covers the full
-  no-key-length family per the Bug 74 doctrine — every TEXT tier, every
-  BLOB tier, the Bug 72 wide-`varchar(N)` down-map tiers, JSON/arrays/
-  hstore, and DOMAINs over any of those — × {UNIQUE, plain secondary,
-  composite member, PRIMARY KEY}. Same-engine MySQL → MySQL
-  prefix-indexed TEXT sources are unaffected (the prefix length
-  round-trips as before), as is PG → PG. The MySQL-family target gate
-  in the translation-notice scans now also recognizes the self-hosted
-  `vitess` flavor (previously only `mysql`/`planetscale`), so the Bug
-  69/72 advisories and this refusal fire for vitess targets too.
-- **ADR-0054 shard-consolidation leases are now host-TZ-independent on
-  Postgres targets (task #44).** `lease_expires_at` is a naive
-  `TIMESTAMP` column, and pgx encodes a `time.Time` parameter as its own
-  location's wall-clock digits — so a sluice process on a TZ-behind-UTC
-  host (e.g. PDT) wrote an expiry hours in the past, making a
-  just-acquired lease instantly stealable by a peer shard (the
-  cross-shard DDL serialization guarantee was void), while a
-  TZ-ahead-of-UTC host wrote an expiry hours in the future (stuck
-  lease blocking takeover). Lease expiries are now normalized to UTC
-  before binding, and the takeover guard compares against
-  `timezone('utc', now())` instead of `CURRENT_TIMESTAMP`. Rows written
-  by earlier versions from UTC hosts already hold UTC digits and remain
-  compatible; rows from non-UTC hosts were already broken in the same
-  direction this fixes. MySQL targets were unaffected (the driver
-  config pins `loc=UTC` + session `time_zone='+00:00'`); a host-TZ
-  independence pin now covers both engines and both skew directions.
-- **Bug 137: a hard-killed Postgres-source `backup full` no longer leaks
-  its snapshot-anchor replication slot.** The default-shape (non
-  `--chain-slot`) anchor (`sluice_backup_anchor_<timestamp>`) was created
-  as a persistent slot and dropped only on graceful close — so every
-  SIGKILLed/crashed backup left an inactive slot behind, each one silently
-  pinning WAL at its `restart_lsn` until the source disk filled. Two-part
-  fix: (1) the anchor is now created protocol-`TEMPORARY`, so the server
-  itself reclaims it when the backup's replication connection dies —
-  including on hard process death; (2) when a backup RESUMES an
-  in-progress run, the engine sweeps persistent anchor slots leaked by
-  pre-fix binaries (inactive, non-temporary, anchor-named, older than a
-  one-hour safety margin), WARN-logging each slot dropped and each
-  too-young suspect deliberately left alone. `--chain-slot` runs are
-  unaffected by design: the persistent chain slot is the deliverable, and
-  a crashed run's leftover is surfaced loudly by the already-exists
-  refusal on retry.
+- **Bug 136: PG → MySQL with an index on a `text`/`bytea`/JSON-landing column now refuses EARLY — before any DDL or rows move — instead of dying with MySQL Error 1170 at create-indexes, after the full bulk copy.** MySQL cannot index a TEXT/BLOB column without an explicit key length (and JSON columns cannot be key parts at all); a PG source never carries prefix lengths, so a UNIQUE or secondary index on such a column emitted invalid index DDL that failed at the latest possible moment, and `sluice schema preview` rendered it with no advisory. sluice deliberately does NOT auto-emit a prefix key length — a prefix index (above all a UNIQUE one) silently changes matching/uniqueness semantics. The refusal fires at the shared cross-engine pre-flight (migrate, chain restore, restore, and incremental schema-deltas all go through it), names every offending `table.column` + index, and spells out the `--type-override TABLE.COL=varchar(N)` escape hatch — which keeps working end-to-end (indexes build, UNIQUE semantics preserved on the full value). `schema preview` now renders a dedicated "migrate WILL REFUSE" section (text) and a `text_index_refusals` JSON list. The scan covers the full no-key-length family per the Bug 74 doctrine — every TEXT tier, every BLOB tier, the Bug 72 wide-`varchar(N)` down-map tiers, JSON/arrays/ hstore, and DOMAINs over any of those — × {UNIQUE, plain secondary, composite member, PRIMARY KEY}. Same-engine MySQL → MySQL prefix-indexed TEXT sources are unaffected (the prefix length round-trips as before), as is PG → PG. The MySQL-family target gate in the translation-notice scans now also recognizes the self-hosted `vitess` flavor (previously only `mysql`/`planetscale`), so the Bug 69/72 advisories and this refusal fire for vitess targets too.
+- **ADR-0054 shard-consolidation leases are now host-TZ-independent on Postgres targets (task #44).** `lease_expires_at` is a naive `TIMESTAMP` column, and pgx encodes a `time.Time` parameter as its own location's wall-clock digits — so a sluice process on a TZ-behind-UTC host (e.g. PDT) wrote an expiry hours in the past, making a just-acquired lease instantly stealable by a peer shard (the cross-shard DDL serialization guarantee was void), while a TZ-ahead-of-UTC host wrote an expiry hours in the future (stuck lease blocking takeover). Lease expiries are now normalized to UTC before binding, and the takeover guard compares against `timezone('utc', now())` instead of `CURRENT_TIMESTAMP`. Rows written by earlier versions from UTC hosts already hold UTC digits and remain compatible; rows from non-UTC hosts were already broken in the same direction this fixes. MySQL targets were unaffected (the driver config pins `loc=UTC` + session `time_zone='+00:00'`); a host-TZ independence pin now covers both engines and both skew directions.
+- **Bug 137: a hard-killed Postgres-source `backup full` no longer leaks its snapshot-anchor replication slot.** The default-shape (non `--chain-slot`) anchor (`sluice_backup_anchor_<timestamp>`) was created as a persistent slot and dropped only on graceful close — so every SIGKILLed/crashed backup left an inactive slot behind, each one silently pinning WAL at its `restart_lsn` until the source disk filled. Two-part fix: (1) the anchor is now created protocol-`TEMPORARY`, so the server itself reclaims it when the backup's replication connection dies — including on hard process death; (2) when a backup RESUMES an in-progress run, the engine sweeps persistent anchor slots leaked by pre-fix binaries (inactive, non-temporary, anchor-named, older than a one-hour safety margin), WARN-logging each slot dropped and each too-young suspect deliberately left alone. `--chain-slot` runs are unaffected by design: the persistent chain slot is the deliverable, and a crashed run's leftover is surfaced loudly by the already-exists refusal on retry.
 
 ## [0.99.36] - 2026-06-11
 
 ### Fixed
-- **CRITICAL (Bug 135, v0.99.35 regression, caught by the post-release
-  battle-test): resuming an interrupted backup no longer silently
-  corrupts the artifact.** The per-chunk resume reuse kept a prior
-  partial run's chunk N verbatim and skipped N×chunk-rows rows of the
-  NEW row stream — which assumed the two runs deliver rows in identical
-  order. The reader has never guaranteed that (full-table reads carry no
-  ORDER BY by design), and under v0.99.35's parallel sweep the
-  accidental stability broke reliably: resumed backups contained
-  duplicate AND missing rows while exiting 0 with a self-consistent
-  manifest. Resume is now table-granular — fully-completed tables are
-  still kept verbatim (order-independent), partially-written tables
-  re-stream from scratch (bounded by the crash contract: at most
-  `--table-parallelism` tables were in flight), and byte-identical
-  re-produced chunks still skip their upload via a content-addressed
-  comparison. Pinned by a revert-tested order-divergence test that
-  reproduces the exact corruption shape pre-fix. If you resumed an
-  interrupted backup ON v0.99.35, discard that artifact and re-run it
-  fresh.
+- **CRITICAL (Bug 135, v0.99.35 regression, caught by the post-release battle-test): resuming an interrupted backup no longer silently corrupts the artifact.** The per-chunk resume reuse kept a prior partial run's chunk N verbatim and skipped N×chunk-rows rows of the NEW row stream — which assumed the two runs deliver rows in identical order. The reader has never guaranteed that (full-table reads carry no ORDER BY by design), and under v0.99.35's parallel sweep the accidental stability broke reliably: resumed backups contained duplicate AND missing rows while exiting 0 with a self-consistent manifest. Resume is now table-granular — fully-completed tables are still kept verbatim (order-independent), partially-written tables re-stream from scratch (bounded by the crash contract: at most `--table-parallelism` tables were in flight), and byte-identical re-produced chunks still skip their upload via a content-addressed comparison. Pinned by a revert-tested order-divergence test that reproduces the exact corruption shape pre-fix. If you resumed an interrupted backup ON v0.99.35, discard that artifact and re-run it fresh.
 
 ## [0.99.35] - 2026-06-11
 
 ### Added
-- **`backup full --chain-slot` — one-flag incremental-chain provisioning
-  (Postgres, ADR-0083).** The persistent chain slot (named by `--slot-name`)
-  is created *as* the snapshot anchor — its consistent point IS the
-  manifest's recorded EndPosition — and the pgoutput publication is ensured
-  *before* the anchor, so `backup incremental` chains with zero gap and zero
-  manual setup. Previously the operator had to create both objects by hand
-  *before* the full (the manifest pointed at a slot that might not exist);
-  pgoutput's historic-catalog rule means a late-created publication can
-  never decode the chain's first window, observed live in benchmarking. The
-  slot is kept only when the backup completes — a failed run drops it so
-  retries start clean — and an already-existing slot is refused loudly.
-  Engines without a slot concept (MySQL) log a loud no-op.
+- **`backup full --chain-slot` — one-flag incremental-chain provisioning (Postgres, ADR-0083).** The persistent chain slot (named by `--slot-name`) is created *as* the snapshot anchor — its consistent point IS the manifest's recorded EndPosition — and the pgoutput publication is ensured *before* the anchor, so `backup incremental` chains with zero gap and zero manual setup. Previously the operator had to create both objects by hand *before* the full (the manifest pointed at a slot that might not exist); pgoutput's historic-catalog rule means a late-created publication can never decode the chain's first window, observed live in benchmarking. The slot is kept only when the backup completes — a failed run drops it so retries start clean — and an already-existing slot is refused loudly. Engines without a slot concept (MySQL) log a loud no-op.
 
 ### Fixed
-- **Silent-loss class closed: an incremental against a late-created or
-  foreign-advanced slot now refuses loudly instead of silently gapping the
-  chain.** A replication slot created (or advanced by another consumer)
-  *after* the parent backup cannot serve the WAL in between — PostgreSQL
-  silently fast-forwards `START_REPLICATION` to the slot's
-  `confirmed_flush_lsn`, so `backup incremental` used to SUCCEED while the
-  chain silently missed every write in the gap. A new chain-resume
-  preflight refuses with the exact positions and the recovery
-  (`backup full --chain-slot`). The slot-missing refusal also now says the
-  slot may never have existed (the old message blamed WAL pruning).
-- **Backup chains no longer ack streamed-but-uncommitted positions.**
-  `backup incremental` / `backup stream` have no applier, so the CDC
-  reader's keepalive fell back to acking the *streamed* LSN — events parsed
-  by the pump but discarded at window close could advance
-  `confirmed_flush_lsn` past the recorded EndPosition, silently gapping the
-  next link (timing-dependent). The chain consumers now hold the slot ack
-  at the stream start and release it only to durably committed window ends;
-  on `backup stream` this also bounds source WAL retention to ~one rollover
-  window.
-- **DDL-free incrementals no longer record phantom `alter_table` schema
-  deltas.** Schema readers drained indexes and foreign keys through Go
-  map iteration (randomized order), so two reads of the *same* schema
-  could be structurally unequal — a recorded parent manifest vs the
-  end-of-window catalog read then diffed as spurious `alter_table`
-  entries (observed: 6 phantom deltas on a DDL-free incremental), and
-  `ComputeSchemaHash` fingerprints diverged for identical schemas. Both
-  engines' readers now drain in sorted (table, name) order; the
-  incremental schema diff compares indexes as a name-keyed set (so
-  chains rooted in pre-fix manifests stop false-alarming too); and the
-  schema hash fingerprints a canonical view (non-semantic collections
-  name-sorted; table and column order stay semantic).
-- **Stop-then-restart no longer stalls on a lingering walsender.** Closing
-  a replication connection with an already-cancelled context skipped the
-  protocol's graceful `Terminate` message, so the server-side walsender
-  kept the slot marked active until `wal_sender_timeout` (60 s default)
-  reaped it — longer than the v0.99.34 slot-active retry budget, producing
-  `slot is active for PID N` refusals on immediate restarts. Every
-  replication-conn close now runs under a fresh bounded context so
-  `Terminate` is always sent and the slot releases in milliseconds; the
-  retry stays as defense in depth.
+- **Silent-loss class closed: an incremental against a late-created or foreign-advanced slot now refuses loudly instead of silently gapping the chain.** A replication slot created (or advanced by another consumer) *after* the parent backup cannot serve the WAL in between — PostgreSQL silently fast-forwards `START_REPLICATION` to the slot's `confirmed_flush_lsn`, so `backup incremental` used to SUCCEED while the chain silently missed every write in the gap. A new chain-resume preflight refuses with the exact positions and the recovery (`backup full --chain-slot`). The slot-missing refusal also now says the slot may never have existed (the old message blamed WAL pruning).
+- **Backup chains no longer ack streamed-but-uncommitted positions.** `backup incremental` / `backup stream` have no applier, so the CDC reader's keepalive fell back to acking the *streamed* LSN — events parsed by the pump but discarded at window close could advance `confirmed_flush_lsn` past the recorded EndPosition, silently gapping the next link (timing-dependent). The chain consumers now hold the slot ack at the stream start and release it only to durably committed window ends; on `backup stream` this also bounds source WAL retention to ~one rollover window.
+- **DDL-free incrementals no longer record phantom `alter_table` schema deltas.** Schema readers drained indexes and foreign keys through Go map iteration (randomized order), so two reads of the *same* schema could be structurally unequal — a recorded parent manifest vs the end-of-window catalog read then diffed as spurious `alter_table` entries (observed: 6 phantom deltas on a DDL-free incremental), and `ComputeSchemaHash` fingerprints diverged for identical schemas. Both engines' readers now drain in sorted (table, name) order; the incremental schema diff compares indexes as a name-keyed set (so chains rooted in pre-fix manifests stop false-alarming too); and the schema hash fingerprints a canonical view (non-semantic collections name-sorted; table and column order stay semantic).
+- **Stop-then-restart no longer stalls on a lingering walsender.** Closing a replication connection with an already-cancelled context skipped the protocol's graceful `Terminate` message, so the server-side walsender kept the slot marked active until `wal_sender_timeout` (60 s default) reaped it — longer than the v0.99.34 slot-active retry budget, producing `slot is active for PID N` refusals on immediate restarts. Every replication-conn close now runs under a fresh bounded context so `Terminate` is always sent and the slot releases in milliseconds; the retry stays as defense in depth.
 
 ### Performance
-- **`backup full` reads tables in parallel on Postgres sources
-  (`--table-parallelism`, ADR-0084).** The full-backup row sweep now fans
-  out across a bounded worker pool (default 4 tables at once, pgcopydb
-  `--table-jobs` parity), every reader pinned to the SAME exported snapshot
-  via `SET TRANSACTION SNAPSHOT` — cross-table consistency is identical to
-  the serial sweep. Motivated by the 2026-06-10 benchmark (133 GB /
-  43 tables: 2367 s vs `pg_dump -j8`'s 232 s; ~3.4× of that gap is pure
-  cross-table parallelism). MySQL backups stay serial (per-session
-  snapshot, not shareable — an INFO log names the reason), as does the
-  non-snapshot fallback. Manifest table order and resume semantics are
-  unchanged-by-construction: entries are pre-staged in schema order and a
-  crashed run leaves at most `--table-parallelism` tables with partial
-  chunk lists, which the existing resume path already handles. **Measured
-  on the benchmark corpus: 2367 s → 881 s (2.7×) with defaults**, closing
-  the gap vs `pg_dump -j8` from 10.2× to 3.2× (`docs/comparison-backup.md`).
-- **`restore` bulk-applies tables in parallel on EVERY target
-  (`--table-parallelism`, ADR-0084 restore side).** The restore chunk-apply
-  phase now fans out across a bounded writer pool (default 4 tables at
-  once), one dedicated row-writer connection per concurrent table —
-  engine-generic, since parallel writers need no shared snapshot (PG and
-  MySQL targets alike), bounded by the target's connection budget.
-  Motivated by the same 2026-06-10 benchmark (serial restore projected ~3 h
-  vs `pg_restore -j8`'s 917 s); restore wall time is the operator's
-  recovery-time objective. Per-table chunk ordering, per-chunk SHA-256
-  verification, and chain restores' ordered incremental replay are
-  unchanged; chain restores parallelize each segment full's bulk-apply via
-  the same flag. Copy/index overlap on restore is deliberately deferred.
-  **Measured: a projected ~3 h serial restore completes in 2810 s (≥3.8×)
-  with defaults**, closing the gap vs `pg_restore -j8` from ~11.5× to 3.1×.
+- **`backup full` reads tables in parallel on Postgres sources (`--table-parallelism`, ADR-0084).** The full-backup row sweep now fans out across a bounded worker pool (default 4 tables at once, pgcopydb `--table-jobs` parity), every reader pinned to the SAME exported snapshot via `SET TRANSACTION SNAPSHOT` — cross-table consistency is identical to the serial sweep. Motivated by the 2026-06-10 benchmark (133 GB / 43 tables: 2367 s vs `pg_dump -j8`'s 232 s; ~3.4× of that gap is pure cross-table parallelism). MySQL backups stay serial (per-session snapshot, not shareable — an INFO log names the reason), as does the non-snapshot fallback. Manifest table order and resume semantics are unchanged-by-construction: entries are pre-staged in schema order and a crashed run leaves at most `--table-parallelism` tables with partial chunk lists, which the existing resume path already handles. **Measured on the benchmark corpus: 2367 s → 881 s (2.7×) with defaults**, closing the gap vs `pg_dump -j8` from 10.2× to 3.2× (`docs/comparison-backup.md`).
+- **`restore` bulk-applies tables in parallel on EVERY target (`--table-parallelism`, ADR-0084 restore side).** The restore chunk-apply phase now fans out across a bounded writer pool (default 4 tables at once), one dedicated row-writer connection per concurrent table — engine-generic, since parallel writers need no shared snapshot (PG and MySQL targets alike), bounded by the target's connection budget. Motivated by the same 2026-06-10 benchmark (serial restore projected ~3 h vs `pg_restore -j8`'s 917 s); restore wall time is the operator's recovery-time objective. Per-table chunk ordering, per-chunk SHA-256 verification, and chain restores' ordered incremental replay are unchanged; chain restores parallelize each segment full's bulk-apply via the same flag. Copy/index overlap on restore is deliberately deferred. **Measured: a projected ~3 h serial restore completes in 2810 s (≥3.8×) with defaults**, closing the gap vs `pg_restore -j8` from ~11.5× to 3.1×.
 
 ## [0.99.34] - 2026-06-10
 
 ### Fixed
-- **Warm resumes and crash recoveries no longer fail on a not-yet-released
-  replication slot.** Restarting a PG stream moments after the prior owner
-  stopped (or crashed) could hit `replication slot is active for PID N`
-  (SQLSTATE 55006) and fail loudly for a condition that self-heals as soon
-  as Postgres reaps the dead walsender. `START_REPLICATION` now retries
-  with bounded backoff (8 attempts, 0.5–8 s, each wait visible at INFO);
-  a *genuinely* concurrent second writer still holds the slot past the
-  budget and gets the original loud refusal — the two-writers guard is
-  unchanged and pinned.
+- **Warm resumes and crash recoveries no longer fail on a not-yet-released replication slot.** Restarting a PG stream moments after the prior owner stopped (or crashed) could hit `replication slot is active for PID N` (SQLSTATE 55006) and fail loudly for a condition that self-heals as soon as Postgres reaps the dead walsender. `START_REPLICATION` now retries with bounded backoff (8 attempts, 0.5–8 s, each wait visible at INFO); a *genuinely* concurrent second writer still holds the slot past the budget and gets the original loud refusal — the two-writers guard is unchanged and pinned.
 
 ### Performance
-- **Migration-state checkpoints are O(1) in table count (ADR-0082).**
-  Per-table progress and resume cursors now live one-row-per-table instead
-  of re-serializing the entire progress map into a single hot row on every
-  checkpoint. Measured at 10k tables on real Postgres: **31.7 ms → 377 µs
-  per checkpoint (84×)**; a 10k-table migration's total state writes drop
-  from ~17 GB to ~1.3 MB. Existing migrations upgrade transparently on
-  first resume (crash-safe, one-time); a *downgraded* binary encountering
-  the upgraded layout fails loudly instead of silently re-copying.
+- **Migration-state checkpoints are O(1) in table count (ADR-0082).** Per-table progress and resume cursors now live one-row-per-table instead of re-serializing the entire progress map into a single hot row on every checkpoint. Measured at 10k tables on real Postgres: **31.7 ms → 377 µs per checkpoint (84×)**; a 10k-table migration's total state writes drop from ~17 GB to ~1.3 MB. Existing migrations upgrade transparently on first resume (crash-safe, one-time); a *downgraded* binary encountering the upgraded layout fails loudly instead of silently re-copying.
 
 ### Internal
-- Applier control-plane extraction arc complete (ADR-0081 tiers a–d): the
-  duplicated batch loop, control-table CRUD, and lease-row conversion now
-  live once in `internal/appliershared`; ADR-0081 records what stays
-  engine-specific and why.
-- Random-op sync-convergence property test (`pgregory.net/rapid`) joins
-  the suite: random transaction interleavings against live PG/MySQL syncs
-  must converge to exact content equality; smoke budget in PR CI,
-  env-knobbed deep runs.
+- Applier control-plane extraction arc complete (ADR-0081 tiers a–d): the duplicated batch loop, control-table CRUD, and lease-row conversion now live once in `internal/appliershared`; ADR-0081 records what stays engine-specific and why.
+- Random-op sync-convergence property test (`pgregory.net/rapid`) joins the suite: random transaction interleavings against live PG/MySQL syncs must converge to exact content equality; smoke budget in PR CI, env-knobbed deep runs.
 
 ## [0.99.33] - 2026-06-10
 
 ### Fixed
-- **Single-manifest (full-only) cross-engine restores now run the same
-  unsupportability gate as chain restores (Bug 134).** v0.99.32 fixed the
-  PG→`vitess` *chain*-restore refusal skip — but the single-manifest restore
-  branch (a `backup full` with no incrementals) never called the gate at all,
-  on **any** MySQL-family target: a full-only PG backup carrying an `EXCLUDE`
-  constraint restored to `mysql`, `planetscale`, or `vitess` with exit 0 and
-  the constraint silently downgraded to a plain non-unique `KEY` (the same
-  applies to the gate's other refusal families — extension opclasses, PostGIS
-  metadata). Pre-existing on every version with cross-engine restore; found
-  by the v0.99.32 regression cycle within hours of the chain-path fix —
-  the instance one branch over. Anyone who restored a **full-only** PG backup
-  to a MySQL-family target should re-check that schema's constraints (adding
-  even one incremental made the same restore refuse loudly, so chains were
-  covered). Pinned across all three MySQL-family targets plus the PG→PG and
-  clean-schema controls, with a revert-test proving the pin catches the bug.
+- **Single-manifest (full-only) cross-engine restores now run the same unsupportability gate as chain restores (Bug 134).** v0.99.32 fixed the PG→`vitess` *chain*-restore refusal skip — but the single-manifest restore branch (a `backup full` with no incrementals) never called the gate at all, on **any** MySQL-family target: a full-only PG backup carrying an `EXCLUDE` constraint restored to `mysql`, `planetscale`, or `vitess` with exit 0 and the constraint silently downgraded to a plain non-unique `KEY` (the same applies to the gate's other refusal families — extension opclasses, PostGIS metadata). Pre-existing on every version with cross-engine restore; found by the v0.99.32 regression cycle within hours of the chain-path fix — the instance one branch over. Anyone who restored a **full-only** PG backup to a MySQL-family target should re-check that schema's constraints (adding even one incremental made the same restore refuse loudly, so chains were covered). Pinned across all three MySQL-family targets plus the PG→PG and clean-schema controls, with a revert-test proving the pin catches the bug.
 
 ### Internal
-- **The applier batch loop now lives once (ADR-0081, extraction tier b).**
-  Both engines' ~500-line mirrored AIMD/flush/idle-grace state machines
-  collapsed into one shared loop in `internal/appliershared` behind a
-  closure seam; the measured 69 divergent lines reduce to five named
-  config fields. Behavior-identical — the item-18 timing pins and the
-  ADR-0010 idempotency pin passed unchanged on both engines. The next
-  batch-loop fix lands in one file instead of two.
+- **The applier batch loop now lives once (ADR-0081, extraction tier b).** Both engines' ~500-line mirrored AIMD/flush/idle-grace state machines collapsed into one shared loop in `internal/appliershared` behind a closure seam; the measured 69 divergent lines reduce to five named config fields. Behavior-identical — the item-18 timing pins and the ADR-0010 idempotency pin passed unchanged on both engines. The next batch-loop fix lands in one file instead of two.
 
 ### CI
-- Weekly Postgres version matrix (`pg-version-matrix.yml`): the postgres
-  engine integration suite now runs against stock `postgres:17`, `:18`,
-  and a `:latest` canary (PG19-beta drift signal) on a Saturday schedule +
-  dispatch — PR CI stays on the prebaked PG16. Enabled by a
-  `SLUICE_TEST_PG_IMAGE` override on the shared test container.
-- `funlen`/`gocyclo` hold-the-line lint ceilings (210 lines / complexity
-  60, ratchet-down note in the config) so the orchestrator mega-function
-  class can't regrow silently.
+- Weekly Postgres version matrix (`pg-version-matrix.yml`): the postgres engine integration suite now runs against stock `postgres:17`, `:18`, and a `:latest` canary (PG19-beta drift signal) on a Saturday schedule + dispatch — PR CI stays on the prebaked PG16. Enabled by a `SLUICE_TEST_PG_IMAGE` override on the shared test container.
+- `funlen`/`gocyclo` hold-the-line lint ceilings (210 lines / complexity 60, ratchet-down note in the config) so the orchestrator mega-function class can't regrow silently.
 
 ## [0.99.32] - 2026-06-10
 
 ### Fixed
-- **PG → `vitess`-flavor chain restores no longer silently skip the PG-native
-  refusal checks.** The `vitess` self-hosted flavor (shipped v0.99.15) was
-  missing from the MySQL-family target check in the cross-engine restore gate,
-  so restoring a PG-lineage backup chain to a `vitess` target silently skipped
-  every PG-native unsupportability refusal — a PG schema carrying `EXCLUDE`
-  constraints or extension opclasses would restore with those constraints
-  **silently dropped** instead of refusing loudly. Found while converting
-  engine-name dispatch to capability dispatch (the exact bug class that
-  conversion exists to kill); now pinned. Anyone who restored a PG-lineage
-  chain to a `vitess`-flavor target on v0.99.15–v0.99.31 should re-check that
-  schema's constraints. (`planetscale` and `mysql` targets were always
-  covered; PG→PG restores unaffected.)
+- **PG → `vitess`-flavor chain restores no longer silently skip the PG-native refusal checks.** The `vitess` self-hosted flavor (shipped v0.99.15) was missing from the MySQL-family target check in the cross-engine restore gate, so restoring a PG-lineage backup chain to a `vitess` target silently skipped every PG-native unsupportability refusal — a PG schema carrying `EXCLUDE` constraints or extension opclasses would restore with those constraints **silently dropped** instead of refusing loudly. Found while converting engine-name dispatch to capability dispatch (the exact bug class that conversion exists to kill); now pinned. Anyone who restored a PG-lineage chain to a `vitess`-flavor target on v0.99.15–v0.99.31 should re-check that schema's constraints. (`planetscale` and `mysql` targets were always covered; PG→PG restores unaffected.)
 
 ### Changed
-- **The `vitess` flavor now inherits the PlanetScale-tuned apply defaults it
-  was always meant to have** (same vtgate semantics): conservative AIMD p95
-  target latency (5s, was the generic 10s), the apply-batch-size>50
-  transaction-killer warning, and MySQL-dialect schema-diff rendering (was
-  PG-style).
+- **The `vitess` flavor now inherits the PlanetScale-tuned apply defaults it was always meant to have** (same vtgate semantics): conservative AIMD p95 target latency (5s, was the generic 10s), the apply-batch-size>50 transaction-killer warning, and MySQL-dialect schema-diff rendering (was PG-style).
 
 ### Performance
-- **Idle `backup stream` broker ticks are now O(1) store reads instead of one
-  GET per manifest in the chain** (~2,000 GETs per 30s tick on a week-old
-  5-minute-rollover stream → exactly 2). The walked chain is cached on the
-  byte-identity of the lineage catalog + tail manifest; any structural change
-  (rotation, compaction, prune, append, tail checkpoint rewrite) invalidates.
-- **Bulk-copy decode and write now overlap** (bounded 64-row buffers on the
-  row-channel chain; backpressure preserved) and the PG COPY bridge no longer
-  allocates per row (0 allocs/op pinned).
-- **The per-flush `SHOW WARNINGS` probe on batched-INSERT targets is sampled**
-  (first 10 flushes exhaustive, then 1-in-16, final flush always) — up to ~30
-  min saved on large cross-region PlanetScale loads; the LOAD DATA path keeps
-  its every-statement check.
+- **Idle `backup stream` broker ticks are now O(1) store reads instead of one GET per manifest in the chain** (~2,000 GETs per 30s tick on a week-old 5-minute-rollover stream → exactly 2). The walked chain is cached on the byte-identity of the lineage catalog + tail manifest; any structural change (rotation, compaction, prune, append, tail checkpoint rewrite) invalidates.
+- **Bulk-copy decode and write now overlap** (bounded 64-row buffers on the row-channel chain; backpressure preserved) and the PG COPY bridge no longer allocates per row (0 allocs/op pinned).
+- **The per-flush `SHOW WARNINGS` probe on batched-INSERT targets is sampled** (first 10 flushes exhaustive, then 1-in-16, final flush always) — up to ~30 min saved on large cross-region PlanetScale loads; the LOAD DATA path keeps its every-statement check.
 
 ### Internal
-- Applier column-metadata shapes converged across engines + byte-identical
-  helpers extracted to `internal/appliershared` (control-plane extraction
-  tiers a; groundwork for one-applier-fix-lands-once).
-- Orchestrator engine dispatch re-anchored to `ir.Capabilities` (five new
-  declared fields); per-engine compile-time optional-interface declarations
-  (a method-set break now fails compile instead of silently downgrading).
-- The three orchestrator mega-functions (`runOnce`, `coldStart`,
-  `runSingleDatabase`) carved into named phase methods and `streamer.go`
-  split by its own seams (3,205 → 1,235 lines) — purely mechanical, zero
-  test edits, teardown ordering byte-identical.
+- Applier column-metadata shapes converged across engines + byte-identical helpers extracted to `internal/appliershared` (control-plane extraction tiers a; groundwork for one-applier-fix-lands-once).
+- Orchestrator engine dispatch re-anchored to `ir.Capabilities` (five new declared fields); per-engine compile-time optional-interface declarations (a method-set break now fails compile instead of silently downgrading).
+- The three orchestrator mega-functions (`runOnce`, `coldStart`, `runSingleDatabase`) carved into named phase methods and `streamer.go` split by its own seams (3,205 → 1,235 lines) — purely mechanical, zero test edits, teardown ordering byte-identical.
 
 ## [0.99.31] - 2026-06-10
 
 ### Added
-- **Combined-`ALTER` MySQL secondary-index builds (ADR-0080 follow-up).** When
-  `sluice migrate` builds a table's secondary indexes on a MySQL target, all
-  combinable `BTREE`/`UNIQUE` indexes for that table are now created in **one**
-  `ALTER TABLE ... ADD INDEX ..., ADD INDEX ...` statement — one InnoDB scan and
-  one metadata lock per table instead of one per index. `FULLTEXT`/`SPATIAL`
-  stay separate statements (MySQL restricts combining them). Measured on the
-  `benchmarks/mysql/` harness: **−18.1 % median index-phase time** on top of the
-  v0.99.30 overlap win, zero-loss verified. Applies to both the overlapped and
-  serial post-copy index paths.
-- **`--log-format=json`.** Emits one JSON object per line on stderr (slog's
-  JSONHandler) instead of the human-readable text format — the shape Loki /
-  Datadog / CloudWatch agents ingest natively. Pairs with the existing
-  `/metrics` + `/healthz` + `/readyz` endpoints for running `sluice sync` under
-  Kubernetes. Default remains `text`.
+- **Combined-`ALTER` MySQL secondary-index builds (ADR-0080 follow-up).** When `sluice migrate` builds a table's secondary indexes on a MySQL target, all combinable `BTREE`/`UNIQUE` indexes for that table are now created in **one** `ALTER TABLE ... ADD INDEX ..., ADD INDEX ...` statement — one InnoDB scan and one metadata lock per table instead of one per index. `FULLTEXT`/`SPATIAL` stay separate statements (MySQL restricts combining them). Measured on the `benchmarks/mysql/` harness: **−18.1 % median index-phase time** on top of the v0.99.30 overlap win, zero-loss verified. Applies to both the overlapped and serial post-copy index paths.
+- **`--log-format=json`.** Emits one JSON object per line on stderr (slog's JSONHandler) instead of the human-readable text format — the shape Loki / Datadog / CloudWatch agents ingest natively. Pairs with the existing `/metrics` + `/healthz` + `/readyz` endpoints for running `sluice sync` under Kubernetes. Default remains `text`.
 
 ### Security
-- **Local backup stores and crash bundles are now written owner-only (0600
-  files / 0700 directories; previously 0644/0755).** Backup chunks contain full
-  row data and `--encrypt` is opt-in, so a world-readable backup directory
-  handed any local user the dataset. Existing stores keep their current
-  permissions (only newly created files/dirs are affected); restore is
-  unaffected. No effect on Windows.
+- **Local backup stores and crash bundles are now written owner-only (0600 files / 0700 directories; previously 0644/0755).** Backup chunks contain full row data and `--encrypt` is opt-in, so a world-readable backup directory handed any local user the dataset. Existing stores keep their current permissions (only newly created files/dirs are affected); restore is unaffected. No effect on Windows.
 
 ### Fixed
-- **Failed backup-compact orphan sweeps now leave a WARN breadcrumb.** The
-  post-commit delete pass that removes a merged segment's superseded files was
-  silently best-effort; a failure leaked backup-store disk with no log line at
-  any level. The chain remains correct either way — this is purely operator
-  visibility.
+- **Failed backup-compact orphan sweeps now leave a WARN breadcrumb.** The post-commit delete pass that removes a merged segment's superseded files was silently best-effort; a failure leaked backup-store disk with no log line at any level. The chain remains correct either way — this is purely operator visibility.
 
 ### CI
-- **The `postgres-trigger` engine's integration tests now run in CI.** The
-  package landed after the integration-shard split and no shard listed it, so
-  its suite — including the capture-payload pin for a known silent-loss class —
-  had never executed in CI. A new Lint-job guard fails CI if a package with
-  integration-tagged tests is ever outside the shard matrix again, and a
-  tags-vet matrix type-checks every build-tag combination (including tagged
-  test files) on every PR.
+- **The `postgres-trigger` engine's integration tests now run in CI.** The package landed after the integration-shard split and no shard listed it, so its suite — including the capture-payload pin for a known silent-loss class — had never executed in CI. A new Lint-job guard fails CI if a package with integration-tagged tests is ever outside the shard matrix again, and a tags-vet matrix type-checks every build-tag combination (including tagged test files) on every PR.
 
 ## [0.99.30] - 2026-06-09
 
 ### Added
-- **Index-build overlap extended to MySQL targets (ADR-0080).** `sluice migrate`
-  to a MySQL target (MySQL→MySQL and PG→MySQL) now builds each table's secondary
-  indexes as that table's copy lands, concurrently with the still-copying tables
-  — collapsing the separate post-copy whole-schema index phase, the same
-  structural win Postgres targets got in v0.99.29 (ADR-0077). The MySQL
-  `SchemaWriter` now implements `ir.IncrementalIndexBuilder` + `ir.TableIndexedNotifier`,
-  draining the completed-tables channel into a bounded worker pool (each table's
-  indexes built on its own connection, detect-then-skip for idempotent resume).
-  MySQL has no connection-slot prober, so the pool sizes itself from a fixed
-  worker count (default 4) rather than a measured budget; PlanetScale/Vitess
-  targets decline the overlap and defer to their own online-DDL (the channel is
-  drained into a no-op that still fires the per-table callback so resume
-  accounting stays correct, then the post-copy `CreateIndexes` runs as before).
-  No throughput number is claimed yet — it needs an at-scale MySQL measurement.
-- **Within-table chunking on the PG-source `sync start` fast cold-start
-  (ADR-0079 v1.1).** v0.99.29 gave the fast sync cold-start cross-table
-  parallelism + index-overlap + raw passthrough; v0.99.30 adds within-table
-  PK-range chunking so a large single table on the sync path is copied in
-  parallel chunks instead of single-streamed. Engages when the source table has
-  planner stats (`pg_class.reltuples`); a never-ANALYZEd table stays
-  single-stream (slower, never lossy). PG-source only. Implemented via a new
-  optional `ir.RowCountEstimator` surface (sibling to `RowCounter`) that carries
-  the chunk-decision-only estimate; the PG implementation reads `reltuples` off a
-  separate connection so it never races the live snapshot stream. Only the
-  chunk-decision estimate changes — a wrong estimate degrades to single-stream,
-  never corrupts the copy.
+- **Index-build overlap extended to MySQL targets (ADR-0080).** `sluice migrate` to a MySQL target (MySQL→MySQL and PG→MySQL) now builds each table's secondary indexes as that table's copy lands, concurrently with the still-copying tables — collapsing the separate post-copy whole-schema index phase, the same structural win Postgres targets got in v0.99.29 (ADR-0077). The MySQL `SchemaWriter` now implements `ir.IncrementalIndexBuilder` + `ir.TableIndexedNotifier`, draining the completed-tables channel into a bounded worker pool (each table's indexes built on its own connection, detect-then-skip for idempotent resume). MySQL has no connection-slot prober, so the pool sizes itself from a fixed worker count (default 4) rather than a measured budget; PlanetScale/Vitess targets decline the overlap and defer to their own online-DDL (the channel is drained into a no-op that still fires the per-table callback so resume accounting stays correct, then the post-copy `CreateIndexes` runs as before). No throughput number is claimed yet — it needs an at-scale MySQL measurement.
+- **Within-table chunking on the PG-source `sync start` fast cold-start (ADR-0079 v1.1).** v0.99.29 gave the fast sync cold-start cross-table parallelism + index-overlap + raw passthrough; v0.99.30 adds within-table PK-range chunking so a large single table on the sync path is copied in parallel chunks instead of single-streamed. Engages when the source table has planner stats (`pg_class.reltuples`); a never-ANALYZEd table stays single-stream (slower, never lossy). PG-source only. Implemented via a new optional `ir.RowCountEstimator` surface (sibling to `RowCounter`) that carries the chunk-decision-only estimate; the PG implementation reads `reltuples` off a separate connection so it never races the live snapshot stream. Only the chunk-decision estimate changes — a wrong estimate degrades to single-stream, never corrupts the copy.
 
 ### Fixed
-- **MySQL `SPATIAL` / `FULLTEXT` index creation no longer fails with
-  `Error 1089`.** sluice emitted a per-column prefix length (e.g. `pt(32)`) on
-  `SPATIAL` and `FULLTEXT` indexes, which MySQL rejects with `Error 1089`
-  ("Incorrect prefix key; the used key part isn't a string…"), so the index was
-  never created and the migration errored. The source reader can legitimately
-  surface a `SUB_PART` (length) on a geometry/full-text index column; the prefix
-  is now dropped at emit time for those two index kinds (every other kind keeps
-  the source's prefix length). Affected any migration carrying a
-  `SPATIAL`/`FULLTEXT` secondary index to a MySQL target, on both the serial
-  post-copy `CreateIndexes` path and the new overlapped path. Pre-existing bug —
-  present in every prior published version on that path — first surfaced by the
-  ADR-0080 work. Loud failure (the migration errors; the index is not created),
-  not silent data loss, so no data re-verification is needed.
+- **MySQL `SPATIAL` / `FULLTEXT` index creation no longer fails with `Error 1089`.** sluice emitted a per-column prefix length (e.g. `pt(32)`) on `SPATIAL` and `FULLTEXT` indexes, which MySQL rejects with `Error 1089` ("Incorrect prefix key; the used key part isn't a string…"), so the index was never created and the migration errored. The source reader can legitimately surface a `SUB_PART` (length) on a geometry/full-text index column; the prefix is now dropped at emit time for those two index kinds (every other kind keeps the source's prefix length). Affected any migration carrying a `SPATIAL`/`FULLTEXT` secondary index to a MySQL target, on both the serial post-copy `CreateIndexes` path and the new overlapped path. Pre-existing bug — present in every prior published version on that path — first surfaced by the ADR-0080 work. Loud failure (the migration errors; the index is not created), not silent data loss, so no data re-verification is needed.
 
 ## [0.99.29] - 2026-06-09
 
 ### Added
 
-- **Cross-table copy worker pool for `sluice migrate` (`--table-parallelism`,
-  ADR-0076) + adaptive `--bulk-parallel-min-rows`.** `migrate` now copies
-  multiple tables concurrently (the cross-table axis, pgcopydb's `--table-jobs`),
-  composed with the existing within-table `--bulk-parallelism` PK-range
-  splitting — closing the many-medium-table gap where each table sat below the
-  within-table-split threshold and the serial table loop left cores idle. The
-  two axes multiply, and the product is bounded by the target's connection
-  budget (and `--max-target-connections`) at a single chokepoint. `0` (default)
-  = auto 4; `1` disables. `--bulk-parallel-min-rows` became a `0=auto` sentinel
-  that dials the within-table-split threshold down on many-table schemas
-  (`base/table-count`, floored at 10000); explicit values are honoured verbatim,
-  single/few-table behaviour unchanged. ~2.76× on the 30×50k shape, zero-loss.
-- **Index-build overlap for `migrate` (ADR-0077, Postgres target).** Each
-  table's secondary indexes are now built as that table's copy lands,
-  concurrently with the still-copying tables, instead of a separate post-copy
-  whole-schema index phase (which had been a sequential ~457 s tail — 29% of
-  total — on the 110 GB benchmark). Copy and index connections are open
-  simultaneously, so the budget reserves a clamped ~25% slice (capped at 8) for
-  the index pool at the same chokepoint. Constraints/FKs stay after the combined
-  phase. Resume is additive (`TableProgress.IndexesBuilt`, omitempty; old tokens
-  re-feed, a no-op under `CREATE INDEX IF NOT EXISTS`). PG-only; a MySQL target
-  falls back to the post-copy `CreateIndexes`.
-- **PG→PG identity passthrough (ADR-0078).** For a same-engine, no-transform
-  PG→PG copy, `migrate` byte-pipes the raw COPY stream (`COPY (SELECT …) TO
-  STDOUT` → `io.Pipe` → `COPY … FROM STDIN`) past the typed IR, removing the
-  per-value decode/re-encode and closing the per-stream rate gap vs pgcopydb.
-  Auto-engaged behind a value-fidelity gate: same-engine + no transform (no
-  `--redact` / `--type-override` / `--expr-override` / `--inject-shard-column`)
-  + a per-table projection that excludes OID/wire-format-sensitive types
-  (extension / verbatim / bit / geometry / array — the Bug-74 element-family
-  classes) in v1; any transform falls back to the IR path. New
-  `--raw-copy-format=text|binary|auto` (text default — cross-major safe; binary
-  only when source/target server majors match, downgrading to text loudly
-  otherwise). Both sessions are forced to `client_encoding=UTF8` so the
-  byte-pipe is self-consistent regardless of either DSN (an asymmetric
-  `client_encoding` would otherwise silently corrupt non-ASCII text).
-- **Fast parallel cold-start for the `sync` path (ADR-0079, Postgres source).**
-  `sluice sync start`'s PG-source cold-start now reuses the fast machinery —
-  cross-table pool + index-build overlap + raw passthrough — so the
-  copy-then-continuously-follow workflow (pgcopydb's `--follow` equivalent) gets
-  the fast initial copy instead of the old serial one. All parallel readers are
-  pinned to the one exported snapshot via `SET TRANSACTION SNAPSHOT`, so the
-  reads are snapshot-consistent (gap-free). Capability-gated on a shareable
-  exported-snapshot surface (IR-first, never an engine-name check): MySQL and
-  VStream/PlanetScale sources stay on the serial cold-start with a loud INFO
-  log. Resume, `--schema-already-applied`, and multi-database / multi-schema
-  cold-start stay serial in v1. New `sync start` flags mirror migrate's:
-  `--table-parallelism`, `--bulk-parallelism`, `--bulk-parallel-min-rows`,
-  `--bulk-batch-size`, `--raw-copy-format` (inert on MySQL/VStream sources).
+- **Cross-table copy worker pool for `sluice migrate` (`--table-parallelism`, ADR-0076) + adaptive `--bulk-parallel-min-rows`.** `migrate` now copies multiple tables concurrently (the cross-table axis, pgcopydb's `--table-jobs`), composed with the existing within-table `--bulk-parallelism` PK-range splitting — closing the many-medium-table gap where each table sat below the within-table-split threshold and the serial table loop left cores idle. The two axes multiply, and the product is bounded by the target's connection budget (and `--max-target-connections`) at a single chokepoint. `0` (default) = auto 4; `1` disables. `--bulk-parallel-min-rows` became a `0=auto` sentinel that dials the within-table-split threshold down on many-table schemas (`base/table-count`, floored at 10000); explicit values are honoured verbatim, single/few-table behaviour unchanged. ~2.76× on the 30×50k shape, zero-loss.
+- **Index-build overlap for `migrate` (ADR-0077, Postgres target).** Each table's secondary indexes are now built as that table's copy lands, concurrently with the still-copying tables, instead of a separate post-copy whole-schema index phase (which had been a sequential ~457 s tail — 29% of total — on the 110 GB benchmark). Copy and index connections are open simultaneously, so the budget reserves a clamped ~25% slice (capped at 8) for the index pool at the same chokepoint. Constraints/FKs stay after the combined phase. Resume is additive (`TableProgress.IndexesBuilt`, omitempty; old tokens re-feed, a no-op under `CREATE INDEX IF NOT EXISTS`). PG-only; a MySQL target falls back to the post-copy `CreateIndexes`.
+- **PG→PG identity passthrough (ADR-0078).** For a same-engine, no-transform PG→PG copy, `migrate` byte-pipes the raw COPY stream (`COPY (SELECT …) TO STDOUT` → `io.Pipe` → `COPY … FROM STDIN`) past the typed IR, removing the per-value decode/re-encode and closing the per-stream rate gap vs pgcopydb. Auto-engaged behind a value-fidelity gate: same-engine + no transform (no `--redact` / `--type-override` / `--expr-override` / `--inject-shard-column`) + a per-table projection that excludes OID/wire-format-sensitive types (extension / verbatim / bit / geometry / array — the Bug-74 element-family classes) in v1; any transform falls back to the IR path. New `--raw-copy-format=text|binary|auto` (text default — cross-major safe; binary only when source/target server majors match, downgrading to text loudly otherwise). Both sessions are forced to `client_encoding=UTF8` so the byte-pipe is self-consistent regardless of either DSN (an asymmetric `client_encoding` would otherwise silently corrupt non-ASCII text).
+- **Fast parallel cold-start for the `sync` path (ADR-0079, Postgres source).** `sluice sync start`'s PG-source cold-start now reuses the fast machinery — cross-table pool + index-build overlap + raw passthrough — so the copy-then-continuously-follow workflow (pgcopydb's `--follow` equivalent) gets the fast initial copy instead of the old serial one. All parallel readers are pinned to the one exported snapshot via `SET TRANSACTION SNAPSHOT`, so the reads are snapshot-consistent (gap-free). Capability-gated on a shareable exported-snapshot surface (IR-first, never an engine-name check): MySQL and VStream/PlanetScale sources stay on the serial cold-start with a loud INFO log. Resume, `--schema-already-applied`, and multi-database / multi-schema cold-start stay serial in v1. New `sync start` flags mirror migrate's: `--table-parallelism`, `--bulk-parallelism`, `--bulk-parallel-min-rows`, `--bulk-batch-size`, `--raw-copy-format` (inert on MySQL/VStream sources).
 
 ### Changed
 
-- Vitess cluster integration-test floor extended to v21, with a scheduled
-  multi-version matrix (v21→latest) backed by prebaked GHCR server images
-  (test/CI infrastructure only — no binary behaviour change). Testcontainers
-  ryuk disabled on the integration jobs to kill the docker.io ryuk-pull flake;
-  `actions/setup-go` bumped v5→v6.
+- Vitess cluster integration-test floor extended to v21, with a scheduled multi-version matrix (v21→latest) backed by prebaked GHCR server images (test/CI infrastructure only — no binary behaviour change). Testcontainers ryuk disabled on the integration jobs to kill the docker.io ryuk-pull flake; `actions/setup-go` bumped v5→v6.
 
 ## [0.99.28] - 2026-06-08
 
 ### Fixed
 
-- **A silent value clamp/truncation under `--mysql-sql-mode=''` is now reported
-  loudly (Vector B).** Passing `--mysql-sql-mode=''` (the legacy-data escape
-  hatch) relaxes the MySQL target so it accepts legacy zero-dates — but it also
-  makes MySQL **silently** clamp or truncate any *other* out-of-range value on
-  write (a numeric overflow → MAX, an over-long string → cut). The post-write
-  warning guard previously skipped its check entirely under relaxed mode, so
-  those coercions passed unannounced. sluice now emits a loud **one-time-per-
-  column WARN** (not a refusal — you opted into relaxed mode) naming the
-  coercions and the data-preserving remedy (`--type-override`), on all three
-  bulk-copy write paths (`LOAD DATA`, batched INSERT, and the idempotent upsert
-  path used on resume / parallel chunked copy / cold-start). Under strict
-  sql_mode the value is still refused, as before. Drop `--mysql-sql-mode=''` to
-  refuse instead of coerce.
-- **Range/overflow refusal messages no longer render an empty `Examples: []`.**
-  The warning guard read `@@warning_count` before `SHOW WARNINGS`, and that
-  intervening read clears MySQL's diagnostic list — so the strict-mode refusal
-  (and the NaN/±Infinity refusal) listed no offending values. The guard now
-  reads `SHOW WARNINGS` first, so the refusal names the values.
+- **A silent value clamp/truncation under `--mysql-sql-mode=''` is now reported loudly (Vector B).** Passing `--mysql-sql-mode=''` (the legacy-data escape hatch) relaxes the MySQL target so it accepts legacy zero-dates — but it also makes MySQL **silently** clamp or truncate any *other* out-of-range value on write (a numeric overflow → MAX, an over-long string → cut). The post-write warning guard previously skipped its check entirely under relaxed mode, so those coercions passed unannounced. sluice now emits a loud **one-time-per- column WARN** (not a refusal — you opted into relaxed mode) naming the coercions and the data-preserving remedy (`--type-override`), on all three bulk-copy write paths (`LOAD DATA`, batched INSERT, and the idempotent upsert path used on resume / parallel chunked copy / cold-start). Under strict sql_mode the value is still refused, as before. Drop `--mysql-sql-mode=''` to refuse instead of coerce.
+- **Range/overflow refusal messages no longer render an empty `Examples: []`.** The warning guard read `@@warning_count` before `SHOW WARNINGS`, and that intervening read clears MySQL's diagnostic list — so the strict-mode refusal (and the NaN/±Infinity refusal) listed no offending values. The guard now reads `SHOW WARNINGS` first, so the refusal names the values.
 
 ## [0.99.27] - 2026-06-08
 
 ### Added
 
-- **`--type-override COL=interval` carries a MySQL `TIME` *duration* to a
-  Postgres `INTERVAL` (Vector C).** A MySQL `TIME` column is a duration in the
-  range `-838:59:59…838:59:59`, which exceeds Postgres `time`'s `00:00–24:00`
-  time-of-day range — so a column used to store a real duration (a >24h span, a
-  negative offset) could not be carried by the default `TIME → time` mapping.
-  Overriding the column to `interval` maps it to PG `INTERVAL`, which holds the
-  full range; the value is carried as its textual form and PG's interval parser
-  accepts it. Works on both `migrate` and continuous `sync` (CDC), in all the
-  duration shapes (max-positive, negative, fractional-second, zero, NULL).
-  `interval` is now a first-class Postgres type in the IR (a new `ir.Interval`,
-  distinct from `ir.Time`): PG→PG round-trips a native `interval` column, and a
-  non-Postgres target — which has no interval type — is refused loudly rather
-  than silently degraded back to `TIME` (which would re-lose the range the
-  override exists to preserve).
+- **`--type-override COL=interval` carries a MySQL `TIME` *duration* to a Postgres `INTERVAL` (Vector C).** A MySQL `TIME` column is a duration in the range `-838:59:59…838:59:59`, which exceeds Postgres `time`'s `00:00–24:00` time-of-day range — so a column used to store a real duration (a >24h span, a negative offset) could not be carried by the default `TIME → time` mapping. Overriding the column to `interval` maps it to PG `INTERVAL`, which holds the full range; the value is carried as its textual form and PG's interval parser accepts it. Works on both `migrate` and continuous `sync` (CDC), in all the duration shapes (max-positive, negative, fractional-second, zero, NULL). `interval` is now a first-class Postgres type in the IR (a new `ir.Interval`, distinct from `ir.Time`): PG→PG round-trips a native `interval` column, and a non-Postgres target — which has no interval type — is refused loudly rather than silently degraded back to `TIME` (which would re-lose the range the override exists to preserve).
 
 ## [0.99.26] - 2026-06-08
 
 ### Added
 
-- **`--type-override` accepts parenthesised precision/length from the CLI:
-  `decimal(20,0)`, `numeric(20,0)`, `decimal(20)`, `varchar(255)`.** Previously
-  the CLI flag passed the whole post-`=` string as a bare type name, so a
-  precision-bearing decimal could only be set via the YAML `mappings:` form
-  (`target_type_options`) — the documented remediation hint
-  `decimal:precision=20,scale=0` did not actually parse from the CLI. The
-  concise paren form now works, and `numeric` is accepted as an alias for
-  `decimal` (the Postgres spelling). Malformed specs (unbalanced/empty parens,
-  non-integer or wrong-arity arguments, parens on a non-parametric type) are
-  rejected with a clear error.
+- **`--type-override` accepts parenthesised precision/length from the CLI: `decimal(20,0)`, `numeric(20,0)`, `decimal(20)`, `varchar(255)`.** Previously the CLI flag passed the whole post-`=` string as a bare type name, so a precision-bearing decimal could only be set via the YAML `mappings:` form (`target_type_options`) — the documented remediation hint `decimal:precision=20,scale=0` did not actually parse from the CLI. The concise paren form now works, and `numeric` is accepted as an alias for `decimal` (the Postgres spelling). Malformed specs (unbalanced/empty parens, non-integer or wrong-arity arguments, parens on a non-parametric type) are rejected with a clear error.
 
 ### Fixed
 
-- **The unsigned-bigint / unconstrained-numeric range advisories now point at a
-  remediation that actually works from the CLI.** The notices, `schema preview`
-  output, and the LOAD-DATA recovery hint recommended
-  `--type-override COL=decimal:precision=N,scale=M`, which the CLI never parsed
-  (it silently became an unknown type name). They now recommend the working
-  `--type-override COL=decimal(N,M)` form (e.g. `decimal(20,0)` to carry a full
-  unsigned-64 value into PG `numeric(20,0)`).
+- **The unsigned-bigint / unconstrained-numeric range advisories now point at a remediation that actually works from the CLI.** The notices, `schema preview` output, and the LOAD-DATA recovery hint recommended `--type-override COL=decimal:precision=N,scale=M`, which the CLI never parsed (it silently became an unknown type name). They now recommend the working `--type-override COL=decimal(N,M)` form (e.g. `decimal(20,0)` to carry a full unsigned-64 value into PG `numeric(20,0)`).
 
 ## [0.99.25] - 2026-06-08
 
 ### Fixed
 
-- **A string with an embedded NUL byte (`0x00`) bound for a Postgres
-  `text`/`varchar`/`char` column is now refused loudly and early (Vector C).**
-  PostgreSQL text types cannot store a NUL byte, and over the COPY protocol PG
-  rejects it with SQLSTATE 22021 as an opaque stream error far from the
-  offending row. A MySQL `CHAR`/`VARCHAR`/`TEXT` *can* hold embedded NULs, so a
-  cross-engine MySQL → Postgres copy can hit this. sluice now detects the NUL at
-  the value layer and refuses with an actionable message naming the column and
-  the data-preserving remedy (`--type-override <col>=bytea`, since `bytea` holds
-  arbitrary bytes including NUL) instead of letting the driver fail cryptically
-  mid-stream. No value is silently altered — stripping the NUL would be silent
-  corruption. Pinned by `TestPrepareValueNULByteRefused` (text/varchar/char +
-  DOMAIN-over-text recursion; `bytea` and NUL-free text unaffected).
+- **A string with an embedded NUL byte (`0x00`) bound for a Postgres `text`/`varchar`/`char` column is now refused loudly and early (Vector C).** PostgreSQL text types cannot store a NUL byte, and over the COPY protocol PG rejects it with SQLSTATE 22021 as an opaque stream error far from the offending row. A MySQL `CHAR`/`VARCHAR`/`TEXT` *can* hold embedded NULs, so a cross-engine MySQL → Postgres copy can hit this. sluice now detects the NUL at the value layer and refuses with an actionable message naming the column and the data-preserving remedy (`--type-override <col>=bytea`, since `bytea` holds arbitrary bytes including NUL) instead of letting the driver fail cryptically mid-stream. No value is silently altered — stripping the NUL would be silent corruption. Pinned by `TestPrepareValueNULByteRefused` (text/varchar/char + DOMAIN-over-text recursion; `bytea` and NUL-free text unaffected).
 
 ## [0.99.24] - 2026-06-07
 
 ### Added
 
-- **Postgres-source multi-schema CONTINUOUS SYNC / CDC (ADR-0075 Phase 2b).**
-  `sluice sync start` against a Postgres source now supports the multi-schema
-  fan-out flags `--include-schema` / `--exclude-schema` / `--all-schemas` for
-  the full cold-start **and** continuous-CDC path — the steady-state counterpart
-  to Phase 2a's multi-schema `migrate`. Each selected source schema is replicated
-  to a same-named target namespace (a Postgres schema, or a database on a MySQL
-  target). Because a Postgres logical-replication slot is database-wide, the
-  selected schemas are cold-started under **one spanning exported snapshot**,
-  then the single database-wide CDC stream is routed per-change to the matching
-  target namespace; warm-resume continues all schemas from the one persisted
-  slot/LSN. This mirrors the ADR-0074 MySQL multi-database shape (the
-  orchestrator is shared and unchanged). Previously a multi-schema `sync start`
-  against a Postgres source was refused loudly ("Phase 2b, not in this
-  release"); that refusal is now real support. Same-named tables in different
-  schemas are isolated on the target (routing + per-namespace applier caches are
-  schema-keyed), out-of-scope schemas are dropped (never misapplied), and CDC
-  `TRUNCATE` routes to exactly one namespace. Pinned by per-drop-site scope unit
-  tests plus PG→PG and PG→MySQL multi-schema integration tests (cold-start +
-  steady-state insert/update/delete/truncate + cross-schema bleed guards +
-  warm-resume parity), run under the CI `-race` Integration gate.
+- **Postgres-source multi-schema CONTINUOUS SYNC / CDC (ADR-0075 Phase 2b).** `sluice sync start` against a Postgres source now supports the multi-schema fan-out flags `--include-schema` / `--exclude-schema` / `--all-schemas` for the full cold-start **and** continuous-CDC path — the steady-state counterpart to Phase 2a's multi-schema `migrate`. Each selected source schema is replicated to a same-named target namespace (a Postgres schema, or a database on a MySQL target). Because a Postgres logical-replication slot is database-wide, the selected schemas are cold-started under **one spanning exported snapshot**, then the single database-wide CDC stream is routed per-change to the matching target namespace; warm-resume continues all schemas from the one persisted slot/LSN. This mirrors the ADR-0074 MySQL multi-database shape (the orchestrator is shared and unchanged). Previously a multi-schema `sync start` against a Postgres source was refused loudly ("Phase 2b, not in this release"); that refusal is now real support. Same-named tables in different schemas are isolated on the target (routing + per-namespace applier caches are schema-keyed), out-of-scope schemas are dropped (never misapplied), and CDC `TRUNCATE` routes to exactly one namespace. Pinned by per-drop-site scope unit tests plus PG→PG and PG→MySQL multi-schema integration tests (cold-start + steady-state insert/update/delete/truncate + cross-schema bleed guards + warm-resume parity), run under the CI `-race` Integration gate.
 
 ## [0.99.23] - 2026-06-07
 
 ### Fixed
 
-- **`--zero-date` now works on a PlanetScale/Vitess source.** The VStream CDC
-  decoder parsed temporal cells with a strict layout that rejected a zero or
-  partial date (`'0000-00-00'`, `'YYYY-00-DD'`, `'YYYY-MM-00'`), then fell back
-  to handing the raw bytes downstream — where a Postgres target failed with a
-  confusing `expected time.Time, got []byte` instead of applying the operator's
-  `--zero-date` policy. The vanilla MySQL binlog / bulk-copy paths have honored
-  `--zero-date` since the original Vector A fix; this brings the VStream path to
-  parity. A zero/partial date now resolves per `--zero-date`: `error` (default)
-  refuses the stream loudly naming the column, `null` carries SQL `NULL`
-  (refused on a `NOT NULL` column), `epoch` substitutes `1970-01-01 00:00:01`.
-  A genuinely malformed but non-zero date (month 13, Feb 30) still fails loudly
-  as before. Covers the live CDC reader and the cold-start COPY + catch-up
-  paths. Pinned by decoder unit tests across the temporal family × every zero
-  shape × each policy (including the `NOT NULL` refusal).
+- **`--zero-date` now works on a PlanetScale/Vitess source.** The VStream CDC decoder parsed temporal cells with a strict layout that rejected a zero or partial date (`'0000-00-00'`, `'YYYY-00-DD'`, `'YYYY-MM-00'`), then fell back to handing the raw bytes downstream — where a Postgres target failed with a confusing `expected time.Time, got []byte` instead of applying the operator's `--zero-date` policy. The vanilla MySQL binlog / bulk-copy paths have honored `--zero-date` since the original Vector A fix; this brings the VStream path to parity. A zero/partial date now resolves per `--zero-date`: `error` (default) refuses the stream loudly naming the column, `null` carries SQL `NULL` (refused on a `NOT NULL` column), `epoch` substitutes `1970-01-01 00:00:01`. A genuinely malformed but non-zero date (month 13, Feb 30) still fails loudly as before. Covers the live CDC reader and the cold-start COPY + catch-up paths. Pinned by decoder unit tests across the temporal family × every zero shape × each policy (including the `NOT NULL` refusal).
 
 ## [0.99.22] - 2026-06-07
 
 ### Fixed
 
-- **The `TINYINT(1)` out-of-range WARN now also fires on the CDC read paths.**
-  v0.99.21 made a `TINYINT(1)` value outside `{0,1}` loud on the bulk-copy /
-  snapshot path (it had been silently collapsed to `true`). This extends the
-  same one-time-per-column WARN to the steady-state CDC tail — both the binlog
-  reader and the PlanetScale/Vitess VStream reader (and its cold-start COPY) —
-  so a non-`{0,1}` value written live during continuous sync is flagged too,
-  not just during `migrate` / `sync` cold-start. Detection-only and
-  side-effect-free: the decoded value is unchanged; the `--type-override
-  <table>.<col>=smallint` (or `=int`) remedy already preserved the integer on
-  every path. Closes the Vector D detection gap.
+- **The `TINYINT(1)` out-of-range WARN now also fires on the CDC read paths.** v0.99.21 made a `TINYINT(1)` value outside `{0,1}` loud on the bulk-copy / snapshot path (it had been silently collapsed to `true`). This extends the same one-time-per-column WARN to the steady-state CDC tail — both the binlog reader and the PlanetScale/Vitess VStream reader (and its cold-start COPY) — so a non-`{0,1}` value written live during continuous sync is flagged too, not just during `migrate` / `sync` cold-start. Detection-only and side-effect-free: the decoded value is unchanged; the `--type-override <table>.<col>=smallint` (or `=int`) remedy already preserved the integer on every path. Closes the Vector D detection gap.
 
 ## [0.99.21] - 2026-06-07
 
 ### Fixed
 
-- **MySQL `TINYINT(1)` columns that store real integers (not a 0/1 boolean) no
-  longer collapse silently.** sluice maps `TINYINT(1)` to boolean by the
-  documented MySQL convention, but `TINYINT(1)` is only a display width — the
-  column physically stores the full signed 8-bit range, so a schema using it as
-  a status code or small enum can hold `2`, `127`, `-1`, etc. The boolean decode
-  collapsed every non-zero value to `true`, losing the integer with no warning —
-  even MySQL→MySQL. The bulk-copy / snapshot read path now **WARNs loudly, once
-  per column** (naming the `table.column` and an example value) when it reads a
-  `TINYINT(1)` value outside `{0,1}`, instead of doing it silently.
+- **MySQL `TINYINT(1)` columns that store real integers (not a 0/1 boolean) no longer collapse silently.** sluice maps `TINYINT(1)` to boolean by the documented MySQL convention, but `TINYINT(1)` is only a display width — the column physically stores the full signed 8-bit range, so a schema using it as a status code or small enum can hold `2`, `127`, `-1`, etc. The boolean decode collapsed every non-zero value to `true`, losing the integer with no warning — even MySQL→MySQL. The bulk-copy / snapshot read path now **WARNs loudly, once per column** (naming the `table.column` and an example value) when it reads a `TINYINT(1)` value outside `{0,1}`, instead of doing it silently.
 
 ### Added
 
-- **`--type-override <table>.<col>=smallint` (and `=int` / `=integer`) to
-  preserve a `TINYINT(1)` integer column.** The override rewrites the IR type the
-  reader decodes with, so the cell is read as an integer (not collapsed to a
-  bool) and carried faithfully end-to-end — cross-engine and same-engine.
-  `smallint` is the recommended floor: a `TINYINT(1)` value always fits, and
-  unlike a `tinyint` override it can't re-emit a MySQL `TINYINT(1)` target column
-  that would re-trigger the boolean mapping on a round-trip. The new
-  out-of-range WARN points operators here. (The WARN currently fires on the
-  copy / `sync` cold-start path; the CDC tail is a tracked follow-up — the
-  override already preserves the value on every path.)
+- **`--type-override <table>.<col>=smallint` (and `=int` / `=integer`) to preserve a `TINYINT(1)` integer column.** The override rewrites the IR type the reader decodes with, so the cell is read as an integer (not collapsed to a bool) and carried faithfully end-to-end — cross-engine and same-engine. `smallint` is the recommended floor: a `TINYINT(1)` value always fits, and unlike a `tinyint` override it can't re-emit a MySQL `TINYINT(1)` target column that would re-trigger the boolean mapping on a round-trip. The new out-of-range WARN points operators here. (The WARN currently fires on the copy / `sync` cold-start path; the CDC tail is a tracked follow-up — the override already preserves the value on every path.)
 
 ## [0.99.20] - 2026-06-07
 
 ### Fixed
 
-- **`--zero-date=epoch` now lands a real date on a MySQL `TIMESTAMP` target
-  instead of silently storing the `0000-00-00` zero sentinel.** The epoch
-  substitute was `1970-01-01 00:00:00` — exactly one second below MySQL's
-  `TIMESTAMP` range floor (`1970-01-01 00:00:01` UTC). Because reading a legacy
-  zero-date source requires `--mysql-sql-mode=''`, which also relaxes the target
-  connection, a midnight-epoch write into a MySQL `TIMESTAMP` column was silently
-  coerced back to `0000-00-00` — re-introducing the very value epoch is meant to
-  replace — at exit 0 with no warning. (`DATE`/`DATETIME` targets and all
-  Postgres targets were unaffected; the decoder was always correct.) The epoch
-  sentinel is now `1970-01-01 00:00:01`, which sits at the `TIMESTAMP` floor and
-  is representable by every temporal target. The one-second offset is meaningless
-  on a synthetic placeholder for an invalid date. Pinned by a real-MySQL
-  integration test that ground-truths the midnight coercion and proves the new
-  sentinel round-trips as a non-zero value.
+- **`--zero-date=epoch` now lands a real date on a MySQL `TIMESTAMP` target instead of silently storing the `0000-00-00` zero sentinel.** The epoch substitute was `1970-01-01 00:00:00` — exactly one second below MySQL's `TIMESTAMP` range floor (`1970-01-01 00:00:01` UTC). Because reading a legacy zero-date source requires `--mysql-sql-mode=''`, which also relaxes the target connection, a midnight-epoch write into a MySQL `TIMESTAMP` column was silently coerced back to `0000-00-00` — re-introducing the very value epoch is meant to replace — at exit 0 with no warning. (`DATE`/`DATETIME` targets and all Postgres targets were unaffected; the decoder was always correct.) The epoch sentinel is now `1970-01-01 00:00:01`, which sits at the `TIMESTAMP` floor and is representable by every temporal target. The one-second offset is meaningless on a synthetic placeholder for an invalid date. Pinned by a real-MySQL integration test that ground-truths the midnight coercion and proves the new sentinel round-trips as a non-zero value.
 
 ## [0.99.19] - 2026-06-07
 
 ### Fixed
 
-- **CRITICAL: MySQL zero and partial dates were silently corrupted into a
-  wrong calendar date on the `migrate` / snapshot bulk-copy path.** A source
-  column holding a legacy invalid date — the all-zero `'0000-00-00'`, a zero
-  month (`'2026-00-15'`), or a zero day (`'2026-06-00'`), all storable under a
-  relaxed source `sql_mode` — was read through the MySQL driver's
-  `parseTime=true`, which hands such values to Go's `time.Date(2026, 0, 0, …)`.
-  Go *normalizes* a zero component into a neighbouring real date
-  (`'2026-06-00'` → `2026-05-31`, `'2026-00-00'` → `2025-11-30`), so the
-  migration carried a **different, plausible-looking date** and exited 0. The
-  all-zero `'0000-00-00'` was the only case handled sanely (→ NULL); every
-  partial date was silently wrong. The CDC binlog tail already surfaced these
-  loudly; only the bulk-copy read path corrupted them.
+- **CRITICAL: MySQL zero and partial dates were silently corrupted into a wrong calendar date on the `migrate` / snapshot bulk-copy path.** A source column holding a legacy invalid date — the all-zero `'0000-00-00'`, a zero month (`'2026-00-15'`), or a zero day (`'2026-06-00'`), all storable under a relaxed source `sql_mode` — was read through the MySQL driver's `parseTime=true`, which hands such values to Go's `time.Date(2026, 0, 0, …)`. Go *normalizes* a zero component into a neighbouring real date (`'2026-06-00'` → `2026-05-31`, `'2026-00-00'` → `2025-11-30`), so the migration carried a **different, plausible-looking date** and exited 0. The all-zero `'0000-00-00'` was the only case handled sanely (→ NULL); every partial date was silently wrong. The CDC binlog tail already surfaced these loudly; only the bulk-copy read path corrupted them.
 
-  **Fix:** sluice now reads `DATE`/`DATETIME`/`TIMESTAMP` columns as their raw
-  text (`CAST(... AS CHAR)`) so the decode layer sees MySQL's literal value
-  before any `time.Time` is constructed, and resolves zero/partial dates per a
-  new `--zero-date` policy:
-  - `--zero-date=error` (**default**) — refuse loudly, naming the column. The
-    safe default: nothing silently wrong leaves the source.
-  - `--zero-date=null` — carry the value as SQL `NULL` (refused loudly for a
-    `NOT NULL` column).
+  **Fix:** sluice now reads `DATE`/`DATETIME`/`TIMESTAMP` columns as their raw text (`CAST(... AS CHAR)`) so the decode layer sees MySQL's literal value before any `time.Time` is constructed, and resolves zero/partial dates per a new `--zero-date` policy:
+  - `--zero-date=error` (**default**) — refuse loudly, naming the column. The safe default: nothing silently wrong leaves the source.
+  - `--zero-date=null` — carry the value as SQL `NULL` (refused loudly for a `NOT NULL` column).
   - `--zero-date=epoch` — substitute `1970-01-01`.
 
-  A genuinely out-of-range but non-zero date (month 13, Feb 30) stays a hard
-  error regardless of the flag. This is a **behavior change**: prior versions
-  silently mapped `'0000-00-00'` to NULL; that case now refuses by default —
-  pass `--zero-date=null` to restore it. See
-  [docs/operator/migrating-legacy-mysql.md](docs/operator/migrating-legacy-mysql.md).
-  Pinned by unit tests across the full temporal family × every zero shape ×
-  each policy, plus an integration test that ground-truths the live-driver
-  normalization against real MySQL 8.0.
+  A genuinely out-of-range but non-zero date (month 13, Feb 30) stays a hard error regardless of the flag. This is a **behavior change**: prior versions silently mapped `'0000-00-00'` to NULL; that case now refuses by default — pass `--zero-date=null` to restore it. See [docs/operator/migrating-legacy-mysql.md](docs/operator/migrating-legacy-mysql.md). Pinned by unit tests across the full temporal family × every zero shape × each policy, plus an integration test that ground-truths the live-driver normalization against real MySQL 8.0.
 
-- **Temporal primary keys now paginate by the real date column on the chunked
-  copy path.** The zero-date fix above projects `DATE`/`DATETIME`/`TIMESTAMP`
-  columns as `CAST(... AS CHAR)`, which aliases a temporal column to its own
-  name. On the >100k-row keyset-paginated bulk copy, an unqualified
-  `ORDER BY` then sorted by that text alias while the cursor predicate
-  compared the real date column — consistent only by ISO date strings sorting
-  in calendar order, and it defeated the primary-key index (forced a
-  filesort). The cursor and ordering clauses are now table-qualified so both
-  bind the real column: date-typed throughout and index-ordered. No
-  user-visible behavior change for valid data; caught by the value-fidelity
-  review of the zero-date fix. Pinned by a SQL-shape unit test plus
-  `DATE`/`DATETIME(6)` primary-key pagination integration tests across page
-  boundaries.
+- **Temporal primary keys now paginate by the real date column on the chunked copy path.** The zero-date fix above projects `DATE`/`DATETIME`/`TIMESTAMP` columns as `CAST(... AS CHAR)`, which aliases a temporal column to its own name. On the >100k-row keyset-paginated bulk copy, an unqualified `ORDER BY` then sorted by that text alias while the cursor predicate compared the real date column — consistent only by ISO date strings sorting in calendar order, and it defeated the primary-key index (forced a filesort). The cursor and ordering clauses are now table-qualified so both bind the real column: date-typed throughout and index-ordered. No user-visible behavior change for valid data; caught by the value-fidelity review of the zero-date fix. Pinned by a SQL-shape unit test plus `DATE`/`DATETIME(6)` primary-key pagination integration tests across page boundaries.
 
 ## [0.99.18] - 2026-06-07
 
 ### Fixed
 
-- **CRITICAL: a `migrate` from a PlanetScale/Vitess source (`--source-driver=
-  planetscale` or `vitess`) silently copied only a tiny fraction of a large
-  PK table and still reported success.** v0.99.14 set vtgate's `workload=olap`
-  as a **session-wide** setting on the source reader (to lift vtgate's ~100k
-  OLTP result cap on a *no-PK* full-table scan). But that session setting also
-  covered the `LIMIT`-paged reads used by the **parallel chunked bulk-copy**
-  (the default for tables at or above `--bulk-parallel-min-rows`, 100k), and
-  under olap *streaming* mode each concurrently-read chunk's page was
-  truncated — so a large PK table was copied only in part (e.g. ~7.5k of
-  1.5M rows) while `sluice migrate` still exited 0 with `migration complete`.
-  Single-stream copies (`--bulk-parallelism=1`) and vanilla MySQL sources were
-  unaffected, and the bug only appeared above the chunk threshold — which is
-  why the existing VStream tests (sub-threshold tables) did not catch it.
+- **CRITICAL: a `migrate` from a PlanetScale/Vitess source (`--source-driver= planetscale` or `vitess`) silently copied only a tiny fraction of a large PK table and still reported success.** v0.99.14 set vtgate's `workload=olap` as a **session-wide** setting on the source reader (to lift vtgate's ~100k OLTP result cap on a *no-PK* full-table scan). But that session setting also covered the `LIMIT`-paged reads used by the **parallel chunked bulk-copy** (the default for tables at or above `--bulk-parallel-min-rows`, 100k), and under olap *streaming* mode each concurrently-read chunk's page was truncated — so a large PK table was copied only in part (e.g. ~7.5k of 1.5M rows) while `sluice migrate` still exited 0 with `migration complete`. Single-stream copies (`--bulk-parallelism=1`) and vanilla MySQL sources were unaffected, and the bug only appeared above the chunk threshold — which is why the existing VStream tests (sub-threshold tables) did not catch it.
 
-  **Affected releases: v0.99.14, v0.99.15, v0.99.16, v0.99.17.** Anyone who
-  ran a PlanetScale/Vitess `migrate` of a table with ≥100k rows at the default
-  parallelism on those versions should **re-verify row counts** (and re-run on
-  v0.99.18). No fix-up is needed for the *source* — the data was never touched;
-  the target simply received a partial copy. `sync start` cold-start and CDC
-  were not affected by this path.
+  **Affected releases: v0.99.14, v0.99.15, v0.99.16, v0.99.17.** Anyone who ran a PlanetScale/Vitess `migrate` of a table with ≥100k rows at the default parallelism on those versions should **re-verify row counts** (and re-run on v0.99.18). No fix-up is needed for the *source* — the data was never touched; the target simply received a partial copy. `sync start` cold-start and CDC were not affected by this path.
 
-  **Fix:** `workload=olap` is now scoped to **just** the unbounded no-PK full
-  scan (`ReadRows`), applied on a dedicated connection — never session-wide.
-  The `LIMIT`-paged `ReadRowsBatch` the chunked copy uses is olap-free again,
-  exactly as it was before v0.99.14, so the parallel copy reads every row,
-  while the no-PK 100k-cap lift the olap change was added for is preserved.
-  Pinned by a new VStream regression test that migrates an above-threshold PK
-  table at parallelism > 1 and asserts exact row-count parity (the
-  chunk-threshold dimension the prior pins missed).
+  **Fix:** `workload=olap` is now scoped to **just** the unbounded no-PK full scan (`ReadRows`), applied on a dedicated connection — never session-wide. The `LIMIT`-paged `ReadRowsBatch` the chunked copy uses is olap-free again, exactly as it was before v0.99.14, so the parallel copy reads every row, while the no-PK 100k-cap lift the olap change was added for is preserved. Pinned by a new VStream regression test that migrates an above-threshold PK table at parallelism > 1 and asserts exact row-count parity (the chunk-threshold dimension the prior pins missed).
 
 ## [0.99.17] - 2026-06-07
 
 ### Fixed
 
-- **Crash during a backup rotation could leave the backup un-restorable
-  ("branching/mis-stitched lineage").** When a streaming backup rotated to a
-  new segment and the process crashed (or was cancelled) at just the wrong
-  moment, the segment's first incremental could be written durably to object
-  storage but lost from `lineage.json`'s incremental list (its catalog append
-  is best-effort, so it never fails the stream). On resume the stream
-  correctly re-stitched off the on-disk tail — so **no data was lost** — but
-  the catalog kept the gap: its first recorded incremental then parented off
-  the orphaned one instead of the segment's full, and a later `restore`
-  **refused the whole segment** with `branching/mis-stitched lineage` even
-  though the on-disk chain was complete. sluice now **reconciles the open
-  segment's catalog against the on-disk chain on resume**, re-cataloguing any
-  orphaned incremental in chain order before streaming continues, so restore
-  succeeds. The repair is conservative and idempotent — it refuses to guess
-  when the on-disk manifests aren't a single clean linear chain (a branch,
-  a parentless incremental, or an unreachable manifest), leaving those for
-  restore's strict validation to surface rather than masking real corruption.
-  This was a loud, recoverable failure (a refused restore, never silent data
-  loss), surfaced by the ADR-0046 crash-injection matrix under the race
-  detector.
+- **Crash during a backup rotation could leave the backup un-restorable ("branching/mis-stitched lineage").** When a streaming backup rotated to a new segment and the process crashed (or was cancelled) at just the wrong moment, the segment's first incremental could be written durably to object storage but lost from `lineage.json`'s incremental list (its catalog append is best-effort, so it never fails the stream). On resume the stream correctly re-stitched off the on-disk tail — so **no data was lost** — but the catalog kept the gap: its first recorded incremental then parented off the orphaned one instead of the segment's full, and a later `restore` **refused the whole segment** with `branching/mis-stitched lineage` even though the on-disk chain was complete. sluice now **reconciles the open segment's catalog against the on-disk chain on resume**, re-cataloguing any orphaned incremental in chain order before streaming continues, so restore succeeds. The repair is conservative and idempotent — it refuses to guess when the on-disk manifests aren't a single clean linear chain (a branch, a parentless incremental, or an unreachable manifest), leaving those for restore's strict validation to surface rather than masking real corruption. This was a loud, recoverable failure (a refused restore, never silent data loss), surfaced by the ADR-0046 crash-injection matrix under the race detector.
 
 ## [0.99.16] - 2026-06-07
 
-**Multi-database MySQL migration and continuous sync (ADR-0074).** A single
-`sluice` run can now connect to a MySQL server and migrate — and continuously
-sync — many databases at once, each landing in its own same-named target
-namespace, analogous to how a Postgres source carries multiple schemas.
-Drop-in from v0.99.15 — purely additive; without the new flags, every
-existing single-database run is byte-identical.
+**Multi-database MySQL migration and continuous sync (ADR-0074).** A single `sluice` run can now connect to a MySQL server and migrate — and continuously sync — many databases at once, each landing in its own same-named target namespace, analogous to how a Postgres source carries multiple schemas. Drop-in from v0.99.15 — purely additive; without the new flags, every existing single-database run is byte-identical.
 
 ### Added
 
-- **`migrate` across multiple MySQL databases in one run.** New flags
-  `--include-database <glob>` / `--exclude-database <glob>` (mutually
-  exclusive, repeatable) and `--all-databases`. When any is set, the source
-  DSN is a *server* connection (its database component is optional), sluice
-  enumerates the server's databases, and each selected database is migrated
-  to a **same-named target namespace**: a Postgres **schema** (MySQL→Postgres)
-  or an auto-created target **database** (MySQL→MySQL, via `CREATE DATABASE IF
-  NOT EXISTS`). System databases (`information_schema`, `performance_schema`,
-  `mysql`, `sys`) are always excluded. Cross-database foreign keys are
-  preserved when both databases are in scope and applied in a final pass after
-  every database's tables exist; a foreign key pointing at a database *outside*
-  the selected set is **refused loudly** (sluice can't guarantee the referent
-  exists on the target) rather than silently flattened.
+- **`migrate` across multiple MySQL databases in one run.** New flags `--include-database <glob>` / `--exclude-database <glob>` (mutually exclusive, repeatable) and `--all-databases`. When any is set, the source DSN is a *server* connection (its database component is optional), sluice enumerates the server's databases, and each selected database is migrated to a **same-named target namespace**: a Postgres **schema** (MySQL→Postgres) or an auto-created target **database** (MySQL→MySQL, via `CREATE DATABASE IF NOT EXISTS`). System databases (`information_schema`, `performance_schema`, `mysql`, `sys`) are always excluded. Cross-database foreign keys are preserved when both databases are in scope and applied in a final pass after every database's tables exist; a foreign key pointing at a database *outside* the selected set is **refused loudly** (sluice can't guarantee the referent exists on the target) rather than silently flattened.
 
-- **`sync start` across multiple MySQL databases — cold-start, CDC, and
-  resume.** The same `--include-database` / `--exclude-database` /
-  `--all-databases` flags on `sync start` give continuous multi-database
-  replication. The cold start captures **one consistent snapshot spanning all
-  selected databases** (a single `START TRANSACTION WITH CONSISTENT SNAPSHOT`
-  on one pinned connection, one binlog position) so the snapshot→CDC handoff is
-  a single gapless cut across every database. Steady-state CDC then rides the
-  **server-wide MySQL binlog as one stream**, routing each change to its source
-  database's target namespace — not N streams. A stopped stream **warm-resumes**
-  from the one persisted server-wide position without re-copying. Works
-  MySQL→MySQL and MySQL→Postgres.
+- **`sync start` across multiple MySQL databases — cold-start, CDC, and resume.** The same `--include-database` / `--exclude-database` / `--all-databases` flags on `sync start` give continuous multi-database replication. The cold start captures **one consistent snapshot spanning all selected databases** (a single `START TRANSACTION WITH CONSISTENT SNAPSHOT` on one pinned connection, one binlog position) so the snapshot→CDC handoff is a single gapless cut across every database. Steady-state CDC then rides the **server-wide MySQL binlog as one stream**, routing each change to its source database's target namespace — not N streams. A stopped stream **warm-resumes** from the one persisted server-wide position without re-copying. Works MySQL→MySQL and MySQL→Postgres.
 
 ### Fixed
 
-- **Silent-loss boundary gap in the binlog snapshot→CDC handoff.** The binlog
-  snapshot opener captured the row view (`START TRANSACTION WITH CONSISTENT
-  SNAPSHOT`) and the CDC start position (`SHOW BINARY LOG STATUS`) as two
-  separate statements. A transaction committing in the window between them
-  landed in **neither** the snapshot (it committed after the read view froze)
-  **nor** the CDC tail (its binlog offset is below the captured position) — a
-  silently lost row. The capture is now wrapped in `FLUSH TABLES WITH READ
-  LOCK` … `UNLOCK TABLES` (the mydumper/Debezium consistent-snapshot pattern),
-  so the snapshot view and the binlog position name the exact same logical
-  cut; the lock is released immediately after the position read and writes
-  resume captured by CDC from the frozen position. `FLUSH TABLES WITH READ
-  LOCK` needs the `RELOAD` privilege — absent it, sluice warns and falls back
-  to the prior lock-free capture rather than failing the run. The fix lands in
-  the shared snapshot opener, so it closes the gap for both the new
-  multi-database cold start **and** the pre-existing single-database binlog
-  snapshot path. Caught by the multi-database concurrent-writes regression
-  test under `-race`.
+- **Silent-loss boundary gap in the binlog snapshot→CDC handoff.** The binlog snapshot opener captured the row view (`START TRANSACTION WITH CONSISTENT SNAPSHOT`) and the CDC start position (`SHOW BINARY LOG STATUS`) as two separate statements. A transaction committing in the window between them landed in **neither** the snapshot (it committed after the read view froze) **nor** the CDC tail (its binlog offset is below the captured position) — a silently lost row. The capture is now wrapped in `FLUSH TABLES WITH READ LOCK` … `UNLOCK TABLES` (the mydumper/Debezium consistent-snapshot pattern), so the snapshot view and the binlog position name the exact same logical cut; the lock is released immediately after the position read and writes resume captured by CDC from the frozen position. `FLUSH TABLES WITH READ LOCK` needs the `RELOAD` privilege — absent it, sluice warns and falls back to the prior lock-free capture rather than failing the run. The fix lands in the shared snapshot opener, so it closes the gap for both the new multi-database cold start **and** the pre-existing single-database binlog snapshot path. Caught by the multi-database concurrent-writes regression test under `-race`.
 
 ### Compatibility
 
-- No breaking API or CLI changes. Drop-in from v0.99.15. Multi-database mode
-  engages only when a `--*-database` / `--all-databases` flag is set; without
-  them, single-database `migrate` and `sync start` are byte-identical (same
-  snapshot, same position, same apply path). The feature is MySQL-source
-  fan-out; PlanetScale/VStream multi-keyspace and the reverse
-  Postgres-source→MySQL-multi-database direction are tracked follow-ons. New
-  engine surfaces are additive optional interfaces. A MySQL→MySQL
-  multi-database target DSN must name a "home" database for the sync control
-  table (it errors clearly if absent); per-source user data still routes to its
-  own database.
+- No breaking API or CLI changes. Drop-in from v0.99.15. Multi-database mode engages only when a `--*-database` / `--all-databases` flag is set; without them, single-database `migrate` and `sync start` are byte-identical (same snapshot, same position, same apply path). The feature is MySQL-source fan-out; PlanetScale/VStream multi-keyspace and the reverse Postgres-source→MySQL-multi-database direction are tracked follow-ons. New engine surfaces are additive optional interfaces. A MySQL→MySQL multi-database target DSN must name a "home" database for the sync control table (it errors clearly if absent); per-source user data still routes to its own database.
 
 ## [0.99.15] - 2026-06-07
 
-A self-hosted Vitess engine flavor and a clearer error for an unsupported
-Postgres user-defined type. Drop-in from v0.99.14 — additive, no breaking
-API or CLI changes.
+A self-hosted Vitess engine flavor and a clearer error for an unsupported Postgres user-defined type. Drop-in from v0.99.14 — additive, no breaking API or CLI changes.
 
 ### Added
 
@@ -1521,11 +394,7 @@ API or CLI changes.
 
 ## [0.99.14] - 2026-06-07
 
-Resume-idempotency hardening plus a PlanetScale no-PK migrate fix. A
-`migrate --resume` whose schema-apply phases re-run over already-built
-objects no longer aborts on a duplicate, and migrating a large no-PK table
-from PlanetScale no longer silently truncates at vtgate's row cap. Drop-in
-from v0.99.13 — no breaking API or CLI changes.
+Resume-idempotency hardening plus a PlanetScale no-PK migrate fix. A `migrate --resume` whose schema-apply phases re-run over already-built objects no longer aborts on a duplicate, and migrating a large no-PK table from PlanetScale no longer silently truncates at vtgate's row cap. Drop-in from v0.99.13 — no breaking API or CLI changes.
 
 ### Fixed
 
@@ -1541,11 +410,7 @@ from v0.99.13 — no breaking API or CLI changes.
 
 ## [0.99.13] - 2026-06-06
 
-Cross-engine parity + table-scope completion. A no-PK table that carries a
-NOT-NULL UNIQUE key now migrates and syncs MySQL→Postgres without a manual schema
-change (it already worked MySQL→MySQL), and the v0.99.12 `--include-table`
-snapshot scope now also covers the PlanetScale cold-start *resume* and *backup*
-paths. Drop-in from v0.99.12 — no breaking API or CLI changes.
+Cross-engine parity + table-scope completion. A no-PK table that carries a NOT-NULL UNIQUE key now migrates and syncs MySQL→Postgres without a manual schema change (it already worked MySQL→MySQL), and the v0.99.12 `--include-table` snapshot scope now also covers the PlanetScale cold-start *resume* and *backup* paths. Drop-in from v0.99.12 — no breaking API or CLI changes.
 
 ### Fixed
 
@@ -1561,9 +426,7 @@ paths. Drop-in from v0.99.12 — no breaking API or CLI changes.
 
 ## [0.99.12] - 2026-06-06
 
-`--include-table` now scopes the PlanetScale (VStream) cold-start snapshot COPY,
-not just the write path — so copying a subset of tables out of a large keyspace
-no longer streams (and buffers) the excluded tables. Drop-in from v0.99.11.
+`--include-table` now scopes the PlanetScale (VStream) cold-start snapshot COPY, not just the write path — so copying a subset of tables out of a large keyspace no longer streams (and buffers) the excluded tables. Drop-in from v0.99.11.
 
 ### Fixed
 
@@ -1575,9 +438,7 @@ no longer streams (and buffers) the excluded tables. Drop-in from v0.99.11.
 
 ## [0.99.11] - 2026-06-06
 
-A small CLI safety fix: `sync start` now validates mutually-exclusive flags
-*before* prompting for the `--reset-target-data` destructive confirmation.
-Drop-in from v0.99.10; no behaviour change for valid invocations.
+A small CLI safety fix: `sync start` now validates mutually-exclusive flags *before* prompting for the `--reset-target-data` destructive confirmation. Drop-in from v0.99.10; no behaviour change for valid invocations.
 
 ### Fixed
 
@@ -1589,17 +450,7 @@ Drop-in from v0.99.10; no behaviour change for valid invocations.
 
 ## [0.99.10] - 2026-06-06
 
-A Vitess/PlanetScale stream-resilience release: a stalled stream now fails loud
-instead of hanging silently, cold-start CDC errors are no longer swallowed, an
-unproductive reconnect loop after a tablet death can no longer churn forever, and
-a new `--restart-from-scratch` flag forces a clean cold-start without dropping the
-target. Drop-in upgrade from v0.99.9 — no breaking API or CLI changes; every new
-behaviour is opt-in and the defaults are unchanged. The hardening was surfaced by
-a new fault-injection ("chaos") test suite run against a full Vitess 24 cluster —
-killed tablets, primary failovers (PlannedReparentShard + EmergencyReparentShard),
-vtgate restarts, and a rolling version upgrade — each asserting the load-bearing
-invariant: after a fault, the stream delivers every row exactly once **or** fails
-loudly, never a silent partial.
+A Vitess/PlanetScale stream-resilience release: a stalled stream now fails loud instead of hanging silently, cold-start CDC errors are no longer swallowed, an unproductive reconnect loop after a tablet death can no longer churn forever, and a new `--restart-from-scratch` flag forces a clean cold-start without dropping the target. Drop-in upgrade from v0.99.9 — no breaking API or CLI changes; every new behaviour is opt-in and the defaults are unchanged. The hardening was surfaced by a new fault-injection ("chaos") test suite run against a full Vitess 24 cluster — killed tablets, primary failovers (PlannedReparentShard + EmergencyReparentShard), vtgate restarts, and a rolling version upgrade — each asserting the load-bearing invariant: after a fault, the stream delivers every row exactly once **or** fails loudly, never a silent partial.
 
 ### Added
 
@@ -1621,10 +472,7 @@ loudly, never a silent partial.
 
 ## [0.99.9] - 2026-06-06
 
-A CRITICAL silent-loss fix for the resumable PlanetScale cold-start. Drop-in
-upgrade from v0.99.8; strongly recommended for anyone relying on cold-start
-resume. Found by post-release validation against a real PlanetScale production
-branch.
+A CRITICAL silent-loss fix for the resumable PlanetScale cold-start. Drop-in upgrade from v0.99.8; strongly recommended for anyone relying on cold-start resume. Found by post-release validation against a real PlanetScale production branch.
 
 ### Fixed
 
@@ -1636,11 +484,7 @@ branch.
 
 ## [0.99.8] - 2026-06-05
 
-Two PlanetScale/VStream warm-resume fixes — restarting a sync no longer crashes,
-and an interrupted cold-start now resumes its bulk COPY at full speed instead of
-silently crawling. Drop-in upgrade from v0.99.7; a no-op for migrations that never
-restart a PlanetScale sync. Both were found by post-release validation against a
-real PlanetScale production branch.
+Two PlanetScale/VStream warm-resume fixes — restarting a sync no longer crashes, and an interrupted cold-start now resumes its bulk COPY at full speed instead of silently crawling. Drop-in upgrade from v0.99.7; a no-op for migrations that never restart a PlanetScale sync. Both were found by post-release validation against a real PlanetScale production branch.
 
 ### Fixed
 
@@ -1654,11 +498,7 @@ real PlanetScale production branch.
 
 ## [0.99.7] - 2026-06-05
 
-A Vitess robustness release: online-DDL cutovers no longer leak shadow-table
-rows into the target, and a primary-only Vitess cluster now works (or fails
-loudly) instead of wedging silently. Drop-in upgrade from v0.99.6 — no breaking
-API or CLI changes; a no-op for migrations that don't run online DDL on a
-PlanetScale/Vitess source.
+A Vitess robustness release: online-DDL cutovers no longer leak shadow-table rows into the target, and a primary-only Vitess cluster now works (or fails loudly) instead of wedging silently. Drop-in upgrade from v0.99.6 — no breaking API or CLI changes; a no-op for migrations that don't run online DDL on a PlanetScale/Vitess source.
 
 ### Fixed
 
@@ -1676,8 +516,7 @@ A self-hosted-Vitess compatibility fix. A no-op for PlanetScale users.
 
 ## [0.99.5] - 2026-06-05
 
-Resumable PlanetScale cold-start, a memory hard-cap, and a no-PK CDC-resume
-correctness fix. Drop-in upgrade from v0.99.4 — no breaking API or CLI changes.
+Resumable PlanetScale cold-start, a memory hard-cap, and a no-PK CDC-resume correctness fix. Drop-in upgrade from v0.99.4 — no breaking API or CLI changes.
 
 ### Added
 
@@ -1691,9 +530,7 @@ correctness fix. Drop-in upgrade from v0.99.4 — no breaking API or CLI changes
 
 ## [0.99.4] - 2026-06-04
 
-A cold-start-hardening release: a CRITICAL silent-loss fix on the PlanetScale
-(VStream) cold-start path, plus auto-retry on transient mid-copy connection
-drops. Drop-in upgrade from v0.99.3 — no API or CLI changes.
+A cold-start-hardening release: a CRITICAL silent-loss fix on the PlanetScale (VStream) cold-start path, plus auto-retry on transient mid-copy connection drops. Drop-in upgrade from v0.99.3 — no API or CLI changes.
 
 ### Fixed
 
@@ -1713,9 +550,7 @@ drops. Drop-in upgrade from v0.99.3 — no API or CLI changes.
 
 ## [0.99.2] - 2026-06-03
 
-A distribution release — sluice is now installable via Homebrew, Scoop, WinGet,
-and native Debian/RedHat packages. No engine, API, or runtime changes from
-v0.99.1.
+A distribution release — sluice is now installable via Homebrew, Scoop, WinGet, and native Debian/RedHat packages. No engine, API, or runtime changes from v0.99.1.
 
 ### Added
 
@@ -1731,9 +566,7 @@ v0.99.1.
 
 ## [0.99.1] - 2026-06-03
 
-The first release published from the public repository. No new features — a
-MySQL concurrency fix, a Go toolchain security bump, and routine dependency
-updates.
+The first release published from the public repository. No new features — a MySQL concurrency fix, a Go toolchain security bump, and routine dependency updates.
 
 ### Fixed
 
@@ -1749,10 +582,7 @@ updates.
 
 ## [0.99.0] - 2026-06-02
 
-The "new home" release: sluice moved to its own GitHub organization and a
-vanity module path, and now ships an official container image. No functional
-engine changes from v0.98.1 — the connection-resilience + index-build work
-shipped in v0.98.0 / v0.98.1.
+The "new home" release: sluice moved to its own GitHub organization and a vanity module path, and now ships an official container image. No functional engine changes from v0.98.1 — the connection-resilience + index-build work shipped in v0.98.0 / v0.98.1.
 
 ### Changed
 
@@ -1774,13 +604,7 @@ shipped in v0.98.0 / v0.98.1.
 
 ## [0.98.0] - 2026-06-02
 
-A connection-resilience + index-build-throughput arc. Five opt-in
-capabilities harden Postgres targets against connection-slot exhaustion
-and orphaned backends, and make the deferred secondary-index build phase
-materially faster on managed Postgres. Every new behavior is default-safe:
-connection labelling is the only thing on by default, the budget cap is
-auto-sizing (refuse-loudly only when a target genuinely cannot host the
-copy), and reaping / memory / parallelism tuning are explicit opt-ins.
+A connection-resilience + index-build-throughput arc. Five opt-in capabilities harden Postgres targets against connection-slot exhaustion and orphaned backends, and make the deferred secondary-index build phase materially faster on managed Postgres. Every new behavior is default-safe: connection labelling is the only thing on by default, the budget cap is auto-sizing (refuse-loudly only when a target genuinely cannot host the copy), and reaping / memory / parallelism tuning are explicit opt-ins.
 
 ### Added
 
@@ -3681,7 +2505,7 @@ Phase 1 ships the four highest-value strategies — `null` / `static` / `hash:sh
   - `copyTableIdempotent` (mid-stream add-table)
   - `copyTableWithCursor` (resumable per-batch cursor path)
   - `copyChunk` (parallel-copy per-chunk goroutine)
-  
+
   Each callsite wraps the row channel with the new `redactRows` helper; nil/empty Registry is a zero-cost passthrough (no goroutine, no allocations).
 
 - **`Migrator.Redactor`, `Streamer.Redactor`, `AddTable.Redactor` fields** for direct Go-API callers + structural plumbing.
@@ -4362,7 +3186,7 @@ Added a `golangci-lint run` step to both `.githooks/pre-commit` (bash) and `scri
   - `CONVERT_TZ` (rule #23, loud failure: no PG core equivalent)
   - `INET_ATON` / `INET_NTOA` (rule #29, loud failure: no portable PG equivalent without custom function)
   - `SHA1` / `SHA2` (rule #10, loud failure: requires pgcrypto — suppressed when `--enable-pg-extension pgcrypto` is set since the v0.38.0 rewrite ships)
-  
+
   Detection is case-insensitive with word-boundary matching (rejects `IS_GREATEST_HIT(` etc.). Returns `nil` for non-MySQL-to-PG engine pairs.
 
 - **`sluice schema preview` renders the gaps section** in both text and JSON outputs:
@@ -4539,7 +3363,7 @@ The remaining 8 catalog rules stay catalog-only with `--expr-override` as the es
   - **M-only** (LINESTRINGM, POINTM): puts the "M" suffix in `type` directly AND records `coord_dimension=3`. v0.33.2's `parseGeometrySubtype` upper-case + suffix-strip path handled this case.
   - **Z** (POINTZ, LINESTRINGZ): leaves `type` as the 2D base name (`POINT`, `LINESTRING`) and signals the dimension only via `coord_dimension=3`. v0.33.2 didn't read `coord_dimension`, so the Z flag silently dropped at translate-time and the writer emitted `geometry(POINT, 4326)` instead of `geometry(POINTZ, 4326)`. Bulk copy then failed with SQLSTATE 22023 ("Geometry has Z dimension but column does not").
   - **ZM** (POLYGONZM, etc.): same as Z — `type` stays as the 2D base name, dimension signaled by `coord_dimension=4`.
-  
+
   The fix adds `coord_dimension` to the `SELECT` in both `readGeometryColumnInfo` and `readGeographyColumnInfo`, maps it to `HasZ` / `HasM` flags on the per-column `geometryColumnInfo` via a new `dimensionFlagsFromCoordDim` helper that disambiguates the 3D case by inspecting whether the type column ends in "M", and OR-merges the reader-side flags with the existing type-string parsing in `translateType`. Either channel alone may be load-bearing; the OR-merge means neither in isolation is fragile.
 - **PostGIS catalog evidence is now first-class in integration tests.** The v0.33.2 cycle filed Bug 53 because the integration tests asserted on `geometry_columns.type='POINTZ'` — a value PostGIS never produces for that column (the view normalises to the base name, even though the column itself accepts Z values). v0.33.3 shifts the ground-truth assertion to `pg_attribute.format_type(atttypid, atttypmod)`, which returns the modifier-bearing form `geometry(PointZ,4326)`. Three new dimensional-variant integration tests (`TestMigrate_PG_PostGIS_PointZPassthrough`, `TestMigrate_PG_PostGIS_PolygonZMPassthrough`, `TestMigrate_PG_PostGIS_LineStringMPassthrough`) all run against real PostgreSQL containers locally (verified) and will run in CI under the `integration postgis` tag.
 
@@ -5377,9 +4201,7 @@ Single-bug patch from the v0.19.0 test cycle. v0.19.0 shipped logical-backups Ph
 
   **Pre-fix shape (v0.19.0):** `TestBackupStream_Postgres_StopCommandRequestsExit` consistently exceeds even a 60-second post-stop budget on CI (25.71s → 65.69s when budget bumped 20s → 60s — proportional scaling indicating the stream NEVER observes the stop, not just slow). `t.Skip` guard added so the test runs locally but not on CI; v0.19.0 ships with a workaround documented for operators (use SIGTERM directly instead of `backup stream stop`).
 
-  **v0.19.1 fix (two layered closes):**
-  1. **Heartbeat read-modify-write** (the actual correctness bug). New `writeStreamStateMergeHeartbeat` helper in `stream_state.go`: at every per-rollover heartbeat boundary, read the current state file first, copy any concurrent `StopRequestedAt` forward into the new payload, then write. When the merge observes a concurrent stop, the outer loop's heartbeat call returns `stopObserved=true` and the stream exits cleanly without starting a fresh rollover. Closes the clobber-race window across all backends (`LocalStore` and the `s3://` / `gs://` / `azblob://` `BlobStore` variants).
-  2. **In-process channel notification** (option (b) from BUG-CATALOG; structural reliability win). New `stream_stop_registry.go` maintains a process-local map of `[ir.BackupStore]→chan struct{}`; `BackupStream.Run` registers its store at startup and deregisters on return. `RequestStreamStop` closes the registered channel alongside the file write. `captureWindow`'s select grows a `case <-stopCh` that fires instantaneously when same-process — no file I/O, no select-loop starvation, no clobber-race window. Cross-process operators (`sluice backup stream stop --target=<url>` on a different machine) still go through the file; the channel is process-local and `notifyStreamStop` is a no-op for them. Both paths land at the same eager-exit code path, so the chain-correctness contract is unchanged.
+  **v0.19.1 fix (two layered closes):** 1. **Heartbeat read-modify-write** (the actual correctness bug). New `writeStreamStateMergeHeartbeat` helper in `stream_state.go`: at every per-rollover heartbeat boundary, read the current state file first, copy any concurrent `StopRequestedAt` forward into the new payload, then write. When the merge observes a concurrent stop, the outer loop's heartbeat call returns `stopObserved=true` and the stream exits cleanly without starting a fresh rollover. Closes the clobber-race window across all backends (`LocalStore` and the `s3://` / `gs://` / `azblob://` `BlobStore` variants). 2. **In-process channel notification** (option (b) from BUG-CATALOG; structural reliability win). New `stream_stop_registry.go` maintains a process-local map of `[ir.BackupStore]→chan struct{}`; `BackupStream.Run` registers its store at startup and deregisters on return. `RequestStreamStop` closes the registered channel alongside the file write. `captureWindow`'s select grows a `case <-stopCh` that fires instantaneously when same-process — no file I/O, no select-loop starvation, no clobber-race window. Cross-process operators (`sluice backup stream stop --target=<url>` on a different machine) still go through the file; the channel is process-local and `notifyStreamStop` is a no-op for them. Both paths land at the same eager-exit code path, so the chain-correctness contract is unchanged.
 
   **Verification (v0.19.1 cycle):** `TestBackupStream_Postgres_StopCommandRequestsExit` re-enabled on CI (no skip); local runs pass in ~6s with logs showing `in_process_stop` fires within ~5ms of `RequestStreamStop`'s write. All 6 BackupStream Postgres + MySQL integration tests pass. Phase 3 chain-restore + Phase 3.3 `--position-from-manifest` tests pass clean. Full `./internal/pipeline` integration suite green (834s, 0 failures). New unit tests `TestWriteStreamStateMergeHeartbeat_PreservesStop`, `TestWriteStreamStateMergeHeartbeat_NoStopReturnsFalse`, and `TestStreamStopRegistry_*` pin the contracts.
 
@@ -5456,9 +4278,7 @@ Single-bug patch from the v0.17.2 test cycle. v0.17.2 shipped Phase 3.3's PG sof
 
 - **Bug 36 — Patroni / managed-PG idle-slot trap warning does not fire on PlanetScale Postgres (or other tenant-isolated managed PG services).** The v0.17.2 `detectPatroniSource` heuristic checked three signals: (1) `pg_settings WHERE name ILIKE '%patroni%'`, (2) `pg_stat_replication.application_name ILIKE 'patroni%'`, (3) `pg_roles WHERE rolname IN ('patroni', 'replicator')`. All three miss on PS-PG: Patroni sets standard PG GUCs via `ALTER SYSTEM` (not Patroni-prefixed ones, so `name ILIKE '%patroni%'` returns 0 rows); `pg_stat_replication` is permission-restricted on per-tenant roles (returns 0 rows even when Patroni is using it); PS creates tenant-prefixed roles like `hzi_xgsa060j2bbb_role` (so `rolname IN ('patroni', 'replicator')` doesn't match). Net effect: managed-PG operators got no warning when pointing `--position-from-manifest` at their cluster. Fix lands as option (c) from the BUG-CATALOG analysis: broader heuristics + an explicit override flag.
 
-  **Broader engine-side heuristics (v0.17.3 adds Signals 4–5):**
-  1. **Non-temporary physical replication slots present.** `SELECT count(*) FROM pg_replication_slots WHERE slot_type = 'physical' AND temporary = false`. Standby physical slots are a strong HA-cluster signal — most non-HA PG deployments don't carry them. Permission-denied on `pg_replication_slots` (some managed services restrict it) gracefully degrades to skipping the signal.
-  2. **`cluster_name` GUC populated.** Patroni convention sets this; many managed services follow suit. Empty string = no signal; permission-denied / sql.ErrNoRows on `pg_settings WHERE name = 'cluster_name'` gracefully degrades.
+  **Broader engine-side heuristics (v0.17.3 adds Signals 4–5):** 1. **Non-temporary physical replication slots present.** `SELECT count(*) FROM pg_replication_slots WHERE slot_type = 'physical' AND temporary = false`. Standby physical slots are a strong HA-cluster signal — most non-HA PG deployments don't carry them. Permission-denied on `pg_replication_slots` (some managed services restrict it) gracefully degrades to skipping the signal. 2. **`cluster_name` GUC populated.** Patroni convention sets this; many managed services follow suit. Empty string = no signal; permission-denied / sql.ErrNoRows on `pg_settings WHERE name = 'cluster_name'` gracefully degrades.
 
   **DSN hostname-pattern signal (streamer layer, layered on top of the engine's six SQL signals):** known managed-PG suffixes — `*.psdb.cloud` (PlanetScale Postgres), `*.aws.prod.archil.com` / `*.gcp.prod.archil.com` (Archil), `*.cluster*.rds.amazonaws.com` (Aurora cluster endpoints; vanilla RDS instances are excluded because they're not always HA), `*.postgres.database.azure.com` (Azure Database for PostgreSQL), `*.cloudsql.google.internal` (Cloud SQL via private IP). Patterns are intentionally narrow — false positives on non-HA setups would erode the warning's signal value. The signal lives at the streamer layer because the IR `PositionFromManifestPreflight` interface deliberately doesn't carry the DSN (engines without network awareness can implement it cleanly).
 
@@ -5476,10 +4296,7 @@ Logical backups Phase 3.3 lands: full-backup `EndPosition` recording, the `--pos
 
 - **Full-backup `EndPosition` recording (Phase 3.3.A).** `sluice backup full` now captures the source's CDC position at end-of-backup and writes it onto the manifest's `EndPosition` field. PG records `pg_current_wal_lsn()` paired with the configured slot name (default `sluice_slot`; override via the new `--slot-name` flag); MySQL records `@@global.gtid_executed` (or `(file, position)` when GTID mode is off) via the existing master-status helpers. Engines opt in by implementing the new `ir.BackupPositionCapturer` optional interface on their `SchemaReader`; engines without CDC support skip silently. Closes the v0.17.0 known limitation: incrementals chained off v0.17.2-rooted fulls no longer fire the "parent has no EndPosition; chain will start from CDC's current position" warning.
 - **`sluice sync start --position-from-manifest=<chain-url>`.** New CLI flag that loads the chain's terminal manifest's `EndPosition` and uses it as the resume position, bypassing the per-target `sluice_cdc_state` lookup. Use after `sluice restore --from=<chain-url>` to resume CDC from the chain's tail without re-bulking from source. Mutually exclusive with `--reset-target-data` (different recovery shapes; both override the persisted position). The slot-missing fall-through (ADR-0022) is suppressed when chain handoff is requested — silently re-bulking would defeat the chain's purpose. Accepts the same `s3://` / `gs://` / `azblob://` / `file:///` URL schemes as `sluice backup`, with companion `--backup-endpoint` / `--backup-region` / `--backup-path-style` flags for S3-compatible providers.
-- **PG soft-warning pre-flights (Phase 3.3.C) for `--position-from-manifest`.** New `ir.PositionFromManifestPreflight` optional engine surface; PG implements three checks against the source before CDC opens:
-   1. `wal_keep_size` sufficiency — soft warning when configured below PG's 64 MB default (so only setups that explicitly dialed it down trigger), with an operator-facing pointer to `docs/postgres-source-prep.md`.
-   2. Patroni / HA-managed source detection — soft warning about the idle-slot failover trap (the user's 2026-05-07 production finding). Three signals checked in order: Patroni-set GUCs in `pg_settings` (most specific), `pg_stat_replication.application_name` LIKE 'patroni%' (catches standby connections; gracefully degrades on permission denied), role names `patroni` / `replicator` (loosest).
-   3. Slot existence + health — fatal refusal for missing or `wal_status='lost'` / `'unreserved'`. Always a refusal regardless of `--strict-preflight` because the slot can't deliver what's needed.
+- **PG soft-warning pre-flights (Phase 3.3.C) for `--position-from-manifest`.** New `ir.PositionFromManifestPreflight` optional engine surface; PG implements three checks against the source before CDC opens: 1. `wal_keep_size` sufficiency — soft warning when configured below PG's 64 MB default (so only setups that explicitly dialed it down trigger), with an operator-facing pointer to `docs/postgres-source-prep.md`. 2. Patroni / HA-managed source detection — soft warning about the idle-slot failover trap (the user's 2026-05-07 production finding). Three signals checked in order: Patroni-set GUCs in `pg_settings` (most specific), `pg_stat_replication.application_name` LIKE 'patroni%' (catches standby connections; gracefully degrades on permission denied), role names `patroni` / `replicator` (loosest). 3. Slot existence + health — fatal refusal for missing or `wal_status='lost'` / `'unreserved'`. Always a refusal regardless of `--strict-preflight` because the slot can't deliver what's needed.
 
    MySQL intentionally has no preflight surface — its CDC reader's existing `verifyPositionResumable` already covers binlog purge.
 
@@ -5858,21 +4675,7 @@ Operator quality-of-life + cross-engine type-edge audit + OSS-hygiene starter + 
 
   The streamer only clears the flag on stop-signal-driven exits, not on Ctrl-C / outer-ctx cancels — `pollStopSignal` now exposes an optional `*atomic.Bool` that the streamer reads after `dispatchApply` returns to decide whether the exit was the operator's stop request or something else. Without `--wait` the behaviour is unchanged; against an older streamer that doesn't clear the flag, `--wait` blocks until `--timeout` and then surfaces a clear "did not complete drain" message.
 
-- **TIMESTAMP / DATETIME precision integration tests**
-  (`internal/pipeline/migrate_temporal_precision_integration_test.go`).
-  Bug 19 (v0.8.0) closed the silent-corruption hole on the TZ axis;
-  the precision axis was previously covered only by unit tests on the
-  IR's `Precision` field. The new integration tests exercise
-  end-to-end behaviour across `DATETIME(0/3/6)` /
-  `TIMESTAMP(0/3/6)` (MySQL→PG) and `TIMESTAMP(0/3/6)` /
-  `TIMESTAMPTZ(0/3/6)` (PG→MySQL), seeded with
-  `12:34:56.123456` so each precision tier surfaces a distinct
-  truncated value. Round-trips assert wall-clock equivalence within
-  the column's declared precision; the PG→MySQL case also pins the
-  expected target column types (`TIMESTAMP` → `DATETIME`,
-  `TIMESTAMPTZ` → `TIMESTAMP`) so a future schema-emit rewire would
-  surface as a schema-shape failure rather than silently passing on
-  equivalent values.
+- **TIMESTAMP / DATETIME precision integration tests** (`internal/pipeline/migrate_temporal_precision_integration_test.go`). Bug 19 (v0.8.0) closed the silent-corruption hole on the TZ axis; the precision axis was previously covered only by unit tests on the IR's `Precision` field. The new integration tests exercise end-to-end behaviour across `DATETIME(0/3/6)` / `TIMESTAMP(0/3/6)` (MySQL→PG) and `TIMESTAMP(0/3/6)` / `TIMESTAMPTZ(0/3/6)` (PG→MySQL), seeded with `12:34:56.123456` so each precision tier surfaces a distinct truncated value. Round-trips assert wall-clock equivalence within the column's declared precision; the PG→MySQL case also pins the expected target column types (`TIMESTAMP` → `DATETIME`, `TIMESTAMPTZ` → `TIMESTAMP`) so a future schema-emit rewire would surface as a schema-shape failure rather than silently passing on equivalent values.
 
 - **`CONTRIBUTING.md` release-process section + `docs/dev/release-template.md`** — formalise the GitHub release-notes structure (Highlights / Fixed / Compatibility / Who-needs-this) that's been carried in conversation memory across the v0.x ramp, plus the `chore: cut vX.Y.Z` commit + annotated-tag pattern. The release-template doc carries section-by-section guidance with examples drawn from the v0.7.0 / v0.8.0 release notes.
 
@@ -5917,273 +4720,47 @@ Schema-diff release plus seven real-world bug fixes from v0.7.0 testing. Headlin
 
 ### Added
 
-- **`sluice schema diff` (ADR-0029).** Drift detection between what
-  sluice would produce on a target (source schema → translation
-  pipeline → expected target shape) and the schema that's actually
-  there. Reads both sides through the existing `SchemaReader`
-  surface — no new engine API; every engine that already implements
-  `SchemaReader` (today: PG, MySQL) gets diff support immediately.
-  Renders text (default; per-table sections with copy-paste
-  ALTER/DROP suggestions and a preamble noting they're starting
-  points, not verified migration scripts) or JSON (stable shape for
-  CI consumers) and supports `--output FILE` with the same atomic
-  temp+rename semantics as `schema preview`. Filter and mapping
-  flags mirror `schema preview` so the diff and preview pipelines
-  stay aligned. CI-friendly exit codes: 0 on no drift, 1 on drift
-  detected (suitable for failing a `schema-drift.yml` job), 2 on
-  operational error like a bad DSN — distinct so CI scripts don't
-  conflate "the gate failed" with "we couldn't run the gate."
-  `--ignore-extras` suppresses extra-on-target entries (useful when
-  the target hosts other applications' tables); `--ignore-charset-
-  collation` is plumbed for the v1.x extension when those fields
-  land in the IR. Out of scope per the ADR: column reordering,
-  index column ordering, FK constraint name normalisation, and
-  trigger/function/view comparison — surfacing those as drift
-  produces too much noise for too little operator value, and
-  reconciliation is a different tool's job (Atlas, sqitch).
+- **`sluice schema diff` (ADR-0029).** Drift detection between what sluice would produce on a target (source schema → translation pipeline → expected target shape) and the schema that's actually there. Reads both sides through the existing `SchemaReader` surface — no new engine API; every engine that already implements `SchemaReader` (today: PG, MySQL) gets diff support immediately. Renders text (default; per-table sections with copy-paste ALTER/DROP suggestions and a preamble noting they're starting points, not verified migration scripts) or JSON (stable shape for CI consumers) and supports `--output FILE` with the same atomic temp+rename semantics as `schema preview`. Filter and mapping flags mirror `schema preview` so the diff and preview pipelines stay aligned. CI-friendly exit codes: 0 on no drift, 1 on drift detected (suitable for failing a `schema-drift.yml` job), 2 on operational error like a bad DSN — distinct so CI scripts don't conflate "the gate failed" with "we couldn't run the gate." `--ignore-extras` suppresses extra-on-target entries (useful when the target hosts other applications' tables); `--ignore-charset- collation` is plumbed for the v1.x extension when those fields land in the IR. Out of scope per the ADR: column reordering, index column ordering, FK constraint name normalisation, and trigger/function/view comparison — surfacing those as drift produces too much noise for too little operator value, and reconciliation is a different tool's job (Atlas, sqitch).
 
-- **Schema diff: defaults, generated expressions, CHECK constraints,
-  per-column ALTER rendering.** Three categories originally listed
-  as out-of-scope in ADR-0029 are now compared because the IR
-  already carries the underlying fields and the comparison shape is
-  additive on `ColumnDiff` / `TableDiff`: column defaults
-  (`ExpectedDefault` / `ActualDefault`, with a small cross-engine
-  equivalence map for the common pairs like `now()` ↔
-  `CURRENT_TIMESTAMP`; mismatches outside the map are flagged
-  low-confidence rather than silently equated), generated-column
-  expressions (verbatim string comparison after trim — engines don't
-  support in-place generated-expr ALTERs, so the renderer emits a
-  comment plus a DROP+ADD reconciliation hint), and table-level
-  CHECK constraints (matched by name; unnamed CHECKs are dropped
-  from the comparison to avoid cross-engine spelling false
-  positives). Renderer fills the actual column type, default, and
-  generated expression on `ALTER TABLE ... ADD COLUMN` suggestions
-  for missing-on-target columns via a new optional
-  `ir.ColumnDDLPreviewer` interface (implemented on both PG and
-  MySQL); the prior `-- TYPE` placeholder remains as a defensive
-  fallback for engines that don't implement it.
+- **Schema diff: defaults, generated expressions, CHECK constraints, per-column ALTER rendering.** Three categories originally listed as out-of-scope in ADR-0029 are now compared because the IR already carries the underlying fields and the comparison shape is additive on `ColumnDiff` / `TableDiff`: column defaults (`ExpectedDefault` / `ActualDefault`, with a small cross-engine equivalence map for the common pairs like `now()` ↔ `CURRENT_TIMESTAMP`; mismatches outside the map are flagged low-confidence rather than silently equated), generated-column expressions (verbatim string comparison after trim — engines don't support in-place generated-expr ALTERs, so the renderer emits a comment plus a DROP+ADD reconciliation hint), and table-level CHECK constraints (matched by name; unnamed CHECKs are dropped from the comparison to avoid cross-engine spelling false positives). Renderer fills the actual column type, default, and generated expression on `ALTER TABLE ... ADD COLUMN` suggestions for missing-on-target columns via a new optional `ir.ColumnDDLPreviewer` interface (implemented on both PG and MySQL); the prior `-- TYPE` placeholder remains as a defensive fallback for engines that don't implement it.
 
-- **Cross-engine type-policy retarget on schema diff.** New
-  `internal/translate.RetargetForEngine` rewrites the source-side
-  schema's PG-native IR types (`UUID`, `Inet`, `Cidr`, `Macaddr`,
-  `Array`) to the MySQL-storage IR shapes (`Char(36)`, `Varchar(45)`,
-  `Varchar(30)`, `JSON[binary]`) the target engine's DDL writer
-  would land them on. Wired into `pipeline.Differ.Run` between
-  `ApplyMappings` and the target schema read so cross-engine
-  `sluice schema diff` no longer flags every translated column as
-  drift when the target storage is exactly what sluice would
-  produce. Same-engine pairs and unknown engine pairs return the
-  schema unchanged. Operator-supplied `--type-override` mappings
-  take precedence (override replaces the IR type via
-  `ApplyMappings`; the retarget pass only fires on still-source-
-  native types). v0.8.0 scope is the PG→MySQL direction.
+- **Cross-engine type-policy retarget on schema diff.** New `internal/translate.RetargetForEngine` rewrites the source-side schema's PG-native IR types (`UUID`, `Inet`, `Cidr`, `Macaddr`, `Array`) to the MySQL-storage IR shapes (`Char(36)`, `Varchar(45)`, `Varchar(30)`, `JSON[binary]`) the target engine's DDL writer would land them on. Wired into `pipeline.Differ.Run` between `ApplyMappings` and the target schema read so cross-engine `sluice schema diff` no longer flags every translated column as drift when the target storage is exactly what sluice would produce. Same-engine pairs and unknown engine pairs return the schema unchanged. Operator-supplied `--type-override` mappings take precedence (override replaces the IR type via `ApplyMappings`; the retarget pass only fires on still-source- native types). v0.8.0 scope is the PG→MySQL direction.
 
 ### Tests
 
-- Cross-engine integration test for `sluice schema diff`
-  (`internal/pipeline/diff_cross_engine_integration_test.go`) booting
-  a PG source + MySQL target. Asserts the retarget pass collapses
-  the noisy cross-engine type drift so only the deliberately
-  injected drift surfaces (narrowed VARCHAR, missing column, extra
-  table on target). Also covers JSON / text rendering and
-  `IgnoreExtras` semantics on the cross-engine path.
+- Cross-engine integration test for `sluice schema diff` (`internal/pipeline/diff_cross_engine_integration_test.go`) booting a PG source + MySQL target. Asserts the retarget pass collapses the noisy cross-engine type drift so only the deliberately injected drift surfaces (narrowed VARCHAR, missing column, extra table on target). Also covers JSON / text rendering and `IgnoreExtras` semantics on the cross-engine path.
 
 ### Fixed
 
-- **Bug 16 — MySQL functional / expression indexes wall the schema
-  reader.** `information_schema.statistics` rows for
-  functional/expression indexes (MySQL 8.0.13+) carry
-  `COLUMN_NAME = NULL` and put the actual expression in the
-  `EXPRESSION` column. The reader scanned `column_name` into a plain
-  `string`, so the first such index produced
-  `converting NULL to string is unsupported` and aborted the
-  schema-read for the whole database — a hard wall blocking every
-  operation against production schemas that use the feature.
+- **Bug 16 — MySQL functional / expression indexes wall the schema reader.** `information_schema.statistics` rows for functional/expression indexes (MySQL 8.0.13+) carry `COLUMN_NAME = NULL` and put the actual expression in the `EXPRESSION` column. The reader scanned `column_name` into a plain `string`, so the first such index produced `converting NULL to string is unsupported` and aborted the schema-read for the whole database — a hard wall blocking every operation against production schemas that use the feature.
 
-  Fix: scan into `sql.NullString`, add `EXPRESSION` to the SELECT,
-  and route NULL-column rows into a new `ir.IndexColumn.Expression`
-  field (run through the same `normalizeMySQLExpressionText`
-  identifier-quote scrubbing the reader applies to generated columns
-  and CHECKs). MySQL and Postgres DDL writers render expression
-  entries as parenthesised expression text. Cross-engine MySQL→PG
-  emit is best-effort: portable expressions round-trip; non-portable
-  ones still fail loudly on `CREATE INDEX`. Regression guards:
-  `TestEmitCreateIndex/expression_entry`,
-  `TestEmitCreateIndex/mixed_plain_and_expression_entries` (unit) and
-  `TestSchemaReader_FunctionalIndex` (integration).
+  Fix: scan into `sql.NullString`, add `EXPRESSION` to the SELECT, and route NULL-column rows into a new `ir.IndexColumn.Expression` field (run through the same `normalizeMySQLExpressionText` identifier-quote scrubbing the reader applies to generated columns and CHECKs). MySQL and Postgres DDL writers render expression entries as parenthesised expression text. Cross-engine MySQL→PG emit is best-effort: portable expressions round-trip; non-portable ones still fail loudly on `CREATE INDEX`. Regression guards: `TestEmitCreateIndex/expression_entry`, `TestEmitCreateIndex/mixed_plain_and_expression_entries` (unit) and `TestSchemaReader_FunctionalIndex` (integration).
 
-- **Bug 17 — MySQL bool-idiom CHECK / generated expressions reject
-  on PG (ADR-0016 addition).** MySQL's tinyint(1)→PG BOOLEAN mapping
-  silently broke CHECK constraints and generated columns that compared
-  the column against an integer literal — `0 <> is_active`,
-  `is_active = 1`, `coalesce(is_active, 0)` — because PG's strict
-  typing rejects integer↔boolean comparisons that MySQL accepts via
-  implicit coercion. Real-world report: 3 of 138 tables on
-  `schema_example_02` blocked by this until columns were dropped
-  manually.
+- **Bug 17 — MySQL bool-idiom CHECK / generated expressions reject on PG (ADR-0016 addition).** MySQL's tinyint(1)→PG BOOLEAN mapping silently broke CHECK constraints and generated columns that compared the column against an integer literal — `0 <> is_active`, `is_active = 1`, `coalesce(is_active, 0)` — because PG's strict typing rejects integer↔boolean comparisons that MySQL accepts via implicit coercion. Real-world report: 3 of 138 tables on `schema_example_02` blocked by this until columns were dropped manually.
 
-  Fix extends the writer-side translator (`translateExprForPG`) with
-  an `ExprContext` carrying the table's bool-mapped column names.
-  When the rewrite recognises `<int_lit> <op> <bool_ident>` /
-  `<bool_ident> <op> <int_lit>` (op ∈ `=`, `!=`, `<>`; lit ∈ `0`, `1`)
-  or `COALESCE(<bool_ident>, <int_lit>)` and the symmetric form, the
-  int literal is replaced with `false` / `true`. `IFNULL` is renamed
-  to `COALESCE` by an earlier pass so it falls in too. Anything else
-  passes through verbatim — same loud-failure tenet as the rest of
-  ADR-0016. Same-engine emits unaffected (the translator only fires
-  when the IR's dialect tag differs from the writer's). New
-  integration test `TestMigrate_MySQLToPostgres_CheckBoolIdiom`
-  verifies a real `CHECK (0 <> is_active)` lands on PG and enforces
-  correctly. ADR-0016 updated with an "Added in v0.8.0" subsection.
+  Fix extends the writer-side translator (`translateExprForPG`) with an `ExprContext` carrying the table's bool-mapped column names. When the rewrite recognises `<int_lit> <op> <bool_ident>` / `<bool_ident> <op> <int_lit>` (op ∈ `=`, `!=`, `<>`; lit ∈ `0`, `1`) or `COALESCE(<bool_ident>, <int_lit>)` and the symmetric form, the int literal is replaced with `false` / `true`. `IFNULL` is renamed to `COALESCE` by an earlier pass so it falls in too. Anything else passes through verbatim — same loud-failure tenet as the rest of ADR-0016. Same-engine emits unaffected (the translator only fires when the IR's dialect tag differs from the writer's). New integration test `TestMigrate_MySQLToPostgres_CheckBoolIdiom` verifies a real `CHECK (0 <> is_active)` lands on PG and enforces correctly. ADR-0016 updated with an "Added in v0.8.0" subsection.
 
-- **Bug 18 — `--reset-target-data` left orphaned PG enum types.**
-  The destructive-recovery path (ADR-0023) dropped tables and the
-  bookkeeping row; enum types created during a partially-failed
-  cold-start survived and caused the next reset's `CREATE TYPE` to
-  fail with "type X already exists" until operators manually
-  `DROP TYPE`d. Fix extends the reset path with a
-  `dropSchemaTypes` pass that runs after the table drops, walking
-  the source schema for `ir.Enum` columns and emitting
-  `DROP TYPE IF EXISTS "schema"."<table>_<col>_enum" CASCADE`. PG-
-  only via the new optional `ir.SchemaTypeDropper` interface; MySQL
-  embeds enum values inline and is unaffected. Idempotent across
-  partial failures. New integration test
-  `TestMigrate_ResetTargetData_DropsOrphanEnumTypes` simulates the
-  stuck state, runs reset, and asserts the next migrate succeeds
-  with rows landing.
+- **Bug 18 — `--reset-target-data` left orphaned PG enum types.** The destructive-recovery path (ADR-0023) dropped tables and the bookkeeping row; enum types created during a partially-failed cold-start survived and caused the next reset's `CREATE TYPE` to fail with "type X already exists" until operators manually `DROP TYPE`d. Fix extends the reset path with a `dropSchemaTypes` pass that runs after the table drops, walking the source schema for `ir.Enum` columns and emitting `DROP TYPE IF EXISTS "schema"."<table>_<col>_enum" CASCADE`. PG- only via the new optional `ir.SchemaTypeDropper` interface; MySQL embeds enum values inline and is unaffected. Idempotent across partial failures. New integration test `TestMigrate_ResetTargetData_DropsOrphanEnumTypes` simulates the stuck state, runs reset, and asserts the next migrate succeeds with rows landing.
 
-- **Bug 19 — silent TIMESTAMP corruption in MySQL→PG CDC on non-UTC
-  hosts.** TIMESTAMP values delivered through CDC drifted by the host
-  process's local UTC offset (e.g. seven hours early on a US/Pacific
-  host during DST). Cold-start bulk copy was correct, CDC was not, so
-  the destination silently held the wrong instant for every row
-  updated post-cold-start until an operator happened to compare
-  source and target epochs. Loud failures beat silent corruption;
-  this one snuck past v0.7.x.
+- **Bug 19 — silent TIMESTAMP corruption in MySQL→PG CDC on non-UTC hosts.** TIMESTAMP values delivered through CDC drifted by the host process's local UTC offset (e.g. seven hours early on a US/Pacific host during DST). Cold-start bulk copy was correct, CDC was not, so the destination silently held the wrong instant for every row updated post-cold-start until an operator happened to compare source and target epochs. Loud failures beat silent corruption; this one snuck past v0.7.x.
 
   Two distinct corruption surfaces landed under the same symptom:
 
-  - **CDC binlog path.** MySQL's binlog wire format encodes
-    TIMESTAMP as a UTC seconds-since-epoch integer, but go-mysql's
-    `decodeTimestamp2` builds the resulting `time.Time` via
-    `time.Unix(sec, ...)` whose `Location` defaults to `time.Local`.
-    With the parser's `ParseTime=false` setting (sluice's configured
-    path), `fracTime.String()` then formats that instant in
-    process-local TZ unless
-    `BinlogSyncerConfig.TimestampStringLocation` is pinned. The
-    formatted wall-clock string flowed into sluice's `decodeTime`,
-    which parses naked datetime strings as UTC — silently
-    re-interpreting a PT wall clock as a UTC instant.
+  - **CDC binlog path.** MySQL's binlog wire format encodes TIMESTAMP as a UTC seconds-since-epoch integer, but go-mysql's `decodeTimestamp2` builds the resulting `time.Time` via `time.Unix(sec, ...)` whose `Location` defaults to `time.Local`. With the parser's `ParseTime=false` setting (sluice's configured path), `fracTime.String()` then formats that instant in process-local TZ unless `BinlogSyncerConfig.TimestampStringLocation` is pinned. The formatted wall-clock string flowed into sluice's `decodeTime`, which parses naked datetime strings as UTC — silently re-interpreting a PT wall clock as a UTC instant.
 
-  - **Cold-start / database/sql path.** A second, latent surface:
-    if the MySQL session's `time_zone` inherits the server's
-    `default_time_zone` (often `SYSTEM`, which follows the host),
-    MySQL converts the column's UTC-stored TIMESTAMP into the
-    session TZ for the wire format. The driver — running with
-    `cfg.Loc=UTC` — re-interprets that wall-clock as UTC, producing
-    the same offset. This wasn't observed because test containers
-    default to UTC; production deployments against MySQL servers
-    with non-UTC `default_time_zone` would have hit it.
+  - **Cold-start / database/sql path.** A second, latent surface: if the MySQL session's `time_zone` inherits the server's `default_time_zone` (often `SYSTEM`, which follows the host), MySQL converts the column's UTC-stored TIMESTAMP into the session TZ for the wire format. The driver — running with `cfg.Loc=UTC` — re-interprets that wall-clock as UTC, producing the same offset. This wasn't observed because test containers default to UTC; production deployments against MySQL servers with non-UTC `default_time_zone` would have hit it.
 
-  Fix lives at the connection-protocol layer in two places — no
-  Go-side runtime-TZ conversion that could drift with deployment
-  changes: the binlog client sets
-  `BinlogSyncerConfig.TimestampStringLocation = time.UTC`, and
-  every database/sql connection injects `time_zone='+00:00'` into
-  `cfg.Params` so the driver issues `SET time_zone='+00:00'`
-  immediately after handshake (covers schema reader, row reader,
-  row writer, CDC schema cache, change applier, migration-state
-  store). DATETIME is unaffected (its binlog encoding is the
-  broken-down date/time directly with no TZ conversion).
-  Regression guard: `TestCDCReader_TimestampNonUTCHost`
-  (integration tag) pins `time.Local` to America/Los_Angeles,
-  inserts a TIMESTAMP, and asserts the value comes back as the
-  same UTC instant from both the cold-start `RowReader` and the
-  CDC stream's update event.
+  Fix lives at the connection-protocol layer in two places — no Go-side runtime-TZ conversion that could drift with deployment changes: the binlog client sets `BinlogSyncerConfig.TimestampStringLocation = time.UTC`, and every database/sql connection injects `time_zone='+00:00'` into `cfg.Params` so the driver issues `SET time_zone='+00:00'` immediately after handshake (covers schema reader, row reader, row writer, CDC schema cache, change applier, migration-state store). DATETIME is unaffected (its binlog encoding is the broken-down date/time directly with no TZ conversion). Regression guard: `TestCDCReader_TimestampNonUTCHost` (integration tag) pins `time.Local` to America/Los_Angeles, inserts a TIMESTAMP, and asserts the value comes back as the same UTC instant from both the cold-start `RowReader` and the CDC stream's update event.
 
-- **Bug 21 — PG snapshot transaction held source-table locks for the
-  entire CDC lifetime, blocking ALTER on the source.** The PG cold-
-  start path opens a snapshot transaction (`SET TRANSACTION SNAPSHOT
-  '<name>'`) on a pinned SQL connection so bulk-copy reads see a
-  consistent view. Pre-fix, that transaction stayed open as `idle in
-  transaction` for as long as the SnapshotStream was alive — i.e.
-  for the entire CDC streaming phase, which on a long-running sync
-  is hours or days. Every snapshotted table held an
-  `AccessShareLock`, blocking any concurrent `ALTER TABLE` on the
-  source. Real-world report: a 310-second `idle in transaction` queue,
-  ALTER waiting behind it, both unblocked the moment sluice exited.
+- **Bug 21 — PG snapshot transaction held source-table locks for the entire CDC lifetime, blocking ALTER on the source.** The PG cold- start path opens a snapshot transaction (`SET TRANSACTION SNAPSHOT '<name>'`) on a pinned SQL connection so bulk-copy reads see a consistent view. Pre-fix, that transaction stayed open as `idle in transaction` for as long as the SnapshotStream was alive — i.e. for the entire CDC streaming phase, which on a long-running sync is hours or days. Every snapshotted table held an `AccessShareLock`, blocking any concurrent `ALTER TABLE` on the source. Real-world report: a 310-second `idle in transaction` queue, ALTER waiting behind it, both unblocked the moment sluice exited.
 
-  Fix splits the SnapshotStream cleanup into two phases via a new
-  `ir.SnapshotStream.ReleaseRowsFn` (and the corresponding
-  `ReleaseRows()` method): the streamer calls `ReleaseRows` after
-  bulk-copy completes, which COMMITs the snapshot transaction and
-  closes the import-side connections (the pinned SQL conn + the
-  slot-creation replication conn) without disturbing the CDC reader.
-  The CDC reader runs on its own connection, and the slot's logical
-  position is independent of the exporting transaction, so CDC
-  continues seamlessly. `Close()` remains the catch-all cleanup and
-  is idempotent with `ReleaseRows` — calling both is safe; calling
-  only `Close()` still works (it invokes the release path internally
-  if not already done). MySQL implementations don't need this surface
-  (per-session snapshot, no shared exporter), and the field is
-  optional. Regression guard:
-  `TestSnapshotStream_ReleaseRowsClosesSnapshotTx` (integration
-  tag) asserts `pg_stat_activity` shows zero `idle in transaction`
-  sessions after release, that an ALTER TABLE on the source
-  succeeds without blocking, and that CDC continues delivering
-  events post-release.
+  Fix splits the SnapshotStream cleanup into two phases via a new `ir.SnapshotStream.ReleaseRowsFn` (and the corresponding `ReleaseRows()` method): the streamer calls `ReleaseRows` after bulk-copy completes, which COMMITs the snapshot transaction and closes the import-side connections (the pinned SQL conn + the slot-creation replication conn) without disturbing the CDC reader. The CDC reader runs on its own connection, and the slot's logical position is independent of the exporting transaction, so CDC continues seamlessly. `Close()` remains the catch-all cleanup and is idempotent with `ReleaseRows` — calling both is safe; calling only `Close()` still works (it invokes the release path internally if not already done). MySQL implementations don't need this surface (per-session snapshot, no shared exporter), and the field is optional. Regression guard: `TestSnapshotStream_ReleaseRowsClosesSnapshotTx` (integration tag) asserts `pg_stat_activity` shows zero `idle in transaction` sessions after release, that an ALTER TABLE on the source succeeds without blocking, and that CDC continues delivering events post-release.
 
-- **Bug 22 — Vitess `_vt_*` shadow tables included by default.**
-  Vitess maintains internal lifecycle tables (`_vt_HOLD_*`,
-  `_vt_PURGE_*`, `_vt_EVAC_*`, `_vt_DROP_*` in legacy naming;
-  `_vt_hld_*` / `_vt_prg_*` / `_vt_evc_*` / `_vt_drp_*` plus a
-  trailing underscore in the post-PR-14613 scheme) that aren't user
-  data and shouldn't appear in publication or bulk-copy. v0.7.0
-  silently included them, generating quiet write churn against the
-  target with no operator-visible signal. Workaround was a manual
-  `--exclude-table='_vt_*'`.
+- **Bug 22 — Vitess `_vt_*` shadow tables included by default.** Vitess maintains internal lifecycle tables (`_vt_HOLD_*`, `_vt_PURGE_*`, `_vt_EVAC_*`, `_vt_DROP_*` in legacy naming; `_vt_hld_*` / `_vt_prg_*` / `_vt_evc_*` / `_vt_drp_*` plus a trailing underscore in the post-PR-14613 scheme) that aren't user data and shouldn't appear in publication or bulk-copy. v0.7.0 silently included them, generating quiet write churn against the target with no operator-visible signal. Workaround was a manual `--exclude-table='_vt_*'`.
 
-  Fix: new optional `ir.DefaultTableExcluder` engine surface lets
-  engines declare baseline exclusion patterns; the orchestrator
-  merges them into the operator's filter at the start of `Migrator`
-  / `Streamer` `Run`. The PlanetScale flavor opts in with the
-  `_vt_*` pattern (covers both legacy and post-PR-14613 naming).
-  Operator-supplied `--include-table` short-circuits the merge —
-  if the operator explicitly opts into a precise table list, engine
-  defaults don't override it. Vanilla MySQL returns no defaults
-  (`_vt_*` is a Vitess namespace, not an upstream MySQL one;
-  vanilla MySQL operators on Vitess-backed servers can still
-  pass `--exclude-table='_vt_*'` manually — auto-detect of the
-  underlying server flavor is out of scope for v0.8.0). The merged
-  exclusions are surfaced via a structured INFO log at
-  orchestrator startup so operators see what's being filtered.
-  Regression guards:
-  `TestEffectiveTableFilter_MergesEngineDefaults` (covers all four
-  merge paths: empty, exclude-mode, include-mode short-circuit,
-  duplicate-pattern dedup) and
-  `TestDefaultExcludePatterns_PlanetScale` (pins the flavor's
-  declared default).
+  Fix: new optional `ir.DefaultTableExcluder` engine surface lets engines declare baseline exclusion patterns; the orchestrator merges them into the operator's filter at the start of `Migrator` / `Streamer` `Run`. The PlanetScale flavor opts in with the `_vt_*` pattern (covers both legacy and post-PR-14613 naming). Operator-supplied `--include-table` short-circuits the merge — if the operator explicitly opts into a precise table list, engine defaults don't override it. Vanilla MySQL returns no defaults (`_vt_*` is a Vitess namespace, not an upstream MySQL one; vanilla MySQL operators on Vitess-backed servers can still pass `--exclude-table='_vt_*'` manually — auto-detect of the underlying server flavor is out of scope for v0.8.0). The merged exclusions are surfaced via a structured INFO log at orchestrator startup so operators see what's being filtered. Regression guards: `TestEffectiveTableFilter_MergesEngineDefaults` (covers all four merge paths: empty, exclude-mode, include-mode short-circuit, duplicate-pattern dedup) and `TestDefaultExcludePatterns_PlanetScale` (pins the flavor's declared default).
 
-- **Bug 20 — cross-engine warm-resume dispatch on the wrong driver.**
-  `sluice sync start --resume` failed on
-  `--source-driver=planetscale --target-driver=postgres` because the
-  persisted CDC position came back from the target's
-  `sluice_cdc_state` tagged with the applier's (target's) engine
-  name, so the source CDC reader's decoder rejected it as belonging
-  to the wrong engine. v0.1.0's Bug 2 fix patched the symmetric
-  same-family PS↔MySQL pair by widening MySQL's decoder; it didn't
-  generalise to truly cross-engine pairs. Fix is a re-stamp at the
-  streamer level: every persisted position picked up via
-  `applier.ReadPosition` has its `Engine` field set to
-  `s.Source.Name()` before reaching the source CDC reader. All four
-  pairs (MySQL↔MySQL, MySQL↔PG, PG↔PG, PG↔MySQL, plus the
-  PlanetScale flavor) round-trip cleanly without per-pair special-
-  casing. The from-now sentinel (`Engine="" Token=""`) is preserved.
-  The `--reset-target-data --yes` workaround is no longer needed for
-  cross-engine zero-downtime resumes. New unit tests
-  `TestRetagPositionForSource_*` (helper-level pinning across the
-  four pairs) and `TestStreamer_WarmResume_CrossEngine_Retag`
-  (end-to-end-shape pin via recording reader/applier).
+- **Bug 20 — cross-engine warm-resume dispatch on the wrong driver.** `sluice sync start --resume` failed on `--source-driver=planetscale --target-driver=postgres` because the persisted CDC position came back from the target's `sluice_cdc_state` tagged with the applier's (target's) engine name, so the source CDC reader's decoder rejected it as belonging to the wrong engine. v0.1.0's Bug 2 fix patched the symmetric same-family PS↔MySQL pair by widening MySQL's decoder; it didn't generalise to truly cross-engine pairs. Fix is a re-stamp at the streamer level: every persisted position picked up via `applier.ReadPosition` has its `Engine` field set to `s.Source.Name()` before reaching the source CDC reader. All four pairs (MySQL↔MySQL, MySQL↔PG, PG↔PG, PG↔MySQL, plus the PlanetScale flavor) round-trip cleanly without per-pair special- casing. The from-now sentinel (`Engine="" Token=""`) is preserved. The `--reset-target-data --yes` workaround is no longer needed for cross-engine zero-downtime resumes. New unit tests `TestRetagPositionForSource_*` (helper-level pinning across the four pairs) and `TestStreamer_WarmResume_CrossEngine_Retag` (end-to-end-shape pin via recording reader/applier).
 
 ## [0.7.0] - 2026-05-05
 
@@ -6191,171 +4768,41 @@ Performance round 2 + ergonomics + reliability follow-ups. Four new ADRs (0025 g
 
 ### Added
 
-- **MySQL `LOAD DATA LOCAL INFILE` row-writer (ADR-0026).** Vanilla
-  MySQL bulk-copy now streams TSV over `LOAD DATA LOCAL INFILE` via
-  go-sql-driver's `RegisterReaderHandler` mechanism (no real file
-  written, no `?allowAllFiles=true` needed). Typically 5–10× faster
-  than the parameter-bound multi-row `INSERT` path on wide-row
-  tables. The `BulkLoadLoadDataInfile` capability constant has been
-  declared on vanilla MySQL since v0.1; this release brings the
-  implementation up to the declaration. PlanetScale stays on
-  BatchedInsert (the flavor doesn't allow `LOAD DATA LOCAL INFILE`).
+- **MySQL `LOAD DATA LOCAL INFILE` row-writer (ADR-0026).** Vanilla MySQL bulk-copy now streams TSV over `LOAD DATA LOCAL INFILE` via go-sql-driver's `RegisterReaderHandler` mechanism (no real file written, no `?allowAllFiles=true` needed). Typically 5–10× faster than the parameter-bound multi-row `INSERT` path on wide-row tables. The `BulkLoadLoadDataInfile` capability constant has been declared on vanilla MySQL since v0.1; this release brings the implementation up to the declaration. PlanetScale stays on BatchedInsert (the flavor doesn't allow `LOAD DATA LOCAL INFILE`).
 
-  Per-call fallback to BatchedInsert when (a) the server has
-  `local_infile=OFF` (default on MySQL 8.0+) — one structured WARN
-  surfaces the speedup-pending hint, and (b) the table contains a
-  geometry column (the SRID-prefixed WKB wire format isn't
-  expressible in a column-only LOAD DATA). The TSV serializer
-  escapes the four MySQL LOAD DATA defaults
-  (tab/newline/CR/backslash/NUL) and emits `\N` for NULL. Statement
-  uses `CHARACTER SET binary` plus per-column `SET col = CONVERT(@cN
-  USING utf8mb4)` for VARCHAR/TEXT/SET/JSON columns to round-trip
-  binary blobs and JSON cleanly in the same statement.
+  Per-call fallback to BatchedInsert when (a) the server has `local_infile=OFF` (default on MySQL 8.0+) — one structured WARN surfaces the speedup-pending hint, and (b) the table contains a geometry column (the SRID-prefixed WKB wire format isn't expressible in a column-only LOAD DATA). The TSV serializer escapes the four MySQL LOAD DATA defaults (tab/newline/CR/backslash/NUL) and emits `\N` for NULL. Statement uses `CHARACTER SET binary` plus per-column `SET col = CONVERT(@cN USING utf8mb4)` for VARCHAR/TEXT/SET/JSON columns to round-trip binary blobs and JSON cleanly in the same statement.
 
-- **Source-transaction-boundary aware CDC batching (ADR-0027).** New
-  `ir.TxBegin` / `ir.TxCommit` change variants surface source-side
-  transaction boundaries to the applier. Postgres emits from
-  `BeginMessage` / `CommitMessage` (with `StreamStart` / `StreamStop`
-  mapping to boundaries for the streaming-in-progress chunked path);
-  MySQL emits from `BEGIN` QueryEvent / `XIDEvent`. The batched
-  applier (`ApplyBatch`) flushes on `TxCommit` so a 5000-row source
-  transaction commits as one 5000-row target transaction instead of
-  being split by the row-count cap. The cap remains the upper bound;
-  idle flush, channel close, and Truncate flush behave as before.
-  Empty source transactions produce no target commits (lazy-tx-open
-  absorbs them). Per-change `Apply` treats boundary events as
-  no-ops; the table filter explicitly bypasses them so a filter
-  never drops a boundary signal. Position-and-data atomicity
-  (ADR-0007) and idempotency (ADR-0010) preserved. Closes the
-  follow-up explicitly deferred from ADR-0017.
+- **Source-transaction-boundary aware CDC batching (ADR-0027).** New `ir.TxBegin` / `ir.TxCommit` change variants surface source-side transaction boundaries to the applier. Postgres emits from `BeginMessage` / `CommitMessage` (with `StreamStart` / `StreamStop` mapping to boundaries for the streaming-in-progress chunked path); MySQL emits from `BEGIN` QueryEvent / `XIDEvent`. The batched applier (`ApplyBatch`) flushes on `TxCommit` so a 5000-row source transaction commits as one 5000-row target transaction instead of being split by the row-count cap. The cap remains the upper bound; idle flush, channel close, and Truncate flush behave as before. Empty source transactions produce no target commits (lazy-tx-open absorbs them). Per-change `Apply` treats boundary events as no-ops; the table filter explicitly bypasses them so a filter never drops a boundary signal. Position-and-data atomicity (ADR-0007) and idempotency (ADR-0010) preserved. Closes the follow-up explicitly deferred from ADR-0017.
 
-- **`--max-buffer-bytes N` (ADR-0028).** Default `67108864` = 64 MiB,
-  on `sluice migrate` and `sluice sync start`. Bounds per-batch
-  buffered memory by total byte size in addition to the existing
-  row-count caps. Wide-row workloads (TEXT / BYTEA / JSON at MB
-  scale) no longer have to manually retune `--bulk-batch-size` /
-  `--apply-batch-size` to control heap usage; the byte cap fires
-  whichever way is tighter. The cap is a soft target — a single row
-  larger than the cap still applies. Implemented in the bulk-INSERT
-  writer, idempotent-INSERT writer, and CDC `ApplyBatch` paths for
-  both engines via the new `ir.MaxBufferBytesSetter` optional
-  surface; the COPY-protocol and LOAD DATA paths are streaming and
-  unaffected. The byte-counting helper (`approximateRowBytes`) was
-  hoisted from the pipeline to `internal/ir/bytes.go` so engine
-  packages can reuse it.
+- **`--max-buffer-bytes N` (ADR-0028).** Default `67108864` = 64 MiB, on `sluice migrate` and `sluice sync start`. Bounds per-batch buffered memory by total byte size in addition to the existing row-count caps. Wide-row workloads (TEXT / BYTEA / JSON at MB scale) no longer have to manually retune `--bulk-batch-size` / `--apply-batch-size` to control heap usage; the byte cap fires whichever way is tighter. The cap is a soft target — a single row larger than the cap still applies. Implemented in the bulk-INSERT writer, idempotent-INSERT writer, and CDC `ApplyBatch` paths for both engines via the new `ir.MaxBufferBytesSetter` optional surface; the COPY-protocol and LOAD DATA paths are streaming and unaffected. The byte-counting helper (`approximateRowBytes`) was hoisted from the pipeline to `internal/ir/bytes.go` so engine packages can reuse it.
 
-- **PG-native types auto-emit on MySQL targets.** `Inet` / `Cidr`
-  (PG → MySQL) auto-emit as `VARCHAR(45)`; `Macaddr` as
-  `VARCHAR(30)`; `Array` as `JSON` (matches the v0.5.0 Bug 14 fix
-  where array values are serialized as JSON for the writer).
-  Pre-v0.7.0 these returned an error pointing operators at
-  `--type-override`; the auto-emit removes the toil for every
-  PG→MySQL migration that touches these types. Operators wanting
-  strict syntactic validation still use `--type-override` to a
-  custom shape with their own CHECK constraint; the schema-preview
-  command (ADR-0024) surfaces the auto-emit choice so it isn't
-  silent. Closes roadmap §6.
+- **PG-native types auto-emit on MySQL targets.** `Inet` / `Cidr` (PG → MySQL) auto-emit as `VARCHAR(45)`; `Macaddr` as `VARCHAR(30)`; `Array` as `JSON` (matches the v0.5.0 Bug 14 fix where array values are serialized as JSON for the writer). Pre-v0.7.0 these returned an error pointing operators at `--type-override`; the auto-emit removes the toil for every PG→MySQL migration that touches these types. Operators wanting strict syntactic validation still use `--type-override` to a custom shape with their own CHECK constraint; the schema-preview command (ADR-0024) surfaces the auto-emit choice so it isn't silent. Closes roadmap §6.
 
-- **Throughput tuning guide** (`docs/throughput-tuning.md`).
-  Operator reference for the knobs that matter at scale —
-  `--apply-batch-size`, `--bulk-parallelism`, network compression
-  (MySQL `compress=true`, PG TLS+gss settings), and
-  `--max-buffer-bytes`. Cross-references the relevant ADRs.
+- **Throughput tuning guide** (`docs/throughput-tuning.md`). Operator reference for the knobs that matter at scale — `--apply-batch-size`, `--bulk-parallelism`, network compression (MySQL `compress=true`, PG TLS+gss settings), and `--max-buffer-bytes`. Cross-references the relevant ADRs.
 
-- **`migrate --dry-run` cross-reference to schema preview.** The
-  dry-run plan output now includes a one-line pointer to
-  `sluice schema preview` for full DDL inspection with translation
-  notes and advisory hints. Closes roadmap §10.
+- **`migrate --dry-run` cross-reference to schema preview.** The dry-run plan output now includes a one-line pointer to `sluice schema preview` for full DDL inspection with translation notes and advisory hints. Closes roadmap §10.
 
 ### Fixed
 
-- **Bug 12 — MySQL CDC silently dropped events with TIMESTAMP /
-  DATETIME / DATE columns.** The decoder for binlog row events
-  (`decodeTime` in `internal/engines/mysql/value_decode.go`) only
-  accepted `time.Time` directly — but the binlog protocol hands
-  temporal values back as their raw string form ("YYYY-MM-DD
-  HH:MM:SS[.ffffff]" / "YYYY-MM-DD") regardless of the schema-cache
-  DSN's `parseTime=true` setting. The first row event on any table
-  with a temporal column raised `cannot decode string as time.Time
-  (parseTime=true should be set)`; the binlog pump exited with that
-  error stored on the reader (only surfaced via `Err()`, not logged),
-  the change channel closed, and the applier saw zero events.
-  Symptom: cold-start bulk-copy completed cleanly, then CDC mode
-  produced no further inserts on the destination — looked exactly
-  like a network/heartbeat issue, which sent the original Bug 12
-  hypothesis chasing port-forwarding ghosts.
+- **Bug 12 — MySQL CDC silently dropped events with TIMESTAMP / DATETIME / DATE columns.** The decoder for binlog row events (`decodeTime` in `internal/engines/mysql/value_decode.go`) only accepted `time.Time` directly — but the binlog protocol hands temporal values back as their raw string form ("YYYY-MM-DD HH:MM:SS[.ffffff]" / "YYYY-MM-DD") regardless of the schema-cache DSN's `parseTime=true` setting. The first row event on any table with a temporal column raised `cannot decode string as time.Time (parseTime=true should be set)`; the binlog pump exited with that error stored on the reader (only surfaced via `Err()`, not logged), the change channel closed, and the applier saw zero events. Symptom: cold-start bulk-copy completed cleanly, then CDC mode produced no further inserts on the destination — looked exactly like a network/heartbeat issue, which sent the original Bug 12 hypothesis chasing port-forwarding ghosts.
 
-  Fix: `decodeTime` now parses MySQL's canonical temporal string
-  formats — second-precision, microsecond-precision, date-only —
-  plus byte-slice equivalents and the `0000-00-00` zero-value (maps
-  to `time.Time{}` for clean cross-engine round-trip). Regression
-  guard: `TestDecodeTimeFromString` covers all five shapes; the
-  pre-existing `TestDecodeValueErrors/timestamp_from_string` case
-  was inverted to test the unparseable-string error path instead
-  (parseable strings now succeed).
+  Fix: `decodeTime` now parses MySQL's canonical temporal string formats — second-precision, microsecond-precision, date-only — plus byte-slice equivalents and the `0000-00-00` zero-value (maps to `time.Time{}` for clean cross-engine round-trip). Regression guard: `TestDecodeTimeFromString` covers all five shapes; the pre-existing `TestDecodeValueErrors/timestamp_from_string` case was inverted to test the unparseable-string error path instead (parseable strings now succeed).
 
-  Empirical confirmation against `bug12_repro_dev.sh` (local mysql:8.0
-  containers, table with `t TIMESTAMP DEFAULT CURRENT_TIMESTAMP`):
-  pre-fix dropped 100% of CDC events on tables with a temporal
-  column; post-fix all events flow.
+  Empirical confirmation against `bug12_repro_dev.sh` (local mysql:8.0 containers, table with `t TIMESTAMP DEFAULT CURRENT_TIMESTAMP`): pre-fix dropped 100% of CDC events on tables with a temporal column; post-fix all events flow.
 
-- **Bug 15 CLI sync-stop drain (data loss in warm-up window,
-  ADR-0025).** The v0.5.0 slot-ack-after-apply work (ADR-0020)
-  closed the post-restart wedge but left a residual data-loss path
-  in the warm-up window between stream start and the first applied
-  commit. Pre-fix, `ackLSN` returned `streamedLSN` (the highest
-  commit-LSN parsed off the WAL) when the applier-feedback tracker
-  was still at zero; the keepalive routine ack'd that to the slot,
-  advancing `confirmed_flush_lsn` past events that hadn't been
-  durably applied. A subsequent `sync stop` mid-batch then lost
-  the events between persisted_position and confirmed_flush_lsn —
-  warm-resume's slot stream started past them and the rows never
-  landed. Empirical repro on local docker: 25-42 row gap with
-  `--apply-batch-size=50` and a sustained 10/sec writer.
+- **Bug 15 CLI sync-stop drain (data loss in warm-up window, ADR-0025).** The v0.5.0 slot-ack-after-apply work (ADR-0020) closed the post-restart wedge but left a residual data-loss path in the warm-up window between stream start and the first applied commit. Pre-fix, `ackLSN` returned `streamedLSN` (the highest commit-LSN parsed off the WAL) when the applier-feedback tracker was still at zero; the keepalive routine ack'd that to the slot, advancing `confirmed_flush_lsn` past events that hadn't been durably applied. A subsequent `sync stop` mid-batch then lost the events between persisted_position and confirmed_flush_lsn — warm-resume's slot stream started past them and the rows never landed. Empirical repro on local docker: 25-42 row gap with `--apply-batch-size=50` and a sustained 10/sec writer.
 
   Fix has two layers:
 
-  1. **`ackLSN` anchors at startLSN until first apply commit.** The
-     load-bearing data-correctness fix. When the tracker is fresh
-     (`applied=0`), ack returns the LSN the pump started from
-     (cold-start: snapshot LSN; warm-resume: persisted_position's
-     LSN). The slot can't advance past that point until the applier
-     reports a higher value via the tracker. One-line, one-parameter
-     change.
+  1. **`ackLSN` anchors at startLSN until first apply commit.** The load-bearing data-correctness fix. When the tracker is fresh (`applied=0`), ack returns the LSN the pump started from (cold-start: snapshot LSN; warm-resume: persisted_position's LSN). The slot can't advance past that point until the applier reports a higher value via the tracker. One-line, one-parameter change.
 
-  2. **Graceful-drain shape for `sync stop`.** The pre-fix
-     `pollStopSignal` cancelled `applyCtx`, rolling back the open
-     batch — relying on warm-resume to redeliver. With the ackLSN
-     fix that worked correctly but produced unnecessary redelivery
-     storms. Stop-signal now cancels a separate `streamCtx` (which
-     scopes the CDC reader's pump); the channel closes cleanly,
-     the applier's existing `channelClosed` branch commits the
-     in-flight partial batch, position writes naturally. A
-     30-second watchdog escalates to hard-cancelling `applyCtx` if
-     the drain wedges.
+  2. **Graceful-drain shape for `sync stop`.** The pre-fix `pollStopSignal` cancelled `applyCtx`, rolling back the open batch — relying on warm-resume to redeliver. With the ackLSN fix that worked correctly but produced unnecessary redelivery storms. Stop-signal now cancels a separate `streamCtx` (which scopes the CDC reader's pump); the channel closes cleanly, the applier's existing `channelClosed` branch commits the in-flight partial batch, position writes naturally. A 30-second watchdog escalates to hard-cancelling `applyCtx` if the drain wedges.
 
-  Unit-level regression guard: `TestAckLSN_AnchorsAtStartLSNUntilFirstApply`
-  pins the contract. Empirical integration repro lives at
-  `sluice-testing/workspace/bug15_repro_dev.sh` (sustained
-  writer, mid-stream `sync stop`): pre-fix dropped 25-42 rows;
-  post-fix drops 0. The existing programmatic-RequestStop integration
-  test (`TestStreamer_PostgresToPostgres_StopRestartNoLoss`) still
-  passes — it happened to time RequestStop past first-batch commit,
-  masking the warm-up window. See ADR-0025.
+  Unit-level regression guard: `TestAckLSN_AnchorsAtStartLSNUntilFirstApply` pins the contract. Empirical integration repro lives at `sluice-testing/workspace/bug15_repro_dev.sh` (sustained writer, mid-stream `sync stop`): pre-fix dropped 25-42 rows; post-fix drops 0. The existing programmatic-RequestStop integration test (`TestStreamer_PostgresToPostgres_StopRestartNoLoss`) still passes — it happened to time RequestStop past first-batch commit, masking the warm-up window. See ADR-0025.
 
-- **Windows CI: `TestPreviewer_Golden_Text` fails with CRLF/LF
-  mismatch.** The test compared `bytes.Equal(buf.Bytes(), want)` —
-  buffer with LF newlines (Go's native `\n`) vs. file content that
-  git's default `core.autocrlf=true` had converted to CRLF on
-  Windows checkouts. The diff showed visually identical content;
-  byte comparison failed.
+- **Windows CI: `TestPreviewer_Golden_Text` fails with CRLF/LF mismatch.** The test compared `bytes.Equal(buf.Bytes(), want)` — buffer with LF newlines (Go's native `\n`) vs. file content that git's default `core.autocrlf=true` had converted to CRLF on Windows checkouts. The diff showed visually identical content; byte comparison failed.
 
-  Two-part fix:
-  1. New `.gitattributes` enforces `eol=lf` on text files so
-     Windows checkouts no longer get CRLF on golden fixtures.
-  2. The test normalises CRLF→LF on the read side before comparing
-     — belt-and-suspenders against any future checkout that
-     bypasses the attribute (e.g. zip-download, alternate clones).
+  Two-part fix: 1. New `.gitattributes` enforces `eol=lf` on text files so Windows checkouts no longer get CRLF on golden fixtures. 2. The test normalises CRLF→LF on the read side before comparing — belt-and-suspenders against any future checkout that bypasses the attribute (e.g. zip-download, alternate clones).
 
   No behavioural change to runtime code; CI-only fix.
 
@@ -6365,1110 +4812,344 @@ Feature release. Headline additions are `sluice schema preview` (operator-facing
 
 ### Fixed
 
-- **Data race in parallel-copy state-write path.** v0.5.0's
-  `migrate_parallel.go::copyChunk` checkpoint sites took `stateMu`,
-  mutated their slot in `state.TableProgress`, then did a shallow
-  copy `stateCopy := *state` and released the lock before calling
-  `writeState`. The shallow copy left `stateCopy.TableProgress`
-  pointing at the same map backing storage as `state`, so the JSON
-  encoder iterating outside the lock raced peer chunk goroutines
-  taking the lock to mutate their own slots. Surfaced as a CI -race
-  failure in `TestMigrate_PG_ParallelCopy_Resume` for the v0.5.x
-  releases.
+- **Data race in parallel-copy state-write path.** v0.5.0's `migrate_parallel.go::copyChunk` checkpoint sites took `stateMu`, mutated their slot in `state.TableProgress`, then did a shallow copy `stateCopy := *state` and released the lock before calling `writeState`. The shallow copy left `stateCopy.TableProgress` pointing at the same map backing storage as `state`, so the JSON encoder iterating outside the lock raced peer chunk goroutines taking the lock to mutate their own slots. Surfaced as a CI -race failure in `TestMigrate_PG_ParallelCopy_Resume` for the v0.5.x releases.
 
-  Fix: a `cloneStateForWrite` helper re-allocates the
-  `TableProgress` map and each entry's `Chunks` slice under the
-  lock; the encoder gets a fully independent snapshot. Per-chunk
-  reference fields (`LowerPK`/`UpperPK`/`LastPK`) are not deep-
-  cloned because they're either written once at resolution time or
-  replaced wholesale (not mutated in place) on each checkpoint.
-  Pre-existing behaviour preserved bit-for-bit; the fix is sync-
-  primitive-only.
+  Fix: a `cloneStateForWrite` helper re-allocates the `TableProgress` map and each entry's `Chunks` slice under the lock; the encoder gets a fully independent snapshot. Per-chunk reference fields (`LowerPK`/`UpperPK`/`LastPK`) are not deep- cloned because they're either written once at resolution time or replaced wholesale (not mutated in place) on each checkpoint. Pre-existing behaviour preserved bit-for-bit; the fix is sync- primitive-only.
 
-- **Two parallel-copy hygiene follow-ups.** `progressTicker.startedAt`
-  swaps the `Load → Store` check-then-set for an `atomic.CompareAndSwap`
-  so the contract stays correct if `loop` ever runs from multiple
-  goroutines (single-goroutine today; one-line future-proofing).
-  `kickOffRowCount` now suppresses the `row-count probe failed`
-  WARN when the parent context was already cancelled, and skips
-  the `setTotalRows` store when the ticker is already stopped —
-  removes interleaved teardown-time noise during test cleanup.
+- **Two parallel-copy hygiene follow-ups.** `progressTicker.startedAt` swaps the `Load → Store` check-then-set for an `atomic.CompareAndSwap` so the contract stays correct if `loop` ever runs from multiple goroutines (single-goroutine today; one-line future-proofing). `kickOffRowCount` now suppresses the `row-count probe failed` WARN when the parent context was already cancelled, and skips the `setTotalRows` store when the ticker is already stopped — removes interleaved teardown-time noise during test cleanup.
 
 ### Added
 
-- **`sluice schema preview` subcommand.** Reads the source schema,
-  applies the translation pipeline (mappings + cross-engine type
-  policy), and emits the target DDL with inline cross-engine
-  translation notes and advisory hints — without touching either
-  database's data. Operators see exactly what the target schema will
-  look like before any migration runs, including the `--type-override`
-  invocation for known operator-preferable alternatives (e.g. PG
-  `uuid` → MySQL `BINARY(16)` instead of the default `CHAR(36)`).
-  Supports `--format text|json`, `--include-table`/`--exclude-table`,
-  `--type-override`, and `--output FILE` (atomic temp-file +
-  rename, so a Ctrl-C mid-write never corrupts the destination).
-  New `ir.DDLPreviewer` engine surface; both Postgres and MySQL
-  implement it on the same struct as their `SchemaWriter` (the
-  emitTableDef/emitCreateIndex/emitAddForeignKey helpers are now
-  shared between the execute and preview paths). Initial advisory-
-  hints registry seeds five high-traffic surprises from real-world
-  testing reports (UUID, large-TEXT, JSON-vs-JSONB note, DATETIME
-  timezone, unbounded numeric). Translate package gains
-  `binary_uuid`, `mediumtext`, `timestamptz`, and parameterised
-  `decimal` aliases to support the suggested overrides. See
-  ADR-0024.
+- **`sluice schema preview` subcommand.** Reads the source schema, applies the translation pipeline (mappings + cross-engine type policy), and emits the target DDL with inline cross-engine translation notes and advisory hints — without touching either database's data. Operators see exactly what the target schema will look like before any migration runs, including the `--type-override` invocation for known operator-preferable alternatives (e.g. PG `uuid` → MySQL `BINARY(16)` instead of the default `CHAR(36)`). Supports `--format text|json`, `--include-table`/`--exclude-table`, `--type-override`, and `--output FILE` (atomic temp-file + rename, so a Ctrl-C mid-write never corrupts the destination). New `ir.DDLPreviewer` engine surface; both Postgres and MySQL implement it on the same struct as their `SchemaWriter` (the emitTableDef/emitCreateIndex/emitAddForeignKey helpers are now shared between the execute and preview paths). Initial advisory- hints registry seeds five high-traffic surprises from real-world testing reports (UUID, large-TEXT, JSON-vs-JSONB note, DATETIME timezone, unbounded numeric). Translate package gains `binary_uuid`, `mediumtext`, `timestamptz`, and parameterised `decimal` aliases to support the suggested overrides. See ADR-0024.
 
-- **`--reset-target-data` for destructive recovery.** New flag on
-  `sluice migrate` and `sluice sync start` that DELETEs the
-  bookkeeping row (`sluice_migrate_state` / `sluice_cdc_state`),
-  DROPs every source-schema table on the target, then proceeds with
-  cold-start. Collapses the post-`slot drop` recovery flow to a
-  single command (no more enumerating tables for `DROP TABLE`).
-  Confirmation prompt requires the operator to type `reset`
-  verbatim — bypassed by `--yes` for non-interactive use. Mutually
-  exclusive with `--resume` at parse time. New optional engine
-  surfaces: `ir.TableDropper`, `ir.StreamCleaner`, and
-  `ir.MigrationStateStore.ClearMigration`. See ADR-0023.
+- **`--reset-target-data` for destructive recovery.** New flag on `sluice migrate` and `sluice sync start` that DELETEs the bookkeeping row (`sluice_migrate_state` / `sluice_cdc_state`), DROPs every source-schema table on the target, then proceeds with cold-start. Collapses the post-`slot drop` recovery flow to a single command (no more enumerating tables for `DROP TABLE`). Confirmation prompt requires the operator to type `reset` verbatim — bypassed by `--yes` for non-interactive use. Mutually exclusive with `--resume` at parse time. New optional engine surfaces: `ir.TableDropper`, `ir.StreamCleaner`, and `ir.MigrationStateStore.ClearMigration`. See ADR-0023.
 
-  An additional optional surface, `ir.BulkTableDropper`, lets
-  engines collapse the per-table DROP loop into one statement —
-  the recovery flow on a 500-table source pays one network round-
-  trip instead of 500. Both Postgres (`DROP TABLE … CASCADE`) and
-  MySQL (`DROP TABLE …`) implement the bulk path; engines without
-  it fall back to per-table `DropTable` automatically. Audit log
-  lines name every dropped table on either path.
+  An additional optional surface, `ir.BulkTableDropper`, lets engines collapse the per-table DROP loop into one statement — the recovery flow on a 500-table source pays one network round- trip instead of 500. Both Postgres (`DROP TABLE … CASCADE`) and MySQL (`DROP TABLE …`) implement the bulk path; engines without it fall back to per-table `DropTable` automatically. Audit log lines name every dropped table on either path.
 
-  `docs/postgres-source-prep.md` cross-references the flag from the
-  `wal_status='lost'` recovery section so the doc trail through the
-  destructive-recovery flow stays connected.
+  `docs/postgres-source-prep.md` cross-references the flag from the `wal_status='lost'` recovery section so the doc trail through the destructive-recovery flow stays connected.
 
-- **Batched-apply idle flush on quiet streams.** Closes the trailing-
-  row latency footnote from ADR-0020. The batched applier now commits
-  a partial in-flight batch (n < `--apply-batch-size`) within
-  `defaultIdleFlushPeriod` (5s) when no further change arrives. On
-  Postgres this lets the slot's `confirmed_flush_lsn` advance past
-  in-flight work on idle streams, so warm-resume from a quiet stream
-  starts at the most recent commit rather than the previous full
-  batch boundary; on MySQL the same logic keeps `source_position`
-  current so the replay window on warm-resume stays bounded. Both
-  engines use the same 5s default for symmetry. Existing flush
-  triggers (channel close, Truncate, ctx cancel) are unchanged; idle
-  flush is purely additive. Integration test:
-  `TestChangeApplier_ApplyBatch_IdleFlushCommitsPartial` (PG;
-  partial-batch persistence on MySQL was already covered by
-  `TestChangeApplier_ApplyBatch_PartialFlushPersistsPosition`).
+- **Batched-apply idle flush on quiet streams.** Closes the trailing- row latency footnote from ADR-0020. The batched applier now commits a partial in-flight batch (n < `--apply-batch-size`) within `defaultIdleFlushPeriod` (5s) when no further change arrives. On Postgres this lets the slot's `confirmed_flush_lsn` advance past in-flight work on idle streams, so warm-resume from a quiet stream starts at the most recent commit rather than the previous full batch boundary; on MySQL the same logic keeps `source_position` current so the replay window on warm-resume stays bounded. Both engines use the same 5s default for symmetry. Existing flush triggers (channel close, Truncate, ctx cancel) are unchanged; idle flush is purely additive. Integration test: `TestChangeApplier_ApplyBatch_IdleFlushCommitsPartial` (PG; partial-batch persistence on MySQL was already covered by `TestChangeApplier_ApplyBatch_PartialFlushPersistsPosition`).
 
-- **MySQL binlog-purged fall-through to cold-start.** Extends the
-  v0.5.2 PG slot-missing recovery to the MySQL side. The MySQL CDC
-  reader's `resolveStartPosition` now pre-flights the persisted
-  position before handing off to go-mysql's binlog syncer:
-  - **File/pos mode**: queries `SHOW BINARY LOGS` and checks the
-    persisted file is still present. If missing (typical when
-    `expire_logs_seconds` rolled it off, or an operator ran
-    `PURGE BINARY LOGS`), returns
-    `mysql: binlog file %q is no longer available on the source
-    (purged); cannot resume: ir: persisted position is no longer
-    valid`.
-  - **GTID mode**: runs `SELECT GTID_SUBSET(@@gtid_purged, ?)` with
-    the resume set. Returns 0 when the source has purged GTIDs the
-    resume set hasn't consumed — meaning we'd be missing data on
-    resume — and surfaces `mysql: source has purged GTIDs not
-    present in resume set; cannot resume`.
+- **MySQL binlog-purged fall-through to cold-start.** Extends the v0.5.2 PG slot-missing recovery to the MySQL side. The MySQL CDC reader's `resolveStartPosition` now pre-flights the persisted position before handing off to go-mysql's binlog syncer:
+  - **File/pos mode**: queries `SHOW BINARY LOGS` and checks the persisted file is still present. If missing (typical when `expire_logs_seconds` rolled it off, or an operator ran `PURGE BINARY LOGS`), returns `mysql: binlog file %q is no longer available on the source (purged); cannot resume: ir: persisted position is no longer valid`.
+  - **GTID mode**: runs `SELECT GTID_SUBSET(@@gtid_purged, ?)` with the resume set. Returns 0 when the source has purged GTIDs the resume set hasn't consumed — meaning we'd be missing data on resume — and surfaces `mysql: source has purged GTIDs not present in resume set; cannot resume`.
 
-  Both branches wrap with `ir.ErrPositionInvalid`; the streamer's
-  existing v0.5.2 fall-through (added engine-neutrally) detects the
-  sentinel and re-enters `coldStart` with the same `lsnTracker`.
-  No new code in the pipeline package; the engine-neutrality of the
-  v0.5.2 design pays off here. ADR-0022 extended.
+  Both branches wrap with `ir.ErrPositionInvalid`; the streamer's existing v0.5.2 fall-through (added engine-neutrally) detects the sentinel and re-enters `coldStart` with the same `lsnTracker`. No new code in the pipeline package; the engine-neutrality of the v0.5.2 design pays off here. ADR-0022 extended.
 
-  Pre-fix shape: a sluice stream restarted after the source's
-  binlog had rotated past the persisted file would surface
-  go-mysql's raw "Could not find first log file name in binary log
-  index file" error mid-stream. Post-fix: the WARN fires at startup,
-  cold-start runs, dest is reseeded.
+  Pre-fix shape: a sluice stream restarted after the source's binlog had rotated past the persisted file would surface go-mysql's raw "Could not find first log file name in binary log index file" error mid-stream. Post-fix: the WARN fires at startup, cold-start runs, dest is reseeded.
 
-  Integration test:
-  `TestStreamer_MySQLToMySQL_BinlogPurgedFallsThroughToColdStart`
-  exercises the file/pos branch end-to-end. GTID branch is covered
-  by the same `verifyPositionResumable` dispatch and the SQL-side
-  semantics of `GTID_SUBSET` (no separate integration test;
-  GTID-mode setups are tested elsewhere in the resume coverage).
+  Integration test: `TestStreamer_MySQLToMySQL_BinlogPurgedFallsThroughToColdStart` exercises the file/pos branch end-to-end. GTID branch is covered by the same `verifyPositionResumable` dispatch and the SQL-side semantics of `GTID_SUBSET` (no separate integration test; GTID-mode setups are tested elsewhere in the resume coverage).
 
 ## [0.5.2] - 2026-05-05
 
-Single-feature patch release closing Item F from the v0.4.0
-real-world testing report: PG CDC streams whose replication slot
-was dropped (typically after `wal_status='lost'`) now recover via
-auto-fall-through to cold-start instead of erroring out with no
-flag to bypass.
+Single-feature patch release closing Item F from the v0.4.0 real-world testing report: PG CDC streams whose replication slot was dropped (typically after `wal_status='lost'`) now recover via auto-fall-through to cold-start instead of erroring out with no flag to bypass.
 
 ### Added
 
-- **Slot-missing fall-through to cold-start (Item F).** When a
-  Postgres CDC stream's persisted position references a replication
-  slot that no longer exists on the source — typically because the
-  operator dropped it after sluice surfaced `wal_status='lost'` —
-  the streamer now logs a loud WARN naming the slot + persisted LSN,
-  then falls through to the cold-start path automatically. No flag
-  required; no manual `DELETE FROM sluice_cdc_state` step. Bug 9's
-  pre-flight refusal still gates populated-dest operations, so
-  operators who want a fresh bulk-copy still pass `--force-cold-start`
-  or drop dest tables manually. The fall-through is engine-neutral:
-  CDC readers signal the condition via `ir.ErrPositionInvalid`
-  (wrapped on their specific diagnostic via `%w`); the pipeline
-  detects it via `errors.Is`. PG slot-missing is the only emitter
-  in this release; MySQL binlog-purged is queued as a follow-up.
-  See ADR-0022.
+- **Slot-missing fall-through to cold-start (Item F).** When a Postgres CDC stream's persisted position references a replication slot that no longer exists on the source — typically because the operator dropped it after sluice surfaced `wal_status='lost'` — the streamer now logs a loud WARN naming the slot + persisted LSN, then falls through to the cold-start path automatically. No flag required; no manual `DELETE FROM sluice_cdc_state` step. Bug 9's pre-flight refusal still gates populated-dest operations, so operators who want a fresh bulk-copy still pass `--force-cold-start` or drop dest tables manually. The fall-through is engine-neutral: CDC readers signal the condition via `ir.ErrPositionInvalid` (wrapped on their specific diagnostic via `%w`); the pipeline detects it via `errors.Is`. PG slot-missing is the only emitter in this release; MySQL binlog-purged is queued as a follow-up. See ADR-0022.
 
-  Recovery flow before this fix: drop slot → DELETE cdc_state row
-  → drop publication → drop dest tables (or `--force-cold-start`)
-  → re-run sluice. With this fix: drop slot → drop dest tables
-  (or `--force-cold-start`) → re-run sluice. The two manual SQL
-  steps disappear.
+  Recovery flow before this fix: drop slot → DELETE cdc_state row → drop publication → drop dest tables (or `--force-cold-start`) → re-run sluice. With this fix: drop slot → drop dest tables (or `--force-cold-start`) → re-run sluice. The two manual SQL steps disappear.
 
-  Integration test:
-  `TestStreamer_PostgresToPostgres_SlotMissingFallsThroughToColdStart`.
+  Integration test: `TestStreamer_PostgresToPostgres_SlotMissingFallsThroughToColdStart`.
 
 ## [0.5.1] - 2026-05-05
 
-Single-issue patch release fixing a misleading flag name in the
-Postgres `wal_status='unreserved'`/`'lost'` recovery hint. No
-behavioural change.
+Single-issue patch release fixing a misleading flag name in the Postgres `wal_status='unreserved'`/`'lost'` recovery hint. No behavioural change.
 
 ### Fixed
 
-- **`wal_status` recovery hint named `--target` instead of
-  `--source` (Item F).** When sluice refused to start CDC against an
-  invalidated slot, the error message pointed operators at
-  `sluice slot drop <name> --target ...`. The slot lives on the
-  *source* database and `slot drop`'s actual flag is `--source` —
-  operators following the hint hit a flag-not-found error and had
-  to consult `slot drop --help` to recover. Both the `unreserved`
-  and `lost` branches of `checkSlotUsable` now emit
-  `--source-driver=postgres --source ...`. `docs/postgres-source-prep.md`
-  is corrected in lockstep. Real-world testing surfaced this as the
-  one polish item against an otherwise gold-standard error message.
-  Test coverage extended to assert the recovery hint references
-  `--source` so the regression doesn't return.
+- **`wal_status` recovery hint named `--target` instead of `--source` (Item F).** When sluice refused to start CDC against an invalidated slot, the error message pointed operators at `sluice slot drop <name> --target ...`. The slot lives on the *source* database and `slot drop`'s actual flag is `--source` — operators following the hint hit a flag-not-found error and had to consult `slot drop --help` to recover. Both the `unreserved` and `lost` branches of `checkSlotUsable` now emit `--source-driver=postgres --source ...`. `docs/postgres-source-prep.md` is corrected in lockstep. Real-world testing surfaced this as the one polish item against an otherwise gold-standard error message. Test coverage extended to assert the recovery hint references `--source` so the regression doesn't return.
 
 ## [0.5.0] - 2026-05-05
 
-Reliability + performance release. Headline feature is parallel
-within-table bulk copy (the pgcopydb-class signature win for multi-TB
-migrations), throughput metrics extended to MB/s + ETA, plus four
-fixes uncovered during real-world v0.4.0 soak testing — one of which
-(Bug 15) was a CRITICAL silent-data-loss path on Postgres CDC. Three
-new ADRs (0019, 0020, 0021).
+Reliability + performance release. Headline feature is parallel within-table bulk copy (the pgcopydb-class signature win for multi-TB migrations), throughput metrics extended to MB/s + ETA, plus four fixes uncovered during real-world v0.4.0 soak testing — one of which (Bug 15) was a CRITICAL silent-data-loss path on Postgres CDC. Three new ADRs (0019, 0020, 0021).
 
 ### Added — performance
 
-- **Parallel within-table bulk copy.** Tables above
-  `--bulk-parallel-min-rows` (default 100k) with a single integer PK
-  are now split into N PK ranges and copied concurrently, with per-
-  chunk cursor checkpoints in `sluice_migrate_state`. Tables below
-  the threshold, with composite PKs, or without a PK fall through to
-  the v0.4.x single-reader behaviour. Postgres readers share a single
-  exported snapshot via `SET TRANSACTION SNAPSHOT` (`SnapshotImporter`
-  optional engine surface) so all chunks see a consistent view; MySQL
-  uses per-chunk `REPEATABLE READ` transactions because per-session
-  REPEATABLE-READ snapshots have no shareable name. Boundaries are
-  computed once via `MIN`/`MAX` on the PK and persisted, so a resume
-  run aligns exactly with completed chunks rather than recomputing
-  ranges (which would shift if rows landed concurrently). New flags:
-  `--bulk-parallelism` (default `min(8, NumCPU)`) and
-  `--bulk-parallel-min-rows`. See ADR-0019.
-- **Throughput metrics: MB/s + ETA.** The bulk-copy progress ticker
-  now emits `total_rows`, `bytes`, `rate_mb_per_sec`, and
-  `eta_seconds` alongside the existing `rows`/`rate` attributes;
-  per-chunk progress lines carry a `chunk=` attribute so operators
-  can see which range is in flight. Row-byte estimation walks the
-  `ir.Row` value-side: string/`[]byte` by length, fixed-width
-  numerics by Go size, `time.Time` as 24, bool as 1, recursive on
-  `[]any`/`[]string`. Approximate but stable enough that MB/s tracks
-  observed network throughput within a few percent.
-- **`CountRows` / `RangeBounds` optional engine surfaces.** Postgres
-  estimates row counts via `pg_class.reltuples` (autovacuum-
-  maintained); MySQL via `information_schema.TABLE_ROWS`. Both short-
-  circuit when called against a snapshot-pinned reader where a
-  concurrent query would deadlock the single shared connection. The
-  ETA computation falls back gracefully when the surface isn't
-  available.
+- **Parallel within-table bulk copy.** Tables above `--bulk-parallel-min-rows` (default 100k) with a single integer PK are now split into N PK ranges and copied concurrently, with per- chunk cursor checkpoints in `sluice_migrate_state`. Tables below the threshold, with composite PKs, or without a PK fall through to the v0.4.x single-reader behaviour. Postgres readers share a single exported snapshot via `SET TRANSACTION SNAPSHOT` (`SnapshotImporter` optional engine surface) so all chunks see a consistent view; MySQL uses per-chunk `REPEATABLE READ` transactions because per-session REPEATABLE-READ snapshots have no shareable name. Boundaries are computed once via `MIN`/`MAX` on the PK and persisted, so a resume run aligns exactly with completed chunks rather than recomputing ranges (which would shift if rows landed concurrently). New flags: `--bulk-parallelism` (default `min(8, NumCPU)`) and `--bulk-parallel-min-rows`. See ADR-0019.
+- **Throughput metrics: MB/s + ETA.** The bulk-copy progress ticker now emits `total_rows`, `bytes`, `rate_mb_per_sec`, and `eta_seconds` alongside the existing `rows`/`rate` attributes; per-chunk progress lines carry a `chunk=` attribute so operators can see which range is in flight. Row-byte estimation walks the `ir.Row` value-side: string/`[]byte` by length, fixed-width numerics by Go size, `time.Time` as 24, bool as 1, recursive on `[]any`/`[]string`. Approximate but stable enough that MB/s tracks observed network throughput within a few percent.
+- **`CountRows` / `RangeBounds` optional engine surfaces.** Postgres estimates row counts via `pg_class.reltuples` (autovacuum- maintained); MySQL via `information_schema.TABLE_ROWS`. Both short- circuit when called against a snapshot-pinned reader where a concurrent query would deadlock the single shared connection. The ETA computation falls back gracefully when the surface isn't available.
 
 ### Fixed
 
-- **Postgres CDC: slot ack advanced before apply commit (Bug 15,
-  CRITICAL — silent data loss on crash).** The PG CDC reader was
-  sending the *streamed* LSN in `StandbyStatusUpdate`, so a crash
-  between `Send` and `tx.Commit` advanced `confirmed_flush_lsn` past
-  events that were never applied — and a warm resume started at the
-  acked position, dropping the in-flight batch on the floor. Real-
-  world soak observed silent row drift after a clean stop/restart
-  cycle when the streamer happened to interrupt a partial batch.
+- **Postgres CDC: slot ack advanced before apply commit (Bug 15, CRITICAL — silent data loss on crash).** The PG CDC reader was sending the *streamed* LSN in `StandbyStatusUpdate`, so a crash between `Send` and `tx.Commit` advanced `confirmed_flush_lsn` past events that were never applied — and a warm resume started at the acked position, dropping the in-flight batch on the floor. Real- world soak observed silent row drift after a clean stop/restart cycle when the streamer happened to interrupt a partial batch.
 
-  Fix: a single-producer/single-consumer `lsnTracker` plumbed
-  engine-neutrally via `lsnTrackerProvider`/`lsnTrackerAttacher`
-  structural interfaces. The applier reports `appliedLSN` after
-  `tx.Commit()`; the reader sends `min(streamed, applied)` in the
-  next status update. Trailing-row latency under `--apply-batch-size
+  Fix: a single-producer/single-consumer `lsnTracker` plumbed engine-neutrally via `lsnTrackerProvider`/`lsnTrackerAttacher` structural interfaces. The applier reports `appliedLSN` after `tx.Commit()`; the reader sends `min(streamed, applied)` in the next status update. Trailing-row latency under `--apply-batch-size
   > 1` is bounded by the batch interval since the LSN only advances
-  on commit boundaries — acceptable today; idle-flush is on the
-  roadmap. See ADR-0020.
+  on commit boundaries — acceptable today; idle-flush is on the roadmap. See ADR-0020.
 
-  Integration test: `TestStreamer_PostgresToPostgres_StopRestartNoLoss`
-  exercises a stop in the middle of a batched apply and asserts
-  every source change lands on the target after warm resume.
+  Integration test: `TestStreamer_PostgresToPostgres_StopRestartNoLoss` exercises a stop in the middle of a batched apply and asserts every source change lands on the target after warm resume.
 
-- **Postgres CDC: publication scope was `FOR ALL TABLES` (Bug 13).**
-  The v0.4.0 publication was created `FOR ALL TABLES`, so a brand-
-  new unrelated table on the source — created after sluice started
-  streaming — would land in the pgoutput stream. The applier either
-  crashed on the unknown table OID or, worse, silently dropped the
-  events.
+- **Postgres CDC: publication scope was `FOR ALL TABLES` (Bug 13).** The v0.4.0 publication was created `FOR ALL TABLES`, so a brand- new unrelated table on the source — created after sluice started streaming — would land in the pgoutput stream. The applier either crashed on the unknown table OID or, worse, silently dropped the events.
 
-  Fix: `Engine.EnsurePublication(ctx, dsn, tables)` now creates
-  `FOR TABLE <list>` from the resolved migration set after
-  `applyTableFilter`. Existing v0.4.0 `FOR ALL TABLES` publications
-  are migrated by drop-and-recreate during cold start (the slot is
-  unaffected; only the publication is replaced). The applier now
-  has defence-in-depth: an unknown table OID is logged at WARN and
-  the change is skipped rather than crashing the stream. See
-  ADR-0021.
+  Fix: `Engine.EnsurePublication(ctx, dsn, tables)` now creates `FOR TABLE <list>` from the resolved migration set after `applyTableFilter`. Existing v0.4.0 `FOR ALL TABLES` publications are migrated by drop-and-recreate during cold start (the slot is unaffected; only the publication is replaced). The applier now has defence-in-depth: an unknown table OID is logged at WARN and the change is skipped rather than crashing the stream. See ADR-0021.
 
-  Integration test: `TestStreamer_PostgresToPostgres_NewTableOnSourceIgnored`
-  creates a fresh table on the source mid-stream and asserts the
-  applier ignores it.
+  Integration test: `TestStreamer_PostgresToPostgres_NewTableOnSourceIgnored` creates a fresh table on the source mid-stream and asserts the applier ignores it.
 
-- **PG array → MySQL JSON conversion (Bug 14).** A PG source column
-  of array type (e.g. `text[]`, `int[]`) migrating to a MySQL JSON
-  target arrived at the writer as `[]any`, a PG-array literal string
-  (`{a,b,c}`), or `[]byte` holding the same — none of which MySQL's
-  driver knows how to bind to a JSON column. `prepareValue` now
-  branches `convertArrayLikeToJSON` for all three shapes. Empty
-  arrays serialize as `[]` (disambiguated from `{}`, which would be a
-  JSON object). Integration test:
-  `TestMigrate_PostgresToMySQL_ArrayToJSONOverride`.
+- **PG array → MySQL JSON conversion (Bug 14).** A PG source column of array type (e.g. `text[]`, `int[]`) migrating to a MySQL JSON target arrived at the writer as `[]any`, a PG-array literal string (`{a,b,c}`), or `[]byte` holding the same — none of which MySQL's driver knows how to bind to a JSON column. `prepareValue` now branches `convertArrayLikeToJSON` for all three shapes. Empty arrays serialize as `[]` (disambiguated from `{}`, which would be a JSON object). Integration test: `TestMigrate_PostgresToMySQL_ArrayToJSONOverride`.
 
-- **MySQL CDC: silent stalls on quiet upstream (Bug 12).**
-  go-mysql's binlog syncer can hang silently if the upstream goes
-  quiet for long enough that the TCP keepalive doesn't fire — the
-  reader has no signal to distinguish "no events" from "connection
-  dead". v0.5.0 sets `defaultBinlogHeartbeatPeriod = 10s` on the
-  syncer so the upstream emits keep-alive heartbeats, and adds a
-  30s no-events watchdog that surfaces a stalled-stream error if no
-  row-relevant event arrives in that window (filtered by
-  `isRowRelevantEvent` so heartbeat and rotation events don't reset
-  the timer indefinitely, which would mask a real stall). Not
-  reproducible in CI without a multi-minute idle, so manually
-  validated against real PlanetScale/vanilla MySQL streams.
+- **MySQL CDC: silent stalls on quiet upstream (Bug 12).** go-mysql's binlog syncer can hang silently if the upstream goes quiet for long enough that the TCP keepalive doesn't fire — the reader has no signal to distinguish "no events" from "connection dead". v0.5.0 sets `defaultBinlogHeartbeatPeriod = 10s` on the syncer so the upstream emits keep-alive heartbeats, and adds a 30s no-events watchdog that surfaces a stalled-stream error if no row-relevant event arrives in that window (filtered by `isRowRelevantEvent` so heartbeat and rotation events don't reset the timer indefinitely, which would mask a real stall). Not reproducible in CI without a multi-minute idle, so manually validated against real PlanetScale/vanilla MySQL streams.
 
 ### Added — architecture documentation
 
 Three new ADRs in `docs/adr/`:
 
-- **ADR-0019**: Parallel within-table bulk copy — chunk-boundary
-  computation, snapshot-import strategy per engine, boundary
-  stability invariant, fallback matrix.
-- **ADR-0020**: Slot-ack-after-apply — LSN tracker design, SPSC
-  contract, why `min(streamed, applied)` instead of just `applied`,
-  trailing-row latency tradeoff.
-- **ADR-0021**: Publication scope by table — `FOR TABLE <list>`
-  rationale, drop-and-recreate migration from v0.4.0 publications,
-  applier defence-in-depth on unknown OIDs.
+- **ADR-0019**: Parallel within-table bulk copy — chunk-boundary computation, snapshot-import strategy per engine, boundary stability invariant, fallback matrix.
+- **ADR-0020**: Slot-ack-after-apply — LSN tracker design, SPSC contract, why `min(streamed, applied)` instead of just `applied`, trailing-row latency tradeoff.
+- **ADR-0021**: Publication scope by table — `FOR TABLE <list>` rationale, drop-and-recreate migration from v0.4.0 publications, applier defence-in-depth on unknown OIDs.
 
 ## [0.4.0] - 2026-05-04
 
-Feature release with four substantive responses to measured production
-concerns from the v0.3.x robustness testing rounds, plus three new
-ADRs (0016, 0017, 0018) documenting the design decisions.
+Feature release with four substantive responses to measured production concerns from the v0.3.x robustness testing rounds, plus three new ADRs (0016, 0017, 0018) documenting the design decisions.
 
 ### Added — performance
 
-- **`--apply-batch-size N`** on `sluice sync start` (and
-  `Streamer.ApplyBatchSize` for programmatic callers) batches up to N
-  CDC changes per target transaction with the position write of the
-  last change in the batch. Default 1 keeps v0.3.x conservative
-  one-change-per-tx behaviour; production tuning is 100–500. v0.3.0
-  testing measured the per-change applier at ~6.5 rows/sec on
-  PG→MySQL CDC with a 5000-row source transaction; batched mode
-  amortises commit overhead 50–100× on production hardware (3.5×
-  observed locally without fsync). Idempotency preserved via the
-  existing ON CONFLICT / ON DUPLICATE KEY UPDATE semantics on
-  Insert. Schema-change events (Truncate, DDL) flush the in-flight
-  batch before applying. See ADR-0017.
-- **`--bulk-batch-size N`** on `sluice migrate` (default 5000)
-  controls the per-batch checkpointing size for resume. Cold-start
-  migrations continue to use the faster plain-INSERT (and PG COPY)
-  path with no per-batch overhead.
+- **`--apply-batch-size N`** on `sluice sync start` (and `Streamer.ApplyBatchSize` for programmatic callers) batches up to N CDC changes per target transaction with the position write of the last change in the batch. Default 1 keeps v0.3.x conservative one-change-per-tx behaviour; production tuning is 100–500. v0.3.0 testing measured the per-change applier at ~6.5 rows/sec on PG→MySQL CDC with a 5000-row source transaction; batched mode amortises commit overhead 50–100× on production hardware (3.5× observed locally without fsync). Idempotency preserved via the existing ON CONFLICT / ON DUPLICATE KEY UPDATE semantics on Insert. Schema-change events (Truncate, DDL) flush the in-flight batch before applying. See ADR-0017.
+- **`--bulk-batch-size N`** on `sluice migrate` (default 5000) controls the per-batch checkpointing size for resume. Cold-start migrations continue to use the faster plain-INSERT (and PG COPY) path with no per-batch overhead.
 
 ### Added — operability
 
-- **Per-batch checkpointing for `sluice migrate --resume`.**
-  Previously, resume on an in-progress table truncated and re-copied
-  from row 0. v0.4.0 tracks a per-table PK cursor in
-  `sluice_migrate_state.table_progress`, reads the source via
-  `WHERE pk > cursor ORDER BY pk LIMIT batch_size`, and applies
-  rows with `ON CONFLICT` / `ON DUPLICATE KEY UPDATE` so the brief
-  replay window between batch commit and cursor write is tolerated
-  cleanly. Multi-hour copies of 100M+ row tables can resume mid-
-  table. Composite PKs descend via row-comparison cursors
-  (`(a,b) > ($1,$2) ORDER BY a,b`). Tables without a PK fall back
-  to the v0.3.0 truncate-and-redo behaviour with a clear log line.
-  v0.3.0-shape state rows are read backward-compatibly. See
-  ADR-0018.
-- **Cross-engine expression translation for generated columns and
-  CHECK constraints.** v0.3.2's verbatim-passthrough policy held
-  the fail-loud claim (no silent corruption), but the set of
-  "non-portable" expressions included very common idioms.
-  Bidirectional translation pass at the writer boundary now covers:
-  - **MySQL → Postgres**: `CONCAT(a,b)` → `(a || b)`, `IFNULL` →
-    `COALESCE`, `IF(cond,a,b)` → `CASE WHEN cond THEN a ELSE b END`,
-    `JSON_UNQUOTE(JSON_EXTRACT(j,'$.k'))` → `(j->>'k')`,
-    `JSON_EXTRACT(j,'$.k')` → `(j->'k')`.
-  - **Postgres → MySQL**: `(expr)::type` → `CAST(expr AS …)`,
-    `a || b` → `CONCAT(a, b)`, `~~`/`~~*` → `LIKE`/case-insensitive
-    `LIKE`, `= ANY(ARRAY[…])` → `IN (…)`.
+- **Per-batch checkpointing for `sluice migrate --resume`.** Previously, resume on an in-progress table truncated and re-copied from row 0. v0.4.0 tracks a per-table PK cursor in `sluice_migrate_state.table_progress`, reads the source via `WHERE pk > cursor ORDER BY pk LIMIT batch_size`, and applies rows with `ON CONFLICT` / `ON DUPLICATE KEY UPDATE` so the brief replay window between batch commit and cursor write is tolerated cleanly. Multi-hour copies of 100M+ row tables can resume mid- table. Composite PKs descend via row-comparison cursors (`(a,b) > ($1,$2) ORDER BY a,b`). Tables without a PK fall back to the v0.3.0 truncate-and-redo behaviour with a clear log line. v0.3.0-shape state rows are read backward-compatibly. See ADR-0018.
+- **Cross-engine expression translation for generated columns and CHECK constraints.** v0.3.2's verbatim-passthrough policy held the fail-loud claim (no silent corruption), but the set of "non-portable" expressions included very common idioms. Bidirectional translation pass at the writer boundary now covers:
+  - **MySQL → Postgres**: `CONCAT(a,b)` → `(a || b)`, `IFNULL` → `COALESCE`, `IF(cond,a,b)` → `CASE WHEN cond THEN a ELSE b END`, `JSON_UNQUOTE(JSON_EXTRACT(j,'$.k'))` → `(j->>'k')`, `JSON_EXTRACT(j,'$.k')` → `(j->'k')`.
+  - **Postgres → MySQL**: `(expr)::type` → `CAST(expr AS …)`, `a || b` → `CONCAT(a, b)`, `~~`/`~~*` → `LIKE`/case-insensitive `LIKE`, `= ANY(ARRAY[…])` → `IN (…)`.
 
-  Unrecognized constructs still pass through verbatim and rely on
-  the loud-failure-on-target fallback. Translator uses a string-
-  literal-aware walker that respects single-quoted literals and
-  balanced parens — no full SQL parser. See ADR-0016.
+  Unrecognized constructs still pass through verbatim and rely on the loud-failure-on-target fallback. Translator uses a string- literal-aware walker that respects single-quoted literals and balanced parens — no full SQL parser. See ADR-0016.
 
 ### Fixed
 
-- **Cold-start hangs when dest tables have pre-existing data
-  (Bug 9, open since v0.3.0).** Three-part fix:
-  1. **Pre-flight refusal**: cold-start now checks each source
-     table for non-empty dest data and refuses with a clear error
-     pointing at recovery commands. Skipped on `--resume` (resume
-     expects partial state).
-  2. **Goroutine-leak fix**: `copyTable` now derives a child
-     context and cancels it on every return path. Previously, when
-     `WriteRows` errored mid-stream, the row-reader goroutine
-     blocked forever on `out <- row` against an abandoned
-     consumer, holding the snapshot transaction open and surfacing
-     as PG's "idle in transaction" sessions.
-  3. **Clearer log shape**: progress ticker's Stop now takes the
-     writer error and logs `bulk copy aborted table=foo rows=N
-     err="…"` on failure instead of the misleading `bulk copy
-     complete rows=N`. New `--force-cold-start` flag bypasses the
-     pre-flight refusal for the rare legitimate "bulk-copy into a
-     populated target" case.
-- **`stop_requested_at` not cleared after consumption (Bug 11,
-  open since v0.3.2).** A `sluice sync stop` left the timestamp
-  set after the streamer drained and exited; the next
-  `sluice sync start` would see the stale signal and exit within
-  the first poll interval. The streamer now clears the flag at
-  startup (after `EnsureControlTable`, before reading the persisted
-  position). Idempotent and tolerant of a missing row. New
-  `ChangeApplier.ClearStopRequested` interface method on the
-  applier.
+- **Cold-start hangs when dest tables have pre-existing data (Bug 9, open since v0.3.0).** Three-part fix: 1. **Pre-flight refusal**: cold-start now checks each source table for non-empty dest data and refuses with a clear error pointing at recovery commands. Skipped on `--resume` (resume expects partial state). 2. **Goroutine-leak fix**: `copyTable` now derives a child context and cancels it on every return path. Previously, when `WriteRows` errored mid-stream, the row-reader goroutine blocked forever on `out <- row` against an abandoned consumer, holding the snapshot transaction open and surfacing as PG's "idle in transaction" sessions. 3. **Clearer log shape**: progress ticker's Stop now takes the writer error and logs `bulk copy aborted table=foo rows=N err="…"` on failure instead of the misleading `bulk copy complete rows=N`. New `--force-cold-start` flag bypasses the pre-flight refusal for the rare legitimate "bulk-copy into a populated target" case.
+- **`stop_requested_at` not cleared after consumption (Bug 11, open since v0.3.2).** A `sluice sync stop` left the timestamp set after the streamer drained and exited; the next `sluice sync start` would see the stale signal and exit within the first poll interval. The streamer now clears the flag at startup (after `EnsureControlTable`, before reading the persisted position). Idempotent and tolerant of a missing row. New `ChangeApplier.ClearStopRequested` interface method on the applier.
 
 ### Changed
 
-- **`docs/type-mapping.md` corrected for PG→MySQL `Inet`/`Cidr`/
-  `Macaddr`/`Array` types.** The doc previously claimed auto-emit
-  as `VARCHAR(N) CHECK (format)`; v0.3.x and v0.4.x actually refuse
-  loudly with a copy-paste-ready `mappings:` YAML snippet pointing
-  at the `--type-override` CLI flag. Auto-emit is queued as a
-  future enhancement; manual override is the supported path today.
+- **`docs/type-mapping.md` corrected for PG→MySQL `Inet`/`Cidr`/ `Macaddr`/`Array` types.** The doc previously claimed auto-emit as `VARCHAR(N) CHECK (format)`; v0.3.x and v0.4.x actually refuse loudly with a copy-paste-ready `mappings:` YAML snippet pointing at the `--type-override` CLI flag. Auto-emit is queued as a future enhancement; manual override is the supported path today.
 
 ## [0.3.2] - 2026-05-04
 
-Patch release adding CHECK constraint support, a CLI form of the
-type-override YAML config, and an opportunistic improvement to
-the generated-column expression normalizer that the CHECK work
-surfaced.
+Patch release adding CHECK constraint support, a CLI form of the type-override YAML config, and an opportunistic improvement to the generated-column expression normalizer that the CHECK work surfaced.
 
 ### Added
 
-- **CHECK constraint support across both engines.** Source schemas
-  declared with `CHECK (qty >= 0)` or `CHECK (status IN ('open',
-  'closed'))` now round-trip cleanly: the schema readers capture
-  the expression on `Table.CheckConstraints`, the DDL writers
-  emit `CONSTRAINT name CHECK (expr)` inline in CREATE TABLE,
-  and the constraint is enforced on the target.
+- **CHECK constraint support across both engines.** Source schemas declared with `CHECK (qty >= 0)` or `CHECK (status IN ('open', 'closed'))` now round-trip cleanly: the schema readers capture the expression on `Table.CheckConstraints`, the DDL writers emit `CONSTRAINT name CHECK (expr)` inline in CREATE TABLE, and the constraint is enforced on the target.
 
-  Translation policy is verbatim passthrough — non-portable
-  expressions fail loudly on the target rather than be guessed
-  at. Identifier and string-literal decoration is normalized at
-  the read boundary (see below).
+  Translation policy is verbatim passthrough — non-portable expressions fail loudly on the target rather than be guessed at. Identifier and string-literal decoration is normalized at the read boundary (see below).
 
-  Integration coverage: MySQL→MySQL, PG→PG, and MySQL→PG cross-
-  engine snapshot migrations each verify (1) the CHECK lands on
-  the target's `information_schema.check_constraints`, (2)
-  bulk-copied rows survived, (3) a violating INSERT is rejected
-  by the target, and (4) a satisfying INSERT is accepted.
+  Integration coverage: MySQL→MySQL, PG→PG, and MySQL→PG cross- engine snapshot migrations each verify (1) the CHECK lands on the target's `information_schema.check_constraints`, (2) bulk-copied rows survived, (3) a violating INSERT is rejected by the target, and (4) a satisfying INSERT is accepted.
 
-- **`--type-override TABLE.COLUMN=TYPE` CLI flag** on `sluice
-  migrate` and `sluice sync start`. Repeatable; format mirrors
-  the YAML `mappings:` shape but in a single string. Wholesale
-  CLI-over-YAML precedence (matches the existing `--include-table`
-  / `--exclude-table` precedence policy). For target-type options
-  (e.g. `jsonb` with `binary=true`) operators still need the YAML
-  form — the CLI deliberately doesn't try to encode key/value
-  options in a single string.
+- **`--type-override TABLE.COLUMN=TYPE` CLI flag** on `sluice migrate` and `sluice sync start`. Repeatable; format mirrors the YAML `mappings:` shape but in a single string. Wholesale CLI-over-YAML precedence (matches the existing `--include-table` / `--exclude-table` precedence policy). For target-type options (e.g. `jsonb` with `binary=true`) operators still need the YAML form — the CLI deliberately doesn't try to encode key/value options in a single string.
 
 ### Fixed
 
-- **Generated-column cross-engine expressions with string
-  literals**. The v0.3.1 generated-column work normalized MySQL's
-  backtick identifier quotes but missed two more layers of
-  decoration MySQL applies to the stored expression text:
+- **Generated-column cross-engine expressions with string literals**. The v0.3.1 generated-column work normalized MySQL's backtick identifier quotes but missed two more layers of decoration MySQL applies to the stored expression text:
 
-  - **Charset introducers** — every string literal is wrapped as
-    `_<charset>'literal'` (e.g. `_utf8mb4'open'`). PG rejects this
-    as a syntax error.
-  - **Delimiter-escape form** — every string literal's apostrophes
-    are stored as `\'`. PG with `standard_conforming_strings=on`
-    (the default since 9.1) rejects `\'` outright.
+  - **Charset introducers** — every string literal is wrapped as `_<charset>'literal'` (e.g. `_utf8mb4'open'`). PG rejects this as a syntax error.
+  - **Delimiter-escape form** — every string literal's apostrophes are stored as `\'`. PG with `standard_conforming_strings=on` (the default since 9.1) rejects `\'` outright.
 
-  v0.3.1 didn't catch these because the test fixtures used
-  `qty * price` — no string literals. The CHECK constraint work
-  in this release surfaced both immediately (via `status IN
-  ('open', ...)`) and the new `normalizeMySQLExpressionText`
-  helper now strips all three layers. **Generated columns benefit
-  from the same fix**: a column declared as `CONCAT(name, ' ')`
-  cross-engine that would have silently failed on v0.3.1 now
-  works.
+  v0.3.1 didn't catch these because the test fixtures used `qty * price` — no string literals. The CHECK constraint work in this release surfaced both immediately (via `status IN ('open', ...)`) and the new `normalizeMySQLExpressionText` helper now strips all three layers. **Generated columns benefit from the same fix**: a column declared as `CONCAT(name, ' ')` cross-engine that would have silently failed on v0.3.1 now works.
 
 ## [0.3.1] - 2026-05-04
 
-Patch release — adds first-class generated-column support and
-includes the CI-pipeline fixes that surfaced during the v0.3.0
-release rebuild.
+Patch release — adds first-class generated-column support and includes the CI-pipeline fixes that surfaced during the v0.3.0 release rebuild.
 
 ### Added
 
-- **Generated column support across both engines.** Source columns
-  declared as `GENERATED ALWAYS AS (expr) STORED` (or `VIRTUAL` on
-  MySQL) now round-trip cleanly: the schema readers capture the
-  expression on `ir.Column.GeneratedExpr`, the DDL writers emit
-  the corresponding `GENERATED ALWAYS AS (...)` clause, and the
-  bulk-copy / CDC paths skip the column from INSERT/UPDATE column
-  lists so the target re-computes via its own GENERATED clause.
+- **Generated column support across both engines.** Source columns declared as `GENERATED ALWAYS AS (expr) STORED` (or `VIRTUAL` on MySQL) now round-trip cleanly: the schema readers capture the expression on `ir.Column.GeneratedExpr`, the DDL writers emit the corresponding `GENERATED ALWAYS AS (...)` clause, and the bulk-copy / CDC paths skip the column from INSERT/UPDATE column lists so the target re-computes via its own GENERATED clause.
 
-  Translation policy is verbatim passthrough — non-portable
-  expressions (e.g. MySQL `CONCAT(a, b)` vs PG `a || b`) fail
-  loudly on the target rather than be guessed at. Identifier
-  quoting *is* normalized at the read boundary (MySQL's stored
-  expression text uses backticks that PG can't parse), since
-  that's a mechanical dialect-quoting issue rather than a
-  function/operator translation. Cross-engine sources with
-  VIRTUAL columns are silently promoted to STORED on PG (which
-  doesn't support VIRTUAL) with a `slog.Warn` documenting the
-  shift.
+  Translation policy is verbatim passthrough — non-portable expressions (e.g. MySQL `CONCAT(a, b)` vs PG `a || b`) fail loudly on the target rather than be guessed at. Identifier quoting *is* normalized at the read boundary (MySQL's stored expression text uses backticks that PG can't parse), since that's a mechanical dialect-quoting issue rather than a function/operator translation. Cross-engine sources with VIRTUAL columns are silently promoted to STORED on PG (which doesn't support VIRTUAL) with a `slog.Warn` documenting the shift.
 
-  Integration coverage on MySQL→MySQL, PG→PG, and MySQL→PG
-  (cross-engine) for both the migrate and streamer paths.
+  Integration coverage on MySQL→MySQL, PG→PG, and MySQL→PG (cross-engine) for both the migrate and streamer paths.
 
 ### Fixed
 
 - **CI pipeline fixes uncovered during the v0.3.0 release rebuild**:
-  - Migrated `.golangci.yml` to v2 schema (top-level `version: "2"`,
-    `linters.default: none`, formatters split into the new
-    top-level `formatters:` section, drop deprecated `gosimple`
-    which is merged into `staticcheck`).
-  - Bumped `golangci/golangci-lint-action` to `@v8` so `version:
-    latest` resolves to the v2 module path.
-  - Re-enabled `install-mode: goinstall` so the linter compiles
-    with our Go 1.26 toolchain rather than the prebuilt-binary's
-    older Go (which couldn't typecheck stdlib `chacha20poly1305`'s
-    Go-1.26-only file).
-  - **MySQL binlog composite-PK test**: corrected `int32` type
-    assertions to `int64`. The binlog reader's `decodeInteger`
-    widens every integer to `int64`, so the v0.3.0 test asserted
-    a type that doesn't exist in the row map.
-  - Five new lint findings v1 missed (caught by v2): `any`
-    variable shadowing the builtin, an embedded-field selector
-    simplification, a capitalised error string, two De-Morgan'd
-    conditional reads.
+  - Migrated `.golangci.yml` to v2 schema (top-level `version: "2"`, `linters.default: none`, formatters split into the new top-level `formatters:` section, drop deprecated `gosimple` which is merged into `staticcheck`).
+  - Bumped `golangci/golangci-lint-action` to `@v8` so `version: latest` resolves to the v2 module path.
+  - Re-enabled `install-mode: goinstall` so the linter compiles with our Go 1.26 toolchain rather than the prebuilt-binary's older Go (which couldn't typecheck stdlib `chacha20poly1305`'s Go-1.26-only file).
+  - **MySQL binlog composite-PK test**: corrected `int32` type assertions to `int64`. The binlog reader's `decodeInteger` widens every integer to `int64`, so the v0.3.0 test asserted a type that doesn't exist in the row map.
+  - Five new lint findings v1 missed (caught by v2): `any` variable shadowing the builtin, an embedded-field selector simplification, a capitalised error string, two De-Morgan'd conditional reads.
 
 ### Changed
 
-- **Schema readers exclude `sluice_*_state` tables**. Already done
-  in v0.3.0 for the migrate-state table; this release extends the
-  list to fully cover both bookkeeping tables on re-migrations.
+- **Schema readers exclude `sluice_*_state` tables**. Already done in v0.3.0 for the migrate-state table; this release extends the list to fully cover both bookkeeping tables on re-migrations.
 
 ## [0.3.0] - 2026-05-04
 
-Feature release. Three substantial additions to the operator surface
-(`sluice migrate --resume`, `sluice sync stop`, `--include-table` /
-`--exclude-table`), one silent-data-loss fix on Postgres CDC, and
-five new ADRs documenting the v0.2.x and v0.3.0 design decisions.
+Feature release. Three substantial additions to the operator surface (`sluice migrate --resume`, `sluice sync stop`, `--include-table` / `--exclude-table`), one silent-data-loss fix on Postgres CDC, and five new ADRs documenting the v0.2.x and v0.3.0 design decisions.
 
 ### Added — resumable simple-mode migrations
 
-- **`sluice migrate --resume --migration-id ID`** picks up a failed
-  migration where it left off rather than forcing a drop-and-redo.
-  Per-target `sluice_migrate_state` row tracks phase
-  (`tables`/`bulk_copy`/`identity_sync`/`indexes`/`constraints`/
-  `complete`) and per-table bulk-copy progress as a JSON map.
-  In-progress tables are TRUNCATEd before re-copy. Failure paths
-  persist the in-flight phase plus a 1KB-truncated error message;
-  a state-write failure during cleanup is joined with the primary
-  error via `errors.Join` so the operator never loses the root
-  cause.
-- **Behavior matrix** is conservative for non-resume runs: existing
-  state row + no `--resume` errors out (no silent overwrites), and
-  `--resume` against a `complete` row exits cleanly with an
-  "already complete" log. New `MigrationStateStore` and
-  `TableTruncator` are optional engine surfaces (type-assertion
-  pattern, mirroring `SlotManagerOpener`); engines without the
-  primitives error clearly when `--resume` is requested.
-- **`CREATE TABLE IF NOT EXISTS`** is now universal in the DDL
-  emitters on both engines, so the resume tables-phase is a clean
-  no-op on re-run. Schema readers exclude `sluice_*_state` so
-  re-migrations don't propagate sluice's bookkeeping as user data.
+- **`sluice migrate --resume --migration-id ID`** picks up a failed migration where it left off rather than forcing a drop-and-redo. Per-target `sluice_migrate_state` row tracks phase (`tables`/`bulk_copy`/`identity_sync`/`indexes`/`constraints`/ `complete`) and per-table bulk-copy progress as a JSON map. In-progress tables are TRUNCATEd before re-copy. Failure paths persist the in-flight phase plus a 1KB-truncated error message; a state-write failure during cleanup is joined with the primary error via `errors.Join` so the operator never loses the root cause.
+- **Behavior matrix** is conservative for non-resume runs: existing state row + no `--resume` errors out (no silent overwrites), and `--resume` against a `complete` row exits cleanly with an "already complete" log. New `MigrationStateStore` and `TableTruncator` are optional engine surfaces (type-assertion pattern, mirroring `SlotManagerOpener`); engines without the primitives error clearly when `--resume` is requested.
+- **`CREATE TABLE IF NOT EXISTS`** is now universal in the DDL emitters on both engines, so the resume tables-phase is a clean no-op on re-run. Schema readers exclude `sluice_*_state` so re-migrations don't propagate sluice's bookkeeping as user data.
 
 ### Added — selective table inclusion / exclusion
 
-- **`--include-table TABLE,...`** and **`--exclude-table TABLE,...`**
-  on `sluice migrate` and `sluice sync start`. Comma-separated,
-  repeatable, glob patterns supported via stdlib `path.Match`
-  (`audit_*`, `tmp_*`). Mutually exclusive at the CLI parse layer.
-  Same fields available in YAML config as `include_tables` /
-  `exclude_tables`; CLI takes precedence wholesale (no merge).
-- **Filtering happens at the orchestrator boundary**: schema
-  pruning after `ReadSchema` and a CDC dispatch wrapper that drops
-  events for excluded tables before the applier sees them. Engines
-  remain agnostic to the spec, so behaviour is identical across
-  MySQL/Postgres/future engines.
-- **Position-advancement caveat**: positions only commit when an
-  event applies, so a stream that consists entirely of dropped
-  events lags within the source-side WAL/binlog retention window.
-  Documented on the `Streamer.Filter` field.
+- **`--include-table TABLE,...`** and **`--exclude-table TABLE,...`** on `sluice migrate` and `sluice sync start`. Comma-separated, repeatable, glob patterns supported via stdlib `path.Match` (`audit_*`, `tmp_*`). Mutually exclusive at the CLI parse layer. Same fields available in YAML config as `include_tables` / `exclude_tables`; CLI takes precedence wholesale (no merge).
+- **Filtering happens at the orchestrator boundary**: schema pruning after `ReadSchema` and a CDC dispatch wrapper that drops events for excluded tables before the applier sees them. Engines remain agnostic to the spec, so behaviour is identical across MySQL/Postgres/future engines.
+- **Position-advancement caveat**: positions only commit when an event applies, so a stream that consists entirely of dropped events lags within the source-side WAL/binlog retention window. Documented on the `Streamer.Filter` field.
 
 ### Added — graceful stream stop
 
-- **`sluice sync stop --target-driver X --target DSN --stream-id ID`**
-  asks a running sync stream to drain in-flight changes, persist
-  the final position, and exit cleanly. Mechanism is a control-
-  table flag (`stop_requested_at` column on `sluice_cdc_state`)
-  polled by the running streamer every 5s. Survives operator
-  machine boundaries, container lifecycles, and process restarts —
-  the flag persists; a restarted streamer sees it on next poll.
-- **Additive to `Ctrl-C` / `SIGTERM`** which still work via the
-  existing signal path. The new mechanism fits Kubernetes lifecycle
-  hooks, systemd `ExecStop`, and remote orchestrators that can't
-  send signals to a different machine.
-- **Idempotent schema migration**: existing v0.2.x deployments pick
-  up the new column on next `EnsureControlTable` call without
-  losing data. PG uses `ADD COLUMN IF NOT EXISTS`; MySQL uses
-  detect-then-ALTER for portability across all 8.x versions.
+- **`sluice sync stop --target-driver X --target DSN --stream-id ID`** asks a running sync stream to drain in-flight changes, persist the final position, and exit cleanly. Mechanism is a control- table flag (`stop_requested_at` column on `sluice_cdc_state`) polled by the running streamer every 5s. Survives operator machine boundaries, container lifecycles, and process restarts — the flag persists; a restarted streamer sees it on next poll.
+- **Additive to `Ctrl-C` / `SIGTERM`** which still work via the existing signal path. The new mechanism fits Kubernetes lifecycle hooks, systemd `ExecStop`, and remote orchestrators that can't send signals to a different machine.
+- **Idempotent schema migration**: existing v0.2.x deployments pick up the new column on next `EnsureControlTable` call without losing data. PG uses `ADD COLUMN IF NOT EXISTS`; MySQL uses detect-then-ALTER for portability across all 8.x versions.
 
 ### Added — observability
 
-- **Structured logging via `log/slog`** (replacing
-  `fmt.Fprintf`-to-stdout). `--log-level` is now wired into the
-  default handler; `debug` / `info` / `warn` / `error` actually
-  change verbosity. Pipeline records emit as
-  `time=... level=INFO msg="..." key=value` to stderr; CLI table
-  outputs (`engines`, `sync status`, `slot list`) keep using stdout
-  unchanged — they're table renders, not log streams.
-- **Bulk-copy progress reporting**: a per-table `progressTicker`
-  emits `bulk copy progress table=foo rows=N rate=R` every 2s
-  while a copy is in flight, plus a final `bulk copy complete`
-  line on table completion. Long migrations are no longer 30
-  minutes of silence.
-- **Phase-aware error hints**: wrapped pipeline errors gain an
-  optional one-line `hint:` suffix for common operator-facing
-  failures (missing target table, bad DSN host, auth failures,
-  missing `REPLICATION` grant, missing `CREATE` on schema).
-  Registry is intentionally tiny (7 entries, scoped by phase);
-  hints are appended via `fmt.Errorf("%w\nhint: %s")` so
-  `errors.Is`/`As` traversal is unaffected.
+- **Structured logging via `log/slog`** (replacing `fmt.Fprintf`-to-stdout). `--log-level` is now wired into the default handler; `debug` / `info` / `warn` / `error` actually change verbosity. Pipeline records emit as `time=... level=INFO msg="..." key=value` to stderr; CLI table outputs (`engines`, `sync status`, `slot list`) keep using stdout unchanged — they're table renders, not log streams.
+- **Bulk-copy progress reporting**: a per-table `progressTicker` emits `bulk copy progress table=foo rows=N rate=R` every 2s while a copy is in flight, plus a final `bulk copy complete` line on table completion. Long migrations are no longer 30 minutes of silence.
+- **Phase-aware error hints**: wrapped pipeline errors gain an optional one-line `hint:` suffix for common operator-facing failures (missing target table, bad DSN host, auth failures, missing `REPLICATION` grant, missing `CREATE` on schema). Registry is intentionally tiny (7 entries, scoped by phase); hints are appended via `fmt.Errorf("%w\nhint: %s")` so `errors.Is`/`As` traversal is unaffected.
 
 ### Added — architecture documentation
 
 Five new ADRs in `docs/adr/`:
 
 - **ADR-0011**: `SlotManager` as an optional engine surface.
-- **ADR-0012**: Bypass `pglogrepl` to send raw
-  `CREATE_REPLICATION_SLOT FAILOVER true` for PG 17+.
-- **ADR-0013**: Applier value-shaping via column-type cache and
-  `CAST(? AS JSON)` (the Bug 6 fix shape).
-- **ADR-0014**: Phase-aware error-hint registry (substring + phase
-  matching, deliberately tiny).
-- **ADR-0015**: Migration resume design — per-target state table,
-  truncate-and-redo for in-progress tables, `errors.Join` on
-  state-write-during-failure paths.
+- **ADR-0012**: Bypass `pglogrepl` to send raw `CREATE_REPLICATION_SLOT FAILOVER true` for PG 17+.
+- **ADR-0013**: Applier value-shaping via column-type cache and `CAST(? AS JSON)` (the Bug 6 fix shape).
+- **ADR-0014**: Phase-aware error-hint registry (substring + phase matching, deliberately tiny).
+- **ADR-0015**: Migration resume design — per-target state table, truncate-and-redo for in-progress tables, `errors.Join` on state-write-during-failure paths.
 
 ### Fixed
 
-- **Postgres CDC: composite-PK DELETE silently lost (Bug 8)**.
-  pgoutput's `DeleteMessage` with `REPLICA IDENTITY DEFAULT`
-  carries an `OldTuple` whose `ColumnNum` equals the relation's
-  full column count, with `'n'` (null) markers for non-key
-  columns. `decodeTuple` translated those into present-but-nil
-  entries on the row map; the applier's `WHERE` then emitted
-  `non_key IS NULL` predicates that matched zero rows on the
-  destination. The applier's resume-idempotency tolerance for
-  zero-rows-affected (ADR-0010) absorbed the silence; the
-  position advanced; `DELETE`s disappeared. Real-world soak
-  testing observed a 30-row drift on a composite-PK
-  `order_items` table.
+- **Postgres CDC: composite-PK DELETE silently lost (Bug 8)**. pgoutput's `DeleteMessage` with `REPLICA IDENTITY DEFAULT` carries an `OldTuple` whose `ColumnNum` equals the relation's full column count, with `'n'` (null) markers for non-key columns. `decodeTuple` translated those into present-but-nil entries on the row map; the applier's `WHERE` then emitted `non_key IS NULL` predicates that matched zero rows on the destination. The applier's resume-idempotency tolerance for zero-rows-affected (ADR-0010) absorbed the silence; the position advanced; `DELETE`s disappeared. Real-world soak testing observed a 30-row drift on a composite-PK `order_items` table.
 
-  Fix: `filterDeleteBefore` narrows the emitted Before to columns
-  flagged `KeyColumn=true` on the relation cache. Correct under
-  every `REPLICA IDENTITY` mode (DEFAULT drops `'n'` entries; FULL
-  drops non-identity columns; USING INDEX is a no-op on the
-  already-narrow OldTuple; PK-less FULL falls back to the full row
-  to honour the operator's deliberate setting). `REPLICA IDENTITY
-  NOTHING` is rejected loudly — DELETE is unreplicatable in that
-  mode.
+  Fix: `filterDeleteBefore` narrows the emitted Before to columns flagged `KeyColumn=true` on the relation cache. Correct under every `REPLICA IDENTITY` mode (DEFAULT drops `'n'` entries; FULL drops non-identity columns; USING INDEX is a no-op on the already-narrow OldTuple; PK-less FULL falls back to the full row to honour the operator's deliberate setting). `REPLICA IDENTITY NOTHING` is rejected loudly — DELETE is unreplicatable in that mode.
 
-  MySQL is unaffected: `binlog_row_image=FULL` (the default)
-  carries every column with real values, so the WHERE matches
-  exactly. The user's PG→MySQL drift was the PG source-side bug
-  propagating through.
+  MySQL is unaffected: `binlog_row_image=FULL` (the default) carries every column with real values, so the WHERE matches exactly. The user's PG→MySQL drift was the PG source-side bug propagating through.
 
 ### Test gap closed
 
-- **Composite-PK CDC coverage on MySQL paths**. Bug 8 reached
-  real-world soak because no existing CDC integration test
-  exercised composite-PK tables across any direction. Added
-  `TestCDCReader_CompositePK` (MySQL binlog, asserts both PK
-  columns survive INSERT/UPDATE/DELETE) and
-  `TestStreamer_MySQLToPostgres_CompositePKDelete` (cross-engine,
-  asserts row-count drop on the target). VStream coverage punted
-  to a follow-up — the test infrastructure (vtgate setup) is
-  heavier and the protocol surface differs enough to warrant its
-  own pass.
+- **Composite-PK CDC coverage on MySQL paths**. Bug 8 reached real-world soak because no existing CDC integration test exercised composite-PK tables across any direction. Added `TestCDCReader_CompositePK` (MySQL binlog, asserts both PK columns survive INSERT/UPDATE/DELETE) and `TestStreamer_MySQLToPostgres_CompositePKDelete` (cross-engine, asserts row-count drop on the target). VStream coverage punted to a follow-up — the test infrastructure (vtgate setup) is heavier and the protocol surface differs enough to warrant its own pass.
 
 ## [0.2.2] - 2026-05-04
 
-Patch release closing a CDC-applier JSON-encoding bug that surfaced
-during v0.2.1 revalidation testing — affecting both PG→MySQL (loud
-crash) and MySQL→MySQL (silent data divergence). Plus a small
-dry-run output clarification and a debug-level zero-rows-affected
-log so the silent class of bug is one filter away from being
-spotted in the future.
+Patch release closing a CDC-applier JSON-encoding bug that surfaced during v0.2.1 revalidation testing — affecting both PG→MySQL (loud crash) and MySQL→MySQL (silent data divergence). Plus a small dry-run output clarification and a debug-level zero-rows-affected log so the silent class of bug is one filter away from being spotted in the future.
 
 ### Fixed
 
-- **MySQL applier: shape JSON column values for the wire on CDC
-  Insert/Update/Delete**. The MySQL `ChangeApplier` bound row values
-  straight from `ir.Row` to the parameterised SQL, bypassing the
-  `prepareValue` used by the bulk-copy path. Two production failures
-  shared the same root cause:
+- **MySQL applier: shape JSON column values for the wire on CDC Insert/Update/Delete**. The MySQL `ChangeApplier` bound row values straight from `ir.Row` to the parameterised SQL, bypassing the `prepareValue` used by the bulk-copy path. Two production failures shared the same root cause:
 
-  - **Loud (PG → MySQL CDC on Vitess/PlanetScale)**: `[]byte` JSON
-    values arrived `_binary`-tagged on the wire and Vitess rejected
-    them with "Cannot create a JSON value from a string with
-    CHARACTER SET 'binary'". Sluice exited.
-  - **Silent (MySQL → MySQL CDC, vanilla MySQL included)**: `WHERE`
-    on a JSON column with a bare `?` placeholder never matched —
-    MySQL's `=` operator does not implicitly cast a bound parameter
-    to JSON regardless of whether it's `[]byte` or `string`. The
-    applier (which tolerates zero-rows-affected for resume
-    idempotency) silently advanced past UPDATEs and DELETEs that
-    should have matched. The destination row stayed stale forever
-    with no error signal — data divergence with no observability.
+  - **Loud (PG → MySQL CDC on Vitess/PlanetScale)**: `[]byte` JSON values arrived `_binary`-tagged on the wire and Vitess rejected them with "Cannot create a JSON value from a string with CHARACTER SET 'binary'". Sluice exited.
+  - **Silent (MySQL → MySQL CDC, vanilla MySQL included)**: `WHERE` on a JSON column with a bare `?` placeholder never matched — MySQL's `=` operator does not implicitly cast a bound parameter to JSON regardless of whether it's `[]byte` or `string`. The applier (which tolerates zero-rows-affected for resume idempotency) silently advanced past UPDATEs and DELETEs that should have matched. The destination row stayed stale forever with no error signal — data divergence with no observability.
 
-  The fix has two parts: (1) a per-table column-type cache lets every
-  bound value go through `prepareValue` (so JSON `[]byte` → `string`,
-  Set `[]string` → comma-joined, Geometry gets the SRID prefix); and
-  (2) `WHERE` placeholders on JSON-typed columns are wrapped in
-  `CAST(? AS JSON)` so the comparison is JSON-vs-JSON rather than
-  JSON-vs-text. The Postgres applier got the parallel cleanup for
-  symmetry and for Array/Geometry shaping (its WHERE didn't need a
-  CAST equivalent — pgx inspects per-column type metadata natively).
+  The fix has two parts: (1) a per-table column-type cache lets every bound value go through `prepareValue` (so JSON `[]byte` → `string`, Set `[]string` → comma-joined, Geometry gets the SRID prefix); and (2) `WHERE` placeholders on JSON-typed columns are wrapped in `CAST(? AS JSON)` so the comparison is JSON-vs-JSON rather than JSON-vs-text. The Postgres applier got the parallel cleanup for symmetry and for Array/Geometry shaping (its WHERE didn't need a CAST equivalent — pgx inspects per-column type metadata natively).
 
-  A new `TestChangeApplier_JSONColumn` integration test on each
-  engine exercises the silent path end-to-end; without the fix it
-  fails loudly in PG→MySQL and quietly in MySQL→MySQL.
+  A new `TestChangeApplier_JSONColumn` integration test on each engine exercises the silent path end-to-end; without the fix it fails loudly in PG→MySQL and quietly in MySQL→MySQL.
 
 ### Added
 
-- **Debug-level zero-rows-affected log on Update/Delete**. The
-  applier still tolerates zero-rows-affected (resume idempotency
-  depends on it), but a `slog.Debug` line now fires when it
-  happens — a single observability footprint that lets future
-  silent-divergence bugs be one log filter away from being spotted.
+- **Debug-level zero-rows-affected log on Update/Delete**. The applier still tolerates zero-rows-affected (resume idempotency depends on it), but a `slog.Debug` line now fires when it happens — a single observability footprint that lets future silent-divergence bugs be one log filter away from being spotted.
 
 ### Changed
 
-- **Dry-run table output: split `indexes` into `primary_key` +
-  `secondary_indexes`**. The IR stores the primary key on a separate
-  field from secondary indexes, so the v0.2.0 `indexes=N` field
-  silently excluded PK and confused operators comparing against
-  psql / SHOW INDEX output. The new shape (`primary_key=true
-  secondary_indexes=1 foreign_keys=2`) is explicit from the field
-  names alone.
+- **Dry-run table output: split `indexes` into `primary_key` + `secondary_indexes`**. The IR stores the primary key on a separate field from secondary indexes, so the v0.2.0 `indexes=N` field silently excluded PK and confused operators comparing against psql / SHOW INDEX output. The new shape (`primary_key=true secondary_indexes=1 foreign_keys=2`) is explicit from the field names alone.
 
 ## [0.2.1] - 2026-05-03
 
-Single-issue patch release fixing a regression introduced in v0.2.0:
-PG-source CDC is unblocked on PlanetScale Postgres (and any other
-PG 17+ deployment whose option-list parser is strict).
+Single-issue patch release fixing a regression introduced in v0.2.0: PG-source CDC is unblocked on PlanetScale Postgres (and any other PG 17+ deployment whose option-list parser is strict).
 
 ### Fixed
 
-- **PG 17+ slot creation: use named `SNAPSHOT 'export'` option**.
-  v0.2.0 sent `CREATE_REPLICATION_SLOT ... (EXPORT_SNAPSHOT,
-  FAILOVER true)` on PG 17+, which is a syntax mismatch — the bare
-  `EXPORT_SNAPSHOT` keyword is the *pre-PG-17* form. Inside the new
-  parenthesised option-list grammar the snapshot option must be the
-  named form `SNAPSHOT 'export'`. PlanetScale Postgres rejected the
-  v0.2.0 form with `ERROR: unrecognized option: export_snapshot`,
-  blocking every `sluice sync start` against a PG source. Cold-start
-  CDC (without snapshot export) was unaffected; snapshot+CDC handoff
-  is the path that hit it.
+- **PG 17+ slot creation: use named `SNAPSHOT 'export'` option**. v0.2.0 sent `CREATE_REPLICATION_SLOT ... (EXPORT_SNAPSHOT, FAILOVER true)` on PG 17+, which is a syntax mismatch — the bare `EXPORT_SNAPSHOT` keyword is the *pre-PG-17* form. Inside the new parenthesised option-list grammar the snapshot option must be the named form `SNAPSHOT 'export'`. PlanetScale Postgres rejected the v0.2.0 form with `ERROR: unrecognized option: export_snapshot`, blocking every `sluice sync start` against a PG source. Cold-start CDC (without snapshot export) was unaffected; snapshot+CDC handoff is the path that hit it.
 
 ## [0.2.0] - 2026-05-03
 
-Bug-fix and operator-UX release driven by real-world v0.1.0
-testing against PlanetScale Postgres + MySQL. Four target-side
-data-correctness bugs fixed; the slot lifecycle on PG sources
-gets a first-class CLI plus auto-drop on failed setup; logical
-slots now opt into PG 17 `FAILOVER`; CLI output moves to
-structured logging with bulk-copy progress lines and phase-aware
-error hints.
+Bug-fix and operator-UX release driven by real-world v0.1.0 testing against PlanetScale Postgres + MySQL. Four target-side data-correctness bugs fixed; the slot lifecycle on PG sources gets a first-class CLI plus auto-drop on failed setup; logical slots now opt into PG 17 `FAILOVER`; CLI output moves to structured logging with bulk-copy progress lines and phase-aware error hints.
 
 ### Added — operator surface
 
-- **`sluice slot list` / `sluice slot drop`**: source-side
-  replication-slot management for Postgres CDC. List shows
-  every slot's plugin, active flag, `wal_status`, `restart_lsn`,
-  and `confirmed_flush_lsn`; drop is destructive and prompts
-  for confirmation by default (`--yes` skips, `--force` allows
-  dropping an active slot, `--if-exists` swallows the not-found
-  error). Engines without slot management (MySQL today) surface
-  a clear error rather than silently no-op. Backed by a new
-  `ir.SlotManager` interface that engines opt into via
-  `OpenSlotManager`.
-- **Auto-drop slot on failed cold-start**: when sluice creates a
-  fresh slot in `StreamChanges` and any later setup step fails
-  (IDENTIFY_SYSTEM, START_REPLICATION, ctx cancellation), the
-  slot is dropped before `StreamChanges` returns. Slots that
-  already existed when the call started are never touched. Once
-  the channel is in the caller's hands the auto-drop is
-  suppressed: emitted change positions reference the slot, and
-  that's user data we don't auto-clean.
-- **Refuse to start on invalidated slots**: `pg_replication_slots
-  .wal_status` of `unreserved` or `lost` (the latter caused by a
-  slow consumer falling behind `max_slot_wal_keep_size`) now
-  surfaces a clear, actionable error pointing at
-  `sluice slot drop` and `max_slot_wal_keep_size` for prevention,
-  instead of letting `START_REPLICATION` fail mid-stream with
-  "requested WAL segment has already been removed".
-- **Structured logging via `log/slog`**: `--log-level` is now
-  wired into the slog default handler (stderr text format), so
-  `debug`/`info`/`warn`/`error` actually changes verbosity. The
-  pipeline's `Migrator` and `Streamer` types drop their `Stdout`
-  fields and emit structured records (`migration complete
-  tables=N`, `bulk copy complete table=foo rows=N`, etc.).
-  Operator-facing CLI tables (`engines`, `sync status`,
-  `slot list`) keep using stdout — they're table renders, not
-  log streams.
-- **Bulk-copy progress reporting**: a new `progressTicker` sits
-  in the row pipe between `RowReader` and `RowWriter` for each
-  bulk-copied table. It atomically counts rows, emits
-  `bulk copy progress` every 2s while rows are advancing, and a
-  final `bulk copy complete` line on Stop. Counting at the
-  pipeline layer keeps engines unchanged.
-- **Phase-aware error hints**: wrapped pipeline errors get an
-  optional one-line `hint:` suffix for common operator-facing
-  failures — missing target table, bad DSN host, auth failures,
-  missing REPLICATION grant, missing CREATE on schema. Hints are
-  appended via `fmt.Errorf("%w\nhint: %s")` so `errors.Is`/`As`
-  traversal is unaffected. Registry is intentionally tiny (7
-  entries) and scoped by phase.
+- **`sluice slot list` / `sluice slot drop`**: source-side replication-slot management for Postgres CDC. List shows every slot's plugin, active flag, `wal_status`, `restart_lsn`, and `confirmed_flush_lsn`; drop is destructive and prompts for confirmation by default (`--yes` skips, `--force` allows dropping an active slot, `--if-exists` swallows the not-found error). Engines without slot management (MySQL today) surface a clear error rather than silently no-op. Backed by a new `ir.SlotManager` interface that engines opt into via `OpenSlotManager`.
+- **Auto-drop slot on failed cold-start**: when sluice creates a fresh slot in `StreamChanges` and any later setup step fails (IDENTIFY_SYSTEM, START_REPLICATION, ctx cancellation), the slot is dropped before `StreamChanges` returns. Slots that already existed when the call started are never touched. Once the channel is in the caller's hands the auto-drop is suppressed: emitted change positions reference the slot, and that's user data we don't auto-clean.
+- **Refuse to start on invalidated slots**: `pg_replication_slots .wal_status` of `unreserved` or `lost` (the latter caused by a slow consumer falling behind `max_slot_wal_keep_size`) now surfaces a clear, actionable error pointing at `sluice slot drop` and `max_slot_wal_keep_size` for prevention, instead of letting `START_REPLICATION` fail mid-stream with "requested WAL segment has already been removed".
+- **Structured logging via `log/slog`**: `--log-level` is now wired into the slog default handler (stderr text format), so `debug`/`info`/`warn`/`error` actually changes verbosity. The pipeline's `Migrator` and `Streamer` types drop their `Stdout` fields and emit structured records (`migration complete tables=N`, `bulk copy complete table=foo rows=N`, etc.). Operator-facing CLI tables (`engines`, `sync status`, `slot list`) keep using stdout — they're table renders, not log streams.
+- **Bulk-copy progress reporting**: a new `progressTicker` sits in the row pipe between `RowReader` and `RowWriter` for each bulk-copied table. It atomically counts rows, emits `bulk copy progress` every 2s while rows are advancing, and a final `bulk copy complete` line on Stop. Counting at the pipeline layer keeps engines unchanged.
+- **Phase-aware error hints**: wrapped pipeline errors get an optional one-line `hint:` suffix for common operator-facing failures — missing target table, bad DSN host, auth failures, missing REPLICATION grant, missing CREATE on schema. Hints are appended via `fmt.Errorf("%w\nhint: %s")` so `errors.Is`/`As` traversal is unaffected. Registry is intentionally tiny (7 entries) and scoped by phase.
 
 ### Added — Postgres slot HA
 
-- **`FAILOVER true` on PG 17+ slot creation**: both slot-creation
-  sites — the cold-start path in the CDC reader and the
-  snapshot+CDC handoff — now go through a version-aware helper.
-  PG 17+ sends a raw `CREATE_REPLICATION_SLOT ... (FAILOVER true)`
-  protocol command via `pgconn.Exec` (pglogrepl's options struct
-  doesn't yet expose the flag); PG ≤ 16 falls back to the
-  FAILOVER-less path and emits a one-time stderr warning naming
-  the slot and pointing at the manual workaround. Closes the
-  silent slot-loss-on-failover gotcha for PlanetScale and any
-  Patroni-fronted PG 17+ deployment.
+- **`FAILOVER true` on PG 17+ slot creation**: both slot-creation sites — the cold-start path in the CDC reader and the snapshot+CDC handoff — now go through a version-aware helper. PG 17+ sends a raw `CREATE_REPLICATION_SLOT ... (FAILOVER true)` protocol command via `pgconn.Exec` (pglogrepl's options struct doesn't yet expose the flag); PG ≤ 16 falls back to the FAILOVER-less path and emits a one-time stderr warning naming the slot and pointing at the manual workaround. Closes the silent slot-loss-on-failover gotcha for PlanetScale and any Patroni-fronted PG 17+ deployment.
 
 ### Added — orchestration
 
-- **`sluice sync start --dry-run`** (`-n`): symmetric with the
-  existing `migrate --dry-run` flag. Reads the source schema,
-  looks up the persisted position on the target, and prints the
-  plan (cold-start vs warm-resume; source schema summary or
-  position token) without modifying the target or starting the
-  stream. The position lookup is tolerant of the control table
-  being absent — both engines' `readPosition` helpers now fall
-  through "missing relation" errors as "no row".
+- **`sluice sync start --dry-run`** (`-n`): symmetric with the existing `migrate --dry-run` flag. Reads the source schema, looks up the persisted position on the target, and prints the plan (cold-start vs warm-resume; source schema summary or position token) without modifying the target or starting the stream. The position lookup is tolerant of the control table being absent — both engines' `readPosition` helpers now fall through "missing relation" errors as "no row".
 
 ### Added — managed-service support
 
-- **Multi-shard Vitess snapshot+CDC handoff**: the snapshot path
-  (`Engine.OpenSnapshotStream` on the `planetscale` flavor) now
-  fans out to every shard in a sharded keyspace, buffers rows
-  from all shards into a unified per-table view, and uses the
-  global `COPY_COMPLETED` event (both `Keyspace` and `Shard`
-  empty) as the snapshot→CDC handoff boundary. The captured
-  `ir.Position` carries one `shardGtid` entry per shard. Pairs
-  with `vstream_auto_discover_shards=true` for shard discovery
-  via `SHOW VITESS_SHARDS`. Validated against
-  `vitess/vttestserver` with `NUM_SHARDS=2`.
-- **Reshard-during-COPY signalling**: a `JOURNAL` event during
-  the snapshot path's COPY phase now surfaces the typed
-  `ShardLayoutChangedError`, matching the standalone CDC reader.
-  v1 of the multi-shard snapshot does not recover in place — the
-  caller drops the snapshot stream and reopens against the new
-  layout.
+- **Multi-shard Vitess snapshot+CDC handoff**: the snapshot path (`Engine.OpenSnapshotStream` on the `planetscale` flavor) now fans out to every shard in a sharded keyspace, buffers rows from all shards into a unified per-table view, and uses the global `COPY_COMPLETED` event (both `Keyspace` and `Shard` empty) as the snapshot→CDC handoff boundary. The captured `ir.Position` carries one `shardGtid` entry per shard. Pairs with `vstream_auto_discover_shards=true` for shard discovery via `SHOW VITESS_SHARDS`. Validated against `vitess/vttestserver` with `NUM_SHARDS=2`.
+- **Reshard-during-COPY signalling**: a `JOURNAL` event during the snapshot path's COPY phase now surfaces the typed `ShardLayoutChangedError`, matching the standalone CDC reader. v1 of the multi-shard snapshot does not recover in place — the caller drops the snapshot stream and reopens against the new layout.
 
 ### Fixed
 
-- **MySQL target rejects JSON values labelled `_binary`**: PG
-  source columns of type JSONB arriving through a MySQL writer
-  were being sent over the wire with the `_binary` charset
-  prefix, which Vitess (and MySQL strict mode) reject with
-  "Cannot create a JSON value from a string with CHARACTER SET
-  'binary'". `prepareValue` now converts `[]byte` to `string`
-  for `ir.JSON` columns. Surfaced during PlanetScale-target
-  testing.
-- **Warm-resume engine alias**: `ChangeApplier.ReadPosition`
-  stamps every recovered position with the applier's engine
-  name (always `mysql` for the MySQL applier) regardless of
-  which reader produced the original. Strict engine-name checks
-  in `decodeBinlogPos` / `decodeVStreamPos` rejected warm-resume
-  on PlanetScale streams with `wrong engine "mysql"; want
-  "planetscale"`. Both decoders now accept the mysql-family
-  aliases (`mysql` or `planetscale`); the cross-engine guard
-  still rejects `postgres` positions.
-- **Postgres UPDATE empty-WHERE under REPLICA IDENTITY DEFAULT**:
-  pgoutput omits `OldTuple` on UPDATEs that don't modify the
-  identity-key columns (the common case under the server-default
-  identity). The CDC reader previously left `Before` nil, and
-  the applier built `UPDATE t SET ... WHERE` with an empty
-  predicate that Postgres rejects with "syntax error at end of
-  input". The reader now synthesises a key-only `Before` from
-  the after-tuple's identity columns. REPLICA IDENTITY NOTHING
-  and tables without identity columns surface a clear error
-  instead of a malformed statement.
-- **MySQL `CURRENT_TIMESTAMP` default precision mismatch**: MySQL
-  rejects `TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP` because the
-  function-call precision must equal the column's. The most
-  common path that hit this was a PG `TIMESTAMPTZ DEFAULT now()`
-  migrating to MySQL — PG reports `Precision=6`, the translator
-  turned `now()` into bare `CURRENT_TIMESTAMP`, leaving
-  precisions mismatched. `emitDefault` now promotes a bare
-  `CURRENT_TIMESTAMP` to `CURRENT_TIMESTAMP(N)` on a
-  `TIMESTAMP`/`DATETIME`/`TIME` column with non-zero precision.
-  Expressions that already carry an explicit precision pass
-  through unchanged.
+- **MySQL target rejects JSON values labelled `_binary`**: PG source columns of type JSONB arriving through a MySQL writer were being sent over the wire with the `_binary` charset prefix, which Vitess (and MySQL strict mode) reject with "Cannot create a JSON value from a string with CHARACTER SET 'binary'". `prepareValue` now converts `[]byte` to `string` for `ir.JSON` columns. Surfaced during PlanetScale-target testing.
+- **Warm-resume engine alias**: `ChangeApplier.ReadPosition` stamps every recovered position with the applier's engine name (always `mysql` for the MySQL applier) regardless of which reader produced the original. Strict engine-name checks in `decodeBinlogPos` / `decodeVStreamPos` rejected warm-resume on PlanetScale streams with `wrong engine "mysql"; want "planetscale"`. Both decoders now accept the mysql-family aliases (`mysql` or `planetscale`); the cross-engine guard still rejects `postgres` positions.
+- **Postgres UPDATE empty-WHERE under REPLICA IDENTITY DEFAULT**: pgoutput omits `OldTuple` on UPDATEs that don't modify the identity-key columns (the common case under the server-default identity). The CDC reader previously left `Before` nil, and the applier built `UPDATE t SET ... WHERE` with an empty predicate that Postgres rejects with "syntax error at end of input". The reader now synthesises a key-only `Before` from the after-tuple's identity columns. REPLICA IDENTITY NOTHING and tables without identity columns surface a clear error instead of a malformed statement.
+- **MySQL `CURRENT_TIMESTAMP` default precision mismatch**: MySQL rejects `TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP` because the function-call precision must equal the column's. The most common path that hit this was a PG `TIMESTAMPTZ DEFAULT now()` migrating to MySQL — PG reports `Precision=6`, the translator turned `now()` into bare `CURRENT_TIMESTAMP`, leaving precisions mismatched. `emitDefault` now promotes a bare `CURRENT_TIMESTAMP` to `CURRENT_TIMESTAMP(N)` on a `TIMESTAMP`/`DATETIME`/`TIME` column with non-zero precision. Expressions that already carry an explicit precision pass through unchanged.
 
 ### Added — docs
 
-- **`docs/postgres-source-prep.md`**: operator checklist for
-  running sluice CDC against a Postgres source — required GUCs,
-  connecting role attributes, slot lifecycle, `wal_status`
-  recovery workflow, and the failover-survival mechanisms
-  (Patroni `slots:`, PlanetScale "Logical slot name" UI,
-  PG 17 `sync_replication_slots`). The PlanetScale section is
-  load-bearing: slot loss on failover is silent without proper
-  permanent-slots config.
-- **README hero example** showing `migrate` / `sync start` /
-  `sync status` end-to-end against the same DSN pair.
-- **CONTRIBUTING test-tag layering**: documents the four build
-  tags (default, integration, integration+postgis,
-  integration+vstream, psverify) and which container images each
-  pulls.
+- **`docs/postgres-source-prep.md`**: operator checklist for running sluice CDC against a Postgres source — required GUCs, connecting role attributes, slot lifecycle, `wal_status` recovery workflow, and the failover-survival mechanisms (Patroni `slots:`, PlanetScale "Logical slot name" UI, PG 17 `sync_replication_slots`). The PlanetScale section is load-bearing: slot loss on failover is silent without proper permanent-slots config.
+- **README hero example** showing `migrate` / `sync start` / `sync status` end-to-end against the same DSN pair.
+- **CONTRIBUTING test-tag layering**: documents the four build tags (default, integration, integration+postgis, integration+vstream, psverify) and which container images each pulls.
 
 ## [0.1.0] - 2026-05-03
 
-The initial tagged release. Captures everything from the design
-pass through the multi-shard Vitess + `sluice sync status`
-chunks. Entries are grouped by capability rather than
-chronologically; `git log` is the source of truth for commit-
-level history.
+The initial tagged release. Captures everything from the design pass through the multi-shard Vitess + `sluice sync status` chunks. Entries are grouped by capability rather than chronologically; `git log` is the source of truth for commit- level history.
 
 ### Added — orchestration
 
-- **Simple-mode `Migrator`**: one-shot schema-and-data migration
-  with three-phase apply (tables-without-constraints → bulk row
-  copy → identity-sequence sync → indexes → foreign keys). Wired
-  into the kong `migrate` subcommand. CLI signals (Ctrl-C) cancel
-  cleanly via context.
-- **Continuous-sync `Streamer`**: long-running snapshot+CDC
-  orchestrator. Cold start captures a consistent snapshot, runs
-  the bulk-copy phase, then tails CDC events through to a target
-  `ChangeApplier`. Warm resume reads the persisted position from
-  the target's control table and skips the snapshot phase
-  entirely. Wired into the `sluice sync start` subcommand.
-- **Translation layer (`internal/translate`)**: per-column
-  type-override layer that consumes the `mappings:` block from
-  `sluice.yaml` and rewrites column types in the IR before the
-  schema-write phase sees them. Strict on missing tables/columns
-  (typos surface as startup errors). Initial alias set covers
-  `text`, `text_array`, `jsonb`, `json`, `bytea`, `varchar`
-  (with optional `length` option), and the eight `postgis_*`
-  geometry shapes (with optional `srid`).
-- **`sluice sync status`** subcommand: prints every continuous-
-  sync stream the target database has been the destination for
-  (one row per `sluice_cdc_state` entry) with stream-id, last-
-  updated wall-clock, human "5m ago" age, and a truncated
-  position token. Filterable to a single stream via
-  `--stream-id`. Tolerant of the target's control table being
-  absent — operators querying status against a fresh target see
-  "no streams recorded" rather than an error. Backed by a new
-  `ChangeApplier.ListStreams` interface method, implemented on
-  both MySQL and Postgres.
+- **Simple-mode `Migrator`**: one-shot schema-and-data migration with three-phase apply (tables-without-constraints → bulk row copy → identity-sequence sync → indexes → foreign keys). Wired into the kong `migrate` subcommand. CLI signals (Ctrl-C) cancel cleanly via context.
+- **Continuous-sync `Streamer`**: long-running snapshot+CDC orchestrator. Cold start captures a consistent snapshot, runs the bulk-copy phase, then tails CDC events through to a target `ChangeApplier`. Warm resume reads the persisted position from the target's control table and skips the snapshot phase entirely. Wired into the `sluice sync start` subcommand.
+- **Translation layer (`internal/translate`)**: per-column type-override layer that consumes the `mappings:` block from `sluice.yaml` and rewrites column types in the IR before the schema-write phase sees them. Strict on missing tables/columns (typos surface as startup errors). Initial alias set covers `text`, `text_array`, `jsonb`, `json`, `bytea`, `varchar` (with optional `length` option), and the eight `postgis_*` geometry shapes (with optional `srid`).
+- **`sluice sync status`** subcommand: prints every continuous- sync stream the target database has been the destination for (one row per `sluice_cdc_state` entry) with stream-id, last- updated wall-clock, human "5m ago" age, and a truncated position token. Filterable to a single stream via `--stream-id`. Tolerant of the target's control table being absent — operators querying status against a fresh target see "no streams recorded" rather than an error. Backed by a new `ChangeApplier.ListStreams` interface method, implemented on both MySQL and Postgres.
 
 ### Added — engines
 
-- **MySQL engine** (vanilla, `mysql:` driver): SchemaReader,
-  SchemaWriter, RowReader, RowWriter (LOAD DATA INFILE),
-  CDCReader (row-based binlog via go-mysql), ChangeApplier,
-  SnapshotStream (REPEATABLE READ + WITH CONSISTENT SNAPSHOT
-  pinned to the binlog position).
-- **PlanetScale MySQL flavor** (`planetscale:` driver): same code
-  paths as vanilla, with a capability declaration that disables
-  `LOAD DATA INFILE` (uses BatchedInsert), turns off
-  user-defined partitioning, and selects the VStream gRPC
-  protocol for CDC.
-- **Postgres engine** (`postgres:` driver): SchemaReader,
-  SchemaWriter (with three-phase apply, identity-sequence sync,
-  PostGIS-aware geometry emission, MySQL SET → TEXT[] with a
-  CHECK constraint), RowReader, RowWriter (COPY FROM STDIN),
-  CDCReader (pgoutput logical replication via pglogrepl),
-  ChangeApplier, SnapshotStream (CREATE_REPLICATION_SLOT +
-  EXPORT_SNAPSHOT + SET TRANSACTION SNAPSHOT for atomic
-  snapshot-to-CDC handoff).
+- **MySQL engine** (vanilla, `mysql:` driver): SchemaReader, SchemaWriter, RowReader, RowWriter (LOAD DATA INFILE), CDCReader (row-based binlog via go-mysql), ChangeApplier, SnapshotStream (REPEATABLE READ + WITH CONSISTENT SNAPSHOT pinned to the binlog position).
+- **PlanetScale MySQL flavor** (`planetscale:` driver): same code paths as vanilla, with a capability declaration that disables `LOAD DATA INFILE` (uses BatchedInsert), turns off user-defined partitioning, and selects the VStream gRPC protocol for CDC.
+- **Postgres engine** (`postgres:` driver): SchemaReader, SchemaWriter (with three-phase apply, identity-sequence sync, PostGIS-aware geometry emission, MySQL SET → TEXT[] with a CHECK constraint), RowReader, RowWriter (COPY FROM STDIN), CDCReader (pgoutput logical replication via pglogrepl), ChangeApplier, SnapshotStream (CREATE_REPLICATION_SLOT + EXPORT_SNAPSHOT + SET TRANSACTION SNAPSHOT for atomic snapshot-to-CDC handoff).
 
 ### Added — managed-service support
 
-- **PlanetScale Postgres** (PS-PG): the vanilla `postgres` engine
-  works against PS-PG without code changes. All six verification
-  phases pass against a real PS-PG account: connectivity, schema
-  reader, simple-mode migration, CDC reader, snapshot+CDC
-  streamer, and cross-engine PS-MySQL → PS-PG. See
-  [docs/managed-services.md](docs/managed-services.md).
-- **PlanetScale MySQL via VStream**: Vitess's gRPC streaming
-  protocol is now sluice's CDC path for the PlanetScale flavor.
-  Capability declaration declares `CDCVStream` so the streamer
-  accepts the flavor. Position encoding is JSON `[]shardGtid`
-  matching Debezium's persistence shape, future-proofing for
-  multi-keyspace migrations.
-- **Vanilla Vitess deployments**: the same `planetscale` flavor
-  covers self-hosted Vitess, with DSN flags to opt out of
-  PlanetScale-specific defaults: `vstream_transport=plaintext`,
-  `vstream_auth=none`, `vstream_shards=<custom>`,
-  `vstream_endpoint=<host:port>`. Verified against
-  `vitess/vttestserver` via testcontainers.
-- **Sharded Vitess keyspaces** are now supported: the VStream
-  reader streams from N shards concurrently (per-shard cursor
-  tracking is built into the `[]shardGtid` position), and the
-  new `vstream_auto_discover_shards=true` DSN flag asks the
-  reader to populate the layout via `SHOW VITESS_SHARDS LIKE
-  '<keyspace>/%'` at Open time. Reshards are detected via the
-  typed `ShardLayoutChangedError` (matchable with `errors.Is`
-  against `ErrShardLayoutChanged`); callers resume on the new
-  layout via `vstreamCDCReader.Reopen`. Validated against
-  `vttestserver` with `NUM_SHARDS=2` (`-80,80-`).
+- **PlanetScale Postgres** (PS-PG): the vanilla `postgres` engine works against PS-PG without code changes. All six verification phases pass against a real PS-PG account: connectivity, schema reader, simple-mode migration, CDC reader, snapshot+CDC streamer, and cross-engine PS-MySQL → PS-PG. See [docs/managed-services.md](docs/managed-services.md).
+- **PlanetScale MySQL via VStream**: Vitess's gRPC streaming protocol is now sluice's CDC path for the PlanetScale flavor. Capability declaration declares `CDCVStream` so the streamer accepts the flavor. Position encoding is JSON `[]shardGtid` matching Debezium's persistence shape, future-proofing for multi-keyspace migrations.
+- **Vanilla Vitess deployments**: the same `planetscale` flavor covers self-hosted Vitess, with DSN flags to opt out of PlanetScale-specific defaults: `vstream_transport=plaintext`, `vstream_auth=none`, `vstream_shards=<custom>`, `vstream_endpoint=<host:port>`. Verified against `vitess/vttestserver` via testcontainers.
+- **Sharded Vitess keyspaces** are now supported: the VStream reader streams from N shards concurrently (per-shard cursor tracking is built into the `[]shardGtid` position), and the new `vstream_auto_discover_shards=true` DSN flag asks the reader to populate the layout via `SHOW VITESS_SHARDS LIKE '<keyspace>/%'` at Open time. Reshards are detected via the typed `ShardLayoutChangedError` (matchable with `errors.Is` against `ErrShardLayoutChanged`); callers resume on the new layout via `vstreamCDCReader.Reopen`. Validated against `vttestserver` with `NUM_SHARDS=2` (`-80,80-`).
 
 ### Added — types and translation policies
 
-- **MySQL SET → PostgreSQL TEXT[]** (default policy): SET columns
-  emerge on the target as `TEXT[]` with a table-level
-  `CONSTRAINT <table>_<column>_set CHECK (... <@ ARRAY[...])`
-  enforcing membership. Comma-separated MySQL DEFAULTs translate
-  to PG array literals so the source default survives the
-  rewrite.
-- **PostGIS-aware GEOMETRY emission**: PG engine detects PostGIS
-  at writer-open time. With the extension installed, ir.Geometry
-  columns emit as `geometry(<subtype>, <srid>)`; without it the
-  existing loud rejection persists (sluice doesn't auto-install
-  extensions). MySQL SRID-prefixed WKB → PostGIS EWKB framing
-  via `wkbToEWKB`. Per-column SRID flows through the translate
-  layer's `postgis_*` aliases. The PG schema reader queries
-  PostGIS's `geometry_columns` view at read time so geometry
-  columns surface in the IR with their precise subtype + SRID
-  (cleanly degrades to `GeometryUnspecified+SRID=0` when PostGIS
-  isn't installed).
-- **TRUNCATE detection in CDC** for both binlog and VStream
-  paths. The narrow `parseTruncateTable` parser recognises
-  `TRUNCATE [TABLE] [<schema>.]<table>` shapes and emits
-  `ir.Truncate`; out-of-shape statements fall through to the
-  cache-invalidation path.
-- **MySQL TINYINT(1) → PG BOOLEAN** through both the snapshot
-  bulk-copy path and the CDC stream, validated by the
-  cross-engine integration test.
-- **MySQL UNSIGNED BIGINT → PG NUMERIC(20,0)**, with auto-
-  increment widening to BIGINT IDENTITY when applicable.
-- **MySQL ENUM → PG enum type** with per-column generated type
-  names, default-value casting handled inline.
-- **MySQL JSON → PG JSONB** by default (canonical fast path);
-  override to `json` (text) via mappings if needed.
+- **MySQL SET → PostgreSQL TEXT[]** (default policy): SET columns emerge on the target as `TEXT[]` with a table-level `CONSTRAINT <table>_<column>_set CHECK (... <@ ARRAY[...])` enforcing membership. Comma-separated MySQL DEFAULTs translate to PG array literals so the source default survives the rewrite.
+- **PostGIS-aware GEOMETRY emission**: PG engine detects PostGIS at writer-open time. With the extension installed, ir.Geometry columns emit as `geometry(<subtype>, <srid>)`; without it the existing loud rejection persists (sluice doesn't auto-install extensions). MySQL SRID-prefixed WKB → PostGIS EWKB framing via `wkbToEWKB`. Per-column SRID flows through the translate layer's `postgis_*` aliases. The PG schema reader queries PostGIS's `geometry_columns` view at read time so geometry columns surface in the IR with their precise subtype + SRID (cleanly degrades to `GeometryUnspecified+SRID=0` when PostGIS isn't installed).
+- **TRUNCATE detection in CDC** for both binlog and VStream paths. The narrow `parseTruncateTable` parser recognises `TRUNCATE [TABLE] [<schema>.]<table>` shapes and emits `ir.Truncate`; out-of-shape statements fall through to the cache-invalidation path.
+- **MySQL TINYINT(1) → PG BOOLEAN** through both the snapshot bulk-copy path and the CDC stream, validated by the cross-engine integration test.
+- **MySQL UNSIGNED BIGINT → PG NUMERIC(20,0)**, with auto- increment widening to BIGINT IDENTITY when applicable.
+- **MySQL ENUM → PG enum type** with per-column generated type names, default-value casting handled inline.
+- **MySQL JSON → PG JSONB** by default (canonical fast path); override to `json` (text) via mappings if needed.
 
 ### Added — testing
 
-- **Integration suite** (`integration` build tag): testcontainers
-  pairs cover MySQL→MySQL, PG→PG, MySQL→PG, PG→MySQL one-shot
-  migrations, plus PG→PG and MySQL→PG continuous-sync streaming
-  with restart-resume. The cross-engine seed exercises every
-  type-translation policy in one fixture.
-- **PostGIS suite** (`integration && postgis` build tag): boots
-  `postgis/postgis:16-3.4`, exercises end-to-end MySQL → PG
-  geometry round-trip with `ST_AsText` verification.
-- **PlanetScale verification suite** (`psverify` build tag):
-  exercises sluice's PG and MySQL paths against a real
-  PlanetScale account using credentials from
-  `PLANETSCALE_CREDENTIALS.env` or env vars. Includes
-  connectivity probe (logs version, wal_level, REPLICATION
-  attribute, PostGIS state), schema reader round-trip, simple-
-  mode migration, CDC reader, continuous-sync streamer, and
-  cross-engine verification. CI workflow at
-  `.github/workflows/psverify.yml` (manual-trigger only).
-- **VStream suite** (`integration && vstream` build tag):
-  testcontainers-based against `vitess/vttestserver:mysql80`,
-  exercises the FlavorPlanetScale CDC path against vanilla
-  Vitess (plaintext + no-auth) including INSERT/UPDATE/DELETE
-  and TRUNCATE.
+- **Integration suite** (`integration` build tag): testcontainers pairs cover MySQL→MySQL, PG→PG, MySQL→PG, PG→MySQL one-shot migrations, plus PG→PG and MySQL→PG continuous-sync streaming with restart-resume. The cross-engine seed exercises every type-translation policy in one fixture.
+- **PostGIS suite** (`integration && postgis` build tag): boots `postgis/postgis:16-3.4`, exercises end-to-end MySQL → PG geometry round-trip with `ST_AsText` verification.
+- **PlanetScale verification suite** (`psverify` build tag): exercises sluice's PG and MySQL paths against a real PlanetScale account using credentials from `PLANETSCALE_CREDENTIALS.env` or env vars. Includes connectivity probe (logs version, wal_level, REPLICATION attribute, PostGIS state), schema reader round-trip, simple- mode migration, CDC reader, continuous-sync streamer, and cross-engine verification. CI workflow at `.github/workflows/psverify.yml` (manual-trigger only).
+- **VStream suite** (`integration && vstream` build tag): testcontainers-based against `vitess/vttestserver:mysql80`, exercises the FlavorPlanetScale CDC path against vanilla Vitess (plaintext + no-auth) including INSERT/UPDATE/DELETE and TRUNCATE.
 
 ### Added — CI
 
-- Four-job CI workflow: cross-platform unit Test (Linux, macOS,
-  Windows), Integration on Linux, Lint, and cross-platform
-  Build smoke-test. Required for branch protection on main.
-- Manual-trigger PlanetScale verification workflow with
-  per-environment secrets for the four PS DSNs.
+- Four-job CI workflow: cross-platform unit Test (Linux, macOS, Windows), Integration on Linux, Lint, and cross-platform Build smoke-test. Required for branch protection on main.
+- Manual-trigger PlanetScale verification workflow with per-environment secrets for the four PS DSNs.
 
 ### Architecture and process
 
-- 10 ADRs in [docs/adr/](docs/adr/) capture the load-bearing
-  design decisions: IR-first translation, sealed interfaces,
-  kong+koanf, three-phase schema apply, MySQL flavors, pgoutput
-  over wal2json, position persistence on the target, go-mysql
-  for binlog parsing, Streamer as separate orchestrator, and
-  idempotent applier semantics.
-- Documentation under [docs/](docs/): architecture overview,
-  type-mapping policies, runtime value contract, testing guide,
-  managed-services compatibility matrix, and a sakila-based
-  end-to-end walkthrough.
+- 10 ADRs in [docs/adr/](docs/adr/) capture the load-bearing design decisions: IR-first translation, sealed interfaces, kong+koanf, three-phase schema apply, MySQL flavors, pgoutput over wal2json, position persistence on the target, go-mysql for binlog parsing, Streamer as separate orchestrator, and idempotent applier semantics.
+- Documentation under [docs/](docs/): architecture overview, type-mapping policies, runtime value contract, testing guide, managed-services compatibility matrix, and a sakila-based end-to-end walkthrough.
 
 ### Removed
 
-- The pre-translate placeholder mappings handling in `Migrator`
-  and `Streamer`. Replaced by `translate.ApplyMappings` between
-  schema-read and schema-write.
+- The pre-translate placeholder mappings handling in `Migrator` and `Streamer`. Replaced by `translate.ApplyMappings` between schema-read and schema-write.
 
 ### Known limitations
 
 (none currently — see the closed entries above.)
 
-[Unreleased]: https://github.com/sluicesync/sluice/compare/v0.7.0...HEAD
-[0.7.0]: https://github.com/sluicesync/sluice/releases/tag/v0.7.0
-[0.6.0]: https://github.com/sluicesync/sluice/releases/tag/v0.6.0
-[0.5.2]: https://github.com/sluicesync/sluice/releases/tag/v0.5.2
-[0.5.1]: https://github.com/sluicesync/sluice/releases/tag/v0.5.1
-[0.5.0]: https://github.com/sluicesync/sluice/releases/tag/v0.5.0
-[0.4.0]: https://github.com/sluicesync/sluice/releases/tag/v0.4.0
-[0.3.2]: https://github.com/sluicesync/sluice/releases/tag/v0.3.2
-[0.3.1]: https://github.com/sluicesync/sluice/releases/tag/v0.3.1
-[0.3.0]: https://github.com/sluicesync/sluice/releases/tag/v0.3.0
-[0.2.2]: https://github.com/sluicesync/sluice/releases/tag/v0.2.2
-[0.2.1]: https://github.com/sluicesync/sluice/releases/tag/v0.2.1
-[0.2.0]: https://github.com/sluicesync/sluice/releases/tag/v0.2.0
-[0.1.0]: https://github.com/sluicesync/sluice/releases/tag/v0.1.0
+[Unreleased]: https://github.com/sluicesync/sluice/compare/v0.7.0...HEAD [0.7.0]: https://github.com/sluicesync/sluice/releases/tag/v0.7.0 [0.6.0]: https://github.com/sluicesync/sluice/releases/tag/v0.6.0 [0.5.2]: https://github.com/sluicesync/sluice/releases/tag/v0.5.2 [0.5.1]: https://github.com/sluicesync/sluice/releases/tag/v0.5.1 [0.5.0]: https://github.com/sluicesync/sluice/releases/tag/v0.5.0 [0.4.0]: https://github.com/sluicesync/sluice/releases/tag/v0.4.0 [0.3.2]: https://github.com/sluicesync/sluice/releases/tag/v0.3.2 [0.3.1]: https://github.com/sluicesync/sluice/releases/tag/v0.3.1 [0.3.0]: https://github.com/sluicesync/sluice/releases/tag/v0.3.0 [0.2.2]: https://github.com/sluicesync/sluice/releases/tag/v0.2.2 [0.2.1]: https://github.com/sluicesync/sluice/releases/tag/v0.2.1 [0.2.0]: https://github.com/sluicesync/sluice/releases/tag/v0.2.0 [0.1.0]: https://github.com/sluicesync/sluice/releases/tag/v0.1.0
