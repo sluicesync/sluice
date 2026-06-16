@@ -292,6 +292,31 @@ type Streamer struct {
 	// not perpetually re-cold-start.
 	RestartFromScratch bool
 
+	// SuppressAutoResnapshotOnInvalidPosition is the OPT-OUT for the
+	// ADR-0093 auto-recovery from a resume against an invalid/purged
+	// source position. Deliberately an opt-out so the ZERO VALUE (false)
+	// is the safe, binlog-parity default — auto-recover — for every
+	// Streamer construction (CLI, tests, future callers) without each
+	// having to set a field. Set true only by `--no-auto-resnapshot`.
+	//
+	// Default (false) = auto-recover: BOTH the pre-flight fall-through
+	// (the ADR-0022 sites in [phaseOpenChangeStream]) AND the reactive
+	// recovery (a [ir.ErrPositionInvalid] surfaced from the VStream
+	// pump's Recv — see ADR-0093 — routed by [Run] / [runWithRetry])
+	// re-enter cold-start in the same Run, non-destructively (the
+	// idempotent COPY writer absorbs the overlap; no target drop). The
+	// reactive recovery is bounded to ONE re-snapshot per Run: a second
+	// consecutive [ir.ErrPositionInvalid] after a fresh cold-start is
+	// terminal — the source is purging faster than a snapshot completes,
+	// which auto-retry cannot fix and must surface loudly.
+	//
+	// True (operator set --no-auto-resnapshot) = both paths suppressed:
+	// [ir.ErrPositionInvalid] surfaces as a loud, actionable terminal
+	// error naming the recovery commands. For operators who would rather
+	// decide a (potentially expensive) full re-snapshot deliberately than
+	// have it happen automatically.
+	SuppressAutoResnapshotOnInvalidPosition bool
+
 	// SchemaAlreadyApplied, when true, declares that the target's
 	// schema (and the `sluice_cdc_state` control table) have been
 	// pre-created out-of-band. Sluice skips every DDL phase during
@@ -742,6 +767,13 @@ type Streamer struct {
 	// in the standard way.
 	sourceErrFn func() error
 
+	// runOnceFn is a test seam: when non-nil, [Run] / [runWithRetry]
+	// invoke it in place of [runOnce]. Production always leaves it nil
+	// (runOnceCall defaults to s.runOnce), so behaviour is identical;
+	// the ADR-0093 reactive-cold-start tests inject a stub here to drive
+	// the retry/recovery loop without booting a full pipeline.
+	runOnceFn func(context.Context) error
+
 	// leaseMgr is the ADR-0054 Shape A Phase 2 live-coordination
 	// lease manager. Constructed by [engageShardCoordination] when
 	// [CoordinateLiveDDL] is true, [InjectShardColumn] is engaged,
@@ -843,10 +875,117 @@ func (s *Streamer) Run(ctx context.Context) error {
 		attempts = 1
 	}
 	if attempts == 1 {
-		// Retry disabled: behaviour identical to v0.41.x.
-		return s.runOnce(ctx)
+		// Retry disabled: single-attempt semantics identical to v0.41.x,
+		// except a reactive [ir.ErrPositionInvalid] is routed to the
+		// one-shot cold-start re-snapshot (ADR-0093) the same as the
+		// retry path — so the VStream purged-position recovery does not
+		// depend on --apply-retry-attempts being set.
+		return s.runOnceWithReactiveResnapshot(ctx)
 	}
 	return s.runWithRetry(ctx, attempts)
+}
+
+// runOnceCall invokes the per-attempt pipeline body. Production leaves
+// [runOnceFn] nil and this calls [runOnce]; the ADR-0093 tests inject a
+// stub so they can drive the reactive-cold-start loop without a full
+// pipeline boot.
+func (s *Streamer) runOnceCall(ctx context.Context) error {
+	if s.runOnceFn != nil {
+		return s.runOnceFn(ctx)
+	}
+	return s.runOnce(ctx)
+}
+
+// runOnceWithReactiveResnapshot runs the pipeline once and, on a reactive
+// [ir.ErrPositionInvalid] (ADR-0093 — e.g. a VStream resume from a purged
+// GTID position surfaced via the pump's Recv), applies the one-shot
+// cold-start re-snapshot recovery. Used by the single-attempt [Run] path;
+// [runWithRetry] inlines the equivalent recovery in its loop so it
+// composes with the ADR-0038 retry budget.
+//
+// Bounded to ONE re-snapshot: a second consecutive ErrPositionInvalid
+// after the forced cold-start is terminal (loud), since it means the
+// source is purging faster than a snapshot completes.
+func (s *Streamer) runOnceWithReactiveResnapshot(ctx context.Context) error {
+	resnapshotted := false
+	for {
+		err := s.runOnceCall(ctx)
+		if !s.isReactiveInvalidPosition(err) {
+			return err
+		}
+		retry, rerr := s.reactiveResnapshotDecision(ctx, err, resnapshotted)
+		if !retry {
+			return rerr
+		}
+		resnapshotted = true
+	}
+}
+
+// isReactiveInvalidPosition reports whether err is an
+// [ir.ErrPositionInvalid] surfaced reactively from a run attempt (ADR-0093)
+// — i.e. invalid-position, and NOT a bare ctx cancellation/deadline. A
+// wrapped retriable error carrying DeadlineExceeded is excluded because it
+// is handled by the retry path, not the cold-start path.
+func (s *Streamer) isReactiveInvalidPosition(err error) bool {
+	if err == nil {
+		return false
+	}
+	if !errors.Is(err, ir.ErrPositionInvalid) {
+		return false
+	}
+	// A genuine ctx termination (operator Ctrl-C / sync stop) must not be
+	// mistaken for an invalid-position recovery trigger. ErrPositionInvalid
+	// never wraps ctx errors in practice, but guard explicitly.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	return true
+}
+
+// reactiveResnapshotDecision implements the ADR-0093 reactive recovery
+// policy for a confirmed [ir.ErrPositionInvalid] (see
+// [isReactiveInvalidPosition]). It returns (retry=true, nil) when the
+// caller should re-run the pipeline once in forced cold-start, or
+// (retry=false, terminalErr) when the position must surface as a loud
+// terminal error.
+//
+//   - auto (default, !Suppress) && !alreadyResnapshotted: log a loud
+//     WARN, set RestartFromScratch so the next attempt re-snapshots
+//     non-destructively, and signal retry.
+//   - auto (default, !Suppress) && alreadyResnapshotted: bounded —
+//     a second consecutive invalid position after a fresh cold-start is
+//     terminal (the source is purging faster than a snapshot completes).
+//   - SuppressAutoResnapshotOnInvalidPosition: opt-out — surface the loud,
+//     actionable terminal error naming the recovery commands.
+func (s *Streamer) reactiveResnapshotDecision(ctx context.Context, err error, alreadyResnapshotted bool) (bool, error) {
+	if s.SuppressAutoResnapshotOnInvalidPosition {
+		return false, invalidPositionOptOutError(err)
+	}
+	if alreadyResnapshotted {
+		return false, fmt.Errorf(
+			"pipeline: source position is still invalid immediately after an automatic cold-start re-snapshot — the source is purging its binlogs/retention faster than a fresh snapshot can complete; this cannot be auto-recovered. Reduce snapshot duration (more --table-parallelism / --bulk-parallelism), widen the source's binlog retention, or run with --no-auto-resnapshot and recover deliberately: %w", err,
+		)
+	}
+	slog.WarnContext(
+		ctx, "source resume position is no longer valid; auto re-snapshotting (cold-start) to recover (ADR-0093). Suppress with --no-auto-resnapshot.",
+		slog.String("stream_id", s.resolveStreamID()),
+		slog.String("err", err.Error()),
+	)
+	// Force a fresh, non-destructive cold-start on the next attempt: the
+	// idempotent COPY writer absorbs the re-copied overlap (no target drop).
+	s.RestartFromScratch = true
+	return true, nil
+}
+
+// invalidPositionOptOutError formats the loud, actionable terminal error
+// returned when --no-auto-resnapshot suppresses the automatic re-snapshot
+// (ADR-0093). It names the explicit recovery commands so the operator can
+// decide. Shared by the reactive path and the pre-flight fall-through
+// sites so the opt-out message is identical everywhere.
+func invalidPositionOptOutError(err error) error {
+	return fmt.Errorf(
+		"pipeline: the persisted source position is no longer valid (older than the source's retained binlogs / purged) and --no-auto-resnapshot is set, so sluice will not auto re-snapshot. Re-run with --restart-from-scratch for a non-destructive fresh cold-start (the idempotent copy absorbs the overlap), or --reset-target-data to drop and re-copy: %w", err,
+	)
 }
 
 // runOnce executes a single snapshot+CDC pipeline attempt. The

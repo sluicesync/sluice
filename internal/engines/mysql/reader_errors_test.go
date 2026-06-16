@@ -125,6 +125,80 @@ func TestClassifyReaderError_SchemaResolution(t *testing.T) {
 	}
 }
 
+// TestClassifyReaderError_PurgedGTID pins the ADR-0093 carve-out: a
+// VStream/PlanetScale resume from a purged GTID position (gtid_purged
+// advanced past the persisted position) surfaces REACTIVELY from the
+// pump's Recv. classifyReaderError must map it to an error that
+// errors.Is(ir.ErrPositionInvalid) so the streamer routes it to a
+// cold-start re-snapshot (ADR-0022 parity) — and must NOT classify it
+// retriable (retrying the same purged position spins forever; the
+// PlanetScale-flavored vtgate error can carry codes.Unknown, which IS in
+// the retriable gRPC set, so the purged check has to win FIRST).
+//
+// Pin-the-class: both known wordings (MySQL 1236 "the master has purged
+// required binary logs" and Vitess's "the source purged required binary
+// logs"), including a gRPC-status-wrapped Unknown variant, are asserted
+// invalid-position-and-not-retriable; a near-miss (bare "purged", no
+// "required binary logs") is asserted to STAY terminal/unchanged so the
+// substring match can't widen into masking unrelated errors.
+func TestClassifyReaderError_PurgedGTID(t *testing.T) {
+	cases := []struct {
+		name            string
+		err             error
+		invalidPosition bool
+	}{
+		{
+			"mysql 1236 master purged",
+			errors.New("Error 1236 (HY000): the master has purged required binary logs and replication is required"),
+			true,
+		},
+		{
+			"vitess source purged",
+			errors.New("vstreamer: the source purged required binary logs needed to resume"),
+			true,
+		},
+		{
+			// PlanetScale-flavored: the purged error arrives as a gRPC
+			// status carrying codes.Unknown (in the ADR-0038 retriable
+			// set). The purged check MUST win before isRetriableGRPCCode,
+			// or this would be (wrongly) retried forever.
+			"purged carried as gRPC Unknown (must not be retriable)",
+			status.Error(codes.Unknown, "vttablet: the source purged required binary logs"),
+			true,
+		},
+		{
+			// Near-miss: "purged" alone, without the discriminating
+			// "required binary logs", is some other error and must stay
+			// terminal/unchanged (not swept into ErrPositionInvalid).
+			"bare purged stays terminal",
+			errors.New("the throttler purged a stale entry"),
+			false,
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			// Wrap as the VStream pump does.
+			wrapped := fmt.Errorf("mysql/vstream: recv: %w", c.err)
+			got := classifyReaderError(wrapped)
+
+			if errors.Is(got, ir.ErrPositionInvalid) != c.invalidPosition {
+				t.Errorf("classifyReaderError(%q): errors.Is(ErrPositionInvalid)=%v, want %v (got %v)",
+					c.name, errors.Is(got, ir.ErrPositionInvalid), c.invalidPosition, got)
+			}
+			// A purged position is NEVER retriable — retrying spins forever.
+			var re ir.RetriableError
+			if c.invalidPosition && errors.As(got, &re) {
+				t.Errorf("classifyReaderError(%q) classified a purged position as retriable; it must be ErrPositionInvalid (terminal-but-recoverable-via-cold-start)", c.name)
+			}
+			// The underlying error must stay reachable for diagnostics.
+			if !errors.Is(got, c.err) {
+				t.Errorf("classifyReaderError(%q) lost the underlying error from the chain", c.name)
+			}
+		})
+	}
+}
+
 // TestClassifyReaderError_GRPCStatusCodes pins the gRPC-status branch
 // the reader classifier adds on top of the SQL-path delegation — the
 // reader-only shape a VStream stream Recv produces on a connection
