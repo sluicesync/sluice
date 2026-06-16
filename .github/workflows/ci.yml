@@ -427,25 +427,38 @@ jobs:
   # pipeline package on top of the postgis-specific tests. v0.28.0's
   # 5 force-tag-moves and ballooning timeout budget surfaced the cost).
   #
-  # The `-run TestMigrate_PostGIS_` filter scopes the run to ONLY the
-  # postgis-tagged tests (the additivity is unavoidable at the build-
-  # tag level, but `-run` selects which tests actually execute). All
-  # postgis-tagged tests live in
-  # internal/pipeline/migrate_postgis_integration_test.go and have
-  # the TestMigrate_PostGIS_ prefix; new postgis tests should follow
-  # this naming convention so the filter keeps them in scope.
+  # The `-run 'PostGIS_'` filter scopes the run to ONLY the postgis
+  # integration suites (the build-tag additivity is unavoidable, but
+  # `-run` selects which tests actually execute). The CONVENTION — made
+  # non-falsifiable by scripts/check-postgis-coverage.sh in the Lint job —
+  # is: every test in a `//go:build … postgis`-tagged file MUST have a
+  # `PostGIS_` segment in its name AND live in a package this job's path
+  # list covers. The three suites today:
+  #   - internal/pipeline/migrate_postgis_integration_test.go
+  #       (TestMigrate_PostGIS_*  — MySQL↔PG geometry round-trips)
+  #   - internal/pipeline/migrate_pg_postgis_passthrough_integration_test.go
+  #       (TestMigrate_PG_PostGIS_*  — PG→PG GiST/SP-GiST/BRIN index +
+  #        geography + Z/ZM/M passthrough + target-missing refusal)
+  #   - internal/engines/postgres/change_applier_pipelined_postgis_integration_test.go
+  #       (TestPipelined_PostGIS_*  — ADR-0092 pipelined-vs-serial geometry
+  #        equivalence pin; this is the guard for the geometry-codec work)
+  # The narrower `TestMigrate_PostGIS_` filter used through v0.99.53 matched
+  # ONLY the first suite — the passthrough (10 tests) and the engine-package
+  # pipelined pin (1 test) compiled but never ran in CI. `PostGIS_` (trailing
+  # underscore) matches all three but EXCLUDES the fast unit tests named
+  # `…PostGIS` without a trailing `_` (e.g. TestPGPostGISEmit_SentinelRefusal),
+  # which already run in the Test job.
   #
-  # Image: postgis/postgis:16-3.4 (~500 MB layer-compressed).
-  # 20m timeout — the suite has 2 tests today (PG↔MySQL round-trips
-  # in both directions); each takes ~30-60s to boot the postgis
-  # container and do its work. Headroom for growth.
+  # Image: ghcr.io/sluicesync/sluice-postgis:16-3.4-prebaked (Task #68).
+  # 30m timeout — the suite has 13 tests today; each boots its own pre-baked
+  # postgis container (~10-30s) and runs under -race. Headroom for growth.
   integration-postgis:
     name: Integration (PostGIS)
     runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     # Disable ryuk on CI — see the integration job's env block.
     env:
       TESTCONTAINERS_RYUK_DISABLED: "true"
-    timeout-minutes: 20
+    timeout-minutes: 30
     # See the integration job's permissions block for the rationale.
     permissions:
       contents: read
@@ -469,7 +482,7 @@ jobs:
             ghcr.io/sluicesync/sluice-mysql:8.0-prebaked \
             ghcr.io/sluicesync/sluice-postgres:16-prebaked \
             ghcr.io/sluicesync/sluice-postgis:16-3.4-prebaked
-      - run: go test -tags="integration postgis" -race -count=1 -timeout=15m -run TestMigrate_PostGIS_ ./internal/pipeline/...
+      - run: go test -tags="integration postgis" -race -count=1 -timeout=25m -run 'PostGIS_' ./internal/pipeline/... ./internal/engines/postgres/...
 
   # ----- Integration (vstream) -----
   # The PlanetScale/Vitess VStream path is exercised end-to-end against a
@@ -576,6 +589,15 @@ jobs:
       # two weeks).
       - name: check integration shard coverage
         run: bash scripts/check-shard-coverage.sh
+
+      # Companion to the shard-coverage guard for the postgis suite: the
+      # Integration (PostGIS) job scopes execution with `-run 'PostGIS_'`
+      # over a hand-maintained path list, so a postgis test can compile
+      # vet-clean yet never RUN. This guard fails CI if any postgis-tagged
+      # test lacks a `PostGIS_` name segment or sits in an uncovered package
+      # (the mechanism that hid 11 postgis tests from CI through v0.99.53).
+      - name: check postgis run coverage
+        run: bash scripts/check-postgis-coverage.sh
 
       - uses: golangci/golangci-lint-action@v9
         with:
