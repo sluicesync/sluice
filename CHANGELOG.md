@@ -2,6 +2,14 @@
 
 All notable changes to sluice are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project follows [Semantic Versioning](https://semver.org/).
 
+## [0.99.62] - 2026-06-16
+
+### Added
+- **A PlanetScale/Vitess source reshard mid-stream is now followed automatically, instead of halting the sync (ADR-0094).** When the source keyspace reshards (a shard split, merge, or `MoveTables`), vtgate emits a JOURNAL marker and ends the stream at the cut. Previously sluice surfaced that as a loud terminal error (`shard layout changed … reopen required`) and the sync stopped until an operator restarted it. The CDC reader already detected the reshard and could rebuild the stream against the new shard layout from the journal-stamped GTIDs (proven exactly-once by the reshard chaos test), but the orchestrator never invoked that path. It now does: on the reshard signal the Streamer reopens the stream onto the new layout and continues applying, with no gap and no overlap at the seam (the journal GTIDs anchor the cut), no re-snapshot, and no operator intervention. The follow is bounded (a pathological reshard storm or a misbehaving reader still fails loud rather than spinning), and a pending schema-forwarding error is never masked by a reopen. Validated end-to-end on a real multi-process Vitess cluster: a cold-started sync through a live 1→2 reshard lands every pre- and post-reshard row exactly once on the target.
+
+### Notes
+- Scope: single-stream Vitess/PlanetScale (VStream) sync. Reshard while `--inject-shard-column` (Shape-A multi-shard consolidation) is engaged is intentionally **not** auto-followed yet — that interplay is deferred to a follow-up; it keeps the prior loud-terminal behavior. No effect on non-Vitess sources.
+
 ## [0.99.61] - 2026-06-16
 
 ### Added
