@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 	"time"
 
@@ -97,6 +98,19 @@ func vstreamCopyFilterRules(tables []string) []*binlogdata.Rule {
 // writer) rather than the per-row CDC apply path the plain CDC reader
 // would use. On COPY completion it transitions to CDC exactly as a fresh
 // cold-start does.
+//
+// Auto-shard composes with resume (ADR-0098). When the scope has more than
+// one table (and the operator hasn't opted out via
+// vstream_copy_single_stream), BOTH a fresh start AND a resume drive the
+// per-table auto-shard pump ([copyPumpAutoShard]) — one single-table COPY at
+// a time, constant memory, NO interleave. On a resume the persisted cursor
+// names the one in-progress table; the pump re-copies the tables before it
+// idempotently, resumes that table from its cursor, and copies the tables
+// after it fresh ([resolveResumeAutoShard]). This is the fix for the bug
+// where a resume of a large multi-table keyspace fell back to the legacy
+// single keyspace-wide interleaved stream and crash-looped on the ADR-0071
+// buffer cap. A single-table scope (or the opt-out) keeps the legacy
+// single-stream resume path.
 //
 // A non-nil start is REQUIRED to carry a TablePKs cursor on at least one
 // shard (the caller is resuming an interrupted COPY); seeding a bulk
@@ -194,20 +208,59 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 	// can't fail for it — but the resume cursor's base64 TableLastPK can
 	// (corrupt persisted token), and the general decode returns an error,
 	// so we handle it.
-	// Auto-shard-by-table eligibility (ADR-0095): copy each table as its
-	// own single-table VStream (constant memory, no interleave) instead of
-	// one keyspace-wide interleaved stream. Engaged on a FRESH cold-start
-	// (start == nil — a per-shard-TablePKs resume is per-table already and
-	// stays on the single-stream resume path) with MORE THAN ONE table in
-	// scope, unless the operator opts out via vstream_copy_single_stream.
-	// A one-table scope is already constant-memory single-stream, so
-	// auto-shard adds nothing there. The order is the caller's filtered
-	// table order, which matches the orchestrator's per-table ReadRows
-	// order — the invariant that keeps exactly one table in flight.
-	autoShard := start == nil && len(tables) > 1 && !vstreamCopySingleStreamFromDSN(cfg)
+	// Auto-shard-by-table eligibility (ADR-0095, extended to resume by
+	// ADR-0098): copy each table as its own single-table VStream (constant
+	// memory, no interleave) instead of one keyspace-wide interleaved
+	// stream. Engaged with MORE THAN ONE table in scope, unless the operator
+	// opts out via vstream_copy_single_stream — for BOTH a fresh cold-start
+	// (start == nil) AND an interrupted-cold-start RESUME (start != nil
+	// carrying a per-table TablePKs cursor). A one-table scope is already
+	// constant-memory single-stream, so auto-shard adds nothing there. The
+	// order is the caller's filtered table order, which matches the
+	// orchestrator's per-table ReadRows order — the invariant that keeps
+	// exactly one table in flight.
+	//
+	// ADR-0098: the resume gate USED to require start == nil, so a resume of
+	// a >1-table keyspace fell back to the legacy single keyspace-wide
+	// interleaved stream — which re-introduced the very multi-table
+	// interleave ADR-0095 removed, crash-looping on the ADR-0071 cap for any
+	// large keyspace. Resume is now auto-shard-aware: the persisted cursor
+	// names exactly the in-progress table (the only table carrying TablePKs);
+	// the per-table loop re-copies the tables before it idempotently
+	// (Bug-125 upsert absorbs the overlap), resumes that table from its
+	// cursor, and copies the tables after it fresh. See resolveResumeAutoShard.
+	autoShard := len(tables) > 1 && !vstreamCopySingleStreamFromDSN(cfg)
 
+	// resumeSeed/resumeSeedTable carry the persisted cursor into the
+	// auto-shard pump (ADR-0098): when resuming, the pump seeds the
+	// in-progress table's per-table COPY from this cursor instead of
+	// from-beginning. resolveResumeAutoShard validates the persisted cursor
+	// names exactly one in-scope table and returns its name; a cursor that
+	// can't be placed in the table sequence is refused loudly rather than
+	// silently re-copying or skipping.
+	var (
+		resumeSeed      []shardGtid
+		resumeSeedTable string
+	)
+	if start != nil && autoShard {
+		seedTable, rerr := resolveResumeAutoShard(start, tables)
+		if rerr != nil {
+			streamCancel()
+			_ = conn.Close()
+			return nil, rerr
+		}
+		resumeSeed = start
+		resumeSeedTable = seedTable
+	}
+
+	// In auto-shard mode the constructor's stream for table[0] is always
+	// opened from the BEGINNING (the fresh-cold-start shape). On a resume the
+	// pump's first iteration reopens table[0] with the seed when table[0] IS
+	// the in-progress table (resumeSeedTable == tables[0]); a single-stream
+	// (non-auto-shard) resume keeps seeding the one stream from the cursor as
+	// before. This keeps exactly one per-table open path in the pump.
 	startPos := start
-	if startPos == nil {
+	if startPos == nil || autoShard {
 		startPos = fromBeginningVStreamPos(keyspace, shards)
 	}
 	protoShardGtids, err := toProtoShardGtids(startPos)
@@ -252,9 +305,16 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 	if autoShard {
 		reconnectScope = []string{tables[0]}
 		seq = tables
-		slog.InfoContext(ctx, "mysql/vstream: snapshot: auto-shard-by-table COPY (one table at a time, bounded memory)",
-			slog.String("keyspace", keyspace),
-			slog.Int("tables", len(tables)))
+		if resumeSeedTable != "" {
+			slog.InfoContext(ctx, "mysql/vstream: snapshot: auto-shard-by-table COPY RESUME (one table at a time, bounded memory; in-progress table seeded from cursor)",
+				slog.String("keyspace", keyspace),
+				slog.Int("tables", len(tables)),
+				slog.String("resume_table", resumeSeedTable))
+		} else {
+			slog.InfoContext(ctx, "mysql/vstream: snapshot: auto-shard-by-table COPY (one table at a time, bounded memory)",
+				slog.String("keyspace", keyspace),
+				slog.Int("tables", len(tables)))
+		}
 	}
 
 	snap := &vstreamSnapshotStream{
@@ -263,6 +323,8 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 		shards:               shards,
 		copyTables:           reconnectScope,
 		copyTablesSeq:        seq,
+		resumeSeed:           resumeSeed,
+		resumeSeedTable:      resumeSeedTable,
 		tableCopyComplete:    make(map[string]bool),
 		reconnectMax:         defaultCopyReconnectMax,
 		reconnectBackoffBase: defaultCopyReconnectBackoffBase,
@@ -419,6 +481,21 @@ type vstreamSnapshotStream struct {
 	// table's COPY_COMPLETED arrives); read under mu by helpers that name
 	// the active table in log/error messages.
 	autoShardIdx int
+
+	// resumeSeed / resumeSeedTable carry the persisted mid-COPY cursor into
+	// the auto-shard pump on an interrupted-cold-start RESUME (ADR-0098).
+	// resumeSeedTable is the unqualified name of the in-progress table the
+	// persisted cursor names (the only table carrying TablePKs); resumeSeed
+	// is the full []shardGtid resume position. When the auto-shard pump
+	// reaches resumeSeedTable it opens that table's per-table COPY SEEDED
+	// from resumeSeed (so vtgate continues the scan from the last-copied PK)
+	// instead of from-beginning; every other table in the sequence opens
+	// from-beginning (the tables before it are re-copied idempotently — the
+	// Bug-125 upsert absorbs the overlap — and the tables after it are fresh).
+	// Empty (resumeSeedTable == "") on a fresh cold-start. Set at
+	// construction; read by the pump.
+	resumeSeed      []shardGtid
+	resumeSeedTable string
 
 	// perTableSnapshots accumulates each completed per-table COPY's
 	// snapshot VGTID (P_i), in copyTablesSeq order (ADR-0095). After the
@@ -832,6 +909,94 @@ func (s *vstreamSnapshotStream) copyPump(ctx context.Context, cancel context.Can
 	}
 }
 
+// resolveResumeAutoShard validates that a persisted mid-COPY resume
+// position (start) can drive the ADR-0098 auto-shard-aware resume over the
+// in-scope table sequence, and returns the unqualified name of the
+// in-progress table the cursor names.
+//
+// The persisted position carries a per-shard TablePKs cursor for EXACTLY the
+// one table whose per-table COPY was in flight when the run was interrupted
+// (auto-shard scopes each per-table COPY to a single table, so vtgate only
+// ever emits a TablePKs entry for that one table). The auto-shard pump then:
+//
+//   - re-copies every table BEFORE the in-progress one from-beginning
+//     (idempotent upsert absorbs the re-copy overlap, Bug-125), so each
+//     contributes a fresh per-table snapshot to the stitch;
+//   - resumes the in-progress table from its cursor (vtgate continues the
+//     scan from the last-copied PK, no row-0 restart);
+//   - copies every table AFTER it fresh.
+//
+// It refuses LOUDLY (never silently re-copies or skips) when:
+//
+//   - the cursor names MORE THAN ONE table (a single-stream / legacy
+//     interleaved-resume token, or a corrupt one) — auto-shard cannot place
+//     a multi-table cursor in the per-table sequence safely;
+//   - the cursor names a table NOT in the current in-scope sequence (an
+//     --include-table change since the checkpoint, or a stale token) — the
+//     operator-facing error names the table so the mismatch is diagnosable.
+//
+// A position with no TablePKs cursor never reaches here (the resume entry
+// point gates on anyTablePKsPresent before calling).
+func resolveResumeAutoShard(start []shardGtid, tables []string) (string, error) {
+	inScope := make(map[string]bool, len(tables))
+	for _, t := range tables {
+		inScope[t] = true
+	}
+
+	cursorTables := make(map[string]bool)
+	for _, sg := range start {
+		decoded, err := decodeTablePKs(sg.TablePKs)
+		if err != nil {
+			return "", fmt.Errorf("mysql/vstream: snapshot resume: auto-shard: decode TablePKs cursor: %w", err)
+		}
+		for _, pk := range decoded {
+			if name := pk.GetTableName(); name != "" {
+				cursorTables[name] = true
+			}
+		}
+	}
+
+	switch len(cursorTables) {
+	case 0:
+		// The resume entry point gates on anyTablePKsPresent, so an empty
+		// cursor here is a contract violation — refuse rather than silently
+		// re-copy the whole keyspace from row 0.
+		return "", errors.New(
+			"mysql/vstream: snapshot resume: auto-shard: position carries no in-progress table cursor; " +
+				"refusing to drive an auto-shard resume without a seed (the cursor-less warm-resume belongs on the plain CDC path)",
+		)
+	case 1:
+		// fallthrough to the single-table extraction below.
+	default:
+		names := make([]string, 0, len(cursorTables))
+		for n := range cursorTables {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		return "", fmt.Errorf(
+			"mysql/vstream: snapshot resume: auto-shard: persisted cursor names %d tables (%v); "+
+				"auto-shard resume expects a single in-progress table cursor. This token was written by the legacy "+
+				"single keyspace-wide COPY (pre-ADR-0098) or is corrupt — re-run with vstream_copy_single_stream=true "+
+				"to resume it on the legacy path, or restart the cold-start (the idempotent COPY writer absorbs the re-copy)",
+			len(cursorTables), names,
+		)
+	}
+
+	var seedTable string
+	for n := range cursorTables {
+		seedTable = n
+	}
+	if !inScope[seedTable] {
+		return "", fmt.Errorf(
+			"mysql/vstream: snapshot resume: auto-shard: persisted cursor names in-progress table %q, "+
+				"which is not in the current in-scope table set %v (an --include-table change since the checkpoint, "+
+				"or a stale token). Restore the original table scope to resume, or restart the cold-start",
+			seedTable, tables,
+		)
+	}
+	return seedTable, nil
+}
+
 // copyPumpAutoShard is the auto-shard-by-table COPY driver (ADR-0095). It
 // copies each table in s.copyTablesSeq as its OWN single-table VStream —
 // constant memory, no interleave — sequentially on the same gRPC
@@ -869,11 +1034,27 @@ func (s *vstreamSnapshotStream) copyPumpAutoShard(ctx context.Context, cancel co
 		s.mu.Unlock()
 
 		// Reopen the stream scoped to this table for every table after the
-		// first (the constructor already opened table[0]). Reopening on a
-		// FRESH from-beginning cursor for the new table is correct: each
-		// single-table COPY is independent and captures its own snapshot
-		// point; there is no cross-table cursor to carry.
-		if idx > 0 {
+		// first (the constructor already opened table[0] from-beginning).
+		// Reopening on a FRESH from-beginning cursor for the new table is
+		// correct for a cold-start: each single-table COPY is independent
+		// and captures its own snapshot point; there is no cross-table
+		// cursor to carry.
+		//
+		// ADR-0098 resume: when this table IS the in-progress table the
+		// persisted cursor names (resumeSeedTable), reopen it SEEDED from
+		// resumeSeed so vtgate continues the COPY scan from the last-copied
+		// PK rather than from row 0 — even when it is table[0] (the
+		// constructor opened table[0] from-beginning, so we must reopen it
+		// seeded here). Tables BEFORE the in-progress table are re-copied
+		// from-beginning (idempotent upsert absorbs the overlap, Bug-125);
+		// tables AFTER it are fresh from-beginning.
+		switch {
+		case s.resumeSeedTable != "" && table == s.resumeSeedTable:
+			if err := s.reopenForTableSeeded(ctx, table, s.resumeSeed); err != nil {
+				s.failCopy(err)
+				return
+			}
+		case idx > 0:
 			if err := s.reopenForTable(ctx, table); err != nil {
 				s.failCopy(err)
 				return
@@ -1005,7 +1186,22 @@ func (s *vstreamSnapshotStream) pumpOneTableCopy(ctx context.Context, cancel con
 // cursor. copyTables is rewritten to the new single table so a subsequent
 // [reconnectCopy] re-applies the correct (one-table) scope.
 func (s *vstreamSnapshotStream) reopenForTable(ctx context.Context, table string) error {
-	startPos := fromBeginningVStreamPos(s.keyspace, s.shards)
+	return s.reopenForTableSeeded(ctx, table, nil)
+}
+
+// reopenForTableSeeded is [reopenForTable] with an explicit start position:
+// nil (the cold-start / fresh-table case) seeds the per-table COPY from the
+// beginning; a non-nil seed (ADR-0098 resume) seeds it from the persisted
+// per-shard cursor (Gtid + TablePKs) so vtgate continues the in-progress
+// table's COPY scan from the last-copied PK rather than restarting at row 0.
+// The seed carries TablePKs for exactly the one in-progress table; that is
+// the correct per-table cursor because in auto-shard mode the stream is
+// scoped to a single table, so vtgate's resume clause names only that table.
+func (s *vstreamSnapshotStream) reopenForTableSeeded(ctx context.Context, table string, seed []shardGtid) error {
+	startPos := seed
+	if startPos == nil {
+		startPos = fromBeginningVStreamPos(s.keyspace, s.shards)
+	}
 	protoShardGtids, err := toProtoShardGtids(startPos)
 	if err != nil {
 		return fmt.Errorf("mysql/vstream: snapshot: auto-shard: build start position for %q: %w", table, err)
@@ -1028,9 +1224,15 @@ func (s *vstreamSnapshotStream) reopenForTable(ctx context.Context, table string
 	s.grpcStream = grpcStream
 	s.copyTables = []string{table}
 	s.mu.Unlock()
-	slog.DebugContext(ctx, "mysql/vstream: snapshot: auto-shard advanced to next table COPY",
-		slog.String("keyspace", s.keyspace),
-		slog.String("table", table))
+	if seed != nil {
+		slog.DebugContext(ctx, "mysql/vstream: snapshot: auto-shard resumed in-progress table COPY from cursor",
+			slog.String("keyspace", s.keyspace),
+			slog.String("table", table))
+	} else {
+		slog.DebugContext(ctx, "mysql/vstream: snapshot: auto-shard advanced to next table COPY",
+			slog.String("keyspace", s.keyspace),
+			slog.String("table", table))
+	}
 	return nil
 }
 
