@@ -564,6 +564,35 @@ type vstreamSnapshotStream struct {
 	// when the whole keyspace copy ends. Guarded by mu/cond.
 	tableCopyComplete map[string]bool
 
+	// --- per-stream byte budget (ADR-0099 §2, the deadlock fix) ---
+	//
+	// The concurrent cross-table COPY (ADR-0099) runs K independent producer
+	// streams against ONE shared rowBuffer + byte cap, but the orchestrator
+	// consumer drains tables ONE AT A TIME. If all K streams shared the single
+	// maxBufferBytes cap, a stream racing ahead on a look-ahead table the
+	// consumer hasn't reached yet could fill the whole cap, leaving the stream
+	// that owns the table the consumer IS draining unable to enqueue its first
+	// row — a liveness deadlock the progress watchdog only escapes from after
+	// ~10 minutes (the LOUD timeout). We give each of the K streams its OWN
+	// byte sub-budget = maxBufferBytes / K (perStreamCap): a look-ahead stream
+	// parks on its OWN sub-cap (bounded), while the stream whose table is being
+	// drained always has its full sub-cap free to produce. Total bounded memory
+	// is unchanged (K × (cap/K) = cap).
+	//
+	// perStreamBytes[idx] is the running ApproximateRowBytes sum currently
+	// buffered by stream idx (incremented on enqueue by the producing stream,
+	// debited on ReadRows handoff via tableStreamIdx). perStreamCap is the
+	// per-stream sub-budget (>= 1; floored so a stream can always make
+	// progress one row at a time even at a tiny cap / large K, matching the
+	// single-row-exceeds-cap fallback of the sequential enqueueRowLocked).
+	// tableStreamIdx maps each in-scope table to the index of the stream that
+	// produces it (the disjoint partition, built once before the pumps start;
+	// read-only thereafter). nil/empty on every non-concurrent path — the
+	// sequential pumps never touch these. Guarded by mu.
+	perStreamBytes []int64
+	perStreamCap   int64
+	tableStreamIdx map[string]int
+
 	// reconnectMax is the in-place COPY-reconnect budget (Phase C):
 	// consecutive retriable Recv failures the pump absorbs before giving
 	// up and failing the COPY (the outer runWithRetry then becomes the
@@ -2557,7 +2586,19 @@ func (r *vstreamSnapshotRows) ReadRows(ctx context.Context, table *ir.Table) (<-
 			row := queue[0]
 			queue[0] = nil
 			s.rowBuffer[tableName] = queue[1:]
-			s.bufferedBytes -= ir.ApproximateRowBytes(row)
+			rowBytes := ir.ApproximateRowBytes(row)
+			s.bufferedBytes -= rowBytes
+			// Concurrent COPY (ADR-0099): also credit the PRODUCING stream's
+			// own sub-budget so its backpressure (enqueueConcurrentRowLocked,
+			// which waits on perStreamBytes[idx] vs perStreamCap) is relieved
+			// by this drain. tableStreamIdx is nil on the sequential paths, so
+			// this is a clean no-op there. The disjoint partition guarantees
+			// exactly one producing stream per table.
+			if s.tableStreamIdx != nil {
+				if idx, ok := s.tableStreamIdx[tableName]; ok {
+					s.perStreamBytes[idx] -= rowBytes
+				}
+			}
 			s.cond.Broadcast()
 			s.mu.Unlock()
 

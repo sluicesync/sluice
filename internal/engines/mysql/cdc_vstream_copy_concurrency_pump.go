@@ -103,6 +103,30 @@ type copyStream struct {
 func (s *vstreamSnapshotStream) copyPumpAutoShardConcurrent(ctx context.Context, cancel context.CancelFunc, stream *ir.SnapshotStream, groups [][]string) {
 	defer close(s.copyDone)
 
+	// Per-stream byte budget (ADR-0099 §2, the deadlock fix). Each of the K
+	// streams gets its OWN sub-cap = maxBufferBytes / K so one stream's
+	// look-ahead can't starve the cap the consumer's active stream needs (see
+	// the perStreamBytes field doc). Build the table→stream index from the
+	// disjoint partition BEFORE the pumps start so the ReadRows debit can
+	// credit the right stream. perStreamCap floors at 1 byte: a stream's queue
+	// is always allowed at least one in-flight row regardless of how tiny
+	// cap/K is (the single-row-exceeds-cap fallback, per stream), so a tiny
+	// cap degrades to one-row-at-a-time rather than wedging.
+	s.mu.Lock()
+	k := len(groups)
+	s.perStreamBytes = make([]int64, k)
+	s.perStreamCap = s.maxBufferBytes / int64(k)
+	if s.perStreamCap < 1 {
+		s.perStreamCap = 1
+	}
+	s.tableStreamIdx = make(map[string]int)
+	for g := range groups {
+		for _, t := range groups[g] {
+			s.tableStreamIdx[t] = g
+		}
+	}
+	s.mu.Unlock()
+
 	// Place the ADR-0098 resume seed into the ONE group whose table set
 	// contains the in-progress table the persisted cursor names. The other
 	// groups re-copy their tables fresh (idempotent upsert absorbs any
@@ -132,6 +156,18 @@ func (s *vstreamSnapshotStream) copyPumpAutoShardConcurrent(ctx context.Context,
 		slog.String("keyspace", s.keyspace),
 		slog.Int("streams", len(groups)),
 		slog.Int("tables", len(s.copyTablesSeq)))
+
+	// Connection-demand honesty (ADR-0099 §3). K (the concurrent-stream count)
+	// is a source-DSN knob opaque to the pipeline's target connection-budget
+	// preflight, which only resolves D (the ADR-0097 write fan-out degree) —
+	// so K is NOT folded into that preflight in v1. We surface the source-side
+	// demand (K concurrent gRPC streams) and the operator's manual
+	// responsibility here rather than silently letting K × D exceed the
+	// target's slots. K × D ≤ --max-target-connections is the operator
+	// contract; see ADR-0099 §3.
+	slog.WarnContext(ctx, "mysql/vstream: snapshot: concurrent COPY opens K source streams, each driving the write fan-out (D) on the target; "+
+		"ensure K × D ≤ --max-target-connections (K is a source-DSN knob, NOT auto-clamped against the target connection budget — ADR-0099 §3)",
+		slog.Int("streams_k", len(groups)))
 
 	var wg sync.WaitGroup
 	for g := range seeds {
@@ -427,11 +463,11 @@ func (cs *copyStream) dispatchCopyEvent(table string, ev *binlogdata.VEvent) (bo
 // bufferRow decodes a COPY-phase ROW for this stream's table and appends
 // each row to the parent's SHARED rowBuffer under the parent mu/cond. The
 // partition is disjoint, so this table's queue has exactly this stream as
-// its producer — but the byte cap is shared across all K streams' in-flight
-// queues, so the enqueue backpressures (cond.Wait) against the SHARED
-// bufferedBytes, which the K consumers' ReadRows debits relieve. This is
-// where K × one-table memory is bounded by K × the per-stream slack under
-// one shared cap.
+// its producer. Backpressure is against this stream's OWN byte sub-budget
+// (perStreamCap = maxBufferBytes / K), NOT the shared total — so one
+// stream's look-ahead can't starve the cap the consumer's active stream
+// needs (ADR-0099 §2, the deadlock fix). K × perStreamCap = maxBufferBytes,
+// so total in-flight memory is still bounded by the cap.
 func (cs *copyStream) bufferRow(table string, ev *binlogdata.VEvent) error {
 	s := cs.parent
 	rev := ev.GetRowEvent()
@@ -454,7 +490,7 @@ func (cs *copyStream) bufferRow(table string, ev *binlogdata.VEvent) error {
 		if !ok {
 			continue
 		}
-		if err := s.enqueueConcurrentRowLocked(tableName, row); err != nil {
+		if err := s.enqueueConcurrentRowLocked(cs.idx, tableName, row); err != nil {
 			return err
 		}
 	}
@@ -462,28 +498,41 @@ func (cs *copyStream) bufferRow(table string, ev *binlogdata.VEvent) error {
 }
 
 // enqueueConcurrentRowLocked appends one COPY row to tableName's SHARED
-// queue under the SHARED byte cap (ADR-0099). It is the concurrent-pump
-// analogue of enqueueRowLocked, taking the parent mu itself (the sequential
-// enqueueRowLocked assumes the caller already holds mu via dispatchCopyEvent;
-// here each stream's pump dispatches without holding the lock, so we acquire
-// it here).
+// queue under the PRODUCING STREAM's OWN byte sub-budget (ADR-0099 §2). It
+// is the concurrent-pump analogue of enqueueRowLocked, taking the parent mu
+// itself (the sequential enqueueRowLocked assumes the caller already holds
+// mu via dispatchCopyEvent; here each stream's pump dispatches without
+// holding the lock, so we acquire it here).
 //
-// Backpressure: when the append would push the SHARED bufferedBytes over the
-// cap, it waits on cond until a consumer drains enough — UNLESS this table's
-// own queue is empty (bufferedBytes is over cap because OTHER streams' tables
-// are buffered): in auto-shard / concurrent mode there is no cross-table
-// loud-refusal (every buffered table has, or imminently will have, a
-// draining consumer — the orchestrator drains every table), so waiting is
-// always correct. The ADR-0071 cross-table refusal is the single-stream
-// INTERLEAVE guard only; it never fires here (copyTablesSeq is non-empty).
+// Backpressure — the deadlock fix. Each of the K streams has its OWN sub-cap
+// (perStreamCap = maxBufferBytes / K). The append waits on cond only while
+// THIS stream's own in-flight bytes (perStreamBytes[streamIdx]) plus the new
+// row would exceed THIS stream's sub-cap — NOT the shared total. Why this
+// removes the wedge: the consumer drains tables one at a time; when it is
+// draining table tᵢ owned by stream S, S's earlier tables are already
+// consumed (perStreamBytes[S] is only tᵢ's in-flight bytes), so S's sub-cap
+// has room and S can always enqueue tᵢ — the consumer is actively debiting
+// it. The OTHER streams' look-ahead tables park on THEIR OWN sub-caps
+// (bounded), never on S's, so they can't starve the table the consumer is
+// waiting on. Under one shared cap a look-ahead stream could fill the whole
+// cap and strand S's first row → the ~10-minute progress-watchdog abort.
 //
-// A shutdown (s.err / s.copyComplete flipped by close/failCopy) unwedges a
-// parked wait loudly.
-func (s *vstreamSnapshotStream) enqueueConcurrentRowLocked(tableName string, row ir.Row) error {
+// Single-row-exceeds-sub-cap fallback (mirrors the sequential path): when
+// THIS stream's queue is empty (perStreamBytes[streamIdx] == 0) a single row
+// larger than the sub-cap still goes through, so a tiny cap / large K
+// degrades to one-row-at-a-time per stream rather than wedging.
+//
+// In auto-shard / concurrent mode there is no cross-table loud-refusal
+// (every buffered table has, or imminently will have, a draining consumer —
+// the orchestrator drains every table), so waiting is always correct; the
+// ADR-0071 cross-table refusal is the single-stream INTERLEAVE guard only,
+// never reached here. A shutdown (s.err / s.copyComplete flipped by
+// close/failCopy) unwedges a parked wait loudly.
+func (s *vstreamSnapshotStream) enqueueConcurrentRowLocked(streamIdx int, tableName string, row ir.Row) error {
 	rowBytes := ir.ApproximateRowBytes(row)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for s.bufferedBytes > 0 && s.bufferedBytes+rowBytes > s.maxBufferBytes {
+	for s.perStreamBytes[streamIdx] > 0 && s.perStreamBytes[streamIdx]+rowBytes > s.perStreamCap {
 		if s.err != nil {
 			return s.err
 		}
@@ -494,6 +543,7 @@ func (s *vstreamSnapshotStream) enqueueConcurrentRowLocked(tableName string, row
 	}
 	s.rowBuffer[tableName] = append(s.rowBuffer[tableName], row)
 	s.bufferedBytes += rowBytes
+	s.perStreamBytes[streamIdx] += rowBytes
 	s.broadcast()
 	return nil
 }

@@ -11,6 +11,7 @@ import (
 
 	"google.golang.org/grpc"
 	"vitess.io/vitess/go/vt/proto/binlogdata"
+	"vitess.io/vitess/go/vt/proto/query"
 	"vitess.io/vitess/go/vt/proto/vtgate"
 	"vitess.io/vitess/go/vt/proto/vtgateservice"
 
@@ -463,5 +464,386 @@ func TestVStreamConcurrent_CtxCancelNoLeak(t *testing.T) {
 	case <-s.copyDone:
 	case <-time.After(10 * time.Second):
 		t.Fatal("concurrent copy did not unwind on ctx-cancel")
+	}
+}
+
+// bigRowTableScript is perTableCopyScript with a SINGLE row whose payload is
+// large enough to fill a tight shared byte cap by itself. Used by the
+// liveness-deadlock pin to make one look-ahead table monopolize the cap.
+func bigRowTableScript(table, gtid string, payloadBytes int) []*vtgate.VStreamResponse {
+	field := &binlogdata.VEvent{
+		Type: binlogdata.VEventType_FIELD,
+		FieldEvent: &binlogdata.FieldEvent{
+			TableName: table,
+			Keyspace:  "main",
+			Shard:     "-",
+			Fields:    []*query.Field{{Name: "id", Type: query.Type_INT64}},
+		},
+	}
+	big := make([]byte, payloadBytes)
+	for i := range big {
+		big[i] = 'x'
+	}
+	row := &binlogdata.VEvent{
+		Type: binlogdata.VEventType_ROW,
+		RowEvent: &binlogdata.RowEvent{
+			TableName:  table,
+			Keyspace:   "main",
+			Shard:      "-",
+			RowChanges: []*binlogdata.RowChange{{After: makeRow([]string{string(big)})}},
+		},
+	}
+	return []*vtgate.VStreamResponse{
+		oneEvent(field), oneEvent(row),
+		oneEvent(snapVgtidEvent(gtid)), oneEvent(globalCopyCompleted()),
+	}
+}
+
+// TestVStreamConcurrent_PerStreamCapNoDeadlock is the ADR-0099 §2
+// liveness-deadlock pin (the BLOCKER the value-fidelity review found). It
+// reproduces the exact wedge: K=2 over groups [a,c]/[b,d] under a tight
+// SHARED cap, where a LOOK-AHEAD table (c, stream 0's second table) fills the
+// whole cap before the stream that owns the consumer's NEXT table (b, stream
+// 1) can enqueue its first row.
+//
+// Sequence on the OLD shared-cap code:
+//   - stream 0 copies "a" (small, the consumer drains it), advances to "c",
+//     and enqueues c's single OVERSIZED row — admitted because the shared
+//     buffer was momentarily empty (the single-row-exceeds-cap fallback), so
+//     bufferedBytes is now > cap;
+//   - stream 1 tries to enqueue "b"'s first row but bufferedBytes is already
+//     over cap (held by c, a look-ahead table) → it PARKS;
+//   - the consumer finishes "a", moves to "b" — but b has NO rows (stream 1
+//     is parked) → the consumer BLOCKS;
+//   - c's row never drains (the consumer won't reach table c until it
+//     finishes b) → WEDGE. With the watchdog disabled in the unit harness
+//     this hangs forever; in production the ~10-minute progress watchdog
+//     aborts LOUDLY.
+//
+// With the per-stream sub-budget (ADR-0099 §2) c counts only against stream
+// 0's own sub-cap, so stream 1's sub-cap is free: it enqueues b, the consumer
+// drains b then c, and the copy COMPLETES. This test FAILS (times out) on the
+// shared-cap code and PASSES on the per-stream-cap fix.
+func TestVStreamConcurrent_PerStreamCapNoDeadlock(t *testing.T) {
+	tables := []string{"a", "b", "c", "d"}
+	const k = 2 // round-robin over sorted ⇒ group0=[a,c], group1=[b,d].
+
+	// A tight cap. "c" carries one row larger than the WHOLE cap, so on the
+	// old shared-cap code that single look-ahead row monopolizes the buffer.
+	const capBytes = 4096
+	byTable := map[string][]*vtgate.VStreamResponse{"": {}}
+	byTable["a"] = perTableCopyScript("a", "MySQL56/"+uuidA+":1-10", 2)
+	byTable["b"] = perTableCopyScript("b", "MySQL56/"+uuidA+":1-20", 3)
+	byTable["c"] = bigRowTableScript("c", "MySQL56/"+uuidA+":1-30", capBytes*2)
+	byTable["d"] = perTableCopyScript("d", "MySQL56/"+uuidA+":1-40", 2)
+
+	s, stream, _, cancel := newConcurrentHarness(t, tables, k, byTable, capBytes)
+	defer cancel()
+
+	ctx, ccancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer ccancel()
+
+	// Drain in schema order [a, b, c, d] — exactly the order that strands the
+	// look-ahead table "c" against the cap while the consumer waits on "b".
+	rowsPer := map[string]int{"a": 2, "b": 3, "c": 1, "d": 2}
+	done := make(chan error, 1)
+	go func() {
+		for _, tbl := range tables {
+			irTbl := &ir.Table{Name: tbl, Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}
+			ch, err := stream.Rows.ReadRows(ctx, irTbl)
+			if err != nil {
+				done <- err
+				return
+			}
+			got := 0
+			for range ch {
+				got++
+			}
+			if e := stream.Rows.Err(); e != nil {
+				done <- e
+				return
+			}
+			if got != rowsPer[tbl] {
+				done <- &countMismatch{tbl: tbl, got: got, want: rowsPer[tbl]}
+				return
+			}
+		}
+		done <- nil
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("concurrent copy drain: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("concurrent copy WEDGED: a look-ahead table monopolized the shared cap and the active table starved " +
+			"(this is the shared-cap deadlock the per-stream sub-budget fixes)")
+	}
+
+	select {
+	case <-s.copyDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("concurrent copy did not finish after drain")
+	}
+	if err := s.Err(); err != nil {
+		t.Fatalf("pump error: %v", err)
+	}
+}
+
+type countMismatch struct {
+	tbl       string
+	got, want int
+}
+
+func (c *countMismatch) Error() string {
+	return c.tbl + ": rows = " + itoa(c.got) + "; want " + itoa(c.want)
+}
+
+// perTableTwoShardScript is perTableCopyScript for a 2-shard keyspace: it
+// emits FIELD+ROWs for BOTH shards ("-80" and "80-") and one VGTID carrying a
+// per-shard GTID for each, before the global COPY_COMPLETED. gtidLo/gtidHi are
+// the two shards' snapshot GTIDs for this table. Used by the multi-shard
+// set-min pin to ground-truth that the stitch selects each shard's min
+// INDEPENDENTLY across the K streams.
+func perTableTwoShardScript(table, gtidLo, gtidHi string, nPerShard int) []*vtgate.VStreamResponse {
+	out := []*vtgate.VStreamResponse{}
+	for _, shard := range []string{"-80", "80-"} {
+		field := &binlogdata.VEvent{
+			Type: binlogdata.VEventType_FIELD,
+			FieldEvent: &binlogdata.FieldEvent{
+				TableName: table,
+				Keyspace:  "main",
+				Shard:     shard,
+				Fields:    []*query.Field{{Name: "id", Type: query.Type_INT64}},
+			},
+		}
+		out = append(out, oneEvent(field))
+		for i := 0; i < nPerShard; i++ {
+			row := &binlogdata.VEvent{
+				Type: binlogdata.VEventType_ROW,
+				RowEvent: &binlogdata.RowEvent{
+					TableName:  table,
+					Keyspace:   "main",
+					Shard:      shard,
+					RowChanges: []*binlogdata.RowChange{{After: makeRow([]string{itoa(i)})}},
+				},
+			}
+			out = append(out, oneEvent(row))
+		}
+	}
+	vgtid := &binlogdata.VEvent{
+		Type: binlogdata.VEventType_VGTID,
+		Vgtid: &binlogdata.VGtid{
+			ShardGtids: []*binlogdata.ShardGtid{
+				{Keyspace: "main", Shard: "-80", Gtid: gtidLo},
+				{Keyspace: "main", Shard: "80-", Gtid: gtidHi},
+			},
+		},
+	}
+	out = append(out, oneEvent(vgtid), oneEvent(globalCopyCompleted()))
+	return out
+}
+
+// TestVStreamConcurrent_MultiShardSetMinAcrossStreams pins the per-shard
+// set-min selection across K>1 streams on a >=2-shard keyspace (the existing
+// concurrent pins are all single-shard). Each of K=2 streams copies its
+// disjoint tables; each table finishes both shards at distinct per-shard
+// GTIDs. The stitched handoff position must be, FOR EACH SHARD, the min across
+// the UNION of every stream's every per-table snapshot — and the two shards'
+// minima come from DIFFERENT tables (so a per-shard bug that picked one
+// shard's min globally would be caught).
+func TestVStreamConcurrent_MultiShardSetMinAcrossStreams(t *testing.T) {
+	tables := []string{"a", "b", "c", "d"} // group0=[a,c], group1=[b,d] at K=2.
+	const k = 2
+
+	// Per-shard GTIDs chosen so:
+	//   shard -80 min  = :1-10  (table "a", stream 0)
+	//   shard 80- min  = :1-15  (table "b", stream 1)
+	// i.e. the two shards' minima are produced by tables in DIFFERENT streams.
+	loGTID := map[string]string{
+		"a": "MySQL56/" + uuidA + ":1-10",
+		"b": "MySQL56/" + uuidA + ":1-40",
+		"c": "MySQL56/" + uuidA + ":1-90",
+		"d": "MySQL56/" + uuidA + ":1-70",
+	}
+	hiGTID := map[string]string{
+		"a": "MySQL56/" + uuidB + ":1-50",
+		"b": "MySQL56/" + uuidB + ":1-15",
+		"c": "MySQL56/" + uuidB + ":1-80",
+		"d": "MySQL56/" + uuidB + ":1-60",
+	}
+
+	byTable := map[string][]*vtgate.VStreamResponse{"": {}}
+	for _, tbl := range tables {
+		byTable[tbl] = perTableTwoShardScript(tbl, loGTID[tbl], hiGTID[tbl], 2)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := newTableKeyedClient(ctx, byTable)
+
+	s := newTestSnapshotStream()
+	s.client = client
+	s.shards = []string{"-80", "80-"}
+	s.copyTablesSeq = tables
+	s.copyTables = []string{tables[0]}
+	s.tableCopyComplete = make(map[string]bool)
+	s.reconnectMax = defaultCopyReconnectMax
+	s.reconnectBackoffBase = defaultCopyReconnectBackoffBase
+	s.reconnectBackoffCap = defaultCopyReconnectBackoffCap
+	s.copyDone = make(chan struct{})
+
+	groups := partitionTablesForStreams(tables, k, nil)
+	stream := &ir.SnapshotStream{
+		Rows:    &vstreamSnapshotRows{snap: s},
+		Changes: &vstreamSnapshotChanges{snap: s},
+	}
+	go s.copyPumpAutoShardConcurrent(ctx, cancel, stream, groups)
+
+	dctx, dcancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer dcancel()
+	for _, tbl := range tables {
+		irTbl := &ir.Table{Name: tbl, Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}
+		ch, err := stream.Rows.ReadRows(dctx, irTbl)
+		if err != nil {
+			t.Fatalf("ReadRows(%s): %v", tbl, err)
+		}
+		got := 0
+		for range ch {
+			got++
+		}
+		if got != 4 { // 2 per shard × 2 shards
+			t.Fatalf("%s rows = %d; want 4 (2 shards × 2)", tbl, got)
+		}
+	}
+
+	select {
+	case <-s.copyDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("multi-shard concurrent copy did not finish")
+	}
+	if err := s.Err(); err != nil {
+		t.Fatalf("pump error: %v", err)
+	}
+
+	// The stitched position must carry BOTH shards, each at its own per-shard
+	// MIN across the union of all 4 tables (across both streams):
+	//   -80 → :1-10 (a),  80- → :1-15 (b).
+	wantPos, err := encodeVStreamPos([]shardGtid{
+		{Keyspace: "main", Shard: "-80", Gtid: loGTID["a"]},
+		{Keyspace: "main", Shard: "80-", Gtid: hiGTID["b"]},
+	})
+	if err != nil {
+		t.Fatalf("encodeVStreamPos: %v", err)
+	}
+	if stream.Position.Token != wantPos.Token {
+		t.Fatalf("stitched Position = %q; want per-shard min across streams %q",
+			stream.Position.Token, wantPos.Token)
+	}
+}
+
+// TestVStreamConcurrent_ResumeSeedTableNotGroupFirst pins the resume edge the
+// review flagged: the in-progress (seed) table is NOT its group's first sorted
+// table. With group0=[a,c] (K=2) and the cursor naming "c" (group0's SECOND
+// table), the earlier-in-group table "a" must re-copy FRESH (opened
+// from-beginning, no cursor) while "c" opens SEEDED from its cursor — and the
+// copy completes with every table contributing a snapshot. A bug that seeded
+// the group's first table, or skipped the earlier-in-group table, is caught.
+func TestVStreamConcurrent_ResumeSeedTableNotGroupFirst(t *testing.T) {
+	tables := []string{"a", "b", "c", "d"}
+	const k = 2
+
+	groups := partitionTablesForStreams(tables, k, nil)
+	// Sanity: confirm "c" is group0's SECOND table (the not-first precondition).
+	var cGroup []string
+	for _, g := range groups {
+		for _, tbl := range g {
+			if tbl == "c" {
+				cGroup = g
+			}
+		}
+	}
+	if len(cGroup) < 2 || cGroup[0] == "c" {
+		t.Fatalf("precondition: want 'c' as a NON-first table in its group; group=%v", cGroup)
+	}
+	earlierInGroup := cGroup[0] // "a" — must re-copy fresh.
+	const resumeTable = "c"
+
+	byTable := map[string][]*vtgate.VStreamResponse{"": {}}
+	for _, tbl := range tables {
+		byTable[tbl] = perTableCopyScript(tbl, "MySQL56/"+uuidA+":1-10", 2)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := newTableKeyedClient(ctx, byTable)
+
+	s := newTestSnapshotStream()
+	s.client = client
+	s.shards = []string{"-"}
+	s.copyTablesSeq = tables
+	s.copyTables = []string{tables[0]}
+	s.tableCopyComplete = make(map[string]bool)
+	s.reconnectMax = defaultCopyReconnectMax
+	s.reconnectBackoffBase = defaultCopyReconnectBackoffBase
+	s.reconnectBackoffCap = defaultCopyReconnectBackoffCap
+	s.copyDone = make(chan struct{})
+	s.resumeSeedTable = resumeTable
+	s.resumeSeed = resumeCursorPos(t, resumeTable, 9000)
+
+	stream := &ir.SnapshotStream{
+		Rows:    &vstreamSnapshotRows{snap: s},
+		Changes: &vstreamSnapshotChanges{snap: s},
+	}
+	go s.copyPumpAutoShardConcurrent(ctx, cancel, stream, groups)
+
+	dctx, dcancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer dcancel()
+	for _, tbl := range tables {
+		irTbl := &ir.Table{Name: tbl, Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}
+		ch, err := stream.Rows.ReadRows(dctx, irTbl)
+		if err != nil {
+			t.Fatalf("ReadRows(%s): %v", tbl, err)
+		}
+		got := 0
+		for range ch {
+			got++
+		}
+		if got != 2 {
+			t.Fatalf("%s rows = %d; want 2 (re-copied fresh / resumed)", tbl, got)
+		}
+	}
+
+	select {
+	case <-s.copyDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("concurrent resume (non-first seed table) did not finish")
+	}
+	if err := s.Err(); err != nil {
+		t.Fatalf("pump error: %v", err)
+	}
+
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	// The in-progress table (group's SECOND) seeds from its cursor.
+	if !client.seededTables[resumeTable] {
+		t.Fatalf("in-progress table %q (group's second) did not seed from its cursor", resumeTable)
+	}
+	// The EARLIER-in-group table must re-copy FRESH (opened, never seeded).
+	if client.seededTables[earlierInGroup] {
+		t.Errorf("earlier-in-group table %q opened seeded; it must re-copy fresh from-beginning", earlierInGroup)
+	}
+	if client.openCount[earlierInGroup] < 1 {
+		t.Errorf("earlier-in-group table %q never opened a COPY; it must re-copy fresh", earlierInGroup)
+	}
+	// No other table seeds.
+	for _, tbl := range tables {
+		if tbl == resumeTable {
+			continue
+		}
+		if client.seededTables[tbl] {
+			t.Errorf("table %q seeded; only the in-progress table %q may seed", tbl, resumeTable)
+		}
 	}
 }
