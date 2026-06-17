@@ -4,7 +4,7 @@
 package pipeline
 
 // WRITE-side parallel fan-out for the idempotent VStream/CDC snapshot
-// cold-start copy (ADR-0096).
+// cold-start copy (ADR-0097).
 //
 // The PlanetScale-MySQL snapshot writer falls back to a single
 // cross-region-RTT-bound batched-INSERT connection (vtgate blocks LOAD
@@ -15,7 +15,7 @@ package pipeline
 // [ir.ParallelIdempotentCopyWriter] runs N idempotent batched-INSERT
 // workers, each on its own pinned connection.
 //
-// Correctness invariants (silent-loss class — see ADR-0096 §2/§3/§7):
+// Correctness invariants (silent-loss class — see ADR-0097 §2/§3/§7):
 //   - EXACTLY-ONCE routing: every row is sent to exactly one worker
 //     channel (no drop, no dup). PK-hash (not round-robin) pins every
 //     emission of a given PK to the SAME worker, so Bug-125 COPY
@@ -41,7 +41,7 @@ import (
 
 const (
 	// defaultCopyFanoutDegree is the conservative default WRITE-side
-	// fan-out degree. The live experiment (ADR-0096 Context) showed 3–4
+	// fan-out degree. The live experiment (ADR-0097 Context) showed 3–4
 	// concurrent INSERT streams already beat PG's single-stream COPY
 	// with near-linear scaling and no target ingest ceiling; 4 is the
 	// safe default. NOT aggressive — operators raise it explicitly for a
@@ -111,13 +111,24 @@ func copyTableColdStartIdempotentMaybeParallel(
 // PK-hash dispatcher over N per-worker channels and calls
 // WriteRowsIdempotentParallel.
 //
-// The durable-write watermark (ADR-0072 Phase B / v0.99.9) is
-// intentionally NOT wired on this path: the mid-COPY resume cursor it
-// gates is single-stream-only (ADR-0095 v1 limitation — fan-out is not
-// used on resume), so reporting per-worker durable deltas would persist
-// a cursor no resume path consumes. The whole-table durability is still
-// guaranteed by WriteRowsIdempotentParallel returning only after every
-// worker commits, before any position advances.
+// The mid-COPY durable-write watermark (ADR-0072 Phase B / v0.99.9) is
+// DISABLED for the duration of a fan-out copy — not by this function, but
+// inside the writer: [ir.ParallelIdempotentCopyWriter]'s
+// WriteRowsIdempotentParallel runs every worker with durable-progress
+// reporting suppressed (the MySQL writer passes reportDurable=false). It
+// MUST be disabled, not merely unconsumed: under fan-out the flat
+// durable-flushed-row count is NOT order-equivalent to the snapshot
+// reader's enqueue-order breadcrumb frontier (rows flush in per-worker
+// order with independent batch buffers), so a mid-COPY breadcrumb could be
+// checkpointed past an early-enqueued row that a lagging worker has not yet
+// flushed — a hard crash after that checkpoint would resume PAST the
+// un-flushed row (silent loss; ADR-0097 §3). The SOLE durability guarantee
+// for a fanned-out table is therefore the whole-table join:
+// WriteRowsIdempotentParallel returns only after every worker has durably
+// committed, and the orchestrator advances no position (and persists the
+// final COPY_COMPLETED position) until this function returns nil (ADR-0007).
+// Resume never fans out (ADR-0095 single-stream v1), so the disabled
+// mid-COPY cursor is also one no resume path would consume.
 func copyTableColdStartIdempotentParallel(
 	ctx context.Context,
 	rr ir.RowReader,

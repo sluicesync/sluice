@@ -429,7 +429,7 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 	}
 
 	// Connection-budget preflight (connection-resilience item 4). The
-	// serial cold-start is single-reader, but the ADR-0096 WRITE-side
+	// serial cold-start is single-reader, but the ADR-0097 WRITE-side
 	// fan-out opens N writer connections against the ACTIVE table (one
 	// table at a time per ADR-0095), so the budget request is the
 	// resolved fan-out degree, not 1 — this is what makes the loud

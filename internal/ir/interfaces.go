@@ -582,7 +582,7 @@ type IdempotentCopyWriter interface {
 
 // ParallelIdempotentCopyWriter is the OPTIONAL writer capability that
 // enables WRITE-side fan-out on the VStream/CDC snapshot cold-start
-// copy (ADR-0096). On a PlanetScale-MySQL target the snapshot writer
+// copy (ADR-0097). On a PlanetScale-MySQL target the snapshot writer
 // falls back to a single cross-region-RTT-bound batched-INSERT
 // connection (vtgate blocks LOAD DATA LOCAL INFILE); fanning the one
 // incoming snapshot row stream out to N concurrent batched-INSERT

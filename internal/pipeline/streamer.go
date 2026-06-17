@@ -456,7 +456,7 @@ type Streamer struct {
 	RawCopyFormat       ir.RawCopyFormat
 
 	// CopyFanoutDegree is the WRITE-side parallel fan-out degree for the
-	// idempotent VStream/CDC snapshot cold-start copy (ADR-0096) — the
+	// idempotent VStream/CDC snapshot cold-start copy (ADR-0097) — the
 	// PS-MySQL gap the FAST cold-start (above) can't reach because the
 	// VStream READ side is a single un-chunkable stream. On that serial
 	// idempotent path the writer falls back to one cross-region-RTT-bound

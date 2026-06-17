@@ -721,7 +721,7 @@ type bulkCopyOpts struct {
 	Shard ShardColumnSpec
 
 	// CopyFanoutDegree is the WRITE-side parallel fan-out degree for
-	// the idempotent VStream/CDC snapshot cold-start copy (ADR-0096).
+	// the idempotent VStream/CDC snapshot cold-start copy (ADR-0097).
 	// Resolved through [resolveCopyFanoutDegree]: the Go zero value (0)
 	// maps to the safe default degree, 1 is serial, >1 fans the single
 	// incoming row stream out to N PK-hash-partitioned writer workers.
@@ -772,6 +772,16 @@ func runBulkCopyWithOpts(
 	// resume past un-written rows (silent loss). The writer reports
 	// per-flush deltas; the sink sums them. Wired only on the idempotent
 	// cold-start path (the only one with a resumable VStream source).
+	//
+	// The reporter is wired ONCE here for the whole run, but it stays
+	// inert for any table copied via the ADR-0097 WRITE-side fan-out:
+	// WriteRowsIdempotentParallel runs its workers with durable-progress
+	// reporting suppressed (the per-worker flush order is not the reader's
+	// enqueue order, so a mid-COPY breadcrumb could checkpoint past an
+	// un-flushed early row — silent loss). Serial (non-fan-out) tables in
+	// the same run keep the ADR-0072 mid-COPY checkpoint. See
+	// copyTableColdStartIdempotentParallel + the MySQL writer's
+	// WriteRowsIdempotentParallel for the full argument.
 	if needsIdempotent {
 		if sink, ok := rows.(ir.CopyDurableProgressSink); ok {
 			if reporter, ok := rw.(ir.CopyDurableProgressReporter); ok {
@@ -787,7 +797,7 @@ func runBulkCopyWithOpts(
 	// enough that parallelising it is a separate, deliberately deferred
 	// chunk. Only `sluice migrate` (runBulkCopyPhases) drives cross-table
 	// concurrency.
-	// ADR-0096: WRITE-side fan-out for the idempotent VStream/CDC
+	// ADR-0097: WRITE-side fan-out for the idempotent VStream/CDC
 	// snapshot cold-start copy. The READ side is a single un-chunkable
 	// vtgate stream, so the only lever is fanning the one row stream out
 	// to N PK-hash-partitioned writer workers. Gated on: idempotent path

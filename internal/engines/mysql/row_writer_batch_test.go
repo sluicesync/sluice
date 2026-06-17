@@ -236,7 +236,7 @@ func TestWriteRowsIdempotent_RefusesKeylessTable(t *testing.T) {
 // TestWriteRowsIdempotentParallel_RefusesKeylessTable: the conflict key
 // is resolved ONCE before any worker spawns, so a keyless table is
 // refused loudly (Bug 125) on the fan-out path too — no worker ever
-// runs (ADR-0096 §2 no-PK contract preserved). No DB needed: the
+// runs (ADR-0097 §2 no-PK contract preserved). No DB needed: the
 // refusal fires before w.db.Conn.
 func TestWriteRowsIdempotentParallel_RefusesKeylessTable(t *testing.T) {
 	w := &RowWriter{bulkLoad: ir.BulkLoadBatchedInsert}
