@@ -92,6 +92,10 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position, lsnTra
 	if errer, ok := cdc.(interface{ Err() error }); ok {
 		s.sourceErrFn = errer.Err
 	}
+	// ADR-0094: reshard-reopen surface (VStream flavors) for runOnce.
+	if rr, ok := cdc.(ir.ReshardReopener); ok {
+		s.sourceReshard = rr
+	}
 	return changes, stop, nil
 }
 

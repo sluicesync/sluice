@@ -773,6 +773,15 @@ type Streamer struct {
 	// in the standard way.
 	sourceErrFn func() error
 
+	// sourceReshard is the per-attempt CDC reader cast to
+	// [ir.ReshardReopener] when the reader implements it (the VStream
+	// flavors; nil for binlog MySQL / Postgres). ADR-0094: after the
+	// change channel closes cleanly, runOnce calls ReopenAfterReshard to
+	// follow a source reshard (split/merge/MoveTables) onto the new shard
+	// layout instead of exiting. Reset to nil per attempt alongside
+	// sourceErrFn; populated where sourceErrFn is.
+	sourceReshard ir.ReshardReopener
+
 	// runOnceFn is a test seam: when non-nil, [Run] / [runWithRetry]
 	// invoke it in place of [runOnce]. Production always leaves it nil
 	// (runOnceCall defaults to s.runOnce), so behaviour is identical;
@@ -1261,18 +1270,93 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	var stopObserved atomic.Bool
 	liveFilter := s.phaseStartApplySidecars(applyCtx, applier, streamID, cancelStream, cancelApply, &stopObserved)
 
-	// Wrap the change channel: live-add-aware table filter → ADR-0054
-	// Shape-A SchemaSnapshot intercept → ADR-0058 ADD COLUMN forward
-	// intercept. The cold-start seed is consumed and cleared inside
-	// the phase.
-	filtered := s.phaseWireInterceptChain(applyCtx, changes, liveFilter, streamID)
-	dispatchErr := s.dispatchApply(applyCtx, applier, streamID, filtered)
-	// Settle the outcome: surface intercept-stored errors, classify
-	// the dispatch error (Bug 57: retriable before ctx-termination),
-	// surface a source CDC pump error (GitHub #19), and clear the stop
-	// flag after a graceful drain. Uses the OUTER ctx — applyCtx may
-	// already be cancelled here.
-	return s.phaseSettleDispatch(ctx, applier, streamID, dispatchErr, &stopObserved)
+	// Apply, following any source reshard onto the new shard layout
+	// (ADR-0094). The OUTER ctx is used for settle (applyCtx may already
+	// be cancelled by the time a graceful drain completes).
+	return s.applyWithReshardFollow(ctx, applyCtx, applier, streamID, changes, liveFilter, &stopObserved)
+}
+
+// applyWithReshardFollow drains the change channel through the applier and,
+// on a CLEAN channel close that the source reader reports as a reshard
+// (ADR-0094), reopens the stream against the new shard layout (journal-
+// stamped GTIDs — no gap/overlap) and re-applies; otherwise it settles
+// normally. The loop is bounded by [maxReshardReopensPerRun] so a reshard
+// storm or a buggy reader fails loud rather than spinning silently.
+//
+// Reshard auto-follow is attempted only when: the close was clean
+// (dispatchErr==nil — a non-nil error is a real apply failure to
+// settle/retry), the reader exposes [ir.ReshardReopener], the sync is
+// single-stream (Shape-A reshard is deferred per ADR-0094), and no
+// intercept error is pending (a reopen must never mask a schema-forward /
+// coordination failure — that must reach [phaseSettleDispatch]).
+func (s *Streamer) applyWithReshardFollow(
+	ctx, applyCtx context.Context,
+	applier ir.ChangeApplier,
+	streamID string,
+	changes <-chan ir.Change,
+	liveFilter *liveAddedFilter,
+	stopObserved *atomic.Bool,
+) error {
+	reshardReopens := 0
+	for {
+		// Wrap the change channel: live-add-aware table filter → ADR-0054
+		// Shape-A SchemaSnapshot intercept → ADR-0058 ADD COLUMN forward
+		// intercept. The cold-start seed is consumed and cleared inside
+		// the phase on the FIRST call; a reopened iteration re-wires the
+		// chain with a nil seed (a reshard is a continuation, not a fresh
+		// cold start), which is exactly right.
+		filtered := s.phaseWireInterceptChain(applyCtx, changes, liveFilter, streamID)
+		dispatchErr := s.dispatchApply(applyCtx, applier, streamID, filtered)
+
+		if dispatchErr == nil && s.sourceReshard != nil && !s.InjectShardColumn.Engaged() && !s.interceptErrorPending() {
+			newChanges, wasReshard, rerr := s.sourceReshard.ReopenAfterReshard(applyCtx)
+			if wasReshard {
+				if rerr != nil {
+					return wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: reshard reopen: %w", rerr))
+				}
+				reshardReopens++
+				if reshardReopens > maxReshardReopensPerRun {
+					return wrapWithHint(PhaseCDC, fmt.Errorf(
+						"pipeline: reshard reopen budget exhausted after %d reopens in one run "+
+							"(possible reshard storm or a reader re-signalling without progress); "+
+							"restart the sync to resume", reshardReopens,
+					))
+				}
+				slog.InfoContext(
+					applyCtx, "cdc: source reshard — following the new shard layout",
+					slog.String("stream_id", streamID),
+					slog.Int("reopen", reshardReopens),
+				)
+				changes = newChanges
+				continue
+			}
+		}
+
+		// Settle the outcome: surface intercept-stored errors, classify
+		// the dispatch error (Bug 57: retriable before ctx-termination),
+		// surface a source CDC pump error (GitHub #19), and clear the stop
+		// flag after a graceful drain.
+		return s.phaseSettleDispatch(ctx, applier, streamID, dispatchErr, stopObserved)
+	}
+}
+
+// maxReshardReopensPerRun bounds ADR-0094 reshard auto-follow within a
+// single Run. Each reopen requires a real vtgate JOURNAL (a completed
+// reshard), so this ceiling is far above any plausible real-world count —
+// it exists only so a buggy reader that re-signals a reshard without
+// making progress fails LOUD rather than spinning. A genuine long-lived
+// stream that somehow crosses this many reshards just restarts and
+// resumes.
+const maxReshardReopensPerRun = 256
+
+// interceptErrorPending reports whether an ADR-0054/ADR-0058 SchemaSnapshot
+// intercept has stored a (non-nil) error this attempt. Used by the
+// reshard auto-follow guard so a reopen never masks a schema-forwarding /
+// coordination failure — that must reach [phaseSettleDispatch] and be
+// classified/surfaced.
+func (s *Streamer) interceptErrorPending() bool {
+	p := s.schemaSnapshotErr.Load()
+	return p != nil && *p != nil
 }
 
 // surfaceSourceError returns the source CDC reader's stored Err()
