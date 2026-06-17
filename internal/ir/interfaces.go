@@ -580,6 +580,54 @@ type IdempotentCopyWriter interface {
 	HandlesNoPKIdempotentCopy() bool
 }
 
+// ParallelIdempotentCopyWriter is the OPTIONAL writer capability that
+// enables WRITE-side fan-out on the VStream/CDC snapshot cold-start
+// copy (ADR-0097). On a PlanetScale-MySQL target the snapshot writer
+// falls back to a single cross-region-RTT-bound batched-INSERT
+// connection (vtgate blocks LOAD DATA LOCAL INFILE); fanning the one
+// incoming snapshot row stream out to N concurrent batched-INSERT
+// workers — each on its own pinned connection — closes that gap. The
+// READ side cannot be PK-range-chunked (vtgate streams the snapshot;
+// no arbitrary range SELECT), so write-side fan-out is the only lever
+// on this path. Contrast [ADR-0019]'s read-side chunking for the
+// `sluice migrate` path, which can range-SELECT the source.
+//
+// The pipeline owns the reader goroutine + the PK-hash partition that
+// routes every row to EXACTLY ONE of the supplied per-worker channels
+// (no drop, no dup) — so the same PK can never be in two workers'
+// in-flight batches (Bug-125 COPY re-emissions of a PK serialize on
+// one worker; cross-worker interleaving is irrelevant because every
+// write is an upsert, ADR-0010). The writer owns only the N-worker
+// execution: it MUST run one goroutine per supplied channel, each
+// pinning its own target connection and running the engine's existing
+// idempotent batched-INSERT core, and MUST return only after EVERY
+// worker has fully drained its channel and DURABLY committed its
+// final batch (the ADR-0007 position-handoff guard — no position is
+// advanced until this returns nil). Any worker error aborts the whole
+// copy loudly (returns non-nil, the orchestrator advances no
+// position); a ctx cancel unwinds every worker and leaks no
+// goroutine or connection.
+//
+// The MySQL target implements it. Postgres does not (its eligible
+// cold-start copy uses the fast raw-COPY / parallel snapshot path,
+// ADR-0079; the VStream-source serial idempotent path that reaches
+// this fan-out is the PS-MySQL gap). The pipeline type-asserts on this
+// surface and, when present with a usable partition key and a degree
+// > 1, fans out; otherwise it falls through to the serial
+// WriteRowsIdempotent — never silently doing nothing.
+type ParallelIdempotentCopyWriter interface {
+	IdempotentRowWriter
+
+	// WriteRowsIdempotentParallel runs the idempotent batched-copy over
+	// len(workers) concurrent workers, each consuming one of the
+	// supplied per-worker channels and pinning its own target
+	// connection. Returns only after every worker has drained and
+	// durably committed, or the first worker error (loudly), or the
+	// ctx error on cancel. len(workers) == 1 is equivalent to
+	// WriteRowsIdempotent on that one channel.
+	WriteRowsIdempotentParallel(ctx context.Context, table *Table, workers []<-chan Row) error
+}
+
 // TableTruncator is the optional surface a [RowWriter] (or
 // [SchemaWriter]) can implement to expose TRUNCATE TABLE for
 // resume's truncate-and-redo path. The pipeline.Migrator type-asserts

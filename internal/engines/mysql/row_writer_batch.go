@@ -26,9 +26,11 @@ package mysql
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -58,20 +60,131 @@ func (w *RowWriter) WriteRowsIdempotent(ctx context.Context, table *ir.Table, ro
 // no-PK path on this capability.
 func (w *RowWriter) HandlesNoPKIdempotentCopy() bool { return true }
 
+// WriteRowsIdempotentParallel implements [ir.ParallelIdempotentCopyWriter]
+// (ADR-0097): the WRITE-side fan-out for the VStream/CDC snapshot
+// cold-start copy. It runs one worker goroutine per supplied channel,
+// each pinning its OWN connection from the shared *sql.DB pool and
+// running the same [writeBatchedIdempotentConn] core the serial path
+// runs — so per-row value fidelity and the Vector-B warning probe are
+// byte-identical to the serial path; fan-out changes only how many
+// connections carry the load.
+//
+// Correctness contract (the load-bearing part):
+//   - The PIPELINE owns the PK-hash partition that routed each row to
+//     exactly one of these channels (no drop/dup); this method owns
+//     only the N-worker execution.
+//   - It returns only AFTER every worker has drained its channel and
+//     durably committed its final batch (the join below) — so the
+//     orchestrator advances no position until every row is durable
+//     (ADR-0007). A worker still in flight when the position commits
+//     would be a silent-loss-on-resume gap; the join makes that
+//     structurally impossible.
+//   - The first worker error cancels a shared child context so the
+//     other workers (and the pipeline's reader) unwind; the first
+//     error is returned (loud abort, no partial silent success).
+//   - On ctx cancel every worker's loop selects on ctx.Done() and
+//     exits; each worker's pinned conn is Closed in its own defer, so
+//     no goroutine or connection leaks.
+//
+// MID-COPY DURABLE-PROGRESS CHECKPOINT IS DISABLED ON THIS PATH (the
+// silent-loss guard). The ADR-0072 Phase B watermark (w.copyDurableProgress
+// → the snapshot reader's AdvanceDurableRows) is only sound when the
+// durable flushed-row COUNT is order-equivalent to the reader's
+// enqueue-order breadcrumb frontier — true under a SINGLE serial FIFO
+// stream (durable-count K ⟹ the first K enqueued rows are durable), FALSE
+// under fan-out: rows flush in per-worker order with independent batch
+// buffers, so a fast worker can push the flat count to K while a lagging
+// worker still holds an EARLY-enqueued row un-flushed. A breadcrumb at
+// rowsCovered=K would then be checkpointed as durable while an early row
+// is not yet on the target — a hard crash after the checkpoint resumes
+// PAST that row (silent loss, exit 0). So every worker here is run with
+// reportDurable=false; the whole-table join below (wg.Wait before any
+// position advances, ADR-0007) is the SOLE durability guarantee for a
+// fanned-out table, and the orchestrator's final position persistence at
+// COPY_COMPLETED fires only after that join (the fully-durable position).
+// Resume never fans out (ADR-0095 single-stream v1), so no resume path
+// consumes a mid-COPY fan-out cursor anyway.
+//
+// keyCols is resolved ONCE here (not per worker) so a keyless table is
+// refused loudly before any worker spawns, identical to the serial
+// path's gate.
+func (w *RowWriter) WriteRowsIdempotentParallel(ctx context.Context, table *ir.Table, workers []<-chan ir.Row) error {
+	if table == nil {
+		return errors.New("mysql: WriteRowsIdempotentParallel: table is nil")
+	}
+	if len(table.Columns) == 0 {
+		return fmt.Errorf("mysql: WriteRowsIdempotentParallel: table %q has no columns", table.Name)
+	}
+	if len(workers) == 0 {
+		return errors.New("mysql: WriteRowsIdempotentParallel: no worker channels")
+	}
+	for i, ch := range workers {
+		if ch == nil {
+			return fmt.Errorf("mysql: WriteRowsIdempotentParallel: worker channel %d is nil", i)
+		}
+	}
+	// Resolve the conflict key once — refuse a keyless table loudly
+	// before spawning any worker (Bug 125), same gate as the serial path.
+	keyCols, ok := effectiveUpsertKeyColumns(table)
+	if !ok {
+		return errKeylessIdempotent(table)
+	}
+
+	// A single worker is just the serial core — no fan-out machinery
+	// needed (and the pipeline only calls this with len==1 on the
+	// degenerate path). reportDurable=false: this method IS the fan-out
+	// path (see the mid-COPY-checkpoint note below); even the 1-worker
+	// case never advances the durable watermark, so the fan-out vs serial
+	// durability contract is uniform regardless of degree.
+	if len(workers) == 1 {
+		conn, err := w.db.Conn(ctx)
+		if err != nil {
+			return fmt.Errorf("mysql: idempotent insert into %q: pin connection: %w", table.Name, err)
+		}
+		defer func() { _ = conn.Close() }()
+		return w.writeBatchedIdempotentConn(ctx, conn, table, keyCols, workers[0], false)
+	}
+
+	// Shared child ctx: the first worker error cancels it so peers (and
+	// the pipeline's reader, which selects on the same parent ctx via
+	// the caller) unwind deterministically.
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var (
+		wg      sync.WaitGroup
+		errOnce sync.Once
+		firstEr error
+	)
+	for _, ch := range workers {
+		wg.Add(1)
+		go func(rows <-chan ir.Row) {
+			defer wg.Done()
+			conn, err := w.db.Conn(workerCtx)
+			if err != nil {
+				errOnce.Do(func() { firstEr = fmt.Errorf("mysql: idempotent insert into %q: pin connection: %w", table.Name, err) })
+				cancel()
+				return
+			}
+			defer func() { _ = conn.Close() }()
+			// reportDurable=false — fan-out workers must not advance the
+			// mid-COPY durable watermark (see the doc comment above).
+			if err := w.writeBatchedIdempotentConn(workerCtx, conn, table, keyCols, rows, false); err != nil {
+				errOnce.Do(func() { firstEr = err })
+				cancel()
+			}
+		}(ch)
+	}
+	wg.Wait()
+	return firstEr
+}
+
 // writeBatchedIdempotent is the upsert-form of [writeBatched]. The
 // per-batch flush mechanics are identical (flush on whichever of
 // row-count cap and byte-size cap fires first; ADR-0028); only the
-// SQL changes.
+// SQL changes. It pins one connection and delegates the loop to
+// [writeBatchedIdempotentConn].
 func (w *RowWriter) writeBatchedIdempotent(ctx context.Context, table *ir.Table, rows <-chan ir.Row) error {
-	limit := w.maxRowsPerBatch
-	if limit <= 0 {
-		limit = defaultMaxRowsPerBatch
-	}
-	byteCap := w.maxBufferBytes
-	if byteCap <= 0 {
-		byteCap = defaultMaxBufferBytes
-	}
-
 	// Bug 125: the conflict key the upsert keys on is the table's PK
 	// when present, else a deterministic non-null UNIQUE index. MySQL's
 	// ON DUPLICATE KEY UPDATE fires on ANY unique key on the target, so
@@ -97,6 +210,43 @@ func (w *RowWriter) writeBatchedIdempotent(ctx context.Context, table *ir.Table,
 		return fmt.Errorf("mysql: idempotent insert into %q: pin connection: %w", table.Name, err)
 	}
 	defer func() { _ = conn.Close() }()
+	// reportDurable=true — the serial path is a single FIFO stream, so the
+	// mid-COPY durable watermark (ADR-0072 Phase B) is order-equivalent and
+	// safe to advance per flush.
+	return w.writeBatchedIdempotentConn(ctx, conn, table, keyCols, rows, true)
+}
+
+// writeBatchedIdempotentConn is the per-connection idempotent batched
+// upsert loop, shared by the serial [writeBatchedIdempotent] (one conn)
+// and the parallel [WriteRowsIdempotentParallel] (N conns, one per
+// worker). The caller owns pinning + closing conn and resolving keyCols.
+//
+// reportDurable gates the ADR-0072 Phase B mid-COPY durable watermark
+// (w.copyDurableProgress). The SERIAL path passes true (single FIFO
+// stream ⟹ flushed-count is order-equivalent to the reader's enqueue-order
+// frontier). The FAN-OUT path ([WriteRowsIdempotentParallel]) passes
+// false: per-worker flush ordering is NOT order-equivalent to enqueue
+// order, so advancing the watermark mid-COPY could checkpoint past an
+// un-flushed early row (silent-loss-on-resume). See the
+// WriteRowsIdempotentParallel doc comment for the full argument.
+//
+// Concurrency note (ADR-0097): when N of these run on one RowWriter,
+// they share w.warnedClamp (a sync.Map — safe). copyDurableProgress is
+// never called on the fan-out path (reportDurable=false), so no worker
+// touches the watermark concurrently. Each invocation keeps its own batch
+// buffer and flush counter, so the per-call Vector-B sampling schedule is
+// per-worker (defensible: a systematic clamp still trips every worker's
+// first-N exhaustive flushes and the final flush). No shared mutable
+// batch state crosses workers.
+func (w *RowWriter) writeBatchedIdempotentConn(ctx context.Context, conn *sql.Conn, table *ir.Table, keyCols []string, rows <-chan ir.Row, reportDurable bool) error {
+	limit := w.maxRowsPerBatch
+	if limit <= 0 {
+		limit = defaultMaxRowsPerBatch
+	}
+	byteCap := w.maxBufferBytes
+	if byteCap <= 0 {
+		byteCap = defaultMaxBufferBytes
+	}
 
 	batch := make([]ir.Row, 0, limit)
 	var batchBytes int64
@@ -121,8 +271,11 @@ func (w *RowWriter) writeBatchedIdempotent(ctx context.Context, table *ir.Table,
 		// committed (autocommit Exec), so the snapshot reader's checkpoint
 		// may advance to cover these rows. Reported AFTER the Exec +
 		// warning check succeed — never before — so the watermark stays
-		// at-or-behind the durable frontier.
-		if w.copyDurableProgress != nil {
+		// at-or-behind the durable frontier. Suppressed entirely on the
+		// fan-out path (reportDurable=false): per-worker flush order is not
+		// enqueue order, so a mid-COPY breadcrumb could land past an
+		// un-flushed early row (silent-loss-on-resume; ADR-0097 §3).
+		if reportDurable && w.copyDurableProgress != nil {
 			w.copyDurableProgress(int64(len(batch)))
 		}
 		batch = batch[:0]

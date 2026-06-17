@@ -429,13 +429,18 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 	}
 
 	// Connection-budget preflight (connection-resilience item 4). The
-	// streamer's cold-start is single-reader (requested=1), so there's
-	// no parallelism to cap — but the loud refusal still fires when the
-	// target has no free slot for the copy + CDC connections, and an
-	// operator --max-target-connections ceiling is honoured. No-op on
-	// engines without a connection-slot model (MySQL). Discarded
-	// effective value (it can only be 1 here); we run it for the refusal.
-	if _, _, err := resolveTargetCopyParallelism(ctx, s.Target, s.TargetDSN, 1, s.MaxTargetConnections); err != nil {
+	// serial cold-start is single-reader, but the ADR-0097 WRITE-side
+	// fan-out opens N writer connections against the ACTIVE table (one
+	// table at a time per ADR-0095), so the budget request is the
+	// resolved fan-out degree, not 1 — this is what makes the loud
+	// refusal fire (and the --max-target-connections ceiling apply) when
+	// the fan-out would exceed the target's free slots. No-op on engines
+	// without a connection-slot model (MySQL — which is exactly where
+	// fan-out runs today; the refusal is the live guard for a future
+	// slot-modelled fan-out target). We run it for the refusal; the
+	// effective value is discarded (the per-table fan-out degree governs
+	// the actual worker count).
+	if _, _, err := resolveTargetCopyParallelism(ctx, s.Target, s.TargetDSN, resolveCopyFanoutDegree(s.CopyFanoutDegree), s.MaxTargetConnections); err != nil {
 		closeIf(rw)
 		closeIf(sw)
 		_ = stream.Close()
@@ -581,9 +586,10 @@ func (s *Streamer) coldStartRunCopy(ctx context.Context, schema *ir.Schema, stre
 		slog.InfoContext(ctx, "sync cold-start: "+fastReason+"; using serial cold-start",
 			slog.String("stream_id", streamID))
 		bulkOpts := bulkCopyOpts{
-			SkipSchemaApply: s.SchemaAlreadyApplied,
-			Redactor:        s.Redactor,
-			Shard:           s.InjectShardColumn,
+			SkipSchemaApply:  s.SchemaAlreadyApplied,
+			Redactor:         s.Redactor,
+			Shard:            s.InjectShardColumn,
+			CopyFanoutDegree: s.CopyFanoutDegree,
 		}
 		copyErr = runBulkCopyWithOpts(ctx, schema, stream.Rows, sw, rw, bulkOpts)
 	}

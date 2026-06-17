@@ -455,6 +455,19 @@ type Streamer struct {
 	BulkBatchSize       int
 	RawCopyFormat       ir.RawCopyFormat
 
+	// CopyFanoutDegree is the WRITE-side parallel fan-out degree for the
+	// idempotent VStream/CDC snapshot cold-start copy (ADR-0097) — the
+	// PS-MySQL gap the FAST cold-start (above) can't reach because the
+	// VStream READ side is a single un-chunkable stream. On that serial
+	// idempotent path the writer falls back to one cross-region-RTT-bound
+	// batched-INSERT connection; this fans the single incoming row stream
+	// out to N PK-hash-partitioned writer workers. ZERO-VALUE-SAFE (the
+	// v0.99.51 trap): the Go zero value resolves to the conservative
+	// default degree via [resolveCopyFanoutDegree] — never "zero workers".
+	// 1 forces serial. Inert on every path that isn't the idempotent
+	// cold-start with a parallel-capable writer + a per-table PK.
+	CopyFanoutDegree int
+
 	// ReapStaleBackends opts the operator into terminating sluice's own
 	// orphaned backends on the target during the cold-start preflight
 	// (connection-resilience Phase 2, item 2). Detection runs always and
