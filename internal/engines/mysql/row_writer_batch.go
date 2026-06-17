@@ -26,9 +26,11 @@ package mysql
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -58,20 +60,107 @@ func (w *RowWriter) WriteRowsIdempotent(ctx context.Context, table *ir.Table, ro
 // no-PK path on this capability.
 func (w *RowWriter) HandlesNoPKIdempotentCopy() bool { return true }
 
+// WriteRowsIdempotentParallel implements [ir.ParallelIdempotentCopyWriter]
+// (ADR-0096): the WRITE-side fan-out for the VStream/CDC snapshot
+// cold-start copy. It runs one worker goroutine per supplied channel,
+// each pinning its OWN connection from the shared *sql.DB pool and
+// running the same [writeBatchedIdempotentConn] core the serial path
+// runs — so per-row value fidelity and the Vector-B warning probe are
+// byte-identical to the serial path; fan-out changes only how many
+// connections carry the load.
+//
+// Correctness contract (the load-bearing part):
+//   - The PIPELINE owns the PK-hash partition that routed each row to
+//     exactly one of these channels (no drop/dup); this method owns
+//     only the N-worker execution.
+//   - It returns only AFTER every worker has drained its channel and
+//     durably committed its final batch (the join below) — so the
+//     orchestrator advances no position until every row is durable
+//     (ADR-0007). A worker still in flight when the position commits
+//     would be a silent-loss-on-resume gap; the join makes that
+//     structurally impossible.
+//   - The first worker error cancels a shared child context so the
+//     other workers (and the pipeline's reader) unwind; the first
+//     error is returned (loud abort, no partial silent success).
+//   - On ctx cancel every worker's loop selects on ctx.Done() and
+//     exits; each worker's pinned conn is Closed in its own defer, so
+//     no goroutine or connection leaks.
+//
+// keyCols is resolved ONCE here (not per worker) so a keyless table is
+// refused loudly before any worker spawns, identical to the serial
+// path's gate.
+func (w *RowWriter) WriteRowsIdempotentParallel(ctx context.Context, table *ir.Table, workers []<-chan ir.Row) error {
+	if table == nil {
+		return errors.New("mysql: WriteRowsIdempotentParallel: table is nil")
+	}
+	if len(table.Columns) == 0 {
+		return fmt.Errorf("mysql: WriteRowsIdempotentParallel: table %q has no columns", table.Name)
+	}
+	if len(workers) == 0 {
+		return errors.New("mysql: WriteRowsIdempotentParallel: no worker channels")
+	}
+	for i, ch := range workers {
+		if ch == nil {
+			return fmt.Errorf("mysql: WriteRowsIdempotentParallel: worker channel %d is nil", i)
+		}
+	}
+	// Resolve the conflict key once — refuse a keyless table loudly
+	// before spawning any worker (Bug 125), same gate as the serial path.
+	keyCols, ok := effectiveUpsertKeyColumns(table)
+	if !ok {
+		return errKeylessIdempotent(table)
+	}
+
+	// A single worker is just the serial core — no fan-out machinery
+	// needed (and the pipeline only calls this with len==1 on the
+	// degenerate path).
+	if len(workers) == 1 {
+		conn, err := w.db.Conn(ctx)
+		if err != nil {
+			return fmt.Errorf("mysql: idempotent insert into %q: pin connection: %w", table.Name, err)
+		}
+		defer func() { _ = conn.Close() }()
+		return w.writeBatchedIdempotentConn(ctx, conn, table, keyCols, workers[0])
+	}
+
+	// Shared child ctx: the first worker error cancels it so peers (and
+	// the pipeline's reader, which selects on the same parent ctx via
+	// the caller) unwind deterministically.
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var (
+		wg      sync.WaitGroup
+		errOnce sync.Once
+		firstEr error
+	)
+	for _, ch := range workers {
+		wg.Add(1)
+		go func(rows <-chan ir.Row) {
+			defer wg.Done()
+			conn, err := w.db.Conn(workerCtx)
+			if err != nil {
+				errOnce.Do(func() { firstEr = fmt.Errorf("mysql: idempotent insert into %q: pin connection: %w", table.Name, err) })
+				cancel()
+				return
+			}
+			defer func() { _ = conn.Close() }()
+			if err := w.writeBatchedIdempotentConn(workerCtx, conn, table, keyCols, rows); err != nil {
+				errOnce.Do(func() { firstEr = err })
+				cancel()
+			}
+		}(ch)
+	}
+	wg.Wait()
+	return firstEr
+}
+
 // writeBatchedIdempotent is the upsert-form of [writeBatched]. The
 // per-batch flush mechanics are identical (flush on whichever of
 // row-count cap and byte-size cap fires first; ADR-0028); only the
-// SQL changes.
+// SQL changes. It pins one connection and delegates the loop to
+// [writeBatchedIdempotentConn].
 func (w *RowWriter) writeBatchedIdempotent(ctx context.Context, table *ir.Table, rows <-chan ir.Row) error {
-	limit := w.maxRowsPerBatch
-	if limit <= 0 {
-		limit = defaultMaxRowsPerBatch
-	}
-	byteCap := w.maxBufferBytes
-	if byteCap <= 0 {
-		byteCap = defaultMaxBufferBytes
-	}
-
 	// Bug 125: the conflict key the upsert keys on is the table's PK
 	// when present, else a deterministic non-null UNIQUE index. MySQL's
 	// ON DUPLICATE KEY UPDATE fires on ANY unique key on the target, so
@@ -97,6 +186,30 @@ func (w *RowWriter) writeBatchedIdempotent(ctx context.Context, table *ir.Table,
 		return fmt.Errorf("mysql: idempotent insert into %q: pin connection: %w", table.Name, err)
 	}
 	defer func() { _ = conn.Close() }()
+	return w.writeBatchedIdempotentConn(ctx, conn, table, keyCols, rows)
+}
+
+// writeBatchedIdempotentConn is the per-connection idempotent batched
+// upsert loop, shared by the serial [writeBatchedIdempotent] (one conn)
+// and the parallel [WriteRowsIdempotentParallel] (N conns, one per
+// worker). The caller owns pinning + closing conn and resolving keyCols.
+//
+// Concurrency note (ADR-0096): when N of these run on one RowWriter,
+// they share w.warnedClamp (a sync.Map — safe) and w.copyDurableProgress
+// (the snapshot reader's AdvanceDurableRows, mutex-guarded — safe). Each
+// invocation keeps its own batch buffer and flush counter, so the
+// per-call Vector-B sampling schedule is per-worker (defensible: a
+// systematic clamp still trips every worker's first-N exhaustive flushes
+// and the final flush). No shared mutable batch state crosses workers.
+func (w *RowWriter) writeBatchedIdempotentConn(ctx context.Context, conn *sql.Conn, table *ir.Table, keyCols []string, rows <-chan ir.Row) error {
+	limit := w.maxRowsPerBatch
+	if limit <= 0 {
+		limit = defaultMaxRowsPerBatch
+	}
+	byteCap := w.maxBufferBytes
+	if byteCap <= 0 {
+		byteCap = defaultMaxBufferBytes
+	}
 
 	batch := make([]ir.Row, 0, limit)
 	var batchBytes int64

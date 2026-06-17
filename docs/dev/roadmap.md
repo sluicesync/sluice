@@ -121,6 +121,14 @@ v1.1 re-land note: the first v1.1 land regressed broadly (relaxing pinned-reader
 
 **Gotchas.** (A) is the better UX (one command, like pgcopydb `--follow`) but couples the fast paths to the checkpoint machinery; (B) is lower-risk (reuses backup-chain handoff) but is a two-command workflow and needs `migrate` to capture+persist the consistent CDC start position (it takes the snapshot but may not persist a resumable CDC position today — verify). Either way: the snapshot/CDC boundary must stay gap-free (the FTWRL / exported-snapshot boundary discipline from the v0.99.16 silent-loss fix applies). `-race` chunk. Design-pass (Plan agent) before building; own ADR.
 
+### 3e. Parallel writer fan-out on the VStream/CDC snapshot cold-start copy (the PS-MySQL throughput gap) — *ADR-0096 written; implementation in PR (do NOT tag until `-race` green)*
+
+**Why.** Item 3d brought the FAST parallel cold-start to the `sync` path, but only for sources whose snapshot can be PK-range-chunked on the READ side (exported-snapshot PG, raw passthrough). The **VStream/PlanetScale-MySQL** cold-start cannot: vtgate streams the snapshot down one logical channel (no arbitrary range-`SELECT`), and PlanetScale blocks `LOAD DATA LOCAL INFILE`, so the writer falls back to a SINGLE cross-region-RTT-bound batched-`INSERT` connection (~13 GB/h). A live experiment proved N independent `sync` processes scaled near-linearly (N=3 → ~128 GB/h), beating PG single-stream COPY at N≥3–4.
+
+**What.** The WRITE-side analogue of ADR-0019's read-side chunking: one reader goroutine PK-hash-partitions the single incoming snapshot row stream to N per-worker channels; N writer workers each run the existing idempotent batched-INSERT core on their own pinned connection. Engine-neutral pipeline routing + a new opt-in `ir.ParallelIdempotentCopyWriter` capability (MySQL implements; PG stays serial). See [ADR-0096](../adr/adr-0096-parallel-writer-fanout-vstream-snapshot-copy.md).
+
+**Gotchas.** Exactly-once routing (no drop/dup; every row to one worker) is silent-loss-class. No position advances until every worker is durably flushed (ADR-0007 handoff). PK-hash (not round-robin) so Bug-125 COPY re-emissions of a PK serialize on one worker. Zero-value-safe degree int (`0`→default; the v0.99.51 trap). Resume stays the ADR-0095 single-stream v1 limitation. `-race` chunk — the integration `-race` gate is the merge gate and MUST be green before any tag.
+
 ---
 
 ### 5. Translator catalog continuation

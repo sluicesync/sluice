@@ -233,6 +233,57 @@ func TestWriteRowsIdempotent_RefusesKeylessTable(t *testing.T) {
 	}
 }
 
+// TestWriteRowsIdempotentParallel_RefusesKeylessTable: the conflict key
+// is resolved ONCE before any worker spawns, so a keyless table is
+// refused loudly (Bug 125) on the fan-out path too — no worker ever
+// runs (ADR-0096 §2 no-PK contract preserved). No DB needed: the
+// refusal fires before w.db.Conn.
+func TestWriteRowsIdempotentParallel_RefusesKeylessTable(t *testing.T) {
+	w := &RowWriter{bulkLoad: ir.BulkLoadBatchedInsert}
+	table := &ir.Table{
+		Name: "log_lines",
+		Columns: []*ir.Column{
+			{Name: "ts", Type: ir.Timestamp{}, Nullable: false},
+			{Name: "msg", Type: ir.Text{}, Nullable: true},
+		},
+	}
+	ch := make(chan ir.Row)
+	close(ch)
+	err := w.WriteRowsIdempotentParallel(context.Background(), table, []<-chan ir.Row{ch, ch})
+	if err == nil {
+		t.Fatal("WriteRowsIdempotentParallel on keyless table: err=nil; want loud refusal")
+	}
+	if !strings.Contains(err.Error(), "log_lines") || !strings.Contains(err.Error(), "Bug 125") {
+		t.Errorf("error %q; want it to name the table and Bug 125", err.Error())
+	}
+}
+
+// TestWriteRowsIdempotentParallel_Guards: the shape guards fire before
+// any connection is pinned (no DB needed).
+func TestWriteRowsIdempotentParallel_Guards(t *testing.T) {
+	w := &RowWriter{bulkLoad: ir.BulkLoadBatchedInsert}
+	pkTable := &ir.Table{
+		Name:       "users",
+		Columns:    []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+	}
+	ch := make(chan ir.Row)
+	close(ch)
+
+	if err := w.WriteRowsIdempotentParallel(context.Background(), nil, []<-chan ir.Row{ch}); err == nil {
+		t.Error("nil table: want error")
+	}
+	if err := w.WriteRowsIdempotentParallel(context.Background(), &ir.Table{Name: "x"}, []<-chan ir.Row{ch}); err == nil {
+		t.Error("no columns: want error")
+	}
+	if err := w.WriteRowsIdempotentParallel(context.Background(), pkTable, nil); err == nil {
+		t.Error("no worker channels: want error")
+	}
+	if err := w.WriteRowsIdempotentParallel(context.Background(), pkTable, []<-chan ir.Row{nil}); err == nil {
+		t.Error("nil worker channel: want error")
+	}
+}
+
 func TestPrimaryKeyColumns(t *testing.T) {
 	table := &ir.Table{
 		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{

@@ -719,6 +719,18 @@ type bulkCopyOpts struct {
 	// channel before the writer sees it. Zero-value (empty Name)
 	// is the no-op default — single-source streams pay nothing.
 	Shard ShardColumnSpec
+
+	// CopyFanoutDegree is the WRITE-side parallel fan-out degree for
+	// the idempotent VStream/CDC snapshot cold-start copy (ADR-0096).
+	// Resolved through [resolveCopyFanoutDegree]: the Go zero value (0)
+	// maps to the safe default degree, 1 is serial, >1 fans the single
+	// incoming row stream out to N PK-hash-partitioned writer workers.
+	// Only consulted on the idempotent cold-start path (the PS-MySQL
+	// gap) and only when the writer implements
+	// [ir.ParallelIdempotentCopyWriter] and the table has a usable PK;
+	// otherwise the serial path runs. Zero-value-safe by construction
+	// (the v0.99.51 trap): no value produces "zero workers".
+	CopyFanoutDegree int
 }
 
 // runBulkCopyWithOpts is the configurable variant of [runBulkCopy].
@@ -775,12 +787,23 @@ func runBulkCopyWithOpts(
 	// enough that parallelising it is a separate, deliberately deferred
 	// chunk. Only `sluice migrate` (runBulkCopyPhases) drives cross-table
 	// concurrency.
+	// ADR-0096: WRITE-side fan-out for the idempotent VStream/CDC
+	// snapshot cold-start copy. The READ side is a single un-chunkable
+	// vtgate stream, so the only lever is fanning the one row stream out
+	// to N PK-hash-partitioned writer workers. Gated on: idempotent path
+	// + a writer that implements the parallel capability + a resolved
+	// degree > 1 + a per-table usable PK (the partition key). Falls
+	// through to the serial idempotent copy otherwise — never silently
+	// no-ops.
+	fanoutDegree := resolveCopyFanoutDegree(opts.CopyFanoutDegree)
 	for _, table := range schema.Tables {
-		copyFn := copyTable
 		if needsIdempotent {
-			copyFn = copyTableColdStartIdempotent
+			if err := copyTableColdStartIdempotentMaybeParallel(ctx, rows, rw, table, opts.Redactor, opts.Shard, fanoutDegree); err != nil {
+				return wrapWithHint(PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", table.Name, err))
+			}
+			continue
 		}
-		if err := copyFn(ctx, rows, rw, table, opts.Redactor, opts.Shard); err != nil {
+		if err := copyTable(ctx, rows, rw, table, opts.Redactor, opts.Shard); err != nil {
 			return wrapWithHint(PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", table.Name, err))
 		}
 	}

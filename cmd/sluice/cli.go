@@ -694,6 +694,8 @@ type SyncStartCmd struct {
 
 	BulkBatchSize int `help:"FAST cold-start (ADR-0079, PG source) only: bulk-copy batch size for the within-table cursor path. Default 5000. Inert on MySQL/VStream sources (serial cold-start)." default:"5000" placeholder:"N"`
 
+	CopyFanoutDegree int `help:"VStream/CDC snapshot cold-start (ADR-0096, PlanetScale-MySQL target) only: WRITE-side fan-out — the single incoming snapshot row stream is PK-hash-partitioned out to N concurrent batched-INSERT writer workers, each on its own connection, to beat the single cross-region-RTT-bound INSERT connection vtgate forces (it blocks LOAD DATA). 0 (default) = auto: 4; 1 disables fan-out (serial). Bounded by the target connection budget / --max-target-connections. Inert on the FAST cold-start path and on no-PK tables. See ADR-0096." default:"0" placeholder:"N"`
+
 	RawCopyFormat string `help:"FAST cold-start (ADR-0079, same-engine PG→PG) only: wire format for the raw-copy passthrough fast lane (ADR-0078). 'text' (default) is cross-major safe; 'binary' is used only when source and target server majors match (downgrades to text loudly otherwise); 'auto' requests binary. The lane engages ONLY for a no-transform copy (no --redact / --type-override / --expr-override / --inject-shard-column). Inert on MySQL/VStream sources (serial cold-start)." default:"text" enum:"text,binary,auto" placeholder:"text|binary|auto"`
 
 	MaxTargetConnections int `help:"Explicit ceiling on the target connection budget (connection-resilience item 4). On cold-start, sluice probes the target's connection-slot budget (Postgres max_connections / role / database limits minus in-use and a small reserve) and refuses loudly if no slot is free for the copy + CDC connections. 0 (default) = auto (probe-and-refuse-on-exhaustion, no operator ceiling). On the ADR-0079 FAST cold-start (PG source) it also bounds the cross-table × within-table copy + index-build connection product (plus the reserved CDC slot); on the serial cold-start it's the loud-refusal floor plus an explicit ceiling. Inert against engines without a connection-slot model (MySQL target)." default:"0" placeholder:"N"`
@@ -1091,6 +1093,7 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		TableParallelism:                        s.TableParallelism,
 		BulkParallelMinRows:                     s.BulkParallelMinRows,
 		BulkBatchSize:                           s.BulkBatchSize,
+		CopyFanoutDegree:                        s.CopyFanoutDegree,
 		RawCopyFormat:                           parseRawCopyFormat(s.RawCopyFormat),
 		ReapStaleBackends:                       s.ReapStaleBackends,
 		ApplyExecTimeout:                        s.ApplyExecTimeout,
