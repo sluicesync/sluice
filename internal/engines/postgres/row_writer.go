@@ -223,15 +223,31 @@ func (w *RowWriter) DropSchemaTypes(ctx context.Context, schema *ir.Schema) erro
 	if schema == nil {
 		return nil
 	}
+	// Mirror exactly what cold-start (CreateTablesWithoutConstraints)
+	// creates: resolveEnumTypeName honors a PG-source enum's carried
+	// TypeName (Bug 19c) and otherwise synthesizes <table>_<col>_enum,
+	// and generated enum columns emit as TEXT + CHECK (Bug 25) so they
+	// create no type. Dropping by the synthesized name alone (the old
+	// behavior) missed a PG-source named type, leaving it orphaned to
+	// re-trigger SQLSTATE 42710 on the next fresh cold-start (Bug 154).
+	// Dedup so a type shared by multiple columns isn't double-dropped
+	// (harmless via IF EXISTS, but keeps the audit clean).
+	dropped := map[string]struct{}{}
 	for _, table := range schema.Tables {
 		if table == nil {
 			continue
 		}
 		for _, col := range table.Columns {
-			if _, isEnum := col.Type.(ir.Enum); !isEnum {
+			enum, isEnum := col.Type.(ir.Enum)
+			if !isEnum || col.IsGenerated() {
 				continue
 			}
-			stmt := "DROP TYPE IF EXISTS " + quoteIdent(w.schema) + "." + quoteIdent(enumTypeName(table.Name, col.Name)) + " CASCADE"
+			typeName := resolveEnumTypeName(enum, table.Name, col.Name)
+			if _, done := dropped[typeName]; done {
+				continue
+			}
+			dropped[typeName] = struct{}{}
+			stmt := "DROP TYPE IF EXISTS " + quoteIdent(w.schema) + "." + quoteIdent(typeName) + " CASCADE"
 			if _, err := w.db.ExecContext(ctx, stmt); err != nil {
 				return fmt.Errorf("postgres: drop enum type for %s.%s: %w", table.Name, col.Name, err)
 			}
