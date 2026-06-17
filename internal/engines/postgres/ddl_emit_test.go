@@ -990,6 +990,21 @@ func TestEmitCreateEnumType_PreservesSourceTypeName(t *testing.T) {
 	}
 }
 
+// Bug 154: cold-start's enum CREATE TYPE must be idempotent so a
+// resumed/restarted cold-start (interrupted after the CREATE but before
+// commit) doesn't crash-loop on SQLSTATE 42710. PG has no `CREATE TYPE
+// IF NOT EXISTS`, so guardedCreateEnumType wraps the bare CREATE in a
+// DO block swallowing duplicate_object. This pins the wrapper shape; the
+// integration test pins the behavior (create twice → no error).
+func TestGuardedCreateEnumType_WrapsInDuplicateObjectGuard(t *testing.T) {
+	bare := emitCreateEnumType(ir.Enum{Values: []string{"a", "b"}}, "public", "t", "c")
+	got := guardedCreateEnumType(bare)
+	want := `DO $$ BEGIN ` + bare + ` EXCEPTION WHEN duplicate_object THEN NULL; END $$;`
+	if got != want {
+		t.Errorf("\n got  %q\n want %q", got, want)
+	}
+}
+
 func TestEmitTableDef(t *testing.T) {
 	table := &ir.Table{
 		Name: "users",

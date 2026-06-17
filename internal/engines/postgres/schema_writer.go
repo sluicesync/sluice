@@ -246,7 +246,15 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 				continue
 			}
 			createdEnumTypes[typeName] = struct{}{}
-			stmt := emitCreateEnumType(enum, w.schema, table.Name, col.Name)
+			// Bug 154: guard the CREATE TYPE so a resumed/restarted
+			// cold-start (interrupted after this CREATE but before the
+			// migration committed) re-runs idempotently instead of
+			// failing with SQLSTATE 42710 "type already exists" — which
+			// otherwise turns every restart into a crash-loop with zero
+			// progress. PG has no `CREATE TYPE IF NOT EXISTS`; the
+			// DO-block guard (shared with the CDC forward path via
+			// guardedCreateEnumType) swallows duplicate_object.
+			stmt := guardedCreateEnumType(emitCreateEnumType(enum, w.schema, table.Name, col.Name))
 			if _, err := w.db.ExecContext(ctx, stmt); err != nil {
 				return fmt.Errorf("postgres: create enum type for %s.%s: %w", table.Name, col.Name, err)
 			}
@@ -1411,12 +1419,22 @@ func (w *SchemaWriter) ensureEnumType(ctx context.Context, table *ir.Table, col 
 	if !ok || col.IsGenerated() {
 		return nil
 	}
-	create := emitCreateEnumType(enum, w.schema, table.Name, col.Name)
-	stmt := fmt.Sprintf("DO $$ BEGIN %s EXCEPTION WHEN duplicate_object THEN NULL; END $$;", create)
+	stmt := guardedCreateEnumType(emitCreateEnumType(enum, w.schema, table.Name, col.Name))
 	if _, err := w.db.ExecContext(ctx, stmt); err != nil {
 		return fmt.Errorf("ensure enum type for %s.%s.%s: %w", w.schema, table.Name, col.Name, err)
 	}
 	return nil
+}
+
+// guardedCreateEnumType wraps a bare `CREATE TYPE ... AS ENUM` in a DO
+// block that swallows SQLSTATE 42710 (duplicate_object), making the
+// create idempotent — PG has no `CREATE TYPE IF NOT EXISTS`. Shared by
+// cold-start (CreateTablesWithoutConstraints) and the CDC forward path
+// (ensureEnumType) so a re-run of either against a target where the
+// type already exists is a no-op instead of a hard failure (Bug 154,
+// Bug 145). The argument is the statement emitCreateEnumType produces.
+func guardedCreateEnumType(create string) string {
+	return fmt.Sprintf("DO $$ BEGIN %s EXCEPTION WHEN duplicate_object THEN NULL; END $$;", create)
 }
 
 // alterEnumAddValues forwards an enum value-add (Bug 145): ensure the enum
