@@ -27,6 +27,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -271,6 +272,115 @@ func (r *RowReader) reltuplesOffConn(ctx context.Context, table *ir.Table) (int6
 		return 0, nil
 	}
 	return count, nil
+}
+
+// SampleKeysetBoundaries implements [ir.KeysetSampler] (ADR-0096). It
+// returns n-1 interior boundary tuples that split the table into n
+// approximately equal ROW-COUNT slices ordered by the PK columns, for a
+// non-integer / composite PK the MIN/MAX/divide path can't handle.
+//
+// One windowed scan of the PK index: ROW_NUMBER() ranks each row in PK
+// order, COUNT(*) OVER () gives the total, and we keep the rows at rank
+// ceil(total*k/n) for k in 1..n-1. The PK index is covering (only PK
+// columns projected), and the split is by actual count → skew-free on
+// any keyspace clustering.
+//
+// On a snapshot-pinned reader (closer == nil OR snapshotPinned) a query
+// on the pinned conn would conflict with the in-flight stream, so this
+// runs on a FRESH off-snapshot conn from r.estimatorDSN when pinned —
+// the boundary sample is for chunk *partitioning*, and any consistent
+// PK ordering partitions correctly; the per-chunk readers re-pin the
+// real snapshot. With no estimatorDSN a pinned reader returns an error
+// → single-reader fallback. On the non-pinned migrate reader it runs on
+// the pool (strictly pre-stream).
+//
+// Fewer than n-1 distinct boundaries / empty table returns fewer / zero
+// tuples — not an error; the orchestrator collapses chunks accordingly.
+func (r *RowReader) SampleKeysetBoundaries(ctx context.Context, table *ir.Table, pkColumns []string, n int) ([][]any, error) {
+	if table == nil {
+		return nil, errors.New("postgres: SampleKeysetBoundaries: table is nil")
+	}
+	if len(pkColumns) == 0 {
+		return nil, errors.New("postgres: SampleKeysetBoundaries: no PK columns")
+	}
+	if n <= 1 {
+		return nil, fmt.Errorf("postgres: SampleKeysetBoundaries: n must be > 1, got %d", n)
+	}
+
+	pinned := r.closer == nil || r.snapshotPinned
+	if pinned {
+		if r.estimatorDSN == "" {
+			return nil, errors.New("postgres: SampleKeysetBoundaries: snapshot-pinned reader without estimator DSN; single-reader fallback")
+		}
+		db, err := openDB(ctx, &pgConfig{dsn: r.estimatorDSN, schema: r.schema, appID: r.estimatorAppID})
+		if err != nil {
+			return nil, fmt.Errorf("postgres: SampleKeysetBoundaries open: %w", err)
+		}
+		defer func() { _ = db.Close() }()
+		return r.sampleKeysetOn(ctx, db, table, pkColumns, n)
+	}
+	return r.sampleKeysetOn(ctx, r.q, table, pkColumns, n)
+}
+
+// sampleKeysetOn runs the windowed boundary-sample query against q.
+func (r *RowReader) sampleKeysetOn(ctx context.Context, q querier, table *ir.Table, pkColumns []string, n int) ([][]any, error) {
+	tableRef := quoteIdent(r.effectiveSchema(table)) + "." + quoteIdent(table.Name)
+	pkQuoted := make([]string, len(pkColumns))
+	for i, c := range pkColumns {
+		pkQuoted[i] = quoteIdent(c)
+	}
+	pkList := strings.Join(pkQuoted, ", ")
+
+	// ceil(total*k/n) as integer arithmetic: (total*k + n-1) / n. PG
+	// integer division truncates toward zero, so the +n-1 lifts it to the
+	// ceiling. n and k are orchestrator ints (no user input → no bind).
+	rankExpr := make([]string, 0, n-1)
+	for k := 1; k < n; k++ {
+		rankExpr = append(rankExpr, fmt.Sprintf("(total*%d + %d) / %d", k, n-1, n))
+	}
+	stmt := fmt.Sprintf(`
+		SELECT %s FROM (
+			SELECT %s,
+			       ROW_NUMBER() OVER (ORDER BY %s) AS rn,
+			       COUNT(*)     OVER ()            AS total
+			FROM %s
+		) s
+		WHERE rn IN (%s)
+		ORDER BY rn`,
+		pkList, pkList, pkList, tableRef, strings.Join(rankExpr, ", "))
+
+	rows, err := q.QueryContext(ctx, stmt) //nolint:rowserrcheck,sqlclosecheck // handled below
+	if err != nil {
+		return nil, fmt.Errorf("postgres: SampleKeysetBoundaries query: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out [][]any
+	for rows.Next() {
+		holders := make([]any, len(pkColumns))
+		ptrs := make([]any, len(pkColumns))
+		for i := range holders {
+			ptrs[i] = &holders[i]
+		}
+		if scanErr := rows.Scan(ptrs...); scanErr != nil {
+			return nil, fmt.Errorf("postgres: SampleKeysetBoundaries scan: %w", scanErr)
+		}
+		tuple := make([]any, len(pkColumns))
+		for i, v := range holders {
+			if b, ok := v.([]byte); ok {
+				cp := make([]byte, len(b))
+				copy(cp, b)
+				tuple[i] = cp
+			} else {
+				tuple[i] = v
+			}
+		}
+		out = append(out, tuple)
+	}
+	if rerr := rows.Err(); rerr != nil {
+		return nil, fmt.Errorf("postgres: SampleKeysetBoundaries rows: %w", rerr)
+	}
+	return out, nil
 }
 
 // exactCount runs SELECT COUNT(*) for the table. Used only as the

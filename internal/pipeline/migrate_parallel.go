@@ -211,8 +211,23 @@ func shouldParallelChunk(ctx context.Context, deps *parallelBulkCopyDeps, rows i
 	if deps == nil || deps.parallelism <= 1 {
 		return false, "parallelism is 1; single-reader path"
 	}
-	if eligible, reason := canParallelChunkTable(table, deps.parallelism); !eligible {
+	eligible, strategy, reason := canParallelChunkTable(table, deps.parallelism)
+	if !eligible {
 		return false, reason
+	}
+	// The reader must implement the surface the chosen strategy needs;
+	// otherwise fall back cleanly here rather than erroring inside
+	// resolveChunks. (ADR-0096: keyset needs KeysetSampler; MIN/MAX needs
+	// RangeBoundsQuerier — both shipping engines implement both.)
+	switch strategy {
+	case strategyMinMaxDivide:
+		if _, ok := rows.(rangeQuerier); !ok {
+			return false, "reader does not implement RangeBoundsQuerier; single-reader path"
+		}
+	case strategyKeysetSample:
+		if _, ok := rows.(keysetSampler); !ok {
+			return false, "reader does not implement KeysetSampler (non-integer/composite PK); single-reader path"
+		}
 	}
 	count, err := approximateRowCount(ctx, rows, table)
 	if err != nil {
@@ -365,13 +380,34 @@ func resolveChunks(
 		return entry.Chunks, nil
 	}
 
-	// Fresh start (or upgrade from v0.4.0): compute boundaries via
-	// MIN/MAX/divide.
-	rangeQ, ok := primaryRows.(rangeQuerier)
-	if !ok {
-		return nil, errors.New("pipeline: primary row reader does not implement RangeBoundsQuerier")
+	// Fresh start (or upgrade from v0.4.0): compute boundaries. The
+	// strategy is derived from the table's PK shape (ADR-0096):
+	// single integer PK → MIN/MAX/divide; non-integer / composite
+	// orderable PK → sampled-keyset.
+	eligible, strategy, reason := canParallelChunkTable(table, parallelism)
+	if !eligible {
+		return nil, fmt.Errorf("pipeline: table %q not chunk-eligible: %s", table.Name, reason)
 	}
-	bounds, err := computeChunkBoundaries(ctx, rangeQ, table, parallelism)
+	var (
+		bounds []chunkBoundary
+		err    error
+	)
+	switch strategy {
+	case strategyMinMaxDivide:
+		rangeQ, ok := primaryRows.(rangeQuerier)
+		if !ok {
+			return nil, errors.New("pipeline: primary row reader does not implement RangeBoundsQuerier")
+		}
+		bounds, err = computeChunkBoundaries(ctx, rangeQ, table, parallelism)
+	case strategyKeysetSample:
+		sampler, ok := primaryRows.(keysetSampler)
+		if !ok {
+			return nil, errors.New("pipeline: primary row reader does not implement KeysetSampler")
+		}
+		bounds, err = computeKeysetChunkBoundaries(ctx, sampler, table, parallelism)
+	default:
+		return nil, fmt.Errorf("pipeline: table %q has unknown chunk strategy %d", table.Name, strategy)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("pipeline: compute chunks for %q: %w", table.Name, err)
 	}
@@ -1200,42 +1236,44 @@ func cloneTableProgressForWrite(p ir.TableProgress) ir.TableProgress {
 }
 
 // filterByUpperBound wraps a row channel with a goroutine that drops
-// rows whose PK exceeds the chunk's upper bound. Returns the
-// downstream channel (forwarded as-is when upperPK is nil).
+// rows whose PK exceeds the chunk's INCLUSIVE upper bound. Returns the
+// downstream channel (forwarded as-is when upperPK is nil — the last
+// chunk has no upper bound).
 //
-// The filter is necessary because the underlying ReadRowsBatch
-// query has no notion of "upper bound" — it returns up to N rows with
-// PK > cursor in PK order. Without this filter, chunk 0's batch could
-// run past chunk 1's range and double-copy. The filter terminates
-// the channel early (closes downstream and cancels via the parent
-// ctx) when it sees a row beyond UpperPK so the reader doesn't keep
-// scanning rows that won't be used.
+// The filter is necessary because the underlying ReadRowsBatch query has
+// no notion of "upper bound" — it returns up to N rows with PK > cursor
+// in PK order. Without this filter, chunk 0's batch could run past chunk
+// 1's range and double-copy. The filter terminates the channel early
+// (closes downstream so the reader goroutine unwinds) the first time it
+// sees a row strictly past UpperPK; because rows arrive in the engine's
+// PK order, every subsequent row is also past the bound, so stopping is
+// safe and complete.
 //
-// For composite PKs the comparison would need a row-comparison
-// predicate; v1 supports single-column integer PKs only, so a
-// straightforward int64 compare suffices.
+// The comparison is the full-tuple [comparePKTuple] — the SAME total
+// order the engine's ORDER BY / WHERE (pk...) > (...) cursor uses — so it
+// is correct for single integer PKs (ADR-0019), single non-integer PKs,
+// and composite PKs (ADR-0096). The row's PK tuple is projected from
+// pkCols in declaration order. UpperPK is inclusive: a row whose PK
+// equals UpperPK belongs to THIS chunk (matching the half-open
+// (LowerPK, UpperPK] convention), so only comparePKTuple > 0 is dropped.
 func filterByUpperBound(ctx context.Context, src <-chan ir.Row, pkCols []string, upperPK []any) <-chan ir.Row {
 	if upperPK == nil || len(pkCols) == 0 {
 		// No upper bound (last chunk) or degenerate PK — pass through.
 		return src
 	}
-	// v1 only handles single-column integer PKs. For other shapes
-	// the parallel path is gated upstream; defensive pass-through
-	// here keeps unexpected callers safe.
-	if len(pkCols) != 1 || len(upperPK) != 1 {
+	if len(upperPK) != len(pkCols) {
+		// Width mismatch should not happen (boundaries are width-checked
+		// at computation). Defensive pass-through keeps an unexpected
+		// caller safe rather than mis-clipping.
 		return src
 	}
-	upperInt, ok := coerceInt64(upperPK[0])
-	if !ok {
-		return src
-	}
-	pkCol := pkCols[0]
 
 	// Bounded buffer for the same decode/write-overlap reason as the
 	// tees — see [rowChanBuffer].
 	out := make(chan ir.Row, rowChanBuffer)
 	go func() {
 		defer close(out)
+		rowPK := make([]any, len(pkCols))
 		for {
 			select {
 			case <-ctx.Done():
@@ -1244,24 +1282,14 @@ func filterByUpperBound(ctx context.Context, src <-chan ir.Row, pkCols []string,
 				if !ok {
 					return
 				}
-				rowPK, ok := coerceInt64(row[pkCol])
-				if !ok {
-					// Non-integer row PK on an integer-PK chunk: should
-					// not happen given the eligibility checks. Forward
-					// rather than silently drop to surface the
-					// inconsistency in any subsequent integrity check.
-					select {
-					case out <- row:
-					case <-ctx.Done():
-						return
-					}
-					continue
+				for i, c := range pkCols {
+					rowPK[i] = row[c]
 				}
-				if rowPK > upperInt {
-					// Past the chunk's upper bound; drop the row and
-					// drain the rest of the channel so the reader's
-					// goroutine unwinds cleanly. The next ReadRowsBatch
-					// returns zero rows and the chunk loop exits.
+				if comparePKTuple(rowPK, upperPK) > 0 {
+					// Strictly past the chunk's inclusive upper bound;
+					// drop this row and stop. Rows arrive in PK order, so
+					// nothing after it can be within the bound. Returning
+					// closes `out` and the reader goroutine unwinds.
 					return
 				}
 				select {

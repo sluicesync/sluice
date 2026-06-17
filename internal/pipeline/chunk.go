@@ -38,6 +38,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -171,42 +172,109 @@ func resolveBulkParallelMinRows(configured int64, tableCount int) int64 {
 	return adapted
 }
 
+// chunkStrategy names how a table's PK range is divided into chunks.
+//
+//   - strategyMinMaxDivide: ADR-0019's MIN/MAX/divide on a single
+//     integer PK column. One cheap two-aggregate query; no skew on
+//     dense integer keys. Requires [ir.RangeBoundsQuerier].
+//   - strategyKeysetSample: ADR-0096's sampled-keyset (ROW_NUMBER()
+//     over the PK index, split by row count → skew-free) for a single
+//     non-integer orderable PK or a composite PK. Requires
+//     [ir.KeysetSampler].
+//   - strategyNone: the table is not eligible for parallel chunking and
+//     takes the single-reader path.
+type chunkStrategy int
+
+const (
+	strategyNone chunkStrategy = iota
+	strategyMinMaxDivide
+	strategyKeysetSample
+)
+
 // canParallelChunkTable reports whether table is eligible for the
-// parallel-copy path. A table is eligible when:
+// parallel-copy path and, if so, which boundary strategy applies.
 //
-//   - It has exactly one PK column. Composite PKs fall back to
-//     single-reader for v1; ADR-0019 documents the limitation.
-//   - The PK column type is an integer. Non-integer leading PKs
-//     (text, UUID, decimal) fall back; future strategies (b)/(c) in
-//     ADR-0019 will lift this.
-//   - The configured parallelism is > 1. Single-pair parallelism is
-//     the same as the v0.4.x path.
+// A table is chunkable when parallelism is > 1, it has a primary key,
+// and every PK column has an orderable type (one the engines' row-
+// comparison cursor — ReadRowsBatch — already ORDER BYs and compares
+// correctly). The strategy is then:
 //
-// Returns (true, nil) when eligible, (false, reason) otherwise.
-// The reason string is suitable for a single-line operator-facing
-// log message.
-func canParallelChunkTable(table *ir.Table, parallelism int) (eligible bool, reason string) {
+//   - strategyMinMaxDivide for a single integer PK (ADR-0019), and
+//   - strategyKeysetSample for everything else orderable — a single
+//     non-integer PK (UUID/string/binary/decimal/temporal) or a
+//     composite PK (ADR-0096).
+//
+// A no-PK table, or a PK with any non-orderable column type
+// (JSON/Array/Geometry — which no sane schema uses as a key), falls back
+// to single-reader: we never invent a chunking that could miss or
+// double-copy rows.
+//
+// Returns (true, strategy, "") when eligible, (false, strategyNone,
+// reason) otherwise. The reason string is suitable for a single-line
+// operator-facing log message.
+func canParallelChunkTable(table *ir.Table, parallelism int) (eligible bool, strategy chunkStrategy, reason string) {
 	if parallelism <= 1 {
-		return false, "parallelism is 1; single-reader path"
+		return false, strategyNone, "parallelism is 1; single-reader path"
 	}
 	if table == nil {
-		return false, "table is nil"
+		return false, strategyNone, "table is nil"
 	}
 	if table.PrimaryKey == nil || len(table.PrimaryKey.Columns) == 0 {
-		return false, "table has no primary key"
+		return false, strategyNone, "table has no primary key"
 	}
-	if len(table.PrimaryKey.Columns) > 1 {
-		return false, "composite primary key (v1 supports single-column PKs)"
+
+	// Every PK column must be orderable for the keyset cursor + boundary
+	// comparison to be well-defined.
+	for _, pkc := range table.PrimaryKey.Columns {
+		col := lookupColumn(table, pkc.Column)
+		if col == nil {
+			return false, strategyNone, fmt.Sprintf("primary key column %q not found in column list", pkc.Column)
+		}
+		if !isOrderablePKType(col.Type) {
+			return false, strategyNone, fmt.Sprintf("primary key column %q is %s; not an orderable chunk key", pkc.Column, col.Type.String())
+		}
 	}
-	pkColName := table.PrimaryKey.Columns[0].Column
-	col := lookupColumn(table, pkColName)
-	if col == nil {
-		return false, fmt.Sprintf("primary key column %q not found in column list", pkColName)
+
+	// Single integer PK → the cheap MIN/MAX/divide path (ADR-0019).
+	if len(table.PrimaryKey.Columns) == 1 {
+		col := lookupColumn(table, table.PrimaryKey.Columns[0].Column)
+		if _, ok := col.Type.(ir.Integer); ok {
+			return true, strategyMinMaxDivide, ""
+		}
 	}
-	if _, ok := col.Type.(ir.Integer); !ok {
-		return false, fmt.Sprintf("primary key column %q is %s; v1 supports integer PKs", pkColName, col.Type.String())
+
+	// Single non-integer orderable PK, or composite orderable PK → the
+	// sampled-keyset path (ADR-0096).
+	return true, strategyKeysetSample, ""
+}
+
+// isOrderablePKType reports whether an IR type can serve as (part of) a
+// chunk key: it sorts deterministically under SQL ORDER BY and its
+// values round-trip through a parameter placeholder for the row-
+// comparison predicate. This is exactly the set the engines'
+// ReadRowsBatch already orders and compares (ADR-0018), and the set the
+// boundary comparator [comparePKTuple] handles per family.
+//
+// ir.Bit is included: the cursor reader orders it and the comparator
+// treats it as its string bit-form. ir.Domain unwraps to its base type.
+// JSON / Array / Geometry / Set / Enum and unknown types are NOT
+// orderable as keys and route the table to single-reader.
+func isOrderablePKType(t ir.Type) bool {
+	if dom, ok := t.(ir.Domain); ok {
+		if dom.BaseType == nil {
+			return false
+		}
+		return isOrderablePKType(dom.BaseType)
 	}
-	return true, ""
+	switch t.(type) {
+	case ir.Integer, ir.Decimal,
+		ir.Char, ir.Varchar, ir.Text, ir.UUID,
+		ir.Binary, ir.Varbinary, ir.Blob, ir.Bit,
+		ir.Date, ir.Time, ir.Timestamp, ir.DateTime:
+		return true
+	default:
+		return false
+	}
 }
 
 // lookupColumn returns the column with the given name, or nil if not
@@ -252,7 +320,7 @@ func computeChunkBoundaries(ctx context.Context, q rangeQuerier, table *ir.Table
 	if n <= 0 {
 		return nil, errors.New("pipeline: computeChunkBoundaries: n must be > 0")
 	}
-	if eligible, reason := canParallelChunkTable(table, n); !eligible {
+	if eligible, _, reason := canParallelChunkTable(table, n); !eligible {
 		return nil, fmt.Errorf("pipeline: computeChunkBoundaries: table %q not eligible: %s", table.Name, reason)
 	}
 
@@ -379,3 +447,217 @@ func coerceInt64(v any) (int64, bool) {
 // alias here lets the chunk-boundary code be a small focused unit
 // without the test fixtures having to refer to the IR import.
 type rangeQuerier = ir.RangeBoundsQuerier
+
+// keysetSampler is a local alias for [ir.KeysetSampler] (ADR-0096).
+type keysetSampler = ir.KeysetSampler
+
+// computeKeysetChunkBoundaries divides a non-integer / composite-PK
+// table into chunks using the sampled-keyset strategy (ADR-0096). It
+// asks the sampler for n-1 interior boundary tuples (each split point an
+// actual row's PK, so the split is by row count and skew-free), then
+// assembles them into half-open (LowerPK, UpperPK] chunk ranges with the
+// same nil-bound convention computeChunkBoundaries uses for integers:
+// chunk 0 has LowerPK==nil, chunk N-1 has UpperPK==nil, and boundary[k]
+// is the INCLUSIVE upper of chunk k and the EXCLUSIVE lower of chunk k+1.
+//
+// Edge cases (all → fewer chunks, never a mis-split):
+//
+//   - Empty table / sampler returns 0 boundaries: a single nil-bounded
+//     chunk; the parallel path collapses to single-reader.
+//   - Fewer than n-1 DISTINCT boundaries (tiny or heavily-duplicate-
+//     keyed table): consecutive equal boundaries would produce a
+//     zero-width interior chunk (LowerPK == UpperPK under the half-open
+//     convention captures NO rows — those rows fall in the earlier
+//     chunk under pk <= boundary). We drop the duplicates, yielding
+//     fewer, non-empty chunks. No row is placed in two chunks or zero
+//     chunks.
+//
+// Boundary tuples must be width == len(pkCols); the sampler contract
+// guarantees it, and a mismatch is a loud programming error rather than
+// a silent partial bound.
+func computeKeysetChunkBoundaries(ctx context.Context, s keysetSampler, table *ir.Table, n int) ([]chunkBoundary, error) {
+	if n <= 0 {
+		return nil, errors.New("pipeline: computeKeysetChunkBoundaries: n must be > 0")
+	}
+	if eligible, strategy, reason := canParallelChunkTable(table, n); !eligible || strategy != strategyKeysetSample {
+		return nil, fmt.Errorf("pipeline: computeKeysetChunkBoundaries: table %q not keyset-eligible: %s", table.Name, reason)
+	}
+
+	pkCols := primaryKeyColumnNames(table)
+	boundaries, err := s.SampleKeysetBoundaries(ctx, table, pkCols, n)
+	if err != nil {
+		return nil, fmt.Errorf("pipeline: sample keyset boundaries for %q: %w", table.Name, err)
+	}
+
+	// Validate width and drop consecutive duplicates so no zero-width
+	// interior chunk is produced. Boundaries arrive in PK order.
+	deduped := make([][]any, 0, len(boundaries))
+	for _, b := range boundaries {
+		if len(b) != len(pkCols) {
+			return nil, fmt.Errorf("pipeline: keyset boundary for %q has %d values; want %d PK columns",
+				table.Name, len(b), len(pkCols))
+		}
+		if len(deduped) > 0 && comparePKTuple(deduped[len(deduped)-1], b) == 0 {
+			// Equal to the previous boundary: the interior chunk between
+			// them would be empty (pk > prev AND pk <= b with prev == b).
+			// Drop it so we don't burn a connection on a no-row chunk.
+			continue
+		}
+		deduped = append(deduped, b)
+	}
+
+	// 0 boundaries → single nil-bounded chunk (collapses to single-reader).
+	if len(deduped) == 0 {
+		return []chunkBoundary{{chunkIndex: 0}}, nil
+	}
+
+	// k boundaries → k+1 chunks. Chunk i:
+	//   lower = boundary[i-1] (nil for i==0),
+	//   upper = boundary[i]   (nil for the last chunk).
+	out := make([]chunkBoundary, 0, len(deduped)+1)
+	for i := 0; i <= len(deduped); i++ {
+		var lower, upper []any
+		if i > 0 {
+			lower = deduped[i-1]
+		}
+		if i < len(deduped) {
+			upper = deduped[i]
+		}
+		out = append(out, chunkBoundary{chunkIndex: i, lowerPK: lower, upperPK: upper})
+	}
+	return out, nil
+}
+
+// comparePKTuple compares two PK tuples under the SAME total order the
+// engines' row-comparison cursor uses (ORDER BY pk1, pk2, ... and
+// WHERE (pk1,...) > (...)): lexicographic, column by column, with each
+// column compared per its value family. Returns -1, 0, or +1.
+//
+// This is the load-bearing exactly-once surface (ADR-0096): the boundary
+// clip in [filterByUpperBound] uses it to decide whether a row is at or
+// past a chunk's inclusive UpperPK, and the dedup above uses it to drop
+// zero-width chunks. A wrong comparison for any family would silently
+// mis-place a boundary row (the Bug-74 class), so the comparator is
+// pinned across every orderable family × {single, composite}.
+//
+// Tuples must be equal width (the orchestrator only ever compares a row's
+// PK projection against a same-width boundary). A nil/empty tuple sorts
+// before any non-empty one; equal-prefix-but-shorter sorts first.
+func comparePKTuple(a, b []any) int {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		if c := comparePKValue(a[i], b[i]); c != 0 {
+			return c
+		}
+	}
+	switch {
+	case len(a) < len(b):
+		return -1
+	case len(a) > len(b):
+		return 1
+	default:
+		return 0
+	}
+}
+
+// comparePKValue compares two single PK column values within their
+// family. The families mirror [isOrderablePKType]:
+//
+//   - integer-like (int64/int32/int/uint64/uint32) → numeric compare.
+//   - everything else is normalised to a comparable scalar:
+//     []byte (binary / driver-returned strings / decimal-as-bytes) and
+//     string compare BYTEWISE — which matches SQL's binary collation for
+//     BINARY/VARBINARY and the C-locale ORDER BY the cursor relies on;
+//     time.Time compares chronologically.
+//
+// Mixed integer/non-integer (shouldn't happen — a column is one family)
+// falls through to a stable bytewise compare of the fmt forms so the
+// result is deterministic rather than panicking. NULL PK values cannot
+// occur (PK columns are NOT NULL); a nil here is a programming error and
+// sorts before any value rather than silently equal.
+func comparePKValue(a, b any) int {
+	// Integer family first (the common case + the MIN/MAX/divide path).
+	ai, aok := coerceInt64(a)
+	bi, bok := coerceInt64(b)
+	if aok && bok {
+		switch {
+		case ai < bi:
+			return -1
+		case ai > bi:
+			return 1
+		default:
+			return 0
+		}
+	}
+
+	// nil sorts first (defensive — PK columns are NOT NULL).
+	switch {
+	case a == nil && b == nil:
+		return 0
+	case a == nil:
+		return -1
+	case b == nil:
+		return 1
+	}
+
+	// time.Time chronological compare.
+	if at, ok := a.(time.Time); ok {
+		if bt, ok := b.(time.Time); ok {
+			switch {
+			case at.Before(bt):
+				return -1
+			case at.After(bt):
+				return 1
+			default:
+				return 0
+			}
+		}
+	}
+
+	// Everything else: bytewise compare of the canonical byte form
+	// (matches SQL binary collation + the C-locale cursor ORDER BY).
+	return bytesCompare(pkBytes(a), pkBytes(b))
+}
+
+// pkBytes renders a non-integer, non-time PK value to its canonical byte
+// form for bytewise comparison. string and []byte are the two shapes the
+// drivers return for orderable string/binary/decimal/uuid/bit columns;
+// anything else falls back to its fmt form so the compare stays
+// deterministic.
+func pkBytes(v any) []byte {
+	switch t := v.(type) {
+	case []byte:
+		return t
+	case string:
+		return []byte(t)
+	default:
+		return []byte(fmt.Sprintf("%v", v))
+	}
+}
+
+// bytesCompare is bytes.Compare without importing bytes for one call.
+func bytesCompare(a, b []byte) int {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		switch {
+		case a[i] < b[i]:
+			return -1
+		case a[i] > b[i]:
+			return 1
+		}
+	}
+	switch {
+	case len(a) < len(b):
+		return -1
+	case len(a) > len(b):
+		return 1
+	default:
+		return 0
+	}
+}

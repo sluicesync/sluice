@@ -379,6 +379,50 @@ type RangeBoundsQuerier interface {
 	RangeBounds(ctx context.Context, table *Table, pkColumn string) (minVal, maxVal any, err error)
 }
 
+// KeysetSampler is the optional surface a [RowReader] can implement to
+// expose sampled-keyset chunk boundaries for a table whose primary key
+// is NOT a single integer column — a single non-integer orderable PK
+// (UUID, string, binary, decimal, temporal) or a composite PK
+// (ADR-0096). It is the (c) NTILE/ROW_NUMBER() strategy ADR-0019
+// deferred; [RangeBoundsQuerier] (MIN/MAX/divide) stays the path for
+// single integer PKs.
+//
+// SampleKeysetBoundaries returns n-1 INTERIOR boundary tuples that split
+// the table into n approximately equal ROW-COUNT slices, ordered by the
+// PK columns. Each returned tuple has len(pkColumns) values, in
+// pkColumns order, scanned in the engine's canonical [Row] value shape
+// (so they round-trip through the same parameter binding the cursor
+// predicate uses). The orchestrator assembles them into half-open
+// (LowerPK, UpperPK] chunk ranges:
+//
+//   - boundary[k] is the INCLUSIVE upper bound of chunk k and the
+//     EXCLUSIVE lower bound of chunk k+1, matching the engine's
+//     WHERE (pk...) > (...) / <= (...) row-comparison total order.
+//
+// The split is by actual row count (ROW_NUMBER() over the PK index),
+// so it is skew-free regardless of how clustered the keyspace is — the
+// reason the keyset strategy exists for exactly the UUID/string keys
+// MIN/MAX/divide would skew on.
+//
+// Returning fewer than n-1 distinct boundaries (a tiny or
+// heavily-duplicate-keyed table, or an empty table) is NOT an error: the
+// orchestrator drops zero-width interior chunks and, if too few remain,
+// routes the table to the single-reader path. Returning an error makes
+// the table fall back to single-reader too — keyset chunking is a
+// performance optimisation whose absence is never a correctness problem.
+//
+// Like [RangeBoundsQuerier] this MUST run strictly pre-stream (the
+// chunk-boundary decision is single-goroutine and precedes any per-chunk
+// copy stream), so a snapshot-pinned reader either runs it on a conn
+// that cannot race an in-flight stream or returns an error to fall back.
+//
+// Engines that don't implement this interface keep the ADR-0019
+// behaviour: non-integer/composite-PK tables stay on the single-reader
+// path. The shipping engines (MySQL, Postgres) both implement it.
+type KeysetSampler interface {
+	SampleKeysetBoundaries(ctx context.Context, table *Table, pkColumns []string, n int) ([][]any, error)
+}
+
 // RowCounter is the optional surface a [RowReader] can implement to
 // expose a row-count estimate for ETA reporting in the bulk-copy
 // progress lines (v0.5.0). The estimate may be exact (`SELECT
