@@ -1,0 +1,80 @@
+# ADR-0095: Auto-shard-by-table VStream cold-copy (bounded memory for a full keyspace, one command)
+
+## Status
+
+Accepted. Builds on [ADR-0071](adr-0071-vstream-snapshot-bounded-memory.md) (bounded-memory VStream snapshot streaming — the Phase 1 loud-refusal floor + the Phase 2 concurrent streaming pump) and replaces its deferred **Phase 3** (disk-spill the not-yet-consumed-table buffer) for the multi-table case. Composes with [ADR-0072](adr-0072-resumable-coldstart-copy.md) (resumable COPY cursor), [ADR-0010](adr-0010-idempotent-applier.md) (idempotent apply), and [ADR-0007](adr-0007-position-persistence.md) (position-then-commit). Does not touch the binlog (vanilla MySQL) or Postgres cold-copy paths.
+
+## Context
+
+The program's **#1 finding** (proven on a 302 GB PlanetScale source, sluice v0.99.62): a full multi-table Vitess/PlanetScale keyspace cannot be cold-copied in one command at bounded memory.
+
+The VStream cold-copy opens **one** VStream with the keyspace-wide filter `[{Match:"/.*/"}]` (`vstreamCopyFilterRules`, `internal/engines/mysql/cdc_vstream_snapshot.go`). vtgate's COPY mode then streams **every table interleaved** down that single physical stream. sluice's orchestrator, by contract, drains one table at a time (`runBulkCopyWithOpts` → per-table `ReadRows`), so every table that is *not* the one currently being drained accumulates in `rowBuffer` under `maxBufferBytes`. The steady-state RAM requirement is therefore:
+
+```
+RAM ≈ Σ (every table except the active one)
+```
+
+For the 302 GB source that is ~290 GB — infeasible — so the run hits ADR-0071's **Phase 1 loud refusal** on the first oversized not-yet-consumed table (`enqueueRowLocked`'s "multi-table interleaving … not yet disk-spilled (ADR-0071 Phase 3)" error). The only current workaround is to drive the copy table-by-table by hand with repeated `--include-table` runs — exactly the per-table workaround this ADR removes.
+
+This affects **sharded and unsharded** Vitess/PlanetScale equally: it is a property of VStream COPY mode (one stream, all tables interleaved), not of sharding. The fan-in across shards is orthogonal — vtgate already merges N shards into one logical stream, and sluice already merges per-shard rows for one logical table by unqualified name.
+
+### Why the interleave exists at all (what we are giving up)
+
+The single keyspace-wide stream produces a **single, globally-consistent snapshot point**: the global `COPY_COMPLETED` event fires once every per-(shard,table) copy has finished, and the VGTID captured at that moment is a single position `P_global` valid for *every* table. The CDC handoff then resumes from `P_global` and the union (snapshot ∪ CDC) covers every row exactly once. That global consistency is the property the interleave buys — and the property this ADR must reconstruct from per-table pieces without losing or duplicating a single row across the snapshot→CDC seam.
+
+ADR-0071 already considered "align orchestrator consumption to VStream's emission order" and rejected it (couples the engine-neutral orchestrator to VStream specifics). That tenet is preserved here: the orchestrator is untouched; the per-table iteration lives entirely **inside the engine**, behind the existing `ir.SnapshotStream` contract.
+
+## Decision
+
+Make the VStream cold-copy **auto-shard by table internally**. Instead of opening one keyspace-wide COPY and letting vtgate interleave, the engine iterates the COPY **per table** — opening, draining, and completing one single-table VStream COPY (`Filter: [{Match:<table>}]`) at a time on the **same** gRPC connection — then opens the single CDC tail. Each single-table COPY has **constant memory** by construction (only one table's rows are ever in flight; there is no interleave to buffer). The user still runs **one** `sluice migrate` / `sluice sync` command; the per-table iteration is invisible above the `SnapshotStream` boundary.
+
+The user-visible `--include-table` behavior is preserved exactly: it scopes *which* tables the per-table loop iterates (it already flows in as the `tables` allowlist to `OpenSnapshotStreamForTables` / `vstreamCopyFilterRules`).
+
+### Consistency model — the correctness-critical part
+
+Per-table COPY means each table `t_i` completes its COPY at a **different** per-table snapshot VGTID `P_i` (later tables finish later, so on each shard `P_i`'s GTID set grows monotonically across the loop — they are produced by **one in-flight session against one vtgate**, so they are causally ordered, not arbitrary). There is no single global `COPY_COMPLETED`. The seam question is: from what position does CDC resume so that the union (per-table snapshots ∪ CDC tail) still covers every row **exactly once** — no gap (silent loss), no un-absorbable duplicate?
+
+**The stitch: resume CDC from the per-shard GTID-set _intersection_ (the set-theoretic minimum) of the captured per-table snapshot points — `P_start = ⋂_i P_i` per shard.**
+
+Why this is gapless and overlap-safe — the load-bearing argument the main-session review must check hardest:
+
+- **No gap (no silent loss).** A row change for table `t_i` is missed only if it committed *after* `t_i`'s snapshot `P_i` *and* CDC starts *after* that change. CDC starts at `P_start = ⋂_i P_i`, which is a **subset of every** `P_i` (in particular of `P_i` itself). So for every table, CDC replays the entire window `(P_start, P_i]` and everything after. Every committed change after any table's snapshot is therefore re-delivered by CDC. **No change after any per-table snapshot can be skipped.** This is the only direction that is safe; the forbidden direction is resuming from `⋃_i P_i` (the maximum), which would skip `(P_i, max]` for every lagging table — that is the silent-loss class the loud-failure tenet forbids, and the design refuses to construct it.
+- **Overlap is absorbed (no duplicate-loss).** Because `P_start ≤ P_i` for every table, CDC re-delivers the window `(P_start, P_i]` for table `t_i` — changes already reflected in `t_i`'s snapshot. This overlap is exactly the at-least-once seam sluice already relies on at *every* cold-start→CDC handoff: Inserts/Updates apply through the idempotent upsert path (`ON CONFLICT (pk) DO UPDATE` / `ON DUPLICATE KEY UPDATE`, ADR-0010), and Deletes are zero-rows-affected-tolerant. The VStream cold-copy already declares `IdempotentCopyReader.CopyNeedsIdempotentWriter() = true` (Bug 125), so the bulk-copy writer is already the upsert path and the CDC applier is already idempotent. The per-table overlap is the **same** kind of overlap, just per-table-sized instead of zero-sized — well within the contract.
+
+Vitess GTIDs are **sets** (`MySQL56/<uuid>:1-N`), so "minimum / intersection" is precise: `⋂_i P_i` is the largest GTID set that is a subset of every `P_i`. For the dominant unsharded single-source-uuid case this collapses to the numerically-smallest interval end. The engine already has the per-shard GTID **superset** predicate (`gtidAtOrAfter` / `MysqlGTIDSet.Contain`, used by the `PositionOrderer` and `verifyGTIDSetReachable`); the stitch reuses that primitive.
+
+**Selection rule, made robust to the no-clean-intersection edge.** go-mysql exposes `Contain` (superset test) but no interval-intersection primitive, and hand-rolling interval arithmetic over GTID sets is exactly the subtle-codec class the Bug-74 "pin the class, not the representative" lesson warns against. Because the per-table snapshots come from one causally-ordered session, in practice one captured `P_i` per shard is already a subset of all the others — the **earliest** one. So the stitch is: for each shard, choose the captured per-table GTID set that is `Contain`-ed by every other captured set for that shard (the set-min among the candidates). If — and only if — no captured candidate is a subset of all the others (genuinely disjoint per-shard sets, which a single monotonic session should never produce), the engine **refuses loudly** rather than guessing a position that might gap; the operator-facing error names the shard and the divergent GTID sets. This keeps the design inside proven primitives and converts the theoretically-impossible case into a loud failure, never a silent one.
+
+**The first per-table COPY's pre-COPY VGTID is a safe lower bound.** The very first event vtgate sends on a fresh-from-beginning COPY is the attach VGTID (the position the COPY began from). Capturing the *first* table's opening VGTID gives a position provably `≤` every `P_i` (nothing was streamed before it), which is a correct, even-more-conservative `P_start` if the per-shard selection above ever needs a floor. The implementation prefers the tightest safe `P_start` (the set-min of the `P_i`) because a tighter start means less overlap to re-apply, but the opening-VGTID floor is the safety net that guarantees a valid answer always exists.
+
+### Position-token shape (additive, back-compatible)
+
+The captured handoff position stays the existing VStream JSON array of `shardGtid` (`cdc_vstream_position.go`) — `P_start` is itself a valid per-shard GTID array, so the CDC half, the persisted control-table anchor, and the `PositionOrderer` are all unchanged. No new token field. The mid-COPY **resume** cursor (ADR-0072 `TablePKs`) composes unchanged: it is per-table, so an interrupted per-table COPY resumes that one table from its cursor; tables already finished are skipped, tables not yet started begin fresh (this is the same per-table composition `OpenSnapshotStreamFromPosition` already documents).
+
+### What stays the same
+
+- The `ir.SnapshotStream` contract, the orchestrator, and every non-VStream engine path: untouched.
+- `--include-table` (`OpenSnapshotStreamForTables`) and the resumable-COPY surfaces (`OpenSnapshotStreamFromPosition`, `PositionCarriesCopyCursor`): preserved; the allowlist scopes the per-table loop.
+- ADR-0071 Phase 1 loud refusal: still present as the floor, but now **unreachable on the default keyspace copy** — a single-table COPY has no interleave, so a not-yet-consumed table can never accumulate past the cap. (It remains reachable only if an operator forces the legacy single-stream mode; see below.)
+- The streaming pump, backpressure (`enqueueRowLocked` ↔ `ReadRows`), bounded memory per table, the Bug-125 idempotent writer, ADR-0073 internal-table exclusion, the liveness/progress watchdogs, and the durable-write watermark (ADR-0072 Phase B / v0.99.9): all reused per single-table COPY.
+
+### Bounded-parallelism (deferred sub-decision)
+
+The per-table COPY can be **sequential** (one single-table VStream at a time — the v1 here) or **bounded-parallel** (K concurrent single-table VStreams, each still constant-memory). Sequential is chosen for v1: it is the simplest correct shape, it keeps exactly one Recv loop alive at a time (no new concurrent-Recv hazard beyond what ADR-0071 already manages), and the dominant real cost on a 302 GB source is wire throughput, not per-table setup latency. Bounded-parallel COPY (each table on its own gRPC stream, K-capped, results stitched the same way — the set-min stitch is parallelism-agnostic) is a natural follow-on if a real workload shows per-table serialization dominates; it does not change the consistency model.
+
+## Alternatives considered
+
+- **ADR-0071 Phase 3 disk-spill (the originally-deferred plan).** Keep the one interleaved keyspace stream; spill not-yet-consumed-table rows to per-table temp files of encoded `ir.Row`. Bounds RAM but adds a temp-file lifecycle (disk-space accounting, cleanup-on-crash, encode/decode fidelity for every value family — another Bug-74 surface), keeps the global single-position consistency for free, but pays full disk write+read for ~290 GB of spill on the motivating case (double the I/O). **Rejected as the primary fix:** the per-table COPY needs no spill at all (constant RAM, no temp files, no extra I/O) and the set-min stitch reconstructs the consistency the global stream gave for free. Disk-spill stays a theoretical fallback only if a *single* table ever exceeds RAM faster than the target can drain it — but that is already handled by the streaming backpressure (Recv stalls Vitess), so Phase 3 is now effectively unneeded.
+- **Resume CDC from the _maximum_ per-table snapshot (`⋃_i P_i`).** Tempting (it is the "latest" position) and wrong: it skips `(P_i, max]` for every table that finished before the last one — **silent loss**. Explicitly forbidden.
+- **One global FTWRL-style freeze across the keyspace (à la ADR-0088 vanilla MySQL).** vtgate cannot `FLUSH TABLES WITH READ LOCK` across shards; ADR-0088 itself carves Vitess out for exactly this reason. Not available.
+- **Keep the keyspace stream but raise `--max-buffer-bytes` to fit Σ(tables).** Just restates the OOM as an operator knob; the 290 GB requirement does not fit any host. Rejected.
+- **Document the `--include-table` per-table workaround as the supported path.** This is the status quo the finding flags as the #1 problem; the whole point is to remove it. Rejected.
+
+## Consequences
+
+- **A full multi-table Vitess/PlanetScale keyspace cold-copies in ONE command at bounded memory** — the finding is closed. Memory is constant in the number of tables (one table in flight), bounded by `--max-buffer-bytes` per table exactly as ADR-0071 intended for the single-table case.
+- **The snapshot→CDC seam is at-least-once per table** (overlap `(P_start, P_i]` re-applied idempotently) instead of zero-overlap global. This is correct by ADR-0010, but means slightly more CDC catch-up work right after a large multi-table cold-start (proportional to write traffic during the copy window, not to table size). Acceptable and already the contract for every cold-start handoff.
+- **Concurrency-adjacent (stream lifecycle).** Opening/closing N sequential per-table VStreams on one connection, then the CDC stream, touches the same Recv/pump machinery ADR-0071 made race-clean. Per the project's rule, the integration **`-race`** gate MUST pass **before** the release tag is cut (push-first, tag-after, or the local `scripts/race-integration.ps1`).
+- **New pins.** Unit: the set-min stitch over per-shard GTID sets (each family — single-uuid unsharded, multi-uuid, multi-shard — × {one-subset-of-all, the disjoint loud-refuse edge}); a per-table sequential COPY drive over a client-factory fake that returns N scripted single-table streams then the CDC stream, asserting each table drains at constant buffer and the captured handoff position equals the computed set-min. Integration (`vstream` / `vitesscluster`): a multi-table keyspace where Σ(tables) far exceeds a tiny `--max-buffer-bytes`, asserting all tables land on the target (no loud refusal) and `target COUNT == source COUNT` per table with zero loss/dup across the seam under concurrent writes.
+- **Escape hatch.** The legacy single-stream keyspace COPY remains reachable behind the `vstream_copy_single_stream=true` DSN opt-out (so an operator who *wants* the global single-position consistency on a small keyspace, or who is debugging, can ask for it); the default is the new auto-shard-by-table path. The opt-out keeps ADR-0071's Phase 1 refusal as its (now-explicitly-chosen) failure mode.
+- **Resume of an interrupted auto-shard COPY (v1 limitation, not a correctness gap).** The ADR-0072 process-restart resume (`OpenSnapshotStreamFromPosition`, a position carrying a per-table `TablePKs` cursor) stays on the single-stream resume path — it is gated on `start == nil`, and auto-shard re-derivation across "which tables already finished" is deferred. Resume is still **correct** (the idempotent COPY writer absorbs any overlap; `--include-table` scope is honored), but a resume of a huge multi-table copy can re-introduce the interleave for the not-yet-finished tables and so re-hit ADR-0071's loud refusal under a tight `--max-buffer-bytes`. The fresh cold-start — the dominant 302 GB case — is fully covered; resume-with-auto-shard is a clean follow-on.

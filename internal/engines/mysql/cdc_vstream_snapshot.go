@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	gomysql "github.com/go-sql-driver/mysql"
 	"google.golang.org/grpc"
 	"vitess.io/vitess/go/vt/proto/binlogdata"
 	"vitess.io/vitess/go/vt/proto/query"
@@ -193,6 +194,18 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 	// can't fail for it — but the resume cursor's base64 TableLastPK can
 	// (corrupt persisted token), and the general decode returns an error,
 	// so we handle it.
+	// Auto-shard-by-table eligibility (ADR-0095): copy each table as its
+	// own single-table VStream (constant memory, no interleave) instead of
+	// one keyspace-wide interleaved stream. Engaged on a FRESH cold-start
+	// (start == nil — a per-shard-TablePKs resume is per-table already and
+	// stays on the single-stream resume path) with MORE THAN ONE table in
+	// scope, unless the operator opts out via vstream_copy_single_stream.
+	// A one-table scope is already constant-memory single-stream, so
+	// auto-shard adds nothing there. The order is the caller's filtered
+	// table order, which matches the orchestrator's per-table ReadRows
+	// order — the invariant that keeps exactly one table in flight.
+	autoShard := start == nil && len(tables) > 1 && !vstreamCopySingleStreamFromDSN(cfg)
+
 	startPos := start
 	if startPos == nil {
 		startPos = fromBeginningVStreamPos(keyspace, shards)
@@ -203,12 +216,20 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 		_ = conn.Close()
 		return nil, fmt.Errorf("mysql/vstream: snapshot: build start position: %w", err)
 	}
+
+	// In auto-shard mode the first physical stream is scoped to the FIRST
+	// table only; the pump reopens per-table as it advances. Otherwise the
+	// single stream carries the whole (possibly keyspace-wide) scope.
+	firstFilterTables := tables
+	if autoShard {
+		firstFilterTables = []string{tables[0]}
+	}
 	req := &vtgate.VStreamRequest{
 		TabletType: topodata.TabletType_PRIMARY,
 		Vgtid: &binlogdata.VGtid{
 			ShardGtids: protoShardGtids,
 		},
-		Filter: &binlogdata.Filter{Rules: vstreamCopyFilterRules(tables)},
+		Filter: &binlogdata.Filter{Rules: vstreamCopyFilterRules(firstFilterTables)},
 		Flags: &vtgate.VStreamFlags{
 			MinimizeSkew:      true,
 			StopOnReshard:     true,
@@ -223,11 +244,26 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 		return nil, fmt.Errorf("mysql/vstream: snapshot: open stream: %w", err)
 	}
 
+	// copyTables is the scope the in-place reconnect re-applies: in
+	// auto-shard mode that is the currently-open single table; otherwise
+	// the full scope.
+	reconnectScope := tables
+	var seq []string
+	if autoShard {
+		reconnectScope = []string{tables[0]}
+		seq = tables
+		slog.InfoContext(ctx, "mysql/vstream: snapshot: auto-shard-by-table COPY (one table at a time, bounded memory)",
+			slog.String("keyspace", keyspace),
+			slog.Int("tables", len(tables)))
+	}
+
 	snap := &vstreamSnapshotStream{
 		keyspace:             keyspace,
 		client:               client,
 		shards:               shards,
-		copyTables:           tables,
+		copyTables:           reconnectScope,
+		copyTablesSeq:        seq,
+		tableCopyComplete:    make(map[string]bool),
 		reconnectMax:         defaultCopyReconnectMax,
 		reconnectBackoffBase: defaultCopyReconnectBackoffBase,
 		reconnectBackoffCap:  defaultCopyReconnectBackoffCap,
@@ -267,10 +303,29 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 	// completion here. streamCtx (owned by CloseFn) bounds the pump's
 	// lifetime; the caller's ctx does NOT, because the SnapshotStream —
 	// and the gRPC stream it rides — must outlive this function.
+	//
+	// Auto-shard mode (ADR-0095) runs the per-table COPY driver, which
+	// reopens the stream once per table on the same connection and
+	// stitches the per-table snapshot points; otherwise the legacy
+	// single-stream pump drains the one keyspace-wide / single-table COPY.
 	snap.copyDone = make(chan struct{})
-	go snap.copyPump(streamCtx, streamCancel, stream)
+	if len(snap.copyTablesSeq) > 0 {
+		go snap.copyPumpAutoShard(streamCtx, streamCancel, stream)
+	} else {
+		go snap.copyPump(streamCtx, streamCancel, stream)
+	}
 
 	return stream, nil
+}
+
+// vstreamCopySingleStreamFromDSN reports whether the operator opted OUT
+// of the ADR-0095 auto-shard-by-table COPY via
+// `vstream_copy_single_stream=true`, restoring the legacy single
+// keyspace-wide interleaved COPY stream (and its ADR-0071 multi-table
+// loud-refusal floor). Default false — auto-shard is on by default so the
+// full-keyspace cold-copy just works at bounded memory.
+func vstreamCopySingleStreamFromDSN(cfg *gomysql.Config) bool {
+	return cfg.Params["vstream_copy_single_stream"] == "true"
 }
 
 // vstreamSnapshotStream owns the gRPC connection and stream that
@@ -340,7 +395,45 @@ type vstreamSnapshotStream struct {
 	// reconnect would silently widen the COPY back to the whole keyspace
 	// and start streaming the large unrelated table the original scope
 	// excluded (the ADR-0071 overflow this feature avoids).
+	//
+	// In auto-shard-by-table mode (ADR-0095, copyTablesSeq non-empty)
+	// copyTables is the SINGLE table the currently-open per-table COPY
+	// stream is scoped to (so [reconnectCopy] re-applies that one table's
+	// scope on an in-place reconnect). The pump rewrites it as it advances
+	// from table to table.
 	copyTables []string
+
+	// copyTablesSeq is the auto-shard-by-table COPY iteration order
+	// (ADR-0095). When non-empty, the COPY pump copies these tables ONE AT
+	// A TIME — each a single-table VStream (Match:<table>, constant memory,
+	// no interleave) opened on the same connection — instead of one
+	// keyspace-wide interleaved stream. The order MUST match the
+	// orchestrator's per-table ReadRows order (the filtered schema order)
+	// so exactly one table is ever in flight. Empty means the legacy
+	// single-stream keyspace COPY (the opt-out escape hatch, or a
+	// one-table/keyspace-wide open). Set at construction; read by the pump.
+	copyTablesSeq []string
+
+	// autoShardIdx is the index into copyTablesSeq of the table whose
+	// per-table COPY is currently in flight. Pump-owned (advanced as each
+	// table's COPY_COMPLETED arrives); read under mu by helpers that name
+	// the active table in log/error messages.
+	autoShardIdx int
+
+	// perTableSnapshots accumulates each completed per-table COPY's
+	// snapshot VGTID (P_i), in copyTablesSeq order (ADR-0095). After the
+	// last table the pump stitches these into the single CDC-resume
+	// position via [stitchSnapshotMin] (the per-shard GTID-set minimum).
+	// Pump-owned during the auto-shard COPY.
+	perTableSnapshots [][]shardGtid
+
+	// tableCopyComplete marks, per unqualified table name, that the
+	// table's per-table COPY has finished (auto-shard mode). [ReadRows]
+	// closes a table's channel once its queue drains AND this is set for
+	// it — the per-table analogue of the global copyComplete, so a
+	// consumer draining table t_0 closes when t_0's COPY ends, not only
+	// when the whole keyspace copy ends. Guarded by mu/cond.
+	tableCopyComplete map[string]bool
 
 	// reconnectMax is the in-place COPY-reconnect budget (Phase C):
 	// consecutive retriable Recv failures the pump absorbs before giving
@@ -737,6 +830,242 @@ func (s *vstreamSnapshotStream) copyPump(ctx context.Context, cancel context.Can
 		// an otherwise-healthy snapshot.
 		lastCheckpoint = s.maybeCheckpoint(ctx, lastCheckpoint)
 	}
+}
+
+// copyPumpAutoShard is the auto-shard-by-table COPY driver (ADR-0095). It
+// copies each table in s.copyTablesSeq as its OWN single-table VStream —
+// constant memory, no interleave — sequentially on the same gRPC
+// connection, then stitches the per-table snapshot points into one
+// CDC-resume position.
+//
+// For each table it runs the SAME per-event dispatch / watchdog /
+// in-place-reconnect / checkpoint machinery the single-stream [copyPump]
+// uses (factored into [pumpOneTableCopy]); the only difference is what
+// happens at a COPY_COMPLETED: instead of finishing the whole copy, it
+// records that table's snapshot VGTID (P_i), signals the table complete
+// so the draining [ReadRows] closes, and reopens the stream scoped to the
+// NEXT table. After the last table it computes the per-shard GTID-set
+// minimum ([stitchSnapshotMin]) — the gapless, overlap-safe CDC-resume
+// position (ADR-0095 consistency model) — records it onto the stream, and
+// flips the global copyComplete so any straggler consumer unwedges.
+//
+// Concurrency: exactly one per-table stream is Recv'd at a time (the
+// loop is sequential), so this introduces no concurrent-Recv hazard
+// beyond what [copyPump] already manages. The streamCtx (CloseFn-owned)
+// bounds every per-table Recv; cancel unblocks a parked Recv.
+func (s *vstreamSnapshotStream) copyPumpAutoShard(ctx context.Context, cancel context.CancelFunc, stream *ir.SnapshotStream) {
+	defer close(s.copyDone)
+
+	for idx, table := range s.copyTablesSeq {
+		select {
+		case <-ctx.Done():
+			s.failCopy(ctx.Err())
+			return
+		default:
+		}
+
+		s.mu.Lock()
+		s.autoShardIdx = idx
+		s.mu.Unlock()
+
+		// Reopen the stream scoped to this table for every table after the
+		// first (the constructor already opened table[0]). Reopening on a
+		// FRESH from-beginning cursor for the new table is correct: each
+		// single-table COPY is independent and captures its own snapshot
+		// point; there is no cross-table cursor to carry.
+		if idx > 0 {
+			if err := s.reopenForTable(ctx, table); err != nil {
+				s.failCopy(err)
+				return
+			}
+		}
+
+		snap, err := s.pumpOneTableCopy(ctx, cancel, table)
+		if err != nil {
+			s.failCopy(err)
+			return
+		}
+
+		// Record this table's snapshot point and signal it complete so the
+		// consumer draining it (ReadRows) closes its channel. The next
+		// table's COPY then streams into a fresh field cache / cursor.
+		s.mu.Lock()
+		s.perTableSnapshots = append(s.perTableSnapshots, snap)
+		s.tableCopyComplete[table] = true
+		// Reset the per-stream cursor + field cache for the next table's
+		// single-table COPY. currentVgtid is the JUST-captured P_i; the
+		// next table starts from the beginning and captures its own P.
+		s.currentVgtid = nil
+		clear(s.fields)
+		s.posBreadcrumbs = nil
+		s.broadcast()
+		s.mu.Unlock()
+	}
+
+	s.finishCopyAutoShard(stream)
+}
+
+// pumpOneTableCopy Recv-drives the currently-open single-table COPY
+// stream until its (global) COPY_COMPLETED, returning that table's
+// snapshot VGTID (a copy of s.currentVgtid at completion). It reuses the
+// single-stream pump's liveness watchdog, in-place reconnect, and
+// bounded-cadence checkpoint verbatim — only the terminal action differs
+// (return the snapshot instead of finishing the whole copy). table is the
+// unqualified name, used only for log/error context.
+//
+// A single-table COPY emits exactly one COPY_COMPLETED (the global one,
+// empty keyspace+shard), which [dispatchCopyEventLocked] returns as
+// done=true — the natural per-table terminator.
+func (s *vstreamSnapshotStream) pumpOneTableCopy(ctx context.Context, cancel context.CancelFunc, table string) ([]shardGtid, error) {
+	live := startVStreamLiveness(ctx, s.livenessWindow, s.copyProgressWindow, s.idleWarnWindow,
+		func() {
+			err := vstreamLivenessTimeoutError(s.livenessWindow, topodata.TabletType_PRIMARY, s.keyspace, s.shards)
+			s.setErr(err)
+			cancel()
+		},
+		func() {
+			err := vstreamProgressTimeoutError(s.copyProgressWindow, topodata.TabletType_PRIMARY, s.keyspace, s.shards)
+			s.setErr(err)
+			cancel()
+		},
+		func() {
+			slog.WarnContext(ctx, vstreamIdleWarnMessage(s.idleWarnWindow, s.keyspace, s.shards))
+		})
+	defer live.stop()
+
+	lastCheckpoint := time.Now()
+	reconnectAttempts := 0
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		resp, err := s.grpcStream.Recv()
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil, err
+			}
+			classified := classifyReaderError(fmt.Errorf("mysql/vstream: snapshot: copy recv (table %q): %w", table, err))
+			var re ir.RetriableError
+			if errors.As(classified, &re) && reconnectAttempts < s.reconnectMax {
+				reconnectAttempts++
+				if rerr := s.reconnectCopy(ctx, reconnectAttempts); rerr != nil {
+					return nil, rerr
+				}
+				continue
+			}
+			return nil, classified
+		}
+		if evs := resp.GetEvents(); len(evs) > 0 {
+			live.observe(eventsProveLiveness(evs))
+		}
+		copiedRow := false
+		for _, ev := range resp.GetEvents() {
+			if ev.GetType() == binlogdata.VEventType_ROW {
+				copiedRow = true
+			}
+			done, derr := s.dispatchCopyEvent(ev)
+			if derr != nil {
+				return nil, derr
+			}
+			if done {
+				// This table's COPY is complete. Snapshot its captured
+				// VGTID under mu (the pump is the sole writer, but reading
+				// it under the same lock keeps the contract uniform).
+				s.mu.Lock()
+				snap := make([]shardGtid, len(s.currentVgtid))
+				copy(snap, s.currentVgtid)
+				s.mu.Unlock()
+				if len(snap) == 0 {
+					// A COPY_COMPLETED with no observed VGTID means vtgate
+					// emitted no GTID for this (possibly empty) table. Fall
+					// back to the from-beginning sentinel for the resolved
+					// shard layout: the stitch treats "" as the dominating
+					// minimum (resume the keyspace from the beginning — the
+					// most conservative, no-gap choice).
+					snap = fromBeginningVStreamPos(s.keyspace, s.shards)
+				}
+				return snap, nil
+			}
+		}
+		if copiedRow {
+			reconnectAttempts = 0
+		}
+		lastCheckpoint = s.maybeCheckpoint(ctx, lastCheckpoint)
+	}
+}
+
+// reopenForTable closes the current per-table COPY stream and opens a
+// fresh one scoped to the next table (auto-shard, ADR-0095). The gRPC
+// CONNECTION is reused; only the stream is replaced — the same in-place
+// pattern [reconnectCopy] uses, but seeded from-beginning for the new
+// table (each single-table COPY is independent) rather than from a resume
+// cursor. copyTables is rewritten to the new single table so a subsequent
+// [reconnectCopy] re-applies the correct (one-table) scope.
+func (s *vstreamSnapshotStream) reopenForTable(ctx context.Context, table string) error {
+	startPos := fromBeginningVStreamPos(s.keyspace, s.shards)
+	protoShardGtids, err := toProtoShardGtids(startPos)
+	if err != nil {
+		return fmt.Errorf("mysql/vstream: snapshot: auto-shard: build start position for %q: %w", table, err)
+	}
+	req := &vtgate.VStreamRequest{
+		TabletType: topodata.TabletType_PRIMARY,
+		Vgtid:      &binlogdata.VGtid{ShardGtids: protoShardGtids},
+		Filter:     &binlogdata.Filter{Rules: vstreamCopyFilterRules([]string{table})},
+		Flags: &vtgate.VStreamFlags{
+			MinimizeSkew:      true,
+			StopOnReshard:     true,
+			HeartbeatInterval: 5,
+		},
+	}
+	grpcStream, err := s.client.VStream(ctx, req)
+	if err != nil {
+		return fmt.Errorf("mysql/vstream: snapshot: auto-shard: open stream for %q: %w", table, err)
+	}
+	s.mu.Lock()
+	s.grpcStream = grpcStream
+	s.copyTables = []string{table}
+	s.mu.Unlock()
+	slog.DebugContext(ctx, "mysql/vstream: snapshot: auto-shard advanced to next table COPY",
+		slog.String("keyspace", s.keyspace),
+		slog.String("table", table))
+	return nil
+}
+
+// finishCopyAutoShard stitches the captured per-table snapshot points
+// into the single CDC-resume position (the per-shard GTID-set minimum,
+// ADR-0095), records it onto the stream, and flips the global
+// copyComplete so any straggler consumer unwedges. The happens-before
+// edge to the orchestrator's post-bulk-copy Position read is the same as
+// [finishCopy]: the Position write precedes the copyComplete flip under
+// mu, and the orchestrator reads Position only after every ReadRows
+// channel has closed.
+func (s *vstreamSnapshotStream) finishCopyAutoShard(stream *ir.SnapshotStream) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.err == nil {
+		startShards, err := stitchSnapshotMin(s.perTableSnapshots)
+		if err != nil {
+			s.err = fmt.Errorf("mysql/vstream: snapshot: auto-shard stitch: %w", err)
+		} else {
+			pos, encErr := encodeVStreamPos(startShards)
+			if encErr != nil {
+				s.err = fmt.Errorf("mysql/vstream: snapshot: auto-shard encode stitched position: %w", encErr)
+			} else {
+				stream.Position = pos
+				// The CDC tail resumes from the stitched minimum, so seed
+				// currentVgtid with it — StreamChanges reuses the same
+				// in-flight stream, and the post-COPY pump advances from
+				// here.
+				s.currentVgtid = startShards
+			}
+		}
+	}
+	s.copyComplete = true
+	s.broadcast()
 }
 
 // reconnectCopy re-opens the VStream IN PLACE after a retriable mid-COPY
@@ -1256,7 +1585,17 @@ func (s *vstreamSnapshotStream) enqueueRowLocked(tableName string, row ir.Row) e
 		// Over cap with at least one row already queued. A consumer
 		// actively draining a DIFFERENT table can never relieve the
 		// pressure on this one — refuse rather than deadlock.
-		if s.activeTable != "" && s.activeTable != tableName {
+		//
+		// Auto-shard mode (ADR-0095) NEVER hits this: the pump copies
+		// exactly one table at a time, so the only rows in flight are this
+		// table's, and a consumer is (or imminently will be) draining it —
+		// backpressure-wait is always the correct response. The
+		// cross-table refusal is the single-stream-interleave guard only;
+		// suppressing it here also avoids a benign false-positive in the
+		// window between one table's COPY_COMPLETED and the next ReadRows
+		// setting activeTable (the pump may enqueue the next table's first
+		// rows while activeTable still names the just-finished table).
+		if len(s.copyTablesSeq) == 0 && s.activeTable != "" && s.activeTable != tableName {
 			return fmt.Errorf(
 				"mysql/vstream: snapshot: table %q would buffer %d bytes, exceeding the --max-buffer-bytes cap of %d "+
 					"while table %q is being copied; this multi-table interleaving case is not yet disk-spilled "+
@@ -1323,9 +1662,70 @@ func (s *vstreamSnapshotStream) startPump(ctx context.Context) (<-chan ir.Change
 		return nil, err
 	}
 
+	// Auto-shard mode (ADR-0095): the COPY phase left the gRPC stream
+	// scoped to the LAST per-table COPY (Match:<lastTable>) and positioned
+	// at that table's GTID — neither the keyspace-wide scope nor the
+	// stitched resume position the CDC tail needs. Open a FRESH
+	// keyspace-wide CDC stream seeded from the stitched minimum
+	// (currentVgtid) so the tail covers every table, gapless, from
+	// P_start. The single-stream path skips this — its one stream is
+	// already keyspace-wide / single-table and at the right position, so
+	// it just resumes in place.
+	if len(s.copyTablesSeq) > 0 {
+		if err := s.reopenForCDC(ctx); err != nil {
+			return nil, err
+		}
+	}
+
 	out := make(chan ir.Change, vstreamChannelBuffer)
 	go s.pump(ctx, out)
 	return out, nil
+}
+
+// reopenForCDC replaces the last per-table COPY stream with a fresh
+// keyspace-wide CDC stream seeded from the stitched resume position
+// (auto-shard, ADR-0095). It is the auto-shard handoff: the per-table
+// COPY streams were each scoped to one table, but the CDC tail must
+// follow EVERY table from the stitched minimum P_start. The gRPC
+// connection is reused; only the stream is replaced. currentVgtid holds
+// P_start (seeded by [finishCopyAutoShard]); a from-scratch keyspace
+// filter ("/.*/") with that position resumes CDC for the whole keyspace.
+func (s *vstreamSnapshotStream) reopenForCDC(ctx context.Context) error {
+	s.mu.Lock()
+	resume := make([]shardGtid, len(s.currentVgtid))
+	copy(resume, s.currentVgtid)
+	s.mu.Unlock()
+	if len(resume) == 0 {
+		return errors.New("mysql/vstream: snapshot: auto-shard CDC handoff: no stitched resume position")
+	}
+	protoShardGtids, err := toProtoShardGtids(resume)
+	if err != nil {
+		return fmt.Errorf("mysql/vstream: snapshot: auto-shard CDC handoff: build resume position: %w", err)
+	}
+	req := &vtgate.VStreamRequest{
+		TabletType: topodata.TabletType_PRIMARY,
+		Vgtid:      &binlogdata.VGtid{ShardGtids: protoShardGtids},
+		// Keyspace-wide: the CDC tail follows every table, not just the
+		// last one copied. ADR-0073 internal-table exclusion still strips
+		// _vt_* events in the CDC dispatch.
+		Filter: &binlogdata.Filter{Rules: vstreamCopyFilterRules(nil)},
+		Flags: &vtgate.VStreamFlags{
+			MinimizeSkew:      true,
+			StopOnReshard:     true,
+			HeartbeatInterval: 5,
+		},
+	}
+	grpcStream, err := s.client.VStream(ctx, req)
+	if err != nil {
+		return fmt.Errorf("mysql/vstream: snapshot: auto-shard CDC handoff: open stream: %w", err)
+	}
+	s.mu.Lock()
+	s.grpcStream = grpcStream
+	clear(s.fields) // the keyspace-wide stream re-emits FIELD per table
+	s.mu.Unlock()
+	slog.InfoContext(ctx, "mysql/vstream: snapshot: auto-shard CDC handoff (keyspace-wide tail from stitched position)",
+		slog.String("keyspace", s.keyspace))
+	return nil
 }
 
 // pump owns out and closes it before returning. The CDC phase
@@ -1873,14 +2273,23 @@ func (r *vstreamSnapshotRows) ReadRows(ctx context.Context, table *ir.Table) (<-
 			// Wait for a row, completion, a terminal error, or
 			// cancellation. ctx is polled here (we can't select on a
 			// cond) and again on the send below.
-			for len(s.rowBuffer[tableName]) == 0 && !s.copyComplete && s.err == nil && ctx.Err() == nil {
+			//
+			// "Completion" for THIS table is either the global copyComplete
+			// (single-stream path) OR this table's per-table COPY finishing
+			// (auto-shard, ADR-0095 — tableCopyComplete[tableName]). The
+			// per-table signal is essential: in auto-shard mode the pump
+			// has moved on to the NEXT table's COPY, so a consumer draining
+			// this table must close on the per-table signal — the global
+			// copyComplete only flips after EVERY table, far too late.
+			for len(s.rowBuffer[tableName]) == 0 && !s.copyComplete &&
+				!s.tableCopyComplete[tableName] && s.err == nil && ctx.Err() == nil {
 				s.cond.Wait()
 			}
 			queue := s.rowBuffer[tableName]
 			if len(queue) == 0 {
-				// Empty queue + (complete | error | cancelled): the
-				// table is fully delivered. Drop its now-empty entry so
-				// a second ReadRows returns immediately.
+				// Empty queue + (complete | per-table-complete | error |
+				// cancelled): the table is fully delivered. Drop its now-
+				// empty entry so a second ReadRows returns immediately.
 				delete(s.rowBuffer, tableName)
 				s.mu.Unlock()
 				return
