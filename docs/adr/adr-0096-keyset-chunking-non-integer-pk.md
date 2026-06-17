@@ -267,20 +267,51 @@ chunk N-1 has no upper bound.)
   when `span < n`, so an empty chunk never costs a connection. No row is
   ever placed in two chunks or zero chunks.
 
-The two enforcement points for this are: the persisted boundary tuples,
-and `filterByUpperBound`, which clips a chunk's final batch at `UpperPK`.
-`filterByUpperBound` is generalised from its int64-only compare to a
-**tuple comparison** (`comparePKTuple([]any, []any) int`) that implements
-exactly the same `≤` SQL row-comparison the reader's `ORDER BY` /
-`WHERE (...)>(...)` uses, per type family. This is the Bug-74-class
-surface: the comparator dispatches on PK column **type family**
-(integer, decimal-as-string, string, binary, temporal), and a wrong
-comparison for any family would silently mis-place boundary rows. It is
-therefore unit-tested across **every** orderable family × shape
-{single, composite, NULL-free} with the partition invariants
-(union == full range, pairwise disjoint, each probe row in exactly one
-chunk) asserted directly, and integration-tested src==dst row-and-checksum
-equal on a real container for a representative of each family.
+The load-bearing requirement is that the **chunk upper-bound clip MUST
+use the same total order the reader's `ORDER BY` / `WHERE (pk) > (...)`
+cursor uses**. For string / varchar / char and decimal-as-text PKs that
+order is the column's **DB collation** (PG `en_US.utf8`, MySQL's
+case-/accent-insensitive `utf8mb4_0900_ai_ci`), **not** a byte order. The
+first cut of this ADR enforced the upper bound in Go with a **bytewise**
+tuple comparator (`comparePKTuple`) while the SQL side used the column
+collation; the two **diverge** for those families, so a boundary-straddling
+row could be excluded by **both** the chunk above it (Go: "past upper")
+**and** the chunk below it (SQL: "≤ lower") — landing in **no chunk**, a
+silent permanent loss. (Decimal carried as text is wrong for an even
+simpler reason: lexical `"10" < "9"` but numeric `10 > 9`.) This was the
+exact Bug-74 family-dispatch trap; the original test suite missed it
+because it used **UUID** — byte-monotonic lowercase hex, accidentally
+collation-safe — as the "string" representative.
+
+The fix makes the upper bound a **SQL** predicate, enforced in the column's
+native collation alongside the existing lower bound. The
+`ir.BoundedBatchedRowReader` surface (`ReadRowsBatchBounded`) emits
+`WHERE (pk) > ($after) AND (pk) <= ($upTo) ORDER BY pk`, so **both** bounds
+and the `ORDER BY` use the same collation and the same PK index — the
+partition is exactly-once for every orderable family **by construction**,
+with no Go-side comparison in the coverage path. The keyset strategy
+**requires** this surface (`shouldParallelChunk` routes a reader without it
+to the single-reader path), so the collation-sensitive families never take
+a divergent byte clip. Both shipping engines implement it; the
+single-integer raw-copy lane (bare integer SQL literals) is gated to
+integer single PKs so a string keyset chunk never reaches it.
+
+`filterByUpperBound` (the byte-tuple comparator) survives **only** as the
+fallback clip for a hypothetical reader that lacks the bounded surface, and
+is correct there only for byte-ordered families (integer, temporal,
+PG-native uuid/bytea) — never reached for string/decimal because the
+strategy requires the bounded reader.
+
+These invariants are unit-tested (the SQL bound-predicate shape — single,
+composite, lower-only, upper-only, both — for each engine; the half-open
+partition arithmetic across families) and integration-tested src==dst
+row-count-and-checksum on real containers for the **collation-sensitive**
+families specifically: PG `text`/`varchar` under default **and** explicit
+`COLLATE "en_US.utf8"`, PG `numeric`, PG `char(n)`; MySQL `varchar` and
+`decimal` under default `utf8mb4_0900_ai_ci` plus a composite. A further
+integration pin ground-truths the Go partition against the **real DB
+ORDER BY** (sample boundaries → drain each chunk via the bounded read →
+assert every PK appears in exactly one chunk).
 
 NULLs in a PK column cannot occur (PK columns are `NOT NULL` by
 definition), so the comparator does not define a NULL ordering and a NULL

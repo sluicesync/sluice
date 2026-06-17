@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/ir"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -176,6 +177,363 @@ func TestMigrate_PG_KeysetCopy_CompositePK(t *testing.T) {
 	assertChunkFanout(t, logs.String(), 2)
 	assertCountAndChecksum(t, sourceDSN, targetDSN, "memberships",
 		"tenant_id::text || '|' || seq::text || '|' || payload")
+}
+
+// makeCollatedStringValues builds rowCount distinct string PK values that
+// SPAN case, punctuation, and non-ASCII so that the DB's default collation
+// (en_US.utf8 — case- and accent-aware, NOT byte order) DISAGREES with a
+// naive bytewise comparison. Under the old Go-side bytewise upper-bound
+// clip, boundary-straddling rows (e.g. a lowercase value just under an
+// uppercase boundary) were excluded by BOTH the chunk above (Go: "past
+// upper") and the chunk below (DB: "<= lower"), landing in NO chunk —
+// silent permanent loss. The fix pushes the upper bound into SQL so it
+// uses the SAME collation as ORDER BY; this generator makes the gap
+// reproducible if the fix regresses.
+func makeCollatedStringValues(n int) []string {
+	// A small alphabet of code points whose collation order differs from
+	// their byte order under en_US.utf8: mixed case (a<A is collation but
+	// 'A'=0x41<'a'=0x61 byte), underscore/punctuation, and accented Latin.
+	alphabet := []rune{'a', 'A', 'b', 'B', '_', '-', 'z', 'Z', 'é', 'É', 'ñ', '0', '9'}
+	out := make([]string, 0, n)
+	seen := map[string]bool{}
+	// Deterministic enumeration of length-3 strings over the alphabet,
+	// taken in order until we have n distinct values.
+	la := len(alphabet)
+	for i := 0; len(out) < n; i++ {
+		s := string([]rune{
+			alphabet[(i/(la*la))%la],
+			alphabet[(i/la)%la],
+			alphabet[i%la],
+		}) + fmt.Sprintf("%05d", i) // suffix guarantees distinctness
+		if seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+func insertStringPKRows(t *testing.T, dsn, table string, vals []string) {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open for seed: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	stmt, err := tx.PrepareContext(ctx, "INSERT INTO "+table+" (id, label) VALUES ($1, $2)")
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	for i, v := range vals {
+		if _, err := stmt.ExecContext(ctx, v, fmt.Sprintf("row-%d", i)); err != nil {
+			t.Fatalf("insert %q: %v", v, err)
+		}
+	}
+	_ = stmt.Close()
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "ANALYZE "+table); err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+}
+
+// TestMigrate_PG_KeysetCopy_StringPK_DefaultCollation is the load-bearing
+// pin the original suite MISSED by using UUID (byte-monotonic lowercase
+// hex) as the "string" representative. It seeds a text-PK table > the
+// chunk threshold with values whose en_US.utf8 collation order differs
+// from byte order, runs parallel keyset copy, and asserts every row lands
+// EXACTLY ONCE (count + order-independent checksum). A coverage gap from a
+// bytewise-vs-collation upper-bound mismatch fails this loudly.
+func TestMigrate_PG_KeysetCopy_StringPK_DefaultCollation(t *testing.T) {
+	sourceDSN, targetDSN, cleanup := startPostgres(t)
+	defer cleanup()
+
+	const rowCount = 40_000
+	applyPGDDL(t, sourceDSN, `
+		CREATE TABLE names (
+			id    TEXT PRIMARY KEY,
+			label TEXT NOT NULL
+		);`)
+	insertStringPKRows(t, sourceDSN, "names", makeCollatedStringValues(rowCount))
+
+	pgEng, _ := engines.Get("postgres")
+	logs := captureSlog(t)
+	mig := &Migrator{
+		Source:              pgEng,
+		Target:              pgEng,
+		SourceDSN:           sourceDSN,
+		TargetDSN:           targetDSN,
+		BulkParallelism:     4,
+		BulkParallelMinRows: 10_000,
+		MigrationID:         "test-keyset-string-default-collation",
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	if err := mig.Run(ctx); err != nil {
+		t.Fatalf("Migrator.Run: %v", err)
+	}
+	assertChunkFanout(t, logs.String(), 2)
+	assertCountAndChecksum(t, sourceDSN, targetDSN, "names", "id || '|' || label")
+}
+
+// TestMigrate_PG_KeysetCopy_StringPK_ExplicitCollation is the same
+// coverage assertion but with an EXPLICIT per-column COLLATE "en_US.utf8"
+// on the PK, confirming the SQL upper-bound predicate honours the column's
+// declared collation (not the database default) — the order ORDER BY and
+// the `<=` row comparison both use.
+func TestMigrate_PG_KeysetCopy_StringPK_ExplicitCollation(t *testing.T) {
+	sourceDSN, targetDSN, cleanup := startPostgres(t)
+	defer cleanup()
+
+	const rowCount = 40_000
+	applyPGDDL(t, sourceDSN, `
+		CREATE TABLE names_coll (
+			id    TEXT COLLATE "en_US.utf8" PRIMARY KEY,
+			label TEXT NOT NULL
+		);`)
+	insertStringPKRows(t, sourceDSN, "names_coll", makeCollatedStringValues(rowCount))
+
+	pgEng, _ := engines.Get("postgres")
+	logs := captureSlog(t)
+	mig := &Migrator{
+		Source:              pgEng,
+		Target:              pgEng,
+		SourceDSN:           sourceDSN,
+		TargetDSN:           targetDSN,
+		BulkParallelism:     4,
+		BulkParallelMinRows: 10_000,
+		MigrationID:         "test-keyset-string-explicit-collation",
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	if err := mig.Run(ctx); err != nil {
+		t.Fatalf("Migrator.Run: %v", err)
+	}
+	assertChunkFanout(t, logs.String(), 2)
+	assertCountAndChecksum(t, sourceDSN, targetDSN, "names_coll", "id || '|' || label")
+}
+
+// TestMigrate_PG_KeysetCopy_NumericPK pins the decimal/numeric PK family
+// where LEXICAL order != NUMERIC order ("10" < "9" as text). The bytewise
+// Go clip compared decimal-as-text lexically while the DB orders
+// numerically, so boundary rows could fall into no chunk. With the SQL
+// upper bound the DB does the comparison numerically on both bounds.
+func TestMigrate_PG_KeysetCopy_NumericPK(t *testing.T) {
+	sourceDSN, targetDSN, cleanup := startPostgres(t)
+	defer cleanup()
+
+	const rowCount = 40_000
+	// Values where lexical and numeric order diverge across magnitudes:
+	// generate_series gives 1..N; as NUMERIC the DB orders them 1,2,..,N
+	// but their text forms order 1,10,100,...,2,20,... — the exact gap.
+	ddl := fmt.Sprintf(`
+		CREATE TABLE ledger (
+			id    NUMERIC(20,4) PRIMARY KEY,
+			label TEXT NOT NULL
+		);
+		INSERT INTO ledger (id, label)
+			SELECT g + 0.5, 'r-' || g FROM generate_series(1, %d) AS g;
+		ANALYZE ledger;
+	`, rowCount)
+	applyPGDDL(t, sourceDSN, ddl)
+
+	pgEng, _ := engines.Get("postgres")
+	logs := captureSlog(t)
+	mig := &Migrator{
+		Source:              pgEng,
+		Target:              pgEng,
+		SourceDSN:           sourceDSN,
+		TargetDSN:           targetDSN,
+		BulkParallelism:     4,
+		BulkParallelMinRows: 10_000,
+		MigrationID:         "test-keyset-numeric",
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	if err := mig.Run(ctx); err != nil {
+		t.Fatalf("Migrator.Run: %v", err)
+	}
+	assertChunkFanout(t, logs.String(), 2)
+	assertCountAndChecksum(t, sourceDSN, targetDSN, "ledger", "id::text || '|' || label")
+}
+
+// TestMigrate_PG_KeysetCopy_CharPK pins the CHAR(n) PK family
+// (blank-padded comparison semantics) under the default collation.
+func TestMigrate_PG_KeysetCopy_CharPK(t *testing.T) {
+	sourceDSN, targetDSN, cleanup := startPostgres(t)
+	defer cleanup()
+
+	const rowCount = 40_000
+	applyPGDDL(t, sourceDSN, `
+		CREATE TABLE codes (
+			id    CHAR(8) PRIMARY KEY,
+			label TEXT NOT NULL
+		);`)
+	// CHAR(8) values that span case + punctuation + accent within 8 chars
+	// so the collation-vs-byte-order gap is exercised under blank padding.
+	insertStringPKRows(t, sourceDSN, "codes", distinctTruncated(rowCount))
+
+	pgEng, _ := engines.Get("postgres")
+	logs := captureSlog(t)
+	mig := &Migrator{
+		Source:              pgEng,
+		Target:              pgEng,
+		SourceDSN:           sourceDSN,
+		TargetDSN:           targetDSN,
+		BulkParallelism:     4,
+		BulkParallelMinRows: 10_000,
+		MigrationID:         "test-keyset-char",
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	if err := mig.Run(ctx); err != nil {
+		t.Fatalf("Migrator.Run: %v", err)
+	}
+	assertChunkFanout(t, logs.String(), 2)
+	// CHAR comparison is blank-padded; compare on rtrim'd value so source
+	// and target agree regardless of how each surfaces trailing spaces.
+	assertCountAndChecksum(t, sourceDSN, targetDSN, "codes", "rtrim(id) || '|' || label")
+}
+
+// distinctTruncated builds n distinct CHAR(8)-fitting values that still
+// span case + punctuation + accent so the collation gap is exercised
+// within 8 chars. Two collated lead chars + a base-36 5-char counter fits
+// in 7-8 chars and stays distinct for well past 40k rows.
+func distinctTruncated(n int) []string {
+	lead := []rune{'a', 'A', 'b', 'B', '_', 'z', 'Z', 'é', 'ñ'}
+	out := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		c1 := lead[i%len(lead)]
+		c2 := lead[(i/len(lead))%len(lead)]
+		out = append(out, string([]rune{c1, c2})+fmt.Sprintf("%05d", i))
+	}
+	return out
+}
+
+// TestKeysetPartition_MatchesDBOrder_StringPK is the DIRECT invariant pin
+// the original suite lacked (it only self-checked the Go comparator). It
+// ground-truths the partition against the REAL database: it samples actual
+// keyset boundaries from a collated-string table, assembles the half-open
+// (lower, upper] chunks via computeKeysetChunkBoundaries, drains EACH chunk
+// through ReadRowsBatchBounded (the same SQL bounded read the orchestrator
+// uses), and asserts the chunks together cover EVERY source PK EXACTLY
+// ONCE. Under the old bytewise Go clip on a non-C collation this fails
+// (boundary-straddling rows land in zero chunks); with the SQL upper bound
+// it holds by construction because both bounds use the column's collation.
+func TestKeysetPartition_MatchesDBOrder_StringPK(t *testing.T) {
+	sourceDSN, _, cleanup := startPostgres(t)
+	defer cleanup()
+
+	const rowCount = 20_000
+	applyPGDDL(t, sourceDSN, `
+		CREATE TABLE part_probe (
+			id    TEXT PRIMARY KEY,
+			label TEXT NOT NULL
+		);`)
+	insertStringPKRows(t, sourceDSN, "part_probe", makeCollatedStringValues(rowCount))
+
+	pgEng, _ := engines.Get("postgres")
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	sr, err := pgEng.OpenSchemaReader(ctx, sourceDSN)
+	if err != nil {
+		t.Fatalf("OpenSchemaReader: %v", err)
+	}
+	schema, err := sr.ReadSchema(ctx)
+	if err != nil {
+		t.Fatalf("ReadSchema: %v", err)
+	}
+	var table *ir.Table
+	for _, tb := range schema.Tables {
+		if tb.Name == "part_probe" {
+			table = tb
+		}
+	}
+	if table == nil {
+		t.Fatal("part_probe not found in schema")
+	}
+
+	rr, err := pgEng.OpenRowReader(ctx, sourceDSN)
+	if err != nil {
+		t.Fatalf("OpenRowReader: %v", err)
+	}
+	if c, ok := rr.(interface{ Close() error }); ok {
+		defer func() { _ = c.Close() }()
+	}
+
+	sampler, ok := rr.(ir.KeysetSampler)
+	if !ok {
+		t.Fatal("PG reader does not implement KeysetSampler")
+	}
+	bounded, ok := rr.(ir.BoundedBatchedRowReader)
+	if !ok {
+		t.Fatal("PG reader does not implement BoundedBatchedRowReader")
+	}
+
+	const n = 4
+	bounds, err := computeKeysetChunkBoundaries(ctx, sampler, table, n)
+	if err != nil {
+		t.Fatalf("computeKeysetChunkBoundaries: %v", err)
+	}
+	if len(bounds) < 2 {
+		t.Fatalf("expected >= 2 chunks for ground-truth partition; got %d", len(bounds))
+	}
+
+	// Drain every chunk and tally how many chunks each PK appears in.
+	seen := map[string]int{}
+	for _, b := range bounds {
+		cursor := b.lowerPK
+		for {
+			ch, err := bounded.ReadRowsBatchBounded(ctx, table, cursor, b.upperPK, 2000)
+			if err != nil {
+				t.Fatalf("ReadRowsBatchBounded chunk %d: %v", b.chunkIndex, err)
+			}
+			var last []any
+			batch := 0
+			for row := range ch {
+				id := fmt.Sprintf("%v", row["id"])
+				seen[id]++
+				last = []any{row["id"]}
+				batch++
+			}
+			if rerr := rr.Err(); rerr != nil {
+				t.Fatalf("reader err on chunk %d: %v", b.chunkIndex, rerr)
+			}
+			if batch == 0 {
+				break
+			}
+			cursor = last
+		}
+	}
+
+	// Every source PK must be seen exactly once across all chunks.
+	missing, dup := 0, 0
+	for id, c := range seen {
+		switch {
+		case c == 0:
+			missing++
+		case c > 1:
+			dup++
+			if dup <= 5 {
+				t.Errorf("pk %q appeared in %d chunks (disjointness violated)", id, c)
+			}
+		}
+	}
+	if len(seen) != rowCount {
+		t.Errorf("partition covered %d distinct PKs; want %d (coverage gap = silent loss)", len(seen), rowCount)
+	}
+	if missing != 0 || dup != 0 {
+		t.Errorf("partition not exactly-once: missing=%d duplicated=%d", missing, dup)
+	}
 }
 
 // TestMigrate_PG_KeysetCopy_NoPKFallback confirms a table with no usable

@@ -187,6 +187,46 @@ type BatchedRowReader interface {
 	ReadRowsBatch(ctx context.Context, table *Table, after []any, limit int) (<-chan Row, error)
 }
 
+// BoundedBatchedRowReader is an optional extension of [BatchedRowReader]
+// that additionally bounds a batch by an INCLUSIVE upper PK. It is the
+// load-bearing exactly-once surface for the parallel within-table chunk
+// copy (ADR-0096): a chunk's read must be clipped at the chunk's upper
+// boundary, and that clip MUST agree with the engine's ORDER BY total
+// order — which is the column's NATIVE DB COLLATION, not a byte order.
+//
+// The earlier design clipped the upper bound in Go with a bytewise tuple
+// comparator while the SQL ORDER BY used the column collation. For string
+// / varchar / char PKs under a non-C collation (PG en_US.utf8, MySQL
+// utf8mb4_0900_ai_ci) and for decimal-as-text PKs the two orders DIVERGE,
+// so a boundary-straddling row could be excluded by BOTH the chunk above
+// it (Go says "past upper") AND the chunk below it (SQL says "<= lower"),
+// landing in NO chunk — a silent permanent row loss (the Bug-74 class).
+// Pushing the upper bound into the SQL WHERE makes BOTH bounds use the
+// same collation and the same PK index, so the partition is exactly-once
+// for every orderable family by construction.
+//
+// ReadRowsBatchBounded returns up to limit rows where
+// (pk) > after AND (pk) <= upTo, in PK ascending order. after may be nil
+// (start of the chunk's range / table); upTo may be nil (the last chunk
+// has no upper bound, identical to [BatchedRowReader.ReadRowsBatch]).
+// When both are nil the behaviour is identical to ReadRowsBatch.
+//
+// The orchestrator REQUIRES this surface for the non-integer / composite
+// keyset chunk strategy: an engine that does not implement it routes
+// those tables to the single-reader path rather than risk the bytewise
+// vs collation mismatch. The shipping engines (MySQL, Postgres) both
+// implement it.
+type BoundedBatchedRowReader interface {
+	BatchedRowReader
+
+	// ReadRowsBatchBounded returns up to limit rows from table where the
+	// PK is strictly greater than after AND less than or equal to upTo
+	// (both compared in the engine's native PK order, i.e. the column's
+	// DB collation), streamed in PK ascending order. nil after means "no
+	// lower bound"; nil upTo means "no upper bound".
+	ReadRowsBatchBounded(ctx context.Context, table *Table, after, upTo []any, limit int) (<-chan Row, error)
+}
+
 // RowWriter performs bulk inserts using the target's native fast-load
 // path (COPY, LOAD DATA INFILE, batched INSERTs, etc.). Implementations
 // should consume rows until the channel is closed or ctx is cancelled.
