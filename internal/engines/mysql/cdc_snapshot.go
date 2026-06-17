@@ -131,6 +131,16 @@ func (e Engine) OpenSnapshotStreamFromPosition(ctx context.Context, dsn string, 
 	// entry resumes from it, an allowlisted table with no cursor entry
 	// starts fresh, and a table dropped from the allowlist simply stops
 	// being copied. Empty/nil tables keeps the whole-keyspace COPY.
+	//
+	// ADR-0098: a multi-table resume drives the per-table AUTO-SHARD pump
+	// (one single-table COPY at a time, bounded memory, no interleave) rather
+	// than the legacy single keyspace-wide interleaved stream. The persisted
+	// cursor names the one in-progress table; openVStreamSnapshotStreamFrom
+	// validates it against this allowlist (resolveResumeAutoShard) and refuses
+	// loudly on a mismatch (an --include-table change since the checkpoint, a
+	// legacy multi-table cursor, or a corrupt token) rather than silently
+	// re-copying or skipping. This is what keeps a resume of a large
+	// multi-table keyspace from re-hitting the ADR-0071 buffer-cap crash-loop.
 	if len(tables) > 0 {
 		slog.InfoContext(ctx, "mysql/vstream: snapshot resume: scoping resumed COPY to included tables",
 			slog.Int("table_count", len(tables)))
