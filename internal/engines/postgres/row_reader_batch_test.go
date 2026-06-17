@@ -21,7 +21,7 @@ func TestBuildBatchedSelect_SinglePK_FirstBatch(t *testing.T) {
 		},
 		PrimaryKey: &ir.Index{Name: "pk_users", Columns: []ir.IndexColumn{{Column: "id"}}},
 	}
-	got := buildBatchedSelect("public", table, 5000, false)
+	got := buildBatchedSelect("public", table, 5000, false, false)
 	want := `SELECT "id", "email" FROM "public"."users" ORDER BY "id" LIMIT 5000`
 	if got != want {
 		t.Errorf("\n got  %q\n want %q", got, want)
@@ -40,8 +40,71 @@ func TestBuildBatchedSelect_SinglePK_WithCursor(t *testing.T) {
 		},
 		PrimaryKey: &ir.Index{Name: "pk_users", Columns: []ir.IndexColumn{{Column: "id"}}},
 	}
-	got := buildBatchedSelect("public", table, 5000, true)
+	got := buildBatchedSelect("public", table, 5000, true, false)
 	want := `SELECT "id", "email" FROM "public"."users" WHERE ("id") > ($1) ORDER BY "id" LIMIT 5000`
+	if got != want {
+		t.Errorf("\n got  %q\n want %q", got, want)
+	}
+}
+
+// TestBuildBatchedSelect_SinglePK_BothBounds confirms the ADR-0096
+// upper-bound clip is emitted as a SECOND row-comparison predicate on the
+// same PK tuple, with the upper placeholder numbered AFTER the lower so
+// readRowsBatch's after...,upTo... arg order lines up. Both bounds being
+// SQL row-comparisons is what makes the clip use the column's collation.
+func TestBuildBatchedSelect_SinglePK_BothBounds(t *testing.T) {
+	table := &ir.Table{
+		Name: "users",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Varchar{Length: 64}},
+			{Name: "email", Type: ir.Varchar{Length: 255}},
+		},
+		PrimaryKey: &ir.Index{Name: "pk_users", Columns: []ir.IndexColumn{{Column: "id"}}},
+	}
+	got := buildBatchedSelect("public", table, 5000, true, true)
+	want := `SELECT "id", "email" FROM "public"."users" WHERE ("id") > ($1) AND ("id") <= ($2) ORDER BY "id" LIMIT 5000`
+	if got != want {
+		t.Errorf("\n got  %q\n want %q", got, want)
+	}
+}
+
+// TestBuildBatchedSelect_SinglePK_UpperOnly confirms a first-batch read
+// with only an upper bound (chunk 0, no lower) clips correctly with $1 as
+// the upper placeholder.
+func TestBuildBatchedSelect_SinglePK_UpperOnly(t *testing.T) {
+	table := &ir.Table{
+		Name: "users",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Varchar{Length: 64}},
+			{Name: "email", Type: ir.Varchar{Length: 255}},
+		},
+		PrimaryKey: &ir.Index{Name: "pk_users", Columns: []ir.IndexColumn{{Column: "id"}}},
+	}
+	got := buildBatchedSelect("public", table, 5000, false, true)
+	want := `SELECT "id", "email" FROM "public"."users" WHERE ("id") <= ($1) ORDER BY "id" LIMIT 5000`
+	if got != want {
+		t.Errorf("\n got  %q\n want %q", got, want)
+	}
+}
+
+// TestBuildBatchedSelect_CompositePK_BothBounds confirms placeholder
+// numbering across both bounds for a composite PK: lower gets $1,$2 and
+// upper continues at $3,$4.
+func TestBuildBatchedSelect_CompositePK_BothBounds(t *testing.T) {
+	table := &ir.Table{
+		Name: "products",
+		Columns: []*ir.Column{
+			{Name: "tenant", Type: ir.Varchar{Length: 32}},
+			{Name: "sku", Type: ir.Integer{Width: 64}},
+			{Name: "name", Type: ir.Varchar{Length: 255}},
+		},
+		PrimaryKey: &ir.Index{
+			Name:    "pk_products",
+			Columns: []ir.IndexColumn{{Column: "tenant"}, {Column: "sku"}},
+		},
+	}
+	got := buildBatchedSelect("public", table, 1000, true, true)
+	want := `SELECT "tenant", "sku", "name" FROM "public"."products" WHERE ("tenant", "sku") > ($1, $2) AND ("tenant", "sku") <= ($3, $4) ORDER BY "tenant", "sku" LIMIT 1000`
 	if got != want {
 		t.Errorf("\n got  %q\n want %q", got, want)
 	}
@@ -66,7 +129,7 @@ func TestBuildBatchedSelect_CompositePK(t *testing.T) {
 			},
 		},
 	}
-	got := buildBatchedSelect("public", table, 1000, true)
+	got := buildBatchedSelect("public", table, 1000, true, false)
 	want := `SELECT "tenant", "sku", "name" FROM "public"."products" WHERE ("tenant", "sku") > ($1, $2) ORDER BY "tenant", "sku" LIMIT 1000`
 	if got != want {
 		t.Errorf("\n got  %q\n want %q", got, want)

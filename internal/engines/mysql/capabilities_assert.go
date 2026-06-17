@@ -64,6 +64,7 @@ var (
 
 	// RowReader optional surfaces.
 	_ ir.BatchedRowReader   = (*RowReader)(nil)
+	_ ir.KeysetSampler      = (*RowReader)(nil)
 	_ ir.RangeBoundsQuerier = (*RowReader)(nil)
 	_ ir.RowCounter         = (*RowReader)(nil)
 

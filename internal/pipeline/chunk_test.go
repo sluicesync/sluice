@@ -44,21 +44,28 @@ func integerPKTable() *ir.Table {
 	}
 }
 
-// TestCanParallelChunkTable_Eligibility covers the happy-path and the
-// four documented fall-back branches.
+// TestCanParallelChunkTable_Eligibility covers the happy-path, the
+// strategy classification (ADR-0096), and the documented fall-backs.
 func TestCanParallelChunkTable_Eligibility(t *testing.T) {
+	jsonPK := &ir.Table{
+		Name:       "blobs",
+		Columns:    []*ir.Column{{Name: "doc", Type: ir.JSON{}}},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "doc"}}},
+	}
 	cases := []struct {
-		name        string
-		table       *ir.Table
-		parallelism int
-		want        bool
-		wantSubstr  string
+		name         string
+		table        *ir.Table
+		parallelism  int
+		want         bool
+		wantStrategy chunkStrategy
+		wantSubstr   string
 	}{
-		{"happy", integerPKTable(), 4, true, ""},
-		{"parallelism_1", integerPKTable(), 1, false, "single-reader"},
-		{"no_pk", &ir.Table{Name: "log", Columns: []*ir.Column{{Name: "x", Type: ir.Integer{Width: 64}}}}, 4, false, "no primary key"},
+		{"happy_integer", integerPKTable(), 4, true, strategyMinMaxDivide, ""},
+		{"parallelism_1", integerPKTable(), 1, false, strategyNone, "single-reader"},
+		{"no_pk", &ir.Table{Name: "log", Columns: []*ir.Column{{Name: "x", Type: ir.Integer{Width: 64}}}}, 4, false, strategyNone, "no primary key"},
 		{
-			"composite_pk",
+			// Composite PK is now keyset-eligible (ADR-0096).
+			"composite_pk_keyset",
 			&ir.Table{
 				Name: "join",
 				Columns: []*ir.Column{
@@ -67,25 +74,72 @@ func TestCanParallelChunkTable_Eligibility(t *testing.T) {
 				},
 				PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "a"}, {Column: "b"}}},
 			},
-			4, false, "composite",
+			4, true, strategyKeysetSample, "",
 		},
 		{
-			"non_integer_pk",
+			// Single non-integer orderable PK → keyset (ADR-0096).
+			"uuid_pk_keyset",
 			&ir.Table{
-				Name: "tokens",
-				Columns: []*ir.Column{
-					{Name: "id", Type: ir.UUID{}},
-				},
+				Name:       "tokens",
+				Columns:    []*ir.Column{{Name: "id", Type: ir.UUID{}}},
 				PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
 			},
-			4, false, "supports integer PKs",
+			4, true, strategyKeysetSample, "",
+		},
+		{
+			"varchar_pk_keyset",
+			&ir.Table{
+				Name:       "users",
+				Columns:    []*ir.Column{{Name: "email", Type: ir.Varchar{Length: 255}}},
+				PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "email"}}},
+			},
+			4, true, strategyKeysetSample, "",
+		},
+		{
+			// Non-orderable PK type → single-reader fallback.
+			"json_pk_fallback", jsonPK, 4, false, strategyNone, "not an orderable chunk key",
+		},
+		{
+			// ADR-0048 Shape A: --inject-shard-column rewrites the PK as a
+			// composite (injected discriminator, …source PK). The injected
+			// leading column exists only on the target-planning schema, NOT
+			// the source, so the keyset boundary sample / bounded read would
+			// reference it against the source and fail SQLSTATE 42703. Must
+			// route to single-reader (pre-ADR-0096 behaviour). This is the
+			// regression the shard_injection cold-start integration test hit.
+			"shard_injected_composite_pk_fallback",
+			&ir.Table{
+				Name: "widgets",
+				Columns: []*ir.Column{
+					{Name: "id", Type: ir.Integer{Width: 64}},
+					{Name: "shard_id", Type: ir.Varchar{Length: 64}, SluiceInjected: true},
+				},
+				PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "shard_id"}, {Column: "id"}}},
+			},
+			4, false, strategyNone, "sluice-injected",
+		},
+		{
+			// Pin the CLASS, not the shard-leading representative: ANY
+			// sluice-injected PK column (even a hypothetical single-column or
+			// trailing-position one) is unreadable from the source and must
+			// fall back, independent of position in the PK tuple.
+			"single_injected_pk_fallback",
+			&ir.Table{
+				Name:       "injected",
+				Columns:    []*ir.Column{{Name: "shard_id", Type: ir.Varchar{Length: 64}, SluiceInjected: true}},
+				PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "shard_id"}}},
+			},
+			4, false, strategyNone, "sluice-injected",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			ok, reason := canParallelChunkTable(tc.table, tc.parallelism)
+			ok, strategy, reason := canParallelChunkTable(tc.table, tc.parallelism)
 			if ok != tc.want {
 				t.Errorf("canParallelChunkTable: got %v, %q; want %v", ok, reason, tc.want)
+			}
+			if ok && strategy != tc.wantStrategy {
+				t.Errorf("strategy: got %d; want %d", strategy, tc.wantStrategy)
 			}
 			if !tc.want && tc.wantSubstr != "" && !contains(reason, tc.wantSubstr) {
 				t.Errorf("reason %q does not contain %q", reason, tc.wantSubstr)

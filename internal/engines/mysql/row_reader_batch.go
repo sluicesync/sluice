@@ -21,12 +21,15 @@ package mysql
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
+
+// Static assertion: the MySQL reader satisfies the bounded batched
+// surface (which embeds [ir.BatchedRowReader]).
+var _ ir.BoundedBatchedRowReader = (*RowReader)(nil)
 
 // ReadRowsBatch implements [ir.BatchedRowReader]. See the file-header
 // comment for the SQL shape and the design rationale.
@@ -36,37 +39,62 @@ import (
 // method, but the defensive check is cheaper than a malformed SQL
 // statement at runtime.
 func (r *RowReader) ReadRowsBatch(ctx context.Context, table *ir.Table, after []any, limit int) (<-chan ir.Row, error) {
+	return r.readRowsBatch(ctx, table, after, nil, limit, "ReadRowsBatch")
+}
+
+// ReadRowsBatchBounded implements [ir.BoundedBatchedRowReader]: the same
+// PK-cursor page as [ReadRowsBatch] but additionally clipped to an
+// INCLUSIVE upper PK (`(pk) <= upTo`). Pushing the chunk's upper bound
+// into the SQL WHERE — in the SAME collation the ORDER BY uses — is what
+// makes within-table chunk coverage exactly-once for string / varchar /
+// decimal PKs under a case-/accent-insensitive collation like
+// utf8mb4_0900_ai_ci (ADR-0096; see the interface doc).
+func (r *RowReader) ReadRowsBatchBounded(ctx context.Context, table *ir.Table, after, upTo []any, limit int) (<-chan ir.Row, error) {
+	return r.readRowsBatch(ctx, table, after, upTo, limit, "ReadRowsBatchBounded")
+}
+
+// readRowsBatch is the shared body for the lower-bound-only and
+// lower+upper-bounded batched reads. upTo == nil reproduces the original
+// ReadRowsBatch query exactly (no upper-bound predicate).
+func (r *RowReader) readRowsBatch(ctx context.Context, table *ir.Table, after, upTo []any, limit int, op string) (<-chan ir.Row, error) {
 	if table == nil {
-		return nil, errors.New("mysql: ReadRowsBatch: table is nil")
+		return nil, fmt.Errorf("mysql: %s: table is nil", op)
 	}
 	if len(table.Columns) == 0 {
-		return nil, fmt.Errorf("mysql: ReadRowsBatch: table %q has no columns", table.Name)
+		return nil, fmt.Errorf("mysql: %s: table %q has no columns", op, table.Name)
 	}
 	if table.PrimaryKey == nil || len(table.PrimaryKey.Columns) == 0 {
-		return nil, fmt.Errorf("mysql: ReadRowsBatch: table %q has no primary key; cannot use cursor-paginated reads", table.Name)
+		return nil, fmt.Errorf("mysql: %s: table %q has no primary key; cannot use cursor-paginated reads", op, table.Name)
 	}
 	if limit <= 0 {
-		return nil, fmt.Errorf("mysql: ReadRowsBatch: limit must be > 0, got %d", limit)
+		return nil, fmt.Errorf("mysql: %s: limit must be > 0, got %d", op, limit)
 	}
 	pkCols := table.PrimaryKey.Columns
 	if len(after) != 0 && len(after) != len(pkCols) {
-		return nil, fmt.Errorf("mysql: ReadRowsBatch: after has %d values, table %q has %d PK columns",
-			len(after), table.Name, len(pkCols))
+		return nil, fmt.Errorf("mysql: %s: after has %d values, table %q has %d PK columns",
+			op, len(after), table.Name, len(pkCols))
+	}
+	if len(upTo) != 0 && len(upTo) != len(pkCols) {
+		return nil, fmt.Errorf("mysql: %s: upTo has %d values, table %q has %d PK columns",
+			op, len(upTo), table.Name, len(pkCols))
 	}
 
 	r.mu.Lock()
 	r.err = nil
 	r.mu.Unlock()
 
-	query := buildBatchedSelect(table, limit, len(after) > 0)
-	args := append([]any{}, after...)
+	query := buildBatchedSelect(table, limit, len(after) > 0, len(upTo) > 0)
+	// Bind in clause order: lower-bound placeholders first, then upper.
+	args := make([]any, 0, len(after)+len(upTo))
+	args = append(args, after...)
+	args = append(args, upTo...)
 
 	// rowserrcheck and sqlclosecheck can't follow rows into the
 	// goroutine; both are handled inside stream() (Close via defer,
 	// Err checked once iteration ends).
 	rows, err := r.q.QueryContext(ctx, query, args...) //nolint:rowserrcheck,sqlclosecheck
 	if err != nil {
-		return nil, fmt.Errorf("mysql: ReadRowsBatch: query failed: %w", err)
+		return nil, fmt.Errorf("mysql: %s: query failed: %w", op, err)
 	}
 
 	out := make(chan ir.Row, rowChanBuffer)
@@ -75,8 +103,16 @@ func (r *RowReader) ReadRowsBatch(ctx context.Context, table *ir.Table, after []
 }
 
 // buildBatchedSelect returns the cursor-paginated SELECT for table.
-// hasCursor=true emits the row-comparison WHERE predicate;
-// hasCursor=false emits the first-batch form (no WHERE).
+// hasCursor=true emits the row-comparison LOWER bound (`(pk) > (?...)`);
+// hasUpper=true emits the INCLUSIVE row-comparison UPPER bound
+// (`(pk) <= (?...)`); neither emits the first-batch form (no WHERE).
+//
+// CRITICAL (ADR-0096): both bounds are row-comparison predicates on the
+// PK tuple, so MySQL compares them in the column's collation — the SAME
+// order the ORDER BY uses. This is what makes chunk coverage exactly-once
+// for a case-/accent-insensitive collation like utf8mb4_0900_ai_ci;
+// clipping the upper bound in Go with a byte comparator would diverge
+// from the ORDER BY and silently drop boundary-straddling rows.
 //
 // Generated columns are excluded from the SELECT list — same
 // invariant as [buildSelect].
@@ -84,7 +120,7 @@ func (r *RowReader) ReadRowsBatch(ctx context.Context, table *ir.Table, after []
 // LIMIT is embedded as a literal because it's an orchestrator-
 // controlled int (no user input) and parameterising LIMIT in MySQL
 // has historical compatibility quirks across versions.
-func buildBatchedSelect(table *ir.Table, limit int, hasCursor bool) string {
+func buildBatchedSelect(table *ir.Table, limit int, hasCursor, hasUpper bool) string {
 	src := sourceReadableColumns(table.Columns)
 	colsList := make([]string, len(src))
 	for i, c := range src {
@@ -110,18 +146,27 @@ func buildBatchedSelect(table *ir.Table, limit int, hasCursor bool) string {
 	}
 	pkTuple := strings.Join(pkList, ", ")
 
+	placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(pkCols)), ", ")
+
 	var sb strings.Builder
 	sb.WriteString("SELECT ")
 	sb.WriteString(strings.Join(colsList, ", "))
 	sb.WriteString(" FROM ")
 	sb.WriteString(quoteIdent(table.Name))
+
+	// Placeholders bind in clause order: the lower-bound tuple first, then
+	// the upper-bound tuple. readRowsBatch binds after... then upTo... to
+	// match.
+	var conds []string
 	if hasCursor {
-		placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(pkCols)), ", ")
-		sb.WriteString(" WHERE (")
-		sb.WriteString(pkTuple)
-		sb.WriteString(") > (")
-		sb.WriteString(placeholders)
-		sb.WriteString(")")
+		conds = append(conds, "("+pkTuple+") > ("+placeholders+")")
+	}
+	if hasUpper {
+		conds = append(conds, "("+pkTuple+") <= ("+placeholders+")")
+	}
+	if len(conds) > 0 {
+		sb.WriteString(" WHERE ")
+		sb.WriteString(strings.Join(conds, " AND "))
 	}
 	sb.WriteString(" ORDER BY ")
 	sb.WriteString(pkTuple)
