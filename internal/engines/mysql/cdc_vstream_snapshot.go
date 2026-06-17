@@ -182,6 +182,15 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 		_ = conn.Close()
 		return nil, err
 	}
+	// ADR-0099: cross-table COPY concurrency. The raw operator intent is
+	// parsed here (loud on a malformed value); the effective stream count is
+	// resolved against the in-scope table count below, once auto-shard
+	// eligibility is known.
+	rawTableParallelism, err := vstreamCopyTableParallelismFromDSN(cfg)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
 	client := vtgateservice.NewVitessClient(conn)
 
 	// The gRPC stream lives for the lifetime of the SnapshotStream:
@@ -231,13 +240,33 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 	// cursor, and copies the tables after it fresh. See resolveResumeAutoShard.
 	autoShard := len(tables) > 1 && !vstreamCopySingleStreamFromDSN(cfg)
 
+	// ADR-0099: cross-table COPY concurrency. When auto-shard is engaged and
+	// the operator opted into K > 1 streams, the in-scope tables are
+	// partitioned into K disjoint groups and the concurrent driver runs one
+	// single-table COPY sub-sequence per group on its own VStream. K resolves
+	// to 1 (the sequential single-stream auto-shard, byte-identical to
+	// ADR-0095/0098) for the zero value / absent param / a one-table scope —
+	// so concurrent is a pure opt-in and every existing caller is unchanged.
+	// The partition is a DETERMINISTIC pure function of (sorted tables, K)
+	// (cross-start/resume stability — ADR-0099 §5); v1 has no per-table size
+	// estimator wired, so it uses the deterministic round-robin floor.
+	var concurrentGroups [][]string
+	if autoShard {
+		if k := resolveCopyTableParallelism(rawTableParallelism, len(tables)); k > 1 {
+			concurrentGroups = partitionTablesForStreams(tables, k, nil)
+		}
+	}
+	concurrent := len(concurrentGroups) > 1
+
 	// resumeSeed/resumeSeedTable carry the persisted cursor into the
 	// auto-shard pump (ADR-0098): when resuming, the pump seeds the
 	// in-progress table's per-table COPY from this cursor instead of
 	// from-beginning. resolveResumeAutoShard validates the persisted cursor
 	// names exactly one in-scope table and returns its name; a cursor that
 	// can't be placed in the table sequence is refused loudly rather than
-	// silently re-copying or skipping.
+	// silently re-copying or skipping. It runs against the FULL in-scope set
+	// before partitioning, so the concurrent driver can place the seed into
+	// whichever group contains the in-progress table.
 	var (
 		resumeSeed      []shardGtid
 		resumeSeedTable string
@@ -259,42 +288,50 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 	// the in-progress table (resumeSeedTable == tables[0]); a single-stream
 	// (non-auto-shard) resume keeps seeding the one stream from the cursor as
 	// before. This keeps exactly one per-table open path in the pump.
-	startPos := start
-	if startPos == nil || autoShard {
-		startPos = fromBeginningVStreamPos(keyspace, shards)
-	}
-	protoShardGtids, err := toProtoShardGtids(startPos)
-	if err != nil {
-		streamCancel()
-		_ = conn.Close()
-		return nil, fmt.Errorf("mysql/vstream: snapshot: build start position: %w", err)
-	}
+	//
+	// ADR-0099: in CONCURRENT mode the constructor opens NO stream — each of
+	// the K copyStreams opens its own per-table VStream in its own pump
+	// goroutine (cs.openStreamForTable). The grpcStream field stays nil; the
+	// concurrent driver never touches it.
+	var grpcStream vtgateservice.Vitess_VStreamClient
+	if !concurrent {
+		startPos := start
+		if startPos == nil || autoShard {
+			startPos = fromBeginningVStreamPos(keyspace, shards)
+		}
+		protoShardGtids, perr := toProtoShardGtids(startPos)
+		if perr != nil {
+			streamCancel()
+			_ = conn.Close()
+			return nil, fmt.Errorf("mysql/vstream: snapshot: build start position: %w", perr)
+		}
 
-	// In auto-shard mode the first physical stream is scoped to the FIRST
-	// table only; the pump reopens per-table as it advances. Otherwise the
-	// single stream carries the whole (possibly keyspace-wide) scope.
-	firstFilterTables := tables
-	if autoShard {
-		firstFilterTables = []string{tables[0]}
-	}
-	req := &vtgate.VStreamRequest{
-		TabletType: topodata.TabletType_PRIMARY,
-		Vgtid: &binlogdata.VGtid{
-			ShardGtids: protoShardGtids,
-		},
-		Filter: &binlogdata.Filter{Rules: vstreamCopyFilterRules(firstFilterTables)},
-		Flags: &vtgate.VStreamFlags{
-			MinimizeSkew:      true,
-			StopOnReshard:     true,
-			HeartbeatInterval: 5,
-		},
-	}
+		// In auto-shard mode the first physical stream is scoped to the FIRST
+		// table only; the pump reopens per-table as it advances. Otherwise the
+		// single stream carries the whole (possibly keyspace-wide) scope.
+		firstFilterTables := tables
+		if autoShard {
+			firstFilterTables = []string{tables[0]}
+		}
+		req := &vtgate.VStreamRequest{
+			TabletType: topodata.TabletType_PRIMARY,
+			Vgtid: &binlogdata.VGtid{
+				ShardGtids: protoShardGtids,
+			},
+			Filter: &binlogdata.Filter{Rules: vstreamCopyFilterRules(firstFilterTables)},
+			Flags: &vtgate.VStreamFlags{
+				MinimizeSkew:      true,
+				StopOnReshard:     true,
+				HeartbeatInterval: 5,
+			},
+		}
 
-	grpcStream, err := client.VStream(streamCtx, req)
-	if err != nil {
-		streamCancel()
-		_ = conn.Close()
-		return nil, fmt.Errorf("mysql/vstream: snapshot: open stream: %w", err)
+		grpcStream, err = client.VStream(streamCtx, req)
+		if err != nil {
+			streamCancel()
+			_ = conn.Close()
+			return nil, fmt.Errorf("mysql/vstream: snapshot: open stream: %w", err)
+		}
 	}
 
 	// copyTables is the scope the in-place reconnect re-applies: in
@@ -305,12 +342,18 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 	if autoShard {
 		reconnectScope = []string{tables[0]}
 		seq = tables
-		if resumeSeedTable != "" {
+		switch {
+		case concurrent:
+			slog.InfoContext(ctx, "mysql/vstream: snapshot: cross-table concurrent COPY enabled (ADR-0099)",
+				slog.String("keyspace", keyspace),
+				slog.Int("tables", len(tables)),
+				slog.Int("streams", len(concurrentGroups)))
+		case resumeSeedTable != "":
 			slog.InfoContext(ctx, "mysql/vstream: snapshot: auto-shard-by-table COPY RESUME (one table at a time, bounded memory; in-progress table seeded from cursor)",
 				slog.String("keyspace", keyspace),
 				slog.Int("tables", len(tables)),
 				slog.String("resume_table", resumeSeedTable))
-		} else {
+		default:
 			slog.InfoContext(ctx, "mysql/vstream: snapshot: auto-shard-by-table COPY (one table at a time, bounded memory)",
 				slog.String("keyspace", keyspace),
 				slog.Int("tables", len(tables)))
@@ -370,10 +413,19 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 	// reopens the stream once per table on the same connection and
 	// stitches the per-table snapshot points; otherwise the legacy
 	// single-stream pump drains the one keyspace-wide / single-table COPY.
+	//
+	// ADR-0099: when K > 1 concurrent streams were resolved, the concurrent
+	// driver runs one single-table COPY sub-sequence per disjoint table group
+	// on its own VStream, then stitches the per-shard set-min across the union
+	// of every stream's per-table snapshots. K == 1 stays byte-identical on
+	// the sequential copyPumpAutoShard.
 	snap.copyDone = make(chan struct{})
-	if len(snap.copyTablesSeq) > 0 {
+	switch {
+	case concurrent:
+		go snap.copyPumpAutoShardConcurrent(streamCtx, streamCancel, stream, concurrentGroups)
+	case len(snap.copyTablesSeq) > 0:
 		go snap.copyPumpAutoShard(streamCtx, streamCancel, stream)
-	} else {
+	default:
 		go snap.copyPump(streamCtx, streamCancel, stream)
 	}
 
@@ -511,6 +563,35 @@ type vstreamSnapshotStream struct {
 	// consumer draining table t_0 closes when t_0's COPY ends, not only
 	// when the whole keyspace copy ends. Guarded by mu/cond.
 	tableCopyComplete map[string]bool
+
+	// --- per-stream byte budget (ADR-0099 §2, the deadlock fix) ---
+	//
+	// The concurrent cross-table COPY (ADR-0099) runs K independent producer
+	// streams against ONE shared rowBuffer + byte cap, but the orchestrator
+	// consumer drains tables ONE AT A TIME. If all K streams shared the single
+	// maxBufferBytes cap, a stream racing ahead on a look-ahead table the
+	// consumer hasn't reached yet could fill the whole cap, leaving the stream
+	// that owns the table the consumer IS draining unable to enqueue its first
+	// row — a liveness deadlock the progress watchdog only escapes from after
+	// ~10 minutes (the LOUD timeout). We give each of the K streams its OWN
+	// byte sub-budget = maxBufferBytes / K (perStreamCap): a look-ahead stream
+	// parks on its OWN sub-cap (bounded), while the stream whose table is being
+	// drained always has its full sub-cap free to produce. Total bounded memory
+	// is unchanged (K × (cap/K) = cap).
+	//
+	// perStreamBytes[idx] is the running ApproximateRowBytes sum currently
+	// buffered by stream idx (incremented on enqueue by the producing stream,
+	// debited on ReadRows handoff via tableStreamIdx). perStreamCap is the
+	// per-stream sub-budget (>= 1; floored so a stream can always make
+	// progress one row at a time even at a tiny cap / large K, matching the
+	// single-row-exceeds-cap fallback of the sequential enqueueRowLocked).
+	// tableStreamIdx maps each in-scope table to the index of the stream that
+	// produces it (the disjoint partition, built once before the pumps start;
+	// read-only thereafter). nil/empty on every non-concurrent path — the
+	// sequential pumps never touch these. Guarded by mu.
+	perStreamBytes []int64
+	perStreamCap   int64
+	tableStreamIdx map[string]int
 
 	// reconnectMax is the in-place COPY-reconnect budget (Phase C):
 	// consecutive retriable Recv failures the pump absorbs before giving
@@ -2505,7 +2586,19 @@ func (r *vstreamSnapshotRows) ReadRows(ctx context.Context, table *ir.Table) (<-
 			row := queue[0]
 			queue[0] = nil
 			s.rowBuffer[tableName] = queue[1:]
-			s.bufferedBytes -= ir.ApproximateRowBytes(row)
+			rowBytes := ir.ApproximateRowBytes(row)
+			s.bufferedBytes -= rowBytes
+			// Concurrent COPY (ADR-0099): also credit the PRODUCING stream's
+			// own sub-budget so its backpressure (enqueueConcurrentRowLocked,
+			// which waits on perStreamBytes[idx] vs perStreamCap) is relieved
+			// by this drain. tableStreamIdx is nil on the sequential paths, so
+			// this is a clean no-op there. The disjoint partition guarantees
+			// exactly one producing stream per table.
+			if s.tableStreamIdx != nil {
+				if idx, ok := s.tableStreamIdx[tableName]; ok {
+					s.perStreamBytes[idx] -= rowBytes
+				}
+			}
 			s.cond.Broadcast()
 			s.mu.Unlock()
 
