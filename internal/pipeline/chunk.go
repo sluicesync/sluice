@@ -230,6 +230,20 @@ func canParallelChunkTable(table *ir.Table, parallelism int) (eligible bool, str
 		if col == nil {
 			return false, strategyNone, fmt.Sprintf("primary key column %q not found in column list", pkc.Column)
 		}
+		// A sluice-injected PK column (ADR-0048 Shape A: the leading
+		// discriminator of the rewritten composite PK) exists ONLY on the
+		// target-planning schema, NOT on the source — every chunk read
+		// (keyset boundary sample, ReadRowsBatchBounded predicate, ORDER BY)
+		// would reference it against the source and fail SQLSTATE 42703
+		// "column does not exist" (the Bug-80 class). It is also constant for
+		// the whole per-shard run, so it can't partition the keyspace anyway.
+		// Route the table to single-reader, which reads only sourceReadable
+		// columns and stamps the discriminator between read and write. (This
+		// restores the pre-ADR-0096 behaviour: a shard-injected table has a
+		// composite PK, which was never chunk-eligible before keyset landed.)
+		if col.SluiceInjected {
+			return false, strategyNone, fmt.Sprintf("primary key column %q is sluice-injected (not present on source); single-reader path", pkc.Column)
+		}
 		if !isOrderablePKType(col.Type) {
 			return false, strategyNone, fmt.Sprintf("primary key column %q is %s; not an orderable chunk key", pkc.Column, col.Type.String())
 		}

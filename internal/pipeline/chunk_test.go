@@ -99,6 +99,38 @@ func TestCanParallelChunkTable_Eligibility(t *testing.T) {
 			// Non-orderable PK type → single-reader fallback.
 			"json_pk_fallback", jsonPK, 4, false, strategyNone, "not an orderable chunk key",
 		},
+		{
+			// ADR-0048 Shape A: --inject-shard-column rewrites the PK as a
+			// composite (injected discriminator, …source PK). The injected
+			// leading column exists only on the target-planning schema, NOT
+			// the source, so the keyset boundary sample / bounded read would
+			// reference it against the source and fail SQLSTATE 42703. Must
+			// route to single-reader (pre-ADR-0096 behaviour). This is the
+			// regression the shard_injection cold-start integration test hit.
+			"shard_injected_composite_pk_fallback",
+			&ir.Table{
+				Name: "widgets",
+				Columns: []*ir.Column{
+					{Name: "id", Type: ir.Integer{Width: 64}},
+					{Name: "shard_id", Type: ir.Varchar{Length: 64}, SluiceInjected: true},
+				},
+				PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "shard_id"}, {Column: "id"}}},
+			},
+			4, false, strategyNone, "sluice-injected",
+		},
+		{
+			// Pin the CLASS, not the shard-leading representative: ANY
+			// sluice-injected PK column (even a hypothetical single-column or
+			// trailing-position one) is unreadable from the source and must
+			// fall back, independent of position in the PK tuple.
+			"single_injected_pk_fallback",
+			&ir.Table{
+				Name:       "injected",
+				Columns:    []*ir.Column{{Name: "shard_id", Type: ir.Varchar{Length: 64}, SluiceInjected: true}},
+				PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "shard_id"}}},
+			},
+			4, false, strategyNone, "sluice-injected",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
