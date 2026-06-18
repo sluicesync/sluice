@@ -379,6 +379,16 @@ So NOTIFY-kick is **demoted** — the poll isn't the bottleneck. Closing the rea
 
 ---
 
+### 22. Progress ETA: label `total_rows` as an estimate (avoid "rows > total" confusion) — *cosmetic UX hardening; ETA safety already handled*
+
+**Why.** The bulk-copy progress ticker's `total_rows` is ALWAYS a statistics ESTIMATE — MySQL `information_schema.TABLE_ROWS`, PG `pg_class.reltuples` (`row_reader_range.go` `CountRows` on both engines; the native concurrent reader uses the same TABLE_ROWS estimate via the side metadata pool, item 21a follow-up). These can be off ±50%+ without a recent `ANALYZE` or under write churn, so a table can copy MORE rows than the estimate. The ETA math is already safe — `progress.go:218` only computes ETA `if total > rows`, so once rows reach/exceed the estimate `eta_seconds` reverts to `-1` (unknown), never negative — but the raw progress line can read `rows=1500000 total_rows=800000 eta_seconds=-1`, which looks odd (rows past the stated total). Pre-existing + universal (all cold-start/migrate paths), surfaced 2026-06-18 while reviewing the item-21a ETA forwarding.
+
+**What.** Make `total_rows` self-evidently approximate so "rows passed it" reads as expected, not alarming: e.g. an `total_rows_estimated=true` attr on the progress line (correct unconditionally — both engines estimate), and any percent-deriving consumer (a future dashboard) clamps to 100% and renders `~N`. Do NOT fudge the number (bumping `total` up to `rows` would misrepresent it). Repo-wide progress-UX touch (`internal/pipeline/progress.go`), pinned by a ticker unit test (rows > total → estimated flag set, ETA stays `-1`).
+
+**Gotchas.** Keep it honest — the value stays the real estimate; only the LABEL changes. Don't introduce a divide-by-zero or a negative when rows == total (the existing `total > rows` guard already covers it; preserve it). Low priority — purely cosmetic; the safety-critical ETA behavior is already correct.
+
+---
+
 ### Open bugs awaiting fix windows
 
 Tracked in detail in the project's internal regression catalog; recap here for roadmap visibility:
