@@ -176,6 +176,92 @@ func TestClassifyApplierError_Error1105WithoutVttablet(t *testing.T) {
 	}
 }
 
+// TestClassifyApplierError_TxKillerSetsTransactionKilled pins the
+// v0.99.69 fix: a Vitess tx-killer abort (Error 1105 with the "tx
+// killer" reason fragment) must classify as a retriable error that
+// ALSO satisfies ir.TransactionKilledError with TransactionKilled()
+// ==true — the signal the AIMD controller reads to shrink immediately.
+// The other retriable 1105 shapes (Aborted-without-killer, Unknown,
+// Unavailable, ResourceExhausted) stay retriable but report
+// TransactionKilled()==false so a same-size retry rides them out.
+func TestClassifyApplierError_TxKillerSetsTransactionKilled(t *testing.T) {
+	cases := []struct {
+		name       string
+		msg        string
+		wantKilled bool
+	}{
+		{
+			name:       "tx-killer Aborted (the live v0.99.69 shape)",
+			msg:        "target: lst-mysql-b.-.primary: vttablet: rpc error: code = Aborted desc = transaction 173: in use: in use: for tx killer rollback",
+			wantKilled: true,
+		},
+		{
+			name:       "Aborted without tx-killer (e.g. primary stepping down)",
+			msg:        "vttablet: rpc error: code = Aborted desc = primary is stepping down",
+			wantKilled: false,
+		},
+		{
+			name:       "Unknown — retriable but not a tx-killer",
+			msg:        "vttablet: rpc error: code = Unknown desc = caller id churn",
+			wantKilled: false,
+		},
+		{
+			name:       "ResourceExhausted — retriable but not a tx-killer",
+			msg:        "vttablet: rpc error: code = ResourceExhausted desc = throttler engaged",
+			wantKilled: false,
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := classifyApplierError(&gomysql.MySQLError{Number: 1105, Message: c.msg})
+			var re ir.RetriableError
+			if !errors.As(got, &re) {
+				t.Fatalf("not classified retriable; got %T", got)
+			}
+			var tk ir.TransactionKilledError
+			if !errors.As(got, &tk) {
+				t.Fatalf("classified error does not satisfy ir.TransactionKilledError; got %T", got)
+			}
+			if tk.TransactionKilled() != c.wantKilled {
+				t.Errorf("TransactionKilled() = %v; want %v for %q", tk.TransactionKilled(), c.wantKilled, c.msg)
+			}
+		})
+	}
+}
+
+// TestVitessTxKillerSubstrings_PinDown is the change-detector for the
+// tx-killer discriminator, in the same spirit as
+// TestVitessRetriableSubstrings_PinDown4. If Vitess ever reworded the
+// tx-killer reason fragment ("for tx killer rollback"), this fails
+// loudly — a maintainer must re-derive the fragment and update both the
+// production slice and this pin. Without it, a reworded tx-killer abort
+// would silently classify as a generic transient and re-open the
+// v0.99.69 die-on-sustained-kill failure mode (re-submitting the same
+// too-large batch every retry).
+func TestVitessTxKillerSubstrings_PinDown(t *testing.T) {
+	want := []string{"tx killer"}
+	if len(vitessTxKillerSubstrings) != len(want) {
+		t.Fatalf("vitessTxKillerSubstrings = %q; pin expects %q. If Vitess reworded the tx-killer reason, update both.",
+			vitessTxKillerSubstrings, want)
+	}
+	for i, w := range want {
+		if vitessTxKillerSubstrings[i] != w {
+			t.Errorf("vitessTxKillerSubstrings[%d] = %q; want %q", i, vitessTxKillerSubstrings[i], w)
+		}
+	}
+	// End-to-end: the live shape is a tx-killer; a bare Aborted is not.
+	if !isVitessTxKillerMessage("vttablet: rpc error: code = Aborted desc = transaction 1: in use: for tx killer rollback") {
+		t.Error("live tx-killer shape not detected by isVitessTxKillerMessage")
+	}
+	if isVitessTxKillerMessage("vttablet: rpc error: code = Aborted desc = primary stepping down") {
+		t.Error("non-killer Aborted wrongly detected as tx-killer")
+	}
+	if isVitessTxKillerMessage("for tx killer rollback (no discriminator tag)") {
+		t.Error("tx-killer fragment without the vttablet discriminator wrongly detected")
+	}
+}
+
 // TestClassifyVitessMessage covers the leaf helper directly so the
 // gRPC-code matching is testable without constructing a full
 // MySQLError shell.

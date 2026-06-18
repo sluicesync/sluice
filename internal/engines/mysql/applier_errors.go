@@ -50,15 +50,25 @@ import (
 // transient. The wrapped underlying error is preserved via Unwrap so
 // errors.Is / errors.As against the driver's *MySQLError still works
 // from the consumer side.
+//
+// txKilled additionally satisfies [ir.TransactionKilledError] when the
+// classified transient is a Vitess tx-killer abort (Error 1105 with a
+// `code = Aborted ... for tx killer rollback` payload). The AIMD
+// controller reads that surface as a strong, immediate shrink signal
+// (ADR-0052; the v0.99.69 sustained-tx-killer finding) — a batch the
+// target rolled back for exceeding its tx-timeout window must shrink,
+// not re-submit at the same size and be killed again.
 type retriableMySQLError struct {
-	err  error
-	hint time.Duration
+	err      error
+	hint     time.Duration
+	txKilled bool
 }
 
 func (e *retriableMySQLError) Error() string            { return e.err.Error() }
 func (e *retriableMySQLError) Unwrap() error            { return e.err }
 func (e *retriableMySQLError) Retriable() bool          { return true }
 func (e *retriableMySQLError) RetryHint() time.Duration { return e.hint }
+func (e *retriableMySQLError) TransactionKilled() bool  { return e.txKilled }
 
 // isMySQLDeadlock reports whether err is (or wraps) an InnoDB deadlock —
 // MySQL error 1213 / SQLSTATE 40001. The deadlock victim's transaction is
@@ -130,7 +140,10 @@ func classifyApplierError(err error) error {
 			return &retriableMySQLError{err: err}
 		case 1105:
 			if classifyVitessMessage(mysqlErr.Message) {
-				return &retriableMySQLError{err: err}
+				return &retriableMySQLError{
+					err:      err,
+					txKilled: isVitessTxKillerMessage(mysqlErr.Message),
+				}
 			}
 		case 1062:
 			// Explicit non-retriable: don't wrap. Falls through to
@@ -216,6 +229,53 @@ func classifyVitessMessage(msg string) bool {
 		return false
 	}
 	for _, sub := range vitessRetriableSubstrings {
+		if strings.Contains(msg, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// vitessTxKillerSubstrings are the markers that distinguish a Vitess
+// transaction-killer abort from the other retriable 1105 shapes. The
+// tx-killer rolls back a transaction held longer than vttablet's
+// wall-clock timeout; its payload is `code = Aborted ... for tx killer
+// rollback` (the live v0.99.69 finding) — but vttablet has worded the
+// reason differently across versions, so the match is the union of:
+//
+//	"tx killer"           — the canonical reason fragment ("for tx
+//	                        killer rollback"), version-stable.
+//	"exceeded ... timeout" markers are NOT matched here because they
+//	                        also cover non-killer Aborted shapes; the
+//	                        "tx killer" fragment is the precise signal.
+//
+// A bare `code = Aborted` WITHOUT the tx-killer fragment (e.g. a
+// primary stepping down) is still retriable (classifyVitessMessage
+// returns true) but is NOT a tx-killer — re-applying the same batch
+// after a failover succeeds, so it should not force a shrink. Keeping
+// the tx-killer match narrow avoids shrinking the batch on transients
+// that a same-size retry would clear.
+//
+// [TestVitessTxKillerSubstrings_PinDown] pins these literals so a
+// future Vitess wording change fails a test rather than silently
+// classifying a tx-killer abort as a generic transient (which would
+// re-open the v0.99.69 die-on-sustained-kill failure mode). Extend
+// this slice and the pin test together.
+var vitessTxKillerSubstrings = []string{
+	"tx killer",
+}
+
+// isVitessTxKillerMessage reports whether a MySQL Error 1105's text is
+// specifically a Vitess transaction-killer abort (a subset of the
+// shapes [classifyVitessMessage] marks retriable). Callers gate the
+// call on classifyVitessMessage already returning true, so this only
+// needs to test the tx-killer discriminator on a known-vttablet
+// message.
+func isVitessTxKillerMessage(msg string) bool {
+	if !strings.Contains(msg, "vttablet") {
+		return false
+	}
+	for _, sub := range vitessTxKillerSubstrings {
 		if strings.Contains(msg, sub) {
 			return true
 		}

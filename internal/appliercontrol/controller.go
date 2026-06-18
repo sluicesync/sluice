@@ -74,6 +74,20 @@ type Config struct {
 	// expiry. Unit tests inject deterministic clocks; production uses
 	// [time.Now]. Nil falls back to time.Now.
 	Now func() time.Time
+
+	// OnShrink, when non-nil, is invoked with the new (post-MD) batch
+	// size after every multiplicative decrease. The streamer wires it
+	// to persist the shrunk size ACROSS runOnce restarts: a Vitess
+	// tx-killer abort propagates out of runOnce to the ADR-0038
+	// streamer-level retry loop, which reconstructs the controller on
+	// the next attempt — without this hook the new controller would
+	// reset to the ceiling and re-submit the same too-large batch that
+	// was just killed, exhausting the retry budget (the v0.99.69
+	// finding). The callback runs UNDER the controller's mutex, so it
+	// must be cheap and non-blocking (a single field store). Nil is the
+	// default — the controller is self-contained within one runOnce
+	// without it.
+	OnShrink func(newSize int)
 }
 
 // Defaults applied per ADR-0052 § "Implementation pre-resolutions".
@@ -224,6 +238,29 @@ func (c *Controller) ObserveBatch(ctx context.Context, latency time.Duration, ro
 		c.window.Observe(latency)
 	}
 
+	// Transaction-killer abort: a STRONG, IMMEDIATE shrink signal
+	// (ADR-0052; the v0.99.69 sustained-tx-killer finding). When the
+	// target's server-side transaction killer rolled back the batch
+	// (Vitess `code = Aborted ... for tx killer rollback`), the batch
+	// was simply too large to commit inside the target's tx-timeout
+	// window — re-submitting the SAME size will be killed again. We MD
+	// at once, bypassing the generic retry-rate accumulator's
+	// threshold-of-3 (which can never trip from tx-killer aborts in
+	// practice: one abort is fatal to the runOnce attempt, so they
+	// never accumulate before the run dies and the controller is torn
+	// down). The OnShrink hook then persists the smaller size across
+	// the ADR-0038 streamer-level retry so the next attempt re-applies
+	// at the shrunk size and converges, instead of dying at the
+	// ceiling. The tx-killer timestamp still feeds the retry-rate
+	// accumulator below so a slow trickle of mixed transients is
+	// accounted, but the immediate MD here is what makes convergence
+	// happen. Checked BEFORE the generic accumulator so the first
+	// tx-killer abort shrinks without waiting for a fourth.
+	if err != nil && isTxKilledError(err) {
+		c.multiplicativeDecreaseLocked(ctx, "transaction-killer", prevSize)
+		return
+	}
+
 	// Retry-rate accounting. We count *any* observation whose err
 	// satisfies [ir.RetriableError] semantics — the caller has the
 	// engine-side classifier; we just pin the timestamp here.
@@ -332,6 +369,13 @@ func (c *Controller) multiplicativeDecreaseLocked(ctx context.Context, reason st
 		slog.Duration("p95", c.window.P95()),
 		slog.Duration("target_latency", c.cfg.TargetLatency),
 	)
+	// Persist the shrunk size so it survives a runOnce restart (the
+	// streamer wires OnShrink to its cross-attempt resume-size field).
+	// Called under c.mu — the hook is a cheap field store; see the
+	// Config.OnShrink doc for the lifecycle rationale.
+	if c.cfg.OnShrink != nil {
+		c.cfg.OnShrink(c.currentSize)
+	}
 }
 
 // debugDecisionLocked emits the per-batch DEBUG log line capturing the
@@ -433,6 +477,34 @@ func isRetriableError(err error) bool {
 	var r retriable
 	if errors.As(err, &r) {
 		return r.Retriable()
+	}
+	return false
+}
+
+// txKilled is the structural shape the controller looks for to detect
+// a server-side transaction-killer abort. Mirrors
+// [ir.TransactionKilledError] without importing the ir package — same
+// engine-neutrality reasoning as [retriable]. The MySQL applier's
+// classifier produces a value satisfying this shape for Vitess
+// tx-killer 1105 aborts (it returns false for the other retriable 1105
+// shapes, so a same-size retry still rides out a benign transient
+// without an unnecessary shrink).
+type txKilled interface {
+	error
+	TransactionKilled() bool
+}
+
+// isTxKilledError walks the error chain via [errors.As] looking for a
+// value that satisfies [txKilled] and reports its verdict. Returns
+// false for errors that don't implement the surface (the common case)
+// and for tx-killer-capable errors whose per-error flag is false.
+func isTxKilledError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var t txKilled
+	if errors.As(err, &t) {
+		return t.TransactionKilled()
 	}
 	return false
 }
