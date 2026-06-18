@@ -251,12 +251,16 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 	// time; the n goroutines run n SELECTs across n DISTINCT connections.
 	rows := newConcurrentBinlogRows(conns, groups, cfg.DBName)
 
-	// Honest connection-budget surfacing (no false auto-clamp — ADR-0101 §5).
+	// Honest connection-budget surfacing (no false auto-clamp — ADR-0101 §5 /
+	// ADR-0102 §3). readers = W = the cross-table reader pipelines; each fans
+	// its active table across D = --copy-fanout-degree plain-INSERT writers
+	// (ADR-0102), so the target write concurrency is W × D and the operator
+	// owns the budget (MySQL has no connection-slot prober on this path).
 	slog.InfoContext(ctx,
 		"mysql: native concurrent cold-copy: opened consistent multi-table snapshot",
 		slog.Int("readers", n),
 		slog.Int("groups", len(groups)),
-		slog.String("contract", "operator ensures readers × write-fanout ≤ --max-target-connections and readers ≤ source max_connections"))
+		slog.String("contract", "operator ensures W(readers) × D(--copy-fanout-degree) ≤ --max-target-connections and readers ≤ source max_connections"))
 
 	stream := &ir.SnapshotStream{
 		Position: position,

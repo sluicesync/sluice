@@ -97,11 +97,13 @@ func concurrentCopyGroups(rows ir.RowReader) [][]string {
 // serial loop's dispatch:
 //   - true  → [copyTableColdStartIdempotentMaybeParallel] (the upsert path —
 //     the VStream COPY re-emits rows, Bug 125, ADR-0099/0100).
-//   - false → [copyTable] (plain INSERT — the native-MySQL binlog snapshot,
-//     ADR-0101: each table is read EXACTLY ONCE from a frozen
-//     REPEATABLE-READ view, gap-free + overlap-free, so no upsert is needed
-//     and the disjoint partition means each table is plain-INSERTed by
-//     exactly one pipeline).
+//   - false → [copyTablePlainMaybeParallel] (plain INSERT with the ADR-0097
+//     D-way write fan-out — the native-MySQL binlog snapshot, ADR-0101/0102:
+//     each table is read EXACTLY ONCE from a frozen REPEATABLE-READ view,
+//     gap-free + overlap-free, so no upsert is needed and the disjoint
+//     partition means each table is plain-INSERTed by exactly one pipeline;
+//     within that pipeline the table's rows fan across D plain-INSERT workers
+//     → W × D).
 //
 // The two readers that surface a concurrent partition are mutually exclusive
 // on this axis (VStream is always idempotent; native binlog is never), so
@@ -176,9 +178,13 @@ func runConcurrentTableCopy(
 				if needsIdempotent {
 					cerr = copyTableColdStartIdempotentMaybeParallel(tctx, rows, rw, table, redactor, shard, fanoutDegree)
 				} else {
-					// Native-MySQL gap-free snapshot (ADR-0101): plain INSERT,
-					// same per-table helper the serial non-idempotent loop uses.
-					cerr = copyTable(tctx, rows, rw, table, redactor, shard)
+					// Native-MySQL gap-free snapshot (ADR-0101/0102): plain
+					// INSERT with the SAME ADR-0097 D-way write fan-out the
+					// idempotent path uses, so each of the W group pipelines
+					// fans its active table across D plain-INSERT workers →
+					// W × D. Reuses partitionRowsByPK verbatim; degree==1 or a
+					// no-PK table falls back to the single-writer copyTable.
+					cerr = copyTablePlainMaybeParallel(tctx, rows, rw, table, redactor, shard, fanoutDegree)
 				}
 				if cerr != nil {
 					return wrapWithHint(PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", name, cerr))

@@ -395,15 +395,6 @@ func (w *RowWriter) WriteRows(ctx context.Context, table *ir.Table, rows <-chan 
 // individual rows. This matches what pscale-cli's batcher does:
 // flush at ~1 MB of statement body rather than a fixed row count.
 func (w *RowWriter) writeBatched(ctx context.Context, table *ir.Table, rows <-chan ir.Row) error {
-	limit := w.maxRowsPerBatch
-	if limit <= 0 {
-		limit = defaultMaxRowsPerBatch
-	}
-	byteCap := w.maxBufferBytes
-	if byteCap <= 0 {
-		byteCap = defaultMaxBufferBytes
-	}
-
 	// Pin a single connection for the whole batched write so the
 	// post-flush warning check (Vector B) reads SHOW WARNINGS on the SAME
 	// session that ran the INSERT — @@warning_count / SHOW WARNINGS are
@@ -418,6 +409,33 @@ func (w *RowWriter) writeBatched(ctx context.Context, table *ir.Table, rows <-ch
 		return fmt.Errorf("mysql: batched insert into %q: pin connection: %w", table.Name, err)
 	}
 	defer func() { _ = conn.Close() }()
+	return w.writeBatchedConn(ctx, conn, table, rows)
+}
+
+// writeBatchedConn is the per-connection PLAIN batched-INSERT loop, shared
+// by the serial [writeBatched] (one conn) and the parallel
+// [WriteRowsParallel] (N conns, one per worker, ADR-0102). The caller owns
+// pinning + closing conn. It is the plain-INSERT mirror of
+// [writeBatchedIdempotentConn] — same batch/flush mechanics and Vector-B
+// warning probe, plain INSERT instead of upsert.
+//
+// Concurrency note (ADR-0102): when N of these run on one RowWriter for a
+// fan-out copy, they share w.warnedClamp (a sync.Map — safe). There is no
+// mid-COPY durable watermark on the plain path (plain INSERT has no
+// CopyDurableProgressReporter wiring), so no shared mutable progress state
+// crosses workers. Each invocation keeps its own batch buffer and flush
+// counter, so the per-call Vector-B sampling schedule is per-worker
+// (defensible: a systematic clamp still trips every worker's first-N
+// exhaustive flushes and its final flush).
+func (w *RowWriter) writeBatchedConn(ctx context.Context, conn *sql.Conn, table *ir.Table, rows <-chan ir.Row) error {
+	limit := w.maxRowsPerBatch
+	if limit <= 0 {
+		limit = defaultMaxRowsPerBatch
+	}
+	byteCap := w.maxBufferBytes
+	if byteCap <= 0 {
+		byteCap = defaultMaxBufferBytes
+	}
 
 	batch := make([]ir.Row, 0, limit)
 	var batchBytes int64

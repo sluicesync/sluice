@@ -860,7 +860,14 @@ func runBulkCopyWithOpts(
 				}
 				continue
 			}
-			if err := copyTable(ctx, rows, rw, table, opts.Redactor, opts.Shard); err != nil {
+			// Plain (gap-free) path: compose the ADR-0097 D-way write fan-out
+			// (ADR-0102) when the target writer is parallel-capable + the table
+			// has a PK + degree > 1, else the single-writer copyTable. This
+			// gives a SINGLE-stream native-MySQL cold-copy (W = 1) 1 × D
+			// per-table fan-out; PG / VStream-single-stream targets that don't
+			// implement ir.ParallelCopyWriter fall through to copyTable
+			// byte-identically.
+			if err := copyTablePlainMaybeParallel(ctx, rows, rw, table, opts.Redactor, opts.Shard, fanoutDegree); err != nil {
 				return wrapWithHint(PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", table.Name, err))
 			}
 		}
