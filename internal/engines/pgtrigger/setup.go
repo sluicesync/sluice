@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 
@@ -183,6 +184,28 @@ func Setup(ctx context.Context, dsn string, opts SetupOptions) (*Plan, error) {
 		return nil, errors.New("pgtrigger: setup: no tables specified; pass --tables=t1,t2,…")
 	}
 
+	// Never install capture triggers on the engine's OWN internal tables. The
+	// capture function INSERTs into sluice_change_log, so a capture trigger on
+	// that table re-fires on every insert → unbounded recursion → PostgreSQL
+	// "stack depth limit exceeded", which fails EVERY write on EVERY triggered
+	// table (a source-wide write outage, not a localized error). Both internal
+	// tables carry a PRIMARY KEY, so any caller that enumerates "all tables with
+	// a PK" (the common shape) sweeps them in on a re-run once they exist. Guard
+	// here so the engine is self-protecting regardless of caller hygiene; the
+	// matching caller-side filter is defense-in-depth, not the load-bearing fix.
+	keptTables, excludedInternal := filterEngineInternalTables(opts.Tables)
+	if len(excludedInternal) > 0 {
+		slog.Warn(
+			"pgtrigger: setup: excluded the engine's own internal tables from trigger installation; a capture trigger on these recurses infinitely and would block all source writes",
+			"excluded", excludedInternal,
+			"see", "ADR-0066",
+		)
+	}
+	opts.Tables = keptTables
+	if len(opts.Tables) == 0 {
+		return nil, errors.New("pgtrigger: setup: no user tables remain after excluding the engine's own internal tables (sluice_change_log / sluice_change_log_meta); pass actual user tables via --tables")
+	}
+
 	// Validate (and default) the capture-payload mode before touching
 	// any source-side state, so an unknown value refuses loudly upfront.
 	payload, err := normalizePayload(opts.CapturePayload)
@@ -335,6 +358,29 @@ func Teardown(ctx context.Context, dsn string, opts TeardownOptions) (*Plan, err
 		}
 	}
 	return plan, nil
+}
+
+// isEngineInternalTable reports whether name is one of the source-side tables
+// the engine creates for its own bookkeeping (the change-log and its meta
+// companion). These must NEVER receive a capture trigger: the capture function
+// writes into sluice_change_log, so a trigger there recurses to a stack-depth
+// failure, and sluice_change_log_meta is engine state, not user data.
+func isEngineInternalTable(name string) bool {
+	return name == ChangeLogTable || name == ChangeLogMetaTable
+}
+
+// filterEngineInternalTables splits a caller-supplied table list into the
+// tables to set up (kept) and the engine-internal names to exclude. It is
+// order-preserving so the rendered DDL order is stable for tests and dry-run.
+func filterEngineInternalTables(tables []string) (kept, excluded []string) {
+	for _, t := range tables {
+		if isEngineInternalTable(t) {
+			excluded = append(excluded, t)
+			continue
+		}
+		kept = append(kept, t)
+	}
+	return kept, excluded
 }
 
 // renderSetupDDL produces the ordered DDL statements that install the
