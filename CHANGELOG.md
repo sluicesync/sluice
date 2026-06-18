@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.72] - 2026-06-18
+
+### Fixed
+
+- **The postgres-trigger engine no longer installs its capture trigger on its OWN internal tables, which on a re-run could recurse infinitely and block ALL writes on the source (HIGH; live Track-A finding).** `trigger setup` takes an explicit table list from the caller, and a caller that enumerates "every table with a primary key" (the common shape) sweeps in sluice's own `sluice_change_log` and `sluice_change_log_meta` once they exist — both carry a PRIMARY KEY. On the FIRST setup the change-log table doesn't exist yet, so it's never in the list; on a RE-setup (re-configure) it does, and the engine dutifully installed the `sluice_capture` row trigger on it. Because the capture function INSERTs into `sluice_change_log`, a capture trigger on that very table re-fires on every insert → unbounded recursion → PostgreSQL `stack depth limit exceeded`. That doesn't fail just the change-log write — it fails EVERY INSERT/UPDATE/DELETE on EVERY triggered table, i.e. a source-wide write outage (in a real migration this takes the customer's source database offline for writes). `Setup` now filters its own internal tables (`sluice_change_log`, `sluice_change_log_meta`) out of the table list before the preflight and DDL, emits a loud WARN naming what was excluded, and errors only if nothing caller-supplied remains — so the engine is self-protecting regardless of caller hygiene. Pinned by unit tests over the filter (mixed / only-internal / none, order-preserving) and a render assertion that the post-filter DDL never attaches a trigger to an internal table while still triggering the real user tables. (The companion `sluice-heroku-migrator` also excludes `sluice_*` in its table enumeration as defense-in-depth, but this engine-side guard is the load-bearing fix.) No effect on a correctly-scoped setup: the change-log tables were never meant to be replicated, so excluding them changes nothing for any healthy install.
+
 ## [0.99.71] - 2026-06-18
 
 ### Added
