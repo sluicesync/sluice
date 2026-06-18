@@ -87,11 +87,25 @@ func concurrentCopyGroups(rows ir.RowReader) [][]string {
 
 // runConcurrentTableCopy copies schema.Tables through W = len(groups)
 // CONCURRENT consumer pipelines (ADR-0100), one per disjoint group, each
-// looping its group's tables serially through
-// [copyTableColdStartIdempotentMaybeParallel] (so the ADR-0097 D-way write
-// fan-out composes per table). It is the write-side companion to ADR-0099's
-// K concurrent producer streams (W = K): each group's producer fills its
-// tables' queues, each group's consumer (here) drains+writes them.
+// looping its group's tables serially through the per-table copy helper (so
+// the ADR-0097 D-way write fan-out composes per table). It is the write-side
+// companion to ADR-0099's K concurrent producer streams (W = K): each group's
+// producer fills its tables' queues, each group's consumer (here)
+// drains+writes them.
+//
+// needsIdempotent selects the per-table write path, EXACTLY mirroring the
+// serial loop's dispatch:
+//   - true  → [copyTableColdStartIdempotentMaybeParallel] (the upsert path —
+//     the VStream COPY re-emits rows, Bug 125, ADR-0099/0100).
+//   - false → [copyTable] (plain INSERT — the native-MySQL binlog snapshot,
+//     ADR-0101: each table is read EXACTLY ONCE from a frozen
+//     REPEATABLE-READ view, gap-free + overlap-free, so no upsert is needed
+//     and the disjoint partition means each table is plain-INSERTed by
+//     exactly one pipeline).
+//
+// The two readers that surface a concurrent partition are mutually exclusive
+// on this axis (VStream is always idempotent; native binlog is never), so
+// needsIdempotent is constant across a run.
 //
 // It returns only after the W-way errgroup joins — so when it returns nil,
 // EVERY table in EVERY group is fully and durably written (the write
@@ -121,6 +135,7 @@ func runConcurrentTableCopy(
 	redactor *redact.Registry,
 	shard ShardColumnSpec,
 	fanoutDegree int,
+	needsIdempotent bool,
 ) error {
 	if concurrentCopyDispatchObserver != nil {
 		concurrentCopyDispatchObserver(len(groups))
@@ -157,8 +172,16 @@ func runConcurrentTableCopy(
 						name,
 					)
 				}
-				if err := copyTableColdStartIdempotentMaybeParallel(tctx, rows, rw, table, redactor, shard, fanoutDegree); err != nil {
-					return wrapWithHint(PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", name, err))
+				var cerr error
+				if needsIdempotent {
+					cerr = copyTableColdStartIdempotentMaybeParallel(tctx, rows, rw, table, redactor, shard, fanoutDegree)
+				} else {
+					// Native-MySQL gap-free snapshot (ADR-0101): plain INSERT,
+					// same per-table helper the serial non-idempotent loop uses.
+					cerr = copyTable(tctx, rows, rw, table, redactor, shard)
+				}
+				if cerr != nil {
+					return wrapWithHint(PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", name, cerr))
 				}
 			}
 			return nil

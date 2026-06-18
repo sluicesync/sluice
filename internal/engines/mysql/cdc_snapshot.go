@@ -63,7 +63,29 @@ func (e Engine) OpenSnapshotStreamForTables(ctx context.Context, dsn string, tab
 		return e.openVStreamSnapshotStreamFrom(ctx, dsn, nil, tables)
 	}
 	// Vanilla/binlog flavor: its snapshot RowReader already reads per-table,
-	// so it never over-streams; the table scope is a no-op there.
+	// so it never over-streams; the table scope is a no-op for correctness.
+	//
+	// ADR-0101: the table scope IS used to drive native concurrent cold-copy.
+	// When the operator opts into copy_table_parallelism > 1 AND the scope has
+	// > 1 table, open N FTWRL-coordinated consistent-snapshot readers over a
+	// disjoint partition of the in-scope tables (the engine surfaces the
+	// partition; the ADR-0100 pipeline consumer drives W = N read→write
+	// pipelines). N = 1 / a one-table scope / absent param all resolve to the
+	// serial single-snapshot path below, byte-identical to today (the
+	// zero-value-safe floor, the v0.99.51 trap avoided by reusing the same
+	// resolver). A malformed knob is a LOUD parse error, not a silent serial
+	// fallback.
+	cfg, err := parseDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+	rawN, err := nativeCopyTableParallelismFromDSN(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if n := resolveCopyTableParallelism(rawN, len(tables)); n > 1 && len(tables) > 1 {
+		return e.openBinlogSnapshotStreamConcurrent(ctx, dsn, n, tables)
+	}
 	return e.openBinlogSnapshotStream(ctx, dsn)
 }
 
