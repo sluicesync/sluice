@@ -366,6 +366,8 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 		shards:               shards,
 		copyTables:           reconnectScope,
 		copyTablesSeq:        seq,
+		concurrentCopy:       concurrent,
+		concurrentGroups:     concurrentGroups,
 		resumeSeed:           resumeSeed,
 		resumeSeedTable:      resumeSeedTable,
 		tableCopyComplete:    make(map[string]bool),
@@ -616,6 +618,30 @@ type vstreamSnapshotStream struct {
 	perStreamBytes []int64
 	perStreamCap   int64
 	tableStreamIdx map[string]int
+
+	// concurrentCopy is the immutable (set-at-construction, read-only)
+	// discriminator for the ADR-0099/0100 concurrent cross-table COPY path.
+	// True iff K > 1 streams were resolved (len(concurrentGroups) > 1). Read
+	// by [ReadRows] WITHOUT the lock to decide whether to skip the
+	// sequential-only activeTable bookkeeping (which W concurrent consumers
+	// would race-clobber); safe to read lock-free because it is never
+	// mutated after construction. Distinct from tableStreamIdx (which the
+	// pump populates under the lock AFTER the goroutine spawns, so reading it
+	// lock-free from ReadRows would data-race).
+	concurrentCopy bool
+
+	// concurrentGroups is the disjoint table partition the concurrent
+	// producer driver runs (ADR-0099), surfaced to the pipeline so it can
+	// run one read→write CONSUMER pipeline per group concurrently (ADR-0100,
+	// the write-side companion). It is EXACTLY the [][]string
+	// copyPumpAutoShardConcurrent partitions the producers into, so the
+	// consumer partition the pipeline reads ≡ the producer partition by
+	// construction (coverage + disjointness inherited, never re-derived). nil
+	// on every non-concurrent path (K = 1 / single-stream / one-table scope)
+	// — the pipeline then runs the serial table loop byte-identically. Set
+	// once at construction; read-only thereafter (surfaced via
+	// [vstreamSnapshotRows.ConcurrentCopyGroups]).
+	concurrentGroups [][]string
 
 	// reconnectMax is the in-place COPY-reconnect budget (Phase C):
 	// consecutive retriable Recv failures the pump absorbs before giving
@@ -2563,6 +2589,21 @@ func (r *vstreamSnapshotRows) Err() error {
 // the writer absorbs the overlap idempotently.
 func (r *vstreamSnapshotRows) CopyNeedsIdempotentWriter() bool { return true }
 
+// ConcurrentCopyGroups implements [ir.ConcurrentCopyPartitioner]
+// (ADR-0100). It returns the disjoint table partition the concurrent
+// producer driver runs (ADR-0099) so the pipeline can run one read→write
+// consumer pipeline per group CONCURRENTLY (W = K), instead of draining
+// every table through one serial consumer (the ~1.4× ceiling). The groups
+// are the EXACT [][]string copyPumpAutoShardConcurrent partitions the
+// producers into (stored at open), so the consumer partition ≡ the
+// producer partition — coverage + disjointness inherited from ADR-0099's
+// unit-pinned partition, never re-derived here. nil on every
+// non-concurrent path (K = 1 / single-stream / one-table scope); the
+// pipeline then runs the serial table loop byte-identically.
+func (r *vstreamSnapshotRows) ConcurrentCopyGroups() [][]string {
+	return r.snap.concurrentGroups
+}
+
 // ReadRows returns a channel that streams the rows the COPY pump
 // captures for table.Name AS THEY ARRIVE, then closes once the table's
 // queue is empty and the COPY phase has completed (or the pump hit a
@@ -2586,15 +2627,31 @@ func (r *vstreamSnapshotRows) ReadRows(ctx context.Context, table *ir.Table) (<-
 
 	// Mark this table active so the pump backpressures (rather than
 	// refuses) on its over-cap growth while we drain it.
-	s.mu.Lock()
-	s.activeTable = tableName
-	s.cond.Broadcast()
-	s.mu.Unlock()
+	//
+	// ADR-0100: activeTable governs ONLY the sequential single-stream
+	// interleave guard (enqueueRowLocked, gated on copyTablesSeq == 0). On
+	// the CONCURRENT path (tableStreamIdx != nil) W consumers call ReadRows
+	// at once and would race-clobber this single field — so we don't touch
+	// it there (the concurrent pump uses per-stream byte sub-budgets, never
+	// activeTable, so the field is dead state on that path). Skipping the
+	// write keeps activeTable's invariant clean (it always names the one
+	// active table on the sequential path) and avoids W goroutines fighting
+	// over one field for no purpose.
+	concurrent := s.concurrentCopy
+	if !concurrent {
+		s.mu.Lock()
+		s.activeTable = tableName
+		s.cond.Broadcast()
+		s.mu.Unlock()
+	}
 
 	out := make(chan ir.Row)
 	go func() {
 		defer close(out)
 		defer func() {
+			if concurrent {
+				return
+			}
 			s.mu.Lock()
 			if s.activeTable == tableName {
 				s.activeTable = ""

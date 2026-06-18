@@ -782,7 +782,20 @@ func runBulkCopyWithOpts(
 	// the same run keep the ADR-0072 mid-COPY checkpoint. See
 	// copyTableColdStartIdempotentParallel + the MySQL writer's
 	// WriteRowsIdempotentParallel for the full argument.
-	if needsIdempotent {
+	//
+	// ADR-0100: the durable watermark is wired ONLY when the serial table
+	// loop runs. When the engine surfaces a concurrent-copy partition (≥2
+	// disjoint groups → the W = K read→write pipelines below), the mid-COPY
+	// checkpoint MUST stay disabled: under W concurrent consumers the
+	// durable flushed-row frontier is not order-equivalent to any single
+	// stream's enqueue order, so a mid-COPY breadcrumb could checkpoint past
+	// an un-written early row → silent-loss-on-resume (the same ADR-0097 §3
+	// argument the D-way fan-out already obeys). So we resolve the concurrent
+	// partition FIRST and skip the watermark wiring entirely on that path.
+	// (The engine pump also records no mid-COPY breadcrumb on the concurrent
+	// path, so this is the second of two independent guards — ADR-0100 §6.)
+	concGroups := concurrentCopyGroups(rows)
+	if needsIdempotent && concGroups == nil {
 		if sink, ok := rows.(ir.CopyDurableProgressSink); ok {
 			if reporter, ok := rw.(ir.CopyDurableProgressReporter); ok {
 				reporter.SetCopyDurableProgress(sink.AdvanceDurableRows)
@@ -806,15 +819,44 @@ func runBulkCopyWithOpts(
 	// through to the serial idempotent copy otherwise — never silently
 	// no-ops.
 	fanoutDegree := resolveCopyFanoutDegree(opts.CopyFanoutDegree)
-	for _, table := range schema.Tables {
-		if needsIdempotent {
-			if err := copyTableColdStartIdempotentMaybeParallel(ctx, rows, rw, table, opts.Redactor, opts.Shard, fanoutDegree); err != nil {
+	// ADR-0100: WRITE-side cross-table concurrency. When the snapshot reader
+	// surfaces a disjoint concurrent-copy partition (the ADR-0099 VStream K
+	// concurrent producer streams → ≥2 groups), drive W = K consumer
+	// pipelines, one per group, each writing its group's tables (the
+	// ADR-0097 D-way fan-out composes per table → W × D). This removes the
+	// serial one-table-at-a-time consumer that capped ADR-0099 + ADR-0097 at
+	// ~1.4×. Always idempotent on this path (the partition only comes from
+	// the VStream reader, which declares CopyNeedsIdempotentWriter). When no
+	// partition is surfaced (PG / vanilla MySQL / single-stream VStream / K =
+	// 1), concGroups is nil and the serial loop below runs BYTE-IDENTICALLY.
+	if concGroups != nil {
+		if !needsIdempotent {
+			// Defensive: a partition without the idempotent declaration is a
+			// programming error (only the idempotent VStream reader surfaces
+			// one). Refuse loudly rather than concurrently plain-INSERT a
+			// re-emitting COPY stream (Bug 125).
+			return wrapWithHint(PhaseBulkCopy, errors.New(
+				"pipeline: reader surfaced a concurrent-copy partition but is not an idempotent copy reader "+
+					"(VStream COPY re-emits rows, Bug 125); refusing to concurrently plain-INSERT",
+			))
+		}
+		if err := runConcurrentTableCopy(ctx, concGroups, schema, rows, rw, opts.Redactor, opts.Shard, fanoutDegree); err != nil {
+			return err
+		}
+	} else {
+		if concurrentCopyDispatchObserver != nil {
+			concurrentCopyDispatchObserver(0) // serial path taken
+		}
+		for _, table := range schema.Tables {
+			if needsIdempotent {
+				if err := copyTableColdStartIdempotentMaybeParallel(ctx, rows, rw, table, opts.Redactor, opts.Shard, fanoutDegree); err != nil {
+					return wrapWithHint(PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", table.Name, err))
+				}
+				continue
+			}
+			if err := copyTable(ctx, rows, rw, table, opts.Redactor, opts.Shard); err != nil {
 				return wrapWithHint(PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", table.Name, err))
 			}
-			continue
-		}
-		if err := copyTable(ctx, rows, rw, table, opts.Redactor, opts.Shard); err != nil {
-			return wrapWithHint(PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", table.Name, err))
 		}
 	}
 	if !opts.SkipSchemaApply {

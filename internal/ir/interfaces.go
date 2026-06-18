@@ -556,6 +556,56 @@ type IdempotentCopyReader interface {
 	CopyNeedsIdempotentWriter() bool
 }
 
+// ConcurrentCopyPartitioner is the OPTIONAL surface a snapshot
+// [RowReader] implements to declare that its cold-start COPY may be
+// drained CONCURRENTLY across disjoint table groups (ADR-0100, the
+// WRITE-side companion to ADR-0099's K-independent-read-streams lever).
+//
+// ADR-0099 makes the VStream cold-copy READ side concurrent: K
+// independent vtgate VStreams, each over a DISJOINT subset of the
+// in-scope tables, all filling one shared per-table row buffer. But the
+// orchestrator's serial bulk-copy loop drains one table at a time, so
+// only one table is ever WRITTEN at a time — the measured ~1.4× ceiling
+// (the target PROCESSLIST showed exactly one table receiving rows). This
+// surface lets the engine hand the pipeline the EXACT disjoint partition
+// it gave the producers, so the pipeline can run one read→write consumer
+// pipeline per group concurrently (W = K), instead of one shared serial
+// consumer. Each group's producer fills its tables' queues; each group's
+// consumer drains+writes them — the 1:1 producer↔consumer-per-table
+// coupling (and ADR-0099's per-stream byte sub-budget) is preserved.
+//
+// The MySQL VStream snapshot reader implements it: it returns the same
+// groups [partitionTablesForStreams] produced at open (stored on the
+// snapshot stream), so producer partition ≡ consumer partition by
+// construction — the coverage + disjointness ADR-0099 unit-pins is
+// inherited, not re-derived. The pipeline type-asserts on this surface
+// during cold-start and, when it returns ≥2 groups, replaces the serial
+// table loop with a W-goroutine errgroup (one consumer per group). nil /
+// ≤1 group ⇒ the serial loop runs BYTE-IDENTICALLY (the zero-value-safe
+// default — K = 1 / single-stream / a one-table scope all surface no
+// groups).
+//
+// Readers that don't implement it (Postgres snapshot, MySQL binlog
+// snapshot, single-stream VStream) keep the serial cold-start loop.
+//
+// CORRECTNESS (silent-loss class): every in-scope table must appear in
+// EXACTLY ONE group — none dropped (a silently un-written table), none
+// duplicated (two consumers draining one queue). The pipeline relies on
+// this; the engine guarantees it via the disjoint partition it also gave
+// the producers.
+type ConcurrentCopyPartitioner interface {
+	RowReader
+
+	// ConcurrentCopyGroups returns the disjoint table groups the
+	// cold-start bulk copy may write CONCURRENTLY — one consumer pipeline
+	// per group, each group's tables drained serially within the group.
+	// Returns nil (or a single group) when no cross-table write
+	// concurrency is engaged, in which case the orchestrator runs the
+	// serial table loop unchanged. Names are unqualified (matching the
+	// COPY filter + ReadRows scope).
+	ConcurrentCopyGroups() [][]string
+}
+
 // IdempotentCopyWriter is the writer-side capability the cold-start
 // Bug-125 path requires before it will route a NO-PRIMARY-KEY table
 // through [IdempotentRowWriter.WriteRowsIdempotent]. A writer implements
