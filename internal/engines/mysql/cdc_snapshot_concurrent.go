@@ -249,7 +249,7 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 	// group (disjoint), and the ADR-0100 consumer drains each group serially
 	// within one goroutine, so each connection runs at most ONE SELECT at a
 	// time; the n goroutines run n SELECTs across n DISTINCT connections.
-	rows := newConcurrentBinlogRows(conns, groups, cfg.DBName)
+	rows := newConcurrentBinlogRows(conns, groups, cfg.DBName, db)
 
 	// Honest connection-budget surfacing (no false auto-clamp — ADR-0101 §5 /
 	// ADR-0102 §3). readers = W = the cross-table reader pipelines; each fans
@@ -323,8 +323,14 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 // concurrent path (ADR-0101 §6).
 // Compile-time guarantee that the native multi-snapshot reader satisfies the
 // work-stealing surface (roadmap 21a) in addition to the static partition one
-// — its N connections share one FTWRL cut, so any can read any table.
-var _ ir.WorkStealingCopyReader = (*concurrentBinlogRows)(nil)
+// — its N connections share one FTWRL cut, so any can read any table. It also
+// implements ir.RowCounter so the progress ticker gets a per-table ETA on the
+// concurrent path (the inner snapshot readers cannot — closer == nil no-ops
+// their CountRows — so the count runs on the side metaDB pool instead).
+var (
+	_ ir.WorkStealingCopyReader = (*concurrentBinlogRows)(nil)
+	_ ir.RowCounter             = (*concurrentBinlogRows)(nil)
+)
 
 type concurrentBinlogRows struct {
 	// byTable maps an unqualified table name to the inner RowReader (one per
@@ -341,13 +347,27 @@ type concurrentBinlogRows struct {
 	// groups is the disjoint table partition surfaced via
 	// ConcurrentCopyGroups (one group per inner reader, same index).
 	groups [][]string
+
+	// metaDB is the source connection POOL the N snapshot connections were
+	// pinned from (retained for the copy's lifetime — releaseRows closes it).
+	// CountRows runs the cheap information_schema.TABLE_ROWS estimate on a
+	// FRESH pooled connection here, NOT on a pinned snapshot connection: the
+	// inner snapshot readers (closer == nil) deliberately no-op CountRows
+	// because a concurrent metadata query on a connection that is actively
+	// streaming a table's rows would deadlock/error (one query per *sql.Conn).
+	// The estimate is catalog metadata — it does not need the snapshot — so a
+	// non-snapshot pooled connection is both correct and collision-free. The
+	// pool has no MaxOpenConns cap (openDB), so this never starves behind the
+	// N pinned connections.
+	metaDB *sql.DB
+	dbName string
 }
 
 // newConcurrentBinlogRows builds the router from the N pinned connections
 // and their disjoint groups. conns[i] serves groups[i]; len(conns) ==
 // len(groups). dbName is the source database (the single-database snapshot
 // path; reads are unqualified, byte-identical to the serial reader).
-func newConcurrentBinlogRows(conns []*sql.Conn, groups [][]string, dbName string) *concurrentBinlogRows {
+func newConcurrentBinlogRows(conns []*sql.Conn, groups [][]string, dbName string, metaDB *sql.DB) *concurrentBinlogRows {
 	readers := make([]*RowReader, len(conns))
 	byTable := make(map[string]*RowReader)
 	for i, c := range conns {
@@ -371,6 +391,8 @@ func newConcurrentBinlogRows(conns []*sql.Conn, groups [][]string, dbName string
 		byTable: byTable,
 		readers: readers,
 		groups:  groups,
+		metaDB:  metaDB,
+		dbName:  dbName,
 	}
 }
 
@@ -434,6 +456,30 @@ func (r *concurrentBinlogRows) ReadRowsOn(ctx context.Context, table *ir.Table, 
 		)
 	}
 	return r.readers[reader].ReadRows(ctx, table)
+}
+
+// CountRows implements [ir.RowCounter] so the progress ticker gets a per-table
+// ETA on the concurrent path. The inner snapshot readers deliberately no-op
+// CountRows (closer == nil — a metadata query on a connection actively
+// streaming a table would be a concurrent query on one *sql.Conn), so the
+// estimate runs on a FRESH connection from the side metaDB pool: it reads
+// information_schema.TABLE_ROWS — catalog metadata, the SAME cheap estimate the
+// serial RowReader uses (NOT an exact COUNT(*) scan), needing no snapshot and
+// never touching the pinned connections. A missing pool/dbName yields (0, nil):
+// an honest "no estimate" (the ticker shows rows-copied without a %/ETA) rather
+// than a wrong total.
+func (r *concurrentBinlogRows) CountRows(ctx context.Context, table *ir.Table) (int64, error) {
+	if table == nil || r.metaDB == nil || r.dbName == "" {
+		return 0, nil
+	}
+	const q = `SELECT COALESCE(TABLE_ROWS, 0)
+	      FROM information_schema.tables
+	      WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?`
+	var n int64
+	if err := r.metaDB.QueryRowContext(ctx, q, r.dbName, table.Name).Scan(&n); err != nil {
+		return 0, fmt.Errorf("mysql: concurrent CountRows estimate for %q: %w", table.Name, err)
+	}
+	return n, nil
 }
 
 // Close releases the inner readers. In snapshot mode each inner reader's

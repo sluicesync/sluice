@@ -53,6 +53,14 @@ func (r *wsConcReader) ConcurrentCopyGroups() [][]string { return r.groups }
 func (r *wsConcReader) ConcurrentReaderCount() int       { return r.n }
 func (r *wsConcReader) Err() error                       { return nil }
 
+// CountRows models the native reader's ir.RowCounter estimate (served off a
+// side metadata pool in production); here it returns the seeded row count.
+func (r *wsConcReader) CountRows(_ context.Context, table *ir.Table) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return int64(len(r.rows[table.Name])), nil
+}
+
 // ReadRows is the static-partition entry point — it MUST NOT be called on the
 // work-stealing path; we flag it so the test can assert the path taken.
 func (r *wsConcReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.Row, error) {
@@ -216,4 +224,47 @@ func TestRunConcurrentTableCopy_WorkStealing_CrossesGroupBoundary(t *testing.T) 
 	if !crossed {
 		t.Errorf("no reader crossed the static group boundary — work-stealing did not redistribute; reads = %v", reader.readsByIdx)
 	}
+}
+
+// TestPinnedRowReader_ForwardsCountRows pins that the work-stealing adapter
+// forwards the underlying reader's row-count estimate (so the per-table ETA
+// works on the work-stealing path), and degrades to (0, nil) when the reader
+// does not implement ir.RowCounter.
+func TestPinnedRowReader_ForwardsCountRows(t *testing.T) {
+	rowsPer := map[string]int{"t": 42}
+	reader := newWSConcReader([][]string{{"t"}}, 2, rowsPer)
+	p := pinnedRowReader{ws: reader, idx: 1}
+
+	got, err := p.CountRows(context.Background(), concTable("t"))
+	if err != nil {
+		t.Fatalf("CountRows: %v", err)
+	}
+	if got != 42 {
+		t.Errorf("forwarded count = %d; want 42", got)
+	}
+
+	// A reader that does not implement ir.RowCounter → graceful (0, nil).
+	bare := pinnedRowReader{ws: &bareWS{n: 2}, idx: 0}
+	if got, err := bare.CountRows(context.Background(), concTable("t")); err != nil || got != 0 {
+		t.Errorf("non-RowCounter reader: got (%d, %v); want (0, nil)", got, err)
+	}
+}
+
+// bareWS is a minimal ir.WorkStealingCopyReader with NO ir.RowCounter, used to
+// pin pinnedRowReader.CountRows's graceful fallback.
+type bareWS struct{ n int }
+
+func (b *bareWS) ConcurrentCopyGroups() [][]string { return [][]string{{"t"}, {"u"}} }
+func (b *bareWS) ConcurrentReaderCount() int       { return b.n }
+func (b *bareWS) Err() error                       { return nil }
+func (b *bareWS) ReadRows(context.Context, *ir.Table) (<-chan ir.Row, error) {
+	ch := make(chan ir.Row)
+	close(ch)
+	return ch, nil
+}
+
+func (b *bareWS) ReadRowsOn(context.Context, *ir.Table, int) (<-chan ir.Row, error) {
+	ch := make(chan ir.Row)
+	close(ch)
+	return ch, nil
 }

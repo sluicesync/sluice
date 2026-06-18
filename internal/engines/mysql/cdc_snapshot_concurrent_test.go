@@ -90,7 +90,7 @@ func TestConcurrentBinlogRows_DispatchByGroup(t *testing.T) {
 	// and indexes the groups, and the paths we assert (absent/nil table)
 	// return BEFORE dereferencing any connection. The present-table query
 	// path is covered by the integration test against a real DB.
-	rr := newConcurrentBinlogRows(nil, groups, "db")
+	rr := newConcurrentBinlogRows(nil, groups, "db", nil)
 
 	if got := rr.ConcurrentCopyGroups(); len(got) != 2 {
 		t.Fatalf("ConcurrentCopyGroups len = %d; want 2", len(got))

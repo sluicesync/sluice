@@ -310,15 +310,33 @@ func runWorkStealingTableCopy(
 // work-stealing pipeline can drive the existing per-table copy helpers (which
 // take an ir.RowReader and call ReadRows) while reading on its own pinned
 // connection. Err delegates to the underlying reader (shared across all
-// connections); the native concurrent reader does not implement ir.RowCounter,
-// so there is no ETA estimate to forward (parity with the static path).
+// connections); CountRows forwards the underlying reader's row-count estimate
+// (the native concurrent reader implements ir.RowCounter via a side metadata
+// pool — collision-free with the pinned reads — so the work-stealing pipeline's
+// progress ticker gets a per-table ETA).
 type pinnedRowReader struct {
 	ws  ir.WorkStealingCopyReader
 	idx int
 }
+
+// Compile-time guarantee the adapter forwards the row-count surface so
+// kickOffRowCount's ir.RowCounter assertion succeeds on the work-stealing path.
+var _ ir.RowCounter = pinnedRowReader{}
 
 func (p pinnedRowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.Row, error) {
 	return p.ws.ReadRowsOn(ctx, table, p.idx)
 }
 
 func (p pinnedRowReader) Err() error { return p.ws.Err() }
+
+// CountRows forwards the underlying reader's per-table row-count ESTIMATE so the
+// progress ticker can show a %/ETA on the work-stealing path. The native
+// concurrent reader runs it on a side metadata pool (not the pinned snapshot
+// connections), so it never collides with this pipeline's active read. A reader
+// that doesn't implement ir.RowCounter yields (0, nil) — graceful no-ETA.
+func (p pinnedRowReader) CountRows(ctx context.Context, table *ir.Table) (int64, error) {
+	if rc, ok := p.ws.(ir.RowCounter); ok {
+		return rc.CountRows(ctx, table)
+	}
+	return 0, nil
+}
