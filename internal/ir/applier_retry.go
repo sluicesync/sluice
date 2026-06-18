@@ -42,3 +42,39 @@ type RetriableError interface {
 	// that sometimes carry a retry-after signal.
 	RetryHint() time.Duration
 }
+
+// TransactionKilledError is the optional surface a [RetriableError]
+// can additionally implement to tell the AIMD apply-batch-size
+// controller (ADR-0052) that the failure was a server-side
+// transaction-killer abort — a Vitess vttablet `code = Aborted ...
+// for tx killer rollback` (MySQL Error 1105), or any future engine
+// whose server enforces a wall-clock transaction killer
+// ([Capabilities.TransactionKiller]).
+//
+// Such an abort is unambiguous evidence that the batch was too large
+// to commit within the target's transaction-timeout window: the whole
+// transaction was rolled back server-side. Unlike a generic transient
+// (a deadlock victim, a connection blip), repeating the SAME large
+// batch will be killed again. The controller treats this as a STRONG,
+// IMMEDIATE multiplicative-decrease signal (halve the next batch at
+// once, bypassing the generic retry-rate accumulator's threshold) so
+// successive attempts converge on a batch small enough to commit
+// before the killer fires — instead of exhausting the ADR-0038 retry
+// budget at a fixed large size and dying (the v0.99.69 live finding).
+//
+// The signal is engine-neutral: the controller checks for this surface
+// via [errors.As] without importing any engine package, mirroring the
+// way it checks [RetriableError]. An error that implements this MUST
+// also implement [RetriableError] with Retriable()==true — a tx-killer
+// abort is always retriable (the rollback already happened, so the
+// re-apply is clean and idempotent per ADR-0010).
+type TransactionKilledError interface {
+	RetriableError
+
+	// TransactionKilled reports whether this error is a server-side
+	// transaction-killer abort. Implementations that set the flag
+	// conditionally (only some Error 1105 shapes are tx-killer aborts)
+	// return the per-error verdict; the bare presence of the method
+	// is not itself the signal.
+	TransactionKilled() bool
+}

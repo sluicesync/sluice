@@ -160,6 +160,51 @@ ADR-0038's existing exponential backoff inside the retry policy is
 unchanged; the AIMD controller observes the OUTCOME (retriable error
 fired) not the retry machinery itself.
 
+#### Transaction-killer aborts are a STRONG, IMMEDIATE shrink (v0.99.69)
+
+The threshold-of-3 dampening above is correct for *generic* transients
+(a deadlock victim, a connection blip) — a same-size retry usually
+clears those. But it is wrong for a **server-side transaction-killer
+abort** (Vitess vttablet `code = Aborted ... for tx killer rollback`,
+MySQL Error 1105): that abort is unambiguous evidence the batch was too
+large to commit inside the target's tx-timeout window, so a same-size
+retry will be killed again. The live v0.99.69 finding (Track B,
+PlanetScale-MySQL `lst-mysql-b`) was a CDC stream dying because every
+retry re-submitted a ~1000-row batch that the tx-killer rolled back —
+exhausting the ADR-0038 budget at the ceiling. Two things made the
+dampening ineffective there: (1) one tx-killer abort is fatal to the
+`runOnce` attempt, so tx-killer aborts never *accumulate* to the
+threshold before the run dies and the controller is torn down; (2) the
+controller is reconstructed per `runOnce`, so any shrink it did apply
+was discarded on the streamer-level retry restart.
+
+The fix gives a tx-killer abort its own surface,
+`ir.TransactionKilledError` (an optional extension of
+`ir.RetriableError`; the MySQL classifier sets it only for the
+"tx killer" 1105 shape, NOT for the other retriable 1105 codes a
+same-size retry rides out). When the controller observes it, it
+multiplicative-decreases **immediately** — bypassing the threshold —
+and a new `Config.OnShrink` hook persists the shrunk size into a
+`Streamer`-level field so the next `runOnce` attach **resumes at the
+shrunk size instead of the ceiling**. Successive restarts therefore
+converge (1000 → 500 → 250 → …) on a batch small enough to commit,
+rather than dying at a fixed large size.
+
+**No explicit batch-splitting path is added.** The AIMD shrink + the
+existing ADR-0010 warm-resume re-apply *is* the split: a tx-killed
+batch was rolled back server-side (Vitess `Aborted` = rolled back), so
+the persisted position never advanced past the previous successful
+commit (the position write rides the batch tx — ADR-0007); the retry
+warm-resumes from there and re-applies the SAME source changes, in
+source order, now grouped into smaller batches by the shrunk controller.
+Per-row idempotency (upsert for keyed tables) is unchanged, so re-apply
+is exactly-once across the rollback+retry+regroup — reusing the proven
+warm-resume path rather than introducing a new split codec that could
+break ordering or idempotency. The pathological floor case (even a
+1-row batch is tx-killed) cannot shrink below the floor of 1 and is
+bounded by ADR-0038's retry budget into a loud terminal failure naming
+the tx-killer — never an infinite spin.
+
 ### Interaction with ADR-0017 conservative-default
 
 ADR-0017's conservative-default of `--apply-batch-size=1` is

@@ -802,6 +802,26 @@ type Streamer struct {
 	// the retry/recovery loop without booting a full pipeline.
 	runOnceFn func(context.Context) error
 
+	// aimdResumeSize carries the AIMD controller's shrunk batch size
+	// ACROSS runOnce restarts within one Run (the v0.99.69
+	// sustained-tx-killer fix). The controller is constructed per
+	// runOnce (maybeAttachAIMDController), so a tx-killer abort that
+	// propagates out of runOnce to the ADR-0038 streamer-level retry
+	// loop would otherwise discard the shrink and re-attach a fresh
+	// controller at the ceiling — re-submitting the same too-large
+	// batch that was just killed, exhausting the retry budget. The
+	// controller's OnShrink hook stores the post-MD size here; the
+	// NEXT maybeAttachAIMDController reads it as the new InitialSize so
+	// the re-applied batch starts small and converges. atomic because
+	// OnShrink fires from the apply goroutine while the next runOnce
+	// reads it from the retry-loop goroutine. Zero = "no prior shrink;
+	// start at the ceiling" — the natural cold-start default. Never
+	// grows back to the ceiling on its own: a healthy stream's AI
+	// re-climbs within the live controller, and the next-run InitialSize
+	// is clamped to [1, ceiling] so this can never exceed the operator's
+	// --apply-batch-size cap.
+	aimdResumeSize atomic.Int64
+
 	// leaseMgr is the ADR-0054 Shape A Phase 2 live-coordination
 	// lease manager. Constructed by [engageShardCoordination] when
 	// [CoordinateLiveDDL] is true, [InjectShardColumn] is engaged,

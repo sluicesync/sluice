@@ -147,6 +147,69 @@ func TestStreamer_MaybeAttachAIMDController_SkipsEngineWithoutSetters(t *testing
 	}
 }
 
+// txKilledFake is the engine-neutral tx-killer error shape (satisfies
+// ir.TransactionKilledError) used to drive the controller's immediate
+// MD from the streamer-level pin.
+type txKilledFake struct{ msg string }
+
+func (e txKilledFake) Error() string            { return e.msg }
+func (e txKilledFake) Retriable() bool          { return true }
+func (e txKilledFake) RetryHint() time.Duration { return 0 }
+func (e txKilledFake) TransactionKilled() bool  { return true }
+
+// TestStreamer_AIMDResumeSizePersistsAcrossRunOnce pins the v0.99.69
+// cross-runOnce convergence: when a tx-killer abort shrinks the
+// controller in one runOnce attempt, the NEXT maybeAttachAIMDController
+// (a streamer-level retry restart) resumes at the shrunk size, not the
+// ceiling. Without this the retry re-submits the same too-large batch
+// and exhausts the budget.
+func TestStreamer_AIMDResumeSizePersistsAcrossRunOnce(t *testing.T) {
+	s := &Streamer{
+		Target:         &namedEngine{name: "planetscale"},
+		ApplyBatchSize: 1000,
+		AutoTune:       true,
+	}
+	ctx := context.Background()
+
+	// --- runOnce attempt #1: attach, then a tx-killer abort fires. ---
+	a1 := &fakeAIMDApplier{}
+	ctrl1 := s.maybeAttachAIMDController(ctx, a1, "stream")
+	if ctrl1 == nil {
+		t.Fatal("attempt 1: expected controller")
+	}
+	if got := a1.provider.NextBatchSize(); got != 1000 {
+		t.Fatalf("attempt 1 initial size = %d; want 1000 (ceiling, no prior shrink)", got)
+	}
+	// The tx-killer abort that propagates out of runOnce — observed via
+	// the controller's BatchObserver surface, fired from the apply path.
+	ctrl1.ObserveBatch(ctx, 100*time.Millisecond, 1000, txKilledFake{msg: "tx killer rollback"})
+	if got := a1.provider.NextBatchSize(); got != 500 {
+		t.Fatalf("attempt 1 post-tx-killer size = %d; want 500 (immediate MD)", got)
+	}
+
+	// --- runOnce attempt #2: streamer-level retry reconstructs the
+	// controller. It MUST resume at 500, not the 1000 ceiling. ---
+	a2 := &fakeAIMDApplier{}
+	ctrl2 := s.maybeAttachAIMDController(ctx, a2, "stream")
+	if ctrl2 == nil {
+		t.Fatal("attempt 2: expected controller")
+	}
+	if got := a2.provider.NextBatchSize(); got != 500 {
+		t.Fatalf("attempt 2 resume size = %d; want 500 (shrunk size persisted across runOnce)", got)
+	}
+	// A further tx-killer on attempt 2 shrinks again from 500 → 250,
+	// and a hypothetical attempt 3 would resume at 250 — successive
+	// restarts converge instead of dying at the ceiling.
+	ctrl2.ObserveBatch(ctx, 100*time.Millisecond, 500, txKilledFake{msg: "tx killer rollback"})
+	a3 := &fakeAIMDApplier{}
+	if ctrl3 := s.maybeAttachAIMDController(ctx, a3, "stream"); ctrl3 == nil {
+		t.Fatal("attempt 3: expected controller")
+	}
+	if got := a3.provider.NextBatchSize(); got != 250 {
+		t.Fatalf("attempt 3 resume size = %d; want 250 (convergence across restarts)", got)
+	}
+}
+
 func TestStreamer_ResolveAIMDTargetLatency_EngineDefaults(t *testing.T) {
 	cases := []struct {
 		engine string

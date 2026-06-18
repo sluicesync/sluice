@@ -37,6 +37,21 @@ func (e retriableErr) Unwrap() error            { return e.inner }
 func (e retriableErr) Retriable() bool          { return true }
 func (e retriableErr) RetryHint() time.Duration { return 0 }
 
+// txKilledErr is a minimal stand-in for ir.TransactionKilledError —
+// the shape the MySQL classifier produces for a Vitess tx-killer
+// abort. Same engine-neutrality reasoning as retriableErr: the
+// controller's isTxKilledError walk only needs the structural shape.
+type txKilledErr struct {
+	inner  error
+	killed bool
+}
+
+func (e txKilledErr) Error() string            { return e.inner.Error() }
+func (e txKilledErr) Unwrap() error            { return e.inner }
+func (e txKilledErr) Retriable() bool          { return true }
+func (e txKilledErr) RetryHint() time.Duration { return 0 }
+func (e txKilledErr) TransactionKilled() bool  { return e.killed }
+
 func mustController(t *testing.T, cfg Config) *Controller {
 	t.Helper()
 	c, err := New(cfg)
@@ -375,6 +390,118 @@ func TestController_ByteCapHintRateLimited(t *testing.T) {
 	c.mu.Unlock()
 	if !third.After(first) {
 		t.Fatalf("third NoteByteCapDominant did not advance lastByteCapHint after window expiry")
+	}
+}
+
+// TestController_TxKillerImmediateMD pins the v0.99.69 fix: a single
+// transaction-killer abort triggers an IMMEDIATE multiplicative
+// decrease, bypassing the generic retry-rate threshold-of-3. Without
+// this, a sustained tx-killer load re-submits the same too-large batch
+// every retry and exhausts the budget.
+func TestController_TxKillerImmediateMD(t *testing.T) {
+	c := mustController(t, Config{
+		StreamID:                "s",
+		Floor:                   1,
+		Ceiling:                 1000,
+		InitialSize:             1000,
+		TargetLatency:           5 * time.Second,
+		RetriableErrorThreshold: 3,
+		RetriableErrorWindow:    time.Minute,
+	})
+	ctx := context.Background()
+	// One tx-killer abort. rows>0 because the kill fires at commit
+	// after the batch dispatched its rows (the real shape).
+	c.ObserveBatch(ctx, 100*time.Millisecond, 1000, txKilledErr{inner: errors.New("tx killer rollback"), killed: true})
+	if got := c.NextBatchSize(); got != 500 {
+		t.Fatalf("after ONE tx-killer abort NextBatchSize = %d; want 500 (immediate MD, no threshold wait)", got)
+	}
+	if snap := c.Snapshot(); snap.DecreasesTotal != 1 || !snap.InCoolOff {
+		t.Fatalf("after tx-killer MD: DecreasesTotal=%d InCoolOff=%v; want 1, true", snap.DecreasesTotal, snap.InCoolOff)
+	}
+	// A second tx-killer abort halves again — successive kills converge
+	// toward a size that commits.
+	c.ObserveBatch(ctx, 100*time.Millisecond, 500, txKilledErr{inner: errors.New("tx killer rollback"), killed: true})
+	if got := c.NextBatchSize(); got != 250 {
+		t.Fatalf("after second tx-killer abort NextBatchSize = %d; want 250", got)
+	}
+}
+
+// TestController_TxKillerCapableButNotKilledNoMD pins that an error
+// implementing the tx-killer surface with killed==false (a non-killer
+// retriable 1105 shape, e.g. a primary stepping down) does NOT force
+// the immediate shrink — a same-size retry rides it out. It still
+// counts toward the generic retry-rate accumulator.
+func TestController_TxKillerCapableButNotKilledNoMD(t *testing.T) {
+	now := time.Now()
+	clk := func() time.Time { return now }
+	c := mustController(t, Config{
+		StreamID:                "s",
+		Floor:                   1,
+		Ceiling:                 1000,
+		InitialSize:             1000,
+		TargetLatency:           5 * time.Second,
+		RetriableErrorThreshold: 3,
+		RetriableErrorWindow:    time.Minute,
+		Now:                     clk,
+	})
+	ctx := context.Background()
+	notKilled := txKilledErr{inner: errors.New("vttablet code = Aborted (failover)"), killed: false}
+	// Three of them: equal to threshold, no MD yet (generic accumulator
+	// path, not the immediate tx-killer path).
+	for i := 0; i < 3; i++ {
+		c.ObserveBatch(ctx, time.Millisecond, 0, notKilled)
+	}
+	if got := c.NextBatchSize(); got != 1000 {
+		t.Fatalf("3 non-killer retriables (== threshold) NextBatchSize = %d; want 1000 (no immediate MD, accumulator not yet over)", got)
+	}
+	// The fourth trips the generic accumulator (> threshold).
+	c.ObserveBatch(ctx, time.Millisecond, 0, notKilled)
+	if got := c.NextBatchSize(); got != 500 {
+		t.Fatalf("4 non-killer retriables (> threshold) NextBatchSize = %d; want 500 (generic accumulator MD)", got)
+	}
+}
+
+// TestController_OnShrinkPersistsSize pins that OnShrink fires with the
+// post-MD size on every decrease — the cross-runOnce persistence hook
+// the streamer wires for the tx-killer convergence (v0.99.69).
+func TestController_OnShrinkPersistsSize(t *testing.T) {
+	var got []int
+	c := mustController(t, Config{
+		StreamID:      "s",
+		Floor:         1,
+		Ceiling:       1000,
+		InitialSize:   1000,
+		TargetLatency: 5 * time.Second,
+		OnShrink:      func(newSize int) { got = append(got, newSize) },
+	})
+	ctx := context.Background()
+	c.ObserveBatch(ctx, 100*time.Millisecond, 1000, txKilledErr{inner: errors.New("tx killer rollback"), killed: true})
+	c.ObserveBatch(ctx, 100*time.Millisecond, 500, txKilledErr{inner: errors.New("tx killer rollback"), killed: true})
+	if len(got) != 2 || got[0] != 500 || got[1] != 250 {
+		t.Fatalf("OnShrink calls = %v; want [500 250]", got)
+	}
+}
+
+// TestController_TxKillerFloorsAtOne pins the pathological case: a batch
+// already at the floor that keeps getting tx-killed cannot shrink below
+// 1 (the controller can't make progress on its own). The streamer's
+// ADR-0038 retry budget bounds this to a loud terminal failure rather
+// than an infinite spin; the controller's contract here is only that it
+// never produces a sub-floor size.
+func TestController_TxKillerFloorsAtOne(t *testing.T) {
+	c := mustController(t, Config{
+		StreamID:      "s",
+		Floor:         1,
+		Ceiling:       1000,
+		InitialSize:   1,
+		TargetLatency: 5 * time.Second,
+	})
+	ctx := context.Background()
+	for i := 0; i < 5; i++ {
+		c.ObserveBatch(ctx, 100*time.Millisecond, 1, txKilledErr{inner: errors.New("tx killer rollback"), killed: true})
+		if got := c.NextBatchSize(); got != 1 {
+			t.Fatalf("tx-killer at floor: NextBatchSize = %d; want 1 (floored, never sub-floor)", got)
+		}
 	}
 }
 

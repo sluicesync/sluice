@@ -98,13 +98,34 @@ func (s *Streamer) maybeAttachAIMDController(ctx context.Context, applier ir.Cha
 		target = resolveAIMDTargetLatency(s.targetCapsForAIMD())
 	}
 
+	// Resume from the shrunk size if a prior runOnce attempt this Run
+	// already multiplicative-decreased (the v0.99.69 sustained-tx-killer
+	// fix). Zero (the cold-start default) starts at the ceiling. The
+	// stored value is always within [1, ceiling] by construction, but
+	// clamp defensively so an unexpected value can never exceed the
+	// operator's --apply-batch-size cap.
+	initial := s.ApplyBatchSize
+	if resume := int(s.aimdResumeSize.Load()); resume > 0 && resume < initial {
+		initial = resume
+		slog.InfoContext(
+			ctx, "applier: AIMD resuming at shrunk batch size after a prior transaction-killer decrease this run",
+			slog.String("stream_id", streamID),
+			slog.Int("resume_size", initial),
+			slog.Int("ceiling", s.ApplyBatchSize),
+		)
+	}
+
 	cfg := appliercontrol.Config{
 		StreamID:      streamID,
 		EngineName:    s.engineNameForAIMD(),
 		Floor:         1,
 		Ceiling:       s.ApplyBatchSize,
-		InitialSize:   s.ApplyBatchSize,
+		InitialSize:   initial,
 		TargetLatency: target,
+		// Persist every multiplicative decrease so the shrunk size
+		// survives a runOnce restart driven by a tx-killer abort. See
+		// the aimdResumeSize field doc for the cross-attempt lifecycle.
+		OnShrink: func(newSize int) { s.aimdResumeSize.Store(int64(newSize)) },
 	}
 	ctrl, err := appliercontrol.New(cfg)
 	if err != nil {
