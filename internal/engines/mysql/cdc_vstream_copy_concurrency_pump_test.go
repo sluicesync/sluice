@@ -107,6 +107,11 @@ func newConcurrentHarness(t *testing.T, tables []string, k int, byTable map[stri
 	s.copyDone = make(chan struct{})
 
 	groups := partitionTablesForStreams(tables, k, nil)
+	// Mirror the constructor (ADR-0100): the concurrent path sets these so
+	// ReadRows skips the sequential-only activeTable bookkeeping and the
+	// reader can surface the partition to the pipeline.
+	s.concurrentCopy = len(groups) > 1
+	s.concurrentGroups = groups
 
 	stream := &ir.SnapshotStream{
 		Rows:    &vstreamSnapshotRows{snap: s},
