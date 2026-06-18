@@ -179,6 +179,98 @@ func (w *RowWriter) WriteRowsIdempotentParallel(ctx context.Context, table *ir.T
 	return firstEr
 }
 
+// WriteRowsParallel implements [ir.ParallelCopyWriter] (ADR-0102): the
+// WRITE-side fan-out for the PLAIN-INSERT (gap-free, fresh-target) cold-copy
+// — the native-MySQL concurrent cold-copy lever (ADR-0101). It is the
+// plain-INSERT mirror of [WriteRowsIdempotentParallel]: one worker goroutine
+// per supplied channel, each pinning its OWN connection from the shared
+// *sql.DB pool and running the same [writeBatchedConn] plain core the serial
+// path runs — so per-row value fidelity and the Vector-B warning probe are
+// byte-identical to the serial path; fan-out changes only how many
+// connections carry the load.
+//
+// Correctness contract (the load-bearing part — identical to the idempotent
+// fan-out except the absence of upsert):
+//   - The PIPELINE owns the PK-hash partition that routed each row to
+//     exactly one of these channels (no drop/dup); this method owns only
+//     the N-worker execution. Plain INSERT is safe under fan-out because the
+//     source is a gap-free snapshot onto a FRESH target (ADR-0102 §2): no
+//     re-emission, no overlap, nothing for two workers to collide on.
+//   - It returns only AFTER every worker has drained its channel and durably
+//     committed its final batch (the join below) — so the orchestrator
+//     advances no position until every row is durable (ADR-0007).
+//   - The first worker error cancels a shared child context so the other
+//     workers (and the pipeline's reader) unwind; the first error is
+//     returned (loud abort, no partial silent success).
+//   - On ctx cancel every worker's loop selects on ctx.Done() and exits;
+//     each worker's pinned conn is Closed in its own defer, so no goroutine
+//     or connection leaks.
+//
+// There is NO mid-COPY durable-progress watermark on the plain path (plain
+// INSERT carries no CopyDurableProgressReporter wiring), so — like the
+// idempotent fan-out — the whole-table join is the SOLE durability guarantee
+// for a fanned-out table; the orchestrator's final position persistence
+// fires only after this returns nil. The native concurrent path that drives
+// this never wires a mid-COPY cursor anyway (ADR-0101 §7 / ADR-0102 §5).
+func (w *RowWriter) WriteRowsParallel(ctx context.Context, table *ir.Table, workers []<-chan ir.Row) error {
+	if table == nil {
+		return errors.New("mysql: WriteRowsParallel: table is nil")
+	}
+	if len(table.Columns) == 0 {
+		return fmt.Errorf("mysql: WriteRowsParallel: table %q has no columns", table.Name)
+	}
+	if len(workers) == 0 {
+		return errors.New("mysql: WriteRowsParallel: no worker channels")
+	}
+	for i, ch := range workers {
+		if ch == nil {
+			return fmt.Errorf("mysql: WriteRowsParallel: worker channel %d is nil", i)
+		}
+	}
+
+	// A single worker is just the serial core — no fan-out machinery needed
+	// (the pipeline only calls this with len==1 on the degenerate path).
+	if len(workers) == 1 {
+		conn, err := w.db.Conn(ctx)
+		if err != nil {
+			return fmt.Errorf("mysql: batched insert into %q: pin connection: %w", table.Name, err)
+		}
+		defer func() { _ = conn.Close() }()
+		return w.writeBatchedConn(ctx, conn, table, workers[0])
+	}
+
+	// Shared child ctx: the first worker error cancels it so peers (and the
+	// pipeline's reader, which selects on the same parent ctx via the caller)
+	// unwind deterministically.
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var (
+		wg      sync.WaitGroup
+		errOnce sync.Once
+		firstEr error
+	)
+	for _, ch := range workers {
+		wg.Add(1)
+		go func(rows <-chan ir.Row) {
+			defer wg.Done()
+			conn, err := w.db.Conn(workerCtx)
+			if err != nil {
+				errOnce.Do(func() { firstEr = fmt.Errorf("mysql: batched insert into %q: pin connection: %w", table.Name, err) })
+				cancel()
+				return
+			}
+			defer func() { _ = conn.Close() }()
+			if err := w.writeBatchedConn(workerCtx, conn, table, rows); err != nil {
+				errOnce.Do(func() { firstEr = err })
+				cancel()
+			}
+		}(ch)
+	}
+	wg.Wait()
+	return firstEr
+}
+
 // writeBatchedIdempotent is the upsert-form of [writeBatched]. The
 // per-batch flush mechanics are identical (flush on whichever of
 // row-count cap and byte-size cap fires first; ADR-0028); only the

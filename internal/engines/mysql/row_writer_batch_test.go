@@ -284,6 +284,41 @@ func TestWriteRowsIdempotentParallel_Guards(t *testing.T) {
 	}
 }
 
+// TestWriteRowsParallel_Guards: the ADR-0102 plain fan-out writer's shape
+// guards fire before any connection is pinned (no DB needed). Unlike the
+// idempotent variant there is NO keyless refusal — the plain path copies a
+// no-PK table fine (it just doesn't fan it out; the pipeline routes a no-PK
+// table to the single-writer path before reaching here).
+func TestWriteRowsParallel_Guards(t *testing.T) {
+	w := &RowWriter{bulkLoad: ir.BulkLoadBatchedInsert}
+	pkTable := &ir.Table{
+		Name:       "users",
+		Columns:    []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+	}
+	ch := make(chan ir.Row)
+	close(ch)
+
+	if err := w.WriteRowsParallel(context.Background(), nil, []<-chan ir.Row{ch}); err == nil {
+		t.Error("nil table: want error")
+	}
+	if err := w.WriteRowsParallel(context.Background(), &ir.Table{Name: "x"}, []<-chan ir.Row{ch}); err == nil {
+		t.Error("no columns: want error")
+	}
+	if err := w.WriteRowsParallel(context.Background(), pkTable, nil); err == nil {
+		t.Error("no worker channels: want error")
+	}
+	if err := w.WriteRowsParallel(context.Background(), pkTable, []<-chan ir.Row{nil}); err == nil {
+		t.Error("nil worker channel: want error")
+	}
+}
+
+// Capability surface pin (ADR-0102): *RowWriter satisfies
+// ir.ParallelCopyWriter so the pipeline's type-assert engages the plain
+// fan-out. A compile-time assertion — if the method signature drifts, the
+// build breaks here.
+var _ ir.ParallelCopyWriter = (*RowWriter)(nil)
+
 func TestPrimaryKeyColumns(t *testing.T) {
 	table := &ir.Table{
 		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{

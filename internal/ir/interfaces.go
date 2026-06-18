@@ -678,6 +678,54 @@ type ParallelIdempotentCopyWriter interface {
 	WriteRowsIdempotentParallel(ctx context.Context, table *Table, workers []<-chan Row) error
 }
 
+// ParallelCopyWriter is the OPTIONAL writer capability that enables
+// WRITE-side fan-out on the PLAIN-INSERT cold-start copy (ADR-0102) —
+// the gap-free, fresh-target analogue of [ParallelIdempotentCopyWriter].
+// It is the lever for the native-MySQL concurrent cold-copy (ADR-0101):
+// each of the W concurrent table pipelines fans its active table's writes
+// across D plain-INSERT workers → W × D, closing the remaining throughput
+// gap to the VStream W × D ceiling on a cross-region PS-MySQL target where
+// a single batched-INSERT connection is RTT-bound (vtgate blocks LOAD DATA
+// LOCAL INFILE).
+//
+// It mirrors [ParallelIdempotentCopyWriter] exactly EXCEPT the write core:
+// plain INSERT, not upsert. Plain INSERT is correct here because the native
+// concurrent path is a gap-free snapshot (each row read exactly once from a
+// frozen REPEATABLE-READ view, no re-emission) onto a FRESH target (the
+// cold-start-from-scratch path resets a populated target first), and the
+// disjoint partition + PK-hash routing means every row is written by
+// exactly one worker — no overlap, nothing to absorb. (Contrast the
+// idempotent surface, which exists precisely because the VStream COPY
+// re-emits rows, Bug 125.)
+//
+// The pipeline owns the reader goroutine + the PK-hash partition that
+// routes every row to EXACTLY ONE of the supplied per-worker channels (no
+// drop, no dup — the same [partitionRowsByPK] the idempotent fan-out uses).
+// The writer owns only the N-worker execution: one goroutine per channel,
+// each pinning its own target connection and running the engine's existing
+// PLAIN batched-INSERT core, returning only after EVERY worker has drained
+// and DURABLY committed (the ADR-0007 position-handoff guard). Any worker
+// error aborts the copy loudly; a ctx cancel unwinds every worker and leaks
+// no goroutine or connection.
+//
+// The MySQL target implements it. Postgres does not (its eligible
+// cold-start copy uses the fast raw-COPY / parallel snapshot path,
+// ADR-0079). The pipeline type-asserts on this surface and, when present
+// with a usable partition key and a degree > 1, fans out; otherwise it
+// falls through to the serial single-writer [RowWriter.WriteRows] — never
+// silently doing nothing.
+type ParallelCopyWriter interface {
+	RowWriter
+
+	// WriteRowsParallel runs the PLAIN batched-INSERT copy over
+	// len(workers) concurrent workers, each consuming one of the supplied
+	// per-worker channels and pinning its own target connection. Returns
+	// only after every worker has drained and durably committed, or the
+	// first worker error (loudly), or the ctx error on cancel.
+	// len(workers) == 1 is equivalent to WriteRows on that one channel.
+	WriteRowsParallel(ctx context.Context, table *Table, workers []<-chan Row) error
+}
+
 // TableTruncator is the optional surface a [RowWriter] (or
 // [SchemaWriter]) can implement to expose TRUNCATE TABLE for
 // resume's truncate-and-redo path. The pipeline.Migrator type-asserts

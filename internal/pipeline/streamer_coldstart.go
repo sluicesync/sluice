@@ -599,7 +599,7 @@ func (s *Streamer) coldStartRunCopy(ctx context.Context, schema *ir.Schema, stre
 	// snapshot importer — so the one-command copy+follow workflow gets the
 	// fast copy, with all N parallel readers pinned to the ONE snapshot.
 	// Otherwise (MySQL, VStream, resume, --schema-already-applied) the
-	// existing serial path runs, with a loud INFO naming the reason — the
+	// runBulkCopyWithOpts path runs, with a loud INFO naming the reason — the
 	// resumable durable-watermark + idempotent-COPY coupling lives ONLY on
 	// the serial path and is left untouched.
 	fast, fastReason := coldStartFastEligible(resumingCopy, s.SchemaAlreadyApplied, stream.SnapshotName, s.Source)
@@ -610,8 +610,25 @@ func (s *Streamer) coldStartRunCopy(ctx context.Context, schema *ir.Schema, stre
 	if fast {
 		copyErr = s.runColdStartParallel(ctx, stream, sw, rw, schema)
 	} else {
-		slog.InfoContext(ctx, "sync cold-start: "+fastReason+"; using serial cold-start",
-			slog.String("stream_id", streamID))
+		// The ADR-0079 fast shareable-snapshot path was not taken — but that
+		// does NOT mean the copy is serial. When the source surfaced a
+		// concurrent-copy partition (the native-MySQL ADR-0101/0102 path /
+		// VStream ADR-0099/0100), runBulkCopyWithOpts engages W (× D) read→
+		// write pipelines one layer down. Word the INFO so an operator can
+		// tell which actually runs, rather than reading a contradictory
+		// "using serial cold-start" while the engine then logs the concurrent
+		// snapshot it opened. (This wording bit the Track-D measurement
+		// interpretation — ADR-0102 §6.)
+		if concurrentCopyGroups(stream.Rows) != nil {
+			slog.InfoContext(ctx, "sync cold-start: "+fastReason+
+				"; the ADR-0079 shareable-snapshot fast path is unavailable, but the source surfaced a "+
+				"concurrent-copy partition — using CONCURRENT multi-table cold-start (see the engine's "+
+				"\"concurrent cold-copy\" line for the reader/fan-out degree)",
+				slog.String("stream_id", streamID))
+		} else {
+			slog.InfoContext(ctx, "sync cold-start: "+fastReason+"; using serial cold-start",
+				slog.String("stream_id", streamID))
+		}
 		bulkOpts := bulkCopyOpts{
 			SkipSchemaApply:  s.SchemaAlreadyApplied,
 			Redactor:         s.Redactor,

@@ -73,6 +73,102 @@ func resolveCopyFanoutDegree(n int) int {
 	}
 }
 
+// copyTablePlainMaybeParallel routes a cold-start PLAIN-INSERT table copy
+// through the WRITE-side fan-out (ADR-0102) when it is both eligible and
+// beneficial, and through the serial single-writer [copyTable] otherwise.
+// It is the plain-INSERT mirror of
+// [copyTableColdStartIdempotentMaybeParallel]: it reuses the SAME ADR-0097
+// PK-hash partition ([partitionRowsByPK]) — only the per-worker write call
+// differs (plain INSERT, not upsert). Eligibility (all required):
+//
+//   - degree > 1 (a degree of 1 is serial by definition);
+//   - the writer implements [ir.ParallelCopyWriter];
+//   - the table has a usable PRIMARY KEY (the partition key). A no-PK table
+//     CANNOT be PK-hash-partitioned, so it routes to the single-writer
+//     serial copy — fully copied, never refused (a gap-free plain-INSERT
+//     snapshot has no re-emission to duplicate, unlike the idempotent case)
+//     and never partially fanned out.
+//
+// Falling through to serial is always correct (same plain writer, same
+// loud-failure gate via [copyTable]) — it just doesn't get the speedup.
+//
+// Plain INSERT (not upsert) is correct here because the only reader that
+// drives this is the native-MySQL gap-free concurrent snapshot (ADR-0101)
+// onto a FRESH target: each row is read exactly once, the disjoint partition
+// means each table is owned by one pipeline, and the PK-hash routing means
+// each row is written by exactly one worker — no overlap, nothing to absorb.
+func copyTablePlainMaybeParallel(
+	ctx context.Context,
+	rr ir.RowReader,
+	rw ir.RowWriter,
+	table *ir.Table,
+	redactor *redact.Registry,
+	shard ShardColumnSpec,
+	degree int,
+) error {
+	par, ok := rw.(ir.ParallelCopyWriter)
+	if !ok || degree <= 1 || len(tablePKColumns(table)) == 0 {
+		return copyTable(ctx, rr, rw, table, redactor, shard)
+	}
+	return copyTablePlainParallel(ctx, rr, par, table, redactor, shard, degree)
+}
+
+// copyTablePlainParallel is the fan-out variant of [copyTable]. It mirrors
+// [copyTableColdStartIdempotentParallel]'s goroutine lifecycle, redaction,
+// shard-stamping, and the Bug-68 loud-failure gate EXACTLY — only the writer
+// call differs: instead of one WriteRows over the single channel, it spins
+// up the SAME ADR-0097 PK-hash dispatcher over N per-worker channels and
+// calls [ir.ParallelCopyWriter.WriteRowsParallel] (plain INSERT, not upsert).
+//
+// There is no mid-COPY durable watermark to disable here: the plain path
+// carries no CopyDurableProgressReporter wiring, and the native concurrent
+// path that drives this sets no CopyDurableProgressSink (ADR-0101 §7 /
+// ADR-0102 §5). The whole-table join inside WriteRowsParallel is the SOLE
+// durability guarantee, and the orchestrator advances no position until this
+// returns nil (ADR-0007).
+func copyTablePlainParallel(
+	ctx context.Context,
+	rr ir.RowReader,
+	pw ir.ParallelCopyWriter,
+	table *ir.Table,
+	redactor *redact.Registry,
+	shard ShardColumnSpec,
+	degree int,
+) (retErr error) {
+	copyCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	rows, err := rr.ReadRows(copyCtx, table)
+	if err != nil {
+		return fmt.Errorf("read rows: %w", err)
+	}
+	pt := newProgressTicker(copyCtx, progressInterval, table.Name)
+	kickOffRowCount(copyCtx, rr, table, pt)
+	defer func() { pt.Stop(ctx, retErr) }()
+
+	teed := teeRows(copyCtx, rows, pt.observeRow)
+	redacted, redactErrFn := redactRows(copyCtx, teed, redactor, table.Schema, table.Name, table.Columns, tablePKColumns(table), "")
+	stamped, _ := shardStampRows(copyCtx, redacted, shard.Name, shard.Value)
+
+	// Partition the single (redacted, stamped) stream out to `degree`
+	// per-worker channels, hashed by PK so every row lands on exactly one
+	// worker — the SAME dispatcher the idempotent fan-out uses. The
+	// dispatcher closes all worker channels when the source drains (or
+	// copyCtx cancels), so each worker sees a clean close.
+	workers := partitionRowsByPK(copyCtx, stamped, table, degree)
+
+	if err := pw.WriteRowsParallel(copyCtx, table, workers); err != nil {
+		return fmt.Errorf("write rows (plain, fan-out): %w", err)
+	}
+	if err := redactErrFn(); err != nil {
+		return fmt.Errorf("redact rows: %w", err)
+	}
+	// The writers returned without error, but the reader may have aborted
+	// mid-table on a scan/decode failure (Bug 68). Surface it loudly so a
+	// silently-truncated table never reports success.
+	return readerStreamErr(rr, table)
+}
+
 // copyTableColdStartIdempotentMaybeParallel routes a cold-start
 // idempotent table copy through the WRITE-side fan-out when it is both
 // eligible and beneficial, and through the serial
