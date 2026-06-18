@@ -389,6 +389,16 @@ So NOTIFY-kick is **demoted** — the poll isn't the bottleneck. Closing the rea
 
 ---
 
+### 23. Cross-region CDC apply to PlanetScale-MySQL: per-shard progress stall + apply-throughput under a high-write multi-shard Vitess source — *INVESTIGATE (live finding, possible defect)*
+
+**Why (live finding, 2026-06-18, Track B re-test on v0.99.73).** A Vitess→PS-MySQL `sync` cold-copy completed and entered CDC cleanly (the auto-resnapshot/retention fix held — item-21/ADR-0093 path validated), but in steady-state CDC the apply does NOT keep up with a continuously-writing 2-shard source, and the lag is **per-shard asymmetric**: shard `80-` applied at a healthy clip (lag ~37K and roughly stable), while shard `-80`'s applied GTID position **froze** (e.g. `3,598,251` unchanged across many minutes) with its lag **GROWING** (303K → 349K and climbing) — even though the source keeps committing to `-80` and the stream logs no error (only heartbeats + AIMD `p95≈10s` batch-shrink). So one shard's apply effectively stalls while the other proceeds — observable via the per-shard source-vs-applied GTID gap (`sluice sync status` token vs tablet `gtid_executed`). NOT silent (the lag is visible; CDC never claims caught-up), but a stalled shard on a "healthy" stream is a serious shape.
+
+**What (investigate first — three-phase; do NOT assume the cause).** Candidate hypotheses to disprove with ground truth: **(a)** the `-80` vstreamer is throttle-suppressed at the source (the documented Vitess lag-throttler shard-stall, roadmap item 19 — an INFRA condition, not a sluice bug; confirm via `SHOW VITESS_THROTTLED_APPS` / the tablet throttler + whether `-80` events are arriving at all); **(b)** the keyspace-wide CDC apply orders/serializes across shards such that one shard starves the other (a sluice apply-scheduling issue — the K-stream COPY is concurrent but the CDC tail is a single keyspace-wide stream whose per-shard apply progress can diverge); **(c)** cross-region commit latency (`p95≈10s`, AIMD shrinking toward batch=1) caps apply throughput below the source write rate generally, and `-80` just lost the scheduler race. Phase A = instrument/observe which shard's events reach the applier and whether `-80` commits ever land; only then fix the confirmed cause.
+
+**Then (if it is throughput, not a stall-bug).** The cold-copy got W×D write fan-out (ADR-0097/0100/0102), but the **CDC apply path has no equivalent throughput lever** for a cross-region RTT-bound target — and unlike cold-copy it must preserve apply order, so any parallelism needs per-key/per-table ordering guarantees (composing with ADR-0010 idempotent apply) or per-shard apply pipelines. Design-gated on the Phase-A finding. **Gotcha:** whatever the cause, the per-shard lag must stay observable (it is — the gap is the signal) and exactly-once/ordering must not be weakened to chase throughput.
+
+---
+
 ### Open bugs awaiting fix windows
 
 Tracked in detail in the project's internal regression catalog; recap here for roadmap visibility:
