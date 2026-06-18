@@ -108,6 +108,64 @@ func resetTargetDataForStream(ctx context.Context, schema *ir.Schema, rw ir.RowW
 	return nil
 }
 
+// copyReaderIsIdempotent reports whether a snapshot reader's COPY-phase
+// row stream is idempotent — i.e. the cold-start bulk copy routes through
+// the engine's UPSERT writer (ON DUPLICATE KEY UPDATE / ON CONFLICT DO
+// UPDATE) rather than plain INSERT. This MUST mirror the discriminator
+// in [runBulkCopyWithOpts] exactly: a reader is idempotent iff it
+// implements [ir.IdempotentCopyReader] and reports true. The VStream /
+// PlanetScale snapshot reader does (it re-emits COPY rows during binlog
+// catchup, Bug 125); the native MySQL binlog snapshot and the Postgres
+// snapshot do NOT — their reads are gap-free and overlap-free, so they
+// take the faster plain-INSERT path.
+//
+// The distinction matters for the restart-from-scratch / auto-resnapshot
+// recovery (ADR-0093): a fresh cold-start onto a NON-idempotent reader
+// runs plain INSERT, which dup-key-collides (MySQL Error 1062) on a
+// target that still holds rows from the prior copy. The idempotent path
+// genuinely absorbs the overlap; the plain-INSERT path does not, so the
+// caller must clean the target first.
+func copyReaderIsIdempotent(rows ir.RowReader) bool {
+	icr, ok := rows.(ir.IdempotentCopyReader)
+	return ok && icr.CopyNeedsIdempotentWriter()
+}
+
+// resetTargetTablesForRestart drops the in-scope target tables (and any
+// schema-defined types) ahead of a from-scratch cold-start whose reader
+// is NON-idempotent. It reuses the same FK-safe drop machinery as
+// [resetTargetDataForStream] (PG CASCADE / MySQL InnoDB referential
+// drops) so a re-copy onto a populated, already-FK-constrained target can
+// recreate empty tables via CreateTablesWithoutConstraints. Unlike the
+// full --reset-target-data path it does NOT clear the cdc-state row —
+// the restart-from-scratch / auto-resnapshot dispatch already discards
+// the persisted position, and the cold-start re-stamps a fresh one at the
+// CDC handoff, so clearing it here would be redundant.
+//
+// Idempotent across retries via DROP TABLE IF EXISTS. An engine without
+// the [ir.TableDropper] surface surfaces a clear, accurate refusal rather
+// than silently proceeding into the dup-key trap.
+func resetTargetTablesForRestart(ctx context.Context, schema *ir.Schema, rw ir.RowWriter) error {
+	dropper, ok := rw.(ir.TableDropper)
+	if !ok {
+		return errors.New(
+			"pipeline: restart-from-scratch onto a non-idempotent source (native MySQL binlog) needs an empty target, " +
+				"but this target engine's row writer does not support DROP TABLE — drop the dest tables manually, " +
+				"or re-run with --reset-target-data, before retrying",
+		)
+	}
+	if err := dropTables(ctx, dropper, schema.Tables); err != nil {
+		return err
+	}
+	if err := dropSchemaTypes(ctx, rw, schema); err != nil {
+		return err
+	}
+	slog.InfoContext(
+		ctx, "restart-from-scratch: non-idempotent source — dropped target tables before the fresh cold-start (plain INSERT would otherwise dup-key on the leftover rows)",
+		slog.Int("tables_dropped", len(schema.Tables)),
+	)
+	return nil
+}
+
 // dropSchemaTypes drops user-defined database-level types the source
 // IR schema would create on a cold-start (e.g. PG enum types). Probes
 // the row writer for the optional [ir.SchemaTypeDropper] surface; a

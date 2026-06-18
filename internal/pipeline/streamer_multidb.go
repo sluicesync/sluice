@@ -570,6 +570,19 @@ func (s *Streamer) coldStartCopyOneDatabase(
 			closeIf(sw)
 			return fmt.Errorf("pipeline: reset target data for %q: %w", database, err)
 		}
+	case s.RestartFromScratch && !copyReaderIsIdempotent(stream.Rows):
+		// restart-from-scratch / auto-resnapshot onto a NON-idempotent reader
+		// (multi-database fan-out is MySQL-source native binlog, plain
+		// INSERT). Drop the in-scope target tables first so the fresh
+		// cold-start doesn't dup-key (Error 1062) on the prior copy's rows.
+		// Mirrors the single-database gate in coldStartGatePreflight; the
+		// idempotent path (none in multi-DB today, but guarded for parity)
+		// keeps the absorb-the-overlap behaviour via the default branch.
+		if err := resetTargetTablesForRestart(ctx, schema, rw); err != nil {
+			closeIf(rw)
+			closeIf(sw)
+			return fmt.Errorf("pipeline: restart-from-scratch reset for %q: %w", database, err)
+		}
 	default:
 		if err := preflightColdStart(ctx, schema, rw, s.ForceColdStart || s.RestartFromScratch, preflightModeSync); err != nil {
 			closeIf(rw)

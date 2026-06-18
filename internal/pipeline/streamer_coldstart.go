@@ -514,6 +514,28 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 			ctx, "cold-start COPY resume: skipping populated-target preflight (partial copy is the expected state)",
 			slog.String("stream_id", streamID),
 		)
+	case s.RestartFromScratch && !s.InjectShardColumn.Engaged() && !copyReaderIsIdempotent(stream.Rows):
+		// restart-from-scratch / auto-resnapshot (ADR-0093) onto a
+		// NON-idempotent snapshot reader (native MySQL binlog: the cold-copy
+		// runs plain INSERT — see [runBulkCopyWithOpts]). "From scratch"
+		// means a clean re-copy, but the dispatch routes here WITHOUT
+		// dropping the target, so the leftover rows from the prior copy would
+		// dup-key-collide (MySQL Error 1062) on the plain INSERT. The
+		// idempotent VStream/PG path genuinely absorbs the overlap (UPSERT)
+		// and stays on the default skip-preflight branch below; this branch
+		// makes the non-idempotent case actually start from a clean target by
+		// dropping the in-scope tables first (CreateTablesWithoutConstraints
+		// recreates them empty). Reuses the FK-safe drop machinery
+		// --reset-target-data uses, but leaves the cdc-state row alone (the
+		// restart dispatch already discards the position). This is the loud-
+		// failure fix for the misleading "the idempotent copy absorbs the
+		// overlap" hint, which only ever held for idempotent readers.
+		if err := resetTargetTablesForRestart(ctx, schema, rw); err != nil {
+			closeIf(rw)
+			closeIf(sw)
+			_ = stream.Close()
+			return err
+		}
 	default:
 		// ADR-0048 Shape A populated-target preflight (DP-2). When
 		// --inject-shard-column is set, this is the LOUD replacement
@@ -545,8 +567,13 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 		// check above is the operator-opted-in replacement; the
 		// classic cold-start preflight is suppressed in that case.
 		if !s.InjectShardColumn.Engaged() {
-			// --restart-from-scratch implies the pre-flight skip: the operator
-			// is deliberately re-copying onto existing rows (idempotently).
+			// --restart-from-scratch reaches this default branch only for an
+			// IDEMPOTENT reader (VStream/PG) — the non-idempotent case is
+			// drained by the dedicated case above, which drops the target
+			// first. For the idempotent reader the pre-flight skip is correct:
+			// the operator is deliberately re-copying onto existing rows and
+			// the UPSERT writer absorbs the overlap. (--force-cold-start keeps
+			// its existing skip semantics for either reader.)
 			if err := preflightColdStart(ctx, schema, rw, s.ForceColdStart || s.RestartFromScratch, preflightModeSync); err != nil {
 				closeIf(rw)
 				closeIf(sw)

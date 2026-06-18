@@ -1019,8 +1019,14 @@ func (s *Streamer) reactiveResnapshotDecision(ctx context.Context, err error, al
 		slog.String("stream_id", s.resolveStreamID()),
 		slog.String("err", err.Error()),
 	)
-	// Force a fresh, non-destructive cold-start on the next attempt: the
-	// idempotent COPY writer absorbs the re-copied overlap (no target drop).
+	// Force a fresh cold-start on the next attempt. RestartFromScratch
+	// discards the persisted (now-invalid) position; the cold-start gate
+	// then makes the re-copy land cleanly per source: an idempotent reader
+	// (VStream/PlanetScale) absorbs the re-copied overlap via UPSERT with no
+	// target drop, while a non-idempotent reader (native MySQL binlog, plain
+	// INSERT) drops + recreates the in-scope target tables first so the copy
+	// doesn't dup-key (Error 1062) on the prior copy's leftover rows. The
+	// cdc-state row is preserved either way.
 	s.RestartFromScratch = true
 	return true, nil
 }
@@ -1032,7 +1038,7 @@ func (s *Streamer) reactiveResnapshotDecision(ctx context.Context, err error, al
 // sites so the opt-out message is identical everywhere.
 func invalidPositionOptOutError(err error) error {
 	return fmt.Errorf(
-		"pipeline: the persisted source position is no longer valid (older than the source's retained binlogs / purged) and --no-auto-resnapshot is set, so sluice will not auto re-snapshot. Re-run with --restart-from-scratch for a non-destructive fresh cold-start (the idempotent copy absorbs the overlap), or --reset-target-data to drop and re-copy: %w", err,
+		"pipeline: the persisted source position is no longer valid (older than the source's retained binlogs / purged) and --no-auto-resnapshot is set, so sluice will not auto re-snapshot. Re-run with --restart-from-scratch for a fresh cold-start (idempotent sources absorb the overlap with no target drop; non-idempotent sources such as native MySQL binlog drop + recreate the in-scope target tables first so the plain-INSERT copy starts clean, preserving the cdc-state row), or --reset-target-data to also clear the cdc-state row and drop the tables: %w", err,
 	)
 }
 
