@@ -243,7 +243,7 @@ func TestRunConcurrentTableCopy_WindowsOverlap(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		// degree=1: isolate cross-TABLE concurrency from per-table fan-out.
-		done <- runConcurrentTableCopy(ctx, groups, schema, reader, writer, nil, ShardColumnSpec{}, 1)
+		done <- runConcurrentTableCopy(ctx, groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, true)
 	}()
 
 	// Wait until two windows are concurrently open (one per group).
@@ -273,7 +273,7 @@ func TestRunConcurrentTableCopy_ExactlyOnce(t *testing.T) {
 	reader := newConcPartReader(groups, rowsPer)
 	writer := newRecordingWriter()
 
-	if err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, 1); err != nil {
+	if err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, true); err != nil {
 		t.Fatalf("runConcurrentTableCopy: %v", err)
 	}
 
@@ -299,7 +299,7 @@ func TestRunConcurrentTableCopy_ErrorAbortsLoudly(t *testing.T) {
 	writer := newRecordingWriter()
 	writer.failOn = "b"
 
-	err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, 1)
+	err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, true)
 	if err == nil {
 		t.Fatal("expected error from failing consumer; got nil (silent partial success)")
 	}
@@ -314,7 +314,7 @@ func TestRunConcurrentTableCopy_MissingTableLoud(t *testing.T) {
 	reader := newConcPartReader(groups, map[string]int{"a": 1, "ghost": 1})
 	writer := newRecordingWriter()
 
-	err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, 1)
+	err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, true)
 	if err == nil {
 		t.Fatal("expected loud error for a group table missing from the schema; got nil")
 	}
@@ -334,7 +334,9 @@ func TestRunConcurrentTableCopy_CancelNoLeak(t *testing.T) {
 	before := runtime.NumGoroutine()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- runConcurrentTableCopy(ctx, groups, schema, reader, writer, nil, ShardColumnSpec{}, 1) }()
+	go func() {
+		done <- runConcurrentTableCopy(ctx, groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, true)
+	}()
 
 	time.Sleep(50 * time.Millisecond)
 	cancel()
@@ -358,6 +360,111 @@ func TestRunConcurrentTableCopy_CancelNoLeak(t *testing.T) {
 	}
 	if got := runtime.NumGoroutine(); got > before+4 {
 		t.Fatalf("goroutine leak after cancel: before=%d after=%d", before, got)
+	}
+}
+
+// nativeConcReader is the ADR-0101 native-MySQL concurrent reader fake: it
+// surfaces a concurrent-copy partition (ir.ConcurrentCopyPartitioner) but
+// does NOT declare the idempotent contract (no CopyNeedsIdempotentWriter) —
+// the binlog snapshot is gap-free + overlap-free, so the cold-copy plain-
+// INSERTs each table exactly once. It embeds concPartReader for ReadRows /
+// ConcurrentCopyGroups but deliberately re-declares Err and omits the
+// idempotent declaration by NOT being assertable as ir.IdempotentCopyReader.
+type nativeConcReader struct {
+	groups [][]string
+	rows   map[string][]ir.Row
+}
+
+func newNativeConcReader(groups [][]string, rowsPerTable map[string]int) *nativeConcReader {
+	r := &nativeConcReader{groups: groups, rows: map[string][]ir.Row{}}
+	for tbl, n := range rowsPerTable {
+		rows := make([]ir.Row, 0, n)
+		for i := 0; i < n; i++ {
+			rows = append(rows, ir.Row{"id": int64(i), "v": fmt.Sprintf("%s-%d", tbl, i)})
+		}
+		r.rows[tbl] = rows
+	}
+	return r
+}
+
+func (r *nativeConcReader) ConcurrentCopyGroups() [][]string { return r.groups }
+func (r *nativeConcReader) Err() error                       { return nil }
+
+func (r *nativeConcReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.Row, error) {
+	rows := r.rows[table.Name]
+	out := make(chan ir.Row)
+	go func() {
+		defer close(out)
+		for _, row := range rows {
+			select {
+			case <-ctx.Done():
+				return
+			case out <- row:
+			}
+		}
+	}()
+	return out, nil
+}
+
+// TestRunConcurrentTableCopy_NativePlainInsert pins the ADR-0101 native path:
+// a NON-idempotent reader surfacing ≥2 groups drives the concurrent PLAIN-
+// INSERT path (needsIdempotent=false → copyTable), every table written
+// exactly once. This is the gap-free native-MySQL snapshot — concurrently
+// plain-INSERTing it is safe because the disjoint partition means each table
+// is written by exactly one pipeline.
+func TestRunConcurrentTableCopy_NativePlainInsert(t *testing.T) {
+	groups := [][]string{{"a", "c"}, {"b", "d"}}
+	schema := concSchema("a", "b", "c", "d")
+	rowsPer := map[string]int{"a": 7, "b": 11, "c": 13, "d": 17}
+	reader := newNativeConcReader(groups, rowsPer)
+	writer := newRecordingWriter()
+
+	// needsIdempotent=false → the plain copyTable path.
+	if err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, false); err != nil {
+		t.Fatalf("runConcurrentTableCopy (native plain): %v", err)
+	}
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	if len(writer.counts) != 4 {
+		t.Fatalf("tables written = %d; want 4: %v", len(writer.counts), writer.counts)
+	}
+	for tbl, want := range rowsPer {
+		if got := writer.counts[tbl]; got != want {
+			t.Errorf("table %q rows written = %d; want %d", tbl, got, want)
+		}
+	}
+}
+
+// TestRunBulkCopyWithOpts_NativeConcurrentNotRefused pins that a NON-
+// idempotent reader surfacing ≥2 groups is NOT refused (the ADR-0101 guard
+// widening) — it takes the concurrent path. Before ADR-0101 this combination
+// was a loud refusal ("not an idempotent copy reader; refusing to
+// concurrently plain-INSERT").
+func TestRunBulkCopyWithOpts_NativeConcurrentNotRefused(t *testing.T) {
+	prev := concurrentCopyDispatchObserver
+	defer func() { concurrentCopyDispatchObserver = prev }()
+	var got int
+	var mu sync.Mutex
+	concurrentCopyDispatchObserver = func(groups int) {
+		mu.Lock()
+		got = groups
+		mu.Unlock()
+	}
+
+	groups := [][]string{{"a"}, {"b"}}
+	schema := concSchema("a", "b")
+	reader := newNativeConcReader(groups, map[string]int{"a": 2, "b": 2})
+	writer := newRecordingWriter()
+	if err := runBulkCopyWithOpts(context.Background(), schema, reader, noopSchemaWriter{}, writer, bulkCopyOpts{CopyFanoutDegree: 1}); err != nil {
+		t.Fatalf("runBulkCopyWithOpts (native concurrent): %v (a non-idempotent concurrent reader must NOT be refused)", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if got != 2 {
+		t.Fatalf("dispatch observed groups=%d; want 2 (native concurrent path engaged)", got)
+	}
+	if writer.counts["a"] != 2 || writer.counts["b"] != 2 {
+		t.Fatalf("native concurrent counts = %v; want a:2 b:2", writer.counts)
 	}
 }
 
@@ -439,7 +546,7 @@ func TestRunConcurrentTableCopy_CoversAllGroupTables(t *testing.T) {
 	reader := newConcPartReader(groups, rowsPer)
 	writer := newRecordingWriter()
 
-	if err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, 1); err != nil {
+	if err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, true); err != nil {
 		t.Fatalf("runConcurrentTableCopy: %v", err)
 	}
 

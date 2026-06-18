@@ -272,10 +272,24 @@ func finishParseDSN(cfg *mysql.Config) *mysql.Config {
 // are never valid MySQL session variables.
 const vstreamParamPrefix = "vstream_"
 
+// nativeSluiceParams are sluice-internal source-DSN knobs that are NOT under
+// the vstream_ prefix but must STILL be stripped before a MySQL session, for
+// the same Bug-126 reason: the go-sql-driver emits each cfg.Params entry as
+// `SET <key>=<value>` at session init, and these are not valid MySQL system
+// variables. copy_table_parallelism (ADR-0101) is the native-binlog
+// concurrent-cold-copy reader count; it governs sluice's snapshot opener,
+// never a MySQL session. Listed explicitly (an allowlist, not a prefix) so a
+// real future MySQL variable starting with "copy_" is never accidentally
+// swallowed.
+var nativeSluiceParams = map[string]struct{}{
+	"copy_table_parallelism": {},
+}
+
 // stripVStreamParams returns a clone of cfg with every cfg.Params entry
-// whose key carries the vstream_ prefix removed. It never mutates the
-// caller's cfg (it Clone()s first), so a caller may continue to read the
-// original cfg.Params after the call.
+// whose key carries the vstream_ prefix removed (plus the explicit
+// nativeSluiceParams). It never mutates the caller's cfg (it Clone()s
+// first), so a caller may continue to read the original cfg.Params after the
+// call.
 //
 // Bug 126. sluice's vstream_* DSN extensions are consumed only by the
 // VStream CDC reader (cdc_vstream.go), which reads them out of cfg.Params
@@ -302,6 +316,10 @@ func stripVStreamParams(cfg *mysql.Config) *mysql.Config {
 	clone := cfg.Clone()
 	for k := range clone.Params {
 		if strings.HasPrefix(k, vstreamParamPrefix) {
+			delete(clone.Params, k)
+			continue
+		}
+		if _, ok := nativeSluiceParams[k]; ok {
 			delete(clone.Params, k)
 		}
 	}
