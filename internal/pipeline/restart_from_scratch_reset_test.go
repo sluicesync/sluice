@@ -230,6 +230,30 @@ func TestColdStartGate_RestartFromScratch_SurfaceFalse_DropsTarget(t *testing.T)
 	}
 }
 
+// The proactive warm-resume → ir.ErrPositionInvalid fall-through auto-
+// resnapshots ONLY for GTID/binlog sources (routine purge); PG logical-slot
+// loss and trigger CDC refuse loudly (deliberate-recovery contract). This pins
+// the engine discriminator that keeps TestStreamer_MultiSchema_
+// SlotLossRefusesLoudly green while fixing the Track-B/D VStream/MySQL dead-end.
+func TestSourceAutoResnapshotOnInvalidPosition(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		cdc  ir.CDCMethod
+		want bool
+	}{
+		{ir.CDCBinlog, true},              // vanilla MySQL — routine binlog purge → resnapshot
+		{ir.CDCVStream, true},             // Vitess/PlanetScale — routine GTID purge → resnapshot
+		{ir.CDCLogicalReplication, false}, // PG slot-loss — abnormal → refuse loudly
+		{ir.CDCTriggers, false},           // trigger CDC — no purge semantics → refuse
+	}
+	for _, tc := range cases {
+		eng := &copyResumeEngine{caps: ir.Capabilities{CDC: tc.cdc}}
+		if got := sourceAutoResnapshotOnInvalidPosition(eng); got != tc.want {
+			t.Errorf("CDC=%v: sourceAutoResnapshotOnInvalidPosition = %v, want %v", tc.cdc, got, tc.want)
+		}
+	}
+}
+
 // populatedChecker is a RowWriter whose target tables are NON-empty, so the
 // default populated-target preflight (Bug 9) fires unless suppressed.
 type populatedChecker struct{ dropped []string }

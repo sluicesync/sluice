@@ -468,6 +468,30 @@ func (s *Streamer) phaseLookupPosition(ctx context.Context, applier ir.ChangeApp
 	return persisted, found, nil
 }
 
+// sourceAutoResnapshotOnInvalidPosition reports whether a purged/invalid resume
+// position is a ROUTINE, auto-recoverable event for this source — so the
+// proactive warm-resume → ir.ErrPositionInvalid fall-through should
+// auto-resnapshot (forceFresh) rather than refuse. True for GTID/binlog sources
+// (vanilla MySQL CDCBinlog, Vitess/PlanetScale CDCVStream), where the
+// binlog/GTID retention window legitimately advances past an old snapshot
+// position (ADR-0093; the live Track-B/D finding). FALSE for logical-
+// replication-slot sources (PG CDCLogicalReplication) and trigger CDC
+// (CDCTriggers): a lost PG slot is an abnormal failover/config event, not a
+// routine purge, so the fall-through refuses LOUDLY and leaves the
+// data-preserving recovery (--reset-target-data / --force-cold-start) to a
+// deliberate operator choice — the ADR-0075 Phase 2b rig-confirmed contract,
+// pinned by TestStreamer_MultiSchema_SlotLossRefusesLoudly. The operator's
+// explicit --restart-from-scratch is unaffected (it forces fresh for any
+// engine); this only governs the AUTOMATIC fall-through.
+func sourceAutoResnapshotOnInvalidPosition(source ir.Engine) bool {
+	switch source.Capabilities().CDC {
+	case ir.CDCBinlog, ir.CDCVStream:
+		return true
+	default:
+		return false
+	}
+}
+
 // phaseOpenChangeStream is the ---- 4 ---- dispatch: cold start vs
 // warm resume vs multi-database fan-out, including the ADR-0022
 // slot-missing fall-through and the v0.99.8 interrupted-COPY resume
@@ -559,10 +583,14 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, lsnTrac
 					slog.String("err", err.Error()),
 				)
 				stop()
-				// forceFresh=true: auto-resnapshot re-copies onto the populated
-				// target (its persisted server-wide position was purged) — same
-				// fix as the single-database path.
-				changes, stop, err = s.coldStartMultiDatabase(streamCtx, lsnTracker, applier, streamID, true)
+				// Auto-resnapshot re-copies onto the populated target (its
+				// persisted server-wide position was purged) — but ONLY for
+				// GTID/binlog sources where a purge is routine. A PG
+				// logical-slot source (CDCLogicalReplication) gets forceFresh
+				// =false here so the gate refuses LOUDLY (the ADR-0075 Phase 2b
+				// deliberate-recovery contract; TestStreamer_MultiSchema_
+				// SlotLossRefusesLoudly). Same engine-aware gate as single-DB.
+				changes, stop, err = s.coldStartMultiDatabase(streamCtx, lsnTracker, applier, streamID, sourceAutoResnapshotOnInvalidPosition(s.Source))
 				warmResumed = false
 			}
 		default:
@@ -635,13 +663,18 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, lsnTrac
 			// warmResume failed; its stop is the no-op (it cleaned up
 			// its reader inline). coldStart's stop supersedes it.
 			stop()
-			// forceFresh=true: this auto-resnapshot re-copies onto the
-			// EXISTING (populated) target whose persisted position was purged.
-			// Without it the default populated-target preflight refuses (the
-			// target is always populated for a resnapshot of a live stream) —
-			// the live Track-B/D dead-end. Idempotent readers absorb the
-			// overlap via UPSERT; native MySQL drops + recreates first.
-			changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID, ir.Position{}, true)
+			// Auto-resnapshot re-copies onto the EXISTING (populated) target
+			// whose persisted position was purged — but ONLY for GTID/binlog
+			// sources (CDCBinlog/CDCVStream) where a purge is routine: there
+			// forceFresh suppresses the populated-target refusal that dead-ended
+			// the live Track-B/D run (idempotent readers absorb via UPSERT;
+			// native MySQL drops + recreates first). A PG logical-slot source
+			// (CDCLogicalReplication) gets forceFresh=false so the gate refuses
+			// LOUDLY — the ADR-0075 Phase 2b deliberate-recovery contract
+			// (TestStreamer_MultiSchema_SlotLossRefusesLoudly). The operator's
+			// explicit --restart-from-scratch is unaffected (forces fresh for
+			// any engine); this governs only the AUTOMATIC fall-through.
+			changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID, ir.Position{}, sourceAutoResnapshotOnInvalidPosition(s.Source))
 			// coldStart supersedes the warm resume — schema-history
 			// stays brand-new from the applier's perspective (the
 			// snapshot bulk-copy reset effective state).
