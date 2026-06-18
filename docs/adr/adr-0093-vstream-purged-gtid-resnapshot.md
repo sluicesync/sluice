@@ -77,9 +77,17 @@ fails the pin rather than silently reverting to a restart loop).
 In the `Run` retry path (`runWithRetry`, and the `attempts == 1` direct `runOnce` path),
 when `runOnce` returns an error that `errors.Is(err, ir.ErrPositionInvalid)` and it is not
 a bare ctx-cancellation: log a loud WARN naming the position, then **re-run `runOnce`
-once** with `RestartFromScratch = true` (the existing non-destructive forced-cold-start
-knob — ignores the persisted position and re-snapshots; the idempotent COPY writer
-absorbs the overlap, no target drop). This is **bounded**: at most one re-snapshot per
+once** with `RestartFromScratch = true` (the existing forced-cold-start knob — ignores
+the persisted position and re-snapshots). On the VStream/PlanetScale path this ADR targets,
+the cold-copy is idempotent (UPSERT, Bug 125), so the re-snapshot absorbs the overlap with
+no target drop. **Amendment (#244 value-fidelity review):** the same `RestartFromScratch`
+knob is also reached for NON-idempotent native-MySQL-binlog sources (whose cold-copy is
+plain INSERT). On that path "absorb the overlap" never held — a fresh plain-INSERT onto the
+prior copy's leftover rows dup-key-errors (MySQL Error 1062). The cold-start gate
+(`coldStartGatePreflight` → `resetTargetTablesForRestart`) therefore drops + recreates the
+in-scope target tables before the re-copy when the reader is non-idempotent, so the auto-
+resnapshot lands cleanly for native MySQL too; the cdc-state row is preserved (only the
+position is discarded). The idempotent VStream path is unchanged. This is **bounded**: at most one re-snapshot per
 purged-position detection (a second consecutive `ir.ErrPositionInvalid` after a fresh
 cold-start is terminal — it would indicate the source is purging faster than the snapshot
 completes, which auto-retry cannot fix and must surface loudly). Mirrors the binlog

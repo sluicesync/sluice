@@ -566,11 +566,16 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, lsnTrac
 		changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID, ir.Position{})
 	case s.RestartFromScratch:
 		// Force a fresh cold-start from row 0, ignoring any persisted
-		// position (incl. a mid-COPY cursor). Unlike --reset-target-data this
-		// does NOT drop the target — the idempotent COPY writer absorbs the
-		// re-copied overlap. warmResumed stays false (a fresh cold-start
-		// resets effective schema-history state), so the cache prime gets the
-		// brand-new-stream sentinel below.
+		// position (incl. a mid-COPY cursor). The cold-start gate
+		// (coldStartGatePreflight) makes the re-copy land cleanly per source:
+		// an idempotent reader (VStream/PlanetScale, PG) keeps its tables and
+		// absorbs the re-copied overlap via UPSERT; a non-idempotent reader
+		// (native MySQL binlog, plain INSERT) has its in-scope target tables
+		// dropped + recreated first so the copy doesn't dup-key (Error 1062)
+		// on the prior copy's rows. Either way the cdc-state row is preserved
+		// (only --reset-target-data clears it). warmResumed stays false (a
+		// fresh cold-start resets effective schema-history state), so the
+		// cache prime gets the brand-new-stream sentinel below.
 		slog.InfoContext(
 			ctx, "restart-from-scratch: forcing a fresh cold-start, ignoring the persisted position",
 			slog.String("stream_id", streamID),
