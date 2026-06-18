@@ -279,6 +279,14 @@ func TestVStream_AutoShardResume_MultiTableBoundedMemoryNoInterleaveCap(t *testi
 		}
 	}
 
+	// Join the COPY-completion barrier before reading Position — the
+	// per-table ReadRows close does NOT order the producer's stitched-
+	// Position write on the auto-shard resume path (the real cold-start
+	// handoff does this join; see WaitCopyComplete).
+	if err := resumed.WaitCopyComplete(resumeCtx); err != nil {
+		t.Fatalf("WaitCopyComplete after auto-shard resume: %v", err)
+	}
+
 	// Handoff position present so the CDC tail can resume from the stitched
 	// per-shard minimum.
 	if resumed.Position.Engine == "" || resumed.Position.Token == "" {

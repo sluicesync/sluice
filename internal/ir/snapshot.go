@@ -3,6 +3,8 @@
 
 package ir
 
+import "context"
+
 // SnapshotStream pairs a snapshot-pinned [RowReader] with a [CDCReader]
 // whose start position is the snapshot's logical capture point. The
 // orchestrator runs the bulk-copy phase using Rows, then starts the
@@ -71,6 +73,34 @@ type SnapshotStream struct {
 	// the closure idempotent so a CloseFn that internally calls
 	// it as a safety net doesn't double-rollback.
 	ReleaseRowsFn func() error
+
+	// WaitCopyCompleteFn is the OPTIONAL engine-supplied barrier the
+	// cold-start handoff joins after bulk-copy drains but BEFORE it
+	// reads Position to start CDC. It blocks until the engine has
+	// finished recording the snapshot's CDC-resume Position.
+	//
+	// Why it exists: on most engines, draining Rows to EOF already
+	// establishes the happens-before edge to the Position write — the
+	// row channel closes only after the producer has recorded Position.
+	// The MySQL VStream auto-shard / concurrent COPY paths (ADR-0095 /
+	// ADR-0099) break that edge: each table's Rows channel closes on a
+	// PER-TABLE completion signal, so the LAST ReadRows can return
+	// BEFORE the producer goroutine stitches and writes the
+	// stitched-minimum Position. Reading Position at the handoff then
+	// races the producer's write and can observe an EMPTY/stale
+	// Position — the wrong CDC start position, a potential silent gap.
+	//
+	// Engines that set this MUST close their completion signal (the
+	// VStream copyDone channel) only AFTER the Position write under the
+	// same mutex the read side uses, so the chain is: producer writes
+	// Position under mu → producer signals completion → handoff waits on
+	// completion → handoff reads Position under mu. The closure is
+	// ctx-cancellable so a shutdown mid-wait unwedges, and idempotent
+	// (joining an already-closed signal returns immediately). Engines
+	// without a separable COPY producer leave it nil; the handoff treats
+	// a nil hook as "no barrier needed" (the Rows drain already ordered
+	// the Position read).
+	WaitCopyCompleteFn func(ctx context.Context) error
 }
 
 // Close releases the snapshot transaction and the underlying
@@ -94,6 +124,21 @@ func (s *SnapshotStream) ReleaseRows() error {
 		return nil
 	}
 	return s.ReleaseRowsFn()
+}
+
+// WaitCopyComplete blocks until the engine has finished recording the
+// snapshot's CDC-resume Position, establishing the happens-before edge
+// the cold-start handoff needs before it reads Position. Call this after
+// bulk-copy drains and BEFORE reading Position to start CDC. On engines
+// that drain Rows in a way that already orders the Position write (every
+// non-VStream-auto-shard path) the hook is nil and this is a no-op.
+// Cancellable via ctx; idempotent — safe to call once the barrier has
+// already passed. See [SnapshotStream.WaitCopyCompleteFn].
+func (s *SnapshotStream) WaitCopyComplete(ctx context.Context) error {
+	if s == nil || s.WaitCopyCompleteFn == nil {
+		return nil
+	}
+	return s.WaitCopyCompleteFn(ctx)
 }
 
 // PositionMonotonicChecker is the OPTIONAL engine surface the

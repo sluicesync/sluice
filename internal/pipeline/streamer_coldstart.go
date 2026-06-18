@@ -626,6 +626,21 @@ func (s *Streamer) coldStartRunCopy(ctx context.Context, schema *ir.Schema, stre
 // closed here and the returned stop is the no-op.
 func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStream, applier ir.ChangeApplier, streamID string, lsnTracker any) (changes <-chan ir.Change, stop func(), err error) {
 	stop = func() {}
+	// Join the engine's COPY-completion barrier BEFORE reading
+	// stream.Position. On most engines draining Rows to EOF already
+	// orders the Position write, so this is a no-op. On the MySQL
+	// VStream auto-shard / concurrent COPY paths (ADR-0095 / ADR-0099)
+	// each table's Rows channel closes on a PER-TABLE signal, so the
+	// last ReadRows can return BEFORE the producer goroutine stitches
+	// and writes the stitched-minimum Position; reading Position here
+	// without the join would race the write and could read an EMPTY
+	// Position — the wrong CDC start position, a potential silent gap.
+	// The barrier (copyDone) is closed only after the producer writes
+	// Position under mu, so this establishes the happens-before edge.
+	if err := stream.WaitCopyComplete(ctx); err != nil {
+		_ = stream.Close()
+		return nil, stop, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: wait for snapshot COPY completion: %w", err))
+	}
 	// GitHub issue #15: persist the snapshot's anchor position on the
 	// target BEFORE the first CDC batch lands. Without this write, the
 	// cdc-state row stays absent through the entire window between
