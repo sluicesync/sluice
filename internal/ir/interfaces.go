@@ -606,6 +606,47 @@ type ConcurrentCopyPartitioner interface {
 	ConcurrentCopyGroups() [][]string
 }
 
+// WorkStealingCopyReader is the OPTIONAL surface a concurrent snapshot
+// [RowReader] implements when its N readers ALL observe the SAME consistent
+// snapshot, so ANY reader can read ANY in-scope table and see identical data
+// — which lets the pipeline replace the static disjoint partition (drained
+// one group per pipeline) with WORK-STEALING: N pipelines pull tables from a
+// shared queue, each reading its pulled table on its OWN reader. This keeps
+// the cold-copy N-wide to the tail instead of tapering as the lighter
+// [ConcurrentCopyPartitioner] groups finish early and idle (roadmap item 21a).
+//
+// The native-MySQL multi-snapshot reader implements it: its N pinned
+// connections are each a `REPEATABLE READ` / `START TRANSACTION WITH
+// CONSISTENT SNAPSHOT` opened under ONE FLUSH TABLES WITH READ LOCK (ADR-0101),
+// so every connection is the SAME cut — reading table T on connection i is
+// byte-identical for any i. The VStream reader does NOT implement it: each of
+// its K streams is a separate vtgate session Match-scoped to its group at
+// open, so a reader has rows ONLY for its own group — work-stealing there
+// needs source-stream restructuring and stays on the static
+// [ConcurrentCopyPartitioner] partition.
+//
+// CORRECTNESS (silent-loss class): the pipeline guarantees each in-scope
+// table is claimed by EXACTLY ONE pipeline (atomic queue claim) and that no
+// two pipelines ever issue a concurrent read on the same reader index — so
+// each pinned connection still has at most one in-flight query, exactly as
+// the static partition gave for free. The native single recorded FTWRL
+// position is independent of WHICH connection read a table, so the
+// snapshot→CDC seam is unaffected by stealing.
+type WorkStealingCopyReader interface {
+	ConcurrentCopyPartitioner
+
+	// ConcurrentReaderCount returns the number of independent readers
+	// (connections), each able to read ANY in-scope table from the same
+	// consistent snapshot. >1 enables work-stealing.
+	ConcurrentReaderCount() int
+
+	// ReadRowsOn reads table on reader index i (0 <= i < ConcurrentReaderCount)
+	// — the work-stealing analogue of [RowReader.ReadRows], which routes by the
+	// table's statically-assigned reader. The caller guarantees at most one
+	// in-flight ReadRowsOn per reader index i at a time.
+	ReadRowsOn(ctx context.Context, table *Table, reader int) (<-chan Row, error)
+}
+
 // IdempotentCopyWriter is the writer-side capability the cold-start
 // Bug-125 path requires before it will route a NO-PRIMARY-KEY table
 // through [IdempotentRowWriter.WriteRowsIdempotent]. A writer implements

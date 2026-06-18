@@ -44,6 +44,7 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 
 	"golang.org/x/sync/errgroup"
 
@@ -155,6 +156,20 @@ func runConcurrentTableCopy(
 		byName[t.Name] = t
 	}
 
+	// Work-stealing path (roadmap item 21a). When the reader's N connections
+	// ALL observe the same consistent snapshot (native-MySQL FTWRL multi-
+	// snapshot — ir.WorkStealingCopyReader), ANY connection can read ANY table,
+	// so the static per-group drain is replaced with N pipelines pulling tables
+	// from a SHARED queue, each reading on its OWN connection. This keeps the
+	// copy N-wide to the tail instead of tapering as the lighter static groups
+	// finish early and idle (the live Track-B/D tail observation). The VStream
+	// reader does NOT implement the surface — each of its K streams is Match-
+	// scoped to its group at the source, so a stealing consumer would have no
+	// rows for an out-of-group table — so it stays on the static partition below.
+	if ws, ok := rows.(ir.WorkStealingCopyReader); ok && ws.ConcurrentReaderCount() > 1 {
+		return runWorkStealingTableCopy(ctx, groups, byName, ws, rw, redactor, shard, fanoutDegree, needsIdempotent)
+	}
+
 	tg, tctx := errgroup.WithContext(ctx)
 	for _, group := range groups {
 		group := group
@@ -195,3 +210,115 @@ func runConcurrentTableCopy(
 	}
 	return tg.Wait()
 }
+
+// runWorkStealingTableCopy is the roadmap-21a work-stealing variant of the
+// concurrent table copy, used when the reader's N connections all share one
+// consistent snapshot (native-MySQL FTWRL — [ir.WorkStealingCopyReader]). It
+// flattens the disjoint partition into ONE ordered work list and runs W =
+// min(N, len(tables)) pipelines that PULL tables from a shared atomic cursor,
+// each reading its pulled table on its OWN reader index (connection). A fast
+// pipeline naturally claims more tables, so the copy stays W-wide until fewer
+// than W tables remain — closing the static partition's tail taper (the
+// lighter groups would otherwise finish early and idle while a heavier group
+// grinds its last large table).
+//
+// Correctness mirrors the static path's invariants and adds the claim:
+//   - EXACTLY-ONCE: each table is claimed by exactly one pipeline — the atomic
+//     fetch-add hands each index to one goroutine; coverage is total (every
+//     index 0..len-1 is claimed before any goroutine sees claim >= len).
+//   - ONE QUERY PER CONNECTION: reader index i is owned by exactly one
+//     pipeline, which copies one table at a time, so each pinned connection has
+//     at most one in-flight ReadRowsOn — the invariant the static partition
+//     gave for free and [ir.WorkStealingCopyReader] requires.
+//   - SEAM-SAFE: the native single recorded FTWRL position is independent of
+//     WHICH connection read a table, so stealing does not affect the
+//     snapshot→CDC handoff (ADR-0101 §6 / ADR-0007).
+//   - LOUD ABORT / NO LEAKS: same errgroup semantics as the static path — the
+//     first error cancels peers via the derived ctx; no position advances.
+//
+// needsIdempotent threads through to the same per-table helper the static path
+// uses (false for the native binlog snapshot → plain-INSERT + ADR-0097 D-way
+// fan-out, so total concurrency stays W × D).
+func runWorkStealingTableCopy(
+	ctx context.Context,
+	groups [][]string,
+	byName map[string]*ir.Table,
+	ws ir.WorkStealingCopyReader,
+	rw ir.RowWriter,
+	redactor *redact.Registry,
+	shard ShardColumnSpec,
+	fanoutDegree int,
+	needsIdempotent bool,
+) error {
+	// Flatten the disjoint groups into one ordered work list. The partition is
+	// a pure function of the sorted table set, so this order is deterministic
+	// (stable across runs/resumes); order does not affect correctness here —
+	// only complete coverage + the exactly-once claim do.
+	var allTables []string
+	for _, g := range groups {
+		allTables = append(allTables, g...)
+	}
+
+	w := ws.ConcurrentReaderCount()
+	if w > len(allTables) {
+		// Never spawn more pipelines than tables (a pipeline with no table to
+		// claim would idle immediately); also keeps every reader index in range.
+		w = len(allTables)
+	}
+
+	var next atomic.Int64 // shared cursor into allTables; fetch-add to claim
+	tg, tctx := errgroup.WithContext(ctx)
+	for i := 0; i < w; i++ {
+		readerIdx := i
+		tg.Go(func() error {
+			// This pipeline reads every table it claims on its OWN connection
+			// (reader index readerIdx) via the pinned adapter, so the existing
+			// per-table copy helpers (which call ReadRows) drive the
+			// work-stealing read unchanged.
+			src := pinnedRowReader{ws: ws, idx: readerIdx}
+			for {
+				claim := next.Add(1) - 1
+				if claim >= int64(len(allTables)) {
+					return nil // queue drained — this pipeline is done
+				}
+				name := allTables[claim]
+				table, ok := byName[name]
+				if !ok {
+					return fmt.Errorf(
+						"pipeline: concurrent copy (work-stealing): table %q is not in the migration schema "+
+							"(engine surfaced a table the pipeline does not have — a partition/scope mismatch)",
+						name,
+					)
+				}
+				var cerr error
+				if needsIdempotent {
+					cerr = copyTableColdStartIdempotentMaybeParallel(tctx, src, rw, table, redactor, shard, fanoutDegree)
+				} else {
+					cerr = copyTablePlainMaybeParallel(tctx, src, rw, table, redactor, shard, fanoutDegree)
+				}
+				if cerr != nil {
+					return wrapWithHint(PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", name, cerr))
+				}
+			}
+		})
+	}
+	return tg.Wait()
+}
+
+// pinnedRowReader adapts an [ir.WorkStealingCopyReader] to a plain
+// [ir.RowReader] that reads EVERY table on a FIXED reader index, so a
+// work-stealing pipeline can drive the existing per-table copy helpers (which
+// take an ir.RowReader and call ReadRows) while reading on its own pinned
+// connection. Err delegates to the underlying reader (shared across all
+// connections); the native concurrent reader does not implement ir.RowCounter,
+// so there is no ETA estimate to forward (parity with the static path).
+type pinnedRowReader struct {
+	ws  ir.WorkStealingCopyReader
+	idx int
+}
+
+func (p pinnedRowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.Row, error) {
+	return p.ws.ReadRowsOn(ctx, table, p.idx)
+}
+
+func (p pinnedRowReader) Err() error { return p.ws.Err() }

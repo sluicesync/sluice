@@ -321,6 +321,11 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 // concurrent path, not the upsert one. The pipeline's concurrent-partition
 // guard is widened to allow a non-idempotent gap-free reader onto the plain
 // concurrent path (ADR-0101 §6).
+// Compile-time guarantee that the native multi-snapshot reader satisfies the
+// work-stealing surface (roadmap 21a) in addition to the static partition one
+// — its N connections share one FTWRL cut, so any can read any table.
+var _ ir.WorkStealingCopyReader = (*concurrentBinlogRows)(nil)
+
 type concurrentBinlogRows struct {
 	// byTable maps an unqualified table name to the inner RowReader (one per
 	// pinned connection) that owns its group. Built once at open from the
@@ -398,6 +403,37 @@ func (r *concurrentBinlogRows) ReadRows(ctx context.Context, table *ir.Table) (<
 // consumer for this reader.
 func (r *concurrentBinlogRows) ConcurrentCopyGroups() [][]string {
 	return r.groups
+}
+
+// ConcurrentReaderCount implements [ir.WorkStealingCopyReader]: the number of
+// pinned connections. Every connection is a consistent-snapshot transaction
+// from the SAME FTWRL cut (ADR-0101), so any can read any in-scope table and
+// see identical data — which is what makes work-stealing correct (roadmap
+// item 21a). >1 here by construction (the opener gates on n > 1).
+func (r *concurrentBinlogRows) ConcurrentReaderCount() int {
+	return len(r.readers)
+}
+
+// ReadRowsOn implements [ir.WorkStealingCopyReader]: read table on the pinned
+// connection at index `reader`, rather than the table's statically-assigned
+// owner ([ReadRows] via byTable). Correct for ANY index because all N
+// connections share the one FTWRL snapshot cut. The work-stealing consumer
+// guarantees at most one in-flight ReadRowsOn per index, so each connection
+// still serves one query at a time (the same invariant the static partition
+// gave for free). A table not present in the schema still produces a valid
+// SELECT; an out-of-range index is refused LOUDLY (a caller bug, never a
+// silent wrong-connection read).
+func (r *concurrentBinlogRows) ReadRowsOn(ctx context.Context, table *ir.Table, reader int) (<-chan ir.Row, error) {
+	if table == nil {
+		return nil, errors.New("mysql: concurrent ReadRowsOn: table is nil")
+	}
+	if reader < 0 || reader >= len(r.readers) {
+		return nil, fmt.Errorf(
+			"mysql: concurrent ReadRowsOn: reader index %d out of range [0,%d) — caller bug",
+			reader, len(r.readers),
+		)
+	}
+	return r.readers[reader].ReadRows(ctx, table)
 }
 
 // Close releases the inner readers. In snapshot mode each inner reader's
