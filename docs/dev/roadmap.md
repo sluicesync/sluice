@@ -405,6 +405,16 @@ So NOTIFY-kick is **demoted** — the poll isn't the bottleneck. Closing the rea
 
 ---
 
+### 24. VStream (Vitess/PlanetScale) source: secondary-index / index-only DDL is NOT forwarded to the target mid-sync — *confirmed gap (live, 2026-06-18); demand-gated; loud-failure-safe (no silent loss)*
+
+**Why (live finding, 2026-06-18, Track B/B2).** Added a secondary index to a live source table via Vitess online DDL (`ALTER TABLE wide_payload ADD INDEX idx_lst_ts (ts)`, `ddl_strategy=vitess`); the migration cut over on both shards (index present on the source), but the index appeared on NEITHER target — not the PS-MySQL target (`lst-mysql-b-v2`) nor the PS-PG target (`lst-pg-b2`). Data kept flowing correctly; only the index did not cross. **No silent loss** — DATA is unaffected; this is a schema-fidelity gap, not a value-fidelity one.
+
+**Root cause (code-confirmed).** sluice HAS a `CREATE INDEX` forwarding path (`ShapeKindCreateIndex` → `applyShapeForward` → `ir.ShapeDeltaApplier`), but it is driven by an `ir.SchemaSnapshot` event, which the VStream reader (`maybeSnapshotSchema`) emits only when the projected (column-name, ordered-type) SIGNATURE changes. The VStream projection `projectVStreamFields` (`internal/engines/mysql/field_to_ir.go`) returns `&ir.Table{Schema, Name, Columns}` — **columns only, no `Indexes`, not even the PK** — because vtgate `FIELD` events carry column metadata only. So an index-only DDL produces an identical signature ⇒ no `SchemaSnapshot` ⇒ `ClassifyShape` never sees `ShapeKindCreateIndex` ⇒ nothing forwarded. The DDL event itself only clears sluice's field cache (`dispatchDDL`). **Index DDL is structurally invisible to schema-forwarding on the VStream path** (CREATE INDEX, DROP INDEX, and — since the PK isn't projected either — PK changes). Whether the binlog (vanilla-MySQL) and PG-logical CDC readers carry index metadata in their CDC `SchemaSnapshot` (and therefore DO forward index DDL via the same path) is a SEPARATE question to verify before claiming parity.
+
+**What (when demanded).** To forward index DDL on the VStream path, the reader would need index metadata at the boundary — e.g. on a DDL event for a table, re-introspect that table's indexes (a primary-routed `SHOW CREATE TABLE` / `information_schema.STATISTICS` probe) and fold them into the projected `ir.Table` so the signature/shape classifier can see the delta. **Gotchas:** (1) the online-DDL cutover streams `_vt_` shadow-table events (filtered by ADR-0073(c)) and re-emits a `FIELD` on the logical table — that's the natural hook point; (2) a re-introspection probe adds a source round-trip per DDL and must be primary-routed + degrade-don't-refuse (mirror `verifyVStreamPositionReachable`); (3) cross-engine index translation (MySQL index → PG index) already exists for cold-copy, so the apply side is mostly there — the gap is purely detection. **Today's operator workaround:** add the index on the target out-of-band (consistent with sluice's "index lifecycle is explicit, not silently auto-handled" stance); cold-copy DOES create source indexes on the target (deferred index creation), so this gap is specific to indexes added AFTER cold-copy during continuous sync.
+
+---
+
 ### Open bugs awaiting fix windows
 
 Tracked in detail in the project's internal regression catalog; recap here for roadmap visibility:
