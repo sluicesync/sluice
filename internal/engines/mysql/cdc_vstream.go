@@ -128,6 +128,25 @@ type vstreamCDCReader struct {
 	// the soft WARN only.
 	idleWarnWindow time.Duration
 
+	// shardStallWarnWindow is the PER-SHARD progress WARN window (item 23,
+	// B-1): how long ONE shard of a multi-shard VStream may go without its
+	// GTID component advancing WHILE a peer shard keeps advancing before the
+	// watchdog emits a single rate-limited WARN naming the wedged shard — the
+	// shard-asymmetric wedge the whole-stream watchdog (a single merged
+	// channel) cannot see. OBSERVABILITY ONLY; never fails the stream. From
+	// the vstream_shard_stall_warn_timeout DSN param; 0 disables this WARN
+	// only. A bare struct literal (unit test) leaves the zero value, which
+	// safely means "off" for this observability-only signal.
+	shardStallWarnWindow time.Duration
+
+	// shardProgress is the per-shard progress watchdog, owned by [pump] for
+	// the stream's life and accessed ONLY from the single-goroutine dispatch
+	// path (set at pump start, cleared at pump exit) — the same
+	// single-goroutine discipline as boolWarn. nil when not pumping or when
+	// the WARN is disabled (shardStallWarnWindow<=0); every watchdog method
+	// is nil-safe.
+	shardProgress *shardProgressWatchdog
+
 	// conn is the underlying gRPC client connection. Held for the
 	// reader's lifetime so multiple StreamChanges calls (currently
 	// disallowed; reserved for a future API change) would share it.
@@ -246,6 +265,13 @@ const vstreamChannelBuffer = 256
 //     to tolerate the multi-minute vreplication/schema-engine warmup
 //     before the first COPY row. Only relevant on the snapshot path;
 //     0 or negative disables Phase 2 for the COPY pump.
+//   - vstream_shard_stall_warn_timeout=<duration> — default 60s. The
+//     PER-SHARD progress WARN window (item 23, B-1): on a multi-shard
+//     keyspace, how long ONE shard's GTID component may freeze WHILE a
+//     peer shard keeps advancing before a single rate-limited WARN names
+//     the wedged shard — the shard-asymmetric wedge the whole-stream
+//     watchdog (a single merged channel) cannot see. OBSERVABILITY ONLY;
+//     never fails the stream. 0 or negative disables this WARN only.
 //
 // Multi-shard sharded keyspaces are supported: enable
 // auto-discovery (or list shards explicitly) and the receive path
@@ -323,25 +349,31 @@ func openVStreamReader(ctx context.Context, dsn string, flavor Flavor) (ir.CDCRe
 		return nil, err
 	}
 
+	shardStallWarnWindow, err := vstreamShardStallWarnWindowFromDSN(cfg)
+	if err != nil {
+		return nil, err
+	}
+
 	conn, err := grpc.NewClient(endpoint, dialOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("mysql/vstream: dial %s: %w", endpoint, err)
 	}
 
 	return &vstreamCDCReader{
-		endpoint:       endpoint,
-		authHeader:     authHeader,
-		keyspace:       cfg.DBName,
-		cfg:            cfg,
-		shards:         shards,
-		tabletType:     tabletType,
-		livenessWindow: livenessWindow,
-		progressWindow: progressWindow,
-		idleWarnWindow: idleWarnWindow,
-		conn:           conn,
-		client:         vtgateservice.NewVitessClient(conn),
-		fields:         make(map[string][]*query.Field),
-		snapshotSig:    make(map[string]ir.SchemaSignature),
+		endpoint:             endpoint,
+		authHeader:           authHeader,
+		keyspace:             cfg.DBName,
+		cfg:                  cfg,
+		shards:               shards,
+		tabletType:           tabletType,
+		livenessWindow:       livenessWindow,
+		progressWindow:       progressWindow,
+		idleWarnWindow:       idleWarnWindow,
+		shardStallWarnWindow: shardStallWarnWindow,
+		conn:                 conn,
+		client:               vtgateservice.NewVitessClient(conn),
+		fields:               make(map[string][]*query.Field),
+		snapshotSig:          make(map[string]ir.SchemaSignature),
 	}, nil
 }
 
@@ -887,6 +919,22 @@ func (r *vstreamCDCReader) pump(
 		})
 	defer live.stop()
 
+	// PER-SHARD progress watchdog (item 23, B-1): WARNs when one shard's
+	// GTID component freezes while a peer keeps advancing — the
+	// shard-asymmetric wedge the whole-stream `live` watchdog (one merged
+	// channel) cannot see. OBSERVABILITY ONLY: onShardStall WARNs and nothing
+	// else — it must NOT setErr or cancel. Owned here for the pump's life and
+	// stashed on r so the single-goroutine dispatch path can feed it the
+	// per-shard advancement diff (cleared on exit).
+	r.shardProgress = startShardProgressWatchdog(ctx, r.shardStallWarnWindow,
+		func(shard string) {
+			slog.WarnContext(ctx, vstreamShardStallWarnMessage(r.shardStallWarnWindow, r.keyspace, shard))
+		})
+	defer func() {
+		r.shardProgress.stop()
+		r.shardProgress = nil
+	}()
+
 	for {
 		resp, err := stream.Recv()
 		if err != nil {
@@ -903,7 +951,15 @@ func (r *vstreamCDCReader) pump(
 		// heartbeats even with no serving tablet (the primary-only wedge,
 		// ADR-0073 (b2)).
 		if evs := resp.GetEvents(); len(evs) > 0 {
-			live.observe(eventsProveLiveness(evs))
+			proof := eventsProveLiveness(evs)
+			live.observe(proof)
+			if proof {
+				// The same serving-proof gate the per-shard watchdog needs:
+				// its WARN is a Phase-2 concept (a frozen shard before serving
+				// is proven is the whole-stream Phase-1 guard's job).
+				// Idempotent — markServingProven sets a flag once.
+				r.shardProgress.markServingProven()
+			}
 		}
 		for _, ev := range resp.GetEvents() {
 			if err := r.dispatch(ctx, ev, out); err != nil {
@@ -952,6 +1008,13 @@ func (r *vstreamCDCReader) dispatch(ctx context.Context, ev *binlogdata.VEvent, 
 		if err != nil {
 			return err
 		}
+		// Per-shard progress watchdog feed (item 23, B-1): diff the previous
+		// VGTID against next to find which shards' GTID component changed, and
+		// report them. Done HERE — where both old and new are in hand on the
+		// single-goroutine dispatch path — so the watchdog can detect a
+		// shard-asymmetric wedge (one shard frozen while a peer advances).
+		// r.shardProgress is nil-safe (disabled WARN / not pumping).
+		r.shardProgress.observeAdvance(advancedShards(r.currentVgtid, next))
 		r.currentVgtid = next
 		return nil
 
