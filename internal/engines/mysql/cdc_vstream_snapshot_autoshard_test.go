@@ -162,6 +162,11 @@ func newAutoShardHarness(t *testing.T, tables []string, scripts [][]*vtgate.VStr
 		Rows:    &vstreamSnapshotRows{snap: s},
 		Changes: &vstreamSnapshotChanges{snap: s},
 	}
+	// Mirror OpenSnapshotStream: wire the COPY-completion barrier the
+	// cold-start handoff joins (via stream.WaitCopyComplete) before it
+	// reads stream.Position. Without this the harness can't exercise the
+	// fix path.
+	stream.WaitCopyCompleteFn = s.waitCopyComplete
 	go s.copyPumpAutoShard(ctx, cancel, stream)
 	return s, stream, client, cancel
 }
@@ -269,6 +274,88 @@ func TestVStreamSnapshot_AutoShard_PerTableThenStitch(t *testing.T) {
 	}
 	if matches[2] != "/.*/" {
 		t.Errorf("stream[2] Match = %q; want %q (keyspace-wide CDC handoff)", matches[2], "/.*/")
+	}
+}
+
+// TestVStreamSnapshot_AutoShard_WaitCopyCompleteOrdersPosition pins the
+// fix for the Position/copyDone handoff race (ADR-0095 / ADR-0099): on
+// the auto-shard path each table's ReadRows channel closes on a PER-TABLE
+// signal (tableCopyComplete), so the LAST ReadRows returning does NOT
+// guarantee the producer goroutine has stitched and written the
+// CDC-resume Position. The cold-start handoff MUST therefore join the
+// producer's completion barrier (ir.SnapshotStream.WaitCopyComplete —
+// copyDone, closed only after finishCopyAutoShard writes Position under
+// mu) BEFORE it reads stream.Position. Without the join the handoff races
+// the write and can read an EMPTY Position — the wrong CDC start
+// position, a potential silent gap (the bug a K=2 -race resume test
+// surfaced as a DATA RACE + "resumed handoff Position empty").
+//
+// This test asserts the post-WaitCopyComplete contract: after the
+// barrier returns, stream.Position is non-empty and equals the stitched
+// per-shard MIN. The accompanying CI -race job is what proves the data
+// race itself is gone; this pin guards the empty/wrong-Position
+// correctness regression and that the barrier hook is wired.
+func TestVStreamSnapshot_AutoShard_WaitCopyCompleteOrdersPosition(t *testing.T) {
+	tables := []string{"users", "orders"}
+	usersGTID := "MySQL56/" + uuidA + ":1-100"
+	ordersGTID := "MySQL56/" + uuidA + ":1-300"
+	scripts := [][]*vtgate.VStreamResponse{
+		perTableCopyScript("users", usersGTID, 3),
+		perTableCopyScript("orders", ordersGTID, 2),
+		{}, // CDC handoff stream (unused here).
+	}
+
+	s, stream, _, cancel := newAutoShardHarness(t, tables, scripts, 0)
+	defer cancel()
+
+	ctx, ccancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer ccancel()
+
+	// The handoff barrier MUST be wired by the constructor (mirrored in
+	// the harness): a nil hook would silently degrade the join to a no-op
+	// and re-expose the race (the zero-value-default trap).
+	if stream.WaitCopyCompleteFn == nil {
+		t.Fatal("WaitCopyCompleteFn is nil; the auto-shard handoff barrier is not wired — the Position/copyDone race is unguarded")
+	}
+
+	// Drain every table's ReadRows to EOF — exactly what runBulkCopy does
+	// before the handoff. On the auto-shard path this can complete BEFORE
+	// the producer writes Position (per-table close signal).
+	for _, name := range tables {
+		tbl := &ir.Table{Name: name, Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}
+		ch, err := stream.Rows.ReadRows(ctx, tbl)
+		if err != nil {
+			t.Fatalf("ReadRows(%s): %v", name, err)
+		}
+		for range ch { //nolint:revive // drain to EOF; row count asserted elsewhere
+		}
+		if err := stream.Rows.Err(); err != nil {
+			t.Fatalf("Err after %s drain: %v", name, err)
+		}
+	}
+
+	// Join the producer's completion barrier — the load-bearing edge the
+	// handoff relies on. After this returns, Position is established.
+	if err := stream.WaitCopyComplete(ctx); err != nil {
+		t.Fatalf("WaitCopyComplete: %v", err)
+	}
+	if err := s.Err(); err != nil {
+		t.Fatalf("pump error: %v", err)
+	}
+
+	// Post-barrier: Position must be non-empty AND the stitched per-shard
+	// MIN (users :1-100, not orders :1-300). An empty token here is the
+	// exact bug — the handoff would persist a zero anchor and start CDC
+	// from the wrong position.
+	if stream.Position.Token == "" {
+		t.Fatal("stream.Position is EMPTY after WaitCopyComplete; the handoff would start CDC from a zero anchor (silent-gap bug)")
+	}
+	wantPos, err := encodeVStreamPos([]shardGtid{{Keyspace: "main", Shard: "-", Gtid: usersGTID}})
+	if err != nil {
+		t.Fatalf("encodeVStreamPos: %v", err)
+	}
+	if stream.Position.Token != wantPos.Token {
+		t.Fatalf("Position token after WaitCopyComplete = %q; want the stitched MIN %q", stream.Position.Token, wantPos.Token)
 	}
 }
 

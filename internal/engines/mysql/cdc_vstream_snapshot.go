@@ -392,10 +392,25 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 	stream := &ir.SnapshotStream{
 		// Position is finalised by the COPY pump at the global
 		// COPY_COMPLETED event and read by the orchestrator only AFTER
-		// bulk-copy (ADR-0071). The happens-before edge is the per-table
-		// row-channel close: the pump records the final position BEFORE
-		// signalling copy-completion, and the orchestrator's post-bulk-
-		// copy read is ordered after every ReadRows channel has closed.
+		// bulk-copy (ADR-0071).
+		//
+		// On the SINGLE-STREAM path, the happens-before edge to the
+		// orchestrator's Position read is the row-channel close: the
+		// pump records Position under mu, flips copyComplete, and only
+		// then can a draining ReadRows observe completion and close, so
+		// a post-drain Position read is ordered after the write.
+		//
+		// On the AUTO-SHARD / concurrent paths (ADR-0095 / ADR-0099)
+		// that edge does NOT hold: each ReadRows closes on a PER-TABLE
+		// signal (tableCopyComplete), so the last ReadRows can return
+		// BEFORE the producer goroutine stitches and writes the
+		// stitched-minimum Position. The orchestrator must therefore
+		// join the producer's completion barrier (WaitCopyCompleteFn,
+		// below — copyDone, closed only AFTER finishCopyAutoShard writes
+		// Position under mu) before reading Position. Without the join
+		// the handoff races the write and can read an EMPTY Position —
+		// the wrong CDC start position, a potential silent gap.
+		//
 		// It is the zero Position at open time; the cold-start log line
 		// that reads it immediately after open simply shows an empty
 		// token (cosmetic — the load-bearing read is the post-copy one).
@@ -403,6 +418,15 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 		Changes: &vstreamSnapshotChanges{snap: snap},
 	}
 	stream.CloseFn = snap.close
+	// The cold-start handoff joins this barrier after bulk-copy drains
+	// and before it reads stream.Position. copyDone is closed by the
+	// COPY pump exactly once, AFTER finishCopy / finishCopyAutoShard has
+	// written Position under mu, so the join establishes
+	// producer-writes-Position → closes-copyDone → handoff-waits-copyDone
+	// → handoff-reads-Position. Required on the auto-shard / concurrent
+	// paths (per-table ReadRows close); harmless (already closed) on the
+	// single-stream path.
+	stream.WaitCopyCompleteFn = snap.waitCopyComplete
 
 	// Pump the COPY phase concurrently rather than draining it to
 	// completion here. streamCtx (owned by CloseFn) bounds the pump's
@@ -1320,11 +1344,17 @@ func (s *vstreamSnapshotStream) reopenForTableSeeded(ctx context.Context, table 
 // finishCopyAutoShard stitches the captured per-table snapshot points
 // into the single CDC-resume position (the per-shard GTID-set minimum,
 // ADR-0095), records it onto the stream, and flips the global
-// copyComplete so any straggler consumer unwedges. The happens-before
-// edge to the orchestrator's post-bulk-copy Position read is the same as
-// [finishCopy]: the Position write precedes the copyComplete flip under
-// mu, and the orchestrator reads Position only after every ReadRows
-// channel has closed.
+// copyComplete so any straggler consumer unwedges.
+//
+// Happens-before to the orchestrator's post-bulk-copy Position read:
+// this runs as a regular call inside the COPY pump, BEFORE the pump's
+// deferred close(copyDone). The Position write here is under mu; the
+// orchestrator joins copyDone (via WaitCopyComplete) before reading
+// Position. The chain is: write Position under mu → close copyDone →
+// handoff waits copyDone → handoff reads Position. NOTE the per-table
+// ReadRows close (tableCopyComplete) does NOT order this write — the
+// last ReadRows can return before this runs — so the copyDone join is
+// the load-bearing edge, not the row-channel close.
 func (s *vstreamSnapshotStream) finishCopyAutoShard(stream *ir.SnapshotStream) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1911,6 +1941,32 @@ func (s *vstreamSnapshotStream) enqueueRowLocked(tableName string, row ir.Row) e
 	return nil
 }
 
+// waitCopyComplete blocks until the COPY pump closes copyDone — the
+// barrier the cold-start handoff joins (via
+// [ir.SnapshotStream.WaitCopyComplete]) after bulk-copy drains and
+// BEFORE it reads stream.Position. copyDone is closed exactly once by
+// the COPY pump, AFTER finishCopy / finishCopyAutoShard has written
+// Position under mu (and seeded currentVgtid), so the join establishes:
+// producer writes Position under mu → closes copyDone → handoff waits
+// copyDone → handoff reads Position. This is the load-bearing edge on
+// the auto-shard / concurrent paths, where each ReadRows closes on a
+// PER-TABLE signal and the last ReadRows can return before Position is
+// written; on the single-stream path copyDone is already closed by the
+// time the handoff calls this, so it returns immediately. ctx-cancellable
+// so a shutdown mid-wait unwedges; idempotent (a closed channel keeps
+// returning). A nil copyDone (never constructed) is a no-op.
+func (s *vstreamSnapshotStream) waitCopyComplete(ctx context.Context) error {
+	if s.copyDone == nil {
+		return nil
+	}
+	select {
+	case <-s.copyDone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // startPump spawns the post-COPY CDC pump goroutine. Returns the
 // changes channel the pump owns and closes on shutdown. Idempotent
 // guard via pumpStarted: a second StreamChanges call returns an
@@ -1934,12 +1990,8 @@ func (s *vstreamSnapshotStream) startPump(ctx context.Context) (<-chan ir.Change
 	s.pumpStarted = true
 	s.mu.Unlock()
 
-	if s.copyDone != nil {
-		select {
-		case <-s.copyDone:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
+	if err := s.waitCopyComplete(ctx); err != nil {
+		return nil, err
 	}
 	if err := s.Err(); err != nil {
 		return nil, err
