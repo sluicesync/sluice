@@ -175,7 +175,7 @@ func TestColdStartGate_RestartFromScratch_NonIdempotent_DropsTarget(t *testing.T
 
 	err := s.coldStartGatePreflight(
 		context.Background(), schema, nil /*sw*/, rw, gateStream(nonIdempotentReader{}),
-		&stubChangeApplier{}, "stream-1", false, /*resumingCopy*/
+		&stubChangeApplier{}, "stream-1", false /*resumingCopy*/, true, /*forceFresh*/
 	)
 	if err != nil {
 		t.Fatalf("gate: %v", err)
@@ -196,7 +196,7 @@ func TestColdStartGate_RestartFromScratch_Idempotent_DoesNotDrop(t *testing.T) {
 
 	err := s.coldStartGatePreflight(
 		context.Background(), schema, nil /*sw*/, rw, gateStream(idempotentReader{}),
-		&stubChangeApplier{}, "stream-1", false, /*resumingCopy*/
+		&stubChangeApplier{}, "stream-1", false /*resumingCopy*/, true, /*forceFresh*/
 	)
 	if err != nil {
 		t.Fatalf("gate: %v", err)
@@ -220,12 +220,74 @@ func TestColdStartGate_RestartFromScratch_SurfaceFalse_DropsTarget(t *testing.T)
 
 	err := s.coldStartGatePreflight(
 		context.Background(), schema, nil, rw, gateStream(idempotentReaderFalse{}),
-		&stubChangeApplier{}, "stream-1", false,
+		&stubChangeApplier{}, "stream-1", false /*resumingCopy*/, true, /*forceFresh*/
 	)
 	if err != nil {
 		t.Fatalf("gate: %v", err)
 	}
 	if len(rw.dropped) != 1 {
 		t.Errorf("surface-false reader must be treated as non-idempotent and dropped; dropped = %v", rw.dropped)
+	}
+}
+
+// populatedChecker is a RowWriter whose target tables are NON-empty, so the
+// default populated-target preflight (Bug 9) fires unless suppressed.
+type populatedChecker struct{ dropped []string }
+
+func (w *populatedChecker) WriteRows(context.Context, *ir.Table, <-chan ir.Row) error {
+	return errors.New("populatedChecker.WriteRows should not be called by the gate")
+}
+
+func (w *populatedChecker) DropTable(_ context.Context, table *ir.Table) error {
+	w.dropped = append(w.dropped, table.Name)
+	return nil
+}
+
+func (w *populatedChecker) IsTableEmpty(context.Context, *ir.Table) (bool, error) {
+	return false, nil
+}
+
+// The live Track-B/D dead-end: an ADR-0093 auto-resnapshot (warm-resume →
+// ir.ErrPositionInvalid because the persisted GTID/binlog position was purged)
+// re-copies onto the EXISTING stream's target — which is populated by
+// definition. Before the fix the fall-through called coldStart with force=false
+// and the populated-target preflight refused, dead-ending the recovery.
+// forceFresh is the discriminator the fix threads through both --restart-from-
+// scratch AND the auto-resnapshot fall-through:
+//   - forceFresh=true  → proceed (idempotent reader absorbs the overlap via
+//     UPSERT; no drop), so the resnapshot can actually re-copy.
+//   - forceFresh=false → STILL refuse (a genuine fresh cold-start onto a
+//     populated target is the Bug-9 operator mistake — must not be weakened).
+func TestColdStartGate_ForceFresh_DiscriminatesPopulatedTarget(t *testing.T) {
+	captureSlog(t)
+	schema := &ir.Schema{Tables: []*ir.Table{{Name: "users"}}}
+	s := &Streamer{Source: &copyResumeEngine{name: "planetscale"}}
+
+	// forceFresh=true on a POPULATED idempotent target: proceed, no refusal,
+	// no drop (the UPSERT cold-copy absorbs the overlap). This is the fix —
+	// the auto-resnapshot / restart-from-scratch re-copy path.
+	rwFresh := &populatedChecker{}
+	if err := s.coldStartGatePreflight(
+		context.Background(), schema, nil, rwFresh, gateStream(idempotentReader{}),
+		&stubChangeApplier{}, "stream-1", false /*resumingCopy*/, true, /*forceFresh*/
+	); err != nil {
+		t.Fatalf("forceFresh=true must PROCEED on a populated idempotent target (auto-resnapshot/restart): %v", err)
+	}
+	if len(rwFresh.dropped) != 0 {
+		t.Errorf("idempotent forceFresh must NOT drop (UPSERT absorbs the overlap); dropped = %v", rwFresh.dropped)
+	}
+
+	// forceFresh=false on the SAME populated target: still refuses (Bug 9
+	// cold-start guard preserved — we did not weaken it).
+	rwGenuine := &populatedChecker{}
+	err := s.coldStartGatePreflight(
+		context.Background(), schema, nil, rwGenuine, gateStream(idempotentReader{}),
+		&stubChangeApplier{}, "stream-1", false /*resumingCopy*/, false, /*forceFresh*/
+	)
+	if err == nil {
+		t.Fatal("forceFresh=false on a populated target must REFUSE (Bug 9 cold-start guard)")
+	}
+	if !errors.Is(err, errColdStartRefused) {
+		t.Errorf("want errColdStartRefused, got: %v", err)
 	}
 }

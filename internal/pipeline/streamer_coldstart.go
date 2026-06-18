@@ -50,7 +50,20 @@ import (
 // the bulk-copy machinery, the CDC handoff) is shared verbatim with the
 // fresh path. The completed-cold-start warm-resume (cursor-less position)
 // never reaches here — it stays on the fast plain-CDC warmResume path.
-func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.ChangeApplier, streamID string, resumeFrom ir.Position) (changes <-chan ir.Change, stop func(), err error) {
+// forceFresh marks a DELIBERATE re-copy onto an expectedly-populated target:
+// the operator's `--restart-from-scratch` OR the automatic ADR-0093
+// auto-resnapshot (warm-resume → ir.ErrPositionInvalid fall-through, where the
+// persisted position was purged from the source binlog/GTID window). In both
+// cases the target already holds the prior copy — that is the EXPECTED state,
+// not the Bug-9 "operator pointed at a populated target" mistake — so the
+// cold-start gate must NOT refuse: an idempotent reader (VStream/PlanetScale,
+// PG) re-copies with UPSERT (absorbs the overlap) and a non-idempotent reader
+// (native MySQL binlog, plain INSERT) has its in-scope target tables dropped +
+// recreated first so the copy doesn't dup-key. Before this flag the
+// auto-resnapshot path took the default branch with force=false and ALWAYS
+// dead-ended on the populated-target refusal (a re-snapshot of an existing
+// stream is populated by definition) — the live Track-B/D finding.
+func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.ChangeApplier, streamID string, resumeFrom ir.Position, forceFresh bool) (changes <-chan ir.Change, stop func(), err error) {
 	// resumingCopy is the interrupted-cold-start discriminator: a non-zero
 	// resume position. It gates the seeded snapshot open and the preflight
 	// skip in the phases below. Read once here so the call sites can't drift.
@@ -113,7 +126,7 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// Gate the cold start: --reset-target-data recovery,
 	// --schema-already-applied skip, interrupted-COPY resume skip, or
 	// the default populated-target preflight (Bug 9 / ADR-0048 DP-2).
-	if err := s.coldStartGatePreflight(ctx, schema, sw, rw, stream, applier, streamID, resumingCopy); err != nil {
+	if err := s.coldStartGatePreflight(ctx, schema, sw, rw, stream, applier, streamID, resumingCopy, forceFresh); err != nil {
 		return nil, stop, err
 	}
 
@@ -473,7 +486,7 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 // expected state), or the default path's populated-target preflights
 // (ADR-0048 Shape-A three-point check / Bug 9 cold-start refusal).
 // On any error the writers and the snapshot stream are closed here.
-func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema, sw ir.SchemaWriter, rw ir.RowWriter, stream *ir.SnapshotStream, applier ir.ChangeApplier, streamID string, resumingCopy bool) error {
+func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema, sw ir.SchemaWriter, rw ir.RowWriter, stream *ir.SnapshotStream, applier ir.ChangeApplier, streamID string, resumingCopy, forceFresh bool) error {
 	switch {
 	case s.ResetTargetData:
 		if err := resetTargetDataForStream(ctx, schema, rw, applier, streamID); err != nil {
@@ -514,22 +527,24 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 			ctx, "cold-start COPY resume: skipping populated-target preflight (partial copy is the expected state)",
 			slog.String("stream_id", streamID),
 		)
-	case s.RestartFromScratch && !s.InjectShardColumn.Engaged() && !copyReaderIsIdempotent(stream.Rows):
+	case forceFresh && !s.InjectShardColumn.Engaged() && !copyReaderIsIdempotent(stream.Rows):
 		// restart-from-scratch / auto-resnapshot (ADR-0093) onto a
 		// NON-idempotent snapshot reader (native MySQL binlog: the cold-copy
-		// runs plain INSERT — see [runBulkCopyWithOpts]). "From scratch"
-		// means a clean re-copy, but the dispatch routes here WITHOUT
-		// dropping the target, so the leftover rows from the prior copy would
-		// dup-key-collide (MySQL Error 1062) on the plain INSERT. The
+		// runs plain INSERT — see [runBulkCopyWithOpts]). forceFresh is set by
+		// BOTH the operator's --restart-from-scratch AND the automatic
+		// auto-resnapshot fall-through (warm-resume → ir.ErrPositionInvalid).
+		// "From scratch" means a clean re-copy, but the dispatch routes here
+		// WITHOUT dropping the target, so the leftover rows from the prior copy
+		// would dup-key-collide (MySQL Error 1062) on the plain INSERT. The
 		// idempotent VStream/PG path genuinely absorbs the overlap (UPSERT)
 		// and stays on the default skip-preflight branch below; this branch
 		// makes the non-idempotent case actually start from a clean target by
 		// dropping the in-scope tables first (CreateTablesWithoutConstraints
 		// recreates them empty). Reuses the FK-safe drop machinery
 		// --reset-target-data uses, but leaves the cdc-state row alone (the
-		// restart dispatch already discards the position). This is the loud-
-		// failure fix for the misleading "the idempotent copy absorbs the
-		// overlap" hint, which only ever held for idempotent readers.
+		// restart/resnapshot dispatch already discards the position). This is
+		// the loud-failure fix for the misleading "the idempotent copy absorbs
+		// the overlap" hint, which only ever held for idempotent readers.
 		if err := resetTargetTablesForRestart(ctx, schema, rw); err != nil {
 			closeIf(rw)
 			closeIf(sw)
@@ -567,14 +582,16 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 		// check above is the operator-opted-in replacement; the
 		// classic cold-start preflight is suppressed in that case.
 		if !s.InjectShardColumn.Engaged() {
-			// --restart-from-scratch reaches this default branch only for an
-			// IDEMPOTENT reader (VStream/PG) — the non-idempotent case is
-			// drained by the dedicated case above, which drops the target
-			// first. For the idempotent reader the pre-flight skip is correct:
-			// the operator is deliberately re-copying onto existing rows and
-			// the UPSERT writer absorbs the overlap. (--force-cold-start keeps
+			// forceFresh (--restart-from-scratch OR auto-resnapshot) reaches
+			// this default branch only for an IDEMPOTENT reader (VStream/PG) —
+			// the non-idempotent case is drained by the dedicated case above,
+			// which drops the target first. For the idempotent reader the
+			// pre-flight skip is correct: this is a deliberate re-copy onto
+			// existing rows and the UPSERT writer absorbs the overlap. (A
+			// genuine fresh cold-start has forceFresh=false and is still
+			// refused on a populated target — Bug 9. --force-cold-start keeps
 			// its existing skip semantics for either reader.)
-			if err := preflightColdStart(ctx, schema, rw, s.ForceColdStart || s.RestartFromScratch, preflightModeSync); err != nil {
+			if err := preflightColdStart(ctx, schema, rw, s.ForceColdStart || forceFresh, preflightModeSync); err != nil {
 				closeIf(rw)
 				closeIf(sw)
 				_ = stream.Close()

@@ -133,11 +133,18 @@ func (s *Streamer) resolveStreamDatabases(ctx context.Context) (selected []strin
 //
 // The returned changes channel + stop closure follow the same contract as
 // [Streamer.coldStart].
+// forceFresh has the same meaning as in [Streamer.coldStart]: a deliberate
+// re-copy onto an expectedly-populated target — the operator's
+// --restart-from-scratch OR the automatic ADR-0093 auto-resnapshot
+// (warm-resume → ir.ErrPositionInvalid fall-through). It suppresses the
+// populated-target refusal (idempotent absorbs via UPSERT; non-idempotent
+// drops + recreates first), keeping the cdc-state row.
 func (s *Streamer) coldStartMultiDatabase(
 	ctx context.Context,
 	lsnTracker any,
 	applier ir.ChangeApplier,
 	streamID string,
+	forceFresh bool,
 ) (changes <-chan ir.Change, stop func(), err error) {
 	stop = func() {}
 
@@ -211,7 +218,7 @@ func (s *Streamer) coldStartMultiDatabase(
 	// qualifies its SELECT by that schema, so the single pinned snapshot
 	// connection reads across every database at the one consistent view. ----
 	for _, database := range selected {
-		if err := s.coldStartCopyOneDatabase(ctx, stream, applier, streamID, database, inScope, targetDeriver, targetCanDeriveDB); err != nil {
+		if err := s.coldStartCopyOneDatabase(ctx, stream, applier, streamID, database, inScope, targetDeriver, targetCanDeriveDB, forceFresh); err != nil {
 			closeStream()
 			return nil, stop, err
 		}
@@ -468,6 +475,7 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	inScope func(string) bool,
 	targetDeriver ir.DatabaseDSNDeriver,
 	targetCanDeriveDB bool,
+	forceFresh bool,
 ) error {
 	// Per-database source DSN so the scoped SchemaReader reads the right
 	// database's information_schema. The bulk-copy ROW reads come from the
@@ -570,21 +578,23 @@ func (s *Streamer) coldStartCopyOneDatabase(
 			closeIf(sw)
 			return fmt.Errorf("pipeline: reset target data for %q: %w", database, err)
 		}
-	case s.RestartFromScratch && !copyReaderIsIdempotent(stream.Rows):
+	case forceFresh && !copyReaderIsIdempotent(stream.Rows):
 		// restart-from-scratch / auto-resnapshot onto a NON-idempotent reader
 		// (multi-database fan-out is MySQL-source native binlog, plain
-		// INSERT). Drop the in-scope target tables first so the fresh
-		// cold-start doesn't dup-key (Error 1062) on the prior copy's rows.
-		// Mirrors the single-database gate in coldStartGatePreflight; the
-		// idempotent path (none in multi-DB today, but guarded for parity)
-		// keeps the absorb-the-overlap behaviour via the default branch.
+		// INSERT). forceFresh covers BOTH --restart-from-scratch AND the
+		// automatic auto-resnapshot fall-through. Drop the in-scope target
+		// tables first so the fresh cold-start doesn't dup-key (Error 1062) on
+		// the prior copy's rows. Mirrors the single-database gate in
+		// coldStartGatePreflight; the idempotent path (none in multi-DB today,
+		// but guarded for parity) keeps the absorb-the-overlap behaviour via
+		// the default branch.
 		if err := resetTargetTablesForRestart(ctx, schema, rw); err != nil {
 			closeIf(rw)
 			closeIf(sw)
 			return fmt.Errorf("pipeline: restart-from-scratch reset for %q: %w", database, err)
 		}
 	default:
-		if err := preflightColdStart(ctx, schema, rw, s.ForceColdStart || s.RestartFromScratch, preflightModeSync); err != nil {
+		if err := preflightColdStart(ctx, schema, rw, s.ForceColdStart || forceFresh, preflightModeSync); err != nil {
 			closeIf(rw)
 			closeIf(sw)
 			return fmt.Errorf("pipeline: cold-start preflight for %q: %w", database, err)
