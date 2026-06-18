@@ -111,6 +111,14 @@ func TestVStream_ConcurrentCopy_AllTablesLand(t *testing.T) {
 		}
 	}
 
+	// Join the COPY-completion barrier before reading Position — on the
+	// concurrent path the per-table ReadRows close does NOT order the
+	// producer's stitched-Position write, so a direct read races it (the
+	// real cold-start handoff does this join; see WaitCopyComplete).
+	if err := stream.WaitCopyComplete(ctx); err != nil {
+		t.Fatalf("WaitCopyComplete after concurrent copy: %v", err)
+	}
+
 	// The handoff position is the per-shard set-min across the union of all
 	// streams' per-table snapshots — must be a valid resume token.
 	if stream.Position.Engine == "" || stream.Position.Token == "" {

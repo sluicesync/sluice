@@ -120,6 +120,14 @@ func TestVStream_AutoShardSnapshot_MultiTableBoundedMemory(t *testing.T) {
 		}
 	}
 
+	// Join the COPY-completion barrier before reading Position — on the
+	// auto-shard path the per-table ReadRows close does NOT order the
+	// producer's stitched-Position write, so a direct read races it (the
+	// real cold-start handoff does this join; see WaitCopyComplete).
+	if err := stream.WaitCopyComplete(ctx); err != nil {
+		t.Fatalf("WaitCopyComplete after auto-shard copy: %v", err)
+	}
+
 	// The handoff position must be a valid VStream position (the stitched
 	// per-table minimum) so the CDC tail can resume.
 	if stream.Position.Engine == "" || stream.Position.Token == "" {
