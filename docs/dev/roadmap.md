@@ -359,6 +359,16 @@ So NOTIFY-kick is **demoted** — the poll isn't the bottleneck. Closing the rea
 
 ---
 
+### 20. Heroku migrator: PlanetScale **MySQL** target support (today it's Postgres-target only) — *demand-gated follow-up; core path already exists*
+
+**Why.** The `sluicesync/sluice-heroku-migrator` wrapper drives Heroku Postgres → **PlanetScale Postgres** only — `scripts/mk-sluice-repl.sh` hardcodes `--target-driver=postgres --target="$REPLICA"`, and `entrypoint.sh` treats `PLANETSCALE_URL` as a PG DSN (`sslmode`/`sslrootcert=system`, psql-based status/cutover). But sluice's **core already supports Heroku PG → PlanetScale MySQL**: `postgres-trigger` → MySQL is the supported cross-engine direction (`internal/pipeline/cross_engine_supportable.go:49` — "the only supported cross-engine direction is PG ↔ MySQL"; `postgres-trigger` explicitly recognized as a cross-engine source) and is integration-tested (`migrate_pgtrigger_cross_congruence_integration_test.go`, `migrate_pgtrigger_streamer_integration_test.go`, `cutover_pgtrigger_cross_integration_test.go`). So this is a **wrapper enhancement, not a core capability gap** — surfaced 2026-06-18 during the large-scale program.
+
+**What.** Add a `TARGET_ENGINE=postgres|mysql` switch to the migrator: (1) thread `--target-driver=mysql` + a MySQL target DSN shape (`user:pw@tcp(host:3306)/db?tls=true`) through `mk-sluice-repl.sh` (the cutover REVOKE/GRANT is source-side, so that part is engine-agnostic); (2) the status server / entrypoint must stop assuming a PG target DSN (the `sslrootcert=system` rewrite + any target-side psql probes are PG-only — gate them on `TARGET_ENGINE`); (3) surface the **cross-engine type-translation refusals in the dashboard preflight** so an operator sees blocked columns (PG arrays, PostGIS geometry, non-default extension types — refused loudly, resolved via `--type-override`/`--exclude-column`) *before* starting, not mid-run.
+
+**Gotchas.** Cross-engine PG→MySQL is loud-refuse-by-default for PG-native types with no clean MySQL form — the migrator must present that as a first-class preflight, not a surprise failure. The `_ps_migration_state` table is target-side; with a MySQL target it lives on PlanetScale MySQL (the existing psql-based persistence path would need a MySQL equivalent, or route it differently). Pairs conceptually with the "postgres-trigger Phase 2 cross-engine targets (task #72)" note in `cross_engine_supportable.go`. **Demand-gated** — revisit when an operator actually wants Heroku PG → PlanetScale MySQL; the heavy lifting (cross-engine CDC + congruence) is already shipped and tested.
+
+---
+
 ### Open bugs awaiting fix windows
 
 Tracked in detail in the project's internal regression catalog; recap here for roadmap visibility:
