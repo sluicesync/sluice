@@ -4,6 +4,16 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.78] - 2026-06-19
+
+### Removed
+
+- **The experimental `--apply-pipeline-depth` flag (ADR-0104 Phase 1) is removed — superseded by `--apply-concurrency` (v0.99.77).** Phase 1 was an in-order pipelined-COMMIT design that, on the live cross-region PlanetScale-MySQL link, was measured to overlap only the commit RTT and not the per-batch data execs, so it delivered no throughput improvement (≈ serial, 7 of 8 backends idle). Its successor — `--apply-concurrency`, the key-hash concurrent apply path added in v0.99.77 and live-validated at ~4× — fully replaces it, so the dead commit-pipeline implementation (`mysqlPipeline` and ~1,100 lines of code + tests) and the `--apply-pipeline-depth` flag are removed wholesale rather than left as confusing, ineffective scaffolding. The change is a pure removal that reverts the batched-apply seam to its pre-ADR-0104 serial shape with no change to serial-apply behavior; the concurrent path (`--apply-concurrency`) is untouched. Operators who want concurrent CDC apply on a MySQL target should use `--apply-concurrency=W` (which actually closes the cross-region apply-deficit wedge); `--apply-pipeline-depth` never did, so removing it loses no working capability.
+
+### Fixed
+
+- **De-flaked `TestShardProgressWatchdog_EndToEnd_AsymmetricStallWarns` under `-race` (test-only; no runtime change).** The per-shard stall watchdog's end-to-end test sent a redundant initial `observeAdvance` and tried to drain it by firing the fake timer, but firing the timer drains the `timer.C()` select case, not the depth-1 advances channel — so the first advance could still occupy the buffer when the second was sent, and the watchdog's intended drop-when-full behavior silently dropped it under an unfavorable `-race` schedule, leaving no fresh peer and so no WARN (a CI timeout). The production watchdog is correct (it pre-seeds every known shard's clock at start, so both shards are fresh at t=0 without any observe); the redundant observe was a test-harness artifact and is removed, mirroring the non-flaky from-start-frozen test. No change to the watchdog itself.
+
 ## [0.99.77] - 2026-06-19
 
 ### Fixed
