@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
+
 	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/redact"
@@ -110,6 +112,48 @@ import (
 type ChangeApplier struct {
 	db     *sql.DB
 	schema string
+
+	// pipelineCfg is the parsed target DSN, retained so the ADR-0104
+	// pipelined-apply pool can be opened lazily on the first pipelined
+	// batch ([ChangeApplier.pipeline]). nil for direct-API / unit
+	// constructions, which disables the pipelined path (falls back to
+	// serial). Set by OpenChangeApplier.
+	pipelineCfg *mysql.Config
+
+	// applyPipelineDepth is the ADR-0104 Phase-1 in-flight commit-window
+	// depth W: the number of independent ordered transactions that may be
+	// in flight across W dedicated backends, committed strictly in
+	// submission order to overlap cross-region commit RTTs (aggregate
+	// ceiling ~W/RTT). Zero-value-safe (the v0.99.51 trap): 0 and 1 BOTH
+	// mean serial — byte-identical to the pre-ADR-0104 path, no dedicated
+	// pool opened, no WARN. Pipelining engages ONLY when an operator sets
+	// W > 1 via [SetApplyPipelineDepth]. Every non-CLI construction (tests,
+	// broker, chain, future callers) gets the safe serial default for free.
+	applyPipelineDepth int
+
+	// pipelinePool is the lazily-started ADR-0104 ordered commit pipeline
+	// (dedicated W-backend pool + single in-order commit worker). nil until
+	// the first pipelined BeginTx; reset to nil by drainPipeline so a
+	// warm-resume / retry re-opens a fresh worker. Applier-goroutine-owned
+	// for lifecycle (open in pipeline(), nil-out in drainPipeline); its
+	// internal channels + mutex make the producer/consumer hand-off
+	// race-clean (see change_applier_pipelined.go).
+	pipelinePool *mysqlPipeline
+
+	// pipelineWarnedFallback / pipelineWarnedEngaged gate the one-time
+	// fallback WARN and one-time engaged INFO so a persistent condition
+	// logs once, not once per batch (mirrors ADR-0092's PG counterpart).
+	pipelineWarnedFallback bool
+	pipelineWarnedEngaged  bool
+
+	// pendingKeylessFlush carries the ADR-0089 keyless verdict from the
+	// shared loop's IsKeylessTable callback to the imminent Commit closure,
+	// so a pipelined keyless batch commits synchronously with the window
+	// drained (it linearizes as --apply-batch-size=1; the pipeline never
+	// widens the at-least-once replay window). Applier-goroutine-owned
+	// (set + read+clear on the single applier goroutine); unread on the
+	// serial path.
+	pendingKeylessFlush bool
 
 	// multiDBRouting is the ADR-0074 Phase 1b per-change namespace
 	// routing switch, set by [SetMultiDatabaseRouting]. When false (the
@@ -371,6 +415,23 @@ func (a *ChangeApplier) SetExecTimeout(d time.Duration) {
 	a.execTimeout = d
 }
 
+// SetApplyPipelineDepth implements [ir.ApplyPipelineDepthSetter]
+// (ADR-0104 Phase 1). Records the in-flight commit-window depth W. The
+// streamer calls this after [Engine.OpenChangeApplier] returns when
+// --apply-pipeline-depth is set, before ApplyBatch runs.
+//
+// Zero-value-safe (the v0.99.51 trap): depth 0 and 1 BOTH resolve to
+// serial — byte-identical to the pre-ADR-0104 path, no dedicated pool
+// opened, no WARN. Pipelining engages ONLY for W > 1. A negative value
+// is clamped to 0 (serial) so a mis-parsed flag can never engage the
+// pipeline. Idempotent; the streamer may call this on every Run.
+func (a *ChangeApplier) SetApplyPipelineDepth(depth int) {
+	if depth < 0 {
+		depth = 0
+	}
+	a.applyPipelineDepth = depth
+}
+
 // SetRedactor implements [ir.RedactorSetter] (PII Phase 1.5,
 // roadmap item 15a follow-on). Stores the operator-configured
 // redaction registry; the apply path invokes
@@ -599,12 +660,26 @@ func (a *ChangeApplier) commitWithTimeout(tx *sql.Tx) error {
 	return appliershared.RunWithDeadline(a.execTimeout, tx.Commit)
 }
 
-// Close releases the underlying connection pool.
+// Close releases the underlying connection pool(s) — both the per-change
+// pool and any lazily-started ADR-0104 pipelined pool. The pipeline is
+// drained first (committing every in-flight batch in order and stopping
+// the commit worker) so Close never strands a backend or leaks the
+// worker goroutine; its drain error is returned if the primary close
+// succeeds.
 func (a *ChangeApplier) Close() error {
-	if a.db == nil {
-		return nil
+	var firstErr error
+	if a.pipelinePool != nil {
+		if err := a.pipelinePool.closePool(); err != nil {
+			firstErr = err
+		}
+		a.pipelinePool = nil
 	}
-	return a.db.Close()
+	if a.db != nil {
+		if err := a.db.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // EnsureControlTable creates the per-target sluice_cdc_state table

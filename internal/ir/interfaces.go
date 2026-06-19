@@ -367,6 +367,25 @@ type ApplyExecTimeoutSetter interface {
 	SetExecTimeout(d time.Duration)
 }
 
+// ApplyPipelineDepthSetter is the optional surface a [ChangeApplier]
+// can implement to receive the ADR-0104 apply-pipeline depth W: the
+// number of independent ordered CDC-apply transactions that may be in
+// flight at once, committed strictly in submission (source) order, to
+// overlap cross-region commit RTTs (aggregate apply ceiling ~W/RTT).
+// The streamer threads [pipeline.Streamer.ApplyPipelineDepth] to every
+// applier that exposes this setter.
+//
+// Zero-value-safe (the v0.99.51 trap): depth 0 and 1 BOTH mean serial —
+// byte-identical to the pre-ADR-0104 path, no dedicated pool, no
+// throughput claim. Pipelining engages ONLY when an operator explicitly
+// sets W > 1. Engines that don't implement the setter (or run with the
+// zero value) stay serial. Only the MySQL target implements it today
+// (Postgres uses the within-transaction statement-pipelining lever of
+// ADR-0092 instead; the levers are protocol-specific and do not port).
+type ApplyPipelineDepthSetter interface {
+	SetApplyPipelineDepth(depth int)
+}
+
 // RedactorSetter is the optional surface a [ChangeApplier] can
 // implement to receive the operator-configured PII redaction
 // policy. PII Phase 1.5 (roadmap item 15a follow-on, GitHub issue

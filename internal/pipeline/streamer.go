@@ -495,6 +495,24 @@ type Streamer struct {
 	// to bound the silent-stall window (GitHub issue #23).
 	ApplyExecTimeout time.Duration
 
+	// ApplyPipelineDepth is the ADR-0104 Phase-1 apply-pipeline depth W
+	// plumbed to the target [ir.ChangeApplier] via the optional
+	// [ir.ApplyPipelineDepthSetter] interface. It is the number of
+	// independent ordered CDC-apply transactions that may be in flight at
+	// once, committed strictly in submission (source) order, to overlap
+	// cross-region commit RTTs on a high-latency link (aggregate apply
+	// ceiling ~W/RTT) — the lever that closes the item-23 per-shard wedge
+	// on a cross-region PlanetScale-MySQL target.
+	//
+	// Zero-value-safe (the v0.99.51 trap): 0 and 1 BOTH mean serial,
+	// byte-identical to the pre-ADR-0104 path; pipelining engages ONLY for
+	// W > 1. Only the MySQL target applier implements the setter today
+	// (Postgres uses ADR-0092's within-tx statement pipelining instead).
+	// The CLI's `sync start --apply-pipeline-depth=W` flag is the
+	// operator-facing knob; the default (0) keeps every stream serial
+	// unless the operator opts in.
+	ApplyPipelineDepth int
+
 	// AutoTune controls whether the AIMD apply-batch-size controller
 	// (ADR-0052) is engaged for this stream. Per ADR-0052 DP-1 the
 	// default is "on" — operators pass `--no-auto-tune` to opt out.

@@ -1391,6 +1391,28 @@ func applyExecTimeout(target any, d time.Duration) {
 	}
 }
 
+// applyApplyPipelineDepth plumbs the streamer-side
+// --apply-pipeline-depth value to a target [ir.ChangeApplier] that opts
+// into the ADR-0104 ordered commit pipeline via
+// [ir.ApplyPipelineDepthSetter]. Engines that don't implement the setter
+// (Postgres today) inherit their existing apply path unchanged.
+//
+// Zero-value-safe (the v0.99.51 trap): depth <= 1 is a no-op — the setter
+// is not called, so the applier keeps its serial default. The setter is
+// invoked ONLY for an explicit W > 1, so a stream that never opts in is
+// byte-identical to the pre-ADR-0104 path.
+//
+// Called immediately after each engine applier opens, before any
+// ApplyBatch dispatch (sibling to applyExecTimeout / applyMaxBufferBytes).
+func applyApplyPipelineDepth(target any, depth int) {
+	if depth <= 1 {
+		return
+	}
+	if setter, ok := target.(ir.ApplyPipelineDepthSetter); ok {
+		setter.SetApplyPipelineDepth(depth)
+	}
+}
+
 // applyRedactor plumbs the streamer-side --redact registry to a
 // target [ir.ChangeApplier] that opts into PII redaction via
 // [ir.RedactorSetter]. PII Phase 1.5: completes the operator

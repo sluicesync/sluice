@@ -704,6 +704,8 @@ type SyncStartCmd struct {
 
 	ApplyExecTimeout time.Duration `help:"Per-statement deadline applied to every tx.ExecContext on the apply path. GitHub #23 Phase B fix (v0.52.0): closes the silent-stall failure mode where a half-closed destination connection blocked the apply goroutine indefinitely inside the driver's TLS read path. On expiry the driver returns context.DeadlineExceeded, which is classified retriable so the runWithRetry loop reopens the applier and retries the batch on a fresh connection. 0 disables (the pre-v0.52.0 behaviour: unbounded). Tune up for legitimately slow batch upserts on slow targets; down for tighter stall detection." default:"60s" placeholder:"DUR"`
 
+	ApplyPipelineDepth int `help:"MySQL target only (ADR-0104 Phase 1): overlap cross-region CDC-apply commit RTTs across an in-flight window of W independent transactions on a dedicated W-backend pool, committed STRICTLY in source order. On a high-latency (cross-region) link a serial applier is RTT-bound (~1/RTT) and falls below the source rate, causing the per-shard MinimizeSkew wedge; this lifts the aggregate apply ceiling toward W/RTT while keeping the commit linearization point in source order (exactly-once preserved). 0/1 (default) = serial, byte-identical to the pre-ADR-0104 path. Set W>1 (e.g. 4) to engage; the operator-set W is the connection budget — sluice opens exactly W backends (no auto-clamp; MySQL has no connection-budget prober). Keep W conservative on PlanetScale (vttablet limits + the 20s tx-killer interact with W; the AIMD controller still governs per-transaction batch SIZE). Inert on Postgres targets (ADR-0092's within-tx statement pipelining is used there instead)." default:"0" placeholder:"W"`
+
 	ApplyRetryAttempts    int           `help:"Maximum consecutive retriable apply failures the streamer absorbs before exiting. ADR-0038. 1 = no retry (exit on first transient — pre-v0.42.0 behaviour). 8 = default for managed-Vitess / Vitess-flavoured MySQL where tx-killer transients are routine. Counter resets when persisted CDC position advances between attempts; a streamer surviving for hours doesn't carry retry debt." default:"8" placeholder:"N"`
 	ApplyRetryBackoffBase time.Duration `help:"Base interval for the exponential backoff between retriable apply failures. ADR-0038. Doubles on each consecutive failure, capped at --apply-retry-backoff-cap. Only consulted when --apply-retry-attempts > 1." default:"100ms" placeholder:"DUR"`
 	ApplyRetryBackoffCap  time.Duration `help:"Upper bound on each per-attempt backoff interval. ADR-0038. Defaults to 30s. With 8 attempts and default base, the per-attempt sequence is: 100ms → 200ms → 400ms → 800ms → 1.6s → 3.2s → 6.4s → 12.8s, capped at the cap when it grows past." default:"30s" placeholder:"DUR"`
@@ -1097,6 +1099,7 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		RawCopyFormat:                           parseRawCopyFormat(s.RawCopyFormat),
 		ReapStaleBackends:                       s.ReapStaleBackends,
 		ApplyExecTimeout:                        s.ApplyExecTimeout,
+		ApplyPipelineDepth:                      s.ApplyPipelineDepth,
 		ApplyRetryAttempts:                      s.ApplyRetryAttempts,
 		ApplyRetryBackoffBase:                   s.ApplyRetryBackoffBase,
 		ApplyRetryBackoffCap:                    s.ApplyRetryBackoffCap,
