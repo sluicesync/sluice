@@ -218,13 +218,38 @@ func ResolveSchemaVersion(orderer PositionOrderer, versions []RetainedSchemaVers
 			// mutually at-or-after = equivalent anchors (same boundary
 			// re-observed); either is fine, keep the current best.
 		default:
-			// Neither dominates: two distinct boundaries both at-or-
-			// before p but unordered relative to each other. No single
-			// in-effect schema → loud.
-			return nil, fmt.Errorf("ir: schema-history resolve: position %+v has two "+
-				"incomparable candidate schema versions (anchors %+v and %+v); cannot pick a "+
-				"single in-effect schema: %w", p, versions[bestIdx].Anchor, versions[i].Anchor,
-				ErrPositionInvalid)
+			// Neither anchor dominates the other under the partial order.
+			// On a MULTI-SHARD source (VStream/PlanetScale) this is the
+			// EXPECTED steady state, not a corruption: every cold-start /
+			// auto-resnapshot re-emits a table's CURRENT boundary at FRESH
+			// per-shard GTIDs (the reader's snapshotSig cache is per-
+			// instance, so a new reader re-snapshots each table on first
+			// touch), so the SAME schema accumulates multiple anchors whose
+			// multi-shard positions are mutually incomparable — each ahead
+			// on a different shard. That is NOT a real ambiguity: both
+			// anchors carry the same decode contract, so the in-effect
+			// schema at p is unambiguous. Only DISTINCT schemas at
+			// incomparable anchors are a genuine "which DDL is in effect?"
+			// question that must stay loud (→ ADR-0022 cold-start).
+			//
+			// Without this, a multi-shard sync could NEVER warm-resume once
+			// it had re-snapshotted (HIGH resilience bug, found live on a
+			// 2-shard Vitess→PlanetScale-MySQL resume): the resolver refused
+			// every restart, forcing a wasteful full re-snapshot each time.
+			same, serr := sameSchemaVersion(versions[i].TableJSON, versions[bestIdx].TableJSON)
+			if serr != nil {
+				return nil, fmt.Errorf("ir: schema-history resolve: compare incomparable-anchor "+
+					"schemas (anchors %+v and %+v): %w", versions[bestIdx].Anchor, versions[i].Anchor, serr)
+			}
+			if !same {
+				return nil, fmt.Errorf("ir: schema-history resolve: position %+v has two "+
+					"incomparable candidate schema versions with DIFFERENT decode contracts "+
+					"(anchors %+v and %+v); cannot pick a single in-effect schema: %w", p,
+					versions[bestIdx].Anchor, versions[i].Anchor, ErrPositionInvalid)
+			}
+			// Same schema at incomparable anchors → no real conflict; the
+			// current best (a maximal anchor ≤ p) already carries the
+			// correct decode contract, so keep it.
 		}
 	}
 
@@ -243,4 +268,27 @@ func ResolveSchemaVersion(orderer PositionOrderer, versions []RetainedSchemaVers
 			"nil table (corrupt history row): %w", versions[bestIdx].Anchor, ErrPositionInvalid)
 	}
 	return t, nil
+}
+
+// sameSchemaVersion reports whether two retained schema-version blobs
+// describe the SAME decode contract — identical [SchemaSignature] (column
+// names in order + IR types). It is the oracle [ResolveSchemaVersion] uses
+// to tell a benign multi-shard duplicate (the same schema re-snapshotted at
+// incomparable per-shard GTIDs) from a genuine two-distinct-schemas
+// ambiguity. This is deliberately the SAME equality the CDC reader uses to
+// decide whether a FIELD event is a "true delta" worth a new version, so
+// the resolver and the emitter agree on what "same schema version" means:
+// the emitter writes a new anchor only on a signature change, so two
+// anchors that compare equal here are, by construction, the same version
+// recorded twice (e.g. once per cold-start).
+func sameSchemaVersion(aJSON, bJSON []byte) (bool, error) {
+	a, err := UnmarshalTable(aJSON)
+	if err != nil {
+		return false, fmt.Errorf("decode anchor schema: %w", err)
+	}
+	b, err := UnmarshalTable(bJSON)
+	if err != nil {
+		return false, fmt.Errorf("decode anchor schema: %w", err)
+	}
+	return SchemaSignatureOf(a).Equal(SchemaSignatureOf(b)), nil
 }

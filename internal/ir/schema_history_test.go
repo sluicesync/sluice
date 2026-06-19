@@ -309,19 +309,137 @@ func (disjointOrderer) PositionAtOrAfter(p, anchor Position) (bool, error) {
 	return true, nil
 }
 
-// Two retained anchors that are mutually incomparable (disjoint GTID
-// sets), and an event position that is a superset of BOTH. The resolve
-// MUST refuse loudly with ErrPositionInvalid rather than silently pick
-// one — there is no single in-effect schema.
-func TestResolveSchemaVersion_PartialOrder_IncomparableCandidates_IsLoud(t *testing.T) {
-	versions := []RetainedSchemaVersion{
-		anchorVersion(t, "A", "vA"),
-		anchorVersion(t, "B", "vB"),
+// anchorVersionCols builds a retained version with an explicit column set
+// (so a test can make two anchors carry DIFFERENT decode contracts).
+func anchorVersionCols(t *testing.T, token, tableName string, cols []*Column) RetainedSchemaVersion {
+	t.Helper()
+	b, err := MarshalTable(&Table{Name: tableName, Columns: cols})
+	if err != nil {
+		t.Fatalf("MarshalTable: %v", err)
 	}
-	// p ⊇ {A} and p ⊇ {B}; A and B are disjoint → both satisfy, neither dominates.
+	return RetainedSchemaVersion{Anchor: Position{Engine: "test", Token: token}, TableJSON: b}
+}
+
+// Two retained anchors that are mutually incomparable (disjoint GTID sets)
+// but carry the SAME decode contract (identical columns), with an event
+// position that is a superset of BOTH. This is the multi-shard /
+// re-snapshot reality (a cold-start re-emits the same boundary at fresh
+// per-shard GTIDs): there is no real ambiguity, so resolve MUST succeed and
+// return that schema — NOT refuse. Regression pin for the HIGH resilience
+// bug found live on a 2-shard Vitess→PlanetScale-MySQL warm-resume, where
+// the old "incomparable → always loud" rule forced a wasteful full
+// re-snapshot on every restart (the sync could never warm-resume into CDC).
+func TestResolveSchemaVersion_PartialOrder_IncomparableSameSchema_Resolves(t *testing.T) {
+	cols := []*Column{{Name: "id", Type: Integer{Width: 64}}, {Name: "v", Type: Varchar{Length: 64}}}
+	versions := []RetainedSchemaVersion{
+		anchorVersionCols(t, "A", "events_log", cols),
+		anchorVersionCols(t, "B", "events_log", cols),
+	}
+	// p ⊇ {A} and p ⊇ {B}; A and B disjoint → both satisfy, neither dominates,
+	// but they are the same schema → unambiguous decode contract.
+	got, err := ResolveSchemaVersion(disjointOrderer{}, versions, Position{Token: "A,B"})
+	if err != nil {
+		t.Fatalf("incomparable SAME-schema anchors must resolve, not refuse; got err %v", err)
+	}
+	if got == nil || got.Name != "events_log" || len(got.Columns) != 2 {
+		t.Fatalf("resolved table = %v; want events_log with 2 columns", got)
+	}
+}
+
+// Two retained anchors that are mutually incomparable (disjoint GTID sets)
+// AND carry DIFFERENT decode contracts (a real column delta), with an event
+// position that is a superset of BOTH. THIS is the genuine ambiguity — two
+// distinct schemas both at-or-before p, unordered relative to each other —
+// and the resolve MUST still refuse loudly with ErrPositionInvalid rather
+// than guess which DDL is in effect. The loud safety floor is preserved;
+// only the same-schema false positive above was relaxed.
+func TestResolveSchemaVersion_PartialOrder_IncomparableDifferentSchema_IsLoud(t *testing.T) {
+	versions := []RetainedSchemaVersion{
+		anchorVersionCols(t, "A", "t", []*Column{{Name: "id", Type: Integer{Width: 64}}}),
+		anchorVersionCols(t, "B", "t", []*Column{{Name: "id", Type: Integer{Width: 64}}, {Name: "email", Type: Varchar{Length: 255}}}),
+	}
 	_, err := ResolveSchemaVersion(disjointOrderer{}, versions, Position{Token: "A,B"})
 	if !errors.Is(err, ErrPositionInvalid) {
-		t.Fatalf("incomparable candidates must be a loud ErrPositionInvalid refuse; got %v", err)
+		t.Fatalf("incomparable DIFFERENT-schema candidates must be a loud ErrPositionInvalid refuse; got %v", err)
+	}
+}
+
+// TestResolveSchemaVersion_IncomparableDifferentSchema_PerFamily pins the
+// class, not one representative (Bug-74 discipline): the relaxation's whole
+// safety rests on sameSchemaVersion's signature oracle catching EVERY
+// decode-affecting type-parameter change after a real codec round-trip
+// (marshal→unmarshal, which a pure SchemaSignatureOf unit test bypasses).
+// For each family, two incomparable anchors differing ONLY in one column's
+// decode-affecting parameter MUST still refuse loudly — if any family's
+// parameter were dropped by the codec, this would silently resolve and the
+// case would fail.
+func TestResolveSchemaVersion_IncomparableDifferentSchema_PerFamily(t *testing.T) {
+	base := func(c Type) []*Column {
+		return []*Column{{Name: "id", Type: Integer{Width: 64}}, {Name: "c", Type: c}}
+	}
+	cases := []struct {
+		name string
+		a, b Type
+	}{
+		{"int width", Integer{Width: 32}, Integer{Width: 64}},
+		{"decimal precision/scale", Decimal{Precision: 10, Scale: 2}, Decimal{Precision: 12, Scale: 4}},
+		{"varchar length", Varchar{Length: 255}, Varchar{Length: 64}},
+		{"enum value-set", Enum{Values: []string{"a", "b"}}, Enum{Values: []string{"a", "b", "c"}}},
+		{"enum value-order", Enum{Values: []string{"a", "b"}}, Enum{Values: []string{"b", "a"}}},
+		{"array element type", Array{Element: Integer{Width: 32}}, Array{Element: Integer{Width: 64}}},
+		{"time precision", Time{Precision: 3}, Time{Precision: 6}},
+		{"timestamp tz", Timestamp{Precision: 6, WithTimeZone: false}, Timestamp{Precision: 6, WithTimeZone: true}},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			versions := []RetainedSchemaVersion{
+				anchorVersionCols(t, "A", "t", base(c.a)),
+				anchorVersionCols(t, "B", "t", base(c.b)),
+			}
+			_, err := ResolveSchemaVersion(disjointOrderer{}, versions, Position{Token: "A,B"})
+			if !errors.Is(err, ErrPositionInvalid) {
+				t.Fatalf("%s: incomparable anchors with a real decode delta must refuse loudly "+
+					"(signature oracle missed this family's parameter?); got %v", c.name, err)
+			}
+		})
+	}
+}
+
+// TestResolveSchemaVersion_IncomparableThreeAnchors pins the ACTUAL
+// multi-shard steady state: re-snapshots accumulate MORE than two same-
+// schema anchors across restarts, all mutually incomparable. Three
+// same-schema incomparable anchors must resolve; introducing one
+// different-schema anchor among them must flip it back to a loud refuse —
+// regardless of slice order (the pairwise keep-best logic must not let a
+// distinct schema slip through depending on ordering).
+func TestResolveSchemaVersion_IncomparableThreeAnchors(t *testing.T) {
+	same := []*Column{{Name: "id", Type: Integer{Width: 64}}, {Name: "v", Type: Varchar{Length: 64}}}
+	diff := []*Column{{Name: "id", Type: Integer{Width: 64}}, {Name: "v", Type: Varchar{Length: 128}}}
+
+	// Three same-schema incomparable anchors → resolves.
+	v3 := []RetainedSchemaVersion{
+		anchorVersionCols(t, "A", "t", same),
+		anchorVersionCols(t, "B", "t", same),
+		anchorVersionCols(t, "C", "t", same),
+	}
+	got, err := ResolveSchemaVersion(disjointOrderer{}, v3, Position{Token: "A,B,C"})
+	if err != nil || got == nil {
+		t.Fatalf("three same-schema incomparable anchors must resolve; got err %v", err)
+	}
+
+	// 2 same + 1 different, every rotation → loud (a distinct decode contract
+	// among incomparable anchors is genuine ambiguity, order must not hide it).
+	rotations := [][]RetainedSchemaVersion{
+		{anchorVersionCols(t, "A", "t", diff), anchorVersionCols(t, "B", "t", same), anchorVersionCols(t, "C", "t", same)},
+		{anchorVersionCols(t, "A", "t", same), anchorVersionCols(t, "B", "t", diff), anchorVersionCols(t, "C", "t", same)},
+		{anchorVersionCols(t, "A", "t", same), anchorVersionCols(t, "B", "t", same), anchorVersionCols(t, "C", "t", diff)},
+	}
+	for i, vs := range rotations {
+		_, err := ResolveSchemaVersion(disjointOrderer{}, vs, Position{Token: "A,B,C"})
+		if !errors.Is(err, ErrPositionInvalid) {
+			t.Fatalf("rotation %d: a different-schema anchor among incomparable peers must refuse loudly; got %v", i, err)
+		}
 	}
 }
 
