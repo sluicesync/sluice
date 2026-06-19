@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -220,6 +221,18 @@ type ChangeApplier struct {
 	// Set via [SetExecTimeout]. 0 disables the timeout (preserves
 	// pre-v0.52.0 unbounded-block behavior).
 	execTimeout time.Duration
+
+	// cacheMu guards the four lazily-populated metadata caches below
+	// (pkCache, colTypeCache, keylessCache, warnedKeyless) so the
+	// ADR-0104 concurrent key-hash apply lanes can call dispatch from W
+	// goroutines safely. EVERY access to those maps goes through the
+	// guarded accessors in change_applier_concurrent.go — there is no
+	// direct map access elsewhere, so a missed-lock race cannot hide from
+	// the -race gate. The serial path takes the same lock; the cost is one
+	// RLock + map read per cache hit (negligible). activeSchema is NOT
+	// guarded here: schema events are barrier-only (never routed to a
+	// lane), so that cache stays single-goroutine (coordinator) owned.
+	cacheMu sync.RWMutex
 
 	// pkCache maps "schema.table" → ordered list of PK column names.
 	// Populated lazily via a single information_schema query the
@@ -604,7 +617,7 @@ func (a *ChangeApplier) redactChange(ctx context.Context, c ir.Change) error {
 func (a *ChangeApplier) pkForRedact(ctx context.Context, changeSchema, table string) ([]string, error) {
 	schema := a.routedSchema(changeSchema)
 	qn := qualifiedName(schema, table)
-	if cached, ok := a.pkCache[qn]; ok {
+	if cached, ok := a.cachedPK(qn); ok {
 		return cached, nil
 	}
 	tx, err := a.db.BeginTx(ctx, nil)
@@ -616,7 +629,7 @@ func (a *ChangeApplier) pkForRedact(ctx context.Context, changeSchema, table str
 	if err != nil {
 		return nil, fmt.Errorf("mysql: applier: pkForRedact: %w", err)
 	}
-	a.pkCache[qn] = pk
+	a.storePK(qn, pk)
 	return pk, nil
 }
 
@@ -1144,14 +1157,14 @@ func logZeroRowsAffected(ctx context.Context, op, schema, table string, res sql.
 // override a cross-database lookup back to the bound database).
 func (a *ChangeApplier) pkFor(ctx context.Context, tx *sql.Tx, schema, table string) ([]string, error) {
 	qn := qualifiedName(schema, table)
-	if cached, ok := a.pkCache[qn]; ok {
+	if cached, ok := a.cachedPK(qn); ok {
 		return cached, nil
 	}
 	pk, err := loadPrimaryKey(ctx, tx, schema, table)
 	if err != nil {
 		return nil, err
 	}
-	a.pkCache[qn] = pk
+	a.storePK(qn, pk)
 	return pk, nil
 }
 
@@ -1168,7 +1181,7 @@ func (a *ChangeApplier) pkFor(ctx context.Context, tx *sql.Tx, schema, table str
 // available to the applier without further plumbing.
 func (a *ChangeApplier) colTypesFor(ctx context.Context, _ *sql.Tx, schema, table string) (map[string]*ir.Column, error) {
 	qn := qualifiedName(schema, table)
-	if cached, ok := a.colTypeCache[qn]; ok {
+	if cached, ok := a.cachedColTypes(qn); ok {
 		return cached, nil
 	}
 	// loadTableSchema queries information_schema directly; we use the
@@ -1188,7 +1201,7 @@ func (a *ChangeApplier) colTypesFor(ctx context.Context, _ *sql.Tx, schema, tabl
 	for _, col := range tbl.Columns {
 		out[col.Name] = col
 	}
-	a.colTypeCache[qn] = out
+	a.storeColTypes(qn, out)
 	return out, nil
 }
 

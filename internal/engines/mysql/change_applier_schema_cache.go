@@ -125,8 +125,7 @@ func (a *ChangeApplier) cacheActiveSchemaAfterCommit(s ir.SchemaSnapshot) {
 // SchemaSnapshot carries the SOURCE schema, so route it before deleting.
 func (a *ChangeApplier) invalidateTargetCachesForBoundary(s ir.SchemaSnapshot) {
 	qn := qualifiedName(a.routedSchema(s.Schema), s.Table)
-	delete(a.colTypeCache, qn)
-	delete(a.pkCache, qn)
+	a.invalidateMetadataCaches(qn)
 }
 
 // distinctSchemaTablesForStream returns the unique (schema, table)

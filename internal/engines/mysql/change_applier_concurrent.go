@@ -324,3 +324,87 @@ func (f *checkpointFrontier) frontierSeq() uint64 {
 	defer f.mu.Unlock()
 	return f.frontier
 }
+
+// --- Guarded metadata-cache accessors (ADR-0104 concurrency safety) ---
+//
+// Every read/write of pkCache, colTypeCache, keylessCache and
+// warnedKeyless funnels through these so the concurrent key-hash lanes
+// (which call dispatch from W goroutines) never touch a map unguarded. The
+// load-on-miss callers use the RLock-check → unlock → DB-load → Lock-store
+// pattern so a cache miss does NOT serialize every lane on the DB
+// round-trip; the double-store on a concurrent miss is idempotent.
+
+func (a *ChangeApplier) cachedPK(qn string) ([]string, bool) {
+	a.cacheMu.RLock()
+	defer a.cacheMu.RUnlock()
+	v, ok := a.pkCache[qn]
+	return v, ok
+}
+
+func (a *ChangeApplier) storePK(qn string, pk []string) {
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+	if a.pkCache == nil {
+		a.pkCache = make(map[string][]string)
+	}
+	a.pkCache[qn] = pk
+}
+
+func (a *ChangeApplier) cachedColTypes(qn string) (map[string]*ir.Column, bool) {
+	a.cacheMu.RLock()
+	defer a.cacheMu.RUnlock()
+	v, ok := a.colTypeCache[qn]
+	return v, ok
+}
+
+func (a *ChangeApplier) storeColTypes(qn string, cols map[string]*ir.Column) {
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+	if a.colTypeCache == nil {
+		a.colTypeCache = make(map[string]map[string]*ir.Column)
+	}
+	a.colTypeCache[qn] = cols
+}
+
+func (a *ChangeApplier) cachedKeyless(qn string) (keyless, ok bool) {
+	a.cacheMu.RLock()
+	defer a.cacheMu.RUnlock()
+	v, ok := a.keylessCache[qn]
+	return v, ok
+}
+
+func (a *ChangeApplier) storeKeyless(qn string, keyless bool) {
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+	if a.keylessCache == nil {
+		a.keylessCache = make(map[string]bool)
+	}
+	a.keylessCache[qn] = keyless
+}
+
+// markWarnedKeyless records that the keyless WARN has been emitted for qn
+// and reports whether THIS call was the one that recorded it — so the
+// caller logs the WARN exactly once even under concurrent lanes (the
+// check-and-set is atomic under the write lock).
+func (a *ChangeApplier) markWarnedKeyless(qn string) (firstTime bool) {
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+	if a.warnedKeyless == nil {
+		a.warnedKeyless = make(map[string]bool)
+	}
+	if a.warnedKeyless[qn] {
+		return false
+	}
+	a.warnedKeyless[qn] = true
+	return true
+}
+
+// invalidateMetadataCaches drops the PK + column-type cache entries for qn
+// (the ADR-0049 schema-change cache invalidation). Guarded so a
+// barrier-path invalidation is safe against concurrent lane reads.
+func (a *ChangeApplier) invalidateMetadataCaches(qn string) {
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+	delete(a.colTypeCache, qn)
+	delete(a.pkCache, qn)
+}

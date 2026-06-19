@@ -326,10 +326,7 @@ func (a *ChangeApplier) isKeylessInsert(ctx context.Context, c ir.Change) bool {
 // it once the transient condition clears.
 func (a *ChangeApplier) tableIsKeyless(ctx context.Context, schema, table string) bool {
 	qn := qualifiedName(schema, table)
-	if a.keylessCache == nil {
-		a.keylessCache = make(map[string]bool)
-	}
-	if v, ok := a.keylessCache[qn]; ok {
+	if v, ok := a.cachedKeyless(qn); ok {
 		return v
 	}
 	const q = `SELECT COUNT(*) FROM information_schema.statistics
@@ -341,7 +338,7 @@ func (a *ChangeApplier) tableIsKeyless(ctx context.Context, schema, table string
 		return true
 	}
 	keyless := n == 0
-	a.keylessCache[qn] = keyless
+	a.storeKeyless(qn, keyless)
 	return keyless
 }
 
@@ -349,13 +346,9 @@ func (a *ChangeApplier) tableIsKeyless(ctx context.Context, schema, table string
 // ADR-0089 guard holds it at single-row apply, so an operator sees why
 // that table is not getting batched throughput.
 func (a *ChangeApplier) warnKeylessOnce(ctx context.Context, qn string) {
-	if a.warnedKeyless == nil {
-		a.warnedKeyless = make(map[string]bool)
-	}
-	if a.warnedKeyless[qn] {
+	if !a.markWarnedKeyless(qn) {
 		return
 	}
-	a.warnedKeyless[qn] = true
 	slog.WarnContext(ctx,
 		"mysql: applier: table has no PRIMARY KEY or unique index — its INSERTs are not "+
 			"idempotent, so keyless CDC is at-least-once: a crash before the source "+
