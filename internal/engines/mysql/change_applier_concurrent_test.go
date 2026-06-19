@@ -4,7 +4,10 @@
 package mysql
 
 import (
+	"context"
+	"sync"
 	"testing"
+	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -203,6 +206,103 @@ func TestCheckpointFrontier_IdempotentCheckpoint(t *testing.T) {
 		got, ok := f.checkpointPosition()
 		if !ok || got.Token != "X" {
 			t.Fatalf("call %d: checkpoint=%v ok=%v, want token X", i, got, ok)
+		}
+	}
+}
+
+// TestWaitForFrontier_WakesOnAdvance: a waiter blocked on a target seq
+// wakes once concurrent markCommitted calls advance the frontier past it.
+func TestWaitForFrontier_WakesOnAdvance(t *testing.T) {
+	f := newCheckpointFrontier()
+	done := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		done <- f.waitForFrontier(ctx, 3)
+	}()
+
+	// Commit out of order from another goroutine; the waiter must not wake
+	// until the contiguous frontier reaches 3.
+	var wg sync.WaitGroup
+	for _, seq := range []uint64{2, 1, 3} {
+		wg.Add(1)
+		go func(s uint64) { defer wg.Done(); f.markCommitted(s) }(seq)
+	}
+	wg.Wait()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("waitForFrontier returned %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("waitForFrontier did not wake; frontier=%d", f.frontierSeq())
+	}
+}
+
+// TestWaitForFrontier_AlreadyReached: target ≤ current frontier returns
+// immediately (no block).
+func TestWaitForFrontier_AlreadyReached(t *testing.T) {
+	f := newCheckpointFrontier()
+	f.markCommitted(1)
+	f.markCommitted(2)
+	if err := f.waitForFrontier(context.Background(), 2); err != nil {
+		t.Fatalf("waitForFrontier(2) = %v, want nil (already reached)", err)
+	}
+}
+
+// TestWaitForFrontier_CtxCancel: a waiter unblocks with the ctx error when
+// the frontier never reaches the target.
+func TestWaitForFrontier_CtxCancel(t *testing.T) {
+	f := newCheckpointFrontier()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- f.waitForFrontier(ctx, 5) }()
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("waitForFrontier returned nil after cancel, want ctx error")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waitForFrontier did not unblock on ctx cancel")
+	}
+}
+
+func TestPkChangedUpdate(t *testing.T) {
+	pk := []string{"id"}
+	cases := []struct {
+		name string
+		u    ir.Update
+		want bool
+	}{
+		{"same-pk", ir.Update{Before: ir.Row{"id": int64(1), "v": "a"}, After: ir.Row{"id": int64(1), "v": "b"}}, false},
+		{"changed-pk", ir.Update{Before: ir.Row{"id": int64(1)}, After: ir.Row{"id": int64(2)}}, true},
+		{"nil-before", ir.Update{Before: nil, After: ir.Row{"id": int64(1)}}, false},
+		{"bytes-pk-same", ir.Update{Before: ir.Row{"id": []byte("k")}, After: ir.Row{"id": []byte("k")}}, false},
+		{"bytes-pk-diff", ir.Update{Before: ir.Row{"id": []byte("k")}, After: ir.Row{"id": []byte("j")}}, true},
+	}
+	for _, tc := range cases {
+		if got := pkChangedUpdate(tc.u, pk); got != tc.want {
+			t.Errorf("%s: pkChangedUpdate=%v want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestRowChangeSchemaTable(t *testing.T) {
+	cases := []struct {
+		c             ir.Change
+		schema, table string
+	}{
+		{ir.Insert{Schema: "ks", Table: "t"}, "ks", "t"},
+		{ir.Update{Schema: "ks", Table: "u"}, "ks", "u"},
+		{ir.Delete{Schema: "ks", Table: "d"}, "ks", "d"},
+		{ir.TxBegin{}, "", ""},
+	}
+	for _, tc := range cases {
+		s, tb := rowChangeSchemaTable(tc.c)
+		if s != tc.schema || tb != tc.table {
+			t.Errorf("rowChangeSchemaTable(%T) = (%q,%q), want (%q,%q)", tc.c, s, tb, tc.schema, tc.table)
 		}
 	}
 }

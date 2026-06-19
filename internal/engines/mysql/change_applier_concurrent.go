@@ -70,13 +70,18 @@ package mysql
 // not read-consistent mid-stream regardless.
 
 import (
+	"bytes"
+	"context"
+	"database/sql"
 	"fmt"
 	"hash/fnv"
 	"io"
+	"log/slog"
 	"sort"
 	"strconv"
 	"sync"
 
+	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -247,6 +252,11 @@ type checkpointFrontier struct {
 	// of each source-transaction commit not yet superseded by a persisted
 	// checkpoint. Pruned as the persisted checkpoint advances.
 	txBoundaries []txBoundary
+
+	// notify is closed-and-replaced on every frontier advance so
+	// waitForFrontier can block until a target seq is reached without
+	// busy-polling. Guarded by mu.
+	notify chan struct{}
 }
 
 type txBoundary struct {
@@ -255,7 +265,34 @@ type txBoundary struct {
 }
 
 func newCheckpointFrontier() *checkpointFrontier {
-	return &checkpointFrontier{pending: make(map[uint64]bool)}
+	return &checkpointFrontier{
+		pending: make(map[uint64]bool),
+		notify:  make(chan struct{}),
+	}
+}
+
+// waitForFrontier blocks until the contiguous frontier reaches target (all
+// changes with seq ≤ target are durably committed across every lane) or ctx
+// is cancelled. The coordinator uses it to drain all lanes before a barrier
+// event (Truncate / SchemaSnapshot / keyless / PK-changing update) so the
+// barrier applies in correct global order relative to the row changes
+// around it. Progress is guaranteed by the lanes' idle-flush, so a quiet
+// lane still drains within DefaultIdleFlushPeriod.
+func (f *checkpointFrontier) waitForFrontier(ctx context.Context, target uint64) error {
+	for {
+		f.mu.Lock()
+		if f.frontier >= target {
+			f.mu.Unlock()
+			return nil
+		}
+		ch := f.notify
+		f.mu.Unlock()
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 // markCommitted records that the change at sequence seq has durably
@@ -273,9 +310,17 @@ func (f *checkpointFrontier) markCommitted(seq uint64) {
 		return
 	}
 	f.pending[seq] = true
+	advanced := false
 	for f.pending[f.frontier+1] {
 		delete(f.pending, f.frontier+1)
 		f.frontier++
+		advanced = true
+	}
+	if advanced {
+		// Wake any waitForFrontier waiters: close the current notify
+		// channel and install a fresh one for the next wait cycle.
+		close(f.notify)
+		f.notify = make(chan struct{})
 	}
 }
 
@@ -407,4 +452,399 @@ func (a *ChangeApplier) invalidateMetadataCaches(qn string) {
 	defer a.cacheMu.Unlock()
 	delete(a.colTypeCache, qn)
 	delete(a.pkCache, qn)
+}
+
+// --- Concurrent apply orchestration (ADR-0104, item 23(c)) ---
+
+// checkpointEveryChanges is how many routed row-changes the coordinator
+// processes between persisted-position checkpoints on a barrier-free run.
+// Smaller = shorter crash-replay window; larger = fewer position-write
+// round trips. Barriers (TxCommit-driven boundaries) also trigger a
+// checkpoint, so on a transactional stream the real cadence is finer.
+const checkpointEveryChanges = 2000
+
+// concurrentApplyManager is the ADR-0104 key-hash concurrent apply
+// coordinator. The single coordinator goroutine (the one running
+// [ChangeApplier.applyBatchConcurrent]) reads the merged change stream in
+// source order, assigns each event a monotonic sequence, and either routes
+// a keyed row-change to its key-hash lane or handles a barrier event
+// (Tx*, Truncate, SchemaSnapshot, keyless, PK-changing update) by draining
+// all lanes first. W lane goroutines each apply their routed changes
+// in-order on a dedicated backend (no position write) and report committed
+// sequences to the [checkpointFrontier]; the coordinator persists the
+// resume position only up to a fully-durable source-tx boundary.
+type concurrentApplyManager struct {
+	a            *ChangeApplier
+	streamID     string
+	maxBatchSize int
+	lanes        int
+
+	laneDB   *sql.DB // dedicated pool for lane backends (MaxOpenConns == lanes)
+	router   laneRouter
+	frontier *checkpointFrontier
+
+	laneIn  []chan ir.Change // per-lane change feed (coordinator → lane)
+	laneSeq []chan uint64    // per-lane seq FIFO, pushed before each change
+
+	nextSeq         uint64 // coordinator-owned monotonic sequence
+	sinceCheckpoint int    // routed changes since the last checkpoint
+	lastWrittenTok  string // last persisted position token (skip redundant writes)
+
+	cancel context.CancelFunc
+
+	wg       sync.WaitGroup
+	errMu    sync.Mutex
+	firstErr error
+}
+
+// applyBatchConcurrent is the ADR-0104 concurrent key-hash apply entry,
+// invoked from ApplyBatch when an operator wires --apply-pipeline-depth
+// (the lane count W) > 1 and a dedicated pool can be opened. It owns the
+// lane pool for the call's lifetime. On any lane or coordinator error the
+// whole run stops (ctx cancel + drain) and the error is returned; the
+// persisted position reflects only fully-durable work, so warm-resume
+// re-streams + idempotently re-applies the remainder (exactly-once for
+// keyed tables; the keyless at-least-once guarantee is unchanged because
+// keyless changes take the single-row barrier path).
+func (a *ChangeApplier) applyBatchConcurrent(ctx context.Context, streamID string, changes <-chan ir.Change, maxBatchSize, lanes int) error {
+	laneDB, err := openDB(ctx, a.pipelineCfg)
+	if err != nil {
+		return classifyApplierError(fmt.Errorf("mysql: applier: open concurrent lane pool: %w", err))
+	}
+	defer func() { _ = laneDB.Close() }()
+	laneDB.SetMaxOpenConns(lanes)
+	laneDB.SetMaxIdleConns(lanes)
+
+	m := &concurrentApplyManager{
+		a:            a,
+		streamID:     streamID,
+		maxBatchSize: maxBatchSize,
+		lanes:        lanes,
+		laneDB:       laneDB,
+		router:       newLaneRouter(lanes),
+		frontier:     newCheckpointFrontier(),
+		laneIn:       make([]chan ir.Change, lanes),
+		laneSeq:      make([]chan uint64, lanes),
+	}
+	// Buffer each lane a batch's worth so the coordinator's routing isn't
+	// gated on a lane's per-change commit latency (the whole point — lanes
+	// overlap their cross-region commit RTTs). The seq FIFO matches.
+	buf := maxBatchSize
+	if buf < 1 {
+		buf = 1
+	}
+	for i := range m.laneIn {
+		m.laneIn[i] = make(chan ir.Change, buf)
+		m.laneSeq[i] = make(chan uint64, buf)
+	}
+	return m.run(ctx, changes)
+}
+
+func (m *concurrentApplyManager) run(ctx context.Context, changes <-chan ir.Change) error {
+	ctx, cancel := context.WithCancel(ctx)
+	m.cancel = cancel
+	defer cancel()
+
+	m.wg.Add(m.lanes)
+	for i := 0; i < m.lanes; i++ {
+		go m.laneLoop(ctx, i)
+	}
+	slog.InfoContext(ctx,
+		"mysql: applier: concurrent key-hash CDC apply engaged — routing row changes to W in-order "+
+			"lanes by primary-key hash, committing each lane concurrently on a dedicated pool; the "+
+			"resume position advances only to a source-tx boundary durable across all lanes (ADR-0104)",
+		slog.Int("lanes_W", m.lanes),
+		slog.Int("dedicated_backends", m.lanes))
+
+	var loopErr error
+	for c := range changes {
+		if err := m.getErr(); err != nil {
+			loopErr = err
+			break
+		}
+		m.nextSeq++
+		if err := m.handle(ctx, m.nextSeq, c); err != nil {
+			loopErr = err
+			break
+		}
+	}
+
+	if loopErr != nil {
+		// Abort: unblock any lane stuck on a slow commit and any pending
+		// barrier drain, then collect.
+		cancel()
+	}
+	for _, ch := range m.laneIn {
+		close(ch)
+	}
+	m.wg.Wait()
+	if e := m.getErr(); e != nil && loopErr == nil {
+		loopErr = e
+	}
+	if loopErr != nil {
+		return loopErr
+	}
+	// Clean end-of-stream: persist the final fully-durable checkpoint.
+	return m.writeCheckpoint(ctx)
+}
+
+// handle dispatches one source event by kind: boundary markers advance the
+// frontier directly, keyed row-changes route to a lane, everything else
+// (Truncate / SchemaSnapshot / keyless / PK-changing update) takes the
+// barrier path.
+func (m *concurrentApplyManager) handle(ctx context.Context, seq uint64, c ir.Change) error {
+	switch v := c.(type) {
+	case ir.TxBegin:
+		// Boundary marker, no lane work — mark committed so the contiguous
+		// frontier can advance past it once the tx's rows (lower seqs) land.
+		m.frontier.markCommitted(seq)
+		return nil
+	case ir.TxCommit:
+		m.frontier.recordTxBoundary(seq, v.Pos())
+		m.frontier.markCommitted(seq)
+		return m.maybeCheckpoint(ctx)
+	case ir.Insert, ir.Update, ir.Delete:
+		return m.routeRow(ctx, seq, c)
+	default:
+		// Truncate, SchemaSnapshot, or any future barrier-class event.
+		return m.barrier(ctx, seq, c)
+	}
+}
+
+// routeRow routes a keyed row-change to its key-hash lane, or falls to the
+// barrier path when the change is keyless, malformed, or a PK-changing
+// update (where the old and new keys could land on different lanes and the
+// old/new ordering must be preserved globally).
+func (m *concurrentApplyManager) routeRow(ctx context.Context, seq uint64, c ir.Change) error {
+	schema, table := rowChangeSchemaTable(c)
+	routed := m.a.routedSchema(schema)
+	pkCols, err := m.a.pkForRedact(ctx, schema, table)
+	if err != nil {
+		return classifyApplierError(err)
+	}
+	vals, ok := pkValuesForRouting(c, pkCols)
+	if !ok {
+		// Keyless / malformed → single-row barrier (preserves the ADR-0089
+		// keyless at-least-once bound; never silently mis-routed).
+		return m.barrier(ctx, seq, c)
+	}
+	if u, isUpd := c.(ir.Update); isUpd && pkChangedUpdate(u, pkCols) {
+		return m.barrier(ctx, seq, c)
+	}
+	lane := m.router.laneFor(qualifiedName(routed, table), vals)
+	// Push the seq BEFORE the change so the lane, after committing N
+	// changes, always finds N seqs waiting (the FIFO-alignment invariant).
+	select {
+	case m.laneSeq[lane] <- seq:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case m.laneIn[lane] <- c:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	m.sinceCheckpoint++
+	return m.maybeCheckpoint(ctx)
+}
+
+// barrier applies a globally-ordered event (Truncate / SchemaSnapshot /
+// keyless or PK-changing row change) after draining EVERY lane to the
+// barrier's predecessor, so it lands in correct order relative to the row
+// changes around it. It first persists a checkpoint (so the barrier's own
+// position write, via applyOne, is monotone), then applies the change on
+// the coordinator backend (applyOne writes the barrier's position + data
+// atomically — ADR-0007), then advances the frontier past it and records
+// it as a tx boundary so subsequent checkpoints stay monotone from here.
+func (m *concurrentApplyManager) barrier(ctx context.Context, seq uint64, c ir.Change) error {
+	if err := m.frontier.waitForFrontier(ctx, seq-1); err != nil {
+		return err
+	}
+	if err := m.writeCheckpoint(ctx); err != nil {
+		return err
+	}
+	if err := m.a.applyOne(ctx, m.streamID, c); err != nil {
+		return err
+	}
+	// SchemaSnapshot changed the table shape — drop the metadata caches so
+	// lanes re-probe on the next change for that table.
+	if snap, ok := c.(ir.SchemaSnapshot); ok {
+		m.a.invalidateMetadataCaches(qualifiedName(m.a.routedSchema(snap.Schema), snap.Table))
+	}
+	m.frontier.recordTxBoundary(seq, c.Pos())
+	m.frontier.markCommitted(seq)
+	m.lastWrittenTok = c.Pos().Token
+	m.sinceCheckpoint = 0
+	return nil
+}
+
+// laneLoop runs one lane: repeatedly apply a batch of its routed changes
+// (reusing the shared batch loop, so AIMD-free static batching + byte cap +
+// the Bug-56 watchdog all apply) and, after each successful commit, pop the
+// committed changes' sequences and advance the frontier. A lane writes NO
+// position (WritePosition is a no-op in laneBatchConfig); the coordinator
+// owns the merged position. Any error stops the whole run.
+func (m *concurrentApplyManager) laneLoop(ctx context.Context, i int) {
+	defer m.wg.Done()
+	cfg := m.a.laneBatchConfig(m.laneDB)
+	for {
+		n, _, closed, err := appliershared.RunOneBatch(ctx, cfg, m.streamID, m.laneIn[i], m.maxBatchSize)
+		if err != nil {
+			m.recordErr(err)
+			m.cancel()
+			return
+		}
+		for k := 0; k < n; k++ {
+			select {
+			case seq := <-m.laneSeq[i]:
+				m.frontier.markCommitted(seq)
+			case <-ctx.Done():
+				return
+			}
+		}
+		if closed {
+			return
+		}
+	}
+}
+
+// maybeCheckpoint persists a checkpoint once enough changes have been
+// routed since the last one. Called on the coordinator goroutine only, so
+// all position writes are serialized (no race on the sluice_cdc_state row).
+func (m *concurrentApplyManager) maybeCheckpoint(ctx context.Context) error {
+	if m.sinceCheckpoint < checkpointEveryChanges {
+		return nil
+	}
+	m.sinceCheckpoint = 0
+	return m.writeCheckpoint(ctx)
+}
+
+// writeCheckpoint persists the highest source-tx-boundary position that is
+// durable across all lanes (the contiguous frontier), in its own
+// transaction on the coordinator's primary pool. It is a no-op when no new
+// boundary is durable, or when the boundary equals the last one written
+// (idempotent / monotone). This is the ADR-0104 position relaxation: the
+// persisted position lags the durable data but can never lead it.
+func (m *concurrentApplyManager) writeCheckpoint(ctx context.Context) error {
+	pos, ok := m.frontier.checkpointPosition()
+	if !ok || pos.Token == m.lastWrittenTok {
+		return nil
+	}
+	posCtx, cancel := m.a.execTimeoutCtx(ctx)
+	defer cancel()
+	tx, err := m.a.db.BeginTx(posCtx, nil)
+	if err != nil {
+		return classifyApplierError(fmt.Errorf("mysql: applier: checkpoint begin: %w", err))
+	}
+	if err := writePositionTx(posCtx, tx, m.streamID, pos.Token, m.a.slotName, m.a.sourceFingerprint, m.a.targetSchema); err != nil {
+		_ = tx.Rollback()
+		return classifyApplierError(fmt.Errorf("mysql: applier: checkpoint position write: %w", err))
+	}
+	if err := m.a.commitWithTimeout(tx); err != nil {
+		return classifyApplierError(fmt.Errorf("mysql: applier: checkpoint commit: %w", err))
+	}
+	m.lastWrittenTok = pos.Token
+	return nil
+}
+
+func (m *concurrentApplyManager) recordErr(err error) {
+	m.errMu.Lock()
+	defer m.errMu.Unlock()
+	if m.firstErr == nil {
+		m.firstErr = err
+	}
+}
+
+func (m *concurrentApplyManager) getErr() error {
+	m.errMu.Lock()
+	defer m.errMu.Unlock()
+	return m.firstErr
+}
+
+// laneBatchConfig builds the shared-batch-loop seam for one lane: serial
+// in-order dispatch+commit on the lane's dedicated pool, the SAME builders
+// / codec / redaction / shard-stamp / keyless-guard the serial path uses,
+// but with NO position write (the coordinator owns the merged position) and
+// NO AIMD observer (lanes use static batch sizing in this first cut; per-
+// lane AIMD + tx-killer convergence is a tracked follow-up — a tx-killer
+// abort on a lane currently stops the run and warm-resume recovers).
+func (a *ChangeApplier) laneBatchConfig(laneDB *sql.DB) *appliershared.BatchConfig {
+	byteCap := a.maxBufferBytes
+	if byteCap <= 0 {
+		byteCap = defaultMaxBufferBytes
+	}
+	return &appliershared.BatchConfig{
+		EngineName:       "mysql",
+		TransactionalDDL: false,
+		ByteCap:          byteCap,
+		BeginTx: func(ctx context.Context) (appliershared.BatchTx, error) {
+			tx, err := laneDB.BeginTx(ctx, nil)
+			if err != nil {
+				return nil, fmt.Errorf("mysql: applier: lane begin tx: %w", err)
+			}
+			return tx, nil
+		},
+		Dispatch: func(ctx context.Context, tx appliershared.BatchTx, streamID string, c ir.Change) error {
+			return a.dispatch(ctx, tx.(*sql.Tx), streamID, c)
+		},
+		ApplyOne:   a.applyOne,
+		Redact:     a.redactChange,
+		StampShard: a.stampShardChange,
+		Classify:   classifyApplierError,
+		// Lanes write NO position — the coordinator's frontier checkpoint
+		// owns the merged []shardGtid resume point (ADR-0104 relaxation).
+		WritePosition: func(_ context.Context, _ appliershared.BatchTx, _, _ string) error { return nil },
+		Commit:        func(tx appliershared.BatchTx) error { return a.commitWithTimeout(tx.(*sql.Tx)) },
+		// Inert on lanes (keyless changes take the barrier path, never a
+		// lane), wired for defensive parity with the serial config.
+		IsKeylessTable: a.isKeylessInsert,
+	}
+}
+
+// rowChangeSchemaTable returns the source schema + table of a row-bearing
+// change (Insert/Update/Delete). Barrier-class events never reach here.
+func rowChangeSchemaTable(c ir.Change) (schema, table string) {
+	switch v := c.(type) {
+	case ir.Insert:
+		return v.Schema, v.Table
+	case ir.Update:
+		return v.Schema, v.Table
+	case ir.Delete:
+		return v.Schema, v.Table
+	}
+	return "", ""
+}
+
+// pkChangedUpdate reports whether an Update changes any primary-key column
+// value (Before vs After). A nil Before image (source without before-rows)
+// cannot be compared, so it returns false (route by the After key). Such
+// PK-changing updates are rare; the caller routes them through the barrier
+// path so the old-key and new-key effects stay globally ordered.
+func pkChangedUpdate(u ir.Update, pkCols []string) bool {
+	if u.Before == nil || u.After == nil {
+		return false
+	}
+	for _, col := range pkCols {
+		b, bok := u.Before[col]
+		a, aok := u.After[col]
+		if bok != aok || !valuesEqualForKey(b, a) {
+			return true
+		}
+	}
+	return false
+}
+
+// valuesEqualForKey compares two primary-key values for the PK-change
+// check. Byte slices ([]byte keys) need content comparison; everything else
+// is a comparable scalar the decode path produces, so == is correct.
+func valuesEqualForKey(a, b any) bool {
+	ab, aIsBytes := a.([]byte)
+	bb, bIsBytes := b.([]byte)
+	if aIsBytes || bIsBytes {
+		if !aIsBytes || !bIsBytes {
+			return false
+		}
+		return bytes.Equal(ab, bb)
+	}
+	return a == b
 }
