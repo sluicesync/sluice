@@ -82,6 +82,7 @@ var (
 	_ ir.ApplyExecTimeoutSetter         = (*ChangeApplier)(nil)
 	_ ir.BatchObserverSetter            = (*ChangeApplier)(nil)
 	_ ir.BatchSizeProviderSetter        = (*ChangeApplier)(nil)
+	_ ir.ApplyConcurrencySetter         = (*ChangeApplier)(nil)
 	_ ir.BatchedChangeApplier           = (*ChangeApplier)(nil)
 	_ ir.MaxBufferBytesSetter           = (*ChangeApplier)(nil)
 	_ ir.MultiDatabaseRouter            = (*ChangeApplier)(nil)

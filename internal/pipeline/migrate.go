@@ -1413,6 +1413,24 @@ func applyApplyPipelineDepth(target any, depth int) {
 	}
 }
 
+// applyApplyConcurrency plumbs the streamer-side --apply-concurrency value
+// to a target [ir.ChangeApplier] that opts into the ADR-0104 (item 23(c))
+// key-hash concurrent apply via [ir.ApplyConcurrencySetter]. Engines that
+// don't implement the setter (Postgres today) inherit their existing apply
+// path unchanged.
+//
+// Zero-value-safe: lanes <= 1 is a no-op (serial default kept); the setter
+// is invoked ONLY for an explicit W > 1. Called immediately after each
+// engine applier opens, alongside applyApplyPipelineDepth.
+func applyApplyConcurrency(target any, lanes int) {
+	if lanes <= 1 {
+		return
+	}
+	if setter, ok := target.(ir.ApplyConcurrencySetter); ok {
+		setter.SetApplyConcurrency(lanes)
+	}
+}
+
 // applyRedactor plumbs the streamer-side --redact registry to a
 // target [ir.ChangeApplier] that opts into PII redaction via
 // [ir.RedactorSetter]. PII Phase 1.5: completes the operator

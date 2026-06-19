@@ -386,6 +386,26 @@ type ApplyPipelineDepthSetter interface {
 	SetApplyPipelineDepth(depth int)
 }
 
+// ApplyConcurrencySetter is the optional surface a [ChangeApplier] can
+// implement to receive the ADR-0104 (item 23(c)) key-hash apply LANE count
+// W: the merged CDC change stream is fanned across W in-order apply lanes
+// by primary-key hash (same key → same lane → in-order, so the
+// dependent-row hazard cannot occur), each committing concurrently on a
+// dedicated backend, lifting aggregate apply throughput toward W× while the
+// resume position advances only to a fully-durable source boundary (the
+// seq-frontier). This is the LIVE successor to the ADR-0104 Phase-1 commit
+// pipeline (proven ineffective — commit-only overlap); the streamer threads
+// [pipeline.Streamer.ApplyConcurrency] to every applier that exposes it.
+//
+// Zero-value-safe (the v0.99.51 trap): W 0 and 1 BOTH mean serial —
+// byte-identical to the pre-concurrency path. Concurrency engages ONLY when
+// an operator explicitly sets W > 1 and a dedicated pool is available. Only
+// the MySQL target implements it today (Postgres uses ADR-0092's
+// within-transaction statement pipelining instead).
+type ApplyConcurrencySetter interface {
+	SetApplyConcurrency(lanes int)
+}
+
 // RedactorSetter is the optional surface a [ChangeApplier] can
 // implement to receive the operator-configured PII redaction
 // policy. PII Phase 1.5 (roadmap item 15a follow-on, GitHub issue

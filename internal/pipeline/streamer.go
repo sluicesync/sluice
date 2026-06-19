@@ -513,6 +513,21 @@ type Streamer struct {
 	// unless the operator opts in.
 	ApplyPipelineDepth int
 
+	// ApplyConcurrency is the ADR-0104 (item 23(c)) key-hash apply LANE
+	// count W plumbed to the target [ir.ChangeApplier] via the optional
+	// [ir.ApplyConcurrencySetter] interface. The merged CDC stream is fanned
+	// across W in-order lanes by primary-key hash, each committing
+	// concurrently on a dedicated backend, lifting aggregate apply
+	// throughput toward W× — the LIVE successor to ApplyPipelineDepth's
+	// Phase-1 commit pipeline for closing the item-23 cross-region wedge.
+	//
+	// Zero-value-safe: 0 and 1 mean serial (byte-identical); concurrency
+	// engages ONLY for W > 1 with a dedicated pool available. Only the MySQL
+	// target applier implements the setter today. The CLI's
+	// `sync start --apply-concurrency=W` flag is the operator knob; default 0
+	// keeps every stream serial unless the operator opts in.
+	ApplyConcurrency int
+
 	// AutoTune controls whether the AIMD apply-batch-size controller
 	// (ADR-0052) is engaged for this stream. Per ADR-0052 DP-1 the
 	// default is "on" — operators pass `--no-auto-tune` to opt out.
