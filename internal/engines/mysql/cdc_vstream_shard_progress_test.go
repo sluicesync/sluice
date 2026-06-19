@@ -165,14 +165,21 @@ func TestShardProgressWatchdog_EndToEnd_AsymmetricStallWarns(t *testing.T) {
 
 	w.markServingProven()
 
-	// Both fresh at t=0.
-	w.observeAdvance([]string{"-80", "80-"})
-	// Drain the first observe through the goroutine (one fire/await turn) so
-	// the next observe's buffered send can't be coalesced away.
+	// Drain one turn so the goroutine has reached its loop and PRE-SEEDED both
+	// shards at t=0 (from knownShards) before we move the clock — both fresh at
+	// t=0 ⇒ no warn yet. Do NOT send a redundant observeAdvance(["-80","80-"])
+	// here: the pre-seed already makes both shards fresh, and firing the timer
+	// drains the timer.C() case, NOT the depth-1 w.advances channel — so a
+	// pre-queued advance would still occupy the buffer when observe(["80-"])
+	// runs below, and observeAdvance's drop-when-full branch would DROP the
+	// "80-" advance under an unfavorable -race schedule (no fresh peer → no
+	// WARN → the timeout this test used to flake on). Mirrors the
+	// FromStartFrozen test, which never had a redundant observe and never flaked.
 	ft.fire <- time.Now()
 	ft.awaitReset(t, 100*time.Millisecond)
 
-	// t=150ms: only 80- advances → -80 stale while a peer is fresh ⇒ wedge.
+	// t=150ms: only 80- advances → -80 (pre-seeded at t=0) stale while a peer
+	// is fresh ⇒ wedge.
 	clk.advance(150 * time.Millisecond)
 	w.observeAdvance([]string{"80-"})
 	if got := pumpScansUntilWarn(t, ft, warns); got != "-80" {
