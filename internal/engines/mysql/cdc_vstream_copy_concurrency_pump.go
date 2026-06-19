@@ -169,6 +169,32 @@ func (s *vstreamSnapshotStream) copyPumpAutoShardConcurrent(ctx context.Context,
 		"ensure K × D ≤ --max-target-connections (K is a source-DSN knob, NOT auto-clamped against the target connection budget — ADR-0099 §3)",
 		slog.Int("streams_k", len(groups)))
 
+	// ctx-cancel waker (clean-shutdown unwind). A producer parked in the
+	// backpressure wait (enqueueConcurrentRowLocked → s.cond.Wait()) only
+	// wakes on a broadcast — it does NOT observe ctx. Normally a peer stream
+	// still in a ctx-observing select trips failCopy()→broadcast on cancel,
+	// which frees the parked one; but if ALL K streams are parked on their
+	// sub-caps when the context is cancelled (e.g. operator Ctrl-C / graceful
+	// drain with no consumer draining), no goroutine observes ctx, nothing
+	// broadcasts, and wg.Wait() hangs forever — a shutdown hang under full
+	// backpressure (and the TestVStreamConcurrent_CtxCancelNoLeak flake under
+	// load). This waker guarantees a bare cancel always trips failCopy (which
+	// sets s.err + broadcasts), so every parked producer wakes and returns
+	// s.err. It exits without side effect on the normal-completion path
+	// (copyDone closes first; the re-check avoids retroactively failing an
+	// already-finished copy if cancel and completion race).
+	go func() {
+		select {
+		case <-s.copyDone:
+		case <-ctx.Done():
+			select {
+			case <-s.copyDone: // copy already finished — do not retro-fail it
+			default:
+				s.failCopy(ctx.Err())
+			}
+		}
+	}()
+
 	var wg sync.WaitGroup
 	for g := range seeds {
 		wg.Add(1)

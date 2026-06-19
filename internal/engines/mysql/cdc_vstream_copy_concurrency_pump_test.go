@@ -461,14 +461,25 @@ func TestVStreamConcurrent_CtxCancelNoLeak(t *testing.T) {
 
 	s, _, _, cancel := newConcurrentHarness(t, tables, 3, byTable, 4*1024)
 
-	// Cancel almost immediately, before any consumer drains — the streams are
-	// backpressured/parked. The driver must unwind and close copyDone.
+	// Let every stream fill its tiny per-stream sub-cap and PARK in the
+	// backpressure wait (no consumer drains). This deterministically reaches
+	// the all-streams-parked state — the one the ctx-cancel waker fixes:
+	// previously, with every producer parked in s.cond.Wait() (which does not
+	// observe ctx), a bare cancel had no goroutine to broadcast, so wg.Wait()
+	// hung (the flake under load was exactly this race — sometimes a stream
+	// hadn't parked yet and tripped failCopy itself). The brief settle removes
+	// that timing dependency: pre-fix this hangs to the timeout; post-fix the
+	// waker trips failCopy on cancel and every parked producer unwinds at once.
+	time.Sleep(300 * time.Millisecond)
+
+	// Cancel with all streams backpressured/parked. The driver must unwind
+	// every stream and close copyDone.
 	cancel()
 
 	select {
 	case <-s.copyDone:
 	case <-time.After(10 * time.Second):
-		t.Fatal("concurrent copy did not unwind on ctx-cancel")
+		t.Fatal("concurrent copy did not unwind on ctx-cancel (all-streams-parked)")
 	}
 }
 
