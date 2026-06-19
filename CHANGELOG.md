@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.79] - 2026-06-19
+
+### Fixed
+
+- **The cross-table concurrent VStream cold-copy (ADR-0099) no longer hangs on cancellation when every stream is parked in backpressure — a clean-shutdown hang under full backpressure.** Each of the K concurrent copy streams parks its producer in a `sync.Cond` backpressure wait (`enqueueConcurrentRowLocked` → `s.cond.Wait()`) when its per-stream byte sub-cap is full and the consumer isn't draining. That wait wakes only on a broadcast (a peer erroring via `failCopy`, or copy completion) — it does NOT observe context cancellation. Normally a cancel is noticed by some stream still in a `ctx`-observing select, which trips `failCopy()`→broadcast and frees the parked ones; but if ALL K streams are parked on their sub-caps at the moment a bare `ctx` cancel fires (operator Ctrl-C / graceful drain during the cold-copy phase with no consumer draining), no goroutine observes `ctx`, nothing broadcasts, and the copy's `WaitGroup` join blocks forever — the shutdown hangs. The fix adds a `ctx`-cancel waker goroutine that trips `failCopy(ctx.Err())` (setting the error + broadcasting) so every parked producer wakes and unwinds; it exits with no side effect on the normal-completion path (it selects on the copy-done signal, with a re-check so a cancel/completion race can never retroactively fail an already-finished copy). No change to the happy path, to throughput, or to the exactly-once / position-recording contract (a cancelled copy still records no position, exactly as a cancel detected by a stream's own select already did). Found as an intermittent `-race` test timeout under heavy parallel load and confirmed via a settle-then-cancel regression test that deterministically reaches the all-streams-parked state (it hangs to the timeout on the unpatched code and passes with the fix). Only affects the concurrent VStream cold-copy (`vstream_copy_table_parallelism` / auto-shard, K>1); the serial and single-stream copy paths were never exposed.
+
 ## [0.99.78] - 2026-06-19
 
 ### Removed
