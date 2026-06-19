@@ -405,7 +405,7 @@ So NOTIFY-kick is **demoted** — the poll isn't the bottleneck. Closing the rea
 
 ---
 
-### 24. VStream (Vitess/PlanetScale) source: secondary-index / index-only DDL is NOT forwarded to the target mid-sync — *confirmed gap (live, 2026-06-18); demand-gated; loud-failure-safe (no silent loss)*
+### 24. Secondary-index / index-only DDL is NOT forwarded to the target mid-sync (ALL CDC sources) — *confirmed gap (live, 2026-06-18); designed in [ADR-0103](../adr/adr-0103-forward-index-ddl-during-cdc.md); demand-gated; loud-failure-safe (no silent loss)*
 
 **Why (live finding, 2026-06-18, Track B/B2).** Added a secondary index to a live source table via Vitess online DDL (`ALTER TABLE wide_payload ADD INDEX idx_lst_ts (ts)`, `ddl_strategy=vitess`); the migration cut over on both shards (index present on the source), but the index appeared on NEITHER target — not the PS-MySQL target (`lst-mysql-b-v2`) nor the PS-PG target (`lst-pg-b2`). Data kept flowing correctly; only the index did not cross. **No silent loss** — DATA is unaffected; this is a schema-fidelity gap, not a value-fidelity one.
 
