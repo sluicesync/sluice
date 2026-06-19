@@ -132,6 +132,19 @@ type ChangeApplier struct {
 	// broker, chain, future callers) gets the safe serial default for free.
 	applyPipelineDepth int
 
+	// applyConcurrency is the ADR-0104 (item 23(c)) key-hash apply LANE
+	// count W: the number of in-order apply lanes the merged change stream
+	// is fanned across by primary-key hash (same key → same lane → in-order,
+	// so the dependent-row hazard cannot occur), each committing concurrently
+	// on a dedicated backend while the coordinator persists the resume
+	// position only up to a fully-durable source boundary (the seq-frontier).
+	// This is the LIVE successor to applyPipelineDepth's Phase-1 commit
+	// pipeline (which was proven ineffective — commit-only overlap). Its own
+	// knob keeps the two distinct until Phase 1 is removed. Zero-value-safe:
+	// 0 and 1 mean serial (byte-identical to today); concurrency engages
+	// ONLY for W > 1 via [SetApplyConcurrency]. See change_applier_concurrent.go.
+	applyConcurrency int
+
 	// pipelinePool is the lazily-started ADR-0104 ordered commit pipeline
 	// (dedicated W-backend pool + single in-order commit worker). nil until
 	// the first pipelined BeginTx; reset to nil by drainPipeline so a
@@ -443,6 +456,20 @@ func (a *ChangeApplier) SetApplyPipelineDepth(depth int) {
 		depth = 0
 	}
 	a.applyPipelineDepth = depth
+}
+
+// SetApplyConcurrency records the ADR-0104 (item 23(c)) key-hash apply
+// LANE count W. The concurrent apply path engages ONLY for W > 1 and when a
+// dedicated pool is available; 0 and 1 are serial (zero-value-safe — every
+// non-CLI construction gets the safe serial default). A negative value is
+// clamped to 0. Idempotent. The operator-facing CLI/streamer plumbing is
+// added when the path is validated for release; until then this is reached
+// directly (tests) and the path is inert by default.
+func (a *ChangeApplier) SetApplyConcurrency(lanes int) {
+	if lanes < 0 {
+		lanes = 0
+	}
+	a.applyConcurrency = lanes
 }
 
 // SetRedactor implements [ir.RedactorSetter] (PII Phase 1.5,

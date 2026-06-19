@@ -341,7 +341,7 @@ func (f *checkpointFrontier) recordTxBoundary(seq uint64, pos ir.Position) {
 // when such a boundary exists. It prunes superseded boundaries so memory
 // stays bounded. ok=false means no tx boundary has fully committed yet
 // (nothing safe to persist); the caller must NOT persist a partial point.
-func (f *checkpointFrontier) checkpointPosition() (ir.Position, bool) {
+func (f *checkpointFrontier) checkpointPosition() (pos ir.Position, seq uint64, ok bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	front := f.frontier
@@ -350,16 +350,16 @@ func (f *checkpointFrontier) checkpointPosition() (ir.Position, bool) {
 		return f.txBoundaries[i].seq > front
 	})
 	if idx == 0 {
-		return ir.Position{}, false
+		return ir.Position{}, 0, false
 	}
-	pos := f.txBoundaries[idx-1].pos
+	chosen := f.txBoundaries[idx-1]
 	// Prune every boundary strictly below the chosen one; keep the chosen
 	// one so a repeat call with no further progress is idempotent (returns
-	// the same position, ok=true) rather than spuriously false.
+	// the same boundary, ok=true) rather than spuriously false.
 	if idx-1 > 0 {
 		f.txBoundaries = append([]txBoundary(nil), f.txBoundaries[idx-1:]...)
 	}
-	return pos, true
+	return chosen.pos, chosen.seq, true
 }
 
 // frontierSeq returns the current contiguous frontier sequence. Test and
@@ -488,7 +488,19 @@ type concurrentApplyManager struct {
 
 	nextSeq         uint64 // coordinator-owned monotonic sequence
 	sinceCheckpoint int    // routed changes since the last checkpoint
-	lastWrittenTok  string // last persisted position token (skip redundant writes)
+	lastWrittenSeq  uint64 // seq of the last persisted boundary (monotone guard)
+	lastWrittenTok  string // token of the last persisted boundary (skip redundant)
+
+	// prevSeq / prevPos track the most-recent event for position-change
+	// boundary detection: a checkpoint boundary is the highest seq sharing a
+	// given source position, detected when the NEXT event carries a
+	// different position. This generalizes TxCommit boundaries to any stream
+	// (incl. boundary-less streams where every change has a distinct
+	// position), and guarantees the persisted position never names a
+	// position that an uncommitted later change also carries (the unsafe
+	// mid-transaction-resume case). prevSeq == 0 means "no prior event".
+	prevSeq uint64
+	prevPos ir.Position
 
 	cancel context.CancelFunc
 
@@ -584,7 +596,12 @@ func (m *concurrentApplyManager) run(ctx context.Context, changes <-chan ir.Chan
 	if loopErr != nil {
 		return loopErr
 	}
-	// Clean end-of-stream: persist the final fully-durable checkpoint.
+	// Clean end-of-stream: the final position run never saw a differing
+	// successor, so record its boundary now, then persist the final
+	// fully-durable checkpoint (frontier is at its max after wg.Wait).
+	if m.prevSeq != 0 {
+		m.frontier.recordTxBoundary(m.prevSeq, m.prevPos)
+	}
 	return m.writeCheckpoint(ctx)
 }
 
@@ -593,14 +610,18 @@ func (m *concurrentApplyManager) run(ctx context.Context, changes <-chan ir.Chan
 // (Truncate / SchemaSnapshot / keyless / PK-changing update) takes the
 // barrier path.
 func (m *concurrentApplyManager) handle(ctx context.Context, seq uint64, c ir.Change) error {
-	switch v := c.(type) {
+	// Position-change boundary detection (see prevSeq/prevPos): when this
+	// event's position differs from the previous event's, the previous
+	// event was the last of its position run — a safe checkpoint boundary.
+	m.noteBoundary(seq, c.Pos())
+
+	switch c.(type) {
 	case ir.TxBegin:
 		// Boundary marker, no lane work — mark committed so the contiguous
 		// frontier can advance past it once the tx's rows (lower seqs) land.
 		m.frontier.markCommitted(seq)
 		return nil
 	case ir.TxCommit:
-		m.frontier.recordTxBoundary(seq, v.Pos())
 		m.frontier.markCommitted(seq)
 		return m.maybeCheckpoint(ctx)
 	case ir.Insert, ir.Update, ir.Delete:
@@ -609,6 +630,21 @@ func (m *concurrentApplyManager) handle(ctx context.Context, seq uint64, c ir.Ch
 		// Truncate, SchemaSnapshot, or any future barrier-class event.
 		return m.barrier(ctx, seq, c)
 	}
+}
+
+// noteBoundary records the previous event as a checkpoint boundary when the
+// current event's position differs from it, then advances the prev cursor.
+// Coordinator-goroutine-only (no lock on prev* needed). A boundary at seq S
+// means: once the frontier reaches S, the position at S is a safe resume
+// point (no later change carries that same position). Recording happens
+// when the position CHANGES, so the highest seq of each position run is the
+// boundary — exactly the safe point.
+func (m *concurrentApplyManager) noteBoundary(seq uint64, pos ir.Position) {
+	if m.prevSeq != 0 && pos.Token != m.prevPos.Token {
+		m.frontier.recordTxBoundary(m.prevSeq, m.prevPos)
+	}
+	m.prevSeq = seq
+	m.prevPos = pos
 }
 
 // routeRow routes a keyed row-change to its key-hash lane, or falls to the
@@ -671,8 +707,12 @@ func (m *concurrentApplyManager) barrier(ctx context.Context, seq uint64, c ir.C
 	if snap, ok := c.(ir.SchemaSnapshot); ok {
 		m.a.invalidateMetadataCaches(qualifiedName(m.a.routedSchema(snap.Schema), snap.Table))
 	}
-	m.frontier.recordTxBoundary(seq, c.Pos())
+	// applyOne persisted the barrier's own position + data atomically and
+	// it is now the highest durable point. Mark it on the frontier and
+	// advance the persisted-checkpoint cursor to it so a later checkpoint
+	// can never regress below the barrier (the seq-monotone guard).
 	m.frontier.markCommitted(seq)
+	m.lastWrittenSeq = seq
 	m.lastWrittenTok = c.Pos().Token
 	m.sinceCheckpoint = 0
 	return nil
@@ -726,8 +766,11 @@ func (m *concurrentApplyManager) maybeCheckpoint(ctx context.Context) error {
 // (idempotent / monotone). This is the ADR-0104 position relaxation: the
 // persisted position lags the durable data but can never lead it.
 func (m *concurrentApplyManager) writeCheckpoint(ctx context.Context) error {
-	pos, ok := m.frontier.checkpointPosition()
-	if !ok || pos.Token == m.lastWrittenTok {
+	pos, seq, ok := m.frontier.checkpointPosition()
+	// Seq-monotone guard: never write a boundary at or below the last one
+	// persisted (prevents regression below a barrier's direct applyOne
+	// write, and skips redundant re-writes of the same point).
+	if !ok || seq <= m.lastWrittenSeq {
 		return nil
 	}
 	posCtx, cancel := m.a.execTimeoutCtx(ctx)
@@ -743,6 +786,7 @@ func (m *concurrentApplyManager) writeCheckpoint(ctx context.Context) error {
 	if err := m.a.commitWithTimeout(tx); err != nil {
 		return classifyApplierError(fmt.Errorf("mysql: applier: checkpoint commit: %w", err))
 	}
+	m.lastWrittenSeq = seq
 	m.lastWrittenTok = pos.Token
 	return nil
 }

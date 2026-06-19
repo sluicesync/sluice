@@ -108,16 +108,15 @@ func (a *ChangeApplier) ApplyBatch(ctx context.Context, streamID string, changes
 	if maxBatchSize <= 1 {
 		return a.Apply(ctx, streamID, changes)
 	}
-	// ADR-0104 item 23(c): when the operator wired --apply-pipeline-depth
-	// (the key-hash apply LANE count W) > 1 and a dedicated pool can be
-	// opened, route to the concurrent key-hash apply path — W in-order
-	// lanes committing concurrently, with the resume position advanced only
-	// to a fully-durable source-tx boundary. This SUPERSEDES the Phase-1
-	// commit-pipeline (kept below as the serial fallback when no dedicated
-	// pool is available; slated for removal once the concurrent path is
-	// validated). depth 0/1 stays on the byte-identical serial loop.
-	if a.applyPipelineDepth > 1 && a.pipelineCfg != nil {
-		return a.applyBatchConcurrent(ctx, streamID, changes, maxBatchSize, a.applyPipelineDepth)
+	// ADR-0104 item 23(c): when the operator wired the key-hash apply LANE
+	// count (--apply-concurrency W) > 1 and a dedicated pool can be opened,
+	// route to the concurrent key-hash apply path — W in-order lanes
+	// committing concurrently, with the resume position advanced only to a
+	// fully-durable source boundary. Its own knob (NOT --apply-pipeline-depth,
+	// the superseded Phase-1 commit-pipeline) so the two paths stay distinct
+	// until Phase 1 is removed. 0/1 stays on the serial / Phase-1 loop below.
+	if a.applyConcurrency > 1 && a.pipelineCfg != nil {
+		return a.applyBatchConcurrent(ctx, streamID, changes, maxBatchSize, a.applyConcurrency)
 	}
 	loopErr := appliershared.RunBatchLoop(ctx, a.batchConfig(), streamID, changes, maxBatchSize)
 	// ADR-0104: drain the in-flight window. drainPipeline returns the first

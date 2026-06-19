@@ -163,7 +163,7 @@ func TestCheckpointFrontier_PositionOnlyAtCommittedBoundary(t *testing.T) {
 	f.recordTxBoundary(6, pos("B"))
 
 	// Nothing committed yet → no safe checkpoint.
-	if _, ok := f.checkpointPosition(); ok {
+	if _, _, ok := f.checkpointPosition(); ok {
 		t.Fatal("expected no checkpoint before any commit")
 	}
 
@@ -171,7 +171,7 @@ func TestCheckpointFrontier_PositionOnlyAtCommittedBoundary(t *testing.T) {
 	f.markCommitted(1)
 	f.markCommitted(2)
 	f.markCommitted(3)
-	got, ok := f.checkpointPosition()
+	got, _, ok := f.checkpointPosition()
 	if !ok || got.Token != "A" {
 		t.Fatalf("after tx A committed: checkpoint=%v ok=%v, want token A", got, ok)
 	}
@@ -180,14 +180,14 @@ func TestCheckpointFrontier_PositionOnlyAtCommittedBoundary(t *testing.T) {
 	// boundary B (seq 6) is NOT yet safe; checkpoint stays at A.
 	f.markCommitted(4)
 	f.markCommitted(6)
-	got, ok = f.checkpointPosition()
+	got, _, ok = f.checkpointPosition()
 	if !ok || got.Token != "A" {
 		t.Fatalf("tx B partial: checkpoint=%v ok=%v, want token A (B not fully durable)", got, ok)
 	}
 
 	// Fill the gap (5) → frontier reaches 6 → boundary B safe.
 	f.markCommitted(5)
-	got, ok = f.checkpointPosition()
+	got, _, ok = f.checkpointPosition()
 	if !ok || got.Token != "B" {
 		t.Fatalf("after tx B committed: checkpoint=%v ok=%v, want token B", got, ok)
 	}
@@ -203,7 +203,7 @@ func TestCheckpointFrontier_IdempotentCheckpoint(t *testing.T) {
 	f.markCommitted(2)
 
 	for i := 0; i < 3; i++ {
-		got, ok := f.checkpointPosition()
+		got, _, ok := f.checkpointPosition()
 		if !ok || got.Token != "X" {
 			t.Fatalf("call %d: checkpoint=%v ok=%v, want token X", i, got, ok)
 		}
