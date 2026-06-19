@@ -35,6 +35,7 @@ import (
 	"crypto/md5"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -414,6 +415,110 @@ func TestPipelined_IdempotentReplayAndPosition(t *testing.T) {
 	if pos2.Token != lastToken {
 		t.Errorf("position token after replay = %q; want %q (no regression)", pos2.Token, lastToken)
 	}
+}
+
+// TestPipelined_MidWindowCommitFailure_NoPositionGap pins the exactly-once
+// CRITICAL invariant (value-fidelity review finding): when a MIDDLE batch of
+// the in-flight window fails to commit (the routine cross-region tx-killer),
+// the commit worker MUST NOT commit any LATER batch and MUST NOT advance the
+// persisted position past the failed batch. Without halt-on-first-failure the
+// worker would commit the already-queued later batches and the blind position
+// UPSERT would advance past the rolled-back one — a resume would then skip the
+// failed batch's changes (silent loss; idempotent re-apply cannot recover what
+// is never re-streamed). After the failure, a warm-resume (re-feed from the
+// contiguously-committed position) must recover exactly-once.
+func TestPipelined_MidWindowCommitFailure_NoPositionGap(t *testing.T) {
+	dsn, cleanup := startMySQLForApplier(t)
+	defer cleanup()
+
+	const tbl = "midfail_pipe"
+	applyMySQLApplier(t, dsn, fmt.Sprintf(`
+		CREATE TABLE %s (
+			id    BIGINT       NOT NULL,
+			email VARCHAR(255) NOT NULL,
+			PRIMARY KEY (id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`, quoteIdent(tbl)))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	a := openPipelinedApplier(t, ctx, dsn, pipelineDepthW)
+	defer closeApplier(a)
+
+	// 40 keyed inserts, batchSize 8 → 5 batches (seq 1..5); window W=4, so
+	// batches 3,4(,5) are queued/in-flight behind batch 2 when it fails.
+	const totalRows = 40
+	const batchSize = 8
+	events := make([]ir.Change, 0, totalRows)
+	for i := int64(1); i <= totalRows; i++ {
+		events = append(events, ir.Insert{
+			Position: ir.Position{Engine: engineNameMySQL, Token: fmt.Sprintf("row-%d", i)},
+			Schema:   "target_db", Table: tbl,
+			Row: ir.Row{"id": i, "email": fmt.Sprintf("u%d@x", i)},
+		})
+	}
+
+	// Fail the SECOND batch's commit (seq 2). Later batches are already queued
+	// behind it; halt-on-first-failure must roll them back, not commit them.
+	pipelineTestCommitHook = func(seq uint64) error {
+		if seq == 2 {
+			return errors.New("mysql: simulated tx-killer commit abort (seq 2)")
+		}
+		return nil
+	}
+	err := pumpBatchedChangesPipelinedExpectErr(t, ctx, a, testStreamID, events, batchSize)
+	pipelineTestCommitHook = nil // clear before the recovery run
+	if err == nil {
+		t.Fatal("ApplyBatch returned nil; want the injected mid-window commit failure surfaced (fail-fast)")
+	}
+
+	// CONTIGUOUS POSITION: only batch 1 (seq 1, tokens row-1..row-8) committed;
+	// the position must be EXACTLY row-8 — never advanced to row-40, which
+	// would be the silent-loss gap past the rolled-back batch 2.
+	pos, ok, perr := a.ReadPosition(ctx, testStreamID)
+	if perr != nil {
+		t.Fatalf("ReadPosition after mid-window failure: %v", perr)
+	}
+	if !ok || pos.Token != "row-8" {
+		t.Fatalf("persisted position after mid-window commit failure = %q (ok=%v); want exactly \"row-8\" "+
+			"(the highest CONTIGUOUSLY-committed batch — any token past it is a silent-loss position gap)", pos.Token, ok)
+	}
+	// Only batch 1's 8 rows are durable; batches 2..5 must have rolled back.
+	if got := countAllRows(t, dsn, "target_db", tbl); got != batchSize {
+		t.Fatalf("rows after mid-window failure = %d; want %d (later batches must NOT commit past the failed one)", got, batchSize)
+	}
+
+	// WARM-RESUME RECOVERY: re-feed the full stream (hook cleared). Idempotent
+	// upsert absorbs batch 1's overlap and applies batches 2..5 → all rows
+	// present, position at the last token. Exactly-once across the abort.
+	pumpBatchedChangesPipelined(t, ctx, a, testStreamID, events, batchSize)
+	if got := countAllRows(t, dsn, "target_db", tbl); got != totalRows {
+		t.Fatalf("rows after warm-resume recovery = %d; want %d (exactly-once recovery from the abort)", got, totalRows)
+	}
+	pos2, ok, perr := a.ReadPosition(ctx, testStreamID)
+	if perr != nil || !ok || pos2.Token != "row-40" {
+		t.Fatalf("position after recovery = %q (ok=%v err=%v); want \"row-40\"", pos2.Token, ok, perr)
+	}
+}
+
+// pumpBatchedChangesPipelinedExpectErr is like pumpBatchedChangesPipelined but
+// RETURNS the ApplyBatch error instead of failing the test — the
+// mid-window-commit-failure pin expects the injected failure to surface.
+func pumpBatchedChangesPipelinedExpectErr(t *testing.T, ctx context.Context, applier ir.ChangeApplier, streamID string, events []ir.Change, batchSize int) error {
+	t.Helper()
+	if err := applier.EnsureControlTable(ctx); err != nil {
+		t.Fatalf("EnsureControlTable: %v", err)
+	}
+	batched, ok := applier.(ir.BatchedChangeApplier)
+	if !ok {
+		t.Fatalf("applier does not implement BatchedChangeApplier")
+	}
+	ch := make(chan ir.Change, len(events))
+	for _, e := range events {
+		ch <- e
+	}
+	close(ch)
+	return batched.ApplyBatch(ctx, streamID, ch, batchSize)
 }
 
 // pumpBatchedChangesPipelined feeds events through ApplyBatch under the

@@ -148,6 +148,19 @@ type mysqlBatchTx struct {
 // *sql.Tx loop with a one-time WARN.
 var errPipelineUnavailable = errors.New("mysql: applier: pipelined apply unavailable")
 
+// pipelineTestCommitHook, when non-nil, lets a test inject a commit failure
+// for a chosen batch sequence (the mid-window commit-failure path that pins
+// the halt-on-first-failure / contiguous-position invariant — otherwise
+// unreproducible without a real cross-region tx-killer abort). It is consulted
+// by [mysqlPipeline.commitTx] BEFORE the real commit; a non-nil return rolls
+// the batch's tx back (simulating an aborted commit) and is treated as a
+// commit failure. nil in production (a single nil check per commit). The test
+// sets it before [ChangeApplier.ApplyBatch] (which starts the commit worker,
+// establishing happens-before) and clears it after ApplyBatch returns (the
+// worker has already exited via drain), so the read (worker goroutine) is
+// race-free against the write (test goroutine).
+var pipelineTestCommitHook func(seq uint64) error
+
 // pipelineEnabled reports whether the operator wired an explicit
 // apply-pipeline depth > 1. Zero/1 (every non-CLI construction's zero
 // value) is serial — the v0.99.51 zero-value-safe default.
@@ -217,8 +230,26 @@ func (p *mysqlPipeline) commitWorker() {
 // the single commit worker, so it is also the single observation site —
 // the source-order, no-overlap-poisoning property the controller needs.
 func (p *mysqlPipeline) commitOne(b *mysqlBatchTx) {
+	// HALT-ON-FIRST-FAILURE (the exactly-once invariant — value-fidelity
+	// review CRITICAL fix). If ANY earlier batch in this run already failed
+	// to commit, this batch MUST NOT commit. The FIFO worker reaches this
+	// batch after the failed one; committing it would write its position
+	// token and advance the persisted position PAST the rolled-back failed
+	// batch — a silent-loss GAP on resume (the resume point would skip the
+	// failed batch's changes, and idempotent re-apply cannot recover what is
+	// never re-streamed). So roll back instead and release the slot, leaving
+	// the persisted position at the highest CONTIGUOUSLY-committed token; the
+	// stream then stops (the producer already saw pendingErr) and warm-resume
+	// re-streams + idempotently re-applies from there. This is what makes the
+	// "contiguous" in "highest contiguously-committed" actually hold — a
+	// commit failure stops ALL later commits, it does not let them race ahead.
+	if p.pendingErr() != nil {
+		_ = b.tx.Rollback()
+		<-p.slots
+		return
+	}
 	start := time.Now()
-	err := appliershared.RunWithDeadline(p.a.execTimeout, b.tx.Commit)
+	err := p.commitTx(b)
 	latency := time.Since(start)
 	if err != nil {
 		err = classifyApplierError(fmt.Errorf("mysql: applier: pipelined commit (seq %d): %w", b.seq, err))
@@ -234,6 +265,21 @@ func (p *mysqlPipeline) commitOne(b *mysqlBatchTx) {
 	// Release the window slot AFTER the commit fully completes, so the
 	// in-flight count reflects real durability, not just dispatch.
 	<-p.slots
+}
+
+// commitTx commits b's transaction under the Bug-56 commit watchdog. A test
+// may inject a commit failure for a chosen sequence via pipelineTestCommitHook
+// (nil in production) to pin the halt-on-first-failure / no-position-gap
+// invariant; a hook failure rolls the tx back (not durable) and is returned as
+// the commit error so the worker stops all later commits.
+func (p *mysqlPipeline) commitTx(b *mysqlBatchTx) error {
+	if pipelineTestCommitHook != nil {
+		if herr := pipelineTestCommitHook(b.seq); herr != nil {
+			_ = b.tx.Rollback()
+			return herr
+		}
+	}
+	return appliershared.RunWithDeadline(p.a.execTimeout, b.tx.Commit)
 }
 
 // recordErr stores the first async commit error fail-fast. Subsequent
