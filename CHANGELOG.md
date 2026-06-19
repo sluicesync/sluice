@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.76] - 2026-06-19
+
+### Fixed
+
+- **The per-shard VStream stall WARN (v0.99.74) now detects a shard that is wedged from the very first CDC event — it was previously blind to exactly that case.** The per-shard progress watchdog populated its per-shard last-advance clock ONLY when a shard delivered its first advancing VGTID, so a shard that froze at the start of the CDC tail (and therefore never delivered an advancing event) was never entered into the watchdog's state and `scan` never even considered it — no WARN, ever. That was precisely the live silence on a multi-shard Vitess→PlanetScale-MySQL sync where one shard was frozen from the snapshot→CDC handoff while the other advanced: the detector built for that wedge was structurally blind to its worst case. The fix threads the resolved shard layout into the watchdog and PRE-SEEDS every known shard's clock at start, so a shard that never advances goes stale after the window and is detected (given a fresh peer — the asymmetric signature). Seeding at start time (not the zero time) preserves a full window of warm-up grace, and combined with the existing serving-proven gate and the "a peer must be fresh" requirement a just-started stream still cannot warn during warm-up. A shard absent from the known layout (e.g. one appearing after a reshard) is still tracked lazily on first advance, as before. This is observability-only — the WARN never alters the stream's resilience; it just no longer misses the from-start-frozen case. Pinned by a new end-to-end watchdog test (a shard NEVER observed advancing still WARNs once stale vs a fresh peer) plus the existing scan/latch/serving-gate/disabled/teardown pins. (Investigation note: a load-forced live capture established that the dominant per-shard wedge is a delivery-side `MinimizeSkew` hold under a cross-region apply-deficit — vtgate stops delivering the held shard — which a stream reopen does NOT clear; the durable fix there is apply throughput, tracked separately. This release is the detector-completeness fix, not the recovery.)
+
 ## [0.99.75] - 2026-06-19
 
 ### Fixed
