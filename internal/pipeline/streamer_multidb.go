@@ -526,6 +526,17 @@ func (s *Streamer) coldStartCopyOneDatabase(
 		return fmt.Errorf("pipeline: apply expression overrides for %q: %w", database, err)
 	}
 
+	// Cross-engine schema-narrowing advisory notices (Bug 157 Q2). Emitted
+	// PER DATABASE — once each database's schema is finalized (mappings +
+	// expression overrides applied) and before its target tables are created
+	// — so a MySQL→PG multi-database sync surfaces the same up-front WARNs
+	// the migrate path emits, scoped to the affected database. The helper's
+	// scanners self-short-circuit by engine pair (MySQL→MySQL multi-database
+	// — the common fan-out shape — emits ZERO notices). FK stripping below
+	// does not affect column-type scanning, so order versus stripForeignKeys
+	// is immaterial.
+	emitCrossEngineTranslationNotices(ctx, schema, s.Source.Name(), s.Target.Name(), "sync cold-start")
+
 	// Foreign keys are deferred to keep the first cut symmetric with the
 	// multi-database migrate path: a same-named cross-database FK may
 	// reference a database whose tables are created in a later iteration.

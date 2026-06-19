@@ -280,53 +280,19 @@ func (m *Migrator) phaseTranslateAndGateSchema(ctx context.Context, schema *ir.S
 			return nil, false, err
 		}
 
-		// ---- 1.67. Unsigned-bigint range-narrowing notice (Bug 11) ----
-		// MySQL `bigint unsigned` maps uniformly to PG `bigint` so PK
-		// and FK types match by construction (the FK-to-IDENTITY-PK
-		// type mismatch that aborted every default ORM schema is gone).
-		// The (2^63, 2^64) range loss is a deliberate, documented
-		// policy — surfaced LOUDLY here (and at `schema preview`) so it
-		// is never silent. This is a NOTICE, not a refusal: the
-		// universal Rails/Laravel/Django schema must still migrate.
-		// Emitted at WARN so it stands out in default-level logs.
-		if noticeErr := translate.UnsignedBigintNoticeError(
-			schema, m.Source.Name(), m.Target.Name(), "migrate",
-		); noticeErr != nil {
-			slog.WarnContext(ctx, noticeErr.Error())
-		}
-
-		// ---- 1.68. Unconstrained-numeric widening notice (Bug 69) ----
-		// An unconstrained PG `numeric` (no declared precision/scale)
-		// maps to MySQL `DECIMAL(65,30)` (MySQL has no unbounded
-		// DECIMAL). The pre-fix behaviour silently truncated to
-		// DECIMAL(0,0); this preserves far more and surfaces the
-		// deliberate widening LOUDLY here (and at `schema preview`) so
-		// it is never silent. NOTICE, not a refusal — unconstrained
-		// numeric is ubiquitous in PG schemas and must still migrate.
-		// PG → PG is unaffected (round-trips as bare NUMERIC); the scan
-		// short-circuits non-MySQL targets. Emitted at WARN so it
-		// stands out in default-level logs.
-		if noticeErr := translate.UnconstrainedNumericNoticeError(
-			schema, m.Source.Name(), m.Target.Name(), "migrate",
-		); noticeErr != nil {
-			slog.WarnContext(ctx, noticeErr.Error())
-		}
-
-		// ---- 1.69. Wide-varchar down-map notice (Bug 72) ----
-		// A wide bounded PG `varchar(N)` (over MySQL's ~16383-char
-		// utf8mb4 VARCHAR cap / 65535-byte row budget) is down-mapped
-		// to a MySQL TEXT tier sized to hold N chars — mirroring the
-		// unbounded `text` → LONGTEXT policy. The pre-fix behaviour
-		// emitted VARCHAR(N) literally and died with a raw MySQL
-		// Error 1074 / 1118 at create-tables. NOTICE, not a refusal —
-		// wide free-text columns are common and must still migrate.
-		// PG → PG is unaffected (varchar round-trips unchanged); the
-		// scan short-circuits non-MySQL targets.
-		if noticeErr := translate.WideVarcharNoticeError(
-			schema, m.Source.Name(), m.Target.Name(), "migrate",
-		); noticeErr != nil {
-			slog.WarnContext(ctx, noticeErr.Error())
-		}
+		// ---- 1.67. Cross-engine schema-narrowing advisory notices ----
+		// The unsigned-bigint range narrowing (Bug 11), the
+		// unconstrained-numeric widening (Bug 69), and the wide-varchar
+		// down-map (Bug 72) — each a deliberate, documented cross-engine
+		// policy surfaced LOUDLY here (and at `schema preview`) so it is
+		// never silent. These are NOTICES, not refusals: the universal
+		// Rails/Laravel/Django (and ubiquitous unconstrained-numeric /
+		// wide free-text) schemas must still migrate. Each scanner
+		// self-short-circuits its non-applicable engine pair, so the
+		// helper is safe to call unconditionally here inside the
+		// cross-engine block. Shared verbatim with the `sync` cold-start
+		// path (Bug 157 Q2) via emitCrossEngineTranslationNotices.
+		emitCrossEngineTranslationNotices(ctx, schema, m.Source.Name(), m.Target.Name(), "migrate")
 	}
 
 	return schema, rawCopyOK, nil

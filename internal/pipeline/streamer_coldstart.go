@@ -107,6 +107,19 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		return nil, stop, err
 	}
 
+	// Cross-engine schema-narrowing advisory notices (Bug 157 Q2). The
+	// same advisory WARNs the migrate path emits (unsigned-bigint
+	// narrowing / unconstrained-numeric widening / wide-varchar down-map)
+	// must also surface on the `sync` cold-start path — emitted AFTER the
+	// schema is finalized (mappings / expression overrides / shard-column
+	// injection all applied in coldStartPrepareSchema) and BEFORE any
+	// target table is created or any row moves, so the operator sees the
+	// warning up front rather than discovering the narrowing mid-copy. The
+	// helper's scanners self-short-circuit by engine pair, so a same-engine
+	// sync (MySQL→MySQL, PG→PG) emits ZERO notices — no false WARN on the
+	// lossless path.
+	emitCrossEngineTranslationNotices(ctx, schema, s.Source.Name(), s.Target.Name(), "sync cold-start")
+
 	// Open the snapshot stream — seeded from the persisted mid-COPY
 	// cursor when resuming an interrupted cold-start (v0.99.8), from
 	// the beginning otherwise.
