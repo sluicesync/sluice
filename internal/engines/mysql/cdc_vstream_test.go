@@ -1895,3 +1895,39 @@ func TestDecodeVStreamRow_ZeroDatePolicy(t *testing.T) {
 		}
 	})
 }
+
+// TestShardScopedTarget pins the vtgate target string the purged-GTID
+// pre-flight uses to read @@global.gtid_purged for ONE specific shard.
+//
+// The load-bearing fix (item 23 Phase-A finding): a keyspace-level target
+// ("keyspace@<tablettype>") lets vtgate answer @@global.gtid_purged from an
+// ARBITRARY shard per query, so the per-shard GTID_SUBSET check compared a
+// random shard's purged set (a different server-UUID) against this shard's
+// resume gtid and false-rejected the position. A shard-scoped target
+// ("keyspace:shard@<tablettype>") pins the read to the same shard whose
+// resume gtid is being compared.
+func TestShardScopedTarget(t *testing.T) {
+	cases := []struct {
+		name     string
+		keyspace string
+		shard    string
+		tablet   topodata.TabletType
+		want     string
+	}{
+		{"sharded replica -80", "commerce", "-80", topodata.TabletType_REPLICA, "commerce:-80@replica"},
+		{"sharded replica 80-", "commerce", "80-", topodata.TabletType_REPLICA, "commerce:80-@replica"},
+		{"sharded primary", "commerce", "-80", topodata.TabletType_PRIMARY, "commerce:-80@primary"},
+		{"sharded rdonly", "commerce", "80-", topodata.TabletType_RDONLY, "commerce:80-@rdonly"},
+		{"unsharded dash shard", "ks", "-", topodata.TabletType_REPLICA, "ks:-@replica"},
+		{"empty shard falls back to keyspace-level", "ks", "", topodata.TabletType_REPLICA, "ks@replica"},
+		{"empty shard whitespace falls back", "ks", "  ", topodata.TabletType_PRIMARY, "ks@primary"},
+		{"zero tablet type defaults to replica", "ks", "-80", topodata.TabletType_UNKNOWN, "ks:-80@replica"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shardScopedTarget(tc.keyspace, tc.shard, tc.tablet); got != tc.want {
+				t.Errorf("shardScopedTarget(%q,%q,%v) = %q; want %q", tc.keyspace, tc.shard, tc.tablet, got, tc.want)
+			}
+		})
+	}
+}

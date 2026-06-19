@@ -757,29 +757,42 @@ func (r *vstreamCDCReader) verifyVStreamPositionReachable(ctx context.Context, d
 	if r.cfg == nil {
 		return nil // direct-API / unit construction: no DSN to probe with.
 	}
-	// Retarget the probe at the SAME tablet type the stream will bind to.
-	c := r.cfg.Clone()
-	c.DBName = r.keyspace + "@" + tabletTypeSuffix(r.tabletType)
-	db, err := openDB(ctx, c)
-	if err != nil {
-		slog.WarnContext(ctx, "mysql/vstream: purged-GTID pre-flight: could not open probe connection; proceeding without the check",
-			slog.String("target", c.DBName), slog.String("err", err.Error()))
-		return nil
-	}
-	defer func() { _ = db.Close() }()
-
 	for _, sg := range decoded {
 		bare := stripGTIDFlavor(sg.Gtid)
 		if strings.TrimSpace(bare) == "" || strings.EqualFold(bare, "current") {
 			continue // not a resumable GTID set — nothing to verify.
 		}
+		// Target the probe at THIS SHARD specifically (keyspace:shard@tablettype),
+		// NOT a keyspace-level target. Phase-A ground truth (live multi-shard
+		// Vitess): `@@global.gtid_purged` read through a keyspace-level target
+		// (`keyspace@replica`) is answered by an ARBITRARY shard vtgate picks
+		// per query — a bare `SELECT @@global.gtid_purged` returned shard -80's
+		// purged set, while the SAME variable evaluated inside a function call on
+		// the next query returned shard 80-'s. So the per-shard check
+		// `GTID_SUBSET(@@global.gtid_purged, <this shard's resume gtid>)` compared
+		// a RANDOM shard's purged set — carrying a DIFFERENT server-UUID — against
+		// this shard's resume gtid, and a different-UUID set is never a subset →
+		// GTID_SUBSET=0 → a FALSE "position purged" rejection on essentially every
+		// multi-shard warm-resume, forcing a needless full cold-start re-copy.
+		// Shard-scoped targeting pins `@@global.gtid_purged` to the SAME shard
+		// whose resume gtid we compare, so same-UUID sets are compared correctly.
+		c := r.cfg.Clone()
+		c.DBName = shardScopedTarget(r.keyspace, sg.Shard, r.tabletType)
+		db, err := openDB(ctx, c)
+		if err != nil {
+			slog.WarnContext(ctx, "mysql/vstream: purged-GTID pre-flight: could not open probe connection; proceeding without the check",
+				slog.String("target", c.DBName), slog.String("shard", sg.Shard), slog.String("err", err.Error()))
+			return nil
+		}
 		var subset int
-		if err := db.QueryRowContext(ctx, "SELECT GTID_SUBSET(@@global.gtid_purged, ?)", bare).Scan(&subset); err != nil {
+		qerr := db.QueryRowContext(ctx, "SELECT GTID_SUBSET(@@global.gtid_purged, ?)", bare).Scan(&subset)
+		_ = db.Close()
+		if qerr != nil {
 			// Couldn't run the check (routing/availability/transient) — don't
 			// turn that into a spurious re-snapshot; the stream open below will
 			// surface any real failure loudly.
 			slog.WarnContext(ctx, "mysql/vstream: purged-GTID pre-flight: GTID_SUBSET probe failed; proceeding without the check",
-				slog.String("target", c.DBName), slog.String("shard", sg.Shard), slog.String("err", err.Error()))
+				slog.String("target", c.DBName), slog.String("shard", sg.Shard), slog.String("err", qerr.Error()))
 			return nil
 		}
 		if subset == 0 {
@@ -788,6 +801,20 @@ func (r *vstreamCDCReader) verifyVStreamPositionReachable(ctx context.Context, d
 		}
 	}
 	return nil
+}
+
+// shardScopedTarget builds the vtgate target that pins a query to ONE shard at
+// the given tablet type — "keyspace:shard@<tablettype>". This is required for
+// reading a per-shard server variable like @@global.gtid_purged: a keyspace-
+// level target ("keyspace@<tablettype>") lets vtgate answer from an arbitrary
+// shard per query (Phase-A finding behind the purged-GTID pre-flight shard fix).
+// An empty shard (unsharded keyspace with no explicit shard) falls back to the
+// keyspace-level target, which is unambiguous when there is only one shard.
+func shardScopedTarget(keyspace, shard string, t topodata.TabletType) string {
+	if strings.TrimSpace(shard) == "" {
+		return keyspace + "@" + tabletTypeSuffix(t)
+	}
+	return keyspace + ":" + shard + "@" + tabletTypeSuffix(t)
 }
 
 // tabletTypeSuffix maps a topodata.TabletType to the vtgate target suffix
