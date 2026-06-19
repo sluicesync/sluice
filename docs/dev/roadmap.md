@@ -420,6 +420,14 @@ So NOTIFY-kick is **demoted** — the poll isn't the bottleneck. Closing the rea
 
 ---
 
+### 25. Pre-existing target table whose schema DIFFERS from the source is silently accepted (`CREATE TABLE IF NOT EXISTS` skips) — target-schema-drift preflight — *demand-gated; mostly loud, but a relaxed-`sql_mode` MySQL target makes it a latent SILENT-coercion vector*
+
+**Why (Bug 157 Phase-A finding, 2026-06-18).** A cold-start's create-tables step uses `CREATE TABLE IF NOT EXISTS` (`internal/engines/mysql/ddl_emit.go` ~915; PG path equivalent). If an **empty** target table already exists with a schema that differs from what sluice would emit (a stale/reused target, a hand-created table, a prior run's leftover DDL), the `IF NOT EXISTS` makes creation a NO-OP and sluice copies into the DRIFTED schema. This was the real cause of Bug 157's MySQL-target Error 1264: `lst-mysql-b` carried a stale **signed** `bigint` column from earlier drop/recopy cycles, so the otherwise-correct `bigint unsigned` cold-copy aborted mid-write. (The Bug-9 populated-target gate catches a target with *data*, but an *empty-but-drifted* table passes it.) **Class:** for an over-range integer it is LOUD (the write aborts) — but a narrower drifted column under MySQL relaxed `sql_mode` (e.g. target `VARCHAR(10)` vs source `VARCHAR(255)`) is the Vector-B SILENT-truncation class, so this is a latent silent-loss vector, not purely UX.
+
+**What.** A preflight that, before copying into a pre-existing target table, compares the existing target column set/types against what sluice would emit and REFUSES LOUDLY (or WARNs under an explicit opt-in) on a material mismatch — naming the drifted columns + the remediation (`--reset-target-data` for a clean re-create, or fix the target DDL). This is engine-general (all types, not just `bigint unsigned`) and target-side. **Gotchas:** must not false-fire on benign/representational differences sluice itself introduces by design (e.g. the deliberate `bigint unsigned`→PG `bigint` mapping, wide-varchar→TEXT down-map, unconstrained-numeric widening — compare against sluice's OWN emitted type, not the source type); should compose with the existing cold-start gate ordering (after stale-backend reap, around the Bug-9 populated-target check). Demand-gated: surfaced by the large-scale program's reused-target churn, not a normal fresh-target migration.
+
+---
+
 ### Open bugs awaiting fix windows
 
 Tracked in detail in the project's internal regression catalog; recap here for roadmap visibility:
