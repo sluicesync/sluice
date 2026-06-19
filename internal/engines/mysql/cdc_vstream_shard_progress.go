@@ -101,20 +101,25 @@ type shardProgressWatchdog struct {
 }
 
 // startShardProgressWatchdog arms the per-shard progress watchdog. window
-// is the per-shard stall window; onShardStall(shard) is called ONCE per
-// stall spell per shard (latched, cleared when that shard advances again),
-// in the watchdog goroutine, when the shard has not advanced for the
-// window WHILE a peer advanced within the window AND serving has been
-// proven. onShardStall MUST be observability only (a WARN) — it must NOT
-// fail or cancel the stream.
+// is the per-shard stall window; knownShards is the resolved shard layout the
+// stream subscribes to (e.g. ["-80","80-"]) — PRE-SEEDED at start so a shard
+// that is wedged from the very first CDC event (never delivers one advancing
+// VGTID) is still detectable; without pre-seeding, the watchdog only ever knew
+// about a shard AFTER its first advance, so a from-start-frozen shard was
+// invisible (the live item-23 B-1 blind spot). onShardStall(shard) is called
+// ONCE per stall spell per shard (latched, cleared when that shard advances
+// again), in the watchdog goroutine, when the shard has not advanced for the
+// window WHILE a peer advanced within the window AND serving has been proven.
+// onShardStall MUST be observability only (a WARN) — it must NOT fail or
+// cancel the stream.
 //
 // window <= 0 disables the watchdog: returns a no-op whose
 // observeAdvance/markServingProven/stop are all safe to call. Production
 // always gets the real timer via [newRealLivenessTimer]; only unit tests
 // pass anything else (and an injectable clock) through
 // [startShardProgressWatchdogWithDeps].
-func startShardProgressWatchdog(ctx context.Context, window time.Duration, onShardStall func(shard string)) *shardProgressWatchdog {
-	return startShardProgressWatchdogWithDeps(ctx, window, onShardStall, newRealLivenessTimer, time.Now)
+func startShardProgressWatchdog(ctx context.Context, window time.Duration, knownShards []string, onShardStall func(shard string)) *shardProgressWatchdog {
+	return startShardProgressWatchdogWithDeps(ctx, window, knownShards, onShardStall, newRealLivenessTimer, time.Now)
 }
 
 // startShardProgressWatchdogWithDeps is the test seam behind
@@ -124,7 +129,7 @@ func startShardProgressWatchdog(ctx context.Context, window time.Duration, onSha
 // a test drive per-shard last-advance ages deterministically instead of
 // racing the real clock — the same flake-avoidance discipline as the
 // liveness fake-timer tests (the v0.99.31 windows-latest flake).
-func startShardProgressWatchdogWithDeps(ctx context.Context, window time.Duration, onShardStall func(shard string), newTimer func(time.Duration) livenessTimer, now func() time.Time) *shardProgressWatchdog {
+func startShardProgressWatchdogWithDeps(ctx context.Context, window time.Duration, knownShards []string, onShardStall func(shard string), newTimer func(time.Duration) livenessTimer, now func() time.Time) *shardProgressWatchdog {
 	w := &shardProgressWatchdog{}
 	if window <= 0 {
 		// Disabled: nil channels make every method a no-op; no goroutine.
@@ -138,7 +143,7 @@ func startShardProgressWatchdogWithDeps(ctx context.Context, window time.Duratio
 	w.advances = make(chan []string, 1)
 	w.proven = make(chan struct{}, 1)
 	w.done = make(chan struct{})
-	go w.run(ctx, window, onShardStall, newTimer, now)
+	go w.run(ctx, window, knownShards, onShardStall, newTimer, now)
 	return w
 }
 
@@ -147,27 +152,48 @@ func startShardProgressWatchdogWithDeps(ctx context.Context, window time.Duratio
 // timer re-armed to window. The pump never touches the timer.
 //
 // State:
-//   - lastAdvance[shard] = wall-clock time that shard last advanced. A
-//     shard first SEEN (its first advancement) seeds its clock to now, so
-//     a shard never WARNs before it has advanced at least once (we cannot
-//     call a never-yet-seen shard "stalled").
+//   - lastAdvance[shard] = wall-clock time that shard last advanced. ALL
+//     knownShards are PRE-SEEDED to the start time, so a shard that is wedged
+//     from the very first CDC event — and therefore never delivers an
+//     advancing VGTID — still has a clock that goes stale after the window and
+//     is detected (the live item-23 B-1 blind spot: before pre-seeding, the
+//     map was populated only on a shard's FIRST advance, so a from-start-
+//     frozen shard was never even considered by [scan]). A shard not in
+//     knownShards (e.g. one that appears only after a reshard) is still added
+//     lazily on its first observed advance.
 //   - warned[shard] latches a fired WARN so it fires at most once per
 //     stall spell; cleared when that shard advances again.
 //   - proven gates the whole scan: nothing fires until serving is proven
-//     (the per-shard WARN is strictly a Phase-2 concept).
+//     (the per-shard WARN is strictly a Phase-2 concept) — which, with the
+//     pre-seed + the "a peer must be fresh" requirement, is what keeps a
+//     just-started stream from warning during warm-up (no peer has advanced
+//     yet, so the asymmetry can't trip).
 //
 // On each timer fire (every window), for each known shard S: if S is
 // "stale" (now - lastAdvance[S] >= window) AND some OTHER shard P is
 // "fresh" (now - lastAdvance[P] < window) AND S is not already latched,
 // WARN once and latch S. A stale shard with NO fresh peer is a GLOBAL
 // stall (the whole-stream watchdog's job) — deliberately NOT this WARN.
-func (w *shardProgressWatchdog) run(ctx context.Context, window time.Duration, onShardStall func(shard string), newTimer func(time.Duration) livenessTimer, now func() time.Time) {
+func (w *shardProgressWatchdog) run(ctx context.Context, window time.Duration, knownShards []string, onShardStall func(shard string), newTimer func(time.Duration) livenessTimer, now func() time.Time) {
 	timer := newTimer(window)
 	defer timer.Stop()
 
 	lastAdvance := make(map[string]time.Time)
 	warned := make(map[string]bool)
 	proven := false
+
+	// Pre-seed every known shard at the start time so a shard that never
+	// advances (wedged from the first event) goes stale after the window and
+	// is detectable — the from-start-frozen case the lazy "seed on first
+	// advance" map missed. Seeding at now() (not the zero time) gives every
+	// shard a full window of grace from start before it can be called stale.
+	startedAt := now()
+	for _, s := range knownShards {
+		if s == "" {
+			continue
+		}
+		lastAdvance[s] = startedAt
+	}
 
 	// resetTimer stops+drains then re-arms the timer for window. Same
 	// race-free stop/drain/reset as vstreamLiveness.run (single-goroutine

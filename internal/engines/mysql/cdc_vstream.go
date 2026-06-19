@@ -953,7 +953,7 @@ func (r *vstreamCDCReader) pump(
 	// else — it must NOT setErr or cancel. Owned here for the pump's life and
 	// stashed on r so the single-goroutine dispatch path can feed it the
 	// per-shard advancement diff (cleared on exit).
-	r.shardProgress = startShardProgressWatchdog(ctx, r.shardStallWarnWindow,
+	r.shardProgress = startShardProgressWatchdog(ctx, r.shardStallWarnWindow, r.shards,
 		func(shard string) {
 			slog.WarnContext(ctx, vstreamShardStallWarnMessage(r.shardStallWarnWindow, r.keyspace, shard))
 		})

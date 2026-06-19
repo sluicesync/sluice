@@ -158,6 +158,7 @@ func TestShardProgressWatchdog_EndToEnd_AsymmetricStallWarns(t *testing.T) {
 	clk := newFakeClock()
 	warns := make(chan string, 8)
 	w := startShardProgressWatchdogWithDeps(context.Background(), 100*time.Millisecond,
+		[]string{"-80", "80-"},
 		func(shard string) { warns <- shard },
 		ft.factory(), clk.now)
 	defer w.stop()
@@ -187,6 +188,43 @@ func TestShardProgressWatchdog_EndToEnd_AsymmetricStallWarns(t *testing.T) {
 	case s := <-warns:
 		t.Fatalf("WARN fired again while latched (shard %q) — once-per-spell broken", s)
 	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestShardProgressWatchdog_EndToEnd_FromStartFrozenShardWarns pins the
+// item-23 B-1 BLIND-SPOT FIX (the live Track-B silence): a shard that is
+// wedged from the very first CDC event — it never delivers an advancing
+// VGTID, so observeAdvance is NEVER called for it — must STILL be detected,
+// because the known shard set is PRE-SEEDED at start. Before the fix the
+// watchdog learned of a shard only on its first advance, so a from-start-
+// frozen shard was never even in lastAdvance and could never WARN. Here -80
+// is never advanced; only 80- advances; once -80's pre-seeded clock goes
+// stale while 80- stays fresh, -80 must WARN. (Without the pre-seed this test
+// hangs in pumpScansUntilWarn and fails — the regression guard.)
+func TestShardProgressWatchdog_EndToEnd_FromStartFrozenShardWarns(t *testing.T) {
+	ft := newFakeLivenessTimer()
+	clk := newFakeClock()
+	warns := make(chan string, 8)
+	w := startShardProgressWatchdogWithDeps(context.Background(), 100*time.Millisecond,
+		[]string{"-80", "80-"}, // BOTH pre-seeded at t=0 — even though -80 is never observed
+		func(shard string) { warns <- shard },
+		ft.factory(), clk.now)
+	defer w.stop()
+
+	w.markServingProven()
+
+	// Drain one turn so the goroutine has seeded both shards at t=0 (and
+	// consumed the proven signal) before we move the clock. At t=0 both are
+	// fresh ⇒ no warn yet.
+	ft.fire <- time.Now()
+	ft.awaitReset(t, 100*time.Millisecond)
+
+	// Advance past the window; ONLY 80- advances. -80 is never observed — it
+	// stays at its t=0 pre-seed ⇒ stale ⇒ asymmetric wedge vs the fresh 80-.
+	clk.advance(150 * time.Millisecond)
+	w.observeAdvance([]string{"80-"})
+	if got := pumpScansUntilWarn(t, ft, warns); got != "-80" {
+		t.Fatalf("from-start-frozen WARN = %q; want -80 (the never-advanced but pre-seeded shard)", got)
 	}
 }
 
@@ -224,6 +262,7 @@ func (c *fakeClock) advance(d time.Duration) {
 func TestShardProgressWatchdog_NeverBeforeServingProven(t *testing.T) {
 	ft := newFakeLivenessTimer()
 	w := startShardProgressWatchdogWithDeps(context.Background(), 100*time.Millisecond,
+		[]string{"-80", "80-"},
 		func(shard string) {
 			t.Errorf("per-shard WARN fired for %q before serving was proven — it must be Phase-2 only", shard)
 		},
@@ -246,6 +285,7 @@ func TestShardProgressWatchdog_NeverBeforeServingProven(t *testing.T) {
 func TestShardProgressWatchdog_DisabledWindow(t *testing.T) {
 	requested := false
 	w := startShardProgressWatchdogWithDeps(context.Background(), 0,
+		[]string{"-80", "80-"},
 		func(shard string) {
 			t.Errorf("per-shard WARN fired for %q with window<=0 — it must be disabled", shard)
 		},
@@ -271,6 +311,7 @@ func TestShardProgressWatchdog_DisabledWindow(t *testing.T) {
 func TestShardProgressWatchdog_StopTearsDown(t *testing.T) {
 	ft := newFakeLivenessTimer()
 	w := startShardProgressWatchdogWithDeps(context.Background(), time.Minute,
+		[]string{"-80", "80-"},
 		func(shard string) { t.Errorf("per-shard WARN fired for %q after teardown", shard) },
 		ft.factory(), time.Now)
 	w.stop()
