@@ -31,7 +31,9 @@ package mysql
 
 import (
 	"context"
+	"crypto/md5"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"testing"
 	"time"
@@ -223,4 +225,81 @@ func TestConcurrentApply_BoundarylessStreamPersistsPosition(t *testing.T) {
 	if pos.Token != lastTok {
 		t.Errorf("persisted position = %q; want %q (seq-frontier must reach the last durable change)", pos.Token, lastTok)
 	}
+}
+
+// pumpBatchedChangesPipelined feeds events through ApplyBatch under the
+// given streamID. Unlike the package's pumpBatchedChanges it threads an
+// explicit streamID so the value-fidelity differential can run the serial
+// and concurrent passes against the same target under distinct stream rows.
+func pumpBatchedChangesPipelined(t *testing.T, ctx context.Context, applier ir.ChangeApplier, streamID string, events []ir.Change, batchSize int) {
+	t.Helper()
+	if err := applier.EnsureControlTable(ctx); err != nil {
+		t.Fatalf("EnsureControlTable: %v", err)
+	}
+	batched, ok := applier.(ir.BatchedChangeApplier)
+	if !ok {
+		t.Fatalf("applier does not implement BatchedChangeApplier")
+	}
+	ch := make(chan ir.Change, len(events))
+	for _, e := range events {
+		ch <- e
+	}
+	close(ch)
+	if err := batched.ApplyBatch(ctx, streamID, ch, batchSize); err != nil {
+		t.Fatalf("ApplyBatch (stream %s): %v", streamID, err)
+	}
+}
+
+func closeApplier(applier ir.ChangeApplier) {
+	if c, ok := applier.(interface{ Close() error }); ok {
+		_ = c.Close()
+	}
+}
+
+// tableChecksum returns a stable MD5 over every row of the table (ordered
+// by orderBy) so the value-fidelity differential can assert the serial and
+// concurrent passes produce byte-identical target state.
+func tableChecksum(t *testing.T, dsn, schema, table, orderBy string) string {
+	t.Helper()
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	rows, err := db.QueryContext(ctx, "SELECT * FROM "+quoteIdent(schema)+"."+quoteIdent(table)+" ORDER BY "+orderBy)
+	if err != nil {
+		t.Fatalf("checksum query: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	cols, err := rows.Columns()
+	if err != nil {
+		t.Fatalf("checksum columns: %v", err)
+	}
+	h := md5.New()
+	for rows.Next() {
+		raw := make([]sql.RawBytes, len(cols))
+		dest := make([]any, len(cols))
+		for i := range raw {
+			dest[i] = &raw[i]
+		}
+		if err := rows.Scan(dest...); err != nil {
+			t.Fatalf("checksum scan: %v", err)
+		}
+		for _, rb := range raw {
+			if rb == nil {
+				h.Write([]byte("\x00NULL\x00"))
+			} else {
+				h.Write(rb)
+				h.Write([]byte("\x01"))
+			}
+		}
+		h.Write([]byte("\x02"))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("checksum rows.Err: %v", err)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }

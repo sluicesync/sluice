@@ -311,9 +311,10 @@ func (Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeAppli
 	return &ChangeApplier{
 		db:     db,
 		schema: cfg.DBName,
-		// pipelineCfg retains the parsed DSN so the ADR-0104 pipelined-apply
-		// pool can be opened lazily on the first pipelined batch (only when
-		// --apply-pipeline-depth > 1 is wired via SetApplyPipelineDepth).
+		// pipelineCfg retains the parsed DSN so the ADR-0104 concurrent
+		// key-hash apply path can open its dedicated pool lazily on the first
+		// concurrent batch (only when --apply-concurrency > 1 is wired via
+		// SetApplyConcurrency).
 		pipelineCfg:   cfg,
 		pkCache:       make(map[string][]string),
 		colTypeCache:  make(map[string]map[string]*ir.Column),

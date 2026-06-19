@@ -510,7 +510,7 @@ type concurrentApplyManager struct {
 }
 
 // applyBatchConcurrent is the ADR-0104 concurrent key-hash apply entry,
-// invoked from ApplyBatch when an operator wires --apply-pipeline-depth
+// invoked from ApplyBatch when an operator wires --apply-concurrency
 // (the lane count W) > 1 and a dedicated pool can be opened. It owns the
 // lane pool for the call's lifetime. On any lane or coordinator error the
 // whole run stops (ctx cancel + drain) and the error is returned; the

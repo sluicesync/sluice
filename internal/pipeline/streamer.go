@@ -495,31 +495,12 @@ type Streamer struct {
 	// to bound the silent-stall window (GitHub issue #23).
 	ApplyExecTimeout time.Duration
 
-	// ApplyPipelineDepth is the ADR-0104 Phase-1 apply-pipeline depth W
-	// plumbed to the target [ir.ChangeApplier] via the optional
-	// [ir.ApplyPipelineDepthSetter] interface. It is the number of
-	// independent ordered CDC-apply transactions that may be in flight at
-	// once, committed strictly in submission (source) order, to overlap
-	// cross-region commit RTTs on a high-latency link (aggregate apply
-	// ceiling ~W/RTT) — the lever that closes the item-23 per-shard wedge
-	// on a cross-region PlanetScale-MySQL target.
-	//
-	// Zero-value-safe (the v0.99.51 trap): 0 and 1 BOTH mean serial,
-	// byte-identical to the pre-ADR-0104 path; pipelining engages ONLY for
-	// W > 1. Only the MySQL target applier implements the setter today
-	// (Postgres uses ADR-0092's within-tx statement pipelining instead).
-	// The CLI's `sync start --apply-pipeline-depth=W` flag is the
-	// operator-facing knob; the default (0) keeps every stream serial
-	// unless the operator opts in.
-	ApplyPipelineDepth int
-
 	// ApplyConcurrency is the ADR-0104 (item 23(c)) key-hash apply LANE
 	// count W plumbed to the target [ir.ChangeApplier] via the optional
 	// [ir.ApplyConcurrencySetter] interface. The merged CDC stream is fanned
 	// across W in-order lanes by primary-key hash, each committing
 	// concurrently on a dedicated backend, lifting aggregate apply
-	// throughput toward W× — the LIVE successor to ApplyPipelineDepth's
-	// Phase-1 commit pipeline for closing the item-23 cross-region wedge.
+	// throughput toward W× — the lever closing the item-23 cross-region wedge.
 	//
 	// Zero-value-safe: 0 and 1 mean serial (byte-identical); concurrency
 	// engages ONLY for W > 1 with a dedicated pool available. Only the MySQL
