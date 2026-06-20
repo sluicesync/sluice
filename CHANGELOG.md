@@ -4,6 +4,16 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.82] - 2026-06-20
+
+### Added
+
+- **`--apply-concurrency` now works on Postgres targets too — concurrent key-hash CDC apply comes to Postgres (ADR-0105, roadmap item 26).** The cross-region CDC apply throughput lever that ADR-0104 gave MySQL targets (a merged change stream fanned across W in-order lanes by primary-key hash, each lane committing concurrently on its own backend with its own AIMD controller, the resume position advancing only to a source-tx boundary durable across all lanes) is now available for Postgres targets as well. Until now a Postgres target had only the ADR-0092 within-transaction statement pipelining, which overlaps the commit RTT but cannot parallelize across keys, so a high-latency cross-region Postgres apply was RTT-bound with no concurrency knob. The shared exactly-once core — the key-hash router and the contiguous checkpoint frontier — was extracted into a new engine-neutral `internal/laneapply` package (the MySQL path re-wired onto it and pinned byte-identical), and the Postgres engine implements the small per-engine seam: per-lane `INSERT … ON CONFLICT DO UPDATE` (ADR-0010 idempotency), an in-lane split-and-retry that treats a Postgres serialization failure (SQLSTATE 40001) or deadlock (40P01) the way the MySQL path treats a transaction-killer, and a separate-transaction position checkpoint. Set `--apply-concurrency=4` (or higher) on a Postgres target to engage; `0`/`1` (the default) is serial and byte-identical to the prior path. Live-validated on a cross-region 2-shard Vitess→PlanetScale-Postgres link: `--apply-concurrency=4` cleared a ~16,000-GTID backlog to caught-up within ~2 minutes and then held pace with the source, where the serial path could not keep up. Postgres inherits the ADR-0104 position relaxation verbatim (the persisted position lags durable data but never leads it → exactly-once for keyed tables on crash+resume; keyless stays at-least-once).
+
+### Fixed
+
+- **`--apply-concurrency` help text said "MySQL target only / inert on Postgres" — corrected to describe both engines.** The flag plumbing was already engine-general; only the help lagged, so a Postgres operator would not have known to use it.
+
 ## [0.99.81] - 2026-06-20
 
 ### Changed
