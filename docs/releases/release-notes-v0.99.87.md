@@ -1,5 +1,7 @@
 # sluice v0.99.87
 
+> ⚠️ **KNOWN ISSUE — upgrade to v0.99.88.** This version's compression support has a CRITICAL edge case: a **large** compressed transaction (more rows than `--apply-batch-size`, default 1000) that is **interrupted mid-apply and warm-resumed** can silently drop the un-applied rows (the resume position could advance past the whole payload). Small compressed transactions and uninterrupted applies are unaffected, but **anyone using `binlog_transaction_compression=ON` should use v0.99.88**, which fixes the resume-position anchoring. Sources without binlog compression are not affected at all.
+
 **MySQL CDC now supports `binlog_transaction_compression=ON`.** Previously, a source with binlog transaction compression enabled would have its compressed transactions *silently* not applied — continuous sync looked healthy but replicated nothing. This fixes that.
 
 ## Fixed
