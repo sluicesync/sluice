@@ -1,5 +1,7 @@
 # sluice v0.99.82
 
+> ⚠️ **KNOWN ISSUE — do NOT use `--apply-concurrency > 1` on a Postgres target in this version.** A post-release regression cycle found a CRITICAL silent-data-loss bug (Bug 158): on a Postgres target, when a table's schema trips the ADR-0091 first-post-cold-start phantom-shape skip, the concurrent apply pipeline can silently drop CDC changes and freeze the apply position. **MySQL-target `--apply-concurrency` and serial Postgres apply (the default, `--apply-concurrency` unset/0/1) are NOT affected.** Fixed in v0.99.83 — upgrade before enabling concurrent apply on a Postgres target. The headline feature below is otherwise as described; only the Postgres concurrent path is affected.
+
 **Concurrent CDC apply comes to Postgres targets: `--apply-concurrency` is now engine-general.** The cross-region apply-throughput lever that v0.99.77–v0.99.80 brought to MySQL targets now works for Postgres targets too — closing the last open side of the cross-region CDC apply wedge.
 
 ## Added
