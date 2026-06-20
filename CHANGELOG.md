@@ -4,6 +4,20 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.80] - 2026-06-20
+
+### Added
+
+- **`--apply-concurrency` graduates to full GA: per-lane AIMD + in-lane transaction-killer recovery (ADR-0104, item 23(c)).** The concurrent key-hash apply path (added in v0.99.77) now gives each lane its OWN AIMD apply-batch-size controller, so every lane adapts its batch size to the link latency independently — the concurrent path is now W parallel adaptive appliers, not W static ones. And a PlanetScale transaction-killer abort (Error 1105 "tx killer rollback") is handled IN-LANE: the lane's controller multiplicative-decreases and the failed batch is RE-CHUNKED — split in half recursively and re-applied idempotently — until the sub-batches are small enough to commit, with NO whole-run restart. A transient tx-killer recovers on a quick retry-same; a persistent one converges by splitting ("the shrink IS the split", matching the serial #54 behavior); a single change that still can't commit fails the run loudly after a bounded retry (→ warm-resume). Exactly-once is preserved: a sub-batch's sequences advance the resume frontier only after that sub-batch durably commits, in source order across the splits. Live-validated on the cross-region 2-shard Vitess→PlanetScale-MySQL link: steady-state apply ~233 rows/s on the default config (no tx-killers — the AIMD keeps batches committable), and a deliberately-triggered tx-killer storm split-and-converged with zero fatal errors and zero stream restarts. This closes the v0.99.77 PREVIEW caveat (lanes previously used static batch sizing, so a tx-killer stopped the stream and warm-resumed rather than recovering in place). The CLI help now documents the GA behavior and the one operating note below.
+
+### Fixed
+
+- **In-lane tx-killer recovery now SPLITS a persistently-killed batch instead of re-applying it whole (found by the GA live validation).** The first cut of the in-lane retry re-applied the same buffered batch on a retriable failure; the controller's multiplicative-decrease only sized the *next* read, so a batch large enough to exceed the target's transaction-killer timeout could never commit when re-applied unchanged — it exhausted the retry budget and went fatal (→ a whole-run restart loop at a high ceiling). The deliberate tx-killer-storm validation on the live link exposed this (all lanes stuck re-applying ~12.8k-row batches, position frozen). The fix re-chunks: split the failed batch in half and apply each half recursively until the sub-batches commit. Pinned by a new test that tx-kills any batch above a threshold and proves the input lands exactly-once via splitting; the transient-only pin (which succeeds on retry-same) did not cover this.
+
+### Known limitations
+
+- **A very large `--apply-batch-size` on a transaction-killer-heavy target can cause split churn.** When the ceiling is set far above what commits under the target's transaction-killer timeout, the AIMD cool-off lags the committable size, so lanes repeatedly read oversized batches and split them — safe (no data loss, no crash, no restart) but slow / little net progress. Keep `--apply-batch-size` at a sane value (the default is fine); the controller adapts from there. A follow-up will speed the post-tx-killer shrink so an over-large ceiling self-corrects faster.
+
 ## [0.99.79] - 2026-06-19
 
 ### Fixed
