@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.85] - 2026-06-20
+
+### Added
+
+- **A timed-out MySQL warm-resume now diagnoses *why* the source is unresponsive instead of reporting a generic stall.** Building on the v0.99.84 verify-timeout fix: when the bounded resume-position verify (`SHOW BINARY LOGS` / `GTID_SUBSET`) times out, sluice runs a bounded `SELECT 1` liveness probe on a fresh connection and folds an actionable diagnosis into the (still retriable, still never `ErrPositionInvalid`) error — the verify query touches the binlog subsystem while `SELECT 1` does not, so the differential isolates the layer that is stuck: (a) the probe returns a disk-full signal (`Error 1021`, `No space left on device`, `errno 28`, or the "waiting for someone to free some space" block-message) → the source host is named as **out of disk**; (b) the probe *also* times out → the source server is **globally unresponsive** (a full datadir blocks MySQL writes server-wide, severe overload, or the server is down); (c) the probe succeeds → the server is up but the **binlog subsystem specifically** is slow, commonly an over-large binlog file count or a slow/full binlog volume (check `binlog_expire_logs_seconds`; consider `PURGE BINARY LOGS`). This is honest best-effort narrowing, not a definitive verdict: the MySQL wire protocol exposes no datadir free-space surface, and a full disk frequently makes MySQL *block* rather than return an error, so the timeout itself is often the only hard signal — the probe narrows the likely cause and points at the remedy rather than leaving the operator to SSH in and run `df`. The probe is itself bounded so it can never hang, and it is pure diagnosis: it changes only the error text, never the retry or position decision. Motivated by a live large-scale finding where a source accumulated 2,585 binlog files on a 100%-full disk and `SHOW BINARY LOGS` blocked.
+
 ## [0.99.84] - 2026-06-20
 
 ### Fixed
