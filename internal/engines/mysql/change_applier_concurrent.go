@@ -475,6 +475,16 @@ const checkpointEveryChanges = 2000
 // the target's tx-killer timeout) and the batch is split — see applyLaneBatch.
 const retrySameBeforeSplit = 2
 
+// laneReadCapGrowth is the factor applied to a lane's largest just-committed
+// (sub-)batch size to bound its NEXT read (see laneApplyLoop's readCap). After
+// a tx-killer storm splits a batch down to a committable size S, the next read
+// is capped at S×laneReadCapGrowth — so the lane climbs back toward the
+// controller's size gradually (doubling per success) rather than immediately
+// re-reading an over-large ceiling and re-triggering the killer. >1 so the cap
+// always allows growth; on the happy path (whole batches commit) the cap
+// exceeds the controller's size and never binds.
+const laneReadCapGrowth = 2
+
 // maxInLaneRetries bounds the SINGLE-change retry loop (the recursion's base
 // case in applyLaneBatch): a lone change is re-applied idempotently (ADR-0010)
 // up to this many times. A transient single-row tx-killer recovers within the
@@ -823,10 +833,26 @@ func (m *concurrentApplyManager) laneApplyLoop(ctx context.Context, i int) {
 	if i < len(m.laneControllers) {
 		ctrl = m.laneControllers[i]
 	}
+	// readCap is a lane-local learned bound on the read size, derived from the
+	// largest batch this lane has recently COMMITTED. It exists for the
+	// over-large-ceiling case: the AIMD controller shrinks only one
+	// multiplicative-decrease per tx-killer (each costing a full target
+	// tx-killer timeout), so from an absurd ceiling it takes many timeouts to
+	// reach a committable size — but applyLaneBatch's re-chunk discovers that
+	// size in-memory in one storm. Capping the next read at the just-committed
+	// size (× a gentle growth factor) lets the lane SNAP to the committable
+	// band after one storm instead of waiting out the controller's slow
+	// descent. 0 = no cap yet (first read). It is happy-path-neutral: when
+	// batches commit whole, readCap = len(buf)×growth ≥ the controller's size,
+	// so min(NextBatchSize, readCap) == NextBatchSize and the cap never binds.
+	readCap := 0
 	for {
 		size := m.maxBatchSize
 		if ctrl != nil {
 			size = ctrl.NextBatchSize()
+		}
+		if readCap > 0 && readCap < size {
+			size = readCap
 		}
 		buf, closed, err := m.readLaneBatch(ctx, i, size)
 		if err != nil {
@@ -840,10 +866,17 @@ func (m *concurrentApplyManager) laneApplyLoop(ctx context.Context, i int) {
 			}
 			continue
 		}
-		if err := m.applyLaneBatch(ctx, ctrl, buf); err != nil {
+		committed, err := m.applyLaneBatch(ctx, ctrl, buf)
+		if err != nil {
 			m.recordErr(err)
 			m.cancel()
 			return
+		}
+		// Learn the committable size: cap the next read at the largest
+		// just-committed (sub-)batch grown by laneReadCapGrowth, so the read
+		// tracks the proven-committable band and can climb back gradually.
+		if committed > 0 {
+			readCap = committed * laneReadCapGrowth
 		}
 		if closed {
 			return
@@ -922,7 +955,12 @@ func (m *concurrentApplyManager) readLaneBatch(ctx context.Context, i, size int)
 // after that envelope's sub-batch durably commits, in seq order across the
 // splits, so exactly-once + same-lane ordering hold. See laneApplyLoop's
 // invariant block.
-func (m *concurrentApplyManager) applyLaneBatch(ctx context.Context, ctrl ir.BatchSizeController, buf []laneChange) error {
+// It returns the size of the LARGEST (sub-)batch that durably committed —
+// the lane's "proven-committable size" — which laneApplyLoop uses to cap its
+// next read (so an over-large ceiling snaps to the committable band after one
+// storm instead of waiting out the controller's slow per-tx-killer descent).
+// committed is 0 on any error path (the run is cancelling; the cap is moot).
+func (m *concurrentApplyManager) applyLaneBatch(ctx context.Context, ctrl ir.BatchSizeController, buf []laneChange) (committed int, err error) {
 	// Single change: bounded retry-in-place. A transient single-row tx-killer
 	// recovers within the budget; persistent failure (the target cannot accept
 	// even one row) is fatal — surface loudly so warm-resume / the operator can
@@ -932,18 +970,18 @@ func (m *concurrentApplyManager) applyLaneBatch(ctx context.Context, ctrl ir.Bat
 		// attempt 0 is the initial try; 1..maxInLaneRetries are the retries.
 		for attempt := 0; attempt <= maxInLaneRetries; attempt++ {
 			if ctx.Err() != nil {
-				return ctx.Err()
+				return 0, ctx.Err()
 			}
 			rawErr = m.commitObserve(ctx, ctrl, buf)
 			if rawErr == nil {
 				m.frontier.markCommitted(buf[0].seq) // advance only on durable commit
-				return nil
+				return 1, nil
 			}
 			if !isApplierErrorRetriable(rawErr) {
-				return classifyApplierError(rawErr)
+				return 0, classifyApplierError(rawErr)
 			}
 		}
-		return classifyApplierError(rawErr)
+		return 0, classifyApplierError(rawErr)
 	}
 
 	// Multi-change: retry the SAME batch a few times first — a TRANSIENT
@@ -952,17 +990,17 @@ func (m *concurrentApplyManager) applyLaneBatch(ctx context.Context, ctrl ir.Bat
 	var rawErr error
 	for attempt := 1; attempt <= retrySameBeforeSplit; attempt++ {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return 0, ctx.Err()
 		}
 		rawErr = m.commitObserve(ctx, ctrl, buf)
 		if rawErr == nil {
 			for _, e := range buf { // advance only on durable commit
 				m.frontier.markCommitted(e.seq)
 			}
-			return nil
+			return len(buf), nil
 		}
 		if !isApplierErrorRetriable(rawErr) {
-			return classifyApplierError(rawErr) // non-retriable → fatal
+			return 0, classifyApplierError(rawErr) // non-retriable → fatal
 		}
 	}
 
@@ -981,10 +1019,18 @@ func (m *concurrentApplyManager) applyLaneBatch(ctx context.Context, ctrl ir.Bat
 		slog.Int("rows", len(buf)),
 		slog.Int("split_at", mid),
 		slog.String("err", classifyApplierError(rawErr).Error()))
-	if e := m.applyLaneBatch(ctx, ctrl, buf[:mid]); e != nil {
-		return e
+	lc, e := m.applyLaneBatch(ctx, ctrl, buf[:mid])
+	if e != nil {
+		return 0, e
 	}
-	return m.applyLaneBatch(ctx, ctrl, buf[mid:])
+	rc, e := m.applyLaneBatch(ctx, ctrl, buf[mid:])
+	if e != nil {
+		return 0, e
+	}
+	if rc > lc {
+		return rc, nil
+	}
+	return lc, nil
 }
 
 // commitObserve runs one commit attempt of buf and feeds the per-lane AIMD

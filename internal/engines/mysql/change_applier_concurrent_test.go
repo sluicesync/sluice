@@ -391,11 +391,19 @@ func TestLaneApply_PersistentTxKillerSplitsToConverge(t *testing.T) {
 	for i := range buf {
 		buf[i] = laneChange{seq: uint64(i + 1), change: ir.Insert{Schema: "ks", Table: "t", Row: ir.Row{"id": int64(i + 1)}}}
 	}
-	if err := m.applyLaneBatch(context.Background(), ctrl, buf); err != nil {
+	committed, err := m.applyLaneBatch(context.Background(), ctrl, buf)
+	if err != nil {
 		t.Fatalf("applyLaneBatch = %v; want nil (re-chunk must converge a persistent tx-killer)", err)
 	}
 	if got := m.frontier.frontierSeq(); got != n {
 		t.Errorf("frontier = %d; want %d (every change committed exactly once via splitting)", got, n)
+	}
+	// The returned committable size (the lane-read-cap input) must be ≤ the
+	// threshold — proof applyLaneBatch reports the size its splits proved
+	// committable, so laneApplyLoop caps the next read at that band instead of
+	// the over-large ceiling (v0.99.81 churn fix).
+	if committed <= 0 || committed > commitThreshold {
+		t.Errorf("returned committable size = %d; want in (0, %d] (the learned read-cap input)", committed, commitThreshold)
 	}
 	total := 0
 	for _, s := range committedSizes {
@@ -430,7 +438,7 @@ func TestLaneApply_TxKillerShrinkAndRetry(t *testing.T) {
 		{seq: 1, change: ir.Insert{Schema: "ks", Table: "t", Row: ir.Row{"id": int64(1)}}},
 		{seq: 2, change: ir.Insert{Schema: "ks", Table: "t", Row: ir.Row{"id": int64(2)}}},
 	}
-	if err := m.applyLaneBatch(context.Background(), ctrl, buf); err != nil {
+	if _, err := m.applyLaneBatch(context.Background(), ctrl, buf); err != nil {
 		t.Fatalf("applyLaneBatch returned %v; want nil (in-lane recovery)", err)
 	}
 	if attempts != 2 {
@@ -474,7 +482,7 @@ func TestLaneApply_MarkCommittedOnlyOnDurableCommit(t *testing.T) {
 		return nil
 	}
 
-	if err := m.applyLaneBatch(context.Background(), ctrl, buf); err != nil {
+	if _, err := m.applyLaneBatch(context.Background(), ctrl, buf); err != nil {
 		t.Fatalf("applyLaneBatch = %v; want nil", err)
 	}
 	if got := m.frontier.frontierSeq(); got != 1 {
@@ -496,7 +504,7 @@ func TestLaneApply_RetryExhaustionIsFatal(t *testing.T) {
 	ctrl := newFakeLaneController(8)
 	buf := []laneChange{{seq: 1, change: ir.Insert{Schema: "ks", Table: "t", Row: ir.Row{"id": int64(1)}}}}
 
-	err := m.applyLaneBatch(context.Background(), ctrl, buf)
+	_, err := m.applyLaneBatch(context.Background(), ctrl, buf)
 	if err == nil {
 		t.Fatal("applyLaneBatch = nil; want a fatal error after retry exhaustion")
 	}
@@ -529,7 +537,7 @@ func TestLaneApply_NonRetriableIsImmediatelyFatal(t *testing.T) {
 	ctrl := newFakeLaneController(8)
 	buf := []laneChange{{seq: 1, change: ir.Insert{Schema: "ks", Table: "t", Row: ir.Row{"id": int64(1)}}}}
 
-	if err := m.applyLaneBatch(context.Background(), ctrl, buf); err == nil {
+	if _, err := m.applyLaneBatch(context.Background(), ctrl, buf); err == nil {
 		t.Fatal("applyLaneBatch = nil; want a fatal error for a non-retriable failure")
 	}
 	if attempts != 1 {
@@ -563,10 +571,10 @@ func TestLaneApply_PerLaneIndependence(t *testing.T) {
 	buf0 := []laneChange{{seq: 1, change: ir.Insert{Schema: "ks", Table: "t", Row: ir.Row{"id": int64(10)}}}}
 	buf1 := []laneChange{{seq: 2, change: ir.Insert{Schema: "ks", Table: "t", Row: ir.Row{"id": int64(11)}}}}
 
-	if err := m0.applyLaneBatch(context.Background(), ctrl0, buf0); err != nil {
+	if _, err := m0.applyLaneBatch(context.Background(), ctrl0, buf0); err != nil {
 		t.Fatalf("lane 0 applyLaneBatch = %v; want nil", err)
 	}
-	if err := m1.applyLaneBatch(context.Background(), ctrl1, buf1); err != nil {
+	if _, err := m1.applyLaneBatch(context.Background(), ctrl1, buf1); err != nil {
 		t.Fatalf("lane 1 applyLaneBatch = %v; want nil", err)
 	}
 	if _, _, s0 := ctrl0.snapshot(); s0 != 1 {
@@ -593,7 +601,7 @@ func TestLaneApply_NilControllerStaticSizeStillRetries(t *testing.T) {
 	m := newTestLaneManager(1, commit)
 	buf := []laneChange{{seq: 1, change: ir.Insert{Schema: "ks", Table: "t", Row: ir.Row{"id": int64(1)}}}}
 
-	if err := m.applyLaneBatch(context.Background(), nil, buf); err != nil {
+	if _, err := m.applyLaneBatch(context.Background(), nil, buf); err != nil {
 		t.Fatalf("applyLaneBatch(nil ctrl) = %v; want nil (bounded retry without AIMD)", err)
 	}
 	if attempts != 2 {
@@ -619,7 +627,7 @@ func TestLaneApply_CtxCancelAbortsRetry(t *testing.T) {
 	ctrl := newFakeLaneController(8)
 	buf := []laneChange{{seq: 1, change: ir.Insert{Schema: "ks", Table: "t", Row: ir.Row{"id": int64(1)}}}}
 
-	if err := m.applyLaneBatch(ctx, ctrl, buf); err == nil {
+	if _, err := m.applyLaneBatch(ctx, ctrl, buf); err == nil {
 		t.Fatal("applyLaneBatch = nil; want an error after ctx cancel")
 	}
 	if attempts != 1 {
