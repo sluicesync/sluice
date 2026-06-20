@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.88] - 2026-06-20
+
+### Fixed
+
+- **CRITICAL: a large compressed MySQL transaction could silently drop rows on warm-resume (regression in v0.99.87's compression support).** v0.99.87 added `binlog_transaction_compression` support by unpacking each `TRANSACTION_PAYLOAD_EVENT` and stamping every inner event with the payload's end position. That is correct for a small transaction that applies in a single batch, but a transaction with more rows than `--apply-batch-size` (default 1000) is committed by the applier in *several* target batches mid-payload — and each of those partial commits persisted a resume position *past the entire payload*. So if the stream was interrupted partway through applying a large compressed transaction (a tx-killer restart, a watchdog bounce, a crash) and then warm-resumed, the un-applied rows of that transaction were silently skipped — an exactly-once violation. (Small compressed transactions and uninterrupted applies were unaffected, which is why the original single-row pin didn't catch it; a large multi-row compressed-transaction resume test surfaced it — a 20000-row compressed INSERT killed mid-apply resumed with ~5000 rows permanently missing.) The fix recognizes that a payload's inner events have no independent on-wire positions, so the payload is atomic for resume: every inner row/table-map/BEGIN event now anchors at the payload's *start* position (a mid-payload interruption re-reads the whole payload and idempotently re-applies it per ADR-0010), and only the final inner event — the commit — advances the resume position to the payload's end, once the whole transaction is durably applied. Live-validated (a 20000-row compressed INSERT killed mid-CDC-apply then resumed converges exactly, source checksum == target checksum) and pinned by an integration test that asserts a multi-inner-event payload's rows anchor at the start while the commit advances to the end (verified to fail without the fix). GTID-mode resume is unaffected. **Anyone using `binlog_transaction_compression=ON` should upgrade from v0.99.87 to v0.99.88.**
+
 ## [0.99.87] - 2026-06-20
 
 ### Fixed
