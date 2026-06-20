@@ -590,6 +590,11 @@ func isRowRelevantEvent(ev *replication.BinlogEvent) bool {
 	switch ev.Event.(type) {
 	case *replication.RowsEvent, *replication.QueryEvent, *replication.GTIDEvent, *replication.XIDEvent:
 		return true
+	case *replication.TransactionPayloadEvent:
+		// A compressed transaction (binlog_transaction_compression=ON) wraps
+		// real DML; it counts as row-relevant so the Bug-12 no-events watchdog
+		// is suppressed once compressed traffic arrives.
+		return true
 	}
 	return false
 }
@@ -738,9 +743,44 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 		}
 		return send(ctx, out, ir.TxCommit{Position: pos})
 
+	case *replication.TransactionPayloadEvent:
+		// binlog_transaction_compression=ON (MySQL 8.0.20+) wraps an ENTIRE
+		// transaction — its BEGIN QueryEvent, TABLE_MAP(s), ROWS, and XID —
+		// into one ZSTD-compressed TRANSACTION_PAYLOAD_EVENT (event type 0x1f).
+		// go-mysql decodes the inner events into e.Events but does NOT re-stream
+		// them as separate GetEvent results, so WITHOUT this case the whole
+		// transaction silently falls through to default — nothing applied, the
+		// position never advances, no error (only the Bug-12 "no row events"
+		// WARN): the item-28 silent-non-application bug. Unpack and dispatch
+		// each inner event through the SAME routing (TABLE_MAP caches, ROWS
+		// emit, XID commits), in order.
+		//
+		// POSITION (the load-bearing detail): the inner events carry synthetic
+		// LogPos — the server zeroes their end_log_pos on compression because
+		// they are not independently addressable inside the compressed file —
+		// so the ONLY valid resume point is the OUTER payload event's LogPos
+		// (the binlog position of the transaction boundary). Stamp every inner
+		// header with it, so the persisted file/pos position is payload-aligned:
+		// a warm-resume starts at the NEXT payload, never mid-transaction (the
+		// misalignment that fails downstream with "no corresponding table map
+		// event"). In GTID mode positionFor ignores LogPos (the GTID rides the
+		// GTIDEvent that precedes the payload), so the stamp is a harmless no-op
+		// there. Payloads do not nest, so the recursion is one level deep.
+		for _, inner := range e.Events {
+			if inner == nil || inner.Header == nil {
+				continue
+			}
+			inner.Header.LogPos = ev.Header.LogPos
+			if err := r.dispatch(ctx, inner, out); err != nil {
+				return err
+			}
+		}
+		return nil
+
 	default:
-		// FORMAT_DESCRIPTION_EVENT, ROWS_QUERY_EVENT, and the various
-		// MariaDB / payload-compressed events fall through silently.
+		// FORMAT_DESCRIPTION_EVENT, ROWS_QUERY_EVENT, and other bookkeeping
+		// events fall through silently. (Compressed transactions are handled
+		// by the TransactionPayloadEvent case above.)
 		return nil
 	}
 }
