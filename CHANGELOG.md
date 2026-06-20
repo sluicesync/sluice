@@ -4,6 +4,16 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.81] - 2026-06-20
+
+### Changed
+
+- **Lane-local committable-size read cap: an over-large `--apply-batch-size` now self-corrects after the first successful commit (follow-up to the v0.99.80 known-limitation).** Each concurrent-apply lane now caps its next read at twice the size that last committed, so when the ceiling is set far above what the target's transaction-killer timeout allows, a lane stops repeatedly re-reading oversized batches and converges to a committable size immediately after its first durable commit — instead of relying solely on the per-transaction-killer multiplicative-decrease (one shrink per ~tx-killer-timeout) to walk down from the ceiling. Happy-path-neutral: the cap only ever lowers the *next* read after a commit and never below what just succeeded, so a sanely-configured run (the default) reads and commits exactly as before. Unit-pinned by the existing persistent-tx-killer convergence test plus the cap logic.
+
+### Clarified (no behavior change)
+
+- **A frozen resume position under *sustained lock contention* is correct exactly-once behavior, not a stall.** Live cross-region validation surfaced a case worth documenting: when the target is under enough transaction-killer pressure that one change is *repeatedly* aborted (lock contention — the abort fires even at batch-size 1, so it is not a sizing problem), the persisted resume position holds steady while *other* lanes keep committing data ahead of it (the per-lane AIMD controllers grow, confirming forward progress). This is the checkpoint frontier refusing to advance its contiguous prefix past the one not-yet-durable change — exactly as exactly-once requires (advancing past it would skip it on warm-resume = silent loss). The committed-ahead rows are idempotent (UPSERT), so they re-apply harmlessly once the stuck change finally lands and the frontier catches up. No data loss, no crash, fully warm-resumable. The v0.99.80 "split churn" note covers the *sizing*-driven case (which the cap above now self-corrects); this clarifies the distinct *contention*-driven case, which is correct by design and outside what any batch-sizing strategy can change.
+
 ## [0.99.80] - 2026-06-20
 
 ### Added
