@@ -238,17 +238,144 @@ func TestCDCReader_BinlogTransactionCompression_AppliesAndResumes(t *testing.T) 
 		// item-28 resume failure.
 		t.Fatalf("StreamChanges (resume from compressed position): %v", err)
 	}
-	got2 := drainChanges(t, ctx, changes2, 2, 60*time.Second)
-	if len(got2) != 2 {
-		t.Fatalf("WARM RESUME: got %d row changes after resuming from a compressed-transaction "+
-			"position; want 2 (the item-28 resume symptom: a mid-payload-misaligned position emits 0)", len(got2))
+	// capturedPos is the DELETE row change's position, which is the payload's
+	// START (the position fix: a row event anchors at the payload start so a
+	// mid-payload interrupt re-reads the WHOLE payload — never one past it,
+	// which would silently drop un-applied rows). So resuming here legitimately
+	// RE-DELIVERS the delete payload (idempotent at-least-once) before the new
+	// changes. Drain generously and assert the NEW changes both appear and
+	// nothing is lost — tolerating the idempotent re-delivery.
+	got2 := drainChanges(t, ctx, changes2, 3, 60*time.Second)
+	var sawIns202, sawUpd201 bool
+	for _, c := range got2 {
+		if ins, ok := c.(ir.Insert); ok && rowID(t, ins.Row) == 202 {
+			sawIns202 = true
+		}
+		if upd, ok := c.(ir.Update); ok && rowID(t, upd.After) == 201 {
+			sawUpd201 = true
+		}
 	}
-	if ins2, ok := got2[0].(ir.Insert); !ok || rowID(t, ins2.Row) != 202 {
-		t.Fatalf("resume change[0] = %#v; want Insert id=202", got2[0])
+	if !sawIns202 || !sawUpd201 {
+		t.Fatalf("WARM RESUME: after resuming from a compressed-transaction position the new "+
+			"changes were not both delivered (Insert202=%v Update201=%v); got %d changes %#v "+
+			"(item-28 resume symptom: a mid-payload-misaligned position emits 0/loses changes)",
+			sawIns202, sawUpd201, len(got2), got2)
 	}
-	if upd2, ok := got2[1].(ir.Update); !ok || rowID(t, upd2.After) != 201 {
-		t.Fatalf("resume change[1] = %#v; want Update id=201", got2[1])
+}
+
+// TestCDCReader_BinlogTransactionCompression_LargePayloadPositionAnchoring pins
+// the position fix that prevents the v0.99.87 large-payload silent loss: in a
+// compressed transaction big enough to span MULTIPLE inner ROWS events, every
+// emitted ROW change must anchor at the payload's START position (so a partial
+// mid-payload apply re-reads the WHOLE payload on resume), and ONLY the commit
+// (TxCommit) advances to the payload's END. The original fix stamped every inner
+// event with the END, so a partial batch commit + resume silently skipped the
+// un-applied rows. With that bug, the row changes would carry the END position
+// (== the commit's) and this test fails; with the fix, rows carry START < END.
+func TestCDCReader_BinlogTransactionCompression_LargePayloadPositionAnchoring(t *testing.T) {
+	dsn, cleanup := startMySQLCompressionForCDC(t)
+	defer cleanup()
+	assertCompressionOn(t, dsn)
+
+	applyMySQL(t, dsn, `
+		CREATE TABLE big (
+			id   BIGINT       NOT NULL,
+			pad  VARCHAR(500),
+			PRIMARY KEY (id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`)
+
+	eng := Engine{Flavor: FlavorVanilla}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	rdr, err := eng.OpenCDCReader(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenCDCReader: %v", err)
 	}
+	defer func() {
+		if c, ok := rdr.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+	changes, err := rdr.StreamChanges(ctx, ir.Position{})
+	if err != nil {
+		t.Fatalf("StreamChanges: %v", err)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	// ONE transaction inserting 400 rows × ~500 bytes ≈ 200 KB — far over the
+	// ~8 KB binlog_row_event_max_size, so MySQL emits MANY WRITE_ROWS events
+	// inside the single compressed payload (the multi-inner-event shape the
+	// silent-loss bug needs). cte_max_recursion_depth raised so the generator
+	// CTE isn't capped at the 1000 default.
+	applyMySQL(t, dsn, "SET SESSION cte_max_recursion_depth=100000")
+	applyMySQL(t, dsn, "INSERT INTO big (id,pad) SELECT seq, REPEAT('x',500) "+
+		"FROM (WITH RECURSIVE s(seq) AS (SELECT 1 UNION ALL SELECT seq+1 FROM s WHERE seq<400) SELECT seq FROM s) q")
+
+	// Collect the full transaction stream INCLUDING the TxCommit boundary
+	// (drainChanges filters it, so read the channel directly). Stop at TxCommit.
+	var (
+		rowPositions []string
+		commitPos    string
+		gotRows      int
+	)
+	deadline := time.NewTimer(60 * time.Second)
+	defer deadline.Stop()
+collect:
+	for {
+		select {
+		case c, ok := <-changes:
+			if !ok {
+				break collect
+			}
+			switch v := c.(type) {
+			case ir.Insert:
+				gotRows++
+				rowPositions = append(rowPositions, v.Position.Token)
+			case ir.TxCommit:
+				commitPos = v.Position.Token
+				break collect
+			}
+		case <-deadline.C:
+			t.Fatalf("timed out collecting the large compressed transaction (got %d rows, commit=%q)", gotRows, commitPos)
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
+
+	if gotRows != 400 {
+		t.Fatalf("got %d row changes from the large compressed transaction; want 400 "+
+			"(all inner ROWS events of the payload must be unpacked)", gotRows)
+	}
+	if commitPos == "" {
+		t.Fatal("no TxCommit position captured")
+	}
+	// Every row anchors at the SAME payload-START position...
+	for i, p := range rowPositions {
+		if p != rowPositions[0] {
+			t.Fatalf("row[%d] position %q != row[0] %q — inner rows must all anchor at the payload START", i, p, rowPositions[0])
+		}
+	}
+	// ...and the commit advances PAST it (payload END > payload START). With the
+	// silent-loss bug, rows carried the END too, so this would be equal.
+	startPos := decodePosOrFatal(t, rowPositions[0])
+	endPos := decodePosOrFatal(t, commitPos)
+	if !(endPos.Mode == positionModeFilePos && startPos.Mode == positionModeFilePos) {
+		t.Fatalf("expected file/pos mode; start=%q end=%q", startPos.Mode, endPos.Mode)
+	}
+	if endPos.Pos <= startPos.Pos {
+		t.Fatalf("commit position (%d) must be GREATER than the row-anchor START position (%d) — "+
+			"equal means rows were stamped with the payload END (the v0.99.87 silent-loss bug)",
+			endPos.Pos, startPos.Pos)
+	}
+}
+
+func decodePosOrFatal(t *testing.T, token string) binlogPos {
+	t.Helper()
+	p, ok, err := decodeBinlogPos(ir.Position{Engine: "mysql", Token: token})
+	if err != nil || !ok {
+		t.Fatalf("decode position %q: ok=%v err=%v", token, ok, err)
+	}
+	return p
 }
 
 // assertCompressionOn fails the test unless the source actually has

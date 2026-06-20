@@ -755,22 +755,47 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 		// each inner event through the SAME routing (TABLE_MAP caches, ROWS
 		// emit, XID commits), in order.
 		//
-		// POSITION (the load-bearing detail): the inner events carry synthetic
-		// LogPos — the server zeroes their end_log_pos on compression because
-		// they are not independently addressable inside the compressed file —
-		// so the ONLY valid resume point is the OUTER payload event's LogPos
-		// (the binlog position of the transaction boundary). Stamp every inner
-		// header with it, so the persisted file/pos position is payload-aligned:
-		// a warm-resume starts at the NEXT payload, never mid-transaction (the
-		// misalignment that fails downstream with "no corresponding table map
-		// event"). In GTID mode positionFor ignores LogPos (the GTID rides the
-		// GTIDEvent that precedes the payload), so the stamp is a harmless no-op
-		// there. Payloads do not nest, so the recursion is one level deep.
-		for _, inner := range e.Events {
+		// POSITION (the load-bearing detail — exactly-once crux): the inner
+		// events have NO independent on-wire positions (the server zeroes their
+		// end_log_pos when compressing), so the payload is ATOMIC for resume —
+		// a resume can only re-read from BEFORE the payload or skip to AFTER it,
+		// never partway in. A LARGE transaction is applied by the batched
+		// applier in SEVERAL target batches (it flushes every apply-batch-size
+		// changes), so if we stamped every inner event with the payload's END
+		// position, a partial mid-payload batch commit (then a stream restart)
+		// would persist a position PAST the whole payload and SILENTLY DROP the
+		// un-applied inner rows — a CRITICAL silent-loss bug (v0.99.87, caught by
+		// a large multi-row compressed-transaction resume test). So stamp every
+		// inner event with the payload's START position EXCEPT the final (commit)
+		// inner event, which gets the payload's END: the persisted resume point
+		// advances past the payload ONLY once the whole transaction is durably
+		// applied, and any earlier interruption re-reads + idempotently
+		// re-applies the ENTIRE payload (ADR-0010). This also keeps the
+		// transaction-boundary alignment that avoids the "no corresponding table
+		// map event" mid-payload resume failure. In GTID mode positionFor
+		// ignores LogPos (the GTID rides the GTIDEvent preceding the payload), so
+		// the stamping is a no-op there. Payloads do not nest (one level deep).
+		payloadEnd := ev.Header.LogPos
+		payloadStart := payloadEnd - ev.Header.EventSize
+		lastIdx := -1
+		for i, inner := range e.Events {
+			if inner != nil && inner.Header != nil {
+				lastIdx = i
+			}
+		}
+		for i, inner := range e.Events {
 			if inner == nil || inner.Header == nil {
 				continue
 			}
-			inner.Header.LogPos = ev.Header.LogPos
+			if i == lastIdx {
+				// The commit (XID) — advance the resume point past the payload
+				// now that the whole transaction has been dispatched.
+				inner.Header.LogPos = payloadEnd
+			} else {
+				// Mid-payload — a partial apply must re-read the whole payload
+				// on resume, so anchor at the payload's start.
+				inner.Header.LogPos = payloadStart
+			}
 			if err := r.dispatch(ctx, inner, out); err != nil {
 				return err
 			}
