@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.84] - 2026-06-20
+
+### Fixed
+
+- **A MySQL CDC stream could hang forever on warm-resume against a wedged source connection (HIGH resilience; no data loss).** Found by a three-phase RCA of a live stall: after a transaction-killer-induced stream restart left a half-dead connection in the source pool, the warm-resume preflight (`verifyPositionResumable` → `SHOW BINARY LOGS` for file/pos mode, `GTID_SUBSET` for GTID mode) ran under the stream's *unbounded* context, so the verify query blocked on the TCP read indefinitely — the whole stream wedged (the main goroutine was observed stuck **302 minutes** in `verifyBinlogFilePresent` in `IO wait`), the apply position froze, and the process looked alive while making zero progress. This is a loud-failure-discipline violation (hang rather than a loud, retriable error), not silent loss — but a stalled-but-healthy-looking stream is a serious shape. The fix runs the verify queries under a bounded timeout (30s) and, on expiry, surfaces a **retriable** error so the ADR-0038 retry loop reconnects with a fresh connection — never `ErrPositionInvalid` (which would force a destructive cold-start re-snapshot on a transient source blip). A genuine shutdown (parent-context cancel) is not rewritten into the reconnect path. Pinned by unit tests using a fake blocking driver (timeout is retriable-and-not-`ErrPositionInvalid` for both position modes, bounded in time, and a parent cancel is not misclassified).
+
 ## [0.99.83] - 2026-06-20
 
 ### Fixed
