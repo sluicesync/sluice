@@ -362,6 +362,53 @@ func newTestLaneManager(lanes int, commit func(ctx context.Context, buf []laneCh
 	}
 }
 
+// TestLaneApply_PersistentTxKillerSplitsToConverge pins the re-chunk
+// convergence the live Track-B validation exposed: a batch too large to ever
+// commit under the tx-killer timeout must be SPLIT (not re-applied whole) to
+// make progress. The fake commit tx-kills ANY batch larger than a threshold
+// and succeeds only at/below it, so re-applying the same oversized batch can
+// never converge — only halving does. Asserts the whole batch lands
+// exactly-once (frontier reaches the last seq), every COMMITTED sub-batch is
+// at/below the threshold (proof it split down), and the committed rows sum to
+// the input with no gap/dup. (The transient-only TxKillerShrinkAndRetry pin
+// below did NOT cover this — its injected tx-killer succeeds on retry-same.)
+func TestLaneApply_PersistentTxKillerSplitsToConverge(t *testing.T) {
+	const commitThreshold = 3 // any batch larger than this persistently tx-kills
+	m := newTestLaneManager(1, nil)
+	ctrl := newFakeLaneController(8)
+
+	var committedSizes []int
+	m.commitBatchFn = func(_ context.Context, buf []laneChange) error {
+		if len(buf) > commitThreshold {
+			return fakeTxKillerError() // persistent — re-applying whole can't converge
+		}
+		committedSizes = append(committedSizes, len(buf))
+		return nil
+	}
+
+	const n = 8
+	buf := make([]laneChange, n)
+	for i := range buf {
+		buf[i] = laneChange{seq: uint64(i + 1), change: ir.Insert{Schema: "ks", Table: "t", Row: ir.Row{"id": int64(i + 1)}}}
+	}
+	if err := m.applyLaneBatch(context.Background(), ctrl, buf); err != nil {
+		t.Fatalf("applyLaneBatch = %v; want nil (re-chunk must converge a persistent tx-killer)", err)
+	}
+	if got := m.frontier.frontierSeq(); got != n {
+		t.Errorf("frontier = %d; want %d (every change committed exactly once via splitting)", got, n)
+	}
+	total := 0
+	for _, s := range committedSizes {
+		if s > commitThreshold {
+			t.Errorf("committed a sub-batch of %d > threshold %d (did not split down far enough)", s, commitThreshold)
+		}
+		total += s
+	}
+	if total != n {
+		t.Errorf("committed rows = %d; want %d exactly (no gap, no dup)", total, n)
+	}
+}
+
 // TestLaneApply_TxKillerShrinkAndRetry pins the core graduation claim: a
 // tx-killer on a lane's FIRST commit attempt causes the SAME batch to be
 // re-applied and succeed, the frontier advances exactly-once (every seq, no

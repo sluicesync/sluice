@@ -464,18 +464,24 @@ func (a *ChangeApplier) invalidateMetadataCaches(qn string) {
 // checkpoint, so on a transactional stream the real cadence is finer.
 const checkpointEveryChanges = 2000
 
-// maxInLaneRetries bounds the in-lane shrink-and-retry loop (ADR-0104
-// graduation): a lane re-applies the SAME buffered batch when the commit
-// fails with a retriable error (the AIMD controller, if present, has
-// already shrunk the next read, but the retry re-applies the current buf
-// at its current size — idempotently, ADR-0010). The cap exists so a
-// target that tx-kills even at batch-size-1 (the controller floor)
-// eventually FAILS THE RUN LOUDLY (→ ctx cancel → the streamer's
-// warm-resume re-streams from the last durable boundary) rather than
-// spinning forever. 10 attempts is generous: with AIMD halving on each
-// tx-killer, a ceiling-sized batch reaches the floor of 1 in ~log2(ceil)
-// attempts, so 10 covers ceilings up to ~1000 while still terminating a
-// genuinely un-committable batch.
+// retrySameBeforeSplit is how many times a MULTI-change lane batch is
+// re-applied at its current size before the in-lane recovery re-chunks
+// (splits it in half). A TRANSIENT tx-killer — a momentary target overload —
+// usually clears within a retry or two, so retrying the same batch avoids the
+// cost of splitting a batch that would have committed anyway. Must be ≥ 2 so
+// a tx-killer that recovers on the second attempt is caught without splitting
+// (the TxKillerShrinkAndRetry pin). Once these attempts are exhausted the
+// failure is treated as PERSISTENT (the batch is too large to commit under
+// the target's tx-killer timeout) and the batch is split — see applyLaneBatch.
+const retrySameBeforeSplit = 2
+
+// maxInLaneRetries bounds the SINGLE-change retry loop (the recursion's base
+// case in applyLaneBatch): a lone change is re-applied idempotently (ADR-0010)
+// up to this many times. A transient single-row tx-killer recovers within the
+// budget; a target that tx-kills even a single row exhausts it and FAILS THE
+// RUN LOUDLY (→ ctx cancel → the streamer's warm-resume re-streams from the
+// last durable boundary) rather than spinning forever. Multi-change batches
+// converge by SPLITTING (retrySameBeforeSplit → halve), not by this cap.
 const maxInLaneRetries = 10
 
 // laneCommitHookForTest, when non-nil, is copied onto every
@@ -900,57 +906,100 @@ func (m *concurrentApplyManager) readLaneBatch(ctx context.Context, i, size int)
 	return buf, false, nil
 }
 
-// applyLaneBatch applies one buffered batch on the lane's dedicated
-// backend with in-lane shrink-and-retry, advancing the frontier past every
-// committed seq ONLY after a durable commit. See laneApplyLoop's invariant
-// block for the exactly-once argument; this is its mechanism.
+// applyLaneBatch applies one buffered batch on the lane's dedicated backend
+// with in-lane shrink-and-retry, advancing the frontier past every
+// committed seq ONLY after a durable commit. On a retriable failure of a
+// MULTI-change batch it RE-CHUNKS — splits the batch in half and applies
+// each half recursively — because a batch large enough to exceed the target's
+// transaction-killer timeout can NEVER commit if re-applied whole; the
+// controller's multiplicative-decrease only sizes the NEXT read, so the
+// stuck batch must itself be broken down ("the shrink IS the split",
+// matching serial #54). Halving guarantees convergence to committable
+// sub-batches (and, in the limit, to a single change). A single change that
+// still fails retriably uses a bounded retry — a transient single-row
+// tx-killer recovers; persistent failure (a target that can't accept even
+// one row) is fatal after the budget. markCommitted fires per envelope ONLY
+// after that envelope's sub-batch durably commits, in seq order across the
+// splits, so exactly-once + same-lane ordering hold. See laneApplyLoop's
+// invariant block.
 func (m *concurrentApplyManager) applyLaneBatch(ctx context.Context, ctrl ir.BatchSizeController, buf []laneChange) error {
-	for attempt := 0; ; attempt++ {
-		start := time.Now()
-		rawErr := m.commitBatchFn(ctx, buf)
-		latency := time.Since(start)
-		// Classify ONCE: the controller's tx-killer / retriable MD logic and
-		// the retry predicate both inspect the engine-classified error (it is
-		// the wrapper that carries the TransactionKilled() / Retriable()
-		// surfaces — a raw *MySQLError does not). Observing the classified
-		// error is what makes a Vitess tx-killer abort drive the MD shrink.
-		err := classifyApplierError(rawErr)
-		// Feed the controller (if any) so it adapts: a tx-killer shrinks the
-		// NEXT read immediately, a slow p95 drives the latency MD, a clean
-		// fast commit rides AI back up — each lane independently.
-		if ctrl != nil {
-			ctrl.ObserveBatch(ctx, latency, len(buf), err)
+	// Single change: bounded retry-in-place. A transient single-row tx-killer
+	// recovers within the budget; persistent failure (the target cannot accept
+	// even one row) is fatal — surface loudly so warm-resume / the operator can
+	// act. There is nothing left to split, so this is the recursion's base case.
+	if len(buf) == 1 {
+		var rawErr error
+		// attempt 0 is the initial try; 1..maxInLaneRetries are the retries.
+		for attempt := 0; attempt <= maxInLaneRetries; attempt++ {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			rawErr = m.commitObserve(ctx, ctrl, buf)
+			if rawErr == nil {
+				m.frontier.markCommitted(buf[0].seq) // advance only on durable commit
+				return nil
+			}
+			if !isApplierErrorRetriable(rawErr) {
+				return classifyApplierError(rawErr)
+			}
 		}
+		return classifyApplierError(rawErr)
+	}
+
+	// Multi-change: retry the SAME batch a few times first — a TRANSIENT
+	// tx-killer (a momentary target overload) recovers on retry-same without
+	// the cost of splitting. Only when it PERSISTS do we re-chunk.
+	var rawErr error
+	for attempt := 1; attempt <= retrySameBeforeSplit; attempt++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		rawErr = m.commitObserve(ctx, ctrl, buf)
 		if rawErr == nil {
-			// ADVANCE ONLY ON DURABLE COMMIT: the batch is now durable, so
-			// every envelope's seq is safe to report to the contiguous
-			// frontier (which the coordinator turns into the resume point).
-			for _, e := range buf {
+			for _, e := range buf { // advance only on durable commit
 				m.frontier.markCommitted(e.seq)
 			}
 			return nil
 		}
-		// Retriable + budget remaining + not cancelled → re-apply the SAME
-		// buf. The controller (if present) already shrank the next read; the
-		// retry re-applies this buf idempotently (ADR-0010 UPSERT /
-		// zero-rows-tolerant), so a seq still advances only on durable work.
-		if isApplierErrorRetriable(rawErr) && ctx.Err() == nil && attempt < maxInLaneRetries {
-			slog.WarnContext(ctx,
-				"mysql: applier: concurrent lane batch retriable failure — re-applying same batch (idempotent) after controller shrink",
-				slog.Int("attempt", attempt+1),
-				slog.Int("max_attempts", maxInLaneRetries),
-				slog.Int("rows", len(buf)),
-				slog.String("err", err.Error()))
-			continue
+		if !isApplierErrorRetriable(rawErr) {
+			return classifyApplierError(rawErr) // non-retriable → fatal
 		}
-		// Fatal or retry budget exhausted: surface loudly. The run cancels,
-		// the persisted position still names only the last fully-durable
-		// boundary, and warm-resume re-streams + idempotently re-applies the
-		// remainder. `err` is already the engine-classified value, so it keeps
-		// the retriable/terminal shape for the streamer's ADR-0038 retry loop
-		// (a budget-exhausted tx-killer stays retriable → warm-resume).
-		return err
 	}
+
+	// Persistent retriable failure on a multi-change batch ⇒ it is too large to
+	// commit under the target's tx-killer timeout, and re-applying it whole can
+	// NEVER converge (the controller's MD only sizes the NEXT read). RE-CHUNK:
+	// split in half and apply each half recursively until the sub-batches are
+	// small enough to commit ("the shrink IS the split", matching serial #54).
+	// The first half commits + advances the frontier before the second is
+	// attempted; a fatal second half leaves the first durable (warm-resume
+	// re-applies the rest idempotently). markCommitted therefore still fires
+	// per envelope only on a durable commit, in seq order across the splits.
+	mid := len(buf) / 2
+	slog.WarnContext(ctx,
+		"mysql: applier: concurrent lane batch persistently tx-killed — splitting to converge in-lane",
+		slog.Int("rows", len(buf)),
+		slog.Int("split_at", mid),
+		slog.String("err", classifyApplierError(rawErr).Error()))
+	if e := m.applyLaneBatch(ctx, ctrl, buf[:mid]); e != nil {
+		return e
+	}
+	return m.applyLaneBatch(ctx, ctrl, buf[mid:])
+}
+
+// commitObserve runs one commit attempt of buf and feeds the per-lane AIMD
+// controller the per-transaction latency + the ENGINE-CLASSIFIED error
+// (only the classified wrapper carries the TransactionKilled() / Retriable()
+// surfaces a raw *MySQLError lacks — observing the classified error is what
+// drives the tx-killer multiplicative decrease). Returns the RAW commit
+// error so the caller's retriable/split decision inspects the original.
+func (m *concurrentApplyManager) commitObserve(ctx context.Context, ctrl ir.BatchSizeController, buf []laneChange) error {
+	start := time.Now()
+	rawErr := m.commitBatchFn(ctx, buf)
+	if ctrl != nil {
+		ctrl.ObserveBatch(ctx, time.Since(start), len(buf), classifyApplierError(rawErr))
+	}
+	return rawErr
 }
 
 // commitLaneBatch dispatches every change in buf onto a single lane
