@@ -74,6 +74,13 @@ type CDCReader struct {
 	// different protocol and needs the REPLICATION SLAVE privilege.
 	db *sql.DB
 
+	// posVerifyTimeout bounds the warm-resume position-verify queries
+	// (see [positionVerifyTimeout]). Zero — the production default for a
+	// reader built without setting it — falls back to the const; only
+	// unit tests set a small value to exercise the deadline path
+	// deterministically (the zero-value-safe default pattern).
+	posVerifyTimeout time.Duration
+
 	// schema is the database name the reader is bound to. In the
 	// default single-database mode, events from other databases are
 	// dropped during dispatch — this engine presents a single-schema
@@ -1035,6 +1042,20 @@ func send(ctx context.Context, out chan<- ir.Change, c ir.Change) error {
 	}
 }
 
+// positionVerifyTimeout bounds the warm-resume position-verify source
+// queries (SHOW BINARY LOGS / GTID_SUBSET). Without a deadline, a
+// half-dead source connection — e.g. one left in the pool by a prior
+// broken pipe after a transaction-killer-induced stream restart — makes
+// the verify QueryContext block on the TCP read FOREVER, hanging the
+// whole stream startup (goroutine 1) with the apply position frozen: a
+// "looks alive but wedged" stall, found live on Track D (2026-06-20,
+// goroutine 1 stuck 302min in verifyBinlogFilePresent [IO wait]). 30s is
+// generous for these metadata queries; on expiry the verify returns a
+// RETRIABLE error (so the stream reconnects + retries) and NEVER
+// [ir.ErrPositionInvalid] (which would trigger a destructive cold-start
+// re-snapshot on a transient source blip).
+const positionVerifyTimeout = 30 * time.Second
+
 // verifyPositionResumable confirms that the source still has the
 // WAL/binlog data referenced by p. Returns an error wrapping
 // [ir.ErrPositionInvalid] when the persisted position can't be
@@ -1046,7 +1067,39 @@ func send(ctx context.Context, out chan<- ir.Change, c ir.Change) error {
 // falls through to cold-start (ADR-0022). Empty/auto-detect
 // positions don't reach this helper — the resolveStartPosition
 // caller short-circuits before calling it.
+//
+// The verify queries run under a bounded [positionVerifyTimeout] so a
+// wedged source connection fails LOUDLY + retriably (reconnect) instead
+// of hanging the stream forever; see the const's comment for the live
+// Track-D hang this closes.
 func (r *CDCReader) verifyPositionResumable(ctx context.Context, p binlogPos) error {
+	timeout := r.posVerifyTimeout
+	if timeout <= 0 {
+		timeout = positionVerifyTimeout
+	}
+	vctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	err := r.verifyPositionResumableInner(vctx, p)
+	if err != nil && errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+		// OUR bounded deadline fired (the parent ctx is still live, so this
+		// is not a shutdown cancel): the source did not answer the resume
+		// preflight in time — typically a half-dead connection. Surface
+		// RETRIABLE (classifyApplierError maps context.DeadlineExceeded →
+		// ir.RetriableError) so the streamer's ADR-0038 loop reconnects +
+		// retries, rather than hanging forever OR being mistaken for a
+		// purged position (which would cold-start). The retry draws a fresh
+		// connection from the pool, leaving the wedged one behind.
+		return classifyApplierError(fmt.Errorf(
+			"mysql: resume-position verify exceeded %s (source unresponsive; reconnecting): %w",
+			timeout, err,
+		))
+	}
+	return err
+}
+
+// verifyPositionResumableInner runs the actual mode-specific verify
+// queries under the caller-supplied (already deadline-bounded) context.
+func (r *CDCReader) verifyPositionResumableInner(ctx context.Context, p binlogPos) error {
 	switch p.Mode {
 	case positionModeFilePos:
 		// Track 1c node-replace floor: a file/pos position is only
