@@ -1119,6 +1119,32 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 // the [CDCReader]'s keepalive routine can advance
 // confirmed_flush_lsn past this change.
 func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Change) error {
+	return a.applyOneImpl(ctx, streamID, c, true /* writePosition */)
+}
+
+// applyBarrierNoPosition applies one barrier-path change (Truncate /
+// SchemaSnapshot) on the coordinator backend WITHOUT writing the stream
+// position. It is the concurrent (ADR-0104/ADR-0105) barrier apply: on that
+// path the resume position is owned EXCLUSIVELY by the frontier-checkpoint
+// coordinator (the position relaxation — the merged position is persisted in
+// a separate WriteCheckpoint tx, only up to a fully-durable source-tx
+// boundary). Letting the barrier write its own change's position would
+// regress the persisted position to a metadata-anchored value — the
+// first-touch SchemaSnapshot carries WAL position 0/0, which pinned the
+// stream at 0/0 and broke warm-resume (Bug 158, the position half). The data
+// + ADR-0049 schema-history row + cache-after-commit still apply atomically;
+// only the position write is omitted (the frontier checkpoint persists the
+// real resume LSN of the surrounding row events).
+func (a *ChangeApplier) applyBarrierNoPosition(ctx context.Context, streamID string, c ir.Change) error {
+	return a.applyOneImpl(ctx, streamID, c, false /* writePosition */)
+}
+
+// applyOneImpl is the shared per-change apply: redact → stamp → dispatch →
+// (optional) position write → commit → cache-after-commit. writePosition
+// gates the ADR-0007 position write: true for the serial per-change path
+// (position + data atomic); false for the concurrent barrier path (position
+// owned by the frontier checkpoint — see applyBarrierNoPosition).
+func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.Change, writePosition bool) error {
 	// PII Phase 1.5: redact CDC row data before dispatch.
 	if err := a.redactChange(ctx, c); err != nil {
 		return classifyApplierError(fmt.Errorf("postgres: applier: redact: %w", err))
@@ -1144,12 +1170,14 @@ func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Chan
 		return classifyApplierError(err)
 	}
 	token := c.Pos().Token
-	posCtx, posCancel := a.execTimeoutCtx(ctx)
-	err = writePositionTx(posCtx, tx, a.controlSchema, streamID, token, a.slotName, a.sourceFingerprint, a.targetSchema)
-	posCancel()
-	if err != nil {
-		_ = tx.Rollback()
-		return classifyApplierError(err)
+	if writePosition {
+		posCtx, posCancel := a.execTimeoutCtx(ctx)
+		err = writePositionTx(posCtx, tx, a.controlSchema, streamID, token, a.slotName, a.sourceFingerprint, a.targetSchema)
+		posCancel()
+		if err != nil {
+			_ = tx.Rollback()
+			return classifyApplierError(err)
+		}
 	}
 	if err := a.commitWithTimeout(tx); err != nil {
 		return classifyApplierError(fmt.Errorf("postgres: applier: commit: %w", err))
@@ -1161,7 +1189,9 @@ func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Chan
 	if snap, isSnap := c.(ir.SchemaSnapshot); isSnap {
 		a.cacheActiveSchemaAfterCommit(snap)
 	}
-	a.reportAppliedToken(ctx, token)
+	if writePosition {
+		a.reportAppliedToken(ctx, token)
+	}
 	return nil
 }
 

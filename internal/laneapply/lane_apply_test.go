@@ -74,7 +74,6 @@ func (s *testSeam) ApplyLaneBatch(ctx context.Context, _ int, batch []ir.Change)
 func (s *testSeam) ClassifyError(err error) error                       { return classifyTest(err) }
 func (s *testSeam) WriteCheckpoint(context.Context, ir.Position) error  { return nil }
 func (s *testSeam) ApplyBarrierChange(context.Context, ir.Change) error { return nil }
-func (s *testSeam) InvalidateMetadataCaches(string, string)             {}
 
 // fakeLaneController is a deterministic [ir.BatchSizeController] stand-in for
 // the per-lane AIMD pins: NextBatchSize returns the current size; ObserveBatch

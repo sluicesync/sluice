@@ -145,21 +145,19 @@ type LaneApplier interface {
 
 	// ApplyBarrierChange applies one barrier-path change on the coordinator
 	// backend (writing its position + data atomically per ADR-0007), and —
-	// for a schema change — performs any engine-side metadata-cache
-	// invalidation needed AFTER the apply commits. The orchestrator
-	// additionally calls [LaneApplier.InvalidateMetadataCaches] on a
-	// SchemaSnapshot for the same effect; engines may implement the
-	// invalidation in either place (MySQL does it here, inside applyOne's
-	// after-commit hook, AND exposes the explicit invalidator).
+	// for a SchemaSnapshot — performs ALL engine-side metadata-cache
+	// invalidation needed after the apply commits, using the SAME guarded
+	// apply-then-invalidate the serial path uses: invalidate ONLY on a real
+	// signature-changing boundary, NEVER on a first-touch baseline /
+	// identical re-send. Both engine implementations already do this inside
+	// applyOne's after-commit hook (cacheActiveSchemaAfterCommit). The
+	// orchestrator does NOT independently invalidate — a separate
+	// unconditional invalidation bypassed the first-touch guard and forced
+	// the PG lane DML onto the text-encode path, silently dropping
+	// non-text-round-trippable values (Bug 158); deferring entirely to this
+	// method keeps the concurrent path's invalidation byte-identical to
+	// serial.
 	ApplyBarrierChange(ctx context.Context, c ir.Change) error
-
-	// InvalidateMetadataCaches drops the engine's PK + column-type cache for
-	// the table named by a SchemaSnapshot, so lanes re-probe on the next
-	// change for that table. Called by the orchestrator on a SchemaSnapshot
-	// barrier AFTER ApplyBarrierChange returns (preserving the GA
-	// apply-then-invalidate order). schema/table are the snapshot's RAW
-	// source schema+table; the engine applies its own routing/qualification.
-	InvalidateMetadataCaches(schema, table string)
 }
 
 // retriable reports whether the raw lane error is one the ADR-0038 streamer
@@ -302,7 +300,6 @@ type Orchestrator struct {
 	nextSeq         uint64 // coordinator-owned monotonic sequence
 	sinceCheckpoint int    // routed changes since the last checkpoint
 	lastWrittenSeq  uint64 // seq of the last persisted boundary (monotone guard)
-	lastWrittenTok  string // token of the last persisted boundary (skip redundant)
 
 	// prevSeq / prevPos track the most-recent event for position-change
 	// boundary detection: a checkpoint boundary is the highest seq sharing a
@@ -434,7 +431,19 @@ func (o *Orchestrator) handle(ctx context.Context, seq uint64, c ir.Change) erro
 	// Position-change boundary detection (see prevSeq/prevPos): when this
 	// event's position differs from the previous event's, the previous
 	// event was the last of its position run — a safe checkpoint boundary.
-	o.noteBoundary(seq, c.Pos())
+	//
+	// A SchemaSnapshot is EXCLUDED from boundary tracking: its position is
+	// metadata-anchored (pgoutput's first-touch RelationMessage carries WAL
+	// position 0/0, before any real anchor exists), NOT a resumable source
+	// position. Letting a 0/0-token SchemaSnapshot participate recorded a
+	// (seq, 0/0) "boundary" that CheckpointPosition then returned as the
+	// resume point, pinning the persisted position at 0/0 forever — the
+	// stream could never warm-resume to the right LSN (Bug 158, the position
+	// half). The surrounding row/Tx events carry the real resume positions
+	// and ARE tracked.
+	if !isSchemaSnapshot(c) {
+		o.noteBoundary(seq, c.Pos())
+	}
 
 	switch c.(type) {
 	case ir.TxBegin:
@@ -451,6 +460,16 @@ func (o *Orchestrator) handle(ctx context.Context, seq uint64, c ir.Change) erro
 		// Truncate, SchemaSnapshot, or any future barrier-class event.
 		return o.barrier(ctx, seq, c)
 	}
+}
+
+// isSchemaSnapshot reports whether c is an [ir.SchemaSnapshot]. A
+// SchemaSnapshot's position is metadata-anchored (pgoutput's first-touch
+// RelationMessage carries WAL 0/0), NOT a resumable source position, so it is
+// excluded from boundary/checkpoint tracking and never written as the resume
+// position on the concurrent path (Bug 158, the position half).
+func isSchemaSnapshot(c ir.Change) bool {
+	_, ok := c.(ir.SchemaSnapshot)
+	return ok
 }
 
 // noteBoundary records the previous event as a checkpoint boundary when the
@@ -502,12 +521,26 @@ func (o *Orchestrator) routeRow(ctx context.Context, seq uint64, c ir.Change) er
 // barrier applies a globally-ordered event (Truncate / SchemaSnapshot /
 // keyless or PK-changing row change) after draining EVERY lane to the
 // barrier's predecessor, so it lands in correct order relative to the row
-// changes around it. It first persists a checkpoint (so the barrier's own
-// position write, via ApplyBarrierChange, is monotone), then applies the
-// change on the coordinator backend (which writes the barrier's position +
-// data atomically — ADR-0007), then advances the frontier past it and
-// records it as a tx boundary so subsequent checkpoints stay monotone from
-// here.
+// changes around it. It first persists a checkpoint (advancing the resume
+// position to the now-fully-durable predecessor), then applies the change on
+// the coordinator backend POSITION-FREE (ApplyBarrierChange writes the data +
+// any schema-history row but NOT the position — the frontier checkpoint owns
+// the resume position on this path), then marks the barrier's seq durable and
+// persists the checkpoint again.
+//
+// Metadata-cache invalidation on a SchemaSnapshot is owned ENTIRELY by
+// ApplyBarrierChange (whose engine implementation runs the SAME guarded
+// apply-then-invalidate the serial path uses — invalidate ONLY on a real
+// signature-changing boundary, NOT on the first-touch baseline). The
+// orchestrator must NOT independently force-invalidate here: doing so
+// bypassed that guard and marked even the first post-cold-start baseline
+// SchemaSnapshot schema-dirty, which on PG forced every subsequent lane DML
+// onto the QueryExecModeExec text-encode path and silently dropped every
+// value that doesn't round-trip as text (Bug 158: json/jsonb → SQLSTATE
+// 22P02 → lane fatal → run wedged at position 0/0). Serial never hit this
+// because its boundary invalidation (cacheActiveSchemaAfterCommit) is
+// guarded; deferring entirely to ApplyBarrierChange makes the concurrent
+// path's invalidation byte-identical to serial.
 func (o *Orchestrator) barrier(ctx context.Context, seq uint64, c ir.Change) error {
 	if err := o.frontier.WaitForFrontier(ctx, seq-1); err != nil {
 		return err
@@ -518,22 +551,21 @@ func (o *Orchestrator) barrier(ctx context.Context, seq uint64, c ir.Change) err
 	if err := o.la.ApplyBarrierChange(ctx, c); err != nil {
 		return err
 	}
-	// SchemaSnapshot changed the table shape — drop the metadata caches so
-	// lanes re-probe on the next change for that table. The apply (above)
-	// has already committed; this preserves the GA apply-then-invalidate
-	// order.
-	if snap, ok := c.(ir.SchemaSnapshot); ok {
-		o.la.InvalidateMetadataCaches(snap.Schema, snap.Table)
-	}
-	// ApplyBarrierChange persisted the barrier's own position + data
-	// atomically and it is now the highest durable point. Mark it on the
-	// frontier and advance the persisted-checkpoint cursor to it so a later
-	// checkpoint can never regress below the barrier (the seq-monotone guard).
+	// ApplyBarrierChange applied the barrier's data + (for a SchemaSnapshot)
+	// the ADR-0049 history row atomically, but did NOT write the position —
+	// the frontier checkpoint owns the resume position exclusively on this
+	// path (the ADR-0104 relaxation). The barrier's seq is now durable, so
+	// mark it on the frontier and persist the checkpoint: a non-SchemaSnapshot
+	// barrier (Truncate / a keyless or PK-changing row) carries a real
+	// resumable position, recorded as a tx boundary by noteBoundary (in
+	// handle), so the checkpoint can advance up to it. A SchemaSnapshot is NOT
+	// a resume point (its token is metadata-anchored — 0/0 at first-touch), so
+	// it is excluded from boundary tracking (see handle / noteBoundary); the
+	// resume position stays at the last real row/Tx boundary, which warm-resume
+	// + idempotent re-apply correctly replays the schema event from (Bug 158).
 	o.frontier.MarkCommitted(seq)
-	o.lastWrittenSeq = seq
-	o.lastWrittenTok = c.Pos().Token
 	o.sinceCheckpoint = 0
-	return nil
+	return o.writeCheckpoint(ctx)
 }
 
 // laneApplyLoop runs one lane (ADR-0104 graduation): it reads a batch of
@@ -842,7 +874,6 @@ func (o *Orchestrator) writeCheckpoint(ctx context.Context) error {
 		return err
 	}
 	o.lastWrittenSeq = seq
-	o.lastWrittenTok = pos.Token
 	return nil
 }
 

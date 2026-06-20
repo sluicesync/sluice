@@ -262,20 +262,21 @@ func (la *laneApplierAdapter) WriteCheckpoint(ctx context.Context, pos ir.Positi
 }
 
 // ApplyBarrierChange applies one barrier-path change on the coordinator
-// backend via applyOne (which writes the barrier's position + data atomically
-// per ADR-0007, and owns the ADR-0049 SchemaSnapshot cache-after-commit
-// update itself). The orchestrator additionally calls InvalidateMetadataCaches
-// on a SchemaSnapshot AFTER this returns, preserving the GA
-// apply-then-invalidate order.
+// backend via applyBarrierNoPosition — which applies the data + ADR-0049
+// schema-history row + (for a SchemaSnapshot) the GUARDED cache-after-commit
+// invalidation (cacheActiveSchemaAfterCommit → invalidateTargetCachesForBoundary,
+// fired ONLY on a real signature-changing boundary, never on the first-touch
+// baseline — the SAME guarded path the serial applier uses), but does NOT
+// write the position. On the concurrent path the resume position is owned
+// exclusively by the frontier checkpoint (the ADR-0104 relaxation), so the
+// barrier must not write its own (metadata-anchored) token. The orchestrator
+// does NOT invalidate separately either (Bug 158: an unconditional
+// orchestrator-side invalidation bypassed the first-touch guard; on PG that
+// silently dropped all post-baseline changes — MySQL's text bind tolerated it
+// but the over-invalidation was still wrong, needlessly schema-dirtying every
+// table on first touch).
 func (la *laneApplierAdapter) ApplyBarrierChange(ctx context.Context, c ir.Change) error {
-	return la.a.applyOne(ctx, la.streamID, c)
-}
-
-// InvalidateMetadataCaches drops the PK + column-type cache for the table a
-// SchemaSnapshot named, applying the same routedSchema + qualifiedName
-// computation the GA barrier path used, so lanes re-probe on the next change.
-func (la *laneApplierAdapter) InvalidateMetadataCaches(schema, table string) {
-	la.a.invalidateMetadataCaches(qualifiedName(la.a.routedSchema(schema), table))
+	return la.a.applyBarrierNoPosition(ctx, la.streamID, c)
 }
 
 // applyBatchConcurrent is the ADR-0104 concurrent key-hash apply entry,

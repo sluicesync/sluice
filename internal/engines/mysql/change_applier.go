@@ -907,6 +907,27 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 // retry policy (ADR-0038) can recognise transient Vitess / MySQL
 // errors and back off rather than exit the stream.
 func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Change) error {
+	return a.applyOneImpl(ctx, streamID, c, true /* writePosition */)
+}
+
+// applyBarrierNoPosition applies one barrier-path change (Truncate /
+// SchemaSnapshot) WITHOUT writing the stream position. Used by the concurrent
+// (ADR-0104) barrier path, where the resume position is owned exclusively by
+// the frontier-checkpoint coordinator (the position relaxation). Symmetric to
+// the PG applier's same-named method; keeps the concurrent barrier's position
+// bookkeeping uniform across engines (the frontier — never the barrier's own
+// metadata-anchored token — names the resume LSN/GTID; Bug 158). The data +
+// ADR-0049 schema-history row + cache-after-commit still apply atomically.
+func (a *ChangeApplier) applyBarrierNoPosition(ctx context.Context, streamID string, c ir.Change) error {
+	return a.applyOneImpl(ctx, streamID, c, false /* writePosition */)
+}
+
+// applyOneImpl is the shared per-change apply: redact → stamp → dispatch →
+// (optional) position write → commit → cache-after-commit. writePosition
+// gates the ADR-0007 position write: true for the serial per-change path
+// (position + data atomic); false for the concurrent barrier path (position
+// owned by the frontier checkpoint — see applyBarrierNoPosition).
+func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.Change, writePosition bool) error {
 	// PII Phase 1.5: redact CDC row data before dispatch when the
 	// operator has configured rules. nil/empty redactor is a no-op
 	// fast path; the apply hot path stays free when no redaction is
@@ -932,17 +953,21 @@ func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Chan
 	// position write that follows rides the same `tx`, and a single
 	// commit makes them atomic. A failure rolls back BOTH and
 	// propagates (locked decision #4b: fatal/loud, never
-	// logged-and-continued).
+	// logged-and-continued). On the position-free barrier path the
+	// history-version write is still atomic with its data; the position
+	// is persisted separately by the frontier checkpoint.
 	if err := a.dispatch(ctx, tx, streamID, c); err != nil {
 		_ = tx.Rollback()
 		return classifyApplierError(err)
 	}
-	posCtx, posCancel := a.execTimeoutCtx(ctx)
-	err = writePositionTx(posCtx, tx, streamID, c.Pos().Token, a.slotName, a.sourceFingerprint, a.targetSchema)
-	posCancel()
-	if err != nil {
-		_ = tx.Rollback()
-		return classifyApplierError(err)
+	if writePosition {
+		posCtx, posCancel := a.execTimeoutCtx(ctx)
+		err = writePositionTx(posCtx, tx, streamID, c.Pos().Token, a.slotName, a.sourceFingerprint, a.targetSchema)
+		posCancel()
+		if err != nil {
+			_ = tx.Rollback()
+			return classifyApplierError(err)
+		}
 	}
 	if err := a.commitWithTimeout(tx); err != nil {
 		return classifyApplierError(fmt.Errorf("mysql: applier: commit: %w", err))

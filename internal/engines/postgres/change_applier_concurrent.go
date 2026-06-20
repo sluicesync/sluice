@@ -299,22 +299,23 @@ func (la *laneApplierAdapter) WriteCheckpoint(ctx context.Context, pos ir.Positi
 }
 
 // ApplyBarrierChange applies one barrier-path change on the coordinator
-// backend via applyOne (which writes the barrier's position + data
-// atomically per ADR-0007, and owns the ADR-0049 active-schema
-// cache-after-commit update itself). The orchestrator additionally calls
-// InvalidateMetadataCaches on a SchemaSnapshot AFTER this returns, preserving
-// the serial apply-then-invalidate order.
+// backend via applyOne, which writes the barrier's position + data
+// atomically per ADR-0007 AND — for a SchemaSnapshot — owns the ADR-0049
+// active-schema cache-after-commit update + the GUARDED metadata-cache
+// invalidation (cacheActiveSchemaAfterCommit → invalidateTargetCachesForBoundary,
+// fired ONLY on a real signature-changing boundary, never on the first-touch
+// baseline). This is the SAME guarded path the serial applier uses, so the
+// concurrent path invalidates byte-identically. The orchestrator does NOT
+// invalidate separately — Bug 158 was an unconditional orchestrator-side
+// invalidation that bypassed the first-touch guard, marked the baseline
+// SchemaSnapshot schema-dirty, and forced every subsequent lane DML onto the
+// QueryExecModeExec text-encode path (json/jsonb → SQLSTATE 22P02 → silent
+// total loss on the PG concurrent path).
 func (la *laneApplierAdapter) ApplyBarrierChange(ctx context.Context, c ir.Change) error {
-	return la.a.applyOne(ctx, la.streamID, c)
-}
-
-// InvalidateMetadataCaches drops the PK + column-type + conflict-key caches
-// (and marks the table schema-dirty) for the table a SchemaSnapshot named,
-// applying the same routedSchema + qualifier computation the serial barrier
-// path (invalidateTargetCachesForBoundary) used, so lanes re-probe on the
-// next change.
-func (la *laneApplierAdapter) InvalidateMetadataCaches(schema, table string) {
-	la.a.invalidateMetadataCaches(schemaTableKey(la.a.routedSchema(schema), table))
+	// Position-free: the frontier checkpoint owns the resume position on the
+	// concurrent path (writing the barrier's own metadata-anchored token —
+	// 0/0 for a first-touch SchemaSnapshot — would regress it; Bug 158).
+	return la.a.applyBarrierNoPosition(ctx, la.streamID, c)
 }
 
 // applyBatchConcurrent is the ADR-0105 concurrent key-hash apply entry,

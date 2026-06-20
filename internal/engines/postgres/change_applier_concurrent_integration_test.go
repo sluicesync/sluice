@@ -393,6 +393,188 @@ func TestConcurrentApply_W1EquivalentToSerial(t *testing.T) {
 	assertNoDifference(t, ctx, dsn, "w1_unset", "w1_one", "id, n, s, arr::text")
 }
 
+// TestConcurrentApply_FirstBoundarySchemaSnapshot_Bug158 is the Bug 158
+// regression pin: a CDC stream whose FIRST event is a SchemaSnapshot barrier
+// (the first-post-cold-start boundary — pgoutput's first-touch RelationMessage,
+// which carries WAL position 0/0) followed by the full value-family row stream
+// must, at W=4, apply EVERY row byte-identically to serial AND persist a REAL
+// resume position (never the SchemaSnapshot's metadata-anchored 0/0 token).
+//
+// The CRITICAL silent-loss this pins (the data half): on v0.99.82 the
+// concurrent orchestrator UNCONDITIONALLY invalidated the table's metadata
+// caches on every SchemaSnapshot barrier (even the first-touch baseline),
+// marking the table schema-dirty. That forced every subsequent lane DML onto
+// pgx's QueryExecModeExec text-encode path, where json/jsonb (and other typed)
+// values fail to encode ("invalid input syntax for type json", SQLSTATE 22P02)
+// → the lane aborted → the whole run wedged at position 0/0 → ALL post-baseline
+// changes silently lost. The serial path never hit it because its boundary
+// invalidation (cacheActiveSchemaAfterCommit) is GUARDED to fire only on a real
+// signature-changing boundary, not the baseline. The fix defers all barrier
+// invalidation to ApplyBarrierChange (which runs that same guarded path), so
+// the concurrent baseline boundary no longer over-invalidates.
+//
+// The position half: ApplyBarrierChange used to write the SchemaSnapshot's own
+// 0/0 token as the resume position; the fix makes the concurrent barrier apply
+// position-free (the frontier checkpoint owns the resume position), and the
+// orchestrator excludes a SchemaSnapshot from boundary tracking, so the
+// persisted position advances to the surrounding rows' real LSN — warm-resume
+// works instead of cold-starting from 0/0 forever.
+//
+// This is the Bug-74 reviewer-corollary realized: the differential exercises
+// EVERY value family (numeric extremes, text/varchar/uuid, json/jsonb,
+// timestamp µs, bool, bytea, AND arrays int/text/numeric incl. 2-D + NULL) —
+// the json/jsonb family is the one that silently dropped; the rest guard the
+// class.
+func TestConcurrentApply_FirstBoundarySchemaSnapshot_Bug158(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+
+	ddl := func(suffix string) string {
+		return fmt.Sprintf(`CREATE TABLE b158_%s (
+			id      BIGINT PRIMARY KEY,
+			n_int   INTEGER,
+			n_num   NUMERIC(38,10),
+			t_text  TEXT,
+			u_uuid  UUID,
+			j_json  JSON,
+			j_jsonb JSONB,
+			ts_us   TIMESTAMP(6),
+			b_bool  BOOLEAN,
+			y_bytea BYTEA,
+			a_int   INTEGER[],
+			a_text  TEXT[],
+			a_num2d NUMERIC(20,4)[][]
+		);`, suffix)
+	}
+
+	// tableIR mirrors the DDL so the SchemaSnapshot's IR signature matches the
+	// table — the FIRST-TOUCH BASELINE case (no prior version on this stream →
+	// cacheActiveSchemaAfterCommit's guard must NOT invalidate). This is exactly
+	// the phantom-skip shape: a SchemaSnapshot that does not change the shape.
+	tableIR := func(table string) *ir.Table {
+		col := func(name string, typ ir.Type) *ir.Column { return &ir.Column{Name: name, Type: typ} }
+		return &ir.Table{
+			Schema: "public", Name: table,
+			Columns: []*ir.Column{
+				col("id", ir.Integer{Width: 64}),
+				col("n_int", ir.Integer{Width: 32}),
+				col("n_num", ir.Decimal{Precision: 38, Scale: 10}),
+				col("t_text", ir.Text{}),
+				col("u_uuid", ir.UUID{}),
+				col("j_json", ir.JSON{Binary: false}),
+				col("j_jsonb", ir.JSON{Binary: true}),
+				col("ts_us", ir.Timestamp{Precision: 6}),
+				col("b_bool", ir.Boolean{}),
+				col("y_bytea", ir.Blob{Size: ir.BlobLong}),
+				col("a_int", ir.Array{Element: ir.Integer{Width: 32}}),
+				col("a_text", ir.Array{Element: ir.Text{}}),
+				col("a_num2d", ir.Array{Element: ir.Array{Element: ir.Decimal{Precision: 20, Scale: 4}}}),
+			},
+			PrimaryKey: &ir.Index{Name: "pk", Columns: []ir.IndexColumn{{Column: "id"}}},
+		}
+	}
+
+	// CRITICAL value-shape fidelity (Bug 158 + Bug 74): the PG CDC reader
+	// decodes json/jsonb to []byte (value_decode.go: ir.JSON → decodeBytes),
+	// NOT a Go string. The bug only fires for the []byte shape: under the
+	// over-invalidation's QueryExecModeExec text-encode path, pgx rejects a
+	// []byte bound to a json column ("invalid input syntax for type json",
+	// 22P02). A Go string would have round-tripped and HIDDEN the bug — so the
+	// pin MUST use the same []byte shape the CDC decode produces.
+	mkRow := func(i int64) ir.Row {
+		return ir.Row{
+			"id":      i,
+			"n_int":   -2147483648 + i,
+			"n_num":   fmt.Sprintf("%d.1234567890", i*1000000),
+			"t_text":  fmt.Sprintf("row-%d-ünïcödé-世界", i),
+			"u_uuid":  fmt.Sprintf("00000000-0000-0000-0000-%012d", i),
+			"j_json":  []byte(fmt.Sprintf(`{"k":%d,"u":"世界"}`, i)),
+			"j_jsonb": []byte(fmt.Sprintf(`{"z":%d,"nested":{"q":[1,2,3]}}`, i)),
+			"ts_us":   "2024-01-02 03:04:05.123456",
+			"b_bool":  i%2 == 0,
+			"y_bytea": []byte{0x00, 0x01, byte(i % 256), 0xff},
+			"a_int":   []any{i, i + 1, nil},
+			"a_text":  []any{fmt.Sprintf("e%d", i), nil, "z"},
+			"a_num2d": []any{[]any{"1.1", "2.2"}, []any{"3.3", fmt.Sprintf("%d.4", i)}},
+		}
+	}
+
+	// The Bug-158 stream shape: a first-touch SchemaSnapshot BARRIER carrying
+	// the 0/0 metadata-anchored token, THEN the value-family row stream carrying
+	// real positions. Under the bug, the barrier marked the table schema-dirty
+	// → every row's json/jsonb encode failed → nothing applied.
+	const snapTok = `{"slot":"sluice_slot","lsn":"0/0"}`
+	lastRowTok := func(table string) string { return fmt.Sprintf(`{"slot":"sluice_slot","lsn":"row-%s-final"}`, table) }
+	mkStream := func(table string) []ir.Change {
+		ev := []ir.Change{
+			ir.SchemaSnapshot{Position: cpos(snapTok), Schema: "public", Table: table, IR: tableIR(table)},
+		}
+		seq := 0
+		tok := func() string { seq++; return fmt.Sprintf(`{"slot":"sluice_slot","lsn":"row-%s-%06d"}`, table, seq) }
+		for i := int64(1); i <= 40; i++ {
+			ev = append(ev, ir.Insert{Position: cpos(tok()), Schema: "public", Table: table, Row: mkRow(i)})
+		}
+		// Dependent same-key sequences (INSERT→UPDATE→DELETE) exercising the
+		// value families through the lane on a re-touched key.
+		for i := int64(1); i <= 40; i += 2 {
+			after := mkRow(i)
+			after["t_text"] = "UPD-世界"
+			after["j_jsonb"] = []byte(`{"upd":true}`)
+			after["a_num2d"] = []any{[]any{"9.9", "8.8"}}
+			ev = append(ev, ir.Update{Position: cpos(tok()), Schema: "public", Table: table, Before: mkRow(i), After: after})
+		}
+		for i := int64(4); i <= 40; i += 4 {
+			ev = append(ev, ir.Delete{Position: cpos(tok()), Schema: "public", Table: table, Before: mkRow(i)})
+		}
+		// A final distinct-token insert so the last persisted position is
+		// deterministic for the position assertion.
+		ev = append(ev, ir.Insert{Position: cpos(lastRowTok(table)), Schema: "public", Table: table, Row: mkRow(9999)})
+		return ev
+	}
+
+	applyPGApplier(t, dsn, ddl("serial")+ddl("conc"))
+
+	aSerial := openConcurrentApplier(t, ctx, dsn, 1)
+	defer func() { _ = aSerial.Close() }()
+	pumpConcurrentChanges(t, ctx, aSerial, "b158-serial", mkStream("b158_serial"), 9)
+
+	aConc := openConcurrentApplier(t, ctx, dsn, concurrentLanesW)
+	defer func() { _ = aConc.Close() }()
+	pumpConcurrentChanges(t, ctx, aConc, "b158-conc", mkStream("b158_conc"), 9)
+
+	// (1) Data half: byte-identical across EVERY value family (the json/jsonb
+	// columns are the ones that silently dropped under the bug).
+	const cols = `id, n_int, n_num::text, t_text, u_uuid::text,
+		j_json::text, j_jsonb::text, ts_us::text, b_bool, encode(y_bytea,'hex'),
+		a_int::text, a_text::text, a_num2d::text`
+	assertNoDifference(t, ctx, dsn, "b158_serial", "b158_conc", cols)
+
+	// (2) Row count must be the full applied set (not frozen at 0) — a direct
+	// guard against the silent-total-loss symptom (dst stayed at the seed).
+	if got := countAllRows(t, dsn, "b158_conc"); got == 0 {
+		t.Fatal("concurrent target empty — the first-boundary SchemaSnapshot swallowed every row (Bug 158)")
+	}
+
+	// (3) Position half: the persisted resume position must be the last REAL
+	// row token, NEVER the SchemaSnapshot's 0/0 metadata anchor (which pinned
+	// the stream at 0/0 and broke warm-resume).
+	pos, ok, err := aConc.ReadPosition(ctx, "b158-conc")
+	if err != nil || !ok {
+		t.Fatalf("ReadPosition(concurrent): ok=%v err=%v", ok, err)
+	}
+	if pos.Token == snapTok {
+		t.Fatalf("persisted position pinned at the SchemaSnapshot's 0/0 token %q — "+
+			"the barrier must not persist a metadata-anchored position (Bug 158, position half)", pos.Token)
+	}
+	if pos.Token != lastRowTok("b158_conc") {
+		t.Errorf("persisted position = %q; want the last real row token %q "+
+			"(the frontier checkpoint must advance past the 0/0 baseline)", pos.Token, lastRowTok("b158_conc"))
+	}
+}
+
 // assertNoDifference fails the test unless tableA and tableB hold the exact
 // same rows over the given projected columns (EXCEPT in both directions).
 func assertNoDifference(t *testing.T, ctx context.Context, dsn, tableA, tableB, cols string) {
