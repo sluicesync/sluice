@@ -432,7 +432,7 @@ So NOTIFY-kick is **demoted** — the poll isn't the bottleneck. Closing the rea
 
 ---
 
-### 26. PG-side concurrent CDC apply (the ADR-0104 key-hash-lane analog for the ADR-0092 Postgres path) — *operator-prioritized 2026-06-20; cross-region PG apply throughput*
+### 26. PG-side concurrent CDC apply (the ADR-0104 key-hash-lane analog for the ADR-0092 Postgres path) — *operator-prioritized 2026-06-20; designed in [ADR-0105](../adr/adr-0105-postgres-concurrent-cdc-apply.md); cross-region PG apply throughput*
 
 **Why (live finding, 2026-06-20, Track B vs B2).** The cross-region CDC apply wedge (item 23) is now closed for **MySQL** targets via ADR-0104 `--apply-concurrency` (key-hash lanes, ~4×, live-validated). It remains OPEN for **Postgres** targets: Track B2 (same Vitess source → PS-PG) uses the ADR-0092 within-transaction pipelined apply (single AIMD controller, ceiling 1000) and on a contended cross-region link was measured applying ~6.5 rows/s — ~10× slower than Track B's concurrent MySQL apply (~66 rows/s) under the same source. ADR-0092 overlaps only the commit RTT; it does not parallelize across keys, so a high-RTT PG target is apply-bound with no concurrency lever. The asymmetry is structural, not a bug — but it makes PG the slower cross-region target.
 
