@@ -132,6 +132,16 @@ type ChangeApplier struct {
 	// change_applier_concurrent.go.
 	applyConcurrency int
 
+	// laneControllers are the ADR-0104 per-lane AIMD controllers, one per
+	// concurrent apply lane in lane-index order (laneControllers[i] drives
+	// lane i). Set by [SetLaneAIMDControllers] when the streamer engages
+	// --apply-concurrency W > 1 with AIMD auto-tune; nil (the default) means
+	// the lanes run at the static maxBatchSize with bounded in-lane retry but
+	// no adaptive sizing. Each lane drives its controller from a single
+	// goroutine, so per-lane shrink decisions (and tx-killer convergence)
+	// stay independent. See change_applier_concurrent.go (laneApplyLoop).
+	laneControllers []ir.BatchSizeController
+
 	// multiDBRouting is the ADR-0074 Phase 1b per-change namespace
 	// routing switch, set by [SetMultiDatabaseRouting]. When false (the
 	// default — every single-database run, ALL engine pairs) the applier
@@ -416,6 +426,18 @@ func (a *ChangeApplier) SetApplyConcurrency(lanes int) {
 		lanes = 0
 	}
 	a.applyConcurrency = lanes
+}
+
+// SetLaneAIMDControllers implements [ir.LaneAIMDSetter] (ADR-0104).
+// Records the per-lane AIMD controllers — one per concurrent apply lane,
+// in lane-index order — so each lane consults its OWN controller for the
+// next batch size and feeds it the commit outcome (so a tx-killer shrinks
+// only the affected lane). The streamer wires this only when
+// --apply-concurrency W > 1 AND auto-tune is on; nil clears it (lanes run
+// at the static maxBatchSize). Idempotent. The serial path keeps the
+// single-controller [SetBatchSizeProvider] / [SetBatchObserver] wiring.
+func (a *ChangeApplier) SetLaneAIMDControllers(controllers []ir.BatchSizeController) {
+	a.laneControllers = controllers
 }
 
 // SetRedactor implements [ir.RedactorSetter] (PII Phase 1.5,

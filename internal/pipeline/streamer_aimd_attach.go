@@ -83,6 +83,22 @@ func (s *Streamer) maybeAttachAIMDController(ctx context.Context, applier ir.Cha
 	if !s.AutoTune || s.ApplyBatchSize <= 1 {
 		return nil
 	}
+	// ADR-0104 concurrent key-hash apply: with --apply-concurrency W > 1 the
+	// applier runs W independent in-order lanes, each needing its OWN AIMD
+	// controller (a tx-killer on a slow lane must shrink only that lane). When
+	// the applier implements [ir.LaneAIMDSetter] we build W controllers and
+	// wire them via SetLaneAIMDControllers, then return nil: the metrics
+	// server has no single controller to snapshot on this path (per-lane
+	// snapshot aggregation is a documented follow-up). The serial single-
+	// controller path below is UNCHANGED for W <= 1.
+	if s.ApplyConcurrency > 1 {
+		if laneSetter, ok := applier.(ir.LaneAIMDSetter); ok {
+			return s.attachLaneAIMDControllers(ctx, laneSetter, streamID)
+		}
+		// W > 1 but the engine lacks the per-lane surface (e.g. Postgres):
+		// fall through to the single-controller path. Harmless — Postgres
+		// doesn't run key-hash lanes, so one controller is correct there.
+	}
 	provSetter, hasProv := applier.(ir.BatchSizeProviderSetter)
 	obsSetter, hasObs := applier.(ir.BatchObserverSetter)
 	if !hasProv || !hasObs {
@@ -147,6 +163,69 @@ func (s *Streamer) maybeAttachAIMDController(ctx context.Context, applier ir.Cha
 		slog.Duration("target_latency", cfg.TargetLatency),
 	)
 	return ctrl
+}
+
+// attachLaneAIMDControllers builds W AIMD controllers — one per ADR-0104
+// concurrent apply lane — and wires them onto the applier via
+// [ir.LaneAIMDSetter]. Each controller carries the SAME Config as the
+// serial single-controller path (Floor 1, Ceiling = --apply-batch-size,
+// the resolved target latency) but its OWN OnShrink, so a tx-killer on one
+// lane shrinks only that lane's controller. Returns nil: there is no single
+// controller for the metrics server to snapshot on this path (per-lane
+// snapshot aggregation is a documented follow-up; the serial metrics path
+// is untouched).
+//
+// follow-up: per-lane resume-size persistence across a WHOLE-RUN restart is
+// deliberately omitted. The in-lane shrink-and-retry (laneApplyLoop) absorbs
+// a sustained tx-killer WITHOUT propagating out of runOnce, so the
+// cross-runOnce resume-size carry (aimdResumeSize, the serial path's
+// v0.99.69 fix) is not load-bearing here. If a future change makes a lane's
+// failure escalate to a whole-run restart, add a []atomic.Int64 (one slot
+// per lane) mirroring aimdResumeSize and thread each lane's OnShrink to its
+// slot; each fresh controller would then resume from its slot rather than
+// the ceiling.
+func (s *Streamer) attachLaneAIMDControllers(ctx context.Context, setter ir.LaneAIMDSetter, streamID string) *appliercontrol.Controller {
+	target := s.ApplyTuneTargetLatency
+	if target <= 0 {
+		target = resolveAIMDTargetLatency(s.targetCapsForAIMD())
+	}
+	w := s.ApplyConcurrency
+	controllers := make([]ir.BatchSizeController, 0, w)
+	for i := 0; i < w; i++ {
+		cfg := appliercontrol.Config{
+			StreamID:      streamID,
+			EngineName:    s.engineNameForAIMD(),
+			Floor:         1,
+			Ceiling:       s.ApplyBatchSize,
+			InitialSize:   s.ApplyBatchSize,
+			TargetLatency: target,
+			// No OnShrink resume-size carry on the per-lane path (see the
+			// follow-up note above); each controller is self-contained within
+			// runOnce, which is sufficient because in-lane retry handles a
+			// sustained tx-killer without a whole-run restart.
+		}
+		ctrl, err := appliercontrol.New(cfg)
+		if err != nil {
+			slog.WarnContext(
+				ctx, "applier: failed to construct per-lane AIMD controller; lanes fall back to the static apply-batch-size cap",
+				slog.String("stream_id", streamID),
+				slog.Int("lane", i),
+				slog.String("err", err.Error()),
+			)
+			return nil
+		}
+		controllers = append(controllers, ctrl)
+	}
+	setter.SetLaneAIMDControllers(controllers)
+	slog.InfoContext(
+		ctx, "applier: per-lane AIMD apply-batch-size controllers engaged (ADR-0104 concurrent key-hash apply)",
+		slog.String("stream_id", streamID),
+		slog.String("engine", s.engineNameForAIMD()),
+		slog.Int("lanes_W", w),
+		slog.Int("ceiling", s.ApplyBatchSize),
+		slog.Duration("target_latency", target),
+	)
+	return nil
 }
 
 // engineNameForAIMD returns the canonical engine name used to label

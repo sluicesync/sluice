@@ -35,9 +35,13 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	gomysql "github.com/go-sql-driver/mysql"
+
+	"sluicesync.dev/sluice/internal/appliercontrol"
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -176,6 +180,24 @@ func TestConcurrentApply_SerialDifferential(t *testing.T) {
 		defer cancel()
 		a := openConcurrentApplier(t, ctx, dsn, lanes)
 		defer closeApplier(a)
+		// Wire per-lane AIMD controllers on the concurrent pass so the
+		// differential proves byte-identity HOLDS with controllers engaged
+		// (value encoding is independent of WHEN/whether a batch is sized or
+		// retried — the ADR-0104 invariant). The serial pass keeps the
+		// single-controller-less path.
+		if lanes > 1 {
+			ctrls := make([]ir.BatchSizeController, lanes)
+			for i := range ctrls {
+				c, err := appliercontrol.New(appliercontrol.Config{
+					StreamID: testStreamID, Floor: 1, Ceiling: 9, InitialSize: 9, TargetLatency: 10 * time.Second,
+				})
+				if err != nil {
+					t.Fatalf("controller %d: %v", i, err)
+				}
+				ctrls[i] = c
+			}
+			a.(*ChangeApplier).SetLaneAIMDControllers(ctrls)
+		}
 		pumpBatchedChangesPipelined(t, ctx, a, testStreamID, mkStream(), 9)
 		return tableChecksum(t, dsn, "target_db", "a", "id"), tableChecksum(t, dsn, "target_db", "b", "id")
 	}
@@ -224,6 +246,95 @@ func TestConcurrentApply_BoundarylessStreamPersistsPosition(t *testing.T) {
 	}
 	if pos.Token != lastTok {
 		t.Errorf("persisted position = %q; want %q (seq-frontier must reach the last durable change)", pos.Token, lastTok)
+	}
+}
+
+// TestConcurrentApply_TxKillerInLaneRetry is the ADR-0104-graduation pin: a
+// Vitess tx-killer abort forced on a lane's FIRST commit attempt must be
+// recovered IN-LANE — the SAME batch is re-applied and succeeds, the final
+// target state is exactly-once-correct (no dup / no gap), the run does NOT
+// cancel (other lanes keep flowing), and the affected lane's AIMD controller
+// shrank. This exercises the real DB apply path + the per-lane controller
+// wiring (SetLaneAIMDControllers), not just the unit-level retry loop.
+//
+// NOTE: -race Integration on CI is the authoritative gate (concurrency chunk).
+func TestConcurrentApply_TxKillerInLaneRetry(t *testing.T) {
+	dsn, cleanup := startMySQLForApplier(t)
+	defer cleanup()
+
+	const tbl = "conc_txk"
+	applyMySQLApplier(t, dsn, fmt.Sprintf(`
+		CREATE TABLE %s (id BIGINT NOT NULL, v VARCHAR(64) NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`, quoteIdent(tbl)))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	a := openConcurrentApplier(t, ctx, dsn, concurrentLanesW)
+	defer closeApplier(a)
+
+	// Wire real per-lane AIMD controllers so we can assert the affected lane
+	// shrank (the same shape the streamer's attachLaneAIMDControllers builds).
+	ctrls := make([]ir.BatchSizeController, concurrentLanesW)
+	rawCtrls := make([]*appliercontrol.Controller, concurrentLanesW)
+	for i := range ctrls {
+		c, err := appliercontrol.New(appliercontrol.Config{
+			StreamID: testStreamID, Floor: 1, Ceiling: 16, InitialSize: 16, TargetLatency: 10 * time.Second,
+		})
+		if err != nil {
+			t.Fatalf("controller %d: %v", i, err)
+		}
+		ctrls[i] = c
+		rawCtrls[i] = c
+	}
+	a.(*ChangeApplier).SetLaneAIMDControllers(ctrls)
+
+	// Force a tx-killer on the FIRST lane commit only — set the package test
+	// hook to return a real Vitess tx-killer 1105 on its first invocation,
+	// then disable itself so the retry succeeds. Reset on cleanup so it can't
+	// leak into another test.
+	var fired atomic.Bool
+	laneCommitHookForTest = func(_ []laneChange) error {
+		if fired.CompareAndSwap(false, true) {
+			return &gomysql.MySQLError{
+				Number:  1105,
+				Message: "vttablet: rpc error: code = Aborted desc = transaction rolled back for tx killer rollback",
+			}
+		}
+		return nil
+	}
+	t.Cleanup(func() { laneCommitHookForTest = nil })
+
+	const keys = 80
+	var ev []ir.Change
+	seq := 0
+	tok := func() string { seq++; return fmt.Sprintf("txk-%06d", seq) }
+	for i := int64(1); i <= keys; i++ {
+		ev = append(ev, ir.Insert{Position: ir.Position{Engine: engineNameMySQL, Token: tok()}, Schema: "target_db", Table: tbl, Row: ir.Row{"id": i, "v": "x"}})
+	}
+
+	// The run MUST succeed (in-lane recovery), not error out.
+	pumpBatchedChangesPipelined(t, ctx, a, testStreamID, ev, 5)
+
+	// Exactly-once: every key present exactly once (no dup from the re-applied
+	// batch, no gap from the failed attempt).
+	if got := countAllRows(t, dsn, "target_db", tbl); got != keys {
+		t.Fatalf("rows = %d; want %d (exactly-once after in-lane retry)", got, keys)
+	}
+	if !fired.Load() {
+		t.Fatal("tx-killer hook never fired — the test did not exercise the retry path")
+	}
+	// The affected lane's controller must have shrunk at least once; the
+	// others stay at the ceiling (per-lane independence). Exactly one shrink
+	// across all lanes (the single forced tx-killer).
+	totalShrinks := uint64(0)
+	for i, c := range rawCtrls {
+		snap := c.Snapshot()
+		totalShrinks += snap.DecreasesTotal
+		if snap.CurrentSize > 16 {
+			t.Errorf("lane %d size %d exceeds ceiling 16", i, snap.CurrentSize)
+		}
+	}
+	if totalShrinks != 1 {
+		t.Errorf("total controller shrinks = %d; want exactly 1 (one forced tx-killer)", totalShrinks)
 	}
 }
 

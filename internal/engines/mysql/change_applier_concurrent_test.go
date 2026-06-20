@@ -5,9 +5,12 @@ package mysql
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
+
+	gomysql "github.com/go-sql-driver/mysql"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -286,6 +289,294 @@ func TestPkChangedUpdate(t *testing.T) {
 		if got := pkChangedUpdate(tc.u, pk); got != tc.want {
 			t.Errorf("%s: pkChangedUpdate=%v want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+// --- In-lane AIMD + tx-killer shrink-and-retry pins (ADR-0104 graduation) ---
+
+// fakeLaneController is a deterministic [ir.BatchSizeController] stand-in for
+// the per-lane AIMD pins: NextBatchSize returns the current size; ObserveBatch
+// HALVES it (floor 1) on a retriable error (mirroring the real controller's MD
+// on [ir.TransactionKilledError]) and records the observed outcomes. It does
+// no latency/windowing — the unit pins only care that a tx-killer drives a
+// shrink and that observations land on the right lane's controller.
+type fakeLaneController struct {
+	mu       sync.Mutex
+	size     int
+	observed int
+	shrinks  int
+}
+
+func newFakeLaneController(initial int) *fakeLaneController {
+	return &fakeLaneController{size: initial}
+}
+
+func (c *fakeLaneController) NextBatchSize() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.size
+}
+
+func (c *fakeLaneController) ObserveBatch(_ context.Context, _ time.Duration, _ int, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.observed++
+	if err != nil && isApplierErrorRetriable(err) {
+		c.shrinks++
+		c.size /= 2
+		if c.size < 1 {
+			c.size = 1
+		}
+	}
+}
+
+func (c *fakeLaneController) snapshot() (size, observed, shrinks int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.size, c.observed, c.shrinks
+}
+
+// fakeTxKillerError is a real MySQL Error 1105 carrying the canonical Vitess
+// tx-killer payload ("vttablet ... code = Aborted ... for tx killer
+// rollback") — the EXACT shape classifyApplierError recognizes as a
+// retriable tx-killer abort. The pins drive the real classifier (via
+// isApplierErrorRetriable), not a hand-rolled retriable, so they verify the
+// in-lane retry predicate agrees with the streamer's ADR-0038 classification.
+func fakeTxKillerError() error {
+	return &gomysql.MySQLError{
+		Number:  1105,
+		Message: "vttablet: rpc error: code = Aborted desc = transaction rolled back for tx killer rollback",
+	}
+}
+
+// newTestLaneManager builds a manager wired for the no-DB unit pins: a fake
+// commit function and a frontier. It does NOT open a lane pool — only
+// applyLaneBatch / the frontier are exercised.
+func newTestLaneManager(lanes int, commit func(ctx context.Context, buf []laneChange) error) *concurrentApplyManager {
+	return &concurrentApplyManager{
+		lanes:         lanes,
+		maxBatchSize:  8,
+		frontier:      newCheckpointFrontier(),
+		commitBatchFn: commit,
+		cancel:        func() {},
+	}
+}
+
+// TestLaneApply_TxKillerShrinkAndRetry pins the core graduation claim: a
+// tx-killer on a lane's FIRST commit attempt causes the SAME batch to be
+// re-applied and succeed, the frontier advances exactly-once (every seq, no
+// dup/gap), the controller shrank, and applyLaneBatch returns nil (no run
+// cancel — in-lane recovery).
+func TestLaneApply_TxKillerShrinkAndRetry(t *testing.T) {
+	attempts := 0
+	commit := func(_ context.Context, _ []laneChange) error {
+		attempts++
+		if attempts == 1 {
+			return fakeTxKillerError() // first attempt: tx-killer
+		}
+		return nil // retry succeeds
+	}
+	m := newTestLaneManager(1, commit)
+	ctrl := newFakeLaneController(8)
+
+	buf := []laneChange{
+		{seq: 1, change: ir.Insert{Schema: "ks", Table: "t", Row: ir.Row{"id": int64(1)}}},
+		{seq: 2, change: ir.Insert{Schema: "ks", Table: "t", Row: ir.Row{"id": int64(2)}}},
+	}
+	if err := m.applyLaneBatch(context.Background(), ctrl, buf); err != nil {
+		t.Fatalf("applyLaneBatch returned %v; want nil (in-lane recovery)", err)
+	}
+	if attempts != 2 {
+		t.Errorf("commit attempts = %d; want 2 (one tx-killer + one success)", attempts)
+	}
+	// Frontier advanced to seq 2, exactly-once (no gap, no dup).
+	if got := m.frontier.frontierSeq(); got != 2 {
+		t.Errorf("frontier = %d; want 2 (both seqs committed exactly once)", got)
+	}
+	size, observed, shrinks := ctrl.snapshot()
+	if shrinks != 1 {
+		t.Errorf("controller shrinks = %d; want 1 (tx-killer must shrink)", shrinks)
+	}
+	if size != 4 {
+		t.Errorf("controller size = %d; want 4 (8 halved once)", size)
+	}
+	if observed != 2 {
+		t.Errorf("controller observed = %d; want 2 (one per attempt)", observed)
+	}
+}
+
+// TestLaneApply_MarkCommittedOnlyOnDurableCommit pins the load-bearing
+// exactly-once invariant: while a batch keeps failing retriably, NO seq
+// advances; the frontier moves only after the commit finally succeeds.
+func TestLaneApply_MarkCommittedOnlyOnDurableCommit(t *testing.T) {
+	m := newTestLaneManager(1, nil)
+	ctrl := newFakeLaneController(8)
+	buf := []laneChange{{seq: 1, change: ir.Insert{Schema: "ks", Table: "t", Row: ir.Row{"id": int64(1)}}}}
+
+	attempts := 0
+	// The commit checks the frontier is still 0 on every failing attempt —
+	// markCommitted must NOT fire before a durable commit.
+	m.commitBatchFn = func(_ context.Context, _ []laneChange) error {
+		if got := m.frontier.frontierSeq(); got != 0 {
+			t.Fatalf("frontier advanced to %d before a durable commit", got)
+		}
+		attempts++
+		if attempts < 3 {
+			return fakeTxKillerError()
+		}
+		return nil
+	}
+
+	if err := m.applyLaneBatch(context.Background(), ctrl, buf); err != nil {
+		t.Fatalf("applyLaneBatch = %v; want nil", err)
+	}
+	if got := m.frontier.frontierSeq(); got != 1 {
+		t.Errorf("frontier = %d after success; want 1", got)
+	}
+}
+
+// TestLaneApply_RetryExhaustionIsFatal pins the loud-failure bound: a target
+// that tx-kills on EVERY attempt fails the batch after maxInLaneRetries+1
+// attempts (no infinite loop), surfaces a classified error, and never
+// advances the frontier.
+func TestLaneApply_RetryExhaustionIsFatal(t *testing.T) {
+	attempts := 0
+	commit := func(_ context.Context, _ []laneChange) error {
+		attempts++
+		return fakeTxKillerError()
+	}
+	m := newTestLaneManager(1, commit)
+	ctrl := newFakeLaneController(8)
+	buf := []laneChange{{seq: 1, change: ir.Insert{Schema: "ks", Table: "t", Row: ir.Row{"id": int64(1)}}}}
+
+	err := m.applyLaneBatch(context.Background(), ctrl, buf)
+	if err == nil {
+		t.Fatal("applyLaneBatch = nil; want a fatal error after retry exhaustion")
+	}
+	// One initial attempt + maxInLaneRetries retries.
+	if want := maxInLaneRetries + 1; attempts != want {
+		t.Errorf("commit attempts = %d; want %d (initial + maxInLaneRetries)", attempts, want)
+	}
+	if got := m.frontier.frontierSeq(); got != 0 {
+		t.Errorf("frontier = %d; want 0 (nothing durable)", got)
+	}
+	// The surfaced error stays classified-retriable so the streamer's
+	// ADR-0038 warm-resume loop activates rather than exiting the stream.
+	var re ir.RetriableError
+	if !errors.As(err, &re) || !re.Retriable() {
+		t.Errorf("exhaustion error = %v; want a classified RetriableError (warm-resume)", err)
+	}
+}
+
+// TestLaneApply_NonRetriableIsImmediatelyFatal pins that a NON-retriable
+// failure (e.g. a duplicate-key data bug) fails on the FIRST attempt without
+// burning the retry budget — retry is for transients only.
+func TestLaneApply_NonRetriableIsImmediatelyFatal(t *testing.T) {
+	attempts := 0
+	fatal := errors.New("Error 1062: Duplicate entry") // not classified retriable
+	commit := func(_ context.Context, _ []laneChange) error {
+		attempts++
+		return fatal
+	}
+	m := newTestLaneManager(1, commit)
+	ctrl := newFakeLaneController(8)
+	buf := []laneChange{{seq: 1, change: ir.Insert{Schema: "ks", Table: "t", Row: ir.Row{"id": int64(1)}}}}
+
+	if err := m.applyLaneBatch(context.Background(), ctrl, buf); err == nil {
+		t.Fatal("applyLaneBatch = nil; want a fatal error for a non-retriable failure")
+	}
+	if attempts != 1 {
+		t.Errorf("commit attempts = %d; want 1 (non-retriable must not retry)", attempts)
+	}
+	if got := m.frontier.frontierSeq(); got != 0 {
+		t.Errorf("frontier = %d; want 0", got)
+	}
+}
+
+// TestLaneApply_PerLaneIndependence pins that a tx-killer on lane i shrinks
+// only lane i's controller — lane j's controller is untouched, so a slow
+// lane doesn't drag the others down.
+func TestLaneApply_PerLaneIndependence(t *testing.T) {
+	// Lane 0 hits one tx-killer then succeeds; lane 1 succeeds immediately.
+	lane0Attempts := 0
+	commitLane0 := func(_ context.Context, _ []laneChange) error {
+		lane0Attempts++
+		if lane0Attempts == 1 {
+			return fakeTxKillerError()
+		}
+		return nil
+	}
+	commitLane1 := func(_ context.Context, _ []laneChange) error { return nil }
+
+	m0 := newTestLaneManager(2, commitLane0)
+	m1 := newTestLaneManager(2, commitLane1)
+	ctrl0 := newFakeLaneController(8)
+	ctrl1 := newFakeLaneController(8)
+
+	buf0 := []laneChange{{seq: 1, change: ir.Insert{Schema: "ks", Table: "t", Row: ir.Row{"id": int64(10)}}}}
+	buf1 := []laneChange{{seq: 2, change: ir.Insert{Schema: "ks", Table: "t", Row: ir.Row{"id": int64(11)}}}}
+
+	if err := m0.applyLaneBatch(context.Background(), ctrl0, buf0); err != nil {
+		t.Fatalf("lane 0 applyLaneBatch = %v; want nil", err)
+	}
+	if err := m1.applyLaneBatch(context.Background(), ctrl1, buf1); err != nil {
+		t.Fatalf("lane 1 applyLaneBatch = %v; want nil", err)
+	}
+	if _, _, s0 := ctrl0.snapshot(); s0 != 1 {
+		t.Errorf("lane 0 controller shrinks = %d; want 1", s0)
+	}
+	if size1, _, s1 := ctrl1.snapshot(); s1 != 0 || size1 != 8 {
+		t.Errorf("lane 1 controller shrinks=%d size=%d; want 0 shrinks, size 8 (independent of lane 0)", s1, size1)
+	}
+}
+
+// TestLaneApply_NilControllerStaticSizeStillRetries pins the nil-controller
+// path: with no AIMD controller the lane still does bounded in-lane retry on
+// a retriable error (just no adaptive shrink), recovers, and advances the
+// frontier — so --apply-concurrency without auto-tune is still resilient.
+func TestLaneApply_NilControllerStaticSizeStillRetries(t *testing.T) {
+	attempts := 0
+	commit := func(_ context.Context, _ []laneChange) error {
+		attempts++
+		if attempts == 1 {
+			return fakeTxKillerError()
+		}
+		return nil
+	}
+	m := newTestLaneManager(1, commit)
+	buf := []laneChange{{seq: 1, change: ir.Insert{Schema: "ks", Table: "t", Row: ir.Row{"id": int64(1)}}}}
+
+	if err := m.applyLaneBatch(context.Background(), nil, buf); err != nil {
+		t.Fatalf("applyLaneBatch(nil ctrl) = %v; want nil (bounded retry without AIMD)", err)
+	}
+	if attempts != 2 {
+		t.Errorf("attempts = %d; want 2", attempts)
+	}
+	if got := m.frontier.frontierSeq(); got != 1 {
+		t.Errorf("frontier = %d; want 1", got)
+	}
+}
+
+// TestLaneApply_CtxCancelAbortsRetry pins that a cancelled ctx stops the
+// in-lane retry promptly even while the commit keeps returning a retriable
+// error — ctx cancellation must win over the retry budget.
+func TestLaneApply_CtxCancelAbortsRetry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	attempts := 0
+	commit := func(_ context.Context, _ []laneChange) error {
+		attempts++
+		cancel() // cancel after the first failing attempt
+		return fakeTxKillerError()
+	}
+	m := newTestLaneManager(1, commit)
+	ctrl := newFakeLaneController(8)
+	buf := []laneChange{{seq: 1, change: ir.Insert{Schema: "ks", Table: "t", Row: ir.Row{"id": int64(1)}}}}
+
+	if err := m.applyLaneBatch(ctx, ctrl, buf); err == nil {
+		t.Fatal("applyLaneBatch = nil; want an error after ctx cancel")
+	}
+	if attempts != 1 {
+		t.Errorf("attempts = %d; want 1 (ctx cancel must stop the retry loop)", attempts)
 	}
 }
 

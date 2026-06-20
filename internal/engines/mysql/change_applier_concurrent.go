@@ -73,6 +73,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -80,8 +81,8 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"time"
 
-	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -463,6 +464,38 @@ func (a *ChangeApplier) invalidateMetadataCaches(qn string) {
 // checkpoint, so on a transactional stream the real cadence is finer.
 const checkpointEveryChanges = 2000
 
+// maxInLaneRetries bounds the in-lane shrink-and-retry loop (ADR-0104
+// graduation): a lane re-applies the SAME buffered batch when the commit
+// fails with a retriable error (the AIMD controller, if present, has
+// already shrunk the next read, but the retry re-applies the current buf
+// at its current size — idempotently, ADR-0010). The cap exists so a
+// target that tx-kills even at batch-size-1 (the controller floor)
+// eventually FAILS THE RUN LOUDLY (→ ctx cancel → the streamer's
+// warm-resume re-streams from the last durable boundary) rather than
+// spinning forever. 10 attempts is generous: with AIMD halving on each
+// tx-killer, a ceiling-sized batch reaches the floor of 1 in ~log2(ceil)
+// attempts, so 10 covers ceilings up to ~1000 while still terminating a
+// genuinely un-committable batch.
+const maxInLaneRetries = 10
+
+// laneCommitHookForTest, when non-nil, is copied onto every
+// concurrentApplyManager's laneCommitHook so integration tests can force a
+// deterministic lane-commit failure (the in-lane retry / tx-killer-convergence
+// pin). Production leaves it nil — the apply path is byte-identical. Set only
+// by single-test fixtures (set then reset in the same test), so no concurrent
+// mutation across tests.
+var laneCommitHookForTest func(buf []laneChange) error
+
+// laneChange is the {seq, change} envelope the coordinator pushes onto a
+// lane's feed. Pairing the source sequence with its change on one channel
+// is the FIFO-alignment fix: the lane reads the seq and the change
+// together, so markCommitted(seq) can never drift out of step with the
+// change it accounts for.
+type laneChange struct {
+	seq    uint64
+	change ir.Change
+}
+
 // concurrentApplyManager is the ADR-0104 key-hash concurrent apply
 // coordinator. The single coordinator goroutine (the one running
 // [ChangeApplier.applyBatchConcurrent]) reads the merged change stream in
@@ -483,8 +516,21 @@ type concurrentApplyManager struct {
 	router   laneRouter
 	frontier *checkpointFrontier
 
-	laneIn  []chan ir.Change // per-lane change feed (coordinator → lane)
-	laneSeq []chan uint64    // per-lane seq FIFO, pushed before each change
+	// laneIn is the per-lane change feed (coordinator → lane). Each element
+	// is a {seq, change} envelope so a lane reads the sequence and its change
+	// inherently paired — there is no separate seq channel to keep
+	// FIFO-aligned (the prior two-channel design was fragile: a lane that read
+	// N changes had to trust N seqs were queued in lock-step on a sibling
+	// channel; the envelope removes that coupling).
+	laneIn []chan laneChange
+
+	// laneControllers are the per-lane AIMD controllers (one per lane, in
+	// lane-index order), copied from the applier at construction. A nil slice
+	// (or a nil element) makes that lane run at the static maxBatchSize with
+	// bounded in-lane retry but no adaptive sizing. Each lane drives its own
+	// controller from its single goroutine, so a tx-killer shrink stays local
+	// to the affected lane. See laneApplyLoop.
+	laneControllers []ir.BatchSizeController
 
 	nextSeq         uint64 // coordinator-owned monotonic sequence
 	sinceCheckpoint int    // routed changes since the last checkpoint
@@ -507,6 +553,21 @@ type concurrentApplyManager struct {
 	wg       sync.WaitGroup
 	errMu    sync.Mutex
 	firstErr error
+
+	// laneCommitHook, when non-nil, is invoked just before a lane's commit
+	// with the batch about to commit; a non-nil return forces the commit to
+	// fail (rolled back), driving the in-lane retry path deterministically.
+	// Test-only seam (the lane analogue of the serial path's removed
+	// pipelineTestCommitHook); nil in production. Wired by the integration
+	// pins, which run a single lane, so no cross-goroutine access concern.
+	laneCommitHook func(buf []laneChange) error
+
+	// commitBatchFn is the lane-batch commit seam: production uses
+	// [commitLaneBatch] (a real lane transaction). Unit tests substitute a
+	// no-DB fake so the in-lane shrink-and-retry / markCommitted ordering can
+	// be pinned deterministically without testcontainers. Defaults to
+	// commitLaneBatch in [run]; nil only transiently before that.
+	commitBatchFn func(ctx context.Context, buf []laneChange) error
 }
 
 // applyBatchConcurrent is the ADR-0104 concurrent key-hash apply entry,
@@ -528,26 +589,26 @@ func (a *ChangeApplier) applyBatchConcurrent(ctx context.Context, streamID strin
 	laneDB.SetMaxIdleConns(lanes)
 
 	m := &concurrentApplyManager{
-		a:            a,
-		streamID:     streamID,
-		maxBatchSize: maxBatchSize,
-		lanes:        lanes,
-		laneDB:       laneDB,
-		router:       newLaneRouter(lanes),
-		frontier:     newCheckpointFrontier(),
-		laneIn:       make([]chan ir.Change, lanes),
-		laneSeq:      make([]chan uint64, lanes),
+		a:               a,
+		streamID:        streamID,
+		maxBatchSize:    maxBatchSize,
+		lanes:           lanes,
+		laneDB:          laneDB,
+		router:          newLaneRouter(lanes),
+		frontier:        newCheckpointFrontier(),
+		laneIn:          make([]chan laneChange, lanes),
+		laneControllers: a.laneControllers,
+		laneCommitHook:  laneCommitHookForTest, // nil in production
 	}
 	// Buffer each lane a batch's worth so the coordinator's routing isn't
 	// gated on a lane's per-change commit latency (the whole point — lanes
-	// overlap their cross-region commit RTTs). The seq FIFO matches.
+	// overlap their cross-region commit RTTs).
 	buf := maxBatchSize
 	if buf < 1 {
 		buf = 1
 	}
 	for i := range m.laneIn {
-		m.laneIn[i] = make(chan ir.Change, buf)
-		m.laneSeq[i] = make(chan uint64, buf)
+		m.laneIn[i] = make(chan laneChange, buf)
 	}
 	return m.run(ctx, changes)
 }
@@ -557,9 +618,13 @@ func (m *concurrentApplyManager) run(ctx context.Context, changes <-chan ir.Chan
 	m.cancel = cancel
 	defer cancel()
 
+	if m.commitBatchFn == nil {
+		m.commitBatchFn = m.commitLaneBatch
+	}
+
 	m.wg.Add(m.lanes)
 	for i := 0; i < m.lanes; i++ {
-		go m.laneLoop(ctx, i)
+		go m.laneApplyLoop(ctx, i)
 	}
 	slog.InfoContext(ctx,
 		"mysql: applier: concurrent key-hash CDC apply engaged — routing row changes to W in-order "+
@@ -668,15 +733,12 @@ func (m *concurrentApplyManager) routeRow(ctx context.Context, seq uint64, c ir.
 		return m.barrier(ctx, seq, c)
 	}
 	lane := m.router.laneFor(qualifiedName(routed, table), vals)
-	// Push the seq BEFORE the change so the lane, after committing N
-	// changes, always finds N seqs waiting (the FIFO-alignment invariant).
+	// Push the {seq, change} envelope so the lane reads the sequence and its
+	// change inherently paired (the FIFO-alignment fix — no sibling seq
+	// channel to drift out of step). The select honours ctx cancel so a
+	// stalled lane during shutdown doesn't wedge the coordinator.
 	select {
-	case m.laneSeq[lane] <- seq:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-	select {
-	case m.laneIn[lane] <- c:
+	case m.laneIn[lane] <- laneChange{seq: seq, change: c}:
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -718,34 +780,248 @@ func (m *concurrentApplyManager) barrier(ctx context.Context, seq uint64, c ir.C
 	return nil
 }
 
-// laneLoop runs one lane: repeatedly apply a batch of its routed changes
-// (reusing the shared batch loop, so AIMD-free static batching + byte cap +
-// the Bug-56 watchdog all apply) and, after each successful commit, pop the
-// committed changes' sequences and advance the frontier. A lane writes NO
-// position (WritePosition is a no-op in laneBatchConfig); the coordinator
-// owns the merged position. Any error stops the whole run.
-func (m *concurrentApplyManager) laneLoop(ctx context.Context, i int) {
+// laneApplyLoop runs one lane (ADR-0104 graduation): it reads a batch of
+// the lane's routed {seq, change} envelopes, applies them on the lane's
+// dedicated backend in one target transaction, and — ONLY after that
+// transaction durably commits — advances the contiguous frontier past each
+// committed seq. It owns per-lane AIMD sizing (its own controller) AND the
+// in-lane shrink-and-retry that graduates --apply-concurrency out of
+// preview: a retriable commit failure (a Vitess tx-killer, a transient)
+// re-applies the SAME buffered batch idempotently (ADR-0010) at the
+// controller's freshly-shrunk size, so a loaded cross-region target
+// converges in-lane instead of dropping the whole run on the first abort.
+//
+// A lane writes NO position — the coordinator's seq-frontier owns the
+// merged []shardGtid resume point (the ADR-0104 position relaxation). The
+// lane never sees keyless / schema / Tx-boundary events (the coordinator's
+// routing/barrier handles those), so this loop is deliberately lean: no
+// keyless guard, no schema handling, no Tx-commit flush, no applyOne.
+//
+// ## Exactly-once invariants (do not reorder — the review focus)
+//
+//   - markCommitted(seq) fires ONLY after the lane's target transaction
+//     durably commits. A retriable retry re-applies the SAME buf and does
+//     NOT advance any seq until a commit succeeds, so the frontier — and
+//     thus the persisted resume position — only ever passes durable work.
+//   - Value encoding is byte-identical to the serial path: each change is
+//     redacted + shard-stamped (m.a.redactChange + m.a.stampShardChange, in
+//     the SAME order RunOneBatch uses) then dispatched via the SAME
+//     m.a.dispatch. In-lane retry changes only WHETHER/WHEN a batch is
+//     re-applied, never HOW a value is encoded.
+//   - A genuinely un-committable batch (the target tx-kills even at the
+//     controller floor of 1) fails the run LOUDLY after maxInLaneRetries —
+//     ctx cancel → warm-resume — rather than looping forever.
+func (m *concurrentApplyManager) laneApplyLoop(ctx context.Context, i int) {
 	defer m.wg.Done()
-	cfg := m.a.laneBatchConfig(m.laneDB)
+	var ctrl ir.BatchSizeController
+	if i < len(m.laneControllers) {
+		ctrl = m.laneControllers[i]
+	}
 	for {
-		n, _, closed, err := appliershared.RunOneBatch(ctx, cfg, m.streamID, m.laneIn[i], m.maxBatchSize)
+		size := m.maxBatchSize
+		if ctrl != nil {
+			size = ctrl.NextBatchSize()
+		}
+		buf, closed, err := m.readLaneBatch(ctx, i, size)
 		if err != nil {
+			// Only ctx cancellation reaches here (the read has no other
+			// failure mode); the coordinator already owns the run error.
+			return
+		}
+		if len(buf) == 0 {
+			if closed {
+				return
+			}
+			continue
+		}
+		if err := m.applyLaneBatch(ctx, ctrl, buf); err != nil {
 			m.recordErr(err)
 			m.cancel()
 			return
-		}
-		for k := 0; k < n; k++ {
-			select {
-			case seq := <-m.laneSeq[i]:
-				m.frontier.markCommitted(seq)
-			case <-ctx.Done():
-				return
-			}
 		}
 		if closed {
 			return
 		}
 	}
+}
+
+// readLaneBatch reads up to `size` {seq, change} envelopes from lane i's
+// feed into a fresh slice, returning early when: the channel closes
+// (closed=true; the caller drains+returns once buf is empty), the running
+// ApproximateChangeBytes total reaches the applier's byte cap (ADR-0028 —
+// the same cap the serial path enforces), the idle-flush grace elapses with
+// a partial buffer (so the frontier/position stays current on a quiet
+// lane — item 18 Fix B), or ctx is cancelled. A non-nil error is ONLY
+// ctx.Err(); the read itself cannot otherwise fail.
+func (m *concurrentApplyManager) readLaneBatch(ctx context.Context, i, size int) (buf []laneChange, closed bool, err error) {
+	if size < 1 {
+		size = 1
+	}
+	byteCap := m.a.maxBufferBytes
+	if byteCap <= 0 {
+		byteCap = defaultMaxBufferBytes
+	}
+	var batchBytes int64
+	// The idle timer is created only after the first envelope lands, so a
+	// quiet lane blocks indefinitely on the read (no spin) until work or
+	// shutdown arrives, then flushes a partial batch within the grace.
+	var idle *time.Timer
+	defer func() {
+		if idle != nil {
+			idle.Stop()
+		}
+	}()
+	for len(buf) < size {
+		var idleC <-chan time.Time
+		if idle != nil {
+			idleC = idle.C
+		}
+		select {
+		case lc, ok := <-m.laneIn[i]:
+			if !ok {
+				return buf, true, nil
+			}
+			buf = append(buf, lc)
+			batchBytes += ir.ApproximateChangeBytes(lc.change)
+			if batchBytes >= byteCap {
+				return buf, false, nil
+			}
+			if idle == nil {
+				idle = time.NewTimer(defaultIdleFlushPeriod)
+			} else {
+				resetLaneIdleTimer(idle)
+			}
+		case <-idleC:
+			return buf, false, nil
+		case <-ctx.Done():
+			return buf, false, ctx.Err()
+		}
+	}
+	return buf, false, nil
+}
+
+// applyLaneBatch applies one buffered batch on the lane's dedicated
+// backend with in-lane shrink-and-retry, advancing the frontier past every
+// committed seq ONLY after a durable commit. See laneApplyLoop's invariant
+// block for the exactly-once argument; this is its mechanism.
+func (m *concurrentApplyManager) applyLaneBatch(ctx context.Context, ctrl ir.BatchSizeController, buf []laneChange) error {
+	for attempt := 0; ; attempt++ {
+		start := time.Now()
+		rawErr := m.commitBatchFn(ctx, buf)
+		latency := time.Since(start)
+		// Classify ONCE: the controller's tx-killer / retriable MD logic and
+		// the retry predicate both inspect the engine-classified error (it is
+		// the wrapper that carries the TransactionKilled() / Retriable()
+		// surfaces — a raw *MySQLError does not). Observing the classified
+		// error is what makes a Vitess tx-killer abort drive the MD shrink.
+		err := classifyApplierError(rawErr)
+		// Feed the controller (if any) so it adapts: a tx-killer shrinks the
+		// NEXT read immediately, a slow p95 drives the latency MD, a clean
+		// fast commit rides AI back up — each lane independently.
+		if ctrl != nil {
+			ctrl.ObserveBatch(ctx, latency, len(buf), err)
+		}
+		if rawErr == nil {
+			// ADVANCE ONLY ON DURABLE COMMIT: the batch is now durable, so
+			// every envelope's seq is safe to report to the contiguous
+			// frontier (which the coordinator turns into the resume point).
+			for _, e := range buf {
+				m.frontier.markCommitted(e.seq)
+			}
+			return nil
+		}
+		// Retriable + budget remaining + not cancelled → re-apply the SAME
+		// buf. The controller (if present) already shrank the next read; the
+		// retry re-applies this buf idempotently (ADR-0010 UPSERT /
+		// zero-rows-tolerant), so a seq still advances only on durable work.
+		if isApplierErrorRetriable(rawErr) && ctx.Err() == nil && attempt < maxInLaneRetries {
+			slog.WarnContext(ctx,
+				"mysql: applier: concurrent lane batch retriable failure — re-applying same batch (idempotent) after controller shrink",
+				slog.Int("attempt", attempt+1),
+				slog.Int("max_attempts", maxInLaneRetries),
+				slog.Int("rows", len(buf)),
+				slog.String("err", err.Error()))
+			continue
+		}
+		// Fatal or retry budget exhausted: surface loudly. The run cancels,
+		// the persisted position still names only the last fully-durable
+		// boundary, and warm-resume re-streams + idempotently re-applies the
+		// remainder. `err` is already the engine-classified value, so it keeps
+		// the retriable/terminal shape for the streamer's ADR-0038 retry loop
+		// (a budget-exhausted tx-killer stays retriable → warm-resume).
+		return err
+	}
+}
+
+// commitLaneBatch dispatches every change in buf onto a single lane
+// transaction and commits it. Redaction + shard-stamp happen FIRST, in the
+// SAME order the serial RunOneBatch path uses, so value encoding is
+// byte-identical; the lane writes NO position (the coordinator's frontier
+// owns it). Returns the raw (unclassified) error so the caller's retry
+// predicate can inspect it; on any failure the tx is rolled back.
+//
+// The *sql.Tx is rolled back on every error path and committed via
+// commitWithTimeout on success; sqlclosecheck can't track that
+// commit-or-rollback discipline across the dispatch loop, so it's suppressed.
+//
+//nolint:sqlclosecheck
+func (m *concurrentApplyManager) commitLaneBatch(ctx context.Context, buf []laneChange) error {
+	tx, err := m.laneDB.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("mysql: applier: lane begin tx: %w", err)
+	}
+	for _, e := range buf {
+		if err := m.a.redactChange(ctx, e.change); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("mysql: applier: redact: %w", err)
+		}
+		m.a.stampShardChange(e.change)
+		if err := m.a.dispatch(ctx, tx, m.streamID, e.change); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	// Test seam: force a commit-path failure deterministically (the lane
+	// analogue of the serial path's removed pipelineTestCommitHook). nil in
+	// production. Returns the error to take the same rollback+retry path a
+	// real commit failure would.
+	if m.laneCommitHook != nil {
+		if herr := m.laneCommitHook(buf); herr != nil {
+			_ = tx.Rollback()
+			return herr
+		}
+	}
+	if err := m.a.commitWithTimeout(tx); err != nil {
+		return fmt.Errorf("mysql: applier: lane commit: %w", err)
+	}
+	return nil
+}
+
+// resetLaneIdleTimer re-arms the idle-flush timer using the
+// stop-drain-reset idiom (same as appliershared.resetIdleTimer): a stale
+// tick is drained so the reset arms a clean grace window rather than
+// firing instantly on the next read.
+func resetLaneIdleTimer(idle *time.Timer) {
+	if !idle.Stop() {
+		select {
+		case <-idle.C:
+		default:
+		}
+	}
+	idle.Reset(defaultIdleFlushPeriod)
+}
+
+// isApplierErrorRetriable reports whether the raw lane error is one the
+// ADR-0038 streamer retry loop would treat as transient. It REUSES the
+// engine's single source of truth — [classifyApplierError] — rather than
+// re-deriving the MySQL/Vitess transient set: classify the raw error, then
+// check the same [ir.RetriableError] surface the streamer's
+// classifyRetriable inspects. A Vitess tx-killer abort is retriable here
+// (it satisfies RetriableError), which is exactly what makes the in-lane
+// shrink-and-retry converge instead of dropping the run.
+func isApplierErrorRetriable(err error) bool {
+	var re ir.RetriableError
+	return errors.As(classifyApplierError(err), &re) && re.Retriable()
 }
 
 // maybeCheckpoint persists a checkpoint once enough changes have been
@@ -803,46 +1079,6 @@ func (m *concurrentApplyManager) getErr() error {
 	m.errMu.Lock()
 	defer m.errMu.Unlock()
 	return m.firstErr
-}
-
-// laneBatchConfig builds the shared-batch-loop seam for one lane: serial
-// in-order dispatch+commit on the lane's dedicated pool, the SAME builders
-// / codec / redaction / shard-stamp / keyless-guard the serial path uses,
-// but with NO position write (the coordinator owns the merged position) and
-// NO AIMD observer (lanes use static batch sizing in this first cut; per-
-// lane AIMD + tx-killer convergence is a tracked follow-up — a tx-killer
-// abort on a lane currently stops the run and warm-resume recovers).
-func (a *ChangeApplier) laneBatchConfig(laneDB *sql.DB) *appliershared.BatchConfig {
-	byteCap := a.maxBufferBytes
-	if byteCap <= 0 {
-		byteCap = defaultMaxBufferBytes
-	}
-	return &appliershared.BatchConfig{
-		EngineName:       "mysql",
-		TransactionalDDL: false,
-		ByteCap:          byteCap,
-		BeginTx: func(ctx context.Context) (appliershared.BatchTx, error) {
-			tx, err := laneDB.BeginTx(ctx, nil)
-			if err != nil {
-				return nil, fmt.Errorf("mysql: applier: lane begin tx: %w", err)
-			}
-			return tx, nil
-		},
-		Dispatch: func(ctx context.Context, tx appliershared.BatchTx, streamID string, c ir.Change) error {
-			return a.dispatch(ctx, tx.(*sql.Tx), streamID, c)
-		},
-		ApplyOne:   a.applyOne,
-		Redact:     a.redactChange,
-		StampShard: a.stampShardChange,
-		Classify:   classifyApplierError,
-		// Lanes write NO position — the coordinator's frontier checkpoint
-		// owns the merged []shardGtid resume point (ADR-0104 relaxation).
-		WritePosition: func(_ context.Context, _ appliershared.BatchTx, _, _ string) error { return nil },
-		Commit:        func(tx appliershared.BatchTx) error { return a.commitWithTimeout(tx.(*sql.Tx)) },
-		// Inert on lanes (keyless changes take the barrier path, never a
-		// lane), wired for defensive parity with the serial config.
-		IsKeylessTable: a.isKeylessInsert,
-	}
 }
 
 // rowChangeSchemaTable returns the source schema + table of a row-bearing

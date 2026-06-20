@@ -104,3 +104,44 @@ type BatchSizeProviderSetter interface {
 type BatchObserverSetter interface {
 	SetBatchObserver(o BatchObserver)
 }
+
+// BatchSizeController is one AIMD controller's full surface — both the
+// batch-size provider and the per-batch observer — bundled so a single
+// value can drive ONE apply lane's adaptive sizing end to end. The
+// [appliercontrol.Controller] satisfies it by construction (it
+// implements both halves already).
+//
+// It exists for the ADR-0104 concurrent key-hash apply path
+// ([LaneAIMDSetter]): each of the W in-order lanes owns its OWN
+// controller, consulting NextBatchSize before reading a batch and
+// feeding ObserveBatch its commit outcome — so a tx-killer on a slow
+// lane shrinks only that lane, while the other lanes keep riding at
+// their own sizes. The serial path keeps the separate
+// [BatchSizeProviderSetter] / [BatchObserverSetter] wiring (one
+// controller); this is the per-lane bundle.
+type BatchSizeController interface {
+	BatchSizeProvider
+	BatchObserver
+}
+
+// LaneAIMDSetter is the optional surface a [ChangeApplier] implements to
+// receive the per-lane AIMD controllers for the ADR-0104 concurrent
+// key-hash apply path: W controllers, one per apply lane, in lane-index
+// order (controllers[i] drives lane i). The streamer builds them only
+// when --apply-concurrency W > 1 and the applier implements this surface;
+// each controller carries the same Config as the serial single-controller
+// path (Floor 1, Ceiling --apply-batch-size, the resolved target
+// latency) but its OWN OnShrink, so per-lane shrink decisions stay
+// independent.
+//
+// Each lane drives its controller from a SINGLE goroutine
+// (NextBatchSize before a read, ObserveBatch after a commit), so no two
+// goroutines touch the same controller — but the [appliercontrol.Controller]
+// is concurrency-safe regardless (the metrics scraper reads Snapshot).
+//
+// Engines that don't implement it (Postgres — it uses ADR-0092's
+// within-transaction statement pipelining, not key-hash lanes) inherit
+// the static per-lane batch size. Only the MySQL target implements it.
+type LaneAIMDSetter interface {
+	SetLaneAIMDControllers(controllers []BatchSizeController)
+}
