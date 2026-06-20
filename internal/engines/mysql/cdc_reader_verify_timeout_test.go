@@ -226,6 +226,12 @@ func TestSourceUnresponsiveDiagnosis_NarrowsByLivenessProbe(t *testing.T) {
 			if !strings.Contains(err.Error(), tc.wantPhrase) {
 				t.Fatalf("diagnosis did not narrow to %q; got: %v", tc.wantPhrase, err)
 			}
+			// All three binlog/disk-pressure causes name the EXACT safe purge
+			// target derived from the resume file (file/pos mode) — the
+			// operator gets the command, not a generic "consider PURGE".
+			if !strings.Contains(err.Error(), "PURGE BINARY LOGS TO 'binlog.000123'") {
+				t.Fatalf("diagnosis did not include the exact safe purge command; got: %v", err)
+			}
 			// Still retriable, still not a destructive cold-start trigger.
 			var re ir.RetriableError
 			if !errors.As(err, &re) || !re.Retriable() {
@@ -235,6 +241,31 @@ func TestSourceUnresponsiveDiagnosis_NarrowsByLivenessProbe(t *testing.T) {
 				t.Fatalf("diagnosis path must not be ErrPositionInvalid: %v", err)
 			}
 		})
+	}
+}
+
+// TestSafePurgeHint pins the exact, safe purge recommendation derived from the
+// resume position: file/pos names PURGE BINARY LOGS TO '<resume-file>' (which
+// keeps the resume file) + the shared-infra caveat; GTID gives the constraint,
+// not a file; an empty file yields no hint.
+func TestSafePurgeHint(t *testing.T) {
+	t.Parallel()
+	filePos := safePurgeHint(binlogPos{Mode: positionModeFilePos, File: "binlog.003186"})
+	if !strings.Contains(filePos, "PURGE BINARY LOGS TO 'binlog.003186'") {
+		t.Errorf("file/pos hint must name the exact safe target; got: %q", filePos)
+	}
+	if !strings.Contains(filePos, "OLDER") || !strings.Contains(filePos, "other replica") {
+		t.Errorf("file/pos hint must explain it deletes only older logs + the shared-infra caveat; got: %q", filePos)
+	}
+	gtid := safePurgeHint(binlogPos{Mode: positionModeGTID, GTIDSet: "uuid:1-100"})
+	if strings.Contains(gtid, "PURGE BINARY LOGS TO '") {
+		t.Errorf("GTID mode has no single resume file — must not name a TO '<file>' target; got: %q", gtid)
+	}
+	if !strings.Contains(gtid, "GTID") {
+		t.Errorf("GTID hint must state the GTID-set constraint; got: %q", gtid)
+	}
+	if h := safePurgeHint(binlogPos{Mode: positionModeFilePos, File: ""}); h != "" {
+		t.Errorf("empty resume file must yield no hint; got: %q", h)
 	}
 }
 

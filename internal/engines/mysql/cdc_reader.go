@@ -1100,7 +1100,7 @@ func (r *CDCReader) verifyPositionResumable(ctx context.Context, p binlogPos) er
 		// retries, rather than hanging forever OR being mistaken for a
 		// purged position (which would cold-start). The retry draws a fresh
 		// connection from the pool, leaving the wedged one behind.
-		diag := r.sourceUnresponsiveDiagnosis(ctx)
+		diag := r.sourceUnresponsiveDiagnosis(ctx, p)
 		return classifyApplierError(fmt.Errorf(
 			"mysql: resume-position verify exceeded %s (%s); reconnecting: %w",
 			timeout, diag, err,
@@ -1167,7 +1167,15 @@ const sourceLivenessProbeTimeout = 5 * time.Second
 // It is itself bounded ([sourceLivenessProbeTimeout]) so it can never hang.
 // Pure diagnosis: it changes only the error TEXT, never the retry/position
 // decision.
-func (r *CDCReader) sourceUnresponsiveDiagnosis(ctx context.Context) string {
+//
+// For the binlog/disk-pressure causes it also appends an EXACT, safe remediation
+// derived from the resume position p (see [safePurgeHint]) — e.g. the precise
+// `PURGE BINARY LOGS TO '<resume-file>'` that frees space without losing this
+// stream's resume point — so the operator gets the command, not just "consider
+// PURGE BINARY LOGS". sluice surfaces the command; it never runs it (purging
+// source binlogs is destructive, affects shared infra the tool can't see, and
+// needs an elevated source privilege sluice deliberately does not require).
+func (r *CDCReader) sourceUnresponsiveDiagnosis(ctx context.Context, p binlogPos) string {
 	probeTimeout := r.posVerifyProbeTimeout
 	if probeTimeout <= 0 {
 		probeTimeout = sourceLivenessProbeTimeout
@@ -1180,16 +1188,46 @@ func (r *CDCReader) sourceUnresponsiveDiagnosis(ctx context.Context) string {
 	case err == nil:
 		return "a SELECT 1 liveness probe succeeded, so the source server is up but its BINLOG subsystem " +
 			"specifically is slow — commonly an over-large binlog file count or a slow/full binlog volume; " +
-			"check the source's binlog disk and binlog_expire_logs_seconds (consider PURGE BINARY LOGS)"
+			"check the source's binlog disk and binlog_expire_logs_seconds." + safePurgeHint(p)
 	case isDiskFullSignal(err):
 		return "a SELECT 1 liveness probe returned a disk-full signal — the source host appears to be OUT OF " +
-			"DISK SPACE; free space on the source (e.g. PURGE BINARY LOGS / lower binlog_expire_logs_seconds) before resuming"
+			"DISK SPACE; free space on the source before resuming." + safePurgeHint(p)
 	case errors.Is(err, context.DeadlineExceeded):
 		return "a SELECT 1 liveness probe ALSO timed out, so the source server is globally unresponsive — " +
 			"disk exhaustion (a full datadir blocks MySQL writes), severe overload, or the server is down; " +
-			"check the source host's disk and load"
+			"check the source host's disk and load." + safePurgeHint(p)
 	default:
 		return fmt.Sprintf("a SELECT 1 liveness probe failed (%v) — the source connection is unhealthy", err)
+	}
+}
+
+// safePurgeHint returns an EXACT, safe source-side binlog-purge recommendation
+// derived from the resume position, for the diagnosis branches that point at
+// binlog/disk pressure. In file/pos mode it names the precise
+// `PURGE BINARY LOGS TO '<resume-file>'` — MySQL deletes only logs OLDER than
+// the named file and KEEPS that file, so the resume (which reads from it) is
+// preserved; sluice already knows the resume file, so it can hand the operator
+// the exact command instead of a generic "consider PURGE BINARY LOGS". In GTID
+// mode the safe boundary is a GTID set, not a single file, so it states the
+// constraint rather than a command. ALWAYS carries the shared-infra caveat:
+// sluice only knows ITS OWN resume needs — other replicas / PITR backups may
+// still need the older logs, so the operator must confirm before purging. An
+// empty resume file (defensive) yields no hint.
+func safePurgeHint(p binlogPos) string {
+	switch p.Mode {
+	case positionModeFilePos:
+		if p.File == "" {
+			return ""
+		}
+		return fmt.Sprintf(" To free space WITHOUT losing this stream's resume point, run on the source: "+
+			"PURGE BINARY LOGS TO '%s'; — this deletes only logs OLDER than the resume file and keeps it; "+
+			"first confirm no other replica or backup still needs those older logs (sluice cannot see them).", p.File)
+	case positionModeGTID:
+		return " To free space safely, purge so that NO GTID in this stream's resume set is removed " +
+			"(e.g. PURGE BINARY LOGS BEFORE a timestamp older than the resume), and confirm no other " +
+			"replica or backup needs those logs (sluice cannot see them)."
+	default:
+		return ""
 	}
 }
 
