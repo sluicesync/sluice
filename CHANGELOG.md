@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.87] - 2026-06-20
+
+### Fixed
+
+- **MySQL CDC now supports `binlog_transaction_compression=ON` — previously, compressed transactions were silently not applied (item 28).** When a MySQL 8.0.20+ source has binlog transaction compression enabled, each transaction is written to the binlog as a single `TRANSACTION_PAYLOAD_EVENT` (a ZSTD container wrapping the transaction's `TABLE_MAP` + row events + commit). sluice's binlog event dispatch had no case for that event type, so a compressed transaction fell through to the ignored-events default: nothing was applied to the target, the resume position never advanced, and there was no error — only a soft "no row events received" warning while heartbeats kept the stream looking alive. On a source with compression enabled (a common setting for WAN replication / disk savings), continuous sync silently replicated nothing — a loud-failure-discipline violation. The fix unpacks the payload event, dispatching each decoded inner event (TABLE_MAP, INSERT/UPDATE/DELETE rows, commit) through the normal path. The one subtlety is position tracking: the inner events carry synthetic binlog positions (the server zeroes them when compressing), so each is stamped with the *outer* payload event's position — the real transaction boundary — which keeps the persisted file/pos resume point payload-aligned (a warm-resume restarts at the next transaction, never mid-payload; mid-payload misalignment is what surfaces downstream as "no corresponding table map event"). GTID-mode resume is unaffected (it tracks the GTID set, which rides the separate GTID event preceding each payload). Validated end-to-end against a real compression-enabled MySQL 8.0 source: compressed INSERT/UPDATE/DELETE apply exactly-once in steady state, and a warm-resume from a compressed-transaction position drains the backlog correctly; pinned by an integration test verified to fail without the fix and pass with it. (Found while investigating a large-scale-program resume incident; the earlier "no corresponding table map event" symptom was the same missing-support gap surfacing under a disk-full-confounded source.)
+
 ## [0.99.86] - 2026-06-20
 
 ### Added
