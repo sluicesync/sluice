@@ -1,0 +1,363 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
+package postgres
+
+// # Postgres adapter for the concurrent key-hash CDC apply (ADR-0105)
+//
+// The engine-neutral correctness core (the key-hash router, the contiguous
+// checkpoint frontier, the lane orchestration with in-lane shrink-and-retry
+// and the lane-local read cap) lives in [internal/laneapply], shared with
+// the GA MySQL target (ADR-0104). This file is the Postgres side of the
+// [laneapply.LaneApplier] seam: the PK-metadata-driven routing decision, the
+// dedicated-backend lane commit (using the SERIAL dispatch on a *sql.Tx, so
+// value encoding is byte-identical to the ADR-0092 serial/pipelined apply
+// path), the position-checkpoint write, the barrier-path apply, and the
+// Postgres error classification (serialization 40001 / deadlock 40P01 →
+// retriable, the analog of MySQL's tx-killer).
+//
+// W=1 (or unset) is byte-identical to today's PG batch path. The position
+// relaxation, the dependent-row hazard, and the exactly-once invariants are
+// documented at the top of internal/laneapply/laneapply.go; PG inherits the
+// ADR-0104 contract verbatim (ADR-0105 "The position relaxation").
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+
+	"github.com/jackc/pgx/v5/stdlib"
+
+	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/laneapply"
+)
+
+// --- Guarded metadata-cache accessors (ADR-0105 concurrency safety) ---
+//
+// Every read/write of pkCache, colTypeCache, conflictKeyCache,
+// warnedKeyless and schemaDirtyTables funnels through these so the
+// concurrent key-hash lanes (which call dispatch from W goroutines) never
+// touch a map unguarded. The load-on-miss callers use the RLock-check →
+// unlock → DB-load → Lock-store pattern so a cache miss does NOT serialize
+// every lane on the DB round-trip; the double-store on a concurrent miss is
+// idempotent. The serial path takes the same lock (single-goroutine, so
+// uncontended).
+
+func (a *ChangeApplier) cachedPK(qn string) ([]string, bool) {
+	a.cacheMu.RLock()
+	defer a.cacheMu.RUnlock()
+	v, ok := a.pkCache[qn]
+	return v, ok
+}
+
+func (a *ChangeApplier) storePK(qn string, pk []string) {
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+	if a.pkCache == nil {
+		a.pkCache = make(map[string][]string)
+	}
+	a.pkCache[qn] = pk
+}
+
+func (a *ChangeApplier) cachedColTypes(qn string) (map[string]*ir.Column, bool) {
+	a.cacheMu.RLock()
+	defer a.cacheMu.RUnlock()
+	v, ok := a.colTypeCache[qn]
+	return v, ok
+}
+
+func (a *ChangeApplier) storeColTypes(qn string, cols map[string]*ir.Column) {
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+	if a.colTypeCache == nil {
+		a.colTypeCache = make(map[string]map[string]*ir.Column)
+	}
+	a.colTypeCache[qn] = cols
+}
+
+func (a *ChangeApplier) cachedConflictKey(qn string) ([]string, bool) {
+	a.cacheMu.RLock()
+	defer a.cacheMu.RUnlock()
+	v, ok := a.conflictKeyCache[qn]
+	return v, ok
+}
+
+func (a *ChangeApplier) storeConflictKey(qn string, key []string) {
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+	if a.conflictKeyCache == nil {
+		a.conflictKeyCache = make(map[string][]string)
+	}
+	a.conflictKeyCache[qn] = key
+}
+
+// tableSchemaDirty reports whether qn (a ROUTED qualified name) has crossed
+// a forwarded schema boundary in this applier's lifetime (ADR-0091 F7a GAP
+// #3). Read on every DML via execDMLArgs.
+func (a *ChangeApplier) tableSchemaDirty(qn string) bool {
+	a.cacheMu.RLock()
+	defer a.cacheMu.RUnlock()
+	return a.schemaDirtyTables[qn]
+}
+
+// markWarnedKeyless records that the keyless WARN has been emitted for qn
+// and reports whether THIS call was the one that recorded it — so the caller
+// logs the WARN exactly once even under concurrent lanes (the check-and-set
+// is atomic under the write lock).
+func (a *ChangeApplier) markWarnedKeyless(qn string) (firstTime bool) {
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+	if a.warnedKeyless == nil {
+		a.warnedKeyless = make(map[string]bool)
+	}
+	if a.warnedKeyless[qn] {
+		return false
+	}
+	a.warnedKeyless[qn] = true
+	return true
+}
+
+// invalidateMetadataCaches drops the per-table PK + column-type +
+// conflict-key cache entries for qn and marks it schema-dirty — the SAME set
+// of caches the serial schema-boundary invalidation
+// ([ChangeApplier.invalidateTargetCachesForBoundary]) drops, so lanes
+// re-probe the live post-DDL catalog on the next change. Guarded so a
+// barrier-path invalidation is safe against concurrent lane reads. PG has
+// MORE caches than the MySQL adapter drops (conflictKeyCache + the
+// schemaDirtyTables stamp), and all of them are handled here.
+func (a *ChangeApplier) invalidateMetadataCaches(qn string) {
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+	delete(a.colTypeCache, qn)
+	delete(a.pkCache, qn)
+	delete(a.conflictKeyCache, qn)
+	if a.schemaDirtyTables == nil {
+		a.schemaDirtyTables = make(map[string]bool)
+	}
+	a.schemaDirtyTables[qn] = true
+}
+
+// --- Concurrent apply: PG adapter for the laneapply seam (ADR-0105) ---
+
+// laneCommitHookForTest, when non-nil, is invoked by the lane adapter's
+// ApplyLaneBatch just before a lane's commit with the batch about to commit;
+// a non-nil return forces the commit to fail (rolled back), driving the
+// in-lane retry / serialization-abort-convergence integration pin
+// deterministically. Production leaves it nil — the apply path is
+// byte-identical. Set only by single-test fixtures (set then reset in the
+// same test), so no concurrent mutation across tests. Mirrors the MySQL
+// adapter's hook (change_applier_concurrent.go).
+var laneCommitHookForTest func(buf []laneChange) error
+
+// laneChange is the per-change envelope [laneCommitHookForTest] receives. The
+// orchestration owns its own [laneapply.LaneChange] (including the seq), so
+// this thin type survives only as the parameter shape the integration pin's
+// hook expects. The adapter fills `change`; the hook ignores its arg.
+type laneChange struct {
+	change ir.Change
+}
+
+// laneApplierAdapter is the Postgres implementation of
+// [laneapply.LaneApplier]. It carries the [ChangeApplier] (for
+// redact/stamp/dispatch/cache/position writes), the resolved streamID, the
+// dedicated lane pool (MaxOpenConns == lanes, registering the SAME geometry
+// codec the serial/pipelined pools use), and a copy of
+// [laneCommitHookForTest] captured at construction.
+type laneApplierAdapter struct {
+	a              *ChangeApplier
+	streamID       string
+	laneDB         *sql.DB
+	laneCommitHook func(buf []laneChange) error
+}
+
+// PKValuesForRouting decodes the row change's schema/table, loads the PK
+// columns, and returns the routed-qualified name + ordered PK values for
+// lane hashing. ok=false routes to the barrier path for: a non-row event, a
+// keyless/malformed change, OR a PK-changing update (a key migration whose
+// old/new effects must stay globally ordered) — exactly the cases the serial
+// path treats as global-order-sensitive. The route identity is the PRIMARY
+// KEY (matching MySQL), NOT the ON-CONFLICT conflict key: a no-PK-but-unique
+// table still routes by its (empty) PK → barrier, preserving the ADR-0089
+// at-least-once keyless guard. A PK-metadata lookup error is classified and
+// aborts the run.
+func (la *laneApplierAdapter) PKValuesForRouting(ctx context.Context, c ir.Change) (qualified string, pkVals []any, ok bool, err error) {
+	schema, table := laneapply.RowChangeSchemaTable(c)
+	routed := la.a.routedSchema(schema)
+	pkCols, perr := la.a.pkForRedact(ctx, routed, table)
+	if perr != nil {
+		return "", nil, false, classifyApplierError(perr)
+	}
+	vals, routable := laneapply.PKValuesFromRow(c, pkCols)
+	if !routable {
+		// Keyless / malformed → barrier (ADR-0089 at-least-once; never
+		// silently mis-routed).
+		return "", nil, false, nil
+	}
+	if u, isUpd := c.(ir.Update); isUpd && laneapply.PKChangedUpdate(u, pkCols) {
+		// PK-changing update → barrier so old-key/new-key effects stay
+		// globally ordered (they could hash to different lanes).
+		return "", nil, false, nil
+	}
+	return schemaTableKey(routed, table), vals, true, nil
+}
+
+// ApplyLaneBatch dispatches every change in batch onto a single lane
+// transaction and commits it. Redaction + shard-stamp happen FIRST, in the
+// SAME order the serial applyOne / RunOneBatch path uses, then the SERIAL
+// dispatch (on *sql.Tx — NOT the ADR-0092 pgx.Batch pipeline) runs, so value
+// encoding is byte-identical to the serial path. The F7 synchronous_commit
+// pin is applied exactly as the serial BeginTx does (ADR-0007 durability).
+// The lane writes NO position (the orchestrator's frontier owns it). Returns
+// len(batch) on success, the RAW (unclassified) error on failure so the
+// orchestrator's retry predicate can inspect it; on any failure the tx is
+// rolled back. The `lane` index is accepted for the seam contract but unused
+// by the adapter: the lane pool (MaxOpenConns == lanes) hands out one
+// backend per in-flight tx, so a pooled connection per concurrent lane
+// commit == one backend per lane in practice.
+//
+// The *sql.Tx is rolled back on every error path and committed via
+// commitWithTimeout on success; sqlclosecheck can't track that
+// commit-or-rollback discipline across the dispatch loop, so it's suppressed.
+//
+//nolint:sqlclosecheck
+func (la *laneApplierAdapter) ApplyLaneBatch(ctx context.Context, _ int, batch []ir.Change) (int, error) {
+	tx, err := la.laneDB.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("postgres: applier: lane begin tx: %w", err)
+	}
+	// F7: pin synchronous_commit on for the duration of this tx so a
+	// role/db-level default of `off` can't silently break ADR-0007's
+	// durability contract — identical to the serial BeginTx.
+	if err := la.a.forceSynchronousCommitOn(ctx, tx); err != nil {
+		_ = tx.Rollback()
+		return 0, err
+	}
+	for _, c := range batch {
+		if err := la.a.redactChange(ctx, c); err != nil {
+			_ = tx.Rollback()
+			return 0, fmt.Errorf("postgres: applier: redact: %w", err)
+		}
+		la.a.stampShardChange(c)
+		if err := la.a.dispatch(ctx, tx, la.streamID, c); err != nil {
+			_ = tx.Rollback()
+			return 0, err
+		}
+	}
+	// Test seam: force a commit-path failure deterministically (the lane
+	// analogue of forcing a PG serialization abort). nil in production.
+	if la.laneCommitHook != nil {
+		buf := make([]laneChange, len(batch))
+		for i, c := range batch {
+			buf[i] = laneChange{change: c}
+		}
+		if herr := la.laneCommitHook(buf); herr != nil {
+			_ = tx.Rollback()
+			return 0, herr
+		}
+	}
+	if err := la.a.commitWithTimeout(tx); err != nil {
+		return 0, fmt.Errorf("postgres: applier: lane commit: %w", err)
+	}
+	return len(batch), nil
+}
+
+// ClassifyError maps a raw lane error to the engine's classified error so the
+// orchestrator can derive retriability (the single source of truth — a PG
+// serialization (40001) / deadlock (40P01) abort satisfies
+// [ir.RetriableError], driving the in-lane shrink-and-retry).
+func (la *laneApplierAdapter) ClassifyError(err error) error {
+	return classifyApplierError(err)
+}
+
+// WriteCheckpoint persists the merged frontier position in its own
+// transaction on the coordinator's primary pool (the ADR-0104 position
+// relaxation). The orchestrator owns the frontier read + the seq-monotone
+// guard; this does only the durable write. The F7 synchronous_commit pin is
+// applied (the position is durable per ADR-0007's hardening), and each error
+// is classified exactly as the serial position write would be.
+func (la *laneApplierAdapter) WriteCheckpoint(ctx context.Context, pos ir.Position) error {
+	a := la.a
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return classifyApplierError(fmt.Errorf("postgres: applier: checkpoint begin: %w", err))
+	}
+	if err := a.forceSynchronousCommitOn(ctx, tx); err != nil {
+		_ = tx.Rollback()
+		return classifyApplierError(err)
+	}
+	posCtx, posCancel := a.execTimeoutCtx(ctx)
+	werr := writePositionTx(posCtx, tx, a.controlSchema, la.streamID, pos.Token, a.slotName, a.sourceFingerprint, a.targetSchema)
+	posCancel()
+	if werr != nil {
+		_ = tx.Rollback()
+		return classifyApplierError(fmt.Errorf("postgres: applier: checkpoint position write: %w", werr))
+	}
+	if err := a.commitWithTimeout(tx); err != nil {
+		return classifyApplierError(fmt.Errorf("postgres: applier: checkpoint commit: %w", err))
+	}
+	return nil
+}
+
+// ApplyBarrierChange applies one barrier-path change on the coordinator
+// backend via applyOne (which writes the barrier's position + data
+// atomically per ADR-0007, and owns the ADR-0049 active-schema
+// cache-after-commit update itself). The orchestrator additionally calls
+// InvalidateMetadataCaches on a SchemaSnapshot AFTER this returns, preserving
+// the serial apply-then-invalidate order.
+func (la *laneApplierAdapter) ApplyBarrierChange(ctx context.Context, c ir.Change) error {
+	return la.a.applyOne(ctx, la.streamID, c)
+}
+
+// InvalidateMetadataCaches drops the PK + column-type + conflict-key caches
+// (and marks the table schema-dirty) for the table a SchemaSnapshot named,
+// applying the same routedSchema + qualifier computation the serial barrier
+// path (invalidateTargetCachesForBoundary) used, so lanes re-probe on the
+// next change.
+func (la *laneApplierAdapter) InvalidateMetadataCaches(schema, table string) {
+	la.a.invalidateMetadataCaches(schemaTableKey(la.a.routedSchema(schema), table))
+}
+
+// applyBatchConcurrent is the ADR-0105 concurrent key-hash apply entry,
+// invoked from ApplyBatch when an operator wires --apply-concurrency (the
+// lane count W) > 1 and a dedicated pool can be opened. It owns the lane pool
+// for the call's lifetime, builds the PG [laneApplierAdapter], and drives the
+// engine-neutral [laneapply.Orchestrator]. On any lane or coordinator error
+// the whole run stops (ctx cancel + drain) and the error is returned; the
+// persisted position reflects only fully-durable work, so warm-resume
+// re-streams + idempotently re-applies the remainder (exactly-once for keyed
+// tables; the keyless at-least-once guarantee is unchanged because keyless
+// changes take the single-row barrier path).
+func (a *ChangeApplier) applyBatchConcurrent(ctx context.Context, streamID string, changes <-chan ir.Change, maxBatchSize, lanes int) error {
+	// CRITICAL: the lane pool MUST register the PostGIS geometry codec
+	// (afterConnectRegisterGeometry) exactly as the serial applier pool
+	// (engine.go OpenChangeApplier) and the pipelined pool (pipelinePool) do
+	// — otherwise a geometry column would silently mis-encode (TEXT-refused)
+	// on the lane path while passing on the serial path: a Bug-74-class
+	// codec-coverage trap. Same role + DSN as those pools.
+	laneDB, err := openDBAs(ctx, a.pipelineCfg, roleApplier, stdlib.OptionAfterConnect(afterConnectRegisterGeometry))
+	if err != nil {
+		return classifyApplierError(fmt.Errorf("postgres: applier: open concurrent lane pool: %w", err))
+	}
+	defer func() { _ = laneDB.Close() }()
+	laneDB.SetMaxOpenConns(lanes)
+	laneDB.SetMaxIdleConns(lanes)
+
+	byteCap := a.maxBufferBytes
+	if byteCap <= 0 {
+		byteCap = defaultMaxBufferBytes
+	}
+	adapter := &laneApplierAdapter{
+		a:              a,
+		streamID:       streamID,
+		laneDB:         laneDB,
+		laneCommitHook: laneCommitHookForTest, // nil in production
+	}
+	orch := laneapply.NewOrchestrator(laneapply.Config{
+		Lanes:           lanes,
+		MaxBatchSize:    maxBatchSize,
+		LaneControllers: a.laneControllers,
+		MaxBufferBytes:  byteCap,
+		IdleFlushPeriod: defaultIdleFlushPeriod,
+	}, adapter)
+	return orch.Run(ctx, changes)
+}

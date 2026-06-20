@@ -104,10 +104,12 @@ var (
 	_ ir.TableTruncator              = (*RowWriter)(nil)
 
 	// ChangeApplier optional surfaces.
+	_ ir.ApplyConcurrencySetter         = (*ChangeApplier)(nil)
 	_ ir.ApplyExecTimeoutSetter         = (*ChangeApplier)(nil)
 	_ ir.BatchObserverSetter            = (*ChangeApplier)(nil)
 	_ ir.BatchSizeProviderSetter        = (*ChangeApplier)(nil)
 	_ ir.BatchedChangeApplier           = (*ChangeApplier)(nil)
+	_ ir.LaneAIMDSetter                 = (*ChangeApplier)(nil)
 	_ ir.MaxBufferBytesSetter           = (*ChangeApplier)(nil)
 	_ ir.MultiDatabaseRouter            = (*ChangeApplier)(nil)
 	_ ir.PositionWriter                 = (*ChangeApplier)(nil)

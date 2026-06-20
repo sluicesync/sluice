@@ -145,20 +145,14 @@ func (a *ChangeApplier) cacheActiveSchemaAfterCommit(s ir.SchemaSnapshot) {
 // it before deleting (a cross-engine MySQL→PG snapshot carries
 // "source_db" but the DML, and the cache, live under "public").
 func (a *ChangeApplier) invalidateTargetCachesForBoundary(s ir.SchemaSnapshot) {
-	qn := schemaTableKey(a.routedSchema(s.Schema), s.Table)
-	delete(a.colTypeCache, qn)
-	delete(a.pkCache, qn)
-	delete(a.conflictKeyCache, qn)
-	// Mark the table schema-dirty so subsequent DML re-describes its
-	// parameter OIDs instead of reusing pgx's stale per-connection
-	// prepared-statement cache (the second half of the GAP #3 fix — the
-	// cache above busts sluice's own value-prep; this busts pgx's wire-
-	// level OID inference, which is keyed by the byte-identical SQL text
-	// and survives a colTypeCache reload).
-	if a.schemaDirtyTables == nil {
-		a.schemaDirtyTables = make(map[string]bool)
-	}
-	a.schemaDirtyTables[qn] = true
+	// Route through the cacheMu-guarded invalidator so a serial-path boundary
+	// invalidation is safe against concurrent lane reads (ADR-0105). It drops
+	// colType + pk + conflict-key for the routed qn AND marks it schema-dirty
+	// — the second half of the GAP #3 fix (the cache drop busts sluice's own
+	// value-prep; the schema-dirty stamp busts pgx's wire-level OID inference,
+	// which is keyed by the byte-identical SQL text and survives a
+	// colTypeCache reload).
+	a.invalidateMetadataCaches(schemaTableKey(a.routedSchema(s.Schema), s.Table))
 }
 
 // distinctSchemaTablesForStream returns the unique (schema, table)

@@ -21,7 +21,6 @@ package mysql
 // re-wrap, not a logic change).
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -156,7 +155,7 @@ type laneApplierAdapter struct {
 // old/new effects must stay globally ordered) — exactly the cases the GA
 // routeRow barriered. A PK-metadata lookup error is classified and aborts.
 func (la *laneApplierAdapter) PKValuesForRouting(ctx context.Context, c ir.Change) (qualified string, pkVals []any, ok bool, err error) {
-	schema, table := rowChangeSchemaTable(c)
+	schema, table := laneapply.RowChangeSchemaTable(c)
 	routed := la.a.routedSchema(schema)
 	pkCols, perr := la.a.pkForRedact(ctx, schema, table)
 	if perr != nil {
@@ -168,7 +167,7 @@ func (la *laneApplierAdapter) PKValuesForRouting(ctx context.Context, c ir.Chang
 		// silently mis-routed).
 		return "", nil, false, nil
 	}
-	if u, isUpd := c.(ir.Update); isUpd && pkChangedUpdate(u, pkCols) {
+	if u, isUpd := c.(ir.Update); isUpd && laneapply.PKChangedUpdate(u, pkCols) {
 		// PK-changing update → barrier so old-key/new-key effects stay
 		// globally ordered (they could hash to different lanes).
 		return "", nil, false, nil
@@ -316,52 +315,4 @@ func (a *ChangeApplier) applyBatchConcurrent(ctx context.Context, streamID strin
 		IdleFlushPeriod: defaultIdleFlushPeriod,
 	}, adapter)
 	return orch.Run(ctx, changes)
-}
-
-// rowChangeSchemaTable returns the source schema + table of a row-bearing
-// change (Insert/Update/Delete). Barrier-class events never reach here.
-func rowChangeSchemaTable(c ir.Change) (schema, table string) {
-	switch v := c.(type) {
-	case ir.Insert:
-		return v.Schema, v.Table
-	case ir.Update:
-		return v.Schema, v.Table
-	case ir.Delete:
-		return v.Schema, v.Table
-	}
-	return "", ""
-}
-
-// pkChangedUpdate reports whether an Update changes any primary-key column
-// value (Before vs After). A nil Before image (source without before-rows)
-// cannot be compared, so it returns false (route by the After key). Such
-// PK-changing updates are rare; the caller routes them through the barrier
-// path so the old-key and new-key effects stay globally ordered.
-func pkChangedUpdate(u ir.Update, pkCols []string) bool {
-	if u.Before == nil || u.After == nil {
-		return false
-	}
-	for _, col := range pkCols {
-		b, bok := u.Before[col]
-		a, aok := u.After[col]
-		if bok != aok || !valuesEqualForKey(b, a) {
-			return true
-		}
-	}
-	return false
-}
-
-// valuesEqualForKey compares two primary-key values for the PK-change
-// check. Byte slices ([]byte keys) need content comparison; everything else
-// is a comparable scalar the decode path produces, so == is correct.
-func valuesEqualForKey(a, b any) bool {
-	ab, aIsBytes := a.([]byte)
-	bb, bIsBytes := b.([]byte)
-	if aIsBytes || bIsBytes {
-		if !aIsBytes || !bIsBytes {
-			return false
-		}
-		return bytes.Equal(ab, bb)
-	}
-	return a == b
 }

@@ -338,8 +338,8 @@ func (a *ChangeApplier) dispatchPipelined(ctx context.Context, b *pgxBatchTx, st
 // so the keyless guard (isKeylessInsert) reads the same entry the serial
 // path would have populated.
 func (a *ChangeApplier) conflictKeyForPipelined(ctx context.Context, schema, table string) ([]string, error) {
-	qn := schema + "." + table
-	if cached, ok := a.conflictKeyCache[qn]; ok {
+	qn := schemaTableKey(schema, table)
+	if cached, ok := a.cachedConflictKey(qn); ok {
 		return cached, nil
 	}
 	tx, err := a.db.BeginTx(ctx, nil)
@@ -351,7 +351,7 @@ func (a *ChangeApplier) conflictKeyForPipelined(ctx context.Context, schema, tab
 	if err != nil {
 		return nil, err
 	}
-	a.conflictKeyCache[qn] = key
+	a.storeConflictKey(qn, key)
 	return key, nil
 }
 

@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -116,6 +117,28 @@ type ChangeApplier struct {
 	// persistent escape/open failure logs once, not once per batch.
 	pipelineWarnedFallback bool
 
+	// applyConcurrency is the ADR-0105 (item 26) key-hash apply LANE count
+	// W: the merged CDC change stream is fanned across W in-order apply
+	// lanes by primary-key hash (same key → same lane → in-order, so the
+	// dependent-row hazard cannot occur), each committing concurrently on a
+	// dedicated backend while the coordinator persists the resume position
+	// only up to a fully-durable source boundary (the seq-frontier). Shares
+	// the engine-neutral [laneapply] core with the MySQL target (ADR-0104).
+	// Zero-value-safe: 0 and 1 mean serial (byte-identical to the ADR-0092
+	// pipelined/serial batch path); concurrency engages ONLY for W > 1 via
+	// [SetApplyConcurrency]. See change_applier_concurrent.go.
+	applyConcurrency int
+
+	// laneControllers are the ADR-0105 per-lane AIMD controllers, one per
+	// concurrent apply lane in lane-index order (laneControllers[i] drives
+	// lane i). Set by [SetLaneAIMDControllers] when the streamer engages
+	// --apply-concurrency W > 1 with AIMD auto-tune; nil (the default) means
+	// the lanes run at the static maxBatchSize with bounded in-lane retry but
+	// no adaptive sizing. Each lane drives its controller from a single
+	// goroutine, so per-lane shrink decisions (PG serialization-abort
+	// convergence) stay independent. See change_applier_concurrent.go.
+	laneControllers []ir.BatchSizeController
+
 	// schema is the namespace user-data INSERT/UPDATE/DELETE / TRUNCATE
 	// land in. Defaults to the DSN's `schema` query parameter (typically
 	// `public`); operator-overridable at startup via [SetSchema] when
@@ -193,6 +216,23 @@ type ChangeApplier struct {
 	// the values agree, but the recorded column is the canonical
 	// resume signal.
 	targetSchema string
+
+	// cacheMu guards the five lazily-populated metadata caches the lane
+	// dispatch tree can touch from W goroutines under the ADR-0105
+	// concurrent key-hash apply path: pkCache, colTypeCache,
+	// conflictKeyCache, warnedKeyless, and schemaDirtyTables. EVERY access
+	// to those maps goes through the guarded accessors in
+	// change_applier_concurrent.go — there is no direct map access elsewhere
+	// in the dispatch call tree — so a missed-lock race cannot hide from the
+	// -race gate. The serial path takes the same lock; the cost is one RLock
+	// + map read per cache hit (negligible). activeSchema is NOT guarded
+	// here: schema events are barrier-only (drained, applied single-row by
+	// the coordinator — never routed to a lane), so that cache stays
+	// single-goroutine owned (see its own field doc). Same shape as the
+	// MySQL applier's cacheMu (ADR-0104), but PG has MORE per-table caches
+	// (conflictKeyCache + schemaDirtyTables on top of pk/colType/keyless),
+	// so all five are routed through it.
+	cacheMu sync.RWMutex
 
 	// pkCache maps "schema.table" → ordered list of PK column names.
 	// Populated lazily via a single information_schema query the
@@ -474,6 +514,32 @@ func (a *ChangeApplier) SetBatchObserver(o ir.BatchObserver) {
 	a.batchObserver = o
 }
 
+// SetApplyConcurrency implements [ir.ApplyConcurrencySetter] (ADR-0105, item
+// 26). Records the key-hash apply LANE count W. The concurrent apply path
+// engages ONLY for W > 1 and when a dedicated pool can be opened (pipelineCfg
+// set); 0 and 1 are serial (zero-value-safe — every non-CLI construction
+// gets the safe serial default, the v0.99.51 trap). A negative value is
+// clamped to 0. Idempotent. The streamer threads --apply-concurrency to
+// every applier exposing this surface; PG now joins MySQL.
+func (a *ChangeApplier) SetApplyConcurrency(lanes int) {
+	if lanes < 0 {
+		lanes = 0
+	}
+	a.applyConcurrency = lanes
+}
+
+// SetLaneAIMDControllers implements [ir.LaneAIMDSetter] (ADR-0105). Records
+// the per-lane AIMD controllers — one per concurrent apply lane, in
+// lane-index order — so each lane consults its OWN controller for the next
+// batch size and feeds it the commit outcome (so a serialization abort
+// shrinks only the affected lane). The streamer wires this only when
+// --apply-concurrency W > 1 AND auto-tune is on; nil clears it (lanes run at
+// the static maxBatchSize). Idempotent. The serial path keeps the
+// single-controller [SetBatchSizeProvider] / [SetBatchObserver] wiring.
+func (a *ChangeApplier) SetLaneAIMDControllers(controllers []ir.BatchSizeController) {
+	a.laneControllers = controllers
+}
+
 // redactChange mirrors the MySQL applier's redactChange. nil/empty
 // redactor is the no-op fast path. PII Phase 1.5 row-data scope:
 // Insert.Row, Update.Before/After, Delete.Before.
@@ -527,8 +593,8 @@ func (a *ChangeApplier) redactChange(ctx context.Context, c ir.Change) error {
 // catch the no-PK case before CDC events arrive, but defense-
 // in-depth applies here).
 func (a *ChangeApplier) pkForRedact(ctx context.Context, schema, table string) ([]string, error) {
-	qn := schema + "." + table
-	if cached, ok := a.pkCache[qn]; ok {
+	qn := schemaTableKey(schema, table)
+	if cached, ok := a.cachedPK(qn); ok {
 		return cached, nil
 	}
 	tx, err := a.db.BeginTx(ctx, nil)
@@ -540,7 +606,7 @@ func (a *ChangeApplier) pkForRedact(ctx context.Context, schema, table string) (
 	if err != nil {
 		return nil, fmt.Errorf("postgres: applier: pkForRedact: %w", err)
 	}
-	a.pkCache[qn] = pk
+	a.storePK(qn, pk)
 	return pk, nil
 }
 
@@ -587,7 +653,7 @@ func (a *ChangeApplier) forceSynchronousCommitOn(ctx context.Context, tx *sql.Tx
 // widened bigint value against the cached int4 OID). Steady-state
 // (never-altered) tables keep the cached fast path.
 func (a *ChangeApplier) execDMLArgs(routedSchema, table string, args []any) []any {
-	if !a.schemaDirtyTables[schemaTableKey(routedSchema, table)] {
+	if !a.tableSchemaDirty(schemaTableKey(routedSchema, table)) {
 		return args
 	}
 	out := make([]any, 0, len(args)+1)
@@ -1368,15 +1434,15 @@ func logZeroRowsAffected(ctx context.Context, op, schema, table string, res sql.
 // cached separately from pkFor so the redactor keeps reading the true
 // PK rather than a unique-key fallback.
 func (a *ChangeApplier) conflictKeyFor(ctx context.Context, tx *sql.Tx, schema, table string) ([]string, error) {
-	qn := schema + "." + table
-	if cached, ok := a.conflictKeyCache[qn]; ok {
+	qn := schemaTableKey(schema, table)
+	if cached, ok := a.cachedConflictKey(qn); ok {
 		return cached, nil
 	}
 	key, err := loadConflictKey(ctx, tx, schema, table)
 	if err != nil {
 		return nil, err
 	}
-	a.conflictKeyCache[qn] = key
+	a.storeConflictKey(qn, key)
 	return key, nil
 }
 
@@ -1393,15 +1459,15 @@ func (a *ChangeApplier) conflictKeyFor(ctx context.Context, tx *sql.Tx, schema, 
 // "what does this column hold" in lockstep with the rest of the
 // engine.
 func (a *ChangeApplier) colTypesFor(ctx context.Context, schema, table string) (map[string]*ir.Column, error) {
-	qn := schema + "." + table
-	if cached, ok := a.colTypeCache[qn]; ok {
+	qn := schemaTableKey(schema, table)
+	if cached, ok := a.cachedColTypes(qn); ok {
 		return cached, nil
 	}
 	out, err := loadColumnTypes(ctx, a.db, schema, table)
 	if err != nil {
 		return nil, err
 	}
-	a.colTypeCache[qn] = out
+	a.storeColTypes(qn, out)
 	return out, nil
 }
 

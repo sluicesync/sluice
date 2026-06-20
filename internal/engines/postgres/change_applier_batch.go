@@ -93,6 +93,15 @@ func (a *ChangeApplier) ApplyBatch(ctx context.Context, streamID string, changes
 	if maxBatchSize <= 1 {
 		return a.Apply(ctx, streamID, changes)
 	}
+	// ADR-0105 item 26: when the operator wired the key-hash apply LANE count
+	// (--apply-concurrency W) > 1 and a dedicated pool can be opened, route to
+	// the shared concurrent key-hash apply path — W in-order lanes committing
+	// concurrently, with the resume position advanced only to a fully-durable
+	// source boundary (the seq-frontier). 0/1 stays on the ADR-0092 batch loop
+	// below. Matches the MySQL applier's routing precedence exactly.
+	if a.applyConcurrency > 1 && a.pipelineCfg != nil {
+		return a.applyBatchConcurrent(ctx, streamID, changes, maxBatchSize, a.applyConcurrency)
+	}
 	return appliershared.RunBatchLoop(ctx, a.batchConfig(), streamID, changes, maxBatchSize)
 }
 
@@ -227,8 +236,8 @@ func (a *ChangeApplier) isKeylessInsert(ctx context.Context, c ir.Change) bool {
 	if !ok {
 		return false
 	}
-	qn := a.routedSchema(ins.Schema) + "." + ins.Table
-	key, ok := a.conflictKeyCache[qn]
+	qn := schemaTableKey(a.routedSchema(ins.Schema), ins.Table)
+	key, ok := a.cachedConflictKey(qn)
 	if !ok || len(key) > 0 {
 		return false
 	}
@@ -238,15 +247,13 @@ func (a *ChangeApplier) isKeylessInsert(ctx context.Context, c ir.Change) bool {
 
 // warnKeylessOnce logs a single WARN per keyless table the first time the
 // ADR-0089 guard holds it at single-row apply, so an operator sees why
-// that table is not getting batched throughput.
+// that table is not getting batched throughput. The check-and-set is atomic
+// under the cacheMu write lock (markWarnedKeyless) so the WARN fires exactly
+// once even when concurrent lanes touch the same keyless table.
 func (a *ChangeApplier) warnKeylessOnce(ctx context.Context, qn string) {
-	if a.warnedKeyless == nil {
-		a.warnedKeyless = make(map[string]bool)
-	}
-	if a.warnedKeyless[qn] {
+	if !a.markWarnedKeyless(qn) {
 		return
 	}
-	a.warnedKeyless[qn] = true
 	slog.WarnContext(ctx,
 		"postgres: applier: table has no PRIMARY KEY or usable unique index — its INSERTs are "+
 			"not idempotent, so keyless CDC is at-least-once: a crash before the source "+

@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package mysql
+package laneapply
 
 import (
 	"testing"
@@ -9,14 +9,12 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
-// The router / frontier / lane-apply unit pins moved to internal/laneapply
-// (the ADR-0105 STEP-1 extraction of the engine-neutral concurrent key-hash
-// apply core) — see internal/laneapply/{router,frontier,lane_apply}_test.go.
-// The two pins below stay here because they exercise the MySQL-side decode
-// helpers (rowChangeSchemaTable / pkChangedUpdate) the [laneApplierAdapter]
-// owns behind the seam.
+// PK-change / row-identity helper pins. These moved here from the MySQL
+// engine package in the ADR-0105 STEP-2 single-sourcing (both the MySQL and
+// Postgres lane adapters route their PK-change decision through these), so
+// the pin lives with the now-shared helpers.
 
-func TestPkChangedUpdate(t *testing.T) {
+func TestPKChangedUpdate(t *testing.T) {
 	pk := []string{"id"}
 	cases := []struct {
 		name string
@@ -30,8 +28,8 @@ func TestPkChangedUpdate(t *testing.T) {
 		{"bytes-pk-diff", ir.Update{Before: ir.Row{"id": []byte("k")}, After: ir.Row{"id": []byte("j")}}, true},
 	}
 	for _, tc := range cases {
-		if got := pkChangedUpdate(tc.u, pk); got != tc.want {
-			t.Errorf("%s: pkChangedUpdate=%v want %v", tc.name, got, tc.want)
+		if got := PKChangedUpdate(tc.u, pk); got != tc.want {
+			t.Errorf("%s: PKChangedUpdate=%v want %v", tc.name, got, tc.want)
 		}
 	}
 }
@@ -47,9 +45,9 @@ func TestRowChangeSchemaTable(t *testing.T) {
 		{ir.TxBegin{}, "", ""},
 	}
 	for _, tc := range cases {
-		s, tb := rowChangeSchemaTable(tc.c)
+		s, tb := RowChangeSchemaTable(tc.c)
 		if s != tc.schema || tb != tc.table {
-			t.Errorf("rowChangeSchemaTable(%T) = (%q,%q), want (%q,%q)", tc.c, s, tb, tc.schema, tc.table)
+			t.Errorf("RowChangeSchemaTable(%T) = (%q,%q), want (%q,%q)", tc.c, s, tb, tc.schema, tc.table)
 		}
 	}
 }
