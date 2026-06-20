@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.86] - 2026-06-20
+
+### Added
+
+- **The source-unresponsive diagnosis now hands you the EXACT, safe binlog-purge command instead of a generic "consider PURGE BINARY LOGS".** Extending the v0.99.85 verify-timeout diagnosis: for the binlog/disk-pressure causes, sluice derives the precise remediation from the resume position it already holds. In file/pos mode it names `PURGE BINARY LOGS TO '<resume-file>'` — MySQL deletes only the logs *older* than that file and keeps it, so this stream's resume point is preserved — so the operator can copy-paste the command rather than work out a safe boundary by hand. In GTID mode (no single resume file) it states the GTID-set constraint instead. Every hint carries the shared-infra caveat: sluice knows only *its own* resume needs, so other replicas or point-in-time-recovery backups may still need the older logs — confirm before purging. sluice **surfaces** the command; it deliberately does **not** run it — purging source binlogs is destructive, affects shared infrastructure sluice can't see, and would require an elevated source privilege (`BINLOG_ADMIN`/`SUPER`) that the CDC user deliberately does not hold (it needs only `REPLICATION SLAVE`/`REPLICATION CLIENT` + `SELECT`). This is the same report-don't-auto-apply posture as the index-DDL handling in ADR-0103. Validated against the live large-scale source that triggered the v0.99.85 work (2,585 binlog files on a full disk).
+
 ## [0.99.85] - 2026-06-20
 
 ### Added
