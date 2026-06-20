@@ -9,9 +9,12 @@ import (
 	"database/sql/driver"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	gomysql "github.com/go-sql-driver/mysql"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -79,8 +82,9 @@ func TestVerifyPositionResumable_TimeoutIsRetriableNotPositionInvalid(t *testing
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			r := &CDCReader{
-				db:               newBlockingDB(t),
-				posVerifyTimeout: 50 * time.Millisecond, // small so the deadline fires fast
+				db:                    newBlockingDB(t),
+				posVerifyTimeout:      50 * time.Millisecond, // small so the deadline fires fast
+				posVerifyProbeTimeout: 50 * time.Millisecond, // diagnosis probe also blocks here → bound it small
 			}
 			start := time.Now()
 			err := r.verifyPositionResumable(context.Background(), tc.pos)
@@ -131,5 +135,133 @@ func TestVerifyPositionResumable_ParentCancelNotMisclassified(t *testing.T) {
 	// applied on a real shutdown cancel (ctx.Err() != nil at the guard).
 	if errors.Is(err, ir.ErrPositionInvalid) {
 		t.Fatalf("parent cancel must not be ErrPositionInvalid: %v", err)
+	}
+}
+
+// --- Diagnosis-branch fake driver: SELECT 1 behaves per-DSN, the binlog
+// verify query (anything else) always blocks (the wedged-verify shape). Lets
+// the three sourceUnresponsiveDiagnosis branches be pinned deterministically.
+
+type diagDriver struct{}
+
+type diagConn struct{ mode string }
+
+func (diagDriver) Open(dsn string) (driver.Conn, error) { return diagConn{mode: dsn}, nil }
+
+func (diagConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("not supported") }
+func (diagConn) Close() error                        { return nil }
+func (diagConn) Begin() (driver.Tx, error)           { return nil, errors.New("not supported") }
+
+type oneRow struct{ done bool }
+
+func (*oneRow) Columns() []string { return []string{"1"} }
+func (*oneRow) Close() error      { return nil }
+func (r *oneRow) Next(dest []driver.Value) error {
+	if r.done {
+		return io.EOF
+	}
+	r.done = true
+	dest[0] = int64(1)
+	return nil
+}
+
+func (c diagConn) QueryContext(ctx context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+	if query == "SELECT 1" {
+		switch c.mode {
+		case "probe_ok":
+			return &oneRow{}, nil
+		case "probe_diskfull":
+			return nil, errors.New("write error: No space left on device (errno: 28)")
+		case "probe_block":
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+	}
+	// The binlog verify query (SHOW BINARY LOGS / GTID_SUBSET) always wedges.
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+var registerDiagOnce sync.Once
+
+func newDiagDB(t *testing.T, mode string) *sql.DB {
+	t.Helper()
+	registerDiagOnce.Do(func() { sql.Register("sluice-diag-test", diagDriver{}) })
+	db, err := sql.Open("sluice-diag-test", mode) // DSN = probe mode
+	if err != nil {
+		t.Fatalf("open diag db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+// TestSourceUnresponsiveDiagnosis_NarrowsByLivenessProbe pins that the
+// verify-timeout message is narrowed by the differential SELECT 1 probe to the
+// correct cause — binlog-subsystem-slow vs out-of-disk vs globally-unresponsive
+// — while staying retriable and never ir.ErrPositionInvalid in every case.
+func TestSourceUnresponsiveDiagnosis_NarrowsByLivenessProbe(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name       string
+		mode       string
+		wantPhrase string
+	}{
+		{"probe_ok_binlog_slow", "probe_ok", "BINLOG subsystem"},
+		{"probe_diskfull", "probe_diskfull", "OUT OF"},
+		{"probe_block_global", "probe_block", "globally unresponsive"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := &CDCReader{
+				db:                    newDiagDB(t, tc.mode),
+				posVerifyTimeout:      50 * time.Millisecond,
+				posVerifyProbeTimeout: 50 * time.Millisecond,
+			}
+			err := r.verifyPositionResumable(context.Background(),
+				binlogPos{Mode: positionModeFilePos, File: "binlog.000123"})
+			if err == nil {
+				t.Fatal("want a retriable error on verify timeout")
+			}
+			if !strings.Contains(err.Error(), tc.wantPhrase) {
+				t.Fatalf("diagnosis did not narrow to %q; got: %v", tc.wantPhrase, err)
+			}
+			// Still retriable, still not a destructive cold-start trigger.
+			var re ir.RetriableError
+			if !errors.As(err, &re) || !re.Retriable() {
+				t.Fatalf("want retriable; got %T: %v", err, err)
+			}
+			if errors.Is(err, ir.ErrPositionInvalid) {
+				t.Fatalf("diagnosis path must not be ErrPositionInvalid: %v", err)
+			}
+		})
+	}
+}
+
+// TestIsDiskFullSignal pins the disk-full matcher across the shapes MySQL
+// surfaces ENOSPC in (and the negative case).
+func TestIsDiskFullSignal(t *testing.T) {
+	t.Parallel()
+	yes := []error{
+		errors.New("No space left on device"),
+		errors.New("write failed (errno: 28)"),
+		errors.New("Disk full writing './binlog.003186'"),
+		errors.New("Disk is full waiting for someone to free some space"),
+		&gomysql.MySQLError{Number: 1021, Message: "Disk full"},
+	}
+	for _, e := range yes {
+		if !isDiskFullSignal(e) {
+			t.Errorf("want disk-full for %q", e)
+		}
+	}
+	no := []error{
+		nil,
+		errors.New("connection reset by peer"),
+		&gomysql.MySQLError{Number: 1213, Message: "Deadlock found"},
+	}
+	for _, e := range no {
+		if isDiskFullSignal(e) {
+			t.Errorf("want NOT disk-full for %v", e)
+		}
 	}
 }

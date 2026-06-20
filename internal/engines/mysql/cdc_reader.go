@@ -81,6 +81,14 @@ type CDCReader struct {
 	// deterministically (the zero-value-safe default pattern).
 	posVerifyTimeout time.Duration
 
+	// posVerifyProbeTimeout bounds the SELECT 1 liveness probe that
+	// diagnoses WHY a verify query timed out (see
+	// [sourceLivenessProbeTimeout] / [sourceUnresponsiveDiagnosis]). Zero
+	// falls back to the const; only tests set a small value. The probe is
+	// itself bounded so a wedged source can't turn the diagnosis into a
+	// second hang.
+	posVerifyProbeTimeout time.Duration
+
 	// schema is the database name the reader is bound to. In the
 	// default single-database mode, events from other databases are
 	// dropped during dispatch — this engine presents a single-schema
@@ -1083,15 +1091,19 @@ func (r *CDCReader) verifyPositionResumable(ctx context.Context, p binlogPos) er
 	if err != nil && errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
 		// OUR bounded deadline fired (the parent ctx is still live, so this
 		// is not a shutdown cancel): the source did not answer the resume
-		// preflight in time — typically a half-dead connection. Surface
-		// RETRIABLE (classifyApplierError maps context.DeadlineExceeded →
+		// preflight in time — typically a half-dead connection or a wedged
+		// source. Run a bounded differential liveness probe to NARROW the
+		// cause (server globally unresponsive vs binlog-subsystem-slow vs
+		// out-of-disk) and fold it into the message. Surface RETRIABLE
+		// (classifyApplierError maps context.DeadlineExceeded →
 		// ir.RetriableError) so the streamer's ADR-0038 loop reconnects +
 		// retries, rather than hanging forever OR being mistaken for a
 		// purged position (which would cold-start). The retry draws a fresh
 		// connection from the pool, leaving the wedged one behind.
+		diag := r.sourceUnresponsiveDiagnosis(ctx)
 		return classifyApplierError(fmt.Errorf(
-			"mysql: resume-position verify exceeded %s (source unresponsive; reconnecting): %w",
-			timeout, err,
+			"mysql: resume-position verify exceeded %s (%s); reconnecting: %w",
+			timeout, diag, err,
 		))
 	}
 	return err
@@ -1121,6 +1133,63 @@ func (r *CDCReader) verifyPositionResumableInner(ctx context.Context, p binlogPo
 		return verifyGTIDSetReachable(ctx, r.db, p.GTIDSet)
 	default:
 		return fmt.Errorf("mysql: cannot verify position with mode %q", p.Mode)
+	}
+}
+
+// sourceLivenessProbeTimeout bounds the SELECT 1 liveness probe in
+// [sourceUnresponsiveDiagnosis]. Short on purpose: a wedged source must not
+// turn the diagnosis itself into a second long stall, and a healthy server
+// answers SELECT 1 in milliseconds.
+const sourceLivenessProbeTimeout = 5 * time.Second
+
+// sourceUnresponsiveDiagnosis runs a bounded `SELECT 1` liveness probe to
+// NARROW why a resume-position verify query timed out, returning an
+// operator-facing hint folded into the timeout error. The verify query
+// (SHOW BINARY LOGS / GTID_SUBSET) touches the binlog subsystem; a plain
+// SELECT 1 does not — so the differential tells the operator which layer is
+// stuck:
+//
+//   - SELECT 1 returns a disk-full signal ([isDiskFullSignal]) → the source
+//     host is OUT OF DISK; name it explicitly (the highest-value case).
+//   - SELECT 1 ALSO times out → the server is GLOBALLY unresponsive (a full
+//     datadir blocks MySQL writes server-wide, severe overload, or down).
+//   - SELECT 1 succeeds → the server is up but the BINLOG SUBSYSTEM
+//     specifically is slow — commonly an over-large binlog file count or a
+//     slow/full binlog volume (this is the Track-D shape: 2585 binlog files
+//     on a full disk made SHOW BINARY LOGS block while the server otherwise
+//     answered).
+//   - SELECT 1 fails some other way → the connection is unhealthy.
+//
+// Why this is best-effort, not authoritative: the MySQL wire protocol exposes
+// no datadir free-space surface, and a full disk frequently makes MySQL BLOCK
+// ("waiting for someone to free some space") rather than return an error — so
+// the probe NARROWS the cause, it does not definitively assert "disk full".
+// It is itself bounded ([sourceLivenessProbeTimeout]) so it can never hang.
+// Pure diagnosis: it changes only the error TEXT, never the retry/position
+// decision.
+func (r *CDCReader) sourceUnresponsiveDiagnosis(ctx context.Context) string {
+	probeTimeout := r.posVerifyProbeTimeout
+	if probeTimeout <= 0 {
+		probeTimeout = sourceLivenessProbeTimeout
+	}
+	pctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	var one int
+	err := r.db.QueryRowContext(pctx, "SELECT 1").Scan(&one)
+	switch {
+	case err == nil:
+		return "a SELECT 1 liveness probe succeeded, so the source server is up but its BINLOG subsystem " +
+			"specifically is slow — commonly an over-large binlog file count or a slow/full binlog volume; " +
+			"check the source's binlog disk and binlog_expire_logs_seconds (consider PURGE BINARY LOGS)"
+	case isDiskFullSignal(err):
+		return "a SELECT 1 liveness probe returned a disk-full signal — the source host appears to be OUT OF " +
+			"DISK SPACE; free space on the source (e.g. PURGE BINARY LOGS / lower binlog_expire_logs_seconds) before resuming"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "a SELECT 1 liveness probe ALSO timed out, so the source server is globally unresponsive — " +
+			"disk exhaustion (a full datadir blocks MySQL writes), severe overload, or the server is down; " +
+			"check the source host's disk and load"
+	default:
+		return fmt.Sprintf("a SELECT 1 liveness probe failed (%v) — the source connection is unhealthy", err)
 	}
 }
 

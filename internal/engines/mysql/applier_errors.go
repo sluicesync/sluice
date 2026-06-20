@@ -80,6 +80,31 @@ func isMySQLDeadlock(err error) bool {
 	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1213
 }
 
+// isDiskFullSignal reports whether err is (or wraps / textually carries) a
+// source-side OUT-OF-DISK signal. Used to enrich the source-unresponsive
+// diagnosis (the verify-timeout path) — a full source datadir is a leading
+// cause of a wedged source, but MySQL surfaces it inconsistently: sometimes
+// as ER_DISK_FULL (1021), often as the OS ENOSPC text ("No space left on
+// device" / "errno: 28"), and frequently NOT as a returned error at all —
+// MySQL famously BLOCKS on a full disk ("Disk full ...; waiting for someone
+// to free some space"), which is why the verify times out rather than erroring
+// (so this matcher is best-effort enrichment, never the sole detector). The
+// match is broad-but-specific: these phrases do not appear in healthy errors.
+func isDiskFullSignal(err error) bool {
+	if err == nil {
+		return false
+	}
+	var mysqlErr *gomysql.MySQLError
+	if errors.As(err, &mysqlErr) && mysqlErr.Number == 1021 { // ER_DISK_FULL
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no space left on device") ||
+		strings.Contains(msg, "errno: 28") ||
+		strings.Contains(msg, "disk full") ||
+		strings.Contains(msg, "waiting for someone to free some space")
+}
+
 // classifyApplierError inspects err and returns a value satisfying
 // [ir.RetriableError] when err matches one of the documented MySQL /
 // Vitess transient shapes. Returns err unchanged for non-retriable
