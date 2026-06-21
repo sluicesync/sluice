@@ -301,16 +301,26 @@ type Orchestrator struct {
 	sinceCheckpoint int    // routed changes since the last checkpoint
 	lastWrittenSeq  uint64 // seq of the last persisted boundary (monotone guard)
 
-	// prevSeq / prevPos track the most-recent event for position-change
-	// boundary detection: a checkpoint boundary is the highest seq sharing a
-	// given source position, detected when the NEXT event carries a
-	// different position. This generalizes TxCommit boundaries to any stream
-	// (incl. boundary-less streams where every change has a distinct
-	// position), and guarantees the persisted position never names a
-	// position that an uncommitted later change also carries. prevSeq == 0
-	// means "no prior event".
+	// prevSeq / prevPos drive the position-run boundary heuristic used ONLY on
+	// marker-LESS streams (VStream — see sawTxMarker): a checkpoint boundary is
+	// the highest seq sharing a given source position, detected when the NEXT
+	// event carries a different position. This is safe ONLY when within-tx
+	// events share a position token (VStream's VGTID is stable within a source
+	// transaction); it must NOT be used for MySQL file/pos, where every binlog
+	// event has a distinct LogPos so a mid-transaction ROW position would be
+	// recorded as a "boundary" yet is unresumable ("no corresponding table map
+	// event" on warm-resume — the bug this heuristic caused on the concurrent
+	// path). prevSeq == 0 means "no prior event".
 	prevSeq uint64
 	prevPos ir.Position
+
+	// sawTxMarker latches true once an [ir.TxBegin] or [ir.TxCommit] is seen on
+	// the stream. It selects the boundary-detection strategy (see handle):
+	// marker streams (binlog-MySQL, Postgres) record a checkpoint boundary ONLY
+	// at the real boundary events (TxCommit, and the DDL-boundary Truncate),
+	// while marker-LESS streams (VStream) fall back to the prevSeq/prevPos
+	// position-run heuristic above. Coordinator-goroutine-only (no lock).
+	sawTxMarker bool
 
 	cancel context.CancelFunc
 
@@ -414,10 +424,13 @@ func (o *Orchestrator) Run(ctx context.Context, changes <-chan ir.Change) error 
 	if loopErr != nil {
 		return loopErr
 	}
-	// Clean end-of-stream: the final position run never saw a differing
-	// successor, so record its boundary now, then persist the final
-	// fully-durable checkpoint (frontier is at its max after wg.Wait).
-	if o.prevSeq != 0 {
+	// Clean end-of-stream. On a marker-LESS stream the final position run never
+	// saw a differing successor, so record its boundary now. On a marker stream
+	// the boundary was already recorded at each TxCommit / Truncate (noteBoundary
+	// is never used there, so prevSeq stays 0); never record prevPos, which could
+	// be a mid-transaction row position. Then persist the final fully-durable
+	// checkpoint (frontier is at its max after wg.Wait).
+	if !o.sawTxMarker && o.prevSeq != 0 {
 		o.frontier.RecordTxBoundary(o.prevSeq, o.prevPos)
 	}
 	return o.writeCheckpoint(ctx)
@@ -428,36 +441,69 @@ func (o *Orchestrator) Run(ctx context.Context, changes <-chan ir.Change) error 
 // (Truncate / SchemaSnapshot / keyless / PK-changing update) takes the
 // barrier path.
 func (o *Orchestrator) handle(ctx context.Context, seq uint64, c ir.Change) error {
-	// Position-change boundary detection (see prevSeq/prevPos): when this
-	// event's position differs from the previous event's, the previous
-	// event was the last of its position run — a safe checkpoint boundary.
+	// Checkpoint-boundary tracking. Which source positions are safe to resume
+	// FROM depends on the stream's shape:
 	//
-	// A SchemaSnapshot is EXCLUDED from boundary tracking: its position is
-	// metadata-anchored (pgoutput's first-touch RelationMessage carries WAL
-	// position 0/0, before any real anchor exists), NOT a resumable source
-	// position. Letting a 0/0-token SchemaSnapshot participate recorded a
-	// (seq, 0/0) "boundary" that CheckpointPosition then returned as the
-	// resume point, pinning the persisted position at 0/0 forever — the
-	// stream could never warm-resume to the right LSN (Bug 158, the position
-	// half). The surrounding row/Tx events carry the real resume positions
-	// and ARE tracked.
-	if !isSchemaSnapshot(c) {
-		o.noteBoundary(seq, c.Pos())
-	}
-
+	//   - MARKER streams — those emitting TxBegin/TxCommit (the binlog-MySQL
+	//     and Postgres CDC readers) — record a checkpoint boundary ONLY at the
+	//     real boundary events: TxCommit (the transaction boundary) and the
+	//     DDL-boundary Truncate. This is LOAD-BEARING for MySQL file/pos: every
+	//     binlog event has a distinct LogPos, so a mid-transaction ROW position
+	//     points INTO a transaction (after its TABLE_MAP) and is NOT a valid
+	//     warm-resume point — persisting one crash-loops the stream with "no
+	//     corresponding table map event" (the concurrent-path counterpart of
+	//     the serial item-29 / v0.99.89 fix; found live on a native-MySQL
+	//     file/pos run). For Postgres the mid-tx LSN is independently resumable,
+	//     but a TxCommit boundary is equally valid and the canonical restart
+	//     point, so the same rule applies — and never persisting a mid-tx
+	//     position is strictly safer.
+	//
+	//   - MARKER-LESS streams — VStream — emit only row changes whose position
+	//     token (the VGTID) is STABLE within a source transaction and changes
+	//     only at the tx boundary, with no Tx* markers to anchor on. For these
+	//     the prevSeq/prevPos position-run heuristic (noteBoundary) correctly
+	//     finds the boundary as the last change of each run.
+	//
+	// sawTxMarker latches once a TxBegin/TxCommit is seen, selecting the marker
+	// path. SchemaSnapshot is excluded from BOTH: its token is metadata-anchored
+	// (pgoutput's first-touch RelationMessage carries WAL 0/0, before any real
+	// anchor exists), NOT a resumable position; recording a (seq, 0/0) boundary
+	// pinned the persisted position at 0/0 forever (Bug 158, the position half).
 	switch c.(type) {
 	case ir.TxBegin:
+		o.sawTxMarker = true
 		// Boundary marker, no lane work — mark committed so the contiguous
 		// frontier can advance past it once the tx's rows (lower seqs) land.
 		o.frontier.MarkCommitted(seq)
 		return nil
 	case ir.TxCommit:
+		o.sawTxMarker = true
+		// The source-transaction boundary: its position is the resume-safe
+		// restart point. Record it — the frontier returns it as the checkpoint
+		// once every lower seq (this tx's rows) is durably committed across all
+		// lanes.
+		o.frontier.RecordTxBoundary(seq, c.Pos())
 		o.frontier.MarkCommitted(seq)
 		return o.maybeCheckpoint(ctx)
 	case ir.Insert, ir.Update, ir.Delete:
+		// Marker-less (VStream) only: the position-run heuristic. On a marker
+		// stream a row position is mid-transaction and must NOT be a boundary.
+		if !o.sawTxMarker {
+			o.noteBoundary(seq, c.Pos())
+		}
 		return o.routeRow(ctx, seq, c)
 	default:
 		// Truncate, SchemaSnapshot, or any future barrier-class event.
+		if o.sawTxMarker {
+			// A Truncate is a DDL statement boundary (auto-committed, not
+			// wrapped in BEGIN/XID), so its position IS a resume-safe restart
+			// point — record it. SchemaSnapshot is NOT (metadata-anchored).
+			if _, isTrunc := c.(ir.Truncate); isTrunc {
+				o.frontier.RecordTxBoundary(seq, c.Pos())
+			}
+		} else if !isSchemaSnapshot(c) {
+			o.noteBoundary(seq, c.Pos())
+		}
 		return o.barrier(ctx, seq, c)
 	}
 }
@@ -555,14 +601,17 @@ func (o *Orchestrator) barrier(ctx context.Context, seq uint64, c ir.Change) err
 	// the ADR-0049 history row atomically, but did NOT write the position —
 	// the frontier checkpoint owns the resume position exclusively on this
 	// path (the ADR-0104 relaxation). The barrier's seq is now durable, so
-	// mark it on the frontier and persist the checkpoint: a non-SchemaSnapshot
-	// barrier (Truncate / a keyless or PK-changing row) carries a real
-	// resumable position, recorded as a tx boundary by noteBoundary (in
-	// handle), so the checkpoint can advance up to it. A SchemaSnapshot is NOT
-	// a resume point (its token is metadata-anchored — 0/0 at first-touch), so
-	// it is excluded from boundary tracking (see handle / noteBoundary); the
-	// resume position stays at the last real row/Tx boundary, which warm-resume
-	// + idempotent re-apply correctly replays the schema event from (Bug 158).
+	// mark it on the frontier and persist the checkpoint. Whether the barrier's
+	// own position becomes the checkpoint depends on its kind + the stream
+	// shape (see handle): a Truncate is a DDL boundary and IS recorded (marker
+	// streams) or token-run-recorded (marker-less); a keyless / PK-changing ROW
+	// barrier is a mid-transaction position and is NOT recorded on a marker
+	// stream (it is unresumable on MySQL file/pos) — the resume position stays
+	// at the last TxCommit boundary and warm-resume + idempotent re-apply
+	// replays the in-flight tx (at-least-once for keyless, as on the serial
+	// path). A SchemaSnapshot is never a resume point (metadata-anchored — 0/0
+	// at first-touch), excluded from boundary tracking; warm-resume + idempotent
+	// re-apply replays the schema event from the prior boundary (Bug 158).
 	o.frontier.MarkCommitted(seq)
 	o.sinceCheckpoint = 0
 	return o.writeCheckpoint(ctx)
