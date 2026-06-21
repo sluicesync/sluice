@@ -495,18 +495,32 @@ type Streamer struct {
 	// to bound the silent-stall window (GitHub issue #23).
 	ApplyExecTimeout time.Duration
 
-	// ApplyConcurrency is the ADR-0104 (item 23(c)) key-hash apply LANE
-	// count W plumbed to the target [ir.ChangeApplier] via the optional
-	// [ir.ApplyConcurrencySetter] interface. The merged CDC stream is fanned
-	// across W in-order lanes by primary-key hash, each committing
-	// concurrently on a dedicated backend, lifting aggregate apply
+	// ApplyConcurrency is the ADR-0104 (item 23(c)) / ADR-0105 (item 26)
+	// key-hash apply LANE count W plumbed to the target [ir.ChangeApplier]
+	// via the optional [ir.ApplyConcurrencySetter] interface. The merged CDC
+	// stream is fanned across W in-order lanes by primary-key hash, each
+	// committing concurrently on a dedicated backend, lifting aggregate apply
 	// throughput toward W× — the lever closing the item-23 cross-region wedge.
 	//
-	// Zero-value-safe: 0 and 1 mean serial (byte-identical); concurrency
-	// engages ONLY for W > 1 with a dedicated pool available. Only the MySQL
-	// target applier implements the setter today. The CLI's
-	// `sync start --apply-concurrency=W` flag is the operator knob; default 0
-	// keeps every stream serial unless the operator opts in.
+	// ADR-0106 (item 31): the field follows the established `--table-parallelism`
+	// contract — `0 = auto:N` (adaptive, connection-budget-bounded), `1 =
+	// explicit serial opt-out`, `N > 1 = honored`. The raw int alone
+	// distinguishes unset/0 (→ auto:N) from an explicit 1 (→ serial), so no
+	// sentinel is needed. The `0 → auto:N` resolution happens HERE at the
+	// Streamer level (in [resolveApplyConcurrency], called per attempt by
+	// [runOnce] into [resolvedApplyConcurrency]), NOT only in the CLI — exactly
+	// as the sibling [AutoTune] field defaults on at the streamer level — so any
+	// programmatic / test / broker caller that leaves the field zero gets the
+	// fast default too, rather than re-triggering the v0.99.51
+	// zero-value-safe-default trap.
+	//
+	// Engagement is still gated downstream: concurrency runs ONLY when the
+	// resolved W > 1 AND the engine applier implements [ir.ApplyConcurrencySetter]
+	// AND it can open a dedicated lane pool (its pipelineCfg is set — true for
+	// every applier opened via OpenChangeApplier, false for direct-API / test
+	// stubs). A caller that does NOT wire a real applier therefore stays serial
+	// regardless of the resolved value (bounds the blast radius). The CLI's
+	// `sync start --apply-concurrency=W` flag is the operator knob.
 	ApplyConcurrency int
 
 	// AutoTune controls whether the AIMD apply-batch-size controller
@@ -907,6 +921,19 @@ type Streamer struct {
 	// the applier's target schema is the same as when cold-start
 	// completed).
 	coldStartSeedSnapshots []ir.SchemaSnapshot
+
+	// resolvedApplyConcurrency is the per-attempt resolution of the operator's
+	// [ApplyConcurrency] field (ADR-0106, item 31): `0 → auto:N`, `1 → 1`
+	// (explicit serial), `N > 1 → N`. Computed once per [runOnce] attempt by
+	// [resolveApplyConcurrency] (before the applier opens), then read by
+	// [openApplier] (the [ir.ApplyConcurrencySetter] plumb) and
+	// [maybeAttachAIMDController] (the per-lane AIMD wiring) so the auto:N
+	// default actually engages concurrency everywhere — not just on the one
+	// CLI path. Re-derived each attempt because the PG connection-budget probe
+	// that bounds auto:N may see a different live slot count on a retry. The
+	// operator's raw [ApplyConcurrency] is never mutated (a retry must
+	// re-resolve from the same input).
+	resolvedApplyConcurrency int
 }
 
 // Run executes a snapshot+CDC stream with optional retry on
@@ -1072,6 +1099,15 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
+	// ---- 0.5. Resolve the adaptive apply-concurrency default (ADR-0106) ----
+	// `--apply-concurrency 0` (unset) → auto:N (connection-budget-bounded);
+	// `1` stays explicit serial; `N > 1` honored. Resolved HERE (per attempt,
+	// before the applier opens) so both the applier plumb (step 1) and the
+	// per-lane AIMD wiring (step 1.5) read the same resolved value — the
+	// streamer-level default that makes auto:N actually engage everywhere,
+	// not just on the one CLI path.
+	s.resolvedApplyConcurrency = s.resolveApplyConcurrency(ctx)
 
 	// ---- 1. Open / wire the applier first ----
 	applier, ownsApplier, err := s.openApplier(ctx)

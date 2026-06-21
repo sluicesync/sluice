@@ -18,6 +18,23 @@ local Docker; production hardware sees 3–100× improvements depending
 on source transaction shape and network latency. See
 [ADR-0017](adr/adr-0017-batched-cdc-apply.md).
 
+## Concurrent CDC apply: `--apply-concurrency`
+
+Default: `auto:N` — fast out of the box as of ADR-0106. The merged CDC change stream is fanned across N in-order lanes by primary-key hash (same key → same lane → applied in source order, so dependent INSERT→UPDATE→DELETE on a row never reorder), each lane committing concurrently on its own dedicated backend with its own AIMD batch-size controller. On a high-latency cross-region link a serial applier is RTT-bound and falls below the source write rate; concurrent lanes lift aggregate apply throughput toward N× (live-validated ~4× on a 2-shard Vitess→PlanetScale-MySQL link).
+
+`N` is conservative and connection-budget-bounded, matching the cold-copy axes' `auto:4` so the whole pipeline has one mental model — sluice fans out ~4-wide by default, bounded by your target:
+
+- **Postgres target:** `min(4, budget)`, where `budget` comes from the same connection-slot probe `--max-target-connections` drives. A constrained instance yields fewer lanes automatically; if the budget is exhausted or the probe is unavailable, apply degrades to serial (the cold-start preflight still owns the loud connection-budget refusal).
+- **MySQL / PlanetScale-MySQL target:** a fixed ceiling of `4` — there is no connection-slot probe (`--max-target-connections` is inert against engines without a slot model), and PlanetScale per-branch connection limits are generous relative to 4 lanes + 4 dedicated backends across every tier.
+
+The contract mirrors `--table-parallelism` (`0 = auto:N`, `1 = disable`):
+
+- `--apply-concurrency 0` (the default, unset) → `auto:N`.
+- `--apply-concurrency 1` → the explicit **serial opt-out**, byte-identical to the pre-ADR-0106 default. Reach for it if you want strictly serial apply (e.g. a tiny target you'd rather not fan out against).
+- `--apply-concurrency W` (W > 1) → honored verbatim — you own your target's connection budget. Raise it for a beefy target.
+
+Correctness is unchanged by the default flip: the resume position advances only to a source boundary durable across all lanes (exactly-once for keyed tables; keyless tables keep their at-least-once baseline via the keyless guard), per-lane AIMD self-throttles on a slow/weak target, and a transient in-lane abort (a PlanetScale tx-killer on MySQL, a serialization/deadlock on Postgres) is handled in-lane (controller shrink + idempotent split-retry) without restarting the stream. See [ADR-0104](adr/adr-0104-mysql-pipelined-cdc-apply.md) (MySQL), [ADR-0105](adr/adr-0105-postgres-concurrent-cdc-apply.md) (Postgres), and [ADR-0106](adr/adr-0106-default-adaptive-apply-concurrency.md) (the fast-by-default decision).
+
 ## Parallel within-table bulk copy: `--bulk-parallelism` + `--bulk-parallel-min-rows`
 
 Default: `min(8, NumCPU)` parallel readers per table; tables under
@@ -121,3 +138,6 @@ for the full rationale and the audit of where memory accumulates.
 - [ADR-0019 — Parallel within-table bulk copy](adr/adr-0019-parallel-within-table-bulk-copy.md)
 - [ADR-0027 — Source-transaction-boundary CDC batching](adr/adr-0027-source-transaction-boundary-cdc-batching.md)
 - [ADR-0028 — Memory-bounded streaming](adr/adr-0028-memory-bounded-streaming.md)
+- [ADR-0104 — MySQL pipelined / concurrent CDC apply](adr/adr-0104-mysql-pipelined-cdc-apply.md)
+- [ADR-0105 — Postgres concurrent key-hash CDC apply](adr/adr-0105-postgres-concurrent-cdc-apply.md)
+- [ADR-0106 — Fast-by-default adaptive `--apply-concurrency`](adr/adr-0106-default-adaptive-apply-concurrency.md)

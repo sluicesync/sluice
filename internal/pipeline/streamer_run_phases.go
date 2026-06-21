@@ -124,7 +124,7 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 		applyMaxBufferBytes(s.Applier, s.MaxBufferBytes)
 		applyTargetSchema(s.Applier, s.TargetSchema)
 		applyExecTimeout(s.Applier, s.ApplyExecTimeout)
-		applyApplyConcurrency(s.Applier, s.ApplyConcurrency)
+		applyApplyConcurrency(s.Applier, s.resolvedApplyConcurrency)
 		applyRedactor(s.Applier, s.Redactor)
 		if err := checkShardColumnSupport(s.Applier, s.InjectShardColumn, "sync"); err != nil {
 			return nil, false, wrapWithHint(PhaseConnect, err)
@@ -150,7 +150,7 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 	applyMaxBufferBytes(a, s.MaxBufferBytes)
 	applyTargetSchema(a, s.TargetSchema)
 	applyExecTimeout(a, s.ApplyExecTimeout)
-	applyApplyConcurrency(a, s.ApplyConcurrency)
+	applyApplyConcurrency(a, s.resolvedApplyConcurrency)
 	applyRedactor(a, s.Redactor)
 	if err := checkShardColumnSupport(a, s.InjectShardColumn, "sync"); err != nil {
 		closeIf(a)

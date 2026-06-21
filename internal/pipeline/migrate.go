@@ -1391,16 +1391,19 @@ func applyExecTimeout(target any, d time.Duration) {
 	}
 }
 
-// applyApplyConcurrency plumbs the streamer-side --apply-concurrency value
-// to a target [ir.ChangeApplier] that opts into the ADR-0104 (item 23(c))
-// key-hash concurrent apply via [ir.ApplyConcurrencySetter]. Engines that
-// don't implement the setter (Postgres today) inherit their existing apply
-// path unchanged.
+// applyApplyConcurrency plumbs the streamer-side resolved apply-concurrency
+// value to a target [ir.ChangeApplier] that opts into the ADR-0104 (item
+// 23(c), MySQL) / ADR-0105 (item 26, Postgres) key-hash concurrent apply via
+// [ir.ApplyConcurrencySetter]. Both shipping engines implement the setter;
+// any future engine that doesn't inherits its existing serial apply path
+// unchanged (type-assertion fails closed).
 //
-// Zero-value-safe: lanes <= 1 is a no-op (serial default kept); the setter
-// is invoked ONLY for an explicit W > 1. Called immediately after each
-// engine applier opens, before any ApplyBatch dispatch (sibling to
-// applyExecTimeout / applyMaxBufferBytes).
+// lanes is the ADR-0106-resolved value (auto:N for an unset
+// --apply-concurrency, an explicit 1 for serial opt-out, N>1 honored), not
+// the operator's raw field. lanes <= 1 is a no-op (serial default kept); the
+// setter is invoked ONLY for W > 1. Called immediately after each engine
+// applier opens, before any ApplyBatch dispatch (sibling to applyExecTimeout
+// / applyMaxBufferBytes).
 func applyApplyConcurrency(target any, lanes int) {
 	if lanes <= 1 {
 		return

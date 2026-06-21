@@ -90,8 +90,10 @@ func (s *Streamer) maybeAttachAIMDController(ctx context.Context, applier ir.Cha
 	// wire them via SetLaneAIMDControllers, then return nil: the metrics
 	// server has no single controller to snapshot on this path (per-lane
 	// snapshot aggregation is a documented follow-up). The serial single-
-	// controller path below is UNCHANGED for W <= 1.
-	if s.ApplyConcurrency > 1 {
+	// controller path below is UNCHANGED for W <= 1. The lane count is the
+	// ADR-0106-resolved value (auto:N for an unset --apply-concurrency), so the
+	// per-lane controllers match the lanes the applier actually engaged.
+	if s.resolvedApplyConcurrency > 1 {
 		if laneSetter, ok := applier.(ir.LaneAIMDSetter); ok {
 			return s.attachLaneAIMDControllers(ctx, laneSetter, streamID)
 		}
@@ -189,7 +191,7 @@ func (s *Streamer) attachLaneAIMDControllers(ctx context.Context, setter ir.Lane
 	if target <= 0 {
 		target = resolveAIMDTargetLatency(s.targetCapsForAIMD())
 	}
-	w := s.ApplyConcurrency
+	w := s.resolvedApplyConcurrency
 	controllers := make([]ir.BatchSizeController, 0, w)
 	for i := 0; i < w; i++ {
 		cfg := appliercontrol.Config{

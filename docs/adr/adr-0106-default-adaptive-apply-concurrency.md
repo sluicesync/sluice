@@ -2,7 +2,7 @@
 
 ## Status
 
-**Proposed** (design; NOT yet implemented). Realizes roadmap item 31. Operator-flagged 2026-06-21 ("better speeds out-of-the-box, rather than users needing to opt-in to faster behavior"). Changes a default for **every** user, so it ships as its own release behind a full regression cycle and the `-race`-before-tag gate (CDC/exactly-once chunk).
+**Accepted** (implemented; resolution lives in `internal/pipeline.Streamer.resolveApplyConcurrency`, called per attempt by `runOnce`). Realizes roadmap item 31. Operator-flagged 2026-06-21 ("better speeds out-of-the-box, rather than users needing to opt-in to faster behavior"). Changes a default for **every** user, so it ships as its own release behind a full regression cycle and the `-race`-before-tag gate (CDC/exactly-once chunk) — the main session drives that release.
 
 ## Context
 
