@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 
@@ -449,21 +450,59 @@ func (w *RowWriter) writeBatchedConn(ctx context.Context, conn *sql.Conn, table 
 		}
 		query := buildBatchInsert(table, len(batch))
 		args := flattenArgs(batch, table)
-		if _, err := conn.ExecContext(ctx, query, args...); err != nil {
-			return fmt.Errorf("mysql: insert into %q (%d rows): %w", table.Name, len(batch), err)
-		}
-		flushes++
-		// Strict sql_mode rejects an out-of-range value at the INSERT
-		// above (loud already); under --mysql-sql-mode='' MySQL silently
-		// clamps/truncates and only flags it via the warning list — so
-		// check after a successful flush (Vector B). Refuses (strict)
-		// or WARNs once per table (relaxed). Sampled rather than
-		// every-flush — see [warningsCheckDue] for the schedule and
-		// what the sampling does and doesn't weaken.
-		if final || warningsCheckDue(flushes) {
-			if err := w.reportBulkWriteWarnings(ctx, conn, table.Name); err != nil {
-				return err
+		// ADR-0108: ride a transient target primary-reparent / "not
+		// serving". The exec + the session-scoped SHOW WARNINGS probe BOTH
+		// run on the conn flushWithReparentRetry hands us — the originally
+		// pinned conn on the first try, a FRESH pool conn (reconnected to
+		// the new primary) on every retry. The dead post-reparent conn is
+		// never reused.
+		if err := w.flushWithReparentRetry(ctx, table.Name, len(batch), func(c *sql.Conn, isRetry bool) error {
+			if _, err := c.ExecContext(ctx, query, args...); err != nil {
+				// WART: tolerate-1062-on-retry (ADR-0108). A plain cold-copy
+				// batch is a SINGLE atomic multi-row INSERT. On a classified
+				// transient (reparent / conn-reset) the prior attempt either
+				// fully rolled back (this retry succeeds clean) OR
+				// committed-but-the-ack-was-lost. In the lost-ack case the
+				// retry re-applies the BYTE-IDENTICAL batch and collides with
+				// the rows it already landed → Error 1062. Because cold-copy
+				// is the SOLE writer onto a fresh target and the batch is
+				// byte-identical, a 1062 *on the retry of the same batch*
+				// PROVES those exact rows are already durable — so we treat
+				// the batch as done and continue (no silent loss: the data is
+				// there). This tolerance is SCOPED to isRetry only: a
+				// FIRST-ATTEMPT 1062 stays terminal (a real non-PK uniqueness
+				// violation / dirty target must fail loudly — unchanged
+				// ADR-0038 policy). The idempotent path needs no such wart
+				// (its UPSERT absorbs the collision).
+				if isRetry && isMySQLDupKey(err) {
+					slog.WarnContext(
+						ctx, "mysql: cold-copy plain INSERT retry collided with a duplicate key (Error 1062); "+
+							"the prior attempt committed but lost its ack across the transient — the rows already landed, "+
+							"treating this byte-identical batch as durable (ADR-0108 tolerate-1062-on-retry)",
+						slog.String("table", table.Name),
+						slog.Int("rows", len(batch)),
+					)
+					return nil
+				}
+				return fmt.Errorf("mysql: insert into %q (%d rows): %w", table.Name, len(batch), err)
 			}
+			// Strict sql_mode rejects an out-of-range value at the INSERT
+			// above (loud already); under --mysql-sql-mode='' MySQL silently
+			// clamps/truncates and only flags it via the warning list — so
+			// check after a successful flush (Vector B). Refuses (strict)
+			// or WARNs once per table (relaxed). Sampled rather than
+			// every-flush — see [warningsCheckDue] for the schedule and
+			// what the sampling does and doesn't weaken. The flushes counter
+			// drives sampling; bumped once per logical flush (here, inside
+			// the attempt) so a retry of the same batch re-checks under the
+			// same schedule slot rather than skewing the count.
+			flushes++
+			if final || warningsCheckDue(flushes) {
+				return w.reportBulkWriteWarnings(ctx, c, table.Name)
+			}
+			return nil
+		}, conn); err != nil {
+			return err
 		}
 		batch = batch[:0]
 		batchBytes = 0

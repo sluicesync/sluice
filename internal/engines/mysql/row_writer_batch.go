@@ -348,15 +348,25 @@ func (w *RowWriter) writeBatchedIdempotentConn(ctx context.Context, conn *sql.Co
 		}
 		query := buildBatchUpsert(table, len(batch), keyCols)
 		args := flattenArgs(batch, table)
-		if _, err := conn.ExecContext(ctx, query, args...); err != nil {
-			return fmt.Errorf("mysql: idempotent insert into %q (%d rows): %w", table.Name, len(batch), err)
-		}
-		// Vector B: strict sql_mode errors at the upsert above; under
-		// --mysql-sql-mode='' MySQL silently clamps and only flags the
-		// warning list — check it before advancing any watermark so a
-		// strict-mode refusal (returned error) doesn't mark a bad batch
-		// durable, and a relaxed-mode clamp is WARNed once per table.
-		if err := w.reportBulkWriteWarnings(ctx, conn, table.Name); err != nil {
+		// ADR-0108: ride a transient target primary-reparent / "not
+		// serving". The exec + the session-scoped SHOW WARNINGS probe BOTH
+		// run on the conn flushWithReparentRetry hands us — the originally
+		// pinned conn on the first try, a FRESH pool conn (reconnected to
+		// the new primary) on every retry. The dead post-reparent conn is
+		// never reused. The idempotent UPSERT absorbs an ambiguous-commit
+		// replay natively, so no 1062-on-retry tolerance is needed here
+		// (contrast the plain path's wart).
+		if err := w.flushWithReparentRetry(ctx, table.Name, len(batch), func(c *sql.Conn, _ bool) error {
+			if _, err := c.ExecContext(ctx, query, args...); err != nil {
+				return fmt.Errorf("mysql: idempotent insert into %q (%d rows): %w", table.Name, len(batch), err)
+			}
+			// Vector B: strict sql_mode errors at the upsert above; under
+			// --mysql-sql-mode='' MySQL silently clamps and only flags the
+			// warning list — check it before advancing any watermark so a
+			// strict-mode refusal (returned error) doesn't mark a bad batch
+			// durable, and a relaxed-mode clamp is WARNed once per table.
+			return w.reportBulkWriteWarnings(ctx, c, table.Name)
+		}, conn); err != nil {
 			return err
 		}
 		// Report the durable-write delta (v0.99.9): this batch is now

@@ -1,0 +1,177 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
+// # Cold-copy reparent-retry (ADR-0108)
+//
+// The COPY-phase analog of ADR-0038's apply-phase retry. A bulk
+// cold-copy that runs for minutes can outlive a transient target
+// PRIMARY REPARENT — e.g. a PlanetScale non-Metal storage auto-grow at
+// the ~39 GB boundary triggers a primary reparent, and the in-flight
+// INSERT connection dies with a "not serving" / vttablet
+// `code = Unavailable` error. Pre-ADR-0108 the RowWriter returned that
+// raw driver error unwrapped, the cold-copy process EXITED, and the
+// supervisor crash-looped straight back into the still-in-progress
+// reparent (the live Track-D finding: 9 relaunches, each re-hitting it).
+//
+// This file adds a bounded, observable retry around the per-batch flush.
+// It deliberately does NOT import internal/pipeline (the writer lives in
+// an engine package; the pipeline's ADR-0038 loop is apply-phase only) —
+// the backoff shape is re-derived here, small and self-contained.
+//
+// The load-bearing requirement (see ADR-0108): after a reparent the
+// PINNED connection is DEAD. A retry MUST re-acquire a FRESH connection
+// from w.db — the pool reconnects to the new primary on the next
+// db.Conn() — never reuse the bad one. The caller (the flush closure)
+// re-runs the exec + the post-flush SHOW WARNINGS probe on that fresh
+// conn.
+
+package mysql
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"sluicesync.dev/sluice/internal/ir"
+)
+
+// Cold-copy reparent-retry bounds. Zero-value-safe by construction:
+// these are package constants, not config fields, so there is no
+// EnableX-defaulting-true trap (the v0.99.51 lesson) — every
+// construction path (CLI, tests, broker, future callers) gets the same
+// bounds. The envelope is sized to ride a 30–60s reparent comfortably,
+// up to ~2–3 min worst case:
+//
+//	100ms → 200ms → 400ms → 800ms → 1.6s → 3.2s → 6.4s → 12.8s →
+//	25.6s → 30s (cap) → 30s → 30s → ...
+//
+// 12 attempts × max(30s) ≈ up to ~4 min of failure tolerated before a
+// LOUD terminal error — long enough for a managed-Vitess reparent /
+// storage-grow, short enough that a genuinely-wedged target surfaces
+// rather than hiding for hours. Mirrors ADR-0038's 8×30s envelope,
+// stretched slightly because a storage-auto-grow reparent can run longer
+// than a tx-killer blip.
+//
+// These are package vars (not consts) ONLY so the unit tests can shrink
+// the envelope to keep the suite fast — production NEVER mutates them, so
+// the zero-value-safe-default reasoning is unaffected (there is no config
+// field and no zero-value path; the values are baked at package init).
+var (
+	coldCopyReparentRetryAttemptsVar = 12
+	coldCopyReparentBackoffBaseVar   = 100 * time.Millisecond
+	coldCopyReparentBackoffCapVar    = 30 * time.Second
+)
+
+// coldCopyReparentBackoff returns the per-attempt backoff for the
+// cold-copy reparent-retry loop: exponential doubling from
+// coldCopyReparentBackoffBaseVar, capped at coldCopyReparentBackoffCapVar.
+// attempt is 1-based (attempt 1 is the first RETRY, i.e. the wait BEFORE
+// the second flush try). Mirrors pipeline.computeRetryBackoff's shape
+// without the engine RetryHint plumbing (cold-copy has no hint source).
+func coldCopyReparentBackoff(attempt int) time.Duration {
+	b := coldCopyReparentBackoffBaseVar
+	for i := 1; i < attempt; i++ {
+		b *= 2
+		if b > coldCopyReparentBackoffCapVar {
+			return coldCopyReparentBackoffCapVar
+		}
+	}
+	return b
+}
+
+// flushWithReparentRetry runs a single cold-copy batch flush with the
+// ADR-0108 bounded reparent-retry around it. It is the ONE place the
+// retry policy lives so the plain and idempotent paths (and their
+// parallel-worker callers) share one shape, one log, one bound.
+//
+//   - tableName names the table for the WARN/terminal messages.
+//   - rows is the row count of the batch being flushed (for the logs).
+//   - attempt runs the flush against a CONNECTION. On the first try the
+//     caller passes its already-pinned conn (isRetry=false); on every
+//     retry this helper re-acquires a FRESH *sql.Conn from w.db (the pool
+//     reconnects to the new primary) and passes it in with isRetry=true —
+//     so the dead post-reparent conn is NEVER reused. attempt MUST run
+//     the exec AND the post-flush warning probe on the conn it is handed.
+//     The isRetry flag is load-bearing for the plain path's
+//     1062-on-retry tolerance wart (see writeBatchedConn): the SAME
+//     byte-identical atomic batch re-applied after a classified transient
+//     may collide on a committed-but-unacked prior attempt; that 1062 is
+//     provably "already landed" ONLY on a retry. A first-attempt 1062
+//     (isRetry=false) stays terminal (real dup-key / dirty target).
+//
+// The first error is routed through classifyApplierError; the loop
+// retries ONLY when it satisfies ir.RetriableError (the same transient
+// set the CDC apply path retries — connection-reset / EOF / vttablet
+// Unavailable / the new "not serving"/"reparent" text fallback). Any
+// non-retriable (terminal) error returns unchanged, exactly as today.
+//
+// On retry the helper backs off (honoring ctx.Done() for prompt cancel),
+// re-acquires a fresh conn, closes it after the attempt, and tries
+// again. On budget exhaustion it returns a LOUD terminal error wrapping
+// the most recent transient (never silent, never infinite).
+func (w *RowWriter) flushWithReparentRetry(
+	ctx context.Context,
+	tableName string,
+	rows int,
+	attempt func(conn *sql.Conn, isRetry bool) error,
+	firstConn *sql.Conn,
+) error {
+	err := attempt(firstConn, false)
+	if err == nil {
+		return nil
+	}
+
+	for try := 1; ; try++ {
+		// Classify the MOST RECENT error. Only a transient (reparent /
+		// connection-reset / vttablet-unavailable class) is retriable;
+		// everything else — including a real terminal value-fidelity
+		// failure or a first-attempt 1062 — returns unchanged.
+		var re ir.RetriableError
+		if !errors.As(classifyApplierError(err), &re) || !re.Retriable() {
+			return err
+		}
+		if try >= coldCopyReparentRetryAttemptsVar {
+			return fmt.Errorf(
+				"mysql: cold-copy into %q: batch flush (%d rows) still failing after exhausting the reparent-retry budget "+
+					"(%d attempts; the target may be undergoing a prolonged reparent/failover or be genuinely down): %w",
+				tableName, rows, try, err,
+			)
+		}
+
+		backoff := coldCopyReparentBackoff(try)
+		slog.WarnContext(
+			ctx, "mysql: cold-copy batch flush hit a transient target error (likely a primary reparent / 'not serving'); "+
+				"re-acquiring a fresh connection and retrying",
+			slog.String("table", tableName),
+			slog.Int("rows", rows),
+			slog.Int("attempt", try),
+			slog.Int("max_attempts", coldCopyReparentRetryAttemptsVar),
+			slog.Duration("backoff", backoff),
+			slog.String("err", err.Error()),
+		)
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+
+		// Re-acquire a FRESH connection — the pinned conn is dead after a
+		// reparent; the pool reconnects to the new primary here. NEVER
+		// reuse firstConn. A re-acquire failure is itself classified on
+		// the next loop iteration (a still-in-progress reparent surfaces
+		// the same transient shape), so it rides the budget too.
+		conn, acqErr := w.db.Conn(ctx)
+		if acqErr != nil {
+			err = acqErr
+			continue
+		}
+		err = attempt(conn, true)
+		_ = conn.Close()
+		if err == nil {
+			return nil
+		}
+	}
+}

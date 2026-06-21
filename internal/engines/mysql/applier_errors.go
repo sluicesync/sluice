@@ -80,6 +80,21 @@ func isMySQLDeadlock(err error) bool {
 	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1213
 }
 
+// isMySQLDupKey reports whether err is (or wraps) a duplicate-key error —
+// MySQL error 1062 / SQLSTATE 23000. classifyApplierError keeps 1062
+// firmly NON-retriable (ADR-0038: a real uniqueness violation or an
+// idempotency gap must fail loudly). This predicate exists ONLY for the
+// ADR-0108 plain-cold-copy "tolerate-1062-on-retry" wart: a byte-
+// identical atomic INSERT re-applied after a classified transient may
+// have committed-but-lost-the-ack on the prior attempt, so a 1062 on the
+// RETRY of the same batch means those exact rows already landed durably.
+// See writeBatchedConn for the full safety argument and why this is
+// scoped to retry-only.
+func isMySQLDupKey(err error) bool {
+	var mysqlErr *gomysql.MySQLError
+	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1062
+}
+
 // isDiskFullSignal reports whether err is (or wraps / textually carries) a
 // source-side OUT-OF-DISK signal. Used to enrich the source-unresponsive
 // diagnosis (the verify-timeout path) — a full source datadir is a leading
@@ -194,6 +209,17 @@ func classifyApplierError(err error) error {
 	// Connection-string-level transients that don't surface as a
 	// MySQLError but do appear as raw error text from the driver
 	// or the connection pool. Pattern-match defensively.
+	//
+	// "not serving" / "reparent" (ADR-0108): a target PRIMARY REPARENT
+	// (e.g. a PlanetScale non-Metal storage auto-grow at the ~39 GB
+	// boundary) makes the in-flight tablet briefly "not serving". The
+	// vttablet-framed shape (Error 1105 `code = Unavailable`) is already
+	// caught above, but a PlanetScale/vtgate reparent can ALSO surface
+	// without that framing — belt-and-suspenders so the cold-copy
+	// reparent-retry (ADR-0108) AND the CDC apply path (ADR-0038) both
+	// ride it out. Case-insensitive: vtgate/vttablet wording varies in
+	// case across versions. These phrases do not appear in healthy or
+	// terminal-semantic errors.
 	if msg := err.Error(); msg != "" {
 		switch {
 		case strings.Contains(msg, "connection reset by peer"),
@@ -202,9 +228,41 @@ func classifyApplierError(err error) error {
 			strings.Contains(msg, "i/o timeout"):
 			return &retriableMySQLError{err: err}
 		}
+		lower := strings.ToLower(msg)
+		for _, sub := range reparentRetriableSubstrings {
+			if strings.Contains(lower, sub) {
+				return &retriableMySQLError{err: err}
+			}
+		}
 	}
 
 	return err
+}
+
+// reparentRetriableSubstrings is the EXACT (lower-cased) substring set
+// that marks an un-framed target primary-reparent / "not serving"
+// transient as retriable (ADR-0108) — the belt-and-suspenders fallback
+// for a PlanetScale/vtgate reparent that surfaces WITHOUT the vttablet
+// `code = Unavailable` framing [classifyVitessMessage] already catches.
+//
+// Pinned as a standalone slice in the same discipline as
+// [vitessRetriableSubstrings] / [vitessTxKillerSubstrings]:
+// [TestReparentRetriableSubstrings_PinDown] pins these literals so a
+// future Vitess/PlanetScale wording change fails a test rather than
+// silently non-retrying a production reparent. The matcher lower-cases
+// the error text before comparing, so these MUST be lower-case. Do NOT
+// inline these strings elsewhere — extend this slice and the pin test
+// together.
+//
+//	"not serving" — the tablet-state phrase a reparent surfaces while the
+//	                new primary is being promoted ("tablet ... is not
+//	                serving", "primary is not serving").
+//	"reparent"    — the operation name itself, in case it appears in the
+//	                error text (PlanetScale/vtgate emergency-reparent
+//	                / planned-reparent messages).
+var reparentRetriableSubstrings = []string{
+	"not serving",
+	"reparent",
 }
 
 // vitessRetriableSubstrings is the EXACT set of substrings that mark a

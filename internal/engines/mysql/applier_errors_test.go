@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"testing"
 
 	gomysql "github.com/go-sql-driver/mysql"
@@ -369,5 +370,81 @@ func TestVitessRetriableSubstrings_PinDown4(t *testing.T) {
 	}
 	if classifyVitessMessage("rpc error: code = Aborted desc = no discriminator tag") {
 		t.Errorf("missing %q discriminator still classified retriable — ADR-0038 pin-down 4 requires the tag", discriminator)
+	}
+}
+
+// TestClassifyApplierError_ReparentSubstrings pins the ADR-0108 text
+// fallback: an un-framed primary-reparent / "not serving" error (one
+// WITHOUT the vttablet `code = Unavailable` framing the Vitess branch
+// already catches) classifies as retriable, case-insensitively — so both
+// the cold-copy reparent-retry (ADR-0108) and the CDC apply retry
+// (ADR-0038) ride it out. An unrelated error stays terminal.
+func TestClassifyApplierError_ReparentSubstrings(t *testing.T) {
+	retriable := []struct {
+		name string
+		msg  string
+	}{
+		{"not serving (lower)", "tablet ks/-80 is not serving"},
+		{"Not Serving (mixed case)", "ERROR: primary is Not Serving during failover"},
+		{"reparent (lower)", "operation interrupted by emergency reparent"},
+		{"Reparent (mixed case)", "PlanetScale: Planned Reparent in progress, retry shortly"},
+	}
+	for _, c := range retriable {
+		c := c
+		t.Run("retriable/"+c.name, func(t *testing.T) {
+			got := classifyApplierError(errors.New(c.msg))
+			var re ir.RetriableError
+			if !errors.As(got, &re) || !re.Retriable() {
+				t.Errorf("ADR-0108: %q should classify retriable; got %T (%v)", c.msg, got, got)
+			}
+		})
+	}
+
+	terminal := []struct {
+		name string
+		msg  string
+	}{
+		{"unrelated error stays terminal", "syntax error near 'FROM'"},
+		{"serving (no 'not') stays terminal", "tablet is serving traffic normally"},
+		{"parent (substring near-miss) stays terminal", "parent table missing for FK"},
+	}
+	for _, c := range terminal {
+		c := c
+		t.Run("terminal/"+c.name, func(t *testing.T) {
+			got := classifyApplierError(errors.New(c.msg))
+			var re ir.RetriableError
+			if errors.As(got, &re) {
+				t.Errorf("ADR-0108 default-deny: %q must stay terminal; got retriable", c.msg)
+			}
+		})
+	}
+}
+
+// TestReparentRetriableSubstrings_PinDown is the change-detector for the
+// ADR-0108 reparent-fallback match set, in the same discipline as
+// TestVitessRetriableSubstrings_PinDown4. If a future Vitess/PlanetScale
+// wording change drops "not serving" / "reparent", this fails LOUDLY so a
+// maintainer re-derives the set rather than silently non-retrying a
+// production reparent. The literals are duplicated from production (a pin
+// that reads the value it guards cannot detect the value changing) and
+// MUST be lower-case (the matcher lower-cases the error text first).
+func TestReparentRetriableSubstrings_PinDown(t *testing.T) {
+	want := []string{"not serving", "reparent"}
+	if len(reparentRetriableSubstrings) != len(want) {
+		t.Fatalf("reparentRetriableSubstrings = %q; ADR-0108 pins exactly %q. "+
+			"If the reparent wording changed, update BOTH the production slice and this pin (and ADR-0108).",
+			reparentRetriableSubstrings, want)
+	}
+	got := make(map[string]bool, len(reparentRetriableSubstrings))
+	for _, s := range reparentRetriableSubstrings {
+		if s != strings.ToLower(s) {
+			t.Errorf("reparentRetriableSubstrings entry %q is not lower-case; the matcher lower-cases the error text, so a mixed-case literal can never match", s)
+		}
+		got[s] = true
+	}
+	for _, w := range want {
+		if !got[w] {
+			t.Errorf("ADR-0108: reparentRetriableSubstrings is missing %q (got %q); a reparent with this phrasing would silently NON-retry", w, reparentRetriableSubstrings)
+		}
 	}
 }
