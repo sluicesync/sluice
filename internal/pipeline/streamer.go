@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"sluicesync.dev/sluice/internal/appliercontrol"
 	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
@@ -934,6 +935,17 @@ type Streamer struct {
 	// operator's raw [ApplyConcurrency] is never mutated (a retry must
 	// re-resolve from the same input).
 	resolvedApplyConcurrency int
+
+	// laneAIMDControllers holds the W per-lane AIMD controllers built by
+	// [attachLaneAIMDControllers] on the ADR-0104/0105 concurrent key-hash
+	// apply path. The serial single-controller path returns its controller
+	// directly to the metrics phase; the per-lane path has no single
+	// controller to return, so it parks the slice here for
+	// [phaseStartMetricsServer] to attach to the metrics server (each lane
+	// emitted as its own `lane="N"`-labeled series). Re-set per runOnce
+	// attempt alongside the controllers it describes; nil on the serial path
+	// and when --apply-concurrency resolves to 1.
+	laneAIMDControllers []*appliercontrol.Controller
 }
 
 // Run executes a snapshot+CDC stream with optional retry on

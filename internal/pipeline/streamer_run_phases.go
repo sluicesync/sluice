@@ -286,6 +286,14 @@ func (s *Streamer) phaseStartMetricsServer(ctx context.Context, applier ir.Chang
 	if aimdController != nil {
 		metricsSrv.AttachAIMDController(aimdController)
 	}
+	// ADR-0104/0105 concurrent key-hash apply (item 31's default path): the
+	// per-lane controllers have no single handle to thread through
+	// aimdController, so maybeAttachAIMDController parks them on the streamer.
+	// Attach them here so each lane surfaces as its own `lane="N"`-labeled
+	// AIMD series. Serial path leaves this nil — byte-identical to before.
+	if len(s.laneAIMDControllers) > 0 {
+		metricsSrv.AttachLaneAIMDControllers(s.laneAIMDControllers)
+	}
 	// Severity-B finding F2 (2026-05-22 PG-internals research): when
 	// the source supports it (PG 14+), attach a spill-stats reporter
 	// so per-scrape `pg_stat_replication_slots.spill_*` counters are

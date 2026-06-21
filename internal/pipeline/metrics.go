@@ -61,7 +61,12 @@ type MetricsServer struct {
 
 	mu             sync.RWMutex
 	aimdController *appliercontrol.Controller
-	spillReporter  SpillReporterFunc
+	// laneAIMDControllers holds the W per-lane controllers when the stream
+	// runs the ADR-0104/0105 concurrent key-hash apply path. Mutually
+	// exclusive with aimdController in practice (the streamer attaches one
+	// or the other), but both are snapshotted at scrape time if set.
+	laneAIMDControllers []*appliercontrol.Controller
+	spillReporter       SpillReporterFunc
 
 	// ready flips to true once the streamer has finished its cold-start
 	// or warm-resume preamble and entered the apply loop. /readyz reads
@@ -169,6 +174,23 @@ func (m *MetricsServer) AttachAIMDController(c *appliercontrol.Controller) {
 	m.aimdController = c
 }
 
+// AttachLaneAIMDControllers plugs the W per-lane [appliercontrol.Controller]s
+// of the ADR-0104/0105 concurrent key-hash apply path into the metrics
+// server so the AIMD gauges fire PER LANE — the same four metric families as
+// the serial path, each carrying an additional `lane="N"` label. Snapshotted
+// at scrape time via [appliercontrol.Controller.Snapshot]; no instrumentation
+// of the apply hot path. Idempotent; a nil/empty slice detaches.
+//
+// Item 31 made the concurrent path the default (`--apply-concurrency` resolves
+// to auto:N), so without this the default stream lost AIMD observability
+// entirely — the serial AttachAIMDController surface above never engages on
+// the per-lane path.
+func (m *MetricsServer) AttachLaneAIMDControllers(cs []*appliercontrol.Controller) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.laneAIMDControllers = cs
+}
+
 // AttachSpillReporter plugs a PG-slot-spill snapshotter into the metrics
 // server (severity-B finding F2). The closure owns its own source DB
 // connection and is invoked at scrape time; see [SpillReporterFunc] for
@@ -193,6 +215,23 @@ func (m *MetricsServer) aimdSnapshot() (appliercontrol.MetricsSnapshot, bool) {
 		return appliercontrol.MetricsSnapshot{}, false
 	}
 	return m.aimdController.Snapshot(), true
+}
+
+// laneAIMDSnapshots returns one snapshot per attached lane controller, in
+// lane-index order (index i is lane i), or nil when none are attached. Each
+// controller is snapshotted atomically via Snapshot; the returned slice is
+// freshly allocated so the caller can emit it outside the lock.
+func (m *MetricsServer) laneAIMDSnapshots() []appliercontrol.MetricsSnapshot {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if len(m.laneAIMDControllers) == 0 {
+		return nil
+	}
+	snaps := make([]appliercontrol.MetricsSnapshot, len(m.laneAIMDControllers))
+	for i, c := range m.laneAIMDControllers {
+		snaps[i] = c.Snapshot()
+	}
+	return snaps
 }
 
 // spillReporterFn returns the attached spill-reporter closure (or nil
@@ -221,6 +260,9 @@ func (m *MetricsServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	emitMetrics(w, streams, now)
 	if snap, ok := m.aimdSnapshot(); ok {
 		emitAIMDMetrics(w, snap)
+	}
+	if snaps := m.laneAIMDSnapshots(); len(snaps) > 0 {
+		emitLaneAIMDMetrics(w, snaps)
 	}
 	if fn := m.spillReporterFn(); fn != nil {
 		snap, ok, err := fn(r.Context())
@@ -350,11 +392,58 @@ func emitAIMDMetrics(w io.Writer, s appliercontrol.MetricsSnapshot) {
 
 	fmt.Fprintln(w, "# HELP sluice_apply_batch_size_cooloff 1 when the AIMD controller is currently in cool-off (suppressing AI), 0 otherwise.")
 	fmt.Fprintln(w, "# TYPE sluice_apply_batch_size_cooloff gauge")
-	coolOff := 0
-	if s.InCoolOff {
-		coolOff = 1
+	fmt.Fprintf(w, `sluice_apply_batch_size_cooloff{stream_id=%q} %d`+"\n", s.StreamID, boolGauge(s.InCoolOff))
+}
+
+// emitLaneAIMDMetrics renders the per-lane AIMD controllers of the
+// ADR-0104/0105 concurrent key-hash apply path (item 31's now-default
+// surface). It emits the SAME four metric families as [emitAIMDMetrics] but
+// each series carries an additional `lane="N"` label (N = the lane index), so
+// the serial path's existing series shape is untouched and a concurrent
+// stream surfaces one series per lane:
+//
+//	sluice_apply_batch_size_current{stream_id="…",lane="0"} 1000
+//	sluice_apply_batch_size_current{stream_id="…",lane="1"} 750
+//	…
+//
+// HELP/TYPE headers are emitted once per family (the lane series share the
+// metric name); the per-lane samples follow. snaps is in lane-index order.
+func emitLaneAIMDMetrics(w io.Writer, snaps []appliercontrol.MetricsSnapshot) {
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "# HELP sluice_apply_batch_size_current AIMD controller's current target apply-batch-size after its latest decision.")
+	fmt.Fprintln(w, "# TYPE sluice_apply_batch_size_current gauge")
+	for i, s := range snaps {
+		fmt.Fprintf(w, `sluice_apply_batch_size_current{stream_id=%q,lane="%d"} %d`+"\n", s.StreamID, i, s.CurrentSize)
 	}
-	fmt.Fprintf(w, `sluice_apply_batch_size_cooloff{stream_id=%q} %d`+"\n", s.StreamID, coolOff)
+	fmt.Fprintln(w)
+
+	fmt.Fprintln(w, "# HELP sluice_apply_batch_size_p95_seconds Rolling p95 batch-apply latency, in seconds, over the AIMD controller's sliding window.")
+	fmt.Fprintln(w, "# TYPE sluice_apply_batch_size_p95_seconds gauge")
+	for i, s := range snaps {
+		fmt.Fprintf(w, `sluice_apply_batch_size_p95_seconds{stream_id=%q,lane="%d"} %s`+"\n", s.StreamID, i, formatPrometheusSeconds(s.P95))
+	}
+	fmt.Fprintln(w)
+
+	fmt.Fprintln(w, "# HELP sluice_apply_batch_size_decreases_total Number of multiplicative-decrease events the AIMD controller has fired on this stream.")
+	fmt.Fprintln(w, "# TYPE sluice_apply_batch_size_decreases_total counter")
+	for i, s := range snaps {
+		fmt.Fprintf(w, `sluice_apply_batch_size_decreases_total{stream_id=%q,lane="%d"} %d`+"\n", s.StreamID, i, s.DecreasesTotal)
+	}
+	fmt.Fprintln(w)
+
+	fmt.Fprintln(w, "# HELP sluice_apply_batch_size_cooloff 1 when the AIMD controller is currently in cool-off (suppressing AI), 0 otherwise.")
+	fmt.Fprintln(w, "# TYPE sluice_apply_batch_size_cooloff gauge")
+	for i, s := range snaps {
+		fmt.Fprintf(w, `sluice_apply_batch_size_cooloff{stream_id=%q,lane="%d"} %d`+"\n", s.StreamID, i, boolGauge(s.InCoolOff))
+	}
+}
+
+// boolGauge maps a Go bool to the Prometheus 1/0 gauge convention.
+func boolGauge(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // formatPrometheusSeconds renders a duration as a Prometheus gauge

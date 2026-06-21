@@ -139,9 +139,10 @@ type BatchSizeController interface {
 // goroutines touch the same controller — but the [appliercontrol.Controller]
 // is concurrency-safe regardless (the metrics scraper reads Snapshot).
 //
-// Engines that don't implement it (Postgres — it uses ADR-0092's
-// within-transaction statement pipelining, not key-hash lanes) inherit
-// the static per-lane batch size. Only the MySQL target implements it.
+// Both shipping engines implement it: MySQL's key-hash lanes (ADR-0104)
+// and Postgres's lane router (ADR-0105). A future engine that adopts
+// --apply-concurrency without a per-lane surface simply doesn't implement
+// it and inherits the static per-lane batch size.
 type LaneAIMDSetter interface {
 	SetLaneAIMDControllers(controllers []BatchSizeController)
 }

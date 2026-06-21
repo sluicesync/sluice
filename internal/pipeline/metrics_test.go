@@ -140,6 +140,136 @@ func TestEmitAIMDMetrics_NotInCoolOff(t *testing.T) {
 	}
 }
 
+// newAIMDControllerForTest builds a real appliercontrol.Controller wound to
+// a known CurrentSize, so the handler-level lane tests exercise the actual
+// Snapshot path (not a hand-built snapshot). InitialSize == ceiling so the
+// controller's CurrentSize starts at `size`.
+func newAIMDControllerForTest(t *testing.T, streamID string, size int) *appliercontrol.Controller {
+	t.Helper()
+	ctrl, err := appliercontrol.New(appliercontrol.Config{
+		StreamID:      streamID,
+		Floor:         1,
+		Ceiling:       size,
+		InitialSize:   size,
+		TargetLatency: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("appliercontrol.New: %v", err)
+	}
+	return ctrl
+}
+
+// TestEmitLaneAIMDMetrics pins the ADR-0104/0105 per-lane gauge set (item
+// 31's now-default concurrent path). Every lane must emit ALL FOUR metric
+// families with a `lane="N"` label and the correct per-lane value — the
+// renderer dispatches the same four lines per slice element, so the pin
+// exercises >1 lane with DISTINCT values across all four families (current,
+// p95, decreases, cool-off true AND false) rather than a single
+// representative lane. HELP/TYPE headers emit once per family.
+func TestEmitLaneAIMDMetrics(t *testing.T) {
+	snaps := []appliercontrol.MetricsSnapshot{
+		appliercontrolSnapshot("mystream", 1000, 1_200*time.Millisecond, 0, false),
+		appliercontrolSnapshot("mystream", 500, 4_750*time.Millisecond, 2, true),
+		appliercontrolSnapshot("mystream", 250, 9_001*time.Millisecond, 5, false),
+	}
+	var buf bytes.Buffer
+	emitLaneAIMDMetrics(&buf, snaps)
+	out := buf.String()
+	for _, want := range []string{
+		// HELP/TYPE headers — once per family (shared metric name).
+		"# HELP sluice_apply_batch_size_current",
+		"# TYPE sluice_apply_batch_size_current gauge",
+		"# HELP sluice_apply_batch_size_p95_seconds",
+		"# TYPE sluice_apply_batch_size_p95_seconds gauge",
+		"# HELP sluice_apply_batch_size_decreases_total",
+		"# TYPE sluice_apply_batch_size_decreases_total counter",
+		"# HELP sluice_apply_batch_size_cooloff",
+		"# TYPE sluice_apply_batch_size_cooloff gauge",
+		// Lane 0.
+		`sluice_apply_batch_size_current{stream_id="mystream",lane="0"} 1000`,
+		`sluice_apply_batch_size_p95_seconds{stream_id="mystream",lane="0"} 1.200`,
+		`sluice_apply_batch_size_decreases_total{stream_id="mystream",lane="0"} 0`,
+		`sluice_apply_batch_size_cooloff{stream_id="mystream",lane="0"} 0`,
+		// Lane 1 — distinct values, cool-off ON.
+		`sluice_apply_batch_size_current{stream_id="mystream",lane="1"} 500`,
+		`sluice_apply_batch_size_p95_seconds{stream_id="mystream",lane="1"} 4.750`,
+		`sluice_apply_batch_size_decreases_total{stream_id="mystream",lane="1"} 2`,
+		`sluice_apply_batch_size_cooloff{stream_id="mystream",lane="1"} 1`,
+		// Lane 2.
+		`sluice_apply_batch_size_current{stream_id="mystream",lane="2"} 250`,
+		`sluice_apply_batch_size_p95_seconds{stream_id="mystream",lane="2"} 9.001`,
+		`sluice_apply_batch_size_decreases_total{stream_id="mystream",lane="2"} 5`,
+		`sluice_apply_batch_size_cooloff{stream_id="mystream",lane="2"} 0`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in per-lane AIMD output; got:\n%s", want, out)
+		}
+	}
+	// The serial (no-lane) series shape MUST NOT appear on the per-lane path:
+	// the substring `_current{stream_id="mystream"} ` (label set closing right
+	// after stream_id, no lane) would mean we accidentally emitted the serial
+	// form too.
+	if strings.Contains(out, `sluice_apply_batch_size_current{stream_id="mystream"} `) {
+		t.Errorf("per-lane path must not emit the serial (lane-less) series; got:\n%s", out)
+	}
+}
+
+// TestMetricsHandler_LaneAIMD_AttachedEmitsPerLane pins the end-to-end scrape
+// wiring of the now-default concurrent path: AttachLaneAIMDControllers([W])
+// makes /metrics emit W lane-labeled series across all four AIMD families.
+// This is the regression guard for the v0.99.91 gate-blocker — without the
+// fix the default --apply-concurrency stream emitted no AIMD gauges at all.
+func TestMetricsHandler_LaneAIMD_AttachedEmitsPerLane(t *testing.T) {
+	ms := newTestMetricsServer(t)
+	ms.AttachLaneAIMDControllers([]*appliercontrol.Controller{
+		newAIMDControllerForTest(t, "concstream", 1000),
+		newAIMDControllerForTest(t, "concstream", 750),
+	})
+	body := scrapeMetrics(t, ms)
+	for _, want := range []string{
+		`sluice_apply_batch_size_current{stream_id="concstream",lane="0"} 1000`,
+		`sluice_apply_batch_size_current{stream_id="concstream",lane="1"} 750`,
+		`sluice_apply_batch_size_p95_seconds{stream_id="concstream",lane="0"}`,
+		`sluice_apply_batch_size_decreases_total{stream_id="concstream",lane="1"}`,
+		`sluice_apply_batch_size_cooloff{stream_id="concstream",lane="0"}`,
+		// The substring the failing integration test asserts is satisfied by
+		// the lane series — pin it here so the contract is explicit.
+		`sluice_apply_batch_size_current{stream_id=`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected %q in /metrics body; got:\n%s", want, body)
+		}
+	}
+}
+
+// TestMetricsHandler_LaneAIMD_NotAttached pins the off-by-default surface:
+// with no lane controllers attached, the per-lane (`lane=`) series never
+// appear. Guards the serial path's byte-identical contract.
+func TestMetricsHandler_LaneAIMD_NotAttached(t *testing.T) {
+	ms := newTestMetricsServer(t)
+	body := scrapeMetrics(t, ms)
+	if strings.Contains(body, `lane="`) {
+		t.Errorf("no lane-labeled series should appear when no lane controllers attached; got:\n%s", body)
+	}
+}
+
+// TestMetricsHandler_LaneAIMD_DetachOnNil pins idempotent detach: passing a
+// nil/empty slice to AttachLaneAIMDControllers removes previously-attached
+// controllers, mirroring AttachAIMDController's contract.
+func TestMetricsHandler_LaneAIMD_DetachOnNil(t *testing.T) {
+	ms := newTestMetricsServer(t)
+	ms.AttachLaneAIMDControllers([]*appliercontrol.Controller{
+		newAIMDControllerForTest(t, "s", 100),
+	})
+	if body := scrapeMetrics(t, ms); !strings.Contains(body, `lane="0"`) {
+		t.Fatalf("precondition: lane series should be present before detach; got:\n%s", body)
+	}
+	ms.AttachLaneAIMDControllers(nil)
+	if body := scrapeMetrics(t, ms); strings.Contains(body, `lane="`) {
+		t.Errorf("lane series should NOT appear after detach; got:\n%s", body)
+	}
+}
+
 // TestEmitSpillMetrics pins the severity-B finding F2 gauge set. The
 // HELP/TYPE shape and the two counter lines must be present so
 // Prometheus operators get a stable scrape format for the PG-14+

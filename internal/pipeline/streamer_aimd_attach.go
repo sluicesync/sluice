@@ -83,23 +83,28 @@ func (s *Streamer) maybeAttachAIMDController(ctx context.Context, applier ir.Cha
 	if !s.AutoTune || s.ApplyBatchSize <= 1 {
 		return nil
 	}
-	// ADR-0104 concurrent key-hash apply: with --apply-concurrency W > 1 the
-	// applier runs W independent in-order lanes, each needing its OWN AIMD
+	// ADR-0104/0105 concurrent key-hash apply: with --apply-concurrency W > 1
+	// the applier runs W independent in-order lanes, each needing its OWN AIMD
 	// controller (a tx-killer on a slow lane must shrink only that lane). When
-	// the applier implements [ir.LaneAIMDSetter] we build W controllers and
-	// wire them via SetLaneAIMDControllers, then return nil: the metrics
-	// server has no single controller to snapshot on this path (per-lane
-	// snapshot aggregation is a documented follow-up). The serial single-
-	// controller path below is UNCHANGED for W <= 1. The lane count is the
-	// ADR-0106-resolved value (auto:N for an unset --apply-concurrency), so the
-	// per-lane controllers match the lanes the applier actually engaged.
+	// the applier implements [ir.LaneAIMDSetter] we build W controllers, wire
+	// them via SetLaneAIMDControllers, AND park them on s.laneAIMDControllers
+	// for [phaseStartMetricsServer] to attach (each lane emitted as its own
+	// `lane="N"`-labeled metric series). We return nil because there is no
+	// single controller for the serial AttachAIMDController surface on this
+	// path. The serial single-controller path below is UNCHANGED for W <= 1.
+	// The lane count is the ADR-0106-resolved value (auto:N for an unset
+	// --apply-concurrency), so the per-lane controllers match the lanes the
+	// applier actually engaged.
 	if s.resolvedApplyConcurrency > 1 {
 		if laneSetter, ok := applier.(ir.LaneAIMDSetter); ok {
 			return s.attachLaneAIMDControllers(ctx, laneSetter, streamID)
 		}
-		// W > 1 but the engine lacks the per-lane surface (e.g. Postgres):
-		// fall through to the single-controller path. Harmless — Postgres
-		// doesn't run key-hash lanes, so one controller is correct there.
+		// W > 1 but the engine lacks the per-lane surface: fall through to
+		// the single-controller path. (Both shipping engines implement
+		// LaneAIMDSetter as of ADR-0105 — MySQL's key-hash lanes and
+		// Postgres's lane router — so this is the safety fallback for a
+		// future engine that adopts --apply-concurrency without the per-lane
+		// surface, not a path the bundled engines take.)
 	}
 	provSetter, hasProv := applier.(ir.BatchSizeProviderSetter)
 	obsSetter, hasObs := applier.(ir.BatchObserverSetter)
@@ -167,15 +172,16 @@ func (s *Streamer) maybeAttachAIMDController(ctx context.Context, applier ir.Cha
 	return ctrl
 }
 
-// attachLaneAIMDControllers builds W AIMD controllers — one per ADR-0104
+// attachLaneAIMDControllers builds W AIMD controllers — one per ADR-0104/0105
 // concurrent apply lane — and wires them onto the applier via
 // [ir.LaneAIMDSetter]. Each controller carries the SAME Config as the
 // serial single-controller path (Floor 1, Ceiling = --apply-batch-size,
 // the resolved target latency) but its OWN OnShrink, so a tx-killer on one
-// lane shrinks only that lane's controller. Returns nil: there is no single
-// controller for the metrics server to snapshot on this path (per-lane
-// snapshot aggregation is a documented follow-up; the serial metrics path
-// is untouched).
+// lane shrinks only that lane's controller. It also parks the controllers on
+// s.laneAIMDControllers so [phaseStartMetricsServer] can attach them to the
+// metrics server (each surfaced as its own `lane="N"`-labeled series).
+// Returns nil: there is no single controller for the serial
+// AttachAIMDController surface on this path.
 //
 // follow-up: per-lane resume-size persistence across a WHOLE-RUN restart is
 // deliberately omitted. The in-lane shrink-and-retry (laneApplyLoop) absorbs
@@ -192,7 +198,12 @@ func (s *Streamer) attachLaneAIMDControllers(ctx context.Context, setter ir.Lane
 		target = resolveAIMDTargetLatency(s.targetCapsForAIMD())
 	}
 	w := s.resolvedApplyConcurrency
-	controllers := make([]ir.BatchSizeController, 0, w)
+	// Keep the concrete controllers (for the metrics server's Snapshot) AND
+	// the interface view (for the LaneAIMDSetter wiring) in lock-step by
+	// index, so metric series lane="i" and the applier's lane i are the same
+	// controller.
+	controllers := make([]*appliercontrol.Controller, 0, w)
+	laneSetters := make([]ir.BatchSizeController, 0, w)
 	for i := 0; i < w; i++ {
 		cfg := appliercontrol.Config{
 			StreamID:      streamID,
@@ -217,8 +228,13 @@ func (s *Streamer) attachLaneAIMDControllers(ctx context.Context, setter ir.Lane
 			return nil
 		}
 		controllers = append(controllers, ctrl)
+		laneSetters = append(laneSetters, ctrl)
 	}
-	setter.SetLaneAIMDControllers(controllers)
+	setter.SetLaneAIMDControllers(laneSetters)
+	// Park the concrete controllers for phaseStartMetricsServer to snapshot
+	// per lane. Without this the now-default concurrent path emits no AIMD
+	// gauges at all (the serial AttachAIMDController surface never engages).
+	s.laneAIMDControllers = controllers
 	slog.InfoContext(
 		ctx, "applier: per-lane AIMD apply-batch-size controllers engaged (ADR-0104 concurrent key-hash apply)",
 		slog.String("stream_id", streamID),
