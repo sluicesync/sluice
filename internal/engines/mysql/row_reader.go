@@ -220,7 +220,18 @@ func (r *RowReader) stream(ctx context.Context, rows *sql.Rows, table *ir.Table,
 	}
 
 	if err := rows.Err(); err != nil {
-		r.setErr(fmt.Errorf("mysql: rows iteration: %w", err))
+		// ADR-0109: a mid-table SOURCE-read drop (the transient that backpressure
+		// from a stalled target induces — the source server closes the idle read
+		// connection past net_write_timeout → unexpected EOF / invalid connection)
+		// surfaces here as the rows-iteration error. Route it through the SAME
+		// classifier the CDC apply path uses (classifyApplierError) so the sticky
+		// Err() carries an ir.RetriableError for the connection-drop class, and the
+		// pipeline's per-table reconnect-and-resume retry can ride it out instead
+		// of aborting the whole cold-copy. A non-transient iteration error (a real
+		// query/decode fault) is returned verbatim by the classifier — still
+		// terminal, exactly as before. The original *MySQLError stays reachable via
+		// %w / Unwrap for diagnostics.
+		r.setErr(classifyApplierError(fmt.Errorf("mysql: rows iteration: %w", err)))
 	}
 }
 

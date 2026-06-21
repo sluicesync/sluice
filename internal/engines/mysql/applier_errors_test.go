@@ -448,3 +448,37 @@ func TestReparentRetriableSubstrings_PinDown(t *testing.T) {
 		}
 	}
 }
+
+// TestClassifyApplierError_BulkCopyReadDrop pins ADR-0109's reader-side
+// classification contract: the RowReader.stream path wraps a mid-table
+// connection-drop as `mysql: rows iteration: %w` and routes it through
+// classifyApplierError so the sticky Err() carries an ir.RetriableError
+// for the source-read reconnect-and-resume retry. A NON-connection
+// iteration error (a decode/value fault) must stay terminal. This pins
+// the EXACT shapes the reader produces — the wire path differs by the
+// underlying driver error even though sluice's wrap is identical, so each
+// connection-drop family is exercised, not one representative.
+func TestClassifyApplierError_BulkCopyReadDrop(t *testing.T) {
+	retriable := []error{
+		fmt.Errorf("mysql: rows iteration: %w", gomysql.ErrInvalidConn),
+		fmt.Errorf("mysql: rows iteration: %w", driver.ErrBadConn),
+		fmt.Errorf("mysql: rows iteration: %w", io.EOF),
+		fmt.Errorf("mysql: rows iteration: %w", errors.New("read tcp 10.0.0.1:3306: connection reset by peer")),
+		fmt.Errorf("mysql: rows iteration: %w", errors.New("write tcp: broken pipe")),
+		fmt.Errorf("mysql: rows iteration: %w", errors.New("dial tcp: i/o timeout")),
+	}
+	for _, in := range retriable {
+		out := classifyApplierError(in)
+		var re ir.RetriableError
+		if !errors.As(out, &re) || !re.Retriable() {
+			t.Errorf("connection-drop iteration error %q must classify retriable for the ADR-0109 source-read retry; got %T", in, out)
+		}
+	}
+
+	// A non-connection iteration error (a real value fault that surfaced
+	// during iteration) must NOT be retriable — the copy stays terminal.
+	terminal := fmt.Errorf("mysql: rows iteration: %w", errors.New("invalid utf8 sequence in column data"))
+	if re := classifyApplierError(terminal); func() bool { var r ir.RetriableError; return errors.As(re, &r) }() {
+		t.Errorf("a non-connection iteration error must stay TERMINAL; got retriable for %q", terminal)
+	}
+}

@@ -124,6 +124,100 @@ func bulkCopyOneTable(
 		// Nothing to do up front; the per-batch path starts at PK > nil.
 	}
 
+	// ADR-0109: wrap the per-table data copy in the bounded source-read
+	// reconnect-and-resume retry. A transient mid-table SOURCE-read drop
+	// (the backpressure-EOF a stalled target induces) re-opens a FRESH
+	// source reader and resumes the table copy instead of aborting the
+	// whole run. The retry is local to THIS table, so a transient never
+	// propagates to the cross-table pool's errgroup and never aborts a
+	// sibling table's copy — only a terminal (non-retriable / exhausted)
+	// error does. The strategy is per-table:
+	//   - keyset/integer-PK CHUNKED tables resume each chunk from its
+	//     persisted chunk.LastPK (re-run in RESUME mode) — dup/loss-safe;
+	//   - everything else truncates the target + re-copies (always
+	//     correct, the named efficiency wart).
+	// When the parallel deps (the fresh-reader factory) are absent, the
+	// retry is skipped and the data copy runs exactly as before — the
+	// retry is purely additive resilience for the migrate path.
+	attempt := func(ctx context.Context, rows ir.RowReader, resuming bool) error {
+		return copyOneTableData(ctx, rc, state, stateMu, rows, rw, table, resuming, bulkBatchSize, parallel, redactor, shard)
+	}
+	if parallel == nil {
+		return attempt(ctx, rows, resuming)
+	}
+	strategy := resumeTruncateRestart
+	if willKeysetChunk(ctx, parallel, rows, table, resuming, state, stateMu) {
+		strategy = resumeFromChunkCursor
+	}
+	freshReader := func(ctx context.Context) (ir.RowReader, func(), error) {
+		rdr, err := openChunkReader(ctx, parallel)
+		if err != nil {
+			return nil, nil, err
+		}
+		return rdr, func() { closeIf(rdr) }, nil
+	}
+	truncate := func(ctx context.Context) error { return truncateForResume(ctx, rw, table) }
+	return copyTableWithSourceReadRetry(ctx, table.Name, strategy, rows, resuming, attempt, freshReader, truncate)
+}
+
+// willKeysetChunk reports whether table will take the keyset/integer-PK
+// within-table CHUNKED copy path on this run — i.e. the path whose per-chunk
+// LastPK crash-resume machinery (ADR-0096/0019) makes a source-read drop
+// dup/loss-safely resumable from the chunk cursor (ADR-0109 §2 case 1). It
+// is true when the table either already has recorded chunks (a resume) OR
+// is freshly chunk-eligible-and-large-enough ([shouldParallelChunk]). Every
+// other table — plain whole-table, raw-copy passthrough, no-PK, or a
+// chunk-eligible table below the size threshold — has no safe mid-table
+// cursor on a cold-start and uses the truncate-restart strategy instead.
+//
+// Pure aside from the row-count probe shouldParallelChunk already runs; it
+// runs once per table BEFORE the copy, and tryParallelCopyTable re-derives
+// the same decision when it actually dispatches, so the two never disagree.
+func willKeysetChunk(
+	ctx context.Context,
+	parallel *parallelBulkCopyDeps,
+	rows ir.RowReader,
+	table *ir.Table,
+	resuming bool,
+	state *ir.MigrationState,
+	stateMu *sync.Mutex,
+) bool {
+	if parallel == nil || parallel.parallelism <= 1 {
+		return false
+	}
+	// Recorded chunks (a resume mid-chunked-copy) always take the chunk path.
+	stateMu.Lock()
+	entry := state.TableProgress[table.Name]
+	stateMu.Unlock()
+	if resuming && len(entry.Chunks) > 1 {
+		return true
+	}
+	chunk, _ := shouldParallelChunk(ctx, parallel, rows, table)
+	return chunk
+}
+
+// copyOneTableData runs the actual per-table data copy (the parallel/chunk
+// dispatch, the ADR-0078 raw-copy passthrough, and the single-reader
+// whole-table / per-batch-cursor fallbacks). It is the closure the ADR-0109
+// source-read retry re-invokes on a fresh reader; the resume-classification
+// + up-front truncate (the parts that must run exactly once per table) stay
+// in [bulkCopyOneTable] above. Behaviour is byte-identical to the pre-ADR-0109
+// inline body — only the reader + resuming arrive as parameters so a retry
+// can swap a fresh reader in.
+func copyOneTableData(
+	ctx context.Context,
+	rc resumeContext,
+	state *ir.MigrationState,
+	stateMu *sync.Mutex,
+	rows ir.RowReader,
+	rw ir.RowWriter,
+	table *ir.Table,
+	resuming bool,
+	bulkBatchSize int,
+	parallel *parallelBulkCopyDeps,
+	redactor *redact.Registry,
+	shard ShardColumnSpec,
+) error {
 	// Parallel-copy dispatch: applicable when the deps are configured,
 	// the table is large enough, and the eligibility checks pass. The
 	// parallel path is independent of resume — it can be used on a
