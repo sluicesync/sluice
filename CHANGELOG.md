@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.97] - 2026-06-21
+
+### Fixed
+
+- **InnoDB lock-wait-timeout (`Error 1205`, `ER_LOCK_WAIT_TIMEOUT`) is now classified retriable — the sibling of deadlock (1213), which was already retried.** A lock-wait-timeout is the textbook "retry the transaction" InnoDB transient: the timed-out statement is rolled back and a retry succeeds once the contending lock releases. The classifier retried deadlocks (1213) but not lock-wait-timeouts (1205), so a 1205 aborted the cold-copy / CDC apply where a 1213 would have ridden through — an inconsistency independent of any particular target. It surfaces heavily under a prolonged PlanetScale storage-auto-grow stall, where the concurrent cold-copy writers contend while the volume grows (the v0.99.96 PS-320 validation rode ~13 minutes of disk-full / query-killer retries — those fixes working — then died on this unretried lock-wait-timeout). vttablet wraps it as `code = DeadlineExceeded desc = Lock wait timeout exceeded`; matched on the MySQL error number 1205 so the wrapping is irrelevant. Bounded by the existing retry budgets. Pinned alongside the 1213 deadlock case in the classifier test set.
+
 ## [0.99.96] - 2026-06-21
 
 ### Fixed

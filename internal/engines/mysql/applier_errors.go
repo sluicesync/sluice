@@ -166,6 +166,16 @@ func classifyApplierError(err error) error {
 	// care about for transients:
 	//
 	//   - 1213: InnoDB deadlock (always retriable)
+	//   - 1205: InnoDB lock-wait-timeout (ER_LOCK_WAIT_TIMEOUT) —
+	//     deadlock's sibling and the textbook "retry the transaction"
+	//     transient (the rolled-back txn succeeds on a retry once the
+	//     contending lock releases). vttablet wraps it as
+	//     `code = DeadlineExceeded desc = Lock wait timeout exceeded`.
+	//     Surfaces heavily under a prolonged PlanetScale storage-grow
+	//     stall when the concurrent cold-copy writers contend (the
+	//     v0.99.96 PS-320-v5 live finding — the copy rode ~13 min of
+	//     disk-full/query-killer retries, then died here). Always
+	//     retriable, like 1213.
 	//   - 1105: HY000 — Vitess uses this code to wrap upstream
 	//     gRPC status codes. The message contains "vttablet: rpc
 	//     error: code = X desc = ..." where X is the gRPC code.
@@ -176,7 +186,9 @@ func classifyApplierError(err error) error {
 	var mysqlErr *gomysql.MySQLError
 	if errors.As(err, &mysqlErr) {
 		switch mysqlErr.Number {
-		case 1213:
+		case 1213, 1205:
+			// 1213 InnoDB deadlock + 1205 lock-wait-timeout — the
+			// canonical "retry the transaction" InnoDB transients.
 			return &retriableMySQLError{err: err}
 		case 1105:
 			if classifyVitessMessage(mysqlErr.Message) {

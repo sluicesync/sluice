@@ -99,6 +99,7 @@ func TestClassifyApplierError_RetriableShapes(t *testing.T) {
 		err  error
 	}{
 		{"InnoDB deadlock (Error 1213)", &gomysql.MySQLError{Number: 1213, Message: "Deadlock found when trying to get lock; try restarting transaction"}},
+		{"InnoDB lock-wait-timeout (Error 1205, PS-320-v5 storage-grow contention)", &gomysql.MySQLError{Number: 1205, Message: "target: lst-mysql-d-ps320-v5.-.primary: vttablet: rpc error: code = DeadlineExceeded desc = Lock wait timeout exceeded; try restarting transaction"}},
 		{"Vitess tx-killer Aborted (Error 1105)", &gomysql.MySQLError{Number: 1105, Message: "target: ks.-.primary: vttablet: rpc error: code = Aborted desc = transaction 1234: in use: for tx killer rollback"}},
 		{"Vitess Unknown (Error 1105)", &gomysql.MySQLError{Number: 1105, Message: "vttablet: rpc error: code = Unknown desc = caller id churn"}},
 		{"Vitess Unavailable (Error 1105)", &gomysql.MySQLError{Number: 1105, Message: "vttablet: rpc error: code = Unavailable desc = tablet not serving"}},
