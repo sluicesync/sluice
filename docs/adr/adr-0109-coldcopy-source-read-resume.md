@@ -29,12 +29,55 @@ abort the run. This is loud-failure-safe today (the copy dies cleanly with a `--
 hint; no silent loss), but not resilient — a copy that happens to cross a target
 storage-grow mid-flight dies and needs a manual restart.
 
+## The sync-path constraint (corrected after implementation)
+
+The first cut of this ADR assumed a **per-table reconnect + resume** was always
+possible. It is **not** on the `sync` cold-start path — and that is the path the live
+Track-D failure took. The `sync` native cold-copy holds **one consistent multi-table
+snapshot** (FTWRL-coordinated, all readers frozen at a single binlog position so CDC
+can stitch from it). **MySQL cannot re-establish that snapshot on a fresh connection**
+— a reconnect gets a *later* point, so re-reading one table on a new connection would
+mix rows from two points and break exactly-once CDC stitching. Per-table reconnect is
+therefore only viable on the `migrate` path (independent per-table readers, no shared
+consistent point). The fix is split accordingly.
+
 ## Decision
 
-Wrap the per-table cold-copy read in a **bounded reconnect-and-resume retry** — the
-read-side analog of ADR-0108. On a **classified retriable** source-read error, open a
-fresh source reader and resume the table copy from a position that is provably
-dup-free and loss-free, bounded, and loud on exhaustion.
+A three-pronged defense, addressing the mechanism (a target stall backpressures the
+pipeline → the source read idles past `net_write_timeout` → the source drops it):
+
+### (A) Raise the source read session timeouts — PRIMARY (prevents the drop)
+
+sluice **`SET SESSION net_write_timeout` / `net_read_timeout`** to a generous bounded
+value (default ~10 min) on every source read connection it opens (the same session
+seam that already sets `workload=olap` for PlanetScale reads). A transient target
+stall (e.g. a storage auto-grow taking seconds-to-minutes) then no longer causes the
+source to drop sluice's idle read connection; when the target recovers, the writer
+drains, the reader resumes consuming, and the copy continues — **no reconnect, no
+re-snapshot, no consistency problem.** The bound stays finite so a *genuinely* dead
+target still surfaces (complemented by sluice's existing source-unresponsive
+detection), rather than hanging forever.
+
+### (B) Bounded auto-restart of the cold-start — BACKSTOP (sync path)
+
+If a source read still drops (a stall longer than the raised timeout, or an unrelated
+drop), the classified-retriable read error (see (C)) must **not** be a fatal exit.
+On the `sync` path — where per-table resume is impossible — it triggers a **bounded,
+backed-off auto-restart of the whole cold-start** (re-snapshot at a fresh consistent
+point + re-copy), rather than crashing the process. This re-copies, which is
+wasteful, but it is the only consistency-preserving recovery given the snapshot
+constraint, and it is bounded + loud (never an infinite crash-loop like an external
+watchdog). It composes with the existing ADR-0093 reactive-resnapshot machinery.
+
+### (C) Per-table reconnect + resume — `migrate` path only
+
+On the `migrate` path (independent per-table readers, no shared consistent snapshot),
+a classified-retriable source-read error opens a **fresh per-table reader** and
+resumes from a dup/loss-safe position, bounded, loud on exhaustion. This is the
+read-side analog of ADR-0108 and is the efficient (no re-copy) recovery where the
+architecture permits it.
+
+### Classification (shared by A/B/C)
 
 ### Classification
 
