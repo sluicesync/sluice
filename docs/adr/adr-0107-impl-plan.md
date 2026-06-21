@@ -19,6 +19,8 @@ Companion to [adr-0107-planetscale-metrics-integration.md](adr-0107-planetscale-
 
 Phase 1 is reviewable + mergeable before any HTTP client exists. Phase 2 is the only piece needing live-doc re-confirmation + credentials.
 
+**Status (Phase 2 landed):** Phase 1 shipped (the seam + advisory consumers + `sluice_target_*` re-export). Phase 2 — the real `internal/planetscale/telemetry` provider (SD + signed scrape + Prometheus-text parser + distillation), the `--planetscale-org` / `--planetscale-metrics-token-id` / `--planetscale-metrics-token` / `--planetscale-metrics-branch` / `--planetscale-metrics-database` CLI flags, and the composition-root wiring (loud all-or-nothing refusal on an incomplete opt-in; nil provider ⇒ byte-identical default sync) — is implemented and fixture-tested, with a `psverify`-gated credentialed smoke. With Phase 2 in, **ADR-0107 can move from Proposed toward Accepted** (status flip left to the maintainer; only the demand-gated Phase 3 follow-ups remain).
+
 ---
 
 ## Phase 1 — engine-neutral seam + advisory consumption (fake-provider driven)
@@ -94,9 +96,33 @@ The controller already takes optional config; add an advisory hint it consults u
 
 ## Phase 2 — the real PlanetScale provider + flags (the only PS-touching code)
 
-### 2a. Preflight: re-confirm the live surface
+### 2a. CONFIRMED live surface (probed 2026-06-21 against the real `sluicesync` org endpoint)
 
-The PS docs pages 404'd during the design pass. BEFORE writing the client, re-confirm against current docs (or `pscale` CLI source): the metrics endpoint path, the auth header for a `${TOKEN_ID}:${TOKEN}` service token with `read_metrics_endpoints`, the HTTP-SD response shape (per-branch targets), and the exact metric names. Adjust the parser's name table to whatever is current; the ADR records the roadmap-confirmed names as the starting point.
+The docs-404 caveat from the design pass is RESOLVED — the live endpoint was probed directly with the `read_metrics_endpoints` service token and the mechanics below are what Phase 2 was built against. They REPLACE the roadmap-confirmed starting point in the ADR.
+
+**Service-discovery (auth'd):** `GET https://api.planetscale.com/v1/organizations/{ORG}/metrics` with header `Authorization: {TOKEN_ID}:{TOKEN}` → HTTP 200 JSON array (Prometheus HTTP-SD shape). Each element:
+
+```json
+{"targets":["metrics.psdb.cloud"],
+ "labels":{"__metrics_path__":"/metrics/branch/<id>","__param_sig":"<sig>","__param_exp":"<unixexp>","__scheme__":"https",
+           "planetscale_database_name":"<db>","planetscale_branch_name":"main","planetscale_organization_name":"<org>", ...}}
+```
+
+Filter to the element whose `planetscale_database_name` == the sync target's database AND `planetscale_branch_name` == the target branch (default `main`).
+
+**Scrape (signed, NO auth header):** `GET https://metrics.psdb.cloud{__metrics_path__}?sig={__param_sig}&exp={__param_exp}` → Prometheus text exposition (`version=0.0.4`), `name{labels} value [timestamp_ms]`. The URL is pre-signed so the token never travels on the scrape leg.
+
+**Metric names + units (MySQL/Vitess), CONFIRMED** — the parser's name table (`internal/planetscale/telemetry/distill.go`):
+
+| Snapshot field | Metric | Units / selection |
+|---|---|---|
+| `CPUUtil` | `planetscale_pods_cpu_util_percentages` | PERCENTAGE 0–100 → ÷100. Select `planetscale_component="vttablet"` AND `planetscale_tablet_type="primary"` (the write target); graceful fallback when the label is absent. |
+| `MemUtil` | `planetscale_pods_mem_util_percentages` | same shape/units/selection as CPU. |
+| `StorageUtil` + raw bytes | `planetscale_vttablet_volume_available_bytes`, `planetscale_vttablet_volume_capacity_bytes` (primary vttablet) | `StorageUtil = 1 - available/capacity`; raw bytes into `StorageAvailableBytes`/`StorageCapacityBytes`. (`planetscale_vttablet_table_storage_all_bytes` also exists, unused.) |
+| `ReplicaLagSeconds` (secondary) | `planetscale_mysql_replica_lag_seconds` | seconds. |
+| `ActiveConnections`/`MaxConnections` (secondary) | `planetscale_edge_active_connections`, `planetscale_mysql_max_connections` | counts. |
+
+Any metric absent from the scrape leaves its value 0 AND its `*Known` flag false — never 0-as-idle (the honesty/loud-failure tenet, pinned in `distill_test.go`). The selection cascade (exact vttablet-primary → any primary-tagged → single unlabelled series → refuse-to-guess on ambiguous multi-pod) lives in `selectPrimaryValue`. A PG-target metric-name table (`planetscale_volume_*`, `planetscale_postgres_*`) is a small follow-up edit to the same table when a PG telemetry target appears.
 
 ### 2b. The provider package — `internal/planetscale/telemetry`
 

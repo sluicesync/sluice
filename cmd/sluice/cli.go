@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -20,6 +22,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline"
+	pstelemetry "sluicesync.dev/sluice/internal/planetscale/telemetry"
 	"sluicesync.dev/sluice/internal/redact"
 )
 
@@ -712,6 +715,20 @@ type SyncStartCmd struct {
 
 	MetricsListen string `help:"Bind a Prometheus-format /metrics endpoint at this address (e.g. ':9090' for all interfaces port 9090, '127.0.0.1:9090' for localhost only) for the duration of the stream. Off by default — opt-in. Companion to 'sluice sync health' (which is the cron-friendly one-shot probe shape). Useful for operators running Prometheus / Grafana / alertmanager." placeholder:"ADDR"`
 
+	// ADR-0107 Phase 2: OPTIONAL PlanetScale target-health telemetry. When
+	// the operator supplies the org + a read_metrics_endpoints service token,
+	// sluice polls the PlanetScale metrics endpoint (CPU/mem/storage, plus
+	// secondary lag/conns) off the apply hot path and feeds the Phase-1
+	// advisory consumers (proactive AIMD back-off, storage-resize WARN, the
+	// sluice_target_* gauges). CONTROL-PLANE credential, distinct from the
+	// data-plane DSN. All-or-nothing: org without a complete token pair is a
+	// loud refusal. Unset ⇒ no provider wired ⇒ byte-identical default sync.
+	PlanetScaleOrg            string `help:"PlanetScale org slug; enables OPTIONAL target-health telemetry (CPU/mem/storage) from the PlanetScale metrics endpoint for proactive apply back-off + in-tool observability (ADR-0107). Opt-in; requires --planetscale-metrics-token-id and --planetscale-metrics-token. Control-plane only — distinct from the data-plane --target DSN. Off when unset (default sync unchanged)." placeholder:"ORG"`
+	PlanetScaleMetricsTokenID string `help:"PlanetScale service-token ID (granted the read_metrics_endpoints permission) for --planetscale-org target-health telemetry. Prefer the env var so the id never lands in shell history." env:"PLANETSCALE_METRICS_TOKEN_ID" placeholder:"ID"`
+	PlanetScaleMetricsToken   string `help:"PlanetScale service-token secret for --planetscale-org target-health telemetry. Set via the env var (never on the command line); masked in all logging." env:"PLANETSCALE_METRICS_TOKEN" placeholder:"SECRET"`
+	PlanetScaleMetricsBranch  string `help:"Target branch to filter telemetry series to (defaults to 'main'). Only consulted when --planetscale-org is set." placeholder:"BRANCH"`
+	PlanetScaleMetricsDB      string `help:"Target database name to filter PlanetScale telemetry SD to. Defaults to the --target DSN's database. Only consulted when --planetscale-org is set." placeholder:"DATABASE"`
+
 	HeartbeatInterval time.Duration `help:"Wall-clock cadence the per-stream heartbeat goroutine logs an INFO 'stream: heartbeat' line at. GitHub #23 Phase A: distinguishes silent-stall (process alive but no apply, no log) from wedge (process alive, no heartbeat either). 0 disables." default:"60s" placeholder:"DUR"`
 
 	PollInterval time.Duration `help:"Override the CDC reader's poll cadence for poll-based engines (today: postgres-trigger; default 1s). Push-based engines (postgres pgoutput, mysql binlog, planetscale VStream) silently ignore — they have no poll loop. Operators chasing lower CDC latency on a write-heavy postgres-trigger stream tighten this to e.g. 250ms; operators trading latency for source load loosen to 5s. 0 (the default) keeps the engine's built-in cadence. ADR-0066 §6; roadmap item 18(c)." placeholder:"DUR"`
@@ -806,6 +823,133 @@ func resolveApplyBatchSize(raw string, target ir.Engine) (int, error) {
 		return 0, fmt.Errorf("expected a non-negative integer or 'auto'; got %d", n)
 	}
 	return n, nil
+}
+
+// buildTargetTelemetry constructs the OPTIONAL PlanetScale target-health
+// telemetry provider (ADR-0107 Phase 2) from the operator's opt-in flags,
+// or returns (nil, nil) when telemetry is OFF (no --planetscale-org). The
+// opt-in is ALL-OR-NOTHING: setting --planetscale-org without a complete
+// service-token pair is a LOUD refusal (the contain-PS-complexity tenet —
+// a half-configured control-plane capability never half-runs silently).
+//
+// The provider is constructed here at the composition root (the sole place
+// allowed to import the PS provider package) and threaded onto the streamer
+// as the engine-neutral ir.TargetTelemetry. The provider starts its own
+// background poll loop scoped to ctx; the caller defers Close.
+//
+// The token NEVER appears in any error or log line emitted here — only the
+// org/database/branch identifiers, which are not secret.
+func buildTargetTelemetry(ctx context.Context, s *SyncStartCmd) (*pstelemetry.Provider, error) {
+	if s.PlanetScaleOrg == "" {
+		// Telemetry off (the default): no provider, no behaviour change.
+		if s.PlanetScaleMetricsTokenID != "" || s.PlanetScaleMetricsToken != "" {
+			// Token supplied without --planetscale-org: nothing consumes it.
+			// Warn rather than refuse — the operator may have set the env var
+			// globally; refusing would block every non-PS sync on that shell.
+			slog.WarnContext(ctx,
+				"PlanetScale metrics service token is set but --planetscale-org is not; target-health telemetry is OFF (set --planetscale-org to enable)")
+		}
+		return nil, nil //nolint:nilnil // (nil, nil) == "telemetry off", a valid no-op result distinct from an error
+	}
+	if s.PlanetScaleMetricsTokenID == "" || s.PlanetScaleMetricsToken == "" {
+		return nil, errors.New(
+			"--planetscale-org is set but the metrics service token is incomplete: supply BOTH --planetscale-metrics-token-id and --planetscale-metrics-token (env PLANETSCALE_METRICS_TOKEN_ID / PLANETSCALE_METRICS_TOKEN). Telemetry is opt-in and all-or-nothing — it never half-runs",
+		)
+	}
+
+	database := s.PlanetScaleMetricsDB
+	if database == "" {
+		database = databaseFromDSN(s.Target)
+	}
+	if database == "" {
+		return nil, errors.New(
+			"--planetscale-org telemetry: could not determine the target database name from the --target DSN; supply --planetscale-metrics-database explicitly",
+		)
+	}
+
+	provider, err := pstelemetry.New(ctx, pstelemetry.Config{
+		Org:      s.PlanetScaleOrg,
+		TokenID:  s.PlanetScaleMetricsTokenID,
+		Token:    s.PlanetScaleMetricsToken,
+		Database: database,
+		Branch:   s.PlanetScaleMetricsBranch,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("--planetscale-org telemetry: %w", err)
+	}
+	slog.InfoContext(
+		ctx,
+		"PlanetScale target-health telemetry enabled (ADR-0107) — advisory only; apply correctness is unaffected",
+		slog.String("org", s.PlanetScaleOrg),
+		slog.String("database", database),
+		slog.String("branch", branchOrMainLabel(s.PlanetScaleMetricsBranch)),
+	)
+	return provider, nil
+}
+
+// telemetryProviderOrNil converts a possibly-nil *Provider into the
+// streamer's ir.TargetTelemetry field WITHOUT the typed-nil interface trap:
+// assigning a nil *Provider straight to an interface yields a NON-nil
+// interface (concrete type, nil value) that the streamer's
+// `TargetTelemetry != nil` guards would wrongly fire on, then nil-deref.
+// Returning a true nil interface keeps "no provider ⇒ no telemetry" exact.
+func telemetryProviderOrNil(p *pstelemetry.Provider) ir.TargetTelemetry {
+	if p == nil {
+		return nil
+	}
+	return p
+}
+
+// branchOrMainLabel is the log-label form of the telemetry branch: the
+// configured value, or "main" when unset (matching the provider's default).
+func branchOrMainLabel(branch string) string {
+	if branch == "" {
+		return "main"
+	}
+	return branch
+}
+
+// databaseFromDSN extracts the database name from a target DSN for the
+// PlanetScale telemetry SD filter, best-effort across the two DSN shapes
+// sluice's engines accept:
+//
+//   - Go-MySQL DSN: "user:pass@tcp(host:port)/dbname?params" — the path
+//     segment after the last '/' (before any '?').
+//   - URL DSN (postgres://…/dbname, mysql://…/dbname): the URL path.
+//
+// Returns "" when no database segment is present (the caller then refuses
+// loudly and asks for --planetscale-metrics-database). The DSN may contain
+// a password; this function returns ONLY the database segment, never echoes
+// the DSN.
+func databaseFromDSN(dsn string) string {
+	if dsn == "" {
+		return ""
+	}
+	// URL form (postgres://…/db, mysql://…/db): parse and take the path
+	// segment, so the scheme's "//" and the host:port are never mistaken for
+	// a database. A URL with no path (e.g. "postgres://host") yields "".
+	if strings.Contains(dsn, "://") {
+		if u, err := url.Parse(dsn); err == nil && u.Scheme != "" {
+			return strings.Trim(u.Path, "/")
+		}
+		return ""
+	}
+	// Go-MySQL form ("user:pass@tcp(host:port)/db?params"): strip the query
+	// string, then take the final path segment after the last '/'.
+	if i := strings.IndexByte(dsn, '?'); i >= 0 {
+		dsn = dsn[:i]
+	}
+	slash := strings.LastIndexByte(dsn, '/')
+	if slash < 0 || slash == len(dsn)-1 {
+		return ""
+	}
+	db := dsn[slash+1:]
+	// Reject a segment that still looks like a host:port or carries '@' — a
+	// malformed DSN must yield "" (loud refusal upstream), not a bogus name.
+	if strings.ContainsAny(db, "@:") {
+		return ""
+	}
+	return db
 }
 
 // parseIndexBuildMem turns the --index-build-mem flag value into a byte
@@ -1060,6 +1204,19 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 	source = labelEngine(source, s.StreamID)
 	target = labelEngine(target, s.StreamID)
 
+	// ADR-0107 Phase 2: construct the OPTIONAL PlanetScale target-health
+	// telemetry provider when the operator opts in. Wired ONLY here at the
+	// composition root (the sole place allowed to import the PS provider);
+	// the streamer holds it as the engine-neutral ir.TargetTelemetry. Nil
+	// when the operator did not opt in ⇒ byte-identical default sync.
+	telemetryProvider, err := buildTargetTelemetry(kongContext(), s)
+	if err != nil {
+		return err
+	}
+	if telemetryProvider != nil {
+		defer func() { _ = telemetryProvider.Close() }()
+	}
+
 	streamer := &pipeline.Streamer{
 		Source:             source,
 		Target:             target,
@@ -1104,8 +1261,13 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		ApplyRetryBackoffBase:                   s.ApplyRetryBackoffBase,
 		ApplyRetryBackoffCap:                    s.ApplyRetryBackoffCap,
 		MetricsListen:                           s.MetricsListen,
-		HeartbeatInterval:                       s.HeartbeatInterval,
-		PollInterval:                            s.PollInterval,
+		// ADR-0107: nil unless the operator opted into PlanetScale telemetry.
+		// telemetryProviderOrNil returns a TRUE nil interface when off, so the
+		// streamer's `TargetTelemetry != nil` guards stay exact (no typed-nil
+		// trap from assigning a nil *Provider straight into the interface).
+		TargetTelemetry:   telemetryProviderOrNil(telemetryProvider),
+		HeartbeatInterval: s.HeartbeatInterval,
+		PollInterval:      s.PollInterval,
 
 		SourceHeartbeatInterval:    s.SourceHeartbeatInterval,
 		SourceHeartbeatPruneWindow: s.SourceHeartbeatPruneWindow,
