@@ -18,10 +18,12 @@ import (
 // Default poll cadence and clamp bounds. The cadence is plumbed FROM the
 // caller (cmd/sluice passes the pipeline's telemetryPollInterval so there
 // is one canonical value), but a zero or out-of-range value falls back to
-// these. PS-side SD refresh is ~10 min; 20s balances metric freshness vs
-// control-plane API load (ADR-0107 open question 2).
+// these. 60s matches the CONFIRMED PlanetScale metric granularity (the SD
+// targets advertise __scrape_interval__=1m and sample timestamps advance
+// exactly every 60s, probed live 2026-06-21), so polling faster only
+// re-reads the same sample (ADR-0107 Phase 2 resolved open question 2).
 const (
-	defaultPollInterval = 20 * time.Second
+	defaultPollInterval = 60 * time.Second
 	minPollInterval     = 10 * time.Second
 	maxPollInterval     = 120 * time.Second
 )

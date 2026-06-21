@@ -28,7 +28,13 @@ const (
 	// storage-WARN tick can reference one canonical value). Phase 1 does
 	// NOT start a poll loop — the provider owns that — but the storage
 	// sidecar ticks at this cadence to read the provider's cached sample.
-	telemetryPollInterval = 20 * time.Second
+	//
+	// 60s matches the CONFIRMED PlanetScale metrics granularity: the SD
+	// targets advertise __scrape_interval__=1m and the metric sample
+	// timestamps advance exactly every 60s (probed live 2026-06-21 against
+	// the real endpoint), so polling faster only re-reads the same sample
+	// (wasted control-plane round-trips). ADR-0107 Phase 2.
+	telemetryPollInterval = 60 * time.Second
 
 	// telemetryFreshnessWindow is how old a snapshot may be and still be
 	// acted on (see [ir.TargetHealthSnapshot.Fresh]). 3x the poll cadence
