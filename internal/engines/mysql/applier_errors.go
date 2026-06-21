@@ -110,14 +110,24 @@ func isDiskFullSignal(err error) bool {
 		return false
 	}
 	var mysqlErr *gomysql.MySQLError
-	if errors.As(err, &mysqlErr) && mysqlErr.Number == 1021 { // ER_DISK_FULL
+	if errors.As(err, &mysqlErr) && (mysqlErr.Number == 1021 || mysqlErr.Number == 1114) {
+		// 1021 ER_DISK_FULL; 1114 ER_RECORD_FILE_FULL ("The table is full").
+		// On a managed InnoDB target the latter means the tablespace/volume
+		// is out of space — the SAME root as ER_DISK_FULL, just a different
+		// code (vttablet wraps it as `code = ResourceExhausted desc = The
+		// table '<t>' is full`). The v0.99.96 PS-320 finding covered errno-28
+		// / Error 3 / 1021 but missed 1114, which the next storage-grow step
+		// surfaced (v0.99.97 PS-320-v6); both must be treated as a transient
+		// out-of-disk so the bounded retry rides the auto-grow.
 		return true
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "no space left on device") ||
 		strings.Contains(msg, "errno: 28") ||
 		strings.Contains(msg, "disk full") ||
-		strings.Contains(msg, "waiting for someone to free some space")
+		strings.Contains(msg, "waiting for someone to free some space") ||
+		strings.Contains(msg, "the table is full") ||
+		strings.Contains(msg, "is full (errno")
 }
 
 // classifyApplierError inspects err and returns a value satisfying

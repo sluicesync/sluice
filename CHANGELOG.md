@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.98] - 2026-06-21
+
+### Fixed
+
+- **`ER_RECORD_FILE_FULL` (`Error 1114`, "The table is full") is now treated as a transient out-of-disk and retried — completing v0.99.96's disk-full coverage.** v0.99.96 made a target out-of-disk retriable via `isDiskFullSignal`, but only matched `ER_DISK_FULL` (1021) and the errno-28 / "No space left on device" text. A managed InnoDB target out of tablespace can instead surface `Error 1114` "The table '<t>' is full" (vttablet wraps it as `code = ResourceExhausted desc = The table '<t>' is full (errno: 28 ...)`) — the same root condition (the volume is full and auto-growing), a different MySQL code — which slipped through and aborted the cold-copy at the next storage-grow step (the v0.99.97 PS-320 validation rode further still, then died here). `isDiskFullSignal` now also matches `ER_RECORD_FILE_FULL` (1114) and the "table is full" / "is full (errno" text, so the existing bounded retry rides the auto-grow out (a genuinely-capped, non-growing target still exhausts the budget and fails loudly). Pinned in the classifier test set alongside the 1021 / errno-28 disk-full cases.
+
 ## [0.99.97] - 2026-06-21
 
 ### Fixed

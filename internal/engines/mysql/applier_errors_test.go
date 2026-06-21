@@ -107,6 +107,7 @@ func TestClassifyApplierError_RetriableShapes(t *testing.T) {
 		{"Vitess query-killer Canceled/TerminateAll (Error 1105, PS-320-v3 storage-grow finding)", &gomysql.MySQLError{Number: 1105, Message: "target: lst-mysql-d-ps320-v3.-.primary: vttablet: rpc error: code = Canceled desc = QueryList.TerminateAll(), elapsed time: 1m1.46075474s, killing connection ID 167 (CallerID: bnqr12v83ivogvozijwa)"}},
 		{"target out of disk Error 3 errno-28 (PS-320-v4 storage-grow root face)", &gomysql.MySQLError{Number: 3, Message: "target: lst-mysql-d-ps320-v4.-.primary: vttablet: rpc error: code = Unknown desc = Error writing file '/vt/vtdataroot/vt_2760286790/tmp/MLfd=122' (OS errno 28 - No space left on device) (errno 3) (sqlstate HY000)"}},
 		{"target out of disk ER_DISK_FULL 1021", &gomysql.MySQLError{Number: 1021, Message: "Disk full (/tmp); waiting for someone to free some space..."}},
+		{"target table full ER_RECORD_FILE_FULL 1114 (PS-320-v6 storage-grow root variant)", &gomysql.MySQLError{Number: 1114, Message: "target: lst-mysql-d-ps320-v6.-.primary: vttablet: rpc error: code = ResourceExhausted desc = The table '_tally' is full (errno: 28 - No space left on device)"}},
 		{"schema drift: unknown column 1054 (Bug F8)", &gomysql.MySQLError{Number: 1054, Message: "Unknown column 'soak_extra' in 'field list'"}},
 		{"schema drift: no such table 1146 (Bug F8)", &gomysql.MySQLError{Number: 1146, Message: "Table 'soak.new_table' doesn't exist"}},
 		{"driver.ErrBadConn", driver.ErrBadConn},
