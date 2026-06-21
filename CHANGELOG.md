@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.94] - 2026-06-21
+
+### Fixed
+
+- **The vttablet QUERY-killer (`code = Canceled` / `QueryList.TerminateAll`) is now classified retriable, so a cold-copy / CDC apply rides through it instead of aborting.** During a PlanetScale storage auto-grow, the in-flight write can hang past vttablet's query timeout, and vttablet then terminates the connection with `Error 1105 (HY000): ... vttablet: rpc error: code = Canceled desc = QueryList.TerminateAll(), elapsed time: 1m1s, killing connection ID N`. This is the same transient storage-grow stall that v0.99.92 (ADR-0108, the reparent-*error* face) and v0.99.93 (ADR-0109, the source-read-timeout face) addressed — but it surfaced as a *third* face, the target query-killer, which the ADR-0038 classifier did not mark retriable (it covered the tx-killer `code = Aborted "tx killer"` and `Unknown`/`Unavailable`/`ResourceExhausted`, but not `Canceled`). So neither ADR-0108's cold-copy write-retry nor ADR-0109's auto-restart engaged, and the copy exited fatally. The fix adds the **specific** server-side reason `QueryList.TerminateAll` to the retriable Vitess-message set, so the write-retry and auto-restart both ride it out, retrying after the stall clears. It is matched on the precise `QueryList.TerminateAll` reason and **not** on a blanket `code = Canceled` — a bare Canceled also covers a client-side context cancel (clean shutdown), which stays terminal (pinned: a `code = Canceled desc = context canceled` without the kill reason is not retried). It is treated as a plain transient, not a tx-killer, so it retries at size rather than forcing an AIMD shrink (it is a stall, not an oversized transaction). Found live on the v0.99.93 PS-320-v3 storage-grow validation, where v0.99.93's source-read-timeout fix held the source side but the target query-killer then surfaced. Pinned in the ADR-0038 classifier test set (retriable shape + the change-detector pin + the client-cancel negative).
+
 ## [0.99.93] - 2026-06-21
 
 ### Added

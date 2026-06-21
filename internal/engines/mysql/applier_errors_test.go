@@ -103,6 +103,7 @@ func TestClassifyApplierError_RetriableShapes(t *testing.T) {
 		{"Vitess Unknown (Error 1105)", &gomysql.MySQLError{Number: 1105, Message: "vttablet: rpc error: code = Unknown desc = caller id churn"}},
 		{"Vitess Unavailable (Error 1105)", &gomysql.MySQLError{Number: 1105, Message: "vttablet: rpc error: code = Unavailable desc = tablet not serving"}},
 		{"Vitess ResourceExhausted (Error 1105)", &gomysql.MySQLError{Number: 1105, Message: "vttablet: rpc error: code = ResourceExhausted desc = throttler engaged"}},
+		{"Vitess query-killer Canceled/TerminateAll (Error 1105, PS-320-v3 storage-grow finding)", &gomysql.MySQLError{Number: 1105, Message: "target: lst-mysql-d-ps320-v3.-.primary: vttablet: rpc error: code = Canceled desc = QueryList.TerminateAll(), elapsed time: 1m1.46075474s, killing connection ID 167 (CallerID: bnqr12v83ivogvozijwa)"}},
 		{"schema drift: unknown column 1054 (Bug F8)", &gomysql.MySQLError{Number: 1054, Message: "Unknown column 'soak_extra' in 'field list'"}},
 		{"schema drift: no such table 1146 (Bug F8)", &gomysql.MySQLError{Number: 1146, Message: "Table 'soak.new_table' doesn't exist"}},
 		{"driver.ErrBadConn", driver.ErrBadConn},
@@ -150,6 +151,11 @@ func TestClassifyApplierError_VitessNonTransientCodesNotRetriable(t *testing.T) 
 		{"FailedPrecondition", "vttablet: rpc error: code = FailedPrecondition desc = primary readonly"},
 		{"NotFound", "vttablet: rpc error: code = NotFound desc = keyspace 'unknown' not found"},
 		{"PermissionDenied", "vttablet: rpc error: code = PermissionDenied desc = user lacks INSERT"},
+		// A bare code=Canceled WITHOUT the server-side QueryList.TerminateAll
+		// reason is a CLIENT-side cancel (clean shutdown) and MUST stay
+		// terminal — only the specific server query-killer reason is retriable
+		// (v0.99.94: do not blanket-retry code=Canceled).
+		{"Canceled client-cancel (no TerminateAll) stays terminal", "vttablet: rpc error: code = Canceled desc = context canceled"},
 	}
 	for _, c := range cases {
 		c := c
@@ -331,6 +337,7 @@ func TestVitessRetriableSubstrings_PinDown4(t *testing.T) {
 		"code = Unknown",
 		"code = Unavailable",
 		"code = ResourceExhausted",
+		"QueryList.TerminateAll",
 	}
 
 	// Pin the production set length + membership against the literal

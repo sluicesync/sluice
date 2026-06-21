@@ -286,15 +286,38 @@ var reparentRetriableSubstrings = []string{
 //	                        ADR-0038's MySQL table lists it retriable.
 //	"code = Unavailable"  — vttablet not ready, in-flight failover.
 //	"code = ResourceExhausted" — throttler engaged, pool full.
+//	"QueryList.TerminateAll" — vttablet's QUERY-killer (surfaces as
+//	                        `code = Canceled desc = QueryList.TerminateAll()
+//	                        ... killing connection ID N`). vttablet kills a
+//	                        long-running query/connection when it exceeds the
+//	                        query timeout OR during a pool drain on a
+//	                        reparent/storage-grow stall — e.g. a PlanetScale
+//	                        non-Metal storage auto-grow blocks the in-flight
+//	                        INSERT past the query timeout, then vttablet
+//	                        terminates it (the v0.99.93 PS-320-v3 live
+//	                        finding). It is TRANSIENT: retrying after the
+//	                        stall clears succeeds. Matched by the SPECIFIC
+//	                        reason `QueryList.TerminateAll`, NOT a blanket
+//	                        `code = Canceled` — a bare Canceled also covers a
+//	                        CLIENT-side ctx cancel (clean shutdown) which must
+//	                        stay terminal, and that shape never carries the
+//	                        server-side TerminateAll reason. Sibling of the
+//	                        tx-killer (`code = Aborted "tx killer"`, #54) but
+//	                        NOT flagged TransactionKilled — it is a stall, not
+//	                        an oversized-tx, so it should retry-at-size, not
+//	                        force an AIMD shrink.
 //
 // Other gRPC codes (InvalidArgument, FailedPrecondition, NotFound,
 // PermissionDenied, …) are terminal — the operator's SQL is wrong or
 // a constraint is being violated; retrying those would mask real bugs.
+// A bare `code = Canceled` is deliberately ABSENT (client-cancel ambiguity);
+// only the server-side `QueryList.TerminateAll` reason is retriable.
 var vitessRetriableSubstrings = []string{
 	"code = Aborted",
 	"code = Unknown",
 	"code = Unavailable",
 	"code = ResourceExhausted",
+	"QueryList.TerminateAll",
 }
 
 // classifyVitessMessage returns true when a MySQL Error 1105's text
