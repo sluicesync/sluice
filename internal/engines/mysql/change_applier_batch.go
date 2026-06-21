@@ -122,11 +122,24 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 		// MySQL DDL implicit-commits the open tx — schema events must
 		// flush the batch and apply alone via ApplyOne (see the file-
 		// header comment).
-		TransactionalDDL:  false,
-		ByteCap:           byteCap,
-		BatchSizeProvider: a.batchSizeProvider,
-		BatchObserver:     a.batchObserver,
-		BeginTx:           a.beginSerialBatchTx,
+		TransactionalDDL: false,
+		// MySQL file/pos resume cannot start mid-transaction (go-mysql seeks
+		// to the byte offset; a ROWS event whose TABLE_MAP was earlier in the
+		// same tx fails with "no corresponding table map event"). Persist the
+		// resume position ONLY at a source-tx / DDL boundary so a row-cap /
+		// byte-cap / idle / keyless / channel-close flush that lands mid-tx
+		// commits its data but does NOT advance the persisted position — the
+		// interrupted tx re-reads whole and idempotently re-applies on resume
+		// (ADR-0010). The concurrent laneapply path already enforces this; the
+		// serial loop must match it. Found live on the large-scale program: a
+		// slow cross-region target drove AIMD to batch-size 1, split a large
+		// multi-row source tx across batches, and persisted a mid-tx position
+		// that crash-looped every warm-resume.
+		CheckpointOnlyAtTxBoundary: true,
+		ByteCap:                    byteCap,
+		BatchSizeProvider:          a.batchSizeProvider,
+		BatchObserver:              a.batchObserver,
+		BeginTx:                    a.beginSerialBatchTx,
 		Dispatch: func(ctx context.Context, tx appliershared.BatchTx, streamID string, c ir.Change) error {
 			return a.dispatch(ctx, tx.(*sql.Tx), streamID, c)
 		},

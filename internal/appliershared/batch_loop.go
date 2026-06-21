@@ -117,6 +117,38 @@ type BatchConfig struct {
 	// output is byte-identical to the pre-extraction per-engine loops.
 	EngineName string
 
+	// CheckpointOnlyAtTxBoundary, when true, makes the loop persist the
+	// resume position ONLY on a source-transaction boundary flush
+	// (TxCommit) or a DDL flush (Truncate / SchemaSnapshot, which
+	// implicit-commit on MySQL and ride their own tx on PG) — never on a
+	// row-cap / byte-cap / idle / keyless / channel-close flush that lands
+	// mid-transaction. The batch's DATA still commits on every flush
+	// (memory stays bounded, ADR-0028); only the *position write* is gated.
+	//
+	// This exists because MySQL file/pos resume is NOT valid mid-transaction:
+	// go-mysql seeks to the persisted byte offset and starts reading there,
+	// so a position pointing at a ROWS event whose TABLE_MAP was earlier in
+	// the same transaction fails with "no corresponding table map event" and
+	// the stream cannot warm-resume (found live on the large-scale program:
+	// the serial applier, driven to AIMD batch-size 1 by a slow cross-region
+	// target, split a large multi-row source transaction across batches and
+	// persisted a mid-tx position; every restart then crash-looped). The
+	// concurrent laneapply path already enforces this invariant via its
+	// frontier ("must NOT persist a partial point"); this flag gives the
+	// serial loop the same guarantee. On a mid-tx flush the position row
+	// simply retains its last boundary value, so a crash re-reads the whole
+	// in-flight transaction from the previous boundary and idempotently
+	// re-applies it (ADR-0010) — at-least-once for the interrupted tx, the
+	// same model the keyless guard and the concurrent frontier already use.
+	//
+	// false (Postgres): unchanged. PG logical-replication resume is by LSN
+	// and the walsender resends whole transactions from restart_lsn, so a
+	// mid-tx position is a valid restart point; persisting lastPos every
+	// flush keeps the slot's confirmed_flush_lsn advancing promptly
+	// (ADR-0020). Engines whose AfterCommit advances a slot ack must leave
+	// this false.
+	CheckpointOnlyAtTxBoundary bool
+
 	// TransactionalDDL names the one structural divergence between the
 	// engines' batch loops: whether a schema-changing event (Truncate /
 	// SchemaSnapshot) can ride the open batch transaction.
@@ -346,11 +378,30 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 				return 0, ir.Position{}, true, nil
 			}
 			switch c.(type) {
-			case ir.TxBegin, ir.TxCommit:
-				// Empty source tx (BEGIN → COMMIT with no row events)
-				// or a boundary that arrived after a previous batch
-				// flushed — both are no-ops; keep waiting for the
-				// next row event.
+			case ir.TxBegin:
+				// Source-tx start with no batch open yet — a no-op; keep
+				// waiting for the first row event of the transaction.
+				continue
+			case ir.TxCommit:
+				// A source-transaction boundary that arrived on an empty
+				// batch: either an empty tx (BEGIN → COMMIT with no rows,
+				// e.g. a heartbeat) or — the load-bearing case under
+				// CheckpointOnlyAtTxBoundary — the trailing COMMIT of a tx
+				// whose rows already committed in prior batches (its last
+				// row filled a batch before this COMMIT was read; common at
+				// AIMD batch-size 1). When mid-tx flushes skip the position
+				// write, this is the ONLY place the boundary can be
+				// persisted, so do it here in a dedicated position-only tx;
+				// the rows are already durable (serial in-order apply), so
+				// advancing the checkpoint to this boundary is safe and
+				// keeps warm-resume restarting at a clean tx boundary.
+				// Without the flag (PG) this stays a pure no-op: PG already
+				// advanced its position on the rows' own flushes.
+				if cfg.CheckpointOnlyAtTxBoundary {
+					if err := writeBoundaryOnly(ctx, cfg, streamID, c.Pos().Token); err != nil {
+						return 0, ir.Position{}, false, err
+					}
+				}
 				continue
 			}
 			first = c
@@ -411,10 +462,10 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 	// after commitBatch reports nil (Chunk C cache-after-commit).
 	if cfg.TransactionalDDL {
 		if _, isTruncate := first.(ir.Truncate); isTruncate {
-			return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n)
+			return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, true)
 		}
 		if snap, isSnap := first.(ir.SchemaSnapshot); isSnap {
-			if err := commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n); err != nil {
+			if err := commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, true); err != nil {
 				return 0, ir.Position{}, false, err
 			}
 			cfg.CacheSchemaSnapshot(snap)
@@ -431,7 +482,7 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 	// above) and has just dispatched, so the engine's key cache is populated
 	// for the lookup.
 	if cfg.IsKeylessTable != nil && cfg.IsKeylessTable(ctx, first) {
-		return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n)
+		return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, false)
 	}
 
 	// Idle-flush timer: commit a partial batch if no further change
@@ -446,7 +497,7 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 		case c, ok := <-changes:
 			if !ok {
 				channelClosed = true
-				return n, lastPos, channelClosed, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n)
+				return n, lastPos, channelClosed, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, false)
 			}
 			// Source-tx boundary handling (ADR-0027). TxCommit flushes
 			// the in-flight target tx so the apply aligns with the
@@ -458,7 +509,7 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 			// to keep alignment.
 			if _, isTxCommit := c.(ir.TxCommit); isTxCommit {
 				lastPos = c.Pos()
-				return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n)
+				return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, true)
 			}
 			if _, isTxBegin := c.(ir.TxBegin); isTxBegin {
 				// Reset the idle timer so a TxBegin observed mid-batch
@@ -476,7 +527,7 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 			// the per-change path. Return rows=1 and the event's
 			// position so the outer loop logs it as its own batch.
 			if !cfg.TransactionalDDL && isSchemaEvent(c) {
-				if err := commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n); err != nil {
+				if err := commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, false); err != nil {
 					return 0, ir.Position{}, false, err
 				}
 				logBatchCommitted(ctx, cfg.EngineName, streamID, n, lastPos.Token)
@@ -508,10 +559,10 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 			// arrive in later batches) are applied.
 			if cfg.TransactionalDDL {
 				if _, isTruncate := c.(ir.Truncate); isTruncate {
-					return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n)
+					return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, true)
 				}
 				if snap, isSnap := c.(ir.SchemaSnapshot); isSnap {
-					if err := commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n); err != nil {
+					if err := commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, true); err != nil {
 						return 0, ir.Position{}, false, err
 					}
 					// ADR-0049 Chunk C cache-after-commit: see the
@@ -530,7 +581,7 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 			// (keyless CDC is at-least-once; see the IsKeylessTable doc and
 			// the first-change branch above; Bug 143).
 			if cfg.IsKeylessTable != nil && cfg.IsKeylessTable(ctx, c) {
-				return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n)
+				return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, false)
 			}
 			// Byte-cap flush (ADR-0028): bounds the in-flight tx's
 			// buffered parameter memory on wide-row streams. Checked
@@ -555,7 +606,7 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 						hinter.NoteByteCapDominant(ctx, n, batchBytes, cfg.ByteCap)
 					}
 				}
-				return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n)
+				return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, false)
 			}
 			// Reset the idle timer for each successful change so the
 			// timer measures gaps between events, not absolute time
@@ -568,14 +619,14 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 				slog.Int("rows", n),
 				slog.Duration("idle", DefaultIdleFlushPeriod),
 			)
-			return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n)
+			return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, false)
 		case <-ctx.Done():
 			_ = tx.Rollback()
 			return 0, ir.Position{}, false, ctx.Err()
 		}
 	}
 
-	return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n)
+	return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, false)
 }
 
 // commitBatch writes the position then commits the open tx, then
@@ -584,16 +635,28 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 // Returns a wrapped error on either failure with a rollback already
 // attempted on the position-write path. This ordering IS the ADR-0007
 // position-and-data atomicity contract; do not reorder.
-func commitBatch(ctx context.Context, cfg *BatchConfig, tx BatchTx, streamID, token string, rows int) error {
-	if err := cfg.WritePosition(ctx, tx, streamID, token); err != nil {
-		_ = tx.Rollback()
-		slog.WarnContext(
-			ctx, cfg.EngineName+": applier: batch rollback on position-write error",
-			slog.String("stream_id", streamID),
-			slog.Int("rows_attempted", rows),
-			slog.String("err", err.Error()),
-		)
-		return err
+//
+// atBoundary reports whether `token` is a safe source-transaction /
+// DDL boundary resume point. When [BatchConfig.CheckpointOnlyAtTxBoundary]
+// is set and atBoundary is false, the position write (and the AfterCommit
+// slot-ack) is SKIPPED: the batch's data still commits, but the persisted
+// position retains its last boundary value so warm-resume re-reads the
+// whole in-flight transaction (see the CheckpointOnlyAtTxBoundary doc for
+// why MySQL file/pos cannot resume mid-transaction). When the flag is
+// false (Postgres) every flush writes the position as before.
+func commitBatch(ctx context.Context, cfg *BatchConfig, tx BatchTx, streamID, token string, rows int, atBoundary bool) error {
+	skipPosition := cfg.CheckpointOnlyAtTxBoundary && !atBoundary
+	if !skipPosition {
+		if err := cfg.WritePosition(ctx, tx, streamID, token); err != nil {
+			_ = tx.Rollback()
+			slog.WarnContext(
+				ctx, cfg.EngineName+": applier: batch rollback on position-write error",
+				slog.String("stream_id", streamID),
+				slog.Int("rows_attempted", rows),
+				slog.String("err", err.Error()),
+			)
+			return err
+		}
 	}
 	if err := cfg.Commit(tx); err != nil {
 		slog.WarnContext(
@@ -603,6 +666,38 @@ func commitBatch(ctx context.Context, cfg *BatchConfig, tx BatchTx, streamID, to
 			slog.String("err", err.Error()),
 		)
 		return cfg.Classify(fmt.Errorf("%s: applier: commit: %w", cfg.EngineName, err))
+	}
+	if !skipPosition && cfg.AfterCommit != nil {
+		cfg.AfterCommit(ctx, token)
+	}
+	return nil
+}
+
+// writeBoundaryOnly persists a source-transaction boundary position in
+// its own tiny transaction (begin → WritePosition → commit), with no row
+// data. It exists for the CheckpointOnlyAtTxBoundary path: when a tx's
+// rows committed across earlier batches and the trailing TxCommit arrives
+// on an empty batch (the pre-tx wait loop), this is the only place the
+// boundary checkpoint can advance. The rows are already durable (serial
+// in-order apply), so persisting the boundary afterward never moves the
+// position ahead of durable data (ADR-0007). Mirrors commitBatch's
+// position-then-commit-then-AfterCommit ordering for the one-row-less case.
+func writeBoundaryOnly(ctx context.Context, cfg *BatchConfig, streamID, token string) error {
+	tx, err := cfg.BeginTx(ctx)
+	if err != nil {
+		return err
+	}
+	if err := cfg.WritePosition(ctx, tx, streamID, token); err != nil {
+		_ = tx.Rollback()
+		slog.WarnContext(
+			ctx, cfg.EngineName+": applier: boundary-position rollback on write error",
+			slog.String("stream_id", streamID),
+			slog.String("err", err.Error()),
+		)
+		return err
+	}
+	if err := cfg.Commit(tx); err != nil {
+		return cfg.Classify(fmt.Errorf("%s: applier: boundary commit: %w", cfg.EngineName, err))
 	}
 	if cfg.AfterCommit != nil {
 		cfg.AfterCommit(ctx, token)

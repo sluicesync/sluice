@@ -296,6 +296,86 @@ func TestRunOneBatch_TxCommitBoundaryFlushes(t *testing.T) {
 	assertEvents(t, rec, []string{"begin", "dispatch:p1", "writePosition:p2", "commit"})
 }
 
+// txBegin / txCommit build the source-transaction boundary markers the
+// reader emits around row events (ADR-0027).
+func txBegin(token string) ir.Change  { return ir.TxBegin{Position: pos(token)} }
+func txCommit(token string) ir.Change { return ir.TxCommit{Position: pos(token)} }
+
+// TestRunBatchLoop_CheckpointOnlyAtTxBoundary_NeverPersistsMidTxPosition
+// is the regression pin for the HIGH native-MySQL warm-resume bug found
+// live on the large-scale program: under CheckpointOnlyAtTxBoundary, a
+// source transaction split across batches (here forced by batch size 1)
+// must NEVER persist a mid-transaction position — each row's batch commits
+// its DATA but skips the position write, and the resume checkpoint advances
+// only when the trailing TxCommit boundary is seen (persisted here via the
+// dedicated position-only tx, since the COMMIT lands on an empty batch).
+//
+// Before the fix the row-cap flush persisted the last ROW's position
+// (mid-tx); go-mysql then could not warm-resume from it ("no corresponding
+// table map event") and crash-looped. The assertion surface is exact: the
+// ONLY writePosition is the boundary token, never p1 / p2.
+func TestRunBatchLoop_CheckpointOnlyAtTxBoundary_NeverPersistsMidTxPosition(t *testing.T) {
+	rec := &recorder{}
+	cfg := testConfig(t, rec, false)
+	cfg.CheckpointOnlyAtTxBoundary = true
+
+	// One source tx of two rows then COMMIT, forced to split by cap=1.
+	ch := feed(true, txBegin("tb"), insertAt("p1"), insertAt("p2"), txCommit("tc"))
+	if err := RunBatchLoop(context.Background(), cfg, "stream", ch, 1); err != nil {
+		t.Fatalf("RunBatchLoop: %v", err)
+	}
+	assertEvents(t, rec, []string{
+		"begin", "dispatch:p1", "commit", // row 1: data only — NO mid-tx position
+		"begin", "dispatch:p2", "commit", // row 2: data only — NO mid-tx position
+		"begin", "writePosition:tc", "commit", // boundary: dedicated position-only tx
+	})
+}
+
+// TestRunBatchLoop_CheckpointDefault_PersistsMidTxPosition is the Postgres
+// regression guard: with the flag OFF (the default), behaviour is byte-for-
+// byte what it was before the fix — every flush persists its position
+// (PG logical-replication resume is by LSN and tolerates a mid-tx restart
+// point), and a TxCommit on an empty batch stays a pure no-op. This pins
+// that the MySQL fix did NOT change the PG path.
+func TestRunBatchLoop_CheckpointDefault_PersistsMidTxPosition(t *testing.T) {
+	rec := &recorder{}
+	cfg := testConfig(t, rec, false) // CheckpointOnlyAtTxBoundary defaults false
+
+	ch := feed(true, txBegin("tb"), insertAt("p1"), insertAt("p2"), txCommit("tc"))
+	if err := RunBatchLoop(context.Background(), cfg, "stream", ch, 1); err != nil {
+		t.Fatalf("RunBatchLoop: %v", err)
+	}
+	assertEvents(t, rec, []string{
+		"begin", "dispatch:p1", "writePosition:p1", "commit",
+		"begin", "dispatch:p2", "writePosition:p2", "commit",
+		// trailing TxCommit on an empty batch: no-op (no dedicated write)
+	})
+}
+
+// TestRunOneBatch_CheckpointOnlyAtTxBoundary_BoundaryWritesAtomically pins
+// the common case: when the whole source tx fits in one batch, the
+// TxCommit boundary flush writes the boundary position atomically with the
+// rows' data (NO dedicated position-only tx) — the dedicated write is only
+// the empty-batch fallback. Resume checkpoint = the boundary (tc), not the
+// last row.
+func TestRunOneBatch_CheckpointOnlyAtTxBoundary_BoundaryWritesAtomically(t *testing.T) {
+	rec := &recorder{}
+	cfg := testConfig(t, rec, false)
+	cfg.CheckpointOnlyAtTxBoundary = true
+
+	ch := feed(false, insertAt("p1"), insertAt("p2"), txCommit("tc"))
+	n, lastPos, closed, err := RunOneBatch(context.Background(), cfg, "stream", ch, 100)
+	if err != nil {
+		t.Fatalf("RunOneBatch: %v", err)
+	}
+	if n != 2 || lastPos.Token != "tc" || closed {
+		t.Fatalf("n=%d lastPos=%q closed=%v; want n=2 lastPos=tc closed=false", n, lastPos.Token, closed)
+	}
+	assertEvents(t, rec, []string{
+		"begin", "dispatch:p1", "dispatch:p2", "writePosition:tc", "commit",
+	})
+}
+
 // TestRunOneBatch_SchemaEventOutsideTx_FirstAppliesAlone pins the
 // TransactionalDDL=false (MySQL) first-change shape: the event runs
 // via ApplyOne with NO batch tx, and the AIMD observer does not fire
