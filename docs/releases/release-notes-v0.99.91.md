@@ -19,6 +19,8 @@ The headline effect is out-of-the-box CDC catch-up and steady-state throughput r
 
 Pinned by unit tests (the `0 → auto:N`, `1 → serial`, `W>1 → verbatim` contract; the keystone "unset is not serial"; PG budget-bounds-and-caps-lanes; probe-refuse/fail → serial; a programmatic applier without the concurrency surface stays serial) and an integration test that confirms the default engages concurrency end-to-end with no operator action and that the default converges byte-identical to explicit serial. The `-race` integration gate ran before tagging (CDC/exactly-once chunk).
 
+**Per-lane AIMD observability.** Because the new default routes a stream through the per-lane key-hash apply controllers, the AIMD apply-batch-size metrics (`sluice_apply_batch_size_current`, `_p95_seconds`, `_decreases_total`, `_cooloff`) are now exported once per lane with an added `lane="N"` label — so a `--apply-concurrency` stream keeps full observability of each lane's batch size, p95 latency, decrease count, and cool-off state, rather than the gauges vanishing when concurrency engaged. The serial path's metrics are unchanged (no `lane` label).
+
 ## Compatibility
 
 This **changes a default for every user**: a `sluice sync` started without `--apply-concurrency` now applies CDC changes across multiple key-hash lanes instead of one. It is wire- and result-compatible — final target state is byte-identical to serial — and resumable exactly as before. The only observable differences are higher steady-state apply throughput and slightly more target connections by default (≤ `N` lanes + `N` dedicated backends, bounded by the probe on PG / the fixed ceiling on MySQL, well within real limits). To restore the exact prior behavior, pass `--apply-concurrency 1`.
