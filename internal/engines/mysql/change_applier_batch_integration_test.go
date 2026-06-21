@@ -318,10 +318,13 @@ func TestChangeApplier_ApplyBatch_TxCommitFlushesBatch(t *testing.T) {
 	}
 }
 
-// TestChangeApplier_ApplyBatch_PartialFlushPersistsPosition checks
-// the channel-close-flush path: when the channel closes before the
-// batch fills, the partial batch commits and the position of the
-// last applied change persists.
+// TestChangeApplier_ApplyBatch_PartialFlushPersistsPosition checks that
+// a partial (sub-maxBatchSize) batch that ends at a source-transaction
+// boundary commits its rows and persists the BOUNDARY position. Post
+// item 29 the serial loop checkpoints only at tx boundaries (a mid-tx
+// position is not a valid MySQL file/pos resume point), so the stream
+// ends with a TxCommit and the persisted token is that boundary's — not
+// the last row's. The channel then closes after the boundary flush.
 func TestChangeApplier_ApplyBatch_PartialFlushPersistsPosition(t *testing.T) {
 	dsn, cleanup := startMySQLForApplier(t)
 	defer cleanup()
@@ -349,10 +352,15 @@ func TestChangeApplier_ApplyBatch_PartialFlushPersistsPosition(t *testing.T) {
 	}()
 
 	const lastToken = "the-last-token"
+	// A partial (3 rows ≪ 100) source transaction: BEGIN, three rows, COMMIT.
+	// The TxCommit flushes the sub-cap batch and persists the BOUNDARY token;
+	// the channel then closes after the boundary has been checkpointed.
 	events := []ir.Change{
+		ir.TxBegin{Position: ir.Position{Token: "tx-begin"}},
 		ir.Insert{Position: ir.Position{Token: "p1"}, Schema: "target_db", Table: "users", Row: ir.Row{"id": int64(1), "email": "a@x"}},
 		ir.Insert{Position: ir.Position{Token: "p2"}, Schema: "target_db", Table: "users", Row: ir.Row{"id": int64(2), "email": "b@x"}},
-		ir.Insert{Position: ir.Position{Token: lastToken}, Schema: "target_db", Table: "users", Row: ir.Row{"id": int64(3), "email": "c@x"}},
+		ir.Insert{Position: ir.Position{Token: "p3"}, Schema: "target_db", Table: "users", Row: ir.Row{"id": int64(3), "email": "c@x"}},
+		ir.TxCommit{Position: ir.Position{Token: lastToken}},
 	}
 	pumpBatchedChanges(t, ctx, applier, events, 100)
 
@@ -365,29 +373,33 @@ func TestChangeApplier_ApplyBatch_PartialFlushPersistsPosition(t *testing.T) {
 		t.Fatalf("ReadPosition: %v", err)
 	}
 	if !ok {
-		t.Fatal("ReadPosition: no row found; expected partial-batch flush to persist position")
+		t.Fatal("ReadPosition: no row found; expected the TxCommit-boundary flush to persist position")
 	}
 	if pos.Token != lastToken {
-		t.Errorf("position token = %q; want %q (last applied change in batch)", pos.Token, lastToken)
+		t.Errorf("position token = %q; want %q (the source TxCommit boundary, not a mid-tx row)", pos.Token, lastToken)
 	}
 }
 
 // TestChangeApplier_ApplyBatch_IdleFlushCommitsPartial is the MySQL
 // mirror of the PG idle-flush test. It pins roadmap item 18 Fix B: a
-// partial batch (n < maxBatchSize) on a quiet stream commits within the
-// short idle grace (now 100ms, was 5s) even when the channel hasn't
-// closed and no Truncate has arrived.
+// partial batch (n < maxBatchSize) on a quiet stream commits its DATA
+// within the short idle grace (now 100ms, was 5s) even when the channel
+// hasn't closed and no Truncate has arrived — so the target stays fresh
+// and the unapplied-data window stays small.
 //
 // Pre-fix shape: the applier waited indefinitely for maxBatchSize,
-// channel close, or a Truncate; a 3-of-100 batch sat in memory and the
-// persisted source_position never advanced past the last full batch,
-// lengthening the warm-resume replay window.
+// channel close, or a Truncate; a 3-of-100 batch sat in memory for 5s.
 //
-// The channel is kept OPEN (the channel-close path would commit on its
-// own); the test feeds 3 changes, then polls for the persisted position
-// and asserts the flush landed well inside the old 5s grace. The 2s
-// poll deadline is comfortably above 100ms + CI jitter but far below
-// 5s, so a regression to the old grace fails loudly.
+// The stream here is an IN-FLIGHT source transaction that paused (BEGIN +
+// three rows, no COMMIT yet). The idle flush commits the three rows'
+// data promptly — but because the transaction has not committed, the
+// resume position is NOT advanced (item 29: the serial loop checkpoints
+// only at a tx boundary; a mid-tx MySQL file/pos position is not a valid
+// resume point). So the assertion surface is the DATA landing within the
+// grace, plus the position deliberately NOT persisting mid-transaction.
+// The channel is kept OPEN so the idle timer (not channel-close) is what
+// fires. The 2s deadline is far above 100ms + CI jitter but well below
+// the pre-fix 5s, so a regression to the old grace fails loudly.
 func TestChangeApplier_ApplyBatch_IdleFlushCommitsPartial(t *testing.T) {
 	dsn, cleanup := startMySQLForApplier(t)
 	defer cleanup()
@@ -422,11 +434,13 @@ func TestChangeApplier_ApplyBatch_IdleFlushCommitsPartial(t *testing.T) {
 		t.Fatalf("applier does not implement BatchedChangeApplier")
 	}
 
-	const lastToken = "idle-flush-last"
+	// An in-flight source transaction that paused mid-stream: BEGIN + three
+	// rows, no COMMIT. The idle flush must commit the rows' DATA promptly.
 	events := []ir.Change{
+		ir.TxBegin{Position: ir.Position{Token: "tx-begin"}},
 		ir.Insert{Position: ir.Position{Token: "p1"}, Schema: "target_db", Table: "users", Row: ir.Row{"id": int64(1), "email": "a@x"}},
 		ir.Insert{Position: ir.Position{Token: "p2"}, Schema: "target_db", Table: "users", Row: ir.Row{"id": int64(2), "email": "b@x"}},
-		ir.Insert{Position: ir.Position{Token: lastToken}, Schema: "target_db", Table: "users", Row: ir.Row{"id": int64(3), "email": "c@x"}},
+		ir.Insert{Position: ir.Position{Token: "p3"}, Schema: "target_db", Table: "users", Row: ir.Row{"id": int64(3), "email": "c@x"}},
 	}
 
 	ch := make(chan ir.Change, len(events))
@@ -445,29 +459,25 @@ func TestChangeApplier_ApplyBatch_IdleFlushCommitsPartial(t *testing.T) {
 		done <- batched.ApplyBatch(applyCtx, testStreamID, ch, 100)
 	}()
 
+	// Poll for the DATA: the idle flush commits the three rows promptly even
+	// though no COMMIT has arrived (item 18 Fix B). Position persistence is
+	// NOT the signal here — a mid-tx flush deliberately does not advance it.
 	const flushDeadline = 2 * time.Second
-	var pos ir.Position
-	var found bool
+	var rows int
 	deadline := time.Now().Add(flushDeadline)
 	for time.Now().Before(deadline) {
-		pos, found, err = applier.ReadPosition(parentCtx, testStreamID)
-		if err != nil {
-			cancelApply()
-			<-done
-			t.Fatalf("ReadPosition: %v", err)
-		}
-		if found {
+		if rows = countAllRows(t, dsn, "target_db", "users"); rows == 3 {
 			break
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
 	flushElapsed := time.Since(start)
 
-	if !found {
+	if rows != 3 {
 		cancelApply()
 		<-done
-		t.Fatalf("idle-flush did not persist the partial batch within %v (Fix B grace is %v; a regression to the 5s grace would manifest here)",
-			flushDeadline, defaultIdleFlushPeriod)
+		t.Fatalf("idle-flush did not commit the partial batch's data within %v (got %d rows; Fix B grace is %v; a regression to the 5s grace would manifest here)",
+			flushDeadline, rows, defaultIdleFlushPeriod)
 	}
 	if flushElapsed >= 5*time.Second {
 		cancelApply()
@@ -475,15 +485,19 @@ func TestChangeApplier_ApplyBatch_IdleFlushCommitsPartial(t *testing.T) {
 		t.Errorf("idle flush took %v; want well under the pre-fix 5s grace (item 18 Fix B = %v)", flushElapsed, defaultIdleFlushPeriod)
 	}
 
-	if got := countAllRows(t, dsn, "target_db", "users"); got != 3 {
+	// item 29: the transaction has NOT committed, so the resume position must
+	// NOT have advanced into the transaction (a mid-tx MySQL file/pos point is
+	// an invalid resume anchor). It stays unset until a TxCommit boundary.
+	_, found, err := applier.ReadPosition(parentCtx, testStreamID)
+	if err != nil {
 		cancelApply()
 		<-done
-		t.Errorf("after idle flush: rows = %d; want 3", got)
+		t.Fatalf("ReadPosition: %v", err)
 	}
-	if pos.Token != lastToken {
+	if found {
 		cancelApply()
 		<-done
-		t.Errorf("position token = %q; want %q (last applied change in partial batch)", pos.Token, lastToken)
+		t.Error("position was persisted mid-transaction; want NO checkpoint until a TxCommit boundary (item 29)")
 	}
 
 	// Cancel and drain so the goroutine exits cleanly.
