@@ -458,6 +458,22 @@ func copyTableWithCursor(
 			return err
 		}
 
+		// CRITICAL silent-loss guard (same class as the ADR-0109 chunk-path
+		// sibling-cancel fix; a SEPARATE pre-existing latent bug in the
+		// single-reader --resume cursor path). The cross-table copy pool
+		// (ADR-0076) cancels its errgroup ctx on the FIRST table's terminal
+		// error so peers unwind; a peer table cancelled here closes its batch
+		// channel early (batchCount==0 or short), and readerStreamErr filters
+		// ctx.Canceled to nil — so without this check the cancelled table
+		// returns nil, the caller marks it State=Complete, and a later --resume
+		// SKIPS it with only a partial copy on disk → silent loss of its unread
+		// tail. Returning the cancellation keeps the table NOT-complete so the
+		// resume re-runs it from its durable LastPK. Mirrors the copyChunk /
+		// copyChunkFast guards.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		if batchCount == 0 {
 			// Empty batch from the reader → end of table.
 			return nil

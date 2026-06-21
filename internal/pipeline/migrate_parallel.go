@@ -825,6 +825,20 @@ func copyChunk(
 			return err
 		}
 
+		// CRITICAL (ADR-0109 sibling-cancel silent-loss fix): a
+		// ctx-cancellation must NOT read as a clean end-of-chunk. A peer
+		// chunk's retriable source-read drop cancels the shared errgroup ctx;
+		// the reader then closes this chunk's batch channel early (batchCount==0
+		// or short), and readerStreamErr filters ctx.Canceled to nil — so
+		// without this check the chunk would break-out and be marked
+		// State=Complete with a partial copy, and the whole-table retry would
+		// SKIP it → silent loss of the unread tail. Returning the cancellation
+		// keeps the chunk NOT-complete so the retry re-runs it from its durable
+		// LastPK cursor. Mirrors the copyChunkFast pump guard.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		if batchCount == 0 {
 			// End of chunk (either hit upper bound or end of table).
 			break
@@ -1024,6 +1038,23 @@ func copyChunkFast(
 			// batchCount, so a decode failure fails the migrate instead
 			// of silently ending the chunk's stream.
 			if err := readerStreamErr(br, table); err != nil {
+				pumpErr <- err
+				return
+			}
+			// CRITICAL (ADR-0109 sibling-cancel silent-loss fix): a
+			// ctx-cancellation must NOT read as a clean end-of-chunk. The
+			// reader closes its page channel early on cancellation (yielding
+			// batchCount==0 or a short page), and readerStreamErr DELIBERATELY
+			// filters ctx.Canceled/DeadlineExceeded to nil (benign-cancel) — so
+			// without this check a chunk cancelled by a PEER chunk's retriable
+			// source-read drop (errgroup cancels gctx) would post pumpErr<-nil,
+			// be recorded State=Complete with a PARTIAL/EMPTY copy, and the
+			// whole-table retry would then SKIP it (chunk already "complete") →
+			// silent loss of the chunk's unread tail. Surfacing the cancellation
+			// leaves the chunk NOT-complete so the retry re-runs it from its
+			// durable cursor. (Checked before the batchCount/short-page verdicts,
+			// which is where the benign-cancel close lands.)
+			if err := streamCtx.Err(); err != nil {
 				pumpErr <- err
 				return
 			}

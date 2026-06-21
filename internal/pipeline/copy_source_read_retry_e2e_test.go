@@ -19,27 +19,58 @@ import (
 // with ZERO duplicates and ZERO drops. They pin the value-fidelity core of
 // ADR-0109: a reconnect must never lose or duplicate a row.
 
-// fakeSource is a scriptable in-memory source for the source-read retry
-// e2e tests. It backs a single integer-PK table id=1..N and serves rows
-// from that backing store, supporting the whole-table (ReadRows) and
-// cursor/chunk (ReadRowsBatch / ReadRowsBatchBounded) read shapes plus the
-// chunk-eligibility surfaces (RangeBounds / RowCounter / RowCountEstimator).
+// fakeSourceStore is the SHARED backing of a scriptable source: the
+// id=1..maxID rows and the one-shot drop latch. Multiple fakeSource reader
+// HANDLES (one per OpenRowReader / per chunk) read from it concurrently —
+// modelling production, where every chunk/table copy opens its OWN
+// connection-backed reader against the same source database.
 //
 // dropBeforeID scripts EXACTLY ONE mid-table connection drop, keyed on the
 // PK value rather than a call counter so it fires DETERMINISTICALLY
-// regardless of which chunk reads first under within-table parallelism:
-// the first emit that is about to send the row with id == dropBeforeID
-// instead closes its channel (having emitted the rows before it) and sets
-// a RETRIABLE sticky Err() — exactly the shape the real MySQL reader
-// produces when classifyApplierError wraps a connection-drop rows-iteration
-// error. The drop is guarded by dropFired so it fires once for the whole
-// run; every read after it serves the full (bounded) range cleanly.
-type fakeSource struct {
+// regardless of which chunk reads first under within-table parallelism.
+// The latch (dropFired) lives here so the drop is one-shot ACROSS all
+// reader handles; the RETRIABLE sticky error it raises is set on the
+// individual handle that hit the drop, never shared (see fakeSource.err).
+type fakeSourceStore struct {
 	mu           sync.Mutex
 	maxID        int64 // backing rows are id = 1..maxID
 	dropBeforeID int64 // PK at which the ONE drop fires (0 = never)
 	dropFired    bool  // the drop is one-shot for the whole run
-	err          error // sticky error from the most recent read
+}
+
+// fakeSource is one reader HANDLE over a fakeSourceStore. It serves rows
+// from the shared store, supporting the whole-table (ReadRows) and
+// cursor/chunk (ReadRowsBatch / ReadRowsBatchBounded) read shapes plus the
+// chunk-eligibility surfaces (RangeBounds / RowCounter / RowCountEstimator).
+//
+// CRITICAL fidelity (the v34/ADR-0109 -race-only e2e failure): err is
+// PER-HANDLE, never shared across reader handles. In production each chunk
+// opens its own *RowReader with its own sticky err (row_reader.go), set at
+// the start of each ReadRowsBatch and read by the caller after the page
+// drains — sequentially, on that ONE reader. An EARLIER cut of this fake
+// shared a single instance (and thus a single err) across concurrent chunk
+// readers, so a sibling chunk's emit could reset err=nil between the
+// dropping chunk's drop and its readerStreamErr check — masking the
+// retriable drop, which then read as a clean short-page end-of-chunk and
+// SILENTLY dropped the unread rows. That was a HARNESS modelling defect,
+// not a production bug: per-handle err reproduces the real isolation.
+type fakeSource struct {
+	store *fakeSourceStore
+	mu    sync.Mutex
+	err   error // sticky error from the most recent read on THIS handle
+}
+
+// newFakeSource builds a store and one reader handle over it. Additional
+// handles (one per chunk / per OpenRowReader) come from openHandle, sharing
+// the store but each carrying its own sticky err.
+func newFakeSource(maxID, dropBeforeID int64) *fakeSource {
+	return &fakeSource{store: &fakeSourceStore{maxID: maxID, dropBeforeID: dropBeforeID}}
+}
+
+// openHandle returns a fresh reader handle over the same store — the fake's
+// analog of source.OpenRowReader minting a new connection-backed reader.
+func (s *fakeSource) openHandle() *fakeSource {
+	return &fakeSource{store: s.store}
 }
 
 func (s *fakeSource) Err() error {
@@ -50,8 +81,11 @@ func (s *fakeSource) Err() error {
 
 // emit serves rows with id in (after, upTo] (upTo<=0 meaning no upper
 // bound), up to limit (limit<=0 meaning unbounded). The first time any
-// emit reaches id == dropBeforeID it injects the one-shot drop (closes the
-// channel having sent the rows before it, sets a retriable sticky error).
+// handle's emit reaches id == dropBeforeID it injects the one-shot drop
+// (closes the channel having sent the rows before it, sets a retriable
+// sticky error on THIS handle). The err reset and the drop's err are both
+// on this handle (s.mu / s.err); the one-shot latch is on the shared store
+// (s.store.mu / dropFired).
 func (s *fakeSource) emit(ctx context.Context, after, upTo int64, limit int) <-chan ir.Row {
 	s.mu.Lock()
 	s.err = nil
@@ -61,25 +95,28 @@ func (s *fakeSource) emit(ctx context.Context, after, upTo int64, limit int) <-c
 	go func() {
 		defer close(out)
 		sent := 0
-		for id := after + 1; id <= s.maxID; id++ {
+		for id := after + 1; id <= s.store.maxID; id++ {
 			if upTo > 0 && id > upTo {
 				return
 			}
 			if limit > 0 && sent >= limit {
 				return
 			}
-			s.mu.Lock()
-			if s.dropBeforeID != 0 && !s.dropFired && id == s.dropBeforeID {
+			s.store.mu.Lock()
+			if s.store.dropBeforeID != 0 && !s.store.dropFired && id == s.store.dropBeforeID {
 				// Inject the one-shot mid-table connection drop: stop emitting
-				// at this PK and surface a RETRIABLE sticky error (the
-				// connection-drop class). Deterministic across concurrent
-				// chunks because it is keyed on the PK value, not a call count.
-				s.dropFired = true
+				// at this PK and surface a RETRIABLE sticky error on THIS
+				// handle (the connection-drop class). Deterministic across
+				// concurrent chunks because it is keyed on the PK value, not a
+				// call count; one-shot because the latch is on the store.
+				s.store.dropFired = true
+				s.store.mu.Unlock()
+				s.mu.Lock()
 				s.err = fakeRetriableErr{msg: "mysql: rows iteration: invalid connection"}
 				s.mu.Unlock()
 				return
 			}
-			s.mu.Unlock()
+			s.store.mu.Unlock()
 			select {
 			case <-ctx.Done():
 				s.mu.Lock()
@@ -107,12 +144,14 @@ func (s *fakeSource) ReadRowsBatchBounded(ctx context.Context, _ *ir.Table, afte
 }
 
 func (s *fakeSource) RangeBounds(_ context.Context, _ *ir.Table, _ string) (minVal, maxVal any, err error) {
-	return int64(1), s.maxID, nil
+	return int64(1), s.store.maxID, nil
 }
 
-func (s *fakeSource) CountRows(context.Context, *ir.Table) (int64, error) { return s.maxID, nil }
+func (s *fakeSource) CountRows(context.Context, *ir.Table) (int64, error) { return s.store.maxID, nil }
 
-func (s *fakeSource) EstimateRowCount(context.Context, *ir.Table) (int64, error) { return s.maxID, nil }
+func (s *fakeSource) EstimateRowCount(context.Context, *ir.Table) (int64, error) {
+	return s.store.maxID, nil
+}
 
 func afterID(pk []any) int64 {
 	if len(pk) == 0 || pk[0] == nil {
@@ -187,10 +226,15 @@ func (w *fakeTarget) snapshotIDs() []int64 {
 }
 
 // fakeTargetEngine hands fakeTarget back from OpenRowWriter (the chunk /
-// table-pair connection factory) and fakeSource clones from OpenRowReader
-// (the ADR-0109 fresh-reader factory). The SAME *fakeTarget instance is
-// returned every time so writes from chunk-0's primary writer and a
-// freshly-opened chunk/table writer all land in one row map.
+// table-pair connection factory) and a FRESH fakeSource HANDLE from
+// OpenRowReader (the per-chunk reader factory + the ADR-0109 fresh-reader
+// factory). The SAME *fakeTarget instance is returned every time so writes
+// from chunk-0's primary writer and a freshly-opened chunk/table writer all
+// land in one row map. OpenRowReader, by contrast, returns a NEW handle
+// each call (sharing the backing store) — modelling production, where each
+// chunk opens its own connection-backed reader with its own sticky Err()
+// (the fidelity that makes the e2e test exercise the real isolation rather
+// than a shared-err artifact; see fakeSource).
 type fakeTargetEngine struct {
 	stubEngine
 	target *fakeTarget
@@ -202,7 +246,7 @@ func (e *fakeTargetEngine) OpenRowWriter(context.Context, string) (ir.RowWriter,
 }
 
 func (e *fakeTargetEngine) OpenRowReader(context.Context, string) (ir.RowReader, error) {
-	return e.source, nil
+	return e.source.openHandle(), nil
 }
 
 // expectedIDs returns 1..n.
@@ -290,7 +334,7 @@ func TestSourceReadRetryE2E_KeysetChunked_ResumesFromLastPK(t *testing.T) {
 	withFastSourceReadBackoff(t)
 
 	const n = 40
-	src := &fakeSource{maxID: n, dropBeforeID: 8} // drop mid chunk-0 (ids 1..20), at id=8
+	src := newFakeSource(n, 8) // drop mid chunk-0 (ids 1..20), at id=8
 	tgt := newFakeTarget()
 	eng := &fakeTargetEngine{target: tgt, source: src}
 
@@ -314,7 +358,7 @@ func TestSourceReadRetryE2E_Idempotent_AbsorbsOverlap(t *testing.T) {
 	withFastSourceReadBackoff(t)
 
 	const n = 30
-	src := &fakeSource{maxID: n, dropBeforeID: 6} // drop mid chunk-0 (ids 1..15), at id=6
+	src := newFakeSource(n, 6) // drop mid chunk-0 (ids 1..15), at id=6
 	tgt := newFakeTarget()
 	eng := &fakeTargetEngine{target: tgt, source: src}
 
@@ -337,7 +381,7 @@ func TestSourceReadRetryE2E_PlainNonChunkable_TruncateRestart(t *testing.T) {
 	withFastSourceReadBackoff(t)
 
 	const n = 25
-	src := &fakeSource{maxID: n, dropBeforeID: 11} // drop the whole-table scan partway, at id=11
+	src := newFakeSource(n, 11) // drop the whole-table scan partway, at id=11
 	tgt := newFakeTarget()
 	eng := &fakeTargetEngine{target: tgt, source: src}
 
@@ -365,7 +409,7 @@ func TestSourceReadRetryE2E_NonRetriableDecodeIsTerminal(t *testing.T) {
 	withFastSourceReadBackoff(t)
 
 	const n = 20
-	src := &terminalDropSource{fakeSource: &fakeSource{maxID: n}}
+	src := &terminalDropSource{fakeSource: newFakeSource(n, 0)}
 	tgt := newFakeTarget()
 	eng := &fakeTargetEngine{target: tgt, source: src.fakeSource}
 
@@ -419,12 +463,12 @@ func TestSourceReadRetryE2E_SiblingUnaffected(t *testing.T) {
 
 	const n = 30
 	// The dropping table and its target.
-	dropSrc := &fakeSource{maxID: n, dropBeforeID: 5}
+	dropSrc := newFakeSource(n, 5)
 	dropTgt := newFakeTarget()
 	dropEng := &fakeTargetEngine{target: dropTgt, source: dropSrc}
 
 	// The clean sibling table and its target.
-	cleanSrc := &fakeSource{maxID: n}
+	cleanSrc := newFakeSource(n, 0)
 	cleanTgt := newFakeTarget()
 	cleanEng := &fakeTargetEngine{target: cleanTgt, source: cleanSrc}
 
