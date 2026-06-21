@@ -148,13 +148,47 @@ func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
 		// another destructive reset of dest tables. The reset
 		// happens at most once per Run.
 		s.ResetTargetData = false
-		// Same one-shot semantics for the force-fresh-COPY knob: a retry
-		// after the first cold-start should warm-resume from the position the
-		// fresh copy just established, not re-cold-start from row 0 again.
-		s.RestartFromScratch = false
 
 		afterPos, afterFound, _ := posReader.ReadPosition(ctx, streamID)
 		progressed := beforeFound && afterFound && afterPos.Token != beforePos.Token
+
+		// ADR-0109 §B — bounded auto-restart of the cold-start after a
+		// classified source-read drop DURING the cold-copy phase (the
+		// sync-path BACKSTOP, where per-table reconnect (C) is impossible
+		// because the snapshot pins one consistent point). The discriminator
+		// is afterFound: no cdc-state row exists yet ⇒ the run never reached
+		// the post-copy CDC anchor write (coldStartBeginCDC), so the
+		// retriable error fired in the cold-copy phase. A naive re-run would
+		// take the plain `default:` cold-start branch with forceFresh=false
+		// and either dead-end on the populated-target refusal or dup-key
+		// (1062) on the partial prior copy (native MySQL, plain INSERT). Set
+		// RestartFromScratch so the re-run forces a clean re-establishment:
+		// coldStartGatePreflight then makes it land cleanly PER SOURCE — a
+		// non-idempotent reader (native MySQL binlog) drops + recreates the
+		// in-scope target tables first, an idempotent reader (VStream/PG)
+		// re-copies with UPSERT and absorbs the overlap (the v0.99.73
+		// forceFresh path). It is bounded + backed-off by the SAME ADR-0038
+		// budget below (never an infinite loop) and loud (the retry WARN +
+		// the budget-exhaustion terminal both fire). The cdc-state row is
+		// untouched (only --reset-target-data clears it).
+		//
+		// Once a cdc-state row exists (afterFound — the run reached CDC), a
+		// retriable error is an apply/CDC-phase transient: warm-resume from
+		// the persisted position is correct (and a re-copy would be a wasteful
+		// full re-snapshot), so RestartFromScratch is cleared, exactly as the
+		// pre-ADR-0109 retry did. A non-retriable cold-start error (the
+		// populated-target refusal from a GENUINE operator mistake, a decode
+		// fault) never reaches here — classifyRetriable returned false above
+		// and the loop already returned it terminal, preserving the
+		// v0.99.92-clean terminal behaviour.
+		if afterFound {
+			// CDC phase: warm-resume from the durable position on the next
+			// attempt; do not force a re-copy.
+			s.RestartFromScratch = false
+		} else {
+			// Cold-copy phase: force a clean re-establishment of the copy.
+			s.RestartFromScratch = true
+		}
 		if progressed {
 			consecutive = 1
 		} else {

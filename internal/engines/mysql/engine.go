@@ -114,6 +114,12 @@ func (e Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, er
 	if err != nil {
 		return nil, err
 	}
+	// ADR-0109 §A: raise this source read pool's net_write_timeout /
+	// net_read_timeout so a transient target-stall-induced backpressure
+	// (the source read sitting idle while the writer can't drain) doesn't
+	// trip the source server's default 60s net_write_timeout and drop the
+	// cold-copy read. Bounded (10 min), operator-override-respecting.
+	applySourceReadSessionTimeouts(cfg)
 	db, err := openDB(ctx, cfg)
 	if err != nil {
 		return nil, err

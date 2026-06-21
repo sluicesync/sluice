@@ -265,6 +265,69 @@ func finishParseDSN(cfg *mysql.Config) *mysql.Config {
 	return cfg
 }
 
+// sourceReadSessionTimeoutSeconds is the bounded value sluice applies to
+// `net_write_timeout` / `net_read_timeout` on every MySQL SOURCE read
+// session it opens for a cold-copy (ADR-0109 §A — PRIMARY defense).
+//
+// The mechanism it prevents: a transient TARGET stall (a non-Metal
+// PlanetScale storage auto-grow that BLOCKS the target's writes for
+// seconds-to-minutes under semi-sync) backpressures sluice's reader/writer
+// pipeline — the writer can't drain, so the reader stops consuming, so the
+// SOURCE read connection sits idle. The source server's default
+// `net_write_timeout` is 60s; once the idle read crosses it, the source
+// CLOSES the connection (`unexpected EOF` / `invalid connection`) and the
+// whole cold-copy aborts. Raising the source session's timeout to a
+// generous bound lets the read survive the stall: when the target recovers,
+// the writer drains, the reader resumes, and the copy continues — no
+// reconnect, no re-snapshot, no consistency problem (the per-table reconnect
+// (C) and the cold-start auto-restart (B) are the BACKSTOPS for a stall that
+// outlives even this raised bound).
+//
+// 600s (10 min) is deliberately FINITE: a genuinely-dead target still
+// surfaces (the read eventually drops and sluice's source-unresponsive
+// detection + the (B)/(C) retries take over) rather than hanging forever.
+//
+// Zero-value-safe by construction: this is a package CONSTANT, not a config
+// field — there is no EnableX-defaulting-true trap (the v0.99.51 lesson).
+// Every construction path that opens a source read session
+// ([applySourceReadSessionTimeouts] below) gets the same bound; an operator
+// who needs a different value sets `net_write_timeout` / `net_read_timeout`
+// directly in the source DSN params, which wins (the helper never overwrites
+// an operator-supplied value).
+const sourceReadSessionTimeoutSeconds = 600
+
+// applySourceReadSessionTimeouts injects `net_write_timeout` /
+// `net_read_timeout` into cfg.Params (ADR-0109 §A) so the go-sql-driver
+// emits `SET <key> = <value>` on every connection in the pool at session
+// init — covering EVERY source read session for free: the dedicated
+// full-scan conn, the LIMIT-paged chunked ReadRowsBatch reads, and the
+// snapshot path's pinned REPEATABLE-READ connection(s). Scoped to the
+// SOURCE-read open paths (OpenRowReader + the binlog snapshot openers) so
+// the target write/applier sessions are untouched — the timeout is a
+// source-side defense, not a target one.
+//
+// An operator-supplied DSN value for either key wins absolutely (same
+// two-tier override shape as sql_mode / time_zone above): the helper only
+// sets a key that is absent, so a deliberate per-source tuning is never
+// clobbered. The numeric value is emitted bare (no SQL quotes) — these are
+// integer session variables, unlike the quoted string literals time_zone /
+// sql_mode require.
+func applySourceReadSessionTimeouts(cfg *mysql.Config) {
+	if cfg == nil {
+		return
+	}
+	if cfg.Params == nil {
+		cfg.Params = map[string]string{}
+	}
+	val := fmt.Sprintf("%d", sourceReadSessionTimeoutSeconds)
+	if _, ok := cfg.Params["net_write_timeout"]; !ok {
+		cfg.Params["net_write_timeout"] = val
+	}
+	if _, ok := cfg.Params["net_read_timeout"]; !ok {
+		cfg.Params["net_read_timeout"] = val
+	}
+}
+
 // vstreamParamPrefix is the DSN-parameter namespace sluice reserves
 // for its Vitess VStream extensions (vstream_endpoint, vstream_transport,
 // vstream_auth, vstream_shards, vstream_auto_discover_shards,

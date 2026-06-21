@@ -286,6 +286,13 @@ func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, 
 	if err != nil {
 		return nil, err
 	}
+	// ADR-0109 §A: raise the snapshot pool's net_write_timeout /
+	// net_read_timeout. The single pinned snapshot connection below reads
+	// every table under one consistent view; a target stall backpressuring
+	// that long-lived read would otherwise trip the source's default 60s
+	// net_write_timeout and drop the whole cold-copy. Bounded (10 min),
+	// operator-override-respecting.
+	applySourceReadSessionTimeouts(cfg)
 	db, err := openDB(ctx, cfg)
 	if err != nil {
 		return nil, err

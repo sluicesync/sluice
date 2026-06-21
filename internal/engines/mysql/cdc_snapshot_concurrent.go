@@ -108,6 +108,12 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 	if err != nil {
 		return nil, err
 	}
+	// ADR-0109 §A: raise net_write_timeout / net_read_timeout on the
+	// concurrent snapshot pool too — every one of the N FTWRL-coordinated
+	// reader connections inherits it at session init, so a target stall
+	// backpressuring any reader doesn't trip the source's default 60s
+	// net_write_timeout. Bounded (10 min), operator-override-respecting.
+	applySourceReadSessionTimeouts(cfg)
 	db, err := openDB(ctx, cfg)
 	if err != nil {
 		return nil, err
