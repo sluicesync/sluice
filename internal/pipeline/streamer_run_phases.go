@@ -302,6 +302,12 @@ func (s *Streamer) phaseStartMetricsServer(ctx context.Context, applier ir.Chang
 	// running with the rest of the metric set; the spill lines just
 	// don't appear in /metrics. See [attachSpillReporter].
 	spillCleanup := s.attachSpillReporter(ctx, metricsSrv, streamID)
+	// ADR-0107 use (c): re-export the optional target-health snapshot as
+	// the sluice_target_* gauge family. nil provider ⇒ no attach ⇒ no
+	// extra lines, byte-identical to before.
+	if s.TargetTelemetry != nil {
+		metricsSrv.AttachTargetTelemetry(s.TargetTelemetry)
+	}
 	if mErr := metricsSrv.Start(); mErr != nil {
 		spillCleanup()
 		return nil, func() {}, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: start metrics server: %w", mErr))
@@ -749,6 +755,13 @@ func (s *Streamer) phaseStartApplySidecars(applyCtx context.Context, applier ir.
 	// stream is alive; the absence of these lines combined with no
 	// `applier: batch` lines is the silent-stall signature.
 	startHeartbeat(applyCtx, streamID, s.HeartbeatInterval)
+
+	// ADR-0107 Phase 1 (b): storage-resize anticipation. When a telemetry
+	// provider is wired, a slow-tick sidecar warns ONCE per crossing when
+	// the target's storage volume approaches capacity, so an operator can
+	// anticipate the resize/reparent that items 30/33 ride through. No
+	// provider ⇒ no goroutine; it never pauses or gates the stream.
+	s.startStorageHeadroomWatch(applyCtx, streamID)
 	return liveFilter
 }
 

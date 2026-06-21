@@ -88,7 +88,52 @@ type Config struct {
 	// default — the controller is self-contained within one runOnce
 	// without it.
 	OnShrink func(newSize int)
+
+	// TelemetryHint, when non-nil, is an advisory proactive-saturation
+	// signal (ADR-0107 Phase 1). It is consulted under the controller
+	// mutex during ObserveBatch: when a FRESH snapshot reports CPU or
+	// memory utilisation at/above the high-water mark, the controller
+	// suppresses additive-increase (HOLD) and applies AT MOST ONE
+	// multiplicative-decrease on the fresh saturation edge, then holds.
+	// It can ONLY push toward smaller/held sizes — never raise the
+	// ceiling, grow a batch, advance a position, or stall the stream.
+	// Nil (the default) is a no-op: the controller takes its existing
+	// reactive AIMD path, byte-for-byte. A stale / no-signal snapshot is
+	// ignored exactly as if the hint were nil — see [TelemetryHint].
+	TelemetryHint TelemetryHint
+
+	// TelemetryHighWater is informational only — the saturation decision
+	// lives in the [TelemetryHint] (which owns the snapshot, freshness,
+	// and the threshold comparison). It is stamped on log lines so an
+	// operator can see the configured mark. Default 0.85 when zero
+	// (ADR-0107's decided high-water).
+	TelemetryHighWater float64
 }
+
+// TelemetryHint is the advisory proactive-saturation surface the
+// controller consults (ADR-0107 Phase 1). The streamer adapts an
+// ir.TargetTelemetry provider into one of these, so the appliercontrol
+// package stays free of the ir import on the telemetry path — exactly
+// as it mirrors ir.RetriableError / ir.TransactionKilledError
+// structurally rather than importing them (see [retriable] / [txKilled]).
+//
+// Saturated owns the freshness check and the high-water comparison: the
+// controller never sees the raw snapshot, only the distilled verdict.
+type TelemetryHint interface {
+	// Saturated reports whether the target is at/above the high-water
+	// mark on a FRESH snapshot. ok=false means "no usable signal right
+	// now" (provider not warmed up, or the last poll went stale) and the
+	// controller degrades to its reactive AIMD path, exactly as if no
+	// hint were wired.
+	Saturated() (saturated, ok bool)
+}
+
+// DefaultTelemetryHighWater is the CPU/memory utilisation fraction
+// at/above which the proactive telemetry damp engages (ADR-0107). It is
+// the threshold the streamer's hint adapter applies; the controller only
+// stamps it on logs. 0.85 leaves headroom before the target's reactive
+// signals (latency, tx-killer) would otherwise push back.
+const DefaultTelemetryHighWater = 0.85
 
 // Defaults applied per ADR-0052 § "Implementation pre-resolutions".
 const (
@@ -146,6 +191,9 @@ func (c Config) withDefaults() Config {
 	if c.CoolOffBatches <= 0 {
 		c.CoolOffBatches = defaultCoolOffBatches
 	}
+	if c.TelemetryHighWater <= 0 {
+		c.TelemetryHighWater = DefaultTelemetryHighWater
+	}
 	if c.Now == nil {
 		c.Now = time.Now
 	}
@@ -173,6 +221,21 @@ type Controller struct {
 	decreaseCount   uint64
 	retryTimes      []time.Time // sorted ascending; pruned on the fly
 	lastByteCapHint time.Time
+
+	// lastTelemetrySaturated is the edge-detection latch for the
+	// ADR-0107 proactive telemetry damp: it records whether the PREVIOUS
+	// ObserveBatch saw the hint report saturated. A fresh rising edge
+	// (was false, now true) fires AT MOST ONE multiplicative-decrease;
+	// sustained saturation only holds (suppresses AI) so a hot target
+	// shrinks once then waits, rather than collapsing to the floor on
+	// every batch.
+	lastTelemetrySaturated bool
+
+	// telemetryDamped reports, for the metrics scrape, whether the most
+	// recent telemetry consultation was actively damping (holding /
+	// edge-shrinking) the controller. Snapshot-only; no behaviour gates
+	// on it.
+	telemetryDamped bool
 }
 
 // New returns a Controller initialized with the supplied config. Config
@@ -289,6 +352,44 @@ func (c *Controller) ObserveBatch(ctx context.Context, latency time.Duration, ro
 			return
 		}
 
+		// ADR-0107 proactive telemetry damp. Consulted AFTER the reactive
+		// latency-MD (which keeps precedence — a hot target that is also
+		// slow still shrinks for the slowness) and BEFORE cool-off / AI.
+		// The hint owns freshness + the high-water comparison; we only act
+		// on (saturated, ok). Behaviour:
+		//
+		//   - FRESH rising edge (was not saturated, now is): one MD, latch
+		//     the edge, return. The MD itself enters cool-off, so AI is
+		//     already suppressed for the cool-off window.
+		//   - FRESH sustained saturation (already latched): HOLD — suppress
+		//     AI and return, but never shrink again. A persistently hot
+		//     target damps once then waits rather than collapsing to Floor.
+		//   - not saturated, OR no usable signal (ok=false / nil hint):
+		//     clear the latch and fall through to the unchanged reactive
+		//     path. This is the degrade-to-today contract.
+		//
+		// It can only HOLD or SHRINK within [Floor, Ceiling]; it never
+		// grows a batch or advances a position.
+		if c.cfg.TelemetryHint != nil {
+			if saturated, ok := c.cfg.TelemetryHint.Saturated(); ok && saturated {
+				if !c.lastTelemetrySaturated {
+					c.lastTelemetrySaturated = true
+					c.telemetryDamped = true
+					c.multiplicativeDecreaseLocked(ctx, "telemetry-saturation-edge", prevSize)
+					return
+				}
+				// Sustained saturation: hold (suppress AI), shrink no further.
+				c.telemetryDamped = true
+				c.debugDecisionLocked(ctx, "telemetry-hold")
+				return
+			}
+			// No saturation signal (healthy / stale / not-warmed-up):
+			// reset the edge latch so the NEXT crossing fires a fresh MD,
+			// and resume the reactive path below.
+			c.lastTelemetrySaturated = false
+			c.telemetryDamped = false
+		}
+
 		if c.coolOffRemain > 0 {
 			c.coolOffRemain--
 			if c.coolOffRemain == 0 {
@@ -398,11 +499,12 @@ func (c *Controller) debugDecisionLocked(ctx context.Context, decision string) {
 // exporter (DP-3). Captured atomically under the mutex so a scrape
 // can never observe torn state.
 type MetricsSnapshot struct {
-	StreamID       string
-	CurrentSize    int
-	P95            time.Duration
-	DecreasesTotal uint64
-	InCoolOff      bool
+	StreamID        string
+	CurrentSize     int
+	P95             time.Duration
+	DecreasesTotal  uint64
+	InCoolOff       bool
+	TelemetryDamped bool
 }
 
 // Snapshot returns the current scrape-time view.
@@ -410,11 +512,12 @@ func (c *Controller) Snapshot() MetricsSnapshot {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return MetricsSnapshot{
-		StreamID:       c.cfg.StreamID,
-		CurrentSize:    c.currentSize,
-		P95:            c.window.P95(),
-		DecreasesTotal: c.decreaseCount,
-		InCoolOff:      c.coolOffRemain > 0,
+		StreamID:        c.cfg.StreamID,
+		CurrentSize:     c.currentSize,
+		P95:             c.window.P95(),
+		DecreasesTotal:  c.decreaseCount,
+		InCoolOff:       c.coolOffRemain > 0,
+		TelemetryDamped: c.telemetryDamped,
 	}
 }
 

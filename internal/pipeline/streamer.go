@@ -383,6 +383,17 @@ type Streamer struct {
 	// instrumentation of the apply hot path.
 	MetricsListen string
 
+	// TargetTelemetry, when non-nil, is an advisory control-plane health
+	// provider (ADR-0107). Consulted OFF the hot path for proactive AIMD
+	// back-off, storage-resize anticipation, and operator observability.
+	// nil (the default) ⇒ every consumer takes its reactive path, so the
+	// zero value is the safe/common default (no zero-value trap — see
+	// CLAUDE.md's v0.99.51 note): a Streamer constructed anywhere without
+	// this field behaves exactly as it did pre-ADR-0107. Wired only by
+	// cmd/sluice when the operator opts into PlanetScale metrics (Phase 2
+	// supplies the real provider; Phase 1 exercises it with a fake).
+	TargetTelemetry ir.TargetTelemetry
+
 	// MaxBufferBytes is the soft upper bound on per-batch buffered
 	// memory in the CDC applier (and, on the cold-start branch, the
 	// bulk-copy writer). Each in-flight target transaction tracks

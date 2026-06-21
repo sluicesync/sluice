@@ -67,6 +67,12 @@ type MetricsServer struct {
 	// or the other), but both are snapshotted at scrape time if set.
 	laneAIMDControllers []*appliercontrol.Controller
 	spillReporter       SpillReporterFunc
+	// targetTelemetry is the optional ADR-0107 control-plane health
+	// provider. When attached, /metrics re-exports its cached snapshot as
+	// the sluice_target_* gauge family (each line gated on its *Known
+	// flag; the whole block gated on Sample returning ok). nil ⇒ no
+	// sluice_target_* lines, exactly as before.
+	targetTelemetry ir.TargetTelemetry
 
 	// ready flips to true once the streamer has finished its cold-start
 	// or warm-resume preamble and entered the apply loop. /readyz reads
@@ -206,6 +212,28 @@ func (m *MetricsServer) AttachSpillReporter(fn SpillReporterFunc) {
 	m.spillReporter = fn
 }
 
+// AttachTargetTelemetry plugs an [ir.TargetTelemetry] provider into the
+// metrics server so /metrics re-exports the target's cached health
+// snapshot as the sluice_target_* gauge family (ADR-0107 use (c)). The
+// provider's Sample is read at scrape time (non-blocking, cached); a
+// missing signal omits the block rather than emitting misleading zeros,
+// mirroring the spill reporter's posture. Idempotent; a nil argument
+// detaches. Off by default — only the operator's opt-in PlanetScale
+// telemetry wiring attaches one.
+func (m *MetricsServer) AttachTargetTelemetry(t ir.TargetTelemetry) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.targetTelemetry = t
+}
+
+// targetTelemetryProvider returns the attached provider (or nil). Pulled
+// out for read-locking discipline; Sample is invoked outside the mutex.
+func (m *MetricsServer) targetTelemetryProvider() ir.TargetTelemetry {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.targetTelemetry
+}
+
 // aimdSnapshot returns a snapshot of the attached AIMD controller, or
 // (snapshot, false) when no controller is attached.
 func (m *MetricsServer) aimdSnapshot() (appliercontrol.MetricsSnapshot, bool) {
@@ -279,6 +307,29 @@ func (m *MetricsServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			emitSpillMetrics(w, snap)
 		}
 	}
+	// ADR-0107 use (c): re-export the target-health snapshot when a
+	// provider is wired. Sample is non-blocking (cached); ok=false emits
+	// a comment, not a 500 — telemetry is advisory secondary signal.
+	if tp := m.targetTelemetryProvider(); tp != nil {
+		if snap, ok := tp.Sample(r.Context()); ok {
+			emitTargetTelemetryMetrics(w, streamsOrFirstID(streams), snap)
+		} else {
+			fmt.Fprintln(w, "\n# target-telemetry: no signal")
+		}
+	}
+}
+
+// streamsOrFirstID returns a stream_id label for the sluice_target_*
+// family. Target telemetry is a per-TARGET signal (one control-plane
+// branch), not per-stream, so it has no natural stream_id; we stamp the
+// first known stream's id (the common single-stream case) so the series
+// joins cleanly with the other per-stream gauges in a dashboard, and an
+// empty label when no stream is known yet.
+func streamsOrFirstID(streams []ir.StreamStatus) string {
+	if len(streams) == 0 {
+		return ""
+	}
+	return streams[0].StreamID
 }
 
 // handleHealthz is the liveness probe — "is the process responsive?".
@@ -393,6 +444,11 @@ func emitAIMDMetrics(w io.Writer, s appliercontrol.MetricsSnapshot) {
 	fmt.Fprintln(w, "# HELP sluice_apply_batch_size_cooloff 1 when the AIMD controller is currently in cool-off (suppressing AI), 0 otherwise.")
 	fmt.Fprintln(w, "# TYPE sluice_apply_batch_size_cooloff gauge")
 	fmt.Fprintf(w, `sluice_apply_batch_size_cooloff{stream_id=%q} %d`+"\n", s.StreamID, boolGauge(s.InCoolOff))
+	fmt.Fprintln(w)
+
+	fmt.Fprintln(w, "# HELP sluice_apply_batch_size_telemetry_damped 1 when the AIMD controller is actively damping on an ADR-0107 telemetry-saturation signal (holding/edge-shrinking), 0 otherwise.")
+	fmt.Fprintln(w, "# TYPE sluice_apply_batch_size_telemetry_damped gauge")
+	fmt.Fprintf(w, `sluice_apply_batch_size_telemetry_damped{stream_id=%q} %d`+"\n", s.StreamID, boolGauge(s.TelemetryDamped))
 }
 
 // emitLaneAIMDMetrics renders the per-lane AIMD controllers of the
@@ -436,6 +492,81 @@ func emitLaneAIMDMetrics(w io.Writer, snaps []appliercontrol.MetricsSnapshot) {
 	for i, s := range snaps {
 		fmt.Fprintf(w, `sluice_apply_batch_size_cooloff{stream_id=%q,lane="%d"} %d`+"\n", s.StreamID, i, boolGauge(s.InCoolOff))
 	}
+	fmt.Fprintln(w)
+
+	fmt.Fprintln(w, "# HELP sluice_apply_batch_size_telemetry_damped 1 when the AIMD controller is actively damping on an ADR-0107 telemetry-saturation signal (holding/edge-shrinking), 0 otherwise.")
+	fmt.Fprintln(w, "# TYPE sluice_apply_batch_size_telemetry_damped gauge")
+	for i, s := range snaps {
+		fmt.Fprintf(w, `sluice_apply_batch_size_telemetry_damped{stream_id=%q,lane="%d"} %d`+"\n", s.StreamID, i, boolGauge(s.TelemetryDamped))
+	}
+}
+
+// emitTargetTelemetryMetrics renders the ADR-0107 control-plane health
+// snapshot in Prometheus exposition format (use (c) re-export). Each
+// utilisation/figure line is gated on its companion *Known flag — an
+// unobserved metric is OMITTED rather than emitted as a misleading 0,
+// mirroring the snapshot's (value, *Known) honesty and the spill
+// reporter's (snap, ok) posture. The caller has already confirmed
+// Sample returned ok; this only filters the per-metric known flags.
+//
+// Gauge family (labels: stream_id):
+//
+//   - sluice_target_cpu_util / sluice_target_mem_util — fractions [0,1].
+//   - sluice_target_storage_util / sluice_target_storage_available_bytes
+//     / sluice_target_storage_capacity_bytes — storage volume figures.
+//   - sluice_target_replica_lag_seconds — secondary signal.
+//   - sluice_target_active_connections / sluice_target_max_connections —
+//     secondary signal.
+func emitTargetTelemetryMetrics(w io.Writer, streamID string, snap ir.TargetHealthSnapshot) {
+	if snap.CPUKnown {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "# HELP sluice_target_cpu_util Target CPU utilisation as a fraction in [0,1] from the control-plane telemetry provider (ADR-0107).")
+		fmt.Fprintln(w, "# TYPE sluice_target_cpu_util gauge")
+		fmt.Fprintf(w, `sluice_target_cpu_util{stream_id=%q} %s`+"\n", streamID, formatPrometheusFraction(snap.CPUUtil))
+	}
+	if snap.MemKnown {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "# HELP sluice_target_mem_util Target memory utilisation as a fraction in [0,1] from the control-plane telemetry provider (ADR-0107).")
+		fmt.Fprintln(w, "# TYPE sluice_target_mem_util gauge")
+		fmt.Fprintf(w, `sluice_target_mem_util{stream_id=%q} %s`+"\n", streamID, formatPrometheusFraction(snap.MemUtil))
+	}
+	if snap.StorageKnown {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "# HELP sluice_target_storage_util Target storage volume utilisation as a fraction in [0,1] (ADR-0107).")
+		fmt.Fprintln(w, "# TYPE sluice_target_storage_util gauge")
+		fmt.Fprintf(w, `sluice_target_storage_util{stream_id=%q} %s`+"\n", streamID, formatPrometheusFraction(snap.StorageUtil))
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "# HELP sluice_target_storage_available_bytes Target storage bytes still available before a resize (ADR-0107).")
+		fmt.Fprintln(w, "# TYPE sluice_target_storage_available_bytes gauge")
+		fmt.Fprintf(w, `sluice_target_storage_available_bytes{stream_id=%q} %d`+"\n", streamID, snap.StorageAvailableBytes)
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "# HELP sluice_target_storage_capacity_bytes Target storage volume capacity in bytes (ADR-0107).")
+		fmt.Fprintln(w, "# TYPE sluice_target_storage_capacity_bytes gauge")
+		fmt.Fprintf(w, `sluice_target_storage_capacity_bytes{stream_id=%q} %d`+"\n", streamID, snap.StorageCapacityBytes)
+	}
+	if snap.LagKnown {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "# HELP sluice_target_replica_lag_seconds Target replica lag in seconds from the control-plane telemetry provider (ADR-0107).")
+		fmt.Fprintln(w, "# TYPE sluice_target_replica_lag_seconds gauge")
+		fmt.Fprintf(w, `sluice_target_replica_lag_seconds{stream_id=%q} %s`+"\n", streamID, formatPrometheusFraction(snap.ReplicaLagSeconds))
+	}
+	if snap.ConnKnown {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "# HELP sluice_target_active_connections Target active connection count from the control-plane telemetry provider (ADR-0107).")
+		fmt.Fprintln(w, "# TYPE sluice_target_active_connections gauge")
+		fmt.Fprintf(w, `sluice_target_active_connections{stream_id=%q} %d`+"\n", streamID, snap.ActiveConnections)
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "# HELP sluice_target_max_connections Target maximum connection budget from the control-plane telemetry provider (ADR-0107).")
+		fmt.Fprintln(w, "# TYPE sluice_target_max_connections gauge")
+		fmt.Fprintf(w, `sluice_target_max_connections{stream_id=%q} %d`+"\n", streamID, snap.MaxConnections)
+	}
+}
+
+// formatPrometheusFraction renders a [0,1] (or seconds) fraction as a
+// fixed-point gauge value with 4-decimal resolution — enough to
+// distinguish utilisation steps without exposing float noise.
+func formatPrometheusFraction(f float64) string {
+	return fmt.Sprintf("%.4f", f)
 }
 
 // boolGauge maps a Go bool to the Prometheus 1/0 gauge convention.

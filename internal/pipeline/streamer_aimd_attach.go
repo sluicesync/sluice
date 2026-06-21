@@ -138,6 +138,11 @@ func (s *Streamer) maybeAttachAIMDController(ctx context.Context, applier ir.Cha
 		)
 	}
 
+	// ADR-0107 Phase 1: adapt the optional target-telemetry provider into
+	// the controller's advisory proactive-saturation hint. nil provider ⇒
+	// nil hint ⇒ the controller's reactive AIMD path, unchanged.
+	hint := newTelemetryHint(ctx, s.TargetTelemetry, appliercontrol.DefaultTelemetryHighWater)
+
 	cfg := appliercontrol.Config{
 		StreamID:      streamID,
 		EngineName:    s.engineNameForAIMD(),
@@ -149,6 +154,9 @@ func (s *Streamer) maybeAttachAIMDController(ctx context.Context, applier ir.Cha
 		// survives a runOnce restart driven by a tx-killer abort. See
 		// the aimdResumeSize field doc for the cross-attempt lifecycle.
 		OnShrink: func(newSize int) { s.aimdResumeSize.Store(int64(newSize)) },
+		// nil when no provider is wired; the controller treats a nil hint
+		// as a no-op (the default reactive path).
+		TelemetryHint: telemetryHintOrNil(hint),
 	}
 	ctrl, err := appliercontrol.New(cfg)
 	if err != nil {
@@ -198,6 +206,11 @@ func (s *Streamer) attachLaneAIMDControllers(ctx context.Context, setter ir.Lane
 		target = resolveAIMDTargetLatency(s.targetCapsForAIMD())
 	}
 	w := s.resolvedApplyConcurrency
+	// ADR-0107 Phase 1: ONE shared telemetry-hint adapter across all lanes
+	// (the provider's Sample is a lock-free cached read; each lane consults
+	// it under its own controller mutex, so sharing introduces no
+	// cross-lane coupling). nil provider ⇒ nil hint ⇒ reactive path.
+	hint := telemetryHintOrNil(newTelemetryHint(ctx, s.TargetTelemetry, appliercontrol.DefaultTelemetryHighWater))
 	// Keep the concrete controllers (for the metrics server's Snapshot) AND
 	// the interface view (for the LaneAIMDSetter wiring) in lock-step by
 	// index, so metric series lane="i" and the applier's lane i are the same
@@ -216,6 +229,9 @@ func (s *Streamer) attachLaneAIMDControllers(ctx context.Context, setter ir.Lane
 			// follow-up note above); each controller is self-contained within
 			// runOnce, which is sufficient because in-lane retry handles a
 			// sustained tx-killer without a whole-run restart.
+
+			// Shared advisory proactive-saturation hint (nil ⇒ no-op).
+			TelemetryHint: hint,
 		}
 		ctrl, err := appliercontrol.New(cfg)
 		if err != nil {
