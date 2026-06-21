@@ -236,6 +236,25 @@ func classifyApplierError(err error) error {
 		}
 	}
 
+	// Target transiently OUT OF DISK — the ROOT face of a PlanetScale
+	// non-Metal storage auto-grow (ADR-0108/0109). While the volume is full
+	// and growing, a write surfaces "No space left on device" (OS errno 28),
+	// which MySQL/vttablet wraps inconsistently: as Error 3 "Error writing
+	// file" (code = Unknown), ER_DISK_FULL (1021), or the ENOSPC text — none
+	// of which the Error-1105 vttablet-code branch above catches (it gates on
+	// Number==1105). It is TRANSIENT: the auto-grow adds space and the retry
+	// succeeds (the v0.99.95 PS-320-v4 live finding — the copy rode ~8 min of
+	// query-killer retries, then died here on the unretried disk-full). A
+	// bounded retry rides the grow out; a genuinely-full, NON-growing target
+	// (e.g. an undersized fixed-storage Metal) exhausts the retry budget and
+	// fails LOUDLY — never an infinite wait. isDiskFullSignal matches the
+	// errno-28 text + ER_DISK_FULL; reused here (it already exists for the
+	// source-unresponsive diagnosis) so the same shape is recognized on the
+	// target write path.
+	if isDiskFullSignal(err) {
+		return &retriableMySQLError{err: err}
+	}
+
 	return err
 }
 

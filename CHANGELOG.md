@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.96] - 2026-06-21
+
+### Fixed
+
+- **A transient target out-of-disk error (`No space left on device`, OS errno 28) is now classified retriable — the root face of a PlanetScale storage auto-grow stall.** While a non-Metal PlanetScale volume is full and auto-growing, a target write surfaces "No space left on device", which MySQL/vttablet wraps inconsistently — as `Error 3` "Error writing file" (`code = Unknown`), `ER_DISK_FULL` (1021), or the bare ENOSPC text. None of these were caught by the Error-1105 vttablet-code branch (it gates on the MySQL error number being 1105), so the cold-copy / CDC apply aborted on the actual disk-full even though the surrounding faces (reparent error in v0.99.92, source-read timeout in v0.99.93, query-killer in v0.99.94) were already retriable. The fix routes a target disk-full through the existing `isDiskFullSignal` matcher (errno-28 text + `ER_DISK_FULL`) to a bounded retry: a transient auto-grow adds space and the retry succeeds, while a genuinely-full, non-growing target (e.g. an undersized fixed-storage Metal instance) exhausts the retry budget and fails loudly — never an infinite wait. Found live on the v0.99.95 PS-320 storage-grow validation, where the copy rode ~8 minutes of query-killer retries (v0.99.94 working) and then died on the unretried disk-full; this is the last observed face of the auto-grow stall. Pinned in the ADR-0038 classifier test set (the `Error 3` errno-28 shape and `ER_DISK_FULL` both retriable).
+
 ## [0.99.95] - 2026-06-21
 
 ### Added
