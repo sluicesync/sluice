@@ -314,7 +314,8 @@ func TestColdCopyReparentRetry_WallClockBound(t *testing.T) {
 	origAttempts := coldCopyReparentRetryAttemptsVar
 	origBase := coldCopyReparentBackoffBaseVar
 	origCap := coldCopyReparentBackoffCapVar
-	coldCopyReparentMaxWallVar = 40 * time.Millisecond
+	const maxWall = 150 * time.Millisecond
+	coldCopyReparentMaxWallVar = maxWall
 	coldCopyReparentRetryAttemptsVar = 100000 // high backstop: wall-clock must be what fires
 	coldCopyReparentBackoffBaseVar = time.Millisecond
 	coldCopyReparentBackoffCapVar = time.Millisecond
@@ -333,7 +334,9 @@ func TestColdCopyReparentRetry_WallClockBound(t *testing.T) {
 	db := newScriptDB(t, script)
 	w := &RowWriter{db: db, bulkLoad: ir.BulkLoadBatchedInsert}
 
+	start := time.Now()
 	err := w.WriteRows(context.Background(), pinReparentTable(), feedReparentRows(2))
+	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("persistent transient must terminate LOUDLY on the wall-clock bound; got nil")
 	}
@@ -344,14 +347,18 @@ func TestColdCopyReparentRetry_WallClockBound(t *testing.T) {
 	if errors.As(err, &re) {
 		t.Error("wall-clock terminal error must be TERMINAL (not ir.RetriableError)")
 	}
-	// The wall-clock bound — not the attempt count — is what fired: with a
-	// ~1ms backoff and a 40ms window the loop ran well past the old 24-attempt
-	// cap but FAR below the 100000 backstop, so it is bounded by time.
-	got := script.execCalls.Load()
-	if got <= 24 {
-		t.Errorf("exec calls = %d; want > 24 (wall-clock bound rides past the old attempt cap)", got)
+	// The bound is WALL-CLOCK, not the attempt count. Asserting by ELAPSED
+	// TIME (not a fixed attempt count) keeps this robust across platforms with
+	// coarse timer granularity (Windows' ~15ms floor makes "N attempts in a
+	// 40ms window" timing-dependent — the v0.99.104 Windows-CI flake). The loop
+	// terminates only once now > deadline, so it MUST have waited ~maxWall — far
+	// longer than the old fixed 24-attempt cap (~tens of ms of backoff) would
+	// have run, proving the bound is time, not count.
+	if elapsed < maxWall*3/4 {
+		t.Errorf("returned after %v; want >= ~%v (the wall-clock window must govern, not a fast attempt-count cap)", elapsed, maxWall)
 	}
-	if got >= 100000 {
+	// And it stayed bounded — it did not run away to the attempt backstop.
+	if got := script.execCalls.Load(); got >= 100000 {
 		t.Errorf("exec calls = %d; the attempt backstop fired instead of the wall-clock bound", got)
 	}
 }

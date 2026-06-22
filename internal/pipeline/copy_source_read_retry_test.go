@@ -149,8 +149,9 @@ func TestSourceReadRetry_BudgetExhaustionIsLoudTerminal(t *testing.T) {
 func TestSourceReadRetry_WallClockBound(t *testing.T) {
 	captureSlog(t)
 	withFastSourceReadBackoff(t)
+	const maxWall = 150 * time.Millisecond
 	origWall, origAttempts := coldCopySourceReadMaxWall, coldCopySourceReadRetryAttempts
-	coldCopySourceReadMaxWall = 40 * time.Millisecond
+	coldCopySourceReadMaxWall = maxWall
 	coldCopySourceReadRetryAttempts = 100000 // high backstop: wall-clock must be what fires
 	t.Cleanup(func() {
 		coldCopySourceReadMaxWall = origWall
@@ -167,19 +168,25 @@ func TestSourceReadRetry_WallClockBound(t *testing.T) {
 		return noopRowReader{}, func() {}, nil
 	}
 
+	start := time.Now()
 	err := copyTableWithSourceReadRetry(context.Background(), "events",
 		resumeTruncateRestart, noopRowReader{}, false, attempt, freshReader,
 		func(_ context.Context) error { return nil }, nil)
+	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("persistent transient must terminate LOUDLY on the wall-clock bound; got nil")
 	}
 	if !strings.Contains(err.Error(), "wall-clock") {
 		t.Errorf("terminal error should name the wall-clock window; got %v", err)
 	}
-	// Wall-clock — not the attempt count — is what fired: many more than the
-	// old 24-attempt cap, far below the 100000 backstop.
-	if attempts <= 24 {
-		t.Errorf("attempts = %d; want > 24 (wall-clock rides past the old attempt cap)", attempts)
+	// The bound is WALL-CLOCK, not the attempt count. Assert by ELAPSED TIME,
+	// not a fixed attempt count, so it's robust on coarse-timer platforms
+	// (Windows' ~15ms floor made "N attempts in a 40ms window" timing-dependent
+	// — the v0.99.104 Windows-CI flake). The loop exits only once now > deadline,
+	// so it must have waited ~maxWall, far longer than the old fixed 24-attempt
+	// cap would have run.
+	if elapsed < maxWall*3/4 {
+		t.Errorf("returned after %v; want >= ~%v (the wall-clock window must govern, not a fast attempt-count cap)", elapsed, maxWall)
 	}
 	if attempts >= 100000 {
 		t.Errorf("attempts = %d; the attempt backstop fired instead of the wall-clock bound", attempts)
