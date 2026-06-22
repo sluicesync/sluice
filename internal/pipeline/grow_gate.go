@@ -74,6 +74,15 @@ import (
 // unaffected (there is no config field, no zero-value path; the values
 // are baked at package init). This is the same vars-not-consts discipline
 // the cold-copy reparent-retry / source-read-retry helpers use.
+//
+// CRITICAL (the -race lesson, v0.99.100): these globals are read ONLY at
+// gate CONSTRUCTION — newGrowGate snapshots them into per-instance fields
+// (backoffBase / backoffCap / maxHold). The owner goroutine reads the
+// gate's OWN fields, never these globals, so a test's shrink-then-restore
+// of a global can never race a still-running owner from an earlier gate.
+// The first cut read growGateBackoffCap directly in runOwner and the
+// -race gate caught it racing a test's t.Cleanup restore; snapshotting at
+// construction removes the shared-mutable-global read from the hot path.
 var (
 	growGateBackoffBase = 100 * time.Millisecond
 	growGateBackoffCap  = 30 * time.Second
@@ -83,21 +92,6 @@ var (
 	// rather than hiding behind a forever-closed gate.
 	growGateMaxHold = 20 * time.Minute
 )
-
-// growGateBackoff returns the per-cycle hold duration for the gate's
-// owner goroutine: exponential doubling from growGateBackoffBase, capped
-// at growGateBackoffCap. cycle is 1-based (cycle 1 is the first hold).
-// Mirrors coldCopyReparentBackoff's shape.
-func growGateBackoff(cycle int) time.Duration {
-	b := growGateBackoffBase
-	for i := 1; i < cycle; i++ {
-		b *= 2
-		if b > growGateBackoffCap {
-			return growGateBackoffCap
-		}
-	}
-	return b
-}
 
 // growGate is the concrete [ir.GrowGate] coordinator. State is open/closed
 // guarded by mu plus a closed-channel-broadcast reopenCh (re-created on
@@ -135,6 +129,17 @@ type growGate struct {
 	// construction.
 	ownerCtx context.Context
 
+	// backoffBase / backoffCap / maxHold are the gate's OWN copy of the
+	// timing envelope, snapshotted from the package defaults at
+	// construction (newGrowGate). The owner goroutine reads these — never
+	// the package globals — so a test that shrinks a global and restores it
+	// on cleanup can never race a still-running owner (the v0.99.100 -race
+	// lesson). Production always gets the package defaults; tests shrink a
+	// global before constructing the gate they then drive.
+	backoffBase time.Duration
+	backoffCap  time.Duration
+	maxHold     time.Duration
+
 	// clock-injection seams for deterministic tests; nil ⇒ real time.
 	afterFn func(time.Duration) <-chan time.Time
 	nowFn   func() time.Time
@@ -155,7 +160,30 @@ func newGrowGate(ctx context.Context, recovered func() bool) *growGate {
 	return &growGate{
 		ownerCtx:  ctx,
 		recovered: recovered,
+		// Snapshot the timing envelope at construction so the owner
+		// goroutine reads instance fields, never the mutable package
+		// globals (the -race safety property; see the var block above).
+		backoffBase: growGateBackoffBase,
+		backoffCap:  growGateBackoffCap,
+		maxHold:     growGateMaxHold,
 	}
+}
+
+// backoff returns the per-cycle hold duration for the gate's owner
+// goroutine: exponential doubling from the gate's OWN backoffBase, capped
+// at its backoffCap. cycle is 1-based (cycle 1 is the first hold). Reading
+// the per-instance fields (snapshotted at construction) — never the package
+// globals — is what keeps the owner goroutine race-free against a test's
+// global shrink/restore. Mirrors coldCopyReparentBackoff's shape.
+func (g *growGate) backoff(cycle int) time.Duration {
+	b := g.backoffBase
+	for i := 1; i < cycle; i++ {
+		b *= 2
+		if b > g.backoffCap {
+			return g.backoffCap
+		}
+	}
+	return b
 }
 
 // Await implements [ir.GrowGate]. Fast-paths the open read under mu (a
@@ -256,9 +284,9 @@ func (g *growGate) runOwner(reopenCh, extend chan struct{}) {
 	if g.onOwnerStart != nil {
 		g.onOwnerStart()
 	}
-	deadline := g.now().Add(growGateMaxHold)
+	deadline := g.now().Add(g.maxHold)
 	for cycle := 1; ; cycle++ {
-		hold := growGateBackoff(cycle)
+		hold := g.backoff(cycle)
 		if remaining := deadline.Sub(g.now()); remaining < hold {
 			hold = remaining
 		}

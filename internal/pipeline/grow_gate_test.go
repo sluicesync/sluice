@@ -334,13 +334,12 @@ func TestGrowGate_ProactiveReleasesOnRecovery(t *testing.T) {
 // TestGrowGate_BackoffShape pins the exponential-doubling envelope (same
 // shape as ADR-0108/0109): 100ms base doubling to the 30s cap.
 func TestGrowGate_BackoffShape(t *testing.T) {
-	base, capDur := growGateBackoffBase, growGateBackoffCap
-	growGateBackoffBase = 100 * time.Millisecond
-	growGateBackoffCap = 30 * time.Second
-	t.Cleanup(func() {
-		growGateBackoffBase = base
-		growGateBackoffCap = capDur
-	})
+	// Drive the per-instance backoff method directly (the production default
+	// envelope, snapshotted at construction) — no package-global mutation,
+	// so nothing can race a still-running owner from another test.
+	g := newGrowGate(context.Background(), nil)
+	g.backoffBase = 100 * time.Millisecond
+	g.backoffCap = 30 * time.Second
 
 	want := []time.Duration{
 		100 * time.Millisecond,  // cycle 1
@@ -356,8 +355,8 @@ func TestGrowGate_BackoffShape(t *testing.T) {
 		30 * time.Second, // 11: stays capped
 	}
 	for i, w := range want {
-		if got := growGateBackoff(i + 1); got != w {
-			t.Errorf("growGateBackoff(%d) = %v, want %v", i+1, got, w)
+		if got := g.backoff(i + 1); got != w {
+			t.Errorf("g.backoff(%d) = %v, want %v", i+1, got, w)
 		}
 	}
 }
