@@ -729,6 +729,8 @@ type SyncStartCmd struct {
 	PlanetScaleMetricsBranch  string `help:"Target branch to filter telemetry series to (defaults to 'main'). Only consulted when --planetscale-org is set." placeholder:"BRANCH"`
 	PlanetScaleMetricsDB      string `help:"Target database name to filter PlanetScale telemetry SD to. Defaults to the --target DSN's database. Only consulted when --planetscale-org is set." placeholder:"DATABASE"`
 
+	SuppressTargetMetricsHistory bool `help:"Disable persisting polled PlanetScale target-health metrics to the sluice_target_metrics_history table on the target (ADR-0107 item 35). Only relevant when --planet-scale-org telemetry is configured; recording is on by default then. The rolling history lets 'sluice diagnose' show the recent CPU/mem/storage/lag/conn trend without scripting the metrics API; the table is bounded (7-day retention, pruned). Recording is advisory and failure-isolated — it never affects the sync."`
+
 	HeartbeatInterval time.Duration `help:"Wall-clock cadence the per-stream heartbeat goroutine logs an INFO 'stream: heartbeat' line at. GitHub #23 Phase A: distinguishes silent-stall (process alive but no apply, no log) from wedge (process alive, no heartbeat either). 0 disables." default:"60s" placeholder:"DUR"`
 
 	PollInterval time.Duration `help:"Override the CDC reader's poll cadence for poll-based engines (today: postgres-trigger; default 1s). Push-based engines (postgres pgoutput, mysql binlog, planetscale VStream) silently ignore — they have no poll loop. Operators chasing lower CDC latency on a write-heavy postgres-trigger stream tighten this to e.g. 250ms; operators trading latency for source load loosen to 5s. 0 (the default) keeps the engine's built-in cadence. ADR-0066 §6; roadmap item 18(c)." placeholder:"DUR"`
@@ -1301,9 +1303,11 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		// telemetryProviderOrNil returns a TRUE nil interface when off, so the
 		// streamer's `TargetTelemetry != nil` guards stay exact (no typed-nil
 		// trap from assigning a nil *Provider straight into the interface).
-		TargetTelemetry:   telemetryProviderOrNil(telemetryProvider),
-		HeartbeatInterval: s.HeartbeatInterval,
-		PollInterval:      s.PollInterval,
+		TargetTelemetry: telemetryProviderOrNil(telemetryProvider),
+		// ADR-0107 item 35: opt-out (zero value = record when telemetry wired).
+		SuppressTargetMetricsHistory: s.SuppressTargetMetricsHistory,
+		HeartbeatInterval:            s.HeartbeatInterval,
+		PollInterval:                 s.PollInterval,
 
 		SourceHeartbeatInterval:    s.SourceHeartbeatInterval,
 		SourceHeartbeatPruneWindow: s.SourceHeartbeatPruneWindow,

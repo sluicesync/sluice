@@ -394,6 +394,24 @@ type Streamer struct {
 	// supplies the real provider; Phase 1 exercises it with a fake).
 	TargetTelemetry ir.TargetTelemetry
 
+	// SuppressTargetMetricsHistory is the OPT-OUT for the ADR-0107 item 35
+	// rolling-history recorder: when a telemetry provider is wired, sluice
+	// also persists each poll into the bounded sluice_target_metrics_history
+	// table on the target so `sluice diagnose` surfaces the recent trend.
+	// Deliberately an opt-out so the ZERO VALUE (false) is the safe default —
+	// record-when-telemetry-wired — for every construction (CLI, tests,
+	// future callers) without each having to set a field. Set true only by
+	// `--suppress-target-metrics-history`.
+	//
+	// Zero-value safety (the v0.99.51 trap): the recorder only STARTS when a
+	// telemetry provider is non-nil, and TargetTelemetry is nil for every
+	// non-CLI construction (tests, broker/chain paths), so a zero-value
+	// Streamer never records regardless of this flag — the default is safe by
+	// construction. The opt-out naming is belt-and-suspenders so the field's
+	// zero value is also the common-case "record" intent for the one
+	// construction (the CLI) that does wire telemetry.
+	SuppressTargetMetricsHistory bool
+
 	// MaxBufferBytes is the soft upper bound on per-batch buffered
 	// memory in the CDC applier (and, on the cold-start branch, the
 	// bulk-copy writer). Each in-flight target transaction tracks

@@ -765,6 +765,15 @@ func (s *Streamer) phaseStartApplySidecars(applyCtx context.Context, applier ir.
 	// WARN-only, exactly as before; the coordinated pause is a cold-copy-
 	// phase concern (runColdStartParallel wires its own gated watch).
 	s.startStorageHeadroomWatch(applyCtx, streamID, nil)
+
+	// ADR-0107 item 35: rolling-history recorder. When a telemetry provider
+	// is wired, a slow-tick sidecar persists each poll into the bounded
+	// sluice_target_metrics_history table on the target so `sluice diagnose`
+	// surfaces the recent trend. No provider / no store impl / opted-out ⇒ no
+	// goroutine. Started here (once per stream attempt) because this is where
+	// the opened applier and the provider are both in scope. Advisory only —
+	// every error is logged at WARN and swallowed.
+	s.startTargetMetricsHistoryRecorder(applyCtx, streamID, applier, s.TargetTelemetry)
 	return liveFilter
 }
 
