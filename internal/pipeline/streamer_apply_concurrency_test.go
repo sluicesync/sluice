@@ -8,6 +8,7 @@ import (
 	"errors"
 	"testing"
 
+	"sluicesync.dev/sluice/internal/appliercontrol"
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -174,6 +175,118 @@ func TestResolveApplyConcurrency_ExplicitValueSkipsProbe(t *testing.T) {
 		if eng.probeCall != 0 {
 			t.Errorf("explicit W=%d probed %d times; want 0 (no probe on explicit value)", w, eng.probeCall)
 		}
+	}
+}
+
+// --- ADR-0107 Phase 3 (a): headroom-clamped auto:N ---
+
+// TestClampConcurrencyByHeadroom pins the startup headroom bias on the auto:N
+// base (MySQL-shaped target, base = defaultApplyConcurrency = 4). Healthy
+// headroom keeps the full base; approaching the mark halves it; at/above the
+// high-water mark quarters it; and every degrade path (no provider, no fresh
+// signal, neither CPU nor mem observed) returns the base UNCHANGED — the
+// advisory contract. The clamp never RAISES the base.
+func TestClampConcurrencyByHeadroom(t *testing.T) {
+	hw := appliercontrol.DefaultTelemetryHighWater
+	base := defaultApplyConcurrency // 4
+	cases := []struct {
+		name string
+		prov ir.TargetTelemetry
+		want int
+	}{
+		{"nil provider → base", nil, base},
+		{
+			"healthy cpu → base",
+			&fakeTelemetry{ok: true, snap: ir.TargetHealthSnapshot{SampledAt: freshNow(), CPUUtil: 0.10, CPUKnown: true}},
+			base,
+		},
+		{
+			"approaching (0.72) → halved",
+			&fakeTelemetry{ok: true, snap: ir.TargetHealthSnapshot{SampledAt: freshNow(), CPUUtil: 0.72, CPUKnown: true}},
+			base / 2,
+		},
+		{
+			"saturated cpu (0.90) → quartered",
+			&fakeTelemetry{ok: true, snap: ir.TargetHealthSnapshot{SampledAt: freshNow(), CPUUtil: 0.90, CPUKnown: true}},
+			base / 4,
+		},
+		{
+			"exactly at high-water → quartered",
+			&fakeTelemetry{ok: true, snap: ir.TargetHealthSnapshot{SampledAt: freshNow(), CPUUtil: hw, CPUKnown: true}},
+			base / 4,
+		},
+		{
+			"mem drives when cpu unknown (saturated)",
+			&fakeTelemetry{ok: true, snap: ir.TargetHealthSnapshot{SampledAt: freshNow(), MemUtil: 0.95, MemKnown: true}},
+			base / 4,
+		},
+		{
+			"busiest of cpu/mem wins (mem hotter)",
+			&fakeTelemetry{ok: true, snap: ir.TargetHealthSnapshot{SampledAt: freshNow(), CPUUtil: 0.10, CPUKnown: true, MemUtil: 0.95, MemKnown: true}},
+			base / 4,
+		},
+		{
+			"no fresh signal (ok=false) → base",
+			&fakeTelemetry{ok: false, snap: ir.TargetHealthSnapshot{SampledAt: freshNow(), CPUUtil: 0.99, CPUKnown: true}},
+			base,
+		},
+		{
+			"neither cpu nor mem observed → base",
+			&fakeTelemetry{ok: true, snap: ir.TargetHealthSnapshot{SampledAt: freshNow(), StorageUtil: 0.99, StorageKnown: true}},
+			base,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := &Streamer{Source: noProberEngine{}, Target: noProberEngine{}, TargetTelemetry: c.prov}
+			if got := s.clampConcurrencyByHeadroom(context.Background(), base); got != c.want {
+				t.Errorf("clampConcurrencyByHeadroom(base=%d) = %d; want %d", base, got, c.want)
+			}
+		})
+	}
+}
+
+// TestClampConcurrencyByHeadroom_NeverRaisesOrGoesBelowOne pins the bounds: a
+// base of 1 stays 1 even on a saturated target (the clamp never produces 0 /
+// serial-below-serial), and a saturated target never RAISES the base.
+func TestClampConcurrencyByHeadroom_NeverRaisesOrGoesBelowOne(t *testing.T) {
+	sat := &fakeTelemetry{ok: true, snap: ir.TargetHealthSnapshot{SampledAt: freshNow(), CPUUtil: 0.99, CPUKnown: true}}
+	healthy := &fakeTelemetry{ok: true, snap: ir.TargetHealthSnapshot{SampledAt: freshNow(), CPUUtil: 0.05, CPUKnown: true}}
+
+	s := &Streamer{Source: noProberEngine{}, Target: noProberEngine{}, TargetTelemetry: sat}
+	if got := s.clampConcurrencyByHeadroom(context.Background(), 1); got != 1 {
+		t.Errorf("base=1 saturated = %d; want 1 (never below serial)", got)
+	}
+	// A small base of 2, saturated: 2/4 = 0 → floored to 1.
+	if got := s.clampConcurrencyByHeadroom(context.Background(), 2); got != 1 {
+		t.Errorf("base=2 saturated = %d; want 1 (floored)", got)
+	}
+	s.TargetTelemetry = healthy
+	if got := s.clampConcurrencyByHeadroom(context.Background(), 2); got != 2 {
+		t.Errorf("base=2 healthy = %d; want 2 (never raised)", got)
+	}
+}
+
+// TestAutoApplyConcurrency_HeadroomClampWiredIn pins that the clamp is actually
+// on the resolve path: an unset --apply-concurrency on a saturated target
+// resolves BELOW the fixed default (the budget base is quartered).
+func TestAutoApplyConcurrency_HeadroomClampWiredIn(t *testing.T) {
+	sat := &fakeTelemetry{ok: true, snap: ir.TargetHealthSnapshot{SampledAt: freshNow(), CPUUtil: 0.92, CPUKnown: true}}
+	s := &Streamer{Source: noProberEngine{}, Target: noProberEngine{}, TargetTelemetry: sat} // unset → auto:N
+	got := s.resolveApplyConcurrency(context.Background())
+	if got != defaultApplyConcurrency/4 {
+		t.Fatalf("saturated-target auto = %d; want %d (default %d quartered)", got, defaultApplyConcurrency/4, defaultApplyConcurrency)
+	}
+}
+
+// TestAutoApplyConcurrency_DryRunSkipsHeadroomClamp pins that a dry-run reports
+// the policy default even with a saturated telemetry snapshot wired — the plan
+// reflects the policy, not a transient load, and does no I/O.
+func TestAutoApplyConcurrency_DryRunSkipsHeadroomClamp(t *testing.T) {
+	sat := &fakeTelemetry{ok: true, snap: ir.TargetHealthSnapshot{SampledAt: freshNow(), CPUUtil: 0.99, CPUKnown: true}}
+	s := &Streamer{Source: noProberEngine{}, Target: noProberEngine{}, TargetTelemetry: sat, DryRun: true}
+	if got := s.resolveApplyConcurrency(context.Background()); got != defaultApplyConcurrency {
+		t.Errorf("dry-run saturated auto = %d; want fixed default %d (clamp skipped)", got, defaultApplyConcurrency)
 	}
 }
 

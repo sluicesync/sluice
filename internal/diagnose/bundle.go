@@ -71,6 +71,15 @@ type Request struct {
 	// bundles.
 	CrashContext string
 
+	// TargetTelemetry is an optional control-plane telemetry provider
+	// (ADR-0107 — today: PlanetScale metrics) for the target. When set,
+	// PrivacyStandard+ bundles include a "Target health" section with the
+	// most recent CPU/mem/storage/lag/connection snapshot, so a recipient
+	// sees WHY apply was slow (a hot or storage-constrained target) without
+	// leaving the bundle. nil ⇒ the section records "telemetry not
+	// configured" — the honest absence, never a fabricated reading.
+	TargetTelemetry ir.TargetTelemetry
+
 	// Now overrides the assembler's wall-clock for tests. Production
 	// callers leave this zero and the assembler uses time.Now().
 	Now time.Time
@@ -279,7 +288,53 @@ func collectStandardSections(ctx context.Context, zw *zip.Writer, req Request) e
 		probeAndWriteHealth(ctx, zw, "health/sync_health.json", req)
 	}
 
+	// Target health — the ADR-0107 control-plane telemetry snapshot
+	// (CPU/mem/storage/lag/conns). Always emitted at PrivacyStandard+ so
+	// the recipient can tell "telemetry not configured" from "configured but
+	// no fresh sample" from a real reading.
+	probeAndWriteTargetHealth(ctx, zw, "health/target_health.json", req)
+
 	return nil
+}
+
+// probeAndWriteTargetHealth writes the ADR-0107 target-telemetry snapshot. It
+// is best-effort and honest: no provider ⇒ a reason file; a provider with no
+// fresh sample ⇒ {"fresh": false}; a fresh sample ⇒ the distilled
+// CPU/mem/storage/lag/connection view with each value gated by its *Known
+// flag (an unobserved metric is omitted, never reported as 0/idle).
+func probeAndWriteTargetHealth(ctx context.Context, zw *zip.Writer, name string, req Request) {
+	if req.TargetTelemetry == nil {
+		_ = writeReason(zw, name, "target telemetry not configured (no --planet-scale-org / metrics token)")
+		return
+	}
+	snap, ok := req.TargetTelemetry.Sample(ctx)
+	if !ok {
+		_ = writeJSON(zw, name, map[string]any{"fresh": false, "reason": "no fresh telemetry sample available"})
+		return
+	}
+	out := map[string]any{
+		"fresh":      true,
+		"sampled_at": snap.SampledAt.UTC().Format(time.RFC3339),
+	}
+	if snap.CPUKnown {
+		out["cpu_util"] = snap.CPUUtil
+	}
+	if snap.MemKnown {
+		out["mem_util"] = snap.MemUtil
+	}
+	if snap.StorageKnown {
+		out["storage_util"] = snap.StorageUtil
+		out["storage_available_bytes"] = snap.StorageAvailableBytes
+		out["storage_capacity_bytes"] = snap.StorageCapacityBytes
+	}
+	if snap.LagKnown {
+		out["replica_lag_seconds"] = snap.ReplicaLagSeconds
+	}
+	if snap.ConnKnown {
+		out["active_connections"] = snap.ActiveConnections
+		out["max_connections"] = snap.MaxConnections
+	}
+	_ = writeJSON(zw, name, out)
 }
 
 // collectVerboseSections writes the PrivacyVerbose additions: per-

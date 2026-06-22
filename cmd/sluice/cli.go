@@ -839,10 +839,40 @@ func resolveApplyBatchSize(raw string, target ir.Engine) (int, error) {
 //
 // The token NEVER appears in any error or log line emitted here — only the
 // org/database/branch identifiers, which are not secret.
+// telemetryParams is the engine-neutral input to [buildTargetTelemetryProvider],
+// gathered from a subcommand's --planet-scale-* flags + the target DSN/driver.
+// Sharing it lets both `sync start` and `diagnose` construct the same provider
+// without duplicating the opt-in / all-or-nothing validation.
+type telemetryParams struct {
+	org       string
+	tokenID   string
+	token     string
+	metricsDB string
+	branch    string
+	targetDSN string
+	engine    string // target engine registry name (selects the metric-name table)
+}
+
 func buildTargetTelemetry(ctx context.Context, s *SyncStartCmd) (*pstelemetry.Provider, error) {
-	if s.PlanetScaleOrg == "" {
+	return buildTargetTelemetryProvider(ctx, telemetryParams{
+		org:       s.PlanetScaleOrg,
+		tokenID:   s.PlanetScaleMetricsTokenID,
+		token:     s.PlanetScaleMetricsToken,
+		metricsDB: s.PlanetScaleMetricsDB,
+		branch:    s.PlanetScaleMetricsBranch,
+		targetDSN: s.Target,
+		engine:    s.TargetDriver,
+	})
+}
+
+// buildTargetTelemetryProvider constructs the optional PlanetScale telemetry
+// provider (ADR-0107) from the gathered params, or returns (nil, nil) when
+// telemetry is off (no --planetscale-org). Opt-in is all-or-nothing: an org
+// without a complete token pair is a loud refusal.
+func buildTargetTelemetryProvider(ctx context.Context, p telemetryParams) (*pstelemetry.Provider, error) {
+	if p.org == "" {
 		// Telemetry off (the default): no provider, no behaviour change.
-		if s.PlanetScaleMetricsTokenID != "" || s.PlanetScaleMetricsToken != "" {
+		if p.tokenID != "" || p.token != "" {
 			// Token supplied without --planetscale-org: nothing consumes it.
 			// Warn rather than refuse — the operator may have set the env var
 			// globally; refusing would block every non-PS sync on that shell.
@@ -851,15 +881,15 @@ func buildTargetTelemetry(ctx context.Context, s *SyncStartCmd) (*pstelemetry.Pr
 		}
 		return nil, nil //nolint:nilnil // (nil, nil) == "telemetry off", a valid no-op result distinct from an error
 	}
-	if s.PlanetScaleMetricsTokenID == "" || s.PlanetScaleMetricsToken == "" {
+	if p.tokenID == "" || p.token == "" {
 		return nil, errors.New(
 			"--planetscale-org is set but the metrics service token is incomplete: supply BOTH --planetscale-metrics-token-id and --planetscale-metrics-token (env PLANETSCALE_METRICS_TOKEN_ID / PLANETSCALE_METRICS_TOKEN). Telemetry is opt-in and all-or-nothing — it never half-runs",
 		)
 	}
 
-	database := s.PlanetScaleMetricsDB
+	database := p.metricsDB
 	if database == "" {
-		database = databaseFromDSN(s.Target)
+		database = databaseFromDSN(p.targetDSN)
 	}
 	if database == "" {
 		return nil, errors.New(
@@ -868,11 +898,17 @@ func buildTargetTelemetry(ctx context.Context, s *SyncStartCmd) (*pstelemetry.Pr
 	}
 
 	provider, err := pstelemetry.New(ctx, pstelemetry.Config{
-		Org:      s.PlanetScaleOrg,
-		TokenID:  s.PlanetScaleMetricsTokenID,
-		Token:    s.PlanetScaleMetricsToken,
+		Org:      p.org,
+		TokenID:  p.tokenID,
+		Token:    p.token,
 		Database: database,
-		Branch:   s.PlanetScaleMetricsBranch,
+		Branch:   p.branch,
+		// Engine selects the per-engine metric-name table (ADR-0107 Phase 3):
+		// a Postgres target reads `planetscale_volume_*` / `planetscale_postgres_*`
+		// rather than the Vitess `vttablet_*` names. The raw driver name is the
+		// registry key ("mysql"/"planetscale"/"vitess"/"postgres"/…); the
+		// provider maps it.
+		Engine: p.engine,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("--planetscale-org telemetry: %w", err)
@@ -880,9 +916,9 @@ func buildTargetTelemetry(ctx context.Context, s *SyncStartCmd) (*pstelemetry.Pr
 	slog.InfoContext(
 		ctx,
 		"PlanetScale target-health telemetry enabled (ADR-0107) — advisory only; apply correctness is unaffected",
-		slog.String("org", s.PlanetScaleOrg),
+		slog.String("org", p.org),
 		slog.String("database", database),
-		slog.String("branch", branchOrMainLabel(s.PlanetScaleMetricsBranch)),
+		slog.String("branch", branchOrMainLabel(p.branch)),
 	)
 	return provider, nil
 }

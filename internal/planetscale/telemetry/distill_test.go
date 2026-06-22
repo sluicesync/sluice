@@ -70,6 +70,77 @@ func TestDistill_FullExposition_AllFamilies(t *testing.T) {
 	}
 }
 
+// pgExposition is a representative Postgres scrape: shared pod CPU/mem
+// percentages, the PG-flavor `planetscale_volume_*` storage names (no
+// `vttablet_` prefix), and `planetscale_postgres_replica_lag_seconds`. A
+// single pod with no tablet labels exercises the (3) single-series selection
+// fallback. The MySQL/Vitess volume names are present too, as DECOYS, to prove
+// the PG table reads the right series.
+const pgExposition = `
+planetscale_pods_cpu_util_percentages 62
+planetscale_pods_mem_util_percentages 55
+planetscale_volume_available_bytes 40000000000
+planetscale_volume_capacity_bytes 160000000000
+planetscale_vttablet_volume_available_bytes 999
+planetscale_vttablet_volume_capacity_bytes 999
+planetscale_postgres_replica_lag_seconds 2
+planetscale_mysql_replica_lag_seconds 99
+`
+
+// TestDistill_PostgresEngine_UsesPGNames pins Phase 3(c): a PG target reads
+// the `planetscale_volume_*` / `planetscale_postgres_*` series, NOT the Vitess
+// decoys, and leaves connections unobserved (the honest PG-conn gap).
+func TestDistill_PostgresEngine_UsesPGNames(t *testing.T) {
+	snap := distillTextWith(pgExposition, "postgres")
+
+	if !snap.CPUKnown || snap.CPUUtil != 0.62 {
+		t.Errorf("CPU = %v known=%v, want 0.62 true", snap.CPUUtil, snap.CPUKnown)
+	}
+	if !snap.MemKnown || snap.MemUtil != 0.55 {
+		t.Errorf("Mem = %v known=%v, want 0.55 true", snap.MemUtil, snap.MemKnown)
+	}
+	// Storage from the PG names: 1 - 40e9/160e9 = 0.75; the vttablet decoy
+	// (999/999 → 0) must NOT win.
+	if !snap.StorageKnown || snap.StorageUtil != 0.75 {
+		t.Errorf("Storage = %v known=%v, want 0.75 true (PG volume names)", snap.StorageUtil, snap.StorageKnown)
+	}
+	if snap.StorageAvailableBytes != 40000000000 || snap.StorageCapacityBytes != 160000000000 {
+		t.Errorf("raw storage = %d/%d, want 40e9/160e9", snap.StorageAvailableBytes, snap.StorageCapacityBytes)
+	}
+	// Lag from the postgres series (2), not the mysql decoy (99).
+	if !snap.LagKnown || snap.ReplicaLagSeconds != 2 {
+		t.Errorf("Lag = %v known=%v, want 2 true (postgres lag name)", snap.ReplicaLagSeconds, snap.LagKnown)
+	}
+	// Connections: PG table leaves these unset → honest unobserved.
+	if snap.ConnKnown {
+		t.Error("ConnKnown true; want false (PG conn metrics intentionally unmapped)")
+	}
+}
+
+// TestDistill_MySQLDefault_IgnoresPGVolumeNames is the mirror: the default
+// (MySQL/Vitess) table must NOT read the PG `planetscale_volume_*` names, so a
+// scrape that has ONLY the PG volume series leaves storage unobserved.
+func TestDistill_MySQLDefault_IgnoresPGVolumeNames(t *testing.T) {
+	const text = `
+planetscale_volume_available_bytes 40000000000
+planetscale_volume_capacity_bytes 160000000000
+`
+	snap := distillTextWith(text, "mysql")
+	if snap.StorageKnown {
+		t.Error("StorageKnown true under MySQL table reading PG volume names; want false")
+	}
+	// metricNamesFor: empty and unknown engines fall back to the MySQL table.
+	if metricNamesFor("") != mysqlMetricNames {
+		t.Error(`metricNamesFor("") did not fall back to mysqlMetricNames`)
+	}
+	if metricNamesFor("planetscale") != mysqlMetricNames {
+		t.Error(`metricNamesFor("planetscale") did not map to mysqlMetricNames`)
+	}
+	if metricNamesFor("postgres") != postgresMetricNames {
+		t.Error(`metricNamesFor("postgres") did not map to postgresMetricNames`)
+	}
+}
+
 // TestDistill_MissingMetric_KnownFalse pins the honesty contract: a metric
 // absent from the scrape leaves its value 0 AND *Known false — never a 0
 // that a consumer reads as "idle".
@@ -167,7 +238,14 @@ func TestClampFraction(t *testing.T) {
 	}
 }
 
-// distillText is the test helper: parse + distill at a fixed time.
+// distillText is the test helper: parse + distill at a fixed time using the
+// MySQL/Vitess metric names (the default, confirmed surface).
 func distillText(text string) ir.TargetHealthSnapshot {
-	return distill(parsePromText(strings.NewReader(text)), time.Unix(1000, 0))
+	return distill(parsePromText(strings.NewReader(text)), mysqlMetricNames, time.Unix(1000, 0))
+}
+
+// distillTextWith is the test helper variant that selects the metric-name
+// table by engine (Phase 3 — exercises the Postgres name set).
+func distillTextWith(text, engine string) ir.TargetHealthSnapshot {
+	return distill(parsePromText(strings.NewReader(text)), metricNamesFor(engine), time.Unix(1000, 0))
 }
