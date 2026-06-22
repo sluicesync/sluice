@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.107] - 2026-06-22
+
+### Added
+
+- **Rolling target-metrics history (ADR-0107 item 35) — sluice now persists the polled PlanetScale target-health metrics into a bounded table on the target so operators can see the trend without scripting the metrics API.** When PlanetScale telemetry is configured (`--planet-scale-org` + the metrics token), a slow-tick sidecar — mirroring the storage-headroom watch, off the apply hot path — records each ~60 s poll (CPU / memory / storage util + raw volume bytes, replica lag, connections) into a new `sluice_target_metrics_history` metadata table on the target, where sluice's other metadata already lives. The recent trend then surfaces as a `health/target_metrics_history.json` section in the `sluice diagnose` bundle (recent rows plus current / 1 m / 5 m / 10 m avg+max aggregates for CPU/mem/storage), or via a plain `SELECT` against the table. The table is bounded — rows older than 7 days are pruned on a periodic pass — and the recorder is purely advisory: every record/prune/ensure error is logged at WARN and swallowed, so it can never stall or crash the sync. An unobserved metric is stored as SQL `NULL` and reconstructed as "unknown" on read (never a misleading `0`/idle), the same honesty contract the live telemetry snapshot keeps. Recording is on by default when telemetry is configured; `--suppress-target-metrics-history` opts out. No behaviour change for any sync that doesn't configure PlanetScale telemetry. Implemented engine-generally (the `ir.TargetMetricsHistoryStore` seam, with MySQL and Postgres stores), so a Postgres-on-PlanetScale target gets the same history table.
+
 ## [0.99.106] - 2026-06-22
 
 ### Added
