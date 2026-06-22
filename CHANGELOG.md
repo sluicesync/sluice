@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.101] - 2026-06-22
+
+### Fixed
+
+- **A transiently read-only target (`Error 1290`, `ER_OPTION_PREVENTS_STATEMENT` — "The MySQL server is running with the --read-only option") is now classified retriable — a newly-observed face of a PlanetScale storage auto-grow / reparent window.** The ADR-0110 live validation (a fresh PS-320 cold-copy on v0.99.100) surfaced a grow-window face the entire v0.99.92–v0.99.99 arc never hit: during the grow's serving transition the target tablet briefly runs with `--read-only` before the new primary is promoted, and an in-flight write fails with errno 1290 (vttablet frames it as `code = Code(17)`, but the driver still parses `Number==1290`). Because 1290 was not in the classifier, the cold-copy went terminal immediately — no retry, and the ADR-0110 coordinated grow-gate never engaged (the gate only quiesces lanes on a *classified* transient). It is transient (the retry succeeds once the new primary serves), so it now joins the same bounded-retry class as the reparent / disk-full / lock-wait faces, and the grow-gate then coordinates the lane quiesce for the window. The match is specific to the read-only wording — 1290 is a generic code ("running with the %s option"), so a 1290 for any other server option stays terminal (no over-match), and a genuinely read-only target (a replica endpoint, a misconfigured DSN) exhausts the bounded retry budget and fails loudly rather than waiting forever. Pinned in the classifier test set alongside the 1021/1114 disk-full and 1205 lock-wait cases, with a negative pin proving a non-read-only 1290 stays terminal.
+
 ## [0.99.100] - 2026-06-22
 
 ### Added

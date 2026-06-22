@@ -130,6 +130,40 @@ func isDiskFullSignal(err error) bool {
 		strings.Contains(msg, "is full (errno")
 }
 
+// isReadOnlyTargetSignal reports whether err is a target that is
+// transiently READ-ONLY — another face of a PlanetScale storage
+// auto-grow / reparent window (the v0.99.100 PS-320-v10 live finding).
+// During a grow's serving transition the target tablet briefly runs with
+// `--read-only` (it has not yet been promoted to the new primary), and an
+// in-flight write surfaces ER_OPTION_PREVENTS_STATEMENT (1290): "The MySQL
+// server is running with the --read-only option so it cannot execute this
+// statement" (vttablet frames it as `code = Code(17)` but the driver still
+// parses Number==1290). It is TRANSIENT — once the new primary is serving,
+// the retry succeeds — so it belongs to the same bounded-retry class as the
+// reparent / disk-full / lock-wait faces. A genuinely read-only target
+// (e.g. a replica endpoint, a misconfigured DSN) exhausts the retry budget
+// and fails LOUDLY, never an infinite wait.
+//
+// 1290 (ER_OPTION_PREVENTS_STATEMENT) is a GENERIC code ("running with the
+// %s option"); only the read-only variant is the grow transient, so the
+// match requires the read-only wording — an unrelated 1290 stays terminal.
+func isReadOnlyTargetSignal(err error) bool {
+	if err == nil {
+		return false
+	}
+	var mysqlErr *gomysql.MySQLError
+	if errors.As(err, &mysqlErr) && mysqlErr.Number == 1290 {
+		m := strings.ToLower(mysqlErr.Message)
+		if strings.Contains(m, "read-only") || strings.Contains(m, "read only") {
+			return true
+		}
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "--read-only option") ||
+		strings.Contains(msg, "--super-read-only option") ||
+		strings.Contains(msg, "running with the --read-only")
+}
+
 // classifyApplierError inspects err and returns a value satisfying
 // [ir.RetriableError] when err matches one of the documented MySQL /
 // Vitess transient shapes. Returns err unchanged for non-retriable
@@ -274,6 +308,23 @@ func classifyApplierError(err error) error {
 	// source-unresponsive diagnosis) so the same shape is recognized on the
 	// target write path.
 	if isDiskFullSignal(err) {
+		return &retriableMySQLError{err: err}
+	}
+
+	// Target transiently READ-ONLY — another face of a PlanetScale storage
+	// auto-grow / reparent window (the v0.99.100 PS-320-v10 live finding).
+	// During the grow's serving transition the tablet briefly runs with
+	// `--read-only` before the new primary is promoted, and an in-flight
+	// write surfaces ER_OPTION_PREVENTS_STATEMENT (1290). It is TRANSIENT —
+	// the retry succeeds once the new primary serves — so it joins the same
+	// bounded-retry class as the reparent / disk-full / lock-wait faces, and
+	// the cold-copy grow-gate (ADR-0110) then quiesces the lanes for the
+	// window. A genuinely read-only target exhausts the budget and fails
+	// loudly. The entire v0.99.92–v0.99.99 arc never saw this face; the
+	// ADR-0110 live validation surfaced it (it died unretried before the
+	// grow-gate could engage, because the gate only fires on a CLASSIFIED
+	// transient).
+	if isReadOnlyTargetSignal(err) {
 		return &retriableMySQLError{err: err}
 	}
 

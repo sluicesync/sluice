@@ -64,6 +64,11 @@ func TestClassifyApplierError_NonRetriableUnchanged(t *testing.T) {
 		{"duplicate key (explicit non-retriable per ADR-0038)", &gomysql.MySQLError{Number: 1062, Message: "Duplicate entry '1179' for key 'events.PRIMARY'"}},
 		{"foreign key violation", &gomysql.MySQLError{Number: 1452, Message: "Cannot add or update a child row"}},
 		{"syntax error", &gomysql.MySQLError{Number: 1064, Message: "You have an error in your SQL syntax"}},
+		// 1290 (ER_OPTION_PREVENTS_STATEMENT) is GENERIC — only the
+		// read-only variant is the grow/reparent transient. A 1290 for any
+		// OTHER server option must stay TERMINAL (no over-match), exactly
+		// like the v0.99.94 "Canceled without TerminateAll" guard.
+		{"1290 non-read-only option stays terminal (no over-match)", &gomysql.MySQLError{Number: 1290, Message: "The MySQL server is running with the --skip-grant-tables option so it cannot execute this statement"}},
 	}
 	for _, c := range cases {
 		c := c
@@ -108,6 +113,7 @@ func TestClassifyApplierError_RetriableShapes(t *testing.T) {
 		{"target out of disk Error 3 errno-28 (PS-320-v4 storage-grow root face)", &gomysql.MySQLError{Number: 3, Message: "target: lst-mysql-d-ps320-v4.-.primary: vttablet: rpc error: code = Unknown desc = Error writing file '/vt/vtdataroot/vt_2760286790/tmp/MLfd=122' (OS errno 28 - No space left on device) (errno 3) (sqlstate HY000)"}},
 		{"target out of disk ER_DISK_FULL 1021", &gomysql.MySQLError{Number: 1021, Message: "Disk full (/tmp); waiting for someone to free some space..."}},
 		{"target table full ER_RECORD_FILE_FULL 1114 (PS-320-v6 storage-grow root variant)", &gomysql.MySQLError{Number: 1114, Message: "target: lst-mysql-d-ps320-v6.-.primary: vttablet: rpc error: code = ResourceExhausted desc = The table '_tally' is full (errno: 28 - No space left on device)"}},
+		{"target transiently read-only ER_OPTION_PREVENTS_STATEMENT 1290 (PS-320-v10 grow/reparent face, the ADR-0110 live finding)", &gomysql.MySQLError{Number: 1290, Message: "target: lst-mysql-d-ps320-v10.-.primary: vttablet: rpc error: code = Code(17) desc = The MySQL server is running with the --read-only option so it cannot execute this statement (errno 1290) (sqlstate HY000) (CallerID: 0stqntpljpw3ts7gxjxr)"}},
 		{"schema drift: unknown column 1054 (Bug F8)", &gomysql.MySQLError{Number: 1054, Message: "Unknown column 'soak_extra' in 'field list'"}},
 		{"schema drift: no such table 1146 (Bug F8)", &gomysql.MySQLError{Number: 1146, Message: "Table 'soak.new_table' doesn't exist"}},
 		{"driver.ErrBadConn", driver.ErrBadConn},
