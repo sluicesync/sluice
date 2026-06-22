@@ -503,6 +503,15 @@ func (m *Migrator) phaseBuildCopyDeps(ctx context.Context, schema *ir.Schema, rr
 		// happen at dispatch.
 		rawCopyOK:     rawCopyOK,
 		rawCopyFormat: rawCopyFormat,
+		// ADR-0110: one coordinated grow-pause gate for the whole cold-copy
+		// run, shared across all lanes. Constructed UNCONDITIONALLY (no
+		// EnableX config bool — the v0.99.51 zero-value trap); with no trip
+		// source firing it is inert (Await fast-paths, no owner goroutine
+		// spawns). The migrate path has no TargetTelemetry wired, so this is
+		// the SIGNAL-driven gate (recovered=nil): the first classified
+		// grow-transient on any lane quiesces the rest. ctx is the run ctx,
+		// so the gate's owner goroutine exits on run unwind.
+		growGate: growGateOrNil(newGrowGate(ctx, nil)),
 	}
 
 	return parallelDeps

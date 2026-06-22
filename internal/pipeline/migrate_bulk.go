@@ -157,7 +157,10 @@ func bulkCopyOneTable(
 		return rdr, func() { closeIf(rdr) }, nil
 	}
 	truncate := func(ctx context.Context) error { return truncateForResume(ctx, rw, table) }
-	return copyTableWithSourceReadRetry(ctx, table.Name, strategy, rows, resuming, attempt, freshReader, truncate)
+	// ADR-0110: thread the run's shared coordinated-pause gate so a
+	// classified source-read drop on this table trips it (sibling lanes
+	// quiesce) and each (re)attempt Awaits an in-effect pause. nil-safe.
+	return copyTableWithSourceReadRetry(ctx, table.Name, strategy, rows, resuming, attempt, freshReader, truncate, parallel.growGate)
 }
 
 // willKeysetChunk reports whether table will take the keyset/integer-PK

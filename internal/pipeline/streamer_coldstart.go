@@ -638,7 +638,7 @@ func (s *Streamer) coldStartRunCopy(ctx context.Context, schema *ir.Schema, stre
 	}
 	var copyErr error
 	if fast {
-		copyErr = s.runColdStartParallel(ctx, stream, sw, rw, schema)
+		copyErr = s.runColdStartParallel(ctx, stream, sw, rw, schema, streamID)
 	} else {
 		// The ADR-0079 fast shareable-snapshot path was not taken — but that
 		// does NOT mean the copy is serial. When the source surfaced a

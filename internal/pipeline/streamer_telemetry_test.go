@@ -221,7 +221,7 @@ func TestStartStorageHeadroomWatch_NilProviderNoOp(_ *testing.T) {
 	s := &Streamer{}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	s.startStorageHeadroomWatch(ctx, "s1") // must be a total no-op.
+	s.startStorageHeadroomWatch(ctx, "s1", nil) // must be a total no-op.
 }
 
 // --- telemetryHint adapter degrade behaviour (use (a)) ---

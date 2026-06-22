@@ -760,8 +760,11 @@ func (s *Streamer) phaseStartApplySidecars(applyCtx context.Context, applier ir.
 	// provider is wired, a slow-tick sidecar warns ONCE per crossing when
 	// the target's storage volume approaches capacity, so an operator can
 	// anticipate the resize/reparent that items 30/33 ride through. No
-	// provider ⇒ no goroutine; it never pauses or gates the stream.
-	s.startStorageHeadroomWatch(applyCtx, streamID)
+	// provider ⇒ no goroutine; it never pauses or gates the stream. The
+	// apply phase has no cold-copy lanes, so it passes a nil gate (ADR-0110):
+	// WARN-only, exactly as before; the coordinated pause is a cold-copy-
+	// phase concern (runColdStartParallel wires its own gated watch).
+	s.startStorageHeadroomWatch(applyCtx, streamID, nil)
 	return liveFilter
 }
 

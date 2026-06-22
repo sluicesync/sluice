@@ -2,9 +2,27 @@
 
 ## Status
 
-**Proposed (2026-06-21).** The *proactive* deepening of the v0.99.92–v0.99.99
+**Accepted (2026-06-21).** The *proactive* deepening of the v0.99.92–v0.99.99
 reactive storage-grow arc (ADR-0108 reparent-retry, ADR-0109 source-read-resume,
 and the classifier widenings). Roadmap item 37. `-race`-before-tag concurrency chunk.
+
+Implemented as specified. The engine-neutral `ir.GrowGate` (+ `ir.GrowGateSetter`)
+seam lives in `internal/ir/grow_gate.go`; the concrete `pipeline.growGate`
+coordinator in `internal/pipeline/grow_gate.go`; the hot-path `Await`/`Trip` wiring
+in `internal/engines/mysql/row_writer_reparent_retry.go` (write lanes) and
+`internal/pipeline/copy_source_read_retry.go` (source-read lane); the
+telemetry-driven trip + recovery probe in `internal/pipeline/streamer_telemetry.go`.
+One deviation from the design sketch, for race-safety (recorded in Consequences
+below): the owner goroutine does NOT reopen *mid-window* to let lanes probe and then
+re-close on a re-trip (that would need a second owner / a probe-vs-trip race).
+Instead a quiet backoff cycle ENDS the window — the reopen lets the lanes resume and
+probe; if the target is still bad the first lane to re-hit the transient opens a
+FRESH window. This is observably equivalent (coordinated quiesce, coalesced
+concurrent trips, exponential hold matching the retry envelope, bounded by max-hold)
+and is single-owner / single-teardown, so it has no double-close / dangling-owner
+race. **The `-race` integration gate has NOT been run locally (CGO=0 box); the main
+session must land it through CI's `-race` Integration job before any tag** — this is
+a concurrency chunk.
 
 ## Context
 
@@ -153,15 +171,54 @@ pipeline source-read retry, and (c) the telemetry sidecar. Behaviour:
 - **Not changed:** the correctness contract, the resume format, the retry budgets
   (they remain the loud terminal floor), any untroubled-copy behaviour.
 
+### Impl notes (deviations from the design sketch)
+
+- **Window lifecycle = single owner, quiet-cycle teardown (not mid-window
+  reopen/re-close).** The decision sketched a per-cycle "reopen to let lanes probe;
+  if a lane immediately re-trips, close + extend." Implemented differently for
+  race-safety: ONE owner goroutine per window holds the gate closed across
+  exponential-backoff cycles and reopens exactly once, via a SINGLE teardown
+  (`finishWindow`), when the FIRST of {a quiet cycle with no re-trip | recovered() |
+  max-hold | ctx-cancel} fires. Lanes "probe" by the window ending (reopen → they
+  resume); a still-bad target's first re-trip opens a fresh window. A mid-window
+  reopen-then-re-close would need either a second owner or a probe-vs-Trip race on
+  the open/closed flag; the single-owner shape sidesteps both (`Trip` coalesces onto
+  the live owner via the `extend` channel while `g.extend != nil`, and only spawns a
+  new owner once the window has fully torn down). Observably equivalent: coordinated
+  quiesce, concurrent-trip coalescing into one window, exponential hold matching the
+  ADR-0108/0109 retry envelope, bounded by max-hold, proactive early-release on
+  recovery.
+- **Construction is unconditional + zero-value-safe; no CLI flag added.** The gate is
+  built once per cold-copy run (signal-driven on `migrate`; signal + telemetry-recovery
+  on the sync cold-start, which has the `TargetTelemetry` seam) and is inert until a
+  trip fires. No `--no-coordinated-grow-pause` flag was added (deferred until there's
+  a reason to disable it); if one is ever added it must be opt-*out* per the design.
+- **Telemetry trip layered on the existing WARN edge, not woven into it.** The
+  storage-headroom tick (`evalStorageHeadroomTick`) keeps its exact WARN edge-trigger
+  semantics; `evalStorageHeadroomTickWithGate` wraps it and trips the gate on the same
+  false→true latch transition. A cold-copy-phase headroom watch (gated) runs alongside
+  the unchanged apply-phase watch (gate=nil, WARN-only).
+
 ## Validation
 
-- Unit: gate FSM under `-race` — coalescing concurrent trips, reopen broadcast,
-  prompt ctx-cancel unwind of N parked `Await`ers, max-hold bound, telemetry-recovery
-  release. A deterministic "all lanes parked then ctx-cancel" test (the ADR-0099
-  shutdown-hang lesson) proving no goroutine leak / no hang.
-- Integration: a fan-out cold-copy against a fake writer that injects a classified
-  grow-transient on lane 0 and asserts sibling lanes quiesce (don't issue new flushes)
-  until reopen, then converge byte-identically to the serial copy.
-- Live: re-run the Track-D PS-320 growing-volume scenario and confirm the copy rides
-  the grow with fewer total retry attempts + no 1205 storm vs the v0.99.99 reactive
-  baseline (the win is efficiency, not new correctness).
+- Unit: gate FSM (`internal/pipeline/grow_gate_test.go`) — coalescing concurrent
+  trips into one window (owner-count seam), reopen broadcast wakes all N parked
+  `Await`ers, prompt ctx-cancel unwind of N parked `Await`ers (the ADR-0099
+  shutdown-hang lesson: park-then-cancel proves no hang / no leak), owner-exit +
+  reopen on run-ctx cancel, max-hold bound on a forever-re-tripping target,
+  telemetry-recovery early release, backoff shape, nil-gate pre-ADR no-op. Writer-seam
+  pins (`internal/engines/mysql/row_writer_grow_gate_test.go`): Await before each
+  flush attempt, Trip on classified transient, no Trip on terminal, nil-gate inert,
+  ctx-cancel halts. Source-read seam + telemetry probe pins in the pipeline package.
+  **NOTE: `-race` is CI-only on this box (CGO=0); the unit tests are deterministic but
+  the race gate must run in CI before tag.**
+- Integration (no Docker): `TestSourceReadRetryE2E_GrowGate_QuiescesAndConverges`
+  drives the full migrate per-table copy with a real `growGate` wired in; a mid-chunk
+  source drop trips the gate and each retry Awaits it, and the copy still converges
+  byte-identically (zero dup / zero drop). The cross-lane "siblings issue no new
+  flushes while closed" property is pinned mechanically by the FSM unit tests
+  (reopen-broadcast + coalescing + ctx-cancel-unwind) rather than a multi-container
+  fan-out, which would need testcontainers.
+- Live (main session): re-run the Track-D PS-320 growing-volume scenario and confirm
+  the copy rides the grow with fewer total retry attempts + no 1205 storm vs the
+  v0.99.99 reactive baseline (the win is efficiency, not new correctness).

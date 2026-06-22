@@ -7,6 +7,7 @@ import (
 	"context"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -345,6 +346,63 @@ func TestSourceReadRetryE2E_KeysetChunked_ResumesFromLastPK(t *testing.T) {
 	if tgt.truncations != 0 {
 		t.Errorf("chunked resume must NOT truncate (it resumes from LastPK); truncations=%d", tgt.truncations)
 	}
+}
+
+// TestSourceReadRetryE2E_GrowGate_QuiescesAndConverges pins the ADR-0110
+// coordinated-pause integration on the SOURCE-READ path end-to-end (no
+// Docker): a real growGate (shrunk envelope) is wired into the run; a
+// mid-chunk source drop TRIPS the gate (so siblings would quiesce) and each
+// retry Awaits it, and the copy still converges byte-identically to the
+// no-gate case — proving the gate changes only WHEN a read attempt runs,
+// never WHAT lands (zero dup, zero drop). The cross-lane "siblings issue no
+// new flushes while closed" property is pinned mechanically by the FSM
+// unit tests (grow_gate_test.go: reopen-broadcast + ctx-cancel-unwind +
+// coalescing); here we pin that the integrated path preserves correctness.
+func TestSourceReadRetryE2E_GrowGate_QuiescesAndConverges(t *testing.T) {
+	captureSlog(t)
+	withFastSourceReadBackoff(t)
+	withFastGrowGate(t)
+
+	const n = 40
+	src := newFakeSource(n, 8) // drop mid chunk-0 at id=8
+	tgt := newFakeTarget()
+	eng := &fakeTargetEngine{target: tgt, source: src}
+
+	deps := chunkDeps(eng)
+	gate := newGrowGate(context.Background(), nil)
+	var tripped, awaited int64
+	obs := &observingGate{inner: gate, trips: &tripped, awaits: &awaited}
+	deps.growGate = obs
+
+	if err := runOneTable(t, intPKTable("documents"), src, tgt, deps, false); err != nil {
+		t.Fatalf("bulkCopyOneTable: %v", err)
+	}
+	assertConverged(t, tgt, n)
+	if tripped == 0 {
+		t.Error("the mid-chunk source drop should have TRIPPED the coordinated grow-gate; trips=0")
+	}
+	if awaited == 0 {
+		t.Error("the source-read path should have AWAITED the gate at least once; awaits=0")
+	}
+}
+
+// observingGate wraps a real growGate to count Await/Trip calls while
+// preserving the real FSM behaviour (so the e2e exercises the actual
+// coordinator, not a no-op stub).
+type observingGate struct {
+	inner  *growGate
+	trips  *int64
+	awaits *int64
+}
+
+func (g *observingGate) Await(ctx context.Context) error {
+	atomic.AddInt64(g.awaits, 1)
+	return g.inner.Await(ctx)
+}
+
+func (g *observingGate) Trip(reason string) {
+	atomic.AddInt64(g.trips, 1)
+	g.inner.Trip(reason)
 }
 
 // TestSourceReadRetryE2E_Idempotent_AbsorbsOverlap pins ADR-0109 case 2:

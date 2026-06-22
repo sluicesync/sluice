@@ -183,6 +183,7 @@ func (s *Streamer) runColdStartParallel(
 	sw ir.SchemaWriter,
 	rw ir.RowWriter,
 	schema *ir.Schema,
+	streamID string,
 ) error {
 	opener, ok := s.Source.(ir.SnapshotImporterOpener)
 	if !ok {
@@ -259,6 +260,19 @@ func (s *Streamer) runColdStartParallel(
 		slog.Bool("raw_copy_eligible", rawCopyOK),
 		slog.String("raw_copy_reason", rawCopyReason))
 
+	// ADR-0110: one coordinated grow-pause gate for the whole cold-copy run.
+	// Constructed unconditionally (no EnableX config — the v0.99.51 trap);
+	// inert until a trip source fires. The sync cold-start path has a
+	// TargetTelemetry seam, so this gate gets a recovery probe: a PROACTIVE
+	// storage-headroom trip (from the gated headroom watch below) reopens on
+	// the earlier of {max-hold | storage headroom recovered}. nil provider ⇒
+	// the probe is nil and the gate is signal-driven only.
+	gate := growGateOrNil(newGrowGate(ctx, storageRecoveredProbe(ctx, s.TargetTelemetry)))
+	// Run a cold-copy-phase storage-headroom watch that trips the gate
+	// proactively on the rising edge. Scoped to the cold-copy ctx so it
+	// exits when the copy completes / unwinds; nil provider ⇒ no goroutine.
+	s.startStorageHeadroomWatch(ctx, streamID, gate)
+
 	deps := &parallelBulkCopyDeps{
 		source:             s.Source,
 		target:             s.Target,
@@ -271,6 +285,7 @@ func (s *Streamer) runColdStartParallel(
 		rawCopyOK:          rawCopyOK,
 		rawCopyFormat:      rawCopyFormat,
 		chunkReaderFactory: readerFactory,
+		growGate:           gate,
 	}
 
 	// A disabled resume context: the fast path is fresh-cold-start-only

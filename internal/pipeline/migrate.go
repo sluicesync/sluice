@@ -1340,6 +1340,22 @@ func applyMaxBufferBytes(target any, bytes int64) {
 	}
 }
 
+// applyGrowGate wires the cold-copy run's shared coordinated-pause gate
+// (ADR-0110) onto a freshly-opened writer that opts into it via
+// [ir.GrowGateSetter]. Engines that don't implement the setter (PG today)
+// retain their per-lane retry behaviour unchanged. A nil gate is a no-op:
+// the writer keeps its zero-value nil gate (pre-ADR-0110 behaviour). Called
+// immediately after each chunk/table writer opens, alongside
+// applyMaxBufferBytes, before any flush.
+func applyGrowGate(target any, gate ir.GrowGate) {
+	if gate == nil {
+		return
+	}
+	if setter, ok := target.(ir.GrowGateSetter); ok {
+		setter.SetGrowGate(gate)
+	}
+}
+
 // applyCopyCheckpoint wires the resumable COPY-cursor checkpoint sink
 // (ADR-0072 Phase B) onto a snapshot row reader that opts into it via
 // [ir.CopyCheckpointer]. The sink upserts the in-progress snapshot

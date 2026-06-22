@@ -140,16 +140,21 @@ func (h *telemetryHint) nowOrDefault() time.Time {
 // anticipation sidecar: a slow-tick goroutine that reads the provider's
 // cached snapshot and, on the rising EDGE of crossing the storage
 // high-water mark, logs ONE structured WARN so an operator knows a
-// resize/reparent may interrupt apply shortly. It is pure
-// anticipation/explanation — it NEVER pauses, gates, or errors the
-// stream; items 30/33's retriable classification remains the actual
-// ride-through. Edge-triggered: it warns once per crossing, then stays
-// quiet until storage drops back below the mark (so a sustained-low-
-// headroom target doesn't flood the log every tick).
+// resize/reparent may interrupt apply shortly. Edge-triggered: it warns
+// once per crossing, then stays quiet until storage drops back below the
+// mark (so a sustained-low-headroom target doesn't flood the log).
 //
-// nil provider ⇒ no goroutine (a total no-op, the default). The
-// goroutine exits when ctx is cancelled; the caller does not track it.
-func (s *Streamer) startStorageHeadroomWatch(ctx context.Context, streamID string) {
+// ADR-0110: when a non-nil cold-copy grow-gate is supplied (the cold-copy
+// phase passes one; the apply phase passes nil), this sidecar ALSO trips
+// the gate on the SAME rising edge — a PROACTIVE coordinated pause, before
+// the lanes start hitting transients. This keeps the WARN's edge-trigger
+// semantics untouched (the gate trip is layered on top of the existing
+// latch transition, not woven into evalStorageHeadroomTick) and stays
+// advisory: nil gate ⇒ WARN-only, exactly as the apply-phase sidecar.
+//
+// nil provider ⇒ no goroutine (a total no-op, the default). The goroutine
+// exits when ctx is cancelled; the caller does not track it.
+func (s *Streamer) startStorageHeadroomWatch(ctx context.Context, streamID string, gate ir.GrowGate) {
 	if s.TargetTelemetry == nil {
 		return
 	}
@@ -165,10 +170,55 @@ func (s *Streamer) startStorageHeadroomWatch(ctx context.Context, streamID strin
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				warned = evalStorageHeadroomTick(ctx, logger, provider, streamID, warned)
+				warned = evalStorageHeadroomTickWithGate(ctx, logger, provider, streamID, warned, gate)
 			}
 		}
 	}()
+}
+
+// evalStorageHeadroomTickWithGate is one tick of the storage-headroom watch
+// WITH the ADR-0110 proactive grow-gate trip layered on top: it runs the
+// existing [evalStorageHeadroomTick] (whose WARN edge-trigger semantics are
+// unchanged) and, on the RISING EDGE of the warn latch (false→true == a
+// fresh high-water crossing), trips the supplied gate so every cold-copy
+// lane quiesces proactively. nil gate ⇒ WARN-only (apply-phase + no-cold-
+// copy paths), byte-for-byte the pre-ADR-0110 behaviour. Pulled out so the
+// rising-edge trip is unit-testable without a live 60s ticker.
+func evalStorageHeadroomTickWithGate(
+	ctx context.Context,
+	logger *slog.Logger,
+	provider ir.TargetTelemetry,
+	streamID string,
+	warned bool,
+	gate ir.GrowGate,
+) bool {
+	next := evalStorageHeadroomTick(ctx, logger, provider, streamID, warned)
+	if !warned && next && gate != nil {
+		gate.Trip("proactive: target storage headroom approaching the auto-grow boundary (ADR-0110 telemetry)")
+	}
+	return next
+}
+
+// storageRecoveredProbe returns a func reporting whether the target's
+// storage headroom has RECOVERED — a fresh snapshot whose StorageUtil is
+// back below the high-water mark. The cold-copy grow-gate consults it so a
+// PROACTIVE (telemetry-tripped) pause reopens on the earlier of {max-hold |
+// recovery}. nil provider ⇒ nil probe (the gate is then signal-driven only:
+// it reopens on its own max-hold / quiet-cycle timing). The probe is
+// conservative: a stale / unobservable / unknown-storage snapshot reports
+// "not recovered" (false), so the gate never reopens early on a missing
+// signal — it falls back to the max-hold bound, exactly the reactive floor.
+func storageRecoveredProbe(ctx context.Context, provider ir.TargetTelemetry) func() bool {
+	if provider == nil {
+		return nil
+	}
+	return func() bool {
+		snap, ok := provider.Sample(ctx)
+		if !ok || !snap.StorageKnown || !snap.Fresh(time.Now(), telemetryFreshnessWindow) {
+			return false
+		}
+		return snap.StorageUtil < appliercontrol.DefaultTelemetryHighWater
+	}
 }
 
 // evalStorageHeadroomTick is one tick of the storage-headroom watch,

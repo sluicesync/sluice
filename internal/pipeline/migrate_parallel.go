@@ -148,6 +148,19 @@ type parallelBulkCopyDeps struct {
 	// per-chunk acquisition shape); it must be safe for concurrent calls
 	// from peer chunk/table goroutines.
 	chunkReaderFactory func(ctx context.Context) (ir.RowReader, error)
+
+	// growGate is the run's shared cold-copy coordinated-pause primitive
+	// (ADR-0110). Constructed ONCE per cold-copy run and shared across all
+	// lanes: it is threaded onto every per-chunk/per-table writer
+	// ([openOneChunkConn] via [applyGrowGate]) and into the source-read
+	// retry ([bulkCopyOneTable]) so a classified grow-transient on any lane
+	// — or a proactive storage-headroom telemetry signal — quiesces ALL
+	// lanes together for the grow window. nil ⇒ pre-ADR-0110 behaviour: the
+	// gate degrades to a no-op (Await instant, Trip no-op) and every lane
+	// rides the grow independently via its own bounded retry budget, exactly
+	// as before. It is the typed [ir.GrowGate] (set via [growGateOrNil]),
+	// not the concrete *growGate, so a nil value stays a true nil interface.
+	growGate ir.GrowGate
 }
 
 // useFastLoader is the ADR-0043 gate: it decides whether a parallel
@@ -630,6 +643,11 @@ func openOneChunkConn(ctx context.Context, deps *parallelBulkCopyDeps) (ir.RowRe
 		return nil, nil, err
 	}
 	applyMaxBufferBytes(wr, deps.maxBufferBytes)
+	// ADR-0110: share the run's coordinated grow-pause gate with this
+	// chunk/table writer so every cold-copy lane quiesces together for a
+	// target storage-grow window. nil-safe (no-op when the run has no gate
+	// or the engine doesn't implement the setter).
+	applyGrowGate(wr, deps.growGate)
 	return rdr, wr, nil
 }
 

@@ -180,7 +180,15 @@ func copyTableWithSourceReadRetry(
 	attempt func(ctx context.Context, rows ir.RowReader, resuming bool) error,
 	freshReader func(ctx context.Context) (ir.RowReader, func(), error),
 	truncate func(ctx context.Context) error,
+	gate ir.GrowGate,
 ) error {
+	// ADR-0110: quiesce with the run's other cold-copy lanes if a
+	// coordinated grow-window pause is in effect before reading. Await is a
+	// cheap open read when no pause is active and returns ctx.Err() promptly
+	// on cancel. nil gate ⇒ instant return (pre-ADR-0110 behaviour).
+	if aerr := awaitGrowGate(ctx, gate); aerr != nil {
+		return aerr
+	}
 	err := attempt(ctx, firstReader, firstResuming)
 	if err == nil {
 		return nil
@@ -193,6 +201,12 @@ func copyTableWithSourceReadRetry(
 		if !isRetriableSourceReadError(err) {
 			return err
 		}
+		// ADR-0110: a classified source-read drop is the READ-side face of a
+		// target storage-grow stall (the backpressure-EOF a stalled target
+		// induces). TRIP the shared gate so sibling lanes quiesce together
+		// for the grow window. Coalescing + idempotent; this lane keeps its
+		// own bounded retry below as the authoritative floor.
+		tripGrowGate(gate, "pipeline cold-copy source-read transient: "+err.Error())
 		if try >= coldCopySourceReadRetryAttempts {
 			return fmt.Errorf(
 				"pipeline: cold-copy of %q: source read still failing after exhausting the reconnect-and-resume retry budget "+
@@ -230,6 +244,13 @@ func copyTableWithSourceReadRetry(
 			}
 		}
 
+		// ADR-0110: before re-opening + retrying, Await the coordinated
+		// pause again — if the gate is still closed for the grow window this
+		// lane parks calmly instead of opening a fresh reader against a
+		// stalled target. Returns promptly on ctx-cancel; nil gate ⇒ instant.
+		if aerr := awaitGrowGate(ctx, gate); aerr != nil {
+			return aerr
+		}
 		// Open a FRESH source reader — the post-drop reader is dead; the
 		// engine factory reconnects to a healthy source here. NEVER reuse
 		// firstReader. A re-open failure is itself classified on the next

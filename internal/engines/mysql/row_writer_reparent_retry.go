@@ -124,6 +124,16 @@ func (w *RowWriter) flushWithReparentRetry(
 	attempt func(conn *sql.Conn, isRetry bool) error,
 	firstConn *sql.Conn,
 ) error {
+	// ADR-0110: quiesce with the run's other cold-copy lanes if a
+	// coordinated grow-window pause is in effect. Await is a cheap open
+	// read when no pause is active (the common case) and returns ctx.Err()
+	// promptly on cancel (the no-deadlock contract). nil gate ⇒ instant
+	// return (pre-ADR-0110 behaviour). It only changes WHEN this attempt
+	// runs, never WHAT it does — the reparent-retry budget below is still
+	// the authoritative loud-on-exhaustion floor.
+	if err := w.awaitGrowGate(ctx); err != nil {
+		return err
+	}
 	err := attempt(firstConn, false)
 	if err == nil {
 		return nil
@@ -138,6 +148,13 @@ func (w *RowWriter) flushWithReparentRetry(
 		if !errors.As(classifyApplierError(err), &re) || !re.Retriable() {
 			return err
 		}
+		// ADR-0110: this lane hit a classified grow-transient — TRIP the
+		// shared gate so every sibling cold-copy lane quiesces together for
+		// the grow window instead of independently hammering the struggling
+		// target. Idempotent + coalescing: the ~W×D lanes that hit the
+		// transient at once collapse into one pause window. This lane keeps
+		// its own bounded retry below as the floor.
+		w.tripGrowGate("mysql cold-copy flush transient: " + err.Error())
 		if try >= coldCopyReparentRetryAttemptsVar {
 			return fmt.Errorf(
 				"mysql: cold-copy into %q: batch flush (%d rows) still failing after exhausting the reparent-retry budget "+
@@ -163,6 +180,14 @@ func (w *RowWriter) flushWithReparentRetry(
 			return ctx.Err()
 		}
 
+		// ADR-0110: before the retry attempt, Await the coordinated pause
+		// again — if the gate is (still) closed for the grow window this
+		// lane parks calmly here instead of re-acquiring a conn and
+		// hammering the target. Returns promptly on ctx-cancel. nil gate ⇒
+		// instant return.
+		if aerr := w.awaitGrowGate(ctx); aerr != nil {
+			return aerr
+		}
 		// Re-acquire a FRESH connection — the pinned conn is dead after a
 		// reparent; the pool reconnects to the new primary here. NEVER
 		// reuse firstConn. A re-acquire failure is itself classified on
@@ -179,4 +204,25 @@ func (w *RowWriter) flushWithReparentRetry(
 			return nil
 		}
 	}
+}
+
+// awaitGrowGate blocks while the run's shared coordinated-pause gate
+// (ADR-0110) is closed and returns ctx.Err() promptly on cancel. A nil
+// gate ⇒ instant nil return (pre-ADR-0110 behaviour, byte-for-byte). It
+// only changes WHEN a flush attempt runs, never WHAT it does.
+func (w *RowWriter) awaitGrowGate(ctx context.Context) error {
+	if w.growGate == nil {
+		return nil
+	}
+	return w.growGate.Await(ctx)
+}
+
+// tripGrowGate trips the run's shared coordinated-pause gate so sibling
+// cold-copy lanes quiesce together for a grow window. A nil gate ⇒ no-op.
+// Idempotent + coalescing (see [ir.GrowGate.Trip]).
+func (w *RowWriter) tripGrowGate(reason string) {
+	if w.growGate == nil {
+		return
+	}
+	w.growGate.Trip(reason)
 }

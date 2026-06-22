@@ -64,7 +64,7 @@ func TestSourceReadRetry_RecoversAfterTransientDrops(t *testing.T) {
 	}
 
 	err := copyTableWithSourceReadRetry(context.Background(), "documents",
-		resumeFromChunkCursor, noopRowReader{}, false, attempt, freshReader, truncate)
+		resumeFromChunkCursor, noopRowReader{}, false, attempt, freshReader, truncate, nil)
 	if err != nil {
 		t.Fatalf("expected recovery, got %v", err)
 	}
@@ -94,7 +94,7 @@ func TestSourceReadRetry_FirstAttemptNonRetriableIsTerminal(t *testing.T) {
 	truncate := func(_ context.Context) error { truncs++; return nil }
 
 	err := copyTableWithSourceReadRetry(context.Background(), "t",
-		resumeTruncateRestart, noopRowReader{}, false, attempt, freshReader, truncate)
+		resumeTruncateRestart, noopRowReader{}, false, attempt, freshReader, truncate, nil)
 	if !errors.Is(err, decodeErr) {
 		t.Fatalf("expected the terminal decode error verbatim, got %v", err)
 	}
@@ -124,7 +124,7 @@ func TestSourceReadRetry_BudgetExhaustionIsLoudTerminal(t *testing.T) {
 
 	err := copyTableWithSourceReadRetry(context.Background(), "events",
 		resumeTruncateRestart, noopRowReader{}, false, attempt, freshReader,
-		func(_ context.Context) error { return nil })
+		func(_ context.Context) error { return nil }, nil)
 	if err == nil {
 		t.Fatal("expected a loud terminal error on budget exhaustion, got nil")
 	}
@@ -169,7 +169,7 @@ func TestSourceReadRetry_CtxCancelDuringBackoffUnwinds(t *testing.T) {
 		done <- copyTableWithSourceReadRetry(ctx, "t", resumeTruncateRestart,
 			noopRowReader{}, false, attempt,
 			func(context.Context) (ir.RowReader, func(), error) { return noopRowReader{}, func() {}, nil },
-			func(context.Context) error { return nil })
+			func(context.Context) error { return nil }, nil)
 	}()
 	select {
 	case err := <-done:
@@ -206,7 +206,7 @@ func TestSourceReadRetry_TruncateRestartTruncatesAndForcesRestart(t *testing.T) 
 	truncate := func(context.Context) error { truncs++; return nil }
 
 	if err := copyTableWithSourceReadRetry(context.Background(), "logs",
-		resumeTruncateRestart, noopRowReader{}, false, attempt, freshReader, truncate); err != nil {
+		resumeTruncateRestart, noopRowReader{}, false, attempt, freshReader, truncate, nil); err != nil {
 		t.Fatalf("expected recovery, got %v", err)
 	}
 	if truncs != 1 {
@@ -243,7 +243,7 @@ func TestSourceReadRetry_ChunkCursorForcesResume(t *testing.T) {
 	if err := copyTableWithSourceReadRetry(context.Background(), "documents",
 		resumeFromChunkCursor, noopRowReader{}, false, attempt,
 		func(context.Context) (ir.RowReader, func(), error) { return noopRowReader{}, func() {}, nil },
-		truncate); err != nil {
+		truncate, nil); err != nil {
 		t.Fatalf("expected recovery, got %v", err)
 	}
 	if len(sawResuming) != 2 || sawResuming[0] /* run flag */ || !sawResuming[1] /* forced */ {
@@ -279,7 +279,7 @@ func TestSourceReadRetry_ReopenFailureRidesBudget(t *testing.T) {
 	}
 	if err := copyTableWithSourceReadRetry(context.Background(), "t",
 		resumeFromChunkCursor, noopRowReader{}, false, attempt, freshReader,
-		func(context.Context) error { return nil }); err != nil {
+		func(context.Context) error { return nil }, nil); err != nil {
 		t.Fatalf("expected eventual recovery after a transient reopen failure, got %v", err)
 	}
 	if opens != 2 {

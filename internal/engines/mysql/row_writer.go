@@ -85,6 +85,27 @@ type RowWriter struct {
 	// most one WARN per table rather than one per flushed batch. Keyed
 	// by table name; values are struct{}. Zero value is ready to use.
 	warnedClamp sync.Map
+
+	// growGate is the shared cold-copy coordinated-pause primitive
+	// (ADR-0110). The pipeline threads ONE gate per cold-copy run onto
+	// every writer it opens (via [SetGrowGate]); flushWithReparentRetry
+	// Awaits it at the top of each flush attempt and Trips it on a
+	// classified grow-transient so all sibling lanes quiesce together for
+	// the grow window. nil ⇒ pre-ADR-0110 behaviour, byte-for-byte (Await
+	// returns immediately, Trip is a no-op) — the default on every path
+	// the pipeline doesn't wire (serial copy, tests, the non-cold-copy
+	// apply path). Implements [ir.GrowGateSetter].
+	growGate ir.GrowGate
+}
+
+// SetGrowGate implements [ir.GrowGateSetter] (ADR-0110). The pipeline
+// wires the cold-copy run's shared [ir.GrowGate] here, right after
+// OpenRowWriter, so every per-table / per-fan-out-worker writer in the run
+// shares ONE pause coordinator. A nil gate disables the coordinated pause
+// (pre-ADR-0110 behaviour); the per-lane reparent-retry budget remains the
+// authoritative floor either way.
+func (w *RowWriter) SetGrowGate(gate ir.GrowGate) {
+	w.growGate = gate
 }
 
 // SetCopyDurableProgress implements [ir.CopyDurableProgressReporter]
