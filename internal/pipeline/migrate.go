@@ -992,6 +992,22 @@ func runBulkCopyPhases(
 	redactor *redact.Registry,
 	shard ShardColumnSpec,
 ) error {
+	// ADR-0110 (v0.99.102): wire the run's coordinated grow-pause gate onto
+	// the TOP-LEVEL cold-copy writer here, centrally. The native-concurrent /
+	// fan-out path (copyTablePlainParallel / copyTableColdStartIdempotentParallel)
+	// reuses THIS rw across all D workers — they all call w.flushWithReparentRetry
+	// on the same *RowWriter — so setting the gate on rw engages the coordination
+	// for the whole fan-out. (The migrate keyset-chunked path ADDITIONALLY wires
+	// each fresh per-chunk writer in openOneChunkConn.) v0.99.100 wired ONLY the
+	// chunked openOneChunkConn path, so the gate was inert in the sync cold-start /
+	// native concurrent cold-copy path — the Track-D / PlanetScale CDC path — and
+	// the v0.99.101 PS-320-v11 live run proved it: the gate tripped ZERO times
+	// while the writers rode 74 real grow-window retries independently. nil gate
+	// or a non-setter writer ⇒ no-op (pre-ADR-0110 behaviour, byte-for-byte).
+	if parallel != nil {
+		applyGrowGate(rw, parallel.growGate)
+	}
+
 	// Phase 1: tables.
 	if err := markPhase(ctx, rc, state, ir.MigrationPhaseTables); err != nil {
 		// Phase mark is non-fatal; continue with the data work.

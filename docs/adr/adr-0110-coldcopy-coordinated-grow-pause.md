@@ -24,6 +24,22 @@ race. **The `-race` integration gate has NOT been run locally (CGO=0 box); the m
 session must land it through CI's `-race` Integration job before any tag** — this is
 a concurrency chunk.
 
+**Wiring fix (v0.99.102).** v0.99.100 wired the gate onto the writer only in the
+migrate keyset-chunked path (`openOneChunkConn` → `applyGrowGate`). The **sync
+cold-start path** (incl. the native-concurrent W×D cold-copy that Track-D / every
+PlanetScale CDC migration uses) opens ONE top-level writer that the fan-out reuses
+across all D workers, and that writer never had `SetGrowGate` called — so the gate was
+**inert** there (the source-read retry got it via `deps.growGate`, but the write path
+did not). The v0.99.101 PS-320-v11 live run proved it: the gate tripped **zero** times
+while the writers rode **74** real grow-window retries independently. Fix:
+`runBulkCopyPhases` now calls `applyGrowGate(rw, parallel.growGate)` centrally on the
+top-level writer, so every cold-copy path (sync parallel, native-concurrent,
+migrate-nonchunked) engages the coordination; the chunked path keeps its per-chunk
+wiring. Pinned by `TestRunBulkCopyPhases_WiresGrowGateOntoTopLevelWriter` (+ a nil-gate
+no-op pin). The v0.99.100 regression cycle missed this because its no-op Focus tests
+used the migrate `--bulk-parallelism` path (where the wiring existed) and could not
+trigger a live grow to observe the sync path never tripping.
+
 ## Context
 
 A non-Metal PlanetScale MySQL volume auto-grows in steps (12 → 39 → 62 → 214 GB).

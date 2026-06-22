@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.102] - 2026-06-22
+
+### Fixed
+
+- **The ADR-0110 coordinated grow-window pause is now actually wired into the `sync` cold-start path — v0.99.100 engaged it only for `migrate`.** v0.99.100 attached the shared grow-gate to the cold-copy writer only in the migrate keyset-chunked path (`openOneChunkConn`); the `sync` cold-start path — including the native-concurrent W×D cold-copy that every continuous PlanetScale CDC migration (and Track-D) uses — opens one top-level writer that the fan-out reuses across all D workers, and that writer never had the gate attached. The result: in a `sync` run the gate was inert (the source-read retry got it, but the write path did not), so the cold-copy lanes rode a storage grow by independently hammer-retrying the target — exactly the thundering-herd behaviour ADR-0110 exists to replace. The live v0.99.101 validation surfaced it immediately: a fresh PS-320 `sync` cold-copy tripped the grow-gate **zero** times while its writers logged **74** real grow-window retries. The fix wires the gate centrally in `runBulkCopyPhases` (`applyGrowGate(rw, parallel.growGate)`), so every cold-copy path — sync parallel, native-concurrent, and migrate-nonchunked — engages the coordination; the migrate chunked path keeps its existing per-chunk wiring. No behaviour change for an untroubled copy (the gate stays inert until a classified grow-transient or telemetry signal trips it), and a nil gate / non-PlanetScale target is a byte-for-byte no-op. Pinned by a `runBulkCopyPhases` wiring test (the top-level writer receives the gate) plus a nil-gate no-op pin.
+
 ## [0.99.101] - 2026-06-22
 
 ### Fixed
