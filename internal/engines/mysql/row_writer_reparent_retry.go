@@ -42,25 +42,30 @@ import (
 // these are package constants, not config fields, so there is no
 // EnableX-defaulting-true trap (the v0.99.51 lesson) — every
 // construction path (CLI, tests, broker, future callers) gets the same
-// bounds. The envelope is sized to ride a 30–60s reparent comfortably,
-// up to ~2–3 min worst case:
+// bounds. The envelope is sized to ride a MULTI-STEP PlanetScale storage
+// auto-grow (12→39→62→214 GB), where a single big-table grow step can
+// stall the write for several minutes:
 //
 //	100ms → 200ms → 400ms → 800ms → 1.6s → 3.2s → 6.4s → 12.8s →
-//	25.6s → 30s (cap) → 30s → 30s → ...
+//	25.6s → 30s (cap) → 30s → 30s → ... (24×)
 //
-// 12 attempts × max(30s) ≈ up to ~4 min of failure tolerated before a
-// LOUD terminal error — long enough for a managed-Vitess reparent /
-// storage-grow, short enough that a genuinely-wedged target surfaces
-// rather than hiding for hours. Mirrors ADR-0038's 8×30s envelope,
-// stretched slightly because a storage-auto-grow reparent can run longer
-// than a tx-killer blip.
+// 24 attempts × max(30s) ≈ up to ~12 min of backoff (plus each attempt's
+// own stall-until-error, often tens of seconds) ≈ a ~15–20 min envelope
+// tolerated before a LOUD terminal error — long enough for a prolonged
+// storage-grow step, short enough that a genuinely-wedged target still
+// surfaces rather than hiding for hours. The v0.99.98 PS-320-v7 run rode
+// ~23 min of retries across the whole grow but a single `documents`
+// grow-step stall exhausted the prior 12-attempt (~4 min) budget — hence
+// 24. (The DEEPER fix for the underlying contention is the proactive
+// coordinated pause-on-stall / Item-32 telemetry throttle, a follow-up;
+// this bump is the targeted budget fix.)
 //
 // These are package vars (not consts) ONLY so the unit tests can shrink
 // the envelope to keep the suite fast — production NEVER mutates them, so
 // the zero-value-safe-default reasoning is unaffected (there is no config
 // field and no zero-value path; the values are baked at package init).
 var (
-	coldCopyReparentRetryAttemptsVar = 12
+	coldCopyReparentRetryAttemptsVar = 24
 	coldCopyReparentBackoffBaseVar   = 100 * time.Millisecond
 	coldCopyReparentBackoffCapVar    = 30 * time.Second
 )

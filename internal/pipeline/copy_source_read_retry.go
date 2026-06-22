@@ -85,7 +85,9 @@ import (
 // zero-value-safe reasoning is unaffected (there is no config field and no
 // zero-value path; the values are baked at package init).
 var (
-	coldCopySourceReadRetryAttempts = 12
+	// 24 (≈ ~15-20 min envelope) to span a prolonged multi-step storage-grow
+	// stall, matching the write-side coldCopyReparentRetryAttemptsVar (v0.99.99).
+	coldCopySourceReadRetryAttempts = 24
 	coldCopySourceReadBackoffBase   = 100 * time.Millisecond
 	coldCopySourceReadBackoffCap    = 30 * time.Second
 )

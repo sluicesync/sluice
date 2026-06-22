@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.99] - 2026-06-22
+
+### Changed
+
+- **The cold-copy reparent/disk-full retry budget is raised (12→24 attempts, ~4 min → ~15–20 min envelope) so it spans a prolonged multi-step storage-grow stall.** With the full set of storage-auto-grow transient faces now retriable (v0.99.92–v0.99.98), a long PlanetScale validation copy rode ~23 minutes of retries cleanly — but a single big-table grow step (`documents`) stalled the write for longer than the prior 12-attempt (~4 min) per-batch budget, exhausting it and failing loudly mid-grow. The per-batch budget for both the target-write reparent-retry (`flushWithReparentRetry`) and the source-read reconnect-retry is raised to 24 attempts (still 100 ms→30 s exponential backoff, now ~12 min of backoff plus each attempt's own stall-until-error ≈ a ~15–20 min envelope). It remains bounded and loud on exhaustion — a genuinely-wedged or undersized-fixed-storage target still surfaces, just after a longer, grow-appropriate wait. This is the targeted budget fix for a prolonged grow step; the deeper efficiency/robustness lever (a proactive coordinated pause-on-stall and the Item-32-telemetry-driven throttle, which would shorten the stall by not hammering the target with all write lanes during a grow) is a tracked follow-up. The bounds are package-baked constants (no config field, no zero-value trap).
+
 ## [0.99.98] - 2026-06-21
 
 ### Fixed
