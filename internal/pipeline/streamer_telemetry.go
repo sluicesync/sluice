@@ -260,12 +260,12 @@ func evalStorageHeadroomTick(
 // message + the edge-trigger semantics without a live ticker.
 func logStorageHeadroomWarn(ctx context.Context, logger *slog.Logger, streamID string, snap ir.TargetHealthSnapshot) {
 	logger.WarnContext(
-		ctx, "target storage approaching capacity — a resize/reparent may briefly interrupt apply shortly (items 30/33 retry transparently)",
+		ctx, "target storage approaching capacity — a resize/reparent may briefly interrupt the stream shortly (rides through transparently)",
 		slog.String("stream_id", streamID),
 		slog.Float64("storage_util", snap.StorageUtil),
 		slog.Int64("storage_available_bytes", snap.StorageAvailableBytes),
 		slog.Int64("storage_capacity_bytes", snap.StorageCapacityBytes),
 		slog.Float64("high_water", appliercontrol.DefaultTelemetryHighWater),
-		slog.String("hint", "this is anticipation only — sluice does not pause; if a brief apply stall follows it is the resize, and the stream rides through it"),
+		slog.String("hint", "during a cold-copy the grow-gate (ADR-0110) quiesces the copy lanes for this window and resumes when headroom recovers; during steady-state CDC apply the stream rides the resize transparently via the bounded retries. Apply correctness is unaffected either way."),
 	)
 }
