@@ -2,12 +2,28 @@
 
 ## Status
 
-**Proposed (2026-06-22).** Brings the **native vanilla-MySQL** concurrent cold-copy
-path to the resilience parity that [ADR-0072](adr-0072-resumable-coldstart-copy.md)
-gave the **VStream** (PlanetScale/Vitess) cold-start. Roadmap task #96.
-`-race`-before-tag concurrency + **value-fidelity-critical** chunk (the CDC-anchor
-decision is a silent-loss risk if wrong → mandatory value-fidelity review + pinned
-differential tests).
+**Accepted (2026-06-22, implementation landed).** Brings the **native
+vanilla-MySQL** concurrent cold-copy path to the resilience parity that
+[ADR-0072](adr-0072-resumable-coldstart-copy.md) gave the **VStream**
+(PlanetScale/Vitess) cold-start. Roadmap task #96. `-race`-before-tag concurrency
++ **value-fidelity-critical** chunk (the CDC-anchor decision is a silent-loss risk
+if wrong → mandatory value-fidelity review + pinned differential tests).
+
+**Implementation note — scope landed vs. deferred (see Consequences).** The
+**in-process re-snapshot-from-cursor recovery** (§Decision 2–5, the operator's
+core goal: a source-read drop resumes incomplete tables instead of restarting
+from row 0) is implemented, with the §3 CDC-anchor-at-earliest invariant enforced
+in code (a runtime guard + a dedicated unit pin) and the keyed-converge /
+keyless-at-least-once matrix tested. The **control-table PERSISTENCE of the
+per-table cursors** (§Decision 1) — and therefore a PROCESS-restart resume of an
+interrupted native cold-copy — is **deferred** as a value-fidelity-driven scoping
+decision: persisting a mid-cold-copy cursor on the native concurrent path without
+also (a) native `SnapshotStreamResumer` routing and (b) a durable-write watermark
+coupling (the concurrent copy path deliberately wires no durable-progress
+reporter) would let a process crash leave the persisted cursor AHEAD of the
+durably-written rows → a silent gap on restart. The cursors therefore live
+in-memory (sufficient for the in-process recovery, which is the WIN); the
+persistence + process-restart resume is a separable follow-up.
 
 ## Context
 
@@ -101,25 +117,68 @@ native analog of ADR-0072, accounting for the non-re-observable snapshot:
   cold-copy) resumes only the incomplete tables from their cursors instead of re-copying
   everything — eliminating the restart-from-scratch that v13 hit, the operator's core
   goal. Native MySQL reaches ADR-0072 (VStream) parity.
-- **Cost:** per-table cursor checkpointing on the native concurrent path (a bounded
-  control-table write, off the hot path, exactly as ADR-0072); a re-snapshot/resume
-  recovery routine; the CDC-anchor-at-earliest bookkeeping.
-- **Not changed:** the happy-path cold-copy, the consistent-snapshot model on the first
-  pass, the exactly-once CDC contract. Keyed convergence and keyless at-least-once are
-  preserved by construction.
+- **Cost:** in-memory per-table cursor tracking on the native concurrent path; a
+  re-snapshot/resume recovery routine; the CDC-anchor-at-earliest bookkeeping. The
+  keyed happy-path read changes from a single full-scan to a cursor-paginated read
+  (ORDER BY pk, LIMIT N) so a re-snapshot can resume WHERE (pk) > cursor — a small
+  read-side cost for the resumability; keyless tables keep the single full scan.
+- **Implemented (in-process recovery, the WIN):** a source-read drop during a grow
+  (or any transient on a long native-MySQL cold-copy) re-snapshots and resumes only
+  the incomplete tables from their cursors instead of re-copying everything —
+  eliminating the restart-from-scratch that v13 hit. The recovery closes the old
+  snapshot transactions BEFORE acquiring the fresh FTWRL (otherwise the new FTWRL
+  blocks behind the old transactions' metadata locks — observed as a multi-minute
+  stall in the first integration run, then fixed).
+- **DEVIATION — control-table cursor persistence + process-restart resume DEFERRED
+  (value-fidelity-driven).** §Decision 1 specified persisting the per-table cursors
+  to the control table. That is NOT implemented; the cursors live in-memory, used
+  only by the in-process recovery. Reason: the native concurrent copy path
+  deliberately wires NO durable-write progress reporter
+  (`copy_concurrent_tables.go` — "MID-COPY CHECKPOINT DISABLED"), so a persisted
+  cursor could, on a PROCESS crash, sit AHEAD of the durably-written rows → a silent
+  gap on a process-restart resume. Persisting safely would require additionally (a)
+  native `SnapshotStreamResumer` routing (today the vanilla flavor's
+  `PositionCarriesCopyCursor` returns false and `OpenSnapshotStreamFromPosition`
+  refuses — only VStream resumes) and (b) coupling a durable-write watermark to the
+  cursor (the ADR-0072 v0.99.9 breadcrumb machinery). Both are separable, larger
+  changes; shipping persistence without them would REGRESS process-restart to a
+  silent gap. The in-process recovery — the operator's core goal — needs only the
+  in-memory cursor. Follow-up: add the durable-watermark + native resumer to
+  graduate to process-restart parity.
+- **DEVIATION — keyless recovery is at-least-once, not truncate-dedup.** §Decision 4
+  specified TRUNCATE+restart for keyless tables on recovery. The reader cannot
+  truncate the target (that is target knowledge a source reader must not hold), so a
+  keyless table instead re-reads from the start on the fresh snapshot: loss-free,
+  possibly with duplicate rows — exactly the existing keyless at-least-once cold-copy
+  contract (Bug 143; the recovery WARN names it). Making keyless recovery dup-free
+  would need a pipeline-side target-truncate hook; deferred as a refinement.
+- **Not changed:** the happy-path cold-copy correctness, the consistent-snapshot model
+  on the first pass, the exactly-once CDC contract. Keyed convergence (exactly-once)
+  and keyless at-least-once are preserved by construction; the CDC anchor stays at the
+  earliest P (a runtime guard refuses any advance).
 
 ## Validation
 
-- **Unit:** the cursor checkpoint cadence + per-table complete marker; the recovery
-  skip-completed / resume-from-cursor / truncate-keyless decision; the CDC-anchor stays
-  at the original P across a re-snapshot (the silent-loss guard).
-- **Value-fidelity review (mandatory):** re-derive the keyed-converge / keyless-at-least-once
-  matrix; prove anchoring at the earliest position cannot skip a P→P′ change on a
-  completed table.
-- **Integration (`-race`):** inject a classified source-read drop mid-copy on one table
-  of a multi-table native-MySQL→MySQL concurrent copy; assert recovery re-snapshots,
-  skips completed tables, resumes the dropped table from its cursor, anchors CDC at the
-  original position, and converges byte-identically to a clean run (src md5 == dst,
-  0 dups/gaps) — keyed AND keyless variants.
-- **Live:** re-run the PS-320 grow scenario (the v13 setup) and confirm a source-read
-  drop during the grow resumes-from-cursor instead of restarting from scratch.
+- **Unit (landed):** the per-table cursor + complete-marker tracking; the recovery
+  skip-completed / resume-keyed-from-cursor / restart-keyless decision; the orderable-PK
+  family matrix (every PK type family, the Bug-74 discipline — a missed family would
+  route a resumable keyed table to the lossy keyless restart); the bounded backoff; the
+  no-resnapshot-wired-is-terminal and binlog-purged-falls-back guards; and **the
+  dedicated CDC-anchor-stays-at-P silent-loss guard** (`TestVerifyCDCAnchorUnchanged` +
+  `TestConcurrentReader_AnchorNeverMutatesUnderRecovery`).
+- **Integration (landed; `-race` is the CI gate — see below):** inject a CLASSIFIED
+  source-read drop mid-copy on one table of a multi-table native-MySQL concurrent copy;
+  assert the genuine recovery (real FTWRL re-snapshot on the container) resumes the
+  dropped KEYED table from its PK cursor and converges to the exact source id set (no
+  gap, no dup), anchors CDC at the ORIGINAL position, and a post-snapshot insert still
+  surfaces on CDC from that anchor; a KEYLESS variant re-reads from start (at-least-once,
+  every source value present). `TestNativeConcurrentResume_KeyedFromCursor` /
+  `TestNativeConcurrentResume_KeylessAtLeastOnce`.
+- **`-race` (CI-only, REQUIRED before tag):** this chunk is concurrency-touching
+  (swappable connection set under connMu, peer-coalesced recovery under recoveryMu, the
+  abandon-old-conns-while-peers-read window). The local box is CGO=0 so `-race` cannot
+  run here; the main session must land it through CI's `-race` Integration job before any
+  tag.
+- **Live (pending main session):** re-run the PS-320 grow scenario (the v13 setup) and
+  confirm a source-read drop during the grow resumes-from-cursor instead of restarting
+  from scratch.

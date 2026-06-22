@@ -49,6 +49,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"sync"
 
 	gomysql "github.com/go-sql-driver/mysql"
 
@@ -119,99 +120,27 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 		return nil, err
 	}
 
-	// Pin connection 0 and acquire the global write freeze on it. The lock
-	// is held across ALL N START TRANSACTION calls AND the position read, so
-	// every snapshot pins the same logical cut (ADR-0101 §2, silent-loss
-	// guard #1).
-	conn0, err := db.Conn(ctx)
+	// Acquire the consistent N-snapshot (FTWRL → N pinned CONSISTENT SNAPSHOT
+	// conns → record ONE binlog position P → UNLOCK). Extracted so the
+	// ADR-0111 re-snapshot recovery re-runs the EXACT same sequence on a fresh
+	// pool. errFTWRLUnavailable is the no-RELOAD signal → fall back to the
+	// SERIAL single-snapshot path (LOUD WARN, ADR-0101 §4); any other error
+	// already cleaned up the pool inside the helper.
+	conns, file, pos, serverUUID, err := acquireConsistentSnapshot(ctx, db, n)
 	if err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("mysql: snapshot(concurrent): pin conn 0: %w", err)
-	}
-	if _, err := conn0.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
-		_ = conn0.Close()
-		_ = db.Close()
-		return nil, fmt.Errorf("mysql: snapshot(concurrent): set isolation: %w", err)
-	}
-
-	// FTWRL is the consistency lynchpin. If it fails (no RELOAD privilege,
-	// or a managed MySQL that blocks it), we MUST NOT proceed with N
-	// independent snapshots (silent-inconsistency class). Fall back to the
-	// SERIAL single-snapshot path — consistent by construction, concurrency
-	// disabled — with a loud WARN. (ADR-0101 §4.)
-	if _, err := conn0.ExecContext(ctx, "FLUSH TABLES WITH READ LOCK"); err != nil {
-		slog.WarnContext(ctx,
-			"mysql: snapshot(concurrent): FLUSH TABLES WITH READ LOCK failed; "+
-				"falling back to the SERIAL single-snapshot cold-copy — cross-table "+
-				"concurrency DISABLED, consistency preserved. Grant RELOAD to the "+
-				"source user to enable copy_table_parallelism>1.",
-			slog.Int("requested_parallelism", n),
-			slog.String("error", err.Error()))
-		_ = conn0.Close()
-		_ = db.Close()
-		return e.openBinlogSnapshotStreamShared(ctx, dsn, false)
-	}
-
-	// From here the FTWRL is HELD. Every failure path before UNLOCK must
-	// release it (and close conn0 + db). conns accumulates the pinned reader
-	// connections (conn0 first) so a partway failure unwinds all of them.
-	conns := []*sql.Conn{conn0}
-	failUnlock := func(wrap error) (*ir.SnapshotStream, error) {
-		// Release the lock on conn0 (still open), then close every pinned
-		// conn and the pool. Best-effort on the cleanup; return the
-		// triggering error.
-		_, _ = conn0.ExecContext(context.Background(), "UNLOCK TABLES")
-		for _, c := range conns {
-			_ = c.Close()
+		if errors.Is(err, errFTWRLUnavailable) {
+			slog.WarnContext(ctx,
+				"mysql: snapshot(concurrent): FLUSH TABLES WITH READ LOCK failed; "+
+					"falling back to the SERIAL single-snapshot cold-copy — cross-table "+
+					"concurrency DISABLED, consistency preserved. Grant RELOAD to the "+
+					"source user to enable copy_table_parallelism>1.",
+				slog.Int("requested_parallelism", n),
+				slog.String("error", err.Error()))
+			_ = db.Close()
+			return e.openBinlogSnapshotStreamShared(ctx, dsn, false)
 		}
 		_ = db.Close()
-		return nil, wrap
-	}
-
-	// conn0's own snapshot transaction.
-	if _, err := conn0.ExecContext(ctx, "START TRANSACTION WITH CONSISTENT SNAPSHOT"); err != nil {
-		return failUnlock(fmt.Errorf("mysql: snapshot(concurrent): start tx (reader 0): %w", err))
-	}
-
-	// Open the remaining N-1 reader connections + their snapshot
-	// transactions, all while the FTWRL is held — so they pin the SAME cut.
-	for i := 1; i < n; i++ {
-		c, err := db.Conn(ctx)
-		if err != nil {
-			return failUnlock(fmt.Errorf("mysql: snapshot(concurrent): pin conn %d: %w", i, err))
-		}
-		conns = append(conns, c)
-		if _, err := c.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
-			return failUnlock(fmt.Errorf("mysql: snapshot(concurrent): set isolation (reader %d): %w", i, err))
-		}
-		if _, err := c.ExecContext(ctx, "START TRANSACTION WITH CONSISTENT SNAPSHOT"); err != nil {
-			return failUnlock(fmt.Errorf("mysql: snapshot(concurrent): start tx (reader %d): %w", i, err))
-		}
-	}
-
-	// Record the ONE binlog position inside the lock, on conn0's snapshot
-	// transaction — the single CDC-resume anchor every reader shares
-	// (ADR-0101 §2 step 3, silent-loss guard #3).
-	file, pos, err := snapshotMasterStatus(ctx, conn0)
-	if err != nil {
-		return failUnlock(fmt.Errorf("mysql: snapshot(concurrent): capture position: %w", err))
-	}
-
-	// Release the write freeze — both the snapshot views (all N) and the
-	// binlog position are captured. The open transactions keep their views
-	// alive for the per-group COPY reads that follow.
-	if _, err := conn0.ExecContext(ctx, "UNLOCK TABLES"); err != nil {
-		// UNLOCK failed but the snapshots + position are already captured.
-		// Treat as fatal (a stuck global lock would block the source) and
-		// unwind everything — but the UNLOCK we issue in failUnlock is a
-		// best-effort retry.
-		return failUnlock(fmt.Errorf("mysql: snapshot(concurrent): unlock tables: %w", err))
-	}
-
-	// Instance identity (Track 1c floor) — non-fatal on failure.
-	var serverUUID string
-	if err := conn0.QueryRowContext(ctx, "SELECT @@global.server_uuid").Scan(&serverUUID); err != nil {
-		serverUUID = ""
+		return nil, err
 	}
 
 	// Paired CDC reader (separate connection + binlog-dump protocol), same
@@ -227,12 +156,16 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 		return nil, fmt.Errorf("mysql: snapshot(concurrent): build cdc reader: %w", err)
 	}
 
-	position, err := encodeBinlogPos(binlogPos{
+	// The ORIGINAL CDC anchor P. It is stamped onto stream.Position here and
+	// recorded on the reader; the ADR-0111 re-snapshot recovery NEVER advances
+	// it (the value-fidelity invariant). CopyCursors is empty at open.
+	anchor := binlogPos{
 		Mode:       positionModeFilePos,
 		File:       file,
 		Pos:        pos,
 		ServerUUID: serverUUID,
-	})
+	}
+	position, err := encodeBinlogPos(anchor)
 	if err != nil {
 		_ = cdcReader.(closer).Close()
 		for _, c := range conns {
@@ -257,6 +190,34 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 	// time; the n goroutines run n SELECTs across n DISTINCT connections.
 	rows := newConcurrentBinlogRows(conns, groups, cfg.DBName, db)
 
+	// ADR-0111: record the original anchor + wire the re-snapshot recovery so a
+	// classified source-read drop resumes incomplete tables from their cursors
+	// instead of restarting the whole copy from row 0. The resnapshot closure
+	// re-runs the EXACT FTWRL→N-CONSISTENT-SNAPSHOT→position→UNLOCK sequence on
+	// a FRESH pool (a dropped connection's read-view cannot be recreated), and
+	// hands the fresh conns back to the reader. It captures dsn/n only — never
+	// the anchor — so it cannot accidentally advance P.
+	rows.anchor = anchor
+	rows.anchorToken = position.Token
+	rows.anchorSet = true
+	rows.resnapshot = func(rctx context.Context) ([]*sql.Conn, *sql.DB, string, uint32, error) {
+		rcfg, perr := parseDSN(dsn)
+		if perr != nil {
+			return nil, nil, "", 0, perr
+		}
+		applySourceReadSessionTimeouts(rcfg)
+		rdb, derr := openDB(rctx, rcfg)
+		if derr != nil {
+			return nil, nil, "", 0, derr
+		}
+		rconns, rfile, rpos, _, aerr := acquireConsistentSnapshot(rctx, rdb, n)
+		if aerr != nil {
+			_ = rdb.Close()
+			return nil, nil, "", 0, aerr
+		}
+		return rconns, rdb, rfile, rpos, nil
+	}
+
 	// Honest connection-budget surfacing (no false auto-clamp — ADR-0101 §5 /
 	// ADR-0102 §3). readers = W = the cross-table reader pipelines; each fans
 	// its active table across D = --copy-fanout-degree plain-INSERT writers
@@ -275,28 +236,17 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 	}
 
 	// Lifecycle: COMMIT + close all N pinned connections + the pool, once,
-	// first-error-wins (ADR-0101 §8). Same shape as the single-reader
-	// releaseRows, scaled to N. The FTWRL is already released by now (held
-	// only during open).
+	// first-error-wins (ADR-0101 §8). It closes the reader's CURRENT connection
+	// set — after an ADR-0111 re-snapshot recovery those are the FRESH P′ conns
+	// (the recovery already closed the dropped originals), so the lifecycle
+	// always cleans up whatever the reader holds NOW, not the open-time pool.
 	released := false
 	releaseRows := func() error {
 		if released {
 			return nil
 		}
 		released = true
-		var firstErr error
-		for _, c := range conns {
-			if _, err := c.ExecContext(context.Background(), "COMMIT"); err != nil && firstErr == nil {
-				firstErr = err
-			}
-			if err := c.Close(); err != nil && firstErr == nil {
-				firstErr = err
-			}
-		}
-		if err := db.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-		return firstErr
+		return rows.commitAndCloseConns()
 	}
 	stream.ReleaseRowsFn = releaseRows
 	stream.CloseFn = func() error {
@@ -312,6 +262,89 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 		return firstErr
 	}
 	return stream, nil
+}
+
+// errFTWRLUnavailable signals that FLUSH TABLES WITH READ LOCK failed (no
+// RELOAD privilege, or a managed MySQL that blocks it). The INITIAL open maps
+// it to the SERIAL single-snapshot fallback (ADR-0101 §4); the ADR-0111
+// recovery treats it as a non-transient terminal failure (the source's
+// FTWRL capability won't appear mid-run, so retrying is pointless).
+var errFTWRLUnavailable = errors.New("mysql: snapshot(concurrent): FLUSH TABLES WITH READ LOCK unavailable")
+
+// acquireConsistentSnapshot runs the consistency-lynchpin sequence on db:
+// FTWRL → N pinned REPEATABLE-READ CONSISTENT SNAPSHOT connections → record
+// ONE binlog position (file, pos) → UNLOCK → read @@server_uuid. All N
+// snapshots pin the SAME cut because the FTWRL is held across every START
+// TRANSACTION and the position read (ADR-0101 §2). It is the ONE place this
+// sequence lives so the initial open AND the ADR-0111 re-snapshot recovery
+// run byte-identical logic on their respective pools.
+//
+// On FTWRL failure it returns errFTWRLUnavailable (and cleans up). On any
+// other failure before UNLOCK it releases the lock + closes the pinned conns
+// (NOT db — the caller owns the pool) and returns the wrapped error. On
+// success the N pinned connections are live (each in its consistent-snapshot
+// transaction) and the caller owns their lifecycle.
+func acquireConsistentSnapshot(ctx context.Context, db *sql.DB, n int) (conns []*sql.Conn, file string, pos uint32, serverUUID string, err error) {
+	conn0, err := db.Conn(ctx)
+	if err != nil {
+		return nil, "", 0, "", fmt.Errorf("mysql: snapshot(concurrent): pin conn 0: %w", err)
+	}
+	if _, err := conn0.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
+		_ = conn0.Close()
+		return nil, "", 0, "", fmt.Errorf("mysql: snapshot(concurrent): set isolation: %w", err)
+	}
+	// FTWRL is the consistency lynchpin — never proceed with N independent
+	// snapshots if it fails (silent-inconsistency class, ADR-0101 §4).
+	if _, err := conn0.ExecContext(ctx, "FLUSH TABLES WITH READ LOCK"); err != nil {
+		_ = conn0.Close()
+		return nil, "", 0, "", fmt.Errorf("%w: %w", errFTWRLUnavailable, err)
+	}
+
+	// From here the FTWRL is HELD. Every failure path before UNLOCK releases it
+	// and closes the pinned conns accumulated so far.
+	conns = []*sql.Conn{conn0}
+	failUnlock := func(wrap error) ([]*sql.Conn, string, uint32, string, error) {
+		_, _ = conn0.ExecContext(context.Background(), "UNLOCK TABLES")
+		for _, c := range conns {
+			_ = c.Close()
+		}
+		return nil, "", 0, "", wrap
+	}
+
+	if _, err := conn0.ExecContext(ctx, "START TRANSACTION WITH CONSISTENT SNAPSHOT"); err != nil {
+		return failUnlock(fmt.Errorf("mysql: snapshot(concurrent): start tx (reader 0): %w", err))
+	}
+	// Open the remaining N-1 reader connections + their snapshot transactions
+	// while the FTWRL is held — so they pin the SAME cut.
+	for i := 1; i < n; i++ {
+		c, err := db.Conn(ctx)
+		if err != nil {
+			return failUnlock(fmt.Errorf("mysql: snapshot(concurrent): pin conn %d: %w", i, err))
+		}
+		conns = append(conns, c)
+		if _, err := c.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
+			return failUnlock(fmt.Errorf("mysql: snapshot(concurrent): set isolation (reader %d): %w", i, err))
+		}
+		if _, err := c.ExecContext(ctx, "START TRANSACTION WITH CONSISTENT SNAPSHOT"); err != nil {
+			return failUnlock(fmt.Errorf("mysql: snapshot(concurrent): start tx (reader %d): %w", i, err))
+		}
+	}
+
+	// Record the ONE binlog position inside the lock — the single CDC-resume
+	// anchor every reader shares (ADR-0101 §2 step 3).
+	file, pos, err = snapshotMasterStatus(ctx, conn0)
+	if err != nil {
+		return failUnlock(fmt.Errorf("mysql: snapshot(concurrent): capture position: %w", err))
+	}
+	// Release the write freeze — snapshot views + position are captured.
+	if _, err := conn0.ExecContext(ctx, "UNLOCK TABLES"); err != nil {
+		return failUnlock(fmt.Errorf("mysql: snapshot(concurrent): unlock tables: %w", err))
+	}
+	// Instance identity (Track 1c floor) — non-fatal on failure.
+	if uerr := conn0.QueryRowContext(ctx, "SELECT @@global.server_uuid").Scan(&serverUUID); uerr != nil {
+		serverUUID = ""
+	}
+	return conns, file, pos, serverUUID, nil
 }
 
 // concurrentBinlogRows is the multi-snapshot RowReader (ADR-0101 §6): it
@@ -339,15 +372,25 @@ var (
 )
 
 type concurrentBinlogRows struct {
-	// byTable maps an unqualified table name to the inner RowReader (one per
-	// pinned connection) that owns its group. Built once at open from the
-	// disjoint partition; read-only thereafter, so concurrent ReadRows from
-	// the W consumer goroutines need no lock to look up their reader.
-	byTable map[string]*RowReader
+	// connMu guards the SWAPPABLE inner-connection set (byTable, readers,
+	// metaDB) against the ADR-0111 re-snapshot-from-cursor recovery, which
+	// replaces all three under it. The copy path reads via pickReader (RLock);
+	// recovery writes via swapConnections (Lock) — so a read never observes a
+	// half-swapped connection set.
+	connMu sync.RWMutex
 
-	// readers is the N inner RowReaders (one per connection), kept for
-	// Close. Each wraps one *sql.Conn (snapshot mode: closer nil — the
-	// SnapshotStream owns the lifecycle, mirroring the single-reader path).
+	// byTable maps an unqualified table name to the inner RowReader owning its
+	// group; byTableIdx maps it to that group's INDEX (so the resumable read
+	// can re-resolve the owner after a swap, where the *RowReader pointers
+	// change but the index is stable). Built at open from the disjoint
+	// partition; rebuilt onto the fresh snapshot by the ADR-0111 recovery.
+	byTable    map[string]*RowReader
+	byTableIdx map[string]int
+
+	// readers is the N inner RowReaders (one per connection), kept for Close,
+	// the work-stealing ReadRowsOn, and pickReader. Each wraps one *sql.Conn
+	// (snapshot mode: closer nil — the SnapshotStream owns the lifecycle).
+	// Swapped by the ADR-0111 recovery (guarded by connMu).
 	readers []*RowReader
 
 	// groups is the disjoint table partition surfaced via
@@ -364,18 +407,59 @@ type concurrentBinlogRows struct {
 	// The estimate is catalog metadata — it does not need the snapshot — so a
 	// non-snapshot pooled connection is both correct and collision-free. The
 	// pool has no MaxOpenConns cap (openDB), so this never starves behind the
-	// N pinned connections.
+	// N pinned connections. Swapped by the recovery (guarded by connMu).
 	metaDB *sql.DB
 	dbName string
+
+	// --- ADR-0111 resumable cold-copy state (see cdc_snapshot_concurrent_resume.go) ---
+
+	// anchor is the ORIGINAL CDC anchor P recorded at open (file/pos + uuid),
+	// and anchorToken is its encoded token. The re-snapshot recovery NEVER
+	// advances either (the ADR-0111 §3 value-fidelity invariant); the recovery
+	// re-encodes anchor and asserts it still equals anchorToken as a runtime
+	// guard against an accidental advance.
+	anchor      binlogPos
+	anchorToken string
+	anchorSet   bool
+
+	// resnapshot re-establishes a fresh consistent N-snapshot at P′ for the
+	// recovery. Supplied by the opener; nil disables recovery (a drop becomes
+	// terminal, never a silent wrong-point read).
+	resnapshot resnapshotFn
+
+	// cursMu guards the IN-MEMORY per-table cursor map (NOT persisted — see the
+	// ADR-0111 scope note in cdc_snapshot_concurrent_resume.go). Distinct from
+	// connMu so a cursor update on the row path never blocks (or is blocked by)
+	// a connection swap.
+	cursMu  sync.Mutex
+	cursors map[string]*tableCursor
+
+	// recoveryMu serialises the re-snapshot recovery across the W concurrent
+	// read pipelines; recoveryGen / lastObservedGen coalesce peers so only the
+	// first pipeline of a drop generation re-snapshots (peers observe the
+	// advanced generation and resume).
+	recoveryMu      sync.Mutex
+	recoveryGen     int
+	lastObservedGen int
+
+	// errMu / err is the reader's OWN sticky error (the resumable path owns
+	// error reporting now; the inner readers' errors are consumed inside the
+	// per-table read). Mirrors RowReader.Err's contract for the orchestrator's
+	// post-drain check.
+	errMu sync.Mutex
+	err   error
 }
 
 // newConcurrentBinlogRows builds the router from the N pinned connections
 // and their disjoint groups. conns[i] serves groups[i]; len(conns) ==
 // len(groups). dbName is the source database (the single-database snapshot
-// path; reads are unqualified, byte-identical to the serial reader).
+// path; reads are unqualified, byte-identical to the serial reader). The
+// ADR-0111 resumable state (anchor, resnapshot fn) is attached by the opener
+// after construction.
 func newConcurrentBinlogRows(conns []*sql.Conn, groups [][]string, dbName string, metaDB *sql.DB) *concurrentBinlogRows {
 	readers := make([]*RowReader, len(conns))
 	byTable := make(map[string]*RowReader)
+	byTableIdx := make(map[string]int)
 	for i, c := range conns {
 		rr := &RowReader{
 			q:      c,
@@ -390,16 +474,33 @@ func newConcurrentBinlogRows(conns []*sql.Conn, groups [][]string, dbName string
 		if i < len(groups) {
 			for _, t := range groups[i] {
 				byTable[t] = rr
+				byTableIdx[t] = i
 			}
 		}
 	}
 	return &concurrentBinlogRows{
-		byTable: byTable,
-		readers: readers,
-		groups:  groups,
-		metaDB:  metaDB,
-		dbName:  dbName,
+		byTable:    byTable,
+		byTableIdx: byTableIdx,
+		readers:    readers,
+		groups:     groups,
+		metaDB:     metaDB,
+		dbName:     dbName,
+		cursors:    make(map[string]*tableCursor),
 	}
+}
+
+// setErr records the reader's sticky error (first-wins is not enforced — the
+// last classified terminal error is the one the orchestrator surfaces, which
+// matches RowReader.setErr). Safe to call from the per-table read goroutines.
+func (r *concurrentBinlogRows) setErr(err error) {
+	if err == nil {
+		return
+	}
+	r.errMu.Lock()
+	if r.err == nil {
+		r.err = err
+	}
+	r.errMu.Unlock()
 }
 
 // ReadRows dispatches the table to the inner reader (pinned connection)
@@ -412,7 +513,7 @@ func (r *concurrentBinlogRows) ReadRows(ctx context.Context, table *ir.Table) (<
 	if table == nil {
 		return nil, errors.New("mysql: concurrent ReadRows: table is nil")
 	}
-	rr, ok := r.byTable[table.Name]
+	idx, ok := r.byTableIdx[table.Name]
 	if !ok {
 		return nil, fmt.Errorf(
 			"mysql: concurrent ReadRows: table %q is not in the concurrent-copy partition "+
@@ -420,7 +521,11 @@ func (r *concurrentBinlogRows) ReadRows(ctx context.Context, table *ir.Table) (<
 			table.Name,
 		)
 	}
-	return rr.ReadRows(ctx, table)
+	// ADR-0111: read through the resumable wrapper, pinned to the table's
+	// statically-assigned group connection (idx). The wrapper rides out a
+	// classified source-read drop via re-snapshot-from-cursor recovery,
+	// producing ONE continuous channel; the CDC anchor stays at the original P.
+	return r.readResumable(ctx, table, idx)
 }
 
 // ConcurrentCopyGroups returns the disjoint table partition the cold-start
@@ -461,7 +566,10 @@ func (r *concurrentBinlogRows) ReadRowsOn(ctx context.Context, table *ir.Table, 
 			reader, len(r.readers),
 		)
 	}
-	return r.readers[reader].ReadRows(ctx, table)
+	// ADR-0111: read through the resumable wrapper, pinned to the requested
+	// connection index. After a re-snapshot the index still selects a valid
+	// fresh connection (the reader count is preserved across recovery).
+	return r.readResumable(ctx, table, reader)
 }
 
 // CountRows implements [ir.RowCounter] so the progress ticker gets a per-table
@@ -503,15 +611,16 @@ func (r *concurrentBinlogRows) Close() error {
 	return firstErr
 }
 
-// Err returns the first error across the inner readers (sticky, valid after
-// the channels drain). Mirrors RowReader.Err for the orchestrator's
-// post-drain error check; each inner reader tracks its own table's scan
-// error, so the first non-nil across them is the copy's failure cause.
+// Err returns the reader's sticky error (valid after the channels drain).
+// Mirrors RowReader.Err for the orchestrator's post-drain check. ADR-0111:
+// the resumable read path (readResumable) owns error reporting now — it
+// consumes each inner read's error inside the per-table loop, rides out the
+// classified-drop class via re-snapshot recovery, and records only a TERMINAL
+// failure here (a real decode/query fault, or recovery exhaustion / binlog
+// purge). So a transient that recovery absorbed never surfaces, while a true
+// terminal cause does.
 func (r *concurrentBinlogRows) Err() error {
-	for _, rr := range r.readers {
-		if err := rr.Err(); err != nil {
-			return err
-		}
-	}
-	return nil
+	r.errMu.Lock()
+	defer r.errMu.Unlock()
+	return r.err
 }
