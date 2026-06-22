@@ -4,6 +4,13 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.105] - 2026-06-22
+
+### Fixed
+
+- **A proactively-tripped grow-gate now quiet-cycles its lanes back to work instead of parking them for the whole max-hold — the v14 live finding.** ADR-0110's first cut held a *proactive* (telemetry-tripped) pause until either storage headroom `recovered()` or the 20-minute max-hold backstop expired; a *signal-driven* pause, by contrast, reopened as soon as a backoff cycle passed quietly. The v0.99.104 v14 PS-320 validation proved that asymmetry backfires: the proactive trip fired correctly at util=0.859, but the `volume_available_bytes`/`volume_capacity_bytes` gauges swing wildly and transiently vanish across the reparent (the 62 GB volume read 85.9% one moment and a 1.66 TB volume at ~0% the next, with the series absent in between), so `recovered()` could not confirm the grow had finished exactly when it mattered — and the gate rode a flat, zero-progress 20-minute max-hold on every reparent, strictly worse than the reactive cycling it was meant to improve on (which makes incremental progress each ~30 s window). The reopen path is now unified: **every** pause — proactive or signal-driven — quiet-cycles open as soon as a backoff cycle elapses with no re-trip (the lanes resume and probe; if the target is still bad the next transient re-trips a fresh, longer-backed-off window). `recovered()` is retained purely as an *accelerator* that reopens earlier when the telemetry signal is trustworthy, and max-hold remains the backstop. A proactive trip is thus a brief anticipatory pause that hands off to the proven reactive cycling, never a hold for the entire grow. Pinned by a new test that holds `recovered()` false with a far-off max-hold and asserts the gate still reopens promptly via the quiet cycle, plus an updated recovery test that hammers re-trips to isolate `recovered()` as the genuine early-reopen path.
+- **Corrected the storage-headroom WARN hint, which wrongly told operators "sluice does not pause."** Since ADR-0110 the cold-copy phase *does* coordinate a lane quiesce across a storage-grow window, and steady-state CDC apply rides the resize via the bounded retries; the hint now states this accurately ("during a cold-copy the grow-gate quiesces the copy lanes for this window and resumes when headroom recovers; during steady-state CDC apply the stream rides the resize transparently via the bounded retries — apply correctness is unaffected either way"). Text-only; no behaviour change.
+
 ## [0.99.104] - 2026-06-22
 
 ### Fixed
