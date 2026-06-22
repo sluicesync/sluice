@@ -774,6 +774,14 @@ func (s *Streamer) phaseStartApplySidecars(applyCtx context.Context, applier ir.
 	// the opened applier and the provider are both in scope. Advisory only —
 	// every error is logged at WARN and swallowed.
 	s.startTargetMetricsHistoryRecorder(applyCtx, streamID, applier, s.TargetTelemetry)
+
+	// ADR-0107 item 36: sync-scoped target-metrics threshold ALERTER. When a
+	// telemetry provider is wired AND the operator configured at least one
+	// notification sink + threshold, a slow-tick sidecar fires edge-triggered,
+	// cooldown'd alerts to the sinks (generic webhook + Slack). No provider /
+	// no sink / no rule ⇒ no goroutine. Observability only — a dead sink is
+	// logged-and-swallowed, never able to stall or crash the stream.
+	s.startTargetMetricsNotifier(applyCtx, streamID, applier, s.TargetTelemetry, s.buildMetricsNotifier())
 	return liveFilter
 }
 

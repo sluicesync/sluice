@@ -731,6 +731,19 @@ type SyncStartCmd struct {
 
 	SuppressTargetMetricsHistory bool `help:"Disable persisting polled PlanetScale target-health metrics to the sluice_target_metrics_history table on the target (ADR-0107 item 35). Only relevant when --planet-scale-org telemetry is configured; recording is on by default then. The rolling history lets 'sluice diagnose' show the recent CPU/mem/storage/lag/conn trend without scripting the metrics API; the table is bounded (7-day retention, pruned). Recording is advisory and failure-isolated — it never affects the sync."`
 
+	// ADR-0107 item 36 — sync-scoped target-metrics threshold ALERTER. Opt-in,
+	// only active with --planetscale-org telemetry; advisory (never affects the
+	// sync); credential-gated (sink URLs via env); failure-isolated (a dead sink
+	// is logged-and-swallowed). A rule with threshold 0 is inert.
+	NotifyWebhook             string        `help:"Generic webhook URL to POST target-metrics threshold alerts to as JSON (ADR-0107 item 36). Opt-in; only active with --planetscale-org telemetry AND at least one --notify-*-util/--notify-lag-seconds/--notify-storage-growth-per-min threshold set. ADVISORY — never affects the sync; a dead sink is logged-and-swallowed. A credential (set via the env var, not the command line)." env:"SLUICE_NOTIFY_WEBHOOK" placeholder:"URL"`
+	NotifySlack               string        `help:"Slack incoming-webhook URL to POST target-metrics threshold alerts to (ADR-0107 item 36). Same gating + advisory + failure-isolated semantics as --notify-webhook. A credential (set via the env var)." env:"SLUICE_NOTIFY_SLACK" placeholder:"URL"`
+	NotifyStorageUtil         float64       `help:"Alert when the target's storage utilisation (used/capacity, 0-1) is at or above this fraction (ADR-0107 item 36). 0 (default) disables the rule. Edge-triggered + cooldown'd. Requires --planetscale-org telemetry + a --notify-webhook/--notify-slack sink." placeholder:"FRAC"`
+	NotifyCPUUtil             float64       `help:"Alert when the target's CPU utilisation (0-1) is at or above this fraction (ADR-0107 item 36). 0 disables. Same gating as --notify-storage-util." placeholder:"FRAC"`
+	NotifyMemUtil             float64       `help:"Alert when the target's memory utilisation (0-1) is at or above this fraction (ADR-0107 item 36). 0 disables. Same gating as --notify-storage-util." placeholder:"FRAC"`
+	NotifyLagSeconds          float64       `help:"Alert when the target's replica lag (seconds) is at or above this value (ADR-0107 item 36). 0 disables. Same gating as --notify-storage-util." placeholder:"SECONDS"`
+	NotifyStorageGrowthPerMin float64       `help:"Alert when the target's storage utilisation is CLIMBING at or above this fraction-of-capacity per minute (ADR-0107 item 36) — a pre-grow early warning. e.g. 0.02 = +2%/min. 0 disables. Same gating as --notify-storage-util." placeholder:"FRAC_PER_MIN"`
+	NotifyCooldown            time.Duration `help:"Minimum interval between re-fires of a STILL-breached target-metrics alert (ADR-0107 item 36). A sustained breach reminds at most once per this interval rather than every poll. Default 15m." default:"15m" placeholder:"DUR"`
+
 	HeartbeatInterval time.Duration `help:"Wall-clock cadence the per-stream heartbeat goroutine logs an INFO 'stream: heartbeat' line at. GitHub #23 Phase A: distinguishes silent-stall (process alive but no apply, no log) from wedge (process alive, no heartbeat either). 0 disables." default:"60s" placeholder:"DUR"`
 
 	PollInterval time.Duration `help:"Override the CDC reader's poll cadence for poll-based engines (today: postgres-trigger; default 1s). Push-based engines (postgres pgoutput, mysql binlog, planetscale VStream) silently ignore — they have no poll loop. Operators chasing lower CDC latency on a write-heavy postgres-trigger stream tighten this to e.g. 250ms; operators trading latency for source load loosen to 5s. 0 (the default) keeps the engine's built-in cadence. ADR-0066 §6; roadmap item 18(c)." placeholder:"DUR"`
@@ -1306,8 +1319,18 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		TargetTelemetry: telemetryProviderOrNil(telemetryProvider),
 		// ADR-0107 item 35: opt-out (zero value = record when telemetry wired).
 		SuppressTargetMetricsHistory: s.SuppressTargetMetricsHistory,
-		HeartbeatInterval:            s.HeartbeatInterval,
-		PollInterval:                 s.PollInterval,
+		// ADR-0107 item 36: sync-scoped threshold alerter (opt-in; inert unless
+		// a sink URL + a threshold are set AND telemetry is wired).
+		NotifyWebhookURL:          s.NotifyWebhook,
+		NotifySlackWebhookURL:     s.NotifySlack,
+		NotifyStorageUtil:         s.NotifyStorageUtil,
+		NotifyCPUUtil:             s.NotifyCPUUtil,
+		NotifyMemUtil:             s.NotifyMemUtil,
+		NotifyLagSeconds:          s.NotifyLagSeconds,
+		NotifyStorageGrowthPerMin: s.NotifyStorageGrowthPerMin,
+		NotifyCooldown:            s.NotifyCooldown,
+		HeartbeatInterval:         s.HeartbeatInterval,
+		PollInterval:              s.PollInterval,
 
 		SourceHeartbeatInterval:    s.SourceHeartbeatInterval,
 		SourceHeartbeatPruneWindow: s.SourceHeartbeatPruneWindow,

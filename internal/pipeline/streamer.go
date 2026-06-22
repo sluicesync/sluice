@@ -412,6 +412,30 @@ type Streamer struct {
 	// construction (the CLI) that does wire telemetry.
 	SuppressTargetMetricsHistory bool
 
+	// ADR-0107 item 36 — the sync-scoped target-metrics threshold ALERTER.
+	// When a telemetry provider is wired AND at least one sink URL is set,
+	// a sidecar evaluates these thresholds against the polled snapshot and
+	// fires edge-triggered, cooldown'd notifications to the configured sinks.
+	// All zero ⇒ INERT (opt-in): the alerter only runs when an operator
+	// supplies a sink URL AND at least one threshold, so the zero value is
+	// the safe default for every construction (no zero-value trap — the
+	// feature is gated on a non-empty URL, not on a bool defaulting true).
+	// Observability only — failure-isolated, never on the value path.
+	//
+	// The URLs are credentials (set via env at the CLI). A threshold of 0
+	// leaves its rule inert. NotifyStorageGrowthPerMin is the storage
+	// rate-of-change rule, expressed as a FRACTION-of-capacity per minute
+	// (e.g. 0.02 = storage util climbing 2%/min) so the threshold is
+	// capacity-relative; inert at 0.
+	NotifyWebhookURL          string
+	NotifySlackWebhookURL     string
+	NotifyStorageUtil         float64
+	NotifyCPUUtil             float64
+	NotifyMemUtil             float64
+	NotifyLagSeconds          float64
+	NotifyStorageGrowthPerMin float64
+	NotifyCooldown            time.Duration
+
 	// MaxBufferBytes is the soft upper bound on per-batch buffered
 	// memory in the CDC applier (and, on the cold-start branch, the
 	// bulk-copy writer). Each in-flight target transaction tracks
