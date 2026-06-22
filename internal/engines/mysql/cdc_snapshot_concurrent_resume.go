@@ -249,6 +249,13 @@ func (r *concurrentBinlogRows) streamResumable(ctx context.Context, table *ir.Ta
 			return
 		}
 
+		// Capture the recovery generation this read attempt runs against,
+		// BEFORE the read. If the read drops and a PEER re-snapshotted in the
+		// meantime, recoveryGen will have advanced past observedGen and
+		// recoverFromDrop coalesces (this lane resumes on the swapped conns
+		// instead of doing its own redundant FTWRL re-snapshot).
+		observedGen := r.currentRecoveryGen()
+
 		err := r.readOnce(ctx, table, readerIdx, keyed, out)
 		if err == nil {
 			r.noteTableComplete(table.Name, keyed)
@@ -270,7 +277,7 @@ func (r *concurrentBinlogRows) streamResumable(ctx context.Context, table *ir.Ta
 		// the fresh snapshot; on terminal failure (budget exhausted / binlog
 		// purged) the error is surfaced and the whole copy aborts loudly so
 		// the existing full restart-from-scratch takes over.
-		if rerr := r.recoverFromDrop(ctx, err); rerr != nil {
+		if rerr := r.recoverFromDrop(ctx, err, observedGen); rerr != nil {
 			r.setErr(rerr)
 			return
 		}
@@ -426,15 +433,26 @@ func (r *concurrentBinlogRows) pickReader(readerIdx int) *RowReader {
 // then return nil (their connections were already swapped). On terminal
 // failure (budget exhausted / binlog purged / re-snapshot non-transient) it
 // returns a LOUD error.
-func (r *concurrentBinlogRows) recoverFromDrop(ctx context.Context, cause error) error {
+// currentRecoveryGen returns the count of completed re-snapshot recoveries.
+// A read pipeline captures this BEFORE a read so recoverFromDrop can tell
+// whether a peer already re-snapshotted the drop it then hits (coalescing).
+func (r *concurrentBinlogRows) currentRecoveryGen() int {
+	r.recoveryMu.Lock()
+	defer r.recoveryMu.Unlock()
+	return r.recoveryGen
+}
+
+func (r *concurrentBinlogRows) recoverFromDrop(ctx context.Context, cause error, observedGen int) error {
 	r.recoveryMu.Lock()
 	defer r.recoveryMu.Unlock()
 
-	// Coalesce: a peer already recovered this drop generation while we waited
-	// for the lock — our connections are fresh; just resume.
-	startGen := r.recoveryGen
-	if startGen != r.lastObservedGen {
-		r.lastObservedGen = startGen
+	// Coalesce: a peer already re-snapshotted since this read began (recoveryGen
+	// advanced past the generation the dropped read ran against), so the fresh
+	// connections are already swapped in — just resume on them (the caller's
+	// loop re-reads from the cursor on the new conns). Only the FIRST lane of a
+	// given drop generation falls through to the actual re-snapshot below, so a
+	// grow window costs ONE FTWRL re-snapshot, not W.
+	if r.recoveryGen > observedGen {
 		return nil
 	}
 
@@ -458,7 +476,6 @@ func (r *concurrentBinlogRows) recoverFromDrop(ctx context.Context, cause error)
 		err := r.recoverViaResnapshot(ctx)
 		if err == nil {
 			r.recoveryGen++
-			r.lastObservedGen = r.recoveryGen
 			return nil
 		}
 		if errors.Is(err, errBinlogPurgedDuringResnapshot) {
@@ -558,9 +575,18 @@ func (r *concurrentBinlogRows) recoverViaResnapshot(ctx context.Context) error {
 // BEFORE the fresh FTWRL so the old snapshot transactions' metadata locks are
 // released first (otherwise the new FTWRL blocks behind them). The CDC anchor
 // is untouched (it lives in r.anchor / stream.Position). After this, pickReader
-// returns nil until swapConnections installs the fresh set — but the only
-// caller (the same recovery goroutine, holding recoveryMu) does not read in
-// between, and peer pipelines are parked on recoveryMu.
+// returns nil until swapConnections installs the fresh set.
+//
+// Concurrency: a PEER pipeline that has not yet hit a drop may still be reading
+// on these old conns when this runs — that is SAFE, not a data race: the
+// per-conn access is serialised by database/sql's own *sql.Conn mutex, and the
+// peer's resulting mid-iteration error is classified retriable (row_reader.go →
+// classifyApplierError), so the peer enters recoverFromDrop and COALESCES on the
+// recovery this goroutine is performing (its captured generation is now behind
+// recoveryGen) — it does not start a second re-snapshot. (Earlier wording
+// claimed peers are "parked on recoveryMu"; that was inaccurate — peers only
+// contend on recoveryMu once they themselves drop. The -race gate covers the
+// no-data-race conclusion for copy_table_parallelism>1.)
 func (r *concurrentBinlogRows) releaseOldConns() {
 	r.connMu.Lock()
 	old := r.readers

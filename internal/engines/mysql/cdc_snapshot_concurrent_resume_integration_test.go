@@ -227,6 +227,118 @@ func TestNativeConcurrentResume_KeylessAtLeastOnce(t *testing.T) {
 	}
 }
 
+// TestNativeConcurrentResume_KeyedFamilies closes the Bug-74 coverage gap the
+// value-fidelity review flagged: the genuine drop→re-snapshot→resume-from-cursor
+// round-trip exercised for NON-INTEGER keyed PKs — a TEMPORAL PK (DATETIME(6),
+// whose cursor takes the load-bearing CAST-to-CHAR path in row_reader_batch) and
+// a COMPOSITE (BIGINT, VARCHAR) PK (whose cursor is a multi-column
+// row-constructor `(a,b) > (?,?)`). Each must converge to its EXACT PK set with
+// no gap/dup across the recovery, anchor unchanged.
+func TestNativeConcurrentResume_KeyedFamilies(t *testing.T) {
+	dsn, cleanup := startMySQLForSnapshotCDC(t)
+	defer cleanup()
+
+	const seedDDL = `
+		CREATE TABLE r_ts   (ts DATETIME(6) NOT NULL, v VARCHAR(255), PRIMARY KEY (ts)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+		CREATE TABLE r_comp (a BIGINT NOT NULL, b VARCHAR(64) NOT NULL, v VARCHAR(255), PRIMARY KEY (a, b)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+	`
+	applyMySQLSnap(t, dsn, seedDDL)
+
+	const nTs, nComp = 80, 80
+	var tb []byte
+	for i := 0; i < nTs; i++ {
+		// Distinct, ordered microsecond timestamps so the keyed cursor advances.
+		tb = append(tb, []byte(fmt.Sprintf("INSERT INTO r_ts (ts, v) VALUES ('2020-01-01 00:00:00.%06d', 'ts-%d');", i+1, i))...)
+	}
+	applyMySQLSnap(t, dsn, string(tb))
+	var cb []byte
+	for i := 0; i < nComp; i++ {
+		// (a,b) tuples distinct on the composite key (a alone repeats across b).
+		cb = append(cb, []byte(fmt.Sprintf("INSERT INTO r_comp (a, b, v) VALUES (%d, 'b%d', 'c-%d');", i%10, i, i))...)
+	}
+	applyMySQLSnap(t, dsn, string(cb))
+
+	// Shrink the page size so the drop lands mid-table with a non-empty cursor.
+	defer restoreBatchSize(nativeResumeBatchSize)
+	nativeResumeBatchSize = 30
+
+	// Re-arming injector: ONE mid-table drop on EACH family table.
+	firedTs, firedComp := false, false
+	concurrentDropInjector = func(tableName string, rowsHandedOff int) error {
+		if !firedTs && tableName == "r_ts" && rowsHandedOff >= 40 {
+			firedTs = true
+			return &retriableTestErr{}
+		}
+		if !firedComp && tableName == "r_comp" && rowsHandedOff >= 40 {
+			firedComp = true
+			return &retriableTestErr{}
+		}
+		return nil
+	}
+	defer func() { concurrentDropInjector = nil }()
+
+	eng := Engine{Flavor: FlavorVanilla}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	concDSN := dsn + "&copy_table_parallelism=2"
+	stream, err := eng.OpenSnapshotStreamForTables(ctx, concDSN, []string{"r_ts", "r_comp"})
+	if err != nil {
+		t.Fatalf("OpenSnapshotStreamForTables(concurrent): %v", err)
+	}
+	defer func() { _ = stream.Close() }()
+	anchorBefore := stream.Position
+
+	tsTbl := &ir.Table{
+		Name:       "r_ts",
+		Columns:    []*ir.Column{{Name: "ts", Type: ir.DateTime{}}, {Name: "v", Type: ir.Varchar{Length: 255}}},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "ts"}}},
+	}
+	compTbl := &ir.Table{
+		Name: "r_comp",
+		Columns: []*ir.Column{
+			{Name: "a", Type: ir.Integer{Width: 64}},
+			{Name: "b", Type: ir.Varchar{Length: 64}},
+			{Name: "v", Type: ir.Varchar{Length: 255}},
+		},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "a"}, {Column: "b"}}},
+	}
+
+	tsRows := drainAllRows(t, ctx, stream.Rows, tsTbl)
+	compRows := drainAllRows(t, ctx, stream.Rows, compTbl)
+	if !firedTs || !firedComp {
+		t.Fatalf("drop injectors did not both fire (ts=%v comp=%v); recovery not exercised for both families", firedTs, firedComp)
+	}
+	assertExactDistinct(t, "r_ts", tsRows, func(r ir.Row) string { return fmt.Sprintf("%v", r["ts"]) }, nTs)
+	assertExactDistinct(t, "r_comp", compRows, func(r ir.Row) string { return fmt.Sprintf("%v|%v", r["a"], r["b"]) }, nComp)
+
+	if stream.Position != anchorBefore {
+		t.Fatalf("CDC anchor CHANGED across family re-snapshot recovery: before=%+v after=%+v (silent loss, ADR-0111 §3)", anchorBefore, stream.Position)
+	}
+}
+
+// assertExactDistinct verifies the drained rows form EXACTLY wantN distinct PK
+// keys (keyFn) with no gap (count == wantN) and no dup (distinct == count) —
+// byte-identical to a clean run across the re-snapshot resume.
+func assertExactDistinct(t *testing.T, table string, rows []ir.Row, keyFn func(ir.Row) string, wantN int) {
+	t.Helper()
+	seen := make(map[string]int, len(rows))
+	for _, r := range rows {
+		seen[keyFn(r)]++
+	}
+	if len(rows) != wantN {
+		t.Errorf("%s: %d rows after resume; want %d (gap or dup)", table, len(rows), wantN)
+	}
+	if len(seen) != wantN {
+		t.Errorf("%s: %d DISTINCT keys after resume; want %d (a dup or a missing key = gap/dup across the cursor resume)", table, len(seen), wantN)
+	}
+	for k, c := range seen {
+		if c != 1 {
+			t.Errorf("%s: key %q appears %d times after resume (dup across re-snapshot)", table, k, c)
+		}
+	}
+}
+
 // assertNoDupNoGapKeyed checks a keyed table's drained rows form the exact
 // contiguous id set [1..wantN] with no duplicate and no gap (byte-identical to
 // a clean run).

@@ -435,12 +435,15 @@ type concurrentBinlogRows struct {
 	cursors map[string]*tableCursor
 
 	// recoveryMu serialises the re-snapshot recovery across the W concurrent
-	// read pipelines; recoveryGen / lastObservedGen coalesce peers so only the
-	// first pipeline of a drop generation re-snapshots (peers observe the
-	// advanced generation and resume).
-	recoveryMu      sync.Mutex
-	recoveryGen     int
-	lastObservedGen int
+	// read pipelines. recoveryGen counts COMPLETED recoveries (bumped once per
+	// successful re-snapshot, under recoveryMu). It coalesces peers: a pipeline
+	// captures the generation it began its read at (currentRecoveryGen) and, on
+	// a drop, only re-snapshots if recoveryGen has NOT advanced past that
+	// captured value — otherwise a peer already re-snapshotted this drop and it
+	// just resumes on the swapped-in fresh connections. So a single grow window
+	// triggers ONE FTWRL re-snapshot, not W.
+	recoveryMu  sync.Mutex
+	recoveryGen int
 
 	// errMu / err is the reader's OWN sticky error (the resumable path owns
 	// error reporting now; the inner readers' errors are consumed inside the

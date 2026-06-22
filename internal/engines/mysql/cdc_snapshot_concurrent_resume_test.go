@@ -304,7 +304,7 @@ func TestRecoverFromDrop_TerminalWhenNoResnapshotWired(t *testing.T) {
 	r.resnapshot = nil // not wired
 
 	cause := &retriableTestErr{}
-	err := r.recoverFromDrop(context.Background(), cause)
+	err := r.recoverFromDrop(context.Background(), cause, 0)
 	if err == nil {
 		t.Fatal("recoverFromDrop with no resnapshot fn returned nil; want a LOUD terminal error (never silent)")
 	}
@@ -331,9 +331,52 @@ func TestRecoverFromDrop_BinlogPurgedFallsBack(t *testing.T) {
 	r.resnapshot = func(_ context.Context) ([]*sql.Conn, *sql.DB, string, uint32, error) {
 		return nil, nil, "", 0, errBinlogPurgedDuringResnapshot
 	}
-	err := r.recoverFromDrop(context.Background(), &retriableTestErr{})
+	err := r.recoverFromDrop(context.Background(), &retriableTestErr{}, 0)
 	if !errors.Is(err, errBinlogPurgedDuringResnapshot) {
 		t.Fatalf("recoverFromDrop = %v; want errBinlogPurgedDuringResnapshot (loud fallback to full restart-from-scratch)", err)
+	}
+}
+
+// TestRecoverFromDrop_CoalesceByGeneration pins the peer-coalescing fix: a lane
+// whose read began at a generation a PEER has already re-snapshotted past
+// (observedGen < recoveryGen) must COALESCE — return nil WITHOUT a second FTWRL
+// re-snapshot — while the FIRST lane of a generation (observedGen ==
+// recoveryGen) DOES re-snapshot. Without this, every dropped lane re-snapshots
+// (W× FTWRL stalls per grow window — the regression the value-fidelity review
+// caught).
+func TestRecoverFromDrop_CoalesceByGeneration(t *testing.T) {
+	// (a) Peer already recovered: observedGen(0) < recoveryGen(1) → coalesce;
+	// the resnapshot fn must NOT be invoked.
+	rc := newConcurrentBinlogRows(nil, [][]string{{"a"}}, "db", nil)
+	rc.anchor = binlogPos{Mode: positionModeFilePos, File: "bin.000001", Pos: 4}
+	rc.anchorSet = true
+	rc.recoveryGen = 1
+	rc.resnapshot = func(_ context.Context) ([]*sql.Conn, *sql.DB, string, uint32, error) {
+		t.Fatal("coalesce path must NOT call the resnapshot fn (a peer already recovered this drop)")
+		return nil, nil, "", 0, nil
+	}
+	if err := rc.recoverFromDrop(context.Background(), &retriableTestErr{}, 0); err != nil {
+		t.Fatalf("coalesce path returned %v; want nil (resume on the peer-swapped conns)", err)
+	}
+
+	// (b) First lane of a generation: observedGen(0) == recoveryGen(0) →
+	// proceeds to the actual re-snapshot (fn invoked). Return the purge sentinel
+	// so the test stays DB-free while still proving the fn ran.
+	defer restoreResnapshotEnvelope(saveResnapshotEnvelope())
+	nativeResnapshotMaxWall = time.Second
+	nativeResnapshotBackoffBase = time.Millisecond
+	nativeResnapshotBackoffCap = time.Millisecond
+	rf := newConcurrentBinlogRows(nil, [][]string{{"a"}}, "db", nil)
+	rf.anchor = binlogPos{Mode: positionModeFilePos, File: "bin.000001", Pos: 4}
+	rf.anchorSet = true
+	called := false
+	rf.resnapshot = func(_ context.Context) ([]*sql.Conn, *sql.DB, string, uint32, error) {
+		called = true
+		return nil, nil, "", 0, errBinlogPurgedDuringResnapshot
+	}
+	_ = rf.recoverFromDrop(context.Background(), &retriableTestErr{}, 0)
+	if !called {
+		t.Fatal("first lane of a generation must re-snapshot (resnapshot fn was never called)")
 	}
 }
 
