@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.108] - 2026-06-22
+
+### Added
+
+- **Sync-scoped target-metrics threshold alerts (ADR-0107 item 36) — sluice can now POST a notification to a webhook or Slack when the PlanetScale target's CPU/memory/storage/lag crosses a threshold, or when storage is climbing fast (a pre-grow early warning).** An opt-in, advisory observability follow-up to the metrics work: when telemetry is configured (`--planet-scale-org`) and at least one sink + threshold is set, a slow-tick sidecar (off the apply hot path, mirroring the metrics-history recorder) evaluates the configured rules each ~60 s and fires a notification on the rising edge of a breach. Sinks: a generic webhook (`--notify-webhook`, JSON POST) and Slack incoming-webhook (`--notify-slack`), both credential-gated via env vars (`SLUICE_NOTIFY_WEBHOOK` / `SLUICE_NOTIFY_SLACK`). Rules (each inert unless its threshold is set): `--notify-storage-util`, `--notify-cpu-util`, `--notify-mem-util`, `--notify-lag-seconds`, and `--notify-storage-growth-per-min` (the rate-of-change rule — alerts when storage utilisation climbs at or above the given fraction-of-capacity per minute, so you hear about an impending auto-grow before it reparents). Alerts are edge-triggered with a per-rule cooldown (`--notify-cooldown`, default 15 m) so a sustained breach reminds rather than floods, and re-arm only after the metric recovers below the threshold (with a small hysteresis margin to avoid flapping at the line). The whole feature is failure-isolated: a dead or slow sink is logged at WARN and swallowed — it can never stall or crash the sync. Engine-neutral (the new `internal/notify` sink layer imports no engine or telemetry code). An unobserved metric never fires (the same honesty contract the rest of the telemetry path keeps). No behaviour change for any sync that doesn't configure a notify sink. Scope note: SMTP/email sinks and a standalone metrics-watch daemon remain demand-gated — this is the in-sync, sync-scoped alerter.
+
 ## [0.99.107] - 2026-06-22
 
 ### Added

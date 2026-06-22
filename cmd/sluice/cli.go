@@ -723,21 +723,21 @@ type SyncStartCmd struct {
 	// sluice_target_* gauges). CONTROL-PLANE credential, distinct from the
 	// data-plane DSN. All-or-nothing: org without a complete token pair is a
 	// loud refusal. Unset ⇒ no provider wired ⇒ byte-identical default sync.
-	PlanetScaleOrg            string `help:"PlanetScale org slug; enables OPTIONAL target-health telemetry (CPU/mem/storage) from the PlanetScale metrics endpoint for proactive apply back-off + in-tool observability (ADR-0107). Opt-in; requires --planetscale-metrics-token-id and --planetscale-metrics-token. Control-plane only — distinct from the data-plane --target DSN. Off when unset (default sync unchanged)." placeholder:"ORG"`
-	PlanetScaleMetricsTokenID string `help:"PlanetScale service-token ID (granted the read_metrics_endpoints permission) for --planetscale-org target-health telemetry. Prefer the env var so the id never lands in shell history." env:"PLANETSCALE_METRICS_TOKEN_ID" placeholder:"ID"`
-	PlanetScaleMetricsToken   string `help:"PlanetScale service-token secret for --planetscale-org target-health telemetry. Set via the env var (never on the command line); masked in all logging." env:"PLANETSCALE_METRICS_TOKEN" placeholder:"SECRET"`
-	PlanetScaleMetricsBranch  string `help:"Target branch to filter telemetry series to (defaults to 'main'). Only consulted when --planetscale-org is set." placeholder:"BRANCH"`
-	PlanetScaleMetricsDB      string `help:"Target database name to filter PlanetScale telemetry SD to. Defaults to the --target DSN's database. Only consulted when --planetscale-org is set." placeholder:"DATABASE"`
+	PlanetScaleOrg            string `help:"PlanetScale org slug; enables OPTIONAL target-health telemetry (CPU/mem/storage) from the PlanetScale metrics endpoint for proactive apply back-off + in-tool observability (ADR-0107). Opt-in; requires --planet-scale-metrics-token-id and --planet-scale-metrics-token. Control-plane only — distinct from the data-plane --target DSN. Off when unset (default sync unchanged)." placeholder:"ORG"`
+	PlanetScaleMetricsTokenID string `help:"PlanetScale service-token ID (granted the read_metrics_endpoints permission) for --planet-scale-org target-health telemetry. Prefer the env var so the id never lands in shell history." env:"PLANETSCALE_METRICS_TOKEN_ID" placeholder:"ID"`
+	PlanetScaleMetricsToken   string `help:"PlanetScale service-token secret for --planet-scale-org target-health telemetry. Set via the env var (never on the command line); masked in all logging." env:"PLANETSCALE_METRICS_TOKEN" placeholder:"SECRET"`
+	PlanetScaleMetricsBranch  string `help:"Target branch to filter telemetry series to (defaults to 'main'). Only consulted when --planet-scale-org is set." placeholder:"BRANCH"`
+	PlanetScaleMetricsDB      string `help:"Target database name to filter PlanetScale telemetry SD to. Defaults to the --target DSN's database. Only consulted when --planet-scale-org is set." placeholder:"DATABASE"`
 
 	SuppressTargetMetricsHistory bool `help:"Disable persisting polled PlanetScale target-health metrics to the sluice_target_metrics_history table on the target (ADR-0107 item 35). Only relevant when --planet-scale-org telemetry is configured; recording is on by default then. The rolling history lets 'sluice diagnose' show the recent CPU/mem/storage/lag/conn trend without scripting the metrics API; the table is bounded (7-day retention, pruned). Recording is advisory and failure-isolated — it never affects the sync."`
 
 	// ADR-0107 item 36 — sync-scoped target-metrics threshold ALERTER. Opt-in,
-	// only active with --planetscale-org telemetry; advisory (never affects the
+	// only active with --planet-scale-org telemetry; advisory (never affects the
 	// sync); credential-gated (sink URLs via env); failure-isolated (a dead sink
 	// is logged-and-swallowed). A rule with threshold 0 is inert.
-	NotifyWebhook             string        `help:"Generic webhook URL to POST target-metrics threshold alerts to as JSON (ADR-0107 item 36). Opt-in; only active with --planetscale-org telemetry AND at least one --notify-*-util/--notify-lag-seconds/--notify-storage-growth-per-min threshold set. ADVISORY — never affects the sync; a dead sink is logged-and-swallowed. A credential (set via the env var, not the command line)." env:"SLUICE_NOTIFY_WEBHOOK" placeholder:"URL"`
+	NotifyWebhook             string        `help:"Generic webhook URL to POST target-metrics threshold alerts to as JSON (ADR-0107 item 36). Opt-in; only active with --planet-scale-org telemetry AND at least one --notify-*-util/--notify-lag-seconds/--notify-storage-growth-per-min threshold set. ADVISORY — never affects the sync; a dead sink is logged-and-swallowed. A credential (set via the env var, not the command line)." env:"SLUICE_NOTIFY_WEBHOOK" placeholder:"URL"`
 	NotifySlack               string        `help:"Slack incoming-webhook URL to POST target-metrics threshold alerts to (ADR-0107 item 36). Same gating + advisory + failure-isolated semantics as --notify-webhook. A credential (set via the env var)." env:"SLUICE_NOTIFY_SLACK" placeholder:"URL"`
-	NotifyStorageUtil         float64       `help:"Alert when the target's storage utilisation (used/capacity, 0-1) is at or above this fraction (ADR-0107 item 36). 0 (default) disables the rule. Edge-triggered + cooldown'd. Requires --planetscale-org telemetry + a --notify-webhook/--notify-slack sink." placeholder:"FRAC"`
+	NotifyStorageUtil         float64       `help:"Alert when the target's storage utilisation (used/capacity, 0-1) is at or above this fraction (ADR-0107 item 36). 0 (default) disables the rule. Edge-triggered + cooldown'd. Requires --planet-scale-org telemetry + a --notify-webhook/--notify-slack sink." placeholder:"FRAC"`
 	NotifyCPUUtil             float64       `help:"Alert when the target's CPU utilisation (0-1) is at or above this fraction (ADR-0107 item 36). 0 disables. Same gating as --notify-storage-util." placeholder:"FRAC"`
 	NotifyMemUtil             float64       `help:"Alert when the target's memory utilisation (0-1) is at or above this fraction (ADR-0107 item 36). 0 disables. Same gating as --notify-storage-util." placeholder:"FRAC"`
 	NotifyLagSeconds          float64       `help:"Alert when the target's replica lag (seconds) is at or above this value (ADR-0107 item 36). 0 disables. Same gating as --notify-storage-util." placeholder:"SECONDS"`
@@ -842,8 +842,8 @@ func resolveApplyBatchSize(raw string, target ir.Engine) (int, error) {
 
 // buildTargetTelemetry constructs the OPTIONAL PlanetScale target-health
 // telemetry provider (ADR-0107 Phase 2) from the operator's opt-in flags,
-// or returns (nil, nil) when telemetry is OFF (no --planetscale-org). The
-// opt-in is ALL-OR-NOTHING: setting --planetscale-org without a complete
+// or returns (nil, nil) when telemetry is OFF (no --planet-scale-org). The
+// opt-in is ALL-OR-NOTHING: setting --planet-scale-org without a complete
 // service-token pair is a LOUD refusal (the contain-PS-complexity tenet —
 // a half-configured control-plane capability never half-runs silently).
 //
@@ -882,23 +882,23 @@ func buildTargetTelemetry(ctx context.Context, s *SyncStartCmd) (*pstelemetry.Pr
 
 // buildTargetTelemetryProvider constructs the optional PlanetScale telemetry
 // provider (ADR-0107) from the gathered params, or returns (nil, nil) when
-// telemetry is off (no --planetscale-org). Opt-in is all-or-nothing: an org
+// telemetry is off (no --planet-scale-org). Opt-in is all-or-nothing: an org
 // without a complete token pair is a loud refusal.
 func buildTargetTelemetryProvider(ctx context.Context, p telemetryParams) (*pstelemetry.Provider, error) {
 	if p.org == "" {
 		// Telemetry off (the default): no provider, no behaviour change.
 		if p.tokenID != "" || p.token != "" {
-			// Token supplied without --planetscale-org: nothing consumes it.
+			// Token supplied without --planet-scale-org: nothing consumes it.
 			// Warn rather than refuse — the operator may have set the env var
 			// globally; refusing would block every non-PS sync on that shell.
 			slog.WarnContext(ctx,
-				"PlanetScale metrics service token is set but --planetscale-org is not; target-health telemetry is OFF (set --planetscale-org to enable)")
+				"PlanetScale metrics service token is set but --planet-scale-org is not; target-health telemetry is OFF (set --planet-scale-org to enable)")
 		}
 		return nil, nil //nolint:nilnil // (nil, nil) == "telemetry off", a valid no-op result distinct from an error
 	}
 	if p.tokenID == "" || p.token == "" {
 		return nil, errors.New(
-			"--planetscale-org is set but the metrics service token is incomplete: supply BOTH --planetscale-metrics-token-id and --planetscale-metrics-token (env PLANETSCALE_METRICS_TOKEN_ID / PLANETSCALE_METRICS_TOKEN). Telemetry is opt-in and all-or-nothing — it never half-runs",
+			"--planet-scale-org is set but the metrics service token is incomplete: supply BOTH --planet-scale-metrics-token-id and --planet-scale-metrics-token (env PLANETSCALE_METRICS_TOKEN_ID / PLANETSCALE_METRICS_TOKEN). Telemetry is opt-in and all-or-nothing — it never half-runs",
 		)
 	}
 
@@ -908,7 +908,7 @@ func buildTargetTelemetryProvider(ctx context.Context, p telemetryParams) (*pste
 	}
 	if database == "" {
 		return nil, errors.New(
-			"--planetscale-org telemetry: could not determine the target database name from the --target DSN; supply --planetscale-metrics-database explicitly",
+			"--planet-scale-org telemetry: could not determine the target database name from the --target DSN; supply --planet-scale-metrics-database explicitly",
 		)
 	}
 
@@ -926,7 +926,7 @@ func buildTargetTelemetryProvider(ctx context.Context, p telemetryParams) (*pste
 		Engine: p.engine,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("--planetscale-org telemetry: %w", err)
+		return nil, fmt.Errorf("--planet-scale-org telemetry: %w", err)
 	}
 	slog.InfoContext(
 		ctx,
@@ -969,7 +969,7 @@ func branchOrMainLabel(branch string) string {
 //   - URL DSN (postgres://…/dbname, mysql://…/dbname): the URL path.
 //
 // Returns "" when no database segment is present (the caller then refuses
-// loudly and asks for --planetscale-metrics-database). The DSN may contain
+// loudly and asks for --planet-scale-metrics-database). The DSN may contain
 // a password; this function returns ONLY the database segment, never echoes
 // the DSN.
 func databaseFromDSN(dsn string) string {
