@@ -85,9 +85,14 @@ import (
 // zero-value-safe reasoning is unaffected (there is no config field and no
 // zero-value path; the values are baked at package init).
 var (
-	// 24 (≈ ~15-20 min envelope) to span a prolonged multi-step storage-grow
-	// stall, matching the write-side coldCopyReparentRetryAttemptsVar (v0.99.99).
-	coldCopySourceReadRetryAttempts = 24
+	// WALL-CLOCK BOUND (v0.99.103): the real terminal bound is elapsed time
+	// (~30 min), mirroring the write-side coldCopyReparentMaxWallVar — a
+	// single table's source-read reconnect rides a prolonged multi-step
+	// storage-grow stall regardless of how many fast retry cycles elapsed.
+	coldCopySourceReadMaxWall = 30 * time.Minute
+	// coldCopySourceReadRetryAttempts is now a high RUNAWAY BACKSTOP only
+	// (not the operational bound — the wall-clock deadline is).
+	coldCopySourceReadRetryAttempts = 100000
 	coldCopySourceReadBackoffBase   = 100 * time.Millisecond
 	coldCopySourceReadBackoffCap    = 30 * time.Second
 )
@@ -194,6 +199,12 @@ func copyTableWithSourceReadRetry(
 		return nil
 	}
 
+	// WALL-CLOCK BOUND (v0.99.103): retry until success or this deadline —
+	// not a fixed attempt count — so a table's source-read reconnect rides a
+	// prolonged grow regardless of retry cadence (mirrors the write-side
+	// coldCopyReparentMaxWallVar).
+	deadline := time.Now().Add(coldCopySourceReadMaxWall)
+
 	for try := 1; ; try++ {
 		// Classify the MOST RECENT error. Only the connection-drop class is
 		// retriable; everything else — a real value-fidelity decode failure,
@@ -207,12 +218,12 @@ func copyTableWithSourceReadRetry(
 		// for the grow window. Coalescing + idempotent; this lane keeps its
 		// own bounded retry below as the authoritative floor.
 		tripGrowGate(gate, "pipeline cold-copy source-read transient: "+err.Error())
-		if try >= coldCopySourceReadRetryAttempts {
+		if time.Now().After(deadline) || try >= coldCopySourceReadRetryAttempts {
 			return fmt.Errorf(
-				"pipeline: cold-copy of %q: source read still failing after exhausting the reconnect-and-resume retry budget "+
-					"(%d attempts; the source connection keeps dropping — the source may be wedged, or a prolonged target stall keeps "+
+				"pipeline: cold-copy of %q: source read still failing after riding the reconnect-and-resume window "+
+					"(%s wall-clock, %d attempts; the source connection keeps dropping — the source may be wedged, or a prolonged target stall keeps "+
 					"backpressuring the read past the source's net_write_timeout): %w",
-				tableName, try, err,
+				tableName, coldCopySourceReadMaxWall, try, err,
 			)
 		}
 
@@ -222,7 +233,8 @@ func copyTableWithSourceReadRetry(
 			slog.String("table", tableName),
 			slog.String("resume", resumeStrategyLabel(strategy)),
 			slog.Int("attempt", try),
-			slog.Int("max_attempts", coldCopySourceReadRetryAttempts),
+			slog.Duration("elapsed", time.Since(deadline.Add(-coldCopySourceReadMaxWall))),
+			slog.Duration("max_wall", coldCopySourceReadMaxWall),
 			slog.Duration("backoff", backoff),
 			slog.String("err", err.Error()),
 		)

@@ -40,6 +40,28 @@ no-op pin). The v0.99.100 regression cycle missed this because its no-op Focus t
 used the migrate `--bulk-parallelism` path (where the wiring existed) and could not
 trigger a live grow to observe the sync path never tripping.
 
+**Real wiring + wall-clock bound (v0.99.103).** v0.99.102's wiring was *still* on the
+wrong function: `runBulkCopyPhases` is used by the ADR-0079 shareable-snapshot fast
+path and `migrate`, but the native-MySQL concurrent cold-copy that Track-D / every
+PlanetScale MySQL→MySQL `sync` uses goes through a DIFFERENT path —
+`coldStartRunCopy` → `runBulkCopyWithOpts` → `runConcurrentTableCopy(rw)` — which
+never constructed or wired a gate at all. The PS-320-v10/11/12 live runs tripped the
+gate zero times. v0.99.103 constructs + wires the gate in `coldStartRunCopy` (and the
+multi-DB twin in `streamer_multidb.go`), where the Streamer's `TargetTelemetry` is in
+scope; `runConcurrentTableCopy` reuses the single `rw` across all W×D workers, so
+`SetGrowGate(rw)` engages the coordination for the whole fan-out.
+
+v0.99.103 ALSO changes the cold-copy retry bound from **attempt-count to WALL-CLOCK**
+(`flushWithReparentRetry` + `copyTableWithSourceReadRetry`, ~30 min). The gate's fast
+probe cycles consume attempts far faster than wall-clock, so the old 24-attempt cap
+exhausted on a *single* batch mid-grow (PS-320-v11/v12 died on `documents`/`bool_tiny`
+during the initial 12→39 grow); a wall-clock deadline rides a prolonged multi-step
+grow regardless of probe cadence — the robust "don't get stuck on a storage threshold"
+guarantee — while still surfacing a genuinely-wedged target loudly after ~30 min. The
+attempt count remains only as a high runaway backstop. Two misfires (v0.99.101/102
+wired adjacent functions, not Track-D's actual path) are the lesson: trace the exact
+runtime path from ground truth before fixing.
+
 ## Context
 
 A non-Metal PlanetScale MySQL volume auto-grows in steps (12 → 39 → 62 → 214 GB).

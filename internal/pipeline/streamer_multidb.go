@@ -617,6 +617,14 @@ func (s *Streamer) coldStartCopyOneDatabase(
 		slog.String("database", database),
 		slog.Int("tables", len(schema.Tables)))
 
+	// ADR-0110 (v0.99.103): wire the coordinated grow-gate onto this
+	// database's cold-copy writer — runBulkCopyWithOpts reuses this rw
+	// across all fan-out workers (see coldStartRunCopy for the rationale).
+	// One gate per database cold-copy; nil provider ⇒ signal-driven only.
+	gate := growGateOrNil(newGrowGate(ctx, storageRecoveredProbe(ctx, s.TargetTelemetry)))
+	applyGrowGate(rw, gate)
+	s.startStorageHeadroomWatch(ctx, streamID, gate)
+
 	bulkOpts := bulkCopyOpts{Redactor: s.Redactor}
 	if err := runBulkCopyWithOpts(ctx, schema, stream.Rows, sw, rw, bulkOpts); err != nil {
 		closeIf(rw)

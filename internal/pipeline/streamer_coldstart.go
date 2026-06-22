@@ -659,6 +659,23 @@ func (s *Streamer) coldStartRunCopy(ctx context.Context, schema *ir.Schema, stre
 			slog.InfoContext(ctx, "sync cold-start: "+fastReason+"; using serial cold-start",
 				slog.String("stream_id", streamID))
 		}
+		// ADR-0110 (v0.99.103): wire the coordinated grow-gate into THIS
+		// path. The native-concurrent / serial cold-copy
+		// (runBulkCopyWithOpts → runConcurrentTableCopy) reuses the SINGLE rw
+		// across all W group pipelines × D fan-out workers — they all call
+		// w.flushWithReparentRetry on this one *RowWriter — so SetGrowGate on
+		// rw engages the coordination for the whole fan-out. v0.99.100-102
+		// wired the gate only into runBulkCopyPhases (the ADR-0079 fast path +
+		// migrate), which this path NEVER calls, so the gate was inert for
+		// native-MySQL→PlanetScale cold-copy (the PS-320-v10/11/12 live runs
+		// tripped it zero times). Construct it HERE, where the Streamer's
+		// TargetTelemetry (recovery probe + headroom watch) is in scope; the
+		// fast path (above) constructs its own gate in runColdStartParallel.
+		// nil provider ⇒ signal-driven only; nil gate ⇒ pre-ADR-0110 no-op.
+		gate := growGateOrNil(newGrowGate(ctx, storageRecoveredProbe(ctx, s.TargetTelemetry)))
+		applyGrowGate(rw, gate)
+		s.startStorageHeadroomWatch(ctx, streamID, gate)
+
 		bulkOpts := bulkCopyOpts{
 			SkipSchemaApply:  s.SchemaAlreadyApplied,
 			Redactor:         s.Redactor,

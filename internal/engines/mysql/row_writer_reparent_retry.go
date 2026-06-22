@@ -49,23 +49,41 @@ import (
 //	100ms → 200ms → 400ms → 800ms → 1.6s → 3.2s → 6.4s → 12.8s →
 //	25.6s → 30s (cap) → 30s → 30s → ... (24×)
 //
-// 24 attempts × max(30s) ≈ up to ~12 min of backoff (plus each attempt's
-// own stall-until-error, often tens of seconds) ≈ a ~15–20 min envelope
-// tolerated before a LOUD terminal error — long enough for a prolonged
-// storage-grow step, short enough that a genuinely-wedged target still
-// surfaces rather than hiding for hours. The v0.99.98 PS-320-v7 run rode
-// ~23 min of retries across the whole grow but a single `documents`
-// grow-step stall exhausted the prior 12-attempt (~4 min) budget — hence
-// 24. (The DEEPER fix for the underlying contention is the proactive
-// coordinated pause-on-stall / Item-32 telemetry throttle, a follow-up;
-// this bump is the targeted budget fix.)
+// WALL-CLOCK BOUND (v0.99.103): the terminal bound is ELAPSED TIME
+// (coldCopyReparentMaxWallVar, ~30 min), NOT an attempt count. The prior
+// 24-attempt cap exhausted on a SINGLE batch during a prolonged grow: the
+// ADR-0110 grow-gate adds fast probe cycles (the gate reopens, the lane
+// attempts once, re-trips) so the attempt count gets consumed far faster
+// than wall-clock, and PS-320-v11/v12 died with one `documents`/`bool_tiny`
+// batch burning 24 attempts mid-grow. A wall-clock bound rides a prolonged
+// multi-step grow regardless of probe cadence — the robust "don't get stuck
+// on a storage threshold" guarantee — while STILL surfacing a genuinely-
+// wedged target loudly after ~30 min. coldCopyReparentRetryAttemptsVar
+// remains ONLY as a high runaway backstop (a tight-loop guard if backoff
+// were ever zero); the wall-clock deadline is the real bound.
+//
+// Backoff shape is unchanged (100ms → 200ms → … → 30s cap), so the lane
+// still backs off between attempts; at the 30s cap a ~30-min window is
+// ~60 attempts, well under the backstop.
 //
 // These are package vars (not consts) ONLY so the unit tests can shrink
 // the envelope to keep the suite fast — production NEVER mutates them, so
 // the zero-value-safe-default reasoning is unaffected (there is no config
 // field and no zero-value path; the values are baked at package init).
+// Unlike the ADR-0110 grow-gate's backoff vars, these are read only inside
+// the SYNCHRONOUS per-batch retry loop (never a long-lived background
+// goroutine that could outlive a test's restore), so the -race lesson that
+// drove the gate's per-instance snapshot does not apply here.
 var (
-	coldCopyReparentRetryAttemptsVar = 24
+	// coldCopyReparentMaxWallVar is the wall-clock ceiling on a single
+	// batch's reparent-retry — the REAL terminal bound. ~30 min spans a
+	// prolonged multi-step PlanetScale storage auto-grow (12→39→62→214 GB).
+	coldCopyReparentMaxWallVar = 30 * time.Minute
+	// coldCopyReparentRetryAttemptsVar is now a high RUNAWAY BACKSTOP only
+	// (not the operational bound — the wall-clock deadline is). Kept large
+	// so the backoff-rate-limited loop is bounded even in a pathological
+	// zero-backoff test.
+	coldCopyReparentRetryAttemptsVar = 100000
 	coldCopyReparentBackoffBaseVar   = 100 * time.Millisecond
 	coldCopyReparentBackoffCapVar    = 30 * time.Second
 )
@@ -139,6 +157,13 @@ func (w *RowWriter) flushWithReparentRetry(
 		return nil
 	}
 
+	// WALL-CLOCK BOUND (v0.99.103): the batch retries until it succeeds or
+	// this deadline passes — NOT a fixed attempt count. The ADR-0110 gate's
+	// fast probe cycles consume attempts faster than wall-clock, so an
+	// attempt-count bound exhausted mid-grow (PS-320-v11/v12); a wall-clock
+	// deadline rides a prolonged grow regardless of probe cadence.
+	deadline := time.Now().Add(coldCopyReparentMaxWallVar)
+
 	for try := 1; ; try++ {
 		// Classify the MOST RECENT error. Only a transient (reparent /
 		// connection-reset / vttablet-unavailable class) is retriable;
@@ -155,11 +180,15 @@ func (w *RowWriter) flushWithReparentRetry(
 		// transient at once collapse into one pause window. This lane keeps
 		// its own bounded retry below as the floor.
 		w.tripGrowGate("mysql cold-copy flush transient: " + err.Error())
-		if try >= coldCopyReparentRetryAttemptsVar {
+		// Terminal on the WALL-CLOCK deadline (the real bound) or the
+		// runaway attempt backstop. A genuinely-wedged target surfaces
+		// loudly after ~30 min; a transient grow is ridden regardless of
+		// how many fast gate-probe cycles elapsed.
+		if time.Now().After(deadline) || try >= coldCopyReparentRetryAttemptsVar {
 			return fmt.Errorf(
-				"mysql: cold-copy into %q: batch flush (%d rows) still failing after exhausting the reparent-retry budget "+
-					"(%d attempts; the target may be undergoing a prolonged reparent/failover or be genuinely down): %w",
-				tableName, rows, try, err,
+				"mysql: cold-copy into %q: batch flush (%d rows) still failing after riding the reparent-retry window "+
+					"(%s wall-clock, %d attempts; the target may be undergoing a prolonged reparent/failover or be genuinely down): %w",
+				tableName, rows, coldCopyReparentMaxWallVar, try, err,
 			)
 		}
 
@@ -170,7 +199,8 @@ func (w *RowWriter) flushWithReparentRetry(
 			slog.String("table", tableName),
 			slog.Int("rows", rows),
 			slog.Int("attempt", try),
-			slog.Int("max_attempts", coldCopyReparentRetryAttemptsVar),
+			slog.Duration("elapsed", time.Since(deadline.Add(-coldCopyReparentMaxWallVar))),
+			slog.Duration("max_wall", coldCopyReparentMaxWallVar),
 			slog.Duration("backoff", backoff),
 			slog.String("err", err.Error()),
 		)

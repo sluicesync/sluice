@@ -281,8 +281,8 @@ func TestColdCopyReparentRetry_Exhaustion(t *testing.T) {
 	if err == nil {
 		t.Fatal("persistent transient must exhaust the budget LOUDLY; got nil")
 	}
-	if !strings.Contains(err.Error(), "reparent-retry budget") {
-		t.Errorf("exhaustion error should name the budget; got %v", err)
+	if !strings.Contains(err.Error(), "reparent-retry window") {
+		t.Errorf("exhaustion error should name the reparent-retry window; got %v", err)
 	}
 	// The terminal error must NOT be classified retriable (the stream/copy
 	// gives up, it doesn't loop forever).
@@ -299,6 +299,60 @@ func TestColdCopyReparentRetry_Exhaustion(t *testing.T) {
 	// retries), never infinite.
 	if got := script.execCalls.Load(); got != 4 {
 		t.Errorf("INSERT exec calls = %d; want 4 (bounded by the attempt cap)", got)
+	}
+}
+
+// TestColdCopyReparentRetry_WallClockBound pins the v0.99.103 change: the
+// REAL terminal bound is wall-clock, not attempt count. With a tiny
+// max-wall and a high attempt backstop, a persistent transient retries
+// MANY times (far past the old 24-attempt cap) but still terminates LOUDLY
+// once the wall-clock deadline passes — proving a single batch rides a
+// prolonged grow regardless of how fast the (gate-driven) probe cycles burn
+// attempts.
+func TestColdCopyReparentRetry_WallClockBound(t *testing.T) {
+	origWall := coldCopyReparentMaxWallVar
+	origAttempts := coldCopyReparentRetryAttemptsVar
+	origBase := coldCopyReparentBackoffBaseVar
+	origCap := coldCopyReparentBackoffCapVar
+	coldCopyReparentMaxWallVar = 40 * time.Millisecond
+	coldCopyReparentRetryAttemptsVar = 100000 // high backstop: wall-clock must be what fires
+	coldCopyReparentBackoffBaseVar = time.Millisecond
+	coldCopyReparentBackoffCapVar = time.Millisecond
+	t.Cleanup(func() {
+		coldCopyReparentMaxWallVar = origWall
+		coldCopyReparentRetryAttemptsVar = origAttempts
+		coldCopyReparentBackoffBaseVar = origBase
+		coldCopyReparentBackoffCapVar = origCap
+	})
+
+	errs := make([]error, 100000)
+	for i := range errs {
+		errs[i] = vttabletUnavailable()
+	}
+	script := &flushScript{execErrs: errs}
+	db := newScriptDB(t, script)
+	w := &RowWriter{db: db, bulkLoad: ir.BulkLoadBatchedInsert}
+
+	err := w.WriteRows(context.Background(), pinReparentTable(), feedReparentRows(2))
+	if err == nil {
+		t.Fatal("persistent transient must terminate LOUDLY on the wall-clock bound; got nil")
+	}
+	if !strings.Contains(err.Error(), "wall-clock") {
+		t.Errorf("terminal error should name the wall-clock window; got %v", err)
+	}
+	var re ir.RetriableError
+	if errors.As(err, &re) {
+		t.Error("wall-clock terminal error must be TERMINAL (not ir.RetriableError)")
+	}
+	// The wall-clock bound — not the attempt count — is what fired: with a
+	// ~1ms backoff and a 40ms window the loop ran well past the old 24-attempt
+	// cap but FAR below the 100000 backstop, so it is bounded by time.
+	got := script.execCalls.Load()
+	if got <= 24 {
+		t.Errorf("exec calls = %d; want > 24 (wall-clock bound rides past the old attempt cap)", got)
+	}
+	if got >= 100000 {
+		t.Errorf("exec calls = %d; the attempt backstop fired instead of the wall-clock bound", got)
 	}
 }
 

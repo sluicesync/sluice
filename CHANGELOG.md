@@ -4,6 +4,13 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.103] - 2026-06-22
+
+### Fixed
+
+- **The ADR-0110 grow-gate is now wired into the native-concurrent `sync` cold-copy path (the one Track-D / PlanetScale MySQL→MySQL actually uses) — v0.99.100–v0.99.102 wired adjacent functions it never calls.** The native-MySQL concurrent cold-copy takes `coldStartRunCopy → runBulkCopyWithOpts → runConcurrentTableCopy`, not the `runBulkCopyPhases` path the earlier releases wired, so the gate was constructed-and-inert (or never constructed) for that path — three successive live PS-320 runs tripped the gate zero times. The gate is now constructed and attached in `coldStartRunCopy` (and the multi-database twin in `streamer_multidb.go`), where the Streamer's PlanetScale telemetry is in scope for the proactive trip + recovery probe; `runConcurrentTableCopy` reuses the single writer across all W×D fan-out workers, so attaching the gate there engages the coordination for the whole fan-out.
+- **The cold-copy retry bound is now WALL-CLOCK based (~30 min), not a fixed 24-attempt count — so a single batch reliably rides a prolonged storage-grow regardless of retry cadence.** The grow-gate's fast probe cycles consume retry *attempts* far faster than wall-clock, so the prior attempt-count cap could exhaust on one batch mid-grow (a fresh PS-320 cold-copy died on the `documents`/`bool_tiny` batch during the initial 12→39 GB grow, before the gate could help). `flushWithReparentRetry` (target-write) and `copyTableWithSourceReadRetry` (source-read) now terminate on an elapsed-time deadline (~30 min, sized to span a multi-step 12→39→62→214 GB auto-grow) rather than an attempt count; the count remains only as a high runaway backstop. A genuinely-wedged or undersized target still fails loudly after the window — bounded, never infinite. This is the robust "don't get stuck on a storage threshold and have to restart from scratch" guarantee; the grow-gate coordination (above) is the efficiency layer on top. Pinned by wall-clock-bound tests on both retry paths (retries far past the old 24-attempt cap, terminates on elapsed time) plus the existing convergence/exhaustion/ctx-cancel pins.
+
 ## [0.99.102] - 2026-06-22
 
 ### Fixed

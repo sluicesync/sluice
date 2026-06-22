@@ -131,12 +131,58 @@ func TestSourceReadRetry_BudgetExhaustionIsLoudTerminal(t *testing.T) {
 	if !errors.As(err, new(fakeRetriableErr)) {
 		t.Errorf("terminal error must WRAP the last transient (%%w); got %v", err)
 	}
-	if !strings.Contains(err.Error(), "events") || !strings.Contains(err.Error(), "retry budget") {
-		t.Errorf("terminal error must name the table + budget; got %v", err)
+	if !strings.Contains(err.Error(), "events") || !strings.Contains(err.Error(), "reconnect-and-resume window") {
+		t.Errorf("terminal error must name the table + the reconnect-and-resume window; got %v", err)
 	}
 	// initial attempt + (attempts-1) retries = coldCopySourceReadRetryAttempts.
 	if attempts != coldCopySourceReadRetryAttempts {
 		t.Errorf("attempts = %d, want %d", attempts, coldCopySourceReadRetryAttempts)
+	}
+}
+
+// TestSourceReadRetry_WallClockBound pins the v0.99.103 change: the REAL
+// terminal bound is wall-clock, not attempt count. With a tiny max-wall and
+// a high attempt backstop, a persistent transient retries MANY times (past
+// the old 24-attempt cap) but still terminates LOUDLY once the wall-clock
+// deadline passes — so a table's source-read reconnect rides a prolonged
+// grow regardless of retry cadence.
+func TestSourceReadRetry_WallClockBound(t *testing.T) {
+	captureSlog(t)
+	withFastSourceReadBackoff(t)
+	origWall, origAttempts := coldCopySourceReadMaxWall, coldCopySourceReadRetryAttempts
+	coldCopySourceReadMaxWall = 40 * time.Millisecond
+	coldCopySourceReadRetryAttempts = 100000 // high backstop: wall-clock must be what fires
+	t.Cleanup(func() {
+		coldCopySourceReadMaxWall = origWall
+		coldCopySourceReadRetryAttempts = origAttempts
+	})
+
+	last := fakeRetriableErr{msg: "mysql: rows iteration: connection reset by peer"}
+	var attempts int
+	attempt := func(_ context.Context, _ ir.RowReader, _ bool) error {
+		attempts++
+		return last
+	}
+	freshReader := func(_ context.Context) (ir.RowReader, func(), error) {
+		return noopRowReader{}, func() {}, nil
+	}
+
+	err := copyTableWithSourceReadRetry(context.Background(), "events",
+		resumeTruncateRestart, noopRowReader{}, false, attempt, freshReader,
+		func(_ context.Context) error { return nil }, nil)
+	if err == nil {
+		t.Fatal("persistent transient must terminate LOUDLY on the wall-clock bound; got nil")
+	}
+	if !strings.Contains(err.Error(), "wall-clock") {
+		t.Errorf("terminal error should name the wall-clock window; got %v", err)
+	}
+	// Wall-clock — not the attempt count — is what fired: many more than the
+	// old 24-attempt cap, far below the 100000 backstop.
+	if attempts <= 24 {
+		t.Errorf("attempts = %d; want > 24 (wall-clock rides past the old attempt cap)", attempts)
+	}
+	if attempts >= 100000 {
+		t.Errorf("attempts = %d; the attempt backstop fired instead of the wall-clock bound", attempts)
 	}
 }
 
