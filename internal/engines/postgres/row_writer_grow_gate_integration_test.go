@@ -130,22 +130,22 @@ func growFixtureRows(n int) []ir.Row {
 			"amount":   "12345678901234567890.1234567890", // 38-digit extreme
 			"label":    "row-世界-" + string(rune('A'+i%26)) + "-Ωémoji😀",
 			"blob":     []byte{byte(i), 0x00, 0xff, 0xfe, byte(i * 3)},
-			"doc_text": `{"k":"v","i":` + itoa(i) + `}`,
-			"doc_bin":  `{"a":[1,2,3],"n":` + itoa(i) + `}`,
+			"doc_text": `{"k":"v","i":` + growItoa(i) + `}`,
+			"doc_bin":  `{"a":[1,2,3],"n":` + growItoa(i) + `}`,
 			"ts":       tsBase.Add(time.Duration(i) * time.Minute),
 			"tstz":     tsBase.Add(time.Duration(i) * time.Hour),
 			"flag":     i%2 == 0,
 
 			// Arrays — []any (nested for multi-dim), the IR canonical form.
 			"arr_int":  []any{int64(i), int64(i + 1), int64(i + 2)},
-			"arr_text": []any{"a-" + itoa(i), "b-世界", "c-Ω"},
+			"arr_text": []any{"a-" + growItoa(i), "b-世界", "c-Ω"},
 			// numeric[][] — the EXACT Bug-74 multi-dimensional case (2×2).
 			"arr_num2d": []any{
-				[]any{itoa(i) + ".0001", itoa(i) + ".0002"},
-				[]any{itoa(i) + ".0003", itoa(i) + ".0004"},
+				[]any{growItoa(i) + ".0001", growItoa(i) + ".0002"},
+				[]any{growItoa(i) + ".0003", growItoa(i) + ".0004"},
 			},
 			// text[] with a NULL element (middle slot).
-			"arr_text_null": []any{"x-" + itoa(i), nil, "z-" + itoa(i)},
+			"arr_text_null": []any{"x-" + growItoa(i), nil, "z-" + growItoa(i)},
 
 			// String-shaped non-text OIDs (canonical text form, as the readers
 			// emit under pgx stdlib mode).
@@ -193,7 +193,7 @@ func growFixtureRows(n int) []ir.Row {
 	return rows
 }
 
-func itoa(i int) string {
+func growItoa(i int) string {
 	if i == 0 {
 		return "0"
 	}
@@ -239,12 +239,12 @@ func fmtHex12(i int) string {
 
 func fmtInet(i int) string {
 	// IPv4 host address, varying in the low octet.
-	return "192.168.1." + itoa(i%256)
+	return "192.168.1." + growItoa(i%256)
 }
 
 func fmtCidr(i int) string {
 	// IPv4 network spec (host bits zero — PG canonicalizes cidr).
-	return "10." + itoa(i%256) + ".0.0/16"
+	return "10." + growItoa(i%256) + ".0.0/16"
 }
 
 func fmtMac(i int) string {
@@ -268,7 +268,7 @@ func fmtTimeTZ(i int) string {
 }
 
 func fmt2(i int) string {
-	s := itoa(i)
+	s := growItoa(i)
 	if len(s) < 2 {
 		return "0" + s
 	}
