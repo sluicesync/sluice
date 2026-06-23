@@ -73,6 +73,15 @@ type ChainRestore struct {
 	// by construction). Same semantics as [Restore.TableParallelism].
 	TableParallelism int
 
+	// ChunkParallelism caps how many of a single table's chunks
+	// bulk-apply CONCURRENTLY during each segment full's chunk restore
+	// — the within-table axis (ADR-0112). Threaded into the re-entrant
+	// [Restore] for every segment full; the incremental change-replay
+	// path is untouched (ordered by construction). Composes with
+	// TableParallelism under the same connection-budget bound. Same
+	// semantics as [Restore.ChunkParallelism].
+	ChunkParallelism int
+
 	// ApplyBatchSize is the upper bound on changes per target
 	// transaction during incremental replay. Same shape as
 	// [Streamer.ApplyBatchSize]. Zero falls back to 100 — chain
@@ -312,6 +321,7 @@ func (r *ChainRestore) applyFull(ctx context.Context, full *segmentRecord, dataO
 		Filter:            r.Filter,
 		MaxBufferBytes:    r.MaxBufferBytes,
 		TableParallelism:  r.TableParallelism,
+		ChunkParallelism:  r.ChunkParallelism,
 		SkipChainDispatch: true,
 		DataOnly:          dataOnly,
 		Envelope:          r.Envelope,

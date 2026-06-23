@@ -1178,6 +1178,8 @@ type RestoreCmd struct {
 
 	TableParallelism int `help:"Number of tables bulk-applied CONCURRENTLY during the restore (the write-side analog of pg_restore -j / migrate --table-parallelism). Engine-generic: each concurrent table writes through its own dedicated connection — no snapshot sharing is involved on the write side, so it engages for EVERY target (Postgres, MySQL). The resolved value is bounded by the TARGET's connection budget and clamped to the table count. Applies to chain restores too (each segment full's bulk-apply; incremental change replay stays strictly ordered). 0 (default) = auto: 4. 1 disables cross-table concurrency. See ADR-0084." default:"0" placeholder:"N"`
 
+	BulkParallelism int `help:"Number of a single table's chunks applied CONCURRENTLY (within-table axis), composed with --table-parallelism; bounded by the target connection budget. Each chunk-group worker writes through its own dedicated connection; snapshot chunks are a disjoint partition of the table's rows, so parallel apply cannot collide on a PK on a cold target. Engages only for tables with >= 2 chunks; the two axes multiply (table × bulk) and their product never exceeds the measured budget. Applies to chain restores too (each segment full's bulk-apply). 0 (default) = auto: min(8, NumCPU); 1 = serial (single-stream per table). See ADR-0112." default:"0" placeholder:"N"`
+
 	TargetSchema string `help:"Per-source target schema namespace (Postgres-only). When set, restored tables land in the named schema rather than the DSN's default. Mirrors 'sluice migrate --target-schema' / 'sync start --target-schema' (ADR-0031). PG-only: flat-namespace engines (MySQL) refuse at validate time — operators use a different --target DSN database instead. The schema is auto-created on the target if it doesn't exist. v0.56.0+ closure of the v0.55.0 cycle's UX-gap finding." placeholder:"NAME"`
 
 	EncryptionFlags
@@ -1248,6 +1250,7 @@ func (r *RestoreCmd) Run(g *Globals) error {
 		Filter:           filter,
 		MaxBufferBytes:   r.MaxBufferBytes,
 		TableParallelism: r.TableParallelism,
+		ChunkParallelism: r.BulkParallelism,
 		Envelope:         envelope,
 		TargetSchema:     r.TargetSchema,
 	}

@@ -28,6 +28,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sync/atomic"
+
+	"golang.org/x/sync/errgroup"
 
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
@@ -69,6 +72,26 @@ type Restore struct {
 	// MySQL). The resolved value is bounded by the target's measured
 	// connection budget and clamped to the table count.
 	TableParallelism int
+
+	// ChunkParallelism caps how many of a SINGLE table's chunks
+	// bulk-apply CONCURRENTLY during that table's restore — the
+	// within-table axis (ADR-0112), the restore-side analog of
+	// migrate's BulkParallelism (ADR-0019). 0 = auto (min(8, NumCPU));
+	// 1 = serial (the pre-ADR-0112 single-stream behaviour). When the
+	// resolved value P > 1 AND a table has >= 2 chunks, restoreTable
+	// fans that table's chunk list across P workers, each writing
+	// through its OWN dedicated row-writer connection (via the
+	// openTargetRowWriter factory) and streaming its disjoint subset of
+	// chunks through one WriteRows call. Snapshot chunks are a disjoint
+	// partition of the table's rows, so parallel INSERT cannot collide
+	// on a PK on a cold target (ADR-0112 §Correctness). The two axes
+	// MULTIPLY (table × chunk) and are bounded at the SAME connection-
+	// budget chokepoint migrate uses (resolveTargetCopyParallelism +
+	// resolveCopyParallelismBudget, ADR-0076): within-table is satisfied
+	// first, the table axis takes the remainder, the product never
+	// exceeds the target's measured CopyBudget. Targets without a budget
+	// prober (MySQL) pass through unclamped.
+	ChunkParallelism int
 
 	// SkipChainDispatch, when true, suppresses the chain-detection
 	// branch in [Restore.Run]. Used internally by [ChainRestore] so
@@ -192,6 +215,7 @@ func (r *Restore) Run(ctx context.Context) error {
 				Filter:           r.Filter,
 				MaxBufferBytes:   r.MaxBufferBytes,
 				TableParallelism: r.TableParallelism,
+				ChunkParallelism: r.ChunkParallelism,
 				Envelope:         r.Envelope,
 				TargetSchema:     r.TargetSchema,
 			}
@@ -331,15 +355,21 @@ func (r *Restore) Run(ctx context.Context) error {
 		}
 		tasks = append(tasks, restoreTableTask{table: table, entry: entry})
 	}
-	tableParallelism, err := r.resolveRestoreTableParallelism(ctx, len(tasks))
+	tableParallelism, chunkParallelism, err := r.resolveRestoreParallelism(ctx, len(tasks))
 	if err != nil {
 		return err
 	}
+	// A dedicated-writer factory is needed when EITHER axis fans out:
+	// the cross-table pool opens one per concurrent peer table, and a
+	// within-table chunk fan-out opens one per chunk-group worker
+	// (ADR-0112). Both come through openTargetRowWriter — the single
+	// construction path — so buffer cap + target-schema routing can't
+	// drift across either axis.
 	var factory restoreWriterFactory
-	if tableParallelism > 1 {
+	if tableParallelism > 1 || chunkParallelism > 1 {
 		factory = r.openTargetRowWriter
 	}
-	if err := r.runRestoreTablePool(ctx, tasks, rw, factory, tableParallelism); err != nil {
+	if err := r.runRestoreTablePool(ctx, tasks, rw, factory, tableParallelism, chunkParallelism); err != nil {
 		return err
 	}
 
@@ -402,21 +432,38 @@ func (r *Restore) openTargetRowWriter(ctx context.Context) (ir.RowWriter, error)
 	return rw, nil
 }
 
-// restoreTable bulk-copies every chunk's rows into the target via the
-// row writer, verifying each chunk's SHA-256 along the way. The
-// orchestrator opens one [chunkReader] per chunk; rows from all
-// chunks of a table flow through a single channel into a single
-// [ir.RowWriter.WriteRows] call so the writer's batching / commit
-// logic doesn't reset per chunk.
+// restoreTable bulk-copies a table's chunks into the target, verifying
+// each chunk's SHA-256 along the way.
 //
-// Per-chunk SHA-256 verification is the load-bearing layer-1 check
-// of the proto-ADR's "100% confidence" story. A mismatch is a hard
-// failure — silent corruption is not acceptable.
+// When the resolved within-table parallelism P > 1 AND the table has
+// >= 2 chunks, the chunk list is partitioned across P workers (ADR-0112,
+// the within-table axis): each worker acquires its OWN row-writer
+// connection (worker 0 reuses the supplied primary; peers open dedicated
+// writers via factory), streams its disjoint, contiguous subset of the
+// table's chunks through ONE channel into ONE WriteRows call (so
+// per-worker batch continuity is preserved — batching does not reset per
+// chunk), and returns its rows-applied count. The orchestrator sums the
+// per-worker counts for the layer-2 row-count check, so the manifest
+// cross-check is exactly as strong as the serial path. Snapshot chunks
+// are a disjoint partition of the table's rows, so parallel INSERT
+// cannot collide on a PK on a cold target.
+//
+// P <= 1, or a single-chunk table, runs the original single-stream path
+// through the SAME worker code (one group covering every chunk) with a
+// loud INFO naming why the within-table fan-out didn't engage when it
+// was requested (ADR-0079: never a silent no-op).
+//
+// Per-chunk SHA-256 verification is the load-bearing layer-1 check of
+// the proto-ADR's "100% confidence" story, unchanged and still
+// per-chunk. A mismatch is a hard failure — silent corruption is not
+// acceptable.
 func (r *Restore) restoreTable(
 	ctx context.Context,
 	rw ir.RowWriter,
 	table *ir.Table,
 	entry *irbackup.TableManifest,
+	chunkParallelism int,
+	factory restoreWriterFactory,
 ) error {
 	if len(entry.Chunks) == 0 {
 		slog.InfoContext(ctx, "restore: empty table; no chunks to apply",
@@ -424,6 +471,79 @@ func (r *Restore) restoreTable(
 		return nil
 	}
 
+	groups := partitionChunks(entry.Chunks, r.resolveTableChunkParallelism(ctx, table, len(entry.Chunks), chunkParallelism))
+
+	// errgroup-derived ctx so the first worker's failure cancels its
+	// siblings' producers (the Bug-40b cancel-on-writer-error shape,
+	// replicated per worker — without it a peer producer blocked on
+	// `rowCh <- row` would hang). The serial path (one group) is the
+	// degenerate case of this same code.
+	wg, wctx := errgroup.WithContext(ctx)
+	var rowsApplied atomic.Int64
+	for groupIdx, group := range groups {
+		groupIdx, group := groupIdx, group
+		wg.Go(func() error {
+			// Worker 0 reuses the supplied primary writer; peers open
+			// their own dedicated connection via factory — the SAME
+			// construction path, so buffer cap + target-schema routing
+			// can't drift across the within-table axis.
+			worker := rw
+			if groupIdx > 0 {
+				if factory == nil {
+					return errRestoreChunkPoolNoFactory
+				}
+				w, err := factory(wctx)
+				if err != nil {
+					return err
+				}
+				defer closeIf(w)
+				worker = w
+			}
+			n, err := r.restoreChunkGroup(wctx, worker, table, group)
+			if err != nil {
+				return err
+			}
+			rowsApplied.Add(n)
+			return nil
+		})
+	}
+	if err := wg.Wait(); err != nil {
+		return err
+	}
+
+	// Layer-2 row-count check: the EXACT sum of ACTUALLY-decoded rows
+	// across workers compared to the manifest's RowCount — byte-for-byte
+	// as strong as the serial path. A mismatch stays a HARD failure (no
+	// silent corruption).
+	if entry.RowCount > 0 && rowsApplied.Load() != entry.RowCount {
+		return fmt.Errorf("layer-2 row-count mismatch on table %q: manifest says %d, streamed %d",
+			table.Name, entry.RowCount, rowsApplied.Load())
+	}
+	slog.InfoContext(
+		ctx, "restore: table complete",
+		slog.String("table", table.Name),
+		slog.Int64("rows", entry.RowCount),
+		slog.Int("chunks", len(entry.Chunks)),
+		slog.Int("chunk_workers", len(groups)),
+	)
+	return nil
+}
+
+// restoreChunkGroup streams one worker's contiguous subset of a table's
+// chunks through ONE channel into ONE WriteRows call, returning the
+// rows applied by this worker (for the orchestrator's layer-2 sum).
+//
+// This is the per-worker body of the ADR-0112 within-table fan-out; the
+// serial path is the degenerate one-group case. Each worker owns its
+// own writer (the caller decides reuse-primary vs dedicated), so the
+// channel + producer goroutine + Bug-40b cancel below are entirely
+// worker-local — no cross-worker channel sharing.
+func (r *Restore) restoreChunkGroup(
+	ctx context.Context,
+	rw ir.RowWriter,
+	table *ir.Table,
+	group []*irbackup.ChunkInfo,
+) (int64, error) {
 	// Bug 40b fix (v0.20.1): wrap the producer goroutine in a derived
 	// context so a writer-side failure can cancel the producer.
 	// Pre-fix: the producer pushed rows into an unbuffered channel
@@ -439,15 +559,29 @@ func (r *Restore) restoreTable(
 	defer streamCancel()
 
 	rowCh := make(chan ir.Row)
-	errCh := make(chan error, 1)
+	// The producer reports either an error OR the count of rows it
+	// actually decoded+streamed for this group (the ACTUAL count, not
+	// the manifest sum — so the orchestrator's layer-2 cross-check is
+	// exactly as strong as the serial path even for chunks whose
+	// manifest RowCount is unrecorded). Buffered-1 so the producer never
+	// blocks reporting.
+	type groupResult struct {
+		rows int64
+		err  error
+	}
+	resCh := make(chan groupResult, 1)
 
 	go func() {
 		defer close(rowCh)
 		var rowsApplied int64
-		for chunkIdx, chunk := range entry.Chunks {
+		for chunkIdx, chunk := range group {
+			// streamChunkRows verifies each chunk's SHA-256 AND
+			// cross-checks the decoded count against the chunk's manifest
+			// RowCount (the per-chunk layer-2 check); a mismatch on either
+			// is a hard failure surfaced here.
 			chunkRows, err := r.streamChunkRows(streamCtx, chunk, rowCh)
 			if err != nil {
-				errCh <- fmt.Errorf("chunk %d (%s): %w", chunkIdx, chunk.File, err)
+				resCh <- groupResult{err: fmt.Errorf("chunk %d (%s): %w", chunkIdx, chunk.File, err)}
 				return
 			}
 			rowsApplied += chunkRows
@@ -458,23 +592,21 @@ func (r *Restore) restoreTable(
 				slog.Int64("rows", chunkRows),
 			)
 		}
-		if entry.RowCount > 0 && rowsApplied != entry.RowCount {
-			errCh <- fmt.Errorf("layer-2 row-count mismatch on table %q: manifest says %d, streamed %d",
-				table.Name, entry.RowCount, rowsApplied)
-			return
-		}
-		errCh <- nil
+		resCh <- groupResult{rows: rowsApplied}
 	}()
 
 	// DataOnly (later rotation-segment full): use the idempotent
 	// upsert writer when the engine exposes it so re-applying the
 	// snapshot over the prior segment's restored rows converges
-	// (ON CONFLICT / ON DUPLICATE KEY UPDATE). Engines without the
-	// surface, or no-PK tables, fall back to plain WriteRows — the
-	// caller's lineage invariant (S_n >= prior end) means the rows are
-	// at-or-ahead, so a plain insert only collides on a PK the upsert
-	// would have updated to the same value; the idempotent path is the
-	// correct one and shipping engines (PG, MySQL) implement it.
+	// (ON CONFLICT / ON DUPLICATE KEY UPDATE). Each worker type-asserts
+	// its OWN writer, so the dispatch decision is independent and
+	// idempotent upsert is order- and concurrency-independent for the
+	// disjoint rows of a snapshot. Engines without the surface, or
+	// no-PK tables, fall back to plain WriteRows — the caller's lineage
+	// invariant (S_n >= prior end) means the rows are at-or-ahead, so a
+	// plain insert only collides on a PK the upsert would have updated
+	// to the same value; the idempotent path is the correct one and
+	// shipping engines (PG, MySQL) implement it.
 	writeFn := rw.WriteRows
 	if r.DataOnly {
 		if iw, ok := rw.(ir.IdempotentRowWriter); ok {
@@ -484,7 +616,7 @@ func (r *Restore) restoreTable(
 	if err := writeFn(ctx, table, rowCh); err != nil {
 		// Bug 40b: cancel the producer's context so a goroutine
 		// blocked on `rowCh <- row` unblocks via the streamChunkRows
-		// `<-ctx.Done()` arm. Without this, `<-errCh` below would
+		// `<-ctx.Done()` arm. Without this, `<-resCh` below would
 		// deadlock — the silent-hang shape from Bug 40.
 		slog.ErrorContext(
 			ctx, "restore: write rows failed; cancelling chunk producer",
@@ -492,19 +624,89 @@ func (r *Restore) restoreTable(
 			slog.String("err", err.Error()),
 		)
 		streamCancel()
-		<-errCh
-		return fmt.Errorf("write rows for table %q: %w", table.Name, err)
+		<-resCh
+		return 0, fmt.Errorf("write rows for table %q: %w", table.Name, err)
 	}
-	if err := <-errCh; err != nil {
-		return err
+	res := <-resCh
+	if res.err != nil {
+		return 0, res.err
+	}
+	return res.rows, nil
+}
+
+// errRestoreChunkPoolNoFactory is the loud precondition guard for the
+// within-table chunk fan-out: a peer worker (groupIdx > 0) needs a
+// dedicated writer, which the orchestrator only configures together with
+// a writer factory. Reaching it with a nil factory is a programming
+// error, surfaced rather than silently deref'd. Mirrors
+// [errRestorePoolNoFactory].
+var errRestoreChunkPoolNoFactory = errors.New("pipeline: restore chunk fan-out: dedicated writer needed but no writer factory configured")
+
+// partitionChunks splits chunks into p contiguous, disjoint groups so
+// each within-table worker streams ONE run of chunks through ONE
+// WriteRows call (preserving per-worker batch continuity). The split is
+// near-even: the first (len%p) groups get one extra chunk. Ordering
+// within a group is the manifest's chunk order, unchanged. p <= 1, or
+// fewer chunks than p, collapses to the appropriate group count (never
+// an empty group). Returns at least one group whenever chunks is
+// non-empty.
+func partitionChunks(chunks []*irbackup.ChunkInfo, p int) [][]*irbackup.ChunkInfo {
+	if p < 1 {
+		p = 1
+	}
+	if p > len(chunks) {
+		p = len(chunks)
+	}
+	if p <= 1 {
+		return [][]*irbackup.ChunkInfo{chunks}
+	}
+	groups := make([][]*irbackup.ChunkInfo, 0, p)
+	base := len(chunks) / p
+	rem := len(chunks) % p
+	start := 0
+	for i := 0; i < p; i++ {
+		size := base
+		if i < rem {
+			size++
+		}
+		groups = append(groups, chunks[start:start+size])
+		start += size
+	}
+	return groups
+}
+
+// resolveTableChunkParallelism decides the effective within-table
+// worker count for ONE table: the already-budget-resolved
+// chunkParallelism, but collapsed to serial (1) when there are fewer
+// than 2 chunks to spread. When the operator requested the fan-out
+// (chunkParallelism > 1) but a table can't use it, that's logged loudly
+// (ADR-0112 / ADR-0079: never a silent no-op) naming the reason —
+// mirroring resolveRestoreTableParallelism's serialReason pattern.
+func (r *Restore) resolveTableChunkParallelism(ctx context.Context, table *ir.Table, chunkCount, chunkParallelism int) int {
+	if chunkParallelism <= 1 {
+		return 1
+	}
+	if chunkCount < 2 {
+		slog.InfoContext(
+			ctx, "restore: within-table chunk parallel apply not engaged; applying chunks serially",
+			slog.String("table", table.Name),
+			slog.String("reason", "table has fewer than 2 chunks"),
+			slog.Int("requested_chunk_parallelism", chunkParallelism),
+			slog.Int("chunks", chunkCount),
+		)
+		return 1
+	}
+	effective := chunkParallelism
+	if effective > chunkCount {
+		effective = chunkCount // never spawn more workers than chunks
 	}
 	slog.InfoContext(
-		ctx, "restore: table complete",
+		ctx, "restore: within-table chunk parallel apply engaged (ADR-0112)",
 		slog.String("table", table.Name),
-		slog.Int64("rows", entry.RowCount),
-		slog.Int("chunks", len(entry.Chunks)),
+		slog.Int("chunk_parallelism", effective),
+		slog.Int("chunks", chunkCount),
 	)
-	return nil
+	return effective
 }
 
 // streamChunkRows opens chunk in the store, decodes every row, sends
