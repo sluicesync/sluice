@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.109] - 2026-06-23
+
+### Fixed
+
+- **Bug 159 (HIGH, loud-safe): the concurrent CDC apply path now persists the resume watermark on a low-volume marker-less stream — it was frozen at the cold-start anchor (`{"last_id":0}`) for a sparse postgres-trigger source.** The concurrent key-hash apply orchestrator (`internal/laneapply`, the default since ADR-0106/v0.99.91) checkpointed the persisted `source_position` only every 2000 routed changes, at a barrier, or at clean end-of-stream. A **low-volume, marker-less** stream — notably a `postgres-trigger` source, whose reader emits row changes but no `TxBegin`/`TxCommit` markers — hits none of those, so the watermark never advanced past the cold-start anchor. Data still converged idempotently and warm-resume still produced correct data, so there was **no data loss** — but the consumed watermark never persisted, which meant the source `sluice_change_log` could never be pruned (unbounded growth) and every warm-resume re-read the entire change-log from id 0 and re-applied it (at-least-once re-read). The serial applier was immune via its existing item-18 100 ms idle flush; the gap surfaced only once ADR-0106 made the concurrent path the default. The fix adds a 1-second idle-checkpoint tick to the orchestrator that persists the **durable frontier** on a quiet stream (mirroring the serial idle flush) and records the trailing boundary of a marker-less position-run so the last applied change becomes checkpointable. It only ever persists a fully-durable frontier boundary, so the position can never lead committed data (the exactly-once contract is unchanged), and it is a no-op on a marker stream (MySQL binlog / Postgres with Tx markers — so the v0.99.89/v0.99.90 mid-transaction-position protections are untouched). Found by the post-release regression cycle; root-caused with the three-phase protocol against a live rig (ground truth: persisted `last_id=0` vs change-log `max(id)=4` at production-default concurrency). Pinned by a unit test (a low-volume marker-less stream checkpoints mid-stream) and a postgres-trigger integration test (`source_position` advances past 0 after CDC changes apply) — both verified to fail against the unpatched code.
+
 ## [0.99.108] - 2026-06-22
 
 ### Added
