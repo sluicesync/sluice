@@ -25,6 +25,10 @@ type restoreRecorderEngine struct {
 	phases []string
 	// Per-table rows recorded by the row writer.
 	rows map[string][]ir.Row
+	// growGateSets counts SetGrowGate calls with a NON-nil gate across all
+	// row writers this engine handed out — pins the ADR-0110 grow-gate
+	// wiring into the restore path (the Track-C silent-under-copy fix).
+	growGateSets int
 }
 
 func newRestoreRecorderEngine(name string) *restoreRecorderEngine {
@@ -124,6 +128,18 @@ func (w *restoreRecordingRowWriter) WriteRows(_ context.Context, table *ir.Table
 	}
 	w.engine.recordPhase("WriteRows:" + table.Name)
 	return nil
+}
+
+// SetGrowGate implements [ir.GrowGateSetter] so the recorder can pin that
+// restore wires the ADR-0110 coordinated grow-gate onto every writer it
+// opens. A non-nil gate increments the engine's counter.
+func (w *restoreRecordingRowWriter) SetGrowGate(gate ir.GrowGate) {
+	if gate == nil {
+		return
+	}
+	w.engine.mu.Lock()
+	defer w.engine.mu.Unlock()
+	w.engine.growGateSets++
 }
 
 func TestRestore_Validate(t *testing.T) {
@@ -240,6 +256,43 @@ func TestBackupRestore_FullRoundTrip(t *testing.T) {
 				t.Errorf("users[%d].%s: got %v want %v", i, k, got[k], wantV)
 			}
 		}
+	}
+}
+
+// TestRestore_WiresGrowGate pins the ADR-0110 grow-gate wiring into the
+// restore path (the Track-C silent-under-copy fix): every writer the
+// restore opens must receive a NON-nil coordinated grow-gate so concurrent
+// restore workers quiesce together through a storage-grow reparent instead
+// of independently hammering the target and outrunning its replication.
+// The bug was that restore — unlike the migrate cold-copy — never wired the
+// gate, so SetGrowGate was never called.
+func TestRestore_WiresGrowGate(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewLocalStore(dir)
+	if err != nil {
+		t.Fatalf("NewLocalStore: %v", err)
+	}
+	schema := &ir.Schema{Tables: []*ir.Table{{
+		Name:    "t",
+		Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
+	}}}
+	rows := map[string][]ir.Row{"t": {{"id": int64(1)}, {"id": int64(2)}}}
+
+	src := newBackupRecorderEngine("postgres", schema, rows)
+	if err := (&Backup{Source: src, SourceDSN: "src", Store: store, ChunkRows: 10}).Run(context.Background()); err != nil {
+		t.Fatalf("Backup.Run: %v", err)
+	}
+
+	tgt := newRestoreRecorderEngine("postgres")
+	if err := (&Restore{Target: tgt, TargetDSN: "tgt", Store: store}).Run(context.Background()); err != nil {
+		t.Fatalf("Restore.Run: %v", err)
+	}
+
+	tgt.mu.Lock()
+	n := tgt.growGateSets
+	tgt.mu.Unlock()
+	if n < 1 {
+		t.Fatalf("restore wired the grow-gate to %d writers; want >=1 (gate never reached the writers — the Track-C silent-loss regression)", n)
 	}
 }
 

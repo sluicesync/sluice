@@ -4,7 +4,15 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.117] - 2026-06-23
+
+### Fixed
+
+- **CRITICAL — concurrent restore (ADR-0112) could silently under-copy rows on a target undergoing a live storage-grow reparent; now fixed by wiring the ADR-0110 coordinated grow-gate into the restore path.** The Track-C live A/B (full MySQL backup → fresh PlanetScale-MySQL PS-10, restored serially vs. in parallel) caught this: the parallel restore finished `rc=0` with every table logged complete, but six tables were short by up to 6.1 M rows versus the manifest, while the serial restore matched the manifest exactly. Root cause (Phase-A log forensics): during the fresh instance's first storage auto-grow the volume filled (`Error 1114 "table is full"`) and reparented (`Error 1105 QueryList.TerminateAll()`), and restore's concurrent writers (the table×chunk fan-out) each *independently* retried — hammering the struggling target and, because parallel writes ~2.4× faster than serial, outrunning the target's replication so the new primary came up without the recently-committed-but-unreplicated rows. There were zero tolerated dup-keys, confirming the lost rows were never retried (committed + acked on the old primary, dropped on reparent). The serial path, naturally calm, stayed within replication and lost nothing. **Fix:** restore now constructs the same engine-neutral coordinated grow-gate the `migrate` cold-copy uses (signal-driven; `internal/pipeline/grow_gate.go`, ADR-0110) and wires it onto *every* restore writer (primary, cross-table-pool, and within-table chunk-worker) via the single `openTargetRowWriter` construction path — so the first classified grow-transient on any worker **quiesces all workers together** through the reparent instead of hammering, matching the migrate cold-copy that is byte-perfect through grows. Restore was the one bulk-copy path that never had the gate wired. Pinned by a unit test asserting the gate reaches the writers; live-re-validated parallel-restore byte-identical to the manifest on a fresh reparenting PS-10. (A scale-aware post-restore row-count verification is tracked separately as a defense-in-depth backstop; a full `COUNT(*)` gate is impractical on very large tables, so prevention via the grow-gate is the primary fix.)
+
 ## [0.99.116] - 2026-06-23
+
+> ⚠️ **Known issue (fixed in v0.99.117):** the within-table restore parallelism added here can **silently under-copy rows** when restoring into a target that undergoes a **storage-grow reparent mid-restore** (notably a fresh non-Metal PlanetScale instance crossing its first auto-grow): concurrent writers outrun the target's replication across the reparent and the restore still reports success. Upgrade to **v0.99.117**, which wires the ADR-0110 coordinated grow-gate into the restore path. Serial restore (`--bulk-parallelism 1`) is unaffected.
 
 ### Added
 

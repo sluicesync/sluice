@@ -148,6 +148,21 @@ type Restore struct {
 	// with SkipChainDispatch). Recorded, never sniffed (ADR-0046 §5).
 	// Set by Run / by ChainRestore.applyFull.
 	segCodec Codec
+
+	// growGate is the run's shared coordinated cold-copy grow-window pause
+	// (ADR-0110), constructed unconditionally in Run and applied to EVERY
+	// restore writer via [openTargetRowWriter] (the single construction
+	// path). Without it, a concurrent restore (ADR-0112 table×chunk
+	// fan-out) hammer-retries a storage-growing target independently per
+	// worker and can outrun the target's replication during a grow/
+	// reparent — the silent under-copy found on the live PS-10 A/B (Track
+	// C, 2026-06-23). With the gate, the first classified grow-transient
+	// on any worker quiesces ALL workers together so writes don't outrun
+	// replication across the reparent, matching the migrate cold-copy that
+	// is byte-perfect through grows. Signal-driven (recovered=nil) — the
+	// restore path wires no telemetry provider, so it relies on the
+	// universal signal floor, exactly as the migrate cold-copy does.
+	growGate ir.GrowGate
 }
 
 // lineageNeedsWalk reports whether the store's lineage requires the
@@ -320,6 +335,16 @@ func (r *Restore) Run(ctx context.Context) error {
 	applyTargetSchema(sw, r.TargetSchema)
 	defer closeIf(sw)
 
+	// Construct the run's shared coordinated grow-gate (ADR-0110) BEFORE
+	// opening any row writer, so every writer openTargetRowWriter hands out
+	// — the primary here, plus the cross-table-pool and within-table
+	// chunk-worker writers (ADR-0112) — takes its grow-aware flush path.
+	// Signal-driven (recovered=nil), matching the migrate cold-copy: the
+	// first classified grow-transient on any worker quiesces ALL workers so
+	// a concurrent restore can't outrun the target's replication across a
+	// storage-grow reparent (the Track-C live silent-under-copy fix).
+	r.growGate = growGateOrNil(newGrowGate(ctx, nil))
+
 	rw, err := r.openTargetRowWriter(ctx)
 	if err != nil {
 		return err
@@ -429,6 +454,12 @@ func (r *Restore) openTargetRowWriter(ctx context.Context) (ir.RowWriter, error)
 	}
 	applyMaxBufferBytes(rw, r.MaxBufferBytes)
 	applyTargetSchema(rw, r.TargetSchema)
+	// Wire the run's shared grow-gate (ADR-0110) onto every writer so the
+	// MySQL writer's flushWithReparentRetry awaits/trips it — coordinating
+	// all concurrent restore workers through a storage-grow reparent instead
+	// of independently hammering (the Track-C silent-under-copy fix). nil
+	// gate (direct unit-test callers that don't go through Run) is a no-op.
+	applyGrowGate(rw, r.growGate)
 	return rw, nil
 }
 
