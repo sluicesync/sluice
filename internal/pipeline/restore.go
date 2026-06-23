@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 
 	"golang.org/x/sync/errgroup"
@@ -163,6 +164,62 @@ type Restore struct {
 	// restore path wires no telemetry provider, so it relies on the
 	// universal signal floor, exactly as the migrate cold-copy does.
 	growGate ir.GrowGate
+
+	// reparentTracker collects the set of tables a writer reported as
+	// reparent-touched (ADR-0113). The grow-gate calms the target but
+	// cannot recover rows a PlanetScale storage-grow reparent dropped
+	// BEFORE the first transient was seen; after the bulk copy the restore
+	// re-derives exactly these tables from their immutable chunks (TRUNCATE
+	// + serial redo, or idempotent re-apply for a chain segment) so each
+	// matches the manifest regardless of what the reparent dropped. nil ⇒
+	// no tracking (direct unit-test callers that bypass Run).
+	reparentTracker *reparentTracker
+}
+
+// reparentTracker is the thread-safe set of reparent-touched tables fed by
+// the writers' [ir.ReparentObserverSetter] callback and drained by the
+// restore reconciliation phase (ADR-0113).
+type reparentTracker struct {
+	mu      sync.Mutex
+	touched map[string]bool
+}
+
+func newReparentTracker() *reparentTracker {
+	return &reparentTracker{touched: map[string]bool{}}
+}
+
+// mark records table as reparent-touched. Safe for concurrent calls from
+// every restore writer.
+func (t *reparentTracker) mark(table string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.touched[table] = true
+}
+
+// drain returns the current touched set and clears it, so a reconciliation
+// round can re-derive those tables while a concurrent redo that itself hits
+// a reparent re-marks for the next round.
+func (t *reparentTracker) drain() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.touched) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(t.touched))
+	for k := range t.touched {
+		out = append(out, k)
+	}
+	t.touched = map[string]bool{}
+	return out
+}
+
+// reparentMark returns the observer callback to wire onto each writer, or
+// nil when no tracker is constructed (so applyReparentObserver no-ops).
+func (r *Restore) reparentMark() func(string) {
+	if r.reparentTracker == nil {
+		return nil
+	}
+	return r.reparentTracker.mark
 }
 
 // lineageNeedsWalk reports whether the store's lineage requires the
@@ -344,6 +401,12 @@ func (r *Restore) Run(ctx context.Context) error {
 	// a concurrent restore can't outrun the target's replication across a
 	// storage-grow reparent (the Track-C live silent-under-copy fix).
 	r.growGate = growGateOrNil(newGrowGate(ctx, nil))
+	// ADR-0113: the reparent tracker collects tables that hit a grow/reparent
+	// transient during apply, so the reconciliation phase below can re-derive
+	// exactly those from their chunks (recovering rows the reparent dropped
+	// that the gate cannot). Constructed before any writer opens so every
+	// writer receives the observer through openTargetRowWriter.
+	r.reparentTracker = newReparentTracker()
 
 	rw, err := r.openTargetRowWriter(ctx)
 	if err != nil {
@@ -396,6 +459,16 @@ func (r *Restore) Run(ctx context.Context) error {
 	}
 	if err := r.runRestoreTablePool(ctx, tasks, rw, factory, tableParallelism, chunkParallelism); err != nil {
 		return err
+	}
+
+	// ADR-0113: reconcile any reparent-touched table. The grow-gate calms a
+	// storage-growing target but cannot recover rows its reparent dropped
+	// before the first transient was seen (PlanetScale promotes a new primary
+	// behind the async-acked window). Re-derive each touched table from its
+	// immutable chunks so it exactly matches the manifest. No-op when no
+	// reparent occurred.
+	if err := r.reconcileReparentTouched(ctx, rw, tasks); err != nil {
+		return wrapWithHint(PhaseBulkCopy, err)
 	}
 
 	if r.DataOnly {
@@ -460,7 +533,106 @@ func (r *Restore) openTargetRowWriter(ctx context.Context) (ir.RowWriter, error)
 	// of independently hammering (the Track-C silent-under-copy fix). nil
 	// gate (direct unit-test callers that don't go through Run) is a no-op.
 	applyGrowGate(rw, r.growGate)
+	// ADR-0113: wire the run's reparent observer so this writer reports any
+	// table it sees hit a grow/reparent transient — the reconciliation
+	// phase re-derives those tables. nil observer (no tracker / non-restore
+	// callers) is a no-op.
+	applyReparentObserver(rw, r.reparentMark())
 	return rw, nil
+}
+
+// applyReparentObserver wires the run's reparent-touched observer (ADR-0113)
+// onto a freshly-opened writer that opts in via [ir.ReparentObserverSetter].
+// nil observe (no tracker constructed) or an engine that doesn't implement
+// the setter is a no-op — pre-ADR-0113 behaviour, byte-for-byte. Called
+// alongside applyGrowGate, on the single openTargetRowWriter path, so every
+// restore writer reports through the same tracker.
+func applyReparentObserver(target any, observe func(table string)) {
+	if observe == nil {
+		return
+	}
+	if setter, ok := target.(ir.ReparentObserverSetter); ok {
+		setter.SetReparentObserver(observe)
+	}
+}
+
+// reconcileMaxRounds bounds the ADR-0113 reconciliation loop: a target that
+// reparents on EVERY serial redo is wedged (not a transient grow), so after
+// this many rounds the restore surfaces loudly rather than looping forever.
+// In practice one round suffices — by reconciliation time the volume has
+// grown to its final size, so a redo writes into an already-grown volume and
+// triggers no fresh reparent.
+const reconcileMaxRounds = 10
+
+// reconcileReparentTouched re-derives every reparent-touched table from its
+// chunks (ADR-0113) so it exactly matches the manifest, recovering rows a
+// storage-grow reparent dropped that the grow-gate could not. Each redo runs
+// through the SAME reparent-retry + observer, so a redo that itself hits a
+// reparent re-marks its table for the next round; the loop ends when a full
+// pass observes no new touches (the sound proxy for "no reparent ⇒ no loss",
+// since a reparent is the only loss vector). No-op when no reparent occurred.
+func (r *Restore) reconcileReparentTouched(ctx context.Context, rw ir.RowWriter, tasks []restoreTableTask) error {
+	if r.reparentTracker == nil {
+		return nil
+	}
+	byName := make(map[string]restoreTableTask, len(tasks))
+	for _, t := range tasks {
+		byName[t.table.Name] = t
+	}
+	for round := 1; ; round++ {
+		touched := r.reparentTracker.drain()
+		if len(touched) == 0 {
+			return nil
+		}
+		if round > reconcileMaxRounds {
+			return fmt.Errorf(
+				"restore: reparent reconciliation did not converge after %d rounds — the target keeps reparenting during the serial redo (still-touched: %v); re-run with --bulk-parallelism 1 or restore into a pre-sized / Metal target",
+				reconcileMaxRounds, touched,
+			)
+		}
+		slog.WarnContext(
+			ctx, "restore: reconciling reparent-touched tables (ADR-0113) — re-deriving each from its chunks to recover any rows the target's storage-grow reparent dropped",
+			slog.Int("round", round),
+			slog.Int("tables", len(touched)),
+			slog.Any("table_names", touched),
+		)
+		for _, name := range touched {
+			task, ok := byName[name]
+			if !ok {
+				// Touched a table outside this run's task set (e.g. filtered
+				// out after the mark) — nothing to re-derive.
+				continue
+			}
+			if err := r.reapplyTableForReconcile(ctx, rw, task.table, task.entry); err != nil {
+				return fmt.Errorf("reconcile table %q: %w", name, err)
+			}
+		}
+	}
+}
+
+// reapplyTableForReconcile re-derives one table from its chunks (ADR-0113).
+// Non-DataOnly cold restore: TRUNCATE then redo SERIALLY (chunkParallelism=1
+// — the pace that never outruns replication) into the now-empty table; no
+// primary-key/UPSERT needed, and indexes/constraints are later phases so the
+// TRUNCATE is clean and cheap. DataOnly (chain rotation segment): skip the
+// truncate (it would wipe a prior segment) and re-apply idempotently — the
+// idempotent writer restoreTable selects converges. The serial redo reuses
+// the supplied primary writer (which carries the reparent observer), so a
+// reparent during the redo re-marks the table for another round.
+func (r *Restore) reapplyTableForReconcile(ctx context.Context, rw ir.RowWriter, table *ir.Table, entry *irbackup.TableManifest) error {
+	if !r.DataOnly {
+		truncator, ok := rw.(ir.TableTruncator)
+		if !ok {
+			return fmt.Errorf(
+				"target engine %q cannot TRUNCATE for reconciliation of %q; re-run with --bulk-parallelism 1",
+				r.Target.Name(), table.Name,
+			)
+		}
+		if err := truncator.TruncateTable(ctx, table); err != nil {
+			return fmt.Errorf("truncate before redo: %w", err)
+		}
+	}
+	return r.restoreTable(ctx, rw, table, entry, 1, nil)
 }
 
 // restoreTable bulk-copies a table's chunks into the target, verifying

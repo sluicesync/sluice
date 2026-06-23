@@ -29,10 +29,22 @@ type restoreRecorderEngine struct {
 	// row writers this engine handed out — pins the ADR-0110 grow-gate
 	// wiring into the restore path (the Track-C silent-under-copy fix).
 	growGateSets int
+
+	// --- ADR-0113 reparent-reconciliation simulation ---
+	// dropTable (when non-empty) names a table whose FIRST WriteRows drops
+	// its last row AND reports the table reparent-touched (via the wired
+	// observer) — modelling PlanetScale's grow-reparent dropping a
+	// committed-but-unreplicated row. The reconciliation phase must then
+	// TRUNCATE + redo the table and recover the full set. Empty ⇒ no drop
+	// (every other test is unaffected).
+	dropTable       string
+	dropped         map[string]bool
+	reparentObserve func(table string)
+	reconcileRedos  int // counts truncate+redo reapplies for assertions
 }
 
 func newRestoreRecorderEngine(name string) *restoreRecorderEngine {
-	return &restoreRecorderEngine{name: name, rows: map[string][]ir.Row{}}
+	return &restoreRecorderEngine{name: name, rows: map[string][]ir.Row{}, dropped: map[string]bool{}}
 }
 
 func (e *restoreRecorderEngine) Name() string                  { return e.name }
@@ -123,10 +135,52 @@ type restoreRecordingRowWriter struct {
 }
 
 func (w *restoreRecordingRowWriter) WriteRows(_ context.Context, table *ir.Table, rows <-chan ir.Row) error {
+	got := make([]ir.Row, 0)
 	for r := range rows {
-		w.engine.recordRow(table.Name, r)
+		got = append(got, r)
 	}
+
+	// ADR-0113 simulation: on the FIRST write of the configured drop-table,
+	// drop the last row and report a reparent — modelling a grow-reparent
+	// silently dropping a committed-but-unreplicated row. The reconciliation
+	// phase must TRUNCATE + redo and recover it.
+	w.engine.mu.Lock()
+	if w.engine.dropTable != "" && table.Name == w.engine.dropTable && !w.engine.dropped[table.Name] {
+		w.engine.dropped[table.Name] = true
+		observe := w.engine.reparentObserve
+		w.engine.mu.Unlock()
+		if len(got) > 0 {
+			got = got[:len(got)-1] // the dropped (lost) row
+		}
+		if observe != nil {
+			observe(table.Name) // mark reparent-touched
+		}
+		w.engine.mu.Lock()
+	}
+	w.engine.rows[table.Name] = append(w.engine.rows[table.Name], got...)
+	w.engine.mu.Unlock()
+
 	w.engine.recordPhase("WriteRows:" + table.Name)
+	return nil
+}
+
+// SetReparentObserver implements [ir.ReparentObserverSetter] — the engine
+// stores the latest observer so the drop-table's simulated reparent can
+// report itself for reconciliation.
+func (w *restoreRecordingRowWriter) SetReparentObserver(observe func(table string)) {
+	w.engine.mu.Lock()
+	defer w.engine.mu.Unlock()
+	w.engine.reparentObserve = observe
+}
+
+// TruncateTable implements [ir.TableTruncator] — clears the recorded rows
+// for the table so the reconciliation redo re-derives the full set into an
+// empty table (the cold-restore TRUNCATE+redo path).
+func (w *restoreRecordingRowWriter) TruncateTable(_ context.Context, table *ir.Table) error {
+	w.engine.mu.Lock()
+	defer w.engine.mu.Unlock()
+	delete(w.engine.rows, table.Name)
+	w.engine.reconcileRedos++
 	return nil
 }
 
@@ -293,6 +347,52 @@ func TestRestore_WiresGrowGate(t *testing.T) {
 	tgt.mu.Unlock()
 	if n < 1 {
 		t.Fatalf("restore wired the grow-gate to %d writers; want >=1 (gate never reached the writers — the Track-C silent-loss regression)", n)
+	}
+}
+
+// TestRestore_ReparentReconciliation_RecoversDroppedRows is the
+// load-bearing ADR-0113 test: a target that silently drops a row on a
+// simulated grow-reparent (and reports the table touched) must be
+// reconciled — the restore TRUNCATE+redoes the touched table from its
+// chunks and recovers the full row set. Without reconciliation the table
+// would be permanently short (the Track-C silent-under-copy class).
+func TestRestore_ReparentReconciliation_RecoversDroppedRows(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewLocalStore(dir)
+	if err != nil {
+		t.Fatalf("NewLocalStore: %v", err)
+	}
+	schema := &ir.Schema{Tables: []*ir.Table{
+		{Name: "t", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+		{Name: "u", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+	}}
+	rows := map[string][]ir.Row{
+		"t": {{"id": int64(1)}, {"id": int64(2)}, {"id": int64(3)}, {"id": int64(4)}, {"id": int64(5)}},
+		"u": {{"id": int64(10)}, {"id": int64(11)}, {"id": int64(12)}},
+	}
+	src := newBackupRecorderEngine("postgres", schema, rows)
+	if err := (&Backup{Source: src, SourceDSN: "src", Store: store, ChunkRows: 100}).Run(context.Background()); err != nil {
+		t.Fatalf("Backup.Run: %v", err)
+	}
+
+	tgt := newRestoreRecorderEngine("postgres")
+	tgt.dropTable = "t" // simulate the reparent dropping a row from table t
+	if err := (&Restore{Target: tgt, TargetDSN: "tgt", Store: store}).Run(context.Background()); err != nil {
+		t.Fatalf("Restore.Run: %v", err)
+	}
+
+	_, gotRows := tgt.snapshot()
+	if n := len(gotRows["t"]); n != 5 {
+		t.Errorf("table t after reconciliation: got %d rows, want 5 (reparent-dropped row not recovered — silent under-copy)", n)
+	}
+	if n := len(gotRows["u"]); n != 3 {
+		t.Errorf("untouched table u: got %d rows, want 3", n)
+	}
+	tgt.mu.Lock()
+	redos := tgt.reconcileRedos
+	tgt.mu.Unlock()
+	if redos != 1 {
+		t.Errorf("reconcile redos = %d; want exactly 1 (only the touched table t truncated+redone)", redos)
 	}
 }
 

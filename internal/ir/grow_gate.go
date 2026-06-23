@@ -59,3 +59,25 @@ type GrowGate interface {
 type GrowGateSetter interface {
 	SetGrowGate(gate GrowGate)
 }
+
+// ReparentObserverSetter is the OPTIONAL surface a cold-copy [RowWriter]
+// implements to report, per table, that it observed a classified
+// storage-grow / reparent transient while writing — the signal the restore
+// reconciliation phase (ADR-0113) uses to know which tables a target's
+// reparent may have silently under-copied (PlanetScale's grow-reparent can
+// drop committed-but-unreplicated rows that the reactive grow-gate cannot
+// recover, because they were lost before the first transient was seen).
+//
+// The writer calls the observer with the table name at the SAME point it
+// trips the [GrowGate] (the first classified transient on a flush). The
+// restore wires one observer per run onto every writer via this setter
+// (the same construction-time pattern as [GrowGateSetter]); after the bulk
+// copy it re-derives every marked table from its immutable chunks (TRUNCATE
+// + serial redo, or idempotent re-apply for a chain segment) so the table
+// exactly matches the manifest regardless of what the reparent dropped.
+//
+// A nil observer (or a writer that doesn't implement the setter) ⇒ no
+// reconciliation tracking, byte-for-byte the pre-ADR-0113 behaviour.
+type ReparentObserverSetter interface {
+	SetReparentObserver(observe func(table string))
+}
