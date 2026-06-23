@@ -4,6 +4,13 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.110] - 2026-06-23
+
+### Fixed
+
+- **PlanetScale telemetry on a Postgres target now reads CPU and memory (the operator's #1-priority metrics), which were being silently dropped (ADR-0107 follow-up, found by the live PG-160 test).** The per-pod CPU/mem metric (`planetscale_pods_*_util_percentages`) is emitted once **per container** on a PlanetScale Postgres branch (`postgres`, `pgbouncer`, `walg-daemon`, all under `planetscale_component="hzinstance"` with no `tablet_type` label), so the Vitess-shaped primary-series selector found no `vttablet`/`primary` match and — with more than one series — refused to guess, leaving `CPUKnown`/`MemKnown` false for every PG target. (Storage was unaffected: the PG volume metric is a single series, so the single-series fallback already picked it.) The selector is now engine-aware: a Postgres target selects the `planetscale_container="postgres"` series; MySQL/Vitess keep the existing `vttablet`+`primary` cascade unchanged. Verified against the live PlanetScale PG metrics endpoint. This makes the item-32 proactive back-off, the item-35 rolling history, and the item-36 threshold alerts all actually see CPU/mem on a Postgres target.
+- **Corrected the Postgres replica-lag metric name, which named a series the live endpoint does not expose.** ADR-0107 Phase 3 guessed `planetscale_postgres_replica_lag_seconds`; the live PG endpoint has no such metric (it exposes `planetscale_postgres_wal_archiver_lag_bytes` / `wal_size_bytes`, a different signal, and a single-node PG has no replica lag at all). The bogus name already produced `LagKnown=false` (no match), so this is behaviorally a no-op — the constant is now simply unset, documenting the live finding, so PG replica-lag stays an honest "unobserved" rather than naming a non-existent series. (PG connection metrics remain intentionally unmapped, as before.)
+
 ## [0.99.109] - 2026-06-23
 
 ### Fixed

@@ -107,9 +107,11 @@ func TestDistill_PostgresEngine_UsesPGNames(t *testing.T) {
 	if snap.StorageAvailableBytes != 40000000000 || snap.StorageCapacityBytes != 160000000000 {
 		t.Errorf("raw storage = %d/%d, want 40e9/160e9", snap.StorageAvailableBytes, snap.StorageCapacityBytes)
 	}
-	// Lag from the postgres series (2), not the mysql decoy (99).
-	if !snap.LagKnown || snap.ReplicaLagSeconds != 2 {
-		t.Errorf("Lag = %v known=%v, want 2 true (postgres lag name)", snap.ReplicaLagSeconds, snap.LagKnown)
+	// Lag: PG lag name is now UNSET (the live endpoint has no
+	// planetscale_postgres_replica_lag_seconds — probed 2026-06-23), so the
+	// mysql decoy (99) must NOT be read and LagKnown stays false (honest).
+	if snap.LagKnown {
+		t.Errorf("LagKnown true (=%v); want false (PG lag intentionally unmapped)", snap.ReplicaLagSeconds)
 	}
 	// Connections: PG table leaves these unset → honest unobserved.
 	if snap.ConnKnown {
@@ -185,7 +187,7 @@ m{planetscale_component="vtgate"} 1
 m{planetscale_component="vttablet",planetscale_tablet_type="replica"} 2
 m{planetscale_component="vttablet",planetscale_tablet_type="primary"} 3
 `))
-		v, ok := selectPrimaryValue(samples, "m")
+		v, ok := selectPrimaryValue(samples, "m", "")
 		if !ok || v != 3 {
 			t.Errorf("got %v ok=%v, want 3 true", v, ok)
 		}
@@ -196,7 +198,7 @@ m{planetscale_component="vttablet",planetscale_tablet_type="primary"} 3
 m{planetscale_component="vtgate"} 1
 m{planetscale_tablet_type="primary"} 7
 `))
-		v, ok := selectPrimaryValue(samples, "m")
+		v, ok := selectPrimaryValue(samples, "m", "")
 		if !ok || v != 7 {
 			t.Errorf("got %v ok=%v, want 7 true", v, ok)
 		}
@@ -204,7 +206,7 @@ m{planetscale_tablet_type="primary"} 7
 
 	t.Run("single unlabelled series (fallback 3)", func(t *testing.T) {
 		samples := parsePromText(strings.NewReader(`m 11`))
-		v, ok := selectPrimaryValue(samples, "m")
+		v, ok := selectPrimaryValue(samples, "m", "")
 		if !ok || v != 11 {
 			t.Errorf("got %v ok=%v, want 11 true", v, ok)
 		}
@@ -215,18 +217,66 @@ m{planetscale_tablet_type="primary"} 7
 m{planetscale_component="vtgate"} 1
 m{planetscale_component="vtorc"} 2
 `))
-		_, ok := selectPrimaryValue(samples, "m")
+		_, ok := selectPrimaryValue(samples, "m", "")
 		if ok {
 			t.Error("ok true for ambiguous non-primary series; want false (refuse to guess the wrong pod)")
 		}
 	})
 
 	t.Run("absent metric", func(t *testing.T) {
-		_, ok := selectPrimaryValue(nil, "m")
+		_, ok := selectPrimaryValue(nil, "m", "")
 		if ok {
 			t.Error("ok true for absent metric; want false")
 		}
 	})
+
+	// (0) Postgres container selection: the cpu/mem metric fans out per
+	// container (postgres / pgbouncer / walg-daemon) under component=hzinstance
+	// with NO tablet_type, so the Vitess cascade can't pick one and (with >1
+	// series) fallback (3) refuses. primaryContainer="postgres" must select the
+	// DB container. Live-confirmed PG shape 2026-06-23.
+	t.Run("postgres container selection picks the db container", func(t *testing.T) {
+		samples := parsePromText(strings.NewReader(`
+m{planetscale_component="hzinstance",planetscale_container="postgres"} 0.62
+m{planetscale_component="hzinstance",planetscale_container="pgbouncer"} 0.05
+m{planetscale_component="hzinstance",planetscale_container="walg-daemon"} 0.01
+`))
+		// Without the container preference the Vitess cascade refuses (>1
+		// ambiguous series) — the bug.
+		if _, ok := selectPrimaryValue(samples, "m", ""); ok {
+			t.Error("Vitess cascade picked a value for multi-container PG fan; want refuse (the pre-fix bug)")
+		}
+		// With primaryContainer="postgres" it selects the DB container.
+		v, ok := selectPrimaryValue(samples, "m", "postgres")
+		if !ok || v != 0.62 {
+			t.Errorf("got %v ok=%v, want 0.62 true (postgres container)", v, ok)
+		}
+	})
+}
+
+// TestDistill_PostgresEngine_CPUMemSelected pins the end-to-end PG fix: a
+// multi-container PG scrape yields KNOWN cpu/mem (selected from the postgres
+// container) — the Bug found by the #94 PG-160 showcase, where CPU/mem were
+// silently dropped (the operator's #1 metrics).
+func TestDistill_PostgresEngine_CPUMemSelected(t *testing.T) {
+	const text = `
+planetscale_pods_cpu_util_percentages{planetscale_component="hzinstance",planetscale_container="postgres"} 62
+planetscale_pods_cpu_util_percentages{planetscale_component="hzinstance",planetscale_container="pgbouncer"} 4
+planetscale_pods_mem_util_percentages{planetscale_component="hzinstance",planetscale_container="postgres"} 55
+planetscale_pods_mem_util_percentages{planetscale_component="hzinstance",planetscale_container="walg-daemon"} 2
+planetscale_volume_available_bytes{planetscale_component="hzinstance"} 40000000000
+planetscale_volume_capacity_bytes{planetscale_component="hzinstance"} 160000000000
+`
+	snap := distillTextWith(text, "postgres")
+	if !snap.CPUKnown || snap.CPUUtil != 0.62 {
+		t.Errorf("CPU = %v known=%v, want 0.62 true (postgres container, not pgbouncer 0.04)", snap.CPUUtil, snap.CPUKnown)
+	}
+	if !snap.MemKnown || snap.MemUtil != 0.55 {
+		t.Errorf("Mem = %v known=%v, want 0.55 true (postgres container)", snap.MemUtil, snap.MemKnown)
+	}
+	if !snap.StorageKnown || snap.StorageUtil != 0.75 {
+		t.Errorf("Storage = %v known=%v, want 0.75 true (single-series volume)", snap.StorageUtil, snap.StorageKnown)
+	}
 }
 
 func TestClampFraction(t *testing.T) {

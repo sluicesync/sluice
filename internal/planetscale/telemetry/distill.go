@@ -23,6 +23,17 @@ type metricNames struct {
 	replicaLagSec    string
 	activeConns      string
 	maxConns         string
+
+	// primaryContainer, when non-empty, is the `planetscale_container` label
+	// value that identifies the write-target's primary series among MULTIPLE
+	// container series of a per-pod metric (cpu/mem). Postgres emits cpu/mem
+	// once per container (`postgres`, `pgbouncer`, `walg-daemon`) under
+	// `planetscale_component="hzinstance"` with NO `tablet_type` — so the
+	// Vitess vttablet/primary cascade can't pick one and (with >1 series) the
+	// single-series fallback refuses, silently dropping CPU/mem on PG targets
+	// (live-confirmed 2026-06-23). This selects the `postgres` container.
+	// Empty (MySQL/Vitess) ⇒ the vttablet/primary cascade as before.
+	primaryContainer string
 }
 
 // mysqlMetricNames is the MySQL/Vitess table, CONFIRMED against the live
@@ -53,8 +64,14 @@ var postgresMetricNames = metricNames{
 	memUtilPct:       "planetscale_pods_mem_util_percentages",
 	volAvailableByte: "planetscale_volume_available_bytes",
 	volCapacityByte:  "planetscale_volume_capacity_bytes",
-	replicaLagSec:    "planetscale_postgres_replica_lag_seconds",
+	// replicaLagSec intentionally UNSET: the live PG endpoint exposes no
+	// `planetscale_postgres_replica_lag_seconds` (probed 2026-06-23 — it has
+	// `planetscale_postgres_wal_archiver_lag_bytes` / `wal_size_bytes`, a
+	// different signal). A single-node PG has no replica lag anyway; leaving it
+	// unset keeps LagKnown=false (honest unobserved) rather than naming a
+	// non-existent series.
 	// activeConns / maxConns intentionally unset — see doc comment above.
+	primaryContainer: "postgres",
 }
 
 // metricNamesFor selects the metric-name table for a target engine registry
@@ -78,6 +95,7 @@ func metricNamesFor(engine string) metricNames {
 const (
 	labelComponent  = "planetscale_component"
 	labelTabletType = "planetscale_tablet_type"
+	labelContainer  = "planetscale_container"
 
 	componentVTTablet = "vttablet"
 	tabletTypePrimary = "primary"
@@ -104,17 +122,17 @@ const (
 func distill(samples []promSample, names metricNames, now time.Time) ir.TargetHealthSnapshot {
 	snap := ir.TargetHealthSnapshot{SampledAt: now}
 
-	if v, ok := selectPrimaryValue(samples, names.cpuUtilPct); ok {
+	if v, ok := selectPrimaryValue(samples, names.cpuUtilPct, names.primaryContainer); ok {
 		snap.CPUUtil = clampFraction(v / 100.0)
 		snap.CPUKnown = true
 	}
-	if v, ok := selectPrimaryValue(samples, names.memUtilPct); ok {
+	if v, ok := selectPrimaryValue(samples, names.memUtilPct, names.primaryContainer); ok {
 		snap.MemUtil = clampFraction(v / 100.0)
 		snap.MemKnown = true
 	}
 
-	avail, availOK := selectPrimaryValue(samples, names.volAvailableByte)
-	capac, capacOK := selectPrimaryValue(samples, names.volCapacityByte)
+	avail, availOK := selectPrimaryValue(samples, names.volAvailableByte, names.primaryContainer)
+	capac, capacOK := selectPrimaryValue(samples, names.volCapacityByte, names.primaryContainer)
 	if availOK && capacOK && capac > 0 {
 		snap.StorageAvailableBytes = int64(avail)
 		snap.StorageCapacityBytes = int64(capac)
@@ -122,13 +140,13 @@ func distill(samples []promSample, names metricNames, now time.Time) ir.TargetHe
 		snap.StorageKnown = true
 	}
 
-	if v, ok := selectPrimaryValue(samples, names.replicaLagSec); ok {
+	if v, ok := selectPrimaryValue(samples, names.replicaLagSec, names.primaryContainer); ok {
 		snap.ReplicaLagSeconds = v
 		snap.LagKnown = true
 	}
 
-	active, activeOK := selectPrimaryValue(samples, names.activeConns)
-	maxc, maxOK := selectPrimaryValue(samples, names.maxConns)
+	active, activeOK := selectPrimaryValue(samples, names.activeConns, names.primaryContainer)
+	maxc, maxOK := selectPrimaryValue(samples, names.maxConns, names.primaryContainer)
 	if activeOK || maxOK {
 		// Connections are a secondary signal; report whichever halves we
 		// observed (a missing half stays 0). ConnKnown gates the whole pair.
@@ -141,20 +159,25 @@ func distill(samples []promSample, names metricNames, now time.Time) ir.TargetHe
 }
 
 // selectPrimaryValue finds the value for the named metric on the
-// write-target's PRIMARY vttablet pod. Selection is a graceful cascade:
+// write-target's PRIMARY series. Selection is a graceful cascade:
 //
+//  0. (Postgres) if primaryContainer is set, a series whose
+//     `planetscale_container` matches it — the PG DB container, picked out of
+//     the per-container fan (postgres / pgbouncer / walg-daemon) that has no
+//     vttablet/tablet_type labels;
 //  1. an exact match (component=vttablet AND tablet_type=primary) — the
-//     write target;
+//     Vitess write target;
 //  2. else any series tagged tablet_type=primary (a primary pod whose
 //     component label is absent/different);
 //  3. else, if exactly one series exists for the metric, use it (single-pod
-//     exposition with no distinguishing labels — the common small-DB case);
+//     exposition with no distinguishing labels — the common small-DB case,
+//     e.g. the single-series PG volume metric);
 //  4. else no confident pick → ok=false (the metric stays *Known=false
 //     rather than guessing the wrong pod).
 //
 // Returns ok=false when the metric is absent entirely (including the
 // engine-table-unset case where name is "").
-func selectPrimaryValue(samples []promSample, name string) (float64, bool) {
+func selectPrimaryValue(samples []promSample, name, primaryContainer string) (float64, bool) {
 	if name == "" {
 		return 0, false
 	}
@@ -167,6 +190,11 @@ func selectPrimaryValue(samples []promSample, name string) (float64, bool) {
 			continue
 		}
 		matches = append(matches, s)
+		// (0) Postgres container match — the write-target DB container among a
+		// multi-container fan. Take it immediately.
+		if primaryContainer != "" && s.label(labelContainer) == primaryContainer {
+			return s.value, true
+		}
 		isPrimary := s.label(labelTabletType) == tabletTypePrimary
 		if isPrimary && s.label(labelComponent) == componentVTTablet {
 			// (1) exact write-target match — take it immediately.
