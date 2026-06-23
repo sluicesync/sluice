@@ -577,6 +577,22 @@ So NOTIFY-kick is **demoted** — the poll isn't the bottleneck. Closing the rea
 
 **Gotchas.** (1) One recorder per stream — don't double-start across the cold-copy→CDC transition (dedup or hand off). (2) The cold-copy phase is where storage-grow alerts matter MOST (pre-grow warning) — this is the highest-value window for item 36. (3) Engine-neutral; the metadata-store seam already exists.
 
+### 40. Metrics-aware clamp on restore's auto `--bulk-parallelism` × `--table-parallelism` product (the PlanetScale-correct bound) — *operator-flagged 2026-06-23; follow-up to ADR-0112; queued AFTER the live restore A/B*
+
+**Why.** ADR-0112's within-table chunk parallelism is auto-on by default (`--bulk-parallelism 0` → `min(8, NumCPU)`, same `0→auto` pattern as `--apply-concurrency`/item 31). The `table × bulk` product is bounded at the connection-budget chokepoint — but **only for engines with a budget prober (Postgres)**. **MySQL/PlanetScale has no prober, so the product passes through UNCLAMPED.** And per the operator (2026-06-23): PlanetScale MySQL can carry many connections (VTGate fronts the pool — `conns=6/250` observed), so **connections are not the scarce resource; CPU is**, especially on small plans (PS-10 pinned at CPU 1.000 during the Track-C restore). So a connection-budget bound (item 41) is the *wrong* lever for PlanetScale — the right one is the **live CPU/mem telemetry** sluice already ships.
+
+**What.** Route restore's auto-resolved `table × bulk` product through the **existing v0.99.106 `clampConcurrencyByHeadroom`** (quarter at ≥0.85 CPU/mem high-water, halve at ≥0.70) when a telemetry provider is wired — the same startup headroom clamp that already governs apply-lane auto:N. Restore-specific wiring only; the clamp logic + the telemetry seam are shipped. Startup-only (restore's partition is fixed once chosen; no mid-run re-partition). Degrades to today (unclamped auto) when no provider / no fresh sample — never raises an explicit operator value. Keeps restore correct either way (the reparent-retry already rides any over-aggression); this makes the auto-default *faster net* on small instances by not self-inflicting tx-killer/reparent churn.
+
+**Gotchas.** (1) Restore has no AIMD (bulk INSERT, not CDC apply), so the clamp is the ONLY proactive throttle on the restore path — it's load-bearing for small targets, not just advisory. (2) Startup-only by design. (3) Telemetry-gated + failure-isolated (no provider ⇒ exactly today's behaviour).
+
+### 41. MySQL `TargetConnectionBudgetProber` so restore/migrate parallelism is budget-bounded on self-hosted MySQL like Postgres — *demand-gated; the self-hosted-MySQL analog, NOT the PlanetScale fix (see item 40)*
+
+**Why.** Postgres implements `ir.TargetConnectionBudgetProber`, so the copy-parallelism resolver bounds the `table × within` product to the target's real budget. MySQL implements no prober, so MySQL targets pass through unclamped. For a **self-hosted vanilla MySQL** with a genuine `max_connections` wall, that can over-subscribe the server. (For **PlanetScale** it's largely a no-op — VTGate's ceiling is big and CPU is the real limit, which item 40 handles.)
+
+**What.** A MySQL `ProbeTargetConnectionBudget` reading `@@max_connections` + `Threads_connected` (in-use) + `@@max_user_connections` / `mysql.user.max_user_connections`, minus a reserve, returning the budget; the resolve path already calls the interface, so MySQL would just start participating and the product would clamp like Postgres. ~150–250 LOC + tests.
+
+**Gotchas.** (1) Per-user limits vs global — bound by the tighter. (2) Near-no-op on PlanetScale (don't expect it to protect a PS-10 — that's item 40's job). (3) Demand-gated: surfaced by reasoning about the unclamped MySQL product, not yet by a self-hosted-MySQL operator hitting it.
+
 ---
 
 ### Open bugs awaiting fix windows
