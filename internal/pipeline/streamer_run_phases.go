@@ -766,23 +766,43 @@ func (s *Streamer) phaseStartApplySidecars(applyCtx context.Context, applier ir.
 	// phase concern (runColdStartParallel wires its own gated watch).
 	s.startStorageHeadroomWatch(applyCtx, streamID, nil)
 
-	// ADR-0107 item 35: rolling-history recorder. When a telemetry provider
-	// is wired, a slow-tick sidecar persists each poll into the bounded
-	// sluice_target_metrics_history table on the target so `sluice diagnose`
-	// surfaces the recent trend. No provider / no store impl / opted-out ⇒ no
-	// goroutine. Started here (once per stream attempt) because this is where
-	// the opened applier and the provider are both in scope. Advisory only —
-	// every error is logged at WARN and swallowed.
-	s.startTargetMetricsHistoryRecorder(applyCtx, streamID, applier, s.TargetTelemetry)
-
-	// ADR-0107 item 36: sync-scoped target-metrics threshold ALERTER. When a
-	// telemetry provider is wired AND the operator configured at least one
-	// notification sink + threshold, a slow-tick sidecar fires edge-triggered,
-	// cooldown'd alerts to the sinks (generic webhook + Slack). No provider /
-	// no sink / no rule ⇒ no goroutine. Observability only — a dead sink is
-	// logged-and-swallowed, never able to stall or crash the stream.
-	s.startTargetMetricsNotifier(applyCtx, streamID, applier, s.TargetTelemetry, s.buildMetricsNotifier())
+	// ADR-0107 items 35 (rolling-history recorder) + 36 (threshold alerter)
+	// are NO LONGER started here — they are started earlier, in runOnce (see
+	// startTelemetrySidecars), so they cover the COLD-COPY phase too (the
+	// loaded, storage-grow-prone window where they matter most), not just CDC
+	// apply (roadmap item 39). The applier opened in runOnce step 1 lives for
+	// the whole attempt, so a single start spans both phases.
 	return liveFilter
+}
+
+// startTelemetrySidecars starts the ADR-0107 target-telemetry CONSUMERS that
+// should run for the WHOLE stream attempt — the item-35 rolling-history
+// recorder and the item-36 threshold alerter — so they cover the cold-copy
+// phase as well as CDC apply (roadmap item 39; before this they started only
+// at phaseStartApplySidecars, leaving cold-copy — where the target is under
+// the heaviest write load and storage grows happen — uncovered).
+//
+// It is called ONCE per attempt from runOnce, right after the applier is open
+// (step 1) and the stream-id is resolved. The applier lives for the whole
+// attempt (runOnce's defer), so reusing it here is safe; during cold-copy the
+// applier connection is idle (no apply loop yet), so the recorder's metadata
+// writes don't contend. ctx is a run-scoped context cancelled when the attempt
+// returns, so both goroutines exit cleanly (no cross-attempt leak on a
+// warm-resume loop).
+//
+// Both consumers are individually no-ops when their preconditions aren't met
+// (nil provider / no store impl / opted-out / no sink+rule), so this is a
+// total no-op for a sync that hasn't configured PlanetScale telemetry.
+func (s *Streamer) startTelemetrySidecars(ctx context.Context, applier ir.ChangeApplier, streamID string) {
+	// Item 35: rolling-history recorder. No provider / no store impl /
+	// --suppress-target-metrics-history ⇒ no goroutine. Advisory; every error
+	// logged at WARN and swallowed.
+	s.startTargetMetricsHistoryRecorder(ctx, streamID, applier, s.TargetTelemetry)
+
+	// Item 36: sync-scoped threshold alerter. No provider / no sink / no rule
+	// ⇒ no goroutine. Observability only — a dead sink is logged-and-swallowed,
+	// never able to stall or crash the stream.
+	s.startTargetMetricsNotifier(ctx, streamID, applier, s.TargetTelemetry, s.buildMetricsNotifier())
 }
 
 // phaseWireInterceptChain wraps the raw change channel with the

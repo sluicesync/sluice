@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.112] - 2026-06-23
+
+### Changed
+
+- **The target-telemetry rolling-history recorder (item 35) and threshold alerter (item 36) now run during the COLD-COPY phase too, not only during CDC apply (roadmap item 39).** Both were started in the apply-phase sidecar wiring, so a long initial cold-copy — the phase where the target is under the heaviest write load and where storage auto-grows happen — recorded no metrics history and fired no threshold alerts. They are now started once per attempt, right after the applier opens (which lives for the whole attempt and is idle during cold-copy, so reusing it is safe), spanning cold-copy + apply with a single start (no double-record / double-fire). This means a storage-approaching-capacity or CPU-saturation alert can fire *during* the cold-copy that triggers the grow — the highest-value window — and the rolling-history table captures the cold-copy trend. Total no-op for any sync that hasn't configured PlanetScale telemetry; the run-scoped context cancels both sidecars cleanly at attempt end (no cross-attempt goroutine leak on warm-resume). Pinned by tests that the unified start engages the recorder when a provider + store are wired and is a no-op without a provider.
+
 ## [0.99.111] - 2026-06-23
 
 ### Added

@@ -1208,6 +1208,19 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	// opt-out path.
 	aimdController := s.maybeAttachAIMDController(ctx, applier, streamID)
 
+	// ---- 1.6. Target-telemetry sidecars for the WHOLE attempt (ADR-0107
+	// items 35 + 36, roadmap item 39) ----
+	// The rolling-history recorder + threshold alerter are started HERE (not
+	// at the apply phase) so they cover the COLD-COPY phase too — the loaded,
+	// storage-grow-prone window where they matter most. The applier opened in
+	// step 1 lives for the whole attempt and is idle during cold-copy, so
+	// reusing it is safe. telemetryCtx is cancelled when this attempt returns,
+	// so the goroutines exit cleanly (no cross-attempt leak on warm-resume).
+	// Total no-op when PlanetScale telemetry isn't configured.
+	telemetryCtx, cancelTelemetry := context.WithCancel(ctx)
+	defer cancelTelemetry()
+	s.startTelemetrySidecars(telemetryCtx, applier, streamID)
+
 	// ---- 1a. Optional Prometheus metrics endpoint ----
 	// When --metrics-listen is set, a small HTTP server runs alongside
 	// the stream exposing /metrics, /healthz, and /readyz. Off by

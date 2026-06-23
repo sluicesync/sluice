@@ -86,6 +86,48 @@ type plainApplier struct {
 	ir.ChangeApplier
 }
 
+// TestStartTelemetrySidecars_StartsRecorderEarly pins roadmap item 39: the
+// unified entry point (called from runOnce BEFORE cold-copy, so the telemetry
+// consumers cover the cold-copy phase) starts the recorder when a provider +
+// store-applier are wired — proven by a synchronous EnsureTargetMetricsHistory
+// call before the ticker goroutine spawns.
+func TestStartTelemetrySidecars_StartsRecorderEarly(t *testing.T) {
+	store := &fakeMetricsStore{}
+	applier := &metricsStoreApplier{fakeMetricsStore: store}
+	prov := &fakeTelemetry{ok: true, snap: ir.TargetHealthSnapshot{
+		SampledAt: time.Now(), CPUUtil: 0.4, CPUKnown: true,
+	}}
+	s := &Streamer{TargetTelemetry: prov}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s.startTelemetrySidecars(ctx, applier, "s1")
+	cancel() // stop the recorder's ticker goroutine
+
+	store.mu.Lock()
+	n := store.ensureCalls
+	store.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("recorder not started by startTelemetrySidecars: ensureCalls=%d, want 1", n)
+	}
+}
+
+// TestStartTelemetrySidecars_NoProviderNoOp pins the degrade: no telemetry
+// provider ⇒ neither sidecar starts (the common no-PlanetScale-telemetry sync).
+func TestStartTelemetrySidecars_NoProviderNoOp(t *testing.T) {
+	store := &fakeMetricsStore{}
+	applier := &metricsStoreApplier{fakeMetricsStore: store}
+	s := &Streamer{} // nil TargetTelemetry
+
+	s.startTelemetrySidecars(context.Background(), applier, "s1")
+
+	store.mu.Lock()
+	n := store.ensureCalls
+	store.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("recorder started with no provider: ensureCalls=%d, want 0", n)
+	}
+}
+
 func TestRecordTargetMetricsTick_DedupesOnSampledAt(t *testing.T) {
 	store := &fakeMetricsStore{}
 	t0 := time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC)

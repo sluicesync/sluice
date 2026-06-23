@@ -569,7 +569,7 @@ So NOTIFY-kick is **demoted** — the poll isn't the bottleneck. Closing the rea
 
 **Gotchas.** (1) A single PG `COPY FROM STDIN` of one large table is one long operation — riding a mid-COPY grow may require splitting it (keyset chunks) so a retry has a resume point, or accepting table-granularity restart. (2) The grow-gate seam is engine-neutral already; the work is wiring `Await` into the PG writer + a PG-target error classifier (mirror `classifyApplierError`). (3) Validate against a fresh small-volume PS-160 PG so the grow re-triggers.
 
-### 39. Extend items 35 + 36 (metrics history + threshold alerts) to the COLD-COPY phase — *found 2026-06-23 during the #94 showcase*
+### 39. Extend items 35 + 36 (metrics history + threshold alerts) to the COLD-COPY phase — **✅ SHIPPED v0.99.112** (recorder + alerter hoisted to a single per-attempt `startTelemetrySidecars` in runOnce right after the applier opens — covers cold-copy + CDC with one start; run-scoped ctx, no double-start, no cross-attempt leak; the applier is idle during cold-copy so reuse is safe) — *found 2026-06-23 during the #94 showcase*
 
 **Why.** The item-35 rolling-history recorder and the item-36 threshold alerter are wired in `phaseStartApplySidecars` — the **CDC-apply phase**. So during a long **cold-copy** (the dominant phase of a big migration, and exactly when the target is under heavy write load and storage grows happen) neither records metrics history nor fires threshold alerts. The telemetry provider itself polls throughout (so the AIMD damp + the storage-headroom WARN + the grow-gate already cover cold-copy), but the new recorder/alerter sidecars miss it. The #94 showcase made this concrete: items 35/36 stayed dormant until the (small-subset) copy reached CDC.
 
