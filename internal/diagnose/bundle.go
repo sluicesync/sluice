@@ -469,7 +469,7 @@ func metricSeries(rows []ir.TargetMetricsHistoryRow, sel func(ir.TargetMetricsHi
 // flag (an unobserved metric is omitted, never reported as 0/idle).
 func probeAndWriteTargetHealth(ctx context.Context, zw *zip.Writer, name string, req Request) {
 	if req.TargetTelemetry == nil {
-		_ = writeReason(zw, name, "target telemetry not configured (no --planet-scale-org / metrics token)")
+		_ = writeReason(zw, name, "target telemetry not configured (no --planetscale-org / metrics token)")
 		return
 	}
 	snap, ok := req.TargetTelemetry.Sample(ctx)

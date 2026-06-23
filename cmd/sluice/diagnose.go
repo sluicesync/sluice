@@ -84,11 +84,11 @@ type DiagnoseCmd struct {
 	// Optional PlanetScale target-health telemetry (ADR-0107) — when set, the
 	// PrivacyStandard+ bundle includes a one-shot CPU/mem/storage/lag snapshot
 	// of the target so the recipient sees WHY apply was slow. Off when unset.
-	PlanetScaleOrg            string `help:"PlanetScale org slug; enables the OPTIONAL target-health telemetry snapshot (CPU/mem/storage) in the bundle (ADR-0107). Requires --planetscale-metrics-token-id and --planetscale-metrics-token. Control-plane only — distinct from --target." placeholder:"ORG" group:"target"`
-	PlanetScaleMetricsTokenID string `help:"PlanetScale service-token ID (read_metrics_endpoints) for the target-health snapshot. Prefer the env var." env:"PLANETSCALE_METRICS_TOKEN_ID" placeholder:"ID" group:"target"`
-	PlanetScaleMetricsToken   string `help:"PlanetScale service-token secret for the target-health snapshot. Set via the env var; masked in all logging." env:"PLANETSCALE_METRICS_TOKEN" placeholder:"SECRET" group:"target"`
-	PlanetScaleMetricsBranch  string `help:"Target branch to filter telemetry series to (defaults to 'main'). Only consulted when --planetscale-org is set." placeholder:"BRANCH" group:"target"`
-	PlanetScaleMetricsDB      string `help:"Target database name to filter PlanetScale telemetry SD to. Defaults to the --target DSN's database. Only consulted when --planetscale-org is set." placeholder:"DATABASE" group:"target"`
+	PlanetScaleOrg            string `name:"planetscale-org" help:"PlanetScale org slug; enables the OPTIONAL target-health telemetry snapshot (CPU/mem/storage) in the bundle (ADR-0107). Requires --planetscale-metrics-token-id and --planetscale-metrics-token. Control-plane only — distinct from --target." placeholder:"ORG" group:"target"`
+	PlanetScaleMetricsTokenID string `name:"planetscale-metrics-token-id" help:"PlanetScale service-token ID (read_metrics_endpoints) for the target-health snapshot. Prefer the env var." env:"PLANETSCALE_METRICS_TOKEN_ID" placeholder:"ID" group:"target"`
+	PlanetScaleMetricsToken   string `name:"planetscale-metrics-token" help:"PlanetScale service-token secret for the target-health snapshot. Set via the env var; masked in all logging." env:"PLANETSCALE_METRICS_TOKEN" placeholder:"SECRET" group:"target"`
+	PlanetScaleMetricsBranch  string `name:"planetscale-metrics-branch" help:"Target branch to filter telemetry series to (defaults to 'main'). Only consulted when --planetscale-org is set." placeholder:"BRANCH" group:"target"`
+	PlanetScaleMetricsDB      string `name:"planetscale-metrics-db" help:"Target database name to filter PlanetScale telemetry SD to. Defaults to the --target DSN's database. Only consulted when --planetscale-org is set." placeholder:"DATABASE" group:"target"`
 }
 
 // Run implements `sluice diagnose`.

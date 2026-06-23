@@ -4,6 +4,16 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.113] - 2026-06-23
+
+### Changed
+
+- **The PlanetScale telemetry flags are renamed `--planet-scale-*` → `--planetscale-*` (one word, matching PlanetScale's own branding).** `--planetscale-org`, `--planetscale-metrics-token-id`, `--planetscale-metrics-token`, `--planetscale-metrics-db`, `--planetscale-metrics-branch` (on both `sync start` and `diagnose`). The previous hyphenated forms were kong's automatic camelCase derivation of the field names; this pins the brand-correct spelling explicitly. **Breaking** for anyone who scripted the old flags — but a clean rename with no shim per the zero-users policy (the env-var forms `PLANETSCALE_METRICS_TOKEN_ID` / `PLANETSCALE_METRICS_TOKEN` were already one word and are unchanged). The old form now errors with a `did you mean "--planetscale-org"?` suggestion.
+
+### Fixed
+
+- **A PlanetScale Postgres serving-transition read-only window during a storage auto-grow is now retriable on the cold-copy path (item 38 follow-up, found by the live re-validation).** The v0.99.111 PG cold-copy grow resilience correctly rode the `53100` could-not-extend (disk-full) faces of a non-Metal PlanetScale-Postgres storage auto-grow — but the full-corpus re-validation surfaced a *second* face of the same grow: while the new primary takes over, the cluster is briefly promoted **read-only**, and an in-flight chunk `COPY` fails with `pg_readonly: invalid statement because cluster is read-only` (SQLSTATE `XX000`). That wasn't in the retriable classifier, so the cold-copy died loudly on it (no data loss, but not resilient) after riding 22 grow-gate windows. It's now classified retriable — the exact Postgres twin of the MySQL `Error 1290 --read-only` reparent face fixed in v0.99.101 — so the grow-gate + chunked-COPY retry rides the read-only window and resumes once the new primary serves read-write. Matched on the message (`cluster is read-only` / `pg_readonly`), not the bare `XX000` code (which is the generic `internal_error` catch-all), so a non-read-only `XX000` stays terminal — no over-match. Pinned in the classifier test set (read-only `XX000` → retriable; generic `XX000` → terminal). With this, a full MySQL→PlanetScale-Postgres cold-copy rides *both* storage-grow faces (disk-full + read-only reparent) to completion.
+
 ## [0.99.112] - 2026-06-23
 
 ### Changed

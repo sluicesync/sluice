@@ -130,6 +130,25 @@ func classifyApplierError(err error) error {
 			// Explicit non-retriable per ADR-0038 — fall through
 			// to the bare return.
 		}
+		// PlanetScale Postgres serving-transition READ-ONLY window. During a
+		// non-Metal storage auto-grow the PG cluster is briefly promoted
+		// read-only while the new primary takes over, and an in-flight
+		// cold-copy chunk COPY / apply fails with `pg_readonly: invalid
+		// statement because cluster is read-only` (SQLSTATE XX000). This is the
+		// PG twin of the MySQL `Error 1290 --read-only` reparent face
+		// (v0.99.101): it clears once the new primary serves read-write, so it
+		// joins the bounded-retry grow class and lets the grow-gate /
+		// chunked-COPY retry ride the reparent. Matched on the MESSAGE, NOT the
+		// bare code: XX000 (internal_error) is a generic catch-all, so a
+		// non-read-only XX000 stays terminal (no over-match) — only the
+		// read-only wording is retriable. Live finding (item 38 PG cold-copy
+		// re-validation, 2026-06-23).
+		if pgErr.Code == "XX000" {
+			m := strings.ToLower(pgErr.Message)
+			if strings.Contains(m, "cluster is read-only") || strings.Contains(m, "pg_readonly") {
+				return &retriablePGError{err: err}
+			}
+		}
 		// Class 08: connection_exception. Includes 08000, 08003,
 		// 08006, 08007, 08P01. All are network / connection-state
 		// transients.

@@ -39,6 +39,9 @@ func TestClassifyApplierError_NonRetriableUnchanged(t *testing.T) {
 		{"check violation", &pgconn.PgError{Code: "23514", Message: "new row violates check constraint"}},
 		{"syntax error", &pgconn.PgError{Code: "42601", Message: "syntax error at or near \"FOO\""}},
 		{"428C9 (generated column non-DEFAULT)", &pgconn.PgError{Code: "428C9", Message: `cannot insert a non-DEFAULT value into column "margin"`}},
+		// XX000 is generic internal_error — a non-read-only XX000 must stay
+		// terminal (the pg_readonly arm matches the message, not the bare code).
+		{"XX000 non-read-only (generic internal_error stays terminal)", &pgconn.PgError{Code: "XX000", Message: "internal error: something unexpected"}},
 	}
 	for _, c := range cases {
 		c := c
@@ -79,6 +82,9 @@ func TestClassifyApplierError_RetriableShapes(t *testing.T) {
 		{"disk_full 53100 (could not extend file — item 38, live #94)", &pgconn.PgError{Code: "53100", Message: `could not extend file "base/16384/24576": No space left on device`}},
 		{"insufficient_resources 53000", &pgconn.PgError{Code: "53000", Message: "insufficient resources"}},
 		{"out_of_memory 53200", &pgconn.PgError{Code: "53200", Message: "out of memory"}},
+		// PlanetScale PG serving-transition read-only window (XX000 + message;
+		// PG twin of MySQL 1290, item 38 re-validation 2026-06-23).
+		{"pg_readonly XX000 (cluster is read-only — PS reparent)", &pgconn.PgError{Code: "XX000", Message: "pg_readonly: invalid statement because cluster is read-only. See planetscale.com/docs/postgres/troubleshooting/readonly"}},
 		{"connection_exception 08000", &pgconn.PgError{Code: "08000", Message: "connection_exception"}},
 		{"connection_does_not_exist 08003", &pgconn.PgError{Code: "08003", Message: "connection does not exist"}},
 		{"connection_failure 08006", &pgconn.PgError{Code: "08006", Message: "connection failure"}},
