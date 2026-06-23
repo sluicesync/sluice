@@ -92,6 +92,26 @@ func classifyApplierError(err error) error {
 		case "40001", "40P01",
 			"57P01", "57P02", "57P03":
 			return &retriablePGError{err: err}
+		case "53100", "53000", "53200":
+			// Class 53 — insufficient_resources (roadmap item 38). On a
+			// cold-copy COPY into a PlanetScale-class PG target whose volume
+			// auto-grows under the streaming write, a 53100 disk_full ("could
+			// not extend file … No space left on device") surfaces mid-COPY
+			// while the volume grows ahead of the write. Classifying the class
+			// as retriable lets the cold-copy grow-gate / chunked-COPY retry
+			// (copyChunkWithRetry) ride the grow window and replay the chunk
+			// once headroom returns, instead of a terminal exit →
+			// supervisor crash-loop (live finding #94). 53000
+			// (insufficient_resources, the class root) and 53200
+			// (out_of_memory) share the transient grow/back-pressure shape —
+			// a momentary resource squeeze that clears. NOT over-matched:
+			// 53300 (too_many_connections) and 53400
+			// (configuration_limit_exceeded) are deliberately EXCLUDED —
+			// those are config/operator faults that do not self-heal by
+			// retrying. The retry budget is wall-clock bounded and loud on
+			// genuine exhaustion (a target truly out of disk surfaces after
+			// ~30 min, never silently).
+			return &retriablePGError{err: err}
 		case "42703", "42P01":
 			// Schema drift (Bug F8): 42703 undefined_column / 42P01
 			// undefined_table — the source has a column/table the target

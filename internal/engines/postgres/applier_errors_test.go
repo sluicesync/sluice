@@ -72,6 +72,13 @@ func TestClassifyApplierError_RetriableShapes(t *testing.T) {
 		{"admin_shutdown (57P01)", &pgconn.PgError{Code: "57P01", Message: "terminating connection due to administrator command"}},
 		{"crash_shutdown (57P02)", &pgconn.PgError{Code: "57P02", Message: "terminating connection due to crash of another server process"}},
 		{"cannot_connect_now (57P03)", &pgconn.PgError{Code: "57P03", Message: "the database system is starting up"}},
+		// Class 53 — insufficient_resources (roadmap item 38). 53100 is the
+		// live #94 storage-grow face: a streaming COPY into a PlanetScale PG
+		// volume that is auto-growing under the write. 53000 / 53200 share the
+		// transient-resource-squeeze shape.
+		{"disk_full 53100 (could not extend file — item 38, live #94)", &pgconn.PgError{Code: "53100", Message: `could not extend file "base/16384/24576": No space left on device`}},
+		{"insufficient_resources 53000", &pgconn.PgError{Code: "53000", Message: "insufficient resources"}},
+		{"out_of_memory 53200", &pgconn.PgError{Code: "53200", Message: "out of memory"}},
 		{"connection_exception 08000", &pgconn.PgError{Code: "08000", Message: "connection_exception"}},
 		{"connection_does_not_exist 08003", &pgconn.PgError{Code: "08003", Message: "connection does not exist"}},
 		{"connection_failure 08006", &pgconn.PgError{Code: "08006", Message: "connection failure"}},
@@ -117,6 +124,12 @@ func TestClassifyApplierError_UnknownSQLSTATENotRetriable(t *testing.T) {
 		"22P02", // invalid_text_representation
 		"54000", // program_limit_exceeded
 		"P0001", // raise_exception (PL/pgSQL custom)
+		// Class-53 members deliberately EXCLUDED from item 38's retriable set:
+		// these are config/operator faults that do NOT self-heal by retrying,
+		// so they must stay terminal even though 53100/53000/53200 are now
+		// retriable (don't over-match the class).
+		"53300", // too_many_connections
+		"53400", // configuration_limit_exceeded
 	}
 	for _, code := range cases {
 		code := code

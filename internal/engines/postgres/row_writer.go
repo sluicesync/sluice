@@ -86,6 +86,32 @@ type RowWriter struct {
 	// [ir.CopyDurableProgressReporter] via [SetCopyDurableProgress]. nil
 	// on every non-cold-start path.
 	copyDurableProgress ir.CopyDurableProgressFunc
+
+	// growGate is the shared cold-copy coordinated-pause primitive
+	// (ADR-0110, roadmap item 38 — the PG-target analog of the MySQL
+	// writer's gate). The pipeline threads ONE gate per cold-copy run onto
+	// every writer it opens (via [SetGrowGate]). When set, writeViaCopy
+	// takes the CHUNKED-COPY-with-retry path so a mid-COPY storage-grow
+	// transient (53100 could-not-extend-file on a PlanetScale non-Metal PG
+	// volume) is ridden chunk-by-chunk instead of aborting the table
+	// fatally; copyChunkWithRetry Awaits the gate before each chunk and
+	// Trips it on a classified grow-transient so all sibling lanes quiesce
+	// together. nil ⇒ pre-ADR-0110 behaviour, byte-for-byte: writeViaCopy
+	// stays on the monolithic single-CopyFrom path (the default on serial
+	// copy, tests, vanilla PG, and the non-cold-copy apply path).
+	// Implements [ir.GrowGateSetter] (see row_writer_grow_gate.go).
+	growGate ir.GrowGate
+
+	// copyChunkFaultHook is a TEST-ONLY fault-injection seam for the
+	// chunked-COPY retry path (roadmap item 38). When set, the chunked
+	// attempt closure calls it with the 1-based attempt number BEFORE the
+	// real CopyFrom; a non-nil return is treated exactly like a CopyFrom
+	// error (classified + possibly retried), and a nil return lets the real
+	// CopyFrom run. It exists so the integration test can inject ONE
+	// classified-retriable fault on the first chunk attempt and then prove
+	// the replay converges with no dup/drop against a real PG. nil in every
+	// production path (set only from a _test.go in this package).
+	copyChunkFaultHook func(attempt int) error
 }
 
 // SetCopyDurableProgress implements [ir.CopyDurableProgressReporter]
@@ -470,19 +496,139 @@ func (w *RowWriter) WriteRows(ctx context.Context, table *ir.Table, rows <-chan 
 // the entire copy. The error message names how many rows landed
 // before the failure so operators can scope the impact.
 func (w *RowWriter) writeViaCopy(ctx context.Context, table *ir.Table, rows <-chan ir.Row) error {
+	// ADR-0110 / roadmap item 38: when a grow-gate is attached (a
+	// PlanetScale-class target), take the CHUNKED-COPY-with-retry path so a
+	// mid-COPY storage-grow transient is ridden chunk-by-chunk. When no gate
+	// is attached (vanilla PG, the common case) keep the existing monolithic
+	// single-CopyFrom path byte-for-byte — no chunking, no behaviour change,
+	// no throughput regression.
+	if w.growGate != nil {
+		return w.writeViaCopyChunked(ctx, table, rows)
+	}
+
 	sqlConn, err := w.db.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("postgres: copy: acquire conn: %w", err)
 	}
 	defer func() { _ = sqlConn.Close() }() // returns conn to pool
 
+	columnNames := copyColumnNames(table)
+	source := newChanCopySource(ctx, table, rows)
+
+	copied, rawErr := w.copyFromOnSQLConn(ctx, sqlConn, table, columnNames, source)
+	if rawErr != nil {
+		return fmt.Errorf("postgres: copy into %q (%d rows copied before error): %w",
+			table.Name, copied, rawErr)
+	}
+	return nil
+}
+
+// writeViaCopyChunked is the grow-gate-engaged COPY path (roadmap item 38).
+// It drains the row channel into bounded buffered chunks (up to
+// [pgCopyChunkRows] rows / [pgCopyChunkBytes] bytes) and runs ONE atomic
+// CopyFrom per chunk through [copyChunkWithRetry], so a mid-COPY storage-grow
+// transient (53100 could-not-extend-file) is ridden per chunk: a rolled-back
+// chunk wrote nothing into the append-only fresh cold-copy table, so its
+// buffered rows are replayed on a fresh connection with NO dup and NO partial.
+//
+// Value-fidelity (LOAD-BEARING): each chunk is encoded through
+// [newSliceCopySource], which uses the SAME nonGeneratedColumns filter and
+// the SAME prepareValue call per cell as the monolithic path's
+// [newChanCopySource]. There is exactly ONE encoding path, so a chunked write
+// produces byte-identical target rows to the monolithic single-CopyFrom.
+func (w *RowWriter) writeViaCopyChunked(ctx context.Context, table *ir.Table, rows <-chan ir.Row) error {
+	columnNames := copyColumnNames(table)
+
+	// flushChunk runs one buffered chunk through the bounded reparent-retry.
+	// Each attempt re-acquires a FRESH conn (the prior one may be dead after a
+	// reparent / poisoned by a 53100) and replays the chunk from the start via
+	// a fresh slice source over the SAME buffered rows.
+	flushChunk := func(chunk []ir.Row) error {
+		if len(chunk) == 0 {
+			return nil
+		}
+		attemptNo := 0
+		return w.copyChunkWithRetry(ctx, table.Name, len(chunk), func(attemptCtx context.Context) error {
+			attemptNo++
+			// TEST-ONLY fault injection (nil in production): lets a test inject
+			// one classified-retriable fault on a given attempt to prove the
+			// replay converges. Consulted BEFORE acquiring a conn so an injected
+			// fault models a CopyFrom that never landed any rows.
+			if w.copyChunkFaultHook != nil {
+				if ferr := w.copyChunkFaultHook(attemptNo); ferr != nil {
+					return ferr
+				}
+			}
+			sqlConn, err := w.db.Conn(attemptCtx)
+			if err != nil {
+				return fmt.Errorf("postgres: copy: acquire conn: %w", err)
+			}
+			defer func() { _ = sqlConn.Close() }() // returns conn to pool
+			source := newSliceCopySource(table, chunk)
+			copied, copyErr := w.copyFromOnSQLConn(attemptCtx, sqlConn, table, columnNames, source)
+			if copyErr != nil {
+				return fmt.Errorf("postgres: copy chunk into %q (%d of %d rows copied before error): %w",
+					table.Name, copied, len(chunk), copyErr)
+			}
+			return nil
+		})
+	}
+
+	chunkRows := pgCopyChunkRowsVar
+	chunk := make([]ir.Row, 0, chunkRows)
+	var chunkBytes int64
+	for {
+		select {
+		case row, ok := <-rows:
+			if !ok {
+				return flushChunk(chunk)
+			}
+			chunk = append(chunk, row)
+			chunkBytes += ir.ApproximateRowBytes(row)
+			if len(chunk) >= chunkRows || chunkBytes >= pgCopyChunkBytes {
+				if err := flushChunk(chunk); err != nil {
+					return err
+				}
+				// Start a fresh backing array for the next chunk: flushChunk has
+				// fully drained (incl. all retries) by here, but the just-flushed
+				// slice must not be aliased into the next chunk's buffer.
+				chunk = make([]ir.Row, 0, chunkRows)
+				chunkBytes = 0
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// copyColumnNames returns the non-generated column names for a table's COPY
+// column list, in declaration order — the list both COPY paths hand to
+// pgx.CopyFrom (kept in lockstep with the value lists the copy sources emit,
+// which apply the same nonGeneratedColumns filter).
+func copyColumnNames(table *ir.Table) []string {
 	cols := nonGeneratedColumns(table.Columns)
 	columnNames := make([]string, len(cols))
 	for i, c := range cols {
 		columnNames[i] = c.Name
 	}
-	source := newChanCopySource(ctx, table, rows)
+	return columnNames
+}
 
+// copyFromOnSQLConn registers the per-conn extension codecs (pgvector /
+// hstore / timetz) and runs one pgx CopyFrom over source on the pinned
+// *sql.Conn. It is the single COPY-encode site shared by the monolithic
+// (writeViaCopy) and chunked (writeViaCopyChunked) paths, so both register
+// the SAME codecs and run the SAME CopyFrom — there is no second encode path.
+// Returns the rows pgx reports copied (for the error message) and the raw
+// CopyFrom / codec-registration error unwrapped (the caller classifies and
+// wraps it).
+func (w *RowWriter) copyFromOnSQLConn(
+	ctx context.Context,
+	sqlConn *sql.Conn,
+	table *ir.Table,
+	columnNames []string,
+	source pgx.CopyFromSource,
+) (int64, error) {
 	needsPGVectorCodec := tableHasPGVectorColumn(table)
 	needsPGHstoreCodec := tableHasHstoreColumn(table)
 	needsPGTimetzCodec := tableHasTimetzColumn(table)
@@ -516,11 +662,7 @@ func (w *RowWriter) writeViaCopy(ctx context.Context, table *ir.Table, rows <-ch
 		copied = n
 		return copyErr
 	})
-	if rawErr != nil {
-		return fmt.Errorf("postgres: copy into %q (%d rows copied before error): %w",
-			table.Name, copied, rawErr)
-	}
-	return nil
+	return copied, rawErr
 }
 
 // tableHasPGVectorColumn reports whether table has any column whose
