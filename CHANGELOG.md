@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.116] - 2026-06-23
+
+### Added
+
+- **`sluice restore` now parallelizes *within* a table, not just across tables — a second concurrency axis (`--bulk-parallelism`) that fans a single table's chunks across N writers (ADR-0112).** Restore already applied tables concurrently (`--table-parallelism`, ADR-0084), but each table was single-streamed — so a corpus of a few very large tables, or an INSERT-bound cross-region target (a PlanetScale target disallows `LOAD DATA LOCAL`, so every chunk is a batched INSERT round-tripping the network), restored at "slowest single table, serially," and restore wall-time *is* the recovery-time objective. Now, when a table has ≥2 chunks and the resolved within-table parallelism is >1, restore partitions that table's chunk list into disjoint contiguous groups and applies them through N dedicated writer connections concurrently. The two axes multiply (`table × bulk`) and are bounded at the **same** connection-budget chokepoint migrate uses (ADR-0076): within-table is satisfied first, the table axis takes the remainder, and the product never exceeds the target's measured budget; targets without a budget prober (MySQL) pass through unclamped. `--bulk-parallelism 0` (default) = auto (`min(8, NumCPU)`); `1` = the prior single-stream-per-table behaviour. Applies to chain restores too (each segment full's bulk-apply; incremental change replay stays strictly ordered). **Correctness is unchanged-strong:** a snapshot's chunks are a disjoint partition of the table's rows, so parallel INSERT cannot collide on a primary key on a cold target; per-chunk SHA-256 verification stays per-chunk; the layer-2 row-count check is the exact sum of actually-decoded rows across all workers versus the manifest, and a mismatch is still a hard failure. Pinned by serial-vs-parallel **byte-identical** integration tests on both Postgres and MySQL targets across a varied value matrix (int/decimal/text/json(b)/bytea-varbinary/uuid/temporal/bool), plus single-chunk-stays-serial and row-count-mismatch-fails-hard pins. The per-worker writer composes with the storage-grow reparent ride-through (ADR-0108) automatically, so within-table workers each ride a PlanetScale reparent independently.
+
 ## [0.99.115] - 2026-06-23
 
 ### Added
