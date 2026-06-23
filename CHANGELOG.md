@@ -4,6 +4,14 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.115] - 2026-06-23
+
+### Added
+
+- **A standalone `sluice metrics-watch` daemon — watch a PlanetScale database's control-plane metrics (CPU / memory / storage / lag / connections) and fire threshold alerts with no sync attached (ADR-0107 leftover).** Until now the target-metrics alerter (item 36) only ran *alongside* an active migration/sync. `sluice metrics-watch --engine mysql|postgres --planetscale-org ORG --planetscale-metrics-db DB` polls that database's metrics endpoint on an interval and prints a live `cpu= mem= storage= lag= conns=` line, with the SAME edge-triggered + cooldown'd + hysteresis Slack/webhook alerts as `sync start` (the rule set and evaluator are shared, so the daemon can never drift from the sync path). It opens **no connection to the database** — only the PlanetScale metrics control-plane — so it needs just the `--planetscale-metrics-token-id`/`-token` credentials, not a `--target` DSN. `--once` polls a single sample and exits (for scripts); `--quiet` suppresses the live line for headless alert-only operation; threshold flags mirror `sync start`'s `--notify-storage-util` / `-cpu-util` / `-mem-util` / `-lag-seconds` / `-storage-growth-per-min` / `-cooldown` / `--notify-webhook` / `--notify-slack` one-for-one. Advisory + failure-isolated throughout (a dead sink is logged and swallowed; an unobserved metric never fires, honouring the `*Known` contract).
+
+- **A richer own-`/metrics` Prometheus surface, and a `/metrics` endpoint on the metrics-watch daemon (ADR-0107 inverse sub-item).** Every sluice `/metrics` endpoint now also emits `sluice_build_info{version,commit,go_version}` (the standard exporter build-info series) and a compact Go-runtime block — `sluice_go_goroutines`, `sluice_go_gomaxprocs`, `sluice_go_memstats_heap_alloc_bytes` / `_heap_sys_bytes` / `_heap_objects`, and cumulative `sluice_go_gc_completed_total` / `sluice_go_gc_pause_seconds_total` — so operators can watch sluice's OWN process health (the load-bearing signal for the bounded-memory guarantees of the auto-shard / fan-out copy paths) in the same Grafana/Datadog stack as the stream metrics. All scrape-time only (no apply-path instrumentation). The metrics-watch daemon gains an optional `--metrics-listen ADDR` that re-exports the watched database's health as the `sluice_target_*` gauge family alongside `build_info` + the runtime block — turning the daemon into a standalone PlanetScale-metrics Prometheus exporter that needs no database credential, only the metrics token.
+
 ## [0.99.114] - 2026-06-23
 
 ### Fixed

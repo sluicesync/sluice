@@ -283,6 +283,7 @@ func (s *Streamer) phaseStartMetricsServer(ctx context.Context, applier ir.Chang
 	if mErr != nil {
 		return nil, func() {}, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: prepare metrics server: %w", mErr))
 	}
+	metricsSrv.SetBuildInfo(s.BuildVersion, s.BuildCommit)
 	if aimdController != nil {
 		metricsSrv.AttachAIMDController(aimdController)
 	}

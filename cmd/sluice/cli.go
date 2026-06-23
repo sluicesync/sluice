@@ -118,6 +118,8 @@ type CLI struct {
 	Diagnose DiagnoseCmd `cmd:"" help:"Assemble an operator-bundle (cockroach-debug-zip-shape) for filing GitHub issues. ADR-0056."`
 	Cutover  CutoverCmd  `cmd:"" help:"Two-phase sequence priming at cutover — re-read source sequence/AUTO_INCREMENT state and apply to the target with a safety margin (F10, ADR-0062)."`
 	Trigger  TriggerCmd  `cmd:"" help:"Install / remove the postgres-trigger engine's source-side state (ADR-0066)."`
+
+	MetricsWatch MetricsWatchCmd `cmd:"" help:"Watch a PlanetScale database's control-plane metrics (CPU/mem/storage/lag) and fire threshold alerts — standalone, no sync attached (ADR-0107)."`
 }
 
 // EnginesCmd lists the database engines registered in the binary,
@@ -1312,6 +1314,8 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		ApplyRetryBackoffBase:                   s.ApplyRetryBackoffBase,
 		ApplyRetryBackoffCap:                    s.ApplyRetryBackoffCap,
 		MetricsListen:                           s.MetricsListen,
+		BuildVersion:                            version,
+		BuildCommit:                             commit,
 		// ADR-0107: nil unless the operator opted into PlanetScale telemetry.
 		// telemetryProviderOrNil returns a TRUE nil interface when off, so the
 		// streamer's `TargetTelemetry != nil` guards stay exact (no typed-nil

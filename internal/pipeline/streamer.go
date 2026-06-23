@@ -383,6 +383,12 @@ type Streamer struct {
 	// instrumentation of the apply hot path.
 	MetricsListen string
 
+	// BuildVersion / BuildCommit populate the /metrics sluice_build_info
+	// gauge. Set from the cmd layer's -ldflags build vars; empty ⇒ the
+	// emitter's "dev"/"unknown" placeholders. Observability-only.
+	BuildVersion string
+	BuildCommit  string
+
 	// TargetTelemetry, when non-nil, is an advisory control-plane health
 	// provider (ADR-0107). Consulted OFF the hot path for proactive AIMD
 	// back-off, storage-resize anticipation, and operator observability.

@@ -106,6 +106,20 @@ func newMetricsNotifyState() *metricsNotifyState {
 // operator opts each metric in individually. Returns nil when no rule is
 // active (the alerter then no-ops).
 func (s *Streamer) buildMetricsNotifyRules() []metricsNotifyRule {
+	return buildMetricsNotifyRulesFrom(
+		s.NotifyStorageUtil, s.NotifyCPUUtil, s.NotifyMemUtil,
+		s.NotifyLagSeconds, s.NotifyStorageGrowthPerMin,
+	)
+}
+
+// buildMetricsNotifyRulesFrom is the engine-neutral rule assembler shared by
+// the sync-scoped alerter ([Streamer.buildMetricsNotifyRules]) and the
+// standalone `sluice metrics-watch` daemon ([RunMetricsWatch]). A threshold of
+// 0 (unset) leaves that metric's rule INERT and omitted, so each metric is
+// opted in individually. Returns nil when no rule is active. Keeping this a
+// free function means both call sites share ONE definition of the rule set,
+// thresholds, levels, and titles — the daemon can never drift from the sync.
+func buildMetricsNotifyRulesFrom(storageUtil, cpuUtil, memUtil, lagSeconds, storageGrowthPerMin float64) []metricsNotifyRule {
 	var rules []metricsNotifyRule
 	add := func(metric notifyMetric, threshold float64, level notify.Level, title string, read func(ir.TargetHealthSnapshot) (float64, bool)) {
 		if threshold <= 0 {
@@ -119,21 +133,21 @@ func (s *Streamer) buildMetricsNotifyRules() []metricsNotifyRule {
 			read:      read,
 		})
 	}
-	add(notifyStorageUtil, s.NotifyStorageUtil, notify.LevelCritical, "target storage approaching capacity", func(snap ir.TargetHealthSnapshot) (float64, bool) {
+	add(notifyStorageUtil, storageUtil, notify.LevelCritical, "target storage approaching capacity", func(snap ir.TargetHealthSnapshot) (float64, bool) {
 		return snap.StorageUtil, snap.StorageKnown
 	})
-	add(notifyCPUUtil, s.NotifyCPUUtil, notify.LevelWarning, "target CPU saturating", func(snap ir.TargetHealthSnapshot) (float64, bool) {
+	add(notifyCPUUtil, cpuUtil, notify.LevelWarning, "target CPU saturating", func(snap ir.TargetHealthSnapshot) (float64, bool) {
 		return snap.CPUUtil, snap.CPUKnown
 	})
-	add(notifyMemUtil, s.NotifyMemUtil, notify.LevelWarning, "target memory saturating", func(snap ir.TargetHealthSnapshot) (float64, bool) {
+	add(notifyMemUtil, memUtil, notify.LevelWarning, "target memory saturating", func(snap ir.TargetHealthSnapshot) (float64, bool) {
 		return snap.MemUtil, snap.MemKnown
 	})
-	add(notifyLagSeconds, s.NotifyLagSeconds, notify.LevelCritical, "target replica lag high", func(snap ir.TargetHealthSnapshot) (float64, bool) {
+	add(notifyLagSeconds, lagSeconds, notify.LevelCritical, "target replica lag high", func(snap ir.TargetHealthSnapshot) (float64, bool) {
 		return snap.ReplicaLagSeconds, snap.LagKnown
 	})
 	// The storage rate-of-change rule has a nil reader; its value is derived
 	// in evalMetricsNotifyTick from the storage delta between ticks.
-	add(notifyStorageGrowth, s.NotifyStorageGrowthPerMin, notify.LevelCritical, "target storage climbing fast (auto-grow may be imminent)", nil)
+	add(notifyStorageGrowth, storageGrowthPerMin, notify.LevelCritical, "target storage climbing fast (auto-grow may be imminent)", nil)
 	return rules
 }
 
@@ -144,12 +158,20 @@ func (s *Streamer) buildMetricsNotifyRules() []metricsNotifyRule {
 // stays exact — assigning a nil MultiNotifier straight into the interface
 // would yield a non-nil interface and a wrong "notifier configured" verdict.
 func (s *Streamer) buildMetricsNotifier() notify.Notifier {
+	return buildMetricsNotifierFrom(s.NotifyWebhookURL, s.NotifySlackWebhookURL)
+}
+
+// buildMetricsNotifierFrom assembles the [notify.Notifier] from the configured
+// sink URLs — shared by the sync alerter and the `sluice metrics-watch` daemon.
+// Returns a TRUE nil interface when no sink URL is set (NOT a typed-nil
+// MultiNotifier), so a `notifier == nil` guard stays exact at every call site.
+func buildMetricsNotifierFrom(webhookURL, slackWebhookURL string) notify.Notifier {
 	var sinks []notify.Notifier
-	if s.NotifyWebhookURL != "" {
-		sinks = append(sinks, &notify.WebhookNotifier{URL: s.NotifyWebhookURL})
+	if webhookURL != "" {
+		sinks = append(sinks, &notify.WebhookNotifier{URL: webhookURL})
 	}
-	if s.NotifySlackWebhookURL != "" {
-		sinks = append(sinks, &notify.SlackNotifier{WebhookURL: s.NotifySlackWebhookURL})
+	if slackWebhookURL != "" {
+		sinks = append(sinks, &notify.SlackNotifier{WebhookURL: slackWebhookURL})
 	}
 	m := notify.NewMultiNotifier(sinks...)
 	if m == nil {
