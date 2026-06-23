@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.114] - 2026-06-23
+
+### Fixed
+
+- **A PlanetScale Postgres storage-grow reparent that severs the connection mid-COPY (`unexpected EOF` / `use of closed network connection`) is now retriable on the cold-copy path — the third reparent face, completing the item-38 grow ride-through.** The live re-validation showed the PlanetScale-Postgres storage auto-grow reparent surfaces as a *cluster* of transient faces, hit in different rounds depending on timing: `53100` could-not-extend (disk-full, classified v0.99.111), `pg_readonly` read-only window (`XX000`, classified v0.99.113), and now a raw connection severance — the new primary takeover drops the in-flight chunk `COPY` connection, surfacing as `unexpected EOF` (pgx, no SQLSTATE) rather than a server error. That wasn't classified, so the cold-copy died terminal on it (no data loss; the per-chunk COPY is atomic so a severed chunk wrote nothing). Now `io.ErrUnexpectedEOF` (sentinel) and the `unexpected EOF` / `use of closed network connection` message forms join the connection-transient retriable class (alongside the existing `io.EOF`, `driver.ErrBadConn`, connection-reset/refused/broken-pipe/i-o-timeout, and class-08 faces), so the grow-gate + chunked-COPY retry reconnects and replays the chunk across the reparent. Bounded (~30 min wall-clock) and loud on genuine exhaustion. With this, the cold-copy rides all three observed reparent faces; pinned in the classifier test set (both the `io.ErrUnexpectedEOF` sentinel and the wrapped string form → retriable).
+
 ## [0.99.113] - 2026-06-23
 
 ### Changed

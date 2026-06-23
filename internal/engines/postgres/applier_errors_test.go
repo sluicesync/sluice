@@ -93,6 +93,8 @@ func TestClassifyApplierError_RetriableShapes(t *testing.T) {
 		{"schema drift: undefined_table 42P01 (Bug F8)", &pgconn.PgError{Code: "42P01", Message: `relation "new_table" does not exist`}},
 		{"driver.ErrBadConn", driver.ErrBadConn},
 		{"io.EOF", io.EOF},
+		{"io.ErrUnexpectedEOF sentinel (reparent conn drop)", io.ErrUnexpectedEOF},
+		{"unexpected EOF string form (pgx mid-COPY conn sever)", errors.New(`copy chunk into "customers" (0 of 50000 rows copied before error): unexpected EOF`)},
 		{"wrapped driver.ErrBadConn", fmt.Errorf("query: %w", driver.ErrBadConn)},
 		{"context.DeadlineExceeded (GitHub #23 per-exec timeout)", context.DeadlineExceeded},
 		{"wrapped context.DeadlineExceeded (GitHub #23)", fmt.Errorf("postgres: applier: insert: %w", context.DeadlineExceeded)},

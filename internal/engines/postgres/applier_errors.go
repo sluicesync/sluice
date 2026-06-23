@@ -80,6 +80,7 @@ func classifyApplierError(err error) error {
 	// connection blocked the apply goroutine indefinitely.
 	if errors.Is(err, driver.ErrBadConn) ||
 		errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
 		errors.Is(err, context.DeadlineExceeded) {
 		return &retriablePGError{err: err}
 	}
@@ -165,6 +166,15 @@ func classifyApplierError(err error) error {
 			strings.Contains(msg, "connection refused"),
 			strings.Contains(msg, "broken pipe"),
 			strings.Contains(msg, "i/o timeout"),
+			// "unexpected EOF" — the server severed the connection mid-stream
+			// (e.g. a PlanetScale reparent dropping the in-flight cold-copy
+			// COPY connection: live finding, item 38 re-validation 2026-06-23).
+			// pgx surfaces this as a plain string error (not always wrapping the
+			// io.ErrUnexpectedEOF sentinel caught above), so match the message
+			// too. A transient connection severance; the cold-copy chunk retry /
+			// CDC reconnect rides it, bounded + loud on genuine exhaustion.
+			strings.Contains(msg, "unexpected EOF"),
+			strings.Contains(msg, "use of closed network connection"),
 			strings.Contains(msg, "the database system is starting up"),
 			strings.Contains(msg, "the database system is shutting down"):
 			return &retriablePGError{err: err}
