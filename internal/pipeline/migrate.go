@@ -1358,10 +1358,14 @@ func applyMaxBufferBytes(target any, bytes int64) {
 
 // applyGrowGate wires the cold-copy run's shared coordinated-pause gate
 // (ADR-0110) onto a freshly-opened writer that opts into it via
-// [ir.GrowGateSetter]. Engines that don't implement the setter (PG today)
-// retain their per-lane retry behaviour unchanged. A nil gate is a no-op:
-// the writer keeps its zero-value nil gate (pre-ADR-0110 behaviour). Called
-// immediately after each chunk/table writer opens, alongside
+// [ir.GrowGateSetter]. Both engines implement the setter today (MySQL and
+// Postgres), so on a cold-copy run — where the gate is constructed
+// unconditionally (see [newGrowGate] in migrate_phases.go) — the writer
+// receives a non-nil gate and takes its grow-aware path. Any future engine
+// that does NOT implement the setter retains its per-lane behaviour
+// unchanged. A nil gate (non-cold-copy callers / direct unit tests) is a
+// no-op: the writer keeps its zero-value nil gate (pre-ADR-0110 behaviour).
+// Called immediately after each chunk/table writer opens, alongside
 // applyMaxBufferBytes, before any flush.
 func applyGrowGate(target any, gate ir.GrowGate) {
 	if gate == nil {

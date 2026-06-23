@@ -89,17 +89,21 @@ type RowWriter struct {
 
 	// growGate is the shared cold-copy coordinated-pause primitive
 	// (ADR-0110, roadmap item 38 — the PG-target analog of the MySQL
-	// writer's gate). The pipeline threads ONE gate per cold-copy run onto
-	// every writer it opens (via [SetGrowGate]). When set, writeViaCopy
-	// takes the CHUNKED-COPY-with-retry path so a mid-COPY storage-grow
-	// transient (53100 could-not-extend-file on a PlanetScale non-Metal PG
-	// volume) is ridden chunk-by-chunk instead of aborting the table
-	// fatally; copyChunkWithRetry Awaits the gate before each chunk and
-	// Trips it on a classified grow-transient so all sibling lanes quiesce
-	// together. nil ⇒ pre-ADR-0110 behaviour, byte-for-byte: writeViaCopy
-	// stays on the monolithic single-CopyFrom path (the default on serial
-	// copy, tests, vanilla PG, and the non-cold-copy apply path).
-	// Implements [ir.GrowGateSetter] (see row_writer_grow_gate.go).
+	// writer's gate). The pipeline constructs ONE gate per cold-copy run
+	// UNCONDITIONALLY (signal-driven universal floor — see [newGrowGate])
+	// and threads it onto every writer it opens (via [SetGrowGate]), so on
+	// ANY cold-copy run — vanilla PG included, not just a PlanetScale-class
+	// target — this is non-nil and writeViaCopy takes the
+	// CHUNKED-COPY-with-retry path: a mid-COPY storage-grow transient
+	// (53100 could-not-extend-file on an auto-grow PG volume) is ridden
+	// chunk-by-chunk instead of aborting the table fatally;
+	// copyChunkWithRetry Awaits the gate before each chunk and Trips it on a
+	// classified grow-transient so all sibling lanes quiesce together. nil ⇒
+	// writeViaCopy stays on the monolithic single-CopyFrom path — that
+	// happens only for the no-gate CONSTRUCTIONS: direct unit tests and any
+	// non-cold-copy caller. The per-value encoding is byte-identical either
+	// way (one prepareValue path). Implements [ir.GrowGateSetter] (see
+	// row_writer_grow_gate.go).
 	growGate ir.GrowGate
 
 	// copyChunkFaultHook is a TEST-ONLY fault-injection seam for the
@@ -496,12 +500,17 @@ func (w *RowWriter) WriteRows(ctx context.Context, table *ir.Table, rows <-chan 
 // the entire copy. The error message names how many rows landed
 // before the failure so operators can scope the impact.
 func (w *RowWriter) writeViaCopy(ctx context.Context, table *ir.Table, rows <-chan ir.Row) error {
-	// ADR-0110 / roadmap item 38: when a grow-gate is attached (a
-	// PlanetScale-class target), take the CHUNKED-COPY-with-retry path so a
-	// mid-COPY storage-grow transient is ridden chunk-by-chunk. When no gate
-	// is attached (vanilla PG, the common case) keep the existing monolithic
-	// single-CopyFrom path byte-for-byte — no chunking, no behaviour change,
-	// no throughput regression.
+	// ADR-0110 / roadmap item 38: when a grow-gate is attached, take the
+	// CHUNKED-COPY-with-retry path so a mid-COPY storage-grow transient is
+	// ridden chunk-by-chunk. On a cold-copy run the gate is constructed
+	// UNCONDITIONALLY (signal-driven universal floor — see [newGrowGate]),
+	// so a PG target — vanilla PG included — takes this chunked path; any
+	// auto-grow target benefits, not just a PlanetScale-class one. The
+	// monolithic single-CopyFrom path below runs only for the no-gate
+	// constructions: direct unit tests and non-cold-copy callers. The
+	// per-value encoding is byte-identical either way (one prepareValue
+	// path) — no behaviour change, no throughput regression on the
+	// monolithic path.
 	if w.growGate != nil {
 		return w.writeViaCopyChunked(ctx, table, rows)
 	}

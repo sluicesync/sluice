@@ -9,11 +9,20 @@
 //  1. BYTE-IDENTICAL — the grow-gate-engaged CHUNKED COPY path
 //     (writeViaCopyChunked) must produce EXACTLY the same target rows as the
 //     monolithic single-CopyFrom path (writeViaCopy with no gate), across a
-//     multi-family fixture (int / numeric-extreme / text+unicode / bytea /
-//     json/jsonb / timestamp(tz) / bool / NULLs). This is the Bug-74
-//     discipline: the chunked path must not introduce a second encoding. The
-//     two tables are copied BOTH ways and compared via an md5 over PG's own
-//     canonical ::text rendering of every row, ordered by PK.
+//     multi-family fixture spanning every distinct pgx encode branch:
+//     int / numeric-extreme / text+unicode / bytea / json/jsonb /
+//     timestamp(tz) / bool / NULLs, PLUS the Bug-74-corollary families —
+//     arrays (int[], text[], the EXACT numeric[][] multi-dim Bug-74 case, and
+//     a NULL-element text[]), the string-shaped non-text OIDs (uuid / inet /
+//     cidr / macaddr), the temporal leaves (date / time / timetz — timetz
+//     exercises the per-conn registerPGTimetzCodec registration that must fire
+//     on BOTH paths via copyFromOnSQLConn), and bit / varbit. This is the
+//     Bug-74 discipline: the chunked path must not introduce a second
+//     encoding. The two tables are copied BOTH ways and compared via an md5
+//     over PG's own canonical ::text rendering of every row, ordered by PK.
+//     (pgvector / hstore are NOT in this fixture — the shared test PG image
+//     lacks both extensions; they have dedicated end-to-end pins on the
+//     prebaked pgvector image. See the fixture-schema NOTE.)
 //
 //  2. RETRY CONVERGENCE — when a classified-retriable fault (53100) is
 //     injected on the first attempt of the FIRST chunk, the chunk is replayed
@@ -25,6 +34,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"testing"
 	"time"
 
@@ -51,6 +61,52 @@ func growFixtureSchema(name string) *ir.Schema {
 			{Name: "ts", Type: ir.Timestamp{Precision: 6, WithTimeZone: false}, Nullable: true},
 			{Name: "tstz", Type: ir.Timestamp{Precision: 6, WithTimeZone: true}, Nullable: true},
 			{Name: "flag", Type: ir.Boolean{}, Nullable: true},
+
+			// --- Bug-74-corollary families: each is a DISTINCT pgx codec /
+			// encode branch the chunked path must prove byte-identical to the
+			// monolithic path (a green test on one family does NOT cover the
+			// others — the driver wire path differs by target OID). ---
+
+			// Arrays (the literal Bug-74 family). int[] (native int8 leaf),
+			// text[] (string-leaf Text codec), numeric[][] (the EXACT Bug-74
+			// multi-dimensional case — a wrong leaf silently flattens ≥2-D),
+			// and a text[] with a NULL element (typed-nil *T leaf round-trip).
+			{Name: "arr_int", Type: ir.Array{Element: ir.Integer{Width: 64}}, Nullable: true},
+			{Name: "arr_text", Type: ir.Array{Element: ir.Text{}}, Nullable: true},
+			{Name: "arr_num2d", Type: ir.Array{Element: ir.Decimal{Precision: 20, Scale: 4}}, Nullable: true},
+			{Name: "arr_text_null", Type: ir.Array{Element: ir.Text{}}, Nullable: true},
+
+			// String-shaped non-text OIDs (each a distinct element codec OID).
+			{Name: "u", Type: ir.UUID{}, Nullable: true},
+			{Name: "ip", Type: ir.Inet{}, Nullable: true},
+			{Name: "net", Type: ir.Cidr{}, Nullable: true},
+			{Name: "mac", Type: ir.Macaddr{}, Nullable: true},
+
+			// Temporal leaves. timetz exercises the per-conn
+			// registerPGTimetzCodec registration that must fire identically on
+			// BOTH paths via copyFromOnSQLConn (pgx ships no timetz codec — a
+			// dropped registration aborts the COPY with "cannot find encode
+			// plan").
+			{Name: "d", Type: ir.Date{}, Nullable: true},
+			{Name: "tod", Type: ir.Time{Precision: 6, WithTimeZone: false}, Nullable: true},
+			{Name: "todtz", Type: ir.Time{Precision: 6, WithTimeZone: true}, Nullable: true},
+
+			// bit / varbit (pgtype.Bits — left-aligned wire format + value-bit
+			// length, catalog Bug 62/75).
+			{Name: "bits", Type: ir.Bit{Length: 8, Varying: false}, Nullable: true},
+			{Name: "vbits", Type: ir.Bit{Length: 16, Varying: true}, Nullable: true},
+
+			// NOTE: pgvector (`vector`) and hstore — the HIGHEST
+			// "refactor dropped a codec" risk, since they exercise the
+			// per-conn codec-registration extraction in copyFromOnSQLConn — are
+			// deliberately NOT in this fixture. The shared test PG image
+			// (newSharedPGDB) carries neither extension, so CREATE TABLE would
+			// fail. They have dedicated end-to-end pins in
+			// change_applier_pipelined_ext_integration_test.go (on the prebaked
+			// pgvector image). The timetz column above already exercises the
+			// same per-conn registration seam (copyFromOnSQLConn) on the
+			// standard rig, so the "registration must fire on both paths"
+			// contract is covered here.
 		},
 		PrimaryKey: &ir.Index{
 			Name:    name + "_pkey",
@@ -79,8 +135,37 @@ func growFixtureRows(n int) []ir.Row {
 			"ts":       tsBase.Add(time.Duration(i) * time.Minute),
 			"tstz":     tsBase.Add(time.Duration(i) * time.Hour),
 			"flag":     i%2 == 0,
+
+			// Arrays — []any (nested for multi-dim), the IR canonical form.
+			"arr_int":  []any{int64(i), int64(i + 1), int64(i + 2)},
+			"arr_text": []any{"a-" + itoa(i), "b-世界", "c-Ω"},
+			// numeric[][] — the EXACT Bug-74 multi-dimensional case (2×2).
+			"arr_num2d": []any{
+				[]any{itoa(i) + ".0001", itoa(i) + ".0002"},
+				[]any{itoa(i) + ".0003", itoa(i) + ".0004"},
+			},
+			// text[] with a NULL element (middle slot).
+			"arr_text_null": []any{"x-" + itoa(i), nil, "z-" + itoa(i)},
+
+			// String-shaped non-text OIDs (canonical text form, as the readers
+			// emit under pgx stdlib mode).
+			"u":   fmtUUID(i),
+			"ip":  fmtInet(i),
+			"net": fmtCidr(i),
+			"mac": fmtMac(i),
+
+			// Temporal: date (time.Time), time-of-day + timetz (canonical text).
+			"d":     time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).AddDate(0, 0, i),
+			"tod":   fmtTimeOfDay(i),
+			"todtz": fmtTimeTZ(i),
+
+			// bit(8) fixed + varbit(16) — canonical '0'/'1' bit-strings.
+			"bits":  fmtBits8(i),
+			"vbits": fmtVarbits(i),
 		}
-		// Scatter NULLs across every nullable family on selected rows.
+		// Scatter NULLs across every nullable family on selected rows — incl.
+		// every new family, so the NULL-element / NULL-array shape variants are
+		// exercised on both paths.
 		if i%5 == 0 {
 			r["n_small"] = nil
 			r["amount"] = nil
@@ -89,6 +174,19 @@ func growFixtureRows(n int) []ir.Row {
 			r["doc_bin"] = nil
 			r["tstz"] = nil
 			r["flag"] = nil
+			r["arr_int"] = nil
+			r["arr_text"] = nil
+			r["arr_num2d"] = nil
+			r["arr_text_null"] = nil
+			r["u"] = nil
+			r["ip"] = nil
+			r["net"] = nil
+			r["mac"] = nil
+			r["d"] = nil
+			r["tod"] = nil
+			r["todtz"] = nil
+			r["bits"] = nil
+			r["vbits"] = nil
 		}
 		rows = append(rows, r)
 	}
@@ -115,6 +213,88 @@ func itoa(i int) string {
 		buf[pos] = '-'
 	}
 	return string(buf[pos:])
+}
+
+// Per-family deterministic value formatters for the Bug-74-corollary
+// columns. Each returns the value in the canonical text/Go shape the COPY
+// encode path expects (uuid/inet/cidr/macaddr/timetz/time as their canonical
+// PG text strings; bit/varbit as '0'/'1' bit-strings). Both the monolithic and
+// the chunked path encode the SAME bytes, so byte-identity is the assertion;
+// the formatters only need to produce values PG accepts.
+
+func fmtUUID(i int) string {
+	// A valid v4-shaped uuid that varies per row in the last group.
+	return "0000ffff-0000-4000-8000-" + fmtHex12(i)
+}
+
+func fmtHex12(i int) string {
+	const hexdigits = "0123456789abcdef"
+	var b [12]byte
+	for p := 11; p >= 0; p-- {
+		b[p] = hexdigits[i&0xf]
+		i >>= 4
+	}
+	return string(b[:])
+}
+
+func fmtInet(i int) string {
+	// IPv4 host address, varying in the low octet.
+	return "192.168.1." + itoa(i%256)
+}
+
+func fmtCidr(i int) string {
+	// IPv4 network spec (host bits zero — PG canonicalizes cidr).
+	return "10." + itoa(i%256) + ".0.0/16"
+}
+
+func fmtMac(i int) string {
+	return "08:00:2b:01:02:" + fmtHex2(i)
+}
+
+func fmtHex2(i int) string {
+	const hexdigits = "0123456789abcdef"
+	v := i & 0xff
+	return string([]byte{hexdigits[v>>4], hexdigits[v&0xf]})
+}
+
+func fmtTimeOfDay(i int) string {
+	// HH:MM:SS.ffffff — the IR canonical time-of-day form.
+	return fmt2(i%24) + ":" + fmt2((i*7)%60) + ":" + fmt2((i*13)%60) + ".123456"
+}
+
+func fmtTimeTZ(i int) string {
+	// HH:MM:SS+ZZ — canonical timetz text (exercises registerPGTimetzCodec).
+	return fmt2(i%24) + ":" + fmt2((i*7)%60) + ":" + fmt2((i*13)%60) + "+05"
+}
+
+func fmt2(i int) string {
+	s := itoa(i)
+	if len(s) < 2 {
+		return "0" + s
+	}
+	return s
+}
+
+func fmtBits8(i int) string {
+	// 8-char '0'/'1' string for a fixed bit(8).
+	var b [8]byte
+	for p := 7; p >= 0; p-- {
+		b[p] = byte('0' + (i & 1))
+		i >>= 1
+	}
+	return string(b[:])
+}
+
+func fmtVarbits(i int) string {
+	// A varying-length bit-string (1..16 bits) so varbit's value-bit-length
+	// (not the declared width) is exercised — catalog Bug 75.
+	n := 1 + (i % 16)
+	b := make([]byte, n)
+	for p := n - 1; p >= 0; p-- {
+		b[p] = byte('0' + (i & 1))
+		i >>= 1
+	}
+	return string(b)
 }
 
 // applyFixtureAndReadTable applies the schema and re-reads the table object
@@ -313,6 +493,75 @@ func TestPGGrowGate_ChunkRetryConvergesNoDupNoDrop(t *testing.T) {
 	retryMD5 := tableRowMD5(t, ctx, rwRetry.db, "grow_retry")
 	if refMD5 != retryMD5 {
 		t.Fatalf("chunk-retry result is NOT byte-identical to a clean copy:\n  ref   md5 = %s\n  retry md5 = %s", refMD5, retryMD5)
+	}
+}
+
+// TestPGGrowGate_TerminalErrorMidChunkSurfacesLoudly_NotComplete pins the
+// loud-fail-safe contract on the chunked path with a REAL db: a NON-retriable
+// (terminal) error injected on a LATER chunk (chunk 2 of N) — after chunk 1 has
+// really landed its rows — makes WriteRows return a non-nil error. The table
+// copy is NOT reported complete; chunk-everywhere does not silently treat a
+// partial table as done. (The operator recovers via the existing --reset/resume
+// re-copy of the whole table.)
+//
+// A terminal 42501 (insufficient_privilege) is classified non-retriable by
+// classifyApplierError, so the chunk-2 fault is surfaced without retry. The
+// hook fires per-chunk on attempt 1; we count chunk boundaries and fault the
+// SECOND chunk. We then assert the table is PARTIAL (chunk 1's rows landed,
+// chunk 2 onward did not) — i.e. the run is incomplete and loud, never a silent
+// full-table success.
+func TestPGGrowGate_TerminalErrorMidChunkSurfacesLoudly_NotComplete(t *testing.T) {
+	dsn, cleanup := startPostgres(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	const nRows = 300
+	rows := growFixtureRows(nRows)
+
+	table := applyFixtureAndReadTable(t, ctx, dsn, "grow_terminal")
+
+	withFastPGCopyBackoff(t)
+	withSmallPGChunk(t, 50) // 300/50 ⇒ 6 chunks; the terminal hits chunk 2
+
+	rwIface, err := Engine{}.OpenRowWriter(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenRowWriter: %v", err)
+	}
+	defer closeIf(rwIface)
+	rw := rwIface.(*RowWriter)
+	rw.SetGrowGate(&recordingGrowGate{})
+
+	terminal := &pgconn.PgError{Code: "42501", Message: "permission denied for table grow_terminal"}
+	var chunkSeq int
+	rw.copyChunkFaultHook = func(attempt int) error {
+		// attempt resets to 1 per chunk; count chunk boundaries by attempt==1.
+		if attempt == 1 {
+			chunkSeq++
+		}
+		if chunkSeq == 2 {
+			// Chunk 2: a TERMINAL error before any conn is acquired — chunk 1 has
+			// already landed its rows against the real db.
+			return terminal
+		}
+		return nil // every other chunk runs the real CopyFrom
+	}
+
+	err = rw.WriteRows(ctx, table, feedRows(rows))
+	if err == nil {
+		t.Fatal("WriteRows must return the terminal mid-chunk error LOUDLY (got nil — silent partial-as-complete)")
+	}
+	if !errors.Is(err, terminal) {
+		t.Errorf("the terminal error must propagate verbatim; got %v", err)
+	}
+
+	// The table is PARTIAL: chunk 1's 50 rows landed (a real CopyFrom), chunk 2
+	// onward did not. The key contract is incompleteness surfaced loudly, NOT
+	// the exact count — assert it is strictly between 0 and the full fixture.
+	got := tableCount(t, ctx, rw.db, "grow_terminal")
+	if got <= 0 || got >= nRows {
+		t.Errorf("partial-table count = %d; want 0 < count < %d (chunk 1 landed, the terminal aborted before the full table)", got, nRows)
 	}
 }
 

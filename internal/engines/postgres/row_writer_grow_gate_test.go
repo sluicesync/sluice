@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // ADR-0110 / roadmap item 38 grow-gate wiring pins (PG RowWriter side). These
@@ -215,6 +217,70 @@ func TestPGCopyChunkRetry_NilGateInert(t *testing.T) {
 	if calls != 2 {
 		t.Errorf("attempt calls = %d; want 2 (transient + replay, gate inert)", calls)
 	}
+}
+
+// TestWriteViaCopyChunked_TerminalErrorSurfacesLoudly pins the loud-fail-safe
+// contract of chunk-everywhere (the design decision behind item 38): a
+// NON-retriable (terminal) error on a chunk makes the whole table copy return a
+// non-nil error — the run fails, the table is NOT reported complete (no silent
+// partial-as-done). The operator recovers via the existing --reset/resume
+// re-copy: a rolled-back chunk wrote nothing and earlier chunks are
+// append-only into the fresh cold-copy table, so the re-copy is clean.
+//
+// It drives writeViaCopyChunked directly. copyChunkFaultHook is consulted
+// BEFORE any conn is acquired, so a terminal fault never touches the (nil) db —
+// no testcontainers needed. The "terminal on a LATER chunk (chunk 2 of N)"
+// case requires earlier chunks to succeed against a real db (a nil-db unit
+// harness can't let a chunk succeed without panicking on Conn()), so it is
+// pinned in row_writer_grow_gate_integration_test.go
+// (TestPGGrowGate_TerminalErrorMidChunkSurfacesLoudly_NotComplete). This unit
+// pin proves the path-level loudness without a container.
+func TestWriteViaCopyChunked_TerminalErrorSurfacesLoudly(t *testing.T) {
+	withFastPGCopyBackoff(t)
+	withSmallChunkUnit(t, 2) // 5 rows / 2 ⇒ several chunks; the first faults terminally
+
+	gate := &recordingGrowGate{}
+	w := &RowWriter{growGate: gate} // nil db: the hook short-circuits before Conn()
+
+	// A terminal SQLSTATE: 42501 insufficient_privilege. classifyApplierError
+	// returns it unchanged (not in the retriable set), so the retry loop must
+	// surface it on the first attempt without retrying.
+	terminal := &pgconn.PgError{Code: "42501", Message: "permission denied for table grow_chunk"}
+	var attempts int
+	w.copyChunkFaultHook = func(int) error {
+		attempts++
+		return terminal
+	}
+
+	rows := make(chan ir.Row, 5)
+	for i := 0; i < 5; i++ {
+		rows <- ir.Row{"id": int64(i)}
+	}
+	close(rows)
+
+	tbl := &ir.Table{Name: "grow_chunk", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}
+	err := w.writeViaCopyChunked(context.Background(), tbl, rows)
+	if err == nil {
+		t.Fatal("writeViaCopyChunked must return the terminal error LOUDLY (got nil — silent partial-as-complete)")
+	}
+	if !errors.Is(err, terminal) {
+		t.Errorf("the terminal error must propagate verbatim; got %v", err)
+	}
+	if attempts != 1 {
+		t.Errorf("attempts = %d; want 1 (terminal must NOT be retried)", attempts)
+	}
+	if got := gate.trips.Load(); got != 0 {
+		t.Errorf("gate.Trip = %d; want 0 (a terminal error must not trip the grow pause)", got)
+	}
+}
+
+// withSmallChunkUnit shrinks the chunked-COPY row cap for a unit test so a
+// small fixture spans several chunks, restoring it afterwards.
+func withSmallChunkUnit(t *testing.T, rowsPerChunk int) {
+	t.Helper()
+	prev := pgCopyChunkRowsVar
+	pgCopyChunkRowsVar = rowsPerChunk
+	t.Cleanup(func() { pgCopyChunkRowsVar = prev })
 }
 
 // TestSetGrowGate_RoutesChunkedVsMonolithic pins the engage-only-where-needed

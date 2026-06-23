@@ -99,11 +99,15 @@ func pgCopyReparentBackoff(attempt int) time.Duration {
 // The pipeline wires the cold-copy run's shared [ir.GrowGate] here, right
 // after OpenRowWriter, so every per-table / per-fan-out-worker writer in the
 // run shares ONE pause coordinator — the same construction-time wiring as the
-// MySQL RowWriter. A nil gate (the default on serial copy, tests, vanilla PG,
-// and the non-cold-copy apply path) disables the coordinated pause AND keeps
-// writeViaCopy on the monolithic single-CopyFrom path byte-for-byte; the
-// per-chunk reparent-retry budget is the authoritative loud-on-exhaustion
-// floor whenever a gate IS attached.
+// MySQL RowWriter. On a cold-copy run the gate is constructed UNCONDITIONALLY
+// (signal-driven universal floor — any auto-grow target benefits, not just a
+// PlanetScale-class one), so a PG target — vanilla PG included — receives a
+// non-nil gate here and writeViaCopy takes the chunked-COPY path. A nil gate
+// — only the no-gate CONSTRUCTIONS: direct unit tests and the non-cold-copy
+// apply path — disables the coordinated pause AND keeps writeViaCopy on the
+// monolithic single-CopyFrom path (per-value encoding is byte-identical
+// either way). The per-chunk reparent-retry budget is the authoritative
+// loud-on-exhaustion floor whenever a gate IS attached.
 func (w *RowWriter) SetGrowGate(gate ir.GrowGate) {
 	w.growGate = gate
 }
