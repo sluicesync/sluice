@@ -477,22 +477,34 @@ func (r *Restore) Run(ctx context.Context) error {
 		return nil
 	}
 
-	// 7. Phase 3: identity-sequence sync.
-	if err := sw.SyncIdentitySequences(ctx, schema); err != nil {
+	// 7. Phase 3: identity-sequence sync. Each post-copy DDL phase is
+	// wrapped in the ADR-0114 reparent retry so a PlanetScale storage-grow
+	// reparent landing on the DDL phase (the index build is the textbook
+	// case — Track-C live finding) rides out instead of aborting the whole
+	// restore after a byte-perfect data copy. All four phases are idempotent
+	// on re-run (see runDDLPhaseWithReparentRetry's header).
+	if err := runDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
+		return sw.SyncIdentitySequences(ctx, schema)
+	}); err != nil {
 		return wrapWithHint(PhaseSchemaApply, fmt.Errorf("restore: sync identity sequences: %w", err))
 	}
 
 	// 8. Phase 4: indexes.
-	if err := sw.CreateIndexes(ctx, schema); err != nil {
+	if err := runDDLPhaseWithReparentRetry(ctx, "indexes", sw, func(ctx context.Context) error {
+		return sw.CreateIndexes(ctx, schema)
+	}); err != nil {
 		return wrapWithHint(PhaseIndexes, fmt.Errorf("restore: create indexes: %w", err))
 	}
 
 	// 9. Phase 5: constraints.
-	if err := sw.CreateConstraints(ctx, schema); err != nil {
+	if err := runDDLPhaseWithReparentRetry(ctx, "constraints", sw, func(ctx context.Context) error {
+		return sw.CreateConstraints(ctx, schema)
+	}); err != nil {
 		return wrapWithHint(PhaseConstraints, fmt.Errorf("restore: create constraints: %w", err))
 	}
 
-	// 10. Phase 6: views.
+	// 10. Phase 6: views. runViewsPhase wraps its own per-view DDL in the
+	// reparent retry (ADR-0114) atop its dependency-pass retry.
 	if err := runViewsPhase(ctx, schema, sw); err != nil {
 		return wrapWithHint(PhaseViews, err)
 	}

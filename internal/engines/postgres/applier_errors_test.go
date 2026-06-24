@@ -16,6 +16,43 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
+// TestSchemaWriter_IsTransientError pins the ADR-0114 DDL-phase retry
+// verdict the orchestrator reads via [ir.TransientClassifier]: the live
+// Track-C reparent shapes that killed the index build (57P01 / 57P03 /
+// disk-full grow class) must classify transient, and a real DDL fault
+// (undefined column, unique violation) must NOT — so a broken DDL still
+// fails loudly instead of looping. Delegates to classifyApplierError, so
+// this also guards that the SchemaWriter never grew a second classifier.
+func TestSchemaWriter_IsTransientError(t *testing.T) {
+	w := &SchemaWriter{}
+	transient := []error{
+		&pgconn.PgError{Code: "57P01", Message: "terminating connection due to administrator command"},
+		&pgconn.PgError{Code: "57P03", Message: "the database system is not accepting connections"},
+		&pgconn.PgError{Code: "53100", Message: `could not extend file "base/5/16634": No space left on device`},
+	}
+	for _, e := range transient {
+		if !w.IsTransientError(e) {
+			t.Errorf("IsTransientError(%v) = false; want true (a reparent/grow transient must retry)", e)
+		}
+	}
+	// NOTE: 42703/42P01 are classified retriable schema-drift (self-heals
+	// when the operator adds the column/table), so they are deliberately NOT
+	// in this terminal set — assert only the genuinely-terminal shapes.
+	terminal := []error{
+		&pgconn.PgError{Code: "23505", Message: "duplicate key value violates unique constraint"},
+		&pgconn.PgError{Code: "42601", Message: `syntax error at or near "FOO"`},
+		errors.New("some random non-transient failure"),
+	}
+	for _, e := range terminal {
+		if w.IsTransientError(e) {
+			t.Errorf("IsTransientError(%v) = true; want false (a real DDL fault must fail loudly)", e)
+		}
+	}
+	if w.IsTransientError(nil) {
+		t.Error("IsTransientError(nil) = true; want false")
+	}
+}
+
 // TestClassifyApplierError_NilInNilOut — boundary case the pipeline
 // relies on. Wrapping every applier return site MUST pass nil
 // through unchanged or success becomes a typed error.

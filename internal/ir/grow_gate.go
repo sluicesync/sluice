@@ -60,6 +60,32 @@ type GrowGateSetter interface {
 	SetGrowGate(gate GrowGate)
 }
 
+// TransientClassifier is the OPTIONAL surface an engine [SchemaWriter]
+// implements so the orchestrator can ask whether an error from a
+// NON-applier path is a transient storage-grow / reparent shape worth
+// retrying (ADR-0114). The applier / cold-copy paths already route their
+// driver returns through the engine's internal classifier, which wraps a
+// transient as an [ir.RetriableError]; but the post-copy DDL phases
+// (CreateIndexes / CreateConstraints / CreateViews / SyncIdentitySequences)
+// exec their DDL directly and return the RAW driver error, so the
+// pipeline can't see the same verdict via errors.As. This surface exposes
+// that verdict: the engine delegates to the exact same classifier the
+// apply path uses, so the DDL-phase retry recognises a PlanetScale
+// reparent (PG 57P01 / MySQL "not serving") identically to the row path.
+//
+// A SchemaWriter that doesn't implement this ⇒ the DDL-phase retry is a
+// no-op (one attempt, terminal on any error) — the pre-ADR-0114 behaviour,
+// byte-for-byte. The classifier is a pure verdict over the error: it never
+// mutates state, advances a position, or swallows a terminal error.
+type TransientClassifier interface {
+	// IsTransientError reports whether err (or anything it wraps) is a
+	// classified transient (connection-drop / reparent / storage-grow)
+	// the DDL-phase retry should ride out. A non-transient (a real DDL
+	// fault, a type error, a constraint violation) returns false and the
+	// phase fails loudly, exactly as before.
+	IsTransientError(err error) bool
+}
+
 // ReparentObserverSetter is the OPTIONAL surface a cold-copy [RowWriter]
 // implements to report, per table, that it observed a classified
 // storage-grow / reparent transient while writing — the signal the restore

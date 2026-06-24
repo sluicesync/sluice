@@ -595,6 +595,14 @@ So NOTIFY-kick is **demoted** — the poll isn't the bottleneck. Closing the rea
 
 **Gotchas.** (1) Per-user limits vs global — bound by the tighter. (2) A connection-budget prober alone bounds the wrong resource on PlanetScale (CPU is the limit, conns are abundant) — pair it with the buffer-pool tier-proxy cap above. (3) Demand-gated for the self-hosted-MySQL connection-wall case; the PlanetScale tier-proxy cap is the part worth building first (feeds item 40 with a no-credential signal).
 
+### 42. PG-migrate overlapped copy+index path: ride a reparent inside the per-table index build (ADR-0114 residual) — *demand-gated*
+
+**Why.** ADR-0114 (v0.99.118) wraps every post-copy DDL phase (`CreateIndexes`/`CreateConstraints`/`CreateViews`/`SyncIdentitySequences`) in an engine-general bounded reparent-retry, in BOTH `restore.go` and `migrate.go`. But the Postgres-migrate **overlapped copy+index** optimization (ADR-0077, `runOverlappedCopyAndIndexPhase` → `ir.IncrementalIndexBuilder.BuildTableIndexesFromChannel`) builds per-table indexes *interleaved with the copy*, INSIDE the engine method — so the pipeline-level wrap can't reach it. A storage-grow reparent landing on one of those interleaved index builds would still abort (the builder currently cancels the errgroup on the first build error). The live-failing path (Track-C restore) uses the now-wrapped `CreateIndexes`, not the overlap path, so this is a known residual, not a regression.
+
+**What.** Push a classify-and-retry INTO the engine's per-table index build: on a classified `ir.RetriableError` (the same `classifyApplierError` verdict ADR-0114's `ir.TransientClassifier` exposes), back off + re-run that table's `CREATE INDEX IF NOT EXISTS` (idempotent) instead of cancelling the group. Mirror the ADR-0114 envelope (~30-min wall-clock, loud on exhaustion). Pin with a fake builder that fails one table's build with a transient then succeeds.
+
+**Gotchas.** (1) The build runs concurrently with the copy pool, so the retry must not wedge the `completedTables` channel drain. (2) Only the index BUILD is retriable; a real DDL fault stays terminal (loud). (3) Demand-gated — only the PG-migrate (not restore, not MySQL) overlap path is exposed, and only on a target that reparents mid-index-build.
+
 ---
 
 ### Open bugs awaiting fix windows
