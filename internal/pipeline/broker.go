@@ -146,6 +146,25 @@ type SyncFromBackup struct {
 	// memory. Same semantics as [Migrator.MaxBufferBytes].
 	MaxBufferBytes int64
 
+	// ApplyConcurrency is the key-hash concurrent-apply LANE count for
+	// incremental REPLAY (ADR-0104/0105, the same machinery `sync start`
+	// uses). The broker previously replayed every incremental through the
+	// single-stream pipelined applier (ApplyBatch with concurrency 1), so a
+	// large incremental into a high-latency / cross-region target applied
+	// serially and could grind — the broker-replay analog of the item-23/26
+	// cross-region wedge (live Track-C finding, 2026-06-24). When > 1 (or
+	// auto), the broker plumbs it onto the applier via
+	// [applyApplyConcurrency] so ApplyBatch fans the merged change stream
+	// across W in-order PK-hash lanes. Exactly-once is preserved exactly as
+	// on the streamer path: every change in an incremental carries the same
+	// broker position token, so the lanes persist the identical position the
+	// serial path does, and the broker's idempotent re-replay-from-parent
+	// recovery is unchanged. Follows the ADR-0106 contract: `0 = auto:N`
+	// (the fast default — see [resolveBrokerApplyConcurrency]), `1 = serial
+	// opt-out`, `N > 1 = honored`. The zero value gets the fast default (no
+	// zero-value-safe-default trap, the v0.99.51 lesson).
+	ApplyConcurrency int
+
 	// ResetTargetData, when true, runs a [ChainRestore] internally
 	// before transitioning to live polling. Matches `migrate`'s
 	// `--reset-target-data` shape: drops target tables, applies the
@@ -241,6 +260,34 @@ func encodeBrokerPosition(chainURL, backupID string) ir.Position {
 	}
 }
 
+// resolveBrokerApplyConcurrency maps [SyncFromBackup.ApplyConcurrency] to the
+// effective key-hash lane count for incremental replay, applying the same
+// ADR-0106 raw-int contract the streamer uses ([resolveApplyConcurrency]):
+//
+//	n  < 0 → 1                    (defensive against bad input)
+//	n == 1 → 1                    (explicit serial opt-out)
+//	n  > 1 → n                    (operator override, honored as-is)
+//	n == 0 → defaultApplyConcurrency (unset → the fast adaptive default)
+//
+// Unlike the streamer's resolver this does NOT run a connection-budget probe:
+// the broker opens a single applier up front and the concurrent path's per-lane
+// AIMD ([change_applier_concurrent.go]) backs each lane off independently if the
+// target is tight, so the fixed conservative default (4) is safe here without
+// the extra probe round-trip. The zero value resolving to the fast default —
+// rather than the Go-zero-meaning-serial trap (v0.99.51) — is why every broker
+// construction path (CLI, tests, future callers) gets concurrent replay unless
+// it explicitly opts out with 1.
+func resolveBrokerApplyConcurrency(n int) int {
+	switch {
+	case n < 0:
+		return 1
+	case n == 0:
+		return defaultApplyConcurrency
+	default:
+		return n
+	}
+}
+
 // decodeBrokerPosition parses a position token written by
 // [encodeBrokerPosition]. Returns (nil, error) when the token isn't
 // JSON-shaped or doesn't carry the broker sentinel — a non-broker
@@ -328,6 +375,7 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 	}
 	defer closeIf(applier)
 	applyMaxBufferBytes(applier, b.MaxBufferBytes)
+	applyApplyConcurrency(applier, resolveBrokerApplyConcurrency(b.ApplyConcurrency))
 	if err := applier.EnsureControlTable(ctx); err != nil {
 		return wrapWithHint(PhaseSchemaApply, fmt.Errorf("broker: ensure control table: %w", err))
 	}

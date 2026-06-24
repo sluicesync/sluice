@@ -4,6 +4,10 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Added
+
+- **The `sync from-backup` broker (chain-replay) now applies incrementals through the concurrent key-hash apply lanes, not a single serial stream — large incrementals into a high-latency / cross-region target no longer effectively stall (`--apply-concurrency W`, ADR-0104/0105).** Found live by the Track-C large-scale program: replaying an ~8 M-change incremental from an object-storage backup chain into a small cross-region PlanetScale-Postgres target ground to ~1–2 changes/s. Root cause: while `sync start` (live CDC) already fans its merged change stream across W in-order PK-hash lanes (ADR-0104 MySQL / ADR-0105 Postgres), the broker's incremental-replay path opened its applier and then never wired the lane count, so every incremental replayed through the single-stream ADR-0092 pipelined applier — RTT-bound on a cross-region link, exactly the wedge `--apply-concurrency` was built to lift, but on the broker-replay path instead of the live one. The broker now plumbs the lane count onto the applier via the same shared helper the streamer uses, so an incremental's changes fan across W concurrent lanes. The new `--apply-concurrency` flag on `sync from-backup run` follows the ADR-0106 fast-by-default contract: `0`/unset → an adaptive default of 4 (a fixed conservative ceiling — the broker does not run a connection-budget probe; per-lane backpressure handles a tight target), `1` → the explicit serial opt-out, `W>1` → honored verbatim. Exactly-once is preserved exactly as on the live path: every change in an incremental carries the same broker chain-position token, so the lanes persist the identical resume position the serial path did, and the broker's idempotent re-replay-from-parent crash recovery is unchanged. Pinned by unit tests on the resolver (zero-value-safe fast default; explicit `1` stays serial) and the plumb (the shared helper engages the applier's lane setter for `W>1`, no-op for serial).
+
 ## [0.99.122] - 2026-06-24
 
 ### Fixed

@@ -508,6 +508,8 @@ type SyncFromBackupCmd struct {
 	ApplyBatchSize int   `help:"Batch up to N CDC changes per target transaction during incremental replay. Idempotent applier semantics (ADR-0010) keep replay-on-crash safe." default:"100" placeholder:"N"`
 	MaxBufferBytes int64 `help:"Soft cap on per-batch buffered memory in the CDC applier. Default 67108864 (64 MiB). See ADR-0028." default:"67108864" placeholder:"N"`
 
+	ApplyConcurrency int `help:"Key-hash concurrent-apply LANE count W for incremental REPLAY (ADR-0104/0105, the same machinery 'sync start --apply-concurrency' uses). Each incremental's merged change stream is fanned across W in-order PK-hash lanes committing concurrently, each with its own AIMD controller. Without this a large incremental replayed into a high-latency / cross-region target applies through a single serial pipelined stream and is RTT-bound (the broker-replay analog of the 'sync start' cross-region wedge). Exactly-once is preserved: every change in an incremental carries the same broker chain position, so the lanes persist the identical resume position the serial path does. ADR-0106 FAST BY DEFAULT: 0 (default, unset) = auto:4 (a fixed conservative ceiling — the broker does not run a connection-budget probe; per-lane AIMD backs off if the target is tight); 1 = explicit SERIAL opt-out (byte-identical to the pre-fix behaviour); W>1 honored verbatim." default:"0" placeholder:"W"`
+
 	ResetTargetData bool `help:"Cold-start recovery: drop target tables, run a chain restore (full + every incremental up to current), then transition to live polling. Mirrors 'migrate --reset-target-data'. Mutually exclusive with --at-chain-id."`
 
 	AtChainID string `help:"Operator-asserted resumption: the broker treats the target as currently being at chain ID <ID>; writes a fresh sluice_cdc_state row and transitions to live polling from there. Use after a manual 'sluice restore --from=<chain-url>'. Mutually exclusive with --reset-target-data." placeholder:"BACKUP-ID"`
@@ -570,18 +572,19 @@ func (s *SyncFromBackupCmd) Run(_ *Globals) error {
 	}
 
 	broker := &pipeline.SyncFromBackup{
-		Target:          target,
-		TargetDSN:       s.Target,
-		Store:           store,
-		ChainURL:        storeDesc,
-		StreamID:        s.StreamID,
-		PollInterval:    s.PollInterval,
-		ApplyBatchSize:  s.ApplyBatchSize,
-		MaxBufferBytes:  s.MaxBufferBytes,
-		ResetTargetData: s.ResetTargetData,
-		AtChainID:       s.AtChainID,
-		SluiceVersion:   version,
-		Envelope:        envelope,
+		Target:           target,
+		TargetDSN:        s.Target,
+		Store:            store,
+		ChainURL:         storeDesc,
+		StreamID:         s.StreamID,
+		PollInterval:     s.PollInterval,
+		ApplyBatchSize:   s.ApplyBatchSize,
+		MaxBufferBytes:   s.MaxBufferBytes,
+		ApplyConcurrency: s.ApplyConcurrency,
+		ResetTargetData:  s.ResetTargetData,
+		AtChainID:        s.AtChainID,
+		SluiceVersion:    version,
+		Envelope:         envelope,
 	}
 	return broker.Run(ctx)
 }
