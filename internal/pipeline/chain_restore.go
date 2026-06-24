@@ -89,6 +89,22 @@ type ChainRestore struct {
 	// (1) would make even modest chains painfully slow.
 	ApplyBatchSize int
 
+	// ApplyConcurrency is the key-hash concurrent-apply LANE count for
+	// the chain's incremental replay (ADR-0104/0105). Without it the
+	// chain-restore incremental apply runs through the single-stream
+	// ADR-0092 pipelined applier — RTT-bound on a high-latency /
+	// cross-region target, so a chain carrying a large incremental
+	// stalls exactly as the broker's polling path did before its
+	// concurrent-apply fix (live Track-C finding, 2026-06-24: a
+	// cold-start absorbed the full backup then wedged at ~1 change/s
+	// applying an 8M-change incremental into cross-region PlanetScale-PG).
+	// This is the chain-restore analog of that fix: the full-restore COPY
+	// is already parallel (ADR-0112); this closes the incremental-apply
+	// leg. Resolved through [resolveReplayApplyConcurrency] (ADR-0106:
+	// 0 = auto:N fast default, 1 = serial opt-out, N > 1 honored), so the
+	// zero value gets the fast default (no zero-value-safe-default trap).
+	ApplyConcurrency int
+
 	// Envelope, when non-nil, is the [crypto.EnvelopeEncryption] used
 	// to unwrap CEKs from encrypted manifests. Required for encrypted
 	// chains. See [Restore.Envelope].
@@ -211,6 +227,7 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	defer closeIf(applier)
 	applyMaxBufferBytes(applier, r.MaxBufferBytes)
 	applyTargetSchema(applier, r.TargetSchema)
+	applyApplyConcurrency(applier, resolveReplayApplyConcurrency(r.ApplyConcurrency))
 	if err := applier.EnsureControlTable(ctx); err != nil {
 		return wrapWithHint(PhaseSchemaApply, fmt.Errorf("chain restore: ensure control table: %w", err))
 	}

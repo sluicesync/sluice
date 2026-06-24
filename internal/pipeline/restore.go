@@ -94,6 +94,19 @@ type Restore struct {
 	// prober (MySQL) pass through unclamped.
 	ChunkParallelism int
 
+	// ApplyConcurrency is the key-hash concurrent-apply LANE count used
+	// ONLY when this restore targets a multi-incremental chain and so
+	// dispatches to [ChainRestore] (the incremental-replay leg). It has no
+	// effect on a single-full restore, whose row load is the bulk-copy
+	// COPY governed by TableParallelism × ChunkParallelism (ADR-0112).
+	// Threaded into the dispatched ChainRestore so a chain carrying a
+	// large incremental doesn't replay through the single-stream applier
+	// and stall on a high-latency / cross-region target (the chain-restore
+	// analog of the broker's concurrent-replay fix). Resolved through
+	// [resolveReplayApplyConcurrency] (ADR-0106: 0 = auto:N, 1 = serial,
+	// N > 1 honored) inside ChainRestore.
+	ApplyConcurrency int
+
 	// TargetTelemetry, when non-nil, is an advisory control-plane health
 	// provider (ADR-0107) the restore consults at parallelism-resolve time
 	// to clamp the AUTO bulk×table fan-out by the target's LIVE CPU/memory
@@ -302,6 +315,7 @@ func (r *Restore) Run(ctx context.Context) error {
 				MaxBufferBytes:   r.MaxBufferBytes,
 				TableParallelism: r.TableParallelism,
 				ChunkParallelism: r.ChunkParallelism,
+				ApplyConcurrency: r.ApplyConcurrency,
 				Envelope:         r.Envelope,
 				TargetSchema:     r.TargetSchema,
 			}

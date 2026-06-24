@@ -25,8 +25,8 @@ func TestResolveBrokerApplyConcurrency(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := resolveBrokerApplyConcurrency(c.in); got != c.want {
-				t.Errorf("resolveBrokerApplyConcurrency(%d) = %d; want %d", c.in, got, c.want)
+			if got := resolveReplayApplyConcurrency(c.in); got != c.want {
+				t.Errorf("resolveReplayApplyConcurrency(%d) = %d; want %d", c.in, got, c.want)
 			}
 		})
 	}
@@ -41,14 +41,14 @@ func TestResolveBrokerApplyConcurrency(t *testing.T) {
 func TestBrokerApplyConcurrency_PlumbEngages(t *testing.T) {
 	// Unset broker field (0) → fast default → setter engaged with W = default.
 	rec := &recordingConcurrencySetter{}
-	applyApplyConcurrency(rec, resolveBrokerApplyConcurrency(0))
+	applyApplyConcurrency(rec, resolveReplayApplyConcurrency(0))
 	if rec.calls != 1 || rec.lanes != defaultApplyConcurrency {
 		t.Errorf("unset: setter calls=%d lanes=%d; want calls=1 lanes=%d", rec.calls, rec.lanes, defaultApplyConcurrency)
 	}
 
 	// Explicit serial opt-out (1) → no-op, applier stays on the serial path.
 	recSerial := &recordingConcurrencySetter{}
-	applyApplyConcurrency(recSerial, resolveBrokerApplyConcurrency(1))
+	applyApplyConcurrency(recSerial, resolveReplayApplyConcurrency(1))
 	if recSerial.calls != 0 {
 		t.Errorf("serial opt-out engaged the setter %d times; want 0", recSerial.calls)
 	}

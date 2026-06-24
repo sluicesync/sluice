@@ -1180,6 +1180,8 @@ type RestoreCmd struct {
 
 	BulkParallelism int `help:"Number of a single table's chunks applied CONCURRENTLY (within-table axis), composed with --table-parallelism; bounded by the target connection budget. Each chunk-group worker writes through its own dedicated connection; snapshot chunks are a disjoint partition of the table's rows, so parallel apply cannot collide on a PK on a cold target. Engages only for tables with >= 2 chunks; the two axes multiply (table × bulk) and their product never exceeds the measured budget. Applies to chain restores too (each segment full's bulk-apply). 0 (default) = auto: min(8, NumCPU); 1 = serial (single-stream per table). See ADR-0112." default:"0" placeholder:"N"`
 
+	ApplyConcurrency int `help:"Key-hash concurrent-apply LANE count for the INCREMENTAL-replay leg of a chain restore (ADR-0104/0105). Only matters when restoring a chain that carries incrementals: the full-restore row load is the bulk COPY governed by --table-parallelism × --bulk-parallelism, while the incremental change-replay would otherwise run through a single serial stream — RTT-bound on a high-latency / cross-region target, so a chain with a large incremental stalls (the chain-restore analog of the from-backup broker's concurrent-replay path). Fans each incremental's changes across W in-order PK-hash lanes; exactly-once is preserved (every change carries the segment's chain position, so lanes persist the identical resume position the serial path did). ADR-0106 fast-by-default: 0 (default, unset) = auto:4 (no connection-budget probe; per-lane backpressure handles a tight target); 1 = explicit serial opt-out; W>1 honored. No effect on a single-full restore." default:"0" placeholder:"W"`
+
 	TargetSchema string `help:"Per-source target schema namespace (Postgres-only). When set, restored tables land in the named schema rather than the DSN's default. Mirrors 'sluice migrate --target-schema' / 'sync start --target-schema' (ADR-0031). PG-only: flat-namespace engines (MySQL) refuse at validate time — operators use a different --target DSN database instead. The schema is auto-created on the target if it doesn't exist. v0.56.0+ closure of the v0.55.0 cycle's UX-gap finding." placeholder:"NAME"`
 
 	// PlanetScale target-health telemetry (ADR-0107) — OPTIONAL. When set, the
@@ -1284,6 +1286,7 @@ func (r *RestoreCmd) Run(g *Globals) error {
 		MaxBufferBytes:   r.MaxBufferBytes,
 		TableParallelism: r.TableParallelism,
 		ChunkParallelism: r.BulkParallelism,
+		ApplyConcurrency: r.ApplyConcurrency,
 		Envelope:         envelope,
 		TargetSchema:     r.TargetSchema,
 		// telemetryProviderOrNil returns a TRUE nil interface when off, so the

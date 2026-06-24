@@ -160,7 +160,7 @@ type SyncFromBackup struct {
 	// broker position token, so the lanes persist the identical position the
 	// serial path does, and the broker's idempotent re-replay-from-parent
 	// recovery is unchanged. Follows the ADR-0106 contract: `0 = auto:N`
-	// (the fast default — see [resolveBrokerApplyConcurrency]), `1 = serial
+	// (the fast default — see [resolveReplayApplyConcurrency]), `1 = serial
 	// opt-out`, `N > 1 = honored`. The zero value gets the fast default (no
 	// zero-value-safe-default trap, the v0.99.51 lesson).
 	ApplyConcurrency int
@@ -260,9 +260,13 @@ func encodeBrokerPosition(chainURL, backupID string) ir.Position {
 	}
 }
 
-// resolveBrokerApplyConcurrency maps [SyncFromBackup.ApplyConcurrency] to the
-// effective key-hash lane count for incremental replay, applying the same
-// ADR-0106 raw-int contract the streamer uses ([resolveApplyConcurrency]):
+// resolveReplayApplyConcurrency maps an operator-supplied lane count to the
+// effective key-hash lane count for INCREMENTAL REPLAY, applying the same
+// ADR-0106 raw-int contract the streamer uses ([resolveApplyConcurrency]).
+// Shared by the from-backup broker's polling replay ([SyncFromBackup.
+// ApplyConcurrency]) and the chain-restore incremental replay
+// ([ChainRestore.ApplyConcurrency]) — both replay manifest change-chunks
+// through an up-front applier, so both want the same mapping:
 //
 //	n  < 0 → 1                    (defensive against bad input)
 //	n == 1 → 1                    (explicit serial opt-out)
@@ -270,14 +274,14 @@ func encodeBrokerPosition(chainURL, backupID string) ir.Position {
 //	n == 0 → defaultApplyConcurrency (unset → the fast adaptive default)
 //
 // Unlike the streamer's resolver this does NOT run a connection-budget probe:
-// the broker opens a single applier up front and the concurrent path's per-lane
+// these paths open a single applier up front and the concurrent path's per-lane
 // AIMD ([change_applier_concurrent.go]) backs each lane off independently if the
 // target is tight, so the fixed conservative default (4) is safe here without
 // the extra probe round-trip. The zero value resolving to the fast default —
-// rather than the Go-zero-meaning-serial trap (v0.99.51) — is why every broker
+// rather than the Go-zero-meaning-serial trap (v0.99.51) — is why every
 // construction path (CLI, tests, future callers) gets concurrent replay unless
 // it explicitly opts out with 1.
-func resolveBrokerApplyConcurrency(n int) int {
+func resolveReplayApplyConcurrency(n int) int {
 	switch {
 	case n < 0:
 		return 1
@@ -375,7 +379,7 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 	}
 	defer closeIf(applier)
 	applyMaxBufferBytes(applier, b.MaxBufferBytes)
-	applyApplyConcurrency(applier, resolveBrokerApplyConcurrency(b.ApplyConcurrency))
+	applyApplyConcurrency(applier, resolveReplayApplyConcurrency(b.ApplyConcurrency))
 	if err := applier.EnsureControlTable(ctx); err != nil {
 		return wrapWithHint(PhaseSchemaApply, fmt.Errorf("broker: ensure control table: %w", err))
 	}
@@ -685,12 +689,13 @@ func (b *SyncFromBackup) coldStartReset(ctx context.Context, applier ir.ChangeAp
 	}
 
 	rest := &ChainRestore{
-		Target:         b.Target,
-		TargetDSN:      b.TargetDSN,
-		Store:          b.Store,
-		MaxBufferBytes: b.MaxBufferBytes,
-		ApplyBatchSize: b.ApplyBatchSize,
-		Envelope:       b.Envelope,
+		Target:           b.Target,
+		TargetDSN:        b.TargetDSN,
+		Store:            b.Store,
+		MaxBufferBytes:   b.MaxBufferBytes,
+		ApplyBatchSize:   b.ApplyBatchSize,
+		ApplyConcurrency: b.ApplyConcurrency,
+		Envelope:         b.Envelope,
 	}
 	if err := rest.Run(ctx); err != nil {
 		return "", fmt.Errorf("broker: chain restore failed: %w", err)
