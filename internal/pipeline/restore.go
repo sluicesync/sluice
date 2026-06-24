@@ -947,7 +947,7 @@ func (r *Restore) streamChunkRows(
 	chunk *irbackup.ChunkInfo,
 	rowCh chan<- ir.Row,
 ) (int64, error) {
-	src, err := r.Store.Get(ctx, chunk.File)
+	src, err := fetchChunkVerified(ctx, r.Store, chunk.File, chunk.SHA256)
 	if err != nil {
 		return 0, fmt.Errorf("open chunk: %w", err)
 	}
@@ -1286,19 +1286,15 @@ func probeChunkDecrypt(env crypto.EnvelopeEncryption, chunk *irbackup.ChunkInfo)
 }
 
 // verifyChunk fetches a chunk and recomputes its SHA-256, returning
-// nil on match or a wrapped [ErrChunkHashMismatch] on mismatch.
+// nil on match or a wrapped [ErrChunkHashMismatch] on mismatch. It routes
+// through [fetchChunkVerified] so a transient short read is retried rather
+// than reported as a false mismatch (the same robustness the restore
+// chunk-read path gained); a genuine at-rest corruption persists across
+// the retries and still surfaces loudly.
 func verifyChunk(ctx context.Context, store irbackup.Store, chunk *irbackup.ChunkInfo) error {
-	src, err := store.Get(ctx, chunk.File)
+	rc, err := fetchChunkVerified(ctx, store, chunk.File, chunk.SHA256)
 	if err != nil {
-		return fmt.Errorf("open: %w", err)
+		return err
 	}
-	defer func() { _ = src.Close() }()
-	got, err := hashChunkBytes(ctx, src)
-	if err != nil {
-		return fmt.Errorf("hash: %w", err)
-	}
-	if got != chunk.SHA256 {
-		return fmt.Errorf("%w: expected %s, got %s", ErrChunkHashMismatch, chunk.SHA256, got)
-	}
-	return nil
+	return rc.Close()
 }

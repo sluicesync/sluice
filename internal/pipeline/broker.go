@@ -1116,7 +1116,7 @@ func (b *SyncFromBackup) streamOneChunkWithPosition(
 	pos ir.Position,
 	out chan<- ir.Change,
 ) error {
-	src, err := segStore.Get(ctx, chunk.File)
+	src, err := fetchChunkVerified(ctx, segStore, chunk.File, chunk.SHA256)
 	if err != nil {
 		return fmt.Errorf("open chunk: %w", err)
 	}

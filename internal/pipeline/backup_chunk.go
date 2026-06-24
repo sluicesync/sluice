@@ -59,12 +59,14 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"log/slog"
 	"math"
 	"strconv"
 	"time"
 
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
+	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // chunkHeaderVersion is the chunk-file format version embedded in
@@ -519,6 +521,100 @@ func (r *chunkReader) Close() error {
 		return fmt.Errorf("%w: expected %s, got %s", ErrChunkHashMismatch, r.expected, got)
 	}
 	return nil
+}
+
+// chunkFetchMaxAttempts is the bounded number of times
+// [fetchChunkVerified] re-fetches a content chunk whose object-store read
+// came back transiently short / failed. Four attempts (1 + 3 retries) with
+// the backoff below covers the flaky-S3-body case the live Track-C restore
+// hit; a genuinely corrupt-at-rest chunk still surfaces loudly after the
+// attempts are exhausted (re-fetching identical bad bytes can't fix it).
+const chunkFetchMaxAttempts = 4
+
+// chunkFetchBackoff is the inter-attempt delay for [fetchChunkVerified]:
+// 200ms, 400ms, 800ms. Short because a truncated read is a transport blip,
+// not a reparent — the next GET almost always returns the full object.
+func chunkFetchBackoff(attempt int) time.Duration {
+	return time.Duration(200*(1<<(attempt-1))) * time.Millisecond
+}
+
+// fetchChunkVerified reads the entire content chunk at `file` into memory,
+// retrying on a transient object-store read failure, and returns a
+// bytes-backed reader the caller hands to [newChunkReader] /
+// [newChangeChunkReader] unchanged.
+//
+// Why this exists: a streaming chunk read straight into the restore's COPY
+// emits rows as it decodes, so a truncated / short object-store GET (a
+// flaky S3 body) surfaces deep in the decode path as a row-decode error
+// ("unexpected end of JSON input") AFTER some rows have already been
+// applied — it cannot be safely re-streamed (that would duplicate the
+// emitted rows), so the prior code had no retry and ONE transport blip
+// aborted an entire multi-hour restore. Caught live on Track-C: a 3220-chunk
+// PlanetScale-Postgres cold-start died ~6 tables in on a single truncated
+// chunk that `backup verify` then confirmed intact at rest. This is the
+// chunk-read analog of ADR-0114's DDL-phase reparent retry.
+//
+// Completeness is checked by SHA-256 against the manifest. expectedSHA256
+// is the hash of the RAW object bytes — gzip plaintext for an unencrypted
+// chunk, ciphertext for an encrypted one (the chunk writer hashes
+// post-codec / post-encrypt) — so a short read mismatches and triggers a
+// re-fetch, BEFORE any row is emitted. Because the whole object is in hand
+// and verified before decoding starts, the retry is safe (no partial
+// emit) and idempotent (chunks are content-addressed). The downstream
+// reader re-verifies the SHA on Close (a cheap in-memory double-check).
+// A persistent mismatch — genuine at-rest corruption — surfaces loudly as
+// [ErrChunkHashMismatch] once the attempts are exhausted.
+func fetchChunkVerified(ctx context.Context, store irbackup.Store, file, expectedSHA256 string) (io.ReadCloser, error) {
+	var lastErr error
+	for attempt := 1; attempt <= chunkFetchMaxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		buf, sum, err := readChunkBytesAndHash(ctx, store, file)
+		switch {
+		case err != nil:
+			lastErr = err
+		case sum != expectedSHA256:
+			lastErr = fmt.Errorf("%w: expected %s, got %s (chunk %s, attempt %d/%d)",
+				ErrChunkHashMismatch, expectedSHA256, sum, file, attempt, chunkFetchMaxAttempts)
+		default:
+			if attempt > 1 {
+				slog.DebugContext(ctx, "restore: chunk fetch recovered after transient short read",
+					slog.String("chunk", file), slog.Int("attempt", attempt))
+			}
+			return io.NopCloser(bytes.NewReader(buf)), nil
+		}
+		if attempt < chunkFetchMaxAttempts {
+			slog.WarnContext(ctx, "restore: chunk fetch failed; retrying",
+				slog.String("chunk", file), slog.Int("attempt", attempt),
+				slog.Int("max_attempts", chunkFetchMaxAttempts), slog.String("err", lastErr.Error()))
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(chunkFetchBackoff(attempt)):
+			}
+		}
+	}
+	return nil, fmt.Errorf("fetch chunk %s after %d attempts: %w", file, chunkFetchMaxAttempts, lastErr)
+}
+
+// readChunkBytesAndHash GETs file from store, reads the whole body into a
+// buffer, and returns the bytes plus their SHA-256 hex digest. The
+// TeeReader hashes during the single read pass so a short body is detected
+// by [fetchChunkVerified]'s digest comparison rather than slipping into the
+// decoder. Closes the store handle before returning.
+func readChunkBytesAndHash(ctx context.Context, store irbackup.Store, file string) (data []byte, sha string, err error) {
+	src, err := store.Get(ctx, file)
+	if err != nil {
+		return nil, "", fmt.Errorf("open: %w", err)
+	}
+	defer func() { _ = src.Close() }()
+	h := sha256.New()
+	buf, err := io.ReadAll(io.TeeReader(src, h))
+	if err != nil {
+		return nil, "", fmt.Errorf("read: %w", err)
+	}
+	return buf, fmt.Sprintf("%x", h.Sum(nil)), nil
 }
 
 // hashChunkBytes streams r through a SHA-256 hasher and returns the

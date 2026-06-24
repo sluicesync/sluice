@@ -723,7 +723,7 @@ func (r *ChainRestore) streamOneChangeChunk(
 	chunk *irbackup.ChunkInfo,
 	out chan<- ir.Change,
 ) error {
-	src, err := segStore.Get(ctx, chunk.File)
+	src, err := fetchChunkVerified(ctx, segStore, chunk.File, chunk.SHA256)
 	if err != nil {
 		return fmt.Errorf("open chunk: %w", err)
 	}
