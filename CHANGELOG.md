@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.121] - 2026-06-24
+
+### Added
+
+- **MySQL targets now get a connection-budget bound on copy parallelism like Postgres already did, plus a no-credential PlanetScale tier-aware CPU cap (ADR-0116, roadmap item 41).** sluice bounds its automatic bulk-copy parallelism (cross-table × within-table) to the target's real capacity, but until now that bound only applied to Postgres (which exposes a connection-budget prober); MySQL/PlanetScale targets had no prober, so the automatic product passed through unbounded. This release implements the prober for the MySQL engine: it reads the target's connection accounting (`@@max_connections`, `Threads_connected`, the per-account/global user-connection limit) and caps the copy pool to the real free-slot budget, mirroring the Postgres path (including the loud refusal when not even one slot is free, and the advisory degrade-and-proceed when a managed target forbids the accounting queries). On top of that — and this is the part that matters most for PlanetScale — it adds a **credential-free CPU/tier proxy**: on PlanetScale connections are abundant (vtgate fronts a large pool) but CPU is the scarce resource on small tiers, and `@@innodb_buffer_pool_size` scales monotonically by plan tier and isn't masked by vtgate (live-measured PS-10 0.125 GB → PS-160 9.80 GB). sluice buckets that size into a conservative parallelism cap (`<256 MB → 2`, `<2 GB → 4`, `<8 GB → 6`, `≥8 GB → 8`) and folds it into the budget as a lower bound, so a small PlanetScale instance (or a tiny self-hosted box) isn't fanned out wider than its CPU can serve — without needing the metrics-token telemetry. This complements the metrics-aware clamp from v0.99.119/ADR-0115: the telemetry clamp is the robust always-correct path when configured; this buffer-pool heuristic is the credential-free fallback (and the genuine connection bound for self-hosted MySQL). Fully advisory and safe: it only ever lowers the automatic parallelism, never raises it; an unreadable buffer-pool size is a no-op; a probe failure logs a warning and proceeds with the prior unbounded behaviour. The bucket boundaries are pinned by a change-detector test, and the prober is covered by unit tests (the budget math, the managed-permission-denied degrade) plus container-backed integration tests.
+
 ## [0.99.120] - 2026-06-24
 
 ### Fixed
