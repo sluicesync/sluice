@@ -113,7 +113,7 @@ const unlimited = -1
 // It is a pure function (no I/O) so the whole matrix — unlimited role
 // limit, tight global, role-capped, tier-capped, refuse-when-<1 — is
 // table-unit-testable.
-func computeConnectionBudget(p connectionBudgetProbe, reserve int) connectionBudget {
+func computeConnectionBudget(p connectionBudgetProbe, reserve int, applyTierCap bool) connectionBudget {
 	globalAvailable := p.maxConnections - p.inUse
 
 	available := globalAvailable
@@ -123,12 +123,25 @@ func computeConnectionBudget(p connectionBudgetProbe, reserve int) connectionBud
 
 	copyBudget := available - reserve
 
-	// ADR-0116 Part B: fold the buffer-pool tier cap. bufferPoolParallelismCap
-	// returns 0 when the buffer pool size could not be read, in which case
-	// the cap is a no-op (it never lowers the connection-derived budget).
-	tierCap := bufferPoolParallelismCap(p.bufferPoolBytes)
-	if tierCap > 0 && tierCap < copyBudget {
-		copyBudget = tierCap
+	// ADR-0116 Part B: fold the buffer-pool tier cap — but ONLY on the
+	// PlanetScale flavor (applyTierCap). The buckets are calibrated to
+	// PlanetScale's FIXED plan tiers (the live-measured PS-10→PS-160
+	// @@innodb_buffer_pool_size sizes), where the buffer pool genuinely proxies
+	// the instance's CPU tier. A vanilla MySQL — or a SELF-HOSTED Vitess
+	// (FlavorVitess) — sizes its buffer pool to the operator's own hardware, so
+	// @@innodb_buffer_pool_size is NOT a tier/CPU signal there and the cap
+	// would wrongly throttle parallelism (a 128 MB default vanilla MySQL →
+	// cap 2, collapsing parallel backup/restore). The v0.99.121 first cut
+	// applied the cap to EVERY MySQL flavor; this gate (v0.99.122) restores
+	// non-PlanetScale parallelism. The connection budget (Part A, above) still
+	// applies to all flavors — it is a real slot bound, not a tier heuristic.
+	// tierCap stays 0 (its "not applied" sentinel) on the non-PlanetScale path.
+	tierCap := 0
+	if applyTierCap {
+		tierCap = bufferPoolParallelismCap(p.bufferPoolBytes)
+		if tierCap > 0 && tierCap < copyBudget {
+			copyBudget = tierCap
+		}
 	}
 
 	return connectionBudget{
@@ -290,7 +303,13 @@ func (e Engine) ProbeTargetConnectionBudget(ctx context.Context, dsn string, req
 		}, nil
 	}
 
-	budget := computeConnectionBudget(probe, connBudgetReserve)
+	// The buffer-pool tier cap (Part B) is a PlanetScale-tier CPU proxy; it is
+	// applied ONLY for the hosted PlanetScale flavor. Vanilla MySQL and
+	// self-hosted Vitess size their buffer pool to their own hardware, so the
+	// cap's PlanetScale-calibrated buckets don't apply to them (they get the
+	// real connection budget, Part A, only). Gated on == FlavorPlanetScale
+	// specifically, NOT usesVStream(), so self-hosted Vitess is excluded.
+	budget := computeConnectionBudget(probe, connBudgetReserve, e.Flavor == FlavorPlanetScale)
 
 	// Fold the operator's explicit --max-target-connections ceiling into
 	// the copy budget: it's an upper bound the auto-cap further reduces,

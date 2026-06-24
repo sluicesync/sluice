@@ -119,7 +119,10 @@ func TestComputeConnectionBudget(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := computeConnectionBudget(tc.probe, reserve)
+			// This matrix is the PlanetScale path (applyTierCap=true) — it
+			// exercises the buffer-pool tier cap. The non-PlanetScale path is
+			// pinned separately in TestComputeConnectionBudget_TierCapPlanetScaleOnly.
+			got := computeConnectionBudget(tc.probe, reserve, true)
 			if got.Available != tc.wantAvailable {
 				t.Errorf("Available = %d, want %d", got.Available, tc.wantAvailable)
 			}
@@ -127,6 +130,43 @@ func TestComputeConnectionBudget(t *testing.T) {
 				t.Errorf("CopyBudget = %d, want %d", got.CopyBudget, tc.wantCopy)
 			}
 		})
+	}
+}
+
+// TestComputeConnectionBudget_TierCapPlanetScaleOnly pins the v0.99.122
+// regression fix: the buffer-pool tier cap (Part B) applies ONLY on the
+// PlanetScale flavor. v0.99.121's first cut folded it on every MySQL flavor,
+// so a vanilla MySQL (or self-hosted Vitess) with the common 128 MB default
+// innodb_buffer_pool_size was throttled to parallelism 2 — collapsing parallel
+// backup/restore (caught by the -race integration shard, not unit tests). With
+// applyTierCap=false the connection-derived budget stands unchanged and the
+// recorded tierCap is its 0 "not applied" sentinel.
+func TestComputeConnectionBudget_TierCapPlanetScaleOnly(t *testing.T) {
+	const reserve = 4
+	// A roomy connection budget + a PS-10-sized buffer pool (128 MiB) whose
+	// tier cap WOULD be 2 if applied. This is the exact vanilla-MySQL shape
+	// that regressed: max_connections 151 (MySQL default), a few in use.
+	probe := connectionBudgetProbe{
+		maxConnections:  151,
+		inUse:           6,
+		roleLimit:       unlimited,
+		bufferPoolBytes: 134217728, // 128 MiB ⇒ tier cap 2 if applied
+	}
+
+	// PlanetScale flavor: the tier cap binds (the CPU-proxy is the point).
+	ps := computeConnectionBudget(probe, reserve, true)
+	if ps.CopyBudget != 2 || ps.tierCap != 2 {
+		t.Errorf("PlanetScale: CopyBudget=%d tierCap=%d; want 2/2 (tier cap binds)", ps.CopyBudget, ps.tierCap)
+	}
+
+	// Vanilla MySQL / self-hosted Vitess: the cap is NOT applied — the full
+	// connection budget stands (151-6-4 = 141), tierCap recorded as 0.
+	nonPS := computeConnectionBudget(probe, reserve, false)
+	if nonPS.CopyBudget != 141 {
+		t.Errorf("non-PlanetScale: CopyBudget=%d; want 141 (no tier cap — parallelism preserved)", nonPS.CopyBudget)
+	}
+	if nonPS.tierCap != 0 {
+		t.Errorf("non-PlanetScale: tierCap=%d; want 0 (not applied)", nonPS.tierCap)
 	}
 }
 

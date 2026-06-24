@@ -67,7 +67,9 @@ func TestProbeConnectionBudget_SaneNumbers(t *testing.T) {
 		t.Errorf("tier cap from buffer pool %d = %d, want > 0 (cap must be applied on a real server)", p.bufferPoolBytes, cap)
 	}
 
-	budget := computeConnectionBudget(p, connBudgetReserve)
+	// applyTierCap=true to exercise the cap-applied (PlanetScale) branch on a
+	// real server with a readable buffer pool; CopyBudget >= 1 holds either way.
+	budget := computeConnectionBudget(p, connBudgetReserve, true)
 	if budget.CopyBudget < 1 {
 		t.Errorf("a fresh shared container should have copy budget >= 1; got %d", budget.CopyBudget)
 	}
@@ -84,8 +86,9 @@ func TestProbeTargetConnectionBudget_CeilingCaps(t *testing.T) {
 	defer cancel()
 
 	// Request 8, ceiling 2 → effective must be 2 (ceiling-bounded), Capped.
-	// (The default container's buffer-pool tier cap is also >= 2, so the
-	// ceiling is the binding constraint here.)
+	// Engine{} is FlavorVanilla, so the buffer-pool tier cap is NOT applied
+	// (v0.99.122 — it is PlanetScale-only); the connection budget is roomy, so
+	// the operator ceiling of 2 is the binding constraint here.
 	report, err := Engine{}.ProbeTargetConnectionBudget(ctx, dsn, 8, 2)
 	if err != nil {
 		t.Fatalf("ProbeTargetConnectionBudget: %v", err)
