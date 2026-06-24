@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.120] - 2026-06-24
+
+### Fixed
+
+- **A storage-grow reparent landing on the Postgres-migrate *overlapped* index build (where per-table indexes are built interleaved with the still-running copy) now rides the reparent instead of aborting the migration — closing the one residual left by v0.99.118's ADR-0114 fix.** v0.99.118 wrapped the post-copy DDL phases (`CreateIndexes` / constraints / views / identity sync) in an engine-general reparent-retry, but that wrap sits at the pipeline orchestrator level and so couldn't reach the Postgres `migrate` *overlap* optimization (ADR-0077), which builds each table's indexes inside the engine as that table's copy completes, concurrently with the other tables still copying. A reparent that hit one of those interleaved `CREATE INDEX` statements still cancelled the whole copy+index errgroup. This release wraps the overlap path's per-table build in an in-engine bounded reparent-retry that reuses the exact same retry envelope and error classifier as the cold-copy chunk retry: on a classified storage-grow/reparent transient it closes the dead pinned connection, backs off, re-acquires a fresh connection against the reparented primary, re-tunes it, and replays the build — `CREATE INDEX IF NOT EXISTS` is idempotent, so a replay after an interrupted build is clean. A real DDL fault still fails loudly on the first attempt with no retry; a genuinely-wedged target surfaces a loud terminal error after the wall-clock bound (never silent, never infinite). Only the Postgres-`migrate` overlap path was exposed (restore uses the now-wrapped whole-schema index phase, and MySQL has no overlap builder); the retry policy is pinned by unit tests (rides-transient-then-succeeds, terminal-fault-no-retry, reacquire-transient-ridden, loud-on-exhaustion, ctx-cancel-unwinds).
+
 ## [0.99.119] - 2026-06-24
 
 ### Added
