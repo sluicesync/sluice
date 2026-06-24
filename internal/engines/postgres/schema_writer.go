@@ -640,10 +640,40 @@ func (w *SchemaWriter) buildOneIndex(ctx context.Context, conn *sql.Conn, job in
 	// first " INDEX " token is the keyword to follow. sluice owns these
 	// tables, so a same-named index is the one it built.
 	stmt = strings.Replace(stmt, "INDEX ", "INDEX IF NOT EXISTS ", 1)
-	if _, err := conn.ExecContext(ctx, stmt); err != nil {
-		return fmt.Errorf("postgres: create index %q on %q: %w", job.idx.Name, job.tableName, err)
-	}
-	return nil
+	// Bug #114 (found live by the v0.99.118 fresh-DB re-validation):
+	// `CREATE INDEX IF NOT EXISTS` is NOT atomic against an overlapping
+	// same-name creation — its pg_class existence pre-check and the catalog
+	// insert race. Under the ADR-0114 whole-phase reparent-retry over the
+	// CONCURRENT index pool, a PlanetScale reparent makes a retry's CREATE
+	// overlap the prior attempt's just-committed (replicated-to-the-new-
+	// primary) build → unique_violation on `pg_class_relname_nsp_index`
+	// (23505). That 23505 is correctly classified NON-transient (a user-table
+	// dup-key must stay loud), so the reparent-retry layers don't catch it and
+	// it aborted the restore with all data already correctly copied. Wrap the
+	// exec in the SAME narrow catalog-race retry the CDC apply path uses
+	// (retryOnCatalogRace → isCatalogRaceError): it retries ONLY the
+	// pg_class/pg_type constraint-name 23505 shape (3× 50/100/200ms), keeping
+	// every user-table 23505 loud per ADR-0038. This is the INNER layer (the
+	// race resolves in ms); a transient 57P0x still propagates to the outer
+	// reparent-retry. buildOneIndex is the single chokepoint for all three
+	// index-build entry points (serial dedicated-conn / concurrent CreateIndexes
+	// pool / overlap BuildTableIndexesFromChannel), so one wrap covers them all.
+	return retryOnCatalogRace(ctx, func() error {
+		if err := indexStmtExec(ctx, conn, stmt); err != nil {
+			return fmt.Errorf("postgres: create index %q on %q: %w", job.idx.Name, job.tableName, err)
+		}
+		return nil
+	})
+}
+
+// indexStmtExec executes a built CREATE INDEX statement on conn. It is a
+// package var ONLY so the Bug #114 catalog-race-retry pin can inject a
+// failing-then-succeeding exec without a live connection (a regression that
+// unwraps buildOneIndex's retryOnCatalogRace must fail a test). Production
+// always uses the real ExecContext.
+var indexStmtExec = func(ctx context.Context, conn *sql.Conn, stmt string) error {
+	_, err := conn.ExecContext(ctx, stmt)
+	return err
 }
 
 // tuneIndexBuildConn raises maintenance_work_mem + max_parallel_maintenance_workers

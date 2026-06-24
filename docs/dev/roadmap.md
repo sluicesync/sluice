@@ -609,6 +609,14 @@ So NOTIFY-kick is **demoted** — the poll isn't the bottleneck. Closing the rea
 
 **Gotchas.** (1) The build runs concurrently with the copy pool, so the retry must not wedge the `completedTables` channel drain. (2) Only the index BUILD is retriable; a real DDL fault stays terminal (loud). (3) Demand-gated — only the PG-migrate (not restore, not MySQL) overlap path is exposed, and only on a target that reparents mid-index-build.
 
+### 43. LATENT cross-engine SILENT-LOSS: two source tables sharing a long/colliding index name collapse to one on the PG target (the `pgIndexName` verbatim escape hatch) — *demand-gated; value-fidelity*
+
+**Why (flagged by the Bug #114 RCA, 2026-06-24 — NOT triggered by that schema, but a real silent-loss class).** PG index names are schema-GLOBAL (unique in `pg_class` per namespace); MySQL index names are per-TABLE. sluice's `pgIndexName` (`internal/engines/postgres/ddl_emit.go:~800`) disambiguates by prefixing the table name (`idx_x` on `inventory` → `inventory_idx_x`), which is why Bug #114 was NOT an index-name collision. **But** `pgIndexName` intentionally returns the source name **verbatim** when prefixing would overflow PG's 63-char identifier limit, and on convention-prefix matches. So if two source tables genuinely share a >63-char index name (or a colliding convention shape), they emit the SAME PG relation name → the serial index path's `CREATE INDEX IF NOT EXISTS` **silently skips the second table's index** (a missing-index silent-correctness loss — wrong-but-plausible, exit 0). The concurrent pool would instead loudly `23505` (now ridden by the #114 catalog-race retry — which would mask it further on the serial path). The escape hatch is documented in-code as a deliberate trade.
+
+**What.** When two distinct source indexes would emit the same PG name, REFUSE LOUDLY (naming both source `table.index` + the collision) rather than silently coalescing — or hash-suffix to a guaranteed-unique ≤63-char name. Value-fidelity lens: a missing index is silent. Pin the class: long-name overflow + convention-prefix collision across ≥2 tables, asserting a loud refusal (or distinct emitted names), not a silent skip.
+
+**Gotchas.** (1) Must compare EMITTED PG names, not source names. (2) The 63-char truncation is the trigger — test at the boundary. (3) Demand-gated (requires two tables sharing a long/colliding index name); LOW likelihood but a genuine silent-loss class, so worth a loud-refusal pin.
+
 ---
 
 ### Open bugs awaiting fix windows

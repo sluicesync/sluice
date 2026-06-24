@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.122] - 2026-06-24
+
+### Fixed
+
+- **HIGH — a PostgreSQL index build during a storage-grow reparent could abort the restore/migration with a spurious `pg_class` duplicate-key error (`23505`) even though all data had copied correctly; now ridden out in-place (Bug #114).** Found live by the v0.99.118 fresh-database re-validation: a parallel cross-engine MySQL→PlanetScale-Postgres restore correctly rode 16 storage-grow reparents through the post-copy DDL phase (the v0.99.118/ADR-0114 fix working), then aborted at `create index … on inventory: duplicate key value violates unique constraint "pg_class_relname_nsp_index" (23505)` — with every row already landed byte-perfect against the manifest (loud, never silent). Root cause (confirmed by three-phase investigation, with the more-serious cross-engine index-name-collision hypothesis conclusively ruled out for the path): `CREATE INDEX IF NOT EXISTS` is not atomic against an overlapping same-name creation — its `pg_class` existence pre-check and the catalog insert race. Under ADR-0114's whole-phase retry over the concurrent index pool, a reparent makes a retry's `CREATE INDEX` overlap the prior attempt's just-committed (replicated-to-the-new-primary) build, and the resulting `pg_class` unique-violation is — correctly — classified non-transient (a user-table duplicate key must always stay loud), so the reparent-retry layers didn't catch it and it aborted the run. The fix wraps the single index-build chokepoint (`buildOneIndex`, through which the serial, concurrent-pool, and overlap index-build paths all route) in the **same** narrow catalog-race retry the CDC schema-apply path already uses: it retries only the `pg_class` / `pg_type` constraint-name `23505` shape (three short backoffs, the race resolves in milliseconds) and keeps every user-table `23505` loud. It is the inner layer — a genuine connection/reparent transient still propagates to the outer reparent-retry. Pinned by unit tests that fail if the wrap is removed (catalog-race retries to success; a user-table or non-`23505` error surfaces on the first attempt with no retry). No value-fidelity surface; data was never at risk.
+
 ## [0.99.121] - 2026-06-24
 
 ### Added
