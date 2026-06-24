@@ -4,6 +4,8 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.125] - 2026-06-24
+
 ### Fixed
 
 - **HIGH — restoring a backup chain that carries a large incremental (standalone `restore --from <chain>`, or a `sync from-backup --reset-target-data` cold-start) could stall: the chain-restore incremental-replay leg ran single-stream serial, not the concurrent key-hash lanes (ADR-0104/0105).** Found live by the Track-C program: a cross-region MySQL→PlanetScale-Postgres cold-start restored the ~43 GB full backup fine (parallel COPY, ADR-0112) then wedged at ~1 change/s applying an 8 M-change incremental — RTT-bound `idle in transaction`, the exact stall the broker's *polling* path had before its concurrent-replay fix, but on the chain-restore leg, which has its own applier that was never wired with the lane count. `ChainRestore` now resolves an `ApplyConcurrency` lane count through the same shared helper the broker and streamer use, so each incremental's changes fan across W in-order PK-hash lanes. Threaded from the broker cold-start (inherits the broker's `--apply-concurrency`) and from a new `restore --apply-concurrency W` flag on the standalone path; ADR-0106 fast-by-default (0/unset → auto:4, 1 → serial opt-out, W>1 honored). Exactly-once is preserved verbatim — every change carries the segment's chain position, so the lanes persist the identical resume position the serial path did, and the full-restore COPY axis (`--table-parallelism` × `--bulk-parallelism`) is unchanged and orthogonal (this closes only the incremental-apply leg). The chain-restore + broker integration suites exercise the now-default concurrent apply under `-race` and assert convergence.
