@@ -1,5 +1,7 @@
 # sluice v0.99.121
 
+> ⚠️ **Known issue (fixed in v0.99.122):** the PlanetScale buffer-pool tier cap added here was wrongly applied to **every** MySQL flavor, so a vanilla MySQL or self-hosted Vitess with the common 128 MB default `innodb_buffer_pool_size` had its automatic `migrate` / `backup` / `restore` parallelism throttled to ~serial. Output was always correct — just slower. **Upgrade to v0.99.122**, which gates the tier cap to the PlanetScale flavor only. PlanetScale targets are unaffected.
+
 **MySQL targets now get the same connection-budget bound on automatic copy parallelism that Postgres already had — plus a no-credential, PlanetScale-tier-aware CPU cap (ADR-0116, roadmap item 41).**
 
 ## Added
