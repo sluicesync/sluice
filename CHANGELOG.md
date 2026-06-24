@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.119] - 2026-06-24
+
+### Added
+
+- **`sluice restore` can now consume PlanetScale target-health telemetry to clamp its automatic parallelism by the target's live CPU/memory headroom — the PlanetScale-correct bound (ADR-0115, roadmap item 40).** Restore fans out on two automatic axes — cross-table (`--table-parallelism`) and within-table chunk (`--bulk-parallelism`) — whose product is bounded at the connection-budget chokepoint. But that bound only applies to engines with a connection-budget prober (Postgres); a MySQL/PlanetScale target has no prober, so the auto product passed through unbounded. And on PlanetScale connections are the wrong thing to bound on anyway — vtgate fronts a large pool (connections are abundant) while CPU is the scarce resource on small tiers (a PS-10 pinned at 100% CPU during the Track-C restore A/B). This release wires the same telemetry the CDC apply path already uses (the `--planetscale-org` / `--planetscale-metrics-token-id` / `--planetscale-metrics-token` / `--planetscale-metrics-db` / `--planetscale-metrics-branch` flags, now accepted by `restore` too) into the restore parallelism resolver: when telemetry reports the target's CPU/memory headroom is tight, the auto `table × chunk` product is reduced (halved when approaching the high-water, quartered when at/over it), with the cross-table axis absorbing the reduction first so each table keeps its within-table chunk fan-out. The threshold logic is now shared one-for-one with the apply-path clamp, so the two can never disagree on what "tight" means. Fully advisory and opt-in: with no telemetry configured (the default), restore behaves exactly as before. It never raises the resolved parallelism, never reduces an axis below 1, and never clamps an axis the operator pinned explicitly (only the automatic `0` axes) — an explicit `--table-parallelism` / `--bulk-parallelism` is always respected. The connection-budget split still bounds prober-equipped engines; this adds the CPU-aware bound that PlanetScale-class targets actually need.
+
 ## [0.99.118] - 2026-06-23
 
 ### Fixed

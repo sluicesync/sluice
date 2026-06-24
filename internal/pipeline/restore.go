@@ -94,6 +94,20 @@ type Restore struct {
 	// prober (MySQL) pass through unclamped.
 	ChunkParallelism int
 
+	// TargetTelemetry, when non-nil, is an advisory control-plane health
+	// provider (ADR-0107) the restore consults at parallelism-resolve time
+	// to clamp the AUTO bulk×table fan-out by the target's LIVE CPU/memory
+	// headroom (ADR-0115 / item 40). This is the PlanetScale-correct bound:
+	// connections are abundant there (vtgate fronts a large pool) but CPU is
+	// the scarce resource on small tiers, and the connection-budget split
+	// only clamps engines with a budget prober (Postgres) — so a MySQL/
+	// PlanetScale auto fan-out otherwise passes through unbounded onto a hot
+	// instance. Advisory and degrades exactly like every other telemetry
+	// consumer: nil (the default, e.g. the cold-copy grow-gate's signal-only
+	// path) ⇒ no clamp, the pre-ADR-0115 behaviour. It never RAISES the
+	// resolved parallelism and never clamps an explicitly-pinned axis.
+	TargetTelemetry ir.TargetTelemetry
+
 	// SkipChainDispatch, when true, suppresses the chain-detection
 	// branch in [Restore.Run]. Used internally by [ChainRestore] so
 	// that re-entering Restore for the full-application step doesn't

@@ -159,31 +159,14 @@ func (s *Streamer) budgetBoundedAutoConcurrency(ctx context.Context) int {
 // explicit operator --apply-concurrency never reaches here (only the unset
 // auto:N path does), and a healthy target keeps the full budget-bounded count.
 func (s *Streamer) clampConcurrencyByHeadroom(ctx context.Context, base int) int {
-	if base <= 1 || s.TargetTelemetry == nil {
+	if base <= 1 {
 		return base
 	}
-	snap, ok := s.TargetTelemetry.Sample(ctx)
-	if !ok {
-		return base
+	divisor, util, ok := headroomDivisor(ctx, s.TargetTelemetry)
+	if !ok || divisor <= 1 {
+		return base // no telemetry verdict, or healthy headroom: keep the base.
 	}
-	util, known := maxKnownUtil(snap)
-	if !known {
-		return base
-	}
-
-	hw := appliercontrol.DefaultTelemetryHighWater
-	var lanes int
-	switch {
-	case util >= hw:
-		// Already saturated — start minimal; per-lane AIMD grows it back if
-		// headroom opens up. quarter, floored at 1.
-		lanes = base / 4
-	case util >= concurrencyHeadroomApproaching:
-		// Approaching the mark — halve, floored at 1.
-		lanes = base / 2
-	default:
-		return base // healthy headroom: keep the full budget-bounded base.
-	}
+	lanes := base / divisor
 	if lanes < 1 {
 		lanes = 1
 	}
@@ -193,9 +176,50 @@ func (s *Streamer) clampConcurrencyByHeadroom(ctx context.Context, base int) int
 		slog.Int("base_lanes", base),
 		slog.Int("lanes", lanes),
 		slog.Float64("busiest_util", util),
-		slog.Float64("high_water", hw),
+		slog.Float64("high_water", appliercontrol.DefaultTelemetryHighWater),
 	)
 	return lanes
+}
+
+// headroomDivisor returns the factor by which an AUTO concurrency / parallelism
+// value should be reduced given the target's LIVE resource headroom: 1 =
+// healthy (no reduction), 2 = approaching the high-water, 4 = at/over it. ok is
+// false (divisor 1) when telemetry is absent / stale / neither CPU nor mem
+// observed — the caller leaves its value unchanged (today's behaviour).
+// busiestUtil is the deciding utilisation, returned for the caller's log.
+//
+// This is the SINGLE source of the headroom thresholds, shared by the CDC
+// apply lane clamp ([clampConcurrencyByHeadroom], ADR-0107 Phase 3) and the
+// restore parallelism clamp ([Restore.clampRestoreParallelismByHeadroom],
+// ADR-0115) so the two paths can never disagree on what "tight" means. It is
+// the engine-neutral telemetry-consumer contract: a partial snapshot still
+// drives the verdict on whichever of CPU/mem is present (maxKnownUtil), and an
+// unobserved metric never counts as 0.
+func headroomDivisor(ctx context.Context, tel ir.TargetTelemetry) (divisor int, busiestUtil float64, ok bool) {
+	if tel == nil {
+		return 1, 0, false
+	}
+	snap, sok := tel.Sample(ctx)
+	if !sok {
+		return 1, 0, false
+	}
+	util, known := maxKnownUtil(snap)
+	if !known {
+		return 1, 0, false
+	}
+	switch {
+	case util >= appliercontrol.DefaultTelemetryHighWater:
+		// Already saturated — quarter the auto fan-out; the reactive
+		// controllers (per-lane AIMD / chunk retry) grow it back if headroom
+		// opens up.
+		return 4, util, true
+	case util >= concurrencyHeadroomApproaching:
+		// Approaching the mark — halve.
+		return 2, util, true
+	default:
+		// Healthy headroom: no reduction.
+		return 1, util, true
+	}
 }
 
 // maxKnownUtil returns the busiest of the snapshot's observed CPU / memory

@@ -262,6 +262,13 @@ func (r *Restore) resolveRestoreParallelism(ctx context.Context, taskCount int) 
 	tableParallelism = r.dispatchRestoreTableAxis(ctx, tableP, requestedTable, taskCount, budgetReport.CopyBudget)
 	chunkParallelism = r.dispatchRestoreChunkAxis(ctx, chunkP, requestedChunk)
 
+	// ADR-0115 / item 40: clamp the AUTO product by the target's LIVE CPU/mem
+	// headroom — the PlanetScale-correct bound the connection-budget split
+	// can't provide on a no-prober engine (MySQL/PlanetScale). No-op when no
+	// telemetry is wired, when headroom is healthy, or for an explicitly-
+	// pinned axis. Never raises.
+	tableParallelism, chunkParallelism = r.clampRestoreParallelismByHeadroom(ctx, tableParallelism, chunkParallelism)
+
 	slog.InfoContext(
 		ctx, "restore: bulk-apply parallelism resolved",
 		slog.Int("table_parallelism", tableParallelism),
@@ -270,6 +277,81 @@ func (r *Restore) resolveRestoreParallelism(ctx context.Context, taskCount int) 
 		slog.Int("copy_budget", budgetReport.CopyBudget),
 	)
 	return tableParallelism, chunkParallelism, nil
+}
+
+// clampRestoreParallelismByHeadroom reduces the AUTO-resolved restore fan-out
+// product (table × chunk) when the target's LIVE resource headroom is tight
+// (ADR-0115), the restore analog of [Streamer.clampConcurrencyByHeadroom]. It
+// shares the SAME [headroomDivisor] thresholds as the CDC apply clamp, so the
+// two paths agree on what "tight" means.
+//
+// PlanetScale-correct: the connection-budget split ([resolveCopyParallelismBudget])
+// only bounds engines with a budget prober (Postgres); a MySQL/PlanetScale auto
+// fan-out otherwise passes through unbounded — and on PlanetScale connections
+// are abundant while CPU is the scarce resource on small tiers, so a CPU/mem
+// headroom clamp is the right bound there.
+//
+// It only clamps an AUTO axis (the operator left --table-parallelism /
+// --bulk-parallelism at 0); an explicitly-pinned axis is respected and never
+// reduced. It never RAISES either axis, never drops below 1, and degrades to a
+// no-op (returns its inputs unchanged) when no telemetry is wired, the snapshot
+// is stale, or headroom is healthy. The reduction is applied to the auto axes
+// to bring the product down ~divisor-fold, reducing the cross-table axis first
+// (keeping each table's within-table chunk fan-out intact) and falling through
+// to the within-table axis only if the cross-table axis can't absorb it alone.
+func (r *Restore) clampRestoreParallelismByHeadroom(ctx context.Context, tableP, chunkP int) (clampedTable, clampedChunk int) {
+	if tableP*chunkP <= 1 {
+		return tableP, chunkP // nothing to clamp
+	}
+	divisor, util, ok := headroomDivisor(ctx, r.TargetTelemetry)
+	if !ok || divisor <= 1 {
+		return tableP, chunkP // no telemetry verdict, or healthy headroom.
+	}
+	tableAuto := r.TableParallelism == 0
+	chunkAuto := r.ChunkParallelism == 0
+	if !tableAuto && !chunkAuto {
+		return tableP, chunkP // both pinned — respect operator intent.
+	}
+
+	target := (tableP * chunkP) / divisor
+	if target < 1 {
+		target = 1
+	}
+	newTable, newChunk := tableP, chunkP
+	switch {
+	case tableAuto && chunkAuto:
+		// Reduce the cross-table axis first, keeping each table's within-table
+		// chunk fan-out; the chunk axis only shrinks if table=1 still overshoots.
+		if newChunk > target {
+			newChunk = target
+		}
+		newTable = target / newChunk
+	case tableAuto:
+		// Chunk pinned — reduce only the cross-table axis to fit the target.
+		newTable = target / chunkP
+	case chunkAuto:
+		// Table pinned — reduce only the within-table axis to fit the target.
+		newChunk = target / tableP
+	}
+	if newTable < 1 {
+		newTable = 1
+	}
+	if newChunk < 1 {
+		newChunk = 1
+	}
+	if newTable == tableP && newChunk == chunkP {
+		return tableP, chunkP // clamp didn't actually reduce (e.g. already minimal)
+	}
+	slog.InfoContext(
+		ctx, "restore: reducing bulk-apply parallelism — target resource headroom is tight (ADR-0115; advisory, CPU-bound clamp for PlanetScale-class targets)",
+		slog.Int("table_parallelism_before", tableP),
+		slog.Int("chunk_parallelism_before", chunkP),
+		slog.Int("table_parallelism", newTable),
+		slog.Int("chunk_parallelism", newChunk),
+		slog.Float64("busiest_util", util),
+		slog.Int("divisor", divisor),
+	)
+	return newTable, newChunk
 }
 
 // dispatchRestoreTableAxis collapses the cross-table axis to serial with

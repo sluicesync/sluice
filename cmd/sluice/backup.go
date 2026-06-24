@@ -1182,6 +1182,19 @@ type RestoreCmd struct {
 
 	TargetSchema string `help:"Per-source target schema namespace (Postgres-only). When set, restored tables land in the named schema rather than the DSN's default. Mirrors 'sluice migrate --target-schema' / 'sync start --target-schema' (ADR-0031). PG-only: flat-namespace engines (MySQL) refuse at validate time — operators use a different --target DSN database instead. The schema is auto-created on the target if it doesn't exist. v0.56.0+ closure of the v0.55.0 cycle's UX-gap finding." placeholder:"NAME"`
 
+	// PlanetScale target-health telemetry (ADR-0107) — OPTIONAL. When set, the
+	// restore clamps the AUTO --table-parallelism × --bulk-parallelism product
+	// by the target's LIVE CPU/memory headroom (ADR-0115 / item 40) — the
+	// PlanetScale-correct bound, since connections are abundant there but CPU
+	// is the scarce resource on small tiers and the connection-budget split
+	// only bounds prober-equipped engines (Postgres). Same opt-in /
+	// all-or-nothing semantics as 'sync start'; off (no clamp) when unset.
+	PlanetScaleOrg            string `name:"planetscale-org" help:"PlanetScale org slug; enables OPTIONAL target-health telemetry (CPU/mem/storage) used to clamp the AUTO restore parallelism product by live headroom (ADR-0107/0115). Opt-in; requires --planetscale-metrics-token-id and --planetscale-metrics-token. Control-plane only — distinct from the data-plane --target DSN. Off when unset." placeholder:"ORG"`
+	PlanetScaleMetricsTokenID string `name:"planetscale-metrics-token-id" help:"PlanetScale service-token ID (granted read_metrics_endpoints) for --planetscale-org telemetry. Prefer the env var so the id never lands in shell history." env:"PLANETSCALE_METRICS_TOKEN_ID" placeholder:"ID"`
+	PlanetScaleMetricsToken   string `name:"planetscale-metrics-token" help:"PlanetScale service-token secret for --planetscale-org telemetry. Set via the env var (never on the command line); masked in all logging." env:"PLANETSCALE_METRICS_TOKEN" placeholder:"SECRET"`
+	PlanetScaleMetricsBranch  string `name:"planetscale-metrics-branch" help:"Target branch to filter telemetry series to (defaults to 'main'). Only consulted when --planetscale-org is set." placeholder:"BRANCH"`
+	PlanetScaleMetricsDB      string `name:"planetscale-metrics-db" help:"Target database name to filter PlanetScale telemetry SD to. Defaults to the --target DSN's database. Only consulted when --planetscale-org is set." placeholder:"DATABASE"`
+
 	EncryptionFlags
 }
 
@@ -1243,6 +1256,26 @@ func (r *RestoreCmd) Run(g *Globals) error {
 		return err
 	}
 
+	// OPTIONAL PlanetScale telemetry (ADR-0107) — used here only to clamp the
+	// AUTO parallelism product by live headroom (ADR-0115). (nil, nil) when
+	// off; an org without a complete token pair is a loud refusal. Closed at
+	// return so its background poller stops.
+	telemetryProvider, err := buildTargetTelemetryProvider(ctx, telemetryParams{
+		org:       r.PlanetScaleOrg,
+		tokenID:   r.PlanetScaleMetricsTokenID,
+		token:     r.PlanetScaleMetricsToken,
+		metricsDB: r.PlanetScaleMetricsDB,
+		branch:    r.PlanetScaleMetricsBranch,
+		targetDSN: r.Target,
+		engine:    r.TargetDriver,
+	})
+	if err != nil {
+		return err
+	}
+	if telemetryProvider != nil {
+		defer func() { _ = telemetryProvider.Close() }()
+	}
+
 	restore := &pipeline.Restore{
 		Target:           target,
 		TargetDSN:        r.Target,
@@ -1253,6 +1286,9 @@ func (r *RestoreCmd) Run(g *Globals) error {
 		ChunkParallelism: r.BulkParallelism,
 		Envelope:         envelope,
 		TargetSchema:     r.TargetSchema,
+		// telemetryProviderOrNil returns a TRUE nil interface when off, so the
+		// restore's `TargetTelemetry != nil` guard stays exact (no typed-nil trap).
+		TargetTelemetry: telemetryProviderOrNil(telemetryProvider),
 	}
 	return restore.Run(ctx)
 }
