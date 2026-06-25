@@ -28,6 +28,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sync"
+	"sync/atomic"
+
+	"golang.org/x/sync/errgroup"
 
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
@@ -69,6 +73,53 @@ type Restore struct {
 	// MySQL). The resolved value is bounded by the target's measured
 	// connection budget and clamped to the table count.
 	TableParallelism int
+
+	// ChunkParallelism caps how many of a SINGLE table's chunks
+	// bulk-apply CONCURRENTLY during that table's restore — the
+	// within-table axis (ADR-0112), the restore-side analog of
+	// migrate's BulkParallelism (ADR-0019). 0 = auto (min(8, NumCPU));
+	// 1 = serial (the pre-ADR-0112 single-stream behaviour). When the
+	// resolved value P > 1 AND a table has >= 2 chunks, restoreTable
+	// fans that table's chunk list across P workers, each writing
+	// through its OWN dedicated row-writer connection (via the
+	// openTargetRowWriter factory) and streaming its disjoint subset of
+	// chunks through one WriteRows call. Snapshot chunks are a disjoint
+	// partition of the table's rows, so parallel INSERT cannot collide
+	// on a PK on a cold target (ADR-0112 §Correctness). The two axes
+	// MULTIPLY (table × chunk) and are bounded at the SAME connection-
+	// budget chokepoint migrate uses (resolveTargetCopyParallelism +
+	// resolveCopyParallelismBudget, ADR-0076): within-table is satisfied
+	// first, the table axis takes the remainder, the product never
+	// exceeds the target's measured CopyBudget. Targets without a budget
+	// prober (MySQL) pass through unclamped.
+	ChunkParallelism int
+
+	// ApplyConcurrency is the key-hash concurrent-apply LANE count used
+	// ONLY when this restore targets a multi-incremental chain and so
+	// dispatches to [ChainRestore] (the incremental-replay leg). It has no
+	// effect on a single-full restore, whose row load is the bulk-copy
+	// COPY governed by TableParallelism × ChunkParallelism (ADR-0112).
+	// Threaded into the dispatched ChainRestore so a chain carrying a
+	// large incremental doesn't replay through the single-stream applier
+	// and stall on a high-latency / cross-region target (the chain-restore
+	// analog of the broker's concurrent-replay fix). Resolved through
+	// [resolveReplayApplyConcurrency] (ADR-0106: 0 = auto:N, 1 = serial,
+	// N > 1 honored) inside ChainRestore.
+	ApplyConcurrency int
+
+	// TargetTelemetry, when non-nil, is an advisory control-plane health
+	// provider (ADR-0107) the restore consults at parallelism-resolve time
+	// to clamp the AUTO bulk×table fan-out by the target's LIVE CPU/memory
+	// headroom (ADR-0115 / item 40). This is the PlanetScale-correct bound:
+	// connections are abundant there (vtgate fronts a large pool) but CPU is
+	// the scarce resource on small tiers, and the connection-budget split
+	// only clamps engines with a budget prober (Postgres) — so a MySQL/
+	// PlanetScale auto fan-out otherwise passes through unbounded onto a hot
+	// instance. Advisory and degrades exactly like every other telemetry
+	// consumer: nil (the default, e.g. the cold-copy grow-gate's signal-only
+	// path) ⇒ no clamp, the pre-ADR-0115 behaviour. It never RAISES the
+	// resolved parallelism and never clamps an explicitly-pinned axis.
+	TargetTelemetry ir.TargetTelemetry
 
 	// SkipChainDispatch, when true, suppresses the chain-detection
 	// branch in [Restore.Run]. Used internally by [ChainRestore] so
@@ -125,6 +176,77 @@ type Restore struct {
 	// with SkipChainDispatch). Recorded, never sniffed (ADR-0046 §5).
 	// Set by Run / by ChainRestore.applyFull.
 	segCodec Codec
+
+	// growGate is the run's shared coordinated cold-copy grow-window pause
+	// (ADR-0110), constructed unconditionally in Run and applied to EVERY
+	// restore writer via [openTargetRowWriter] (the single construction
+	// path). Without it, a concurrent restore (ADR-0112 table×chunk
+	// fan-out) hammer-retries a storage-growing target independently per
+	// worker and can outrun the target's replication during a grow/
+	// reparent — the silent under-copy found on the live PS-10 A/B (Track
+	// C, 2026-06-23). With the gate, the first classified grow-transient
+	// on any worker quiesces ALL workers together so writes don't outrun
+	// replication across the reparent, matching the migrate cold-copy that
+	// is byte-perfect through grows. Signal-driven (recovered=nil) — the
+	// restore path wires no telemetry provider, so it relies on the
+	// universal signal floor, exactly as the migrate cold-copy does.
+	growGate ir.GrowGate
+
+	// reparentTracker collects the set of tables a writer reported as
+	// reparent-touched (ADR-0113). The grow-gate calms the target but
+	// cannot recover rows a PlanetScale storage-grow reparent dropped
+	// BEFORE the first transient was seen; after the bulk copy the restore
+	// re-derives exactly these tables from their immutable chunks (TRUNCATE
+	// + serial redo, or idempotent re-apply for a chain segment) so each
+	// matches the manifest regardless of what the reparent dropped. nil ⇒
+	// no tracking (direct unit-test callers that bypass Run).
+	reparentTracker *reparentTracker
+}
+
+// reparentTracker is the thread-safe set of reparent-touched tables fed by
+// the writers' [ir.ReparentObserverSetter] callback and drained by the
+// restore reconciliation phase (ADR-0113).
+type reparentTracker struct {
+	mu      sync.Mutex
+	touched map[string]bool
+}
+
+func newReparentTracker() *reparentTracker {
+	return &reparentTracker{touched: map[string]bool{}}
+}
+
+// mark records table as reparent-touched. Safe for concurrent calls from
+// every restore writer.
+func (t *reparentTracker) mark(table string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.touched[table] = true
+}
+
+// drain returns the current touched set and clears it, so a reconciliation
+// round can re-derive those tables while a concurrent redo that itself hits
+// a reparent re-marks for the next round.
+func (t *reparentTracker) drain() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.touched) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(t.touched))
+	for k := range t.touched {
+		out = append(out, k)
+	}
+	t.touched = map[string]bool{}
+	return out
+}
+
+// reparentMark returns the observer callback to wire onto each writer, or
+// nil when no tracker is constructed (so applyReparentObserver no-ops).
+func (r *Restore) reparentMark() func(string) {
+	if r.reparentTracker == nil {
+		return nil
+	}
+	return r.reparentTracker.mark
 }
 
 // lineageNeedsWalk reports whether the store's lineage requires the
@@ -192,6 +314,8 @@ func (r *Restore) Run(ctx context.Context) error {
 				Filter:           r.Filter,
 				MaxBufferBytes:   r.MaxBufferBytes,
 				TableParallelism: r.TableParallelism,
+				ChunkParallelism: r.ChunkParallelism,
+				ApplyConcurrency: r.ApplyConcurrency,
 				Envelope:         r.Envelope,
 				TargetSchema:     r.TargetSchema,
 			}
@@ -296,6 +420,22 @@ func (r *Restore) Run(ctx context.Context) error {
 	applyTargetSchema(sw, r.TargetSchema)
 	defer closeIf(sw)
 
+	// Construct the run's shared coordinated grow-gate (ADR-0110) BEFORE
+	// opening any row writer, so every writer openTargetRowWriter hands out
+	// — the primary here, plus the cross-table-pool and within-table
+	// chunk-worker writers (ADR-0112) — takes its grow-aware flush path.
+	// Signal-driven (recovered=nil), matching the migrate cold-copy: the
+	// first classified grow-transient on any worker quiesces ALL workers so
+	// a concurrent restore can't outrun the target's replication across a
+	// storage-grow reparent (the Track-C live silent-under-copy fix).
+	r.growGate = growGateOrNil(newGrowGate(ctx, nil))
+	// ADR-0113: the reparent tracker collects tables that hit a grow/reparent
+	// transient during apply, so the reconciliation phase below can re-derive
+	// exactly those from their chunks (recovering rows the reparent dropped
+	// that the gate cannot). Constructed before any writer opens so every
+	// writer receives the observer through openTargetRowWriter.
+	r.reparentTracker = newReparentTracker()
+
 	rw, err := r.openTargetRowWriter(ctx)
 	if err != nil {
 		return err
@@ -331,16 +471,32 @@ func (r *Restore) Run(ctx context.Context) error {
 		}
 		tasks = append(tasks, restoreTableTask{table: table, entry: entry})
 	}
-	tableParallelism, err := r.resolveRestoreTableParallelism(ctx, len(tasks))
+	tableParallelism, chunkParallelism, err := r.resolveRestoreParallelism(ctx, len(tasks))
 	if err != nil {
 		return err
 	}
+	// A dedicated-writer factory is needed when EITHER axis fans out:
+	// the cross-table pool opens one per concurrent peer table, and a
+	// within-table chunk fan-out opens one per chunk-group worker
+	// (ADR-0112). Both come through openTargetRowWriter — the single
+	// construction path — so buffer cap + target-schema routing can't
+	// drift across either axis.
 	var factory restoreWriterFactory
-	if tableParallelism > 1 {
+	if tableParallelism > 1 || chunkParallelism > 1 {
 		factory = r.openTargetRowWriter
 	}
-	if err := r.runRestoreTablePool(ctx, tasks, rw, factory, tableParallelism); err != nil {
+	if err := r.runRestoreTablePool(ctx, tasks, rw, factory, tableParallelism, chunkParallelism); err != nil {
 		return err
+	}
+
+	// ADR-0113: reconcile any reparent-touched table. The grow-gate calms a
+	// storage-growing target but cannot recover rows its reparent dropped
+	// before the first transient was seen (PlanetScale promotes a new primary
+	// behind the async-acked window). Re-derive each touched table from its
+	// immutable chunks so it exactly matches the manifest. No-op when no
+	// reparent occurred.
+	if err := r.reconcileReparentTouched(ctx, rw, tasks); err != nil {
+		return wrapWithHint(PhaseBulkCopy, err)
 	}
 
 	if r.DataOnly {
@@ -349,22 +505,34 @@ func (r *Restore) Run(ctx context.Context) error {
 		return nil
 	}
 
-	// 7. Phase 3: identity-sequence sync.
-	if err := sw.SyncIdentitySequences(ctx, schema); err != nil {
+	// 7. Phase 3: identity-sequence sync. Each post-copy DDL phase is
+	// wrapped in the ADR-0114 reparent retry so a PlanetScale storage-grow
+	// reparent landing on the DDL phase (the index build is the textbook
+	// case — Track-C live finding) rides out instead of aborting the whole
+	// restore after a byte-perfect data copy. All four phases are idempotent
+	// on re-run (see runDDLPhaseWithReparentRetry's header).
+	if err := runDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
+		return sw.SyncIdentitySequences(ctx, schema)
+	}); err != nil {
 		return wrapWithHint(PhaseSchemaApply, fmt.Errorf("restore: sync identity sequences: %w", err))
 	}
 
 	// 8. Phase 4: indexes.
-	if err := sw.CreateIndexes(ctx, schema); err != nil {
+	if err := runDDLPhaseWithReparentRetry(ctx, "indexes", sw, func(ctx context.Context) error {
+		return sw.CreateIndexes(ctx, schema)
+	}); err != nil {
 		return wrapWithHint(PhaseIndexes, fmt.Errorf("restore: create indexes: %w", err))
 	}
 
 	// 9. Phase 5: constraints.
-	if err := sw.CreateConstraints(ctx, schema); err != nil {
+	if err := runDDLPhaseWithReparentRetry(ctx, "constraints", sw, func(ctx context.Context) error {
+		return sw.CreateConstraints(ctx, schema)
+	}); err != nil {
 		return wrapWithHint(PhaseConstraints, fmt.Errorf("restore: create constraints: %w", err))
 	}
 
-	// 10. Phase 6: views.
+	// 10. Phase 6: views. runViewsPhase wraps its own per-view DDL in the
+	// reparent retry (ADR-0114) atop its dependency-pass retry.
 	if err := runViewsPhase(ctx, schema, sw); err != nil {
 		return wrapWithHint(PhaseViews, err)
 	}
@@ -399,24 +567,146 @@ func (r *Restore) openTargetRowWriter(ctx context.Context) (ir.RowWriter, error)
 	}
 	applyMaxBufferBytes(rw, r.MaxBufferBytes)
 	applyTargetSchema(rw, r.TargetSchema)
+	// Wire the run's shared grow-gate (ADR-0110) onto every writer so the
+	// MySQL writer's flushWithReparentRetry awaits/trips it — coordinating
+	// all concurrent restore workers through a storage-grow reparent instead
+	// of independently hammering (the Track-C silent-under-copy fix). nil
+	// gate (direct unit-test callers that don't go through Run) is a no-op.
+	applyGrowGate(rw, r.growGate)
+	// ADR-0113: wire the run's reparent observer so this writer reports any
+	// table it sees hit a grow/reparent transient — the reconciliation
+	// phase re-derives those tables. nil observer (no tracker / non-restore
+	// callers) is a no-op.
+	applyReparentObserver(rw, r.reparentMark())
 	return rw, nil
 }
 
-// restoreTable bulk-copies every chunk's rows into the target via the
-// row writer, verifying each chunk's SHA-256 along the way. The
-// orchestrator opens one [chunkReader] per chunk; rows from all
-// chunks of a table flow through a single channel into a single
-// [ir.RowWriter.WriteRows] call so the writer's batching / commit
-// logic doesn't reset per chunk.
+// applyReparentObserver wires the run's reparent-touched observer (ADR-0113)
+// onto a freshly-opened writer that opts in via [ir.ReparentObserverSetter].
+// nil observe (no tracker constructed) or an engine that doesn't implement
+// the setter is a no-op — pre-ADR-0113 behaviour, byte-for-byte. Called
+// alongside applyGrowGate, on the single openTargetRowWriter path, so every
+// restore writer reports through the same tracker.
+func applyReparentObserver(target any, observe func(table string)) {
+	if observe == nil {
+		return
+	}
+	if setter, ok := target.(ir.ReparentObserverSetter); ok {
+		setter.SetReparentObserver(observe)
+	}
+}
+
+// reconcileMaxRounds bounds the ADR-0113 reconciliation loop: a target that
+// reparents on EVERY serial redo is wedged (not a transient grow), so after
+// this many rounds the restore surfaces loudly rather than looping forever.
+// In practice one round suffices — by reconciliation time the volume has
+// grown to its final size, so a redo writes into an already-grown volume and
+// triggers no fresh reparent.
+const reconcileMaxRounds = 10
+
+// reconcileReparentTouched re-derives every reparent-touched table from its
+// chunks (ADR-0113) so it exactly matches the manifest, recovering rows a
+// storage-grow reparent dropped that the grow-gate could not. Each redo runs
+// through the SAME reparent-retry + observer, so a redo that itself hits a
+// reparent re-marks its table for the next round; the loop ends when a full
+// pass observes no new touches (the sound proxy for "no reparent ⇒ no loss",
+// since a reparent is the only loss vector). No-op when no reparent occurred.
+func (r *Restore) reconcileReparentTouched(ctx context.Context, rw ir.RowWriter, tasks []restoreTableTask) error {
+	if r.reparentTracker == nil {
+		return nil
+	}
+	byName := make(map[string]restoreTableTask, len(tasks))
+	for _, t := range tasks {
+		byName[t.table.Name] = t
+	}
+	for round := 1; ; round++ {
+		touched := r.reparentTracker.drain()
+		if len(touched) == 0 {
+			return nil
+		}
+		if round > reconcileMaxRounds {
+			return fmt.Errorf(
+				"restore: reparent reconciliation did not converge after %d rounds — the target keeps reparenting during the serial redo (still-touched: %v); re-run with --bulk-parallelism 1 or restore into a pre-sized / Metal target",
+				reconcileMaxRounds, touched,
+			)
+		}
+		slog.WarnContext(
+			ctx, "restore: reconciling reparent-touched tables (ADR-0113) — re-deriving each from its chunks to recover any rows the target's storage-grow reparent dropped",
+			slog.Int("round", round),
+			slog.Int("tables", len(touched)),
+			slog.Any("table_names", touched),
+		)
+		for _, name := range touched {
+			task, ok := byName[name]
+			if !ok {
+				// Touched a table outside this run's task set (e.g. filtered
+				// out after the mark) — nothing to re-derive.
+				continue
+			}
+			if err := r.reapplyTableForReconcile(ctx, rw, task.table, task.entry); err != nil {
+				return fmt.Errorf("reconcile table %q: %w", name, err)
+			}
+		}
+	}
+}
+
+// reapplyTableForReconcile re-derives one table from its chunks (ADR-0113).
+// Non-DataOnly cold restore: TRUNCATE then redo SERIALLY (chunkParallelism=1
+// — the pace that never outruns replication) into the now-empty table; no
+// primary-key/UPSERT needed, and indexes/constraints are later phases so the
+// TRUNCATE is clean and cheap. DataOnly (chain rotation segment): skip the
+// truncate (it would wipe a prior segment) and re-apply idempotently — the
+// idempotent writer restoreTable selects converges. The serial redo reuses
+// the supplied primary writer (which carries the reparent observer), so a
+// reparent during the redo re-marks the table for another round.
+func (r *Restore) reapplyTableForReconcile(ctx context.Context, rw ir.RowWriter, table *ir.Table, entry *irbackup.TableManifest) error {
+	if !r.DataOnly {
+		truncator, ok := rw.(ir.TableTruncator)
+		if !ok {
+			return fmt.Errorf(
+				"target engine %q cannot TRUNCATE for reconciliation of %q; re-run with --bulk-parallelism 1",
+				r.Target.Name(), table.Name,
+			)
+		}
+		if err := truncator.TruncateTable(ctx, table); err != nil {
+			return fmt.Errorf("truncate before redo: %w", err)
+		}
+	}
+	return r.restoreTable(ctx, rw, table, entry, 1, nil)
+}
+
+// restoreTable bulk-copies a table's chunks into the target, verifying
+// each chunk's SHA-256 along the way.
 //
-// Per-chunk SHA-256 verification is the load-bearing layer-1 check
-// of the proto-ADR's "100% confidence" story. A mismatch is a hard
-// failure — silent corruption is not acceptable.
+// When the resolved within-table parallelism P > 1 AND the table has
+// >= 2 chunks, the chunk list is partitioned across P workers (ADR-0112,
+// the within-table axis): each worker acquires its OWN row-writer
+// connection (worker 0 reuses the supplied primary; peers open dedicated
+// writers via factory), streams its disjoint, contiguous subset of the
+// table's chunks through ONE channel into ONE WriteRows call (so
+// per-worker batch continuity is preserved — batching does not reset per
+// chunk), and returns its rows-applied count. The orchestrator sums the
+// per-worker counts for the layer-2 row-count check, so the manifest
+// cross-check is exactly as strong as the serial path. Snapshot chunks
+// are a disjoint partition of the table's rows, so parallel INSERT
+// cannot collide on a PK on a cold target.
+//
+// P <= 1, or a single-chunk table, runs the original single-stream path
+// through the SAME worker code (one group covering every chunk) with a
+// loud INFO naming why the within-table fan-out didn't engage when it
+// was requested (ADR-0079: never a silent no-op).
+//
+// Per-chunk SHA-256 verification is the load-bearing layer-1 check of
+// the proto-ADR's "100% confidence" story, unchanged and still
+// per-chunk. A mismatch is a hard failure — silent corruption is not
+// acceptable.
 func (r *Restore) restoreTable(
 	ctx context.Context,
 	rw ir.RowWriter,
 	table *ir.Table,
 	entry *irbackup.TableManifest,
+	chunkParallelism int,
+	factory restoreWriterFactory,
 ) error {
 	if len(entry.Chunks) == 0 {
 		slog.InfoContext(ctx, "restore: empty table; no chunks to apply",
@@ -424,6 +714,79 @@ func (r *Restore) restoreTable(
 		return nil
 	}
 
+	groups := partitionChunks(entry.Chunks, r.resolveTableChunkParallelism(ctx, table, len(entry.Chunks), chunkParallelism))
+
+	// errgroup-derived ctx so the first worker's failure cancels its
+	// siblings' producers (the Bug-40b cancel-on-writer-error shape,
+	// replicated per worker — without it a peer producer blocked on
+	// `rowCh <- row` would hang). The serial path (one group) is the
+	// degenerate case of this same code.
+	wg, wctx := errgroup.WithContext(ctx)
+	var rowsApplied atomic.Int64
+	for groupIdx, group := range groups {
+		groupIdx, group := groupIdx, group
+		wg.Go(func() error {
+			// Worker 0 reuses the supplied primary writer; peers open
+			// their own dedicated connection via factory — the SAME
+			// construction path, so buffer cap + target-schema routing
+			// can't drift across the within-table axis.
+			worker := rw
+			if groupIdx > 0 {
+				if factory == nil {
+					return errRestoreChunkPoolNoFactory
+				}
+				w, err := factory(wctx)
+				if err != nil {
+					return err
+				}
+				defer closeIf(w)
+				worker = w
+			}
+			n, err := r.restoreChunkGroup(wctx, worker, table, group)
+			if err != nil {
+				return err
+			}
+			rowsApplied.Add(n)
+			return nil
+		})
+	}
+	if err := wg.Wait(); err != nil {
+		return err
+	}
+
+	// Layer-2 row-count check: the EXACT sum of ACTUALLY-decoded rows
+	// across workers compared to the manifest's RowCount — byte-for-byte
+	// as strong as the serial path. A mismatch stays a HARD failure (no
+	// silent corruption).
+	if entry.RowCount > 0 && rowsApplied.Load() != entry.RowCount {
+		return fmt.Errorf("layer-2 row-count mismatch on table %q: manifest says %d, streamed %d",
+			table.Name, entry.RowCount, rowsApplied.Load())
+	}
+	slog.InfoContext(
+		ctx, "restore: table complete",
+		slog.String("table", table.Name),
+		slog.Int64("rows", entry.RowCount),
+		slog.Int("chunks", len(entry.Chunks)),
+		slog.Int("chunk_workers", len(groups)),
+	)
+	return nil
+}
+
+// restoreChunkGroup streams one worker's contiguous subset of a table's
+// chunks through ONE channel into ONE WriteRows call, returning the
+// rows applied by this worker (for the orchestrator's layer-2 sum).
+//
+// This is the per-worker body of the ADR-0112 within-table fan-out; the
+// serial path is the degenerate one-group case. Each worker owns its
+// own writer (the caller decides reuse-primary vs dedicated), so the
+// channel + producer goroutine + Bug-40b cancel below are entirely
+// worker-local — no cross-worker channel sharing.
+func (r *Restore) restoreChunkGroup(
+	ctx context.Context,
+	rw ir.RowWriter,
+	table *ir.Table,
+	group []*irbackup.ChunkInfo,
+) (int64, error) {
 	// Bug 40b fix (v0.20.1): wrap the producer goroutine in a derived
 	// context so a writer-side failure can cancel the producer.
 	// Pre-fix: the producer pushed rows into an unbuffered channel
@@ -439,15 +802,29 @@ func (r *Restore) restoreTable(
 	defer streamCancel()
 
 	rowCh := make(chan ir.Row)
-	errCh := make(chan error, 1)
+	// The producer reports either an error OR the count of rows it
+	// actually decoded+streamed for this group (the ACTUAL count, not
+	// the manifest sum — so the orchestrator's layer-2 cross-check is
+	// exactly as strong as the serial path even for chunks whose
+	// manifest RowCount is unrecorded). Buffered-1 so the producer never
+	// blocks reporting.
+	type groupResult struct {
+		rows int64
+		err  error
+	}
+	resCh := make(chan groupResult, 1)
 
 	go func() {
 		defer close(rowCh)
 		var rowsApplied int64
-		for chunkIdx, chunk := range entry.Chunks {
+		for chunkIdx, chunk := range group {
+			// streamChunkRows verifies each chunk's SHA-256 AND
+			// cross-checks the decoded count against the chunk's manifest
+			// RowCount (the per-chunk layer-2 check); a mismatch on either
+			// is a hard failure surfaced here.
 			chunkRows, err := r.streamChunkRows(streamCtx, chunk, rowCh)
 			if err != nil {
-				errCh <- fmt.Errorf("chunk %d (%s): %w", chunkIdx, chunk.File, err)
+				resCh <- groupResult{err: fmt.Errorf("chunk %d (%s): %w", chunkIdx, chunk.File, err)}
 				return
 			}
 			rowsApplied += chunkRows
@@ -458,23 +835,21 @@ func (r *Restore) restoreTable(
 				slog.Int64("rows", chunkRows),
 			)
 		}
-		if entry.RowCount > 0 && rowsApplied != entry.RowCount {
-			errCh <- fmt.Errorf("layer-2 row-count mismatch on table %q: manifest says %d, streamed %d",
-				table.Name, entry.RowCount, rowsApplied)
-			return
-		}
-		errCh <- nil
+		resCh <- groupResult{rows: rowsApplied}
 	}()
 
 	// DataOnly (later rotation-segment full): use the idempotent
 	// upsert writer when the engine exposes it so re-applying the
 	// snapshot over the prior segment's restored rows converges
-	// (ON CONFLICT / ON DUPLICATE KEY UPDATE). Engines without the
-	// surface, or no-PK tables, fall back to plain WriteRows — the
-	// caller's lineage invariant (S_n >= prior end) means the rows are
-	// at-or-ahead, so a plain insert only collides on a PK the upsert
-	// would have updated to the same value; the idempotent path is the
-	// correct one and shipping engines (PG, MySQL) implement it.
+	// (ON CONFLICT / ON DUPLICATE KEY UPDATE). Each worker type-asserts
+	// its OWN writer, so the dispatch decision is independent and
+	// idempotent upsert is order- and concurrency-independent for the
+	// disjoint rows of a snapshot. Engines without the surface, or
+	// no-PK tables, fall back to plain WriteRows — the caller's lineage
+	// invariant (S_n >= prior end) means the rows are at-or-ahead, so a
+	// plain insert only collides on a PK the upsert would have updated
+	// to the same value; the idempotent path is the correct one and
+	// shipping engines (PG, MySQL) implement it.
 	writeFn := rw.WriteRows
 	if r.DataOnly {
 		if iw, ok := rw.(ir.IdempotentRowWriter); ok {
@@ -484,7 +859,7 @@ func (r *Restore) restoreTable(
 	if err := writeFn(ctx, table, rowCh); err != nil {
 		// Bug 40b: cancel the producer's context so a goroutine
 		// blocked on `rowCh <- row` unblocks via the streamChunkRows
-		// `<-ctx.Done()` arm. Without this, `<-errCh` below would
+		// `<-ctx.Done()` arm. Without this, `<-resCh` below would
 		// deadlock — the silent-hang shape from Bug 40.
 		slog.ErrorContext(
 			ctx, "restore: write rows failed; cancelling chunk producer",
@@ -492,19 +867,89 @@ func (r *Restore) restoreTable(
 			slog.String("err", err.Error()),
 		)
 		streamCancel()
-		<-errCh
-		return fmt.Errorf("write rows for table %q: %w", table.Name, err)
+		<-resCh
+		return 0, fmt.Errorf("write rows for table %q: %w", table.Name, err)
 	}
-	if err := <-errCh; err != nil {
-		return err
+	res := <-resCh
+	if res.err != nil {
+		return 0, res.err
+	}
+	return res.rows, nil
+}
+
+// errRestoreChunkPoolNoFactory is the loud precondition guard for the
+// within-table chunk fan-out: a peer worker (groupIdx > 0) needs a
+// dedicated writer, which the orchestrator only configures together with
+// a writer factory. Reaching it with a nil factory is a programming
+// error, surfaced rather than silently deref'd. Mirrors
+// [errRestorePoolNoFactory].
+var errRestoreChunkPoolNoFactory = errors.New("pipeline: restore chunk fan-out: dedicated writer needed but no writer factory configured")
+
+// partitionChunks splits chunks into p contiguous, disjoint groups so
+// each within-table worker streams ONE run of chunks through ONE
+// WriteRows call (preserving per-worker batch continuity). The split is
+// near-even: the first (len%p) groups get one extra chunk. Ordering
+// within a group is the manifest's chunk order, unchanged. p <= 1, or
+// fewer chunks than p, collapses to the appropriate group count (never
+// an empty group). Returns at least one group whenever chunks is
+// non-empty.
+func partitionChunks(chunks []*irbackup.ChunkInfo, p int) [][]*irbackup.ChunkInfo {
+	if p < 1 {
+		p = 1
+	}
+	if p > len(chunks) {
+		p = len(chunks)
+	}
+	if p <= 1 {
+		return [][]*irbackup.ChunkInfo{chunks}
+	}
+	groups := make([][]*irbackup.ChunkInfo, 0, p)
+	base := len(chunks) / p
+	rem := len(chunks) % p
+	start := 0
+	for i := 0; i < p; i++ {
+		size := base
+		if i < rem {
+			size++
+		}
+		groups = append(groups, chunks[start:start+size])
+		start += size
+	}
+	return groups
+}
+
+// resolveTableChunkParallelism decides the effective within-table
+// worker count for ONE table: the already-budget-resolved
+// chunkParallelism, but collapsed to serial (1) when there are fewer
+// than 2 chunks to spread. When the operator requested the fan-out
+// (chunkParallelism > 1) but a table can't use it, that's logged loudly
+// (ADR-0112 / ADR-0079: never a silent no-op) naming the reason —
+// mirroring resolveRestoreTableParallelism's serialReason pattern.
+func (r *Restore) resolveTableChunkParallelism(ctx context.Context, table *ir.Table, chunkCount, chunkParallelism int) int {
+	if chunkParallelism <= 1 {
+		return 1
+	}
+	if chunkCount < 2 {
+		slog.InfoContext(
+			ctx, "restore: within-table chunk parallel apply not engaged; applying chunks serially",
+			slog.String("table", table.Name),
+			slog.String("reason", "table has fewer than 2 chunks"),
+			slog.Int("requested_chunk_parallelism", chunkParallelism),
+			slog.Int("chunks", chunkCount),
+		)
+		return 1
+	}
+	effective := chunkParallelism
+	if effective > chunkCount {
+		effective = chunkCount // never spawn more workers than chunks
 	}
 	slog.InfoContext(
-		ctx, "restore: table complete",
+		ctx, "restore: within-table chunk parallel apply engaged (ADR-0112)",
 		slog.String("table", table.Name),
-		slog.Int64("rows", entry.RowCount),
-		slog.Int("chunks", len(entry.Chunks)),
+		slog.Int("chunk_parallelism", effective),
+		slog.Int("chunks", chunkCount),
 	)
-	return nil
+	return effective
 }
 
 // streamChunkRows opens chunk in the store, decodes every row, sends
@@ -516,7 +961,7 @@ func (r *Restore) streamChunkRows(
 	chunk *irbackup.ChunkInfo,
 	rowCh chan<- ir.Row,
 ) (int64, error) {
-	src, err := r.Store.Get(ctx, chunk.File)
+	src, err := fetchChunkVerified(ctx, r.Store, chunk.File, chunk.SHA256)
 	if err != nil {
 		return 0, fmt.Errorf("open chunk: %w", err)
 	}
@@ -855,19 +1300,15 @@ func probeChunkDecrypt(env crypto.EnvelopeEncryption, chunk *irbackup.ChunkInfo)
 }
 
 // verifyChunk fetches a chunk and recomputes its SHA-256, returning
-// nil on match or a wrapped [ErrChunkHashMismatch] on mismatch.
+// nil on match or a wrapped [ErrChunkHashMismatch] on mismatch. It routes
+// through [fetchChunkVerified] so a transient short read is retried rather
+// than reported as a false mismatch (the same robustness the restore
+// chunk-read path gained); a genuine at-rest corruption persists across
+// the retries and still surfaces loudly.
 func verifyChunk(ctx context.Context, store irbackup.Store, chunk *irbackup.ChunkInfo) error {
-	src, err := store.Get(ctx, chunk.File)
+	rc, err := fetchChunkVerified(ctx, store, chunk.File, chunk.SHA256)
 	if err != nil {
-		return fmt.Errorf("open: %w", err)
+		return err
 	}
-	defer func() { _ = src.Close() }()
-	got, err := hashChunkBytes(ctx, src)
-	if err != nil {
-		return fmt.Errorf("hash: %w", err)
-	}
-	if got != chunk.SHA256 {
-		return fmt.Errorf("%w: expected %s, got %s", ErrChunkHashMismatch, chunk.SHA256, got)
-	}
-	return nil
+	return rc.Close()
 }

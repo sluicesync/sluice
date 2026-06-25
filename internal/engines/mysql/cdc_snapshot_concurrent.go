@@ -65,7 +65,15 @@ import (
 // no VStream). Absent ⇒ defaultCopyTableParallelism (1, serial). A malformed
 // value is a LOUD error (the loud-failure tenet: an operator who set the knob
 // deserves to know it didn't parse), NOT a silent fallback to serial.
+//
+// ADR-0118 finding 4 precedence: an explicit --copy-table-parallelism CLI flag
+// (recorded via SetNativeCopyTableParallelismOverride, value > 0) WINS over the
+// DSN param. The DSN form is still read + validated loudly when no CLI override
+// is set, so existing DSN-only setups are byte-identical.
 func nativeCopyTableParallelismFromDSN(cfg *gomysql.Config) (int, error) {
+	if cli := int(nativeCopyTableParallelismOverride.Load()); cli > 0 {
+		return cli, nil
+	}
 	v := cfg.Params["copy_table_parallelism"]
 	if v == "" {
 		return defaultCopyTableParallelism, nil

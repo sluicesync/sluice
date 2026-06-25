@@ -873,10 +873,16 @@ func runBulkCopyWithOpts(
 		}
 	}
 	if !opts.SkipSchemaApply {
-		if err := sw.SyncIdentitySequences(ctx, schema); err != nil {
+		// ADR-0114: each post-copy DDL phase rides a storage-grow/reparent
+		// instead of aborting the whole migration after a correct data copy.
+		if err := runDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
+			return sw.SyncIdentitySequences(ctx, schema)
+		}); err != nil {
 			return wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: sync identity sequences: %w", err))
 		}
-		if err := sw.CreateIndexes(ctx, schema); err != nil {
+		if err := runDDLPhaseWithReparentRetry(ctx, "indexes", sw, func(ctx context.Context) error {
+			return sw.CreateIndexes(ctx, schema)
+		}); err != nil {
 			return wrapWithHint(PhaseIndexes, fmt.Errorf("pipeline: create indexes: %w", err))
 		}
 	}
@@ -885,7 +891,9 @@ func runBulkCopyWithOpts(
 		// by the loop below short-circuiting them in the same block.
 		return nil
 	}
-	if err := sw.CreateConstraints(ctx, schema); err != nil {
+	if err := runDDLPhaseWithReparentRetry(ctx, "constraints", sw, func(ctx context.Context) error {
+		return sw.CreateConstraints(ctx, schema)
+	}); err != nil {
 		return wrapWithHint(PhaseConstraints, fmt.Errorf("pipeline: create constraints: %w", err))
 	}
 	reportDegradedFKs(ctx, sw)
@@ -939,13 +947,20 @@ func runBulkCopyForAddTable(
 			return wrapWithHint(PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", table.Name, err))
 		}
 	}
-	if err := sw.SyncIdentitySequences(ctx, schema); err != nil {
+	// ADR-0114: post-copy DDL phases ride a storage-grow/reparent.
+	if err := runDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
+		return sw.SyncIdentitySequences(ctx, schema)
+	}); err != nil {
 		return wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: sync identity sequences: %w", err))
 	}
-	if err := sw.CreateIndexes(ctx, schema); err != nil {
+	if err := runDDLPhaseWithReparentRetry(ctx, "indexes", sw, func(ctx context.Context) error {
+		return sw.CreateIndexes(ctx, schema)
+	}); err != nil {
 		return wrapWithHint(PhaseIndexes, fmt.Errorf("pipeline: create indexes: %w", err))
 	}
-	if err := sw.CreateConstraints(ctx, schema); err != nil {
+	if err := runDDLPhaseWithReparentRetry(ctx, "constraints", sw, func(ctx context.Context) error {
+		return sw.CreateConstraints(ctx, schema)
+	}); err != nil {
 		return wrapWithHint(PhaseConstraints, fmt.Errorf("pipeline: create constraints: %w", err))
 	}
 	reportDegradedFKs(ctx, sw)
@@ -1062,7 +1077,9 @@ func runBulkCopyPhases(
 		if err := markPhase(ctx, rc, state, ir.MigrationPhaseIdentitySync); err != nil {
 			_ = err
 		}
-		if err := sw.SyncIdentitySequences(ctx, schema); err != nil {
+		if err := runDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
+			return sw.SyncIdentitySequences(ctx, schema)
+		}); err != nil {
 			err = fmt.Errorf("pipeline: sync identity sequences: %w", err)
 			return wrapWithHint(PhaseSchemaApply, markFailed(ctx, rc, *state, ir.MigrationPhaseIdentitySync, err))
 		}
@@ -1082,7 +1099,9 @@ func runBulkCopyPhases(
 		if err := markPhase(ctx, rc, state, ir.MigrationPhaseIdentitySync); err != nil {
 			_ = err
 		}
-		if err := sw.SyncIdentitySequences(ctx, schema); err != nil {
+		if err := runDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
+			return sw.SyncIdentitySequences(ctx, schema)
+		}); err != nil {
 			err = fmt.Errorf("pipeline: sync identity sequences: %w", err)
 			return wrapWithHint(PhaseSchemaApply, markFailed(ctx, rc, *state, ir.MigrationPhaseIdentitySync, err))
 		}
@@ -1092,7 +1111,9 @@ func runBulkCopyPhases(
 		if err := markPhase(ctx, rc, state, ir.MigrationPhaseIndexes); err != nil {
 			_ = err
 		}
-		if err := sw.CreateIndexes(ctx, schema); err != nil {
+		if err := runDDLPhaseWithReparentRetry(ctx, "indexes", sw, func(ctx context.Context) error {
+			return sw.CreateIndexes(ctx, schema)
+		}); err != nil {
 			err = fmt.Errorf("pipeline: create indexes: %w", err)
 			return wrapWithHint(PhaseIndexes, markFailed(ctx, rc, *state, ir.MigrationPhaseIndexes, err))
 		}
@@ -1103,7 +1124,9 @@ func runBulkCopyPhases(
 	if err := markPhase(ctx, rc, state, ir.MigrationPhaseConstraints); err != nil {
 		_ = err
 	}
-	if err := sw.CreateConstraints(ctx, schema); err != nil {
+	if err := runDDLPhaseWithReparentRetry(ctx, "constraints", sw, func(ctx context.Context) error {
+		return sw.CreateConstraints(ctx, schema)
+	}); err != nil {
 		err = fmt.Errorf("pipeline: create constraints: %w", err)
 		return wrapWithHint(PhaseConstraints, markFailed(ctx, rc, *state, ir.MigrationPhaseConstraints, err))
 	}
@@ -1159,7 +1182,12 @@ func runViewsPhase(ctx context.Context, schema *ir.Schema, sw ir.SchemaWriter) e
 		lastErrs = nil
 		for _, v := range pending {
 			single := &ir.Schema{Views: []*ir.View{v}}
-			if err := sw.CreateViews(ctx, single); err != nil {
+			// ADR-0114: ride a storage-grow/reparent that lands on the view
+			// DDL, atop the dependency-pass retry below. A non-transient
+			// failure (e.g. an unresolved view-on-view dependency) returns
+			// promptly and is handled by the pass-retry exactly as before.
+			cv := func(ctx context.Context) error { return sw.CreateViews(ctx, single) }
+			if err := runDDLPhaseWithReparentRetry(ctx, "views", sw, cv); err != nil {
 				if pass == maxPasses-1 {
 					// Last pass — accumulate the error for the caller.
 					lastErrs = append(lastErrs, fmt.Errorf("view %q: %w", v.Name, err))
@@ -1358,10 +1386,14 @@ func applyMaxBufferBytes(target any, bytes int64) {
 
 // applyGrowGate wires the cold-copy run's shared coordinated-pause gate
 // (ADR-0110) onto a freshly-opened writer that opts into it via
-// [ir.GrowGateSetter]. Engines that don't implement the setter (PG today)
-// retain their per-lane retry behaviour unchanged. A nil gate is a no-op:
-// the writer keeps its zero-value nil gate (pre-ADR-0110 behaviour). Called
-// immediately after each chunk/table writer opens, alongside
+// [ir.GrowGateSetter]. Both engines implement the setter today (MySQL and
+// Postgres), so on a cold-copy run — where the gate is constructed
+// unconditionally (see [newGrowGate] in migrate_phases.go) — the writer
+// receives a non-nil gate and takes its grow-aware path. Any future engine
+// that does NOT implement the setter retains its per-lane behaviour
+// unchanged. A nil gate (non-cold-copy callers / direct unit tests) is a
+// no-op: the writer keeps its zero-value nil gate (pre-ADR-0110 behaviour).
+// Called immediately after each chunk/table writer opens, alongside
 // applyMaxBufferBytes, before any flush.
 func applyGrowGate(target any, gate ir.GrowGate) {
 	if gate == nil {

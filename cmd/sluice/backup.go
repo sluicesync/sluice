@@ -392,7 +392,7 @@ type BackupFullCmd struct {
 
 	ChunkSize int `help:"Maximum rows per chunk file. The writer rolls over to a new file whenever the current chunk hits this row count. Smaller chunks restore faster (per-chunk SHA-256 verification can fail-fast on the smallest possible unit) but inflate the manifest. Default 100000." default:"100000" placeholder:"N"`
 
-	TableParallelism int `help:"Number of tables read CONCURRENTLY during the backup row sweep (the read-side analog of pg_dump -j / migrate --table-parallelism). Postgres pins every parallel reader to ONE shareable exported snapshot; vanilla MySQL opens N readers whose consistent snapshots COINCIDE under a brief FLUSH TABLES WITH READ LOCK window (ADR-0088) — so cross-table consistency matches the serial sweep on both. MySQL falls back to a serial single reader (a loud INFO names the reason) when the source role lacks RELOAD; PlanetScale/Vitess sources keep the VStream-COPY path. The resolved value is bounded by the source's connection budget, reserving one slot for the snapshot's replication conn. 0 (default) = auto: 4. 1 disables cross-table concurrency. See ADR-0084 / ADR-0088." default:"0" placeholder:"N"`
+	TableParallelism int `help:"READ-side (backup): number of tables read CONCURRENTLY during the backup row sweep (the read-side analog of pg_dump -j / migrate --table-parallelism). Postgres pins every parallel reader to ONE shareable exported snapshot; vanilla MySQL opens N readers whose consistent snapshots COINCIDE under a brief FLUSH TABLES WITH READ LOCK window (ADR-0088) — so cross-table consistency matches the serial sweep on both. MySQL falls back to a serial single reader (a loud INFO names the reason) when the source role lacks RELOAD; PlanetScale/Vitess sources keep the VStream-COPY path. The resolved value is bounded by the source's connection budget, reserving one slot for the snapshot's replication conn. 0 (default) = auto: 4. 1 disables cross-table concurrency. See ADR-0084 / ADR-0088." default:"0" placeholder:"N"`
 
 	Compression string `help:"Per-segment chunk compression codec: none | gzip | zstd. Default zstd (klauspost/compress at SpeedDefault — 55-85% faster restore, the DR-critical axis; ~1-5% larger than gzip on representative data). 'none' leaves chunks as human-readable .jsonl on a local-FS target; 'gzip' is the pre-v0.67.0 codec. Recorded in lineage.json and read back from there on restore (never inferred from bytes)." default:"zstd" enum:"none,gzip,zstd" placeholder:"CODEC"`
 
@@ -681,9 +681,15 @@ type BackupStreamCmd struct {
 
 	RolloverHook string `help:"Shell command to invoke after each rollover commits successfully. Receives env vars SLUICE_ROLLOVER_MANIFEST_PATH, SLUICE_ROLLOVER_PARENT_BACKUP_ID, SLUICE_ROLLOVER_BACKUP_ID, SLUICE_ROLLOVER_CHANGES, SLUICE_ROLLOVER_BYTES, SLUICE_ROLLOVER_ELAPSED_MS. Hook errors are WARN-logged but don't fail the stream. 30s timeout." placeholder:"CMD"`
 
-	RetryAttempts    int           `help:"Cap on consecutive retriable rollover failures the stream will absorb before giving up. Mirrors the sync-stream's --apply-retry-attempts. GitHub #22: transient source-side errors that v0.46.0 fixed for sync streams now also retry on backup-stream. 1 disables retry." default:"8" placeholder:"N"`
-	RetryBackoffBase time.Duration `help:"Base interval for exponential backoff between retriable rollover failures. Doubles each attempt, capped at --retry-backoff-cap." default:"100ms" placeholder:"DUR"`
-	RetryBackoffCap  time.Duration `help:"Upper bound on each retriable rollover backoff interval." default:"30s" placeholder:"DUR"`
+	// ADR-0118 finding 2: the retry knobs are the same concept the sync
+	// stream exposes as --apply-retry-* (identical defaults, 8/100ms/30s).
+	// Cross-add each sync spelling as an alias so an operator's muscle
+	// memory works on either command; the primary (shown in --help) stays
+	// backup's existing --retry-* name. Additive — no existing command line
+	// changes behaviour.
+	RetryAttempts    int           `aliases:"apply-retry-attempts" help:"Cap on consecutive retriable rollover failures the stream will absorb before giving up. Mirrors the sync-stream's --apply-retry-attempts (accepted here as an alias). GitHub #22: transient source-side errors that v0.46.0 fixed for sync streams now also retry on backup-stream. 1 disables retry." default:"8" placeholder:"N"`
+	RetryBackoffBase time.Duration `aliases:"apply-retry-backoff-base" help:"Base interval for exponential backoff between retriable rollover failures. Doubles each attempt, capped at --retry-backoff-cap. Alias: --apply-retry-backoff-base (the sync-stream spelling)." default:"100ms" placeholder:"DUR"`
+	RetryBackoffCap  time.Duration `aliases:"apply-retry-backoff-cap" help:"Upper bound on each retriable rollover backoff interval. Alias: --apply-retry-backoff-cap (the sync-stream spelling)." default:"30s" placeholder:"DUR"`
 
 	RetainRotateAt            time.Duration `help:"In-process backup-segment rotation (ADR-0046): once the open segment reaches this age, the stream caps it and opens a fresh segment over the SAME CDC handle (no operator wrapper, no stream exit). Pair with 'sluice backup prune' to bound total disk. 0 disables (unbounded single segment)." placeholder:"DUR"`
 	RetainRotateAtChainLength int           `help:"Rotate the open segment after this many incrementals are committed to it. Either rotation threshold firing wins. 0 disables." placeholder:"N"`
@@ -1176,9 +1182,26 @@ type RestoreCmd struct {
 
 	MaxBufferBytes int64 `help:"Soft cap on per-batch buffered memory in the bulk-copy writer. Same semantics as 'sluice migrate --max-buffer-bytes'. Default 67108864 (64 MiB)." default:"67108864" placeholder:"N"`
 
-	TableParallelism int `help:"Number of tables bulk-applied CONCURRENTLY during the restore (the write-side analog of pg_restore -j / migrate --table-parallelism). Engine-generic: each concurrent table writes through its own dedicated connection — no snapshot sharing is involved on the write side, so it engages for EVERY target (Postgres, MySQL). The resolved value is bounded by the TARGET's connection budget and clamped to the table count. Applies to chain restores too (each segment full's bulk-apply; incremental change replay stays strictly ordered). 0 (default) = auto: 4. 1 disables cross-table concurrency. See ADR-0084." default:"0" placeholder:"N"`
+	TableParallelism int `help:"WRITE-side (restore): number of tables bulk-applied CONCURRENTLY during the restore (the write-side analog of pg_restore -j / migrate --table-parallelism). Engine-generic: each concurrent table writes through its own dedicated connection — no snapshot sharing is involved on the write side, so it engages for EVERY target (Postgres, MySQL). The resolved value is bounded by the TARGET's connection budget and clamped to the table count. Applies to chain restores too (each segment full's bulk-apply; incremental change replay stays strictly ordered). 0 (default) = auto: 4. 1 disables cross-table concurrency. See ADR-0084." default:"0" placeholder:"N"`
+
+	BulkParallelism int `help:"WRITE-side (restore): number of a single table's chunks applied CONCURRENTLY (within-table axis), composed with --table-parallelism; bounded by the target connection budget. Each chunk-group worker writes through its own dedicated connection; snapshot chunks are a disjoint partition of the table's rows, so parallel apply cannot collide on a PK on a cold target. Engages only for tables with >= 2 chunks; the two axes multiply (table × bulk) and their product never exceeds the measured budget. Applies to chain restores too (each segment full's bulk-apply). 0 (default) = auto: min(8, NumCPU); 1 = serial (single-stream per table). See ADR-0112." default:"0" placeholder:"N"`
+
+	ApplyConcurrency int `help:"Key-hash concurrent-apply LANE count for the INCREMENTAL-replay leg of a chain restore (ADR-0104/0105). Only matters when restoring a chain that carries incrementals: the full-restore row load is the bulk COPY governed by --table-parallelism × --bulk-parallelism, while the incremental change-replay would otherwise run through a single serial stream — RTT-bound on a high-latency / cross-region target, so a chain with a large incremental stalls (the chain-restore analog of the from-backup broker's concurrent-replay path). Fans each incremental's changes across W in-order PK-hash lanes; exactly-once is preserved (every change carries the segment's chain position, so lanes persist the identical resume position the serial path did). ADR-0106 fast-by-default: 0 (default, unset) = auto:4 (no connection-budget probe; per-lane backpressure handles a tight target); 1 = explicit serial opt-out; W>1 honored. No effect on a single-full restore." default:"0" placeholder:"W"`
 
 	TargetSchema string `help:"Per-source target schema namespace (Postgres-only). When set, restored tables land in the named schema rather than the DSN's default. Mirrors 'sluice migrate --target-schema' / 'sync start --target-schema' (ADR-0031). PG-only: flat-namespace engines (MySQL) refuse at validate time — operators use a different --target DSN database instead. The schema is auto-created on the target if it doesn't exist. v0.56.0+ closure of the v0.55.0 cycle's UX-gap finding." placeholder:"NAME"`
+
+	// PlanetScale target-health telemetry (ADR-0107) — OPTIONAL. When set, the
+	// restore clamps the AUTO --table-parallelism × --bulk-parallelism product
+	// by the target's LIVE CPU/memory headroom (ADR-0115 / item 40) — the
+	// PlanetScale-correct bound, since connections are abundant there but CPU
+	// is the scarce resource on small tiers and the connection-budget split
+	// only bounds prober-equipped engines (Postgres). Same opt-in /
+	// all-or-nothing semantics as 'sync start'; off (no clamp) when unset.
+	PlanetScaleOrg            string `name:"planetscale-org" help:"PlanetScale org slug; enables OPTIONAL target-health telemetry (CPU/mem/storage) used to clamp the AUTO restore parallelism product by live headroom (ADR-0107/0115). Opt-in; requires --planetscale-metrics-token-id and --planetscale-metrics-token. Control-plane only — distinct from the data-plane --target DSN. Off when unset." placeholder:"ORG"`
+	PlanetScaleMetricsTokenID string `name:"planetscale-metrics-token-id" help:"PlanetScale service-token ID (granted read_metrics_endpoints) for --planetscale-org telemetry. Prefer the env var so the id never lands in shell history." env:"PLANETSCALE_METRICS_TOKEN_ID" placeholder:"ID"`
+	PlanetScaleMetricsToken   string `name:"planetscale-metrics-token" help:"PlanetScale service-token secret for --planetscale-org telemetry. Set via the env var (never on the command line); masked in all logging." env:"PLANETSCALE_METRICS_TOKEN" placeholder:"SECRET"`
+	PlanetScaleMetricsBranch  string `name:"planetscale-metrics-branch" help:"Target branch to filter telemetry series to (defaults to 'main'). Only consulted when --planetscale-org is set." placeholder:"BRANCH"`
+	PlanetScaleMetricsDB      string `name:"planetscale-metrics-db" help:"Target database name to filter PlanetScale telemetry SD to. Defaults to the --target DSN's database. Only consulted when --planetscale-org is set." placeholder:"DATABASE"`
 
 	EncryptionFlags
 }
@@ -1241,6 +1264,26 @@ func (r *RestoreCmd) Run(g *Globals) error {
 		return err
 	}
 
+	// OPTIONAL PlanetScale telemetry (ADR-0107) — used here only to clamp the
+	// AUTO parallelism product by live headroom (ADR-0115). (nil, nil) when
+	// off; an org without a complete token pair is a loud refusal. Closed at
+	// return so its background poller stops.
+	telemetryProvider, err := buildTargetTelemetryProvider(ctx, telemetryParams{
+		org:       r.PlanetScaleOrg,
+		tokenID:   r.PlanetScaleMetricsTokenID,
+		token:     r.PlanetScaleMetricsToken,
+		metricsDB: r.PlanetScaleMetricsDB,
+		branch:    r.PlanetScaleMetricsBranch,
+		targetDSN: r.Target,
+		engine:    r.TargetDriver,
+	})
+	if err != nil {
+		return err
+	}
+	if telemetryProvider != nil {
+		defer func() { _ = telemetryProvider.Close() }()
+	}
+
 	restore := &pipeline.Restore{
 		Target:           target,
 		TargetDSN:        r.Target,
@@ -1248,8 +1291,13 @@ func (r *RestoreCmd) Run(g *Globals) error {
 		Filter:           filter,
 		MaxBufferBytes:   r.MaxBufferBytes,
 		TableParallelism: r.TableParallelism,
+		ChunkParallelism: r.BulkParallelism,
+		ApplyConcurrency: r.ApplyConcurrency,
 		Envelope:         envelope,
 		TargetSchema:     r.TargetSchema,
+		// telemetryProviderOrNil returns a TRUE nil interface when off, so the
+		// restore's `TargetTelemetry != nil` guard stays exact (no typed-nil trap).
+		TargetTelemetry: telemetryProviderOrNil(telemetryProvider),
 	}
 	return restore.Run(ctx)
 }

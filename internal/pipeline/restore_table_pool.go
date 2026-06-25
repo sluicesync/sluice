@@ -31,14 +31,19 @@
 //     — the SAME construction path as the primary, so buffer cap +
 //     target-schema routing can never drift) and close them on
 //     release. The primary's lifecycle stays with the orchestrator.
-//   - Per-table chunk ordering is preserved by construction:
-//     [Restore.restoreTable] is called UNCHANGED — its producer
-//     goroutine streams the table's chunks IN ORDER through one
-//     channel into one WriteRows call, and the Bug-40b
-//     cancel-on-writer-error shape inside it is per-call-local.
+//   - Within a table, [Restore.restoreTable] applies the chunks. With
+//     the cross-table axis alone (chunkParallelism=1) each table is a
+//     single producer goroutine streaming its chunks through one
+//     channel into one WriteRows call; with the within-table axis
+//     engaged (ADR-0112, chunkParallelism>1 AND >=2 chunks) it fans the
+//     chunk list across per-group workers — each its OWN writer (worker
+//     0 reuses this pool's claimed writer, peers open dedicated ones via
+//     the SAME factory), so the two axes compose under one connection
+//     budget. The Bug-40b cancel-on-writer-error shape is per-worker.
 //   - DataOnly segments parallelize identically: the idempotent-writer
-//     selection inside restoreTable type-asserts its OWN writer, so
-//     each worker independently routes through WriteRowsIdempotent.
+//     selection inside restoreTable type-asserts each worker's OWN
+//     writer, so every worker independently routes through
+//     WriteRowsIdempotent.
 //
 // Read-side shared state under concurrency (verified, not assumed):
 //
@@ -61,6 +66,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime"
 
 	"golang.org/x/sync/errgroup"
 
@@ -112,6 +118,7 @@ func (r *Restore) runRestoreTablePool(
 	primary ir.RowWriter,
 	factory restoreWriterFactory,
 	tableParallelism int,
+	chunkParallelism int,
 ) error {
 	limit := tableParallelism
 	if limit < 1 {
@@ -137,7 +144,14 @@ func (r *Restore) runRestoreTablePool(
 				return err
 			}
 			defer release()
-			if err := r.restoreTable(tctx, rw, task.table, task.entry); err != nil {
+			// The within-table chunk fan-out (ADR-0112) opens its OWN
+			// dedicated peer writers via the SAME factory; the cross-table
+			// pool and the within-table fan-out share the construction
+			// path so neither setup can drift. The product table × chunk
+			// is bounded at the connection-budget chokepoint upstream
+			// (resolveRestoreParallelism), so the open-connection ceiling
+			// holds by construction without a runtime semaphore.
+			if err := r.restoreTable(tctx, rw, task.table, task.entry, chunkParallelism, factory); err != nil {
 				return wrapWithHint(PhaseBulkCopy, fmt.Errorf("restore: table %q: %w", task.table.Name, err))
 			}
 			return nil
@@ -188,29 +202,165 @@ func acquireRestoreWriter(
 // rather than silently deref'd. Mirrors [errBackupPoolNoFactory].
 var errRestorePoolNoFactory = errors.New("pipeline: restore table pool: dedicated writer needed but no writer factory configured")
 
-// resolveRestoreTableParallelism resolves the effective cross-table
-// fan-out for the restore bulk-apply: the operator's requested value
-// (0 = auto = 4, [resolveTableParallelism]) clamped to the number of
-// tables actually being applied and bounded by the TARGET's measured
-// connection budget. Unlike the backup side there is NO capability
-// gate — parallel writers need no shared snapshot, so every target
-// engine is eligible. ≤1 collapses to serial — the same pool runs
-// with one worker — with a loud INFO naming the reason (the ADR-0079
-// disposition: a silent fallback would leave operators wondering why
-// the knob did nothing).
+// restoreChunkDispatchObserver is the within-table-axis counterpart of
+// [restoreDispatchObserver] (ADR-0112): when non-nil it fires with the
+// resolved chunk parallelism the moment
+// [Restore.resolveRestoreParallelism] chooses — >1 means the within-
+// table fan-out is eligible (the per-table engage decision still
+// depends on that table having >=2 chunks, made in
+// [Restore.resolveTableChunkParallelism]); reason carries the
+// not-engaged clause ("" when eligible). nil in production.
+var restoreChunkDispatchObserver func(chunkParallelism int, reason string)
+
+// resolveRestoreParallelism resolves BOTH restore concurrency axes —
+// cross-table (ADR-0084) and within-table chunk (ADR-0112) — through
+// the SINGLE connection-budget chokepoint, exactly as migrate does
+// (ADR-0076; see phaseResolveCopyParallelism). The within-table axis is
+// satisfied FIRST; the table axis takes the remainder; the PRODUCT
+// table × chunk never exceeds the target's measured CopyBudget.
 //
-// The budget chokepoint reuses [resolveTargetCopyParallelism] against
-// the TARGET DSN. Restore opens exactly ONE writer connection per
-// concurrent table (no within-table axis), so the budget-capped value
-// IS the table parallelism directly. Targets without a prober (MySQL)
-// pass through unclamped, the same contract as migrate. The schema
-// writer's single long-lived connection rides in the prober's
-// existing headroom, exactly as on the migrate path.
-func (r *Restore) resolveRestoreTableParallelism(ctx context.Context, taskCount int) (int, error) {
-	requested := resolveTableParallelism(r.TableParallelism)
-	if requested > taskCount {
-		requested = taskCount // never fan out wider than there are tables to apply
+// Both requested values apply the auto/serial rules first: cross-table
+// via [resolveTableParallelism] (0 = 4), within-table via
+// [resolveBulkParallelism] (0 = min(8, NumCPU)). The within factor is
+// budget-capped via [resolveTargetCopyParallelism] against the TARGET
+// DSN; the table factor is then clamped by [resolveCopyParallelismBudget]
+// to whole multiples of the within factor that fit the product budget.
+// Targets without a prober (MySQL) pass through unclamped — the same
+// contract as migrate and as the restore cross-table pool. The schema
+// writer's single long-lived connection rides in the prober's existing
+// headroom, exactly as on the migrate path.
+//
+// Each axis ≤1 collapses to serial with a loud INFO naming the reason
+// (ADR-0079: a silent fallback would leave operators wondering why the
+// knob did nothing). Returns (tableParallelism, chunkParallelism), both
+// >= 1.
+func (r *Restore) resolveRestoreParallelism(ctx context.Context, taskCount int) (tableParallelism, chunkParallelism int, err error) {
+	requestedTable := resolveTableParallelism(r.TableParallelism)
+	if requestedTable > taskCount {
+		requestedTable = taskCount // never fan out wider than there are tables to apply
 	}
+
+	// Within-table axis FIRST, budget-capped at the chokepoint. Restore
+	// has no --max-target-connections flag, so ceiling=0 (auto only) —
+	// the measured CopyBudget is the sole product bound.
+	requestedChunk := resolveBulkParallelism(r.ChunkParallelism, runtime.NumCPU())
+	resolvedChunk, budgetReport, err := resolveTargetCopyParallelism(
+		ctx, r.Target, r.TargetDSN, requestedChunk, 0,
+	)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	// Split the single budget across the two axes: within is pinned to
+	// its budget-capped value, the table factor gets whatever whole
+	// multiples of within fit the product budget (0 budget = MySQL /
+	// degraded probe = unclamped).
+	tableP, chunkP := resolveCopyParallelismBudget(
+		resolvedChunk, requestedTable, budgetReport.CopyBudget, 0,
+	)
+
+	tableParallelism = r.dispatchRestoreTableAxis(ctx, tableP, requestedTable, taskCount, budgetReport.CopyBudget)
+	chunkParallelism = r.dispatchRestoreChunkAxis(ctx, chunkP, requestedChunk)
+
+	// ADR-0115 / item 40: clamp the AUTO product by the target's LIVE CPU/mem
+	// headroom — the PlanetScale-correct bound the connection-budget split
+	// can't provide on a no-prober engine (MySQL/PlanetScale). No-op when no
+	// telemetry is wired, when headroom is healthy, or for an explicitly-
+	// pinned axis. Never raises.
+	tableParallelism, chunkParallelism = r.clampRestoreParallelismByHeadroom(ctx, tableParallelism, chunkParallelism)
+
+	slog.InfoContext(
+		ctx, "restore: bulk-apply parallelism resolved",
+		slog.Int("table_parallelism", tableParallelism),
+		slog.Int("chunk_parallelism", chunkParallelism),
+		slog.Int("max_concurrent_connections", tableParallelism*chunkParallelism),
+		slog.Int("copy_budget", budgetReport.CopyBudget),
+	)
+	return tableParallelism, chunkParallelism, nil
+}
+
+// clampRestoreParallelismByHeadroom reduces the AUTO-resolved restore fan-out
+// product (table × chunk) when the target's LIVE resource headroom is tight
+// (ADR-0115), the restore analog of [Streamer.clampConcurrencyByHeadroom]. It
+// shares the SAME [headroomDivisor] thresholds as the CDC apply clamp, so the
+// two paths agree on what "tight" means.
+//
+// PlanetScale-correct: the connection-budget split ([resolveCopyParallelismBudget])
+// only bounds engines with a budget prober (Postgres); a MySQL/PlanetScale auto
+// fan-out otherwise passes through unbounded — and on PlanetScale connections
+// are abundant while CPU is the scarce resource on small tiers, so a CPU/mem
+// headroom clamp is the right bound there.
+//
+// It only clamps an AUTO axis (the operator left --table-parallelism /
+// --bulk-parallelism at 0); an explicitly-pinned axis is respected and never
+// reduced. It never RAISES either axis, never drops below 1, and degrades to a
+// no-op (returns its inputs unchanged) when no telemetry is wired, the snapshot
+// is stale, or headroom is healthy. The reduction is applied to the auto axes
+// to bring the product down ~divisor-fold, reducing the cross-table axis first
+// (keeping each table's within-table chunk fan-out intact) and falling through
+// to the within-table axis only if the cross-table axis can't absorb it alone.
+func (r *Restore) clampRestoreParallelismByHeadroom(ctx context.Context, tableP, chunkP int) (clampedTable, clampedChunk int) {
+	if tableP*chunkP <= 1 {
+		return tableP, chunkP // nothing to clamp
+	}
+	divisor, util, ok := headroomDivisor(ctx, r.TargetTelemetry)
+	if !ok || divisor <= 1 {
+		return tableP, chunkP // no telemetry verdict, or healthy headroom.
+	}
+	tableAuto := r.TableParallelism == 0
+	chunkAuto := r.ChunkParallelism == 0
+	if !tableAuto && !chunkAuto {
+		return tableP, chunkP // both pinned — respect operator intent.
+	}
+
+	target := (tableP * chunkP) / divisor
+	if target < 1 {
+		target = 1
+	}
+	newTable, newChunk := tableP, chunkP
+	switch {
+	case tableAuto && chunkAuto:
+		// Reduce the cross-table axis first, keeping each table's within-table
+		// chunk fan-out; the chunk axis only shrinks if table=1 still overshoots.
+		if newChunk > target {
+			newChunk = target
+		}
+		newTable = target / newChunk
+	case tableAuto:
+		// Chunk pinned — reduce only the cross-table axis to fit the target.
+		newTable = target / chunkP
+	case chunkAuto:
+		// Table pinned — reduce only the within-table axis to fit the target.
+		newChunk = target / tableP
+	}
+	if newTable < 1 {
+		newTable = 1
+	}
+	if newChunk < 1 {
+		newChunk = 1
+	}
+	if newTable == tableP && newChunk == chunkP {
+		return tableP, chunkP // clamp didn't actually reduce (e.g. already minimal)
+	}
+	slog.InfoContext(
+		ctx, "restore: reducing bulk-apply parallelism — target resource headroom is tight (ADR-0115; advisory, CPU-bound clamp for PlanetScale-class targets)",
+		slog.Int("table_parallelism_before", tableP),
+		slog.Int("chunk_parallelism_before", chunkP),
+		slog.Int("table_parallelism", newTable),
+		slog.Int("chunk_parallelism", newChunk),
+		slog.Float64("busiest_util", util),
+		slog.Int("divisor", divisor),
+	)
+	return newTable, newChunk
+}
+
+// dispatchRestoreTableAxis collapses the cross-table axis to serial with
+// a loud INFO + observer fire when it can't engage, mirroring the
+// pre-ADR-0112 resolveRestoreTableParallelism reason set. effective is
+// the post-budget-split table factor; requested is the operator's
+// auto-resolved request (for the INFO); copyBudget feeds the
+// budget-exhaustion reason.
+func (r *Restore) dispatchRestoreTableAxis(ctx context.Context, effective, requested, taskCount, copyBudget int) int {
 	serialReason := func(reason string) int {
 		slog.InfoContext(
 			ctx, "restore: cross-table parallel apply not engaged; applying tables serially",
@@ -227,15 +377,16 @@ func (r *Restore) resolveRestoreTableParallelism(ctx context.Context, taskCount 
 		if taskCount <= 1 {
 			reason = "at most one table to apply"
 		}
-		return serialReason(reason), nil
-	}
-
-	effective, _, err := resolveTargetCopyParallelism(ctx, r.Target, r.TargetDSN, requested, 0)
-	if err != nil {
-		return 0, err
+		return serialReason(reason)
 	}
 	if effective <= 1 {
-		return serialReason("target connection budget allows only one writer"), nil
+		reason := "target connection budget allows only one writer"
+		if copyBudget < 1 {
+			// No measured budget but still collapsed: the table factor was
+			// squeezed out by the within axis taking the whole product.
+			reason = "within-table parallelism consumed the connection budget"
+		}
+		return serialReason(reason)
 	}
 	slog.InfoContext(
 		ctx, "restore: cross-table parallel apply engaged (ADR-0084)",
@@ -244,5 +395,39 @@ func (r *Restore) resolveRestoreTableParallelism(ctx context.Context, taskCount 
 	if restoreDispatchObserver != nil {
 		restoreDispatchObserver(effective, "")
 	}
-	return effective, nil
+	return effective
+}
+
+// dispatchRestoreChunkAxis collapses the within-table axis to serial
+// with a loud INFO + observer fire when it can't engage (ADR-0112).
+// effective is the post-budget-split chunk factor; requested is the
+// operator's auto-resolved request. A >1 result means the fan-out is
+// ELIGIBLE — whether it engages for a given table still depends on that
+// table having >= 2 chunks (resolveTableChunkParallelism).
+func (r *Restore) dispatchRestoreChunkAxis(ctx context.Context, effective, requested int) int {
+	serialReason := func(reason string) int {
+		slog.InfoContext(
+			ctx, "restore: within-table chunk parallel apply not engaged; applying chunks serially",
+			slog.String("reason", reason),
+			slog.Int("requested_chunk_parallelism", requested),
+		)
+		if restoreChunkDispatchObserver != nil {
+			restoreChunkDispatchObserver(1, reason)
+		}
+		return 1
+	}
+	if requested <= 1 {
+		return serialReason("within-table chunk parallelism disabled (--bulk-parallelism=1)")
+	}
+	if effective <= 1 {
+		return serialReason("target connection budget allows only one writer per table")
+	}
+	slog.InfoContext(
+		ctx, "restore: within-table chunk parallel apply eligible (ADR-0112)",
+		slog.Int("chunk_parallelism", effective),
+	)
+	if restoreChunkDispatchObserver != nil {
+		restoreChunkDispatchObserver(effective, "")
+	}
+	return effective
 }

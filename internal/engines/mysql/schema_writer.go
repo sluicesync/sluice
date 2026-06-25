@@ -295,6 +295,23 @@ func (w *SchemaWriter) maybeWarnDomainCheckDrop(ctx context.Context, s *ir.Schem
 	})
 }
 
+// IsTransientError reports whether err is a classified storage-grow /
+// reparent transient, satisfying [ir.TransientClassifier] (ADR-0114). It
+// delegates to the SAME [classifyApplierError] the apply / cold-copy paths
+// use, so the post-copy DDL-phase retry (CreateIndexes / CreateConstraints
+// / CreateViews / SyncIdentitySequences) recognises a PlanetScale reparent
+// identically to the row-write path — no second classifier to drift. A
+// non-transient (a real DDL fault) returns false and the phase fails
+// loudly, exactly as before.
+func (w *SchemaWriter) IsTransientError(err error) bool {
+	var re ir.RetriableError
+	return errors.As(classifyApplierError(err), &re) && re.Retriable()
+}
+
+// Compile-time proof the SchemaWriter exposes the DDL-phase retry verdict
+// (ADR-0114) so the orchestrator's post-copy DDL retry engages.
+var _ ir.TransientClassifier = (*SchemaWriter)(nil)
+
 // CreateIndexes adds every non-PRIMARY index across the schema. Each
 // index is added with its own ALTER TABLE statement so a failure on
 // one doesn't leave others in an indeterminate state.

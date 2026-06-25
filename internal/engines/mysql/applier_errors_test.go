@@ -39,6 +39,42 @@ func TestIsMySQLDeadlock(t *testing.T) {
 	}
 }
 
+// TestSchemaWriter_IsTransientError pins the ADR-0114 DDL-phase retry
+// verdict the orchestrator reads via [ir.TransientClassifier]: a
+// PlanetScale reparent / storage-grow shape (vttablet "not serving",
+// disk-full, read-only window) must classify transient so a grow landing
+// on the index/constraint phase retries, while a real DDL fault (unknown
+// column, duplicate key) must NOT — a broken DDL still fails loudly.
+// Delegates to classifyApplierError, guarding against a second classifier.
+func TestSchemaWriter_IsTransientError(t *testing.T) {
+	w := &SchemaWriter{}
+	transient := []error{
+		&gomysql.MySQLError{Number: 1105, Message: "target: ks.0.primary: vttablet: rpc error: code = Unavailable desc = primary is not serving"},
+		&gomysql.MySQLError{Number: 1021, Message: "No space left on device"},
+		&gomysql.MySQLError{Number: 1290, Message: "The MySQL server is running with the --read-only option so it cannot execute this statement"},
+	}
+	for _, e := range transient {
+		if !w.IsTransientError(e) {
+			t.Errorf("IsTransientError(%v) = false; want true (a reparent/grow transient must retry)", e)
+		}
+	}
+	// NOTE: 1054/1146 are classified retriable schema-drift (self-heals when
+	// the operator adds the missing column/table), so they are deliberately
+	// NOT in this terminal set — assert only the genuinely-terminal shapes.
+	terminal := []error{
+		&gomysql.MySQLError{Number: 1062, Message: "Duplicate entry '1' for key 'PRIMARY'"},
+		errors.New("some random non-transient failure"),
+	}
+	for _, e := range terminal {
+		if w.IsTransientError(e) {
+			t.Errorf("IsTransientError(%v) = true; want false (a real DDL fault must fail loudly)", e)
+		}
+	}
+	if w.IsTransientError(nil) {
+		t.Error("IsTransientError(nil) = true; want false")
+	}
+}
+
 // TestClassifyApplierError_NilInNilOut is the boring boundary case
 // the pipeline relies on: classifier must pass nil through unchanged
 // so wrapping every applier return site doesn't accidentally turn a

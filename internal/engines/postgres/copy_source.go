@@ -91,3 +91,72 @@ func (s *chanCopySource) Values() ([]any, error) {
 func (s *chanCopySource) Err() error {
 	return s.err
 }
+
+// sliceCopySource adapts a buffered []ir.Row chunk to pgx's
+// [CopyFromSource] interface for the grow-gate-engaged chunked-COPY path
+// (roadmap item 38). It is the slice-backed twin of [chanCopySource]: the
+// chunked writer buffers a bounded chunk of rows so a CopyFrom that fails on
+// a storage-grow transient can be REPLAYED, and this source feeds that same
+// buffered slice into pgx — re-runnable from the start on each replay.
+//
+// LOAD-BEARING: it shares the SAME per-value encoding as [chanCopySource] —
+// the exact same nonGeneratedColumns filter and the exact same prepareValue
+// call per cell. There is deliberately ONE encoding path, so a chunked write
+// produces byte-identical target rows to the monolithic single-CopyFrom path
+// (the value-fidelity / Bug-74 discipline).
+type sliceCopySource struct {
+	rows    []ir.Row
+	cols    []*ir.Column // non-generated columns, computed once — invariant per table
+	idx     int          // next row to deliver; reset to 0 to replay the chunk
+	current []any        // values for the row Next just dequeued; reused across calls
+	err     error        // sticky; once non-nil, Next returns false on every call
+}
+
+// newSliceCopySource builds a source over a buffered chunk for the given
+// table schema. The non-generated column filter is hoisted once (invariant
+// per table) and the values slice is allocated once and reused, mirroring
+// [newChanCopySource]. The source does not retain ownership of rows — the
+// chunked writer owns the buffer and may reuse this source's chunk across a
+// replay by constructing a fresh source over the same slice.
+func newSliceCopySource(table *ir.Table, rows []ir.Row) *sliceCopySource {
+	cols := nonGeneratedColumns(table.Columns)
+	return &sliceCopySource{rows: rows, cols: cols, current: make([]any, len(cols))}
+}
+
+// Next advances to the next buffered row. Returns false at end of chunk
+// (a clean drain, nil Err) or on a value-preparation error (sticky in Err).
+// Generated columns are skipped so the value list stays in lockstep with the
+// column list passed to pgx.CopyFrom (also filtered) — identical to
+// [chanCopySource.Next].
+func (s *sliceCopySource) Next() bool {
+	if s.err != nil {
+		return false
+	}
+	if s.idx >= len(s.rows) {
+		return false
+	}
+	row := s.rows[s.idx]
+	s.idx++
+	for i, col := range s.cols {
+		v, err := prepareValue(row[col.Name], col.Type)
+		if err != nil {
+			s.err = fmt.Errorf("column %q: %w", col.Name, err)
+			return false
+		}
+		s.current[i] = v
+	}
+	return true
+}
+
+// Values returns the values for the row [Next] just dequeued. The slice is
+// reused across calls; pgx's CopyFrom copies what it needs before the next
+// [Next] call.
+func (s *sliceCopySource) Values() ([]any, error) {
+	return s.current, nil
+}
+
+// Err returns the sticky error from the most recent [Next] that returned
+// false. End-of-chunk (clean drain) is reported as nil.
+func (s *sliceCopySource) Err() error {
+	return s.err
+}

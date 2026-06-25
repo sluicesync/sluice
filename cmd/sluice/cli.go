@@ -19,6 +19,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/engines/mysql"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline"
@@ -118,6 +119,8 @@ type CLI struct {
 	Diagnose DiagnoseCmd `cmd:"" help:"Assemble an operator-bundle (cockroach-debug-zip-shape) for filing GitHub issues. ADR-0056."`
 	Cutover  CutoverCmd  `cmd:"" help:"Two-phase sequence priming at cutover — re-read source sequence/AUTO_INCREMENT state and apply to the target with a safety margin (F10, ADR-0062)."`
 	Trigger  TriggerCmd  `cmd:"" help:"Install / remove the postgres-trigger engine's source-side state (ADR-0066)."`
+
+	MetricsWatch MetricsWatchCmd `cmd:"" help:"Watch a PlanetScale database's control-plane metrics (CPU/mem/storage/lag) and fire threshold alerts — standalone, no sync attached (ADR-0107)."`
 }
 
 // EnginesCmd lists the database engines registered in the binary,
@@ -189,15 +192,19 @@ type MigrateCmd struct {
 
 	BulkBatchSize int `help:"Bulk-copy batch size for resume-mid-table checkpointing. Each batch commits with an updated cursor in sluice_migrate_state.table_progress, so a crash mid-table resumes without re-copying the prefix. Tables without a PK fall back to truncate-and-redo regardless. Lower values shorten the replay window on crash; higher values amortise per-tx commit overhead. Only consulted on the resume path; cold-start migrations use the faster plain-INSERT / COPY path. Default 5000." default:"5000" placeholder:"N"`
 
-	BulkParallelism int `help:"Number of parallel reader/writer pairs per table during bulk copy. Tables above --bulk-parallel-min-rows are split into this many PK ranges and copied concurrently. Tables without a single integer PK fall back to single-reader. 0 means use min(8, NumCPU); 1 disables parallelism. See ADR-0019." default:"0" placeholder:"N"`
+	// ADR-0118 finding 1(a): lead with applicability. On `migrate` these are
+	// the general-purpose copy-parallelism knobs and apply for EVERY source
+	// (the within-table axis) — distinct from the `sync start` variants, which
+	// are PG-source-only.
+	BulkParallelism int `help:"Every source: number of parallel reader/writer pairs per table during bulk copy — the within-table axis. Tables above --bulk-parallel-min-rows are split into this many PK ranges and copied concurrently. Tables without a single integer PK fall back to single-reader. 0 means use min(8, NumCPU); 1 disables parallelism. See ADR-0019." default:"0" placeholder:"N"`
 
-	TableParallelism int `help:"Number of tables copied CONCURRENTLY during bulk copy — the cross-table axis (pgcopydb --table-jobs), composed with the within-table --bulk-parallelism axis. Closes the many-medium-table gap where each table sat below the within-table-split threshold and the table loop ran them serially, leaving cores idle. The two axes MULTIPLY: at most --table-parallelism × (effective --bulk-parallelism) connections open against the target at once, and that PRODUCT is bounded by the target's connection budget (and --max-target-connections) at a single chokepoint — within-table parallelism is satisfied first, the table axis gets whatever remains. 0 (default) = auto: 4 (pgcopydb's --table-jobs default), bounded by the budget split. 1 disables cross-table concurrency (one table at a time). Only the migrate path uses this; the sync cold-start path stays serial by design. See ADR-0076." default:"0" placeholder:"N"`
+	TableParallelism int `help:"Every source: number of tables copied CONCURRENTLY during bulk copy — the cross-table axis (pgcopydb --table-jobs), composed with the within-table --bulk-parallelism axis. Closes the many-medium-table gap where each table sat below the within-table-split threshold and the table loop ran them serially, leaving cores idle. The two axes MULTIPLY: at most --table-parallelism × (effective --bulk-parallelism) connections open against the target at once, and that PRODUCT is bounded by the target's connection budget (and --max-target-connections) at a single chokepoint — within-table parallelism is satisfied first, the table axis gets whatever remains. 0 (default) = auto: 4 (pgcopydb's --table-jobs default), bounded by the budget split. 1 disables cross-table concurrency (one table at a time). Only the migrate path uses this; the sync cold-start path stays serial by design. See ADR-0076." default:"0" placeholder:"N"`
 
 	MaxTargetConnections int `help:"Explicit ceiling on the number of connections the bulk-copy pool opens against the target (connection-resilience item 4). 0 (default) = auto: sluice probes the target's connection-slot budget (Postgres max_connections / role / database limits minus in-use and a small reserve) and caps --bulk-parallelism to fit, refusing loudly if no budget is free. When set, it's an explicit upper bound the auto-cap further bounds — it never raises --bulk-parallelism. Inert against engines without a connection-slot model (MySQL target)." default:"0" placeholder:"N"`
 
 	ReapStaleBackends bool `help:"Terminate sluice's OWN orphaned backends on the target during the cold-start preflight (connection-resilience Phase 2, item 2). Detection runs ALWAYS and reports loudly; this flag authorises pg_terminate_backend on each orphan. An orphan is a backend whose application_name carries the 'sluice/' prefix, owned by the connecting role, NOT the current session, and either idle-in-transaction or holding a lock on a relation sluice is about to write — typically a SIGKILL'd / OOM'd prior run whose server-side COPY backend still holds a target-table lock and a connection slot. Default off — detect-and-report is the safe baseline, because a legitimately-running concurrent sluice process on the same target is a real possibility (the report is shown first so you can tell them apart). Termination is always scoped to your own sluice backends; it never touches another role's or a non-sluice session, and needs no superuser grant. Inert against engines without a backend model (MySQL target)."`
 
-	BulkParallelMinRows int64 `help:"Row-count threshold below which a table is copied with a single reader/writer pair regardless of --bulk-parallelism. Avoids per-chunk overhead on small tables. 0 (default) = auto: base 80000 (sits below 100k to absorb the InnoDB information_schema row-count undershoot), dialled DOWN on many-table schemas (base/table-count, floored at 10000) so a many-medium-table migrate engages within-table parallelism instead of copying each table serially + single-streamed (the pgcopydb many-table gap, roadmap item 3). Set an explicit N to pin the threshold (e.g. 100000 for pre-v0.62.0 behaviour); explicit values are never auto-lowered." default:"0" placeholder:"N"`
+	BulkParallelMinRows int64 `help:"Every source: row-count threshold below which a table is copied with a single reader/writer pair regardless of --bulk-parallelism. Avoids per-chunk overhead on small tables. 0 (default) = auto: base 80000 (sits below 100k to absorb the InnoDB information_schema row-count undershoot), dialled DOWN on many-table schemas (base/table-count, floored at 10000) so a many-medium-table migrate engages within-table parallelism instead of copying each table serially + single-streamed (the pgcopydb many-table gap, roadmap item 3). Set an explicit N to pin the threshold (e.g. 100000 for pre-v0.62.0 behaviour); explicit values are never auto-lowered." default:"0" placeholder:"N"`
 
 	MaxBufferBytes int64 `help:"Soft cap on per-batch buffered memory in the bulk-copy writer. The writer flushes when accumulated row-value bytes reach the cap regardless of row count, so wide-row workloads (TEXT/BYTEA/JSON at MB scale) don't blow out heap. A single row larger than the cap still applies (soft target). Default 67108864 (64 MiB). See ADR-0028." default:"67108864" placeholder:"N"`
 
@@ -506,6 +513,8 @@ type SyncFromBackupCmd struct {
 	ApplyBatchSize int   `help:"Batch up to N CDC changes per target transaction during incremental replay. Idempotent applier semantics (ADR-0010) keep replay-on-crash safe." default:"100" placeholder:"N"`
 	MaxBufferBytes int64 `help:"Soft cap on per-batch buffered memory in the CDC applier. Default 67108864 (64 MiB). See ADR-0028." default:"67108864" placeholder:"N"`
 
+	ApplyConcurrency int `help:"Key-hash concurrent-apply LANE count W for incremental REPLAY (ADR-0104/0105, the same machinery 'sync start --apply-concurrency' uses). Each incremental's merged change stream is fanned across W in-order PK-hash lanes committing concurrently, each with its own AIMD controller. Without this a large incremental replayed into a high-latency / cross-region target applies through a single serial pipelined stream and is RTT-bound (the broker-replay analog of the 'sync start' cross-region wedge). Exactly-once is preserved: every change in an incremental carries the same broker chain position, so the lanes persist the identical resume position the serial path does. ADR-0106 FAST BY DEFAULT: 0 (default, unset) = auto:4 (a fixed conservative ceiling — the broker does not run a connection-budget probe; per-lane AIMD backs off if the target is tight); 1 = explicit SERIAL opt-out (byte-identical to the pre-fix behaviour); W>1 honored verbatim." default:"0" placeholder:"W"`
+
 	ResetTargetData bool `help:"Cold-start recovery: drop target tables, run a chain restore (full + every incremental up to current), then transition to live polling. Mirrors 'migrate --reset-target-data'. Mutually exclusive with --at-chain-id."`
 
 	AtChainID string `help:"Operator-asserted resumption: the broker treats the target as currently being at chain ID <ID>; writes a fresh sluice_cdc_state row and transitions to live polling from there. Use after a manual 'sluice restore --from=<chain-url>'. Mutually exclusive with --reset-target-data." placeholder:"BACKUP-ID"`
@@ -568,18 +577,19 @@ func (s *SyncFromBackupCmd) Run(_ *Globals) error {
 	}
 
 	broker := &pipeline.SyncFromBackup{
-		Target:          target,
-		TargetDSN:       s.Target,
-		Store:           store,
-		ChainURL:        storeDesc,
-		StreamID:        s.StreamID,
-		PollInterval:    s.PollInterval,
-		ApplyBatchSize:  s.ApplyBatchSize,
-		MaxBufferBytes:  s.MaxBufferBytes,
-		ResetTargetData: s.ResetTargetData,
-		AtChainID:       s.AtChainID,
-		SluiceVersion:   version,
-		Envelope:        envelope,
+		Target:           target,
+		TargetDSN:        s.Target,
+		Store:            store,
+		ChainURL:         storeDesc,
+		StreamID:         s.StreamID,
+		PollInterval:     s.PollInterval,
+		ApplyBatchSize:   s.ApplyBatchSize,
+		MaxBufferBytes:   s.MaxBufferBytes,
+		ApplyConcurrency: s.ApplyConcurrency,
+		ResetTargetData:  s.ResetTargetData,
+		AtChainID:        s.AtChainID,
+		SluiceVersion:    version,
+		Envelope:         envelope,
 	}
 	return broker.Run(ctx)
 }
@@ -689,15 +699,35 @@ type SyncStartCmd struct {
 
 	IndexBuildParallelism int `help:"Postgres-only, cold-start branch: number of secondary indexes to build CONCURRENTLY in the deferred index phase (Phase B). Each concurrent build runs plain CREATE INDEX on its own connection with its own maintenance_work_mem, so the aggregate memory budget is DIVIDED across the workers. 0 (default) = auto: sluice derives a conservative N bounded by the target's spare connection-slot budget AND a memory budget (so it can't OOM a small node) AND the index count. Parallelism barely helps below PS-640 (max_worker_processes flat at 4), so auto stays modest there. Set >0 to override the auto count verbatim; N=1 forces the serial build. Only the cold-start path builds indexes; warm-resume ignores this. Inert on MySQL targets. See docs/dev/notes/index-build-phase-tuning.md." default:"0" placeholder:"N"`
 
-	BulkParallelism int `help:"FAST cold-start (ADR-0079, PG source) only: parallel reader/writer pairs PER table during the initial cold-start copy — the within-table axis (ADR-0019 PK-range chunking). Engages with the cross-table --table-parallelism axis when the PG source surfaces a shareable exported snapshot; all parallel readers are pinned to the ONE snapshot. 0 = min(8, NumCPU); 1 disables. Inert on MySQL/VStream sources (serial cold-start). See ADR-0079." default:"0" placeholder:"N"`
+	// ADR-0118 finding 1(a): the applicability clause is front-loaded as the
+	// FIRST thing a --help reader sees. On a MySQL/VStream source these flags
+	// are INERT (serial cold-start); --copy-fanout-degree / the DSN copy-table
+	// parallelism knobs (--vstream-copy-table-parallelism /
+	// --copy-table-parallelism) tune VStream/native cold-copy there. Setting
+	// one explicitly on such a source emits a one-time runtime WARN (finding
+	// 1(b), see warnInertParallelismFlags).
+	BulkParallelism int `help:"PG source only; inert on MySQL/VStream — use --copy-fanout-degree / --vstream-copy-table-parallelism / --copy-table-parallelism there. FAST cold-start (ADR-0079): parallel reader/writer pairs PER table during the initial cold-start copy — the within-table axis (ADR-0019 PK-range chunking). Engages with the cross-table --table-parallelism axis when the PG source surfaces a shareable exported snapshot; all parallel readers are pinned to the ONE snapshot. 0 = min(8, NumCPU); 1 disables. See ADR-0079." default:"0" placeholder:"N"`
 
-	TableParallelism int `help:"FAST cold-start (ADR-0079, PG source) only: tables copied CONCURRENTLY during the initial cold-start copy — the cross-table axis (pgcopydb --table-jobs), composed with within-table --bulk-parallelism. The two MULTIPLY; the product (plus the reserved CDC connection) is bounded by the target's connection budget and --max-target-connections at a single chokepoint. 0 (default) = auto: 4. 1 disables cross-table concurrency. Inert on MySQL/VStream sources (serial cold-start). See ADR-0076 / ADR-0079." default:"0" placeholder:"N"`
+	TableParallelism int `help:"PG source only; inert on MySQL/VStream — use --copy-fanout-degree / --vstream-copy-table-parallelism / --copy-table-parallelism there. FAST cold-start (ADR-0079): tables copied CONCURRENTLY during the initial cold-start copy — the cross-table axis (pgcopydb --table-jobs), composed with within-table --bulk-parallelism. The two MULTIPLY; the product (plus the reserved CDC connection) is bounded by the target's connection budget and --max-target-connections at a single chokepoint. 0 (default) = auto: 4. 1 disables cross-table concurrency. See ADR-0076 / ADR-0079." default:"0" placeholder:"N"`
 
-	BulkParallelMinRows int64 `help:"FAST cold-start (ADR-0079, PG source) only: row-count threshold below which a table is copied with a single reader/writer pair regardless of --bulk-parallelism. 0 (default) = auto (base 80000, dialled down on many-table schemas). Set an explicit N to pin it. Inert on MySQL/VStream sources (serial cold-start)." default:"0" placeholder:"N"`
+	BulkParallelMinRows int64 `help:"PG source only; inert on MySQL/VStream — use --copy-fanout-degree / --vstream-copy-table-parallelism / --copy-table-parallelism there. FAST cold-start (ADR-0079): row-count threshold below which a table is copied with a single reader/writer pair regardless of --bulk-parallelism. 0 (default) = auto (base 80000, dialled down on many-table schemas). Set an explicit N to pin it." default:"0" placeholder:"N"`
 
 	BulkBatchSize int `help:"FAST cold-start (ADR-0079, PG source) only: bulk-copy batch size for the within-table cursor path. Default 5000. Inert on MySQL/VStream sources (serial cold-start)." default:"5000" placeholder:"N"`
 
 	CopyFanoutDegree int `help:"VStream/CDC snapshot cold-start (ADR-0097, PlanetScale-MySQL target) only: WRITE-side fan-out — the single incoming snapshot row stream is PK-hash-partitioned out to N concurrent batched-INSERT writer workers, each on its own connection, to beat the single cross-region-RTT-bound INSERT connection vtgate forces (it blocks LOAD DATA). 0 (default) = auto: 4; 1 disables fan-out (serial). Bounded by the target connection budget / --max-target-connections. Inert on the FAST cold-start path and on no-PK tables. See ADR-0097." default:"0" placeholder:"N"`
+
+	// ADR-0118 finding 4: promote the DSN read-axis params to first-class CLI
+	// flags. Precedence is explicit CLI flag > DSN param > engine default
+	// (1 = serial). 0 (the default, unset) means "fall back to the DSN param",
+	// so the new flag's zero value never silently overrides a DSN value — only
+	// an explicitly-set CLI flag wins (zero-value-safe, the v0.99.51 trap). The
+	// DSN form (vstream_copy_table_parallelism / copy_table_parallelism in the
+	// source DSN query-string) keeps working verbatim. The resolved override is
+	// threaded into the mysql engine in SyncStartCmd.Run, where the engine reads
+	// it ahead of the DSN param.
+	VStreamCopyTableParallelism int `name:"vstream-copy-table-parallelism" help:"VStream cold-copy READ axis (Vitess/PlanetScale source): the number of CONCURRENT single-table COPY streams the auto-shard cold-copy runs (ADR-0099), the read-side sibling of the write-side --copy-fanout-degree. 0 (default) = unset — fall back to the source DSN's vstream_copy_table_parallelism param, then to the engine default (1 = serial single-stream). An explicit value here WINS over the DSN param. The DSN form keeps working verbatim. 1 = serial. Inert on PG / native-MySQL sources." default:"0" placeholder:"N"`
+
+	CopyTableParallelism int `name:"copy-table-parallelism" help:"Native-MySQL cold-copy READ axis (self-managed, non-Vitess MySQL source): the number of CONCURRENT FTWRL-coordinated pinned-snapshot reader connections the cold-copy opens (ADR-0101). 0 (default) = unset — fall back to the source DSN's copy_table_parallelism param, then to the engine default (1 = serial single-snapshot). An explicit value here WINS over the DSN param. The DSN form keeps working verbatim. 1 = serial. Inert on PG / VStream sources." default:"0" placeholder:"N"`
 
 	RawCopyFormat string `help:"FAST cold-start (ADR-0079, same-engine PG→PG) only: wire format for the raw-copy passthrough fast lane (ADR-0078). 'text' (default) is cross-major safe; 'binary' is used only when source and target server majors match (downgrades to text loudly otherwise); 'auto' requests binary. The lane engages ONLY for a no-transform copy (no --redact / --type-override / --expr-override / --inject-shard-column). Inert on MySQL/VStream sources (serial cold-start)." default:"text" enum:"text,binary,auto" placeholder:"text|binary|auto"`
 
@@ -709,9 +739,13 @@ type SyncStartCmd struct {
 
 	ApplyConcurrency int `help:"MySQL or Postgres target (ADR-0104 / ADR-0105, item 23(c)/26): the key-hash apply LANE count W. The merged CDC change stream is fanned across W in-order apply lanes by primary-key hash (same key → same lane → applied in source order, so dependent INSERT→UPDATE→DELETE on a row never reorder), each lane committing CONCURRENTLY on a dedicated backend with its OWN AIMD batch-size controller. On a high-latency cross-region link a serial applier is RTT-bound and falls below the source write rate, causing the per-shard MinimizeSkew wedge; concurrent lanes lift aggregate apply throughput toward W× and keep both shards drained (live-validated ~4× on a 2-shard Vitess→PlanetScale-MySQL link). The resume position advances only to a source boundary durable across ALL lanes (exactly-once for keyed tables; keyless stays at-least-once). An in-lane abort that the target may transiently throw — a PlanetScale transaction-killer (MySQL) or a serialization/deadlock (Postgres) — is handled IN-LANE: the lane's controller shrinks and the batch is split-and-retried idempotently without restarting the stream. ADR-0106 (FAST BY DEFAULT): 0 (the default, unset) = auto:N — an adaptive, connection-budget-bounded lane count: Postgres min(4, slot-budget) via the same probe --max-target-connections drives, MySQL/PlanetScale a fixed conservative ceiling of 4 (no slot probe, --max-target-connections inert there). 1 = the explicit SERIAL opt-out (byte-identical to the pre-ADR-0106 default, for operators who want strictly serial apply). W>1 honored verbatim (you own your target's budget). The auto value matches the cold-copy axes' auto:4 so the whole pipeline fans out ~4-wide by default, bounded by the target. Keep --apply-batch-size at a sane value (the default is fine): an absurdly high ceiling can make the controller lag on an abort-heavy target (safe — no data loss — but slow). On Postgres this composes with (does not replace) the ADR-0092 statement pipelining used within each lane's transaction." default:"0" placeholder:"W"`
 
-	ApplyRetryAttempts    int           `help:"Maximum consecutive retriable apply failures the streamer absorbs before exiting. ADR-0038. 1 = no retry (exit on first transient — pre-v0.42.0 behaviour). 8 = default for managed-Vitess / Vitess-flavoured MySQL where tx-killer transients are routine. Counter resets when persisted CDC position advances between attempts; a streamer surviving for hours doesn't carry retry debt." default:"8" placeholder:"N"`
-	ApplyRetryBackoffBase time.Duration `help:"Base interval for the exponential backoff between retriable apply failures. ADR-0038. Doubles on each consecutive failure, capped at --apply-retry-backoff-cap. Only consulted when --apply-retry-attempts > 1." default:"100ms" placeholder:"DUR"`
-	ApplyRetryBackoffCap  time.Duration `help:"Upper bound on each per-attempt backoff interval. ADR-0038. Defaults to 30s. With 8 attempts and default base, the per-attempt sequence is: 100ms → 200ms → 400ms → 800ms → 1.6s → 3.2s → 6.4s → 12.8s, capped at the cap when it grows past." default:"30s" placeholder:"DUR"`
+	// ADR-0118 finding 2: cross-add backup's --retry-* spelling as an alias
+	// (identical concept + defaults, 8/100ms/30s). The primary shown in
+	// --help stays the sync-stream's --apply-retry-* name. Additive —
+	// no existing command line changes behaviour.
+	ApplyRetryAttempts    int           `aliases:"retry-attempts" help:"Maximum consecutive retriable apply failures the streamer absorbs before exiting. ADR-0038. 1 = no retry (exit on first transient — pre-v0.42.0 behaviour). 8 = default for managed-Vitess / Vitess-flavoured MySQL where tx-killer transients are routine. Counter resets when persisted CDC position advances between attempts; a streamer surviving for hours doesn't carry retry debt. Alias: --retry-attempts (the backup-stream spelling)." default:"8" placeholder:"N"`
+	ApplyRetryBackoffBase time.Duration `aliases:"retry-backoff-base" help:"Base interval for the exponential backoff between retriable apply failures. ADR-0038. Doubles on each consecutive failure, capped at --apply-retry-backoff-cap. Only consulted when --apply-retry-attempts > 1. Alias: --retry-backoff-base (the backup-stream spelling)." default:"100ms" placeholder:"DUR"`
+	ApplyRetryBackoffCap  time.Duration `aliases:"retry-backoff-cap" help:"Upper bound on each per-attempt backoff interval. ADR-0038. Defaults to 30s. With 8 attempts and default base, the per-attempt sequence is: 100ms → 200ms → 400ms → 800ms → 1.6s → 3.2s → 6.4s → 12.8s, capped at the cap when it grows past. Alias: --retry-backoff-cap (the backup-stream spelling)." default:"30s" placeholder:"DUR"`
 
 	MetricsListen string `help:"Bind a Prometheus-format /metrics endpoint at this address (e.g. ':9090' for all interfaces port 9090, '127.0.0.1:9090' for localhost only) for the duration of the stream. Off by default — opt-in. Companion to 'sluice sync health' (which is the cron-friendly one-shot probe shape). Useful for operators running Prometheus / Grafana / alertmanager." placeholder:"ADDR"`
 
@@ -723,11 +757,26 @@ type SyncStartCmd struct {
 	// sluice_target_* gauges). CONTROL-PLANE credential, distinct from the
 	// data-plane DSN. All-or-nothing: org without a complete token pair is a
 	// loud refusal. Unset ⇒ no provider wired ⇒ byte-identical default sync.
-	PlanetScaleOrg            string `help:"PlanetScale org slug; enables OPTIONAL target-health telemetry (CPU/mem/storage) from the PlanetScale metrics endpoint for proactive apply back-off + in-tool observability (ADR-0107). Opt-in; requires --planetscale-metrics-token-id and --planetscale-metrics-token. Control-plane only — distinct from the data-plane --target DSN. Off when unset (default sync unchanged)." placeholder:"ORG"`
-	PlanetScaleMetricsTokenID string `help:"PlanetScale service-token ID (granted the read_metrics_endpoints permission) for --planetscale-org target-health telemetry. Prefer the env var so the id never lands in shell history." env:"PLANETSCALE_METRICS_TOKEN_ID" placeholder:"ID"`
-	PlanetScaleMetricsToken   string `help:"PlanetScale service-token secret for --planetscale-org target-health telemetry. Set via the env var (never on the command line); masked in all logging." env:"PLANETSCALE_METRICS_TOKEN" placeholder:"SECRET"`
-	PlanetScaleMetricsBranch  string `help:"Target branch to filter telemetry series to (defaults to 'main'). Only consulted when --planetscale-org is set." placeholder:"BRANCH"`
-	PlanetScaleMetricsDB      string `help:"Target database name to filter PlanetScale telemetry SD to. Defaults to the --target DSN's database. Only consulted when --planetscale-org is set." placeholder:"DATABASE"`
+	PlanetScaleOrg            string `name:"planetscale-org" help:"PlanetScale org slug; enables OPTIONAL target-health telemetry (CPU/mem/storage) from the PlanetScale metrics endpoint for proactive apply back-off + in-tool observability (ADR-0107). Opt-in; requires --planetscale-metrics-token-id and --planetscale-metrics-token. Control-plane only — distinct from the data-plane --target DSN. Off when unset (default sync unchanged)." placeholder:"ORG"`
+	PlanetScaleMetricsTokenID string `name:"planetscale-metrics-token-id" help:"PlanetScale service-token ID (granted the read_metrics_endpoints permission) for --planetscale-org target-health telemetry. Prefer the env var so the id never lands in shell history." env:"PLANETSCALE_METRICS_TOKEN_ID" placeholder:"ID"`
+	PlanetScaleMetricsToken   string `name:"planetscale-metrics-token" help:"PlanetScale service-token secret for --planetscale-org target-health telemetry. Set via the env var (never on the command line); masked in all logging." env:"PLANETSCALE_METRICS_TOKEN" placeholder:"SECRET"`
+	PlanetScaleMetricsBranch  string `name:"planetscale-metrics-branch" help:"Target branch to filter telemetry series to (defaults to 'main'). Only consulted when --planetscale-org is set." placeholder:"BRANCH"`
+	PlanetScaleMetricsDB      string `name:"planetscale-metrics-db" help:"Target database name to filter PlanetScale telemetry SD to. Defaults to the --target DSN's database. Only consulted when --planetscale-org is set." placeholder:"DATABASE"`
+
+	SuppressTargetMetricsHistory bool `help:"Disable persisting polled PlanetScale target-health metrics to the sluice_target_metrics_history table on the target (ADR-0107 item 35). Only relevant when --planetscale-org telemetry is configured; recording is on by default then. The rolling history lets 'sluice diagnose' show the recent CPU/mem/storage/lag/conn trend without scripting the metrics API; the table is bounded (7-day retention, pruned). Recording is advisory and failure-isolated — it never affects the sync."`
+
+	// ADR-0107 item 36 — sync-scoped target-metrics threshold ALERTER. Opt-in,
+	// only active with --planetscale-org telemetry; advisory (never affects the
+	// sync); credential-gated (sink URLs via env); failure-isolated (a dead sink
+	// is logged-and-swallowed). A rule with threshold 0 is inert.
+	NotifyWebhook             string        `help:"Generic webhook URL to POST target-metrics threshold alerts to as JSON (ADR-0107 item 36). Opt-in; only active with --planetscale-org telemetry AND at least one --notify-*-util/--notify-lag-seconds/--notify-storage-growth-per-min threshold set. ADVISORY — never affects the sync; a dead sink is logged-and-swallowed. A credential (set via the env var, not the command line)." env:"SLUICE_NOTIFY_WEBHOOK" placeholder:"URL"`
+	NotifySlack               string        `help:"Slack incoming-webhook URL to POST target-metrics threshold alerts to (ADR-0107 item 36). Same gating + advisory + failure-isolated semantics as --notify-webhook. A credential (set via the env var)." env:"SLUICE_NOTIFY_SLACK" placeholder:"URL"`
+	NotifyStorageUtil         float64       `help:"Alert when the target's storage utilisation (used/capacity, 0-1) is at or above this fraction (ADR-0107 item 36). 0 (default) disables the rule. Edge-triggered + cooldown'd. Requires --planetscale-org telemetry + a --notify-webhook/--notify-slack sink." placeholder:"FRAC"`
+	NotifyCPUUtil             float64       `help:"Alert when the target's CPU utilisation (0-1) is at or above this fraction (ADR-0107 item 36). 0 disables. Same gating as --notify-storage-util." placeholder:"FRAC"`
+	NotifyMemUtil             float64       `help:"Alert when the target's memory utilisation (0-1) is at or above this fraction (ADR-0107 item 36). 0 disables. Same gating as --notify-storage-util." placeholder:"FRAC"`
+	NotifyLagSeconds          float64       `help:"Alert when the target's replica lag (seconds) is at or above this value (ADR-0107 item 36). 0 disables. Same gating as --notify-storage-util." placeholder:"SECONDS"`
+	NotifyStorageGrowthPerMin float64       `help:"Alert when the target's storage utilisation is CLIMBING at or above this fraction-of-capacity per minute (ADR-0107 item 36) — a pre-grow early warning. e.g. 0.02 = +2%/min. 0 disables. Same gating as --notify-storage-util." placeholder:"FRAC_PER_MIN"`
+	NotifyCooldown            time.Duration `help:"Minimum interval between re-fires of a STILL-breached target-metrics alert (ADR-0107 item 36). A sustained breach reminds at most once per this interval rather than every poll. Default 15m." default:"15m" placeholder:"DUR"`
 
 	HeartbeatInterval time.Duration `help:"Wall-clock cadence the per-stream heartbeat goroutine logs an INFO 'stream: heartbeat' line at. GitHub #23 Phase A: distinguishes silent-stall (process alive but no apply, no log) from wedge (process alive, no heartbeat either). 0 disables." default:"60s" placeholder:"DUR"`
 
@@ -839,10 +888,40 @@ func resolveApplyBatchSize(raw string, target ir.Engine) (int, error) {
 //
 // The token NEVER appears in any error or log line emitted here — only the
 // org/database/branch identifiers, which are not secret.
+// telemetryParams is the engine-neutral input to [buildTargetTelemetryProvider],
+// gathered from a subcommand's --planetscale-* flags + the target DSN/driver.
+// Sharing it lets both `sync start` and `diagnose` construct the same provider
+// without duplicating the opt-in / all-or-nothing validation.
+type telemetryParams struct {
+	org       string
+	tokenID   string
+	token     string
+	metricsDB string
+	branch    string
+	targetDSN string
+	engine    string // target engine registry name (selects the metric-name table)
+}
+
 func buildTargetTelemetry(ctx context.Context, s *SyncStartCmd) (*pstelemetry.Provider, error) {
-	if s.PlanetScaleOrg == "" {
+	return buildTargetTelemetryProvider(ctx, telemetryParams{
+		org:       s.PlanetScaleOrg,
+		tokenID:   s.PlanetScaleMetricsTokenID,
+		token:     s.PlanetScaleMetricsToken,
+		metricsDB: s.PlanetScaleMetricsDB,
+		branch:    s.PlanetScaleMetricsBranch,
+		targetDSN: s.Target,
+		engine:    s.TargetDriver,
+	})
+}
+
+// buildTargetTelemetryProvider constructs the optional PlanetScale telemetry
+// provider (ADR-0107) from the gathered params, or returns (nil, nil) when
+// telemetry is off (no --planetscale-org). Opt-in is all-or-nothing: an org
+// without a complete token pair is a loud refusal.
+func buildTargetTelemetryProvider(ctx context.Context, p telemetryParams) (*pstelemetry.Provider, error) {
+	if p.org == "" {
 		// Telemetry off (the default): no provider, no behaviour change.
-		if s.PlanetScaleMetricsTokenID != "" || s.PlanetScaleMetricsToken != "" {
+		if p.tokenID != "" || p.token != "" {
 			// Token supplied without --planetscale-org: nothing consumes it.
 			// Warn rather than refuse — the operator may have set the env var
 			// globally; refusing would block every non-PS sync on that shell.
@@ -851,15 +930,15 @@ func buildTargetTelemetry(ctx context.Context, s *SyncStartCmd) (*pstelemetry.Pr
 		}
 		return nil, nil //nolint:nilnil // (nil, nil) == "telemetry off", a valid no-op result distinct from an error
 	}
-	if s.PlanetScaleMetricsTokenID == "" || s.PlanetScaleMetricsToken == "" {
+	if p.tokenID == "" || p.token == "" {
 		return nil, errors.New(
 			"--planetscale-org is set but the metrics service token is incomplete: supply BOTH --planetscale-metrics-token-id and --planetscale-metrics-token (env PLANETSCALE_METRICS_TOKEN_ID / PLANETSCALE_METRICS_TOKEN). Telemetry is opt-in and all-or-nothing — it never half-runs",
 		)
 	}
 
-	database := s.PlanetScaleMetricsDB
+	database := p.metricsDB
 	if database == "" {
-		database = databaseFromDSN(s.Target)
+		database = databaseFromDSN(p.targetDSN)
 	}
 	if database == "" {
 		return nil, errors.New(
@@ -868,11 +947,17 @@ func buildTargetTelemetry(ctx context.Context, s *SyncStartCmd) (*pstelemetry.Pr
 	}
 
 	provider, err := pstelemetry.New(ctx, pstelemetry.Config{
-		Org:      s.PlanetScaleOrg,
-		TokenID:  s.PlanetScaleMetricsTokenID,
-		Token:    s.PlanetScaleMetricsToken,
+		Org:      p.org,
+		TokenID:  p.tokenID,
+		Token:    p.token,
 		Database: database,
-		Branch:   s.PlanetScaleMetricsBranch,
+		Branch:   p.branch,
+		// Engine selects the per-engine metric-name table (ADR-0107 Phase 3):
+		// a Postgres target reads `planetscale_volume_*` / `planetscale_postgres_*`
+		// rather than the Vitess `vttablet_*` names. The raw driver name is the
+		// registry key ("mysql"/"planetscale"/"vitess"/"postgres"/…); the
+		// provider maps it.
+		Engine: p.engine,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("--planetscale-org telemetry: %w", err)
@@ -880,9 +965,9 @@ func buildTargetTelemetry(ctx context.Context, s *SyncStartCmd) (*pstelemetry.Pr
 	slog.InfoContext(
 		ctx,
 		"PlanetScale target-health telemetry enabled (ADR-0107) — advisory only; apply correctness is unaffected",
-		slog.String("org", s.PlanetScaleOrg),
+		slog.String("org", p.org),
 		slog.String("database", database),
-		slog.String("branch", branchOrMainLabel(s.PlanetScaleMetricsBranch)),
+		slog.String("branch", branchOrMainLabel(p.branch)),
 	)
 	return provider, nil
 }
@@ -1065,6 +1150,21 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 	if err != nil {
 		return fmt.Errorf("--target-driver: %w", err)
 	}
+
+	// ADR-0118 finding 1(b): the FAST-cold-start parallelism flags are inert
+	// on a MySQL/VStream source (serial cold-start). If the operator set one
+	// EXPLICITLY against such a source, turn the silent no-op into a one-time
+	// loud WARN (detection is by the literal argv spelling, not the resolved
+	// value — see warnInertParallelismFlags).
+	warnInertParallelismFlags(kongContext(), source)
+
+	// ADR-0118 finding 4: thread the explicit read-axis CLI flags into the
+	// mysql engine at the composition root (the same idiom as
+	// --mysql-sql-mode / --zero-date). A value > 0 wins over the source DSN's
+	// vstream_copy_table_parallelism / copy_table_parallelism param; 0 (the
+	// default) leaves the DSN-then-default behaviour byte-identical.
+	mysql.SetVStreamCopyTableParallelismOverride(s.VStreamCopyTableParallelism)
+	mysql.SetNativeCopyTableParallelismOverride(s.CopyTableParallelism)
 
 	if len(s.IncludeTable) > 0 && len(s.ExcludeTable) > 0 {
 		return errors.New("--include-table and --exclude-table are mutually exclusive")
@@ -1261,13 +1361,27 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		ApplyRetryBackoffBase:                   s.ApplyRetryBackoffBase,
 		ApplyRetryBackoffCap:                    s.ApplyRetryBackoffCap,
 		MetricsListen:                           s.MetricsListen,
+		BuildVersion:                            version,
+		BuildCommit:                             commit,
 		// ADR-0107: nil unless the operator opted into PlanetScale telemetry.
 		// telemetryProviderOrNil returns a TRUE nil interface when off, so the
 		// streamer's `TargetTelemetry != nil` guards stay exact (no typed-nil
 		// trap from assigning a nil *Provider straight into the interface).
-		TargetTelemetry:   telemetryProviderOrNil(telemetryProvider),
-		HeartbeatInterval: s.HeartbeatInterval,
-		PollInterval:      s.PollInterval,
+		TargetTelemetry: telemetryProviderOrNil(telemetryProvider),
+		// ADR-0107 item 35: opt-out (zero value = record when telemetry wired).
+		SuppressTargetMetricsHistory: s.SuppressTargetMetricsHistory,
+		// ADR-0107 item 36: sync-scoped threshold alerter (opt-in; inert unless
+		// a sink URL + a threshold are set AND telemetry is wired).
+		NotifyWebhookURL:          s.NotifyWebhook,
+		NotifySlackWebhookURL:     s.NotifySlack,
+		NotifyStorageUtil:         s.NotifyStorageUtil,
+		NotifyCPUUtil:             s.NotifyCPUUtil,
+		NotifyMemUtil:             s.NotifyMemUtil,
+		NotifyLagSeconds:          s.NotifyLagSeconds,
+		NotifyStorageGrowthPerMin: s.NotifyStorageGrowthPerMin,
+		NotifyCooldown:            s.NotifyCooldown,
+		HeartbeatInterval:         s.HeartbeatInterval,
+		PollInterval:              s.PollInterval,
 
 		SourceHeartbeatInterval:    s.SourceHeartbeatInterval,
 		SourceHeartbeatPruneWindow: s.SourceHeartbeatPruneWindow,

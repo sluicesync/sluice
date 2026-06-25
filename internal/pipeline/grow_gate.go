@@ -313,7 +313,13 @@ func (g *growGate) runOwner(reopenCh, extend chan struct{}) {
 		default:
 		}
 
-		// RECOVERED (proactive only): reopen as soon as headroom is back.
+		// EARLY REOPEN (telemetry, when present): if a fresh sample shows the
+		// storage headroom genuinely recovered, reopen before the quiet cycle
+		// would. This is an ACCELERATOR, not the sole reopen path — it must not
+		// be relied on, because the volume_* gauges swing wildly and transiently
+		// DISAPPEAR across a reparent (v0.99.104 v14 live: capacity 62GB@85.9%
+		// → 1.66TB@~0% mid-reparent, series absent), so recovered() often can't
+		// confirm "grow finished" exactly when it matters.
 		if g.recovered != nil && g.recovered() {
 			g.finishWindow(reopenCh, "storage headroom recovered")
 			return
@@ -325,13 +331,28 @@ func (g *growGate) runOwner(reopenCh, extend chan struct{}) {
 			return
 		}
 
-		// A proactive pause holds until recovered/max-hold regardless of
-		// re-trips; a signal-driven pause ends as soon as a cycle is QUIET.
-		if g.recovered == nil && !retripped {
-			g.finishWindow(reopenCh, "transient cleared — lanes resume and probe")
+		// QUIET CYCLE (the primary reopen, ALWAYS applied — telemetry or not):
+		// a backoff cycle elapsed with no re-trip, so the transient burst (or an
+		// anticipated grow that hasn't actually faulted yet) is over for now.
+		// Reopen so the lanes resume and PROBE; if the target is still bad the
+		// next transient re-trips a FRESH window (the exponential backoff grows
+		// across windows). This applies to BOTH signal-driven and proactive
+		// (telemetry) trips: a proactive trip is a BRIEF anticipatory pause that
+		// hands off to this reactive cycling — NOT a hold for the whole grow.
+		//
+		// v0.99.104 v14 live proved the old "proactive holds until
+		// recovered()/max-hold" rode a flat ~20-min max-hold on every reparent
+		// (zero progress) because recovered() is defeated by the mid-reparent
+		// metric instability above — strictly worse than the reactive cycling
+		// (which makes incremental progress every ~30s window). Cycling-always
+		// matches the proven reactive behaviour; recovered() above only reopens
+		// EARLIER when the signal is trustworthy; max-hold stays the backstop.
+		if !retripped {
+			g.finishWindow(reopenCh, "quiet cycle — lanes resume and probe")
 			return
 		}
-		// Otherwise: keep holding for the next (longer) cycle.
+		// Otherwise (re-tripped this cycle): keep holding for the next (longer)
+		// cycle, bounded by max-hold.
 	}
 }
 

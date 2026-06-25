@@ -627,3 +627,96 @@ func fileNames(files map[string][]byte) []string {
 	}
 	return out
 }
+
+// fakeTelemetry is a minimal scriptable ir.TargetTelemetry for the
+// target-health section test (ADR-0107 Phase 3(b)).
+type fakeTelemetry struct {
+	snap ir.TargetHealthSnapshot
+	ok   bool
+}
+
+func (f fakeTelemetry) Sample(context.Context) (ir.TargetHealthSnapshot, bool) {
+	return f.snap, f.ok
+}
+
+// TestBundle_TargetHealth_Section pins the ADR-0107 Phase 3(b) target-health
+// section across its three honest states: no provider → reason file; provider
+// with no fresh sample → {"fresh": false}; a fresh sample → the *Known-gated
+// snapshot (an unobserved metric omitted, never reported as 0/idle).
+func TestBundle_TargetHealth_Section(t *testing.T) {
+	base, full := newFakeTarget("stream-1")
+	target := &fakeEngineFull{fakeEngine: base, full: full}
+
+	write := func(t *testing.T, prov ir.TargetTelemetry) map[string][]byte {
+		t.Helper()
+		var buf bytes.Buffer
+		if err := Write(context.Background(), &buf, Request{
+			StreamID:        "stream-1",
+			PrivacyLevel:    PrivacyStandard,
+			TargetEngine:    target,
+			TargetDSN:       "postgres://u:p@h:5432/db",
+			TargetTelemetry: prov,
+			Now:             time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC),
+		}); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		return readBundle(t, &buf)
+	}
+
+	t.Run("no provider → reason", func(t *testing.T) {
+		files := write(t, nil)
+		if _, ok := files["health/target_health.json"]; ok {
+			t.Error("expected reason file, got a JSON snapshot with no provider")
+		}
+		if _, ok := files["health/target_health.json/__skipped.txt"]; !ok {
+			t.Errorf("missing target-health reason file; have %v", fileNames(files))
+		}
+	})
+
+	t.Run("no fresh sample → fresh:false", func(t *testing.T) {
+		files := write(t, fakeTelemetry{ok: false})
+		b, ok := files["health/target_health.json"]
+		if !ok {
+			t.Fatalf("missing target_health.json; have %v", fileNames(files))
+		}
+		var out map[string]any
+		if err := json.Unmarshal(b, &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if out["fresh"] != false {
+			t.Errorf("fresh = %v, want false", out["fresh"])
+		}
+	})
+
+	t.Run("fresh sample → known-gated fields", func(t *testing.T) {
+		files := write(t, fakeTelemetry{ok: true, snap: ir.TargetHealthSnapshot{
+			SampledAt:            time.Date(2026, 6, 22, 11, 59, 0, 0, time.UTC),
+			CPUUtil:              0.62,
+			CPUKnown:             true,
+			StorageUtil:          0.80,
+			StorageCapacityBytes: 160 << 30,
+			StorageKnown:         true,
+			// Mem / lag / conns intentionally UNKNOWN — must be omitted.
+		}})
+		b := files["health/target_health.json"]
+		var out map[string]any
+		if err := json.Unmarshal(b, &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if out["fresh"] != true {
+			t.Errorf("fresh = %v, want true", out["fresh"])
+		}
+		if out["cpu_util"] != 0.62 {
+			t.Errorf("cpu_util = %v, want 0.62", out["cpu_util"])
+		}
+		if out["storage_util"] != 0.80 {
+			t.Errorf("storage_util = %v, want 0.80", out["storage_util"])
+		}
+		// Unobserved metrics must be ABSENT, not present-as-zero.
+		for _, k := range []string{"mem_util", "replica_lag_seconds", "active_connections"} {
+			if _, present := out[k]; present {
+				t.Errorf("unobserved metric %q present in output; honesty contract requires omission", k)
+			}
+		}
+	})
+}

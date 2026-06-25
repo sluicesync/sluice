@@ -80,6 +80,7 @@ func classifyApplierError(err error) error {
 	// connection blocked the apply goroutine indefinitely.
 	if errors.Is(err, driver.ErrBadConn) ||
 		errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
 		errors.Is(err, context.DeadlineExceeded) {
 		return &retriablePGError{err: err}
 	}
@@ -91,6 +92,26 @@ func classifyApplierError(err error) error {
 		switch pgErr.Code {
 		case "40001", "40P01",
 			"57P01", "57P02", "57P03":
+			return &retriablePGError{err: err}
+		case "53100", "53000", "53200":
+			// Class 53 — insufficient_resources (roadmap item 38). On a
+			// cold-copy COPY into a PlanetScale-class PG target whose volume
+			// auto-grows under the streaming write, a 53100 disk_full ("could
+			// not extend file … No space left on device") surfaces mid-COPY
+			// while the volume grows ahead of the write. Classifying the class
+			// as retriable lets the cold-copy grow-gate / chunked-COPY retry
+			// (copyChunkWithRetry) ride the grow window and replay the chunk
+			// once headroom returns, instead of a terminal exit →
+			// supervisor crash-loop (live finding #94). 53000
+			// (insufficient_resources, the class root) and 53200
+			// (out_of_memory) share the transient grow/back-pressure shape —
+			// a momentary resource squeeze that clears. NOT over-matched:
+			// 53300 (too_many_connections) and 53400
+			// (configuration_limit_exceeded) are deliberately EXCLUDED —
+			// those are config/operator faults that do not self-heal by
+			// retrying. The retry budget is wall-clock bounded and loud on
+			// genuine exhaustion (a target truly out of disk surfaces after
+			// ~30 min, never silently).
 			return &retriablePGError{err: err}
 		case "42703", "42P01":
 			// Schema drift (Bug F8): 42703 undefined_column / 42P01
@@ -110,6 +131,25 @@ func classifyApplierError(err error) error {
 			// Explicit non-retriable per ADR-0038 — fall through
 			// to the bare return.
 		}
+		// PlanetScale Postgres serving-transition READ-ONLY window. During a
+		// non-Metal storage auto-grow the PG cluster is briefly promoted
+		// read-only while the new primary takes over, and an in-flight
+		// cold-copy chunk COPY / apply fails with `pg_readonly: invalid
+		// statement because cluster is read-only` (SQLSTATE XX000). This is the
+		// PG twin of the MySQL `Error 1290 --read-only` reparent face
+		// (v0.99.101): it clears once the new primary serves read-write, so it
+		// joins the bounded-retry grow class and lets the grow-gate /
+		// chunked-COPY retry ride the reparent. Matched on the MESSAGE, NOT the
+		// bare code: XX000 (internal_error) is a generic catch-all, so a
+		// non-read-only XX000 stays terminal (no over-match) — only the
+		// read-only wording is retriable. Live finding (item 38 PG cold-copy
+		// re-validation, 2026-06-23).
+		if pgErr.Code == "XX000" {
+			m := strings.ToLower(pgErr.Message)
+			if strings.Contains(m, "cluster is read-only") || strings.Contains(m, "pg_readonly") {
+				return &retriablePGError{err: err}
+			}
+		}
 		// Class 08: connection_exception. Includes 08000, 08003,
 		// 08006, 08007, 08P01. All are network / connection-state
 		// transients.
@@ -126,6 +166,15 @@ func classifyApplierError(err error) error {
 			strings.Contains(msg, "connection refused"),
 			strings.Contains(msg, "broken pipe"),
 			strings.Contains(msg, "i/o timeout"),
+			// "unexpected EOF" — the server severed the connection mid-stream
+			// (e.g. a PlanetScale reparent dropping the in-flight cold-copy
+			// COPY connection: live finding, item 38 re-validation 2026-06-23).
+			// pgx surfaces this as a plain string error (not always wrapping the
+			// io.ErrUnexpectedEOF sentinel caught above), so match the message
+			// too. A transient connection severance; the cold-copy chunk retry /
+			// CDC reconnect rides it, bounded + loud on genuine exhaustion.
+			strings.Contains(msg, "unexpected EOF"),
+			strings.Contains(msg, "use of closed network connection"),
 			strings.Contains(msg, "the database system is starting up"),
 			strings.Contains(msg, "the database system is shutting down"):
 			return &retriablePGError{err: err}

@@ -831,6 +831,55 @@ func pgIndexName(tableName, sourceName string) string {
 	return full
 }
 
+// validatePGIndexName refuses an effective PG index identifier that
+// exceeds PostgreSQL's 63-byte NAMEDATALEN-1 ceiling (roadmap item 43,
+// the `pgIndexName` >63-byte latent silent-collapse class flagged in the
+// Bug #114 RCA).
+//
+// Why this is a value-fidelity issue: PG silently TRUNCATES any
+// identifier longer than 63 BYTES at CREATE time. Two distinct indexes
+// whose names share the same first 63 bytes both truncate to the same
+// catalog identifier — and because sluice emits `CREATE INDEX IF NOT
+// EXISTS` ([SchemaWriter.buildOneIndex]), the second create silently
+// no-ops. Result: an index the source declared is silently MISSING on
+// the target. No error, no row-data loss, but a missing index is a
+// silent schema-fidelity loss. Per the "contain Postgres complexity,
+// surface explicitly" tenet the safe behaviour is to fail loudly here
+// rather than auto-truncate or auto-rename (either would silently
+// transform the operator's schema).
+//
+// The limit is BYTES, not runes: PG counts bytes against NAMEDATALEN, so
+// a multibyte UTF-8 name whose rune count is <=63 but whose byte length
+// is >63 still truncates. Go's len() on a string is the byte count, so
+// the check is byte-correct as written.
+//
+// effectiveName is the identifier pgIndexName resolved (either the
+// table-prefixed form or a verbatim source name); sourceName and
+// tableName are carried only for an actionable error message. Names
+// <=63 bytes pass through unchanged (no behaviour change).
+//
+// Note on same-prefix collisions among <=63-byte names: two index names
+// that both already fit 63 bytes cannot share a 63-byte truncation
+// prefix unless they are byte-identical for their full length — in which
+// case they are the SAME catalog identifier and the IR carries one, not
+// two (index names are unique per table on every source engine sluice
+// reads). The only way two DISTINCT indexes collide on a 63-byte prefix
+// is if at least one exceeds 63 bytes, which this refusal already
+// catches. So the >63-byte refusal is sufficient to close the collision
+// class; no separate same-prefix check is needed.
+func validatePGIndexName(effectiveName, sourceName, tableName string) error {
+	if len(effectiveName) <= maxPGIdentifierLen {
+		return nil
+	}
+	return fmt.Errorf(
+		"postgres: index name %q on table %q is %d bytes, exceeding PostgreSQL's %d-byte identifier limit; "+
+			"PostgreSQL would silently truncate it, risking a collision with another index that shares the "+
+			"same first %d bytes (the second CREATE INDEX IF NOT EXISTS would silently no-op, leaving the "+
+			"index missing) — shorten or alias the source index name (source name: %q) to %d bytes or fewer",
+		effectiveName, tableName, len(effectiveName), maxPGIdentifierLen, maxPGIdentifierLen, sourceName, maxPGIdentifierLen,
+	)
+}
+
 // emitCreateDomainType produces a CREATE DOMAIN statement for a single
 // DOMAIN. Bug 113 round-trip carry (v0.95.2). Emits the schema-
 // qualified DOMAIN name + the base type's DDL spelling + one CHECK
@@ -1038,9 +1087,16 @@ func emitTableDef(schema string, table *ir.Table, opts emitOpts) (string, error)
 	// it isn't re-created as a duplicate. nil when a PK exists or no
 	// non-null UNIQUE qualifies.
 	if idx := inlineUniqueKeyForCopy(table); idx != nil {
+		name := pgIndexName(table.Name, idx.Name)
+		// Roadmap item 43: the inline unique-key constraint name lands
+		// in the same 63-byte-limited PG identifier namespace as a
+		// CREATE INDEX name, so refuse a >63-byte name here too.
+		if err := validatePGIndexName(name, idx.Name, table.Name); err != nil {
+			return "", err
+		}
 		parts = append(parts, fmt.Sprintf(
 			"CONSTRAINT %s UNIQUE %s",
-			quoteIdent(pgIndexName(table.Name, idx.Name)),
+			quoteIdent(name),
 			emitIndexColumnList(idx.Columns, opts),
 		))
 	}
@@ -1177,7 +1233,15 @@ func emitCreateIndex(schema, tableName string, idx *ir.Index, opts emitOpts) (st
 		// `film_actor` would collide on the PG target. Prefixing
 		// with the table name disambiguates without losing the
 		// human-readable original.
-		sb.WriteString(quoteIdent(pgIndexName(tableName, idx.Name)))
+		name := pgIndexName(tableName, idx.Name)
+		// Roadmap item 43: refuse a >63-byte effective name loudly
+		// rather than let PG silently truncate it into a collision
+		// (the IF NOT EXISTS second-create silent no-op → missing
+		// index, a silent schema-fidelity loss).
+		if err := validatePGIndexName(name, idx.Name, tableName); err != nil {
+			return "", err
+		}
+		sb.WriteString(quoteIdent(name))
 		sb.WriteByte(' ')
 	}
 	sb.WriteString("ON ")

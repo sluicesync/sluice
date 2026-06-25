@@ -40,6 +40,13 @@ type Config struct {
 	Database string // target database to filter SD by (from the target DSN)
 	Branch   string // target branch; defaults to "main" when empty
 
+	// Engine is the target engine registry name ("mysql", "planetscale",
+	// "postgres", …). It selects the per-engine metric-name table
+	// ([metricNamesFor]) so a Postgres target reads `planetscale_volume_*` /
+	// `planetscale_postgres_*` rather than the Vitess `vttablet_*` names. Empty
+	// or any non-Postgres name ⇒ the MySQL/Vitess table (the default surface).
+	Engine string
+
 	// PollInterval is the background poll cadence; clamped to
 	// [minPollInterval, maxPollInterval]. 0 ⇒ defaultPollInterval.
 	PollInterval time.Duration
@@ -77,6 +84,7 @@ type Provider struct {
 	client    *client
 	database  string
 	branch    string
+	names     metricNames
 	interval  time.Duration
 	freshness time.Duration
 	now       func() time.Time
@@ -160,6 +168,7 @@ func New(ctx context.Context, cfg Config) (*Provider, error) {
 		},
 		database:  cfg.Database,
 		branch:    branch,
+		names:     metricNamesFor(cfg.Engine),
 		interval:  interval,
 		freshness: freshness,
 		now:       now,
@@ -232,7 +241,7 @@ func (p *Provider) pollOnce(ctx context.Context) {
 		p.warnPoll(ctx, err)
 		return
 	}
-	snap := distill(parsePromText(strings.NewReader(text)), p.now())
+	snap := distill(parsePromText(strings.NewReader(text)), p.names, p.now())
 	p.mu.Lock()
 	p.cached = snap
 	p.haveOK = true

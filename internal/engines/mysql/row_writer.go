@@ -96,6 +96,19 @@ type RowWriter struct {
 	// the pipeline doesn't wire (serial copy, tests, the non-cold-copy
 	// apply path). Implements [ir.GrowGateSetter].
 	growGate ir.GrowGate
+
+	// reparentObserver, when non-nil, is called with the table name the
+	// FIRST time a flush on that table hits a classified grow/reparent
+	// transient (the same point growGate is tripped). The restore wires it
+	// (ADR-0113) so its reconciliation phase knows which tables a target's
+	// reparent may have silently under-copied — PlanetScale's grow-reparent
+	// can drop committed-but-unreplicated rows the reactive grow-gate cannot
+	// recover. nil ⇒ no tracking (the default on every non-restore path).
+	// Implements [ir.ReparentObserverSetter]. Guarded by reparentOnce so a
+	// table is reported at most once per writer regardless of how many of
+	// its batches hit the transient.
+	reparentObserver func(table string)
+	reparentSeen     sync.Map
 }
 
 // SetGrowGate implements [ir.GrowGateSetter] (ADR-0110). The pipeline
@@ -106,6 +119,27 @@ type RowWriter struct {
 // authoritative floor either way.
 func (w *RowWriter) SetGrowGate(gate ir.GrowGate) {
 	w.growGate = gate
+}
+
+// SetReparentObserver implements [ir.ReparentObserverSetter] (ADR-0113).
+// The restore wires one run-shared observer onto every writer it opens, so
+// the reconciliation phase can re-derive any reparent-touched table from
+// its chunks. A nil observer disables tracking (every non-restore path).
+func (w *RowWriter) SetReparentObserver(observe func(table string)) {
+	w.reparentObserver = observe
+}
+
+// notifyReparent reports table to the wired reparent observer at most once
+// per writer per table (the sync.Map dedup). No-op when no observer is
+// wired. Called from flushWithReparentRetry at the grow-gate trip point.
+func (w *RowWriter) notifyReparent(table string) {
+	if w.reparentObserver == nil {
+		return
+	}
+	if _, seen := w.reparentSeen.LoadOrStore(table, struct{}{}); seen {
+		return
+	}
+	w.reparentObserver(table)
 }
 
 // SetCopyDurableProgress implements [ir.CopyDurableProgressReporter]
