@@ -58,7 +58,7 @@ sluice backup full \
     --source-driver postgres \
     --source ... \
     --output-dir /var/backups/myapp \
-    --encrypt --encrypt-kek-mode=kms --encrypt-kek-ref='arn:aws:kms:us-east-1:...:key/...'
+    --encrypt --kms-key-arn='arn:aws:kms:us-east-1:...:key/...'
 ```
 
 The chain root records the KMS key ARN; sluice calls `Encrypt` /
@@ -95,7 +95,7 @@ sluice backup stream run \
     --output-dir /var/backups/myapp \
     --encrypt --encryption-passphrase 'pick-a-real-passphrase' \
     --retain-rotate-at-chain-length 50 \
-    --retain-rotate-on-age 24h \
+    --retain-rotate-at 24h \
     --rollover-window 5m
 ```
 
@@ -106,7 +106,7 @@ control segment cadence:
 
 - `--retain-rotate-at-chain-length 50` — rotate into a new segment
   after 50 incrementals.
-- `--retain-rotate-on-age 24h` — also rotate every 24 hours.
+- `--retain-rotate-at 24h` — also rotate every 24 hours.
 - `--rollover-window 5m` — group changes within a 5-minute window
   into a single incremental.
 
