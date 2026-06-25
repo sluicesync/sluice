@@ -113,7 +113,7 @@ jobs:
     # comfortably inside the same budget.
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # GHCR_TOKEN is the GITHUB_TOKEN piped through to the script
       # (the script accepts GHCR_TOKEN or GITHUB_TOKEN). GHCR_USER is
