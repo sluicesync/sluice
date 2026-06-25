@@ -4,6 +4,10 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Added
+
+- **`--vstream-relax-skew` (opt-in, default off): relax vtgate's `MinimizeSkew` on the steady-state multi-shard VStream CDC stream so both shards stream and drain concurrently during an apply-deficit backlog (ADR-0120, roadmap item 27).** On a multi-shard Vitess/PlanetScale source, the CDC stream is opened with `MinimizeSkew=true`, so vtgate holds the *ahead* shard's delivery back to keep the merged stream commit-time ordered. During a backlog drain that becomes a throughput cap — the ahead shard is frozen (live-seen for many minutes) until the behind shard fully catches up. This flag flips the steady-state CDC request to `MinimizeSkew=false` so both shards drain concurrently. It is correctness-safe under range-sharding: a given `(table, PK)` lives in exactly one shard, the concurrent key-hash apply lanes serialize same-key changes within a shard, and `StopOnReshard=true` closes the only window where a key could transiently span two shards — so cross-shard commit-time ordering buys nothing (a consumer audit confirmed every multi-shard consumer — position orderer, lane apply, frontier checkpoint, snapshot stitch, stall watchdog, resume — is already per-shard-independent). The flag is **opt-in-named**, so the Go zero value leaves `MinimizeSkew` on (today's proven behavior) for every non-CLI caller, and the source DSN form `vstream_relax_skew=true` also works (the explicit flag wins). When relaxed, the per-shard stall WARN drops the now-impossible "MinimizeSkew catch-up hold" cause so it points only at a genuine stall. Inert on PostgreSQL / native-MySQL sources and on a single-shard keyspace. **Default-off, no behavior change on upgrade**; flipping the default is gated on a live both-shard-drain A/B.
+
 ## [0.99.128] - 2026-06-25
 
 ### Added

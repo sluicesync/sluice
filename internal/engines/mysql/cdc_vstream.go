@@ -106,6 +106,14 @@ type vstreamCDCReader struct {
 	// vstream_tablet_type=primary or the stream wedges (ADR-0073 (b2)).
 	tabletType topodata.TabletType
 
+	// relaxSkew, when true, opens the steady-state CDC VStream request with
+	// MinimizeSkew=false so vtgate delivers both shards concurrently instead of
+	// holding the ahead shard back for commit-time ordering (ADR-0120, roadmap
+	// item 27). From --vstream-relax-skew / the vstream_relax_skew DSN param;
+	// default false = MinimizeSkew on (today's behaviour). Correctness-safe under
+	// range-sharding — no consumer depends on cross-shard commit ordering.
+	relaxSkew bool
+
 	// livenessWindow is the Phase-1 watchdog window: how long the pump
 	// waits for the FIRST NON-HEARTBEAT (serving-proof) event before
 	// failing LOUDLY rather than hanging silently (the no-REPLICA-tablet
@@ -366,6 +374,7 @@ func openVStreamReader(ctx context.Context, dsn string, flavor Flavor) (ir.CDCRe
 		cfg:                  cfg,
 		shards:               shards,
 		tabletType:           tabletType,
+		relaxSkew:            vstreamRelaxSkewFromDSN(cfg),
 		livenessWindow:       livenessWindow,
 		progressWindow:       progressWindow,
 		idleWarnWindow:       idleWarnWindow,
@@ -891,7 +900,13 @@ func (r *vstreamCDCReader) buildVStreamRequest(start []shardGtid) (*vtgate.VStre
 			{Match: "/.*/"},
 		}},
 		Flags: &vtgate.VStreamFlags{
-			MinimizeSkew:      true,
+			// MinimizeSkew holds the ahead shard back to keep the merged
+			// multi-shard stream commit-time ordered. ADR-0120: --vstream-relax-skew
+			// flips it off so both shards stream + drain concurrently during an
+			// apply-deficit backlog (correctness-safe under range-sharding — the
+			// per-shard-independent consumer audit). Default (relaxSkew false) keeps
+			// MinimizeSkew=true, byte-identical to pre-ADR-0120.
+			MinimizeSkew:      !r.relaxSkew,
 			StopOnReshard:     true,
 			HeartbeatInterval: 5,
 		},
@@ -955,7 +970,7 @@ func (r *vstreamCDCReader) pump(
 	// per-shard advancement diff (cleared on exit).
 	r.shardProgress = startShardProgressWatchdog(ctx, r.shardStallWarnWindow, r.shards,
 		func(shard string) {
-			slog.WarnContext(ctx, vstreamShardStallWarnMessage(r.shardStallWarnWindow, r.keyspace, shard))
+			slog.WarnContext(ctx, vstreamShardStallWarnMessage(r.shardStallWarnWindow, r.keyspace, shard, r.relaxSkew))
 		})
 	defer func() {
 		r.shardProgress.stop()

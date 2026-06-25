@@ -364,7 +364,24 @@ func gtidForShard(sgs []shardGtid, shard string) (string, bool) {
 //     this (ahead) shard's events back so the merged stream stays
 //     commit-time ordered while a BEHIND peer drains a backlog. This is
 //     expected during a legitimate catch-up and resolves itself.
-func vstreamShardStallWarnMessage(window time.Duration, keyspace, shard string) string {
+//
+// relaxSkew (ADR-0120) drops the MinimizeSkew-hold cause from the message: when
+// the stream was opened with MinimizeSkew=false (--vstream-relax-skew), vtgate is
+// NOT holding the ahead shard, so the only remaining cause is a genuine per-shard
+// stall — naming the non-existent hold would point the operator at the wrong
+// thing. The "S frozen while a peer advances" signature is then a more reliable
+// wedge indicator.
+func vstreamShardStallWarnMessage(window time.Duration, keyspace, shard string, relaxSkew bool) string {
+	if relaxSkew {
+		return fmt.Sprintf(
+			"mysql/vstream: shard %q of keyspace %q has not advanced for %s while a peer shard keeps advancing — "+
+				"a genuine per-shard source stall (source-tablet throttle, a large transaction, or a tablet issue; "+
+				"check `SHOW VITESS_THROTTLED_APPS` on shard %q's primary). MinimizeSkew is relaxed "+
+				"(--vstream-relax-skew), so this is not a skew catch-up hold "+
+				"(the stream stays connected and will catch up when the shard resumes)",
+			shard, keyspace, window, shard,
+		)
+	}
 	return fmt.Sprintf(
 		"mysql/vstream: shard %q of keyspace %q has not advanced for %s while a peer shard keeps advancing — "+
 			"either a genuine per-shard source stall (source-tablet throttle, a large transaction, or a tablet issue; "+

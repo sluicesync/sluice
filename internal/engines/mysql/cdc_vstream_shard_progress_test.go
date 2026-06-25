@@ -440,7 +440,7 @@ func TestStripVStreamParams_StripsShardStallWarn(t *testing.T) {
 // SHOW VITESS_THROTTLED_APPS, OR a normal MinimizeSkew catch-up hold), and
 // states the stream stays connected.
 func TestVStreamShardStallWarnMessage_Actionable(t *testing.T) {
-	msg := vstreamShardStallWarnMessage(60*time.Second, "main", "-80")
+	msg := vstreamShardStallWarnMessage(60*time.Second, "main", "-80", false)
 	for _, want := range []string{
 		`"-80"`, `"main"`, "has not advanced",
 		"SHOW VITESS_THROTTLED_APPS", "MinimizeSkew",
@@ -449,5 +449,26 @@ func TestVStreamShardStallWarnMessage_Actionable(t *testing.T) {
 		if !strings.Contains(msg, want) {
 			t.Errorf("shard-stall message missing %q: %v", want, msg)
 		}
+	}
+}
+
+// TestVStreamShardStallWarnMessage_RelaxSkewDropsHoldCause pins the ADR-0120
+// variant: with MinimizeSkew relaxed the message must NOT offer the (now
+// non-existent) skew-hold cause, so the operator isn't pointed at the wrong
+// thing — it still names the shard/keyspace and the genuine-stall remedy.
+func TestVStreamShardStallWarnMessage_RelaxSkewDropsHoldCause(t *testing.T) {
+	msg := vstreamShardStallWarnMessage(60*time.Second, "main", "-80", true)
+	for _, want := range []string{
+		`"-80"`, `"main"`, "has not advanced",
+		"SHOW VITESS_THROTTLED_APPS", "--vstream-relax-skew", "stays connected",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("relaxed shard-stall message missing %q: %v", want, msg)
+		}
+	}
+	// The skew-HOLD must not be OFFERED as a candidate cause (it cannot occur
+	// when skew is relaxed); the message may still state it is NOT a hold.
+	if strings.Contains(msg, "or a normal MinimizeSkew") {
+		t.Errorf("relaxed message should not offer a MinimizeSkew catch-up hold as a cause: %v", msg)
 	}
 }

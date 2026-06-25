@@ -444,7 +444,7 @@ So NOTIFY-kick is **demoted** — the poll isn't the bottleneck. Closing the rea
 
 ---
 
-### 27. Relax `MinimizeSkew` on the multi-shard VStream concurrent-apply path (remove the artificial per-shard catch-up cap) — *optional throughput optimization surfaced by the item-23 v0.99.81 RCA; CRITICAL ordering, design-gated*
+### 27. Relax `MinimizeSkew` on the multi-shard VStream concurrent-apply path (remove the artificial per-shard catch-up cap) — *optional throughput optimization surfaced by the item-23 v0.99.81 RCA; CRITICAL ordering, design-gated* — **ADR-0120 Proposed (2026-06-25); opt-in flag `--vstream-relax-skew` LANDED default-off (MinimizeSkew unchanged), consumer audit found NO cross-shard-ordering dependency. Remaining gate before flipping the default: a live A/B (both-shard backlog drain, skew on vs off) on a multi-shard Vitess source — runnable on the self-hosted `vitessreshard` 2-shard local cluster (no PlanetScale needed; it's a source-side vtgate flag), Vultr→PlanetScale optional for cross-region headline numbers.**
 
 **Why (item-23 Phase-A RCA, 2026-06-20).** The VStream request sets `MinimizeSkew=true` (`cdc_vstream.go:894`) so vtgate holds the ahead shard back to keep the merged stream commit-time ordered. Under an apply-deficit this is the benign-but-throughput-capping per-shard hold item 23 documents: the ahead shard's delivery is frozen until the behind shard fully drains (~hours for a large backlog), even when apply > source. Live-confirmed on v0.99.81: shard `80-` delivery frozen for many minutes while `-80` drained at ~123 GTID/s.
 

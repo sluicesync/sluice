@@ -729,6 +729,16 @@ type SyncStartCmd struct {
 
 	CopyTableParallelism int `name:"copy-table-parallelism" help:"Native-MySQL cold-copy READ axis (self-managed, non-Vitess MySQL source): the number of CONCURRENT FTWRL-coordinated pinned-snapshot reader connections the cold-copy opens (ADR-0101). 0 (default) = unset — fall back to the source DSN's copy_table_parallelism param, then to the engine default (1 = serial single-snapshot). An explicit value here WINS over the DSN param. The DSN form keeps working verbatim. 1 = serial. Inert on PG / VStream sources." default:"0" placeholder:"N"`
 
+	// VStreamRelaxSkew (ADR-0120, roadmap item 27) opts the steady-state
+	// multi-shard VStream CDC stream out of vtgate's MinimizeSkew hold, so both
+	// shards stream + drain concurrently during an apply-deficit backlog instead
+	// of the ahead shard being held back for commit-time ordering. Opt-in-named:
+	// the zero value (false) keeps MinimizeSkew=on, today's behaviour, for every
+	// non-CLI caller (the v0.99.51 trap, inverted). The DSN form
+	// (vstream_relax_skew=true) keeps working verbatim; the explicit flag wins.
+	// Threaded into the mysql engine in SyncStartCmd.Run.
+	VStreamRelaxSkew bool `name:"vstream-relax-skew" help:"VStream CDC (Vitess/PlanetScale source) only: relax vtgate's MinimizeSkew on the steady-state multi-shard stream so both shards stream and drain CONCURRENTLY during an apply-deficit backlog, instead of holding the ahead shard back to keep the merged stream commit-time ordered (ADR-0120). Safe under range-sharding (a key lives in one shard; the key-hash apply lanes serialize same-key within a shard) and intended for use WITH concurrent apply (--apply-concurrency, the default). Off by default (MinimizeSkew on). The DSN form vstream_relax_skew=true also works; this flag wins. Inert on PG / native-MySQL sources and on a single-shard keyspace."`
+
 	NoIntraTableStealing bool `name:"no-intra-table-stealing" help:"Native-MySQL concurrent cold-copy (--copy-table-parallelism > 1) only: DISABLE intra-table PK-range work-stealing (ADR-0119). By default a large, chunk-eligible table (single/composite orderable PK, above the within-table row threshold) is split into PK-range chunks so idle reader connections can steal a CHUNK of the last big table — keeping the copy N-wide to the tail instead of tapering to one whole table. With this flag set, every table is copied as one whole-table work item (the prior tier-(a) whole-table-stealing behaviour). A throughput knob, not a correctness one: chunk coverage is gap-free + overlap-free either way. Inert on PG / VStream sources and on a serial (--copy-table-parallelism=1) cold-copy."`
 
 	RawCopyFormat string `help:"FAST cold-start (ADR-0079, same-engine PG→PG) only: wire format for the raw-copy passthrough fast lane (ADR-0078). 'text' (default) is cross-major safe; 'binary' is used only when source and target server majors match (downgrades to text loudly otherwise); 'auto' requests binary. The lane engages ONLY for a no-transform copy (no --redact / --type-override / --expr-override / --inject-shard-column). Inert on MySQL/VStream sources (serial cold-start)." default:"text" enum:"text,binary,auto" placeholder:"text|binary|auto"`
@@ -1167,6 +1177,11 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 	// default) leaves the DSN-then-default behaviour byte-identical.
 	mysql.SetVStreamCopyTableParallelismOverride(s.VStreamCopyTableParallelism)
 	mysql.SetNativeCopyTableParallelismOverride(s.CopyTableParallelism)
+
+	// ADR-0120: thread the explicit --vstream-relax-skew CLI value into the mysql
+	// engine at the composition root. true wins over the source DSN's
+	// vstream_relax_skew param; false (the default) leaves MinimizeSkew on.
+	mysql.SetVStreamRelaxSkewOverride(s.VStreamRelaxSkew)
 
 	if len(s.IncludeTable) > 0 && len(s.ExcludeTable) > 0 {
 		return errors.New("--include-table and --exclude-table are mutually exclusive")
