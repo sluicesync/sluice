@@ -383,6 +383,12 @@ type Streamer struct {
 	// instrumentation of the apply hot path.
 	MetricsListen string
 
+	// BuildVersion / BuildCommit populate the /metrics sluice_build_info
+	// gauge. Set from the cmd layer's -ldflags build vars; empty ⇒ the
+	// emitter's "dev"/"unknown" placeholders. Observability-only.
+	BuildVersion string
+	BuildCommit  string
+
 	// TargetTelemetry, when non-nil, is an advisory control-plane health
 	// provider (ADR-0107). Consulted OFF the hot path for proactive AIMD
 	// back-off, storage-resize anticipation, and operator observability.
@@ -393,6 +399,48 @@ type Streamer struct {
 	// cmd/sluice when the operator opts into PlanetScale metrics (Phase 2
 	// supplies the real provider; Phase 1 exercises it with a fake).
 	TargetTelemetry ir.TargetTelemetry
+
+	// SuppressTargetMetricsHistory is the OPT-OUT for the ADR-0107 item 35
+	// rolling-history recorder: when a telemetry provider is wired, sluice
+	// also persists each poll into the bounded sluice_target_metrics_history
+	// table on the target so `sluice diagnose` surfaces the recent trend.
+	// Deliberately an opt-out so the ZERO VALUE (false) is the safe default —
+	// record-when-telemetry-wired — for every construction (CLI, tests,
+	// future callers) without each having to set a field. Set true only by
+	// `--suppress-target-metrics-history`.
+	//
+	// Zero-value safety (the v0.99.51 trap): the recorder only STARTS when a
+	// telemetry provider is non-nil, and TargetTelemetry is nil for every
+	// non-CLI construction (tests, broker/chain paths), so a zero-value
+	// Streamer never records regardless of this flag — the default is safe by
+	// construction. The opt-out naming is belt-and-suspenders so the field's
+	// zero value is also the common-case "record" intent for the one
+	// construction (the CLI) that does wire telemetry.
+	SuppressTargetMetricsHistory bool
+
+	// ADR-0107 item 36 — the sync-scoped target-metrics threshold ALERTER.
+	// When a telemetry provider is wired AND at least one sink URL is set,
+	// a sidecar evaluates these thresholds against the polled snapshot and
+	// fires edge-triggered, cooldown'd notifications to the configured sinks.
+	// All zero ⇒ INERT (opt-in): the alerter only runs when an operator
+	// supplies a sink URL AND at least one threshold, so the zero value is
+	// the safe default for every construction (no zero-value trap — the
+	// feature is gated on a non-empty URL, not on a bool defaulting true).
+	// Observability only — failure-isolated, never on the value path.
+	//
+	// The URLs are credentials (set via env at the CLI). A threshold of 0
+	// leaves its rule inert. NotifyStorageGrowthPerMin is the storage
+	// rate-of-change rule, expressed as a FRACTION-of-capacity per minute
+	// (e.g. 0.02 = storage util climbing 2%/min) so the threshold is
+	// capacity-relative; inert at 0.
+	NotifyWebhookURL          string
+	NotifySlackWebhookURL     string
+	NotifyStorageUtil         float64
+	NotifyCPUUtil             float64
+	NotifyMemUtil             float64
+	NotifyLagSeconds          float64
+	NotifyStorageGrowthPerMin float64
+	NotifyCooldown            time.Duration
 
 	// MaxBufferBytes is the soft upper bound on per-batch buffered
 	// memory in the CDC applier (and, on the cold-start branch, the
@@ -1165,6 +1213,19 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	// static-cap behaviour bit-for-bit — zero overhead on the
 	// opt-out path.
 	aimdController := s.maybeAttachAIMDController(ctx, applier, streamID)
+
+	// ---- 1.6. Target-telemetry sidecars for the WHOLE attempt (ADR-0107
+	// items 35 + 36, roadmap item 39) ----
+	// The rolling-history recorder + threshold alerter are started HERE (not
+	// at the apply phase) so they cover the COLD-COPY phase too — the loaded,
+	// storage-grow-prone window where they matter most. The applier opened in
+	// step 1 lives for the whole attempt and is idle during cold-copy, so
+	// reusing it is safe. telemetryCtx is cancelled when this attempt returns,
+	// so the goroutines exit cleanly (no cross-attempt leak on warm-resume).
+	// Total no-op when PlanetScale telemetry isn't configured.
+	telemetryCtx, cancelTelemetry := context.WithCancel(ctx)
+	defer cancelTelemetry()
+	s.startTelemetrySidecars(telemetryCtx, applier, streamID)
 
 	// ---- 1a. Optional Prometheus metrics endpoint ----
 	// When --metrics-listen is set, a small HTTP server runs alongside

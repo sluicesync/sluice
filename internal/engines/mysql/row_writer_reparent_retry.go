@@ -180,6 +180,12 @@ func (w *RowWriter) flushWithReparentRetry(
 		// transient at once collapse into one pause window. This lane keeps
 		// its own bounded retry below as the floor.
 		w.tripGrowGate("mysql cold-copy flush transient: " + err.Error())
+		// ADR-0113: mark this table as reparent-touched so the restore's
+		// reconciliation phase re-derives it from its chunks — the grow-gate
+		// quiesces lanes but cannot recover rows the reparent dropped before
+		// the first transient was seen (the silent under-copy fix). No-op
+		// when no observer is wired (every non-restore path).
+		w.notifyReparent(tableName)
 		// Terminal on the WALL-CLOCK deadline (the real bound) or the
 		// runaway attempt backstop. A genuinely-wedged target surfaces
 		// loudly after ~30 min; a transient grow is ridden regardless of

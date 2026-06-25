@@ -73,12 +73,37 @@ type ChainRestore struct {
 	// by construction). Same semantics as [Restore.TableParallelism].
 	TableParallelism int
 
+	// ChunkParallelism caps how many of a single table's chunks
+	// bulk-apply CONCURRENTLY during each segment full's chunk restore
+	// — the within-table axis (ADR-0112). Threaded into the re-entrant
+	// [Restore] for every segment full; the incremental change-replay
+	// path is untouched (ordered by construction). Composes with
+	// TableParallelism under the same connection-budget bound. Same
+	// semantics as [Restore.ChunkParallelism].
+	ChunkParallelism int
+
 	// ApplyBatchSize is the upper bound on changes per target
 	// transaction during incremental replay. Same shape as
 	// [Streamer.ApplyBatchSize]. Zero falls back to 100 — chain
 	// restore wants throughput; the per-change conservative default
 	// (1) would make even modest chains painfully slow.
 	ApplyBatchSize int
+
+	// ApplyConcurrency is the key-hash concurrent-apply LANE count for
+	// the chain's incremental replay (ADR-0104/0105). Without it the
+	// chain-restore incremental apply runs through the single-stream
+	// ADR-0092 pipelined applier — RTT-bound on a high-latency /
+	// cross-region target, so a chain carrying a large incremental
+	// stalls exactly as the broker's polling path did before its
+	// concurrent-apply fix (live Track-C finding, 2026-06-24: a
+	// cold-start absorbed the full backup then wedged at ~1 change/s
+	// applying an 8M-change incremental into cross-region PlanetScale-PG).
+	// This is the chain-restore analog of that fix: the full-restore COPY
+	// is already parallel (ADR-0112); this closes the incremental-apply
+	// leg. Resolved through [resolveReplayApplyConcurrency] (ADR-0106:
+	// 0 = auto:N fast default, 1 = serial opt-out, N > 1 honored), so the
+	// zero value gets the fast default (no zero-value-safe-default trap).
+	ApplyConcurrency int
 
 	// Envelope, when non-nil, is the [crypto.EnvelopeEncryption] used
 	// to unwrap CEKs from encrypted manifests. Required for encrypted
@@ -202,6 +227,7 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	defer closeIf(applier)
 	applyMaxBufferBytes(applier, r.MaxBufferBytes)
 	applyTargetSchema(applier, r.TargetSchema)
+	applyApplyConcurrency(applier, resolveReplayApplyConcurrency(r.ApplyConcurrency))
 	if err := applier.EnsureControlTable(ctx); err != nil {
 		return wrapWithHint(PhaseSchemaApply, fmt.Errorf("chain restore: ensure control table: %w", err))
 	}
@@ -312,6 +338,7 @@ func (r *ChainRestore) applyFull(ctx context.Context, full *segmentRecord, dataO
 		Filter:            r.Filter,
 		MaxBufferBytes:    r.MaxBufferBytes,
 		TableParallelism:  r.TableParallelism,
+		ChunkParallelism:  r.ChunkParallelism,
 		SkipChainDispatch: true,
 		DataOnly:          dataOnly,
 		Envelope:          r.Envelope,
@@ -713,7 +740,7 @@ func (r *ChainRestore) streamOneChangeChunk(
 	chunk *irbackup.ChunkInfo,
 	out chan<- ir.Change,
 ) error {
-	src, err := segStore.Get(ctx, chunk.File)
+	src, err := fetchChunkVerified(ctx, segStore, chunk.File, chunk.SHA256)
 	if err != nil {
 		return fmt.Errorf("open chunk: %w", err)
 	}

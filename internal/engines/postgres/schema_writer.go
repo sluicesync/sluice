@@ -367,6 +367,24 @@ type indexBuildJob struct {
 // untuned — the speedup must never break a working index phase. A
 // dedicated-conn open failure or a CREATE INDEX failure IS a hard error:
 // the first such error cancels the group so peers unwind, and surfaces.
+// IsTransientError reports whether err is a classified storage-grow /
+// reparent transient, satisfying [ir.TransientClassifier] (ADR-0114). It
+// delegates to the SAME [classifyApplierError] the apply / cold-copy paths
+// use, so the post-copy DDL-phase retry (CreateIndexes / CreateConstraints
+// / CreateViews / SyncIdentitySequences) recognises a PlanetScale PG
+// reparent (57P01/57P03, the read-only serving-transition window, the
+// disk-full grow class) identically to the row-write path — no second
+// classifier to drift. A non-transient (a real DDL fault) returns false
+// and the phase fails loudly, exactly as before.
+func (w *SchemaWriter) IsTransientError(err error) bool {
+	var re ir.RetriableError
+	return errors.As(classifyApplierError(err), &re) && re.Retriable()
+}
+
+// Compile-time proof the SchemaWriter exposes the DDL-phase retry verdict
+// (ADR-0114) so the orchestrator's post-copy DDL retry engages.
+var _ ir.TransientClassifier = (*SchemaWriter)(nil)
+
 func (w *SchemaWriter) CreateIndexes(ctx context.Context, s *ir.Schema) error {
 	if s == nil {
 		return errors.New("postgres: CreateIndexes: schema is nil")
@@ -622,10 +640,40 @@ func (w *SchemaWriter) buildOneIndex(ctx context.Context, conn *sql.Conn, job in
 	// first " INDEX " token is the keyword to follow. sluice owns these
 	// tables, so a same-named index is the one it built.
 	stmt = strings.Replace(stmt, "INDEX ", "INDEX IF NOT EXISTS ", 1)
-	if _, err := conn.ExecContext(ctx, stmt); err != nil {
-		return fmt.Errorf("postgres: create index %q on %q: %w", job.idx.Name, job.tableName, err)
-	}
-	return nil
+	// Bug #114 (found live by the v0.99.118 fresh-DB re-validation):
+	// `CREATE INDEX IF NOT EXISTS` is NOT atomic against an overlapping
+	// same-name creation — its pg_class existence pre-check and the catalog
+	// insert race. Under the ADR-0114 whole-phase reparent-retry over the
+	// CONCURRENT index pool, a PlanetScale reparent makes a retry's CREATE
+	// overlap the prior attempt's just-committed (replicated-to-the-new-
+	// primary) build → unique_violation on `pg_class_relname_nsp_index`
+	// (23505). That 23505 is correctly classified NON-transient (a user-table
+	// dup-key must stay loud), so the reparent-retry layers don't catch it and
+	// it aborted the restore with all data already correctly copied. Wrap the
+	// exec in the SAME narrow catalog-race retry the CDC apply path uses
+	// (retryOnCatalogRace → isCatalogRaceError): it retries ONLY the
+	// pg_class/pg_type constraint-name 23505 shape (3× 50/100/200ms), keeping
+	// every user-table 23505 loud per ADR-0038. This is the INNER layer (the
+	// race resolves in ms); a transient 57P0x still propagates to the outer
+	// reparent-retry. buildOneIndex is the single chokepoint for all three
+	// index-build entry points (serial dedicated-conn / concurrent CreateIndexes
+	// pool / overlap BuildTableIndexesFromChannel), so one wrap covers them all.
+	return retryOnCatalogRace(ctx, func() error {
+		if err := indexStmtExec(ctx, conn, stmt); err != nil {
+			return fmt.Errorf("postgres: create index %q on %q: %w", job.idx.Name, job.tableName, err)
+		}
+		return nil
+	})
+}
+
+// indexStmtExec executes a built CREATE INDEX statement on conn. It is a
+// package var ONLY so the Bug #114 catalog-race-retry pin can inject a
+// failing-then-succeeding exec without a live connection (a regression that
+// unwraps buildOneIndex's retryOnCatalogRace must fail a test). Production
+// always uses the real ExecContext.
+var indexStmtExec = func(ctx context.Context, conn *sql.Conn, stmt string) error {
+	_, err := conn.ExecContext(ctx, stmt)
+	return err
 }
 
 // tuneIndexBuildConn raises maintenance_work_mem + max_parallel_maintenance_workers

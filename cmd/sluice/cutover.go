@@ -56,7 +56,14 @@ type CutoverCmd struct {
 	IncludeTable []string `help:"Only prime sequences on these tables (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --exclude-table." sep:"," placeholder:"TABLE"`
 	ExcludeTable []string `help:"Prime sequences on every table except these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-table." sep:"," placeholder:"TABLE"`
 
-	SequenceMargin int64 `name:"cutover-sequence-margin" help:"Safety margin added on top of every source sequence value before applying. Operator headroom against in-flight source-side INSERTs between the read and the apply (or between the read and the operator flipping traffic). The same margin doubles as the idempotency tolerance — a re-run within margin rows of the first run does NOT refuse. Default 1000." default:"1000" placeholder:"N"`
+	// ADR-0118 finding 3: the canonical name drops the redundant command-name
+	// prefix — under the `cutover` subcommand `cutover-` is pure redundancy.
+	// The old --cutover-sequence-margin spelling keeps working as a deprecated
+	// alias (every existing command line / script is unchanged); passing it
+	// specifically emits the one-time deprecation WARN below
+	// (warnDeprecatedSequenceMargin), mirroring the ADR-0091
+	// --forward-schema-add-column posture.
+	SequenceMargin int64 `name:"sequence-margin" aliases:"cutover-sequence-margin" help:"Safety margin added on top of every source sequence value before applying. Operator headroom against in-flight source-side INSERTs between the read and the apply (or between the read and the operator flipping traffic). The same margin doubles as the idempotency tolerance — a re-run within margin rows of the first run does NOT refuse. Default 1000. (The old spelling --cutover-sequence-margin still works as a deprecated alias.)" default:"1000" placeholder:"N"`
 
 	TargetSchema string `help:"Per-source target schema namespace (Postgres-only). Threaded to the writer's pg_get_serial_sequence lookups so cutover resolves sequences in the same namespace the migration landed in (ADR-0031). MySQL operators use a different --target DSN database instead." placeholder:"NAME"`
 
@@ -74,6 +81,14 @@ type CutoverCmd struct {
 // operators piping the output to a metrics tool see the per-table
 // detail of whatever did succeed before the failure.
 func (c *CutoverCmd) Run(_ *Globals) error {
+	// ADR-0118 finding 3: one-time deprecation WARN, fired ONLY when the
+	// operator passed the OLD --cutover-sequence-margin spelling (kong has no
+	// per-alias set-tracking, so we read the literal token from os.Args, not
+	// the resolved value — the zero-value-safety property: an unset flag at
+	// its default never trips this). Mirrors the ADR-0091
+	// --forward-schema-add-column posture.
+	warnDeprecatedSequenceMargin()
+
 	source, err := resolveEngine(c.SourceDriver)
 	if err != nil {
 		return fmt.Errorf("--source-driver: %w", err)
@@ -87,7 +102,7 @@ func (c *CutoverCmd) Run(_ *Globals) error {
 		return errors.New("--include-table and --exclude-table are mutually exclusive")
 	}
 	if c.SequenceMargin < 0 {
-		return fmt.Errorf("--cutover-sequence-margin=%d must be non-negative", c.SequenceMargin)
+		return fmt.Errorf("--sequence-margin=%d must be non-negative", c.SequenceMargin)
 	}
 	if strings.TrimSpace(c.Source) == "" {
 		return errors.New("--source is required")

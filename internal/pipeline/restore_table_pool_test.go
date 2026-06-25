@@ -118,7 +118,7 @@ func TestRestoreTablePool_SerialCollapseNeverOpensWriters(t *testing.T) {
 		factoryCalls.Add(1)
 		return nil, errors.New("factory must not be called on the serial path")
 	}
-	if err := r.runRestoreTablePool(context.Background(), tasks, primary, factory, 1); err != nil {
+	if err := r.runRestoreTablePool(context.Background(), tasks, primary, factory, 1, 1); err != nil {
 		t.Fatalf("runRestoreTablePool: %v", err)
 	}
 	if n := factoryCalls.Load(); n != 0 {
@@ -142,7 +142,7 @@ func TestRestoreTablePool_DedicatedWritersClosed(t *testing.T) {
 		opened.Add(1)
 		return &restorePoolFakeWriter{closes: &dedicatedCloses, drained: &drained}, nil
 	}
-	if err := r.runRestoreTablePool(context.Background(), tasks, primary, factory, 4); err != nil {
+	if err := r.runRestoreTablePool(context.Background(), tasks, primary, factory, 4, 1); err != nil {
 		t.Fatalf("runRestoreTablePool: %v", err)
 	}
 	if primaryCloses.Load() != 0 {
@@ -170,7 +170,7 @@ func TestRestoreTablePool_FirstErrorCancelsPeers(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- r.runRestoreTablePool(context.Background(), tasks, primary, factory, 4)
+		done <- r.runRestoreTablePool(context.Background(), tasks, primary, factory, 4, 1)
 	}()
 	select {
 	case err := <-done:
@@ -208,11 +208,14 @@ func observeRestoreDispatch(t *testing.T) (gotParallelism *int, gotReason *strin
 	return &p, &r
 }
 
-// TestResolveRestoreTableParallelism pins the dispatch matrix: 0 = auto
-// = 4, clamp to the table count, the operator-serial collapse, and an
-// explicit value passing through unclamped on a budget-less target —
-// no engine eligibility gate (restore parallelism is engine-generic).
-func TestResolveRestoreTableParallelism(t *testing.T) {
+// TestResolveRestoreParallelism pins the cross-table (ADR-0084) dispatch
+// matrix: 0 = auto = 4, clamp to the table count, the operator-serial
+// collapse, and an explicit value passing through unclamped on a
+// budget-less target — no engine eligibility gate (restore parallelism
+// is engine-generic). The within-table chunk axis is left at default
+// (auto) here; budget-less stubEngine passes both axes through, so the
+// table axis is unaffected by the two-axis split.
+func TestResolveRestoreParallelism(t *testing.T) {
 	cases := []struct {
 		name       string
 		configured int
@@ -231,9 +234,9 @@ func TestResolveRestoreTableParallelism(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			r := &Restore{Target: stubEngine{}, TargetDSN: "dsn", Store: &LocalStore{}, TableParallelism: c.configured}
 			gotP, gotReason := observeRestoreDispatch(t)
-			got, err := r.resolveRestoreTableParallelism(context.Background(), c.taskCount)
+			got, _, err := r.resolveRestoreParallelism(context.Background(), c.taskCount)
 			if err != nil {
-				t.Fatalf("resolveRestoreTableParallelism: %v", err)
+				t.Fatalf("resolveRestoreParallelism: %v", err)
 			}
 			if got != c.want || *gotP != c.want {
 				t.Errorf("tableParallelism = %d (observer %d); want %d", got, *gotP, c.want)

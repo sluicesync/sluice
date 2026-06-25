@@ -591,3 +591,48 @@ func TestEmitSpillMetrics_Zero(t *testing.T) {
 		t.Errorf("zero spill_bytes should render as 0; got:\n%s", out)
 	}
 }
+
+// TestEmitBuildInfoMetrics pins the build_info series shape + the empty-value
+// placeholder fallback.
+func TestEmitBuildInfoMetrics(t *testing.T) {
+	var buf bytes.Buffer
+	emitBuildInfoMetrics(&buf, "v0.99.115", "abc123")
+	out := buf.String()
+	if !strings.Contains(out, "# TYPE sluice_build_info gauge") {
+		t.Errorf("missing TYPE header: %q", out)
+	}
+	if !strings.Contains(out, `version="v0.99.115"`) || !strings.Contains(out, `commit="abc123"`) {
+		t.Errorf("version/commit labels missing: %q", out)
+	}
+	if !strings.Contains(out, `go_version=`) || !strings.HasSuffix(strings.TrimSpace(out), "1") {
+		t.Errorf("expected go_version label and a trailing 1 value: %q", out)
+	}
+
+	// Empty values fall back to dev/unknown so the line always emits.
+	buf.Reset()
+	emitBuildInfoMetrics(&buf, "", "")
+	if out := buf.String(); !strings.Contains(out, `version="dev"`) || !strings.Contains(out, `commit="unknown"`) {
+		t.Errorf("empty build vars should fall back to dev/unknown: %q", out)
+	}
+}
+
+// TestEmitGoRuntimeMetrics pins the Go-runtime block's metric names + that the
+// values are real (goroutines >= 1).
+func TestEmitGoRuntimeMetrics(t *testing.T) {
+	var buf bytes.Buffer
+	emitGoRuntimeMetrics(&buf)
+	out := buf.String()
+	for _, want := range []string{
+		"sluice_go_goroutines ",
+		"sluice_go_gomaxprocs ",
+		"sluice_go_memstats_heap_alloc_bytes ",
+		"sluice_go_memstats_heap_sys_bytes ",
+		"sluice_go_memstats_heap_objects ",
+		"# TYPE sluice_go_gc_completed_total counter",
+		"# TYPE sluice_go_gc_pause_seconds_total counter",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("runtime block missing %q in:\n%s", want, out)
+		}
+	}
+}

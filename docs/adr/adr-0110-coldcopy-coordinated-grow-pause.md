@@ -62,6 +62,22 @@ attempt count remains only as a high runaway backstop. Two misfires (v0.99.101/1
 wired adjacent functions, not Track-D's actual path) are the lesson: trace the exact
 runtime path from ground truth before fixing.
 
+**Reopen-semantics refinement (v0.99.105, the v14 finding).** The first live run with
+telemetry ON (v0.99.104 PS-320-v14) exposed that the original "a proactive pause holds
+until `recovered()` or max-hold" rule made the telemetry-enabled gate *worse* than the
+reactive one: the `volume_*` gauges `recovered()` reads swing wildly and transiently
+**disappear** across a reparent (observed live: 62 GB@85.9% → 1.66 TB@~0%, series
+absent), so `recovered()` could not confirm "grow finished" and the gate rode the full
+~20-min max-hold — a flat zero-progress stall on every reparent, strictly worse than the
+reactive path's incremental ~30 s cycling. Fix: the **quiet-cycle reopen now applies
+ALWAYS** (telemetry or not) — a backoff cycle with no re-trip reopens so the lanes
+resume and probe, the proven reactive behaviour. `recovered()` is demoted to an
+*early-reopen accelerator* (reopen sooner when the signal is trustworthy), and max-hold
+stays the backstop. So a proactive (telemetry) trip is now a BRIEF anticipatory pause
+that hands off to the reactive cycling, not a hold for the whole grow. (Smarter proactive
+behaviour — a rate-of-change trigger and reparent-robust recovery detection — is the
+Phase-3 metrics follow-up, roadmap item 32/§Phase 3.)
+
 ## Context
 
 A non-Metal PlanetScale MySQL volume auto-grows in steps (12 → 39 → 62 → 214 GB).

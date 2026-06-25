@@ -36,6 +36,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -58,6 +59,13 @@ type MetricsServer struct {
 	addr    string
 	applier ir.ChangeApplier
 	server  *http.Server
+
+	// buildVersion / buildCommit populate the sluice_build_info gauge. Set
+	// via SetBuildInfo from the cmd-layer build vars; empty ⇒ "dev"/"unknown"
+	// placeholders so the line always emits (a build_info series is a
+	// Prometheus convention every exporter is expected to carry).
+	buildVersion string
+	buildCommit  string
 
 	mu             sync.RWMutex
 	aimdController *appliercontrol.Controller
@@ -166,6 +174,15 @@ func (m *MetricsServer) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return m.server.Shutdown(ctx)
+}
+
+// SetBuildInfo records the build version + commit for the sluice_build_info
+// gauge. Called once at wiring time from the cmd layer's build vars. Safe to
+// call before Start; not concurrency-guarded (set once, read at scrape time on
+// the same fields without mutation thereafter).
+func (m *MetricsServer) SetBuildInfo(version, commit string) {
+	m.buildVersion = version
+	m.buildCommit = commit
 }
 
 // AttachAIMDController plugs an [appliercontrol.Controller] into the
@@ -286,6 +303,12 @@ func (m *MetricsServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	emitMetrics(w, streams, now)
+	// Exporter-hygiene families: a build_info series (Prometheus convention)
+	// and a compact Go-runtime block. Both are scrape-time only (no apply-path
+	// instrumentation) and let operators watch sluice's OWN resource use —
+	// directly relevant to the bounded-memory guarantees (ADR-0095/0099).
+	emitBuildInfoMetrics(w, m.buildVersion, m.buildCommit)
+	emitGoRuntimeMetrics(w)
 	if snap, ok := m.aimdSnapshot(); ok {
 		emitAIMDMetrics(w, snap)
 	}
@@ -621,6 +644,70 @@ func emitSpillMetrics(w io.Writer, s SpillSnapshot) {
 	fmt.Fprintln(w, "# HELP sluice_pg_slot_spill_bytes_total Cumulative bytes of decoded transaction data that spilled to disk for this PG slot (pg_stat_replication_slots.spill_bytes, PG 14+).")
 	fmt.Fprintln(w, "# TYPE sluice_pg_slot_spill_bytes_total counter")
 	fmt.Fprintf(w, `sluice_pg_slot_spill_bytes_total{stream_id=%q,slot=%q} %d`+"\n", s.StreamID, s.SlotName, s.SpillBytes)
+}
+
+// emitBuildInfoMetrics renders the standard build-info series: a constant-1
+// gauge carrying the sluice version, git commit, and Go toolchain version as
+// labels (the Prometheus exporter convention). Empty version/commit fall back
+// to the same placeholders the CLI uses, so the line always emits. version and
+// commit are supplied by the cmd layer's -ldflags build vars.
+func emitBuildInfoMetrics(w io.Writer, version, commit string) {
+	if version == "" {
+		version = "dev"
+	}
+	if commit == "" {
+		commit = "unknown"
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "# HELP sluice_build_info Build metadata; constant 1 with version/commit/go_version labels.")
+	fmt.Fprintln(w, "# TYPE sluice_build_info gauge")
+	fmt.Fprintf(w, `sluice_build_info{version=%q,commit=%q,go_version=%q} 1`+"\n", version, commit, runtime.Version())
+}
+
+// emitGoRuntimeMetrics renders a compact Go-runtime block so operators can
+// watch sluice's OWN process health alongside the stream metrics — goroutine
+// count, heap footprint (the load-bearing signal for the bounded-memory
+// guarantees of the auto-shard / fan-out copy paths), and cumulative GC work.
+// All values are read at scrape time via runtime.ReadMemStats (a brief
+// stop-the-world on the order of microseconds — never on the apply path).
+func emitGoRuntimeMetrics(w io.Writer) {
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "# HELP sluice_go_goroutines Number of goroutines currently running.")
+	fmt.Fprintln(w, "# TYPE sluice_go_goroutines gauge")
+	fmt.Fprintf(w, "sluice_go_goroutines %d\n", runtime.NumGoroutine())
+
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "# HELP sluice_go_gomaxprocs Configured GOMAXPROCS (the apply/copy concurrency ceiling derives from this).")
+	fmt.Fprintln(w, "# TYPE sluice_go_gomaxprocs gauge")
+	fmt.Fprintf(w, "sluice_go_gomaxprocs %d\n", runtime.GOMAXPROCS(0))
+
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "# HELP sluice_go_memstats_heap_alloc_bytes Bytes of allocated heap objects currently in use.")
+	fmt.Fprintln(w, "# TYPE sluice_go_memstats_heap_alloc_bytes gauge")
+	fmt.Fprintf(w, "sluice_go_memstats_heap_alloc_bytes %d\n", ms.HeapAlloc)
+
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "# HELP sluice_go_memstats_heap_sys_bytes Bytes of heap memory obtained from the OS.")
+	fmt.Fprintln(w, "# TYPE sluice_go_memstats_heap_sys_bytes gauge")
+	fmt.Fprintf(w, "sluice_go_memstats_heap_sys_bytes %d\n", ms.HeapSys)
+
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "# HELP sluice_go_memstats_heap_objects Number of allocated heap objects currently in use.")
+	fmt.Fprintln(w, "# TYPE sluice_go_memstats_heap_objects gauge")
+	fmt.Fprintf(w, "sluice_go_memstats_heap_objects %d\n", ms.HeapObjects)
+
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "# HELP sluice_go_gc_completed_total Cumulative number of completed GC cycles.")
+	fmt.Fprintln(w, "# TYPE sluice_go_gc_completed_total counter")
+	fmt.Fprintf(w, "sluice_go_gc_completed_total %d\n", ms.NumGC)
+
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "# HELP sluice_go_gc_pause_seconds_total Cumulative stop-the-world GC pause time, in seconds.")
+	fmt.Fprintln(w, "# TYPE sluice_go_gc_pause_seconds_total counter")
+	fmt.Fprintf(w, "sluice_go_gc_pause_seconds_total %s\n", formatPrometheusSeconds(time.Duration(ms.PauseTotalNs))) //nolint:gosec // PauseTotalNs fits int64 in practice
 }
 
 // quoteForPrometheusLabelValue escapes a string for use as a

@@ -29,8 +29,12 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 
@@ -171,7 +175,15 @@ func (w *SchemaWriter) indexBuildWorkerTracked(ctx context.Context, jobCh <-chan
 	if err != nil {
 		return fmt.Errorf("postgres: BuildTableIndexesFromChannel: acquire worker connection: %w", err)
 	}
-	defer func() { _ = conn.Close() }()
+	// conn is reassigned by the reparent-retry when it re-acquires a fresh
+	// connection after a storage-grow/reparent kills the pinned one, so the
+	// deferred close targets whatever the CURRENT conn is (nil-guarded — an
+	// exhausted acquire can leave it nil).
+	defer func() {
+		if conn != nil {
+			_ = conn.Close()
+		}
+	}()
 
 	w.tuneIndexBuildConn(ctx, conn, plan)
 
@@ -186,10 +198,128 @@ func (w *SchemaWriter) indexBuildWorkerTracked(ctx context.Context, jobCh <-chan
 			if hook := onIndexBuildStartObserver; hook != nil {
 				hook(job.tableName)
 			}
-			if err := w.buildOneIndex(ctx, conn, job); err != nil {
-				return err
+			// ADR-0114 (overlap-path residual, roadmap item 42): a storage-grow
+			// reparent landing on this CREATE INDEX would otherwise abort the
+			// whole migration. Ride it out in-engine — the pipeline-level DDL
+			// retry can't reach this per-table build (it runs interleaved with
+			// the copy, inside the engine). The retry may replace the dead conn.
+			var rerr error
+			conn, rerr = w.buildOneIndexWithReparentRetry(ctx, conn, plan, job)
+			if rerr != nil {
+				return rerr
 			}
 			tracker.complete(job.tableName)
+		}
+	}
+}
+
+// buildOneIndexWithReparentRetry runs one overlapped CREATE INDEX with the
+// bounded reparent-retry around it (ADR-0114 overlap-path residual, item 42),
+// mirroring the cold-copy chunk retry ([RowWriter.copyChunkWithRetry]) and
+// reusing the SAME envelope (pgCopyReparent*Var) + classifier. On a classified
+// storage-grow/reparent transient it closes the dead pinned connection, backs
+// off, re-acquires a FRESH connection (the reparented primary), re-tunes it,
+// and replays the build — `CREATE INDEX IF NOT EXISTS` is idempotent (a
+// non-CONCURRENTLY build is transactional, so a killed attempt left nothing,
+// and IF NOT EXISTS skips one that did land). A non-transient (a real DDL
+// fault) returns unchanged; budget exhaustion returns a LOUD terminal error.
+// Returns the connection the caller should keep using (possibly the fresh one,
+// or nil if a re-acquire ultimately failed) so the worker's deferred close and
+// subsequent jobs target the live conn.
+func (w *SchemaWriter) buildOneIndexWithReparentRetry(ctx context.Context, conn *sql.Conn, plan indexBuildPlan, job indexBuildJob) (*sql.Conn, error) {
+	indexName := ""
+	if job.idx != nil {
+		indexName = job.idx.Name
+	}
+	// attempt runs one build on the CURRENT conn; reacquire closes the dead
+	// pinned conn and refreshes it (the reparented primary), re-tuning the new
+	// session. conn is captured by reference so the worker keeps using whatever
+	// connection survives — possibly the fresh one, or nil if a re-acquire
+	// ultimately failed (the deferred close in the worker is nil-guarded).
+	attempt := func(ctx context.Context) error { return w.buildOneIndex(ctx, conn, job) }
+	reacquire := func(ctx context.Context) error {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		conn = nil
+		fresh, err := w.db.Conn(ctx)
+		if err != nil {
+			return err
+		}
+		conn = fresh
+		w.tuneIndexBuildConn(ctx, conn, plan)
+		return nil
+	}
+	err := retryIndexBuildWithReparent(ctx, fmt.Sprintf("%q on %q", indexName, job.tableName), attempt, reacquire)
+	return conn, err
+}
+
+// retryIndexBuildWithReparent is the PURE retry policy behind the overlapped
+// index build (ADR-0114 overlap residual, item 42) — no SQL, so it is unit-
+// testable with fake attempt/reacquire closures. It reuses the SAME envelope
+// (pgCopyReparent*Var + pgCopyReparentBackoff) and classifier as the cold-copy
+// chunk retry, so the two ride a PlanetScale storage-grow/reparent identically:
+//
+//   - attempt runs one index build on the current connection.
+//   - on a CLASSIFIED transient (ir.RetriableError via classifyApplierError —
+//     53100 disk-full / 57P0x reparent / 08* connection / read-only window) it
+//     backs off (honoring ctx), calls reacquire to refresh the connection, and
+//     attempts again. CREATE INDEX IF NOT EXISTS is idempotent, so a replay
+//     after a killed build is clean.
+//   - a NON-transient (a real DDL fault) returns unchanged — terminal, no
+//     retry, exactly as before this fix.
+//   - a reacquire error is itself classified on the next iteration (a still-
+//     unreachable target surfaces the same transient shape), riding the budget.
+//   - budget exhaustion (wall-clock or runaway-attempt backstop) returns a LOUD
+//     terminal error wrapping the most recent transient — never silent, never
+//     infinite.
+func retryIndexBuildWithReparent(
+	ctx context.Context,
+	label string,
+	attempt func(ctx context.Context) error,
+	reacquire func(ctx context.Context) error,
+) error {
+	err := attempt(ctx)
+	if err == nil {
+		return nil
+	}
+	deadline := time.Now().Add(pgCopyReparentMaxWallVar)
+	for try := 1; ; try++ {
+		var re ir.RetriableError
+		if !errors.As(classifyApplierError(err), &re) || !re.Retriable() {
+			return err
+		}
+		if time.Now().After(deadline) || try >= pgCopyReparentRetryAttemptsVar {
+			return fmt.Errorf(
+				"postgres: overlapped index build %s still failing after riding the storage-grow/reparent window "+
+					"(%s wall-clock, %d attempts; the target may be undergoing a prolonged storage-grow/reparent): %w",
+				label, pgCopyReparentMaxWallVar, try, err,
+			)
+		}
+
+		backoff := pgCopyReparentBackoff(try)
+		slog.WarnContext(
+			ctx, "postgres: overlapped index build hit a transient target error (likely a storage auto-grow / reparent); "+
+				"re-acquiring a fresh connection and retrying the index build (ADR-0114 overlap path)",
+			slog.String("index", label),
+			slog.Int("attempt", try),
+			slog.Duration("max_wall", pgCopyReparentMaxWallVar),
+			slog.Duration("backoff", backoff),
+			slog.String("err", err.Error()),
+		)
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+
+		if rerr := reacquire(ctx); rerr != nil {
+			err = rerr
+			continue
+		}
+		err = attempt(ctx)
+		if err == nil {
+			return nil
 		}
 	}
 }

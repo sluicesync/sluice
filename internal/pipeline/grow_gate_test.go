@@ -313,6 +313,26 @@ func TestGrowGate_ProactiveReleasesOnRecovery(t *testing.T) {
 	g := newGrowGate(context.Background(), healthy.Load)
 	g.Trip("proactive: storage near boundary")
 
+	// Continuously re-trip so the QUIET-CYCLE reopen is suppressed (retripped
+	// stays true every cycle) — this isolates the recovery() accelerator as the
+	// reopen path under a sustained transient, the v0.99.104 fix's contract
+	// (recovered() reopens EARLIER than the far max-hold even while lanes keep
+	// faulting).
+	stop := make(chan struct{})
+	go func() {
+		tk := time.NewTicker(time.Millisecond)
+		defer tk.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-tk.C:
+				g.Trip("still near boundary")
+			}
+		}
+	}()
+	defer close(stop)
+
 	// Flip to recovered shortly after the pause begins.
 	go func() {
 		time.Sleep(30 * time.Millisecond)
@@ -328,6 +348,42 @@ func TestGrowGate_ProactiveReleasesOnRecovery(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("proactive pause never released on recovery (it should reopen the moment headroom recovers)")
+	}
+}
+
+// TestGrowGate_ProactiveQuietCyclesNotHeldToMaxHold pins the v0.99.104 #97
+// fix: a proactive (telemetry) trip that does NOT keep re-tripping must reopen
+// on the QUIET CYCLE — promptly, NOT held to the (long) max-hold — even when
+// recovered() never returns true (the mid-reparent case where the volume_*
+// gauges are absent/bogus so recovery can't be confirmed). Before the fix a
+// proactive pause rode the full max-hold (a flat ~20-min stall live).
+func TestGrowGate_ProactiveQuietCyclesNotHeldToMaxHold(t *testing.T) {
+	captureSlog(t)
+	base, capDur, maxHold := growGateBackoffBase, growGateBackoffCap, growGateMaxHold
+	growGateBackoffBase = 5 * time.Millisecond
+	growGateBackoffCap = 5 * time.Millisecond
+	growGateMaxHold = time.Hour // far away — the quiet cycle, NOT max-hold, must reopen
+	t.Cleanup(func() {
+		growGateBackoffBase = base
+		growGateBackoffCap = capDur
+		growGateMaxHold = maxHold
+	})
+
+	// recovered probe that NEVER recovers (mimics the gauges being absent/high
+	// across a reparent) — so ONLY the quiet cycle can reopen it.
+	neverRecovered := func() bool { return false }
+	g := newGrowGate(context.Background(), neverRecovered)
+	g.Trip("proactive: storage near boundary") // no further re-trips
+
+	done := make(chan error, 1)
+	go func() { done <- g.Await(context.Background()) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Await returned %v, want nil on quiet-cycle reopen", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("proactive pause was HELD (not quiet-cycle-reopened) despite no re-trips and a far max-hold — the #97 stall regressed")
 	}
 }
 

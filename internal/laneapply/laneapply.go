@@ -179,6 +179,22 @@ func retriable(la LaneApplier, err error) bool {
 // checkpoint, so on a transactional stream the real cadence is finer.
 const checkpointEveryChanges = 2000
 
+// checkpointIdlePeriod bounds how long the persisted resume position may
+// lag the durable frontier on a LOW-VOLUME stream. The count-based
+// checkpointEveryChanges cadence only fires every 2000 routed changes, so
+// a sparse stream (e.g. a postgres-trigger source applying a handful of
+// changes) would otherwise leave source_position frozen at the cold-start
+// anchor until 2000 changes accrued — the data converges idempotently but
+// the consumed watermark never persists, so the capture log is never
+// reclaimable and every warm-resume re-reads from the start (Bug 159).
+// A periodic coordinator-side checkpoint mirrors the serial path's item-18
+// idle flush (appliershared.DefaultIdleFlushPeriod = 100ms), which already
+// persists the position on every quiet-stream flush. 1s keeps the position
+// current within a poll interval while staying negligible against the
+// count-based cadence on a busy stream (where 2000 changes arrive well
+// inside 1s and the count path fires first).
+const checkpointIdlePeriod = 1 * time.Second
+
 // retrySameBeforeSplit is how many times a MULTI-change lane batch is
 // re-applied at its current size before the in-lane recovery re-chunks
 // (splits it in half). A TRANSIENT tx-killer — a momentary target overload —
@@ -314,6 +330,16 @@ type Orchestrator struct {
 	prevSeq uint64
 	prevPos ir.Position
 
+	// lastNotedSeq is the highest prevSeq already handed to the frontier as a
+	// boundary (by noteBoundary or the idle-checkpoint flush). It dedups the
+	// idle flush against noteBoundary so the same (seq,pos) isn't recorded
+	// twice: the idle tick records the trailing prevSeq/prevPos as a boundary
+	// on a marker-LESS stream (the position-run heuristic otherwise records a
+	// run's boundary only when a DIFFERENT-token successor arrives — which
+	// never happens on a quiet stream, leaving the last change's watermark
+	// unpersisted). Coordinator-goroutine-only (no lock). 0 = nothing noted.
+	lastNotedSeq uint64
+
 	// sawTxMarker latches true once an [ir.TxBegin] or [ir.TxCommit] is seen on
 	// the stream. It selects the boundary-detection strategy (see handle):
 	// marker streams (binlog-MySQL, Postgres) record a checkpoint boundary ONLY
@@ -396,16 +422,52 @@ func (o *Orchestrator) Run(ctx context.Context, changes <-chan ir.Change) error 
 		slog.Int("lanes_W", o.lanes),
 		slog.Int("dedicated_backends", o.lanes))
 
+	// Idle-checkpoint ticker (Bug 159): on a LOW-VOLUME stream the count-based
+	// checkpointEveryChanges cadence (every 2000 routed changes) rarely fires,
+	// so without a time-based flush the persisted resume position lags the
+	// durable frontier indefinitely (frozen at the cold-start anchor on a
+	// sparse postgres-trigger source). The tick persists the current durable
+	// frontier — mirroring the serial path's item-18 idle flush — so a quiet
+	// stream's watermark stays current within ~checkpointIdlePeriod. It only
+	// ever writes a fully-durable boundary (writeCheckpoint consults the
+	// frontier), so it never advances the position ahead of committed data.
+	ticker := time.NewTicker(checkpointIdlePeriod)
+	defer ticker.Stop()
+
 	var loopErr error
-	for c := range changes {
-		if err := o.getErr(); err != nil {
-			loopErr = err
-			break
-		}
-		o.nextSeq++
-		if err := o.handle(ctx, o.nextSeq, c); err != nil {
-			loopErr = err
-			break
+loop:
+	for {
+		select {
+		case c, ok := <-changes:
+			if !ok {
+				break loop
+			}
+			if err := o.getErr(); err != nil {
+				loopErr = err
+				break loop
+			}
+			o.nextSeq++
+			if err := o.handle(ctx, o.nextSeq, c); err != nil {
+				loopErr = err
+				break loop
+			}
+		case <-ticker.C:
+			if err := o.getErr(); err != nil {
+				loopErr = err
+				break loop
+			}
+			// Record the trailing marker-LESS boundary (no-op on a marker
+			// stream or when already noted) so the last applied change's
+			// watermark becomes checkpointable on a quiet stream, then persist
+			// whatever the frontier has made durable.
+			o.flushPendingBoundary()
+			if err := o.writeCheckpoint(ctx); err != nil {
+				loopErr = err
+				break loop
+			}
+		case <-ctx.Done():
+			loopErr = ctx.Err()
+			break loop
 		}
 	}
 
@@ -425,13 +487,15 @@ func (o *Orchestrator) Run(ctx context.Context, changes <-chan ir.Change) error 
 		return loopErr
 	}
 	// Clean end-of-stream. On a marker-LESS stream the final position run never
-	// saw a differing successor, so record its boundary now. On a marker stream
-	// the boundary was already recorded at each TxCommit / Truncate (noteBoundary
-	// is never used there, so prevSeq stays 0); never record prevPos, which could
-	// be a mid-transaction row position. Then persist the final fully-durable
-	// checkpoint (frontier is at its max after wg.Wait).
-	if !o.sawTxMarker && o.prevSeq != 0 {
-		o.frontier.RecordTxBoundary(o.prevSeq, o.prevPos)
+	// saw a differing successor, so record its boundary now (dedup-aware via
+	// flushPendingBoundary so an idle tick that already recorded it doesn't
+	// double-append). On a marker stream the boundary was already recorded at
+	// each TxCommit / Truncate (noteBoundary is never used there, so prevSeq
+	// stays 0); never record prevPos, which could be a mid-transaction row
+	// position. Then persist the final fully-durable checkpoint (frontier is at
+	// its max after wg.Wait).
+	if !o.sawTxMarker {
+		o.flushPendingBoundary()
 	}
 	return o.writeCheckpoint(ctx)
 }
@@ -526,11 +590,30 @@ func isSchemaSnapshot(c ir.Change) bool {
 // when the position CHANGES, so the highest seq of each position run is the
 // boundary — exactly the safe point.
 func (o *Orchestrator) noteBoundary(seq uint64, pos ir.Position) {
-	if o.prevSeq != 0 && pos.Token != o.prevPos.Token {
+	if o.prevSeq != 0 && pos.Token != o.prevPos.Token && o.prevSeq > o.lastNotedSeq {
 		o.frontier.RecordTxBoundary(o.prevSeq, o.prevPos)
+		o.lastNotedSeq = o.prevSeq
 	}
 	o.prevSeq = seq
 	o.prevPos = pos
+}
+
+// flushPendingBoundary records the trailing prevSeq/prevPos of a marker-LESS
+// stream as a checkpoint boundary if it hasn't been recorded yet. The
+// position-run heuristic in noteBoundary records a run's boundary only when a
+// DIFFERENT-token successor arrives; on a quiet / low-volume stream no such
+// successor comes, so the last applied change's watermark would never persist
+// (Bug 159). The idle-checkpoint tick and clean end-of-stream call this to
+// record that trailing boundary. Safe because on a marker-LESS stream every
+// row carries a distinct, monotone position token (e.g. the pgtrigger
+// change-log id), so a settled prevSeq IS a resume-safe point — there is no
+// in-flight successor sharing its token. Idempotent via lastNotedSeq.
+// Coordinator-goroutine-only. No-op on a marker stream (prevSeq stays 0).
+func (o *Orchestrator) flushPendingBoundary() {
+	if o.prevSeq != 0 && o.prevSeq > o.lastNotedSeq {
+		o.frontier.RecordTxBoundary(o.prevSeq, o.prevPos)
+		o.lastNotedSeq = o.prevSeq
+	}
 }
 
 // routeRow routes a keyed row-change to its key-hash lane, or falls to the
