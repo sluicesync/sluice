@@ -4,7 +4,11 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
-## [0.99.125] - 2026-06-24
+## [0.99.126] - 2026-06-25
+
+### Changed
+
+- **Test coverage: added a multi-schema generated-column integration pin (no behavior change).** `TestMigrate_PG_Generated_NonPublicSchema` exercises a `GENERATED ALWAYS AS … STORED` column living in a **non-`public`** PostgreSQL source schema end-to-end — asserting it is detected, dropped from the bulk-copy column list (PG rejects writes to a generated column), recreated as a real `GENERATED` column on the target, recomputed on the initial copy *and* on a subsequent UPDATE, with no spillover into `public`. This guards the class of bug seen in other tools (e.g. heroku-migrator#11) where generated-column detection was hardcoded to the `public` schema and silently missed others; sluice's PostgreSQL schema reader is parameterized by schema (`WHERE table_schema = $1`), so detection always matches the schema actually being migrated — this pin makes that property explicit. Behavior, flags, and value handling are unchanged; this release is test + documentation only.
 
 ### Fixed
 
