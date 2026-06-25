@@ -19,6 +19,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/engines/mysql"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline"
@@ -191,15 +192,19 @@ type MigrateCmd struct {
 
 	BulkBatchSize int `help:"Bulk-copy batch size for resume-mid-table checkpointing. Each batch commits with an updated cursor in sluice_migrate_state.table_progress, so a crash mid-table resumes without re-copying the prefix. Tables without a PK fall back to truncate-and-redo regardless. Lower values shorten the replay window on crash; higher values amortise per-tx commit overhead. Only consulted on the resume path; cold-start migrations use the faster plain-INSERT / COPY path. Default 5000." default:"5000" placeholder:"N"`
 
-	BulkParallelism int `help:"Number of parallel reader/writer pairs per table during bulk copy. Tables above --bulk-parallel-min-rows are split into this many PK ranges and copied concurrently. Tables without a single integer PK fall back to single-reader. 0 means use min(8, NumCPU); 1 disables parallelism. See ADR-0019." default:"0" placeholder:"N"`
+	// ADR-0118 finding 1(a): lead with applicability. On `migrate` these are
+	// the general-purpose copy-parallelism knobs and apply for EVERY source
+	// (the within-table axis) — distinct from the `sync start` variants, which
+	// are PG-source-only.
+	BulkParallelism int `help:"Every source: number of parallel reader/writer pairs per table during bulk copy — the within-table axis. Tables above --bulk-parallel-min-rows are split into this many PK ranges and copied concurrently. Tables without a single integer PK fall back to single-reader. 0 means use min(8, NumCPU); 1 disables parallelism. See ADR-0019." default:"0" placeholder:"N"`
 
-	TableParallelism int `help:"Number of tables copied CONCURRENTLY during bulk copy — the cross-table axis (pgcopydb --table-jobs), composed with the within-table --bulk-parallelism axis. Closes the many-medium-table gap where each table sat below the within-table-split threshold and the table loop ran them serially, leaving cores idle. The two axes MULTIPLY: at most --table-parallelism × (effective --bulk-parallelism) connections open against the target at once, and that PRODUCT is bounded by the target's connection budget (and --max-target-connections) at a single chokepoint — within-table parallelism is satisfied first, the table axis gets whatever remains. 0 (default) = auto: 4 (pgcopydb's --table-jobs default), bounded by the budget split. 1 disables cross-table concurrency (one table at a time). Only the migrate path uses this; the sync cold-start path stays serial by design. See ADR-0076." default:"0" placeholder:"N"`
+	TableParallelism int `help:"Every source: number of tables copied CONCURRENTLY during bulk copy — the cross-table axis (pgcopydb --table-jobs), composed with the within-table --bulk-parallelism axis. Closes the many-medium-table gap where each table sat below the within-table-split threshold and the table loop ran them serially, leaving cores idle. The two axes MULTIPLY: at most --table-parallelism × (effective --bulk-parallelism) connections open against the target at once, and that PRODUCT is bounded by the target's connection budget (and --max-target-connections) at a single chokepoint — within-table parallelism is satisfied first, the table axis gets whatever remains. 0 (default) = auto: 4 (pgcopydb's --table-jobs default), bounded by the budget split. 1 disables cross-table concurrency (one table at a time). Only the migrate path uses this; the sync cold-start path stays serial by design. See ADR-0076." default:"0" placeholder:"N"`
 
 	MaxTargetConnections int `help:"Explicit ceiling on the number of connections the bulk-copy pool opens against the target (connection-resilience item 4). 0 (default) = auto: sluice probes the target's connection-slot budget (Postgres max_connections / role / database limits minus in-use and a small reserve) and caps --bulk-parallelism to fit, refusing loudly if no budget is free. When set, it's an explicit upper bound the auto-cap further bounds — it never raises --bulk-parallelism. Inert against engines without a connection-slot model (MySQL target)." default:"0" placeholder:"N"`
 
 	ReapStaleBackends bool `help:"Terminate sluice's OWN orphaned backends on the target during the cold-start preflight (connection-resilience Phase 2, item 2). Detection runs ALWAYS and reports loudly; this flag authorises pg_terminate_backend on each orphan. An orphan is a backend whose application_name carries the 'sluice/' prefix, owned by the connecting role, NOT the current session, and either idle-in-transaction or holding a lock on a relation sluice is about to write — typically a SIGKILL'd / OOM'd prior run whose server-side COPY backend still holds a target-table lock and a connection slot. Default off — detect-and-report is the safe baseline, because a legitimately-running concurrent sluice process on the same target is a real possibility (the report is shown first so you can tell them apart). Termination is always scoped to your own sluice backends; it never touches another role's or a non-sluice session, and needs no superuser grant. Inert against engines without a backend model (MySQL target)."`
 
-	BulkParallelMinRows int64 `help:"Row-count threshold below which a table is copied with a single reader/writer pair regardless of --bulk-parallelism. Avoids per-chunk overhead on small tables. 0 (default) = auto: base 80000 (sits below 100k to absorb the InnoDB information_schema row-count undershoot), dialled DOWN on many-table schemas (base/table-count, floored at 10000) so a many-medium-table migrate engages within-table parallelism instead of copying each table serially + single-streamed (the pgcopydb many-table gap, roadmap item 3). Set an explicit N to pin the threshold (e.g. 100000 for pre-v0.62.0 behaviour); explicit values are never auto-lowered." default:"0" placeholder:"N"`
+	BulkParallelMinRows int64 `help:"Every source: row-count threshold below which a table is copied with a single reader/writer pair regardless of --bulk-parallelism. Avoids per-chunk overhead on small tables. 0 (default) = auto: base 80000 (sits below 100k to absorb the InnoDB information_schema row-count undershoot), dialled DOWN on many-table schemas (base/table-count, floored at 10000) so a many-medium-table migrate engages within-table parallelism instead of copying each table serially + single-streamed (the pgcopydb many-table gap, roadmap item 3). Set an explicit N to pin the threshold (e.g. 100000 for pre-v0.62.0 behaviour); explicit values are never auto-lowered." default:"0" placeholder:"N"`
 
 	MaxBufferBytes int64 `help:"Soft cap on per-batch buffered memory in the bulk-copy writer. The writer flushes when accumulated row-value bytes reach the cap regardless of row count, so wide-row workloads (TEXT/BYTEA/JSON at MB scale) don't blow out heap. A single row larger than the cap still applies (soft target). Default 67108864 (64 MiB). See ADR-0028." default:"67108864" placeholder:"N"`
 
@@ -694,15 +699,35 @@ type SyncStartCmd struct {
 
 	IndexBuildParallelism int `help:"Postgres-only, cold-start branch: number of secondary indexes to build CONCURRENTLY in the deferred index phase (Phase B). Each concurrent build runs plain CREATE INDEX on its own connection with its own maintenance_work_mem, so the aggregate memory budget is DIVIDED across the workers. 0 (default) = auto: sluice derives a conservative N bounded by the target's spare connection-slot budget AND a memory budget (so it can't OOM a small node) AND the index count. Parallelism barely helps below PS-640 (max_worker_processes flat at 4), so auto stays modest there. Set >0 to override the auto count verbatim; N=1 forces the serial build. Only the cold-start path builds indexes; warm-resume ignores this. Inert on MySQL targets. See docs/dev/notes/index-build-phase-tuning.md." default:"0" placeholder:"N"`
 
-	BulkParallelism int `help:"FAST cold-start (ADR-0079, PG source) only: parallel reader/writer pairs PER table during the initial cold-start copy — the within-table axis (ADR-0019 PK-range chunking). Engages with the cross-table --table-parallelism axis when the PG source surfaces a shareable exported snapshot; all parallel readers are pinned to the ONE snapshot. 0 = min(8, NumCPU); 1 disables. Inert on MySQL/VStream sources (serial cold-start). See ADR-0079." default:"0" placeholder:"N"`
+	// ADR-0118 finding 1(a): the applicability clause is front-loaded as the
+	// FIRST thing a --help reader sees. On a MySQL/VStream source these flags
+	// are INERT (serial cold-start); --copy-fanout-degree / the DSN copy-table
+	// parallelism knobs (--vstream-copy-table-parallelism /
+	// --copy-table-parallelism) tune VStream/native cold-copy there. Setting
+	// one explicitly on such a source emits a one-time runtime WARN (finding
+	// 1(b), see warnInertParallelismFlags).
+	BulkParallelism int `help:"PG source only; inert on MySQL/VStream — use --copy-fanout-degree / --vstream-copy-table-parallelism / --copy-table-parallelism there. FAST cold-start (ADR-0079): parallel reader/writer pairs PER table during the initial cold-start copy — the within-table axis (ADR-0019 PK-range chunking). Engages with the cross-table --table-parallelism axis when the PG source surfaces a shareable exported snapshot; all parallel readers are pinned to the ONE snapshot. 0 = min(8, NumCPU); 1 disables. See ADR-0079." default:"0" placeholder:"N"`
 
-	TableParallelism int `help:"FAST cold-start (ADR-0079, PG source) only: tables copied CONCURRENTLY during the initial cold-start copy — the cross-table axis (pgcopydb --table-jobs), composed with within-table --bulk-parallelism. The two MULTIPLY; the product (plus the reserved CDC connection) is bounded by the target's connection budget and --max-target-connections at a single chokepoint. 0 (default) = auto: 4. 1 disables cross-table concurrency. Inert on MySQL/VStream sources (serial cold-start). See ADR-0076 / ADR-0079." default:"0" placeholder:"N"`
+	TableParallelism int `help:"PG source only; inert on MySQL/VStream — use --copy-fanout-degree / --vstream-copy-table-parallelism / --copy-table-parallelism there. FAST cold-start (ADR-0079): tables copied CONCURRENTLY during the initial cold-start copy — the cross-table axis (pgcopydb --table-jobs), composed with within-table --bulk-parallelism. The two MULTIPLY; the product (plus the reserved CDC connection) is bounded by the target's connection budget and --max-target-connections at a single chokepoint. 0 (default) = auto: 4. 1 disables cross-table concurrency. See ADR-0076 / ADR-0079." default:"0" placeholder:"N"`
 
-	BulkParallelMinRows int64 `help:"FAST cold-start (ADR-0079, PG source) only: row-count threshold below which a table is copied with a single reader/writer pair regardless of --bulk-parallelism. 0 (default) = auto (base 80000, dialled down on many-table schemas). Set an explicit N to pin it. Inert on MySQL/VStream sources (serial cold-start)." default:"0" placeholder:"N"`
+	BulkParallelMinRows int64 `help:"PG source only; inert on MySQL/VStream — use --copy-fanout-degree / --vstream-copy-table-parallelism / --copy-table-parallelism there. FAST cold-start (ADR-0079): row-count threshold below which a table is copied with a single reader/writer pair regardless of --bulk-parallelism. 0 (default) = auto (base 80000, dialled down on many-table schemas). Set an explicit N to pin it." default:"0" placeholder:"N"`
 
 	BulkBatchSize int `help:"FAST cold-start (ADR-0079, PG source) only: bulk-copy batch size for the within-table cursor path. Default 5000. Inert on MySQL/VStream sources (serial cold-start)." default:"5000" placeholder:"N"`
 
 	CopyFanoutDegree int `help:"VStream/CDC snapshot cold-start (ADR-0097, PlanetScale-MySQL target) only: WRITE-side fan-out — the single incoming snapshot row stream is PK-hash-partitioned out to N concurrent batched-INSERT writer workers, each on its own connection, to beat the single cross-region-RTT-bound INSERT connection vtgate forces (it blocks LOAD DATA). 0 (default) = auto: 4; 1 disables fan-out (serial). Bounded by the target connection budget / --max-target-connections. Inert on the FAST cold-start path and on no-PK tables. See ADR-0097." default:"0" placeholder:"N"`
+
+	// ADR-0118 finding 4: promote the DSN read-axis params to first-class CLI
+	// flags. Precedence is explicit CLI flag > DSN param > engine default
+	// (1 = serial). 0 (the default, unset) means "fall back to the DSN param",
+	// so the new flag's zero value never silently overrides a DSN value — only
+	// an explicitly-set CLI flag wins (zero-value-safe, the v0.99.51 trap). The
+	// DSN form (vstream_copy_table_parallelism / copy_table_parallelism in the
+	// source DSN query-string) keeps working verbatim. The resolved override is
+	// threaded into the mysql engine in SyncStartCmd.Run, where the engine reads
+	// it ahead of the DSN param.
+	VStreamCopyTableParallelism int `name:"vstream-copy-table-parallelism" help:"VStream cold-copy READ axis (Vitess/PlanetScale source): the number of CONCURRENT single-table COPY streams the auto-shard cold-copy runs (ADR-0099), the read-side sibling of the write-side --copy-fanout-degree. 0 (default) = unset — fall back to the source DSN's vstream_copy_table_parallelism param, then to the engine default (1 = serial single-stream). An explicit value here WINS over the DSN param. The DSN form keeps working verbatim. 1 = serial. Inert on PG / native-MySQL sources." default:"0" placeholder:"N"`
+
+	CopyTableParallelism int `name:"copy-table-parallelism" help:"Native-MySQL cold-copy READ axis (self-managed, non-Vitess MySQL source): the number of CONCURRENT FTWRL-coordinated pinned-snapshot reader connections the cold-copy opens (ADR-0101). 0 (default) = unset — fall back to the source DSN's copy_table_parallelism param, then to the engine default (1 = serial single-snapshot). An explicit value here WINS over the DSN param. The DSN form keeps working verbatim. 1 = serial. Inert on PG / VStream sources." default:"0" placeholder:"N"`
 
 	RawCopyFormat string `help:"FAST cold-start (ADR-0079, same-engine PG→PG) only: wire format for the raw-copy passthrough fast lane (ADR-0078). 'text' (default) is cross-major safe; 'binary' is used only when source and target server majors match (downgrades to text loudly otherwise); 'auto' requests binary. The lane engages ONLY for a no-transform copy (no --redact / --type-override / --expr-override / --inject-shard-column). Inert on MySQL/VStream sources (serial cold-start)." default:"text" enum:"text,binary,auto" placeholder:"text|binary|auto"`
 
@@ -714,9 +739,13 @@ type SyncStartCmd struct {
 
 	ApplyConcurrency int `help:"MySQL or Postgres target (ADR-0104 / ADR-0105, item 23(c)/26): the key-hash apply LANE count W. The merged CDC change stream is fanned across W in-order apply lanes by primary-key hash (same key → same lane → applied in source order, so dependent INSERT→UPDATE→DELETE on a row never reorder), each lane committing CONCURRENTLY on a dedicated backend with its OWN AIMD batch-size controller. On a high-latency cross-region link a serial applier is RTT-bound and falls below the source write rate, causing the per-shard MinimizeSkew wedge; concurrent lanes lift aggregate apply throughput toward W× and keep both shards drained (live-validated ~4× on a 2-shard Vitess→PlanetScale-MySQL link). The resume position advances only to a source boundary durable across ALL lanes (exactly-once for keyed tables; keyless stays at-least-once). An in-lane abort that the target may transiently throw — a PlanetScale transaction-killer (MySQL) or a serialization/deadlock (Postgres) — is handled IN-LANE: the lane's controller shrinks and the batch is split-and-retried idempotently without restarting the stream. ADR-0106 (FAST BY DEFAULT): 0 (the default, unset) = auto:N — an adaptive, connection-budget-bounded lane count: Postgres min(4, slot-budget) via the same probe --max-target-connections drives, MySQL/PlanetScale a fixed conservative ceiling of 4 (no slot probe, --max-target-connections inert there). 1 = the explicit SERIAL opt-out (byte-identical to the pre-ADR-0106 default, for operators who want strictly serial apply). W>1 honored verbatim (you own your target's budget). The auto value matches the cold-copy axes' auto:4 so the whole pipeline fans out ~4-wide by default, bounded by the target. Keep --apply-batch-size at a sane value (the default is fine): an absurdly high ceiling can make the controller lag on an abort-heavy target (safe — no data loss — but slow). On Postgres this composes with (does not replace) the ADR-0092 statement pipelining used within each lane's transaction." default:"0" placeholder:"W"`
 
-	ApplyRetryAttempts    int           `help:"Maximum consecutive retriable apply failures the streamer absorbs before exiting. ADR-0038. 1 = no retry (exit on first transient — pre-v0.42.0 behaviour). 8 = default for managed-Vitess / Vitess-flavoured MySQL where tx-killer transients are routine. Counter resets when persisted CDC position advances between attempts; a streamer surviving for hours doesn't carry retry debt." default:"8" placeholder:"N"`
-	ApplyRetryBackoffBase time.Duration `help:"Base interval for the exponential backoff between retriable apply failures. ADR-0038. Doubles on each consecutive failure, capped at --apply-retry-backoff-cap. Only consulted when --apply-retry-attempts > 1." default:"100ms" placeholder:"DUR"`
-	ApplyRetryBackoffCap  time.Duration `help:"Upper bound on each per-attempt backoff interval. ADR-0038. Defaults to 30s. With 8 attempts and default base, the per-attempt sequence is: 100ms → 200ms → 400ms → 800ms → 1.6s → 3.2s → 6.4s → 12.8s, capped at the cap when it grows past." default:"30s" placeholder:"DUR"`
+	// ADR-0118 finding 2: cross-add backup's --retry-* spelling as an alias
+	// (identical concept + defaults, 8/100ms/30s). The primary shown in
+	// --help stays the sync-stream's --apply-retry-* name. Additive —
+	// no existing command line changes behaviour.
+	ApplyRetryAttempts    int           `aliases:"retry-attempts" help:"Maximum consecutive retriable apply failures the streamer absorbs before exiting. ADR-0038. 1 = no retry (exit on first transient — pre-v0.42.0 behaviour). 8 = default for managed-Vitess / Vitess-flavoured MySQL where tx-killer transients are routine. Counter resets when persisted CDC position advances between attempts; a streamer surviving for hours doesn't carry retry debt. Alias: --retry-attempts (the backup-stream spelling)." default:"8" placeholder:"N"`
+	ApplyRetryBackoffBase time.Duration `aliases:"retry-backoff-base" help:"Base interval for the exponential backoff between retriable apply failures. ADR-0038. Doubles on each consecutive failure, capped at --apply-retry-backoff-cap. Only consulted when --apply-retry-attempts > 1. Alias: --retry-backoff-base (the backup-stream spelling)." default:"100ms" placeholder:"DUR"`
+	ApplyRetryBackoffCap  time.Duration `aliases:"retry-backoff-cap" help:"Upper bound on each per-attempt backoff interval. ADR-0038. Defaults to 30s. With 8 attempts and default base, the per-attempt sequence is: 100ms → 200ms → 400ms → 800ms → 1.6s → 3.2s → 6.4s → 12.8s, capped at the cap when it grows past. Alias: --retry-backoff-cap (the backup-stream spelling)." default:"30s" placeholder:"DUR"`
 
 	MetricsListen string `help:"Bind a Prometheus-format /metrics endpoint at this address (e.g. ':9090' for all interfaces port 9090, '127.0.0.1:9090' for localhost only) for the duration of the stream. Off by default — opt-in. Companion to 'sluice sync health' (which is the cron-friendly one-shot probe shape). Useful for operators running Prometheus / Grafana / alertmanager." placeholder:"ADDR"`
 
@@ -1121,6 +1150,21 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 	if err != nil {
 		return fmt.Errorf("--target-driver: %w", err)
 	}
+
+	// ADR-0118 finding 1(b): the FAST-cold-start parallelism flags are inert
+	// on a MySQL/VStream source (serial cold-start). If the operator set one
+	// EXPLICITLY against such a source, turn the silent no-op into a one-time
+	// loud WARN (detection is by the literal argv spelling, not the resolved
+	// value — see warnInertParallelismFlags).
+	warnInertParallelismFlags(kongContext(), source)
+
+	// ADR-0118 finding 4: thread the explicit read-axis CLI flags into the
+	// mysql engine at the composition root (the same idiom as
+	// --mysql-sql-mode / --zero-date). A value > 0 wins over the source DSN's
+	// vstream_copy_table_parallelism / copy_table_parallelism param; 0 (the
+	// default) leaves the DSN-then-default behaviour byte-identical.
+	mysql.SetVStreamCopyTableParallelismOverride(s.VStreamCopyTableParallelism)
+	mysql.SetNativeCopyTableParallelismOverride(s.CopyTableParallelism)
 
 	if len(s.IncludeTable) > 0 && len(s.ExcludeTable) > 0 {
 		return errors.New("--include-table and --exclude-table are mutually exclusive")

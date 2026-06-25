@@ -1,6 +1,6 @@
 # ADR-0118: CLI flag-naming consistency (aliases over renames)
 
-- Status: Proposed
+- Status: Accepted (implemented in vX.Y.Z — main session fills the version on tag)
 - Date: 2026-06-24
 - Deciders: maintainer
 - Related: [ADR-0091](adr-0091-default-on-schema-change-forwarding.md) (the `--forward-schema-add-column` deprecation pattern this ADR reuses), [ADR-0076](adr-0076-cross-table-copy-worker-pool.md) / [ADR-0079](adr-0079-fast-cold-start-for-sync-path.md) (the two-axis copy parallelism flags), [ADR-0084](adr-0084-backup-restore-cross-table-parallelism.md) / [ADR-0088](adr-0088-mysql-coordinated-parallel-backup-snapshot.md) (backup/restore parallelism), [ADR-0097](adr-0097-parallel-writer-fanout-vstream-snapshot-copy.md) (`--copy-fanout-degree`), [ADR-0038](adr-0038-applier-retry-on-transient-errors.md) (apply/rollover retry knobs), [ADR-0104](adr-0104-mysql-pipelined-cdc-apply.md) (`--apply-concurrency`)
