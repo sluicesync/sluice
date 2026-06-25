@@ -44,6 +44,17 @@ steadily to 0) and the value-sensitive checksum matched exactly on both sides.
 Every INSERT/UPDATE/DELETE issued during the cold-copy and steady-state was
 applied exactly once.
 
+## Memory soak (sibling tool)
+
+Where this harness validates zero-LOSS, `soak.ps1` measures the long-running
+**memory** profile of `sluice sync` in CDC follow mode — does RSS plateau (no
+leak / no unbounded GC sawtooth) and does `--max-memory` bound it? See
+[`cdc-soak.md`](cdc-soak.md) for the harness, the analysis recipe, and the
+results on record (RSS plateaus flat ~66 MB; `--max-memory` binds it lower; the
+buffer doesn't fill even under a throttled target on the PG path).
+
+## Drain rate
+
 Note on drain rate: the default **per-change** apply (ADR-0017, batch-size 1)
 drained at ~210 net rows/s here, so a heavy sustained writer builds a backlog
 that takes minutes to drain after it stops — a *throughput* characteristic, not
