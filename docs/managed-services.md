@@ -194,6 +194,106 @@ PlanetScale endpoint (requires PlanetScale credentials), run
 on-demand before releases for vendor-specific coverage beyond what
 container Vitess exhibits.
 
+## Storage auto-grow & primary-reparent resilience (PlanetScale and other Vitess/managed targets)
+
+Managed targets that auto-grow storage — most visibly a non-Metal
+PlanetScale instance crossing a storage boundary, but the same shape
+applies to any service that reparents a primary during normal operation
+— briefly disrupt in-flight writes while the volume grows and a new
+primary is promoted. Sluice rides these windows automatically; **no
+flags are required**, and the behaviour is bounded and loud on genuine
+exhaustion (a target that never recovers still fails rather than hanging
+forever). What's covered:
+
+| Phase | Behaviour during a grow/reparent | Reference |
+|-------|----------------------------------|-----------|
+| Cold-copy **write** | Per-batch flush retries on a fresh connection (the reparented primary) | ADR-0108 |
+| Cold-copy **source read** | Reconnect-and-resume from the durable chunk cursor | ADR-0109 |
+| Cold-copy coordination | All concurrent copy lanes quiesce together for the grow window, then resume | ADR-0110 |
+| Restore (parallel) | Any reparent-touched table is re-derived from its immutable backup chunks so it matches the manifest exactly | ADR-0113 |
+| **Post-copy DDL** (index / constraint / view / identity-sequence build) | The phase retries through the reparent instead of aborting after a correct data copy | ADR-0114 (v0.99.118) |
+
+During a grow window you'll see `WARN` lines naming the transient
+(e.g. PG `57P01`/`57P03`/`53100`, MySQL/Vitess `1105 "not serving"` /
+read-only / disk-full) and the retry; these are expected and
+self-clearing. A real, non-transient failure (a genuine type error, an
+unrecoverable target) still surfaces loudly and promptly — only the
+classified grow/reparent transients are ridden out.
+
+## Control-plane metrics, proactive adaptivity & alerting (PlanetScale)
+
+Sluice can consume PlanetScale's **control-plane metrics** (target CPU,
+memory, storage, replication lag, connections) to adapt proactively and
+to surface operator alerts. This is opt-in and uses a metrics token
+distinct from the database DSN — it reads the PlanetScale metrics API,
+not the database.
+
+Enable it on `sync start` (or `diagnose`) with the telemetry flags; the
+token is supplied via environment variables, never on the command line:
+
+```bash
+export PLANETSCALE_METRICS_TOKEN_ID=...
+export PLANETSCALE_METRICS_TOKEN=...
+sluice sync start \
+  --source-driver planetscale --source "$SOURCE" \
+  --target-driver postgres   --target "$TARGET" \
+  --planetscale-org acme \
+  --planetscale-metrics-db app          # defaults to the target DSN's database \
+  --notify-storage-util 0.85 --notify-cpu-util 0.90 \
+  --notify-slack "$SLACK_WEBHOOK"
+```
+
+- **Proactive adaptivity** — live CPU/memory headroom clamps the
+  startup apply-lane count (see `--apply-concurrency` below) and damps
+  the apply AIMD high-water during pressure; a storage-headroom signal
+  coordinates the cold-copy grow-gate.
+- **Threshold alerts** (`--notify-*`) — edge-triggered, cooldown'd
+  (`--notify-cooldown`, default 15m), hysteresis-armed alerts to a
+  generic webhook (`SLUICE_NOTIFY_WEBHOOK`) or Slack
+  (`SLUICE_NOTIFY_SLACK` / `--notify-slack`). Rules:
+  `--notify-storage-util` / `-cpu-util` / `-mem-util` (fractions 0–1),
+  `--notify-lag-seconds`, and the rate-of-change
+  `--notify-storage-growth-per-min`. Advisory and failure-isolated — a
+  dead sink is logged and swallowed; an unobserved metric never fires.
+- **Metrics history** — when telemetry is configured, sluice persists a
+  rolling history (current / 1m / 5m / 10m) to a
+  `sluice_target_metrics_history` table on the target (7-day retention),
+  surfaced in `sluice diagnose`. Disable with
+  `--suppress-target-metrics-history`.
+- **Own `/metrics` export** — every sluice `/metrics` endpoint also
+  emits `sluice_build_info{version,commit,go_version}`, a Go-runtime
+  block, and the `sluice_target_*` gauge family (CPU/mem/storage/lag)
+  when telemetry is on.
+
+### Standalone `sluice metrics-watch` daemon
+
+To watch a PlanetScale database's health **without** running a
+sync — for dashboards or alert-only operation — `metrics-watch` polls
+the control-plane metrics with no database connection attached:
+
+```bash
+sluice metrics-watch \
+  --engine planetscale --planetscale-org acme --planetscale-metrics-db app \
+  --notify-storage-util 0.85 --notify-slack "$SLACK_WEBHOOK" --quiet
+```
+
+It prints a live `cpu= mem= storage= lag= conns=` line (suppressed with
+`--quiet`), fires the **same** `--notify-*` alerts as `sync start`,
+supports `--once` (single sample, for scripts) and `--interval`
+(default 60s), and with `--metrics-listen ADDR` becomes a standalone
+PlanetScale-metrics Prometheus exporter — needing only the metrics
+token, no DB credential.
+
+### Fast-by-default concurrent CDC apply
+
+`--apply-concurrency` controls the key-hash CDC apply lane count and is
+**adaptive-by-default** (`0`/unset → an auto value bounded by the
+target's measured headroom; engine-general across MySQL and Postgres).
+Each lane runs its own AIMD controller and recovers in-lane from a
+PlanetScale tx-killer / deadlock (shrink + idempotent split-retry, no
+stream restart). Exactly-once is preserved for keyed tables. Pass
+`--apply-concurrency 1` to force the legacy serial apply.
+
 ## Other managed services
 
 The following haven't been formally verified but should work on the

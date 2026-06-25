@@ -121,6 +121,112 @@ func TestPgIndexName_NoCollisionAcrossLongSiblingNames(t *testing.T) {
 	}
 }
 
+// TestEmitCreateIndex_NameLengthRefusal pins roadmap item 43: an
+// effective PG index name >63 BYTES is refused loudly (PG would silently
+// truncate it into a collision against another index sharing the same
+// 63-byte prefix; with CREATE INDEX IF NOT EXISTS the second create
+// silently no-ops → missing index = silent schema-fidelity loss). The
+// matrix proves: exactly-63 accepted; 64 refused with the name in the
+// message; a multibyte/UTF-8 name whose RUNE count <=63 but BYTE count
+// >63 refused (proves BYTE-based, not rune-based); and two names
+// differing only after byte 63 both refused.
+func TestEmitCreateIndex_NameLengthRefusal(t *testing.T) {
+	// A short table name so pgIndexName's prepend doesn't itself push a
+	// boundary case over the limit — these cases exercise the EFFECTIVE
+	// name length, and the source names here already start with the
+	// convention/table form so they emit verbatim (no prepend). We
+	// construct verbatim-emitted names by using the `ix_<table>_` shape
+	// so pgIndexName returns the source name unchanged and the assertion
+	// is about the source's own byte length.
+	const tbl = "t"
+
+	// helper: build a single-column index with the given name.
+	mkIdx := func(name string) *ir.Index {
+		return &ir.Index{Name: name, Columns: []ir.IndexColumn{{Column: "c"}}}
+	}
+
+	// 63-byte ASCII name, emitted verbatim (starts with `ix_t_`).
+	name63 := "ix_t_" + strings.Repeat("a", 63-len("ix_t_"))
+	if len(name63) != 63 {
+		t.Fatalf("test setup: name63 is %d bytes, want 63", len(name63))
+	}
+	// 64-byte ASCII name, emitted verbatim.
+	name64 := "ix_t_" + strings.Repeat("a", 64-len("ix_t_"))
+	if len(name64) != 64 {
+		t.Fatalf("test setup: name64 is %d bytes, want 64", len(name64))
+	}
+
+	// Multibyte: rune count <=63 but byte count >63. 'é' is 2 bytes in
+	// UTF-8. `ix_t_` (5 bytes) + 30×'é' (60 bytes) = 65 bytes, 35 runes.
+	multibyte := "ix_t_" + strings.Repeat("é", 30)
+	if rc := len([]rune(multibyte)); rc > maxPGIdentifierLen {
+		t.Fatalf("test setup: multibyte rune count %d should be <=%d to prove byte-vs-rune", rc, maxPGIdentifierLen)
+	}
+	if len(multibyte) <= maxPGIdentifierLen {
+		t.Fatalf("test setup: multibyte byte count %d should be >%d", len(multibyte), maxPGIdentifierLen)
+	}
+
+	t.Run("exactly 63 bytes accepted", func(t *testing.T) {
+		stmt, err := emitCreateIndex("public", tbl, mkIdx(name63), emitOpts{})
+		if err != nil {
+			t.Fatalf("63-byte name should be accepted, got error: %v", err)
+		}
+		if !strings.Contains(stmt, name63) {
+			t.Errorf("emitted statement should contain the 63-byte name; got %q", stmt)
+		}
+	})
+
+	t.Run("64 bytes refused loudly with name in message", func(t *testing.T) {
+		_, err := emitCreateIndex("public", tbl, mkIdx(name64), emitOpts{})
+		if err == nil {
+			t.Fatal("64-byte name must be refused, got nil error")
+		}
+		if !strings.Contains(err.Error(), name64) {
+			t.Errorf("error message must name the offending index %q; got %q", name64, err.Error())
+		}
+		if !strings.Contains(err.Error(), tbl) {
+			t.Errorf("error message must name the offending table %q; got %q", tbl, err.Error())
+		}
+	})
+
+	t.Run("multibyte name >63 bytes but <=63 runes refused (byte-based)", func(t *testing.T) {
+		_, err := emitCreateIndex("public", tbl, mkIdx(multibyte), emitOpts{})
+		if err == nil {
+			t.Fatalf("multibyte name of %d bytes (%d runes) must be refused (byte-based check), got nil error",
+				len(multibyte), len([]rune(multibyte)))
+		}
+		if !strings.Contains(err.Error(), multibyte) {
+			t.Errorf("error message must name the offending index; got %q", err.Error())
+		}
+	})
+
+	t.Run("two names differing only after byte 63 both refused", func(t *testing.T) {
+		base := "ix_t_" + strings.Repeat("a", 63-len("ix_t_")) // 63 bytes shared prefix
+		nameA := base + "_alpha"
+		nameB := base + "_beta"
+		if _, err := emitCreateIndex("public", tbl, mkIdx(nameA), emitOpts{}); err == nil {
+			t.Errorf("name A (%d bytes) sharing a 63-byte prefix must be refused", len(nameA))
+		}
+		if _, err := emitCreateIndex("public", tbl, mkIdx(nameB), emitOpts{}); err == nil {
+			t.Errorf("name B (%d bytes) sharing a 63-byte prefix must be refused", len(nameB))
+		}
+	})
+}
+
+// TestValidatePGIndexName_Boundary is a direct unit pin on the helper at
+// the exact 63/64-byte boundary (separate from the emitter wiring so a
+// regression in either layer is localizable).
+func TestValidatePGIndexName_Boundary(t *testing.T) {
+	at63 := strings.Repeat("x", 63)
+	if err := validatePGIndexName(at63, at63, "tbl"); err != nil {
+		t.Errorf("63 bytes must pass; got %v", err)
+	}
+	at64 := strings.Repeat("x", 64)
+	if err := validatePGIndexName(at64, at64, "tbl"); err == nil {
+		t.Error("64 bytes must be refused")
+	}
+}
+
 func TestEmitColumnType(t *testing.T) {
 	cases := []struct {
 		name string

@@ -71,6 +71,15 @@ type Request struct {
 	// bundles.
 	CrashContext string
 
+	// TargetTelemetry is an optional control-plane telemetry provider
+	// (ADR-0107 — today: PlanetScale metrics) for the target. When set,
+	// PrivacyStandard+ bundles include a "Target health" section with the
+	// most recent CPU/mem/storage/lag/connection snapshot, so a recipient
+	// sees WHY apply was slow (a hot or storage-constrained target) without
+	// leaving the bundle. nil ⇒ the section records "telemetry not
+	// configured" — the honest absence, never a fabricated reading.
+	TargetTelemetry ir.TargetTelemetry
+
 	// Now overrides the assembler's wall-clock for tests. Production
 	// callers leave this zero and the assembler uses time.Now().
 	Now time.Time
@@ -279,7 +288,218 @@ func collectStandardSections(ctx context.Context, zw *zip.Writer, req Request) e
 		probeAndWriteHealth(ctx, zw, "health/sync_health.json", req)
 	}
 
+	// Target health — the ADR-0107 control-plane telemetry snapshot
+	// (CPU/mem/storage/lag/conns). Always emitted at PrivacyStandard+ so
+	// the recipient can tell "telemetry not configured" from "configured but
+	// no fresh sample" from a real reading.
+	probeAndWriteTargetHealth(ctx, zw, "health/target_health.json", req)
+
+	// Target metrics ROLLING HISTORY — the ADR-0107 item 35 persisted trend
+	// (recent rows + current/1m/5m/10m avg+max aggregates for cpu/mem/
+	// storage). Read from the sluice_target_metrics_history table on the
+	// target via the optional ir.TargetMetricsHistoryStore surface.
+	probeAndWriteTargetMetricsHistory(ctx, zw, "health/target_metrics_history.json", req)
+
 	return nil
+}
+
+// targetMetricsHistoryRowCap bounds the rolling-history rows embedded in the
+// bundle: 120 rows ≈ 2h at the ~60s scrape cadence — enough trend for a
+// recipient diagnosing a slow apply without ballooning the bundle.
+const targetMetricsHistoryRowCap = 120
+
+// probeAndWriteTargetMetricsHistory writes the ADR-0107 item 35
+// rolling-history section: the recent persisted samples plus current /
+// 1m / 5m / 10m avg+max aggregates for cpu/mem/storage. Honest states,
+// mirroring the other section helpers (reason file, never fail the bundle):
+//   - target engine/DSN missing ⇒ reason file,
+//   - engine's applier doesn't implement ir.TargetMetricsHistoryStore ⇒
+//     reason file (so "not supported" is distinguishable from "no rows"),
+//   - no rows ⇒ {recent: [], aggregates: {...empty windows...}}.
+func probeAndWriteTargetMetricsHistory(ctx context.Context, zw *zip.Writer, name string, req Request) {
+	if req.TargetEngine == nil || req.TargetDSN == "" {
+		_ = writeReason(zw, name, "target engine or DSN missing; target-metrics history skipped")
+		return
+	}
+	applier, err := req.TargetEngine.OpenChangeApplier(ctx, req.TargetDSN)
+	if err != nil {
+		_ = writeReason(zw, name, fmt.Sprintf("open target applier: %v", err))
+		return
+	}
+	defer closeIfCloser(applier)
+
+	store, ok := applier.(ir.TargetMetricsHistoryStore)
+	if !ok {
+		_ = writeReason(zw, name,
+			fmt.Sprintf("engine %q does not implement ir.TargetMetricsHistoryStore", req.TargetEngine.Name()))
+		return
+	}
+	rows, err := store.ListTargetMetricsHistory(ctx, req.StreamID, targetMetricsHistoryRowCap)
+	if err != nil {
+		_ = writeReason(zw, name, fmt.Sprintf("list target-metrics history: %v", err))
+		return
+	}
+	_ = writeJSON(zw, name, map[string]any{
+		"recent":     renderTargetMetricsRows(rows),
+		"aggregates": computeTargetMetricsAggregates(rows),
+	})
+}
+
+// renderTargetMetricsRows formats the persisted history rows for the
+// bundle, gating each metric by its *Known flag — an unobserved value is
+// OMITTED (never rendered as 0/idle), the same honesty contract the live
+// target_health section keeps.
+func renderTargetMetricsRows(rows []ir.TargetMetricsHistoryRow) []map[string]any {
+	out := make([]map[string]any, 0, len(rows))
+	for _, r := range rows {
+		m := map[string]any{
+			"sampled_at": r.SampledAt.UTC().Format(time.RFC3339),
+		}
+		if r.Database != "" {
+			m["database"] = r.Database
+		}
+		if r.Branch != "" {
+			m["branch"] = r.Branch
+		}
+		if r.CPUKnown {
+			m["cpu_util"] = r.CPUUtil
+		}
+		if r.MemKnown {
+			m["mem_util"] = r.MemUtil
+		}
+		if r.StorageKnown {
+			m["storage_util"] = r.StorageUtil
+			m["storage_available_bytes"] = r.StorageAvailableBytes
+			m["storage_capacity_bytes"] = r.StorageCapacityBytes
+		}
+		if r.LagKnown {
+			m["replica_lag_seconds"] = r.ReplicaLagSeconds
+		}
+		if r.ConnKnown {
+			m["active_connections"] = r.ActiveConnections
+			m["max_connections"] = r.MaxConnections
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// computeTargetMetricsAggregates rolls the recent history into the
+// current value + 1m/5m/10m avg+max windows for cpu/mem/storage, computed
+// RELATIVE TO THE NEWEST ROW (rows arrive sampled_at DESC). Only *Known
+// values contribute to a window; a window with no observed value omits its
+// avg/max (honest absence, never a fabricated 0). The "current" value is
+// the newest *Known reading for that metric.
+func computeTargetMetricsAggregates(rows []ir.TargetMetricsHistoryRow) map[string]any {
+	cpu := metricSeries(rows, func(r ir.TargetMetricsHistoryRow) (float64, bool) {
+		return r.CPUUtil, r.CPUKnown
+	})
+	mem := metricSeries(rows, func(r ir.TargetMetricsHistoryRow) (float64, bool) {
+		return r.MemUtil, r.MemKnown
+	})
+	storage := metricSeries(rows, func(r ir.TargetMetricsHistoryRow) (float64, bool) {
+		return r.StorageUtil, r.StorageKnown
+	})
+	return map[string]any{
+		"cpu":     cpu,
+		"mem":     mem,
+		"storage": storage,
+	}
+}
+
+// metricSeries computes one metric's {current, avg_1m, max_1m, avg_5m,
+// max_5m, avg_10m, max_10m} over the *Known samples, windowed relative to
+// the newest row's sampled_at. rows are sampled_at DESC (newest first).
+func metricSeries(rows []ir.TargetMetricsHistoryRow, sel func(ir.TargetMetricsHistoryRow) (float64, bool)) map[string]any {
+	out := map[string]any{}
+	if len(rows) == 0 {
+		return out
+	}
+	// newest is the reference instant for the windows (rows are DESC).
+	newest := rows[0].SampledAt
+	// current = newest *Known reading for this metric.
+	for _, r := range rows {
+		if v, ok := sel(r); ok {
+			out["current"] = v
+			break
+		}
+	}
+	windows := []struct {
+		suffix string
+		dur    time.Duration
+	}{
+		{"1m", 1 * time.Minute},
+		{"5m", 5 * time.Minute},
+		{"10m", 10 * time.Minute},
+	}
+	for _, w := range windows {
+		var sum float64
+		var n int
+		var maxV float64
+		var sawMax bool
+		floor := newest.Add(-w.dur)
+		for _, r := range rows {
+			// Inclusive of the floor instant so a sample exactly w old counts.
+			if r.SampledAt.Before(floor) {
+				continue
+			}
+			v, ok := sel(r)
+			if !ok {
+				continue
+			}
+			sum += v
+			n++
+			if !sawMax || v > maxV {
+				maxV = v
+				sawMax = true
+			}
+		}
+		if n > 0 {
+			out["avg_"+w.suffix] = sum / float64(n)
+			out["max_"+w.suffix] = maxV
+		}
+	}
+	return out
+}
+
+// probeAndWriteTargetHealth writes the ADR-0107 target-telemetry snapshot. It
+// is best-effort and honest: no provider ⇒ a reason file; a provider with no
+// fresh sample ⇒ {"fresh": false}; a fresh sample ⇒ the distilled
+// CPU/mem/storage/lag/connection view with each value gated by its *Known
+// flag (an unobserved metric is omitted, never reported as 0/idle).
+func probeAndWriteTargetHealth(ctx context.Context, zw *zip.Writer, name string, req Request) {
+	if req.TargetTelemetry == nil {
+		_ = writeReason(zw, name, "target telemetry not configured (no --planetscale-org / metrics token)")
+		return
+	}
+	snap, ok := req.TargetTelemetry.Sample(ctx)
+	if !ok {
+		_ = writeJSON(zw, name, map[string]any{"fresh": false, "reason": "no fresh telemetry sample available"})
+		return
+	}
+	out := map[string]any{
+		"fresh":      true,
+		"sampled_at": snap.SampledAt.UTC().Format(time.RFC3339),
+	}
+	if snap.CPUKnown {
+		out["cpu_util"] = snap.CPUUtil
+	}
+	if snap.MemKnown {
+		out["mem_util"] = snap.MemUtil
+	}
+	if snap.StorageKnown {
+		out["storage_util"] = snap.StorageUtil
+		out["storage_available_bytes"] = snap.StorageAvailableBytes
+		out["storage_capacity_bytes"] = snap.StorageCapacityBytes
+	}
+	if snap.LagKnown {
+		out["replica_lag_seconds"] = snap.ReplicaLagSeconds
+	}
+	if snap.ConnKnown {
+		out["active_connections"] = snap.ActiveConnections
+		out["max_connections"] = snap.MaxConnections
+	}
+	_ = writeJSON(zw, name, out)
 }
 
 // collectVerboseSections writes the PrivacyVerbose additions: per-

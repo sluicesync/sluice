@@ -39,6 +39,7 @@ var (
 	_ ir.ServerCDCReaderOpener                 = Engine{}
 	_ ir.ShardDiscoverer                       = Engine{}
 	_ ir.SnapshotStreamResumer                 = Engine{}
+	_ ir.TargetConnectionBudgetProber          = Engine{}
 	_ irbackup.TableScopedBackupSnapshotOpener = Engine{}
 	_ ir.TableScopedSnapshotOpener             = Engine{}
 
