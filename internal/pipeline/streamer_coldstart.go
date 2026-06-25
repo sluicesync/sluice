@@ -677,10 +677,11 @@ func (s *Streamer) coldStartRunCopy(ctx context.Context, schema *ir.Schema, stre
 		s.startStorageHeadroomWatch(ctx, streamID, gate)
 
 		bulkOpts := bulkCopyOpts{
-			SkipSchemaApply:  s.SchemaAlreadyApplied,
-			Redactor:         s.Redactor,
-			Shard:            s.InjectShardColumn,
-			CopyFanoutDegree: s.CopyFanoutDegree,
+			SkipSchemaApply:      s.SchemaAlreadyApplied,
+			Redactor:             s.Redactor,
+			Shard:                s.InjectShardColumn,
+			CopyFanoutDegree:     s.CopyFanoutDegree,
+			NoIntraTableStealing: s.NoIntraTableStealing,
 		}
 		copyErr = runBulkCopyWithOpts(ctx, schema, stream.Rows, sw, rw, bulkOpts)
 	}

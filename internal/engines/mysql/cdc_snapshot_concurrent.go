@@ -371,12 +371,16 @@ func acquireConsistentSnapshot(ctx context.Context, db *sql.DB, n int) (conns []
 // Compile-time guarantee that the native multi-snapshot reader satisfies the
 // work-stealing surface (roadmap 21a) in addition to the static partition one
 // — its N connections share one FTWRL cut, so any can read any table. It also
-// implements ir.RowCounter so the progress ticker gets a per-table ETA on the
-// concurrent path (the inner snapshot readers cannot — closer == nil no-ops
-// their CountRows — so the count runs on the side metaDB pool instead).
+// satisfies the CHUNKED work-stealing surface (roadmap 21b, ADR-0119): any
+// connection can read any PK-RANGE of any table, so a large table can be split
+// across several idle readers at the tail. And it implements ir.RowCounter so
+// the progress ticker gets a per-table ETA on the concurrent path (the inner
+// snapshot readers cannot — closer == nil no-ops their CountRows — so the count
+// runs on the side metaDB pool instead).
 var (
-	_ ir.WorkStealingCopyReader = (*concurrentBinlogRows)(nil)
-	_ ir.RowCounter             = (*concurrentBinlogRows)(nil)
+	_ ir.WorkStealingCopyReader        = (*concurrentBinlogRows)(nil)
+	_ ir.ChunkedWorkStealingCopyReader = (*concurrentBinlogRows)(nil)
+	_ ir.RowCounter                    = (*concurrentBinlogRows)(nil)
 )
 
 type concurrentBinlogRows struct {
@@ -536,7 +540,8 @@ func (r *concurrentBinlogRows) ReadRows(ctx context.Context, table *ir.Table) (<
 	// statically-assigned group connection (idx). The wrapper rides out a
 	// classified source-read drop via re-snapshot-from-cursor recovery,
 	// producing ONE continuous channel; the CDC anchor stays at the original P.
-	return r.readResumable(ctx, table, idx)
+	// Whole-table read: no PK-range bounds, cursor keyed on the table name.
+	return r.readResumable(ctx, table, nil, nil, table.Name, idx)
 }
 
 // ConcurrentCopyGroups returns the disjoint table partition the cold-start
@@ -580,7 +585,92 @@ func (r *concurrentBinlogRows) ReadRowsOn(ctx context.Context, table *ir.Table, 
 	// ADR-0111: read through the resumable wrapper, pinned to the requested
 	// connection index. After a re-snapshot the index still selects a valid
 	// fresh connection (the reader count is preserved across recovery).
-	return r.readResumable(ctx, table, reader)
+	// Whole-table read: no PK-range bounds, cursor keyed on the table name.
+	return r.readResumable(ctx, table, nil, nil, table.Name, reader)
+}
+
+// ReadRowsRangeOn implements [ir.ChunkedWorkStealingCopyReader]: read the
+// half-open PK range (lowerPK, upperPK] of table on the pinned connection at
+// index `reader` (ADR-0119, roadmap 21b). Correct for ANY index because all N
+// connections share the one FTWRL snapshot cut, and correct for ANY range
+// because the upper clip is pushed into SQL in the column's native collation
+// (the Bug-74 contract) — so the M chunks of a table tile its rows with no gap
+// and no overlap. chunkIndex disambiguates the per-(table,chunk) resume cursor
+// (Decision 4) so concurrent chunks of one table never alias on the shared
+// cursor map: cursorKey = "table#chunkIndex" (vs table.Name for a whole-table
+// read). An out-of-range index is refused LOUDLY (a caller bug, never a silent
+// wrong-connection read), mirroring [ReadRowsOn].
+func (r *concurrentBinlogRows) ReadRowsRangeOn(ctx context.Context, table *ir.Table, lowerPK, upperPK []any, chunkIndex, reader int) (<-chan ir.Row, error) {
+	if table == nil {
+		return nil, errors.New("mysql: concurrent ReadRowsRangeOn: table is nil")
+	}
+	if reader < 0 || reader >= len(r.readers) {
+		return nil, fmt.Errorf(
+			"mysql: concurrent ReadRowsRangeOn: reader index %d out of range [0,%d) — caller bug",
+			reader, len(r.readers),
+		)
+	}
+	return r.readResumable(ctx, table, lowerPK, upperPK, workItemCursorKey(table.Name, chunkIndex), reader)
+}
+
+// workItemCursorKey is the per-work-item key into the in-memory resume cursor
+// map (ADR-0119 Decision 4). A whole-table item (chunkIndex < 0) keys on the
+// bare table name — sharing the tier-(a) whole-table cursor space; a chunk keys
+// on "table#chunkIndex". A table is read EITHER whole OR as chunks (never both),
+// so the two key spaces never overlap, and CONCURRENT chunks of one table get
+// DISTINCT entries — no collision on the shared cursor map under W readers.
+func workItemCursorKey(tableName string, chunkIndex int) string {
+	if chunkIndex < 0 {
+		return tableName
+	}
+	return fmt.Sprintf("%s#%d", tableName, chunkIndex)
+}
+
+// RangeBounds implements [ir.RangeBoundsQuerier] for the chunked work-stealing
+// boundary HINT (ADR-0119 Decision 2): it delegates to a metaDB-backed
+// [RowReader] (a FRESH pooled connection, NOT a pinned snapshot conn — the same
+// collision-free side pool CountRows uses), so the MIN/MAX query never races an
+// in-flight snapshot read. The result is a partition hint, not a
+// consistency-bearing read: the chunk ranges tile (-inf, +inf] regardless of
+// how fresh the bounds are. A missing pool/dbName yields (nil, nil, nil) — an
+// honest "no hint" that collapses the table to a single whole-table chunk.
+func (r *concurrentBinlogRows) RangeBounds(ctx context.Context, table *ir.Table, pkColumn string) (minVal, maxVal any, err error) {
+	mr := r.metaReader()
+	if mr == nil {
+		return nil, nil, nil
+	}
+	return mr.RangeBounds(ctx, table, pkColumn)
+}
+
+// SampleKeysetBoundaries implements [ir.KeysetSampler] for the chunked
+// work-stealing boundary HINT (non-integer / composite PK, ADR-0119 Decision
+// 2). Like [RangeBounds] it delegates to a metaDB-backed [RowReader] on the
+// side pool. A missing pool/dbName yields (nil, nil) — no boundaries → the
+// table collapses to a single whole-table chunk.
+func (r *concurrentBinlogRows) SampleKeysetBoundaries(ctx context.Context, table *ir.Table, pkColumns []string, n int) ([][]any, error) {
+	mr := r.metaReader()
+	if mr == nil {
+		return nil, nil
+	}
+	return mr.SampleKeysetBoundaries(ctx, table, pkColumns, n)
+}
+
+// metaReader builds a non-snapshot [RowReader] over the side metaDB pool for
+// the boundary-HINT queries (RangeBounds / SampleKeysetBoundaries). The closer
+// is set to the pool so the reader is NOT classified snapshot-pinned (those
+// methods refuse a closer==nil pinned reader, since a boundary query on a
+// streaming snapshot conn would conflict) — RangeBounds / SampleKeysetBoundaries
+// never call Close, so wiring the pool as closer only satisfies that guard. The
+// pool reference is read under connMu so it never observes a half-swapped set
+// across an ADR-0111 recovery; nil pool/dbName ⇒ nil reader (graceful no-hint).
+func (r *concurrentBinlogRows) metaReader() *RowReader {
+	r.connMu.RLock()
+	db, dbName := r.metaDB, r.dbName
+	r.connMu.RUnlock()
+	if db == nil || dbName == "" {
+		return nil
+	}
+	return &RowReader{q: db, schema: dbName, qualifyBySchema: false, closer: db}
 }
 
 // CountRows implements [ir.RowCounter] so the progress ticker gets a per-table

@@ -729,6 +729,8 @@ type SyncStartCmd struct {
 
 	CopyTableParallelism int `name:"copy-table-parallelism" help:"Native-MySQL cold-copy READ axis (self-managed, non-Vitess MySQL source): the number of CONCURRENT FTWRL-coordinated pinned-snapshot reader connections the cold-copy opens (ADR-0101). 0 (default) = unset — fall back to the source DSN's copy_table_parallelism param, then to the engine default (1 = serial single-snapshot). An explicit value here WINS over the DSN param. The DSN form keeps working verbatim. 1 = serial. Inert on PG / VStream sources." default:"0" placeholder:"N"`
 
+	NoIntraTableStealing bool `name:"no-intra-table-stealing" help:"Native-MySQL concurrent cold-copy (--copy-table-parallelism > 1) only: DISABLE intra-table PK-range work-stealing (ADR-0119). By default a large, chunk-eligible table (single/composite orderable PK, above the within-table row threshold) is split into PK-range chunks so idle reader connections can steal a CHUNK of the last big table — keeping the copy N-wide to the tail instead of tapering to one whole table. With this flag set, every table is copied as one whole-table work item (the prior tier-(a) whole-table-stealing behaviour). A throughput knob, not a correctness one: chunk coverage is gap-free + overlap-free either way. Inert on PG / VStream sources and on a serial (--copy-table-parallelism=1) cold-copy."`
+
 	RawCopyFormat string `help:"FAST cold-start (ADR-0079, same-engine PG→PG) only: wire format for the raw-copy passthrough fast lane (ADR-0078). 'text' (default) is cross-major safe; 'binary' is used only when source and target server majors match (downgrades to text loudly otherwise); 'auto' requests binary. The lane engages ONLY for a no-transform copy (no --redact / --type-override / --expr-override / --inject-shard-column). Inert on MySQL/VStream sources (serial cold-start)." default:"text" enum:"text,binary,auto" placeholder:"text|binary|auto"`
 
 	MaxTargetConnections int `help:"Explicit ceiling on the target connection budget (connection-resilience item 4). On cold-start, sluice probes the target's connection-slot budget (Postgres max_connections / role / database limits minus in-use and a small reserve) and refuses loudly if no slot is free for the copy + CDC connections. 0 (default) = auto (probe-and-refuse-on-exhaustion, no operator ceiling). On the ADR-0079 FAST cold-start (PG source) it also bounds the cross-table × within-table copy + index-build connection product (plus the reserved CDC slot); on the serial cold-start it's the loud-refusal floor plus an explicit ceiling. Inert against engines without a connection-slot model (MySQL target)." default:"0" placeholder:"N"`
@@ -1353,6 +1355,7 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		BulkParallelMinRows:                     s.BulkParallelMinRows,
 		BulkBatchSize:                           s.BulkBatchSize,
 		CopyFanoutDegree:                        s.CopyFanoutDegree,
+		NoIntraTableStealing:                    s.NoIntraTableStealing,
 		RawCopyFormat:                           parseRawCopyFormat(s.RawCopyFormat),
 		ReapStaleBackends:                       s.ReapStaleBackends,
 		ApplyExecTimeout:                        s.ApplyExecTimeout,

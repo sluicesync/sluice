@@ -528,6 +528,15 @@ type Streamer struct {
 	// cold-start with a parallel-capable writer + a per-table PK.
 	CopyFanoutDegree int
 
+	// NoIntraTableStealing opts OUT of intra-table PK-range work-stealing on the
+	// native-MySQL concurrent cold-copy (ADR-0119, roadmap 21b): with it set,
+	// every table is copied as a single whole-table work item (the tier-(a)
+	// whole-table-stealing behaviour). OPT-OUT-named so the Go zero value
+	// (false) keeps intra-table stealing ON — the common default — for every
+	// non-CLI construction (the v0.99.51 zero-value trap). Inert on every source
+	// that isn't the native-MySQL multi-snapshot work-stealing reader.
+	NoIntraTableStealing bool
+
 	// ReapStaleBackends opts the operator into terminating sluice's own
 	// orphaned backends on the target during the cold-start preflight
 	// (connection-resilience Phase 2, item 2). Detection runs always and

@@ -731,6 +731,16 @@ type bulkCopyOpts struct {
 	// otherwise the serial path runs. Zero-value-safe by construction
 	// (the v0.99.51 trap): no value produces "zero workers".
 	CopyFanoutDegree int
+
+	// NoIntraTableStealing opts OUT of intra-table PK-range work-stealing on
+	// the native-MySQL concurrent cold-copy (ADR-0119, roadmap 21b): when true,
+	// every table is copied as ONE whole-table work item (the tier-(a)
+	// whole-table-stealing behaviour). The Go zero value (false) keeps
+	// intra-table stealing ON — the common default — so the field is
+	// OPT-OUT-named (the v0.99.51 zero-value trap): a field named for the
+	// on-behavior would silently invert to off for every non-CLI construction.
+	// Inert on every path that isn't the native-MySQL work-stealing reader.
+	NoIntraTableStealing bool
 }
 
 // runBulkCopyWithOpts is the configurable variant of [runBulkCopy].
@@ -846,7 +856,7 @@ func runBulkCopyWithOpts(
 	// native MySQL / K = 1), concGroups is nil and the serial loop below runs
 	// BYTE-IDENTICALLY.
 	if concGroups != nil {
-		if err := runConcurrentTableCopy(ctx, concGroups, schema, rows, rw, opts.Redactor, opts.Shard, fanoutDegree, needsIdempotent); err != nil {
+		if err := runConcurrentTableCopy(ctx, concGroups, schema, rows, rw, opts.Redactor, opts.Shard, fanoutDegree, needsIdempotent, opts.NoIntraTableStealing); err != nil {
 			return err
 		}
 	} else {

@@ -667,6 +667,63 @@ type WorkStealingCopyReader interface {
 	ReadRowsOn(ctx context.Context, table *Table, reader int) (<-chan Row, error)
 }
 
+// ChunkedWorkStealingCopyReader is the OPTIONAL surface a
+// [WorkStealingCopyReader] implements when, in addition to letting any reader
+// read any WHOLE table from the shared consistent snapshot, it can read an
+// arbitrary PK-RANGE chunk of a table on a pinned reader. This makes the unit
+// of stealable work a (table, PK-range) chunk rather than a whole table, so the
+// cold-copy stays N-wide down to a chunk of the last large table instead of
+// tapering to one whole big table at the tail (ADR-0119, roadmap item 21b — the
+// intra-table refinement of [WorkStealingCopyReader]'s table-level stealing).
+//
+// The native-MySQL multi-snapshot reader implements it: every pinned connection
+// is the SAME FTWRL cut (ADR-0101), so reading the half-open PK range
+// (lowerPK, upperPK] of table T on connection i is byte-identical for any i —
+// exactly what splitting one large table across several idle readers needs. The
+// VStream reader does NOT (its per-stream Match-scoping is not range-splittable),
+// so it stays on the whole-table [WorkStealingCopyReader] / static partition.
+//
+// The pipeline computes the chunk boundaries through the embedded
+// [RangeBoundsQuerier] (single integer PK → MIN/MAX/divide) and [KeysetSampler]
+// (non-integer / composite PK → sampled keyset), reusing the SAME boundary
+// machinery the `sluice migrate` parallel copy pins (ADR-0019 / ADR-0096) — so
+// it never imports engine internals to tile a table. Those boundary queries are
+// a partition HINT (run on a side metadata pool, NOT a pinned snapshot conn);
+// the chunk ranges tile (-inf, +inf] regardless of how fresh the sampled split
+// points are, so coverage stays complete and disjoint even if the live table
+// has drifted from the frozen cut (ADR-0119 Decision 2).
+//
+// CORRECTNESS (silent-loss class): the M chunks of a table partition its rows
+// with NO gap and NO overlap — the bounds are half-open (lowerPK, upperPK] with
+// nil end-caps (chunk 0 lowerPK==nil, last chunk upperPK==nil) from the shared
+// boundary code, and the upper clip is pushed into SQL in the column's native
+// collation (the Bug-74 contract). A table is read EITHER whole OR as chunks,
+// never both, and each chunk is claimed by exactly one pipeline (the pipeline's
+// atomic claim), so every source row reaches the target exactly once.
+type ChunkedWorkStealingCopyReader interface {
+	WorkStealingCopyReader
+
+	// ReadRowsRangeOn reads the half-open PK range (lowerPK, upperPK] of table
+	// on the pinned connection `reader`, paging with the collation-correct SQL
+	// upper-bound clip ([BoundedBatchedRowReader.ReadRowsBatchBounded]). A nil
+	// lowerPK means "no lower bound" (chunk 0); a nil upperPK means "no upper
+	// bound" (the last chunk) — together they tile the keyspace. chunkIndex
+	// disambiguates the per-(table,chunk) in-process resume cursor so concurrent
+	// chunks of one table never alias on the reader's shared cursor map; a
+	// negative chunkIndex denotes a whole-table read keyed on the table name
+	// (equivalent to [WorkStealingCopyReader.ReadRowsOn]). The caller guarantees
+	// at most one in-flight read per reader index at a time.
+	ReadRowsRangeOn(ctx context.Context, table *Table, lowerPK, upperPK []any, chunkIndex, reader int) (<-chan Row, error)
+
+	// RangeBoundsQuerier (single integer PK) and KeysetSampler (non-integer /
+	// composite PK) are surfaced so the pipeline can compute chunk boundaries
+	// without importing engine internals. They MUST run on a connection that
+	// cannot race an in-flight snapshot read (a side metadata pool), since the
+	// boundary decision is pre-read and the pinned conns are streaming.
+	RangeBoundsQuerier
+	KeysetSampler
+}
+
 // IdempotentCopyWriter is the writer-side capability the cold-start
 // Bug-125 path requires before it will route a NO-PRIMARY-KEY table
 // through [IdempotentRowWriter.WriteRowsIdempotent]. A writer implements

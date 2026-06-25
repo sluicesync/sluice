@@ -625,7 +625,7 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	applyGrowGate(rw, gate)
 	s.startStorageHeadroomWatch(ctx, streamID, gate)
 
-	bulkOpts := bulkCopyOpts{Redactor: s.Redactor}
+	bulkOpts := bulkCopyOpts{Redactor: s.Redactor, NoIntraTableStealing: s.NoIntraTableStealing}
 	if err := runBulkCopyWithOpts(ctx, schema, stream.Rows, sw, rw, bulkOpts); err != nil {
 		closeIf(rw)
 		closeIf(sw)

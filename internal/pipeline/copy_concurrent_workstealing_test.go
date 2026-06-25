@@ -116,7 +116,7 @@ func TestRunConcurrentTableCopy_WorkStealing_ExactlyOnce(t *testing.T) {
 
 	// needsIdempotent=false → the native plain-INSERT path (work-stealing only
 	// applies to the native shared-snapshot reader).
-	if err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, false); err != nil {
+	if err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, false, false); err != nil {
 		t.Fatalf("runConcurrentTableCopy (work-stealing): %v", err)
 	}
 
@@ -177,7 +177,7 @@ func TestRunConcurrentTableCopy_WorkStealing_CrossesGroupBoundary(t *testing.T) 
 
 	done := make(chan error, 1)
 	go func() {
-		done <- runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, false)
+		done <- runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, false, false)
 	}()
 
 	// Wait until the 5 non-gated tables (b..f) are all written by the free

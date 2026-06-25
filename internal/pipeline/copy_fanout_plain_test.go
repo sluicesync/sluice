@@ -300,7 +300,7 @@ func TestRunConcurrentTableCopy_NativeWxD(t *testing.T) {
 	writer := newWXDWriter()
 
 	// needsIdempotent=false → the plain path; degree=4 → per-table fan-out.
-	if err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, degree, false); err != nil {
+	if err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, degree, false, false); err != nil {
 		t.Fatalf("runConcurrentTableCopy (native W×D): %v", err)
 	}
 	if atomic.LoadInt32(&writer.parallelHit) == 0 {
@@ -328,7 +328,7 @@ func TestRunConcurrentTableCopy_NativeDegreeOneByteIdentical(t *testing.T) {
 	reader := newNativeConcReader(groups, rowsPer)
 	writer := newWXDWriter()
 
-	if err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, false); err != nil {
+	if err := runConcurrentTableCopy(context.Background(), groups, schema, reader, writer, nil, ShardColumnSpec{}, 1, false, false); err != nil {
 		t.Fatalf("runConcurrentTableCopy (native D=1): %v", err)
 	}
 	if atomic.LoadInt32(&writer.parallelHit) != 0 {

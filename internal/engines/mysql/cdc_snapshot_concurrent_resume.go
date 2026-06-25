@@ -218,12 +218,19 @@ var errBinlogPurgedDuringResnapshot = errors.New(
 // snapshot was re-established mid-table. readerIdx selects the pinned
 // connection (work-stealing path); a negative readerIdx uses the table's
 // statically-assigned owner (static-partition path).
-func (r *concurrentBinlogRows) readResumable(ctx context.Context, table *ir.Table, readerIdx int) (<-chan ir.Row, error) {
+//
+// lowerPK/upperPK bound the read to a half-open PK range (lowerPK, upperPK]
+// (ADR-0119, roadmap 21b): nil/nil is the WHOLE table (the tier-(a) and serial
+// callers), a non-nil bound is an intra-table chunk. cursorKey identifies the
+// per-work-item in-memory resume cursor — table.Name for a whole-table item,
+// "table#chunkIndex" for a chunk — so concurrent chunks of one table never
+// alias on the shared cursor map.
+func (r *concurrentBinlogRows) readResumable(ctx context.Context, table *ir.Table, lowerPK, upperPK []any, cursorKey string, readerIdx int) (<-chan ir.Row, error) {
 	if table == nil {
 		return nil, errors.New("mysql: native concurrent cold-copy resume: table is nil")
 	}
 	out := make(chan ir.Row, rowChanBuffer)
-	go r.streamResumable(ctx, table, readerIdx, out)
+	go r.streamResumable(ctx, table, lowerPK, upperPK, cursorKey, readerIdx, out)
 	return out, nil
 }
 
@@ -234,18 +241,19 @@ func (r *concurrentBinlogRows) readResumable(ctx context.Context, table *ir.Tabl
 // cadence checkpoint). On a classified source-read drop it runs the bounded
 // recovery loop, then re-reads the SAME table from its cursor. It owns out
 // (closes it on exit) and the reader's sticky Err.
-func (r *concurrentBinlogRows) streamResumable(ctx context.Context, table *ir.Table, readerIdx int, out chan<- ir.Row) {
+func (r *concurrentBinlogRows) streamResumable(ctx context.Context, table *ir.Table, lowerPK, upperPK []any, cursorKey string, readerIdx int, out chan<- ir.Row) {
 	defer close(out)
 
 	keyed := tableHasOrderablePK(table)
 
 	for {
-		// A previously-recorded complete marker (e.g. the table finished, then
-		// a sibling table's drop triggered a re-snapshot) means nothing left
-		// to read — return cleanly. Defensive: the consumer reads each table
-		// once, so a completed table isn't re-opened in normal flow, but the
-		// recovery's "skip completed" is enforced here too.
-		if r.cursorFor(table.Name).complete {
+		// A previously-recorded complete marker (e.g. the work item finished,
+		// then a sibling's drop triggered a re-snapshot) means nothing left to
+		// read — return cleanly. Defensive: the consumer reads each work item
+		// once, so a completed item isn't re-opened in normal flow, but the
+		// recovery's "skip completed" is enforced here too. Keyed on cursorKey
+		// so a per-chunk complete marker is distinct from its siblings.
+		if r.cursorFor(cursorKey).complete {
 			return
 		}
 
@@ -256,9 +264,9 @@ func (r *concurrentBinlogRows) streamResumable(ctx context.Context, table *ir.Ta
 		// instead of doing its own redundant FTWRL re-snapshot).
 		observedGen := r.currentRecoveryGen()
 
-		err := r.readOnce(ctx, table, readerIdx, keyed, out)
+		err := r.readOnce(ctx, table, lowerPK, upperPK, cursorKey, readerIdx, keyed, out)
 		if err == nil {
-			r.noteTableComplete(table.Name, keyed)
+			r.noteTableComplete(cursorKey, keyed)
 			return
 		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -292,11 +300,14 @@ func (r *concurrentBinlogRows) streamResumable(ctx context.Context, table *ir.Ta
 // It returns nil on a clean EOF (table fully read), or the underlying read
 // error (classified) on a drop. It does NOT mark the table complete (the
 // caller does) and does NOT close out.
-func (r *concurrentBinlogRows) readOnce(ctx context.Context, table *ir.Table, readerIdx int, keyed bool, out chan<- ir.Row) error {
+func (r *concurrentBinlogRows) readOnce(ctx context.Context, table *ir.Table, lowerPK, upperPK []any, cursorKey string, readerIdx int, keyed bool, out chan<- ir.Row) error {
 	if keyed {
-		return r.readKeyedPaged(ctx, table, readerIdx, out)
+		return r.readKeyedPaged(ctx, table, lowerPK, upperPK, cursorKey, readerIdx, out)
 	}
-	return r.readKeyless(ctx, table, readerIdx, out)
+	// Keyless tables are NEVER chunked (no orderable key to tile on, ADR-0119
+	// Decision 1), so a keyless read is always whole — cursorKey is the table
+	// name and the PK-range bounds are nil.
+	return r.readKeyless(ctx, table, cursorKey, readerIdx, out)
 }
 
 // nativeResumeBatchSize is the page size for the keyed cursor-paginated read.
@@ -315,29 +326,45 @@ var nativeResumeBatchSize = 50_000
 // continue. tableName + rowsHandedOff let it target one table at one offset.
 var concurrentDropInjector func(tableName string, rowsHandedOff int) error
 
-// readKeyedPaged pages the keyed table from its persisted cursor using
-// ReadRowsBatch (WHERE (pk) > lastpk ORDER BY pk LIMIT N) so a re-snapshot
-// resumes exactly where it left off. A short page (< limit) is the clean EOF.
+// readKeyedPaged pages the keyed table from its per-work-item cursor using
+// ReadRowsBatchBounded (WHERE (pk) > lastpk AND (pk) <= upperPK ORDER BY pk
+// LIMIT N) so a re-snapshot resumes exactly where it left off, clipped to the
+// chunk's upper bound. A short page (< limit) is the clean EOF.
+//
+// CHUNK BOUNDS (ADR-0119). The first page's lower cursor is `after`: the
+// per-work-item cursor's lastPK once a row has been handed off, else lowerPK
+// (the chunk's exclusive lower bound; nil for chunk 0 / a whole-table read).
+// upperPK is the chunk's INCLUSIVE upper bound, pushed into SQL in the column's
+// native collation — nil for the last chunk / a whole table, which makes the
+// query byte-identical to the unbounded whole-table form (the upperPK==nil case
+// of ReadRowsBatchBounded == today's ReadRowsBatch). So the M chunks of a table
+// tile its rows with no gap and no overlap (the Bug-74 collation contract).
 //
 // EXACTLY-ONCE on recovery (the value-fidelity core). The cursor is advanced
-// (noteRowEmitted) ONLY AFTER the row is successfully handed to out — so
-// r.lastPK never names a row the writer was not given. Because recovery keeps
-// out OPEN and continues (it never closes the channel mid-table), the writer
-// drains EVERY row placed on out to durability; thus every row with pk ≤
-// lastPK is written, and the resume WHERE (pk) > lastPK neither skips an
+// (noteRowEmitted, keyed on cursorKey) ONLY AFTER the row is successfully handed
+// to out — so the cursor never names a row the writer was not given. Because
+// recovery keeps out OPEN and continues (it never closes the channel mid-read),
+// the writer drains EVERY row placed on out to durability; thus every row with
+// pk ≤ cursor is written, and the resume WHERE (pk) > cursor neither skips an
 // in-flight row (no gap) nor re-reads a handed-off one (no dup). Ordering the
 // advance AFTER the send is what makes this hold even if the send loses the
 // ctx race (the row is then NOT handed off and the cursor is NOT advanced).
-func (r *concurrentBinlogRows) readKeyedPaged(ctx context.Context, table *ir.Table, readerIdx int, out chan<- ir.Row) error {
+func (r *concurrentBinlogRows) readKeyedPaged(ctx context.Context, table *ir.Table, lowerPK, upperPK []any, cursorKey string, readerIdx int, out chan<- ir.Row) error {
 	pkNames := primaryKeyColumnNames(table)
 	handedOff := 0
 	for {
-		after := r.cursorFor(table.Name).lastPK
+		// Resume from the cursor's lastPK once a row has been handed off; before
+		// the first row, start at the chunk's exclusive lower bound (nil for
+		// chunk 0 / whole-table → no lower predicate).
+		after := r.cursorFor(cursorKey).lastPK
+		if len(after) == 0 {
+			after = lowerPK
+		}
 		rr := r.pickReader(readerIdx)
 		if rr == nil {
 			return errors.New("mysql: native concurrent cold-copy resume: no snapshot reader available")
 		}
-		ch, err := rr.ReadRowsBatch(ctx, table, after, nativeResumeBatchSize)
+		ch, err := rr.ReadRowsBatchBounded(ctx, table, after, upperPK, nativeResumeBatchSize)
 		if err != nil {
 			return err
 		}
@@ -351,7 +378,7 @@ func (r *concurrentBinlogRows) readKeyedPaged(ctx context.Context, table *ir.Tab
 			}
 			// Advance the cursor AFTER the successful hand-off (see the
 			// exactly-once argument above).
-			r.noteRowEmitted(table.Name, true, pk)
+			r.noteRowEmitted(cursorKey, true, pk)
 			n++
 			handedOff++
 			if inj := concurrentDropInjector; inj != nil {
@@ -377,7 +404,7 @@ func (r *concurrentBinlogRows) readKeyedPaged(ctx context.Context, table *ir.Tab
 // (loss-free, possible duplicates — the existing keyless cold-copy contract,
 // Bug 143; the recovery WARN names it). It tracks no LastPK but still counts
 // rows toward the cursor's keyless marker so the complete marker on EOF lands.
-func (r *concurrentBinlogRows) readKeyless(ctx context.Context, table *ir.Table, readerIdx int, out chan<- ir.Row) error {
+func (r *concurrentBinlogRows) readKeyless(ctx context.Context, table *ir.Table, cursorKey string, readerIdx int, out chan<- ir.Row) error {
 	rr := r.pickReader(readerIdx)
 	if rr == nil {
 		return errors.New("mysql: native concurrent cold-copy resume: no snapshot reader available")
@@ -395,7 +422,8 @@ func (r *concurrentBinlogRows) readKeyless(ctx context.Context, table *ir.Table,
 		}
 		// Keyless tables record no LastPK; the note keeps the keyless marker
 		// (recorded after the hand-off, for consistency with the keyed path).
-		r.noteRowEmitted(table.Name, false, nil)
+		// cursorKey == table.Name here (keyless tables are never chunked).
+		r.noteRowEmitted(cursorKey, false, nil)
 		handedOff++
 		if inj := concurrentDropInjector; inj != nil {
 			if derr := inj(table.Name, handedOff); derr != nil {

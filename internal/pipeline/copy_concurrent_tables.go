@@ -44,6 +44,7 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync/atomic"
 
 	"golang.org/x/sync/errgroup"
@@ -60,6 +61,15 @@ import (
 // nil in production (a single nil check). Mirrors the
 // coldStartDispatchObserver / onTableCopiedObserver disposition.
 var concurrentCopyDispatchObserver func(groups int)
+
+// intraTableChunkObserver is a TEST-ONLY seam (nil in production — a single nil
+// check) that fires once per table during work-item construction with the
+// number of work items that table was split into: 1 = a whole-table item (not
+// chunked), M ≥ 2 = M intra-table PK-range chunks (ADR-0119, roadmap 21b). It
+// lets the integration test assert that the skewed corpus's huge table was
+// chunked (tail reclaimed) WITHOUT inferring it from timing. Mirrors the
+// [concurrentCopyDispatchObserver] disposition.
+var intraTableChunkObserver func(table string, chunks int)
 
 // concurrentCopyGroups returns the engine-surfaced disjoint table
 // partition the cold-start bulk copy may write CONCURRENTLY (ADR-0100),
@@ -139,6 +149,7 @@ func runConcurrentTableCopy(
 	shard ShardColumnSpec,
 	fanoutDegree int,
 	needsIdempotent bool,
+	noIntraTableStealing bool,
 ) error {
 	if concurrentCopyDispatchObserver != nil {
 		concurrentCopyDispatchObserver(len(groups))
@@ -167,7 +178,7 @@ func runConcurrentTableCopy(
 	// scoped to its group at the source, so a stealing consumer would have no
 	// rows for an out-of-group table — so it stays on the static partition below.
 	if ws, ok := rows.(ir.WorkStealingCopyReader); ok && ws.ConcurrentReaderCount() > 1 {
-		return runWorkStealingTableCopy(ctx, groups, byName, ws, rw, redactor, shard, fanoutDegree, needsIdempotent)
+		return runWorkStealingTableCopy(ctx, groups, byName, ws, rw, redactor, shard, fanoutDegree, needsIdempotent, noIntraTableStealing)
 	}
 
 	tg, tctx := errgroup.WithContext(ctx)
@@ -211,34 +222,67 @@ func runConcurrentTableCopy(
 	return tg.Wait()
 }
 
-// runWorkStealingTableCopy is the roadmap-21a work-stealing variant of the
-// concurrent table copy, used when the reader's N connections all share one
-// consistent snapshot (native-MySQL FTWRL — [ir.WorkStealingCopyReader]). It
-// flattens the disjoint partition into ONE ordered work list and runs W =
-// min(N, len(tables)) pipelines that PULL tables from a shared atomic cursor,
-// each reading its pulled table on its OWN reader index (connection). A fast
-// pipeline naturally claims more tables, so the copy stays W-wide until fewer
-// than W tables remain — closing the static partition's tail taper (the
-// lighter groups would otherwise finish early and idle while a heavier group
-// grinds its last large table).
+// maxChunksPerTable caps how many intra-table PK-range chunks one table is
+// split into (ADR-0119 Decision 1). The split reclaims the tail; past a point
+// extra chunks only add per-chunk overhead (a boundary tuple, a claim, a SQL
+// page) without widening the copy beyond the N pinned readers. 64 is generous
+// (a table N× the threshold still chunks fully up to the cap) while bounding the
+// work list.
+const maxChunksPerTable = 64
+
+// copyWorkItem is the unit of stealable work the work-stealing copy claims off
+// the shared cursor (ADR-0119 Decision 1). A whole-table item (chunkIndex < 0,
+// both bounds nil) is byte-identical to tier (a); a chunk item carries the
+// half-open (lowerPK, upperPK] bounds the engine reads within. table is the
+// resolved *ir.Table (resolution happens at build time so a partition/scope
+// mismatch fails loudly before any goroutine spawns).
+type copyWorkItem struct {
+	table      *ir.Table
+	chunkIndex int // < 0 ⇒ whole table
+	lowerPK    []any
+	upperPK    []any
+}
+
+// runWorkStealingTableCopy is the work-stealing variant of the concurrent table
+// copy, used when the reader's N connections all share one consistent snapshot
+// (native-MySQL FTWRL — [ir.WorkStealingCopyReader]). It flattens the disjoint
+// partition into ONE ordered list of WORK ITEMS and runs W = min(N, len(items))
+// pipelines that PULL items from a shared atomic cursor, each reading its pulled
+// item on its OWN reader index (connection). A fast pipeline naturally claims
+// more items, so the copy stays W-wide until fewer than W items remain.
 //
-// Correctness mirrors the static path's invariants and adds the claim:
-//   - EXACTLY-ONCE: each table is claimed by exactly one pipeline — the atomic
-//     fetch-add hands each index to one goroutine; coverage is total (every
-//     index 0..len-1 is claimed before any goroutine sees claim >= len).
+// Tier (a) (roadmap 21a) made the item a whole table, closing most of the
+// static-partition taper. Tier (b) (roadmap 21b, ADR-0119) makes the item a
+// (table, PK-range) CHUNK for large, chunk-eligible tables when the reader also
+// implements [ir.ChunkedWorkStealingCopyReader] — so the tail is bounded by a
+// chunk of the last big table, not the whole table. noIntraTableStealing forces
+// every table back to one whole-table item (the tier-(a) behaviour) for
+// operators who want it; the Go zero value (false) keeps intra-table stealing
+// ON (the common default — every test/non-CLI caller gets stealing, the
+// v0.99.51 opt-out-naming trap).
+//
+// Correctness mirrors the static path's invariants and adds the claim + tiling:
+//   - EXACTLY-ONCE: each work item is claimed by exactly one pipeline — the
+//     atomic fetch-add hands each index to one goroutine; coverage is total
+//     (every index 0..len-1 claimed before any goroutine sees claim >= len).
+//     The M chunks of a table tile its rows with no gap and no overlap (the
+//     half-open bounds + the collation-correct SQL upper clip, Bug-74), and a
+//     table is read EITHER whole OR as chunks, never both — so every source row
+//     reaches the target exactly once.
 //   - ONE QUERY PER CONNECTION: reader index i is owned by exactly one
-//     pipeline, which copies one table at a time, so each pinned connection has
-//     at most one in-flight ReadRowsOn — the invariant the static partition
-//     gave for free and [ir.WorkStealingCopyReader] requires.
+//     pipeline, which copies one item at a time, so each pinned connection has
+//     at most one in-flight read — the invariant [ir.WorkStealingCopyReader]
+//     requires (unchanged by chunking).
 //   - SEAM-SAFE: the native single recorded FTWRL position is independent of
-//     WHICH connection read a table, so stealing does not affect the
-//     snapshot→CDC handoff (ADR-0101 §6 / ADR-0007).
+//     WHICH connection read WHICH range, so stealing does not affect the
+//     snapshot→CDC handoff (ADR-0101 §6 / ADR-0007 / ADR-0119 Decision 5).
 //   - LOUD ABORT / NO LEAKS: same errgroup semantics as the static path — the
 //     first error cancels peers via the derived ctx; no position advances.
 //
-// needsIdempotent threads through to the same per-table helper the static path
+// needsIdempotent threads through to the same per-item helper the static path
 // uses (false for the native binlog snapshot → plain-INSERT + ADR-0097 D-way
-// fan-out, so total concurrency stays W × D).
+// fan-out, so total concurrency stays W × D; disjoint chunks carry disjoint
+// rows, so plain-INSERT per chunk stays exactly-once).
 func runWorkStealingTableCopy(
 	ctx context.Context,
 	groups [][]string,
@@ -249,8 +293,9 @@ func runWorkStealingTableCopy(
 	shard ShardColumnSpec,
 	fanoutDegree int,
 	needsIdempotent bool,
+	noIntraTableStealing bool,
 ) error {
-	// Flatten the disjoint groups into one ordered work list. The partition is
+	// Flatten the disjoint groups into one ordered table list. The partition is
 	// a pure function of the sorted table set, so this order is deterministic
 	// (stable across runs/resumes); order does not affect correctness here —
 	// only complete coverage + the exactly-once claim do.
@@ -259,50 +304,202 @@ func runWorkStealingTableCopy(
 		allTables = append(allTables, g...)
 	}
 
-	w := ws.ConcurrentReaderCount()
-	if w > len(allTables) {
-		// Never spawn more pipelines than tables (a pipeline with no table to
-		// claim would idle immediately); also keeps every reader index in range.
-		w = len(allTables)
+	// Build the work list: one whole-table item per table, OR M chunk items for
+	// a large, chunk-eligible table (when the reader is chunk-capable and
+	// stealing is not opted out). Boundary computation runs on the reader's side
+	// metadata pool BEFORE any pipeline spawns, so it cannot race a pinned read.
+	items, err := buildCopyWorkItems(ctx, allTables, byName, ws, noIntraTableStealing)
+	if err != nil {
+		return err
 	}
 
-	var next atomic.Int64 // shared cursor into allTables; fetch-add to claim
+	w := ws.ConcurrentReaderCount()
+	if w > len(items) {
+		// Never spawn more pipelines than work items (a pipeline with no item to
+		// claim would idle immediately); also keeps every reader index in range.
+		w = len(items)
+	}
+
+	// cws is the chunked surface, non-nil only when the reader implements it;
+	// chunk items exist only in that case, so the in-loop assertion is safe.
+	cws, _ := ws.(ir.ChunkedWorkStealingCopyReader)
+
+	var next atomic.Int64 // shared cursor into items; fetch-add to claim
 	tg, tctx := errgroup.WithContext(ctx)
 	for i := 0; i < w; i++ {
 		readerIdx := i
 		tg.Go(func() error {
-			// This pipeline reads every table it claims on its OWN connection
-			// (reader index readerIdx) via the pinned adapter, so the existing
-			// per-table copy helpers (which call ReadRows) drive the
-			// work-stealing read unchanged.
-			src := pinnedRowReader{ws: ws, idx: readerIdx}
 			for {
 				claim := next.Add(1) - 1
-				if claim >= int64(len(allTables)) {
+				if claim >= int64(len(items)) {
 					return nil // queue drained — this pipeline is done
 				}
-				name := allTables[claim]
-				table, ok := byName[name]
-				if !ok {
-					return fmt.Errorf(
-						"pipeline: concurrent copy (work-stealing): table %q is not in the migration schema "+
-							"(engine surfaced a table the pipeline does not have — a partition/scope mismatch)",
-						name,
-					)
+				item := items[claim]
+				// A whole-table item reads via the plain pinned adapter; a chunk
+				// item reads its PK-range via the range adapter. Either way the
+				// existing per-item copy helpers (which call ReadRows) drive the
+				// work-stealing read unchanged, each on this pipeline's OWN
+				// connection (reader index readerIdx).
+				var src ir.RowReader
+				if item.chunkIndex < 0 {
+					src = pinnedRowReader{ws: ws, idx: readerIdx}
+				} else {
+					src = pinnedRangeRowReader{
+						ws:         cws,
+						idx:        readerIdx,
+						chunkIndex: item.chunkIndex,
+						lowerPK:    item.lowerPK,
+						upperPK:    item.upperPK,
+					}
 				}
 				var cerr error
 				if needsIdempotent {
-					cerr = copyTableColdStartIdempotentMaybeParallel(tctx, src, rw, table, redactor, shard, fanoutDegree)
+					cerr = copyTableColdStartIdempotentMaybeParallel(tctx, src, rw, item.table, redactor, shard, fanoutDegree)
 				} else {
-					cerr = copyTablePlainMaybeParallel(tctx, src, rw, table, redactor, shard, fanoutDegree)
+					cerr = copyTablePlainMaybeParallel(tctx, src, rw, item.table, redactor, shard, fanoutDegree)
 				}
 				if cerr != nil {
-					return wrapWithHint(PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", name, cerr))
+					return wrapWithHint(PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q (chunk %d): %w", item.table.Name, item.chunkIndex, cerr))
 				}
 			}
 		})
 	}
 	return tg.Wait()
+}
+
+// buildCopyWorkItems turns the flattened table list into the work list the
+// work-stealing copy claims (ADR-0119 Decision 1). For each table it emits one
+// whole-table item, OR M ≥ 2 chunk items when ALL of: the reader is
+// chunk-capable ([ir.ChunkedWorkStealingCopyReader]); intra-table stealing is
+// not opted out; the table is chunk-eligible ([canParallelChunkTable] — an
+// orderable, non-sluice-injected single/composite PK, so keyless / no-PK tables
+// stay whole and the keyless at-least-once contract is unchanged); and its
+// CountRows estimate clears the within-table threshold.
+//
+// A table name absent from the schema is a partition/scope mismatch (the engine
+// surfaced a table the pipeline does not have) and is refused LOUDLY here,
+// before any goroutine spawns — the same silent-loss-class guard the per-table
+// loop had, moved earlier. Any failure to COMPUTE boundaries (a boundary-query
+// error, or a degenerate single-chunk result) is NOT fatal — boundaries are a
+// partition hint (ADR-0119 Decision 2), so the table falls back to one
+// whole-table item (logged at debug), never failing the copy.
+func buildCopyWorkItems(
+	ctx context.Context,
+	allTables []string,
+	byName map[string]*ir.Table,
+	ws ir.WorkStealingCopyReader,
+	noIntraTableStealing bool,
+) ([]copyWorkItem, error) {
+	cws, chunkable := ws.(ir.ChunkedWorkStealingCopyReader)
+	rc, _ := ws.(ir.RowCounter)
+	// The within-table threshold adapts to the table count exactly as the
+	// migrate path's parallel chunker does (0 = the auto sentinel).
+	threshold := resolveBulkParallelMinRows(0, len(allTables))
+
+	var items []copyWorkItem
+	for _, name := range allTables {
+		table, ok := byName[name]
+		if !ok {
+			return nil, fmt.Errorf(
+				"pipeline: concurrent copy (work-stealing): table %q is not in the migration schema "+
+					"(engine surfaced a table the pipeline does not have — a partition/scope mismatch)",
+				name,
+			)
+		}
+		tableItems := chunkItemsFor(ctx, table, cws, chunkable, rc, threshold, noIntraTableStealing)
+		if intraTableChunkObserver != nil {
+			intraTableChunkObserver(table.Name, len(tableItems))
+		}
+		items = append(items, tableItems...)
+	}
+	return items, nil
+}
+
+// chunkItemsFor returns the work items for one table: a single whole-table item
+// (chunkIndex < 0), or M ≥ 2 chunk items when the table is large + chunk-eligible
+// + the reader is chunk-capable + stealing is not opted out. It never errors:
+// any reason not to chunk (or any boundary-compute failure) yields the
+// whole-table item, because the chunk split is a throughput hint, never a
+// correctness gate (ADR-0119 Decision 2).
+func chunkItemsFor(
+	ctx context.Context,
+	table *ir.Table,
+	cws ir.ChunkedWorkStealingCopyReader,
+	chunkable bool,
+	rc ir.RowCounter,
+	threshold int64,
+	noIntraTableStealing bool,
+) []copyWorkItem {
+	whole := []copyWorkItem{{table: table, chunkIndex: -1}}
+	if noIntraTableStealing || !chunkable {
+		return whole
+	}
+	// Eligibility: an orderable single/composite PK (keyless / sluice-injected /
+	// non-orderable → whole, so the keyless at-least-once contract is unchanged).
+	// Pass parallelism 2 — canParallelChunkTable only gates parallelism <= 1, and
+	// the work-stealing reader always has N > 1 connections.
+	eligible, strategy, _ := canParallelChunkTable(table, 2)
+	if !eligible {
+		return whole
+	}
+	// Large gate: only chunk past the within-table threshold (per-chunk overhead
+	// dominates below it). A reader without a RowCounter estimate (est 0) stays
+	// whole.
+	var est int64
+	if rc != nil {
+		est, _ = rc.CountRows(ctx, table)
+	}
+	if est < threshold {
+		return whole
+	}
+	// M = clamp(ceil(est/threshold), 2, maxChunksPerTable). threshold > 0
+	// (resolveBulkParallelMinRows floors it), so the ceil-divide is safe.
+	m := int((est + threshold - 1) / threshold)
+	if m < 2 {
+		m = 2
+	}
+	if m > maxChunksPerTable {
+		m = maxChunksPerTable
+	}
+
+	// Compute boundaries on the side metadata pool via the SAME functions the
+	// migrate parallel copy pins (ADR-0019 integer MIN/MAX/divide, ADR-0096
+	// keyset), picking by the strategy canParallelChunkTable returned.
+	var (
+		boundaries []chunkBoundary
+		berr       error
+	)
+	switch strategy {
+	case strategyMinMaxDivide:
+		boundaries, berr = computeChunkBoundaries(ctx, cws, table, m)
+	case strategyKeysetSample:
+		boundaries, berr = computeKeysetChunkBoundaries(ctx, cws, table, m)
+	default:
+		return whole
+	}
+	if berr != nil || len(boundaries) < 2 {
+		// Boundaries are a HINT — a compute error or a degenerate single-chunk
+		// result (empty/tiny table, too-few distinct keys) collapses to the
+		// whole-table item rather than failing the copy.
+		slog.DebugContext(ctx,
+			"pipeline: concurrent copy (work-stealing): intra-table chunking fell back to a whole-table copy",
+			slog.String("table", table.Name),
+			slog.Int("requested_chunks", m),
+			slog.Int("computed_boundaries", len(boundaries)),
+			slog.Any("error", berr))
+		return whole
+	}
+
+	items := make([]copyWorkItem, 0, len(boundaries))
+	for _, b := range boundaries {
+		items = append(items, copyWorkItem{
+			table:      table,
+			chunkIndex: b.chunkIndex,
+			lowerPK:    b.lowerPK,
+			upperPK:    b.upperPK,
+		})
+	}
+	return items
 }
 
 // pinnedRowReader adapts an [ir.WorkStealingCopyReader] to a plain
@@ -340,3 +537,30 @@ func (p pinnedRowReader) CountRows(ctx context.Context, table *ir.Table) (int64,
 	}
 	return 0, nil
 }
+
+// pinnedRangeRowReader adapts an [ir.ChunkedWorkStealingCopyReader] to a plain
+// [ir.RowReader] that reads ONE intra-table PK-range chunk on a FIXED reader
+// index (ADR-0119, roadmap 21b). A work-stealing pipeline that claims a chunk
+// item drives the EXISTING per-table copy helpers (which take an ir.RowReader
+// and call ReadRows) through this adapter, so the chunk read needs no change to
+// those helpers — ReadRows forwards the chunk's bounds + index to
+// ReadRowsRangeOn. Err delegates to the underlying shared reader.
+//
+// It deliberately does NOT implement [ir.RowCounter]: the whole-table estimate
+// would overstate a single chunk (and several chunks of one table would each
+// report the full count), so the per-chunk progress shows rows-copied without a
+// %/ETA — an honest "no estimate" rather than a wrong one. The whole-table
+// items still get an ETA via [pinnedRowReader].
+type pinnedRangeRowReader struct {
+	ws         ir.ChunkedWorkStealingCopyReader
+	idx        int
+	chunkIndex int
+	lowerPK    []any
+	upperPK    []any
+}
+
+func (p pinnedRangeRowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.Row, error) {
+	return p.ws.ReadRowsRangeOn(ctx, table, p.lowerPK, p.upperPK, p.chunkIndex, p.idx)
+}
+
+func (p pinnedRangeRowReader) Err() error { return p.ws.Err() }
