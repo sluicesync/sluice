@@ -30,7 +30,7 @@ require (
 	github.com/knadh/koanf/v2 v2.3.5
 	github.com/testcontainers/testcontainers-go v0.43.0
 	github.com/testcontainers/testcontainers-go/modules/mysql v0.43.0
-	github.com/testcontainers/testcontainers-go/modules/postgres v0.42.0
+	github.com/testcontainers/testcontainers-go/modules/postgres v0.43.0
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	gocloud.dev v0.46.0
 	golang.org/x/crypto v0.53.0
