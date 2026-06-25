@@ -2,7 +2,7 @@
 
 ## Status
 
-**Proposed (2026-06-25).** Roadmap item 21, **tier (b)**. Builds on tier (a) —
+**Accepted (2026-06-25, implementation landed).** Roadmap item 21, **tier (b)**. Builds on tier (a) —
 table-level work-stealing, [ADR-0111]-era `runWorkStealingTableCopy` /
 `ir.WorkStealingCopyReader`, shipped v0.99.74 — by letting an idle copy pipeline
 steal a **PK-range chunk** of an in-progress LARGE table, so the copy stays
