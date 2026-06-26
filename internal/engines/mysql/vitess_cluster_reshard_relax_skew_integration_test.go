@@ -115,6 +115,20 @@ type relaxAB struct {
 	perShardCommitted map[string]int
 
 	convergeDur time.Duration // writer-stop → delivered==committed
+
+	// backlog is committed-minus-delivered at the moment the writer stops
+	// (the apply-deficit the full-speed drain then has to absorb). Populated
+	// by the magnitude-sweep runner; the legacy runRelaxSkewScenario leaves
+	// it zero.
+	backlog int
+
+	// noConverge is set by the magnitude-sweep runner when a HELD
+	// (MinimizeSkew ON) run could not drain to delivered==committed within the
+	// budget because vtgate's skew buffer held the ahead shard's tail once the
+	// writer went quiet (the measured hold pathology — the stream stays alive
+	// with heartbeats and the rows remain on the source; it is NOT sluice
+	// loss). Relaxed runs never set this (they must converge — the win).
+	noConverge bool
 }
 
 // TestVitessReshard_RelaxSkewConcurrentDrainAB is the ADR-0120 live A/B.
