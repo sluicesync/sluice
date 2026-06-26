@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync/atomic"
+	"time"
 
 	"sluicesync.dev/sluice/internal/appliercontrol"
 	"sluicesync.dev/sluice/internal/ir"
@@ -876,6 +877,21 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 	// a streamer restart picks up a fresh seed in its next coldStart
 	// run.
 	s.coldStartSeedSnapshots = nil
+	// Roadmap item 46 (ADR-0121): the delayed-replica gate. When
+	// --apply-delay is set, hold each change until its source commit
+	// timestamp + delay has elapsed before forwarding it to the applier (the
+	// MASTER_DELAY "oops window" DR pattern). It sits UPSTREAM of the applier,
+	// so a held-but-unapplied change never advances the durable resume
+	// position (ADR-0007) — a crash mid-delay-window re-reads the held tail on
+	// resume (exactly-once via ADR-0010). Held changes backpressure to the
+	// source read rather than accumulating in heap. Off by default (0 ⇒ no
+	// gate, no extra goroutine, default apply path byte-identical). It is
+	// wired BEFORE the sync-lag observer below so the observer sees the
+	// post-delay timestamp and the tracker subtracts ApplyDelay back out (the
+	// intentional delay is not "falling behind"; ADR-0121 §5).
+	if s.ApplyDelay > 0 {
+		filtered = delayChanges(applyCtx, filtered, s.ApplyDelay, time.Now, realSleep)
+	}
 	// Roadmap item 45: final pass-through that feeds the sync-lag tracker
 	// from each change's source commit timestamp. Wired only when the
 	// operator opted into the metrics endpoint or a sync-lag alert (nil

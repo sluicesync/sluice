@@ -70,26 +70,34 @@ type syncLagTracker struct {
 	// observedAtUnixNano is the wall-clock (UnixNano) of the most recent
 	// observe with a non-zero source commit time. 0 ⇒ nothing observed yet.
 	observedAtUnixNano atomic.Int64
-	// frozenLagNanos is (observedAt − commitTime), clamped ≥0, FROZEN at
-	// observe time so it does not age between changes — the key to idle
-	// honesty: a caught-up stream that applied its last change promptly
+	// frozenLagNanos is (observedAt − commitTime − applyDelay), clamped ≥0,
+	// FROZEN at observe time so it does not age between changes — the key to
+	// idle honesty: a caught-up stream that applied its last change promptly
 	// holds a ~0 reading rather than a value that climbs with wall-clock.
 	frozenLagNanos atomic.Int64
+	// applyDelay is the configured [Streamer.ApplyDelay] (roadmap item 46,
+	// ADR-0121 §5). It is SUBTRACTED from the observed lag so a deliberately
+	// delayed replica reads ~0 ("not falling behind") rather than `delay`
+	// seconds: the change is observed at now ≈ commitTime + applyDelay, and we
+	// back the intentional delay out. Zero on every non-delayed stream, so the
+	// subtraction is a no-op there (byte-identical to the pre-item-46 metric).
+	// Immutable after construction; read without synchronisation.
+	applyDelay time.Duration
 }
 
-func newSyncLagTracker() *syncLagTracker {
-	return &syncLagTracker{}
+func newSyncLagTracker(applyDelay time.Duration) *syncLagTracker {
+	return &syncLagTracker{applyDelay: applyDelay}
 }
 
 // observe records one applied-bound change. A zero commitTime is ignored (the
 // source/path supplied no timestamp — see [ir.Change.SourceCommitTime]); the
-// lag is floored at 0 so source/target clock skew or a future-dated commit
-// can never report a negative "behind".
+// lag is floored at 0 so source/target clock skew, a future-dated commit, or
+// the configured apply-delay subtraction can never report a negative "behind".
 func (t *syncLagTracker) observe(commitTime, now time.Time) {
 	if commitTime.IsZero() {
 		return
 	}
-	lag := now.Sub(commitTime)
+	lag := now.Sub(commitTime) - t.applyDelay
 	if lag < 0 {
 		lag = 0
 	}

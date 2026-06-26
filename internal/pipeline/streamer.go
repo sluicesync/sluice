@@ -587,6 +587,30 @@ type Streamer struct {
 	// to bound the silent-stall window (GitHub issue #23).
 	ApplyExecTimeout time.Duration
 
+	// ApplyDelay is the roadmap-item-46 / ADR-0121 delayed-replica knob: in
+	// steady-state CDC apply, hold each change until its source commit
+	// timestamp + ApplyDelay has elapsed on the local wall clock before
+	// applying it (the MySQL MASTER_DELAY "oops window" DR pattern — a target
+	// deliberately held behind so an operator can stop sluice before an
+	// accidental DROP / bad migration replicates, then recover from the
+	// still-intact target). Engine-neutral; the cold-start / bulk-copy phase
+	// is unaffected (only steady-state CDC delays).
+	//
+	// Zero (the default) means no delay — byte-identical to today's apply
+	// path (no interceptor, no extra goroutine), so the zero value is the safe
+	// off default for every construction (no zero-value trap). The CLI's
+	// `sync start --apply-delay=DUR` flag is the operator knob.
+	//
+	// Resume stays exactly-once across a crash mid-delay-window: the delay
+	// gate sits UPSTREAM of the applier, which is the only thing that advances
+	// the durable resume position (ADR-0007), so a held-but-unapplied change
+	// never advances the position and is re-read on resume. See
+	// [delayChanges] and ADR-0121. Held changes backpressure to the source
+	// read rather than accumulating in heap; for delays approaching the
+	// source's replication idle timeout (PG wal_sender_timeout, MySQL
+	// net_write_timeout) raise that server-side timeout (ADR-0121 §3).
+	ApplyDelay time.Duration
+
 	// ApplyConcurrency is the ADR-0104 (item 23(c)) / ADR-0105 (item 26)
 	// key-hash apply LANE count W plumbed to the target [ir.ChangeApplier]
 	// via the optional [ir.ApplyConcurrencySetter] interface. The merged CDC
@@ -1287,7 +1311,10 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	// (which feeds it). nil unless the operator opted into /metrics or a
 	// sync-lag alert, so the default apply path stays byte-identical.
 	if !s.DryRun && s.syncLagObservationWanted() {
-		s.syncLag = newSyncLagTracker()
+		// Roadmap item 46 (ADR-0121 §5): seed the tracker with ApplyDelay so a
+		// delayed replica's intentional hold is subtracted out of the reported
+		// sync lag (0 on a non-delayed stream — unchanged behaviour).
+		s.syncLag = newSyncLagTracker(s.ApplyDelay)
 	} else {
 		s.syncLag = nil
 	}

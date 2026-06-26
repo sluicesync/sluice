@@ -17,7 +17,7 @@ import (
 // before any source-timestamped change is applied the reading is "unknown"
 // (omitted, never 0).
 func TestSyncLagTracker_UnknownUntilObserved(t *testing.T) {
-	tr := newSyncLagTracker()
+	tr := newSyncLagTracker(0)
 	if _, known := tr.SyncLagSeconds(time.Now()); known {
 		t.Fatal("fresh tracker reported known; want unknown until first observation")
 	}
@@ -28,7 +28,7 @@ func TestSyncLagTracker_UnknownUntilObserved(t *testing.T) {
 // wall-clock), so a caught-up stream that applied its last change promptly
 // keeps reading ~0 rather than a growing number.
 func TestSyncLagTracker_FrozenLagDoesNotAge(t *testing.T) {
-	tr := newSyncLagTracker()
+	tr := newSyncLagTracker(0)
 	base := time.Date(2026, 6, 25, 12, 0, 0, 0, time.UTC)
 	commit := base.Add(-3 * time.Second) // applied 3s behind source
 	tr.observe(commit, base)
@@ -52,7 +52,7 @@ func TestSyncLagTracker_FrozenLagDoesNotAge(t *testing.T) {
 // applied work retires a stale non-zero reading to 0 (caught up) — the #1
 // false-alarm class the metric must avoid.
 func TestSyncLagTracker_CaughtUpAfterIdle(t *testing.T) {
-	tr := newSyncLagTracker()
+	tr := newSyncLagTracker(0)
 	base := time.Date(2026, 6, 25, 12, 0, 0, 0, time.UTC)
 	tr.observe(base.Add(-30*time.Second), base) // 30s behind when last applied
 
@@ -69,7 +69,7 @@ func TestSyncLagTracker_CaughtUpAfterIdle(t *testing.T) {
 // TestSyncLagTracker_ZeroCommitIgnored pins that a change carrying no source
 // commit time contributes no signal (the engine/path didn't supply one).
 func TestSyncLagTracker_ZeroCommitIgnored(t *testing.T) {
-	tr := newSyncLagTracker()
+	tr := newSyncLagTracker(0)
 	tr.observe(time.Time{}, time.Now())
 	if _, known := tr.SyncLagSeconds(time.Now()); known {
 		t.Fatal("zero-commit observe registered a reading; want still unknown")
@@ -79,7 +79,7 @@ func TestSyncLagTracker_ZeroCommitIgnored(t *testing.T) {
 // TestSyncLagTracker_ClockSkewFloor pins that a future-dated source commit
 // (clock skew) floors at 0 rather than reporting a negative "behind".
 func TestSyncLagTracker_ClockSkewFloor(t *testing.T) {
-	tr := newSyncLagTracker()
+	tr := newSyncLagTracker(0)
 	now := time.Date(2026, 6, 25, 12, 0, 0, 0, time.UTC)
 	tr.observe(now.Add(5*time.Second), now) // commit "in the future"
 	got, known := tr.SyncLagSeconds(now)
@@ -93,7 +93,7 @@ func TestSyncLagTracker_ClockSkewFloor(t *testing.T) {
 // shard's lag as its older-commit-time events flow. Observing a fast shard's
 // recent change then a slow shard's old change reflects the slow shard.
 func TestSyncLagTracker_MultiShardSlowestReflected(t *testing.T) {
-	tr := newSyncLagTracker()
+	tr := newSyncLagTracker(0)
 	now := time.Date(2026, 6, 25, 12, 0, 0, 0, time.UTC)
 	// Fast shard: event committed ~0s ago.
 	tr.observe(now, now)
@@ -110,7 +110,7 @@ func TestSyncLagTracker_MultiShardSlowestReflected(t *testing.T) {
 // TestObserveSyncLagChanges_PassThroughAndFeeds pins the interceptor: every
 // change is forwarded unchanged AND its commit time feeds the tracker.
 func TestObserveSyncLagChanges_PassThroughAndFeeds(t *testing.T) {
-	tr := newSyncLagTracker()
+	tr := newSyncLagTracker(0)
 	in := make(chan ir.Change, 2)
 	commit := time.Now().Add(-7 * time.Second)
 	in <- ir.Insert{Schema: "s", Table: "t", CommitTime: commit}
@@ -128,6 +128,47 @@ func TestObserveSyncLagChanges_PassThroughAndFeeds(t *testing.T) {
 	got, known := tr.SyncLagSeconds(time.Now())
 	if !known || got < 6.5 || got > 7.5 {
 		t.Fatalf("tracker lag = %v known=%v; want ~7s/known", got, known)
+	}
+}
+
+// TestSyncLagTracker_ApplyDelaySubtracted pins the roadmap-item-46 / ADR-0121
+// §5 hook: a delayed replica's intentional --apply-delay hold is subtracted out
+// of the reported lag, so a correctly-running delayed stream reads ~0 ("not
+// falling behind"), not `delay` seconds. Genuine apply backlog ON TOP of the
+// delay still surfaces; the subtraction floors at 0; and a zero delay leaves
+// the reading unchanged (the non-delayed default).
+func TestSyncLagTracker_ApplyDelaySubtracted(t *testing.T) {
+	const delay = 10 * time.Minute
+	base := time.Date(2026, 6, 25, 12, 0, 0, 0, time.UTC)
+
+	// A change committed `delay` ago, observed now (the steady-state delayed
+	// replica): now − commitTime == delay, so the corrected lag is ~0.
+	tr := newSyncLagTracker(delay)
+	tr.observe(base.Add(-delay), base)
+	if got, known := tr.SyncLagSeconds(base); !known || got < 0 || got > 0.1 {
+		t.Fatalf("delayed-replica lag = %v known=%v; want ~0 (delay subtracted)", got, known)
+	}
+
+	// Genuine backlog on top of the delay surfaces: committed delay+30s ago.
+	tr2 := newSyncLagTracker(delay)
+	tr2.observe(base.Add(-delay-30*time.Second), base)
+	if got, _ := tr2.SyncLagSeconds(base); got < 29 || got > 31 {
+		t.Fatalf("delayed-replica backlog lag = %v; want ~30s (backlog above the delay)", got)
+	}
+
+	// A change YOUNGER than the delay (released early / clock skew) floors at 0
+	// rather than reporting negative.
+	tr3 := newSyncLagTracker(delay)
+	tr3.observe(base.Add(-time.Minute), base)
+	if got, _ := tr3.SyncLagSeconds(base); got != 0 {
+		t.Fatalf("sub-delay lag = %v; want 0 floor", got)
+	}
+
+	// Zero delay (the non-delayed default) leaves the reading unchanged.
+	tr4 := newSyncLagTracker(0)
+	tr4.observe(base.Add(-3*time.Second), base)
+	if got, _ := tr4.SyncLagSeconds(base); got < 2.9 || got > 3.1 {
+		t.Fatalf("zero-delay lag = %v; want ~3s (no subtraction)", got)
 	}
 }
 
