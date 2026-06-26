@@ -63,6 +63,53 @@ global-state change** (unlike the sibling per-sync MySQL-overrides item, ADR-012
    Streamer's run loop), exactly as the single-sync provider outlives a reactive
    re-snapshot.
 
+## Fleet config example (`syncs.yaml`)
+
+The common one-org-one-token fleet: set the service token ONCE in the
+environment (`PLANETSCALE_METRICS_TOKEN_ID` / `PLANETSCALE_METRICS_TOKEN`) and
+add only the non-secret `planetscale-org` (+ optional `-branch`/`-db`) per sync.
+NEVER commit a token to the YAML.
+
+```yaml
+syncs:
+  - stream-id: orders
+    source-driver: mysql
+    source: mysql://u:p@src:3306/app
+    target-driver: postgres
+    target: postgres://u:p@orders.psdb:5432/orders_db
+    # PlanetScale target-health telemetry for THIS sync. Token resolves from
+    # PLANETSCALE_METRICS_TOKEN_ID / PLANETSCALE_METRICS_TOKEN in the env.
+    planetscale-org: acme
+    planetscale-metrics-branch: main      # optional; defaults to "main"
+    planetscale-metrics-db: orders_db     # optional; defaults to the target DSN's db
+    # PS-gated threshold alerts (ride the existing per-sync notify sinks):
+    notify-storage-util: 0.85
+    notify-cpu-util: 0.90
+    notify-lag-seconds: 30
+    notify-webhook: ""                    # sink URL via SLUICE_NOTIFY_WEBHOOK env
+  - stream-id: analytics
+    source-driver: postgres
+    source: postgres://u:p@src2:5432/app
+    target-driver: postgres
+    target: postgres://u:p@analytics.psdb:5432/analytics_db
+    planetscale-org: acme                 # same org+token, different target db
+    # no notify-* thresholds set ⇒ telemetry feeds the headroom clamp + metrics
+    # + diagnose only (no alerts)
+  - stream-id: legacy
+    source-driver: mysql
+    source: mysql://u:p@src3:3306/app
+    target-driver: mysql
+    target: mysql://u:p@dst:3306/app
+    # no planetscale-org ⇒ telemetry off (byte-identical default sync)
+```
+
+A sync that sets `planetscale-org` but has no resolvable token (neither in the
+spec nor the env) is refused at `sync run` config-load, named by stream-id. The
+`--dry-run` plan prints each sync's disposition (`telemetry=acme/orders_db@main`
+or `telemetry=off`) without the token. For a rare multi-org fleet, override the
+token per sync with `planetscale-metrics-token-id` / `planetscale-metrics-token`
+(prefer a secrets-manager-injected env over committing it).
+
 ## Consequences
 
 - Each fleet sync can watch its own PlanetScale target: per-sync headroom-clamped apply

@@ -35,7 +35,7 @@ func installReloadHandler(ctx context.Context, configPath string, sup *pipeline.
 				return
 			case <-ch:
 				slog.InfoContext(ctx, "sync run: SIGHUP received; reloading fleet config", slog.String("config", configPath))
-				if err := reloadFleet(configPath, sup); err != nil {
+				if err := reloadFleet(ctx, configPath, sup); err != nil {
 					slog.ErrorContext(
 						ctx,
 						"sync run: config reload REFUSED; live fleet unchanged (still running on the previous config)",

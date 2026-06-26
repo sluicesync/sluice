@@ -126,7 +126,7 @@ process-global overrides (`--mysql-sql-mode` / `--zero-date` / VStream tuning ar
 set once per process via package setters and are shared by every sync in the
 fleet); per-sync PlanetScale control-plane telemetry (the PS-util threshold alerts
 need a telemetry provider the v1 fleet does not wire — `notify-sync-lag-seconds` is
-ungated and DOES work); redaction keyset/dictionaries; and env-overlay over the
+ungated and DOES work) — **now SHIPPED in [ADR-0126](adr-0126-per-sync-planetscale-telemetry.md)**: the `planetscale-*` + PS-gated `notify-*` keys are per-sync, env-first token, refused all-or-nothing at config-load; redaction keyset/dictionaries; and env-overlay over the
 list. These are additive follow-ups, not correctness gaps.
 
 ### 4. Slot-name uniqueness guard (the data-corruption refusal)

@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -23,6 +24,7 @@ import (
 	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/notify"
 	"sluicesync.dev/sluice/internal/pipeline"
+	pstelemetry "sluicesync.dev/sluice/internal/planetscale/telemetry"
 )
 
 // SyncFleetConfig is the parsed `syncs.yaml` (ADR-0122 §3): a list of
@@ -56,8 +58,9 @@ func (r RestartConfig) toPolicy() pipeline.RestartPolicy {
 // the `sync start` flag surface (ADR-0122 §3) — the per-sync knobs that
 // matter for a fleet. Field keys are kebab-case to mirror the CLI flags
 // operators already know. Process-global MySQL knobs (--mysql-sql-mode /
-// --zero-date / VStream tuning) and per-sync PlanetScale telemetry are
-// intentionally out of v1 (set once per process / a future addition).
+// --zero-date / VStream tuning) remain out of v1 (set once per process);
+// per-sync PlanetScale telemetry landed in ADR-0126 (the planetscale-* +
+// PS-gated notify-* keys below).
 type SyncSpec struct {
 	StreamID     string `koanf:"stream-id"`
 	SourceDriver string `koanf:"source-driver"`
@@ -105,6 +108,35 @@ type SyncSpec struct {
 	NotifySMTPTLS      string   `koanf:"notify-smtp-tls"`
 	NotifySMTPAuth     string   `koanf:"notify-smtp-auth"`
 	NotifySMTPUsername string   `koanf:"notify-smtp-username"`
+
+	// OPTIONAL per-sync PlanetScale target-health telemetry (ADR-0126,
+	// mirroring `sync start`'s --planetscale-* flags). Setting planetscale-org
+	// enables it: sluice polls THIS sync's PlanetScale target off the apply
+	// hot path, feeding the headroom clamp + sluice_target_* metrics + diagnose
+	// + the PS-gated notify-* alerts below. The two secret fields are env-first
+	// (ADR-0126 §2): empty in the spec ⇒ fall back to PLANETSCALE_METRICS_TOKEN_ID
+	// / PLANETSCALE_METRICS_TOKEN — set the token once in the environment, only
+	// planetscale-org/-branch/-db per sync. NEVER commit a token to the YAML.
+	// All-or-nothing: planetscale-org without a resolvable token is refused at
+	// validate(); unset ⇒ telemetry-off (byte-identical default sync).
+	PlanetScaleOrg            string `koanf:"planetscale-org"`
+	PlanetScaleMetricsTokenID string `koanf:"planetscale-metrics-token-id"`
+	PlanetScaleMetricsToken   string `koanf:"planetscale-metrics-token"`
+	PlanetScaleMetricsBranch  string `koanf:"planetscale-metrics-branch"`
+	PlanetScaleMetricsDB      string `koanf:"planetscale-metrics-db"`
+
+	SuppressTargetMetricsHistory bool `koanf:"suppress-target-metrics-history"`
+
+	// PS-gated threshold alerts (ADR-0107 item 36, per-sync via ADR-0126).
+	// Inert unless planetscale-org telemetry is wired AND a notify sink is set;
+	// a threshold of 0 leaves its rule off. notify-lag-seconds is the PS
+	// control-plane TARGET-INTERNAL replica lag — distinct from the ungated
+	// notify-sync-lag-seconds (sluice's own end-to-end lag) above.
+	NotifyStorageUtil         float64 `koanf:"notify-storage-util"`
+	NotifyCPUUtil             float64 `koanf:"notify-cpu-util"`
+	NotifyMemUtil             float64 `koanf:"notify-mem-util"`
+	NotifyLagSeconds          float64 `koanf:"notify-lag-seconds"`
+	NotifyStorageGrowthPerMin float64 `koanf:"notify-storage-growth-per-min"`
 }
 
 // loadFleetConfig parses a syncs.yaml fleet config from path. Durations
@@ -193,8 +225,67 @@ func (f *SyncFleetConfig) validate() error {
 		); err != nil {
 			return fmt.Errorf("sync run: %s: %w", who, err)
 		}
+
+		// PlanetScale telemetry opt-in is per-sync all-or-nothing (ADR-0126 §3,
+		// mirroring `sync start`'s contract): planetscale-org without a
+		// resolvable token-id + token (spec OR the shared env vars) is refused
+		// loudly here at config-load — named by stream-id and missing field —
+		// rather than silently running telemetry-off. A sync that sets none is
+		// telemetry-off, byte-identical to today.
+		if err := s.validateTelemetry(who); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// validateTelemetry enforces the per-sync PlanetScale telemetry all-or-nothing
+// contract (ADR-0126 §3): if planetscale-org is set, BOTH the token-id and the
+// token must resolve (from the spec or the PLANETSCALE_METRICS_TOKEN_ID /
+// PLANETSCALE_METRICS_TOKEN env vars). The refusal names the offending sync and
+// the missing field; the token value itself is never echoed.
+func (s *SyncSpec) validateTelemetry(who string) error {
+	if s.PlanetScaleOrg == "" {
+		return nil // telemetry off — the zero value, unchanged.
+	}
+	p := s.resolveTelemetryParams()
+	switch {
+	case p.tokenID == "" && p.token == "":
+		return fmt.Errorf(
+			"sync run: %s: planetscale-org is set but no metrics service token is resolvable: set planetscale-metrics-token-id + planetscale-metrics-token in the spec, or the PLANETSCALE_METRICS_TOKEN_ID / PLANETSCALE_METRICS_TOKEN env vars (telemetry is opt-in and all-or-nothing — it never half-runs)",
+			who,
+		)
+	case p.tokenID == "":
+		return fmt.Errorf(
+			"sync run: %s: planetscale-org is set but planetscale-metrics-token-id is missing (set it in the spec or the PLANETSCALE_METRICS_TOKEN_ID env var)",
+			who,
+		)
+	case p.token == "":
+		return fmt.Errorf(
+			"sync run: %s: planetscale-org is set but planetscale-metrics-token is missing (set it in the spec or the PLANETSCALE_METRICS_TOKEN env var)",
+			who,
+		)
+	}
+	return nil
+}
+
+// resolveTelemetryParams gathers this sync's PlanetScale telemetry params for
+// [buildTargetTelemetryProvider], resolving the two secret fields ENV-FIRST
+// (ADR-0126 §2): an empty planetscale-metrics-token-id / -token in the spec
+// falls back to the shared PLANETSCALE_METRICS_TOKEN_ID / PLANETSCALE_METRICS_TOKEN
+// env vars (the same vars the single-sync flags read). The common one-org-one-
+// token fleet sets the secret once in the environment and only planetscale-org
+// (+ optional -branch/-db) per sync. The token is never logged.
+func (s *SyncSpec) resolveTelemetryParams() telemetryParams {
+	return telemetryParams{
+		org:       s.PlanetScaleOrg,
+		tokenID:   firstNonEmpty(s.PlanetScaleMetricsTokenID, os.Getenv("PLANETSCALE_METRICS_TOKEN_ID")),
+		token:     firstNonEmpty(s.PlanetScaleMetricsToken, os.Getenv("PLANETSCALE_METRICS_TOKEN")),
+		metricsDB: s.PlanetScaleMetricsDB,
+		branch:    s.PlanetScaleMetricsBranch,
+		targetDSN: s.Target,
+		engine:    s.TargetDriver,
+	}
 }
 
 // describe names a sync for an error message: its stream-id when set,
@@ -290,10 +381,14 @@ func (c *SyncRunCmd) Run(g *Globals) error {
 	warnSharedTargetBudget(fleet)
 
 	ctx := kongContext()
-	supervised, err := buildSupervisedFleet(fleet)
+	supervised, closeTelemetry, err := buildSupervisedFleet(ctx, fleet)
 	if err != nil {
 		return err
 	}
+	// ADR-0126: shut down every per-sync PlanetScale telemetry provider's poll
+	// goroutine on fleet exit. Each provider is also scoped to ctx as a
+	// backstop, but the explicit Close is the documented lifecycle.
+	defer func() { _ = closeTelemetry() }()
 
 	sup := pipeline.NewSupervisor(supervised, fleet.Restart.toPolicy())
 
@@ -328,13 +423,43 @@ func (c *SyncRunCmd) Run(g *Globals) error {
 // input, building one Streamer per sync and stamping each with a stable
 // fingerprint of its resolved spec so [pipeline.Supervisor.Reconcile] can
 // detect a CHANGED sync across a hot-reload.
-func buildSupervisedFleet(fleet *SyncFleetConfig) ([]pipeline.SupervisedSync, error) {
+//
+// For each telemetry-enabled sync (ADR-0126) it also builds a PlanetScale
+// telemetry provider from that sync's resolved params and attaches it to THAT
+// sync's Streamer.TargetTelemetry. The returned closer shuts every provider's
+// poll goroutine down; the caller (`sync run`) defers it on fleet exit. The
+// provider polls independently of the Streamer's run loop, so it persists
+// across a sync's supervisor restarts — exactly as the single-sync provider
+// outlives a reactive re-snapshot.
+func buildSupervisedFleet(ctx context.Context, fleet *SyncFleetConfig) ([]pipeline.SupervisedSync, func() error, error) {
 	supervised := make([]pipeline.SupervisedSync, 0, len(fleet.Syncs))
+	var providers []*pstelemetry.Provider
+	closeProviders := func() error {
+		errs := make([]error, 0, len(providers))
+		for _, p := range providers {
+			errs = append(errs, p.Close())
+		}
+		return errors.Join(errs...)
+	}
 	for i := range fleet.Syncs {
 		spec := &fleet.Syncs[i]
 		streamer, err := buildStreamerFromSpec(spec)
 		if err != nil {
-			return nil, fmt.Errorf("sync run: %s: %w", spec.describe(i), err)
+			_ = closeProviders()
+			return nil, nil, fmt.Errorf("sync run: %s: %w", spec.describe(i), err)
+		}
+		// ADR-0126: build + attach this sync's PlanetScale telemetry provider.
+		// Returns (nil, nil) when the sync did not opt in (no planetscale-org)
+		// ⇒ TargetTelemetry stays the zero nil interface ⇒ byte-identical
+		// default sync. telemetryProviderOrNil avoids the typed-nil trap.
+		provider, err := buildTargetTelemetryProvider(ctx, spec.resolveTelemetryParams())
+		if err != nil {
+			_ = closeProviders()
+			return nil, nil, fmt.Errorf("sync run: %s: %w", spec.describe(i), err)
+		}
+		if provider != nil {
+			providers = append(providers, provider)
+			streamer.TargetTelemetry = telemetryProviderOrNil(provider)
 		}
 		supervised = append(supervised, pipeline.SupervisedSync{
 			ID:          spec.StreamID,
@@ -342,7 +467,7 @@ func buildSupervisedFleet(fleet *SyncFleetConfig) ([]pipeline.SupervisedSync, er
 			Fingerprint: spec.fingerprint(),
 		})
 	}
-	return supervised, nil
+	return supervised, closeProviders, nil
 }
 
 // reloadFleet re-reads the fleet config from path, RE-RUNS the same
@@ -353,7 +478,7 @@ func buildSupervisedFleet(fleet *SyncFleetConfig) ([]pipeline.SupervisedSync, er
 // error WITHOUT calling Reconcile, so the running fleet keeps going on
 // the old config unchanged. A malformed / colliding reloaded config can
 // never take down or corrupt the live fleet.
-func reloadFleet(path string, sup *pipeline.Supervisor) error {
+func reloadFleet(ctx context.Context, path string, sup *pipeline.Supervisor) error {
 	fleet, err := loadFleetConfig(path)
 	if err != nil {
 		return err
@@ -362,13 +487,23 @@ func reloadFleet(path string, sup *pipeline.Supervisor) error {
 		return err
 	}
 	warnSharedTargetBudget(fleet)
-	supervised, err := buildSupervisedFleet(fleet)
+	supervised, closeTelemetry, err := buildSupervisedFleet(ctx, fleet)
 	if err != nil {
 		return err
 	}
 	if _, err := sup.Reconcile(supervised); err != nil {
+		// Reconcile refused the reload (live fleet untouched): none of the
+		// freshly built telemetry providers were adopted, so close them now to
+		// avoid leaking their poll goroutines.
+		_ = closeTelemetry()
 		return err
 	}
+	// On a successful reconcile the adopted syncs' providers are live for the
+	// fleet's lifetime. Providers built for an UNCHANGED sync (which Reconcile
+	// discards in favour of the already-running streamer) are not closed here,
+	// but every provider is scoped to ctx, so they all stop at fleet shutdown —
+	// a bounded, advisory, failure-isolated duplicate-poll between a reload and
+	// shutdown, never a permanent goroutine leak.
 	return nil
 }
 
@@ -467,6 +602,18 @@ func buildStreamerFromSpec(spec *SyncSpec) (*pipeline.Streamer, error) {
 		NotifyCooldown:        spec.NotifyCooldown,
 		NotifySMTP:            smtp,
 
+		// ADR-0126: per-sync PlanetScale telemetry config. The provider itself
+		// is built + attached in buildSupervisedFleet (it needs ctx + a poll
+		// goroutine); these are the plain-data knobs. The PS-gated notify rules
+		// stay inert unless a provider is wired AND a sink + threshold are set,
+		// exactly as on `sync start` — so setting them here is always safe.
+		SuppressTargetMetricsHistory: spec.SuppressTargetMetricsHistory,
+		NotifyStorageUtil:            spec.NotifyStorageUtil,
+		NotifyCPUUtil:                spec.NotifyCPUUtil,
+		NotifyMemUtil:                spec.NotifyMemUtil,
+		NotifyLagSeconds:             spec.NotifyLagSeconds,
+		NotifyStorageGrowthPerMin:    spec.NotifyStorageGrowthPerMin,
+
 		BuildVersion: version,
 		BuildCommit:  commit,
 	}, nil
@@ -502,9 +649,9 @@ func printFleetPlan(out *os.File, fleet *SyncFleetConfig) error {
 			slot = resolvedSlotName(s.SlotName)
 		}
 		if _, err := fmt.Fprintf(
-			out, "  %s\t%s://%s -> %s://%s\tslot=%s\n",
+			out, "  %s\t%s://%s -> %s://%s\tslot=%s\ttelemetry=%s\n",
 			s.StreamID, s.SourceDriver, dsnEndpoint(s.Source),
-			s.TargetDriver, dsnEndpoint(s.Target), slot,
+			s.TargetDriver, dsnEndpoint(s.Target), slot, telemetryPlanLabel(s),
 		); err != nil {
 			return err
 		}
@@ -517,6 +664,25 @@ func printFleetPlan(out *os.File, fleet *SyncFleetConfig) error {
 		p.MaxConsecutiveFailures,
 	)
 	return err
+}
+
+// telemetryPlanLabel renders a sync's PlanetScale telemetry disposition for
+// the --dry-run plan (ADR-0126 §5): "off" when no planetscale-org, else
+// "org/db@branch" where db is the explicit planetscale-metrics-db or the one
+// derived from the target DSN ("?" when neither yields a name), and branch is
+// the configured branch or "main". It NEVER prints the token.
+func telemetryPlanLabel(s *SyncSpec) string {
+	if s.PlanetScaleOrg == "" {
+		return "off"
+	}
+	db := s.PlanetScaleMetricsDB
+	if db == "" {
+		db = databaseFromDSN(s.Target)
+	}
+	if db == "" {
+		db = "?"
+	}
+	return fmt.Sprintf("%s/%s@%s", s.PlanetScaleOrg, db, branchOrMainLabel(s.PlanetScaleMetricsBranch))
 }
 
 // isPostgresSourceDriver reports whether the named source driver has a

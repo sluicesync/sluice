@@ -238,7 +238,7 @@ func TestReloadFleet_RefusesBadConfig(t *testing.T) {
 
 	t.Run("malformed yaml", func(t *testing.T) {
 		path := writeFleetYAML(t, "syncs: [this is : not valid yaml")
-		err := reloadFleet(path, sup)
+		err := reloadFleet(context.Background(), path, sup)
 		if err == nil {
 			t.Fatal("reloadFleet on malformed yaml = nil; want a parse error")
 		}
@@ -258,7 +258,7 @@ syncs:
     target-driver: mysql
     target: mysql://u:p@dst:3306/app
 `)
-		err := reloadFleet(path, sup)
+		err := reloadFleet(context.Background(), path, sup)
 		if err == nil {
 			t.Fatal("reloadFleet on slot-colliding config = nil; want a refusal")
 		}
@@ -281,7 +281,7 @@ syncs:
     target-driver: postgres
     target: postgres://u:p@dst:5432/app
 `)
-		err := reloadFleet(path, sup)
+		err := reloadFleet(context.Background(), path, sup)
 		if err == nil || !strings.Contains(err.Error(), "duplicate stream-id") {
 			t.Fatalf("reloadFleet on duplicate stream-id = %v; want a duplicate-stream-id refusal", err)
 		}
