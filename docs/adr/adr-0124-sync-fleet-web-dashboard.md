@@ -49,9 +49,10 @@ the zero-value-safe default).
    - `GET /` → the dashboard HTML (a single `go:embed`-ed page; auto-refreshes by
      polling `/api/fleet` on a client-side timer — no websockets, no build step).
    - `GET /api/fleet` → JSON: `{ "generated_at": <rfc3339>, "syncs": [ {id, state,
-     consecutive_failures, restarts, last_error, last_start, since, uptime_seconds} ] }`,
+     consecutive_failures, restarts, last_error, last_start, since, seconds_in_state} ] }`,
      derived purely from `Supervisor.Snapshot()`. Stable, documented shape so the page
-     (or any external poller) can consume it.
+     (or any external poller) can consume it. (`seconds_in_state` is the wall-clock
+     seconds the sync has been in its current state — `now − since`.)
    - `GET /healthz` → `200 "ok"` (liveness; mirrors the metrics server) so the dashboard
      port is probe-able.
 
