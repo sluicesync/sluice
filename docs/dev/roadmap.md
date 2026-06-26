@@ -631,6 +631,38 @@ So NOTIFY-kick is **demoted** — the poll isn't the bottleneck. Closing the rea
 
 ---
 
+> **Items 45–47 form one coherent "sync control plane" direction** (operator-flagged 2026-06-25): turn sluice from a tool you run per-migration into a long-running sync fabric you *operate* — many supervised syncs (47), any of them optionally lag-delayed for DR (46), all of them health-alerted against their source (45). Queued as worthwhile next work (not demand-gated); suggested order is 45 → 46 → 47 (cheapest/broadest first, unifying layer last). Each builds directly on shipped foundations (bounded streaming, the notify layer, per-stream metrics).
+
+### 45. Source-vs-target lag alerting: an engine-neutral "seconds behind source" metric + threshold alert — *queued; small, high-value, reuses the shipped notify layer*
+
+**Why.** The notification machinery is already shipped (item 36 / ADR-0107: webhook + Slack sinks, an edge-triggered threshold alerter with per-rule cooldown + hysteresis, and a `--notify-lag-seconds` rule). But that lag rule reads the **target's control-plane replica lag from PlanetScale telemetry** (`sluice_target_replica_lag_seconds`, PS-gated) — there is no engine-agnostic alert on sluice's **own** sync lag: how far the applied target position trails the source's latest commit. That "is my target keeping up with my source" signal is exactly what an operator wants to be paged on, and it should work for MySQL and Postgres alike, with no PlanetScale dependency.
+
+**What.** Surface a first-class engine-neutral sync-lag metric — source latest-commit timestamp minus the applied-position commit timestamp ("seconds behind source") — exported as `sluice_sync_lag_seconds` alongside the existing gauges, and wire it into the existing threshold-alerter UNGATED from PS telemetry. The sink / cooldown / hysteresis / Slack plumbing already exists; this is "add one metric + one rule," so the surface is small.
+
+**Gotchas.** (1) Time-based lag needs source commit timestamps — CDC changes already carry them (binlog/GTID event time, VStream event time). (2) Define lag HONESTLY when idle: no new source commits ⇒ lag is 0/caught-up, not a growing number (a common false-alarm class). (3) Multi-shard VStream: report max-across-shards (the slowest shard is the lag). (4) Keep it distinct from the existing PS control-plane `sluice_target_replica_lag_seconds` (different metric name, different meaning — apply lag vs target-internal replica lag). (5) Must subtract item 46's intentional delay if both are engaged (don't page on a deliberately-delayed replica).
+
+---
+
+### 46. Delayed replica: keep the target a configurable interval behind the source — *queued; medium, strong DR story; ADR-worthy*
+
+**Why.** The "oops window" disaster-recovery pattern (MySQL's `MASTER_DELAY` analog): a deliberately N-minutes-behind target gives an operator time to **stop sluice before an accidental `DROP TABLE` / bad migration / runaway `DELETE` on the source replicates**, then recover from the still-intact target. It's cheap, comprehensible point-in-time protection that complements the logical-backup track. Nothing like it exists today — CDC applies as fast as it can.
+
+**What.** An `--apply-delay DURATION` knob: hold each CDC change until `commit_ts + delay ≤ now` before applying it. Engine-neutral, lives in the streamer apply loop; the cold-copy phase is unaffected (only steady-state CDC delays).
+
+**Gotchas.** (1) Resume / exactly-once: the delay buffer must NEVER be the only home of un-applied changes — resume restarts from the last **applied** position and re-reads the delayed window (the position model already supports resuming from an older point); a process crash must not lose the buffered-but-unapplied tail. (2) Bounded memory: the buffer is `≤ delay × write-rate`, which can be large, so it must backpressure / spill rather than balloon (the bounded-streaming discipline the memory-soak work validated). (3) Lag alerting (item 45) must treat the configured delay as expected, not as falling behind.
+
+---
+
+### 47. Sync command center: supervise many syncs from one sluice instance + aggregated status/dashboard — *queued; larger, the unifying layer; stage minimal-first*
+
+**Why.** Shifts sluice from "a tool you run per-migration" to "a sync fabric you operate." Today each `sluice sync start` is one source→target stream in its own process; the observability primitives already exist (per-stream `sync status` / `sync-health` / `/metrics`, the standalone `metrics-watch` daemon, and `sync status` already renders in terms of "N streams"), but there is no layer to **drive and aggregate many syncs at once** — which is what an operator keeping several ongoing cross-database syncs alive actually wants.
+
+**What.** Stage it. Minimal first: `sluice sync run --config syncs.yaml` that supervises N streams in ONE process (each its own stream-id, with independent failure isolation + restart) plus `sync status --all` that rolls up the existing per-stream status/metrics into a fleet view. A TUI / web dashboard is a later layer over the already-exported metrics, not v1.
+
+**Gotchas.** (1) Failure isolation is the load-bearing part — one sync dying must NOT take down the others (independent ctx / retry / restart per stream). (2) Shared connection-budget accounting when several syncs target one server. (3) Distinct replication-slot names per Postgres sync (the `--slot-name` convention already supports this; the supervisor must enforce uniqueness). (4) Config hot-reload is a later nicety, not v1. Composes with item 45 (per-sync lag alerts roll up to the fleet view) and item 46 (any supervised sync can be delayed).
+
+---
+
 ### Open bugs awaiting fix windows
 
 Tracked in detail in the project's internal regression catalog; recap here for roadmap visibility:
