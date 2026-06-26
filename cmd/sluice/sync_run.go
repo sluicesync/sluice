@@ -266,7 +266,8 @@ func warnSharedTargetBudget(fleet *SyncFleetConfig) {
 // is the global --config / -c flag (a syncs.yaml fleet config here, the
 // list of sync specs + the restart policy).
 type SyncRunCmd struct {
-	DryRun bool `short:"n" help:"Validate the fleet config (required fields, stream-id + slot-name uniqueness, retry bounds) and print the resolved plan without starting any sync."`
+	DryRun          bool   `short:"n" help:"Validate the fleet config (required fields, stream-id + slot-name uniqueness, retry bounds) and print the resolved plan without starting any sync."`
+	DashboardListen string `help:"Serve a read-only fleet dashboard (HTML + a /api/fleet JSON API) on ADDR (e.g. :9300). Empty = off. NO AUTHENTICATION — bind to localhost or a trusted network only."`
 }
 
 // Run implements `sluice sync run`.
@@ -295,6 +296,24 @@ func (c *SyncRunCmd) Run(g *Globals) error {
 	}
 
 	sup := pipeline.NewSupervisor(supervised, fleet.Restart.toPolicy())
+
+	// Read-only fleet dashboard (ADR-0124): opt-in via --dashboard-listen.
+	// A bind-time failure is LOUD-FATAL — the operator asked for the
+	// dashboard, so refuse to start the fleet rather than silently run
+	// without it (mirrors phaseStartMetricsServer's bind disposition). The
+	// server reads only sup.Snapshot() — never the apply path. Empty addr
+	// (the zero value) ⇒ off; never started under --dry-run.
+	if c.DashboardListen != "" && !c.DryRun {
+		dash, err := pipeline.NewDashboardServer(c.DashboardListen, sup)
+		if err != nil {
+			return err
+		}
+		if err := dash.Start(); err != nil {
+			return err
+		}
+		defer func() { _ = dash.Close() }()
+		slog.InfoContext(ctx, "sync run: fleet dashboard listening", slog.String("addr", c.DashboardListen))
+	}
 
 	// SIGHUP hot-reload (ADR-0122 §3): re-read + re-validate the config and
 	// reconcile the live fleet without a process restart. POSIX-only — on

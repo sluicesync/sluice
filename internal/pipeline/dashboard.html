@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<!--
+  sluice — fleet dashboard (ADR-0124). Self-contained: inline CSS + vanilla
+  JS, no external/CDN assets, no build step. Read-only; polls /api/fleet.
+  XSS-safe: every cell value is set via textContent, never innerHTML —
+  stream-ids and error strings are operator/runtime data.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sluice — fleet dashboard</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --card: #ffffff;
+    --ink: #1f2733;
+    --muted: #6b7685;
+    --border: #e3e7ec;
+    --running: #1a7f37;
+    --backoff: #b7791f;
+    --starting: #1f6feb;
+    --failed: #c0392b;
+    --stopped: #6b7685;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  header {
+    padding: 20px 24px;
+    background: var(--card);
+    border-bottom: 1px solid var(--border);
+  }
+  h1 {
+    margin: 0;
+    font-size: 18px;
+    font-weight: 650;
+    letter-spacing: -0.01em;
+  }
+  h1 .glyph { color: var(--starting); }
+  .counts {
+    margin-top: 8px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    color: var(--muted);
+    font-size: 13px;
+  }
+  .counts b { color: var(--ink); font-weight: 650; }
+  .updated { margin-left: auto; }
+  main { padding: 16px 24px 32px; }
+  .banner {
+    display: none;
+    margin: 0 0 16px;
+    padding: 10px 14px;
+    border-radius: 8px;
+    background: #fdecea;
+    border: 1px solid #f5c6c0;
+    color: var(--failed);
+    font-weight: 600;
+  }
+  .banner.show { display: block; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  th, td {
+    text-align: left;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    font-weight: 600;
+    background: #fafbfc;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  td.id { font-weight: 600; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  td.err { color: var(--muted); max-width: 480px; word-break: break-word; }
+  td.num { font-variant-numeric: tabular-nums; }
+  .pill {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 650;
+    color: #fff;
+    text-transform: capitalize;
+  }
+  .pill.running { background: var(--running); }
+  .pill.backoff { background: var(--backoff); }
+  .pill.starting { background: var(--starting); }
+  .pill.failed { background: var(--failed); }
+  .pill.stopped { background: var(--stopped); }
+  .empty { color: var(--muted); padding: 24px 14px; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span class="glyph">~</span> sluice &mdash; fleet dashboard</h1>
+  <div class="counts">
+    <span><b id="c-total">0</b> total</span>
+    <span><b id="c-running">0</b> running</span>
+    <span><b id="c-failed">0</b> failed</span>
+    <span class="updated">last updated <b id="c-updated">never</b></span>
+  </div>
+</header>
+<main>
+  <div class="banner" id="banner">&#9888; dashboard API unreachable &mdash; showing last known fleet state</div>
+  <table>
+    <thead>
+      <tr>
+        <th>Stream ID</th>
+        <th>State</th>
+        <th>Restarts</th>
+        <th>Consecutive failures</th>
+        <th>In state</th>
+        <th>Last error</th>
+      </tr>
+    </thead>
+    <tbody id="rows">
+      <tr><td class="empty" colspan="6">loading&hellip;</td></tr>
+    </tbody>
+  </table>
+</main>
+<script>
+"use strict";
+
+// humanizeDuration renders seconds as a compact "1h2m3s" / "3m12s" / "45s".
+function humanizeDuration(seconds) {
+  if (!isFinite(seconds) || seconds < 0) { return "-"; }
+  var s = Math.floor(seconds);
+  var h = Math.floor(s / 3600);
+  var m = Math.floor((s % 3600) / 60);
+  var sec = s % 60;
+  if (h > 0) { return h + "h" + m + "m" + sec + "s"; }
+  if (m > 0) { return m + "m" + sec + "s"; }
+  return sec + "s";
+}
+
+// cell builds a <td> whose text is set via textContent (never innerHTML),
+// so operator/runtime strings can't inject markup.
+function cell(text, className) {
+  var td = document.createElement("td");
+  if (className) { td.className = className; }
+  td.textContent = text;
+  return td;
+}
+
+var KNOWN_STATES = { running: 1, backoff: 1, starting: 1, failed: 1, stopped: 1 };
+
+function statePill(state) {
+  var td = document.createElement("td");
+  var span = document.createElement("span");
+  var cls = KNOWN_STATES[state] ? state : "stopped";
+  span.className = "pill " + cls;
+  span.textContent = state || "unknown";
+  td.appendChild(span);
+  return td;
+}
+
+function render(report) {
+  var syncs = (report && report.syncs) || [];
+  var tbody = document.getElementById("rows");
+  tbody.textContent = "";
+
+  var running = 0, failed = 0;
+  if (syncs.length === 0) {
+    tbody.appendChild((function () {
+      var tr = document.createElement("tr");
+      tr.appendChild(cell("no syncs configured", "empty"));
+      tr.firstChild.setAttribute("colspan", "6");
+      return tr;
+    })());
+  } else {
+    syncs.forEach(function (s) {
+      if (s.state === "running") { running++; }
+      if (s.state === "failed") { failed++; }
+      var tr = document.createElement("tr");
+      tr.appendChild(cell(s.id, "id"));
+      tr.appendChild(statePill(s.state));
+      tr.appendChild(cell(String(s.restarts || 0), "num"));
+      tr.appendChild(cell(String(s.consecutive_failures || 0), "num"));
+      tr.appendChild(cell(humanizeDuration(s.seconds_in_state), "num"));
+      tr.appendChild(cell(s.last_error || "", "err"));
+      tbody.appendChild(tr);
+    });
+  }
+
+  document.getElementById("c-total").textContent = String(syncs.length);
+  document.getElementById("c-running").textContent = String(running);
+  document.getElementById("c-failed").textContent = String(failed);
+  document.getElementById("c-updated").textContent = new Date().toLocaleTimeString();
+}
+
+function setBanner(show) {
+  document.getElementById("banner").classList.toggle("show", show);
+}
+
+function poll() {
+  fetch("/api/fleet", { cache: "no-store" })
+    .then(function (resp) {
+      if (!resp.ok) { throw new Error("HTTP " + resp.status); }
+      return resp.json();
+    })
+    .then(function (report) {
+      setBanner(false);
+      render(report);
+    })
+    .catch(function () {
+      // Don't blank the table on a transient failure — leave the last
+      // known state up and raise the unreachable banner.
+      setBanner(true);
+    });
+}
+
+poll();
+setInterval(poll, 3000);
+</script>
+</body>
+</html>
