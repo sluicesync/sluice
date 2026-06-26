@@ -2077,9 +2077,28 @@ func ensurePublication(ctx context.Context, db *sql.DB, name, schema string, tab
 				quoteIdent(name), formatPublicationTableList(schema, tables))
 		}
 		if _, err := db.ExecContext(ctx, createQuery); err != nil {
-			return fmt.Errorf("postgres: create publication %q: %w", name, err)
+			if !isDuplicatePublication(err) {
+				return fmt.Errorf("postgres: create publication %q: %w", name, err)
+			}
+			// Lost the create race against a concurrent ensurer. Several
+			// PG-source syncs sharing one source routinely ensure the same
+			// publication at fleet cold-start (ADR-0122), and a check-then-
+			// create has a TOCTOU window where two sessions both pass the
+			// existence check and both CREATE, so one hits a unique-violation
+			// on pg_publication's pubname index (SQLSTATE 23505). That is
+			// benign — the publication now exists — so re-read and fall
+			// through to reconcile our scope rather than failing the sync
+			// (which the supervisor would then spuriously restart).
+			if err := db.QueryRowContext(ctx, checkQuery, name).Scan(&exists, &allTables); err != nil {
+				return fmt.Errorf("postgres: re-check publication after create race: %w", err)
+			}
+			if !exists {
+				return fmt.Errorf("postgres: publication %q reported a duplicate on create yet is absent on re-check", name)
+			}
+			// fall through to the exists-reconcile below
+		} else {
+			return nil
 		}
-		return nil
 	}
 
 	// Publication exists. If the caller supplied an explicit table
@@ -2191,9 +2210,31 @@ func ensureAllTablesPublication(ctx context.Context, db *sql.DB, name string) er
 	}
 	createQuery := fmt.Sprintf(`CREATE PUBLICATION %s FOR ALL TABLES`, quoteIdent(name))
 	if _, err := db.ExecContext(ctx, createQuery); err != nil {
+		// A concurrent ensurer winning the create race (shared-source fleet
+		// cold-start, ADR-0122) surfaces as a unique-violation on
+		// pg_publication. Benign: every racer here is creating the SAME
+		// FOR ALL TABLES publication, so an existing one is exactly the goal.
+		if isDuplicatePublication(err) {
+			return nil
+		}
 		return fmt.Errorf("postgres: create FOR ALL TABLES publication %q: %w", name, err)
 	}
 	return nil
+}
+
+// isDuplicatePublication reports whether err is the benign
+// "publication already exists" shape — either a concurrent CREATE losing
+// the race (23505 unique_violation on pg_publication's pubname index, the
+// shape two sessions hit when both pass a check-then-create existence
+// check) or the single-session 42710 duplicate_object. Used to make
+// publication creation idempotent for shared-source fleets where several
+// syncs ensure the same publication concurrently at cold-start.
+func isDuplicatePublication(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "23505" || pgErr.Code == "42710"
+	}
+	return false
 }
 
 // publicationIsEmpty reports whether the named publication has no

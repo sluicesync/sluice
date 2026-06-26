@@ -271,3 +271,51 @@ func TestRecordFailure_ResetsOnHealthyRun(t *testing.T) {
 		t.Errorf("Restarts = %d; want 3", snap.Restarts)
 	}
 }
+
+// TestSupervisor_Snapshot_HealthyDerivationClearsStaleError pins the
+// read-time healthy-derivation: a sync that failed, then recovered and has
+// been running past HealthyRunThreshold, reports ConsecutiveFailures=0 and
+// an empty LastError (the lazy reset only fires on the NEXT failure, so
+// without this a recovered green sync keeps showing a stale error + count
+// indefinitely — the dashboard wart the shared-source demo surfaced). The
+// lifetime Restarts counter is preserved, and within the threshold the
+// stale error is still shown (a just-recovered sync's recent error is
+// still relevant).
+func TestSupervisor_Snapshot_HealthyDerivationClearsStaleError(t *testing.T) {
+	sup := NewSupervisor([]SupervisedSync{{ID: "s"}}, RestartPolicy{HealthyRunThreshold: time.Minute})
+	sup.recordFailure("s", errors.New("boom"), false)
+	sup.recordFailure("s", errors.New("boom"), false) // now two consecutive failures, two restarts, lastErr stored
+
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	sup.clock = func() time.Time { return base }
+	sup.markRunning("s") // transition to running; stamps lastStart at base
+
+	// Within the threshold: the recent error + count are still shown.
+	sup.clock = func() time.Time { return base.Add(10 * time.Second) }
+	if snap, _ := snapshotFor(sup, "s"); snap.LastError == "" || snap.ConsecutiveFailures != 2 {
+		t.Fatalf("within threshold: want error+count retained; got err=%q consec=%d", snap.LastError, snap.ConsecutiveFailures)
+	}
+
+	// Past the threshold: healthy — error + consecutive cleared, restarts kept.
+	sup.clock = func() time.Time { return base.Add(90 * time.Second) }
+	snap, _ := snapshotFor(sup, "s")
+	if snap.State != SyncRunning {
+		t.Errorf("State = %q; want running", snap.State)
+	}
+	if snap.LastError != "" {
+		t.Errorf("past threshold: LastError = %q; want cleared", snap.LastError)
+	}
+	if snap.ConsecutiveFailures != 0 {
+		t.Errorf("past threshold: ConsecutiveFailures = %d; want 0", snap.ConsecutiveFailures)
+	}
+	if snap.Restarts != 2 {
+		t.Errorf("Restarts = %d; want 2 (lifetime counter preserved)", snap.Restarts)
+	}
+
+	// A sync in backoff (not running) past the same elapsed time still
+	// shows its error — the derivation only applies to a running sync.
+	sup.setState("s", SyncBackoff, errors.New("down again"))
+	if snap, _ := snapshotFor(sup, "s"); snap.LastError == "" {
+		t.Errorf("backoff sync: LastError cleared; want retained")
+	}
+}

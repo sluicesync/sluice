@@ -596,6 +596,7 @@ func (s *Supervisor) setState(id string, state SyncState, err error) {
 func (s *Supervisor) Snapshot() []SyncStatusSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := s.clock()
 	out := make([]SyncStatusSnapshot, 0, len(s.order))
 	for _, id := range s.order {
 		st := s.states[id]
@@ -603,15 +604,32 @@ func (s *Supervisor) Snapshot() []SyncStatusSnapshot {
 			continue
 		}
 		snap := SyncStatusSnapshot{
-			ID:                  id,
-			State:               st.state,
-			ConsecutiveFailures: st.consecutive,
-			Restarts:            st.restarts,
-			LastStart:           st.lastStart,
-			Since:               st.since,
+			ID:        id,
+			State:     st.state,
+			Restarts:  st.restarts,
+			LastStart: st.lastStart,
+			Since:     st.since,
 		}
-		if st.lastErr != nil {
-			snap.LastError = st.lastErr.Error()
+		// Healthy-derivation: a sync currently running past
+		// HealthyRunThreshold is healthy by the SAME definition the lazy
+		// reset uses (recordFailure resets the consecutive counter when the
+		// prior run lasted >= the threshold). The stored counter only resets
+		// on the NEXT failure, so without this a recovered sync would keep
+		// reporting a stale consecutive-failure count AND a stale last_error
+		// indefinitely while sitting green — the dashboard wart the
+		// shared-source demo surfaced. We derive at read time rather than
+		// clearing eagerly on markRunning: eager clearing would reset the
+		// counter every restart and defeat the MaxConsecutiveFailures cap (a
+		// crash-loop would never be isolated). Restarts is a lifetime counter
+		// and is left intact.
+		healthy := st.state == SyncRunning &&
+			!st.lastStart.IsZero() &&
+			now.Sub(st.lastStart) >= s.policy.HealthyRunThreshold
+		if !healthy {
+			snap.ConsecutiveFailures = st.consecutive
+			if st.lastErr != nil {
+				snap.LastError = st.lastErr.Error()
+			}
 		}
 		out = append(out, snap)
 	}

@@ -4,6 +4,15 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+- **Shared-source PostgreSQL fleets: publication creation is now idempotent against the concurrent-create race.** When several PostgreSQL-source syncs share one source — the `sync run` command-center's normal case — they ensure the same publication concurrently at cold-start, and the prior check-then-create had a TOCTOU window: two sessions both passed the existence check and both ran `CREATE PUBLICATION`, so one hit a unique-violation on `pg_publication` (SQLSTATE 23505), failed, and the supervisor restarted that sync. sluice now treats the duplicate as benign (the publication already exists), re-reads, and reconciles its scope instead of failing — eliminating the spurious cold-start failure + restart. Surfaced by the fleet-dashboard demo (two of three shared-source syncs spuriously restarted once at boot). No behavior change for single-sync runs.
+- **Fleet dashboard / `sync status --all`: a recovered sync no longer shows a stale last error and failure count.** The supervisor's consecutive-failure reset is lazy — it only fires when the *next* failure is recorded — so a sync that failed, recovered, and has been running healthily kept reporting its old `consecutive_failures` count and `last_error` indefinitely: a green/`running` sync displaying a scary, no-longer-relevant error. `Supervisor.Snapshot()` now derives health at read time: a sync that has been `running` past the healthy-run threshold reports zero consecutive failures and an empty last error (the lifetime `restarts` counter is preserved). This is a read-only derivation using the exact threshold the lazy reset already uses — the `MaxConsecutiveFailures` isolation cap is untouched (clearing eagerly on transition-to-running would have defeated it, letting a crash-loop evade isolation).
+
+### Changed
+
+- **Fleet dashboard: sluice branding.** The `sync run --dashboard-listen` page now carries the sluice gate mark (inline SVG logo + favicon) and the sluicesync brand palette (primary `#F35815`, deep `#C0410A`, flow accent `#FFDCC6`), matching sluicesync.com — a cosmetic refresh of the v0.99.135 dashboard, no behavior change.
+
 ## [0.99.135] - 2026-06-26
 
 ### Added

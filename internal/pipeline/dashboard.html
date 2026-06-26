@@ -10,18 +10,22 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>sluice — fleet dashboard</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMjggMTI4IiByb2xlPSJpbWciIGFyaWEtbGFiZWw9InNsdWljZSI+CiAgPCEtLSBQUklNQVJZIG1hcmsgKHNlbWktZmluYWwpOiAjRjM1ODE1IGZsYXQsIGhhcmQtZWRnZSBnYXRlLCByb3VuZGVkIHdhdGVyLAogICAgICAgY29ubmVjdGVkIFQtaGFuZGxlLiAtLT4KICA8cmVjdCB4PSI0IiB5PSI0IiB3aWR0aD0iMTIwIiBoZWlnaHQ9IjEyMCIgcng9IjQiIGZpbGw9IiNGMzU4MTUiLz4KCiAgPCEtLSBjaGFubmVsIHdhbGxzIChzcXVhcmUpIC0tPgogIDxyZWN0IHg9IjM3IiB5PSIzNiIgd2lkdGg9IjgiIGhlaWdodD0iNjAiIGZpbGw9IiNGRkZGRkYiLz4KICA8cmVjdCB4PSI4MyIgeT0iMzYiIHdpZHRoPSI4IiBoZWlnaHQ9IjYwIiBmaWxsPSIjRkZGRkZGIi8+CgogIDwhLS0gcmFpc2VkIGdhdGUgcGFkZGxlIChzcXVhcmUpIC0tPgogIDxyZWN0IHg9IjQ0IiB5PSI0NiIgd2lkdGg9IjQwIiBoZWlnaHQ9IjExIiBmaWxsPSIjRkZGRkZGIi8+CgogIDwhLS0gY29ubmVjdGVkIFQtaGFuZGxlOiBiYXIgKyBzdGVtIG92ZXJsYXBwaW5nIGl0ICh0aGUgZ2F0ZSBsaWZ0KSAtLT4KICA8cmVjdCB4PSI1MiIgeT0iMjAiIHdpZHRoPSIyNCIgaGVpZ2h0PSI2IiBmaWxsPSIjRkZGRkZGIi8+CiAgPHJlY3QgeD0iNjEuNSIgeT0iMjMiIHdpZHRoPSI1IiBoZWlnaHQ9IjI0IiBmaWxsPSIjRkZGRkZGIi8+CgogIDwhLS0gcmVndWxhdGVkIGZsb3cgdW5kZXJuZWF0aCAocm91bmRlZCkgLS0+CiAgPHJlY3QgeD0iNDkiIHk9IjY4IiB3aWR0aD0iMzAiIGhlaWdodD0iNiIgcng9IjMiIGZpbGw9IiNGRkRDQzYiLz4KICA8cmVjdCB4PSI1MyIgeT0iNzkiIHdpZHRoPSIyMiIgaGVpZ2h0PSI2IiByeD0iMyIgZmlsbD0iI0ZGRENDNiIvPgogIDxyZWN0IHg9IjU3IiB5PSI5MCIgd2lkdGg9IjE0IiBoZWlnaHQ9IjYiIHJ4PSIzIiBmaWxsPSIjRkZEQ0M2Ii8+Cjwvc3ZnPgo=">
 <style>
   :root {
-    --bg: #f6f7f9;
+    --bg: #fbf7f4;
     --card: #ffffff;
-    --ink: #1f2733;
-    --muted: #6b7685;
-    --border: #e3e7ec;
+    --ink: #2a2018;
+    --muted: #8a7d72;
+    --border: #ece4dd;
+    --brand: #F35815;
+    --brand-deep: #C0410A;
+    --brand-soft: #FFDCC6;
     --running: #1a7f37;
     --backoff: #b7791f;
-    --starting: #1f6feb;
+    --starting: #F35815;
     --failed: #c0392b;
-    --stopped: #6b7685;
+    --stopped: #8a7d72;
   }
   * { box-sizing: border-box; }
   body {
@@ -31,17 +35,22 @@
     font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   }
   header {
-    padding: 20px 24px;
+    padding: 18px 24px;
     background: var(--card);
     border-bottom: 1px solid var(--border);
+    border-top: 3px solid var(--brand);
   }
   h1 {
     margin: 0;
     font-size: 18px;
     font-weight: 650;
     letter-spacing: -0.01em;
+    color: var(--brand-deep);
+    display: flex;
+    align-items: center;
+    gap: 10px;
   }
-  h1 .glyph { color: var(--starting); }
+  h1 svg.mark { width: 26px; height: 26px; border-radius: 5px; display: block; flex: none; }
   .counts {
     margin-top: 8px;
     display: flex;
@@ -109,7 +118,17 @@
 </head>
 <body>
 <header>
-  <h1><span class="glyph">~</span> sluice &mdash; fleet dashboard</h1>
+  <h1><svg class="mark" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="sluice">
+    <rect x="4" y="4" width="120" height="120" rx="4" fill="#F35815"/>
+    <rect x="37" y="36" width="8" height="60" fill="#FFFFFF"/>
+    <rect x="83" y="36" width="8" height="60" fill="#FFFFFF"/>
+    <rect x="44" y="46" width="40" height="11" fill="#FFFFFF"/>
+    <rect x="52" y="20" width="24" height="6" fill="#FFFFFF"/>
+    <rect x="61.5" y="23" width="5" height="24" fill="#FFFFFF"/>
+    <rect x="49" y="68" width="30" height="6" rx="3" fill="#FFDCC6"/>
+    <rect x="53" y="79" width="22" height="6" rx="3" fill="#FFDCC6"/>
+    <rect x="57" y="90" width="14" height="6" rx="3" fill="#FFDCC6"/>
+  </svg><span>sluice &mdash; fleet dashboard</span></h1>
   <div class="counts">
     <span><b id="c-total">0</b> total</span>
     <span><b id="c-running">0</b> running</span>
