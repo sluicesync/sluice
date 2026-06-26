@@ -35,6 +35,32 @@ cd "$(dirname "$0")/.."
 # Linux/macOS the two are equivalent.
 exprs=$(git ls-files -- '*.go' | xargs grep -h '^//go:build ' | sort -u)
 
+# GOOS/GOARCH constraints (e.g. `windows`, `!windows`, `linux`, `amd64`) are
+# selected by the toolchain's GOOS/GOARCH, NOT passed via `-tags`, and the
+# default `go vet ./...` already type-checks them for the runner's platform
+# (plus the Windows CI matrix on tag pushes). Strip them — and their negations
+# — from each expression before the conjunction parser below, so a
+# platform-gated file like `//go:build !windows` (a negation) doesn't trip the
+# guard or get mis-treated as a `-tags` value. A pure-GOOS expression collapses
+# to empty and is dropped; a mixed one like `integration && !windows` reduces
+# to its real tag set (`integration`).
+exprs=$(printf '%s\n' "$exprs" | awk '
+	BEGIN {
+		split("aix android darwin dragonfly freebsd hurd illumos ios js linux nacl netbsd openbsd plan9 solaris wasip1 wasm windows zos 386 amd64 arm arm64 loong64 mips mips64 mips64le mipsle ppc64 ppc64le riscv64 s390x cgo gc gccgo unix boringcrypto", gl, " ")
+		for (i in gl) goos[gl[i]] = 1
+	}
+	{
+		sub(/^\/\/go:build /, "")
+		n = split($0, terms, /[[:space:]]*&&[[:space:]]*/)
+		out = ""
+		for (i = 1; i <= n; i++) {
+			bare = terms[i]; sub(/^!/, "", bare)
+			if (bare in goos) continue
+			out = (out == "" ? terms[i] : out " && " terms[i])
+		}
+		if (out != "") print "//go:build " out
+	}' | sort -u)
+
 # Guard against vacuous success: this repo always has tagged files, so
 # empty discovery means the discovery itself broke — fail loudly rather
 # than "pass" by checking nothing.
