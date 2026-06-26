@@ -293,6 +293,12 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (events []ir.Chang
 
 		// §7 DDL marker handling — short-circuit the loop and
 		// surface the refusal to the pump.
+		// Source commit timestamp for the engine-neutral sync-lag metric
+		// (roadmap item 45): the change-log row's committed_at (projected
+		// as epoch seconds) is the instant the captured transaction
+		// committed on the source. Carry it onto every emitted change.
+		commitTime := pgTriggerCommitTime(committed)
+
 		if op == "X" {
 			tag := decodeDDLTag(pkJSON.String)
 			return nil, newLast, tag, nil
@@ -303,7 +309,7 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (events []ir.Chang
 			if err != nil {
 				return nil, lastSeen, "", fmt.Errorf("encode position: %w", err)
 			}
-			events = append(events, ir.Truncate{Position: pos, Schema: schema, Table: table})
+			events = append(events, ir.Truncate{Position: pos, Schema: schema, Table: table, CommitTime: commitTime})
 			continue
 		}
 
@@ -333,7 +339,7 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (events []ir.Chang
 
 		switch op {
 		case "I":
-			events = append(events, ir.Insert{Position: pos, Schema: schema, Table: table, Row: afterRow})
+			events = append(events, ir.Insert{Position: pos, Schema: schema, Table: table, Row: afterRow, CommitTime: commitTime})
 		case "U":
 			// `before`/`after` completeness is a deliberate
 			// capture-payload mode choice (ADR-0068), NOT a REPLICA
@@ -348,7 +354,7 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (events []ir.Chang
 			// the applier builds its WHERE from `before` and SET from
 			// `after` — both correct and idempotent for any of the
 			// modes, with no reader/applier code change.
-			events = append(events, ir.Update{Position: pos, Schema: schema, Table: table, Before: beforeRow, After: afterRow})
+			events = append(events, ir.Update{Position: pos, Schema: schema, Table: table, Before: beforeRow, After: afterRow, CommitTime: commitTime})
 		case "D":
 			// Delete events carry only OLD; the applier's PK-only
 			// path uses Before to identify the row.
@@ -359,17 +365,16 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (events []ir.Chang
 				// is correct.
 				return nil, lastSeen, "", fmt.Errorf("delete event id=%d has NULL before_jsonb", id)
 			}
-			events = append(events, ir.Delete{Position: pos, Schema: schema, Table: table, Before: beforeRow})
+			events = append(events, ir.Delete{Position: pos, Schema: schema, Table: table, Before: beforeRow, CommitTime: commitTime})
 		default:
 			return nil, lastSeen, "", fmt.Errorf("unknown op %q at id=%d", op, id)
 		}
-		// txid and committed are scanned (the SELECT projects them for
-		// schema-shape stability with the trigger's audit table) but
-		// not yet consumed: ordering uses the bigserial id alone.
-		// They become load-bearing if/when transactional batching or
-		// commit-timestamp watermarks land.
+		// txid is scanned (the SELECT projects it for schema-shape
+		// stability with the trigger's audit table) but not yet consumed:
+		// ordering uses the bigserial id alone. It becomes load-bearing
+		// if/when transactional batching lands. committed is consumed
+		// above as the sync-lag commit timestamp (roadmap item 45).
 		_ = txid
-		_ = committed
 	}
 	if err := rows.Err(); err != nil {
 		return nil, lastSeen, "", fmt.Errorf("iter rows: %w", err)
@@ -392,6 +397,18 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (events []ir.Chang
 // Returns nil for "" or "null" (PG's `NULL::jsonb::text` returns
 // "null" while an actual SQL NULL surfaces via the caller's
 // sql.NullString check).
+// pgTriggerCommitTime maps the change-log row's committed_at epoch-seconds
+// projection to the [ir.Change] source-commit-time the sync-lag metric
+// consumes (roadmap item 45). A non-positive value — a row whose
+// committed_at was somehow NULL/0 — maps to the zero time, which the metric
+// treats as "unknown" and omits, never as "committed at the epoch".
+func pgTriggerCommitTime(epochSeconds int64) time.Time {
+	if epochSeconds <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(epochSeconds, 0).UTC()
+}
+
 func decodeJSONBRow(s string) (ir.Row, error) {
 	if s == "" || s == "null" {
 		return nil, nil

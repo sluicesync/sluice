@@ -309,6 +309,12 @@ func (s *Streamer) phaseStartMetricsServer(ctx context.Context, applier ir.Chang
 	if s.TargetTelemetry != nil {
 		metricsSrv.AttachTargetTelemetry(s.TargetTelemetry)
 	}
+	// Roadmap item 45: expose the engine-neutral sync-lag gauge. The tracker
+	// was created in runOnce before this phase (nil unless observation was
+	// opted into); the apply-phase interceptor feeds it.
+	if s.syncLag != nil {
+		metricsSrv.AttachSyncLagSource(s.syncLag)
+	}
 	if mErr := metricsSrv.Start(); mErr != nil {
 		spillCleanup()
 		return nil, func() {}, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: start metrics server: %w", mErr))
@@ -767,6 +773,13 @@ func (s *Streamer) phaseStartApplySidecars(applyCtx context.Context, applier ir.
 	// phase concern (runColdStartParallel wires its own gated watch).
 	s.startStorageHeadroomWatch(applyCtx, streamID, nil)
 
+	// Roadmap item 45: the engine-neutral sync-lag threshold alerter. No
+	// tracker / no threshold / no sink ⇒ no goroutine. UNGATED from
+	// PlanetScale telemetry — fires on sluice's own apply lag on any engine.
+	// Observability only — a dead sink is logged-and-swallowed, never able to
+	// stall or crash the stream.
+	s.startSyncLagNotifier(applyCtx, streamID)
+
 	// ADR-0107 items 35 (rolling-history recorder) + 36 (threshold alerter)
 	// are NO LONGER started here — they are started earlier, in runOnce (see
 	// startTelemetrySidecars), so they cover the COLD-COPY phase too (the
@@ -863,6 +876,15 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 	// a streamer restart picks up a fresh seed in its next coldStart
 	// run.
 	s.coldStartSeedSnapshots = nil
+	// Roadmap item 45: final pass-through that feeds the sync-lag tracker
+	// from each change's source commit timestamp. Wired only when the
+	// operator opted into the metrics endpoint or a sync-lag alert (nil
+	// tracker ⇒ no extra goroutine, default path byte-identical). It sits
+	// LAST so it observes exactly what reaches the applier across the
+	// batched, per-change, and concurrent-lane paths.
+	if s.syncLag != nil {
+		filtered = observeSyncLagChanges(applyCtx, filtered, s.syncLag)
+	}
 	return filtered
 }
 

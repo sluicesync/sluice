@@ -789,6 +789,7 @@ type SyncStartCmd struct {
 	NotifyLagSeconds          float64       `help:"Alert when the target's replica lag (seconds) is at or above this value (ADR-0107 item 36). 0 disables. Same gating as --notify-storage-util." placeholder:"SECONDS"`
 	NotifyStorageGrowthPerMin float64       `help:"Alert when the target's storage utilisation is CLIMBING at or above this fraction-of-capacity per minute (ADR-0107 item 36) — a pre-grow early warning. e.g. 0.02 = +2%/min. 0 disables. Same gating as --notify-storage-util." placeholder:"FRAC_PER_MIN"`
 	NotifyCooldown            time.Duration `help:"Minimum interval between re-fires of a STILL-breached target-metrics alert (ADR-0107 item 36). A sustained breach reminds at most once per this interval rather than every poll. Default 15m." default:"15m" placeholder:"DUR"`
+	NotifySyncLagSeconds      float64       `help:"Alert when sluice's OWN sync lag — seconds the target trails the source's latest applied commit (sluice_sync_lag_seconds, roadmap item 45) — is at or above this value. 0 (default) disables. UNGATED from PlanetScale telemetry: works on MySQL and Postgres alike, needing only a --notify-webhook/--notify-slack sink (NOT --planetscale-org). Distinct from --notify-lag-seconds, which is the PlanetScale control-plane TARGET-INTERNAL replica lag. Edge-triggered + cooldown'd; advisory + failure-isolated." placeholder:"SECONDS"`
 
 	HeartbeatInterval time.Duration `help:"Wall-clock cadence the per-stream heartbeat goroutine logs an INFO 'stream: heartbeat' line at. GitHub #23 Phase A: distinguishes silent-stall (process alive but no apply, no log) from wedge (process alive, no heartbeat either). 0 disables." default:"60s" placeholder:"DUR"`
 
@@ -1398,6 +1399,7 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		NotifyLagSeconds:          s.NotifyLagSeconds,
 		NotifyStorageGrowthPerMin: s.NotifyStorageGrowthPerMin,
 		NotifyCooldown:            s.NotifyCooldown,
+		NotifySyncLagSeconds:      s.NotifySyncLagSeconds,
 		HeartbeatInterval:         s.HeartbeatInterval,
 		PollInterval:              s.PollInterval,
 

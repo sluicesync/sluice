@@ -290,26 +290,40 @@ func evalMetricsNotifyTick(
 			st = &metricsNotifyRuleState{}
 			state.rules[rule.metric] = st
 		}
-		breached := value >= rule.threshold
-		switch {
-		case breached && !st.fired:
-			// Rising edge — fire and latch.
-			st.fired = true
-			st.lastFired = now
+		if evalThresholdAlert(st, value, rule.threshold, cooldown, now) {
 			out = append(out, makeNotification(rule, value, now))
-		case breached && st.fired && now.Sub(st.lastFired) >= cooldown:
-			// Sustained breach past the cooldown — re-fire (reminder).
-			st.lastFired = now
-			out = append(out, makeNotification(rule, value, now))
-		case !breached && value < rule.threshold*notifyRearmHysteresis:
-			// Recovered below the hysteresis floor — re-arm.
-			st.fired = false
 		}
-		// breached && fired && within cooldown: hold (no fire).
-		// !breached but still within [threshold*hysteresis, threshold):
-		// hold the latch (hysteresis dead-band) so we don't flap.
 	}
 	return out
+}
+
+// evalThresholdAlert is the shared edge-trigger + cooldown + hysteresis
+// decision for ONE observed value against its carried latch state (mutated in
+// place). It returns true when a notification should fire this tick. Used by
+// both the target-metrics rules ([evalMetricsNotifyTick]) and the
+// engine-neutral sync-lag alerter ([runSyncLagNotifyTick]) so the firing
+// semantics can never drift between them. With v = the observed value:
+//
+//   - breached := v >= threshold
+//   - FIRE on (breached && !fired)                        — rising edge
+//     OR  (breached && fired && now-lastFired >= cooldown) — re-fire reminder
+//   - RE-ARM (fired=false) when v < threshold*hysteresis  — recovered
+//   - within [threshold*hysteresis, threshold) while fired: HOLD (dead-band,
+//     so a value parked at the line doesn't flap).
+func evalThresholdAlert(st *metricsNotifyRuleState, value, threshold float64, cooldown time.Duration, now time.Time) bool {
+	breached := value >= threshold
+	switch {
+	case breached && !st.fired:
+		st.fired = true
+		st.lastFired = now
+		return true
+	case breached && st.fired && now.Sub(st.lastFired) >= cooldown:
+		st.lastFired = now
+		return true
+	case !breached && value < threshold*notifyRearmHysteresis:
+		st.fired = false
+	}
+	return false
 }
 
 // ruleValue extracts a rule's current value + observed flag. For the
@@ -358,9 +372,15 @@ func makeNotification(rule metricsNotifyRule, value float64, at time.Time) notif
 		Level:     rule.level,
 		Metric:    string(rule.metric),
 		Title:     rule.title,
-		Body:      fmt.Sprintf("%s %.4g ≥ %.4g (%s)", rule.metric, value, rule.threshold, rule.title),
+		Body:      formatThresholdBody(rule.metric, value, rule.threshold, rule.title),
 		Value:     value,
 		Threshold: rule.threshold,
 		At:        at,
 	}
+}
+
+// formatThresholdBody renders the shared "metric V ≥ T (title)" alert body so
+// the target-metrics and sync-lag notifications read identically.
+func formatThresholdBody(metric notifyMetric, value, threshold float64, title string) string {
+	return fmt.Sprintf("%s %.4g ≥ %.4g (%s)", metric, value, threshold, title)
 }

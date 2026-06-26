@@ -1290,6 +1290,13 @@ func (r *vstreamCDCReader) dispatchRow(ctx context.Context, ev *binlogdata.VEven
 		r.boolWarn = newBoolRangeWarner()
 	}
 
+	// Source commit timestamp for the sync-lag metric (roadmap item 45).
+	// A VStream VEvent's Timestamp is the originating transaction's commit
+	// instant in UTC seconds; on a multi-shard stream each shard's events
+	// carry their own commit time, so the merged stream naturally surfaces
+	// the slowest shard's lag as its (older-timestamped) events flow.
+	commitTime := vstreamEventCommitTime(ev)
+
 	for _, rc := range rev.GetRowChanges() {
 		before, beforeOK, err := decodeVStreamRow(rc.GetBefore(), fields, tableName, r.boolWarn)
 		if err != nil {
@@ -1302,29 +1309,32 @@ func (r *vstreamCDCReader) dispatchRow(ctx context.Context, ev *binlogdata.VEven
 		switch {
 		case afterOK && !beforeOK:
 			if err := send(ctx, out, ir.Insert{
-				Position: pos,
-				Schema:   rev.GetKeyspace(),
-				Table:    tableName,
-				Row:      after,
+				Position:   pos,
+				Schema:     rev.GetKeyspace(),
+				Table:      tableName,
+				Row:        after,
+				CommitTime: commitTime,
 			}); err != nil {
 				return err
 			}
 		case beforeOK && afterOK:
 			if err := send(ctx, out, ir.Update{
-				Position: pos,
-				Schema:   rev.GetKeyspace(),
-				Table:    tableName,
-				Before:   before,
-				After:    after,
+				Position:   pos,
+				Schema:     rev.GetKeyspace(),
+				Table:      tableName,
+				Before:     before,
+				After:      after,
+				CommitTime: commitTime,
 			}); err != nil {
 				return err
 			}
 		case beforeOK && !afterOK:
 			if err := send(ctx, out, ir.Delete{
-				Position: pos,
-				Schema:   rev.GetKeyspace(),
-				Table:    tableName,
-				Before:   before,
+				Position:   pos,
+				Schema:     rev.GetKeyspace(),
+				Table:      tableName,
+				Before:     before,
+				CommitTime: commitTime,
 			}); err != nil {
 				return err
 			}
@@ -1334,6 +1344,19 @@ func (r *vstreamCDCReader) dispatchRow(ctx context.Context, ev *binlogdata.VEven
 		}
 	}
 	return nil
+}
+
+// vstreamEventCommitTime maps a VStream VEvent's Timestamp (the originating
+// transaction's commit instant in UTC seconds) to the [ir.Change]
+// source-commit-time the sync-lag metric consumes (roadmap item 45). A zero
+// timestamp — events vtgate sends without a source commit time (e.g. some
+// synthetic boundary events) — maps to the zero time, which the metric
+// treats as "unknown" and omits, never as "committed at the epoch".
+func vstreamEventCommitTime(ev *binlogdata.VEvent) time.Time {
+	if ev == nil || ev.GetTimestamp() == 0 {
+		return time.Time{}
+	}
+	return time.Unix(ev.GetTimestamp(), 0).UTC()
 }
 
 // fieldCacheKey is the key shape used in r.fields. shard might be

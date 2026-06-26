@@ -660,7 +660,7 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 			if err != nil {
 				return err
 			}
-			return send(ctx, out, ir.TxBegin{Position: pos})
+			return send(ctx, out, ir.TxBegin{Position: pos, CommitTime: binlogEventCommitTime(ev.Header)})
 		}
 		if q == "COMMIT" {
 			// Defensive: emit TxCommit on the rare COMMIT-as-
@@ -672,7 +672,7 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 			if err != nil {
 				return err
 			}
-			return send(ctx, out, ir.TxCommit{Position: pos})
+			return send(ctx, out, ir.TxCommit{Position: pos, CommitTime: binlogEventCommitTime(ev.Header)})
 		}
 		// TRUNCATE TABLE arrives as a QUERY_EVENT carrying the SQL
 		// text. The IR has ir.Truncate; PG's pgoutput emits typed
@@ -694,9 +694,10 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 					return err
 				}
 				if err := send(ctx, out, ir.Truncate{
-					Position: pos,
-					Schema:   truncSchema,
-					Table:    truncTable,
+					Position:   pos,
+					Schema:     truncSchema,
+					Table:      truncTable,
+					CommitTime: binlogEventCommitTime(ev.Header),
 				}); err != nil {
 					return err
 				}
@@ -741,7 +742,7 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 		if err != nil {
 			return err
 		}
-		return send(ctx, out, ir.TxCommit{Position: pos})
+		return send(ctx, out, ir.TxCommit{Position: pos, CommitTime: binlogEventCommitTime(ev.Header)})
 
 	case *replication.TransactionPayloadEvent:
 		// binlog_transaction_compression=ON (MySQL 8.0.20+) wraps an ENTIRE
@@ -855,6 +856,11 @@ func (r *CDCReader) dispatchRows(
 	if err != nil {
 		return err
 	}
+	// Source commit timestamp for the engine-neutral sync-lag metric
+	// (roadmap item 45). The binlog event header's Timestamp is the
+	// instant the originating transaction committed on the source, in
+	// UTC seconds; carry it on every row event.
+	commitTime := binlogEventCommitTime(hdr)
 
 	switch hdr.EventType {
 	case replication.WRITE_ROWS_EVENTv0,
@@ -866,10 +872,11 @@ func (r *CDCReader) dispatchRows(
 				return fmt.Errorf("mysql: cdc: decode insert: %w", err)
 			}
 			if err := send(ctx, out, ir.Insert{
-				Position: pos,
-				Schema:   tbl.Schema,
-				Table:    tbl.Name,
-				Row:      row,
+				Position:   pos,
+				Schema:     tbl.Schema,
+				Table:      tbl.Name,
+				Row:        row,
+				CommitTime: commitTime,
 			}); err != nil {
 				return err
 			}
@@ -893,11 +900,12 @@ func (r *CDCReader) dispatchRows(
 				return fmt.Errorf("mysql: cdc: decode update after: %w", err)
 			}
 			if err := send(ctx, out, ir.Update{
-				Position: pos,
-				Schema:   tbl.Schema,
-				Table:    tbl.Name,
-				Before:   before,
-				After:    after,
+				Position:   pos,
+				Schema:     tbl.Schema,
+				Table:      tbl.Name,
+				Before:     before,
+				After:      after,
+				CommitTime: commitTime,
 			}); err != nil {
 				return err
 			}
@@ -922,10 +930,11 @@ func (r *CDCReader) dispatchRows(
 			// docs/adr/adr-0057-hard-delete-semantics-across-engines.md.
 			before = filterDeleteBefore(tbl, before)
 			if err := send(ctx, out, ir.Delete{
-				Position: pos,
-				Schema:   tbl.Schema,
-				Table:    tbl.Name,
-				Before:   before,
+				Position:   pos,
+				Schema:     tbl.Schema,
+				Table:      tbl.Name,
+				Before:     before,
+				CommitTime: commitTime,
 			}); err != nil {
 				return err
 			}
@@ -1093,6 +1102,19 @@ func (r *CDCReader) positionFor(hdr *replication.EventHeader) (ir.Position, erro
 	default:
 		return ir.Position{}, fmt.Errorf("mysql: cdc: position mode %q unset", r.posMode)
 	}
+}
+
+// binlogEventCommitTime maps a binlog event header's Timestamp (UTC
+// seconds-since-epoch, the originating transaction's commit instant) to the
+// [ir.Change] source-commit-time used by the sync-lag metric (roadmap item
+// 45). A zero header timestamp — artificial / format-description events that
+// carry none — maps to the zero time, which the metric treats as "unknown"
+// and omits, never as "committed at the epoch".
+func binlogEventCommitTime(hdr *replication.EventHeader) time.Time {
+	if hdr == nil || hdr.Timestamp == 0 {
+		return time.Time{}
+	}
+	return time.Unix(int64(hdr.Timestamp), 0).UTC()
 }
 
 // setErr stores the first error from the streaming goroutine.

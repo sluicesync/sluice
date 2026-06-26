@@ -82,6 +82,13 @@ type MetricsServer struct {
 	// sluice_target_* lines, exactly as before.
 	targetTelemetry ir.TargetTelemetry
 
+	// syncLag is the optional engine-neutral "seconds behind source"
+	// signal (roadmap item 45). When attached, /metrics emits the
+	// sluice_sync_lag_seconds gauge gated on the reading being known
+	// (omitted, not 0, until a source-timestamped change is applied).
+	// nil ⇒ no sluice_sync_lag_seconds line, exactly as before.
+	syncLag syncLagSource
+
 	// ready flips to true once the streamer has finished its cold-start
 	// or warm-resume preamble and entered the apply loop. /readyz reads
 	// it via atomic.Bool so handler lookups stay lock-free.
@@ -251,6 +258,27 @@ func (m *MetricsServer) targetTelemetryProvider() ir.TargetTelemetry {
 	return m.targetTelemetry
 }
 
+// AttachSyncLagSource plugs the engine-neutral sync-lag signal (roadmap item
+// 45) into the metrics server so /metrics emits sluice_sync_lag_seconds. The
+// source is read at scrape time (lock-free atomics on the tracker); an
+// unknown reading omits the line rather than emitting a misleading 0,
+// mirroring the spill / telemetry posture. Idempotent; a nil argument
+// detaches. Off by default — only attached when the streamer opted into the
+// metrics endpoint and is observing the change stream.
+func (m *MetricsServer) AttachSyncLagSource(s syncLagSource) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.syncLag = s
+}
+
+// syncLagProvider returns the attached sync-lag source (or nil). Pulled out
+// for read-locking discipline; SyncLagSeconds is invoked outside the mutex.
+func (m *MetricsServer) syncLagProvider() syncLagSource {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.syncLag
+}
+
 // aimdSnapshot returns a snapshot of the attached AIMD controller, or
 // (snapshot, false) when no controller is attached.
 func (m *MetricsServer) aimdSnapshot() (appliercontrol.MetricsSnapshot, bool) {
@@ -340,6 +368,29 @@ func (m *MetricsServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintln(w, "\n# target-telemetry: no signal")
 		}
 	}
+	// Roadmap item 45: the engine-neutral "seconds behind source" gauge.
+	// Gated on a known reading (omitted, not 0, until a source-timestamped
+	// change has been applied) — the *Known honesty contract.
+	if sl := m.syncLagProvider(); sl != nil {
+		if seconds, known := sl.SyncLagSeconds(now); known {
+			emitSyncLagMetrics(w, streamsOrFirstID(streams), seconds)
+		} else {
+			fmt.Fprintln(w, "\n# sync-lag: no signal (no source-timestamped change applied yet)")
+		}
+	}
+}
+
+// emitSyncLagMetrics renders the engine-neutral sync-lag gauge (roadmap item
+// 45): how far the target trails the SOURCE's latest applied commit, in
+// seconds. Distinct from sluice_target_replica_lag_seconds (the PS
+// control-plane target-internal lag) and from sluice_seconds_since_last_apply
+// (which ages on a quiet stream); this one reports 0 when caught up. The
+// caller has already confirmed the reading is known.
+func emitSyncLagMetrics(w io.Writer, streamID string, seconds float64) {
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "# HELP sluice_sync_lag_seconds Seconds the target trails the source's latest applied commit (engine-neutral apply lag; 0 when caught up). Distinct from sluice_target_replica_lag_seconds (roadmap item 45).")
+	fmt.Fprintln(w, "# TYPE sluice_sync_lag_seconds gauge")
+	fmt.Fprintf(w, `sluice_sync_lag_seconds{stream_id=%q} %s`+"\n", streamID, formatPrometheusFraction(seconds))
 }
 
 // streamsOrFirstID returns a stream_id label for the sluice_target_*

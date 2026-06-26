@@ -723,6 +723,11 @@ func (r *CDCReader) pump(ctx context.Context, conn *pgconn.PgConn, startLSN pglo
 	// currentTxnLSN (which is the BeginMessage.FinalLSN, == the commit
 	// LSN preview emitted by pgoutput).
 	currentTxnStartLSN := startLSN
+	// currentTxnCommitTime is the commit timestamp pgoutput stamps on the
+	// in-progress transaction's BeginMessage (== the CommitMessage's). It is
+	// carried onto every row event of the transaction for the engine-neutral
+	// sync-lag metric (roadmap item 45); zero until the first BeginMessage.
+	var currentTxnCommitTime time.Time
 	// firstSeenRelLSN remembers the WAL LSN of the very first row event
 	// observed for each relation during this pump's lifetime. ADR-0036
 	// M3 instrumentation: lets the diagnostic test compare against the
@@ -794,7 +799,7 @@ func (r *CDCReader) pump(ctx context.Context, conn *pgconn.PgConn, startLSN pglo
 				r.setErr(fmt.Errorf("postgres: cdc: parse xlogdata: %w", err))
 				return
 			}
-			if err := r.dispatchWAL(ctx, xld, relations, snapshotSig, &currentTxnLSN, &currentTxnStartLSN, &streamedLSN, &inStream, firstSeenRelLSN, out); err != nil {
+			if err := r.dispatchWAL(ctx, xld, relations, snapshotSig, &currentTxnLSN, &currentTxnStartLSN, &currentTxnCommitTime, &streamedLSN, &inStream, firstSeenRelLSN, out); err != nil {
 				r.setErr(err)
 				return
 			}
@@ -819,6 +824,7 @@ func (r *CDCReader) dispatchWAL(
 	snapshotSig map[uint32]ir.SchemaSignature,
 	currentTxnLSN *pglogrepl.LSN,
 	currentTxnStartLSN *pglogrepl.LSN,
+	currentTxnCommitTime *time.Time,
 	streamedLSN *pglogrepl.LSN,
 	inStream *bool,
 	firstSeenRelLSN map[uint32]pglogrepl.LSN,
@@ -904,6 +910,11 @@ func (r *CDCReader) dispatchWAL(
 	case *pglogrepl.BeginMessage:
 		*currentTxnLSN = m.FinalLSN
 		*currentTxnStartLSN = xld.WALStart
+		// Source commit timestamp for the sync-lag metric (roadmap item
+		// 45): pgoutput stamps the whole transaction's commit time on its
+		// BeginMessage, so capture it here and carry it onto every row
+		// event of this transaction below.
+		*currentTxnCommitTime = m.CommitTime
 		// ADR-0036 M1: log txn-start (WAL position of the BEGIN record)
 		// alongside the txn's final commit LSN. Lets the diagnostic test
 		// detect transactions that straddle the publication-add LSN
@@ -924,7 +935,7 @@ func (r *CDCReader) dispatchWAL(
 		if err != nil {
 			return err
 		}
-		return send(ctx, out, ir.TxBegin{Position: pos})
+		return send(ctx, out, ir.TxBegin{Position: pos, CommitTime: m.CommitTime})
 
 	case *pglogrepl.CommitMessage:
 		*streamedLSN = m.CommitLSN
@@ -944,33 +955,33 @@ func (r *CDCReader) dispatchWAL(
 		if err != nil {
 			return err
 		}
-		return send(ctx, out, ir.TxCommit{Position: pos})
+		return send(ctx, out, ir.TxCommit{Position: pos, CommitTime: m.CommitTime})
 
 	case *pglogrepl.InsertMessageV2:
 		r.diagRowEvent(ctx, "insert", relations, m.RelationID, xld, *currentTxnStartLSN, *currentTxnLSN, firstSeenRelLSN)
-		return r.emitInsert(ctx, relations, m.RelationID, m.Tuple, *currentTxnLSN, out)
+		return r.emitInsert(ctx, relations, m.RelationID, m.Tuple, *currentTxnLSN, *currentTxnCommitTime, out)
 	case *pglogrepl.InsertMessage:
 		r.diagRowEvent(ctx, "insert", relations, m.RelationID, xld, *currentTxnStartLSN, *currentTxnLSN, firstSeenRelLSN)
-		return r.emitInsert(ctx, relations, m.RelationID, m.Tuple, *currentTxnLSN, out)
+		return r.emitInsert(ctx, relations, m.RelationID, m.Tuple, *currentTxnLSN, *currentTxnCommitTime, out)
 
 	case *pglogrepl.UpdateMessageV2:
 		r.diagRowEvent(ctx, "update", relations, m.RelationID, xld, *currentTxnStartLSN, *currentTxnLSN, firstSeenRelLSN)
-		return r.emitUpdate(ctx, relations, m.RelationID, m.OldTuple, m.NewTuple, *currentTxnLSN, out)
+		return r.emitUpdate(ctx, relations, m.RelationID, m.OldTuple, m.NewTuple, *currentTxnLSN, *currentTxnCommitTime, out)
 	case *pglogrepl.UpdateMessage:
 		r.diagRowEvent(ctx, "update", relations, m.RelationID, xld, *currentTxnStartLSN, *currentTxnLSN, firstSeenRelLSN)
-		return r.emitUpdate(ctx, relations, m.RelationID, m.OldTuple, m.NewTuple, *currentTxnLSN, out)
+		return r.emitUpdate(ctx, relations, m.RelationID, m.OldTuple, m.NewTuple, *currentTxnLSN, *currentTxnCommitTime, out)
 
 	case *pglogrepl.DeleteMessageV2:
 		r.diagRowEvent(ctx, "delete", relations, m.RelationID, xld, *currentTxnStartLSN, *currentTxnLSN, firstSeenRelLSN)
-		return r.emitDelete(ctx, relations, m.RelationID, m.OldTuple, *currentTxnLSN, out)
+		return r.emitDelete(ctx, relations, m.RelationID, m.OldTuple, *currentTxnLSN, *currentTxnCommitTime, out)
 	case *pglogrepl.DeleteMessage:
 		r.diagRowEvent(ctx, "delete", relations, m.RelationID, xld, *currentTxnStartLSN, *currentTxnLSN, firstSeenRelLSN)
-		return r.emitDelete(ctx, relations, m.RelationID, m.OldTuple, *currentTxnLSN, out)
+		return r.emitDelete(ctx, relations, m.RelationID, m.OldTuple, *currentTxnLSN, *currentTxnCommitTime, out)
 
 	case *pglogrepl.TruncateMessageV2:
-		return r.emitTruncate(ctx, relations, m.RelationIDs, m.Option, *currentTxnLSN, out)
+		return r.emitTruncate(ctx, relations, m.RelationIDs, m.Option, *currentTxnLSN, *currentTxnCommitTime, out)
 	case *pglogrepl.TruncateMessage:
-		return r.emitTruncate(ctx, relations, m.RelationIDs, m.Option, *currentTxnLSN, out)
+		return r.emitTruncate(ctx, relations, m.RelationIDs, m.Option, *currentTxnLSN, *currentTxnCommitTime, out)
 
 	case *pglogrepl.StreamStartMessageV2:
 		*inStream = true
@@ -987,14 +998,14 @@ func (r *CDCReader) dispatchWAL(
 		if err != nil {
 			return err
 		}
-		return send(ctx, out, ir.TxBegin{Position: pos})
+		return send(ctx, out, ir.TxBegin{Position: pos, CommitTime: *currentTxnCommitTime})
 	case *pglogrepl.StreamStopMessageV2:
 		*inStream = false
 		pos, err := r.positionAt(*currentTxnLSN)
 		if err != nil {
 			return err
 		}
-		return send(ctx, out, ir.TxCommit{Position: pos})
+		return send(ctx, out, ir.TxCommit{Position: pos, CommitTime: *currentTxnCommitTime})
 
 	case *pglogrepl.StreamAbortMessageV2:
 		// ADR-0055: refuse loudly. sluice runs pgoutput with
@@ -1104,6 +1115,7 @@ func (r *CDCReader) emitInsert(
 	relID uint32,
 	tuple *pglogrepl.TupleData,
 	lsn pglogrepl.LSN,
+	commitTime time.Time,
 	out chan<- ir.Change,
 ) error {
 	rel, ok := relations[relID]
@@ -1122,10 +1134,11 @@ func (r *CDCReader) emitInsert(
 		return err
 	}
 	return send(ctx, out, ir.Insert{
-		Position: pos,
-		Schema:   rel.Schema,
-		Table:    rel.Name,
-		Row:      row,
+		Position:   pos,
+		Schema:     rel.Schema,
+		Table:      rel.Name,
+		Row:        row,
+		CommitTime: commitTime,
 	})
 }
 
@@ -1135,6 +1148,7 @@ func (r *CDCReader) emitUpdate(
 	relID uint32,
 	oldTuple, newTuple *pglogrepl.TupleData,
 	lsn pglogrepl.LSN,
+	commitTime time.Time,
 	out chan<- ir.Change,
 ) error {
 	rel, ok := relations[relID]
@@ -1186,11 +1200,12 @@ func (r *CDCReader) emitUpdate(
 		return err
 	}
 	return send(ctx, out, ir.Update{
-		Position: pos,
-		Schema:   rel.Schema,
-		Table:    rel.Name,
-		Before:   before,
-		After:    after,
+		Position:   pos,
+		Schema:     rel.Schema,
+		Table:      rel.Name,
+		Before:     before,
+		After:      after,
+		CommitTime: commitTime,
 	})
 }
 
@@ -1251,6 +1266,7 @@ func (r *CDCReader) emitDelete(
 	relID uint32,
 	oldTuple *pglogrepl.TupleData,
 	lsn pglogrepl.LSN,
+	commitTime time.Time,
 	out chan<- ir.Change,
 ) error {
 	rel, ok := relations[relID]
@@ -1284,10 +1300,11 @@ func (r *CDCReader) emitDelete(
 		return err
 	}
 	return send(ctx, out, ir.Delete{
-		Position: pos,
-		Schema:   rel.Schema,
-		Table:    rel.Name,
-		Before:   before,
+		Position:   pos,
+		Schema:     rel.Schema,
+		Table:      rel.Name,
+		Before:     before,
+		CommitTime: commitTime,
 	})
 }
 
@@ -1381,6 +1398,7 @@ func (r *CDCReader) emitTruncate(
 	relIDs []uint32,
 	option uint8,
 	lsn pglogrepl.LSN,
+	commitTime time.Time,
 	out chan<- ir.Change,
 ) error {
 	pos, err := r.positionAt(lsn)
@@ -1411,6 +1429,7 @@ func (r *CDCReader) emitTruncate(
 			Table:           rel.Name,
 			Cascade:         cascade,
 			RestartIdentity: restart,
+			CommitTime:      commitTime,
 		}); err != nil {
 			return err
 		}

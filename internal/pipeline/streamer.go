@@ -442,6 +442,19 @@ type Streamer struct {
 	NotifyStorageGrowthPerMin float64
 	NotifyCooldown            time.Duration
 
+	// NotifySyncLagSeconds is the threshold (in seconds) for the
+	// engine-neutral SYNC-LAG alert (roadmap item 45): fire when sluice's
+	// OWN "seconds behind source" apply lag is at or above this value. It
+	// is UNGATED from PlanetScale telemetry — works on MySQL and Postgres
+	// alike, needing only a --notify-webhook/--notify-slack sink. Distinct
+	// from NotifyLagSeconds, which is the PS control-plane target-internal
+	// replica lag (sluice_target_replica_lag_seconds). 0 (the default) ⇒
+	// INERT, so the zero value is the safe off default for every
+	// construction (no zero-value trap — gated on a non-zero threshold + a
+	// sink, never on a bool defaulting true). Observability only —
+	// failure-isolated, never on the value path.
+	NotifySyncLagSeconds float64
+
 	// MaxBufferBytes is the soft upper bound on per-batch buffered
 	// memory in the CDC applier (and, on the cold-start branch, the
 	// bulk-copy writer). Each in-flight target transaction tracks
@@ -1014,6 +1027,14 @@ type Streamer struct {
 	// attempt alongside the controllers it describes; nil on the serial path
 	// and when --apply-concurrency resolves to 1.
 	laneAIMDControllers []*appliercontrol.Controller
+
+	// syncLag is the per-attempt engine-neutral "seconds behind source"
+	// tracker (roadmap item 45). Created fresh at the top of each [runOnce]
+	// attempt ONLY when an operator opted into the metrics endpoint or a
+	// sync-lag alert (otherwise nil, so the default apply path adds no
+	// interceptor and no goroutine). The change-stream interceptor writes it
+	// (lock-free), the /metrics scrape and the alerter tick read it.
+	syncLag *syncLagTracker
 }
 
 // Run executes a snapshot+CDC stream with optional retry on
@@ -1251,6 +1272,16 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	// warm-resume completes. The defers stay HERE — not in the phase —
 	// so teardown order against the applier / shard-coordination
 	// defers above is exactly the pre-split order.
+	// Roadmap item 45: create the per-attempt sync-lag tracker BEFORE the
+	// metrics server (which attaches it) and the apply-phase interceptor
+	// (which feeds it). nil unless the operator opted into /metrics or a
+	// sync-lag alert, so the default apply path stays byte-identical.
+	if !s.DryRun && s.syncLagObservationWanted() {
+		s.syncLag = newSyncLagTracker()
+	} else {
+		s.syncLag = nil
+	}
+
 	metricsSrv, spillCleanup, err := s.phaseStartMetricsServer(ctx, applier, aimdController, streamID)
 	if err != nil {
 		return err

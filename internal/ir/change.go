@@ -3,7 +3,10 @@
 
 package ir
 
-import "errors"
+import (
+	"errors"
+	"time"
+)
 
 // Position is an opaque, durable bookmark within a source's change
 // stream. Engines populate Token in their own format (binlog file plus
@@ -71,6 +74,16 @@ type Change interface {
 	// just "table" when Schema is empty. Transaction-boundary events
 	// ([TxBegin], [TxCommit]) carry no table reference and return "".
 	QualifiedName() string
+	// SourceCommitTime returns the source-side commit timestamp of the
+	// transaction this change belongs to — the instant it committed on
+	// the SOURCE (MySQL binlog/VStream event time, PG pgoutput commit
+	// time, postgres-trigger committed_at). It is the input to the
+	// engine-neutral "seconds behind source" sync-lag metric (roadmap
+	// item 45). A zero time means the source/path does not surface one;
+	// consumers MUST treat zero as "unknown" and omit the derived lag
+	// rather than report a misleading value (the *Known honesty contract
+	// the metrics layer already uses elsewhere).
+	SourceCommitTime() time.Time
 }
 
 // qualified is a small helper that mirrors Table's identification logic.
@@ -87,11 +100,16 @@ type Insert struct {
 	Schema   string
 	Table    string
 	Row      Row
+	// CommitTime is the source-side commit timestamp; see
+	// [Change.SourceCommitTime]. Zero when the source/path does not
+	// supply one.
+	CommitTime time.Time
 }
 
-func (Insert) isChange()               {}
-func (e Insert) Pos() Position         { return e.Position }
-func (e Insert) QualifiedName() string { return qualified(e.Schema, e.Table) }
+func (Insert) isChange()                     {}
+func (e Insert) Pos() Position               { return e.Position }
+func (e Insert) QualifiedName() string       { return qualified(e.Schema, e.Table) }
+func (e Insert) SourceCommitTime() time.Time { return e.CommitTime }
 
 // Update is a row-modification change event. Before captures the prior
 // state (when available from the source); After captures the new state.
@@ -103,11 +121,15 @@ type Update struct {
 	Table    string
 	Before   Row // optional; nil when the source does not supply it
 	After    Row
+	// CommitTime is the source-side commit timestamp; see
+	// [Change.SourceCommitTime].
+	CommitTime time.Time
 }
 
-func (Update) isChange()               {}
-func (e Update) Pos() Position         { return e.Position }
-func (e Update) QualifiedName() string { return qualified(e.Schema, e.Table) }
+func (Update) isChange()                     {}
+func (e Update) Pos() Position               { return e.Position }
+func (e Update) QualifiedName() string       { return qualified(e.Schema, e.Table) }
+func (e Update) SourceCommitTime() time.Time { return e.CommitTime }
 
 // Delete is a row-removal change event. Before holds the row that was
 // removed, when the source supplies it.
@@ -116,11 +138,15 @@ type Delete struct {
 	Schema   string
 	Table    string
 	Before   Row // optional; nil when the source does not supply it
+	// CommitTime is the source-side commit timestamp; see
+	// [Change.SourceCommitTime].
+	CommitTime time.Time
 }
 
-func (Delete) isChange()               {}
-func (e Delete) Pos() Position         { return e.Position }
-func (e Delete) QualifiedName() string { return qualified(e.Schema, e.Table) }
+func (Delete) isChange()                     {}
+func (e Delete) Pos() Position               { return e.Position }
+func (e Delete) QualifiedName() string       { return qualified(e.Schema, e.Table) }
+func (e Delete) SourceCommitTime() time.Time { return e.CommitTime }
 
 // Truncate is a whole-table truncation event. Some sources emit this as
 // a DDL-flavoured event; the IR treats it as a data-stream change so
@@ -143,11 +169,15 @@ type Truncate struct {
 	Table           string
 	Cascade         bool
 	RestartIdentity bool
+	// CommitTime is the source-side commit timestamp; see
+	// [Change.SourceCommitTime].
+	CommitTime time.Time
 }
 
-func (Truncate) isChange()               {}
-func (e Truncate) Pos() Position         { return e.Position }
-func (e Truncate) QualifiedName() string { return qualified(e.Schema, e.Table) }
+func (Truncate) isChange()                     {}
+func (e Truncate) Pos() Position               { return e.Position }
+func (e Truncate) QualifiedName() string       { return qualified(e.Schema, e.Table) }
+func (e Truncate) SourceCommitTime() time.Time { return e.CommitTime }
 
 // TxBegin marks the start of a source-side transaction. Engines that
 // observe transaction boundaries in their replication protocol
@@ -176,11 +206,15 @@ func (e Truncate) QualifiedName() string { return qualified(e.Schema, e.Table) }
 // See ADR-0027.
 type TxBegin struct {
 	Position Position
+	// CommitTime is the source-side commit timestamp of the transaction
+	// this boundary opens; see [Change.SourceCommitTime].
+	CommitTime time.Time
 }
 
-func (TxBegin) isChange()               {}
-func (e TxBegin) Pos() Position         { return e.Position }
-func (e TxBegin) QualifiedName() string { return "" }
+func (TxBegin) isChange()                     {}
+func (e TxBegin) Pos() Position               { return e.Position }
+func (e TxBegin) QualifiedName() string       { return "" }
+func (e TxBegin) SourceCommitTime() time.Time { return e.CommitTime }
 
 // TxCommit marks the end of a source-side transaction. See [TxBegin]
 // for the design rationale. A [BatchedChangeApplier] that observes
@@ -194,11 +228,15 @@ func (e TxBegin) QualifiedName() string { return "" }
 // the XIDEvent (InnoDB transaction commit marker).
 type TxCommit struct {
 	Position Position
+	// CommitTime is the source-side commit timestamp of the transaction
+	// this boundary closes; see [Change.SourceCommitTime].
+	CommitTime time.Time
 }
 
-func (TxCommit) isChange()               {}
-func (e TxCommit) Pos() Position         { return e.Position }
-func (e TxCommit) QualifiedName() string { return "" }
+func (TxCommit) isChange()                     {}
+func (e TxCommit) Pos() Position               { return e.Position }
+func (e TxCommit) QualifiedName() string       { return "" }
+func (e TxCommit) SourceCommitTime() time.Time { return e.CommitTime }
 
 // SchemaSnapshot is the ADR-0049 (Chunk B) position-anchored
 // schema-history boundary event. A CDC reader emits exactly one of
@@ -240,3 +278,9 @@ func (e SchemaSnapshot) Pos() Position { return e.Position }
 func (e SchemaSnapshot) QualifiedName() string {
 	return qualified(e.Schema, e.Table)
 }
+
+// SourceCommitTime returns the zero time: a schema-boundary event is not a
+// row-bearing change and carries no transaction commit timestamp (the
+// sync-lag metric derives from row events only). See
+// [Change.SourceCommitTime].
+func (SchemaSnapshot) SourceCommitTime() time.Time { return time.Time{} }

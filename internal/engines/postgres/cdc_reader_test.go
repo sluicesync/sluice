@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -1064,16 +1065,16 @@ func TestEmitDropSitesHonorScope(t *testing.T) {
 		emit func(r *CDCReader, relID uint32, out chan<- ir.Change) error
 	}{
 		{"insert", func(r *CDCReader, relID uint32, out chan<- ir.Change) error {
-			return r.emitInsert(context.Background(), relations, relID, keyTuple, lsn, out)
+			return r.emitInsert(context.Background(), relations, relID, keyTuple, lsn, time.Time{}, out)
 		}},
 		{"update", func(r *CDCReader, relID uint32, out chan<- ir.Change) error {
-			return r.emitUpdate(context.Background(), relations, relID, keyTuple, keyTuple, lsn, out)
+			return r.emitUpdate(context.Background(), relations, relID, keyTuple, keyTuple, lsn, time.Time{}, out)
 		}},
 		{"delete", func(r *CDCReader, relID uint32, out chan<- ir.Change) error {
-			return r.emitDelete(context.Background(), relations, relID, keyTuple, lsn, out)
+			return r.emitDelete(context.Background(), relations, relID, keyTuple, lsn, time.Time{}, out)
 		}},
 		{"truncate", func(r *CDCReader, relID uint32, out chan<- ir.Change) error {
-			return r.emitTruncate(context.Background(), relations, []uint32{relID}, 0, lsn, out)
+			return r.emitTruncate(context.Background(), relations, []uint32{relID}, 0, lsn, time.Time{}, out)
 		}},
 	}
 	for _, c := range cases {
@@ -1123,10 +1124,10 @@ func TestEmitDropSitesSingleSchemaBackCompat(t *testing.T) {
 	tup := &pglogrepl.TupleData{ColumnNum: 1, Columns: []*pglogrepl.TupleDataColumn{{DataType: 't', Length: 1, Data: []byte("1")}}}
 
 	out := make(chan ir.Change, 4)
-	if err := r.emitInsert(context.Background(), relations, 1, tup, 0x10, out); err != nil {
+	if err := r.emitInsert(context.Background(), relations, 1, tup, 0x10, time.Time{}, out); err != nil {
 		t.Fatalf("emitInsert bound schema: %v", err)
 	}
-	if err := r.emitInsert(context.Background(), relations, 2, tup, 0x10, out); err != nil {
+	if err := r.emitInsert(context.Background(), relations, 2, tup, 0x10, time.Time{}, out); err != nil {
 		t.Fatalf("emitInsert other schema: %v", err)
 	}
 	close(out)

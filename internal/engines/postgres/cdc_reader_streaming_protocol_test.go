@@ -108,13 +108,14 @@ func TestStreamAbortMessageV2_RefusesLoudly(t *testing.T) {
 	// must refuse BEFORE the inStream gating matters. Pre-set the
 	// flag so the parse succeeds and the dispatch arm is reached.
 	var (
-		relations          = map[uint32]*relationCacheEntry{}
-		snapshotSig        = map[uint32]ir.SchemaSignature{}
-		currentTxnLSN      = pglogrepl.LSN(0)
-		currentTxnStartLSN = pglogrepl.LSN(0)
-		streamedLSN        = pglogrepl.LSN(0)
-		inStream           = true
-		firstSeenRelLSN    = map[uint32]pglogrepl.LSN{}
+		relations            = map[uint32]*relationCacheEntry{}
+		snapshotSig          = map[uint32]ir.SchemaSignature{}
+		currentTxnLSN        = pglogrepl.LSN(0)
+		currentTxnStartLSN   = pglogrepl.LSN(0)
+		currentTxnCommitTime = time.Time{}
+		streamedLSN          = pglogrepl.LSN(0)
+		inStream             = true
+		firstSeenRelLSN      = map[uint32]pglogrepl.LSN{}
 	)
 	out := make(chan ir.Change, 1)
 
@@ -125,6 +126,7 @@ func TestStreamAbortMessageV2_RefusesLoudly(t *testing.T) {
 		snapshotSig,
 		&currentTxnLSN,
 		&currentTxnStartLSN,
+		&currentTxnCommitTime,
 		&streamedLSN,
 		&inStream,
 		firstSeenRelLSN,
@@ -187,13 +189,14 @@ func TestStreamAbortMessageV2_ErrorPropagatesAsUnclassified(t *testing.T) {
 		WALData: streamAbortWireBytes(1, 1),
 	}
 	var (
-		relations          = map[uint32]*relationCacheEntry{}
-		snapshotSig        = map[uint32]ir.SchemaSignature{}
-		currentTxnLSN      = pglogrepl.LSN(0)
-		currentTxnStartLSN = pglogrepl.LSN(0)
-		streamedLSN        = pglogrepl.LSN(0)
-		inStream           = true
-		firstSeenRelLSN    = map[uint32]pglogrepl.LSN{}
+		relations            = map[uint32]*relationCacheEntry{}
+		snapshotSig          = map[uint32]ir.SchemaSignature{}
+		currentTxnLSN        = pglogrepl.LSN(0)
+		currentTxnStartLSN   = pglogrepl.LSN(0)
+		currentTxnCommitTime = time.Time{}
+		streamedLSN          = pglogrepl.LSN(0)
+		inStream             = true
+		firstSeenRelLSN      = map[uint32]pglogrepl.LSN{}
 	)
 	out := make(chan ir.Change, 1)
 
@@ -204,6 +207,7 @@ func TestStreamAbortMessageV2_ErrorPropagatesAsUnclassified(t *testing.T) {
 		snapshotSig,
 		&currentTxnLSN,
 		&currentTxnStartLSN,
+		&currentTxnCommitTime,
 		&streamedLSN,
 		&inStream,
 		firstSeenRelLSN,
