@@ -95,6 +95,12 @@ const (
 	// vtgate frontends (published to host).
 	vrVtgateMySQLPort = "15306/tcp"
 	vrVtgateGRPCPort  = "15991/tcp"
+
+	// Stable Docker-network alias for the vitess/lite container, so a
+	// sidecar (the toxiproxy latency proxy in the per-shard-latency A/B)
+	// can forward UPSTREAM to a tablet by a fixed name instead of the
+	// testcontainers-generated container id.
+	vrVitessAlias = "vitess"
 )
 
 // vitessReshardCluster owns the etcd + vitess/lite containers and the
@@ -365,8 +371,15 @@ func startVitessReshardCluster(t *testing.T, sourceShards string) *vitessReshard
 
 	// --- vitess/lite running the scripted cluster ---
 	vitessReq := testcontainers.ContainerRequest{
-		Image:        vrVitessImage,
-		Networks:     []string{nw.Name},
+		Image:    vrVitessImage,
+		Networks: []string{nw.Name},
+		// Stable network alias so a sidecar (the toxiproxy latency proxy
+		// used by the per-shard-latency A/B) can forward UPSTREAM to a
+		// tablet inside this container by a fixed name. Additive/harmless
+		// for every other test (none of them dial this alias).
+		NetworkAliases: map[string][]string{
+			nw.Name: {vrVitessAlias},
+		},
 		ExposedPorts: []string{vrVtgateMySQLPort, vrVtgateGRPCPort},
 		Env: map[string]string{
 			"ETCD_ADDR":     "etcd:2379",
@@ -515,27 +528,50 @@ func (c *vitessReshardCluster) addTargetShards(t *testing.T, shards ...string) {
 	// uids 200+ to avoid colliding with source uids (100+).
 	uid := 200
 	for _, sh := range shards {
-		script := fmt.Sprintf(`set -e
+		c.bringUpTargetShard(t, sh, uid, "")
+		uid++
+	}
+}
+
+// bringUpTargetShard brings up one target shard (a primary-candidate at
+// `uid` + a REPLICA at `uid+50`) and reparents it, driven from the host
+// via docker exec so target shards can be added AFTER the source cluster
+// is already serving. uid selects the tablet uid / port block (caller is
+// responsible for keeping uids disjoint).
+//
+// replicaHostname, when non-empty, sets the REPLICA tablet's
+// --tablet-hostname so vtgate dials it at that name instead of the
+// container's own hostname. This is the hook the per-shard-latency A/B
+// uses to route ONE shard's VStream replica through a toxiproxy latency
+// sidecar (replicaHostname=the proxy's network alias); the primary is
+// never rerouted so reparent/admin RPCs stay direct. Empty ⇒ today's
+// behavior (direct hostname), so the default reshard tests are unchanged.
+func (c *vitessReshardCluster) bringUpTargetShard(t *testing.T, sh string, uid int, replicaHostname string) {
+	t.Helper()
+	script := fmt.Sprintf(`set -e
 export VTDATAROOT=/vt/vtdataroot
 TOPO="--topo-implementation etcd2 --topo-global-server-address ${ETCD_ADDR} --topo-global-root /vitess/global"
 VC="/vt/bin/vtctldclient --server localhost:15999"
 # Same MySQL-8.4 native-auth hook as the bring-up script; this runs
 # as a separate docker exec so it must re-export EXTRA_MY_CNF.
 export EXTRA_MY_CNF=$VTDATAROOT/native_auth.cnf
-TUID=%d; MYP=%d; VTP=%d; GRP=%d; SHARD=%q; CELL=%s; KS=%s
+TUID=%d; MYP=%d; VTP=%d; GRP=%d; SHARD=%q; CELL=%s; KS=%s; REPLICA_HOST=%q
 
 # Same primary+replica topology as the bring-up script: the target
 # shard also needs a REPLICA so VStream can stream the post-reshard
 # layout after the collector Reopen()s.
+# arg 5 (HOSTFLAG) is an OPTIONAL "--tablet-hostname <name>" string
+# (unquoted on the vttablet line so it splits into two tokens); empty
+# ⇒ the tablet advertises its own hostname (today's behavior).
 one_tablet() {
-  U=$1; MP=$2; VP=$3; GP=$4
+  U=$1; MP=$2; VP=$3; GP=$4; HOSTFLAG=$5
   TD=$VTDATAROOT/vt_$(printf '%%010d' $U)
   mkdir -p $TD
   MYSQL_FLAVOR=MySQL80 /vt/bin/mysqlctl --tablet-uid $U --mysql-port $MP --db-charset utf8mb4 \
     init --init-db-sql-file /vt/config/init_db.sql > $VTDATAROOT/mysqlctl_${U}.log 2>&1
   /vt/bin/vttablet $TOPO --tablet-path ${CELL}-${U} \
     --init-keyspace ${KS} --init-shard ${SHARD} --init-tablet-type replica \
-    --port $VP --grpc-port $GP \
+    --port $VP --grpc-port $GP $HOSTFLAG \
     --service-map 'grpc-queryservice,grpc-tabletmanager,grpc-updatestream' \
     --db-socket $TD/mysql.sock \
     --restore-from-backup=false --pid-file $TD/vttablet.pid \
@@ -546,9 +582,12 @@ one_tablet() {
   done
 }
 
+REPLICA_HOSTFLAG=""
+if [ -n "$REPLICA_HOST" ]; then REPLICA_HOSTFLAG="--tablet-hostname $REPLICA_HOST"; fi
+
 $VC CreateShard --force ${KS}/${SHARD} || true
-one_tablet $TUID $MYP $VTP $GRP
-one_tablet $((TUID+50)) $((MYP+50)) $((VTP+50)) $((GRP+50))
+one_tablet $TUID $MYP $VTP $GRP ""
+one_tablet $((TUID+50)) $((MYP+50)) $((VTP+50)) $((GRP+50)) "$REPLICA_HOSTFLAG"
 for attempt in $(seq 1 12); do
   if $VC PlannedReparentShard ${KS}/${SHARD} --new-primary ${CELL}-${TUID}; then
     break
@@ -556,30 +595,32 @@ for attempt in $(seq 1 12); do
   sleep 3
 done
 echo SLUICE_TARGET_SHARD_READY_${TUID}
-`, uid, 17000+uid, 15000+uid, 16000+uid, sh, vrCell, vrKeyspace)
+`, uid, 17000+uid, 15000+uid, 16000+uid, sh, vrCell, vrKeyspace, replicaHostname)
 
-		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
-		code, reader, err := c.vitess.Exec(ctx, []string{"/bin/bash", "-c", script})
-		cancel()
-		out := vrDrain(reader)
-		if err != nil || code != 0 {
-			t.Fatalf("add target shard %q (uid %d) failed: err=%v code=%d\n%s", sh, uid, err, code, out)
-		}
-		if !strings.Contains(out, fmt.Sprintf("SLUICE_TARGET_SHARD_READY_%d", uid)) {
-			t.Fatalf("add target shard %q: readiness marker missing\n%s", sh, out)
-		}
-		// The script only waits for topo *registration* of the
-		// tablets; the REPLICA tablet (uid+50) needs to additionally
-		// reach a healthy/streamable state before VStream can resume
-		// on it post-reshard. Without this the reader Reopen()s onto
-		// a replica that is still "down or nonexistent" and the
-		// collector sees a spurious gap (ground-truthed, Track-1a
-		// Phase A). Wait for BOTH the primary-candidate and the
-		// replica to be queryable.
-		c.waitTabletServing(t, uid)
-		c.waitTabletServing(t, uid+50)
-		uid++
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	code, reader, err := c.vitess.Exec(ctx, []string{"/bin/bash", "-c", script})
+	cancel()
+	out := vrDrain(reader)
+	if err != nil || code != 0 {
+		t.Fatalf("add target shard %q (uid %d) failed: err=%v code=%d\n%s", sh, uid, err, code, out)
 	}
+	if !strings.Contains(out, fmt.Sprintf("SLUICE_TARGET_SHARD_READY_%d", uid)) {
+		t.Fatalf("add target shard %q: readiness marker missing\n%s", sh, out)
+	}
+	// The script only waits for topo *registration* of the tablets; the
+	// REPLICA tablet (uid+50) needs to additionally reach a
+	// healthy/streamable state before VStream can resume on it
+	// post-reshard. Without this the reader Reopen()s onto a replica
+	// that is still "down or nonexistent" and the collector sees a
+	// spurious gap (ground-truthed, Track-1a Phase A). Wait for BOTH the
+	// primary-candidate and the replica to be queryable.
+	//
+	// When the replica is routed through a latency proxy, vtctld dials it
+	// at replicaHostname through the proxy too — waitTabletServing keys on
+	// topo reads (GetTablet) which still succeed, and a few hundred ms of
+	// added RTT is well within its 3-min budget.
+	c.waitTabletServing(t, uid)
+	c.waitTabletServing(t, uid+50)
 }
 
 // waitTabletServing blocks until vtctld reports the tablet's
