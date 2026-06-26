@@ -77,6 +77,14 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts irbacku
 	if err != nil {
 		return nil, err
 	}
+	// Per-sync zero-date policy (ADR-0127): a backup of a legacy MySQL source
+	// honors the same source-DSN `zero_date` override as the migrate/sync read
+	// paths. Resolved here (loud refusal on an invalid value) and threaded into
+	// both the serial and coordinated openers.
+	zeroDate, err := readerZeroDateMode(cfg)
+	if err != nil {
+		return nil, err
+	}
 
 	// ADR-0088: with a cross-table parallelism request, try the
 	// coordinated open — N reader transactions whose consistent
@@ -87,12 +95,12 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts irbacku
 	// below takes over (a loud INFO already named the reason). N <= 1
 	// skips the coordinated path entirely — serial is byte-identical.
 	if opts.ReaderParallelism > 1 {
-		if snap := e.openBackupSnapshotCoordinated(ctx, cfg, opts.ReaderParallelism); snap != nil {
+		if snap := e.openBackupSnapshotCoordinated(ctx, cfg, opts.ReaderParallelism, zeroDate); snap != nil {
 			return snap, nil
 		}
 	}
 
-	return e.openBackupSnapshotSerial(ctx, cfg)
+	return e.openBackupSnapshotSerial(ctx, cfg, zeroDate)
 }
 
 // openBackupSnapshotSerial opens today's single-reader consistent
@@ -100,7 +108,7 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts irbacku
 // TRANSACTION WITH CONSISTENT SNAPSHOT, position captured inside the
 // tx. It is the floor every coordinated-open failure path falls back
 // to, and the only path when ReaderParallelism <= 1.
-func (e Engine) openBackupSnapshotSerial(ctx context.Context, cfg *gomysql.Config) (*irbackup.Snapshot, error) {
+func (e Engine) openBackupSnapshotSerial(ctx context.Context, cfg *gomysql.Config, zeroDate zeroDateMode) (*irbackup.Snapshot, error) {
 	db, err := openDB(ctx, cfg)
 	if err != nil {
 		return nil, err
@@ -135,9 +143,10 @@ func (e Engine) openBackupSnapshotSerial(ctx context.Context, cfg *gomysql.Confi
 	}
 
 	rowReader := &RowReader{
-		q:      conn,
-		schema: cfg.DBName,
-		closer: nil, // BackupSnapshot owns the lifecycle
+		q:        conn,
+		schema:   cfg.DBName,
+		closer:   nil, // BackupSnapshot owns the lifecycle
+		zeroDate: zeroDate,
 	}
 
 	closed := false
@@ -220,7 +229,7 @@ var backupReadersOpenedHook func()
 //  4. UNLOCK TABLES + close C; writes resume. Each R[i] keeps its view
 //     via its open REPEATABLE-READ tx.
 //  5. return Rows: R[0], ExtraReaders: R[1..N-1], CloseFn closing all.
-func (e Engine) openBackupSnapshotCoordinated(ctx context.Context, cfg *gomysql.Config, n int) *irbackup.Snapshot {
+func (e Engine) openBackupSnapshotCoordinated(ctx context.Context, cfg *gomysql.Config, n int, zeroDate zeroDateMode) *irbackup.Snapshot {
 	db, err := openDB(ctx, cfg)
 	if err != nil {
 		// A pool-open failure is not specific to the coordinated path;
@@ -311,9 +320,10 @@ func (e Engine) openBackupSnapshotCoordinated(ctx context.Context, cfg *gomysql.
 	readers := make([]ir.RowReader, len(conns))
 	for i, conn := range conns {
 		readers[i] = &RowReader{
-			q:      conn,
-			schema: cfg.DBName,
-			closer: nil, // BackupSnapshot owns the lifecycle
+			q:        conn,
+			schema:   cfg.DBName,
+			closer:   nil, // BackupSnapshot owns the lifecycle
+			zeroDate: zeroDate,
 		}
 	}
 

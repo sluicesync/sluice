@@ -114,6 +114,12 @@ func (e Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, er
 	if err != nil {
 		return nil, err
 	}
+	// Per-sync zero-date policy (ADR-0127). Resolved before openDB so an
+	// invalid zero_date DSN param refuses loudly without opening a connection.
+	zeroDate, err := readerZeroDateMode(cfg)
+	if err != nil {
+		return nil, err
+	}
 	// ADR-0109 §A: raise this source read pool's net_write_timeout /
 	// net_read_timeout so a transient target-stall-induced backpressure
 	// (the source read sitting idle while the writer can't drain) doesn't
@@ -144,7 +150,7 @@ func (e Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, er
 	// explicit session choice and is left untouched (olapFullScan off).
 	_, operatorSetWorkload := cfg.Params["workload"]
 	olapFullScan := e.Capabilities().CDC == ir.CDCVStream && !operatorSetWorkload
-	return &RowReader{q: db, schema: cfg.DBName, closer: db, olapFullScan: olapFullScan}, nil
+	return &RowReader{q: db, schema: cfg.DBName, closer: db, olapFullScan: olapFullScan, zeroDate: zeroDate}, nil
 }
 
 // OpenRowWriter returns a [RowWriter] bound to the database identified
@@ -255,6 +261,12 @@ func openBinlogCDCReaderShared(ctx context.Context, dsn string, serverScope bool
 	if err != nil {
 		return nil, err
 	}
+	// Per-sync zero-date policy (ADR-0127), resolved before openDB so an
+	// invalid zero_date DSN param refuses loudly without opening a connection.
+	zeroDate, err := readerZeroDateMode(cfg)
+	if err != nil {
+		return nil, err
+	}
 	db, err := openDB(ctx, cfg)
 	if err != nil {
 		return nil, err
@@ -267,6 +279,7 @@ func openBinlogCDCReaderShared(ctx context.Context, dsn string, serverScope bool
 	return &CDCReader{
 		db:             db,
 		schema:         cfg.DBName,
+		zeroDate:       zeroDate,
 		host:           host,
 		port:           port,
 		user:           cfg.User,

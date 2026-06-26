@@ -1760,7 +1760,7 @@ func TestDecodeVStreamRow_TinyInt1OutOfRangeWarns(t *testing.T) {
 	warner := newBoolRangeWarner()
 
 	// id=1, active=2 (out of range) -> active decodes true, warns once.
-	out, ok, err := decodeVStreamRow(&query.Row{Lengths: []int64{1, 1}, Values: []byte("12")}, fields, "users", warner)
+	out, ok, err := decodeVStreamRow(&query.Row{Lengths: []int64{1, 1}, Values: []byte("12")}, fields, "users", warner, zeroDateInherit)
 	if err != nil {
 		t.Fatalf("decodeVStreamRow: %v", err)
 	}
@@ -1771,7 +1771,7 @@ func TestDecodeVStreamRow_TinyInt1OutOfRangeWarns(t *testing.T) {
 		t.Errorf("active = %#v; want true (non-zero -> true)", out["active"])
 	}
 	// id=3, active=127 -> still out of range, must NOT warn again.
-	if _, _, err := decodeVStreamRow(&query.Row{Lengths: []int64{1, 3}, Values: []byte("3127")}, fields, "users", warner); err != nil {
+	if _, _, err := decodeVStreamRow(&query.Row{Lengths: []int64{1, 3}, Values: []byte("3127")}, fields, "users", warner, zeroDateInherit); err != nil {
 		t.Fatalf("decodeVStreamRow: %v", err)
 	}
 
@@ -1785,7 +1785,7 @@ func TestDecodeVStreamRow_TinyInt1OutOfRangeWarns(t *testing.T) {
 
 	// In-range bool (0/1) never warns.
 	buf.Reset()
-	if _, _, err := decodeVStreamRow(&query.Row{Lengths: []int64{1, 1}, Values: []byte("10")}, fields, "users", newBoolRangeWarner()); err != nil {
+	if _, _, err := decodeVStreamRow(&query.Row{Lengths: []int64{1, 1}, Values: []byte("10")}, fields, "users", newBoolRangeWarner(), zeroDateInherit); err != nil {
 		t.Fatalf("decodeVStreamRow: %v", err)
 	}
 	if strings.Contains(buf.String(), "users.active") {
@@ -1845,7 +1845,7 @@ func TestDecodeVStreamRow_ZeroDatePolicy(t *testing.T) {
 
 	t.Run("error refuses loudly", func(t *testing.T) {
 		withZeroDatePolicy(t, zeroDateRefuse)
-		_, _, err := decodeVStreamRow(rowZero(), fields, "events", newBoolRangeWarner())
+		_, _, err := decodeVStreamRow(rowZero(), fields, "events", newBoolRangeWarner(), zeroDateInherit)
 		if err == nil {
 			t.Fatal("err = nil; want a zero-date refusal")
 		}
@@ -1856,7 +1856,7 @@ func TestDecodeVStreamRow_ZeroDatePolicy(t *testing.T) {
 
 	t.Run("null carries nil", func(t *testing.T) {
 		withZeroDatePolicy(t, zeroDateAsNull)
-		out, _, err := decodeVStreamRow(rowZero(), fields, "events", newBoolRangeWarner())
+		out, _, err := decodeVStreamRow(rowZero(), fields, "events", newBoolRangeWarner(), zeroDateInherit)
 		if err != nil {
 			t.Fatalf("err = %v; want nil under null policy", err)
 		}
@@ -1867,7 +1867,7 @@ func TestDecodeVStreamRow_ZeroDatePolicy(t *testing.T) {
 
 	t.Run("epoch substitutes floor", func(t *testing.T) {
 		withZeroDatePolicy(t, zeroDateAsEpoch)
-		out, _, err := decodeVStreamRow(rowZero(), fields, "events", newBoolRangeWarner())
+		out, _, err := decodeVStreamRow(rowZero(), fields, "events", newBoolRangeWarner(), zeroDateInherit)
 		if err != nil {
 			t.Fatalf("err = %v; want nil under epoch policy", err)
 		}
@@ -1886,7 +1886,7 @@ func TestDecodeVStreamRow_ZeroDatePolicy(t *testing.T) {
 			{Name: "d", Type: query.Type_DATE, ColumnType: "date", Flags: mysqlNotNullFlag},
 		}
 		nnRow := &query.Row{Lengths: []int64{10}, Values: []byte("0000-00-00")}
-		_, _, err := decodeVStreamRow(nnRow, nnFields, "events", newBoolRangeWarner())
+		_, _, err := decodeVStreamRow(nnRow, nnFields, "events", newBoolRangeWarner(), zeroDateInherit)
 		if err == nil {
 			t.Fatal("err = nil; want a NOT NULL refusal under --zero-date=null")
 		}

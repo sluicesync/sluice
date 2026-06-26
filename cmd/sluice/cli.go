@@ -70,7 +70,7 @@ type Globals struct {
 	// `Mode` and emits the flag as `--my-sqlsql-mode` — a typo that
 	// contradicts the help text. v0.92.1 shipped with this defect;
 	// v0.92.2 pins the public name explicitly.
-	MySQLSQLMode string `name:"mysql-sql-mode" help:"Override sluice's default strict sql_mode on every MySQL connection. Pass --mysql-sql-mode='' (explicit empty) to fall through to the server's default sql_mode — required for migrating legacy MySQL data with zero-dates / silently-truncated values. Pass a specific comma-separated mode list to force exactly those modes. See docs/operator/migrating-legacy-mysql.md." default:"STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO" placeholder:"MODES"`
+	MySQLSQLMode string `name:"mysql-sql-mode" help:"Override sluice's default strict sql_mode on every MySQL connection (process-wide). Pass --mysql-sql-mode='' (explicit empty) to fall through to the server's default sql_mode — required for migrating legacy MySQL data with zero-dates / silently-truncated values. Pass a specific comma-separated mode list to force exactly those modes. PER-SYNC override: set sql_mode on an individual source/target DSN via ?sql_mode='...' (the DSN value wins over this flag). See docs/operator/migrating-legacy-mysql.md." default:"STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO" placeholder:"MODES"`
 
 	// ZeroDate controls how MySQL zero and partial dates (0000-00-00,
 	// YYYY-00-DD, YYYY-MM-00) are carried on the read path. These values
@@ -80,7 +80,7 @@ type Globals struct {
 	// (Vector A CRITICAL silent corruption). sluice reads temporal
 	// columns as raw text so it can apply this policy explicitly. The
 	// default refuses loudly, naming the column.
-	ZeroDate string `name:"zero-date" help:"How to carry MySQL zero/partial dates (0000-00-00, YYYY-00-DD, YYYY-MM-00): 'error' refuses loudly naming the column (default), 'null' carries them as NULL (refused on NOT NULL columns), 'epoch' substitutes 1970-01-01. See docs/operator/migrating-legacy-mysql.md." enum:"error,null,epoch" default:"error" placeholder:"MODE"`
+	ZeroDate string `name:"zero-date" help:"How to carry MySQL zero/partial dates (0000-00-00, YYYY-00-DD, YYYY-MM-00) process-wide: 'error' refuses loudly naming the column (default), 'null' carries them as NULL (refused on NOT NULL columns), 'epoch' substitutes 1970-01-01. PER-SYNC override (ADR-0127): set ?zero_date=error|null|epoch on an individual MySQL source DSN (the DSN value wins over this flag), or the zero-date: key in a sync run fleet config. See docs/operator/migrating-legacy-mysql.md." enum:"error,null,epoch" default:"error" placeholder:"MODE"`
 
 	// MaxMemory is a hard soft-ceiling on the Go heap, applied via
 	// runtime/debug.SetMemoryLimit at startup. --max-buffer-bytes only

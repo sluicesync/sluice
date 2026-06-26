@@ -190,6 +190,30 @@ func TestStripVStreamParams_RemovesAllVStreamKeys(t *testing.T) {
 	}
 }
 
+// TestStripVStreamParams_StripsZeroDate pins ADR-0127: the sluice-internal
+// zero_date param (a per-sync zero-date policy override, NOT a MySQL system
+// variable) must be stripped before the MySQL session — otherwise the
+// go-sql-driver would emit `SET zero_date = …` at session init and the server
+// would reject it. It is in nativeSluiceParams alongside copy_table_parallelism.
+func TestStripVStreamParams_StripsZeroDate(t *testing.T) {
+	cfg, err := parseDSN("user:pw@tcp(host:3306)/mydb?zero_date=null")
+	if err != nil {
+		t.Fatalf("parseDSN: %v", err)
+	}
+	if _, ok := cfg.Params["zero_date"]; !ok {
+		t.Fatal("precondition: parsed cfg should carry zero_date")
+	}
+	stripped := stripVStreamParams(cfg)
+	if _, ok := stripped.Params["zero_date"]; ok {
+		t.Error("stripped.Params still contains zero_date; openDB would emit SET zero_date and the server would reject it")
+	}
+	// No-mutation guarantee: the reader reads zero_date out of its own cfg
+	// before openDB strips a CLONE, so the caller's cfg must be left intact.
+	if _, ok := cfg.Params["zero_date"]; !ok {
+		t.Error("stripVStreamParams mutated the caller's cfg (lost zero_date); it must Clone()")
+	}
+}
+
 // TestDSNShapeHint_PlainPathNoHint confirms a well-formed DSN with
 // just `db` in the path produces no hint (we don't want false
 // positives noising every DSN parse error).

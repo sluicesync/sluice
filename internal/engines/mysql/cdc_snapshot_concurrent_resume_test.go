@@ -70,7 +70,7 @@ func TestConcurrentReader_AnchorNeverMutatesUnderRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode anchor: %v", err)
 	}
-	r := newConcurrentBinlogRows(nil, [][]string{{"a"}, {"b"}}, "db", nil)
+	r := newConcurrentBinlogRows(nil, [][]string{{"a"}, {"b"}}, "db", nil, zeroDateInherit)
 	r.anchor = origAnchor
 	r.anchorToken = tok.Token
 	r.anchorSet = true
@@ -108,7 +108,7 @@ func TestConcurrentReader_AnchorNeverMutatesUnderRecovery(t *testing.T) {
 // cursor drives: a completed table is skipped, a keyed in-progress table
 // resumes from its last-PK cursor, a keyless table restarts from the start.
 func TestConcurrentReader_RecoveryDecision(t *testing.T) {
-	r := newConcurrentBinlogRows(nil, [][]string{{"done", "keyed"}, {"keyless"}}, "db", nil)
+	r := newConcurrentBinlogRows(nil, [][]string{{"done", "keyed"}, {"keyless"}}, "db", nil, zeroDateInherit)
 
 	// done: emitted some rows then completed → skip on recovery.
 	r.noteRowEmitted("done", true, []any{int64(10)})
@@ -298,7 +298,7 @@ func TestRecoverFromDrop_TerminalWhenNoResnapshotWired(t *testing.T) {
 	nativeResnapshotBackoffBase = time.Millisecond
 	nativeResnapshotBackoffCap = time.Millisecond
 
-	r := newConcurrentBinlogRows(nil, [][]string{{"a"}}, "db", nil)
+	r := newConcurrentBinlogRows(nil, [][]string{{"a"}}, "db", nil, zeroDateInherit)
 	r.anchor = binlogPos{Mode: positionModeGTID, GTIDSet: "uuid:1-1"}
 	r.anchorSet = true
 	r.resnapshot = nil // not wired
@@ -325,7 +325,7 @@ func TestRecoverFromDrop_BinlogPurgedFallsBack(t *testing.T) {
 	nativeResnapshotBackoffBase = time.Millisecond
 	nativeResnapshotBackoffCap = time.Millisecond
 
-	r := newConcurrentBinlogRows(nil, [][]string{{"a"}}, "db", nil)
+	r := newConcurrentBinlogRows(nil, [][]string{{"a"}}, "db", nil, zeroDateInherit)
 	r.anchor = binlogPos{Mode: positionModeGTID, GTIDSet: "uuid:1-1"}
 	r.anchorSet = true
 	r.resnapshot = func(_ context.Context) ([]*sql.Conn, *sql.DB, string, uint32, error) {
@@ -347,7 +347,7 @@ func TestRecoverFromDrop_BinlogPurgedFallsBack(t *testing.T) {
 func TestRecoverFromDrop_CoalesceByGeneration(t *testing.T) {
 	// (a) Peer already recovered: observedGen(0) < recoveryGen(1) → coalesce;
 	// the resnapshot fn must NOT be invoked.
-	rc := newConcurrentBinlogRows(nil, [][]string{{"a"}}, "db", nil)
+	rc := newConcurrentBinlogRows(nil, [][]string{{"a"}}, "db", nil, zeroDateInherit)
 	rc.anchor = binlogPos{Mode: positionModeFilePos, File: "bin.000001", Pos: 4}
 	rc.anchorSet = true
 	rc.recoveryGen = 1
@@ -366,7 +366,7 @@ func TestRecoverFromDrop_CoalesceByGeneration(t *testing.T) {
 	nativeResnapshotMaxWall = time.Second
 	nativeResnapshotBackoffBase = time.Millisecond
 	nativeResnapshotBackoffCap = time.Millisecond
-	rf := newConcurrentBinlogRows(nil, [][]string{{"a"}}, "db", nil)
+	rf := newConcurrentBinlogRows(nil, [][]string{{"a"}}, "db", nil, zeroDateInherit)
 	rf.anchor = binlogPos{Mode: positionModeFilePos, File: "bin.000001", Pos: 4}
 	rf.anchorSet = true
 	called := false

@@ -509,7 +509,7 @@ func (cs *copyStream) bufferRow(table string, ev *binlogdata.VEvent) error {
 	}
 	tableName := stripKeyspaceFromTable(rev.GetTableName(), rev.GetKeyspace())
 	for _, rc := range rev.GetRowChanges() {
-		row, ok, err := decodeVStreamRow(rc.GetAfter(), fields, tableName, s.boolWarn)
+		row, ok, err := decodeVStreamRow(rc.GetAfter(), fields, tableName, s.boolWarn, s.zeroDate)
 		if err != nil {
 			return err
 		}

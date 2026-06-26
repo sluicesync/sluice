@@ -135,6 +135,11 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 	if cfg.DBName == "" {
 		return nil, errors.New("mysql/vstream: snapshot: DSN has no database name (vitess keyspace expected)")
 	}
+	// Per-sync zero-date policy (ADR-0127); invalid zero_date refuses loudly.
+	zeroDate, err := readerZeroDateMode(cfg)
+	if err != nil {
+		return nil, err
+	}
 	// Self-hosted vitess flavor: default transport=plaintext / auth=none so
 	// the cold-start snapshot (and the backup snapshot, which funnels through
 	// here) dials a self-hosted vtgate without hand-set vstream_* params —
@@ -362,6 +367,7 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 
 	snap := &vstreamSnapshotStream{
 		keyspace:             keyspace,
+		zeroDate:             zeroDate,
 		client:               client,
 		shards:               shards,
 		copyTables:           reconnectScope,
@@ -509,6 +515,13 @@ func vstreamCopySingleStreamFromDSN(cfg *gomysql.Config) bool {
 // ReadRows channel-close happens-before edge.
 type vstreamSnapshotStream struct {
 	keyspace string
+
+	// zeroDate is this snapshot stream's per-sync zero/partial-date policy
+	// (ADR-0127), parsed from the `zero_date` source-DSN param at open. The
+	// zero value (zeroDateInherit) defers to the process-global zeroDatePolicy
+	// (--zero-date); set in the constructor so the COPY cold-copy honors the
+	// same per-sync policy as the steady-state VStream CDC reader.
+	zeroDate zeroDateMode
 
 	// boolWarn carries the one-time-per-column TINYINT(1)-out-of-range
 	// WARN (Vector D) for the VStream cold-start COPY + its CDC catch-up.
@@ -1862,7 +1875,7 @@ func (s *vstreamSnapshotStream) bufferCopyRow(ev *binlogdata.VEvent) error {
 	}
 	tableName := stripKeyspaceFromTable(rev.GetTableName(), rev.GetKeyspace())
 	for _, rc := range rev.GetRowChanges() {
-		row, ok, err := decodeVStreamRow(rc.GetAfter(), fields, tableName, s.boolWarn)
+		row, ok, err := decodeVStreamRow(rc.GetAfter(), fields, tableName, s.boolWarn, s.zeroDate)
 		if err != nil {
 			return err
 		}
@@ -2327,11 +2340,11 @@ func (s *vstreamSnapshotStream) dispatchCDCRow(ctx context.Context, ev *binlogda
 	tableName := stripKeyspaceFromTable(rev.GetTableName(), rev.GetKeyspace())
 
 	for _, rc := range rev.GetRowChanges() {
-		before, beforeOK, err := decodeVStreamRow(rc.GetBefore(), fields, tableName, s.boolWarn)
+		before, beforeOK, err := decodeVStreamRow(rc.GetBefore(), fields, tableName, s.boolWarn, s.zeroDate)
 		if err != nil {
 			return err
 		}
-		after, afterOK, err := decodeVStreamRow(rc.GetAfter(), fields, tableName, s.boolWarn)
+		after, afterOK, err := decodeVStreamRow(rc.GetAfter(), fields, tableName, s.boolWarn, s.zeroDate)
 		if err != nil {
 			return err
 		}

@@ -286,6 +286,14 @@ func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, 
 	if err != nil {
 		return nil, err
 	}
+	// Per-sync zero-date policy (ADR-0127): the snapshot cold-copy honors the
+	// same source-DSN `zero_date` override as the steady-state CDC reader, so a
+	// legacy MySQL source's zero/partial dates are carried consistently across
+	// the handoff. Resolved before openDB so an invalid value refuses loudly.
+	zeroDate, err := readerZeroDateMode(cfg)
+	if err != nil {
+		return nil, err
+	}
 	// ADR-0109 §A: raise the snapshot pool's net_write_timeout /
 	// net_read_timeout. The single pinned snapshot connection below reads
 	// every table under one consistent view; a target stall backpressuring
@@ -432,6 +440,8 @@ func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, 
 		qualifyBySchema: multiDatabase,
 		// Snapshot mode: SnapshotStream.Close handles cleanup.
 		closer: nil,
+		// Per-sync zero-date policy (ADR-0127).
+		zeroDate: zeroDate,
 	}
 
 	stream := &ir.SnapshotStream{

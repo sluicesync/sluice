@@ -335,7 +335,7 @@ func TestDecodeBinlogRow(t *testing.T) {
 	}
 	raw := []any{int64(7), []byte("alice@example.com"), int64(1)}
 
-	row, err := decodeBinlogRow(raw, cols, "users", nil)
+	row, err := decodeBinlogRow(raw, cols, "users", nil, zeroDateInherit)
 	if err != nil {
 		t.Fatalf("decodeBinlogRow: %v", err)
 	}
@@ -362,7 +362,7 @@ func TestDecodeBinlogRow_TinyInt1OutOfRangeWarns(t *testing.T) {
 	}
 	warner := newBoolRangeWarner()
 	// active=2 (out of range) -> still decodes to true, but warns.
-	row, err := decodeBinlogRow([]any{int64(1), int64(2)}, cols, "users", warner)
+	row, err := decodeBinlogRow([]any{int64(1), int64(2)}, cols, "users", warner, zeroDateInherit)
 	if err != nil {
 		t.Fatalf("decodeBinlogRow: %v", err)
 	}
@@ -370,7 +370,7 @@ func TestDecodeBinlogRow_TinyInt1OutOfRangeWarns(t *testing.T) {
 		t.Errorf("active = %#v; want true (convention: non-zero -> true)", row["active"])
 	}
 	// A second out-of-range row must NOT warn again (once per column).
-	if _, err := decodeBinlogRow([]any{int64(2), int64(127)}, cols, "users", warner); err != nil {
+	if _, err := decodeBinlogRow([]any{int64(2), int64(127)}, cols, "users", warner, zeroDateInherit); err != nil {
 		t.Fatalf("decodeBinlogRow (2nd): %v", err)
 	}
 	out := buf.String()
@@ -382,7 +382,7 @@ func TestDecodeBinlogRow_TinyInt1OutOfRangeWarns(t *testing.T) {
 	}
 	// An in-range bool column never warns.
 	buf.Reset()
-	if _, err := decodeBinlogRow([]any{int64(3), int64(1)}, cols, "users", newBoolRangeWarner()); err != nil {
+	if _, err := decodeBinlogRow([]any{int64(3), int64(1)}, cols, "users", newBoolRangeWarner(), zeroDateInherit); err != nil {
 		t.Fatalf("decodeBinlogRow (in-range): %v", err)
 	}
 	if strings.Contains(buf.String(), "users.active") {
@@ -394,7 +394,7 @@ func TestDecodeBinlogRowColumnCountMismatch(t *testing.T) {
 	cols := []*ir.Column{
 		{Name: "id", Type: ir.Integer{Width: 64}},
 	}
-	if _, err := decodeBinlogRow([]any{int64(1), int64(2)}, cols, "t", nil); err == nil {
+	if _, err := decodeBinlogRow([]any{int64(1), int64(2)}, cols, "t", nil, zeroDateInherit); err == nil {
 		t.Error("expected error for column count mismatch")
 	}
 }

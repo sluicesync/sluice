@@ -343,9 +343,35 @@ const vstreamParamPrefix = "vstream_"
 // concurrent-cold-copy reader count; it governs sluice's snapshot opener,
 // never a MySQL session. Listed explicitly (an allowlist, not a prefix) so a
 // real future MySQL variable starting with "copy_" is never accidentally
-// swallowed.
+// swallowed. zero_date (ADR-0127) is the per-sync zero/partial-date policy
+// override; readers parse it into a per-reader zeroDateMode and it is NOT a
+// MySQL session variable, so it strips here for the same reason.
 var nativeSluiceParams = map[string]struct{}{
 	"copy_table_parallelism": {},
+	"zero_date":              {},
+}
+
+// readerZeroDateMode resolves a reader's per-sync zero-date policy from the
+// `zero_date` source-DSN param (ADR-0127). Absent → zeroDateInherit, so the
+// reader defers to the process-global zeroDatePolicy (--zero-date) — exactly
+// the pre-ADR-0127 behavior, byte-identical. Present-but-invalid is refused
+// LOUDLY at reader construction, naming the param and the valid set (never a
+// silent fallback). It reads cfg.Params directly; the param is stripped from
+// the MySQL session separately at openDB via [stripVStreamParams] +
+// nativeSluiceParams, so it never reaches a `SET zero_date = …`.
+func readerZeroDateMode(cfg *mysql.Config) (zeroDateMode, error) {
+	if cfg == nil {
+		return zeroDateInherit, nil
+	}
+	raw, ok := cfg.Params["zero_date"]
+	if !ok {
+		return zeroDateInherit, nil
+	}
+	m, err := parseZeroDateMode(raw)
+	if err != nil {
+		return zeroDateInherit, fmt.Errorf("mysql: invalid zero_date DSN param %q (%w)", raw, err)
+	}
+	return m, nil
 }
 
 // stripVStreamParams returns a clone of cfg with every cfg.Params entry

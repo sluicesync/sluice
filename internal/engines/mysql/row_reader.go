@@ -60,6 +60,13 @@ type RowReader struct {
 	// 132). Set by [Engine.OpenRowReader] for VStream flavors only.
 	olapFullScan bool
 
+	// zeroDate is this reader's per-sync zero/partial-date policy (ADR-0127),
+	// parsed from the `zero_date` source-DSN param at construction. The zero
+	// value (zeroDateInherit) defers to the process-global zeroDatePolicy
+	// (--zero-date) — so the snapshot/concurrent/meta RowReaders that don't
+	// set it stay byte-identical to the pre-ADR-0127 global-only behavior.
+	zeroDate zeroDateMode
+
 	mu  sync.Mutex
 	err error // sticky error from the most recent ReadRows call
 }
@@ -198,7 +205,7 @@ func (r *RowReader) stream(ctx context.Context, rows *sql.Rows, table *ir.Table,
 			if err != nil {
 				var zd *zeroDateValueError
 				if errors.As(err, &zd) {
-					v, err = applyZeroDatePolicy(zd, col)
+					v, err = applyZeroDatePolicy(zd, col, r.zeroDate)
 				}
 			}
 			if err != nil {

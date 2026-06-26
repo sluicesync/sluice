@@ -4,6 +4,10 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Added
+
+- **Per-sync MySQL zero-date policy via a `zero_date` DSN param (roadmap item 47 deferred-polish, ADR-0127).** The MySQL zero/partial-date policy (`error` / `null` / `epoch`, for legacy `0000-00-00`-style values) was process-global — set once from `--zero-date` — so a `sync run` fleet couldn't give two MySQL sources different handling. It is now configurable PER SOURCE via a sluice-specific `zero_date` DSN param on the MySQL source (e.g. `?zero_date=null`), mirroring how `sql_mode` already travels on the DSN and the `copy_table_parallelism` precedent: the param is stripped before the MySQL session (added to `nativeSluiceParams`, never emitted as a bogus `SET`), parsed once per reader, and threaded to the temporal-decode policy. `--zero-date` remains the process-wide DEFAULT; a reader whose DSN omits the param behaves byte-identically to before (a `zeroDateInherit` zero-value sentinel means "use the global default" at every construction site, so no path can silently flip the policy — the v0.99.51 zero-value-trap guard). A `sync run` fleet also gains a per-sync `zero-date` key (validated to `error|null|epoch` at config load, refused on a non-MySQL source) that folds into the source DSN. An invalid `?zero_date=bogus` is refused loudly at reader construction. This is a value-path change shipped under the full Bug-74 family matrix — DATE / DATETIME / DATETIME(6) / TIMESTAMP / TIMESTAMP(6) × every zero/partial shape × each policy, on BOTH the vanilla row-decode and the VStream paths, plus per-reader isolation (two readers, different modes, no interference) and a real-MySQL integration pin — and passed an independent value-fidelity review. Also documented (no code change): per-sync `sql_mode` is set the same way, via the source/target DSN `?sql_mode=`.
+
 ## [0.99.139] - 2026-06-26
 
 ### Added

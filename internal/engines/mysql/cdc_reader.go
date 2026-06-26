@@ -95,6 +95,13 @@ type CDCReader struct {
 	// view, same as RowReader and SchemaReader.
 	schema string
 
+	// zeroDate is this reader's per-sync zero/partial-date policy (ADR-0127),
+	// parsed from the `zero_date` source-DSN param at construction. The zero
+	// value (zeroDateInherit) defers to the process-global zeroDatePolicy
+	// (--zero-date), so a reader that doesn't set it is byte-identical to the
+	// pre-ADR-0127 global-only behavior.
+	zeroDate zeroDateMode
+
 	// boolWarn carries the one-time-per-column TINYINT(1)-out-of-range
 	// WARN (Vector D) for the binlog decode path, mirroring the
 	// bulk-copy reader. Lazily created on the (single-goroutine) pump in
@@ -867,7 +874,7 @@ func (r *CDCReader) dispatchRows(
 		replication.WRITE_ROWS_EVENTv1,
 		replication.WRITE_ROWS_EVENTv2:
 		for _, raw := range ev.Rows {
-			row, err := decodeBinlogRow(raw, tbl.Columns, tbl.Name, r.boolWarn)
+			row, err := decodeBinlogRow(raw, tbl.Columns, tbl.Name, r.boolWarn, r.zeroDate)
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: decode insert: %w", err)
 			}
@@ -891,11 +898,11 @@ func (r *CDCReader) dispatchRows(
 			return fmt.Errorf("mysql: cdc: update rows event has odd row count %d", len(ev.Rows))
 		}
 		for i := 0; i < len(ev.Rows); i += 2 {
-			before, err := decodeBinlogRow(ev.Rows[i], tbl.Columns, tbl.Name, r.boolWarn)
+			before, err := decodeBinlogRow(ev.Rows[i], tbl.Columns, tbl.Name, r.boolWarn, r.zeroDate)
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: decode update before: %w", err)
 			}
-			after, err := decodeBinlogRow(ev.Rows[i+1], tbl.Columns, tbl.Name, r.boolWarn)
+			after, err := decodeBinlogRow(ev.Rows[i+1], tbl.Columns, tbl.Name, r.boolWarn, r.zeroDate)
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: decode update after: %w", err)
 			}
@@ -914,7 +921,7 @@ func (r *CDCReader) dispatchRows(
 		replication.DELETE_ROWS_EVENTv1,
 		replication.DELETE_ROWS_EVENTv2:
 		for _, raw := range ev.Rows {
-			before, err := decodeBinlogRow(raw, tbl.Columns, tbl.Name, r.boolWarn)
+			before, err := decodeBinlogRow(raw, tbl.Columns, tbl.Name, r.boolWarn, r.zeroDate)
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: decode delete: %w", err)
 			}
@@ -1814,7 +1821,7 @@ func stripBackticks(s string) string {
 // excludes the column from the target SQL — the target's GENERATED
 // clause then recomputes the value rather than freezing the source-
 // side result.
-func decodeBinlogRow(raw []any, cols []*ir.Column, tableName string, warner *boolRangeWarner) (ir.Row, error) {
+func decodeBinlogRow(raw []any, cols []*ir.Column, tableName string, warner *boolRangeWarner, zeroDate zeroDateMode) (ir.Row, error) {
 	if len(raw) != len(cols) {
 		return nil, fmt.Errorf("row has %d values; schema has %d columns", len(raw), len(cols))
 	}
@@ -1827,7 +1834,7 @@ func decodeBinlogRow(raw []any, cols []*ir.Column, tableName string, warner *boo
 		if err != nil {
 			var zd *zeroDateValueError
 			if errors.As(err, &zd) {
-				v, err = applyZeroDatePolicy(zd, col)
+				v, err = applyZeroDatePolicy(zd, col, zeroDate)
 			}
 		}
 		if err != nil {

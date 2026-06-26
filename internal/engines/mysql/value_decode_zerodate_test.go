@@ -167,13 +167,13 @@ func TestApplyZeroDatePolicy(t *testing.T) {
 
 	t.Run("error refuses", func(t *testing.T) {
 		withZeroDatePolicy(t, zeroDateRefuse)
-		if _, err := applyZeroDatePolicy(zd, nullable); err == nil {
+		if _, err := applyZeroDatePolicy(zd, nullable, zeroDateInherit); err == nil {
 			t.Fatal("err = nil; want a refusal")
 		}
 	})
 	t.Run("null on nullable yields NULL", func(t *testing.T) {
 		withZeroDatePolicy(t, zeroDateAsNull)
-		v, err := applyZeroDatePolicy(zd, nullable)
+		v, err := applyZeroDatePolicy(zd, nullable, zeroDateInherit)
 		if err != nil {
 			t.Fatalf("err = %v; want nil", err)
 		}
@@ -183,13 +183,13 @@ func TestApplyZeroDatePolicy(t *testing.T) {
 	})
 	t.Run("null on NOT NULL refuses loudly", func(t *testing.T) {
 		withZeroDatePolicy(t, zeroDateAsNull)
-		if _, err := applyZeroDatePolicy(zd, notNull); err == nil {
+		if _, err := applyZeroDatePolicy(zd, notNull, zeroDateInherit); err == nil {
 			t.Fatal("err = nil; want a NOT NULL refusal")
 		}
 	})
 	t.Run("epoch substitutes 1970-01-01 00:00:01", func(t *testing.T) {
 		withZeroDatePolicy(t, zeroDateAsEpoch)
-		v, err := applyZeroDatePolicy(zd, notNull)
+		v, err := applyZeroDatePolicy(zd, notNull, zeroDateInherit)
 		if err != nil {
 			t.Fatalf("err = %v; want nil", err)
 		}

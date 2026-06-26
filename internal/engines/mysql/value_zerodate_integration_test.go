@@ -552,6 +552,114 @@ func TestZeroDate_EpochRepresentableOnMySQLTimestamp(t *testing.T) {
 	})
 }
 
+// TestZeroDate_PerSyncDSNOverride is the end-to-end ADR-0127 pin against a
+// real MySQL: a reader opened from a DSN carrying ?zero_date=null applies the
+// NULL policy EVEN WHILE the process-global --zero-date is the default refuse,
+// proving the per-sync override travels through the DSN → strip → per-reader
+// mode → applyZeroDatePolicy path; a sibling reader on the SAME process with no
+// param falls back to the global refuse (the per-sync isolation property).
+func TestZeroDate_PerSyncDSNOverride(t *testing.T) {
+	const dbName = "sluice_zerodate_persync"
+	host, port, user, password := ensureSharedMySQL(t)
+	resetSharedDB(t, dbName)
+	baseDSN := sharedDSN(host, port, user, password, dbName) + "&multiStatements=true"
+
+	db, err := sql.Open("mysql", baseDSN)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx := context.Background()
+
+	if _, err := db.ExecContext(ctx, `
+		CREATE TABLE zerodates (
+			id INT PRIMARY KEY,
+			d  DATE      NULL,
+			dt DATETIME  NULL,
+			ts TIMESTAMP NULL
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	seed, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("seed conn: %v", err)
+	}
+	if _, err := seed.ExecContext(ctx, "SET SESSION sql_mode = ''"); err != nil {
+		t.Fatalf("relax sql_mode: %v", err)
+	}
+	if _, err := seed.ExecContext(ctx, `INSERT INTO zerodates (id,d,dt,ts) VALUES
+		(1,'2026-06-07','2026-06-07 12:34:56','2026-06-07 12:34:56'),
+		(2,'0000-00-00','0000-00-00 00:00:00','0000-00-00 00:00:00')`); err != nil {
+		t.Fatalf("seed insert: %v", err)
+	}
+	_ = seed.Close()
+
+	// Process-global stays the default refuse for the whole test.
+	withZeroDatePolicy(t, zeroDateRefuse)
+	eng := Engine{Flavor: FlavorVanilla}
+
+	// Reader A: ?zero_date=null overrides the global refuse → NULL carried.
+	t.Run("dsn_param_overrides_global", func(t *testing.T) {
+		rr, err := eng.OpenRowReader(ctx, baseDSN+"&zero_date=null")
+		if err != nil {
+			t.Fatalf("OpenRowReader(zero_date=null): %v", err)
+		}
+		defer func() { _ = rr.(interface{ Close() error }).Close() }()
+
+		rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		ch, err := rr.ReadRows(rctx, zeroDateTable())
+		if err != nil {
+			t.Fatalf("ReadRows: %v", err)
+		}
+		rows := map[int64]ir.Row{}
+		for row := range ch {
+			rows[row["id"].(int64)] = row
+		}
+		if err := rr.(interface{ Err() error }).Err(); err != nil {
+			t.Fatalf("Err = %v; want nil under the per-sync null override", err)
+		}
+		if v := rows[1]["d"]; v != time.Date(2026, 6, 7, 0, 0, 0, 0, time.UTC) {
+			t.Errorf("row 1 d = %v; want the valid date intact", v)
+		}
+		for _, col := range []string{"d", "dt", "ts"} {
+			if v := rows[2][col]; v != nil {
+				t.Errorf("row 2 %s = %v; want NULL (per-sync null override)", col, v)
+			}
+		}
+	})
+
+	// Reader B: no param on the SAME process → inherits the global refuse.
+	t.Run("sibling_reader_without_param_inherits_global_refuse", func(t *testing.T) {
+		rr, err := eng.OpenRowReader(ctx, baseDSN)
+		if err != nil {
+			t.Fatalf("OpenRowReader(no param): %v", err)
+		}
+		defer func() { _ = rr.(interface{ Close() error }).Close() }()
+
+		rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		ch, err := rr.ReadRows(rctx, zeroDateTable())
+		if err != nil {
+			t.Fatalf("ReadRows: %v", err)
+		}
+		for range ch { //nolint:revive // drain to surface the sticky Err
+		}
+		if err := rr.(interface{ Err() error }).Err(); err == nil {
+			t.Fatal("Err = nil; want the global refuse for a reader with no per-sync param")
+		}
+	})
+
+	// Reader C: a bogus param is refused LOUDLY at construction (no read).
+	t.Run("invalid_param_refused_at_open", func(t *testing.T) {
+		if _, err := eng.OpenRowReader(ctx, baseDSN+"&zero_date=bogus"); err == nil {
+			t.Fatal("OpenRowReader(zero_date=bogus) err = nil; want a loud refusal")
+		} else if !strings.Contains(err.Error(), "zero_date") {
+			t.Errorf("err = %q; want it to name the zero_date param", err)
+		}
+	})
+}
+
 // TestZeroDate_NullPolicyRefusesNotNull pins the precise loud refusal:
 // --zero-date=null cannot silently drop a zero date into a NOT NULL
 // column, so it refuses naming the column rather than deferring to a

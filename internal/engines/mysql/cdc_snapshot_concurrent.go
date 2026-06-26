@@ -117,6 +117,13 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 	if err != nil {
 		return nil, err
 	}
+	// Per-sync zero-date policy (ADR-0127): the concurrent cold-copy honors the
+	// same source-DSN `zero_date` override as the serial path and the CDC
+	// reader. Resolved before openDB so an invalid value refuses loudly.
+	zeroDate, err := readerZeroDateMode(cfg)
+	if err != nil {
+		return nil, err
+	}
 	// ADR-0109 §A: raise net_write_timeout / net_read_timeout on the
 	// concurrent snapshot pool too — every one of the N FTWRL-coordinated
 	// reader connections inherits it at session init, so a target stall
@@ -196,7 +203,7 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 	// group (disjoint), and the ADR-0100 consumer drains each group serially
 	// within one goroutine, so each connection runs at most ONE SELECT at a
 	// time; the n goroutines run n SELECTs across n DISTINCT connections.
-	rows := newConcurrentBinlogRows(conns, groups, cfg.DBName, db)
+	rows := newConcurrentBinlogRows(conns, groups, cfg.DBName, db, zeroDate)
 
 	// ADR-0111: record the original anchor + wire the re-snapshot recovery so a
 	// classified source-read drop resumes incomplete tables from their cursors
@@ -423,6 +430,12 @@ type concurrentBinlogRows struct {
 	metaDB *sql.DB
 	dbName string
 
+	// zeroDate is the per-sync zero/partial-date policy (ADR-0127) stamped onto
+	// every inner RowReader at construction AND re-stamped onto the fresh
+	// readers the ADR-0111 recovery builds in swapConnections, so a re-snapshot
+	// never silently reverts the cold-copy to the global default.
+	zeroDate zeroDateMode
+
 	// --- ADR-0111 resumable cold-copy state (see cdc_snapshot_concurrent_resume.go) ---
 
 	// anchor is the ORIGINAL CDC anchor P recorded at open (file/pos + uuid),
@@ -470,8 +483,9 @@ type concurrentBinlogRows struct {
 // len(groups). dbName is the source database (the single-database snapshot
 // path; reads are unqualified, byte-identical to the serial reader). The
 // ADR-0111 resumable state (anchor, resnapshot fn) is attached by the opener
-// after construction.
-func newConcurrentBinlogRows(conns []*sql.Conn, groups [][]string, dbName string, metaDB *sql.DB) *concurrentBinlogRows {
+// after construction. zeroDate is the per-sync zero-date policy (ADR-0127)
+// stamped onto every inner reader.
+func newConcurrentBinlogRows(conns []*sql.Conn, groups [][]string, dbName string, metaDB *sql.DB, zeroDate zeroDateMode) *concurrentBinlogRows {
 	readers := make([]*RowReader, len(conns))
 	byTable := make(map[string]*RowReader)
 	byTableIdx := make(map[string]int)
@@ -484,6 +498,7 @@ func newConcurrentBinlogRows(conns []*sql.Conn, groups [][]string, dbName string
 			// Close/ReleaseRows owns the connection lifecycle.
 			qualifyBySchema: false,
 			closer:          nil,
+			zeroDate:        zeroDate,
 		}
 		readers[i] = rr
 		if i < len(groups) {
@@ -500,6 +515,7 @@ func newConcurrentBinlogRows(conns []*sql.Conn, groups [][]string, dbName string
 		groups:     groups,
 		metaDB:     metaDB,
 		dbName:     dbName,
+		zeroDate:   zeroDate,
 		cursors:    make(map[string]*tableCursor),
 	}
 }
@@ -670,6 +686,12 @@ func (r *concurrentBinlogRows) metaReader() *RowReader {
 	if db == nil || dbName == "" {
 		return nil
 	}
+	// zeroDate is deliberately left at zeroDateInherit here (ADR-0127): this is
+	// the ONLY data-reader-typed site not stamped with the per-sync mode, and
+	// it is safe — metaReader serves boundary-HINT queries only
+	// (RangeBounds / SampleKeysetBoundaries), never carried row data, so a
+	// temporal PK holding a zero/partial date would resolve to the GLOBAL policy
+	// and fail in the LOUD direction (refuse) rather than carry a wrong value.
 	return &RowReader{q: db, schema: dbName, qualifyBySchema: false, closer: db}
 }
 

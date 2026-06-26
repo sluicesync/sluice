@@ -82,6 +82,13 @@ type vstreamCDCReader struct {
 	// DBName at a tablet type.
 	cfg *gomysql.Config
 
+	// zeroDate is this reader's per-sync zero/partial-date policy (ADR-0127),
+	// parsed from the `zero_date` source-DSN param at construction. The zero
+	// value (zeroDateInherit) defers to the process-global zeroDatePolicy
+	// (--zero-date), so a reader that doesn't set it is byte-identical to the
+	// pre-ADR-0127 global-only behavior.
+	zeroDate zeroDateMode
+
 	// boolWarn carries the one-time-per-column TINYINT(1)-out-of-range
 	// WARN (Vector D) for the VStream decode path, mirroring the binlog
 	// reader and the bulk-copy reader. Lazily created on the
@@ -322,6 +329,11 @@ func openVStreamReader(ctx context.Context, dsn string, flavor Flavor) (ir.CDCRe
 	if cfg.DBName == "" {
 		return nil, errors.New("mysql/vstream: DSN has no database name (vitess keyspace expected)")
 	}
+	// Per-sync zero-date policy (ADR-0127); invalid zero_date refuses loudly.
+	zeroDate, err := readerZeroDateMode(cfg)
+	if err != nil {
+		return nil, err
+	}
 	applyVStreamFlavorDefaults(cfg, flavor)
 
 	endpoint, err := vstreamEndpointFromDSN(cfg)
@@ -374,6 +386,7 @@ func openVStreamReader(ctx context.Context, dsn string, flavor Flavor) (ir.CDCRe
 		authHeader:           authHeader,
 		keyspace:             cfg.DBName,
 		cfg:                  cfg,
+		zeroDate:             zeroDate,
 		shards:               shards,
 		tabletType:           tabletType,
 		relaxSkew:            !vstreamPreserveSkewFromDSN(cfg),
@@ -1301,11 +1314,11 @@ func (r *vstreamCDCReader) dispatchRow(ctx context.Context, ev *binlogdata.VEven
 	commitTime := vstreamEventCommitTime(ev)
 
 	for _, rc := range rev.GetRowChanges() {
-		before, beforeOK, err := decodeVStreamRow(rc.GetBefore(), fields, tableName, r.boolWarn)
+		before, beforeOK, err := decodeVStreamRow(rc.GetBefore(), fields, tableName, r.boolWarn, r.zeroDate)
 		if err != nil {
 			return err
 		}
-		after, afterOK, err := decodeVStreamRow(rc.GetAfter(), fields, tableName, r.boolWarn)
+		after, afterOK, err := decodeVStreamRow(rc.GetAfter(), fields, tableName, r.boolWarn, r.zeroDate)
 		if err != nil {
 			return err
 		}
@@ -1430,7 +1443,7 @@ func vgtidToShardGtidSlice(vg *binlogdata.VGtid) ([]shardGtid, error) {
 // docs/value-types.md, so cross-engine MySQL→PG paths behave
 // identically whether changes flow through the binlog reader or
 // the VStream reader.
-func decodeVStreamRow(row *query.Row, fields []*query.Field, tableName string, warner *boolRangeWarner) (ir.Row, bool, error) {
+func decodeVStreamRow(row *query.Row, fields []*query.Field, tableName string, warner *boolRangeWarner, zeroDate zeroDateMode) (ir.Row, bool, error) {
 	if row == nil {
 		return nil, false, nil
 	}
@@ -1461,7 +1474,7 @@ func decodeVStreamRow(row *query.Row, fields []*query.Field, tableName string, w
 		// substitutes the representable floor.
 		if zd, isZero := v.(*zeroDateValueError); isZero {
 			col := &ir.Column{Name: f.GetName(), Nullable: vstreamFieldNullable(f)}
-			rv, err := applyZeroDatePolicy(zd, col)
+			rv, err := applyZeroDatePolicy(zd, col, zeroDate)
 			if err != nil {
 				return nil, false, fmt.Errorf("mysql/vstream: column %q: %w", f.GetName(), err)
 			}

@@ -57,10 +57,10 @@ func (r RestartConfig) toPolicy() pipeline.RestartPolicy {
 // SyncSpec is one supervised sync's config. It is a CURATED SUBSET of
 // the `sync start` flag surface (ADR-0122 §3) — the per-sync knobs that
 // matter for a fleet. Field keys are kebab-case to mirror the CLI flags
-// operators already know. Process-global MySQL knobs (--mysql-sql-mode /
-// --zero-date / VStream tuning) remain out of v1 (set once per process);
-// per-sync PlanetScale telemetry landed in ADR-0126 (the planetscale-* +
-// PS-gated notify-* keys below).
+// operators already know. The per-sync MySQL zero-date policy landed as
+// ADR-0127's `zero-date` key below; sql_mode is per-sync via the source/
+// target DSN `?sql_mode=` (no key needed). Per-sync PlanetScale telemetry
+// landed in ADR-0126 (the planetscale-* + PS-gated notify-* keys below).
 type SyncSpec struct {
 	StreamID     string `koanf:"stream-id"`
 	SourceDriver string `koanf:"source-driver"`
@@ -70,6 +70,14 @@ type SyncSpec struct {
 
 	SlotName     string `koanf:"slot-name"`
 	TargetSchema string `koanf:"target-schema"`
+
+	// ZeroDate is the per-sync MySQL zero/partial-date policy (ADR-0127):
+	// error | null | epoch. Empty defers to the process-global --zero-date.
+	// Sugar over the source DSN's `zero_date` param — it is validated at
+	// config-load and merged into the MySQL SOURCE DSN as `?zero_date=`; an
+	// explicit `zero_date` already in the DSN wins (the foundational
+	// mechanism). Ignored (with a config-load refusal) for non-MySQL sources.
+	ZeroDate string `koanf:"zero-date"`
 
 	IncludeTable []string `koanf:"include-table"`
 	ExcludeTable []string `koanf:"exclude-table"`
@@ -235,8 +243,78 @@ func (f *SyncFleetConfig) validate() error {
 		if err := s.validateTelemetry(who); err != nil {
 			return err
 		}
+
+		// Per-sync zero-date policy (ADR-0127): validated to the 3 values at
+		// config-load, and refused on a non-MySQL source where it has no
+		// meaning (rather than silently ignored).
+		if err := s.validateZeroDate(who); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// validateZeroDate enforces the per-sync zero-date contract (ADR-0127): an
+// empty value defers to the process-global --zero-date; a set value must be
+// one of error|null|epoch (mirroring the --zero-date enum) and applies only to
+// a MySQL-family source. A value on a non-MySQL source is refused loudly at
+// config-load so the operator isn't misled into thinking it took effect.
+func (s *SyncSpec) validateZeroDate(who string) error {
+	if s.ZeroDate == "" {
+		return nil
+	}
+	switch s.ZeroDate {
+	case "error", "null", "epoch":
+	default:
+		return fmt.Errorf(
+			"sync run: %s: invalid zero-date %q (want one of: error, null, epoch)",
+			who, s.ZeroDate,
+		)
+	}
+	if !isMySQLSourceDriver(s.SourceDriver) {
+		return fmt.Errorf(
+			"sync run: %s: zero-date is a MySQL-source policy but source-driver is %q; remove zero-date or set a MySQL source (mysql/planetscale/vitess)",
+			who, s.SourceDriver,
+		)
+	}
+	return nil
+}
+
+// isMySQLSourceDriver reports whether the named source driver is a member of
+// the MySQL engine family (vanilla MySQL or a VStream flavor) — the engines
+// whose readers honor the `zero_date` DSN param (ADR-0127). Keyed on the
+// registry name so a new MySQL flavor slots in by name.
+func isMySQLSourceDriver(name string) bool {
+	switch strings.ToLower(name) {
+	case "mysql", "planetscale", "vitess":
+		return true
+	default:
+		return false
+	}
+}
+
+// applyZeroDateToSourceDSN merges the per-sync zero-date policy (ADR-0127)
+// into a MySQL source DSN as the `zero_date` query param — the foundational
+// mechanism the fleet `zero-date` key is sugar over. An explicit `zero_date`
+// already present in the DSN WINS (the merge only appends when absent), so a
+// hand-set DSN param is never clobbered. The query separator is detected
+// after the last '@' so a '?'/'@' inside the password never confuses it. mode
+// "" (the common case) returns the DSN unchanged.
+func applyZeroDateToSourceDSN(dsn, mode string) string {
+	if mode == "" {
+		return dsn
+	}
+	tail := dsn
+	if at := strings.LastIndex(dsn, "@"); at >= 0 {
+		tail = dsn[at+1:]
+	}
+	if q := strings.IndexByte(tail, '?'); q >= 0 {
+		if strings.Contains(tail[q+1:], "zero_date=") {
+			return dsn // an explicit DSN param wins over the fleet key
+		}
+		return dsn + "&zero_date=" + mode
+	}
+	return dsn + "?zero_date=" + mode
 }
 
 // validateTelemetry enforces the per-sync PlanetScale telemetry all-or-nothing
@@ -569,10 +647,19 @@ func buildStreamerFromSpec(spec *SyncSpec) (*pipeline.Streamer, error) {
 	source = labelEngine(source, spec.StreamID)
 	target = labelEngine(target, spec.StreamID)
 
+	// Per-sync zero-date policy (ADR-0127): fold the `zero-date` key into the
+	// MySQL source DSN as `?zero_date=` so the source reader picks it up. Only
+	// MySQL-family sources honor it (validated at config-load); a hand-set DSN
+	// param wins. Non-MySQL sources keep spec.Source byte-identical.
+	sourceDSN := spec.Source
+	if isMySQLSourceDriver(spec.SourceDriver) {
+		sourceDSN = applyZeroDateToSourceDSN(spec.Source, spec.ZeroDate)
+	}
+
 	return &pipeline.Streamer{
 		Source:             source,
 		Target:             target,
-		SourceDSN:          spec.Source,
+		SourceDSN:          sourceDSN,
 		TargetDSN:          spec.Target,
 		StreamID:           spec.StreamID,
 		SlotName:           spec.SlotName,
