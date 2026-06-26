@@ -206,14 +206,15 @@ func runRelaxSkewScenario(t *testing.T, c *vitessReshardCluster, relax bool, idB
 		minPerShardSeed = 50                // each shard must hold a non-trivial share
 	)
 
-	// Source DSN: CDC from "current" with shard auto-discovery; relax param
-	// only on run B. The reader reads vstream_relax_skew at open.
+	// Source DSN: CDC from "current" with shard auto-discovery. Relaxed skew is
+	// now the DEFAULT (ADR-0120 flipped); the preserve-skew opt-out param is set
+	// only on the non-relaxed arm. The reader reads vstream_preserve_skew at open.
 	sourceDSN := fmt.Sprintf(
 		"%s&vstream_endpoint=%s&vstream_transport=plaintext&vstream_auth=none&vstream_auto_discover_shards=true",
 		c.mysqlDSN, c.grpcAddr,
 	)
-	if relax {
-		sourceDSN += "&vstream_relax_skew=true"
+	if !relax {
+		sourceDSN += "&vstream_preserve_skew=true"
 	}
 
 	eng := Engine{Flavor: FlavorPlanetScale}

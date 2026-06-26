@@ -300,8 +300,8 @@ func runRelaxSkewSweepRun(t *testing.T, c *vitessReshardCluster, p sweepRunParam
 		"%s&vstream_endpoint=%s&vstream_transport=plaintext&vstream_auth=none&vstream_auto_discover_shards=true",
 		c.mysqlDSN, c.grpcAddr,
 	)
-	if p.relax {
-		sourceDSN += "&vstream_relax_skew=true"
+	if !p.relax { // relaxed is the default (ADR-0120 flipped); opt out to preserve skew
+		sourceDSN += "&vstream_preserve_skew=true"
 	}
 
 	eng := Engine{Flavor: FlavorPlanetScale}
@@ -930,9 +930,10 @@ func TestVitessReshard_RelaxSkewReshardMidStream(t *testing.T) {
 	targetDSN, cleanupTgt := newSharedDB(t, "reshard_relaxskew_midstream_target")
 	defer cleanupTgt()
 
-	// --- production Streamer with RELAXED skew on the source ---
+	// --- production Streamer with RELAXED skew on the source (now the default;
+	// no opt-out param needed since ADR-0120 flipped MinimizeSkew off) ---
 	sourceDSN := fmt.Sprintf(
-		"%s&vstream_endpoint=%s&vstream_transport=plaintext&vstream_auth=none&vstream_auto_discover_shards=true&vstream_relax_skew=true",
+		"%s&vstream_endpoint=%s&vstream_transport=plaintext&vstream_auth=none&vstream_auto_discover_shards=true",
 		c.mysqlDSN, c.grpcAddr,
 	)
 	streamer := &pipeline.Streamer{

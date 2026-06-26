@@ -282,8 +282,8 @@ func runEngineeredSkewScenario(t *testing.T, c *vitessReshardCluster, relax bool
 		"%s&vstream_endpoint=%s&vstream_transport=plaintext&vstream_auth=none&vstream_auto_discover_shards=true",
 		c.mysqlDSN, c.grpcAddr,
 	)
-	if relax {
-		sourceDSN += "&vstream_relax_skew=true"
+	if !relax { // relaxed is the default (ADR-0120 flipped); opt out to preserve skew
+		sourceDSN += "&vstream_preserve_skew=true"
 	}
 
 	eng := Engine{Flavor: FlavorPlanetScale}
