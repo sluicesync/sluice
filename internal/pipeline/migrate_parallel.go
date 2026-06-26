@@ -161,7 +161,41 @@ type parallelBulkCopyDeps struct {
 	// as before. It is the typed [ir.GrowGate] (set via [growGateOrNil]),
 	// not the concrete *growGate, so a nil value stays a true nil interface.
 	growGate ir.GrowGate
+
+	// copyGate is the run's SINGLE shared connection-budget gate (ADR-0123).
+	// Constructed ONCE in [runBulkCopyPhases], sized to the resolved budget
+	// (tableParallelism × parallelism — the same product ceiling ADR-0076
+	// enforced as two static caps). Every BASE table connection
+	// ([runBulkCopyTablePool] worker) AND every within-table PK-range chunk
+	// ([runChunks] chunks 1..M-1) draws one token, so the budget is
+	// REDISTRIBUTED at runtime: when a peer table finishes and releases its
+	// base token, an in-progress LARGE table's surplus chunks — blocked on the
+	// same gate — steal it, keeping the copy budget-wide down to the tail
+	// instead of pinned at --bulk-parallelism. Supersedes the per-table
+	// fixed-width gate. nil ⇒ pre-ADR-0123 behaviour: the table pool does no
+	// base gating and [runChunks] falls back to a per-table gate (serial
+	// cold-start, a no-measured-budget target, or a unit test).
+	copyGate *copyParallelismGate
+
+	// copyBudget is the resolved connection budget (tableParallelism ×
+	// parallelism) the copyGate is sized to (ADR-0123). It bounds the finer
+	// chunk count so even a budget > maxChunksPerTable is fully fillable by a
+	// single large table at the tail (the chunk cap is max(maxChunksPerTable,
+	// copyBudget) in [resolveParallelChunkCount]). 0 ⇒ no measured budget; the
+	// cap falls back to maxChunksPerTable.
+	copyBudget int
 }
+
+// copyChunkLifecycleObserver is a TEST-ONLY seam (nil in production — a single
+// nil check): it fires when a within-table PK-range chunk copy STARTS
+// (active=true) and ENDS (active=false), so the skewed-corpus tail-reclaim
+// integration test (ADR-0123) can measure the PEAK concurrent chunk reads of
+// the large table and assert the budget-wide work-stealing reclaim — that the
+// big table expands toward the full budget at the tail, not pinned at
+// --bulk-parallelism — while never exceeding the budget. Completed (resume-
+// skipped) chunks do NOT fire it. Mirrors the intraTableChunkObserver /
+// concurrentCopyDispatchObserver disposition.
+var copyChunkLifecycleObserver func(table string, chunkIndex int, active bool)
 
 // useFastLoader is the ADR-0043 gate: it decides whether a parallel
 // chunk may stream through the engine-native fast loader
@@ -338,7 +372,7 @@ func tryParallelCopyTable(
 	}
 
 	// Compute or reload boundaries.
-	chunks, err := resolveChunks(ctx, state, stateMu, rc, primaryRows, table, deps.parallelism, resuming)
+	chunks, err := resolveChunks(ctx, state, stateMu, rc, primaryRows, table, deps, resuming)
 	if err != nil {
 		return false, err
 	}
@@ -384,9 +418,10 @@ func resolveChunks(
 	rc resumeContext,
 	primaryRows ir.RowReader,
 	table *ir.Table,
-	parallelism int,
+	deps *parallelBulkCopyDeps,
 	resuming bool,
 ) ([]ir.TableChunkProgress, error) {
+	parallelism := deps.parallelism
 	stateMu.Lock()
 	entry := state.TableProgress[table.Name]
 	stateMu.Unlock()
@@ -412,6 +447,13 @@ func resolveChunks(
 	if !eligible {
 		return nil, fmt.Errorf("pipeline: table %q not chunk-eligible: %s", table.Name, reason)
 	}
+	// ADR-0123: derive a FINER chunk count from the row-count estimate so a
+	// large table can fill the WHOLE budget at the tail, not just
+	// --bulk-parallelism. Boundaries stay a deterministic pure function of the
+	// sorted PK set (same computeChunkBoundaries / computeKeysetChunkBoundaries,
+	// just a larger n) and are persisted below, so resume re-derives the
+	// identical set. Pre-ADR-0123 this was exactly `parallelism` chunks.
+	m := resolveParallelChunkCount(ctx, primaryRows, table, deps)
 	var (
 		bounds []chunkBoundary
 		err    error
@@ -422,13 +464,13 @@ func resolveChunks(
 		if !ok {
 			return nil, errors.New("pipeline: primary row reader does not implement RangeBoundsQuerier")
 		}
-		bounds, err = computeChunkBoundaries(ctx, rangeQ, table, parallelism)
+		bounds, err = computeChunkBoundaries(ctx, rangeQ, table, m)
 	case strategyKeysetSample:
 		sampler, ok := primaryRows.(keysetSampler)
 		if !ok {
 			return nil, errors.New("pipeline: primary row reader does not implement KeysetSampler")
 		}
-		bounds, err = computeKeysetChunkBoundaries(ctx, sampler, table, parallelism)
+		bounds, err = computeKeysetChunkBoundaries(ctx, sampler, table, m)
 	default:
 		return nil, fmt.Errorf("pipeline: table %q has unknown chunk strategy %d", table.Name, strategy)
 	}
@@ -454,6 +496,52 @@ func resolveChunks(
 	// then upserts this table's progress row — ADR-0082).
 	setTableProgressAndWrite(ctx, rc, state, stateMu, table.Name, entry)
 	return chunks, nil
+}
+
+// resolveParallelChunkCount derives how many PK-range chunks a large table is
+// split into on a FRESH run (ADR-0123 Decision 2). Pre-ADR-0123 this was a
+// fixed `parallelism` chunks, which pinned a single big table to
+// --bulk-parallelism of the budget; the finer count lets an in-progress large
+// table fill the WHOLE shared budget at the tail (the surplus chunks steal
+// freed tokens off [parallelBulkCopyDeps.copyGate]).
+//
+//		M = clamp(ceil(est / threshold), parallelism, max(maxChunksPerTable, budget))
+//
+//	  - threshold is the same resolveBulkParallelMinRows the eligibility gate
+//	    uses, so each chunk targets ~one threshold's worth of rows;
+//	  - the FLOOR is `parallelism` (the old fixed M), so no eligible table ever
+//	    gets FEWER chunks than pre-ADR-0123 — strictly >= the old width;
+//	  - the CAP is max(maxChunksPerTable, copyBudget) so even a budget larger
+//	    than maxChunksPerTable is fully fillable while bounding per-chunk
+//	    overhead in the common case.
+//
+// Mirrors ADR-0119's chunkItemsFor clamp. Deterministic given (est, threshold,
+// budget); resume does not call this (it reloads the persisted chunk set), so
+// the only requirement is internal consistency within a fresh run.
+func resolveParallelChunkCount(ctx context.Context, rows ir.RowReader, table *ir.Table, deps *parallelBulkCopyDeps) int {
+	threshold := deps.minRows
+	if threshold < 1 {
+		threshold = 1
+	}
+	est, _ := approximateRowCount(ctx, rows, table)
+	if est < 0 {
+		est = 0
+	}
+	m := int((est + threshold - 1) / threshold) // ceiling of est over threshold
+	if m < deps.parallelism {
+		m = deps.parallelism
+	}
+	if m < 2 {
+		m = 2
+	}
+	chunkCap := maxChunksPerTable
+	if deps.copyBudget > chunkCap {
+		chunkCap = deps.copyBudget
+	}
+	if m > chunkCap {
+		m = chunkCap
+	}
+	return m
 }
 
 // runChunks spawns one goroutine per chunk via errgroup. Chunk 0 reuses
@@ -507,11 +595,19 @@ func runChunks(
 		limit = defaultBulkBatchSize
 	}
 
-	// The gate caps concurrently-open chunk connections at the
-	// post-preflight effective parallelism (= len(chunks)) and shrinks it
-	// on a 53300. Chunk 0 reuses the primaries and never goes through the
-	// gate, so the gate governs only the N-1 lazily-opened chunks.
-	gate := newCopyParallelismGate(len(chunks), defaultCopyBackoffPolicy)
+	// ADR-0123: the run's SINGLE shared connection-budget gate caps
+	// concurrently-open chunk connections RUN-WIDE (across all tables) and
+	// shrinks on a 53300, so an in-progress large table's surplus chunks steal
+	// budget freed by finished peer tables. Chunk 0 reuses the primaries
+	// (covered by the table-pool worker's base token) and never goes through
+	// the gate, so the gate governs only chunks 1..M-1. nil copyGate ⇒
+	// pre-ADR-0123 per-table gate sized to this table's chunk count (serial
+	// cold-start / no-budget target / a unit test that didn't wire one) —
+	// byte-identical to the old behaviour.
+	gate := deps.copyGate
+	if gate == nil {
+		gate = newCopyParallelismGate(len(chunks), defaultCopyBackoffPolicy)
+	}
 
 	// classifySlotExhaustion is the engine-supplied predicate that decides
 	// whether an open error is the retryable slot-exhaustion class. A
@@ -710,6 +806,14 @@ func copyChunk(
 			slog.Int("chunk", chunkIndex),
 			slog.Int64("rows_copied", chunk.RowsCopied))
 		return nil
+	}
+
+	// ADR-0123 tail-reclaim observability (test-only). Wraps the whole active
+	// chunk copy (fast / raw / idempotent) so the integration test can track
+	// peak concurrent chunk reads per table.
+	if obs := copyChunkLifecycleObserver; obs != nil {
+		obs(table.Name, chunkIndex, true)
+		defer obs(table.Name, chunkIndex, false)
 	}
 
 	// ADR-0043 fast-loader gate. Evaluated once at chunk entry from

@@ -120,6 +120,23 @@ func runBulkCopyTablePool(
 	for _, table := range schema.Tables {
 		table := table
 		tg.Go(func() error {
+			// ADR-0123: take ONE token from the run's shared connection-budget
+			// gate for this table's BASE connection (the primary / free-pair
+			// connection that chunk 0 / the single-reader path uses), held for
+			// the whole table copy. When the table finishes it releases the
+			// token, so an in-progress LARGE table's surplus PK-range chunks
+			// (blocked on the same gate in runChunks) steal the freed budget —
+			// keeping the copy budget-wide down to the tail instead of pinned at
+			// --bulk-parallelism. budget >= tableParallelism (withinP >= 1), so
+			// the initial base acquires never block. nil gate (serial
+			// cold-start / no measured budget / a unit test) ⇒ no base gating,
+			// byte-identical to pre-ADR-0123.
+			if parallel != nil && parallel.copyGate != nil {
+				if err := parallel.copyGate.acquire(tctx); err != nil {
+					return err
+				}
+				defer parallel.copyGate.release()
+			}
 			pair, release, err := acquireTablePair(tctx, freePair, parallel)
 			if err != nil {
 				return err

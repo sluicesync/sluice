@@ -1033,6 +1033,27 @@ func runBulkCopyPhases(
 		applyGrowGate(rw, parallel.growGate)
 	}
 
+	// ADR-0123: build the run's SINGLE connection-budget gate — one shared
+	// counting semaphore sized to the resolved budget (tableParallelism ×
+	// within-table parallelism), the same product ceiling ADR-0076 enforced as
+	// two independent static caps. Every base table connection AND every
+	// within-table PK-range chunk draws one token from it, so the budget is
+	// REDISTRIBUTED at runtime instead of statically partitioned: when peer
+	// tables finish and release their base tokens, an in-progress large table's
+	// surplus chunks steal them, keeping the copy budget-wide down to the tail
+	// (the measured tail-taper fix). Supersedes the per-table fixed-width gate.
+	// Constructed once here so BOTH the index-overlap pool and the fallback
+	// pool share it. nil parallel (no within-table axis) leaves copyGate nil,
+	// and every consumer falls back to its pre-ADR-0123 behaviour.
+	if parallel != nil && parallel.copyGate == nil {
+		budget := tableParallelism * parallel.parallelism
+		if budget < 1 {
+			budget = 1
+		}
+		parallel.copyGate = newCopyParallelismGate(budget, defaultCopyBackoffPolicy)
+		parallel.copyBudget = budget
+	}
+
 	// Phase 1: tables.
 	if err := markPhase(ctx, rc, state, ir.MigrationPhaseTables); err != nil {
 		// Phase mark is non-fatal; continue with the data work.
