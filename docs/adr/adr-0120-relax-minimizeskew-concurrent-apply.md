@@ -2,10 +2,14 @@
 
 ## Status
 
-**Proposed (2026-06-25).** Roadmap item 27. A throughput optimization on the
+**Accepted (2026-06-25) — flag landed opt-in (default-off), correctness + throughput win both demonstrated locally; the DEFAULT FLIP remains a separate operator decision.** Roadmap item 27. A throughput optimization on the
 multi-shard (Vitess/PlanetScale) VStream CDC apply path: let both shards stream
 and drain concurrently during an apply-deficit backlog instead of vtgate holding
-the ahead shard back to keep the merged stream commit-time ordered.
+the ahead shard back to keep the merged stream commit-time ordered. The
+per-shard-latency harness (Validation, below) reproduced BOTH the hold (skew ON)
+and the relief (skew OFF, ~2.9–3.6× faster catch-up drain) on a single host with
+exactly-once intact — so the qualitative win is proven; a cross-region run is now
+only needed for headline *scale* numbers, not for the go/no-go.
 
 **CRITICAL-ordering surface, design-gated.** This touches the CDC ordering +
 resume-position contract — a silent-loss class if an assumption is wrong. The
