@@ -4,6 +4,8 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.136] - 2026-06-26
+
 ### Fixed
 
 - **Shared-source PostgreSQL fleets: publication creation is now idempotent against the concurrent-create race.** When several PostgreSQL-source syncs share one source — the `sync run` command-center's normal case — they ensure the same publication concurrently at cold-start, and the prior check-then-create had a TOCTOU window: two sessions both passed the existence check and both ran `CREATE PUBLICATION`, so one hit a unique-violation on `pg_publication` (SQLSTATE 23505), failed, and the supervisor restarted that sync. sluice now treats the duplicate as benign (the publication already exists), re-reads, and reconciles its scope instead of failing — eliminating the spurious cold-start failure + restart. Surfaced by the fleet-dashboard demo (two of three shared-source syncs spuriously restarted once at boot). No behavior change for single-sync runs.
