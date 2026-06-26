@@ -663,6 +663,18 @@ So NOTIFY-kick is **demoted** — the poll isn't the bottleneck. Closing the rea
 
 ---
 
+### 48. Email / SMTP notification sink — complete the notify-sink set — *queued; small, companion to items 36 + 45; fake-SMTP-testable*
+
+**Why.** Item 36 / ADR-0107 shipped the generic-webhook + Slack sinks and deferred email ("the generic webhook + Slack cover email via the user's own relay"). But email/SMTP is still the most universal alert channel, and a SINGLE SMTP sink covers every transactional provider (SendGrid is `smtp.sendgrid.net` user `apikey` / pass = API key; Mailgun, SES, Postmark all the same) **and** self-hosted/corporate relays — so one sink delivers broad coverage without N provider-specific HTTP integrations (the already-shipped generic webhook covers anyone who'd rather hit a provider's HTTP API directly).
+
+**What.** An SMTP sink implementing the existing notify sink interface, with the SAME semantics as the webhook/Slack sinks: opt-in, credential-via-env (`SLUICE_NOTIFY_SMTP_PASSWORD`, never the command line), and **advisory + failure-isolated** (a dead relay is logged-and-swallowed, never affects the sync). Config: `--notify-smtp-host` / `-port` / `-from` / `-to` + STARTTLS-vs-implicit-TLS + PLAIN/LOGIN auth + a from/to/subject template. Wire it into the SAME threshold-alerter (and item 45's source-lag rule) so it fires the identical edge-trigger + cooldown + hysteresis alerts the other sinks do.
+
+**Library (researched 2026-06-25).** Lean toward **`github.com/wneessen/go-mail`** — the modern de-facto Go email library: actively maintained (v0.7.x, 2026), **context-aware** (fits sluice's ctx-heavy apply loop + timeout/cancellation), **minimal dependency footprint** (Go stdlib + golang.org/x, explicitly no 3rd-party deps), **MIT** (Apache-2.0-compatible), full STARTTLS + implicit-TLS + PLAIN/LOGIN/CRAM-MD5/XOAUTH2. Alternatives weighed: stdlib `net/smtp` (frozen + minimal — PLAIN-only, no context, known footguns; viable only for the barest v1) and `xhit/go-simple-mail` (MIT, low-dep, but **no context support** and no release since 2023). Final pick at implementation time, but go-mail is the front-runner.
+
+**Gotchas.** Fully testable WITHOUT a real provider — a fake SMTP server (mailpit / MailHog / smtp4dev) in a testcontainer captures the message; the test asserts subject/body/recipient (hermetic, no secrets in CI), mirroring the webhook sink's local-HTTP-capture test. Keep the credential env-only. This closes the notify-sink set — the SMTP/email sink was the last channel demand-deferred at item 36.
+
+---
+
 ### Open bugs awaiting fix windows
 
 Tracked in detail in the project's internal regression catalog; recap here for roadmap visibility:
