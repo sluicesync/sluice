@@ -4,6 +4,10 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Added
+
+- **SQLite / Cloudflare D1 migrate source engine (PROTOTYPE; roadmap item 49, ADR-0128).** A new read-only `sqlite` source engine lets a SQLite database file — and, since `wrangler d1 export` produces an ordinary SQLite file, a Cloudflare D1 export — be imported into Postgres OR MySQL through the existing `sluice migrate` pipeline, with no pgloader dependency. It uses the pure-Go `modernc.org/sqlite` driver (no CGO, so sluice's `CGO_ENABLED=0` posture is preserved) and implements the schema- and row-reader interfaces with `Capabilities.CDC = CDCNone`; SQLite cannot be a target or a CDC source in this prototype. The load-bearing piece is SQLite's dynamic typing: a column's declared-type affinity (INTEGER / TEXT / BLOB / REAL / NUMERIC) maps to an IR type, but each row's value carries its own storage class independent of that affinity — so the row reader decodes every cell by its actual storage class and REFUSES LOUDLY (naming the table, column, rowid, and offending storage class) when a value cannot be faithfully represented in the column's resolved IR type, rather than silently coercing it to a wrong-but-plausible value. SQLite has no native DATE/TIME/BOOLEAN storage, so date and boolean columns are carried as their affinity type rather than guessed. Invoke with `sluice migrate --source-driver sqlite --source ./app.db --target-driver postgres --target <pg-dsn>` (or `--target-driver mysql`). Prototype scope: a native D1 HTTP-API reader, trigger-based CDC, within-table chunking, and a declared date/bool convention policy are deferred follow-ups.
+
 ## [0.99.140] - 2026-06-26
 
 ### Added

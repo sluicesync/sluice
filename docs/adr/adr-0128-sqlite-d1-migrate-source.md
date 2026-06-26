@@ -2,11 +2,14 @@
 
 ## Status
 
-**Proposed (2026-06-26).** Roadmap item 49 — design captured and QUEUED, not yet
-implemented. Prompted by `planetscale/cli` PR #1278 (an offline one-shot importer from
-a Cloudflare D1 *SQLite export* into PlanetScale Postgres, wrapping pgloader). This ADR
-records how sluice would do the equivalent natively; it is the self-contained design to
-pick up when the item is scheduled.
+**Accepted (prototype) (2026-06-26).** Roadmap item 49 — the read-only `sqlite` migrate
+source landed as a prototype: `internal/engines/sqlite` (pure-Go modernc.org/sqlite),
+affinity → IR type mapping with per-row storage-class loud-refusal, and the cross-engine
+round-trip proven into BOTH Postgres and MySQL. Deferred (not in the prototype): a native
+D1 HTTP-API reader, trigger-based CDC, within-table chunking, and the declared date/bool
+convention policy. Prompted by `planetscale/cli` PR #1278 (an offline one-shot importer
+from a Cloudflare D1 *SQLite export* into PlanetScale Postgres, wrapping pgloader); this
+ADR records how sluice does the equivalent natively.
 
 ## Context
 

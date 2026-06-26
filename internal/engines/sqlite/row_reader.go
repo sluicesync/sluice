@@ -1,0 +1,187 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
+package sqlite
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+
+	"sluicesync.dev/sluice/internal/ir"
+)
+
+// RowReader streams rows from SQLite tables for the bulk-copy phase. It
+// implements [ir.RowReader]. Each cell is decoded by its ACTUAL storage
+// class (see value_decode.go); a value whose class cannot be faithfully
+// represented in the column's resolved IR type aborts the read with a
+// loud error naming the table, column, rowid, and offending class —
+// surfaced via [Err] after the channel closes, the same sticky-error
+// contract the other engines' readers use (Bug 68).
+type RowReader struct {
+	db   *sql.DB
+	path string
+
+	mu  sync.Mutex
+	err error // sticky error from the most recent ReadRows call
+}
+
+// rowChanBuffer bounds the reader's output channel so decode can overlap
+// the downstream write while preserving back-pressure. Mirrors the
+// same-named constant in the other engine readers.
+const rowChanBuffer = 64
+
+// Close releases the underlying connection pool. Safe to call multiple
+// times.
+func (r *RowReader) Close() error {
+	if r.db == nil {
+		return nil
+	}
+	return r.db.Close()
+}
+
+// Err returns the error, if any, that terminated the most recently
+// returned channel. Only valid after the channel has been fully drained.
+func (r *RowReader) Err() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.err
+}
+
+func (r *RowReader) setErr(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.err = err
+}
+
+// ReadRows streams the rows of table over the returned channel. The
+// channel closes when the table is fully read, when ctx is cancelled, or
+// when a value fails the storage-class fidelity check (in which case
+// [Err] returns the cause). Callers must drain the channel or cancel ctx.
+func (r *RowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.Row, error) {
+	if table == nil {
+		return nil, errors.New("sqlite: ReadRows: table is nil")
+	}
+	if len(table.Columns) == 0 {
+		return nil, fmt.Errorf("sqlite: ReadRows: table %q has no columns", table.Name)
+	}
+
+	r.mu.Lock()
+	r.err = nil
+	r.mu.Unlock()
+
+	hasRowid := r.tableHasRowid(ctx, table.Name)
+	query := buildSelect(table, hasRowid)
+	// rowserrcheck/sqlclosecheck can't follow rows into the streaming
+	// goroutine; both rows.Err() and rows.Close() are handled inside
+	// stream() (Close via defer, Err checked once iteration ends).
+	rows, err := r.db.QueryContext(ctx, query) //nolint:rowserrcheck,sqlclosecheck
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: ReadRows: query %q failed: %w", table.Name, err)
+	}
+
+	out := make(chan ir.Row, rowChanBuffer)
+	go r.stream(ctx, rows, table, hasRowid, out)
+	return out, nil
+}
+
+// stream scans rows and pushes decoded IR Rows onto out. It owns rows
+// (closes it) and out (closes it before returning).
+func (r *RowReader) stream(ctx context.Context, rows *sql.Rows, table *ir.Table, hasRowid bool, out chan<- ir.Row) {
+	defer close(out)
+	defer func() { _ = rows.Close() }()
+
+	cols := table.Columns
+	// scanBuf layout: [rowid?] + one slot per column, all scanned as *any
+	// so modernc hands back each value's native storage-class Go type.
+	width := len(cols)
+	rowidIdx := -1
+	if hasRowid {
+		rowidIdx = 0
+		width++
+	}
+	scanBuf := make([]any, width)
+	scanPtrs := make([]any, width)
+	for i := range scanBuf {
+		scanPtrs[i] = &scanBuf[i]
+	}
+
+	ordinal := int64(0)
+	for rows.Next() {
+		ordinal++
+		if err := rows.Scan(scanPtrs...); err != nil {
+			r.setErr(fmt.Errorf("sqlite: table %q: scan: %w", table.Name, err))
+			return
+		}
+
+		rowID := ordinal
+		if rowidIdx >= 0 {
+			if id, ok := scanBuf[rowidIdx].(int64); ok {
+				rowID = id
+			}
+		}
+
+		row := make(ir.Row, len(cols))
+		for i, col := range cols {
+			raw := scanBuf[i]
+			if rowidIdx >= 0 {
+				raw = scanBuf[i+1]
+			}
+			v, err := decodeCell(raw, col.Type)
+			if err != nil {
+				r.setErr(fmt.Errorf("sqlite: table %q column %q rowid %d: %w",
+					table.Name, col.Name, rowID, err))
+				return
+			}
+			row[col.Name] = v
+		}
+
+		select {
+		case out <- row:
+		case <-ctx.Done():
+			r.setErr(ctx.Err())
+			return
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		r.setErr(fmt.Errorf("sqlite: table %q: rows iteration: %w", table.Name, err))
+	}
+}
+
+// tableHasRowid reports whether the table exposes a `rowid` (true for
+// ordinary tables, false for WITHOUT ROWID tables). A cheap probe —
+// `SELECT rowid ... LIMIT 1` errors on a WITHOUT ROWID table — lets the
+// reader include the rowid in fidelity-refusal messages when available
+// and fall back to an ordinal otherwise.
+func (r *RowReader) tableHasRowid(ctx context.Context, table string) bool {
+	var discard any
+	err := r.db.QueryRowContext(ctx, "SELECT rowid FROM "+quoteIdent(table)+" LIMIT 1").Scan(&discard)
+	// nil → the column exists and a row was read; ErrNoRows → it exists but
+	// the table is empty. A "no such column: rowid" error (WITHOUT ROWID
+	// table) returns false.
+	return err == nil || errors.Is(err, sql.ErrNoRows)
+}
+
+// buildSelect produces a SELECT over every column of table in declaration
+// order, optionally prefixed with rowid. Identifiers are double-quoted
+// with embedded quotes doubled.
+func buildSelect(table *ir.Table, hasRowid bool) string {
+	parts := make([]string, 0, len(table.Columns)+1)
+	if hasRowid {
+		parts = append(parts, "rowid")
+	}
+	for _, c := range table.Columns {
+		parts = append(parts, quoteIdent(c.Name))
+	}
+	return "SELECT " + strings.Join(parts, ", ") + " FROM " + quoteIdent(table.Name)
+}
+
+// quoteIdent double-quotes a SQLite identifier, escaping internal double
+// quotes by doubling.
+func quoteIdent(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
