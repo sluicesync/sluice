@@ -4,11 +4,14 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"sluicesync.dev/sluice/internal/pipeline"
 )
 
 // writeFleetYAML writes content to a temp file and returns its path.
@@ -193,6 +196,103 @@ func TestFleetValidate(t *testing.T) {
 		})
 	}
 }
+
+// TestSyncSpecFingerprint pins that the hot-reload fingerprint is stable
+// (equal specs hash identically) and discriminating (any field change
+// produces a different hash) — the basis for Reconcile's changed-vs-
+// unchanged decision.
+func TestSyncSpecFingerprint(t *testing.T) {
+	a := pgSpec("orders", "slot_a")
+	b := pgSpec("orders", "slot_a")
+	if a.fingerprint() != b.fingerprint() {
+		t.Errorf("equal specs hashed differently: %q vs %q", a.fingerprint(), b.fingerprint())
+	}
+	// A changed field flips the fingerprint.
+	c := pgSpec("orders", "slot_a")
+	c.ApplyConcurrency = 8
+	if a.fingerprint() == c.fingerprint() {
+		t.Error("apply-concurrency change did not change the fingerprint")
+	}
+	// A changed slice field flips it too.
+	d := pgSpec("orders", "slot_a")
+	d.IncludeTable = []string{"t1"}
+	if a.fingerprint() == d.fingerprint() {
+		t.Error("include-table change did not change the fingerprint")
+	}
+}
+
+// TestReloadFleet_RefusesBadConfig pins THE load-bearing hot-reload
+// property at the CLI seam: a reload whose new config fails to parse OR
+// fails validation (here, two Postgres syncs colliding on the default
+// replication slot) is REFUSED — reloadFleet returns the error BEFORE it
+// would ever call Reconcile, so the live fleet is never touched. The
+// supervisor passed in is intentionally not running; if validation were
+// (wrongly) skipped the test would instead see the "before Run" error
+// from Reconcile, so a plain non-nil error is not enough — we assert the
+// error names the violation.
+func TestReloadFleet_RefusesBadConfig(t *testing.T) {
+	sup := pipeline.NewSupervisor(
+		[]pipeline.SupervisedSync{{ID: "x", Runner: noopRunner{}}},
+		pipeline.RestartPolicy{},
+	)
+
+	t.Run("malformed yaml", func(t *testing.T) {
+		path := writeFleetYAML(t, "syncs: [this is : not valid yaml")
+		err := reloadFleet(path, sup)
+		if err == nil {
+			t.Fatal("reloadFleet on malformed yaml = nil; want a parse error")
+		}
+	})
+
+	t.Run("slot collision", func(t *testing.T) {
+		path := writeFleetYAML(t, `
+syncs:
+  - stream-id: a
+    source-driver: postgres
+    source: postgres://u:p@src:5432/app
+    target-driver: mysql
+    target: mysql://u:p@dst:3306/app
+  - stream-id: b
+    source-driver: postgres
+    source: postgres://u:p@src:5432/app
+    target-driver: mysql
+    target: mysql://u:p@dst:3306/app
+`)
+		err := reloadFleet(path, sup)
+		if err == nil {
+			t.Fatal("reloadFleet on slot-colliding config = nil; want a refusal")
+		}
+		if !strings.Contains(err.Error(), "replication slot") {
+			t.Errorf("error %q does not name the slot collision (validation was skipped?)", err.Error())
+		}
+	})
+
+	t.Run("duplicate stream-id", func(t *testing.T) {
+		path := writeFleetYAML(t, `
+syncs:
+  - stream-id: dup
+    source-driver: mysql
+    source: mysql://u:p@src:3306/app
+    target-driver: postgres
+    target: postgres://u:p@dst:5432/app
+  - stream-id: dup
+    source-driver: mysql
+    source: mysql://u:p@src2:3306/app
+    target-driver: postgres
+    target: postgres://u:p@dst:5432/app
+`)
+		err := reloadFleet(path, sup)
+		if err == nil || !strings.Contains(err.Error(), "duplicate stream-id") {
+			t.Fatalf("reloadFleet on duplicate stream-id = %v; want a duplicate-stream-id refusal", err)
+		}
+	})
+}
+
+// noopRunner is an inert SyncRunner for tests that only need to construct
+// a supervisor (reloadFleet's refusal paths never start it).
+type noopRunner struct{}
+
+func (noopRunner) Run(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }
 
 // TestResolvedSlotName pins the slot-name resolution used by the guard.
 func TestResolvedSlotName(t *testing.T) {

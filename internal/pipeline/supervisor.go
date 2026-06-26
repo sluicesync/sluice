@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+	"sort"
 	"sync"
 	"time"
 )
@@ -27,9 +28,19 @@ type SyncRunner interface {
 // supervisor reports status under; it must be unique across the fleet
 // (the config loader refuses duplicates — a shared id clobbers the
 // per-target position row, ADR-0122 §4).
+//
+// Fingerprint is a stable hash of the resolved spec the runner was
+// built from. It is consumed ONLY by [Supervisor.Reconcile] to decide
+// whether a sync that is present in both the live and the reloaded fleet
+// CHANGED (different fingerprint → stop+restart) or is UNCHANGED (same
+// fingerprint → leave running untouched). It is optional: the initial
+// [Supervisor.Run] path never reads it, and two empty fingerprints
+// compare equal (treated as unchanged), so callers that don't hot-reload
+// can ignore it.
 type SupervisedSync struct {
-	ID     string
-	Runner SyncRunner
+	ID          string
+	Runner      SyncRunner
+	Fingerprint string
 }
 
 // SyncState is the lifecycle phase the supervisor reports for one
@@ -121,17 +132,44 @@ type supervisedState struct {
 	since       time.Time
 }
 
+// syncHandle is a live sync goroutine's control surface: cancel its
+// derived context to stop it, then wait on done for the goroutine to
+// fully unwind (so a restarted sync's predecessor has released its
+// resources — e.g. a PG replication slot — before the replacement
+// starts).
+type syncHandle struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
 // Supervisor runs N independent syncs in one process, each in its own
 // goroutine, each failure-isolated and restarted on a bounded backoff
-// (ADR-0122). A clean ctx-cancel stops all of them.
+// (ADR-0122). A clean ctx-cancel stops all of them. On SIGHUP the CLI
+// re-reads the fleet config and calls [Supervisor.Reconcile] to add /
+// remove / restart syncs WITHOUT a full process restart.
 type Supervisor struct {
 	policy RestartPolicy
-	syncs  []SupervisedSync
+	clock  func() time.Time
 
-	clock func() time.Time
+	// initial is the fleet Run starts with; Reconcile works against the
+	// live `running` set thereafter.
+	initial []SupervisedSync
 
-	mu     sync.Mutex
-	states map[string]*supervisedState
+	// reconcileMu serializes Reconcile against itself AND against Run's
+	// idle-completion decision, so a stop-then-start reconcile can never
+	// be mistaken for the fleet naturally going idle (which would make
+	// Run return mid-reload). It is the coarse "fleet-shape change" lock;
+	// mu remains the fine-grained state lock.
+	reconcileMu sync.Mutex
+
+	mu       sync.Mutex
+	fleetCtx context.Context //nolint:containedctx // parent of every per-sync ctx; set once by Run, read by start/Reconcile
+	running  map[string]*syncHandle
+	states   map[string]*supervisedState
+	order    []string // stable display order for Snapshot; reconcile appends/removes
+	fps      map[string]string
+	wg       sync.WaitGroup
+	wake     chan struct{} // buffered(1); a goroutine pings it on exit so Run can re-check for completion
 }
 
 // NewSupervisor builds a supervisor over the given syncs and restart
@@ -139,51 +177,272 @@ type Supervisor struct {
 // responsibility to refuse; if two slip through they share a status
 // entry (the run loops are still independent).
 func NewSupervisor(syncs []SupervisedSync, policy RestartPolicy) *Supervisor {
-	states := make(map[string]*supervisedState, len(syncs))
-	now := time.Now()
-	for _, sy := range syncs {
-		states[sy.ID] = &supervisedState{state: SyncStarting, since: now}
+	s := &Supervisor{
+		policy:  policy.withDefaults(),
+		clock:   time.Now,
+		initial: syncs,
+		running: make(map[string]*syncHandle, len(syncs)),
+		states:  make(map[string]*supervisedState, len(syncs)),
+		fps:     make(map[string]string, len(syncs)),
+		wake:    make(chan struct{}, 1),
 	}
-	return &Supervisor{
-		policy: policy.withDefaults(),
-		syncs:  syncs,
-		clock:  time.Now,
-		states: states,
+	for _, sy := range syncs {
+		s.registerLocked(sy)
+	}
+	return s
+}
+
+// Run launches every initial sync in its own goroutine and blocks until
+// the fleet stops. On ctx cancel (Ctrl-C / SIGTERM) every sync's loop
+// stops and Run returns nil. If ctx is still live but every sync has
+// ended on its own (all drained or permanently failed), Run returns the
+// aggregated error of the failed syncs — so a single-sync fleet that
+// can't start exits non-zero, while a fleet where one sync fails and
+// others run on keeps blocking (the failed peer is isolated, not fatal).
+func (s *Supervisor) Run(ctx context.Context) error {
+	s.mu.Lock()
+	if len(s.initial) == 0 {
+		s.mu.Unlock()
+		return errors.New("supervisor: no syncs configured")
+	}
+	s.fleetCtx = ctx
+	for _, sy := range s.initial {
+		s.launchLocked(sy)
+	}
+	n := len(s.initial)
+	s.mu.Unlock()
+
+	slog.InfoContext(ctx, "supervisor: starting fleet", slog.Int("syncs", n))
+
+	for {
+		select {
+		case <-ctx.Done():
+			// A ctx cancel (Ctrl-C / SIGTERM) is a clean fleet shutdown:
+			// wait for every goroutine (incl. any started by a concurrent
+			// reconcile) to unwind, then return nil rather than ctx.Err().
+			s.wg.Wait()
+			slog.InfoContext(ctx, "supervisor: fleet stopped (context cancelled)")
+			return nil //nolint:nilerr // ctx-cancel is a clean stop, not a failure
+		case <-s.wake:
+			// A sync goroutine exited. If the fleet has naturally gone idle
+			// (no syncs left and no reconcile in flight) we're done.
+			if s.idleComplete() {
+				s.wg.Wait()
+				return s.aggregateFailures()
+			}
+		}
 	}
 }
 
-// Run launches every sync in its own goroutine and blocks until all of
-// them exit. On ctx cancel (Ctrl-C / SIGTERM) every sync's loop stops
-// and Run returns nil. If ctx is still live but every sync ended on its
-// own (all drained or permanently failed), Run returns the aggregated
-// error of the failed syncs — so a single-sync fleet that can't start
-// exits non-zero, while a fleet where one sync fails and others run on
-// keeps blocking (the failed peer is isolated, not fatal).
-func (s *Supervisor) Run(ctx context.Context) error {
-	if len(s.syncs) == 0 {
-		return errors.New("supervisor: no syncs configured")
+// idleComplete reports whether the fleet has run dry — every sync ended
+// on its own and no reconcile is mid-flight. Holding reconcileMu is what
+// makes a stop-then-start reconcile atomic with respect to this check:
+// if a reconcile is applying, idleComplete blocks until it finishes, by
+// which point `running` reflects the post-reconcile set (non-empty for a
+// valid reload), so Run does not spuriously return mid-reload.
+func (s *Supervisor) idleComplete() bool {
+	s.reconcileMu.Lock()
+	defer s.reconcileMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.running) == 0
+}
+
+// ReconcileResult reports what a [Supervisor.Reconcile] applied. Slices
+// are sorted for deterministic logging and testing.
+type ReconcileResult struct {
+	Started   []string
+	Stopped   []string
+	Restarted []string
+	Unchanged []string
+}
+
+// changed reports whether the reconcile actually mutated the fleet.
+func (r ReconcileResult) changed() bool {
+	return len(r.Started)+len(r.Stopped)+len(r.Restarted) > 0
+}
+
+// Reconcile diffs newSyncs (the freshly-reloaded fleet) against the live
+// set by stream-id and applies the difference WITHOUT a process restart:
+//
+//   - present in newSyncs, not running → START
+//   - running, absent from newSyncs   → STOP (graceful drain)
+//   - present in both, fingerprint changed → RESTART (stop old, start new)
+//   - present in both, fingerprint equal   → untouched
+//
+// THE load-bearing property (ADR-0122 §3, hot-reload): if newSyncs is
+// invalid (duplicate or empty stream-id), Reconcile refuses the WHOLE
+// reload — it returns an error and leaves the live fleet running exactly
+// as it was. The malformed set is validated UP FRONT, before any sync is
+// stopped or started, so a bad reload can never half-apply or take the
+// live fleet down. (The CLI also re-runs the full slot-name + stream-id
+// config validators before calling Reconcile; this is the supervisor's
+// own defense-in-depth invariant.)
+//
+// Stops complete fully — the goroutine exits and its resources release —
+// before the matching start runs, so a restarted Postgres sync releases
+// and reacquires its replication slot cleanly.
+func (s *Supervisor) Reconcile(newSyncs []SupervisedSync) (ReconcileResult, error) {
+	s.reconcileMu.Lock()
+	defer s.reconcileMu.Unlock()
+
+	// Validate the new set BEFORE touching the live fleet. Any violation
+	// returns here with the live set wholly unmutated.
+	newByID := make(map[string]SupervisedSync, len(newSyncs))
+	for _, sy := range newSyncs {
+		if sy.ID == "" {
+			return ReconcileResult{}, errors.New("supervisor: reload refused (live fleet unchanged): a sync has an empty stream-id")
+		}
+		if _, dup := newByID[sy.ID]; dup {
+			return ReconcileResult{}, fmt.Errorf(
+				"supervisor: reload refused (live fleet unchanged): duplicate stream-id %q in the new fleet",
+				sy.ID,
+			)
+		}
+		newByID[sy.ID] = sy
 	}
 
-	slog.InfoContext(ctx, "supervisor: starting fleet", slog.Int("syncs", len(s.syncs)))
-
-	var wg sync.WaitGroup
-	for _, sy := range s.syncs {
-		wg.Add(1)
-		go func(sy SupervisedSync) {
-			defer wg.Done()
-			s.superviseOne(ctx, sy)
-		}(sy)
+	s.mu.Lock()
+	if s.fleetCtx == nil {
+		s.mu.Unlock()
+		return ReconcileResult{}, errors.New("supervisor: Reconcile called before Run")
 	}
-	wg.Wait()
-
-	if ctx.Err() != nil {
-		slog.InfoContext(ctx, "supervisor: fleet stopped (context cancelled)")
-		// A ctx cancel (Ctrl-C / SIGTERM) is a clean fleet shutdown, not
-		// an error — peers drained on their own loops. Deliberately
-		// return nil rather than ctx.Err().
-		return nil //nolint:nilerr // ctx-cancel is a clean stop, not a failure
+	var res ReconcileResult
+	for _, sy := range newSyncs {
+		switch _, live := s.running[sy.ID]; {
+		case !live:
+			// Not currently running: a brand-new sync, or one that ended on
+			// its own (failed/drained) and is back in the config — (re)start.
+			res.Started = append(res.Started, sy.ID)
+		case s.fps[sy.ID] != sy.Fingerprint:
+			res.Restarted = append(res.Restarted, sy.ID)
+		default:
+			res.Unchanged = append(res.Unchanged, sy.ID)
+		}
 	}
-	return s.aggregateFailures()
+	// Anything currently known (running OR already terminal) that the new
+	// config drops is removed from the fleet. stopAndWait gracefully drains
+	// a live one and is a no-op for an already-exited one; either way
+	// forgetLocked clears it from the view.
+	for _, id := range s.order {
+		if _, keep := newByID[id]; !keep {
+			res.Stopped = append(res.Stopped, id)
+		}
+	}
+	s.mu.Unlock()
+
+	sort.Strings(res.Started)
+	sort.Strings(res.Stopped)
+	sort.Strings(res.Restarted)
+	sort.Strings(res.Unchanged)
+
+	// Apply: removals first (free any slots), then restarts (each stops
+	// then starts its own stream), then fresh starts.
+	for _, id := range res.Stopped {
+		s.stopAndWait(id)
+		s.mu.Lock()
+		s.forgetLocked(id)
+		s.mu.Unlock()
+	}
+	for _, id := range res.Restarted {
+		s.stopAndWait(id)
+		s.mu.Lock()
+		s.registerLocked(newByID[id])
+		s.launchLocked(newByID[id])
+		s.mu.Unlock()
+	}
+	for _, id := range res.Started {
+		s.mu.Lock()
+		s.registerLocked(newByID[id])
+		s.launchLocked(newByID[id])
+		s.mu.Unlock()
+	}
+
+	if !res.changed() {
+		slog.Info("supervisor: reload applied — no changes", slog.Int("running", len(res.Unchanged)))
+	} else {
+		slog.Info(
+			"supervisor: reload applied",
+			slog.Any("started", res.Started),
+			slog.Any("stopped", res.Stopped),
+			slog.Any("restarted", res.Restarted),
+			slog.Int("unchanged", len(res.Unchanged)),
+		)
+	}
+	return res, nil
+}
+
+// registerLocked (re)initialises a sync's status to starting, records
+// its fingerprint, and appends its id to the display order if new. Caller
+// holds s.mu.
+func (s *Supervisor) registerLocked(sy SupervisedSync) {
+	if _, ok := s.states[sy.ID]; !ok {
+		s.order = append(s.order, sy.ID)
+	}
+	s.states[sy.ID] = &supervisedState{state: SyncStarting, since: s.clock()}
+	s.fps[sy.ID] = sy.Fingerprint
+}
+
+// launchLocked starts a sync's supervise goroutine under a context
+// derived from the fleet ctx, so either a fleet-wide cancel OR a
+// per-sync reconcile-stop unwinds it. Caller holds s.mu.
+func (s *Supervisor) launchLocked(sy SupervisedSync) {
+	ctx, cancel := context.WithCancel(s.fleetCtx)
+	h := &syncHandle{cancel: cancel, done: make(chan struct{})}
+	s.running[sy.ID] = h
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		defer close(h.done)
+		defer s.goroutineExited(sy.ID)
+		s.superviseOne(ctx, sy)
+	}()
+}
+
+// stopAndWait cancels a live sync and blocks until its goroutine has
+// fully unwound (releasing its resources). The s.mu lock is NOT held
+// while waiting — the goroutine needs it to record its final state. A
+// no-op if the id isn't running.
+func (s *Supervisor) stopAndWait(id string) {
+	s.mu.Lock()
+	h := s.running[id]
+	s.mu.Unlock()
+	if h == nil {
+		return
+	}
+	h.cancel()
+	<-h.done
+}
+
+// forgetLocked drops every trace of a removed sync so it disappears from
+// the fleet view. Caller holds s.mu. (Its running entry is already gone —
+// goroutineExited removed it when the goroutine exited.)
+func (s *Supervisor) forgetLocked(id string) {
+	delete(s.states, id)
+	delete(s.fps, id)
+	delete(s.running, id)
+	for i, oid := range s.order {
+		if oid == id {
+			s.order = append(s.order[:i], s.order[i+1:]...)
+			break
+		}
+	}
+}
+
+// goroutineExited removes a sync from the live set and, if the fleet has
+// gone empty, pings Run to re-check for completion. Runs as the sync
+// goroutine's deferred cleanup.
+func (s *Supervisor) goroutineExited(id string) {
+	s.mu.Lock()
+	delete(s.running, id)
+	empty := len(s.running) == 0
+	s.mu.Unlock()
+	if empty {
+		select {
+		case s.wake <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // superviseOne is the per-sync supervise loop: run, classify the exit,
@@ -332,19 +591,19 @@ func (s *Supervisor) setState(id string, state SyncState, err error) {
 }
 
 // Snapshot returns an immutable copy of every supervised sync's current
-// state, in the fleet's configured order. Safe to call concurrently
-// with the supervise loops.
+// state, in the fleet's display order. Safe to call concurrently with
+// the supervise loops and with Reconcile.
 func (s *Supervisor) Snapshot() []SyncStatusSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]SyncStatusSnapshot, 0, len(s.syncs))
-	for _, sy := range s.syncs {
-		st := s.states[sy.ID]
+	out := make([]SyncStatusSnapshot, 0, len(s.order))
+	for _, id := range s.order {
+		st := s.states[id]
 		if st == nil {
 			continue
 		}
 		snap := SyncStatusSnapshot{
-			ID:                  sy.ID,
+			ID:                  id,
 			State:               st.state,
 			ConsecutiveFailures: st.consecutive,
 			Restarts:            st.restarts,
@@ -365,10 +624,10 @@ func (s *Supervisor) aggregateFailures() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var errs []error
-	for _, sy := range s.syncs {
-		st := s.states[sy.ID]
+	for _, id := range s.order {
+		st := s.states[id]
 		if st != nil && st.state == SyncFailed && st.lastErr != nil {
-			errs = append(errs, fmt.Errorf("sync %q: %w", sy.ID, st.lastErr))
+			errs = append(errs, fmt.Errorf("sync %q: %w", id, st.lastErr))
 		}
 	}
 	return errors.Join(errs...)

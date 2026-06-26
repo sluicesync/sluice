@@ -4,6 +4,9 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -286,21 +289,85 @@ func (c *SyncRunCmd) Run(g *Globals) error {
 	warnSharedTargetBudget(fleet)
 
 	ctx := kongContext()
+	supervised, err := buildSupervisedFleet(fleet)
+	if err != nil {
+		return err
+	}
+
+	sup := pipeline.NewSupervisor(supervised, fleet.Restart.toPolicy())
+
+	// SIGHUP hot-reload (ADR-0122 §3): re-read + re-validate the config and
+	// reconcile the live fleet without a process restart. POSIX-only — on
+	// Windows installReloadHandler is a no-op. A bad reload is refused
+	// loudly and the running fleet keeps going untouched.
+	installReloadHandler(ctx, g.Config, sup)
+
+	return sup.Run(ctx)
+}
+
+// buildSupervisedFleet maps a validated fleet config to the supervisor's
+// input, building one Streamer per sync and stamping each with a stable
+// fingerprint of its resolved spec so [pipeline.Supervisor.Reconcile] can
+// detect a CHANGED sync across a hot-reload.
+func buildSupervisedFleet(fleet *SyncFleetConfig) ([]pipeline.SupervisedSync, error) {
 	supervised := make([]pipeline.SupervisedSync, 0, len(fleet.Syncs))
 	for i := range fleet.Syncs {
 		spec := &fleet.Syncs[i]
 		streamer, err := buildStreamerFromSpec(spec)
 		if err != nil {
-			return fmt.Errorf("sync run: %s: %w", spec.describe(i), err)
+			return nil, fmt.Errorf("sync run: %s: %w", spec.describe(i), err)
 		}
 		supervised = append(supervised, pipeline.SupervisedSync{
-			ID:     spec.StreamID,
-			Runner: streamer,
+			ID:          spec.StreamID,
+			Runner:      streamer,
+			Fingerprint: spec.fingerprint(),
 		})
 	}
+	return supervised, nil
+}
 
-	sup := pipeline.NewSupervisor(supervised, fleet.Restart.toPolicy())
-	return sup.Run(ctx)
+// reloadFleet re-reads the fleet config from path, RE-RUNS the same
+// load-time validators the initial load used (required fields, stream-id
+// + slot-name uniqueness — the data-corruption guards), and on success
+// reconciles the live supervisor. THE load-bearing property: if the new
+// config fails to parse or fails validation, reloadFleet returns the
+// error WITHOUT calling Reconcile, so the running fleet keeps going on
+// the old config unchanged. A malformed / colliding reloaded config can
+// never take down or corrupt the live fleet.
+func reloadFleet(path string, sup *pipeline.Supervisor) error {
+	fleet, err := loadFleetConfig(path)
+	if err != nil {
+		return err
+	}
+	if err := fleet.validate(); err != nil {
+		return err
+	}
+	warnSharedTargetBudget(fleet)
+	supervised, err := buildSupervisedFleet(fleet)
+	if err != nil {
+		return err
+	}
+	if _, err := sup.Reconcile(supervised); err != nil {
+		return err
+	}
+	return nil
+}
+
+// fingerprint is a stable hash of a resolved SyncSpec — every field that
+// affects the built Streamer. The supervisor compares it per stream-id
+// across a hot-reload to tell an UNCHANGED sync (leave running) from a
+// CHANGED one (stop + restart with the new spec). JSON marshalling is
+// order-stable for a flat struct, so two equal specs hash identically.
+func (s *SyncSpec) fingerprint() string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		// A SyncSpec is plain data (strings / numbers / string slices) and
+		// always marshals; fall back to a never-equal sentinel so a
+		// (theoretical) failure forces a restart rather than a false match.
+		return fmt.Sprintf("unmarshalable:%v", err)
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 // buildStreamerFromSpec maps a SyncSpec to a *pipeline.Streamer, reusing

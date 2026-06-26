@@ -130,6 +130,44 @@ func TestSupervisorFleet_FailureIsolation_PostgresToPostgres(t *testing.T) {
 		t.Fatal("healthy sync stopped delivering CDC after its peer failed — isolation broken")
 	}
 
+	// Hot-reload reconcile (ADR-0122 §3): RESTART the healthy stream with a
+	// new spec (changed fingerprint) and DROP the failed peer — the shape a
+	// SIGHUP config reload produces. The load-bearing integration assertion
+	// is that the restarted Postgres sync releases and reacquires its
+	// replication slot CLEANLY (the old goroutine fully drains before the
+	// replacement acquires the same slot) and resumes delivering CDC from
+	// its persisted position.
+	healthyV2 := &Streamer{
+		Source:    pgEng,
+		Target:    pgEng,
+		SourceDSN: sourceDSN,
+		TargetDSN: targetDSN,
+		StreamID:  "healthy",
+		SlotName:  "healthy",
+	}
+	res, err := sup.Reconcile([]SupervisedSync{
+		{ID: "healthy", Runner: healthyV2, Fingerprint: "v2"},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile (restart healthy, drop failing) = %v; want nil", err)
+	}
+	if len(res.Restarted) != 1 || res.Restarted[0] != "healthy" {
+		t.Errorf("Reconcile Restarted = %v; want [healthy]", res.Restarted)
+	}
+	if len(res.Stopped) != 1 || res.Stopped[0] != "failing" {
+		t.Errorf("Reconcile Stopped = %v; want [failing]", res.Stopped)
+	}
+	if _, ok := snapshotFor(sup, "failing"); ok {
+		t.Error("dropped sync \"failing\" still present after reconcile; want removed")
+	}
+	waitForState(t, sup, "healthy", SyncRunning, 60*time.Second)
+
+	// The slot was reacquired cleanly: a post-restart insert still flows.
+	applyDDL(t, sourceDSN, "INSERT INTO users (id, email) VALUES (3, 'r3@example.com');")
+	if !waitForRowCount(t, targetDSN, "users", 3, 60*time.Second) {
+		t.Fatal("restarted healthy sync did not resume delivering CDC — slot not reacquired cleanly")
+	}
+
 	cancel()
 	select {
 	case err := <-done:
