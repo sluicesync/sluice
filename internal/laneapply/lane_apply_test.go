@@ -415,3 +415,140 @@ func TestLaneApply_CtxCancelAbortsRetry(t *testing.T) {
 		t.Errorf("attempts = %d; want 1 (ctx cancel must stop the retry loop)", attempts)
 	}
 }
+
+// --- Run-level error-propagation pins (target-outage silent-stop fix) ---
+//
+// The pins above stop at applyLaneBatch; they never exercised Orchestrator.Run's
+// final error resolution. That gap let a real defect ship: when a lane's target
+// write fails, the lane records the real error and calls o.cancel(), so the
+// coordinator's own loop observes that internal abort as loopErr ==
+// context.Canceled. The old `getErr() != nil && loopErr == nil` guard let that
+// self-inflicted cancel MASK the recorded error, so Run returned a bare
+// context.Canceled — which the streamer/supervisor read as a clean drain and
+// PARKED the sync (stopped, no restart, no last_error) on an uncommitted target
+// outage. These pin that Run surfaces the RECORDED error, while a genuine outer
+// cancel (no recorded error) still returns context.Canceled.
+
+// routingSeam routes EVERY change to a single lane (fixed PK) so a Run-level pin
+// can drive a lane failure through the whole orchestrator — the no-routing
+// testSeam returns ok=false and sends everything down the barrier path instead.
+type routingSeam struct {
+	commit func(ctx context.Context, batch []ir.Change) error
+}
+
+func (s *routingSeam) PKValuesForRouting(context.Context, ir.Change) (qualified string, pkVals []any, ok bool, err error) {
+	return "ks.t", []any{int64(1)}, true, nil
+}
+
+func (s *routingSeam) ApplyLaneBatch(ctx context.Context, _ int, batch []ir.Change) (int, error) {
+	if err := s.commit(ctx, batch); err != nil {
+		return 0, err
+	}
+	return len(batch), nil
+}
+
+func (s *routingSeam) ClassifyError(err error) error                       { return classifyTest(err) }
+func (s *routingSeam) WriteCheckpoint(context.Context, ir.Position) error  { return nil }
+func (s *routingSeam) ApplyBarrierChange(context.Context, ir.Change) error { return nil }
+
+// TestLaneApply_Run_TargetFailureNotMaskedAsCtxCancel is THE regression pin:
+// a lane whose target write fails (a non-retriable connection error here)
+// records that error and cancels the orchestrator; Run must return the RECORDED
+// error, NOT the context.Canceled produced by its own internal abort. With the
+// pre-fix `&& loopErr == nil` guard this FAILS (Run returns context.Canceled).
+func TestLaneApply_Run_TargetFailureNotMaskedAsCtxCancel(t *testing.T) {
+	targetDown := errors.New("dial tcp 127.0.0.1:5432: connect: connection refused")
+	commit := func(context.Context, []ir.Change) error { return targetDown }
+	o := NewOrchestrator(Config{Lanes: 2, MaxBatchSize: 4}, &routingSeam{commit: commit})
+
+	changes := make(chan ir.Change)
+	done := make(chan struct{})
+	// Keep feeding same-key changes so the coordinator keeps routing to the dead
+	// lane and blocks on its full channel — the exact path that yielded the mask.
+	go func() {
+		for i := 0; ; i++ {
+			select {
+			case changes <- ir.Insert{Schema: "ks", Table: "t", Row: ir.Row{"id": int64(i)}}:
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	err := o.Run(context.Background(), changes)
+	close(done)
+
+	if err == nil {
+		t.Fatal("Run = nil on a target write failure; want the recorded error (the silent-stop bug)")
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("Run masked the target failure as context.Canceled (the bug); want %v", targetDown)
+	}
+	if !errors.Is(err, targetDown) {
+		t.Fatalf("Run = %v; want the recorded target failure %v", err, targetDown)
+	}
+}
+
+// TestLaneApply_Run_RetriableExhaustionNotMasked pins the same class for a
+// CLASSIFIED-retriable error that exhausts the in-lane retry budget (the live
+// shape — connection-refused is classified retriable by the real PG classifier):
+// once the lane gives up it records the error + cancels, and Run must still
+// surface it rather than the internal context.Canceled.
+func TestLaneApply_Run_RetriableExhaustionNotMasked(t *testing.T) {
+	commit := func(context.Context, []ir.Change) error { return errTxKiller } // always retriable, never succeeds
+	o := NewOrchestrator(Config{Lanes: 2, MaxBatchSize: 4}, &routingSeam{commit: commit})
+
+	changes := make(chan ir.Change)
+	done := make(chan struct{})
+	go func() {
+		for i := 0; ; i++ {
+			select {
+			case changes <- ir.Insert{Schema: "ks", Table: "t", Row: ir.Row{"id": int64(i)}}:
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	err := o.Run(context.Background(), changes)
+	close(done)
+
+	if err == nil || errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v; want the exhausted-retry error surfaced, not masked as a clean ctx cancel", err)
+	}
+	if !errors.Is(err, errTxKiller) {
+		t.Fatalf("Run = %v; want the recorded tx-killer error", err)
+	}
+}
+
+// TestLaneApply_Run_OuterCancelReturnsCtxCanceled is the negative pin: a genuine
+// OUTER cancel (operator stop) with no lane error must still return a ctx
+// cancellation, so the fix doesn't over-surface a clean operator stop as a
+// failure (which would spuriously restart it).
+func TestLaneApply_Run_OuterCancelReturnsCtxCanceled(t *testing.T) {
+	commit := func(context.Context, []ir.Change) error { return nil } // healthy applies
+	o := NewOrchestrator(Config{Lanes: 2, MaxBatchSize: 4}, &routingSeam{commit: commit})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	changes := make(chan ir.Change)
+	done := make(chan struct{})
+	go func() {
+		for i := 0; ; i++ {
+			select {
+			case changes <- ir.Insert{Schema: "ks", Table: "t", Row: ir.Row{"id": int64(i)}}:
+				if i == 5 {
+					cancel() // operator stop after a few healthy applies
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	err := o.Run(ctx, changes)
+	close(done)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("outer cancel: Run = %v; want context.Canceled (a clean operator stop, no recorded lane error)", err)
+	}
+}

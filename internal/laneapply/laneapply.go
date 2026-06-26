@@ -480,7 +480,20 @@ loop:
 		close(ch)
 	}
 	o.wg.Wait()
-	if e := o.getErr(); e != nil && loopErr == nil {
+	// The RECORDED error is the authoritative run error. A failing lane (or the
+	// coordinator) records the real error and THEN calls o.cancel(), so the
+	// coordinator loop frequently observes that internal abort as loopErr ==
+	// context.Canceled — and the dead lane stops draining, so the coordinator
+	// also blocks routing same-key changes and unblocks only via this same
+	// internal cancel. Preferring the recorded error over loopErr is therefore
+	// load-bearing: without it a real target-side apply failure (e.g.
+	// "connection refused") is masked as a clean context.Canceled, which the
+	// streamer/supervisor read as a graceful drain and PARK the sync (stopped,
+	// no restart, no last_error) on an uncommitted target outage. A genuine
+	// OUTER cancel (operator stop) records no lane error, so getErr() is nil and
+	// loopErr (ctx.Err) is returned unchanged. See the Run-level pins in
+	// lane_apply_test.go.
+	if e := o.getErr(); e != nil {
 		loopErr = e
 	}
 	if loopErr != nil {
