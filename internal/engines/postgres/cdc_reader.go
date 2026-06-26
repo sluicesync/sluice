@@ -231,11 +231,43 @@ func (r *CDCReader) SetSchemaForward(enabled bool) {
 // its first commit, the reader falls back to startLSN so the slot
 // stays alive on idle streams. See ADR-0020.
 //
+// The parameter is `any` so this satisfies the pipeline's engine-neutral
+// `lsnTrackerAttacher` interface (`AttachLSNTracker(any)`) — the streamer
+// fetches the opaque tracker via `lsnTrackerProvider.LSNTracker() any` and
+// hands it here without importing the engine's concrete type. A value that
+// isn't this engine's *lsnTracker (a cross-engine applier's feedback handle)
+// is ignored, falling back to streamed-LSN keepalives.
+//
+// LOAD-BEARING (ADR-0121 discovery): the previous signature took the concrete
+// `*lsnTracker`, which did NOT match the pipeline's `AttachLSNTracker(any)`
+// interface, so the streamer's type-assertion failed silently and the tracker
+// was NEVER attached on the cold-start / warm-resume paths — the keepalive
+// fell back to acking the STREAMED (decoded) LSN, letting confirmed_flush_lsn
+// advance past un-applied changes. With lockstep apply (streamed ≈ applied)
+// that was a near-zero loss window, but `--apply-delay` (ADR-0121) runs the
+// reader far ahead of the applier, turning it into active silent loss on a
+// crash mid-delay-window (held changes the slot already acked are not
+// re-sent on resume). The `any` signature is the documented intent; this
+// finally engages the ADR-0020 slot-ack-after-apply behaviour on the
+// streamer path. Concurrency-adjacent → CI `-race` integration gate.
+//
 // Must be called before [StreamChanges]; calling it on a running
 // reader is racy with the pump goroutine and will be ignored.
-func (r *CDCReader) AttachLSNTracker(t *lsnTracker) {
-	r.appliedLSN = t
+func (r *CDCReader) AttachLSNTracker(t any) {
+	lt, ok := t.(*lsnTracker)
+	if !ok {
+		return
+	}
+	r.appliedLSN = lt
 }
+
+// Compile-time pin of the pipeline's engine-neutral attacher contract
+// (pipeline.lsnTrackerAttacher = AttachLSNTracker(any)). The streamer wires the
+// applier's LSN tracker into the reader via THIS exact structural interface; a
+// drift back to a concrete-typed signature would make that type-assertion fail
+// silently again (ADR-0121) and re-disable slot-ack-after-apply. Keeping the
+// shape here fails the build instead.
+var _ interface{ AttachLSNTracker(any) } = (*CDCReader)(nil)
 
 // SetCDCDatabaseScope implements [ir.CDCDatabaseScoper] (ADR-0075 Phase
 // 2b). It switches the reader from its default single-schema view to a
