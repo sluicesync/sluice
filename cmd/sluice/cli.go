@@ -472,6 +472,7 @@ func labelEngine(e ir.Engine, id string) ir.Engine {
 // migration path and as a reporting/locality replication tool.
 type SyncCmd struct {
 	Start      SyncStartCmd         `cmd:"" help:"Start a continuous-sync stream from source to target."`
+	Run        SyncRunCmd           `cmd:"" help:"Supervise many syncs from one process (a fleet config); each failure-isolated with bounded-backoff restart (ADR-0122)."`
 	Status     SyncStatusCmd        `cmd:"" help:"Show status of a running sync stream."`
 	Stop       SyncStopCmd          `cmd:"" help:"Request a running sync stream to drain in-flight changes and exit cleanly."`
 	Health     SyncHealthCmd        `cmd:"" help:"Probe a running stream's freshness against operator-supplied thresholds; cron-friendly exit codes."`
@@ -1527,8 +1528,9 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 // scrolling. --summary prepends an aggregate header so a fleet of
 // streams is summarisable at a glance even before scanning rows.
 type SyncStatusCmd struct {
-	TargetDriver string        `help:"Target engine name (e.g. mysql, postgres). See 'sluice engines'." required:"" placeholder:"NAME" group:"target"`
-	Target       string        `help:"Target database DSN." required:"" env:"SLUICE_TARGET" placeholder:"DSN" group:"target"`
+	TargetDriver string        `help:"Target engine name (e.g. mysql, postgres). See 'sluice engines'. Not required with --all (the fleet config supplies every target)." placeholder:"NAME" group:"target"`
+	Target       string        `help:"Target database DSN. Not required with --all." env:"SLUICE_TARGET" placeholder:"DSN" group:"target"`
+	All          bool          `help:"Fleet view (ADR-0122): roll up the status of every stream across every target in the --config fleet into one table. Requires the global --config (a syncs.yaml fleet config)."`
 	StreamID     string        `help:"Filter to a specific stream id. When empty, every recorded stream is shown." placeholder:"ID"`
 	Format       string        `help:"Output format: 'text' (human-readable table, default) or 'json' (machine-readable, suitable for jq pipes)." default:"text" enum:"text,json"`
 	Watch        time.Duration `help:"Live-refresh mode: re-render every DURATION until interrupted. 0 (default) disables. Use --watch 2s for the typical operator polling cadence." placeholder:"DURATION"`
@@ -1536,13 +1538,40 @@ type SyncStatusCmd struct {
 }
 
 // Run implements `sluice sync status`.
-func (s *SyncStatusCmd) Run(_ *Globals) error {
+func (s *SyncStatusCmd) Run(g *Globals) error {
+	opts := statusRenderOpts{
+		Format:   s.Format,
+		Summary:  s.Summary,
+		StreamID: s.StreamID,
+	}
+	ctx := kongContext()
+
+	// Fleet view (ADR-0122 §6): aggregate every configured target.
+	if s.All {
+		if g.Config == "" {
+			return errors.New("--all requires --config (the syncs.yaml fleet config naming every target)")
+		}
+		fleet, err := loadFleetConfig(g.Config)
+		if err != nil {
+			return err
+		}
+		if err := fleet.validate(); err != nil {
+			return err
+		}
+		if s.Watch <= 0 {
+			return runStatusAllOnce(ctx, fleet, os.Stdout, opts)
+		}
+		return runStatusAllWatch(ctx, fleet, os.Stdout, opts, s.Watch)
+	}
+
+	if s.TargetDriver == "" || s.Target == "" {
+		return errors.New("--target-driver and --target are required (or use --all --config for a fleet view)")
+	}
 	target, err := resolveEngine(s.TargetDriver)
 	if err != nil {
 		return fmt.Errorf("--target-driver: %w", err)
 	}
 
-	ctx := kongContext()
 	applier, err := target.OpenChangeApplier(ctx, s.Target)
 	if err != nil {
 		return fmt.Errorf("open target applier: %w", err)
@@ -1552,12 +1581,6 @@ func (s *SyncStatusCmd) Run(_ *Globals) error {
 			_ = c.Close()
 		}
 	}()
-
-	opts := statusRenderOpts{
-		Format:   s.Format,
-		Summary:  s.Summary,
-		StreamID: s.StreamID,
-	}
 
 	// One-shot path (default).
 	if s.Watch <= 0 {
