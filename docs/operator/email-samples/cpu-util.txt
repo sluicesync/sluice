@@ -1,0 +1,18 @@
+Subject: [sluice] cpu_util threshold alert: analytics-replica
+
+[sluice] WARNING ALERT — target CPU saturating
+
+The cpu_util threshold was breached on stream analytics-replica.
+
+    0.88 >= 0.85 (threshold)
+
+  Metric:      cpu_util
+  Value:       0.88
+  Threshold:   0.85
+  Stream:      analytics-replica
+  Severity:    WARNING
+  Time (UTC):  2026-06-22T12:00:00Z
+
+Advisory alert from sluice. Notifications are failure-isolated — a delivery
+problem never affects the running sync. Re-fires are rate-limited per the
+configured cooldown until the metric recovers below its threshold.

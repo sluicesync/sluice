@@ -1,0 +1,18 @@
+Subject: [sluice] sync_lag_seconds threshold alert: prod-orders
+
+[sluice] CRITICAL ALERT — sync lag high (target falling behind source)
+
+The sync_lag_seconds threshold was breached on stream prod-orders.
+
+    312 >= 120 (threshold)
+
+  Metric:      sync_lag_seconds
+  Value:       312
+  Threshold:   120
+  Stream:      prod-orders
+  Severity:    CRITICAL
+  Time (UTC):  2026-06-22T12:00:00Z
+
+Advisory alert from sluice. Notifications are failure-isolated — a delivery
+problem never affects the running sync. Re-fires are rate-limited per the
+configured cooldown until the metric recovers below its threshold.

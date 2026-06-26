@@ -30,6 +30,7 @@ internal/translate
 internal/redact
 internal/crypto
 internal/config
+internal/notify
 "
 
 status=0

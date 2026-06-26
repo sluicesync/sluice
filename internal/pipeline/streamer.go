@@ -17,6 +17,7 @@ import (
 	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/notify"
 	"sluicesync.dev/sluice/internal/redact"
 )
 
@@ -454,6 +455,15 @@ type Streamer struct {
 	// sink, never on a bool defaulting true). Observability only —
 	// failure-isolated, never on the value path.
 	NotifySyncLagSeconds float64
+
+	// NotifySMTP is the optional email/SMTP sink (roadmap item 48), wired
+	// into the SAME alerter path as the webhook/Slack sinks so every
+	// threshold alert — the ADR-0107 rules AND the item-45 sync-lag rule —
+	// can be delivered by email. INERT unless [notify.SMTPConfig.Configured]
+	// (a non-empty Host), so the zero value is the safe off default for every
+	// construction. The password is supplied via env only (never the command
+	// line). Advisory + failure-isolated, never on the value path.
+	NotifySMTP notify.SMTPConfig
 
 	// MaxBufferBytes is the soft upper bound on per-batch buffered
 	// memory in the CDC applier (and, on the cold-start branch, the

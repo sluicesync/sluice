@@ -22,6 +22,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines/mysql"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/notify"
 	"sluicesync.dev/sluice/internal/pipeline"
 	pstelemetry "sluicesync.dev/sluice/internal/planetscale/telemetry"
 	"sluicesync.dev/sluice/internal/redact"
@@ -792,6 +793,21 @@ type SyncStartCmd struct {
 	NotifyCooldown            time.Duration `help:"Minimum interval between re-fires of a STILL-breached target-metrics alert (ADR-0107 item 36). A sustained breach reminds at most once per this interval rather than every poll. Default 15m." default:"15m" placeholder:"DUR"`
 	NotifySyncLagSeconds      float64       `help:"Alert when sluice's OWN sync lag — seconds the target trails the source's latest applied commit (sluice_sync_lag_seconds, roadmap item 45) — is at or above this value. 0 (default) disables. UNGATED from PlanetScale telemetry: works on MySQL and Postgres alike, needing only a --notify-webhook/--notify-slack sink (NOT --planetscale-org). Distinct from --notify-lag-seconds, which is the PlanetScale control-plane TARGET-INTERNAL replica lag. Edge-triggered + cooldown'd; advisory + failure-isolated." placeholder:"SECONDS"`
 
+	// Email / SMTP notification sink (roadmap item 48 — ADR-0107 amendment).
+	// Opt-in (inert unless --notify-smtp-host is set); the password is supplied
+	// via the env var SLUICE_NOTIFY_SMTP_PASSWORD only, never on the command
+	// line. Same advisory + failure-isolated semantics as the webhook/Slack
+	// sinks; delivers EVERY threshold alert (the ADR-0107 rules + the item-45
+	// sync-lag rule).
+	NotifySMTPHost     string   `help:"SMTP relay hostname to email threshold alerts through (roadmap item 48). Opt-in; the email sink is inert unless this is set. One sink covers every transactional provider (SendGrid/Mailgun/SES/Postmark are all SMTP) and self-hosted relays. Advisory — a dead relay is logged-and-swallowed, never affects the sync." placeholder:"HOST"`
+	NotifySMTPPort     int      `help:"SMTP relay port. Defaults per --notify-smtp-tls: 587 for starttls/none, 465 for implicit." placeholder:"PORT"`
+	NotifySMTPFrom     string   `help:"From address for alert emails (required when --notify-smtp-host is set)." placeholder:"ADDR"`
+	NotifySMTPTo       []string `help:"Recipient address for alert emails (repeatable for multiple recipients; required when --notify-smtp-host is set)." placeholder:"ADDR"`
+	NotifySMTPTLS      string   `help:"SMTP transport security: starttls (default, upgrade on port 587), implicit (TLS from connect, port 465), or none (cleartext — trusted local relay only)." default:"starttls" enum:"starttls,implicit,none" placeholder:"MODE"`
+	NotifySMTPAuth     string   `help:"SMTP authentication mechanism: none (default), plain, or login. plain/login require --notify-smtp-username and the SLUICE_NOTIFY_SMTP_PASSWORD env var." default:"none" enum:"none,plain,login" placeholder:"MECH"`
+	NotifySMTPUsername string   `help:"SMTP auth username (e.g. 'apikey' for SendGrid). Required for --notify-smtp-auth=plain|login." placeholder:"USER"`
+	NotifySMTPPassword string   `help:"SMTP auth secret. Set via the env var SLUICE_NOTIFY_SMTP_PASSWORD ONLY — never pass it on the command line; masked in all logging." env:"SLUICE_NOTIFY_SMTP_PASSWORD" placeholder:"SECRET"`
+
 	HeartbeatInterval time.Duration `help:"Wall-clock cadence the per-stream heartbeat goroutine logs an INFO 'stream: heartbeat' line at. GitHub #23 Phase A: distinguishes silent-stall (process alive but no apply, no log) from wedge (process alive, no heartbeat either). 0 disables." default:"60s" placeholder:"DUR"`
 
 	PollInterval time.Duration `help:"Override the CDC reader's poll cadence for poll-based engines (today: postgres-trigger; default 1s). Push-based engines (postgres pgoutput, mysql binlog, planetscale VStream) silently ignore — they have no poll loop. Operators chasing lower CDC latency on a write-heavy postgres-trigger stream tighten this to e.g. 250ms; operators trading latency for source load loosen to 5s. 0 (the default) keeps the engine's built-in cadence. ADR-0066 §6; roadmap item 18(c)." placeholder:"DUR"`
@@ -1149,6 +1165,23 @@ func (s *SyncStartCmd) validateFlagCombos() error {
 	return nil
 }
 
+// smtpConfig assembles the [notify.SMTPConfig] for the email sink (roadmap
+// item 48) from the --notify-smtp-* flags + the env-only password. The TLS
+// and auth modes are kong enum-validated, so the cast is safe; an empty Host
+// leaves the config unconfigured (the sink stays inert).
+func (s *SyncStartCmd) smtpConfig() notify.SMTPConfig {
+	return notify.SMTPConfig{
+		Host:     s.NotifySMTPHost,
+		Port:     s.NotifySMTPPort,
+		From:     s.NotifySMTPFrom,
+		To:       s.NotifySMTPTo,
+		Username: s.NotifySMTPUsername,
+		Password: s.NotifySMTPPassword,
+		TLS:      notify.TLSMode(s.NotifySMTPTLS),
+		Auth:     notify.SMTPAuth(s.NotifySMTPAuth),
+	}
+}
+
 //nolint:funlen // ratchet: pre-existing 212-line accretion; split when next touched (hold-the-line note in .golangci.yml)
 func (s *SyncStartCmd) Run(g *Globals) error {
 	cfg, err := config.Load(g.Config)
@@ -1188,6 +1221,12 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 
 	if len(s.IncludeTable) > 0 && len(s.ExcludeTable) > 0 {
 		return errors.New("--include-table and --exclude-table are mutually exclusive")
+	}
+
+	// roadmap item 48: refuse a half-configured email sink loudly (naming the
+	// missing field) rather than silently dropping every alert at send time.
+	if err := s.smtpConfig().Validate(); err != nil {
+		return err
 	}
 	if len(s.IncludeView) > 0 && len(s.ExcludeView) > 0 {
 		return errors.New("--include-view and --exclude-view are mutually exclusive")
@@ -1402,8 +1441,10 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		NotifyStorageGrowthPerMin: s.NotifyStorageGrowthPerMin,
 		NotifyCooldown:            s.NotifyCooldown,
 		NotifySyncLagSeconds:      s.NotifySyncLagSeconds,
-		HeartbeatInterval:         s.HeartbeatInterval,
-		PollInterval:              s.PollInterval,
+		// roadmap item 48: email/SMTP sink (inert unless --notify-smtp-host).
+		NotifySMTP:        s.smtpConfig(),
+		HeartbeatInterval: s.HeartbeatInterval,
+		PollInterval:      s.PollInterval,
 
 		SourceHeartbeatInterval:    s.SourceHeartbeatInterval,
 		SourceHeartbeatPruneWindow: s.SourceHeartbeatPruneWindow,

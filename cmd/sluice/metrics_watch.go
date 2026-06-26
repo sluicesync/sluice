@@ -8,6 +8,7 @@ import (
 	"os"
 	"time"
 
+	"sluicesync.dev/sluice/internal/notify"
 	"sluicesync.dev/sluice/internal/pipeline"
 )
 
@@ -46,6 +47,17 @@ type MetricsWatchCmd struct {
 	NotifyWebhook string `help:"Generic webhook URL to POST threshold alerts to as JSON. Opt-in; only fires when at least one --notify-* threshold is set. ADVISORY — a dead sink is logged-and-swallowed. A credential (set via the env var)." env:"SLUICE_NOTIFY_WEBHOOK" placeholder:"URL"`
 	NotifySlack   string `help:"Slack incoming-webhook URL to POST threshold alerts to. Same gating + advisory + failure-isolated semantics as --notify-webhook. A credential (set via the env var)." env:"SLUICE_NOTIFY_SLACK" placeholder:"URL"`
 
+	// Email / SMTP sink (roadmap item 48) — identical to the sync-path flags.
+	// Opt-in (inert unless --notify-smtp-host); password via env only.
+	NotifySMTPHost     string   `help:"SMTP relay hostname to email threshold alerts through (roadmap item 48). Opt-in; the email sink is inert unless this is set. Advisory + failure-isolated." placeholder:"HOST"`
+	NotifySMTPPort     int      `help:"SMTP relay port. Defaults per --notify-smtp-tls: 587 for starttls/none, 465 for implicit." placeholder:"PORT"`
+	NotifySMTPFrom     string   `help:"From address for alert emails (required when --notify-smtp-host is set)." placeholder:"ADDR"`
+	NotifySMTPTo       []string `help:"Recipient address for alert emails (repeatable; required when --notify-smtp-host is set)." placeholder:"ADDR"`
+	NotifySMTPTLS      string   `help:"SMTP transport security: starttls (default), implicit, or none." default:"starttls" enum:"starttls,implicit,none" placeholder:"MODE"`
+	NotifySMTPAuth     string   `help:"SMTP authentication mechanism: none (default), plain, or login." default:"none" enum:"none,plain,login" placeholder:"MECH"`
+	NotifySMTPUsername string   `help:"SMTP auth username. Required for --notify-smtp-auth=plain|login." placeholder:"USER"`
+	NotifySMTPPassword string   `help:"SMTP auth secret. Set via the env var SLUICE_NOTIFY_SMTP_PASSWORD ONLY — never on the command line." env:"SLUICE_NOTIFY_SMTP_PASSWORD" placeholder:"SECRET"`
+
 	NotifyStorageUtil         float64 `help:"Alert when storage utilisation (used/capacity, 0-1) is at or above this fraction. 0 (default) disables. Edge-triggered + cooldown'd. Requires a --notify-webhook/--notify-slack sink to deliver." placeholder:"FRAC"`
 	NotifyCPUUtil             float64 `help:"Alert when CPU utilisation (0-1) is at or above this fraction. 0 disables." placeholder:"FRAC"`
 	NotifyMemUtil             float64 `help:"Alert when memory utilisation (0-1) is at or above this fraction. 0 disables." placeholder:"FRAC"`
@@ -60,10 +72,29 @@ type MetricsWatchCmd struct {
 	MetricsListen string        `help:"Also serve a Prometheus /metrics endpoint at this address (e.g. ':9090') re-exporting the watched database's CPU/mem/storage/lag as the sluice_target_* gauge family (+ sluice_build_info + Go-runtime), turning the daemon into a standalone PlanetScale-metrics exporter. Off by default; ignored with --once." placeholder:"ADDR"`
 }
 
+// smtpConfig assembles the [notify.SMTPConfig] email sink (roadmap item 48)
+// from the --notify-smtp-* flags + the env-only password. TLS/auth are kong
+// enum-validated; an empty Host leaves the sink inert.
+func (m *MetricsWatchCmd) smtpConfig() notify.SMTPConfig {
+	return notify.SMTPConfig{
+		Host:     m.NotifySMTPHost,
+		Port:     m.NotifySMTPPort,
+		From:     m.NotifySMTPFrom,
+		To:       m.NotifySMTPTo,
+		Username: m.NotifySMTPUsername,
+		Password: m.NotifySMTPPassword,
+		TLS:      notify.TLSMode(m.NotifySMTPTLS),
+		Auth:     notify.SMTPAuth(m.NotifySMTPAuth),
+	}
+}
+
 // Run implements `sluice metrics-watch`.
 func (m *MetricsWatchCmd) Run(_ *Globals) error {
 	if _, err := resolveEngine(m.Engine); err != nil {
 		return operationalError{err: fmt.Errorf("--engine: %w", err)}
+	}
+	if err := m.smtpConfig().Validate(); err != nil {
+		return operationalError{err: err}
 	}
 
 	ctx := kongContext()
@@ -93,6 +124,7 @@ func (m *MetricsWatchCmd) Run(_ *Globals) error {
 		Cooldown:            m.NotifyCooldown,
 		WebhookURL:          m.NotifyWebhook,
 		SlackWebhookURL:     m.NotifySlack,
+		SMTP:                m.smtpConfig(),
 		Interval:            m.Interval,
 		Label:               "metrics-watch:" + m.PlanetScaleMetricsDB,
 		Once:                m.Once,

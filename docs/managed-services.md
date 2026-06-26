@@ -249,12 +249,18 @@ sluice sync start \
   coordinates the cold-copy grow-gate.
 - **Threshold alerts** (`--notify-*`) — edge-triggered, cooldown'd
   (`--notify-cooldown`, default 15m), hysteresis-armed alerts to a
-  generic webhook (`SLUICE_NOTIFY_WEBHOOK`) or Slack
-  (`SLUICE_NOTIFY_SLACK` / `--notify-slack`). Rules:
-  `--notify-storage-util` / `-cpu-util` / `-mem-util` (fractions 0–1),
-  `--notify-lag-seconds`, and the rate-of-change
-  `--notify-storage-growth-per-min`. Advisory and failure-isolated — a
-  dead sink is logged and swallowed; an unobserved metric never fires.
+  generic webhook (`SLUICE_NOTIFY_WEBHOOK`), Slack
+  (`SLUICE_NOTIFY_SLACK` / `--notify-slack`), or email/SMTP
+  (`--notify-smtp-host` / `-port` / `-from` / `-to`, TLS mode
+  `--notify-smtp-tls` = starttls|implicit|none, auth
+  `--notify-smtp-auth` = none|plain|login + `--notify-smtp-username`,
+  password via `SLUICE_NOTIFY_SMTP_PASSWORD` only). One SMTP sink covers
+  every transactional provider (SendGrid/Mailgun/SES/Postmark) and
+  self-hosted relays. Rules: `--notify-storage-util` / `-cpu-util` /
+  `-mem-util` (fractions 0–1), `--notify-lag-seconds`, and the
+  rate-of-change `--notify-storage-growth-per-min`. Advisory and
+  failure-isolated — a dead sink is logged and swallowed; an unobserved
+  metric never fires.
 - **Metrics history** — when telemetry is configured, sluice persists a
   rolling history (current / 1m / 5m / 10m) to a
   `sluice_target_metrics_history` table on the target (7-day retention),

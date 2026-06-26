@@ -152,26 +152,29 @@ func buildMetricsNotifyRulesFrom(storageUtil, cpuUtil, memUtil, lagSeconds, stor
 }
 
 // buildMetricsNotifier assembles the [notify.Notifier] from the configured
-// sink URLs: a generic webhook and/or a Slack incoming webhook. Returns a
-// TRUE nil interface when no sink URL is set (NOT a typed-nil
+// sinks: a generic webhook, a Slack incoming webhook, and/or an SMTP relay.
+// Returns a TRUE nil interface when no sink is set (NOT a typed-nil
 // MultiNotifier), so startTargetMetricsNotifier's `notifier == nil` guard
 // stays exact — assigning a nil MultiNotifier straight into the interface
 // would yield a non-nil interface and a wrong "notifier configured" verdict.
 func (s *Streamer) buildMetricsNotifier() notify.Notifier {
-	return buildMetricsNotifierFrom(s.NotifyWebhookURL, s.NotifySlackWebhookURL)
+	return buildMetricsNotifierFrom(s.NotifyWebhookURL, s.NotifySlackWebhookURL, s.NotifySMTP)
 }
 
 // buildMetricsNotifierFrom assembles the [notify.Notifier] from the configured
-// sink URLs — shared by the sync alerter and the `sluice metrics-watch` daemon.
-// Returns a TRUE nil interface when no sink URL is set (NOT a typed-nil
+// sinks — shared by the sync alerter and the `sluice metrics-watch` daemon.
+// Returns a TRUE nil interface when no sink is set (NOT a typed-nil
 // MultiNotifier), so a `notifier == nil` guard stays exact at every call site.
-func buildMetricsNotifierFrom(webhookURL, slackWebhookURL string) notify.Notifier {
+func buildMetricsNotifierFrom(webhookURL, slackWebhookURL string, smtp notify.SMTPConfig) notify.Notifier {
 	var sinks []notify.Notifier
 	if webhookURL != "" {
 		sinks = append(sinks, &notify.WebhookNotifier{URL: webhookURL})
 	}
 	if slackWebhookURL != "" {
 		sinks = append(sinks, &notify.SlackNotifier{WebhookURL: slackWebhookURL})
+	}
+	if sink := notify.NewSMTPNotifier(smtp); sink != nil {
+		sinks = append(sinks, sink)
 	}
 	m := notify.NewMultiNotifier(sinks...)
 	if m == nil {

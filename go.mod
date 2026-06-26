@@ -32,6 +32,7 @@ require (
 	github.com/testcontainers/testcontainers-go/modules/mysql v0.43.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.43.0
 	github.com/vmihailenco/msgpack/v5 v5.4.1
+	github.com/wneessen/go-mail v0.7.3
 	gocloud.dev v0.46.0
 	golang.org/x/crypto v0.53.0
 	golang.org/x/sync v0.21.0

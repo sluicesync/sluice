@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>storage_util threshold alert</title>
+</head>
+<body style="margin:0; padding:0; background-color:#f4f5f7; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; color:#1f2328;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#f4f5f7; padding:24px 0;">
+<tr><td align="center">
+<table role="presentation" width="520" cellpadding="0" cellspacing="0" style="max-width:520px; width:100%; background-color:#ffffff; border-radius:10px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+<tr>
+<td style="background-color:#b3261e; padding:18px 28px;">
+<div style="font-size:12px; font-weight:700; letter-spacing:0.12em; color:#ffffff; opacity:0.85;">SLUICE &middot; CRITICAL ALERT</div>
+<div style="font-size:20px; font-weight:700; color:#ffffff; margin-top:4px;">target storage approaching capacity</div>
+</td>
+</tr>
+<tr>
+<td style="padding:28px;">
+<div style="font-size:15px; line-height:1.5; color:#3a3f45;">
+The <strong>storage_util</strong> threshold was breached on stream
+<strong>prod-orders</strong>.
+</div>
+<div style="margin:22px 0; padding:16px 18px; background-color:#f7f8fa; border-left:4px solid #b3261e; border-radius:4px;">
+<span style="font-size:26px; font-weight:700; color:#b3261e;">0.91</span>
+<span style="font-size:15px; color:#6a737d;"> &ge; 0.9 (threshold)</span>
+</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:14px; color:#3a3f45; border-collapse:collapse;">
+<tr><td style="padding:6px 0; color:#6a737d; width:130px;">Metric</td><td style="padding:6px 0; font-weight:600;">storage_util</td></tr>
+<tr><td style="padding:6px 0; color:#6a737d;">Value</td><td style="padding:6px 0; font-weight:600;">0.91</td></tr>
+<tr><td style="padding:6px 0; color:#6a737d;">Threshold</td><td style="padding:6px 0; font-weight:600;">0.9</td></tr>
+<tr><td style="padding:6px 0; color:#6a737d;">Stream</td><td style="padding:6px 0; font-weight:600;">prod-orders</td></tr>
+<tr><td style="padding:6px 0; color:#6a737d;">Severity</td><td style="padding:6px 0; font-weight:600;">CRITICAL</td></tr>
+<tr><td style="padding:6px 0; color:#6a737d;">Time (UTC)</td><td style="padding:6px 0; font-weight:600;">2026-06-22T12:00:00Z</td></tr>
+</table>
+</td>
+</tr>
+<tr>
+<td style="padding:16px 28px; background-color:#fafbfc; border-top:1px solid #eaecef; font-size:12px; line-height:1.5; color:#8a929b;">
+Advisory alert from sluice. Notifications are failure-isolated &mdash; a delivery
+problem never affects the running sync. Re-fires are rate-limited per the
+configured cooldown until the metric recovers below its threshold.
+</td>
+</tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>

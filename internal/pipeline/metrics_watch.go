@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/notify"
 )
 
 // Standalone target-metrics WATCH loop — the engine behind the
@@ -59,6 +60,11 @@ type MetricsWatchConfig struct {
 	// Notify sinks. Empty ⇒ no alert delivery (watch-only).
 	WebhookURL      string
 	SlackWebhookURL string
+
+	// SMTP is the optional email sink (roadmap item 48). Inert unless
+	// configured (a non-empty Host). Same advisory + failure-isolated
+	// semantics as the webhook/Slack sinks.
+	SMTP notify.SMTPConfig
 
 	// Interval is the poll/print cadence. 0 ⇒ telemetryPollInterval (60s,
 	// matching the PlanetScale metrics granularity — polling faster only
@@ -122,7 +128,7 @@ func RunMetricsWatch(ctx context.Context, provider ir.TargetTelemetry, cfg Metri
 	}
 
 	rules := buildMetricsNotifyRulesFrom(cfg.StorageUtil, cfg.CPUUtil, cfg.MemUtil, cfg.LagSeconds, cfg.StorageGrowthPerMin)
-	notifier := buildMetricsNotifierFrom(cfg.WebhookURL, cfg.SlackWebhookURL)
+	notifier := buildMetricsNotifierFrom(cfg.WebhookURL, cfg.SlackWebhookURL, cfg.SMTP)
 	logger := slog.Default()
 	state := newMetricsNotifyState()
 	alerting := notifier != nil && len(rules) > 0

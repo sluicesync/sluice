@@ -296,7 +296,7 @@ jobs:
             packages: "./internal/engines/mysql/..."
             goflags: ""
           - name: engines-postgres-and-rest
-            packages: "./internal/engines/postgres/... ./internal/engines/pgtrigger/... ./internal/ir/... ./internal/translate/... ./internal/redact/... ./internal/crypto/... ./internal/config/..."
+            packages: "./internal/engines/postgres/... ./internal/engines/pgtrigger/... ./internal/ir/... ./internal/translate/... ./internal/redact/... ./internal/crypto/... ./internal/config/... ./internal/notify/..."
             goflags: ""
     steps:
       - uses: actions/checkout@v7
