@@ -6,6 +6,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -18,15 +19,20 @@ import (
 // SchemaReader reads schema metadata from a SQLite file via sqlite_master
 // and the table-introspection PRAGMAs. It implements [ir.SchemaReader].
 //
-// Scope (prototype):
+// Scope:
 //   - User tables (sqlite_master type='table', excluding sqlite_* internal
-//     tables), their columns, primary key, foreign keys, and plain-column
-//     secondary/unique indexes.
+//     tables), their columns, primary key, foreign keys, and secondary/unique
+//     indexes (plain-column AND expression/partial — ADR-0133).
 //   - Column IR types resolved from declared-type affinity (see types.go).
+//   - Generated columns, CHECK constraints, and partial/expression indexes are
+//     carried into the IR's existing fields, tagged dialect "sqlite". Their
+//     expression bodies are carried VERBATIM (parsed from the CREATE TABLE /
+//     CREATE INDEX SQL) and emit verbatim on the target; non-portable
+//     constructs are rejected loudly at target DDL time. Cross-dialect
+//     TRANSLATION of the verbatim tail is the deferred next increment.
 //
-// Out of scope (deferred): CHECK constraints, generated columns,
-// expression indexes, partial-index predicates, triggers, views, and any
-// date/bool convention policy.
+// Out of scope (deferred): triggers, views, and a SQLite→canonical expression
+// translator.
 type SchemaReader struct {
 	db   *sql.DB
 	path string
@@ -73,9 +79,18 @@ func (r *SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 	byName := make(map[string]*ir.Table, len(names))
 	for _, name := range names {
 		t := &ir.Table{Name: name}
-		if err := r.readColumnsAndPK(ctx, t); err != nil {
+		genStored, err := r.readColumnsAndPK(ctx, t)
+		if err != nil {
 			return nil, err
 		}
+		// Generated-column bodies and CHECK constraints live only in the
+		// CREATE TABLE SQL (no PRAGMA exposes them); parse it once per table
+		// to populate the IR's existing fields (ADR-0133).
+		createSQL, err := r.objectSQL(ctx, "table", name)
+		if err != nil {
+			return nil, err
+		}
+		applyGeneratedAndChecks(ctx, t, createSQL, genStored)
 		if err := r.readIndexes(ctx, t); err != nil {
 			return nil, err
 		}
@@ -131,21 +146,29 @@ func (r *SchemaReader) tableNames(ctx context.Context) ([]string, error) {
 }
 
 // readColumnsAndPK populates t.Columns (with affinity-resolved IR types,
-// nullability, and defaults) and t.PrimaryKey from PRAGMA table_info.
-func (r *SchemaReader) readColumnsAndPK(ctx context.Context, t *ir.Table) error {
-	rows, err := r.db.QueryContext(ctx, "PRAGMA table_info("+quotePragmaArg(t.Name)+")")
+// nullability, and defaults) and t.PrimaryKey from PRAGMA table_xinfo.
+//
+// table_xinfo is table_info plus a trailing `hidden` column: 0 = ordinary,
+// 1 = hidden (virtual-table columns table_info omits), 2 = VIRTUAL generated,
+// 3 = STORED generated. We skip hidden==1 so the visible-column set stays
+// byte-identical to the pre-ADR-0133 table_info read, and return a
+// name→stored map for the generated columns (hidden 2/3) so ReadSchema can fill
+// their generation expressions from the CREATE TABLE SQL.
+func (r *SchemaReader) readColumnsAndPK(ctx context.Context, t *ir.Table) (map[string]bool, error) {
+	rows, err := r.db.QueryContext(ctx, "PRAGMA table_xinfo("+quotePragmaArg(t.Name)+")")
 	if err != nil {
-		return fmt.Errorf("sqlite: table_info(%q): %w", t.Name, err)
+		return nil, fmt.Errorf("sqlite: table_xinfo(%q): %w", t.Name, err)
 	}
 	defer func() { _ = rows.Close() }()
 
 	// pkMember collects (pk-position, column-name) so the PK columns can be
-	// emitted in the order SQLite records (table_info.pk is 1-based).
+	// emitted in the order SQLite records (table_xinfo.pk is 1-based).
 	type pkEntry struct {
 		pos  int
 		name string
 	}
 	var pkEntries []pkEntry
+	genStored := map[string]bool{}
 
 	for rows.Next() {
 		var (
@@ -155,9 +178,13 @@ func (r *SchemaReader) readColumnsAndPK(ctx context.Context, t *ir.Table) error 
 			notNull   int
 			dfltValue sql.NullString
 			pk        int
+			hidden    int
 		)
-		if err := rows.Scan(&cid, &name, &declType, &notNull, &dfltValue, &pk); err != nil {
-			return fmt.Errorf("sqlite: scan table_info(%q): %w", t.Name, err)
+		if err := rows.Scan(&cid, &name, &declType, &notNull, &dfltValue, &pk, &hidden); err != nil {
+			return nil, fmt.Errorf("sqlite: scan table_xinfo(%q): %w", t.Name, err)
+		}
+		if hidden == 1 {
+			continue // virtual-table hidden column; not part of the visible set
 		}
 		col := &ir.Column{
 			Name:     name,
@@ -165,16 +192,19 @@ func (r *SchemaReader) readColumnsAndPK(ctx context.Context, t *ir.Table) error 
 			Nullable: notNull == 0,
 			Default:  parseDefault(dfltValue),
 		}
+		if hidden == 2 || hidden == 3 {
+			genStored[name] = hidden == 3 // 3 = STORED, 2 = VIRTUAL
+		}
 		if pk > 0 {
 			pkEntries = append(pkEntries, pkEntry{pos: pk, name: name})
 		}
 		t.Columns = append(t.Columns, col)
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("sqlite: iterate table_info(%q): %w", t.Name, err)
+		return nil, fmt.Errorf("sqlite: iterate table_xinfo(%q): %w", t.Name, err)
 	}
 	if len(t.Columns) == 0 {
-		return fmt.Errorf("sqlite: table %q has no columns", t.Name)
+		return nil, fmt.Errorf("sqlite: table %q has no columns", t.Name)
 	}
 
 	if len(pkEntries) > 0 {
@@ -196,7 +226,26 @@ func (r *SchemaReader) readColumnsAndPK(ctx context.Context, t *ir.Table) error 
 			markRowidAutoIncrement(t, pkEntries[0].name)
 		}
 	}
-	return nil
+	return genStored, nil
+}
+
+// objectSQL returns the verbatim `sql` text sqlite_master records for the named
+// object (objType is "table" or "index"). The CREATE TABLE / CREATE INDEX text
+// is the only place generated-column, CHECK, partial-predicate, and
+// expression-index bodies live (no PRAGMA exposes them). A missing or NULL `sql`
+// (e.g. an auto-index from a UNIQUE constraint) returns "" with no error — such
+// objects carry none of these features.
+func (r *SchemaReader) objectSQL(ctx context.Context, objType, name string) (string, error) {
+	var s sql.NullString
+	err := r.db.QueryRowContext(ctx,
+		"SELECT sql FROM sqlite_master WHERE type = ? AND name = ?", objType, name).Scan(&s)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("sqlite: read %s SQL for %q: %w", objType, name, err)
+	}
+	return s.String, nil
 }
 
 // markRowidAutoIncrement flips Integer.AutoIncrement on the named column
@@ -215,11 +264,12 @@ func markRowidAutoIncrement(t *ir.Table, colName string) {
 }
 
 // readIndexes populates t.Indexes from PRAGMA index_list / index_info.
-// The primary-key index (origin 'pk') is skipped — the PK is captured
-// from table_info. Expression-index entries (a NULL column name in
-// index_info) cause the whole index to be skipped in the prototype: it
-// is a performance structure, never a data-fidelity concern, and carrying
-// a partial column list would misrepresent it.
+// The primary-key index (origin 'pk') is skipped — the PK is captured from
+// table_xinfo. Expression-index entries (a NULL column name in index_info) now
+// carry their indexed expression (parsed from the CREATE INDEX SQL, tagged
+// "sqlite") rather than being dropped; a partial index carries its WHERE
+// predicate too (ADR-0133). An expression index whose column list can't be
+// cleanly parsed is WARN-skipped rather than carrying a guessed column set.
 func (r *SchemaReader) readIndexes(ctx context.Context, t *ir.Table) error {
 	metas, err := r.indexListMetas(ctx, t.Name)
 	if err != nil {
@@ -227,29 +277,61 @@ func (r *SchemaReader) readIndexes(ctx context.Context, t *ir.Table) error {
 	}
 	for _, m := range metas {
 		if m.origin == "pk" {
-			continue // captured from table_info
+			continue // captured from table_xinfo
 		}
-		cols, ok, err := r.readIndexColumns(ctx, m.name)
+		entries, err := r.readIndexColumns(ctx, m.name)
 		if err != nil {
 			return err
 		}
-		if !ok {
-			continue // expression index — skipped in the prototype
+		// The CREATE INDEX SQL is needed only for an expression index or a
+		// partial index; an ordinary plain-column index reads from index_info
+		// alone (byte-identical to the pre-ADR-0133 reader).
+		var createSQL string
+		if m.partial || hasExprEntry(entries) {
+			if createSQL, err = r.objectSQL(ctx, "index", m.name); err != nil {
+				return err
+			}
 		}
-		t.Indexes = append(t.Indexes, &ir.Index{
+		cols, exprCount, ok := buildIndexColumns(ctx, t.Name, m.name, entries, createSQL)
+		if !ok {
+			continue // expression index that couldn't be parsed — WARN-skipped
+		}
+		idx := &ir.Index{
 			Name:    m.name,
 			Columns: cols,
 			Unique:  m.unique,
-		})
+		}
+		hasPred := false
+		if m.partial {
+			if pred, pok := extractIndexPredicate(createSQL); pok {
+				idx.Predicate = pred
+				idx.PredicateDialect = sqliteDialect
+				hasPred = true
+			}
+		}
+		warnIndexVerbatim(ctx, t.Name, m.name, hasPred, exprCount)
+		t.Indexes = append(t.Indexes, idx)
 	}
 	return nil
 }
 
+// hasExprEntry reports whether any index_info entry is an expression (NULL
+// column name), so the caller knows whether the CREATE INDEX SQL is needed.
+func hasExprEntry(entries []indexInfoEntry) bool {
+	for _, e := range entries {
+		if e.isExpr {
+			return true
+		}
+	}
+	return false
+}
+
 // idxMeta is one PRAGMA index_list row sluice cares about.
 type idxMeta struct {
-	name   string
-	unique bool
-	origin string // 'c' (CREATE INDEX), 'u' (UNIQUE constraint), 'pk' (PRIMARY KEY)
+	name    string
+	unique  bool
+	origin  string // 'c' (CREATE INDEX), 'u' (UNIQUE constraint), 'pk' (PRIMARY KEY)
+	partial bool   // index_list.partial = 1 → has a WHERE predicate
 }
 
 // indexListMetas reads PRAGMA index_list for one table. Split out so the
@@ -273,7 +355,7 @@ func (r *SchemaReader) indexListMetas(ctx context.Context, table string) ([]idxM
 		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
 			return nil, fmt.Errorf("sqlite: scan index_list(%q): %w", table, err)
 		}
-		metas = append(metas, idxMeta{name: name, unique: unique == 1, origin: origin})
+		metas = append(metas, idxMeta{name: name, unique: unique == 1, origin: origin, partial: partial == 1})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("sqlite: iterate index_list(%q): %w", table, err)
@@ -281,16 +363,17 @@ func (r *SchemaReader) indexListMetas(ctx context.Context, table string) ([]idxM
 	return metas, nil
 }
 
-// readIndexColumns returns the plain-column entries of one index, in
-// position order. ok is false when the index has any expression entry
-// (NULL column name) so the caller can skip it.
-func (r *SchemaReader) readIndexColumns(ctx context.Context, indexName string) (cols []ir.IndexColumn, ok bool, err error) {
+// readIndexColumns returns the index_info entries of one index in position
+// order. An entry whose column name is NULL is an expression entry (isExpr
+// true); its expression text lives in the CREATE INDEX SQL.
+func (r *SchemaReader) readIndexColumns(ctx context.Context, indexName string) ([]indexInfoEntry, error) {
 	rows, err := r.db.QueryContext(ctx, "PRAGMA index_info("+quotePragmaArg(indexName)+")")
 	if err != nil {
-		return nil, false, fmt.Errorf("sqlite: index_info(%q): %w", indexName, err)
+		return nil, fmt.Errorf("sqlite: index_info(%q): %w", indexName, err)
 	}
 	defer func() { _ = rows.Close() }()
 
+	var entries []indexInfoEntry
 	for rows.Next() {
 		var (
 			seqno int
@@ -298,17 +381,14 @@ func (r *SchemaReader) readIndexColumns(ctx context.Context, indexName string) (
 			name  sql.NullString
 		)
 		if err := rows.Scan(&seqno, &cid, &name); err != nil {
-			return nil, false, fmt.Errorf("sqlite: scan index_info(%q): %w", indexName, err)
+			return nil, fmt.Errorf("sqlite: scan index_info(%q): %w", indexName, err)
 		}
-		if !name.Valid {
-			return nil, false, nil // expression entry — skip whole index
-		}
-		cols = append(cols, ir.IndexColumn{Column: name.String})
+		entries = append(entries, indexInfoEntry{name: name.String, isExpr: !name.Valid})
 	}
 	if err := rows.Err(); err != nil {
-		return nil, false, fmt.Errorf("sqlite: iterate index_info(%q): %w", indexName, err)
+		return nil, fmt.Errorf("sqlite: iterate index_info(%q): %w", indexName, err)
 	}
-	return cols, true, nil
+	return entries, nil
 }
 
 // readForeignKeys populates t.ForeignKeys from PRAGMA foreign_key_list.

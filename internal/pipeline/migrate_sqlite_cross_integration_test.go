@@ -596,3 +596,191 @@ func asBool(t *testing.T, v any) bool {
 		return false
 	}
 }
+
+// seedSQLiteFeatures writes a temp SQLite file exercising the ADR-0133 carry: a
+// STORED generated column with a portable expression (qty*price), a portable
+// named table CHECK, and a partial index (WHERE active=1). Returns the path.
+func seedSQLiteFeatures(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "features.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open sqlite seed: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	stmts := []string{
+		`CREATE TABLE line_items (
+			id     INTEGER PRIMARY KEY,
+			qty    INTEGER NOT NULL,
+			price  INTEGER NOT NULL,
+			total  INTEGER GENERATED ALWAYS AS (qty * price) STORED,
+			active INTEGER NOT NULL DEFAULT 1,
+			CONSTRAINT qty_nonneg CHECK (qty >= 0)
+		)`,
+		`INSERT INTO line_items (id, qty, price, active) VALUES (1, 2, 10, 1), (2, 3, 5, 0)`,
+		`CREATE INDEX line_items_active_idx ON line_items(price) WHERE active = 1`,
+	}
+	for _, s := range stmts {
+		if _, err := db.ExecContext(context.Background(), s); err != nil {
+			t.Fatalf("seed exec: %v", err)
+		}
+	}
+	return path
+}
+
+// TestMigrate_SQLiteFeaturesToPostgres pins the ADR-0133 cross-engine carry into
+// Postgres: the STORED generated column lands as a REAL generated column (the
+// target re-derives it), its values are exact, the CHECK is ENFORCED on the
+// target (a violating insert is rejected), and the partial index keeps its
+// predicate. All four prove the feature carried, not silently dropped.
+func TestMigrate_SQLiteFeaturesToPostgres(t *testing.T) {
+	src := seedSQLiteFeatures(t)
+	_, pgTarget, pgCleanup := startPostgres(t)
+	defer pgCleanup()
+
+	sqliteEng, _ := engines.Get("sqlite")
+	pgEng, _ := engines.Get("postgres")
+	mig := &Migrator{Source: sqliteEng, Target: pgEng, SourceDSN: src, TargetDSN: pgTarget}
+	if err := mig.Run(ctx2min(t)); err != nil {
+		t.Fatalf("Migrator.Run (SQLite features→PG): %v", err)
+	}
+
+	db, err := sql.Open("pgx", pgTarget)
+	if err != nil {
+		t.Fatalf("open pg: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx := ctx2min(t)
+
+	// 1. total is a REAL generated column (re-derived), not a plain column.
+	var isGen string
+	if err := db.QueryRowContext(ctx,
+		`SELECT is_generated FROM information_schema.columns
+		 WHERE table_name = 'line_items' AND column_name = 'total'`).Scan(&isGen); err != nil {
+		t.Fatalf("query is_generated: %v", err)
+	}
+	if isGen != "ALWAYS" {
+		t.Errorf("line_items.total is_generated = %q; want ALWAYS (it must land as a GENERATED column)", isGen)
+	}
+
+	// 2. Generated values exact + row count exact.
+	var n int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM line_items`).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("row count = %d; want 2", n)
+	}
+	var t1, t2 int
+	if err := db.QueryRowContext(ctx, `SELECT total FROM line_items WHERE id = 1`).Scan(&t1); err != nil {
+		t.Fatalf("select total id=1: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT total FROM line_items WHERE id = 2`).Scan(&t2); err != nil {
+		t.Fatalf("select total id=2: %v", err)
+	}
+	if t1 != 20 || t2 != 15 {
+		t.Errorf("totals = (%d, %d); want (20, 15) (re-derived qty*price)", t1, t2)
+	}
+
+	// 3. CHECK enforced: a qty < 0 row is rejected on the target.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO line_items (id, qty, price, active) VALUES (99, -1, 1, 1)`); err == nil {
+		t.Error("INSERT violating CHECK (qty >= 0) succeeded; want a rejection (CHECK must have carried)")
+	}
+
+	// 4. Partial index present WITH its predicate.
+	var indexdef string
+	if err := db.QueryRowContext(ctx,
+		`SELECT indexdef FROM pg_indexes WHERE tablename = 'line_items' AND indexdef ILIKE '%WHERE%'`).Scan(&indexdef); err != nil {
+		t.Fatalf("query partial index def (none found?): %v", err)
+	}
+	if !strings.Contains(strings.ToUpper(indexdef), "WHERE") {
+		t.Errorf("partial index def = %q; want a WHERE predicate", indexdef)
+	}
+}
+
+// TestMigrate_SQLiteFeaturesToMySQL is the MySQL half (generated + CHECK): the
+// STORED generated column re-derives on MySQL and the CHECK is enforced.
+func TestMigrate_SQLiteFeaturesToMySQL(t *testing.T) {
+	src := seedSQLiteFeatures(t)
+	_, myTarget, myCleanup := startMySQL(t)
+	defer myCleanup()
+
+	sqliteEng, _ := engines.Get("sqlite")
+	myEng, _ := engines.Get("mysql")
+	mig := &Migrator{Source: sqliteEng, Target: myEng, SourceDSN: src, TargetDSN: myTarget}
+	if err := mig.Run(ctx2min(t)); err != nil {
+		t.Fatalf("Migrator.Run (SQLite features→MySQL): %v", err)
+	}
+
+	db, err := sql.Open("mysql", myTarget)
+	if err != nil {
+		t.Fatalf("open mysql: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx := ctx2min(t)
+
+	// total re-derives on MySQL.
+	var t1 int
+	if err := db.QueryRowContext(ctx, `SELECT total FROM line_items WHERE id = 1`).Scan(&t1); err != nil {
+		t.Fatalf("select total: %v", err)
+	}
+	if t1 != 20 {
+		t.Errorf("total id=1 = %d; want 20 (re-derived qty*price)", t1)
+	}
+	// is generated per information_schema.
+	var extra string
+	if err := db.QueryRowContext(ctx,
+		`SELECT extra FROM information_schema.columns
+		 WHERE table_name = 'line_items' AND column_name = 'total'`).Scan(&extra); err != nil {
+		t.Fatalf("query extra: %v", err)
+	}
+	if !strings.Contains(strings.ToUpper(extra), "GENERATED") {
+		t.Errorf("line_items.total extra = %q; want it to mark a GENERATED column", extra)
+	}
+	// CHECK enforced (MySQL 8.0.16+).
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO line_items (id, qty, price, active) VALUES (99, -1, 1, 1)`); err == nil {
+		t.Error("INSERT violating CHECK (qty >= 0) succeeded on MySQL; want a rejection")
+	}
+}
+
+// TestMigrate_SQLiteNonPortableGeneratedToPostgres pins the loud-rejection edge:
+// a generated column using a SQLite-only function (strftime) is carried VERBATIM
+// and the target CREATE fails LOUDLY (naming the rejected function) — NOT a
+// silent drop or silent mistranslation.
+func TestMigrate_SQLiteNonPortableGeneratedToPostgres(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nonportable.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open sqlite seed: %v", err)
+	}
+	stmts := []string{
+		`CREATE TABLE evt (
+			id  INTEGER PRIMARY KEY,
+			ts  TEXT NOT NULL,
+			day TEXT GENERATED ALWAYS AS (strftime('%Y-%m-%d', ts)) STORED
+		)`,
+		`INSERT INTO evt (id, ts) VALUES (1, '2024-01-02 03:04:05')`,
+	}
+	for _, s := range stmts {
+		if _, err := db.ExecContext(context.Background(), s); err != nil {
+			t.Fatalf("seed exec: %v", err)
+		}
+	}
+	_ = db.Close()
+
+	_, pgTarget, pgCleanup := startPostgres(t)
+	defer pgCleanup()
+	sqliteEng, _ := engines.Get("sqlite")
+	pgEng, _ := engines.Get("postgres")
+	mig := &Migrator{Source: sqliteEng, Target: pgEng, SourceDSN: path, TargetDSN: pgTarget}
+
+	err = mig.Run(ctx2min(t))
+	if err == nil {
+		t.Fatal("Migrator.Run succeeded; want a LOUD target rejection of the non-portable strftime() generated column")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "strftime") {
+		t.Errorf("error = %v; want it to name the rejected strftime() (carried verbatim, target-rejected)", err)
+	}
+}

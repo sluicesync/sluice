@@ -454,23 +454,27 @@ func TestD1SchemaReader_ReadSchema(t *testing.T) {
 	var tableListSQL string
 	client := startMockD1(t, func(sql string, _ []string) (int, []byte) {
 		switch {
+		case strings.Contains(sql, "SELECT sql FROM sqlite_master"):
+			// objectSQL probe for generated/CHECK bodies (ADR-0133). These
+			// tables carry none, so a NULL sql row is the faithful response.
+			return http.StatusOK, d1OK([]map[string]any{{"sql": nil}})
 		case strings.Contains(sql, "FROM sqlite_master"):
 			tableListSQL = sql
 			return http.StatusOK, d1OK([]map[string]any{
 				{"name": "orders"}, {"name": "users"},
 			})
-		case strings.Contains(sql, "table_info('users')"):
+		case strings.Contains(sql, "table_xinfo('users')"):
 			return http.StatusOK, d1OK([]map[string]any{
-				{"cid": 0, "name": "id", "type": "INTEGER", "notnull": 1, "dflt_value": nil, "pk": 1},
-				{"cid": 1, "name": "name", "type": "TEXT", "notnull": 0, "dflt_value": nil, "pk": 0},
-				{"cid": 2, "name": "created_at", "type": "DATETIME", "notnull": 0, "dflt_value": nil, "pk": 0},
-				{"cid": 3, "name": "active", "type": "BOOLEAN", "notnull": 0, "dflt_value": "1", "pk": 0},
+				{"cid": 0, "name": "id", "type": "INTEGER", "notnull": 1, "dflt_value": nil, "pk": 1, "hidden": 0},
+				{"cid": 1, "name": "name", "type": "TEXT", "notnull": 0, "dflt_value": nil, "pk": 0, "hidden": 0},
+				{"cid": 2, "name": "created_at", "type": "DATETIME", "notnull": 0, "dflt_value": nil, "pk": 0, "hidden": 0},
+				{"cid": 3, "name": "active", "type": "BOOLEAN", "notnull": 0, "dflt_value": "1", "pk": 0, "hidden": 0},
 			})
-		case strings.Contains(sql, "table_info('orders')"):
+		case strings.Contains(sql, "table_xinfo('orders')"):
 			return http.StatusOK, d1OK([]map[string]any{
-				{"cid": 0, "name": "id", "type": "INTEGER", "notnull": 1, "dflt_value": nil, "pk": 1},
-				{"cid": 1, "name": "user_id", "type": "INTEGER", "notnull": 1, "dflt_value": nil, "pk": 0},
-				{"cid": 2, "name": "total", "type": "REAL", "notnull": 0, "dflt_value": nil, "pk": 0},
+				{"cid": 0, "name": "id", "type": "INTEGER", "notnull": 1, "dflt_value": nil, "pk": 1, "hidden": 0},
+				{"cid": 1, "name": "user_id", "type": "INTEGER", "notnull": 1, "dflt_value": nil, "pk": 0, "hidden": 0},
+				{"cid": 2, "name": "total", "type": "REAL", "notnull": 0, "dflt_value": nil, "pk": 0, "hidden": 0},
 			})
 		case strings.Contains(sql, "foreign_key_list('orders')"):
 			return http.StatusOK, d1OK([]map[string]any{
@@ -529,6 +533,92 @@ func TestD1SchemaReader_ReadSchema(t *testing.T) {
 	if fk.ReferencedTable != "users" || len(fk.Columns) != 1 || fk.Columns[0] != "user_id" ||
 		len(fk.ReferencedColumns) != 1 || fk.ReferencedColumns[0] != "id" || fk.OnDelete != ir.FKActionCascade {
 		t.Errorf("orders FK = %#v; want user_id → users.id ON DELETE CASCADE", fk)
+	}
+}
+
+// TestD1SchemaReader_SchemaFeatures pins the ADR-0133 carry over the HTTP
+// transport: the d1 reader fetches table_xinfo (with the hidden flag), the
+// CREATE TABLE / CREATE INDEX `sql`, and index_list.partial, then runs the SAME
+// shared parse helpers the file engine uses — so a generated column, a CHECK
+// constraint, a partial-index predicate, and an expression index all carry.
+func TestD1SchemaReader_SchemaFeatures(t *testing.T) {
+	const createCalc = `CREATE TABLE calc (` +
+		`base INTEGER PRIMARY KEY, ` +
+		`name TEXT, ` +
+		`dbl INTEGER AS (base * 2) STORED, ` +
+		`active INTEGER NOT NULL DEFAULT 0, ` +
+		`CONSTRAINT positive_base CHECK (base > 0))`
+	const createActiveIdx = `CREATE INDEX calc_active_idx ON calc(name) WHERE active = 1`
+	const createLnameIdx = `CREATE INDEX calc_lname_idx ON calc(lower(name))`
+
+	client := startMockD1(t, func(sql string, params []string) (int, []byte) {
+		switch {
+		case strings.Contains(sql, "SELECT sql FROM sqlite_master"):
+			// objectSQL binds [objType, name] as params, not in the SQL text.
+			switch params[1] {
+			case "calc_active_idx":
+				return http.StatusOK, d1OK([]map[string]any{{"sql": createActiveIdx}})
+			case "calc_lname_idx":
+				return http.StatusOK, d1OK([]map[string]any{{"sql": createLnameIdx}})
+			default:
+				return http.StatusOK, d1OK([]map[string]any{{"sql": createCalc}})
+			}
+		case strings.Contains(sql, "FROM sqlite_master"):
+			return http.StatusOK, d1OK([]map[string]any{{"name": "calc"}})
+		case strings.Contains(sql, "table_xinfo('calc')"):
+			return http.StatusOK, d1OK([]map[string]any{
+				{"cid": 0, "name": "base", "type": "INTEGER", "notnull": 1, "dflt_value": nil, "pk": 1, "hidden": 0},
+				{"cid": 1, "name": "name", "type": "TEXT", "notnull": 0, "dflt_value": nil, "pk": 0, "hidden": 0},
+				{"cid": 2, "name": "dbl", "type": "INTEGER", "notnull": 0, "dflt_value": nil, "pk": 0, "hidden": 3},
+				{"cid": 3, "name": "active", "type": "INTEGER", "notnull": 1, "dflt_value": "0", "pk": 0, "hidden": 0},
+			})
+		case strings.Contains(sql, "index_list('calc')"):
+			return http.StatusOK, d1OK([]map[string]any{
+				{"seq": 0, "name": "calc_lname_idx", "unique": 0, "origin": "c", "partial": 0},
+				{"seq": 1, "name": "calc_active_idx", "unique": 0, "origin": "c", "partial": 1},
+			})
+		case strings.Contains(sql, "index_info('calc_active_idx')"):
+			return http.StatusOK, d1OK([]map[string]any{
+				{"seqno": 0, "cid": 1, "name": "name"},
+			})
+		case strings.Contains(sql, "index_info('calc_lname_idx')"):
+			// Expression entry: NULL column name.
+			return http.StatusOK, d1OK([]map[string]any{
+				{"seqno": 0, "cid": -2, "name": nil},
+			})
+		case strings.Contains(sql, "foreign_key_list"):
+			return http.StatusOK, d1OK(nil)
+		default:
+			return http.StatusOK, d1OK(nil)
+		}
+	})
+	r := &D1SchemaReader{client: client}
+
+	sch, err := r.ReadSchema(context.Background())
+	if err != nil {
+		t.Fatalf("ReadSchema: %v", err)
+	}
+	calc := sch.Tables[0]
+	if calc.Name != "calc" {
+		t.Fatalf("table[0] = %q; want calc", calc.Name)
+	}
+
+	dbl := columnByName(calc, "dbl")
+	if dbl == nil || dbl.GeneratedExpr != "base * 2" || !dbl.GeneratedStored || dbl.GeneratedExprDialect != "sqlite" {
+		t.Errorf("dbl generated = %#v; want {base * 2, stored, sqlite}", dbl)
+	}
+	if len(calc.CheckConstraints) != 1 || calc.CheckConstraints[0].Name != "positive_base" ||
+		calc.CheckConstraints[0].Expr != "base > 0" || calc.CheckConstraints[0].ExprDialect != "sqlite" {
+		t.Errorf("CheckConstraints = %#v; want [{positive_base, base > 0, sqlite}]", calc.CheckConstraints)
+	}
+	active := indexByName(calc, "calc_active_idx")
+	if active == nil || active.Predicate != "active = 1" || active.PredicateDialect != "sqlite" {
+		t.Errorf("calc_active_idx = %#v; want predicate {active = 1, sqlite}", active)
+	}
+	lname := indexByName(calc, "calc_lname_idx")
+	if lname == nil || len(lname.Columns) != 1 || lname.Columns[0].Expression != "lower(name)" ||
+		lname.Columns[0].ExpressionDialect != "sqlite" {
+		t.Errorf("calc_lname_idx = %#v; want expression {lower(name), sqlite}", lname)
 	}
 }
 

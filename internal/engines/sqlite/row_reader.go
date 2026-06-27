@@ -97,7 +97,12 @@ func (r *RowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.Ro
 	r.mu.Unlock()
 
 	hasRowid := r.tableHasRowid(ctx, table.Name)
-	query := buildSelect(table, hasRowid)
+	// Generated columns are NOT selected: their values are re-derived by the
+	// target's GENERATED clause (ADR-0133), so the row stream omits them — the
+	// same filtering the PG/MySQL readers apply, kept in lockstep with the
+	// writers' nonGeneratedColumns INSERT list.
+	cols := nonGeneratedColumns(table.Columns)
+	query := buildSelect(cols, table.Name, hasRowid)
 	// rowserrcheck/sqlclosecheck can't follow rows into the streaming
 	// goroutine; both rows.Err() and rows.Close() are handled inside
 	// stream() (Close via defer, Err checked once iteration ends).
@@ -107,17 +112,34 @@ func (r *RowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.Ro
 	}
 
 	out := make(chan ir.Row, rowChanBuffer)
-	go r.stream(ctx, rows, table, hasRowid, out)
+	go r.stream(ctx, rows, table.Name, cols, hasRowid, out)
 	return out, nil
 }
 
+// nonGeneratedColumns returns the columns whose values are physically stored
+// and must be copied — i.e. every column that is NOT a generated column. The
+// target re-derives generated columns from their GENERATED clause, so emitting
+// their (source-computed) values would both be wasted and, on a target that
+// declares them GENERATED, be rejected by an INSERT into a generated column.
+func nonGeneratedColumns(cols []*ir.Column) []*ir.Column {
+	out := make([]*ir.Column, 0, len(cols))
+	for _, c := range cols {
+		if c.IsGenerated() {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
 // stream scans rows and pushes decoded IR Rows onto out. It owns rows
-// (closes it) and out (closes it before returning).
-func (r *RowReader) stream(ctx context.Context, rows *sql.Rows, table *ir.Table, hasRowid bool, out chan<- ir.Row) {
+// (closes it) and out (closes it before returning). cols is the projected
+// (non-generated) column set, in SELECT order; tableName is carried only for
+// error messages.
+func (r *RowReader) stream(ctx context.Context, rows *sql.Rows, tableName string, cols []*ir.Column, hasRowid bool, out chan<- ir.Row) {
 	defer close(out)
 	defer func() { _ = rows.Close() }()
 
-	cols := table.Columns
 	// scanBuf layout: [rowid?] + one slot per column, all scanned as *any
 	// so modernc hands back each value's native storage-class Go type.
 	width := len(cols)
@@ -140,7 +162,7 @@ func (r *RowReader) stream(ctx context.Context, rows *sql.Rows, table *ir.Table,
 	for rows.Next() {
 		ordinal++
 		if err := rows.Scan(scanPtrs...); err != nil {
-			r.setErr(fmt.Errorf("sqlite: table %q: scan: %w", table.Name, err))
+			r.setErr(fmt.Errorf("sqlite: table %q: scan: %w", tableName, err))
 			return
 		}
 
@@ -160,7 +182,7 @@ func (r *RowReader) stream(ctx context.Context, rows *sql.Rows, table *ir.Table,
 			v, err := decodeCell(raw, col.Type, enc)
 			if err != nil {
 				r.setErr(fmt.Errorf("sqlite: table %q column %q rowid %d: %w",
-					table.Name, col.Name, rowID, err))
+					tableName, col.Name, rowID, err))
 				return
 			}
 			row[col.Name] = v
@@ -175,7 +197,7 @@ func (r *RowReader) stream(ctx context.Context, rows *sql.Rows, table *ir.Table,
 	}
 
 	if err := rows.Err(); err != nil {
-		r.setErr(fmt.Errorf("sqlite: table %q: rows iteration: %w", table.Name, err))
+		r.setErr(fmt.Errorf("sqlite: table %q: rows iteration: %w", tableName, err))
 	}
 }
 
@@ -193,19 +215,19 @@ func (r *RowReader) tableHasRowid(ctx context.Context, table string) bool {
 	return err == nil || errors.Is(err, sql.ErrNoRows)
 }
 
-// buildSelect produces a SELECT over every column of table in declaration
-// order, optionally prefixed with rowid. Identifiers are double-quoted
-// with embedded quotes doubled. Temporal columns are wrapped by
+// buildSelect produces a SELECT over the given (non-generated) columns in
+// declaration order, optionally prefixed with rowid. Identifiers are
+// double-quoted with embedded quotes doubled. Temporal columns are wrapped by
 // [selectColumnExpr] so the driver hands back their RAW storage class.
-func buildSelect(table *ir.Table, hasRowid bool) string {
-	parts := make([]string, 0, len(table.Columns)+1)
+func buildSelect(cols []*ir.Column, tableName string, hasRowid bool) string {
+	parts := make([]string, 0, len(cols)+1)
 	if hasRowid {
 		parts = append(parts, "rowid")
 	}
-	for _, c := range table.Columns {
+	for _, c := range cols {
 		parts = append(parts, selectColumnExpr(c))
 	}
-	return "SELECT " + strings.Join(parts, ", ") + " FROM " + quoteIdent(table.Name)
+	return "SELECT " + strings.Join(parts, ", ") + " FROM " + quoteIdent(tableName)
 }
 
 // selectColumnExpr renders the SELECT expression for one column. A column

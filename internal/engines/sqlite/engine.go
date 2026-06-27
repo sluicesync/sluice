@@ -194,16 +194,16 @@ func (Engine) OpenSnapshotStream(context.Context, string) (*ir.SnapshotStream, e
 // read-only migrate source: no CDC, no bulk-load target, no extension
 // types. SchemaScope is flat (SQLite has a single table namespace per
 // database file). JSON is stored as TEXT (no distinct type) and is read
-// by affinity, so JSONSupport is None. CHECK constraints, generated
-// columns, and partitioning are not read by the prototype reader and so
-// are declared false rather than over-promising.
+// by affinity, so JSONSupport is None. CHECK constraints and generated
+// columns ARE read and carried (ADR-0133), so both are declared true;
+// partitioning has no SQLite equivalent and stays false.
 var capabilities = ir.Capabilities{
 	BulkLoad:                 ir.BulkLoadNone,
 	CDC:                      ir.CDCNone,
 	SchemaScope:              ir.SchemaScopeFlat,
 	SupportedTypes:           ir.NewTypeSet(), // no extension types
-	SupportsCheckConstraint:  false,
-	SupportsGeneratedColumns: false,
+	SupportsCheckConstraint:  true,
+	SupportsGeneratedColumns: true,
 	SupportsPartitioning:     false,
 	EnumSupport:              ir.EnumNone,
 	JSONSupport:              ir.JSONNone,

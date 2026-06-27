@@ -1284,12 +1284,14 @@ func emitCheckConstraint(c *ir.CheckConstraint) (string, error) {
 // An empty / matching dialect tag emits verbatim — same behaviour as
 // before the translation layer landed.
 func translateGeneratedExpr(c *ir.Column) string {
-	if c.GeneratedExprDialect == "" || c.GeneratedExprDialect == dialectName {
-		// Same-dialect (or untagged) body: emitted verbatim, but the
-		// read boundary stripped backtick identifier quotes for IR
-		// portability. Re-quote any bare token that is a MySQL
-		// reserved word so a column named `order` / `key` doesn't
-		// break the target parser (catalog #5).
+	// Translate ONLY from the one engine this writer's translator accepts
+	// (Postgres); self / untagged / SQLite / any unknown dialect emits
+	// verbatim (ADR-0133 §2). "Verbatim" here still applies the read-boundary
+	// reserved-word re-quote (identifier-quoting normalization, NOT
+	// translation): the source reader stripped quotes for IR portability, so a
+	// column named `order` / `key` needs them back or the MySQL parser breaks
+	// (catalog #5).
+	if c.GeneratedExprDialect != translatableSourceDialect {
 		return requoteMySQLReservedIdents(c.GeneratedExpr)
 	}
 	return requoteMySQLReservedIdents(translateExprForMySQL(c.GeneratedExpr))
@@ -1299,7 +1301,10 @@ func translateGeneratedExpr(c *ir.Column) string {
 // applying the cross-dialect translation pass when the IR's dialect
 // tag indicates a different source dialect.
 func translateCheckExpr(c *ir.CheckConstraint) string {
-	if c.ExprDialect == "" || c.ExprDialect == dialectName {
+	// Translate ONLY from the one engine this writer's translator accepts
+	// (Postgres); self / untagged / SQLite / any unknown dialect emits verbatim
+	// (modulo the read-boundary reserved-word re-quote) — ADR-0133 §2.
+	if c.ExprDialect != translatableSourceDialect {
 		return requoteMySQLReservedIdents(c.Expr)
 	}
 	return requoteMySQLReservedIdents(translateExprForMySQL(c.Expr))
@@ -1322,7 +1327,10 @@ func translateCheckExpr(c *ir.CheckConstraint) string {
 // MySQL spelling instead of emitting verbatim and failing on the
 // target).
 func translateIndexExpr(c ir.IndexColumn) string {
-	if c.ExpressionDialect == "" || c.ExpressionDialect == dialectName {
+	// Translate ONLY from the one engine this writer's translator accepts
+	// (Postgres); self / untagged / SQLite / any unknown dialect emits verbatim
+	// (modulo the read-boundary reserved-word re-quote) — ADR-0133 §2.
+	if c.ExpressionDialect != translatableSourceDialect {
 		return requoteMySQLReservedIdents(c.Expression)
 	}
 	return requoteMySQLReservedIdents(translateExprForMySQL(c.Expression))

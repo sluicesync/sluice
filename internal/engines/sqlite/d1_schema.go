@@ -46,9 +46,18 @@ func (r *D1SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 	byName := make(map[string]*ir.Table, len(names))
 	for _, name := range names {
 		t := &ir.Table{Name: name}
-		if err := r.readColumnsAndPK(ctx, t); err != nil {
+		genStored, err := r.readColumnsAndPK(ctx, t)
+		if err != nil {
 			return nil, err
 		}
+		// Generated-column bodies + CHECK constraints live only in the CREATE
+		// TABLE SQL — fetched here over HTTP, parsed by the SAME shared helpers
+		// the file engine uses (ADR-0133).
+		createSQL, err := r.objectSQL(ctx, "table", name)
+		if err != nil {
+			return nil, err
+		}
+		applyGeneratedAndChecks(ctx, t, createSQL, genStored)
 		if err := r.readIndexes(ctx, t); err != nil {
 			return nil, err
 		}
@@ -94,12 +103,16 @@ func (r *D1SchemaReader) tableNames(ctx context.Context) ([]string, error) {
 }
 
 // readColumnsAndPK populates t.Columns (affinity-resolved IR types, nullability,
-// defaults) and t.PrimaryKey from PRAGMA table_info, reusing the file engine's
-// [resolveColumnType] / [parseDefault] / [markRowidAutoIncrement].
-func (r *D1SchemaReader) readColumnsAndPK(ctx context.Context, t *ir.Table) error {
-	rows, err := r.client.queryRows(ctx, "PRAGMA table_info("+quotePragmaArg(t.Name)+")")
+// defaults) and t.PrimaryKey from PRAGMA table_xinfo, reusing the file engine's
+// [resolveColumnType] / [parseDefault] / [markRowidAutoIncrement]. The `hidden`
+// column (table_xinfo superset of table_info) identifies generated columns
+// (2 = VIRTUAL, 3 = STORED) and hidden virtual-table columns (1, skipped) —
+// the SAME rules as the file engine; the returned name→stored map drives the
+// shared generated-column carry (ADR-0133).
+func (r *D1SchemaReader) readColumnsAndPK(ctx context.Context, t *ir.Table) (map[string]bool, error) {
+	rows, err := r.client.queryRows(ctx, "PRAGMA table_xinfo("+quotePragmaArg(t.Name)+")")
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	type pkEntry struct {
@@ -107,27 +120,35 @@ func (r *D1SchemaReader) readColumnsAndPK(ctx context.Context, t *ir.Table) erro
 		name string
 	}
 	var pkEntries []pkEntry
+	genStored := map[string]bool{}
 
 	for _, row := range rows {
 		name, err := rowString(row, "name")
 		if err != nil {
-			return err
+			return nil, err
 		}
 		declType, _, err := rowNullString(row, "type")
 		if err != nil {
-			return err
+			return nil, err
 		}
 		notNull, err := rowInt(row, "notnull")
 		if err != nil {
-			return err
+			return nil, err
 		}
 		pk, err := rowInt(row, "pk")
 		if err != nil {
-			return err
+			return nil, err
+		}
+		hidden, err := rowInt(row, "hidden")
+		if err != nil {
+			return nil, err
 		}
 		dfltVal, dfltOK, err := rowNullString(row, "dflt_value")
 		if err != nil {
-			return err
+			return nil, err
+		}
+		if hidden == 1 {
+			continue // virtual-table hidden column; not part of the visible set
 		}
 		col := &ir.Column{
 			Name:     name,
@@ -135,13 +156,16 @@ func (r *D1SchemaReader) readColumnsAndPK(ctx context.Context, t *ir.Table) erro
 			Nullable: notNull == 0,
 			Default:  parseDefault(sql.NullString{String: dfltVal, Valid: dfltOK}),
 		}
+		if hidden == 2 || hidden == 3 {
+			genStored[name] = hidden == 3 // 3 = STORED, 2 = VIRTUAL
+		}
 		if pk > 0 {
 			pkEntries = append(pkEntries, pkEntry{pos: int(pk), name: name})
 		}
 		t.Columns = append(t.Columns, col)
 	}
 	if len(t.Columns) == 0 {
-		return fmt.Errorf("d1: table %q has no columns", t.Name)
+		return nil, fmt.Errorf("d1: table %q has no columns", t.Name)
 	}
 
 	if len(pkEntries) > 0 {
@@ -159,13 +183,34 @@ func (r *D1SchemaReader) readColumnsAndPK(ctx context.Context, t *ir.Table) erro
 			markRowidAutoIncrement(t, pkEntries[0].name)
 		}
 	}
-	return nil
+	return genStored, nil
+}
+
+// objectSQL returns the verbatim `sql` text sqlite_master records for the named
+// object (objType "table"/"index") over HTTP — the same query the file engine
+// runs locally. A missing/NULL `sql` (e.g. a UNIQUE-constraint auto-index)
+// returns "" with no error.
+func (r *D1SchemaReader) objectSQL(ctx context.Context, objType, name string) (string, error) {
+	rows, err := r.client.queryRows(ctx,
+		"SELECT sql FROM sqlite_master WHERE type = ? AND name = ?", objType, name)
+	if err != nil {
+		return "", err
+	}
+	if len(rows) == 0 {
+		return "", nil
+	}
+	s, _, err := rowNullString(rows[0], "sql")
+	if err != nil {
+		return "", err
+	}
+	return s, nil
 }
 
 // readIndexes populates t.Indexes from PRAGMA index_list / index_info. The PK
-// index (origin 'pk') is skipped (captured from table_info); an expression
-// index (a NULL index_info column name) is skipped — identical scope to the
-// file engine.
+// index (origin 'pk') is skipped (captured from table_xinfo); expression and
+// partial indexes carry their expression/predicate (parsed from the CREATE
+// INDEX SQL, tagged "sqlite") — identical behaviour to the file engine via the
+// shared [buildIndexColumns] / [extractIndexPredicate] helpers (ADR-0133).
 func (r *D1SchemaReader) readIndexes(ctx context.Context, t *ir.Table) error {
 	listRows, err := r.client.queryRows(ctx, "PRAGMA index_list("+quotePragmaArg(t.Name)+")")
 	if err != nil {
@@ -187,41 +232,60 @@ func (r *D1SchemaReader) readIndexes(ctx context.Context, t *ir.Table) error {
 		if err != nil {
 			return err
 		}
-		cols, ok, err := r.readIndexColumns(ctx, name)
+		partial, err := rowInt(row, "partial")
 		if err != nil {
 			return err
 		}
-		if !ok {
-			continue // expression index — skipped
+		entries, err := r.readIndexColumns(ctx, name)
+		if err != nil {
+			return err
 		}
-		t.Indexes = append(t.Indexes, &ir.Index{
+		var createSQL string
+		if partial == 1 || hasExprEntry(entries) {
+			if createSQL, err = r.objectSQL(ctx, "index", name); err != nil {
+				return err
+			}
+		}
+		cols, exprCount, ok := buildIndexColumns(ctx, t.Name, name, entries, createSQL)
+		if !ok {
+			continue // expression index that couldn't be parsed — WARN-skipped
+		}
+		idx := &ir.Index{
 			Name:    name,
 			Columns: cols,
 			Unique:  unique == 1,
-		})
+		}
+		hasPred := false
+		if partial == 1 {
+			if pred, pok := extractIndexPredicate(createSQL); pok {
+				idx.Predicate = pred
+				idx.PredicateDialect = sqliteDialect
+				hasPred = true
+			}
+		}
+		warnIndexVerbatim(ctx, t.Name, name, hasPred, exprCount)
+		t.Indexes = append(t.Indexes, idx)
 	}
 	return nil
 }
 
-// readIndexColumns returns the plain-column entries of one index in position
-// order. ok is false when the index has any expression entry (NULL column
-// name), so the caller skips it — mirrors the file engine.
-func (r *D1SchemaReader) readIndexColumns(ctx context.Context, indexName string) (cols []ir.IndexColumn, ok bool, err error) {
+// readIndexColumns returns the index_info entries of one index in position
+// order; an entry with a NULL column name is an expression entry (isExpr) whose
+// text lives in the CREATE INDEX SQL — mirrors the file engine.
+func (r *D1SchemaReader) readIndexColumns(ctx context.Context, indexName string) ([]indexInfoEntry, error) {
 	rows, err := r.client.queryRows(ctx, "PRAGMA index_info("+quotePragmaArg(indexName)+")")
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
+	var entries []indexInfoEntry
 	for _, row := range rows {
 		name, present, err := rowNullString(row, "name")
 		if err != nil {
-			return nil, false, err
+			return nil, err
 		}
-		if !present {
-			return nil, false, nil // expression entry — skip whole index
-		}
-		cols = append(cols, ir.IndexColumn{Column: name})
+		entries = append(entries, indexInfoEntry{name: name, isExpr: !present})
 	}
-	return cols, true, nil
+	return entries, nil
 }
 
 // readForeignKeys populates t.ForeignKeys from PRAGMA foreign_key_list, grouping

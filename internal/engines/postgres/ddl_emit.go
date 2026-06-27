@@ -1194,7 +1194,10 @@ func emitIndexColumnList(cols []ir.IndexColumn, opts emitOpts) string {
 // cases. If a bool-context-aware index emit is needed later, the
 // caller can build [ExprContext] and route through this helper.
 func translateIndexExpr(c ir.IndexColumn, opts emitOpts) string {
-	if c.ExpressionDialect == "" || c.ExpressionDialect == dialectName {
+	// Translate ONLY from the one engine this writer's translator accepts
+	// (MySQL); self / untagged / SQLite / any unknown dialect emits verbatim
+	// (ADR-0133 §2).
+	if c.ExpressionDialect != translatableSourceDialect {
 		return c.Expression
 	}
 	// Cross-dialect index expression: re-quote PG reserved-word column
@@ -1288,7 +1291,10 @@ func emitCreateIndex(schema, tableName string, idx *ir.Index, opts emitOpts) (st
 // a MySQL-source predicate is rewritten and PG-reserved idents the
 // source reader de-quoted are re-quoted.
 func translateIndexPredicate(idx *ir.Index, opts emitOpts) string {
-	if idx.PredicateDialect == "" || idx.PredicateDialect == dialectName {
+	// Translate ONLY from the one engine this writer's translator accepts
+	// (MySQL); self / untagged / SQLite / any unknown dialect emits verbatim
+	// (ADR-0133 §2). A SQLite partial-index predicate carries through here.
+	if idx.PredicateDialect != translatableSourceDialect {
 		return idx.Predicate
 	}
 	return requotePGReservedIdents(
@@ -1438,7 +1444,10 @@ func emitCheckConstraint(c *ir.CheckConstraint, tbl *ir.Table, opts emitOpts) (s
 // typed generated columns whose body returns bool get the bool side
 // cast to int, instead of converting the int literal to bool.
 func translateGeneratedExpr(c *ir.Column, tbl *ir.Table, opts emitOpts) string {
-	if c.GeneratedExprDialect == "" || c.GeneratedExprDialect == dialectName {
+	// Translate ONLY from the one engine this writer's translator accepts
+	// (MySQL); self / untagged / SQLite / any unknown dialect emits verbatim
+	// (ADR-0133 §2).
+	if c.GeneratedExprDialect != translatableSourceDialect {
 		return c.GeneratedExpr
 	}
 	ctx := exprContextForTable(tbl)
@@ -1463,7 +1472,10 @@ func translateGeneratedExpr(c *ir.Column, tbl *ir.Table, opts emitOpts) string {
 // column context for the v0.8.0 bool-idiom rewrite; nil is permitted
 // and disables that rewrite.
 func translateCheckExpr(c *ir.CheckConstraint, tbl *ir.Table, opts emitOpts) string {
-	if c.ExprDialect == "" || c.ExprDialect == dialectName {
+	// Translate ONLY from the one engine this writer's translator accepts
+	// (MySQL); self / untagged / SQLite / any unknown dialect emits verbatim
+	// (ADR-0133 §2).
+	if c.ExprDialect != translatableSourceDialect {
 		return c.Expr
 	}
 	ctx := exprContextForTable(tbl)

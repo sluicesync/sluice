@@ -119,10 +119,25 @@ integers > 2^53 and for offline imports — it is simple and exact for those. Us
 `--source-driver d1` when the database has large integers (snowflake IDs, nanosecond
 timestamps, large counters); it is the only path that reads them losslessly.
 
+## Schema features: generated columns, CHECK constraints, partial/expression indexes
+
+Generated columns, CHECK constraints, and partial/expression indexes ARE carried into the
+target (ADR-0133): a generated column lands as a real GENERATED column that the target
+re-derives, a CHECK is enforced on the target, and a partial index keeps its `WHERE`
+predicate. The expression bodies are carried **verbatim** from SQLite, so sluice emits a
+one-time WARN per table/index naming what it carried — verify those expressions on the
+target. Portable constructs (`a + b`, `length(x)`, `x || y`, comparisons) work directly;
+a **non-portable** SQLite-only construct (e.g. `strftime(...)`) is **rejected loudly** by
+the target at `CREATE` time (naming the rejected function), never silently dropped or
+mistranslated. A cross-dialect *translation* of the verbatim tail is a tracked follow-up;
+until then, edit the source expression or re-add the object on the target if it is rejected.
+(MySQL has no partial-index support, so a SQLite partial index lands as a full index on a
+MySQL target — its predicate is not representable there.)
+
 ## Known limits (prototype scope)
 
-Deferred follow-ups (ADR-0128 §): trigger-based continuous CDC, within-table chunking
-(large single tables read as one stream), a per-column date-encoding map (the global flag +
-`--type-override` cover the common and outlier cases), and reading CHECK constraints /
-generated columns / expression-or-partial indexes. SQLite/D1 is a migrate **source** only —
-it is never a sluice target.
+Deferred follow-ups (ADR-0128 §, ADR-0133): trigger-based continuous CDC, within-table
+chunking (large single tables read as one stream), a per-column date-encoding map (the
+global flag + `--type-override` cover the common and outlier cases), and a SQLite→canonical
+expression translator for the verbatim generated/CHECK/index bodies described above.
+SQLite/D1 is a migrate **source** only — it is never a sluice target.

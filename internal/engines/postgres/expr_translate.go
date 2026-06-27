@@ -132,6 +132,18 @@ type ExprContext struct {
 // canonical name ever changes.
 const dialectName = "postgres"
 
+// translatableSourceDialect is the ONE other engine's dialect this writer's
+// cross-dialect translator ([translateExprForPG]) is built to accept as input
+// — MySQL. The DDL-emit dispatch translates an IR expression ONLY when its
+// dialect tag equals this; every other value — "postgres" (self), "" (untagged
+// same-engine / hand-built IR), "sqlite", or any future engine — emits VERBATIM
+// (ADR-0133 §2). This closes the latent bug where an unknown dialect was fed
+// through the MySQL→PG translator (a silent mistranslation): a SQLite-tagged
+// body now passes through and fails loudly at target DDL time if non-portable,
+// rather than being silently rewritten. Byte-identical for every existing
+// producer — the only non-self, non-empty dialect produced today is "mysql".
+const translatableSourceDialect = "mysql"
+
 // translateExprForPG translates a MySQL-dialect expression into PG-
 // dialect form for the v1 set of cross-engine constructs. Unrecognized
 // constructs pass through verbatim — translation is additive on top of
