@@ -93,7 +93,10 @@ func (r *D1RowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.
 	r.err = nil
 	r.mu.Unlock()
 
-	plan := r.planPagination(ctx, table)
+	plan, err := r.planPagination(ctx, table)
+	if err != nil {
+		return nil, err
+	}
 
 	out := make(chan ir.Row, d1RowChanBuffer)
 	go r.stream(ctx, table, plan, out)
@@ -116,23 +119,44 @@ type pagePlan struct {
 }
 
 // planPagination chooses the pagination strategy for a table: keyset on the PK
-// if present, else keyset on rowid (every SQLite/D1 base table without a PK is a
-// rowid table — WITHOUT ROWID requires a PK), else — only if a rowid probe
-// fails — a LIMIT/OFFSET fallback.
-func (r *D1RowReader) planPagination(ctx context.Context, table *ir.Table) pagePlan {
+// if present and text-param-safe, else keyset on rowid (every SQLite/D1 base
+// table without a PK is a rowid table — WITHOUT ROWID requires a PK), else — only
+// if a rowid probe fails — a LIMIT/OFFSET fallback. A BLOB-affinity key column
+// cannot be keyset-bounded by a text param (see [pkKeysetSafe]) and routes to
+// rowid; a WITHOUT ROWID table keyed only by a BLOB column is refused loudly
+// rather than looped forever.
+func (r *D1RowReader) planPagination(ctx context.Context, table *ir.Table) (pagePlan, error) {
 	p := pagePlan{typeofPrefix: typeofPrefix(table.Columns)}
 	p.rowidAlias = p.typeofPrefix + "rowid"
 
 	if table.PrimaryKey != nil && len(table.PrimaryKey.Columns) > 0 {
-		for _, ic := range table.PrimaryKey.Columns {
-			p.orderCols = append(p.orderCols, ic.Column)
+		if pkKeysetSafe(table) {
+			for _, ic := range table.PrimaryKey.Columns {
+				p.orderCols = append(p.orderCols, ic.Column)
+			}
+			return p, nil
 		}
-		return p
+		// A BLOB-affinity (or no-declared-type) key column can't be bounded by a
+		// text param: SQLite ranks BLOB above every TEXT and applies no numeric
+		// coercion to the param, so `blobcol > ?(text)` is ALWAYS true and the
+		// page never advances (infinite loop + duplicate rows). The integer rowid
+		// compares exactly, so fall back to it when the table has one.
+		if r.tableHasRowid(ctx, table.Name) {
+			p.useRowid = true
+			p.orderCols = []string{"rowid"}
+			return p, nil
+		}
+		// WITHOUT ROWID table keyed only by a BLOB column: no safe keyset and no
+		// rowid to fall back to — refuse loudly rather than loop forever.
+		return pagePlan{}, fmt.Errorf(
+			"d1: table %q has a BLOB-affinity primary key and no rowid; cannot keyset-paginate "+
+				"safely (a text-param bound on a BLOB column never advances)", table.Name,
+		)
 	}
 	if r.tableHasRowid(ctx, table.Name) {
 		p.useRowid = true
 		p.orderCols = []string{"rowid"}
-		return p
+		return p, nil
 	}
 	// No orderable key (a WITHOUT ROWID table missing a discoverable PK — rare).
 	// LIMIT/OFFSET is not safe under concurrent writes; D1 reads are typically of
@@ -140,7 +164,36 @@ func (r *D1RowReader) planPagination(ctx context.Context, table *ir.Table) pageP
 	p.useOffset = true
 	slog.WarnContext(ctx, "d1: table has no primary key or rowid; paginating by LIMIT/OFFSET (not safe under concurrent writes)",
 		slog.String("table", table.Name))
-	return p
+	return p, nil
+}
+
+// pkKeysetSafe reports whether every primary-key column can be keyset-bounded by
+// a text param. A BLOB-affinity column (resolved to ir.Blob — which also covers
+// the no-declared-type case) cannot (BLOB outranks TEXT and the text param gets
+// no coercion), so its presence makes the PK keyset unsafe and routes to rowid.
+// A PK column not found in the table (shouldn't happen) is treated as unsafe so
+// the caller falls back to the exact rowid path rather than risk a bad bound.
+func pkKeysetSafe(table *ir.Table) bool {
+	for _, ic := range table.PrimaryKey.Columns {
+		col := findColumn(table, ic.Column)
+		if col == nil {
+			return false
+		}
+		if _, isBlob := col.Type.(ir.Blob); isBlob {
+			return false
+		}
+	}
+	return true
+}
+
+// findColumn returns the named column of table, or nil if absent.
+func findColumn(table *ir.Table, name string) *ir.Column {
+	for _, c := range table.Columns {
+		if c.Name == name {
+			return c
+		}
+	}
+	return nil
 }
 
 // tableHasRowid probes whether the table exposes a rowid (false for a WITHOUT
@@ -270,14 +323,21 @@ func buildD1Projection(table *ir.Table, plan pagePlan) string {
 	for i, c := range table.Columns {
 		q := quoteIdent(c.Name)
 		// typeof → the actual storage class (integer/real/text/blob/null);
-		// value → EXACT text: blobs as hex, everything else CAST AS TEXT (ints +
-		// reals as full decimal text; NULL stays NULL). This is the lossless
-		// core: a CAST(int AS TEXT) carries a > 2^53 integer exactly, where a
-		// bare JSON number would round it.
+		// value → EXACT text per storage class:
+		//   - blob → hex(c)
+		//   - real → format('%.17g', c): 17 significant digits is the IEEE-754
+		//     round-trip guarantee, so ParseFloat recovers the EXACT float64.
+		//     CAST(real AS TEXT) is NOT used because SQLite's default real→text
+		//     can render fewer than 17 sig-digits and silently drop the low bits
+		//     (would hit ir.Float, ir.Decimal's real branch, and julian/unix-REAL
+		//     temporal decode) — this removes any dependence on D1's formatter.
+		//   - everything else (integer/text) → CAST(c AS TEXT): integers carry as
+		//     exact decimal text (> 2^53 included), where a bare JSON number would
+		//     round; NULL stays NULL.
 		parts = append(
 			parts,
 			"typeof("+q+") AS "+quoteIdent(typeofAlias(plan.typeofPrefix, i)),
-			"CASE typeof("+q+") WHEN 'blob' THEN hex("+q+") ELSE CAST("+q+" AS TEXT) END AS "+q,
+			"CASE typeof("+q+") WHEN 'blob' THEN hex("+q+") WHEN 'real' THEN format('%.17g', "+q+") ELSE CAST("+q+" AS TEXT) END AS "+q,
 		)
 	}
 	if plan.useRowid {

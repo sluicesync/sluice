@@ -4,14 +4,22 @@
 package sqlite
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
@@ -99,6 +107,13 @@ type cell struct {
 func tval(s string) cell { return cell{typeOf: "text", value: s} }
 func ival(s string) cell { return cell{typeOf: "integer", value: s} }
 func rval(s string) cell { return cell{typeOf: "real", value: s} }
+
+// withRowid stamps the implicit-rowid alias onto a data-result row, for tables
+// the reader paginates by rowid (no PK, or a BLOB PK falling back to rowid).
+func withRowid(table *ir.Table, row map[string]any, rowid string) map[string]any {
+	row[typeofPrefix(table.Columns)+"rowid"] = rowid
+	return row
+}
 
 // drain reads a row channel to completion and returns the rows.
 func drain(ch <-chan ir.Row) []ir.Row {
@@ -411,12 +426,12 @@ func TestBuildD1PageQuery_Shape(t *testing.T) {
 	}
 
 	// Subsequent page: keyset predicate + ORDER BY, table-qualified.
-	sql, params := buildD1PageQuery(table, plan, proj, []string{"42"}, 0, d1PageSize)
-	if !strings.Contains(sql, `WHERE "t"."id" > ?`) {
-		t.Errorf("keyset predicate not table-qualified:\n%s", sql)
+	query, params := buildD1PageQuery(table, plan, proj, []string{"42"}, 0, d1PageSize)
+	if !strings.Contains(query, `WHERE "t"."id" > ?`) {
+		t.Errorf("keyset predicate not table-qualified:\n%s", query)
 	}
-	if !strings.Contains(sql, `ORDER BY "t"."id"`) {
-		t.Errorf("ORDER BY not table-qualified (would sort the CAST-text alias lexically):\n%s", sql)
+	if !strings.Contains(query, `ORDER BY "t"."id"`) {
+		t.Errorf("ORDER BY not table-qualified (would sort the CAST-text alias lexically):\n%s", query)
 	}
 	if len(params) != 1 || params[0] != "42" {
 		t.Errorf("bound params = %#v; want [\"42\"]", params)
@@ -705,5 +720,473 @@ func TestD1Engine_OpenMissingToken(t *testing.T) {
 	if _, err := e.OpenSchemaReader(context.Background(), "d1://acct/db"); err == nil ||
 		!strings.Contains(err.Error(), envD1Token) {
 		t.Errorf("OpenSchemaReader want loud missing-token error; got %v", err)
+	}
+}
+
+// ---- BLOCK 1: REAL precision (%.17g round-trip) ---------------------------
+
+// TestD1RealPrecision_Pure pins that a REAL rendered at 17 significant digits
+// (the IEEE-754 round-trip guarantee, which the projection now uses instead of
+// CAST-AS-TEXT) decodes back to the EXACT float64 — for ir.Float and for
+// ir.Decimal's real branch. Without %.17g a low-digit render would silently lose
+// the low bits.
+func TestD1RealPrecision_Pure(t *testing.T) {
+	vals := []float64{math.Pi, 0.1, 1.0 / 3.0, 1.0, 1234567890123456.7, math.SmallestNonzeroFloat64, math.MaxFloat64}
+	for _, want := range vals {
+		text := fmt.Sprintf("%.17g", want) // mirrors SQLite format('%.17g', x)
+		raw := json.RawMessage(`"` + text + `"`)
+
+		got, err := d1StorageValue("real", raw)
+		if err != nil {
+			t.Fatalf("d1StorageValue real %q: %v", text, err)
+		}
+		f, err := decodeCell(got, ir.Float{Precision: ir.FloatDouble}, dateEncodingISO)
+		if err != nil {
+			t.Fatalf("decodeCell Float %q: %v", text, err)
+		}
+		if f != want {
+			t.Errorf("real %.17g → Float %v; want EXACT %v (precision silently lost)", want, f, want)
+		}
+		// ir.Decimal real branch: shortest round-trippable decimal of the same float.
+		d, err := decodeCell(got, ir.Decimal{Unconstrained: true}, dateEncodingISO)
+		if err != nil {
+			t.Fatalf("decodeCell Decimal %q: %v", text, err)
+		}
+		if d != strconv.FormatFloat(want, 'g', -1, 64) {
+			t.Errorf("real %.17g → Decimal %q; want %q", want, d, strconv.FormatFloat(want, 'g', -1, 64))
+		}
+	}
+}
+
+// TestD1Format17g_RealDriver is the SQLite ground truth for BLOCK 1: it confirms
+// that the real engine D1 runs (modernc = the same SQLite) actually supports
+// `format('%.17g', x)` AND that its output round-trips a double exactly — so the
+// projection's dependence shifts from D1's default formatter to the IEEE-754
+// guarantee. It runs the reader's EXACT generated projection over a real table
+// and decodes via the production d1StorageValue.
+func TestD1Format17g_RealDriver(t *testing.T) {
+	path := seedDB(
+		t,
+		`CREATE TABLE t (id INTEGER PRIMARY KEY, f REAL, big INTEGER, b BLOB)`,
+		`INSERT INTO t (id, f, big, b) VALUES (9007199254740993, 3.141592653589793, 9223372036854775807, x'cafe00ff')`,
+	)
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	table := &ir.Table{
+		Name: "t",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "f", Type: ir.Float{Precision: ir.FloatDouble}},
+			{Name: "big", Type: ir.Integer{Width: 64}},
+			{Name: "b", Type: ir.Blob{Size: ir.BlobLong}},
+		},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}, Unique: true},
+	}
+	plan := pagePlan{typeofPrefix: typeofPrefix(table.Columns), orderCols: []string{"id"}}
+	proj := buildD1Projection(table, plan)
+	query, _ := buildD1PageQuery(table, plan, proj, nil, 0, d1PageSize)
+
+	rows, err := db.QueryContext(context.Background(), query) //nolint:rowserrcheck // single-row read below, err checked
+	if err != nil {
+		t.Fatalf("run projection %q: %v", query, err)
+	}
+	defer func() { _ = rows.Close() }()
+	if !rows.Next() {
+		t.Fatal("no rows from projection")
+	}
+	colNames, _ := rows.Columns()
+	cells := make([]sql.NullString, len(colNames))
+	ptrs := make([]any, len(colNames))
+	for i := range cells {
+		ptrs[i] = &cells[i]
+	}
+	if err := rows.Scan(ptrs...); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	byName := map[string]sql.NullString{}
+	for i, n := range colNames {
+		byName[n] = cells[i]
+	}
+
+	decode := func(i int, col *ir.Column) any {
+		t.Helper()
+		typeofText := byName[typeofAlias(plan.typeofPrefix, i)].String
+		var raw json.RawMessage
+		if v := byName[col.Name]; v.Valid {
+			b, _ := json.Marshal(v.String)
+			raw = b
+		} else {
+			raw = json.RawMessage(`null`)
+		}
+		storage, err := d1StorageValue(typeofText, raw)
+		if err != nil {
+			t.Fatalf("d1StorageValue %s: %v", col.Name, err)
+		}
+		out, err := decodeCell(storage, col.Type, dateEncodingISO)
+		if err != nil {
+			t.Fatalf("decodeCell %s: %v", col.Name, err)
+		}
+		return out
+	}
+
+	if got := decode(1, table.Columns[1]); got != 3.141592653589793 {
+		t.Errorf("REAL via real driver = %v; want exact math.Pi-ish 3.141592653589793", got)
+	}
+	if got := decode(2, table.Columns[2]); got != int64(9223372036854775807) {
+		t.Errorf("big INTEGER via real driver = %v; want exact max int64", got)
+	}
+	if got, ok := decode(3, table.Columns[3]).([]byte); !ok || len(got) != 4 || got[0] != 0xca || got[3] != 0xff {
+		t.Errorf("BLOB via real driver = %#v; want ca fe 00 ff", got)
+	}
+}
+
+// TestD1Julian_RealText pins a julian-day timestamp delivered as a %.17g REAL:
+// it decodes to the right instant (the REAL precision fix matters for the
+// julian/unix-REAL temporal encodings, not just ir.Float).
+func TestD1Julian_RealText(t *testing.T) {
+	want := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+	const unixEpochJulianDay = 2440587.5
+	jd := unixEpochJulianDay + float64(want.Unix())/86400.0
+	raw := json.RawMessage(`"` + fmt.Sprintf("%.17g", jd) + `"`)
+
+	storage, err := d1StorageValue("real", raw)
+	if err != nil {
+		t.Fatalf("d1StorageValue real: %v", err)
+	}
+	got, err := decodeCell(storage, ir.Timestamp{}, dateEncodingJulian)
+	if err != nil {
+		t.Fatalf("decodeCell julian: %v", err)
+	}
+	gotT, ok := got.(time.Time)
+	if !ok || gotT.Sub(want).Abs() > time.Millisecond {
+		t.Errorf("julian REAL → %v; want ~%v", got, want)
+	}
+}
+
+// ---- BLOCK 2: BLOB-PK keyset safety ---------------------------------------
+
+// TestD1RowReader_BlobPKUsesRowid pins that a table with a BLOB primary key
+// paginates by the integer rowid (NOT the blob, which would loop forever because
+// SQLite ranks BLOB above every TEXT param) — it terminates on a short page and
+// the generated page query orders by rowid.
+func TestD1RowReader_BlobPKUsesRowid(t *testing.T) {
+	table := &ir.Table{
+		Name: "t",
+		Columns: []*ir.Column{
+			{Name: "k", Type: ir.Blob{Size: ir.BlobLong}},
+			{Name: "v", Type: ir.Text{Size: ir.TextLong}},
+		},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "k"}}, Unique: true},
+	}
+	var dataSQL string
+	client := startMockD1(t, func(sql string, _ []string) (int, []byte) {
+		switch {
+		case strings.Contains(sql, "SELECT rowid FROM"):
+			return http.StatusOK, d1OK(nil) // rowid exists (probe succeeds)
+		default:
+			dataSQL = sql
+			return http.StatusOK, d1OK([]map[string]any{
+				withRowid(table, dataRow(table, map[string]cell{"k": bval("cafe"), "v": tval("x")}), "1"),
+			})
+		}
+	})
+	r := &D1RowReader{client: client, pageSize: 2}
+	ch, err := r.ReadRows(context.Background(), table)
+	if err != nil {
+		t.Fatalf("ReadRows: %v", err)
+	}
+	got := drain(ch)
+	if err := r.Err(); err != nil {
+		t.Fatalf("Err: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d rows; want 1 (a blob-keyset loop would never terminate / would dupe)", len(got))
+	}
+	if !strings.Contains(dataSQL, `ORDER BY "t"."rowid"`) {
+		t.Errorf("blob-PK table must paginate by rowid, not the blob key:\n%s", dataSQL)
+	}
+}
+
+// bval builds a blob cell (hex value).
+func bval(hx string) cell { return cell{typeOf: "blob", value: hx} }
+
+// TestD1RowReader_BlobPKNoRowidRefused pins the loud refusal when a WITHOUT ROWID
+// table is keyed only by a BLOB column: no safe keyset and no rowid fallback, so
+// the reader refuses rather than looping forever.
+func TestD1RowReader_BlobPKNoRowidRefused(t *testing.T) {
+	table := &ir.Table{
+		Name:       "t",
+		Columns:    []*ir.Column{{Name: "k", Type: ir.Blob{Size: ir.BlobLong}}},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "k"}}, Unique: true},
+	}
+	client := startMockD1(t, func(sql string, _ []string) (int, []byte) {
+		if strings.Contains(sql, "SELECT rowid FROM") {
+			return http.StatusOK, d1Err(1, "no such column: rowid") // WITHOUT ROWID
+		}
+		return http.StatusOK, d1OK(nil)
+	})
+	r := &D1RowReader{client: client}
+	_, err := r.ReadRows(context.Background(), table)
+	if err == nil || !strings.Contains(err.Error(), "BLOB") || !strings.Contains(err.Error(), "t") {
+		t.Errorf("want loud BLOB-key refusal naming the table; got %v", err)
+	}
+}
+
+// TestD1RowReader_RowidFallbackStitch pins keyset-by-rowid for a table with NO
+// explicit primary key: two pages stitch in rowid order with no dup/gap, and the
+// page-2 bound is the last rowid.
+func TestD1RowReader_RowidFallbackStitch(t *testing.T) {
+	table := &ir.Table{
+		Name:    "t",
+		Columns: []*ir.Column{{Name: "v", Type: ir.Text{Size: ir.TextLong}}},
+	}
+	page1 := []map[string]any{
+		withRowid(table, dataRow(table, map[string]cell{"v": tval("a")}), "1"),
+		withRowid(table, dataRow(table, map[string]cell{"v": tval("b")}), "2"),
+	}
+	page2 := []map[string]any{
+		withRowid(table, dataRow(table, map[string]cell{"v": tval("c")}), "3"),
+	}
+	var bound []string
+	client := startMockD1(t, func(sql string, params []string) (int, []byte) {
+		switch {
+		case strings.Contains(sql, "SELECT rowid FROM"):
+			return http.StatusOK, d1OK(nil)
+		case strings.Contains(sql, "WHERE"):
+			bound = params
+			return http.StatusOK, d1OK(page2)
+		default:
+			return http.StatusOK, d1OK(page1)
+		}
+	})
+	r := &D1RowReader{client: client, pageSize: 2}
+	ch, err := r.ReadRows(context.Background(), table)
+	if err != nil {
+		t.Fatalf("ReadRows: %v", err)
+	}
+	got := drain(ch)
+	if err := r.Err(); err != nil {
+		t.Fatalf("Err: %v", err)
+	}
+	want := []string{"a", "b", "c"}
+	if len(got) != 3 {
+		t.Fatalf("got %d rows; want 3", len(got))
+	}
+	for i, w := range want {
+		if got[i]["v"] != w {
+			t.Errorf("row %d = %#v; want %q", i, got[i]["v"], w)
+		}
+	}
+	if len(bound) != 1 || bound[0] != "2" {
+		t.Errorf("rowid keyset bound = %#v; want [\"2\"]", bound)
+	}
+}
+
+// TestD1RowReader_CompositePKStitch pins an END-TO-END composite-PK keyset across
+// a page boundary: the row-value comparison (a,b) > (?,?) advances correctly with
+// no dup/gap, and the page-2 bound is the last (a,b).
+func TestD1RowReader_CompositePKStitch(t *testing.T) {
+	table := &ir.Table{
+		Name: "t",
+		Columns: []*ir.Column{
+			{Name: "a", Type: ir.Integer{Width: 64}},
+			{Name: "b", Type: ir.Integer{Width: 64}},
+			{Name: "v", Type: ir.Text{Size: ir.TextLong}},
+		},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "a"}, {Column: "b"}}, Unique: true},
+	}
+	page1 := []map[string]any{
+		dataRow(table, map[string]cell{"a": ival("1"), "b": ival("1"), "v": tval("a")}),
+		dataRow(table, map[string]cell{"a": ival("1"), "b": ival("2"), "v": tval("b")}),
+	}
+	page2 := []map[string]any{
+		dataRow(table, map[string]cell{"a": ival("2"), "b": ival("1"), "v": tval("c")}),
+	}
+	var bound []string
+	var page2SQL string
+	client := startMockD1(t, func(sql string, params []string) (int, []byte) {
+		if strings.Contains(sql, "WHERE") {
+			bound = params
+			page2SQL = sql
+			return http.StatusOK, d1OK(page2)
+		}
+		return http.StatusOK, d1OK(page1)
+	})
+	r := &D1RowReader{client: client, pageSize: 2}
+	ch, err := r.ReadRows(context.Background(), table)
+	if err != nil {
+		t.Fatalf("ReadRows: %v", err)
+	}
+	got := drain(ch)
+	if err := r.Err(); err != nil {
+		t.Fatalf("Err: %v", err)
+	}
+	want := []string{"a", "b", "c"}
+	if len(got) != 3 {
+		t.Fatalf("got %d rows; want 3 (composite keyset dup/gap)", len(got))
+	}
+	for i, w := range want {
+		if got[i]["v"] != w {
+			t.Errorf("row %d = %#v; want %q", i, got[i]["v"], w)
+		}
+	}
+	if len(bound) != 2 || bound[0] != "1" || bound[1] != "2" {
+		t.Errorf("composite bound = %#v; want [\"1\",\"2\"]", bound)
+	}
+	if !strings.Contains(page2SQL, `("t"."a", "t"."b") > (?, ?)`) {
+		t.Errorf("page-2 SQL must use the row-value comparison:\n%s", page2SQL)
+	}
+}
+
+// TestD1RowReader_NullKeysetRefused pins the loud refusal when a keyset (PK)
+// column value is NULL — a NULL bound would make pagination skip or loop.
+func TestD1RowReader_NullKeysetRefused(t *testing.T) {
+	table := &ir.Table{
+		Name:       "t",
+		Columns:    []*ir.Column{{Name: "k", Type: ir.Text{Size: ir.TextLong}}},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "k"}}, Unique: true},
+	}
+	rows := []map[string]any{dataRow(table, map[string]cell{"k": nullCell()})}
+	client := startMockD1(t, func(string, []string) (int, []byte) { return http.StatusOK, d1OK(rows) })
+	r := &D1RowReader{client: client}
+	ch, err := r.ReadRows(context.Background(), table)
+	if err != nil {
+		t.Fatalf("ReadRows: %v", err)
+	}
+	_ = drain(ch)
+	if r.Err() == nil || !strings.Contains(r.Err().Error(), "primary-key column") {
+		t.Errorf("want loud NULL-keyset refusal; got %v", r.Err())
+	}
+}
+
+// nullCell is a NULL cell (typeof null, JSON null value).
+func nullCell() cell { return cell{typeOf: "null", value: nil} }
+
+// TestD1RowReader_OffsetFallbackStitch pins the LIMIT/OFFSET fallback for a table
+// with neither a PK nor a rowid: pages stitch by OFFSET and the documented
+// not-safe-under-concurrent-writes caveat is logged.
+func TestD1RowReader_OffsetFallbackStitch(t *testing.T) {
+	// Capture the WARN the fallback emits.
+	var logBuf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer slog.SetDefault(prev)
+
+	table := &ir.Table{
+		Name:    "t",
+		Columns: []*ir.Column{{Name: "v", Type: ir.Text{Size: ir.TextLong}}},
+	}
+	page1 := []map[string]any{
+		dataRow(table, map[string]cell{"v": tval("a")}),
+		dataRow(table, map[string]cell{"v": tval("b")}),
+	}
+	page2 := []map[string]any{dataRow(table, map[string]cell{"v": tval("c")})}
+	client := startMockD1(t, func(sql string, _ []string) (int, []byte) {
+		switch {
+		case strings.Contains(sql, "SELECT rowid FROM"):
+			return http.StatusOK, d1Err(1, "no such column: rowid") // no rowid → OFFSET fallback
+		case strings.Contains(sql, "OFFSET 2"):
+			return http.StatusOK, d1OK(page2)
+		default:
+			return http.StatusOK, d1OK(page1)
+		}
+	})
+	r := &D1RowReader{client: client, pageSize: 2}
+	ch, err := r.ReadRows(context.Background(), table)
+	if err != nil {
+		t.Fatalf("ReadRows: %v", err)
+	}
+	got := drain(ch)
+	if err := r.Err(); err != nil {
+		t.Fatalf("Err: %v", err)
+	}
+	want := []string{"a", "b", "c"}
+	if len(got) != 3 {
+		t.Fatalf("got %d rows; want 3 (OFFSET stitch)", len(got))
+	}
+	for i, w := range want {
+		if got[i]["v"] != w {
+			t.Errorf("row %d = %#v; want %q", i, got[i]["v"], w)
+		}
+	}
+	if !strings.Contains(logBuf.String(), "LIMIT/OFFSET") {
+		t.Errorf("expected the LIMIT/OFFSET not-safe caveat to be logged; got:\n%s", logBuf.String())
+	}
+}
+
+// TestD1RowReader_NumericDecimal pins an ir.Decimal (NUMERIC-affinity) column
+// end-to-end for BOTH an integer and a real stored value — each carried as an
+// exact decimal string through the shared decodeCell.
+func TestD1RowReader_NumericDecimal(t *testing.T) {
+	table := &ir.Table{
+		Name: "t",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "n", Type: ir.Decimal{Unconstrained: true}},
+		},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}, Unique: true},
+	}
+	rows := []map[string]any{
+		dataRow(table, map[string]cell{"id": ival("1"), "n": ival("42")}),
+		dataRow(table, map[string]cell{"id": ival("2"), "n": rval(fmt.Sprintf("%.17g", 1.5))}),
+	}
+	client := startMockD1(t, func(string, []string) (int, []byte) { return http.StatusOK, d1OK(rows) })
+	r := &D1RowReader{client: client}
+	ch, err := r.ReadRows(context.Background(), table)
+	if err != nil {
+		t.Fatalf("ReadRows: %v", err)
+	}
+	got := drain(ch)
+	if err := r.Err(); err != nil {
+		t.Fatalf("Err: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d rows; want 2", len(got))
+	}
+	if got[0]["n"] != "42" {
+		t.Errorf("NUMERIC integer → %#v; want \"42\"", got[0]["n"])
+	}
+	if got[1]["n"] != "1.5" {
+		t.Errorf("NUMERIC real → %#v; want \"1.5\"", got[1]["n"])
+	}
+}
+
+// TestD1RowReader_TextVerbatim pins that a TEXT column carries an embedded NUL
+// byte and multibyte unicode VERBATIM (the reader is faithful; any NUL refusal
+// is a downstream writer concern, not the reader's to silently strip).
+func TestD1RowReader_TextVerbatim(t *testing.T) {
+	const withNUL = "a\x00b"
+	const unicode = "héllo · 世界"
+	table := &ir.Table{
+		Name: "t",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "s", Type: ir.Text{Size: ir.TextLong}},
+		},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}, Unique: true},
+	}
+	rows := []map[string]any{
+		dataRow(table, map[string]cell{"id": ival("1"), "s": tval(withNUL)}),
+		dataRow(table, map[string]cell{"id": ival("2"), "s": tval(unicode)}),
+	}
+	client := startMockD1(t, func(string, []string) (int, []byte) { return http.StatusOK, d1OK(rows) })
+	r := &D1RowReader{client: client}
+	ch, err := r.ReadRows(context.Background(), table)
+	if err != nil {
+		t.Fatalf("ReadRows: %v", err)
+	}
+	got := drain(ch)
+	if err := r.Err(); err != nil {
+		t.Fatalf("Err: %v", err)
+	}
+	if got[0]["s"] != withNUL {
+		t.Errorf("embedded-NUL text = %q; want %q (verbatim)", got[0]["s"], withNUL)
+	}
+	if got[1]["s"] != unicode {
+		t.Errorf("unicode text = %q; want %q (verbatim)", got[1]["s"], unicode)
 	}
 }
