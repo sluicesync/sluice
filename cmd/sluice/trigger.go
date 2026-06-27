@@ -11,6 +11,18 @@ import (
 	"strings"
 
 	"sluicesync.dev/sluice/internal/engines/pgtrigger"
+	sqlitetrigger "sluicesync.dev/sluice/internal/engines/sqlite-trigger"
+)
+
+// triggerDrivers is the set of trigger-CDC source engines the `sluice trigger`
+// commands install/remove. The default ("postgres-trigger") preserves the
+// original PG-only behaviour; "sqlite-trigger" (ADR-0135) installs the
+// change-log + per-table capture triggers in a local SQLite file (the --dsn is
+// the file path). The PG-only flags (--schema, --allow-polled-fingerprint,
+// --capture-payload) do not apply to the SQLite engine and are ignored there.
+const (
+	triggerDriverPostgres = pgtrigger.EngineName     // "postgres-trigger"
+	triggerDriverSQLite   = sqlitetrigger.EngineName // "sqlite-trigger"
 )
 
 // TriggerCmd groups the operator-facing trigger-engine setup +
@@ -33,10 +45,11 @@ type TriggerCmd struct {
 // flow. The command refuses-loudly on any §14 boundary (no-PK,
 // UNLOGGED, generated columns, custom domain-over-UDT).
 type TriggerSetupCmd struct {
-	DSN    string   `help:"PG source DSN (URI or libpq KV form). The connecting role needs CREATE on the target schema, TRIGGER on each replicated table, and INSERT on sluice_change_log." required:"" placeholder:"DSN"`
-	Tables []string `help:"Tables to install per-table row + truncate triggers on (comma-separated, repeatable). Required for v1; empty-list discovery is a follow-up." required:"" sep:"," placeholder:"TABLE"`
-	Schema string   `help:"PG schema (namespace) the change-log + capture function + per-table triggers live in. Defaults to the DSN's 'schema' query parameter (typically 'public')." placeholder:"NAME"`
-	DryRun bool     `help:"Print the DDL the command would apply and exit; no source-side state is modified." short:"n"`
+	SourceDriver string   `help:"Trigger-CDC source engine to install: 'postgres-trigger' (default) or 'sqlite-trigger' (a local SQLite file; --dsn is the file path)." enum:"postgres-trigger,sqlite-trigger" default:"postgres-trigger"`
+	DSN          string   `help:"Source DSN. For postgres-trigger: a PG DSN (URI or libpq KV form; the connecting role needs CREATE on the target schema, TRIGGER on each replicated table, and INSERT on sluice_change_log). For sqlite-trigger: the SQLite file path." required:"" placeholder:"DSN"`
+	Tables       []string `help:"Tables to install per-table capture triggers on (comma-separated, repeatable). Required for v1; empty-list discovery is a follow-up." required:"" sep:"," placeholder:"TABLE"`
+	Schema       string   `help:"PG schema (namespace) the change-log + capture function + per-table triggers live in. Defaults to the DSN's 'schema' query parameter (typically 'public'). Ignored for sqlite-trigger (flat namespace)." placeholder:"NAME"`
+	DryRun       bool     `help:"Print the DDL the command would apply and exit; no source-side state is modified." short:"n"`
 
 	AllowPolledFingerprint bool `help:"Opt in to the polled schema-fingerprint fallback (§7) on tiers that deny event-trigger creation. Default off: the engine refuses-loudly on such tiers so the operator explicitly acknowledges the weaker DDL-detection mode."`
 
@@ -50,6 +63,9 @@ func (c *TriggerSetupCmd) Run(_ *Globals) error {
 	}
 	if len(c.Tables) == 0 {
 		return errors.New("--tables is required for v1 (pass --tables=t1,t2,...)")
+	}
+	if c.SourceDriver == triggerDriverSQLite {
+		return c.runSQLite()
 	}
 	ctx := kongContext()
 	plan, err := pgtrigger.Setup(ctx, c.DSN, pgtrigger.SetupOptions{
@@ -92,6 +108,37 @@ func (c *TriggerSetupCmd) Run(_ *Globals) error {
 	return nil
 }
 
+// runSQLite handles `sluice trigger setup --source-driver sqlite-trigger`
+// (ADR-0135): it installs the change-log + per-table capture triggers in the
+// local SQLite file named by --dsn. The PG-only flags are not applicable here.
+func (c *TriggerSetupCmd) runSQLite() error {
+	ctx := kongContext()
+	plan, err := sqlitetrigger.Setup(ctx, c.DSN, sqlitetrigger.SetupOptions{
+		Tables: c.Tables,
+		DryRun: c.DryRun,
+	})
+	if plan != nil && len(plan.Refusals) > 0 {
+		fmt.Fprintln(os.Stderr, "trigger setup refused — see refusals below:")
+		for _, r := range plan.Refusals {
+			fmt.Fprintf(os.Stderr, "  - %s: %s\n      → %s\n", r.Table, r.Reason, r.Hint)
+		}
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	if c.DryRun {
+		fmt.Fprintf(os.Stdout, "-- sqlite-trigger setup --dry-run (%d statement(s)) --\n", len(plan.Statements))
+		for _, s := range plan.Statements {
+			fmt.Fprintln(os.Stdout, s+";")
+			fmt.Fprintln(os.Stdout)
+		}
+		return nil
+	}
+	fmt.Fprintf(os.Stdout, "sqlite-trigger setup applied (%d statement(s))\n", len(plan.Statements))
+	return nil
+}
+
 // TriggerTeardownCmd removes every trace of the trigger engine from
 // the source. Idempotent — re-running on a partially-uninstalled
 // source proceeds cleanly via DROP ... IF EXISTS.
@@ -101,18 +148,22 @@ func (c *TriggerSetupCmd) Run(_ *Globals) error {
 // confirmation prompt fires by default; --yes skips it for
 // scripted/CI use.
 type TriggerTeardownCmd struct {
-	DSN      string   `help:"PG source DSN." required:"" placeholder:"DSN"`
-	Tables   []string `help:"Tables whose per-table triggers should be dropped. Empty (default) discovers every table with a sluice-installed trigger in the active schema." sep:"," placeholder:"TABLE"`
-	Schema   string   `help:"PG schema. Defaults to the DSN's 'schema' query parameter." placeholder:"NAME"`
-	KeepData bool     `help:"Retain sluice_change_log (and the meta table) for forensics. Default drops them — the engine's promise is to remove every trace from the source."`
-	DryRun   bool     `help:"Print the DDL and exit." short:"n"`
-	Yes      bool     `help:"Skip the destructive-action confirmation prompt. Mirrors 'slot drop --yes'." short:"y"`
+	SourceDriver string   `help:"Trigger-CDC source engine to tear down: 'postgres-trigger' (default) or 'sqlite-trigger'." enum:"postgres-trigger,sqlite-trigger" default:"postgres-trigger"`
+	DSN          string   `help:"Source DSN (PG DSN for postgres-trigger; SQLite file path for sqlite-trigger)." required:"" placeholder:"DSN"`
+	Tables       []string `help:"Tables whose per-table triggers should be dropped. Empty (default) discovers every table with a sluice-installed trigger in the source." sep:"," placeholder:"TABLE"`
+	Schema       string   `help:"PG schema. Defaults to the DSN's 'schema' query parameter. Ignored for sqlite-trigger." placeholder:"NAME"`
+	KeepData     bool     `help:"Retain sluice_change_log (and the meta table) for forensics. Default drops them — the engine's promise is to remove every trace from the source."`
+	DryRun       bool     `help:"Print the DDL and exit." short:"n"`
+	Yes          bool     `help:"Skip the destructive-action confirmation prompt. Mirrors 'slot drop --yes'." short:"y"`
 }
 
 // Run implements `sluice trigger teardown`.
 func (c *TriggerTeardownCmd) Run(_ *Globals) error {
 	if c.DSN == "" {
 		return errors.New("--dsn is required")
+	}
+	if c.SourceDriver == triggerDriverSQLite {
+		return c.runSQLite()
 	}
 	if !c.DryRun && !c.Yes {
 		prompt := "Tear down the sluice trigger engine on the source (drop per-table triggers"
@@ -148,6 +199,48 @@ func (c *TriggerTeardownCmd) Run(_ *Globals) error {
 		return nil
 	}
 	fmt.Fprintf(os.Stdout, "pgtrigger teardown applied (%d statement(s); keep-data=%v)\n",
+		len(plan.Statements), c.KeepData)
+	return nil
+}
+
+// runSQLite handles `sluice trigger teardown --source-driver sqlite-trigger`
+// (ADR-0135): it drops the per-table capture triggers and (unless --keep-data)
+// the change-log + meta tables from the local SQLite file. The destructive
+// confirmation prompt fired in Run before this dispatch.
+func (c *TriggerTeardownCmd) runSQLite() error {
+	if !c.DryRun && !c.Yes {
+		prompt := "Tear down the sluice trigger engine on the SQLite source (drop per-table triggers"
+		if c.KeepData {
+			prompt += "; keep the change-log table)? [y/N] "
+		} else {
+			prompt += " AND the sluice_change_log table)? [y/N] "
+		}
+		ok, err := confirmDestructive(os.Stdin, os.Stdout, prompt)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			fmt.Fprintln(os.Stdout, "aborted")
+			return nil
+		}
+	}
+	ctx := kongContext()
+	plan, err := sqlitetrigger.Teardown(ctx, c.DSN, sqlitetrigger.TeardownOptions{
+		Tables:   c.Tables,
+		KeepData: c.KeepData,
+		DryRun:   c.DryRun,
+	})
+	if err != nil {
+		return err
+	}
+	if c.DryRun {
+		fmt.Fprintf(os.Stdout, "-- sqlite-trigger teardown --dry-run (%d statement(s)) --\n", len(plan.Statements))
+		for _, s := range plan.Statements {
+			fmt.Fprintln(os.Stdout, s+";")
+		}
+		return nil
+	}
+	fmt.Fprintf(os.Stdout, "sqlite-trigger teardown applied (%d statement(s); keep-data=%v)\n",
 		len(plan.Statements), c.KeepData)
 	return nil
 }

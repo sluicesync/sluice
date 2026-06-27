@@ -36,6 +36,7 @@ import (
 	_ "sluicesync.dev/sluice/internal/engines/pgtrigger"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 	"sluicesync.dev/sluice/internal/engines/sqlite"
+	_ "sluicesync.dev/sluice/internal/engines/sqlite-trigger"
 )
 
 // version, commit, and date are populated at build time via -ldflags.

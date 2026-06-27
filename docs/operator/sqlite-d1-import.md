@@ -149,12 +149,65 @@ until then, edit the source expression or re-add the object on the target if it 
 (MySQL has no partial-index support, so a SQLite partial index lands as a full index on a
 MySQL target — its predicate is not representable there.)
 
+## Continuous sync: the `sqlite-trigger` CDC source (ADR-0135)
+
+Beyond the one-shot `migrate`, a **local SQLite file** can be a continuous-sync source —
+streaming every INSERT/UPDATE/DELETE to a Postgres or MySQL target — via the
+`sqlite-trigger` engine. SQLite has no logical replication or decodable change stream, so
+sluice uses the proven trigger pattern (the same model as the `postgres-trigger` engine):
+per-table capture triggers write each change into a `sluice_change_log` table, and a
+polling reader streams them.
+
+**1. Install the capture triggers (once):**
+
+```
+sluice trigger setup --source-driver sqlite-trigger --dsn ./app.db --tables=users,orders
+```
+
+This creates `sluice_change_log` + `sluice_change_log_meta` and three AFTER
+INSERT/UPDATE/DELETE triggers per table. Each listed table must have a PRIMARY KEY (the
+CDC applier identifies rows by PK); a PK-less table is refused loudly. Re-running setup is
+idempotent. Use `--dry-run` to print the DDL without applying it.
+
+**2. Start the sync (cold-start snapshot, then continuous CDC):**
+
+```
+sluice sync start --source-driver sqlite-trigger --source ./app.db \
+  --target-driver postgres --target 'postgres://user:pass@host:5432/db?sslmode=disable'
+```
+
+The cold-start bulk-copies existing rows (reusing the validated `sqlite` reader, including
+its date/bool policy and big-table chunking), then hands off gap-free to the change-log
+poller. Resume is exactly-once from a durable per-row watermark; a hard stop + restart
+re-streams only the un-applied tail. Big integers (> 2^53) and BLOB columns round-trip
+**exactly** through capture and CDC — the trigger encodes each column as a `(typeof,
+text/hex)` pair (the same faithful encoding as the `--source-driver d1` reader), never a
+lossy JSON number.
+
+**3. Remove the triggers when done:**
+
+```
+sluice trigger teardown --source-driver sqlite-trigger --dsn ./app.db --yes
+# add --keep-data to retain sluice_change_log for inspection
+```
+
+**WAL is recommended.** Enable `PRAGMA journal_mode=WAL` on the source so the poller's
+reads never block the application's writes (sluice does not change your journal mode for
+you). **Source-write overhead:** every captured INSERT/UPDATE/DELETE fires a trigger that
+writes one change-log row (the standard trigger-CDC cost). **Schema changes need
+re-setup:** SQLite has no DDL triggers, so a source `ALTER TABLE` is not auto-captured —
+run `trigger teardown` then `trigger setup` again after a schema change. The `sluice
+sync` stream refuses loudly (rather than silently mis-applying) if it sees a captured
+column that is no longer in the source schema. The change-log and meta tables are
+auto-skipped by the schema reader, so they are never themselves migrated or captured.
+
 ## Known limits (prototype scope)
 
-Deferred follow-ups (ADR-0128 §, ADR-0133): trigger-based continuous CDC, a per-column
-date-encoding map (the global flag + `--type-override` cover the common and outlier
-cases), and a SQLite→canonical expression translator for the verbatim generated/CHECK/
-index bodies described above. (Within-table parallel-copy chunking for the binary `.db`
-path now ships — see "Big tables parallel-copy" above; a `.sql`-dump source stays
-single-reader by design.) SQLite/D1 is a migrate **source** only — it is never a sluice
-target.
+Deferred follow-ups: trigger-CDC **Phase 2** (a Cloudflare-D1-over-HTTP variant of
+`sqlite-trigger`, schema-change forwarding, and capture-payload trimming / change-log
+retention — ADR-0135), a per-column date-encoding map (the global flag + `--type-override`
+cover the common and outlier cases — ADR-0129), and a SQLite→canonical expression
+translator for the verbatim generated/CHECK/index bodies described above (ADR-0133).
+(Within-table parallel-copy chunking for the binary `.db` path now ships — see "Big tables
+parallel-copy" above; a `.sql`-dump source stays single-reader by design. Continuous CDC
+from a local SQLite file now ships — see "Continuous sync" above.)

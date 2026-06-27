@@ -118,14 +118,23 @@ func (r *SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 // — e.g. `xcfg_settings` — is NOT silently dropped from the migration (that
 // would be exactly the silent-loss the tenets forbid). `--exclude-table`
 // remains available for anything else. Ordered by name for stable diffs/logs.
+//
+// The sqlite-trigger CDC engine's own bookkeeping tables ([ChangeLogTable] /
+// [ChangeLogMetaTable], ADR-0135) are also excluded by EXACT name (not a LIKE
+// wildcard, so a legitimate user table merely prefixed `sluice_` is untouched):
+// they are sluice-managed change-capture state, never user data, so a cold-start
+// (or a plain `sluice migrate` against a trigger-instrumented file) must never
+// copy them, and the trigger installer must never see them as replication
+// candidates.
 func (r *SchemaReader) tableNames(ctx context.Context) ([]string, error) {
 	const q = `
 		SELECT name FROM sqlite_master
 		WHERE type = 'table'
 		  AND name NOT LIKE 'sqlite_%'
 		  AND name NOT LIKE '\_cf\_%' ESCAPE '\'
+		  AND name NOT IN (?, ?)
 		ORDER BY name`
-	rows, err := r.db.QueryContext(ctx, q)
+	rows, err := r.db.QueryContext(ctx, q, ChangeLogTable, ChangeLogMetaTable)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: list tables in %q: %w", r.path, err)
 	}

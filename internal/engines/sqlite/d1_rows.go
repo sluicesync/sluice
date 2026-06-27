@@ -323,21 +323,15 @@ func buildD1Projection(table *ir.Table, plan pagePlan) string {
 	for i, c := range table.Columns {
 		q := quoteIdent(c.Name)
 		// typeof → the actual storage class (integer/real/text/blob/null);
-		// value → EXACT text per storage class:
-		//   - blob → hex(c)
-		//   - real → format('%.17g', c): 17 significant digits is the IEEE-754
-		//     round-trip guarantee, so ParseFloat recovers the EXACT float64.
-		//     CAST(real AS TEXT) is NOT used because SQLite's default real→text
-		//     can render fewer than 17 sig-digits and silently drop the low bits
-		//     (would hit ir.Float, ir.Decimal's real branch, and julian/unix-REAL
-		//     temporal decode) — this removes any dependence on D1's formatter.
-		//   - everything else (integer/text) → CAST(c AS TEXT): integers carry as
-		//     exact decimal text (> 2^53 included), where a bare JSON number would
-		//     round; NULL stays NULL.
+		// value → EXACT text per storage class (blob→hex, real→%.17g, else
+		// CAST AS TEXT). The (typeof, value) pair is built by the SHARED
+		// [CapturedTypeofExpr] / [CapturedValueExpr] so this reader projection
+		// and the sqlite-trigger capture trigger body (ADR-0135) can never drift
+		// on the encoding — see CapturedValueExpr for the per-class rationale.
 		parts = append(
 			parts,
-			"typeof("+q+") AS "+quoteIdent(typeofAlias(plan.typeofPrefix, i)),
-			"CASE typeof("+q+") WHEN 'blob' THEN hex("+q+") WHEN 'real' THEN format('%.17g', "+q+") ELSE CAST("+q+" AS TEXT) END AS "+q,
+			CapturedTypeofExpr(q)+" AS "+quoteIdent(typeofAlias(plan.typeofPrefix, i)),
+			CapturedValueExpr(q)+" AS "+q,
 		)
 	}
 	if plan.useRowid {
