@@ -23,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite" // pure-Go driver for seeding the temp source file
 
@@ -37,7 +38,7 @@ import (
 // small enough to seed and migrate quickly.
 const chunkSourceRows = 2000
 
-// seedSQLiteChunkSource writes a temp SQLite `.db` with three PK families,
+// seedSQLiteChunkSource writes a temp SQLite `.db` with four PK families,
 // each chunkSourceRows rows:
 //
 //   - wide_int: single INTEGER PK (id 1..N), v = id*2 → MIN/MAX/divide.
@@ -46,11 +47,15 @@ const chunkSourceRows = 2000
 //     collation guard), n = the ordinal payload.
 //   - wide_comp: composite (g, k) PK, payload = g*100000 + j → keyset
 //     row-value comparison.
+//   - wide_ts: single DATETIME PK (the temporal silent-loss guard) — this
+//     table is ABOVE the chunk threshold but its PK decodes to a time.Time
+//     that can't round-trip a `>` cursor, so it MUST be disqualified and
+//     copied whole-table single-reader (NOT chunked); n = the ordinal.
 //
 // Returns the file path plus the expected SUM of each table's payload so the
 // content compare catches a corrupted/duplicated/dropped row, not just a
 // count mismatch.
-func seedSQLiteChunkSource(t *testing.T) (path string, wantIntSum, wantTextSum, wantCompSum int64) {
+func seedSQLiteChunkSource(t *testing.T) (path string, wantIntSum, wantTextSum, wantCompSum, wantTsSum int64) {
 	t.Helper()
 	path = filepath.Join(t.TempDir(), "chunk.db")
 	db, err := sql.Open("sqlite", path)
@@ -63,6 +68,7 @@ func seedSQLiteChunkSource(t *testing.T) (path string, wantIntSum, wantTextSum, 
 		`CREATE TABLE wide_int (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)`,
 		`CREATE TABLE wide_text (k TEXT PRIMARY KEY, n INTEGER NOT NULL)`,
 		`CREATE TABLE wide_comp (g INTEGER NOT NULL, k TEXT NOT NULL, payload INTEGER NOT NULL, PRIMARY KEY (g, k))`,
+		`CREATE TABLE wide_ts (k DATETIME PRIMARY KEY, n INTEGER NOT NULL)`,
 	}
 	for _, s := range ddl {
 		if _, err := db.ExecContext(context.Background(), s); err != nil {
@@ -126,16 +132,40 @@ func seedSQLiteChunkSource(t *testing.T) (path string, wantIntSum, wantTextSum, 
 		}
 	}
 	flush("wide_comp", "g,k,payload", vals)
+	vals = vals[:0]
 
-	return path, wantIntSum, wantTextSum, wantCompSum
+	// wide_ts: a DATETIME PK stored as INTEGER unix-epoch seconds (the source
+	// DSN selects sqlite_date_encoding=unixepoch). This is the CATASTROPHIC
+	// case the value-fidelity review flagged: had the table chunked, the
+	// intra-chunk cursor would bind the decoded time.Time as TEXT, SQLite ranks
+	// numeric < text so `k > <text-cursor>` is FALSE for every numeric row, the
+	// 2nd page of each chunk comes back EMPTY, and the chunk silently truncates
+	// to one page. The fix disqualifies the temporal PK so the table is copied
+	// whole-table single-reader instead — this fixture would FAIL the
+	// exactly-once assertion below if that disqualification regressed.
+	tsBase := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).Unix()
+	for i := 0; i < chunkSourceRows; i++ {
+		vals = append(vals, fmt.Sprintf("(%d,%d)", tsBase+int64(i)*60, i))
+		wantTsSum += int64(i)
+		if len(vals) == batch {
+			flush("wide_ts", "k,n", vals)
+			vals = vals[:0]
+		}
+	}
+	flush("wide_ts", "k,n", vals)
+
+	return path, wantIntSum, wantTextSum, wantCompSum, wantTsSum
 }
 
 // TestMigrate_SQLiteChunkedToPostgres is the end-to-end exactly-once pin for
-// within-table chunking. It also asserts (via the test-only chunk lifecycle
-// observer) that at least one table ACTUALLY chunked — proving the new path
-// ran rather than a silent fall-through to single-reader.
+// within-table chunking. The config forces MULTI-PAGE chunks (chunks larger
+// than the per-page batch limit) so the intra-chunk cursor advance — the
+// silent-loss surface the value-fidelity review flagged — is actually
+// exercised, not just a single page per chunk. It also asserts (via the
+// test-only chunk lifecycle observer) that the round-trippable tables chunked
+// while the temporal-PK table did NOT (it must fall back to single-reader).
 func TestMigrate_SQLiteChunkedToPostgres(t *testing.T) {
-	src, wantIntSum, wantTextSum, wantCompSum := seedSQLiteChunkSource(t)
+	src, wantIntSum, wantTextSum, wantCompSum, wantTsSum := seedSQLiteChunkSource(t)
 	_, pgTarget, pgCleanup := startPostgres(t)
 	defer pgCleanup()
 
@@ -168,13 +198,21 @@ func TestMigrate_SQLiteChunkedToPostgres(t *testing.T) {
 		t.Fatal("postgres engine not registered")
 	}
 
+	// BulkParallelMinRows=600 with 2000-row tables → ceil(2000/600) floored at
+	// parallelism = 4 chunks of ~500 rows; BulkBatchSize=200 → ~3 pages per
+	// chunk, so the intra-chunk cursor advance is exercised across pages. The
+	// 2000-row wide_ts is also above the 600 threshold, so the ONLY reason it
+	// can stay single-reader is the temporal-PK disqualification — exactly
+	// what we assert below.
 	mig := &Migrator{
-		Source:              sqliteEng,
-		Target:              pgEng,
-		SourceDSN:           src,
-		TargetDSN:           pgTarget,
+		Source:    sqliteEng,
+		Target:    pgEng,
+		SourceDSN: src + "?sqlite_date_encoding=unixepoch", // wide_ts stores unix-epoch ints
+		TargetDSN: pgTarget,
+
 		BulkParallelism:     4,
-		BulkParallelMinRows: 100,
+		BulkParallelMinRows: 600,
+		BulkBatchSize:       200,
 	}
 	if err := mig.Run(ctx2min(t)); err != nil {
 		t.Fatalf("Migrator.Run (SQLite chunked → PG): %v", err)
@@ -190,21 +228,25 @@ func TestMigrate_SQLiteChunkedToPostgres(t *testing.T) {
 	// Exactly-once = count == distinct-PK count == expected, AND the payload
 	// SUM matches (so a corrupted/duplicated value, not just a count slip,
 	// fails). distinct-PK count guards against a boundary-straddling dup;
-	// count==expected guards against a drop.
+	// count==expected guards against a drop. wide_ts proves a temporal-PK
+	// table copies exactly-once on the single-reader fallback (the multi-page
+	// cursor bug would have truncated/duped it had it taken the chunk path).
 	assertChunkExactlyOnce(t, ctx, db, "wide_int", "id", "id", chunkSourceRows, wantIntSum)
 	assertChunkExactlyOnce(t, ctx, db, "wide_text", "k", "n", chunkSourceRows, wantTextSum)
 	assertChunkExactlyOnce(t, ctx, db, "wide_comp", "g||':'||k", "payload", chunkSourceRows, wantCompSum)
+	assertChunkExactlyOnce(t, ctx, db, "wide_ts", "k", "n", chunkSourceRows, wantTsSum)
 
 	obsMu.Lock()
 	defer obsMu.Unlock()
-	chunked := false
-	for _, mx := range maxChunk {
-		if mx >= 1 {
-			chunked = true
+	// Round-trippable tables chunked (proves the multi-page chunk path ran).
+	for _, tbl := range []string{"wide_int", "wide_text", "wide_comp"} {
+		if maxChunk[tbl] < 1 {
+			t.Errorf("table %q did not chunk (max chunk index = %d); the within-table chunk path did not run", tbl, maxChunk[tbl])
 		}
 	}
-	if !chunked {
-		t.Errorf("no table chunked (max chunk index per table = %v); the within-table chunk path did not run", maxChunk)
+	// The temporal-PK table must NOT have chunked (copyChunk never ran for it).
+	if mx, seen := maxChunk["wide_ts"]; seen {
+		t.Errorf("temporal-PK table wide_ts chunked (max chunk index = %d); it must fall back to single-reader (the decoded time.Time cursor can't round-trip)", mx)
 	}
 }
 

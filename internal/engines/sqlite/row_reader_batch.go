@@ -98,6 +98,16 @@ func (r *RowReader) readRowsBatch(ctx context.Context, table *ir.Table, after, u
 		return nil, fmt.Errorf("sqlite: %s: upTo has %d values, table %q has %d PK columns",
 			op, len(upTo), table.Name, len(pkCols))
 	}
+	// Loud refusal for a PK whose decoded cursor value can't round-trip the
+	// raw storage class (temporal / decimal — the Bug-74 silent-loss class;
+	// see pkCursorDisqualified). The orchestrator already routes such tables
+	// to the single-reader path (the chunk surfaces return 0;
+	// canResumePerBatch consults DisqualifiesBatchedRead), so this is the
+	// defensive backstop: a direct caller fails LOUDLY here rather than
+	// driving a cursor that silently truncates or dups a page.
+	if disq, reason := pkCursorDisqualified(table); disq {
+		return nil, fmt.Errorf("sqlite: %s: table %q: %s", op, table.Name, reason)
+	}
 
 	r.mu.Lock()
 	r.err = nil

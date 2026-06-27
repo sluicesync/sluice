@@ -227,6 +227,40 @@ type BoundedBatchedRowReader interface {
 	ReadRowsBatchBounded(ctx context.Context, table *Table, after, upTo []any, limit int) (<-chan Row, error)
 }
 
+// BatchedReadDisqualifier is the optional surface a [BatchedRowReader] can
+// implement to VETO cursor-paginated reads for a SPECIFIC table whose PK
+// shape its decoded-value cursor cannot round-trip — the engine-local escape
+// hatch for the case where implementing [BatchedRowReader] would otherwise
+// silently corrupt a table.
+//
+// The cursor loops ([copyTableWithCursor], [copyChunk]) advance the `after`
+// tuple from the DECODED streamed row value (the same value the writer
+// applies), then re-bind it as the `>` bound of the next page. That only
+// works when the decoded value re-binds to the SAME ordered key the column
+// stores. For most engine/type pairs it does. SQLite is the exception: a
+// temporal column's value is decoded to a Go time.Time (or a formatted
+// time-of-day string) and a NUMERIC column's to a decimal string, but the
+// underlying storage may be INTEGER / REAL / TEXT — so the re-bound cursor
+// compares in the WRONG class against the column's ORDER BY and the next
+// page can come back EMPTY (silent truncation) or re-select copied rows
+// (silent dup). Reconstructing the original stored form from the decoded
+// value is not possible, so such a table must NOT drive the cursor at all.
+//
+// A reader returns (true, reason) to disqualify the table: the orchestrator
+// then routes it to the whole-table single-reader copy ([copyTable]) for
+// BOTH the within-table parallel-chunk path AND the per-batch resume path
+// ([canResumePerBatch]), so neither ever binds a non-round-trippable cursor.
+// (false, "") — or not implementing the interface — keeps the default
+// cursor-eligible behaviour. The reason is logged so the routing is
+// auditable.
+type BatchedReadDisqualifier interface {
+	BatchedRowReader
+
+	// DisqualifiesBatchedRead reports whether cursor-paginated reads are
+	// UNSAFE for this table (its PK can't round-trip a decoded cursor).
+	DisqualifiesBatchedRead(table *Table) (disqualified bool, reason string)
+}
+
 // RowWriter performs bulk inserts using the target's native fast-load
 // path (COPY, LOAD DATA INFILE, batched INSERTs, etc.). Implementations
 // should consume rows until the channel is closed or ctx is cancelled.

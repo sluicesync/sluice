@@ -170,6 +170,19 @@ func TestCanResumePerBatch_Classification(t *testing.T) {
 			wantOK:   true,
 			wantWhy:  cursorBlockedAvailable,
 		},
+		{
+			// The reader implements BatchedRowReader but vetoes this table's
+			// PK via BatchedReadDisqualifier (e.g. a SQLite temporal/decimal
+			// PK whose decoded cursor can't round-trip) — must fall back to
+			// whole-table, NOT drive a broken cursor.
+			name:     "reader disqualifies this table's PK",
+			rw:       fakeBatchableWriter{},
+			rr:       fakeDisqualifyingReader{},
+			table:    tableWithPK,
+			resuming: true,
+			wantOK:   false,
+			wantWhy:  cursorBlockedReaderDisqualified,
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -232,6 +245,16 @@ func (fakeBatchableReader) ReadRowsBatch(context.Context, *ir.Table, []any, int)
 }
 
 func (fakeBatchableReader) Err() error { return nil }
+
+// fakeDisqualifyingReader implements BatchedRowReader AND
+// ir.BatchedReadDisqualifier, vetoing every table — the shape a SQLite
+// reader takes for a temporal/decimal PK whose decoded cursor can't
+// round-trip. canResumePerBatch must classify it as blocked.
+type fakeDisqualifyingReader struct{ fakeBatchableReader }
+
+func (fakeDisqualifyingReader) DisqualifiesBatchedRead(*ir.Table) (disqualified bool, reason string) {
+	return true, "test: PK cannot round-trip a decoded cursor"
+}
 
 // fakePlainWriter implements only ir.RowWriter.
 type fakePlainWriter struct{}

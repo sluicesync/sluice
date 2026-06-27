@@ -313,11 +313,12 @@ func copyOneTableData(
 type cursorBlockReason int
 
 const (
-	cursorBlockedNotResuming   cursorBlockReason = iota // not in resume mode
-	cursorBlockedNoPK                                   // table has no primary key
-	cursorBlockedReaderNotImpl                          // reader doesn't implement BatchedRowReader
-	cursorBlockedWriterNotImpl                          // writer doesn't implement IdempotentRowWriter
-	cursorBlockedAvailable                              // sentinel: per-batch is available
+	cursorBlockedNotResuming        cursorBlockReason = iota // not in resume mode
+	cursorBlockedNoPK                                        // table has no primary key
+	cursorBlockedReaderNotImpl                               // reader doesn't implement BatchedRowReader
+	cursorBlockedWriterNotImpl                               // writer doesn't implement IdempotentRowWriter
+	cursorBlockedReaderDisqualified                          // reader vetoes cursor pagination for this table's PK shape
+	cursorBlockedAvailable                                   // sentinel: per-batch is available
 )
 
 // canResumePerBatch reports whether the per-batch cursor path can be
@@ -328,9 +329,17 @@ const (
 //   - The table has a primary key (the cursor is a PK-ordered tuple).
 //   - The reader implements [ir.BatchedRowReader].
 //   - The writer implements [ir.IdempotentRowWriter].
+//   - The reader does NOT veto cursor pagination for this table via the
+//     optional [ir.BatchedReadDisqualifier] surface (a PK whose decoded
+//     value can't round-trip a `>` cursor — e.g. a SQLite temporal/decimal
+//     PK, whose decoded time.Time/decimal-string re-binds in the wrong
+//     class against the column's stored INTEGER/REAL/TEXT and silently
+//     truncates or dups the page). A vetoed table falls back to the
+//     whole-table single-reader [copyTable] on resume, exactly as it did
+//     before the reader implemented BatchedRowReader.
 //
-// All four must be true. The second return value identifies the
-// blocking reason for callers that want to log it.
+// All must be true. The second return value identifies the blocking
+// reason for callers that want to log it.
 func canResumePerBatch(rw ir.RowWriter, rr ir.RowReader, table *ir.Table, resuming bool) (bool, cursorBlockReason) {
 	if !resuming {
 		return false, cursorBlockedNotResuming
@@ -343,6 +352,11 @@ func canResumePerBatch(rw ir.RowWriter, rr ir.RowReader, table *ir.Table, resumi
 	}
 	if _, ok := rw.(ir.IdempotentRowWriter); !ok {
 		return false, cursorBlockedWriterNotImpl
+	}
+	if d, ok := rr.(ir.BatchedReadDisqualifier); ok {
+		if disq, _ := d.DisqualifiesBatchedRead(table); disq {
+			return false, cursorBlockedReaderDisqualified
+		}
 	}
 	return true, cursorBlockedAvailable
 }

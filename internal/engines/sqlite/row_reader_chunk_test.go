@@ -9,9 +9,153 @@ import (
 	"fmt"
 	"sort"
 	"testing"
+	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
+
+// pkNames returns the table's PK column names in order.
+func pkNames(table *ir.Table) []string {
+	out := make([]string, len(table.PrimaryKey.Columns))
+	for i, c := range table.PrimaryKey.Columns {
+		out[i] = c.Column
+	}
+	return out
+}
+
+// twoColInserts builds `INSERT INTO t (k, n) VALUES (<kLit>, i)` for i in
+// 0..n-1, where kLit renders the SQL literal for the PK column.
+func twoColInserts(n int, kLit func(i int) string) string {
+	var b bytes.Buffer
+	b.WriteString("INSERT INTO t (k, n) VALUES ")
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, "(%s,%d)", kLit(i), i)
+	}
+	return b.String()
+}
+
+// TestPK_TemporalDecimalDisqualified is the CRITICAL silent-loss guard (the
+// value-fidelity BLOCK fix): a SQLite temporal or decimal PK decodes to a
+// time.Time / decimal-string that cannot round-trip the column's raw INTEGER/
+// REAL/TEXT storage as a `>` cursor bound, so such tables must be EXCLUDED
+// from BOTH the chunk path AND the per-batch resume cursor and copied
+// whole-table single-reader instead. This pins the exclusion per declared
+// family AND per storage class (incl. the catastrophic INTEGER-storage
+// datetime case): all chunk-decision surfaces report "no chunking", the
+// per-batch capability is vetoed (DisqualifiesBatchedRead), and the batched
+// readers refuse LOUDLY rather than driving a broken cursor.
+func TestPK_TemporalDecimalDisqualified(t *testing.T) {
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name string
+		ddl  string
+		kLit func(i int) string
+	}{
+		{
+			// DATE -> ir.Date, ISO TEXT storage.
+			"date_iso", `CREATE TABLE t (k DATE PRIMARY KEY, n INTEGER)`,
+			func(i int) string { return "'" + base.AddDate(0, 0, i).Format("2006-01-02") + "'" },
+		},
+		{
+			// DATETIME -> ir.Timestamp, ISO TEXT storage.
+			"datetime_iso", `CREATE TABLE t (k DATETIME PRIMARY KEY, n INTEGER)`,
+			func(i int) string {
+				return "'" + base.Add(time.Duration(i)*time.Second).Format("2006-01-02 15:04:05") + "'"
+			},
+		},
+		{
+			// DATETIME -> ir.Timestamp, INTEGER (unix-epoch) storage — the
+			// catastrophic case: a TEXT-bound time.Time cursor ranks below
+			// every numeric row, so the 2nd page would be empty (silent
+			// truncation). Disqualification fires on the declared type before
+			// any decode, so the numeric storage is moot — but pinned anyway.
+			"datetime_int_storage", `CREATE TABLE t (k DATETIME PRIMARY KEY, n INTEGER)`,
+			func(i int) string { return fmt.Sprintf("%d", base.Unix()+int64(i)*60) },
+		},
+		{
+			// TIME -> ir.Time (decodes to a formatted time-of-day string).
+			"time_iso", `CREATE TABLE t (k TIME PRIMARY KEY, n INTEGER)`,
+			func(i int) string { return "'" + base.Add(time.Duration(i)*time.Second).Format("15:04:05") + "'" },
+		},
+		{
+			// DECIMAL -> ir.Decimal (decodes to a decimal string) — excluded
+			// conservatively (NUMERIC-affinity scientific-notation edges).
+			"decimal", `CREATE TABLE t (k DECIMAL PRIMARY KEY, n INTEGER)`,
+			func(i int) string { return fmt.Sprintf("%d.5", i) },
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			path := seedDB(t, c.ddl, twoColInserts(50, c.kLit))
+			tbl := schemaTable(t, path, "t")
+			rr := openReader(t, path)
+			defer func() { _ = rr.Close() }()
+			ctx := context.Background()
+			pk := tbl.PrimaryKey.Columns[0].Column
+
+			// All four chunk-decision surfaces report "no chunking".
+			if n, err := rr.EstimateRowCount(ctx, tbl); err != nil || n != 0 {
+				t.Errorf("EstimateRowCount = (%d,%v); want (0,nil) — must disqualify chunking", n, err)
+			}
+			if n, err := rr.CountRows(ctx, tbl); err != nil || n != 0 {
+				t.Errorf("CountRows = (%d,%v); want (0,nil)", n, err)
+			}
+			if lo, hi, err := rr.RangeBounds(ctx, tbl, pk); err != nil || lo != nil || hi != nil {
+				t.Errorf("RangeBounds = (%v,%v,%v); want (nil,nil,nil)", lo, hi, err)
+			}
+			if b, err := rr.SampleKeysetBoundaries(ctx, tbl, pkNames(tbl), 4); err != nil || len(b) != 0 {
+				t.Errorf("SampleKeysetBoundaries = (%v,%v); want (empty,nil)", b, err)
+			}
+
+			// Per-batch resume capability is vetoed.
+			if dq, reason := rr.DisqualifiesBatchedRead(tbl); !dq || reason == "" {
+				t.Errorf("DisqualifiesBatchedRead = (%v,%q); want (true, <reason>)", dq, reason)
+			}
+
+			// The batched readers refuse LOUDLY (no broken cursor).
+			if _, err := rr.ReadRowsBatch(ctx, tbl, nil, 10); err == nil {
+				t.Error("ReadRowsBatch: err = nil; want a loud refusal for a non-round-trippable PK")
+			}
+			if _, err := rr.ReadRowsBatchBounded(ctx, tbl, nil, nil, 10); err == nil {
+				t.Error("ReadRowsBatchBounded: err = nil; want a loud refusal for a non-round-trippable PK")
+			}
+		})
+	}
+}
+
+// TestPK_RoundTrippableNotDisqualified is the positive control: the
+// round-trippable families (integer / BINARY text / NOCASE text / blob /
+// composite) are NOT disqualified, so they keep the chunk + per-batch cursor
+// path. (Their exactly-once correctness is pinned by
+// TestKeyset_ExactlyOncePartition.)
+func TestPK_RoundTrippableNotDisqualified(t *testing.T) {
+	cases := []struct {
+		name, ddl, insert string
+	}{
+		{"int", `CREATE TABLE t (k INTEGER PRIMARY KEY, n INTEGER)`, `INSERT INTO t (k,n) VALUES (1,1),(2,2)`},
+		{"text", `CREATE TABLE t (k TEXT PRIMARY KEY, n INTEGER)`, `INSERT INTO t (k,n) VALUES ('a',1),('b',2)`},
+		{"text_nocase", `CREATE TABLE t (k TEXT COLLATE NOCASE PRIMARY KEY, n INTEGER)`, `INSERT INTO t (k,n) VALUES ('A',1),('b',2)`},
+		{"blob", `CREATE TABLE t (k BLOB PRIMARY KEY, n INTEGER)`, `INSERT INTO t (k,n) VALUES (x'01',1),(x'02',2)`},
+		{"composite", `CREATE TABLE t (g INTEGER NOT NULL, k TEXT NOT NULL, n INTEGER, PRIMARY KEY (g,k))`, `INSERT INTO t (g,k,n) VALUES (1,'a',1),(1,'b',2)`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			path := seedDB(t, c.ddl, c.insert)
+			tbl := schemaTable(t, path, "t")
+			rr := openReader(t, path)
+			defer func() { _ = rr.Close() }()
+			if dq, _ := rr.DisqualifiesBatchedRead(tbl); dq {
+				t.Errorf("DisqualifiesBatchedRead = true; want false (this PK round-trips)")
+			}
+			if n, err := rr.EstimateRowCount(context.Background(), tbl); err != nil || n != 2 {
+				t.Errorf("EstimateRowCount = (%d,%v); want (2,nil) — must stay chunk-eligible", n, err)
+			}
+		})
+	}
+}
 
 // schemaTable opens path, reads the schema, and returns the named table
 // (with its PrimaryKey populated) so the batched-read helpers have a real

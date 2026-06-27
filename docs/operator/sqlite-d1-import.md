@@ -28,7 +28,10 @@ which a table stays single-reader). Each chunk opens its own read-only connectio
 file. A `.sql` **dump** source (below) stays single-reader regardless — the dump is
 materialized into a temporary database that would be wasteful to rebuild per chunk; if
 you want a dump's big tables to parallel-copy, materialize it to a `.db` first
-(`sqlite3 app.db < dump.sql`) and migrate that.
+(`sqlite3 app.db < dump.sql`) and migrate that. A table whose PRIMARY KEY is a temporal
+(DATE/DATETIME/TIME) or decimal column also stays single-reader (such a value can't drive
+SQLite's range cursor faithfully); it still migrates correctly, just without within-table
+parallelism. Integer / text / blob / composite keys parallel-copy as normal.
 
 ## Cloudflare D1 (the recommended path: export → migrate)
 

@@ -45,19 +45,92 @@ import (
 // Static assertions: the SQLite reader implements the optional chunk-
 // orchestration surfaces.
 var (
-	_ ir.RangeBoundsQuerier = (*RowReader)(nil)
-	_ ir.KeysetSampler      = (*RowReader)(nil)
-	_ ir.RowCounter         = (*RowReader)(nil)
-	_ ir.RowCountEstimator  = (*RowReader)(nil)
+	_ ir.RangeBoundsQuerier      = (*RowReader)(nil)
+	_ ir.KeysetSampler           = (*RowReader)(nil)
+	_ ir.RowCounter              = (*RowReader)(nil)
+	_ ir.RowCountEstimator       = (*RowReader)(nil)
+	_ ir.BatchedReadDisqualifier = (*RowReader)(nil)
 )
+
+// pkCursorDisqualified reports whether table's primary key contains a column
+// whose resolved IR type cannot round-trip a DECODED cursor value back into
+// the page's `>` / `<=` bound — SQLite's temporal and decimal families. It is
+// the load-bearing silent-loss guard for the cursor path (the Bug-74 class).
+//
+// The cursor loops advance the `after` tuple from the DECODED streamed row
+// value (the same value the writer applies), then re-bind it as `(pk) > (?)`
+// for the next page. A temporal column decodes to a Go time.Time (Date /
+// Timestamp) or a formatted time-of-day string (Time), and a NUMERIC column
+// to a decimal string (value_decode.go) — but the column's raw STORAGE class
+// is INTEGER / REAL / TEXT by app convention. Re-binding the decoded value
+// then compares in the WRONG class against the column's ORDER BY:
+//
+//   - unixepoch / unixmillis / julian (numeric storage): a time.Time binds as
+//     TEXT (`t.String()`), SQLite ranks numeric < text and NUMERIC affinity
+//     can't coerce that string, so `pk > <text>` is FALSE for every row → the
+//     2nd page of each chunk is EMPTY → silent truncation to one page.
+//   - ISO text storage with a timezone/`T` separator: `t.String()` normalizes
+//     to UTC and appends ` +0000 UTC`, reordering against the BINARY ORDER BY
+//     → already-copied rows re-selected (dup) or skipped (loss).
+//   - decimal-as-string: usually rescued by NUMERIC affinity but the
+//     scientific-notation / precision edges are unpinned, so it is excluded
+//     conservatively (a family on a family-dispatched path).
+//
+// The original stored form is unrecoverable from the decoded value, so such a
+// table must NOT drive a cursor at all — it falls back to the whole-table
+// single-reader copy. Integer / text (BINARY or NOCASE) / blob / composites
+// of those round-trip exactly and stay cursor-eligible.
+func pkCursorDisqualified(table *ir.Table) (disqualified bool, reason string) {
+	if table == nil || table.PrimaryKey == nil {
+		return false, ""
+	}
+	for _, pkc := range table.PrimaryKey.Columns {
+		for _, c := range table.Columns {
+			if c.Name != pkc.Column {
+				continue
+			}
+			switch c.Type.(type) {
+			case ir.Date, ir.Time, ir.Timestamp, ir.DateTime, ir.Decimal:
+				return true, fmt.Sprintf("primary key column %q is %s, whose decoded cursor value cannot round-trip SQLite's raw storage class; single-reader path",
+					c.Name, c.Type.String())
+			}
+			break
+		}
+	}
+	return false, ""
+}
+
+// chunkDisqualified reports whether table must NOT take the within-table
+// parallel-chunk path. Two causes: a materialized `.sql` dump (per-chunk
+// readers would each re-materialize the temp DB — see the file header) or a
+// PK whose decoded cursor can't round-trip ([pkCursorDisqualified]). All four
+// chunk-DECISION surfaces consult it so a disqualified table routes to the
+// single-reader copy uniformly.
+func (r *RowReader) chunkDisqualified(table *ir.Table) bool {
+	if r.tempPath != "" {
+		return true
+	}
+	dq, _ := pkCursorDisqualified(table)
+	return dq
+}
+
+// DisqualifiesBatchedRead implements [ir.BatchedReadDisqualifier]: it vetoes
+// the cursor-paginated read (and thus the per-batch resume path) for a table
+// whose PK can't round-trip a decoded cursor. Unlike [chunkDisqualified] it
+// does NOT consider tempPath — a `.sql`-dump source reads fine through the
+// SINGLE owning reader's own temp DB on the per-batch resume path; only the
+// per-CHUNK re-materialization is the dump's problem.
+func (r *RowReader) DisqualifiesBatchedRead(table *ir.Table) (disqualified bool, reason string) {
+	return pkCursorDisqualified(table)
+}
 
 // RangeBounds implements [ir.RangeBoundsQuerier]: MIN/MAX of a single
 // integer PK column for the MIN/MAX/divide chunk strategy. An empty table
 // surfaces as (nil, nil, nil) so the orchestrator routes to single-reader.
 //
-// A `.sql`-dump source reports (nil, nil, nil) — "empty / no chunking" —
-// so it never chunks (see the file-header routing note); the binary `.db`
-// path runs the real MIN/MAX.
+// A chunk-disqualified source (a `.sql` dump, or a non-round-trippable PK —
+// [chunkDisqualified]) reports (nil, nil, nil) — "no chunking" — so it never
+// chunks; the binary `.db` integer-PK path runs the real MIN/MAX.
 func (r *RowReader) RangeBounds(ctx context.Context, table *ir.Table, pkColumn string) (minVal, maxVal any, err error) {
 	if table == nil {
 		return nil, nil, errors.New("sqlite: RangeBounds: table is nil")
@@ -65,8 +138,7 @@ func (r *RowReader) RangeBounds(ctx context.Context, table *ir.Table, pkColumn s
 	if pkColumn == "" {
 		return nil, nil, errors.New("sqlite: RangeBounds: pkColumn is empty")
 	}
-	if r.tempPath != "" {
-		// Materialized `.sql` dump: single-reader only (file-header note).
+	if r.chunkDisqualified(table) {
 		return nil, nil, nil
 	}
 	q := fmt.Sprintf("SELECT MIN(%s), MAX(%s) FROM %s",
@@ -103,12 +175,14 @@ func (r *RowReader) RangeBounds(ctx context.Context, table *ir.Table, pkColumn s
 // PK index in the common case), so an exact count beats an approximation,
 // and SQLite's concurrent-reader support means it can run on the reader's
 // pool alongside the in-flight copy stream without conflict. Returns
-// (0, nil) — "no estimate" — for a `.sql`-dump source.
+// (0, nil) — "no estimate" — for a chunk-disqualified source
+// ([chunkDisqualified]: a `.sql` dump or a non-round-trippable PK), uniform
+// with the other chunk-decision surfaces.
 func (r *RowReader) CountRows(ctx context.Context, table *ir.Table) (int64, error) {
 	if table == nil {
 		return 0, errors.New("sqlite: CountRows: table is nil")
 	}
-	if r.tempPath != "" {
+	if r.chunkDisqualified(table) {
 		return 0, nil
 	}
 	return r.countRows(ctx, table)
@@ -117,16 +191,17 @@ func (r *RowReader) CountRows(ctx context.Context, table *ir.Table) (int64, erro
 // EstimateRowCount implements [ir.RowCountEstimator]: the pre-stream chunk-
 // DECISION row count ([shouldParallelChunk]). It is the same exact
 // `SELECT COUNT(*)` as [CountRows] (cheap on a local file) EXCEPT it is the
-// designated routing point for the `.sql`-dump source: a dump returns
-// (0, nil) so the orchestrator keeps it on the single-reader path (the
-// per-chunk readers would each re-materialize the dump — see the file-
-// header note). A real `.db` returns the exact count.
+// designated routing point that returns (0, nil) — "route to single-reader" —
+// for any chunk-disqualified source ([chunkDisqualified]): a `.sql` dump (the
+// per-chunk readers would each re-materialize it) OR a PK whose decoded
+// cursor can't round-trip SQLite's raw storage (temporal/decimal — the
+// silent-loss guard). A real `.db` with a round-trippable PK returns the
+// exact count.
 func (r *RowReader) EstimateRowCount(ctx context.Context, table *ir.Table) (int64, error) {
 	if table == nil {
 		return 0, errors.New("sqlite: EstimateRowCount: table is nil")
 	}
-	if r.tempPath != "" {
-		// Materialized `.sql` dump: route to single-reader (file-header note).
+	if r.chunkDisqualified(table) {
 		return 0, nil
 	}
 	return r.countRows(ctx, table)
@@ -186,8 +261,9 @@ func (r *RowReader) countRows(ctx context.Context, table *ir.Table) (int64, erro
 //
 // Fewer than n-1 distinct boundaries (a tiny / heavily-duplicate-keyed
 // table) or an empty table returns fewer / zero tuples — NOT an error; the
-// orchestrator collapses to fewer chunks or single-reader. A `.sql`-dump
-// source returns zero tuples (single-reader; file-header note).
+// orchestrator collapses to fewer chunks or single-reader. A chunk-
+// disqualified source (a `.sql` dump, or a non-round-trippable PK —
+// [chunkDisqualified]) returns zero tuples (single-reader).
 func (r *RowReader) SampleKeysetBoundaries(ctx context.Context, table *ir.Table, pkColumns []string, n int) ([][]any, error) {
 	if table == nil {
 		return nil, errors.New("sqlite: SampleKeysetBoundaries: table is nil")
@@ -198,8 +274,7 @@ func (r *RowReader) SampleKeysetBoundaries(ctx context.Context, table *ir.Table,
 	if n <= 1 {
 		return nil, fmt.Errorf("sqlite: SampleKeysetBoundaries: n must be > 1, got %d", n)
 	}
-	if r.tempPath != "" {
-		// Materialized `.sql` dump: single-reader only (file-header note).
+	if r.chunkDisqualified(table) {
 		return nil, nil
 	}
 
