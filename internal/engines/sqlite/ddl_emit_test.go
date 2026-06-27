@@ -26,8 +26,11 @@ func TestEmitColumnType(t *testing.T) {
 		{"integer8", ir.Integer{Width: 8}, "INTEGER", isType[ir.Integer]},
 		{"float", ir.Float{Precision: ir.FloatDouble}, "REAL", isType[ir.Float]},
 		{"float single", ir.Float{Precision: ir.FloatSingle}, "REAL", isType[ir.Float]},
-		{"decimal unconstrained", ir.Decimal{Unconstrained: true}, "NUMERIC", isType[ir.Decimal]},
-		{"decimal p,s", ir.Decimal{Precision: 10, Scale: 2}, "DECIMAL(10,2)", isType[ir.Decimal]},
+		// Bug 162: decimals emit TEXT affinity (exact value), reading back as
+		// ir.Text — NUMERIC/DECIMAL affinity silently coerces e.g. 19.99 to a
+		// binary float. Value-faithful type downgrade, like json/uuid→TEXT.
+		{"decimal unconstrained", ir.Decimal{Unconstrained: true}, "TEXT", isType[ir.Text]},
+		{"decimal p,s", ir.Decimal{Precision: 10, Scale: 2}, "TEXT", isType[ir.Text]},
 		{"char", ir.Char{Length: 4}, "TEXT", isType[ir.Text]},
 		{"varchar", ir.Varchar{Length: 20}, "TEXT", isType[ir.Text]},
 		{"text", ir.Text{Size: ir.TextLong}, "TEXT", isType[ir.Text]},

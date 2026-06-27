@@ -46,7 +46,7 @@ read back to the SAME IR type via the reader's `resolveColumnType`:
 | `Boolean` | `BOOLEAN` | `Boolean` (declared-bool match) | value stored 0/1 INTEGER |
 | `Integer` (any width/sign) | `INTEGER` | `Integer{Width:64}` | SQLite ints are 64-bit signed; width/unsigned NOT preserved (SQLite has neither) |
 | `Float` | `REAL` | `Float{double}` | |
-| `Decimal` | `DECIMAL(p,s)` / `NUMERIC` | `Decimal{unconstrained}` | precision/scale not enforced by SQLite; value handling — see §2 wart |
+| `Decimal` | `TEXT` (Bug 162 amendment) | `Text` | NUMERIC affinity silently coerces money to REAL — see the Bug 162 amendment below; TEXT stores the exact decimal string, reading back as `ir.Text` |
 | `Char` / `Varchar` / `Text` | `TEXT` | `Text{long}` | SQLite does not enforce length; Char/Varchar widen to Text on a SQLite round-trip |
 | `Binary` / `Varbinary` / `Blob` | `BLOB` | `Blob{long}` | Binary/Varbinary widen to Blob |
 | `Date` | `DATE` | `Date` | value = ISO `YYYY-MM-DD` TEXT |
@@ -76,9 +76,10 @@ its value text is carried verbatim; a re-read under the default `iso` encoding m
 loud-refuse a zone-suffixed time-of-day. timetz→SQLite is a documented edge, not a
 shipping-path concern.)
 
-**Decimal type vs value (the §2 wart in the table).** The DECLARED type emits NUMERIC
-affinity (`DECIMAL(p,s)`/`NUMERIC`) so the column round-trips as `ir.Decimal`. The VALUE
-handling — where SQLite's coercion forces the loud-refusal — is §2.
+**Decimal type vs value — SUPERSEDED by the Bug 162 amendment below.** The original design
+emitted NUMERIC affinity to round-trip the `ir.Decimal` type; that silently corrupted money
+to REAL. Decimals now emit TEXT affinity (exact value, type downgrades to `ir.Text`). See
+the Bug 162 amendment.
 
 ### 2. Value encode (inverse of `value_decode.go`), refuse-not-coerce
 
@@ -103,26 +104,33 @@ so a re-read recovers them); `--sqlite-date-encoding` is a READ concern for arbi
 existing DBs, not a write knob. A value that cannot be faithfully written is refused
 loudly naming the row's table.column.
 
-**The named decimal wart — `refuse-decimal-beyond-float64`.** SQLite's NUMERIC affinity
-coerces a bound decimal string to INTEGER (exact for any int64-range integer) or REAL
-(float64). A decimal that fits int64 is stored EXACTLY. A fractional decimal — or an
-integer beyond int64 range — is stored as REAL, which round-trips losslessly through the
-reader's `FormatFloat` ONLY up to float64's 15-significant-digit guarantee. The writer
-therefore guards every decimal value: it is allowed iff it parses as an int64 OR its
-significant-digit count is ≤ 15; otherwise it is **REFUSED LOUDLY** (naming
-table.column.value), because SQLite cannot store it without silent precision loss.
+**★ AMENDMENT (2026-06-27, Bug 162 — the original decimal decision was a CRITICAL silent
+corruption; corrected to TEXT affinity.)** The first cut declared decimals with NUMERIC/
+`DECIMAL(p,s)` affinity (to round-trip the `ir.Decimal` *type*) and guarded the value with
+a significant-digit count (`refuse-decimal-beyond-float64`). That was WRONG: SQLite's
+NUMERIC affinity stores an ordinary money value like `19.99` as a binary **REAL** on disk
+(ground-truthed: `typeof` = `real` for `19.99`, `5.10`, `98765432.1098`, `0.1`), and the
+significant-digit guard misses it because float64-loss is about *dyadic representability*,
+not digit count — `19.99` has 4 digits yet is not float64-exact. The `.db` is the entire
+deliverable (X→SQLite→D1), so the on-disk artifact handed to D1 holds money as binary
+floats, and a re-migrate of the REAL back into a constrained target `NUMERIC` can fail
+loudly (`98765432.1098` scans back as `9.87654321098e+07`). The §4 value-fidelity review
+missed this because it read `19.99` back through SQLite's own 15-digit text conversion
+(which shows `19.99`) rather than asserting the on-disk storage class / a byte-exact
+round-trip; the post-release regression cycle on the real binary caught it. This is the
+Bug-74 lesson again: pin the on-disk/real-path behavior, not a representative read.
 
-The contract within the guard is NUMERIC fidelity, not byte-identical text: the value is
-stored losslessly, but its TEXT representation may be NORMALIZED on read-back because the
-reader renders a REAL-stored decimal via Go's shortest-round-trippable `FormatFloat`. So
-an integer-valued decimal drops its scale (`100.00` → `100`, stored as an exact INTEGER),
-trailing zeros are dropped (`0.30` → `0.3`), and a large/small magnitude renders in
-scientific notation (`1234567.89` → `1.23456789e+06`, `0.00001` → `1e-05`,
-`99999999999999.9` → `9.99999999999999e+13`) — every form numerically identical to the
-source. This is pinned by an explicit writer→DB→reader round-trip test that asserts
-numeric equality AND documents the exact normalized text form (so the divergence is
-intentional and visible, not a surprise if the reader or an assertion is later tightened
-to text-equality).
+**Corrected decision — decimals are emitted with TEXT affinity (declared `TEXT`).** SQLite
+stores text verbatim with no numeric coercion, so a decimal of ANY precision round-trips
+**byte-exact** (`19.99` → `19.99`, `100.00` → `100.00`, `0.30` → `0.30`,
+`12345678901234567890.1234567890` → exact). The value is bound as its exact string by
+`encodeDecimal` (no guard, no refusal — TEXT preserves everything). The cost is a
+**documented type downgrade**: the column reads back as `ir.Text` rather than
+`ir.Decimal` — the same value-faithful trade as `JSON`/`UUID`→`TEXT`, and the correct one,
+since a silent VALUE corruption is never acceptable to preserve a TYPE label (and SQLite/D1
+are dynamically typed, so a decimal-as-text is a perfectly faithful decimal value). Pinned
+by an explicit writer→DB→**schema-resolved-reader** round-trip test (`TestWriterDecimalTextExact`)
+that asserts BYTE-exact equality through the real read path — the gap the original review left.
 
 This refuse rule diverges from the seeded ADR phrasing "DECIMAL stored as TEXT to preserve precision" —
 that is empirically IMPOSSIBLE under NUMERIC affinity (text decimals are coerced to

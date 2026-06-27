@@ -35,7 +35,7 @@ import (
 // emitColumnType maps an IR type to its SQLite declared type, or returns
 // a loud refusal for a type SQLite has no faithful storage for.
 func emitColumnType(t ir.Type) (string, error) {
-	switch v := t.(type) {
+	switch t.(type) {
 	case ir.Boolean:
 		// "BOOLEAN" is read back as ir.Boolean (ADR-0129 declared-bool
 		// match); values store as 0/1 INTEGER.
@@ -48,15 +48,22 @@ func emitColumnType(t ir.Type) (string, error) {
 	case ir.Float:
 		return "REAL", nil
 	case ir.Decimal:
-		// NUMERIC affinity so the column reads back as ir.Decimal. The
-		// VALUE-fidelity guard (a decimal beyond float64's exact range is
-		// refused) lives in value_encode.go — SQLite's NUMERIC affinity
-		// coerces a bound text decimal to INTEGER/REAL on insert, so the
-		// declared type cannot itself preserve precision (ADR-0134 §2).
-		if v.Unconstrained {
-			return "NUMERIC", nil
-		}
-		return fmt.Sprintf("DECIMAL(%d,%d)", v.Precision, v.Scale), nil
+		// TEXT affinity — NOT NUMERIC/DECIMAL (Bug 162). SQLite's NUMERIC
+		// affinity coerces a bound decimal to REAL when the text→REAL→text
+		// round-trip is "reversible" at SQLite's 15-digit text precision, so
+		// an ordinary money value like `19.99` is silently stored as the
+		// binary float 19.989999999999998 — and sluice's reader, which
+		// formats a REAL with the shortest-exact FormatFloat(-1), reads it
+		// back as `19.989999999999998`, not `19.99`. That is a SILENT value
+		// corruption, and the `.db` is the deliverable (X→SQLite→D1). The
+		// only way SQLite preserves the exact decimal text is TEXT affinity
+		// (it stores text verbatim, no coercion). The cost is a documented
+		// type downgrade: the column reads back as ir.Text rather than
+		// ir.Decimal — the same value-faithful trade as JSON/UUID→TEXT, and
+		// the right one, since silent value loss is never acceptable. The
+		// decimal value is bound as its exact string by encodeDecimal. See
+		// ADR-0134 §2.
+		return "TEXT", nil
 	case ir.Char, ir.Varchar, ir.Text:
 		// TEXT affinity. SQLite does not enforce a declared length, so
 		// Char/Varchar widen to ir.Text on a SQLite round-trip — values

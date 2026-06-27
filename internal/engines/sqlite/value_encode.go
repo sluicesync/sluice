@@ -6,7 +6,6 @@ package sqlite
 import (
 	"fmt"
 	"math"
-	"strconv"
 	"strings"
 	"time"
 
@@ -153,64 +152,21 @@ func encodeSet(col *ir.Column, v any) (any, error) {
 	}
 }
 
-// encodeDecimal binds a decimal string after guarding against SQLite's
-// silent NUMERIC-affinity precision loss (the named refuse-decimal-
-// beyond-float64 wart, ADR-0134 §2). A decimal that fits int64 stores
-// EXACTLY (INTEGER); any other decimal is coerced to REAL on insert, which
-// round-trips losslessly only up to float64's 15-significant-digit
-// guarantee. A decimal beyond that is REFUSED LOUDLY (SQLite cannot hold
-// it without loss) — the escape hatch is to carry the column as text.
+// encodeDecimal binds a decimal string verbatim. The target column is
+// declared with TEXT affinity (see emitColumnType's ir.Decimal case,
+// Bug 162), so SQLite stores the string AS-IS with no numeric coercion —
+// a decimal of ANY precision round-trips byte-exact. NUMERIC/DECIMAL
+// affinity would silently coerce e.g. `19.99` to the binary float
+// 19.989999999999998 (which sluice's reader then formats shortest-exact
+// as `19.989999999999998`, not `19.99`) — the silent value corruption
+// this fix eliminates. Because TEXT preserves everything, there is no
+// precision guard / loud refusal here anymore.
 func encodeDecimal(col *ir.Column, v any) (any, error) {
 	s, ok := v.(string)
 	if !ok {
 		return nil, encodeMismatch(col, v, "a decimal string")
 	}
-	if !decimalFitsSQLite(s) {
-		return nil, fmt.Errorf(
-			"sqlite: column %q: decimal value %q exceeds SQLite's exact storage range "+
-				"(NUMERIC affinity stores non-integer decimals as float64, losing precision beyond "+
-				"~15 significant digits); refusing to store it lossily — carry the column as text "+
-				"(--type-override <col>=text) to preserve it byte-exact",
-			col.Name, s,
-		)
-	}
-	// Bind the string; SQLite's NUMERIC affinity coerces an integer-valued
-	// decimal to an exact INTEGER and a guarded fractional one to a
-	// round-trippable REAL.
 	return s, nil
-}
-
-// decimalFitsSQLite reports whether a decimal string survives SQLite's
-// NUMERIC-affinity coercion losslessly: an int64-range integer is exact
-// (INTEGER storage); otherwise the value must parse as a float and carry
-// at most 15 significant digits (float64's DBL_DIG round-trip guarantee).
-func decimalFitsSQLite(s string) bool {
-	s = strings.TrimSpace(s)
-	if _, err := strconv.ParseInt(s, 10, 64); err == nil {
-		return true
-	}
-	if _, err := strconv.ParseFloat(s, 64); err != nil {
-		return false // not a number we can faithfully store
-	}
-	return decimalSignificantDigits(s) <= 15
-}
-
-// decimalSignificantDigits counts the significant decimal digits of s —
-// the digits between the first and last non-zero digit, ignoring sign,
-// the decimal point, any exponent, and leading/trailing zeros. Used by
-// [decimalFitsSQLite] to bound a fractional decimal against float64's
-// 15-digit round-trip guarantee.
-func decimalSignificantDigits(s string) int {
-	s = strings.TrimSpace(s)
-	s = strings.TrimPrefix(s, "+")
-	s = strings.TrimPrefix(s, "-")
-	if i := strings.IndexAny(s, "eE"); i >= 0 {
-		s = s[:i] // drop the exponent — it scales, not adds precision
-	}
-	s = strings.Replace(s, ".", "", 1)
-	s = strings.TrimLeft(s, "0")
-	s = strings.TrimRight(s, "0")
-	return len(s)
 }
 
 // encodeDate formats an ir.Date value (time.Time, UTC midnight per the

@@ -85,8 +85,9 @@ func TestEncodeValueRefusals(t *testing.T) {
 		want string // substring the error must contain
 	}{
 		{"uint64 overflow", ir.Integer{Unsigned: true}, uint64(math.MaxInt64) + 1, "unsigned"},
-		{"decimal too precise", ir.Decimal{Unconstrained: true}, "12345678901234567890.12345", "exceeds SQLite's exact storage range"},
-		{"decimal 16 sig digits", ir.Decimal{Unconstrained: true}, "1.234567890123456", "exact storage range"},
+		// (Bug 162: decimals are TEXT-affinity now — any precision carries
+		// exactly, so there is no over-precision refusal. The non-string
+		// decimal refusal below still holds.)
 		{"bool from int", ir.Boolean{}, int64(1), "is not a bool"},
 		{"float from string", ir.Float{}, "3.5", "is not a float64"},
 		{"blob from string", ir.Blob{}, "x", "is not a []byte"},
@@ -109,30 +110,7 @@ func TestEncodeValueRefusals(t *testing.T) {
 	}
 }
 
-// TestDecimalFitsSQLite pins the decimal-survival guard at the exact
-// boundary (15 significant digits) and the int64-exactness exemption.
-func TestDecimalFitsSQLite(t *testing.T) {
-	cases := []struct {
-		s    string
-		fits bool
-	}{
-		{"0", true},
-		{"100", true},
-		{"-42", true},
-		{"9223372036854775807", true},         // int64 max — exact INTEGER
-		{"9223372036854775808", false},        // beyond int64, 19 digits → REAL lossy
-		{"123.45", true},                      // 5 sig
-		{"0.1", true},                         // 1 sig
-		{"123.40", true},                      // trailing zero not significant → 4
-		{"0.000001", true},                    // 1 sig
-		{"1.23456789012345", true},            // 15 sig — the boundary
-		{"1.234567890123456", false},          // 16 sig — refused (safe side)
-		{"12345678901234567890.12345", false}, // 25 sig
-		{"not-a-number", false},               // unparseable → refuse
-	}
-	for _, c := range cases {
-		if got := decimalFitsSQLite(c.s); got != c.fits {
-			t.Errorf("decimalFitsSQLite(%q) = %v; want %v (sig=%d)", c.s, got, c.fits, decimalSignificantDigits(c.s))
-		}
-	}
-}
+// Bug 162: decimals are stored with TEXT affinity (exact), not NUMERIC, so
+// there is no significant-digit "fits" guard to pin anymore — the
+// byte-exact round-trip is pinned end-to-end in writer_db_test.go
+// (TestWriterDecimalNumericFidelity / TestWriterDecimalTextExact).

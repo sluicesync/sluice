@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.147] - 2026-06-27
+
+### Fixed
+
+- **CRITICAL (silent value corruption): `migrate --target-driver sqlite` stored DECIMAL/NUMERIC money as a binary float (Bug 162).** Introduced in v0.99.146 (the SQLite target engine). A `DECIMAL`/`NUMERIC` source column was emitted on the SQLite target with NUMERIC affinity, and SQLite's NUMERIC affinity silently coerces a bound decimal to a binary **REAL** — so an ordinary money value like `19.99` was stored on disk as `19.989999999999998`, `5.10` as `5.0999999999999996`, exit 0, no warning. The v0.99.146 writer's guard keyed on *significant-digit count* (>15), but float64 loss is about *dyadic representability*, not digit count — `19.99` has four significant digits yet is not float64-exact, so it slipped the guard. Because the produced `.db` is the deliverable (e.g. `X → SQLite → Cloudflare D1` via `wrangler d1 import`), the artifact handed downstream held money as binary floats, and a re-migrate of the REAL back into a constrained target `NUMERIC` could fail (`98765432.1098` scans back as `9.87654321098e+07`). **Fix:** decimals are now emitted with **TEXT affinity**, which SQLite stores verbatim with no coercion, so a decimal of any precision round-trips **byte-exact** (`19.99` → `19.99`, `100.00` → `100.00`, `12345678901234567890.1234567890` → exact). The cost is a documented type downgrade — the column reads back as `ir.Text` rather than `ir.Decimal` (the same value-faithful trade as `JSON`/`UUID` → `TEXT`), which is the correct call since a silent value corruption is never acceptable to preserve a type label (and SQLite/D1 are dynamically typed, so a decimal-as-text is a faithful decimal value). The previous over-precision *refusal* is gone — TEXT preserves everything. Pinned by an explicit writer→DB→schema-resolved-reader round-trip test (`TestWriterDecimalTextExact`) asserting byte-exact equality through the real read path — the gap that let the original value-fidelity review pass it. **Anyone who produced a SQLite/D1 database from a decimal-bearing source with v0.99.146 should re-run with v0.99.147; the v0.99.146 `.db` artifacts hold lossy float money values.**
+
 ## [0.99.146] - 2026-06-27
 
 ### Added

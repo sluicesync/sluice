@@ -7,7 +7,6 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -117,8 +116,20 @@ func TestWriterInProcessRoundTrip(t *testing.T) {
 	}
 	_ = sw.(*SchemaWriter).Close()
 
-	// Read back through the reader — every value family must round-trip.
-	got := readBack(t, ctx, eng, dsn, tbl)
+	// Read back through the reader the way the engine actually does — via the
+	// resolved schema (the decimal column was emitted TEXT-affinity per Bug
+	// 162, so it resolves to ir.Text and its value comes back as the exact
+	// decimal string `123.45`). Every value family must round-trip.
+	srdr, err := eng.OpenSchemaReader(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenSchemaReader: %v", err)
+	}
+	rschema, err := srdr.ReadSchema(ctx)
+	_ = srdr.(*SchemaReader).Close()
+	if err != nil {
+		t.Fatalf("ReadSchema: %v", err)
+	}
+	got := readBack(t, ctx, eng, dsn, tableByName(rschema, "v"))
 	if len(got) != 2 {
 		t.Fatalf("rows = %d; want 2", len(got))
 	}
@@ -277,7 +288,8 @@ func TestWriterMaterializedViewRefused(t *testing.T) {
 }
 
 // decimalColTable is the helper table for the decimal write-path pins: a PK
-// plus a single NUMERIC (unconstrained) column.
+// plus a single ir.Decimal column, emitted with TEXT affinity on the SQLite
+// target (Bug 162) so the value is stored verbatim.
 func decimalColTable() *ir.Table {
 	return &ir.Table{
 		Name:       "m",
@@ -286,17 +298,17 @@ func decimalColTable() *ir.Table {
 	}
 }
 
-// TestWriterDecimalNumericFidelity locks the NUMERICALLY-FAITHFUL-but-
-// TEXTUALLY-NORMALIZED decimal contract through the real WRITER→DB→READER
-// path (ADR-0134 §2). SQLite's NUMERIC affinity stores a guarded decimal as
-// INTEGER (integer-valued) or REAL (fractional), and the reader renders a
-// REAL back via Go's shortest-round-trippable FormatFloat — so the value is
-// numerically exact but its TEXT form is normalized (scale/trailing-zero
-// drop, sign drop, scientific notation for big/small magnitudes). The pins
-// assert numeric equality AND document the exact normalized text so the
-// divergence is intentional and visible (it would otherwise regress
-// silently if the reader or an assertion were tightened to text-equality).
-func TestWriterDecimalNumericFidelity(t *testing.T) {
+// TestWriterDecimalTextExact pins the Bug 162 fix through the real
+// WRITER→DB→READER path: an ir.Decimal column is stored with TEXT affinity,
+// so EVERY decimal round-trips BYTE-EXACT — ordinary money (the `19.99` →
+// `19.989999999999998` corruption), preserved scale / trailing zeros, big
+// and small magnitudes (no scientific-notation normalization), and values
+// far beyond float64's precision (TEXT has no precision limit, so the
+// previously-refused over-precision cases now carry exactly). This is the
+// exact path the v0.99.146 value-fidelity probe MISSED: it must read back
+// through the real reader and compare the TEXT byte-for-byte, never
+// numeric-tolerantly (a numeric compare would have hidden the corruption).
+func TestWriterDecimalTextExact(t *testing.T) {
 	ctx := context.Background()
 	eng := Engine{}
 	dsn := filepath.Join(t.TempDir(), "decok.db")
@@ -308,80 +320,62 @@ func TestWriterDecimalNumericFidelity(t *testing.T) {
 	}
 	_ = sw.(*SchemaWriter).Close()
 
-	// src = the decimal we write; wantNum = the numeric value it must keep;
-	// wantText = the EXACT (documented, ground-truthed) reader read-back text.
-	cases := []struct {
-		src      string
-		wantNum  float64
-		wantText string // the normalized text form the reader returns
-	}{
-		{"1234567.89", 1234567.89, "1.23456789e+06"},                   // big magnitude → scientific notation
-		{"0.00001", 0.00001, "1e-05"},                                  // small magnitude → scientific notation
-		{"-19.99", -19.99, "-19.99"},                                   // negative preserved as-is
-		{"100.00", 100, "100"},                                         // integer-valued → stored INTEGER, scale dropped
-		{"0.30", 0.30, "0.3"},                                          // trailing-zero dropped
-		{"1.2300", 1.23, "1.23"},                                       // trailing-zeros dropped
-		{"99999999999999.9", 99999999999999.9, "9.99999999999999e+13"}, // 15-sig boundary, numerically exact
+	srcs := []string{
+		"19.99", "5.10", "0.1", "0.30", "100.00", "-19.99", // money + preserved scale/trailing-zeros
+		"1234567.89", "0.00001", // big/small magnitude — NO scientific-notation normalization
+		"99999999999999.9",                // old 15-sig boundary
+		"123456789012345.6",               // 16 sig — was REFUSED, now exact
+		"12345678901234567890.1234567890", // 30 sig (DECIMAL(38,10)-class) — exact
+		"0",
 	}
-	rows := make([]ir.Row, len(cases))
-	for i, c := range cases {
-		rows[i] = ir.Row{"id": int64(i + 1), "amt": c.src}
+	rows := make([]ir.Row, len(srcs))
+	for i, s := range srcs {
+		rows[i] = ir.Row{"id": int64(i + 1), "amt": s}
 	}
 	if err := writeRows(t, ctx, eng, dsn, tbl, rows); err != nil {
 		t.Fatalf("WriteRows: %v", err)
 	}
 
-	got := readBack(t, ctx, eng, dsn, tbl)
-	if len(got) != len(cases) {
-		t.Fatalf("rows = %d; want %d", len(got), len(cases))
+	// Read back the way the engine actually does: resolve the schema first.
+	// The decimal column was emitted with TEXT affinity, so resolveColumnType
+	// maps it to ir.Text (the documented type downgrade) and the values come
+	// back as their exact decimal strings — never a coerced binary float.
+	sr, err := eng.OpenSchemaReader(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenSchemaReader: %v", err)
+	}
+	schema, err := sr.ReadSchema(ctx)
+	_ = sr.(*SchemaReader).Close()
+	if err != nil {
+		t.Fatalf("ReadSchema: %v", err)
+	}
+	resolved := tableByName(schema, "m")
+	if resolved == nil {
+		t.Fatal("table m missing from resolved schema")
+	}
+	for _, c := range resolved.Columns {
+		if c.Name == "amt" {
+			if _, ok := c.Type.(ir.Text); !ok {
+				t.Errorf("decimal column read back as %T; want ir.Text (Bug 162 TEXT-affinity downgrade)", c.Type)
+			}
+		}
+	}
+	got := readBack(t, ctx, eng, dsn, resolved)
+	if len(got) != len(srcs) {
+		t.Fatalf("rows = %d; want %d", len(got), len(srcs))
 	}
 	byID := map[int64]string{}
 	for _, r := range got {
-		byID[r["id"].(int64)] = r["amt"].(string)
+		s, ok := r["amt"].(string)
+		if !ok {
+			t.Fatalf("id %v: amt read back as %T; want string (TEXT affinity)", r["id"], r["amt"])
+		}
+		byID[r["id"].(int64)] = s
 	}
-	for i, c := range cases {
-		readback := byID[int64(i+1)]
-		// (1) numeric fidelity — the contract.
-		gotNum, err := strconv.ParseFloat(readback, 64)
-		if err != nil {
-			t.Fatalf("src %q: read-back %q not numeric: %v", c.src, readback, err)
+	for i, src := range srcs {
+		if rb := byID[int64(i+1)]; rb != src {
+			t.Errorf("decimal %q read back as %q; want BYTE-EXACT (Bug 162: TEXT affinity must not coerce to a binary float)", src, rb)
 		}
-		if gotNum != c.wantNum {
-			t.Errorf("src %q: numeric read-back = %v; want %v", c.src, gotNum, c.wantNum)
-		}
-		// (2) documented text normalization — locked so a silent change is loud.
-		if readback != c.wantText {
-			t.Errorf("src %q: read-back text = %q; want normalized %q (ADR-0134 §2 — numeric, not byte-identical)",
-				c.src, readback, c.wantText)
-		}
-	}
-}
-
-// TestWriterDecimalLoudRefusalEndToEnd proves the decimal guard fires on the
-// real write path (not just the unit helper): a too-precise decimal — both
-// far over and JUST OVER the 15-sig boundary (16 sig) — aborts WriteRows
-// loudly rather than landing a silently-truncated value.
-func TestWriterDecimalLoudRefusalEndToEnd(t *testing.T) {
-	ctx := context.Background()
-	eng := Engine{}
-
-	for _, over := range []string{
-		"12345678901234567890.12345", // 25 sig — far over
-		"123456789012345.6",          // 16 sig — JUST over the boundary
-	} {
-		t.Run(over, func(t *testing.T) {
-			dsn := filepath.Join(t.TempDir(), "dec.db")
-			tbl := decimalColTable()
-			sw, _ := eng.OpenSchemaWriter(ctx, dsn)
-			if err := sw.CreateTablesWithoutConstraints(ctx, &ir.Schema{Tables: []*ir.Table{tbl}}); err != nil {
-				t.Fatalf("CreateTables: %v", err)
-			}
-			_ = sw.(*SchemaWriter).Close()
-			err := writeRows(t, ctx, eng, dsn, tbl, []ir.Row{{"id": int64(1), "amt": over}})
-			if err == nil || !strings.Contains(err.Error(), "exact storage range") {
-				t.Fatalf("WriteRows with too-precise decimal %q err = %v; want a loud refusal", over, err)
-			}
-		})
 	}
 }
 
