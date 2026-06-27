@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -275,26 +276,112 @@ func TestWriterMaterializedViewRefused(t *testing.T) {
 	}
 }
 
-// TestWriterDecimalLoudRefusalEndToEnd proves the decimal guard fires on the
-// real write path (not just the unit helper): a too-precise decimal aborts
-// WriteRows loudly rather than landing a silently-truncated value.
-func TestWriterDecimalLoudRefusalEndToEnd(t *testing.T) {
-	ctx := context.Background()
-	eng := Engine{}
-	dsn := filepath.Join(t.TempDir(), "dec.db")
-	tbl := &ir.Table{
+// decimalColTable is the helper table for the decimal write-path pins: a PK
+// plus a single NUMERIC (unconstrained) column.
+func decimalColTable() *ir.Table {
+	return &ir.Table{
 		Name:       "m",
 		Columns:    []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}, {Name: "amt", Type: ir.Decimal{Unconstrained: true}}},
 		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}, Unique: true},
 	}
+}
+
+// TestWriterDecimalNumericFidelity locks the NUMERICALLY-FAITHFUL-but-
+// TEXTUALLY-NORMALIZED decimal contract through the real WRITER→DB→READER
+// path (ADR-0134 §2). SQLite's NUMERIC affinity stores a guarded decimal as
+// INTEGER (integer-valued) or REAL (fractional), and the reader renders a
+// REAL back via Go's shortest-round-trippable FormatFloat — so the value is
+// numerically exact but its TEXT form is normalized (scale/trailing-zero
+// drop, sign drop, scientific notation for big/small magnitudes). The pins
+// assert numeric equality AND document the exact normalized text so the
+// divergence is intentional and visible (it would otherwise regress
+// silently if the reader or an assertion were tightened to text-equality).
+func TestWriterDecimalNumericFidelity(t *testing.T) {
+	ctx := context.Background()
+	eng := Engine{}
+	dsn := filepath.Join(t.TempDir(), "decok.db")
+	tbl := decimalColTable()
+
 	sw, _ := eng.OpenSchemaWriter(ctx, dsn)
 	if err := sw.CreateTablesWithoutConstraints(ctx, &ir.Schema{Tables: []*ir.Table{tbl}}); err != nil {
 		t.Fatalf("CreateTables: %v", err)
 	}
 	_ = sw.(*SchemaWriter).Close()
-	err := writeRows(t, ctx, eng, dsn, tbl, []ir.Row{{"id": int64(1), "amt": "12345678901234567890.12345"}})
-	if err == nil || !strings.Contains(err.Error(), "exact storage range") {
-		t.Fatalf("WriteRows with too-precise decimal err = %v; want a loud refusal", err)
+
+	// src = the decimal we write; wantNum = the numeric value it must keep;
+	// wantText = the EXACT (documented, ground-truthed) reader read-back text.
+	cases := []struct {
+		src      string
+		wantNum  float64
+		wantText string // the normalized text form the reader returns
+	}{
+		{"1234567.89", 1234567.89, "1.23456789e+06"},                   // big magnitude → scientific notation
+		{"0.00001", 0.00001, "1e-05"},                                  // small magnitude → scientific notation
+		{"-19.99", -19.99, "-19.99"},                                   // negative preserved as-is
+		{"100.00", 100, "100"},                                         // integer-valued → stored INTEGER, scale dropped
+		{"0.30", 0.30, "0.3"},                                          // trailing-zero dropped
+		{"1.2300", 1.23, "1.23"},                                       // trailing-zeros dropped
+		{"99999999999999.9", 99999999999999.9, "9.99999999999999e+13"}, // 15-sig boundary, numerically exact
+	}
+	rows := make([]ir.Row, len(cases))
+	for i, c := range cases {
+		rows[i] = ir.Row{"id": int64(i + 1), "amt": c.src}
+	}
+	if err := writeRows(t, ctx, eng, dsn, tbl, rows); err != nil {
+		t.Fatalf("WriteRows: %v", err)
+	}
+
+	got := readBack(t, ctx, eng, dsn, tbl)
+	if len(got) != len(cases) {
+		t.Fatalf("rows = %d; want %d", len(got), len(cases))
+	}
+	byID := map[int64]string{}
+	for _, r := range got {
+		byID[r["id"].(int64)] = r["amt"].(string)
+	}
+	for i, c := range cases {
+		readback := byID[int64(i+1)]
+		// (1) numeric fidelity — the contract.
+		gotNum, err := strconv.ParseFloat(readback, 64)
+		if err != nil {
+			t.Fatalf("src %q: read-back %q not numeric: %v", c.src, readback, err)
+		}
+		if gotNum != c.wantNum {
+			t.Errorf("src %q: numeric read-back = %v; want %v", c.src, gotNum, c.wantNum)
+		}
+		// (2) documented text normalization — locked so a silent change is loud.
+		if readback != c.wantText {
+			t.Errorf("src %q: read-back text = %q; want normalized %q (ADR-0134 §2 — numeric, not byte-identical)",
+				c.src, readback, c.wantText)
+		}
+	}
+}
+
+// TestWriterDecimalLoudRefusalEndToEnd proves the decimal guard fires on the
+// real write path (not just the unit helper): a too-precise decimal — both
+// far over and JUST OVER the 15-sig boundary (16 sig) — aborts WriteRows
+// loudly rather than landing a silently-truncated value.
+func TestWriterDecimalLoudRefusalEndToEnd(t *testing.T) {
+	ctx := context.Background()
+	eng := Engine{}
+
+	for _, over := range []string{
+		"12345678901234567890.12345", // 25 sig — far over
+		"123456789012345.6",          // 16 sig — JUST over the boundary
+	} {
+		t.Run(over, func(t *testing.T) {
+			dsn := filepath.Join(t.TempDir(), "dec.db")
+			tbl := decimalColTable()
+			sw, _ := eng.OpenSchemaWriter(ctx, dsn)
+			if err := sw.CreateTablesWithoutConstraints(ctx, &ir.Schema{Tables: []*ir.Table{tbl}}); err != nil {
+				t.Fatalf("CreateTables: %v", err)
+			}
+			_ = sw.(*SchemaWriter).Close()
+			err := writeRows(t, ctx, eng, dsn, tbl, []ir.Row{{"id": int64(1), "amt": over}})
+			if err == nil || !strings.Contains(err.Error(), "exact storage range") {
+				t.Fatalf("WriteRows with too-precise decimal %q err = %v; want a loud refusal", over, err)
+			}
+		})
 	}
 }
 

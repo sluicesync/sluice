@@ -110,8 +110,21 @@ integer beyond int64 range — is stored as REAL, which round-trips losslessly t
 reader's `FormatFloat` ONLY up to float64's 15-significant-digit guarantee. The writer
 therefore guards every decimal value: it is allowed iff it parses as an int64 OR its
 significant-digit count is ≤ 15; otherwise it is **REFUSED LOUDLY** (naming
-table.column.value), because SQLite cannot store it without silent precision loss. This
-diverges from the seeded ADR phrasing "DECIMAL stored as TEXT to preserve precision" —
+table.column.value), because SQLite cannot store it without silent precision loss.
+
+The contract within the guard is NUMERIC fidelity, not byte-identical text: the value is
+stored losslessly, but its TEXT representation may be NORMALIZED on read-back because the
+reader renders a REAL-stored decimal via Go's shortest-round-trippable `FormatFloat`. So
+an integer-valued decimal drops its scale (`100.00` → `100`, stored as an exact INTEGER),
+trailing zeros are dropped (`0.30` → `0.3`), and a large/small magnitude renders in
+scientific notation (`1234567.89` → `1.23456789e+06`, `0.00001` → `1e-05`,
+`99999999999999.9` → `9.99999999999999e+13`) — every form numerically identical to the
+source. This is pinned by an explicit writer→DB→reader round-trip test that asserts
+numeric equality AND documents the exact normalized text form (so the divergence is
+intentional and visible, not a surprise if the reader or an assertion is later tightened
+to text-equality).
+
+This refuse rule diverges from the seeded ADR phrasing "DECIMAL stored as TEXT to preserve precision" —
 that is empirically IMPOSSIBLE under NUMERIC affinity (text decimals are coerced to
 REAL/INTEGER on insert). The 15-digit bound is the safe `DBL_DIG` floor: a 16–17-digit
 decimal that would happen to survive is refused too (loud, safe side), and the operator's
