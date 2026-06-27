@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -164,6 +165,55 @@ func TestDumpIngest_RowsReadAndTempRemoved(t *testing.T) {
 	}
 	if _, err := os.Stat(tempPath); !os.IsNotExist(err) {
 		t.Errorf("temp DB %q should be removed after Close; stat err = %v", tempPath, err)
+	}
+}
+
+// TestDumpIngest_CountRowsCloseNoRace pins the fix for the data race the -race
+// CI gate caught on the dump path: the fire-and-forget ETA probe
+// ([kickOffRowCount] → CountRows → chunkDisqualified) reads tempPath while the
+// table-pool's deferred Close runs. The original Close cleared tempPath, racing
+// that read; Close now removes the temp file via a sync.Once WITHOUT mutating
+// tempPath. This test races CountRows against Close on a dump-materialized
+// reader; it fails the -race detector if tempPath is ever written post-
+// construction. (Runs under the unit-test -race job; no Docker needed.)
+func TestDumpIngest_CountRowsCloseNoRace(t *testing.T) {
+	path := writeDump(t, "d1export.sql", d1LikeDump)
+	eng := Engine{}
+	ctx := context.Background()
+
+	rr, err := eng.OpenRowReader(ctx, path)
+	if err != nil {
+		t.Fatalf("OpenRowReader: %v", err)
+	}
+	rrd := rr.(*RowReader)
+	if rrd.tempPath == "" {
+		t.Fatal("row reader tempPath empty; expected a materialized dump")
+	}
+	// A dump source is chunk-disqualified, so CountRows reads tempPath (via
+	// chunkDisqualified) and returns (0, nil) — exactly the concurrent read
+	// that raced Close's write. The table need only carry a name.
+	tbl := &ir.Table{Name: "users"}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			_, _ = rrd.CountRows(ctx, tbl)
+		}
+	}()
+	// Close concurrently with the probe loop; both touch tempPath.
+	if err := rrd.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+	wg.Wait()
+	// Probe after Close too (the ETA goroutine can outlive the copy/Close).
+	if _, err := rrd.CountRows(ctx, tbl); err != nil {
+		t.Errorf("CountRows after Close: %v", err)
+	}
+	// Close stays idempotent.
+	if err := rrd.Close(); err != nil {
+		t.Errorf("second Close: %v", err)
 	}
 }
 

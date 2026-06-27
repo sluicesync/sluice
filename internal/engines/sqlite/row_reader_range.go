@@ -172,12 +172,17 @@ func (r *RowReader) RangeBounds(ctx context.Context, table *ir.Table, pkColumn s
 
 // CountRows implements [ir.RowCounter]: an exact `SELECT COUNT(*)` for the
 // ETA probe. A local SQLite file makes the count cheap (covering scan of a
-// PK index in the common case), so an exact count beats an approximation,
-// and SQLite's concurrent-reader support means it can run on the reader's
-// pool alongside the in-flight copy stream without conflict. Returns
-// (0, nil) — "no estimate" — for a chunk-disqualified source
-// ([chunkDisqualified]: a `.sql` dump or a non-round-trippable PK), uniform
-// with the other chunk-decision surfaces.
+// PK index in the common case), so an exact count beats an approximation.
+// This is the ONE chunk-decision surface that runs CONCURRENTLY with the
+// in-flight copy and the table-pool's deferred Close (the ETA probe is
+// fire-and-forget; see [kickOffRowCount]), so it must touch only
+// concurrency-safe reader state: the *sql.DB handle is safe for concurrent
+// use (including a concurrent Close), and tempPath is set once at
+// construction and never mutated (Close removes the temp file via a sync.Once
+// WITHOUT clearing the field), so [chunkDisqualified]'s read of tempPath here
+// does not race Close. Returns (0, nil) — "no estimate" — for a chunk-
+// disqualified source ([chunkDisqualified]: a `.sql` dump or a
+// non-round-trippable PK), uniform with the other chunk-decision surfaces.
 func (r *RowReader) CountRows(ctx context.Context, table *ir.Table) (int64, error) {
 	if table == nil {
 		return 0, errors.New("sqlite: CountRows: table is nil")

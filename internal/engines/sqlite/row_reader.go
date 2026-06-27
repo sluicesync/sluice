@@ -33,8 +33,17 @@ type RowReader struct {
 	dateEnc dateEncoding
 
 	// tempPath is the materialized dump DB this reader owns, removed on Close
-	// (ADR-0130). Empty when the source was a real binary `.db`.
+	// (ADR-0130). Empty when the source was a real binary `.db`. It is set ONCE
+	// at construction and never mutated afterwards: the concurrent ETA probe
+	// ([CountRows] → [chunkDisqualified]) reads it while the table-pool's
+	// deferred Close runs, so a Close-time write would be a data race. Cleanup
+	// idempotency is handled by removeOnce instead of clearing this field.
 	tempPath string
+
+	// removeOnce guards the one-time removal of tempPath so a repeated Close is
+	// a no-op without mutating tempPath (which the ETA probe reads concurrently).
+	removeOnce sync.Once
+	removeErr  error
 
 	mu  sync.Mutex
 	err error // sticky error from the most recent ReadRows call
@@ -55,12 +64,17 @@ func (r *RowReader) Close() error {
 	}
 	err := r.db.Close()
 	if r.tempPath != "" {
-		// Clear the path first so a repeated Close is a no-op (the contract),
-		// not a remove of an already-gone file.
-		path := r.tempPath
-		r.tempPath = ""
-		if rmErr := os.Remove(path); rmErr != nil && err == nil {
-			err = rmErr
+		// Remove the temp DB exactly once (a repeated Close is a no-op) WITHOUT
+		// mutating tempPath — the concurrent ETA probe reads tempPath, so a
+		// Close-time write to it would be a data race (caught by the -race CI
+		// gate). os.Remove of an already-gone file would error, hence the Once.
+		r.removeOnce.Do(func() {
+			if rmErr := os.Remove(r.tempPath); rmErr != nil {
+				r.removeErr = rmErr
+			}
+		})
+		if r.removeErr != nil && err == nil {
+			err = r.removeErr
 		}
 	}
 	return err
