@@ -21,6 +21,22 @@ import (
 // is fiddly with Windows paths), so it is the portable read-only lever.
 const queryOnlyPragma = "_pragma=query_only(1)"
 
+// busyTimeoutPragma makes each connection wait up to 5s on a locked
+// database (`SQLITE_BUSY`) before erroring, instead of failing instantly.
+// It matters now that the parallel-bulk-copy orchestrator opens N
+// INDEPENDENT reader connections to the same file concurrently (within-
+// table chunking, ADR-0128): SQLite permits many concurrent READERS, but
+// the brief lock-acquisition contention of N simultaneous opens against
+// one file can spuriously return SQLITE_BUSY. The timeout absorbs it. The
+// source is read-only (query_only), so there is never a writer to wait on
+// — the wait is only ever the momentary open/shared-lock handshake.
+const busyTimeoutPragma = "_pragma=busy_timeout(5000)"
+
+// readOnlyPragmas is the full _pragma set every source connection gets:
+// read-only + a busy-timeout for concurrent-reader safety. modernc applies
+// each repeated `_pragma` query param on connection open.
+const readOnlyPragmas = queryOnlyPragma + "&" + busyTimeoutPragma
+
 // dsnDateEncodingParam is the sluice-internal source-DSN query key that
 // overrides the process-global --sqlite-date-encoding PER SOURCE (ADR-0129),
 // mirroring the MySQL engine's `zero_date` param (ADR-0127). It is NOT a
@@ -90,7 +106,7 @@ func parseDSN(dsn string) (driverDSN, path string, enc dateEncoding, err error) 
 	if strings.Contains(base, "?") {
 		sep = "&"
 	}
-	return base + sep + queryOnlyPragma, path, enc, nil
+	return base + sep + readOnlyPragmas, path, enc, nil
 }
 
 // stripDateEncodingParam removes sluice's [dsnDateEncodingParam] from a DSN's
@@ -156,12 +172,12 @@ func openReadOnly(ctx context.Context, dsn string) (db *sql.DB, path string, enc
 	if !isBinary {
 		// A SQL text dump (e.g. `wrangler d1 export`): materialize it into a
 		// temp DB and read THAT, keeping `path` pointed at the original dump for
-		// error messages. The query_only pragma still applies on the temp pool.
+		// error messages. The read-only pragmas still apply on the temp pool.
 		tempPath, err = materializeDump(ctx, path)
 		if err != nil {
 			return nil, "", dateEncodingInherit, "", err // already names the dump
 		}
-		driverDSN = tempPath + "?" + queryOnlyPragma
+		driverDSN = tempPath + "?" + readOnlyPragmas
 	}
 
 	db, err = sql.Open("sqlite", driverDSN)

@@ -18,6 +18,18 @@ sluice migrate --source-driver sqlite --source ./app.db \
 `--source` may be a bare path, a `file:` URI, or a `sqlite://` URL. The file is opened
 read-only.
 
+### Big tables parallel-copy
+
+A large binary `.db` table is split into PK-range / keyset chunks copied concurrently
+into the target, the same within-table parallelism the other engines use. It is on by
+default and tuned by the existing flags: `--bulk-parallelism` (number of concurrent
+chunk readers/writers) and `--bulk-parallel-min-rows` (the table-size threshold below
+which a table stays single-reader). Each chunk opens its own read-only connection to the
+file. A `.sql` **dump** source (below) stays single-reader regardless — the dump is
+materialized into a temporary database that would be wasteful to rebuild per chunk; if
+you want a dump's big tables to parallel-copy, materialize it to a `.db` first
+(`sqlite3 app.db < dump.sql`) and migrate that.
+
 ## Cloudflare D1 (the recommended path: export → migrate)
 
 `wrangler d1 export` emits a **`.sql` text dump**, and sluice ingests a `.sql` dump
@@ -136,8 +148,10 @@ MySQL target — its predicate is not representable there.)
 
 ## Known limits (prototype scope)
 
-Deferred follow-ups (ADR-0128 §, ADR-0133): trigger-based continuous CDC, within-table
-chunking (large single tables read as one stream), a per-column date-encoding map (the
-global flag + `--type-override` cover the common and outlier cases), and a SQLite→canonical
-expression translator for the verbatim generated/CHECK/index bodies described above.
-SQLite/D1 is a migrate **source** only — it is never a sluice target.
+Deferred follow-ups (ADR-0128 §, ADR-0133): trigger-based continuous CDC, a per-column
+date-encoding map (the global flag + `--type-override` cover the common and outlier
+cases), and a SQLite→canonical expression translator for the verbatim generated/CHECK/
+index bodies described above. (Within-table parallel-copy chunking for the binary `.db`
+path now ships — see "Big tables parallel-copy" above; a `.sql`-dump source stays
+single-reader by design.) SQLite/D1 is a migrate **source** only — it is never a sluice
+target.
