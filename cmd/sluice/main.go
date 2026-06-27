@@ -35,7 +35,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/pgtrigger"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
-	_ "sluicesync.dev/sluice/internal/engines/sqlite"
+	"sluicesync.dev/sluice/internal/engines/sqlite"
 )
 
 // version, commit, and date are populated at build time via -ldflags.
@@ -84,6 +84,9 @@ func main() {
 	// Thread the operator's --zero-date policy (kong's enum tag already
 	// validated the value; the setter re-checks defensively).
 	ctx.FatalIfErrorf(mysql.SetZeroDateMode(cli.ZeroDate))
+	// Thread the operator's --sqlite-date-encoding policy into the sqlite
+	// engine before any source opens (ADR-0129; mirrors SetZeroDateMode).
+	ctx.FatalIfErrorf(sqlite.SetDefaultDateEncoding(cli.SQLiteDateEncoding))
 	err := ctx.Run(&cli.Globals)
 	ctx.FatalIfErrorf(err)
 }

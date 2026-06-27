@@ -18,9 +18,12 @@ package pipeline
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite" // pure-Go driver for seeding the temp source file
 
@@ -264,5 +267,232 @@ func asFloat(t *testing.T, v any) float64 {
 	default:
 		t.Fatalf("value %#v (%T) not numeric", v, v)
 		return 0
+	}
+}
+
+// seedSQLiteTemporal writes a temp SQLite file with DECLARED DATE, DATETIME,
+// and BOOLEAN columns (ADR-0129). With iso=true the values are ISO TEXT and
+// 0/1; with iso=false the happened_at DATETIME is stored as a unix-epoch
+// INTEGER (the unixepoch encoding path). All rows describe the same instants
+// so the same assertions verify both encodings.
+func seedSQLiteTemporal(t *testing.T, iso bool) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "events.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open sqlite seed: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	var stmts []string
+	if iso {
+		stmts = []string{
+			`CREATE TABLE events (
+				id          INTEGER PRIMARY KEY,
+				happened_on   DATE     NOT NULL,
+				happened_at   DATETIME NOT NULL,
+				happened_time TIME     NOT NULL,
+				is_active   BOOLEAN  NOT NULL
+			)`,
+			`INSERT INTO events (id, happened_on, happened_at, happened_time, is_active) VALUES
+				(1, '2024-01-02', '2024-01-02 03:04:05', '03:04:05', 1),
+				(2, '2025-12-31', '2025-12-31 23:59:59', '23:59:59', 0)`,
+		}
+	} else {
+		// The date encoding is GLOBAL per source, so under unixepoch BOTH
+		// temporal columns are unix-epoch INTEGERs (a mixed-encoding column
+		// would loud-refuse — the policy working). happened_on is midnight of
+		// the date: 1704153600 = 2024-01-02 00:00:00 UTC, 1767139200 =
+		// 2025-12-31 00:00:00 UTC. happened_at: 1704164645 = 2024-01-02
+		// 03:04:05 UTC, 1767225599 = 2025-12-31 23:59:59 UTC.
+		stmts = []string{
+			`CREATE TABLE events (
+				id          INTEGER PRIMARY KEY,
+				happened_on DATE     NOT NULL,
+				happened_at DATETIME NOT NULL,
+				is_active   BOOLEAN  NOT NULL
+			)`,
+			`INSERT INTO events (id, happened_on, happened_at, is_active) VALUES
+				(1, 1704153600, 1704164645, 1),
+				(2, 1767139200, 1767225599, 0)`,
+		}
+	}
+	for _, s := range stmts {
+		if _, err := db.ExecContext(context.Background(), s); err != nil {
+			t.Fatalf("seed exec: %v", err)
+		}
+	}
+	return path
+}
+
+// TestMigrate_SQLiteTemporalToPostgres pins the ADR-0129 declared-temporal/
+// bool round-trip into Postgres: the DATE/DATETIME/BOOLEAN source columns
+// land as PG date/timestamp/boolean (NOT numeric) with correct values.
+func TestMigrate_SQLiteTemporalToPostgres(t *testing.T) {
+	runSQLiteTemporalRoundTrip(t, "postgres", startPostgres, true)
+}
+
+// TestMigrate_SQLiteTemporalToMySQL is the MySQL half of the proof.
+func TestMigrate_SQLiteTemporalToMySQL(t *testing.T) {
+	runSQLiteTemporalRoundTrip(t, "mysql", startMySQL, true)
+}
+
+// TestMigrate_SQLiteTemporalUnixEpochToPostgres pins the
+// --sqlite-date-encoding=unixepoch variant: an INTEGER unix-epoch DATETIME
+// source column migrates to a PG timestamp with the correct instant.
+func TestMigrate_SQLiteTemporalUnixEpochToPostgres(t *testing.T) {
+	runSQLiteTemporalRoundTrip(t, "postgres", startPostgres, false)
+}
+
+// TestMigrate_SQLiteTemporalUnixEpochToMySQL is the MySQL unixepoch half.
+func TestMigrate_SQLiteTemporalUnixEpochToMySQL(t *testing.T) {
+	runSQLiteTemporalRoundTrip(t, "mysql", startMySQL, false)
+}
+
+// runSQLiteTemporalRoundTrip migrates a temporal/bool SQLite source into the
+// named target and asserts the target column types and values. iso selects
+// the ISO-TEXT encoding (default); !iso selects unixepoch (an INTEGER
+// happened_at) by appending the sqlite_date_encoding=unixepoch DSN param.
+func runSQLiteTemporalRoundTrip(t *testing.T, targetName string, start func(*testing.T) (string, string, func()), iso bool) {
+	src := seedSQLiteTemporal(t, iso)
+	if !iso {
+		src += "?sqlite_date_encoding=unixepoch"
+	}
+	_, target, cleanup := start(t)
+	defer cleanup()
+
+	sqliteEng, ok := engines.Get("sqlite")
+	if !ok {
+		t.Fatal("sqlite engine not registered")
+	}
+	targetEng, ok := engines.Get(targetName)
+	if !ok {
+		t.Fatalf("%s engine not registered", targetName)
+	}
+
+	mig := &Migrator{
+		Source:    sqliteEng,
+		Target:    targetEng,
+		SourceDSN: src,
+		TargetDSN: target,
+	}
+	if err := mig.Run(ctx2min(t)); err != nil {
+		t.Fatalf("Migrator.Run (SQLite→%s, iso=%v): %v", targetName, iso, err)
+	}
+
+	ctx := ctx2min(t)
+	sr, err := targetEng.OpenSchemaReader(ctx, target)
+	if err != nil {
+		t.Fatalf("OpenSchemaReader: %v", err)
+	}
+	defer closeIf(sr)
+	got, err := sr.ReadSchema(ctx)
+	if err != nil {
+		t.Fatalf("ReadSchema: %v", err)
+	}
+	events := findTable(got, "events")
+	if events == nil {
+		t.Fatalf("missing target table events; have %v", targetTableNames(got))
+	}
+
+	// Type landing: DATE → date, DATETIME → a temporal (timestamp/datetime),
+	// BOOLEAN → boolean — NOT the prototype's numeric/decimal.
+	assertTemporalKind(t, events, "happened_on", "date")
+	assertTemporalKind(t, events, "happened_at", "timestampish")
+	assertTemporalKind(t, events, "is_active", "boolean")
+	if iso {
+		// ir.Time is the third temporal family with a distinct target-write
+		// path (Bug-74 corollary) — pin it lands as a target time column too.
+		// (Only the ISO seed carries a TIME column; a TIME-of-day under a
+		// unix-epoch encoding is semantically muddy and out of scope.)
+		assertTemporalKind(t, events, "happened_time", "timeish")
+	}
+
+	rr, err := targetEng.OpenRowReader(ctx, target)
+	if err != nil {
+		t.Fatalf("OpenRowReader: %v", err)
+	}
+	defer closeIf(rr)
+	rows := readAll(t, ctx, rr, events)
+	if len(rows) != 2 {
+		t.Fatalf("events rows = %d; want 2", len(rows))
+	}
+
+	// Row 1: 2024-01-02 / 2024-01-02 03:04:05 / true.
+	if d := asTime(t, rows[0]["happened_on"]).Format("2006-01-02"); d != "2024-01-02" {
+		t.Errorf("events[0].happened_on = %q; want 2024-01-02", d)
+	}
+	if ts := asTime(t, rows[0]["happened_at"]).UTC().Format("2006-01-02 15:04:05"); ts != "2024-01-02 03:04:05" {
+		t.Errorf("events[0].happened_at = %q; want 2024-01-02 03:04:05", ts)
+	}
+	if b := asBool(t, rows[0]["is_active"]); !b {
+		t.Errorf("events[0].is_active = %v; want true", b)
+	}
+	if iso {
+		// happened_time landed as a target time column; its value (string or
+		// time.Time depending on the target reader) must carry 03:04:05.
+		if s := fmt.Sprint(rows[0]["happened_time"]); !strings.Contains(s, "03:04:05") {
+			t.Errorf("events[0].happened_time = %q; want it to contain 03:04:05", s)
+		}
+	}
+	// Row 2: 2025-12-31 / 2025-12-31 23:59:59 / false.
+	if ts := asTime(t, rows[1]["happened_at"]).UTC().Format("2006-01-02 15:04:05"); ts != "2025-12-31 23:59:59" {
+		t.Errorf("events[1].happened_at = %q; want 2025-12-31 23:59:59", ts)
+	}
+	if b := asBool(t, rows[1]["is_active"]); b {
+		t.Errorf("events[1].is_active = %v; want false", b)
+	}
+}
+
+// assertTemporalKind checks a target column's IR type family for the
+// temporal/bool kinds (engine-neutral: PG and MySQL each report their own
+// canonical temporal IR types).
+func assertTemporalKind(t *testing.T, tbl *ir.Table, col, kind string) {
+	t.Helper()
+	c := findColumn(tbl, col)
+	if c == nil {
+		t.Fatalf("%s.%s missing", tbl.Name, col)
+	}
+	var ok bool
+	switch kind {
+	case "date":
+		_, ok = c.Type.(ir.Date)
+	case "timestampish":
+		switch c.Type.(type) {
+		case ir.Timestamp, ir.DateTime:
+			ok = true
+		}
+	case "timeish":
+		_, ok = c.Type.(ir.Time)
+	case "boolean":
+		_, ok = c.Type.(ir.Boolean)
+	}
+	if !ok {
+		t.Errorf("%s.%s type = %#v; want IR %s (NOT numeric)", tbl.Name, col, c.Type, kind)
+	}
+}
+
+// asTime coerces a temporal row value to time.Time.
+func asTime(t *testing.T, v any) time.Time {
+	t.Helper()
+	tm, ok := v.(time.Time)
+	if !ok {
+		t.Fatalf("value %#v (%T) is not time.Time", v, v)
+	}
+	return tm
+}
+
+// asBool coerces a boolean row value to bool, tolerating the int64/[]byte
+// shapes a target driver might surface for a TINYINT(1)-backed boolean.
+func asBool(t *testing.T, v any) bool {
+	t.Helper()
+	switch x := v.(type) {
+	case bool:
+		return x
+	case int64:
+		return x != 0
+	default:
+		t.Fatalf("value %#v (%T) is not boolean", v, v)
+		return false
 	}
 }

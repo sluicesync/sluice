@@ -2,8 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package sqlite implements a read-only sluice [ir.Engine] for SQLite
-// database files — and, by extension, Cloudflare D1, whose
-// `wrangler d1 export` produces an ordinary SQLite file (ADR-0128).
+// database files — and, by extension, Cloudflare D1 (ADR-0128). Note
+// `wrangler d1 export` emits a `.sql` TEXT dump (CREATE TABLE + INSERTs),
+// NOT a binary SQLite file, so the D1 flow is: export to dump.sql, then
+// materialize a file with `sqlite3 app.db < dump.sql` (strip D1's internal
+// `_cf_KV` table, or `--exclude-table _cf_KV`), then point sluice at
+// app.db. Accepting a `.sql` dump directly (materialized in-process) is a
+// deferred ergonomic follow-up.
 //
 // It is a MIGRATE SOURCE only: it implements [ir.SchemaReader] and
 // [ir.RowReader] so a SQLite/D1 file can be imported into Postgres or
@@ -39,21 +44,33 @@
 //
 // SQLite has NO native DATE / TIME / BOOLEAN storage — dates are stored
 // as TEXT/INTEGER/REAL by application convention and booleans as 0/1
-// INTEGERs. The prototype deliberately does NOT guess a date or boolean
-// type: such columns are carried as their affinity type (a 0/1 flag lands
-// as ir.Integer; a date stored in a TEXT/VARCHAR-declared column lands as
-// ir.Text). A declared date/bool policy (`--sqlite-date-cols` / affinity
-// heuristics) is a deferred follow-up.
+// INTEGERs. The affinity mapping above is overridden for columns whose
+// DECLARED type names a temporal/boolean shape (ADR-0129): a column
+// declared DATETIME/TIMESTAMP → ir.Timestamp, DATE → ir.Date, TIME →
+// ir.Time, BOOL/BOOLEAN → ir.Boolean (case-insensitive substring, in that
+// precedence). An INTEGER-declared 0/1 column is NOT guessed as bool; only
+// the explicit BOOL/BOOLEAN spelling triggers it.
 //
-// OPERATOR CAVEAT (deferred date policy, the safe direction): a column
-// DECLARED `DATE` / `DATETIME` (or `STRING`/`BOOLEAN`) takes NUMERIC
-// affinity → ir.Decimal, so an ISO date *string* stored in it is a
-// TEXT-in-NUMERIC mismatch and the migration is REFUSED LOUDLY (it is not
-// silently mangled). So a typical app schema that declares `created_at
-// DATE` but stores `'2024-01-01'` text will hard-fail this prototype until
-// the date/bool policy lands — refuse-not-corrupt, but a real usability
-// limit. Workaround today: a target `--type-override` for such columns, or
-// source columns declared TEXT.
+// # Declared date/bool value decode (ADR-0129)
+//
+// The IR temporal *type* is unambiguous from the declared type, but the
+// VALUE encoding (ISO text vs unix int vs julian real) is app-specific, and
+// guessing wrong silently yields a wrong date — a value-fidelity violation.
+// So the encoding is an EXPLICIT operator choice, --sqlite-date-encoding
+// (DSN param sqlite_date_encoding), one of:
+//
+//	iso (DEFAULT) — temporal values are ISO-8601 TEXT; a non-TEXT storage
+//	  class, or text matching no layout, is REFUSED LOUDLY.
+//	unixepoch / unixmillis — INTEGER (or REAL) unix seconds / milliseconds.
+//	julian — REAL/INTEGER Julian day number.
+//
+// A non-matching storage class for the active encoding is refused loudly
+// (naming table/column/rowid + the value), never a guessed value. A
+// BOOLEAN-declared column accepts INTEGER 0/1 and TEXT true|false|t|f|yes|
+// no|1|0 (case-insensitive); any other value is refused. The documented
+// escape hatch for an outlier column is `--type-override <col>=text`, which
+// carries the raw SQLite value verbatim. See value_decode.go for the full
+// encoding × storage-class matrix.
 //
 // PRECISION NOTE: a large integer stored in a REAL / DOUBLE-affinity column
 // was already converted to float64 by SQLite AT STORAGE TIME (REAL affinity
@@ -110,7 +127,10 @@ func (Engine) Capabilities() ir.Capabilities { return capabilities }
 // identified by dsn (a filesystem path, `file:` URI, or `sqlite://`
 // URL). The caller is responsible for closing the returned reader.
 func (Engine) OpenSchemaReader(ctx context.Context, dsn string) (ir.SchemaReader, error) {
-	db, path, err := openReadOnly(ctx, dsn)
+	// Schema reading infers the IR type from the declared type alone
+	// (ADR-0129), so the per-source date encoding is irrelevant here and the
+	// resolved value is discarded.
+	db, path, _, err := openReadOnly(ctx, dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -119,13 +139,15 @@ func (Engine) OpenSchemaReader(ctx context.Context, dsn string) (ir.SchemaReader
 
 // OpenRowReader returns a [RowReader] bound to the SQLite file
 // identified by dsn. The caller is responsible for closing the returned
-// reader.
+// reader. The per-source date encoding (the `sqlite_date_encoding` DSN
+// param, or the process-global default — ADR-0129) is resolved here and
+// carried on the reader for value decode.
 func (Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, error) {
-	db, path, err := openReadOnly(ctx, dsn)
+	db, path, enc, err := openReadOnly(ctx, dsn)
 	if err != nil {
 		return nil, err
 	}
-	return &RowReader{db: db, path: path}, nil
+	return &RowReader{db: db, path: path, dateEnc: enc}, nil
 }
 
 // OpenSchemaWriter is not implemented: SQLite is a migrate source only.

@@ -102,7 +102,9 @@ func TestDecodeCell(t *testing.T) {
 	for _, m := range matrix {
 		for _, c := range classes {
 			exp := m.rows[c.name]
-			got, err := decodeCell(c.val, m.irType)
+			// Affinity types ignore the encoding; iso is an arbitrary concrete
+			// pick. The temporal/bool matrices are pinned separately.
+			got, err := decodeCell(c.val, m.irType, dateEncodingISO)
 			switch exp.outcome {
 			case faithful:
 				if err != nil {

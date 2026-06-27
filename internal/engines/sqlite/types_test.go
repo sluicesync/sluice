@@ -81,3 +81,108 @@ func TestIRTypeFor(t *testing.T) {
 		}
 	}
 }
+
+// TestResolveColumnType pins ADR-0129's declared-type → IR resolution: the
+// temporal/bool inference takes precedence over the affinity default for the
+// explicit spellings, the load-bearing precedence order is honored (DATETIME/
+// TIMESTAMP before DATE before TIME), the BIGDATE-style substring
+// false-positive is acknowledged, and every non-temporal/bool declared type
+// still follows the affinity mapping unchanged.
+func TestResolveColumnType(t *testing.T) {
+	cases := []struct {
+		declared string
+		want     ir.Type
+	}{
+		// Temporal/bool overrides (the new policy).
+		{"DATE", ir.Date{}},
+		{"date", ir.Date{}},
+		{"DATETIME", ir.Timestamp{}}, // DATETIME wins over the DATE/TIME substrings
+		{"TIMESTAMP", ir.Timestamp{}},
+		{"TIMESTAMPTZ", ir.Timestamp{}}, // still tz-naive in SQLite
+		{"TIME", ir.Time{}},
+		{"BOOL", ir.Boolean{}},
+		{"BOOLEAN", ir.Boolean{}},
+		{"boolean", ir.Boolean{}},
+		// Precedence: "DATETIME" (no separator) is one token → Timestamp, but
+		// "DATE_TIME" contains the "DATE" substring before "TIME", so DATE wins.
+		{"DATE_TIME", ir.Date{}},
+		{"BIGDATE", ir.Date{}}, // documented substring false-positive
+		// Affinity fallthrough — NOT temporal/bool, so affinity rules apply.
+		{"INTEGER", ir.Integer{Width: 64}}, // an INTEGER 0/1 flag is NOT guessed as bool
+		{"INT", ir.Integer{Width: 64}},
+		{"VARCHAR(255)", ir.Text{Size: ir.TextLong}},
+		{"TEXT", ir.Text{Size: ir.TextLong}},
+		{"REAL", ir.Float{Precision: ir.FloatDouble}},
+		{"NUMERIC", ir.Decimal{Unconstrained: true}},
+		{"DECIMAL(10,2)", ir.Decimal{Unconstrained: true}},
+		{"BLOB", ir.Blob{Size: ir.BlobLong}},
+		{"", ir.Blob{Size: ir.BlobLong}}, // no declared type → BLOB affinity
+	}
+	for _, c := range cases {
+		got := resolveColumnType(c.declared)
+		if got != c.want {
+			t.Errorf("resolveColumnType(%q) = %#v; want %#v", c.declared, got, c.want)
+		}
+	}
+}
+
+// TestDeclaredTemporalBoolType pins the precedence directly, including the
+// negative case (a non-temporal/bool declared type yields ok=false so the
+// caller falls back to affinity).
+func TestDeclaredTemporalBoolType(t *testing.T) {
+	cases := []struct {
+		declared string
+		want     ir.Type
+		wantOK   bool
+	}{
+		{"DATETIME", ir.Timestamp{}, true},
+		{"TIMESTAMP", ir.Timestamp{}, true},
+		{"DATE", ir.Date{}, true},
+		{"TIME", ir.Time{}, true},
+		{"BOOLEAN", ir.Boolean{}, true},
+		{"BOOL", ir.Boolean{}, true},
+		{"INTEGER", nil, false},
+		{"VARCHAR(10)", nil, false},
+		{"NUMERIC", nil, false},
+		{"", nil, false},
+	}
+	for _, c := range cases {
+		got, ok := declaredTemporalBoolType(c.declared)
+		if ok != c.wantOK {
+			t.Errorf("declaredTemporalBoolType(%q) ok = %v; want %v", c.declared, ok, c.wantOK)
+			continue
+		}
+		if ok && got != c.want {
+			t.Errorf("declaredTemporalBoolType(%q) = %#v; want %#v", c.declared, got, c.want)
+		}
+	}
+}
+
+// TestParseDateEncoding pins the shared encoding parser used by both the
+// global flag setter and the per-source DSN param (so they can't drift).
+func TestParseDateEncoding(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    dateEncoding
+		wantErr bool
+	}{
+		{"", dateEncodingISO, false},
+		{"iso", dateEncodingISO, false},
+		{"ISO", dateEncodingISO, false},
+		{"unixepoch", dateEncodingUnixEpoch, false},
+		{"unixmillis", dateEncodingUnixMillis, false},
+		{"julian", dateEncodingJulian, false},
+		{"  julian  ", dateEncodingJulian, false},
+		{"bogus", dateEncodingInherit, true},
+	}
+	for _, c := range cases {
+		got, err := parseDateEncoding(c.in)
+		if (err != nil) != c.wantErr {
+			t.Errorf("parseDateEncoding(%q) err = %v; wantErr %v", c.in, err, c.wantErr)
+			continue
+		}
+		if !c.wantErr && got != c.want {
+			t.Errorf("parseDateEncoding(%q) = %v; want %v", c.in, got, c.want)
+		}
+	}
+}

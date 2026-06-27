@@ -80,7 +80,7 @@ func TestParseDSN(t *testing.T) {
 		{"sqlite:///data/app.db", "/data/app.db"},
 	}
 	for _, c := range cases {
-		driverDSN, path, err := parseDSN(c.in)
+		driverDSN, path, _, err := parseDSN(c.in)
 		if err != nil {
 			t.Errorf("parseDSN(%q) error: %v", c.in, err)
 			continue
@@ -93,8 +93,53 @@ func TestParseDSN(t *testing.T) {
 		}
 	}
 
-	if _, _, err := parseDSN(""); err == nil {
+	if _, _, _, err := parseDSN(""); err == nil {
 		t.Error("parseDSN(\"\") should error")
+	}
+}
+
+// TestParseDSN_DateEncodingParam pins ADR-0129's per-source
+// sqlite_date_encoding DSN param: it resolves to the right encoding, is
+// STRIPPED from the driver DSN (so it never reaches modernc), other query
+// params survive, absence yields the inherit sentinel, and an invalid value
+// refuses loudly before any connection opens.
+func TestParseDSN_DateEncodingParam(t *testing.T) {
+	cases := []struct {
+		in      string
+		wantEnc dateEncoding
+		wantErr bool
+	}{
+		{"./app.db", dateEncodingInherit, false},
+		{"./app.db?sqlite_date_encoding=iso", dateEncodingISO, false},
+		{"./app.db?sqlite_date_encoding=unixepoch", dateEncodingUnixEpoch, false},
+		{"./app.db?sqlite_date_encoding=unixmillis", dateEncodingUnixMillis, false},
+		{"./app.db?sqlite_date_encoding=julian", dateEncodingJulian, false},
+		{"file:app.db?sqlite_date_encoding=julian&cache=shared", dateEncodingJulian, false},
+		{"./app.db?sqlite_date_encoding=bogus", dateEncodingInherit, true},
+	}
+	for _, c := range cases {
+		driverDSN, _, enc, err := parseDSN(c.in)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("parseDSN(%q) err = nil; want a loud refusal", c.in)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseDSN(%q) error: %v", c.in, err)
+			continue
+		}
+		if enc != c.wantEnc {
+			t.Errorf("parseDSN(%q) enc = %v; want %v", c.in, enc, c.wantEnc)
+		}
+		// The sluice-internal param must never reach the driver DSN.
+		if contains(driverDSN, dsnDateEncodingParam) {
+			t.Errorf("parseDSN(%q) driverDSN = %q still carries %q", c.in, driverDSN, dsnDateEncodingParam)
+		}
+		// A non-sluice query param must survive the strip.
+		if c.in == "file:app.db?sqlite_date_encoding=julian&cache=shared" && !contains(driverDSN, "cache=shared") {
+			t.Errorf("parseDSN(%q) dropped cache=shared: %q", c.in, driverDSN)
+		}
 	}
 }
 

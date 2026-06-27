@@ -82,6 +82,17 @@ type Globals struct {
 	// default refuses loudly, naming the column.
 	ZeroDate string `name:"zero-date" help:"How to carry MySQL zero/partial dates (0000-00-00, YYYY-00-DD, YYYY-MM-00) process-wide: 'error' refuses loudly naming the column (default), 'null' carries them as NULL (refused on NOT NULL columns), 'epoch' substitutes 1970-01-01. PER-SYNC override (ADR-0127): set ?zero_date=error|null|epoch on an individual MySQL source DSN (the DSN value wins over this flag), or the zero-date: key in a sync run fleet config. See docs/operator/migrating-legacy-mysql.md." enum:"error,null,epoch" default:"error" placeholder:"MODE"`
 
+	// SQLiteDateEncoding governs how a SQLite SOURCE decodes the VALUE of a
+	// column DECLARED date/time (ir.Date/Timestamp/Time, ADR-0129). SQLite
+	// has no native temporal storage — dates live as ISO TEXT, unix INTEGER,
+	// or Julian REAL by app convention — and the IR type is inferred from the
+	// declared type but the encoding is ambiguous; guessing it silently
+	// yields a wrong date. So it is an explicit operator choice with loud
+	// refusal on a storage-class mismatch (never a silently-wrong date). The
+	// default 'iso' assumes ISO-8601 text. PER-SOURCE override: the
+	// sqlite_date_encoding DSN query param on an individual SQLite source.
+	SQLiteDateEncoding string `name:"sqlite-date-encoding" help:"How a SQLite SOURCE decodes columns DECLARED date/time (ADR-0129): 'iso' (default) reads ISO-8601 TEXT; 'unixepoch'/'unixmillis' read INTEGER/REAL unix seconds/milliseconds; 'julian' reads a REAL/INTEGER Julian day. A value whose storage class doesn't match the chosen encoding is refused loudly (naming the row) — never a silently-wrong date; use --type-override <col>=text to carry an outlier raw. PER-SOURCE override: set ?sqlite_date_encoding=iso|unixepoch|unixmillis|julian on an individual SQLite source DSN (the DSN value wins over this flag)." enum:"iso,unixepoch,unixmillis,julian" default:"iso" placeholder:"ENCODING"`
+
 	// MaxMemory is a hard soft-ceiling on the Go heap, applied via
 	// runtime/debug.SetMemoryLimit at startup. --max-buffer-bytes only
 	// caps *raw value bytes* of buffered ir.Row maps; the real Go-heap

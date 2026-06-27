@@ -70,15 +70,64 @@ func affinityOf(declaredType string) affinity {
 	}
 }
 
-// irTypeFor maps a column affinity to its IR type. This is the schema-
-// side half of the value-fidelity contract; value_decode.go enforces the
-// per-row storage-class half against the same affinity.
+// resolveColumnType maps a column's DECLARED type string to its IR type.
+// It is the single schema-side entry point the reader uses: it applies the
+// ADR-0129 declared-temporal/bool policy FIRST (a column the operator named
+// DATE / DATETIME / TIMESTAMP / TIME / BOOL[EAN] becomes the corresponding
+// IR temporal/boolean type) and falls back to the affinity mapping for
+// everything else. The value half (decoding each row per the resolved type
+// and the operator's date encoding) lives in value_decode.go.
+func resolveColumnType(declaredType string) ir.Type {
+	if t, ok := declaredTemporalBoolType(declaredType); ok {
+		return t
+	}
+	return irTypeFor(affinityOf(declaredType))
+}
+
+// declaredTemporalBoolType implements ADR-0129's declared-type → IR
+// temporal/boolean inference. It matches case-insensitively on a SUBSTRING
+// of the declared type (the same matching philosophy as SQLite's own
+// affinity rules), in a load-bearing PRECEDENCE order:
 //
-// Note: SQLite has no native DATE / TIME / BOOLEAN storage class, so the
-// prototype carries date/bool columns as whatever affinity their
-// declared type yields (a DATE column declared `TEXT` → ir.Text; a 0/1
-// flag declared `INTEGER`/`BOOLEAN` → ir.Integer). It deliberately does
-// not guess a temporal/boolean IR type — see the package doc comment.
+//  1. contains "DATETIME" or "TIMESTAMP" → ir.Timestamp (no tz; SQLite is
+//     tz-naive). Checked first because "DATETIME" also contains "DATE" and
+//     "TIME"; without this precedence a DATETIME column would mis-map to Date.
+//  2. else contains "DATE" → ir.Date
+//  3. else contains "TIME" → ir.Time (no tz)
+//  4. else contains "BOOL" → ir.Boolean (covers BOOL and BOOLEAN)
+//
+// Only these explicit spellings override the affinity default; an
+// INTEGER-declared 0/1 column is NOT guessed as bool (that requires an
+// explicit BOOL/BOOLEAN declaration). Substring matching is deliberate and
+// documented: a contrived declared type like "BIGDATE" contains "DATE" and
+// therefore resolves to ir.Date — the same false-positive surface SQLite's
+// own affinity matching has, and the price of matching SQLite's convention.
+// An operator who hits such a case carries the column raw with
+// `--type-override <col>=text`.
+//
+// ok is false when no temporal/bool spelling is present, so the caller falls
+// back to the affinity mapping.
+func declaredTemporalBoolType(declaredType string) (ir.Type, bool) {
+	t := strings.ToUpper(strings.TrimSpace(declaredType))
+	switch {
+	case strings.Contains(t, "DATETIME"), strings.Contains(t, "TIMESTAMP"):
+		return ir.Timestamp{}, true
+	case strings.Contains(t, "DATE"):
+		return ir.Date{}, true
+	case strings.Contains(t, "TIME"):
+		return ir.Time{}, true
+	case strings.Contains(t, "BOOL"):
+		return ir.Boolean{}, true
+	default:
+		return nil, false
+	}
+}
+
+// irTypeFor maps a column affinity to its IR type. This is the affinity
+// half of the schema-side value-fidelity contract; value_decode.go enforces
+// the per-row storage-class half against the same affinity. Declared
+// temporal/bool spellings are handled ahead of this by
+// [declaredTemporalBoolType] (ADR-0129).
 func irTypeFor(a affinity) ir.Type {
 	switch a {
 	case affinityInteger:

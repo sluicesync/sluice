@@ -135,7 +135,7 @@ func (r *SchemaReader) readColumnsAndPK(ctx context.Context, t *ir.Table) error 
 		}
 		col := &ir.Column{
 			Name:     name,
-			Type:     irTypeFor(affinityOf(declType)),
+			Type:     resolveColumnType(declType),
 			Nullable: notNull == 0,
 			Default:  parseDefault(dfltValue),
 		}

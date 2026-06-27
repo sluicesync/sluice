@@ -6,8 +6,10 @@
 source landed as a prototype: `internal/engines/sqlite` (pure-Go modernc.org/sqlite),
 affinity → IR type mapping with per-row storage-class loud-refusal, and the cross-engine
 round-trip proven into BOTH Postgres and MySQL. Deferred (not in the prototype): a native
-D1 HTTP-API reader, trigger-based CDC, within-table chunking, and the declared date/bool
-convention policy. Prompted by `planetscale/cli` PR #1278 (an offline one-shot importer
+D1 HTTP-API reader, trigger-based CDC, and within-table chunking. The declared date/bool
+convention policy (deferred at prototype time) is now handled per **ADR-0129** (declared
+temporal/bool → IR type; `--sqlite-date-encoding` governs value decode; loud refusal on
+mismatch). Prompted by `planetscale/cli` PR #1278 (an offline one-shot importer
 from a Cloudflare D1 *SQLite export* into PlanetScale Postgres, wrapping pgloader); this
 ADR records how sluice does the equivalent natively.
 
