@@ -37,6 +37,23 @@ const busyTimeoutPragma = "_pragma=busy_timeout(5000)"
 // each repeated `_pragma` query param on connection open.
 const readOnlyPragmas = queryOnlyPragma + "&" + busyTimeoutPragma
 
+// foreignKeysOffPragma disables SQLite's per-connection FK enforcement on a
+// WRITABLE (target) connection. SQLite's default is already OFF, but the
+// SQLite target writer (ADR-0134) emits FOREIGN KEY constraints INLINE in
+// CREATE TABLE (SQLite cannot ADD them later) and the bulk-copy phase loads
+// tables in an unordered sweep — a child row can land before its parent. With
+// enforcement off during load the order doesn't matter; the post-copy
+// `PRAGMA foreign_key_check` (CreateConstraints) then surfaces any genuine
+// violation LOUDLY on a fresh scan of the whole file. Setting it explicitly
+// also guards against a future driver default flip.
+const foreignKeysOffPragma = "_pragma=foreign_keys(0)"
+
+// writePragmas is the full _pragma set every TARGET connection gets: a
+// busy-timeout (the schema-writer and row-writer pools may briefly contend on
+// the one file) plus FK enforcement off for the inline-FK / unordered-copy
+// model. NO query_only — the target is writable. See ADR-0134.
+const writePragmas = foreignKeysOffPragma + "&" + busyTimeoutPragma
+
 // dsnDateEncodingParam is the sluice-internal source-DSN query key that
 // overrides the process-global --sqlite-date-encoding PER SOURCE (ADR-0129),
 // mirroring the MySQL engine's `zero_date` param (ADR-0127). It is NOT a
@@ -61,6 +78,20 @@ const dsnDateEncodingParam = "sqlite_date_encoding"
 // SQLite URI form natively); the other forms are reduced to a plain
 // path, which modernc opens directly.
 func parseDSN(dsn string) (driverDSN, path string, enc dateEncoding, err error) {
+	base, path, enc, err := dsnFormParts(dsn)
+	if err != nil {
+		return "", "", dateEncodingInherit, err
+	}
+	return appendPragmas(base, readOnlyPragmas), path, enc, nil
+}
+
+// dsnFormParts normalises one of sluice's accepted DSN forms into the driver
+// DSN BASE (the file path / file: URI with sluice's own params stripped, but
+// WITHOUT any _pragma set appended), the bare display path, and the resolved
+// per-source date encoding. The pragma set is appended by the caller —
+// readOnlyPragmas for a source ([parseDSN]) or writePragmas for a target
+// ([openWritable]) — so the two open paths share one parser (ADR-0134).
+func dsnFormParts(dsn string) (base, path string, enc dateEncoding, err error) {
 	if strings.TrimSpace(dsn) == "" {
 		return "", "", dateEncodingInherit, errors.New("sqlite: DSN is empty")
 	}
@@ -79,7 +110,6 @@ func parseDSN(dsn string) (driverDSN, path string, enc dateEncoding, err error) 
 		}
 	}
 
-	var base string
 	switch {
 	case strings.HasPrefix(clean, "file:"):
 		// Native SQLite URI form — keep it. The displayed path is the
@@ -101,12 +131,18 @@ func parseDSN(dsn string) (driverDSN, path string, enc dateEncoding, err error) 
 	if path == "" {
 		return "", "", dateEncodingInherit, fmt.Errorf("sqlite: DSN %q has no file path", dsn)
 	}
+	return base, path, enc, nil
+}
 
+// appendPragmas joins a driver-DSN base with a _pragma set, choosing the right
+// query-string separator (`?` for the first param, `&` when base already
+// carries one — e.g. a `file:...?cache=shared` URI).
+func appendPragmas(base, pragmas string) string {
 	sep := "?"
 	if strings.Contains(base, "?") {
 		sep = "&"
 	}
-	return base + sep + readOnlyPragmas, path, enc, nil
+	return base + sep + pragmas
 }
 
 // stripDateEncodingParam removes sluice's [dsnDateEncodingParam] from a DSN's
@@ -200,4 +236,31 @@ func cleanupTemp(tempPath string) {
 	if tempPath != "" {
 		_ = os.Remove(tempPath)
 	}
+}
+
+// openWritable opens a WRITABLE *sql.DB against the SQLite TARGET named by dsn
+// and verifies it is reachable (PingContext, which creates the file if absent —
+// modernc opens with READWRITE|CREATE). Returns the pool and the bare file path
+// (for error messages). The caller owns the pool's lifecycle via Close. Used by
+// [Engine.OpenSchemaWriter] / [Engine.OpenRowWriter] (ADR-0134).
+//
+// Unlike [openReadOnly] there is no dump-sniff/materialize: a target is a real
+// `.db` file sluice creates and writes; the `.sql`-dump ingest path is a SOURCE
+// concern (ADR-0130). The per-source date encoding is irrelevant to the writer
+// (it always writes canonical ISO temporal text), so it is parsed only to strip
+// the param from the driver DSN and otherwise discarded.
+func openWritable(ctx context.Context, dsn string) (db *sql.DB, path string, err error) {
+	base, path, _, err := dsnFormParts(dsn)
+	if err != nil {
+		return nil, "", err
+	}
+	db, err = sql.Open("sqlite", appendPragmas(base, writePragmas))
+	if err != nil {
+		return nil, "", fmt.Errorf("sqlite: open target %q: %w", path, err)
+	}
+	if err = db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, "", fmt.Errorf("sqlite: open target %q: %w", path, err)
+	}
+	return db, path, nil
 }

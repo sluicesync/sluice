@@ -21,13 +21,17 @@
 // `_cf_KV` and wraps nothing in BEGIN/COMMIT.) A native D1 HTTP-API reader
 // remains a deferred follow-up.
 //
-// It is a MIGRATE SOURCE only: it implements [ir.SchemaReader] and
-// [ir.RowReader] so a SQLite/D1 file can be imported into Postgres or
-// MySQL via the standard `sluice migrate` pipeline. The write-side and
-// CDC Open* methods return [ErrNotImplemented]: SQLite cannot be a
-// sluice target or a CDC source in this prototype (Capabilities.CDC =
-// CDCNone). A native D1 HTTP-API reader (paginated REST + token auth)
-// and trigger-based CDC are deferred follow-ups.
+// It is both a migrate SOURCE and a migrate TARGET: it implements
+// [ir.SchemaReader] + [ir.RowReader] (a SQLite/D1 file imports into
+// Postgres or MySQL) and [ir.SchemaWriter] + [ir.RowWriter] (any source —
+// PG, MySQL, or another SQLite/D1 — migrates INTO a SQLite file, ADR-0134),
+// both via the standard `sluice migrate` pipeline. The target write side is
+// the faithful inverse of the reader, enabling X→SQLite→Cloudflare-D1 via
+// `wrangler d1 import`. The CDC / change-apply Open* methods return
+// [ErrNotImplemented]: SQLite is not a CDC source or target in this
+// prototype (Capabilities.CDC = CDCNone). A native D1 HTTP-API reader
+// (paginated REST + token auth) and trigger-based CDC are deferred
+// follow-ups.
 //
 // The engine self-registers as "sqlite" when imported:
 //
@@ -114,15 +118,16 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
-// ErrNotImplemented is returned by the Open* methods that have no SQLite
-// implementation in this prototype — SQLite is a migrate SOURCE only, so
-// the write-side, CDC, and snapshot-stream surfaces are intentionally
-// absent. Callers should check for it with [errors.Is].
-var ErrNotImplemented = errors.New("sqlite engine: not implemented (SQLite is a migrate source only)")
+// ErrNotImplemented is returned by the CDC / change-apply / snapshot-stream
+// Open* methods, which have no SQLite implementation in this prototype —
+// SQLite is a migrate source and target but not a CDC source or target
+// (Capabilities.CDC = CDCNone). Callers should check for it with [errors.Is].
+var ErrNotImplemented = errors.New("sqlite engine: not implemented (SQLite has no CDC / change-apply)")
 
 // Engine is the SQLite implementation of [ir.Engine]. It holds no
-// connection state; the zero value is fully usable. Each Open* call
-// opens an independent read-only *sql.DB against the file.
+// connection state; the zero value is fully usable. Each Open* call opens
+// an independent *sql.DB against the file (read-only for the source
+// reader surfaces, writable for the target writer surfaces).
 type Engine struct{}
 
 // Name returns the engine's short identifier as used in configuration
@@ -162,14 +167,27 @@ func (Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, erro
 	return &RowReader{db: db, path: path, dateEnc: enc, tempPath: tempPath}, nil
 }
 
-// OpenSchemaWriter is not implemented: SQLite is a migrate source only.
-func (Engine) OpenSchemaWriter(context.Context, string) (ir.SchemaWriter, error) {
-	return nil, ErrNotImplemented
+// OpenSchemaWriter returns a [SchemaWriter] bound to the SQLite target
+// file identified by dsn (created if absent). The connection is writable
+// with FK enforcement off for the inline-FK / unordered bulk-copy model
+// (ADR-0134). The caller is responsible for closing the returned writer.
+func (Engine) OpenSchemaWriter(ctx context.Context, dsn string) (ir.SchemaWriter, error) {
+	db, path, err := openWritable(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	return &SchemaWriter{db: db, path: path}, nil
 }
 
-// OpenRowWriter is not implemented: SQLite is a migrate source only.
-func (Engine) OpenRowWriter(context.Context, string) (ir.RowWriter, error) {
-	return nil, ErrNotImplemented
+// OpenRowWriter returns a [RowWriter] bound to the SQLite target file
+// identified by dsn (created if absent). The caller is responsible for
+// closing the returned writer.
+func (Engine) OpenRowWriter(ctx context.Context, dsn string) (ir.RowWriter, error) {
+	db, path, err := openWritable(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	return &RowWriter{db: db, path: path}, nil
 }
 
 // OpenCDCReader is not implemented: SQLite declares CDCNone in this
@@ -190,15 +208,17 @@ func (Engine) OpenSnapshotStream(context.Context, string) (*ir.SnapshotStream, e
 	return nil, ErrNotImplemented
 }
 
-// capabilities declares what this engine supports. SQLite is a
-// read-only migrate source: no CDC, no bulk-load target, no extension
-// types. SchemaScope is flat (SQLite has a single table namespace per
-// database file). JSON is stored as TEXT (no distinct type) and is read
-// by affinity, so JSONSupport is None. CHECK constraints and generated
-// columns ARE read and carried (ADR-0133), so both are declared true;
-// partitioning has no SQLite equivalent and stays false.
+// capabilities declares what this engine supports. SQLite is a migrate
+// source AND target with no CDC. BulkLoad is BatchedInsert: SQLite's
+// fast-load path is a multi-row parameterised INSERT inside one
+// transaction (there is no COPY/LOAD DATA), which makes it a valid target
+// (ADR-0134). No extension types. SchemaScope is flat (a single table
+// namespace per database file). JSON is stored as TEXT (no distinct type)
+// and read by affinity, so JSONSupport is None. CHECK constraints and
+// generated columns ARE read and carried (ADR-0133), so both are declared
+// true; partitioning has no SQLite equivalent and stays false.
 var capabilities = ir.Capabilities{
-	BulkLoad:                 ir.BulkLoadNone,
+	BulkLoad:                 ir.BulkLoadBatchedInsert,
 	CDC:                      ir.CDCNone,
 	SchemaScope:              ir.SchemaScopeFlat,
 	SupportedTypes:           ir.NewTypeSet(), // no extension types

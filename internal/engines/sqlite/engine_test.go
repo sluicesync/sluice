@@ -23,8 +23,9 @@ func TestEngineRegistered(t *testing.T) {
 	}
 }
 
-// TestCapabilities pins the honestly-declared migrate-source capability
-// shape: no CDC, flat namespace, no extension types, no bulk-load target.
+// TestCapabilities pins the honestly-declared capability shape: SQLite is
+// now a migrate source AND target (BulkLoad=BatchedInsert, ADR-0134) with
+// no CDC, a flat namespace, and no extension types.
 func TestCapabilities(t *testing.T) {
 	c := Engine{}.Capabilities()
 	if c.CDC != ir.CDCNone {
@@ -33,27 +34,23 @@ func TestCapabilities(t *testing.T) {
 	if c.SchemaScope != ir.SchemaScopeFlat {
 		t.Errorf("SchemaScope = %v; want flat", c.SchemaScope)
 	}
-	if c.BulkLoad != ir.BulkLoadNone {
-		t.Errorf("BulkLoad = %v; want none", c.BulkLoad)
+	if c.BulkLoad != ir.BulkLoadBatchedInsert {
+		t.Errorf("BulkLoad = %v; want batched-insert (SQLite is a valid target, ADR-0134)", c.BulkLoad)
 	}
 	if c.SupportedTypes != ir.NewTypeSet() {
 		t.Errorf("SupportedTypes = %v; want empty", c.SupportedTypes)
 	}
 }
 
-// TestWriteSideNotImplemented confirms every write/CDC/snapshot Open*
-// returns ErrNotImplemented — SQLite is a migrate source only.
-func TestWriteSideNotImplemented(t *testing.T) {
+// TestCDCSideNotImplemented confirms the CDC / change-apply / snapshot
+// Open* methods return ErrNotImplemented — SQLite has no CDC (the write
+// side IS now implemented; see the writer tests). The target-writer Open*
+// are exercised in writer_db_test.go.
+func TestCDCSideNotImplemented(t *testing.T) {
 	e := Engine{}
 	ctx := context.Background()
 	const dsn = "ignored.db"
 
-	if _, err := e.OpenSchemaWriter(ctx, dsn); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("OpenSchemaWriter err = %v; want ErrNotImplemented", err)
-	}
-	if _, err := e.OpenRowWriter(ctx, dsn); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("OpenRowWriter err = %v; want ErrNotImplemented", err)
-	}
 	if _, err := e.OpenCDCReader(ctx, dsn); !errors.Is(err, ErrNotImplemented) {
 		t.Errorf("OpenCDCReader err = %v; want ErrNotImplemented", err)
 	}
