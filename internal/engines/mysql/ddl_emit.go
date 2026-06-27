@@ -467,7 +467,16 @@ func emitDefault(d ir.DefaultValue, t ir.Type) (string, bool) {
 			return v.Expr, true
 		}
 		expr := v.Expr
-		if v.Dialect != "" && v.Dialect != dialectName {
+		if v.Dialect == translatableSourceDialect {
+			// Translate ONLY from the one engine this writer's translator
+			// accepts (Postgres) — ADR-0133 §2. Self / untagged / SQLite /
+			// any unknown dialect takes the verbatim (else) arm below; this
+			// closes the DEFAULT-path silent-mistranslate where a SQLite
+			// default such as `"draft"` (SQLite's double-quoted-string
+			// misfeature) would otherwise be run through translateExprForMySQL
+			// and rewritten into the backtick identifier `` `draft` `` (a
+			// column reference) — a silently-wrong default.
+			//
 			// Cross-dialect DEFAULT body (Bug 64, MySQL side). Before
 			// ADR-0045 this arm had NO identifier re-quote and NO
 			// operator/function translation — only the 3-entry

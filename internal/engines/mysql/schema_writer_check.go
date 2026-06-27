@@ -172,7 +172,12 @@ var untranslatedPGToMySQLTokens = []string{
 // precise definition of "untranslatable", and it also avoids the
 // `~~` (LIKE) source false-matching the bare `~` regex token.
 func refuseUntranslatedCheckExprMySQL(chk *ir.CheckConstraint, exprText string) error {
-	if chk == nil || chk.ExprDialect == "" || chk.ExprDialect == dialectName {
+	// Scan ONLY a body from the one engine whose tokens this list describes
+	// (Postgres); self / untagged / SQLite / any unknown dialect emits verbatim
+	// and is rejected loudly by the target if non-portable (ADR-0133 §2). A
+	// SQLite CHECK must not be measured against the PG→MySQL token list — that
+	// would false-refuse a SQLite expression that merely shares a token spelling.
+	if chk == nil || chk.ExprDialect != translatableSourceDialect {
 		return nil
 	}
 	lowerOutput := strings.ToLower(exprText)

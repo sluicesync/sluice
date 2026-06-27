@@ -58,3 +58,63 @@ func TestWriterDialectGuard_SQLiteVerbatim(t *testing.T) {
 		})
 	}
 }
+
+// TestWriterDialectGuard_DefaultExpr_MySQL extends the guard to the DEFAULT-
+// expression dispatch (emitDefault): a "sqlite" / "" / unknown DEFAULT body is
+// NOT fed through translateExprForMySQL (the `||` concat stays `||`, not
+// CONCAT), a "postgres" body still translates, and the bitLiteralDialect arm is
+// intact. emitDefault applies the MySQL function-default paren wrap, so the
+// verbatim body lands wrapped — the assertion is on translate-vs-not, not the
+// wrap.
+func TestWriterDialectGuard_DefaultExpr_MySQL(t *testing.T) {
+	typ := ir.Varchar{Length: 50}
+
+	for _, tc := range []struct {
+		name       string
+		dialect    string
+		wantConcat bool
+	}{
+		{"sqlite", "sqlite", false},
+		{"empty", "", false},
+		{"unknown", "duckdb", false},
+		{"postgres_translates", "postgres", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := emitDefault(ir.DefaultExpression{Expr: guardBodyPG, Dialect: tc.dialect}, typ)
+			if !ok {
+				t.Fatalf("emitDefault returned ok=false for %s", tc.name)
+			}
+			if tc.wantConcat {
+				if !strings.Contains(got, "CONCAT") {
+					t.Errorf("default[%s] = %q; want it translated to contain CONCAT", tc.name, got)
+				}
+			} else {
+				if strings.Contains(got, "CONCAT") {
+					t.Errorf("default[%s] = %q; want VERBATIM (|| not translated to CONCAT)", tc.name, got)
+				}
+				if !strings.Contains(got, "||") {
+					t.Errorf("default[%s] = %q; want the || operator carried verbatim", tc.name, got)
+				}
+			}
+		})
+	}
+
+	// The bit-literal arm survives (only ever applies to defaults): b'…' bare.
+	if got, ok := emitDefault(ir.DefaultExpression{Expr: "b'101'", Dialect: bitLiteralDialect}, ir.Bit{Length: 3}); !ok || got != "b'101'" {
+		t.Errorf("bit-literal default = (%q, %v); want (b'101', true) (bit arm must stay intact)", got, ok)
+	}
+
+	// The concrete silent-corruption case: SQLite's double-quoted-string
+	// misfeature DEFAULT "draft" must NOT become the backtick identifier
+	// `draft` (a column reference) — the string must survive verbatim.
+	got, ok := emitDefault(ir.DefaultExpression{Expr: `"draft"`, Dialect: "sqlite"}, typ)
+	if !ok {
+		t.Fatal("emitDefault returned ok=false for the draft case")
+	}
+	if strings.Contains(got, "`") {
+		t.Errorf(`sqlite DEFAULT "draft" = %q; must NOT be rewritten into a backtick identifier`, got)
+	}
+	if !strings.Contains(got, `"draft"`) {
+		t.Errorf(`sqlite DEFAULT "draft" = %q; want the "draft" string carried verbatim`, got)
+	}
+}

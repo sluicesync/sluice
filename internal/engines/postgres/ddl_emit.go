@@ -388,9 +388,6 @@ func emitDefault(d ir.DefaultValue, opts emitOpts) (string, bool) {
 // other column values), so the [ExprContext] passed to the translator
 // is the zero value — bool-idiom rewrites stay no-ops on this path.
 func translateDefaultExpr(d ir.DefaultExpression, opts emitOpts) string {
-	if d.Dialect == "" || d.Dialect == dialectName {
-		return d.Expr
-	}
 	if d.Dialect == bitLiteralDialect {
 		// Bit-literal default on a bit(N) column (catalog Bug 62). The
 		// reader emits the MySQL spelling `b'…'`; PG's bit-string
@@ -398,10 +395,20 @@ func translateDefaultExpr(d ir.DefaultExpression, opts emitOpts) string {
 		// only the surface prefix differs. Anything not in the expected
 		// `b'…'` shape falls through verbatim (loud failure on target
 		// beats a silent guess) — bitLiteralBits already validated the
-		// digits at the read boundary.
+		// digits at the read boundary. This special-case arm is checked
+		// first so the dialect-guard below never sees it.
 		if strings.HasPrefix(d.Expr, "b'") {
 			return "B'" + d.Expr[2:]
 		}
+		return d.Expr
+	}
+	// Translate ONLY from the one engine this writer's translator accepts
+	// (MySQL); self / untagged / SQLite / any unknown dialect emits verbatim
+	// (ADR-0133 §2). This closes the DEFAULT-path silent-mistranslate: a
+	// SQLite default like `"draft"` (SQLite's double-quoted-string misfeature)
+	// must NOT be fed through translateExprForPG — it now passes through and a
+	// non-portable default fails loudly at target DDL time instead.
+	if d.Dialect != translatableSourceDialect {
 		return d.Expr
 	}
 	// Cross-dialect DEFAULT body (Bug 64, PG side). Before ADR-0045

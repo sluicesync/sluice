@@ -63,3 +63,46 @@ func TestWriterDialectGuard_SQLiteVerbatim(t *testing.T) {
 		})
 	}
 }
+
+// TestWriterDialectGuard_DefaultExpr_PG extends the guard to the DEFAULT-
+// expression dispatch (translateDefaultExpr): a "sqlite" / "" / unknown
+// DEFAULT body emits VERBATIM (never through translateExprForPG), a "mysql"
+// body still translates, and the bitLiteralDialect special-case arm is intact.
+func TestWriterDialectGuard_DefaultExpr_PG(t *testing.T) {
+	opts := emitOpts{}
+
+	for _, tc := range []struct {
+		name        string
+		dialect     string
+		wantVerbat  bool
+		mustContain string
+	}{
+		{"sqlite", "sqlite", true, ""},
+		{"empty", "", true, ""},
+		{"unknown", "duckdb", true, ""},
+		{"mysql_translates", "mysql", false, "COALESCE"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := translateDefaultExpr(ir.DefaultExpression{Expr: guardBodyMySQL, Dialect: tc.dialect}, opts)
+			if tc.wantVerbat {
+				if got != guardBodyMySQL {
+					t.Errorf("default[%s] = %q; want VERBATIM %q (translator must not run)", tc.name, got, guardBodyMySQL)
+				}
+			} else if !strings.Contains(got, tc.mustContain) {
+				t.Errorf("default[%s] = %q; want it translated to contain %q", tc.name, got, tc.mustContain)
+			}
+		})
+	}
+
+	// The bit-literal arm survives (it only ever applies to defaults): MySQL
+	// b'…' → PG B'…'.
+	if got := translateDefaultExpr(ir.DefaultExpression{Expr: "b'101'", Dialect: bitLiteralDialect}, opts); got != "B'101'" {
+		t.Errorf("bit-literal default = %q; want B'101' (bit arm must stay intact)", got)
+	}
+
+	// The concrete silent-corruption case: SQLite's double-quoted-string
+	// misfeature DEFAULT "draft" must emit VERBATIM, never be rewritten.
+	if got := translateDefaultExpr(ir.DefaultExpression{Expr: `"draft"`, Dialect: "sqlite"}, opts); got != `"draft"` {
+		t.Errorf(`sqlite DEFAULT "draft" = %q; want it carried verbatim as "draft"`, got)
+	}
+}
