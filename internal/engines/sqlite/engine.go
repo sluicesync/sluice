@@ -2,16 +2,24 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package sqlite implements a read-only sluice [ir.Engine] for SQLite
-// database files — and, by extension, Cloudflare D1 (ADR-0128). Note
-// `wrangler d1 export` emits a `.sql` TEXT dump (CREATE TABLE + INSERTs),
-// NOT a binary SQLite file, so the D1 flow is: export to dump.sql, then
-// materialize a file with `sqlite3 app.db < dump.sql`, then point sluice
-// at app.db. (Validated end-to-end against real D1: current `d1 export`
-// already omits D1's internal `_cf_KV` table and wraps nothing in
-// BEGIN/COMMIT; an older/other export that does include `_cf_*` tables can
-// be dropped with `--exclude-table`.) Accepting a `.sql` dump directly
-// (materialized in-process via modernc) is a deferred ergonomic follow-up
-// that would make the D1 path a single command.
+// database files — and, by extension, Cloudflare D1 (ADR-0128/0130). The
+// --source may be EITHER a binary SQLite `.db` OR a `.sql` TEXT dump (what
+// `wrangler d1 export` emits: CREATE TABLE + INSERTs): the open path sniffs
+// the first 16 bytes of the file and, when they are NOT the SQLite magic
+// header, treats the file as a dump and MATERIALIZES it in-process into a
+// temp SQLite database (via modernc — no `sqlite3` CLI), then reads that.
+// So the Cloudflare D1 import is now a single command —
+//
+//	sluice migrate --source-driver sqlite --source dump.sql \
+//	  --target-driver postgres --target <pg-dsn>
+//
+// — with no `sqlite3 app.db < dump.sql` step and no `_cf_KV` cleanup: D1's
+// internal `_cf_*` tables are auto-skipped by the schema reader (ADR-0130).
+// The temp DB is owned by the reader and removed on Close; a malformed dump
+// fails loudly at materialize, naming the dump, before any data moves.
+// (Validated end-to-end against real D1: current `d1 export` already omits
+// `_cf_KV` and wraps nothing in BEGIN/COMMIT.) A native D1 HTTP-API reader
+// remains a deferred follow-up.
 //
 // It is a MIGRATE SOURCE only: it implements [ir.SchemaReader] and
 // [ir.RowReader] so a SQLite/D1 file can be imported into Postgres or
@@ -132,12 +140,13 @@ func (Engine) Capabilities() ir.Capabilities { return capabilities }
 func (Engine) OpenSchemaReader(ctx context.Context, dsn string) (ir.SchemaReader, error) {
 	// Schema reading infers the IR type from the declared type alone
 	// (ADR-0129), so the per-source date encoding is irrelevant here and the
-	// resolved value is discarded.
-	db, path, _, err := openReadOnly(ctx, dsn)
+	// resolved value is discarded. tempPath is the materialized dump DB (empty
+	// for a real `.db`); the reader removes it on Close.
+	db, path, _, tempPath, err := openReadOnly(ctx, dsn)
 	if err != nil {
 		return nil, err
 	}
-	return &SchemaReader{db: db, path: path}, nil
+	return &SchemaReader{db: db, path: path, tempPath: tempPath}, nil
 }
 
 // OpenRowReader returns a [RowReader] bound to the SQLite file
@@ -146,11 +155,11 @@ func (Engine) OpenSchemaReader(ctx context.Context, dsn string) (ir.SchemaReader
 // param, or the process-global default — ADR-0129) is resolved here and
 // carried on the reader for value decode.
 func (Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, error) {
-	db, path, enc, err := openReadOnly(ctx, dsn)
+	db, path, enc, tempPath, err := openReadOnly(ctx, dsn)
 	if err != nil {
 		return nil, err
 	}
-	return &RowReader{db: db, path: path, dateEnc: enc}, nil
+	return &RowReader{db: db, path: path, dateEnc: enc, tempPath: tempPath}, nil
 }
 
 // OpenSchemaWriter is not implemented: SQLite is a migrate source only.

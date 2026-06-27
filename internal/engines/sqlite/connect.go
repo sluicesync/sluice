@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 )
 
@@ -129,22 +130,58 @@ func trimQuery(s string) string {
 	return s
 }
 
-// openReadOnly opens a read-only *sql.DB against the SQLite file named
-// by dsn and verifies it is reachable (PingContext). Returns the pool, the
-// bare file path (for error messages), and the per-source date encoding
-// resolved from the DSN. The caller owns the pool's lifecycle via Close.
-func openReadOnly(ctx context.Context, dsn string) (*sql.DB, string, dateEncoding, error) {
+// openReadOnly opens a read-only *sql.DB against the SQLite source named by
+// dsn and verifies it is reachable (PingContext). Returns the pool, the bare
+// file path (for error messages — always the operator's original source, even
+// when a dump was materialized), the per-source date encoding resolved from the
+// DSN, and tempPath: the materialized temp DB the caller must os.Remove on
+// Close (empty when the source was a real binary `.db`, so a `.db` source
+// removes nothing). The caller owns the pool's lifecycle via Close.
+//
+// The source is sniffed by its SQLite magic header (ADR-0130): a binary `.db`
+// opens exactly as before; anything else is treated as a SQL text dump and
+// materialized in-process into a temp SQLite DB, which is then opened read-only
+// via the same path. On any error after materialize the temp file is removed
+// before returning, so a failed open never leaks one.
+func openReadOnly(ctx context.Context, dsn string) (db *sql.DB, path string, enc dateEncoding, tempPath string, err error) {
 	driverDSN, path, enc, err := parseDSN(dsn)
 	if err != nil {
-		return nil, "", dateEncodingInherit, err
+		return nil, "", dateEncodingInherit, "", err
 	}
-	db, err := sql.Open("sqlite", driverDSN)
+
+	isBinary, err := sniffSQLiteBinary(path)
 	if err != nil {
-		return nil, "", dateEncodingInherit, fmt.Errorf("sqlite: open %q: %w", path, err)
+		return nil, "", dateEncodingInherit, "", fmt.Errorf("sqlite: open %q: %w", path, err)
 	}
-	if err := db.PingContext(ctx); err != nil {
+	if !isBinary {
+		// A SQL text dump (e.g. `wrangler d1 export`): materialize it into a
+		// temp DB and read THAT, keeping `path` pointed at the original dump for
+		// error messages. The query_only pragma still applies on the temp pool.
+		tempPath, err = materializeDump(ctx, path)
+		if err != nil {
+			return nil, "", dateEncodingInherit, "", err // already names the dump
+		}
+		driverDSN = tempPath + "?" + queryOnlyPragma
+	}
+
+	db, err = sql.Open("sqlite", driverDSN)
+	if err != nil {
+		cleanupTemp(tempPath)
+		return nil, "", dateEncodingInherit, "", fmt.Errorf("sqlite: open %q: %w", path, err)
+	}
+	if err = db.PingContext(ctx); err != nil {
 		_ = db.Close()
-		return nil, "", dateEncodingInherit, fmt.Errorf("sqlite: open %q: %w", path, err)
+		cleanupTemp(tempPath)
+		return nil, "", dateEncodingInherit, "", fmt.Errorf("sqlite: open %q: %w", path, err)
 	}
-	return db, path, enc, nil
+	return db, path, enc, tempPath, nil
+}
+
+// cleanupTemp removes a materialized temp DB, ignoring the empty (no-temp,
+// real-`.db`) case. Errors are ignored: it runs on a failure path where the
+// open error is the signal that matters.
+func cleanupTemp(tempPath string) {
+	if tempPath != "" {
+		_ = os.Remove(tempPath)
+	}
 }

@@ -19,6 +19,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -133,6 +134,105 @@ func TestMigrate_SQLiteToMySQL(t *testing.T) {
 	}
 
 	assertSQLiteRoundTrip(t, mysqlEng, mysqlTarget)
+}
+
+// sqliteDumpSource is a `.sql` TEXT dump (ADR-0130) shaped like a real
+// `wrangler d1 export`: a leading PRAGMA, D1's internal `_cf_KV` table (which
+// the engine must auto-skip), and the SAME users/posts/values as
+// seedSQLiteSource so assertSQLiteRoundTrip applies unchanged. The engine
+// sniffs the missing SQLite magic header and materializes this in-process.
+const sqliteDumpSource = `PRAGMA defer_foreign_keys=TRUE;
+CREATE TABLE _cf_KV (key TEXT PRIMARY KEY, value BLOB);
+INSERT INTO _cf_KV (key, value) VALUES ('d1-internal', x'00');
+CREATE TABLE users (
+	id    INTEGER PRIMARY KEY,
+	name  TEXT NOT NULL,
+	score NUMERIC,
+	rate  REAL,
+	photo BLOB
+);
+INSERT INTO users (id, name, score, rate, photo) VALUES (1, 'alice', 100, 3.5, x'cafe');
+INSERT INTO users (id, name, score, rate, photo) VALUES (2, 'bob', NULL, NULL, NULL);
+CREATE TABLE posts (
+	id      INTEGER PRIMARY KEY,
+	user_id INTEGER NOT NULL,
+	body    TEXT,
+	FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+INSERT INTO posts (id, user_id, body) VALUES (1, 1, 'hello');
+INSERT INTO posts (id, user_id, body) VALUES (2, 1, 'world');
+INSERT INTO posts (id, user_id, body) VALUES (3, 2, 'hi');
+`
+
+// seedSQLiteDumpSource writes sqliteDumpSource to a temp `.sql` file and
+// returns its path — the direct-dump-ingest analogue of seedSQLiteSource.
+func seedSQLiteDumpSource(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "d1export.sql")
+	if err := os.WriteFile(path, []byte(sqliteDumpSource), 0o600); err != nil {
+		t.Fatalf("write sqlite dump: %v", err)
+	}
+	return path
+}
+
+// TestMigrate_SQLiteDumpToPostgres is the direct `.sql`-dump-ingest proof
+// (ADR-0130): a D1-shaped `.sql` dump migrates into Postgres with the SAME row
+// counts/values as the binary `.db` path, and D1's internal `_cf_KV` table does
+// NOT land on the target (auto-skip).
+func TestMigrate_SQLiteDumpToPostgres(t *testing.T) {
+	runSQLiteDumpRoundTrip(t, "postgres", startPostgres)
+}
+
+// TestMigrate_SQLiteDumpToMySQL is the MySQL half of the dump-ingest proof.
+func TestMigrate_SQLiteDumpToMySQL(t *testing.T) {
+	runSQLiteDumpRoundTrip(t, "mysql", startMySQL)
+}
+
+// runSQLiteDumpRoundTrip migrates the `.sql` dump source into the named target,
+// reuses assertSQLiteRoundTrip (which already asserts EXACTLY 2 target tables,
+// so a leaked _cf_KV would fail it), and adds an explicit no-_cf_* assertion.
+func runSQLiteDumpRoundTrip(t *testing.T, targetName string, start func(*testing.T) (string, string, func())) {
+	src := seedSQLiteDumpSource(t)
+	_, target, cleanup := start(t)
+	defer cleanup()
+
+	sqliteEng, ok := engines.Get("sqlite")
+	if !ok {
+		t.Fatal("sqlite engine not registered")
+	}
+	targetEng, ok := engines.Get(targetName)
+	if !ok {
+		t.Fatalf("%s engine not registered", targetName)
+	}
+
+	mig := &Migrator{
+		Source:    sqliteEng,
+		Target:    targetEng,
+		SourceDSN: src,
+		TargetDSN: target,
+	}
+	if err := mig.Run(ctx2min(t)); err != nil {
+		t.Fatalf("Migrator.Run (SQLite dump→%s): %v", targetName, err)
+	}
+
+	assertSQLiteRoundTrip(t, targetEng, target)
+
+	// Explicit: no `_cf_*` table reached the target.
+	ctx := ctx2min(t)
+	sr, err := targetEng.OpenSchemaReader(ctx, target)
+	if err != nil {
+		t.Fatalf("OpenSchemaReader: %v", err)
+	}
+	defer closeIf(sr)
+	got, err := sr.ReadSchema(ctx)
+	if err != nil {
+		t.Fatalf("ReadSchema: %v", err)
+	}
+	for _, tbl := range got.Tables {
+		if strings.HasPrefix(strings.ToLower(tbl.Name), "_cf_") {
+			t.Errorf("D1 internal table %q leaked to the target; have %v", tbl.Name, targetTableNames(got))
+		}
+	}
 }
 
 // assertSQLiteRoundTrip reads the migrated schema + rows back through the

@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,14 +30,31 @@ import (
 type SchemaReader struct {
 	db   *sql.DB
 	path string
+
+	// tempPath is the materialized dump DB this reader owns, removed on Close
+	// (ADR-0130). Empty when the source was a real binary `.db` — then Close
+	// removes nothing.
+	tempPath string
 }
 
-// Close releases the underlying connection pool.
+// Close releases the underlying connection pool and, for a materialized `.sql`
+// dump, removes the temp DB after the pool is closed (the file handle must be
+// released first, which matters on Windows). A `.db` source removes nothing.
 func (r *SchemaReader) Close() error {
 	if r.db == nil {
 		return nil
 	}
-	return r.db.Close()
+	err := r.db.Close()
+	if r.tempPath != "" {
+		// Clear the path first so a repeated Close is a no-op, not a remove of
+		// an already-gone file.
+		path := r.tempPath
+		r.tempPath = ""
+		if rmErr := os.Remove(path); rmErr != nil && err == nil {
+			err = rmErr
+		}
+	}
+	return err
 }
 
 // ReadSchema queries sqlite_master + PRAGMAs and returns a fully
@@ -77,12 +95,20 @@ func (r *SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 	return &ir.Schema{Tables: tables}, nil
 }
 
-// tableNames lists user tables, excluding SQLite's internal sqlite_*
-// tables. Ordered by name for stable diffs and logs.
+// tableNames lists user tables, excluding SQLite's internal sqlite_* tables
+// AND Cloudflare D1's internal `_cf_*` tables (e.g. `_cf_KV`), so a D1 dump
+// migrates without the operator needing `--exclude-table _cf_KV` (ADR-0130).
+// The `_cf_` underscores are ESCAPED (LIKE's `_` is a single-char wildcard), so
+// a legitimate user table whose name merely happens to have "cf" near the front
+// — e.g. `xcfg_settings` — is NOT silently dropped from the migration (that
+// would be exactly the silent-loss the tenets forbid). `--exclude-table`
+// remains available for anything else. Ordered by name for stable diffs/logs.
 func (r *SchemaReader) tableNames(ctx context.Context) ([]string, error) {
 	const q = `
 		SELECT name FROM sqlite_master
-		WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+		WHERE type = 'table'
+		  AND name NOT LIKE 'sqlite_%'
+		  AND name NOT LIKE '\_cf\_%' ESCAPE '\'
 		ORDER BY name`
 	rows, err := r.db.QueryContext(ctx, q)
 	if err != nil {

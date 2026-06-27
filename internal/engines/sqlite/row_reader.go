@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 
@@ -31,6 +32,10 @@ type RowReader struct {
 	// default at decode time via [resolveDateEncoding].
 	dateEnc dateEncoding
 
+	// tempPath is the materialized dump DB this reader owns, removed on Close
+	// (ADR-0130). Empty when the source was a real binary `.db`.
+	tempPath string
+
 	mu  sync.Mutex
 	err error // sticky error from the most recent ReadRows call
 }
@@ -40,13 +45,25 @@ type RowReader struct {
 // same-named constant in the other engine readers.
 const rowChanBuffer = 64
 
-// Close releases the underlying connection pool. Safe to call multiple
-// times.
+// Close releases the underlying connection pool and, for a materialized `.sql`
+// dump, removes the temp DB after the pool is closed (the file handle must be
+// released first, which matters on Windows). A `.db` source removes nothing.
+// Safe to call multiple times.
 func (r *RowReader) Close() error {
 	if r.db == nil {
 		return nil
 	}
-	return r.db.Close()
+	err := r.db.Close()
+	if r.tempPath != "" {
+		// Clear the path first so a repeated Close is a no-op (the contract),
+		// not a remove of an already-gone file.
+		path := r.tempPath
+		r.tempPath = ""
+		if rmErr := os.Remove(path); rmErr != nil && err == nil {
+			err = rmErr
+		}
+	}
+	return err
 }
 
 // Err returns the error, if any, that terminated the most recently
