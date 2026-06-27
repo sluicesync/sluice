@@ -105,13 +105,24 @@ func decodeCell(raw any, t ir.Type, enc dateEncoding) (any, error) {
 		}
 		return nil, mismatchError(raw, t)
 
-	case ir.Text:
+	// The string-affinity family. ir.Text is what resolveColumnType
+	// produces for a declared text column; the others (Varchar, Char,
+	// JSON, UUID) never come from the SQLite reader's own affinity
+	// resolution but DO arrive via `--type-override` (Bug 161): the
+	// override rewrites the column's IR type before decode, and a SQLite
+	// TEXT value carries faithfully into any of them. Same refuse-not-
+	// coerce contract as Text — a non-TEXT storage class is a loud
+	// mismatch, never a silent coercion.
+	case ir.Text, ir.Varchar, ir.Char, ir.JSON, ir.UUID:
 		if v, ok := raw.(string); ok {
 			return v, nil
 		}
 		return nil, mismatchError(raw, t)
 
-	case ir.Blob:
+	// The binary-affinity family — Blob from affinity resolution, Binary/
+	// Varbinary via `--type-override`; a SQLite BLOB value carries into
+	// any of them.
+	case ir.Blob, ir.Binary, ir.Varbinary:
 		if v, ok := raw.([]byte); ok {
 			// modernc may reuse the backing buffer across rows; copy so
 			// the IR Row value is safe to retain.

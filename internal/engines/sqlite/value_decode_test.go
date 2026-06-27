@@ -96,6 +96,62 @@ func TestDecodeCell(t *testing.T) {
 				"BLOB":    {refuse, nil},
 			},
 		},
+		// Bug 161: the string-affinity family that arrives only via
+		// `--type-override` (Varchar/Char/JSON/UUID) decodes exactly like Text
+		// — a SQLite TEXT value carries; any other storage class is a loud
+		// mismatch. Before the fix these hit "no decoder for IR type" (a crash,
+		// not a refusal), breaking the documented `--type-override` escape on
+		// SQLite sources.
+		{
+			ir.Varchar{Length: 255},
+			"Varchar",
+			map[string]expect{
+				"NULL": {faithful, nil}, "INTEGER": {refuse, nil}, "REAL": {refuse, nil},
+				"TEXT": {faithful, "hi"}, "BLOB": {refuse, nil},
+			},
+		},
+		{
+			ir.Char{Length: 8},
+			"Char",
+			map[string]expect{
+				"NULL": {faithful, nil}, "INTEGER": {refuse, nil}, "REAL": {refuse, nil},
+				"TEXT": {faithful, "hi"}, "BLOB": {refuse, nil},
+			},
+		},
+		{
+			ir.JSON{},
+			"JSON",
+			map[string]expect{
+				"NULL": {faithful, nil}, "INTEGER": {refuse, nil}, "REAL": {refuse, nil},
+				"TEXT": {faithful, "hi"}, "BLOB": {refuse, nil},
+			},
+		},
+		{
+			ir.UUID{},
+			"UUID",
+			map[string]expect{
+				"NULL": {faithful, nil}, "INTEGER": {refuse, nil}, "REAL": {refuse, nil},
+				"TEXT": {faithful, "hi"}, "BLOB": {refuse, nil},
+			},
+		},
+		// The binary-affinity family that arrives via `--type-override`
+		// (Binary/Varbinary) decodes exactly like Blob.
+		{
+			ir.Binary{Length: 16},
+			"Binary",
+			map[string]expect{
+				"NULL": {faithful, nil}, "INTEGER": {refuse, nil}, "REAL": {refuse, nil},
+				"TEXT": {refuse, nil}, "BLOB": {faithful, []byte{0x01, 0xff}},
+			},
+		},
+		{
+			ir.Varbinary{Length: 16},
+			"Varbinary",
+			map[string]expect{
+				"NULL": {faithful, nil}, "INTEGER": {refuse, nil}, "REAL": {refuse, nil},
+				"TEXT": {refuse, nil}, "BLOB": {faithful, []byte{0x01, 0xff}},
+			},
+		},
 	}
 
 	classes := []sc{null, integer, realv, text, blob}
