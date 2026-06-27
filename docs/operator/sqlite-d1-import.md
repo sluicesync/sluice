@@ -83,15 +83,46 @@ Also note (query API): `INTEGER 1` and `REAL 1.0` both serialize to bare `1`
 **Practical guidance:**
 - **D1 without integers > 2^53** (the common case): the export → `migrate` path is exact
   and simple — use it.
-- **D1 with large integers**: neither the export nor the default query API is safe. The
-  lossless path is a **D1 query-API reader that reads INTEGER columns via
-  `CAST(... AS TEXT)`** (planned — ADR-0131); it is the *higher*-fidelity reader, not the
-  lower-fidelity one the earlier draft assumed.
+- **D1 with large integers**: neither the export nor the default query API is safe. Use the
+  **`d1` query-API reader** (below) — it reads every value via `CAST(... AS TEXT)` +
+  `typeof()`, so integers > 2^53 round-trip exactly. It is the *higher*-fidelity reader, not
+  the lower-fidelity one the earlier draft assumed.
+
+## Cloudflare D1, the lossless way: the live query-API reader (`--source-driver d1`)
+
+The `d1` source engine reads a **live** D1 database over D1's HTTP query API and is the
+**lossless** D1 import (ADR-0132 — BUILT). Unlike the export path, it reads each value via
+`CAST(col AS TEXT)` + `typeof(col)`, so it recovers integers > 2^53 EXACTLY (the export and
+default-JSON paths round them, as the table above shows), distinguishes INTEGER from REAL,
+and decodes BLOBs from hex. Reads do not take D1 offline (only `export` does).
+
+```
+# the API token is read from the environment ONLY (never a flag, never logged)
+export CLOUDFLARE_API_TOKEN=...        # required
+export CLOUDFLARE_ACCOUNT_ID=...       # optional if the account is in the DSN
+
+sluice migrate --source-driver d1 --source d1://<account_id>/<database_id> \
+  --target-driver postgres --target '<pg-dsn>'
+# or the short DSN form, account from CLOUDFLARE_ACCOUNT_ID:
+#   --source d1://<database_id>
+```
+
+DSN forms: `d1://<account_id>/<database_id>` or `d1://<database_id>` (account from
+`CLOUDFLARE_ACCOUNT_ID`). A missing token, account, or database id is refused loudly at
+startup, before any request. The same `--sqlite-date-encoding` / `sqlite_date_encoding`
+date/bool policy applies to the text values, and the same loud storage-class fidelity holds
+(a value that can't be faithfully held in a column's resolved type is refused, naming the
+row — never silently coerced). Large tables are read in primary-key keyset pages.
+
+**Which path for D1?** Use the export → `migrate` path (above) for a D1 database without
+integers > 2^53 and for offline imports — it is simple and exact for those. Use
+`--source-driver d1` when the database has large integers (snowflake IDs, nanosecond
+timestamps, large counters); it is the only path that reads them losslessly.
 
 ## Known limits (prototype scope)
 
-Deferred follow-ups (ADR-0128 §): a native D1 HTTP-API reader, trigger-based continuous
-CDC, within-table chunking (large single tables read as one stream), a per-column
-date-encoding map (the global flag + `--type-override` cover the common and outlier
-cases), and reading CHECK constraints / generated columns / expression-or-partial
-indexes. SQLite is a migrate **source** only — it is never a sluice target.
+Deferred follow-ups (ADR-0128 §): trigger-based continuous CDC, within-table chunking
+(large single tables read as one stream), a per-column date-encoding map (the global flag +
+`--type-override` cover the common and outlier cases), and reading CHECK constraints /
+generated columns / expression-or-partial indexes. SQLite/D1 is a migrate **source** only —
+it is never a sluice target.
