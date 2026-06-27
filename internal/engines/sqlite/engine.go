@@ -5,10 +5,13 @@
 // database files — and, by extension, Cloudflare D1 (ADR-0128). Note
 // `wrangler d1 export` emits a `.sql` TEXT dump (CREATE TABLE + INSERTs),
 // NOT a binary SQLite file, so the D1 flow is: export to dump.sql, then
-// materialize a file with `sqlite3 app.db < dump.sql` (strip D1's internal
-// `_cf_KV` table, or `--exclude-table _cf_KV`), then point sluice at
-// app.db. Accepting a `.sql` dump directly (materialized in-process) is a
-// deferred ergonomic follow-up.
+// materialize a file with `sqlite3 app.db < dump.sql`, then point sluice
+// at app.db. (Validated end-to-end against real D1: current `d1 export`
+// already omits D1's internal `_cf_KV` table and wraps nothing in
+// BEGIN/COMMIT; an older/other export that does include `_cf_*` tables can
+// be dropped with `--exclude-table`.) Accepting a `.sql` dump directly
+// (materialized in-process via modernc) is a deferred ergonomic follow-up
+// that would make the D1 path a single command.
 //
 // It is a MIGRATE SOURCE only: it implements [ir.SchemaReader] and
 // [ir.RowReader] so a SQLite/D1 file can be imported into Postgres or
