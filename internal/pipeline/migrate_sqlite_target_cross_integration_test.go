@@ -132,7 +132,10 @@ func runSQLiteTargetRoundTrip(t *testing.T, midName string, start func(*testing.
 	assertSQLiteColType(t, widgets, "name", func(x ir.Type) bool { _, ok := x.(ir.Text); return ok })
 	assertSQLiteColType(t, widgets, "data", func(x ir.Type) bool { _, ok := x.(ir.Blob); return ok })
 	assertSQLiteColType(t, widgets, "active", func(x ir.Type) bool { _, ok := x.(ir.Boolean); return ok })
-	assertSQLiteColType(t, widgets, "price", func(x ir.Type) bool { _, ok := x.(ir.Decimal); return ok })
+	// Bug 162: a decimal lands on the SQLite target as TEXT affinity (exact
+	// value), reading back as ir.Text — the value is byte-exact (asserted
+	// below via asNum), the type label degrades like JSON/UUID→TEXT.
+	assertSQLiteColType(t, widgets, "price", func(x ir.Type) bool { _, ok := x.(ir.Text); return ok })
 	assertSQLiteColType(t, widgets, "made_on", func(x ir.Type) bool { _, ok := x.(ir.Date); return ok })
 	assertSQLiteColType(t, widgets, "made_at", func(x ir.Type) bool { _, ok := x.(ir.Timestamp); return ok })
 	assertSQLiteColType(t, widgets, "made_time", func(x ir.Type) bool { _, ok := x.(ir.Time); return ok })
