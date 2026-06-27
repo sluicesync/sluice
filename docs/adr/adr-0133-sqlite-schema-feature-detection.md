@@ -1,83 +1,130 @@
-# ADR-0133: SQLite schema-feature detection — loud-WARN on un-carried CHECK / generated / partial-expr indexes
+# ADR-0133: SQLite schema-feature carry — generated columns, CHECK constraints, partial/expression indexes
 
 ## Status
 
 **Accepted (2026-06-27).** Roadmap item 49 follow-up (#2 of the SQLite source queue).
-The SQLite/D1 source engine silently omits three schema features it doesn't read —
-table CHECK constraints, generated columns (carried as plain columns), and
-expression/partial indexes. This makes the omissions **loud** (a one-time WARN per
-table naming what was not carried) so an operator sees the fidelity gap rather than
-discovering it later. It does NOT add cross-dialect translation (that would need IR
-modeling these features, across every engine — out of scope).
+
+> **Revision note (2026-06-27, pre-implementation).** This ADR's first cut decided
+> "detect + loud-WARN only" on the stated premise that *the IR does not model these
+> features, so carrying them would need new IR shape across every engine*. That premise
+> was **wrong** — verified against the code before any carry shipped. `ir.Column`
+> already carries `GeneratedExpr`/`GeneratedStored`/`GeneratedExprDialect`,
+> `ir.Table.CheckConstraints` is a first-class `[]*ir.CheckConstraint`, and
+> `ir.Index.Predicate`/`ir.IndexColumn.Expression` model partial and expression indexes
+> — and the Postgres and MySQL engines already **read and emit all of them** with the
+> ADR-0016 layered translation. SQLite was simply the one engine whose reader never
+> populated the existing fields. The decision below is the corrected one: **carry these
+> into the existing IR fields** (the foundation exists; SQLite just wasn't wired in),
+> with the loud-WARN retained for the unavoidable third-dialect verbatim tail.
 
 ## Context
 
-The SQLite reader (ADR-0128/0129/0130/0132) reads columns/PK/FK/plain indexes via
-PRAGMAs. It does not surface:
+The SQLite/D1 reader (ADR-0128/0129/0130/0132) reads columns/PK/FK/plain indexes via
+PRAGMAs and silently omitted three schema features the IR *already models*:
 
-- **CHECK constraints** — they live only in the `CREATE TABLE` SQL (no PRAGMA), so the
-  target is created without them. Silent: the target is less-constrained than the source.
-- **Generated columns** — `PRAGMA table_info` returns them as ordinary columns, so their
-  *computed values are copied* (no data loss), but the column lands as a **regular**
-  column on the target and the generation expression is lost. Silent downgrade.
-- **Expression / partial indexes** — skipped (an expression index has a NULL column in
-  `index_info`; a partial index has `index_list.partial = 1`). Silent: a performance/
-  semantics structure is dropped.
+- **Generated columns** — `PRAGMA table_info` returns them as ordinary columns, so the
+  *computed values are copied* (no data loss), but the column landed as a **regular**
+  column on the target and the generation expression was dropped. The IR models this via
+  `ir.Column.GeneratedExpr` + `GeneratedStored` (+ `GeneratedExprDialect`); PG/MySQL
+  `translateGeneratedExpr` + `ddl_emit` already emit generated columns.
+- **CHECK constraints** — live only in the `CREATE TABLE` SQL (no PRAGMA). The IR models
+  them via `ir.Table.CheckConstraints []*ir.CheckConstraint{Name, Expr, ExprDialect}`;
+  PG's `emitSetCheckConstraint`/`translateCheckExpr` and MySQL's `emitCheckConstraint`
+  already emit them.
+- **Partial / expression indexes** — a partial index has `index_list.partial = 1` and a
+  `WHERE` predicate in its `CREATE INDEX` SQL; an expression index has a NULL column in
+  `index_info` and an expression in its DDL. The IR models these via
+  `ir.Index.Predicate` (+ `PredicateDialect`) and `ir.IndexColumn.Expression` (+
+  `ExpressionDialect`); PG's `translateIndexPredicate` already emits partial predicates.
+  `ir.Index.Predicate`'s own doc cites "catalog Bug 19a": dropping the predicate
+  silently turns a partial UNIQUE index into a full one — a silently widened uniqueness
+  scope, the exact silent-correctness class the tenets weight highest.
 
-The IR does not model any of these on `ir.Column`/`ir.Index`/`ir.Table` (only
-`Capabilities.SupportsCheckConstraint`/`SupportsGeneratedColumns` flags and `Domain`
-checks exist), so faithfully *translating* them to PG/MySQL would require new IR shape
-across all engines. That is a much larger effort than the gap warrants today; the
-loud-failure tenet's minimum bar — make the omission visible — is what this delivers.
+**The one real obstacle is the third dialect.** ADR-0016's translation pass is
+mysql↔postgres only. The writers dispatch as `if ExprDialect == "" || ExprDialect ==
+self → verbatim; else → translate`, and the `else` branch is hardcoded to the *one other
+known engine* (PG runs `translateExprForPG`, built for MySQL input; MySQL runs
+`translateExprForMySQL`, built for PG input). A SQLite-tagged expression would fall into
+that `else` and be **mistranslated through the MySQL↔PG translator** — a silent
+corruption. There is no SQLite→canonical translator today.
 
 ## Decision
 
-1. **Detect and loud-WARN, do not silently omit.** During schema read, detect each of
-   the three features and emit a clear one-time WARN per table naming the feature and the
-   consequence, e.g.:
-   - `sqlite: table "t": CHECK constraint(s) are not carried to the target (sluice does not yet translate SQLite CHECK constraints) — re-add them on the target if required`
-   - `sqlite: table "t" column "c": generated column carried as a REGULAR column (its current computed values are copied; the generation expression is not translated)`
-   - `sqlite: table "t" index "ix": expression/partial index not carried (performance/partial-filter structure; recreate on the target if required)`
-   These are WARNs, not refusals: the data migrates correctly; these are target-side
-   schema features the operator can re-add. Refusing would block a migration over a
-   constraint, which is too aggressive.
+**Carry all three into the existing IR fields, with a writer-dialect guard so the
+unknown SQLite dialect passes through verbatim (never mistranslated), and a one-time WARN
+on the verbatim tail so the operator knows to verify non-portable constructs.**
 
-2. **Detect generated columns via `PRAGMA table_xinfo`** (the `hidden` column: 2 = virtual
-   generated, 3 = stored generated; 0/1 = ordinary). Continue to read them as ordinary
-   `ir.Column`s and copy their computed values (preserves data); the WARN records the
-   downgrade. (`table_xinfo` is a superset of `table_info`, available on every supported
-   SQLite/D1 version.)
+1. **Reader: populate the existing IR fields.** The SQLite/D1 schema reader extracts the
+   expression text from `sqlite_master` and populates:
+   - `ir.Column.GeneratedExpr` / `GeneratedStored` (from the `CREATE TABLE` column
+     definition; `PRAGMA table_xinfo` `hidden` ∈ {2 virtual, 3 stored} identifies which
+     columns are generated and their stored-ness), tagged `GeneratedExprDialect = "sqlite"`.
+   - `ir.Table.CheckConstraints` (each `CHECK(expr)`, table- and column-level, extracted
+     paren/string/identifier-aware from the `CREATE TABLE` SQL), tagged `ExprDialect = "sqlite"`.
+   - `ir.Index.Predicate` for partial indexes (the `WHERE` clause of `CREATE INDEX`),
+     tagged `PredicateDialect = "sqlite"`; and `ir.IndexColumn.Expression` for expression
+     indexes where the per-column expression is cleanly extractable, tagged
+     `ExpressionDialect = "sqlite"`.
+   - Flip `Capabilities.SupportsCheckConstraint` / `SupportsGeneratedColumns` to `true`.
 
-3. **Detect CHECK constraints** by scanning the table's `CREATE TABLE` SQL from
-   `sqlite_master` for a top-level `CHECK` (paren-and-string-aware so a `CHECK` inside a
-   string literal or column name doesn't false-positive). Presence → WARN. (Extracting +
-   translating the expression is the deferred follow-up.)
+2. **Writer: dialect guard — translate only from the specific known source.** Change the
+   three dispatch sites (`translateGeneratedExpr`, `translateCheckExpr`,
+   `translateIndexPredicate`, plus the `IndexColumn.Expression` emit) on **both** engines
+   from "translate unless self/empty" to "translate **only** when `ExprDialect` is the
+   specific other engine this writer can translate from" (PG translates iff
+   `== "mysql"`; MySQL translates iff `== "postgres"`). Every other value — `"sqlite"`,
+   `""`, any future/unknown dialect — emits **verbatim**. This is also a latent-bug fix:
+   today any unrecognized dialect is silently fed through the wrong translator.
 
-4. **Detect partial / expression indexes** from `index_list.partial = 1` and the existing
-   NULL-column (`index_info`) expression-index signal → WARN-and-skip (already skipped;
-   add the WARN).
+3. **Verbatim → loud target rejection, never silent guess.** A carried SQLite expression
+   emits verbatim. Portable constructs (`a + b`, `length(x)`, `x || y`, comparisons)
+   work on PG/MySQL; non-portable ones (`strftime(...)`, SQLite-specific functions) cause
+   the target `CREATE`/index DDL to **fail loudly** — which is the ADR-0016 philosophy
+   already in force ("anything not covered falls through verbatim … non-portable
+   constructs surface as a target rejection rather than be guessed-at"). No silent
+   mistranslation path exists after the guard in (2).
+
+4. **One-time WARN on the verbatim tail (honesty for the silent-semantics edge).** For
+   each table/index that carries a `"sqlite"`-dialect generated/CHECK/predicate/expression
+   body, emit one WARN that the expression is carried verbatim and that the operator
+   should verify it on the target — because the residual risk after (2)/(3) is a
+   *bare operator with different semantics under SQLite's loose typing* (e.g. affinity in
+   a comparison), which would neither translate nor loudly reject. The WARN makes that
+   edge visible. (When/if a SQLite→canonical translator or allowlist lands, the WARN
+   narrows to genuinely untranslatable bodies.)
 
 5. **Applies to both transports** — the file/`.sql` reader and the `d1` query-API reader
-   share the schema path, so both get the detection + WARNs.
+   share the schema path, so both carry the features and both emit the WARNs.
 
 ## Consequences
 
-- An operator migrating a SQLite/D1 database with CHECK constraints, generated columns,
-  or partial/expression indexes is told, at read time, exactly what is not carried — the
-  silent fidelity gaps become visible (the loud-failure tenet's minimum bar). Data is
-  unaffected (generated values are still copied).
-- No IR change, no migration-failure risk (WARN, not refuse), no cross-dialect expression
-  translator. Full translation of any of the three (CHECK→target CHECK, generated→target
-  generated, partial/expr index→target) remains a per-feature follow-up requiring IR
-  modeling.
+- A SQLite/D1 source's generated columns land as **generated** columns on the target
+  (re-deriving, not static copies), CHECK constraints are **enforced** on the target, and
+  partial indexes keep their predicate — closing the Bug-19a-class silent uniqueness
+  widening. Data is unaffected either way (generated values were always copied).
+- The writer-dialect guard removes a latent silent-mistranslate path for any
+  non-{self, the-one-known-other} dialect — a correctness improvement beyond SQLite.
+- Non-portable SQLite expressions fail **loudly** at target DDL time (recoverable: the
+  operator edits the source or re-adds on the target), never silently. The one residual
+  silent edge — a portable-looking operator with divergent SQLite semantics — is surfaced
+  by the per-table WARN.
+- **Deferred (tracked follow-up):** a real SQLite→canonical (PG/MySQL) expression
+  translator / portability allowlist, which would let sluice *translate* rather than
+  pass-through-and-warn the verbatim tail. Roadmap item 49 retains this as the next
+  increment; expression-index bodies that can't be cleanly parsed from the `CREATE INDEX`
+  SQL fall back to WARN-skip rather than carrying a guessed expression.
 
 ## Alternatives considered
 
-- **Translate the features** (emit target CHECK / GENERATED / partial indexes). Rejected
-  for now: needs IR fields on Column/Index/Table across every engine + a SQLite→PG/MySQL
-  expression translator — a large, fragile effort disproportionate to current demand.
-- **Refuse loudly on any of them.** Rejected: blocks a perfectly migratable dataset over
-  a target-side constraint the operator can re-add; a WARN is the right severity (data is
-  correct; the gap is recoverable).
-- **Keep silently omitting.** Rejected: violates the loud-failure tenet — the whole point
-  of this item.
+- **Detect + loud-WARN only, carry nothing** (this ADR's rejected first cut). Safe, zero
+  silent risk, but drops portable features the IR + writers already support — burying real,
+  achievable work behind a stale "the IR can't model it" premise. Rejected once the premise
+  was disproven.
+- **Carry but tag `"mysql"`/`"postgres"` to reuse the translator.** Rejected — it is a
+  *lie about provenance* that runs SQLite text through the wrong translator: silent
+  corruption, the cardinal sin.
+- **Build the SQLite→canonical translator now.** Rejected as the first increment — larger
+  and fragile; verbatim-passthrough-with-loud-rejection (the ADR-0016 policy) plus the
+  WARN is the correct, faithful first cut. The translator is the tracked next step.
+- **Refuse loudly on any of them.** Rejected — blocks a migratable dataset over a
+  target-side feature the operator can re-add; WARN + carry is the right severity.
