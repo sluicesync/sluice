@@ -54,26 +54,39 @@ layout, or a non-0/1/non-truthy boolean) is **refused loudly** — never a silen
 date. Carry an outlier column raw with `--type-override <col>=text`. Booleans accept
 INTEGER `0`/`1` and the usual truthy/falsy text.
 
-## Why not read live D1 over its HTTP API?
+## D1 large-integer fidelity (IMPORTANT — empirically verified 2026-06-27)
 
-A native D1 HTTP-API reader (query the live database over Cloudflare's REST API instead
-of exporting) was considered and **deliberately deferred** (ADR-0131). The export path
-is both more faithful and faster:
+> A regular SQLite **`.db` file** is read exactly (sluice reads the int64 from the file).
+> The caveat below is **specific to Cloudflare D1**.
 
-| | export → `migrate` (recommended) | live HTTP-API read (deferred) |
+Both of D1's *default* extraction paths **silently lose integers larger than 2^53**
+(≈ 9,007,199,254,740,992) — confirmed by probing a real D1 database:
+
+| D1 path | `9007199254740993` (2^53+1) comes back as | exact? |
 |---|---|---|
-| **Integer fidelity** | exact (real SQLite file) | **lossy > 2^53** — the API returns JSON, subject to JavaScript's 52-bit number precision (Cloudflare's documented caveat) |
-| **Storage-class fidelity** | exact INTEGER/REAL/TEXT/BLOB | ambiguous — JSON can't distinguish INTEGER vs REAL; BLOBs encode specially |
-| **Throughput** | local file read after one export | HTTP round-trips + pagination + rate limits |
-| **Steps** | two commands (export, migrate) | one command, but needs an API token |
-| **Auth** | wrangler login once | a Cloudflare API token per run |
+| `wrangler d1 export` `.sql` dump | `9007199254740992` | **NO** — D1's export generator rounds it server-side (the exact value is absent from the dump; sluice never sees it) |
+| default query API (bare JSON) | `9007199254740992` | **NO** — serialized as an IEEE-754 double; `max int64` came back off by 1,193 |
+| query API with **`CAST(col AS TEXT)`** | `"9007199254740993"` | **YES** — exact, as a JSON string; `typeof()` also recovers INTEGER vs REAL |
 
-Since the `.sql`-dump ingest reduced the export path to a single `migrate` command, the
-HTTP-API reader's only real advantage (skipping the export) is small, while its fidelity
-ceiling is real. The recommendation is the export path; the HTTP-API reader remains a
-documented future option for operators who specifically need to pull from a live D1
-without an export, and would ship with a **loud refusal on out-of-precision integers**
-(never a silent loss) if demand surfaces.
+So — correcting an earlier assumption — the **export path is NOT a lossless escape**: it
+loses the same large integers as the default query API (the loss is in D1, before sluice
+runs, so sluice cannot detect or refuse it). The **only lossless way to read large
+integers out of D1 is the query API reading INTEGER columns via `CAST(... AS TEXT)`**.
+This matters in practice for snowflake-style IDs (e.g. Discord/Twitter 64-bit IDs),
+nanosecond timestamps, and large counters — all routinely > 2^53.
+
+Also note (query API): `INTEGER 1` and `REAL 1.0` both serialize to bare `1`
+(indistinguishable without `typeof()`); a `BLOB` returns as a JSON byte-int array
+(`[202,254,0,255]`); `NULL` is JSON `null`. The export dump keeps BLOBs exactly
+(`X'cafe00ff'`) but, again, rounds big integers.
+
+**Practical guidance:**
+- **D1 without integers > 2^53** (the common case): the export → `migrate` path is exact
+  and simple — use it.
+- **D1 with large integers**: neither the export nor the default query API is safe. The
+  lossless path is a **D1 query-API reader that reads INTEGER columns via
+  `CAST(... AS TEXT)`** (planned — ADR-0131); it is the *higher*-fidelity reader, not the
+  lower-fidelity one the earlier draft assumed.
 
 ## Known limits (prototype scope)
 

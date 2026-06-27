@@ -2,11 +2,46 @@
 
 ## Status
 
-**Accepted (2026-06-26).** Roadmap item 49. Records the decision to make the
-**export-file path the recommended (and only built) way to import Cloudflare D1**, and
-to **defer a native D1 HTTP-API reader** — with the fidelity/perf analysis behind it, so
-the choice is revisitable if demand surfaces. No code; this is a decision + its
-rationale. Operator-facing guidance lives in `docs/operator/sqlite-d1-import.md`.
+**Superseded in part by an empirical finding (2026-06-27) — see the update below.** The
+original decision (2026-06-26) deferred a native D1 HTTP-API reader on the premise that
+the **export-file path is faithful while the query API is lossy**. A real-D1 probe
+disproved the premise: the export path loses large integers too, and the query API can be
+made the *higher*-fidelity path. The deferral of a *default-JSON* query reader stands, but
+the reason has changed and a `CAST(... AS TEXT)` query reader is now the recommended way
+to read large integers from D1.
+
+### ★ Empirical update (2026-06-27) — premise disproven; conclusion revised
+
+A live-D1 probe (insert `9007199254740993` = 2^53+1 and `9223372036854775807` = max
+int64, then read back) found:
+
+- **The default query API rounds them** (`…992`; max int64 off by 1,193) — bare JSON
+  doubles, INTEGER/REAL indistinguishable (`1.0`→`1`), BLOB as a byte-int array. As
+  documented. **But:**
+- **`wrangler d1 export` ALSO rounds them** — D1's server-side export generator serializes
+  through the same JS/JSON path, so the `.sql` dump contains `…992`, the exact value
+  absent. So the export path is **NOT** the lossless escape this ADR assumed; it is
+  *equally* lossy on > 2^53 integers, and the loss happens in D1 before sluice runs (so
+  sluice cannot detect or refuse it). The values ARE stored exactly in D1 (confirmed via
+  `CAST/typeof`); only these two serializers round them.
+- **The query API with `CAST(col AS TEXT)` is lossless** — it returns the exact integer as
+  a JSON string, and `typeof()` recovers INTEGER-vs-REAL storage class.
+
+**Revised conclusion:** for D1 with large integers (snowflake IDs, ns timestamps, big
+counters — routinely > 2^53), a **D1 query-API reader that reads INTEGER columns via
+`CAST(... AS TEXT)` is the *highest*-fidelity import** — better than both the export dump
+and the default query JSON. The export path remains exact for non-D1 SQLite `.db` files
+and for D1 databases without > 2^53 integers (the common case), so it stays the simple
+default there. The item to build is therefore the **CAST-based query-API reader** (not the
+export-API automation that earlier looked best — that path is also lossy on big ints).
+Evidence + the corrected comparison table live in `docs/operator/sqlite-d1-import.md`.
+
+---
+
+**Original decision (2026-06-26, premise now corrected above).** Roadmap item 49. Recorded
+making the export-file path the recommended D1 import and deferring a native D1 HTTP-API
+reader, with the (since-disproven) fidelity/perf analysis behind it. Operator-facing
+guidance lives in `docs/operator/sqlite-d1-import.md`.
 
 ## Context
 
