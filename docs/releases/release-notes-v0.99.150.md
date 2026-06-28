@@ -1,0 +1,26 @@
+# sluice v0.99.150
+
+**Two fixes from the large-scale test program's first run, both LOUD/zero-silent-loss. The headline: continuous `sync` to a target with a FOREIGN KEY no longer halts the CDC applier on a non-dependency-ordered change (Bug 164). Plus a SQLite→Postgres migrate that aborted on an ordinary ≥ $1M decimal (Bug 163).**
+
+## Fixed
+
+**HIGH — CDC applier now bypasses target FK/trigger enforcement during apply (Bug 164).** A CDC change stream is not FK-dependency-ordered: a source that doesn't enforce FKs (SQLite with the default `PRAGMA foreign_keys=OFF`, MySQL MyISAM, or any app that deletes a parent that still has children) emits orphaning changes, and ADR-0104's concurrent key-hash lanes can commit a child INSERT before its parent in a different lane. Neither applier bypassed target FK enforcement, so the target FK rejected the replayed change (Postgres `23503` / MySQL `1452`), the apply transaction failed, and the sync process exited and warm-resumed into the same failing change — a poison-pill loop that permanently halted continuous replication on a routine source operation (zero corruption, but the target stopped advancing). The fix: every CDC apply connection now bypasses target FK + user-trigger enforcement for the duration of apply — Postgres sets `session_replication_role = replica` on each apply transaction (serial, pipelined, and per-lane), MySQL sets `foreign_key_checks = 0` on each apply connection. This is the canonical logical-replication technique: constraint integrity is the source's responsibility (validated there), so the target faithfully mirrors the source, including the source's own FK-inconsistencies. On a managed Postgres whose apply role lacks the privilege to `SET session_replication_role` (it needs superuser / `rds_superuser` / a granted role), sluice emits a one-time WARN naming the consequence and continues (the sync still works for FK-consistent streams) rather than failing cryptically; MySQL needs no special privilege. (Engine nuance: `session_replication_role = replica` also suppresses Postgres user triggers during replay; MySQL's `foreign_key_checks = 0` disables FK + FK-cascade only, so target user triggers still fire on replayed rows.) Pinned by cross-engine integration tests (SQLite-trigger source → PG and MySQL targets) replicating a parent-delete-orphans-child and a child-insert-with-no-parent without crashing — including a concurrent-lane (`ApplyConcurrency=2`, `ApplyBatchSize>1`) variant that exercises the per-lane bypass path.
+
+**MEDIUM — SQLite→Postgres migrate aborted at COPY on an extreme-magnitude DECIMAL (Bug 163).** A SQLite column declared `DECIMAL`/`NUMERIC` carries NUMERIC affinity, and SQLite coerces a numeric insert to a binary REAL; the reader rendered that REAL with `FormatFloat('g')`, which emits exponent notation for magnitudes ≥ 1e6 or < 1e-4 (e.g. `1234567.89` → `"1.23456789e+06"`). pgx's numeric (OID 1700) BINARY COPY encoder can't encode an exponent-notation string, so `migrate` aborted at COPY — an ordinary money value ≥ $1,000,000 (or a sub-`0.0001` rate) in a SQLite DECIMAL column was enough to break SQLite→Postgres, with no clean remedy. The fix renders the REAL with the `'f'` (plain-digit) verb — the same shortest round-trippable value in plain digits (`"1234567.89"`) that pgx encodes; normal-magnitude values (`19.99`, `0.1`) are byte-identical to before. Applies to both the SQLite file reader and the `d1` query-API reader (shared decode). Pinned by a decode unit test over the repro values + a SQLite→PG integration test asserting the COPY succeeds and the PG value is numerically exact.
+
+## How these were found
+
+Both surfaced on the **first run of the large-scale test program** (a ~3.3M-row SQLite corpus continuously synced into Postgres under a 343k-operation concurrent-write workload). Exactly-once held throughout (chunked migrate, continuous CDC, hard-kill/warm-resume) and no silent-loss bug was found — but the run exposed these two loud defects (Bug 164 a *general* CDC-applier gap, not SQLite-only) that unit tests and review hadn't. A third finding (unbounded change-log growth) is addressed separately as the change-log retention work.
+
+## Compatibility
+
+Both fixes are behavior-preserving for the cases that already worked: Bug 163 only changes the *rendering* of exponent-magnitude decimals (normal values unchanged); Bug 164 only changes whether the target *rejects* an FK-inconsistent replayed change (an FK-consistent stream applies identically). The FK bypass is the standard replication semantics and introduces no silent-loss (the target mirrors the source; `verify` remains the divergence check). The `-race` integration gate passed before tagging; independent value-fidelity review confirmed both.
+
+## Who needs this
+
+Anyone running continuous `sync` into a Postgres/MySQL target that has FOREIGN KEY constraints (Bug 164 — especially with a SQLite/`sqlite-trigger`/`d1-trigger` source, where it bites immediately), and anyone migrating a SQLite/D1 database with large decimal values into Postgres (Bug 163).
+
+---
+
+**Install:** brew install sluicesync/tap/sluice · go install sluicesync.dev/sluice/cmd/sluice@v0.99.150 · **Container:** ghcr.io/sluicesync/sluice:0.99.150
+**Full changelog:** https://github.com/sluicesync/sluice/blob/main/CHANGELOG.md
