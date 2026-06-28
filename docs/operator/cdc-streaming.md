@@ -116,6 +116,48 @@ or anyone who wants the strict fail-fast behaviour, can opt out with
 failover under throttler load can widen the envelope, e.g.
 `--apply-retry-attempts=20`.
 
+## Foreign keys during CDC apply
+
+A CDC change stream is **not foreign-key-dependency-ordered**, so the
+applier deliberately bypasses target FK constraints and user triggers
+for the duration of each apply transaction. This is the standard
+logical-replication technique (it is what Postgres's own logical
+replication does): constraint integrity is the **source's**
+responsibility — it has already validated every change — so the target
+faithfully mirrors the source, including any FK-inconsistency the source
+itself permits, and replicated rows do not double-fire target triggers.
+
+Why this is necessary: a source that does not enforce FKs (SQLite with
+the default `PRAGMA foreign_keys=OFF`, MySQL MyISAM, or any application
+that deletes a parent row that still has children) emits orphaning
+changes, and sluice's concurrent key-hash apply lanes
+(`--apply-concurrency`) can commit a child INSERT before its parent in a
+different lane. Enforcing the target FK against such a stream would
+reject a routine source operation and halt replication. The applier
+therefore:
+
+- **Postgres** — sets `SET session_replication_role = replica` on each
+  apply transaction.
+- **MySQL** — sets `foreign_key_checks = 0` on each apply session.
+
+The bypass is scoped to sluice's own apply work; the constraints remain
+on the target schema and are enforced for every other client. (A bulk
+migrate, separately, defers and re-validates constraints after the copy
+— this section is specifically about continuous CDC apply.)
+
+### Managed-Postgres privilege caveat
+
+`SET session_replication_role` requires elevated privilege — superuser,
+`rds_superuser`, or a role explicitly granted it. On a managed Postgres
+where the apply role lacks it, sluice cannot bypass FK/trigger
+enforcement; rather than failing cryptically it emits a **one-time
+WARN** at the first apply and continues. The sync still works for
+FK-consistent streams, but an FK-violating or out-of-order change will
+then fail the apply loudly. To get the full bypass on such a target,
+grant the apply role the privilege to set `session_replication_role`,
+or make the target FK constraints `DEFERRABLE`. MySQL's
+`foreign_key_checks` needs no special privilege.
+
 ## See also
 
 - [ADR-0038](../adr/adr-0038-applier-retry-on-transient-errors.md) —

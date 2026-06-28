@@ -232,6 +232,14 @@ func (la *laneApplierAdapter) ApplyLaneBatch(ctx context.Context, _ int, batch [
 		_ = tx.Rollback()
 		return 0, err
 	}
+	// Bug 164: bypass target FK + user-trigger enforcement for this lane's
+	// apply tx — the per-lane key-hash split (ADR-0105) can commit a child
+	// INSERT before its parent in a different lane, a transient FK violation
+	// the target would otherwise reject. No-op without privilege.
+	if err := la.a.bypassForeignKeyEnforcement(ctx, tx); err != nil {
+		_ = tx.Rollback()
+		return 0, err
+	}
 	for _, c := range batch {
 		if err := la.a.redactChange(ctx, c); err != nil {
 			_ = tx.Rollback()

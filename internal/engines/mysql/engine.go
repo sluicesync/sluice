@@ -323,6 +323,25 @@ func (Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeAppli
 	if err != nil {
 		return nil, err
 	}
+	// Bug 164: bypass target FK enforcement on every apply connection. A CDC
+	// change stream is NOT FK-dependency-ordered — a source that doesn't
+	// enforce FKs (SQLite default-off, MyISAM, or any app that deletes a
+	// parent with children) emits orphaning changes, and ADR-0104's concurrent
+	// key-hash lanes can commit a child INSERT before its parent in a different
+	// lane. Enforcing target FKs against such a stream rejects a routine source
+	// operation (Error 1452) and halts the sync. The go-sql-driver session init
+	// emits each cfg.Params entry as `SET <key>=<value>` after the handshake
+	// (see openDB / Bug 126), so this sets `foreign_key_checks=0` ONCE per
+	// connection — covering both the serial pool (db) and the ADR-0104 lane
+	// pool (openDB(pipelineCfg)) — with no per-statement overhead and no special
+	// privilege. Constraint integrity is the SOURCE's responsibility (already
+	// validated there); the target faithfully mirrors the source. No FK
+	// constraints exist on sluice_cdc_state, so the control-table writes on
+	// these connections are unaffected.
+	if cfg.Params == nil {
+		cfg.Params = map[string]string{}
+	}
+	cfg.Params["foreign_key_checks"] = "0"
 	db, err := openDB(ctx, cfg)
 	if err != nil {
 		return nil, err

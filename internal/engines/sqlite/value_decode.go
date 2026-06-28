@@ -135,13 +135,21 @@ func decodeCell(raw any, t ir.Type, enc dateEncoding) (any, error) {
 	case ir.Decimal:
 		// Both exact-numeric storage classes carry losslessly into the
 		// IR's decimal-as-string contract: an int64 is an exact integer,
-		// and FormatFloat(g, -1) is the shortest round-trippable decimal
-		// for the float64. TEXT/BLOB are refused by falling through.
+		// and FormatFloat('f', -1) is the shortest round-trippable decimal
+		// for the float64. The 'f' (plain-digit) verb — NOT 'g' — is
+		// load-bearing (Bug 163): 'g' emits exponent notation for
+		// magnitudes >= 1e6 or < 1e-4 (e.g. 1234567.89 -> "1.23456789e+06",
+		// 1e-10 -> "1e-10"), and pgx's numeric (OID 1700) BINARY COPY
+		// encoder cannot encode an exponent-notation string -> the migrate
+		// aborts at COPY. 'f' renders the SAME shortest round-trippable
+		// value in plain digits ("1234567.89", "0.0000000001"), which pgx
+		// encodes; for normal-magnitude values ("19.99", "0.1") the two
+		// verbs are byte-identical. TEXT/BLOB are refused by falling through.
 		switch v := raw.(type) {
 		case int64:
 			return strconv.FormatInt(v, 10), nil
 		case float64:
-			return strconv.FormatFloat(v, 'g', -1, 64), nil
+			return strconv.FormatFloat(v, 'f', -1, 64), nil
 		}
 		return nil, mismatchError(raw, t)
 	}

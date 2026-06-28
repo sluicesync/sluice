@@ -404,6 +404,17 @@ type ChangeApplier struct {
 	// state stream of rows + boundaries has exactly #primed-tables
 	// resolve hits, NOT O(rows) or O(boundaries).
 	resolveCallsForTest atomic.Int64
+
+	// fkBypassOnce guards the one-time Bug-164 privilege probe; fkBypassOK
+	// caches whether the apply role may SET session_replication_role =
+	// replica (needs superuser / a role granted it). When true, every apply
+	// tx bypasses target FK + user-trigger enforcement during CDC replay
+	// (see bypassForeignKeyEnforcement); when false, the probe has already
+	// emitted a one-time WARN and the apply proceeds WITHOUT the bypass. The
+	// W concurrent lanes (ADR-0105) can reach the probe simultaneously, so
+	// sync.Once serialises it.
+	fkBypassOnce sync.Once
+	fkBypassOK   bool
 }
 
 // activeSchemaVersion is one entry in the ADR-0049 Chunk C applier
@@ -640,6 +651,83 @@ func (a *ChangeApplier) forceSynchronousCommitOn(ctx context.Context, tx *sql.Tx
 		return fmt.Errorf("postgres: applier: force synchronous_commit=on: %w", err)
 	}
 	return nil
+}
+
+// replicaRoleSQL is the statement that, run inside an apply tx, makes target
+// FK constraints and user triggers NOT fire for the rest of that tx — PG
+// implements FK enforcement and user triggers as system/user triggers, and
+// `session_replication_role = replica` suppresses both. SET LOCAL scopes it
+// to the apply tx so a returned pooled backend is never left in replica role
+// for non-apply work. It is the canonical logical-replication apply technique
+// (what PG's own logical replication does).
+const replicaRoleSQL = "SET LOCAL session_replication_role = replica"
+
+// bypassForeignKeyEnforcement bypasses target FK + user-trigger enforcement
+// on the apply tx for the duration of CDC replay (Bug 164).
+//
+// A CDC change stream is NOT FK-dependency-ordered: a source that does not
+// enforce FKs (SQLite with the default PRAGMA foreign_keys=OFF, MySQL MyISAM,
+// or any app that deletes a parent that still has children) emits orphaning
+// changes, and ADR-0105's concurrent key-hash lanes can commit a child INSERT
+// before its parent in a different lane. Enforcing target FK constraints
+// against such a stream rejects a routine source operation (PG 23503), fails
+// the apply tx, and halts the sync (it warm-resumes into the same failing
+// change — a poison-pill loop). Disabling enforcement during apply is the
+// correct CDC semantics: constraint integrity is the SOURCE's responsibility
+// (already validated there), so the target faithfully mirrors the source —
+// including the source's own FK-inconsistencies — and replicated rows do NOT
+// double-fire target triggers.
+//
+// No-op when the apply role lacks the privilege to SET
+// session_replication_role (a one-time WARN already fired in the probe); the
+// sync then still works for FK-consistent streams, and an FK-violating or
+// out-of-order change fails loudly as before.
+func (a *ChangeApplier) bypassForeignKeyEnforcement(ctx context.Context, tx *sql.Tx) error {
+	if !a.foreignKeyBypassAvailable(ctx) {
+		return nil
+	}
+	if _, err := a.txExec(ctx, tx, replicaRoleSQL); err != nil {
+		return fmt.Errorf("postgres: applier: bypass FK enforcement (session_replication_role=replica): %w", err)
+	}
+	return nil
+}
+
+// foreignKeyBypassAvailable reports whether the apply role may SET
+// session_replication_role = replica, probing exactly once (lazily, on the
+// first apply tx) and caching the result. `SET session_replication_role`
+// requires elevated privilege (superuser / rds_superuser / a role granted
+// it); on a managed Postgres without it the SET errors. On the first probe
+// failure this emits a single WARN naming the consequence and returns false,
+// so the apply proceeds without the bypass rather than crashing cryptically
+// at every tx. sync.Once serialises the W concurrent lanes (ADR-0105).
+func (a *ChangeApplier) foreignKeyBypassAvailable(ctx context.Context) bool {
+	a.fkBypassOnce.Do(func() {
+		a.fkBypassOK = a.probeReplicaRoleBypass(ctx)
+		if !a.fkBypassOK {
+			slog.WarnContext(ctx, "postgres: applier: target FK/trigger enforcement could not be bypassed; "+
+				"an FK-violating or out-of-order CDC change will fail the apply — grant the apply role the "+
+				"privilege to SET session_replication_role (superuser / rds_superuser), or make the target "+
+				"FK constraints DEFERRABLE")
+		}
+	})
+	return a.fkBypassOK
+}
+
+// probeReplicaRoleBypass attempts the replica-role SET in a throwaway,
+// rolled-back tx to detect whether the apply role holds the privilege,
+// without side effects. Any failure (insufficient privilege, or an inability
+// to open the probe tx) yields false — the safe outcome is to skip the bypass
+// and let an FK-violating change fail loudly. Uses the primary pool a.db; the
+// privilege is role-level, so the result applies to the lane / pipelined pools
+// (same role + DSN) too.
+func (a *ChangeApplier) probeReplicaRoleBypass(ctx context.Context) bool {
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = tx.Rollback() }()
+	_, err = tx.ExecContext(ctx, replicaRoleSQL)
+	return err == nil
 }
 
 // execDMLArgs prepends pgx.QueryExecModeExec to args when the routed
@@ -1162,6 +1250,12 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 	// role/db-level default of `off` can't silently break ADR-0007's
 	// "position + data lands durably together" contract.
 	if err := a.forceSynchronousCommitOn(ctx, tx); err != nil {
+		_ = tx.Rollback()
+		return classifyApplierError(err)
+	}
+	// Bug 164: bypass target FK + user-trigger enforcement for this apply tx
+	// (a CDC stream is not FK-dependency-ordered). No-op without privilege.
+	if err := a.bypassForeignKeyEnforcement(ctx, tx); err != nil {
 		_ = tx.Rollback()
 		return classifyApplierError(err)
 	}

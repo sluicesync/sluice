@@ -212,6 +212,12 @@ func (a *ChangeApplier) beginSerialBatchTx(ctx context.Context) (appliershared.B
 		_ = tx.Rollback()
 		return nil, classifyApplierError(err)
 	}
+	// Bug 164: bypass target FK + user-trigger enforcement for this apply tx
+	// (a CDC stream is not FK-dependency-ordered). No-op without privilege.
+	if err := a.bypassForeignKeyEnforcement(ctx, tx); err != nil {
+		_ = tx.Rollback()
+		return nil, classifyApplierError(err)
+	}
 	return tx, nil
 }
 

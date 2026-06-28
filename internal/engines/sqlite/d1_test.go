@@ -910,13 +910,19 @@ func TestD1RealPrecision_Pure(t *testing.T) {
 		if f != want {
 			t.Errorf("real %.17g → Float %v; want EXACT %v (precision silently lost)", want, f, want)
 		}
-		// ir.Decimal real branch: shortest round-trippable decimal of the same float.
+		// ir.Decimal real branch: shortest round-trippable decimal of the same
+		// float, in PLAIN-DIGIT form (Bug 163 — 'f' not 'g', so pgx's numeric
+		// COPY encoder can encode it; exponent notation aborts the COPY). The
+		// d1 reader shares decodeCell, so this pins the d1 path too.
 		d, err := decodeCell(got, ir.Decimal{Unconstrained: true}, dateEncodingISO)
 		if err != nil {
 			t.Fatalf("decodeCell Decimal %q: %v", text, err)
 		}
-		if d != strconv.FormatFloat(want, 'g', -1, 64) {
-			t.Errorf("real %.17g → Decimal %q; want %q", want, d, strconv.FormatFloat(want, 'g', -1, 64))
+		if ds, _ := d.(string); ds != strconv.FormatFloat(want, 'f', -1, 64) {
+			t.Errorf("real %.17g → Decimal %q; want %q (plain-digit)", want, d, strconv.FormatFloat(want, 'f', -1, 64))
+		}
+		if ds, _ := d.(string); strings.ContainsAny(ds, "eE") {
+			t.Errorf("real %.17g → Decimal %q contains exponent notation (pgx numeric COPY cannot encode it)", want, ds)
 		}
 	}
 }

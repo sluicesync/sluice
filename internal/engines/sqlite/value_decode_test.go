@@ -185,6 +185,58 @@ func TestDecodeCell(t *testing.T) {
 	}
 }
 
+// TestDecodeDecimalPlainDigits pins Bug 163: a REAL stored in a NUMERIC/DECIMAL
+// affinity column must decode to a PLAIN-DIGIT decimal string, never exponent
+// notation. The 'g' verb sluice used before emitted "1e-10"/"1.23456789e+06"
+// for magnitudes < 1e-4 or >= 1e6, which pgx's numeric (OID 1700) BINARY COPY
+// encoder cannot encode -> the SQLite->PG migrate aborted at COPY. The 'f' verb
+// renders the SAME shortest round-trippable value in plain digits. Includes the
+// bug163-repro values plus the empirical 'g'-exponent thresholds (>= 1e6 and
+// < 1e-4) that hit ordinary money values. Shared by the file reader AND the d1
+// reader (both go through decodeCell).
+func TestDecodeDecimalPlainDigits(t *testing.T) {
+	cases := []struct {
+		name string
+		val  float64
+		want string
+	}{
+		// bug163-repro/bug163.db values (declared DECIMAL(38,10), stored REAL).
+		{"repro_19.99", 19.99, "19.99"},
+		{"repro_0.1", 0.1, "0.1"},
+		{"repro_1e-10", 0.0000000001, "0.0000000001"},
+		// 12345678901234567890.12 is beyond float64 precision; SQLite stored it
+		// as the nearest double, which 'f' renders plain (encodable by pgx).
+		{"repro_big", 12345678901234567890.12, "12345678901234567000"},
+		// The 'g' exponent thresholds that broke ordinary money values.
+		{"money_>=1e6", 1234567.89, "1234567.89"},
+		{"exactly_1e6", 1000000.0, "1000000"},
+		{"rate_<1e-4", 0.00001, "0.00001"},
+		// Normal-magnitude values: 'f' and 'g' are byte-identical here, so the
+		// fix changes ONLY the rendering of the exponent cases.
+		{"normal_999999.9999", 999999.9999, "999999.9999"},
+		{"normal_0.0001", 0.0001, "0.0001"},
+	}
+	dec := ir.Decimal{Unconstrained: true}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := decodeCell(c.val, dec, dateEncodingISO)
+			if err != nil {
+				t.Fatalf("decodeCell(%v): unexpected error: %v", c.val, err)
+			}
+			s, ok := got.(string)
+			if !ok {
+				t.Fatalf("decodeCell(%v): got %T; want decimal string", c.val, got)
+			}
+			if s != c.want {
+				t.Errorf("decodeCell(%v) = %q; want %q", c.val, s, c.want)
+			}
+			if strings.ContainsAny(s, "eE") {
+				t.Errorf("decodeCell(%v) = %q contains exponent notation (pgx numeric COPY cannot encode it)", c.val, s)
+			}
+		})
+	}
+}
+
 // valuesEqual compares decoded IR values for the test, handling the []byte
 // case (which == can't compare) and nil.
 func valuesEqual(a, b any) bool {

@@ -159,6 +159,18 @@ func (a *ChangeApplier) beginPipelinedTx(ctx context.Context) (*pgxBatchTx, erro
 		return nil, fmt.Errorf("postgres: applier: pipelined force synchronous_commit=on: %w", err)
 	}
 
+	// Bug 164: bypass target FK + user-trigger enforcement for this apply tx
+	// (a CDC stream is not FK-dependency-ordered) — identical semantics to the
+	// serial bypassForeignKeyEnforcement, applied here on the native pgx.Tx.
+	// SET LOCAL scopes it to this tx; no-op without privilege.
+	if a.foreignKeyBypassAvailable(ctx) {
+		if _, err := tx.Exec(ctx, replicaRoleSQL); err != nil {
+			_ = tx.Rollback(ctx)
+			_ = sqlConn.Close()
+			return nil, fmt.Errorf("postgres: applier: pipelined bypass FK enforcement (session_replication_role=replica): %w", err)
+		}
+	}
+
 	return &pgxBatchTx{
 		a:       a,
 		ctx:     ctx,

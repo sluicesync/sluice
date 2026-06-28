@@ -370,6 +370,82 @@ func asFloat(t *testing.T, v any) float64 {
 	}
 }
 
+// TestMigrate_SQLiteDecimalExponentToPostgres pins Bug 163: a SQLite DECIMAL/
+// NUMERIC-affinity column holding REAL values whose 'g'-rendered form is in
+// exponent notation (magnitude >= 1e6 or < 1e-4) must migrate into PG without
+// aborting at COPY. Before the 'g'->'f' fix the SQLite reader emitted
+// "1.23456789e+06" / "1e-05" / "1e-10", and pgx's numeric (OID 1700) BINARY
+// COPY encoder refused them ("unable to encode ... into binary format for
+// numeric (OID 1700)"). With 'f' the values render plain-digit and land
+// numerically exact. The values cover BOTH exponent thresholds plus the
+// bug163-repro extremes; ordinary money (>= $1,000,000) is enough to trip it.
+func TestMigrate_SQLiteDecimalExponentToPostgres(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bug163.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open sqlite seed: %v", err)
+	}
+	stmts := []string{
+		`CREATE TABLE dec (id INTEGER PRIMARY KEY, m DECIMAL(38,10))`,
+		// Each value is a REAL in a NUMERIC-affinity column. The 'g' verb would
+		// render rows 3-6 in exponent notation (pgx-unencodable); 'f' renders
+		// every one plain. Rows 1-2 are normal-magnitude (byte-identical 'g'/'f').
+		`INSERT INTO dec (id, m) VALUES
+			(1, 19.99),
+			(2, 0.1),
+			(3, 1234567.89),
+			(4, 0.00001),
+			(5, 0.0000000001),
+			(6, 1000000.0)`,
+	}
+	for _, s := range stmts {
+		if _, err := db.ExecContext(context.Background(), s); err != nil {
+			t.Fatalf("seed exec: %v", err)
+		}
+	}
+	_ = db.Close()
+
+	_, pgTarget, pgCleanup := startPostgres(t)
+	defer pgCleanup()
+	sqliteEng, _ := engines.Get("sqlite")
+	pgEng, _ := engines.Get("postgres")
+	mig := &Migrator{Source: sqliteEng, Target: pgEng, SourceDSN: path, TargetDSN: pgTarget}
+	// The whole point: this Run aborted at COPY before the fix.
+	if err := mig.Run(ctx2min(t)); err != nil {
+		t.Fatalf("Migrator.Run (SQLite decimal exponent->PG): %v", err)
+	}
+
+	pg, err := sql.Open("pgx", pgTarget)
+	if err != nil {
+		t.Fatalf("open pg: %v", err)
+	}
+	defer func() { _ = pg.Close() }()
+	ctx := ctx2min(t)
+
+	// Read each value back as numeric text and assert numerically exact (the
+	// trimmed PG numeric text equals the plain decimal the float round-trips to).
+	want := map[int]string{
+		1: "19.99",
+		2: "0.1",
+		3: "1234567.89",
+		4: "0.00001",
+		5: "0.0000000001",
+		6: "1000000",
+	}
+	for id, exp := range want {
+		var got string
+		// trim_scale drops PG's declared-scale trailing zeros so the text matches
+		// the float's shortest plain form.
+		if err := pg.QueryRowContext(ctx,
+			`SELECT trim_scale(m)::text FROM dec WHERE id = $1`, id).Scan(&got); err != nil {
+			t.Fatalf("select dec id=%d: %v", id, err)
+		}
+		if got != exp {
+			t.Errorf("dec id=%d = %q; want %q (numerically exact, plain-digit)", id, got, exp)
+		}
+	}
+}
+
 // seedSQLiteTemporal writes a temp SQLite file with DECLARED DATE, DATETIME,
 // and BOOLEAN columns (ADR-0129). With iso=true the values are ISO TEXT and
 // 0/1; with iso=false the happened_at DATETIME is stored as a unix-epoch
