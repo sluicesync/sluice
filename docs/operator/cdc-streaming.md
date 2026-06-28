@@ -119,13 +119,19 @@ failover under throttler load can widen the envelope, e.g.
 ## Foreign keys during CDC apply
 
 A CDC change stream is **not foreign-key-dependency-ordered**, so the
-applier deliberately bypasses target FK constraints and user triggers
-for the duration of each apply transaction. This is the standard
-logical-replication technique (it is what Postgres's own logical
-replication does): constraint integrity is the **source's**
-responsibility — it has already validated every change — so the target
-faithfully mirrors the source, including any FK-inconsistency the source
-itself permits, and replicated rows do not double-fire target triggers.
+applier deliberately bypasses target FK enforcement for the duration of
+each apply transaction. This is the standard logical-replication
+technique (it is what Postgres's own logical replication does):
+constraint integrity is the **source's** responsibility — it has already
+validated every change — so the target faithfully mirrors the source,
+including any FK-inconsistency the source itself permits.
+
+The two engines differ in what else the bypass suppresses. On Postgres,
+`session_replication_role = replica` also disables **user triggers**
+during replay, so replicated rows do not double-fire target triggers
+(again matching Postgres logical replication). On MySQL,
+`foreign_key_checks = 0` disables **FK constraints and FK cascades
+only** — target user triggers still fire on replayed rows.
 
 Why this is necessary: a source that does not enforce FKs (SQLite with
 the default `PRAGMA foreign_keys=OFF`, MySQL MyISAM, or any application

@@ -80,6 +80,25 @@ func seedSQLiteTriggerFKSource(t *testing.T) string {
 
 // TestStreamer_FKBypass_SQLiteTriggerToPostgres is the Bug 164 PG-target proof.
 func TestStreamer_FKBypass_SQLiteTriggerToPostgres(t *testing.T) {
+	// applyConcurrency 0 = the serial/pipelined apply path (the streamer's
+	// default fast path on a PG target).
+	runFKBypassPG(t, "fk-bypass-pg", 0)
+}
+
+// TestStreamer_FKBypass_SQLiteTriggerToPostgres_ConcurrentLanes pins the bypass
+// on the ADR-0105 CONCURRENT key-hash lane path (ApplyLaneBatch). The default
+// test above does not engage lanes, and the other concurrent-apply integration
+// tests run FK-consistent streams — so without this variant the lane path's FK
+// bypass (a separate tx-open site from serial/pipelined) is unproven for an
+// orphaning change. --apply-concurrency=2 forces W>1 → the lane path.
+func TestStreamer_FKBypass_SQLiteTriggerToPostgres_ConcurrentLanes(t *testing.T) {
+	runFKBypassPG(t, "fk-bypass-pg-w2", 2)
+}
+
+// runFKBypassPG drives the Bug-164 PG-target proof at the given apply
+// concurrency (0 = serial/pipelined default, >1 = concurrent lanes).
+func runFKBypassPG(t *testing.T, streamID string, applyConcurrency int) {
+	t.Helper()
 	src := seedSQLiteTriggerFKSource(t)
 	_, pgTarget, pgCleanup := startPostgres(t)
 	defer pgCleanup()
@@ -94,11 +113,19 @@ func TestStreamer_FKBypass_SQLiteTriggerToPostgres(t *testing.T) {
 	}
 
 	streamer := &Streamer{
-		Source:    srcEng,
-		Target:    pgEng,
-		SourceDSN: src,
-		TargetDSN: pgTarget,
-		StreamID:  "fk-bypass-pg",
+		Source:           srcEng,
+		Target:           pgEng,
+		SourceDSN:        src,
+		TargetDSN:        pgTarget,
+		StreamID:         streamID,
+		ApplyConcurrency: applyConcurrency,
+	}
+	// The concurrent key-hash lane path (ApplyLaneBatch) lives inside the
+	// batched apply; the streamer only routes through ApplyBatch when
+	// ApplyBatchSize > 1 (else it uses per-change Apply, which never engages
+	// lanes). So a lane-path variant must set both.
+	if applyConcurrency > 1 {
+		streamer.ApplyBatchSize = 100
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
