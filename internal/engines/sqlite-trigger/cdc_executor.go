@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 
 	"sluicesync.dev/sluice/internal/engines/sqlite"
@@ -49,6 +50,15 @@ type executor interface {
 	// durably-applied frontier minus a margin, so id == cut is itself durably
 	// applied and safe to remove.
 	pruneChangeLog(ctx context.Context, cut int64) (deleted int64, err error)
+	// checkpointWAL bounds the source WAL under sustained CDC (Bug 167). On the
+	// local SQLite path it issues `PRAGMA wal_checkpoint(TRUNCATE)` so the
+	// continuously-churned change-log WAL is reset on a cadence instead of
+	// growing without bound; a BUSY result (a reader/writer momentarily held the
+	// WAL) is not an error — the next cadence retries. The D1 path is a no-op:
+	// D1 polls over HTTP against Cloudflare-managed storage with no local pager
+	// or WAL file. It is pure WAL-file management — it must never change the
+	// read/apply path or the watermark.
+	checkpointWAL(ctx context.Context) error
 	// vacuum reclaims file space after a prune (SQLite/D1 only; PG uses
 	// autovacuum). Behind the operator's --vacuum opt-in — VACUUM rewrites the
 	// whole database.
@@ -118,6 +128,21 @@ func localBackend(dsn string) backend {
 			db, _, err := sqlite.OpenFile(ctx, dsn, readOnly)
 			if err != nil {
 				return nil, err
+			}
+			if readOnly {
+				// Bug 167: the CDC poller's read connection must NOT linger idle
+				// in the pool. An idle pooled connection retains a stale WAL
+				// read-mark, which pins SQLite's checkpoint (the app writer's
+				// auto-checkpoint AND our own wal_checkpoint(TRUNCATE)) from ever
+				// resetting the WAL — so under sustained change-log churn the
+				// source WAL (and modernc's mmap of it, hence process RSS) grows
+				// without bound. Closing the connection after each poll releases
+				// the mark, so the checkpoint can reset the WAL. Ground-truthed:
+				// default idle pool grew 69→158 MB in 12 s; SetMaxIdleConns(0)
+				// held flat at ~8 MB. Read-only autocommit reads remain correct
+				// (each opens its own consistent snapshot); exactly-once and the
+				// watermark are unaffected.
+				db.SetMaxIdleConns(0)
 			}
 			return &localExecutor{db: db}, nil
 		},
@@ -263,6 +288,28 @@ func (e *localExecutor) pruneChangeLog(ctx context.Context, cut int64) (int64, e
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+func (e *localExecutor) checkpointWAL(ctx context.Context) error {
+	// PRAGMA wal_checkpoint returns one row: (busy, log_frames, checkpointed).
+	// busy=1 means a reader/writer held the WAL so it could not fully truncate
+	// this round — NOT an error; the next cadence retries. On a non-WAL database
+	// it returns (0,-1,-1) with no error, so this is harmless if the operator's
+	// source is not in WAL mode. With the poller pool's idle connection released
+	// (SetMaxIdleConns(0)) there is no stale read-mark of our own to pin it.
+	var busy, logFrames, checkpointed int
+	if err := e.db.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").
+		Scan(&busy, &logFrames, &checkpointed); err != nil {
+		return err
+	}
+	if busy != 0 {
+		slog.DebugContext(ctx, "sqlite-trigger: WAL checkpoint busy; retrying next cadence",
+			slog.Int("log_frames", logFrames), slog.Int("checkpointed", checkpointed))
+	} else {
+		slog.DebugContext(ctx, "sqlite-trigger: WAL checkpoint(TRUNCATE) ok",
+			slog.Int("log_frames", logFrames), slog.Int("checkpointed", checkpointed))
+	}
+	return nil
 }
 
 func (e *localExecutor) vacuum(ctx context.Context) error {
@@ -455,6 +502,11 @@ func (e *d1Executor) pruneChangeLog(ctx context.Context, cut int64) (int64, erro
 	}
 	return deleted, nil
 }
+
+// checkpointWAL is a no-op on the D1 transport: D1 polls over the `/query` HTTP
+// API against Cloudflare-managed storage — there is no local pager or WAL file
+// for sluice to checkpoint (Bug 167 is local-SQLite-only).
+func (e *d1Executor) checkpointWAL(context.Context) error { return nil }
 
 func (e *d1Executor) vacuum(ctx context.Context) error {
 	return e.conn.Exec(ctx, "VACUUM")

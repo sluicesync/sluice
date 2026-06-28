@@ -23,6 +23,15 @@ const (
 	defaultPollInterval = 1 * time.Second
 	defaultBatchSize    = 10000
 	cdcChannelBuffer    = 256
+	// defaultCheckpointInterval is how often the LOCAL SQLite poller issues
+	// PRAGMA wal_checkpoint(TRUNCATE) to bound the source WAL (Bug 167). The
+	// primary fix is releasing the poller's idle connection (so the app writer's
+	// own auto-checkpoint can reset the WAL); this cadence is the backstop that
+	// keeps the WAL bounded even when the operator's app has disabled
+	// auto-checkpoint (PRAGMA wal_autocheckpoint=0). 30 s is low-overhead (a
+	// checkpoint on a quiescent WAL is near-instant) while capping a runaway.
+	// The D1 path's checkpointWAL is a no-op, so this is inert there.
+	defaultCheckpointInterval = 30 * time.Second
 )
 
 // committedAtLayout is the change-log captured_at format produced by the trigger
@@ -53,6 +62,10 @@ type CDCReader struct {
 
 	pollInterval time.Duration
 	batchSize    int
+
+	// checkpointInterval is the cadence at which the pump issues
+	// exec.checkpointWAL to bound the source WAL (Bug 167). Zero disables it.
+	checkpointInterval time.Duration
 
 	// pumpCancel cancels the polling goroutine when Close is called.
 	pumpCancel context.CancelFunc
@@ -106,11 +119,12 @@ func openCDCReaderBackend(ctx context.Context, b backend) (ir.CDCReader, error) 
 		return nil, err
 	}
 	return &CDCReader{
-		exec:         exec,
-		dec:          dec,
-		colTypes:     colTypes,
-		pollInterval: defaultPollInterval,
-		batchSize:    defaultBatchSize,
+		exec:               exec,
+		dec:                dec,
+		colTypes:           colTypes,
+		pollInterval:       defaultPollInterval,
+		batchSize:          defaultBatchSize,
+		checkpointInterval: defaultCheckpointInterval,
 	}, nil
 }
 
@@ -202,6 +216,15 @@ func (r *CDCReader) SetPollInterval(d time.Duration) {
 	}
 }
 
+// SetCheckpointInterval overrides the WAL-checkpoint cadence (Bug 167). Must be
+// called before [StreamChanges]. A zero or negative duration DISABLES the
+// periodic checkpoint (the idle-connection release alone still lets the app
+// writer's auto-checkpoint bound the WAL). Used by tests to force a tight
+// cadence; not wired to a CLI flag — the default is sane for operators.
+func (r *CDCReader) SetCheckpointInterval(d time.Duration) {
+	r.checkpointInterval = d
+}
+
 // Close releases the underlying executor and stops any in-flight polling
 // goroutine.
 func (r *CDCReader) Close() error {
@@ -283,6 +306,9 @@ func (r *CDCReader) pump(ctx context.Context, startID int64, out chan<- ir.Chang
 	lastSeen := startID
 	timer := time.NewTimer(0) // fire immediately on the first iteration
 	defer timer.Stop()
+	// lastCheckpoint paces the WAL-checkpoint cadence (Bug 167). Initialised to
+	// now so the first checkpoint fires one interval into the stream.
+	lastCheckpoint := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
@@ -303,6 +329,18 @@ func (r *CDCReader) pump(ctx context.Context, startID int64, out chan<- ir.Chang
 		}
 		if newLast > lastSeen {
 			lastSeen = newLast
+		}
+		// Bound the source WAL on a cadence (Bug 167). Runs in this same
+		// goroutine, between polls, so it never races the poll read on the
+		// executor. A checkpoint failure must NOT break the stream — WAL
+		// management is orthogonal to read/apply correctness — so it is logged
+		// and the loop continues.
+		if r.checkpointInterval > 0 && time.Since(lastCheckpoint) >= r.checkpointInterval {
+			if cerr := r.exec.checkpointWAL(ctx); cerr != nil {
+				slog.DebugContext(ctx, "sqlite-trigger: WAL checkpoint failed (non-fatal)",
+					slog.Any("err", cerr))
+			}
+			lastCheckpoint = time.Now()
 		}
 		if len(events) == r.batchSize {
 			timer.Reset(0)

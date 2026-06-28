@@ -114,6 +114,40 @@ It is idempotent (a second run with the same durable frontier deletes
 nothing) and safe to overlap with a live sync, so a simple fixed-cadence
 schedule needs no coordination with the streamer.
 
+## SQLite WAL bounding (automatic; `sqlite-trigger` only)
+
+`trigger prune` bounds the change-log **row count** in the main database.
+A separate concern on a local SQLite source is the **write-ahead log
+(`<db>-wal`) file size**. Every captured change is a write, and the
+continuous CDC poller holds a reader on the source; under sustained
+churn that combination prevents SQLite's checkpoint from resetting the
+WAL, so the `-wal` file (and the sync's resident memory, which tracks it)
+can grow without bound even while the change-log row count stays bounded
+by prune. (In a ~52-min endurance run the WAL reached 75 GB on a 20 GB
+database before this was fixed — Bug 167.)
+
+Since v0.99.152 the `sqlite-trigger` poller bounds the WAL automatically,
+with **no operator action**:
+
+- it does not hold an idle pooled read connection between polls (the idle
+  connection's stale read-mark was what pinned the checkpoint), so your
+  app's own auto-checkpoint can reset the WAL normally; and
+- it issues `PRAGMA wal_checkpoint(TRUNCATE)` on a ~30 s cadence as a
+  backstop, so the WAL stays bounded **even if your application sets
+  `PRAGMA wal_autocheckpoint=0`** (disables SQLite's own checkpointing).
+
+This is pure WAL-file management — it never changes what is read or
+applied, and never moves the watermark, so exactly-once is unaffected.
+The checkpoint runs between polls in the poller's own goroutine and a
+momentary `BUSY` (another connection held the WAL) is simply retried on
+the next cadence; it never blocks or fails the stream. The `d1-trigger`
+engine polls Cloudflare D1 over HTTP and has no local WAL, so this does
+not apply there.
+
+If you want to inspect WAL behaviour, watch the `<db>-wal` file size next
+to your source `.db` while a sync runs; with the fix it stays small
+(roughly one checkpoint interval of churn) instead of climbing.
+
 ## Deferred: automatic in-stream pruning
 
 Having the streamer prune the change-log itself on a durable-checkpoint
