@@ -4,6 +4,8 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.148] - 2026-06-27
+
 ### Added
 
 - **SQLite gains continuous logical CDC: the new `sqlite-trigger` source engine (roadmap item 49 follow-up, #5 of the SQLite queue; ADR-0135, Phase 1).** A LOCAL SQLite file now streams its row changes to a Postgres or MySQL target — `sluice trigger setup --source-driver sqlite-trigger --dsn ./app.db --tables=t1,t2` installs a `sluice_change_log` table plus per-table AFTER INSERT/UPDATE/DELETE capture triggers, and `sluice sync start --source-driver sqlite-trigger --source ./app.db --target-driver postgres --target <dsn>` does a cold-start snapshot (reusing the validated `sqlite` reader — chunking + the ADR-0129 date/bool policy) handed off gap-free to a polling CDC reader with a monotonic-id watermark for exactly-once resume. The engine composes `sqlite` by delegation (CDC source only; the write/target surfaces stay not-implemented) and self-registers as `sqlite-trigger`. `sluice trigger teardown --source-driver sqlite-trigger` removes every trace. SQLite has no logical-replication or decodable change stream, so the trigger pattern (the proven `pgtrigger` model, ADR-0066) is the only way to get logical row changes out of it.
