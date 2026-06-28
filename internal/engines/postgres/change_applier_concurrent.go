@@ -24,6 +24,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5/stdlib"
@@ -149,6 +150,15 @@ func (a *ChangeApplier) invalidateMetadataCaches(qn string) {
 // adapter's hook (change_applier_concurrent.go).
 var laneCommitHookForTest func(buf []laneChange) error
 
+// lanePipelinedTakenForTest, when non-nil, is invoked once per lane batch that
+// successfully begins a PIPELINED tx (ADR-0138) — never on the serial fallback.
+// An integration test sets it to assert the concurrent path actually uses the
+// pipelined SendBatch path and has not silently regressed to serial per-row exec
+// (a regression the value-fidelity / exactly-once differentials would NOT catch,
+// since serial is also correct — it would only show up as lost WAN throughput).
+// nil in production (zero overhead).
+var lanePipelinedTakenForTest func()
+
 // laneChange is the per-change envelope [laneCommitHookForTest] receives. The
 // orchestration owns its own [laneapply.LaneChange] (including the seq), so
 // this thin type survives only as the parameter shape the integration pin's
@@ -201,26 +211,92 @@ func (la *laneApplierAdapter) PKValuesForRouting(ctx context.Context, c ir.Chang
 	return schemaTableKey(routed, table), vals, true, nil
 }
 
-// ApplyLaneBatch dispatches every change in batch onto a single lane
-// transaction and commits it. Redaction + shard-stamp happen FIRST, in the
-// SAME order the serial applyOne / RunOneBatch path uses, then the SERIAL
-// dispatch (on *sql.Tx — NOT the ADR-0092 pgx.Batch pipeline) runs, so value
-// encoding is byte-identical to the serial path. The F7 synchronous_commit
-// pin is applied exactly as the serial BeginTx does (ADR-0007 durability).
-// The lane writes NO position (the orchestrator's frontier owns it). Returns
-// len(batch) on success, the RAW (unclassified) error on failure so the
-// orchestrator's retry predicate can inspect it; on any failure the tx is
-// rolled back. The `lane` index is accepted for the seam contract but unused
-// by the adapter: the lane pool (MaxOpenConns == lanes) hands out one
-// backend per in-flight tx, so a pooled connection per concurrent lane
-// commit == one backend per lane in practice.
+// ApplyLaneBatch applies every change in batch on one lane transaction and
+// commits it. Redaction + shard-stamp happen FIRST, in the SAME order the
+// serial applyOne / RunOneBatch path uses; then — ADR-0138 (Bug 168) — the
+// batch is dispatched through the ADR-0092 PIPELINED path (dispatchPipelined
+// queues each change onto a pgx.Batch; flushAndCommit sends the whole batch in
+// ONE SendBatch round trip and commits) instead of one serial Exec round trip
+// per change, so a lane is no longer RTT-bound over WAN. Value encoding is
+// byte-identical to the serial path because dispatchPipelined is the SAME
+// builder + prepareApplierValue codec the single-lane pipelined path uses (the
+// value-fidelity oracle is change_applier_pipelined_*_integration_test.go). The
+// F7 synchronous_commit pin and the Bug-164 FK bypass are applied by
+// beginPipelinedTxOn exactly as the serial BeginTx does (ADR-0007 durability).
+// The lane writes NO position (the orchestrator's frontier owns it).
+//
+// If the raw-conn escape is unavailable (errPipelineUnavailable — a non-pgx /
+// wrapped conn, e.g. some direct-API unit constructions), the lane falls back
+// to the serial *sql.Tx dispatch (applyLaneBatchSerial) with a one-time WARN —
+// loud, never silent, no throughput claim — mirroring the single-lane BeginTx
+// closure. With the production DescribeExec lane pool the escape always
+// succeeds, so the fallback is defensive parity, not the hot path.
+//
+// Returns len(batch) on success; on failure the tx is rolled back and the
+// error is returned for the orchestrator's retry predicate. flushAndCommit
+// returns an already-classified error, but classifyApplierError is idempotent
+// for retriability (a 40001/40P01 stays retriable through re-classification via
+// the retriablePGError Unwrap chain), so the in-lane shrink-and-retry still
+// engages. The `lane` index is accepted for the seam contract but unused: the
+// lane pool (MaxOpenConns == lanes) hands out one backend per in-flight tx.
+func (la *laneApplierAdapter) ApplyLaneBatch(ctx context.Context, _ int, batch []ir.Change) (int, error) {
+	b, err := la.a.beginPipelinedTxOn(ctx, la.laneDB)
+	if err != nil {
+		if errors.Is(err, errPipelineUnavailable) {
+			la.a.warnPipelineFallbackOnce(ctx, err)
+			return la.applyLaneBatchSerial(ctx, batch)
+		}
+		return 0, err
+	}
+	if lanePipelinedTakenForTest != nil {
+		lanePipelinedTakenForTest()
+	}
+	for _, c := range batch {
+		if err := la.a.redactChange(ctx, c); err != nil {
+			_ = b.Rollback()
+			return 0, fmt.Errorf("postgres: applier: redact: %w", err)
+		}
+		la.a.stampShardChange(c)
+		if err := la.a.dispatchPipelined(ctx, b, la.streamID, c); err != nil {
+			_ = b.Rollback()
+			return 0, err
+		}
+	}
+	// Test seam: force a commit-path failure deterministically (the lane
+	// analogue of forcing a PG serialization abort). nil in production. Fires
+	// after queueing, before the SendBatch flush — nothing has been sent yet,
+	// so Rollback aborts the as-yet-empty tx, exactly as the serial path rolled
+	// back before commit.
+	if la.laneCommitHook != nil {
+		buf := make([]laneChange, len(batch))
+		for i, c := range batch {
+			buf[i] = laneChange{change: c}
+		}
+		if herr := la.laneCommitHook(buf); herr != nil {
+			_ = b.Rollback()
+			return 0, herr
+		}
+	}
+	// flushAndCommit sends the whole lane batch in one round trip, commits under
+	// the Bug-56 watchdog, and releases the pinned backend on every path
+	// (including its own rollback on a flush error).
+	if err := la.a.flushAndCommit(b); err != nil {
+		return 0, err
+	}
+	return len(batch), nil
+}
+
+// applyLaneBatchSerial is the pre-ADR-0138 serial lane apply: one *sql.Tx, one
+// Exec round trip per change, one commit. It is the fallback ApplyLaneBatch
+// takes only when the pipelined raw-conn escape is unavailable
+// (errPipelineUnavailable); byte-identical to the historical lane path.
 //
 // The *sql.Tx is rolled back on every error path and committed via
 // commitWithTimeout on success; sqlclosecheck can't track that
 // commit-or-rollback discipline across the dispatch loop, so it's suppressed.
 //
 //nolint:sqlclosecheck
-func (la *laneApplierAdapter) ApplyLaneBatch(ctx context.Context, _ int, batch []ir.Change) (int, error) {
+func (la *laneApplierAdapter) applyLaneBatchSerial(ctx context.Context, batch []ir.Change) (int, error) {
 	tx, err := la.laneDB.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, fmt.Errorf("postgres: applier: lane begin tx: %w", err)
@@ -251,8 +327,6 @@ func (la *laneApplierAdapter) ApplyLaneBatch(ctx context.Context, _ int, batch [
 			return 0, err
 		}
 	}
-	// Test seam: force a commit-path failure deterministically (the lane
-	// analogue of forcing a PG serialization abort). nil in production.
 	if la.laneCommitHook != nil {
 		buf := make([]laneChange, len(batch))
 		for i, c := range batch {
@@ -337,15 +411,29 @@ func (la *laneApplierAdapter) ApplyBarrierChange(ctx context.Context, c ir.Chang
 // tables; the keyless at-least-once guarantee is unchanged because keyless
 // changes take the single-row barrier path).
 func (a *ChangeApplier) applyBatchConcurrent(ctx context.Context, streamID string, changes <-chan ir.Change, maxBatchSize, lanes int) error {
+	// ADR-0138 (Bug 168): the lane pool is opened in DescribeExec mode
+	// (openPgxDBDescribeExec — the SAME constructor the single-lane pipelined
+	// pool uses) rather than the Exec-mode openDBAs, so each lane can apply its
+	// batch via the ADR-0092 pipelined SendBatch path (one round trip per
+	// lane-batch, not one per row). With the Exec-mode pool the concurrent lanes
+	// dispatched serially — one network round trip per change — capping apply at
+	// ~lanes/RTT over WAN (invisible on a LAN, but ~50 changes/s over an 80ms
+	// cross-region link; the lag diverged under load).
+	//
 	// CRITICAL: the lane pool MUST register the PostGIS geometry codec
 	// (afterConnectRegisterGeometry) exactly as the serial applier pool
 	// (engine.go OpenChangeApplier) and the pipelined pool (pipelinePool) do
 	// — otherwise a geometry column would silently mis-encode (TEXT-refused)
 	// on the lane path while passing on the serial path: a Bug-74-class
 	// codec-coverage trap. Same role + DSN as those pools.
-	laneDB, err := openDBAs(ctx, a.pipelineCfg, roleApplier, stdlib.OptionAfterConnect(afterConnectRegisterGeometry))
+	laneDB, err := openPgxDBDescribeExec(a.pipelineCfg.dsn, roleApplier, a.pipelineCfg.appID,
+		stdlib.OptionAfterConnect(afterConnectRegisterGeometry))
 	if err != nil {
 		return classifyApplierError(fmt.Errorf("postgres: applier: open concurrent lane pool: %w", err))
+	}
+	if err := laneDB.PingContext(ctx); err != nil {
+		_ = laneDB.Close()
+		return classifyApplierError(fmt.Errorf("postgres: applier: ping concurrent lane pool: %w", err))
 	}
 	defer func() { _ = laneDB.Close() }()
 	laneDB.SetMaxOpenConns(lanes)

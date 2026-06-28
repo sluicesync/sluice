@@ -114,8 +114,11 @@ type ChangeApplier struct {
 
 	// pipelineWarnedFallback records that the one-time "pipelined apply
 	// unavailable, falling back to serial exec" WARN has fired, so a
-	// persistent escape/open failure logs once, not once per batch.
-	pipelineWarnedFallback bool
+	// persistent escape/open failure logs once, not once per batch. Atomic
+	// because ADR-0138 routes the W concurrent apply lanes through the same
+	// warnPipelineFallbackOnce — previously it was reached only from the
+	// single-goroutine single-lane closure.
+	pipelineWarnedFallback atomic.Bool
 
 	// applyConcurrency is the ADR-0105 (item 26) key-hash apply LANE count
 	// W: the merged CDC change stream is fanned across W in-order apply

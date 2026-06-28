@@ -117,6 +117,18 @@ func (a *ChangeApplier) beginPipelinedTx(ctx context.Context) (*pgxBatchTx, erro
 	if err != nil {
 		return nil, err
 	}
+	return a.beginPipelinedTxOn(ctx, db)
+}
+
+// beginPipelinedTxOn opens a pipelined batch transaction on a SPECIFIC
+// DescribeExec-mode pool. It is the body of [beginPipelinedTx] parameterised
+// on the pool so the single-lane batch path (the shared [pipelinePool]) and
+// each ADR-0105 concurrent lane (its own DescribeExec lane pool, ADR-0138)
+// share one pipelined-tx lifecycle: conn escape → native pgx.Tx → F7
+// synchronous_commit pin → Bug-164 FK bypass → the same errPipelineUnavailable
+// fallback contract. db MUST be a DescribeExec-mode *sql.DB (openPgxDBDescribeExec)
+// for the "only WHEN, never HOW" byte-identical encoding guarantee to hold.
+func (a *ChangeApplier) beginPipelinedTxOn(ctx context.Context, db *sql.DB) (*pgxBatchTx, error) {
 	sqlConn, err := db.Conn(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: applier: pipelined acquire conn: %w", err)
@@ -462,10 +474,11 @@ func (a *ChangeApplier) attributeQueuedError(s queuedStmt, err error) error {
 // operator sees the lost-throughput condition once (not per batch) and no
 // throughput claim is made silently.
 func (a *ChangeApplier) warnPipelineFallbackOnce(ctx context.Context, cause error) {
-	if a.pipelineWarnedFallback {
+	// CompareAndSwap so the WARN fires exactly once even when multiple ADR-0138
+	// concurrent apply lanes hit the fallback simultaneously (race-free).
+	if !a.pipelineWarnedFallback.CompareAndSwap(false, true) {
 		return
 	}
-	a.pipelineWarnedFallback = true
 	slog.WarnContext(ctx,
 		"postgres: applier: pipelined CDC apply unavailable — falling back to serial per-row exec "+
 			"(no throughput improvement on high-latency links; ADR-0092)",

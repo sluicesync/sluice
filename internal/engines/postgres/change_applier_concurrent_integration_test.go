@@ -38,6 +38,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -142,6 +143,47 @@ func TestConcurrentApply_DependentOrderingAndExactlyOnce(t *testing.T) {
 	pumpConcurrentChanges(t, ctx, a, testStreamID, events, 7)
 	if got := countAllRows(t, dsn, "conc_dep"); got != keys/2 {
 		t.Errorf("after replay: rows = %d; want %d (idempotency violated)", got, keys/2)
+	}
+}
+
+// TestConcurrentApply_UsesPipelinedPath pins ADR-0138 (Bug 168): the concurrent
+// lane path must apply via the pipelined SendBatch path (one round trip per lane
+// batch), NOT the serial per-row fallback. This guards a regression the
+// value-fidelity / exactly-once differentials cannot catch — serial is also
+// correct, so a silent fall-back to it would pass every other pin while making
+// apply RTT-bound again over WAN. The lanePipelinedTakenForTest hook fires once
+// per lane batch that began a pipelined tx; we assert it fired.
+func TestConcurrentApply_UsesPipelinedPath(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+
+	applyPGApplier(t, dsn, `CREATE TABLE conc_pipelined (id BIGINT PRIMARY KEY, v TEXT NOT NULL);`)
+
+	var pipelinedBatches atomic.Int64
+	lanePipelinedTakenForTest = func() { pipelinedBatches.Add(1) }
+	defer func() { lanePipelinedTakenForTest = nil }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	a := openConcurrentApplier(t, ctx, dsn, concurrentLanesW)
+	defer func() { _ = a.Close() }()
+
+	const keys = 400
+	var events []ir.Change
+	seq := 0
+	tok := func() string { seq++; return fmt.Sprintf("p-%06d", seq) }
+	for i := int64(1); i <= keys; i++ {
+		events = append(events, ir.Insert{Position: cpos(tok()), Schema: "public", Table: "conc_pipelined", Row: ir.Row{"id": i, "v": "x"}})
+	}
+
+	pumpConcurrentChanges(t, ctx, a, testStreamID, events, 16)
+
+	if got := countAllRows(t, dsn, "conc_pipelined"); got != keys {
+		t.Fatalf("rows = %d; want %d", got, keys)
+	}
+	if n := pipelinedBatches.Load(); n == 0 {
+		t.Fatal("concurrent lane path did not take the pipelined SendBatch path " +
+			"(ADR-0138 regression: fell back to serial per-row exec — apply would be RTT-bound over WAN, Bug 168)")
 	}
 }
 
