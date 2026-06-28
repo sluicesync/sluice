@@ -32,6 +32,7 @@ import (
 	// Engine packages are imported for their init() side effects, which
 	// register them with the engines registry. Add a new engine by
 	// importing its package here.
+	_ "sluicesync.dev/sluice/internal/engines/d1-trigger"
 	"sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/pgtrigger"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"

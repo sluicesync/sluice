@@ -7,15 +7,13 @@ import (
 	"context"
 	"fmt"
 
-	"sluicesync.dev/sluice/internal/engines/sqlite"
 	"sluicesync.dev/sluice/internal/ir"
 )
 
 // OpenSnapshotStream opens a trigger-native consistent snapshot + CDC handoff
-// (ADR-0135 §4). It pairs the cold-start bulk-copy reader (the delegated
-// [sqlite.Engine] RowReader — full storage-class fidelity, within-table chunking,
-// the ADR-0129 date/bool policy) with the trigger CDC poller, anchored so the
-// union covers every row exactly once with no gap and no double-apply-loss.
+// (ADR-0135 §4) for a local SQLite FILE. It delegates to [openSnapshotStream]
+// with the local backend; the D1 engine (ADR-0136) calls the same shared
+// function with the D1 backend via [OpenD1SnapshotStream].
 //
 // # Gap-freedom (why MAX(id) read BEFORE the snapshot is sufficient for SQLite)
 //
@@ -36,34 +34,39 @@ import (
 // is NOT commit-ordered (a low id can commit after a higher one, and rolled-back
 // txns leave gaps), forcing its contiguous-committed-prefix anchor + xmin
 // safety-lag. SQLite needs neither: the single-writer total order makes the naive
-// MAX(id)-before-snapshot anchor gap-free.
+// MAX(id)-before-snapshot anchor gap-free. On D1 the same holds at the primary
+// query path (writes serialised per database; ADR-0136 §4).
 //
 // Lifecycle: Rows and Changes own independent read connections; ReleaseRows
 // closes the bulk-copy reader and Close stops the poller + closes both.
 func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.SnapshotStream, error) {
+	return openSnapshotStream(ctx, localBackend(dsn))
+}
+
+// openSnapshotStream is the transport-neutral snapshot→CDC handoff used by both
+// the local file engine and the D1 engine (ADR-0136). The backend supplies the
+// cold-start row reader, the executor (for the anchor read + the change-log
+// preflight), and the CDC reader.
+func openSnapshotStream(ctx context.Context, b backend) (*ir.SnapshotStream, error) {
 	// Refuse loudly when the change-log is absent — the operator forgot
 	// `sluice trigger setup`. Fire it here so cold-start aborts before any data
-	// moves rather than mid-stream. Use a short-lived read connection for the
-	// preflight + anchor read.
-	anchorDB, _, err := sqlite.OpenFile(ctx, dsn, true)
+	// moves rather than mid-stream. Use a short-lived executor for the preflight
+	// + anchor read (captured BEFORE the Rows reader — the happens-before edge the
+	// gap-freedom argument needs).
+	anchorExec, err := b.openExec(ctx, true)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite-trigger: snapshot: open: %w", err)
 	}
-	if exists, err := changeLogTableExists(ctx, anchorDB); err != nil {
-		_ = anchorDB.Close()
+	if exists, err := anchorExec.changeLogExists(ctx); err != nil {
+		_ = anchorExec.close()
 		return nil, fmt.Errorf("sqlite-trigger: snapshot: preflight: %w", err)
 	} else if !exists {
-		_ = anchorDB.Close()
-		return nil, fmt.Errorf(
-			"sqlite-trigger: %s does not exist on the source — run `sluice trigger setup --source-driver sqlite-trigger --dsn=... --tables=...` before starting the stream",
-			ChangeLogTable,
-		)
+		_ = anchorExec.close()
+		return nil, changeLogAbsentErr(b.driver)
 	}
 
-	// Capture the anchor BEFORE constructing the Rows reader (the happens-before
-	// edge the gap-freedom argument above needs).
-	anchor, err := readChangeLogMaxID(ctx, anchorDB)
-	_ = anchorDB.Close()
+	anchor, err := anchorExec.maxChangeLogID(ctx)
+	_ = anchorExec.close()
 	if err != nil {
 		return nil, fmt.Errorf("sqlite-trigger: snapshot: read CDC anchor: %w", err)
 	}
@@ -72,14 +75,14 @@ func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.Snapsho
 		return nil, fmt.Errorf("sqlite-trigger: snapshot: encode position: %w", err)
 	}
 
-	// Rows: the delegated cold-start reader (its own read-only pool).
-	rowReader, err := e.sq.OpenRowReader(ctx, dsn)
+	// Rows: the delegated cold-start reader (its own read connection).
+	rowReader, err := b.coldStart.OpenRowReader(ctx, b.dsn)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite-trigger: snapshot: open row reader: %w", err)
 	}
 
-	// Changes: the trigger poller, resuming from the anchor (its own pool).
-	cdcReader, err := openCDCReader(ctx, dsn)
+	// Changes: the trigger poller, resuming from the anchor (its own executor).
+	cdcReader, err := openCDCReaderBackend(ctx, b)
 	if err != nil {
 		_ = closeReader(rowReader)
 		return nil, fmt.Errorf("sqlite-trigger: snapshot: open cdc reader: %w", err)

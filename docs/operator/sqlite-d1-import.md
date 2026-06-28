@@ -206,13 +206,64 @@ after a schema change, the stream will not start (it never silently mis-captures
 change-log, meta, and column-fingerprint tables are auto-skipped by the schema reader, so
 they are never themselves migrated or captured.
 
+## Continuous sync from a LIVE Cloudflare D1: the `d1-trigger` CDC source (ADR-0136)
+
+The `sqlite-trigger` design above runs unchanged against a **live Cloudflare D1 database**
+over D1's HTTP query API — the `d1-trigger` engine (ADR-0136). It is the same trigger +
+change-log + polling design (the setup DDL, the trigger bodies, the change-log/meta/
+fingerprint schema, the poll, the watermark, the `MAX(id)` snapshot anchor, and the
+schema-drift refusal are all identical); only the transport differs (the D1 `/query` API
+instead of a local connection). So a live D1 can stream continuous logical CDC to Postgres
+or MySQL.
+
+**Setup over the API.** Credentials are resolved exactly as for `--source-driver d1`: the
+DSN is `d1://<account_id>/<database_id>` (or `d1://<database_id>` with
+`CLOUDFLARE_ACCOUNT_ID`), and the API token is read from `CLOUDFLARE_API_TOKEN` ONLY (never
+a flag, never logged). Installing the triggers MODIFIES your D1 database, so use a real/test
+D1 you control:
+
+```sh
+export CLOUDFLARE_API_TOKEN=...   # a D1:Edit token (CREATE TABLE/TRIGGER over /query)
+sluice trigger setup --source-driver d1-trigger \
+  --dsn d1://<account_id>/<database_id> --tables=users,orders
+
+sluice sync start --source-driver d1-trigger \
+  --source d1://<account_id>/<database_id> \
+  --target-driver postgres --target 'postgres://user:pass@host:5432/db?sslmode=require'
+
+# remove every artifact when done (drops the triggers + change-log; --keep-data to retain):
+sluice trigger teardown --source-driver d1-trigger \
+  --dsn d1://<account_id>/<database_id> --yes
+```
+
+The cold-start snapshot reuses the lossless `d1` query-API reader (the CAST/typeof
+projection, so integers > 2^53 survive), and the CDC tail polls the change-log over the same
+transport — big integers and blobs round-trip **exact**, identical to the local engine.
+
+**Primary-consistency (load-bearing).** The poll uses D1's DEFAULT primary
+(strongly-consistent) query path, NOT D1's Sessions / read-replica routing. The exactly-once
+`id > watermark` guarantee rests on commit-order = id-order, which holds at the
+write-serialised primary but can wobble against a lagging replica; a replica-aware mode would
+have to re-introduce a safety-lag (ADR-0136 §4).
+
+**Caveats specific to D1.** (1) **Write amplification + billing:** every D1 write fires a
+trigger that writes a change-log row — on D1 that is billable rows-written and storage, and
+the change-log grows unbounded until the change-log-retention follow-up. (2) **Polling
+latency + API rate limits:** CDC latency is the poll interval (default 1s) + HTTP round-trip;
+keep the cadence within D1's request-rate limits. (3) Schema changes need a re-setup, with the
+same loud schema-drift refusal as the local engine (above). The token needs D1:Edit (the
+setup runs `CREATE TABLE`/`CREATE TRIGGER` over `/query`).
+
 ## Known limits (prototype scope)
 
-Deferred follow-ups: trigger-CDC **Phase 2** (a Cloudflare-D1-over-HTTP variant of
-`sqlite-trigger`, schema-change forwarding, and capture-payload trimming / change-log
-retention — ADR-0135), a per-column date-encoding map (the global flag + `--type-override`
-cover the common and outlier cases — ADR-0129), and a SQLite→canonical expression
-translator for the verbatim generated/CHECK/index bodies described above (ADR-0133).
+Deferred follow-ups: trigger-CDC **Phase 3** (schema-change forwarding, capture-payload
+trimming, change-log retention/pruning — more urgent on D1 because writes/storage are
+billable — and a replica-aware poll mode; ADR-0135 / ADR-0136), a per-column date-encoding
+map (the global flag + `--type-override` cover the common and outlier cases — ADR-0129), and
+a SQLite→canonical expression translator for the verbatim generated/CHECK/index bodies
+described above (ADR-0133).
 (Within-table parallel-copy chunking for the binary `.db` path now ships — see "Big tables
 parallel-copy" above; a `.sql`-dump source stays single-reader by design. Continuous CDC
-from a local SQLite file now ships — see "Continuous sync" above.)
+from a local SQLite file now ships — see "Continuous sync" above — as does continuous CDC
+from a live Cloudflare D1 database over the HTTP query API — see "Continuous sync from a
+LIVE Cloudflare D1" above.)

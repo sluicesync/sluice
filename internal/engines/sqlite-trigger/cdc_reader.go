@@ -7,7 +7,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -33,20 +32,22 @@ const committedAtLayout = "2006-01-02 15:04:05.999"
 
 // CDCReader is the trigger-engine CDC reader. It polls `sluice_change_log` at a
 // configurable cadence (default 1s) and emits [ir.Change] events via the channel
-// returned from [StreamChanges].
+// returned from [StreamChanges]. It is transport-neutral: the underlying
+// [executor] is either a local *sql.DB (Phase 1) or the D1 `/query` HTTP API
+// (Phase 2, ADR-0136); the poll/decode logic above it is identical.
 //
 // One reader → one [StreamChanges] call. Concurrent calls are not supported; the
-// polling goroutine owns the underlying *sql.DB pool for the lifetime of the
-// stream. The reader emits NO [ir.TxBegin]/[ir.TxCommit] markers (a change-log
-// row carries no source-transaction grouping), so it is a marker-less stream —
-// exactly like pgtrigger; the Streamer's checkpoint cadence persists the
-// watermark (the pgtrigger Bug-159 contract applies identically here).
+// polling goroutine owns the executor for the lifetime of the stream. The reader
+// emits NO [ir.TxBegin]/[ir.TxCommit] markers (a change-log row carries no
+// source-transaction grouping), so it is a marker-less stream — exactly like
+// pgtrigger; the Streamer's checkpoint cadence persists the watermark (the
+// pgtrigger Bug-159 contract applies identically here).
 type CDCReader struct {
-	db  *sql.DB
-	dec *sqlite.CapturedCellDecoder
+	exec executor
+	dec  *sqlite.CapturedCellDecoder
 
 	// colTypes maps table → column-name → resolved IR type, read once at open
-	// from the validated SQLite schema reader so each captured cell decodes
+	// from the validated cold-start schema reader so each captured cell decodes
 	// through the SAME storage-class-faithful path as a cold-start row.
 	colTypes map[string]map[string]ir.Type
 
@@ -60,47 +61,52 @@ type CDCReader struct {
 	err error
 }
 
-// openCDCReader constructs a [CDCReader] bound to dsn (a SQLite file path/URI).
-// It resolves the per-source date/bool policy, reads the schema once to build
-// the column-type lookup, opens a read-only poll connection, and refuses loudly
-// when the change-log table is absent — the operator forgot to run
-// `sluice trigger setup`. The refusal fires at open time so the streamer
-// surfaces it before any data moves.
+// openCDCReader constructs a [CDCReader] for a local SQLite FILE (Phase 1,
+// ADR-0135). It is the byte-identical entry point the file engine + the
+// unit/integration tests use; it delegates to [openCDCReaderBackend] with the
+// local backend.
 func openCDCReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
-	dec, err := sqlite.NewCapturedCellDecoderForDSN(dsn)
+	return openCDCReaderBackend(ctx, localBackend(dsn))
+}
+
+// openCDCReaderBackend constructs a [CDCReader] against any [backend]. It
+// resolves the captured-cell decoder, reads the schema once to build the
+// column-type lookup + the live fingerprints, opens a read-only executor, and
+// refuses loudly when the change-log table is absent (the operator forgot to run
+// `sluice trigger setup`) or when the source schema has drifted since setup. The
+// refusals fire at open time so the streamer surfaces them before any data moves.
+func openCDCReaderBackend(ctx context.Context, b backend) (ir.CDCReader, error) {
+	dec, err := b.newDecoder()
 	if err != nil {
 		return nil, fmt.Errorf("sqlite-trigger: cdc: resolve date encoding: %w", err)
 	}
-	colTypes, liveFingerprints, err := loadColumnTypes(ctx, dsn)
+	colTypes, liveFingerprints, err := loadColumnTypes(ctx, b.coldStart, b.dsn)
 	if err != nil {
 		return nil, err
 	}
 
-	db, _, err := sqlite.OpenFile(ctx, dsn, true)
+	exec, err := b.openExec(ctx, true)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite-trigger: cdc open: %w", err)
 	}
-	if exists, err := changeLogTableExists(ctx, db); err != nil {
-		_ = db.Close()
+	if exists, err := exec.changeLogExists(ctx); err != nil {
+		_ = exec.close()
 		return nil, fmt.Errorf("sqlite-trigger: cdc preflight: %w", err)
 	} else if !exists {
-		_ = db.Close()
-		return nil, fmt.Errorf(
-			"sqlite-trigger: %s does not exist on the source — run `sluice trigger setup --source-driver sqlite-trigger --dsn=... --tables=...` before starting the stream",
-			ChangeLogTable,
-		)
+		_ = exec.close()
+		return nil, changeLogAbsentErr(b.driver)
 	}
-	// Refuse loudly on un-re-setup source schema drift (ADR-0135). SQLite has no
-	// DDL triggers in Phase 1, so an ADD/DROP/RENAME COLUMN after setup leaves
-	// the triggers capturing a stale column set — and an ADD COLUMN would
-	// SILENTLY drop the new column from the stream. The startup fingerprint check
-	// catches BOTH directions before any data moves.
-	if err := verifyNoSchemaDrift(ctx, db, liveFingerprints); err != nil {
-		_ = db.Close()
+	// Refuse loudly on un-re-setup source schema drift (ADR-0135). SQLite/D1 have
+	// no DDL triggers, so an ADD/DROP/RENAME COLUMN after setup leaves the
+	// triggers capturing a stale column set — and an ADD COLUMN would SILENTLY
+	// drop the new column from the stream. The startup fingerprint check catches
+	// BOTH directions before any data moves.
+	if err := verifyNoSchemaDrift(ctx, exec, liveFingerprints); err != nil {
+		_ = exec.close()
 		return nil, err
 	}
 	return &CDCReader{
-		db:           db,
+		exec:         exec,
 		dec:          dec,
 		colTypes:     colTypes,
 		pollInterval: defaultPollInterval,
@@ -108,14 +114,23 @@ func openCDCReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
 	}, nil
 }
 
-// loadColumnTypes reads the SQLite schema once and builds (1) table → column → IR
-// type for per-cell decode and (2) table → captured-column FINGERPRINT (the
-// canonical ordered non-generated column list, [columnFingerprint]) for the
-// startup drift check. Reuses the validated [sqlite.Engine] schema reader so both
-// match the cold-start reader exactly. The change-log/meta/columns tables are
-// already skipped by that reader (ADR-0135).
-func loadColumnTypes(ctx context.Context, dsn string) (colTypes map[string]map[string]ir.Type, fingerprints map[string]string, err error) {
-	sr, err := (sqlite.Engine{}).OpenSchemaReader(ctx, dsn)
+// changeLogAbsentErr is the shared "you forgot `trigger setup`" refusal, naming
+// the actual source-driver so the recovery command is copy-pasteable.
+func changeLogAbsentErr(driver string) error {
+	return fmt.Errorf(
+		"sqlite-trigger: %s does not exist on the source — run "+
+			"`sluice trigger setup --source-driver %s --dsn=... --tables=...` before starting the stream",
+		ChangeLogTable, driver,
+	)
+}
+
+// loadColumnTypes reads the schema once (via the cold-start engine's schema
+// reader, so types + the captured column set match the cold-start reader exactly)
+// and builds (1) table → column → IR type for per-cell decode and (2) table →
+// captured-column FINGERPRINT for the startup drift check. The change-log/meta/
+// columns tables are already skipped by that reader (ADR-0135).
+func loadColumnTypes(ctx context.Context, coldStart ir.Engine, dsn string) (colTypes map[string]map[string]ir.Type, fingerprints map[string]string, err error) {
+	sr, err := coldStart.OpenSchemaReader(ctx, dsn)
 	if err != nil {
 		return nil, nil, fmt.Errorf("sqlite-trigger: cdc: open schema reader: %w", err)
 	}
@@ -145,8 +160,8 @@ func loadColumnTypes(ctx context.Context, dsn string) (colTypes map[string]map[s
 // decode check never fires), but the new column's values would vanish from the
 // stream — caught here at stream start instead. A DROP/RENAME (live set differs)
 // and a dropped table (live fingerprint absent) are caught the same way.
-func verifyNoSchemaDrift(ctx context.Context, db *sql.DB, liveFingerprints map[string]string) error {
-	rows, err := db.QueryContext(ctx, `SELECT tbl, columns FROM "`+ChangeLogColumnsTable+`" ORDER BY tbl`)
+func verifyNoSchemaDrift(ctx context.Context, exec executor, liveFingerprints map[string]string) error {
+	fps, err := exec.readFingerprints(ctx)
 	if err != nil {
 		// The columns table is created alongside the change-log (and dropped with
 		// it), so "change-log exists ⟹ columns exists". A missing/erroring table
@@ -157,28 +172,23 @@ func verifyNoSchemaDrift(ctx context.Context, db *sql.DB, liveFingerprints map[s
 			ChangeLogColumnsTable, err,
 		)
 	}
-	defer func() { _ = rows.Close() }()
-	for rows.Next() {
-		var tbl, captured string
-		if err := rows.Scan(&tbl, &captured); err != nil {
-			return fmt.Errorf("sqlite-trigger: scan captured-column fingerprint: %w", err)
-		}
-		live, ok := liveFingerprints[tbl]
+	for _, fp := range fps {
+		live, ok := liveFingerprints[fp.tbl]
 		if !ok {
 			return fmt.Errorf(
 				"sqlite-trigger: table %q has capture triggers installed but no longer exists in the source schema; "+
-					"re-run `sluice trigger setup` after a schema change (Phase 1 does not forward DDL)", tbl,
+					"re-run `sluice trigger setup` after a schema change (Phase 1 does not forward DDL)", fp.tbl,
 			)
 		}
-		if live != captured {
+		if live != fp.columns {
 			return fmt.Errorf(
 				"sqlite-trigger: table %q schema has drifted since `trigger setup` (captured columns %s, live columns %s); "+
 					"the stale triggers would mis-capture (an ADD COLUMN would be SILENTLY dropped) — "+
-					"re-run `sluice trigger setup` (Phase 1 does not forward DDL)", tbl, captured, live,
+					"re-run `sluice trigger setup` (Phase 1 does not forward DDL)", fp.tbl, fp.columns, live,
 			)
 		}
 	}
-	return rows.Err()
+	return nil
 }
 
 // SetPollInterval overrides the default 1s poll cadence. Idempotent; must be
@@ -192,15 +202,15 @@ func (r *CDCReader) SetPollInterval(d time.Duration) {
 	}
 }
 
-// Close releases the underlying connection pool and stops any in-flight polling
+// Close releases the underlying executor and stops any in-flight polling
 // goroutine.
 func (r *CDCReader) Close() error {
 	if r.pumpCancel != nil {
 		r.pumpCancel()
 	}
-	if r.db != nil {
-		err := r.db.Close()
-		r.db = nil
+	if r.exec != nil {
+		err := r.exec.close()
+		r.exec = nil
 		return err
 	}
 	return nil
@@ -244,7 +254,7 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 	if ok {
 		startID = pos.LastID
 	} else {
-		startID, err = readChangeLogMaxID(ctx, r.db)
+		startID, err = r.exec.maxChangeLogID(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("sqlite-trigger: stream: read MAX(id) start anchor: %w", err)
 		}
@@ -264,9 +274,11 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 // batch. SQLite serialises writers, so the change-log id is allocated in COMMIT
 // order and a plain `id > lastSeen` scan is gap-free — NO safety-lag predicate
 // is needed (the load-bearing simplification over pgtrigger, whose PG bigserial
-// can commit out of allocation order; see ADR-0135 §3 / readChangeLogAnchor).
-// When a poll returns a full batch the next poll fires immediately so a bursty
-// source isn't throttled by the cadence.
+// can commit out of allocation order; see ADR-0135 §3). On D1 the same holds:
+// the poll uses the PRIMARY (strongly-consistent) query path, where writes are
+// serialised per database, so id-order = commit-order (ADR-0136 §4) — NOT a
+// lagging read replica. When a poll returns a full batch the next poll fires
+// immediately so a bursty source isn't throttled by the cadence.
 func (r *CDCReader) pump(ctx context.Context, startID int64, out chan<- ir.Change) {
 	lastSeen := startID
 	timer := time.NewTimer(0) // fire immediately on the first iteration
@@ -303,37 +315,20 @@ func (r *CDCReader) pump(ctx context.Context, startID int64, out chan<- ir.Chang
 // poll runs one id-ordered fetch and decodes each change-log row into an
 // [ir.Change]. A zero-row return is the steady-state "nothing new" shape.
 func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (events []ir.Change, newLast int64, err error) {
-	const q = "SELECT id, op, tbl, before, after, captured_at FROM " +
-		`"` + ChangeLogTable + `" WHERE id > ? ORDER BY id ASC LIMIT ?`
-	//nolint:rowserrcheck,sqlclosecheck // closed via defer below; linter can't track the early-return path
-	rows, qErr := r.db.QueryContext(ctx, q, lastSeen, r.batchSize)
+	raws, qErr := r.exec.pollChangeLog(ctx, lastSeen, r.batchSize)
 	if qErr != nil {
 		return nil, lastSeen, qErr
 	}
-	defer func() { _ = rows.Close() }()
 	newLast = lastSeen
-	for rows.Next() {
-		var (
-			id         int64
-			op, tbl    string
-			beforeJSON sql.NullString
-			afterJSON  sql.NullString
-			capturedAt sql.NullString
-		)
-		if err := rows.Scan(&id, &op, &tbl, &beforeJSON, &afterJSON, &capturedAt); err != nil {
-			return nil, lastSeen, fmt.Errorf("scan row: %w", err)
+	for _, rc := range raws {
+		if rc.id > newLast {
+			newLast = rc.id
 		}
-		if id > newLast {
-			newLast = id
-		}
-		ev, err := r.buildChange(id, op, tbl, beforeJSON, afterJSON, commitTime(capturedAt))
+		ev, err := r.buildChange(rc.id, rc.op, rc.tbl, rc.before, rc.after, commitTime(rc.capturedAt))
 		if err != nil {
 			return nil, lastSeen, err
 		}
 		events = append(events, ev)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, lastSeen, fmt.Errorf("iter rows: %w", err)
 	}
 	if len(events) > 0 {
 		slog.DebugContext(ctx, "sqlite-trigger: poll batch",
@@ -442,33 +437,6 @@ func commitTime(capturedAt sql.NullString) time.Time {
 		return time.Time{}
 	}
 	return tm.UTC()
-}
-
-// changeLogTableExists reports whether the change-log table is present.
-func changeLogTableExists(ctx context.Context, db *sql.DB) (bool, error) {
-	var name string
-	err := db.QueryRowContext(ctx,
-		"SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", ChangeLogTable).Scan(&name)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-// readChangeLogMaxID returns COALESCE(MAX(id), 0) — the "from now" / snapshot
-// anchor.
-func readChangeLogMaxID(ctx context.Context, db *sql.DB) (int64, error) {
-	var id sql.NullInt64
-	if err := db.QueryRowContext(ctx, `SELECT MAX(id) FROM "`+ChangeLogTable+`"`).Scan(&id); err != nil {
-		return 0, err
-	}
-	if !id.Valid {
-		return 0, nil
-	}
-	return id.Int64, nil
 }
 
 // Compile-time check that [CDCReader] implements [ir.CDCReader].

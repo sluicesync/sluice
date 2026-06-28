@@ -18,11 +18,15 @@ import (
 // commands install/remove. The default ("postgres-trigger") preserves the
 // original PG-only behaviour; "sqlite-trigger" (ADR-0135) installs the
 // change-log + per-table capture triggers in a local SQLite file (the --dsn is
-// the file path). The PG-only flags (--schema, --allow-polled-fingerprint,
-// --capture-payload) do not apply to the SQLite engine and are ignored there.
+// the file path); "d1-trigger" (ADR-0136) installs the SAME state on a live
+// Cloudflare D1 database over the HTTP query API (the --dsn is the d1:// form;
+// the token is env-only, CLOUDFLARE_API_TOKEN). The PG-only flags (--schema,
+// --allow-polled-fingerprint, --capture-payload) do not apply to the SQLite/D1
+// engines and are ignored there.
 const (
-	triggerDriverPostgres = pgtrigger.EngineName     // "postgres-trigger"
-	triggerDriverSQLite   = sqlitetrigger.EngineName // "sqlite-trigger"
+	triggerDriverPostgres = pgtrigger.EngineName       // "postgres-trigger"
+	triggerDriverSQLite   = sqlitetrigger.EngineName   // "sqlite-trigger"
+	triggerDriverD1       = sqlitetrigger.EngineNameD1 // "d1-trigger"
 )
 
 // TriggerCmd groups the operator-facing trigger-engine setup +
@@ -45,10 +49,10 @@ type TriggerCmd struct {
 // flow. The command refuses-loudly on any §14 boundary (no-PK,
 // UNLOGGED, generated columns, custom domain-over-UDT).
 type TriggerSetupCmd struct {
-	SourceDriver string   `help:"Trigger-CDC source engine to install: 'postgres-trigger' (default) or 'sqlite-trigger' (a local SQLite file; --dsn is the file path)." enum:"postgres-trigger,sqlite-trigger" default:"postgres-trigger"`
-	DSN          string   `help:"Source DSN. For postgres-trigger: a PG DSN (URI or libpq KV form; the connecting role needs CREATE on the target schema, TRIGGER on each replicated table, and INSERT on sluice_change_log). For sqlite-trigger: the SQLite file path." required:"" placeholder:"DSN"`
+	SourceDriver string   `help:"Trigger-CDC source engine to install: 'postgres-trigger' (default), 'sqlite-trigger' (a local SQLite file; --dsn is the file path), or 'd1-trigger' (a live Cloudflare D1 database over the HTTP query API; --dsn is the d1:// form, token env-only)." enum:"postgres-trigger,sqlite-trigger,d1-trigger" default:"postgres-trigger"`
+	DSN          string   `help:"Source DSN. For postgres-trigger: a PG DSN (URI or libpq KV form; the connecting role needs CREATE on the target schema, TRIGGER on each replicated table, and INSERT on sluice_change_log). For sqlite-trigger: the SQLite file path. For d1-trigger: d1://<account_id>/<database_id> (or d1://<database_id> + CLOUDFLARE_ACCOUNT_ID); the API token is read from CLOUDFLARE_API_TOKEN." required:"" placeholder:"DSN"`
 	Tables       []string `help:"Tables to install per-table capture triggers on (comma-separated, repeatable). Required for v1; empty-list discovery is a follow-up." required:"" sep:"," placeholder:"TABLE"`
-	Schema       string   `help:"PG schema (namespace) the change-log + capture function + per-table triggers live in. Defaults to the DSN's 'schema' query parameter (typically 'public'). Ignored for sqlite-trigger (flat namespace)." placeholder:"NAME"`
+	Schema       string   `help:"PG schema (namespace) the change-log + capture function + per-table triggers live in. Defaults to the DSN's 'schema' query parameter (typically 'public'). Ignored for sqlite-trigger / d1-trigger (flat namespace)." placeholder:"NAME"`
 	DryRun       bool     `help:"Print the DDL the command would apply and exit; no source-side state is modified." short:"n"`
 
 	AllowPolledFingerprint bool `help:"Opt in to the polled schema-fingerprint fallback (§7) on tiers that deny event-trigger creation. Default off: the engine refuses-loudly on such tiers so the operator explicitly acknowledges the weaker DDL-detection mode."`
@@ -64,8 +68,11 @@ func (c *TriggerSetupCmd) Run(_ *Globals) error {
 	if len(c.Tables) == 0 {
 		return errors.New("--tables is required for v1 (pass --tables=t1,t2,...)")
 	}
-	if c.SourceDriver == triggerDriverSQLite {
-		return c.runSQLite()
+	switch c.SourceDriver {
+	case triggerDriverSQLite:
+		return c.runSQLiteLike(triggerDriverSQLite, sqlitetrigger.Setup)
+	case triggerDriverD1:
+		return c.runSQLiteLike(triggerDriverD1, sqlitetrigger.SetupD1)
 	}
 	ctx := kongContext()
 	plan, err := pgtrigger.Setup(ctx, c.DSN, pgtrigger.SetupOptions{
@@ -108,12 +115,17 @@ func (c *TriggerSetupCmd) Run(_ *Globals) error {
 	return nil
 }
 
-// runSQLite handles `sluice trigger setup --source-driver sqlite-trigger`
-// (ADR-0135): it installs the change-log + per-table capture triggers in the
-// local SQLite file named by --dsn. The PG-only flags are not applicable here.
-func (c *TriggerSetupCmd) runSQLite() error {
+// runSQLiteLike handles `sluice trigger setup` for the SQLite-family engines —
+// 'sqlite-trigger' (ADR-0135, a local file) and 'd1-trigger' (ADR-0136, a live
+// D1 over HTTP). Both install the SAME change-log + per-table capture triggers
+// and share identical CLI output; only the installer (setupFn) and the label
+// differ. The PG-only flags are not applicable here.
+func (c *TriggerSetupCmd) runSQLiteLike(
+	label string,
+	setupFn func(context.Context, string, sqlitetrigger.SetupOptions) (*sqlitetrigger.Plan, error),
+) error {
 	ctx := kongContext()
-	plan, err := sqlitetrigger.Setup(ctx, c.DSN, sqlitetrigger.SetupOptions{
+	plan, err := setupFn(ctx, c.DSN, sqlitetrigger.SetupOptions{
 		Tables: c.Tables,
 		DryRun: c.DryRun,
 	})
@@ -128,14 +140,14 @@ func (c *TriggerSetupCmd) runSQLite() error {
 		return err
 	}
 	if c.DryRun {
-		fmt.Fprintf(os.Stdout, "-- sqlite-trigger setup --dry-run (%d statement(s)) --\n", len(plan.Statements))
+		fmt.Fprintf(os.Stdout, "-- %s setup --dry-run (%d statement(s)) --\n", label, len(plan.Statements))
 		for _, s := range plan.Statements {
 			fmt.Fprintln(os.Stdout, s+";")
 			fmt.Fprintln(os.Stdout)
 		}
 		return nil
 	}
-	fmt.Fprintf(os.Stdout, "sqlite-trigger setup applied (%d statement(s))\n", len(plan.Statements))
+	fmt.Fprintf(os.Stdout, "%s setup applied (%d statement(s))\n", label, len(plan.Statements))
 	return nil
 }
 
@@ -148,10 +160,10 @@ func (c *TriggerSetupCmd) runSQLite() error {
 // confirmation prompt fires by default; --yes skips it for
 // scripted/CI use.
 type TriggerTeardownCmd struct {
-	SourceDriver string   `help:"Trigger-CDC source engine to tear down: 'postgres-trigger' (default) or 'sqlite-trigger'." enum:"postgres-trigger,sqlite-trigger" default:"postgres-trigger"`
-	DSN          string   `help:"Source DSN (PG DSN for postgres-trigger; SQLite file path for sqlite-trigger)." required:"" placeholder:"DSN"`
+	SourceDriver string   `help:"Trigger-CDC source engine to tear down: 'postgres-trigger' (default), 'sqlite-trigger', or 'd1-trigger'." enum:"postgres-trigger,sqlite-trigger,d1-trigger" default:"postgres-trigger"`
+	DSN          string   `help:"Source DSN (PG DSN for postgres-trigger; SQLite file path for sqlite-trigger; d1:// form for d1-trigger, token via CLOUDFLARE_API_TOKEN)." required:"" placeholder:"DSN"`
 	Tables       []string `help:"Tables whose per-table triggers should be dropped. Empty (default) discovers every table with a sluice-installed trigger in the source." sep:"," placeholder:"TABLE"`
-	Schema       string   `help:"PG schema. Defaults to the DSN's 'schema' query parameter. Ignored for sqlite-trigger." placeholder:"NAME"`
+	Schema       string   `help:"PG schema. Defaults to the DSN's 'schema' query parameter. Ignored for sqlite-trigger / d1-trigger." placeholder:"NAME"`
 	KeepData     bool     `help:"Retain sluice_change_log (and the meta table) for forensics. Default drops them — the engine's promise is to remove every trace from the source."`
 	DryRun       bool     `help:"Print the DDL and exit." short:"n"`
 	Yes          bool     `help:"Skip the destructive-action confirmation prompt. Mirrors 'slot drop --yes'." short:"y"`
@@ -162,8 +174,11 @@ func (c *TriggerTeardownCmd) Run(_ *Globals) error {
 	if c.DSN == "" {
 		return errors.New("--dsn is required")
 	}
-	if c.SourceDriver == triggerDriverSQLite {
-		return c.runSQLite()
+	switch c.SourceDriver {
+	case triggerDriverSQLite:
+		return c.runSQLiteLike("sqlite-trigger", "SQLite source", sqlitetrigger.Teardown)
+	case triggerDriverD1:
+		return c.runSQLiteLike("d1-trigger", "Cloudflare D1 source", sqlitetrigger.TeardownD1)
 	}
 	if !c.DryRun && !c.Yes {
 		prompt := "Tear down the sluice trigger engine on the source (drop per-table triggers"
@@ -203,13 +218,20 @@ func (c *TriggerTeardownCmd) Run(_ *Globals) error {
 	return nil
 }
 
-// runSQLite handles `sluice trigger teardown --source-driver sqlite-trigger`
-// (ADR-0135): it drops the per-table capture triggers and (unless --keep-data)
-// the change-log + meta tables from the local SQLite file. The destructive
-// confirmation prompt fired in Run before this dispatch.
-func (c *TriggerTeardownCmd) runSQLite() error {
+// runSQLiteLike handles `sluice trigger teardown` for the SQLite-family engines —
+// 'sqlite-trigger' (ADR-0135, a local file) and 'd1-trigger' (ADR-0136, a live
+// D1 over HTTP). Both drop the per-table capture triggers and (unless
+// --keep-data) the change-log + meta + columns tables; only the remover
+// (teardownFn) and the labels differ. label is the engine name for the output
+// lines; sourceLabel names the source in the confirmation prompt. Installing
+// triggers MODIFIES the operator's database, so the destructive prompt fires for
+// D1 too (ADR-0136 §5).
+func (c *TriggerTeardownCmd) runSQLiteLike(
+	label, sourceLabel string,
+	teardownFn func(context.Context, string, sqlitetrigger.TeardownOptions) (*sqlitetrigger.Plan, error),
+) error {
 	if !c.DryRun && !c.Yes {
-		prompt := "Tear down the sluice trigger engine on the SQLite source (drop per-table triggers"
+		prompt := "Tear down the sluice trigger engine on the " + sourceLabel + " (drop per-table triggers"
 		if c.KeepData {
 			prompt += "; keep the change-log table)? [y/N] "
 		} else {
@@ -225,7 +247,7 @@ func (c *TriggerTeardownCmd) runSQLite() error {
 		}
 	}
 	ctx := kongContext()
-	plan, err := sqlitetrigger.Teardown(ctx, c.DSN, sqlitetrigger.TeardownOptions{
+	plan, err := teardownFn(ctx, c.DSN, sqlitetrigger.TeardownOptions{
 		Tables:   c.Tables,
 		KeepData: c.KeepData,
 		DryRun:   c.DryRun,
@@ -234,14 +256,14 @@ func (c *TriggerTeardownCmd) runSQLite() error {
 		return err
 	}
 	if c.DryRun {
-		fmt.Fprintf(os.Stdout, "-- sqlite-trigger teardown --dry-run (%d statement(s)) --\n", len(plan.Statements))
+		fmt.Fprintf(os.Stdout, "-- %s teardown --dry-run (%d statement(s)) --\n", label, len(plan.Statements))
 		for _, s := range plan.Statements {
 			fmt.Fprintln(os.Stdout, s+";")
 		}
 		return nil
 	}
-	fmt.Fprintf(os.Stdout, "sqlite-trigger teardown applied (%d statement(s); keep-data=%v)\n",
-		len(plan.Statements), c.KeepData)
+	fmt.Fprintf(os.Stdout, "%s teardown applied (%d statement(s); keep-data=%v)\n",
+		label, len(plan.Statements), c.KeepData)
 	return nil
 }
 

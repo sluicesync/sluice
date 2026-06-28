@@ -5,7 +5,6 @@ package sqlitetrigger
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -112,6 +111,13 @@ func (r TableRefusal) Error() string {
 // (the applier identifies CDC rows by PK). When opts.DryRun is true, no DDL is
 // applied; the returned Plan carries the statements that would have run.
 func Setup(ctx context.Context, dsn string, opts SetupOptions) (*Plan, error) {
+	return setup(ctx, localBackend(dsn), opts)
+}
+
+// setup is the transport-neutral installer used by both the local file engine
+// ([Setup]) and the D1 engine ([SetupD1], ADR-0136). The backend supplies the
+// cold-start schema reader (table-shape resolution) and the executor (DDL).
+func setup(ctx context.Context, b backend, opts SetupOptions) (*Plan, error) {
 	if len(opts.Tables) == 0 {
 		return nil, errors.New("sqlite-trigger: setup: no tables specified; pass --tables=t1,t2,…")
 	}
@@ -125,10 +131,10 @@ func Setup(ctx context.Context, dsn string, opts SetupOptions) (*Plan, error) {
 		return nil, errors.New("sqlite-trigger: setup: no user tables remain after excluding the engine's own internal tables")
 	}
 
-	// Resolve the requested tables' shapes from the validated SQLite schema
+	// Resolve the requested tables' shapes from the validated cold-start schema
 	// reader (so column lists, PKs, and generated-column flags match exactly what
 	// the cold-start reader sees — ADR-0135 reuse).
-	tables, err := resolveTables(ctx, dsn, opts.Tables)
+	tables, err := resolveTables(ctx, b.coldStart, b.dsn, opts.Tables)
 	if err != nil {
 		return nil, err
 	}
@@ -146,12 +152,12 @@ func Setup(ctx context.Context, dsn string, opts SetupOptions) (*Plan, error) {
 		return plan, nil
 	}
 
-	db, _, err := sqlite.OpenFile(ctx, dsn, false)
+	exec, err := b.openExec(ctx, false)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite-trigger: setup: open: %w", err)
 	}
-	defer func() { _ = db.Close() }()
-	if err := execAll(ctx, db, plan.Statements); err != nil {
+	defer func() { _ = exec.close() }()
+	if err := execAll(ctx, exec, plan.Statements); err != nil {
 		return plan, fmt.Errorf("sqlite-trigger: setup: %w", err)
 	}
 	return plan, nil
@@ -160,17 +166,24 @@ func Setup(ctx context.Context, dsn string, opts SetupOptions) (*Plan, error) {
 // Teardown removes the engine's source-side state. Idempotent — every DROP uses
 // IF EXISTS so re-running on a partially-uninstalled source proceeds cleanly.
 func Teardown(ctx context.Context, dsn string, opts TeardownOptions) (*Plan, error) {
-	db, _, err := sqlite.OpenFile(ctx, dsn, false)
+	return teardown(ctx, localBackend(dsn), opts)
+}
+
+// teardown is the transport-neutral remover used by both the local file engine
+// ([Teardown]) and the D1 engine ([TeardownD1], ADR-0136). The backend supplies
+// the executor (trigger discovery + DROP DDL).
+func teardown(ctx context.Context, b backend, opts TeardownOptions) (*Plan, error) {
+	exec, err := b.openExec(ctx, false)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite-trigger: teardown: open: %w", err)
 	}
-	defer func() { _ = db.Close() }()
+	defer func() { _ = exec.close() }()
 
 	var triggers []string
 	if len(opts.Tables) > 0 {
 		triggers = triggersForTables(opts.Tables)
 	} else {
-		triggers, err = discoverTriggers(ctx, db)
+		triggers, err = exec.discoverTriggers(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("sqlite-trigger: teardown: discover triggers: %w", err)
 		}
@@ -180,18 +193,19 @@ func Teardown(ctx context.Context, dsn string, opts TeardownOptions) (*Plan, err
 	if opts.DryRun {
 		return plan, nil
 	}
-	if err := execAll(ctx, db, plan.Statements); err != nil {
+	if err := execAll(ctx, exec, plan.Statements); err != nil {
 		return plan, fmt.Errorf("sqlite-trigger: teardown: %w", err)
 	}
 	return plan, nil
 }
 
-// resolveTables reads the SQLite schema and returns the requested tables in
+// resolveTables reads the source schema and returns the requested tables in
 // request order, erroring if any requested table is absent. Reuses the validated
-// [sqlite.Engine] schema reader so the captured column set matches the cold-start
-// reader's exactly (incl. generated-column detection).
-func resolveTables(ctx context.Context, dsn string, requested []string) ([]*ir.Table, error) {
-	sr, err := (sqlite.Engine{}).OpenSchemaReader(ctx, dsn)
+// cold-start schema reader (the `sqlite` file reader or the `d1` HTTP reader) so
+// the captured column set matches the cold-start reader's exactly (incl.
+// generated-column detection).
+func resolveTables(ctx context.Context, coldStart ir.Engine, dsn string, requested []string) ([]*ir.Table, error) {
+	sr, err := coldStart.OpenSchemaReader(ctx, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite-trigger: setup: open schema reader: %w", err)
 	}
@@ -390,27 +404,6 @@ func renderTeardownDDL(triggers []string, keepData bool) []string {
 	return out
 }
 
-// discoverTriggers lists every sluice-installed capture trigger in the file
-// (name LIKE 'sluice_capture_%'), so Teardown can drop them without the operator
-// re-supplying the table list. Ordered for stable dry-run output.
-func discoverTriggers(ctx context.Context, db *sql.DB) ([]string, error) {
-	const q = `SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'sluice\_capture\_%' ESCAPE '\' ORDER BY name`
-	rows, err := db.QueryContext(ctx, q)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	var out []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return nil, err
-		}
-		out = append(out, name)
-	}
-	return out, rows.Err()
-}
-
 // triggersForTables returns the three trigger names for each table (used when the
 // operator scopes teardown with --tables).
 func triggersForTables(tables []string) []string {
@@ -442,10 +435,11 @@ func filterInternal(tables []string) []string {
 	return out
 }
 
-// execAll runs each statement in order, wrapping a failure with its first line.
-func execAll(ctx context.Context, db *sql.DB, stmts []string) error {
+// execAll runs each statement in order over the executor, wrapping a failure
+// with its first line.
+func execAll(ctx context.Context, exec executor, stmts []string) error {
 	for _, stmt := range stmts {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
+		if err := exec.execDDL(ctx, stmt); err != nil {
 			return fmt.Errorf("exec %q: %w", firstLine(stmt), err)
 		}
 	}
