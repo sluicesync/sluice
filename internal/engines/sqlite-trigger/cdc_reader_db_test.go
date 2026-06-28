@@ -7,7 +7,9 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite" // pure-Go driver; lets these run in the unit gate (no Docker)
 
@@ -327,6 +329,94 @@ func TestSetup_RefusesNoPK(t *testing.T) {
 	}
 	if plan == nil || len(plan.Refusals) != 1 || plan.Refusals[0].Reason != "no-primary-key" {
 		t.Fatalf("want one no-primary-key refusal; got plan=%+v err=%v", plan, err)
+	}
+}
+
+// TestCapture_TemporalAndBoolFidelity pins the declared-temporal + boolean
+// families through the capture trigger surface (the Bug-74 corollary: the decode
+// is the shared ADR-0129 path, but the capture-trigger surface is new). It
+// exercises DATE/DATETIME under BOTH the `iso` and `unixepoch` encodings and
+// BOOLEAN, asserting the captured→reconstructed value equals what decodeCell
+// (the cold-start reader's same path) produces for the same stored value.
+func TestCapture_TemporalAndBoolFidelity(t *testing.T) {
+	// --- iso encoding (the default) ---
+	isoPath := newSourceFile(t, `CREATE TABLE t (
+		id INTEGER PRIMARY KEY,
+		dt DATETIME,
+		d  DATE,
+		bo BOOLEAN
+	)`)
+	if _, err := Setup(bg(), isoPath, SetupOptions{Tables: []string{"t"}}); err != nil {
+		t.Fatalf("Setup (iso): %v", err)
+	}
+	exec(t, isoPath, `INSERT INTO t (id, dt, d, bo) VALUES (1, '2023-01-15 12:30:45', '2023-01-15', 1)`)
+	exec(t, isoPath, `INSERT INTO t (id, dt, d, bo) VALUES (2, '2023-06-30 00:00:00', '2023-06-30', 0)`)
+
+	r1, err := openCDCReader(bg(), isoPath)
+	if err != nil {
+		t.Fatalf("openCDCReader (iso): %v", err)
+	}
+	defer func() { _ = r1.(interface{ Close() error }).Close() }()
+	iso := collect(t, r1, pos0(t), 2)
+	row1 := mustInsert(t, iso[0]).Row
+	assertEq(t, "iso.dt", row1["dt"], time.Date(2023, 1, 15, 12, 30, 45, 0, time.UTC))
+	assertEq(t, "iso.d", row1["d"], time.Date(2023, 1, 15, 0, 0, 0, 0, time.UTC))
+	assertEq(t, "iso.bo(true)", row1["bo"], true)
+	assertEq(t, "iso.bo(false)", mustInsert(t, iso[1]).Row["bo"], false)
+
+	// --- unixepoch encoding (DSN-scoped) ---
+	uxPath := newSourceFile(t, `CREATE TABLE t (
+		id INTEGER PRIMARY KEY,
+		dt DATETIME
+	)`)
+	if _, err := Setup(bg(), uxPath, SetupOptions{Tables: []string{"t"}}); err != nil {
+		t.Fatalf("Setup (unixepoch): %v", err)
+	}
+	const epoch = int64(1673785845) // 2023-01-15 12:30:45 UTC
+	exec(t, uxPath, `INSERT INTO t (id, dt) VALUES (1, ?)`, epoch)
+
+	r2, err := openCDCReader(bg(), uxPath+"?sqlite_date_encoding=unixepoch")
+	if err != nil {
+		t.Fatalf("openCDCReader (unixepoch): %v", err)
+	}
+	defer func() { _ = r2.(interface{ Close() error }).Close() }()
+	ux := collect(t, r2, pos0(t), 1)
+	assertEq(t, "unixepoch.dt", mustInsert(t, ux[0]).Row["dt"], time.Unix(epoch, 0).UTC())
+}
+
+// TestCapture_RefusesAddColumnDrift pins the MEDIUM silent-loss guard: an
+// ADD COLUMN after `trigger setup` without a re-setup leaves the stale trigger
+// capturing the OLD column set — every captured column is still present, so the
+// per-decode check never fires, and the new column's values would SILENTLY drop.
+// The startup fingerprint check must refuse loudly instead.
+func TestCapture_RefusesAddColumnDrift(t *testing.T) {
+	path := newSourceFile(t, `CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)`)
+	if _, err := Setup(bg(), path, SetupOptions{Tables: []string{"t"}}); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	exec(t, path, `INSERT INTO t (id, v) VALUES (1, 'a')`)
+	// Source schema change WITHOUT re-running setup.
+	exec(t, path, `ALTER TABLE t ADD COLUMN extra TEXT`)
+
+	_, err := openCDCReader(bg(), path)
+	if err == nil {
+		t.Fatal("openCDCReader should refuse: an un-re-setup ADD COLUMN would silently drop the new column")
+	}
+	if !strings.Contains(err.Error(), "drift") || !strings.Contains(err.Error(), "trigger setup") {
+		t.Errorf("drift refusal should name the drift + recovery action; got: %v", err)
+	}
+}
+
+// TestCapture_RefusesDroppedTableDrift pins the other direction: a replicated
+// table dropped after setup (live fingerprint absent) is refused at stream start.
+func TestCapture_RefusesDroppedTableDrift(t *testing.T) {
+	path := newSourceFile(t, `CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)`)
+	if _, err := Setup(bg(), path, SetupOptions{Tables: []string{"t"}}); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	exec(t, path, `DROP TABLE t`)
+	if _, err := openCDCReader(bg(), path); err == nil {
+		t.Fatal("openCDCReader should refuse when a replicated table no longer exists")
 	}
 }
 

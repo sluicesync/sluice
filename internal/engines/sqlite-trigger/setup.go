@@ -6,6 +6,7 @@ package sqlitetrigger
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -21,11 +22,12 @@ import (
 // never drift); the trigger names live here. Exported where the CLI dry-run
 // output and tests refer to them.
 const (
-	// ChangeLogTable and ChangeLogMetaTable mirror pgtrigger's names for
-	// operator familiarity; the literals live in the sqlite package because its
-	// schema reader must skip them (ADR-0135).
-	ChangeLogTable     = sqlite.ChangeLogTable
-	ChangeLogMetaTable = sqlite.ChangeLogMetaTable
+	// ChangeLogTable, ChangeLogMetaTable, and ChangeLogColumnsTable mirror
+	// pgtrigger's names for operator familiarity; the literals live in the sqlite
+	// package because its schema reader must skip them (ADR-0135).
+	ChangeLogTable        = sqlite.ChangeLogTable
+	ChangeLogMetaTable    = sqlite.ChangeLogMetaTable
+	ChangeLogColumnsTable = sqlite.ChangeLogColumnsTable
 
 	// CaptureTriggerPrefix prefixes every per-table capture trigger name; the
 	// teardown discovery scans for it. SQLite triggers are per-operation (no
@@ -235,8 +237,8 @@ func preflight(tables []*ir.Table) []TableRefusal {
 // renderSetupDDL produces the ordered DDL that installs the engine. Order
 // matters: the change-log table must exist before the triggers reference it.
 func renderSetupDDL(tables []*ir.Table) []string {
-	// 3 base statements (change-log table, meta table, meta upsert) + 6 per table.
-	out := make([]string, 0, 3+len(tables)*(2*len(triggerOps)))
+	// 4 base statements + 7 per table (DROP+CREATE×3 triggers + 1 fingerprint upsert).
+	out := make([]string, 0, 4+len(tables)*(2*len(triggerOps)+1))
 	out = append(
 		out,
 		// id is INTEGER PRIMARY KEY AUTOINCREMENT — the monotonic, never-reused
@@ -254,6 +256,15 @@ func renderSetupDDL(tables []*ir.Table) []string {
     singleton_pk   INTEGER PRIMARY KEY CHECK (singleton_pk = 1),
     schema_version INTEGER NOT NULL,
     installed_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
+)`,
+		// Per-table captured-column fingerprint: the EXACT ordered non-generated
+		// column set the triggers below were built against. The CDC reader compares
+		// it to the live schema at stream start so an un-re-setup ADD/DROP/RENAME
+		// COLUMN is REFUSED LOUDLY rather than silently dropping the drifted
+		// column's values (ADR-0135; SQLite has no DDL triggers in Phase 1).
+		"CREATE TABLE IF NOT EXISTS "+quoteIdent(ChangeLogColumnsTable)+` (
+    tbl     TEXT PRIMARY KEY,
+    columns TEXT NOT NULL
 )`,
 		fmt.Sprintf(
 			"INSERT INTO %s (singleton_pk, schema_version) VALUES (1, %d) "+
@@ -276,7 +287,15 @@ func renderTableTriggers(t *ir.Table) []string {
 	beforeImg := captureImageExpr("OLD", cols)
 	fqTable := quoteIdent(t.Name)
 
-	out := make([]string, 0, 2*len(triggerOps))
+	out := make([]string, 0, 2*len(triggerOps)+1)
+	// Record the EXACT captured column set this trigger set is built against, so
+	// the CDC reader can detect an un-re-setup schema change at stream start
+	// (ADR-0135). Upsert so re-running setup for one table doesn't touch others'.
+	out = append(out, fmt.Sprintf(
+		"INSERT INTO %s (tbl, columns) VALUES (%s, %s) "+
+			"ON CONFLICT (tbl) DO UPDATE SET columns = excluded.columns",
+		quoteIdent(ChangeLogColumnsTable), quoteSQLString(t.Name), quoteSQLString(columnFingerprint(cols)),
+	))
 	for _, op := range triggerOps {
 		name := quoteIdent(triggerName(t.Name, op.suffix))
 		before, after := "NULL", "NULL"
@@ -335,10 +354,28 @@ func nonGeneratedColumnNames(t *ir.Table) []string {
 	return out
 }
 
+// columnFingerprint canonicalises an ordered non-generated column-name list into
+// the string stored in [ChangeLogColumnsTable] and compared by the CDC reader at
+// stream start. A JSON array preserves order and is unambiguous under any column
+// name (commas, quotes); Setup and the reader call this SAME function so the
+// stored and live fingerprints are byte-comparable. Marshal of a []string never
+// errors, but the error is checked rather than ignored (errcheck).
+func columnFingerprint(cols []string) string {
+	b, err := json.Marshal(cols)
+	if err != nil {
+		// Unreachable for []string; fall back to a join so a bug surfaces as a
+		// mismatch refusal, never a panic.
+		return strings.Join(cols, "\x00")
+	}
+	return string(b)
+}
+
 // renderTeardownDDL returns the ordered DROP statements. Triggers drop before
-// the change-log table; KeepData retains the change-log + meta for inspection.
+// the change-log table; KeepData retains the change-log + meta + columns tables
+// for inspection (all three kept together so the "change-log exists ⟹ columns
+// exists" invariant the reader's drift check relies on always holds).
 func renderTeardownDDL(triggers []string, keepData bool) []string {
-	out := make([]string, 0, len(triggers)+2)
+	out := make([]string, 0, len(triggers)+3)
 	for _, name := range triggers {
 		out = append(out, "DROP TRIGGER IF EXISTS "+quoteIdent(name))
 	}
@@ -347,6 +384,7 @@ func renderTeardownDDL(triggers []string, keepData bool) []string {
 			out,
 			"DROP TABLE IF EXISTS "+quoteIdent(ChangeLogTable),
 			"DROP TABLE IF EXISTS "+quoteIdent(ChangeLogMetaTable),
+			"DROP TABLE IF EXISTS "+quoteIdent(ChangeLogColumnsTable),
 		)
 	}
 	return out

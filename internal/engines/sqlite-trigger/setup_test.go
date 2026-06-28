@@ -31,13 +31,16 @@ func sampleTable() *ir.Table {
 // format encoding, and that the generated column is EXCLUDED.
 func TestRenderTableTriggers_FaithfulCaptureBody(t *testing.T) {
 	stmts := renderTableTriggers(sampleTable())
-	// 3 ops × (DROP + CREATE) = 6 statements.
-	if len(stmts) != 6 {
-		t.Fatalf("got %d statements; want 6 (DROP+CREATE per INSERT/UPDATE/DELETE)", len(stmts))
+	// 1 captured-column fingerprint upsert + 3 ops × (DROP + CREATE) = 7.
+	if len(stmts) != 7 {
+		t.Fatalf("got %d statements; want 7 (fingerprint upsert + DROP+CREATE per INSERT/UPDATE/DELETE)", len(stmts))
 	}
 	all := strings.Join(stmts, "\n")
 
 	for _, want := range []string{
+		// Captured-column fingerprint records the NON-generated set (id, payload)
+		// — NOT the generated "gen" column — for the startup drift check.
+		`INSERT INTO "sluice_change_log_columns" (tbl, columns) VALUES ('events', '["id","payload"]')`,
 		`CREATE TRIGGER "sluice_capture_events_ins" AFTER INSERT ON "events"`,
 		`CREATE TRIGGER "sluice_capture_events_upd" AFTER UPDATE ON "events"`,
 		`CREATE TRIGGER "sluice_capture_events_del" AFTER DELETE ON "events"`,

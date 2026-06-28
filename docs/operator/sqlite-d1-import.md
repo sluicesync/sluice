@@ -196,10 +196,15 @@ reads never block the application's writes (sluice does not change your journal 
 you). **Source-write overhead:** every captured INSERT/UPDATE/DELETE fires a trigger that
 writes one change-log row (the standard trigger-CDC cost). **Schema changes need
 re-setup:** SQLite has no DDL triggers, so a source `ALTER TABLE` is not auto-captured —
-run `trigger teardown` then `trigger setup` again after a schema change. The `sluice
-sync` stream refuses loudly (rather than silently mis-applying) if it sees a captured
-column that is no longer in the source schema. The change-log and meta tables are
-auto-skipped by the schema reader, so they are never themselves migrated or captured.
+run `trigger teardown` then `trigger setup` again after a schema change. To keep this from
+silently dropping data (an `ADD COLUMN` whose values a stale trigger would never capture),
+`trigger setup` records each table's captured column set, and **`sluice sync start` refuses
+loudly at stream start** if any replicated table's live columns differ from what the
+triggers were built against (in either direction — add, drop, or rename — or a dropped
+table), naming the table and pointing you to re-run `trigger setup`. Until you re-setup
+after a schema change, the stream will not start (it never silently mis-captures). The
+change-log, meta, and column-fingerprint tables are auto-skipped by the schema reader, so
+they are never themselves migrated or captured.
 
 ## Known limits (prototype scope)
 

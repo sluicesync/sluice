@@ -71,6 +71,28 @@ not JSON number), REAL is `%.17g` round-trip-exact, BLOBs come back from hex. Th
    Exactly-once on resume is the durable watermark (last applied `id`), same contract as
    pgtrigger.
 
+   **No safety-lag predicate — and the invariant it rests on.** Unlike pgtrigger (whose
+   `bigserial` id is allocated at INSERT but NOT in commit order, forcing an `xmin`
+   safety-lag + contiguous-committed-prefix anchor), SQLite's `id` is gap-free-correct under
+   a plain `id > watermark` scan because **standard SQLite serializes writers**: only one
+   write transaction is in flight at a time, so the `INTEGER PRIMARY KEY AUTOINCREMENT` id is
+   allocated in *commit* order. **Caveat (load-bearing if the driver ever changes):** this
+   holds for the standard modernc/`sqlite3` engine. A future swap to a *concurrent-writer*
+   SQLite variant — `BEGIN CONCURRENT`, `wal2`, or the HC-tree branch — would break commit-
+   order = id-order (two writers could commit out of id order, opening a silent-gap window),
+   and the reader would then have to re-introduce a safety-lag / contiguous-prefix anchor
+   exactly as pgtrigger does. Do not adopt such a driver for the CDC source without that
+   change.
+
+   **Schema-drift guard (Phase 1, no DDL triggers).** Because SQLite cannot capture DDL,
+   `trigger setup` records each table's exact non-generated column set in a
+   `sluice_change_log_columns` fingerprint table, and the CDC reader compares it to the live
+   schema at stream START — refusing loudly on any difference in either direction. This
+   closes the silent `ADD COLUMN` direction (a stale trigger captures the OLD set, so every
+   captured column is still present and a per-row check would never fire, yet the new
+   column's values would vanish): the operator must re-run `trigger setup` after a schema
+   change.
+
 4. **Snapshot → CDC handoff:** `OpenSnapshotStream` captures `MAX(id)` from
    `sluice_change_log` as the start watermark, runs the cold-start snapshot via the
    delegated `sqlite` reader, then streams changes with `id > watermark` — no gap, no

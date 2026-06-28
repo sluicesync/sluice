@@ -39,6 +39,13 @@ import (
 const (
 	ChangeLogTable     = "sluice_change_log"
 	ChangeLogMetaTable = "sluice_change_log_meta"
+	// ChangeLogColumnsTable records, per replicated table, the EXACT
+	// non-generated column set the capture triggers were built against
+	// (ADR-0135). The CDC reader compares it against the live schema at stream
+	// START to detect an un-re-setup source schema change in EITHER direction —
+	// in particular an ADD COLUMN, whose new values the stale trigger would
+	// otherwise SILENTLY drop. Also skipped by the schema reader.
+	ChangeLogColumnsTable = "sluice_change_log_columns"
 )
 
 // CapturedTypeofExpr returns the storage-class half of the faithful-capture pair

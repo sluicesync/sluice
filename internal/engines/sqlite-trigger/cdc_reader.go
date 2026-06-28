@@ -71,7 +71,7 @@ func openCDCReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sqlite-trigger: cdc: resolve date encoding: %w", err)
 	}
-	colTypes, err := loadColumnTypes(ctx, dsn)
+	colTypes, liveFingerprints, err := loadColumnTypes(ctx, dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -90,6 +90,15 @@ func openCDCReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
 			ChangeLogTable,
 		)
 	}
+	// Refuse loudly on un-re-setup source schema drift (ADR-0135). SQLite has no
+	// DDL triggers in Phase 1, so an ADD/DROP/RENAME COLUMN after setup leaves
+	// the triggers capturing a stale column set — and an ADD COLUMN would
+	// SILENTLY drop the new column from the stream. The startup fingerprint check
+	// catches BOTH directions before any data moves.
+	if err := verifyNoSchemaDrift(ctx, db, liveFingerprints); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return &CDCReader{
 		db:           db,
 		dec:          dec,
@@ -99,29 +108,77 @@ func openCDCReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
 	}, nil
 }
 
-// loadColumnTypes reads the SQLite schema once and builds table → column → IR
-// type, reusing the validated [sqlite.Engine] schema reader so the CDC reader's
-// per-column typing matches the cold-start reader exactly. The change-log/meta
-// tables are already skipped by that reader (ADR-0135).
-func loadColumnTypes(ctx context.Context, dsn string) (map[string]map[string]ir.Type, error) {
+// loadColumnTypes reads the SQLite schema once and builds (1) table → column → IR
+// type for per-cell decode and (2) table → captured-column FINGERPRINT (the
+// canonical ordered non-generated column list, [columnFingerprint]) for the
+// startup drift check. Reuses the validated [sqlite.Engine] schema reader so both
+// match the cold-start reader exactly. The change-log/meta/columns tables are
+// already skipped by that reader (ADR-0135).
+func loadColumnTypes(ctx context.Context, dsn string) (colTypes map[string]map[string]ir.Type, fingerprints map[string]string, err error) {
 	sr, err := (sqlite.Engine{}).OpenSchemaReader(ctx, dsn)
 	if err != nil {
-		return nil, fmt.Errorf("sqlite-trigger: cdc: open schema reader: %w", err)
+		return nil, nil, fmt.Errorf("sqlite-trigger: cdc: open schema reader: %w", err)
 	}
 	defer func() { _ = closeReader(sr) }()
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("sqlite-trigger: cdc: read schema: %w", err)
+		return nil, nil, fmt.Errorf("sqlite-trigger: cdc: read schema: %w", err)
 	}
-	out := make(map[string]map[string]ir.Type, len(schema.Tables))
+	colTypes = make(map[string]map[string]ir.Type, len(schema.Tables))
+	fingerprints = make(map[string]string, len(schema.Tables))
 	for _, t := range schema.Tables {
 		cols := make(map[string]ir.Type, len(t.Columns))
 		for _, c := range t.Columns {
 			cols[c.Name] = c.Type
 		}
-		out[t.Name] = cols
+		colTypes[t.Name] = cols
+		fingerprints[t.Name] = columnFingerprint(nonGeneratedColumnNames(t))
 	}
-	return out, nil
+	return colTypes, fingerprints, nil
+}
+
+// verifyNoSchemaDrift compares the captured-column fingerprint recorded at
+// `trigger setup` (in [ChangeLogColumnsTable]) against the LIVE schema's
+// non-generated column set for every replicated table, and refuses loudly on the
+// first difference. This is the load-bearing guard for the silent ADD-COLUMN
+// direction: the stale trigger still captures every OLD column (so the per-row
+// decode check never fires), but the new column's values would vanish from the
+// stream — caught here at stream start instead. A DROP/RENAME (live set differs)
+// and a dropped table (live fingerprint absent) are caught the same way.
+func verifyNoSchemaDrift(ctx context.Context, db *sql.DB, liveFingerprints map[string]string) error {
+	rows, err := db.QueryContext(ctx, `SELECT tbl, columns FROM "`+ChangeLogColumnsTable+`" ORDER BY tbl`)
+	if err != nil {
+		// The columns table is created alongside the change-log (and dropped with
+		// it), so "change-log exists ⟹ columns exists". A missing/erroring table
+		// here is an inconsistent half-install — refuse rather than skip the guard.
+		return fmt.Errorf(
+			"sqlite-trigger: cannot read the captured-column fingerprint table %s (%w); "+
+				"the trigger install looks inconsistent — re-run `sluice trigger setup`",
+			ChangeLogColumnsTable, err,
+		)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var tbl, captured string
+		if err := rows.Scan(&tbl, &captured); err != nil {
+			return fmt.Errorf("sqlite-trigger: scan captured-column fingerprint: %w", err)
+		}
+		live, ok := liveFingerprints[tbl]
+		if !ok {
+			return fmt.Errorf(
+				"sqlite-trigger: table %q has capture triggers installed but no longer exists in the source schema; "+
+					"re-run `sluice trigger setup` after a schema change (Phase 1 does not forward DDL)", tbl,
+			)
+		}
+		if live != captured {
+			return fmt.Errorf(
+				"sqlite-trigger: table %q schema has drifted since `trigger setup` (captured columns %s, live columns %s); "+
+					"the stale triggers would mis-capture (an ADD COLUMN would be SILENTLY dropped) — "+
+					"re-run `sluice trigger setup` (Phase 1 does not forward DDL)", tbl, captured, live,
+			)
+		}
+	}
+	return rows.Err()
 }
 
 // SetPollInterval overrides the default 1s poll cadence. Idempotent; must be
