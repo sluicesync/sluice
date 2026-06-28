@@ -45,7 +45,11 @@ const sqliteTrigBigInt = int64(9007199254740993)
 func seedSQLiteTriggerSource(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "app.db")
-	db, err := sql.Open("sqlite", path)
+	// busy_timeout so a transient lock (the CDC poller's read / a WAL auto-
+	// checkpoint) makes this connection WAIT rather than fail with SQLITE_BUSY
+	// "database is locked" — without it the test flakes under -race (a real app
+	// configures the same; sluice's own source connections set it via connect.go).
+	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)")
 	if err != nil {
 		t.Fatalf("open sqlite seed: %v", err)
 	}
@@ -79,7 +83,11 @@ func seedSQLiteTriggerSource(t *testing.T) string {
 // own change-log id).
 func sqliteExec(t *testing.T, path, stmt string, args ...any) {
 	t.Helper()
-	db, err := sql.Open("sqlite", path)
+	// busy_timeout so a transient lock (the CDC poller's read / a WAL auto-
+	// checkpoint) makes this connection WAIT rather than fail with SQLITE_BUSY
+	// "database is locked" — without it the test flakes under -race (a real app
+	// configures the same; sluice's own source connections set it via connect.go).
+	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)")
 	if err != nil {
 		t.Fatalf("open source for exec: %v", err)
 	}
