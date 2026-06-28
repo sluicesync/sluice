@@ -1,0 +1,29 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
+package pgtrigger
+
+import "testing"
+
+// TestAppliedLastID covers the token decode `sluice trigger prune` uses to derive
+// the prune bound from the target's durable frontier. The Prune DELETE itself
+// needs a real PG and lives in the pipeline integration suite.
+func TestAppliedLastID(t *testing.T) {
+	got, err := AppliedLastID(`{"last_id":99}`)
+	if err != nil {
+		t.Fatalf("AppliedLastID valid token: %v", err)
+	}
+	if got != 99 {
+		t.Errorf("AppliedLastID = %d; want 99", got)
+	}
+
+	if _, err := AppliedLastID(""); err == nil {
+		t.Error("AppliedLastID(empty) returned nil; want a loud error")
+	}
+	if _, err := AppliedLastID("{bad"); err == nil {
+		t.Error("AppliedLastID(malformed) returned nil; want a loud error")
+	}
+	if _, err := AppliedLastID(`{"last_id":-5}`); err == nil {
+		t.Error("AppliedLastID(negative) returned nil; want a loud error")
+	}
+}

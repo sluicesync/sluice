@@ -44,6 +44,18 @@ type executor interface {
 	changeLogExists(ctx context.Context) (bool, error)
 	maxChangeLogID(ctx context.Context) (int64, error)
 	discoverTriggers(ctx context.Context) ([]string, error)
+	// pruneChangeLog DELETEs change-log rows with id <= cut and returns the
+	// number deleted (ADR-0137). The `<=` (not `<`) is load-bearing: cut is the
+	// durably-applied frontier minus a margin, so id == cut is itself durably
+	// applied and safe to remove.
+	pruneChangeLog(ctx context.Context, cut int64) (deleted int64, err error)
+	// vacuum reclaims file space after a prune (SQLite/D1 only; PG uses
+	// autovacuum). Behind the operator's --vacuum opt-in — VACUUM rewrites the
+	// whole database.
+	vacuum(ctx context.Context) error
+	// changeLogStats returns the post-prune MIN(id) (0 on an empty change-log)
+	// and total row count, for the operator-facing prune report.
+	changeLogStats(ctx context.Context) (minID, count int64, err error)
 	close() error
 }
 
@@ -245,6 +257,30 @@ func (e *localExecutor) discoverTriggers(ctx context.Context) ([]string, error) 
 	return out, rows.Err()
 }
 
+func (e *localExecutor) pruneChangeLog(ctx context.Context, cut int64) (int64, error) {
+	res, err := e.db.ExecContext(ctx, `DELETE FROM "`+ChangeLogTable+`" WHERE id <= ?`, cut)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func (e *localExecutor) vacuum(ctx context.Context) error {
+	_, err := e.db.ExecContext(ctx, "VACUUM")
+	return err
+}
+
+func (e *localExecutor) changeLogStats(ctx context.Context) (minID, count int64, err error) {
+	var m sql.NullInt64
+	if scanErr := e.db.QueryRowContext(ctx, `SELECT MIN(id), COUNT(*) FROM "`+ChangeLogTable+`"`).Scan(&m, &count); scanErr != nil {
+		return 0, 0, scanErr
+	}
+	if m.Valid {
+		minID = m.Int64
+	}
+	return minID, count, nil
+}
+
 func (e *localExecutor) close() error {
 	if e.db == nil {
 		return nil
@@ -387,6 +423,75 @@ func (e *d1Executor) discoverTriggers(ctx context.Context) ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+func (e *d1Executor) pruneChangeLog(ctx context.Context, cut int64) (int64, error) {
+	// The D1 `/query` transport doesn't surface rows-affected, so count the
+	// to-be-deleted rows first. This is exact and concurrency-safe: only rows
+	// with id <= cut are deleted, and the AUTOINCREMENT id only ever grows, so
+	// no row can enter the id <= cut range between this count and the DELETE
+	// (the same property that makes pruning safe while a sync is live). COUNT is
+	// projected as TEXT so a JSON-number cell never reaches d1CellString.
+	cutStr := strconv.FormatInt(cut, 10)
+	rows, err := e.conn.Query(ctx,
+		`SELECT CAST(COUNT(*) AS TEXT) AS n FROM "`+ChangeLogTable+`" WHERE id <= ?`, cutStr)
+	if err != nil {
+		return 0, err
+	}
+	var deleted int64
+	if len(rows) > 0 {
+		text, ok, cerr := d1CellString(rows[0]["n"])
+		if cerr != nil {
+			return 0, fmt.Errorf("d1-trigger: decode prune count: %w", cerr)
+		}
+		if ok {
+			if deleted, err = strconv.ParseInt(text, 10, 64); err != nil {
+				return 0, fmt.Errorf("d1-trigger: prune count %q is not a valid int64: %w", text, err)
+			}
+		}
+	}
+	if err := e.conn.Exec(ctx, `DELETE FROM "`+ChangeLogTable+`" WHERE id <= ?`, cutStr); err != nil {
+		return 0, err
+	}
+	return deleted, nil
+}
+
+func (e *d1Executor) vacuum(ctx context.Context) error {
+	return e.conn.Exec(ctx, "VACUUM")
+}
+
+func (e *d1Executor) changeLogStats(ctx context.Context) (minID, count int64, err error) {
+	rows, err := e.conn.Query(ctx,
+		`SELECT CAST(COALESCE(MIN(id), 0) AS TEXT) AS mn, CAST(COUNT(*) AS TEXT) AS cnt FROM "`+ChangeLogTable+`"`)
+	if err != nil {
+		return 0, 0, err
+	}
+	if len(rows) == 0 {
+		return 0, 0, nil
+	}
+	minID, err = d1IntCell(rows[0]["mn"])
+	if err != nil {
+		return 0, 0, fmt.Errorf("d1-trigger: decode change-log MIN(id): %w", err)
+	}
+	count, err = d1IntCell(rows[0]["cnt"])
+	if err != nil {
+		return 0, 0, fmt.Errorf("d1-trigger: decode change-log count: %w", err)
+	}
+	return minID, count, nil
+}
+
+// d1IntCell decodes a CAST(... AS TEXT) integer cell to int64. A NULL/absent
+// cell decodes to 0 (the COALESCE in the stats query already guards MIN(id);
+// this is a defensive fallback).
+func d1IntCell(raw json.RawMessage) (int64, error) {
+	text, ok, err := d1CellString(raw)
+	if err != nil {
+		return 0, err
+	}
+	if !ok {
+		return 0, nil
+	}
+	return strconv.ParseInt(text, 10, 64)
 }
 
 // close is a no-op: the D1 HTTP transport has no pool/file to release.

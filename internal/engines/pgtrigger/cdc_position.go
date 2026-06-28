@@ -40,6 +40,29 @@ func encodePos(p pgTriggerPos) (ir.Position, error) {
 	return ir.Position{Engine: engineNamePosition, Token: string(b)}, nil
 }
 
+// AppliedLastID extracts the durably-applied change-log id (the
+// {"last_id":N} token shape) from a persisted trigger-CDC position
+// TOKEN. `sluice trigger prune` (ADR-0137) calls it to derive the prune
+// bound from the TARGET's durable frontier — the only safe lower bound.
+// It reuses [decodePos] so the wire shape has a single owner; the token
+// is stamped with this engine's canonical name first because the TARGET
+// re-stamps the position's Engine with its OWN name when it persists the
+// source token (so the raw token alone carries the id).
+//
+// An empty or malformed token is a loud error (a durable position the
+// prune can trust must decode cleanly — never prune blind against a
+// garbled watermark).
+func AppliedLastID(token string) (int64, error) {
+	d, ok, err := decodePos(ir.Position{Engine: engineNamePosition, Token: token})
+	if err != nil {
+		return 0, err
+	}
+	if !ok {
+		return 0, errors.New("pgtrigger: durable position token is empty (no applied watermark)")
+	}
+	return d.LastID, nil
+}
+
 // decodePos parses an [ir.Position] back into a [pgTriggerPos]. The
 // zero value of [ir.Position] (empty Engine + Token) is the "from now"
 // sentinel and is reported via the second return value; callers

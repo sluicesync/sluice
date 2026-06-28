@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -42,6 +43,7 @@ const (
 type TriggerCmd struct {
 	Setup    TriggerSetupCmd    `cmd:"" help:"Install the trigger-engine state (change-log table, capture function, per-table triggers) on the source PG database."`
 	Teardown TriggerTeardownCmd `cmd:"" help:"Remove every trace of the trigger engine from the source PG database."`
+	Prune    TriggerPruneCmd    `cmd:"" help:"Reap durably-applied rows from the source change-log to bound its growth (ADR-0137; safe to run while a sync is live)."`
 }
 
 // TriggerSetupCmd installs the source-side state needed by the
@@ -265,6 +267,232 @@ func (c *TriggerTeardownCmd) runSQLiteLike(
 	fmt.Fprintf(os.Stdout, "%s teardown applied (%d statement(s); keep-data=%v)\n",
 		label, len(plan.Statements), c.KeepData)
 	return nil
+}
+
+// TriggerPruneCmd implements `sluice trigger prune` (ADR-0137, Bug 165). The
+// trigger-CDC capture never reaps consumed rows, so the source change-log grows
+// unbounded for the life of a continuous sync. This command reaps rows the
+// TARGET has already durably applied — the ONLY safe lower bound.
+//
+// The correctness crux (silent-loss avoidance): a change-log row may be pruned
+// only if its id is <= the watermark the applier has PERSISTED to the target's
+// cdc-state. The exactly-once contract advances that watermark only on durable
+// apply, so the target's persisted last_id IS the durably-applied frontier. The
+// CDC reader's read cursor runs AHEAD of it; pruning on the read cursor (or the
+// source's MAX(id), or a TTL) would delete not-yet-applied rows → warm-resume
+// reads id > durable_watermark and finds them gone → silent permanent loss. So
+// the prune bound is read from the TARGET, and the command REFUSES LOUDLY if it
+// cannot read that position (it never prunes blind).
+type TriggerPruneCmd struct {
+	SourceDriver string `help:"Trigger-CDC source engine whose change-log to prune: 'postgres-trigger' (default), 'sqlite-trigger', or 'd1-trigger'." enum:"postgres-trigger,sqlite-trigger,d1-trigger" default:"postgres-trigger" group:"source"`
+	Source       string `help:"Source DSN where sluice_change_log lives (PG DSN for postgres-trigger; SQLite file path for sqlite-trigger; d1:// form for d1-trigger, token via CLOUDFLARE_API_TOKEN)." required:"" env:"SLUICE_SOURCE" placeholder:"DSN" group:"source"`
+	Schema       string `help:"PG source schema holding sluice_change_log. Defaults to the DSN's 'schema' parameter. Ignored for sqlite-trigger / d1-trigger." placeholder:"NAME" group:"source"`
+
+	TargetDriver string `help:"Target engine name (e.g. postgres, mysql) — where the durably-applied CDC position lives. See 'sluice engines'." required:"" placeholder:"NAME" group:"target"`
+	Target       string `help:"Target database DSN (the same target the sync applies to)." required:"" env:"SLUICE_TARGET" placeholder:"DSN" group:"target"`
+	StreamID     string `help:"Stream identifier whose durable position bounds the prune (the same --stream-id the sync uses)." required:"" placeholder:"ID"`
+
+	Keep   int64 `help:"Safety margin: keep the most-recent N change-log ids below the durable frontier unpruned. Belt-and-suspenders — the frontier itself is already durably applied, so even 0 is safe. Default 1000." default:"1000" placeholder:"N"`
+	Vacuum bool  `help:"After pruning, VACUUM to reclaim file space (sqlite-trigger / d1-trigger only; PG relies on autovacuum). Off by default — VACUUM rewrites the whole database."`
+	DryRun bool  `help:"Compute and print the prune bound without deleting anything." short:"n"`
+}
+
+// Run implements `sluice trigger prune`.
+func (c *TriggerPruneCmd) Run(_ *Globals) error {
+	if c.Source == "" {
+		return errors.New("--source is required")
+	}
+	if c.Target == "" {
+		return errors.New("--target is required")
+	}
+	if c.StreamID == "" {
+		return errors.New("--stream-id is required")
+	}
+	if c.Keep < 0 {
+		return errors.New("--keep must be >= 0")
+	}
+
+	ctx := kongContext()
+
+	// Step 1 — read the durably-applied frontier from the TARGET (the only safe
+	// lower bound). Refuses loudly when no durable position exists.
+	appliedLastID, err := c.readDurableFrontier(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Step 2 — compute the prune bound. cut <= 0 means nothing below the frontier
+	// minus the margin: a safe no-op.
+	cut, doPrune := computePruneCut(appliedLastID, c.Keep)
+	if !doPrune {
+		fmt.Fprintf(os.Stdout,
+			"trigger prune: durable frontier last_id=%d, --keep=%d ⇒ cut=%d (<= 0); nothing to prune\n",
+			appliedLastID, c.Keep, cut)
+		return nil
+	}
+
+	if c.DryRun {
+		fmt.Fprintf(os.Stdout, "-- trigger prune --dry-run --\n")
+		fmt.Fprintf(os.Stdout,
+			"durable frontier last_id=%d, --keep=%d ⇒ would DELETE FROM %s WHERE id <= %d\n",
+			appliedLastID, c.Keep, sqlitetrigger.ChangeLogTable, cut)
+		return c.runPruneDryRun(ctx)
+	}
+
+	// Step 3 — engine-dispatched DELETE on the SOURCE.
+	return c.runPrune(ctx, cut)
+}
+
+// readDurableFrontier opens the TARGET's ChangeApplier, reads the persisted CDC
+// position for the stream (the SAME read path `sluice sync status` / `sync
+// health` use), and decodes the trigger-CDC {"last_id":N} token to the
+// durably-applied id. Refuses loudly (operationalError, exit 2) when the target
+// engine is unknown, the position can't be read, or — critically — no position
+// exists yet (no durable frontier ⇒ no safe lower bound ⇒ never prune blind).
+func (c *TriggerPruneCmd) readDurableFrontier(ctx context.Context) (int64, error) {
+	target, err := resolveEngine(c.TargetDriver)
+	if err != nil {
+		return 0, operationalError{err: fmt.Errorf("--target-driver: %w", err)}
+	}
+	applier, err := target.OpenChangeApplier(ctx, c.Target)
+	if err != nil {
+		return 0, operationalError{err: fmt.Errorf("open target applier: %w", err)}
+	}
+	defer func() {
+		if cl, ok := applier.(io.Closer); ok {
+			_ = cl.Close()
+		}
+	}()
+
+	pos, ok, err := applier.ReadPosition(ctx, c.StreamID)
+	if err != nil {
+		return 0, operationalError{err: fmt.Errorf("read durable position for stream %q: %w", c.StreamID, err)}
+	}
+	if !ok {
+		return 0, operationalError{err: fmt.Errorf(
+			"no durable CDC position for stream %q on the target — refusing to prune; "+
+				"without a durably-applied frontier there is no safe lower bound (the applier has not persisted a position yet)",
+			c.StreamID,
+		)}
+	}
+
+	appliedLastID, err := decodeAppliedLastID(c.SourceDriver, pos.Token)
+	if err != nil {
+		return 0, operationalError{err: fmt.Errorf("decode durable position for stream %q: %w", c.StreamID, err)}
+	}
+	return appliedLastID, nil
+}
+
+// decodeAppliedLastID dispatches the trigger-CDC token decode to the source
+// engine's position codec. All three trigger engines share the {"last_id":N}
+// shape, but the decode stays engine-owned (the codec is the wire-shape's single
+// owner). Pure (no I/O) so the prune-bound path is unit-testable.
+func decodeAppliedLastID(sourceDriver, token string) (int64, error) {
+	switch sourceDriver {
+	case triggerDriverSQLite, triggerDriverD1:
+		return sqlitetrigger.AppliedLastID(token)
+	case triggerDriverPostgres:
+		return pgtrigger.AppliedLastID(token)
+	default:
+		return 0, fmt.Errorf("unknown --source-driver %q", sourceDriver)
+	}
+}
+
+// computePruneCut derives the inclusive DELETE bound from the durably-applied
+// frontier and the operator's safety margin: cut = appliedLastID - keep. A
+// non-positive cut means there is nothing safely below the frontier minus the
+// margin, so prune=false (the caller reports a no-op). Pure — unit-tested.
+func computePruneCut(appliedLastID, keep int64) (cut int64, prune bool) {
+	cut = appliedLastID - keep
+	if cut <= 0 {
+		return cut, false
+	}
+	return cut, true
+}
+
+// runPrune dispatches the SOURCE-side DELETE to the trigger engine and reports
+// the outcome.
+func (c *TriggerPruneCmd) runPrune(ctx context.Context, cut int64) error {
+	switch c.SourceDriver {
+	case triggerDriverSQLite:
+		res, err := sqlitetrigger.Prune(ctx, c.Source, sqlitetrigger.PruneOptions{Cut: cut, Vacuum: c.Vacuum})
+		if err != nil {
+			return err
+		}
+		printPruneResult("sqlite-trigger", cut, res.Deleted, res.RemainingMin, res.Remaining, res.Vacuumed)
+		return nil
+	case triggerDriverD1:
+		res, err := sqlitetrigger.PruneD1(ctx, c.Source, sqlitetrigger.PruneOptions{Cut: cut, Vacuum: c.Vacuum})
+		if err != nil {
+			return err
+		}
+		printPruneResult("d1-trigger", cut, res.Deleted, res.RemainingMin, res.Remaining, res.Vacuumed)
+		return nil
+	case triggerDriverPostgres:
+		if c.Vacuum {
+			return errors.New("--vacuum is not supported for postgres-trigger (PG reclaims space via autovacuum); re-run without --vacuum")
+		}
+		res, err := pgtrigger.Prune(ctx, c.Source, pgtrigger.PruneOptions{Cut: cut, Schema: c.Schema})
+		if err != nil {
+			return err
+		}
+		printPruneResult("pgtrigger", cut, res.Deleted, res.RemainingMin, res.Remaining, false)
+		return nil
+	default:
+		return fmt.Errorf("unknown --source-driver %q", c.SourceDriver)
+	}
+}
+
+// runPruneDryRun reports the current change-log stats (no DELETE) so the operator
+// can preview the prune.
+func (c *TriggerPruneCmd) runPruneDryRun(ctx context.Context) error {
+	var (
+		minID, count int64
+		err          error
+	)
+	switch c.SourceDriver {
+	case triggerDriverSQLite:
+		var res *sqlitetrigger.PruneResult
+		res, err = sqlitetrigger.Prune(ctx, c.Source, sqlitetrigger.PruneOptions{DryRun: true})
+		if res != nil {
+			minID, count = res.RemainingMin, res.Remaining
+		}
+	case triggerDriverD1:
+		var res *sqlitetrigger.PruneResult
+		res, err = sqlitetrigger.PruneD1(ctx, c.Source, sqlitetrigger.PruneOptions{DryRun: true})
+		if res != nil {
+			minID, count = res.RemainingMin, res.Remaining
+		}
+	case triggerDriverPostgres:
+		var res *pgtrigger.PruneResult
+		res, err = pgtrigger.Prune(ctx, c.Source, pgtrigger.PruneOptions{Schema: c.Schema, DryRun: true})
+		if res != nil {
+			minID, count = res.RemainingMin, res.Remaining
+		}
+	default:
+		return fmt.Errorf("unknown --source-driver %q", c.SourceDriver)
+	}
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stdout, "change-log currently holds %d row(s) (min id %d)\n", count, minID)
+	return nil
+}
+
+// printPruneResult renders the operator-facing prune outcome on stdout.
+func printPruneResult(label string, cut, deleted, remainingMin, remaining int64, vacuumed bool) {
+	if remaining == 0 {
+		fmt.Fprintf(os.Stdout,
+			"%s prune: deleted %d change-log row(s) with id <= %d; change-log now empty\n",
+			label, deleted, cut)
+	} else {
+		fmt.Fprintf(os.Stdout,
+			"%s prune: deleted %d change-log row(s) with id <= %d; %d row(s) remain (min id %d)\n",
+			label, deleted, cut, remaining, remainingMin)
+	}
+	if vacuumed {
+		fmt.Fprintln(os.Stdout, "  VACUUM applied (file space reclaimed)")
+	}
 }
 
 // triggerSetupExampleSchema is a tiny helper the help-text generator
