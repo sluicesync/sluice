@@ -77,17 +77,25 @@ func (r *D1SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 	return &ir.Schema{Tables: tables}, nil
 }
 
-// tableNames lists user tables, excluding SQLite's internal sqlite_* tables AND
-// Cloudflare D1's internal `_cf_*` tables — the SAME query and escaping the file
-// engine uses (a user table merely containing "cf" is NOT dropped, ADR-0130).
+// tableNames lists user tables, excluding SQLite's internal sqlite_* tables,
+// Cloudflare D1's internal `_cf_*` tables (a user table merely containing "cf"
+// is NOT dropped, ADR-0130), AND — by EXACT name — the trigger engine's own
+// bookkeeping tables ([ChangeLogTable]/[ChangeLogMetaTable]/[ChangeLogColumnsTable],
+// ADR-0135/0136). The SAME query and exclusion as the file engine's
+// [SchemaReader.tableNames]: a cold-start (or a plain `sluice migrate` against a
+// `d1-trigger`-instrumented database) must NEVER copy the change-log/meta/columns
+// tables, and the trigger installer must never see them as replication candidates.
+// The exclusion is a no-op for a normal D1 without those tables. The three names
+// bind as string params, compared exactly against the TEXT `name` column.
 func (r *D1SchemaReader) tableNames(ctx context.Context) ([]string, error) {
 	const q = `
 		SELECT name FROM sqlite_master
 		WHERE type = 'table'
 		  AND name NOT LIKE 'sqlite_%'
 		  AND name NOT LIKE '\_cf\_%' ESCAPE '\'
+		  AND name NOT IN (?, ?, ?)
 		ORDER BY name`
-	rows, err := r.client.queryRows(ctx, q)
+	rows, err := r.client.queryRows(ctx, q, ChangeLogTable, ChangeLogMetaTable, ChangeLogColumnsTable)
 	if err != nil {
 		return nil, err
 	}

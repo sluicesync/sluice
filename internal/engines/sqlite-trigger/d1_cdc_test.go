@@ -36,10 +36,11 @@ import (
 type mockD1 struct {
 	mu sync.Mutex
 
-	exists       bool        // change-log table present?
-	fingerprints [][2]string // (tbl, columns) rows for the drift check
-	maxID        string      // CAST(MAX(id) AS TEXT); "" → NULL (empty log)
-	rows         []clRow     // the canned change-log rows (filtered by id>since)
+	exists        bool        // change-log table present?
+	fingerprints  [][2]string // (tbl, columns) rows for the drift check
+	maxID         string      // CAST(MAX(id) AS TEXT); "" → NULL (empty log)
+	rows          []clRow     // the canned change-log rows (filtered by id>since)
+	pollHTTPError bool        // when set, the poll returns HTTP 500 (transport error)
 
 	ddl      []string // captured non-SELECT statements (setup/teardown DDL)
 	pollSQL  []string // captured poll SELECTs
@@ -90,6 +91,11 @@ func (m *mockD1) handle(t *testing.T, raw []byte, sql string, params []string) (
 		}
 		m.pollSQL = append(m.pollSQL, sql)
 		m.pollArgs = append(m.pollArgs, since)
+		if m.pollHTTPError {
+			// A transport failure mid-poll MUST surface via Err() (loud), never a
+			// silent empty batch falsely read as "no changes".
+			return http.StatusInternalServerError, []byte("d1 internal error")
+		}
 		return http.StatusOK, d1OK(m.pollResultsLocked(t, since))
 	case strings.Contains(sql, "type = 'table'"):
 		if m.exists {
@@ -512,5 +518,112 @@ func TestD1Open_RefusesMissingToken(t *testing.T) {
 	if _, err := SetupD1(bg(), "d1://justdb", SetupOptions{Tables: []string{"t"}}); err == nil ||
 		!strings.Contains(err.Error(), "CLOUDFLARE_ACCOUNT_ID") {
 		t.Errorf("missing account should refuse loudly naming CLOUDFLARE_ACCOUNT_ID; got: %v", err)
+	}
+}
+
+// idNTable is a tiny {id, n} table for the I/U/D + transport-error tests.
+func idNTable() *ir.Table {
+	return &ir.Table{
+		Name:       "t",
+		Columns:    []*ir.Column{{Name: "id", Type: ir.Integer{}}, {Name: "n", Type: ir.Integer{}}},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}, Unique: true},
+	}
+}
+
+// TestD1Capture_UpdateDeleteOverHTTP pins the I/U/D dispatch + before/after image
+// extraction over the D1 transport — the UPDATE (before AND after present) and the
+// DELETE (non-null before) shapes the fidelity matrix's all-INSERT rows don't
+// exercise. The dispatch is shared/transport-neutral, but the before-image-present
+// case is pinned over HTTP here.
+func TestD1Capture_UpdateDeleteOverHTTP(t *testing.T) {
+	tbl := idNTable()
+	m := &mockD1{
+		exists:       true,
+		fingerprints: [][2]string{{"t", columnFingerprint(nonGeneratedColumnNames(tbl))}},
+		rows: []clRow{
+			{
+				id: 1, op: "I", capturedAt: "2023-01-15 12:30:45.000",
+				after: map[string]any{"id": cell("integer", "1"), "n": cell("integer", "10")},
+			},
+			{
+				id: 2, op: "U", capturedAt: "2023-01-15 12:30:46.000",
+				before: map[string]any{"id": cell("integer", "1"), "n": cell("integer", "10")},
+				after:  map[string]any{"id": cell("integer", "1"), "n": cell("integer", "99")},
+			},
+			{
+				id: 3, op: "D", capturedAt: "2023-01-15 12:30:47.000",
+				before: map[string]any{"id": cell("integer", "1"), "n": cell("integer", "99")},
+			},
+		},
+	}
+	conn := startMockD1(t, m)
+	b := d1TestBackend(conn, &ir.Schema{Tables: []*ir.Table{tbl}})
+
+	r, err := openCDCReaderBackend(bg(), b)
+	if err != nil {
+		t.Fatalf("openCDCReaderBackend: %v", err)
+	}
+	defer func() { _ = r.(interface{ Close() error }).Close() }()
+
+	changes := collect(t, r, pos0(t), 3)
+	if len(changes) != 3 {
+		t.Fatalf("got %d changes; want 3 (I, U, D)", len(changes))
+	}
+	mustInsert(t, changes[0])
+
+	upd, ok := changes[1].(ir.Update)
+	if !ok {
+		t.Fatalf("change[1] is %T; want ir.Update", changes[1])
+	}
+	assertEq(t, "upd.Before.n", upd.Before["n"], int64(10))
+	assertEq(t, "upd.After.n", upd.After["n"], int64(99))
+
+	del, ok := changes[2].(ir.Delete)
+	if !ok {
+		t.Fatalf("change[2] is %T; want ir.Delete", changes[2])
+	}
+	assertEq(t, "del.Before.id", del.Before["id"], int64(1))
+	assertEq(t, "del.Before.n", del.Before["n"], int64(99))
+}
+
+// TestD1Capture_PollTransportErrorIsLoud pins the loud-failure contract over the
+// D1 transport: a transport failure mid-poll (HTTP 500) surfaces via Err() with
+// the channel closing — NOT a silent empty batch that the streamer would read as
+// "no changes". (The local path's poll error is the same shape; this pins the
+// HTTP transport's error propagation.)
+func TestD1Capture_PollTransportErrorIsLoud(t *testing.T) {
+	tbl := idNTable()
+	m := &mockD1{
+		exists:        true,
+		fingerprints:  [][2]string{{"t", columnFingerprint(nonGeneratedColumnNames(tbl))}},
+		pollHTTPError: true,
+	}
+	conn := startMockD1(t, m)
+	b := d1TestBackend(conn, &ir.Schema{Tables: []*ir.Table{tbl}})
+
+	r, err := openCDCReaderBackend(bg(), b)
+	if err != nil {
+		t.Fatalf("openCDCReaderBackend: %v", err)
+	}
+	defer func() { _ = r.(interface{ Close() error }).Close() }()
+
+	ch, err := r.StreamChanges(bg(), pos0(t))
+	if err != nil {
+		t.Fatalf("StreamChanges: %v", err)
+	}
+	n := 0
+	for range ch { // a failed poll emits NO events and closes the channel
+		n++
+	}
+	if n != 0 {
+		t.Errorf("got %d events on a failed poll; want 0 (loud, not a silent batch)", n)
+	}
+	errer, ok := r.(interface{ Err() error })
+	if !ok {
+		t.Fatal("reader does not expose Err()")
+	}
+	gotErr := errer.Err()
+	if gotErr == nil || !strings.Contains(gotErr.Error(), "poll") {
+		t.Errorf("transport error mid-poll must surface via Err() naming the poll; got: %v", gotErr)
 	}
 }

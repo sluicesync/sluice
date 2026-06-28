@@ -536,6 +536,79 @@ func TestD1SchemaReader_ReadSchema(t *testing.T) {
 	}
 }
 
+// TestD1SchemaReader_ExcludesChangeLogTables pins the d1-trigger cold-start
+// correctness guard (ADR-0136): a `d1-trigger`-instrumented D1 carries the three
+// sluice bookkeeping tables (sluice_change_log/_meta/_columns), and a cold-start
+// must NEVER copy them to the target. The exclusion is server-side SQL (a
+// `name NOT IN (?, ?, ?)` with the three names bound), exactly like the file
+// reader — so the mock honours the NOT IN by filtering the returned list, and the
+// test asserts both that the params carry the three names and that ReadSchema
+// surfaces ONLY the user table. (Before this guard the D1 reader's table-list
+// query lacked the exclusion — dormant while `d1` was CDCNone, reachable once
+// `d1-trigger` installs the tables.)
+func TestD1SchemaReader_ExcludesChangeLogTables(t *testing.T) {
+	var (
+		tableListSQL    string
+		tableListParams []string
+	)
+	client := startMockD1(t, func(sql string, params []string) (int, []byte) {
+		switch {
+		case strings.Contains(sql, "SELECT sql FROM sqlite_master"):
+			return http.StatusOK, d1OK([]map[string]any{{"sql": nil}})
+		case strings.Contains(sql, "FROM sqlite_master") && strings.Contains(sql, "type = 'table'"):
+			tableListSQL = sql
+			tableListParams = params
+			// Honour the server-side NOT IN: a candidate name present in the bound
+			// params is filtered out (what real D1 does for the exclusion).
+			excluded := map[string]bool{}
+			for _, p := range params {
+				excluded[p] = true
+			}
+			candidates := []string{
+				"users", ChangeLogTable, ChangeLogMetaTable, ChangeLogColumnsTable,
+			}
+			var rows []map[string]any
+			for _, name := range candidates {
+				if !excluded[name] {
+					rows = append(rows, map[string]any{"name": name})
+				}
+			}
+			return http.StatusOK, d1OK(rows)
+		case strings.Contains(sql, "table_xinfo('users')"):
+			return http.StatusOK, d1OK([]map[string]any{
+				{"cid": 0, "name": "id", "type": "INTEGER", "notnull": 1, "dflt_value": nil, "pk": 1, "hidden": 0},
+			})
+		default:
+			return http.StatusOK, d1OK(nil)
+		}
+	})
+	r := &D1SchemaReader{client: client}
+
+	sch, err := r.ReadSchema(context.Background())
+	if err != nil {
+		t.Fatalf("ReadSchema: %v", err)
+	}
+	if !strings.Contains(tableListSQL, "NOT IN (?, ?, ?)") {
+		t.Errorf("table-list query must carry the change-log NOT IN exclusion:\n%s", tableListSQL)
+	}
+	wantParams := map[string]bool{ChangeLogTable: true, ChangeLogMetaTable: true, ChangeLogColumnsTable: true}
+	if len(tableListParams) != 3 {
+		t.Fatalf("table-list params = %v; want the three change-log table names", tableListParams)
+	}
+	for _, p := range tableListParams {
+		if !wantParams[p] {
+			t.Errorf("unexpected table-list exclusion param %q; want the three change-log table names", p)
+		}
+	}
+	if len(sch.Tables) != 1 || sch.Tables[0].Name != "users" {
+		got := make([]string, 0, len(sch.Tables))
+		for _, tb := range sch.Tables {
+			got = append(got, tb.Name)
+		}
+		t.Fatalf("ReadSchema tables = %v; want only [users] (the change-log tables must be excluded)", got)
+	}
+}
+
 // TestD1SchemaReader_SchemaFeatures pins the ADR-0133 carry over the HTTP
 // transport: the d1 reader fetches table_xinfo (with the hidden flag), the
 // CREATE TABLE / CREATE INDEX `sql`, and index_list.partial, then runs the SAME
