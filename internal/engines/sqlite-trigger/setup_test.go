@@ -144,7 +144,14 @@ func TestPositionRoundTrip(t *testing.T) {
 	if _, ok, err := decodePos(ir.Position{}); ok || err != nil {
 		t.Errorf("zero position: ok=%v err=%v; want ok=false err=nil", ok, err)
 	}
-	// Foreign engine → rejected.
+	// Bug 166: the D1 sibling's re-stamped Engine tag MUST decode (the pipeline
+	// re-stamps a persisted position with the source engine's Name() on warm-
+	// resume, so a d1-trigger sync presents Engine="d1-trigger"). Rejecting it
+	// made every d1-trigger restart a poison-pill.
+	if d1pos, ok, err := decodePos(ir.Position{Engine: EngineNameD1, Token: `{"last_id":7}`}); err != nil || !ok || d1pos.LastID != 7 {
+		t.Errorf("d1-trigger-tagged position must decode (Bug 166): pos=%+v ok=%v err=%v", d1pos, ok, err)
+	}
+	// Foreign engine (outside the trigger-CDC family) → still rejected.
 	if _, _, err := decodePos(ir.Position{Engine: "postgres-trigger", Token: `{"last_id":1}`}); err == nil {
 		t.Error("foreign-engine position should be rejected")
 	}

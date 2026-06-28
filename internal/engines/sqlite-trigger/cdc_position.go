@@ -11,10 +11,24 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
-// engineNamePosition is the [ir.Position.Engine] tag this engine writes and
-// accepts. A position produced by another engine is rejected on decode so a
-// foreign bookmark can't be replayed into the trigger reader (and vice versa).
+// engineNamePosition is the [ir.Position.Engine] tag this engine WRITES.
+// On decode the codec accepts the whole trigger-CDC FAMILY ([EngineName] and
+// its D1 sibling [EngineNameD1]) — see [acceptsPositionEngine] — because both
+// transports share this exact change-log-`id` position semantics, and the
+// pipeline re-stamps a persisted position's Engine with the source engine's
+// own Name() on warm-resume (the Bug-20 cross-engine re-stamp). A `d1-trigger`
+// sync therefore presents a position tagged "d1-trigger" on resume; rejecting
+// it would make every restart a poison-pill (Bug 166). This mirrors the
+// engine-name-family acceptance the MySQL codec needed (Bug 2).
 const engineNamePosition = EngineName
+
+// acceptsPositionEngine reports whether a persisted position's Engine tag
+// belongs to the trigger-CDC family this codec can decode. Both the local
+// `sqlite-trigger` and the `d1-trigger` sibling use the identical
+// change-log-id token shape, so a position from either is decodable here.
+func acceptsPositionEngine(engine string) bool {
+	return engine == EngineName || engine == EngineNameD1
+}
 
 // sqliteTriggerPos is the engine-side representation of a polling position
 // (ADR-0135 §3). The durable bookmark is the most-recently-applied `id` value
@@ -49,10 +63,10 @@ func decodePos(p ir.Position) (decoded sqliteTriggerPos, ok bool, err error) {
 	if p.Engine == "" && p.Token == "" {
 		return sqliteTriggerPos{}, false, nil
 	}
-	if p.Engine != engineNamePosition {
+	if !acceptsPositionEngine(p.Engine) {
 		return sqliteTriggerPos{}, false, fmt.Errorf(
-			"sqlite-trigger: decode position: engine = %q; want %q",
-			p.Engine, engineNamePosition,
+			"sqlite-trigger: decode position: engine = %q; want %q or %q",
+			p.Engine, EngineName, EngineNameD1,
 		)
 	}
 	if p.Token == "" {
