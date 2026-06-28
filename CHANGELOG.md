@@ -4,6 +4,8 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.149] - 2026-06-28
+
 ### Added
 
 - **Cloudflare D1 gains continuous logical CDC: the new `d1-trigger` source engine (roadmap item 49 follow-up, #5 of the SQLite queue, Phase 2; ADR-0136).** A LIVE Cloudflare D1 database now streams its row changes to a Postgres or MySQL target over D1's HTTP query API — `sluice trigger setup --source-driver d1-trigger --dsn d1://<account_id>/<database_id> --tables=t1,t2` installs the SAME `sluice_change_log` table + per-table AFTER INSERT/UPDATE/DELETE capture triggers as the local `sqlite-trigger` engine (ADR-0135), and `sluice sync start --source-driver d1-trigger --source d1://<account_id>/<database_id> --target-driver postgres --target <dsn>` does a cold-start snapshot (reusing the validated lossless `d1` reader — ADR-0132's CAST/typeof projection, so integers > 2^53 survive) handed off gap-free to a polling CDC reader with a monotonic-id watermark for exactly-once resume. The API token is env-only (`CLOUDFLARE_API_TOKEN`); the account id may come from the DSN or `CLOUDFLARE_ACCOUNT_ID`. `sluice trigger teardown --source-driver d1-trigger` removes every trace. The engine composes the `d1` engine by delegation (CDC source only; write/target surfaces stay not-implemented) and self-registers as `d1-trigger`.
