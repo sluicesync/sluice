@@ -248,6 +248,61 @@ func TestTriggerPrune_SQLiteToPostgres_WarmResumeStillExactlyOnce(t *testing.T) 
 	case <-time.After(20 * time.Second):
 		t.Fatal("Streamer.Run (2) did not return after ctx cancel")
 	}
+
+	// ---- keep=0 boundary leg: prune at cut == frontier (delete id == applied
+	// last_id EXACTLY), then resume + apply more → still exactly-once. This nails
+	// the off-by-one boundary end-to-end: id == appliedLastID is itself durably
+	// applied, so deleting it (inclusive `id <= cut`) is safe, and resume reads
+	// strictly `id > frontier`. ----
+	frontier0, found0 := readDurableLastID(t, pgTarget, streamID)
+	if !found0 {
+		t.Fatal("durable position vanished before keep=0 leg")
+	}
+	before0 := sqliteChangeLogIDs(t, src)
+	if !containsID(before0, frontier0) {
+		t.Fatalf("test setup: change-log %v does not contain the frontier id %d (can't pin cut==frontier)", before0, frontier0)
+	}
+	res0, err := sqlitetrigger.Prune(context.Background(), src, sqlitetrigger.PruneOptions{Cut: frontier0}) // keep=0 ⇒ cut == frontier
+	if err != nil {
+		t.Fatalf("keep=0 Prune: %v", err)
+	}
+	after0 := sqliteChangeLogIDs(t, src)
+	if containsID(after0, frontier0) {
+		t.Errorf("keep=0 prune left the frontier row id=%d (cut==frontier must delete it inclusively); after=%v", frontier0, after0)
+	}
+	for _, id := range after0 {
+		if id <= frontier0 {
+			t.Errorf("keep=0 prune: change-log id %d <= cut %d survived", id, frontier0)
+		}
+	}
+	if res0.Deleted == 0 {
+		t.Errorf("keep=0 prune reported 0 deleted; before=%v cut=%d", before0, frontier0)
+	}
+	if postFrontier, found := readDurableLastID(t, pgTarget, streamID); !found || postFrontier != frontier0 {
+		t.Errorf("keep=0 prune changed the durable frontier: was %d, now %d", frontier0, postFrontier)
+	}
+
+	// ---- Run 3: warm-resume after the keep=0 prune; assert exactly-once ----
+	ctx3, cancel3 := context.WithCancel(context.Background())
+	defer cancel3()
+	run3 := make(chan error, 1)
+	go func() { run3 <- newStreamer().Run(ctx3) }()
+
+	sqliteExec(t, src, `INSERT INTO events (id, big, blb, note) VALUES (7, 700, NULL, 'cdc-7')`)
+	if !waitForEventBig(t, pgTarget, 7, 700, 60*time.Second) {
+		cancel3()
+		t.Fatalf("warm-resume after keep=0 prune: id=7 never landed: %v", pgEventIDs(t, pgTarget))
+	}
+	if got := pgEventIDs(t, pgTarget); !containsExactly(got, []int64{1, 3, 4, 5, 6, 7}) {
+		t.Errorf("warm-resume-after-keep=0-prune final id set = %v; want [1 3 4 5 6 7] (exactly-once)", got)
+	}
+
+	cancel3()
+	select {
+	case <-run3:
+	case <-time.After(20 * time.Second):
+		t.Fatal("Streamer.Run (3) did not return after ctx cancel")
+	}
 }
 
 // TestTriggerPrune_RefusesWithoutDurablePosition pins the no-prune-blind guard:

@@ -306,6 +306,17 @@ func applySourceFingerprint(applier ir.ChangeApplier, fingerprint string) {
 	}
 }
 
+// FingerprintSourceDSN is the exported wrapper over [fingerprintSourceDSN] so
+// the CLI (`sluice trigger prune`) can recompute a source's recorded fingerprint
+// and cross-check it against the stream's stored `source_dsn_fingerprint` —
+// refusing to prune the wrong change-log when an operator mis-pairs --source
+// with a different stream. Returns "" for a DSN sluice can't fingerprint
+// (host:port:db only — a SQLite file path or d1:// DSN yields ""), in which case
+// the caller can't cross-check.
+func FingerprintSourceDSN(dsn string) string {
+	return fingerprintSourceDSN(dsn)
+}
+
 // fingerprintSourceDSN returns the truncated SHA-256 hex of the DSN's
 // host+port+database tuple (ADR-0031). User and password are
 // deliberately excluded so credential rotation doesn't trip the

@@ -26,4 +26,14 @@ func TestAppliedLastID(t *testing.T) {
 	if _, err := AppliedLastID(`{"last_id":-5}`); err == nil {
 		t.Error("AppliedLastID(negative) returned nil; want a loud error")
 	}
+	// A FOREIGN token that unmarshals cleanly (a vanilla-PG pgoutput {slot,lsn},
+	// a broker envelope) must REFUSE — not silently decode to last_id=0.
+	for _, foreign := range []string{
+		`{"slot":"sluice_slot","lsn":"0/16B3748"}`,
+		`{"chain_id":"c1","segment":3}`,
+	} {
+		if _, err := AppliedLastID(foreign); err == nil {
+			t.Errorf("AppliedLastID(%q) returned nil; want a loud refuse (no last_id key)", foreign)
+		}
+	}
 }

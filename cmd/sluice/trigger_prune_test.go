@@ -51,6 +51,12 @@ func TestDecodeAppliedLastID(t *testing.T) {
 		if _, err := decodeAppliedLastID(driver, ""); err == nil {
 			t.Errorf("decodeAppliedLastID(%q, empty) returned nil; want a loud error", driver)
 		}
+		// A FOREIGN (non-trigger-CDC) token that unmarshals cleanly but has no
+		// last_id must refuse — not silently decode to 0 → "nothing to prune"
+		// against a stream that isn't a trigger-CDC stream.
+		if _, err := decodeAppliedLastID(driver, `{"slot":"sluice_slot","lsn":"0/16B3748"}`); err == nil {
+			t.Errorf("decodeAppliedLastID(%q, pgoutput-shaped) returned nil; want a loud refuse", driver)
+		}
 	}
 
 	if _, err := decodeAppliedLastID("mystery-engine", `{"last_id":7}`); err == nil {

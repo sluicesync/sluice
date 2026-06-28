@@ -64,9 +64,24 @@ func encodePos(p sqliteTriggerPos) (ir.Position, error) {
 // when it persists the source token (so the raw token alone carries the id).
 // Both `sqlite-trigger` and `d1-trigger` share this exact {"last_id":N} shape.
 //
-// An empty or malformed token is a loud error (a durable position the prune can
-// trust must decode cleanly — never prune blind against a garbled watermark).
+// An empty, malformed, or FOREIGN token is a loud error (a durable position the
+// prune can trust must decode cleanly and actually be a trigger-CDC token —
+// never prune blind against a garbled or wrong-engine watermark).
 func AppliedLastID(token string) (int64, error) {
+	if token == "" {
+		return 0, errors.New("sqlite-trigger: durable position token is empty (no applied watermark)")
+	}
+	// Require the last_id key. A FOREIGN (non-trigger-CDC) stream's token — a
+	// pgoutput {slot,lsn}, a mysql-gtid set, a broker envelope — would otherwise
+	// json.Unmarshal cleanly into {LastID:0} and look like "nothing to prune"
+	// against the wrong stream; refuse loudly instead. Decode into a *int64 so an
+	// absent key is distinguishable from an explicit 0.
+	var probe struct {
+		LastID *int64 `json:"last_id"`
+	}
+	if err := json.Unmarshal([]byte(token), &probe); err != nil || probe.LastID == nil {
+		return 0, errors.New("sqlite-trigger: position token has no last_id — the stream is not a trigger-CDC stream")
+	}
 	d, ok, err := decodePos(ir.Position{Engine: engineNamePosition, Token: token})
 	if err != nil {
 		return 0, err

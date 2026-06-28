@@ -13,6 +13,8 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines/pgtrigger"
 	sqlitetrigger "sluicesync.dev/sluice/internal/engines/sqlite-trigger"
+	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline"
 )
 
 // triggerDrivers is the set of trigger-CDC source engines the `sluice trigger`
@@ -344,11 +346,14 @@ func (c *TriggerPruneCmd) Run(_ *Globals) error {
 }
 
 // readDurableFrontier opens the TARGET's ChangeApplier, reads the persisted CDC
-// position for the stream (the SAME read path `sluice sync status` / `sync
-// health` use), and decodes the trigger-CDC {"last_id":N} token to the
-// durably-applied id. Refuses loudly (operationalError, exit 2) when the target
-// engine is unknown, the position can't be read, or — critically — no position
-// exists yet (no durable frontier ⇒ no safe lower bound ⇒ never prune blind).
+// state for the stream via ListStreams (the SAME read path `sluice sync status` /
+// `sync health` use), and decodes the trigger-CDC {"last_id":N} token to the
+// durably-applied id. It also CROSS-CHECKS the stream's recorded source
+// fingerprint against --source to refuse a --source/--stream-id mis-pairing
+// (see [TriggerPruneCmd.crossCheckSource]). Refuses loudly (operationalError,
+// exit 2) when the target engine is unknown, the streams can't be read, or —
+// critically — no position exists yet (no durable frontier ⇒ no safe lower
+// bound ⇒ never prune blind).
 func (c *TriggerPruneCmd) readDurableFrontier(ctx context.Context) (int64, error) {
 	target, err := resolveEngine(c.TargetDriver)
 	if err != nil {
@@ -364,11 +369,20 @@ func (c *TriggerPruneCmd) readDurableFrontier(ctx context.Context) (int64, error
 		}
 	}()
 
-	pos, ok, err := applier.ReadPosition(ctx, c.StreamID)
+	// ListStreams (not ReadPosition) so we get the recorded source fingerprint
+	// alongside the position in one read — both come from the same cdc-state row.
+	streams, err := applier.ListStreams(ctx)
 	if err != nil {
-		return 0, operationalError{err: fmt.Errorf("read durable position for stream %q: %w", c.StreamID, err)}
+		return 0, operationalError{err: fmt.Errorf("read durable streams from the target: %w", err)}
 	}
-	if !ok {
+	var found *ir.StreamStatus
+	for i := range streams {
+		if streams[i].StreamID == c.StreamID {
+			found = &streams[i]
+			break
+		}
+	}
+	if found == nil {
 		return 0, operationalError{err: fmt.Errorf(
 			"no durable CDC position for stream %q on the target — refusing to prune; "+
 				"without a durably-applied frontier there is no safe lower bound (the applier has not persisted a position yet)",
@@ -376,11 +390,47 @@ func (c *TriggerPruneCmd) readDurableFrontier(ctx context.Context) (int64, error
 		)}
 	}
 
-	appliedLastID, err := decodeAppliedLastID(c.SourceDriver, pos.Token)
+	if err := c.crossCheckSource(found.SourceDSNFingerprint); err != nil {
+		return 0, err
+	}
+
+	appliedLastID, err := decodeAppliedLastID(c.SourceDriver, found.Position.Token)
 	if err != nil {
 		return 0, operationalError{err: fmt.Errorf("decode durable position for stream %q: %w", c.StreamID, err)}
 	}
 	return appliedLastID, nil
+}
+
+// crossCheckSource refuses the one real over-delete path: a --source/--stream-id
+// mis-pairing. If --source points at change-log A but --stream-id resolves to a
+// DIFFERENT source B's durable frontier (a different id space), applying B's cut
+// to A's change-log can delete A's not-yet-applied rows = silent loss. The stream
+// recorded its source fingerprint (ADR-0031); we recompute --source's and refuse
+// LOUDLY on mismatch.
+//
+// The check can only run when BOTH fingerprints are known. ADR-0031 fingerprints
+// only host:port:db, so a SQLite file path or a d1:// DSN yields "" — for those
+// sources the cross-check can't run; we print a note and rely on the operator
+// passing the exact --source/--stream-id pair the sync uses (documented in
+// docs/operator/trigger-changelog-retention.md). Extending the fingerprint to
+// file/d1 sources is a tracked follow-up.
+func (c *TriggerPruneCmd) crossCheckSource(storedFingerprint string) error {
+	computed := pipeline.FingerprintSourceDSN(c.Source)
+	if storedFingerprint == "" || computed == "" {
+		fmt.Fprintf(os.Stderr,
+			"note: stream %q source identity not cross-checked (no recorded fingerprint for this source type) — "+
+				"ensure --source is the exact source this stream syncs from\n",
+			c.StreamID)
+		return nil
+	}
+	if computed != storedFingerprint {
+		return operationalError{err: fmt.Errorf(
+			"--source (fingerprint %s) does not match the source recorded for stream %q (fingerprint %s) — "+
+				"refusing to prune the wrong change-log; pass the exact --source/--stream-id pair the sync uses",
+			computed, c.StreamID, storedFingerprint,
+		)}
+	}
+	return nil
 }
 
 // decodeAppliedLastID dispatches the trigger-CDC token decode to the source

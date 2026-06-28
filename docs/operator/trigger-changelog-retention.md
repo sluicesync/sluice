@@ -28,7 +28,29 @@ for those rows and find them gone: **silent, permanent data loss.**
 
 If the command cannot read the target's durable position (no sync has
 applied anything yet, or the target is unreachable), it **refuses
-loudly and deletes nothing**. There is no "prune blind" mode.
+loudly and deletes nothing**. There is no "prune blind" mode. It also
+refuses if the `--stream-id` resolves to a position that is not a
+trigger-CDC watermark (e.g. you pointed it at a pgoutput / GTID stream).
+
+## ⚠️ Pass the EXACT `--source` / `--stream-id` pair the sync uses
+
+The frontier is read from the stream named by `--stream-id`, and the cut
+it produces is applied to the change-log at `--source`. If you pair
+`--source` (change-log A) with a `--stream-id` whose frontier belongs to
+a **different** source B, the two are in different id spaces — and B's
+cut applied to A can delete A's not-yet-applied rows: **silent loss.**
+
+sluice cross-checks this where it can. Each stream records a source
+*fingerprint* (host:port:database, ADR-0031); for a **PostgreSQL** source
+(`postgres-trigger`) the command recomputes `--source`'s fingerprint and
+**refuses loudly on a mismatch**. For a **SQLite file** (`sqlite-trigger`)
+or a **D1** (`d1-trigger`) source there is no recorded fingerprint (only
+host:port:db is fingerprinted), so the cross-check **cannot run** — the
+command prints a `note:` saying so and trusts the pair you passed. For
+those sources it is **your responsibility** to pass the exact
+`--source`/`--stream-id` pair the sync runs with. (Extending the
+fingerprint to file/D1 sources so the cross-check covers them too is a
+tracked Phase-A.1 follow-up.)
 
 ## Usage
 
