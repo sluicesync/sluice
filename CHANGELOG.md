@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.156] - 2026-06-29
+
+### Fixed
+
+- **LOW: `--type-override` rejected an uppercase/mixed-case type name, so the remedy printed by the v0.99.155 Bug-170 refusal did not copy-paste (Bug 171).** The Bug-170 message suggests `--type-override <table>.<col>=VARCHAR(n)` (uppercase, as SQL conventionally writes type names), but the override parser matched the type name case-sensitively against the lower-case set, so `VARCHAR(255)` failed with `type "VARCHAR" does not take parenthesised arguments` and an uppercase bare name (e.g. `BIGINT`) failed to resolve — the operator had to know to lower-case it. Loud, zero data loss. **Fix:** SQL type names are case-insensitive, so the override now canonicalises the type name to lower case — both in the CLI spec parser (covering `VARCHAR(255)`, `Decimal(20,2)`, bare `BIGINT`, …) and in the shared resolver (covering the YAML `mappings:` input path), so any casing resolves identically and the suggested remedy works verbatim. Pinned by parser unit cases (uppercase `VARCHAR(n)`, bare `BIGINT`, mixed-case `Decimal(p,s)`) and a resolver case-insensitivity test.
+
 ## [0.99.155] - 2026-06-29
 
 ### Fixed

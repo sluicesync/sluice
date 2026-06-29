@@ -49,6 +49,25 @@ func TestParseTypeOverride(t *testing.T) {
 			"t.amount=decimal( 20 , 4 )",
 			config.Mapping{Table: "t", Column: "amount", TargetType: "decimal", TargetTypeOptions: map[string]any{"precision": 20, "scale": 4}},
 		},
+		{
+			// Bug 171: the Bug-170 refusal message suggests an UPPERCASE
+			// VARCHAR(n); SQL type names are case-insensitive, so it must parse
+			// to the canonical lower-case `varchar` (else the suggested remedy
+			// fails to copy-paste).
+			"uppercase VARCHAR(n) canonicalised (Bug 171)",
+			"tpk_text.code=VARCHAR(255)",
+			config.Mapping{Table: "tpk_text", Column: "code", TargetType: "varchar", TargetTypeOptions: map[string]any{"length": 255}},
+		},
+		{
+			"uppercase bare type name canonicalised",
+			"t.n=BIGINT",
+			config.Mapping{Table: "t", Column: "n", TargetType: "bigint"},
+		},
+		{
+			"mixed-case decimal canonicalised",
+			"t.amount=Decimal(20,2)",
+			config.Mapping{Table: "t", Column: "amount", TargetType: "decimal", TargetTypeOptions: map[string]any{"precision": 20, "scale": 2}},
+		},
 	}
 	for _, c := range cases {
 		c := c

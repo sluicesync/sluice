@@ -191,6 +191,33 @@ func TestApplyMappings_VarcharOptions(t *testing.T) {
 	}
 }
 
+// TestApplyMappings_TargetTypeCaseInsensitive pins Bug 171: a non-lower-case
+// TargetType (e.g. a YAML `mappings:` block spelling, or the Bug-170 remedy's
+// uppercase VARCHAR) resolves identically — SQL type names are case-insensitive.
+func TestApplyMappings_TargetTypeCaseInsensitive(t *testing.T) {
+	s := schemaWith(struct {
+		table string
+		cols  []string
+	}{"users", []string{"username"}})
+
+	got, err := ApplyMappings(s, []config.Mapping{
+		{
+			Table: "users", Column: "username", TargetType: "VARCHAR",
+			TargetTypeOptions: map[string]any{"length": 64},
+		},
+	})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	v, ok := got.Tables[0].Columns[0].Type.(ir.Varchar)
+	if !ok {
+		t.Fatalf("type = %T; want ir.Varchar (uppercase VARCHAR must resolve)", got.Tables[0].Columns[0].Type)
+	}
+	if v.Length != 64 {
+		t.Errorf("length = %d; want 64", v.Length)
+	}
+}
+
 // TestApplyMappings_NumericAliasAndPrecision pins that `numeric` resolves
 // as an alias for `decimal` and that precision/scale options apply — the
 // resolution side of the CLI `decimal(p,s)`/`numeric(p,s)` paren shorthand.

@@ -114,12 +114,15 @@ func parseTypeOverride(raw string) (config.Mapping, error) {
 func parseTargetTypeSpec(spec string) (name string, opts map[string]any, err error) {
 	open := strings.IndexByte(spec, '(')
 	if open < 0 {
-		return spec, nil, nil
+		// SQL type names are case-insensitive; canonicalise to lower case so
+		// `BIGINT` / `Text` resolve identically to `bigint` / `text` (Bug 171 —
+		// the Bug-170 remedy suggests `VARCHAR(n)`, which must parse).
+		return strings.ToLower(spec), nil, nil
 	}
 	if !strings.HasSuffix(spec, ")") {
 		return "", nil, fmt.Errorf("type %q has an unbalanced '('", spec)
 	}
-	name = strings.TrimSpace(spec[:open])
+	name = strings.ToLower(strings.TrimSpace(spec[:open]))
 	inner := strings.TrimSpace(spec[open+1 : len(spec)-1])
 	if name == "" {
 		return "", nil, fmt.Errorf("missing type name before '(' in %q", spec)

@@ -263,6 +263,11 @@ var postgisAliasSubtypes = map[string]ir.GeometrySubtype{
 // options (`length`); the rest take options as a no-op so future
 // additions don't require a signature change.
 func resolveTargetType(name string, opts map[string]any) (ir.Type, error) {
+	// SQL type names are case-insensitive; canonicalise so a YAML `mappings:`
+	// (or any caller) spelling like `VARCHAR`/`Decimal` resolves identically to
+	// the lower-case form (Bug 171 — the CLI parser already lower-cases, this
+	// covers the other input paths to the same chokepoint).
+	name = strings.ToLower(name)
 	if name == "varchar" {
 		length := 255
 		if raw, ok := opts["length"]; ok {
