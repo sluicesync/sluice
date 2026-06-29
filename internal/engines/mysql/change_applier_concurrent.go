@@ -187,6 +187,14 @@ func (la *laneApplierAdapter) PKValuesForRouting(ctx context.Context, c ir.Chang
 // pooled connection per concurrent lane commit == one backend per lane in
 // practice — matching the GA behavior (no per-lane dedicated *sql.Conn).
 //
+// ADR-0139: the lane's changes run through the SAME coalescing accumulator
+// ([mysqlBatchTx]) the single-lane batch path uses — consecutive same-table,
+// same-shape keyed inserts become one multi-row INSERT, flushed before any
+// serial (non-insert / keyless) change and once more before commit. A lane
+// batch is key-hashed (same key → same lane), so its inserts are distinct-PK
+// rows of a small set of tables — coalescing is highly effective. Encoding
+// reuses buildMultiRowInsertSQL (byte-identical to the serial single-row path).
+//
 // The *sql.Tx is rolled back on every error path and committed via
 // commitWithTimeout on success; sqlclosecheck can't track that
 // commit-or-rollback discipline across the dispatch loop, so it's suppressed.
@@ -197,16 +205,24 @@ func (la *laneApplierAdapter) ApplyLaneBatch(ctx context.Context, _ int, batch [
 	if err != nil {
 		return 0, fmt.Errorf("mysql: applier: lane begin tx: %w", err)
 	}
+	btx := &mysqlBatchTx{a: la.a, tx: tx, ctx: ctx}
 	for _, c := range batch {
 		if err := la.a.redactChange(ctx, c); err != nil {
 			_ = tx.Rollback()
 			return 0, fmt.Errorf("mysql: applier: redact: %w", err)
 		}
 		la.a.stampShardChange(c)
-		if err := la.a.dispatch(ctx, tx, la.streamID, c); err != nil {
+		if err := btx.dispatch(ctx, la.streamID, c); err != nil {
 			_ = tx.Rollback()
 			return 0, err
 		}
+	}
+	// Flush the trailing coalesced insert run before commit so all of the
+	// lane's data is durable in this tx (the lane writes no position — the
+	// orchestrator's frontier checkpoint owns it).
+	if err := btx.flushPending(ctx); err != nil {
+		_ = tx.Rollback()
+		return 0, err
 	}
 	// Test seam: force a commit-path failure deterministically (the lane
 	// analogue of the serial path's removed pipelineTestCommitHook). nil in

@@ -48,9 +48,7 @@ package mysql
 
 import (
 	"context"
-	"database/sql"
 	"errors"
-	"fmt"
 	"log/slog"
 
 	"sluicesync.dev/sluice/internal/appliershared"
@@ -139,21 +137,26 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 		ByteCap:                    byteCap,
 		BatchSizeProvider:          a.batchSizeProvider,
 		BatchObserver:              a.batchObserver,
-		BeginTx:                    a.beginSerialBatchTx,
+		// ADR-0139: BeginTx returns the coalescing handle (*mysqlBatchTx) that
+		// buffers consecutive same-table/same-shape keyed inserts and emits
+		// them as one multi-row INSERT at flush; the Dispatch / WritePosition /
+		// Commit closures drive it (flush-before-position so the data is durable
+		// before the position write, flush-on-commit for the mid-tx
+		// CheckpointOnly path). Value encoding is byte-identical to the serial
+		// single-row path (same prepareApplierValue → `?` binding).
+		BeginTx: a.beginCoalescingBatchTx,
 		Dispatch: func(ctx context.Context, tx appliershared.BatchTx, streamID string, c ir.Change) error {
-			return a.dispatch(ctx, tx.(*sql.Tx), streamID, c)
+			return tx.(*mysqlBatchTx).dispatch(ctx, streamID, c)
 		},
 		ApplyOne:   a.applyOne,
 		Redact:     a.redactChange,
 		StampShard: a.stampShardChange,
 		Classify:   classifyApplierError,
 		WritePosition: func(ctx context.Context, tx appliershared.BatchTx, streamID, token string) error {
-			posCtx, posCancel := a.execTimeoutCtx(ctx)
-			defer posCancel()
-			return writePositionTx(posCtx, tx.(*sql.Tx), streamID, token, a.slotName, a.sourceFingerprint, a.targetSchema)
+			return tx.(*mysqlBatchTx).writePosition(ctx, streamID, token)
 		},
 		Commit: func(tx appliershared.BatchTx) error {
-			return a.commitWithTimeout(tx.(*sql.Tx))
+			return tx.(*mysqlBatchTx).commit()
 		},
 		// AfterCommit stays nil (MySQL has no slot-ack tracker).
 		// CacheSchemaSnapshot stays nil: SchemaSnapshots route through
@@ -162,16 +165,6 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 		IsKeylessTable: a.isKeylessInsert,
 	}
 	return cfg
-}
-
-// beginSerialBatchTx opens the serial *sql.Tx batch transaction, returned
-// as the [appliershared.BatchTx] the seam requires.
-func (a *ChangeApplier) beginSerialBatchTx(ctx context.Context) (appliershared.BatchTx, error) {
-	tx, err := a.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, fmt.Errorf("mysql: applier: begin tx: %w", err)
-	}
-	return tx, nil
 }
 
 // isKeylessInsert is the ADR-0089 keyless-guard predicate (MySQL). It

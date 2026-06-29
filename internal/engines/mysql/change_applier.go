@@ -1271,28 +1271,14 @@ func loadPrimaryKey(ctx context.Context, tx *sql.Tx, schema, table string) ([]st
 	return pk, rows.Err()
 }
 
-// buildInsertSQL builds an INSERT statement using the row-alias
-// UPSERT form (8.0.20+). With a non-empty PK the SET-list reassigns
-// every non-PK column to the new row's value:
-//
-//	INSERT INTO `s`.`t` (`a`, `b`) VALUES (?, ?) AS new
-//	ON DUPLICATE KEY UPDATE `a` = new.`a`, `b` = new.`b`
-//
-// With an empty PK list (tables without a PRIMARY KEY) it STILL emits
-// ON DUPLICATE KEY UPDATE — with a full-row SET-list (every column ←
-// its new value) — because MySQL fires that clause on a conflict
-// against any unique index, not just the PK. This makes a no-PK table
-// with a UNIQUE key idempotent on re-apply (the ADR-0072 Gap-2
-// interlock); a truly keyless table never collides, so the clause is
-// inert and behavior is effectively plain INSERT. See the
-// ChangeApplier package doc for the full resume-idempotency contract.
-//
-// colTypes maps column names to their full IR descriptors and is the
-// input to prepareValue. A missing entry (empty map, or column not
-// present) is tolerated and the raw value is bound — the same
-// pre-Bug-6 shape — so that callers without a populated cache
-// (currently only unit tests pre-dating this fix) still produce
-// valid SQL.
+// buildInsertSQL builds a single-row INSERT using the row-alias UPSERT form
+// (8.0.20+). It is the N == 1 case of [buildMultiRowInsertSQL] and delegates
+// to it so the single-row and multi-row coalescing paths (ADR-0139) share one
+// source of truth for the column list, the value binding, and the
+// ON DUPLICATE KEY UPDATE clause — the output is byte-identical to the
+// pre-ADR-0139 single-row builder. See [buildMultiRowInsertSQL] and
+// [onDuplicateKeyUpdateClause] for the upsert / keyless / no-PK semantics and
+// the value-fidelity contract.
 //
 // The error return is the PG-applier signature convergence (repo-audit
 // M2.1): today no MySQL value rule refuses, so it is always nil — it
@@ -1300,99 +1286,7 @@ func loadPrimaryKey(ctx context.Context, tx *sql.Tx, schema, table string) ([]st
 // this path without another signature change. Same on the
 // buildUpdateSQL / buildDeleteSQL / clause-builder siblings.
 func buildInsertSQL(schema, table string, row ir.Row, pk []string, colTypes map[string]*ir.Column) (sqlStmt string, args []any, err error) {
-	cols := appliershared.NonGeneratedRowKeys(row, colTypes)
-	args = make([]any, 0, len(cols))
-	colSQL := make([]string, len(cols))
-	for i, c := range cols {
-		colSQL[i] = quoteIdent(c)
-		v, perr := prepareApplierValue(row[c], colTypes, c)
-		if perr != nil {
-			return "", nil, fmt.Errorf("column %q: %w", c, perr)
-		}
-		args = append(args, v)
-	}
-
-	tableRef := quoteIdent(schema) + "." + quoteIdent(table)
-	placeholders := strings.Repeat("?, ", len(cols))
-	placeholders = strings.TrimSuffix(placeholders, ", ")
-
-	var sb strings.Builder
-	sb.WriteString("INSERT INTO ")
-	sb.WriteString(tableRef)
-	sb.WriteString(" (")
-	sb.WriteString(strings.Join(colSQL, ", "))
-	sb.WriteString(") VALUES (")
-	sb.WriteString(placeholders)
-	sb.WriteByte(')')
-
-	if len(pk) > 0 {
-		// Row-alias UPSERT: every non-PK column gets reassigned to
-		// the new row's value. PK columns are excluded from the
-		// SET list because updating them on conflict would be a
-		// no-op at best (PK columns equal by definition during the
-		// conflict) and silently incorrect if the new and existing
-		// rows have differing PK shapes.
-		pkSet := make(map[string]struct{}, len(pk))
-		for _, p := range pk {
-			pkSet[p] = struct{}{}
-		}
-		nonPK := make([]string, 0, len(cols))
-		for _, c := range cols {
-			if _, isPK := pkSet[c]; !isPK {
-				nonPK = append(nonPK, c)
-			}
-		}
-		if len(nonPK) > 0 {
-			sb.WriteString(" AS new ON DUPLICATE KEY UPDATE ")
-			parts := make([]string, len(nonPK))
-			for i, c := range nonPK {
-				parts[i] = fmt.Sprintf("%s = new.%s", quoteIdent(c), quoteIdent(c))
-			}
-			sb.WriteString(strings.Join(parts, ", "))
-		} else {
-			// Every column is a PK column — the row IS its own key.
-			// On conflict there's nothing to update; emit
-			// ON DUPLICATE KEY UPDATE with a no-op assignment so
-			// the conflict is absorbed silently.
-			sb.WriteString(" AS new ON DUPLICATE KEY UPDATE ")
-			sb.WriteString(quoteIdent(pk[0]))
-			sb.WriteString(" = new.")
-			sb.WriteString(quoteIdent(pk[0]))
-		}
-	} else {
-		// No PRIMARY KEY. We still emit ON DUPLICATE KEY UPDATE so a
-		// collision on ANY unique index is absorbed idempotently
-		// rather than erroring with MySQL 1062 (duplicate-key). This
-		// is the ADR-0072 Gap-2 interlock: the resumable cold-start
-		// COPY routes the post-checkpoint catch-up rows through this
-		// applier, and the checkpoint cadence (every 50k rows / 10s)
-		// lags the COPY writer's flushes — so on resume vtgate
-		// re-sends rows the target already holds (id > lastpk that
-		// were flushed past the last checkpoint). On a no-PK table
-		// with a UNIQUE key (the Bug-125 shape, e.g. `connections`)
-		// those re-sends would otherwise collide on the unique index
-		// and 1062 → terminal resume failure.
-		//
-		// ON DUPLICATE KEY UPDATE fires on a conflict against any
-		// unique index, so the SET-list is what matters: set every
-		// column to its new value (full-row upsert). That is correct
-		// for both a re-emitted COPY row (overwrites with identical
-		// data — a no-op) and a catch-up UPDATE that arrived as an
-		// Insert (overwrites with the newer image).
-		//
-		// A TRULY keyless table (no PK AND no unique index) never
-		// collides, so the ON DUPLICATE KEY UPDATE clause is inert
-		// and behavior stays effectively plain-INSERT (the unchanged
-		// best-effort path). Such tables are refused at cold-start by
-		// the Bug-125 keyless guard, so they never reach resume.
-		sb.WriteString(" AS new ON DUPLICATE KEY UPDATE ")
-		parts := make([]string, len(cols))
-		for i, c := range cols {
-			parts[i] = fmt.Sprintf("%s = new.%s", quoteIdent(c), quoteIdent(c))
-		}
-		sb.WriteString(strings.Join(parts, ", "))
-	}
-	return sb.String(), args, nil
+	return buildMultiRowInsertSQL(schema, table, []ir.Row{row}, pk, colTypes)
 }
 
 // buildUpdateSQL builds an UPDATE statement. SET uses every column
