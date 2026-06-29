@@ -176,6 +176,13 @@ func TestChangeChunk_Int64Precision_Bug172(t *testing.T) {
 			"blob":  []byte{0x00, 0xff, 0x00},     // wide family
 			"txt":   "x",
 			"nul":   nil,
+			// Bug-74 corollary (value-fidelity review): the pre-fix bug ALSO
+			// corrupted int64 NESTED inside list/map envelopes (each nested
+			// number floated identically), and float64 takes a separate
+			// bare-number decode path — so pin both strictly, not just flat ints.
+			"lst":  []any{int64(9007199254740993), int64(-9223372036854775808)}, // list with unsafe-range int64 elements
+			"jmap": map[string]any{"inner": int64(9223372036854775807)},         // JSON-column map with nested MaxInt64
+			"f":    1.0000000000000002,                                          // float64 needing full precision
 		}
 		for k, v := range bigInts {
 			r[k] = v
@@ -240,6 +247,27 @@ func TestChangeChunk_Int64Precision_Bug172(t *testing.T) {
 		}
 		if gv, ok := row["blob"].([]byte); !ok || !bytes.Equal(gv, []byte{0x00, 0xff, 0x00}) {
 			t.Errorf("%s col blob: got %v, want [0 255 0]", label, row["blob"])
+		}
+		// Nested int64 in a list — must recurse losslessly (Bug-74 corollary).
+		lst, ok := row["lst"].([]any)
+		if !ok || len(lst) != 2 {
+			t.Errorf("%s col lst: got %T %v, want []any of 2", label, row["lst"], row["lst"])
+		} else {
+			for i, want := range []int64{9007199254740993, -9223372036854775808} {
+				if gv, ok := lst[i].(int64); !ok || gv != want {
+					t.Errorf("%s col lst[%d]: got %v (%T), want int64 %d (nested int64 precision — Bug 172)", label, i, lst[i], lst[i], want)
+				}
+			}
+		}
+		// Nested int64 in a JSON-column map — must recurse losslessly.
+		if jm, ok := row["jmap"].(map[string]any); !ok {
+			t.Errorf("%s col jmap: got %T, want map[string]any", label, row["jmap"])
+		} else if gv, ok := jm["inner"].(int64); !ok || gv != 9223372036854775807 {
+			t.Errorf("%s col jmap.inner: got %v (%T), want int64 MaxInt64 (nested int64 precision — Bug 172)", label, jm["inner"], jm["inner"])
+		}
+		// float64 on the separate bare-number decode path — full precision.
+		if gv, ok := row["f"].(float64); !ok || gv != 1.0000000000000002 {
+			t.Errorf("%s col f: got %v (%T), want float64 1.0000000000000002", label, row["f"], row["f"])
 		}
 	}
 	checkRow("insert.row", got[0].(ir.Insert).Row)
