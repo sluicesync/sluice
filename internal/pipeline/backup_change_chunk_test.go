@@ -152,6 +152,102 @@ func TestChangeChunk_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestChangeChunk_Int64Precision_Bug172 pins the Bug-172 fix: int64 values
+// above 2^53 must round-trip EXACTLY through the change-chunk write→read cycle.
+// The pre-fix decoder unmarshalled the record into a changeWire whose Row maps
+// were map[string]any, so the i64 envelope's number became float64 — silently
+// corrupting large ids BEFORE decodeValue ran. The original round-trip test
+// missed this because it used int64(1) (float64-exact) AND a drift-tolerant
+// comparison; this test uses unsafe-range int64s and STRICT per-column value
+// assertions, so any float64 drift fails loudly. (Insert.Row + Update.Before/
+// After + Delete.Before all exercise the same decodeRowValues path.)
+func TestChangeChunk_Int64Precision_Bug172(t *testing.T) {
+	pos := func(tok string) ir.Position { return ir.Position{Engine: "postgres", Token: tok} }
+	bigInts := map[string]int64{
+		"id":        9007199254740993,    // 2^53 + 1 (first int64 float64 can't represent)
+		"i_max":     9223372036854775807, // MaxInt64
+		"i_min":     -9223372036854775808,
+		"i_bug":     9007199254782995, // from the Bug-172 repro (silently +1'd pre-fix)
+		"i_bug_neg": -9223372036854775802,
+	}
+	mkRow := func() ir.Row {
+		r := ir.Row{
+			"u_big": uint64(18446744073709551615), // MaxUint64 (string envelope — pin it too)
+			"blob":  []byte{0x00, 0xff, 0x00},     // wide family
+			"txt":   "x",
+			"nul":   nil,
+		}
+		for k, v := range bigInts {
+			r[k] = v
+		}
+		return r
+	}
+	in := []ir.Change{
+		ir.Insert{Position: pos("t1"), Schema: "public", Table: "t", Row: mkRow()},
+		ir.Update{Position: pos("t2"), Schema: "public", Table: "t", Before: mkRow(), After: mkRow()},
+		ir.Delete{Position: pos("t3"), Schema: "public", Table: "t", Before: mkRow()},
+	}
+
+	buf := &bytes.Buffer{}
+	w, err := newChangeChunkWriter(buf, nil, CodecGzip)
+	if err != nil {
+		t.Fatalf("newChangeChunkWriter: %v", err)
+	}
+	for _, c := range in {
+		if err := w.WriteChange(c); err != nil {
+			t.Fatalf("WriteChange: %v", err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	r, err := newChangeChunkReader(nopReadCloserFromBytes(buf.Bytes()), w.Hash(), nil, CodecGzip)
+	if err != nil {
+		t.Fatalf("newChangeChunkReader: %v", err)
+	}
+	var got []ir.Change
+	for {
+		c, err := r.ReadChange()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("ReadChange: %v", err)
+		}
+		got = append(got, c)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if len(got) != len(in) {
+		t.Fatalf("decoded %d changes; want %d", len(got), len(in))
+	}
+
+	checkRow := func(label string, row ir.Row) {
+		for col, want := range bigInts {
+			gv, ok := row[col].(int64)
+			if !ok {
+				t.Errorf("%s col %q: type %T, want int64 (float64 drift = Bug 172)", label, col, row[col])
+				continue
+			}
+			if gv != want {
+				t.Errorf("%s col %q: got %d, want %d (int64 precision lost — Bug 172)", label, col, gv, want)
+			}
+		}
+		if gv, ok := row["u_big"].(uint64); !ok || gv != 18446744073709551615 {
+			t.Errorf("%s col u_big: got %v (%T), want uint64 MaxUint64", label, row["u_big"], row["u_big"])
+		}
+		if gv, ok := row["blob"].([]byte); !ok || !bytes.Equal(gv, []byte{0x00, 0xff, 0x00}) {
+			t.Errorf("%s col blob: got %v, want [0 255 0]", label, row["blob"])
+		}
+	}
+	checkRow("insert.row", got[0].(ir.Insert).Row)
+	checkRow("update.before", got[1].(ir.Update).Before)
+	checkRow("update.after", got[1].(ir.Update).After)
+	checkRow("delete.before", got[2].(ir.Delete).Before)
+}
+
 // TestChangeChunk_HashMismatch confirms a corrupted chunk surfaces
 // ErrChunkHashMismatch on Close.
 func TestChangeChunk_HashMismatch(t *testing.T) {

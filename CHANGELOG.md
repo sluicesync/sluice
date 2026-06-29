@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.159] - 2026-06-29
+
+### Fixed
+
+- **CRITICAL: restoring an incremental backup chain silently corrupted `int64` values above 2^53 (Bug 172).** The incremental change-chunk decoder unmarshalled each record into a `changeWire` whose row maps were `map[string]any`, so Go's `encoding/json` decoded the `int64` tagged-value envelope's number (`{"_t":"i64","v":<number>}`) into a **`float64` before the value codec ever ran** — losing precision for any integer beyond 2^53. On a `sluice restore` / `sync from-backup` replay of an incremental chain this produced **silent data corruption**: a large id like `9007199254782995` came back as `…996`, and — because corrupted before-images no longer matched — deletes silently affected zero rows, so deleted rows survived on the target. The full-snapshot (row-chunk) decoder was always correct (it decodes each value as a `json.RawMessage` and hands the exact bytes to the codec); only the change-chunk (incremental) path had the defect, so it affects incremental-chain restore for any source whose changes carry int64 values above 2^53. No corruption of full backups or of live (non-backup) CDC apply. **Fix:** the change-chunk decoder now holds each row value as a `json.RawMessage` (matching the row-chunk path) and hands the exact wire bytes to the value codec, so every type — int64 above 2^53 included — round-trips losslessly. The on-wire chunk format is unchanged (a `map[string]json.RawMessage` marshals identically), so existing backups now restore correctly with the fixed reader. The miss was a textbook value-fidelity gap: the existing round-trip test used `int64(1)` (float64-exact) and a drift-tolerant comparison; the new pin exercises 2^53+1, int64 min/max, and the exact repro values across Insert/Update/Delete with strict per-column equality so any float64 drift fails loudly. Found by the SQLite backup-roundtrip test (full SQLite backups verified byte-exact; the chain restore surfaced this). The `-race` integration gate passed before tagging.
+
 ## [0.99.158] - 2026-06-29
 
 ### Added

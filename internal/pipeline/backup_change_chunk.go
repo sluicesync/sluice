@@ -370,14 +370,22 @@ func (r *changeChunkReader) Close() error {
 // The fields are union-typed: Insert uses Row; Update uses Before /
 // After; Delete uses Before; Truncate uses none of them; TxBegin /
 // TxCommit use only Position. The decoder branches on Kind.
+//
+// Row / Before / After are map[string]json.RawMessage — NOT map[string]any.
+// Bug 172: with map[string]any, json.Unmarshal of the record decodes the i64
+// envelope's `"v":<number>` to float64, silently corrupting int64 values above
+// 2^53 BEFORE decodeValue ever runs. Holding each value as a RawMessage hands
+// decodeValue the exact wire bytes (the same approach the row-chunk decoder at
+// backup_chunk.go uses), so int64 round-trips losslessly. The on-wire JSON is
+// identical to the map[string]any form, so existing backups decode correctly.
 type changeWire struct {
-	Kind     string         `json:"_t"`
-	Schema   string         `json:"schema,omitempty"`
-	Table    string         `json:"table,omitempty"`
-	Row      map[string]any `json:"row,omitempty"`
-	Before   map[string]any `json:"before,omitempty"`
-	After    map[string]any `json:"after,omitempty"`
-	Position ir.Position    `json:"position"`
+	Kind     string                     `json:"_t"`
+	Schema   string                     `json:"schema,omitempty"`
+	Table    string                     `json:"table,omitempty"`
+	Row      map[string]json.RawMessage `json:"row,omitempty"`
+	Before   map[string]json.RawMessage `json:"before,omitempty"`
+	After    map[string]json.RawMessage `json:"after,omitempty"`
+	Position ir.Position                `json:"position"`
 }
 
 const (
@@ -398,28 +406,44 @@ func encodeChange(c ir.Change) (*changeWire, error) {
 	}
 	switch x := c.(type) {
 	case ir.Insert:
+		row, err := encodeRowValues(x.Row)
+		if err != nil {
+			return nil, err
+		}
 		return &changeWire{
 			Kind:     changeKindInsert,
 			Schema:   x.Schema,
 			Table:    x.Table,
-			Row:      encodeRowValues(x.Row),
+			Row:      row,
 			Position: x.Position,
 		}, nil
 	case ir.Update:
+		before, err := encodeRowValues(x.Before)
+		if err != nil {
+			return nil, err
+		}
+		after, err := encodeRowValues(x.After)
+		if err != nil {
+			return nil, err
+		}
 		return &changeWire{
 			Kind:     changeKindUpdate,
 			Schema:   x.Schema,
 			Table:    x.Table,
-			Before:   encodeRowValues(x.Before),
-			After:    encodeRowValues(x.After),
+			Before:   before,
+			After:    after,
 			Position: x.Position,
 		}, nil
 	case ir.Delete:
+		before, err := encodeRowValues(x.Before)
+		if err != nil {
+			return nil, err
+		}
 		return &changeWire{
 			Kind:     changeKindDelete,
 			Schema:   x.Schema,
 			Table:    x.Table,
-			Before:   encodeRowValues(x.Before),
+			Before:   before,
 			Position: x.Position,
 		}, nil
 	case ir.Truncate:
@@ -501,38 +525,38 @@ func decodeChange(w *changeWire) (ir.Change, error) {
 }
 
 // encodeRowValues runs each value through encodeValue so wide types
-// (bytes, time, int64) wear the tagged-value envelope. nil rows
-// (legitimate for Truncate / TxBegin / TxCommit and for Update /
-// Delete with no before-image) round-trip to nil.
-func encodeRowValues(r ir.Row) map[string]any {
+// (bytes, time, int64) wear the tagged-value envelope, then marshals each
+// envelope to a json.RawMessage. Holding RawMessage (rather than `any`) is what
+// lets the decoder recover int64 losslessly (Bug 172) — the marshalled bytes
+// are the same the map[string]any form produced, so the on-wire JSON is
+// unchanged. nil rows (legitimate for Truncate / TxBegin / TxCommit and for
+// Update / Delete with no before-image) round-trip to nil.
+func encodeRowValues(r ir.Row) (map[string]json.RawMessage, error) {
 	if r == nil {
-		return nil
+		return nil, nil
 	}
-	out := make(map[string]any, len(r))
+	out := make(map[string]json.RawMessage, len(r))
 	for k, v := range r {
-		out[k] = encodeValue(v)
+		raw, err := json.Marshal(encodeValue(v))
+		if err != nil {
+			return nil, fmt.Errorf("encode row column %q: %w", k, err)
+		}
+		out[k] = raw
 	}
-	return out
+	return out, nil
 }
 
-// decodeRowValues is the inverse of encodeRowValues. JSON unmarshal
-// already turned the wire bytes into a map[string]any (with json's
-// default types); we re-encode to RawMessage so decodeValue can
-// branch on the tagged envelope shape.
-func decodeRowValues(m map[string]any) (ir.Row, error) {
+// decodeRowValues is the inverse of encodeRowValues. Each value is already a
+// json.RawMessage (the EXACT wire bytes — see changeWire: this is the Bug-172
+// fix, avoiding the map[string]any float64 round-trip), so decodeValue branches
+// on the tagged envelope directly with no precision loss.
+func decodeRowValues(m map[string]json.RawMessage) (ir.Row, error) {
 	if m == nil {
 		return nil, nil
 	}
 	out := make(ir.Row, len(m))
 	for k, v := range m {
-		// Round-trip via JSON to get a RawMessage decodeValue can
-		// branch on. The cost is small (a single Marshal per value)
-		// and avoids duplicating the tagged-envelope decoder.
-		raw, err := json.Marshal(v)
-		if err != nil {
-			return nil, fmt.Errorf("decode row column %q: marshal: %w", k, err)
-		}
-		dec, err := decodeValue(raw)
+		dec, err := decodeValue(v)
 		if err != nil {
 			return nil, fmt.Errorf("decode row column %q: %w", k, err)
 		}
