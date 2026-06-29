@@ -339,6 +339,28 @@ type ChangeApplier struct {
 	// state stream of rows + boundaries has exactly #primed-tables
 	// resolve hits, NOT O(rows) or O(boundaries).
 	resolveCallsForTest atomic.Int64
+
+	// coalescedRows / coalescedFlushes are the ADR-0139/0140 coalescing-
+	// ratio observability counters (Bug 169 follow-up): the running total
+	// of rows folded into a multi-row flush and the count of multi-row
+	// statements emitted, respectively. Their ratio (rows ÷ flushes) is
+	// the average rows-per-coalesced-statement — a high ratio means the
+	// workload has long same-kind runs (one round trip absorbs many rows);
+	// ~1 means it alternates kinds / has no runs and apply stays RTT-bound.
+	// Atomic because the ADR-0104 concurrent lanes increment them from W
+	// goroutines via [mysqlBatchTx.flushUpserts] / flushDeletes. Read by
+	// [ChangeApplier.noteCoalescedFlush], which emits a rate-limited INFO
+	// line so an operator can see whether coalescing is helping.
+	coalescedRows    atomic.Int64
+	coalescedFlushes atomic.Int64
+
+	// lastCoalesceLogNanos is the UnixNano of the last emitted coalescing-
+	// ratio INFO line. The rate-limiter (noteCoalescedFlush) reads it,
+	// checks the window, and claims the next slot via CompareAndSwap so at
+	// most ONE of the W concurrent lanes logs per window — no mutex needed
+	// on the apply hot path. Zero means "never logged" (the first flush
+	// logs, matching appliercontrol.NoteByteCapDominant's first-call shape).
+	lastCoalesceLogNanos atomic.Int64
 }
 
 // activeSchemaVersion is one entry in the ADR-0049 Chunk C applier

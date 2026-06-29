@@ -20,7 +20,7 @@ import (
 //	Boolean  → BOOLEAN     (declared-bool match; value 0/1)
 //	Integer  → INTEGER     (INTEGER affinity; width/sign not preserved)
 //	Float    → REAL        (REAL affinity)
-//	Decimal  → DECIMAL(p,s) / NUMERIC (NUMERIC affinity)
+//	Decimal  → TEXT        (TEXT affinity; Bug 162 — preserves the exact decimal)
 //	Char/Varchar/Text → TEXT (TEXT affinity; length not enforced)
 //	Blob/Binary/Varbinary → BLOB (BLOB affinity)
 //	Date     → DATE        Time → TIME    DateTime/Timestamp → DATETIME

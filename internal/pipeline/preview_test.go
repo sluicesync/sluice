@@ -493,6 +493,161 @@ func TestPreviewer_Run_UnknownFormat(t *testing.T) {
 	}
 }
 
+// sqliteAffinityFixtureSchema returns a schema with one column per IR type
+// family that normalizes onto a SQLite affinity, plus a control column
+// (Float → REAL identity) that must NOT produce a note.
+func sqliteAffinityFixtureSchema() *ir.Schema {
+	return &ir.Schema{Tables: []*ir.Table{{
+		Name: "products",
+		Columns: []*ir.Column{
+			{Name: "price", Type: ir.Decimal{Precision: 10, Scale: 2}},
+			{Name: "meta", Type: ir.JSON{}},
+			{Name: "sku", Type: ir.UUID{}},
+			{Name: "code", Type: ir.Char{Length: 8}},
+			{Name: "name", Type: ir.Varchar{Length: 255}},
+			{Name: "qty", Type: ir.Integer{Width: 32}},
+			{Name: "weight", Type: ir.Float{Precision: ir.FloatDouble}}, // control: REAL identity, no note
+		},
+	}}}
+}
+
+func sqliteFixtureStmts() []ir.DDLStatement {
+	return []ir.DDLStatement{{
+		Table: "products",
+		Kind:  "CREATE TABLE",
+		SQL: "CREATE TABLE \"products\" (\n  \"price\" TEXT,\n  \"meta\" TEXT,\n  \"sku\" TEXT,\n" +
+			"  \"code\" TEXT,\n  \"name\" TEXT,\n  \"qty\" INTEGER,\n  \"weight\" REAL\n)",
+	}}
+}
+
+// TestPreviewer_Run_SQLiteAffinityNotes_Text pins the Bug 162 affinity-
+// normalization section in the human-readable preview: a SQLite target
+// surfaces every normalized column (decimal → TEXT headline included), and
+// the control Float column produces none.
+func TestPreviewer_Run_SQLiteAffinityNotes_Text(t *testing.T) {
+	src := &previewStubEngine{name: "postgres", schema: sqliteAffinityFixtureSchema()}
+	tgt := &previewStubEngine{name: "sqlite", schema: sqliteAffinityFixtureSchema(), stmts: sqliteFixtureStmts()}
+
+	var buf bytes.Buffer
+	prev := &Previewer{
+		Source:    src,
+		Target:    tgt,
+		SourceDSN: "src",
+		TargetDSN: "tgt",
+		Format:    "text",
+		Out:       &buf,
+	}
+	if err := prev.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	out := buf.String()
+
+	if !strings.Contains(out, "-- SQLite affinity normalizations: 6") {
+		t.Errorf("expected affinity count of 6 in header; got:\n%s", out)
+	}
+	if !strings.Contains(out, "SQLite affinity normalizations (target: sqlite)") {
+		t.Errorf("missing affinity section header; got:\n%s", out)
+	}
+	// The decimal headline (value-fidelity) must be present and explain the
+	// exact-value preservation.
+	for _, want := range []string{
+		"products.price: Decimal(10,2) -> TEXT affinity",
+		"exact decimal value",
+		"products.qty: Int32 -> INTEGER affinity",
+		"products.sku: UUID -> TEXT affinity",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q; got:\n%s", want, out)
+		}
+	}
+	// The control Float column must NOT appear in the section.
+	if strings.Contains(out, "products.weight") {
+		t.Errorf("Float column should not produce an affinity note; got:\n%s", out)
+	}
+}
+
+// TestPreviewer_Run_SQLiteAffinityNotes_JSON pins the JSON shape: the
+// sqlite_affinity_notes list is populated with the stable field shape.
+func TestPreviewer_Run_SQLiteAffinityNotes_JSON(t *testing.T) {
+	src := &previewStubEngine{name: "postgres", schema: sqliteAffinityFixtureSchema()}
+	tgt := &previewStubEngine{name: "sqlite", schema: sqliteAffinityFixtureSchema(), stmts: sqliteFixtureStmts()}
+
+	var buf bytes.Buffer
+	prev := &Previewer{
+		Source:    src,
+		Target:    tgt,
+		SourceDSN: "src",
+		TargetDSN: "tgt",
+		Format:    "json",
+		Out:       &buf,
+	}
+	if err := prev.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	var got PreviewJSON
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("decode JSON: %v\noutput:\n%s", err, buf.String())
+	}
+	if len(got.SQLiteAffinityNotes) != 6 {
+		t.Fatalf("sqlite_affinity_notes = %d; want 6: %+v", len(got.SQLiteAffinityNotes), got.SQLiteAffinityNotes)
+	}
+	// Locate the decimal headline entry and assert its full shape.
+	var price *PreviewJSONSQLiteAffinity
+	for i := range got.SQLiteAffinityNotes {
+		if got.SQLiteAffinityNotes[i].Column == "price" {
+			price = &got.SQLiteAffinityNotes[i]
+			break
+		}
+	}
+	if price == nil {
+		t.Fatal("expected sqlite_affinity_note for price column")
+	}
+	if price.TargetType != "TEXT" || price.SourceType != "Decimal(10,2)" {
+		t.Errorf("price note = %+v; want SourceType=Decimal(10,2) TargetType=TEXT", *price)
+	}
+	if price.Note == "" {
+		t.Errorf("price note is empty")
+	}
+}
+
+// TestPreviewer_Run_SQLiteAffinityNotes_NonSQLiteNone verifies a non-SQLite
+// target produces no affinity notes in either format.
+func TestPreviewer_Run_SQLiteAffinityNotes_NonSQLiteNone(t *testing.T) {
+	src := &previewStubEngine{name: "postgres", schema: sqliteAffinityFixtureSchema()}
+	tgt := &previewStubEngine{name: "mysql", schema: sqliteAffinityFixtureSchema(), stmts: sqliteFixtureStmts()}
+
+	var buf bytes.Buffer
+	prev := &Previewer{
+		Source:    src,
+		Target:    tgt,
+		SourceDSN: "src",
+		TargetDSN: "tgt",
+		Format:    "json",
+		Out:       &buf,
+	}
+	if err := prev.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	var got PreviewJSON
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("decode JSON: %v", err)
+	}
+	if len(got.SQLiteAffinityNotes) != 0 {
+		t.Errorf("non-sqlite target: sqlite_affinity_notes = %d; want 0", len(got.SQLiteAffinityNotes))
+	}
+	// And the text render must omit the section entirely.
+	var tbuf bytes.Buffer
+	prev.Format = "text"
+	prev.Out = &tbuf
+	if err := prev.Run(context.Background()); err != nil {
+		t.Fatalf("Run text: %v", err)
+	}
+	if strings.Contains(tbuf.String(), "SQLite affinity normalizations") {
+		t.Errorf("non-sqlite target should omit the affinity section; got:\n%s", tbuf.String())
+	}
+}
+
 func TestPreviewer_Validate(t *testing.T) {
 	cases := []struct {
 		name string

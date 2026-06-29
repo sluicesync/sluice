@@ -73,8 +73,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
+	"time"
 
 	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
@@ -412,6 +414,7 @@ func (b *mysqlBatchTx) flushUpserts(ctx context.Context) error {
 	if multiRowFlushHookForTest != nil {
 		multiRowFlushHookForTest(len(b.run.rows))
 	}
+	b.a.noteCoalescedFlush(ctx, len(b.run.rows))
 	b.run.reset()
 	return nil
 }
@@ -434,6 +437,7 @@ func (b *mysqlBatchTx) flushDeletes(ctx context.Context) error {
 	if multiRowDeleteFlushHookForTest != nil {
 		multiRowDeleteFlushHookForTest(len(b.del.keys))
 	}
+	b.a.noteCoalescedFlush(ctx, len(b.del.keys))
 	b.del.reset()
 	return nil
 }
@@ -676,4 +680,103 @@ func buildMultiRowDeleteSQL(schema, table string, pk []string, keys [][]any, col
 	sb.WriteString(strings.Join(groups, ", "))
 	sb.WriteString(")")
 	return sb.String(), args, nil
+}
+
+// # Coalescing-ratio observability (ADR-0139/0140, Bug 169 follow-up)
+//
+// The coalescing above helps same-kind runs a lot and alternating workloads
+// little; an operator otherwise can't tell which they have. These counters +
+// the rate-limited INFO line turn that into a visible metric: the running
+// ratio of rows folded into multi-row statements ÷ statements emitted (avg
+// rows per coalesced statement). A high ratio means long same-kind runs (one
+// round trip absorbs many rows); ~1 means apply stays RTT-bound (the workload
+// alternates kinds or has no runs to coalesce).
+
+// coalesceLogInterval rate-limits the coalescing-ratio INFO line to at most
+// once per window across all concurrent lanes. 30s mirrors the floor of
+// appliercontrol.NoteByteCapDominant's rate limit — often enough to track a
+// workload shift, quiet enough never to be per-flush noise at INFO.
+const coalesceLogInterval = 30 * time.Second
+
+// coalesceClockForTest, when non-nil, overrides the wall clock the coalescing-
+// ratio rate-limiter reads so a unit test can pin the once-per-window
+// behaviour deterministically. Production leaves it nil (real time.Now).
+// Mirrors the package's other test seams (multiRowFlushHookForTest).
+var coalesceClockForTest func() time.Time
+
+func coalesceNow() time.Time {
+	if coalesceClockForTest != nil {
+		return coalesceClockForTest()
+	}
+	return time.Now()
+}
+
+// noteCoalescedFlush records one multi-row flush of `rows` rows against the
+// coalescing counters and, at most once per [coalesceLogInterval], emits an
+// INFO line reporting the running coalescing ratio + totals — so an operator
+// periodically sees whether the workload benefits from coalescing.
+//
+// Cheap and lock-free on the apply hot path: two atomic adds, plus on the rare
+// logging tick one atomic CompareAndSwap that lets exactly ONE of the W
+// concurrent lanes (ADR-0104) claim the window. A rows<=0 flush (a flush
+// always carries >=1 row, so this is defensive) is ignored so it can't skew
+// the ratio or fire the line.
+func (a *ChangeApplier) noteCoalescedFlush(ctx context.Context, rows int) {
+	if rows <= 0 {
+		return
+	}
+	totalRows := a.coalescedRows.Add(int64(rows))
+	totalFlushes := a.coalescedFlushes.Add(1)
+
+	now := coalesceNow().UnixNano()
+	last := a.lastCoalesceLogNanos.Load()
+	if !shouldLogCoalescing(last, now, int64(coalesceLogInterval)) {
+		return
+	}
+	// Claim this window; if another lane beat us to it, stay quiet.
+	if !a.lastCoalesceLogNanos.CompareAndSwap(last, now) {
+		return
+	}
+	ratio := coalescingRatio(totalRows, totalFlushes)
+	slog.InfoContext(
+		ctx, "mysql: applier: coalescing ratio",
+		slog.String("stream_id", a.streamID),
+		slog.Float64("rows_per_stmt", ratio),
+		slog.Int64("coalesced_rows", totalRows),
+		slog.Int64("coalesced_statements", totalFlushes),
+		slog.String("assessment", coalescingAssessment(ratio)),
+	)
+}
+
+// shouldLogCoalescing reports whether the coalescing-ratio line is due: the
+// first line ever (lastNanos == 0) always fires; thereafter only once the
+// window has elapsed. Pure so the window logic is unit-testable without a clock.
+func shouldLogCoalescing(lastNanos, nowNanos, intervalNanos int64) bool {
+	if lastNanos == 0 {
+		return true
+	}
+	return nowNanos-lastNanos >= intervalNanos
+}
+
+// coalescingRatio is the average rows per coalesced statement. Zero flushes
+// yields 0 (no statements emitted yet).
+func coalescingRatio(rows, flushes int64) float64 {
+	if flushes <= 0 {
+		return 0
+	}
+	return float64(rows) / float64(flushes)
+}
+
+// coalescingAssessment renders a short operator-facing verdict on the ratio.
+// The thresholds bucket the ratio so the log reads at a glance ("good" vs
+// "RTT-bound"); they are advisory only and gate nothing.
+func coalescingAssessment(ratio float64) string {
+	switch {
+	case ratio >= 10:
+		return "good — same-kind runs coalescing well"
+	case ratio >= 2:
+		return "moderate — some same-kind runs"
+	default:
+		return "RTT-bound — workload alternates kinds / no same-kind runs"
+	}
 }

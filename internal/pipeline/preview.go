@@ -153,6 +153,14 @@ type PreviewJSON struct {
 	// so the operator sees the refusal (and the `--type-override`
 	// escape hatch) before running anything.
 	TextIndexRefusals []PreviewJSONTextIndex `json:"text_index_refusals,omitempty"`
+	// SQLiteAffinityNotes is the Bug 162 list of columns whose IR type
+	// sluice maps to a SQLite storage affinity that differs from the
+	// nominal type (decimal → TEXT, json/uuid/enum/set → TEXT,
+	// char/varchar → TEXT, integer → INTEGER). Omitted for non-SQLite
+	// targets and when no such column is present. Advisory only — the
+	// migration proceeds; the headline decimal → TEXT note is the
+	// value-fidelity one (TEXT preserves the exact decimal value).
+	SQLiteAffinityNotes []PreviewJSONSQLiteAffinity `json:"sqlite_affinity_notes,omitempty"`
 }
 
 // PreviewJSONUnsignedBigint is one MySQL `bigint unsigned` → PG
@@ -189,6 +197,20 @@ type PreviewJSONTextIndex struct {
 	TargetType string `json:"target_type"`
 	Unique     bool   `json:"unique"`
 	PrimaryKey bool   `json:"primary_key"`
+}
+
+// PreviewJSONSQLiteAffinity is one Bug 162 SQLite-target affinity
+// normalization (IR type → SQLite storage affinity). Stable shape for
+// tooling consumers. SourceType is the column's IR type as declared;
+// TargetType is the SQLite affinity keyword sluice emits (TEXT / INTEGER);
+// Note explains the normalization (the decimal → TEXT entry is the
+// value-fidelity one).
+type PreviewJSONSQLiteAffinity struct {
+	Table      string `json:"table"`
+	Column     string `json:"column"`
+	SourceType string `json:"source_type"`
+	TargetType string `json:"target_type"`
+	Note       string `json:"note"`
 }
 
 // PreviewJSONTranslatorGap is one detected MySQL → PG translator
@@ -415,6 +437,19 @@ func (p *Previewer) Run(ctx context.Context) error {
 		tgtSchema, p.Source.Name(), p.Target.Name(),
 	)
 
+	// ---- 3.10. SQLite-target affinity normalizations (Bug 162) ----
+	// Advisory — NOT a refusal: these are the value-preserving (and, for
+	// decimal, value-CRITICAL) affinity normalizations the SQLite writer
+	// applies. Surfaced so an operator sees, e.g., "decimal → TEXT
+	// affinity preserves the exact value" rather than learning it only
+	// from a code comment. Scanned on the post-override schema so an
+	// applied `--type-override` is reflected. Target-only (any source →
+	// SQLite); nil for every other target. Keyed on the engine NAME +
+	// the IR type, so the pipeline stays free of an engine-package import.
+	sqliteAffinityNotices := translate.ScanSQLiteAffinityNotices(
+		tgtSchema, p.Target.Name(),
+	)
+
 	// ---- 4. Open the target schema writer; type-assert for preview. ----
 	sw, err := p.Target.OpenSchemaWriter(ctx, p.TargetDSN)
 	if err != nil {
@@ -462,6 +497,7 @@ func (p *Previewer) Run(ctx context.Context) error {
 		unconstrainedNumericNotices: unconstrainedNumericNotices,
 		wideVarcharNotices:          wideVarcharNotices,
 		textIndexNotices:            textIndexNotices,
+		sqliteAffinityNotices:       sqliteAffinityNotices,
 		redactor:                    p.Redactor,
 	}
 
@@ -518,7 +554,12 @@ type previewBundle struct {
 	// columns that land on MySQL as TEXT/BLOB/JSON (no inline key
 	// length). Non-empty means `migrate` will REFUSE this schema.
 	textIndexNotices []translate.TextIndexNotice
-	redactor         *redact.Registry // PII Phase 1.5 (v0.55.0) — nil/empty disables annotation
+	// sqliteAffinityNotices is the Bug 162 list of columns whose IR type
+	// normalizes to a different SQLite storage affinity (nil for non-
+	// SQLite targets). Advisory; the decimal → TEXT entry is the
+	// value-fidelity one.
+	sqliteAffinityNotices []translate.SQLiteAffinityNotice
+	redactor              *redact.Registry // PII Phase 1.5 (v0.55.0) — nil/empty disables annotation
 }
 
 // enabledExtensionSet converts the operator's `--enable-pg-extension`
@@ -701,6 +742,9 @@ func renderPreviewText(w io.Writer, bundle previewBundle) error {
 	if n := len(bundle.textIndexNotices); n > 0 {
 		fmt.Fprintf(&sb, "-- un-indexable TEXT/BLOB key parts: %d — migrate WILL REFUSE (see section below)\n", n)
 	}
+	if n := len(bundle.sqliteAffinityNotices); n > 0 {
+		fmt.Fprintf(&sb, "-- SQLite affinity normalizations: %d (see section below)\n", n)
+	}
 	sb.WriteByte('\n')
 
 	if len(bundle.translatorGaps) > 0 {
@@ -721,6 +765,10 @@ func renderPreviewText(w io.Writer, bundle previewBundle) error {
 
 	if len(bundle.textIndexNotices) > 0 {
 		writeTextIndexSection(&sb, bundle.textIndexNotices)
+	}
+
+	if len(bundle.sqliteAffinityNotices) > 0 {
+		writeSQLiteAffinitySection(&sb, bundle.sqliteAffinityNotices)
 	}
 
 	for _, t := range bundle.tables {
@@ -893,6 +941,31 @@ func describePreviewTextIndex(n translate.TextIndexNotice) string {
 	default:
 		return fmt.Sprintf("index %q", n.Index)
 	}
+}
+
+// writeSQLiteAffinitySection appends the Bug 162 SQLite-target affinity-
+// normalization advisory block to sb. NOTICE, not a refusal — `schema
+// preview` still exits 0 and `migrate` still proceeds. It is rendered
+// loudly (its own section, same shape as the advisory blocks above) so the
+// affinity normalizations the SQLite writer applies — above all the
+// value-fidelity decimal → TEXT one — are never invisible to the operator.
+func writeSQLiteAffinitySection(sb *strings.Builder, notices []translate.SQLiteAffinityNotice) {
+	sb.WriteString("-- ============================================================\n")
+	sb.WriteString("-- SQLite affinity normalizations (target: sqlite)\n")
+	sb.WriteString("-- ============================================================\n")
+	sb.WriteString("-- SQLite has only five storage affinities (TEXT, NUMERIC, INTEGER,\n")
+	sb.WriteString("-- REAL, BLOB), so sluice maps several IR types onto a different\n")
+	sb.WriteString("-- declared affinity than their nominal type. These are value-\n")
+	sb.WriteString("-- preserving — and for `decimal` value-CRITICAL: decimal is stored\n")
+	sb.WriteString("-- as TEXT (not NUMERIC) so the exact decimal text survives; SQLite's\n")
+	sb.WriteString("-- NUMERIC affinity would coerce e.g. 19.99 to a lossy binary REAL\n")
+	sb.WriteString("-- (Bug 162). This is advisory; the migration proceeds.\n")
+	sb.WriteString("--\n")
+	for _, n := range notices {
+		fmt.Fprintf(sb, "-- %s.%s: %s -> %s affinity — %s\n",
+			n.Table, n.Column, n.SourceType, n.TargetType, n.Note)
+	}
+	sb.WriteByte('\n')
 }
 
 // writeTableSection appends one table's preview block to sb. The
@@ -1171,6 +1244,15 @@ func renderPreviewJSON(w io.Writer, bundle previewBundle) error {
 			TargetType: n.TargetType,
 			Unique:     n.Unique,
 			PrimaryKey: n.PrimaryKey,
+		})
+	}
+	for _, n := range bundle.sqliteAffinityNotices {
+		out.SQLiteAffinityNotes = append(out.SQLiteAffinityNotes, PreviewJSONSQLiteAffinity{
+			Table:      n.Table,
+			Column:     n.Column,
+			SourceType: n.SourceType,
+			TargetType: n.TargetType,
+			Note:       n.Note,
 		})
 	}
 	enc := json.NewEncoder(w)
