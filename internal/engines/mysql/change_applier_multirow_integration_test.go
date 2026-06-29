@@ -231,6 +231,89 @@ func TestMultiRowApply_ValueFamilyDifferential(t *testing.T) {
 	}
 }
 
+// compositeFamilyPKDDL is a table whose COMPOSITE primary key spans value
+// families — VARBINARY (embedded NUL/0xFF), DECIMAL-as-text, and VARCHAR — so
+// the differential executes the row-value tuple form
+// `(pk_bin, pk_dec, pk_txt) IN ((?,?,?), …)` and every PK-binding family against
+// a real server (value-fidelity review, ADR-0140: the DELETE … IN builder is a
+// new family-dispatched SQL shape; the unit test only checks its string).
+const compositeFamilyPKDDL = `
+	CREATE TABLE cpk (
+		pk_bin  VARBINARY(16)   NOT NULL,
+		pk_dec  DECIMAL(20,4)   NOT NULL,
+		pk_txt  VARCHAR(40)     NOT NULL,
+		v       BIGINT          NOT NULL,
+		PRIMARY KEY (pk_bin, pk_dec, pk_txt)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`
+
+// TestCoalesce_CompositeFamilyPK_DeleteIN_Differential pins the composite-PK
+// `DELETE … WHERE (a,b,c) IN ((?,?,?), …)` path (ADR-0140) against real MySQL
+// across binary/decimal/text PK families: a contiguous run of deletes (so the
+// run coalesces — delMulti>0) applied serially (the oracle, full-before WHERE)
+// and coalesced (single-lane + W=4) must leave byte-identical target state.
+func TestCoalesce_CompositeFamilyPK_DeleteIN_Differential(t *testing.T) {
+	const keys = 40
+	pkRow := func(i int64) ir.Row {
+		return ir.Row{
+			"pk_bin": []byte{byte(i), 0x00, 0xff, byte(i * 7)}, // embedded NUL + 0xFF
+			"pk_dec": fmt.Sprintf("%d.%04d", i*100+i, i*37%10000), // decimal-as-text
+			"pk_txt": fmt.Sprintf("k-%04d", i),
+			"v":      i * 1000,
+		}
+	}
+	var stream []ir.Change
+	seq := 0
+	tok := func() string { seq++; return fmt.Sprintf("cpk-%06d", seq) }
+	for i := int64(1); i <= keys; i++ {
+		stream = append(stream, ir.Insert{Position: ir.Position{Engine: engineNameMySQL, Token: tok()}, Schema: "target_db", Table: "cpk", Row: pkRow(i)})
+	}
+	// Contiguous run of deletes (full Before image — so the serial oracle's
+	// full-before WHERE and the coalesced PK-tuple IN target the same rows).
+	for i := int64(1); i <= keys/2; i++ {
+		stream = append(stream, ir.Delete{Position: ir.Position{Engine: engineNameMySQL, Token: tok()}, Schema: "target_db", Table: "cpk", Before: pkRow(i)})
+	}
+
+	run := func(batchSize, lanes int) (string, *multiRowFlushCounter) {
+		dsn, cleanup := startMySQLForApplier(t)
+		defer cleanup()
+		applyMySQLApplier(t, dsn, compositeFamilyPKDDL)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		defer cancel()
+		a := openConcurrentApplier(t, ctx, dsn, lanes)
+		defer closeApplier(a)
+
+		ctr := &multiRowFlushCounter{}
+		multiRowDeleteFlushHookForTest = func(k int) { ctr.observeDelete(k) }
+		defer func() { multiRowDeleteFlushHookForTest = nil }()
+
+		pumpBatchedChangesPipelined(t, ctx, a, testStreamID, stream, batchSize)
+		if got := countAllRows(t, dsn, "target_db", "cpk"); got != keys/2 {
+			t.Fatalf("rows = %d; want %d (half deleted)", got, keys/2)
+		}
+		return tableChecksum(t, dsn, "target_db", "cpk", "pk_txt"), ctr
+	}
+
+	serialSum, serialCtr := run(1, 1)
+	if serialCtr.delMulti != 0 {
+		t.Errorf("serial pass should never coalesce a delete; saw %d", serialCtr.delMulti)
+	}
+	batchSum, batchCtr := run(64, 1)
+	if batchSum != serialSum {
+		t.Errorf("single-lane checksum %s != serial %s (composite-PK DELETE … IN value fidelity broken)", batchSum, serialSum)
+	}
+	if batchCtr.delMulti == 0 {
+		t.Errorf("single-lane pass never coalesced the composite-PK delete run (delMaxKeys=%d)", batchCtr.delMaxKeys)
+	}
+	concSum, concCtr := run(64, concurrentLanesW)
+	if concSum != serialSum {
+		t.Errorf("W=%d concurrent checksum %s != serial %s (composite-PK DELETE … IN value fidelity broken)", concurrentLanesW, concSum, serialSum)
+	}
+	if concCtr.delMulti == 0 {
+		t.Errorf("concurrent pass never coalesced the composite-PK delete run (delMaxKeys=%d)", concCtr.delMaxKeys)
+	}
+}
+
 // TestMultiRowApply_IdempotentReplay confirms the coalescing batch path stays
 // idempotent (ADR-0010): replaying the whole stream is a no-op for the final
 // state, even though inserts are now packed into multi-row statements.
