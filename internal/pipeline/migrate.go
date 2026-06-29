@@ -1035,9 +1035,10 @@ func runBulkCopyPhases(
 		// here too, centrally, alongside the grow-gate — the single-reader /
 		// chunk-0 / fan-out lanes all flush through THIS rw, so a grow/reparent
 		// transient on any of them reports through the shared tracker. The
-		// reconciliation phase (the MySQL fallback branch below) re-derives the
-		// touched tables, reusing this same rw so a redo that itself reparents
-		// re-marks for another round. nil-safe (no tracker / non-MySQL writer).
+		// reconciliation phase (after the copy+index block below, BOTH branches)
+		// re-derives the touched tables, reusing this same rw so a redo that
+		// itself reparents re-marks for another round. nil-safe (no tracker /
+		// non-MySQL writer).
 		applyReparentObserver(rw, parallel.reparentMark())
 	}
 
@@ -1132,17 +1133,6 @@ func runBulkCopyPhases(
 		); err != nil {
 			return err
 		}
-		// ADR-0141: reconcile any reparent-touched table BEFORE identity-sync /
-		// indexes. A PlanetScale storage-grow reparent silently under-copies
-		// (drops committed-but-unreplicated rows the reactive grow-gate cannot
-		// recover); re-derive each touched table from the SOURCE so it exactly
-		// matches the source. No-op when no reparent occurred (the common case).
-		// Slotted into the MySQL fallback branch only — the confirmed-affected
-		// PlanetScale-MySQL path (ADR-0113 scope); the PG overlapped copy+index
-		// path is untouched.
-		if err := reconcileMigrateReparentTouched(ctx, schema, rows, rw, parallel, redactor, shard); err != nil {
-			return wrapWithHint(PhaseBulkCopy, markFailed(ctx, rc, *state, ir.MigrationPhaseBulkCopy, err))
-		}
 		slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseBulkCopy)))
 
 		// Phase 3.5: identity sync.
@@ -1168,6 +1158,25 @@ func runBulkCopyPhases(
 			return wrapWithHint(PhaseIndexes, markFailed(ctx, rc, *state, ir.MigrationPhaseIndexes, err))
 		}
 		slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseIndexes)))
+	}
+
+	// ADR-0141: reconcile any reparent-touched table AFTER the bulk-copy (and its
+	// overlapped/secondary indexes) but BEFORE constraints. A PlanetScale
+	// storage-grow reparent silently under-copies — it drops committed-but-
+	// unreplicated rows the reactive grow-gate cannot recover — so re-derive each
+	// touched table from the SOURCE (TRUNCATE + serial re-copy) until it matches
+	// the source exactly. Placed here, after BOTH the IncrementalIndexBuilder
+	// (PG, MySQL) overlapped branch AND the non-IIB fallback branch: every
+	// production target implements IncrementalIndexBuilder and therefore takes the
+	// overlapped branch, so scoping this to the fallback else made it dead code —
+	// the reconcile never ran for a real MySQL target (the v0.99.160 miss, caught
+	// by live PlanetScale re-validation). Running before the constraints phase
+	// keeps the TRUNCATE free of FK dependencies; a touched table's already-built
+	// secondary indexes are maintained by the re-INSERT. No-op at zero cost when
+	// no reparent occurred (the common case); only the MySQL writer marks today,
+	// so only a MySQL target ever reconciles.
+	if err := reconcileMigrateReparentTouched(ctx, schema, rows, rw, parallel, redactor, shard); err != nil {
+		return wrapWithHint(PhaseBulkCopy, markFailed(ctx, rc, *state, ir.MigrationPhaseBulkCopy, err))
 	}
 
 	// Phase 5: constraints.

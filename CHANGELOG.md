@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.161] - 2026-06-29
+
+### Fixed
+
+- **CRITICAL: the v0.99.160 migrate-path reparent-reconciliation fix (Bug 175) was inert — it never ran for a real MySQL target.** v0.99.160 placed the reconciliation call inside the non-`IncrementalIndexBuilder` fallback branch of the bulk-copy orchestrator, on the mistaken premise (from a stale interface comment) that MySQL takes that branch. In fact **both the PostgreSQL and MySQL targets implement `ir.IncrementalIndexBuilder`** and take the *overlapped* copy+index branch, so the reconcile call was dead code and never executed for a real PlanetScale-MySQL migrate — leaving Bug 175's silent under-copy unfixed despite the v0.99.160 release. Live PlanetScale re-validation caught it: a real migrate into a reparenting non-Metal PlanetScale MySQL hit 112 reparent-retries and 81 storage-grow-gate trips yet logged 0 reconciliation rounds (no data was lost on that particular run — the reactive grow-gate happened to preserve every row — but a run that dropped acked rows would not have been recovered, which is the whole point of the reconciliation). **Fix:** the reconciliation now runs after the copy+index block, covering BOTH the overlapped (PG/MySQL) branch and the non-IIB fallback branch, before the constraints phase — so the TRUNCATE + serial re-copy of a reparent-touched table is free of FK dependencies, and the table's already-built secondary indexes (built during the overlapped copy) are maintained by the re-`INSERT`. The unit test now drives the real overlapped branch via an `IncrementalIndexBuilder` fake; the original test used a plain non-IIB fake and so validated only the dead branch — the coverage gap that let the inert fix ship. This defect caused no data corruption in any release (v0.99.160's fix was inert, not wrong — it simply left the pre-existing behavior in place); the value of v0.99.161 is that Bug 175's reconciliation now actually engages for a reparenting PlanetScale-MySQL migrate target. The `-race` integration gate passed before tagging (concurrency change).
+
 ## [0.99.160] - 2026-06-29
 
 ### Fixed

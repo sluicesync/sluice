@@ -134,10 +134,29 @@ func (e *reparentTargetEngine) OpenSchemaReader(context.Context, string) (ir.Sch
 }
 
 func (e *reparentTargetEngine) OpenSchemaWriter(context.Context, string) (ir.SchemaWriter, error) {
-	// noopSchemaWriter (copy_concurrent_tables_test.go) deliberately does NOT
-	// implement ir.IncrementalIndexBuilder, so Migrator.Run takes the MySQL
-	// fallback branch — the path the reconciliation slots into.
-	return noopSchemaWriter{}, nil
+	// Return an IncrementalIndexBuilder writer so Migrator.Run takes the
+	// OVERLAPPED copy+index branch — the branch EVERY production target takes
+	// (both PG and MySQL implement ir.IncrementalIndexBuilder). The v0.99.160
+	// miss was a test blind spot: the fake was a plain noopSchemaWriter (NOT an
+	// IncrementalIndexBuilder), so the test exercised the dead non-IIB fallback
+	// `else` branch and never caught that the reconcile call placed there was
+	// unreachable for real engines. Exercising the overlapped branch is
+	// load-bearing — it is the path the reconcile must run after.
+	return reparentIIBSchemaWriter{}, nil
+}
+
+// reparentIIBSchemaWriter is a no-op SchemaWriter that ALSO implements
+// [ir.IncrementalIndexBuilder], forcing Migrator.Run down the overlapped
+// copy+index branch that real PG/MySQL targets take (see OpenSchemaWriter).
+type reparentIIBSchemaWriter struct{ noopSchemaWriter }
+
+// BuildTableIndexesFromChannel implements [ir.IncrementalIndexBuilder]: it
+// drains the completed-table channel (a no-op index build) so the overlapped
+// phase completes exactly as it does for a real IIB target.
+func (reparentIIBSchemaWriter) BuildTableIndexesFromChannel(_ context.Context, _ *ir.Schema, completed <-chan *ir.Table) error {
+	for range completed {
+	}
+	return nil
 }
 
 func (e *reparentTargetEngine) OpenRowReader(context.Context, string) (ir.RowReader, error) {
