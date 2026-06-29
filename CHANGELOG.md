@@ -4,6 +4,13 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.158] - 2026-06-29
+
+### Added
+
+- **`sluice schema preview` now surfaces SQLite-target type-affinity conversions as advisory notes (text + JSON).** When the target is SQLite, the preview previously emitted the target DDL but did not call out where an IR type maps to a different SQLite storage affinity. It now lists those normalizations the same way the existing cross-engine advisories do (e.g. unconstrained-numeric widenings, wide-varchar down-maps): the headline is `DECIMAL`/`NUMERIC` → **TEXT affinity** with the rationale ("stored as TEXT to preserve the exact decimal value; SQLite's NUMERIC affinity would coerce it to a lossy 15-digit REAL" — the Bug-162 fidelity feature), plus `JSON`/`UUID`/`ENUM`/`SET` → TEXT, `CHAR`/`VARCHAR` → TEXT (declared length not enforced), and integer width/sign not preserved. The notes appear in the human-readable preview and as a stable `sqlite_affinity_notes` array in `--format json` for tooling. This makes the automatic same-engine/cross-engine conversions visible for operator awareness before a migrate/sync runs. (Also corrects a stale `Decimal → DECIMAL/NUMERIC` comment in the SQLite DDL emitter to reflect the actual `Decimal → TEXT` mapping.)
+- **MySQL CDC apply now emits a coalescing-ratio observability line.** The ADR-0139/0140 INSERT/UPDATE/DELETE coalescing helps same-kind runs greatly and strictly-alternating workloads little; an operator previously had no way to see which case their sync was in. The applier now tracks coalesced rows and coalesced statements (lock-free atomic counters, safe across the concurrent apply lanes) and emits a rate-limited INFO line — at most once per ~30 s — reporting the running rows-per-coalesced-statement ratio, the totals, and a plain-language assessment ("good — same-kind runs coalescing well" vs "RTT-bound — workload alternates kinds / no same-kind runs"). Observability only; no behavior change to the apply path.
+
 ## [0.99.157] - 2026-06-29
 
 ### Fixed
