@@ -1031,6 +1031,14 @@ func runBulkCopyPhases(
 	// or a non-setter writer ⇒ no-op (pre-ADR-0110 behaviour, byte-for-byte).
 	if parallel != nil {
 		applyGrowGate(rw, parallel.growGate)
+		// ADR-0141: wire the run's reparent observer onto the TOP-LEVEL writer
+		// here too, centrally, alongside the grow-gate — the single-reader /
+		// chunk-0 / fan-out lanes all flush through THIS rw, so a grow/reparent
+		// transient on any of them reports through the shared tracker. The
+		// reconciliation phase (the MySQL fallback branch below) re-derives the
+		// touched tables, reusing this same rw so a redo that itself reparents
+		// re-marks for another round. nil-safe (no tracker / non-MySQL writer).
+		applyReparentObserver(rw, parallel.reparentMark())
 	}
 
 	// ADR-0123: build the run's SINGLE connection-budget gate — one shared
@@ -1124,6 +1132,17 @@ func runBulkCopyPhases(
 		); err != nil {
 			return err
 		}
+		// ADR-0141: reconcile any reparent-touched table BEFORE identity-sync /
+		// indexes. A PlanetScale storage-grow reparent silently under-copies
+		// (drops committed-but-unreplicated rows the reactive grow-gate cannot
+		// recover); re-derive each touched table from the SOURCE so it exactly
+		// matches the source. No-op when no reparent occurred (the common case).
+		// Slotted into the MySQL fallback branch only — the confirmed-affected
+		// PlanetScale-MySQL path (ADR-0113 scope); the PG overlapped copy+index
+		// path is untouched.
+		if err := reconcileMigrateReparentTouched(ctx, schema, rows, rw, parallel, redactor, shard); err != nil {
+			return wrapWithHint(PhaseBulkCopy, markFailed(ctx, rc, *state, ir.MigrationPhaseBulkCopy, err))
+		}
 		slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseBulkCopy)))
 
 		// Phase 3.5: identity sync.
@@ -1177,6 +1196,100 @@ func runBulkCopyPhases(
 	slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseViews)))
 
 	return nil
+}
+
+// reconcileMigrateReparentTouched re-derives every reparent-touched table from
+// the SOURCE (ADR-0141) so it exactly matches the source, recovering rows a
+// PlanetScale storage-grow reparent silently dropped that the grow-gate could
+// not. The migrate analog of [Restore.reconcileReparentTouched]: where the
+// restore replays from its immutable chunks, migrate replays from the live
+// source — sound under migrate's existing static-source precondition (a plain
+// migrate already captures no cross-table snapshot consistency; ADR-0019), and
+// it makes the target match the CURRENT source for the touched table.
+//
+// Each redo runs through the SAME primary writer (which carries the reparent
+// observer), so a redo that itself hits a reparent re-marks its table for the
+// next round; the loop ends when a full pass drains empty — the sound proxy
+// for "no reparent ⇒ no loss", since a reparent is the only loss vector.
+// Bounded by [reconcileMaxRounds] so a target that reparents on every serial
+// redo surfaces loudly rather than looping forever. No-op when no reparent
+// occurred (the common case — the tracker drains empty at zero cost).
+func reconcileMigrateReparentTouched(
+	ctx context.Context,
+	schema *ir.Schema,
+	rows ir.RowReader,
+	rw ir.RowWriter,
+	parallel *parallelBulkCopyDeps,
+	redactor *redact.Registry,
+	shard ShardColumnSpec,
+) error {
+	if parallel == nil || parallel.reparentTracker == nil {
+		return nil
+	}
+	byName := make(map[string]*ir.Table, len(schema.Tables))
+	for _, t := range schema.Tables {
+		byName[t.Name] = t
+	}
+	for round := 1; ; round++ {
+		touched := parallel.reparentTracker.drain()
+		if len(touched) == 0 {
+			return nil
+		}
+		if round > reconcileMaxRounds {
+			return fmt.Errorf(
+				"migrate: reparent reconciliation did not converge after %d rounds — the target keeps reparenting during the serial redo (still-touched: %v); re-run with --bulk-parallelism 1 or migrate into a pre-sized / Metal target",
+				reconcileMaxRounds, touched,
+			)
+		}
+		slog.WarnContext(
+			ctx, "migrate: reconciling reparent-touched tables (ADR-0141) — re-deriving each from the source to recover any rows the target's storage-grow reparent dropped",
+			slog.Int("round", round),
+			slog.Int("tables", len(touched)),
+			slog.Any("table_names", touched),
+		)
+		for _, name := range touched {
+			table, ok := byName[name]
+			if !ok {
+				// Touched a table outside this run's schema (e.g. filtered out
+				// after the mark) — nothing to re-derive.
+				continue
+			}
+			if err := reapplyMigrateTableForReconcile(ctx, rows, rw, table, redactor, shard); err != nil {
+				return fmt.Errorf("reconcile table %q: %w", name, err)
+			}
+		}
+	}
+}
+
+// reapplyMigrateTableForReconcile re-derives one table from the SOURCE
+// (ADR-0141): TRUNCATE the target table (via [ir.TableTruncator] — the MySQL
+// RowWriter implements it) then re-copy it SERIALLY (within-table parallelism
+// = 1, the single-stream [copyTable] pace that never outruns replication) into
+// the now-empty table. No primary-key / UPSERT needed — the truncate leaves a
+// clean target and indexes/constraints are later phases — exactly the cold
+// restore's TRUNCATE+redo shape ([Restore.reapplyTableForReconcile]). The
+// serial redo reuses the supplied primary writer (which carries the reparent
+// observer), so a reparent during the redo re-marks the table for another
+// round.
+func reapplyMigrateTableForReconcile(
+	ctx context.Context,
+	rows ir.RowReader,
+	rw ir.RowWriter,
+	table *ir.Table,
+	redactor *redact.Registry,
+	shard ShardColumnSpec,
+) error {
+	truncator, ok := rw.(ir.TableTruncator)
+	if !ok {
+		return fmt.Errorf(
+			"migrate: target engine cannot TRUNCATE for reconciliation of %q; re-run with --bulk-parallelism 1",
+			table.Name,
+		)
+	}
+	if err := truncator.TruncateTable(ctx, table); err != nil {
+		return fmt.Errorf("truncate before redo: %w", err)
+	}
+	return copyTable(ctx, rows, rw, table, redactor, shard)
 }
 
 // runViewsPhase emits CREATE VIEW for every view in schema.Views with

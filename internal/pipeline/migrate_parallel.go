@@ -184,6 +184,31 @@ type parallelBulkCopyDeps struct {
 	// copyBudget) in [resolveParallelChunkCount]). 0 ⇒ no measured budget; the
 	// cap falls back to maxChunksPerTable.
 	copyBudget int
+
+	// reparentTracker collects the set of tables a writer reported as
+	// reparent-touched during the cold-copy (ADR-0141 — the migrate analog of
+	// ADR-0113's restore reconciliation). The grow-gate calms a storage-growing
+	// PlanetScale target but cannot recover rows its reparent dropped BEFORE the
+	// first transient was seen (committed-but-unreplicated rows lost when the
+	// new primary is promoted behind the async-acked window). After the bulk
+	// copy the migrate reconciliation phase re-derives exactly these tables from
+	// the (replayable, static-precondition) SOURCE so each matches the source
+	// regardless of what the reparent dropped. Constructed once per migrate run
+	// in [Migrator.phaseBuildCopyDeps]; wired onto every cold-copy writer via
+	// [applyReparentObserver] (the same observer the restore wires). nil ⇒ no
+	// tracking (pre-ADR-0141 behaviour, byte-for-byte — e.g. the sync
+	// cold-start deps, which build no tracker).
+	reparentTracker *reparentTracker
+}
+
+// reparentMark returns the observer callback to wire onto each cold-copy
+// writer (ADR-0141), or nil when no tracker is constructed so
+// [applyReparentObserver] no-ops. Mirrors [Restore.reparentMark].
+func (d *parallelBulkCopyDeps) reparentMark() func(string) {
+	if d == nil || d.reparentTracker == nil {
+		return nil
+	}
+	return d.reparentTracker.mark
 }
 
 // copyChunkLifecycleObserver is a TEST-ONLY seam (nil in production — a single
@@ -744,6 +769,13 @@ func openOneChunkConn(ctx context.Context, deps *parallelBulkCopyDeps) (ir.RowRe
 	// target storage-grow window. nil-safe (no-op when the run has no gate
 	// or the engine doesn't implement the setter).
 	applyGrowGate(wr, deps.growGate)
+	// ADR-0141: wire the run's reparent observer onto this per-chunk/per-table
+	// writer too, alongside the grow-gate — any writer that can hit
+	// flushWithReparentRetry must report through the shared tracker so the
+	// migrate reconciliation phase re-derives every reparent-touched table.
+	// nil-safe (no-op when the run built no tracker — the migrate path always
+	// does — or the engine doesn't implement ir.ReparentObserverSetter).
+	applyReparentObserver(wr, deps.reparentMark())
 	return rdr, wr, nil
 }
 

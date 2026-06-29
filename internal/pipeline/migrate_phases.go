@@ -512,6 +512,18 @@ func (m *Migrator) phaseBuildCopyDeps(ctx context.Context, schema *ir.Schema, rr
 		// grow-transient on any lane quiesces the rest. ctx is the run ctx,
 		// so the gate's owner goroutine exits on run unwind.
 		growGate: growGateOrNil(newGrowGate(ctx, nil)),
+		// ADR-0141: the reparent tracker collects tables that hit a grow/
+		// reparent transient during the cold-copy so the migrate reconciliation
+		// phase (runBulkCopyPhases' MySQL fallback branch) can re-derive exactly
+		// those from the SOURCE — recovering rows the reparent dropped that the
+		// grow-gate cannot. Constructed unconditionally (no EnableX config bool,
+		// the v0.99.51 zero-value trap); inert when no reparent fires (the
+		// common case — drain is empty, zero cost). Wired onto every cold-copy
+		// writer via applyReparentObserver. Only MySQL implements the observer
+		// setter today, so this is the confirmed-affected PlanetScale-MySQL path
+		// first (ADR-0113 scope); a no-op on PG, which never reparents into the
+		// silent-under-copy class.
+		reparentTracker: newReparentTracker(),
 	}
 
 	return parallelDeps
