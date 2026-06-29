@@ -723,6 +723,89 @@ func TestEmitTableDef_CheckRefusesRegexCrossDialect(t *testing.T) {
 	}
 }
 
+// TestEmitTableDef_TextKeyRefusedWithoutPrefix pins Bug 170: a TEXT/BLOB column
+// used in the PRIMARY KEY without a prefix length is refused early with a
+// named-column + --type-override remedy, instead of MySQL's opaque errno 1170.
+// A prefix length, a bounded VARCHAR, or a TEXT column outside any key are fine.
+func TestEmitTableDef_TextKeyRefusedWithoutPrefix(t *testing.T) {
+	mk := func(pkCols []ir.IndexColumn, cols []*ir.Column) *ir.Table {
+		return &ir.Table{
+			Name:       "tpk",
+			Columns:    cols,
+			PrimaryKey: &ir.Index{Name: "PRIMARY", Unique: true, Columns: pkCols},
+		}
+	}
+
+	t.Run("text PK without prefix refused", func(t *testing.T) {
+		tbl := mk(
+			[]ir.IndexColumn{{Column: "code"}},
+			[]*ir.Column{{Name: "code", Type: ir.Text{Size: ir.TextLong}}, {Name: "v", Type: ir.Integer{Width: 64}}},
+		)
+		_, err := emitTableDef(tbl)
+		if err == nil {
+			t.Fatal("expected refusal for TEXT PRIMARY KEY without a prefix length, got nil")
+		}
+		for _, want := range []string{"code", "1170", "--type-override", "tpk.code=VARCHAR"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error should mention %q; got: %v", want, err)
+			}
+		}
+	})
+
+	t.Run("text PK with prefix length allowed", func(t *testing.T) {
+		tbl := mk(
+			[]ir.IndexColumn{{Column: "code", Length: 255}},
+			[]*ir.Column{{Name: "code", Type: ir.Text{Size: ir.TextLong}}, {Name: "v", Type: ir.Integer{Width: 64}}},
+		)
+		if _, err := emitTableDef(tbl); err != nil {
+			t.Errorf("TEXT PK WITH a prefix length should be allowed, got: %v", err)
+		}
+	})
+
+	t.Run("text PK with charset suffix still refused", func(t *testing.T) {
+		// emitColumnType appends " CHARACTER SET utf8mb4" — the guard must match
+		// on substring, not suffix.
+		tbl := mk(
+			[]ir.IndexColumn{{Column: "code"}},
+			[]*ir.Column{{Name: "code", Type: ir.Text{Size: ir.TextRegular, Charset: "utf8mb4"}}, {Name: "v", Type: ir.Integer{Width: 64}}},
+		)
+		if _, err := emitTableDef(tbl); err == nil {
+			t.Fatal("expected refusal for charset-qualified TEXT PRIMARY KEY, got nil")
+		}
+	})
+
+	t.Run("varchar PK allowed (no false positive)", func(t *testing.T) {
+		tbl := mk(
+			[]ir.IndexColumn{{Column: "code"}},
+			[]*ir.Column{{Name: "code", Type: ir.Varchar{Length: 64}}, {Name: "v", Type: ir.Integer{Width: 64}}},
+		)
+		if _, err := emitTableDef(tbl); err != nil {
+			t.Errorf("VARCHAR PK should be allowed, got: %v", err)
+		}
+	})
+
+	t.Run("composite PK with a text column refused", func(t *testing.T) {
+		tbl := mk(
+			[]ir.IndexColumn{{Column: "id"}, {Column: "code"}},
+			[]*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}, {Name: "code", Type: ir.Text{Size: ir.TextRegular}}},
+		)
+		_, err := emitTableDef(tbl)
+		if err == nil || !strings.Contains(err.Error(), "code") {
+			t.Fatalf("expected refusal naming the TEXT PK column, got: %v", err)
+		}
+	})
+
+	t.Run("text column outside any key allowed", func(t *testing.T) {
+		tbl := mk(
+			[]ir.IndexColumn{{Column: "id"}},
+			[]*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}, {Name: "body", Type: ir.Text{Size: ir.TextLong}}},
+		)
+		if _, err := emitTableDef(tbl); err != nil {
+			t.Errorf("a TEXT column outside any key should be allowed, got: %v", err)
+		}
+	})
+}
+
 // TestEmitTableDef_CheckConstraints exercises the inline-emission
 // path: CHECK clauses appear after the columns and the primary key,
 // each on its own line, with correct comma punctuation. Both cases

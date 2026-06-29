@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.155] - 2026-06-29
+
+### Fixed
+
+- **LOW/MEDIUM: a SQLite `TEXT PRIMARY KEY` migrated to MySQL failed at CREATE TABLE with the opaque errno 1170 instead of an actionable message (Bug 170).** A SQLite `TEXT`-affinity column used as a PRIMARY KEY (or other inline key) maps to MySQL `LONGTEXT`, and MySQL/InnoDB cannot use a TEXT/BLOB column as a key without a prefix length, so `migrate`/`sync` SQLite→MySQL hard-aborted at `CREATE TABLE` with `Error 1170 (42000) "BLOB/TEXT column used in key specification without a key length"`. Zero data loss (the CREATE TABLE fails cleanly, nothing is written) — but the raw 1170 gives no hint about which column or how to proceed. The same schema migrates cleanly to Postgres (a TEXT primary key is legal there). **Fix:** the MySQL DDL emitter now detects, before issuing the statement, a PRIMARY KEY (or inline UNIQUE key) column that maps to a TEXT/BLOB-family type without a prefix length and refuses with a message naming the table and column and the remedy: re-run with `--type-override <table>.<col>=VARCHAR(n)`, choosing `n` ≥ the longest key value (MySQL's maximum indexable length for utf8mb4 is `VARCHAR(768)`). Auto-mapping to a fixed `VARCHAR(n)` was deliberately *not* chosen: silently picking a length risks truncating — and so colliding — a primary-key value, which is exactly the silent-corruption class sluice refuses to introduce; the operator picks a safe length explicitly. A key column that already carries a prefix length (which MySQL accepts) and a TEXT column outside any key are unaffected. Pinned by unit tests over the TEXT-PK / charset-qualified-TEXT-PK / composite-PK-with-TEXT refusal cases and the prefix-length / VARCHAR-PK / TEXT-outside-key allowed cases.
+
 ## [0.99.154] - 2026-06-28
 
 ### Fixed

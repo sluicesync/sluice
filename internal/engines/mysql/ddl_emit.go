@@ -861,6 +861,80 @@ func inlineUniqueKeyForCopy(table *ir.Table) *ir.Index {
 	return idx
 }
 
+// keyColumnTypeUnindexable reports whether a column of type t maps to a MySQL
+// TEXT/BLOB-family type, which cannot be a PRIMARY KEY / UNIQUE key part without
+// an explicit prefix length (MySQL errno 1170). It returns the offending MySQL
+// keyword for the refusal message. Bounded VARCHAR(n)/VARBINARY(n) are
+// indexable and do not match; only the TEXT and BLOB families do (their
+// keywords end in TEXT/BLOB).
+func keyColumnTypeUnindexable(t ir.Type) (string, bool) {
+	kw, err := emitColumnType(t)
+	if err != nil {
+		return "", false
+	}
+	// Substring (not suffix): emitColumnType can append " CHARACTER SET …" /
+	// " COLLATE …" to a TEXT keyword. No indexable MySQL type name (VARCHAR,
+	// CHAR, VARBINARY, BINARY, the numeric/temporal/JSON/ENUM/SET/BIT families)
+	// contains "TEXT" or "BLOB", so a substring match is exact for this purpose.
+	if strings.Contains(kw, "TEXT") || strings.Contains(kw, "BLOB") {
+		return kw, true
+	}
+	return "", false
+}
+
+// checkInlineKeyColumnsIndexable refuses — early, with an actionable message —
+// a table whose PRIMARY KEY or an inline UNIQUE key includes a column that maps
+// to a MySQL TEXT/BLOB-family type WITHOUT a prefix length. MySQL rejects such a
+// key at CREATE TABLE with errno 1170 ("BLOB/TEXT column used in key
+// specification without a key length"); surfacing that raw is opaque (Bug 170,
+// seen migrating a SQLite `TEXT PRIMARY KEY` — mapped to LONGTEXT — to MySQL).
+// A key column carrying an explicit prefix length is fine (MySQL accepts
+// `code(255)`), so it is not flagged. Zero data loss either way — this only
+// turns a cryptic downstream 1170 into a named-column remedy before the failing
+// DDL is issued.
+func checkInlineKeyColumnsIndexable(table *ir.Table) error {
+	colType := make(map[string]ir.Type, len(table.Columns))
+	for _, c := range table.Columns {
+		colType[c.Name] = c.Type
+	}
+	check := func(keyKind string, cols []ir.IndexColumn) error {
+		for _, kc := range cols {
+			if kc.Column == "" || kc.Length > 0 {
+				// Expression entry, or an explicit prefix length MySQL accepts.
+				continue
+			}
+			t, ok := colType[kc.Column]
+			if !ok {
+				continue
+			}
+			if kw, bad := keyColumnTypeUnindexable(t); bad {
+				return fmt.Errorf("mysql: table %q %s includes column %q, which maps to %s — "+
+					"MySQL cannot index a TEXT/BLOB column without a prefix length (errno 1170). "+
+					"Re-run with --type-override %s.%s=VARCHAR(n), choosing n ≥ your longest key "+
+					"value (max indexable for utf8mb4 is VARCHAR(768))",
+					table.Name, keyKind, kc.Column, kw, table.Name, kc.Column)
+			}
+		}
+		return nil
+	}
+	if table.PrimaryKey != nil {
+		if err := check("PRIMARY KEY", table.PrimaryKey.Columns); err != nil {
+			return err
+		}
+	}
+	if idx := inlineAutoIncrementIndex(table); idx != nil {
+		if err := check("inline UNIQUE key", idx.Columns); err != nil {
+			return err
+		}
+	}
+	if idx := inlineUniqueKeyForCopy(table); idx != nil {
+		if err := check("inline UNIQUE key", idx.Columns); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // emitTableDef returns a CREATE TABLE statement with columns and
 // the primary key inline (plus, when [inlineAutoIncrementIndex]
 // matches, the supporting unique index required to satisfy MySQL's
@@ -893,6 +967,12 @@ func emitTableDefWithDomainChecks(table *ir.Table, inlineCheckSupported bool) (s
 	}
 	if len(table.Columns) == 0 {
 		return "", fmt.Errorf("mysql: emitTableDef: table %q has no columns", table.Name)
+	}
+	// Bug 170: refuse a TEXT/BLOB key column without a prefix length here,
+	// naming the column + the --type-override remedy, rather than letting MySQL
+	// reject the CREATE TABLE with the opaque errno 1170.
+	if err := checkInlineKeyColumnsIndexable(table); err != nil {
+		return "", err
 	}
 	// Pre-compute the inline DOMAIN CHECK clauses so the column-list
 	// trailing-comma logic below can know up-front whether to emit a
