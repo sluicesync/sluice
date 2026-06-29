@@ -255,7 +255,7 @@ func TestCoalesce_CompositeFamilyPK_DeleteIN_Differential(t *testing.T) {
 	const keys = 40
 	pkRow := func(i int64) ir.Row {
 		return ir.Row{
-			"pk_bin": []byte{byte(i), 0x00, 0xff, byte(i * 7)}, // embedded NUL + 0xFF
+			"pk_bin": []byte{byte(i), 0x00, 0xff, byte(i * 7)},    // embedded NUL + 0xFF
 			"pk_dec": fmt.Sprintf("%d.%04d", i*100+i, i*37%10000), // decimal-as-text
 			"pk_txt": fmt.Sprintf("k-%04d", i),
 			"v":      i * 1000,
