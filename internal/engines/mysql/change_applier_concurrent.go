@@ -187,13 +187,16 @@ func (la *laneApplierAdapter) PKValuesForRouting(ctx context.Context, c ir.Chang
 // pooled connection per concurrent lane commit == one backend per lane in
 // practice — matching the GA behavior (no per-lane dedicated *sql.Conn).
 //
-// ADR-0139: the lane's changes run through the SAME coalescing accumulator
+// ADR-0139/0140: the lane's changes run through the SAME coalescing accumulator
 // ([mysqlBatchTx]) the single-lane batch path uses — consecutive same-table,
-// same-shape keyed inserts become one multi-row INSERT, flushed before any
-// serial (non-insert / keyless) change and once more before commit. A lane
-// batch is key-hashed (same key → same lane), so its inserts are distinct-PK
+// same-shape keyed inserts (and non-PK-changing keyed updates as after-image
+// upserts) become one multi-row INSERT, and consecutive keyed deletes become one
+// DELETE … WHERE pk IN (…); each run is flushed before a kind switch, a serial
+// (keyless / PK-changing / non-row) change, and once more before commit. A lane
+// batch is key-hashed (same key → same lane), so its changes are distinct-PK
 // rows of a small set of tables — coalescing is highly effective. Encoding
-// reuses buildMultiRowInsertSQL (byte-identical to the serial single-row path).
+// reuses buildMultiRowInsertSQL / buildMultiRowDeleteSQL (byte-identical value
+// binding to the serial single-row path).
 //
 // The *sql.Tx is rolled back on every error path and committed via
 // commitWithTimeout on success; sqlclosecheck can't track that
@@ -217,9 +220,9 @@ func (la *laneApplierAdapter) ApplyLaneBatch(ctx context.Context, _ int, batch [
 			return 0, err
 		}
 	}
-	// Flush the trailing coalesced insert run before commit so all of the
-	// lane's data is durable in this tx (the lane writes no position — the
-	// orchestrator's frontier checkpoint owns it).
+	// Flush the trailing coalesced run (upsert-run or delete-run; ADR-0140)
+	// before commit so all of the lane's data is durable in this tx (the lane
+	// writes no position — the orchestrator's frontier checkpoint owns it).
 	if err := btx.flushPending(ctx); err != nil {
 		_ = tx.Rollback()
 		return 0, err

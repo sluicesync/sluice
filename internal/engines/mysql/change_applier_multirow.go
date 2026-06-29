@@ -37,6 +37,36 @@ package mysql
 // resolve last-wins — identical to serial. Both the single-lane batch path
 // (via the [appliershared.BatchConfig] seam) and the ADR-0104 concurrent lane
 // path drive the SAME accumulator + builder, one source of truth.
+//
+// # ADR-0140: extend coalescing to UPDATE and DELETE (the Bug 169 U/D tail)
+//
+// Serial U/D were one round trip each (~37/s to PlanetScale-MySQL over WAN);
+// ADR-0140 folds them into the same round-trip-efficient shape:
+//
+//   - A KEYED, non-PK-changing UPDATE is applied as the SAME multi-row
+//     INSERT(after-image) … ON DUPLICATE KEY UPDATE upsert the INSERT path
+//     uses — the row exists in a valid CDC stream (same PK → same lane →
+//     source order, so its INSERT already landed), so MySQL takes the
+//     ON DUPLICATE KEY UPDATE branch and sets the after-image BY PRIMARY KEY.
+//     Inserts and update-upserts to the same table + identical column shape
+//     coalesce into ONE statement.
+//   - Consecutive KEYED DELETEs to one table coalesce into one parameterised
+//     DELETE … WHERE pk IN (?,…) (single-col PK) or WHERE (a,b) IN ((?,?),…)
+//     (composite PK). PK values bind through the SAME prepareApplierValue codec
+//     — no interpolation, no per-type dispatch (the Bug-74 value-fidelity
+//     property is preserved, exactly as for the multi-row INSERT).
+//
+// The accumulator holds at most ONE active run — an upsert-run OR a delete-run.
+// A change that cannot extend the current run flushes it first (preserving
+// apply order): a kind switch (upsert↔delete), a table/shape switch, a
+// per-statement cap overflow, or a serial change. Exclusions stay on the serial
+// full-before path unchanged: a keyless (no-PK) table's U/D (no PK to key on),
+// a PK-changing UPDATE (upserting at the new PK would orphan the old-PK row),
+// and any non-row event. The WHERE semantics for the coalesced forms change
+// from full-before-match to PK-based — correct, indeed self-healing, for a
+// keyed stream (ADR-0140 §Correctness): the PK form realises "this PK's row
+// becomes <after> / is gone" and corrects a drifted target rather than
+// silently skipping it.
 
 import (
 	"context"
@@ -48,6 +78,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/laneapply"
 )
 
 // Per-statement caps on a single coalesced multi-row INSERT, so one statement
@@ -73,6 +104,14 @@ const (
 // leaves it nil. Set only by single-test fixtures (set then reset in the same
 // test), mirroring the package's other test seams (laneCommitHookForTest).
 var multiRowFlushHookForTest func(rows int)
+
+// multiRowDeleteFlushHookForTest is the ADR-0140 delete-run analogue of
+// [multiRowFlushHookForTest]: when non-nil it is invoked by
+// [mysqlBatchTx.flushDeletes] with the number of keys in the just-emitted
+// coalesced DELETE … IN, so an integration pin can assert the delete-coalescing
+// path is actually taken (a flush with keys > 1) rather than silently falling
+// back to serial per-row deletes. Production leaves it nil.
+var multiRowDeleteFlushHookForTest func(keys int)
 
 // insertRun is the pending run of coalescable inserts buffered by
 // [mysqlBatchTx]: a contiguous sequence of Inserts that all target the same
@@ -113,15 +152,60 @@ func (r *insertRun) shouldFlushBefore(schema, table string, cols []string, addAr
 	return r.args+addArgs > maxCoalescedPlaceholders || r.bytes+addBytes > maxCoalescedStatementBytes
 }
 
-// mysqlBatchTx is the ADR-0139 coalescing batch-transaction handle. It wraps
-// the batch's *sql.Tx and buffers a pending run of coalescable inserts; the
-// shared batch loop ([appliershared.RunOneBatch]) only ever calls Rollback on
-// it, while the applier's Dispatch / WritePosition / Commit closures type-
-// assert it to drive the coalescing. It satisfies [appliershared.BatchTx].
+// deleteRun is the ADR-0140 pending run of coalescable DELETEs buffered by
+// [mysqlBatchTx]: a contiguous sequence of keyed Deletes to the same
+// schema.table, accumulated until a flush boundary and emitted as one
+// parameterised DELETE … WHERE pk IN (…). keys holds the ordered primary-key
+// values extracted from each Delete's Before image (one []any per row, in pk
+// order); they bind through the SAME prepareApplierValue codec at flush time
+// ([buildMultiRowDeleteSQL]). args/bytes track the per-statement caps. The pk
+// column list is table-derived, so a same-table run never changes shape — only
+// a table/schema switch or a cap overflow forces a flush.
+type deleteRun struct {
+	schema   string
+	table    string
+	pk       []string
+	colTypes map[string]*ir.Column
+	keys     [][]any
+	args     int
+	bytes    int64
+}
+
+func (r *deleteRun) empty() bool { return len(r.keys) == 0 }
+
+func (r *deleteRun) reset() { *r = deleteRun{} }
+
+// shouldFlushBefore reports whether the pending delete-run must be flushed
+// before appending a Delete for schema.table with the given incremental
+// placeholder/byte cost — i.e. the run is non-empty and the new key either
+// targets a different table or would push the coalesced statement past the
+// caps. The pk shape is table-derived (no cols argument like the insert run),
+// so a same-table append never changes shape. A keyless / kind-switch boundary
+// is handled by the caller (which flushes first); this pure helper governs only
+// the delete-to-delete grouping decision, so it is unit-testable without a live
+// connection.
+func (r *deleteRun) shouldFlushBefore(schema, table string, addArgs int, addBytes int64) bool {
+	if r.empty() {
+		return false
+	}
+	if r.schema != schema || r.table != table {
+		return true
+	}
+	return r.args+addArgs > maxCoalescedPlaceholders || r.bytes+addBytes > maxCoalescedStatementBytes
+}
+
+// mysqlBatchTx is the ADR-0139/0140 coalescing batch-transaction handle. It
+// wraps the batch's *sql.Tx and buffers AT MOST ONE active run — an upsert-run
+// (coalescable inserts + non-PK-changing keyed update-upserts) OR a delete-run
+// (coalescable keyed deletes). The shared batch loop
+// ([appliershared.RunOneBatch]) only ever calls Rollback on it, while the
+// applier's Dispatch / WritePosition / Commit closures type-assert it to drive
+// the coalescing. It satisfies [appliershared.BatchTx].
 type mysqlBatchTx struct {
 	a   *ChangeApplier
 	tx  *sql.Tx
 	run insertRun
+	del deleteRun
 
 	// ctx is the batch's context, captured at BeginTx. The shared loop's
 	// Commit closure takes no ctx, but flushPending (which Commit calls to
@@ -143,29 +227,41 @@ func (a *ChangeApplier) beginCoalescingBatchTx(ctx context.Context) (appliershar
 	return &mysqlBatchTx{a: a, tx: tx, ctx: ctx}, nil
 }
 
-// dispatch routes one change through the coalescing state machine on the open
-// tx. A coalescable Insert (keyed table, same schema.table + identical ordered
-// column set as the pending run, within the per-statement caps) is buffered
-// with no round trip. ANY other change — a non-insert, a keyless-table Insert
-// (ADR-0089: never coalesced, applies single-row), a table switch, a column-
-// shape change, or a cap overflow — first flushes the pending run (preserving
-// apply order), then either appends (table/shape/cap) or applies serially
-// (non-insert / keyless) via the existing per-change [ChangeApplier.dispatch].
+// dispatch routes one change through the ADR-0139/0140 coalescing state machine
+// on the open tx. The accumulator holds at most one active run; the per-kind
+// helpers each flush the OTHER run first (a kind switch) so the at-the-target
+// apply order matches the source change order:
+//
+//   - a keyed Insert / non-PK-changing keyed Update → the upsert-run
+//     (multi-row INSERT … ON DUPLICATE KEY UPDATE);
+//   - a keyed Delete → the delete-run (DELETE … WHERE pk IN (…));
+//   - everything else — a keyless-table change (no PK to key on; ADR-0089), a
+//     PK-changing Update (would orphan the old-PK row), or a non-row event
+//     (Truncate / SchemaSnapshot / Tx*) — flushes both pending runs and applies
+//     serially via the existing per-change [ChangeApplier.dispatch].
 func (b *mysqlBatchTx) dispatch(ctx context.Context, streamID string, c ir.Change) error {
-	ins, isInsert := c.(ir.Insert)
-	// Non-insert OR keyless Insert: not coalescable. Flush the pending run
-	// first so the prior inserts land before this change (apply order), then
-	// apply it single-row via the serial dispatch. isKeylessInsert returns
-	// false for non-inserts and emits the ADR-0089 once-per-table WARN itself.
-	if !isInsert || b.a.isKeylessInsert(ctx, c) {
-		if err := b.flushPending(ctx); err != nil {
-			return err
-		}
-		return b.a.dispatch(ctx, b.tx, streamID, c)
+	switch v := c.(type) {
+	case ir.Insert:
+		return b.dispatchInsert(ctx, streamID, c, v)
+	case ir.Update:
+		return b.dispatchUpdate(ctx, streamID, c, v)
+	case ir.Delete:
+		return b.dispatchDelete(ctx, streamID, c, v)
+	default:
+		// Non-row event (Truncate / SchemaSnapshot / Tx*): flush both runs so
+		// the prior data lands first, then apply serially.
+		return b.applySerial(ctx, streamID, c)
 	}
+}
 
-	// Coalescable Insert. Resolve the routed namespace + cached metadata
-	// exactly as the serial Insert dispatch does (cache hits cost nothing).
+// dispatchInsert buffers a coalescable Insert into the upsert-run, or applies it
+// serially when the table is truly keyless (ADR-0089: keyless inserts are not
+// idempotent, so they apply one-per-tx and are never coalesced — isKeylessInsert
+// emits the once-per-table WARN itself).
+func (b *mysqlBatchTx) dispatchInsert(ctx context.Context, streamID string, c ir.Change, ins ir.Insert) error {
+	if b.a.isKeylessInsert(ctx, c) {
+		return b.applySerial(ctx, streamID, c)
+	}
 	schema := b.a.routedSchema(ins.Schema)
 	pk, err := b.a.pkFor(ctx, b.tx, schema, ins.Table)
 	if err != nil {
@@ -175,32 +271,134 @@ func (b *mysqlBatchTx) dispatch(ctx context.Context, streamID string, c ir.Chang
 	if err != nil {
 		return fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, ins.Table, err)
 	}
-	cols := appliershared.NonGeneratedRowKeys(ins.Row, colTypes)
+	return b.appendUpsert(ctx, schema, ins.Table, ins.Row, pk, colTypes, ir.ApproximateChangeBytes(c))
+}
+
+// dispatchUpdate buffers a keyed, non-PK-changing Update into the upsert-run as
+// its after-image (the row exists in a valid CDC stream, so MySQL takes the
+// ON DUPLICATE KEY UPDATE branch — same end state as the serial UPDATE, keyed by
+// PK). It applies the Update serially (full-before WHERE) when the table has no
+// PK to key on or the Update changes a PK column — upserting the after-image at
+// the new PK would orphan the old-PK row (ADR-0140 §Correctness). The lane
+// router already barriers PK-changing updates; this guard makes the single-lane
+// path safe too.
+func (b *mysqlBatchTx) dispatchUpdate(ctx context.Context, streamID string, c ir.Change, upd ir.Update) error {
+	schema := b.a.routedSchema(upd.Schema)
+	pk, err := b.a.pkFor(ctx, b.tx, schema, upd.Table)
+	if err != nil {
+		return fmt.Errorf("mysql: applier: pk lookup for %s.%s: %w", schema, upd.Table, err)
+	}
+	if len(pk) == 0 || upd.After == nil || laneapply.PKChangedUpdate(upd, pk) {
+		return b.applySerial(ctx, streamID, c)
+	}
+	colTypes, err := b.a.colTypesFor(ctx, b.tx, schema, upd.Table)
+	if err != nil {
+		return fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, upd.Table, err)
+	}
+	return b.appendUpsert(ctx, schema, upd.Table, upd.After, pk, colTypes, ir.ApproximateChangeBytes(c))
+}
+
+// dispatchDelete buffers a keyed Delete into the delete-run (its primary-key
+// values from the Before image), or applies it serially (full-before WHERE) when
+// the table has no PK or the Before image is missing a PK column — exactly the
+// cases for which a PK-keyed DELETE … IN cannot be built.
+func (b *mysqlBatchTx) dispatchDelete(ctx context.Context, streamID string, c ir.Change, del ir.Delete) error {
+	schema := b.a.routedSchema(del.Schema)
+	pk, err := b.a.pkFor(ctx, b.tx, schema, del.Table)
+	if err != nil {
+		return fmt.Errorf("mysql: applier: pk lookup for %s.%s: %w", schema, del.Table, err)
+	}
+	pkVals, ok := laneapply.PKValuesFromRow(c, pk)
+	if len(pk) == 0 || !ok {
+		return b.applySerial(ctx, streamID, c)
+	}
+	colTypes, err := b.a.colTypesFor(ctx, b.tx, schema, del.Table)
+	if err != nil {
+		return fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, del.Table, err)
+	}
+	return b.appendDelete(ctx, schema, del.Table, pk, pkVals, colTypes, ir.ApproximateChangeBytes(c))
+}
+
+// applySerial flushes both pending runs (so prior coalesced data lands first,
+// preserving apply order) then applies one change single-row via the existing
+// per-change [ChangeApplier.dispatch] on the open tx.
+func (b *mysqlBatchTx) applySerial(ctx context.Context, streamID string, c ir.Change) error {
+	if err := b.flushPending(ctx); err != nil {
+		return err
+	}
+	return b.a.dispatch(ctx, b.tx, streamID, c)
+}
+
+// appendUpsert buffers one row (an Insert row or an Update after-image) into the
+// upsert-run. It first flushes any pending delete-run (a kind switch), then
+// flushes the upsert-run if the new row switches table/shape or would overflow a
+// per-statement cap, and finally appends. Inserts and update-upserts to the same
+// table + identical column shape coalesce into ONE multi-row statement.
+func (b *mysqlBatchTx) appendUpsert(ctx context.Context, schema, table string, row ir.Row, pk []string, colTypes map[string]*ir.Column, addBytes int64) error {
+	if err := b.flushDeletes(ctx); err != nil {
+		return err
+	}
+	cols := appliershared.NonGeneratedRowKeys(row, colTypes)
 	addArgs := len(cols)
-	addBytes := ir.ApproximateChangeBytes(c)
-	if b.run.shouldFlushBefore(schema, ins.Table, cols, addArgs, addBytes) {
-		if err := b.flushPending(ctx); err != nil {
+	if b.run.shouldFlushBefore(schema, table, cols, addArgs, addBytes) {
+		if err := b.flushUpserts(ctx); err != nil {
 			return err
 		}
 	}
 	if b.run.empty() {
 		b.run.schema = schema
-		b.run.table = ins.Table
+		b.run.table = table
 		b.run.cols = cols
 		b.run.pk = pk
 		b.run.colTypes = colTypes
 	}
-	b.run.rows = append(b.run.rows, ins.Row)
+	b.run.rows = append(b.run.rows, row)
 	b.run.args += addArgs
 	b.run.bytes += addBytes
 	return nil
 }
 
-// flushPending emits the buffered run as one multi-row INSERT on the open tx
-// (via [buildMultiRowInsertSQL] — byte-identical value encoding to the single-
-// row path) and clears the run. A no-op when the run is empty, so it is safe to
-// call before a serial change, before a position write, and before commit.
+// appendDelete buffers one Delete's ordered primary-key values into the
+// delete-run. It first flushes any pending upsert-run (a kind switch), then
+// flushes the delete-run if the new key switches table or would overflow a
+// per-statement cap, and finally appends.
+func (b *mysqlBatchTx) appendDelete(ctx context.Context, schema, table string, pk []string, pkVals []any, colTypes map[string]*ir.Column, addBytes int64) error {
+	if err := b.flushUpserts(ctx); err != nil {
+		return err
+	}
+	addArgs := len(pkVals)
+	if b.del.shouldFlushBefore(schema, table, addArgs, addBytes) {
+		if err := b.flushDeletes(ctx); err != nil {
+			return err
+		}
+	}
+	if b.del.empty() {
+		b.del.schema = schema
+		b.del.table = table
+		b.del.pk = pk
+		b.del.colTypes = colTypes
+	}
+	b.del.keys = append(b.del.keys, pkVals)
+	b.del.args += addArgs
+	b.del.bytes += addBytes
+	return nil
+}
+
+// flushPending drains BOTH coalesced runs. By the accumulator's at-most-one-
+// active-run invariant only one is ever non-empty, but draining both is correct
+// and safe (the empty one no-ops). Safe to call before a serial change, before a
+// position write, and before commit.
 func (b *mysqlBatchTx) flushPending(ctx context.Context) error {
+	if err := b.flushUpserts(ctx); err != nil {
+		return err
+	}
+	return b.flushDeletes(ctx)
+}
+
+// flushUpserts emits the buffered upsert-run as one multi-row INSERT on the open
+// tx (via [buildMultiRowInsertSQL] — byte-identical value encoding to the
+// single-row path) and clears it. A no-op when the run is empty.
+func (b *mysqlBatchTx) flushUpserts(ctx context.Context) error {
 	if b.run.empty() {
 		return nil
 	}
@@ -215,6 +413,28 @@ func (b *mysqlBatchTx) flushPending(ctx context.Context) error {
 		multiRowFlushHookForTest(len(b.run.rows))
 	}
 	b.run.reset()
+	return nil
+}
+
+// flushDeletes emits the buffered delete-run as one parameterised
+// DELETE … WHERE pk IN (…) on the open tx (via [buildMultiRowDeleteSQL] — PK
+// values bound through the same prepareApplierValue codec) and clears it. A
+// no-op when the run is empty.
+func (b *mysqlBatchTx) flushDeletes(ctx context.Context) error {
+	if b.del.empty() {
+		return nil
+	}
+	stmt, args, err := buildMultiRowDeleteSQL(b.del.schema, b.del.table, b.del.pk, b.del.keys, b.del.colTypes)
+	if err != nil {
+		return fmt.Errorf("mysql: applier: build multi-row delete for %s.%s: %w", b.del.schema, b.del.table, err)
+	}
+	if _, err := b.a.txExec(ctx, b.tx, stmt, args...); err != nil {
+		return fmt.Errorf("mysql: applier: multi-row delete from %s.%s: %w", b.del.schema, b.del.table, err)
+	}
+	if multiRowDeleteFlushHookForTest != nil {
+		multiRowDeleteFlushHookForTest(len(b.del.keys))
+	}
+	b.del.reset()
 	return nil
 }
 
@@ -243,20 +463,21 @@ func (b *mysqlBatchTx) commit() error {
 	return b.a.commitWithTimeout(b.tx)
 }
 
-// Rollback discards the buffered run and rolls back the tx, satisfying
+// Rollback discards both buffered runs and rolls back the tx, satisfying
 // [appliershared.BatchTx]. The shared loop calls it on every error path
-// (dispatch failure, ctx cancel, position-write failure); the multi-row
-// statement was either already exec'd-and-will-roll-back or never sent, so
-// this discards both data and position atomically.
+// (dispatch failure, ctx cancel, position-write failure); any emitted multi-row
+// statement was either already exec'd-and-will-roll-back or never sent, so this
+// discards both data and position atomically.
 func (b *mysqlBatchTx) Rollback() error {
 	b.run.reset()
+	b.del.reset()
 	return b.tx.Rollback()
 }
 
 // buildMultiRowInsertSQL builds a parameterised multi-row upsert for `rows`,
 // all of which MUST share the identical ordered non-generated column set
-// (the caller — [mysqlBatchTx.dispatch] — guarantees this; the column list is
-// derived from rows[0]):
+// (the caller — [mysqlBatchTx.appendUpsert] — guarantees this; the column list
+// is derived from rows[0]):
 //
 //	INSERT INTO `s`.`t` (`a`, `b`) VALUES (?, ?), (?, ?), … AS new
 //	ON DUPLICATE KEY UPDATE `a` = new.`a`, `b` = new.`b`
@@ -371,4 +592,88 @@ func onDuplicateKeyUpdateClause(cols, pk []string) string {
 	}
 	sb.WriteString(strings.Join(parts, ", "))
 	return sb.String()
+}
+
+// buildMultiRowDeleteSQL builds a parameterised, PK-keyed multi-row DELETE for
+// `keys` — one ordered primary-key tuple per buffered Delete, all targeting the
+// same schema.table with the same PK (the caller — [mysqlBatchTx.appendDelete] —
+// guarantees this). The single-column-PK form is a flat IN list; a composite PK
+// uses the row-value tuple form:
+//
+//	DELETE FROM `s`.`t` WHERE `id` IN (?, ?, …)
+//	DELETE FROM `s`.`t` WHERE (`a`, `b`) IN ((?, ?), (?, ?), …)
+//
+// Every PK value binds to a `?` through the SAME prepareApplierValue codec the
+// serial [buildWhereClause] uses, so the wire encoding is byte-identical — no
+// interpolation, no per-type dispatch (the ADR-0140 value-fidelity invariant).
+// PK columns are never JSON in MySQL, so no CAST(? AS JSON) placeholder shaping
+// is needed (that is the [placeholderFor] concern for the full-before WHERE).
+// Set membership is order-independent, so the apply order across deletes within
+// one statement does not matter; the kind/table flush boundaries preserve order
+// against everything else (ADR-0140 §Correctness).
+//
+// colTypes maps column names to their full IR descriptors and is the input to
+// prepareValue; a missing entry (cold cache / unknown column) is tolerated and
+// the raw value bound, mirroring the insert builder.
+func buildMultiRowDeleteSQL(schema, table string, pk []string, keys [][]any, colTypes map[string]*ir.Column) (sqlStmt string, args []any, err error) {
+	if len(keys) == 0 {
+		return "", nil, errors.New("mysql: applier: buildMultiRowDeleteSQL: no keys")
+	}
+	if len(pk) == 0 {
+		return "", nil, errors.New("mysql: applier: buildMultiRowDeleteSQL: empty primary key")
+	}
+	tableRef := quoteIdent(schema) + "." + quoteIdent(table)
+	args = make([]any, 0, len(keys)*len(pk))
+
+	var sb strings.Builder
+	sb.WriteString("DELETE FROM ")
+	sb.WriteString(tableRef)
+	sb.WriteString(" WHERE ")
+
+	if len(pk) == 1 {
+		sb.WriteString(quoteIdent(pk[0]))
+		sb.WriteString(" IN (")
+		placeholders := make([]string, len(keys))
+		for i, k := range keys {
+			if len(k) != 1 {
+				return "", nil, fmt.Errorf("mysql: applier: buildMultiRowDeleteSQL: key %d has %d values, want 1", i, len(k))
+			}
+			v, perr := prepareApplierValue(k[0], colTypes, pk[0])
+			if perr != nil {
+				return "", nil, fmt.Errorf("column %q: %w", pk[0], perr)
+			}
+			args = append(args, v)
+			placeholders[i] = "?"
+		}
+		sb.WriteString(strings.Join(placeholders, ", "))
+		sb.WriteString(")")
+		return sb.String(), args, nil
+	}
+
+	// Composite PK: row-value tuple form (`a`, `b`) IN ((?, ?), …).
+	pkSQL := make([]string, len(pk))
+	for i, p := range pk {
+		pkSQL[i] = quoteIdent(p)
+	}
+	group := "(" + strings.TrimSuffix(strings.Repeat("?, ", len(pk)), ", ") + ")"
+	groups := make([]string, len(keys))
+	for i, k := range keys {
+		if len(k) != len(pk) {
+			return "", nil, fmt.Errorf("mysql: applier: buildMultiRowDeleteSQL: key %d has %d values, want %d", i, len(k), len(pk))
+		}
+		for j, p := range pk {
+			v, perr := prepareApplierValue(k[j], colTypes, p)
+			if perr != nil {
+				return "", nil, fmt.Errorf("column %q: %w", p, perr)
+			}
+			args = append(args, v)
+		}
+		groups[i] = group
+	}
+	sb.WriteString("(")
+	sb.WriteString(strings.Join(pkSQL, ", "))
+	sb.WriteString(") IN (")
+	sb.WriteString(strings.Join(groups, ", "))
+	sb.WriteString(")")
+	return sb.String(), args, nil
 }

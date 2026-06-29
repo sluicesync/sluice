@@ -129,12 +129,19 @@ func mkValueFamilyStream() []ir.Change {
 	return ev
 }
 
-// multiRowFlushCounter records coalesced-flush observations for a test pass.
+// multiRowFlushCounter records coalesced-flush observations for a test pass —
+// both the ADR-0139 upsert-run flushes and the ADR-0140 delete-run flushes, so
+// a pin can assert each coalescing kind actually engaged (a flush with > 1
+// row/key) rather than silently falling back to serial per-row apply.
 type multiRowFlushCounter struct {
 	mu       sync.Mutex
 	flushes  int
-	multiRow int // flushes that coalesced > 1 row
+	multiRow int // upsert flushes that coalesced > 1 row
 	maxRows  int
+
+	delFlushes int
+	delMulti   int // delete flushes that coalesced > 1 key
+	delMaxKeys int
 }
 
 func (c *multiRowFlushCounter) observe(rows int) {
@@ -149,10 +156,24 @@ func (c *multiRowFlushCounter) observe(rows int) {
 	}
 }
 
+func (c *multiRowFlushCounter) observeDelete(keys int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.delFlushes++
+	if keys > 1 {
+		c.delMulti++
+	}
+	if keys > c.delMaxKeys {
+		c.delMaxKeys = keys
+	}
+}
+
 // TestMultiRowApply_ValueFamilyDifferential is the Bug-74-corollary pin: the
 // serial, single-lane-coalescing, and W=4 concurrent paths must produce
 // byte-identical target state over the full value-family matrix, and the
-// coalescing paths must actually take the multi-row path.
+// coalescing paths must actually take BOTH the multi-row upsert path (inserts +
+// non-PK-changing updates as after-image upserts, ADR-0139/0140) and the
+// coalesced DELETE … IN path (ADR-0140).
 func TestMultiRowApply_ValueFamilyDifferential(t *testing.T) {
 	stream := mkValueFamilyStream()
 
@@ -170,7 +191,11 @@ func TestMultiRowApply_ValueFamilyDifferential(t *testing.T) {
 
 		ctr := &multiRowFlushCounter{}
 		multiRowFlushHookForTest = func(rows int) { ctr.observe(rows) }
-		defer func() { multiRowFlushHookForTest = nil }()
+		multiRowDeleteFlushHookForTest = func(keys int) { ctr.observeDelete(keys) }
+		defer func() {
+			multiRowFlushHookForTest = nil
+			multiRowDeleteFlushHookForTest = nil
+		}()
 
 		pumpBatchedChangesPipelined(t, ctx, a, testStreamID, stream, batchSize)
 		return tableChecksum(t, dsn, "target_db", "vf", "id"), ctr
@@ -179,8 +204,8 @@ func TestMultiRowApply_ValueFamilyDifferential(t *testing.T) {
 	// Serial reference: batchSize=1 routes through the per-change Apply path,
 	// which does NOT use the coalescing handle — the oracle.
 	serialSum, serialCtr := run(1, 1)
-	if serialCtr.multiRow != 0 {
-		t.Errorf("serial pass should never coalesce; saw %d multi-row flushes", serialCtr.multiRow)
+	if serialCtr.multiRow != 0 || serialCtr.delMulti != 0 {
+		t.Errorf("serial pass should never coalesce; saw %d multi-row upserts, %d multi-key deletes", serialCtr.multiRow, serialCtr.delMulti)
 	}
 
 	batchSum, batchCtr := run(64, 1)
@@ -188,7 +213,10 @@ func TestMultiRowApply_ValueFamilyDifferential(t *testing.T) {
 		t.Errorf("single-lane batch checksum %s != serial %s (value fidelity broken)", batchSum, serialSum)
 	}
 	if batchCtr.multiRow == 0 {
-		t.Errorf("single-lane batch pass never coalesced (maxRows=%d) — the multi-row path was not taken", batchCtr.maxRows)
+		t.Errorf("single-lane batch pass never coalesced an upsert (maxRows=%d) — the multi-row INSERT path was not taken", batchCtr.maxRows)
+	}
+	if batchCtr.delMulti == 0 {
+		t.Errorf("single-lane batch pass never coalesced a delete (delMaxKeys=%d) — the DELETE … IN path was not taken", batchCtr.delMaxKeys)
 	}
 
 	concSum, concCtr := run(64, concurrentLanesW)
@@ -196,7 +224,10 @@ func TestMultiRowApply_ValueFamilyDifferential(t *testing.T) {
 		t.Errorf("W=%d concurrent checksum %s != serial %s (value fidelity broken)", concurrentLanesW, concSum, serialSum)
 	}
 	if concCtr.multiRow == 0 {
-		t.Errorf("concurrent pass never coalesced (maxRows=%d) — the multi-row path was not taken", concCtr.maxRows)
+		t.Errorf("concurrent pass never coalesced an upsert (maxRows=%d) — the multi-row INSERT path was not taken", concCtr.maxRows)
+	}
+	if concCtr.delMulti == 0 {
+		t.Errorf("concurrent pass never coalesced a delete (delMaxKeys=%d) — the DELETE … IN path was not taken", concCtr.delMaxKeys)
 	}
 }
 
@@ -272,5 +303,151 @@ func TestMultiRowApply_KeylessNotCoalesced(t *testing.T) {
 	}
 	if got := countAllRows(t, dsn, "target_db", "events_log"); got != totalRows {
 		t.Errorf("after keyless apply: rows = %d; want %d", got, totalRows)
+	}
+}
+
+// reorderDDL is a minimal keyed table for the ADR-0140 ordering pins.
+const reorderDDL = `
+	CREATE TABLE reorder (
+		id  BIGINT       NOT NULL,
+		v   VARCHAR(64)  NULL,
+		PRIMARY KEY (id)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`
+
+// TestCoalesce_DeleteThenUpdate_NoResurrection pins the load-bearing ADR-0140
+// correctness claim: across the upsert↔delete kind switches the apply order is
+// preserved, so (a) a key whose final op is a DELETE stays GONE — an earlier
+// buffered upsert never resurrects it — and (b) a key DELETEd and then re-used
+// (re-INSERT + UPDATE of the same PK) ends at the new value, never the stale
+// pre-delete one. The coalescing target state must equal the serial oracle.
+func TestCoalesce_DeleteThenUpdate_NoResurrection(t *testing.T) {
+	ins := func(id int64, v string) ir.Change {
+		return ir.Insert{Position: ir.Position{Engine: engineNameMySQL, Token: fmt.Sprintf("i-%d-%s", id, v)}, Schema: "target_db", Table: "reorder", Row: ir.Row{"id": id, "v": v}}
+	}
+	upd := func(id int64, v string) ir.Change {
+		return ir.Update{Position: ir.Position{Engine: engineNameMySQL, Token: fmt.Sprintf("u-%d-%s", id, v)}, Schema: "target_db", Table: "reorder", Before: ir.Row{"id": id}, After: ir.Row{"id": id, "v": v}}
+	}
+	del := func(id int64) ir.Change {
+		return ir.Delete{Position: ir.Position{Engine: engineNameMySQL, Token: fmt.Sprintf("d-%d", id)}, Schema: "target_db", Table: "reorder", Before: ir.Row{"id": id}}
+	}
+	stream := []ir.Change{
+		ins(1, "A"), upd(1, "A2"), del(1), // key 1: final op delete -> GONE (no resurrection)
+		ins(2, "B"),                                                    // key 2: present "B"
+		del(3),                                                         // key 3: delete first (no-op on empty), then reuse
+		ins(3, "C1"), upd(3, "C2"), del(3), ins(3, "C3"), upd(3, "C4"), // -> "C4"
+	}
+
+	apply := func(batchSize int) string {
+		dsn, cleanup := startMySQLForApplier(t)
+		defer cleanup()
+		applyMySQLApplier(t, dsn, reorderDDL)
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		a := openConcurrentApplier(t, ctx, dsn, 1)
+		defer closeApplier(a)
+		pumpBatchedChangesPipelined(t, ctx, a, testStreamID, stream, batchSize)
+
+		if _, ok := queryScalarString(t, dsn, "SELECT v FROM `target_db`.`reorder` WHERE id = 1"); ok {
+			t.Errorf("key 1 was resurrected — its final op is DELETE, so the row must be gone")
+		}
+		if v, ok := queryScalarString(t, dsn, "SELECT v FROM `target_db`.`reorder` WHERE id = 2"); !ok || v != "B" {
+			t.Errorf("key 2 v = %q (ok=%v); want \"B\"", v, ok)
+		}
+		if v, ok := queryScalarString(t, dsn, "SELECT v FROM `target_db`.`reorder` WHERE id = 3"); !ok || v != "C4" {
+			t.Errorf("key 3 v = %q (ok=%v); want \"C4\" (delete-then-reuse must land the new value)", v, ok)
+		}
+		return tableChecksum(t, dsn, "target_db", "reorder", "id")
+	}
+
+	serialSum := apply(1)
+	coalescedSum := apply(64)
+	if serialSum != coalescedSum {
+		t.Errorf("coalesced checksum %s != serial %s (ordering across kind switches broken)", coalescedSum, serialSum)
+	}
+}
+
+// TestCoalesce_PKChangingUpdate_SerialNoOrphan pins that a PK-changing UPDATE is
+// NOT coalesced as an upsert (which would insert the after-image at the new PK
+// and leave the old-PK row orphaned). It takes the serial full-before path: the
+// old-PK row migrates to the new PK, leaving exactly one row and no orphan.
+func TestCoalesce_PKChangingUpdate_SerialNoOrphan(t *testing.T) {
+	stream := []ir.Change{
+		ir.Insert{Position: ir.Position{Engine: engineNameMySQL, Token: "i1"}, Schema: "target_db", Table: "reorder", Row: ir.Row{"id": int64(1), "v": "x"}},
+		ir.Update{
+			Position: ir.Position{Engine: engineNameMySQL, Token: "u1"}, Schema: "target_db", Table: "reorder",
+			Before: ir.Row{"id": int64(1), "v": "x"}, After: ir.Row{"id": int64(2), "v": "x"},
+		},
+	}
+
+	apply := func(batchSize int) string {
+		dsn, cleanup := startMySQLForApplier(t)
+		defer cleanup()
+		applyMySQLApplier(t, dsn, reorderDDL)
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		a := openConcurrentApplier(t, ctx, dsn, 1)
+		defer closeApplier(a)
+		pumpBatchedChangesPipelined(t, ctx, a, testStreamID, stream, batchSize)
+
+		if got := countAllRows(t, dsn, "target_db", "reorder"); got != 1 {
+			t.Errorf("after PK-changing update: rows = %d; want 1 (no orphaned old-PK row)", got)
+		}
+		if _, ok := queryScalarString(t, dsn, "SELECT v FROM `target_db`.`reorder` WHERE id = 1"); ok {
+			t.Errorf("old-PK row id=1 still present — PK-changing update left an orphan")
+		}
+		if v, ok := queryScalarString(t, dsn, "SELECT v FROM `target_db`.`reorder` WHERE id = 2"); !ok || v != "x" {
+			t.Errorf("new-PK row id=2 v = %q (ok=%v); want \"x\"", v, ok)
+		}
+		return tableChecksum(t, dsn, "target_db", "reorder", "id")
+	}
+
+	serialSum := apply(1)
+	coalescedSum := apply(64)
+	if serialSum != coalescedSum {
+		t.Errorf("coalesced checksum %s != serial %s (PK-changing update mishandled)", coalescedSum, serialSum)
+	}
+}
+
+// TestCoalesce_KeylessUpdateDelete_Serial pins that U/D on a keyless table (no
+// PK to key on) stay on the serial full-before path — never the coalesced
+// DELETE … IN — and still produce the correct final state.
+func TestCoalesce_KeylessUpdateDelete_Serial(t *testing.T) {
+	dsn, cleanup := startMySQLForApplier(t)
+	defer cleanup()
+	applyMySQLApplier(t, dsn, `
+		CREATE TABLE keyless_ud (
+			k  VARCHAR(8)   NOT NULL,
+			v  VARCHAR(32)  NOT NULL
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	a := openConcurrentApplier(t, ctx, dsn, 1)
+	defer closeApplier(a)
+
+	var coalescedDeletes atomic.Int64
+	multiRowDeleteFlushHookForTest = func(int) { coalescedDeletes.Add(1) }
+	defer func() { multiRowDeleteFlushHookForTest = nil }()
+
+	stream := []ir.Change{
+		ir.Insert{Position: ir.Position{Engine: engineNameMySQL, Token: "i-a"}, Schema: "target_db", Table: "keyless_ud", Row: ir.Row{"k": "a", "v": "1"}},
+		ir.Insert{Position: ir.Position{Engine: engineNameMySQL, Token: "i-b"}, Schema: "target_db", Table: "keyless_ud", Row: ir.Row{"k": "b", "v": "2"}},
+		ir.Insert{Position: ir.Position{Engine: engineNameMySQL, Token: "i-c"}, Schema: "target_db", Table: "keyless_ud", Row: ir.Row{"k": "c", "v": "3"}},
+		ir.Update{Position: ir.Position{Engine: engineNameMySQL, Token: "u-a"}, Schema: "target_db", Table: "keyless_ud", Before: ir.Row{"k": "a", "v": "1"}, After: ir.Row{"k": "a", "v": "1-updated"}},
+		ir.Delete{Position: ir.Position{Engine: engineNameMySQL, Token: "d-b"}, Schema: "target_db", Table: "keyless_ud", Before: ir.Row{"k": "b", "v": "2"}},
+	}
+	pumpBatchedChangesPipelined(t, ctx, a, testStreamID, stream, 64)
+
+	if got := coalescedDeletes.Load(); got != 0 {
+		t.Errorf("keyless deletes hit the coalesced DELETE … IN path %d times; want 0 (no PK to key on)", got)
+	}
+	if got := countAllRows(t, dsn, "target_db", "keyless_ud"); got != 2 {
+		t.Errorf("after keyless U/D: rows = %d; want 2 (a updated, b deleted, c kept)", got)
+	}
+	if v, ok := queryScalarString(t, dsn, "SELECT v FROM `target_db`.`keyless_ud` WHERE k = 'a'"); !ok || v != "1-updated" {
+		t.Errorf("keyless update: a.v = %q (ok=%v); want \"1-updated\"", v, ok)
+	}
+	if _, ok := queryScalarString(t, dsn, "SELECT v FROM `target_db`.`keyless_ud` WHERE k = 'b'"); ok {
+		t.Errorf("keyless delete: row b still present; want deleted")
 	}
 }
