@@ -105,6 +105,27 @@ func mkValueFamilyStream() []ir.Change {
 	for i := int64(keys + 1); i <= keys+20; i++ {
 		ev = append(ev, ir.Insert{Position: ir.Position{Engine: engineNameMySQL, Token: tok()}, Schema: "target_db", Table: "vf", Row: insRow(i)})
 	}
+	// Phase 5: a contiguous coalescable run that MIXES NULL and non-NULL in every
+	// nullable column (the Bug-74 NULL shape). Each row carries the SAME 8 keys —
+	// the NULL rows are present-with-nil, NOT absent, so NonGeneratedRowKeys keeps
+	// the identical column set and the run coalesces into one multi-row statement
+	// rather than flushing on a shape change. This binds NULL inside a coalesced
+	// group, and across rows of one statement each nullable column is NULL in some
+	// rows and non-NULL in others — the gap a per-representative (all-non-null)
+	// pin would miss (value-fidelity review, ADR-0139).
+	insRowNull := func(i int64) ir.Row {
+		return ir.Row{
+			"id": i, "decv": nil, "js": nil, "flag": nil,
+			"blb": nil, "ts": nil, "big": nil, "txt": fmt.Sprintf("n-%d", i),
+		}
+	}
+	for i := int64(keys + 21); i <= keys+40; i++ {
+		row := insRow(i)
+		if i%2 == 0 {
+			row = insRowNull(i)
+		}
+		ev = append(ev, ir.Insert{Position: ir.Position{Engine: engineNameMySQL, Token: tok()}, Schema: "target_db", Table: "vf", Row: row})
+	}
 	return ev
 }
 
