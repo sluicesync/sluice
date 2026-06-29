@@ -5,15 +5,16 @@
   <img alt="sluice" src="branding/sluice-logo.png" width="340">
 </picture>
 
-### Open-source enterprise-class CDC for MySQL&nbsp;↔&nbsp;Postgres
+### Open-source enterprise-class CDC for MySQL&nbsp;↔&nbsp;Postgres — plus SQLite & Cloudflare D1
 
 [**Website**](https://sluicesync.com) · [**Documentation**](https://sluicesync.com/docs/) · [**Releases**](https://github.com/sluicesync/sluice/releases/latest)
 
 </div>
 
-Continuous sync between MySQL and Postgres in all four directions, with the schema-evolution, cutover-priming, and slot-health capabilities usually found only in commercial/enterprise CDC tools. Initial snapshot, CDC catch-up, and operator-driven cutover in one tool, opinionated about correctness.
+Continuous sync between MySQL and Postgres in all four directions, with the schema-evolution, cutover-priming, and slot-health capabilities usually found only in commercial/enterprise CDC tools. Initial snapshot, CDC catch-up, and operator-driven cutover in one tool, opinionated about correctness. SQLite files and live Cloudflare D1 databases also migrate into Postgres or MySQL (with trigger-based continuous sync), and SQLite is a migrate target.
 
 - 🔄 **Bidirectional** — MySQL → Postgres, Postgres → MySQL, same-engine in both directions, PlanetScale flavors included
+- 🗃️ **SQLite & Cloudflare D1** — import a SQLite file or a `wrangler d1 export` `.sql` dump (`--source-driver sqlite`), or read a live D1 over its HTTP query API (`--source-driver d1`) into Postgres / MySQL; big integers above 2⁵³ round-trip exactly (no JS 52-bit rounding, [ADR-0132](docs/adr/adr-0132-d1-query-api-reader.md)). SQLite is also a migrate **target** (`--target-driver sqlite`, decimals stored byte-exact as TEXT), and `sqlite-trigger` / `d1-trigger` add trigger-based continuous CDC ([ADR-0135](docs/adr/adr-0135-sqlite-trigger-cdc.md) / [ADR-0136](docs/adr/adr-0136-d1-trigger-cdc.md))
 - 🔌 **Slot-less Postgres sources** — managed Postgres that blocks logical replication (e.g. Heroku Postgres) still streams via a trigger-based CDC engine (`--source-driver=postgres-trigger`) — no replication slot or `REPLICATION` role required
 - 🪶 **Schema evolution** — `ADD COLUMN` forwards automatically; every other shape refuses loudly with a structured drift diff naming the column that changed
 - 🩺 **Operational telemetry** — pre-emptive PG slot-health warnings (70 % / 85 % retention + 30 min inactivity); source-side heartbeat writer keeps slots alive against quiet sources; `sync start --metrics-listen ADDR` serves Prometheus `/metrics` + a `/readyz` readiness probe (200 once the stream enters its apply phase) for k8s / load-balancer health checks
@@ -61,7 +62,19 @@ sluice sync start \
 
 # Cutover-time sequence priming (post-snapshot, pre-traffic-switch)
 sluice cutover --config sluice.yaml --cutover-sequence-margin=1000
+
+# Import a SQLite file (or a `wrangler d1 export` .sql dump) → Postgres
+sluice migrate \
+    --source-driver sqlite   --source ./app.db \
+    --target-driver postgres --target 'postgres://...?sslmode=disable'
+
+# Import a LIVE Cloudflare D1 → Postgres (token via CLOUDFLARE_API_TOKEN)
+sluice migrate \
+    --source-driver d1       --source 'd1://<account_id>/<database_id>' \
+    --target-driver postgres --target 'postgres://...?sslmode=disable'
 ```
+
+SQLite / D1 import (file, `.sql` dump, live query API), the lossless big-integer path, and the `sqlite-trigger` / `d1-trigger` continuous-CDC engines are covered in [`docs/operator/sqlite-d1-import.md`](docs/operator/sqlite-d1-import.md). Migrating many MySQL databases or PG schemas in one run is covered in [`docs/operator/multi-database-multi-schema.md`](docs/operator/multi-database-multi-schema.md).
 
 A 10-minute walkthrough against real MySQL 8.0 + Postgres 16 containers, loading the Sakila sample database, lives at [`docs/examples/quickstart.md`](docs/examples/quickstart.md).
 
@@ -74,6 +87,8 @@ sluice is built around three product surfaces, each independently runnable:
 | You want to… | Run |
 |---|---|
 | Move data **once** between MySQL and Postgres, then stop | `sluice migrate` |
+| Import a **SQLite file / `.sql` dump / live Cloudflare D1** into Postgres or MySQL | `sluice migrate --source-driver sqlite\|d1` |
+| Emit a **SQLite `.db`** from any source (e.g. for `wrangler d1 import`) | `sluice migrate --target-driver sqlite` |
 | Move data **once** with low downtime — snapshot + CDC catch-up + cutover | `sluice migrate` → `sluice sync start --resume` → `sluice cutover` |
 | **Replicate continuously** for analytics, geo-locality, or hot-standby | `sluice sync start` |
 | **Preview** the target DDL before running anything | `sluice schema preview` |
@@ -105,6 +120,17 @@ Since that arc, the **v0.84 → v0.99 releases** widened the surface well beyond
 | **PlanetScale PG** | ✓ | ✓ | ✓ | ✓ |
 
 Cross-engine type translation handles the common surfaces (PG `UUID` / `INET` / `MACADDR` / `ARRAY` ↔ MySQL `CHAR(36)` / `VARCHAR` / `JSON`; MySQL `TINYINT(1)` ↔ PG `BOOLEAN`; MySQL `ENUM` / `SET` → PG enum / `TEXT[] + CHECK`; PostGIS `GEOMETRY` round-trips with SRID; many idioms in generated columns and `CHECK` constraints translate automatically — see [`docs/dev/translator-coverage.md`](docs/dev/translator-coverage.md)). When the default doesn't fit, `--type-override TABLE.COLUMN=TYPE` and `--expr-override TABLE.COLUMN=EXPR` cover one-off cases without writing a config file.
+
+### SQLite & Cloudflare D1
+
+| Engine name | Role | Notes |
+|---|---|---|
+| `sqlite` | **source** (file or `.sql` dump) **and target** | Pure-Go `modernc.org/sqlite`, no CGO. As a source it imports a binary `.db` or a `wrangler d1 export` `.sql` dump (auto-detected) into Postgres / MySQL; as a target (`--target-driver sqlite`) it emits a `.db` from any source, decimals stored byte-exact as TEXT. Migrate only (no CDC). |
+| `d1` | **source** (live, lossless) | Reads a live Cloudflare D1 over its HTTP query API (`--source-driver d1`, token via `CLOUDFLARE_API_TOKEN`); per-column `typeof()` + `CAST(... AS TEXT)` / `hex()` projection makes integers above 2⁵³ and BLOBs round-trip exactly, and reads don't take D1 offline ([ADR-0132](docs/adr/adr-0132-d1-query-api-reader.md)). |
+| `sqlite-trigger` | **CDC source** | Trigger-based continuous sync from a local SQLite file: per-table AFTER triggers + a `sluice_change_log` watermark for exactly-once resume ([ADR-0135](docs/adr/adr-0135-sqlite-trigger-cdc.md)). |
+| `d1-trigger` | **CDC source** | The same trigger-CDC design over a live D1's HTTP query API ([ADR-0136](docs/adr/adr-0136-d1-trigger-cdc.md)). |
+
+SQLite / D1 are migrate **sources** into Postgres or MySQL, and SQLite is also a migrate **target**; D1 is not a target (use a `.db` SQLite target, then `wrangler d1 import`). Declared `DATE` / `DATETIME` / `BOOL` columns and the ambiguous value encoding are governed by `--sqlite-date-encoding` (`iso` default / `unixepoch` / `unixmillis` / `julian`), refusing loudly on a storage-class mismatch. Full operator walkthrough: [`docs/operator/sqlite-d1-import.md`](docs/operator/sqlite-d1-import.md).
 
 ---
 
@@ -139,7 +165,7 @@ The lesson all six share: **the integration test was green** at the surface that
 
 ## Architecture in one paragraph
 
-[`internal/ir`](internal/ir) defines a typed dialect-neutral schema and value model plus the `Engine`, `SchemaReader`, `SchemaWriter`, `RowReader`, `RowWriter`, `CDCReader`, `ChangeApplier` interfaces. Each engine package (`internal/engines/mysql`, `internal/engines/postgres`) implements those interfaces and self-registers via `init()`. `internal/pipeline.Migrator` is the simple-mode orchestrator: read source schema → optional dry-run plan → create target tables (no constraints) → bulk-copy rows → create indexes → create constraints. `cmd/sluice` is a [kong](https://github.com/alecthomas/kong)-based CLI; config loading is via [koanf](https://github.com/knadh/koanf) YAML + env. Engines are looked up by name from `engines.Get(...)`; the pipeline package never imports specific engine packages. MySQL has flavors (Vanilla, PlanetScale) — same engine code, different `Capabilities` declarations, registered under different names. Additional engines slot in without touching the orchestrator.
+[`internal/ir`](internal/ir) defines a typed dialect-neutral schema and value model plus the `Engine`, `SchemaReader`, `SchemaWriter`, `RowReader`, `RowWriter`, `CDCReader`, `ChangeApplier` interfaces. Each engine package (`internal/engines/mysql`, `internal/engines/postgres`, `internal/engines/sqlite`, the trigger-CDC engines under `internal/engines/{pgtrigger,sqlite-trigger,d1-trigger}`) implements those interfaces and self-registers via `init()` — nine registered engines today (`sluice engines` lists them): `mysql`, `planetscale`, `vitess`, `postgres`, `sqlite`, `d1`, `postgres-trigger`, `sqlite-trigger`, `d1-trigger`. `internal/pipeline.Migrator` is the simple-mode orchestrator: read source schema → optional dry-run plan → create target tables (no constraints) → bulk-copy rows → create indexes → create constraints. `cmd/sluice` is a [kong](https://github.com/alecthomas/kong)-based CLI; config loading is via [koanf](https://github.com/knadh/koanf) YAML + env. Engines are looked up by name from `engines.Get(...)`; the pipeline package never imports specific engine packages. MySQL has flavors (Vanilla, PlanetScale) — same engine code, different `Capabilities` declarations, registered under different names. Additional engines slot in without touching the orchestrator.
 
 The longer story lives in [`docs/architecture.md`](docs/architecture.md).
 
@@ -234,23 +260,31 @@ Commands:
   engines                  List registered database engines.
   migrate                  Run a one-time schema + data migration.
   sync start               Start a continuous-sync stream.
+  sync run                 Supervise a fleet of syncs from one process (ADR-0122).
   sync status              Show status of a running sync stream.
   sync stop                Gracefully drain and stop a running stream.
   sync health              Probe a stream's freshness; cron-friendly exit code.
+  sync tui                 Live terminal dashboard for a running fleet (ADR-0125).
   sync from-backup run     Replay a backup chain into a target as a long-running broker.
   cutover                  Prime target sequences from source (post-snapshot, pre-traffic-switch).
   backup                   Take and verify encrypted logical backups (full + incremental chains).
   restore                  Restore a logical backup chain into a target database.
-  trigger setup            Install / remove the postgres-trigger engine's source-side state (slot-less CDC).
+  trigger setup            Install trigger-CDC state (postgres-trigger / sqlite-trigger / d1-trigger).
+  trigger prune            Reap durably-applied rows from a trigger change-log (ADR-0137).
   schema preview           Print the target DDL sluice would emit.
   schema diff              Diff a target against what sluice would produce.
   verify                   Compare row counts between source and target.
   matview refresh          Refresh PostgreSQL materialized views (PG-only).
   slot list / slot drop    Manage Postgres replication slots.
   diagnose                 Bundle source/target capability + role state for operator handoff.
+  metrics-watch            Watch a PlanetScale DB's control-plane metrics + fire alerts (ADR-0107).
 ```
 
 Run `sluice <command> --help` for per-command flags. DSNs can also be passed via `SLUICE_SOURCE` / `SLUICE_TARGET` env vars.
+
+**Migrating many namespaces in one run.** A MySQL server's databases or a Postgres source's schemas can be moved together: `--all-databases` / `--all-schemas` fan every non-system namespace out to a same-named target namespace (auto-created), and `--include-database` / `--exclude-database` (or the PG-source synonyms `--include-schema` / `--exclude-schema`) scope the set. These work on both `migrate` and `sync start` (CDC included). See [`docs/operator/multi-database-multi-schema.md`](docs/operator/multi-database-multi-schema.md) and [ADR-0074](docs/adr/adr-0074-multi-database-mysql-migration-and-sync.md) / [ADR-0075](docs/adr/adr-0075-postgres-source-multi-schema-migration-and-sync.md).
+
+`trigger setup` is no longer Postgres-only: `--source-driver` selects `postgres-trigger` (default), `sqlite-trigger` (a local SQLite file), or `d1-trigger` (a live Cloudflare D1).
 
 ---
 
@@ -259,7 +293,7 @@ Run `sluice <command> --help` for per-command flags. DSNs can also be passed via
 A few terms recur in the codebase and docs:
 
 - **IR** — the **internal representation**, sluice's typed dialect-neutral schema + value model in `internal/ir`. Every cross-engine translation passes through it: source-engine readers populate the IR, target-engine writers consume it. The IR is the only shared contract between engines, which keeps source-specific knowledge out of writers and target-specific knowledge out of readers. See [`docs/architecture.md`](docs/architecture.md) for the longer story.
-- **Engine** — a registered database integration (`mysql`, `postgres`, `planetscale`). Each engine implements the same interface set (`SchemaReader`, `SchemaWriter`, `RowReader`, `RowWriter`, `CDCReader`, `ChangeApplier`, plus optional surfaces like `SlotHealthReporter`, `HeartbeatWriter`, `SequencePrimer`); the orchestrator never imports an engine package directly.
+- **Engine** — a registered database integration. Nine are registered today (run `sluice engines`): `mysql`, `planetscale`, `vitess`, `postgres`, `sqlite`, `d1`, `postgres-trigger`, `sqlite-trigger`, `d1-trigger`. Each engine implements the same interface set (`SchemaReader`, `SchemaWriter`, `RowReader`, `RowWriter`, `CDCReader`, `ChangeApplier`, plus optional surfaces like `SlotHealthReporter`, `HeartbeatWriter`, `SequencePrimer`); the orchestrator never imports an engine package directly.
 - **Stream** — a continuous-sync flow with persisted position, identified by a `--stream-id`. Distinct from a one-shot `migrate` which doesn't persist resume state on the target.
 - **Shape** — the classification of a CDC-observed source DDL (`ShapeKindAddColumn`, `ShapeKindRenameColumn`, `ShapeKindUnrecognized`, …) that drives whether the streamer auto-forwards, coordinates live, or refuses loudly. See ADR-0054 / ADR-0058.
 - **Refuse loudly** — sluice's posture when the safe forward path is ambiguous or the operator-action recovery hint matters more than continuing. Always emits a structured message naming the offending object and the recovery path.
@@ -275,7 +309,7 @@ A few terms recur in the codebase and docs:
 - [`docs/cookbook/`](docs/cookbook/) — task-shaped recipes: one-shot migrate, bidirectional cutover, Heroku-style slot-less migration, encrypted backup chains, PII redaction, PostGIS round-trip, GitLab-shape case study, and the `pg_dump` comparison
 - [`docs/translator-catalog.md`](docs/translator-catalog.md) — consolidated cross-engine expression translator reference: shipped translations + deferred rules + escape hatches
 - [`docs/backup-format-versioning.md`](docs/backup-format-versioning.md) — backup manifest `FormatVersion` contract: proportional version-stamp, refuse-before-touch on older binaries, how older sluice doesn't silently drop RLS / EXCLUDE metadata (Bug 116 closure reference)
-- [`docs/adr/README.md`](docs/adr/README.md) — index of all ADRs (ADR-0001 – ADR-0080), one-line summary per decision
+- [`docs/adr/README.md`](docs/adr/README.md) — index of all ADRs (ADR-0001 – ADR-0140), one-line summary per decision
 - [`docs/managed-services.md`](docs/managed-services.md) — PlanetScale-specific notes, operator preconditions
 - [`docs/postgres-source-prep.md`](docs/postgres-source-prep.md) — required PG GUCs, slot lifecycle, failover-survival mechanisms
 - [`docs/vitess-vstream-troubleshooting.md`](docs/vitess-vstream-troubleshooting.md) — operator runbook for PlanetScale-MySQL VStream lag (throttler, replication lag, deploy requests)
@@ -283,9 +317,11 @@ A few terms recur in the codebase and docs:
 - [`docs/redaction.md`](docs/redaction.md) — PII redaction operator guide: 26 strategies, determinism contracts, dictionary loader
 - [`docs/snapshot-cdc-handoff.md`](docs/snapshot-cdc-handoff.md) — operator reference for the cold-start → CDC handoff
 - [`docs/schema-change-runbook.md`](docs/schema-change-runbook.md) — `ADD COLUMN` / `DROP COLUMN` / `MODIFY` against a running stream
+- [`docs/operator/sqlite-d1-import.md`](docs/operator/sqlite-d1-import.md) — importing SQLite files / `.sql` dumps / live Cloudflare D1 into Postgres or MySQL, the lossless big-integer path, and the SQLite/D1 trigger-CDC engines
+- [`docs/operator/multi-database-multi-schema.md`](docs/operator/multi-database-multi-schema.md) — migrating many MySQL databases / Postgres schemas in one run (`--all-databases` / `--all-schemas`), fan-IN consolidation, and the documented edges
 - [`docs/type-mapping.md`](docs/type-mapping.md), [`docs/value-types.md`](docs/value-types.md) — type translation policies and runtime row contract
 - [`docs/testing.md`](docs/testing.md) — testing strategy, the Bug 74 class-pin lesson
-- [`docs/adr/`](docs/adr/) — Architecture Decision Records (ADR-0001 through ADR-0080)
+- [`docs/adr/`](docs/adr/) — Architecture Decision Records (ADR-0001 through ADR-0140)
 - [`docs/dev/`](docs/dev/) — local development setup, roadmap, design proto-ADRs
 - [`docs/examples/`](docs/examples/) — runnable quickstart, sample `sluice.yaml` config
 
@@ -293,6 +329,8 @@ A few terms recur in the codebase and docs:
 
 Selected highlights from the **v0.94 → v0.99** arc:
 
+- **SQLite & Cloudflare D1 engine family** (v0.99.141 → v0.99.148) — SQLite/D1 migrate source (file + `.sql` dump + lossless live-D1 query-API reader, [ADR-0128](docs/adr/adr-0128-sqlite-d1-migrate-source.md)/[0130](docs/adr/adr-0130-sqlite-sql-dump-ingest.md)/[0132](docs/adr/adr-0132-d1-query-api-reader.md)), generated/CHECK/expression-index carry ([ADR-0133](docs/adr/adr-0133-sqlite-schema-feature-detection.md)), within-table parallel chunking, SQLite as a migrate **target** (decimals byte-exact as TEXT, [ADR-0134](docs/adr/adr-0134-sqlite-target-engine.md)), and the `sqlite-trigger` / `d1-trigger` continuous-CDC engines ([ADR-0135](docs/adr/adr-0135-sqlite-trigger-cdc.md)/[0136](docs/adr/adr-0136-d1-trigger-cdc.md))
+- **MySQL CDC apply-over-WAN coalescing** ([ADR-0139](docs/adr/adr-0139-mysql-multirow-insert-apply.md)/[0140](docs/adr/adr-0140-mysql-coalesce-update-delete-apply.md)) — consecutive same-shape INSERTs fold into one multi-row `INSERT … ON DUPLICATE KEY UPDATE`, UPDATEs apply as the same keyed upsert, and DELETEs coalesce into one `DELETE … WHERE pk IN (…)`, turning N round trips into one and lifting cross-region / PlanetScale-MySQL apply off the per-RTT floor; a rate-limited INFO line reports the rows-per-statement coalescing ratio
 - [v0.99.30](https://github.com/sluicesync/sluice/releases/tag/v0.99.30) — Index-build overlap extended to MySQL targets (ADR-0080) + within-table chunking on the PG fast `sync` cold-start + the `SPATIAL`/`FULLTEXT` `Error 1089` fix
 - [v0.99.29](https://github.com/sluicesync/sluice/releases/tag/v0.99.29) — The bulk-copy throughput arc: cross-table worker pool (`--table-parallelism`, ADR-0076), index-build overlap (ADR-0077), PG→PG raw `COPY` passthrough (ADR-0078), fast `sync` cold-start (ADR-0079)
 - [v0.99.16](https://github.com/sluicesync/sluice/releases/tag/v0.99.16) — Multi-database fan-out (`--all-databases` / `--include-database`, migrate + sync) + the FTWRL binlog-snapshot boundary-gap silent-loss fix

@@ -164,6 +164,45 @@ grant the apply role the privilege to set `session_replication_role`,
 or make the target FK constraints `DEFERRABLE`. MySQL's
 `foreign_key_checks` needs no special privilege.
 
+## Trigger-based CDC sources: `sqlite-trigger` and `d1-trigger`
+
+Most CDC sources read a native change stream — Postgres logical
+replication, MySQL binlog, Vitess VStream. SQLite and Cloudflare D1 have
+no such stream: SQLite's WAL is a *physical* page-log, not a logical
+record of row changes. So sluice captures their changes with **triggers**,
+the same technique the `postgres-trigger` engine uses for managed Postgres
+that blocks logical replication ([ADR-0066](../adr/adr-0066-postgres-trigger-engine-variant.md)).
+
+`sluice trigger setup --source-driver sqlite-trigger` (a local file) or
+`--source-driver d1-trigger` (a live D1 over the HTTP query API) installs:
+
+- **Per-table AFTER INSERT / UPDATE / DELETE triggers** that write the
+  before/after row image into a `sluice_change_log` table. The image is
+  encoded as the same `(typeof, text/hex)` pairs the lossless `d1` reader
+  uses (NOT `json_object()`, which would round integers above 2⁵³ to
+  float64 and can't represent BLOBs) — so capture is value-exact
+  ([ADR-0135](../adr/adr-0135-sqlite-trigger-cdc.md) /
+  [ADR-0136](../adr/adr-0136-d1-trigger-cdc.md)).
+- A **monotonic-`id` watermark** on `sluice_change_log`: the polling
+  reader emits changes in `id` order and persists the last applied `id`,
+  so a restart resumes **exactly-once** from the durable position.
+- A **`MAX(id)` snapshot anchor** captured at snapshot start, so the
+  cold-start → CDC handoff is gap-free (every change after the anchor is
+  streamed; everything at or before it is already in the snapshot).
+- A **captured-column fingerprint** (`sluice_change_log_columns`) that
+  **refuses loudly on schema drift** rather than silently dropping a
+  column added after setup (SQLite has no DDL triggers, so an added
+  column is otherwise invisible to the capture path).
+
+`d1-trigger` polls D1's **primary** (strongly-consistent) query path, not
+a read replica, so commit order equals `id` order. Because every change
+appends a `sluice_change_log` row that is never auto-reaped, run
+`sluice trigger prune` periodically to bound source growth — it deletes
+only rows strictly below the target's durable applied watermark (see
+[trigger-changelog-retention.md](trigger-changelog-retention.md)). The
+full operator walkthrough, including teardown, is in
+[sqlite-d1-import.md](sqlite-d1-import.md).
+
 ## See also
 
 - [ADR-0038](../adr/adr-0038-applier-retry-on-transient-errors.md) —
@@ -171,3 +210,6 @@ or make the target FK constraints `DEFERRABLE`. MySQL's
 - ADR-0010 — idempotent applier (the load-bearing precondition).
 - ADR-0007 — position/data atomicity (preserved by retry).
 - ADR-0027 — source-transaction-boundary batching (preserved by retry).
+- [ADR-0135](../adr/adr-0135-sqlite-trigger-cdc.md) /
+  [ADR-0136](../adr/adr-0136-d1-trigger-cdc.md) — the SQLite / D1
+  trigger-CDC engines.

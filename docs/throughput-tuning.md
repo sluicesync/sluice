@@ -35,6 +35,52 @@ The contract mirrors `--table-parallelism` (`0 = auto:N`, `1 = disable`):
 
 Correctness is unchanged by the default flip: the resume position advances only to a source boundary durable across all lanes (exactly-once for keyed tables; keyless tables keep their at-least-once baseline via the keyless guard), per-lane AIMD self-throttles on a slow/weak target, and a transient in-lane abort (a PlanetScale tx-killer on MySQL, a serialization/deadlock on Postgres) is handled in-lane (controller shrink + idempotent split-retry) without restarting the stream. See [ADR-0104](adr/adr-0104-mysql-pipelined-cdc-apply.md) (MySQL), [ADR-0105](adr/adr-0105-postgres-concurrent-cdc-apply.md) (Postgres), and [ADR-0106](adr/adr-0106-default-adaptive-apply-concurrency.md) (the fast-by-default decision).
 
+## MySQL CDC apply coalescing over WAN (automatic, no flag)
+
+This one needs no tuning — it is on by default — but it is the dominant
+factor in MySQL-target CDC throughput on a high-latency link, so it is
+worth understanding.
+
+Postgres has a pipelining primitive (`pgx.Batch`), so ADR-0092/0138 made
+PG apply send a whole batch in one round trip regardless of size. MySQL
+has **no** pipelining primitive: both the single-lane batch loop and the
+concurrent apply lanes dispatch one `tx.ExecContext` per change, so a
+batch of N changes was N network round trips. On a LAN that is invisible;
+over WAN (cross-region, PlanetScale-MySQL) it caps apply at roughly
+`lanes / RTT` and stalls behind Vitess's 20-second transaction killer —
+measured around ~20 rows/sec to PlanetScale-MySQL versus PG's ~5,000/sec.
+
+sluice now **coalesces** consecutive changes of the same kind and shape
+into one statement ([ADR-0139](adr/adr-0139-mysql-multirow-insert-apply.md)
+/ [ADR-0140](adr/adr-0140-mysql-coalesce-update-delete-apply.md)):
+
+- Same-table, same-column-shape, keyed **INSERTs** → one multi-row
+  `INSERT … VALUES (…),(…),… AS new ON DUPLICATE KEY UPDATE …`.
+- A keyed, non-PK-changing **UPDATE** applies as the same keyed upsert,
+  so it coalesces alongside inserts to the same table+shape.
+- Consecutive keyed **DELETEs** → one `DELETE … WHERE pk IN (?,…)`
+  (single-col PK) / `WHERE (a,b) IN ((?,?),…)` (composite PK).
+
+Every value still binds to a `?` through the identical per-value codec
+the serial path uses — the wire encoding is byte-for-byte unchanged,
+only the number of placeholder groups grows — so this is a round-trip
+optimisation, not a value-path change. A run flushes before any
+non-coalescable change so apply order matches source order; keyless-table
+U/D and PK-changing UPDATEs stay on the serial full-before path.
+
+**Observability.** A rate-limited INFO line (at most once per 30s across
+all lanes) reports the running coalescing ratio:
+
+```
+mysql: applier: coalescing ratio  rows_per_stmt=12.4 coalesced_rows=… coalesced_statements=… assessment="good — same-kind runs coalescing well"
+```
+
+`rows_per_stmt` is the average rows folded into each coalesced statement.
+A high ratio means long same-kind runs (one round trip absorbs many
+rows); a value near `1` means the workload alternates kinds or has no
+runs to coalesce, so apply stays RTT-bound — in that case widen
+`--apply-concurrency` instead.
+
 ## Parallel within-table bulk copy: `--bulk-parallelism` + `--bulk-parallel-min-rows`
 
 Default: `min(8, NumCPU)` parallel readers per table; tables under
@@ -141,3 +187,6 @@ for the full rationale and the audit of where memory accumulates.
 - [ADR-0104 — MySQL pipelined / concurrent CDC apply](adr/adr-0104-mysql-pipelined-cdc-apply.md)
 - [ADR-0105 — Postgres concurrent key-hash CDC apply](adr/adr-0105-postgres-concurrent-cdc-apply.md)
 - [ADR-0106 — Fast-by-default adaptive `--apply-concurrency`](adr/adr-0106-default-adaptive-apply-concurrency.md)
+- [ADR-0138 — Pipeline the concurrent PG apply lanes](adr/adr-0138-pipeline-concurrent-apply-lanes.md)
+- [ADR-0139 — MySQL multi-row INSERT coalescing](adr/adr-0139-mysql-multirow-insert-apply.md)
+- [ADR-0140 — MySQL UPDATE/DELETE apply coalescing](adr/adr-0140-mysql-coalesce-update-delete-apply.md)

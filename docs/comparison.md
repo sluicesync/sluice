@@ -150,6 +150,32 @@ For **measured initial-copy throughput head-to-heads**, see [`docs/comparison-pg
 
 ---
 
+## SQLite & Cloudflare D1 as first-class sources
+
+**Capability claim.** sluice imports a SQLite file, a `wrangler d1 export`
+`.sql` dump, or a **live Cloudflare D1** (over its HTTP query API) into
+Postgres or MySQL in one command — and emits a SQLite `.db` as a target.
+The lossless path matters: D1's query API and its export both serialise
+through JSON float64, so integers above 2⁵³ round on the way out; sluice's
+`d1` reader projects `typeof()` + `CAST(... AS TEXT)` / `hex()` per column
+so big integers and BLOBs round-trip exactly ([ADR-0132](adr/adr-0132-d1-query-api-reader.md)).
+Continuous sync off SQLite/D1 is trigger-based (`sqlite-trigger` /
+`d1-trigger`) since SQLite's WAL is a physical page-log, not a logical
+change stream.
+
+**Why this matters.** The serverless / edge path (D1, embedded SQLite)
+into a "real" managed database is otherwise hand-rolled export scripts —
+exactly where the silent big-integer rounding bites.
+
+**Where the alternatives land.**
+- **pgloader:** the usual SQLite → PG tool, but PG-target only and a
+  separate toolchain; no live-D1 or MySQL-target path.
+- **Debezium / AWS DMS / Fivetran / HVR:** centered on MySQL / Postgres /
+  Oracle / SQL Server sources; SQLite and Cloudflare D1 are not in scope.
+- **pgcopydb:** PG → PG only.
+
+---
+
 ## Single static binary, no daemon, no Kafka
 
 **Capability claim.** sluice is one Go binary (cross-platform via GoReleaser). No coordinator process, no Kafka cluster, no manifest server, no daemon. Run it from a bastion host, a build agent, or a laptop with network reach to both endpoints. State lives in target's `sluice_*` control tables; no external state store.

@@ -95,7 +95,18 @@ Drivers vary in what they return for the same SQL value. Engine readers are resp
 - Copy `[]byte` values off the driver's scan buffer.
 - Pass `time.Time` values through (with `parseTime=true` set in the DSN).
 
-Future engine readers (Postgres, SQLite, etc.) will have their own driver quirks; each is documented at the engine package level and tested with a parallel set of unit tests.
+The Postgres reader and the SQLite / Cloudflare D1 readers have their own driver quirks; each is documented at the engine package level and tested with a parallel set of unit tests. The SQLite/D1 value contract has one non-obvious wrinkle worth calling out here (next section).
+
+### SQLite & Cloudflare D1: the `(typeof, text/hex)` value encoding
+
+SQLite has no static per-column value type — every stored value carries its own storage class (`integer` / `real` / `text` / `blob` / `null`), independent of the column's *declared* type. Two problems follow, both of which would corrupt values if read naively:
+
+- **Big integers.** Cloudflare D1's HTTP query API (and `wrangler d1 export`) serialise results through JSON, whose number type is an IEEE-754 float64 — so any integer above 2⁵³ is silently rounded ([ADR-0131](adr/adr-0131-d1-http-api-reader-deferred.md) corrected this empirically: even the export path rounds). A naive `SELECT col` is therefore lossy on large IDs.
+- **BLOBs.** JSON can't represent raw bytes at all.
+
+The `d1` reader and the `sqlite-trigger` / `d1-trigger` capture path defeat both by projecting, per column, a pair: `typeof(col)` plus `CASE WHEN typeof(col)='blob' THEN hex(col) ELSE CAST(col AS TEXT) END` (REALs use `format('%.17g', col)` for shortest-exact round-trip). The reader reconstructs the `ir.Row` value from that `(storage-class, text-or-hex)` pair through the engine's shared faithful decoder, so integers above 2⁵³ and binary BLOBs round-trip **exactly** ([ADR-0132](adr/adr-0132-d1-query-api-reader.md)). The same encoding is used by the trigger-CDC capture triggers (they must NOT use `json_object()`, which reintroduces the float64 rounding) so cold-start and CDC share one proven seam ([ADR-0135](adr/adr-0135-sqlite-trigger-cdc.md)).
+
+**Decimal read-back from a SQLite target.** When SQLite is the migrate *target*, an `ir.Decimal` is stored with TEXT affinity (the exact decimal string, byte-for-byte) rather than NUMERIC/REAL affinity, because SQLite's NUMERIC affinity silently coerces a value like `19.99` to the binary float `19.989999999999998` (Bug 162). On a later read that column comes back as `ir.Text`, not `ir.Decimal` — a documented type downgrade (the same value-faithful trade as JSON/UUID → TEXT), chosen because silent value loss is never acceptable. See [type-mapping.md](type-mapping.md#sqlite--cloudflare-d1--ir) and [ADR-0134](adr/adr-0134-sqlite-target-engine.md) §2.
 
 ## Per-engine writer expectations
 

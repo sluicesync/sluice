@@ -235,6 +235,40 @@ Postgres extension types — `hstore`, `citext`, `pgvector` (`vector`), `pg_trgm
   - **Without the flag:** an `hstore` column refuses **loudly at schema-read**, naming the column and the remedy (`pass --enable-pg-extension hstore to enable passthrough`) — it is *not* silently dropped, and it is *not* the older misleading "not a recognised enum" message (that wording is now reserved for a genuinely-unknown, non-extension user-defined type).
 - `citext` follows the same Tier-1 shape; `pgvector`/`pg_trgm`/PostGIS add index-method awareness (Tier 2). See ADR-0032 for the per-extension catalog and the cross-engine policy.
 
+## SQLite & Cloudflare D1 ↔ IR
+
+SQLite (and Cloudflare D1, which is SQLite over HTTP) is the one engine whose *value* storage is not pinned by its *column* declaration: a column has a **type affinity** (one of INTEGER / TEXT / BLOB / REAL / NUMERIC) derived from its declared-type spelling, but each stored value carries its own storage class. sluice's mapping respects affinity on the schema side and refuses loudly on a per-row storage-class mismatch on the value side ([ADR-0128](adr/adr-0128-sqlite-d1-migrate-source.md)); the value-level wrinkle (the `(typeof, text/hex)` encoding that keeps big ints and BLOBs exact) is in [value-types.md](value-types.md#sqlite--cloudflare-d1-the-typeof-texthex-value-encoding).
+
+### Reader policies (SQLite / D1 → IR)
+
+A column's IR type is resolved from its **declared type** in a load-bearing order ([ADR-0129](adr/adr-0129-sqlite-date-bool-policy.md) first, affinity second):
+
+1. **Declared temporal / bool spellings override affinity.** A column declared `DATE` → `ir.Date`; `DATETIME` / `TIMESTAMP` → `ir.Timestamp` (no tz; SQLite is tz-naive); `TIME` → `ir.Time`; `BOOL` / `BOOLEAN` → `ir.Boolean`. (`DATETIME` is checked before `DATE`/`TIME` because the string contains all three.) These spellings would otherwise fall to NUMERIC affinity and read as decimals.
+2. **Otherwise, affinity maps to IR:** INTEGER → `ir.Integer{Width:64}` (SQLite integers are 64-bit signed); TEXT → `ir.Text` (unbounded — declared `VARCHAR(n)` lengths are not enforced by SQLite, so no misleading bound is carried); BLOB (or no declared type) → `ir.Blob`; REAL → `ir.Float{Double}`; NUMERIC → `ir.Decimal{Unconstrained:true}`.
+
+The **value** of a declared temporal column is ambiguous (SQLite has no native date type — dates live as ISO text, unix integers, or Julian-day reals by app convention), so the encoding is an explicit operator choice, `--sqlite-date-encoding` (`iso` default / `unixepoch` / `unixmillis` / `julian`). A value whose storage class doesn't match the chosen encoding is **refused loudly** naming the row — never a silently-wrong date. Booleans decode `0`/`1` and truthy text; any other value is refused. The per-column escape hatch is `--type-override <col>=text` (carry the column raw). A per-source override is the `sqlite_date_encoding` DSN query param.
+
+Generated columns, CHECK constraints, and partial / expression indexes are read and **carried verbatim** tagged dialect `"sqlite"` ([ADR-0133](adr/adr-0133-sqlite-schema-feature-detection.md)): portable constructs work on the target, non-portable ones (e.g. `strftime`) are loud-rejected at target DDL rather than silently dropped or mistranslated.
+
+### Writer policies (IR → SQLite)
+
+SQLite as a migrate target ([ADR-0134](adr/adr-0134-sqlite-target-engine.md)) emits the declared type the reader reads back to the same IR type — the faithful inverse of the affinity + ADR-0129 rules:
+
+| IR type | SQLite declared type | Affinity | Note |
+|---|---|---|---|
+| `Boolean` | `BOOLEAN` | NUMERIC | value stores 0/1 |
+| `Integer` | `INTEGER` | INTEGER | 64-bit signed; width/sign not preserved |
+| `Float` | `REAL` | REAL | 8-byte IEEE-754 |
+| `Decimal` | `TEXT` | **TEXT** | **Bug 162 — byte-exact.** NUMERIC affinity would coerce `19.99` to the binary float `19.989999999999998` and silently corrupt money; TEXT stores the exact decimal string verbatim. Reads back as `ir.Text` (documented downgrade). |
+| `Char` / `Varchar` / `Text` | `TEXT` | TEXT | length not enforced; `Char`/`Varchar` widen to `ir.Text` on round-trip |
+| `Binary` / `Varbinary` / `Blob` | `BLOB` | BLOB | |
+| `Date` / `Time` / `DateTime`,`Timestamp` | `DATE` / `TIME` / `DATETIME` | — | tz-aware values land instant-faithful as UTC ISO (display zone dropped — SQLite has no tz type) |
+| `JSON` / `UUID` / `Enum` / `Set` | `TEXT` | TEXT | no native SQLite type; raw value preserved exactly |
+
+Anything SQLite has no faithful storage for — geometry, `inet`/`cidr`/`macaddr`, `bit`, `interval`, `array`, `domain`, unknown extension types — is **refused loudly at emit time** naming the IR type, never coerced to a silently-wrong column (use `--type-override` to carry it as text/blob if a lossy carry is acceptable). Because SQLite can't `ALTER TABLE … ADD` a FK or CHECK after creation, all constraints are emitted inline in the `CREATE TABLE`; the constraint phase becomes a `PRAGMA foreign_key_check` verification.
+
+> D1 is not a migrate target. To land data in D1, emit a SQLite `.db` (`--target-driver sqlite`) and then `wrangler d1 import`. See [docs/operator/sqlite-d1-import.md](operator/sqlite-d1-import.md).
+
 ## Edge cases that need explicit policies
 
 These are the cases that historically turn type-mapping code into a regex zoo. Each one is named, has a default policy, and is overridable via config.

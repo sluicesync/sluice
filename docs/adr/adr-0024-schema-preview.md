@@ -216,6 +216,36 @@ jq '.translator_gaps | map(select(.severity == "loud")) | length == 0' preview.j
 
 Returns `true` when no loud gaps are present.
 
+### SQLite-target affinity advisories (Bug 162)
+
+When the **target** is `sqlite`, preview also surfaces an affinity-notes
+list: columns whose IR type maps to a SQLite storage affinity that
+differs from the nominal type — most importantly `decimal → TEXT`
+(byte-exact; SQLite's NUMERIC affinity would silently coerce a value like
+`19.99` to a binary float), plus `json` / `uuid` / `enum` / `set` → TEXT
+and `char` / `varchar` → TEXT. These are **advisory** (the migration
+proceeds; the decimal → TEXT note is the value-fidelity one — TEXT
+preserves the exact decimal). In `--format text` they print as advisory
+lines; in `--format json` they appear under a `sqlite_affinity_notes`
+array (omitted for non-SQLite targets and when no such column is present):
+
+```json
+{
+  "sqlite_affinity_notes": [
+    {
+      "table": "orders",
+      "column": "price",
+      "source_type": "numeric(10,2)",
+      "target_type": "TEXT",
+      "note": "decimal stored as TEXT affinity to preserve the exact value (reads back as text)"
+    }
+  ]
+}
+```
+
+See [type-mapping.md](../type-mapping.md#sqlite--cloudflare-d1--ir) and
+[ADR-0134](adr-0134-sqlite-target-engine.md) §2 for the affinity map.
+
 ### Why a separate scan and not the advisory-hints registry
 
 The advisory-hints registry is keyed on `(sourceCol, targetCol)` type pairs — the source-of-truth is the column's declared type. Expression-body gaps are keyed on **what the expression *contains***, not the column type. Encoding "this expression body uses `INET_ATON`" in the hints registry's type-pair structure would mean a per-expression-body re-evaluation pass that the registry isn't shaped for. Splitting into a separate `internal/translate/gaps.go` scanner keeps each surface focused.

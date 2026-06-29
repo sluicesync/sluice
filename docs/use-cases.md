@@ -141,6 +141,54 @@ sluice backup restore --from-chain-id <id> --target <dsn>
 
 ---
 
+## SQLite / Cloudflare D1 → Postgres or MySQL
+
+The persona here is an edge / serverless developer who started on SQLite
+or Cloudflare D1 and has outgrown it — they want the data in a "real"
+Postgres or MySQL (often a managed one) without writing an export script
+that quietly mangles large integers.
+
+### Pain shapes
+
+- **A SQLite file or `wrangler d1 export` dump that won't import cleanly.**
+  `pgloader` is the usual answer for SQLite → PG, but it's a separate tool
+  with its own type-mapping quirks; there's no comparable one-command path
+  for MySQL targets.
+- **D1's big-integer rounding.** D1's HTTP query API and its export both
+  serialise through JSON (float64), so any integer above 2⁵³ — Snowflake
+  IDs, large counters — is silently rounded. A naive `SELECT * → INSERT`
+  corrupts those IDs.
+- **No continuous sync off SQLite/D1.** WAL is a physical page-log, not a
+  logical change stream, so there's no built-in CDC to keep a Postgres
+  mirror current.
+
+### sluice procedure
+
+```sh
+# One-shot: a SQLite file (or a wrangler d1 export .sql dump) → Postgres
+sluice migrate --source-driver sqlite --source ./app.db \
+  --target-driver postgres --target 'postgres://...'
+
+# One-shot, lossless, from a LIVE D1 (token via CLOUDFLARE_API_TOKEN)
+sluice migrate --source-driver d1 --source 'd1://<account_id>/<database_id>' \
+  --target-driver postgres --target 'postgres://...'
+
+# Continuous: trigger-based CDC from a local SQLite file
+sluice trigger setup --source-driver sqlite-trigger --dsn ./app.db --tables t1,t2
+sluice sync start --source-driver sqlite-trigger --source ./app.db \
+  --target-driver postgres --target 'postgres://...' --stream-id app-sqlite
+```
+
+### Load-bearing capability
+
+- **Lossless big-int / BLOB round-trip** ([ADR-0132](adr/adr-0132-d1-query-api-reader.md)). The `d1` reader and the trigger-CDC capture path project each value as a `typeof()` + `CAST(... AS TEXT)` / `hex()` pair, so integers above 2⁵³ and binary BLOBs survive exactly — the headline reason to use sluice over a hand-rolled export.
+- **Affinity-faithful type mapping with loud refusal** ([ADR-0128](adr/adr-0128-sqlite-d1-migrate-source.md)/[ADR-0129](adr/adr-0129-sqlite-date-bool-policy.md)). SQLite's per-row storage classes are honoured; an ambiguous declared date needs an explicit `--sqlite-date-encoding`, and a storage-class mismatch is refused, never guessed.
+- **SQLite as a target, decimals byte-exact** ([ADR-0134](adr/adr-0134-sqlite-target-engine.md)). The reverse direction emits a `.db` from any source (decimals stored as TEXT so money doesn't drift), enabling X → SQLite → `wrangler d1 import`.
+
+Full operator walkthrough: [`docs/operator/sqlite-d1-import.md`](operator/sqlite-d1-import.md).
+
+---
+
 ## Choosing sluice for a specific scenario
 
 For each scenario, the alternatives are real and sometimes simpler. The README's "When NOT to use sluice" section names the four explicit non-fits. For the cases above, the decision usually comes down to:

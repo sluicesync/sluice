@@ -140,7 +140,7 @@ Note that the `Schema*` and `Row*` interfaces are deliberately separate. A simpl
 
 ## Engine capabilities
 
-Different engines support different things. Postgres has arrays, MySQL doesn't. Postgres has logical replication, MySQL has binlog, SQLite (when added later) would have triggers or WAL hooks. The orchestrator should not hard-code these differences with `if engine == "mysql"` branches scattered through the code; it should ask each engine what it supports.
+Different engines support different things. Postgres has arrays, MySQL doesn't. Postgres has logical replication, MySQL has binlog. SQLite's WAL is a *physical* page-log, not a logical change stream, so its CDC is trigger-based — the `sqlite-trigger` and `d1-trigger` engines install per-table AFTER triggers that write a change-log (ADR-0135 / ADR-0136), exactly as the `postgres-trigger` engine does for managed Postgres that blocks logical replication. The orchestrator should not hard-code these differences with `if engine == "mysql"` branches scattered through the code; it should ask each engine what it supports.
 
 Every engine declares a `Capabilities` value:
 
@@ -187,34 +187,30 @@ This pattern means new engines slot in without touching the core. It also means 
 
 ## Adding a new engine
 
-Once the core is built, adding a new engine should be a contained operation. The engine package is the only thing that needs to be written, and the registry takes care of wiring.
+Once the core is built, adding a new engine is a contained operation. The engine package is the only thing that needs to be written, and the registry takes care of wiring.
 
-Suppose someone wants to add SQLite. The work is:
+The `sqlite` engine (`internal/engines/sqlite`, shipped) is the canonical worked example. Its shape was exactly:
 
 1. Create `internal/engines/sqlite/`.
-2. Implement the relevant interfaces — `SchemaReader`, `SchemaWriter`, `RowReader`, `RowWriter`. CDC interfaces are optional; SQLite would likely declare `CDC: None` and skip them.
-3. Declare a `Capabilities` value that reflects what SQLite actually supports.
-4. Register the engine in the package's `init()` function:
+2. Implement the relevant interfaces — `SchemaReader`, `SchemaWriter`, `RowReader`, `RowWriter`. CDC interfaces are optional; the base `sqlite` engine declares `CDC: CDCNone` and skips them (continuous sync arrived later as the separate `sqlite-trigger` / `d1-trigger` engines, which *compose* the base engine and add the trigger-CDC surface).
+3. Declare a `Capabilities` value that reflects what SQLite actually supports — a flat namespace, no extension types, `JSONSupport: None`, and the type-affinity behaviour documented in [type-mapping.md](type-mapping.md).
+4. Register the engine in the package's `init()` function. `Register` takes the engine value; the registry reads its name from `Name()`:
 
 ```go
 package sqlite
 
-import "sluice/internal/engines"
+import "sluicesync.dev/sluice/internal/engines"
+
+func (Engine) Name() string { return "sqlite" }
 
 func init() {
-    engines.Register("sqlite", &Engine{})
+    engines.Register(Engine{})
 }
 ```
 
-5. Add a blank import in `cmd/sluice/main.go`:
+5. Add a blank import where engines are wired in so its `init()` runs.
 
-```go
-import (
-    _ "sluice/internal/engines/sqlite"
-)
-```
-
-That's the entire surface area of "add a new engine." No changes to `ir`, `translate`, `pipeline`, or `apply`. No changes to the CLI parsing logic — `driver: sqlite` in a config now resolves through the registry.
+That's the entire surface area of "add a new engine." No changes to `ir`, the translator, `pipeline`, or the appliers. No changes to the CLI parsing logic — `--source-driver sqlite` (or `driver: sqlite` in a config) now resolves through the registry. A hypothetical future engine — say DuckDB — would slot in the same way.
 
 The contract for a new engine:
 

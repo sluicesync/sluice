@@ -29,6 +29,23 @@ recipe still works.
 4. **`sluice restore`** — when you actually need to recover, restore
    the chain to a fresh target.
 
+## Which source engines
+
+The backup path is engine-neutral: it drives the source through the same
+`SchemaReader` / `RowReader` interfaces the migrate path uses, so a
+**full** logical backup (`sluice backup full`) works for any registered
+source — including a **SQLite file** (`--source-driver sqlite`). The
+chunks land in the same manifest/compression/encryption format regardless
+of source engine, and `restore` replays them into any target.
+
+Incremental chains (`sluice backup stream run`) additionally need a
+**CDC-capable** source: Postgres logical replication, MySQL binlog,
+Vitess VStream, or a trigger-CDC engine (`postgres-trigger`,
+`sqlite-trigger`, `d1-trigger`). The base `sqlite` engine declares
+`CDC: None`, so a plain SQLite file supports full backups but not the
+incremental stream — point `--source-driver sqlite-trigger` at it (after
+`sluice trigger setup`) if you want a continuous backup chain from SQLite.
+
 ## Step 1: full backup
 
 On a Postgres source, add `--chain-slot` to the full: it provisions the
