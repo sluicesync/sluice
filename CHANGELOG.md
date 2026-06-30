@@ -4,6 +4,10 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+- **A SQLite/D1 `.sql`-dump source is now STREAMED into the staging database instead of read whole into memory.** `materializeDump` previously did `os.ReadFile(dump)` + `string(...)`, needing ~2× the dump's size in RAM — fine for a small `wrangler d1 export` but catastrophic for a large `sqlite3 .dump` (which is bigger than the database itself: a 45 GB DB dumps to ~85 GB of SQL, ~170 GB to hold in memory). It now reads the dump in bounded 1 MiB blocks, splits complete top-level statements off (carrying any statement/string/comment that spans a block boundary to the next block, so the quote/comment/`;` handling stays correct), and executes them in ~8 MiB multi-statement batches — so peak memory is a few MiB regardless of dump size. Crucially the whole load runs on **one pinned `*sql.Conn`**, so a `sqlite3 .dump`'s single wrapping `BEGIN TRANSACTION … COMMIT` commits correctly (a multi-connection or per-process-chunk loader would roll back the uncommitted prefix and then fail with "no such table"). Pinned by a cross-block + transaction test that materializes a `BEGIN…COMMIT`-wrapped dump (with embedded `;` in strings, an escaped quote, and line/block comments) identically at block sizes of 1/3/7/64/1 MiB. (For very large sources the binary `.db` / live-D1 reader paths remain the recommended, already-memory-bounded route; this removes the footgun on the `.sql`-dump path.)
+
 ## [0.99.167] - 2026-06-30
 
 ### Fixed

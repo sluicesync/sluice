@@ -5,6 +5,7 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
@@ -327,6 +328,93 @@ func TestSniffSQLiteBinary(t *testing.T) {
 	if _, err := sniffSQLiteBinary(filepath.Join(t.TempDir(), "nope.sql")); err == nil {
 		t.Error("sniff(missing) should return a read error")
 	}
+}
+
+// TestStreamMaterializeDump_CrossBlockAndTransaction pins the streaming
+// materializer: a `sqlite3 .dump`-shaped script (wrapped in a single
+// BEGIN TRANSACTION … COMMIT, with embedded ';' in strings, an escaped quote,
+// line + block comments, and a multi-line CREATE) must materialize IDENTICALLY
+// no matter how small the read block is — proving (a) statements/strings/
+// comments that span block boundaries split correctly, and (b) the wrapping
+// transaction COMMITS (all rows present), which is the exact case a per-chunk-
+// process loader gets wrong (chunk-1 rollback → "no such table"). Block sizes of
+// 1/3/7 force a boundary mid-token everywhere.
+func TestStreamMaterializeDump_CrossBlockAndTransaction(t *testing.T) {
+	const dump = `PRAGMA foreign_keys=OFF;
+BEGIN TRANSACTION;
+CREATE TABLE t (
+	id INTEGER PRIMARY KEY,
+	v  TEXT
+);
+INSERT INTO t VALUES (1, 'a;b');  -- trailing; comment
+INSERT INTO t VALUES (2, 'it''s; ok'); /* block ; comment */
+INSERT INTO t VALUES (3, NULL);
+COMMIT;
+`
+	ctx := context.Background()
+	for _, bs := range []int{1, 3, 7, 64, 1 << 20} {
+		t.Run("block="+itoa(bs), func(t *testing.T) {
+			tmp := filepath.Join(t.TempDir(), "out.db")
+			db, err := sql.Open("sqlite", tmp)
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			defer func() { _ = db.Close() }()
+			conn, err := db.Conn(ctx)
+			if err != nil {
+				t.Fatalf("conn: %v", err)
+			}
+			defer func() { _ = conn.Close() }()
+
+			if err := streamMaterializeDump(ctx, conn, strings.NewReader(dump), bs); err != nil {
+				t.Fatalf("streamMaterializeDump(block=%d): %v", bs, err)
+			}
+
+			// The BEGIN…COMMIT data must have persisted — count==3 fails if the
+			// transaction was rolled back (the pscale-style bug).
+			var n int
+			if err := conn.QueryRowContext(ctx, "SELECT count(*) FROM t").Scan(&n); err != nil {
+				t.Fatalf("count (block=%d): %v", bs, err)
+			}
+			if n != 3 {
+				t.Fatalf("rows = %d; want 3 (transaction did not commit?)", n)
+			}
+			// Embedded ';' and escaped-quote values must round-trip exactly.
+			var v1, v2 string
+			if err := conn.QueryRowContext(ctx, "SELECT v FROM t WHERE id=1").Scan(&v1); err != nil {
+				t.Fatal(err)
+			}
+			if err := conn.QueryRowContext(ctx, "SELECT v FROM t WHERE id=2").Scan(&v2); err != nil {
+				t.Fatal(err)
+			}
+			if v1 != "a;b" {
+				t.Errorf("id=1 v = %q; want %q", v1, "a;b")
+			}
+			if v2 != "it's; ok" {
+				t.Errorf("id=2 v = %q; want %q", v2, "it's; ok")
+			}
+			var v3 sql.NullString
+			if err := conn.QueryRowContext(ctx, "SELECT v FROM t WHERE id=3").Scan(&v3); err != nil {
+				t.Fatal(err)
+			}
+			if v3.Valid {
+				t.Errorf("id=3 v = %q; want NULL", v3.String)
+			}
+		})
+	}
+}
+
+// itoa is a tiny int→string for subtest names (avoids an strconv import here).
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var b []byte
+	for n > 0 {
+		b = append([]byte{byte('0' + n%10)}, b...)
+		n /= 10
+	}
+	return string(b)
 }
 
 // TestSplitSQLStatements pins the fallback splitter respects string literals,

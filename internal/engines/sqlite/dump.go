@@ -50,19 +50,20 @@ func sniffSQLiteBinary(path string) (bool, error) {
 // database under os.TempDir() and returns the temp file's path. The caller owns
 // the temp file's lifecycle (the reader removes it on Close).
 //
-// modernc.org/sqlite executes a multi-statement script in a single Exec (proven
-// by the real-Cloudflare-D1 validation, ADR-0130), so the common path is one
-// Exec of the whole dump. If that fails, it falls back to splitting the dump on
-// statement boundaries and executing sequentially; if the split ALSO fails the
-// ORIGINAL single-Exec error is surfaced (it is the truest description of a
-// malformed dump). Any failure removes the temp file and returns a loud error
-// naming the dump — no data moves on a malformed dump (the loud-failure
-// posture, ADR-0130 §5).
+// The dump is STREAMED, never read whole into memory (a `sqlite3 .dump` of a
+// large database is bigger than the database itself, so reading it into RAM
+// would be catastrophic — tens of GB). [streamMaterializeDump] reads it in
+// bounded blocks, splits complete statements off, and executes them in
+// multi-statement batches on ONE pinned connection (so a `BEGIN TRANSACTION …
+// COMMIT`-wrapped dump commits correctly). Any failure removes the temp file and
+// returns a loud error naming the dump — no data moves on a malformed dump (the
+// loud-failure posture, ADR-0130 §5).
 func materializeDump(ctx context.Context, dumpPath string) (tempPath string, err error) {
-	dump, err := os.ReadFile(dumpPath) //nolint:gosec // operator-supplied source path
+	src, err := os.Open(dumpPath) //nolint:gosec // operator-supplied source path
 	if err != nil {
 		return "", fmt.Errorf("sqlite: read dump %q: %w", dumpPath, err)
 	}
+	defer func() { _ = src.Close() }()
 
 	f, err := os.CreateTemp("", "sluice-sqlite-*.db")
 	if err != nil {
@@ -75,8 +76,8 @@ func materializeDump(ctx context.Context, dumpPath string) (tempPath string, err
 	// From here any failure must remove the temp file and report no path, so a
 	// caller that gets an error never has to clean up after us. `created` (not
 	// the named return) is used because the error returns set tempPath="" before
-	// this defer runs. The db.Close defer is registered AFTER this one so it
-	// runs FIRST (LIFO) — the file handle is released before os.Remove, which
+	// this defer runs. The conn/db Close defers are registered AFTER this one so
+	// they run FIRST (LIFO) — the file handle is released before os.Remove, which
 	// matters on Windows.
 	defer func() {
 		if err != nil {
@@ -90,56 +91,108 @@ func materializeDump(ctx context.Context, dumpPath string) (tempPath string, err
 	}
 	defer func() { _ = db.Close() }()
 
-	if err = execDump(ctx, db, string(dump)); err != nil {
+	// Pin ONE underlying connection for the whole load. This is load-bearing:
+	// a `sqlite3 .dump` wraps the script in a single `BEGIN TRANSACTION … COMMIT`,
+	// so the statements must all run on the same connection for the transaction
+	// to persist and commit (a pooled multi-connection exec — or, as some tools
+	// do, a fresh process per chunk — would roll back the uncommitted prefix and
+	// then fail with "no such table"). It also bounds memory: the dump is
+	// STREAMED (never read whole into RAM).
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return "", fmt.Errorf("sqlite: open temp db for dump %q: %w", dumpPath, err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if err = streamMaterializeDump(ctx, conn, src, dumpReadBlockBytes); err != nil {
 		return "", fmt.Errorf("sqlite: materialize dump %q: %w", dumpPath, err)
 	}
 	return tempPath, nil
 }
 
-// execDump runs the dump as one multi-statement Exec, falling back to a
-// statement-split sequential exec only if that fails. On a fallback that also
-// fails, the original single-Exec error is returned.
-func execDump(ctx context.Context, db *sql.DB, dump string) error {
-	_, err := db.ExecContext(ctx, dump)
-	if err == nil {
-		return nil
-	}
-	// Single-Exec failed; some inputs (or a future modernc) may need
-	// statement-by-statement execution. Try the split; if THAT also fails,
-	// surface the original single-Exec error.
-	if splitErr := execSplit(ctx, db, dump); splitErr != nil {
-		return err
-	}
-	return nil
-}
+const (
+	// dumpReadBlockBytes is how much of the dump is read per streamed block.
+	dumpReadBlockBytes = 1 << 20 // 1 MiB
+	// dumpExecBatchBytes is the accumulated-statement size at which a batch is
+	// executed (one ExecContext of a multi-statement script — what modernc runs
+	// natively). Bounds memory while amortising the per-Exec round-trip.
+	dumpExecBatchBytes = 8 << 20 // 8 MiB
+)
 
-// execSplit splits dump into individual statements and executes them in order,
-// stopping (and returning) on the first error.
-func execSplit(ctx context.Context, db *sql.DB, dump string) error {
-	for _, stmt := range splitSQLStatements(dump) {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
+// streamMaterializeDump loads a SQL dump from r into the SQLite connection conn,
+// statement by statement, never holding more than ~one block + one partial
+// statement + one batch in memory. It reads fixed-size blocks, splits them into
+// complete top-level statements ([splitDumpChunk], which carries an unterminated
+// trailing fragment to the next block so a statement, string, or comment may
+// span block boundaries), accumulates them into a batch, and executes each batch
+// on conn. All statements share conn, so a `BEGIN TRANSACTION … COMMIT`-wrapped
+// dump commits correctly. blockSize is parameterised for tests; <= 0 uses the
+// default.
+func streamMaterializeDump(ctx context.Context, conn *sql.Conn, r io.Reader, blockSize int) error {
+	if blockSize <= 0 {
+		blockSize = dumpReadBlockBytes
+	}
+	block := make([]byte, blockSize)
+	var (
+		carry string
+		batch strings.Builder
+	)
+	flush := func() error {
+		if batch.Len() == 0 {
+			return nil
+		}
+		if _, err := conn.ExecContext(ctx, batch.String()); err != nil {
 			return err
 		}
+		batch.Reset()
+		return nil
 	}
-	return nil
+	for {
+		nr, rerr := r.Read(block)
+		if nr > 0 {
+			stmts, rest := splitDumpChunk(carry + string(block[:nr]))
+			carry = rest
+			for _, s := range stmts {
+				batch.WriteString(s)
+				batch.WriteString(";\n")
+				if batch.Len() >= dumpExecBatchBytes {
+					if err := flush(); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				break
+			}
+			return rerr
+		}
+	}
+	// The final fragment after the last top-level ';' (e.g. a trailing statement
+	// with no terminator). An unterminated statement here is malformed and fails
+	// loudly at Exec — exactly the pre-existing posture.
+	if rest := strings.TrimSpace(carry); rest != "" {
+		batch.WriteString(rest)
+		batch.WriteString(";\n")
+	}
+	return flush()
 }
 
-// splitSQLStatements breaks a SQL script into individual statements on
-// top-level ';' boundaries, respecting single-quoted strings (with ” escapes),
-// double-quoted identifiers, and `--` line / `/* */` block comments so a ';'
-// inside any of them does not split a statement. Empty/whitespace-only
-// fragments are dropped. Bytewise iteration is safe because every delimiter is
-// ASCII and UTF-8 continuation bytes (>= 0x80) never collide with one. This is
-// the best-effort fallback for the rare dump modernc won't run in one Exec.
-func splitSQLStatements(script string) []string {
-	var stmts []string
+// splitDumpChunk breaks a SQL script into complete top-level statements and a
+// trailing CARRY — the fragment after the last top-level ';' (which may be an
+// unterminated statement, string, or comment that the next block completes). It
+// respects single-quoted strings (with ” escapes), double-quoted identifiers,
+// and `--` line / `/* */` block comments so a ';' inside any of them does not
+// split. The carry is re-prepended and re-scanned with the next block, so a
+// token straddling a block boundary is always resolved correctly with NO
+// persistent scan state: a two-char delimiter (`”`, `--`, `/*`, `*/`) whose
+// first byte is the chunk's last byte is simply left in the carry — nothing can
+// follow it in the chunk, so no statement is ever wrongly emitted. Bytewise
+// iteration is safe: every delimiter is ASCII and UTF-8 continuation bytes
+// (>= 0x80) never collide with one.
+func splitDumpChunk(script string) (stmts []string, carry string) {
 	start, n := 0, len(script)
-	flush := func(end int) {
-		if s := strings.TrimSpace(script[start:end]); s != "" {
-			stmts = append(stmts, s)
-		}
-		start = end + 1
-	}
 	for i := 0; i < n; i++ {
 		switch script[i] {
 		case '\'':
@@ -178,9 +231,22 @@ func splitSQLStatements(script string) []string {
 				i++ // skip the '*'; the loop's i++ skips the '/'
 			}
 		case ';':
-			flush(i)
+			if s := strings.TrimSpace(script[start:i]); s != "" {
+				stmts = append(stmts, s)
+			}
+			start = i + 1
 		}
 	}
-	flush(n)
+	return stmts, script[start:]
+}
+
+// splitSQLStatements splits a COMPLETE SQL script into individual statements
+// (the whole-script convenience over [splitDumpChunk]: the trailing fragment is
+// the final statement). Empty/whitespace-only fragments are dropped.
+func splitSQLStatements(script string) []string {
+	stmts, carry := splitDumpChunk(script)
+	if s := strings.TrimSpace(carry); s != "" {
+		stmts = append(stmts, s)
+	}
 	return stmts
 }
