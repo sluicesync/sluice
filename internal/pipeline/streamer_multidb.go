@@ -117,7 +117,21 @@ func (s *Streamer) resolveStreamDatabases(ctx context.Context) (selected []strin
 				"or that the source server has non-system databases)",
 		)
 	}
-	if _, err := resolveTargetNamespaces(selected, s.NamespaceMap); err != nil {
+	// Resolve each source namespace's TARGET name through the rename map and
+	// refuse loudly on an exact many-to-one collision (engine-agnostic; fires
+	// even on a case-sensitive target).
+	targets, err := resolveTargetNamespaces(selected, s.NamespaceMap)
+	if err != nil {
+		return nil, nil, err
+	}
+	// Refuse LOUDLY when two distinct MAPPED/unmapped target names FOLD to the
+	// same identifier on a folding MySQL target (ADR-0075 decision #1 /
+	// ADR-0142) — the silent-merge hazard — on the SYNC path too, before any
+	// cold-start or CDC moves data. Mirrors migrate_multidb.go's preflight on
+	// the mapped target names; kept alongside the exact many-to-one guard above
+	// (defense in depth). No-op on a non-folding (Postgres) target; identity
+	// map ⇒ targets == selected ⇒ byte-identical to before.
+	if err := preflightNamespaceFoldCollisions(ctx, s.Target, s.TargetDSN, targets); err != nil {
 		return nil, nil, err
 	}
 
