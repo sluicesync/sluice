@@ -97,7 +97,7 @@ func TestChangeApplier_MultiDatabaseRouting(t *testing.T) {
 	if !ok {
 		t.Fatalf("applier %T does not implement ir.MultiDatabaseRouter", applier)
 	}
-	router.SetMultiDatabaseRouting(true)
+	router.SetMultiDatabaseRouting(true, nil)
 
 	// Mixed stream:
 	//   - two cross-database changes (dbA, dbB) — must route to those DBs;

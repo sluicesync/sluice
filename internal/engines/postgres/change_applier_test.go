@@ -78,6 +78,49 @@ func TestApplier_RoutedSchema_BackCompatClass(t *testing.T) {
 	}
 }
 
+// TestApplier_RoutedSchema_RenameClass pins the ADR-0142 rename class on the
+// Postgres applier (mirror of the MySQL pin — the reviewer re-derives the
+// same matrix on BOTH engines). When routing is ON, the change's source
+// schema is mapped through nsRename to its TARGET schema and THAT qualifies
+// the table reference — the CDC change-router routing OLD into NEW — across
+// every routing outcome, and the rename is IGNORED when routing is OFF.
+func TestApplier_RoutedSchema_RenameClass(t *testing.T) {
+	rename := func(src string) string {
+		switch src {
+		case "app":
+			return "app_prod"
+		case "stays":
+			return "public" // maps onto the bound schema
+		case "public":
+			return "public_renamed" // even the bound-named source routes out
+		default:
+			return src // identity for unmapped sources (e.g. billing)
+		}
+	}
+	cases := []struct {
+		name         string
+		routing      bool
+		changeSchema string
+		want         string
+	}{
+		{"on: mapped source -> renamed target", true, "app", "app_prod"},
+		{"on: unmapped source -> identity (qualified)", true, "billing", "billing"},
+		{"on: mapped onto bound -> bare bound", true, "stays", "public"},
+		{"on: bound-named source remapped out -> renamed", true, "public", "public_renamed"},
+		{"on: empty change schema -> bare bound (rename not consulted)", true, "", "public"},
+		{"off: rename ignored, stays bound", false, "app", "public"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			a := &ChangeApplier{schema: "public", multiDBRouting: c.routing, nsRename: rename}
+			if got := a.routedSchema(c.changeSchema); got != c.want {
+				t.Errorf("routedSchema(%q) routing=%v = %q; want %q", c.changeSchema, c.routing, got, c.want)
+			}
+		})
+	}
+}
+
 // TestBuildInsertSQL covers both the upsert path (PK present) and
 // the plain-INSERT fallback (PK empty), plus the all-PK DO NOTHING
 // edge case. Column order is sorted so the SQL is deterministic.

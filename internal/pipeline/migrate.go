@@ -388,6 +388,17 @@ type Migrator struct {
 	// exclusive with a non-empty DatabaseFilter.
 	AllDatabases bool
 
+	// NamespaceMap is the optional per-namespace source → target rename
+	// for a multi-namespace fan-out (ADR-0142, --map-database/--map-schema).
+	// The zero value is the identity map — every source namespace routes to
+	// a same-named target namespace, byte-identical to pre-ADR-0142 fan-out.
+	// A non-empty map ALSO engages multi-database mode (the map keys are the
+	// selection when no --all-*/--include-*/--exclude-* flag is given), and
+	// only changes the TARGET namespace identifier; reads, Table.Schema
+	// stamping, the FK carve-out, and the per-source MigrationID stay on the
+	// SOURCE name.
+	NamespaceMap NamespaceRenameMap
+
 	// multiDBDeferFKs is set by the multi-database orchestrator on each
 	// per-database clone so the inner single-database run SKIPS the
 	// foreign-key constraint phase. Cross-database FKs reference tables

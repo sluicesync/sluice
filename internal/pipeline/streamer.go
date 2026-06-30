@@ -754,6 +754,16 @@ type Streamer struct {
 	// mode (see DatabaseFilter). Mirrors [Migrator.AllDatabases].
 	AllDatabases bool
 
+	// NamespaceMap is the optional per-namespace source → target rename for
+	// a multi-namespace fan-out `sync start` (ADR-0142,
+	// --map-database/--map-schema). Identity by default (byte-identical
+	// pre-ADR-0142 fan-out). A non-empty map ALSO engages multi-database
+	// mode and is applied at the cold-start target-namespace derivation AND
+	// at the steady-state CDC change-router (a captured change for source
+	// namespace OLD is applied into target namespace NEW). Mirrors
+	// [Migrator.NamespaceMap].
+	NamespaceMap NamespaceRenameMap
+
 	// InjectShardColumn is the ADR-0048 Shape A discriminator-column
 	// spec the per-shard streamer opts into via
 	// `--inject-shard-column NAME=VALUE`. When [ShardColumnSpec.Engaged]

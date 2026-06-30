@@ -94,7 +94,7 @@ func TestChangeApplier_MultiDatabaseRouting(t *testing.T) {
 	if !ok {
 		t.Fatalf("applier %T does not implement ir.MultiDatabaseRouter", applier)
 	}
-	router.SetMultiDatabaseRouting(true)
+	router.SetMultiDatabaseRouting(true, nil)
 
 	events := []ir.Change{
 		ir.Insert{Schema: schemaA, Table: "widgets", Row: ir.Row{"id": int64(1), "name": "a1"}},

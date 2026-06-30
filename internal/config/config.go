@@ -66,6 +66,20 @@ type Config struct {
 	// exclusive with IncludeTables.
 	ExcludeTables []string `koanf:"exclude_tables"`
 
+	// NamespaceMap is the YAML form of the --map-database / --map-schema
+	// per-namespace target rename (ADR-0142). Each key is a SOURCE namespace
+	// (MySQL database / PG schema); each value is the TARGET namespace it
+	// routes to in a multi-namespace fan-out. Identity by default (an absent
+	// key keeps its source name). CLI --map-* flags override this YAML field
+	// wholesale when supplied (same precedence as --include-table over
+	// include_tables). Many-to-one (two sources → one target) is refused
+	// loudly at construction.
+	//
+	//	namespace_map:
+	//	  app: app_prod
+	//	  billing: billing_prod
+	NamespaceMap map[string]string `koanf:"namespace_map"`
+
 	// Redactions is the YAML form of the `--redact` CLI flag (PII
 	// Phase 1.5). Each entry declares a per-column redaction rule
 	// that the orchestrator applies before the value reaches the

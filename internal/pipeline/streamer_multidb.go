@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sort"
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/translate"
@@ -35,7 +34,23 @@ import (
 // returns false and the streamer runs byte-identically to its
 // pre-ADR-0074 shape — the load-bearing back-compat guard.
 func (s *Streamer) multiDatabaseMode() bool {
-	return s.AllDatabases || !s.DatabaseFilter.IsEmpty()
+	return s.AllDatabases || !s.DatabaseFilter.IsEmpty() || !s.NamespaceMap.IsEmpty()
+}
+
+// namespaceRenameFunc returns the per-change source → target namespace
+// rename the multi-database CDC applier applies inside its routedSchema
+// (ADR-0142), or nil when no rename is configured. nil is the load-bearing
+// identity default: [ir.MultiDatabaseRouter.SetMultiDatabaseRouting] with a
+// nil rename is byte-identical to the pre-ADR-0142 same-named routing. The
+// rename lives in the applier (not a Change.Schema rewrite in the
+// orchestrator) so each change's source Schema — and thus source-keyed
+// --redact rule matching — stays intact while only the target table
+// reference is qualified with the renamed namespace.
+func (s *Streamer) namespaceRenameFunc() func(string) string {
+	if s.NamespaceMap.IsEmpty() {
+		return nil
+	}
+	return s.NamespaceMap.Apply
 }
 
 // validateMultiDatabaseStream enforces the multi-database-mode
@@ -87,18 +102,23 @@ func (s *Streamer) resolveStreamDatabases(ctx context.Context) (selected []strin
 		return nil, nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: list source databases: %w", err))
 	}
 
-	selected = make([]string, 0, len(all))
-	for _, db := range all {
-		if s.DatabaseFilter.Allows(db) {
-			selected = append(selected, db)
-		}
+	// Resolve the selected SOURCE set (ADR-0142: map-only ⇒ the map keys ARE
+	// the selection; otherwise the filter decides and the map renames within
+	// it), then refuse loudly if a rename-map key is not in that selection
+	// (typo guard) or two sources resolve to one target (many-to-one).
+	selected = selectNamespaces(all, s.DatabaseFilter, s.AllDatabases, s.NamespaceMap)
+	if err := crossCheckMapSelection(selected, s.NamespaceMap); err != nil {
+		return nil, nil, err
 	}
-	sort.Strings(selected)
 	if len(selected) == 0 {
 		return nil, nil, errors.New(
 			"pipeline: no source databases matched the database scope; nothing to sync " +
-				"(check --include-database / --exclude-database, or that the source server has non-system databases)",
+				"(check --include-database / --exclude-database / --map-database / --map-schema, " +
+				"or that the source server has non-system databases)",
 		)
+	}
+	if _, err := resolveTargetNamespaces(selected, s.NamespaceMap); err != nil {
+		return nil, nil, err
 	}
 
 	selectedSet := make(map[string]struct{}, len(selected))
@@ -191,9 +211,12 @@ func (s *Streamer) coldStartMultiDatabase(
 	targetDeriver, targetCanDeriveDB := s.Target.(ir.DatabaseDSNDeriver)
 	if targetCanDeriveDB {
 		for _, database := range selected {
-			if err := targetDeriver.EnsureDatabase(ctx, s.TargetDSN, database); err != nil {
+			// Route to the (possibly renamed) TARGET namespace (ADR-0142);
+			// identity when the source is unmapped.
+			target := s.NamespaceMap.Apply(database)
+			if err := targetDeriver.EnsureDatabase(ctx, s.TargetDSN, target); err != nil {
 				return nil, stop, wrapWithHint(PhaseSchemaApply,
-					fmt.Errorf("pipeline: ensure target database %q: %w", database, err))
+					fmt.Errorf("pipeline: ensure target database %q: %w", target, err))
 			}
 		}
 	}
@@ -275,11 +298,15 @@ func (s *Streamer) coldStartMultiDatabase(
 	// (b) Enable per-change namespace routing on the applier. The applier's
 	//     bound namespace is the target DSN's database — for a multi-
 	//     database run that is a SERVER DSN (empty bound), so routedSchema
-	//     routes every change to its Change.Schema namespace. Refuse loudly
+	//     routes every change to its Change.Schema namespace. The optional
+	//     rename (ADR-0142) is threaded through the SAME call so the applier
+	//     maps each change's source namespace to its TARGET namespace inside
+	//     routedSchema — keeping the change's source Schema (and thus
+	//     source-keyed --redact rules) intact. nil ⇒ identity. Refuse loudly
 	//     if the applier can't route (it would silently write every database
 	//     into one namespace — cross-database bleed / silent loss).
 	if router, ok := applier.(ir.MultiDatabaseRouter); ok {
-		router.SetMultiDatabaseRouting(true)
+		router.SetMultiDatabaseRouting(true, s.namespaceRenameFunc())
 	} else {
 		closeStream()
 		return nil, stop, fmt.Errorf(
@@ -414,11 +441,14 @@ func (s *Streamer) warmResumeMultiDatabase(
 		)
 	}
 
-	// Enable per-change namespace routing on the applier. Refuse loudly if
-	// absent — it would silently write every database into one namespace
+	// Enable per-change namespace routing on the applier, threading the
+	// optional ADR-0142 rename through the same call (nil ⇒ identity). The
+	// rename map is re-resolved from the same flags on restart, so warm-resume
+	// routes to the same TARGET namespaces the cold-start did. Refuse loudly
+	// if absent — it would silently write every database into one namespace
 	// (cross-database bleed / silent loss).
 	if router, ok := applier.(ir.MultiDatabaseRouter); ok {
-		router.SetMultiDatabaseRouting(true)
+		router.SetMultiDatabaseRouting(true, s.namespaceRenameFunc())
 	} else {
 		closeReader()
 		return nil, stop, fmt.Errorf(
@@ -547,19 +577,23 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	stripForeignKeys(schema)
 
 	// ---- Per-database target writers. ----
+	// target is the source namespace's renamed TARGET (ADR-0142; identity
+	// when unmapped). Only the target writers route to it — the source
+	// schema read above stays keyed on `database`.
+	target := s.NamespaceMap.Apply(database)
 	targetDSN := s.TargetDSN
 	targetSchema := ""
 	if targetCanDeriveDB {
-		// MySQL → MySQL: re-point the target DSN at the same-named database
-		// (already EnsureDatabase'd by the caller).
-		targetDSN, err = targetDeriver.WithDatabase(s.TargetDSN, database)
+		// MySQL → MySQL: re-point the target DSN at the (possibly renamed)
+		// target database (already EnsureDatabase'd by the caller).
+		targetDSN, err = targetDeriver.WithDatabase(s.TargetDSN, target)
 		if err != nil {
-			return fmt.Errorf("pipeline: derive target DSN for database %q: %w", database, err)
+			return fmt.Errorf("pipeline: derive target DSN for database %q: %w", target, err)
 		}
 	} else {
-		// MySQL → PG (or any namespaced target): route to a same-named
-		// target schema; the PG writer auto-creates it.
-		targetSchema = database
+		// MySQL → PG (or any namespaced target): route to the (possibly
+		// renamed) target schema; the PG writer auto-creates it.
+		targetSchema = target
 	}
 
 	sw, err := s.Target.OpenSchemaWriter(ctx, targetDSN)

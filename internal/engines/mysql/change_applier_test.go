@@ -521,6 +521,51 @@ func TestApplier_RoutedSchema_BackCompatClass(t *testing.T) {
 	}
 }
 
+// TestApplier_RoutedSchema_RenameClass pins the ADR-0142 rename class: when
+// routing is ON, the change's source database is mapped through nsRename to
+// its TARGET database and THAT is what qualifies the table reference — the
+// CDC change-router routing OLD into NEW. The matrix exercises every routing
+// outcome the rename can produce, not one representative: mapped→differing,
+// unmapped→identity, mapped→bound (bare), even a bound-named source remapped
+// out, the empty-schema bare case, and the load-bearing guard that a rename
+// is IGNORED when routing is OFF.
+func TestApplier_RoutedSchema_RenameClass(t *testing.T) {
+	rename := func(src string) string {
+		switch src {
+		case "app":
+			return "app_prod"
+		case "stays":
+			return "ctrl" // maps onto the bound database
+		case "ctrl":
+			return "ctrl_renamed" // even the bound-named source routes out
+		default:
+			return src // identity for unmapped sources (e.g. billing)
+		}
+	}
+	cases := []struct {
+		name         string
+		routing      bool
+		changeSchema string
+		want         string
+	}{
+		{"on: mapped source -> renamed target", true, "app", "app_prod"},
+		{"on: unmapped source -> identity (qualified)", true, "billing", "billing"},
+		{"on: mapped onto bound -> bare bound", true, "stays", "ctrl"},
+		{"on: bound-named source remapped out -> renamed", true, "ctrl", "ctrl_renamed"},
+		{"on: empty change schema -> bare bound (rename not consulted)", true, "", "ctrl"},
+		{"off: rename ignored, stays bound", false, "app", "ctrl"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			a := &ChangeApplier{schema: "ctrl", multiDBRouting: c.routing, nsRename: rename}
+			if got := a.routedSchema(c.changeSchema); got != c.want {
+				t.Errorf("routedSchema(%q) routing=%v = %q; want %q", c.changeSchema, c.routing, got, c.want)
+			}
+		})
+	}
+}
+
 // TestApplier_SchemaSnapshot_NilIRIsLoud pins ADR-0049 locked
 // decision #4b at the dispatch boundary: a SchemaSnapshot with a nil
 // IR table is a loud error (never silently skipped). The nil check

@@ -1790,8 +1790,18 @@ type CDCDatabaseScoper interface {
 // The applier does NOT create the target namespace — the cold-start /
 // snapshot phase owns namespace creation (ADR-0074 Phase 1b.2); the
 // applier assumes the routed namespace already exists.
+//
+// rename (ADR-0142) is the OPTIONAL per-namespace source → target rename:
+// when non-nil, the applier maps each change's source namespace through it
+// to derive the TARGET namespace it qualifies the table reference with. nil
+// is the identity default (target == source, byte-identical to the original
+// same-named routing). Crucially the rename is applied INSIDE the routing
+// step only — the change's own [Change.Schema] is NOT rewritten, so anything
+// keyed on the source namespace (notably source-qualified --redact rules)
+// keeps matching on the source name while only the write lands in the
+// renamed target namespace.
 type MultiDatabaseRouter interface {
-	SetMultiDatabaseRouting(enabled bool)
+	SetMultiDatabaseRouting(enabled bool, rename func(sourceNamespace string) string)
 }
 
 // MultiDatabaseSnapshotOpener is the OPTIONAL engine surface for opening

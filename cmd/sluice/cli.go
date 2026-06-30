@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -181,6 +182,9 @@ type MigrateCmd struct {
 	ExcludeSchema []string `help:"Multi-schema fan-out (ADR-0075, Postgres source): migrate every non-system source schema EXCEPT these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-schema. The PG-source synonym of --exclude-database." sep:"," placeholder:"SCHEMA"`
 	AllSchemas    bool     `help:"Multi-schema fan-out (ADR-0075, Postgres source): migrate every non-system schema in the source database, each to a same-named target namespace. The PG-source synonym of --all-databases. Mutually exclusive with --include-schema / --exclude-schema."`
 
+	MapDatabase []string `help:"Multi-namespace fan-out target rename (ADR-0142, MySQL source): rename a source database to a DIFFERENT target database (comma-separated OLD=NEW pairs, repeatable, e.g. 'app=app_prod'). Applied WITHIN the selection; an unmapped selected database keeps its source name. When ONLY --map-database is given (no --all-databases / --include-database), the map keys ARE the selection. A key not in the resolved selection, or two sources mapping to one target (many-to-one), is refused LOUDLY before any data moves. The MySQL-database synonym of --map-schema; supplying both spellings in one invocation is an error. Also settable in sluice.yaml as a namespace_map: block (OLD: NEW)." sep:"," placeholder:"OLD=NEW"`
+	MapSchema   []string `help:"Multi-namespace fan-out target rename (ADR-0142, Postgres source): rename a source schema to a DIFFERENT target schema (comma-separated OLD=NEW pairs, repeatable, e.g. 'app=app_prod'). The PG-source synonym of --map-database; supplying both spellings in one invocation is an error. See --map-database for the full rename/selection semantics." sep:"," placeholder:"OLD=NEW"`
+
 	IncludeView []string `help:"Only migrate these views (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --exclude-view." sep:"," placeholder:"VIEW"`
 	ExcludeView []string `help:"Migrate every view except these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-view." sep:"," placeholder:"VIEW"`
 	SkipViews   bool     `help:"Skip view processing entirely; views in the source schema are not created on the target. Useful when views are managed out-of-band (Atlas / sqitch / liquibase)."`
@@ -283,6 +287,14 @@ func (m *MigrateCmd) Run(g *Globals) error {
 	if err != nil {
 		return err
 	}
+	mapPairs, err := resolveNamespaceMapArgs(m.MapDatabase, m.MapSchema, cfg)
+	if err != nil {
+		return err
+	}
+	namespaceMap, err := pipeline.NewNamespaceRenameMap(mapPairs)
+	if err != nil {
+		return err
+	}
 	if m.Resume && m.ResetTargetData {
 		return errors.New("--resume and --reset-target-data are mutually exclusive")
 	}
@@ -345,6 +357,7 @@ func (m *MigrateCmd) Run(g *Globals) error {
 		Filter:                filter,
 		DatabaseFilter:        databaseFilter,
 		AllDatabases:          allNS,
+		NamespaceMap:          namespaceMap,
 		ViewFilter:            viewFilter,
 		SkipViews:             m.SkipViews,
 		Resume:                m.Resume,
@@ -448,6 +461,46 @@ func resolveNamespaceScopeArgs(
 		return includeSchema, excludeSchema, allSchemas, nil
 	}
 	return includeDatabase, excludeDatabase, allDatabases, nil
+}
+
+// resolveNamespaceMapArgs merges the two spellings of the per-namespace
+// target-rename flag (ADR-0142) into the single OLD=NEW pair list
+// [pipeline.NewNamespaceRenameMap] consumes. `--map-database` (MySQL source)
+// and `--map-schema` (Postgres source) are synonyms — the same engine-neutral
+// rename map ("a MySQL database ≈ a PG schema", ADR-0031) — so supplying BOTH
+// in one invocation is a loud error, mirroring resolveNamespaceScopeArgs.
+//
+// CLI flags override the YAML `namespace_map:` block wholesale when supplied
+// (same precedence as --include-table over include_tables). With no CLI flag
+// the YAML map is rendered to OLD=NEW pairs (sorted, for deterministic
+// construction-time error messages). Returns nil when neither source set a
+// rename — the identity map.
+func resolveNamespaceMapArgs(mapDatabase, mapSchema []string, cfg *config.Config) ([]string, error) {
+	if len(mapDatabase) > 0 && len(mapSchema) > 0 {
+		return nil, errors.New(
+			"--map-schema and --map-database are synonyms; supply only one vocabulary " +
+				"(use --map-schema on a Postgres source, --map-database on a MySQL source)",
+		)
+	}
+	if len(mapDatabase) > 0 {
+		return mapDatabase, nil
+	}
+	if len(mapSchema) > 0 {
+		return mapSchema, nil
+	}
+	if len(cfg.NamespaceMap) == 0 {
+		return nil, nil
+	}
+	keys := make([]string, 0, len(cfg.NamespaceMap))
+	for k := range cfg.NamespaceMap {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	pairs := make([]string, 0, len(keys))
+	for _, k := range keys {
+		pairs = append(pairs, k+"="+cfg.NamespaceMap[k])
+	}
+	return pairs, nil
 }
 
 // resolveEngine looks up an engine by registered name and returns a
@@ -676,6 +729,9 @@ type SyncStartCmd struct {
 	IncludeSchema []string `help:"Multi-schema fan-out (ADR-0075, Postgres source): cold-start + CDC-sync ONLY these source schemas (comma-separated, repeatable). Glob patterns allowed (e.g. 'app_*'). Each source schema routes to a same-named target namespace (PG schema / MySQL database). The PG slot is database-wide, so the selected schemas are cold-started under ONE spanning exported snapshot, then the single database-wide CDC stream is routed per-change to each namespace. The PG-source synonym of --include-database; mutually exclusive with --exclude-schema. Supplying BOTH the --*-schema and --*-database spelling in one invocation is an error." sep:"," placeholder:"SCHEMA"`
 	ExcludeSchema []string `help:"Multi-schema fan-out (ADR-0075, Postgres source): cold-start + CDC-sync every non-system source schema EXCEPT these (comma-separated, repeatable). Glob patterns allowed. The PG-source synonym of --exclude-database; mutually exclusive with --include-schema." sep:"," placeholder:"SCHEMA"`
 	AllSchemas    bool     `help:"Multi-schema fan-out (ADR-0075, Postgres source): cold-start + CDC-sync every non-system schema in the source database, each to a same-named target namespace. The PG-source synonym of --all-databases. Mutually exclusive with --include-schema / --exclude-schema."`
+
+	MapDatabase []string `help:"Multi-namespace fan-out target rename (ADR-0142, MySQL source): rename a source database to a DIFFERENT target database for both the cold-start copy AND the steady-state CDC routing (comma-separated OLD=NEW pairs, repeatable, e.g. 'app=app_prod'). Applied WITHIN the selection; an unmapped selected database keeps its source name. When ONLY --map-database is given (no --all-databases / --include-database), the map keys ARE the selection. A key not in the resolved selection, or two sources mapping to one target (many-to-one), is refused LOUDLY before any data moves. The MySQL-database synonym of --map-schema; supplying both spellings in one invocation is an error. Also settable in sluice.yaml as a namespace_map: block (OLD: NEW)." sep:"," placeholder:"OLD=NEW"`
+	MapSchema   []string `help:"Multi-namespace fan-out target rename (ADR-0142, Postgres source): rename a source schema to a DIFFERENT target schema for both the cold-start copy AND the steady-state CDC routing (comma-separated OLD=NEW pairs, repeatable, e.g. 'app=app_prod'). The PG-source synonym of --map-database; supplying both spellings in one invocation is an error. See --map-database for the full rename/selection semantics." sep:"," placeholder:"OLD=NEW"`
 
 	IncludeView []string `help:"Only create these views on the target during cold-start (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --exclude-view. Views are not replicated by CDC; this filter only affects the cold-start schema-apply phase." sep:"," placeholder:"VIEW"`
 	ExcludeView []string `help:"Skip these views during cold-start schema-apply (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-view." sep:"," placeholder:"VIEW"`
@@ -1266,6 +1322,14 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 	if err != nil {
 		return err
 	}
+	mapPairs, err := resolveNamespaceMapArgs(s.MapDatabase, s.MapSchema, cfg)
+	if err != nil {
+		return err
+	}
+	namespaceMap, err := pipeline.NewNamespaceRenameMap(mapPairs)
+	if err != nil {
+		return err
+	}
 
 	// ADR-0038 pin-down 3: the three retry dials carry hard ranges.
 	// Out-of-range values are rejected at startup (loud, before any
@@ -1406,6 +1470,7 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		SkipViews:          s.SkipViews,
 		DatabaseFilter:     databaseFilter,
 		AllDatabases:       allNS,
+		NamespaceMap:       namespaceMap,
 		ForceColdStart:     s.ForceColdStart,
 		ResetTargetData:    s.ResetTargetData,
 		RestartFromScratch: s.RestartFromScratch,

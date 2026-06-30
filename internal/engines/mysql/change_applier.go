@@ -157,6 +157,13 @@ type ChangeApplier struct {
 	// where a PG source already populates Change.Schema).
 	multiDBRouting bool
 
+	// nsRename is the optional ADR-0142 per-namespace source → target rename,
+	// set alongside multiDBRouting by [SetMultiDatabaseRouting]. nil is the
+	// identity default (target == source). [routedSchema] applies it to the
+	// change's source schema to derive the TARGET database; the change's own
+	// Schema is never rewritten, so source-keyed --redact rules still match.
+	nsRename func(string) string
+
 	// slotName is the active stream's resolved replication-slot name,
 	// set by [SetSlotName] at Streamer startup. Threaded into every
 	// [writePositionTx] call so the per-target sluice_cdc_state row's
@@ -553,8 +560,12 @@ func (a *ChangeApplier) stampShardChange(c ir.Change) {
 // disabled (the default), the applier writes into its bound database and
 // emits byte-identical single-database SQL. Idempotent; the streamer may
 // call this on every Run.
-func (a *ChangeApplier) SetMultiDatabaseRouting(enabled bool) {
+//
+// rename (ADR-0142) is the optional per-namespace source → target rename;
+// nil is the identity default. See [routedSchema].
+func (a *ChangeApplier) SetMultiDatabaseRouting(enabled bool, rename func(string) string) {
 	a.multiDBRouting = enabled
+	a.nsRename = rename
 }
 
 // SetBatchSizeProvider implements [ir.BatchSizeProviderSetter]
@@ -1249,17 +1260,27 @@ func (a *ChangeApplier) colTypesFor(ctx context.Context, _ *sql.Tx, schema, tabl
 //     re-introduce the Phase-1a over-qualification regression.
 //
 //   - Routing ENABLED (multiDBRouting == true; a multi-database CDC
-//     stream): qualifies with the change's source database ONLY when it
-//     is non-empty AND differs from the bound `schema` — exactly the
-//     cross-database case (`app_db` row applied while bound to a
-//     control/different database). A change whose schema is empty or
-//     equals the bound database returns the bound database, so an
-//     in-bound-namespace change still emits the SAME bound SQL. This
-//     mirrors emitAddForeignKey's "qualify across DIFFERING namespaces
-//     only" rule.
+//     stream): maps the change's source database through nsRename (ADR-0142;
+//     identity when nil) to its TARGET database, then qualifies with that
+//     target ONLY when it is non-empty AND differs from the bound `schema`
+//     — exactly the cross-database case (`app_db` row applied while bound to
+//     a control/different database). A change whose (renamed) target is
+//     empty or equals the bound database returns the bound database, so an
+//     in-bound-namespace change still emits the SAME bound SQL. This mirrors
+//     emitAddForeignKey's "qualify across DIFFERING namespaces only" rule.
+//
+// The rename is applied here, on the routing branch only — never by
+// rewriting [ir.Change].Schema upstream — so the change's own source
+// namespace remains visible to source-keyed concerns (e.g. --redact rules).
 func (a *ChangeApplier) routedSchema(changeSchema string) string {
-	if a.multiDBRouting && changeSchema != "" && changeSchema != a.schema {
-		return changeSchema
+	if a.multiDBRouting && changeSchema != "" {
+		routed := changeSchema
+		if a.nsRename != nil {
+			routed = a.nsRename(changeSchema)
+		}
+		if routed != "" && routed != a.schema {
+			return routed
+		}
 	}
 	return appliershared.Schema(a.schema, changeSchema)
 }

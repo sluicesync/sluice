@@ -112,6 +112,90 @@ func TestMigrate_MultiSchema_PostgresToPostgres(t *testing.T) {
 	}
 }
 
+// TestMigrate_MultiSchema_RenameMap_PostgresToPostgres pins ADR-0142: a
+// map-only run (--map-schema, no --include-schema) selects exactly the map
+// keys and lands each source schema's data in its RENAMED target schema —
+// the source-named schemas must NOT exist on the target (proving a rename,
+// not a same-name copy), and rows must be isolated per renamed schema.
+func TestMigrate_MultiSchema_RenameMap_PostgresToPostgres(t *testing.T) {
+	pgSource, pgTarget, cleanup := startPostgres(t)
+	defer cleanup()
+
+	// Source schemas sales + billing; `public` is untouched and unmapped, so
+	// the map-only selection must leave it out entirely.
+	applyPGDDL(t, pgSource, `
+		CREATE SCHEMA sales;
+		CREATE SCHEMA billing;
+		CREATE TABLE sales.widgets   (id BIGINT PRIMARY KEY, name TEXT NOT NULL);
+		CREATE TABLE billing.widgets (id BIGINT PRIMARY KEY, name TEXT NOT NULL);
+		INSERT INTO sales.widgets   (id, name) VALUES (1, 'a-one'), (2, 'a-two');
+		INSERT INTO billing.widgets (id, name) VALUES (1, 'b-one'), (2, 'b-two'), (3, 'b-three');
+	`)
+
+	pgEng, _ := engines.Get("postgres")
+
+	nsMap, err := NewNamespaceRenameMap([]string{"sales=sales_renamed", "billing=billing_renamed"})
+	if err != nil {
+		t.Fatalf("construct rename map: %v", err)
+	}
+	mig := &Migrator{
+		Source:    pgEng,
+		Target:    pgEng,
+		SourceDSN: pgSource,
+		TargetDSN: pgTarget,
+		// Map-only: no DatabaseFilter, the map keys ARE the selection.
+		NamespaceMap: nsMap,
+	}
+	if !mig.multiDatabaseMode() {
+		t.Fatal("a rename map alone should engage multi-schema mode")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	if err := mig.Run(ctx); err != nil {
+		t.Fatalf("rename-map multi-schema Migrator.Run: %v", err)
+	}
+
+	db, err := sql.Open("pgx", pgTarget)
+	if err != nil {
+		t.Fatalf("sql.Open pg target: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	// Data landed in the RENAMED target schemas, isolated per schema.
+	var salesCount, billingCount int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sales_renamed.widgets`).Scan(&salesCount); err != nil {
+		t.Fatalf("count sales_renamed.widgets: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM billing_renamed.widgets`).Scan(&billingCount); err != nil {
+		t.Fatalf("count billing_renamed.widgets: %v", err)
+	}
+	if salesCount != 2 {
+		t.Errorf("sales_renamed.widgets = %d; want 2", salesCount)
+	}
+	if billingCount != 3 {
+		t.Errorf("billing_renamed.widgets = %d; want 3", billingCount)
+	}
+	var firstSales string
+	if err := db.QueryRowContext(ctx, `SELECT name FROM sales_renamed.widgets ORDER BY id LIMIT 1`).Scan(&firstSales); err != nil {
+		t.Fatalf("read sales_renamed name: %v", err)
+	}
+	if !strings.HasPrefix(firstSales, "a-") {
+		t.Errorf("sales_renamed.widgets first name = %q; want a-* (cross-schema bleed)", firstSales)
+	}
+
+	// The SOURCE-named schemas must NOT exist on the target — the rename
+	// routed only to the new names, and `public` (unmapped) was never selected.
+	var staleCount int
+	if err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM information_schema.schemata
+		WHERE  schema_name IN ('sales', 'billing')`).Scan(&staleCount); err != nil {
+		t.Fatalf("count source-named target schemas: %v", err)
+	}
+	if staleCount != 0 {
+		t.Errorf("found %d source-named target schema(s); want 0 (rename must not create same-named schemas)", staleCount)
+	}
+}
+
 // TestMigrate_MultiSchema_PostgresToMySQL is scenario (b): two source
 // schemas → two auto-created same-named MySQL databases.
 func TestMigrate_MultiSchema_PostgresToMySQL(t *testing.T) {

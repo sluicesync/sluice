@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sort"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -44,9 +43,11 @@ type multiDBScope struct {
 
 // multiDatabaseMode reports whether any database-scope flag engages the
 // fan-out path. Single-database mode (the default) returns false and the
-// orchestrator runs byte-identically to its pre-ADR-0074 shape.
+// orchestrator runs byte-identically to its pre-ADR-0074 shape. A non-empty
+// NamespaceMap (ADR-0142 --map-database/--map-schema) also engages the path:
+// a map-only invocation migrates exactly the mapped namespaces.
 func (m *Migrator) multiDatabaseMode() bool {
-	return m.AllDatabases || !m.DatabaseFilter.IsEmpty()
+	return m.AllDatabases || !m.DatabaseFilter.IsEmpty() || !m.NamespaceMap.IsEmpty()
 }
 
 // runMultiDatabase resolves the selected database set and runs the
@@ -87,19 +88,28 @@ func (m *Migrator) runMultiDatabase(ctx context.Context) error {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: list source namespaces: %w", err))
 	}
 
-	selected := make([]string, 0, len(all))
-	for _, db := range all {
-		if m.DatabaseFilter.Allows(db) {
-			selected = append(selected, db)
-		}
+	// Resolve the selected SOURCE set (ADR-0142: map-only ⇒ the map keys
+	// ARE the selection; otherwise the filter decides and the map renames
+	// within it), then refuse loudly if a rename-map key is not in that
+	// selection (typo guard, before any data moves).
+	selected := selectNamespaces(all, m.DatabaseFilter, m.AllDatabases, m.NamespaceMap)
+	if err := crossCheckMapSelection(selected, m.NamespaceMap); err != nil {
+		return err
 	}
-	sort.Strings(selected)
 	if len(selected) == 0 {
 		return errors.New(
 			"pipeline: no source namespaces matched the scope; nothing to migrate " +
-				"(check --include-database / --exclude-database / --include-schema / --exclude-schema, " +
-				"or that the source has non-system databases / schemas)",
+				"(check --include-database / --exclude-database / --include-schema / --exclude-schema / " +
+				"--map-database / --map-schema, or that the source has non-system databases / schemas)",
 		)
+	}
+
+	// Resolve each source namespace's TARGET name through the rename map and
+	// refuse loudly on a many-to-one collision (two sources → one target),
+	// even on a case-sensitive target where the fold preflight is a no-op.
+	targets, err := resolveTargetNamespaces(selected, m.NamespaceMap)
+	if err != nil {
+		return err
 	}
 
 	selectedSet := make(map[string]struct{}, len(selected))
@@ -124,7 +134,10 @@ func (m *Migrator) runMultiDatabase(ctx context.Context) error {
 	// namespaces' data. Refuse LOUDLY, naming both, before any data
 	// moves. No-op on a target engine that doesn't fold (Postgres:
 	// case-sensitive schemas) — the type-assertion falls through. ----
-	if err := preflightNamespaceFoldCollisions(ctx, m.Target, m.TargetDSN, selected); err != nil {
+	// Run on the MAPPED target names (ADR-0142): a case-fold collision
+	// between a mapped and an unmapped target is the same silent-merge
+	// hazard. Identity map ⇒ targets == selected ⇒ byte-identical to before.
+	if err := preflightNamespaceFoldCollisions(ctx, m.Target, m.TargetDSN, targets); err != nil {
 		return err
 	}
 
@@ -158,7 +171,12 @@ func (m *Migrator) runMultiDatabase(ctx context.Context) error {
 	// same routing.
 	perRuns := make([]Migrator, 0, len(selected))
 
-	for _, database := range selected {
+	for i, database := range selected {
+		// target is the source namespace's renamed TARGET (ADR-0142;
+		// identity when unmapped). Only the target-namespace identifier
+		// uses it — the source reads below stay keyed on `database`.
+		target := targets[i]
+
 		sourceDSN, err := deriver.WithDatabase(m.SourceDSN, database)
 		if err != nil {
 			return fmt.Errorf("pipeline: derive source DSN for database %q: %w", database, err)
@@ -173,9 +191,10 @@ func (m *Migrator) runMultiDatabase(ctx context.Context) error {
 		// the single-database path.
 		perDB.DatabaseFilter = DatabaseFilter{}
 		perDB.AllDatabases = false
+		perDB.NamespaceMap = NamespaceRenameMap{}
 
 		if targetCanDeriveDB {
-			// Each source namespace → a same-named target namespace,
+			// Each source namespace → its (possibly renamed) target namespace,
 			// auto-created (CREATE DATABASE for MySQL / CREATE SCHEMA for PG),
 			// with the target DSN re-pointed at it via WithDatabase.
 			// Skip the auto-create under --dry-run: a dry run must not
@@ -183,22 +202,22 @@ func (m *Migrator) runMultiDatabase(ctx context.Context) error {
 			// prints the plan and writes nothing). WithDatabase is pure, so
 			// the routing is still derived for an accurate plan.
 			if !m.DryRun {
-				if err := targetDeriver.EnsureDatabase(ctx, m.TargetDSN, database); err != nil {
+				if err := targetDeriver.EnsureDatabase(ctx, m.TargetDSN, target); err != nil {
 					return wrapWithHint(PhaseSchemaApply,
-						fmt.Errorf("pipeline: ensure target database %q: %w", database, err))
+						fmt.Errorf("pipeline: ensure target database %q: %w", target, err))
 				}
 			}
-			targetDSN, err := targetDeriver.WithDatabase(m.TargetDSN, database)
+			targetDSN, err := targetDeriver.WithDatabase(m.TargetDSN, target)
 			if err != nil {
-				return fmt.Errorf("pipeline: derive target DSN for database %q: %w", database, err)
+				return fmt.Errorf("pipeline: derive target DSN for database %q: %w", target, err)
 			}
 			perDB.TargetDSN = targetDSN
 			perDB.TargetSchema = ""
 		} else {
 			// Fallback for a namespaced target without [ir.DatabaseDSNDeriver]
-			// (none today): route to a target namespace of the same name via
-			// --target-schema and lean on the writer's own auto-create.
-			perDB.TargetSchema = database
+			// (none today): route to the (possibly renamed) target namespace
+			// via --target-schema and lean on the writer's own auto-create.
+			perDB.TargetSchema = target
 		}
 
 		// MigrationID must be unique per database so each database's
