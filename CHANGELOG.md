@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.163] - 2026-06-29
+
+### Fixed
+
+- **The continuous `sync` multi-namespace path now runs the same case-fold-collision preflight on the renamed target names that `migrate` does (ADR-0142 follow-up).** When `--map-database`/`--map-schema` is used with a folding MySQL target (`lower_case_table_names != 0`), two distinct target names that fold to the same identifier are now refused **loudly before any cold-start/CDC moves data** on the sync path too — closing a silent-merge gap that previously only the `migrate` path guarded (the streamer kept only the engine-agnostic *exact* many-to-one guard). Wired into `resolveStreamDatabases`, so it covers both cold-start and warm-resume. No-op on a non-folding (Postgres) target; the identity map (no rename) is byte-for-byte unchanged. Also adds a streamer multi-schema rename CDC integration test (PG→PG `--map-schema a=x,b=y`) asserting cold-start + a full insert/update/delete CDC workload route exactly-once into the renamed target schemas with no cross-schema bleed and the source-named schemas never created. The `-race` integration gate passed before tagging.
+
 ## [0.99.162] - 2026-06-29
 
 ### Added
