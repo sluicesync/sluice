@@ -54,6 +54,15 @@ const (
 	// the timestamptz-vs-timestamp resolution (never invent a zone).
 	offsetGlob = `*[+-][0-9][0-9]:[0-9][0-9]`
 	zuluGlob   = `*Z`
+
+	// subMicroFracGlob matches a value whose fractional-seconds part has MORE
+	// than 6 digits — a dot followed by at least 7 digits (GLOB has no {n,}
+	// quantifier, so the 7 digit-classes are spelled out, then `*` admits more
+	// digits and/or a trailing offset/`Z`). The promotion target is
+	// timestamp(6)/timestamptz(6), so a finer fraction would be silently ROUNDED
+	// by Postgres; such a column is kept as text instead (the never-silent-loss
+	// tenet — the value-fidelity review's secondary finding).
+	subMicroFracGlob = `*.[0-9][0-9][0-9][0-9][0-9][0-9][0-9]*`
 )
 
 // uuidGlob is the 8-4-4-4-12 hex UUID pattern, case-insensitive via the
@@ -212,6 +221,33 @@ func validateInferredTimestamp(
 	if err != nil {
 		return false, nil, 0, err
 	}
+	// MIXED offset/naive is REFUSED (value-fidelity; the v0.99.166 review's
+	// blocking finding). If SOME values carry an explicit offset and some don't,
+	// a naive-timestamp resolution would PARSE the offset-bearing values and
+	// store them UTC-SHIFTED — a silent wall-clock change (e.g. `+05:00` lands 5h
+	// off) — while a timestamptz resolution would invent a zone for the naive
+	// ones. Neither is faithful, so the column is kept as text. (An offset value
+	// can ONLY reach a naive-resolved column via this mixed case, so refusing it
+	// closes the silent-shift path: all-offset stays timestamptz [instant exact],
+	// all-naive stays timestamp [wall-clock exact].)
+	if noOffset != 0 && noOffset != total {
+		return false, ir.Timestamp{}, total, nil
+	}
+
+	// REFUSE sub-microsecond fractions: the target is timestamp(6)/timestamptz(6),
+	// so a value with >6 fractional digits would be silently ROUNDED by Postgres.
+	// Keep such a column as text rather than round.
+	subMicro, err := count(ctx, fmt.Sprintf(
+		"SELECT COUNT(*) AS n FROM %s WHERE %s IS NOT NULL AND %s GLOB '%s'",
+		qt, qc, qc, subMicroFracGlob,
+	))
+	if err != nil {
+		return false, nil, 0, err
+	}
+	if subMicro != 0 {
+		return false, ir.Timestamp{}, total, nil
+	}
+
 	// Precision 6 mirrors the `timestamptz` --type-override alias (mappings.go);
 	// PG renders timestamp(6)/timestamptz(6), the SQLite/ISO common case.
 	return true, ir.Timestamp{Precision: 6, WithTimeZone: noOffset == 0}, total, nil

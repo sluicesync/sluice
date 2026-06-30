@@ -54,6 +54,7 @@ func seedInferSource(t *testing.T) string {
 			is_broken   INTEGER,              -- boolean candidate (non-conforming: a 2)
 			created_at  TEXT,                 -- temporal candidate (all offset → timestamptz)
 			synced_time TEXT,                 -- temporal candidate (naive → timestamp)
+			mixed_at    TEXT,                 -- temporal candidate (MIXED offset+naive → REFUSED, stays text)
 			touched_at  TEXT,                 -- temporal candidate (non-conforming)
 			config_json TEXT,                 -- jsonb candidate (object/array)
 			notes_json  TEXT,                 -- jsonb candidate (non-conforming)
@@ -62,12 +63,12 @@ func seedInferSource(t *testing.T) string {
 		)`,
 		`INSERT INTO records VALUES (
 			1, 'alice', 1, 2,
-			'2024-01-15T10:30:00+05:00', '2024-01-15 10:30:00', 'whenever',
+			'2024-01-15T10:30:00+05:00', '2024-01-15 10:30:00', '2024-03-01T12:00:00+05:00', 'whenever',
 			'{"theme":"dark","n":1}', 'not json',
 			'550e8400-e29b-41d4-a716-446655440000', 'cus_abc123')`,
 		`INSERT INTO records VALUES (
 			2, 'bob', 0, 0,
-			'2024-02-20T08:00:00-08:00', '2024-02-20 08:00:00', '2024-02-20',
+			'2024-02-20T08:00:00-08:00', '2024-02-20 08:00:00', '2024-03-02 09:00:00', '2024-02-20',
 			'[1,2,3]', '{"ok":true}',
 			'6ba7b810-9dad-11d1-80b4-00c04fd430c8', 'cust-002')`,
 	}
@@ -119,6 +120,7 @@ func TestMigrate_InferTypes_SQLiteToPostgres(t *testing.T) {
 		"is_broken":   "bigint",                      // kept (non-conforming)
 		"created_at":  "timestamp with time zone",    // promoted: all values carry an offset
 		"synced_time": "timestamp without time zone", // promoted: naive → NOT tz
+		"mixed_at":    "text",                        // kept: MIXED offset+naive → REFUSED (no silent UTC shift)
 		"touched_at":  "text",                        // kept (non-conforming)
 		"config_json": "jsonb",                       // promoted
 		"notes_json":  "text",                        // kept (non-conforming)
@@ -158,6 +160,11 @@ func TestMigrate_InferTypes_SQLiteToPostgres(t *testing.T) {
 
 	// timestamp (naive): the wall-clock value, no zone conversion.
 	assertText(t, pg, ctx, `SELECT synced_time::text FROM records WHERE id = 1`, "2024-01-15 10:30:00")
+
+	// MIXED offset+naive → REFUSED → kept text → the offset value is carried
+	// VERBATIM, NOT silently UTC-shifted (the value-fidelity review's regression
+	// pin: pre-fix this column promoted to naive timestamp and read '07:00:00').
+	assertText(t, pg, ctx, `SELECT mixed_at FROM records WHERE id = 1`, "2024-03-01T12:00:00+05:00")
 
 	// jsonb: value equal (assert a key), and the kept text column intact.
 	assertText(t, pg, ctx, `SELECT config_json->>'theme' FROM records WHERE id = 1`, "dark")

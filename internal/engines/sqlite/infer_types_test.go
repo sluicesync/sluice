@@ -44,6 +44,9 @@ func TestValidateInferredType_PerFamily(t *testing.T) {
 			ts_mixed  TEXT,
 			ts_date   TEXT,
 			ts_bad    TEXT,
+			ts_mixnz  TEXT,
+			ts_subus  TEXT,
+			ts_frac   TEXT,
 			js_ok     TEXT,
 			js_num    TEXT,
 			js_free   TEXT,
@@ -56,6 +59,7 @@ func TestValidateInferredType_PerFamily(t *testing.T) {
 			1, 1, 2,
 			'2024-01-15T10:30:00+05:00', '2024-01-15 10:30:00', '2024-01-15T10:30:00Z',
 			'2024-01-15', 'not a date',
+			'2024-01-15T10:30:00+05:00', '2024-01-15 10:30:00.1234567', '2024-01-15T10:30:00.123456+05:00',
 			'{"a":1}', '123', 'free',
 			'550e8400-e29b-41d4-a716-446655440000', '550E8400-E29B-41D4-A716-446655440000', 'cus_abc123',
 			NULL)`,
@@ -63,12 +67,13 @@ func TestValidateInferredType_PerFamily(t *testing.T) {
 			2, 0, 0,
 			'2024-02-20T08:00:00-08:00', '2024-02-20 08:00:00', '2024-02-20 08:00:00',
 			'2024-02-20', '2024-02-20',
+			'2024-02-20 08:00:00', '2024-02-20 08:00:00.7654321', '2024-02-20T08:00:00.654321Z',
 			'[1,2,3]', '456', '"hello"',
 			'6ba7b810-9dad-11d1-80b4-00c04fd430c8', '6BA7B810-9DAD-11D1-80B4-00C04FD430C8', 'not-uuid',
 			NULL)`,
 		// Row 3 is all-NULL (except the PK) so every "ok" column has a NULL the
 		// validation must skip — conformance must hold despite it.
-		`INSERT INTO t VALUES (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)`,
+		`INSERT INTO t VALUES (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)`,
 	)
 
 	tsTZ := ir.Timestamp{Precision: 6, WithTimeZone: true}
@@ -86,9 +91,12 @@ func TestValidateInferredType_PerFamily(t *testing.T) {
 
 		{"ts_off", ir.Timestamp{}, true, tsTZ, 2},
 		{"ts_naive", ir.Timestamp{}, true, tsNaive, 2},
-		{"ts_mixed", ir.Timestamp{}, true, tsNaive, 2}, // one value lacks an offset → NOT tz
-		{"ts_date", ir.Timestamp{}, true, tsNaive, 2},  // bare date → naive
-		{"ts_bad", ir.Timestamp{}, false, nil, 2},      // 'not a date' contradicts
+		{"ts_mixed", ir.Timestamp{}, false, nil, 2},   // MIXED offset(`Z`)+naive → REFUSED (value-fidelity fix)
+		{"ts_date", ir.Timestamp{}, true, tsNaive, 2}, // bare date → naive
+		{"ts_bad", ir.Timestamp{}, false, nil, 2},     // 'not a date' contradicts
+		{"ts_mixnz", ir.Timestamp{}, false, nil, 2},   // MIXED +05:00 offset + naive → REFUSED (would silently UTC-shift the offset value into a naive column — the review's BLOCK)
+		{"ts_subus", ir.Timestamp{}, false, nil, 2},   // >6 fractional digits → REFUSED (would silently round under timestamp(6))
+		{"ts_frac", ir.Timestamp{}, true, tsTZ, 2},    // all-offset, exactly 6 frac digits → timestamptz(6) (precision contract)
 
 		{"js_ok", ir.JSON{Binary: true}, true, ir.JSON{Binary: true}, 2},
 		{"js_num", ir.JSON{Binary: true}, false, nil, 2},  // '123' is a bare number

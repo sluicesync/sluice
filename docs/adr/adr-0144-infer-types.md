@@ -16,7 +16,9 @@ Add an **opt-in, data-validated** rich-type inference for **SQLite/D1 sources on
 ### Why this is safe (two independent nets)
 The inference does **not** add new value-conversion code. It computes **validated `--type-override` entries** and applies them through the existing override path (`translate.ApplyMappings` → the SQLite reader's Bug-161 override decode). That decode **refuses loudly** on any value it cannot faithfully interpret (`decodeBoolean`/`decodeTemporal`/the string-family carry in `value_decode.go`). So:
 1. **Up-front exhaustive validation** rejects non-conforming columns before promotion.
-2. **The decoder's loud-refuse** is a second net: even a validation bug cannot silently corrupt — it fails loudly, never coerces.
+2. **The decoder's loud-refuse** is a second net for *parse-validity* — a value the decoder cannot parse aborts the migrate loudly, never coerces.
+
+**Important boundary (the v0.99.166 value-fidelity review):** the decoder's loud-refuse is a *parse-validity* net, NOT a *target-capacity* net — a value that parses fine but the resolved target type cannot faithfully hold would be silently coerced. So the up-front validation MUST also reject *target-capacity* mismatches the decoder can't catch. Two such cases exist in the temporal family and are refused at validation (column kept `text`): (a) a **mixed** column with some offset-bearing and some naive values — promoting to naive `timestamp` would parse the offset values and store them UTC-shifted (silent wall-clock change), and promoting to `timestamptz` would invent a zone for the naive ones; (b) a value with **sub-microsecond** fractional seconds (>6 digits) that `timestamp(6)`/`timestamptz(6)` would silently round. With these refusals, claim (2) holds: nothing reaches the decoder that it would silently mis-hold.
 
 ### Candidate selection (name-hint) + validation (data)
 A column is a *candidate* only if its **name hints** the target type AND its current conservative type is the right source family; it is *promoted* only if **exhaustive data validation** passes:
@@ -24,7 +26,7 @@ A column is a *candidate* only if its **name hints** the target type AND its cur
 | Target | Name hint (case-insensitive) | Source family | Exhaustive validation (one aggregate per column, pushed to the source) |
 |---|---|---|---|
 | `boolean` | `is_*`, `has_*`, `*_flag` | INTEGER | every non-NULL value ∈ {0,1}: `COUNT(*) WHERE col NOT IN (0,1) AND col IS NOT NULL` = 0 |
-| `timestamptz`/`timestamp` | `*_at`, `*_time`, `created`, `updated` | TEXT | every non-NULL value matches an ISO-8601 `GLOB`; **timestamptz iff ALL carry an explicit offset/`Z`, else `timestamp`** (tz-aware, never invent a zone) |
+| `timestamptz`/`timestamp` | `*_at`, `*_time`, `created`, `updated` | TEXT | every non-NULL value matches an ISO-8601 `GLOB`; **timestamptz iff ALL carry an explicit offset/`Z`, all-naive ⇒ `timestamp`** (tz-aware, never invent a zone); a **MIXED** offset/naive column and a **sub-µs** (>6 frac-digit) column are REFUSED (kept text) — see the target-capacity boundary above |
 | `jsonb` | `*_json`, `metadata`, `payload`, `settings`, `attributes` | TEXT | every non-NULL value `json_valid(col)=1` AND is an object/array (not a bare number/string — guards `'123'`/`'free'` false positives) |
 | `uuid` | `*_id`, `*_uuid`, `uuid`, `guid` | TEXT | every non-NULL value matches the 8-4-4-4-12 hex UUID `GLOB` |
 
