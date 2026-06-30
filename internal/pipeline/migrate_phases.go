@@ -98,6 +98,13 @@ func (m *Migrator) phaseReadSourceSchema(ctx context.Context, scope *multiDBScop
 	}
 	applyViewFilter(ctx, schema, m.ViewFilter, m.SkipViews)
 
+	// ---- 1.3. Skip ORM/framework migration-bookkeeping tables (ADR-0143) ----
+	// Runs AFTER applyTableFilter so an explicit --include-table wins. No-op
+	// unless SkipORMTables is set (the CLI default); the zero value for every
+	// programmatic caller is "don't skip", byte-identical to before. Covers
+	// the multi-database per-database migrate runs too (they reuse this phase).
+	applyORMTableSkip(ctx, schema, m.SkipORMTables, m.Filter)
+
 	// Multi-database fan-out (ADR-0074): defer EVERY foreign key to a
 	// final cross-database pass. A cross-database FK references a table
 	// in another selected database which may not exist on the target yet

@@ -71,6 +71,9 @@ func (s *Streamer) logDryRunPlan(ctx context.Context, streamID string, persisted
 		return err
 	}
 	applyViewFilter(ctx, schema, s.ViewFilter, s.SkipViews)
+	// ADR-0143: mirror the cold-start ORM-table skip so the dry-run preview
+	// honestly reflects what a real run would copy.
+	applyORMTableSkip(ctx, schema, s.SkipORMTables, s.Filter)
 	mapped, err := translate.ApplyMappings(schema, s.Mappings)
 	if err != nil {
 		return fmt.Errorf("pipeline: dry-run: apply mappings: %w", err)

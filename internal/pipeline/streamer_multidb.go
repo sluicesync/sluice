@@ -559,6 +559,9 @@ func (s *Streamer) coldStartCopyOneDatabase(
 		return fmt.Errorf("pipeline: filter tables for %q: %w", database, err)
 	}
 	applyViewFilter(ctx, schema, s.ViewFilter, s.SkipViews)
+	// ADR-0143: skip ORM/framework migration-bookkeeping tables in the
+	// per-database sync fan-out too. No-op unless SkipORMTables is set.
+	applyORMTableSkip(ctx, schema, s.SkipORMTables, s.Filter)
 
 	// Apply per-column type / expression overrides before schema-apply.
 	schema, err = translate.ApplyMappings(schema, s.Mappings)

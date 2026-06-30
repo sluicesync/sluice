@@ -425,6 +425,24 @@ type Migrator struct {
 	// if the flag is set against an unsupported target. See
 	// `docs/dev/notes/pgcopydb-planetscale-fork-review.md`.
 	AllowDegradedFKs bool
+
+	// SkipORMTables, when true, drops recognized ORM/framework
+	// migration-bookkeeping tables (flyway_schema_history,
+	// _prisma_migrations, schema_migrations, …) from the source schema
+	// after the table filter, announcing each skip loudly (ADR-0143).
+	// Carrying a source's migration-history table to the target is
+	// almost always wrong — it records migrations that ran against the
+	// SOURCE, so the ORM on the target concludes they already ran.
+	//
+	// ★ Zero-value-safe (the v0.99.51 trap): the zero value (false) is
+	// DO-NOT-skip, the conservative default every programmatic / broker /
+	// test caller gets — they must never suddenly start dropping tables.
+	// ONLY the CLI defaults this on (flipped off by --include-orm-tables),
+	// so loud-skip-by-default is a CLI policy, not a library behaviour
+	// change. A table named explicitly via --include-table is never
+	// skipped; a generic-name collision (name matches but column shape
+	// doesn't) is kept with a loud warning rather than silently dropped.
+	SkipORMTables bool
 }
 
 // ShardColumnSpec carries the ADR-0048 Shape A discriminator

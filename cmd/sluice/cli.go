@@ -189,6 +189,8 @@ type MigrateCmd struct {
 	ExcludeView []string `help:"Migrate every view except these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-view." sep:"," placeholder:"VIEW"`
 	SkipViews   bool     `help:"Skip view processing entirely; views in the source schema are not created on the target. Useful when views are managed out-of-band (Atlas / sqitch / liquibase)."`
 
+	IncludeORMTables bool `help:"Keep ORM/framework migration-bookkeeping tables (flyway_schema_history, _prisma_migrations, …) that are skipped by default; carrying source-engine migration history to the target is usually wrong — re-baseline your ORM on the target instead."`
+
 	TypeOverride []string `help:"Force a specific target type for a column (repeatable). Format: 'TABLE.COLUMN=TYPE', e.g. 'products.attrs=text'. CLI form of the YAML 'mappings:' config; for target-type options (e.g. 'jsonb' with binary=true), use the YAML form." placeholder:"TABLE.COLUMN=TYPE" sep:"none"`
 
 	ExprOverride []string `help:"Replace a generated column's body with operator-supplied target-dialect text (repeatable). Format: 'TABLE.COLUMN=EXPRESSION'. The expression is emitted verbatim — sluice's cross-dialect translator (ADR-0016) does NOT run on overridden columns. Escape hatch for cases the translator's hand-coded rewrites don't recognise. CLI form of the YAML 'expression_mappings:' config." placeholder:"TABLE.COLUMN=EXPRESSION" sep:"none"`
@@ -379,6 +381,10 @@ func (m *MigrateCmd) Run(g *Globals) error {
 		InjectShardColumn:     shardSpec,
 		AllowCrossShardMerge:  m.AllowCrossShardMerge,
 		AllowDegradedFKs:      m.AllowDegradedFKs,
+		// ADR-0143: loud-skip ORM migration-history tables by DEFAULT on the
+		// CLI; --include-orm-tables opts out. (The Migrator zero value is
+		// false = no skip, the safe default for programmatic callers.)
+		SkipORMTables: !m.IncludeORMTables,
 	}
 	keysetSource := m.KeysetSource
 	if keysetSource == "" {
@@ -736,6 +742,8 @@ type SyncStartCmd struct {
 	IncludeView []string `help:"Only create these views on the target during cold-start (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --exclude-view. Views are not replicated by CDC; this filter only affects the cold-start schema-apply phase." sep:"," placeholder:"VIEW"`
 	ExcludeView []string `help:"Skip these views during cold-start schema-apply (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-view." sep:"," placeholder:"VIEW"`
 	SkipViews   bool     `help:"Skip view creation entirely on cold-start. Views are not replicated by CDC, so this only affects the initial schema-apply step."`
+
+	IncludeORMTables bool `help:"Keep ORM/framework migration-bookkeeping tables (flyway_schema_history, _prisma_migrations, …) that are skipped by default; carrying source-engine migration history to the target is usually wrong — re-baseline your ORM on the target instead."`
 
 	TypeOverride []string `help:"Force a specific target type for a column (repeatable). Format: 'TABLE.COLUMN=TYPE', e.g. 'products.attrs=text'. CLI form of the YAML 'mappings:' config; for target-type options, use the YAML form." placeholder:"TABLE.COLUMN=TYPE" sep:"none"`
 
@@ -1468,6 +1476,10 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		Filter:             filter,
 		ViewFilter:         viewFilter,
 		SkipViews:          s.SkipViews,
+		// ADR-0143: loud-skip ORM migration-history tables by DEFAULT on the
+		// CLI; --include-orm-tables opts out. (The Streamer zero value is
+		// false = no skip, the safe default for fleet/programmatic callers.)
+		SkipORMTables:      !s.IncludeORMTables,
 		DatabaseFilter:     databaseFilter,
 		AllDatabases:       allNS,
 		NamespaceMap:       namespaceMap,

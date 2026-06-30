@@ -257,6 +257,20 @@ type Streamer struct {
 	// to round-trip the definitions on cold-start.
 	SkipViews bool
 
+	// SkipORMTables, when true, drops recognized ORM/framework
+	// migration-bookkeeping tables (flyway_schema_history,
+	// _prisma_migrations, schema_migrations, …) from the cold-start
+	// source schema, announcing each skip loudly (ADR-0143). The prune
+	// runs before the snapshot/publication scope is computed, so a
+	// continuous sync neither cold-copies nor (on publication-scoped
+	// sources) streams them.
+	//
+	// ★ Zero-value-safe (the v0.99.51 trap): the zero value (false) is
+	// DO-NOT-skip — the default every programmatic / broker / fleet
+	// construction gets. ONLY the `sync` CLI defaults this on (flipped
+	// off by --include-orm-tables). See [Migrator.SkipORMTables].
+	SkipORMTables bool
+
 	// ForceColdStart, when true, skips the cold-start pre-flight
 	// check that refuses a fresh stream into a target with
 	// pre-existing rows. The check protects against Bug 9 (cold-

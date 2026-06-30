@@ -198,6 +198,12 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context) (*ir.Schema, [
 	}
 	applyViewFilter(ctx, schema, s.ViewFilter, s.SkipViews)
 
+	// ADR-0143: skip ORM/framework migration-bookkeeping tables before the
+	// snapshot/publication scope is computed below, so a continuous sync
+	// neither cold-copies nor (on publication-scoped sources) streams them.
+	// No-op unless SkipORMTables is set (the sync CLI default).
+	applyORMTableSkip(ctx, schema, s.SkipORMTables, s.Filter)
+
 	// Collect the surviving (filtered) table names so a source that
 	// implements ir.TableScopedSnapshotOpener (PlanetScale VStream) can
 	// scope its COPY to exactly these tables. Without this the VStream
