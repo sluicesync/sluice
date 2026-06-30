@@ -13,7 +13,7 @@ This surfaced from the SQLite/D1 migrate-source work (ADR-0128): a D1 export rou
 
 ## Decision
 
-Recognize ORM/framework migration-bookkeeping tables in the pipeline package and **loud-skip them by default on the CLI**: skip recognized tables, but announce each skip loudly, with `--include-orm-tables` to keep them.
+Recognize ORM/framework migration-bookkeeping tables in the pipeline package and **loud-skip them by default on the CLI for CROSS-engine migrations only**: skip recognized tables (announcing each loudly) when source and target are different engine families, because a migration-history table records migrations written for the source engine that never ran against the differently-built target — the carried history is invalid there. For a **same-engine** migration (same family — Postgres→Postgres, MySQL→PlanetScale-MySQL, …) the history is valid (sluice's replicated schema is exactly what those migrations would build on that engine), so the tables are **kept by default**. `--include-orm-tables` forces keep on any run; `--skip-orm-tables` forces skip (e.g. on a same-engine run); the two are mutually exclusive. Engine family is computed from the driver name (`mysql`/`planetscale`/`vitess`; `postgres`/`postgres-trigger`; `sqlite`/`d1`/`sqlite-trigger`/`d1-trigger`). Recognition is engine-neutral; only the skip-*default* is cross-engine-scoped.
 
 ### Recognition (two classes)
 

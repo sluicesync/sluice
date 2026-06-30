@@ -1,10 +1,10 @@
 # sluice v0.99.165
 
-**ORM/framework migration-bookkeeping tables (Flyway, Prisma, Rails, Django, Drizzle, … — 22 frameworks) are now skipped by default with a loud notice, since carrying a source engine's migration history to a freshly-migrated target is almost always wrong. `--include-orm-tables` keeps them. Generic-named tables are guarded by column shape so a real application table is never dropped. Second of the D1/SQLite migration-ergonomics improvements; works for any source engine.**
+**ORM/framework migration-bookkeeping tables (Flyway, Prisma, Rails, Django, Drizzle, … — 22 frameworks) are now recognized and, on a CROSS-engine migration, skipped by default with a loud notice — carrying a source engine's migration history to a differently-built target is invalid there. Same-engine migrations keep them by default (the history is valid). `--include-orm-tables` / `--skip-orm-tables` override. Generic-named tables are guarded by column shape so a real application table is never dropped. Second of the D1/SQLite migration-ergonomics improvements; recognition works for any source engine.**
 
 ## Added
 
-**ORM migration-bookkeeping tables: loud-skip-by-default (ADR-0143).** When a source contains an ORM's migration-history table — `flyway_schema_history`, `_prisma_migrations`, `django_migrations`, `__drizzle_migrations`, … — those rows record migrations applied to the **source** engine. Carrying them to a target whose schema sluice just built is semantically wrong: the ORM on the target would conclude those migrations already ran. So `sluice migrate` and `sluice sync` now **recognize these tables and skip them by default**, announcing each skip:
+**ORM migration-bookkeeping tables: loud-skip-by-default (ADR-0143).** When a source contains an ORM's migration-history table — `flyway_schema_history`, `_prisma_migrations`, `django_migrations`, `__drizzle_migrations`, … — those rows record migrations applied to the **source** engine. On a **cross-engine** migration (D1/SQLite→Postgres, Postgres→MySQL, …) those migrations never ran against the differently-built target, so the carried history is invalid/misleading. So `sluice migrate` and `sluice sync` now **recognize these tables and, on a cross-engine run, skip them by default**, announcing each skip:
 
 ```
 WARN  migration: skipping ORM migration-history table — pass --include-orm-tables to keep it
@@ -19,7 +19,7 @@ WARN  migration: skipping ORM migration-history table — pass --include-orm-tab
 
 ## Compatibility
 
-Engine-neutral — the shape guards test the dialect-neutral IR type families, so this works for any source engine, not just SQLite/D1. **Zero-value-safe:** the underlying `SkipORMTables` setting defaults to *off* for every programmatic/library/broker/fleet construction; only the `migrate` and `sync start` CLI commands enable it by default. So nothing changes for embedded/SDK callers, and existing CLI runs gain the skip + the `--include-orm-tables` escape hatch. After migrating, re-baseline your ORM on the target (the skip notice points this out per framework). The `-race` integration gate passed before tagging.
+Recognition is engine-neutral (the shape guards test the dialect-neutral IR type families, so any source engine is covered, not just SQLite/D1), but the skip-*default* is **cross-engine-scoped**: a same-engine migration keeps these tables (the history is valid), a cross-engine migration skips them. **Zero-value-safe:** the underlying `SkipORMTables` setting defaults to *off* for every programmatic/library/broker/fleet construction; only the `migrate` and `sync start` CLI commands enable it, and only on a cross-engine run. So nothing changes for embedded/SDK callers or same-engine migrations; cross-engine CLI runs gain the skip, and `--include-orm-tables` / `--skip-orm-tables` override on either path. After migrating, re-baseline your ORM on the target (the skip notice points this out per framework). The `-race` integration gate passed before tagging.
 
 ## Who needs this
 

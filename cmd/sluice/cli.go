@@ -189,7 +189,8 @@ type MigrateCmd struct {
 	ExcludeView []string `help:"Migrate every view except these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-view." sep:"," placeholder:"VIEW"`
 	SkipViews   bool     `help:"Skip view processing entirely; views in the source schema are not created on the target. Useful when views are managed out-of-band (Atlas / sqitch / liquibase)."`
 
-	IncludeORMTables bool `help:"Keep ORM/framework migration-bookkeeping tables (flyway_schema_history, _prisma_migrations, …) that are skipped by default; carrying source-engine migration history to the target is usually wrong — re-baseline your ORM on the target instead."`
+	IncludeORMTables bool `help:"Keep ORM/framework migration-bookkeeping tables (flyway_schema_history, _prisma_migrations, …). On a CROSS-engine migration they are skipped by default (the source's migration history is invalid on a different target engine); this flag forces keeping them. Mutually exclusive with --skip-orm-tables."`
+	SkipORMTables    bool `help:"Skip ORM/framework migration-bookkeeping tables (flyway_schema_history, _prisma_migrations, …). On a SAME-engine migration they are kept by default (the migration history is valid); this flag forces skipping them. Mutually exclusive with --include-orm-tables."`
 
 	TypeOverride []string `help:"Force a specific target type for a column (repeatable). Format: 'TABLE.COLUMN=TYPE', e.g. 'products.attrs=text'. CLI form of the YAML 'mappings:' config; for target-type options (e.g. 'jsonb' with binary=true), use the YAML form." placeholder:"TABLE.COLUMN=TYPE" sep:"none"`
 
@@ -268,6 +269,9 @@ func (m *MigrateCmd) Run(g *Globals) error {
 	// programmatic-construction path.
 	if len(m.IncludeTable) > 0 && len(m.ExcludeTable) > 0 {
 		return errors.New("--include-table and --exclude-table are mutually exclusive")
+	}
+	if m.IncludeORMTables && m.SkipORMTables {
+		return errors.New("--include-orm-tables and --skip-orm-tables are mutually exclusive")
 	}
 	includeNS, excludeNS, allNS, err := resolveNamespaceScopeArgs(
 		m.IncludeDatabase, m.ExcludeDatabase, m.AllDatabases,
@@ -381,10 +385,13 @@ func (m *MigrateCmd) Run(g *Globals) error {
 		InjectShardColumn:     shardSpec,
 		AllowCrossShardMerge:  m.AllowCrossShardMerge,
 		AllowDegradedFKs:      m.AllowDegradedFKs,
-		// ADR-0143: loud-skip ORM migration-history tables by DEFAULT on the
-		// CLI; --include-orm-tables opts out. (The Migrator zero value is
-		// false = no skip, the safe default for programmatic callers.)
-		SkipORMTables: !m.IncludeORMTables,
+		// ADR-0143: skip ORM migration-history tables by default ONLY on a
+		// CROSS-engine migration (the source's migration history is invalid on a
+		// different target engine); a same-engine migration KEEPS them by default
+		// (the history is valid). --include-orm-tables / --skip-orm-tables override.
+		// (The Migrator zero value is false = no skip, the safe default for
+		// programmatic callers.)
+		SkipORMTables: resolveSkipORMTables(m.SourceDriver, m.TargetDriver, m.IncludeORMTables, m.SkipORMTables),
 	}
 	keysetSource := m.KeysetSource
 	if keysetSource == "" {
@@ -743,7 +750,8 @@ type SyncStartCmd struct {
 	ExcludeView []string `help:"Skip these views during cold-start schema-apply (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-view." sep:"," placeholder:"VIEW"`
 	SkipViews   bool     `help:"Skip view creation entirely on cold-start. Views are not replicated by CDC, so this only affects the initial schema-apply step."`
 
-	IncludeORMTables bool `help:"Keep ORM/framework migration-bookkeeping tables (flyway_schema_history, _prisma_migrations, …) that are skipped by default; carrying source-engine migration history to the target is usually wrong — re-baseline your ORM on the target instead."`
+	IncludeORMTables bool `help:"Keep ORM/framework migration-bookkeeping tables (flyway_schema_history, _prisma_migrations, …). On a CROSS-engine migration they are skipped by default (the source's migration history is invalid on a different target engine); this flag forces keeping them. Mutually exclusive with --skip-orm-tables."`
+	SkipORMTables    bool `help:"Skip ORM/framework migration-bookkeeping tables (flyway_schema_history, _prisma_migrations, …). On a SAME-engine migration they are kept by default (the migration history is valid); this flag forces skipping them. Mutually exclusive with --include-orm-tables."`
 
 	TypeOverride []string `help:"Force a specific target type for a column (repeatable). Format: 'TABLE.COLUMN=TYPE', e.g. 'products.attrs=text'. CLI form of the YAML 'mappings:' config; for target-type options, use the YAML form." placeholder:"TABLE.COLUMN=TYPE" sep:"none"`
 
@@ -1301,6 +1309,9 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 	if len(s.IncludeTable) > 0 && len(s.ExcludeTable) > 0 {
 		return errors.New("--include-table and --exclude-table are mutually exclusive")
 	}
+	if s.IncludeORMTables && s.SkipORMTables {
+		return errors.New("--include-orm-tables and --skip-orm-tables are mutually exclusive")
+	}
 
 	// roadmap item 48: refuse a half-configured email sink loudly (naming the
 	// missing field) rather than silently dropping every alert at send time.
@@ -1476,10 +1487,12 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		Filter:             filter,
 		ViewFilter:         viewFilter,
 		SkipViews:          s.SkipViews,
-		// ADR-0143: loud-skip ORM migration-history tables by DEFAULT on the
-		// CLI; --include-orm-tables opts out. (The Streamer zero value is
-		// false = no skip, the safe default for fleet/programmatic callers.)
-		SkipORMTables:      !s.IncludeORMTables,
+		// ADR-0143: skip ORM migration-history tables by default ONLY on a
+		// CROSS-engine sync; a same-engine sync KEEPS them by default (the history
+		// is valid). --include-orm-tables / --skip-orm-tables override. (The
+		// Streamer zero value is false = no skip, the safe default for
+		// fleet/programmatic callers.)
+		SkipORMTables:      resolveSkipORMTables(s.SourceDriver, s.TargetDriver, s.IncludeORMTables, s.SkipORMTables),
 		DatabaseFilter:     databaseFilter,
 		AllDatabases:       allNS,
 		NamespaceMap:       namespaceMap,
