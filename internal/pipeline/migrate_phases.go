@@ -165,11 +165,25 @@ func (m *Migrator) phaseReadSourceSchema(ctx context.Context, scope *multiDBScop
 // All of it fires before DryRun and before any schema apply, so there
 // is never a partially-migrated target and the diagnostics match
 // `schema preview`.
-func (m *Migrator) phaseTranslateAndGateSchema(ctx context.Context, schema *ir.Schema) (*ir.Schema, bool, error) {
+func (m *Migrator) phaseTranslateAndGateSchema(ctx context.Context, sr ir.SchemaReader, schema *ir.Schema) (*ir.Schema, bool, error) {
 	// ---- 1.5. Apply per-column type-mapping overrides ----
 	schema, err := translate.ApplyMappings(schema, m.Mappings)
 	if err != nil {
 		return nil, false, fmt.Errorf("pipeline: apply mappings: %w", err)
+	}
+	// ---- 1.505. Opt-in validated rich-type inference (ADR-0144) ----
+	// SQLite/D1 sources only: promote name-hinted columns to richer PG types
+	// (boolean / timestamptz / timestamp / jsonb / uuid) ONLY where every
+	// non-NULL value is exhaustively validated to conform — riding the SAME
+	// override decode as --type-override (no new value-conversion code). Runs
+	// AFTER ApplyMappings so an explicit operator override always wins; a no-op
+	// (byte-identical) when --infer-types is off. A non-SQLite/D1 source (no
+	// validator surface) is refused loudly inside applyInferredTypes.
+	if m.InferTypes {
+		schema, err = m.applyInferredTypes(ctx, sr, schema)
+		if err != nil {
+			return nil, false, err
+		}
 	}
 	schema, err = translate.ApplyExpressionOverrides(schema, m.ExpressionMappings)
 	if err != nil {

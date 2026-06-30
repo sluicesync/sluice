@@ -2601,3 +2601,43 @@ type DefaultTableExcluder interface {
 	// can return DSN-keyed defaults in addition to flag-keyed ones.
 	DefaultExcludePatterns(dsn string) []string
 }
+
+// InferredTypeValidator is the OPTIONAL surface a [SchemaReader] implements
+// to support the opt-in, data-validated rich-type inference (`--infer-types`,
+// ADR-0144). It is the engine-neutral seam the migrate orchestrator calls to
+// ask "does EVERY non-NULL value in this column conform to this richer target
+// type?" — the engine owns the SQL (one cheap aggregate pushed to the source,
+// no row transfer); the pipeline owns the name-hint candidate selection and
+// the override injection.
+//
+// Implemented today by SQLite's file [SchemaReader] and the live-D1 reader,
+// the only dynamically-typed sources where the conservative INTEGER/TEXT
+// mapping leaves a rich-type gap worth closing. A source that does not
+// implement it is refused loudly when `--infer-types` is set (inference is
+// SQLite/D1-only) rather than silently ignored.
+//
+// The inference adds NO new value-conversion code: a conforming column is
+// promoted by injecting a validated `--type-override`-equivalent entry that
+// rides the engine's existing override decode, which itself loud-refuses on
+// any value it cannot faithfully interpret. So the up-front exhaustive
+// validation and the decode's loud-refuse are two independent nets against
+// silent corruption (ADR-0144 §"two independent nets").
+type InferredTypeValidator interface {
+	// ValidateInferredType reports whether every non-NULL value in
+	// table.column conforms to target — exhaustively (a single stray
+	// non-conformer fails it; a one-shot migration cannot tolerate one).
+	//
+	// target names the candidate FAMILY the pipeline selected by name-hint
+	// ([Boolean], [Timestamp], [JSON]{Binary:true}, [UUID]). For the temporal
+	// family the engine RESOLVES the concrete shape from the data — resolved
+	// is [Timestamp]{WithTimeZone:true} iff EVERY value carries an explicit
+	// offset/`Z`, else {WithTimeZone:false} (tz-aware, never inventing a
+	// zone); for the other families resolved == target.
+	//
+	// validated is the count of non-NULL values checked. conforms is true
+	// only when no value contradicted target AND validated > 0 (an all-NULL
+	// or empty column validates nothing, so it is NOT promoted — there is no
+	// evidence the rich type is correct). A query failure returns a non-nil
+	// err and the column is left at its safe type.
+	ValidateInferredType(ctx context.Context, table, column string, target Type) (conforms bool, resolved Type, validated int64, err error)
+}

@@ -92,6 +92,20 @@ type Migrator struct {
 	// coded rewrite table doesn't recognise (ADR-0016).
 	ExpressionMappings []config.ExpressionMapping
 
+	// InferTypes opts into the validated rich-type inference for
+	// SQLite/D1 sources (`--infer-types`, ADR-0144): name-hinted
+	// columns are promoted to richer Postgres types (boolean,
+	// timestamptz/timestamp, jsonb, uuid) ONLY after the source engine
+	// exhaustively validates that every non-NULL value conforms; the
+	// promotion is injected as a validated override that rides the
+	// existing override decode (no new value-conversion code). An
+	// explicit Mappings entry always wins. The zero value (false) is
+	// the safe default — conservative-and-lossless mapping, byte-
+	// identical to before — so every programmatic caller is correct
+	// without setting it. A non-SQLite/D1 source with InferTypes set is
+	// refused loudly (inference is SQLite/D1-only).
+	InferTypes bool
+
 	// Filter selects which source tables participate in the
 	// migration. Empty filter (zero value) keeps the previous
 	// behaviour of migrating every table the source schema reader
@@ -526,7 +540,7 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	// raw-copy lane gate (rawCopyOK threads into the copy deps below),
 	// the redaction-type preflight, and the cross-engine refusals +
 	// loud-notice scans — all before DryRun and any schema apply.
-	schema, rawCopyOK, err := m.phaseTranslateAndGateSchema(ctx, schema)
+	schema, rawCopyOK, err := m.phaseTranslateAndGateSchema(ctx, sr, schema)
 	if err != nil {
 		return err
 	}

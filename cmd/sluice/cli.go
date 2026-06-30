@@ -196,6 +196,8 @@ type MigrateCmd struct {
 
 	ExprOverride []string `help:"Replace a generated column's body with operator-supplied target-dialect text (repeatable). Format: 'TABLE.COLUMN=EXPRESSION'. The expression is emitted verbatim — sluice's cross-dialect translator (ADR-0016) does NOT run on overridden columns. Escape hatch for cases the translator's hand-coded rewrites don't recognise. CLI form of the YAML 'expression_mappings:' config." placeholder:"TABLE.COLUMN=EXPRESSION" sep:"none"`
 
+	InferTypes bool `help:"SQLite/D1 source only: promote conservatively-typed columns to richer Postgres types (boolean, timestamptz/timestamp, jsonb, uuid) — but ONLY after exhaustively validating that every non-NULL value conforms (a name-hint like is_*/created_at/*_json/*_id selects a candidate; the data validation is the gate). A column with a single non-conforming value (e.g. a '*_id' holding 'cus_abc123') is kept at its safe type and reported. Off by default (conservative-and-lossless mapping). Composes with --type-override (an explicit override always wins). Refused loudly against a non-SQLite/D1 source. See ADR-0144."`
+
 	DryRun bool `help:"Read the source schema and print the migration plan without applying changes." short:"n"`
 
 	Resume      bool   `help:"Resume a previously-failed migration. State is read from sluice_migrate_state on the target." short:"r"`
@@ -261,6 +263,13 @@ func (m *MigrateCmd) Run(g *Globals) error {
 	target, err := resolveEngine(m.TargetDriver)
 	if err != nil {
 		return fmt.Errorf("--target-driver: %w", err)
+	}
+
+	// --infer-types is SQLite/D1-only (ADR-0144). Refuse loudly here — before
+	// any DSN dialing — against any other source; richly-typed sources (MySQL/
+	// PG) already carry the type info, so inference there is risk with no gain.
+	if m.InferTypes && source.Name() != "sqlite" && source.Name() != "d1" {
+		return errors.New("--infer-types is only supported for SQLite/D1 sources")
 	}
 
 	// CLI-side mutual exclusion: catching this here means the
@@ -360,6 +369,7 @@ func (m *MigrateCmd) Run(g *Globals) error {
 		DryRun:                m.DryRun,
 		Mappings:              mappings,
 		ExpressionMappings:    exprMappings,
+		InferTypes:            m.InferTypes,
 		Filter:                filter,
 		DatabaseFilter:        databaseFilter,
 		AllDatabases:          allNS,
