@@ -860,3 +860,138 @@ func TestMigrate_SQLiteNonPortableGeneratedToPostgres(t *testing.T) {
 		t.Errorf("error = %v; want it to name the rejected strftime() (carried verbatim, target-rejected)", err)
 	}
 }
+
+// TestMigrate_SQLiteColumnDefaultToPostgres pins D1/SQLite robustness Chunk A:
+// a SQLite source with a SQLite-specific column DEFAULT no longer aborts the
+// ENTIRE migration at create-tables. The headline case is the Flyway/Goose
+// history-table shape `installed_on TEXT NOT NULL DEFAULT (datetime('now'))`,
+// which pre-fix failed PG CREATE TABLE with `function datetime(unknown) does
+// not exist` — so NO data loaded for ANY table.
+//
+// This proves both halves of the fix together:
+//
+//   - a PORTABLE SQLite default (datetime('now')) translates to a real PG
+//     DEFAULT (CURRENT_TIMESTAMP): CREATE TABLE succeeds and an insert that
+//     omits the column gets a server-supplied timestamp; and
+//   - a NON-PORTABLE SQLite default (julianday('now')) is DROPPED (the target
+//     column has NO DEFAULT) with a loud warn — the migration COMPLETES
+//     instead of aborting, the migrated rows (which carry explicit values)
+//     land intact, and an insert that omits the column simply gets NULL.
+func TestMigrate_SQLiteColumnDefaultToPostgres(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "defaults.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open sqlite seed: %v", err)
+	}
+	stmts := []string{
+		// Flyway/Goose-shaped history table: the portable datetime('now')
+		// default on a NOT NULL TEXT column.
+		`CREATE TABLE flyway_schema_history (
+			installed_rank INTEGER PRIMARY KEY,
+			description    TEXT NOT NULL,
+			installed_on   TEXT NOT NULL DEFAULT (datetime('now'))
+		)`,
+		`INSERT INTO flyway_schema_history (installed_rank, description, installed_on)
+			VALUES (1, 'baseline', '2024-01-02 03:04:05')`,
+		// A non-portable default on a NULLABLE column so the post-migrate
+		// insert can demonstrate the no-default (→ NULL) behaviour.
+		`CREATE TABLE audit (
+			id   INTEGER PRIMARY KEY,
+			jd   REAL DEFAULT (julianday('now')),
+			note TEXT
+		)`,
+		`INSERT INTO audit (id, jd, note) VALUES (1, 2460000.5, 'seed')`,
+	}
+	for _, s := range stmts {
+		if _, err := db.ExecContext(context.Background(), s); err != nil {
+			t.Fatalf("seed exec: %v", err)
+		}
+	}
+	_ = db.Close()
+
+	_, pgTarget, pgCleanup := startPostgres(t)
+	defer pgCleanup()
+	sqliteEng, _ := engines.Get("sqlite")
+	pgEng, _ := engines.Get("postgres")
+	mig := &Migrator{Source: sqliteEng, Target: pgEng, SourceDSN: path, TargetDSN: pgTarget}
+
+	// The whole point of Chunk A: this Run aborted at CREATE TABLE before the
+	// fix (datetime(unknown) does not exist), loading NO data for ANY table.
+	if err := mig.Run(ctx2min(t)); err != nil {
+		t.Fatalf("Migrator.Run (SQLite column-default→PG): %v", err)
+	}
+
+	pg, err := sql.Open("pgx", pgTarget)
+	if err != nil {
+		t.Fatalf("open pg: %v", err)
+	}
+	defer func() { _ = pg.Close() }()
+	ctx := ctx2min(t)
+
+	// 1. The portable default landed as a real PG DEFAULT referencing
+	//    CURRENT_TIMESTAMP (the translated keyword), not the SQLite spelling.
+	var installedDefault sql.NullString
+	if err := pg.QueryRowContext(ctx,
+		`SELECT column_default FROM information_schema.columns
+		 WHERE table_name = 'flyway_schema_history' AND column_name = 'installed_on'`).Scan(&installedDefault); err != nil {
+		t.Fatalf("query installed_on default: %v", err)
+	}
+	if !installedDefault.Valid || !strings.Contains(strings.ToUpper(installedDefault.String), "CURRENT_TIMESTAMP") {
+		t.Errorf("installed_on column_default = %#v; want a CURRENT_TIMESTAMP default (portable translation)", installedDefault)
+	}
+
+	// 2. Insert omitting installed_on → the server default supplies a value.
+	if _, err := pg.ExecContext(ctx,
+		`INSERT INTO flyway_schema_history (installed_rank, description) VALUES (2, 'second')`); err != nil {
+		t.Fatalf("insert relying on translated default: %v", err)
+	}
+	var installedOn sql.NullString
+	if err := pg.QueryRowContext(ctx,
+		`SELECT installed_on FROM flyway_schema_history WHERE installed_rank = 2`).Scan(&installedOn); err != nil {
+		t.Fatalf("select inserted installed_on: %v", err)
+	}
+	if !installedOn.Valid || installedOn.String == "" {
+		t.Errorf("inserted installed_on = %#v; want a non-empty server-supplied timestamp", installedOn)
+	}
+	// The migrated row's explicit value carried unchanged.
+	var baseline string
+	if err := pg.QueryRowContext(ctx,
+		`SELECT installed_on FROM flyway_schema_history WHERE installed_rank = 1`).Scan(&baseline); err != nil {
+		t.Fatalf("select baseline installed_on: %v", err)
+	}
+	if baseline != "2024-01-02 03:04:05" {
+		t.Errorf("baseline installed_on = %q; want the carried '2024-01-02 03:04:05'", baseline)
+	}
+
+	// 3. The non-portable default was DROPPED: the target column has NO
+	//    DEFAULT, yet the table created and its row migrated.
+	var auditDefault sql.NullString
+	if err := pg.QueryRowContext(ctx,
+		`SELECT column_default FROM information_schema.columns
+		 WHERE table_name = 'audit' AND column_name = 'jd'`).Scan(&auditDefault); err != nil {
+		t.Fatalf("query audit.jd default: %v", err)
+	}
+	if auditDefault.Valid {
+		t.Errorf("audit.jd column_default = %q; want NULL (non-portable julianday default dropped)", auditDefault.String)
+	}
+	// The migrated row's explicit value carried.
+	var jd float64
+	if err := pg.QueryRowContext(ctx,
+		`SELECT jd FROM audit WHERE id = 1`).Scan(&jd); err != nil {
+		t.Fatalf("select migrated audit.jd: %v", err)
+	}
+	if jd != 2460000.5 {
+		t.Errorf("audit.jd (migrated) = %v; want 2460000.5", jd)
+	}
+	// Insert omitting jd → NULL (no default to supply a value).
+	if _, err := pg.ExecContext(ctx, `INSERT INTO audit (id, note) VALUES (2, 'no-default')`); err != nil {
+		t.Fatalf("insert omitting dropped-default column: %v", err)
+	}
+	var jd2 sql.NullFloat64
+	if err := pg.QueryRowContext(ctx, `SELECT jd FROM audit WHERE id = 2`).Scan(&jd2); err != nil {
+		t.Fatalf("select audit.jd id=2: %v", err)
+	}
+	if jd2.Valid {
+		t.Errorf("audit.jd id=2 = %v; want NULL (column has no DEFAULT)", jd2.Float64)
+	}
+}

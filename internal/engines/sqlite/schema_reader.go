@@ -512,15 +512,19 @@ func parseFKAction(s string) ir.FKAction {
 //   - anything else (CURRENT_TIMESTAMP, function calls, (expr), x'..') →
 //     DefaultExpression tagged dialect "sqlite"
 //
-// A DefaultExpression tagged "sqlite" is run through the target writer's
-// cross-dialect default translator at CREATE TABLE time: portable spellings
-// (CURRENT_TIMESTAMP) emit correctly, while a SQLite-only function
-// (julianday(...), etc.) passes through and the target parser rejects it
-// LOUDLY at CREATE TABLE — never a silently-dropped default. (A SQLite
-// expression the translator mis-rewrites into valid-but-different target SQL
-// is a residual schema-fidelity edge, NOT data loss: DEFAULTs affect only
-// post-migration inserts, never the migrated rows, which are inserted with
-// explicit values.) A full SQLite→target default translator is deferred.
+// A DefaultExpression tagged "sqlite" is handled by the target writer at
+// CREATE TABLE time. The Postgres writer (D1/SQLite robustness Chunk A)
+// translates the small portable set of "current instant" spellings
+// (datetime('now')/CURRENT_TIMESTAMP → CURRENT_TIMESTAMP, date('now')/
+// CURRENT_DATE, time('now')/CURRENT_TIME) and DROPS any other SQLite-only
+// expression (julianday(...), strftime(...), the double-quoted-string
+// misfeature, …) with a LOUD per-column warn naming the table+column —
+// never emitted verbatim (which aborted the whole migration at CREATE
+// TABLE) and never silently dropped. The MySQL target still emits the
+// expression verbatim and relies on its parser rejecting a non-portable
+// default loudly. (A dropped DEFAULT is schema metadata, NOT data loss:
+// DEFAULTs affect only post-migration inserts, never the migrated rows,
+// which are inserted with explicit values.)
 func parseDefault(dflt sql.NullString) ir.DefaultValue {
 	if !dflt.Valid {
 		return ir.DefaultNone{}

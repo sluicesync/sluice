@@ -64,10 +64,26 @@ func TestWriterDialectGuard_SQLiteVerbatim(t *testing.T) {
 	}
 }
 
+// guardCol is the throwaway column context translateDefaultExpr now takes
+// (it carries table+column only for the SQLite loud-drop warn message).
+var guardCol = &ir.Column{Name: "c"}
+
+// guardDefault drives translateDefaultExpr with the throwaway table/col
+// context and returns its (body, emit?) pair.
+func guardDefault(d ir.DefaultExpression, opts emitOpts) (string, bool) {
+	return translateDefaultExpr(nil, guardCol, d, opts)
+}
+
 // TestWriterDialectGuard_DefaultExpr_PG extends the guard to the DEFAULT-
-// expression dispatch (translateDefaultExpr): a "sqlite" / "" / unknown
-// DEFAULT body emits VERBATIM (never through translateExprForPG), a "mysql"
-// body still translates, and the bitLiteralDialect special-case arm is intact.
+// expression dispatch (translateDefaultExpr): an "" / unknown DEFAULT body
+// emits VERBATIM (never through translateExprForPG), a "mysql" body still
+// translates, and the bitLiteralDialect special-case arm is intact.
+//
+// "sqlite" is the exception (D1/SQLite robustness Chunk A): it is NOT
+// verbatim — the portable "current instant" spellings translate to PG
+// keywords and every other SQLite-only expression is DROPPED with a loud
+// warn (asserted in TestWriterDialectGuard_DefaultExpr_SQLite below). It
+// is still never fed through the MySQL→PG translator.
 func TestWriterDialectGuard_DefaultExpr_PG(t *testing.T) {
 	opts := emitOpts{}
 
@@ -77,13 +93,15 @@ func TestWriterDialectGuard_DefaultExpr_PG(t *testing.T) {
 		wantVerbat  bool
 		mustContain string
 	}{
-		{"sqlite", "sqlite", true, ""},
 		{"empty", "", true, ""},
 		{"unknown", "duckdb", true, ""},
 		{"mysql_translates", "mysql", false, "COALESCE"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := translateDefaultExpr(ir.DefaultExpression{Expr: guardBodyMySQL, Dialect: tc.dialect}, opts)
+			got, ok := guardDefault(ir.DefaultExpression{Expr: guardBodyMySQL, Dialect: tc.dialect}, opts)
+			if !ok {
+				t.Fatalf("default[%s] ok=false; want it emitted", tc.name)
+			}
 			if tc.wantVerbat {
 				if got != guardBodyMySQL {
 					t.Errorf("default[%s] = %q; want VERBATIM %q (translator must not run)", tc.name, got, guardBodyMySQL)
@@ -96,13 +114,34 @@ func TestWriterDialectGuard_DefaultExpr_PG(t *testing.T) {
 
 	// The bit-literal arm survives (it only ever applies to defaults): MySQL
 	// b'…' → PG B'…'.
-	if got := translateDefaultExpr(ir.DefaultExpression{Expr: "b'101'", Dialect: bitLiteralDialect}, opts); got != "B'101'" {
-		t.Errorf("bit-literal default = %q; want B'101' (bit arm must stay intact)", got)
+	if got, ok := guardDefault(ir.DefaultExpression{Expr: "b'101'", Dialect: bitLiteralDialect}, opts); !ok || got != "B'101'" {
+		t.Errorf("bit-literal default = (%q, %v); want (B'101', true) (bit arm must stay intact)", got, ok)
+	}
+}
+
+// TestWriterDialectGuard_DefaultExpr_SQLite pins the SQLite DEFAULT dispatch
+// (Chunk A): portable spellings translate to PG keywords; non-portable
+// SQLite-only bodies — including the double-quoted-string misfeature that
+// used to be the silent-corruption case — are DROPPED (ok=false), never fed
+// through the MySQL→PG translator and never emitted verbatim.
+func TestWriterDialectGuard_DefaultExpr_SQLite(t *testing.T) {
+	opts := emitOpts{}
+
+	if got, ok := guardDefault(ir.DefaultExpression{Expr: "datetime('now')", Dialect: "sqlite"}, opts); !ok || got != "CURRENT_TIMESTAMP" {
+		t.Errorf("sqlite portable default = (%q, %v); want (CURRENT_TIMESTAMP, true)", got, ok)
 	}
 
-	// The concrete silent-corruption case: SQLite's double-quoted-string
-	// misfeature DEFAULT "draft" must emit VERBATIM, never be rewritten.
-	if got := translateDefaultExpr(ir.DefaultExpression{Expr: `"draft"`, Dialect: "sqlite"}, opts); got != `"draft"` {
-		t.Errorf(`sqlite DEFAULT "draft" = %q; want it carried verbatim as "draft"`, got)
+	// The former silent-corruption case: DEFAULT "draft" (SQLite's double-
+	// quoted-string misfeature) is non-portable → dropped, NOT rewritten and
+	// NOT emitted verbatim into PG DDL.
+	if got, ok := guardDefault(ir.DefaultExpression{Expr: `"draft"`, Dialect: "sqlite"}, opts); ok || got != "" {
+		t.Errorf(`sqlite DEFAULT "draft" = (%q, %v); want ("", false) — dropped`, got, ok)
+	}
+
+	// The MySQL-marker body proves the MySQL→PG translator never runs on a
+	// SQLite default: it's non-portable here, so it drops (it must NOT become
+	// COALESCE).
+	if got, ok := guardDefault(ir.DefaultExpression{Expr: guardBodyMySQL, Dialect: "sqlite"}, opts); ok || got != "" {
+		t.Errorf("sqlite non-portable default = (%q, %v); want (\"\", false) — dropped, translator must not run", got, ok)
 	}
 }

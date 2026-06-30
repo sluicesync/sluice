@@ -696,11 +696,33 @@ func TestEmitDefault(t *testing.T) {
 			ir.DefaultExpression{Expr: "b'1111000011110000'", Dialect: "bit"},
 			"B'1111000011110000'", true,
 		},
+		// D1/SQLite robustness Chunk A: a portable SQLite default
+		// (datetime('now')) translates to the PG keyword instead of
+		// emitting verbatim (which aborted CREATE TABLE).
+		{
+			"sqlite portable: datetime('now') → CURRENT_TIMESTAMP",
+			ir.DefaultExpression{Expr: "datetime('now')", Dialect: "sqlite"},
+			"CURRENT_TIMESTAMP", true,
+		},
+		// A non-portable SQLite default (julianday) is DROPPED — no DEFAULT
+		// clause, ok=false — rather than emitted verbatim. (The loud warn
+		// fires; TestEmitDefault_SQLiteNonPortableWarns asserts it.)
+		{
+			"sqlite non-portable: julianday('now') drops (no DEFAULT)",
+			ir.DefaultExpression{Expr: "julianday('now')", Dialect: "sqlite"},
+			"", false,
+		},
+		// SQLite's double-quoted-string misfeature is non-portable → drop.
+		{
+			"sqlite non-portable: double-quoted \"draft\" drops",
+			ir.DefaultExpression{Expr: `"draft"`, Dialect: "sqlite"},
+			"", false,
+		},
 	}
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			got, ok := emitDefault(c.in, emitOpts{})
+			got, ok := emitDefault(nil, &ir.Column{Name: "col", Default: c.in}, emitOpts{})
 			if ok != c.wantEmit {
 				t.Errorf("emit flag = %v; want %v", ok, c.wantEmit)
 			}

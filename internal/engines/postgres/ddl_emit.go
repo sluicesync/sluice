@@ -354,8 +354,8 @@ func quoteSQLString(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
-// emitDefault renders a DEFAULT clause body for the given default
-// value. Returns ("", false) if no DEFAULT clause should be emitted.
+// emitDefault renders a DEFAULT clause body for column c. Returns
+// ("", false) if no DEFAULT clause should be emitted.
 //
 // For [ir.DefaultExpression] with a non-empty Dialect tag that doesn't
 // match this writer's dialect, the expression body is routed through
@@ -365,29 +365,38 @@ func quoteSQLString(s string) string {
 // Bugs 28/29/30; pre-fix the DEFAULT path was the only IR-expression
 // path that bypassed the translator (generated + CHECK + index already
 // routed through it).
-func emitDefault(d ir.DefaultValue, opts emitOpts) (string, bool) {
-	switch v := d.(type) {
+//
+// table and c are carried only so the SQLite-source loud-drop path
+// ([translateDefaultExpr]) can name the table+column it dropped a
+// non-portable DEFAULT from; table may be nil (the EmitColumnDef diff-
+// renderer call site passes nil for non-enum columns).
+func emitDefault(table *ir.Table, c *ir.Column, opts emitOpts) (string, bool) {
+	switch v := c.Default.(type) {
 	case nil, ir.DefaultNone:
 		return "", false
 	case ir.DefaultLiteral:
 		return quoteSQLString(v.Value), true
 	case ir.DefaultExpression:
-		return translateDefaultExpr(v, opts), true
+		return translateDefaultExpr(table, c, v, opts)
 	}
 	return "", false
 }
 
-// translateDefaultExpr returns the DEFAULT-expression body to emit,
-// applying the cross-dialect translation pass when the IR's Dialect
-// tag indicates a different source dialect. Same gating shape as
-// [translateGeneratedExpr] and [translateCheckExpr]; an empty / matching
-// dialect tag emits verbatim — same behaviour as before v0.11.3.
+// translateDefaultExpr returns the DEFAULT-expression body to emit and
+// whether a DEFAULT clause should be emitted at all, applying the cross-
+// dialect translation pass when the IR's Dialect tag indicates a different
+// source dialect. Same gating shape as [translateGeneratedExpr] and
+// [translateCheckExpr]; an empty / matching dialect tag emits verbatim —
+// same behaviour as before v0.11.3.
+//
+// The lone case that returns ok=false is a SQLite-source DEFAULT with no
+// portable Postgres form (see below); every other path returns ok=true.
 //
 // The DEFAULT-expression context doesn't carry table-level bool-column
 // information (defaults are evaluated per-row at INSERT time, not over
 // other column values), so the [ExprContext] passed to the translator
 // is the zero value — bool-idiom rewrites stay no-ops on this path.
-func translateDefaultExpr(d ir.DefaultExpression, opts emitOpts) string {
+func translateDefaultExpr(table *ir.Table, c *ir.Column, d ir.DefaultExpression, opts emitOpts) (string, bool) {
 	if d.Dialect == bitLiteralDialect {
 		// Bit-literal default on a bit(N) column (catalog Bug 62). The
 		// reader emits the MySQL spelling `b'…'`; PG's bit-string
@@ -398,18 +407,50 @@ func translateDefaultExpr(d ir.DefaultExpression, opts emitOpts) string {
 		// digits at the read boundary. This special-case arm is checked
 		// first so the dialect-guard below never sees it.
 		if strings.HasPrefix(d.Expr, "b'") {
-			return "B'" + d.Expr[2:]
+			return "B'" + d.Expr[2:], true
 		}
-		return d.Expr
+		return d.Expr, true
+	}
+	// SQLite-source DEFAULT (D1/SQLite migration robustness, Chunk A). A
+	// small, well-known set of portable SQLite "current instant" spellings
+	// (datetime('now'), CURRENT_TIMESTAMP, …) translate to the matching PG
+	// keyword; any other SQLite-only expression (julianday/strftime/
+	// unixepoch/arbitrary, the double-quoted-string misfeature like
+	// `"draft"`, …) is DROPPED with a loud warn rather than emitted
+	// verbatim. Emitting verbatim aborted the ENTIRE migration at CREATE
+	// TABLE — e.g. a Flyway/Goose history table's `installed_on TEXT NOT
+	// NULL DEFAULT (datetime('now'))` failed PG with `function
+	// datetime(unknown) does not exist`, and because create-tables failed
+	// NO data loaded for ANY table. A DEFAULT is non-data metadata (it
+	// only affects future inserts, never the migrated rows, which carry
+	// explicit values), so dropping it with a named, loud warning is far
+	// better than failing the whole migration — loud, never silent.
+	if d.Dialect == sqliteSourceDialect {
+		if pg, ok := translateSQLiteDefaultExpr(d.Expr); ok {
+			return pg, true
+		}
+		slog.Warn(
+			fmt.Sprintf(
+				"postgres: dropped non-portable SQLite DEFAULT on %s.%s "+
+					"(SQLite expression %q has no Postgres equivalent); the column has "+
+					"no DEFAULT on the target — set one explicitly if your application "+
+					"relies on it",
+				quoteIdent(tableNameForLog(table)), quoteIdent(c.Name), d.Expr,
+			),
+			slog.String("table", tableNameForLog(table)),
+			slog.String("column", c.Name),
+			slog.String("expression", d.Expr),
+		)
+		return "", false
 	}
 	// Translate ONLY from the one engine this writer's translator accepts
-	// (MySQL); self / untagged / SQLite / any unknown dialect emits verbatim
-	// (ADR-0133 §2). This closes the DEFAULT-path silent-mistranslate: a
-	// SQLite default like `"draft"` (SQLite's double-quoted-string misfeature)
-	// must NOT be fed through translateExprForPG — it now passes through and a
-	// non-portable default fails loudly at target DDL time instead.
+	// (MySQL); self / untagged / any unknown dialect emits verbatim
+	// (ADR-0133 §2). This closes the DEFAULT-path silent-mistranslate for
+	// any other source: a non-MySQL default must NOT be fed through
+	// translateExprForPG — it passes through and a non-portable default
+	// fails loudly at target DDL time instead.
 	if d.Dialect != translatableSourceDialect {
-		return d.Expr
+		return d.Expr, true
 	}
 	// Cross-dialect DEFAULT body (Bug 64, PG side). Before ADR-0045
 	// this arm translated operator/function spellings but, unlike the
@@ -421,7 +462,7 @@ func translateDefaultExpr(d ir.DefaultExpression, opts emitOpts) string {
 	// (and the bit-literal special case) returned above unchanged.
 	return requotePGReservedIdents(
 		translateExprForPG(d.Expr, ExprContext{EnabledPGExtensions: opts.EnabledExtensions}),
-	)
+	), true
 }
 
 // bitLiteralDialect mirrors the MySQL reader's bit-literal dialect tag
@@ -614,7 +655,7 @@ func emitColumnDef(table *ir.Table, c *ir.Column, opts emitOpts) (string, error)
 	// Default = DefaultNone from the schema reader, so emitDefault
 	// returns ok=false and the clause is skipped naturally; no
 	// special case needed here.
-	if dflt, ok := emitDefault(c.Default, opts); ok {
+	if dflt, ok := emitDefault(table, c, opts); ok {
 		sb.WriteString(" DEFAULT ")
 		// SET columns translate the comma-separated MySQL literal
 		// to a TEXT[] array literal so the source DEFAULT survives
