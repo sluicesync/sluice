@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,6 +22,7 @@ import (
 	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/engines/mysql"
+	"sluicesync.dev/sluice/internal/engines/sqlite"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/notify"
@@ -198,6 +200,10 @@ type MigrateCmd struct {
 
 	InferTypes bool `help:"SQLite/D1 source only: promote conservatively-typed columns to richer Postgres types (boolean, timestamptz/timestamp, jsonb, uuid) — but ONLY after exhaustively validating that every non-NULL value conforms (a name-hint like is_*/created_at/*_json/*_id selects a candidate; the data validation is the gate). A column with a single non-conforming value (e.g. a '*_id' holding 'cus_abc123') is kept at its safe type and reported. Off by default (conservative-and-lossless mapping). Composes with --type-override (an explicit override always wins). Refused loudly against a non-SQLite/D1 source. See ADR-0144."`
 
+	StageLocal bool `help:"Cloudflare D1 source only: first replicate the live D1 database into a local SQLite file (byte-faithful — exact storage classes, integers > 2^53 included), then run the whole migrate against that file. Sidesteps D1's HTTP query limits (the per-query CPU ceiling and the LIKE/GLOB pattern-complexity limit that otherwise block --infer-types on real data), so validation and the bulk read run locally at full speed. Auto-engaged when --infer-types is set against a D1 source (D1 rejects the validation patterns on the direct path); set explicitly to stage without inference. The staged file is created in the system temp dir and removed when the migrate finishes."`
+
+	NoStageLocal bool `help:"Disable the automatic local staging that --infer-types triggers for a Cloudflare D1 source — run --infer-types directly against the live D1 instead. Off by default; use only if you accept that D1's per-query CPU/pattern limits may abort the validation. Mutually exclusive with --stage-local." name:"no-stage-local"`
+
 	DryRun bool `help:"Read the source schema and print the migration plan without applying changes." short:"n"`
 
 	Resume      bool   `help:"Resume a previously-failed migration. State is read from sluice_migrate_state on the target." short:"r"`
@@ -250,6 +256,26 @@ type MigrateCmd struct {
 }
 
 // Run implements the migrate subcommand.
+// stageD1Source replicates the live Cloudflare D1 database named by d1DSN into a
+// temp-dir SQLite file (Strategy A) and returns the file path plus a cleanup
+// func that removes the temp dir. The migrate then runs against the local file,
+// sidestepping D1's HTTP query CPU/pattern limits. Used by `migrate --stage-local`.
+func stageD1Source(ctx context.Context, d1DSN string) (path string, cleanup func(), err error) {
+	dir, err := os.MkdirTemp("", "sluice-d1-stage-")
+	if err != nil {
+		return "", nil, fmt.Errorf("--stage-local: create temp dir: %w", err)
+	}
+	cleanup = func() { _ = os.RemoveAll(dir) }
+	path = filepath.Join(dir, "d1-stage.db")
+	slog.InfoContext(ctx, "stage-local: replicating live D1 into a local SQLite file",
+		slog.String("dest", path))
+	if err := sqlite.StageD1ToLocalFile(ctx, d1DSN, path, slog.Default()); err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("--stage-local: %w", err)
+	}
+	return path, cleanup, nil
+}
+
 func (m *MigrateCmd) Run(g *Globals) error {
 	cfg, err := config.Load(g.Config)
 	if err != nil {
@@ -270,6 +296,41 @@ func (m *MigrateCmd) Run(g *Globals) error {
 	// PG) already carry the type info, so inference there is risk with no gain.
 	if m.InferTypes && source.Name() != "sqlite" && source.Name() != "d1" {
 		return errors.New("--infer-types is only supported for SQLite/D1 sources")
+	}
+
+	// Local staging (Strategy A, ADR-0145): replicate the live D1 into a local
+	// SQLite file up front, then migrate from that file via the `sqlite` engine.
+	// This runs before any other source dialing so the rest of Run operates on
+	// the local file (and --infer-types validates against modernc, sidestepping
+	// D1's HTTP query CPU/pattern limits). Engaged when --stage-local is set OR
+	// auto-engaged for --infer-types against a D1 source (the direct path is
+	// rejected by D1's LIKE/GLOB pattern-complexity limit), unless opted out with
+	// --no-stage-local. Both flags are D1-only.
+	if m.StageLocal && m.NoStageLocal {
+		return errors.New("--stage-local and --no-stage-local are mutually exclusive")
+	}
+	if m.StageLocal && source.Name() != "d1" {
+		return errors.New("--stage-local is only supported for a Cloudflare D1 source (--source-driver d1)")
+	}
+	autoStage := m.InferTypes && source.Name() == "d1" && !m.StageLocal && !m.NoStageLocal
+	if (m.StageLocal || autoStage) && source.Name() == "d1" {
+		if autoStage {
+			slog.Warn("--infer-types on a live Cloudflare D1 requires local staging — " +
+				"D1 rejects the rich-type validation patterns (error code 7500). Replicating the " +
+				"database to a local SQLite file first; pass --no-stage-local to use the direct path instead.")
+		}
+		staged, cleanup, err := stageD1Source(context.Background(), m.Source)
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+		sqliteSource, err := resolveEngine("sqlite")
+		if err != nil {
+			return err
+		}
+		source = sqliteSource
+		m.SourceDriver = "sqlite"
+		m.Source = staged
 	}
 
 	// CLI-side mutual exclusion: catching this here means the

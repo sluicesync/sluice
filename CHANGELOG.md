@@ -4,6 +4,16 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.167] - 2026-06-30
+
+### Fixed
+
+- **`--infer-types` against a live Cloudflare D1 source now works, via automatic lossless local staging (ADR-0145).** Live-D1 testing surfaced that `--infer-types` (v0.99.166) aborts against a real `--source-driver d1` source: D1's HTTP query API rejects the rich-type validation queries with `HTTP 400 code 7500 "LIKE or GLOB pattern too complex"` on the first temporal (`*_at`) or UUID (`*_uuid`) candidate — the conformance checks use long character-class `GLOB` patterns (the UUID pattern is ~356 chars) that exceed D1's SQLite pattern-complexity limit. The failure is **size-independent** (it fires on a 1,750-row table with pristine data) and was invisible until now because every test ran `--infer-types` against local `modernc.org/sqlite`, which uses the permissive default pattern limit; live D1 with a temporal/uuid candidate had never been exercised. (A second D1 limit — a per-query CPU ceiling, `HTTP 429 code 7429`, on an unbounded full-table validation scan over a multi-GB table — is closed by the same fix.) **No data was ever at risk** — the failure is a loud abort, and the conservative default mapping (`INTEGER`→`bigint`, `TEXT`→`text`) was unaffected — but the feature's headline use case (graduating a clean D1 dataset to native Postgres types) was blocked.
+
+### Added
+
+- **`migrate --stage-local` (Cloudflare D1 source only): replicate the live D1 into a byte-faithful local SQLite file, then migrate from that file (ADR-0145).** Local SQLite has neither D1 limit, so validation and the bulk read run locally at full speed. The replica is **lossless** — unlike `wrangler d1 export` (which rounds integers > 2^53 through a JS double) — because it recreates each table from D1's verbatim `sqlite_master` DDL and copies every cell at its exact storage class via the same `CAST`/`typeof`/`hex` projection the ADR-0132 D1 reader uses: integers > 2^53, REALs, BLOBs, NULLs preserved exactly, generated columns recomputed from the DDL, explicit indexes recreated. Because the staged file carries the **original conservative SQLite types**, `--infer-types` sees exactly what it would on D1 and makes identical decisions. Staging **auto-engages** when `--infer-types` is set against a D1 source (with a loud notice — the direct path is structurally broken there); `--no-stage-local` opts out (accepting the direct-path limits), and an explicit `--stage-local` stages even without inference (e.g. for a faster local bulk read). Both flags are D1-only and mutually exclusive. A plain conservative D1 migrate (no `--infer-types`, no explicit `--stage-local`) is byte-for-byte unchanged — it still streams directly with no staging. The staged file lives in the system temp dir and is removed when the migrate finishes. Live-validated end-to-end on a real D1 (the control reproduces code 7500; `--stage-local` runs `--infer-types` to completion and lands every row byte-exact), and pinned byte-faithful on a modernc-backed mock across storage classes, integers > 2^53, BLOBs, NULLs, generated columns, WITHOUT ROWID, composite PK, and explicit indexes.
+
 ## [0.99.166] - 2026-06-29
 
 ### Added
