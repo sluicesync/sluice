@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.164] - 2026-06-29
+
+### Fixed
+
+- **A SQLite/D1 source's portable column DEFAULT functions now translate to Postgres, and a non-portable SQLite DEFAULT is dropped with a loud warning instead of aborting the whole migration.** Found in real D1→Postgres user testing: a table with a SQLite-specific default like `installed_on TEXT NOT NULL DEFAULT (datetime('now'))` (common in Flyway/Goose migration-history tables) made `sluice migrate` carry the expression verbatim to Postgres, where `CREATE TABLE` failed with `function datetime(unknown) does not exist` — and because that failure is in the create-tables phase, **the entire migration aborted and no data loaded for any table.** Now the Postgres writer recognizes the SQLite-source default dialect and (1) maps the small portable "current instant" set — `datetime('now')`/`CURRENT_TIMESTAMP` → `CURRENT_TIMESTAMP`, `date('now')`/`CURRENT_DATE` → `CURRENT_DATE`, `time('now')`/`CURRENT_TIME` → `CURRENT_TIME` (case-, whitespace-, and paren-tolerant, incl. SQLite's double-quoted `"now"` misfeature) — and (2) for any default outside that provably-portable set (`julianday(…)`, `strftime(…)`, `unixepoch(…)`, arbitrary expressions), emits the column with **no DEFAULT clause plus a loud `WARN` naming the table, column, and dropped expression**, rather than failing the CREATE. A DEFAULT is non-data metadata — it affects only future inserts, never the migrated rows (which carry explicit values) — so a loud drop is strictly better than aborting the run; this keeps sluice's loud-failure discipline (never silent) while letting the migration complete. Scoped to the SQLite-source → Postgres-target path; the MySQL-source default translator, the bit-literal path, and same-engine/untagged defaults are byte-for-byte unchanged. Pinned by a translation-map unit matrix (every portable form × case/whitespace/paren/quote variants, plus the non-portable set returning drop), emit-level tests (portable → `DEFAULT CURRENT_TIMESTAMP`; non-portable → no clause + the warn fires), and a SQLite→PG integration test (a `datetime('now')` default lands as `CURRENT_TIMESTAMP` and a `julianday('now')` default is dropped, with the migration completing in both cases).
+
 ## [0.99.163] - 2026-06-29
 
 ### Fixed
