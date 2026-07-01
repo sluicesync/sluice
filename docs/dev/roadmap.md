@@ -268,9 +268,9 @@ Estimated ~800-1500 LOC for v1 + ADR + integration tests, depending on which Tie
 
 1. **Determinism per stream-id.** Two different sluice sync streams over the same source produce *consistent* redactions for the same input — same hash key, same tokenize seed. Otherwise CDC apply would produce row-version drift.
 2. **Schema preview shows redactions.** `sluice schema preview` and `sluice schema diff` annotate redacted columns (`-- REDACTED via tokenize:email_format`) so operators see what they're agreeing to.
-3. **Verify modes downgrade gracefully.** `sluice verify --depth=count` is unaffected (row counts unchanged). `sluice verify --depth=sample` automatically excludes redacted columns from the row hash (otherwise it'd always fail by design).
+3. **Verify modes downgrade gracefully.** `sluice verify --depth=count` is unaffected (row counts unchanged). *(Design intent — **NOT shipped**: `verify` has no redaction awareness; `--depth=sample` hashes the full row, so a redacted target flags every redacted row as a mismatch by design. Verify a redacted target with `--depth=count`, or scope `--depth=sample --include-table` to non-redacted tables.)*
 4. **Generated-column behavior unchanged.** Redactions apply at the reader's IR-emit step, BEFORE the target's `GENERATED ALWAYS AS` recomputes. So a generated column on the target derives from the redacted inputs naturally.
-5. **Refuse to start without acknowledgment when no redactions declared.** Optional `--require-redactions` flag for the safety-conscious operator who wants the pipeline to refuse if they forgot to configure them.
+5. **Refuse to start without acknowledgment when no redactions declared.** Optional `--require-redactions` flag for the safety-conscious operator who wants the pipeline to refuse if they forgot to configure them. *(Design intent — **NOT shipped**; the audit line in (6) is the actual safeguard. Could still be added if demand appears.)*
 6. **Audit logging.** Single INFO line at stream start summarizing how many columns are redacted (`columns_redacted=12 strategies=[...]`).
 
 **Where redaction sits in the pipeline.** Bulk-copy reader → IR rows → redact → bulk-copy writer. CDC reader → decoded events → IR row → redact → applier. Migrate uses the same path. The redaction layer is a single typed function composed with the existing translation step; adds no new I/O.

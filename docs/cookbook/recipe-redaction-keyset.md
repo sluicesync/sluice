@@ -149,17 +149,23 @@ This is **load-bearing for CDC**: if a row's email gets hashed on
 stream-1's migrate AND later via stream-2's CDC apply, the value must
 match exactly or the row-versions diverge.
 
-## What CDC verification does with redacted columns
+## Verifying a redacted target
 
-`sluice verify --depth=sample` (the row-hash verifier) automatically
-**excludes redacted columns** from the row hash. Otherwise verify would
-always fail by design — the source row has `alice@example.com`, the
-target row has `5a8e91…`, the hashes don't match. The verifier knows
-which columns are redacted (from the same config) and computes the
-hash over the un-redacted columns only.
+`sluice verify` has **no redaction awareness** — don't expect it to
+"see through" redactions. `--depth=sample` (the row-hash verifier)
+hashes the full row content, so on a redacted migration it flags every
+redacted row as a mismatch *by design*: the source row has
+`alice@example.com`, the target row has `5a8e91…`, and the hashes don't
+match. (`--depth=sample` is also same-engine only — a cross-engine
+verify refuses it loudly.)
 
-`sluice verify --depth=count` is unaffected — row counts haven't
-changed.
+So to verify a redacted target:
+
+- Use **`sluice verify --depth=count`** — row counts are unchanged by
+  redaction, so a count verify is unaffected and confirms every row
+  made it across.
+- If you want row-level hashing, scope `--depth=sample` to the
+  **non-redacted** tables with `--include-table`.
 
 ## Common pitfalls
 
@@ -172,11 +178,13 @@ changed.
   streams load the same keyset rows. Operators sometimes
   inadvertently put a per-stream key in the file and then wonder why
   the surrogates differ between staging-1 and staging-2.
-- **Forgot `--require-redactions` in a safety-conscious deployment.**
-  Without the flag, an operator who forgot to declare any redactions
-  gets a fully-plaintext target (with one INFO line warning them).
-  Add `--require-redactions` to make sluice refuse-to-start when no
-  redactions are declared.
+- **Forgot to declare any redactions.** sluice does not refuse-to-start
+  on an empty redaction set — an operator who declared none gets a
+  fully-plaintext target. What sluice *does* give you: an audit line at
+  stream start summarizing the redaction scope (column count +
+  strategies), and `sluice schema preview` annotates each redacted
+  column in the DDL. Check both before a production run to confirm the
+  set you intended is actually in effect.
 
 ## What's NOT in this recipe
 
