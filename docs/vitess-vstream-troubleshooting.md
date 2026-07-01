@@ -241,9 +241,15 @@ failures, intermediate-firewall idle timeouts, edge-gateway
 throttling — manifest as the stream ending or pausing without
 events.
 
-Sluice sets `HeartbeatInterval: 5`s. Absence of any event for
-~10s means either the source is silent *and* heartbeats aren't
-reaching you (network broken), or the gRPC peer has gone silent.
+Sluice requests `HeartbeatInterval: 5`s, but the cadence you
+actually observe against real PlanetScale is coarser — heartbeat
+log lines land roughly every ~60s, and under a heavy throttle or a
+large-transaction stall the stream can go *fully silent* (no change
+events, no heartbeats) well past sluice's 45s progress window, up to
+vtgate's own ~10-minute throttle-liveness drop. So a brief absence of
+events is not by itself a broken network; it takes sustained total
+silence (minutes) — or the throttle WARN below — to tell a genuine
+network/peer failure apart from a throttle stall.
 
 **What you can do:**
 
@@ -280,7 +286,10 @@ Metrics from `docs/dev/design/sync-health-monitoring.md`:
   investigating; > 10 minutes = real incident.
 - **`sluice_seconds_since_last_event`**: distinguishes "source
   quiet" from "stream broken" only when combined with knowledge
-  of source write activity. Heartbeats keep this < 6s.
+  of source write activity. On real PlanetScale the heartbeat-log
+  cadence is ~60s (not the requested 5s), so on a healthy stream this
+  sits under ~60s; a throttle stall that withholds heartbeats makes
+  it climb without bound.
 - **`sluice_streamer_state`**: `streaming` → `stopping` /
   `stopped` without operator-issued `sync stop` is the loud
   signal. Wire alerting on this transition.
@@ -299,11 +308,18 @@ For a mid-stream throttle/idle stall (cause #2), watch for the
 rate-limited WARN `alive (heartbeats flowing) but NO change events
 for Ns` — it fires once per quiet spell when heartbeats keep
 arriving but no change events do. Pair it with `sluice_lag_seconds`
-climbing while `sluice_seconds_since_last_event` stays low (< 6s,
-heartbeats arriving): that combination is the throttle/idle
-signature, because vtgate strips the in-band `throttled` flag (see
-cause #2). A genuinely idle source produces the same WARN — check
-`SHOW VITESS_THROTTLED_APPS` on the primary to tell them apart.
+climbing while `sluice_seconds_since_last_event` stays comparatively
+low (heartbeats still arriving): that combination is the
+throttle/large-transaction signature, because vtgate strips the
+in-band `throttled` flag (see cause #2). On real PlanetScale a
+*genuinely idle* source does **not** fire this WARN — vtgate keeps
+emitting periodic VGTID/position events on an idle stream, which
+re-arm sluice's soft-idle timer, so mere idleness stays quiet; the
+WARN is specific to a stall that withholds change events while
+heartbeats continue. A replica-lag / threshold throttle often shows
+only the baseline sentinel in `SHOW VITESS_THROTTLED_APPS` (no
+explicit per-app deny), so treat the WARN plus climbing lag as the
+signature rather than expecting a named throttled app.
 
 ## Targeting a PlanetScale branch (control-table DDL needs an `admin`-role password)
 

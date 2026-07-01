@@ -121,6 +121,10 @@ Since that arc, the **v0.84 → v0.99 releases** widened the surface well beyond
 
 Cross-engine type translation handles the common surfaces (PG `UUID` / `INET` / `MACADDR` / `ARRAY` ↔ MySQL `CHAR(36)` / `VARCHAR` / `JSON`; MySQL `TINYINT(1)` ↔ PG `BOOLEAN`; MySQL `ENUM` / `SET` → PG enum / `TEXT[] + CHECK`; PostGIS `GEOMETRY` round-trips with SRID; many idioms in generated columns and `CHECK` constraints translate automatically — see [`docs/dev/translator-coverage.md`](docs/dev/translator-coverage.md)). When the default doesn't fit, `--type-override TABLE.COLUMN=TYPE` and `--expr-override TABLE.COLUMN=EXPR` cover one-off cases without writing a config file.
 
+### Same-engine copies take a faster path
+
+Cross-engine work flows through sluice's typed IR, where type translation, redaction, and value-fidelity checks live — every value decoded and re-encoded. On a *same-engine, no-transform* Postgres→Postgres copy there's nothing to translate, so sluice skips the round trip entirely and byte-pipes the native `COPY` stream source-to-target (the pgcopydb tactic, composed with parallel chunking — [ADR-0078](docs/adr/adr-0078-pg-pg-identity-passthrough-raw-copy.md)); MySQL→MySQL stays on the IR but writes through the native `LOAD DATA` loader with no translation to perform. This is *the same fidelity, less work* — not a more-exact copy. The Postgres fast lane engages only when a single auditable gate proves there's no transform to skip: add `--redact` / `--type-override` / a shard column, or hit an OID-sensitive type, and it falls back to the IR path automatically, per table.
+
 ### SQLite & Cloudflare D1
 
 | Engine name | Role | Notes |
