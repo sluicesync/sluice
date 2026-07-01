@@ -4,6 +4,24 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.169] - 2026-07-01
+
+### Added
+
+- **PlanetScale-Postgres target ownership advisory (soak finding F10).** On a Postgres target, `migrate` and `sync start` now emit a preflight `WARN` when the connection authenticates as an ephemeral PlanetScale `pscale_api_*` role. Every table sluice creates is **owned by the connecting role**, so if that ephemeral role is later deleted — or a *different* `pscale_api_*` role runs DDL against those tables — you hit ownership/permission errors (the new role isn't the owner, even though both inherit `postgres`). The WARN names the pitfall and the recovery paths: connect as the Default `postgres` role upfront (`pscale role reset-default`), or reassign after the fact (`pscale role reassign`, or the PlanetScale UI "Reassign objects", which works even for an expired role). Advisory only — it never refuses and never auto-reassigns ownership (auto-`ALTER … OWNER` is a privileged action the contain-Postgres-complexity tenet deliberately keeps out of sluice's hands). No-op on non-PostgreSQL targets and on the Default `postgres` role. Surfaced by a real PlanetScale-Postgres soak.
+
+### Fixed
+
+- **The MySQL→Postgres CDC applier no longer logs an applied-LSN parse failure on every apply (soak finding F2).** The Postgres applier's applied-LSN slot-ack feedback is a Postgres-*source* mechanism; against a MySQL / VStream source it received the source's JSON-array position token, tried to parse it as a Postgres LSN, and emitted `applied-LSN report skipped (parse failure)` at `DEBUG` on every single apply. It now recognizes the array-shaped (non-Postgres) token and no-ops silently, while a malformed Postgres-source token still surfaces the error (preserving genuine-corruption diagnostics). `DEBUG`-only log noise with no data-path effect — but it removes a persistent, misleading line from every MySQL→Postgres debug log.
+
+### Documentation
+
+- **New "same-engine copies take a faster path" section (README) and a "How sluice copies your data" guide (docs site)** explaining the two internal copy paths — the typed IR path (every cross-engine copy, and the home of type translation, redaction, and value-fidelity checks) versus the same-engine fast lane (Postgres→Postgres byte-pipes the native `COPY` stream per ADR-0078; MySQL→MySQL writes through the native `LOAD DATA` loader) — framed carefully as *the same fidelity, less work*, not a "more exact" copy, with the auditable gate that falls back to the IR path the moment any transform is present.
+- **Corrected the PlanetScale source-selection guidance.** The README implied a `*.connect.psdb.cloud` host auto-selects VStream; it does not — VStream requires `--source-driver planetscale`, and that host under `--source-driver mysql` gets binlog CDC with the Vitess `_vt_*` shadow tables auto-excluded.
+- **Corrected the VStream idle/heartbeat troubleshooting guidance (soak finding F1).** On real PlanetScale the heartbeat-log cadence is ~60s (not the requested 5s) and goes fully silent under a throttle / large-transaction stall, and a *genuinely idle* source does **not** fire the soft-idle WARN (vtgate's idle VGTIDs re-arm the timer) — so that WARN is a throttle/stall signature, not an idle one.
+- **Corrected redaction documentation drift.** `verify` has no redaction awareness (`--depth=sample` hashes the full row, so a redacted target must be verified with `--depth=count`), and `--require-redactions` is not a real flag — both claims were removed from the redaction cookbook recipe and annotated as not-shipped in the roadmap.
+- **Seven more docs-site guides** covering PII redaction, Postgres source preparation, encrypted backups, schema changes during a live sync, operating a sync fleet, PlanetScale & Vitess, and verify & reconcile.
+
 ## [0.99.168] - 2026-06-30
 
 ### Fixed
