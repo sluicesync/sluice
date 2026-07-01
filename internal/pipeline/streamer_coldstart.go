@@ -495,6 +495,10 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 		}
 	}
 
+	// PlanetScale-Postgres ownership advisory (soak finding F10) — WARN
+	// only, never blocks the stream. No-op on non-PG targets / Default role.
+	preflightTargetOwnershipAdvisory(ctx, rw)
+
 	return sw, rw, nil
 }
 

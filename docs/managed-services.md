@@ -60,6 +60,45 @@ in URI form (`postgresql://…?sslmode=verify-full`) and pgx accepts
 them as-is. No vendor-specific connection-string parameters are
 required.
 
+### Target table ownership — connect as a stable role
+
+On PlanetScale Postgres a *user-defined role* (name `pscale_api_*`,
+which *inherits* the `postgres` role) is distinct from the **Default
+role** (the actual `postgres` user). Whichever role sluice connects
+as **owns every table it creates on the target**, and a `pscale_api_*`
+role is ephemeral — so having your migrated tables owned by one is a
+latent hazard:
+
+- If that `pscale_api_*` role is later deleted, the tables' owner is
+  gone → ownership/permission problems.
+- If a *different* `pscale_api_*` role later runs DDL (`ALTER`, etc.)
+  against those tables, it hits permission errors — it isn't the
+  owner, even though both inherit `postgres`.
+
+**Recommendation: connect the sluice target as the Default `postgres`
+role**, so created tables are owned by a stable role. On PlanetScale
+you can make the Default role's password available with:
+
+```sh
+pscale role reset-default
+```
+
+sluice surfaces this rather than auto-handling it (the *contain
+Postgres complexity* tenet — it never silently `ALTER … OWNER`s your
+tables). When the target connection authenticates as a `pscale_api_*`
+role, `migrate` and `sync start` emit a preflight **WARN** naming the
+pitfall and the recovery paths below.
+
+**Already ran as a `pscale_api_*` role?** The ownership is recoverable
+after the fact — reassign the objects to a stable role with:
+
+```sh
+pscale role reassign
+```
+
+or use the PlanetScale UI (**Settings → Roles → "Reassign objects"**),
+which works even for a `pscale_api_*` role that has since expired.
+
 ### Verification suite
 
 Sluice has automated PlanetScale/Vitess coverage behind a `psverify`

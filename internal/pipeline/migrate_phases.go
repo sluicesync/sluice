@@ -336,6 +336,13 @@ func (m *Migrator) phasePreflightTarget(ctx context.Context, rc resumeContext, s
 		return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
 	}
 
+	// PlanetScale-Postgres ownership advisory (soak finding F10). Advisory-
+	// only (WARN, never a refusal): if the target connects as an ephemeral
+	// pscale_api_* role, every created table is owned by it — a recoverable
+	// but easily-missed hazard. No-op on non-PG targets and on the Default
+	// postgres role.
+	preflightTargetOwnershipAdvisory(ctx, rw)
+
 	// Stale-backend preflight (connection-resilience Phase 2, item 2).
 	// Detect sluice's OWN orphaned backends on the target — a hard-killed
 	// prior run whose server-side COPY backend still holds a target-table

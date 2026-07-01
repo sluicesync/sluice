@@ -95,7 +95,7 @@ sluice is built around three product surfaces, each independently runnable:
 | **Diff** a target against what sluice would produce | `sluice schema diff` |
 | **Verify** that every row made it across | `sluice verify` |
 | **Probe** a running sync's freshness against a staleness threshold | `sluice sync health` |
-| Do all of the above against **PlanetScale** | Same commands; PS-MySQL uses VStream automatically when the DSN host matches `*.connect.psdb.cloud` |
+| Do all of the above against **PlanetScale** | Same commands; select `--source-driver planetscale` for VStream CDC. A `*.connect.psdb.cloud` host under `--source-driver mysql` also works — via binlog CDC — with the Vitess `_vt_*` shadow tables auto-excluded |
 
 ### The four enterprise-class features that landed in v0.80.0 – v0.83.0
 
