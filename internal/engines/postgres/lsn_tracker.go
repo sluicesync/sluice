@@ -112,6 +112,24 @@ func lsnFromPositionToken(token string) (pglogrepl.LSN, error) {
 	if token == "" {
 		return 0, nil
 	}
+	// A non-Postgres source (MySQL / VStream) writes its position as a JSON
+	// array of per-shard GTIDs, never a pgPos object. The applied-LSN /
+	// slot-ack feedback this feeds is a Postgres-source-only mechanism, so
+	// such a token simply carries no LSN to report. Recognize the array
+	// shape and no-op silently rather than letting decodePGPos surface it as
+	// a parse *failure* the commit path then logs on every single apply
+	// (soak finding F2 — MySQL→PG DEBUG log spam). A malformed pgPos *object*
+	// token still falls through to the error path below, preserving that
+	// genuine-corruption diagnostic for a Postgres source.
+	for i := 0; i < len(token); i++ {
+		switch token[i] {
+		case ' ', '\t', '\n', '\r':
+			continue
+		case '[':
+			return 0, nil
+		}
+		break
+	}
 	decoded, ok, err := decodePGPos(ir.Position{Engine: engineNamePostgres, Token: token})
 	if err != nil {
 		return 0, err

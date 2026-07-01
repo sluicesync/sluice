@@ -179,6 +179,34 @@ func TestLSNFromPositionToken_MalformedReturnsError(t *testing.T) {
 	}
 }
 
+// TestLSNFromPositionToken_NonPGArrayTokenIsSilentZero pins soak finding
+// F2: a MySQL / VStream source writes its CDC position as a JSON array of
+// per-shard GTIDs. Fed to the Postgres applier's applied-LSN tracker (a
+// Postgres-source-only mechanism), such a token carries no LSN and must
+// no-op silently — not surface a parse error the commit path then logs on
+// every single apply. Leading whitespace before the '[' is tolerated.
+func TestLSNFromPositionToken_NonPGArrayTokenIsSilentZero(t *testing.T) {
+	for _, tok := range []string{
+		`[{"keyspace":"commerce","shard":"-","gtid":"MySQL56/a1b2:1-100"}]`,
+		`[]`,
+		"  \n\t[{\"shard\":\"-80\"}]",
+	} {
+		lsn, err := lsnFromPositionToken(tok)
+		if err != nil {
+			t.Errorf("array token %q: unexpected error: %v", tok, err)
+		}
+		if lsn != 0 {
+			t.Errorf("array token %q: lsn = %v; want 0", tok, lsn)
+		}
+	}
+	// A malformed pgPos *object* token (not an array) still errors —
+	// the guard is array-shape-specific, preserving genuine-corruption
+	// diagnostics for a real Postgres source.
+	if _, err := lsnFromPositionToken(`{"slot":"s","lsn":"nonsense"}`); err == nil {
+		t.Error("expected error for malformed object token")
+	}
+}
+
 // TestLSNFromPositionToken_PositionShape pins the helper to the
 // canonical position shape so a future change to pgPos's wire
 // format is caught here.
