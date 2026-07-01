@@ -121,7 +121,7 @@ v1.1 re-land note: the first v1.1 land regressed broadly (relaxing pinned-reader
 
 **Gotchas.** (A) is the better UX (one command, like pgcopydb `--follow`) but couples the fast paths to the checkpoint machinery; (B) is lower-risk (reuses backup-chain handoff) but is a two-command workflow and needs `migrate` to capture+persist the consistent CDC start position (it takes the snapshot but may not persist a resumable CDC position today — verify). Either way: the snapshot/CDC boundary must stay gap-free (the FTWRL / exported-snapshot boundary discipline from the v0.99.16 silent-loss fix applies). `-race` chunk. Design-pass (Plan agent) before building; own ADR.
 
-### 3e. Parallel writer fan-out on the VStream/CDC snapshot cold-start copy (the PS-MySQL throughput gap) — *ADR-0097 written; implementation in PR (do NOT tag until `-race` green)*
+### 3e. Parallel writer fan-out on the VStream/CDC snapshot cold-start copy (the PS-MySQL throughput gap) — *SHIPPED v0.99.65 (ADR-0097; `ir.ParallelIdempotentCopyWriter`, `internal/pipeline/copy_fanout.go`)*
 
 **Why.** Item 3d brought the FAST parallel cold-start to the `sync` path, but only for sources whose snapshot can be PK-range-chunked on the READ side (exported-snapshot PG, raw passthrough). The **VStream/PlanetScale-MySQL** cold-start cannot: vtgate streams the snapshot down one logical channel (no arbitrary range-`SELECT`), and PlanetScale blocks `LOAD DATA LOCAL INFILE`, so the writer falls back to a SINGLE cross-region-RTT-bound batched-`INSERT` connection (~13 GB/h). A live experiment proved N independent `sync` processes scaled near-linearly (N=3 → ~128 GB/h), beating PG single-stream COPY at N≥3–4.
 
@@ -131,7 +131,7 @@ v1.1 re-land note: the first v1.1 land regressed broadly (relaxing pinned-reader
 
 ---
 
-### 3f. Auto-shard-aware VStream cold-copy resume (bounded-memory resume of a large multi-table keyspace) — *ADR-0098 written; implementation in PR (do NOT tag until `-race` green)*
+### 3f. Auto-shard-aware VStream cold-copy resume (bounded-memory resume of a large multi-table keyspace) — *SHIPPED v0.99.67 (ADR-0098; `resolveResumeAutoShard`/`reopenForTableSeeded`, `cdc_vstream_copy_concurrency_pump.go`)*
 
 **Why.** ADR-0095 (item 3, v0.99.62) made the VStream cold-copy auto-shard by table (one single-table COPY at a time, bounded memory) — but only on a FRESH cold-start (`start == nil`). A `--resume` (`OpenSnapshotStreamFromPosition`, a position carrying the ADR-0072 `TablePKs` cursor) fell back to the LEGACY single keyspace-wide interleaved stream → ADR-0071 buffer-cap **crash-loop**. Found live (BUG-CATALOG Bug 156): a resumed 28-table / 302 GB keyspace copy crash-looped (`table "binary_blobs" would buffer … exceeding --max-buffer-bytes … while "audit_trail" is being copied`); loud but FATAL-for-resume — the interleaved path can never make progress on a large keyspace, so resume of exactly the case auto-shard exists for was broken. ADR-0095 called this "a v1 limitation, not a correctness gap" — the live finding proves it is not benign.
 
@@ -250,7 +250,7 @@ Estimated ~800-1500 LOC for v1 + ADR + integration tests, depending on which Tie
 
 ---
 
-### 15. PII redaction during logical replication and migration (GitHub #24)
+### 15. PII redaction during logical replication and migration (GitHub #24) — *SHIPPED v0.53.0–v0.63.0 (Phases 1/2/4); only 15c (JSON-path) remains, demand-gated*
 
 **Why.** Common operator ask in the replication space: *"I want a copy of this production database, but without the PII."* Typical destinations: staging/dev environments seeded from production schema + realistic-shape data without exposing real users; analytics warehouses that aggregate but never identify individuals; cross-region / cross-tenancy moves where compliance (GDPR / CCPA / HIPAA) requires PII to stay in the source jurisdiction; vendor handoffs where a third-party data processor needs the schema + the data shape but not the PII. Today operators reach for separate tools (Tonic, Privacy Dynamics, Debezium SMTs, custom ETL); sluice could absorb the use case as a first-class feature since the IR-first row pipeline already passes every value through a typed transform stage. See [GitHub issue #24](https://github.com/sluicesync/sluice/issues/24) for the full motivation + comparable-products analysis.
 
