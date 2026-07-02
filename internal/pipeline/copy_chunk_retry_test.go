@@ -78,7 +78,7 @@ func TestAcquireChunkConn_RetriesOnSlotExhaustionThenSucceeds(t *testing.T) {
 	deps := &parallelBulkCopyDeps{source: eng, target: eng}
 	gate := zeroDelayGate(4, 10)
 
-	rdr, wr, release, err := acquireChunkConn(context.Background(), deps, gate, eng.IsConnectionSlotExhausted, 1)
+	rdr, wr, release, err := acquireChunkConn(context.Background(), deps, gate, eng.IsConnectionSlotExhausted, 1, "t")
 	if err != nil {
 		t.Fatalf("acquireChunkConn after retries: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestAcquireChunkConn_NonRetryableFailsLoudly(t *testing.T) {
 	deps := &parallelBulkCopyDeps{source: eng, target: eng}
 	gate := zeroDelayGate(4, 10)
 
-	_, _, _, err := acquireChunkConn(context.Background(), deps, gate, eng.IsConnectionSlotExhausted, 1)
+	_, _, _, err := acquireChunkConn(context.Background(), deps, gate, eng.IsConnectionSlotExhausted, 1, "t")
 	if err == nil {
 		t.Fatal("expected the non-retryable error to surface, got nil")
 	}
@@ -133,7 +133,7 @@ func TestAcquireChunkConn_GivesUpAfterBound(t *testing.T) {
 	deps := &parallelBulkCopyDeps{source: eng, target: eng}
 	gate := zeroDelayGate(8, 3)
 
-	_, _, _, err := acquireChunkConn(context.Background(), deps, gate, eng.IsConnectionSlotExhausted, 1)
+	_, _, _, err := acquireChunkConn(context.Background(), deps, gate, eng.IsConnectionSlotExhausted, 1, "t")
 	if err == nil {
 		t.Fatal("expected a give-up error on a permanently-exhausted target, got nil")
 	}

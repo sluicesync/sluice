@@ -653,7 +653,7 @@ func runChunks(
 				// no gate token to manage.
 				return copyChunk(gctx, rc, state, stateMu, primaryRows, primaryRW, table, pkCols, k, limit, redactor, shard, resuming, deps.forceColdStart, deps.rawCopyOK, deps.rawCopyFormat)
 			}
-			chunkRows, chunkRW, releaseConn, err := acquireChunkConn(gctx, deps, gate, classifySlotExhaustion, k)
+			chunkRows, chunkRW, releaseConn, err := acquireChunkConn(gctx, deps, gate, classifySlotExhaustion, k, table.Name)
 			if err != nil {
 				return err
 			}
@@ -666,72 +666,64 @@ func runChunks(
 
 // acquireChunkConn opens one source reader + one target writer for a
 // non-zero chunk, retrying under the Phase 2b adaptive backoff when the
-// open returns the connection-slot-exhaustion class (SQLSTATE 53300).
-// It takes a gate token before each open attempt (capping concurrently-
-// open connections) and returns a release function the caller defers to
-// close the connections and return the token.
+// open returns the connection-slot-exhaustion class (SQLSTATE 53300), and
+// (ADR-0146) under a bounded reconnect budget when the open hits a transient
+// connection drop. It takes a gate token before the open (capping
+// concurrently-open connections) and returns a release function the caller
+// defers to close the connections and return the token.
 //
-// Retry / double-copy safety: only a slot-exhaustion error on the OPEN
-// (which fails at ping, before any COPY/WriteRows) is retried; every
-// other error — bad DSN, permission denied, a real connection failure —
-// surfaces immediately and loudly. Because a 53300 fails before any rows
-// are written, a retry re-opens a fresh connection and re-runs the chunk
-// from its recorded cursor with zero risk of duplicate rows.
+// Retry / double-copy safety: an open failure — whether 53300 or a transient
+// drop — fails at reader-open or writer-open, BEFORE any COPY/WriteRows (see
+// openOneChunkConn, which closes any partial and returns (nil, nil, err)). So
+// a retry re-opens a fresh connection and re-runs the chunk from its recorded
+// chunk.LastPK cursor with zero risk of duplicate rows. Every other error —
+// bad DSN, permission denied, an unknown fault — surfaces immediately and
+// loudly. A slot-exhaustion that persists past the AIMD give-up bound, or a
+// transient that persists past the reconnect wall-clock/attempt budget,
+// surfaces a loud, bounded error — never an infinite spin.
 //
-// A slot-exhaustion that persists past the AIMD give-up bound surfaces a
-// loud, bounded errCopySlotsExhausted — never an infinite spin.
+// The retry loop itself lives in openChunkConnWithRetry (copy_chunk_open_
+// retry.go); this wrapper only manages the gate token and builds the closer.
 func acquireChunkConn(
 	ctx context.Context,
 	deps *parallelBulkCopyDeps,
 	gate *copyParallelismGate,
 	isSlotExhausted func(error) bool,
 	chunkIndex int,
+	tableName string,
 ) (ir.RowReader, ir.RowWriter, func(), error) {
 	if err := gate.acquire(ctx); err != nil {
 		return nil, nil, nil, err
 	}
-	// The token is held for the whole lifetime of this chunk's
-	// connections; release() returns it (or swallows it if a shrink
-	// retired it) when the caller's deferred releaseConn runs.
+	// The token is held for the whole lifetime of this chunk's connections
+	// (across every transient/slot retry — the same chunk keeps its budget
+	// slot); release() returns it (or swallows it if a shrink retired it)
+	// when the caller's deferred releaseConn runs, or on any error exit here.
 	release := func() { gate.release() }
 
-	for {
-		rdr, wr, err := openOneChunkConn(ctx, deps)
-		if err == nil {
-			closeConns := func() {
-				if wr != nil {
-					closeIf(wr)
-				}
-				if rdr != nil {
-					closeIf(rdr)
-				}
-				release()
-			}
-			return rdr, wr, closeConns, nil
-		}
-
-		// Non-retryable: surface loudly and immediately. Return the token
-		// so peers aren't starved while the errgroup unwinds.
-		if !isSlotExhausted(err) {
-			release()
-			return nil, nil, nil, fmt.Errorf("open connections for chunk %d: %w", chunkIndex, err)
-		}
-
-		// Slot exhaustion: shrink parallelism + back off, then retry the
-		// open. shrinkAndBackoff returns a give-up error once the AIMD
-		// bound is exhausted.
-		delay, giveErr := gate.shrinkAndBackoff(ctx, chunkIndex)
-		if giveErr != nil {
-			release()
-			return nil, nil, nil, giveErr
-		}
-		select {
-		case <-time.After(delay):
-		case <-ctx.Done():
-			release()
-			return nil, nil, nil, ctx.Err()
-		}
+	rdr, wr, err := openChunkConnWithRetry(
+		ctx, chunkIndex, tableName,
+		func(ctx context.Context) (ir.RowReader, ir.RowWriter, error) {
+			return openOneChunkConn(ctx, deps)
+		},
+		isSlotExhausted,
+		gate.shrinkAndBackoff,
+	)
+	if err != nil {
+		// Return the token so peers aren't starved while the errgroup unwinds.
+		release()
+		return nil, nil, nil, err
 	}
+	closeConns := func() {
+		if wr != nil {
+			closeIf(wr)
+		}
+		if rdr != nil {
+			closeIf(rdr)
+		}
+		release()
+	}
+	return rdr, wr, closeConns, nil
 }
 
 // openChunkReader mints the source-side reader for one parallel chunk/table
