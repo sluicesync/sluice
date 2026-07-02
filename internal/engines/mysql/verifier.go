@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 
@@ -24,17 +25,24 @@ const defaultCountChunkSize = 50000
 // ExactRowCount implements [ir.Verifier]. Returns the exact row count
 // for the given table.
 //
-// Two strategies:
+// On vtgate flavors (PlanetScale / Vitess — [Flavor.usesVStream]) the
+// PRIMARY path is [olapCount]: `SET workload='olap'` + `SELECT COUNT(*)`
+// on a dedicated connection. OLAP streams the scan, so it is not bound by
+// the OLTP max-statement-execution-time limit (MySQL errno 3024, ~900s)
+// that kills a plain count(*) over a large clustered index — and it works
+// for EVERY PK shape, closing the gap the single-integer-PK-only chunked
+// path leaves for composite/string/UUID/no-PK tables (ADR-0147). On any
+// OLAP failure we WARN and fall through to the tested chunked/single-shot
+// path below (a safety net during the OLAP transition).
+//
+// The fall-through path is the ONLY path on vanilla MySQL (no vtgate
+// `workload` var, no errno-3024 wall):
 //   - **Single-shot SELECT COUNT(*)** when the table has no usable
 //     integer PK (composite PK, no PK, or non-integer PK). Simple,
-//     works against vanilla MySQL. May hit PlanetScale's per-query
-//     row-read budget on tables with > ~100K rows; the resulting
-//     error surfaces clearly with PS's `row count exceeded` message
-//     baked into the wrap.
+//     works against vanilla MySQL.
 //   - **Chunked SUM(COUNT(*) per PK range)** when the table has a
 //     single integer PK. Splits the count across PK ranges of
-//     [defaultCountChunkSize] rows each so each subquery stays under
-//     PS's row-read budget. Scales to billions of rows on PS-MySQL.
+//     [defaultCountChunkSize] rows each. Scales to billions of rows.
 //
 // Authoritative count (vs. RowReader's CountRows which uses
 // information_schema.tables.table_rows for ETA hints — that's
@@ -52,12 +60,21 @@ func (r *SchemaReader) ExactRowCount(ctx context.Context, table *ir.Table) (int6
 	if r.db == nil {
 		return 0, errors.New("mysql: ExactRowCount: reader not opened")
 	}
+	if r.flavor.usesVStream() {
+		n, err := olapCount(ctx, r.db, table.Name)
+		if err == nil {
+			return n, nil
+		}
+		// Safety net: OLAP is the primary count path on vtgate flavors, but
+		// keep the tested chunked/single-shot path reachable during the
+		// transition (ADR-0147 tracks retiring the fallback once OLAP-count
+		// is field-proven). Name the table so a persistent fallback is
+		// visible in the logs rather than silent.
+		slog.WarnContext(ctx, "mysql: OLAP row-count failed; falling back to chunked/single-shot count",
+			"table", table.Name, "error", err)
+	}
 	pkCol, ok := singleIntegerPKColumn(table)
 	if !ok {
-		// Fall back to single-shot count. May hit PS row-read limit
-		// on large tables; the error surfaces as-is and the operator
-		// can workaround by adding a single-int PK or restricting
-		// verify scope to chunkable tables.
 		return singleShotCount(ctx, r.db, table.Name)
 	}
 	return chunkedCount(ctx, r.db, table.Name, pkCol, defaultCountChunkSize)
@@ -133,8 +150,47 @@ func (r *SchemaReader) SampleRowHashes(ctx context.Context, table *ir.Table, n i
 	return samples, nil
 }
 
-// singleShotCount returns SELECT COUNT(*) FROM table. Fast on small
-// tables; may hit PS row-read budget on tables > ~100K rows.
+// olapCount returns SELECT COUNT(*) FROM table executed under vtgate's
+// `workload = 'olap'` on a DEDICATED connection. OLAP streams the scan, so
+// the count is NOT bound by the OLTP max-statement-execution-time limit
+// (MySQL errno 3024, ~900s) that kills a plain count(*) over a large
+// clustered index on PlanetScale/Vitess; the optimizer still auto-narrows to
+// a small secondary index when one exists. It works for EVERY PK shape,
+// which is why it supersedes the single-integer-PK-only [chunkedCount] on
+// vtgate flavors (ADR-0147).
+//
+// The `SET workload` is scoped to the dedicated connection and NEVER leaked
+// into a pooled/session-wide connection (the v0.99.15 lesson) — mirroring
+// [RowReader.queryFullScan]'s no-PK full scan: the conn is returned to the
+// pool on Close, and the go-sql-driver's session reset
+// (COM_RESET_CONNECTION) clears the session workload before any reuse.
+//
+// count(*) is exact in any workload mode — OLAP changes the
+// timeout/streaming behavior, not the result — so there is no value-fidelity
+// risk here.
+func olapCount(ctx context.Context, db *sql.DB, tableName string) (int64, error) {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("mysql: olap-count conn %s: %w", tableName, err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.ExecContext(ctx, "SET workload = 'olap'"); err != nil {
+		return 0, fmt.Errorf("mysql: olap-count set workload %s: %w", tableName, err)
+	}
+	q := fmt.Sprintf(`SELECT COUNT(*) FROM %s`, quoteIdent(tableName))
+	var count int64
+	if err := conn.QueryRowContext(ctx, q).Scan(&count); err != nil {
+		return 0, fmt.Errorf("mysql: olap-count %s: %w", tableName, err)
+	}
+	return count, nil
+}
+
+// singleShotCount returns SELECT COUNT(*) FROM table. Fast on small tables.
+// On a large clustered table on PlanetScale/Vitess it can hit the OLTP
+// max-statement-execution-time wall (MySQL errno 3024) — that is a
+// statement-*execution-time* limit, NOT a rows-returned cap (a count(*)
+// returns one row); the OLAP primary path in [SchemaReader.ExactRowCount]
+// exists specifically to stream past it (ADR-0147).
 func singleShotCount(ctx context.Context, db *sql.DB, tableName string) (int64, error) {
 	q := fmt.Sprintf(`SELECT COUNT(*) FROM %s`, quoteIdent(tableName))
 	var count int64
