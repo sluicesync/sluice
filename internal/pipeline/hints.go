@@ -146,6 +146,31 @@ var hintRegistry = []errorHint{
 		hint:     "the target role lacks CREATE on the schema; verify GRANT or use a different role",
 	},
 
+	// Indexes: PlanetScale's max-statement-execution-time limit (MySQL
+	// errno 3024) killing a large post-copy `ALTER … ADD INDEX`. On a
+	// big PlanetScale-MySQL target the deferred index build runs past
+	// the ~900 s statement-time limit and fails ("Query execution was
+	// interrupted, maximum statement execution time exceeded"), leaving
+	// the data copied but the declared secondary indexes uncreated.
+	// --upfront-indexes builds them during the copy (maintained
+	// per-row) so no post-copy ALTER is ever issued. (ADR-0148 tracks a
+	// possible future auto-fallback via PlanetScale deploy requests.)
+	{
+		phase:    PhaseIndexes,
+		contains: "maximum statement execution time",
+		hint:     "the index build hit PlanetScale's statement-time limit (errno 3024); re-run with --upfront-indexes to build secondary indexes during the copy instead of a post-copy ALTER",
+	},
+	// Indexes: PlanetScale safe-migrations blocks direct DDL. With
+	// safe-migrations enabled on the target branch, a direct ALTER is
+	// rejected with "direct DDL is disabled" (1105). --upfront-indexes
+	// does NOT help here (its ALTER is also direct DDL) — the fix is
+	// operator-side.
+	{
+		phase:    PhaseIndexes,
+		contains: "direct ddl is disabled",
+		hint:     "PlanetScale safe-migrations is enabled on the target branch, which blocks direct DDL; disable it for the migration (sluice does not yet drive PlanetScale deploy requests)",
+	},
+
 	// CDC: replication-role attribute missing. Postgres surfaces
 	// "permission denied for replication" when the connecting
 	// role doesn't have the REPLICATION attribute. docs/postgres-

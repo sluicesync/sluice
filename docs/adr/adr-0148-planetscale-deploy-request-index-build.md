@@ -1,6 +1,6 @@
 # ADR-0148: PlanetScale deploy-request index build (auto-adjust for the deferred-index statement-time wall)
 
-- **Status:** Proposed (design; prototype-validated end-to-end, not yet implemented)
+- **Status:** Proposed — **VALIDATED end-to-end but DEFERRED (2026-07-02)**. The prototype proved the whole workflow works on real PlanetScale, but the accumulated warts (below) make it a heavy lift for a marginal gain over the already-shipped `--upfront-indexes` opt-in plus the errno-3024 → `--upfront-indexes` operator hint. **Shipped instead:** `--upfront-indexes` (`ef07c1da`) + the index-phase hint in `hints.go` (the "(B)" stopgap). Revisit this ADR on real demand for the fast-deferred-copy-*and*-no-wall combination.
 - **Date:** 2026-07-02
 - **Related:** the deferred-index errno-3024 roadmap item; `--upfront-indexes` (`ef07c1da`, the shipped opt-in escape hatch); ADR-0147 (OLAP count — the count-side sibling of the same errno-3024 wall); the existing thin PlanetScale HTTP client in `internal/planetscale/telemetry` (the no-SDK precedent to mirror).
 
@@ -25,6 +25,7 @@ The full chain was driven end-to-end via the PlanetScale API (raw HTTP + service
 4. **The revert window holds the deployment "in progress"** — PS refuses to delete the DB (and presumably other lifecycle ops) until `skip-revert` finalizes it (or the window closes). sluice must `skip-revert` to finalize.
 5. **Two extra credentials** beyond the data-plane DSN: a PlanetScale **API service token** (control-plane, deploy-request + branch + password scopes) and a **branch password** for the ALTER-on-branch step.
 6. Small-table deploy was near-instant; a large table's deploy runs the index build via VReplication — real wall-clock but **async and not subject to errno 3024**.
+7. **Safe-migrations enable/disable has a large propagation lag, which kills the per-table-toggle design (2026-07-02 follow-up prototype).** With safe-migrations ON, direct DDL is cleanly rejected with `ERROR 1105: direct DDL is disabled` (a detectable trigger). But after `disable` — even with the control-plane API already reporting `safe_migrations: false` — direct DDL stayed *blocked* for 100 s+ (never recovered in the observed window), and rapid toggling can leave the branch laggy/stuck. A ~100 s+ settle per flip is worse-than-the-wall when amortized per table, so **automatically toggling safe-migrations on/off per table (option (i)) is not viable.** The only workable shapes keep safe-migrations ON once enabled: a **one-way escalation** (direct DDL until the first errno-3024, then enable once and route all remaining post-copy DDL — indexes AND constraints — through deploy requests) or a **whole-run safe-migrations mode**. Both leave the operator's production branch changed (safe-migrations on, direct DDL disabled) unless restored afterward (which pays the same disable lag).
 
 ## Decision (proposed)
 
@@ -51,3 +52,14 @@ Make the deploy-request workflow the **automatic fallback** when a deferred `ADD
 - **Subsumes the "(B) error-guided" idea** — no need to fail loud and tell the operator to re-run with `--upfront-indexes`; the fallback recovers automatically because the deploy-request build is post-copy.
 - New control-plane surface in sluice (HTTP client + async workflow + branch/credential lifecycle) — the largest PlanetScale-specific integration to date, flavor-gated and engaged only on an actual errno-3024 failure (or via explicit `--upfront-indexes` to skip the attempt).
 - Depends on an additional PlanetScale API credential and the safe-migrations prerequisite — the main UX costs.
+
+## Deferral rationale (2026-07-02)
+
+The prototype confirmed it *works*, but four findings turned the cost/benefit against building it now:
+
+1. **The toggle-lag finding (finding #7)** kills the appealing per-table auto-toggle (option (i)); only a one-way escalation or a whole-run safe-migrations mode is viable, and both leave the operator's production branch changed.
+2. **Two extra credentials + the safe-migrations prerequisite** are real UX + setup costs on a path sluice's other flows don't require.
+3. **The benchmark quantified the gain it buys:** `--upfront-indexes` is only ~8–11× slower than deferred (5 M rows / 4 indexes: deferred 44 s vs upfront 363 s) — and that penalty is paid *only* on the opt-in large-PlanetScale case where deferred would otherwise **fail outright**. So the practical comparison is "`--upfront-indexes` completes in minutes" vs "a heavy async control-plane integration to shave those minutes." The former is good enough.
+4. **The (B) hint closes the UX gap cheaply:** an errno-3024 index-build failure now points the operator straight at `--upfront-indexes` (`hints.go`), so no one is stranded on a cryptic error.
+
+Net: ship `--upfront-indexes` + the hint; keep this ADR as the recorded, validated design to revisit if real users want the fast-copy-*and*-no-wall combination enough to justify the control-plane integration.

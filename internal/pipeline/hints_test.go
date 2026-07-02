@@ -68,6 +68,20 @@ func TestHintForRegistry(t *testing.T) {
 			want:  "the target role lacks CREATE on the schema",
 		},
 		{
+			name:  "indexes: PlanetScale errno-3024 statement-time wall points at --upfront-indexes",
+			phase: PhaseIndexes,
+			err: errors.New(
+				`pipeline: create indexes: mysql: ALTER TABLE bench ADD INDEX idx_val: Error 3024: target: db.-.primary: vttablet: Query execution was interrupted, maximum statement execution time exceeded`,
+			),
+			want: "re-run with --upfront-indexes",
+		},
+		{
+			name:  "indexes: PlanetScale safe-migrations direct-DDL block points at disabling it (NOT upfront)",
+			phase: PhaseIndexes,
+			err:   errors.New(`pipeline: create indexes: mysql: ALTER TABLE t ADD INDEX idx: Error 1105: direct DDL is disabled`),
+			want:  "safe-migrations is enabled",
+		},
+		{
 			name:  "cdc: permission denied for replication",
 			phase: PhaseCDC,
 			err:   errors.New(`pq: permission denied for replication`),
