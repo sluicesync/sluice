@@ -158,7 +158,7 @@ var hintRegistry = []errorHint{
 	{
 		phase:    PhaseIndexes,
 		contains: "maximum statement execution time",
-		hint:     "the index build hit PlanetScale's statement-time limit (errno 3024); re-run with --upfront-indexes to build secondary indexes during the copy instead of a post-copy ALTER",
+		hint:     "the index build hit PlanetScale's statement-time limit (errno 3024); the data is already copied, so --resume finishes just the indexes with NO re-copy (increase the PlanetScale resource size first — a larger cluster builds the index faster, more likely under the limit). Alternatively start fresh with --upfront-indexes to build indexes during the copy",
 	},
 	// Indexes: PlanetScale safe-migrations blocks direct DDL. With
 	// safe-migrations enabled on the target branch, a direct ALTER is
