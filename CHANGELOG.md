@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.170] - 2026-07-02
+
+### Fixed
+
+- **A cold-copy `migrate` into a non-Metal PlanetScale-MySQL target now rides a storage-grow reparent that surfaces as `Error 2013 … code = Canceled desc = EOF`, instead of aborting loudly mid-copy.** When such a target auto-grows storage under a high-parallelism bulk copy, the primary reparent can drop the in-flight connection and surface as MySQL `errno 2013` (CR_SERVER_LOST) carrying a vttablet `code = Canceled desc = EOF`. `classifyApplierError` treated it as terminal — the `desc = EOF` text isn't the `io.EOF` sentinel, errno 2013 matched no retriable case, and the `1105` vttablet-message branch never ran — so a migrate under aggressive reparents could abort (`rc=1`). errno `2013` (CR_SERVER_LOST) and `2006` (CR_SERVER_GONE_ERROR) are transport-loss shapes in the same class as `driver.ErrBadConn` / `io.EOF` / connection-reset (all already retriable), and the cold-copy reparent-retry (ADR-0108) re-acquires a fresh connection on retry, so they now classify retriable — keyed on the structured error number, which keeps the deliberate bare-`code = Canceled` client-cancel exclusion (v0.99.94) intact (a genuine client cancel is `context.Canceled` or `1105 … desc = context canceled`, never errno 2013). Bounded by ADR-0108's ~30-minute wall-clock (a tablet that never recovers still fails loudly after the envelope) — no silent-loss exposure, loud either way. The classifier is shared, so the fix also covers the ADR-0109 source-read reconnect and ADR-0114 DDL-phase retry paths. Surfaced by a live PlanetScale-MySQL storage-grow reproduction (which also validated the ADR-0141 migrate reparent-reconciliation end-to-end: a migrate crossed a real grow, rode the reparents to completion, the reconcile re-derived the touched table, and the final row count matched source exactly). Pinned by `TestClassifyApplierError_ConnectionLostErrno2013`.
+
 ## [0.99.169] - 2026-07-01
 
 ### Added
