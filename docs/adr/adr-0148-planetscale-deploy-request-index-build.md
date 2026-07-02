@@ -28,9 +28,13 @@ The full chain was driven end-to-end via the PlanetScale API (raw HTTP + service
 
 ## Decision (proposed)
 
-Add an opt-in PlanetScale-flavor migrate mode that builds deferred secondary indexes via the deploy-request workflow instead of a direct post-copy `ALTER`. Keep the fast deferred bulk copy; after it, for each table's indexes: create a dev branch off the target branch, apply the `ADD INDEX` DDL to it, open a deploy request into the target branch, deploy, poll to `complete_pending_revert`, `skip-revert`, and delete the dev branch. Implemented as a **thin HTTP client** in a new `internal/planetscale/deploy` package (no `planetscale-go` dependency — the telemetry client is the precedent).
+Make the deploy-request workflow the **automatic fallback** when a deferred `ADD INDEX` fails with errno 3024 on a PlanetScale target — not merely an opt-in mode. This is possible, and strictly better than a re-run, precisely because the deploy-request path builds the index **post-copy, on the already-migrated data** (via VReplication) — *exactly like the direct `ALTER` it replaces*. So when the direct deferred `ALTER` hits the wall, the data is already copied; sluice transparently rebuilds that same index via a deploy request on the existing data, with **no re-copy, no operator action, and no `--upfront-indexes` recommendation.** (This is the key asymmetry with `--upfront-indexes`, a *pre*-copy strategy that cannot be applied retroactively to an already-copied table.)
 
-This is a **bigger project than `--upfront-indexes`** and is gated behind explicit opt-in + the PlanetScale flavor; `--upfront-indexes` remains the zero-dependency escape hatch, and the fast deferred `ALTER` remains the default for every non-PlanetScale target and for PlanetScale tables small enough to build inline.
+**The flow:** fast deferred bulk copy (unchanged default) → deferred `ADD INDEX` (unchanged default — fast for small/moderate tables) → **on errno 3024, per failed index/table:** create a dev branch off the target branch, apply the `ADD INDEX` to it, open a deploy request into the target branch, deploy, poll to `complete_pending_revert`, `skip-revert`, delete the dev branch → proceed. Implemented as a **thin HTTP client** in a new `internal/planetscale/deploy` package (no `planetscale-go` dependency — the telemetry client is the precedent).
+
+`--upfront-indexes` remains an explicit opt-in (it avoids even *attempting* the doomed direct `ALTER`). The auto-fallback makes it optional, not required; the fast deferred `ALTER` stays the default everywhere and is only replaced when it actually fails. No size heuristic / guessing is needed for correctness — try-then-fallback beats a tier-dependent threshold.
+
+**Cost of the auto-fallback — the burned attempt.** The direct deferred `ALTER` runs for ~900 s and fails before the fallback engages, so a large table pays that ~900 s once. This is the price of not-guessing. An optional future optimization — a cheap `information_schema.DATA_LENGTH` probe — could let sluice skip the doomed direct `ALTER` for *clearly*-huge tables (well past the wall on any tier) and go straight to the deploy request, avoiding the ~900 s waste, while still using try-then-fallback for the ambiguous middle. Not required for correctness; a perf refinement, and it pairs with (not replaces) the fallback.
 
 ## Open design questions
 
@@ -43,6 +47,7 @@ This is a **bigger project than `--upfront-indexes`** and is gated behind explic
 
 ## Consequences
 
-- The true one-run auto-adjust: fast deferred copy + async index build, no errno-3024 wall, no re-copy, no size guessing.
-- New control-plane surface in sluice (HTTP client + async workflow + branch/credential lifecycle) — the largest PlanetScale-specific integration to date, opt-in and flavor-gated.
+- The true one-run auto-adjust: fast deferred copy + (on failure) async index build on the already-copied data, no errno-3024 wall, no re-copy, no size guessing, no operator action.
+- **Subsumes the "(B) error-guided" idea** — no need to fail loud and tell the operator to re-run with `--upfront-indexes`; the fallback recovers automatically because the deploy-request build is post-copy.
+- New control-plane surface in sluice (HTTP client + async workflow + branch/credential lifecycle) — the largest PlanetScale-specific integration to date, flavor-gated and engaged only on an actual errno-3024 failure (or via explicit `--upfront-indexes` to skip the attempt).
 - Depends on an additional PlanetScale API credential and the safe-migrations prerequisite — the main UX costs.
