@@ -457,6 +457,30 @@ type Migrator struct {
 	// skipped; a generic-name collision (name matches but column shape
 	// doesn't) is kept with a loud warning rather than silently dropped.
 	SkipORMTables bool
+
+	// UpfrontIndexes, when true, creates every secondary index BEFORE the
+	// bulk copy — right after CreateTablesWithoutConstraints — instead of the
+	// default deferred post-copy index phase, so the bulk INSERTs maintain the
+	// indexes as they load (CLI: --upfront-indexes). Indexes-only: identity-
+	// sequence sync and foreign-key constraints keep their positions (FKs are
+	// still created last), so FK ordering is preserved — bare tables → indexes
+	// → copy → FKs.
+	//
+	// The motivating case is a large PlanetScale-MySQL target, where a deferred
+	// `ALTER … ADD INDEX` on a multi-GB table can exceed PlanetScale's max-
+	// statement-execution-time limit (errno 3024) and die AFTER an otherwise-
+	// correct copy, leaving the indexes uncreated. Building them upfront avoids
+	// the post-hoc ALTER entirely, at the cost of a slower load (the INSERTs
+	// maintain the index). Engine-neutral: it reuses the same
+	// SchemaWriter.CreateIndexes the deferred phase calls, so it works for both
+	// MySQL and Postgres targets.
+	//
+	// Zero-value-safe: the zero value (false) is the deferred post-copy build —
+	// today's behaviour, byte-identical. Unlike the v0.99.51 trap, deferred is
+	// GENUINELY the default here (the common case), so the on-behaviour
+	// (upfront) is correctly the opt-in; no inverted NoUpfront/Suppress name is
+	// needed.
+	UpfrontIndexes bool
 }
 
 // ShardColumnSpec carries the ADR-0048 Shape A discriminator
@@ -636,7 +660,7 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	// parallel bulk-copy dependency set.
 	parallelDeps := m.phaseBuildCopyDeps(ctx, schema, rr, rw, rawCopyOK, withinParallelism)
 
-	if err := runBulkCopyPhases(ctx, rc, &state, schema, rr, sw, rw, resuming, m.BulkBatchSize, parallelDeps, tableParallelism, m.Redactor, m.InjectShardColumn); err != nil {
+	if err := runBulkCopyPhases(ctx, rc, &state, schema, rr, sw, rw, resuming, m.BulkBatchSize, parallelDeps, tableParallelism, m.Redactor, m.InjectShardColumn, m.UpfrontIndexes); err != nil {
 		return err
 	}
 
@@ -1059,6 +1083,7 @@ func runBulkCopyPhases(
 	tableParallelism int,
 	redactor *redact.Registry,
 	shard ShardColumnSpec,
+	upfrontIndexes bool,
 ) error {
 	// ADR-0110 (v0.99.102): wire the run's coordinated grow-pause gate onto
 	// the TOP-LEVEL cold-copy writer here, centrally. The native-concurrent /
@@ -1117,6 +1142,33 @@ func runBulkCopyPhases(
 	}
 	slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseTables)))
 
+	// --upfront-indexes (Migrator.UpfrontIndexes): build the secondary indexes
+	// NOW — before the bulk copy — instead of the default deferred post-copy
+	// phase, so the bulk INSERTs maintain them as they load. On a large
+	// PlanetScale-MySQL target a deferred `ALTER … ADD INDEX` can run past the
+	// max-statement-execution-time limit (errno 3024) and die after a correct
+	// copy; building indexes upfront avoids the post-hoc ALTER entirely. This
+	// relocates the SAME runDDLPhaseWithReparentRetry("indexes", … CreateIndexes)
+	// block the deferred path uses (engine-neutral, same reparent-retry + hint)
+	// — it is not rewritten. Indexes-only: SyncIdentitySequences and the FK
+	// CreateConstraints keep their positions below, so FK ordering is preserved
+	// (bare tables → indexes → copy → FKs last). CreateIndexes is idempotent on
+	// resume (Bug 131), so a --resume after a mid-copy crash re-runs this
+	// without clashing on the already-built indexes. When false this block is
+	// skipped and the phase order is byte-identical to before.
+	if upfrontIndexes {
+		if err := markPhase(ctx, rc, state, ir.MigrationPhaseIndexes); err != nil {
+			_ = err
+		}
+		if err := runDDLPhaseWithReparentRetry(ctx, "indexes", sw, func(ctx context.Context) error {
+			return sw.CreateIndexes(ctx, schema)
+		}); err != nil {
+			err = fmt.Errorf("pipeline: create indexes (upfront): %w", err)
+			return wrapWithHint(PhaseIndexes, markFailed(ctx, rc, *state, ir.MigrationPhaseIndexes, err))
+		}
+		slog.InfoContext(ctx, "migration: phase complete (upfront)", slog.String("phase", string(ir.MigrationPhaseIndexes)))
+	}
+
 	// Phase 2: bulk-copy. Per-table state-row updates here so a mid-
 	// phase failure preserves the partial progress map.
 	if err := markPhase(ctx, rc, state, ir.MigrationPhaseBulkCopy); err != nil {
@@ -1143,7 +1195,35 @@ func runBulkCopyPhases(
 	// sequential post-copy index tail. Engines without the surface (MySQL)
 	// run the copy pool, then identity-sync, then the whole-schema
 	// CreateIndexes — exactly the pre-ADR-0077 sequential order.
-	if ib, ok := sw.(ir.IncrementalIndexBuilder); ok {
+	if upfrontIndexes {
+		// Indexes were already built above (before the copy), so run the plain
+		// cross-table copy pool with NO overlapped index building and NO
+		// post-copy index phase. The copy itself is byte-identical to the
+		// non-IIB fallback branch's copy (runBulkCopyTablePool with a nil
+		// onTableCopied) — only the index phase moved earlier. BOTH PG
+		// (IncrementalIndexBuilder) and MySQL take THIS branch when upfront is
+		// set, so upfront is not scoped to one engine family (pin the class,
+		// not the representative). Identity-sync then runs in its usual spot.
+		if err := runBulkCopyTablePool(
+			ctx, rc, state, &stateMu, schema, rows, rw,
+			resuming, bulkBatchSize, parallel, tableParallelism, redactor, shard, nil,
+		); err != nil {
+			return err
+		}
+		slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseBulkCopy)))
+
+		// Phase 3.5: identity sync.
+		if err := markPhase(ctx, rc, state, ir.MigrationPhaseIdentitySync); err != nil {
+			_ = err
+		}
+		if err := runDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
+			return sw.SyncIdentitySequences(ctx, schema)
+		}); err != nil {
+			err = fmt.Errorf("pipeline: sync identity sequences: %w", err)
+			return wrapWithHint(PhaseSchemaApply, markFailed(ctx, rc, *state, ir.MigrationPhaseIdentitySync, err))
+		}
+		slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseIdentitySync)))
+	} else if ib, ok := sw.(ir.IncrementalIndexBuilder); ok {
 		if err := runOverlappedCopyAndIndexPhase(
 			ctx, rc, state, &stateMu, schema, rows, sw, rw, ib,
 			resuming, bulkBatchSize, parallel, tableParallelism, redactor, shard,

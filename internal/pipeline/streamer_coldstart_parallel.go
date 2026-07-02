@@ -301,5 +301,6 @@ func (s *Streamer) runColdStartParallel(
 		s.BulkBatchSize,
 		deps, tableParallelism,
 		s.Redactor, s.InjectShardColumn,
+		false, // upfrontIndexes: --upfront-indexes is a migrate-path flag; the sync cold-start keeps the deferred post-copy index build
 	)
 }

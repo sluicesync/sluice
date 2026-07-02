@@ -456,9 +456,15 @@ func (m *Migrator) phaseResolveCopyParallelism(ctx context.Context, rc resumeCon
 	// (MySQL / degraded probe), or the engine has no IncrementalIndexBuilder
 	// (MySQL again, which overlaps via the post-copy whole-schema fallback).
 	// In that case the copy axes see the full CopyBudget unchanged.
+	//
+	// --upfront-indexes builds every index BEFORE the copy, so there is no
+	// post-copy index build to overlap and the reservation is moot — skip it
+	// so the copy gets the full budget (the index build already finished on an
+	// otherwise-idle target). Guarding here keeps the reservation off for the
+	// upfront path even when the target IS an IncrementalIndexBuilder (PG).
 	copyBudgetForAxes := budgetReport.CopyBudget
 	indexBudget := 0
-	if _, overlaps := sw.(ir.IncrementalIndexBuilder); overlaps {
+	if _, overlaps := sw.(ir.IncrementalIndexBuilder); overlaps && !m.UpfrontIndexes {
 		ib, copyRemaining := splitCopyAndIndexBudget(budgetReport.CopyBudget, copyParallelism)
 		if ib > 0 {
 			indexBudget = ib

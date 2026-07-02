@@ -249,6 +249,80 @@ func TestRunCallsThreePhasesInOrder(t *testing.T) {
 	}
 }
 
+// TestRunUpfrontIndexesBuildsIndexesBeforeCopy pins the --upfront-indexes
+// reorder (Migrator.UpfrontIndexes): CreateIndexes runs BEFORE the bulk copy
+// (right after CreateTablesWithoutConstraints) and is NOT re-run after. FKs
+// (CreateConstraints) stay last, so foreign-key ordering is preserved.
+//
+// recordingSchemaWriter does NOT implement ir.IncrementalIndexBuilder, so it
+// takes the non-overlap branch — but the upfront reorder is a TOP-LEVEL branch
+// that fires for every writer family (IIB or not), which is what makes it apply
+// to a real MySQL/PG target (pin the class, not the representative). The false
+// case is covered by TestRunCallsThreePhasesInOrder above (indexes after copy).
+func TestRunUpfrontIndexesBuildsIndexesBeforeCopy(t *testing.T) {
+	src := newRecordingEngine("source")
+	src.schema = sampleSchema()
+	tgt := newRecordingEngine("target")
+
+	m := &Migrator{
+		Source: src, Target: tgt,
+		SourceDSN: "src", TargetDSN: "tgt",
+		UpfrontIndexes: true,
+	}
+	if err := m.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	wantPhases := []string{
+		"CreateTablesWithoutConstraints",
+		"CreateIndexes",
+		"WriteRows:users",
+		"SyncIdentitySequences",
+		"CreateConstraints",
+	}
+	if len(tgt.phaseLog) != len(wantPhases) {
+		t.Fatalf("got %d phases (%v); want %d (%v)", len(tgt.phaseLog), tgt.phaseLog, len(wantPhases), wantPhases)
+	}
+	for i, want := range wantPhases {
+		if tgt.phaseLog[i] != want {
+			t.Errorf("phase[%d] = %q; want %q", i, tgt.phaseLog[i], want)
+		}
+	}
+
+	// Explicit relative-order guards (independent of exact phase count so the
+	// intent survives a future phase insertion): indexes strictly before the
+	// copy, and NOT rebuilt after it.
+	idxAt, copyAt := indexOf(tgt.phaseLog, "CreateIndexes"), indexOf(tgt.phaseLog, "WriteRows:users")
+	if idxAt < 0 || copyAt < 0 {
+		t.Fatalf("expected both CreateIndexes and WriteRows in log; got %v", tgt.phaseLog)
+	}
+	if idxAt > copyAt {
+		t.Errorf("CreateIndexes (at %d) must precede the bulk copy (at %d): %v", idxAt, copyAt, tgt.phaseLog)
+	}
+	if n := countOf(tgt.phaseLog, "CreateIndexes"); n != 1 {
+		t.Errorf("CreateIndexes ran %d times; want exactly 1 (upfront, not re-run post-copy): %v", n, tgt.phaseLog)
+	}
+}
+
+func indexOf(ss []string, target string) int {
+	for i, s := range ss {
+		if s == target {
+			return i
+		}
+	}
+	return -1
+}
+
+func countOf(ss []string, target string) int {
+	n := 0
+	for _, s := range ss {
+		if s == target {
+			n++
+		}
+	}
+	return n
+}
+
 // staleBackendOrderEngine and its row writer record the sequence in
 // which the stale-backend reap (DetectStaleBackends) and the cold-start
 // empty-table probe (IsTableEmpty) are invoked during Migrator.Run, into
