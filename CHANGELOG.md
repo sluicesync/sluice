@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.171] - 2026-07-02
+
+### Fixed
+
+- **A transient connection drop while OPENING a cold-copy chunk's connections now reconnects and retries instead of aborting the whole `migrate` (ADR-0146).** The parallel bulk-copy opens a fresh source-reader + target-writer pair per chunk via `acquireChunkConn`, which retried ONLY the connection-slot-exhaustion class (SQLSTATE 53300); every other open error — including a transient `ping: invalid connection` (a stale pooled connection after a WAN hiccup or a PlanetScale storage-grow reparent) — hit the fail-fast branch and aborted the entire migrate. A live 49 GB Postgres→PlanetScale-MySQL run lost ~45 GB of already-copied progress to a single such blip (recoverable only via `--resume`, which re-drops and re-copies the table). Now a classified transient connection-drop at chunk-open — `driver.ErrBadConn` / `io.EOF` / a timed-out `net.Error` / the driver-and-OS connection-drop text shapes (`invalid connection`, `connection reset`, `broken pipe`, the Windows `wsarecv … did not properly respond`) — reconnects and retries the open within a bounded ~30-minute wall-clock + exponential-backoff envelope, keeping the chunk's gate-token budget slot. It is DUP-FREE by construction: the open fails at ping, BEFORE any COPY/WriteRows, so re-running the chunk from its recorded `chunk.LastPK` cursor (`WHERE (pk) > LastPK`) reuses the existing ADR-0109 keyset-resume substrate with zero double-copy risk — the same safety argument the 53300 path already documents. The mid-write and source-read paths already reconnect (ADR-0108 `flushWithReparentRetry` + ADR-0109 source-read retry, both honouring the `driver.ErrBadConn` / `ErrInvalidConn` / errno-2013 classifier); this closes the one remaining connection-OPEN hole in that retry fabric. Permanent faults (auth, bad DSN, unknown database, permission denied) stay fail-fast and loud; unknown shapes stay fatal (conservative — no default-to-transient). Pinned by `TestIsRetriableChunkOpenError_Classification` (the full transient × permanent × unknown matrix) and `TestOpenChunkConnWithRetry_*` (bounded retry, no infinite loop, immediate-fatal on permanent, ctx-cancel breaks backoff).
+
 ## [0.99.170] - 2026-07-02
 
 ### Fixed
