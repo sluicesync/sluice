@@ -4,6 +4,16 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.172] - 2026-07-02
+
+### Added
+
+- **`--upfront-indexes` migrate mode.** By default sluice defers secondary-index creation to a post-copy phase (a sort-based bulk `ADD INDEX`, far cheaper than per-row index maintenance). But on a large PlanetScale-MySQL target that deferred `ALTER … ADD INDEX` can run past PlanetScale's max-statement-execution-time limit and fail (**errno 3024**, ~900 s — live-proven: a 49 GB table's index build failed at ~901 s), leaving the data copied but the declared secondary indexes uncreated (recoverable only via `--resume`, which re-attempts the same failing ALTER). `--upfront-indexes` builds the secondary indexes BEFORE the bulk copy (relocating the existing index phase in `runBulkCopyPhases`), so the INSERTs maintain them and no post-copy ALTER is ever issued — the wall is never reached. Engine-neutral (reuses the existing `CreateIndexes` phase), foreign keys stay deferred to the constraints phase (indexes-only reorder → no copy-ordering regression), opt-in (default deferred; zero-value-safe). It is a **reliability escape hatch, not a speed option**: a local-MySQL benchmark (3.2 M rows, 4 secondary indexes) measured deferred at 29 s vs upfront at 333 s (deferred ~11× faster — per-row B-tree maintenance is much costlier than a post-copy sort-based build). So the default stays deferred; reach for `--upfront-indexes` on a PlanetScale target large enough that the deferred `ADD INDEX` would otherwise fail, where the real choice is "fails vs completes."
+
+### Changed
+
+- **`verify`'s exact row count on PlanetScale/Vitess now runs under OLAP workload mode (ADR-0147).** `ExactRowCount` does a full `COUNT(*)`; on a large wide/clustered table that runs long enough to hit PlanetScale's max-statement-execution-time limit (**errno 3024**, ~900 s — live-proven: a 49 GB PK-only table's OLTP `count(*)` failed at ~661 s). sluice only survived this for single-integer-PK tables (via a chunked-PK count); composite/string/UUID/no-PK tables fell back to a plain `COUNT(*)` that failed at scale. On vtgate flavors (PlanetScale + self-hosted Vitess) the count now runs as `SET workload='olap'; SELECT COUNT(*)` on a dedicated connection (never session-wide — the v0.99.15 lesson): OLAP streams, so it is not bound by the OLTP statement-time limit; the optimizer still auto-narrows to a small secondary index when one exists; and it works for every PK shape — closing the gap where non-int-PK tables couldn't be counted at scale. (Benchmark: OLAP and chunked-PK counted the same 49 GB in an identical 1264 s — chunking is not faster; the win is generality.) The existing chunked/single-shot path is retained as a WARN-logged fallback, and vanilla MySQL is unchanged. `count(*)` is exact in any workload mode, so there is no value-fidelity change. A follow-up tracks retiring the chunked fallback once OLAP-count is field-proven.
+
 ## [0.99.171] - 2026-07-02
 
 ### Fixed
