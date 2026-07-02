@@ -182,6 +182,88 @@ func TestClassifyApplierError_RetriableShapes(t *testing.T) {
 	}
 }
 
+// TestClassifyApplierError_ConnectionLostErrno2013 pins the connection-lost
+// family fix (bug175-repro live finding, 2026-07-02): a dropped tablet
+// connection that vtgate surfaces as a MySQL ERR packet carrying errno 2013
+// (CR_SERVER_LOST) / 2006 (CR_SERVER_GONE_ERROR) must classify RETRIABLE so
+// the cold-copy reparent-retry (ADR-0108) re-acquires a fresh conn and rides
+// the storage-grow reparent instead of aborting loudly on the first drop.
+//
+// This is the shape the pre-fix classifier MISSED: `desc = EOF` is text (not
+// the io.EOF sentinel), the Number is 2013 (not 1105, so the vttablet
+// gRPC-code branch never runs), and the reparent text fallback does not match.
+//
+// The companion assertions guard that the fix is keyed on the NUMBER and does
+// NOT disturb the deliberate bare-`code = Canceled` client-cancel exclusion
+// (v0.99.94): a client-side cancel — context.Canceled, or a 1105 message
+// `code = Canceled desc = context canceled` — must stay TERMINAL. This is the
+// "prove the pin catches the regression": the retriable shape flips to
+// retriable, the still-terminal shapes stay terminal.
+func TestClassifyApplierError_ConnectionLostErrno2013(t *testing.T) {
+	retriable := []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "errno 2013 CR_SERVER_LOST — the live bug175-repro shape (code = Canceled desc = EOF)",
+			err:  &gomysql.MySQLError{Number: 2013, Message: "target: bug175-repro.-.primary: vttablet: rpc error: code = Canceled desc = EOF (errno 2013) (sqlstate HY000) (CallerID: bnqr12v83ivogvozijwa): Sql: \"insert into events(...) values (...)\""},
+		},
+		{
+			name: "errno 2013 wrapped by the flush closure",
+			err:  fmt.Errorf("mysql: cold-copy flush: %w", &gomysql.MySQLError{Number: 2013, Message: "vttablet: rpc error: code = Canceled desc = EOF"}),
+		},
+		{
+			name: "errno 2006 CR_SERVER_GONE_ERROR (the connection-lost sibling)",
+			err:  &gomysql.MySQLError{Number: 2006, Message: "MySQL server has gone away"},
+		},
+	}
+	for _, c := range retriable {
+		c := c
+		t.Run("retriable/"+c.name, func(t *testing.T) {
+			got := classifyApplierError(c.err)
+			var re ir.RetriableError
+			if !errors.As(got, &re) || !re.Retriable() {
+				t.Fatalf("errno-2013/2006 connection-lost shape must classify retriable for the ADR-0108 reparent-retry; got %T (%v)", got, got)
+			}
+			if !errors.Is(got, c.err) {
+				t.Errorf("Unwrap chain broken: errors.Is(classified, original) = false")
+			}
+			// Connection-lost is a same-size retry (re-acquire a fresh conn),
+			// NOT an oversized-tx signal — must not force an AIMD shrink.
+			var tk ir.TransactionKilledError
+			if errors.As(got, &tk) && tk.TransactionKilled() {
+				t.Errorf("connection-lost wrongly flagged TransactionKilled(); it is a transport drop, not a tx-killer")
+			}
+		})
+	}
+
+	// STILL TERMINAL — the bare client-cancel exclusion (v0.99.94) is untouched
+	// by the Number-2013 fix. Prove the pin fails to over-retry these.
+	terminal := []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "context.Canceled client-cancel (clean shutdown) stays terminal",
+			err:  context.Canceled,
+		},
+		{
+			name: "1105 bare code = Canceled desc = context canceled stays terminal",
+			err:  &gomysql.MySQLError{Number: 1105, Message: "vttablet: rpc error: code = Canceled desc = context canceled"},
+		},
+	}
+	for _, c := range terminal {
+		c := c
+		t.Run("terminal/"+c.name, func(t *testing.T) {
+			got := classifyApplierError(c.err)
+			var re ir.RetriableError
+			if errors.As(got, &re) {
+				t.Errorf("%s wrongly classified retriable — the errno-2013 fix must not disturb the client-cancel exclusion", c.name)
+			}
+		})
+	}
+}
+
 // TestClassifyApplierError_VitessNonTransientCodesNotRetriable covers
 // the discriminator inside the Error-1105 branch: only Aborted /
 // Unavailable / ResourceExhausted are transients. Other gRPC codes

@@ -234,6 +234,47 @@ func classifyApplierError(err error) error {
 			// 1213 InnoDB deadlock + 1205 lock-wait-timeout — the
 			// canonical "retry the transaction" InnoDB transients.
 			return &retriableMySQLError{err: err}
+		case 2006, 2013:
+			// Connection-lost family (go-sql-driver client codes 2006
+			// CR_SERVER_GONE_ERROR / 2013 CR_SERVER_LOST). vtgate/vttablet
+			// surfaces a dropped tablet connection as a MySQL ERR packet
+			// carrying errno 2013 — e.g. the live bug175-repro finding:
+			//
+			//   Error 2013 (HY000): target: <db>.-.primary: vttablet: rpc
+			//   error: code = Canceled desc = EOF (errno 2013) (sqlstate
+			//   HY000) (CallerID: ...): Sql: "insert ... into events ..."
+			//
+			// This is a transport-loss shape in the SAME class as
+			// driver.ErrBadConn / gomysql.ErrInvalidConn / io.EOF /
+			// "connection reset by peer" (all already retriable above): the
+			// server/tablet connection died — typically a PlanetScale
+			// non-Metal storage-grow reparent dropping the in-flight write —
+			// and the cold-copy reparent-retry (ADR-0108) re-acquires a FRESH
+			// connection on the next attempt, so retrying on it is correct.
+			//
+			// Why the existing branches MISS it (the classifier gap this
+			// closes): the leading `desc = EOF` is TEXT inside a *MySQLError
+			// message, NOT the io.EOF sentinel, so `errors.Is(err, io.EOF)`
+			// does not match; the Number is 2013, not 1105, so the vttablet
+			// gRPC-code branch (classifyVitessMessage) is never entered; and
+			// the reparent text fallback ("not serving"/"reparent") does not
+			// appear in this wording. Result pre-fix: a loud terminal abort
+			// mid-copy (rc=1) even though the write path could ride it.
+			//
+			// This is keyed on the NUMBER (structured, unambiguous), so it is
+			// ORTHOGONAL to the deliberate bare-`code = Canceled` client-cancel
+			// exclusion (v0.99.94): that guard lives in the 1105 message-text
+			// branch and is untouched here. A genuine client-side ctx cancel
+			// surfaces as context.Canceled (a Go sentinel, NOT retriable) or
+			// `code = Canceled desc = context canceled` under Number 1105 —
+			// never as errno 2013 — so a clean shutdown still fails terminally.
+			//
+			// Bounded, never infinite: if the tablet genuinely died (e.g.
+			// out-of-disk that never recovers), the ADR-0108 wall-clock
+			// deadline (~30 min) exhausts and the copy fails LOUDLY, exactly
+			// as it does today — this only gives the transient a chance to
+			// clear first instead of aborting on the first drop.
+			return &retriableMySQLError{err: err}
 		case 1105:
 			if classifyVitessMessage(mysqlErr.Message) {
 				return &retriableMySQLError{
