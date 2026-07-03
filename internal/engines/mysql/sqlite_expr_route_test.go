@@ -1,0 +1,120 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
+package mysql
+
+import (
+	"strings"
+	"testing"
+
+	"sluicesync.dev/sluice/internal/ir"
+)
+
+// TestSQLiteRoute_GeneratedAndCheck_Portable pins the ADR-0133-follow-up
+// routing on MySQL: a "sqlite" generated column / CHECK with a PORTABLE body
+// emits the TRANSLATED MySQL form (|| → CONCAT, length → CHAR_LENGTH).
+func TestSQLiteRoute_GeneratedAndCheck_Portable(t *testing.T) {
+	gen := translateGeneratedExpr(
+		&ir.Column{Type: ir.Text{}, GeneratedExpr: "a || '-' || b", GeneratedExprDialect: "sqlite"},
+	)
+	if want := "CONCAT(a, '-', b)"; gen != want {
+		t.Errorf("generated = %q; want %q", gen, want)
+	}
+
+	chk := translateCheckExpr(
+		&ir.CheckConstraint{Expr: "length(x) > 0", ExprDialect: "sqlite"},
+	)
+	if want := "(CHAR_LENGTH(x) > 0)"; chk != want {
+		t.Errorf("check = %q; want %q", chk, want)
+	}
+}
+
+// TestSQLiteRoute_GeneratedAndCheck_NonPortableRefused pins the F6 policy on
+// MySQL: a non-portable "sqlite" gencol / CHECK is REFUSED LOUDLY at the emit
+// path (naming the column/constraint), never emitted verbatim. Covered:
+// strftime (non-portable function), `a / b` (SQLite integer division vs MySQL
+// decimal — MySQL would SILENTLY accept and mis-compute), and `a % b`.
+func TestSQLiteRoute_GeneratedAndCheck_NonPortableRefused(t *testing.T) {
+	for _, body := range []string{"strftime('%Y', created_at)", "a / b", "a % b"} {
+		col := &ir.Column{
+			Name: "g", Type: ir.Integer{Width: 64},
+			GeneratedExpr: body, GeneratedStored: true, GeneratedExprDialect: "sqlite",
+		}
+		if _, err := emitColumnDef(col); err == nil {
+			t.Errorf("emitColumnDef(sqlite gencol %q) err=nil; want a LOUD refusal (never verbatim)", body)
+		} else if !strings.Contains(err.Error(), "g") {
+			t.Errorf("emitColumnDef(%q) err=%v; want it to name the column", body, err)
+		}
+
+		chk := &ir.CheckConstraint{Name: "c_bad", Expr: body, ExprDialect: "sqlite"}
+		if _, err := emitCheckConstraint(chk); err == nil {
+			t.Errorf("emitCheckConstraint(sqlite CHECK %q) err=nil; want a LOUD refusal", body)
+		} else if !strings.Contains(err.Error(), "c_bad") {
+			t.Errorf("emitCheckConstraint(%q) err=%v; want it to name the constraint", body, err)
+		}
+	}
+}
+
+// TestSQLiteRoute_PortableGenColEmits confirms a portable "sqlite" gencol emits
+// a valid GENERATED column on MySQL (refusal does not false-fire).
+func TestSQLiteRoute_PortableGenColEmits(t *testing.T) {
+	col := &ir.Column{
+		Name: "label", Type: ir.Text{},
+		GeneratedExpr: "a || '-' || b", GeneratedStored: true, GeneratedExprDialect: "sqlite",
+	}
+	def, err := emitColumnDef(col)
+	if err != nil {
+		t.Fatalf("emitColumnDef(portable sqlite gencol): %v", err)
+	}
+	if !strings.Contains(def, "GENERATED ALWAYS AS (CONCAT(a, '-', b)) STORED") {
+		t.Errorf("def = %q; want the translated CONCAT generated body", def)
+	}
+}
+
+// TestSQLiteRoute_Index_PortableEmitted pins that a portable "sqlite"
+// expression index emits the translated MySQL form.
+func TestSQLiteRoute_Index_PortableEmitted(t *testing.T) {
+	idx := &ir.Index{
+		Name: "ix_expr",
+		Columns: []ir.IndexColumn{
+			{Expression: "coalesce(email, '')", ExpressionDialect: "sqlite"},
+		},
+	}
+	stmt, err := emitCreateIndex("users", idx)
+	if err != nil {
+		t.Fatalf("emitCreateIndex: %v", err)
+	}
+	if stmt == "" {
+		t.Fatal("portable expression index was skipped; want it emitted")
+	}
+	if !strings.Contains(stmt, "(COALESCE(email, ''))") {
+		t.Errorf("stmt = %q; want translated expression (COALESCE(email, ''))", stmt)
+	}
+}
+
+// TestSQLiteRoute_Index_NonPortableSkipped pins the index WARN-skip on MySQL,
+// on both the single-emit and combined-emit paths.
+func TestSQLiteRoute_Index_NonPortableSkipped(t *testing.T) {
+	bad := &ir.Index{
+		Name: "ix_bad_expr",
+		Columns: []ir.IndexColumn{
+			{Expression: "strftime('%Y', d)", ExpressionDialect: "sqlite"},
+		},
+	}
+	if stmt, err := emitCreateIndex("t", bad); err != nil || stmt != "" {
+		t.Errorf("non-portable expr index = (%q, %v); want (\"\", nil) — WARN-skip", stmt, err)
+	}
+
+	good := &ir.Index{Name: "ix_ok", Columns: []ir.IndexColumn{{Column: "id"}}}
+	stmts, err := emitCreateIndexesCombined("t", []*ir.Index{bad, good})
+	if err != nil {
+		t.Fatalf("emitCreateIndexesCombined: %v", err)
+	}
+	joined := strings.Join(stmts, "\n")
+	if strings.Contains(joined, "ix_bad_expr") {
+		t.Errorf("combined stmts = %q; the non-portable index must be skipped", joined)
+	}
+	if !strings.Contains(joined, "ix_ok") {
+		t.Errorf("combined stmts = %q; the portable index must survive", joined)
+	}
+}

@@ -49,7 +49,7 @@ func (h *warnRecorder) verbatimCount() int {
 	defer h.mu.Unlock()
 	n := 0
 	for _, m := range h.msgs {
-		if strings.Contains(m, "carried VERBATIM") {
+		if strings.Contains(m, "carried from SQLite") {
 			n++
 		}
 	}

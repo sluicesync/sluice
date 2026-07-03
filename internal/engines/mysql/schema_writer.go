@@ -602,6 +602,10 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 			if err != nil {
 				return nil, err
 			}
+			// Empty stmt = a non-portable SQLite index was WARN-skipped.
+			if stmt == "" {
+				continue
+			}
 			out = append(out, ir.DDLStatement{
 				Table: table.Name,
 				Kind:  "ALTER TABLE",
@@ -819,6 +823,10 @@ func (w *SchemaWriter) CreateShapeIndex(ctx context.Context, table *ir.Table, in
 		stmt, err := emitCreateIndex(table.Name, idx)
 		if err != nil {
 			return fmt.Errorf("create shape index: emit %q: %w", idx.Name, err)
+		}
+		// Empty stmt = a non-portable SQLite index was WARN-skipped.
+		if stmt == "" {
+			continue
 		}
 		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("create shape index %q on %s: %w",

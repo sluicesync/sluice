@@ -15,46 +15,56 @@ import (
 // run; a body containing COALESCE proves it did.
 const guardBodyMySQL = "ifnull(a, 0)"
 
+// guardBodySQLiteNonPortable is CONCAT(a, b): SQLite has no CONCAT function
+// (it uses ||), so the SQLite→PG translator can't translate it (ok=false →
+// verbatim). The MySQL→PG translator WOULD rewrite CONCAT → (a || b). So a
+// verbatim emit proves BOTH translators stayed off it — the load-bearing
+// ADR-0133 §2 invariant that a "sqlite"-dialect body is never fed through the
+// MySQL→PG translator.
+const guardBodySQLiteNonPortable = "CONCAT(a, b)"
+
 // TestWriterDialectGuard_SQLiteVerbatim pins ADR-0133 §2 on the PG writer: a
-// "sqlite"-dialect (or "" / unknown) generated / CHECK / partial-predicate /
-// index-expression body emits VERBATIM — never fed through the MySQL→PG
-// translator — while a "mysql"-dialect body still translates (regression
-// guard). Verbatim is the load-bearing correctness fix: a SQLite expression
-// must not be silently mistranslated.
+// "sqlite"-dialect body that SQLite can't translate (and every "" / unknown
+// body) emits VERBATIM — never fed through the MySQL→PG translator — while a
+// "mysql"-dialect body still translates (regression guard). Verbatim is the
+// load-bearing correctness fix: a SQLite expression must not be silently
+// mistranslated. (Portable "sqlite" bodies are translated by the SQLite→PG
+// translator — pinned separately in sqlite_expr_route_test.go.)
 func TestWriterDialectGuard_SQLiteVerbatim(t *testing.T) {
 	opts := emitOpts{}
 
 	for _, tc := range []struct {
 		name        string
 		dialect     string
-		wantVerbat  bool // true → expect guardBodyMySQL unchanged; false → expect COALESCE
+		body        string
+		wantVerbat  bool
 		mustContain string
 	}{
-		{"sqlite", "sqlite", true, ""},
-		{"empty", "", true, ""},
-		{"unknown", "duckdb", true, ""},
-		{"mysql_translates", "mysql", false, "COALESCE"},
+		{"sqlite", "sqlite", guardBodySQLiteNonPortable, true, ""},
+		{"empty", "", guardBodyMySQL, true, ""},
+		{"unknown", "duckdb", guardBodyMySQL, true, ""},
+		{"mysql_translates", "mysql", guardBodyMySQL, false, "COALESCE"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			gen := translateGeneratedExpr(
-				&ir.Column{Type: ir.Integer{Width: 64}, GeneratedExpr: guardBodyMySQL, GeneratedExprDialect: tc.dialect},
+				&ir.Column{Type: ir.Integer{Width: 64}, GeneratedExpr: tc.body, GeneratedExprDialect: tc.dialect},
 				nil, opts,
 			)
 			chk := translateCheckExpr(
-				&ir.CheckConstraint{Expr: guardBodyMySQL, ExprDialect: tc.dialect}, nil, opts,
+				&ir.CheckConstraint{Expr: tc.body, ExprDialect: tc.dialect}, nil, opts,
 			)
 			pred := translateIndexPredicate(
-				&ir.Index{Predicate: guardBodyMySQL, PredicateDialect: tc.dialect}, opts,
+				&ir.Index{Predicate: tc.body, PredicateDialect: tc.dialect}, opts,
 			)
 			expr := translateIndexExpr(
-				ir.IndexColumn{Expression: guardBodyMySQL, ExpressionDialect: tc.dialect}, opts,
+				ir.IndexColumn{Expression: tc.body, ExpressionDialect: tc.dialect}, opts,
 			)
 			for label, got := range map[string]string{
 				"generated": gen, "check": chk, "predicate": pred, "indexExpr": expr,
 			} {
 				if tc.wantVerbat {
-					if got != guardBodyMySQL {
-						t.Errorf("%s[%s] = %q; want VERBATIM %q (translator must not run)", label, tc.name, got, guardBodyMySQL)
+					if got != tc.body {
+						t.Errorf("%s[%s] = %q; want VERBATIM %q (translator must not run)", label, tc.name, got, tc.body)
 					}
 				} else if !strings.Contains(got, tc.mustContain) {
 					t.Errorf("%s[%s] = %q; want it translated to contain %q", label, tc.name, got, tc.mustContain)

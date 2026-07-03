@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/translate"
 )
 
 // emitColumnType returns the MySQL DDL fragment representing t. The
@@ -669,6 +670,15 @@ func emitColumnDef(c *ir.Column) (string, error) {
 	sb.WriteByte(' ')
 	sb.WriteString(typeStr)
 	if c.IsGenerated() {
+		// SQLite source (ADR-0133 follow-up, F6): a generated column is
+		// DATA-load-bearing, so a body with no provably-portable MySQL
+		// translation is refused LOUDLY — MySQL would silently accept a
+		// syntactically-valid but semantically-divergent body (e.g. `a / b`,
+		// which MySQL computes as decimal division, not SQLite's integer
+		// division) and compute a wrong value.
+		if err := refuseNonPortableSQLiteExprMySQL("generated column", c.Name, c.GeneratedExpr, c.GeneratedExprDialect); err != nil {
+			return "", err
+		}
 		sb.WriteString(" GENERATED ALWAYS AS (")
 		sb.WriteString(translateGeneratedExpr(c))
 		sb.WriteByte(')')
@@ -1162,6 +1172,15 @@ func emitIndexColumnListWithPrefix(cols []ir.IndexColumn, allowPrefix bool) stri
 // statement for a non-primary index. PRIMARY indexes are inline in
 // the CREATE TABLE statement and must not be passed here.
 func emitCreateIndex(tableName string, idx *ir.Index) (string, error) {
+	// SQLite source (ADR-0133 follow-up): WARN-skip a non-portable
+	// expression-index body rather than abort the migration at ADD INDEX.
+	// Signalled to the caller as an empty statement with a nil error.
+	if idx != nil {
+		if offending, portable := sqliteIndexPortableMySQL(idx); !portable {
+			warnSkipSQLiteIndex(tableName, idx, offending)
+			return "", nil
+		}
+	}
 	clause, err := emitAddIndexClause(idx)
 	if err != nil {
 		return "", err
@@ -1251,6 +1270,12 @@ func emitCreateIndexesCombined(tableName string, idxs []*ir.Index) ([]string, er
 	var combinedClauses []string
 	var separate []string
 	for _, idx := range idxs {
+		// SQLite source (ADR-0133 follow-up): WARN-skip a non-portable
+		// expression index instead of dropping the whole combined ALTER.
+		if offending, portable := sqliteIndexPortableMySQL(idx); !portable {
+			warnSkipSQLiteIndex(tableName, idx, offending)
+			continue
+		}
 		clause, err := emitAddIndexClause(idx)
 		if err != nil {
 			return nil, err
@@ -1367,15 +1392,33 @@ func emitCheckConstraint(c *ir.CheckConstraint) (string, error) {
 	return sb.String(), nil
 }
 
+// sqliteSourceDialect is the IR dialect tag the SQLite engine stamps on the
+// schema-feature bodies it carries (generated columns, CHECK constraints,
+// expression indexes — ADR-0133). The MySQL writer recognises it to route the
+// portable subset through the shared SQLite→MySQL translator; it is NEVER fed
+// through the PG→MySQL translator (that path is gated on
+// translatableSourceDialect == "postgres").
+const sqliteSourceDialect = "sqlite"
+
 // translateGeneratedExpr returns the generated-column expression to
 // emit, applying the cross-dialect translation pass when the IR's
 // dialect tag indicates a different source dialect (see ADR-0016).
 // An empty / matching dialect tag emits verbatim — same behaviour as
 // before the translation layer landed.
 func translateGeneratedExpr(c *ir.Column) string {
+	// SQLite source (ADR-0133 follow-up): route the portable subset through
+	// the shared SQLite→MySQL translator. A generated column is
+	// DATA-load-bearing, so a non-portable body (ok=false) emits VERBATIM (the
+	// target rejects a non-portable function loudly) — never warn-DROP.
+	if c.GeneratedExprDialect == sqliteSourceDialect {
+		if my, ok := translate.SQLiteExprToMySQL(c.GeneratedExpr); ok {
+			return requoteMySQLReservedIdents(my)
+		}
+		return requoteMySQLReservedIdents(c.GeneratedExpr)
+	}
 	// Translate ONLY from the one engine this writer's translator accepts
-	// (Postgres); self / untagged / SQLite / any unknown dialect emits
-	// verbatim (ADR-0133 §2). "Verbatim" here still applies the read-boundary
+	// (Postgres); self / untagged / any unknown dialect emits verbatim
+	// (ADR-0133 §2). "Verbatim" here still applies the read-boundary
 	// reserved-word re-quote (identifier-quoting normalization, NOT
 	// translation): the source reader stripped quotes for IR portability, so a
 	// column named `order` / `key` needs them back or the MySQL parser breaks
@@ -1390,8 +1433,17 @@ func translateGeneratedExpr(c *ir.Column) string {
 // applying the cross-dialect translation pass when the IR's dialect
 // tag indicates a different source dialect.
 func translateCheckExpr(c *ir.CheckConstraint) string {
+	// SQLite source (ADR-0133 follow-up): a CHECK is DATA-load-bearing —
+	// translate the portable subset, emit a non-portable body VERBATIM for a
+	// loud target reject, never warn-DROP.
+	if c.ExprDialect == sqliteSourceDialect {
+		if my, ok := translate.SQLiteExprToMySQL(c.Expr); ok {
+			return requoteMySQLReservedIdents(my)
+		}
+		return requoteMySQLReservedIdents(c.Expr)
+	}
 	// Translate ONLY from the one engine this writer's translator accepts
-	// (Postgres); self / untagged / SQLite / any unknown dialect emits verbatim
+	// (Postgres); self / untagged / any unknown dialect emits verbatim
 	// (modulo the read-boundary reserved-word re-quote) — ADR-0133 §2.
 	if c.ExprDialect != translatableSourceDialect {
 		return requoteMySQLReservedIdents(c.Expr)
@@ -1416,13 +1468,79 @@ func translateCheckExpr(c *ir.CheckConstraint) string {
 // MySQL spelling instead of emitting verbatim and failing on the
 // target).
 func translateIndexExpr(c ir.IndexColumn) string {
+	// SQLite source (ADR-0133 follow-up): translate the portable subset. A
+	// non-portable expression-index body WARN-skips the WHOLE index in
+	// emitCreateIndex / emitCreateIndexesCombined, so ok=false here is a
+	// defensive verbatim.
+	if c.ExpressionDialect == sqliteSourceDialect {
+		if my, ok := translate.SQLiteExprToMySQL(c.Expression); ok {
+			return requoteMySQLReservedIdents(my)
+		}
+		return requoteMySQLReservedIdents(c.Expression)
+	}
 	// Translate ONLY from the one engine this writer's translator accepts
-	// (Postgres); self / untagged / SQLite / any unknown dialect emits verbatim
+	// (Postgres); self / untagged / any unknown dialect emits verbatim
 	// (modulo the read-boundary reserved-word re-quote) — ADR-0133 §2.
 	if c.ExpressionDialect != translatableSourceDialect {
 		return requoteMySQLReservedIdents(c.Expression)
 	}
 	return requoteMySQLReservedIdents(translateExprForMySQL(c.Expression))
+}
+
+// refuseNonPortableSQLiteExprMySQL returns a loud, table/column-named refusal
+// when a "sqlite"-dialect DATA-LOAD-BEARING body (a generated column or a
+// CHECK) has no provably-portable MySQL translation. F6 backstop: a construct
+// that is SYNTACTICALLY valid on MySQL but SEMANTICALLY divergent (`/` decimal
+// division, `%` on non-integers, a rounding CAST, …) would be silently
+// accepted by MySQL and compute a wrong value in a STORED generated column, so
+// we refuse rather than trust the target to reject it. Non-sqlite dialects and
+// translatable bodies return nil.
+func refuseNonPortableSQLiteExprMySQL(kind, name, expr, dialect string) error {
+	if dialect != sqliteSourceDialect {
+		return nil
+	}
+	if _, ok := translate.SQLiteExprToMySQL(expr); ok {
+		return nil
+	}
+	return fmt.Errorf(
+		"refuse loudly: %s %q carries a non-portable SQLite expression %q with no "+
+			"provably-equivalent MySQL translation. Emitting it verbatim is unsafe — "+
+			"MySQL may SILENTLY accept a syntactically-valid but semantically-divergent "+
+			"body (e.g. `/` decimal division vs SQLite integer division, or a rounding "+
+			"CAST) and compute a WRONG value. Operator recovery: drop or rewrite the %s on "+
+			"the SQLite source before migrating, or re-create an equivalent MySQL %s on the "+
+			"target post-migration. sluice does not guess non-portable SQLite expression "+
+			"translations",
+		kind, name, expr, kind, kind,
+	)
+}
+
+// sqliteIndexPortableMySQL reports whether every "sqlite"-dialect expression
+// body on idx translates to MySQL. When portable is false, offending names the
+// first body that doesn't (for the WARN). MySQL has no partial-index predicate
+// path, so only expression-index columns are checked. Used by emitCreateIndex
+// and emitCreateIndexesCombined to WARN-skip a non-portable SQLite index.
+func sqliteIndexPortableMySQL(idx *ir.Index) (offending string, portable bool) {
+	for _, c := range idx.Columns {
+		if c.ExpressionDialect == sqliteSourceDialect && c.Expression != "" {
+			if _, ok := translate.SQLiteExprToMySQL(c.Expression); !ok {
+				return c.Expression, false
+			}
+		}
+	}
+	return "", true
+}
+
+// warnSkipSQLiteIndex emits the WARN-skip notice for a non-portable SQLite
+// index (shared by the single- and combined-emit paths).
+func warnSkipSQLiteIndex(tableName string, idx *ir.Index, offending string) {
+	slog.Warn(
+		"mysql: skipping index carrying a non-portable SQLite expression "+
+			"(the index is NOT created on the target — recreate it there if needed)",
+		slog.String("table", tableName),
+		slog.String("index", idx.Name),
+		slog.String("expression", offending),
+	)
 }
 
 // emitColumnList renders a parenthesised, comma-separated list of

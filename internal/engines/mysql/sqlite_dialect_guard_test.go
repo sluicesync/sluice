@@ -17,39 +17,48 @@ import (
 // alone — the body stays byte-identical.)
 const guardBodyPG = "a || b"
 
+// guardBodySQLiteNonPortable is gen_random_uuid(): SQLite has no such function
+// so the SQLite→MySQL translator returns ok=false (verbatim), while the
+// PG→MySQL translator WOULD rewrite it to (UUID()). A verbatim emit proves
+// BOTH translators stayed off it — ADR-0133 §2's "a sqlite body is never fed
+// through the PG→MySQL translator".
+const guardBodySQLiteNonPortable = "gen_random_uuid()"
+
 // TestWriterDialectGuard_SQLiteVerbatim pins ADR-0133 §2 on the MySQL writer: a
-// "sqlite"-dialect (or "" / unknown) generated / CHECK / index-expression body
-// emits VERBATIM — never fed through the PG→MySQL translator — while a
+// "sqlite"-dialect body that SQLite can't translate (and every "" / unknown
+// body) emits VERBATIM — never fed through the PG→MySQL translator — while a
 // "postgres"-dialect body still translates (regression guard). MySQL has no
 // partial-index predicate path, so the predicate site doesn't exist here.
+// (Portable "sqlite" bodies are translated — pinned in sqlite_expr_route_test.go.)
 func TestWriterDialectGuard_SQLiteVerbatim(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		dialect     string
+		body        string
 		wantVerbat  bool
 		mustContain string
 	}{
-		{"sqlite", "sqlite", true, ""},
-		{"empty", "", true, ""},
-		{"unknown", "duckdb", true, ""},
-		{"postgres_translates", "postgres", false, "CONCAT"},
+		{"sqlite", "sqlite", guardBodySQLiteNonPortable, true, ""},
+		{"empty", "", guardBodyPG, true, ""},
+		{"unknown", "duckdb", guardBodyPG, true, ""},
+		{"postgres_translates", "postgres", guardBodyPG, false, "CONCAT"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			gen := translateGeneratedExpr(
-				&ir.Column{Type: ir.Integer{Width: 64}, GeneratedExpr: guardBodyPG, GeneratedExprDialect: tc.dialect},
+				&ir.Column{Type: ir.Integer{Width: 64}, GeneratedExpr: tc.body, GeneratedExprDialect: tc.dialect},
 			)
 			chk := translateCheckExpr(
-				&ir.CheckConstraint{Expr: guardBodyPG, ExprDialect: tc.dialect},
+				&ir.CheckConstraint{Expr: tc.body, ExprDialect: tc.dialect},
 			)
 			expr := translateIndexExpr(
-				ir.IndexColumn{Expression: guardBodyPG, ExpressionDialect: tc.dialect},
+				ir.IndexColumn{Expression: tc.body, ExpressionDialect: tc.dialect},
 			)
 			for label, got := range map[string]string{
 				"generated": gen, "check": chk, "indexExpr": expr,
 			} {
 				if tc.wantVerbat {
-					if got != guardBodyPG {
-						t.Errorf("%s[%s] = %q; want VERBATIM %q (translator must not run)", label, tc.name, got, guardBodyPG)
+					if got != tc.body {
+						t.Errorf("%s[%s] = %q; want VERBATIM %q (translator must not run)", label, tc.name, got, tc.body)
 					}
 				} else if !strings.Contains(got, tc.mustContain) {
 					t.Errorf("%s[%s] = %q; want it translated to contain %q", label, tc.name, got, tc.mustContain)

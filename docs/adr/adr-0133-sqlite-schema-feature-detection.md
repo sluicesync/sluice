@@ -4,6 +4,38 @@
 
 **Accepted (2026-06-27).** Roadmap item 49 follow-up (#2 of the SQLite source queue).
 
+> **Follow-up landed (2026-07-03) — SQLite→canonical EXPRESSION translator.** The
+> deferred "translate rather than pass-through-and-warn" increment shipped: a shared
+> `internal/translate.SQLiteExprToPG` / `SQLiteExprToMySQL` translator rewrites a narrow,
+> value-fidelity-reviewed PROVABLY-portable subset to the target's canonical form, fully
+> parenthesised so target precedence can't change the meaning; anything else returns
+> ok=false.
+>
+> **Allowlist (post-review shrink):** column/literal refs; `+ - *`, all comparisons,
+> `AND/OR/NOT`, `IS [NOT] NULL`; `||` concat (PG `||`, MySQL `CONCAT`); `/` on Postgres
+> ONLY (integer division matches SQLite; MySQL `/` is always decimal); `abs`, `coalesce`,
+> `ifnull→coalesce`, `nullif`, `length` (PG `LENGTH` / MySQL `CHAR_LENGTH`), 1-arg
+> `trim/ltrim/rtrim`; `substr/substring` with a LITERAL start ≥ 1 (and literal len ≥ 0 —
+> SQLite's negative start counts from the end); `min/max`→`LEAST/GREATEST` on MySQL ONLY
+> (LEAST/GREATEST propagate NULL like SQLite; PG's skip NULLs); `cast AS text|real` on both
+> and `cast AS numeric` on PG only; the current-instant keywords. **Excluded** (each a
+> proven silent-divergence a per-representative test would have passed): `%` on BOTH
+> (integer-coercion), `upper/lower` (ASCII vs Unicode fold), `round` (half-away vs
+> half-even on floats), `cast AS integer` (truncate vs round) and `cast AS blob` (byte
+> semantics), plus the temporal/`strftime`/`glob`/`typeof`/… set and the double-quoted
+> misfeature.
+>
+> **Non-portable policy differs by context (F6):** a generated column and a CHECK are
+> DATA-load-bearing, so a body with no provably-portable translation is REFUSED LOUDLY at
+> the emit path (`refuseNonPortableSQLiteExpr{PG,MySQL}`, table/column-named) — NOT emitted
+> verbatim, because a construct like `%` or `a / b` is SYNTACTICALLY valid on the target
+> and would be SILENTLY accepted with divergent semantics (verbatim only fails loudly for
+> non-portable *functions*, not operators/casts). A non-portable partial/expression INDEX
+> body stays WARN-skipped (an index is a performance object). **Still deferred:**
+> `strftime`/epoch format-string + epoch-base translation and a per-column encoding map.
+> Wired in `internal/engines/{postgres,mysql}/ddl_emit.go` + `schema_writer_check.go`;
+> src==dst value-ground-truthed on real PG + MySQL.
+
 > **Revision note (2026-06-27, pre-implementation).** This ADR's first cut decided
 > "detect + loud-WARN only" on the stated premise that *the IR does not model these
 > features, so carrying them would need new IR shape across every engine*. That premise
@@ -108,11 +140,14 @@ on the verbatim tail so the operator knows to verify non-portable constructs.**
   operator edits the source or re-adds on the target), never silently. The one residual
   silent edge — a portable-looking operator with divergent SQLite semantics — is surfaced
   by the per-table WARN.
-- **Deferred (tracked follow-up):** a real SQLite→canonical (PG/MySQL) expression
-  translator / portability allowlist, which would let sluice *translate* rather than
-  pass-through-and-warn the verbatim tail. Roadmap item 49 retains this as the next
-  increment; expression-index bodies that can't be cleanly parsed from the `CREATE INDEX`
-  SQL fall back to WARN-skip rather than carrying a guessed expression.
+- **SQLite→canonical expression translator — LANDED 2026-07-03** (see the Status
+  follow-up note). The portable subset is now *translated* to the target dialect instead
+  of passed-through-and-warned; the verbatim tail is reserved for the genuinely
+  non-portable constructs (still a loud target reject for gencol/CHECK, a WARN-skip for
+  indexes). Expression-index bodies that can't be cleanly parsed from the `CREATE INDEX`
+  SQL still WARN-skip at read time (ADR-0133 §A.4) rather than carrying a guessed
+  expression. **Still deferred:** `strftime`/`julianday`/`unixepoch`/`date·time·datetime`
+  format-string + epoch-base translation, and a per-column encoding map.
 
 ## Alternatives considered
 

@@ -633,6 +633,11 @@ func (w *SchemaWriter) buildOneIndex(ctx context.Context, conn *sql.Conn, job in
 	if err != nil {
 		return err
 	}
+	// Empty stmt = emitCreateIndex WARN-skipped a non-portable SQLite index
+	// (ADR-0133 follow-up); nothing to execute.
+	if stmt == "" {
+		return nil
+	}
 	// Idempotent resume (Bug 131): a resume re-entering phase=indexes over a
 	// table indexed in a prior run — or a partially-completed index phase —
 	// would otherwise fail with "relation already exists". Promote to the
@@ -1145,6 +1150,10 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 			if err != nil {
 				return nil, err
 			}
+			// Empty stmt = a non-portable SQLite index was WARN-skipped.
+			if stmt == "" {
+				continue
+			}
 			out = append(out, ir.DDLStatement{
 				Table: table.Name,
 				Kind:  "CREATE INDEX",
@@ -1374,6 +1383,10 @@ func (w *SchemaWriter) CreateShapeIndex(ctx context.Context, table *ir.Table, in
 		stmt, err := emitCreateIndex(w.schema, table.Name, idx, w.emitOpts())
 		if err != nil {
 			return fmt.Errorf("create shape index: emit %q: %w", idx.Name, err)
+		}
+		// Empty stmt = a non-portable SQLite index was WARN-skipped.
+		if stmt == "" {
+			continue
 		}
 		// Promote bare `CREATE [UNIQUE] INDEX <name>` to idempotent
 		// form. The first " INDEX " token is the keyword we want to

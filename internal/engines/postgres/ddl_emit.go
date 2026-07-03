@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/translate"
 )
 
 // emitOpts carries writer-derived flags that change how a few IR
@@ -618,6 +619,15 @@ func emitColumnDef(table *ir.Table, c *ir.Column, opts emitOpts) (string, error)
 	sb.WriteByte(' ')
 	sb.WriteString(typeStr)
 	if c.IsGenerated() {
+		// SQLite source (ADR-0133 follow-up): a generated column is
+		// DATA-load-bearing (its value is COMPUTED on the target), so a body
+		// with no provably-portable translation must be refused LOUDLY here —
+		// emitting it verbatim is unsafe because PG may silently accept a
+		// syntactically-valid but semantically-divergent body and compute a
+		// wrong value.
+		if err := refuseNonPortableSQLiteExprPG("generated column", c.Name, c.GeneratedExpr, c.GeneratedExprDialect); err != nil {
+			return "", err
+		}
 		// Postgres only supports STORED generated columns. If a
 		// MySQL source provides a VIRTUAL column (GeneratedStored=
 		// false), the closest correct PG representation is STORED
@@ -1242,8 +1252,19 @@ func emitIndexColumnList(cols []ir.IndexColumn, opts emitOpts) string {
 // cases. If a bool-context-aware index emit is needed later, the
 // caller can build [ExprContext] and route through this helper.
 func translateIndexExpr(c ir.IndexColumn, opts emitOpts) string {
+	// SQLite source (ADR-0133 follow-up): translate the portable subset. A
+	// non-portable expression-index body is WARN-skipped for the WHOLE index
+	// in emitCreateIndex (an index is a performance object, not a correctness
+	// one), so ok=false here is a defensive verbatim — the index was already
+	// filtered out before this renders.
+	if c.ExpressionDialect == sqliteSourceDialect {
+		if pg, ok := translate.SQLiteExprToPG(c.Expression); ok {
+			return requotePGReservedIdents(pg)
+		}
+		return c.Expression
+	}
 	// Translate ONLY from the one engine this writer's translator accepts
-	// (MySQL); self / untagged / SQLite / any unknown dialect emits verbatim
+	// (MySQL); self / untagged / any unknown dialect emits verbatim
 	// (ADR-0133 §2).
 	if c.ExpressionDialect != translatableSourceDialect {
 		return c.Expression
@@ -1268,6 +1289,24 @@ func emitCreateIndex(schema, tableName string, idx *ir.Index, opts emitOpts) (st
 	}
 	if len(idx.Columns) == 0 {
 		return "", fmt.Errorf("postgres: emitCreateIndex: index %q has no columns", idx.Name)
+	}
+
+	// SQLite source (ADR-0133 follow-up): if any carried "sqlite"-dialect
+	// predicate/expression body can't be translated to Postgres, WARN-skip
+	// the WHOLE index rather than emit a non-portable body that aborts the
+	// migration at CREATE INDEX. An index is a performance object, not a
+	// correctness one — matching ADR-0133's read-time WARN-skip choice for
+	// expression-index bodies it can't parse. Signalled to the caller as an
+	// empty statement with a nil error.
+	if offending, portable := sqliteIndexPortablePG(idx); !portable {
+		slog.Warn(
+			"postgres: skipping index carrying a non-portable SQLite expression "+
+				"(the index is NOT created on the target — recreate it there if needed)",
+			slog.String("table", tableName),
+			slog.String("index", idx.Name),
+			slog.String("expression", offending),
+		)
+		return "", nil
 	}
 
 	var sb strings.Builder
@@ -1339,15 +1378,73 @@ func emitCreateIndex(schema, tableName string, idx *ir.Index, opts emitOpts) (st
 // a MySQL-source predicate is rewritten and PG-reserved idents the
 // source reader de-quoted are re-quoted.
 func translateIndexPredicate(idx *ir.Index, opts emitOpts) string {
+	// SQLite source (ADR-0133 follow-up): translate the portable subset. A
+	// non-portable predicate WARN-skips the whole partial index in
+	// emitCreateIndex, so ok=false here is a defensive verbatim.
+	if idx.PredicateDialect == sqliteSourceDialect {
+		if pg, ok := translate.SQLiteExprToPG(idx.Predicate); ok {
+			return requotePGReservedIdents(pg)
+		}
+		return idx.Predicate
+	}
 	// Translate ONLY from the one engine this writer's translator accepts
-	// (MySQL); self / untagged / SQLite / any unknown dialect emits verbatim
-	// (ADR-0133 §2). A SQLite partial-index predicate carries through here.
+	// (MySQL); self / untagged / any unknown dialect emits verbatim
+	// (ADR-0133 §2).
 	if idx.PredicateDialect != translatableSourceDialect {
 		return idx.Predicate
 	}
 	return requotePGReservedIdents(
 		translateExprForPG(idx.Predicate, ExprContext{EnabledPGExtensions: opts.EnabledExtensions}),
 	)
+}
+
+// refuseNonPortableSQLiteExprPG returns a loud, table/column-named refusal when
+// a "sqlite"-dialect DATA-LOAD-BEARING body (a generated column or a CHECK)
+// has no provably-portable Postgres translation. This is the F6 backstop: for
+// a construct that is SYNTACTICALLY valid on PG but SEMANTICALLY divergent
+// (the modulo `%` operator, a rounding CAST, …), emitting it verbatim would be
+// SILENTLY accepted by PG and compute a wrong value in a STORED generated
+// column — so we refuse rather than trust the target to reject it. Non-sqlite
+// dialects and translatable bodies return nil. (A non-portable INDEX body is a
+// performance object, so it stays WARN-skip — see sqliteIndexPortablePG.)
+func refuseNonPortableSQLiteExprPG(kind, name, expr, dialect string) error {
+	if dialect != sqliteSourceDialect {
+		return nil
+	}
+	if _, ok := translate.SQLiteExprToPG(expr); ok {
+		return nil
+	}
+	return fmt.Errorf(
+		"refuse loudly: %s %q carries a non-portable SQLite expression %q with no "+
+			"provably-equivalent Postgres translation. Emitting it verbatim is unsafe — "+
+			"Postgres may SILENTLY accept a syntactically-valid but semantically-divergent "+
+			"body (e.g. the modulo operator or a rounding CAST) and compute a WRONG value. "+
+			"Operator recovery: drop or rewrite the %s on the SQLite source before migrating, "+
+			"or re-create an equivalent Postgres %s on the target post-migration. sluice does "+
+			"not guess non-portable SQLite expression translations",
+		kind, name, expr, kind, kind,
+	)
+}
+
+// sqliteIndexPortablePG reports whether every "sqlite"-dialect predicate and
+// expression body carried on idx translates to Postgres. When portable is
+// false, offending names the first body that doesn't (for the WARN);
+// non-SQLite / empty bodies are trivially portable (the verbatim path handles
+// them). Used by emitCreateIndex to WARN-skip a non-portable SQLite index.
+func sqliteIndexPortablePG(idx *ir.Index) (offending string, portable bool) {
+	if idx.PredicateDialect == sqliteSourceDialect && strings.TrimSpace(idx.Predicate) != "" {
+		if _, ok := translate.SQLiteExprToPG(idx.Predicate); !ok {
+			return "WHERE " + idx.Predicate, false
+		}
+	}
+	for _, c := range idx.Columns {
+		if c.ExpressionDialect == sqliteSourceDialect && c.Expression != "" {
+			if _, ok := translate.SQLiteExprToPG(c.Expression); !ok {
+				return c.Expression, false
+			}
+		}
+	}
+	return "", true
 }
 
 // resolveIndexMethod picks the access-method name to emit for an
@@ -1492,8 +1589,20 @@ func emitCheckConstraint(c *ir.CheckConstraint, tbl *ir.Table, opts emitOpts) (s
 // typed generated columns whose body returns bool get the bool side
 // cast to int, instead of converting the int literal to bool.
 func translateGeneratedExpr(c *ir.Column, tbl *ir.Table, opts emitOpts) string {
+	// SQLite source (ADR-0133 follow-up): route the portable subset through
+	// the shared SQLite→PG expression translator. A generated column is
+	// DATA-load-bearing (its value is computed on the target), so a
+	// non-portable body (ok=false) emits VERBATIM — the target REJECTS it
+	// loudly at CREATE TABLE. We NEVER warn-DROP a gencol body, which would
+	// silently change the column's meaning.
+	if c.GeneratedExprDialect == sqliteSourceDialect {
+		if pg, ok := translate.SQLiteExprToPG(c.GeneratedExpr); ok {
+			return requotePGReservedIdents(pg)
+		}
+		return c.GeneratedExpr
+	}
 	// Translate ONLY from the one engine this writer's translator accepts
-	// (MySQL); self / untagged / SQLite / any unknown dialect emits verbatim
+	// (MySQL); self / untagged / any unknown dialect emits verbatim
 	// (ADR-0133 §2).
 	if c.GeneratedExprDialect != translatableSourceDialect {
 		return c.GeneratedExpr
@@ -1520,8 +1629,19 @@ func translateGeneratedExpr(c *ir.Column, tbl *ir.Table, opts emitOpts) string {
 // column context for the v0.8.0 bool-idiom rewrite; nil is permitted
 // and disables that rewrite.
 func translateCheckExpr(c *ir.CheckConstraint, tbl *ir.Table, opts emitOpts) string {
+	// SQLite source (ADR-0133 follow-up): a CHECK constraint is
+	// DATA-load-bearing (it enforces validity), so the portable subset
+	// translates and a non-portable body emits VERBATIM for a loud target
+	// reject — never warn-DROP (dropping a CHECK silently removes an
+	// integrity guarantee).
+	if c.ExprDialect == sqliteSourceDialect {
+		if pg, ok := translate.SQLiteExprToPG(c.Expr); ok {
+			return requotePGReservedIdents(pg)
+		}
+		return c.Expr
+	}
 	// Translate ONLY from the one engine this writer's translator accepts
-	// (MySQL); self / untagged / SQLite / any unknown dialect emits verbatim
+	// (MySQL); self / untagged / any unknown dialect emits verbatim
 	// (ADR-0133 §2).
 	if c.ExprDialect != translatableSourceDialect {
 		return c.Expr

@@ -577,20 +577,22 @@ func buildIndexColumns(ctx context.Context, tableName, indexName string, entries
 }
 
 // warnTableVerbatim emits ONE WARN per table that carries any "sqlite"-dialect
-// generated-column or CHECK body (ADR-0133 §A.5). The carried text is verbatim
-// SQLite SQL: portable constructs work on the target, non-portable ones are
-// rejected loudly at target DDL time, and the residual edge — a bare operator
-// whose meaning differs under SQLite's loose typing — is what this WARN tells
-// the operator to verify.
+// generated-column or CHECK body (ADR-0133 §A.5). On a cross-engine target the
+// PG/MySQL writer TRANSLATES the portable subset (ADR-0133 follow-up, roadmap
+// #49); a body with no provably-portable translation is REFUSED LOUDLY during
+// schema emit (a generated column / CHECK is data-load-bearing). The residual
+// edge — a bare operator whose meaning differs under SQLite's loose typing — is
+// what this WARN tells the operator to verify.
 func warnTableVerbatim(ctx context.Context, t *ir.Table, generatedCols []string) {
 	if len(generatedCols) == 0 && len(t.CheckConstraints) == 0 {
 		return
 	}
 	slog.WarnContext(
 		ctx,
-		"sqlite: schema-feature expressions carried VERBATIM from SQLite; verify them on the target "+
-			"(non-portable constructs are rejected loudly at target DDL time; a bare operator may behave "+
-			"differently under SQLite's loose typing)",
+		"sqlite: schema-feature expressions carried from SQLite; verify them on the target "+
+			"(the portable subset is translated to the target dialect, a non-portable "+
+			"data-bearing construct is refused loudly during schema emit, and a bare operator "+
+			"may behave differently under SQLite's loose typing)",
 		slog.String("table", t.Name),
 		slog.Any("generated_columns", generatedCols),
 		slog.Int("check_constraints", len(t.CheckConstraints)),
@@ -598,15 +600,18 @@ func warnTableVerbatim(ctx context.Context, t *ir.Table, generatedCols []string)
 }
 
 // warnIndexVerbatim emits ONE WARN per index that carries a "sqlite"-dialect
-// partial-index predicate and/or expression-index column (ADR-0133 §A.5).
+// partial-index predicate and/or expression-index column (ADR-0133 §A.5). A
+// non-portable index body is WARN-skipped at emit time (an index is a
+// performance object) rather than carried verbatim into a loud DDL failure.
 func warnIndexVerbatim(ctx context.Context, tableName, indexName string, hasPredicate bool, exprCount int) {
 	if !hasPredicate && exprCount == 0 {
 		return
 	}
 	slog.WarnContext(
 		ctx,
-		"sqlite: index predicate/expression carried VERBATIM from SQLite; verify it on the target "+
-			"(non-portable constructs are rejected loudly at target DDL time)",
+		"sqlite: index predicate/expression carried from SQLite; verify it on the target "+
+			"(the portable subset is translated to the target dialect; a non-portable index body is "+
+			"skipped rather than created)",
 		slog.String("table", tableName),
 		slog.String("index", indexName),
 		slog.Bool("partial_predicate", hasPredicate),
