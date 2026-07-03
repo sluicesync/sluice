@@ -55,6 +55,13 @@ type CDCReader struct {
 	exec executor
 	dec  *sqlite.CapturedCellDecoder
 
+	// b is the transport backend (dsn + executor factory) the reader was opened
+	// against. Retained so the ADR-0137 Phase-B auto-prune ([PruneConsumedChangeLog])
+	// can open its OWN writable executor for the DELETE — independent of the
+	// read-only poll executor above, so the prune never contends with (or races
+	// the Close of) the polling connection.
+	b backend
+
 	// colTypes maps table → column-name → resolved IR type, read once at open
 	// from the validated cold-start schema reader so each captured cell decodes
 	// through the SAME storage-class-faithful path as a cold-start row.
@@ -121,6 +128,7 @@ func openCDCReaderBackend(ctx context.Context, b backend) (ir.CDCReader, error) 
 	return &CDCReader{
 		exec:               exec,
 		dec:                dec,
+		b:                  b,
 		colTypes:           colTypes,
 		pollInterval:       defaultPollInterval,
 		batchSize:          defaultBatchSize,

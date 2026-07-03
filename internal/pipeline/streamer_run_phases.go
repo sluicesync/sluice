@@ -230,6 +230,8 @@ func (s *Streamer) phaseResolveStreamIdentity(ctx context.Context) (string, erro
 	s.sourceErrFn = nil
 	// ADR-0094: same per-attempt reset for the reshard-reopen handle.
 	s.sourceReshard = nil
+	// ADR-0137 Phase B: same per-attempt reset for the change-log-pruner handle.
+	s.changeLogPruner = nil
 
 	// Apply the sluice-prefix convention to the operator-supplied
 	// slot name (v0.10.2). Empty stays empty (engine default);
@@ -780,6 +782,14 @@ func (s *Streamer) phaseStartApplySidecars(applyCtx context.Context, applier ir.
 	// Observability only — a dead sink is logged-and-swallowed, never able to
 	// stall or crash the stream.
 	s.startSyncLagNotifier(applyCtx, streamID)
+
+	// ADR-0137 Phase B: in-stream auto-prune of a trigger-CDC source's
+	// change-log. Started here (apply phase) because the source CDC reader —
+	// hence s.changeLogPruner — is only open once streaming begins. No opt-in
+	// (--auto-prune-change-log off) or a non-trigger source ⇒ no goroutine.
+	// Failure-isolated: a prune error is logged-and-swallowed, never able to
+	// stall or crash the stream.
+	s.startAutoPruneChangeLog(applyCtx, streamID, applier)
 
 	// ADR-0107 items 35 (rolling-history recorder) + 36 (threshold alerter)
 	// are NO LONGER started here — they are started earlier, in runOnce (see

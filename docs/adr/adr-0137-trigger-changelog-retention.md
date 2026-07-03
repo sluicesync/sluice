@@ -51,13 +51,35 @@ durable watermark, never the source reader's read cursor.
    below it with a margin) and decoupled from the live stream. An operator schedules it
    (cron / sidecar / a `--prune-interval` wrapper) alongside a continuous sync.
 
-2. **Phase B — automatic in-stream pruning (DEFERRED).** The streamer, after the applier
-   confirms a position durably persisted (a checkpoint), prunes the source change-log
-   `<= that durable id` on a cadence (every K checkpoints / T seconds), via a source-side
-   prune hook threaded the durable-applied id. This removes the manual-scheduling burden
-   but requires plumbing the applier's durable-checkpoint signal back to a source-side
-   prune and tuning the cadence — its own design increment. Phase A gives operators a
-   safe tool now; Phase B is the ergonomic follow-up.
+2. **Phase B — automatic in-stream pruning (IMPLEMENTED).** The streamer runs an
+   opt-in (`--auto-prune-change-log`) failure-isolated sidecar that prunes the source
+   change-log on a wall-clock cadence (`--auto-prune-interval`, default 5m; margin
+   `--auto-prune-keep`, default 1000) so operators don't schedule a cron. It removes the
+   manual-scheduling burden of Phase A while keeping Phase A's exact safety contract.
+
+   **Implementation notes / divergence from the original sketch (flagged per convention):**
+   - *Durable-frontier source.* Rather than plumbing the applier's per-checkpoint
+     durable-persist signal back to a source-side hook (the original sketch), the sidecar
+     reads the target's durably-persisted position on each cadence via the applier's
+     `ReadPosition` — the SAME cdc-state row `sluice trigger prune` reads — and hands that
+     token to the source. This is simpler, needs no new checkpoint→source plumbing, and is
+     just as safe (the persisted position IS the durably-applied frontier). The timer-based
+     cadence also naturally satisfies "do not prune on every checkpoint".
+   - *Engine-neutral seam.* A new optional IR capability `ir.ChangeLogPruner`
+     (`PruneConsumedChangeLog(ctx, durablePositionToken, keep)`) is implemented on the
+     trigger engines' CDC-reader types (sqlite-trigger / d1-trigger / pgtrigger). The engine
+     decodes the token with its OWN codec (reusing `AppliedLastID`, which refuses a FOREIGN
+     token loudly), computes `cut = appliedLastID - keep`, and reaps `id <= cut` — keeping the
+     position codec inside the engine so the streamer stays engine-neutral (it never imports a
+     trigger package). A non-trigger source doesn't implement the interface ⇒ typed-nil no-op.
+   - *Failure isolation (the one deliberate divergence from Phase A).* Unlike the Phase-A
+     command, which fails LOUD, a Phase-B prune error is logged at WARN and SWALLOWED — it is
+     background housekeeping and must never break or stall the sync, mirroring the ADR-0107
+     telemetry sidecars.
+   - *Default OFF (zero-value-safe).* `--auto-prune-change-log` defaults false: auto-DELETEing
+     source rows is an explicit operator opt-in for the first cut, and the zero value is the
+     safe/pre-Phase-B default for every construction (CLI, tests, broker/chain, future callers).
+     Default-ON is a possible future once the cadence is field-proven on real continuous syncs.
 
 ## Consequences
 

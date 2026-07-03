@@ -973,6 +973,10 @@ type SyncStartCmd struct {
 
 	PollInterval time.Duration `help:"Override the CDC reader's poll cadence for poll-based engines (today: postgres-trigger; default 1s). Push-based engines (postgres pgoutput, mysql binlog, planetscale VStream) silently ignore — they have no poll loop. Operators chasing lower CDC latency on a write-heavy postgres-trigger stream tighten this to e.g. 250ms; operators trading latency for source load loosen to 5s. 0 (the default) keeps the engine's built-in cadence. ADR-0066 §6; roadmap item 18(c)." placeholder:"DUR"`
 
+	AutoPruneChangeLog bool          `help:"Automatically reap consumed rows from a trigger-CDC source's sluice_change_log in-stream, so it doesn't grow unbounded on a continuous sync (ADR-0137 Phase B, Bug 165). Applies only to trigger-CDC sources (postgres-trigger / sqlite-trigger / d1-trigger); a no-op for every other engine (they have no change-log). Off by default — auto-DELETEing source rows is an explicit opt-in. Only durably-applied rows (below the target's persisted CDC frontier, minus --auto-prune-keep) are removed, so warm-resume is never starved; a prune failure is logged and swallowed, never affecting the sync. Equivalent to scheduling 'sluice trigger prune' on a cron, without the cron."`
+	AutoPruneInterval  time.Duration `help:"Cadence for --auto-prune-change-log. Default 5m. Only consulted when --auto-prune-change-log is set." default:"5m" placeholder:"DUR"`
+	AutoPruneKeep      int64         `help:"Safety margin for --auto-prune-change-log: keep the most-recent N change-log ids below the durable frontier unpruned. Belt-and-suspenders — the frontier itself is already durably applied, so even 0 is safe. Default 1000 (matches 'sluice trigger prune --keep'). Only consulted when --auto-prune-change-log is set." default:"1000" placeholder:"N"`
+
 	SourceHeartbeatInterval    time.Duration `help:"ADR-0061 / F17 — enable the source-side heartbeat writer at this cadence. Sluice INSERTs a row into a sluice-owned table on the source every interval; the INSERT generates WAL (Postgres) / binlog (MySQL) so the CDC consumer's position advances even against an idle source, preventing slot eviction / binlog rotation past the consumer. 0 (default) disables — F17 is opt-in because the INSERT is a behaviour change on the source DB that operators on regulated systems must explicitly enable. Typical value 30s. The source-side table (default 'sluice_heartbeat') is auto-created; on roles without CREATE TABLE privilege the streamer WARNs once and continues without F17." default:"0s" placeholder:"DUR"`
 	SourceHeartbeatPruneWindow time.Duration `help:"ADR-0061 / F17 — age threshold for the periodic DELETE that bounds heartbeat-table growth. Rows older than this duration are dropped on a periodic prune pass. 0 disables prune (table grows unbounded). Only consulted when --source-heartbeat-interval > 0." default:"1h" placeholder:"DUR"`
 	SourceHeartbeatTableName   string        `help:"ADR-0061 / F17 — override the source-side heartbeat table name. Default 'sluice_heartbeat'. Operators with hostile DBA-managed namespaces can pre-create a differently-named table and point the writer at it. Only consulted when --source-heartbeat-interval > 0." default:"sluice_heartbeat" placeholder:"NAME"`
@@ -1625,6 +1629,12 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		NotifySMTP:        s.smtpConfig(),
 		HeartbeatInterval: s.HeartbeatInterval,
 		PollInterval:      s.PollInterval,
+
+		// ADR-0137 Phase B: opt-in in-stream change-log auto-prune (trigger-CDC
+		// sources only; a no-op for every other engine). Off by default.
+		AutoPruneChangeLog: s.AutoPruneChangeLog,
+		AutoPruneInterval:  s.AutoPruneInterval,
+		AutoPruneKeep:      s.AutoPruneKeep,
 
 		SourceHeartbeatInterval:    s.SourceHeartbeatInterval,
 		SourceHeartbeatPruneWindow: s.SourceHeartbeatPruneWindow,

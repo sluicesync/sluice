@@ -105,6 +105,31 @@ func Prune(ctx context.Context, dsn string, opts PruneOptions) (*PruneResult, er
 	return res, nil
 }
 
+// PruneConsumedChangeLog implements [ir.ChangeLogPruner] (ADR-0137 Phase B): the
+// streamer's in-stream auto-prune sidecar calls it on a cadence with the TARGET's
+// durably-persisted position token. The decode stays engine-owned — it reuses
+// [AppliedLastID] (which refuses a FOREIGN token loudly) to extract the applied
+// frontier, then reaps `id <= appliedLastID - keep`. A non-positive cut is a safe
+// no-op. It delegates to [Prune] against the reader's DSN, which opens its OWN
+// short-lived connection (not the reader's poll pool), so the prune never races
+// the reader's Close — and inherits Prune's change-log-exists guard.
+func (r *CDCReader) PruneConsumedChangeLog(ctx context.Context, durablePositionToken string, keep int64) (int64, error) {
+	appliedLastID, err := AppliedLastID(durablePositionToken)
+	if err != nil {
+		return 0, err
+	}
+	cut := appliedLastID - keep
+	if cut <= 0 {
+		// Nothing safely below the durable frontier minus the margin yet.
+		return 0, nil
+	}
+	res, err := Prune(ctx, r.dsn, PruneOptions{Cut: cut, Schema: r.schema})
+	if err != nil {
+		return 0, err
+	}
+	return res.Deleted, nil
+}
+
 // pgChangeLogStats returns COALESCE(MIN(id), 0) and COUNT(*) of the change-log.
 // tableRef is the already-quoted schema.table reference.
 func pgChangeLogStats(ctx context.Context, db *sql.DB, tableRef string) (minID, count int64, err error) {

@@ -58,6 +58,32 @@ func PruneD1(ctx context.Context, dsn string, opts PruneOptions) (*PruneResult, 
 	return prune(ctx, b, opts)
 }
 
+// PruneConsumedChangeLog implements [ir.ChangeLogPruner] (ADR-0137 Phase B): the
+// streamer's in-stream auto-prune sidecar calls it on a cadence with the TARGET's
+// durably-persisted position token. The decode stays engine-owned — it reuses
+// [AppliedLastID] (which refuses a FOREIGN token loudly) to extract the applied
+// frontier, then reaps `id <= appliedLastID - keep`. A non-positive cut is a safe
+// no-op. The DELETE runs on a FRESH writable executor opened from the reader's
+// backend (not the read-only poll executor), so it never contends with — or races
+// the Close of — the polling connection. Both the local SQLite file and the D1
+// transport are handled transparently by the shared [prune] path.
+func (r *CDCReader) PruneConsumedChangeLog(ctx context.Context, durablePositionToken string, keep int64) (int64, error) {
+	appliedLastID, err := AppliedLastID(durablePositionToken)
+	if err != nil {
+		return 0, err
+	}
+	cut := appliedLastID - keep
+	if cut <= 0 {
+		// Nothing safely below the durable frontier minus the margin yet.
+		return 0, nil
+	}
+	res, err := prune(ctx, r.b, PruneOptions{Cut: cut})
+	if err != nil {
+		return 0, err
+	}
+	return res.Deleted, nil
+}
+
 // prune is the transport-neutral reaper used by both [Prune] (local file) and
 // [PruneD1] (D1 over HTTP). It opens a writable executor, verifies the change-log
 // exists (refusing loudly otherwise — a prune against a non-setup source is an

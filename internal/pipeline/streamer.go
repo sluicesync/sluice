@@ -903,6 +903,33 @@ type Streamer struct {
 	// ignore this. Zero leaves the engine's default in place.
 	PollInterval time.Duration
 
+	// AutoPruneChangeLog opts IN to the ADR-0137 Phase-B in-stream auto-prune
+	// of a trigger-CDC source's `sluice_change_log` (Bug 165). When set AND the
+	// source implements [ir.ChangeLogPruner] (sqlite-trigger / d1-trigger /
+	// pgtrigger), a failure-isolated sidecar reaps durably-applied change-log
+	// rows on a cadence so the source doesn't grow unbounded, without the
+	// operator scheduling `sluice trigger prune` via cron.
+	//
+	// Zero-value safety (the v0.99.51 trap): default false = OFF = no
+	// auto-prune, the pre-Phase-B behaviour for EVERY construction (CLI, tests,
+	// broker/chain paths, future callers). Auto-deleting source rows is made an
+	// explicit operator opt-in for the first cut. The sidecar is ALSO a no-op
+	// for any non-trigger source (typed-nil pruner), so a set flag on a vanilla
+	// PG/MySQL sync does nothing. Set true only by `--auto-prune-change-log`.
+	AutoPruneChangeLog bool
+
+	// AutoPruneInterval is the wall-clock cadence the auto-prune sidecar reaps
+	// at. Zero ⇒ [defaultAutoPruneInterval] (5 min). Only consulted when
+	// AutoPruneChangeLog is set.
+	AutoPruneInterval time.Duration
+
+	// AutoPruneKeep is the belt-and-suspenders safety margin: keep the most
+	// recent N change-log ids below the durable frontier unpruned (the same
+	// meaning as `sluice trigger prune --keep`). The frontier itself is already
+	// durably applied so even 0 is safe. Only consulted when AutoPruneChangeLog
+	// is set; a negative value is clamped to 0.
+	AutoPruneKeep int64
+
 	// SourceHeartbeatInterval, when > 0, enables the F17 source-side
 	// heartbeat writer (ADR-0061). The streamer attaches a per-stream
 	// goroutine that periodically INSERTs a row into the sluice-owned
@@ -962,6 +989,15 @@ type Streamer struct {
 	// layout instead of exiting. Reset to nil per attempt alongside
 	// sourceErrFn; populated where sourceErrFn is.
 	sourceReshard ir.ReshardReopener
+
+	// changeLogPruner is the per-attempt CDC reader cast to
+	// [ir.ChangeLogPruner] when the reader implements it (the trigger-CDC
+	// engines: sqlite-trigger / d1-trigger / pgtrigger; nil for every other
+	// source, which has no change-log). ADR-0137 Phase B: the auto-prune
+	// sidecar ([startAutoPruneChangeLog]) uses it to reap the source
+	// change-log on a cadence. Reset to nil per attempt alongside sourceErrFn;
+	// populated where sourceErrFn is (coldStart / warmResume).
+	changeLogPruner ir.ChangeLogPruner
 
 	// runOnceFn is a test seam: when non-nil, [Run] / [runWithRetry]
 	// invoke it in place of [runOnce]. Production always leaves it nil

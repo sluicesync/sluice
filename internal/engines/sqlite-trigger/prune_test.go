@@ -174,6 +174,83 @@ func TestPrune_RefusesMissingChangeLog(t *testing.T) {
 	}
 }
 
+// TestPruneConsumedChangeLog_ComputesCutFromFrontier pins the ADR-0137 Phase-B
+// auto-prune bound: PruneConsumedChangeLog derives cut = AppliedLastID(token) -
+// keep and reaps id <= cut, keying off the durable frontier the sidecar passes
+// in. A CDCReader with only its backend set is enough — the method opens its own
+// writable executor. modernc.org/sqlite gives the real DELETE path with no
+// container.
+func TestPruneConsumedChangeLog_ComputesCutFromFrontier(t *testing.T) {
+	path := seedChangeLog(t, 10)
+	r := &CDCReader{b: localBackend(path)}
+
+	// frontier last_id=8, keep=3 ⇒ cut=5 ⇒ delete 1..5, keep 6..10.
+	deleted, err := r.PruneConsumedChangeLog(context.Background(), `{"last_id":8}`, 3)
+	if err != nil {
+		t.Fatalf("PruneConsumedChangeLog: %v", err)
+	}
+	if deleted != 5 {
+		t.Errorf("deleted = %d; want 5 (cut = 8 - 3 = 5, inclusive)", deleted)
+	}
+	if got := remainingIDs(t, path); !equalIDs(got, []int64{6, 7, 8, 9, 10}) {
+		t.Errorf("remaining = %v; want [6 7 8 9 10]", got)
+	}
+}
+
+// TestPruneConsumedChangeLog_NeverAboveFrontier is the load-bearing silent-loss
+// pin: even at keep=0 (cut == frontier), rows with id > frontier — which may be
+// read but NOT yet durably applied — are NEVER deleted.
+func TestPruneConsumedChangeLog_NeverAboveFrontier(t *testing.T) {
+	path := seedChangeLog(t, 10)
+	r := &CDCReader{b: localBackend(path)}
+
+	// frontier last_id=8, keep=0 ⇒ cut=8 ⇒ delete 1..8; ids 9,10 (> frontier)
+	// MUST survive — they are not yet durably applied.
+	deleted, err := r.PruneConsumedChangeLog(context.Background(), `{"last_id":8}`, 0)
+	if err != nil {
+		t.Fatalf("PruneConsumedChangeLog: %v", err)
+	}
+	if deleted != 8 {
+		t.Errorf("deleted = %d; want 8 (cut == frontier, inclusive)", deleted)
+	}
+	if got := remainingIDs(t, path); !equalIDs(got, []int64{9, 10}) {
+		t.Errorf("remaining = %v; want [9 10] — rows above the durable frontier must never be pruned", got)
+	}
+}
+
+// TestPruneConsumedChangeLog_NonPositiveCutIsNoOp asserts that when the margin
+// exceeds the frontier (cut <= 0), nothing is deleted (a safe no-op, no error).
+func TestPruneConsumedChangeLog_NonPositiveCutIsNoOp(t *testing.T) {
+	path := seedChangeLog(t, 10)
+	r := &CDCReader{b: localBackend(path)}
+
+	deleted, err := r.PruneConsumedChangeLog(context.Background(), `{"last_id":2}`, 1000)
+	if err != nil {
+		t.Fatalf("PruneConsumedChangeLog: %v", err)
+	}
+	if deleted != 0 {
+		t.Errorf("deleted = %d; want 0 (cut = 2 - 1000 <= 0 ⇒ no-op)", deleted)
+	}
+	if got := remainingIDs(t, path); len(got) != 10 {
+		t.Errorf("remaining = %v; a non-positive cut must delete nothing", got)
+	}
+}
+
+// TestPruneConsumedChangeLog_RefusesForeignToken asserts a non-trigger-CDC token
+// is refused loudly via the shared AppliedLastID decode (never a blind prune
+// against the wrong stream).
+func TestPruneConsumedChangeLog_RefusesForeignToken(t *testing.T) {
+	path := seedChangeLog(t, 10)
+	r := &CDCReader{b: localBackend(path)}
+
+	if _, err := r.PruneConsumedChangeLog(context.Background(), `{"slot":"s","lsn":"0/16B3748"}`, 0); err == nil {
+		t.Error("PruneConsumedChangeLog(foreign token) returned nil; want a loud refuse")
+	}
+	if got := remainingIDs(t, path); len(got) != 10 {
+		t.Errorf("remaining = %v; a refused prune must delete nothing", got)
+	}
+}
+
 // TestAppliedLastID covers the token decode used to derive the prune bound.
 func TestAppliedLastID(t *testing.T) {
 	got, err := AppliedLastID(`{"last_id":42}`)

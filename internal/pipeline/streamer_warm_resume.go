@@ -96,6 +96,12 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position, lsnTra
 	if rr, ok := cdc.(ir.ReshardReopener); ok {
 		s.sourceReshard = rr
 	}
+	// ADR-0137 Phase B: capture the change-log-pruner surface (trigger-CDC
+	// engines) so the apply-phase auto-prune sidecar can reap the source
+	// change-log on a cadence. Non-trigger readers don't implement it → nil.
+	if p, ok := cdc.(ir.ChangeLogPruner); ok {
+		s.changeLogPruner = p
+	}
 	return changes, stop, nil
 }
 

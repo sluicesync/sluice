@@ -834,6 +834,12 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 	if rr, ok := stream.Changes.(ir.ReshardReopener); ok {
 		s.sourceReshard = rr
 	}
+	// ADR-0137 Phase B: capture the change-log-pruner surface (trigger-CDC
+	// engines) so the apply-phase auto-prune sidecar can reap the source
+	// change-log on a cadence. Non-trigger readers don't implement it → nil.
+	if p, ok := stream.Changes.(ir.ChangeLogPruner); ok {
+		s.changeLogPruner = p
+	}
 	// stream stays alive for the rest of Run; the returned stop closure
 	// closes it when Run unwinds, joining the engine-side streaming
 	// goroutine deterministically (no longer left to process-exit

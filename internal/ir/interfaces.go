@@ -1240,6 +1240,36 @@ type CDCReader interface {
 	StreamChanges(ctx context.Context, from Position) (<-chan Change, error)
 }
 
+// ChangeLogPruner is the OPTIONAL capability a trigger-CDC source
+// (sqlite-trigger / d1-trigger / pgtrigger) implements so the streamer can
+// AUTO-PRUNE its consumed `sluice_change_log` in-stream (ADR-0137 Phase B,
+// Bug 165). The trigger engines capture every source change and never reap it,
+// so the change-log grows unbounded for the life of a continuous sync; the
+// streamer's auto-prune sidecar calls this on a cadence to bound that growth.
+//
+// The argument is the TARGET's durably-persisted CDC position TOKEN (read by
+// the sidecar from the applier's cdc-state — the durably-applied frontier, the
+// ONLY safe lower bound). The engine decodes it with its OWN position codec
+// (reusing its `AppliedLastID`), computes `cut = appliedLastID - keep`, and
+// DELETEs `sluice_change_log` rows with `id <= cut`. Keeping the decode inside
+// the engine keeps the streamer engine-neutral — it never sees the position
+// codec. `keep` is a belt-and-suspenders safety margin (rows kept below the
+// frontier); a non-positive cut is a safe no-op (0 deleted, nil error). It
+// returns the number of rows deleted.
+//
+// The load-bearing safety contract (ADR-0137): the token MUST be the target's
+// durably-applied frontier, NEVER the source reader's read cursor (which runs
+// ahead) — pruning above the durable frontier would delete not-yet-applied
+// rows and cause silent loss on warm-resume. Passing a FOREIGN (non-trigger-CDC)
+// token is refused loudly by the engine's `AppliedLastID` decode.
+//
+// A source that doesn't implement this (vanilla PG/MySQL/vitess — they have no
+// change-log) is a typed-nil no-op: the sidecar type-asserts and simply does
+// not run.
+type ChangeLogPruner interface {
+	PruneConsumedChangeLog(ctx context.Context, durablePositionToken string, keep int64) (deleted int64, err error)
+}
+
 // ChangeApplier applies [Change] events to a target database and
 // persists progress alongside each applied change. Each Apply call
 // commits the data write and the position update in the same target
