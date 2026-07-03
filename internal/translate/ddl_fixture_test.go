@@ -47,7 +47,16 @@
 // `NOTICE` there for upstream source, SHA, license context, and
 // refresh instructions.
 
-package translate
+// package translate_test (external test package) — NOT package translate.
+// This harness imports internal/engines/mysql (blank, for init() self-
+// registration), and engines/mysql imports internal/translate. An internal
+// (package translate) test importing mysql would form a cycle under the
+// `integration && ddlfixture` build — translate → mysql → translate — which
+// scripts/vet-tags.sh catches even though a plain `-tags=integration` run
+// doesn't include this file. Living in translate_test breaks the cycle: nothing
+// imports the external test package, so translate → mysql has no back-edge. The
+// harness references no unexported translate symbols, so the move is transparent.
+package translate_test
 
 import (
 	"context"

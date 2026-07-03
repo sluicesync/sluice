@@ -83,6 +83,16 @@ func (p *autoPruneFakePruner) numCalls() int {
 	return p.calls
 }
 
+// lastCall returns the most recent (token, keep) under the lock. The sidecar
+// goroutine writes lastToken/lastKeep from PruneConsumedChangeLog, so assertions
+// must read them through this accessor — a bare field read races the still-running
+// sidecar (ctx cancel does not wait for it to exit).
+func (p *autoPruneFakePruner) lastCall() (token string, keep int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastToken, p.lastKeep
+}
+
 // --- autoPruneGate cadence -------------------------------------------------
 
 // TestAutoPruneGate_AtMostOncePerInterval pins the cadence contract with an
@@ -275,7 +285,8 @@ func TestStartAutoPruneChangeLog_PrunesOnCadence(t *testing.T) {
 	if pruner.numCalls() == 0 {
 		t.Fatal("pruner never called; want at least one prune on the cadence")
 	}
-	if pruner.lastToken != `{"last_id":99}` || pruner.lastKeep != 10 {
-		t.Errorf("pruner called with token=%q keep=%d; want token={last_id:99} keep=10", pruner.lastToken, pruner.lastKeep)
+	lastToken, lastKeep := pruner.lastCall()
+	if lastToken != `{"last_id":99}` || lastKeep != 10 {
+		t.Errorf("pruner called with token=%q keep=%d; want token={last_id:99} keep=10", lastToken, lastKeep)
 	}
 }
