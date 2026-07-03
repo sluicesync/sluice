@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.173] - 2026-07-02
+
+### Added
+
+- **Operator hints for the PlanetScale index-build statement-time wall.** When a deferred `ADD INDEX` fails with PlanetScale's max-statement-execution-time limit (MySQL errno 3024, "Query execution was interrupted, maximum statement execution time exceeded") on a large target, the index-phase error now carries an actionable hint instead of a cryptic vttablet error: **the data is already copied, so `--resume` finishes just the indexes with no re-copy** — bump the PlanetScale resource size first (a larger cluster builds the index faster, more likely under the limit) — or start fresh with `--upfront-indexes` to build indexes during the copy. The `--resume` framing matters: a large migrate that fails on the *last* table's index build has all its data copied, and `classifyTableForResume` skips completed tables, so `--resume` retries only the index build (no re-copy) rather than restarting the whole migration. A sibling hint covers the safe-migrations `direct DDL is disabled` (errno 1105) case with the *correct* fix — disable safe-migrations — since `--upfront-indexes` does not help there (its `ALTER` is also direct DDL). Both are pure hint-registry entries appended to the existing wrapped error; no behavior change.
+
 ## [0.99.172] - 2026-07-02
 
 ### Added
