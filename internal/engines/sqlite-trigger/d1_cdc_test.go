@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"sluicesync.dev/sluice/internal/engines/sqlite"
 	"sluicesync.dev/sluice/internal/ir"
@@ -739,5 +740,58 @@ func TestD1Prune_BatchesBoundedStatements(t *testing.T) {
 	}
 	if m.pruneLo != cut+1 {
 		t.Errorf("modeled MIN(id) after prune = %d; want %d", m.pruneLo, cut+1)
+	}
+}
+
+// TestD1Poll_BatchClampedToTransportCeiling pins the P-3 clamp end-to-end: a
+// reader opened over the D1 transport polls with LIMIT d1PollBatchSize (1000,
+// the ~1 MB /query response cap that also sizes sqlite.d1PageSize — change rows
+// carry full before/after images, so the shared 10k default could overflow it),
+// verified on the poll SQL the mock /query endpoint actually receives.
+func TestD1Poll_BatchClampedToTransportCeiling(t *testing.T) {
+	tbl := idNTable()
+	m := &mockD1{
+		exists:       true,
+		fingerprints: [][2]string{{"t", columnFingerprint(nonGeneratedColumnNames(tbl))}},
+	}
+	conn := startMockD1(t, m)
+	b := d1TestBackend(conn, &ir.Schema{Tables: []*ir.Table{tbl}})
+
+	r, err := openCDCReaderBackend(bg(), b)
+	if err != nil {
+		t.Fatalf("openCDCReaderBackend: %v", err)
+	}
+	defer func() { _ = r.(interface{ Close() error }).Close() }()
+	if got := r.(*CDCReader).batchSize; got != d1PollBatchSize {
+		t.Errorf("D1 reader batchSize = %d; want %d (transport clamp)", got, d1PollBatchSize)
+	}
+
+	ctx, cancel := context.WithCancel(bg())
+	defer cancel()
+	ch, err := r.StreamChanges(ctx, pos0(t))
+	if err != nil {
+		t.Fatalf("StreamChanges: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		m.mu.Lock()
+		n := len(m.pollSQL)
+		m.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no poll request recorded within 5s")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	for range ch { // drain so the pump goroutine exits cleanly
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !strings.Contains(m.pollSQL[0], "LIMIT "+strconv.Itoa(d1PollBatchSize)) {
+		t.Errorf("poll SQL sent to D1 = %q; want the clamped LIMIT %d", m.pollSQL[0], d1PollBatchSize)
 	}
 }

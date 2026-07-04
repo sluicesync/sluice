@@ -194,6 +194,7 @@ func (s *spyExecutor) pruneChangeLogBatch(context.Context, int64, int64) (int64,
 }
 func (s *spyExecutor) minChangeLogID(context.Context) (int64, error) { return 0, nil }
 func (s *spyExecutor) pruneBatchSize() int64                         { return localPruneBatchSize }
+func (s *spyExecutor) maxPollBatch() int                             { return 0 }
 func (s *spyExecutor) checkpointWAL(context.Context) error {
 	atomic.AddInt64(&s.checkpoints, 1)
 	return nil

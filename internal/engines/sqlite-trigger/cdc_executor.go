@@ -58,6 +58,9 @@ type executor interface {
 	// pruneBatchSize is the transport's DELETE batch bound; see the
 	// per-transport constants for the rationale (P-1).
 	pruneBatchSize() int64
+	// maxPollBatch is the transport's poll-batch ceiling; 0 means no ceiling.
+	// The reader clamps its poll batch to it at open (P-3).
+	maxPollBatch() int
 	// checkpointWAL bounds the source WAL under sustained CDC (Bug 167). On the
 	// local SQLite path it issues `PRAGMA wal_checkpoint(TRUNCATE)` so the
 	// continuously-churned change-log WAL is reset on a cadence instead of
@@ -320,6 +323,10 @@ func (e *localExecutor) minChangeLogID(ctx context.Context) (int64, error) {
 
 func (e *localExecutor) pruneBatchSize() int64 { return localPruneBatchSize }
 
+// maxPollBatch: no transport ceiling — the local *sql.DB path streams rows
+// with no response-size cap, so the reader keeps the shared default batch.
+func (e *localExecutor) maxPollBatch() int { return 0 }
+
 func (e *localExecutor) checkpointWAL(ctx context.Context) error {
 	// PRAGMA wal_checkpoint returns one row: (busy, log_frames, checkpointed).
 	// busy=1 means a reader/writer held the WAL so it could not fully truncate
@@ -564,6 +571,17 @@ func (e *d1Executor) minChangeLogID(ctx context.Context) (int64, error) {
 }
 
 func (e *d1Executor) pruneBatchSize() int64 { return d1PruneBatchSize }
+
+// d1PollBatchSize clamps the change-log poll batch on the D1 transport (P-3).
+// Cloudflare caps a /query response at ~1 MB — the same limit that sizes the
+// cold-copy row reader's page at 1000 (see sqlite.d1PageSize) — and change
+// rows are HEAVIER than data rows (each carries full before/after JSON
+// images), so the shared defaultBatchSize (10000) can overflow the cap on a
+// catch-up poll. 1000 matches d1PageSize's reasoning; the pump's full-batch
+// fast-repoll keeps catch-up throughput unthrottled.
+const d1PollBatchSize = 1000
+
+func (e *d1Executor) maxPollBatch() int { return d1PollBatchSize }
 
 // checkpointWAL is a no-op on the D1 transport: D1 polls over the `/query` HTTP
 // API against Cloudflare-managed storage — there is no local pager or WAL file

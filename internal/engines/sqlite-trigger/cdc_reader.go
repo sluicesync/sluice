@@ -129,13 +129,23 @@ func openCDCReaderBackend(ctx context.Context, b backend) (ir.CDCReader, error) 
 		_ = exec.close()
 		return nil, err
 	}
+	// P-3: clamp the poll batch to the transport's ceiling. The D1 /query
+	// response is size-capped and change rows carry full before/after JSON
+	// images, so the shared 10k default can overflow it on a catch-up poll
+	// (see d1PollBatchSize); the local path declares no ceiling and keeps the
+	// default. The pump's full-batch fast-repoll adapts to whatever batch the
+	// reader ends up with, so a clamped catch-up is not cadence-throttled.
+	batch := defaultBatchSize
+	if ceil := exec.maxPollBatch(); ceil > 0 && batch > ceil {
+		batch = ceil
+	}
 	return &CDCReader{
 		exec:               exec,
 		dec:                dec,
 		b:                  b,
 		colTypes:           colTypes,
 		pollInterval:       defaultPollInterval,
-		batchSize:          defaultBatchSize,
+		batchSize:          batch,
 		checkpointInterval: defaultCheckpointInterval,
 	}, nil
 }

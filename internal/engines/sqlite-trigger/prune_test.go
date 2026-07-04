@@ -540,6 +540,19 @@ func TestPruneConsumedChangeLog_RemainingEstimateConsistent(t *testing.T) {
 	}
 }
 
+// TestPollBatch_TransportCeilings pins the P-3 seam constants: the local
+// transport declares NO poll ceiling (the reader keeps defaultBatchSize) while
+// the D1 transport clamps to d1PollBatchSize (the reader-side wiring is pinned
+// end-to-end in TestD1Poll_BatchClampedToTransportCeiling).
+func TestPollBatch_TransportCeilings(t *testing.T) {
+	if got := (&localExecutor{}).maxPollBatch(); got != 0 {
+		t.Errorf("localExecutor.maxPollBatch() = %d; want 0 (no ceiling)", got)
+	}
+	if got := (&d1Executor{}).maxPollBatch(); got != d1PollBatchSize {
+		t.Errorf("d1Executor.maxPollBatch() = %d; want %d", got, d1PollBatchSize)
+	}
+}
+
 // TestAppliedLastID covers the token decode used to derive the prune bound.
 func TestAppliedLastID(t *testing.T) {
 	got, err := AppliedLastID(`{"last_id":42}`)
