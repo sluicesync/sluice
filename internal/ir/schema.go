@@ -17,6 +17,89 @@ type Schema struct {
 	// View.Definition; cross-engine view-definition translation is a
 	// future Phase 3 effort. See `docs/dev/design/schema-completeness.md`.
 	Views []*View
+
+	// Sequences are the STANDALONE sequences in the schema — sequence
+	// objects that are not the implicit backing store of an IDENTITY
+	// or classic-serial column and therefore must be carried as
+	// first-class schema objects (item-51 TRIAGE finding #1: before
+	// this field existed, `CREATE SEQUENCE order_number_seq START 1000
+	// INCREMENT 5` + `DEFAULT nextval('order_number_seq')` collapsed
+	// to an identity column, silently losing the sequence's options
+	// and topology — post-migration inserts generated DIFFERENT
+	// numbers than the source would). PG-only today: MySQL and SQLite
+	// have no sequence objects, so their readers leave this empty and
+	// their writers refuse loudly when it is non-empty (mirroring the
+	// ExcludeConstraints cross-engine refusal pattern, ADR-0053).
+	Sequences []*Sequence
+}
+
+// Sequence is a dialect-neutral description of a standalone sequence
+// (see [Schema.Sequences] for the standalone/implicit distinction).
+// Field names mirror pg_sequence / pg_sequences so the reader / writer
+// correspondence is direct; the PG writer renders every option
+// explicitly so the target catalog reproduces the source's exactly
+// (pg_dump of the two then matches without text-level games).
+//
+// Backup-envelope note (the Bug 116 class): a schema carrying
+// standalone sequences round-trips through the manifest codec via
+// Schema's natural JSON shape, and backup manifests whose schema has
+// any are stamped [backup.FormatVersionStandaloneSequences] so an
+// older binary refuses-before-touch instead of silently restoring a
+// sequence-less target. See docs/backup-format-versioning.md.
+type Sequence struct {
+	// Schema is the namespace the sequence belongs to. Mirrors
+	// Table.Schema (empty for engines with a flat scope).
+	Schema string
+
+	// Name is the sequence's identifier within its schema.
+	Name string
+
+	// DataType is the sequence's integer type: "smallint", "integer",
+	// or "bigint". Empty means bigint (the PG default) — the writer
+	// emits `AS <type>` only when non-empty.
+	DataType string
+
+	// Start, Increment, MinValue, MaxValue, Cache mirror
+	// pg_sequence.seqstart / seqincrement / seqmin / seqmax /
+	// seqcache. All are rendered explicitly by the writer — emitting
+	// the exact catalog values (rather than "only non-defaults")
+	// reproduces the source catalog for ascending AND descending
+	// sequences without re-deriving PG's direction-dependent
+	// defaults.
+	Start     int64
+	Increment int64
+	MinValue  int64
+	MaxValue  int64
+	Cache     int64
+
+	// Cycle mirrors pg_sequence.seqcycle (`CYCLE` vs the default
+	// `NO CYCLE`).
+	Cycle bool
+
+	// OwnedByTable / OwnedByColumn carry `ALTER SEQUENCE ... OWNED BY
+	// table.column` when the source had it — a standalone sequence
+	// can still be owned (e.g. a serial column whose sequence was
+	// re-optioned, which disqualifies it from the serial→identity
+	// modernization; see docs/type-mapping.md). Both empty when the
+	// sequence is unowned. The writer emits the OWNED BY after tables
+	// are created.
+	OwnedByTable  string
+	OwnedByColumn string
+
+	// LastValue / LastValueIsCalled snapshot the sequence's position
+	// at read time (`SELECT last_value, is_called FROM <seq>`), valid
+	// only when LastValueValid is true. The writer primes the target
+	// via setval(name, LastValue, LastValueIsCalled) so post-migration
+	// nextval() continues exactly where the source would — without it,
+	// a target sequence restarts at Start and re-issues numbers the
+	// copied rows already consumed. LastValueValid=false (the zero
+	// value, e.g. hand-built test fixtures or older backup envelopes
+	// that predate the field) skips priming and the sequence starts
+	// fresh at Start — the safe zero-value default (CLAUDE.md's
+	// v0.99.51 rule: the zero value must be the safe behaviour).
+	LastValue         int64
+	LastValueIsCalled bool
+	LastValueValid    bool
 }
 
 // View is a dialect-neutral description of a SQL view (regular or

@@ -6,7 +6,11 @@
 --   * domain + column                             (email_address)
 --   * STORED generated column                     (orders.total_cents)
 --   * identity columns                            (every table's id)
---   * explicit standalone sequence + nextval def  (order_number_seq)
+--   * explicit standalone sequence + nextval def  (order_number_seq —
+--     carried at FULL parity since the item-51 finding-#1 fix)
+--   * classic serial column                       (legacy_counters.id —
+--     deliberately modernized to identity; allowlisted, cited to
+--     docs/type-mapping.md "Sequences and serial columns")
 --   * UNIQUE constraint                           (customers_email_unique)
 --   * named CHECK constraint                      (orders_subtotal_positive)
 --   * FK ON DELETE CASCADE                        (orders_customer_fk)
@@ -79,6 +83,15 @@ CREATE TABLE bookings (
     CONSTRAINT bookings_no_overlap EXCLUDE USING gist (during WITH &&)
 );
 
+-- Classic serial column: the ONE shape sluice deliberately rewrites
+-- (serial → identity modernization; docs/type-mapping.md "Sequences
+-- and serial columns"). No column defaults besides the serial so the
+-- only oracle deltas for this table are the documented serial trio.
+CREATE TABLE legacy_counters (
+    id   SERIAL PRIMARY KEY,
+    hits BIGINT NOT NULL
+);
+
 CREATE TABLE events (
     id          BIGINT NOT NULL,
     happened_at TIMESTAMPTZ NOT NULL,
@@ -106,6 +119,8 @@ INSERT INTO shipments (order_id, carrier, shipped_at) VALUES
 
 INSERT INTO bookings (room_id, during) VALUES
     (7, int8range(100, 200));
+
+INSERT INTO legacy_counters (hits) VALUES (41), (42);
 
 INSERT INTO events (id, happened_at, payload) VALUES
     (1, '2026-02-01T00:00:00Z', 'h1'),

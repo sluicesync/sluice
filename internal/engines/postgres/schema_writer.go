@@ -292,6 +292,14 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 		}
 	}
 
+	// Phase 1a'': standalone sequences (item-51 TRIAGE finding #1).
+	// Must precede tables — a carried `DEFAULT nextval('seq')` column
+	// fails CREATE TABLE if the sequence doesn't exist yet. The
+	// OWNED BY bindings run after tables (Phase 1b').
+	if err := w.createSequences(ctx, s); err != nil {
+		return err
+	}
+
 	// Phase 1b: tables. opts already constructed for Phase 1a' above.
 	for _, table := range orderedTables(s) {
 		stmt, err := emitTableDef(w.schema, table, opts)
@@ -301,6 +309,14 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("postgres: create table %q: %w", table.Name, err)
 		}
+	}
+
+	// Phase 1b': re-bind sequence ownership now that the owning
+	// columns exist (a standalone-but-owned sequence — e.g. a serial
+	// whose sequence was re-optioned — keeps its OWNED BY so DROP
+	// TABLE cascade semantics match the source).
+	if err := w.bindSequenceOwners(ctx, s); err != nil {
+		return err
 	}
 
 	// Phase 1c: table / column comments (catalog Bug 19d). PG models
@@ -1095,6 +1111,21 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 		}
 	}
 
+	// Phase 1a'': standalone sequences (item-51) — before tables,
+	// matching the apply path. The setval position prime is a runtime
+	// probe-and-prime, not static DDL, so the preview shows the CREATE
+	// (and the OWNED BY below) only.
+	for _, seq := range s.Sequences {
+		if seq == nil {
+			continue
+		}
+		out = append(out, ir.DDLStatement{
+			Table: seq.Name,
+			Kind:  "CREATE SEQUENCE",
+			SQL:   trimTrailingSemicolon(emitCreateSequence(w.schema, seq)),
+		})
+	}
+
 	// Phase 1b: tables.
 	for _, table := range orderedTables(s) {
 		stmt, err := emitTableDef(w.schema, table, opts)
@@ -1105,6 +1136,18 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 			Table: table.Name,
 			Kind:  "CREATE TABLE",
 			SQL:   trimTrailingSemicolon(stmt),
+		})
+	}
+
+	// Phase 1b': sequence OWNED BY bindings, after tables.
+	for _, seq := range s.Sequences {
+		if seq == nil || seq.OwnedByTable == "" || seq.OwnedByColumn == "" {
+			continue
+		}
+		out = append(out, ir.DDLStatement{
+			Table: seq.OwnedByTable,
+			Kind:  "ALTER SEQUENCE",
+			SQL:   trimTrailingSemicolon(emitAlterSequenceOwnedBy(w.schema, seq)),
 		})
 	}
 

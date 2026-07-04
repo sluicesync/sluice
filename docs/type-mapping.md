@@ -193,7 +193,7 @@ When the IR is emitted as MySQL DDL, the inverse mapping applies, with the follo
 | `smallint`                        | `Integer{Width: 16}`                          | |
 | `integer`                         | `Integer{Width: 32}`                          | |
 | `bigint`                          | `Integer{Width: 64}`                          | |
-| `serial`, `bigserial`             | `Integer{..., AutoIncrement: true}`           | Sequence is recorded but managed at emit time. |
+| `serial`, `bigserial`             | `Integer{..., AutoIncrement: true}`           | Only the factory-default, single-owner shape collapses; anything looser is carried as a standalone sequence. See [Sequences and serial columns](#sequences-and-serial-columns). |
 | `numeric(p,s)` / `decimal(p,s)`   | `Decimal{Precision, Scale}`                   | |
 | `numeric` / `decimal` (bare)      | `Decimal{Unconstrained: true}`                | Arbitrary precision; `numeric_precision`/`numeric_scale` are NULL. See [unconstrained numeric](#unconstrained-postgres-numeric-no-precisionscale--owner-surface-design-call-v069x--bug-69). |
 | `real`                            | `Float{Single}`                               | |
@@ -224,6 +224,18 @@ When the IR is emitted as MySQL DDL, the inverse mapping applies, with the follo
 - `Boolean{}` is emitted as `boolean`.
 - `JSON{Binary: false}` is emitted as `jsonb` by default, since `jsonb` is almost always the right choice on Postgres. Override available.
 - `Geometry{}` requires the PostGIS extension; if PostGIS is not in the allowlist, the run errors with an explicit message.
+
+### Sequences and serial columns
+
+PG sequences fall into three classes with three different policies (item 51, restore-parity oracle finding #1):
+
+- **Identity columns** (`GENERATED ... AS IDENTITY`) round-trip as identity columns; their implicit backing sequences are never surfaced.
+- **Classic `serial` / `bigserial` columns are deliberately modernized to identity columns on emit.** This applies only to the exact serial shape: a sequence OWNED BY the column, carrying factory-default options (`START 1 INCREMENT 1 MINVALUE 1 CACHE 1 NO CYCLE`, type-max `MAXVALUE`), referenced by no other column's default. The modernized column behaves identically for inserts (same numbers in the same order, and `SyncIdentitySequences` advances it past the copied rows), but the catalog *text* differs from a pg_dump restore's: pg_dump re-emits the serial trio (`CREATE SEQUENCE` + `OWNED BY` + `SET DEFAULT nextval(...)`) while a sluice target dumps an identity clause. That delta is a documented decision, not a gap — the dump-parity oracle allowlists it citing this section.
+- **Standalone sequences** — explicitly created sequences, serials whose sequence was re-optioned, and sequences shared by multiple columns — are carried as first-class schema objects (`ir.Schema.Sequences`): the exact options (`AS type` / `START` / `INCREMENT` / `MINVALUE` / `MAXVALUE` / `CACHE` / `CYCLE`), the `OWNED BY` binding when present, and the current position (`last_value` / `is_called`, primed onto the target via `setval` so post-migration `nextval()` continues exactly where the source would). Referencing columns keep their `DEFAULT nextval('...')` verbatim. Cross-engine targets (MySQL family, SQLite/D1) **refuse loudly** when the schema carries standalone sequences — they have no sequence objects, `--exclude-table` is no escape (a sequence is schema-level), and the refusal names the sequence plus the remedy (drop the sequence + its nextval defaults on the source, or use a PG target). Backups whose schema carries standalone sequences are stamped backup format version 4 so pre-sequence binaries refuse-before-touch instead of silently restoring a sequence-less target (see `docs/backup-format-versioning.md`).
+
+### Typed-literal default rendering
+
+sluice re-emits literal column defaults as quoted literals, which PostgreSQL stores as explicitly typed casts — a source column declared `DEFAULT 0` lands in the target catalog as `DEFAULT '0'::bigint`. The two forms evaluate identically for every insert; only the catalog text (and therefore pg_dump output) differs. This is an operator-approved cosmetic divergence (2026-07-03), surfaced and allowlisted by the restore-parity oracle citing this section.
 
 ### Extension-passthrough types (`--enable-pg-extension`)
 

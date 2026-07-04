@@ -71,6 +71,27 @@ func checkCrossEngineSupportable(
 	if !pgToMySQL {
 		return nil
 	}
+	// item-51: standalone sequences are PG-only schema objects — MySQL
+	// has no sequence concept, so the object, its custom
+	// START/INCREMENT options, and any shared-sequence topology cannot
+	// land on the target. Pre-fix these silently collapsed into
+	// AUTO_INCREMENT (post-migration inserts generated different
+	// numbers than the source would); the refusal mirrors the
+	// EXCLUDE-constraint pattern below. `--exclude-table` is no escape
+	// here — the sequence is a schema-level object, not a table — so
+	// the remedy names the source-side options instead.
+	if len(schema.Sequences) > 0 {
+		seq := schema.Sequences[0]
+		return fmt.Errorf(
+			"%s: schema carries standalone sequence %q (PG-only — the "+
+				"target engine has no sequence objects, so its options and "+
+				"nextval() topology cannot be preserved). "+
+				"Recovery: drop the sequence and the DEFAULT nextval(...) "+
+				"clauses that reference it on the source (letting the "+
+				"application supply values), or migrate to a PG target",
+			contextID, seq.Name,
+		)
+	}
 	for _, tbl := range schema.Tables {
 		if tbl == nil {
 			continue

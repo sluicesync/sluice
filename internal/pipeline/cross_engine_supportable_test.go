@@ -826,3 +826,46 @@ func TestCheckShardColumnSupport_EngagedUnsupportedRefuses(t *testing.T) {
 		t.Errorf("error %q missing ADR reference", msg)
 	}
 }
+
+// item-51: PG → MySQL-family with a standalone sequence must refuse
+// loudly, naming the sequence and the remedy. Pre-fix, the sequence
+// silently collapsed into AUTO_INCREMENT — post-migration inserts
+// generated different numbers than the source would. The refusal is
+// pinned per MySQL flavor (mysql / planetscale / vitess share the
+// name-check) plus the same-engine and unknown-pair carve-outs.
+func TestCheckCrossEngineSupportable_StandaloneSequenceRefuses(t *testing.T) {
+	s := &ir.Schema{
+		Tables: []*ir.Table{{
+			Name: "orders",
+			Columns: []*ir.Column{
+				{
+					Name: "order_number", Type: ir.Integer{Width: 64},
+					Default: ir.DefaultExpression{Expr: "nextval('order_number_seq'::regclass)", Dialect: "postgres"},
+				},
+			},
+		}},
+		Sequences: []*ir.Sequence{{Schema: "public", Name: "order_number_seq", Start: 1000, Increment: 5}},
+	}
+	for _, target := range []string{"mysql", "planetscale", "vitess"} {
+		err := checkCrossEngineSupportable(s, "postgres", target, "migrate")
+		if err == nil {
+			t.Fatalf("postgres → %s with standalone sequence: want refusal; got nil", target)
+		}
+		msg := err.Error()
+		if !strings.Contains(msg, `"order_number_seq"`) {
+			t.Errorf("postgres → %s: error %q does not name the sequence", target, msg)
+		}
+		if !strings.Contains(msg, "Recovery:") {
+			t.Errorf("postgres → %s: error %q missing the remedy", target, msg)
+		}
+	}
+	// Same-engine PG → PG carries the sequence; no refusal.
+	if err := checkCrossEngineSupportable(s, "postgres", "postgres", "migrate"); err != nil {
+		t.Errorf("postgres → postgres err = %v; want nil (sequence is carried)", err)
+	}
+	// postgres-trigger sources trip the same refusal (they delegate to
+	// the vanilla PG schema surface).
+	if err := checkCrossEngineSupportable(s, "postgres-trigger", "mysql", "migrate"); err == nil {
+		t.Error("postgres-trigger → mysql with standalone sequence: want refusal; got nil")
+	}
+}

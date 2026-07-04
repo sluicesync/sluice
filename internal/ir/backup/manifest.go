@@ -80,7 +80,20 @@ import (
 // is proportional, mirroring Bug 116: FINALIZED manifests are
 // re-stamped with [FormatVersionFor] (1 or 2) and carry no sidecar
 // reference, so successful backups remain readable by older binaries.
-const BackupFormatVersion = 3
+//
+// v0.99.175+ introduces FormatVersion=4 for schemas carrying
+// STANDALONE sequences ([ir.Schema.Sequences], item-51 TRIAGE finding
+// #1). Same Bug-116 class as FormatVersion=2: an older binary reading
+// the manifest ignores the unknown Sequences field and restores a
+// target without the sequence object — silently for a sequence no
+// column references (app-driven nextval), or as a confusing mid-
+// restore DDL failure for one that is (the column's carried
+// `DEFAULT nextval(...)` names a relation that was never created).
+// The bump makes the older binary refuse loudly at the manifest
+// preflight instead, before anything lands on the target.
+// Proportional as always: only manifests whose schema actually
+// carries standalone sequences are stamped 4.
+const BackupFormatVersion = 4
 
 // FormatVersionLegacy / FormatVersionSecurityMetadata name the
 // historically-recorded values so callers don't sprinkle bare ints
@@ -105,14 +118,23 @@ const (
 	// stamped on finalized manifests — those re-stamp with
 	// [FormatVersionFor] and stay readable by older binaries.
 	FormatVersionProgressSidecar = 3
+
+	// FormatVersionStandaloneSequences is the v0.99.175+ version
+	// stamped on manifests whose schema carries standalone sequences
+	// ([ir.Schema.Sequences]). Older binaries would silently drop the
+	// field on restore (the Bug 116 class — the restored target's
+	// nextval() topology diverges from the source's); the bump makes
+	// them refuse loudly at the manifest preflight instead.
+	FormatVersionStandaloneSequences = 4
 )
 
 // chooseFormatVersion returns the smallest manifest format version
-// safe for the supplied schema: [FormatVersionSecurityMetadata] when
-// the schema uses any field older binaries would silently drop,
-// [FormatVersionLegacy] otherwise. nil schema → legacy (a manifest
-// with no schema can't carry security drift; degenerate cases stay
-// maximally compatible).
+// safe for the supplied schema: [FormatVersionStandaloneSequences]
+// when the schema carries standalone sequences,
+// [FormatVersionSecurityMetadata] when it uses any of the Bug-116
+// security/correctness fields, [FormatVersionLegacy] otherwise. nil
+// schema → legacy (a manifest with no schema can't carry security
+// drift; degenerate cases stay maximally compatible).
 //
 // Closes Bug 116 by proportionally bumping only the manifests that
 // actually carry the bumped-feature surface — innocent backups
@@ -120,6 +142,11 @@ const (
 func chooseFormatVersion(s *ir.Schema) int {
 	if s == nil {
 		return FormatVersionLegacy
+	}
+	// Standalone sequences gate the highest tier, so they win over
+	// the table-level security fields below.
+	if len(s.Sequences) > 0 {
+		return FormatVersionStandaloneSequences
 	}
 	for _, t := range s.Tables {
 		if t == nil {

@@ -183,8 +183,9 @@ func filterSchemaTables(schema *ir.Schema, filter TableFilter) *ir.Schema {
 		return schema
 	}
 	out := &ir.Schema{
-		Tables: make([]*ir.Table, 0, len(schema.Tables)),
-		Views:  schema.Views,
+		Tables:    make([]*ir.Table, 0, len(schema.Tables)),
+		Views:     schema.Views,
+		Sequences: schema.Sequences,
 	}
 	for _, t := range schema.Tables {
 		if t == nil {

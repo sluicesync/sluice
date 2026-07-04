@@ -44,17 +44,20 @@ import (
 // as parity.
 //
 // Oracle side (full-fidelity pg_dump restore): 1 enum type + 1 domain
-// + 1 standalone sequence + 7 tables (customers, orders, shipments,
-// bookings, events + 2 partitions) + 3 secondary indexes = 13.
-// Sluice side: the partition family (3 tables) and the standalone
-// sequence are knowingly absent, and identity/PK/unique objects dump
-// as ALTERs, not CREATEs; the floor is the 4 carried tables + enum +
-// domain + the 2 sluice state tables = 8 (indexes excluded from the
-// floor so an index-fidelity regression surfaces as a DIFF, not a
-// guard trip).
+// + 1 standalone sequence + 1 serial backing sequence
+// (legacy_counters_id_seq) + 8 tables (customers, orders, shipments,
+// bookings, legacy_counters, events + 2 partitions) + 3 secondary
+// indexes = 15.
+// Sluice side: the partition family (3 tables) is knowingly absent
+// and the serial backing sequence is modernized into an identity
+// column; the standalone sequence IS carried (item-51 finding #1
+// fix), and identity/PK/unique objects dump as ALTERs, not CREATEs.
+// Floor: 5 carried tables + enum + domain + 1 standalone sequence +
+// the 2 sluice state tables = 10 (indexes excluded from the floor so
+// an index-fidelity regression surfaces as a DIFF, not a guard trip).
 const (
-	dumpParityOracleCreateFloor = 13
-	dumpParitySluiceCreateFloor = 8
+	dumpParityOracleCreateFloor = 15
+	dumpParitySluiceCreateFloor = 10
 )
 
 // startDumpParityPostgres boots one PG container with the source

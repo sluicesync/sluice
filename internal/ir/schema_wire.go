@@ -63,8 +63,9 @@ func UnmarshalTable(b []byte) (*Table, error) {
 //
 // We don't customise marshal at the Schema level; instead we marshal
 // each component via its own MarshalJSON below. Schema's natural
-// struct shape is sufficient because Tables / Views are concrete
-// pointer slices, not interface slices.
+// struct shape is sufficient because Tables / Views / Sequences are
+// concrete pointer slices, not interface slices ([Sequence] is all
+// plain fields, so it needs no envelope of its own).
 
 // schemaTypeEnvelope is the tagged-union form a [Type] takes on the
 // wire: a `kind` discriminator plus the type's natural fields. The

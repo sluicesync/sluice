@@ -24,12 +24,21 @@ Every backup chain root manifest carries a `FormatVersion` field:
   - One or more EXCLUDE constraints on a table (`ExcludeConstraints`)
   - Only sluice v0.94.1 or newer restores it. Older binaries refuse
   loudly at preflight rather than silently dropping the gated fields.
+- **`FormatVersion=3`** — an *in-progress* full backup in the
+  sidecar-checkpoint layout (v0.99.39+, ADR-0086). Never stamped on
+  finalized manifests; older binaries refuse to resume it rather than
+  mis-resume off a base manifest that under-reports progress.
+- **`FormatVersion=4`** — the schema carries one or more standalone
+  sequences (`Schema.Sequences`, v0.99.175+ / roadmap item 51). Older
+  binaries would silently restore a target without the sequence
+  object — its custom `START`/`INCREMENT` options and `nextval()`
+  topology gone — so they refuse loudly at preflight instead.
 
-If your backups don't use RLS or EXCLUDE constraints, you'll never
-see `FormatVersion=2` and cross-version restore behaves exactly as
-it did pre-v0.94.1. If your backups *do* use them, you get the
-security guarantee that older sluice can't silently land a restored
-target with the protections stripped.
+If your backups don't use RLS, EXCLUDE constraints, or standalone
+sequences, you'll never see a version above 1 on a finalized manifest
+and cross-version restore behaves exactly as it did pre-v0.94.1. If
+your backups *do* use them, you get the guarantee that older sluice
+can't silently land a restored target with those invariants stripped.
 
 ## Why this exists — the silent-loss class
 

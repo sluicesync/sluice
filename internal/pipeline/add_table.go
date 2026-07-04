@@ -1021,9 +1021,13 @@ func (a *AddTable) diagReadCurrentWAL(ctx context.Context, phase string) string 
 // running add-table before the CREATE TABLE has actually landed on
 // the source.
 //
-// Views and unrelated tables are dropped so the downstream phases
-// (translate, schema-write, bulk-copy) operate strictly on the new
-// table.
+// Views, sequences, and unrelated tables are dropped so the
+// downstream phases (translate, schema-write, bulk-copy) operate
+// strictly on the new table. A new table whose default references a
+// standalone sequence that does NOT already exist on the target
+// therefore fails loudly at CREATE TABLE (undefined relation) rather
+// than silently collapsing — carrying referenced sequences through
+// the add-table path is a deliberate deferral (item-51 notes).
 func isolateTable(src *ir.Schema, tableName string) (*ir.Schema, error) {
 	if src == nil {
 		return nil, errors.New("pipeline: add-table: source schema is nil")

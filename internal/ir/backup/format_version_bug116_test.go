@@ -100,11 +100,27 @@ func TestChooseFormatVersion_Bug116(t *testing.T) {
 			want: FormatVersionLegacy,
 		},
 		{
-			name: "security-metadata is the FINALIZED-manifest ceiling (FormatVersionProgressSidecar is in-progress-only and never chosen here)",
+			name: "security-metadata is the sequence-less FINALIZED ceiling (FormatVersionProgressSidecar is in-progress-only and never chosen here)",
 			schema: &ir.Schema{
 				Tables: []*ir.Table{{Name: "x", RLSEnabled: true}},
 			},
 			want: FormatVersionSecurityMetadata,
+		},
+		{
+			name: "standalone sequence → standalone-sequences (older binaries would silently drop Schema.Sequences)",
+			schema: &ir.Schema{
+				Tables:    []*ir.Table{{Name: "orders"}},
+				Sequences: []*ir.Sequence{{Name: "order_number_seq", Start: 1000, Increment: 5}},
+			},
+			want: FormatVersionStandaloneSequences,
+		},
+		{
+			name: "standalone sequence wins over security-metadata (highest tier needed)",
+			schema: &ir.Schema{
+				Tables:    []*ir.Table{{Name: "tenants", RLSEnabled: true}},
+				Sequences: []*ir.Sequence{{Name: "s"}},
+			},
+			want: FormatVersionStandaloneSequences,
 		},
 	}
 	for _, c := range cases {
@@ -123,15 +139,16 @@ func TestChooseFormatVersion_Bug116(t *testing.T) {
 }
 
 // TestBackupFormatVersion_Bumped pins the version ladder: the build
-// ceiling is the ADR-0086 in-progress sidecar version, the Bug 116
-// security-metadata version stays the FINALIZED ceiling, and the
-// legacy value is frozen. If a future change reorders these without
-// updating the chooseFormatVersion / sidecar contracts, this test
-// catches the regression at build time.
+// ceiling is the standalone-sequences version, the ADR-0086
+// in-progress sidecar version and the Bug 116 security-metadata
+// version keep their historical slots, and the legacy value is
+// frozen. If a future change reorders these without updating the
+// chooseFormatVersion / sidecar contracts, this test catches the
+// regression at build time.
 func TestBackupFormatVersion_Bumped(t *testing.T) {
-	if BackupFormatVersion != FormatVersionProgressSidecar {
-		t.Errorf("BackupFormatVersion = %d; want FormatVersionProgressSidecar=%d (ADR-0086 ceiling)",
-			BackupFormatVersion, FormatVersionProgressSidecar)
+	if BackupFormatVersion != FormatVersionStandaloneSequences {
+		t.Errorf("BackupFormatVersion = %d; want FormatVersionStandaloneSequences=%d (item-51 sequences ceiling)",
+			BackupFormatVersion, FormatVersionStandaloneSequences)
 	}
 	if FormatVersionLegacy != 1 {
 		t.Errorf("FormatVersionLegacy = %d; must stay 1 (load-bearing for older-binary preflight semantics)", FormatVersionLegacy)
@@ -143,5 +160,9 @@ func TestBackupFormatVersion_Bumped(t *testing.T) {
 	if FormatVersionProgressSidecar <= FormatVersionSecurityMetadata {
 		t.Errorf("FormatVersionProgressSidecar (%d) must be strictly greater than FormatVersionSecurityMetadata (%d) — older binaries refuse the in-progress sidecar layout via the version gate",
 			FormatVersionProgressSidecar, FormatVersionSecurityMetadata)
+	}
+	if FormatVersionStandaloneSequences <= FormatVersionProgressSidecar {
+		t.Errorf("FormatVersionStandaloneSequences (%d) must be strictly greater than FormatVersionProgressSidecar (%d) — sequence-bearing manifests must refuse on every pre-sequence binary, including sidecar-capable ones",
+			FormatVersionStandaloneSequences, FormatVersionProgressSidecar)
 	}
 }

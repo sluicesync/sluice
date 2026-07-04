@@ -136,11 +136,14 @@ func (r *SchemaReader) Close() error {
 // optional interface (Bug 91, v0.79.1). Returns the unprocessed
 // `column_default` text from information_schema.columns for the named
 // column, bypassing [translateDefault]'s SERIAL/BIGSERIAL auto-
-// increment heuristic. The pipeline's ADR-0058 §2a volatility
-// classifier needs the raw expression text because user-written
-// `BIGINT DEFAULT nextval('manual_seq')` defaults are otherwise
-// collapsed to [ir.DefaultNone] (hiding the volatility from the
-// classifier).
+// increment collapse. The pipeline's ADR-0058 §2a volatility
+// classifier needs the raw expression text because a
+// serial-collapsible column's `nextval(...)` default is collapsed to
+// [ir.DefaultNone] (hiding the volatility from the classifier).
+// Standalone-sequence nextval defaults are carried as
+// [ir.DefaultExpression] since the item-51 fix, but the raw read
+// stays authoritative here so the classifier never depends on the
+// collapse rules.
 //
 // schema=="" falls back to r.schema (the DSN-derived default — same
 // search scope as ReadSchema).
@@ -290,7 +293,18 @@ func (r *SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 	if err != nil {
 		return nil, fmt.Errorf("postgres: read views: %w", err)
 	}
-	if len(tables) == 0 && len(views) == 0 {
+	// Standalone sequences + the serial-collapsible map (item-51
+	// TRIAGE finding #1). Read before columns because the column
+	// auto-increment classification consults the map: a nextval()
+	// default collapses to Integer.AutoIncrement ONLY when it
+	// references the factory-default sequence owned by exactly that
+	// column; every other nextval() shape keeps its expression default
+	// and the sequence is carried in Schema.Sequences.
+	sequences, serialSeqs, err := r.readSequences(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: read sequences: %w", err)
+	}
+	if len(tables) == 0 && len(views) == 0 && len(sequences) == 0 {
 		return &ir.Schema{}, nil
 	}
 
@@ -330,7 +344,7 @@ func (r *SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 			return nil, fmt.Errorf("postgres: read domain checks: %w", err)
 		}
 
-		if err := r.populateColumns(ctx, tables, enumValues, geomInfo, geogInfo, domainChecks); err != nil {
+		if err := r.populateColumns(ctx, tables, enumValues, geomInfo, geogInfo, domainChecks, serialSeqs); err != nil {
 			return nil, fmt.Errorf("postgres: read columns: %w", err)
 		}
 		if err := r.populateIndexes(ctx, tables); err != nil {
@@ -354,8 +368,9 @@ func (r *SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 	}
 
 	out := &ir.Schema{
-		Tables: make([]*ir.Table, 0, len(tables)),
-		Views:  views,
+		Tables:    make([]*ir.Table, 0, len(tables)),
+		Views:     views,
+		Sequences: sequences,
 	}
 	for _, name := range sortedKeys(tables) {
 		out.Tables = append(out.Tables, tables[name])
@@ -833,7 +848,7 @@ func isUndefinedRelationErr(err error) bool {
 // server_encoding is global — so the Charset field on the IR types
 // stays empty for PG sources. MySQL writers accept that as "use the
 // table / database default."
-func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*ir.Table, enumValues map[string][]string, geomInfo, geogInfo map[string]geometryColumnInfo, domainChecks map[string][]ir.DomainCheck) error {
+func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*ir.Table, enumValues map[string][]string, geomInfo, geogInfo map[string]geometryColumnInfo, domainChecks map[string][]ir.DomainCheck, serialSeqs map[string]pgSequenceOwner) error {
 	// COALESCE(a.atttypmod, -1) supplies the per-column typmod for
 	// extension-owned types whose modifiers ride on atttypmod
 	// (pgvector dimension; future PostGIS subtype/SRID). -1 is the
@@ -940,7 +955,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			NumPrec:         nullInt64ToPtr(numPrec),
 			NumScale:        nullInt64ToPtr(numScale),
 			DTPrec:          nullInt64ToPtr(dtPrec),
-			IsAutoIncrement: isAutoIncrement(isIdentity, columnDefault),
+			IsAutoIncrement: r.classifyAutoIncrement(isIdentity, columnDefault, tableName, colName, serialSeqs),
 			Collation:       collation,
 			AttTypmod:       attTypmod,
 			FormatType:      formatType,
@@ -1930,12 +1945,22 @@ func (r *SchemaReader) populateComments(ctx context.Context, tables map[string]*
 	return crows.Err()
 }
 
-// isAutoIncrement detects SERIAL, BIGSERIAL, and IDENTITY columns.
+// isAutoIncrement detects SERIAL, BIGSERIAL, and IDENTITY columns by
+// heuristic:
 //
 //   - is_identity = 'YES'    → modern GENERATED ... AS IDENTITY column.
 //   - column_default starts with 'nextval(' → legacy SERIAL/BIGSERIAL.
 //
 // Either is mapped to the IR's Integer.AutoIncrement = true.
+//
+// CDC-projection-only since the item-51 standalone-sequence fix: the
+// change applier's target-column read and the shard-consolidation
+// probe still use this heuristic (their projections are only ever
+// compared against projections from the same code path, and neither
+// has the sequence catalog in hand). [ReadSchema] uses
+// [SchemaReader.classifyAutoIncrement] instead, which collapses a
+// nextval() default only for the true serial shape and carries every
+// other sequence standalone.
 func isAutoIncrement(isIdentity string, columnDefault sql.NullString) bool {
 	if strings.EqualFold(isIdentity, "YES") {
 		return true

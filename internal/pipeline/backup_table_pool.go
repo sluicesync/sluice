@@ -528,7 +528,13 @@ func newManifestCommitter(store irbackup.Store, manifest *irbackup.Manifest) (*m
 	c.sidecarPath = ManifestProgressFileName
 	c.attemptID = attemptID
 	c.finalVersion = manifest.FormatVersion
-	manifest.FormatVersion = irbackup.FormatVersionProgressSidecar
+	// The in-progress stamp must never DOWNGRADE the schema-derived
+	// version: a schema carrying standalone sequences already sits
+	// above the sidecar tier, and re-stamping it lower would let an
+	// older (sidecar-capable, sequence-unaware) binary resume the run
+	// and finalize a manifest with the Sequences field silently
+	// dropped — the Bug 116 class through the resume door.
+	manifest.FormatVersion = max(irbackup.FormatVersionProgressSidecar, c.finalVersion)
 	manifest.ProgressSidecar = &irbackup.ProgressSidecarRef{
 		File:      c.sidecarPath,
 		AttemptID: attemptID,

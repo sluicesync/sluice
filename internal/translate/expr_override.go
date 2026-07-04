@@ -57,7 +57,15 @@ func ApplyExpressionOverrides(s *ir.Schema, overrides []config.ExpressionMapping
 		return nil, err
 	}
 
-	out := &ir.Schema{Tables: make([]*ir.Table, len(s.Tables))}
+	out := &ir.Schema{
+		Tables: make([]*ir.Table, len(s.Tables)),
+		// Schema-level objects pass through untouched: these passes
+		// rewrite table/column shapes only, and dropping Views /
+		// Sequences here would silently strip them from every run that
+		// engages the pass (the item-51 lesson).
+		Views:     s.Views,
+		Sequences: s.Sequences,
+	}
 	for i, tbl := range s.Tables {
 		colMap, hit := byTable[tbl.Name]
 		if !hit {

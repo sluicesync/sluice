@@ -61,6 +61,23 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 	if s == nil {
 		return errors.New("sqlite: CreateTablesWithoutConstraints: schema is nil")
 	}
+	// item-51: standalone sequences are PG-only schema objects. SQLite
+	// has no sequence concept, so the object, its custom
+	// START/INCREMENT options, and any shared nextval() topology
+	// cannot be represented — refuse loudly rather than silently
+	// collapsing them (same posture as the per-table EXCLUDE/RLS
+	// refusals below). `--exclude-table` is no escape (a sequence is
+	// schema-level, not a table), so the remedy names the source-side
+	// options instead.
+	if len(s.Sequences) > 0 {
+		return fmt.Errorf(
+			"sqlite: schema carries standalone sequence %q (%d total); SQLite has no sequence "+
+				"objects and cannot preserve its options or nextval() topology — refusing rather "+
+				"than silently dropping it. Recovery: drop the sequence and the DEFAULT "+
+				"nextval(...) clauses that reference it on the source, or migrate to a PG target",
+			s.Sequences[0].Name, len(s.Sequences),
+		)
+	}
 	for _, table := range s.Tables {
 		if err := refuseUnrepresentableTableFeatures(table); err != nil {
 			return err

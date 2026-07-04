@@ -5,6 +5,7 @@ package pipeline
 
 import (
 	"context"
+	"reflect"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -90,6 +91,29 @@ func TestBackup_FormatVersion_Bug116(t *testing.T) {
 			},
 			want: irbackup.FormatVersionSecurityMetadata,
 		},
+		{
+			name: "schema with standalone sequence → standalone-sequences (item 51; older binaries refuse loudly)",
+			schema: &ir.Schema{
+				Tables: []*ir.Table{
+					{
+						Name: "orders",
+						Columns: []*ir.Column{
+							{
+								Name: "order_number", Type: ir.Integer{Width: 64},
+								Default: ir.DefaultExpression{Expr: "nextval('order_number_seq'::regclass)", Dialect: "postgres"},
+							},
+						},
+					},
+				},
+				Sequences: []*ir.Sequence{{
+					Schema: "public", Name: "order_number_seq",
+					DataType: "bigint", Start: 1000, Increment: 5,
+					MinValue: 1, MaxValue: 9223372036854775807, Cache: 1,
+					LastValue: 1005, LastValueIsCalled: true, LastValueValid: true,
+				}},
+			},
+			want: irbackup.FormatVersionStandaloneSequences,
+		},
 	}
 	for _, c := range cases {
 		c := c
@@ -159,4 +183,54 @@ func countExclude(s *ir.Schema) int {
 		}
 	}
 	return n
+}
+
+// TestBackup_ManifestRoundTrip_StandaloneSequences pins the item-51
+// backup-envelope contract end-to-end at the manifest write/read
+// boundary: a schema carrying a standalone sequence survives
+// Backup.Run → readManifest with every Sequence field intact (options,
+// ownership, captured position), alongside the FormatVersion=4 stamp
+// the table above pins. A restore on THIS build then re-creates the
+// sequence via the ordinary CreateTablesWithoutConstraints path; an
+// older build refuses at readManifest's version preflight instead of
+// silently restoring sequence-less (the Bug 116 class).
+func TestBackup_ManifestRoundTrip_StandaloneSequences(t *testing.T) {
+	want := []*ir.Sequence{{
+		Schema: "public", Name: "order_number_seq",
+		DataType: "bigint", Start: 1000, Increment: 5,
+		MinValue: 1, MaxValue: 9223372036854775807, Cache: 1,
+		OwnedByTable: "orders", OwnedByColumn: "order_number",
+		LastValue: 1005, LastValueIsCalled: true, LastValueValid: true,
+	}}
+	schema := &ir.Schema{
+		Tables: []*ir.Table{{
+			Name: "orders",
+			Columns: []*ir.Column{
+				{
+					Name: "order_number", Type: ir.Integer{Width: 64},
+					Default: ir.DefaultExpression{Expr: "nextval('order_number_seq'::regclass)", Dialect: "postgres"},
+				},
+			},
+		}},
+		Sequences: want,
+	}
+	dir := t.TempDir()
+	store, err := NewLocalStore(dir)
+	if err != nil {
+		t.Fatalf("NewLocalStore: %v", err)
+	}
+	src := newBackupRecorderEngine("postgres", schema, map[string][]ir.Row{})
+	if err := (&Backup{Source: src, SourceDSN: "src", Store: store}).Run(context.Background()); err != nil {
+		t.Fatalf("Backup.Run: %v", err)
+	}
+	m, err := readManifest(context.Background(), store)
+	if err != nil {
+		t.Fatalf("readManifest: %v", err)
+	}
+	if m.FormatVersion != irbackup.FormatVersionStandaloneSequences {
+		t.Errorf("FormatVersion = %d; want %d", m.FormatVersion, irbackup.FormatVersionStandaloneSequences)
+	}
+	if m.Schema == nil || !reflect.DeepEqual(m.Schema.Sequences, want) {
+		t.Errorf("manifest Schema.Sequences did not round-trip:\n got  %+v\n want %+v", m.Schema.Sequences, want)
+	}
 }

@@ -5,6 +5,7 @@ package ir
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
 )
 
@@ -210,5 +211,47 @@ func TestMarshalType_NestedArray(t *testing.T) {
 	}
 	if out.String() != in.String() {
 		t.Errorf("got %v want %v", out, in)
+	}
+}
+
+// TestSchemaJSON_SequencesRoundTrip pins the item-51 backup-envelope
+// shape for [Schema.Sequences]: a schema carrying a standalone
+// sequence must survive the same encoding/json round-trip the CDC
+// schema-history store and the backup manifests use, with every field
+// (options, ownership, captured position) intact. Sequence is all
+// concrete fields so Schema's natural marshal covers it — this pin
+// exists so a future custom Schema codec can't silently drop the
+// slice (the Bug 116 class).
+func TestSchemaJSON_SequencesRoundTrip(t *testing.T) {
+	in := &Schema{
+		Tables: []*Table{{
+			Name: "orders",
+			Columns: []*Column{{
+				Name: "order_number",
+				Type: Integer{Width: 64},
+				Default: DefaultExpression{
+					Expr:    "nextval('order_number_seq'::regclass)",
+					Dialect: "postgres",
+				},
+			}},
+		}},
+		Sequences: []*Sequence{{
+			Schema: "public", Name: "order_number_seq",
+			DataType: "bigint", Start: 1000, Increment: 5,
+			MinValue: 1, MaxValue: 9223372036854775807, Cache: 1, Cycle: true,
+			OwnedByTable: "orders", OwnedByColumn: "order_number",
+			LastValue: 1005, LastValueIsCalled: true, LastValueValid: true,
+		}},
+	}
+	b, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var got Schema
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if !reflect.DeepEqual(got.Sequences, in.Sequences) {
+		t.Errorf("Sequences did not round-trip:\n got  %+v\n want %+v", got.Sequences, in.Sequences)
 	}
 }
