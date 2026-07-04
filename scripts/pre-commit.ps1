@@ -125,9 +125,20 @@ $lint = Get-Command golangci-lint -ErrorAction SilentlyContinue
 if ($lint) {
     & golangci-lint run
     if ($LASTEXITCODE -ne 0) {
-        Red "golangci-lint failed."
-        Write-Host "Run: golangci-lint run  (to see the failures inline)"
-        exit 1
+        # A stale analysis cache reports PHANTOM issues after a sibling
+        # git worktree is removed (typecheck/unused findings pointing at
+        # files that no longer exist — hit 4× with the worktree-agent
+        # flow). Self-heal: clean the cache and retry ONCE. A cold-cache
+        # run costs minutes, so this only happens on failure — real
+        # findings reproduce identically on the retry.
+        Write-Host "golangci-lint failed; retrying once with a clean cache (stale-worktree phantom check)..." -ForegroundColor Yellow
+        & golangci-lint cache clean
+        & golangci-lint run
+        if ($LASTEXITCODE -ne 0) {
+            Red "golangci-lint failed."
+            Write-Host "Run: golangci-lint run  (to see the failures inline)"
+            exit 1
+        }
     }
 } else {
     Write-Host "golangci-lint not installed; skipping (install: https://golangci-lint.run/welcome/install/)" -ForegroundColor Yellow

@@ -69,6 +69,7 @@ Other recurring lint signals:
 - `gocritic paramTypeCombine`: `func f(a string, b string)` → `func f(a, b string)`
 - `gocritic commentedOutCode`: don't leave commented-out code in committed files
 - `errcheck` / `rowserrcheck` / `sqlclosecheck`: when a `*sql.Rows` crosses a goroutine boundary into a streaming channel, the linter can't track the close path; suppress with a focused `//nolint:rowserrcheck,sqlclosecheck` on the specific line and a comment explaining why
+- **Stale-cache phantom failures after deleting a git worktree** (typecheck/unused findings pointing at files that no longer exist — hit 4× with the worktree-agent flow): `golangci-lint cache clean` fixes it. Both pre-commit hooks self-heal (on failure they clean the cache and retry once), so a failure that survives the retry is genuine.
 
 **Zero-value-safe config defaults (the v0.99.51 trap).** A `Streamer`/config `bool` that must default *on* needs **opt-out** (`SuppressX` / `NoX`) semantics, never `EnableX`-defaulting-true-by-intent. The CLI sets the field, but **every other construction — all tests, broker/chain paths, future callers — gets the Go zero value (`false`)**. A field named for the on-behavior silently inverts to off for all of them. ADR-0093's first cut shipped `AutoResnapshotOnInvalidPosition` (intended default true); the `-race` integration job caught it as a nil-deref panic because every test Streamer got `false` and took the suppressed branch. Make the zero value the safe/common default.
 

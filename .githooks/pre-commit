@@ -116,9 +116,19 @@ fi
 # rather than hard-block — CI is the source of truth.
 if command -v golangci-lint >/dev/null 2>&1; then
 	if ! golangci-lint run; then
-		red "pre-commit: golangci-lint failed."
-		echo "Run: golangci-lint run  (to see the failures inline)"
-		exit 1
+		# A stale analysis cache reports PHANTOM issues after a sibling
+		# git worktree is removed (typecheck/unused findings pointing at
+		# files that no longer exist — hit 4x with the worktree-agent
+		# flow). Self-heal: clean the cache and retry ONCE. A cold-cache
+		# run costs minutes, so this only happens on failure — real
+		# findings reproduce identically on the retry.
+		echo "pre-commit: golangci-lint failed; retrying once with a clean cache (stale-worktree phantom check)..."
+		golangci-lint cache clean
+		if ! golangci-lint run; then
+			red "pre-commit: golangci-lint failed."
+			echo "Run: golangci-lint run  (to see the failures inline)"
+			exit 1
+		fi
 	fi
 else
 	echo "pre-commit: golangci-lint not installed; skipping (install: https://golangci-lint.run/welcome/install/)"
