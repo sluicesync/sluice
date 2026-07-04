@@ -1099,6 +1099,13 @@ func (b *SyncFromBackup) applySchemaDeltas(ctx context.Context, link *segmentRec
 // events onto out, rewriting every change's [ir.Position] to pos so
 // the applier records the broker's chain-state token rather than the
 // source's CDC token.
+//
+// DELIBERATELY sequential (no read-ahead): unlike ChainRestore's
+// streamIncrementalChanges, this loop's dominant cadence is the
+// broker's 30 s poll tick over small incremental tails, where
+// prefetching the next chunk buys nothing. Revisit only with evidence
+// of large multi-chunk tails on the broker path — see the perf-parity
+// matrix gap-#4 closure note (docs/dev/perf-parity-matrix.md).
 func (b *SyncFromBackup) streamIncrementalWithPosition(
 	ctx context.Context,
 	link *segmentRecord,
