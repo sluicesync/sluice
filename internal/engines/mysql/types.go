@@ -256,6 +256,17 @@ func bitWidth(columnType string) int {
 // handled by the inner loop. The kind prefix (`enum`/`set`) is matched
 // case-insensitively against the column_type string — the *values*
 // inside the parens preserve their source-side casing.
+//
+// Backslashes arrive DOUBLED: information_schema renders a stored label
+// `a\b` as `enum('a\\b')` — verified on MySQL 8.0, and (unlike SHOW
+// CREATE TABLE's quoting) the rendering does NOT change under a
+// NO_BACKSLASH_ESCAPES session. The inner loop decodes the pair back to
+// one backslash so the IR holds the RAW label, symmetric with
+// COLUMN_DEFAULT / COLUMN_COMMENT (which information_schema reports
+// already decoded). The writer's quoteSQLString re-escapes on emit
+// (SEC-1 review gap 2); pre-fix the escaped form only round-tripped
+// MySQL→MySQL by accidental symmetry and landed on PG with a doubled
+// backslash.
 func parseEnumOrSet(columnType, kind string) ([]string, error) {
 	expected := kind + "("
 	lower := strings.ToLower(columnType)
@@ -274,7 +285,8 @@ func parseEnumOrSet(columnType, kind string) ([]string, error) {
 		if body[0] != '\'' {
 			return nil, fmt.Errorf("mysql: malformed %s value list near %q", strings.ToUpper(kind), body)
 		}
-		// Find the closing quote, accounting for doubled-quote escapes.
+		// Find the closing quote, accounting for doubled-quote escapes and
+		// decoding information_schema's doubled backslashes (see doc above).
 		var sb strings.Builder
 		i := 1
 		for i < len(body) {
@@ -285,6 +297,11 @@ func parseEnumOrSet(columnType, kind string) ([]string, error) {
 					continue
 				}
 				break
+			}
+			if body[i] == '\\' && i+1 < len(body) && body[i+1] == '\\' {
+				sb.WriteByte('\\')
+				i += 2
+				continue
 			}
 			sb.WriteByte(body[i])
 			i++

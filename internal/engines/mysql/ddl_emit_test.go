@@ -1482,10 +1482,34 @@ func TestQuoteSQLString(t *testing.T) {
 		{"it's", "'it''s'"},
 		{"", "''"},
 		{"two''quotes", "'two''''quotes'"},
+		// SEC-1 review gap 2: under the default configured sql_mode (no
+		// NO_BACKSLASH_ESCAPES) MySQL's lexer treats \ as an escape
+		// introducer, so every literal backslash must be doubled — the
+		// interior, TRAILING (quote-swallow shape), pre-doubled, and
+		// mixed-with-quote variants.
+		{`C:\temp`, `'C:\\temp'`},
+		{`trailing\`, `'trailing\\'`},
+		{`a\\b`, `'a\\\\b'`},
+		{`mix\'s`, `'mix\\''s'`},
 	}
 	for _, c := range cases {
 		if got := quoteSQLString(c.in); got != c.want {
 			t.Errorf("quoteSQLString(%q) = %q; want %q", c.in, got, c.want)
 		}
+	}
+
+	// Under a configured NO_BACKSLASH_ESCAPES mode the backslash is an
+	// ordinary character: doubling there would itself corrupt the value, so
+	// the escaping is keyed off the configured session mode. (Serial test —
+	// sessionSQLMode is process-global, set-once-at-startup state; restore
+	// so no other test observes the override.)
+	orig := sessionSQLMode
+	t.Cleanup(func() { SetSessionSQLMode(orig) })
+	SetSessionSQLMode("NO_BACKSLASH_ESCAPES,STRICT_TRANS_TABLES")
+	if got, want := quoteSQLString(`C:\temp`), `'C:\temp'`; got != want {
+		t.Errorf("quoteSQLString under NO_BACKSLASH_ESCAPES = %q; want %q (no doubling)", got, want)
+	}
+	if got, want := quoteSQLString("it's"), "'it''s'"; got != want {
+		t.Errorf("quoteSQLString quote-doubling under NO_BACKSLASH_ESCAPES = %q; want %q", got, want)
 	}
 }

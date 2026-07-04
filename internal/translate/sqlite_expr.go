@@ -30,8 +30,9 @@ package translate
 // (value-fidelity review) removed several constructs that a per-representative
 // test would have passed but that silently diverge on some operand.
 //
-//   - column references (bare and quoted idents) and numeric/string literals
-//     (string literals containing a backslash refuse on MySQL — see below)
+//   - column references (bare, backtick- and bracket-quoted idents) and
+//     numeric/string literals (string literals containing a backslash and
+//     ALL double-quoted tokens refuse on MySQL — see below)
 //   - operators: + - *  = <> != < <= > >=  AND OR NOT  IS [NOT] NULL,
 //     string concat || (PG keeps ||; MySQL becomes CONCAT(...)), and `/` on
 //     Postgres ONLY (see below)
@@ -63,6 +64,13 @@ package translate
 //     stays permissive: under standard_conforming_strings=on (server default
 //     since 9.1, pinned on every sluice PG session) backslash is literal,
 //     matching SQLite, and PG stores the parsed tree, not the text.
+//   - any "…" double-quoted token, on MySQL ONLY (SEC-1 review gap 1):
+//     SQLite reads it as an identifier (or, via the double-quoted-string
+//     misfeature, a string); MySQL under its default sql_mode (no
+//     ANSI_QUOTES) reads it as a STRING LITERAL with backslash-escape
+//     semantics — silently wrong regardless of content (see identNode). PG
+//     reads "…" as an identifier, matching SQLite's primary meaning, and an
+//     unknown column fails loudly (42703) — permissive there.
 //   - substr with a non-literal or < 1 start (negative counts from the end in
 //     SQLite, not in SUBSTRING); min/max on PG (LEAST/GREATEST skip NULLs, but
 //     SQLite scalar min/max propagate NULL).
@@ -123,6 +131,22 @@ func SQLiteExprHasBackslashStringLiteral(expr string) bool {
 	return false
 }
 
+// SQLiteExprHasDoubleQuotedToken reports whether the SQLite expression body
+// contains a "…" double-quoted token — an identifier under SQLite's rules (or
+// a string via the double-quoted-string misfeature), but a STRING LITERAL
+// with backslash-escape semantics under MySQL's default sql_mode (no
+// ANSI_QUOTES), so it silently changes meaning there regardless of content
+// (see identNode). Sibling of [SQLiteExprHasBackslashStringLiteral]; the
+// MySQL writer's refusal boundary uses it to name this wart.
+func SQLiteExprHasDoubleQuotedToken(expr string) bool {
+	for _, tok := range tokenizeSQLiteExpr(expr) {
+		if tok.kind == sqIdent && strings.HasPrefix(tok.text, `"`) {
+			return true
+		}
+	}
+	return false
+}
+
 // sqTarget selects the emit dialect.
 type sqTarget int
 
@@ -161,9 +185,10 @@ type sqNode interface {
 	emit(t sqTarget) (string, bool)
 }
 
-// verbatimNode carries text that is identical on both targets: a column
-// reference (bare or quoted), a numeric literal, NULL, or a current-instant
-// keyword. String literals are NOT verbatim — see stringNode.
+// verbatimNode carries text that is identical on both targets: a bare column
+// reference, a numeric literal, NULL, or a current-instant keyword. String
+// literals and quoted identifiers are NOT verbatim — see stringNode and
+// identNode.
 type verbatimNode struct{ text string }
 
 func (n verbatimNode) emit(sqTarget) (string, bool) { return n.text, true }
@@ -193,6 +218,34 @@ type stringNode struct{ text string }
 
 func (n stringNode) emit(t sqTarget) (string, bool) {
 	if t == sqMySQL && strings.Contains(n.text, `\`) {
+		return "", false
+	}
+	return n.text, true
+}
+
+// identNode carries a quoted-identifier token, delimiters included. Backtick
+// and bracket forms emit verbatim: backtick is MySQL's own identifier quoting
+// (and a loud parse error on PG); bracket is a loud parse error on both. A
+// DOUBLE-quoted token refuses on MySQL (SEC-1 review gap 1) REGARDLESS of
+// content: under MySQL's default sql_mode (no ANSI_QUOTES — sluice's pinned
+// session mode does not enable it, and the body is re-parsed under future
+// sessions' modes sluice does not control) `"…"` lexes as a STRING LITERAL
+// with backslash-escape semantics, not an identifier. So a surviving "…"
+// token silently changes meaning either way: an intended identifier becomes a
+// string (vacating e.g. a CHECK), SQLite's double-quoted-string misfeature
+// becomes an escape-decoded string, and a trailing backslash swallows the
+// closing quote (the DDL-position escape). Note the SQLite reader de-quotes
+// BARE quoted identifiers at the read boundary (stripSQLiteIdentQuotes), so
+// any "…" that reaches this translator is by construction the non-bare /
+// misfeature residue — there is no MySQL-portable use to preserve.
+//
+// PG keeps "…" verbatim: it is a well-formed PG identifier there, matching
+// SQLite's primary meaning, and an unknown column fails loudly (42703) —
+// never silently.
+type identNode struct{ text string }
+
+func (n identNode) emit(t sqTarget) (string, bool) {
+	if t == sqMySQL && strings.HasPrefix(n.text, `"`) {
 		return "", false
 	}
 	return n.text, true
@@ -721,7 +774,7 @@ func (p *sqParser) parsePrimary() (sqNode, bool) {
 		return stringNode{text: t.text}, true
 	case sqIdent:
 		p.pos++
-		return verbatimNode{text: t.text}, true
+		return identNode{text: t.text}, true
 	case sqWord:
 		up := strings.ToUpper(t.text)
 		switch up {

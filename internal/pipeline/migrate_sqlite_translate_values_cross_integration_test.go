@@ -28,6 +28,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/engines"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
@@ -200,43 +201,142 @@ func TestMigrate_SQLiteBackslashLiteral_RefusedToMySQL(t *testing.T) {
 	_, target, cleanup := startMySQL(t)
 	defer cleanup()
 
-	// Each migrate gets an explicit MigrationID: the auto-derived id hashes
-	// DSN host info, which is identical across sqlite temp-file sources, so a
-	// second run against the shared target would otherwise fail on the
-	// partial-migration guard instead of the backslash refusal this test pins.
-	assertBackslashRefusal := func(kind, table, body string, seed func(*testing.T, string, string) string) {
-		t.Helper()
-		src := seed(t, table, body)
-		sqliteEng, ok := engines.Get("sqlite")
-		if !ok {
-			t.Fatal("sqlite engine not registered")
-		}
-		targetEng, ok := engines.Get("mysql")
-		if !ok {
-			t.Fatal("mysql engine not registered")
-		}
-		mig := &Migrator{Source: sqliteEng, Target: targetEng, SourceDSN: src, TargetDSN: target, MigrationID: table}
-		err := mig.Run(ctx2min(t))
-		if err == nil {
-			t.Errorf("%s with backslash literal migrated to mysql without error; want a LOUD named refusal", kind)
-			return
-		}
-		if !strings.Contains(err.Error(), "backslash") {
-			t.Errorf("%s refusal = %v; want the error to NAME the backslash", kind, err)
-		}
-	}
-
 	// Generated column: plain interior backslash.
-	assertBackslashRefusal("gencol", "bs_gen", `a || 'C:\temp'`, seedSQLiteGenCol)
+	assertNamedRefusal(t, target, "gencol", "bs_gen", `a || 'C:\temp'`, "backslash", seedSQLiteGenCol)
 	// CHECK: the trailing-\ quote-swallow shape (satisfied by the seed row).
-	assertBackslashRefusal("CHECK", "bs_chk", `a <> 'x\'`, seedSQLiteCheck)
+	assertNamedRefusal(t, target, "CHECK", "bs_chk", `a <> 'x\'`, "backslash", seedSQLiteCheck)
 	// DEFAULT expression: the verbatim-carry boundary that never routes
 	// through the translator. The body must NOT begin with a quote: PRAGMA
 	// table_info strips the outer parens, and the SQLite reader's
 	// parseDefault classifies a quote-delimited dflt_value as a
 	// DefaultLiteral, which takes the quoteSQLString path instead of the
 	// expression carry this test pins.
-	assertBackslashRefusal("DEFAULT", "bs_def", `(coalesce(NULL, 'C:\temp'))`, seedSQLiteDefaultExpr)
+	assertNamedRefusal(t, target, "DEFAULT", "bs_def", `(coalesce(NULL, 'C:\temp'))`, "backslash", seedSQLiteDefaultExpr)
+}
+
+// TestMigrate_SQLiteDoubleQuoted_RefusedToMySQL pins SEC-1 review gap 1
+// end-to-end: a "…" double-quoted token in a gencol / CHECK — an identifier
+// or the double-quoted-string misfeature to SQLite, but a STRING LITERAL
+// with escape semantics to MySQL's default sql_mode — must abort LOUDLY on a
+// MySQL target with an error naming the double-quoted token. (No DEFAULT
+// cell: SQLite itself rejects a double-quoted token in DEFAULT position. The
+// index cell WARN-skips rather than aborting and is pinned at unit level in
+// the mysql package.)
+func TestMigrate_SQLiteDoubleQuoted_RefusedToMySQL(t *testing.T) {
+	_, target, cleanup := startMySQL(t)
+	defer cleanup()
+
+	// Generated column: misfeature string with interior backslash.
+	assertNamedRefusal(t, target, "gencol", "dq_gen", `a || "C:\temp"`, "double-quoted", seedSQLiteGenCol)
+	// CHECK: the trailing-backslash quote-swallow shape, one quote flavor
+	// over (satisfied by the seed row: 'abcdef' <> the string "x\").
+	assertNamedRefusal(t, target, "CHECK", "dq_chk", `a <> "x\"`, "double-quoted", seedSQLiteCheck)
+}
+
+// assertNamedRefusal runs a SQLite→MySQL migrate that must abort with an
+// error containing wantToken. Each migrate gets an explicit MigrationID: the
+// auto-derived id hashes DSN host info, which is identical across sqlite
+// temp-file sources, so a second run against a shared target would otherwise
+// fail on the partial-migration guard instead of the named refusal.
+func assertNamedRefusal(t *testing.T, target, kind, table, body, wantToken string, seed func(*testing.T, string, string) string) {
+	t.Helper()
+	src := seed(t, table, body)
+	sqliteEng, ok := engines.Get("sqlite")
+	if !ok {
+		t.Fatal("sqlite engine not registered")
+	}
+	targetEng, ok := engines.Get("mysql")
+	if !ok {
+		t.Fatal("mysql engine not registered")
+	}
+	mig := &Migrator{Source: sqliteEng, Target: targetEng, SourceDSN: src, TargetDSN: target, MigrationID: table}
+	err := mig.Run(ctx2min(t))
+	if err == nil {
+		t.Errorf("%s %q migrated to mysql without error; want a LOUD refusal naming %q", kind, body, wantToken)
+		return
+	}
+	if !strings.Contains(err.Error(), wantToken) {
+		t.Errorf("%s refusal = %v; want the error to NAME %q", kind, err, wantToken)
+	}
+}
+
+// TestMigrate_SQLiteBackslashDefaultLiteral_ToMySQL ground-truths SEC-1
+// review gap 2 on the DefaultLiteral route: an UNPARENTHESIZED SQLite string
+// default takes the DefaultLiteral path (the reader's parseDefault strips
+// the quotes to the raw value — probed: PRAGMA reports `'C:\temp'`, decoded
+// to one backslash), and the MySQL writer's quoteSQLString must re-escape it
+// so the STORED default round-trips byte-identically — pre-fix `'C:\temp'`
+// emitted undoubled and MySQL silently decoded it to "C:<TAB>emp", and the
+// trailing-\ shape swallowed the closing quote. Both columns ride a varchar
+// type-override: SQLite's affinity mapping lands declared text at ir.Text,
+// and MySQL forbids DEFAULT on TEXT (the writer warn-suppresses it), so
+// without the override there is no target DEFAULT to pin.
+func TestMigrate_SQLiteBackslashDefaultLiteral_ToMySQL(t *testing.T) {
+	_, target, cleanup := startMySQL(t)
+	defer cleanup()
+
+	src := seedSQLiteText(t, `CREATE TABLE bs_lit (
+		id INTEGER PRIMARY KEY,
+		d TEXT NOT NULL DEFAULT 'C:\temp',
+		w TEXT NOT NULL DEFAULT 'trail\'
+	);
+	INSERT INTO bs_lit (id) VALUES (1);`)
+	srcDB := openSQLite(t, src)
+	defer func() { _ = srcDB.Close() }()
+
+	sqliteEng, ok := engines.Get("sqlite")
+	if !ok {
+		t.Fatal("sqlite engine not registered")
+	}
+	targetEng, ok := engines.Get("mysql")
+	if !ok {
+		t.Fatal("mysql engine not registered")
+	}
+	mig := &Migrator{
+		Source: sqliteEng, Target: targetEng, SourceDSN: src, TargetDSN: target,
+		MigrationID: "bs_lit",
+		Mappings: []config.Mapping{
+			{Table: "bs_lit", Column: "d", TargetType: "varchar"},
+			{Table: "bs_lit", Column: "w", TargetType: "varchar"},
+		},
+	}
+	if err := mig.Run(ctx2min(t)); err != nil {
+		t.Fatalf("Migrator.Run (SQLite→MySQL backslash DefaultLiteral): %v", err)
+	}
+
+	my, err := sql.Open("mysql", target)
+	if err != nil {
+		t.Fatalf("open mysql: %v", err)
+	}
+	defer func() { _ = my.Close() }()
+
+	// The copied row (SQLite applied the defaults at seed time) and a
+	// TARGET-side DEFAULT-applied row must both equal SQLite's values.
+	srcRows := readRowsAsStrings(t, srcDB, `SELECT d, w FROM bs_lit WHERE id = 1`, 2)
+	assertRowsEqual(t, "bs_lit copied row",
+		srcRows,
+		readRowsAsStrings(t, my, `SELECT d, w FROM bs_lit WHERE id = 1`, 2))
+	if _, err := my.ExecContext(ctx2min(t), `INSERT INTO bs_lit (id) VALUES (2)`); err != nil {
+		t.Fatalf("insert DEFAULT-applied row on target: %v", err)
+	}
+	assertRowsEqual(t, "bs_lit target DEFAULT-applied row",
+		srcRows,
+		readRowsAsStrings(t, my, `SELECT d, w FROM bs_lit WHERE id = 2`, 2))
+	if srcRows[0][0] != `C:\temp` || srcRows[0][1] != `trail\` {
+		t.Errorf("source default values = %v; want [C:\\temp trail\\] (seed anchor)", srcRows[0])
+	}
+
+	// Stored-metadata anchor: information_schema reports the DECODED value,
+	// so the target's COLUMN_DEFAULT must carry exactly one backslash.
+	var dDflt, wDflt sql.NullString
+	if err := my.QueryRowContext(ctx2min(t), `SELECT
+		(SELECT COLUMN_DEFAULT FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'bs_lit' AND column_name = 'd'),
+		(SELECT COLUMN_DEFAULT FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'bs_lit' AND column_name = 'w')`).Scan(&dDflt, &wDflt); err != nil {
+		t.Fatalf("read target COLUMN_DEFAULTs: %v", err)
+	}
+	if dDflt.String != `C:\temp` || wDflt.String != `trail\` {
+		t.Errorf("target COLUMN_DEFAULTs = (%q, %q); want (C:\\temp, trail\\) — the stored default must be byte-identical", dDflt.String, wDflt.String)
+	}
 }
 
 // runRefusalSuite reuses ONE target container and attempts a migrate per

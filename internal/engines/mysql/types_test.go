@@ -264,6 +264,11 @@ func TestParseEnumOrSet(t *testing.T) {
 		{"set", "set('x','y','z')", "set", []string{"x", "y", "z"}},
 		{"escaped quote", `enum('it''s','ok')`, "enum", []string{"it's", "ok"}},
 		{"empty value", "enum('','b')", "enum", []string{"", "b"}},
+		// information_schema renders a stored backslash DOUBLED in COLUMN_TYPE
+		// (verified on MySQL 8.0, session-mode-independent); the parser decodes
+		// it so the IR holds the raw label (SEC-1 review gap 2).
+		{"escaped backslash", `enum('a\\b','x')`, "enum", []string{`a\b`, "x"}},
+		{"trailing escaped backslash", `enum('t\\')`, "enum", []string{`t\`}},
 	}
 	for _, c := range cases {
 		c := c

@@ -71,6 +71,27 @@ func SetSessionSQLMode(modes string) {
 	sessionSQLMode = modes
 }
 
+// backslashIsMySQLEscape reports whether MySQL's string-literal lexer treats
+// a backslash as an escape introducer under the sql_mode sluice injects into
+// its sessions ([sessionSQLMode]): true unless the configured mode includes
+// NO_BACKSLASH_ESCAPES. The DDL emitters key their string-literal quoting off
+// this (quoteSQLString, SEC-1 review gap 2): when backslash is an escape,
+// every literal backslash must be doubled or MySQL silently decodes it.
+//
+// Two documented approximations, both conservative toward MySQL's factory
+// default (backslash IS an escape):
+//
+//   - sessionSQLMode == "" means "fall through to the server default", which
+//     sluice cannot see here; no stock MySQL default includes
+//     NO_BACKSLASH_ESCAPES, so escaping is assumed.
+//   - a DSN-level `sql_mode=` param overrides per-connection and is not
+//     visible to the emitters; an operator combining a DSN-only
+//     NO_BACKSLASH_ESCAPES override with backslash-bearing string values
+//     should set --mysql-sql-mode instead so the emitters see it.
+func backslashIsMySQLEscape() bool {
+	return !strings.Contains(strings.ToUpper(sessionSQLMode), "NO_BACKSLASH_ESCAPES")
+}
+
 // dsnShapeHint inspects a DSN that failed to parse and returns a
 // short, leading-newline-terminated hint when sluice can recognise
 // a known operator-side mistake. Returns the empty string for

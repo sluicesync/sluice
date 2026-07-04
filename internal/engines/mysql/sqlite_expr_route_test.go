@@ -165,8 +165,72 @@ func TestSQLiteRoute_BackslashLiteral_RefusedNamed(t *testing.T) {
 	if err := refuseBackslashSQLiteDefaultMySQL("d", ir.DefaultExpression{Expr: `'a\b'`, Dialect: "postgres"}); err != nil {
 		t.Errorf("refuseBackslashSQLiteDefaultMySQL(postgres dialect) = %v; want nil (sqlite-carry guard only)", err)
 	}
+	// A DefaultLiteral is outside this guard's jurisdiction because the
+	// literal path is quoted by quoteSQLString, which re-escapes backslashes
+	// itself (SEC-1 review gap 2) — the value is carried LOSSLESSLY there,
+	// no refusal needed. The quoting is pinned in TestQuoteSQLString; the
+	// emitted DEFAULT clause shape is pinned here.
 	if err := refuseBackslashSQLiteDefaultMySQL("d", ir.DefaultLiteral{Value: `a\b`}); err != nil {
-		t.Errorf("refuseBackslashSQLiteDefaultMySQL(DefaultLiteral) = %v; want nil (literal path is quoted, not carried)", err)
+		t.Errorf("refuseBackslashSQLiteDefaultMySQL(DefaultLiteral) = %v; want nil (the literal path re-escapes losslessly)", err)
+	}
+	litCol := &ir.Column{
+		Name: "d_lit", Type: ir.Varchar{Length: 50},
+		Default: ir.DefaultLiteral{Value: `C:\temp`},
+	}
+	def, err := emitColumnDef(litCol)
+	if err != nil {
+		t.Fatalf("emitColumnDef(DefaultLiteral with backslash) = %v; want nil (lossless re-escape)", err)
+	}
+	if !strings.Contains(def, `DEFAULT 'C:\\temp'`) {
+		t.Errorf("DefaultLiteral emit = %q; want the backslash DOUBLED in the DEFAULT clause", def)
+	}
+}
+
+// TestSQLiteRoute_DoubleQuoted_RefusedNamed pins SEC-1 review gap 1 on the
+// MySQL writer: a "…" double-quoted token — an identifier or the
+// double-quoted-string misfeature under SQLite's rules, but a STRING LITERAL
+// with escape semantics under MySQL's default sql_mode (no ANSI_QUOTES) —
+// refuses LOUDLY naming the mechanism on the data-load-bearing constructs
+// (gencol, CHECK) and WARN-skips on the index path, REGARDLESS of backslash
+// content. The reviewer-derived cells: gencol `a || "C:\temp"`, CHECK
+// `a <> "x\"`, index `coalesce(a, "z\q")`; DEFAULT has no cell — SQLite
+// itself rejects a double-quoted token in DEFAULT position.
+func TestSQLiteRoute_DoubleQuoted_RefusedNamed(t *testing.T) {
+	col := &ir.Column{
+		Name: "g_dq", Type: ir.Text{},
+		GeneratedExpr: `a || "C:\temp"`, GeneratedStored: true, GeneratedExprDialect: "sqlite",
+	}
+	if _, err := emitColumnDef(col); err == nil {
+		t.Error(`emitColumnDef(gencol a || "C:\temp") err=nil; want a LOUD double-quoted refusal`)
+	} else if !strings.Contains(err.Error(), "double-quoted") || !strings.Contains(err.Error(), "g_dq") {
+		t.Errorf("gencol refusal = %v; want it to name the double-quoted token and the column", err)
+	}
+
+	chk := &ir.CheckConstraint{Name: "ck_dq", Expr: `a <> "x\"`, ExprDialect: "sqlite"}
+	if _, err := emitCheckConstraint(chk); err == nil {
+		t.Error(`emitCheckConstraint(a <> "x\") err=nil; want a LOUD double-quoted refusal`)
+	} else if !strings.Contains(err.Error(), "double-quoted") || !strings.Contains(err.Error(), "ck_dq") {
+		t.Errorf("CHECK refusal = %v; want it to name the double-quoted token and the constraint", err)
+	}
+
+	idx := &ir.Index{
+		Name: "ix_dq",
+		Columns: []ir.IndexColumn{
+			{Expression: `coalesce(a, "z\q")`, ExpressionDialect: "sqlite"},
+		},
+	}
+	if stmt, err := emitCreateIndex("t", idx); err != nil || stmt != "" {
+		t.Errorf("double-quoted expr index = (%q, %v); want (\"\", nil) — WARN-skip, never emitted", stmt, err)
+	}
+
+	// Refuse-regardless: a backslash-FREE double-quoted token is still a
+	// silent meaning change on MySQL (identifier → string literal, vacating
+	// the predicate), so it refuses too.
+	noBs := &ir.CheckConstraint{Name: "ck_dq2", Expr: `"status" <> ''`, ExprDialect: "sqlite"}
+	if _, err := emitCheckConstraint(noBs); err == nil {
+		t.Error(`emitCheckConstraint("status" <> '') err=nil; want a LOUD double-quoted refusal (no backslash needed)`)
+	} else if !strings.Contains(err.Error(), "double-quoted") {
+		t.Errorf("backslash-free DQS refusal = %v; want it to name the double-quoted token", err)
 	}
 }
 

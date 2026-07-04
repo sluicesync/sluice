@@ -386,10 +386,23 @@ func emitStringList(values []string) string {
 	return strings.Join(parts, ",")
 }
 
-// quoteSQLString returns s wrapped in single quotes, with interior
-// single quotes escaped by doubling. Suitable for use as a SQL string
-// literal or inside ENUM/SET value lists.
+// quoteSQLString returns s wrapped in single quotes, with interior single
+// quotes escaped by doubling and — when the configured session sql_mode
+// leaves backslash as MySQL's escape introducer (the default; see
+// [backslashIsMySQLEscape]) — backslashes doubled, so the value MySQL stores
+// is byte-identical to s. SEC-1 review gap 2: pre-fix, an undoubled
+// backslash was silently decoded by MySQL's lexer (`'C:\temp'` stored as
+// "C:<TAB>emp"), and a value ENDING in a backslash swallowed the closing
+// quote, shifting the following DDL text into string position. Under
+// NO_BACKSLASH_ESCAPES the backslash is an ordinary character and doubling
+// would itself corrupt, so the doubling is keyed off the configured mode.
+// Suitable for use as a SQL string literal or inside ENUM/SET value lists
+// (whose labels the reader decodes to raw values at the read boundary —
+// see parseEnumOrSet).
 func quoteSQLString(s string) string {
+	if backslashIsMySQLEscape() {
+		s = strings.ReplaceAll(s, `\`, `\\`)
+	}
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
@@ -1529,6 +1542,28 @@ func refuseNonPortableSQLiteExprMySQL(kind, name, expr, dialect string) error {
 				"it would silently change its meaning on the target. Operator recovery: "+
 				"rewrite the expression on the SQLite source without the backslash, or drop "+
 				"the %s and re-create an equivalent one on the MySQL target post-migration",
+			kind, name, expr, kind,
+		)
+	}
+	// SEC-1 review gap 1: a "…" double-quoted token gets its own NAMED
+	// refusal. SQLite reads it as an identifier (or, via the double-quoted-
+	// string misfeature, a string); MySQL under its default sql_mode (no
+	// ANSI_QUOTES) reads it as a STRING LITERAL with backslash-escape
+	// semantics — accepted without a murmur and silently wrong regardless of
+	// content (an intended identifier becomes a string, vacating e.g. a
+	// CHECK; a trailing backslash swallows the closing quote).
+	if translate.SQLiteExprHasDoubleQuotedToken(expr) {
+		return fmt.Errorf(
+			"refuse loudly: %s %q carries SQLite expression %q containing a double-quoted "+
+				"token. SQLite reads a double-quoted token as an identifier (or, via the "+
+				"double-quoted-string misfeature, a string); MySQL under its default sql_mode "+
+				"(no ANSI_QUOTES) reads it as a string literal with backslash-escape semantics "+
+				"— and the expression is stored in the target schema and re-parsed under "+
+				"future sessions' sql_mode, which sluice does not control — so emitting it "+
+				"would silently change its meaning on the target. Operator recovery: rewrite "+
+				"the expression on the SQLite source using single quotes for strings (or bare "+
+				"names for identifiers), or drop the %s and re-create an equivalent one on the "+
+				"MySQL target post-migration",
 			kind, name, expr, kind,
 		)
 	}

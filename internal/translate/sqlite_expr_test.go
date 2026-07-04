@@ -205,6 +205,54 @@ func TestSQLiteExpr_BackslashStringLiterals(t *testing.T) {
 	}
 }
 
+// TestSQLiteExpr_DoubleQuotedTokens pins the SEC-1 gap-1 boundary: any "…"
+// double-quoted token — an identifier under SQLite's rules, or a string via
+// the double-quoted-string misfeature — REFUSES on MySQL regardless of
+// content (under default sql_mode, no ANSI_QUOTES, MySQL lexes it as a
+// string literal WITH escape semantics: an intended identifier silently
+// becomes a string, and a trailing backslash swallows the closing quote).
+// PG keeps "…" verbatim: a well-formed PG identifier matching SQLite's
+// primary meaning; an unknown column fails loudly (42703). Backtick idents
+// stay portable to MySQL (its own identifier quoting).
+func TestSQLiteExpr_DoubleQuotedTokens(t *testing.T) {
+	dqBodies := []string{
+		`"name"`,                 // bare-looking ident, no backslash — still refused
+		`a || "C:\temp"`,         // misfeature string with interior backslash
+		`a <> "x\"`,              // trailing backslash — the quote-swallow shape
+		`coalesce(a, "z\q")`,     // function-argument position
+		`"my col" IS NOT NULL`,   // non-bare ident (space) — the surviving-residue shape
+		`"status" <> 'inactive'`, // predicate that would silently vacate on MySQL
+	}
+	for _, in := range dqBodies {
+		if got, ok := SQLiteExprToMySQL(in); ok {
+			t.Errorf("SQLiteExprToMySQL(%q) = (%q, true); want ok=false (double-quoted token is a string literal on MySQL)", in, got)
+		}
+		if _, ok := SQLiteExprToPG(in); !ok {
+			t.Errorf("SQLiteExprToPG(%q) ok=false; want true (PG reads \"…\" as an identifier, matching SQLite)", in)
+		}
+		if !SQLiteExprHasDoubleQuotedToken(in) {
+			t.Errorf("SQLiteExprHasDoubleQuotedToken(%q) = false; want true", in)
+		}
+	}
+
+	// PG carries the token byte-identically.
+	if got, ok := SQLiteExprToPG(`"my col" IS NOT NULL`); !ok || got != `("my col" IS NOT NULL)` {
+		t.Errorf(`SQLiteExprToPG("my col" IS NOT NULL) = (%q, %v); want (("my col" IS NOT NULL), true)`, got, ok)
+	}
+
+	// Backtick identifiers are MySQL's own quoting — portable there (and the
+	// classifier must not fire); PG rejects them loudly at DDL time, which is
+	// outside the translator's jurisdiction.
+	if got, ok := SQLiteExprToMySQL("`my col` IS NULL"); !ok || got != "(`my col` IS NULL)" {
+		t.Errorf("SQLiteExprToMySQL(backtick ident) = (%q, %v); want ((`my col` IS NULL), true)", got, ok)
+	}
+	for _, in := range []string{"`my col` IS NULL", `'hi'`, "a + b"} {
+		if SQLiteExprHasDoubleQuotedToken(in) {
+			t.Errorf("SQLiteExprHasDoubleQuotedToken(%q) = true; want false", in)
+		}
+	}
+}
+
 // TestSQLiteExpr_NonPortableBoth pins the loud-fail boundary: every construct
 // here returns ok=false on BOTH targets. This is the value-fidelity contract —
 // a construct we cannot prove equivalent (for EVERY operand shape) must never
