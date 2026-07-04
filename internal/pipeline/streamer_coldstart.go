@@ -417,13 +417,18 @@ func (s *Streamer) coldStartOpenSnapshot(ctx context.Context, applier ir.ChangeA
 // coldStartOpenTargetWriters opens the target SchemaWriter +
 // RowWriter, threads the operator knobs onto them, and runs the
 // target-side preflights (stale backends, connection budget, RLS)
-// against them. On any error the writers AND the snapshot stream are
-// closed here before returning — the caller propagates without
-// further cleanup.
+// against them. On any error the writers are closed and the snapshot
+// stream is ABANDONED here before returning (the caller propagates
+// without further cleanup) — Abandon rather than Close because no CDC
+// anchor has been persisted yet, so a just-created PG replication slot
+// would otherwise be orphaned WAL-pinning debris (Bug 177). The same
+// pre-anchor rule governs every stream teardown through
+// [Streamer.coldStartBeginCDC]'s anchor write; after that write the
+// slot is the warm-resume anchor and teardowns switch to Close.
 func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Schema, stream *ir.SnapshotStream) (ir.SchemaWriter, ir.RowWriter, error) {
 	sw, err := s.Target.OpenSchemaWriter(ctx, s.TargetDSN)
 	if err != nil {
-		_ = stream.Close()
+		_ = stream.Abandon()
 		return nil, nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open target schema writer: %w", err))
 	}
 	applyTargetSchema(sw, s.TargetSchema)
@@ -431,13 +436,13 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 	applyIndexBuildParallelism(sw, s.IndexBuildParallelism)
 	if err := applyEnabledPGExtensions(ctx, sw, s.EnabledPGExtensions); err != nil {
 		closeIf(sw)
-		_ = stream.Close()
+		_ = stream.Abandon()
 		return nil, nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: enable PG extensions on target: %w", err))
 	}
 	rw, err := s.Target.OpenRowWriter(ctx, s.TargetDSN)
 	if err != nil {
 		closeIf(sw)
-		_ = stream.Close()
+		_ = stream.Abandon()
 		return nil, nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open target row writer: %w", err))
 	}
 	applyTargetSchema(rw, s.TargetSchema)
@@ -456,7 +461,7 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 	); err != nil {
 		closeIf(rw)
 		closeIf(sw)
-		_ = stream.Close()
+		_ = stream.Abandon()
 		return nil, nil, err
 	}
 
@@ -475,7 +480,7 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 	if _, _, err := resolveTargetCopyParallelism(ctx, s.Target, s.TargetDSN, resolveCopyFanoutDegree(s.CopyFanoutDegree), s.MaxTargetConnections); err != nil {
 		closeIf(rw)
 		closeIf(sw)
-		_ = stream.Close()
+		_ = stream.Abandon()
 		return nil, nil, err
 	}
 
@@ -490,7 +495,7 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 		if err := preflightRLS(ctx, schema, rw, rlsSideTarget); err != nil {
 			closeIf(rw)
 			closeIf(sw)
-			_ = stream.Close()
+			_ = stream.Abandon()
 			return nil, nil, err
 		}
 	}
@@ -508,14 +513,20 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 // interrupted-COPY resume skip (v0.99.8 — the partial copy is the
 // expected state), or the default path's populated-target preflights
 // (ADR-0048 Shape-A three-point check / Bug 9 cold-start refusal).
-// On any error the writers and the snapshot stream are closed here.
+// On any error the writers are closed and the snapshot stream is
+// ABANDONED here (pre-anchor rule, Bug 177 — see
+// [Streamer.coldStartOpenTargetWriters]): a refusal fires before any
+// data movement, so discarding the just-created slot is
+// unconditionally safe, and leaving it would pin source WAL AND break
+// the refusal hint's own preferred `--reset-target-data` recovery on
+// "slot already exists".
 func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema, sw ir.SchemaWriter, rw ir.RowWriter, stream *ir.SnapshotStream, applier ir.ChangeApplier, streamID string, resumingCopy, forceFresh bool) error {
 	switch {
 	case s.ResetTargetData:
 		if err := resetTargetDataForStream(ctx, schema, rw, applier, streamID); err != nil {
 			closeIf(rw)
 			closeIf(sw)
-			_ = stream.Close()
+			_ = stream.Abandon()
 			return err
 		}
 	case s.SchemaAlreadyApplied:
@@ -571,7 +582,7 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 		if err := resetTargetTablesForRestart(ctx, schema, rw); err != nil {
 			closeIf(rw)
 			closeIf(sw)
-			_ = stream.Close()
+			_ = stream.Abandon()
 			return err
 		}
 	default:
@@ -587,13 +598,13 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 		if err := preflightCrossShardCollision(ctx, s.Source, s.SourceDSN, schema, s.InjectShardColumn.Engaged(), s.AllowCrossShardMerge); err != nil {
 			closeIf(rw)
 			closeIf(sw)
-			_ = stream.Close()
+			_ = stream.Abandon()
 			return err
 		}
 		if err := preflightShardConsolidation(ctx, schema, rw, s.InjectShardColumn.Name, s.InjectShardColumn.Value); err != nil {
 			closeIf(rw)
 			closeIf(sw)
-			_ = stream.Close()
+			_ = stream.Abandon()
 			return err
 		}
 		// Cold-start pre-flight: refuse if any target table already
@@ -617,7 +628,7 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 			if err := preflightColdStart(ctx, schema, rw, s.ForceColdStart || forceFresh, preflightModeSync); err != nil {
 				closeIf(rw)
 				closeIf(sw)
-				_ = stream.Close()
+				_ = stream.Abandon()
 				return err
 			}
 		}
@@ -698,7 +709,7 @@ func (s *Streamer) coldStartRunCopy(ctx context.Context, schema *ir.Schema, stre
 	if copyErr != nil {
 		closeIf(rw)
 		closeIf(sw)
-		_ = stream.Close()
+		_ = stream.Abandon()
 		return copyErr
 	}
 	closeIf(rw)
@@ -740,7 +751,7 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 	// The barrier (copyDone) is closed only after the producer writes
 	// Position under mu, so this establishes the happens-before edge.
 	if err := stream.WaitCopyComplete(ctx); err != nil {
-		_ = stream.Close()
+		_ = stream.Abandon()
 		return nil, stop, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: wait for snapshot COPY completion: %w", err))
 	}
 	// GitHub issue #15: persist the snapshot's anchor position on the
@@ -766,7 +777,7 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 	// applier's writePositionTx absorbs the duplicate without conflict.
 	if pw, ok := applier.(ir.PositionWriter); ok {
 		if err := pw.WritePosition(ctx, streamID, stream.Position); err != nil {
-			_ = stream.Close()
+			_ = stream.Abandon()
 			return nil, stop, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: persist cold-start CDC anchor position: %w", err))
 		}
 		slog.DebugContext(

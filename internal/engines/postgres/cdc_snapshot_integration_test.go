@@ -319,3 +319,79 @@ func equalStringSlices(a, b []string) bool {
 	}
 	return true
 }
+
+// TestSnapshotStream_AbandonDropsSlot is the engine-side Bug 177 pin:
+// abandoning an unconsumed snapshot stream drops the replication slot
+// the open created, so an abandoned cold start leaves no WAL-pinning
+// debris and a subsequent OpenSnapshotStream succeeds instead of
+// refusing on "slot already exists". Contrast Close, which must LEAVE
+// the slot (it is the CDC resume anchor for a consumed stream) — both
+// sides are asserted so the distinction can't silently collapse.
+func TestSnapshotStream_AbandonDropsSlot(t *testing.T) {
+	dsn, cleanup := startPostgresForSnapshotCDC(t)
+	defer cleanup()
+
+	applyPGSnap(t, dsn, `CREATE TABLE t177 (id BIGINT PRIMARY KEY, v TEXT);`)
+
+	eng := Engine{}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	slotCount := func() int {
+		t.Helper()
+		db, err := sql.Open("pgx", dsn)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer func() { _ = db.Close() }()
+		var n int
+		if err := db.QueryRowContext(
+			ctx,
+			`SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'sluice_slot'`,
+		).Scan(&n); err != nil {
+			t.Fatalf("count slots: %v", err)
+		}
+		return n
+	}
+
+	// Abandon: slot must be GONE afterwards.
+	stream, err := eng.OpenSnapshotStream(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenSnapshotStream: %v", err)
+	}
+	if got := slotCount(); got != 1 {
+		_ = stream.Abandon()
+		t.Fatalf("slot count after open = %d; want 1", got)
+	}
+	if err := stream.Abandon(); err != nil {
+		t.Fatalf("Abandon: %v", err)
+	}
+	if got := slotCount(); got != 0 {
+		t.Fatalf("slot count after Abandon = %d; want 0 (Bug 177: orphaned slot pins WAL and breaks re-open)", got)
+	}
+
+	// The decisive recovery property: a fresh open now SUCCEEDS (pre-fix
+	// it refused with "slot already exists").
+	stream2, err := eng.OpenSnapshotStream(ctx, dsn)
+	if err != nil {
+		t.Fatalf("re-open after Abandon: %v (the Bug 177 recovery break)", err)
+	}
+
+	// Close: slot must SURVIVE (the consumed-stream resume anchor), and
+	// a second Abandon-after-Close on the same stream must be a no-op
+	// (idempotency guard) — the slot from stream2 is then dropped
+	// manually so the shared DB is left clean.
+	if err := stream2.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := slotCount(); got != 1 {
+		t.Fatalf("slot count after Close = %d; want 1 (Close must leave the CDC resume anchor)", got)
+	}
+	if err := stream2.Abandon(); err != nil {
+		t.Fatalf("Abandon after Close (idempotency no-op): %v", err)
+	}
+	if got := slotCount(); got != 1 {
+		t.Fatalf("slot count after post-Close Abandon = %d; want 1 (teardown already ran; Abandon must not drop a consumed stream's slot)", got)
+	}
+	applyPGSnap(t, dsn, `SELECT pg_drop_replication_slot('sluice_slot');`)
+}

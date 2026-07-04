@@ -242,8 +242,17 @@ func (s *Streamer) coldStartMultiDatabase(
 	if err != nil {
 		return nil, stop, wrapWithHint(PhaseSnapshot, fmt.Errorf("pipeline: open multi-database snapshot stream: %w", err))
 	}
-	// Once the snapshot is open every error path must close it.
+	// Once the snapshot is open every error path must tear it down. The
+	// pre-anchor rule (Bug 177, see coldStartOpenTargetWriters) picks
+	// which teardown: before the CDC anchor position is persisted (step
+	// 5), Abandon — no resume is possible, so a durable slot the open
+	// created would be orphaned debris; after the anchor write, Close —
+	// the slot is the warm-resume anchor. Today's multi-database sources
+	// are MySQL (no AbandonFn ⇒ Abandon ≡ Close), but the PG spanning
+	// snapshot (ADR-0075) shares this opener surface and DOES create a
+	// slot.
 	closeStream := func() { _ = stream.Close() }
+	abandonStream := func() { _ = stream.Abandon() }
 
 	slog.InfoContext(ctx, "multi-database cold start; single spanning snapshot captured",
 		slog.String("stream_id", streamID))
@@ -256,7 +265,7 @@ func (s *Streamer) coldStartMultiDatabase(
 	// connection reads across every database at the one consistent view. ----
 	for _, database := range selected {
 		if err := s.coldStartCopyOneDatabase(ctx, stream, applier, streamID, database, inScope, targetDeriver, targetCanDeriveDB, forceFresh); err != nil {
-			closeStream()
+			abandonStream()
 			return nil, stop, err
 		}
 	}
@@ -279,7 +288,7 @@ func (s *Streamer) coldStartMultiDatabase(
 	// the binlog coordinate is server-wide. ----
 	if pw, ok := applier.(ir.PositionWriter); ok {
 		if err := pw.WritePosition(ctx, streamID, stream.Position); err != nil {
-			closeStream()
+			abandonStream()
 			return nil, stop, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: persist multi-database cold-start CDC anchor position: %w", err))
 		}
 		slog.DebugContext(

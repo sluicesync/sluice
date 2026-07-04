@@ -74,6 +74,25 @@ type SnapshotStream struct {
 	// it as a safety net doesn't double-rollback.
 	ReleaseRowsFn func() error
 
+	// AbandonFn is the OPTIONAL engine-supplied closure for the
+	// "this cold start will never consume the stream" exit: it must
+	// release everything CloseFn releases AND discard any DURABLE
+	// server-side artifact the open created (the Postgres logical
+	// replication slot — which Close deliberately leaves alive
+	// because a consumed stream's slot is the CDC resume anchor).
+	//
+	// Callers invoke it via Abandon, and only on exits where no CDC
+	// anchor position has been durably persisted for this stream —
+	// preflight refusals, pre-copy setup failures, and handoff
+	// failures BEFORE the anchor write (Bug 177: a target-not-empty
+	// refusal after slot creation orphaned the slot, pinning source
+	// WAL and breaking the refusal's own recovery hint on "slot
+	// already exists"). Once the anchor IS persisted, warm-resume
+	// depends on the slot and callers must use Close instead.
+	// Engines whose opens create no durable artifact (MySQL binlog,
+	// VStream) leave it nil; Abandon then falls back to Close.
+	AbandonFn func() error
+
 	// WaitCopyCompleteFn is the OPTIONAL engine-supplied barrier the
 	// cold-start handoff joins after bulk-copy drains but BEFORE it
 	// reads Position to start CDC. It blocks until the engine has
@@ -104,12 +123,30 @@ type SnapshotStream struct {
 }
 
 // Close releases the snapshot transaction and the underlying
-// connections. After Close, Rows and Changes are unusable.
+// connections. After Close, Rows and Changes are unusable. Any
+// durable artifact the open created (the Postgres replication slot)
+// stays alive — it is the CDC resume anchor for a consumed stream.
 func (s *SnapshotStream) Close() error {
 	if s == nil || s.CloseFn == nil {
 		return nil
 	}
 	return s.CloseFn()
+}
+
+// Abandon is the exit for a cold start that will never consume this
+// stream: it releases everything Close releases AND discards any
+// durable artifact the open created (see AbandonFn). Callable ONLY
+// while no CDC anchor position has been durably persisted for the
+// stream; after the anchor write, use Close. Falls back to Close on
+// engines that set no AbandonFn (their opens create nothing durable).
+func (s *SnapshotStream) Abandon() error {
+	if s == nil {
+		return nil
+	}
+	if s.AbandonFn == nil {
+		return s.Close()
+	}
+	return s.AbandonFn()
 }
 
 // ReleaseRows commits the snapshot transaction and closes the

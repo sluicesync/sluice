@@ -155,8 +155,10 @@ func recoveryHintFor(mode preflightMode) string {
 			"Likely state after a previous sync cold-start exited before persisting a CDC position — either " +
 			"mid-bulk-copy or post-bulk-copy-pre-first-CDC-apply (GitHub #15, fixed in v0.40.1 for new runs). " +
 			"To recover: (a) re-run with `--reset-target-data --yes` to wipe the target tables and any stale " +
-			"cdc-state row [preferred]; (b) manually `DROP TABLE` the affected target tables (and on PG sources, " +
-			"drop the source slot via `sluice slot drop`), then re-run; (c) pass `--force-cold-start` to bulk-copy " +
+			"cdc-state row [preferred] (on PG sources, if the interrupted run left its replication slot behind " +
+			"— a killed process can't clean up — drop it first via `sluice slot drop`); (b) manually `DROP TABLE` " +
+			"the affected target tables (and on PG sources, drop the source slot via `sluice slot drop`), then " +
+			"re-run; (c) pass `--force-cold-start` to bulk-copy " +
 			"into the populated table anyway (will collide on PRIMARY KEY in most cases — use with extreme caution)"
 	default: // preflightModeMigrate
 		return "this usually means a previous cold-start was killed mid-bulk-copy. " +

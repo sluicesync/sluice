@@ -311,10 +311,21 @@ func (e Engine) openSnapshotStreamShared(ctx context.Context, dsn, slotName stri
 		return firstErr
 	}
 	stream.ReleaseRowsFn = releaseRows
-	stream.CloseFn = func() error {
-		// Order matters: stop CDC first (releases its own repl conn),
-		// then release the import-side resources if not already
-		// released, then close the schema DB pool.
+	// closeAll is the shared teardown body for CloseFn and AbandonFn.
+	// Order matters: stop CDC first (releases its own repl conn), then
+	// release the import-side resources if not already released — the
+	// slot-creation replConn MUST close before a slot drop, because the
+	// walsender that created the slot still holds it acquired and
+	// pg_drop_replication_slot refuses an active slot (the same dance
+	// the backup anchor teardown documents) — then optionally drop the
+	// slot, then close the schema DB pool. closed guards double
+	// invocation (Abandon-then-Close from layered defers).
+	closed := false
+	closeAll := func(dropSlot bool) error {
+		if closed {
+			return nil
+		}
+		closed = true
 		var firstErr error
 		if c, ok := cdcReader.(closer); ok {
 			if err := c.Close(); err != nil && firstErr == nil {
@@ -324,11 +335,36 @@ func (e Engine) openSnapshotStreamShared(ctx context.Context, dsn, slotName stri
 		if err := releaseRows(); err != nil && firstErr == nil {
 			firstErr = err
 		}
+		if dropSlot {
+			// Bug 177: an abandoned cold start (refusal / setup failure
+			// before the CDC anchor persisted) must not orphan the slot
+			// it just created — the leftover pins source WAL and breaks
+			// the refusal's own preferred recovery on "slot already
+			// exists". A failed drop is LOUD: named manual command, and
+			// the error surfaces to the caller.
+			if _, err := db.ExecContext(context.Background(), "SELECT pg_drop_replication_slot($1)", slotName); err != nil {
+				slog.WarnContext(
+					context.Background(), "postgres: snapshot abandon: dropping the just-created replication slot failed; drop it manually to release WAL",
+					slog.String("slot", slotName),
+					slog.String("manual_drop", fmt.Sprintf("SELECT pg_drop_replication_slot('%s')", slotName)),
+					slog.String("error", err.Error()),
+				)
+				if firstErr == nil {
+					firstErr = fmt.Errorf("postgres: snapshot abandon: drop replication slot %q: %w", slotName, err)
+				}
+			}
+		}
 		if err := db.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 		return firstErr
 	}
+	stream.CloseFn = func() error { return closeAll(false) }
+	// Abandon = Close + drop the slot this open created. Safe exactly
+	// while no CDC anchor position has been persisted for the stream
+	// (the ir.SnapshotStream.AbandonFn contract); the orchestrator owns
+	// that gate.
+	stream.AbandonFn = func() error { return closeAll(true) }
 	return stream, nil
 }
 
