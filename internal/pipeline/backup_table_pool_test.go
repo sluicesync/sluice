@@ -120,7 +120,7 @@ func TestBackupParallelEligible(t *testing.T) {
 // would otherwise engage.
 func TestResolveBackupTableParallelism_TaskCountClamp(t *testing.T) {
 	b := &Backup{Source: importerStubEngine{}, SourceDSN: "dsn", Store: &LocalStore{}}
-	got, err := b.resolveBackupTableParallelism(context.Background(), &irbackup.Snapshot{SnapshotName: "snap-1"}, 1)
+	got, _, err := b.resolveBackupTableParallelism(context.Background(), &irbackup.Snapshot{SnapshotName: "snap-1"}, 1)
 	if err != nil {
 		t.Fatalf("resolveBackupTableParallelism: %v", err)
 	}
@@ -134,7 +134,7 @@ func TestResolveBackupTableParallelism_TaskCountClamp(t *testing.T) {
 // (no measured ceiling → the requested value stands).
 func TestResolveBackupTableParallelism_AutoDefault(t *testing.T) {
 	b := &Backup{Source: importerStubEngine{}, SourceDSN: "dsn", Store: &LocalStore{}}
-	got, err := b.resolveBackupTableParallelism(context.Background(), &irbackup.Snapshot{SnapshotName: "snap-1"}, 10)
+	got, _, err := b.resolveBackupTableParallelism(context.Background(), &irbackup.Snapshot{SnapshotName: "snap-1"}, 10)
 	if err != nil {
 		t.Fatalf("resolveBackupTableParallelism: %v", err)
 	}
@@ -232,7 +232,7 @@ func TestBackupTablePool_SerialCollapseNeverMintsReaders(t *testing.T) {
 		factoryCalls.Add(1)
 		return nil, errors.New("factory must not be called on the serial path")
 	}
-	if err := b.runBackupTablePool(context.Background(), tasks, primary, nil, factory, 1, 100, committer, nil); err != nil {
+	if err := b.runBackupTablePool(context.Background(), tasks, primary, nil, factory, 1, 100, committer, nil, nil); err != nil {
 		t.Fatalf("runBackupTablePool: %v", err)
 	}
 	if n := factoryCalls.Load(); n != 0 {
@@ -258,7 +258,7 @@ func TestBackupTablePool_DedicatedReadersClosed(t *testing.T) {
 		minted.Add(1)
 		return &backupPoolFakeReader{rows: rows, closes: &dedicatedCloses}, nil
 	}
-	if err := b.runBackupTablePool(context.Background(), tasks, primary, nil, factory, 4, 100, committer, nil); err != nil {
+	if err := b.runBackupTablePool(context.Background(), tasks, primary, nil, factory, 4, 100, committer, nil, nil); err != nil {
 		t.Fatalf("runBackupTablePool: %v", err)
 	}
 	if primaryCloses.Load() != 0 {
@@ -290,7 +290,7 @@ func TestBackupTablePool_EagerPeersReusedNeverMinted(t *testing.T) {
 		factoryCalls.Add(1)
 		return nil, errors.New("factory must not be called on the eager path")
 	}
-	if err := b.runBackupTablePool(context.Background(), tasks, primary, peers, factory, 4, 100, committer, nil); err != nil {
+	if err := b.runBackupTablePool(context.Background(), tasks, primary, peers, factory, 4, 100, committer, nil, nil); err != nil {
 		t.Fatalf("runBackupTablePool: %v", err)
 	}
 	if n := factoryCalls.Load(); n != 0 {
@@ -335,7 +335,7 @@ func TestBackupTablePool_FirstErrorCancelsPeers(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- b.runBackupTablePool(context.Background(), tasks, primary, nil, factory, 4, 100, committer, nil)
+		done <- b.runBackupTablePool(context.Background(), tasks, primary, nil, factory, 4, 100, committer, nil, nil)
 	}()
 	select {
 	case err := <-done:

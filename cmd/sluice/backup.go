@@ -394,6 +394,10 @@ type BackupFullCmd struct {
 
 	TableParallelism int `help:"READ-side (backup): number of tables read CONCURRENTLY during the backup row sweep (the read-side analog of pg_dump -j / migrate --table-parallelism). Postgres pins every parallel reader to ONE shareable exported snapshot; vanilla MySQL opens N readers whose consistent snapshots COINCIDE under a brief FLUSH TABLES WITH READ LOCK window (ADR-0088) — so cross-table consistency matches the serial sweep on both. MySQL falls back to a serial single reader (a loud INFO names the reason) when the source role lacks RELOAD; PlanetScale/Vitess sources keep the VStream-COPY path. The resolved value is bounded by the source's connection budget, reserving one slot for the snapshot's replication conn. 0 (default) = auto: 4. 1 disables cross-table concurrency. See ADR-0084 / ADR-0088." default:"0" placeholder:"N"`
 
+	BulkParallelism int `help:"READ-side (backup): number of parallel PK-range readers per LARGE table during the row sweep — the within-table axis (ADR-0149), composed with the cross-table --table-parallelism axis exactly as in migrate. Tables above --bulk-parallel-min-rows whose primary key is chunkable (single integer PK → MIN/MAX ranges; other orderable / composite PKs → sampled keyset) are split into disjoint ranges read concurrently, every range reader pinned to the SAME exported snapshot — so the backup's consistency is identical to the single-reader sweep. Requires the shareable-snapshot source path (Postgres); MySQL's coordinated-FTWRL readers and the non-snapshot fallback keep one reader per table (a loud INFO names the reason). Orthogonal to --chunk-size, which stays the rows-per-chunk-FILE roll boundary regardless of how many readers produced the files (a chunked table may carry up to ranges-1 extra partial-size chunk files). The --table-parallelism × --bulk-parallelism product is bounded by the SOURCE's connection budget (cross-table is satisfied first; within-table gets the remainder — a single-huge-table backup gets the full width). 0 (default) = auto: min(8, NumCPU), budget-split. 1 disables within-table chunking." default:"0" placeholder:"N"`
+
+	BulkParallelMinRows int64 `help:"READ-side (backup): estimated-row-count threshold below which a table streams with a single reader regardless of --bulk-parallelism — the same knob as migrate's --bulk-parallel-min-rows. Avoids per-range overhead on small tables. 0 (default) = auto: base 80000, dialled DOWN on many-table schemas (base/table-count, floored at 10000). Explicit values are never auto-lowered." default:"0" placeholder:"N"`
+
 	Compression string `help:"Per-segment chunk compression codec: none | gzip | zstd. Default zstd (klauspost/compress at SpeedDefault — 55-85% faster restore, the DR-critical axis; ~1-5% larger than gzip on representative data). 'none' leaves chunks as human-readable .jsonl on a local-FS target; 'gzip' is the pre-v0.67.0 codec. Recorded in lineage.json and read back from there on restore (never inferred from bytes)." default:"zstd" enum:"none,gzip,zstd" placeholder:"CODEC"`
 
 	SlotName string `help:"Replication-slot name suffix on engines with a slot concept (Postgres). Used to label the EndPosition recorded on the manifest so a Phase 3 incremental chained off this full opens CDC against a slot of the same name. Default 'sluice_slot'. Engines without slots (MySQL: binlog stream is the slot) ignore this flag." placeholder:"NAME"`
@@ -477,18 +481,20 @@ func (b *BackupFullCmd) run(g *Globals, env *envelopeRun) error {
 		return err
 	}
 	backup := &pipeline.Backup{
-		Source:           source,
-		SourceDSN:        b.Source,
-		Store:            store,
-		Filter:           filter,
-		ChunkRows:        b.ChunkSize,
-		SluiceVersion:    version,
-		SlotName:         pipeline.ResolveSlotName(b.SlotName),
-		ChainSlot:        b.ChainSlot,
-		TableParallelism: b.TableParallelism,
-		ForceOverwrite:   b.ForceOverwrite,
-		Encryption:       encConfig,
-		Codec:            codec,
+		Source:              source,
+		SourceDSN:           b.Source,
+		Store:               store,
+		Filter:              filter,
+		ChunkRows:           b.ChunkSize,
+		SluiceVersion:       version,
+		SlotName:            pipeline.ResolveSlotName(b.SlotName),
+		ChainSlot:           b.ChainSlot,
+		TableParallelism:    b.TableParallelism,
+		BulkParallelism:     b.BulkParallelism,
+		BulkParallelMinRows: b.BulkParallelMinRows,
+		ForceOverwrite:      b.ForceOverwrite,
+		Encryption:          encConfig,
+		Codec:               codec,
 		// --format json envelope hookup; nil in text mode (no-ops).
 		Summary: env.summary,
 	}

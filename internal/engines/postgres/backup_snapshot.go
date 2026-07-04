@@ -250,10 +250,25 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts irbacku
 		)
 	}
 
+	// estimatorDSN + estimatorExactCount (ADR-0149): the backup
+	// orchestrator's within-table chunk DECISION probes this reader's
+	// EstimateRowCount pre-stream. The reader is pinned (closer == nil),
+	// so the probe runs reltuples on a FRESH off-snapshot conn — and on
+	// the never-ANALYZEd sentinel resolves via an exact COUNT(*) on that
+	// SAME fresh conn (the 59c55e27 estimate/bounds split: the decision
+	// is a size estimate with no consistency requirement; the chunk
+	// bounds and row streams stay on the pinned conn). Without the DSN
+	// the estimate reports 0 and every large table would silently stream
+	// single-reader.
 	rowReader := &RowReader{
 		q:      conn,
 		schema: cfg.schema,
 		closer: nil, // BackupSnapshot owns the lifecycle
+
+		snapshotPinned:      true,
+		estimatorDSN:        cfg.dsn,
+		estimatorAppID:      cfg.appID,
+		estimatorExactCount: true,
 	}
 
 	closed := false

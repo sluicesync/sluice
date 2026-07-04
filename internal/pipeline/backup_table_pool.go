@@ -53,6 +53,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime"
 	"sync"
 
 	"golang.org/x/sync/errgroup"
@@ -135,6 +136,14 @@ type backupReaderFactory func(ctx context.Context) (ir.RowReader, error)
 // goroutine, reusing the snapshot's pinned reader for every table in
 // turn).
 //
+// within, when non-nil, enables ADR-0149 within-table read chunking:
+// each worker routes its table through [Backup.backupTableDispatch]
+// (chunk-eligible tables fan out into PK-range readers drawn from the
+// SAME free-reader channel + factory), and draws one BASE token from
+// the shared reader-budget gate so table + range readers together
+// never exceed the tableParallelism × bulk-parallelism budget. nil ⇒
+// the pre-ADR-0149 behaviour, byte-identical.
+//
 // primary is the orchestrator's already-open reader (the snapshot's
 // pinned conn, or the v0.17.x fallback reader). peers are the EAGER
 // pre-opened coordinated readers (MySQL ADR-0088; nil for the PG lazy
@@ -159,6 +168,7 @@ func (b *Backup) runBackupTablePool(
 	chunkRows int,
 	committer *manifestCommitter,
 	chainCEK []byte,
+	within *backupWithinTable,
 ) error {
 	limit := tableParallelism
 	if limit < 1 {
@@ -177,18 +187,34 @@ func (b *Backup) runBackupTablePool(
 	for _, p := range peers {
 		freeReader <- p
 	}
+	if within != nil {
+		// The ADR-0149 range workers draw from the SAME reader supply as
+		// cross-table peers — one acquisition path, one budget.
+		within.freeReader = freeReader
+		within.factory = factory
+	}
 
 	tg, tctx := errgroup.WithContext(ctx)
 	tg.SetLimit(limit)
 	for _, task := range tasks {
 		task := task
 		tg.Go(func() error {
+			if within != nil {
+				// Base token (the ADR-0123 copyGate discipline): the
+				// worker's own held reader counts against the same
+				// table × within read budget the extra range readers draw
+				// from, so the product ceiling holds by construction.
+				if err := within.gate.acquire(tctx); err != nil {
+					return err
+				}
+				defer within.gate.release()
+			}
 			rr, release, err := acquireBackupReader(tctx, freeReader, factory)
 			if err != nil {
 				return err
 			}
 			defer release()
-			if err := b.backupTable(tctx, rr, task, chunkRows, committer, chainCEK); err != nil {
+			if err := b.backupTableDispatch(tctx, rr, task, chunkRows, committer, chainCEK, within); err != nil {
 				return wrapWithHint(PhaseBulkCopy, fmt.Errorf("backup: table %q: %w", task.table.Name, err))
 			}
 			return nil
@@ -313,28 +339,60 @@ func (b *Backup) stageBackupTables(
 // engine that opens coincident readers eagerly (MySQL vanilla, under a
 // FTWRL window) knows how many readers to open; the gated, observed
 // decision is made post-staging by [resolveBackupTableParallelism].
+// Only the cross-table axis matters here — the eager reader supply is
+// per-table — so the within factor is discarded.
+func (b *Backup) resolveRequestedReaderParallelism(ctx context.Context, taskCount int) (int, error) {
+	tableP, _, err := b.resolveBackupReadParallelism(ctx, taskCount)
+	return tableP, err
+}
+
+// resolveBackupReadParallelism resolves BOTH read axes against the
+// SOURCE's measured connection budget: the cross-table fan-out
+// (ADR-0084/0088) and the ADR-0149 within-table range-reader factor
+// (--bulk-parallelism, 0 = auto = min(8, NumCPU) via
+// [resolveBulkParallelism]).
 //
 // The budget chokepoint reuses [resolveTargetCopyParallelism] against
 // the SOURCE DSN (backups open reader connections there; the prober is
-// engine-optional — MySQL has none, so its request stands unbounded by
-// this step, and the coordinator+N-reader bound is the operator's
-// request itself), then RESERVES one slot for the coordinator /
+// engine-optional — MySQL has none, so both requests stand unbounded by
+// this step), then RESERVES one slot for the coordinator /
 // slot-creation conn that stays open during the open window (the
-// ADR-0079 CDC-conn reservation pattern).
-func (b *Backup) resolveRequestedReaderParallelism(ctx context.Context, taskCount int) (int, error) {
-	requested := resolveTableParallelism(b.TableParallelism)
-	if requested > taskCount {
-		requested = taskCount // never fan out wider than there are tables to sweep
+// ADR-0079 CDC-conn reservation pattern), then splits the remainder
+// across the two axes via [resolveCopyParallelismBudget] with the axes
+// SWAPPED relative to migrate: backup satisfies the shipped
+// CROSS-TABLE axis first (its cell of the parity matrix predates
+// within-table chunking, and a default flip that shrank it would
+// regress many-table corpora), and the within axis gets whatever whole
+// multiples remain — which on a single-huge-table corpus (tableP
+// clamped to the task count = 1) is the entire remaining budget, the
+// ADR-0149 headline case. The product tableP × withinP never exceeds
+// the reserved-slot-adjusted budget.
+func (b *Backup) resolveBackupReadParallelism(ctx context.Context, taskCount int) (tableP, withinP int, err error) {
+	if taskCount == 0 {
+		return 0, 1, nil // nothing to sweep; no probe needed
 	}
-	if requested <= 1 {
-		return requested, nil
+	tableP = resolveTableParallelism(b.TableParallelism)
+	if tableP > taskCount {
+		tableP = taskCount // never fan out wider than there are tables to sweep
 	}
-	effective, report, err := resolveTargetCopyParallelism(ctx, b.Source, b.SourceDSN, requested, 0)
+	withinP = resolveBulkParallelism(b.BulkParallelism, runtime.NumCPU())
+	if withinP < 1 {
+		withinP = 1
+	}
+	if tableP <= 1 && withinP <= 1 {
+		return tableP, withinP, nil
+	}
+	probeWidth := tableP
+	if probeWidth < 1 {
+		probeWidth = 1
+	}
+	effective, report, err := resolveTargetCopyParallelism(ctx, b.Source, b.SourceDSN, probeWidth, 0)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
+	budget := 0
 	if report.CopyBudget >= 1 {
-		budget := report.CopyBudget - 1 // reserve the coordinator/repl conn's slot
+		budget = report.CopyBudget - 1 // reserve the coordinator/repl conn's slot
 		if budget < 1 {
 			// A budget of exactly 1 left only the reserved slot; the sweep
 			// still needs at least one reader. Floor at 1 — the loud
@@ -349,27 +407,37 @@ func (b *Backup) resolveRequestedReaderParallelism(ctx context.Context, taskCoun
 	if effective < 1 {
 		effective = 1
 	}
-	return effective, nil
+	// Axis-swapped budget split (see the doc comment): the helper
+	// satisfies its FIRST argument first and clamps the second to whole
+	// multiples of it, so passing (table, within) yields
+	// (withinClamped, tableUnchanged).
+	withinP, tableP = resolveCopyParallelismBudget(effective, withinP, budget, 0)
+	return tableP, withinP, nil
 }
 
 // resolveBackupTableParallelism resolves the EFFECTIVE cross-table
 // fan-out for the row sweep, post-staging: the requested value
-// ([resolveRequestedReaderParallelism]) gated by
-// [backupParallelEligible] against the actual snapshot. Not-eligible
-// (or ≤1 tables to sweep) collapses to 1 — the same pool runs serial —
-// with a loud INFO naming the reason (the ADR-0079 disposition: a
-// silent fallback would leave operators wondering why the knob did
-// nothing). The dispatch observer (test seam) fires with the decision.
+// ([resolveBackupReadParallelism]) gated by [backupParallelEligible]
+// against the actual snapshot. Not-eligible (or ≤1 tables to sweep)
+// collapses to 1 — the same pool runs serial — with a loud INFO naming
+// the reason (the ADR-0079 disposition: a silent fallback would leave
+// operators wondering why the knob did nothing). The dispatch observer
+// (test seam) fires with the decision.
+//
+// The second return is the budget-split within-table factor
+// (--bulk-parallelism, ADR-0149) — NOT yet mode-gated; the caller
+// hands it to [Backup.resolveBackupWithinTable], whose own gate + INFO
+// decide whether within-table chunking engages.
 //
 // For the EAGER MySQL path the snapshot has already opened
 // len(snap.ExtraReaders)+1 readers at the requested count, so the
 // effective value here is bounded by what was opened — it never
 // exceeds 1+len(ExtraReaders) because both were derived from the same
 // requested number bounded by the (≥ this run's) schema table count.
-func (b *Backup) resolveBackupTableParallelism(ctx context.Context, snap *irbackup.Snapshot, taskCount int) (int, error) {
-	effective, err := b.resolveRequestedReaderParallelism(ctx, taskCount)
+func (b *Backup) resolveBackupTableParallelism(ctx context.Context, snap *irbackup.Snapshot, taskCount int) (tableParallelism, withinParallelism int, err error) {
+	effective, withinParallelism, err := b.resolveBackupReadParallelism(ctx, taskCount)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	ok, reason := backupParallelEligible(snap, b.Source, effective)
 	if !ok {
@@ -384,7 +452,7 @@ func (b *Backup) resolveBackupTableParallelism(ctx context.Context, snap *irback
 		if backupDispatchObserver != nil {
 			backupDispatchObserver(1, reason)
 		}
-		return 1, nil
+		return 1, withinParallelism, nil
 	}
 	// Never fan out wider than the eager readers actually opened (the
 	// gate proved at least 1 extra when SnapshotName is empty).
@@ -399,7 +467,7 @@ func (b *Backup) resolveBackupTableParallelism(ctx context.Context, snap *irback
 	if backupDispatchObserver != nil {
 		backupDispatchObserver(effective, "")
 	}
-	return effective, nil
+	return effective, withinParallelism, nil
 }
 
 // openBackupReaderFactory returns a [backupReaderFactory] that mints
@@ -420,12 +488,17 @@ func (b *Backup) resolveBackupTableParallelism(ctx context.Context, snap *irback
 // the primary reader carries — so the parallel sweep reads exactly what
 // the serial sweep would.
 //
-// tableParallelism <= 1, or an eager snapshot, returns a nil factory
-// with a no-op cleanup: the serial pool's single worker always wins the
-// free reader, and the eager pool's peers all live in the free-reader
-// channel, so no on-demand minting is ever needed.
-func (b *Backup) openBackupReaderFactory(ctx context.Context, snap *irbackup.Snapshot, tableParallelism int) (backupReaderFactory, func(), error) {
-	if tableParallelism <= 1 {
+// tableParallelism <= 1 with within-table chunking not engaged
+// (withinParallelism <= 1), or an eager snapshot, returns a nil
+// factory with a no-op cleanup: the serial pool's single worker always
+// wins the free reader, and the eager pool's peers all live in the
+// free-reader channel, so no on-demand minting is ever needed.
+// withinParallelism > 1 (ADR-0149 — the caller only passes it when the
+// within gate held, which asserted the same importer surface) needs
+// the factory even on a serial table sweep: one huge table's range
+// workers mint their readers here.
+func (b *Backup) openBackupReaderFactory(ctx context.Context, snap *irbackup.Snapshot, tableParallelism, withinParallelism int) (backupReaderFactory, func(), error) {
+	if tableParallelism <= 1 && withinParallelism <= 1 {
 		return nil, func() {}, nil
 	}
 	// Eager (MySQL coordinated) readers are seeded into the pool's
@@ -436,8 +509,9 @@ func (b *Backup) openBackupReaderFactory(ctx context.Context, snap *irbackup.Sna
 
 	opener, ok := b.Source.(ir.SnapshotImporterOpener)
 	if !ok {
-		// Unreachable: backupParallelEligible already asserted this.
-		// Loud rather than a silent serial degrade of an engaged gate.
+		// Unreachable: backupParallelEligible / backupWithinChunkingEligible
+		// already asserted this. Loud rather than a silent serial degrade
+		// of an engaged gate.
 		return nil, func() {}, errBackupPoolNoImporter
 	}
 	importer, err := opener.OpenSnapshotImporter(ctx, b.SourceDSN)
@@ -455,6 +529,13 @@ func (b *Backup) openBackupReaderFactory(ctx context.Context, snap *irbackup.Sna
 		if err != nil {
 			return nil, err
 		}
+		// ADR-0149: a minted reader may serve a table worker whose chunk
+		// DECISION probes EstimateRowCount — opt it into the exact-COUNT
+		// never-ANALYZEd fallback so a fresh source doesn't silently
+		// report 0 and lose chunking (the 59c55e27 class). No-op for
+		// engines without the surface; sync cold-start minting does NOT
+		// share this path (ADR-0079 v1.1 unchanged).
+		applyExactCountEstimate(readers[0])
 		return readers[0], nil
 	}
 	return factory, cleanup, nil

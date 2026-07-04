@@ -564,24 +564,32 @@ func resolveChunks(
 // budget); resume does not call this (it reloads the persisted chunk set), so
 // the only requirement is internal consistency within a fresh run.
 func resolveParallelChunkCount(ctx context.Context, rows ir.RowReader, table *ir.Table, deps *parallelBulkCopyDeps) int {
-	threshold := deps.minRows
+	est, _ := approximateRowCount(ctx, rows, table)
+	return clampParallelChunkCount(est, deps.minRows, deps.parallelism, deps.copyBudget)
+}
+
+// clampParallelChunkCount is the pure core of [resolveParallelChunkCount]
+// — the ADR-0123 Decision 2 clamp with no I/O — shared with the backup
+// within-table read planner (ADR-0149), which derives its chunk count
+// from the same (estimate, threshold, parallelism, budget) inputs so the
+// two modes' chunking behaviour cannot drift apart.
+func clampParallelChunkCount(est, threshold int64, parallelism, copyBudget int) int {
 	if threshold < 1 {
 		threshold = 1
 	}
-	est, _ := approximateRowCount(ctx, rows, table)
 	if est < 0 {
 		est = 0
 	}
 	m := int((est + threshold - 1) / threshold) // ceiling of est over threshold
-	if m < deps.parallelism {
-		m = deps.parallelism
+	if m < parallelism {
+		m = parallelism
 	}
 	if m < 2 {
 		m = 2
 	}
 	chunkCap := maxChunksPerTable
-	if deps.copyBudget > chunkCap {
-		chunkCap = deps.copyBudget
+	if copyBudget > chunkCap {
+		chunkCap = copyBudget
 	}
 	if m > chunkCap {
 		m = chunkCap

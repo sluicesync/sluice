@@ -79,6 +79,7 @@ import (
 	"log/slog"
 	"path"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"sluicesync.dev/sluice/internal/crypto"
@@ -264,6 +265,28 @@ type Backup struct {
 	// bounded by the SOURCE's measured connection budget, reserving one
 	// slot for the snapshot's slot-creation replication conn.
 	TableParallelism int
+
+	// BulkParallelism caps how many PK-range readers stream ONE large
+	// table concurrently (ADR-0149, the backup sibling of migrate's
+	// --bulk-parallelism / ADR-0019). 0 = auto (min(8, NumCPU), then
+	// budget-split); 1 = disable within-table chunking (the pre-ADR-0149
+	// behaviour). Engages per table only when the snapshot is shareable
+	// via the LAZY importer path ([backupWithinChunkingEligible]), the
+	// table's PK shape is chunkable ([canParallelChunkTable]) and its
+	// estimated row count clears BulkParallelMinRows; everything else
+	// streams single-reader with the reason logged. The
+	// TableParallelism × BulkParallelism product is bounded by the
+	// SOURCE's connection budget (cross-table is satisfied first; the
+	// within axis gets the remainder). Orthogonal to ChunkRows, which
+	// stays the rows-per-chunk-FILE roll boundary.
+	BulkParallelism int
+
+	// BulkParallelMinRows is the estimated-row-count threshold below
+	// which a table streams single-reader regardless of BulkParallelism
+	// — the same knob and auto-adaptation as migrate's
+	// --bulk-parallel-min-rows ([resolveBulkParallelMinRows]). 0 = auto
+	// (base 80k, dialled down on many-table schemas).
+	BulkParallelMinRows int64
 
 	// ForceOverwrite, when true, lets a re-run replace a previously-
 	// completed backup at the same destination. Without it, finding a
@@ -579,11 +602,19 @@ func (b *Backup) Run(ctx context.Context) error {
 		return fmt.Errorf("backup: persist chain resources: %w", err)
 	}
 
-	tableParallelism, err := b.resolveBackupTableParallelism(ctx, snap, len(tasks))
+	tableParallelism, requestedWithin, err := b.resolveBackupTableParallelism(ctx, snap, len(tasks))
 	if err != nil {
 		return err
 	}
-	factory, factoryCleanup, err := b.openBackupReaderFactory(ctx, snap, tableParallelism)
+	// ADR-0149: within-table read chunking — nil when the mode can't
+	// supply per-range snapshot readers (eager MySQL / non-snapshot
+	// fallback) or --bulk-parallelism resolved to 1.
+	within := b.resolveBackupWithinTable(ctx, snap, tableParallelism, requestedWithin, len(tasks))
+	withinParallelism := 1
+	if within != nil {
+		withinParallelism = within.parallelism
+	}
+	factory, factoryCleanup, err := b.openBackupReaderFactory(ctx, snap, tableParallelism, withinParallelism)
 	if err != nil {
 		return err
 	}
@@ -598,7 +629,7 @@ func (b *Backup) Run(ctx context.Context) error {
 		peers = snap.ExtraReaders
 	}
 
-	if err := b.runBackupTablePool(ctx, tasks, rr, peers, factory, tableParallelism, chunkRows, committer, chainCEK); err != nil {
+	if err := b.runBackupTablePool(ctx, tasks, rr, peers, factory, tableParallelism, chunkRows, committer, chainCEK, within); err != nil {
 		return err
 	}
 
@@ -1090,73 +1121,12 @@ func (b *Backup) backupTable(
 		return fmt.Errorf("read rows: %w", err)
 	}
 
-	cols := nonGeneratedTableColumns(table)
-	colNames := make([]string, len(cols))
-	for i, c := range cols {
-		colNames[i] = c.Name
-	}
-
-	var (
-		writer        *chunkWriter
-		buf           *bytes.Buffer
-		chunkIdx      int
-		rowsTotal     int64
-		curWrappedCEK []byte // populated only in per-chunk mode
-	)
-
-	flush := func() error {
-		if writer == nil {
-			return nil
-		}
-		if err := writer.Close(); err != nil {
-			return fmt.Errorf("close chunk: %w", err)
-		}
-		chunkPath := chunkFilePath(table, chunkIdx)
-		hash := writer.Hash()
-		// Resumable-write defence: if a chunk file is already at this
-		// path (from a prior interrupted run) AND its bytes hash to
-		// the same value as the chunk we just produced, skip the
-		// upload. Mismatches overwrite — a corrupted partial-upload
-		// shouldn't survive a re-run.
-		skip, err := chunkAlreadyMatches(ctx, b.Store, chunkPath, hash)
-		if err != nil {
-			return fmt.Errorf("inspect existing chunk %q: %w", chunkPath, err)
-		}
-		if !skip {
-			if err := b.Store.Put(ctx, chunkPath, buf); err != nil {
-				return fmt.Errorf("store put %q: %w", chunkPath, err)
-			}
-		}
-		ci := &irbackup.ChunkInfo{
-			File:     chunkPath,
-			RowCount: writer.RowCount(),
-			SHA256:   hash,
-		}
-		if b.Encryption != nil {
-			ci.Encryption = &irbackup.ChunkEncryption{
-				Algorithm:  crypto.AlgorithmAESGCM,
-				NonceLen:   crypto.NonceLen,
-				AuthTagLen: crypto.AuthTagLen,
-				WrappedCEK: curWrappedCEK, // empty for per-chain mode
-			}
-		}
-		writer = nil
-		buf = nil
-		curWrappedCEK = nil
-		chunkIdx++
-		// Record the chunk + per-chunk checkpoint: commit the manifest
-		// after every chunk so operators (and the resume plan's log)
-		// can see progress accrue. Resume no longer REUSES these
-		// partial chunks (see the function comment / Bug 135) — the
-		// checkpoint is observability, and it keeps the same-path SHA
-		// fast-skip in flush effective across a re-run. The committer
-		// serializes the entry mutation + the same-key manifest Put
-		// against peer tables.
-		if err := committer.appendChunk(ctx, entry, ci); err != nil {
-			return fmt.Errorf("checkpoint manifest after chunk %d: %w", chunkIdx-1, err)
-		}
-		return nil
-	}
+	// The chunk-roll / upload-skip / per-chunk-checkpoint plumbing lives
+	// in [backupChunkStreamer], shared verbatim with the ADR-0149 range
+	// workers. This single-stream path is its own (sole) index allocator
+	// — the counters are trivially sequential here.
+	var chunkIdx, rowsTotal atomic.Int64
+	s := b.newBackupChunkStreamer(table, entry, chunkRows, committer, chainCEK, &chunkIdx, &rowsTotal)
 
 	for {
 		select {
@@ -1164,7 +1134,7 @@ func (b *Backup) backupTable(
 			return ctx.Err()
 		case row, ok := <-rows:
 			if !ok {
-				if err := flush(); err != nil {
+				if err := s.flush(ctx); err != nil {
 					return err
 				}
 				// Surface any sticky error captured by the reader's
@@ -1179,51 +1149,19 @@ func (b *Backup) backupTable(
 				// whose row count is an exact chunk multiple rely on this
 				// commit — their last per-chunk checkpoint (if any)
 				// doesn't carry the Partial=false flip.
-				if err := committer.finishTable(ctx, entry, rowsTotal); err != nil {
+				if err := committer.finishTable(ctx, entry, rowsTotal.Load()); err != nil {
 					return fmt.Errorf("checkpoint manifest after table: %w", err)
 				}
 				slog.InfoContext(
 					ctx, "backup: table complete",
 					slog.String("table", table.Name),
-					slog.Int64("rows", rowsTotal),
+					slog.Int64("rows", rowsTotal.Load()),
 					slog.Int("chunks", len(entry.Chunks)),
 				)
 				return nil
 			}
-			if writer == nil {
-				buf = &bytes.Buffer{}
-				cek, wrapped, err := b.resolveChunkCEK(chainCEK)
-				if err != nil {
-					return fmt.Errorf("resolve chunk cek: %w", err)
-				}
-				curWrappedCEK = wrapped
-				w, err := newChunkWriter(buf, colNames, cek, b.Codec)
-				if err != nil {
-					return fmt.Errorf("open chunk: %w", err)
-				}
-				writer = w
-			}
-			// PII Phase 1.5: redact row before writing to the chunk so
-			// backups stored on disk are PII-clean. nil/empty Registry
-			// is a zero-cost passthrough.
-			//
-			// streamID is empty for full-backup runs (which are one-shot
-			// snapshots); the per-row randomize:* seed is determined
-			// purely by table + column + PK values, so re-running a
-			// full backup against the same source produces the same
-			// redacted values. pkColumns from the table descriptor gates
-			// randomize:* on no-PK tables (the strategy refuses cleanly).
-			if err := redactRow(b.Redactor, table.Schema, table.Name, row, cols, tablePKColumns(table), ""); err != nil {
-				return fmt.Errorf("redact row: %w", err)
-			}
-			if err := writer.WriteRow(row, cols); err != nil {
-				return fmt.Errorf("write row: %w", err)
-			}
-			rowsTotal++
-			if writer.RowCount() >= int64(chunkRows) {
-				if err := flush(); err != nil {
-					return err
-				}
+			if err := s.writeRow(ctx, row); err != nil {
+				return err
 			}
 		}
 	}

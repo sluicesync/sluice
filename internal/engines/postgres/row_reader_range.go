@@ -243,6 +243,19 @@ func (r *RowReader) reltuplesEstimate(ctx context.Context, q querier, table *ir.
 	return count, nil
 }
 
+// EnableExactCountEstimate implements [ir.ExactCountEstimateOptIn]: it
+// opts this reader's [RowReader.EstimateRowCount] into resolving the
+// never-ANALYZEd reltuples sentinel via an exact COUNT(*) on the fresh
+// off-snapshot estimator connection (see [RowReader.reltuplesOffConn]).
+// The backup orchestrator applies it to the within-table planning
+// readers it mints through [SnapshotImporter.ImportSnapshot] (ADR-0149)
+// — the same disposition [Engine.ExportSnapshot] sets directly on the
+// migrate shared-snapshot primary. Sync cold-start import readers are
+// never opted in (the ADR-0079 v1.1 cost decision, unchanged).
+func (r *RowReader) EnableExactCountEstimate() {
+	r.estimatorExactCount = true
+}
+
 // reltuplesOffConn opens a FRESH short-lived connection from r.estimatorDSN
 // and runs the reltuples lookup on it, leaving the reader's pinned *sql.Conn
 // untouched. Used by [RowReader.EstimateRowCount] on a snapshot-pinned

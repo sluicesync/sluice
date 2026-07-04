@@ -557,6 +557,31 @@ type RowCountEstimator interface {
 	EstimateRowCount(ctx context.Context, table *Table) (int64, error)
 }
 
+// ExactCountEstimateOptIn is the optional surface a snapshot-pinned
+// [RowCountEstimator] reader can implement to let an orchestrator OPT
+// the reader into resolving the never-ANALYZEd catalog-estimate
+// sentinel with an exact COUNT(*) on the reader's FRESH off-snapshot
+// estimator connection — never the pinned conn (safety is identical
+// either way; declining the fallback was always a COST decision, the
+// ADR-0079 v1.1 disposition for sync cold-start import readers).
+//
+// The chunk DECISION is a size estimate with no consistency
+// requirement, but a freshly-loaded, never-ANALYZEd source reports the
+// catalog sentinel and would silently route every large table to the
+// single-stream path (the 59c55e27 / TestRawCopy_ChunkedZeroLoss
+// regression class). Paths whose contract is "a fresh source still
+// chunks" — the migrate shared-snapshot primary (which the engine opts
+// in itself at ExportSnapshot) and the backup within-table planning
+// readers (ADR-0149, which the orchestrator opts in through this
+// surface) — enable the exact-count fallback; sync cold-start import
+// readers are deliberately never opted in (v1.1 unchanged).
+type ExactCountEstimateOptIn interface {
+	// EnableExactCountEstimate switches the reader's EstimateRowCount
+	// never-ANALYZEd-sentinel resolution to an exact COUNT(*) on its
+	// fresh estimator connection. Pre-stream only; idempotent.
+	EnableExactCountEstimate()
+}
+
 // IdempotentRowWriter is an optional extension of [RowWriter] for the
 // resume path. Indicates the writer's bulk INSERT path uses
 // upsert-on-PK semantics (ON CONFLICT / ON DUPLICATE KEY UPDATE)
