@@ -103,6 +103,32 @@ func TestSQLiteRoute_Index_PortableEmitted(t *testing.T) {
 	}
 }
 
+// TestSQLiteRoute_BackslashLiteral_PortableToPG pins the SEC-1 asymmetry: a
+// SQLite string literal containing a backslash stays PORTABLE to Postgres
+// and emits byte-identically — under standard_conforming_strings=on (the
+// server default since 9.1, pinned on every sluice PG session in
+// connect.go) a backslash inside '…' is an ordinary character, exactly
+// SQLite's semantics, and PG stores the parsed expression tree so future
+// sessions can't re-interpret it. The MySQL writer refuses the same bodies
+// (see the mysql package's route test).
+func TestSQLiteRoute_BackslashLiteral_PortableToPG(t *testing.T) {
+	opts := emitOpts{}
+
+	for _, body := range []string{`a || 'C:\temp'`, `a <> 'x\'`, `coalesce(a, '\\')`} {
+		if err := refuseNonPortableSQLiteExprPG("generated column", "g_bs", body, "sqlite"); err != nil {
+			t.Errorf("refuseNonPortableSQLiteExprPG(%q) = %v; want nil (backslash literals are portable to PG)", body, err)
+		}
+	}
+
+	gen := translateGeneratedExpr(
+		&ir.Column{Type: ir.Text{}, GeneratedExpr: `a || 'C:\temp'`, GeneratedExprDialect: "sqlite"},
+		nil, opts,
+	)
+	if want := `(a || 'C:\temp')`; gen != want {
+		t.Errorf("generated = %q; want %q (literal carried byte-identically)", gen, want)
+	}
+}
+
 // TestSQLiteRoute_Index_NonPortableSkipped pins the index WARN-skip policy: a
 // non-portable "sqlite" expression index / partial predicate is skipped
 // (empty stmt, nil error) rather than aborting the migration.

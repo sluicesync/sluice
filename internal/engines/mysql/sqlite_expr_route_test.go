@@ -92,6 +92,84 @@ func TestSQLiteRoute_Index_PortableEmitted(t *testing.T) {
 	}
 }
 
+// TestSQLiteRoute_BackslashLiteral_RefusedNamed pins SEC-1 on the MySQL
+// writer across every construct family a SQLite string literal can reach:
+// generated column and CHECK refuse LOUDLY with an error NAMING the
+// backslash (not the generic non-portable message), the index-expression
+// path WARN-skips (never emits), and the DEFAULT-expression verbatim-carry
+// path — the one position that never routes through the translator —
+// refuses at emitColumnDef. Shapes cover the plain interior backslash and
+// the trailing-\ quote-swallow; backslash-free controls prove no
+// false-fire.
+func TestSQLiteRoute_BackslashLiteral_RefusedNamed(t *testing.T) {
+	// Generated column: plain interior backslash.
+	col := &ir.Column{
+		Name: "g_bs", Type: ir.Text{},
+		GeneratedExpr: `a || 'C:\temp'`, GeneratedStored: true, GeneratedExprDialect: "sqlite",
+	}
+	if _, err := emitColumnDef(col); err == nil {
+		t.Error(`emitColumnDef(gencol a || 'C:\temp') err=nil; want a LOUD backslash refusal`)
+	} else if !strings.Contains(err.Error(), "backslash") || !strings.Contains(err.Error(), "g_bs") {
+		t.Errorf("gencol refusal = %v; want it to name the backslash and the column", err)
+	}
+
+	// CHECK: the trailing-\ quote-swallow shape.
+	chk := &ir.CheckConstraint{Name: "ck_bs", Expr: `a <> 'x\'`, ExprDialect: "sqlite"}
+	if _, err := emitCheckConstraint(chk); err == nil {
+		t.Error(`emitCheckConstraint(a <> 'x\') err=nil; want a LOUD backslash refusal`)
+	} else if !strings.Contains(err.Error(), "backslash") || !strings.Contains(err.Error(), "ck_bs") {
+		t.Errorf("CHECK refusal = %v; want it to name the backslash and the constraint", err)
+	}
+
+	// Index expression: WARN-skip (an index is a performance object), and the
+	// verbatim fallback must never emit.
+	idx := &ir.Index{
+		Name: "ix_bs",
+		Columns: []ir.IndexColumn{
+			{Expression: `coalesce(a, 'x\y')`, ExpressionDialect: "sqlite"},
+		},
+	}
+	if stmt, err := emitCreateIndex("t", idx); err != nil || stmt != "" {
+		t.Errorf("backslash-literal expr index = (%q, %v); want (\"\", nil) — WARN-skip, never verbatim", stmt, err)
+	}
+
+	// DEFAULT expression: the ADR-0133 verbatim-carry boundary.
+	colD := &ir.Column{
+		Name: "d_bs", Type: ir.Varchar{Length: 50},
+		Default: ir.DefaultExpression{Expr: `coalesce(NULL, 'C:\temp')`, Dialect: "sqlite"},
+	}
+	if _, err := emitColumnDef(colD); err == nil {
+		t.Error(`emitColumnDef(DEFAULT ('C:\' || 'x')) err=nil; want a LOUD backslash refusal`)
+	} else if !strings.Contains(err.Error(), "backslash") || !strings.Contains(err.Error(), "d_bs") {
+		t.Errorf("DEFAULT refusal = %v; want it to name the backslash and the column", err)
+	}
+
+	// Controls: identical shapes without the backslash still emit; the
+	// DEFAULT control also pins that a NON-sqlite dialect with a backslash is
+	// out of this guard's jurisdiction (it belongs to that dialect's own
+	// policy, not the sqlite verbatim-carry one).
+	okCol := &ir.Column{
+		Name: "g_ok", Type: ir.Text{},
+		GeneratedExpr: `a || 'C:temp'`, GeneratedStored: true, GeneratedExprDialect: "sqlite",
+	}
+	if _, err := emitColumnDef(okCol); err != nil {
+		t.Errorf("emitColumnDef(backslash-free gencol) = %v; want nil", err)
+	}
+	okD := &ir.Column{
+		Name: "d_ok", Type: ir.Varchar{Length: 50},
+		Default: ir.DefaultExpression{Expr: `('a' || 'b')`, Dialect: "sqlite"},
+	}
+	if _, err := emitColumnDef(okD); err != nil {
+		t.Errorf("emitColumnDef(backslash-free sqlite DEFAULT) = %v; want nil", err)
+	}
+	if err := refuseBackslashSQLiteDefaultMySQL("d", ir.DefaultExpression{Expr: `'a\b'`, Dialect: "postgres"}); err != nil {
+		t.Errorf("refuseBackslashSQLiteDefaultMySQL(postgres dialect) = %v; want nil (sqlite-carry guard only)", err)
+	}
+	if err := refuseBackslashSQLiteDefaultMySQL("d", ir.DefaultLiteral{Value: `a\b`}); err != nil {
+		t.Errorf("refuseBackslashSQLiteDefaultMySQL(DefaultLiteral) = %v; want nil (literal path is quoted, not carried)", err)
+	}
+}
+
 // TestSQLiteRoute_Index_NonPortableSkipped pins the index WARN-skip on MySQL,
 // on both the single-emit and combined-emit paths.
 func TestSQLiteRoute_Index_NonPortableSkipped(t *testing.T) {

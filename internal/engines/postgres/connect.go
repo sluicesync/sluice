@@ -139,7 +139,36 @@ func openPgxDBAs(dsn string, role connRole, appID string, opts ...stdlib.OptionO
 		return nil, fmt.Errorf("postgres: parse dsn: %w", err)
 	}
 	connConfig.DialFunc = netkeepalive.Dialer().DialContext
+	pinStandardConformingStrings(connConfig)
 	return stdlib.OpenDB(*connConfig, opts...), nil
+}
+
+// pinStandardConformingStrings forces standard_conforming_strings=on for the
+// session unless the operator's DSN already sets it (the same two-tier
+// override shape as the MySQL engine's sql_mode / time_zone injection).
+//
+// sluice's DDL emitters quote every string literal by doubling interior
+// single quotes ONLY — correct iff a backslash is an ordinary character,
+// which is exactly what standard_conforming_strings=on guarantees. That has
+// been the server default since PG 9.1, but it is server-configurable;
+// pinning it per-session upgrades the emitters' assumption from "holds on
+// default-configured servers" to "holds by construction". Without the pin, a
+// legacy server running standard_conforming_strings=off would silently
+// reinterpret backslashes in sluice-emitted DDL literals at parse time
+// (SEC-1's Postgres half). This pin is also why the SQLite→PG expression
+// translator stays PERMISSIVE for backslash-bearing string literals while
+// the MySQL side refuses them: PG parses the DDL once on sluice's own
+// (pinned) session and stores the parsed expression tree, so future
+// sessions' settings can't change the meaning. An operator who explicitly
+// sets standard_conforming_strings=off in the DSN wins — and takes on the
+// backslash-reinterpretation hazard themselves.
+func pinStandardConformingStrings(connConfig *pgx.ConnConfig) {
+	if connConfig.RuntimeParams == nil {
+		connConfig.RuntimeParams = map[string]string{}
+	}
+	if _, ok := connConfig.RuntimeParams["standard_conforming_strings"]; !ok {
+		connConfig.RuntimeParams["standard_conforming_strings"] = "on"
+	}
 }
 
 // openPgxDBDescribeExec opens a lazy *sql.DB whose backends default to
@@ -170,6 +199,7 @@ func openPgxDBDescribeExec(dsn string, role connRole, appID string, opts ...stdl
 	}
 	connConfig.DialFunc = netkeepalive.Dialer().DialContext
 	connConfig.DefaultQueryExecMode = pgx.QueryExecModeDescribeExec
+	pinStandardConformingStrings(connConfig)
 	return stdlib.OpenDB(*connConfig, opts...), nil
 }
 

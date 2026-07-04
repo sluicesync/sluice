@@ -144,6 +144,67 @@ func TestSQLiteExpr_TargetSpecific(t *testing.T) {
 	}
 }
 
+// TestSQLiteExpr_BackslashStringLiterals pins the SEC-1 boundary: a '…'
+// string literal containing a backslash REFUSES on MySQL (default sql_mode
+// treats \ as an escape introducer; a literal ending in \ swallows its
+// closing quote and shifts expression text into string position) and stays
+// PORTABLE to PG byte-identically (standard_conforming_strings=on — pinned
+// on every sluice PG session — makes \ an ordinary character, matching
+// SQLite). The shape matrix: plain interior backslash, the trailing-\
+// quote-swallow shape, a doubled backslash, and each expression position a
+// literal can occupy (bare, concat, function arg, comparison) — plus
+// backslash-free controls that must keep translating.
+func TestSQLiteExpr_BackslashStringLiterals(t *testing.T) {
+	backslashBodies := []string{
+		`'C:\temp'`,               // plain interior backslash, bare literal
+		`a || 'C:\temp'`,          // concat position
+		`'trailing\'`,             // literal ending in \ — the quote-swallow shape
+		`'\\'`,                    // doubled backslash (two literal chars in SQLite)
+		`coalesce(a, 'x\y')`,      // function-argument position
+		`substr(a, 1, 2) = 'a\b'`, // comparison position
+	}
+	for _, in := range backslashBodies {
+		if got, ok := SQLiteExprToMySQL(in); ok {
+			t.Errorf("SQLiteExprToMySQL(%q) = (%q, true); want ok=false (backslash literal has no provably-faithful MySQL spelling)", in, got)
+		}
+		if _, ok := SQLiteExprToPG(in); !ok {
+			t.Errorf("SQLiteExprToPG(%q) ok=false; want true (PG treats \\ literally under standard_conforming_strings)", in)
+		}
+		if !SQLiteExprHasBackslashStringLiteral(in) {
+			t.Errorf("SQLiteExprHasBackslashStringLiteral(%q) = false; want true", in)
+		}
+	}
+
+	// PG carries the literal byte-identically (fully-parenthesised emit).
+	if got, ok := SQLiteExprToPG(`a || 'C:\temp'`); !ok || got != `(a || 'C:\temp')` {
+		t.Errorf(`SQLiteExprToPG(a || 'C:\temp') = (%q, %v); want ((a || 'C:\temp'), true)`, got, ok)
+	}
+
+	// Backslash-free literals — including the doubled-single-quote escape —
+	// must keep translating on BOTH targets, and the classifier must not fire.
+	controls := []string{`'hi'`, `'it''s'`, `a || '-' || b`, `coalesce(a, 'x')`}
+	for _, in := range controls {
+		if _, ok := SQLiteExprToMySQL(in); !ok {
+			t.Errorf("SQLiteExprToMySQL(%q) ok=false; want true (backslash-free literal must stay portable)", in)
+		}
+		if _, ok := SQLiteExprToPG(in); !ok {
+			t.Errorf("SQLiteExprToPG(%q) ok=false; want true", in)
+		}
+		if SQLiteExprHasBackslashStringLiteral(in) {
+			t.Errorf("SQLiteExprHasBackslashStringLiteral(%q) = true; want false", in)
+		}
+	}
+
+	// The classifier keys on STRING-LITERAL tokens only: a backslash outside
+	// a literal (already refused by the grammar on both targets) and one
+	// inside a comment (dropped by the tokenizer) must not classify.
+	for _, in := range []string{`a \ b`, "a -- c:\\temp\n"} {
+		if SQLiteExprHasBackslashStringLiteral(in) {
+			t.Errorf("SQLiteExprHasBackslashStringLiteral(%q) = true; want false (no string literal carries the backslash)", in)
+		}
+	}
+}
+
 // TestSQLiteExpr_NonPortableBoth pins the loud-fail boundary: every construct
 // here returns ok=false on BOTH targets. This is the value-fidelity contract —
 // a construct we cannot prove equivalent (for EVERY operand shape) must never

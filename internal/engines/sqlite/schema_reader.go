@@ -522,7 +522,11 @@ func parseFKAction(s string) ir.FKAction {
 // never emitted verbatim (which aborted the whole migration at CREATE
 // TABLE) and never silently dropped. The MySQL target still emits the
 // expression verbatim and relies on its parser rejecting a non-portable
-// default loudly. (A dropped DEFAULT is schema metadata, NOT data loss:
+// default loudly — EXCEPT a body whose string literal contains a
+// backslash, which MySQL's parser would ACCEPT and silently reinterpret
+// (default sql_mode treats \ as an escape introducer); the MySQL writer
+// refuses those pre-emit (SEC-1, refuseBackslashSQLiteDefaultMySQL).
+// (A dropped DEFAULT is schema metadata, NOT data loss:
 // DEFAULTs affect only post-migration inserts, never the migrated rows,
 // which are inserted with explicit values.)
 func parseDefault(dflt sql.NullString) ir.DefaultValue {

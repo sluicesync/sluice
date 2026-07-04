@@ -31,6 +31,7 @@ package translate
 // test would have passed but that silently diverge on some operand.
 //
 //   - column references (bare and quoted idents) and numeric/string literals
+//     (string literals containing a backslash refuse on MySQL — see below)
 //   - operators: + - *  = <> != < <= > >=  AND OR NOT  IS [NOT] NULL,
 //     string concat || (PG keeps ||; MySQL becomes CONCAT(...)), and `/` on
 //     Postgres ONLY (see below)
@@ -53,6 +54,15 @@ package translate
 //     floats and the operand can't be proven decimal-not-float.
 //   - cast AS integer (truncate vs round), cast AS blob (byte semantics),
 //     cast AS numeric on MySQL (bare DECIMAL rounds to 0 decimals).
+//   - a string literal containing a backslash, on MySQL ONLY (SEC-1): SQLite
+//     treats a backslash inside a '…' literal as an ordinary character; MySQL
+//     under its default sql_mode treats it as an escape introducer, and the
+//     expression lands in the TARGET SCHEMA where future sessions — whose
+//     sql_mode sluice does not control — re-parse it. No re-escaping can be
+//     faithful under a mode sluice can't pin, so refuse (see stringNode). PG
+//     stays permissive: under standard_conforming_strings=on (server default
+//     since 9.1, pinned on every sluice PG session) backslash is literal,
+//     matching SQLite, and PG stores the parsed tree, not the text.
 //   - substr with a non-literal or < 1 start (negative counts from the end in
 //     SQLite, not in SUBSTRING); min/max on PG (LEAST/GREATEST skip NULLs, but
 //     SQLite scalar min/max propagate NULL).
@@ -95,6 +105,24 @@ func SQLiteExprToPG(expr string) (string, bool) { return translateSQLiteExpr(exp
 // SQLite's).
 func SQLiteExprToMySQL(expr string) (string, bool) { return translateSQLiteExpr(expr, sqMySQL) }
 
+// SQLiteExprHasBackslashStringLiteral reports whether any '…' string literal
+// in the SQLite expression body contains a backslash — the one construct that
+// is valid on MySQL but silently CHANGES MEANING there (see stringNode). The
+// target writers' refusal boundaries use it to NAME the backslash wart
+// instead of the generic non-portable message, and the MySQL DEFAULT
+// verbatim-carry path uses it directly (SQLite-dialect DEFAULT bodies never
+// route through the translator at all). Token boundaries are computed under
+// SQLite's lexing rules (doubled-quote escaping, backslash NOT an escape) —
+// the same rules the source used to parse the text.
+func SQLiteExprHasBackslashStringLiteral(expr string) bool {
+	for _, tok := range tokenizeSQLiteExpr(expr) {
+		if tok.kind == sqString && strings.Contains(tok.text, `\`) {
+			return true
+		}
+	}
+	return false
+}
+
 // sqTarget selects the emit dialect.
 type sqTarget int
 
@@ -134,11 +162,41 @@ type sqNode interface {
 }
 
 // verbatimNode carries text that is identical on both targets: a column
-// reference (bare or quoted), a numeric/string literal, NULL, or a
-// current-instant keyword.
+// reference (bare or quoted), a numeric literal, NULL, or a current-instant
+// keyword. String literals are NOT verbatim — see stringNode.
 type verbatimNode struct{ text string }
 
 func (n verbatimNode) emit(sqTarget) (string, bool) { return n.text, true }
+
+// stringNode carries a '…' single-quoted string literal (delimiters included,
+// interior quotes doubled — SQLite's own spelling, which is also valid on both
+// targets). It is not a verbatimNode because the literal's MEANING is
+// target-dependent (SEC-1): SQLite treats a backslash inside a string literal
+// as an ordinary character, but MySQL's default sql_mode treats it as an
+// escape introducer — and the translated body lands in the target SCHEMA (a
+// generated column / CHECK / index body), where it is re-parsed under FUTURE
+// sessions' sql_mode, which sluice does not control. So a backslash-bearing
+// literal has no MySQL spelling sluice can prove faithful: 'C:\temp' silently
+// becomes "C:<TAB>emp", and a literal ending in \ swallows its closing quote,
+// shifting the following expression text into string position — the
+// expression-content-escaping-its-DDL-position class SECURITY.md keeps in
+// scope. Refuse on MySQL; the writers' refusal boundaries name the reason via
+// [SQLiteExprHasBackslashStringLiteral].
+//
+// Postgres is asymmetric ON PURPOSE: under standard_conforming_strings=on
+// (the server default since PG 9.1, and pinned on every sluice PG session —
+// see the postgres engine's connect.go) a '…' literal treats backslash
+// literally, exactly like SQLite, and PG stores the parsed expression tree
+// (pg_node_tree) rather than the raw text, so only sluice's own DDL session's
+// setting matters. Backslash literals therefore stay portable to PG.
+type stringNode struct{ text string }
+
+func (n stringNode) emit(t sqTarget) (string, bool) {
+	if t == sqMySQL && strings.Contains(n.text, `\`) {
+		return "", false
+	}
+	return n.text, true
+}
 
 // binaryNode is an arithmetic / comparison / logical binary operator. op is
 // already normalised (== → =, != → <>).
@@ -660,7 +718,7 @@ func (p *sqParser) parsePrimary() (sqNode, bool) {
 		return nil, false
 	case sqString:
 		p.pos++
-		return verbatimNode{text: t.text}, true
+		return stringNode{text: t.text}, true
 	case sqIdent:
 		p.pos++
 		return verbatimNode{text: t.text}, true

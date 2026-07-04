@@ -67,7 +67,12 @@ func TestMigrate_SQLiteTranslateValues_ToPostgres(t *testing.T) {
 		g_div  INTEGER GENERATED ALWAYS AS (na / nb) STORED,
 		g_cast NUMERIC GENERATED ALWAYS AS (cast(x AS numeric)) STORED
 	);
-	INSERT INTO pg_only (id, na, nb, x) VALUES (1, -7, 2, 2.5), (2, 7, 2, 2.5);`
+	INSERT INTO pg_only (id, na, nb, x) VALUES (1, -7, 2, 2.5), (2, 7, 2, 2.5);
+	CREATE TABLE pg_bs (
+		id INTEGER PRIMARY KEY, a TEXT,
+		g_bs TEXT GENERATED ALWAYS AS (a || ' C:\temp\') STORED
+	);
+	INSERT INTO pg_bs (id, a) VALUES (1, 'x');`
 
 	src := seedSQLiteText(t, portableDDL+"\n"+pgExtra)
 	srcDB := openSQLite(t, src)
@@ -104,6 +109,16 @@ func TestMigrate_SQLiteTranslateValues_ToPostgres(t *testing.T) {
 	if srcCast != pgCast || pgCast != 2.5 {
 		t.Errorf("g_cast src=%v dst=%v; want both 2.5", srcCast, pgCast)
 	}
+
+	// SEC-1 asymmetry, value-ground-truthed: a backslash-bearing string
+	// literal (interior AND trailing backslash) is PORTABLE to PG — the
+	// target-recomputed gencol must equal SQLite's byte-for-byte (`x C:\temp\`),
+	// proving standard_conforming_strings treats \ literally on the real
+	// target. The MySQL half REFUSES the same class — see
+	// TestMigrate_SQLiteBackslashLiteral_RefusedToMySQL.
+	assertRowsEqual(t, "pg_bs.g_bs",
+		readRowsAsStrings(t, srcDB, `SELECT g_bs FROM pg_bs ORDER BY id`, 1),
+		readRowsAsStrings(t, pg, `SELECT g_bs FROM pg_bs ORDER BY id`, 1))
 }
 
 // TestMigrate_SQLiteTranslateValues_ToMySQL seeds the portable table PLUS a
@@ -173,6 +188,55 @@ func TestMigrate_SQLiteNonPortable_RefusedToMySQL(t *testing.T) {
 	genBodies := append([]string{"na / nb", "cast(x AS numeric)"}, excludedGenColBodies...)
 	chkBodies := append([]string{"na / nb = 3", "cast(x AS numeric) = 2.9"}, excludedCheckBodies...)
 	runRefusalSuite(t, "mysql", startMySQL, genBodies, chkBodies)
+}
+
+// TestMigrate_SQLiteBackslashLiteral_RefusedToMySQL pins SEC-1 end-to-end: a
+// SQLite source whose generated column / CHECK / DEFAULT expression carries a
+// backslash inside a string literal must abort LOUDLY on a MySQL target with
+// an error NAMING the backslash — never emit (MySQL's default sql_mode would
+// silently reinterpret the backslash as an escape, and a literal ending in \
+// swallows its closing quote, shifting expression text into string position).
+func TestMigrate_SQLiteBackslashLiteral_RefusedToMySQL(t *testing.T) {
+	_, target, cleanup := startMySQL(t)
+	defer cleanup()
+
+	// Each migrate gets an explicit MigrationID: the auto-derived id hashes
+	// DSN host info, which is identical across sqlite temp-file sources, so a
+	// second run against the shared target would otherwise fail on the
+	// partial-migration guard instead of the backslash refusal this test pins.
+	assertBackslashRefusal := func(kind, table, body string, seed func(*testing.T, string, string) string) {
+		t.Helper()
+		src := seed(t, table, body)
+		sqliteEng, ok := engines.Get("sqlite")
+		if !ok {
+			t.Fatal("sqlite engine not registered")
+		}
+		targetEng, ok := engines.Get("mysql")
+		if !ok {
+			t.Fatal("mysql engine not registered")
+		}
+		mig := &Migrator{Source: sqliteEng, Target: targetEng, SourceDSN: src, TargetDSN: target, MigrationID: table}
+		err := mig.Run(ctx2min(t))
+		if err == nil {
+			t.Errorf("%s with backslash literal migrated to mysql without error; want a LOUD named refusal", kind)
+			return
+		}
+		if !strings.Contains(err.Error(), "backslash") {
+			t.Errorf("%s refusal = %v; want the error to NAME the backslash", kind, err)
+		}
+	}
+
+	// Generated column: plain interior backslash.
+	assertBackslashRefusal("gencol", "bs_gen", `a || 'C:\temp'`, seedSQLiteGenCol)
+	// CHECK: the trailing-\ quote-swallow shape (satisfied by the seed row).
+	assertBackslashRefusal("CHECK", "bs_chk", `a <> 'x\'`, seedSQLiteCheck)
+	// DEFAULT expression: the verbatim-carry boundary that never routes
+	// through the translator. The body must NOT begin with a quote: PRAGMA
+	// table_info strips the outer parens, and the SQLite reader's
+	// parseDefault classifies a quote-delimited dflt_value as a
+	// DefaultLiteral, which takes the quoteSQLString path instead of the
+	// expression carry this test pins.
+	assertBackslashRefusal("DEFAULT", "bs_def", `(coalesce(NULL, 'C:\temp'))`, seedSQLiteDefaultExpr)
 }
 
 // runRefusalSuite reuses ONE target container and attempts a migrate per
@@ -257,6 +321,26 @@ func seedSQLiteCheck(t *testing.T, table, body string) string {
 	for _, s := range stmts {
 		if _, err := db.ExecContext(context.Background(), s); err != nil {
 			t.Fatalf("seed check exec: %v", err)
+		}
+	}
+	return path
+}
+
+// seedSQLiteDefaultExpr writes a one-table source whose sole non-key column
+// carries an EXPRESSION default (parenthesised, so the SQLite reader
+// classifies it DefaultExpression dialect "sqlite", not DefaultLiteral).
+func seedSQLiteDefaultExpr(t *testing.T, table, expr string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), table+".db")
+	db := openSQLite(t, path)
+	defer func() { _ = db.Close() }()
+	stmts := []string{
+		fmt.Sprintf(`CREATE TABLE %s (id INTEGER PRIMARY KEY, d VARCHAR(50) DEFAULT %s)`, table, expr),
+		fmt.Sprintf(`INSERT INTO %s (id) VALUES (1)`, table),
+	}
+	for _, s := range stmts {
+		if _, err := db.ExecContext(context.Background(), s); err != nil {
+			t.Fatalf("seed default exec: %v", err)
 		}
 	}
 	return path
