@@ -651,7 +651,7 @@ So NOTIFY-kick is **demoted** — the poll isn't the bottleneck. Closing the rea
 
 > **Items 45–47 form one coherent "sync control plane" direction** (operator-flagged 2026-06-25): turn sluice from a tool you run per-migration into a long-running sync fabric you *operate* — many supervised syncs (47), any of them optionally lag-delayed for DR (46), all of them health-alerted against their source (45). Queued as worthwhile next work (not demand-gated); suggested order is 45 → 46 → 47 (cheapest/broadest first, unifying layer last). Each builds directly on shipped foundations (bounded streaming, the notify layer, per-stream metrics).
 
-### 45. Source-vs-target lag alerting: an engine-neutral "seconds behind source" metric + threshold alert — *SHIPPED (Unreleased): `sluice_sync_lag_seconds` + `--notify-sync-lag-seconds`, ungated from PS telemetry*
+### 45. Source-vs-target lag alerting: an engine-neutral "seconds behind source" metric + threshold alert — *SHIPPED (v0.99.129): `sluice_sync_lag_seconds` + `--notify-sync-lag-seconds`, ungated from PS telemetry*
 
 **Why.** The notification machinery is already shipped (item 36 / ADR-0107: webhook + Slack sinks, an edge-triggered threshold alerter with per-rule cooldown + hysteresis, and a `--notify-lag-seconds` rule). But that lag rule reads the **target's control-plane replica lag from PlanetScale telemetry** (`sluice_target_replica_lag_seconds`, PS-gated) — there is no engine-agnostic alert on sluice's **own** sync lag: how far the applied target position trails the source's latest commit. That "is my target keeping up with my source" signal is exactly what an operator wants to be paged on, and it should work for MySQL and Postgres alike, with no PlanetScale dependency.
 

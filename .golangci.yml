@@ -147,10 +147,6 @@ linters:
         linters:
           - funlen
           - gocyclo
-    # Don't lint generated or fixture code.
-    paths:
-      - test/golden
-      - test/fixtures
 
 formatters:
   # gofumpt + goimports were linters in v1; v2 separates formatters

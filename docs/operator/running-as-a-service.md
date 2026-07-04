@@ -40,6 +40,20 @@ but fallen behind still reports ready; alert on lag via the
 readiness probe. See [ADR-0069](../adr/adr-0069-service-mode-readyz.md)
 for the design rationale.
 
+## Structured logs
+
+The endpoints cover the probe side of the daemon contract; the log stream is the other half. By default sluice logs human-readable text to stderr. For ingestion into Loki, Datadog, CloudWatch, or any other structured-log pipeline, add the global `--log-format=json` flag (valid on every subcommand) to emit one JSON object per line instead:
+
+```
+sluice --log-format=json sync start --stream-id myapp-prod ...
+```
+
+```json
+{"time":"2026-07-03T14:07:31.802819-07:00","level":"INFO","msg":"stream starting","stream_id":"myapp-prod"}
+```
+
+Logs go to stderr in both formats, so point your collector at the service's stderr stream — under systemd that's the journal; under docker and Kubernetes the container log driver picks it up automatically. `--log-level` (`debug`, `info`, `warn`, `error`) controls verbosity independently of the format.
+
 ## systemd
 
 `/etc/systemd/system/sluice-sync.service`:

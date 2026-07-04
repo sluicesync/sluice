@@ -313,7 +313,7 @@ A few terms recur in the codebase and docs:
 - [`docs/cookbook/`](docs/cookbook/) — task-shaped recipes: one-shot migrate, bidirectional cutover, Heroku-style slot-less migration, encrypted backup chains, PII redaction, PostGIS round-trip, GitLab-shape case study, and the `pg_dump` comparison
 - [`docs/translator-catalog.md`](docs/translator-catalog.md) — consolidated cross-engine expression translator reference: shipped translations + deferred rules + escape hatches
 - [`docs/backup-format-versioning.md`](docs/backup-format-versioning.md) — backup manifest `FormatVersion` contract: proportional version-stamp, refuse-before-touch on older binaries, how older sluice doesn't silently drop RLS / EXCLUDE metadata (Bug 116 closure reference)
-- [`docs/adr/README.md`](docs/adr/README.md) — index of all ADRs (ADR-0001 – ADR-0140), one-line summary per decision
+- [`docs/adr/README.md`](docs/adr/README.md) — index of all ADRs, one-line summary per decision
 - [`docs/managed-services.md`](docs/managed-services.md) — PlanetScale-specific notes, operator preconditions
 - [`docs/postgres-source-prep.md`](docs/postgres-source-prep.md) — required PG GUCs, slot lifecycle, failover-survival mechanisms
 - [`docs/vitess-vstream-troubleshooting.md`](docs/vitess-vstream-troubleshooting.md) — operator runbook for PlanetScale-MySQL VStream lag (throttler, replication lag, deploy requests)
@@ -325,7 +325,7 @@ A few terms recur in the codebase and docs:
 - [`docs/operator/multi-database-multi-schema.md`](docs/operator/multi-database-multi-schema.md) — migrating many MySQL databases / Postgres schemas in one run (`--all-databases` / `--all-schemas`), fan-IN consolidation, and the documented edges
 - [`docs/type-mapping.md`](docs/type-mapping.md), [`docs/value-types.md`](docs/value-types.md) — type translation policies and runtime row contract
 - [`docs/testing.md`](docs/testing.md) — testing strategy, the Bug 74 class-pin lesson
-- [`docs/adr/`](docs/adr/) — Architecture Decision Records (ADR-0001 through ADR-0140)
+- [`docs/adr/`](docs/adr/) — Architecture Decision Records; the full index lives in [`docs/adr/README.md`](docs/adr/README.md)
 - [`docs/dev/`](docs/dev/) — local development setup, roadmap, design proto-ADRs
 - [`docs/examples/`](docs/examples/) — runnable quickstart, sample `sluice.yaml` config
 

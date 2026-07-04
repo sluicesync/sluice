@@ -68,33 +68,38 @@ The same engine serves two operator intents: bootstrapping a one-time migration 
 ```
 sluice/
 ├── cmd/
-│   └── sluice/                 # CLI entry point
+│   └── sluice/                 # CLI entry point (kong command tree, koanf config loading)
 ├── internal/
-│   ├── ir/                     # IR types: Schema, Column, Type, Change events
-│   │   ├── schema.go
-│   │   ├── types.go            # core IR types (universal)
-│   │   ├── extension_types.go  # extension IR types (per-engine optional)
-│   │   ├── capabilities.go     # engine capability declarations
-│   │   ├── change.go
-│   │   └── diff/               # pure-function schema diff + per-table drift reports
-│   ├── translate/              # IR ↔ IR transformations and policies
-│   │   ├── policy.go
-│   │   └── translate.go
+│   ├── ir/                     # Dialect-neutral IR: Schema, Column, Type, Change events, engine interfaces
+│   │   ├── diff/               # Pure-function schema diff + per-table drift reports
+│   │   └── backup/             # Logical-backup contract: manifests, chain identity, snapshot surfaces
+│   ├── translate/              # Pure schema-rewrite passes between reader and writer (mapping overrides, expression translation)
 │   ├── engines/                # Engine registry — see "Adding a new engine"
-│   │   ├── registry.go         # name → Engine lookup; engines self-register
-│   │   ├── mysql/              # MySQL engine package: reader+writer+CDC+caps
-│   │   └── postgres/           # Postgres engine package: reader+writer+CDC+caps
-│   ├── apply/                  # Continuous-sync applier and position store
-│   ├── pipeline/               # Simple-mode orchestrator
-│   └── config/                 # Connection, mapping overrides, runtime options
-├── docs/
-└── test/
-    ├── golden/                 # Schema-translation golden files
-    ├── integration/            # Container-based end-to-end tests
-    └── sqllogic/               # Curated semantic-equivalence corpus
+│   │   ├── registry.go         # name → Engine lookup; engines self-register via init()
+│   │   ├── mysql/              # MySQL + wire-compatible flavors (vanilla, PlanetScale, Vitess): reader+writer+CDC+caps
+│   │   ├── postgres/           # Postgres engine: reader+writer+CDC+caps
+│   │   ├── pgtrigger/          # Trigger-based Postgres CDC (`postgres-trigger`) for managed PG that blocks logical replication
+│   │   ├── sqlite/             # SQLite engine: .db files, .sql dumps, live Cloudflare D1 (source + target)
+│   │   ├── sqlite-trigger/     # Trigger-based SQLite CDC (composes the base sqlite engine)
+│   │   └── d1-trigger/         # Trigger-based Cloudflare D1 CDC over the D1 HTTP query API
+│   ├── pipeline/               # Orchestrators: simple-mode Migrator, continuous-sync Streamer, metrics, backup/restore
+│   ├── appliershared/          # Engine-neutral helpers shared by the engine ChangeAppliers
+│   ├── appliercontrol/         # AIMD controller governing --apply-batch-size per stream
+│   ├── laneapply/              # Engine-neutral concurrent key-hash CDC apply core
+│   ├── migratestate/           # Shared persistence skeleton for the per-target resumable-migration state store
+│   ├── config/                 # YAML + env config loading (mapping overrides, extension allowlist)
+│   ├── crypto/                 # Envelope-encryption primitives for encrypted backup chains
+│   ├── diagnose/               # `sluice diagnose` operator support-bundle assembler
+│   ├── fleettui/               # `sluice sync tui` full-screen fleet view
+│   ├── netkeepalive/           # TCP keep-alive policy for long-lived database connections
+│   ├── notify/                 # Notification sinks (webhook / Slack / SMTP) with failure isolation
+│   ├── planetscale/
+│   │   └── telemetry/          # Optional PlanetScale control-plane target-health provider
+│   └── redact/                 # PII redaction strategies + per-column rule registry
+└── docs/
 ```
 
-The `internal/ir` package has no dependencies on any other package in the project. Pure-function helpers and feature-scoped contracts over the IR split into sub-packages under `internal/ir` (today `ir/diff` — the schema diff behind `sluice schema diff` and the per-table drift report behind CDC refuse-loudly messages — and `ir/backup` — the logical-backup manifest types, chain identity/fingerprint helpers, and the optional engine surfaces the backup orchestrator type-asserts on); sub-packages depend only on core `ir`, never the reverse. The sealed-interface JSON codec (`schema_wire.go`) stays in core `ir`: its `Column.MarshalJSON`/`UnmarshalJSON` hooks must be methods on the core type, and the CDC schema-history store shares the codec with the backup manifests. The `translate` package depends only on `ir`. Each engine package under `internal/engines/<name>/` depends on `ir` plus its database driver — never on another engine package, never on `pipeline` or `apply`. This dependency direction is enforced; anything else is a code smell and a review-flag.
+The `internal/ir` package has no dependencies on any other package in the project. Pure-function helpers and feature-scoped contracts over the IR split into sub-packages under `internal/ir` (today `ir/diff` — the schema diff behind `sluice schema diff` and the per-table drift report behind CDC refuse-loudly messages — and `ir/backup` — the logical-backup manifest types, chain identity/fingerprint helpers, and the optional engine surfaces the backup orchestrator type-asserts on); sub-packages depend only on core `ir`, never the reverse. The sealed-interface JSON codec (`schema_wire.go`) stays in core `ir`: its `Column.MarshalJSON`/`UnmarshalJSON` hooks must be methods on the core type, and the CDC schema-history store shares the codec with the backup manifests. The `translate` package depends only on `ir`. Each engine package under `internal/engines/<name>/` depends on `ir`, its database driver, and at most the small engine-neutral helper packages (`appliershared`, `appliercontrol`) — never on another engine package, never on `pipeline`. This dependency direction is enforced; anything else is a code smell and a review-flag.
 
 Each engine package bundles everything that knows about a specific database: schema reader, schema writer, row reader, row writer, CDC reader (if applicable), change applier (if applicable), and a `Capabilities` declaration. Co-locating these means the knowledge of "what MySQL is and how to talk to it" lives in exactly one place.
 
@@ -217,7 +222,7 @@ The contract for a new engine:
 - The reader must produce IR that uses **only** types declared in its own `Capabilities.SupportedTypes`. If the underlying engine has types beyond what we model, the reader either maps them to existing IR types with a documented loss, or extends the IR with a new extension type (and updates other engines' capability declarations to either support or reject it).
 - The writer must accept any IR schema and either emit valid DDL or return a clear, structured error explaining what's not supported and why. Silently dropping fields is not allowed.
 - The capability declaration must be honest. If the writer claims `SupportsCheckConstraint: true`, it had better.
-- The engine package owns its own integration tests (in `internal/engines/<name>/`); the cross-engine matrix tests in `test/integration/` automatically pick up new engines from the registry.
+- The engine package owns its own integration tests (in `internal/engines/<name>/`); the cross-engine matrix tests live in `internal/pipeline`, which resolves engines through the registry.
 
 ## Configuration
 

@@ -101,11 +101,11 @@ For array/collection-element work specifically, the pin matrix is **each element
 - **PlanetScale's pgcopydb fork** — tactical reference for fast Postgres→Postgres copy. Tactics worth borrowing: parallel `COPY` per table, deferred index/constraint creation, snapshot-based consistency.
 - **pscale dumper** — battle-tested batch sizes (1 MB statement, 128 MB chunk) and session variables (`set workload=olap`) for PlanetScale reads. Use these as starting points for any high-throughput MySQL bulk-read code.
 
-## State of play (as of writing)
+## State of play
 
-Done: IR package, both engines (read + write), kong CLI + koanf config, simple-mode orchestrator (`internal/pipeline.Migrator`), unit tests, integration tests for MySQL→MySQL, PG→PG, and MySQL→PG (cross-engine). CI Integration job runs them on every PR.
+The core product surface is shipped and in continuous release: the engine matrix (MySQL/PlanetScale/Vitess ↔ Postgres ↔ SQLite/D1, plus the trigger-CDC variants), continuous CDC sync with the snapshot→CDC handoff, encrypted backup/restore chains, and the simple-mode migrator — all gated by the CI integration matrix on every PR.
 
-For the upcoming work, see `docs/dev/roadmap.md` — it has detailed entries for the Postgres→MySQL test, MySQL/Postgres CDC, the snapshot→CDC handoff, the COPY-protocol writer, translation-policy edges, ADRs, and OSS hygiene.
+Don't enumerate feature state here — snapshots rot (an earlier version of this section still listed CDC as upcoming long after it shipped). `docs/dev/roadmap.md` is the single source of truth for what's next; `CHANGELOG.md` for what landed when.
 
 ## Release process
 
