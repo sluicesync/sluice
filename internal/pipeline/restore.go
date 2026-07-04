@@ -813,7 +813,14 @@ func (r *Restore) restoreChunkGroup(
 	streamCtx, streamCancel := context.WithCancel(ctx)
 	defer streamCancel()
 
-	rowCh := make(chan ir.Row)
+	// Bounded buffer (see [rowChanBuffer]) so chunk decode and target
+	// write overlap instead of rendezvous-alternating — the restore
+	// analog of migrate's bulk-copy hop discipline (perf-parity matrix
+	// gap 2). The Bug-40b cancel path below is unaffected: a writer
+	// error still cancels the producer, which unblocks from a full
+	// buffer via streamChunkRows' <-ctx.Done() arm exactly as it did
+	// from the unbuffered rendezvous.
+	rowCh := make(chan ir.Row, rowChanBuffer)
 	// The producer reports either an error OR the count of rows it
 	// actually decoded+streamed for this group (the ACTUAL count, not
 	// the manifest sum — so the orchestrator's layer-2 cross-check is

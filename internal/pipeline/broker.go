@@ -945,7 +945,12 @@ func (b *SyncFromBackup) applyIncremental(
 	//    change's position rewritten to the broker shape.
 	streamCtx, streamCancel := context.WithCancel(ctx)
 	defer streamCancel()
-	changesCh := make(chan ir.Change)
+	// Bounded buffer (see [rowChanBuffer]) so chunk decode and target
+	// apply overlap instead of rendezvous-alternating — same rationale
+	// as [ChainRestore.applyIncremental]'s replay hop (perf-parity
+	// matrix gap 2). Position durability is unaffected: the applier
+	// persists a position only after consuming the changes ahead of it.
+	changesCh := make(chan ir.Change, rowChanBuffer)
 	errCh := make(chan error, 1)
 	pos := encodeBrokerPosition(b.ChainURL, backupID)
 	go func() {

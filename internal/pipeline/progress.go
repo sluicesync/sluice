@@ -327,7 +327,10 @@ func kickOffRowCount(ctx context.Context, rr ir.RowReader, table *ir.Table, pt *
 
 // rowChanBuffer is the buffer size for the bulk-copy row channels
 // (reader output, progress/PK tees, the fast-loader pump; mirrored by
-// a same-named constant in each engine's row reader).
+// a same-named constant in each engine's row reader) and for the
+// restore / chain-restore / broker replay hops (chunk decode → apply),
+// which adopted the same discipline when perf-parity matrix gap 2
+// closed (2026-07).
 //
 // Unbuffered channels force a rendezvous per row: source decode and
 // target write strictly ALTERNATE, so the per-row cost is

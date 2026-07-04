@@ -630,7 +630,13 @@ func (r *ChainRestore) applyIncremental(
 	}
 	streamCtx, streamCancel := context.WithCancel(ctx)
 	defer streamCancel()
-	changesCh := make(chan ir.Change)
+	// Bounded buffer (see [rowChanBuffer]) so chunk decode and target
+	// apply overlap instead of rendezvous-alternating — the replay
+	// analog of migrate's bulk-copy hop discipline (perf-parity matrix
+	// gap 2). Positions stay exact: the applier persists a position
+	// only AFTER consuming the changes ahead of it, so buffered-but-
+	// unapplied changes can never advance the durable position.
+	changesCh := make(chan ir.Change, rowChanBuffer)
 	errCh := make(chan error, 1)
 	go func() {
 		defer close(changesCh)
@@ -832,15 +838,56 @@ func (r *ChainRestore) streamIncrementalChanges(
 	}
 	segStore := link.segment.store(r.Store)
 	codec := link.segment.codecOrDefault()
-	for chunkIdx, chunk := range link.manifest.ChangeChunks {
-		if err := r.streamOneChangeChunk(ctx, segStore, codec, chunk, out); err != nil {
-			return fmt.Errorf("chunk %d (%s): %w", chunkIdx, chunk.File, err)
+
+	// One-chunk read-ahead (perf-parity matrix gap 4): the fetcher
+	// goroutine GETs + SHA-verifies chunk N+1 while chunk N's changes
+	// decode and apply downstream, hiding the object-store round-trip
+	// behind the apply. The handoff channel is UNBUFFERED — the fetcher
+	// holds at most ONE verified chunk while waiting, so exactly one
+	// chunk of read-ahead, never an N-deep pipeline (fetchChunkVerified
+	// already buffers a whole chunk in memory; this at most doubles
+	// that, bounded). Apply ORDER is strictly preserved (single fetcher,
+	// single consumer, FIFO handoff) and the ADR-0117 per-chunk fetch
+	// retry is untouched — it lives inside fetchChunkVerified, which
+	// still runs once per chunk, just one chunk early.
+	type fetchedChunk struct {
+		idx   int
+		chunk *irbackup.ChunkInfo
+		src   io.ReadCloser
+		err   error
+	}
+	fetchCtx, fetchCancel := context.WithCancel(ctx)
+	defer fetchCancel() // unblocks the fetcher if the decode below fails early
+	fetchCh := make(chan fetchedChunk)
+	go func() {
+		defer close(fetchCh)
+		for chunkIdx, chunk := range link.manifest.ChangeChunks {
+			src, err := fetchChunkVerified(fetchCtx, segStore, chunk.File, chunk.SHA256)
+			select {
+			case fetchCh <- fetchedChunk{idx: chunkIdx, chunk: chunk, src: src, err: err}:
+			case <-fetchCtx.Done():
+				if src != nil {
+					_ = src.Close()
+				}
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	for f := range fetchCh {
+		if f.err != nil {
+			return fmt.Errorf("chunk %d (%s): open chunk: %w", f.idx, f.chunk.File, f.err)
+		}
+		if err := r.streamOneChangeChunk(ctx, codec, f.chunk, f.src, out); err != nil {
+			return fmt.Errorf("chunk %d (%s): %w", f.idx, f.chunk.File, err)
 		}
 		slog.DebugContext(
 			ctx, "chain restore: chunk verified and streamed",
 			slog.String("backup_id", manifestBackupID(link.manifest)),
-			slog.Int("chunk", chunkIdx),
-			slog.Int64("changes", chunk.RowCount),
+			slog.Int("chunk", f.idx),
+			slog.Int64("changes", f.chunk.RowCount),
 		)
 	}
 	return nil
@@ -897,21 +944,18 @@ func (r *ChainRestore) streamSchemaHistorySnapshots(
 	return nil
 }
 
-// streamOneChangeChunk reads chunk's events into out via the
-// change-chunk reader. segStore is the chunk's segment store
-// (Dir-prefixed) and codec is that segment's RECORDED codec (never
-// sniffed from the bytes — ADR-0046 §5).
+// streamOneChangeChunk decodes chunk's events from src — the
+// already-fetched, SHA-verified chunk body handed over by
+// [ChainRestore.streamIncrementalChanges]'s read-ahead fetcher — and
+// pushes them into out. codec is the chunk's segment's RECORDED codec
+// (never sniffed from the bytes — ADR-0046 §5).
 func (r *ChainRestore) streamOneChangeChunk(
 	ctx context.Context,
-	segStore irbackup.Store,
 	codec Codec,
 	chunk *irbackup.ChunkInfo,
+	src io.ReadCloser,
 	out chan<- ir.Change,
 ) error {
-	src, err := fetchChunkVerified(ctx, segStore, chunk.File, chunk.SHA256)
-	if err != nil {
-		return fmt.Errorf("open chunk: %w", err)
-	}
 	cek, err := r.changeChunkCEK(chunk)
 	if err != nil {
 		_ = src.Close()

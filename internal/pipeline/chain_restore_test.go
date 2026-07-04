@@ -1031,6 +1031,80 @@ func seedMultiChunkIncremental(t *testing.T, store irbackup.Store, schema *ir.Sc
 	return incr
 }
 
+// TestChainRestore_MultiChunkReplay_PrefetchPreservesOrder pins the
+// one-chunk read-ahead in the incremental replay (perf-parity matrix
+// gap 4): with an incremental split across three change chunks, the
+// applier must see every change in exact manifest order — the fetcher
+// goroutine overlaps chunk N+1's fetch with chunk N's apply but the
+// unbuffered handoff keeps the apply strictly sequential.
+func TestChainRestore_MultiChunkReplay_PrefetchPreservesOrder(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := NewLocalStore(dir)
+	schema := &ir.Schema{Tables: []*ir.Table{{
+		Name:    "users",
+		Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
+	}}}
+	seedMultiChunkIncremental(t, store, schema)
+
+	tgt := &chainRestoreRecorderEngine{
+		restoreRecorderEngine: newRestoreRecorderEngine("postgres"),
+	}
+	chain := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: store}
+	if err := chain.Run(context.Background()); err != nil {
+		t.Fatalf("ChainRestore.Run: %v", err)
+	}
+
+	tgt.mu.Lock()
+	got := append([]ir.Change(nil), tgt.applied...)
+	tgt.mu.Unlock()
+	if len(got) != 9 {
+		t.Fatalf("applied changes = %d; want 9 (3 chunks x 3 inserts); got %v", len(got), got)
+	}
+	for i, c := range got {
+		ins, ok := c.(ir.Insert)
+		if !ok {
+			t.Fatalf("got[%d] = %T; want Insert", i, c)
+		}
+		if !valuesEquivalent(ins.Row["id"], int64(i+1)) {
+			t.Errorf("got[%d].id = %v; want %d (apply order must match manifest chunk order exactly)", i, ins.Row["id"], i+1)
+		}
+	}
+}
+
+// TestChainRestore_CorruptChangeChunk_FailsLoud pins the read-ahead's
+// error path: a change chunk whose stored bytes no longer match the
+// manifest SHA must fail the restore LOUDLY, naming the chunk, after
+// the ADR-0117 bounded re-fetch attempts — and must not deadlock the
+// fetcher/consumer pair (a hang here would time the test out).
+func TestChainRestore_CorruptChangeChunk_FailsLoud(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := NewLocalStore(dir)
+	schema := &ir.Schema{Tables: []*ir.Table{{
+		Name:    "users",
+		Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
+	}}}
+	incr := seedMultiChunkIncremental(t, store, schema)
+
+	// Corrupt the MIDDLE chunk so the failure surfaces while chunk 0
+	// is already applying — the read-ahead's in-flight case.
+	corrupt := incr.ChangeChunks[1].File
+	if err := store.Put(context.Background(), corrupt, strings.NewReader("not the recorded bytes")); err != nil {
+		t.Fatalf("corrupt chunk: %v", err)
+	}
+
+	tgt := &chainRestoreRecorderEngine{
+		restoreRecorderEngine: newRestoreRecorderEngine("postgres"),
+	}
+	chain := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: store}
+	err := chain.Run(context.Background())
+	if err == nil {
+		t.Fatal("ChainRestore.Run succeeded on a corrupt change chunk; want a loud hash-mismatch failure")
+	}
+	if !strings.Contains(err.Error(), corrupt) || !strings.Contains(err.Error(), "open chunk") {
+		t.Errorf("error should name the corrupt chunk %q via the open-chunk path; got: %v", corrupt, err)
+	}
+}
+
 // TestChainRestore_IdentitySequencesSyncedAtTail_Dispatch pins the
 // chain-tail identity re-sync wiring (roadmap "Open bugs", filed
 // 2026-07-03): a chain whose schema carries an identity column must
