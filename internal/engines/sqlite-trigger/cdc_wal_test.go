@@ -186,10 +186,14 @@ func (s *spyExecutor) pollChangeLog(context.Context, int64, int) ([]rawChangeRow
 
 func (s *spyExecutor) readFingerprints(context.Context) ([]fingerprintRow, error) { return nil, nil }
 
-func (s *spyExecutor) changeLogExists(context.Context) (bool, error)        { return true, nil }
-func (s *spyExecutor) maxChangeLogID(context.Context) (int64, error)        { return 0, nil }
-func (s *spyExecutor) discoverTriggers(context.Context) ([]string, error)   { return nil, nil }
-func (s *spyExecutor) pruneChangeLog(context.Context, int64) (int64, error) { return 0, nil }
+func (s *spyExecutor) changeLogExists(context.Context) (bool, error)      { return true, nil }
+func (s *spyExecutor) maxChangeLogID(context.Context) (int64, error)      { return 0, nil }
+func (s *spyExecutor) discoverTriggers(context.Context) ([]string, error) { return nil, nil }
+func (s *spyExecutor) pruneChangeLogBatch(context.Context, int64, int64) (int64, error) {
+	return 0, nil
+}
+func (s *spyExecutor) minChangeLogID(context.Context) (int64, error) { return 0, nil }
+func (s *spyExecutor) pruneBatchSize() int64                         { return localPruneBatchSize }
 func (s *spyExecutor) checkpointWAL(context.Context) error {
 	atomic.AddInt64(&s.checkpoints, 1)
 	return nil

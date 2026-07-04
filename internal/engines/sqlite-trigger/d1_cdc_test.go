@@ -42,10 +42,17 @@ type mockD1 struct {
 	rows          []clRow     // the canned change-log rows (filtered by id>since)
 	pollHTTPError bool        // when set, the poll returns HTTP 500 (transport error)
 
-	ddl      []string // captured non-SELECT statements (setup/teardown DDL)
-	pollSQL  []string // captured poll SELECTs
-	pollArgs []string // the watermark param of each poll
-	bodies   []string // raw request bodies (to assert string-param binding)
+	// pruneLo/pruneHi model a CONTIGUOUS change-log id range [lo, hi] for the
+	// P-1 batched-prune tests (empty when hi < lo); the MIN/COUNT/DELETE prune
+	// SQL is answered arithmetically against it.
+	pruneLo int64
+	pruneHi int64
+
+	ddl          []string        // captured non-SELECT statements (setup/teardown DDL)
+	pollSQL      []string        // captured poll SELECTs
+	pollArgs     []string        // the watermark param of each poll
+	bodies       []string        // raw request bodies (to assert string-param binding)
+	pruneDeletes []recordedBatch // the (floor, upper] bound of each prune DELETE
 }
 
 // clRow is one canned change-log row.
@@ -62,9 +69,20 @@ func (m *mockD1) handle(t *testing.T, raw []byte, sql string, params []string) (
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.bodies = append(m.bodies, string(raw))
-	// A non-SELECT statement is setup/teardown DDL — record it. (Checked first so
-	// a CREATE TABLE / INSERT against the columns table isn't mis-routed to the
-	// fingerprint-SELECT branch below.)
+	// A batched-prune DELETE (P-1) — record its keyset bound and advance the
+	// modeled contiguous range. Batches ascend, so deleting (floor, upper]
+	// moves the low edge to upper+1.
+	if strings.HasPrefix(strings.TrimSpace(sql), "DELETE") {
+		floor, upper := parseRangeParams(t, params)
+		m.pruneDeletes = append(m.pruneDeletes, recordedBatch{floor, upper})
+		if upper >= m.pruneLo {
+			m.pruneLo = upper + 1
+		}
+		return http.StatusOK, d1OK(nil)
+	}
+	// Any other non-SELECT statement is setup/teardown DDL — record it. (Checked
+	// before the switch so a CREATE TABLE / INSERT against the columns table
+	// isn't mis-routed to the fingerprint-SELECT branch below.)
 	if !strings.HasPrefix(strings.TrimSpace(sql), "SELECT") {
 		m.ddl = append(m.ddl, sql)
 		return http.StatusOK, d1OK(nil)
@@ -78,6 +96,27 @@ func (m *mockD1) handle(t *testing.T, raw []byte, sql string, params []string) (
 			rows = append(rows, map[string]any{"tbl": fp[0], "columns": fp[1]})
 		}
 		return http.StatusOK, d1OK(rows)
+	// The prune-range COUNT must be dispatched BEFORE the generic
+	// "WHERE id > ?" poll branch — its predicate contains that substring too.
+	case strings.Contains(sql, "COUNT(*)") && strings.Contains(sql, "id > ?"):
+		floor, upper := parseRangeParams(t, params)
+		return http.StatusOK, d1OK([]map[string]any{
+			{"n": strconv.FormatInt(m.rangeCountLocked(floor, upper), 10)},
+		})
+	case strings.Contains(sql, "COUNT(*)"): // changeLogStats: MIN + COUNT
+		mn, cnt := int64(0), int64(0)
+		if m.pruneHi >= m.pruneLo && m.pruneLo > 0 {
+			mn, cnt = m.pruneLo, m.pruneHi-m.pruneLo+1
+		}
+		return http.StatusOK, d1OK([]map[string]any{
+			{"mn": strconv.FormatInt(mn, 10), "cnt": strconv.FormatInt(cnt, 10)},
+		})
+	case strings.Contains(sql, "COALESCE(MIN(id), 0)"): // minChangeLogID
+		mn := int64(0)
+		if m.pruneHi >= m.pruneLo && m.pruneLo > 0 {
+			mn = m.pruneLo
+		}
+		return http.StatusOK, d1OK([]map[string]any{{"mn": strconv.FormatInt(mn, 10)}})
 	case strings.Contains(sql, "MAX(id)"):
 		v := any(nil)
 		if m.maxID != "" {
@@ -138,6 +177,35 @@ func (m *mockD1) pollResultsLocked(t *testing.T, since string) []map[string]any 
 		})
 	}
 	return out
+}
+
+// rangeCountLocked returns how many modeled ids fall in (floor, upper] —
+// the mock's answer to the prune-range COUNT.
+func (m *mockD1) rangeCountLocked(floor, upper int64) int64 {
+	lo := max(m.pruneLo, floor+1)
+	hi := min(m.pruneHi, upper)
+	if hi < lo {
+		return 0
+	}
+	return hi - lo + 1
+}
+
+// parseRangeParams decodes the (floor, upper) params of a prune-range
+// statement. The request decode only accepts STRING params, so this also
+// implicitly pins that the bounds are string-bound (the ADR-0132 discipline).
+func parseRangeParams(t *testing.T, params []string) (floor, upper int64) {
+	t.Helper()
+	if len(params) != 2 {
+		t.Fatalf("prune-range statement carried %d params; want 2 (floor, upper)", len(params))
+	}
+	var err error
+	if floor, err = strconv.ParseInt(params[0], 10, 64); err != nil {
+		t.Fatalf("floor param %q not an int: %v", params[0], err)
+	}
+	if upper, err = strconv.ParseInt(params[1], 10, 64); err != nil {
+		t.Fatalf("upper param %q not an int: %v", params[1], err)
+	}
+	return floor, upper
 }
 
 // startMockD1 boots the httptest server + returns the mock and a D1Conn (via the
@@ -625,5 +693,51 @@ func TestD1Capture_PollTransportErrorIsLoud(t *testing.T) {
 	gotErr := errer.Err()
 	if gotErr == nil || !strings.Contains(gotErr.Error(), "poll") {
 		t.Errorf("transport error mid-poll must surface via Err() naming the poll; got: %v", gotErr)
+	}
+}
+
+// TestD1Prune_BatchesBoundedStatements pins the P-1 batched prune over the D1
+// transport: a 5000-row backlog with cut=4500 is reaped as three bounded keyset
+// DELETEs of at most d1PruneBatchSize ids — never one monolithic DELETE that
+// could blow D1's per-query CPU ceiling (the HTTP-400 code-7500 class), whose
+// failed tick would retry an even bigger delete and fall behind permanently.
+// No statement's upper bound exceeds the cut, so rows above the durable
+// frontier survive every batching state (the ADR-0137 invariant).
+func TestD1Prune_BatchesBoundedStatements(t *testing.T) {
+	m := &mockD1{exists: true, pruneLo: 1, pruneHi: 5000}
+	conn := startMockD1(t, m)
+	b := d1TestBackend(conn, &ir.Schema{})
+
+	const cut = 4500
+	res, err := prune(bg(), b, PruneOptions{Cut: cut})
+	if err != nil {
+		t.Fatalf("prune over D1: %v", err)
+	}
+	if res.Deleted != cut {
+		t.Errorf("Deleted = %d; want %d", res.Deleted, cut)
+	}
+	if res.RemainingMin != cut+1 || res.Remaining != 500 {
+		t.Errorf("post-prune stats = (min %d, count %d); want (%d, 500)", res.RemainingMin, res.Remaining, cut+1)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	want := []recordedBatch{{0, 2000}, {2000, 4000}, {4000, 4500}}
+	if len(m.pruneDeletes) != len(want) {
+		t.Fatalf("prune DELETEs = %v; want %v (bounded batches, not one statement)", m.pruneDeletes, want)
+	}
+	for i, gotB := range m.pruneDeletes {
+		if gotB != want[i] {
+			t.Errorf("DELETE[%d] bounds = %v; want %v", i, gotB, want[i])
+		}
+		if gotB.upper-gotB.floor > d1PruneBatchSize {
+			t.Errorf("DELETE[%d] spans %d ids; want <= %d (D1 CPU-ceiling bound)", i, gotB.upper-gotB.floor, d1PruneBatchSize)
+		}
+		if gotB.upper > cut {
+			t.Errorf("DELETE[%d] upper %d exceeds cut %d — rows above the durable frontier must NEVER be touched", i, gotB.upper, cut)
+		}
+	}
+	if m.pruneLo != cut+1 {
+		t.Errorf("modeled MIN(id) after prune = %d; want %d", m.pruneLo, cut+1)
 	}
 }

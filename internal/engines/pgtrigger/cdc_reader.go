@@ -44,6 +44,17 @@ type CDCReader struct {
 	// pumpCancel cancels the polling goroutine when Close is called.
 	pumpCancel context.CancelFunc
 
+	// pruneMu guards pruneDB — the lazily-opened pool the ADR-0137 Phase-B
+	// auto-prune ([PruneConsumedChangeLog]) reuses across ticks instead of
+	// dialing+pinging per tick (P-1). The sidecar goroutine opens and uses it;
+	// Close (another goroutine) releases it.
+	pruneMu sync.Mutex
+	pruneDB *sql.DB
+
+	// pruneBook tracks the auto-prune remaining-rows estimate (P-1). Owned by
+	// the single auto-prune sidecar goroutine; no locking.
+	pruneBook pruneBookkeeper
+
 	// mu guards err. The pump writes; the caller reads via Err.
 	mu  sync.Mutex
 	err error
@@ -112,12 +123,19 @@ func (r *CDCReader) SetPollInterval(d time.Duration) {
 	}
 }
 
-// Close releases the underlying connection pool and stops any
-// in-flight polling goroutine.
+// Close releases the underlying connection pool (and the auto-prune
+// pool, if a prune tick ever opened one) and stops any in-flight
+// polling goroutine.
 func (r *CDCReader) Close() error {
 	if r.pumpCancel != nil {
 		r.pumpCancel()
 	}
+	r.pruneMu.Lock()
+	if r.pruneDB != nil {
+		_ = r.pruneDB.Close()
+		r.pruneDB = nil
+	}
+	r.pruneMu.Unlock()
 	if r.db != nil {
 		err := r.db.Close()
 		r.db = nil

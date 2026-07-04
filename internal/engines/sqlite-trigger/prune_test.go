@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"path/filepath"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite" // pure-Go driver — no cgo, no container needed
 )
@@ -248,6 +249,294 @@ func TestPruneConsumedChangeLog_RefusesForeignToken(t *testing.T) {
 	}
 	if got := remainingIDs(t, path); len(got) != 10 {
 		t.Errorf("remaining = %v; a refused prune must delete nothing", got)
+	}
+}
+
+// --- P-1 batched-prune pins --------------------------------------------------
+
+// recordedBatch is one (floor, upper] keyset step a fake pruneBatchFunc saw.
+type recordedBatch struct{ floor, upper int64 }
+
+// TestPruneInBatches_StepsBoundedKeyset pins the batching shape: a backlog is
+// reaped as multiple bounded `floor < id <= upper` steps — never one monolithic
+// statement — with every upper clamped at the cut (the invariant carrier) and
+// the floor starting at MIN(id)-1 (not 0, so a high-id log doesn't step through
+// millions of empty ranges).
+func TestPruneInBatches_StepsBoundedKeyset(t *testing.T) {
+	cases := []struct {
+		name        string
+		minID, cut  int64
+		step        int64
+		wantBatches []recordedBatch
+	}{
+		{
+			name: "low ids", minID: 1, cut: 25, step: 10,
+			wantBatches: []recordedBatch{{0, 10}, {10, 20}, {20, 25}},
+		},
+		{
+			name: "floor starts at MIN(id)-1", minID: 101, cut: 125, step: 10,
+			wantBatches: []recordedBatch{{100, 110}, {110, 120}, {120, 125}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var batches []recordedBatch
+			del := func(_ context.Context, floor, upper int64) (int64, error) {
+				batches = append(batches, recordedBatch{floor, upper})
+				return upper - floor, nil
+			}
+			deleted, done, err := pruneInBatches(context.Background(), tc.minID, tc.cut, tc.step, 0, del)
+			if err != nil {
+				t.Fatalf("pruneInBatches: %v", err)
+			}
+			if !done {
+				t.Error("done = false; want true (no budget)")
+			}
+			if want := tc.cut - (tc.minID - 1); deleted != want {
+				t.Errorf("deleted = %d; want %d", deleted, want)
+			}
+			if len(batches) != len(tc.wantBatches) {
+				t.Fatalf("batches = %v; want %v", batches, tc.wantBatches)
+			}
+			for i, b := range batches {
+				if b != tc.wantBatches[i] {
+					t.Errorf("batch[%d] = %v; want %v", i, b, tc.wantBatches[i])
+				}
+				if b.upper > tc.cut {
+					t.Errorf("batch[%d] upper %d exceeds cut %d — rows above the cut must NEVER be touched", i, b.upper, tc.cut)
+				}
+			}
+		})
+	}
+}
+
+// TestPruneInBatches_NothingBelowCut pins the two no-work shapes: an empty
+// change-log (minID=0) and a log whose lowest row is already above the cut.
+func TestPruneInBatches_NothingBelowCut(t *testing.T) {
+	del := func(context.Context, int64, int64) (int64, error) {
+		t.Fatal("del must not be called when there is nothing below the cut")
+		return 0, nil
+	}
+	for _, minID := range []int64{0, 6} {
+		deleted, done, err := pruneInBatches(context.Background(), minID, 5, 10, 0, del)
+		if err != nil || !done || deleted != 0 {
+			t.Errorf("minID=%d: got (deleted=%d, done=%v, err=%v); want (0, true, nil)", minID, deleted, done, err)
+		}
+	}
+}
+
+// TestPruneInBatches_BudgetStopsEarly pins the time-budget early exit: when the
+// budget is exhausted mid-backlog the loop stops after the current batch with
+// done=false (no error — the next tick resumes). The fake del sleeps so the
+// clock provably advances past the 1ns deadline after the first batch.
+func TestPruneInBatches_BudgetStopsEarly(t *testing.T) {
+	var batches int
+	del := func(context.Context, int64, int64) (int64, error) {
+		batches++
+		time.Sleep(2 * time.Millisecond)
+		return 10, nil
+	}
+	deleted, done, err := pruneInBatches(context.Background(), 1, 100, 10, time.Nanosecond, del)
+	if err != nil {
+		t.Fatalf("pruneInBatches: %v", err)
+	}
+	if done {
+		t.Error("done = true; want false (budget exhausted with rows still below cut)")
+	}
+	if batches != 1 {
+		t.Errorf("batches = %d; want 1 (stop after the batch that exhausted the budget)", batches)
+	}
+	if deleted != 10 {
+		t.Errorf("deleted = %d; want 10", deleted)
+	}
+}
+
+// TestPruneInBatches_CtxCanceled pins the between-batch ctx check: a shutdown
+// never waits behind a multi-batch backlog.
+func TestPruneInBatches_CtxCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	del := func(context.Context, int64, int64) (int64, error) {
+		t.Fatal("del must not run under a canceled ctx")
+		return 0, nil
+	}
+	if _, _, err := pruneInBatches(ctx, 1, 100, 10, 0, del); err == nil {
+		t.Error("pruneInBatches under canceled ctx returned nil; want ctx error")
+	}
+}
+
+// TestPruneInBatches_RealExecutorBudgetResumes drives the REAL bounded-DELETE
+// SQL through a budget-exhausted first tick and a resuming second tick, and is
+// the P-1 invariant pin at the SQL layer: rows above the cut (the durable
+// frontier) survive EVERY intermediate batching state, and the resume — floor
+// re-derived from MIN(id) — completes to exactly the cut, no further.
+func TestPruneInBatches_RealExecutorBudgetResumes(t *testing.T) {
+	path := seedChangeLog(t, 10)
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	e := &localExecutor{db: db}
+	ctx := context.Background()
+
+	// Tick 1: cut=8 (frontier), step=3, 1ns budget; the slowed del exhausts the
+	// budget after one batch → only (0,3] reaped.
+	slowDel := func(ctx context.Context, floor, upper int64) (int64, error) {
+		n, err := e.pruneChangeLogBatch(ctx, floor, upper)
+		time.Sleep(2 * time.Millisecond)
+		return n, err
+	}
+	deleted, done, err := pruneInBatches(ctx, 1, 8, 3, time.Nanosecond, slowDel)
+	if err != nil {
+		t.Fatalf("tick 1: %v", err)
+	}
+	if done || deleted != 3 {
+		t.Fatalf("tick 1: (deleted=%d, done=%v); want (3, false)", deleted, done)
+	}
+	if got := remainingIDs(t, path); !equalIDs(got, []int64{4, 5, 6, 7, 8, 9, 10}) {
+		t.Fatalf("after tick 1 remaining = %v; want [4..10] (ids 9,10 above the frontier MUST survive)", got)
+	}
+
+	// Tick 2 (the resume): floor re-derives from MIN(id); no budget → completes.
+	minID, err := e.minChangeLogID(ctx)
+	if err != nil {
+		t.Fatalf("minChangeLogID: %v", err)
+	}
+	if minID != 4 {
+		t.Fatalf("minChangeLogID = %d; want 4", minID)
+	}
+	deleted, done, err = pruneInBatches(ctx, minID, 8, 3, 0, e.pruneChangeLogBatch)
+	if err != nil {
+		t.Fatalf("tick 2: %v", err)
+	}
+	if !done || deleted != 5 {
+		t.Fatalf("tick 2: (deleted=%d, done=%v); want (5, true)", deleted, done)
+	}
+	if got := remainingIDs(t, path); !equalIDs(got, []int64{9, 10}) {
+		t.Errorf("after resume remaining = %v; want [9 10] — rows above the durable frontier must never be pruned", got)
+	}
+}
+
+// seedChangeLogBulk seeds n change-log rows (id=1..n) in one recursive-CTE
+// INSERT — fast enough to exercise the REAL localPruneBatchSize multi-batch
+// path without 45k round-trips.
+func seedChangeLogBulk(t *testing.T, n int64) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "src.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx,
+		`CREATE TABLE "`+ChangeLogTable+`" (id INTEGER PRIMARY KEY AUTOINCREMENT, op TEXT, tbl TEXT)`); err != nil {
+		t.Fatalf("create change-log: %v", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		`WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < ?)
+		 INSERT INTO "`+ChangeLogTable+`" (id, op, tbl) SELECT x, 'I', 't' FROM cnt`, n); err != nil {
+		t.Fatalf("bulk seed: %v", err)
+	}
+	return path
+}
+
+// TestPrune_LargeBacklogBatchesToCompletion runs the operator-facing [Prune]
+// over a backlog larger than 2×localPruneBatchSize, so the production batch
+// size (not a test-shrunk step) provably multi-batches to completion with the
+// exact same outcome the old monolithic DELETE gave.
+func TestPrune_LargeBacklogBatchesToCompletion(t *testing.T) {
+	const (
+		total = 2*localPruneBatchSize + 5_000 // 45k rows
+		cut   = 2*localPruneBatchSize + 1_000 // 41k — forces 3 batches (20k, 20k, 1k)
+	)
+	path := seedChangeLogBulk(t, total)
+	res, err := Prune(context.Background(), path, PruneOptions{Cut: cut})
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if res.Deleted != cut {
+		t.Errorf("Deleted = %d; want %d", res.Deleted, cut)
+	}
+	if res.RemainingMin != cut+1 {
+		t.Errorf("RemainingMin = %d; want %d", res.RemainingMin, cut+1)
+	}
+	if res.Remaining != total-cut {
+		t.Errorf("Remaining = %d; want %d", res.Remaining, total-cut)
+	}
+	got := remainingIDs(t, path)
+	if len(got) != total-cut || got[0] != cut+1 || got[len(got)-1] != total {
+		t.Errorf("remaining ids span [%d..%d] (n=%d); want [%d..%d] (n=%d)",
+			got[0], got[len(got)-1], len(got), cut+1, total, total-cut)
+	}
+}
+
+// TestPruneBookkeeper_RecountCadenceAndArithmetic pins the P-1 estimate
+// bookkeeping: recount on the first tick and every pruneRecountEvery-th after,
+// rows-affected arithmetic (floored at 0) between, no effect until anchored.
+func TestPruneBookkeeper_RecountCadenceAndArithmetic(t *testing.T) {
+	var b pruneBookkeeper
+	b.noteDeleted(99) // unanchored: must be a no-op, not a bogus negative
+	if b.anchored || b.remaining != 0 {
+		t.Fatalf("unanchored noteDeleted mutated the bookkeeper: %+v", b)
+	}
+	if !b.tick() {
+		t.Error("tick 1 must recount (nothing anchored yet)")
+	}
+	b.anchor(100)
+	for i := int64(2); i < pruneRecountEvery; i++ {
+		if b.tick() {
+			t.Errorf("tick %d recounted; want arithmetic-only between recounts", i)
+		}
+		b.noteDeleted(5)
+	}
+	if b.remaining != 100-5*(pruneRecountEvery-2) {
+		t.Errorf("remaining = %d; want %d", b.remaining, 100-5*(pruneRecountEvery-2))
+	}
+	if !b.tick() {
+		t.Errorf("tick %d must recount", pruneRecountEvery)
+	}
+	b.anchor(40)
+	b.noteDeleted(1000)
+	if b.remaining != 0 {
+		t.Errorf("remaining = %d; want 0 (floored, never negative)", b.remaining)
+	}
+}
+
+// TestPruneConsumedChangeLog_RemainingEstimateConsistent drives the sidecar
+// entry point across ticks and pins that the arithmetic estimate matches the
+// change-log's TRUE row count at every step, and that a forced recount tick
+// re-anchors to the same truth (drift-free with no concurrent inserts).
+func TestPruneConsumedChangeLog_RemainingEstimateConsistent(t *testing.T) {
+	path := seedChangeLog(t, 100)
+	r := &CDCReader{b: localBackend(path)}
+	ctx := context.Background()
+
+	// Tick 1 (recount tick): frontier 30, keep 0 ⇒ delete 1..30, anchor at 70.
+	if _, err := r.PruneConsumedChangeLog(ctx, `{"last_id":30}`, 0); err != nil {
+		t.Fatalf("tick 1: %v", err)
+	}
+	if !r.pruneBook.anchored || r.pruneBook.remaining != 70 {
+		t.Fatalf("after tick 1 estimate = %+v; want anchored remaining=70", r.pruneBook)
+	}
+
+	// Tick 2 (arithmetic tick): frontier 50 ⇒ delete 31..50 ⇒ estimate 50.
+	if _, err := r.PruneConsumedChangeLog(ctx, `{"last_id":50}`, 0); err != nil {
+		t.Fatalf("tick 2: %v", err)
+	}
+	if truth := int64(len(remainingIDs(t, path))); r.pruneBook.remaining != 50 || truth != 50 {
+		t.Fatalf("after tick 2 estimate = %d, truth = %d; want both 50", r.pruneBook.remaining, truth)
+	}
+
+	// Force the next tick onto the recount cadence and assert the true COUNT
+	// re-anchors to the same value the arithmetic would have reached.
+	r.pruneBook.ticks = pruneRecountEvery - 1
+	if _, err := r.PruneConsumedChangeLog(ctx, `{"last_id":60}`, 0); err != nil {
+		t.Fatalf("tick 3: %v", err)
+	}
+	if truth := int64(len(remainingIDs(t, path))); r.pruneBook.remaining != 40 || truth != 40 {
+		t.Errorf("after recount tick estimate = %d, truth = %d; want both 40", r.pruneBook.remaining, truth)
 	}
 }
 

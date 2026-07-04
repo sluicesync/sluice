@@ -45,11 +45,19 @@ type executor interface {
 	changeLogExists(ctx context.Context) (bool, error)
 	maxChangeLogID(ctx context.Context) (int64, error)
 	discoverTriggers(ctx context.Context) ([]string, error)
-	// pruneChangeLog DELETEs change-log rows with id <= cut and returns the
-	// number deleted (ADR-0137). The `<=` (not `<`) is load-bearing: cut is the
-	// durably-applied frontier minus a margin, so id == cut is itself durably
+	// pruneChangeLogBatch DELETEs one bounded keyset step of change-log rows —
+	// floor < id <= upper — and returns the number deleted (ADR-0137, batched
+	// per P-1). The `<=` upper bound is load-bearing exactly as the old
+	// single-shot form's `id <= cut` was: the caller guarantees upper never
+	// exceeds the durably-applied cut, so id == upper is itself durably
 	// applied and safe to remove.
-	pruneChangeLog(ctx context.Context, cut int64) (deleted int64, err error)
+	pruneChangeLogBatch(ctx context.Context, floor, upper int64) (deleted int64, err error)
+	// minChangeLogID returns MIN(id) of the change-log (0 when empty) — the
+	// prune loop's keyset floor. Indexed (id is the PK) and cheap.
+	minChangeLogID(ctx context.Context) (int64, error)
+	// pruneBatchSize is the transport's DELETE batch bound; see the
+	// per-transport constants for the rationale (P-1).
+	pruneBatchSize() int64
 	// checkpointWAL bounds the source WAL under sustained CDC (Bug 167). On the
 	// local SQLite path it issues `PRAGMA wal_checkpoint(TRUNCATE)` so the
 	// continuously-churned change-log WAL is reset on a cadence instead of
@@ -282,13 +290,35 @@ func (e *localExecutor) discoverTriggers(ctx context.Context) ([]string, error) 
 	return out, rows.Err()
 }
 
-func (e *localExecutor) pruneChangeLog(ctx context.Context, cut int64) (int64, error) {
-	res, err := e.db.ExecContext(ctx, `DELETE FROM "`+ChangeLogTable+`" WHERE id <= ?`, cut)
+// localPruneBatchSize bounds one local-file prune DELETE (P-1). SQLite is
+// single-writer: the SOURCE APPLICATION's writes stall for the duration of any
+// DELETE we run, so a monolithic backlog DELETE would hold its writer hostage.
+// ~20k id-ordered PK deletes is milliseconds on a local file — larger than
+// D1's bound (no per-query CPU ceiling here) but short enough that the app's
+// writer interleaves between batches.
+const localPruneBatchSize = 20_000
+
+func (e *localExecutor) pruneChangeLogBatch(ctx context.Context, floor, upper int64) (int64, error) {
+	res, err := e.db.ExecContext(ctx,
+		`DELETE FROM "`+ChangeLogTable+`" WHERE id > ? AND id <= ?`, floor, upper)
 	if err != nil {
 		return 0, err
 	}
 	return res.RowsAffected()
 }
+
+func (e *localExecutor) minChangeLogID(ctx context.Context) (int64, error) {
+	var id sql.NullInt64
+	if err := e.db.QueryRowContext(ctx, `SELECT MIN(id) FROM "`+ChangeLogTable+`"`).Scan(&id); err != nil {
+		return 0, err
+	}
+	if !id.Valid {
+		return 0, nil
+	}
+	return id.Int64, nil
+}
+
+func (e *localExecutor) pruneBatchSize() int64 { return localPruneBatchSize }
 
 func (e *localExecutor) checkpointWAL(ctx context.Context) error {
 	// PRAGMA wal_checkpoint returns one row: (busy, log_frames, checkpointed).
@@ -472,16 +502,29 @@ func (e *d1Executor) discoverTriggers(ctx context.Context) ([]string, error) {
 	return out, nil
 }
 
-func (e *d1Executor) pruneChangeLog(ctx context.Context, cut int64) (int64, error) {
+// d1PruneBatchSize bounds one D1 prune DELETE (P-1). D1 enforces a per-query
+// CPU ceiling (a too-big statement fails with the HTTP 400 code-7500 class —
+// the same limit that broke `--infer-types` GLOBs, ADR-0145), and a failed
+// tick retries an even BIGGER delete next interval — prune would fall behind
+// permanently, the exact failure ADR-0137 Phase B exists to prevent. 2k
+// id-ordered PK deletes stays comfortably under the ceiling; the batching loop
+// makes throughput a function of the tick budget, not statement size.
+const d1PruneBatchSize = 2_000
+
+func (e *d1Executor) pruneChangeLogBatch(ctx context.Context, floor, upper int64) (int64, error) {
 	// The D1 `/query` transport doesn't surface rows-affected, so count the
-	// to-be-deleted rows first. This is exact and concurrency-safe: only rows
-	// with id <= cut are deleted, and the AUTOINCREMENT id only ever grows, so
-	// no row can enter the id <= cut range between this count and the DELETE
-	// (the same property that makes pruning safe while a sync is live). COUNT is
-	// projected as TEXT so a JSON-number cell never reaches d1CellString.
-	cutStr := strconv.FormatInt(cut, 10)
+	// to-be-deleted range first. This is exact and concurrency-safe: only rows
+	// with id <= upper (<= the durably-applied cut) are deleted, the
+	// AUTOINCREMENT id only ever grows, and the loop steps disjoint
+	// (floor, upper] ranges, so no row can enter the range between this count
+	// and the DELETE (the same property that makes pruning safe while a sync
+	// is live). COUNT is projected as TEXT so a JSON-number cell never reaches
+	// d1CellString.
+	floorStr := strconv.FormatInt(floor, 10)
+	upperStr := strconv.FormatInt(upper, 10)
 	rows, err := e.conn.Query(ctx,
-		`SELECT CAST(COUNT(*) AS TEXT) AS n FROM "`+ChangeLogTable+`" WHERE id <= ?`, cutStr)
+		`SELECT CAST(COUNT(*) AS TEXT) AS n FROM "`+ChangeLogTable+`" WHERE id > ? AND id <= ?`,
+		floorStr, upperStr)
 	if err != nil {
 		return 0, err
 	}
@@ -497,11 +540,30 @@ func (e *d1Executor) pruneChangeLog(ctx context.Context, cut int64) (int64, erro
 			}
 		}
 	}
-	if err := e.conn.Exec(ctx, `DELETE FROM "`+ChangeLogTable+`" WHERE id <= ?`, cutStr); err != nil {
+	if err := e.conn.Exec(ctx,
+		`DELETE FROM "`+ChangeLogTable+`" WHERE id > ? AND id <= ?`, floorStr, upperStr); err != nil {
 		return 0, err
 	}
 	return deleted, nil
 }
+
+func (e *d1Executor) minChangeLogID(ctx context.Context) (int64, error) {
+	rows, err := e.conn.Query(ctx,
+		`SELECT CAST(COALESCE(MIN(id), 0) AS TEXT) AS mn FROM "`+ChangeLogTable+`"`)
+	if err != nil {
+		return 0, err
+	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	id, err := d1IntCell(rows[0]["mn"])
+	if err != nil {
+		return 0, fmt.Errorf("d1-trigger: decode change-log MIN(id): %w", err)
+	}
+	return id, nil
+}
+
+func (e *d1Executor) pruneBatchSize() int64 { return d1PruneBatchSize }
 
 // checkpointWAL is a no-op on the D1 transport: D1 polls over the `/query` HTTP
 // API against Cloudflare-managed storage — there is no local pager or WAL file

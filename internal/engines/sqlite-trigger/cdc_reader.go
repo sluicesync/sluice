@@ -77,6 +77,10 @@ type CDCReader struct {
 	// pumpCancel cancels the polling goroutine when Close is called.
 	pumpCancel context.CancelFunc
 
+	// pruneBook tracks the auto-prune remaining-rows estimate (P-1). Owned by
+	// the single auto-prune sidecar goroutine; no locking.
+	pruneBook pruneBookkeeper
+
 	mu  sync.Mutex
 	err error
 }
