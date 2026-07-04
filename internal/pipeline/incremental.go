@@ -432,6 +432,16 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 		// incrementals (their start-of-window hash should match the
 		// previous incremental's end-of-window hash).
 		manifest.SchemaHash = afterHash
+	} else {
+		// item 51: even a no-DDL window must carry the END-of-window
+		// standalone-sequence positions - positions advance with DML,
+		// so the delta gate above never re-stamps for them, and the
+		// chain-tail re-prime would otherwise read positions the
+		// window's own changes already consumed. Table shape (and the
+		// recorded SchemaHash) stay the before-schema contract:
+		// ComputeSchemaHash canonicalizes positions away, so the swap
+		// is hash-invisible.
+		manifest.Schema = schemaWithRefreshedSequences(manifest.Schema, afterSchema)
 	}
 
 	// 6. Compute BackupID and finalise.
@@ -1206,4 +1216,24 @@ func (b *IncrementalBackup) resolveChunkCEK(chainCEK []byte) (cek, wrapped []byt
 		return nil, nil, fmt.Errorf("wrap chunk cek: %w", err)
 	}
 	return cek, wrapped, nil
+}
+
+// schemaWithRefreshedSequences returns recorded with its standalone
+// sequences replaced by after's (item 51): the incremental / rollover
+// manifest keeps the before-schema TABLE shape (the SchemaHash
+// contract), while the sequence entries — whose positions advance
+// with ordinary DML, invisible to the SchemaDelta gate — carry the
+// end-of-window read the chain-tail re-prime consumes. Shallow copy;
+// neither input is mutated. Returns recorded unchanged when there is
+// nothing to swap.
+func schemaWithRefreshedSequences(recorded, after *ir.Schema) *ir.Schema {
+	if recorded == nil || after == nil {
+		return recorded
+	}
+	if len(recorded.Sequences) == 0 && len(after.Sequences) == 0 {
+		return recorded
+	}
+	cp := *recorded
+	cp.Sequences = after.Sequences
+	return &cp
 }

@@ -5,6 +5,7 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
 
@@ -17,12 +18,27 @@ import (
 // sequence doesn't exist yet — and their OWNED BY bindings are applied
 // AFTER tables, once the owning columns exist.
 
-// createSequences emits CREATE SEQUENCE + the setval position prime
-// for every standalone sequence in s. A sequence that already exists
-// on the target is skipped entirely — including the prime, so a
-// re-run (resume, add-table) can never rewind a sequence the target
-// has advanced since. Mirrors the idempotency posture of the enum
-// phase's guarded CREATE TYPE (Bug 154).
+// createSequences establishes every standalone sequence in s on the
+// target, in one of two modes per sequence:
+//
+//   - Missing on the target → CREATE SEQUENCE + the setval position
+//     prime in ONE transaction. Atomicity is load-bearing (delta
+//     review finding #1): as two autocommit statements, a crash
+//     between them left a created-but-unprimed sequence that a naive
+//     resume skipped entirely — post-cutover nextval() then re-issued
+//     numbers the copied rows already held, the exact silent class
+//     this feature exists to close. Sequence DDL is transactional in
+//     PG, so the pair commits or vanishes together.
+//   - Already exists on the target (resume re-run, operator
+//     pre-created, chain-restore tail) → FORWARD-ONLY RE-PRIME:
+//     setval to the captured source position when the target sits
+//     BEHIND it in the sequence's direction, and never otherwise.
+//     Rewind-safe by construction — an advanced target sequence is
+//     never regressed — while the crashed-before-prime window and the
+//     pre-created-unprimed shape both heal. Every exists-path outcome
+//     is logged at WARN naming the sequence and both positions: a
+//     pre-existing sequence on a migrate target is surprising enough
+//     that the operator should see what sluice decided about it.
 func (w *SchemaWriter) createSequences(ctx context.Context, s *ir.Schema) error {
 	for _, seq := range s.Sequences {
 		if seq == nil {
@@ -39,16 +55,108 @@ func (w *SchemaWriter) createSequences(ctx context.Context, s *ir.Schema) error 
 			return fmt.Errorf("postgres: probe sequence %q: %w", seq.Name, err)
 		}
 		if exists {
-			slog.Debug("postgres: sequence already exists on target; skipping create + position prime",
-				slog.String("sequence", seq.Name))
+			if err := w.reprimeExistingSequence(ctx, seq); err != nil {
+				return err
+			}
 			continue
 		}
-		if _, err := w.db.ExecContext(ctx, emitCreateSequence(w.schema, seq)); err != nil {
-			return fmt.Errorf("postgres: create sequence %q: %w", seq.Name, err)
-		}
-		if err := w.primeSequencePosition(ctx, seq); err != nil {
+		if err := w.createAndPrimeSequence(ctx, seq); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// ReprimeSequences forward-only re-primes (creating if missing) every
+// standalone sequence in s. Exported for the pipeline's chain-restore
+// tail (delta review finding #2): the chain's base full primes
+// sequences at the BASE manifest's captured position, then incremental
+// links apply rows that consumed later values — without a tail
+// re-prime from the newest link's schema, the restored sequence
+// silently re-issues every number the links consumed. Forward-only
+// semantics make the call safe at any point: it can only advance a
+// lagging sequence, never rewind one.
+func (w *SchemaWriter) ReprimeSequences(ctx context.Context, s *ir.Schema) error {
+	if s == nil {
+		return nil
+	}
+	return w.createSequences(ctx, s)
+}
+
+// createAndPrimeSequence runs CREATE SEQUENCE + the position prime in
+// a single transaction (see createSequences for why atomicity is
+// load-bearing). Fixtures without a captured position
+// (LastValueValid=false, the zero value) create unprimed and start
+// fresh at Start.
+func (w *SchemaWriter) createAndPrimeSequence(ctx context.Context, seq *ir.Sequence) error {
+	tx, err := w.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("postgres: begin create-sequence tx for %q: %w", seq.Name, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, emitCreateSequence(w.schema, seq)); err != nil {
+		return fmt.Errorf("postgres: create sequence %q: %w", seq.Name, err)
+	}
+	if seq.LastValueValid {
+		if err := w.setvalSequence(ctx, tx, seq, seq.LastValue, seq.LastValueIsCalled); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("postgres: commit create-sequence tx for %q: %w", seq.Name, err)
+	}
+	return nil
+}
+
+// reprimeExistingSequence is the exists-path half of createSequences:
+// forward-only setval when the target sits behind the captured source
+// position, WARN-logged either way.
+func (w *SchemaWriter) reprimeExistingSequence(ctx context.Context, seq *ir.Sequence) error {
+	if !seq.LastValueValid {
+		slog.Warn("postgres: sequence already exists on target and the IR carries no captured position; leaving it untouched",
+			slog.String("sequence", seq.Name))
+		return nil
+	}
+	targetLV, targetCalled, err := readSequencePositionOn(ctx, w.db, w.schema, seq.Name)
+	if err != nil {
+		return fmt.Errorf("postgres: read position of existing target sequence %q: %w", seq.Name, err)
+	}
+	if !sequencePositionBehind(seq.Increment, targetLV, targetCalled, seq.LastValue, seq.LastValueIsCalled) {
+		slog.Warn("postgres: sequence already exists on target at or beyond the captured source position; skipping re-prime (forward-only)",
+			slog.String("sequence", seq.Name),
+			slog.Int64("target_last_value", targetLV),
+			slog.Bool("target_is_called", targetCalled),
+			slog.Int64("source_last_value", seq.LastValue),
+			slog.Bool("source_is_called", seq.LastValueIsCalled))
+		return nil
+	}
+	if err := w.setvalSequence(ctx, w.db, seq, seq.LastValue, seq.LastValueIsCalled); err != nil {
+		return err
+	}
+	slog.Warn("postgres: sequence already existed on target BEHIND the captured source position; re-primed forward",
+		slog.String("sequence", seq.Name),
+		slog.Int64("target_last_value_before", targetLV),
+		slog.Bool("target_is_called_before", targetCalled),
+		slog.Int64("primed_last_value", seq.LastValue),
+		slog.Bool("primed_is_called", seq.LastValueIsCalled))
+	return nil
+}
+
+// sqlExecer is the ExecContext subset shared by *sql.DB and *sql.Tx,
+// so the setval prime can run inside the create transaction or as a
+// standalone forward-only re-prime.
+type sqlExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// setvalSequence applies setval(seq, lastValue, isCalled) on execer.
+func (w *SchemaWriter) setvalSequence(ctx context.Context, execer sqlExecer, seq *ir.Sequence, lastValue int64, isCalled bool) error {
+	regclass := quoteSQLString(quoteIdent(w.schema) + "." + quoteIdent(seq.Name))
+	q := fmt.Sprintf("SELECT setval(%s, $1, $2)", regclass)
+	if _, err := execer.ExecContext(ctx, q, lastValue, isCalled); err != nil {
+		return fmt.Errorf("postgres: prime sequence %q to %d (is_called=%t): %w",
+			seq.Name, lastValue, isCalled, err)
 	}
 	return nil
 }
@@ -70,25 +178,6 @@ func (w *SchemaWriter) bindSequenceOwners(ctx context.Context, s *ir.Schema) err
 	return nil
 }
 
-// primeSequencePosition replays the source's captured position onto
-// the just-created sequence so post-migration nextval() continues
-// exactly where the source would — without it, the target restarts at
-// Start and re-issues numbers the copied rows already consumed.
-// Fixtures without a captured position (LastValueValid=false, the
-// zero value) skip the prime and the sequence starts fresh at Start.
-func (w *SchemaWriter) primeSequencePosition(ctx context.Context, seq *ir.Sequence) error {
-	if !seq.LastValueValid {
-		return nil
-	}
-	regclass := quoteSQLString(quoteIdent(w.schema) + "." + quoteIdent(seq.Name))
-	q := fmt.Sprintf("SELECT setval(%s, $1, $2)", regclass)
-	if _, err := w.db.ExecContext(ctx, q, seq.LastValue, seq.LastValueIsCalled); err != nil {
-		return fmt.Errorf("postgres: prime sequence %q to %d (is_called=%t): %w",
-			seq.Name, seq.LastValue, seq.LastValueIsCalled, err)
-	}
-	return nil
-}
-
 // sequenceExists probes pg_class for a relkind='S' relation with the
 // given name in the writer's schema.
 func (w *SchemaWriter) sequenceExists(ctx context.Context, name string) (bool, error) {
@@ -106,6 +195,36 @@ func (w *SchemaWriter) sequenceExists(ctx context.Context, name string) (bool, e
 		return false, err
 	}
 	return exists, nil
+}
+
+// readSequencePositionOn reads a sequence's live position — last_value
+// + is_called, selected from the sequence relation itself (the
+// pg_sequences view hides is_called). Shared by the schema reader's
+// capture, the writer's forward-only re-prime, and the cutover
+// standalone-sequence prime.
+func readSequencePositionOn(ctx context.Context, db *sql.DB, schema, name string) (lastValue int64, isCalled bool, err error) {
+	q := fmt.Sprintf(`SELECT last_value, is_called FROM %s.%s`,
+		quoteIdent(schema), quoteIdent(name))
+	if err := db.QueryRowContext(ctx, q).Scan(&lastValue, &isCalled); err != nil {
+		return 0, false, err
+	}
+	return lastValue, isCalled, nil
+}
+
+// sequencePositionBehind reports whether position (aLV, aCalled) is
+// STRICTLY behind (bLV, bCalled) in the direction the sequence moves
+// (increment sign). Within the same last_value, (v, is_called=false)
+// — "v not yet issued" — is behind (v, is_called=true). This is the
+// forward-only comparison every re-prime path gates on: a true result
+// means setval to b cannot rewind a.
+func sequencePositionBehind(increment, aLV int64, aCalled bool, bLV int64, bCalled bool) bool {
+	if aLV != bLV {
+		if increment < 0 {
+			return aLV > bLV
+		}
+		return aLV < bLV
+	}
+	return !aCalled && bCalled
 }
 
 // emitCreateSequence renders the CREATE SEQUENCE statement for seq

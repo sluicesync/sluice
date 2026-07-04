@@ -52,6 +52,12 @@ func InjectShardColumn(s *ir.Schema, name string, valueType ir.Type) (*ir.Schema
 	out := &ir.Schema{
 		Tables: make([]*ir.Table, len(s.Tables)),
 		Views:  s.Views,
+		// Sequences pass through untouched (item-51 delta finding #4):
+		// this pass runs BEFORE checkCrossEngineSupportable on the
+		// consolidation path, so dropping them here would strip a PG
+		// source's standalone sequences before the cross-engine
+		// refusal could ever see them.
+		Sequences: s.Sequences,
 	}
 	for i, tbl := range s.Tables {
 		if tbl == nil {

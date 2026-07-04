@@ -234,3 +234,38 @@ func TestBackup_ManifestRoundTrip_StandaloneSequences(t *testing.T) {
 		t.Errorf("manifest Schema.Sequences did not round-trip:\n got  %+v\n want %+v", m.Schema.Sequences, want)
 	}
 }
+
+// TestSchemaWithRefreshedSequences pins the incremental/rollover
+// end-of-window sequence-position swap (item 51): table shape stays
+// the recorded schema's, Sequences come from the fresh end read,
+// neither input is mutated, and the degenerate shapes pass through.
+func TestSchemaWithRefreshedSequences(t *testing.T) {
+	recorded := &ir.Schema{
+		Tables:    []*ir.Table{{Name: "orders"}},
+		Sequences: []*ir.Sequence{{Name: "s", LastValue: 1005, LastValueValid: true}},
+	}
+	after := &ir.Schema{
+		Tables:    []*ir.Table{{Name: "orders"}, {Name: "added_midwindow"}},
+		Sequences: []*ir.Sequence{{Name: "s", LastValue: 1015, LastValueIsCalled: true, LastValueValid: true}},
+	}
+	got := schemaWithRefreshedSequences(recorded, after)
+	if len(got.Tables) != 1 || got.Tables[0].Name != "orders" {
+		t.Errorf("table shape must stay the recorded schema's: %+v", got.Tables)
+	}
+	if len(got.Sequences) != 1 || got.Sequences[0].LastValue != 1015 {
+		t.Errorf("sequences must come from the end-of-window read: %+v", got.Sequences)
+	}
+	if recorded.Sequences[0].LastValue != 1005 {
+		t.Error("recorded schema was mutated")
+	}
+	if s := schemaWithRefreshedSequences(nil, after); s != nil {
+		t.Errorf("nil recorded → nil; got %+v", s)
+	}
+	if s := schemaWithRefreshedSequences(recorded, nil); s != recorded {
+		t.Errorf("nil after → recorded unchanged; got %+v", s)
+	}
+	empty := &ir.Schema{Tables: []*ir.Table{{Name: "t"}}}
+	if s := schemaWithRefreshedSequences(empty, &ir.Schema{}); s != empty {
+		t.Error("no sequences on either side → recorded returned verbatim")
+	}
+}

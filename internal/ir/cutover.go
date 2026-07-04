@@ -40,10 +40,30 @@ const CutoverSequenceMarginDefault int64 = 1000
 //
 // The orchestrator builds the slice once per cutover invocation; the
 // target engine's [SequencePrimer.PrimeSequences] consumes it.
+//
+// Standalone sequences (item 51): entries for [Schema.Sequences]
+// carry the sequence name in Sequence with Table/Column empty, Value
+// holding the RAW last_value (not the identity canonicalisation —
+// descending sequences make the 0-sentinel ambiguous), and IsCalled
+// distinguishing "Value was issued" from "sequence never called".
+// Identity / AUTO_INCREMENT entries leave Sequence empty and IsCalled
+// false, preserving the historical wire shape.
 type SequenceState struct {
 	Table  string
 	Column string
 	Value  int64
+
+	// Sequence is the standalone sequence's name — set ONLY for
+	// [Schema.Sequences] entries (Table/Column empty then). PG-only
+	// today; MySQL sources never produce these.
+	Sequence string
+
+	// IsCalled mirrors the PG sequence's is_called for standalone
+	// entries: true when Value has actually been issued, false when
+	// the sequence has never produced a value (Value then holds the
+	// start position). Always false for identity entries (their
+	// never-issued signal is the historical Value==0 sentinel).
+	IsCalled bool
 }
 
 // SequencePrimeAction is the per-table outcome of a cutover sequence
@@ -56,6 +76,12 @@ type SequencePrimeAction struct {
 
 	// Column is the identity / AUTO_INCREMENT column on the target.
 	Column string
+
+	// Sequence is the standalone sequence the action describes (item
+	// 51) — set ONLY for [Schema.Sequences] entries, with Table /
+	// Column empty. The CLI renders these as `sequence <name>` instead
+	// of `table.column`.
+	Sequence string
 
 	// SourceValue is the source's last-issued sequence value (after
 	// the engine's canonicalisation; see [SequenceState.Value]).

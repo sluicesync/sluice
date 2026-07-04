@@ -290,11 +290,77 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 		}
 	}
 
+	// 4. Chain-tail standalone-sequence re-prime (item 51, delta
+	//    review finding #2). The base full primed each standalone
+	//    sequence at the BASE manifest's captured position; the
+	//    incremental links then applied rows that consumed LATER
+	//    values, so without this pass the restored sequence silently
+	//    re-issues every number the links consumed. Forward-only by
+	//    construction (the engine primitive only advances a lagging
+	//    sequence), sourced from the NEWEST link that carries a
+	//    schema snapshot.
+	if err := r.reprimeStandaloneSequences(ctx, links); err != nil {
+		return wrapWithHint(PhaseSchemaApply, fmt.Errorf("chain restore: re-prime standalone sequences: %w", err))
+	}
+
 	slog.InfoContext(
 		ctx, "chain restore complete",
 		slog.Int("manifests_applied", len(links)),
 		slog.Int("incrementals", incrementalCount),
 	)
+	return nil
+}
+
+// sequenceReprimer is the optional engine surface the chain-restore
+// tail uses to forward-only re-prime standalone sequences (item 51).
+// Implemented by the postgres SchemaWriter; declared here (like
+// [RawDefaultReader]) so the orchestrator stays engine-neutral.
+type sequenceReprimer interface {
+	ReprimeSequences(ctx context.Context, s *ir.Schema) error
+}
+
+// reprimeStandaloneSequences advances the target's standalone
+// sequences to the NEWEST captured position in the chain. The newest
+// link carrying a schema snapshot wins (incremental manifests carry
+// the schema read at their window START, so the residual exposure is
+// only the final link's own capture window — documented in
+// docs/type-mapping.md "Sequences and serial columns"). No-op when no
+// link carries standalone sequences.
+//
+// A target engine without the re-prime surface is a loud error here,
+// not a skip: reaching this point with sequences means the earlier
+// cross-engine refusals were bypassed, and silently leaving a stale
+// position is the exact class finding #2 closed.
+func (r *ChainRestore) reprimeStandaloneSequences(ctx context.Context, links []segmentRecord) error {
+	var schema *ir.Schema
+	for i := len(links) - 1; i >= 0; i-- {
+		if s := links[i].manifest.Schema; s != nil {
+			schema = s
+			break
+		}
+	}
+	if schema == nil || len(schema.Sequences) == 0 {
+		return nil
+	}
+	sw, err := r.Target.OpenSchemaWriter(ctx, r.TargetDSN)
+	if err != nil {
+		return fmt.Errorf("open target schema writer: %w", err)
+	}
+	defer closeIf(sw)
+	applyTargetSchema(sw, r.TargetSchema)
+	reprimer, ok := sw.(sequenceReprimer)
+	if !ok {
+		return fmt.Errorf(
+			"target engine %q cannot re-prime standalone sequence %q (no sequence surface) — "+
+				"the restored sequence position would silently lag the applied rows",
+			r.Target.Name(), schema.Sequences[0].Name,
+		)
+	}
+	if err := reprimer.ReprimeSequences(ctx, schema); err != nil {
+		return err
+	}
+	slog.InfoContext(ctx, "chain restore: standalone sequences re-primed from newest link schema",
+		slog.Int("sequences", len(schema.Sequences)))
 	return nil
 }
 

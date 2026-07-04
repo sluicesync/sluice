@@ -153,37 +153,50 @@ func renderCutoverReport(report *ir.SequencePrimeReport, format string) {
 		return
 	}
 	if len(report.Actions) == 0 {
-		fmt.Println("cutover: no identity / AUTO_INCREMENT columns in the source schema (nothing to prime)")
+		fmt.Println("cutover: no identity / AUTO_INCREMENT columns or standalone sequences in the source schema (nothing to prime)")
 		return
 	}
 	var primed, noop, skipped, refused int
 	for _, a := range report.Actions {
+		subject := cutoverActionSubject(a)
 		switch a.Outcome {
 		case "primed":
 			primed++
-			fmt.Printf("primed:   %s.%s — source=%d, target=%d -> %d\n",
-				a.Table, a.Column, a.SourceValue, a.TargetBefore, a.TargetAfter)
+			fmt.Printf("primed:   %s — source=%d, target=%d -> %d\n",
+				subject, a.SourceValue, a.TargetBefore, a.TargetAfter)
 		case "noop":
 			noop++
-			fmt.Printf("noop:     %s.%s — target=%d already at or above apply point (source=%d)\n",
-				a.Table, a.Column, a.TargetBefore, a.SourceValue)
+			fmt.Printf("noop:     %s — target=%d already at or above apply point (source=%d)\n",
+				subject, a.TargetBefore, a.SourceValue)
 		case "skipped":
 			skipped++
-			fmt.Printf("skipped:  %s.%s — %s\n", a.Table, a.Column, a.Reason)
+			fmt.Printf("skipped:  %s — %s\n", subject, a.Reason)
 		case "refused":
 			refused++
-			fmt.Printf("REFUSED:  %s.%s — %s\n", a.Table, a.Column, a.Reason)
+			fmt.Printf("REFUSED:  %s — %s\n", subject, a.Reason)
 		default:
-			fmt.Printf("unknown:  %s.%s — outcome=%q\n", a.Table, a.Column, a.Outcome)
+			fmt.Printf("unknown:  %s — outcome=%q\n", subject, a.Outcome)
 		}
 	}
 	fmt.Printf("\ncutover: %d primed, %d noop, %d skipped, %d refused\n",
 		primed, noop, skipped, refused)
 }
 
+// cutoverActionSubject renders the object an action describes:
+// `table.column` for identity / AUTO_INCREMENT entries, `sequence
+// <name>` for standalone-sequence entries (item 51).
+func cutoverActionSubject(a ir.SequencePrimeAction) string {
+	if a.Sequence != "" {
+		return "sequence " + a.Sequence
+	}
+	return a.Table + "." + a.Column
+}
+
 // renderCutoverReportJSON emits a stable JSON shape. Field names use
 // snake_case to match sluice's other JSON-mode outputs (sync-health,
-// schema preview, matview refresh).
+// schema preview, matview refresh). The `sequence` field is the
+// item-51 append-only extension: empty for identity entries,
+// populated (with table/column empty) for standalone sequences.
 func renderCutoverReportJSON(report *ir.SequencePrimeReport) {
 	var sb strings.Builder
 	sb.WriteString(`{"actions":[`)
@@ -192,8 +205,8 @@ func renderCutoverReportJSON(report *ir.SequencePrimeReport) {
 			sb.WriteByte(',')
 		}
 		fmt.Fprintf(&sb,
-			`{"table":%q,"column":%q,"source_value":%d,"target_before":%d,"target_after":%d,"outcome":%q,"reason":%q}`,
-			a.Table, a.Column, a.SourceValue, a.TargetBefore, a.TargetAfter, a.Outcome, a.Reason)
+			`{"table":%q,"column":%q,"sequence":%q,"source_value":%d,"target_before":%d,"target_after":%d,"outcome":%q,"reason":%q}`,
+			a.Table, a.Column, a.Sequence, a.SourceValue, a.TargetBefore, a.TargetAfter, a.Outcome, a.Reason)
 	}
 	sb.WriteString(`]}`)
 	fmt.Println(sb.String())

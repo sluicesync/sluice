@@ -80,6 +80,30 @@ func (r *SchemaReader) ReadSequenceState(ctx context.Context, schema *ir.Schema)
 			out = append(out, state)
 		}
 	}
+
+	// Standalone sequences (item 51, delta review finding #3): under
+	// continuous sync the source's standalone sequences keep advancing
+	// after the migrate-time position carry, so cutover re-reads their
+	// LIVE position here (raw last_value + is_called — the identity
+	// 0-sentinel canonicalisation is ambiguous for descending
+	// sequences) and the target primer applies the same margin
+	// discipline the identity walk gets. Keyed by sequence name;
+	// Table/Column stay empty.
+	for _, seq := range schema.Sequences {
+		if seq == nil || seq.Name == "" {
+			continue
+		}
+		lastValue, isCalled, err := readSequencePositionOn(ctx, r.db, effSchema, seq.Name)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: read standalone sequence state for %q.%q: %w",
+				effSchema, seq.Name, err)
+		}
+		out = append(out, ir.SequenceState{
+			Sequence: seq.Name,
+			Value:    lastValue,
+			IsCalled: isCalled,
+		})
+	}
 	return out, nil
 }
 
@@ -287,10 +311,142 @@ func (w *SchemaWriter) PrimeSequences(ctx context.Context, schema *ir.Schema, so
 		}
 	}
 
+	// Standalone sequences (item 51, delta review finding #3): the
+	// identity walk above never sees them (their columns carry a
+	// verbatim nextval default, not AutoIncrement — and app-driven
+	// sequences have no column at all), so they get their own
+	// margin-disciplined, direction-aware prime keyed by sequence
+	// name. This also covers the re-optioned serial the item-51
+	// reclassification moved OFF the AutoIncrement path.
+	stateBySeq := make(map[string]ir.SequenceState, len(sourceStates))
+	for _, s := range sourceStates {
+		if s.Sequence != "" {
+			stateBySeq[s.Sequence] = s
+		}
+	}
+	for _, seq := range schema.Sequences {
+		if seq == nil || seq.Name == "" {
+			continue
+		}
+		src, hasSource := stateBySeq[seq.Name]
+		action, err := w.primeOneStandaloneSequence(ctx, seq, src, hasSource, margin)
+		if err != nil {
+			return report, fmt.Errorf("postgres: prime standalone sequence %q.%q: %w",
+				w.schema, seq.Name, err)
+		}
+		report.Actions = append(report.Actions, action)
+	}
+
 	if report.HasRefusals() {
 		return report, ir.ErrCutoverSequenceTargetAhead
 	}
 	return report, nil
+}
+
+// primeOneStandaloneSequence is the [Schema.Sequences] counterpart of
+// primeOneSequence — the same source+margin decision tree, made
+// direction-aware (descending sequences advance downward) and applied
+// to the sequence's own position rather than a column's owning
+// sequence. Positions compare on the "last issued" scale: a
+// never-called sequence sits one increment BEFORE its start value, so
+// a fresh prime lands at start-inc+margin and the very next nextval
+// clears the margin headroom — the same advance-ahead-of-source
+// contract the identity walk applies (margin is in VALUE units, so an
+// INCREMENT-BY-N sequence's margin spans margin/N calls).
+//
+// CYCLE sequences are skipped with a named reason: "ahead/behind" is
+// ill-defined once a sequence wraps, and a margin push near the bound
+// would either wrap (silently reordering) or error. The skip is loud
+// in the report; operators verify cycling sequences manually.
+func (w *SchemaWriter) primeOneStandaloneSequence(
+	ctx context.Context,
+	seq *ir.Sequence,
+	src ir.SequenceState,
+	hasSource bool,
+	margin int64,
+) (ir.SequencePrimeAction, error) {
+	action := ir.SequencePrimeAction{
+		Sequence:     seq.Name,
+		TargetBefore: -1,
+	}
+	if !hasSource {
+		action.Outcome = "skipped"
+		action.Reason = "source reported no state for this standalone sequence — dropped on the source since the schema read?"
+		return action, nil
+	}
+	if seq.Cycle {
+		action.Outcome = "skipped"
+		action.Reason = "CYCLE sequence — ahead/behind is ill-defined once a sequence wraps; verify its position manually after cutover"
+		return action, nil
+	}
+	dir := int64(1)
+	if seq.Increment < 0 {
+		dir = -1
+	}
+	// Canonicalise the source position to "last issued": a
+	// never-called sequence has issued nothing, i.e. it sits one
+	// increment before its start value.
+	srcLast := src.Value
+	if !src.IsCalled {
+		srcLast = src.Value - seq.Increment
+	}
+	action.SourceValue = srcLast
+
+	// Read the target's live position directly (is_called included —
+	// pg_sequences hides it). A missing target sequence is a refusal
+	// class, not a skip: the migrate leg creates it, so absence means
+	// the target predates the item-51 carry or was hand-pruned.
+	targetLV, targetCalled, err := readSequencePositionOn(ctx, w.db, w.schema, seq.Name)
+	if err != nil {
+		return action, fmt.Errorf("read target position (does the target carry the sequence? it is created by migrate/restore since v0.99.175): %w", err)
+	}
+	targetLast := targetLV
+	if !targetCalled {
+		targetLast = targetLV - seq.Increment
+	}
+	action.TargetBefore = targetLast
+
+	applyValue := srcLast + dir*margin
+	// Clamp into the sequence's declared bounds — setval outside
+	// [MinValue, MaxValue] errors. At the clamped bound the target
+	// behaves exactly as the source would at exhaustion (nextval
+	// errors loudly), which is the faithful shape.
+	if dir > 0 && applyValue > seq.MaxValue {
+		applyValue = seq.MaxValue
+	}
+	if dir < 0 && applyValue < seq.MinValue {
+		applyValue = seq.MinValue
+	}
+
+	ahead := func(a, b int64) bool {
+		if dir < 0 {
+			return a < b
+		}
+		return a > b
+	}
+
+	// Refusal: target is beyond source+margin by more than the
+	// idempotency tolerance — post-cutover writes already advanced it.
+	if ahead(targetLast, applyValue+dir*margin) {
+		action.Outcome = "refused"
+		action.Reason = fmt.Sprintf("target position %d is ahead of source+margin (%d%+d=%d) by more than the idempotency tolerance; manual re-snapshot recommended",
+			targetLast, srcLast, dir*margin, applyValue)
+		action.TargetAfter = targetLast
+		return action, nil
+	}
+	// No-op: target already at or beyond the apply point (idempotent
+	// re-run lands here).
+	if !ahead(applyValue, targetLast) {
+		action.Outcome = "noop"
+		action.TargetAfter = targetLast
+		return action, nil
+	}
+	if err := w.setvalSequence(ctx, w.db, seq, applyValue, true); err != nil {
+		return action, err
+	}
+	action.Outcome = "primed"
+	action.TargetAfter = applyValue
+	return action, nil
 }
 
 // primeOneSequence executes the per-column decision tree.

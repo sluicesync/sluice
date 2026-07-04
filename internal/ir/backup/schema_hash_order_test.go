@@ -106,3 +106,41 @@ func TestComputeSchemaHash_OrderInsensitiveCollections(t *testing.T) {
 		t.Error("index property change did NOT change the hash")
 	}
 }
+
+// TestComputeSchemaHash_SequencePositionInsensitive pins the item-51
+// fingerprint contract: a standalone sequence's POSITION (last_value /
+// is_called — which advance with ordinary DML) never changes the
+// schema hash, while its SHAPE (options) does. This is what lets an
+// incremental manifest carry end-of-window positions without breaking
+// the recorded before-schema hash chain.
+func TestComputeSchemaHash_SequencePositionInsensitive(t *testing.T) {
+	base := func(lastValue int64, called, valid bool, increment int64) *ir.Schema {
+		return &ir.Schema{
+			Tables: []*ir.Table{{Name: "orders"}},
+			Sequences: []*ir.Sequence{{
+				Schema: "public", Name: "order_number_seq",
+				DataType: "bigint", Start: 1000, Increment: increment,
+				MinValue: 1, MaxValue: 9223372036854775807, Cache: 1,
+				LastValue: lastValue, LastValueIsCalled: called, LastValueValid: valid,
+			}},
+		}
+	}
+	h1, err := ComputeSchemaHash(base(1005, true, true, 5))
+	if err != nil {
+		t.Fatalf("hash 1: %v", err)
+	}
+	h2, err := ComputeSchemaHash(base(9000, false, false, 5))
+	if err != nil {
+		t.Fatalf("hash 2: %v", err)
+	}
+	if h1 != h2 {
+		t.Errorf("hash changed with sequence POSITION only: %s vs %s", h1, h2)
+	}
+	h3, err := ComputeSchemaHash(base(1005, true, true, 7))
+	if err != nil {
+		t.Fatalf("hash 3: %v", err)
+	}
+	if h1 == h3 {
+		t.Error("hash did NOT change when the sequence's INCREMENT (shape) changed")
+	}
+}

@@ -169,3 +169,35 @@ func TestEmitAlterSequenceOwnedBy(t *testing.T) {
 		t.Errorf("emitAlterSequenceOwnedBy = %s; want %s", got, want)
 	}
 }
+
+// TestSequencePositionBehind pins the forward-only comparison every
+// re-prime path gates on (delta review finding #1), across both
+// directions and the is_called tie-break: a true result must mean
+// "setval to b cannot rewind a".
+func TestSequencePositionBehind(t *testing.T) {
+	cases := []struct {
+		name      string
+		increment int64
+		aLV       int64
+		aCalled   bool
+		bLV       int64
+		bCalled   bool
+		want      bool
+	}{
+		{"ascending: target below source", 5, 1000, false, 1005, true, true},
+		{"ascending: target equal, source issued it", 5, 1005, false, 1005, true, true},
+		{"ascending: equal positions", 5, 1005, true, 1005, true, false},
+		{"ascending: target ahead", 5, 1010, true, 1005, true, false},
+		{"ascending: target ahead but uncalled", 5, 1010, false, 1005, true, false},
+		{"descending: target above source (behind)", -3, -10, false, -13, true, true},
+		{"descending: target equal, source issued it", -3, -13, false, -13, true, true},
+		{"descending: target further down (ahead)", -3, -16, true, -13, true, false},
+		{"never-called source never pulls a called target back", 5, 1000, true, 1000, false, false},
+	}
+	for _, c := range cases {
+		if got := sequencePositionBehind(c.increment, c.aLV, c.aCalled, c.bLV, c.bCalled); got != c.want {
+			t.Errorf("%s: sequencePositionBehind(%d, %d/%v, %d/%v) = %v; want %v",
+				c.name, c.increment, c.aLV, c.aCalled, c.bLV, c.bCalled, got, c.want)
+		}
+	}
+}

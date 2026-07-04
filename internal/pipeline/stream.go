@@ -1125,6 +1125,10 @@ func (b *BackupStream) refreshSchemaAndAttachDelta(
 	}
 	delta := diffSchemas(beforeSchema, afterSchema)
 	if len(delta) == 0 {
+		// item 51: no-DDL rollovers still refresh the standalone-
+		// sequence positions (hash-invisible — see the incremental
+		// path's twin swap and schemaWithRefreshedSequences).
+		manifest.Schema = schemaWithRefreshedSequences(manifest.Schema, afterSchema)
 		return nil
 	}
 	manifest.SchemaDelta = delta

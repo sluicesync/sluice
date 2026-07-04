@@ -26,6 +26,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -264,5 +265,123 @@ func TestCutoverSequencePrimer_PG_SkipsCompositePK(t *testing.T) {
 	// action list is empty.
 	if len(report.Actions) != 0 {
 		t.Errorf("actions = %+v; want empty (composite PK has no sequence)", report.Actions)
+	}
+}
+
+// TestCutoverSequencePrimer_PG_StandaloneSequences pins the item-51
+// delta-review finding-#3 extension: cutover re-reads the LIVE source
+// position of every standalone sequence (the migrate-time carry goes
+// stale under continuous sync) and forward-only primes the target
+// with the same margin discipline the identity walk applies. Matrix:
+// ascending consumed (primed, then idempotent noop) and a CYCLE
+// sequence (named skip — ahead/behind is ill-defined once it wraps).
+func TestCutoverSequencePrimer_PG_StandaloneSequences(t *testing.T) {
+	srcDSN, srcCleanup := newSharedPGDB(t, "sluice_cutover_standalone_src")
+	defer srcCleanup()
+	tgtDSN, tgtCleanup := newSharedPGDB(t, "sluice_cutover_standalone_tgt")
+	defer tgtCleanup()
+
+	// Source: standalone sequence advanced to 1010 (three draws) plus
+	// a CYCLE sequence. No tables — app-driven sequences are exactly
+	// the shape the identity walk can never see.
+	applyDDL(t, srcDSN, `
+		CREATE SEQUENCE order_number_seq START WITH 1000 INCREMENT BY 5;
+		SELECT nextval('order_number_seq');
+		SELECT nextval('order_number_seq');
+		SELECT nextval('order_number_seq');
+		CREATE SEQUENCE cyc_seq AS integer MINVALUE 1 MAXVALUE 50 CYCLE;
+	`)
+	// Target: as the migrate leg left it — created at the position the
+	// initial carry captured (here: fresh), since when the source kept
+	// advancing under sync.
+	applyDDL(t, tgtDSN, `
+		CREATE SEQUENCE order_number_seq START WITH 1000 INCREMENT BY 5;
+		CREATE SEQUENCE cyc_seq AS integer MINVALUE 1 MAXVALUE 50 CYCLE;
+	`)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	sr, err := Engine{}.OpenSchemaReader(ctx, srcDSN)
+	if err != nil {
+		t.Fatalf("open source reader: %v", err)
+	}
+	defer closeReader(t, sr)
+	pgsr := sr.(*SchemaReader)
+	schema, err := pgsr.ReadSchema(ctx)
+	if err != nil {
+		t.Fatalf("read schema: %v", err)
+	}
+	if len(schema.Sequences) != 2 {
+		t.Fatalf("schema.Sequences = %+v; want order_number_seq + cyc_seq", schema.Sequences)
+	}
+	states, err := pgsr.ReadSequenceState(ctx, schema)
+	if err != nil {
+		t.Fatalf("read sequence state: %v", err)
+	}
+	bySeq := map[string]ir.SequenceState{}
+	for _, s := range states {
+		if s.Sequence != "" {
+			bySeq[s.Sequence] = s
+		}
+	}
+	if s := bySeq["order_number_seq"]; s.Value != 1010 || !s.IsCalled {
+		t.Errorf("order_number_seq state = %+v; want Value=1010 IsCalled=true", s)
+	}
+
+	sw, err := Engine{}.OpenSchemaWriter(ctx, tgtDSN)
+	if err != nil {
+		t.Fatalf("open target writer: %v", err)
+	}
+	pgsw := sw.(*SchemaWriter)
+
+	margin := int64(1000)
+	report, err := pgsw.PrimeSequences(ctx, schema, states, margin)
+	if err != nil {
+		t.Fatalf("first prime err = %v", err)
+	}
+	byName := map[string]ir.SequencePrimeAction{}
+	for _, a := range report.Actions {
+		if a.Sequence != "" {
+			byName[a.Sequence] = a
+		}
+	}
+	prime := byName["order_number_seq"]
+	if prime.Outcome != "primed" {
+		t.Errorf("order_number_seq outcome = %q; want primed (action %+v)", prime.Outcome, prime)
+	}
+	wantApply := int64(1010 + margin) // last issued 1010 + value-unit margin
+	if prime.TargetAfter != wantApply {
+		t.Errorf("order_number_seq TargetAfter = %d; want %d", prime.TargetAfter, wantApply)
+	}
+	cyc := byName["cyc_seq"]
+	if cyc.Outcome != "skipped" || !strings.Contains(cyc.Reason, "CYCLE") {
+		t.Errorf("cyc_seq action = %+v; want a named CYCLE skip", cyc)
+	}
+
+	// Value-level ground truth on the target.
+	verifyDB, err := sql.Open("pgx", tgtDSN)
+	if err != nil {
+		t.Fatalf("open verify db: %v", err)
+	}
+	defer func() { _ = verifyDB.Close() }()
+	var nextVal int64
+	if err := verifyDB.QueryRowContext(ctx, "SELECT nextval('order_number_seq')").Scan(&nextVal); err != nil {
+		t.Fatalf("nextval after prime: %v", err)
+	}
+	if nextVal != wantApply+5 {
+		t.Errorf("nextval after prime = %d; want %d (apply point + INCREMENT 5)", nextVal, wantApply+5)
+	}
+
+	// Idempotent re-run: source unchanged, target now at apply+5 →
+	// the standalone entry reports noop and never rewinds.
+	report2, err := pgsw.PrimeSequences(ctx, schema, states, margin)
+	if err != nil {
+		t.Fatalf("second prime err = %v", err)
+	}
+	for _, a := range report2.Actions {
+		if a.Sequence == "order_number_seq" && a.Outcome != "noop" {
+			t.Errorf("second prime outcome = %q; want noop (forward-only idempotency)", a.Outcome)
+		}
 	}
 }

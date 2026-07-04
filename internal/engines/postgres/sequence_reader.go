@@ -274,17 +274,13 @@ func sequenceTypeMax(dataType string) int64 {
 	return 0
 }
 
-// readSequencePosition captures the sequence's current position
-// (`last_value` + `is_called`, selected from the sequence relation
-// itself — the pg_sequences view hides is_called) so the writer can
-// prime the target via setval and post-migration nextval() continues
-// exactly where the source would.
+// readSequencePosition captures the sequence's current position (via
+// [readSequencePositionOn]) so the writer can prime the target via
+// setval and post-migration nextval() continues exactly where the
+// source would.
 func (r *SchemaReader) readSequencePosition(ctx context.Context, seq *ir.Sequence) error {
-	q := fmt.Sprintf(`SELECT last_value, is_called FROM %s.%s`,
-		quoteIdent(r.schema), quoteIdent(seq.Name))
-	var lastValue int64
-	var isCalled bool
-	if err := r.db.QueryRowContext(ctx, q).Scan(&lastValue, &isCalled); err != nil {
+	lastValue, isCalled, err := readSequencePositionOn(ctx, r.db, r.schema, seq.Name)
+	if err != nil {
 		return fmt.Errorf("read position of sequence %q: %w", seq.Name, err)
 	}
 	seq.LastValue = lastValue

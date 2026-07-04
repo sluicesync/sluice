@@ -171,6 +171,20 @@ func (w *SchemaWriter) PrimeSequences(ctx context.Context, schema *ir.Schema, so
 	if schema == nil {
 		return nil, errors.New("mysql: PrimeSequences: schema is nil")
 	}
+	// item-51: standalone PG sequences have no MySQL counterpart to
+	// prime. The migrate/restore refusal in
+	// pipeline.checkCrossEngineSupportable normally stops such a pair
+	// long before cutover; this backstop keeps the cutover surface
+	// loud too rather than silently ignoring the sequence-keyed
+	// source states.
+	if len(schema.Sequences) > 0 {
+		return nil, fmt.Errorf(
+			"mysql: PrimeSequences: schema carries standalone sequence %q (PG-only — "+
+				"MySQL has no sequence objects to prime); migrate to a PG target or drop "+
+				"the sequence on the source",
+			schema.Sequences[0].Name,
+		)
+	}
 	if margin <= 0 {
 		margin = ir.CutoverSequenceMarginDefault
 	}

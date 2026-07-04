@@ -213,3 +213,32 @@ func TestInjectShardColumn_MixedFailureSurfacesFirst(t *testing.T) {
 		t.Fatalf("err should be non-nil")
 	}
 }
+
+// TestInjectShardColumn_CarriesSequences pins the item-51 delta review
+// finding #4: this pass runs BEFORE checkCrossEngineSupportable on the
+// shard-consolidation path, so dropping Schema.Sequences here would
+// strip a PG source's standalone sequences before the cross-engine
+// refusal could ever see them (and silently collapse them on
+// same-engine consolidations).
+func TestInjectShardColumn_CarriesSequences(t *testing.T) {
+	seqs := []*ir.Sequence{{Schema: "public", Name: "order_number_seq", Start: 1000, Increment: 5}}
+	in := &ir.Schema{
+		Tables: []*ir.Table{{
+			Name:       "orders",
+			Columns:    []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
+			PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+		}},
+		Views:     []*ir.View{{Name: "v_orders", Definition: "SELECT 1"}},
+		Sequences: seqs,
+	}
+	out, err := InjectShardColumn(in, "shard", ir.Varchar{Length: 16})
+	if err != nil {
+		t.Fatalf("InjectShardColumn: %v", err)
+	}
+	if len(out.Sequences) != 1 || out.Sequences[0] != seqs[0] {
+		t.Errorf("Sequences not carried through: %+v", out.Sequences)
+	}
+	if len(out.Views) != 1 {
+		t.Errorf("Views not carried through: %+v", out.Views)
+	}
+}

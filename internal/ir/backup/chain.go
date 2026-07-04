@@ -77,6 +77,28 @@ func canonicalSchemaForHash(s *ir.Schema) *ir.Schema {
 		ct.Policies = sortedByName(t.Policies, func(x *ir.Policy) string { return x.Name })
 		out.Tables[i] = &ct
 	}
+	// Standalone sequences (item 51): the fingerprint tracks the
+	// sequence's SHAPE (name, type, options, ownership), never its
+	// POSITION — LastValue / is_called advance with ordinary DML, and
+	// a schema hash that churned per-insert would make every no-DDL
+	// window read as a schema change. Zeroing the position fields here
+	// is also what lets the incremental manifest carry end-of-window
+	// positions (the chain-tail re-prime input) without disturbing the
+	// recorded before-schema hash contract.
+	if len(s.Sequences) > 0 {
+		out.Sequences = make([]*ir.Sequence, len(s.Sequences))
+		for i, q := range s.Sequences {
+			if q == nil {
+				continue
+			}
+			cq := *q
+			cq.LastValue = 0
+			cq.LastValueIsCalled = false
+			cq.LastValueValid = false
+			out.Sequences[i] = &cq
+		}
+		out.Sequences = sortedByName(out.Sequences, func(x *ir.Sequence) string { return x.Name })
+	}
 	return &out
 }
 
