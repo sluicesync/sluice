@@ -1607,6 +1607,34 @@ func TestQuoteSQLString(t *testing.T) {
 	}
 }
 
+// TestQuoteSQLString_BackslashDeliberatelyNotEscaped is the SEC-1b
+// reverse-direction pin (MySQL-source backslash-bearing literals → PG target).
+// PG's quoteSQLString doubles ONLY the interior single quote; it deliberately
+// does NOT escape backslashes, because every sluice PG session pins
+// standard_conforming_strings=on (see connect.go's pinStandardConformingStrings),
+// under which a backslash is an ORDINARY character in a '…' literal — so the raw
+// value bytes round-trip verbatim without any backslash doubling. Doubling here
+// would instead STORE a second backslash (silent corruption). The MySQL reader
+// hands the writer RAW value bytes (COLUMN_DEFAULT / COLUMN_COMMENT / TABLE_COMMENT
+// arrive decoded; parseEnumOrSet decodes ENUM/SET labels — ground-truthed on
+// MySQL 8.0), so these inputs are exactly what a MySQL source produces. The
+// {plain, trailing, doubled, quote-adjacent} backslash matrix:
+func TestQuoteSQLString_BackslashDeliberatelyNotEscaped(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		{"plain interior backslash", `a\b`, `'a\b'`},
+		{"trailing backslash", `ab\`, `'ab\'`},
+		{"doubled backslash", `a\\b`, `'a\\b'`},
+		{"quote-adjacent backslash", `a\'b`, `'a\''b'`},
+	}
+	for _, c := range cases {
+		if got := quoteSQLString(c.in); got != c.want {
+			t.Errorf("%s: quoteSQLString(%q) = %q; want %q (backslash is literal under standard_conforming_strings=on — do NOT double it)", c.name, c.in, got, c.want)
+		}
+	}
+}
+
 // TestEmitTableDef_NoPKInlineUniqueKey is the Bug 125 PG pin: a PK-less
 // table with a NOT-NULL UNIQUE key emits the chosen unique key inline as
 // a CONSTRAINT ... UNIQUE (...) so PG's ON CONFLICT (cols) has a real

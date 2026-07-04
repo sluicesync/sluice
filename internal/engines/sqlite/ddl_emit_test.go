@@ -223,3 +223,29 @@ func TestWrapSQLiteExpressionDefault(t *testing.T) {
 		}
 	}
 }
+
+// TestQuoteSQLString_BackslashDeliberatelyNotEscaped is the SEC-1b
+// reverse-direction pin (MySQL-source backslash-bearing literals → SQLite
+// target). SQLite's quoteSQLString doubles ONLY the interior single quote; it
+// deliberately does NOT escape backslashes, because SQLite has NO backslash
+// escapes in '…' string literals at all — a backslash is always an ordinary
+// character, so the raw value bytes round-trip verbatim. Doubling would STORE a
+// second backslash (silent corruption). The MySQL reader hands RAW value bytes
+// to the writer (COLUMN_DEFAULT arrives decoded — ground-truthed on MySQL 8.0),
+// so these inputs are exactly what a MySQL source produces for a DefaultLiteral.
+// The {plain, trailing, doubled, quote-adjacent} backslash matrix:
+func TestQuoteSQLString_BackslashDeliberatelyNotEscaped(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		{"plain interior backslash", `a\b`, `'a\b'`},
+		{"trailing backslash", `ab\`, `'ab\'`},
+		{"doubled backslash", `a\\b`, `'a\\b'`},
+		{"quote-adjacent backslash", `a\'b`, `'a\''b'`},
+	}
+	for _, c := range cases {
+		if got := quoteSQLString(c.in); got != c.want {
+			t.Errorf("%s: quoteSQLString(%q) = %q; want %q (SQLite has no backslash escapes — do NOT double it)", c.name, c.in, got, c.want)
+		}
+	}
+}
