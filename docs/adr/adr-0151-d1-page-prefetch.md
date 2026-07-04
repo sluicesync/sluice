@@ -68,6 +68,21 @@ Matrix row 8 (read batching) CS cell updated in the same PR.
   in-sequence loud failure of a prefetched page, and cancel-mid-stream reaping the
   fetcher with `Err() = context.Canceled`.
 
+## Addendum (2026-07-04): the stage-local leg shares the fetcher
+
+The `--stage-local` staging materializer (ADR-0145, `stage_d1.go`) originally kept its
+own strictly-sequential page loop over the same `buildD1PageQuery` requests. It now
+drives the SAME `fetchPages` fetcher goroutine (audit item 2.2 residual): `stageD1Table`
+consumes the unbuffered `d1Page` handoff, so page N+1's HTTP request overlaps page N's
+local insert — with the identical contract set (byte-identical request order/bounds,
+in-sequence error surfacing, the explicit `final` marker so an aborted fetch can never
+produce a silently truncated staged file, fetcher reaped on every return path). The
+fetcher's silent stop on a key-extraction failure is reproduced loudly by the staging
+loop's per-row `extractKey`, mirroring the reader's `decodeRow`. Pinned by the
+`stage_d1_prefetch_test.go` units mirroring `d1_prefetch_test.go` at the staging seam
+(overlap proven by holding the staging file's write lock while observing the page-2
+request).
+
 ## Alternatives considered
 
 - **N-deep pipeline / concurrent page fetches.** Rejected: memory grows with depth,

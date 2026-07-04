@@ -87,7 +87,7 @@ func stageD1ClientToLocalFile(ctx context.Context, client *d1Client, destPath st
 	// 2. Copy each table's rows at exact storage class.
 	var totalRows int64
 	for _, t := range schema.Tables {
-		n, err := stageD1Table(ctx, client, db, t, log)
+		n, err := stageD1Table(ctx, &D1RowReader{client: client}, db, t, log)
 		if err != nil {
 			return err
 		}
@@ -125,49 +125,60 @@ func stageD1ClientToLocalFile(ctx context.Context, client *d1Client, destPath st
 const stageInsertBatch = 1000
 
 // stageD1Table copies one table's rows from D1 into the local db at exact storage
-// class. It reuses the D1 row reader's pagination plan + lossless projection, but
-// instead of decoding each cell to an IR value (which the bulk migrate would do
-// later, from the staged file) it binds the RAW storage-class value, so the
-// staged file holds the same integer/real/text/blob/null SQLite would have read
-// from D1. Generated columns are skipped (recomputed locally from the DDL).
-func stageD1Table(ctx context.Context, client *d1Client, db *sql.DB, t *ir.Table, log *slog.Logger) (int64, error) {
-	rr := &D1RowReader{client: client}
+// class. It reuses the D1 row reader's pagination plan + lossless projection AND
+// its single-page prefetch fetcher (ADR-0151): [fetchPages] issues page N+1's
+// HTTP request while page N's rows are inserted locally, hiding one HTTP RTT per
+// page exactly as the bulk-read stream loop does — same requests, same bounds,
+// same explicit `final` marker so an aborted fetch can never read as a clean
+// short result. Instead of decoding each cell to an IR value (which the bulk
+// migrate would do later, from the staged file) it binds the RAW storage-class
+// value, so the staged file holds the same integer/real/text/blob/null SQLite
+// would have read from D1. Generated columns are skipped (recomputed locally
+// from the DDL).
+func stageD1Table(ctx context.Context, rr *D1RowReader, db *sql.DB, t *ir.Table, log *slog.Logger) (int64, error) {
 	plan, err := rr.planPagination(ctx, t)
 	if err != nil {
 		return 0, fmt.Errorf("d1 stage: plan pagination for %q: %w", t.Name, err)
 	}
-	projection := buildD1Projection(t, plan)
-	pageSize := rr.effectivePageSize()
 	insertSQL, stored := buildStageInsert(t)
 	if len(stored) == 0 {
 		return 0, fmt.Errorf("d1 stage: table %q has no storable (non-generated) columns", t.Name)
 	}
 
+	// Cancelling fetchCtx on any early return (insert failure, key refusal)
+	// aborts the fetcher's in-flight HTTP request and its blocked handoff, so
+	// the goroutine is always reaped — the same shape as the reader's stream
+	// loop.
+	fetchCtx, cancelFetch := context.WithCancel(ctx)
+	defer cancelFetch()
+	pages := make(chan d1Page) // unbuffered: exactly one page of read-ahead
+	go rr.fetchPages(fetchCtx, t, plan, pages)
+
 	var (
-		lastKey []string
-		offset  int
-		ordinal int64
-		total   int64
+		ordinal  int64
+		total    int64
+		sawFinal bool
 	)
-	for {
-		pageSQL, params := buildD1PageQuery(t, plan, projection, lastKey, offset, pageSize)
-		rows, err := client.queryRows(ctx, pageSQL, params...)
-		if err != nil {
-			return total, fmt.Errorf("d1 stage: table %q: read page: %w", t.Name, err)
+	for page := range pages {
+		if page.err != nil {
+			return total, fmt.Errorf("d1 stage: table %q: read page: %w", t.Name, page.err)
 		}
-		if len(rows) == 0 {
-			break
+		if len(page.rows) > 0 {
+			if err := stageInsertPage(ctx, db, t, plan, rr, insertSQL, stored, page.rows, &ordinal); err != nil {
+				return total, err
+			}
+			total += int64(len(page.rows))
 		}
-
-		if err := stageInsertPage(ctx, db, t, plan, rr, insertSQL, stored, rows, &lastKey, &ordinal); err != nil {
-			return total, err
+		sawFinal = page.final
+	}
+	if !sawFinal {
+		// The channel closed without a terminal page: the fetcher was aborted
+		// (ctx cancellation) mid-table. Refuse loudly — a clean return here
+		// would leave a SILENTLY TRUNCATED staged file.
+		if err := ctx.Err(); err != nil {
+			return total, fmt.Errorf("d1 stage: table %q: %w", t.Name, err)
 		}
-		total += int64(len(rows))
-
-		if len(rows) < pageSize {
-			break
-		}
-		offset += len(rows)
+		return total, fmt.Errorf("d1 stage: table %q: page fetch aborted before the final page", t.Name)
 	}
 
 	log.InfoContext(ctx, "d1 stage: table copied",
@@ -177,11 +188,11 @@ func stageD1Table(ctx context.Context, client *d1Client, db *sql.DB, t *ir.Table
 
 // stageInsertPage inserts one page of D1 rows into the local db, committing in
 // batches of [stageInsertBatch]. It binds each cell's exact storage-class value
-// (via [d1StorageValue]) and advances the keyset cursor (lastKey) and the
-// 1-based ordinal exactly as the row reader's stream loop does.
+// (via [d1StorageValue]) and advances the 1-based ordinal exactly as the row
+// reader's stream loop does.
 func stageInsertPage(
 	ctx context.Context, db *sql.DB, t *ir.Table, plan pagePlan, rr *D1RowReader,
-	insertSQL string, stored []int, rows []d1Row, lastKey *[]string, ordinal *int64,
+	insertSQL string, stored []int, rows []d1Row, ordinal *int64,
 ) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -224,11 +235,13 @@ func stageInsertPage(
 			return fmt.Errorf("d1 stage: insert into %q row %d: %w", t.Name, *ordinal, err)
 		}
 
-		key, kerr := rr.extractKey(t, plan, raw, *ordinal)
-		if kerr != nil {
+		// The fetcher derives the next page's bound itself; this per-row
+		// re-derivation exists to REPRODUCE its key-extraction refusal loudly
+		// with full row context (the fetcher stops silently on that failure —
+		// see [fetchPages]), mirroring the reader's decodeRow.
+		if _, kerr := rr.extractKey(t, plan, raw, *ordinal); kerr != nil {
 			return kerr
 		}
-		*lastKey = key
 
 		sinceCommit++
 		if sinceCommit >= stageInsertBatch {
