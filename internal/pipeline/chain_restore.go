@@ -321,10 +321,12 @@ type sequenceReprimer interface {
 
 // reprimeStandaloneSequences advances the target's standalone
 // sequences to the NEWEST captured position in the chain. The newest
-// link carrying a schema snapshot wins (incremental manifests carry
-// the schema read at their window START, so the residual exposure is
-// only the final link's own capture window — documented in
-// docs/type-mapping.md "Sequences and serial columns"). No-op when no
+// link carrying a schema snapshot wins. Incremental manifests carry
+// sequence positions refreshed at their window END (see
+// schemaWithRefreshedSequences in incremental.go), so the residual
+// exposure is only source advancement AFTER the final link's
+// end-of-window read — the chain's ordinary row RPO, documented in
+// docs/type-mapping.md "Sequences and serial columns". No-op when no
 // link carries standalone sequences.
 //
 // A target engine without the re-prime surface is a loud error here,

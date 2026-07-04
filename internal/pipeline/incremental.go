@@ -440,7 +440,13 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 		// window's own changes already consumed. Table shape (and the
 		// recorded SchemaHash) stay the before-schema contract:
 		// ComputeSchemaHash canonicalizes positions away, so the swap
-		// is hash-invisible.
+		// is hash-invisible for POSITION-only drift. If sequence
+		// OPTIONS changed inside this no-DDL window, the swapped
+		// schema would no longer re-hash to the recorded SchemaHash —
+		// harmless today (no read-side hash verification exists), but
+		// a future hash-verifying chain walker must canonicalize the
+		// same way before comparing, or it would reject legitimate
+		// chains written by this binary.
 		manifest.Schema = schemaWithRefreshedSequences(manifest.Schema, afterSchema)
 	}
 
