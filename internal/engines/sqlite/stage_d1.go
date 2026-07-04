@@ -216,7 +216,7 @@ func stageInsertPage(
 		vals := make([]any, 0, len(stored))
 		for _, i := range stored {
 			col := t.Columns[i]
-			typeofText, ok, jerr := jsonString(raw[typeofAlias(plan.typeofPrefix, i)])
+			typeofText, ok, jerr := jsonString(raw[plan.typeofAliases[i]])
 			if jerr != nil {
 				return fmt.Errorf("d1 stage: table %q column %q row %d: decode typeof: %w",
 					t.Name, col.Name, *ordinal, jerr)

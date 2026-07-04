@@ -413,7 +413,8 @@ func TestBuildD1PageQuery_Shape(t *testing.T) {
 		},
 		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}, Unique: true},
 	}
-	plan := pagePlan{typeofPrefix: typeofPrefix(table.Columns), orderCols: []string{"id"}}
+	plan := newPagePlan(table.Columns)
+	plan.orderCols = []string{"id"}
 	proj := buildD1Projection(table, plan)
 	for _, want := range []string{
 		`CAST("id" AS TEXT)`,
@@ -438,7 +439,8 @@ func TestBuildD1PageQuery_Shape(t *testing.T) {
 	}
 
 	// Composite key → row-value comparison.
-	plan2 := pagePlan{typeofPrefix: typeofPrefix(table.Columns), orderCols: []string{"id", "v"}}
+	plan2 := newPagePlan(table.Columns)
+	plan2.orderCols = []string{"id", "v"}
 	sql2, _ := buildD1PageQuery(table, plan2, proj, []string{"1", "a"}, 0, d1PageSize)
 	if !strings.Contains(sql2, `("t"."id", "t"."v") > (?, ?)`) {
 		t.Errorf("composite keyset not a row-value comparison:\n%s", sql2)
@@ -993,7 +995,8 @@ func TestD1Format17g_RealDriver(t *testing.T) {
 		},
 		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}, Unique: true},
 	}
-	plan := pagePlan{typeofPrefix: typeofPrefix(table.Columns), orderCols: []string{"id"}}
+	plan := newPagePlan(table.Columns)
+	plan.orderCols = []string{"id"}
 	proj := buildD1Projection(table, plan)
 	query, _ := buildD1PageQuery(table, plan, proj, nil, 0, d1PageSize)
 

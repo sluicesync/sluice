@@ -111,11 +111,27 @@ func (r *D1RowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.
 // key and is read by LIMIT/OFFSET (a documented, rare, non-concurrent-safe
 // fallback).
 type pagePlan struct {
-	typeofPrefix string   // collision-free prefix for the per-column typeof aliases
-	rowidAlias   string   // projection alias carrying CAST(rowid AS TEXT), when useRowid
-	orderCols    []string // unqualified key column names (user PK cols, or {"rowid"})
-	useRowid     bool
-	useOffset    bool
+	typeofPrefix  string   // collision-free prefix for the per-column typeof aliases
+	typeofAliases []string // per-column typeof alias, indexed by column position (hoisted: built once per table, not per cell)
+	rowidAlias    string   // projection alias carrying CAST(rowid AS TEXT), when useRowid
+	orderCols     []string // unqualified key column names (user PK cols, or {"rowid"})
+	useRowid      bool
+	useOffset     bool
+}
+
+// newPagePlan seeds a pagePlan with the table's collision-free typeof prefix
+// and the per-column alias slice. The aliases are precomputed HERE — once per
+// table — so the per-cell decode loops (this reader's decodeRow, the staging
+// insert loop) index a slice instead of rebuilding the alias string for every
+// cell (audit P-4).
+func newPagePlan(cols []*ir.Column) pagePlan {
+	p := pagePlan{typeofPrefix: typeofPrefix(cols)}
+	p.rowidAlias = p.typeofPrefix + "rowid"
+	p.typeofAliases = make([]string, len(cols))
+	for i := range cols {
+		p.typeofAliases[i] = typeofAlias(p.typeofPrefix, i)
+	}
+	return p
 }
 
 // planPagination chooses the pagination strategy for a table: keyset on the PK
@@ -126,8 +142,7 @@ type pagePlan struct {
 // rowid; a WITHOUT ROWID table keyed only by a BLOB column is refused loudly
 // rather than looped forever.
 func (r *D1RowReader) planPagination(ctx context.Context, table *ir.Table) (pagePlan, error) {
-	p := pagePlan{typeofPrefix: typeofPrefix(table.Columns)}
-	p.rowidAlias = p.typeofPrefix + "rowid"
+	p := newPagePlan(table.Columns)
 
 	if table.PrimaryKey != nil && len(table.PrimaryKey.Columns) > 0 {
 		if pkKeysetSafe(table) {
@@ -338,7 +353,7 @@ func (r *D1RowReader) fetchPages(ctx context.Context, table *ir.Table, plan page
 func (r *D1RowReader) decodeRow(table *ir.Table, plan pagePlan, raw d1Row, enc dateEncoding, ordinal int64) (ir.Row, []string, error) {
 	row := make(ir.Row, len(table.Columns))
 	for i, col := range table.Columns {
-		typeofText, ok, err := jsonString(raw[typeofAlias(plan.typeofPrefix, i)])
+		typeofText, ok, err := jsonString(raw[plan.typeofAliases[i]])
 		if err != nil {
 			return nil, nil, fmt.Errorf("d1: table %q column %q row %d: decode typeof: %w",
 				table.Name, col.Name, ordinal, err)
@@ -411,7 +426,7 @@ func buildD1Projection(table *ir.Table, plan pagePlan) string {
 		// on the encoding — see CapturedValueExpr for the per-class rationale.
 		parts = append(
 			parts,
-			CapturedTypeofExpr(q)+" AS "+quoteIdent(typeofAlias(plan.typeofPrefix, i)),
+			CapturedTypeofExpr(q)+" AS "+quoteIdent(plan.typeofAliases[i]),
 			CapturedValueExpr(q)+" AS "+q,
 		)
 	}
