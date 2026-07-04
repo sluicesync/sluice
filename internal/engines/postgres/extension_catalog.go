@@ -200,17 +200,45 @@ func HasCrossEngineDefaultTranslator(name string) bool {
 // implementations to format operator-actionable error messages when
 // `--enable-pg-extension EXT` names an unknown extension.
 func recognisedPGExtensionNames() []string {
-	names := make([]string, 0, len(pgExtensionCatalog))
-	for name := range pgExtensionCatalog {
+	return sortedExtensionNames(pgExtensionCatalog)
+}
+
+// sortedExtensionNames returns m's keys via a cheap insertion sort —
+// the catalogs are small.
+func sortedExtensionNames[V any](m map[string]V) []string {
+	names := make([]string, 0, len(m))
+	for name := range m {
 		names = append(names, name)
 	}
-	// Cheap insertion sort — the catalog is small.
 	for i := 1; i < len(names); i++ {
 		for j := i; j > 0 && names[j] < names[j-1]; j-- {
 			names[j-1], names[j] = names[j], names[j-1]
 		}
 	}
 	return names
+}
+
+// RecognisedPGExtensionNames returns the sorted names of every
+// extension in [pgExtensionCatalog]. Exported (with
+// [CrossEngineDefaultTranslatedExtensionNames]) for the pipeline
+// package's catalog lock-step test: the orchestrator's
+// isCrossEngineTranslatablePGExtension hand-mirrors the translated
+// set because pipeline PROD code must not import engine packages —
+// its TEST may, and needs the recognised catalog as the probe
+// universe to assert the mirror mechanically in both directions.
+func RecognisedPGExtensionNames() []string {
+	return recognisedPGExtensionNames()
+}
+
+// CrossEngineDefaultTranslatedExtensionNames returns the sorted names
+// of the extensions in [crossEngineDefaultTranslatedExtensions] — the
+// set with a defensible lossless default cross-engine MySQL
+// translation. Exported for the pipeline package's catalog lock-step
+// test (see [RecognisedPGExtensionNames]): adding an entry to the map
+// without updating the pipeline mirror now fails that test instead of
+// silently over-refusing a translatable extension.
+func CrossEngineDefaultTranslatedExtensionNames() []string {
+	return sortedExtensionNames(crossEngineDefaultTranslatedExtensions)
 }
 
 // pgVectorDef is the catalog entry for the `pgvector` extension

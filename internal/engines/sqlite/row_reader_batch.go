@@ -45,9 +45,9 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
-// Static assertion: the SQLite reader satisfies the bounded batched
-// surface (which embeds [ir.BatchedRowReader]).
-var _ ir.BoundedBatchedRowReader = (*RowReader)(nil)
+// The static conformance assertions for the batched surfaces live in
+// capabilities_assert.go, alongside this package's other optional-interface
+// pins.
 
 // ReadRowsBatch implements [ir.BatchedRowReader]. See the file-header
 // comment for the SQL shape and the design rationale.
