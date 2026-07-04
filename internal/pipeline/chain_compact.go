@@ -993,31 +993,53 @@ func cleanupStagingDirs(ctx context.Context, store irbackup.Store) error {
 // the lineage root that belong to a merged source. After compact the
 // merged segment lives under its own sub-dir, so the root manifest +
 // root incrementals + root chunks are orphans.
+//
+// Best-effort within the sweep: every delete is ATTEMPTED, and each
+// failure is collected (naming its path) into the joined return so
+// the caller's WARN carries a diagnostic trail — a persistently
+// failing delete must never vanish silently while leaking backup-
+// store disk. Missing files are not failures (both LocalStore and
+// BlobStore treat delete-of-absent as nil), so a re-run after a
+// partial sweep stays clean.
 func sweepRootSegmentArtifacts(ctx context.Context, store irbackup.Store, seg *LineageSegment) error {
-	_ = store.Delete(ctx, ManifestFileName)
-	for _, ip := range seg.Incrementals {
-		_ = store.Delete(ctx, ip)
+	var errs []error
+	if err := store.Delete(ctx, ManifestFileName); err != nil {
+		errs = append(errs, fmt.Errorf("delete %q: %w", ManifestFileName, err))
 	}
-	if paths, err := store.List(ctx, "chunks/"); err == nil {
-		for _, p := range paths {
-			_ = store.Delete(ctx, p)
+	for _, ip := range seg.Incrementals {
+		if err := store.Delete(ctx, ip); err != nil {
+			errs = append(errs, fmt.Errorf("delete %q: %w", ip, err))
 		}
 	}
-	return nil
+	paths, err := store.List(ctx, "chunks/")
+	if err != nil {
+		errs = append(errs, fmt.Errorf(`list "chunks/": %w`, err))
+	}
+	for _, p := range paths {
+		if err := store.Delete(ctx, p); err != nil {
+			errs = append(errs, fmt.Errorf("delete %q: %w", p, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // sweepSegmentSubdir deletes every file under a (no-longer-referenced)
 // segment sub-directory. Used to GC merged sources' original dirs
-// after the catalog swap committed them out of authority.
+// after the catalog swap committed them out of authority. Per-file
+// delete failures are collected and joined (see
+// [sweepRootSegmentArtifacts] for the best-effort contract).
 func sweepSegmentSubdir(ctx context.Context, store irbackup.Store, dir string) error {
 	paths, err := store.List(ctx, dir+"/")
 	if err != nil {
 		return err
 	}
+	var errs []error
 	for _, p := range paths {
-		_ = store.Delete(ctx, p)
+		if err := store.Delete(ctx, p); err != nil {
+			errs = append(errs, fmt.Errorf("delete %q: %w", p, err))
+		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // buildPostCompactSegments returns the new lineage segment list after

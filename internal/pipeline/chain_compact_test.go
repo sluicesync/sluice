@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -597,6 +598,95 @@ func TestCompactChain_StaleStagingCleanup(t *testing.T) {
 	}
 	if ex, _ := store.Exists(context.Background(), stale); ex {
 		t.Error("stale staging file survives the cleanup pass")
+	}
+}
+
+// failingDeleteStore wraps memStore, failing Delete for any path with
+// a seeded prefix — models a store where the orphan-sweep deletes
+// persistently fail (permissions, bucket policy) while everything
+// else works.
+type failingDeleteStore struct {
+	*memStore
+	failPrefixes []string
+}
+
+func (s *failingDeleteStore) Delete(ctx context.Context, path string) error {
+	for _, p := range s.failPrefixes {
+		if strings.HasPrefix(path, p) {
+			return fmt.Errorf("seeded delete failure for %s", path)
+		}
+	}
+	return s.memStore.Delete(ctx, path)
+}
+
+// TestCompactChain_OrphanSweepDeleteFailure_Warns pins the Q-1 fix:
+// per-file Delete failures inside the post-commit orphan sweep must
+// reach the sweep WARN (naming the failing path) — never vanish
+// silently — while the compaction itself still succeeds (the sweep is
+// best-effort by contract; the catalog swap already committed).
+func TestCompactChain_OrphanSweepDeleteFailure_Warns(t *testing.T) {
+	var logBuf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	// Fail the root segment's manifest delete AND every delete under the
+	// second source's sub-dir — exercising BOTH sweep helpers.
+	store := &failingDeleteStore{
+		memStore:     newMemStore(),
+		failPrefixes: []string{ManifestFileName, "seg-1/"},
+	}
+	now := time.Date(2026, 5, 16, 0, 0, 0, 0, time.UTC)
+	seedTwoSegmentLineage(t, store, now, time.Hour)
+
+	res, err := CompactChain(context.Background(), store, CompactOpts{
+		MergeWindow:  2 * time.Hour,
+		Now:          func() time.Time { return now.Add(10 * time.Hour) },
+		newSegmentID: func() string { return "merged-warn" },
+	})
+	if err != nil {
+		t.Fatalf("CompactChain must stay best-effort on sweep failures; got %v", err)
+	}
+	if res.GroupsMerged != 1 {
+		t.Errorf("GroupsMerged = %d; want 1 (sweep failure must not block the merge)", res.GroupsMerged)
+	}
+
+	logs := logBuf.String()
+	if !strings.Contains(logs, "orphan sweep failed") {
+		t.Fatalf("no orphan-sweep WARN emitted; logs:\n%s", logs)
+	}
+	if !strings.Contains(logs, ManifestFileName) {
+		t.Errorf("WARN does not name the failing root manifest path %q; logs:\n%s", ManifestFileName, logs)
+	}
+	if !strings.Contains(logs, "seg-1/") {
+		t.Errorf("WARN does not name the failing seg-1/ paths; logs:\n%s", logs)
+	}
+}
+
+// TestSweepSegmentSubdir_CollectsDeleteFailures pins the helper-level
+// contract directly: every delete is attempted (best-effort) and each
+// failure is joined into the returned error, naming its path.
+func TestSweepSegmentSubdir_CollectsDeleteFailures(t *testing.T) {
+	mem := newMemStore()
+	for _, p := range []string{"seg-x/manifest.json", "seg-x/fail-me.json", "seg-x/ok.json"} {
+		if err := mem.Put(context.Background(), p, bytes.NewReader([]byte("x"))); err != nil {
+			t.Fatalf("seed %s: %v", p, err)
+		}
+	}
+	store := &failingDeleteStore{memStore: mem, failPrefixes: []string{"seg-x/fail-me.json"}}
+
+	err := sweepSegmentSubdir(context.Background(), store, "seg-x")
+	if err == nil {
+		t.Fatal("sweepSegmentSubdir returned nil despite a failing delete")
+	}
+	if !strings.Contains(err.Error(), "seg-x/fail-me.json") {
+		t.Errorf("error does not name the failing path: %v", err)
+	}
+	// The other files were still attempted and deleted (best-effort).
+	for _, p := range []string{"seg-x/manifest.json", "seg-x/ok.json"} {
+		if ex, _ := mem.Exists(context.Background(), p); ex {
+			t.Errorf("%s survives the sweep; deletes after a failure must still be attempted", p)
+		}
 	}
 }
 
