@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.179] - 2026-07-04
+
+### Fixed
+
+- **A refused PG-source `sync start` cold-start no longer orphans the replication slot it just created (Bug 177; loud failure, zero data risk; latent in v0.10.0–v0.99.178 — every release with the populated-target cold-start refusal).** The cold-start opened the snapshot (which atomically creates the logical replication slot) BEFORE the target-side preflights, and every refusal/failure exit merely closed the stream — deliberately leaving the slot, since a CONSUMED stream's slot is the CDC resume anchor. But an unconsumed cold start has no anchor: the orphaned slot pinned source WAL until manually dropped, and the `SLUICE-E-COLDSTART-TARGET-NOT-EMPTY` hint's own preferred recovery (`--reset-target-data`) then failed on `replication slot "sluice_slot" already exists` until an un-hinted manual `sluice slot drop`. `ir.SnapshotStream` gains an optional `Abandon()` teardown ("this cold start will never consume the stream") that the PG engine implements as close-everything-then-`pg_drop_replication_slot` (the repl conn closes first — the creating walsender holds the slot acquired); every pre-anchor exit in the sync cold-start (target-writer open failures, connection-budget/RLS/shard/populated-target refusals, bulk-copy failure, the CDC-anchor write itself failing) now abandons instead of closes, on the single-database AND multi-database/multi-schema paths. The boundary is the anchor write: once the CDC position is durably persisted, warm-resume depends on the slot and teardowns keep today's Close. Engines whose opens create nothing durable (MySQL binlog, VStream) have no AbandonFn and Abandon degrades to Close — byte-identical. A failed slot drop is LOUD (WARN with the manual `pg_drop_replication_slot` command + surfaced error). The sync-mode refusal hint's recovery (a) now also names the slot-drop step for the shape the fix cannot reach (a hard-killed process can't clean up). Pinned by unit tests (Abandon dispatch/fallback/error propagation; the gate-preflight refusal invokes Abandon and a passing preflight leaves the stream open) and real-PG integration tests (Abandon drops the slot + re-open succeeds while Close still preserves it; the full Bug-177 shape end-to-end — refusal → zero slots on the source → `--reset-target-data` recovery succeeds first try).
+
 ## [0.99.178] - 2026-07-04
 
 ### Added
