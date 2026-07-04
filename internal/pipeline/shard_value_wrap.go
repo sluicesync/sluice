@@ -60,7 +60,11 @@ func shardStampRows(
 	if shardName == "" {
 		return src, func() error { return nil }
 	}
-	out := make(chan ir.Row)
+	// Standard bounded buffer ([rowChanBuffer], perf-parity matrix row 6):
+	// same rationale as the [redactRows] tee — an unbuffered relay made the
+	// stamp a rendezvous hop in the bulk-copy hot path when Shape A was
+	// engaged. Buffered, stamping and the downstream write overlap.
+	out := make(chan ir.Row, rowChanBuffer)
 	var (
 		mu    sync.Mutex
 		fnErr error

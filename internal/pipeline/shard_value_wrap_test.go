@@ -133,3 +133,17 @@ func TestShardStampRows_StampsNonStringValue(t *testing.T) {
 		t.Errorf("non-string stamp value not preserved; got %v (%T)", row["shard_no"], row["shard_no"])
 	}
 }
+
+// TestShardStampRows_BufferedRelay pins the perf-parity matrix row-6
+// fix (gap 6): the shard-stamp tee's relay channel carries the
+// standard rowChanBuffer so an engaged discriminator stamp never
+// re-introduces an unbuffered rendezvous hop into the bulk-copy hot
+// path.
+func TestShardStampRows_BufferedRelay(t *testing.T) {
+	src := make(chan ir.Row)
+	close(src)
+	out, _ := shardStampRows(context.Background(), src, "shard_id", "s1")
+	if got := cap(out); got != rowChanBuffer {
+		t.Errorf("shard-stamp relay channel cap = %d; want rowChanBuffer (%d)", got, rowChanBuffer)
+	}
+}
