@@ -359,7 +359,14 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 				slog.Int("tables", len(tables)),
 				slog.String("resume_table", resumeSeedTable))
 		default:
-			slog.InfoContext(ctx, "mysql/vstream: snapshot: auto-shard-by-table COPY (one table at a time, bounded memory)",
+			// Perf-parity gap 3: the sequential default is DELIBERATE on the
+			// VStream path (see defaultCopyTableParallelism's rationale —
+			// resume-partition stability + the per-stream buffer split), so
+			// the multi-table cold-copy names the throughput knob loudly
+			// instead of leaving a hidden serial ceiling.
+			slog.InfoContext(ctx, "mysql/vstream: snapshot: auto-shard-by-table COPY (one table at a time, bounded memory); "+
+				"cold-copy runs SEQUENTIAL by default on VStream sources — N concurrent COPY streams are available via "+
+				"--vstream-copy-table-parallelism (see docs/throughput-tuning.md)",
 				slog.String("keyspace", keyspace),
 				slog.Int("tables", len(tables)))
 		}

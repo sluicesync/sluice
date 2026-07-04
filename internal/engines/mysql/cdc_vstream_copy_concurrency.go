@@ -27,16 +27,37 @@ import (
 // parallelism-agnostic, so the snapshot→CDC handoff is unchanged.
 
 const (
-	// defaultCopyTableParallelism is the cross-table COPY stream count when
-	// the operator sets no DSN knob. It is 1 (sequential single-stream
-	// auto-shard, byte-identical to ADR-0095/0098) — the read-side
-	// concurrency is a deliberate throughput opt-in for a known-large
-	// cross-region copy, and defaulting it >1 would multiply connection
-	// pressure on every cold-start by surprise (contrast ADR-0097's
-	// fan-out, whose workers are cheap so it defaults to 4). This is the
-	// zero-value-safe default (the v0.99.51 trap): every constructor / test
-	// / non-DSN caller that gets the Go zero value gets sequential
-	// behavior, NOT "zero streams = copies nothing".
+	// defaultCopyTableParallelism is the VSTREAM cross-table COPY stream
+	// count when the operator sets no knob. It is 1 (sequential single-stream
+	// auto-shard, byte-identical to ADR-0095/0098) and — unlike the native
+	// binlog path, whose defaultNativeCopyTableParallelism flipped to auto-4
+	// in the perf-parity gap-3 chunk — it DELIBERATELY stays 1:
+	//
+	//   - K is not persisted in the position token (ADR-0099 §5 kept the
+	//     ADR-0098 token shape); a resume must re-derive the SAME table→stream
+	//     partition with the SAME K. A default flip would silently change the
+	//     effective K for any durable-watermark job resumed across the upgrade
+	//     boundary → the in-progress cursor's table lands in a different
+	//     stream → missed or double-copied table, the silent-loss class the
+	//     ADR's operator contract exists to prevent. (The native path has no
+	//     cross-process resume, which is why ITS flip is safe.)
+	//   - K > 1 is K INDEPENDENT causally-unordered vtgate sessions whose
+	//     handoff rests on the set-min stitch + its loud-refusal divergence
+	//     path (ADR-0099 §4) — sound, but a refusal class K = 1 structurally
+	//     never hits; not a surprise to spring on every cold-start.
+	//   - Each stream gets a --max-buffer-bytes/K sub-budget (the §2 liveness
+	//     fix); a default flip would silently quarter every cold-start's
+	//     per-stream buffer.
+	//   - Each stream is a full vtgate gRPC COPY session (the original cost
+	//     rationale; contrast ADR-0097's fan-out, whose workers are cheap so
+	//     it defaults to 4).
+	//
+	// Recorded as a deliberate absence in docs/dev/perf-parity-matrix.md;
+	// the sequential path INFO-logs the knob so the throughput is one flag
+	// away, never a hidden ceiling. This is the zero-value-safe default (the
+	// v0.99.51 trap): every constructor / test / non-DSN caller that gets the
+	// Go zero value gets sequential behavior, NOT "zero streams = copies
+	// nothing".
 	defaultCopyTableParallelism = 1
 
 	// maxCopyTableParallelism caps an operator-supplied parallelism so a

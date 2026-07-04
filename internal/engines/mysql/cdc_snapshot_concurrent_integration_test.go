@@ -130,6 +130,66 @@ func TestNativeConcurrentSnapshot_MultiTable(t *testing.T) {
 	}
 }
 
+// TestNativeConcurrentSnapshot_DefaultEngagesConcurrent pins the perf-parity
+// gap-3 default flip AGAINST A REAL SOURCE: with NO copy_table_parallelism
+// knob anywhere (no DSN param, no CLI override), a multi-table cold-copy now
+// opens the FTWRL-coordinated concurrent snapshot with
+// min(defaultNativeCopyTableParallelism, len(tables)) readers — and still
+// copies every table at its exact count. If someone reverts the resolver
+// default to 1, the partition assertion here fails (the serial reader
+// surfaces no groups).
+func TestNativeConcurrentSnapshot_DefaultEngagesConcurrent(t *testing.T) {
+	dsn, cleanup := startMySQLForSnapshotCDC(t)
+	defer cleanup()
+
+	// 5 tables > the auto default of 4, so the clamp resolves to exactly
+	// defaultNativeCopyTableParallelism groups (pinning the clamp too).
+	const seedDDL = `
+		CREATE TABLE d_a (id BIGINT NOT NULL AUTO_INCREMENT, v VARCHAR(255), PRIMARY KEY (id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+		CREATE TABLE d_b (id BIGINT NOT NULL AUTO_INCREMENT, v VARCHAR(255), PRIMARY KEY (id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+		CREATE TABLE d_c (id BIGINT NOT NULL AUTO_INCREMENT, v VARCHAR(255), PRIMARY KEY (id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+		CREATE TABLE d_d (id BIGINT NOT NULL AUTO_INCREMENT, v VARCHAR(255), PRIMARY KEY (id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+		CREATE TABLE d_e (id BIGINT NOT NULL AUTO_INCREMENT, v VARCHAR(255), PRIMARY KEY (id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+		INSERT INTO d_a (v) VALUES ('a1'), ('a2'), ('a3');
+		INSERT INTO d_b (v) VALUES ('b1'), ('b2');
+		INSERT INTO d_c (v) VALUES ('c1');
+		INSERT INTO d_d (v) VALUES ('d1'), ('d2'), ('d3'), ('d4');
+		INSERT INTO d_e (v) VALUES ('e1'), ('e2');
+	`
+	applyMySQLSnap(t, dsn, seedDDL)
+
+	tables := []string{"d_a", "d_b", "d_c", "d_d", "d_e"}
+	wantCounts := map[string]int{"d_a": 3, "d_b": 2, "d_c": 1, "d_d": 4, "d_e": 2}
+
+	eng := Engine{Flavor: FlavorVanilla}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	// NO knob: the plain DSN. The resolver default must engage concurrency.
+	stream, err := eng.OpenSnapshotStreamForTables(ctx, dsn, tables)
+	if err != nil {
+		t.Fatalf("OpenSnapshotStreamForTables(default): %v", err)
+	}
+	defer func() { _ = stream.Close() }()
+
+	part, ok := stream.Rows.(ir.ConcurrentCopyPartitioner)
+	if !ok {
+		t.Fatal("default multi-table snapshot Rows does not implement ir.ConcurrentCopyPartitioner — the gap-3 default flip did not engage (serial reader returned)")
+	}
+	groups := part.ConcurrentCopyGroups()
+	if len(groups) != defaultNativeCopyTableParallelism {
+		t.Fatalf("default ConcurrentCopyGroups = %d groups; want %d (min(default, 5 tables))", len(groups), defaultNativeCopyTableParallelism)
+	}
+	assertPartitionCoversExactly(t, groups, tables)
+
+	for _, tbl := range tables {
+		rows := drainAllRows(t, ctx, stream.Rows, concSnapTable(tbl))
+		if got := len(rows); got != wantCounts[tbl] {
+			t.Errorf("table %q default-concurrent snapshot count = %d; want %d (gap/dup)", tbl, got, wantCounts[tbl])
+		}
+	}
+}
+
 // TestNativeConcurrentSnapshot_FTWRLDeniedFallsBackSerial pins the
 // silent-loss guard (ADR-0101 §4): when FTWRL is unavailable (a restricted
 // user without RELOAD) AND copy_table_parallelism>1 is requested, the opener

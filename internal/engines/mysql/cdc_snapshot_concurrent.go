@@ -39,6 +39,11 @@
 // between the 1st and Nth START TRANSACTION, landing in some readers'
 // snapshots but not others, with no single position naming a cut consistent
 // with all N). See ADR-0101 §4.
+//
+// Since the perf-parity gap-3 chunk, the concurrent path is the DEFAULT for
+// a multi-table cold-copy (defaultNativeCopyTableParallelism = 4, matching
+// migrate's cross-table auto); copy_table_parallelism=1 (DSN) or
+// --copy-table-parallelism=1 (CLI) is the serial opt-out.
 
 package mysql
 
@@ -56,15 +61,45 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
+// defaultNativeCopyTableParallelism is the native-binlog cold-copy reader
+// count when the operator sets neither the CLI flag nor the DSN knob. It is
+// 4 — the SAME auto value migrate's cross-table pool defaults to
+// (pipeline defaultTableParallelism, ADR-0076) — so a MySQL user's first
+// `sync` cold-start is no longer ~4× slower than the `migrate` they just ran
+// against the same database (perf-parity matrix gap 3, roadmap item 54).
+//
+// Why the flip is safe here but NOT on the VStream path (which keeps
+// defaultCopyTableParallelism = 1): the FTWRL-coordinated N-snapshot is
+// consistency-IDENTICAL to the serial path (one cut, one recorded position,
+// no stitch — ADR-0101 §3; strictly stronger than migrate's own
+// per-connection-snapshot parallel readers), the serial opener already
+// attempts the same FTWRL on every cold start, FTWRL-denied sources
+// (RDS/Aurora) fall back to serial with a LOUD WARN (ADR-0101 §4), and the
+// native path has no cross-process resume whose table→reader partition a
+// changed default could destabilize (in-memory cursors only). ADR-0101 §1's
+// serial default was cost caution, not correctness — see the ADR's
+// implementation note. resolveCopyTableParallelism still clamps to
+// min(N, nTables, maxCopyTableParallelism), so a small schema never
+// over-opens; an explicit 1 (CLI or DSN) is the serial opt-out.
+//
+// Zero-value-safety (the v0.99.51 trap): this default lives in the RESOLVER
+// chain below (CLI override → DSN param → this constant), never in a struct
+// field — every construction that reaches the table-scoped opener resolves
+// the same value, and the Go zero of the CLI override (0 = unset) falls
+// through rather than forcing serial.
+const defaultNativeCopyTableParallelism = 4
+
 // nativeCopyTableParallelismFromDSN reads the optional copy_table_parallelism
 // source-DSN parameter — the number of CONCURRENT pinned-snapshot reader
 // connections the native-binlog cold-copy opens (ADR-0101). It is the
 // native-MySQL analogue of vstreamCopyTableParallelismFromDSN (and reuses the
 // SAME resolveCopyTableParallelism resolver + clamp); the distinct DSN key
 // keeps it independent of the VStream knob (a self-managed MySQL source has
-// no VStream). Absent ⇒ defaultCopyTableParallelism (1, serial). A malformed
-// value is a LOUD error (the loud-failure tenet: an operator who set the knob
-// deserves to know it didn't parse), NOT a silent fallback to serial.
+// no VStream). Absent ⇒ defaultNativeCopyTableParallelism (auto: 4, clamped
+// to the table count — NOT the VStream default of 1; see the constant's
+// rationale). A malformed value is a LOUD error (the loud-failure tenet: an
+// operator who set the knob deserves to know it didn't parse), NOT a silent
+// fallback to serial.
 //
 // ADR-0118 finding 4 precedence: an explicit --copy-table-parallelism CLI flag
 // (recorded via SetNativeCopyTableParallelismOverride, value > 0) WINS over the
@@ -76,7 +111,7 @@ func nativeCopyTableParallelismFromDSN(cfg *gomysql.Config) (int, error) {
 	}
 	v := cfg.Params["copy_table_parallelism"]
 	if v == "" {
-		return defaultCopyTableParallelism, nil
+		return defaultNativeCopyTableParallelism, nil
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
@@ -147,8 +182,10 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 			slog.WarnContext(ctx,
 				"mysql: snapshot(concurrent): FLUSH TABLES WITH READ LOCK failed; "+
 					"falling back to the SERIAL single-snapshot cold-copy — cross-table "+
-					"concurrency DISABLED, consistency preserved. Grant RELOAD to the "+
-					"source user to enable copy_table_parallelism>1.",
+					"concurrency DISABLED, consistency preserved. The N-way concurrent "+
+					"cold-copy (the default since the perf-parity gap-3 chunk) needs the "+
+					"RELOAD privilege; grant it to the source user to re-enable, or set "+
+					"--copy-table-parallelism=1 to opt into serial and silence this.",
 				slog.Int("requested_parallelism", n),
 				slog.String("error", err.Error()))
 			_ = db.Close()

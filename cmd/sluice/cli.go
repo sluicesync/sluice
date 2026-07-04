@@ -892,24 +892,27 @@ type SyncStartCmd struct {
 
 	// ADR-0118 finding 1(a): the applicability clause is front-loaded as the
 	// FIRST thing a --help reader sees. On a MySQL/VStream source these flags
-	// are INERT (serial cold-start); --copy-fanout-degree / the DSN copy-table
-	// parallelism knobs (--vstream-copy-table-parallelism /
-	// --copy-table-parallelism) tune VStream/native cold-copy there. Setting
-	// one explicitly on such a source emits a one-time runtime WARN (finding
-	// 1(b), see warnInertParallelismFlags).
+	// are INERT (the cold-copy parallelism is engine-internal there);
+	// --copy-fanout-degree / the copy-table parallelism knobs
+	// (--vstream-copy-table-parallelism / --copy-table-parallelism, the latter
+	// defaulting to auto:4 since the perf-parity gap-3 chunk) tune
+	// VStream/native cold-copy instead. Setting one explicitly on such a
+	// source emits a one-time runtime WARN (finding 1(b), see
+	// warnInertParallelismFlags).
 	BulkParallelism int `help:"PG source only; inert on MySQL/VStream — use --copy-fanout-degree / --vstream-copy-table-parallelism / --copy-table-parallelism there. FAST cold-start (ADR-0079): parallel reader/writer pairs PER table during the initial cold-start copy — the within-table axis (ADR-0019 PK-range chunking). Engages with the cross-table --table-parallelism axis when the PG source surfaces a shareable exported snapshot; all parallel readers are pinned to the ONE snapshot. 0 = min(8, NumCPU); 1 disables. See ADR-0079." default:"0" placeholder:"N"`
 
 	TableParallelism int `help:"PG source only; inert on MySQL/VStream — use --copy-fanout-degree / --vstream-copy-table-parallelism / --copy-table-parallelism there. FAST cold-start (ADR-0079): tables copied CONCURRENTLY during the initial cold-start copy — the cross-table axis (pgcopydb --table-jobs), composed with within-table --bulk-parallelism. The two MULTIPLY; the product (plus the reserved CDC connection) is bounded by the target's connection budget and --max-target-connections at a single chokepoint. 0 (default) = auto: 4. 1 disables cross-table concurrency. See ADR-0076 / ADR-0079." default:"0" placeholder:"N"`
 
 	BulkParallelMinRows int64 `help:"PG source only; inert on MySQL/VStream — use --copy-fanout-degree / --vstream-copy-table-parallelism / --copy-table-parallelism there. FAST cold-start (ADR-0079): row-count threshold below which a table is copied with a single reader/writer pair regardless of --bulk-parallelism. 0 (default) = auto (base 80000, dialled down on many-table schemas). Set an explicit N to pin it." default:"0" placeholder:"N"`
 
-	BulkBatchSize int `help:"FAST cold-start (ADR-0079, PG source) only: bulk-copy batch size for the within-table cursor path. Default 5000. Inert on MySQL/VStream sources (serial cold-start)." default:"5000" placeholder:"N"`
+	BulkBatchSize int `help:"FAST cold-start (ADR-0079, PG source) only: bulk-copy batch size for the within-table cursor path. Default 5000. Inert on MySQL/VStream sources (their cold-copy is engine-internal — see --copy-table-parallelism / --vstream-copy-table-parallelism)." default:"5000" placeholder:"N"`
 
 	CopyFanoutDegree int `help:"VStream/CDC snapshot cold-start (ADR-0097, PlanetScale-MySQL target) only: WRITE-side fan-out — the single incoming snapshot row stream is PK-hash-partitioned out to N concurrent batched-INSERT writer workers, each on its own connection, to beat the single cross-region-RTT-bound INSERT connection vtgate forces (it blocks LOAD DATA). 0 (default) = auto: 4; 1 disables fan-out (serial). Bounded by the target connection budget / --max-target-connections. Inert on the FAST cold-start path and on no-PK tables. See ADR-0097." default:"0" placeholder:"N"`
 
 	// ADR-0118 finding 4: promote the DSN read-axis params to first-class CLI
 	// flags. Precedence is explicit CLI flag > DSN param > engine default
-	// (1 = serial). 0 (the default, unset) means "fall back to the DSN param",
+	// (VStream: 1 = serial, deliberate; native binlog: auto 4 since the
+	// perf-parity gap-3 chunk). 0 (the default, unset) means "fall back to the DSN param",
 	// so the new flag's zero value never silently overrides a DSN value — only
 	// an explicitly-set CLI flag wins (zero-value-safe, the v0.99.51 trap). The
 	// DSN form (vstream_copy_table_parallelism / copy_table_parallelism in the
@@ -918,7 +921,7 @@ type SyncStartCmd struct {
 	// it ahead of the DSN param.
 	VStreamCopyTableParallelism int `name:"vstream-copy-table-parallelism" help:"VStream cold-copy READ axis (Vitess/PlanetScale source): the number of CONCURRENT single-table COPY streams the auto-shard cold-copy runs (ADR-0099), the read-side sibling of the write-side --copy-fanout-degree. 0 (default) = unset — fall back to the source DSN's vstream_copy_table_parallelism param, then to the engine default (1 = serial single-stream). An explicit value here WINS over the DSN param. The DSN form keeps working verbatim. 1 = serial. Inert on PG / native-MySQL sources." default:"0" placeholder:"N"`
 
-	CopyTableParallelism int `name:"copy-table-parallelism" help:"Native-MySQL cold-copy READ axis (self-managed, non-Vitess MySQL source): the number of CONCURRENT FTWRL-coordinated pinned-snapshot reader connections the cold-copy opens (ADR-0101). 0 (default) = unset — fall back to the source DSN's copy_table_parallelism param, then to the engine default (1 = serial single-snapshot). An explicit value here WINS over the DSN param. The DSN form keeps working verbatim. 1 = serial. Inert on PG / VStream sources." default:"0" placeholder:"N"`
+	CopyTableParallelism int `name:"copy-table-parallelism" help:"Native-MySQL cold-copy READ axis (self-managed, non-Vitess MySQL source): the number of CONCURRENT FTWRL-coordinated pinned-snapshot reader connections the cold-copy opens (ADR-0101). 0 (default) = unset — fall back to the source DSN's copy_table_parallelism param, then to the engine default (auto: 4, clamped to the table count — the same cross-table auto as migrate; consistency is identical to serial, one FTWRL cut + one binlog position). An explicit value here WINS over the DSN param. The DSN form keeps working verbatim. 1 = serial opt-out. Sources without the RELOAD privilege (RDS/Aurora) fall back to serial with a loud WARN. Inert on PG / VStream sources." default:"0" placeholder:"N"`
 
 	// VStreamPreserveSkew (ADR-0120, roadmap item 27 — default flipped 2026-06-26)
 	// OPTS OUT of the new relaxed default and restores vtgate's MinimizeSkew hold
@@ -931,9 +934,9 @@ type SyncStartCmd struct {
 	// Threaded into the mysql engine in SyncStartCmd.Run.
 	VStreamPreserveSkew bool `name:"vstream-preserve-skew" help:"VStream CDC (Vitess/PlanetScale source) only: OPT OUT of the default and restore vtgate's MinimizeSkew hold (commit-time-ordered merged stream) on the steady-state multi-shard stream. Since ADR-0120 (default flipped) MinimizeSkew is OFF by default — both shards stream and drain CONCURRENTLY — because the old ON default was shown by a real cross-region A/B to FREEZE the lagging shard under an apply-deficit backlog. Set this only if you specifically need strict cross-shard commit-time delivery and accept the catch-up wedge risk. The DSN form vstream_preserve_skew=true also works; this flag wins. Inert on PG / native-MySQL sources and on a single-shard keyspace."`
 
-	NoIntraTableStealing bool `name:"no-intra-table-stealing" help:"Native-MySQL concurrent cold-copy (--copy-table-parallelism > 1) only: DISABLE intra-table PK-range work-stealing (ADR-0119). By default a large, chunk-eligible table (single/composite orderable PK, above the within-table row threshold) is split into PK-range chunks so idle reader connections can steal a CHUNK of the last big table — keeping the copy N-wide to the tail instead of tapering to one whole table. With this flag set, every table is copied as one whole-table work item (the prior tier-(a) whole-table-stealing behaviour). A throughput knob, not a correctness one: chunk coverage is gap-free + overlap-free either way. Inert on PG / VStream sources and on a serial (--copy-table-parallelism=1) cold-copy."`
+	NoIntraTableStealing bool `name:"no-intra-table-stealing" help:"Native-MySQL concurrent cold-copy (--copy-table-parallelism > 1; the engine default is auto: 4) only: DISABLE intra-table PK-range work-stealing (ADR-0119). By default a large, chunk-eligible table (single/composite orderable PK, above the within-table row threshold) is split into PK-range chunks so idle reader connections can steal a CHUNK of the last big table — keeping the copy N-wide to the tail instead of tapering to one whole table. With this flag set, every table is copied as one whole-table work item (the prior tier-(a) whole-table-stealing behaviour). A throughput knob, not a correctness one: chunk coverage is gap-free + overlap-free either way. Inert on PG / VStream sources and on a serial (--copy-table-parallelism=1) cold-copy."`
 
-	RawCopyFormat string `help:"FAST cold-start (ADR-0079, same-engine PG→PG) only: wire format for the raw-copy passthrough fast lane (ADR-0078). 'text' (default) is cross-major safe; 'binary' is used only when source and target server majors match (downgrades to text loudly otherwise); 'auto' requests binary. The lane engages ONLY for a no-transform copy (no --redact / --type-override / --expr-override / --inject-shard-column). Inert on MySQL/VStream sources (serial cold-start)." default:"text" enum:"text,binary,auto" placeholder:"text|binary|auto"`
+	RawCopyFormat string `help:"FAST cold-start (ADR-0079, same-engine PG→PG) only: wire format for the raw-copy passthrough fast lane (ADR-0078). 'text' (default) is cross-major safe; 'binary' is used only when source and target server majors match (downgrades to text loudly otherwise); 'auto' requests binary. The lane engages ONLY for a no-transform copy (no --redact / --type-override / --expr-override / --inject-shard-column). Inert on MySQL/VStream sources (no raw-copy lane there)." default:"text" enum:"text,binary,auto" placeholder:"text|binary|auto"`
 
 	MaxTargetConnections int `help:"Explicit ceiling on the target connection budget (connection-resilience item 4). On cold-start, sluice probes the target's connection-slot budget (Postgres max_connections / role / database limits minus in-use and a small reserve) and refuses loudly if no slot is free for the copy + CDC connections. 0 (default) = auto (probe-and-refuse-on-exhaustion, no operator ceiling). On the ADR-0079 FAST cold-start (PG source) it also bounds the cross-table × within-table copy + index-build connection product (plus the reserved CDC slot); on the serial cold-start it's the loud-refusal floor plus an explicit ceiling. Inert against engines without a connection-slot model (MySQL target)." default:"0" placeholder:"N"`
 
@@ -1410,7 +1413,8 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 	env.setEngines(source.Name(), target.Name())
 
 	// ADR-0118 finding 1(b): the FAST-cold-start parallelism flags are inert
-	// on a MySQL/VStream source (serial cold-start). If the operator set one
+	// on a MySQL/VStream source (its cold-copy parallelism is the
+	// engine-internal copy-table axis instead). If the operator set one
 	// EXPLICITLY against such a source, turn the silent no-op into a one-time
 	// loud WARN (detection is by the literal argv spelling, not the resolved
 	// value — see warnInertParallelismFlags).

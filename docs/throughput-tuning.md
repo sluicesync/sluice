@@ -81,6 +81,15 @@ rows); a value near `1` means the workload alternates kinds or has no
 runs to coalesce, so apply stays RTT-bound — in that case widen
 `--apply-concurrency` instead.
 
+## Sync cold-start cross-table parallelism (per source flavor)
+
+`sluice sync start`'s initial cold-start copy parallelizes across tables like `sluice migrate` does, but the mechanism — and the default — depends on the source flavor, because each flavor has a different consistency story for "N readers, one CDC handoff position":
+
+- **Postgres source:** parallel by default. The exported-snapshot fast path (ADR-0079) reuses migrate's full cross-table × within-table pool, every reader pinned to the one exported snapshot, budget-clamped by the target's connection-slot probe. `--table-parallelism` / `--bulk-parallelism` apply.
+- **Self-managed (non-Vitess) MySQL source:** parallel by default — `--copy-table-parallelism` auto-resolves to `min(4, table count)` FTWRL-coordinated pinned-snapshot readers (ADR-0101; the same cross-table auto:4 migrate uses). Consistency is identical to the serial path: one FTWRL cut, one binlog position, no stitch. Sources without the RELOAD privilege (RDS, Aurora, restricted users) fall back to the serial single-snapshot copy with a loud WARN — consistency preserved, concurrency lost; grant RELOAD to restore it. `--copy-table-parallelism=1` (or DSN `copy_table_parallelism=1`) is the serial opt-out. Target-side write concurrency is `readers × --copy-fanout-degree`; the operator owns `W × D ≤ --max-target-connections` (MySQL has no connection-slot probe).
+- **Vitess / PlanetScale (VStream) source:** sequential single-stream by default, DELIBERATELY — the cold-copy INFO log names the knob. N concurrent COPY streams are one flag away (`--vstream-copy-table-parallelism`, ADR-0099), but the default stays 1 because the stream count K is not persisted in the resume token: a changed default would silently re-derive a different table→stream partition for an interrupted copy resumed across a version upgrade (ADR-0099 §5). If you set K > 1, resume with the same K.
+- **Trigger-CDC flavors (pgtrigger / sqlite-trigger / d1-trigger):** serial by design — the snapshot/anchor consistency argument is bound to a single connection; there is no parallel knob. The cold-start INFO log says so.
+
 ## Parallel within-table bulk copy: `--bulk-parallelism` + `--bulk-parallel-min-rows`
 
 Default: `min(8, NumCPU)` parallel readers per table; tables under

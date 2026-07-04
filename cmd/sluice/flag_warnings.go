@@ -50,7 +50,9 @@ func sequenceMarginDeprecatedAliasUsed(args []string) bool {
 
 // inertParallelismFlagUsed reports whether the operator EXPLICITLY set one of
 // the FAST-cold-start parallelism flags (ADR-0118 finding 1) on a source whose
-// `sync start` cold-start is serial (so the flag is inert). Returns the flag
+// `sync start` cold-start never takes the ADR-0079 fast path (so the flag is
+// inert — the MySQL/VStream cold-copy parallelism is the engine-internal
+// copy-table axis instead). Returns the flag
 // name that tripped it (for the message) and true; "" / false otherwise. Pure
 // over (args, source) so both the source-class gate and the per-flag detection
 // are unit-pinned.
@@ -88,9 +90,11 @@ func warnDeprecatedSequenceMargin() {
 // the operator EXPLICITLY set one of the FAST-cold-start parallelism flags on a
 // `sync start` whose source engine has no effect for them — MySQL (binlog) or
 // PlanetScale/Vitess (VStream). Those flags govern only the ADR-0079 PG-source
-// fast cold-start; on a MySQL/VStream source the cold-copy is serial (tune it
-// with --copy-fanout-degree / --vstream-copy-table-parallelism /
-// --copy-table-parallelism instead). This turns the silent no-op into a loud
+// fast cold-start; a MySQL/VStream source's cold-copy parallelism is the
+// engine-internal copy-table axis (--copy-fanout-degree /
+// --vstream-copy-table-parallelism / --copy-table-parallelism — the native
+// axis defaults to auto:4 since the perf-parity gap-3 chunk). This turns the
+// silent no-op into a loud
 // one — the loud-failure tenet applied to a UX hazard — without changing any
 // behaviour.
 var warnInertParallelismFlagsOnce sync.Once
@@ -109,11 +113,15 @@ func warnInertParallelismFlags(ctx context.Context, source ir.Engine) {
 	})
 }
 
-// sourceHasSerialColdStart reports whether the named source engine runs a
-// SERIAL cold-start on `sync start` — i.e. the FAST-cold-start parallelism
-// flags (--bulk-parallelism / --table-parallelism / --bulk-parallel-min-rows)
-// are inert for it. True for the MySQL family (binlog) and PlanetScale/Vitess
+// sourceHasSerialColdStart reports whether the named source engine never takes
+// the ADR-0079 fast cold-start on `sync start` — i.e. the FAST-cold-start
+// parallelism flags (--bulk-parallelism / --table-parallelism /
+// --bulk-parallel-min-rows) are inert for it. True for the MySQL family
+// (binlog — whose cold-copy parallelism is the engine-internal
+// --copy-table-parallelism axis, auto:4 by default) and PlanetScale/Vitess
 // (VStream); false for Postgres, whose ADR-0079 fast cold-start honors them.
+// The name is historical (these sources' cold-copy is no longer serial by
+// default); it survives because the predicate is pinned by name in tests.
 // Keyed on the engine registry name so a new MySQL flavor slots in by name.
 func sourceHasSerialColdStart(source ir.Engine) bool {
 	switch source.Name() {

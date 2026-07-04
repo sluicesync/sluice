@@ -6,11 +6,12 @@ package mysql
 import "testing"
 
 // ADR-0118 finding 4 precedence pins: the cold-copy READ-axis resolvers honor
-// explicit CLI flag > DSN param > engine default (1 = serial) for BOTH axes
-// (VStream and native MySQL). These pin that the CLI override WINS over a DSN
-// value, that an unset (0) override falls back to the DSN, and that absent both
-// resolves to the serial default — and that the override is zero-value-safe
-// (Set(0) never overrides a DSN value).
+// explicit CLI flag > DSN param > engine default for BOTH axes (VStream:
+// 1 = serial, deliberate; native MySQL: auto 4 since the perf-parity gap-3
+// chunk). These pin that the CLI override WINS over a DSN value, that an
+// unset (0) override falls back to the DSN, and that absent both resolves to
+// the engine default — and that the override is zero-value-safe (Set(0)
+// never overrides a DSN value).
 //
 // The override is package-level process state (the --mysql-sql-mode idiom), so
 // each subtest resets it via the setters' "0 = unset" reset path with a direct
@@ -73,7 +74,8 @@ func TestADR0118_NativeCopyTableParallelism_Precedence(t *testing.T) {
 	}{
 		{name: "CLI wins over DSN", dsn: "u:p@tcp(h:3306)/db?copy_table_parallelism=2", cliFlag: 6, want: 6},
 		{name: "absent CLI falls back to DSN", dsn: "u:p@tcp(h:3306)/db?copy_table_parallelism=4", cliFlag: 0, want: 4},
-		{name: "absent both → serial default", dsn: "u:p@tcp(h:3306)/db", cliFlag: 0, want: 1},
+		{name: "absent both → auto default (gap 3)", dsn: "u:p@tcp(h:3306)/db", cliFlag: 0, want: defaultNativeCopyTableParallelism},
+		{name: "explicit CLI 1 is the serial opt-out", dsn: "u:p@tcp(h:3306)/db", cliFlag: 1, want: 1},
 		{name: "Set(0) does not override DSN", dsn: "u:p@tcp(h:3306)/db?copy_table_parallelism=5", cliFlag: -1, want: 5},
 	}
 	for _, tc := range cases {
@@ -115,7 +117,7 @@ func TestADR0118_Override_AxesIndependent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-	if n != 1 {
-		t.Errorf("native resolver = %d after setting ONLY the VStream override; want 1 (axes must be independent)", n)
+	if n != defaultNativeCopyTableParallelism {
+		t.Errorf("native resolver = %d after setting ONLY the VStream override; want the native default %d (axes must be independent)", n, defaultNativeCopyTableParallelism)
 	}
 }

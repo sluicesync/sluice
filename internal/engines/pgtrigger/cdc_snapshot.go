@@ -6,6 +6,7 @@ package pgtrigger
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"sluicesync.dev/sluice/internal/engines/postgres"
 	"sluicesync.dev/sluice/internal/ir"
@@ -77,6 +78,14 @@ func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.Snapsho
 			cfg.schema, ChangeLogTable,
 		)
 	}
+
+	// Perf-parity gap 3: the trigger-CDC cold-start copies tables SERIALLY on
+	// the one snapshot-pinned connection below — there is no parallel option
+	// on this flavor (the anchor + snapshot consistency argument is bound to
+	// that single REPEATABLE READ view; parallelizing it is a separate L-effort
+	// item recorded in docs/dev/perf-parity-matrix.md). Say so up front rather
+	// than leaving a silently slower-than-migrate cold start unexplained.
+	slog.InfoContext(ctx, "pgtrigger: snapshot: cold-start bulk copy runs SERIAL on the single snapshot connection (trigger-CDC design; no parallel knob on this flavor)")
 
 	// Pin a single connection and open the REPEATABLE READ snapshot.
 	// READ ONLY documents intent (the snapshot path never writes) and

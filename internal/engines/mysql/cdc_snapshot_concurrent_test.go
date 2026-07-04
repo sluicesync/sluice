@@ -12,12 +12,16 @@ import (
 
 // --- ADR-0101 native-MySQL concurrent cold-copy: unit pins ---
 
-// TestNativeCopyTableParallelismFromDSN pins the knob parse: absent → 1
-// (serial), a valid value passes through, a malformed value is a LOUD error
-// (the loud-failure tenet — an operator who set the knob deserves to know it
-// didn't parse), NOT a silent fallback to serial.
+// TestNativeCopyTableParallelismFromDSN pins the knob parse: absent → the
+// auto default (4 — perf-parity gap 3: migrate's cross-table auto, flipped
+// from 1 because the FTWRL N-snapshot is consistency-identical to serial and
+// the native path has no cross-process resume to destabilize; the VStream
+// default deliberately stays 1), an explicit 1 is the serial opt-out, a valid
+// value passes through, and a malformed value is a LOUD error (the
+// loud-failure tenet — an operator who set the knob deserves to know it
+// didn't parse), NOT a silent fallback.
 func TestNativeCopyTableParallelismFromDSN(t *testing.T) {
-	t.Run("absent defaults to 1 (serial)", func(t *testing.T) {
+	t.Run("absent defaults to auto 4 (perf-parity gap 3)", func(t *testing.T) {
 		cfg, err := parseDSN("u:p@tcp(h:3306)/db")
 		if err != nil {
 			t.Fatalf("parseDSN: %v", err)
@@ -26,8 +30,32 @@ func TestNativeCopyTableParallelismFromDSN(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse: %v", err)
 		}
-		if n != 1 {
-			t.Fatalf("absent param = %d; want 1 (the zero-value-safe serial default)", n)
+		if n != defaultNativeCopyTableParallelism {
+			t.Fatalf("absent param = %d; want %d (the auto default — migrate parity)", n, defaultNativeCopyTableParallelism)
+		}
+		if defaultNativeCopyTableParallelism != 4 {
+			t.Fatalf("defaultNativeCopyTableParallelism = %d; want 4 (migrate's defaultTableParallelism twin — revisit the gap-3 rationale before changing)", defaultNativeCopyTableParallelism)
+		}
+	})
+	t.Run("explicit 1 is the serial opt-out", func(t *testing.T) {
+		cfg, err := parseDSN("u:p@tcp(h:3306)/db?copy_table_parallelism=1")
+		if err != nil {
+			t.Fatalf("parseDSN: %v", err)
+		}
+		n, err := nativeCopyTableParallelismFromDSN(cfg)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if got := resolveCopyTableParallelism(n, 8); got != 1 {
+			t.Fatalf("explicit copy_table_parallelism=1 resolved to %d; want 1 (serial opt-out must survive the default flip)", got)
+		}
+	})
+	t.Run("default clamps to the table count (no over-open on small schemas)", func(t *testing.T) {
+		if got := resolveCopyTableParallelism(defaultNativeCopyTableParallelism, 2); got != 2 {
+			t.Fatalf("resolve(default, 2 tables) = %d; want 2 (clamped)", got)
+		}
+		if got := resolveCopyTableParallelism(defaultNativeCopyTableParallelism, 1); got != 1 {
+			t.Fatalf("resolve(default, 1 table) = %d; want 1 (one table never partitions)", got)
 		}
 	})
 	t.Run("valid value passes through", func(t *testing.T) {

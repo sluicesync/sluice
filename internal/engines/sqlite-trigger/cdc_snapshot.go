@@ -6,6 +6,7 @@ package sqlitetrigger
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -74,6 +75,15 @@ func openSnapshotStream(ctx context.Context, b backend) (*ir.SnapshotStream, err
 	if err != nil {
 		return nil, fmt.Errorf("sqlite-trigger: snapshot: encode position: %w", err)
 	}
+
+	// Perf-parity gap 3: the trigger-CDC cold-start copies tables SERIALLY on
+	// the one delegated reader below — no parallel option on this flavor (the
+	// MAX(id)-anchor gap-freedom argument leans on the single-writer total
+	// order; parallelizing the copy is a separate L-effort item recorded in
+	// docs/dev/perf-parity-matrix.md). Say so up front rather than leaving a
+	// silently slower-than-migrate cold start unexplained.
+	slog.InfoContext(ctx, "sqlite-trigger: snapshot: cold-start bulk copy runs SERIAL on a single reader (trigger-CDC design; no parallel knob on this flavor)",
+		slog.String("driver", b.driver))
 
 	// Rows: the delegated cold-start reader (its own read connection).
 	rowReader, err := b.coldStart.OpenRowReader(ctx, b.dsn)

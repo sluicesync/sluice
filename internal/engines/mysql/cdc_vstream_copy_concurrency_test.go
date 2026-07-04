@@ -13,7 +13,18 @@ import (
 // TestVStreamCopyTableParallelismFromDSN pins the DSN-knob parse (ADR-0099):
 // absent ⇒ default 1 (sequential), a valid integer passes through as the raw
 // intent, and a malformed value is a LOUD error (not a silent fallback).
+//
+// The absent→1 case is a DELIBERATE divergence from the native-binlog default
+// (auto 4 since the perf-parity gap-3 chunk): K is not persisted in the
+// position token, so a default flip would silently change the re-derived
+// table→stream partition for any durable-watermark resume across the upgrade
+// boundary — the ADR-0099 §5 silent-loss class. Do not "fix" this to match
+// the native default without revisiting that rationale (see
+// defaultCopyTableParallelism's comment + docs/dev/perf-parity-matrix.md).
 func TestVStreamCopyTableParallelismFromDSN(t *testing.T) {
+	if defaultCopyTableParallelism != 1 {
+		t.Fatalf("defaultCopyTableParallelism = %d; want 1 — the VStream sequential default is deliberate (resume-partition stability); revisit ADR-0099 §5 before changing", defaultCopyTableParallelism)
+	}
 	cases := []struct {
 		name    string
 		param   string
