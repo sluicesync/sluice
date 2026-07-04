@@ -204,31 +204,55 @@ func (r *D1RowReader) tableHasRowid(ctx context.Context, table string) bool {
 	return err == nil
 }
 
-// stream fetches pages and pushes decoded IR Rows onto out, closing it when
+// d1Page is one fetched page handed from the prefetching fetcher goroutine to
+// the decode loop. err carries that page's fetch failure, delivered IN
+// SEQUENCE so it surfaces exactly when the sequential loop would have reached
+// the page. final marks the stream's terminal page (short page or fetch
+// failure): if the channel closes WITHOUT a final page, the fetch was aborted
+// mid-table and the consumer must NOT report a clean read (silent truncation).
+type d1Page struct {
+	rows  []d1Row
+	err   error
+	final bool
+}
+
+// stream decodes fetched pages and pushes IR Rows onto out, closing it when
 // done. It owns the sticky error.
+//
+// Single-page prefetch (ADR-0151): pages arrive from [fetchPages], a fetcher
+// goroutine that issues page N+1's HTTP request while page N's rows decode and
+// stream downstream — hiding one HTTP round-trip per page. The handoff channel
+// is UNBUFFERED, so the fetcher holds at most ONE page beyond the one being
+// consumed (bounded memory ≈ one extra page), never an N-deep pipeline — the
+// same shape as the chain-replay read-ahead (pipeline.streamIncrementalChanges).
+// This is RTT-hiding, NOT within-table chunking (which stays deferred — see
+// [d1PageSize]). Row order is unchanged: a single fetcher and a single consumer
+// hand pages over FIFO, and rows decode in page order.
 func (r *D1RowReader) stream(ctx context.Context, table *ir.Table, plan pagePlan, out chan<- ir.Row) {
 	defer close(out)
 
 	enc := resolveDateEncoding(r.dateEnc)
-	projection := buildD1Projection(table, plan)
-	pageSize := r.effectivePageSize()
+
+	// Cancelling fetchCtx on any early return (decode refusal, downstream
+	// cancellation) aborts the fetcher's in-flight HTTP request and its
+	// blocked handoff, so the goroutine is always reaped — no leak.
+	fetchCtx, cancelFetch := context.WithCancel(ctx)
+	defer cancelFetch()
+	pages := make(chan d1Page) // unbuffered: exactly one page of read-ahead
+	go r.fetchPages(fetchCtx, table, plan, pages)
 
 	var (
-		lastKey []string // exact-text bound from the previous page (keyset)
-		offset  int      // OFFSET cursor (fallback only)
-		ordinal int64    // 1-based row counter, for error context
+		ordinal  int64 // 1-based row counter, for error context
+		sawFinal bool
 	)
-	for {
-		sql, params := buildD1PageQuery(table, plan, projection, lastKey, offset, pageSize)
-		rows, err := r.client.queryRows(ctx, sql, params...)
-		if err != nil {
-			r.setErr(fmt.Errorf("d1: table %q: read page: %w", table.Name, err))
+	for page := range pages {
+		if page.err != nil {
+			r.setErr(fmt.Errorf("d1: table %q: read page: %w", table.Name, page.err))
 			return
 		}
-
-		for _, raw := range rows {
+		for _, raw := range page.rows {
 			ordinal++
-			row, key, err := r.decodeRow(table, plan, raw, enc, ordinal)
+			row, _, err := r.decodeRow(table, plan, raw, enc, ordinal)
 			if err != nil {
 				r.setErr(err)
 				return
@@ -239,14 +263,71 @@ func (r *D1RowReader) stream(ctx context.Context, table *ir.Table, plan pagePlan
 				r.setErr(ctx.Err())
 				return
 			}
-			lastKey = key
 		}
-
-		// A short (or empty) page is the last page.
-		if len(rows) < pageSize {
+		sawFinal = page.final
+	}
+	if !sawFinal {
+		// The channel closed without a terminal page: the fetcher was
+		// aborted (ctx cancellation) mid-table. Report the cause loudly —
+		// a clean return here would be a SILENTLY TRUNCATED read.
+		if err := ctx.Err(); err != nil {
+			r.setErr(err)
 			return
 		}
-		offset += len(rows)
+		r.setErr(fmt.Errorf("d1: table %q: page fetch aborted before the final page", table.Name))
+	}
+}
+
+// fetchPages issues the page requests strictly in order, one page ahead of the
+// decode loop, and hands each page over the unbuffered pages channel (closing
+// it when the table is exhausted or a page fails). The requests are
+// byte-identical to the pre-prefetch sequential loop's: same SQL, same bound
+// params, same order — page N+1's keyset bound is the exact-text key of page
+// N's LAST row via the same [extractKey] path, so the > 2^53 string-bound
+// discipline (ADR-0132 §6) is unchanged.
+//
+// A fetch error is delivered as that page's [d1Page.err] and ends the fetch —
+// the consumer surfaces it only after the prior page's rows have streamed,
+// exactly as the sequential loop would have. A key-extraction failure on the
+// last row stops fetching WITHOUT delivering an error: the consumer's own
+// per-row decodeRow deterministically reproduces the same loud refusal (with
+// full table/row context) when it reaches that row, so the error is never
+// duplicated and never lost.
+func (r *D1RowReader) fetchPages(ctx context.Context, table *ir.Table, plan pagePlan, pages chan<- d1Page) {
+	defer close(pages)
+
+	projection := buildD1Projection(table, plan)
+	pageSize := r.effectivePageSize()
+
+	var (
+		lastKey []string // exact-text bound from the previous page (keyset)
+		offset  int      // OFFSET cursor (fallback only)
+		ordinal int64    // rows fetched so far (error context for extractKey)
+	)
+	for {
+		sql, params := buildD1PageQuery(table, plan, projection, lastKey, offset, pageSize)
+		rows, err := r.client.queryRows(ctx, sql, params...)
+		// A short (or empty) page is the last page; a failed page ends the
+		// stream when the consumer reaches it.
+		final := err != nil || len(rows) < pageSize
+		select {
+		case pages <- d1Page{rows: rows, err: err, final: final}:
+		case <-ctx.Done():
+			return
+		}
+		if final {
+			return
+		}
+		if plan.useOffset {
+			offset += len(rows)
+			continue
+		}
+		ordinal += int64(len(rows))
+		key, err := r.extractKey(table, plan, rows[len(rows)-1], ordinal)
+		if err != nil {
+			return // consumer reproduces this refusal at the same row
+		}
+		lastKey = key
 	}
 }
 
