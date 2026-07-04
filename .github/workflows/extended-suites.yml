@@ -14,6 +14,11 @@
 # multi-process Vitess clusters and runs fault injection, far too
 # heavy and too stateful for the per-PR gate).
 #
+# The `ddlfixture` leg (repo-audit 2026-07-03 T-5) is DISPATCH-ONLY —
+# it is excluded from the weekly schedule on purpose: the Dolt
+# sqllogictest corpus harness is a fixture sweep, not a regression
+# suite; run it on demand before/after schema-reader changes.
+#
 # Deliberately NOT here: the `kmsverify` suite
 # (internal/pipeline/backup_kms_localstack_integration_test.go) is
 # scaffolding — every test body t.Skip()s pending localstack + AWS
@@ -33,7 +38,7 @@ on:
         required: false
         default: "all"
         type: choice
-        options: [all, chaos, reshard, vstream-pipeline]
+        options: [all, chaos, reshard, vstream-pipeline, ddlfixture]
 
 permissions:
   contents: read
@@ -60,7 +65,13 @@ jobs:
     name: Vitess chaos suite
     if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'chaos' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # -race roughly halves throughput on the CPU-bound stretches
+    # (repo-audit 2026-07-03 item 0.4 added it to this leg; the
+    # vstream-pipeline leg had it from day one), so the pre-race
+    # budgets (80m inner / 90 outer) are bumped ~1.5x. Inner stays
+    # < outer so Go's diagnostic timeout-panic fires before the
+    # hard job kill.
+    timeout-minutes: 135
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
@@ -81,7 +92,7 @@ jobs:
         env:
           VITESS_LITE_IMAGE: ghcr.io/sluicesync/sluice-vitess:v24.0.1
         run: |
-          go test -tags='integration vitesscluster chaos' -count=1 -timeout=80m \
+          go test -tags='integration vitesscluster chaos' -race -count=1 -timeout=120m \
             -run '^TestVitessChaos_' -v ./internal/engines/mysql/...
 
   # The reshard correctness test: proves the CDC reader follows a
@@ -93,7 +104,9 @@ jobs:
     name: Vitess reshard correctness
     if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'reshard' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    # Budgets bumped ~1.5x from the pre-race 65m/75 for the -race
+    # overhead (repo-audit 2026-07-03 item 0.4); inner < outer as above.
+    timeout-minutes: 110
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
@@ -117,7 +130,7 @@ jobs:
 
       - name: Run the reshard suite
         run: |
-          go test -tags='integration vitessreshard' -count=1 -timeout=65m \
+          go test -tags='integration vitessreshard' -race -count=1 -timeout=95m \
             -run '^TestVitessReshard_' -v ./internal/engines/mysql/...
 
   # The PIPELINE-package vstream suite (Bug-132 chunked parity,
@@ -174,3 +187,49 @@ jobs:
         run: |
           go test -tags='integration vstream' -race -count=1 -timeout=40m \
             -run '^(TestMigrate_VStream|TestStreamer_.*VStream|TestSpikeShapeA_)' -v ./internal/pipeline/
+
+  # The DDL-fixture harness (internal/translate/ddl_fixture_test.go):
+  # sweep the Dolt sqllogictest createtable1 corpus (~4,575 CREATE
+  # TABLEs) through a real MySQL 8.0 container and sluice's schema
+  # reader, asserting structural invariants per statement. DISPATCH-
+  # ONLY (repo-audit 2026-07-03 T-5 gave it this CI entry point —
+  # before this leg the suite was runnable but ran nowhere): it is a
+  # corpus sweep for schema-reader changes, not a weekly regression
+  # signal, and its ~25-30 min wall clock is all fixture grind. It IS
+  # included in a dispatched `suite: all` (all means all), but the
+  # `github.event_name` guard keeps it off the weekly schedule.
+  #
+  # No -race: the harness is a single-goroutine DDL apply/read loop,
+  # and -race would roughly double an already corpus-bound half hour
+  # for no concurrency coverage.
+  #
+  # Any ddlfixture-tagged test MUST carry the TestDDLFixture prefix or
+  # the -run filter below silently skips it (enforced by
+  # scripts/check-run-filter-coverage.sh in ci.yml's Lint job).
+  ddlfixture:
+    name: MySQL DDL-fixture corpus
+    if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.suite == 'all' || github.event.inputs.suite == 'ddlfixture') }}
+    runs-on: ubuntu-latest
+    # The in-test context budget is 30m; the harness's own header asks
+    # for -timeout at least 5m larger (deferred summary headroom), and
+    # the outer cap stays above the inner per the usual invariant.
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # The harness boots stock mysql:8.0 via testcontainers; pre-pull
+      # it through its GHCR mirror (docker.io fallback) so the boot
+      # hits the local cache — same task-#36 pattern as ci.yml.
+      - name: Pre-pull mysql:8.0 via its GHCR mirror (docker.io fallback)
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/ci-mirror-pull.sh mysql:8.0
+
+      - name: Run the DDL-fixture corpus
+        run: |
+          go test -tags='integration ddlfixture' -count=1 -timeout=40m \
+            -run '^TestDDLFixture' -v ./internal/translate/...

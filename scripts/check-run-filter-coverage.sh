@@ -35,10 +35,11 @@
 #   - vitesscluster  → vitess-version-matrix.yml `cluster` (weekly; pins
 #                      the SCHEDULED default filter — dispatch may
 #                      override it per-run)
+#   - ddlfixture     → extended-suites.yml `ddlfixture` (dispatch-only)
 #
 # Tags deliberately WITHOUT an axis here: `psverify` (cron off per
-# operator), `kmsverify` (skip-scaffolding), `jsonbench`/`compressbench`/
-# `ddlfixture` (local/on-demand, no `-run` filter to escape). The ci.yml
+# operator), `kmsverify` (skip-scaffolding), `jsonbench`/`compressbench`
+# (local/on-demand, no `-run` filter to escape). The ci.yml
 # pipeline integration shards need no axis either: their -run/-skip
 # regexes are a complete partition (the -skip shard catches every name
 # the other two don't), so no name can escape.
@@ -49,6 +50,7 @@ postgis;PostGIS_;internal/pipeline/... internal/engines/postgres/...;ci.yml inte
 chaos;^TestVitessChaos_;internal/engines/mysql/...;extended-suites.yml chaos
 vitessreshard;^TestVitessReshard_;internal/engines/mysql/...;extended-suites.yml reshard
 vitesscluster!chaos;TestVitessCluster;internal/engines/mysql/...;vitess-version-matrix.yml cluster (weekly default)
+ddlfixture;^TestDDLFixture;internal/translate/...;extended-suites.yml ddlfixture
 '
 
 set -eu
