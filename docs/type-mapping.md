@@ -224,6 +224,7 @@ When the IR is emitted as MySQL DDL, the inverse mapping applies, with the follo
 - `Decimal{Unconstrained: true}` is emitted as bare `NUMERIC` (no parentheses) — PostgreSQL's native arbitrary-precision form. Constrained `Decimal{Precision, Scale}` emits `NUMERIC(p,s)` unchanged. See the [unconstrained numeric](#unconstrained-postgres-numeric-no-precisionscale--owner-surface-design-call-v069x--bug-69) edge case.
 - `Boolean{}` is emitted as `boolean`.
 - Temporal types with `PrecisionUnspecified` emit the BARE form (`TIMESTAMP WITH TIME ZONE`, no parentheses); a known precision always emits explicitly, **including `(0)`** — the pre-fix `0 → bare` collapse silently widened an explicit `timestamptz(0)` (and a MySQL `DATETIME`, whose precision is genuinely 0) to the 6-behaving bare form. See [temporal precision](#temporal-fractional-second-precision-bare-vs-explicit--restore-parity-triage-3).
+- A `ConstraintBacked` unique index (a source PG `CONSTRAINT x UNIQUE (...)`) re-emits as `ALTER TABLE ... ADD CONSTRAINT x UNIQUE (...)` in the constraints phase (unique constraints before FKs, which may reference them); a plain unique index stays `CREATE UNIQUE INDEX` in the index phase. See [UNIQUE constraints vs unique indexes](#unique-constraints-vs-unique-indexes--restore-parity-triage-4).
 - `JSON{Binary: false}` is emitted as `jsonb` by default, since `jsonb` is almost always the right choice on Postgres. Override available.
 - `Geometry{}` requires the PostGIS extension; if PostGIS is not in the allowlist, the run errors with an explicit message.
 
@@ -344,6 +345,12 @@ The temporal counterpart of the unconstrained-numeric case above. A PG column de
 - **SQLite/D1:** SQLite temporals are TEXT storage with no precision concept; the SQLite reader emits `PrecisionUnspecified` and the SQLite writer ignores precision entirely. SQLite → MySQL therefore now lands `DATETIME(6)` (previously bare `DATETIME`, which truncated fractional seconds in SQLite text values — a silent-loss fix that rides along).
 - **Engine asymmetry (deliberate):** MySQL's reader *always* knows the precision — `information_schema` reports 0 for a bare `DATETIME`, and bare ≡ `(0)` in MySQL — so MySQL-sourced temporals never carry `PrecisionUnspecified`. Only engines with a genuine "no declared precision" catalog state (PG's typmod -1, SQLite's affinity typing) produce it.
 - **Cross-version:** backups/manifests written by older binaries carry the materialized `Precision: 6`; they decode as an explicit `(6)` and restore byte-identically to the old behaviour. The wire flag is append-only (`temporal_precision_unspecified`), no backup-format bump.
+
+### UNIQUE constraints vs unique indexes — restore-parity TRIAGE #4
+
+PostgreSQL distinguishes a table-level `CONSTRAINT x UNIQUE (cols)` (a `pg_constraint` row owning a backing index) from a plain `CREATE UNIQUE INDEX`. They are near-equivalent for enforcement, but only the constraint form supports `INSERT ... ON CONFLICT ON CONSTRAINT x` and dumps as `ADD CONSTRAINT` — demoting one to a bare index (the pre-fix behaviour) broke that surface and the catalog diff. The IR carries the distinction via `ir.Index.ConstraintBacked`; the PG writer re-emits constraints in the constraints phase (all unique constraints before any FK, since FKs may reference them; `INCLUDE` payload columns carry) and plain unique indexes in the index phase. The Bug 125 keyless-table path is unchanged: a PK-less table's promoted COPY key is emitted inline as a `CONSTRAINT ... UNIQUE` at CREATE TABLE time and skipped by both later phases.
+
+**Engine asymmetry (deliberate):** MySQL has no such distinction — a MySQL `UNIQUE KEY` *is* an index under the hood, so MySQL-sourced unique indexes never carry `ConstraintBacked`, and a PG-sourced unique CONSTRAINT lands on a MySQL (or SQLite) target as a unique index — the only shape those engines have. Round-tripping PG → MySQL → PG therefore lands the constraint as a plain unique index; only same-engine PG (and PG backups) preserve constraint identity.
 
 ### MySQL ENUM and SET → Postgres
 

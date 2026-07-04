@@ -491,6 +491,14 @@ func (w *SchemaWriter) indexBuildJobsForTables(tables []*ir.Table) []indexBuildJ
 			if _, skipped := skip[idx.Name]; skipped {
 				continue
 			}
+			// TRIAGE #4: a UNIQUE-constraint-backed index is re-created
+			// as ALTER TABLE ... ADD CONSTRAINT in [CreateConstraints]
+			// (constraints are deferred like FKs); building it here as
+			// CREATE UNIQUE INDEX would demote it to a plain index and
+			// break ON CONFLICT ON CONSTRAINT on the target.
+			if idx.ConstraintBacked {
+				continue
+			}
 			jobs = append(jobs, indexBuildJob{tableName: table.Name, idx: idx})
 		}
 	}
@@ -750,6 +758,17 @@ func (w *SchemaWriter) CreateConstraints(ctx context.Context, s *ir.Schema) erro
 		return errors.New("postgres: CreateConstraints: schema is nil")
 	}
 	w.degradedFKs = nil
+	// UNIQUE constraints first, across ALL tables, before any FK: a
+	// foreign key may reference the columns of another table's UNIQUE
+	// constraint, and PG requires the backing unique index to exist
+	// when the FK is added (TRIAGE #4 — these used to be created as
+	// plain unique indexes in the index phase, which also satisfied
+	// FKs; the ordering guarantee moves here with them).
+	for _, table := range orderedTables(s) {
+		if err := w.createUniqueConstraints(ctx, table); err != nil {
+			return err
+		}
+	}
 	for _, table := range orderedTables(s) {
 		fks := append([]*ir.ForeignKey(nil), table.ForeignKeys...)
 		sort.Slice(fks, func(i, j int) bool {
@@ -824,6 +843,65 @@ func pgForeignKeyExists(ctx context.Context, db *sql.DB, schema, table, constrai
 		JOIN pg_class t      ON t.oid = c.conrelid
 		JOIN pg_namespace n  ON n.oid = t.relnamespace
 		WHERE c.contype = 'f' AND c.conname = $1 AND t.relname = $2 AND n.nspname = $3)`
+	var exists bool
+	if err := db.QueryRowContext(ctx, q, constraintName, table, schema).Scan(&exists); err != nil {
+		return false, fmt.Errorf("pg_constraint probe: %w", err)
+	}
+	return exists, nil
+}
+
+// createUniqueConstraints adds the table's UNIQUE constraints — the
+// ConstraintBacked unique indexes the index phase deliberately skips
+// (TRIAGE #4) — via ALTER TABLE ... ADD CONSTRAINT, sorted by name for
+// a deterministic DDL sequence. Skips the index emitTableDef already
+// promoted inline for a PK-less table (Bug 125 — the inline promotion
+// IS a `CONSTRAINT ... UNIQUE`, so nothing is demoted; re-adding it
+// here under the source name could create a duplicate). Idempotent
+// resume mirrors the FK path: PG has no ADD CONSTRAINT IF NOT EXISTS,
+// so detect-then-skip via pg_constraint.
+func (w *SchemaWriter) createUniqueConstraints(ctx context.Context, table *ir.Table) error {
+	inlineSkip := inlineSkipIndexNames(table)
+	indexes := append([]*ir.Index(nil), table.Indexes...)
+	sort.Slice(indexes, func(i, j int) bool {
+		return indexes[i].Name < indexes[j].Name
+	})
+	for _, idx := range indexes {
+		if idx == nil || !idx.ConstraintBacked {
+			continue
+		}
+		if _, skipped := inlineSkip[idx.Name]; skipped {
+			continue
+		}
+		present, err := pgUniqueConstraintExists(ctx, w.db, w.schema, table.Name, idx.Name)
+		if err != nil {
+			return fmt.Errorf("postgres: probe unique constraint %q on %q: %w", idx.Name, table.Name, err)
+		}
+		if present {
+			continue
+		}
+		stmt, err := emitAddUniqueConstraint(w.schema, table.Name, idx)
+		if err != nil {
+			return err
+		}
+		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("postgres: add unique constraint %q on %q: %w", idx.Name, table.Name, err)
+		}
+	}
+	return nil
+}
+
+// pgUniqueConstraintExists reports whether a UNIQUE constraint named
+// constraintName is present on schema.table. The contype 'u' scope
+// mirrors [pgForeignKeyExists]'s 'f' — a same-named FK/CHECK won't
+// false-match. Used by createUniqueConstraints for idempotent resume
+// (Bug 131 same-class) and to converge with the Bug 125 inline
+// promotion when the promoted name matches the source name.
+func pgUniqueConstraintExists(ctx context.Context, db *sql.DB, schema, table, constraintName string) (bool, error) {
+	const q = `SELECT EXISTS(
+		SELECT 1 FROM pg_constraint c
+		JOIN pg_class t      ON t.oid = c.conrelid
+		JOIN pg_namespace n  ON n.oid = t.relnamespace
+		WHERE c.contype = 'u' AND c.conname = $1 AND t.relname = $2 AND n.nspname = $3)`
 	var exists bool
 	if err := db.QueryRowContext(ctx, q, constraintName, table, schema).Scan(&exists); err != nil {
 		return false, fmt.Errorf("pg_constraint probe: %w", err)
@@ -1208,6 +1286,12 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 			if _, skipped := skip[idx.Name]; skipped {
 				continue
 			}
+			// TRIAGE #4: constraint-backed unique indexes preview as
+			// ALTER TABLE ... ADD CONSTRAINT in Phase 3 (mirrors the
+			// live CreateIndexes/CreateConstraints split).
+			if idx.ConstraintBacked {
+				continue
+			}
 			stmt, err := emitCreateIndex(w.schema, table.Name, idx, w.emitOpts())
 			if err != nil {
 				return nil, err
@@ -1224,7 +1308,33 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 		}
 	}
 
-	// Phase 3: foreign-key constraints.
+	// Phase 3: constraints — UNIQUE constraints first across all
+	// tables, then FKs (an FK may reference another table's UNIQUE
+	// constraint), mirroring the live CreateConstraints ordering.
+	for _, table := range orderedTables(s) {
+		inlineSkip := inlineSkipIndexNames(table)
+		indexes := append([]*ir.Index(nil), table.Indexes...)
+		sort.Slice(indexes, func(i, j int) bool {
+			return indexes[i].Name < indexes[j].Name
+		})
+		for _, idx := range indexes {
+			if idx == nil || !idx.ConstraintBacked {
+				continue
+			}
+			if _, skipped := inlineSkip[idx.Name]; skipped {
+				continue
+			}
+			stmt, err := emitAddUniqueConstraint(w.schema, table.Name, idx)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, ir.DDLStatement{
+				Table: table.Name,
+				Kind:  "ALTER TABLE",
+				SQL:   trimTrailingSemicolon(stmt),
+			})
+		}
+	}
 	for _, table := range orderedTables(s) {
 		fks := append([]*ir.ForeignKey(nil), table.ForeignKeys...)
 		sort.Slice(fks, func(i, j int) bool {

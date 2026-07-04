@@ -46,8 +46,9 @@ import (
 // Oracle side (full-fidelity pg_dump restore): 1 enum type + 1 domain
 // + 1 standalone sequence + 1 serial backing sequence
 // (legacy_counters_id_seq) + 8 tables (customers, orders, shipments,
-// bookings, legacy_counters, events + 2 partitions) + 3 secondary
-// indexes = 15.
+// bookings, legacy_counters, events + 2 partitions) + 4 secondary
+// indexes (incl. the plain unique index shipments_order_carrier_uidx;
+// the *_unique UNIQUE constraints dump as ALTERs, not CREATEs) = 16.
 // Sluice side: the partition family (3 tables) is knowingly absent
 // and the serial backing sequence is modernized into an identity
 // column; the standalone sequence IS carried (item-51 finding #1
@@ -56,7 +57,7 @@ import (
 // the 2 sluice state tables = 10 (indexes excluded from the floor so
 // an index-fidelity regression surfaces as a DIFF, not a guard trip).
 const (
-	dumpParityOracleCreateFloor = 15
+	dumpParityOracleCreateFloor = 16
 	dumpParitySluiceCreateFloor = 10
 )
 

@@ -58,18 +58,8 @@ var dumpParityAllowlist = []dumpParityAllowlistEntry{
 		Citation: "docs/type-mapping.md \"Sequences and serial columns\"",
 	},
 	// TRIAGE #3 (bare-timestamptz precision materialization: the
-	// customers + shipments entries) is CLOSED — the ir temporal
-	// PrecisionUnspecified state carries the bare form at FULL parity.
-	{
-		Pattern:  "ALTER TABLE public.* ADD CONSTRAINT *_unique",
-		Reason:   "UNIQUE constraints on tables that have a PK are recreated as plain unique INDEXES, not table constraints (only the keyless-table cold-start path promotes one inline); semantically near-equivalent but catalog-visibly different",
-		Citation: dumpParityTriageCitation,
-	},
-	{
-		// pg_dump does not schema-qualify the index name in CREATE
-		// INDEX (only the ON <table> side), so the key is the bare name.
-		Pattern:  "CREATE INDEX *_unique",
-		Reason:   "sluice side only: the unique index that stands in for the demoted UNIQUE constraint (counterpart of the ADD CONSTRAINT *_unique entry)",
-		Citation: dumpParityTriageCitation,
-	},
+	// customers + shipments entries) and TRIAGE #4 (UNIQUE constraints
+	// demoted to unique indexes: the *_unique entry pair) are CLOSED —
+	// ir temporal PrecisionUnspecified + ir.Index.ConstraintBacked
+	// carry both shapes at FULL parity. Zero TRIAGE entries remain.
 }

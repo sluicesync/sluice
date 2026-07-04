@@ -1209,6 +1209,20 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			-- dialect with table-qualified column refs resolved. Empty
 			-- string for a full (non-partial) index.
 			COALESCE(pg_get_expr(ix.indpred, ix.indrelid), '') AS predicate,
+			-- TRIAGE #4: is this unique index owned by a table-level
+			-- UNIQUE CONSTRAINT (pg_constraint contype='u' whose
+			-- conindid is this index)? The constraint form is
+			-- catalog-distinct from a plain CREATE UNIQUE INDEX (only
+			-- it supports ON CONFLICT ON CONSTRAINT and dumps as ADD
+			-- CONSTRAINT), so the writer must re-emit it as a
+			-- constraint, not demote it to a bare index. contype 'u'
+			-- only: 'p' (PK) rides Table.PrimaryKey and 'x' (EXCLUDE)
+			-- rides Table.ExcludeConstraints.
+			EXISTS (
+				SELECT 1 FROM pg_constraint con
+				WHERE  con.conindid = ix.indexrelid
+				  AND  con.contype  = 'u'
+			) AS constraint_backed,
 			-- ADR-0047: is the access method owned by an extension
 			-- (pg_depend deptype 'e')? An extension-owned AM that is
 			-- NOT one of the ADR-0032 catalogued ones is carried
@@ -1267,6 +1281,7 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			nKeyAtts                              int
 			indOption                             int
 			predicate                             string
+			constraintBacked                      bool
 			amExtOwned, opclassExtOwned           bool
 		)
 		if err := rows.Scan(
@@ -1274,6 +1289,7 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			&isUnique, &isPrimary,
 			&colName, &ord, &opclass, &opclassDefault, &exprText,
 			&nKeyAtts, &indOption, &predicate,
+			&constraintBacked,
 			&amExtOwned, &opclassExtOwned,
 		); err != nil {
 			return err
@@ -1308,6 +1324,10 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 				Name:   indexName,
 				Unique: isUnique,
 				Kind:   kind,
+				// TRIAGE #4: a UNIQUE-constraint-owned index re-emits
+				// as ALTER TABLE ... ADD CONSTRAINT, not CREATE UNIQUE
+				// INDEX. Never true for PK indexes (contype 'p').
+				ConstraintBacked: constraintBacked && isUnique && !isPrimary,
 			}
 			// ADR-0032: preserve extension-introduced access-method
 			// names (ivfflat, hnsw) verbatim so the same-engine writer
@@ -1485,11 +1505,17 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 		return err
 	}
 
-	// Drain in sorted key order, not map order: Go map iteration is
-	// randomized, and an unordered Indexes slice makes two reads of the
-	// SAME schema structurally unequal — recorded manifests then diff
-	// against fresh reads as phantom alter_table deltas (task #41,
-	// observed live as schema_deltas=6 on a DDL-free incremental).
+	attachCollectedIndexes(tables, collected, primary)
+	return nil
+}
+
+// attachCollectedIndexes drains the populateIndexes accumulator onto
+// the tables in sorted key order, not map order: Go map iteration is
+// randomized, and an unordered Indexes slice makes two reads of the
+// SAME schema structurally unequal — recorded manifests then diff
+// against fresh reads as phantom alter_table deltas (task #41,
+// observed live as schema_deltas=6 on a DDL-free incremental).
+func attachCollectedIndexes(tables map[string]*ir.Table, collected map[tableObjectKey]*ir.Index, primary map[string]string) {
 	for _, k := range sortedTableObjectKeys(collected) {
 		idx := collected[k]
 		t := tables[k.table]
@@ -1499,7 +1525,6 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 		}
 		t.Indexes = append(t.Indexes, idx)
 	}
-	return nil
 }
 
 // populateForeignKeys fills in ForeignKey lists. Uses pg_constraint

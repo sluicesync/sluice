@@ -566,6 +566,21 @@ type Index struct {
 	Columns []IndexColumn
 	// Unique reports whether the index enforces uniqueness.
 	Unique bool
+	// ConstraintBacked reports that this unique index exists because a
+	// table-level UNIQUE CONSTRAINT of the same name owns it
+	// (PostgreSQL `CONSTRAINT x UNIQUE (...)` — pg_constraint
+	// contype='u' with conindid pointing at this index), as opposed to
+	// a plain `CREATE UNIQUE INDEX`. The two are near-equivalent but
+	// catalog-distinct: only the constraint form supports `ON CONFLICT
+	// ON CONSTRAINT x` and dumps as `ADD CONSTRAINT`, so demoting one
+	// to a bare index breaks that surface (restore-parity TRIAGE #4).
+	// The PG writer re-emits these as `ALTER TABLE ... ADD CONSTRAINT`
+	// in the constraints phase instead of `CREATE UNIQUE INDEX` in the
+	// index phase. Only the PG reader sets it (MySQL UNIQUE is always
+	// an index under the hood; SQLite's inline UNIQUE auto-indexes are
+	// unnamed) — engines without the distinction ignore it and emit a
+	// plain unique index. Meaningful only when Unique is true.
+	ConstraintBacked bool
 	// Kind is the storage structure (btree, hash, gin, etc.).
 	Kind IndexKind
 	// Method is the verbatim engine-specific access-method name when

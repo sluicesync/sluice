@@ -1659,6 +1659,63 @@ func emitAddForeignKey(schema, childTable string, fk *ir.ForeignKey) (string, er
 	return sb.String(), nil
 }
 
+// emitAddUniqueConstraint produces the ALTER TABLE ... ADD CONSTRAINT
+// statement for a UNIQUE constraint carried as a ConstraintBacked
+// unique index (TRIAGE #4). The constraint name is the source index
+// name VERBATIM — a ConstraintBacked index is only ever produced by
+// the PG reader, whose names are schema-unique by construction, so the
+// cross-engine pgIndexName table-prefix disambiguation does not apply
+// (and would break `ON CONFLICT ON CONSTRAINT <source-name>` on the
+// target). INCLUDE payload columns carry (PG 11+ supports UNIQUE ...
+// INCLUDE); expression entries are a sluice-bug condition — PG forbids
+// expressions in a UNIQUE constraint, so a ConstraintBacked index can
+// never carry one, and hitting it means the reader mis-flagged a plain
+// expression index.
+func emitAddUniqueConstraint(schema, tableName string, idx *ir.Index) (string, error) {
+	if idx == nil {
+		return "", errors.New("postgres: emitAddUniqueConstraint: index is nil")
+	}
+	if idx.Name == "" || len(idx.Columns) == 0 {
+		return "", fmt.Errorf("postgres: emitAddUniqueConstraint: constraint on %q has no name or no columns", tableName)
+	}
+
+	var sb strings.Builder
+	sb.WriteString("ALTER TABLE ")
+	sb.WriteString(quoteIdent(schema))
+	sb.WriteByte('.')
+	sb.WriteString(quoteIdent(tableName))
+	sb.WriteString(" ADD CONSTRAINT ")
+	sb.WriteString(quoteIdent(idx.Name))
+	sb.WriteString(" UNIQUE (")
+	for i, col := range idx.Columns {
+		if col.Expression != "" || col.Column == "" {
+			return "", fmt.Errorf(
+				"postgres: emitAddUniqueConstraint: constraint %q on %q carries an expression entry — "+
+					"PG forbids expressions in UNIQUE constraints, so this index cannot be constraint-backed; "+
+					"this is a sluice bug, please report it",
+				idx.Name, tableName,
+			)
+		}
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteString(quoteIdent(col.Column))
+	}
+	sb.WriteByte(')')
+	if len(idx.IncludeColumns) > 0 {
+		sb.WriteString(" INCLUDE (")
+		for i, c := range idx.IncludeColumns {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteString(quoteIdent(c))
+		}
+		sb.WriteByte(')')
+	}
+	sb.WriteByte(';')
+	return sb.String(), nil
+}
+
 // emitCheckConstraint renders a CHECK clause for inclusion in a
 // CREATE TABLE column list:
 //
