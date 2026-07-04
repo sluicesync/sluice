@@ -1081,9 +1081,20 @@ type ShapeDeltaApplier interface {
 //     `numeric`; pgoutput emits typmod=-1 which the OID mapper
 //     interprets as (0, 0) without flipping Unconstrained).
 //
-// MySQL does NOT implement this interface: the MySQL CDC reader's
+// MySQL implements it too (ADR-0065 / ADR-0091 F7c): its binlog
 // TableMapEvent decoder re-reads information_schema on schema-change
-// boundaries so its projection already matches the SchemaReader's.
+// boundaries so COLUMNS already match the SchemaReader's, but CHECK
+// constraints are never re-read at the boundary, and the VStream
+// flavor's FieldEvent projection additionally omits PrimaryKey /
+// Indexes and per-column charset/collation.
+//
+// The normalization is a comparison LENS and the pipeline intercepts
+// apply it to BOTH sides of every classifier comparison — the
+// cold-start seed at synthesis AND each CDC-projected snapshot at
+// intake (pipeline.normalizeSnapshotForComparison). Normalizing only
+// the seed against a raw CDC post is the TRIAGE-#3 phantom-alter
+// regression shape: any change to a projection's representation on
+// either end silently breaks the one-sided equality.
 //
 // Engines that don't implement the interface are a no-op fallback
 // (the caller passes the table through unchanged). Implementations

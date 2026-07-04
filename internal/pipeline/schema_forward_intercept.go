@@ -93,6 +93,19 @@ type schemaForwardDeps struct {
 	// prober propagate as refuse-loudly via the standard intercept
 	// path — refuse-on-uncertainty.
 	defaultProber defaultProberFunc
+
+	// normalizer is the SOURCE engine's optional Bug 84/86 comparison
+	// lens ([ir.CDCSchemaSnapshotNormalizer]; nil → identity). Applied
+	// to every incoming CDC snapshot before it is classified or cached
+	// so the classifier ALWAYS compares two normalized tables — the
+	// seed side is normalized at synthesis
+	// ([synthesizeColdStartSeedSnapshots]). One-sided normalization is
+	// the TRIAGE-#3 phantom-alter regression shape (see
+	// [normalizeSnapshotForComparison]). The RAW snapshot keeps flowing
+	// into the apply paths (retarget re-resolves type-bearing payloads
+	// by name against snap.IR) and downstream to the applier's
+	// schema-history write.
+	normalizer ir.CDCSchemaSnapshotNormalizer
 }
 
 // defaultProberFunc returns the source's canonical [ir.DefaultValue]
@@ -229,7 +242,14 @@ func interceptAddColumnForward(
 					delete(cache, preKey)
 					delete(seedSourced, preKey)
 				}
-				cache[key] = snap.IR
+				// Comparison form of the post-DDL IR — the same Bug 84/86
+				// lens the seed went through, applied to BOTH classifier
+				// sides (see schemaForwardDeps.normalizer). Cached so the
+				// NEXT boundary's pre is already in comparison form; the
+				// RAW snapshot still drives the apply paths + downstream
+				// forward.
+				post := normalizeSnapshotForComparison(deps.normalizer, snap.IR)
+				cache[key] = post
 				// This snapshot's IR is now the pre-state for the NEXT
 				// boundary, and it came from CDC — so the next comparison
 				// is CDC→CDC (full guard lifts).
@@ -244,7 +264,7 @@ func interceptAddColumnForward(
 					}
 					continue
 				}
-				if err := routeForwardBoundary(ctx, deps, key, pre, snap, preIsSeed, out); err != nil {
+				if err := routeForwardBoundary(ctx, deps, key, pre, post, snap, preIsSeed, out); err != nil {
 					slog.ErrorContext(
 						ctx, "forward-add-column intercept: refuse",
 						"table", key,
@@ -290,24 +310,32 @@ func forwardChange(ctx context.Context, out chan<- ir.Change, c ir.Change) bool 
 // the recognized shapes. Returns nil on success (ALTER landed and
 // optional backfill emitted), a wrapped error on any refuse-loudly
 // case.
+//
+// pre and post are both in COMPARISON form (normalized by the source
+// engine's Bug 84/86 lens — see schemaForwardDeps.normalizer); snap
+// carries the RAW snapshot for the apply paths, whose retarget step
+// re-resolves every type-bearing payload by name against snap.IR so
+// the DDL materialized on the target keeps the wire's full fidelity.
 func routeForwardBoundary(
 	ctx context.Context,
 	deps schemaForwardDeps,
 	tableName string,
-	pre *ir.Table,
+	pre, post *ir.Table,
 	snap ir.SchemaSnapshot,
 	preIsSeed bool,
 	out chan<- ir.Change,
 ) error {
-	shape, err := ClassifyShape(pre, snap.IR)
+	shape, err := ClassifyShape(pre, post)
 	if err != nil {
 		// ADR-0060 (F11) — surface the structured per-table drift
 		// alongside the classify error so the operator sees WHAT
 		// changed even on multi-shape / unrecognized combos. The
 		// classify error itself names the class counts; the drift
-		// rendering names the specific columns / indexes / checks.
+		// rendering names the specific columns / indexes / checks
+		// (rendered from the same comparison-form pair the classifier
+		// actually saw).
 		return fmt.Errorf("classify shape on %q: %w.%s %s",
-			tableName, err, renderDriftForRefusal(pre, snap.IR),
+			tableName, err, renderDriftForRefusal(pre, post),
 			forwardRecoveryHint(tableName))
 	}
 	// ADR-0091 §3 seed-guard: never forward a destructive/mutating shape
@@ -371,10 +399,10 @@ func routeForwardBoundary(
 	case ShapeKindUnrecognized:
 		// Multi-shape combo — already returned as a classify error
 		// above; this arm is defensive.
-		return refuseShapeMultiCombo(tableName, shape, pre, snap.IR)
+		return refuseShapeMultiCombo(tableName, shape, pre, post)
 	}
 	return fmt.Errorf("unrecognized shape kind %v on %q.%s %s",
-		shape.Kind, tableName, renderDriftForRefusal(pre, snap.IR),
+		shape.Kind, tableName, renderDriftForRefusal(pre, post),
 		forwardRecoveryHint(tableName))
 }
 

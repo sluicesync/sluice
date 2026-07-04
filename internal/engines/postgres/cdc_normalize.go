@@ -66,15 +66,26 @@ import "sluicesync.dev/sluice/internal/ir"
 // limitation explicit at the comparison surface.
 //
 // Bug 86 also surfaced a Type-level asymmetry on the temporal family
-// (TIMESTAMP / TIMESTAMPTZ / TIME / TIMETZ): the SchemaReader reads
-// information_schema.columns.datetime_precision, which PG reports as
-// 6 (the default) for any temporal column declared WITHOUT explicit
-// precision; the CDC OID-to-type mapper reads pg_attribute.atttypmod,
-// which is -1 for that same "no explicit precision" case and decodes
-// to Precision=0. [normalizeTypeForCDCComparison] now collapses
-// Precision=6 to 0 for these temporal types so the default-precision
-// case round-trips equally — see the per-type cases for the accepted
-// false-negative-on-explicit-TIMESTAMP(6) trade-off.
+// (TIMESTAMP / TIMESTAMPTZ / TIME / TIMETZ): bare, (0), and (6) are one
+// equivalence class on PG (the engine default is 6), yet different IR
+// sources have represented that class differently over time (the
+// pre-TRIAGE-#3 SchemaReader materialized bare as an explicit 6; the
+// CDC OID mapper decoded typmod=-1 as 0; TRIAGE #3 gave both sides the
+// PrecisionUnspecified state). [normalizeTypeForCDCComparison]
+// collapses every class member to the ONE canonical bare form
+// ({Precision:0, PrecisionUnspecified:true}) so any two
+// representations compare equal — see the per-type cases for the
+// canonical-form rationale and the accepted false-negative-within-
+// the-class trade-off.
+//
+// The normalization is a comparison LENS: the live-coordination
+// intercepts apply it to BOTH sides of every classifier comparison —
+// the cold-start seed AND each CDC-projected snapshot — never only to
+// the seed. Normalizing one side against a raw other side is exactly
+// how the TRIAGE-#3 regression happened: the seed's collapsed form
+// stopped matching the CDC projection's new PrecisionUnspecified
+// representation and every bare temporal column phantom-altered at
+// the first boundary.
 //
 // Returns a new *ir.Table (deep enough copy that mutating the returned
 // struct cannot mutate the input). Idempotent on repeated calls.
@@ -196,40 +207,54 @@ func normalizeTypeForCDCComparison(t ir.Type) ir.Type {
 		}
 		return v
 	case ir.DateTime:
-		// Bug 86 (v0.78.1): the SchemaReader historically read
-		// information_schema.columns.datetime_precision, which PG
-		// reports as 6 (the default) for any `TIMESTAMP` declared
-		// WITHOUT an explicit precision; the CDC OID-to-type mapper
-		// reads pg_attribute.atttypmod, which is -1 for the same case.
-		// Both sides now model that bare form as PrecisionUnspecified
-		// (TRIAGE #3), but PERSISTED schema-history snapshots written
-		// by older binaries still carry the materialized Precision=6,
-		// so the collapse stays: bare ≡ (0) ≡ (6) for CDC comparison.
-		// Operators who explicitly declare TIMESTAMP(6) hit a
-		// false-negative ALTER — an accepted v1 limitation:
-		// classifier-level detection of explicit-precision-changes is
-		// out of scope, and the operator-visible behaviour is no worse
-		// than v0.78.0's blanket refusal of every TIMESTAMP-having
-		// table.
-		v.PrecisionUnspecified = false
-		if v.Precision == 6 {
+		// Bug 86 (v0.78.1) + TRIAGE #3 regression fix: the temporal
+		// collapse class is bare ≡ (0) ≡ (6). PG's engine default is 6,
+		// so all three forms decode the same wire values; historically
+		// they also round-tripped through different representations —
+		// the pre-TRIAGE-#3 SchemaReader materialized bare as
+		// Precision=6 (persisted schema-history/lease rows from older
+		// binaries still carry that), while the CDC OID mapper decoded
+		// typmod=-1 as Precision=0. Collapse every class member to ONE
+		// canonical form so any two representations of a same-class
+		// column compare equal in [pipeline.ClassifyShape].
+		//
+		// The canonical form is the BARE one ({Precision:0,
+		// PrecisionUnspecified:true}) — NOT {0,false} — for two reasons:
+		// (a) it is what both the TRIAGE-#3 SchemaReader and the CDC
+		// projection natively emit for the common bare column, so the
+		// collapse is a no-op there; and (b) normalized types can flow
+		// into shape payloads the ShapeDeltaApplier materializes on the
+		// target (Shape A ADD COLUMN), where the bare form emits bare
+		// DDL (6-behaving — value-safe for every class member) while an
+		// explicit (0) would emit a TRUNCATING timestamp(0). The
+		// pre-TRIAGE-#3 canonical was {0,false} precisely because (0)
+		// then still emitted bare; TRIAGE #3 made a known 0 emit (0),
+		// which is what turned the old canonical into a phantom-alter
+		// regression on bare temporal columns.
+		//
+		// Cost (unchanged, documented since v0.78.1): a genuine ALTER
+		// between two class members — e.g. timestamp(6) → timestamp(0)
+		// — is a false-negative at the classifier. Precisions 1–5 stay
+		// distinct and still classify.
+		if v.PrecisionUnspecified || v.Precision == 0 || v.Precision == 6 {
 			v.Precision = 0
+			v.PrecisionUnspecified = true
 		}
 		return v
 	case ir.Time:
-		// Same TIMESTAMP-default-precision asymmetry as ir.DateTime
-		// above; PG `TIME` and `TIMETZ` default to precision 6 too.
-		v.PrecisionUnspecified = false
-		if v.Precision == 6 {
+		// Same temporal collapse class as ir.DateTime above; PG `TIME`
+		// and `TIMETZ` default to precision 6 too.
+		if v.PrecisionUnspecified || v.Precision == 0 || v.Precision == 6 {
 			v.Precision = 0
+			v.PrecisionUnspecified = true
 		}
 		return v
 	case ir.Timestamp:
-		// Same TIMESTAMP-default-precision asymmetry; covers
-		// `TIMESTAMP WITH TIME ZONE` (TIMESTAMPTZ).
-		v.PrecisionUnspecified = false
-		if v.Precision == 6 {
+		// Same temporal collapse class; covers `TIMESTAMP WITH TIME
+		// ZONE` (TIMESTAMPTZ).
+		if v.PrecisionUnspecified || v.Precision == 0 || v.Precision == 6 {
 			v.Precision = 0
+			v.PrecisionUnspecified = true
 		}
 		return v
 	case ir.Geometry:

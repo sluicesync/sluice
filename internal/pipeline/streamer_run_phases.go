@@ -844,7 +844,13 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 	// applier + probe before forwarding to the downstream applier.
 	// Nil router (drained model / engine doesn't support coordination)
 	// makes the intercept a verbatim pass-through.
-	filtered = interceptSchemaSnapshotsForCoordination(applyCtx, filtered, s.coldStartSeedSnapshots, s.boundaryRouter, &s.schemaSnapshotErr)
+	// The source engine's Bug 84/86 comparison lens is threaded into
+	// BOTH intercepts so each incoming CDC snapshot is normalized
+	// before classification — the same lens the cold-start seed went
+	// through. One-sided normalization is the TRIAGE-#3 phantom-alter
+	// regression shape.
+	snapshotNormalizer, _ := s.Source.(ir.CDCSchemaSnapshotNormalizer)
+	filtered = interceptSchemaSnapshotsForCoordination(applyCtx, filtered, s.coldStartSeedSnapshots, s.boundaryRouter, snapshotNormalizer, &s.schemaSnapshotErr)
 	// ADR-0058: when --forward-schema-add-column is set AND Shape A is
 	// NOT engaged, wrap the changes channel with the
 	// [interceptAddColumnForward] intercept. The intercept observes
@@ -867,6 +873,7 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 				applier:          deltaApplier,
 				sourceEngineName: s.Source.Name(),
 				targetEngineName: s.Target.Name(),
+				normalizer:       snapshotNormalizer,
 			}
 			if s.addColumnForwardSchemaReader != nil {
 				deps.defaultProber = newSourceDefaultProber(s.addColumnForwardSchemaReader)

@@ -76,11 +76,27 @@ import (
 // downstream — the applier already knows the target schema from
 // cold-start's schema-apply phase, and forwarding a seed would write
 // a redundant ADR-0049 schema-history row.
+//
+// normalizer is the source engine's optional
+// [ir.CDCSchemaSnapshotNormalizer] (nil → identity). The Bug 84/86
+// normalization is a comparison LENS and MUST be applied to BOTH sides
+// of every classifier comparison: the seed is normalized at synthesis
+// ([synthesizeColdStartSeedSnapshots]) and each incoming CDC snapshot
+// is normalized here before it is classified or cached. Normalizing
+// only the seed regressed when TRIAGE #3 changed the CDC projection's
+// temporal representation — the collapsed seed no longer matched the
+// raw post and every bare temporal column phantom-altered at the first
+// boundary (the TypeFamilyMatrix extra_timestamp_nullable failure).
+// The ORIGINAL snapshot is still what is forwarded downstream, so the
+// ADR-0049 schema-history row records the faithful projection, and the
+// lease's ddl_text/checksum stays derived from the raw IR (peer
+// checksums compare raw-to-raw exactly as before).
 func interceptSchemaSnapshotsForCoordination(
 	ctx context.Context,
 	in <-chan ir.Change,
 	seed []ir.SchemaSnapshot,
 	router *BoundaryRouter,
+	normalizer ir.CDCSchemaSnapshotNormalizer,
 	errStore *atomic.Pointer[error],
 ) <-chan ir.Change {
 	if router == nil {
@@ -134,7 +150,12 @@ func interceptSchemaSnapshotsForCoordination(
 					delete(cache, preKey)
 					delete(version, preKey)
 				}
-				cache[key] = snap.IR
+				// Comparison form of the post-DDL IR: normalized with the
+				// same lens the seed was (both sides of every classifier
+				// comparison — see the function docstring). Cached so the
+				// NEXT boundary's pre is already in comparison form.
+				post := normalizeSnapshotForComparison(normalizer, snap.IR)
+				cache[key] = post
 				version[key]++
 				if !hadPre {
 					// First snapshot for this table — cold-start seed,
@@ -152,17 +173,19 @@ func interceptSchemaSnapshotsForCoordination(
 					continue
 				}
 				// Subsequent snapshot — drive RouteBoundary against
-				// (pre, post). DDL text is the deterministic
-				// IR-marshalled rendering of the post-IR schema (no
-				// raw source DDL is available through the
-				// SchemaSnapshot path — DP-E's "shapes are sluice's
-				// own structural categories" applies).
+				// (pre, post), both in comparison form. DDL text is the
+				// deterministic IR-marshalled rendering of the RAW
+				// post-IR schema (no raw source DDL is available
+				// through the SchemaSnapshot path — DP-E's "shapes are
+				// sluice's own structural categories" applies; raw
+				// keeps peer checksums byte-compatible with the
+				// pre-normalization lease rows).
 				ddlText := deriveDDLText(snap.IR)
 				// Pass the SchemaSnapshot's source-side Position as the
 				// lease row's anchor — the v0.76.0 lease GC sweep (task
 				// #21) compares it against every stream's persisted
 				// position via the engine's PositionOrderer.
-				if err := router.RouteBoundary(ctx, key, pre, snap.IR, ddlText, version[key], snap.Position); err != nil {
+				if err := router.RouteBoundary(ctx, key, pre, post, ddlText, version[key], snap.Position); err != nil {
 					slog.ErrorContext(
 						ctx, "shard consolidation intercept: route boundary failed",
 						"table", key,
@@ -244,6 +267,22 @@ func synthesizeColdStartSeedSnapshots(schema *ir.Schema, sourceEngine ir.Engine)
 		})
 	}
 	return out
+}
+
+// normalizeSnapshotForComparison applies the source engine's Bug 84/86
+// comparison lens to a CDC-projected snapshot table. nil normalizer
+// (an engine without the [ir.CDCSchemaSnapshotNormalizer] surface) is
+// the identity. Both live-coordination intercepts call this on every
+// incoming snapshot so the classifier ALWAYS compares two normalized
+// tables — the seed side is normalized at synthesis
+// ([synthesizeColdStartSeedSnapshots]), and each cached CDC post-state
+// is normalized here. One-sided normalization is the TRIAGE-#3
+// phantom-alter regression shape; keep the lens two-sided.
+func normalizeSnapshotForComparison(normalizer ir.CDCSchemaSnapshotNormalizer, t *ir.Table) *ir.Table {
+	if normalizer == nil {
+		return t
+	}
+	return normalizer.NormalizeForCDCComparison(t)
 }
 
 // lookupSeedCache resolves a SchemaSnapshot's cache entry, falling

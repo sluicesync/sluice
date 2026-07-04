@@ -40,7 +40,7 @@ func TestIntercept_NilRouter_PassThrough(t *testing.T) {
 	close(in)
 	var errStore atomic.Pointer[error]
 	var inRecv <-chan ir.Change = in
-	out := interceptSchemaSnapshotsForCoordination(context.Background(), inRecv, nil, nil, &errStore)
+	out := interceptSchemaSnapshotsForCoordination(context.Background(), inRecv, nil, nil, nil, &errStore)
 	if out != inRecv {
 		t.Errorf("nil router should pass-through verbatim; got a wrapped channel")
 	}
@@ -66,7 +66,7 @@ func TestIntercept_FirstSnapshotSeedsCache_NoRoute(t *testing.T) {
 	var errStore atomic.Pointer[error]
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	out := interceptSchemaSnapshotsForCoordination(ctx, in, nil, router, &errStore)
+	out := interceptSchemaSnapshotsForCoordination(ctx, in, nil, router, nil, &errStore)
 	got := drainChanges(t, out, 2*time.Second)
 	if len(got) != 1 {
 		t.Fatalf("expected exactly 1 change forwarded; got %d", len(got))
@@ -104,7 +104,7 @@ func TestIntercept_SecondSnapshotRoutesAddColumn(t *testing.T) {
 	var errStore atomic.Pointer[error]
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	out := interceptSchemaSnapshotsForCoordination(ctx, in, nil, router, &errStore)
+	out := interceptSchemaSnapshotsForCoordination(ctx, in, nil, router, nil, &errStore)
 	got := drainChanges(t, out, 2*time.Second)
 	if len(got) != 2 {
 		t.Fatalf("expected 2 snapshots forwarded; got %d", len(got))
@@ -144,7 +144,7 @@ func TestIntercept_UnrecognizedShape_ShortCircuitsAndStoresError(t *testing.T) {
 	var errStore atomic.Pointer[error]
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	out := interceptSchemaSnapshotsForCoordination(ctx, in, nil, router, &errStore)
+	out := interceptSchemaSnapshotsForCoordination(ctx, in, nil, router, nil, &errStore)
 	got := drainChanges(t, out, 2*time.Second)
 	// First snapshot forwarded (cache seed); second NOT forwarded
 	// (refusal short-circuits).
@@ -189,7 +189,7 @@ func TestIntercept_SeededFromColdStart_FirstCDCSnapshotRoutes(t *testing.T) {
 	var errStore atomic.Pointer[error]
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	out := interceptSchemaSnapshotsForCoordination(ctx, in, seed, router, &errStore)
+	out := interceptSchemaSnapshotsForCoordination(ctx, in, seed, router, nil, &errStore)
 	got := drainChanges(t, out, 2*time.Second)
 	if len(got) != 1 {
 		t.Fatalf("expected exactly 1 change forwarded (the CDC SchemaSnapshot; seed is NOT forwarded); got %d", len(got))
@@ -230,7 +230,7 @@ func TestIntercept_SeededFromColdStart_NoCDCSnapshot_NoRoute(t *testing.T) {
 	var errStore atomic.Pointer[error]
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	out := interceptSchemaSnapshotsForCoordination(ctx, in, seed, router, &errStore)
+	out := interceptSchemaSnapshotsForCoordination(ctx, in, seed, router, nil, &errStore)
 	got := drainChanges(t, out, 2*time.Second)
 	if len(got) != 0 {
 		t.Errorf("expected 0 forwarded changes; got %d (seeds are NOT forwarded)", len(got))
@@ -274,7 +274,7 @@ func TestIntercept_SeededFromColdStart_MultiTable(t *testing.T) {
 	var errStore atomic.Pointer[error]
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	out := interceptSchemaSnapshotsForCoordination(ctx, in, seed, router, &errStore)
+	out := interceptSchemaSnapshotsForCoordination(ctx, in, seed, router, nil, &errStore)
 	got := drainChanges(t, out, 2*time.Second)
 	if len(got) != 1 {
 		t.Fatalf("expected exactly 1 forwarded change (users CDC snapshot); got %d", len(got))
@@ -327,7 +327,7 @@ func TestIntercept_SeededFromColdStart_BareNameKeyAlignment(t *testing.T) {
 	var errStore atomic.Pointer[error]
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	out := interceptSchemaSnapshotsForCoordination(ctx, in, seed, router, &errStore)
+	out := interceptSchemaSnapshotsForCoordination(ctx, in, seed, router, nil, &errStore)
 	got := drainChanges(t, out, 2*time.Second)
 	if len(got) != 1 {
 		t.Fatalf("expected exactly 1 change forwarded (the CDC SchemaSnapshot); got %d", len(got))
