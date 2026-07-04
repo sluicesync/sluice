@@ -62,7 +62,7 @@ type RowReader struct {
 
 	// zeroDate is this reader's per-sync zero/partial-date policy (ADR-0127),
 	// parsed from the `zero_date` source-DSN param at construction. The zero
-	// value (zeroDateInherit) defers to the process-global zeroDatePolicy
+	// value (zeroDateInherit) resolves to the loud refuse default (the engine --zero-date default is folded at reader construction, task 2.5)
 	// (--zero-date) — so the snapshot/concurrent/meta RowReaders that don't
 	// set it stay byte-identical to the pre-ADR-0127 global-only behavior.
 	zeroDate zeroDateMode

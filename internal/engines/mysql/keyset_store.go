@@ -39,7 +39,11 @@ func openKeysetStore(ctx context.Context, dsn string) (redact.KeysetStore, error
 	if err != nil {
 		return nil, err
 	}
-	db, err := openDB(ctx, cfg)
+	// nil sqlMode = the strict default: the keyset store is a control-table
+	// connection (sluice_keysets), not a value-migration path, and it is opened
+	// via the redact registry with no engine in scope, so it always uses the
+	// strict-by-default sql_mode rather than a per-instance --mysql-sql-mode.
+	db, err := openDB(ctx, cfg, nil)
 	if err != nil {
 		return nil, err
 	}

@@ -468,40 +468,35 @@ func isMySQLZeroDate(s string) bool {
 // zeroDateMode is the policy for carrying MySQL zero and partial dates
 // discovered on the read path. Two scopes share the type:
 //
-//   - the process-wide default ([zeroDatePolicy]) is set once at startup
-//     from --zero-date via [SetZeroDateMode] (main.go), mirroring
-//     sessionSQLMode;
-//   - each reader (vanilla row-reader, native CDC reader, VStream reader)
-//     can override the default PER SYNC via the `zero_date` source-DSN
-//     param (ADR-0127), stored on the reader and threaded into
-//     [applyZeroDatePolicy].
+//   - the operator's --zero-date default, carried per-instance on the [Engine]
+//     value (engineOptions.zeroDate, set via [Engine.WithZeroDate] — task 2.5,
+//     replacing the former process-wide zeroDatePolicy global) and folded onto
+//     each reader at construction ([Engine.resolveReaderZeroDate]);
+//   - each reader (vanilla row-reader, native CDC reader, VStream reader) can
+//     override that default PER SYNC via the `zero_date` source-DSN param
+//     (ADR-0127), stored on the reader and threaded into [applyZeroDatePolicy].
 //
 // The default refuses loudly: silently normalizing these values to a
 // wrong calendar date was a CRITICAL silent-corruption class (Vector A).
 type zeroDateMode int
 
 const (
-	// zeroDateInherit is the STRUCT-FIELD zero value: a reader that
-	// leaves its mode unset defers to the process-global zeroDatePolicy
-	// (--zero-date). It is the iota-0 sentinel ON PURPOSE — every
-	// RowReader/CDCReader construction site that does NOT set the field
-	// (the snapshot/concurrent/meta readers, bare struct literals in
-	// tests) then stays byte-identical to the pre-ADR-0127 global-only
-	// behavior. Naming the on-behavior at zero-value would silently flip
-	// all of them the moment --zero-date is non-default (the v0.99.51
-	// zero-value-safety lesson).
+	// zeroDateInherit is the STRUCT-FIELD zero value: a reader that leaves its
+	// mode unset resolves to the loud refuse default at decode time
+	// ([applyZeroDatePolicy]). It is the iota-0 sentinel ON PURPOSE — every
+	// RowReader/CDCReader construction site that does NOT set the field (bare
+	// struct literals in tests) stays byte-identical to the refuse default.
+	// Naming the on-behavior at zero-value would silently flip all of them the
+	// moment --zero-date is non-default (the v0.99.51 zero-value-safety lesson).
+	// The operator's --zero-date default is folded onto the reader at
+	// construction (from the [Engine]'s per-instance value, task 2.5), so a
+	// reader whose DSN omits zero_date inherits the CLI default there — not via a
+	// decode-time global read.
 	zeroDateInherit zeroDateMode = iota
 	zeroDateRefuse               // zero_date=error / --zero-date=error (default)
 	zeroDateAsNull               // zero_date=null  / --zero-date=null
 	zeroDateAsEpoch              // zero_date=epoch / --zero-date=epoch
 )
-
-// zeroDatePolicy is the active PROCESS-GLOBAL zero-date mode (the
-// --zero-date default). Read by [applyZeroDatePolicy] whenever a reader's
-// own mode is zeroDateInherit; written once at startup before any engine
-// connects. It is never zeroDateInherit itself (SetZeroDateMode maps an
-// absent/empty value to zeroDateRefuse), so inherit resolution terminates.
-var zeroDatePolicy = zeroDateRefuse
 
 // errInvalidZeroDateMode names the valid set for a bad zero-date value;
 // callers wrap it with their own %q context (the --zero-date flag or the
@@ -511,9 +506,9 @@ var errInvalidZeroDateMode = errors.New("want one of: error, null, epoch")
 
 // parseZeroDateMode maps a zero-date policy string to its mode. Empty and
 // "error" both mean refuse (the loud-failure default), matching the
-// --zero-date flag's enum. It is the SINGLE parser shared by the global
-// flag ([SetZeroDateMode]) and the per-sync DSN param ([readerZeroDateMode]),
-// so the two can never drift on accepted values.
+// --zero-date flag's enum. It is the SINGLE parser shared by the CLI flag
+// ([Engine.WithZeroDate]) and the per-sync DSN param ([readerZeroDateMode]), so
+// the two can never drift on accepted values.
 func parseZeroDateMode(s string) (zeroDateMode, error) {
 	switch s {
 	case "", "error":
@@ -525,18 +520,6 @@ func parseZeroDateMode(s string) (zeroDateMode, error) {
 	default:
 		return zeroDateInherit, errInvalidZeroDateMode
 	}
-}
-
-// SetZeroDateMode sets the process-wide zero-date policy from the
-// operator's --zero-date value. Called once from main.go before any
-// engine opens a connection. An empty string keeps the refuse default.
-func SetZeroDateMode(s string) error {
-	m, err := parseZeroDateMode(s)
-	if err != nil {
-		return fmt.Errorf("mysql: invalid --zero-date %q (%w)", s, err)
-	}
-	zeroDatePolicy = m
-	return nil
 }
 
 // zeroDateEpochValue is the synthetic substitute for --zero-date=epoch:
@@ -568,14 +551,16 @@ func (e *zeroDateValueError) Error() string {
 }
 
 // applyZeroDatePolicy resolves a zero/partial date for column col per the
-// supplied mode — the reader's own per-sync mode (from the `zero_date` DSN
-// param, ADR-0127) or zeroDateInherit, which defers to the process-global
-// zeroDatePolicy (--zero-date). It is the single chokepoint the bulk-copy
-// and CDC read paths funnel zeroDateValueError through. The caller adds the
-// "mysql: column %q" context, so the returned errors carry only the reason.
+// supplied mode — the reader's own already-resolved mode (the `zero_date` DSN
+// param folded against the engine's --zero-date default at construction,
+// ADR-0127 / task 2.5). A residual zeroDateInherit (a bare-struct reader that
+// set neither) resolves to zeroDateRefuse, the loud default. It is the single
+// chokepoint the bulk-copy and CDC read paths funnel zeroDateValueError through.
+// The caller adds the "mysql: column %q" context, so the returned errors carry
+// only the reason.
 func applyZeroDatePolicy(zd *zeroDateValueError, col *ir.Column, mode zeroDateMode) (any, error) {
 	if mode == zeroDateInherit {
-		mode = zeroDatePolicy
+		mode = zeroDateRefuse
 	}
 	switch mode {
 	case zeroDateAsNull:

@@ -4,8 +4,6 @@
 package mysql
 
 import (
-	"sync/atomic"
-
 	gomysql "github.com/go-sql-driver/mysql"
 )
 
@@ -22,40 +20,23 @@ import (
 // audit + the four gated A/B harnesses.
 //
 // `--vstream-preserve-skew` (DSN: vstream_preserve_skew=true) is the OPT-OUT
-// that restores the old MinimizeSkew=true behaviour. Threaded into the engine
-// the same way the ADR-0118 copy-parallelism overrides are: a package-level
-// setter called once from the composition root before any connection opens, with
-// the source DSN param as the lower-precedence form (the CLI flag wins).
-//
-// Zero-value-safety (the v0.99.51 trap): the override defaults to false =
-// "not preserving — use the new relaxed default", so every constructor / test /
-// non-CLI caller that never sets it gets the new default (MinimizeSkew=false).
-// The OPT-OUT name means the safe/common behaviour (relaxed) is the zero value.
-//
-// atomic.Bool because the setter is called once at startup from main-flow and
-// the reader reads it on the connection-open path; the value never changes after
-// startup, but the atomic keeps the happens-before edge clean.
-var vstreamPreserveSkewOverride atomic.Bool
-
-// SetVStreamPreserveSkewOverride records the operator's explicit
-// --vstream-preserve-skew CLI value (ADR-0120). true wins over the source DSN's
-// vstream_preserve_skew param and restores the old MinimizeSkew=true behaviour;
-// false (the default) means "unset — fall back to the DSN param, then the
-// relaxed MinimizeSkew=false default". Call once at startup before any engine
-// opens a connection. Only a true value is recorded, so a non-CLI caller never
-// inverts the DSN-then-default behaviour.
-func SetVStreamPreserveSkewOverride(preserve bool) {
-	if preserve {
-		vstreamPreserveSkewOverride.Store(true)
-	}
-}
+// that restores the old MinimizeSkew=true behaviour. The CLI flag was formerly a
+// process-wide MUTABLE package global (SetVStreamPreserveSkewOverride); task 2.5
+// (finding A-4) moves it onto the per-instance [Engine] value
+// (engineOptions.preserveSkew, set via [Engine.WithVStreamPreserveSkew]), so a
+// fleet `sync run` can carry a distinct value per sync. The CLI flag wins over
+// the source DSN param, exactly as the global did; the resolver threads the
+// override in as an explicit bool argument rather than reading a global.
 
 // vstreamPreserveSkewFromDSN resolves whether to PRESERVE the old MinimizeSkew=
-// true behaviour for a reader: the CLI override (if set) OR the source DSN's
-// vstream_preserve_skew=true param. Default false = the new relaxed default
-// (MinimizeSkew=false). The reader inverts this into its relaxSkew field.
-func vstreamPreserveSkewFromDSN(cfg *gomysql.Config) bool {
-	if vstreamPreserveSkewOverride.Load() {
+// true behaviour for a reader: the per-instance CLI override cliPreserve (if
+// set) OR the source DSN's vstream_preserve_skew=true param. Default false = the
+// new relaxed default (MinimizeSkew=false). The reader inverts this into its
+// relaxSkew field. cliPreserve is engineOptions.preserveSkew (write-once-true via
+// [Engine.WithVStreamPreserveSkew]), so a non-CLI caller passes false and never
+// inverts the DSN-then-default behaviour.
+func vstreamPreserveSkewFromDSN(cfg *gomysql.Config, cliPreserve bool) bool {
+	if cliPreserve {
 		return true
 	}
 	return cfg.Params["vstream_preserve_skew"] == "true"

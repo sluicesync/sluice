@@ -65,6 +65,14 @@ type RowWriter struct {
 	schema   string
 	bulkLoad ir.BulkLoadMethod
 
+	// sqlMode is the engine's resolved --mysql-sql-mode override (task 2.5).
+	// [reportBulkWriteWarnings] keys its WARN-vs-refuse decision off whether the
+	// operator opted into the relaxed "" mode ([resolveSessionSQLMode]), replacing
+	// the former sessionSQLMode package global. nil (the direct-API / unit
+	// construction default) resolves to the strict-by-default mode, so a bare
+	// RowWriter refuses on a LOAD-DATA warning exactly as before.
+	sqlMode *string
+
 	// maxRowsPerBatch caps the number of rows folded into a single
 	// INSERT statement. Tests can override it; callers typically
 	// leave it as the zero value, in which case defaultMaxRowsPerBatch

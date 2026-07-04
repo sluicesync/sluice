@@ -93,7 +93,7 @@ func TestMigrationStateStoreMySQL_LegacyBlobUpgrade(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseDSN: %v", err)
 	}
-	db, err := openDB(ctx, cfg)
+	db, err := openDB(ctx, cfg, nil)
 	if err != nil {
 		t.Fatalf("openDB: %v", err)
 	}

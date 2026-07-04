@@ -57,6 +57,14 @@ func (v *VerifyCmd) Run(g *Globals) error {
 	if err != nil {
 		return operationalError{err: fmt.Errorf("--target-driver: %w", err)}
 	}
+	// Value-fidelity flags (task 2.5): verify reads source + target values, so
+	// its readers honor --zero-date / --sqlite-date-encoding / --mysql-sql-mode.
+	if source, err = applyEngineOptions(source, g); err != nil {
+		return operationalError{err: err}
+	}
+	if target, err = applyEngineOptions(target, g); err != nil {
+		return operationalError{err: err}
+	}
 
 	if len(v.IncludeTable) > 0 && len(v.ExcludeTable) > 0 {
 		return operationalError{err: errors.New("--include-table and --exclude-table are mutually exclusive")}

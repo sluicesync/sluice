@@ -77,17 +77,19 @@ const (
 // fallback to sequential.
 //
 // ADR-0118 finding 4 precedence: an explicit --vstream-copy-table-parallelism
-// CLI flag (recorded via SetVStreamCopyTableParallelismOverride, value > 0)
-// WINS over the DSN param. The DSN form is still read (and still validated
-// loudly) when no CLI override is set, so existing DSN-only setups are
-// byte-identical. The CLI override path skips DSN parsing entirely — an
-// explicit flag means the operator chose the value for this run.
+// CLI flag (the per-instance cliOverride, value > 0 — formerly the
+// SetVStreamCopyTableParallelismOverride global, now
+// engineOptions.vstreamCopyTableParallelism, task 2.5) WINS over the DSN param.
+// The DSN form is still read (and still validated loudly) when no CLI override
+// is set, so existing DSN-only setups are byte-identical. The CLI override path
+// skips DSN parsing entirely — an explicit flag means the operator chose the
+// value for this run.
 //
 // The returned value is the RAW operator intent; resolveCopyTableParallelism
 // clamps it to the table count + the ceiling.
-func vstreamCopyTableParallelismFromDSN(cfg *gomysql.Config) (int, error) {
-	if cli := int(vstreamCopyTableParallelismOverride.Load()); cli > 0 {
-		return cli, nil
+func vstreamCopyTableParallelismFromDSN(cfg *gomysql.Config, cliOverride int) (int, error) {
+	if cliOverride > 0 {
+		return cliOverride, nil
 	}
 	v := cfg.Params["vstream_copy_table_parallelism"]
 	if v == "" {

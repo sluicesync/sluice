@@ -34,9 +34,9 @@ func zeroDateTable() *ir.Table {
 
 // readZeroDateRows drains a full RowReader scan of the fixture table and
 // returns the rows keyed by their id, or the sticky Err.
-func readZeroDateRows(t *testing.T, db *sql.DB) (map[int64]ir.Row, error) {
+func readZeroDateRows(t *testing.T, db *sql.DB, mode zeroDateMode) (map[int64]ir.Row, error) {
 	t.Helper()
-	rr := &RowReader{q: db}
+	rr := &RowReader{q: db, zeroDate: mode}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	ch, err := rr.ReadRows(ctx, zeroDateTable())
@@ -129,8 +129,7 @@ func TestZeroDate_ReadPath(t *testing.T) {
 
 	// (2) Default policy: the sluice read path refuses loudly.
 	t.Run("error_policy_refuses_loudly", func(t *testing.T) {
-		withZeroDatePolicy(t, zeroDateRefuse)
-		_, err := readZeroDateRows(t, db)
+		_, err := readZeroDateRows(t, db, zeroDateRefuse)
 		if err == nil {
 			t.Fatal("ReadRows Err = nil; want a zero-date refusal")
 		}
@@ -141,8 +140,7 @@ func TestZeroDate_ReadPath(t *testing.T) {
 
 	// (3a) null policy: zero/partial dates become NULL; valid row intact.
 	t.Run("null_policy_carries_null", func(t *testing.T) {
-		withZeroDatePolicy(t, zeroDateAsNull)
-		rows, err := readZeroDateRows(t, db)
+		rows, err := readZeroDateRows(t, db, zeroDateAsNull)
 		if err != nil {
 			t.Fatalf("ReadRows Err = %v; want nil under null policy", err)
 		}
@@ -168,8 +166,7 @@ func TestZeroDate_ReadPath(t *testing.T) {
 	// (3b) epoch policy: zero/partial dates become 1970-01-01 00:00:01
 	// (one second past midnight — MySQL's TIMESTAMP floor; see Bug 133).
 	t.Run("epoch_policy_substitutes_epoch", func(t *testing.T) {
-		withZeroDatePolicy(t, zeroDateAsEpoch)
-		rows, err := readZeroDateRows(t, db)
+		rows, err := readZeroDateRows(t, db, zeroDateAsEpoch)
 		if err != nil {
 			t.Fatalf("ReadRows Err = %v; want nil under epoch policy", err)
 		}
@@ -193,9 +190,9 @@ func TestZeroDate_ReadPath(t *testing.T) {
 // real legacy migrate actually takes, so the zero-date decode + policy
 // must hold there too — not just on the full-scan ReadRows (gap closed
 // from the Vector A value-fidelity review).
-func readZeroDateRowsBatched(t *testing.T, db *sql.DB, limit int) (map[int64]ir.Row, error) {
+func readZeroDateRowsBatched(t *testing.T, db *sql.DB, limit int, mode zeroDateMode) (map[int64]ir.Row, error) {
 	t.Helper()
-	rr := &RowReader{q: db}
+	rr := &RowReader{q: db, zeroDate: mode}
 	table := zeroDateTable()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -274,8 +271,7 @@ func TestZeroDate_BatchedReadPath(t *testing.T) {
 	_ = seed.Close()
 
 	t.Run("error_policy_refuses_loudly", func(t *testing.T) {
-		withZeroDatePolicy(t, zeroDateRefuse)
-		_, err := readZeroDateRowsBatched(t, db, 2)
+		_, err := readZeroDateRowsBatched(t, db, 2, zeroDateRefuse)
 		if err == nil {
 			t.Fatal("batched read Err = nil; want a zero-date refusal")
 		}
@@ -285,8 +281,7 @@ func TestZeroDate_BatchedReadPath(t *testing.T) {
 	})
 
 	t.Run("null_policy_carries_null", func(t *testing.T) {
-		withZeroDatePolicy(t, zeroDateAsNull)
-		rows, err := readZeroDateRowsBatched(t, db, 2)
+		rows, err := readZeroDateRowsBatched(t, db, 2, zeroDateAsNull)
 		if err != nil {
 			t.Fatalf("batched read Err = %v; want nil under null policy", err)
 		}
@@ -306,8 +301,7 @@ func TestZeroDate_BatchedReadPath(t *testing.T) {
 	})
 
 	t.Run("epoch_policy_substitutes_epoch", func(t *testing.T) {
-		withZeroDatePolicy(t, zeroDateAsEpoch)
-		rows, err := readZeroDateRowsBatched(t, db, 2)
+		rows, err := readZeroDateRowsBatched(t, db, 2, zeroDateAsEpoch)
 		if err != nil {
 			t.Fatalf("batched read Err = %v; want nil under epoch policy", err)
 		}
@@ -406,7 +400,7 @@ func TestZeroDate_TemporalPKPagination(t *testing.T) {
 				PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "k"}}},
 			}
 
-			withZeroDatePolicy(t, zeroDateRefuse) // valid dates only; policy irrelevant
+			// valid dates only; the reader's default (inherit → refuse) is irrelevant
 			rr := &RowReader{q: db}
 			rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 			defer cancel()
@@ -594,11 +588,12 @@ func TestZeroDate_PerSyncDSNOverride(t *testing.T) {
 	}
 	_ = seed.Close()
 
-	// Process-global stays the default refuse for the whole test.
-	withZeroDatePolicy(t, zeroDateRefuse)
+	// The engine carries no --zero-date default, so its readers resolve an unset
+	// DSN to the loud refuse default (task 2.5). Each reader below sets its own
+	// per-source ?zero_date= param, which wins.
 	eng := Engine{Flavor: FlavorVanilla}
 
-	// Reader A: ?zero_date=null overrides the global refuse → NULL carried.
+	// Reader A: ?zero_date=null overrides the engine's refuse default → NULL carried.
 	t.Run("dsn_param_overrides_global", func(t *testing.T) {
 		rr, err := eng.OpenRowReader(ctx, baseDSN+"&zero_date=null")
 		if err != nil {
@@ -696,8 +691,7 @@ func TestZeroDate_NullPolicyRefusesNotNull(t *testing.T) {
 	}
 	_ = seed.Close()
 
-	withZeroDatePolicy(t, zeroDateAsNull)
-	rr := &RowReader{q: db}
+	rr := &RowReader{q: db, zeroDate: zeroDateAsNull}
 	table := &ir.Table{
 		Name: "nn",
 		Columns: []*ir.Column{

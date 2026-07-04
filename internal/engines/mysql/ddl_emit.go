@@ -14,6 +14,41 @@ import (
 	"sluicesync.dev/sluice/internal/translate"
 )
 
+// mysqlEmitter carries the per-writer DDL-emit policy that used to be read from
+// the process-wide `sessionSQLMode` global (task 2.5 / finding A-4): the sql_mode
+// backslash-escaping rule for SQL string literals. The [SchemaWriter] resolves it
+// ONCE at open from the engine's --mysql-sql-mode override ([newMySQLEmitter]) and
+// carries it on w.emitter, so every string literal a writer emits is escaped for
+// the SAME sql_mode its connections run under — with no package global.
+//
+// The value-emitting functions that render SQL string literals are methods on
+// this type ([mysqlEmitter.quoteSQLString] and everything that reaches it —
+// ENUM/SET values, DEFAULT literals, column/table comments, DOMAIN-CHECK regex
+// patterns). Every such function keeps a thin free wrapper delegating to
+// [stdEmitter] (the strict-mode default) so tests and the type-preview path that
+// don't have a writer stay byte-identical to the pre-task-2.5 behaviour — the
+// default strict sql_mode never contains NO_BACKSLASH_ESCAPES, so backslashEscapes
+// is true, exactly the old global default.
+type mysqlEmitter struct {
+	// backslashEscapes reports whether MySQL's string-literal lexer treats a
+	// backslash as an escape introducer under this writer's resolved sql_mode
+	// (true unless the mode carries NO_BACKSLASH_ESCAPES). See
+	// [backslashIsMySQLEscape] for the two documented approximations.
+	backslashEscapes bool
+}
+
+// newMySQLEmitter resolves the DDL-emit policy from an engine's --mysql-sql-mode
+// override (nil → the strict-by-default mode). Called once at [Engine.OpenSchemaWriter].
+func newMySQLEmitter(sqlMode *string) mysqlEmitter {
+	return mysqlEmitter{backslashEscapes: backslashIsMySQLEscape(sqlMode)}
+}
+
+// stdEmitter is the strict-mode default emitter (backslashEscapes = true, MySQL's
+// factory default). It backs the free-function wrappers below so callers without a
+// writer — the ddl_emit unit tests, the schema-preview type spelling — behave
+// exactly as they did when the emit functions read the strict-default global.
+var stdEmitter = mysqlEmitter{backslashEscapes: true}
+
 // emitColumnType returns the MySQL DDL fragment representing t. The
 // fragment is the type plus any annotations that conventionally live
 // adjacent to the type (CHARACTER SET, COLLATE, AUTO_INCREMENT). The
@@ -24,7 +59,9 @@ import (
 // (Inet, Cidr, Macaddr, Array). Translation policy is responsible for
 // rewriting these to MySQL-compatible types before the writer sees
 // them; an error here means an upstream contract was violated.
-func emitColumnType(t ir.Type) (string, error) {
+func emitColumnType(t ir.Type) (string, error) { return stdEmitter.emitColumnType(t) }
+
+func (m mysqlEmitter) emitColumnType(t ir.Type) (string, error) {
 	switch v := t.(type) {
 	// ---- Numeric / boolean ----
 	case ir.Boolean:
@@ -111,9 +148,9 @@ func emitColumnType(t ir.Type) (string, error) {
 
 	// ---- Categorical (extension) ----
 	case ir.Enum:
-		return "ENUM(" + emitStringList(v.Values) + ")", nil
+		return "ENUM(" + m.emitStringList(v.Values) + ")", nil
 	case ir.Set:
-		return "SET(" + emitStringList(v.Values) + ")", nil
+		return "SET(" + m.emitStringList(v.Values) + ")", nil
 
 	// ---- Identity / spatial (extension) ----
 	case ir.UUID:
@@ -200,7 +237,7 @@ func emitColumnType(t ir.Type) (string, error) {
 		if v.BaseType == nil {
 			return "", fmt.Errorf("mysql: cross-engine PG→MySQL: DOMAIN %q has nil BaseType — cannot downgrade", v.Name)
 		}
-		return emitColumnType(v.BaseType)
+		return m.emitColumnType(v.BaseType)
 	}
 
 	return "", fmt.Errorf("mysql: unknown IR type %T", t)
@@ -443,10 +480,10 @@ func appendCharsetCollation(typeExpr, charset, collation string) string {
 
 // emitStringList formats a sequence of strings as a comma-separated
 // list of single-quoted SQL string literals. Used for ENUM/SET values.
-func emitStringList(values []string) string {
+func (m mysqlEmitter) emitStringList(values []string) string {
 	parts := make([]string, len(values))
 	for i, v := range values {
-		parts[i] = quoteSQLString(v)
+		parts[i] = m.quoteSQLString(v)
 	}
 	return strings.Join(parts, ",")
 }
@@ -463,9 +500,13 @@ func emitStringList(values []string) string {
 // would itself corrupt, so the doubling is keyed off the configured mode.
 // Suitable for use as a SQL string literal or inside ENUM/SET value lists
 // (whose labels the reader decodes to raw values at the read boundary —
-// see parseEnumOrSet).
-func quoteSQLString(s string) string {
-	if backslashIsMySQLEscape() {
+// see parseEnumOrSet). The backslash-doubling is keyed off the emitter's
+// resolved sql_mode (task 2.5): under NO_BACKSLASH_ESCAPES the backslash is an
+// ordinary character and doubling would itself corrupt, so it is suppressed.
+func quoteSQLString(s string) string { return stdEmitter.quoteSQLString(s) }
+
+func (m mysqlEmitter) quoteSQLString(s string) string {
+	if m.backslashEscapes {
 		s = strings.ReplaceAll(s, `\`, `\\`)
 	}
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
@@ -522,7 +563,9 @@ var pgToMySQLDefaultExpr = map[string]string{
 // DefaultExpression values are checked against pgToMySQLDefaultExpr
 // for known PG-canonical forms (e.g. now() → CURRENT_TIMESTAMP),
 // then fall through to verbatim emission.
-func emitDefault(d ir.DefaultValue, t ir.Type) (string, bool) {
+func emitDefault(d ir.DefaultValue, t ir.Type) (string, bool) { return stdEmitter.emitDefault(d, t) }
+
+func (m mysqlEmitter) emitDefault(d ir.DefaultValue, t ir.Type) (string, bool) {
 	switch v := d.(type) {
 	case nil, ir.DefaultNone:
 		return "", false
@@ -535,7 +578,7 @@ func emitDefault(d ir.DefaultValue, t ir.Type) (string, bool) {
 				return "0", true
 			}
 		}
-		return quoteSQLString(v.Value), true
+		return m.quoteSQLString(v.Value), true
 	case ir.DefaultExpression:
 		// Bit-literal default on a BIT(N) column (catalog Bug 62). The
 		// reader tags it "bit"; MySQL accepts the literal bare
@@ -776,10 +819,14 @@ func temporalPrecision(t ir.Type) int {
 // empty at call sites that lack table context (the warn then names the
 // column alone).
 func emitColumnDef(tableName string, c *ir.Column) (string, error) {
+	return stdEmitter.emitColumnDef(tableName, c)
+}
+
+func (m mysqlEmitter) emitColumnDef(tableName string, c *ir.Column) (string, error) {
 	if c == nil {
 		return "", fmt.Errorf("mysql: emitColumnDef: column is nil")
 	}
-	typeStr, err := emitColumnType(c.Type)
+	typeStr, err := m.emitColumnType(c.Type)
 	if err != nil {
 		return "", fmt.Errorf("mysql: column %q: %w", c.Name, err)
 	}
@@ -845,7 +892,7 @@ func emitColumnDef(tableName string, c *ir.Column) (string, error) {
 	// non-data metadata affecting only post-migration inserts).
 	if warnDropNonPortableSQLiteDefaultMySQL(tableName, c) {
 		// DEFAULT dropped loudly; no clause emitted.
-	} else if dflt, ok := emitDefault(c.Default, c.Type); ok {
+	} else if dflt, ok := m.emitDefault(c.Default, c.Type); ok {
 		// MySQL forbids DEFAULT on BLOB, TEXT, GEOMETRY, and JSON
 		// columns — the server rejects CREATE TABLE with Error 1101
 		// ("can't have a default value"). Cross-engine PG → MySQL
@@ -869,7 +916,7 @@ func emitColumnDef(tableName string, c *ir.Column) (string, error) {
 	}
 	if c.Comment != "" {
 		sb.WriteString(" COMMENT ")
-		sb.WriteString(quoteSQLString(c.Comment))
+		sb.WriteString(m.quoteSQLString(c.Comment))
 	}
 	return sb.String(), nil
 }
@@ -1094,7 +1141,7 @@ func checkInlineKeyColumnsIndexable(table *ir.Table) error {
 // driver doesn't require it but it keeps logged statements consistent
 // with what a human would write.
 func emitTableDef(table *ir.Table) (string, error) {
-	return emitTableDefWithDomainChecks(table, false)
+	return stdEmitter.emitTableDefWithDomainChecks(table, false)
 }
 
 // emitTableDefWithDomainChecks is the v0.97.0 variant of emitTableDef
@@ -1111,6 +1158,10 @@ func emitTableDef(table *ir.Table) (string, error) {
 // are silently dropped here — the v0.96.2 WARN at
 // maybeWarnDomainCheckDrop covers them.
 func emitTableDefWithDomainChecks(table *ir.Table, inlineCheckSupported bool) (string, error) {
+	return stdEmitter.emitTableDefWithDomainChecks(table, inlineCheckSupported)
+}
+
+func (m mysqlEmitter) emitTableDefWithDomainChecks(table *ir.Table, inlineCheckSupported bool) (string, error) {
 	if table == nil {
 		return "", fmt.Errorf("mysql: emitTableDef: table is nil")
 	}
@@ -1149,7 +1200,7 @@ func emitTableDefWithDomainChecks(table *ir.Table, inlineCheckSupported bool) (s
 				continue
 			}
 			for _, chk := range dom.Checks {
-				clause, ok := translateDomainCheckToMySQL(col.Name, chk)
+				clause, ok := m.translateDomainCheckToMySQL(col.Name, chk)
 				if !ok {
 					continue
 				}
@@ -1183,7 +1234,7 @@ func emitTableDefWithDomainChecks(table *ir.Table, inlineCheckSupported bool) (s
 	hasUserChecks := len(table.CheckConstraints) > 0
 	hasDomainChecks := len(domainCheckClauses) > 0
 	for i, col := range table.Columns {
-		def, err := emitColumnDef(table.Name, col)
+		def, err := m.emitColumnDef(table.Name, col)
 		if err != nil {
 			return "", err
 		}
@@ -1272,7 +1323,7 @@ func emitTableDefWithDomainChecks(table *ir.Table, inlineCheckSupported bool) (s
 	sb.WriteString(") ENGINE=InnoDB")
 	if table.Comment != "" {
 		sb.WriteString(" COMMENT=")
-		sb.WriteString(quoteSQLString(table.Comment))
+		sb.WriteString(m.quoteSQLString(table.Comment))
 	}
 	sb.WriteByte(';')
 

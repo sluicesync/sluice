@@ -17,6 +17,6 @@ import (
 // Reconcile is portable and unit-tested cross-platform; only the SIGHUP
 // trigger is gated out here. Operators on Windows change the fleet by
 // restarting the process (a clean Ctrl-C drains every sync, then re-run).
-func installReloadHandler(ctx context.Context, configPath string, _ *pipeline.Supervisor) {
+func installReloadHandler(ctx context.Context, configPath string, _ *pipeline.Supervisor, _ *Globals) {
 	slog.InfoContext(ctx, "sync run: config hot-reload (SIGHUP) is not available on Windows; restart the process to change the fleet", slog.String("config", configPath))
 }

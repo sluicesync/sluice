@@ -216,13 +216,11 @@ func TestOpenRowReader_InvalidZeroDateRefuses(t *testing.T) {
 }
 
 // TestZeroDatePerSyncIsolation is the load-bearing per-sync property this ADR
-// adds: two readers in ONE process with DIFFERENT modes must not interfere, an
-// override beats the process global, and an unset reader falls back to the
-// global. It exercises the per-reader field threaded into applyZeroDatePolicy.
+// adds (task 2.5 per-instance form): two readers in ONE process with DIFFERENT
+// modes must not interfere, a per-source DSN override beats the engine default,
+// and an unset reader falls back to the engine's --zero-date default (folded at
+// construction) — no shared process global.
 func TestZeroDatePerSyncIsolation(t *testing.T) {
-	// Process global = refuse (the default).
-	withZeroDatePolicy(t, zeroDateRefuse)
-
 	zd := &zeroDateValueError{raw: "0000-00-00"}
 	nullable := &ir.Column{Name: "d", Type: ir.Date{}, Nullable: true}
 
@@ -244,20 +242,31 @@ func TestZeroDatePerSyncIsolation(t *testing.T) {
 		t.Fatalf("readerEpoch: v=%#v; want %v", vEpoch, zeroDateEpochValue)
 	}
 
-	// Override beats the global: readerNull yields NULL while the global is
-	// refuse; the default reader (inherit) refuses per the global.
+	// An unset (inherit) reader whose engine has no --zero-date default resolves
+	// to the loud refuse default.
 	if _, errDefault := applyZeroDatePolicy(zd, nullable, readerDefault.zeroDate); errDefault == nil {
-		t.Error("readerDefault (inherit, global=refuse): err = nil; want the global refusal")
+		t.Error("readerDefault (inherit, no engine default): err = nil; want the refuse default")
 	}
 
-	// Fallback tracks the global: flip the global to epoch and the inherit
-	// reader now substitutes the floor without any per-reader change.
-	withZeroDatePolicy(t, zeroDateAsEpoch)
-	vDef, errDef := applyZeroDatePolicy(zd, nullable, readerDefault.zeroDate)
+	// The engine default is folded at CONSTRUCTION: an engine carrying
+	// --zero-date=epoch folds onto an inherit-DSN reader, so that reader
+	// substitutes the floor — while the per-source ?zero_date=null reader is
+	// untouched (override beats the engine default).
+	eEpoch, err := Engine{}.WithZeroDate("epoch")
+	if err != nil {
+		t.Fatalf("WithZeroDate(epoch): %v", err)
+	}
+	en := eEpoch.(Engine)
+	foldedDefault := en.resolveReaderZeroDate(zeroDateInherit) // DSN unset → engine epoch
+	foldedNull := en.resolveReaderZeroDate(zeroDateAsNull)     // DSN null wins
+	vDef, errDef := applyZeroDatePolicy(zd, nullable, foldedDefault)
 	if errDef != nil {
-		t.Fatalf("readerDefault (inherit, global=epoch): err=%v; want nil", errDef)
+		t.Fatalf("readerDefault (inherit, engine=epoch): err=%v; want nil", errDef)
 	}
 	if got, ok := vDef.(time.Time); !ok || !got.Equal(zeroDateEpochValue) {
-		t.Errorf("readerDefault (inherit, global=epoch): v=%#v; want %v", vDef, zeroDateEpochValue)
+		t.Errorf("readerDefault (inherit, engine=epoch): v=%#v; want %v", vDef, zeroDateEpochValue)
+	}
+	if vN, errN := applyZeroDatePolicy(zd, nullable, foldedNull); errN != nil || vN != nil {
+		t.Errorf("readerNull (?zero_date=null over engine=epoch): v=%#v err=%v; want nil,nil", vN, errN)
 	}
 }

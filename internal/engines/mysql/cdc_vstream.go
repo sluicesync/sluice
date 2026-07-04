@@ -84,7 +84,7 @@ type vstreamCDCReader struct {
 
 	// zeroDate is this reader's per-sync zero/partial-date policy (ADR-0127),
 	// parsed from the `zero_date` source-DSN param at construction. The zero
-	// value (zeroDateInherit) defers to the process-global zeroDatePolicy
+	// value (zeroDateInherit) resolves to the loud refuse default (the engine --zero-date default is folded at reader construction, task 2.5)
 	// (--zero-date), so a reader that doesn't set it is byte-identical to the
 	// pre-ADR-0127 global-only behavior.
 	zeroDate zeroDateMode
@@ -321,7 +321,7 @@ func applyVStreamFlavorDefaults(cfg *gomysql.Config, flavor Flavor) {
 	}
 }
 
-func openVStreamReader(ctx context.Context, dsn string, flavor Flavor) (ir.CDCReader, error) {
+func openVStreamReader(ctx context.Context, dsn string, flavor Flavor, opts engineOptions) (ir.CDCReader, error) {
 	cfg, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err
@@ -329,11 +329,13 @@ func openVStreamReader(ctx context.Context, dsn string, flavor Flavor) (ir.CDCRe
 	if cfg.DBName == "" {
 		return nil, errors.New("mysql/vstream: DSN has no database name (vitess keyspace expected)")
 	}
-	// Per-sync zero-date policy (ADR-0127); invalid zero_date refuses loudly.
+	// Per-sync zero-date policy (ADR-0127); invalid zero_date refuses loudly. The
+	// DSN param wins; absent, the engine's --zero-date default applies.
 	zeroDate, err := readerZeroDateMode(cfg)
 	if err != nil {
 		return nil, err
 	}
+	zeroDate = foldZeroDate(zeroDate, opts.zeroDate)
 	applyVStreamFlavorDefaults(cfg, flavor)
 
 	endpoint, err := vstreamEndpointFromDSN(cfg)
@@ -389,7 +391,7 @@ func openVStreamReader(ctx context.Context, dsn string, flavor Flavor) (ir.CDCRe
 		zeroDate:             zeroDate,
 		shards:               shards,
 		tabletType:           tabletType,
-		relaxSkew:            !vstreamPreserveSkewFromDSN(cfg),
+		relaxSkew:            !vstreamPreserveSkewFromDSN(cfg, opts.preserveSkew),
 		livenessWindow:       livenessWindow,
 		progressWindow:       progressWindow,
 		idleWarnWindow:       idleWarnWindow,
@@ -498,7 +500,10 @@ func discoverShards(ctx context.Context, cfg *gomysql.Config, keyspace string) (
 	// reader's eyes only, not in a SET statement on the wire.) We
 	// pass cfg through directly; openDB Clone()s, so the caller's
 	// cfg.Params is left intact.
-	db, err := openDB(ctx, cfg)
+	// nil sqlMode = the strict default: a shard-discovery probe issues only
+	// read-only meta queries (SHOW VITESS_SHARDS), so the session sql_mode is
+	// immaterial here — the --mysql-sql-mode override belongs on the value paths.
+	db, err := openDB(ctx, cfg, nil)
 	if err != nil {
 		return nil, fmt.Errorf("open mysql for shard discovery: %w", err)
 	}
@@ -802,7 +807,9 @@ func (r *vstreamCDCReader) verifyVStreamPositionReachable(ctx context.Context, d
 		// whose resume gtid we compare, so same-UUID sets are compared correctly.
 		c := r.cfg.Clone()
 		c.DBName = shardScopedTarget(r.keyspace, sg.Shard, r.tabletType)
-		db, err := openDB(ctx, c)
+		// nil sqlMode = the strict default: this is a read-only GTID_SUBSET
+		// pre-flight probe, so the session sql_mode is immaterial here.
+		db, err := openDB(ctx, c, nil)
 		if err != nil {
 			slog.WarnContext(ctx, "mysql/vstream: purged-GTID pre-flight: could not open probe connection; proceeding without the check",
 				slog.String("target", c.DBName), slog.String("shard", sg.Shard), slog.String("err", err.Error()))

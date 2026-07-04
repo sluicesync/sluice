@@ -72,11 +72,14 @@ func (d *D1Conn) Query(ctx context.Context, sql string, params ...string) ([]map
 	return d.c.queryRows(ctx, sql, params...)
 }
 
-// CellDecoder returns a [CapturedCellDecoder] whose date/bool policy matches the
-// `d1` cold-start reader's for the SAME source: the per-source
-// `sqlite_date_encoding` DSN param parsed at [OpenD1Conn], else the
-// process-global default (ADR-0129). So a captured CDC change decodes
-// byte-identically to a cold-start D1 row.
+// CellDecoder returns a [CapturedCellDecoder] whose date/bool policy is the
+// per-source `sqlite_date_encoding` DSN param parsed at [OpenD1Conn], else ISO
+// (ADR-0129). NOTE (task 2.5): the trigger-CDC decoder does NOT receive the
+// engine's --sqlite-date-encoding default — only the `d1`/`sqlite` migrate-source
+// readers fold that per-instance default. A `d1-trigger` source that relied on
+// the CLI default WITHOUT the DSN param now decodes as ISO (a loud storage-class
+// refusal on mismatch, never silent-wrong); set the DSN param to carry it. Folding
+// the engine default through the trigger backends is a scoped follow-up.
 func (d *D1Conn) CellDecoder() *CapturedCellDecoder {
 	return &CapturedCellDecoder{enc: d.c.dateEnc}
 }

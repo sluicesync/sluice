@@ -99,11 +99,14 @@ type CapturedCellDecoder struct {
 }
 
 // NewCapturedCellDecoderForDSN builds a [CapturedCellDecoder] whose date/bool
-// policy matches what the sqlite file reader would use for the same --source
-// DSN: the per-source `sqlite_date_encoding` param if present, else the
-// process-global default (ADR-0129). Reusing [dsnFormParts] keeps the resolution
-// identical to [Engine.OpenRowReader], so the sqlite-trigger CDC path's temporal
-// and boolean decode is byte-identical to the cold-start snapshot reader.
+// policy is the per-source `sqlite_date_encoding` param if present, else ISO
+// (ADR-0129). NOTE (task 2.5): the trigger-CDC decoder does NOT receive the
+// engine's --sqlite-date-encoding default — only the `sqlite`/`d1` migrate-source
+// readers fold that per-instance default (finding A-4 removed the process global).
+// A `sqlite-trigger` source relying on the CLI default WITHOUT the DSN param now
+// decodes as ISO (a loud storage-class refusal on mismatch, never silent-wrong);
+// set the DSN param to carry it. Folding the engine default through the trigger
+// backends is a scoped follow-up.
 func NewCapturedCellDecoderForDSN(dsn string) (*CapturedCellDecoder, error) {
 	_, _, enc, err := dsnFormParts(dsn)
 	if err != nil {

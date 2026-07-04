@@ -33,10 +33,10 @@ import (
 	// register them with the engines registry. Add a new engine by
 	// importing its package here.
 	_ "sluicesync.dev/sluice/internal/engines/d1-trigger"
-	"sluicesync.dev/sluice/internal/engines/mysql"
+	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/pgtrigger"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
-	"sluicesync.dev/sluice/internal/engines/sqlite"
+	_ "sluicesync.dev/sluice/internal/engines/sqlite"
 	_ "sluicesync.dev/sluice/internal/engines/sqlite-trigger"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
@@ -77,19 +77,13 @@ func main() {
 	configureLogging(cli.LogLevel, cli.LogFormat)
 	applyMaxMemory(cli.MaxMemory)
 	startPprofIfRequested(cli.PprofListen)
-	// v0.92.1 escape hatch: thread the operator's --mysql-sql-mode
-	// override into the mysql engine package before any engine opens
-	// a connection. Empty string means "fall through to server
-	// default" — required for migrating legacy MySQL data with
-	// zero-dates / silently-truncated values that pre-MySQL-5.7
-	// schemas commonly carry. See docs/operator/migrating-legacy-mysql.md.
-	mysql.SetSessionSQLMode(cli.MySQLSQLMode)
-	// Thread the operator's --zero-date policy (kong's enum tag already
-	// validated the value; the setter re-checks defensively).
-	ctx.FatalIfErrorf(mysql.SetZeroDateMode(cli.ZeroDate))
-	// Thread the operator's --sqlite-date-encoding policy into the sqlite
-	// engine before any source opens (ADR-0129; mirrors SetZeroDateMode).
-	ctx.FatalIfErrorf(sqlite.SetDefaultDateEncoding(cli.SQLiteDateEncoding))
+	// The operator's value-fidelity flags (--mysql-sql-mode / --zero-date /
+	// --sqlite-date-encoding) used to be threaded into the engine packages HERE
+	// as process-wide mutable globals (SetSessionSQLMode / SetZeroDateMode /
+	// SetDefaultDateEncoding). Audit task 2.5 (finding A-4) moved them onto
+	// per-instance engine copies applied at engine resolution ([applyEngineOptions],
+	// mirroring labelEngine), so a fleet `sync run` can carry distinct values per
+	// sync instead of one global spanning the whole process. See cli.go.
 	err := ctx.Run(&cli.Globals)
 	// Exit boundary: surface any stable error code + remedy hint as a
 	// structured slog record (the `code`/`hint` attrs agents branch on

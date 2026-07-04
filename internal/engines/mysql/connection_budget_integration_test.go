@@ -37,7 +37,7 @@ func TestProbeConnectionBudget_SaneNumbers(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	db, err := openDB(ctx, cfg)
+	db, err := openDB(ctx, cfg, nil)
 	if err != nil {
 		t.Fatalf("openDB: %v", err)
 	}

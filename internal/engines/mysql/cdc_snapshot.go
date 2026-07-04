@@ -81,7 +81,7 @@ func (e Engine) OpenSnapshotStreamForTables(ctx context.Context, dsn string, tab
 	if err != nil {
 		return nil, err
 	}
-	rawN, err := nativeCopyTableParallelismFromDSN(cfg)
+	rawN, err := nativeCopyTableParallelismFromDSN(cfg, e.opts.copyTableParallelism)
 	if err != nil {
 		return nil, err
 	}
@@ -291,11 +291,13 @@ func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, 
 	// Per-sync zero-date policy (ADR-0127): the snapshot cold-copy honors the
 	// same source-DSN `zero_date` override as the steady-state CDC reader, so a
 	// legacy MySQL source's zero/partial dates are carried consistently across
-	// the handoff. Resolved before openDB so an invalid value refuses loudly.
+	// the handoff. Resolved before openDB so an invalid value refuses loudly. The
+	// DSN param wins; absent, the engine's --zero-date default applies.
 	zeroDate, err := readerZeroDateMode(cfg)
 	if err != nil {
 		return nil, err
 	}
+	zeroDate = e.resolveReaderZeroDate(zeroDate)
 	// ADR-0109 §A: raise the snapshot pool's net_write_timeout /
 	// net_read_timeout. The single pinned snapshot connection below reads
 	// every table under one consistent view; a target stall backpressuring
@@ -303,7 +305,7 @@ func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, 
 	// net_write_timeout and drop the whole cold-copy. Bounded (10 min),
 	// operator-override-respecting.
 	applySourceReadSessionTimeouts(cfg)
-	db, err := openDB(ctx, cfg)
+	db, err := openDB(ctx, cfg, e.opts.sqlMode)
 	if err != nil {
 		return nil, err
 	}
@@ -518,7 +520,7 @@ func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, 
 // SetCDCDatabaseScope predicate is the sole event-scope authority.
 func (e Engine) openCDCReaderForSnapshot(ctx context.Context, dsn string, multiDatabase bool) (ir.CDCReader, error) {
 	if multiDatabase {
-		return openBinlogServerCDCReader(ctx, dsn)
+		return openBinlogServerCDCReader(ctx, dsn, e.opts)
 	}
 	return e.OpenCDCReader(ctx, dsn)
 }

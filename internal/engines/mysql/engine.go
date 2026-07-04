@@ -39,15 +39,29 @@ import (
 // engine. Callers should check for it with [errors.Is].
 var ErrNotImplemented = errors.New("mysql engine: not implemented yet")
 
-// Engine is the MySQL implementation of [ir.Engine]. It is stateless:
-// each Open* call creates an independent connection. Multiple Engines
-// may safely coexist.
+// Engine is the MySQL implementation of [ir.Engine]. Each Open* call
+// creates an independent connection; the value is cheap to copy and holds
+// no connection state. Multiple Engines may safely coexist.
 //
 // The Flavor field selects between MySQL-compatible service variants
 // (vanilla MySQL, PlanetScale, etc.). The zero value is FlavorVanilla
 // so Engine{} continues to behave as a vanilla MySQL engine.
+//
+// The opts field carries the per-instance CLI-flag overrides that were
+// formerly process-wide MUTABLE package globals set by the CLI (audit
+// task 2.5 / finding A-4: SetSessionSQLMode, SetZeroDateMode,
+// Set{Native,VStream}CopyTableParallelismOverride,
+// SetVStreamPreserveSkewOverride). They are applied to the engine value
+// the CLI resolves — via the With* builders (engine_options.go) — BEFORE
+// it opens any reader/writer/CDC-reader, mirroring the [ir.ConnectionLabeler]
+// pattern, so a fleet `sync run` can carry DISTINCT values per sync instead
+// of one global spanning the whole process. Every opts zero value
+// reproduces today's default behaviour for the many constructions (tests,
+// broker/chain paths, non-CLI callers) that never set them; see
+// [engineOptions] for the per-field zero-value contract.
 type Engine struct {
 	Flavor Flavor
+	opts   engineOptions
 }
 
 // Name returns the engine's short identifier as used in configuration
@@ -70,7 +84,7 @@ func (e Engine) OpenSchemaReader(ctx context.Context, dsn string) (ir.SchemaRead
 	if err != nil {
 		return nil, err
 	}
-	db, err := openDB(ctx, cfg)
+	db, err := openDB(ctx, cfg, e.opts.sqlMode)
 	if err != nil {
 		return nil, err
 	}
@@ -86,14 +100,17 @@ func (e Engine) OpenSchemaWriter(ctx context.Context, dsn string) (ir.SchemaWrit
 	if err != nil {
 		return nil, err
 	}
-	db, err := openDB(ctx, cfg)
+	db, err := openDB(ctx, cfg, e.opts.sqlMode)
 	if err != nil {
 		return nil, err
 	}
 	// Thread the flavor so the overlapped index-build path (ADR-0080) can
 	// decline the overlap on PlanetScale/Vitess targets and fall back to
-	// the post-copy whole-schema CreateIndexes.
-	w := &SchemaWriter{db: db, schema: cfg.DBName, flavor: e.Flavor}
+	// the post-copy whole-schema CreateIndexes. The emitter carries the
+	// resolved --mysql-sql-mode backslash policy (task 2.5) so every DDL
+	// string literal this writer emits is escaped for the SAME sql_mode its
+	// connections run under.
+	w := &SchemaWriter{db: db, schema: cfg.DBName, flavor: e.Flavor, emitter: newMySQLEmitter(e.opts.sqlMode)}
 	// Probe SELECT VERSION() once at open so the v0.97.0 inline-CHECK
 	// path knows whether the target is MySQL 8.0.16+. A probe failure
 	// is non-fatal: zero-value inlineCheckSupported (false) preserves
@@ -116,17 +133,19 @@ func (e Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, er
 	}
 	// Per-sync zero-date policy (ADR-0127). Resolved before openDB so an
 	// invalid zero_date DSN param refuses loudly without opening a connection.
+	// The DSN param wins; absent, the engine's --zero-date default applies.
 	zeroDate, err := readerZeroDateMode(cfg)
 	if err != nil {
 		return nil, err
 	}
+	zeroDate = e.resolveReaderZeroDate(zeroDate)
 	// ADR-0109 §A: raise this source read pool's net_write_timeout /
 	// net_read_timeout so a transient target-stall-induced backpressure
 	// (the source read sitting idle while the writer can't drain) doesn't
 	// trip the source server's default 60s net_write_timeout and drop the
 	// cold-copy read. Bounded (10 min), operator-override-respecting.
 	applySourceReadSessionTimeouts(cfg)
-	db, err := openDB(ctx, cfg)
+	db, err := openDB(ctx, cfg, e.opts.sqlMode)
 	if err != nil {
 		return nil, err
 	}
@@ -164,7 +183,7 @@ func (e Engine) OpenRowWriter(ctx context.Context, dsn string) (ir.RowWriter, er
 	if err != nil {
 		return nil, err
 	}
-	db, err := openDB(ctx, cfg)
+	db, err := openDB(ctx, cfg, e.opts.sqlMode)
 	if err != nil {
 		return nil, err
 	}
@@ -172,6 +191,10 @@ func (e Engine) OpenRowWriter(ctx context.Context, dsn string) (ir.RowWriter, er
 		db:       db,
 		schema:   cfg.DBName,
 		bulkLoad: e.Capabilities().BulkLoad,
+		// Resolved --mysql-sql-mode (task 2.5): the LOAD DATA warning path keys
+		// its WARN-vs-refuse decision off whether the operator opted into the
+		// relaxed "" mode, replacing the former sessionSQLMode global read.
+		sqlMode: e.opts.sqlMode,
 		// ADR-0150 companion hint: only the HOSTED PlanetScale flavor
 		// is tier-CPU-bound (self-hosted vitess runs on the operator's
 		// own hardware, so the PS-tier ceiling doesn't apply).
@@ -205,17 +228,17 @@ func (e Engine) OpenCDCReader(ctx context.Context, dsn string) (ir.CDCReader, er
 		return nil, fmt.Errorf("%s: CDC not supported by this flavor: %w", e.Name(), ErrNotImplemented)
 	}
 	if e.Flavor.usesVStream() {
-		return openVStreamReader(ctx, dsn, e.Flavor)
+		return openVStreamReader(ctx, dsn, e.Flavor, e.opts)
 	}
 	// FlavorVanilla and any future binlog-based flavor land here.
-	return openBinlogCDCReader(ctx, dsn)
+	return openBinlogCDCReader(ctx, dsn, e.opts)
 }
 
 // openBinlogCDCReader is the FlavorVanilla path of OpenCDCReader.
 // Lifted out of OpenCDCReader so the flavor dispatch above stays
 // readable.
-func openBinlogCDCReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
-	return openBinlogCDCReaderShared(ctx, dsn, false)
+func openBinlogCDCReader(ctx context.Context, dsn string, opts engineOptions) (ir.CDCReader, error) {
+	return openBinlogCDCReaderShared(ctx, dsn, false, opts)
 }
 
 // openBinlogServerCDCReader opens a binlog CDC reader against a *server*
@@ -225,8 +248,8 @@ func openBinlogCDCReader(ctx context.Context, dsn string) (ir.CDCReader, error) 
 // separately via [CDCReader.SetCDCDatabaseScope]. The single-database
 // path keeps the strict [parseDSN] (database required); this sibling
 // relaxes only that precondition.
-func openBinlogServerCDCReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
-	return openBinlogCDCReaderShared(ctx, dsn, true)
+func openBinlogServerCDCReader(ctx context.Context, dsn string, opts engineOptions) (ir.CDCReader, error) {
+	return openBinlogCDCReaderShared(ctx, dsn, true, opts)
 }
 
 // OpenServerCDCReader opens a server-wide binlog CDC reader against a
@@ -253,10 +276,10 @@ func (e Engine) OpenServerCDCReader(ctx context.Context, dsn string) (ir.CDCRead
 			e.Name(), ErrNotImplemented,
 		)
 	}
-	return openBinlogServerCDCReader(ctx, dsn)
+	return openBinlogServerCDCReader(ctx, dsn, e.opts)
 }
 
-func openBinlogCDCReaderShared(ctx context.Context, dsn string, serverScope bool) (ir.CDCReader, error) {
+func openBinlogCDCReaderShared(ctx context.Context, dsn string, serverScope bool, opts engineOptions) (ir.CDCReader, error) {
 	parse := parseDSN
 	if serverScope {
 		parse = parseServerDSN
@@ -267,11 +290,13 @@ func openBinlogCDCReaderShared(ctx context.Context, dsn string, serverScope bool
 	}
 	// Per-sync zero-date policy (ADR-0127), resolved before openDB so an
 	// invalid zero_date DSN param refuses loudly without opening a connection.
+	// The DSN param wins; absent, the engine's --zero-date default applies.
 	zeroDate, err := readerZeroDateMode(cfg)
 	if err != nil {
 		return nil, err
 	}
-	db, err := openDB(ctx, cfg)
+	zeroDate = foldZeroDate(zeroDate, opts.zeroDate)
+	db, err := openDB(ctx, cfg, opts.sqlMode)
 	if err != nil {
 		return nil, err
 	}
@@ -301,12 +326,12 @@ func openBinlogCDCReaderShared(ctx context.Context, dsn string, serverScope bool
 // [ir.MigrationStateStoreOpener]; the pipeline orchestrator type-
 // asserts on this method so engines without a SQL surface for
 // resumable migrations can omit it.
-func (Engine) OpenMigrationStateStore(ctx context.Context, dsn string) (ir.MigrationStateStore, error) {
+func (e Engine) OpenMigrationStateStore(ctx context.Context, dsn string) (ir.MigrationStateStore, error) {
 	cfg, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err
 	}
-	db, err := openDB(ctx, cfg)
+	db, err := openDB(ctx, cfg, e.opts.sqlMode)
 	if err != nil {
 		return nil, err
 	}
@@ -322,7 +347,7 @@ func (Engine) OpenMigrationStateStore(ctx context.Context, dsn string) (ir.Migra
 //
 // See the [ChangeApplier] doc comment for important details about
 // no-PK and unique-key-without-PK tables.
-func (Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeApplier, error) {
+func (e Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeApplier, error) {
 	cfg, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err
@@ -346,7 +371,7 @@ func (Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeAppli
 		cfg.Params = map[string]string{}
 	}
 	cfg.Params["foreign_key_checks"] = "0"
-	db, err := openDB(ctx, cfg)
+	db, err := openDB(ctx, cfg, e.opts.sqlMode)
 	if err != nil {
 		return nil, err
 	}
@@ -356,8 +381,11 @@ func (Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeAppli
 		// pipelineCfg retains the parsed DSN so the ADR-0104 concurrent
 		// key-hash apply path can open its dedicated pool lazily on the first
 		// concurrent batch (only when --apply-concurrency > 1 is wired via
-		// SetApplyConcurrency).
+		// SetApplyConcurrency). sqlMode is the engine's resolved --mysql-sql-mode
+		// override (task 2.5) so the lazily-opened lane pool injects the SAME
+		// session sql_mode as the serial pool.
 		pipelineCfg:   cfg,
+		sqlMode:       e.opts.sqlMode,
 		pkCache:       make(map[string][]string),
 		colTypeCache:  make(map[string]map[string]*ir.Column),
 		keylessCache:  make(map[string]bool),
@@ -390,12 +418,12 @@ var systemDatabases = map[string]struct{}{
 // so this opens via [parseServerDSN] rather than [parseDSN]. The system
 // databases (information_schema, performance_schema, mysql, sys) are
 // filtered out unconditionally per the ADR.
-func (Engine) ListDatabases(ctx context.Context, dsn string) ([]string, error) {
+func (e Engine) ListDatabases(ctx context.Context, dsn string) ([]string, error) {
 	cfg, err := parseServerDSN(dsn)
 	if err != nil {
 		return nil, err
 	}
-	db, err := openDB(ctx, cfg)
+	db, err := openDB(ctx, cfg, e.opts.sqlMode)
 	if err != nil {
 		return nil, err
 	}
@@ -460,7 +488,7 @@ func (Engine) WithDatabase(dsn, database string) (string, error) {
 // The database identifier is backtick-quoted via quoteIdent so a
 // database name with reserved-word or special-character shape is safe;
 // embedded backticks are doubled by quoteIdent.
-func (Engine) EnsureDatabase(ctx context.Context, dsn, database string) error {
+func (e Engine) EnsureDatabase(ctx context.Context, dsn, database string) error {
 	if database == "" {
 		return errors.New("mysql: EnsureDatabase: database name is empty")
 	}
@@ -472,7 +500,7 @@ func (Engine) EnsureDatabase(ctx context.Context, dsn, database string) error {
 	// yet, so a database-scoped DSN would fail to connect.
 	cfg = cfg.Clone()
 	cfg.DBName = ""
-	db, err := openDB(ctx, cfg)
+	db, err := openDB(ctx, cfg, e.opts.sqlMode)
 	if err != nil {
 		return err
 	}
@@ -508,12 +536,12 @@ func (Engine) EnsureDatabase(ctx context.Context, dsn, database string) error {
 //
 // Used on a MySQL TARGET of a PG-source (or MySQL-source) multi-namespace
 // fan-out. dsn may be a server DSN (database component optional).
-func (Engine) FoldNamespace(ctx context.Context, dsn, name string) (string, error) {
+func (e Engine) FoldNamespace(ctx context.Context, dsn, name string) (string, error) {
 	cfg, err := parseServerDSN(dsn)
 	if err != nil {
 		return "", err
 	}
-	db, err := openDB(ctx, cfg)
+	db, err := openDB(ctx, cfg, e.opts.sqlMode)
 	if err != nil {
 		return "", err
 	}

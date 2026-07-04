@@ -223,7 +223,7 @@ func (w *RowWriter) reportBulkWriteWarnings(ctx context.Context, conn *sql.Conn,
 		more = fmt.Sprintf(" (… and %d more)", count-8)
 	}
 
-	if sessionSQLMode == "" {
+	if resolveSessionSQLMode(w.sqlMode) == "" {
 		// Relaxed: WARN once per table, don't refuse.
 		if _, seen := w.warnedClamp.LoadOrStore(table, struct{}{}); !seen {
 			slog.WarnContext(

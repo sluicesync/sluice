@@ -41,56 +41,45 @@ func init() {
 // deployments).
 const defaultStrictSQLMode = "STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO"
 
-// sessionSQLMode is the value sluice injects into every MySQL
-// connection's `SET SESSION sql_mode = '...'` post-handshake. Set
-// once at process startup by [SetSessionSQLMode] (called from
-// main.go with the operator's --mysql-sql-mode value). Default
-// value matches [defaultStrictSQLMode] so a bare `go test ./...`
-// or any path that doesn't go through main() still gets the strict
-// mode.
-//
-// Empty string is the explicit "fall through to server default"
-// path — operators with legacy MySQL data (zero-dates / silently-
-// truncated values) opt out via --mysql-sql-mode=” .
-var sessionSQLMode = defaultStrictSQLMode
-
-// SetSessionSQLMode overrides the sql_mode sluice forces on every
-// MySQL connection. main.go calls this once at startup with the
-// operator's --mysql-sql-mode CLI value. The DSN-level override
-// (`?sql_mode=...` query param in the connection string) takes
-// precedence over this value if both are set.
-//
-// Empty string disables the override — no SET SESSION sql_mode is
-// issued, so the server's own default applies. Use this when
-// migrating legacy MySQL data with zero-dates / silently-truncated
-// values that a strict mode would refuse.
-//
-// Concurrency: this is process-wide global state set once at
-// startup, before any engine opens a connection. Don't call it
-// from long-lived goroutines.
-func SetSessionSQLMode(modes string) {
-	sessionSQLMode = modes
+// resolveSessionSQLMode collapses an engine's --mysql-sql-mode override to the
+// concrete mode sluice injects into every MySQL connection's
+// `SET SESSION sql_mode = '...'` post-handshake. nil (an override-free engine,
+// every bare `Engine{}` / test / non-CLI construction) resolves to
+// [defaultStrictSQLMode] — the Bug 102/103 strict-by-default. A non-nil value is
+// the operator's explicit --mysql-sql-mode choice, including "" (fall through to
+// the server default — the legacy-data escape hatch). The override was formerly
+// the process-wide MUTABLE `sessionSQLMode` global set by SetSessionSQLMode; task
+// 2.5 (finding A-4) moves it onto the per-instance [engineOptions.sqlMode],
+// threaded into [openDB] so a fleet `sync run` can carry a distinct mode per sync.
+func resolveSessionSQLMode(sqlMode *string) string {
+	if sqlMode != nil {
+		return *sqlMode
+	}
+	return defaultStrictSQLMode
 }
 
 // backslashIsMySQLEscape reports whether MySQL's string-literal lexer treats
 // a backslash as an escape introducer under the sql_mode sluice injects into
-// its sessions ([sessionSQLMode]): true unless the configured mode includes
-// NO_BACKSLASH_ESCAPES. The DDL emitters key their string-literal quoting off
-// this (quoteSQLString, SEC-1 review gap 2): when backslash is an escape,
-// every literal backslash must be doubled or MySQL silently decodes it.
+// its sessions (the engine's resolved --mysql-sql-mode, sqlMode): true unless
+// the configured mode includes NO_BACKSLASH_ESCAPES. The DDL emitters key their
+// string-literal quoting off this ([mysqlEmitter.quoteSQLString], SEC-1 review
+// gap 2): when backslash is an escape, every literal backslash must be doubled or
+// MySQL silently decodes it. The [SchemaWriter] resolves the policy ONCE at open
+// from the engine's sqlMode and carries it on its emitter, so the emit surface
+// stays a pure function of (policy, IR) with no package global.
 //
 // Two documented approximations, both conservative toward MySQL's factory
 // default (backslash IS an escape):
 //
-//   - sessionSQLMode == "" means "fall through to the server default", which
-//     sluice cannot see here; no stock MySQL default includes
-//     NO_BACKSLASH_ESCAPES, so escaping is assumed.
+//   - a "" mode means "fall through to the server default", which sluice cannot
+//     see here; no stock MySQL default includes NO_BACKSLASH_ESCAPES, so
+//     escaping is assumed.
 //   - a DSN-level `sql_mode=` param overrides per-connection and is not
 //     visible to the emitters; an operator combining a DSN-only
 //     NO_BACKSLASH_ESCAPES override with backslash-bearing string values
 //     should set --mysql-sql-mode instead so the emitters see it.
-func backslashIsMySQLEscape() bool {
-	return !strings.Contains(strings.ToUpper(sessionSQLMode), "NO_BACKSLASH_ESCAPES")
+func backslashIsMySQLEscape(sqlMode *string) bool {
+	return !strings.Contains(strings.ToUpper(resolveSessionSQLMode(sqlMode)), "NO_BACKSLASH_ESCAPES")
 }
 
 // sqlModeHasNBE reports whether a raw sql_mode string enables
@@ -103,19 +92,20 @@ func sqlModeHasNBE(mode string) bool {
 }
 
 // warnSQLModeNBEDisagreement logs a single WARN when an operator-supplied
-// DSN `sql_mode` param disagrees with the session mode sluice's DDL emitters
-// assume ([sessionSQLMode], set from --mysql-sql-mode) on NO_BACKSLASH_ESCAPES.
-// The emitters key their string-literal backslash escaping off
-// [backslashIsMySQLEscape] (which reads sessionSQLMode), but a DSN `sql_mode`
-// wins on the actual connection — so a mismatch means the escaping decision is
-// made against the wrong mode, silently doubling (or failing to double)
-// backslashes in DDL string literals. This is a WARN, not a refusal: the DSN
-// override is a legitimate operator choice, and the fix is to align
-// --mysql-sql-mode with it. Fires only when the operator set the DSN param
-// (when sluice injects sessionSQLMode itself, the two agree by construction).
-func warnSQLModeNBEDisagreement(dsnSQLMode string) {
+// DSN `sql_mode` param disagrees, on NO_BACKSLASH_ESCAPES, with the session
+// mode sluice's DDL emitters assume (the engine's resolved --mysql-sql-mode,
+// sqlMode — task 2.5 replaced the former sessionSQLMode global). The emitters
+// key their string-literal backslash escaping off [backslashIsMySQLEscape],
+// but a DSN `sql_mode` wins on the actual connection — so a mismatch means the
+// escaping decision is made against the wrong mode, silently doubling (or
+// failing to double) backslashes in DDL string literals. This is a WARN, not a
+// refusal: the DSN override is a legitimate operator choice, and the fix is to
+// align --mysql-sql-mode with it. Called from [injectSessionSQLMode] only when
+// a DSN `sql_mode` param is present (when sluice injects the mode itself, the
+// two agree by construction).
+func warnSQLModeNBEDisagreement(dsnSQLMode string, sqlMode *string) {
 	dsnNBE := sqlModeHasNBE(dsnSQLMode)
-	sessionNBE := !backslashIsMySQLEscape()
+	sessionNBE := !backslashIsMySQLEscape(sqlMode)
 	if dsnNBE == sessionNBE {
 		return
 	}
@@ -126,7 +116,7 @@ func warnSQLModeNBEDisagreement(dsnSQLMode string) {
 			"COMMENT / expression literal may be silently mis-escaped on the target. Align "+
 			"--mysql-sql-mode with the DSN sql_mode (or drop the DSN override) to remove the mismatch",
 		slog.String("dsn_sql_mode", strings.Trim(dsnSQLMode, "'")),
-		slog.String("session_sql_mode", sessionSQLMode),
+		slog.String("session_sql_mode", resolveSessionSQLMode(sqlMode)),
 		slog.Bool("dsn_no_backslash_escapes", dsnNBE),
 		slog.Bool("session_no_backslash_escapes", sessionNBE),
 	)
@@ -276,49 +266,14 @@ func finishParseDSN(cfg *mysql.Config) *mysql.Config {
 	if _, ok := cfg.Params["time_zone"]; !ok {
 		cfg.Params["time_zone"] = "'+00:00'"
 	}
-	// Bug 102 + Bug 103 (CRITICAL silent-loss, v0.92.1). Pre-fix
-	// sluice inherited the MySQL server's sql_mode, which on dev
-	// containers and some managed deployments doesn't include the
-	// strict modes — so PG `NUMERIC(40,5)` values overflowing
-	// MySQL `DECIMAL(65,30)` silently clamped to the column max
-	// (every overflowing row → same constant; Bug 102 CRITICAL silent
-	// data loss), and PG `TIMESTAMPTZ` values outside MySQL
-	// `TIMESTAMP` range silently became `0000-00-00 00:00:00` (Bug
-	// 103). Both manifestations LOUD-refused on a PG target because
-	// PG always enforces; sluice's silent-on-MySQL was a pure
-	// connection-config oversight.
-	//
-	// The injected sql_mode follows a two-tier override policy:
-	//
-	//   1. DSN-level override (`sql_mode=...` in the connection
-	//      string params) wins absolutely. An operator who needs
-	//      different modes for source vs target sets each DSN's own
-	//      sql_mode.
-	//   2. CLI-level override via --mysql-sql-mode (threaded into
-	//      [sessionSQLMode] from main.go). Empty string means "fall
-	//      through to server default" — the legacy-data escape hatch
-	//      for migrations involving zero-dates / silently-truncated
-	//      values that pre-MySQL-5.7 schemas commonly carry.
-	//
-	// If neither is set, [defaultStrictSQLMode] applies (the
-	// loud-failure-tenet default). The literal-quotes pattern matches
-	// the time_zone override above.
-	operatorSQLMode, operatorSetSQLMode := cfg.Params["sql_mode"]
-	if !operatorSetSQLMode && sessionSQLMode != "" {
-		cfg.Params["sql_mode"] = "'" + sessionSQLMode + "'"
-	}
-	// SEC-1 re-review follow-up: the DDL emitters' backslash-escaping
-	// decision ([quoteSQLString] / [backslashIsMySQLEscape]) reads the
-	// process-global [sessionSQLMode], but a DSN-level `sql_mode` param wins
-	// on the WIRE (the branch above defers to it). When the two disagree on
-	// NO_BACKSLASH_ESCAPES, the emitter doubles (or doesn't double) backslashes
-	// against the WRONG mode — the one residual fail-open channel SEC-1 left.
-	// WARN loudly once per connect, naming both values; never block (the
-	// operator's DSN override is legitimate — this only flags the mismatch so
-	// a silent-corruption surprise becomes a visible one).
-	if operatorSetSQLMode {
-		warnSQLModeNBEDisagreement(operatorSQLMode)
-	}
+	// The session sql_mode injection (Bug 102/103 strict-by-default) lives in
+	// [openDB] → [injectSessionSQLMode], not here: it depends on the
+	// per-instance --mysql-sql-mode override the [Engine] carries (task 2.5,
+	// replacing the former sessionSQLMode global), which parseDSN — a pure DSN
+	// parser shared by tests and non-Engine callers — does not have. openDB is
+	// the single choke point every MySQL connection passes through, so injecting
+	// there covers every Open* path. The SEC-1 NBE-disagreement WARN also fires
+	// from injectSessionSQLMode, for the same per-instance-mode reason.
 	// Bug 106 (v0.92.1). Pre-fix the connection's default character
 	// set could fall back to 3-byte utf8 on older MySQL servers /
 	// managed deployments, silently corrupting 4-byte UTF-8 sequences
@@ -426,9 +381,10 @@ var nativeSluiceParams = map[string]struct{}{
 }
 
 // readerZeroDateMode resolves a reader's per-sync zero-date policy from the
-// `zero_date` source-DSN param (ADR-0127). Absent → zeroDateInherit, so the
-// reader defers to the process-global zeroDatePolicy (--zero-date) — exactly
-// the pre-ADR-0127 behavior, byte-identical. Present-but-invalid is refused
+// `zero_date` source-DSN param (ADR-0127). Absent → zeroDateInherit; the caller
+// then folds the engine's --zero-date default onto it ([Engine.resolveReaderZeroDate],
+// task 2.5), and a residual inherit resolves to the loud refuse default at decode
+// — exactly the pre-task-2.5 behavior, byte-identical. Present-but-invalid is refused
 // LOUDLY at reader construction, naming the param and the valid set (never a
 // silent fallback). It reads cfg.Params directly; the param is stripped from
 // the MySQL session separately at openDB via [stripVStreamParams] +
@@ -495,11 +451,14 @@ func stripVStreamParams(cfg *mysql.Config) *mysql.Config {
 //
 // sluice's vstream_* DSN extensions are stripped here (see
 // [stripVStreamParams]) so they never reach a MySQL session as a
-// `SET vstream_* = …` statement — Bug 126. This is the single choke
-// point every MySQL connection passes through, so the strip is
-// leak-proof against future Open* paths.
-func openDB(ctx context.Context, cfg *mysql.Config) (*sql.DB, error) {
+// `SET vstream_* = …` statement — Bug 126. The session sql_mode is
+// injected here too ([injectSessionSQLMode], sqlMode = the engine's
+// resolved --mysql-sql-mode override). This is the single choke point
+// every MySQL connection passes through, so both the strip and the
+// injection are leak-proof against future Open* paths.
+func openDB(ctx context.Context, cfg *mysql.Config, sqlMode *string) (*sql.DB, error) {
 	cfg = stripVStreamParams(cfg)
+	injectSessionSQLMode(cfg, sqlMode)
 	connector, err := mysql.NewConnector(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("mysql: build connector: %w", err)
@@ -511,4 +470,49 @@ func openDB(ctx context.Context, cfg *mysql.Config) (*sql.DB, error) {
 		return nil, fmt.Errorf("mysql: ping: %w", err)
 	}
 	return db, nil
+}
+
+// injectSessionSQLMode adds `SET SESSION sql_mode='...'` to cfg.Params so the
+// go-sql-driver emits it at session init on every connection in the pool. It is
+// called by [openDB] on the vstream-stripped CLONE, so it never mutates the
+// caller's cfg.
+//
+// Bug 102 + Bug 103 (CRITICAL silent-loss, v0.92.1). Pre-fix sluice inherited the
+// MySQL server's sql_mode, which on dev containers and some managed deployments
+// doesn't include the strict modes — so PG `NUMERIC(40,5)` values overflowing
+// MySQL `DECIMAL(65,30)` silently clamped to the column max (Bug 102), and PG
+// `TIMESTAMPTZ` values outside MySQL `TIMESTAMP` range silently became
+// `0000-00-00 00:00:00` (Bug 103). The injected sql_mode follows a two-tier
+// override policy:
+//
+//  1. DSN-level override (`sql_mode=...` in the connection string params) wins
+//     absolutely — the helper only sets the key when absent.
+//  2. Engine-level override via --mysql-sql-mode ([engineOptions.sqlMode],
+//     resolved by [resolveSessionSQLMode]). "" means "fall through to server
+//     default" — the legacy-data escape hatch — and injects nothing.
+//
+// If neither is set (an override-free engine), [defaultStrictSQLMode] applies
+// (the loud-failure-tenet default). The literal-quotes pattern matches the
+// time_zone override in [finishParseDSN].
+//
+// SEC-1 re-review follow-up: when a DSN `sql_mode` param IS present it wins on
+// the wire, but the DDL emitters escape string-literal backslashes against the
+// per-instance mode (sqlMode) — so a NO_BACKSLASH_ESCAPES disagreement is the
+// one residual fail-open channel. [warnSQLModeNBEDisagreement] flags it (WARN,
+// never blocks). Checked before the empty-mode early return so the
+// --mysql-sql-mode="" escape hatch still surfaces a mismatching DSN override.
+func injectSessionSQLMode(cfg *mysql.Config, sqlMode *string) {
+	if dsnMode, ok := cfg.Params["sql_mode"]; ok {
+		warnSQLModeNBEDisagreement(dsnMode, sqlMode)
+	}
+	mode := resolveSessionSQLMode(sqlMode)
+	if mode == "" {
+		return
+	}
+	if cfg.Params == nil {
+		cfg.Params = map[string]string{}
+	}
+	if _, ok := cfg.Params["sql_mode"]; !ok {
+		cfg.Params["sql_mode"] = "'" + mode + "'"
+	}
 }

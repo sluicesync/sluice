@@ -1513,18 +1513,16 @@ func TestQuoteSQLString(t *testing.T) {
 		}
 	}
 
-	// Under a configured NO_BACKSLASH_ESCAPES mode the backslash is an
-	// ordinary character: doubling there would itself corrupt the value, so
-	// the escaping is keyed off the configured session mode. (Serial test —
-	// sessionSQLMode is process-global, set-once-at-startup state; restore
-	// so no other test observes the override.)
-	orig := sessionSQLMode
-	t.Cleanup(func() { SetSessionSQLMode(orig) })
-	SetSessionSQLMode("NO_BACKSLASH_ESCAPES,STRICT_TRANS_TABLES")
-	if got, want := quoteSQLString(`C:\temp`), `'C:\temp'`; got != want {
+	// Under a configured NO_BACKSLASH_ESCAPES mode the backslash is an ordinary
+	// character: doubling there would itself corrupt the value, so the escaping is
+	// keyed off the emitter's resolved sql_mode (task 2.5 per-instance form — no
+	// process global; the emitter carries the policy).
+	noEsc := "NO_BACKSLASH_ESCAPES,STRICT_TRANS_TABLES"
+	em := newMySQLEmitter(&noEsc)
+	if got, want := em.quoteSQLString(`C:\temp`), `'C:\temp'`; got != want {
 		t.Errorf("quoteSQLString under NO_BACKSLASH_ESCAPES = %q; want %q (no doubling)", got, want)
 	}
-	if got, want := quoteSQLString("it's"), "'it''s'"; got != want {
+	if got, want := em.quoteSQLString("it's"), "'it''s'"; got != want {
 		t.Errorf("quoteSQLString quote-doubling under NO_BACKSLASH_ESCAPES = %q; want %q", got, want)
 	}
 }

@@ -136,10 +136,12 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 		return nil, errors.New("mysql/vstream: snapshot: DSN has no database name (vitess keyspace expected)")
 	}
 	// Per-sync zero-date policy (ADR-0127); invalid zero_date refuses loudly.
+	// The DSN param wins; absent, the engine's --zero-date default applies.
 	zeroDate, err := readerZeroDateMode(cfg)
 	if err != nil {
 		return nil, err
 	}
+	zeroDate = e.resolveReaderZeroDate(zeroDate)
 	// Self-hosted vitess flavor: default transport=plaintext / auth=none so
 	// the cold-start snapshot (and the backup snapshot, which funnels through
 	// here) dials a self-hosted vtgate without hand-set vstream_* params —
@@ -191,7 +193,7 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 	// parsed here (loud on a malformed value); the effective stream count is
 	// resolved against the in-scope table count below, once auto-shard
 	// eligibility is known.
-	rawTableParallelism, err := vstreamCopyTableParallelismFromDSN(cfg)
+	rawTableParallelism, err := vstreamCopyTableParallelismFromDSN(cfg, e.opts.vstreamCopyTableParallelism)
 	if err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -525,7 +527,7 @@ type vstreamSnapshotStream struct {
 
 	// zeroDate is this snapshot stream's per-sync zero/partial-date policy
 	// (ADR-0127), parsed from the `zero_date` source-DSN param at open. The
-	// zero value (zeroDateInherit) defers to the process-global zeroDatePolicy
+	// zero value (zeroDateInherit) resolves to the loud refuse default (the engine --zero-date default is folded at reader construction, task 2.5)
 	// (--zero-date); set in the constructor so the COPY cold-copy honors the
 	// same per-sync policy as the steady-state VStream CDC reader.
 	zeroDate zeroDateMode

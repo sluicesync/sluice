@@ -80,6 +80,14 @@ func (s *SchemaPreviewCmd) Run(g *Globals) error {
 	if err != nil {
 		return fmt.Errorf("--target-driver: %w", err)
 	}
+	// Value-fidelity flags (task 2.5): preview emits target DDL, so the
+	// --mysql-sql-mode backslash policy reaches the schema emitter.
+	if source, err = applyEngineOptions(source, g); err != nil {
+		return err
+	}
+	if target, err = applyEngineOptions(target, g); err != nil {
+		return err
+	}
 
 	if len(s.IncludeTable) > 0 && len(s.ExcludeTable) > 0 {
 		return errors.New("--include-table and --exclude-table are mutually exclusive")

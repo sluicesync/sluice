@@ -24,7 +24,7 @@ import (
 //
 // The handler goroutine stops when ctx is cancelled (fleet shutdown), so
 // no SIGHUP is left registered past the fleet's lifetime.
-func installReloadHandler(ctx context.Context, configPath string, sup *pipeline.Supervisor) {
+func installReloadHandler(ctx context.Context, configPath string, sup *pipeline.Supervisor, g *Globals) {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGHUP)
 	go func() {
@@ -35,7 +35,7 @@ func installReloadHandler(ctx context.Context, configPath string, sup *pipeline.
 				return
 			case <-ch:
 				slog.InfoContext(ctx, "sync run: SIGHUP received; reloading fleet config", slog.String("config", configPath))
-				if err := reloadFleet(ctx, configPath, sup); err != nil {
+				if err := reloadFleet(ctx, configPath, sup, g); err != nil {
 					slog.ErrorContext(
 						ctx,
 						"sync run: config reload REFUSED; live fleet unchanged (still running on the previous config)",

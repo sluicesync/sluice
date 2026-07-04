@@ -96,6 +96,14 @@ func (s *SchemaAddTableCmd) Run(g *Globals) error {
 	if err != nil {
 		return fmt.Errorf("--target-driver: %w", err)
 	}
+	// Value-fidelity flags (task 2.5): add-table reads the source table and emits
+	// target DDL, so the value-decode + sql_mode-emit policies apply.
+	if source, err = applyEngineOptions(source, g); err != nil {
+		return err
+	}
+	if target, err = applyEngineOptions(target, g); err != nil {
+		return err
+	}
 
 	if s.Table == "" {
 		return errors.New("table name is required (positional argument)")

@@ -44,7 +44,7 @@ func TestVStreamCopyTableParallelismFromDSN(t *testing.T) {
 			if tc.param != "" {
 				cfg.Params["vstream_copy_table_parallelism"] = tc.param
 			}
-			got, err := vstreamCopyTableParallelismFromDSN(cfg)
+			got, err := vstreamCopyTableParallelismFromDSN(cfg, 0)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("want a loud error for %q, got nil (val=%d)", tc.param, got)

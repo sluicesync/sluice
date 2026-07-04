@@ -67,7 +67,7 @@ const dsnDateEncodingParam = "sqlite_date_encoding"
 // driver DSN modernc.org/sqlite expects, the bare filesystem path for
 // display / error messages, and the per-source date encoding resolved from
 // the `sqlite_date_encoding` query param (dateEncodingInherit when absent, so
-// the reader defers to the process-global default). Accepted inputs:
+// the engine --sqlite-date-encoding default is folded at OpenRowReader, else ISO). Accepted inputs:
 //
 //   - a bare path: "./app.db", "/data/app.db", `C:\data\app.db`
 //   - a file URI:  "file:app.db", "file:/data/app.db?cache=shared"
@@ -98,7 +98,7 @@ func dsnFormParts(dsn string) (base, path string, enc dateEncoding, err error) {
 
 	// Pull sluice's own sqlite_date_encoding param out of the query string
 	// (ADR-0129) BEFORE any driver-DSN assembly, so it never reaches modernc.
-	// Absent → dateEncodingInherit (defer to the process-global default);
+	// Absent → dateEncodingInherit (the engine default is folded at OpenRowReader, task 2.5; else ISO);
 	// present-but-invalid → loud refusal here, before a connection is opened.
 	clean, encRaw, present := stripDateEncodingParam(dsn)
 	enc = dateEncodingInherit

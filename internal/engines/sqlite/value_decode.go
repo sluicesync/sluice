@@ -181,20 +181,25 @@ func mismatchError(raw any, t ir.Type) error {
 // Two scopes share the type, mirroring the MySQL zero-date pattern
 // (ADR-0127):
 //
-//   - the process-wide default ([defaultDateEncoding]) set once at startup
-//     from --sqlite-date-encoding via [SetDefaultDateEncoding] (main.go);
-//   - each row reader can override it PER SOURCE via the
+//   - the operator's --sqlite-date-encoding default, carried per-instance on
+//     the [Engine] / [d1Engine] value (task 2.5, replacing the former
+//     process-wide defaultDateEncoding global) and folded into each reader at
+//     OpenRowReader when the DSN doesn't specify one;
+//   - each row reader can override that PER SOURCE via the
 //     `sqlite_date_encoding` DSN param (resolved at OpenRowReader, see
 //     connect.go).
 type dateEncoding int
 
 const (
-	// dateEncodingInherit is the STRUCT-FIELD zero value: a reader that
-	// leaves its encoding unset defers to the process-global
-	// [defaultDateEncoding]. It is the iota-0 sentinel ON PURPOSE so every
-	// construction site that does not set the field (tests, future callers)
-	// inherits the operator's --sqlite-date-encoding rather than silently
-	// flipping to a fixed encoding (the v0.99.51 zero-value-safety lesson).
+	// dateEncodingInherit is the STRUCT-FIELD zero value: a reader that leaves
+	// its encoding unset resolves to the ISO default at decode time
+	// ([resolveDateEncoding]). It is the iota-0 sentinel ON PURPOSE so every
+	// construction site that does not set the field (tests, future callers) stays
+	// byte-identical to the ISO-default behaviour (the v0.99.51 zero-value-safety
+	// lesson). The operator's --sqlite-date-encoding default is folded onto the
+	// reader at OpenRowReader (from the [Engine]'s per-instance value, task 2.5),
+	// so a reader whose DSN omits the param inherits the CLI default there — not
+	// via a decode-time global read.
 	dateEncodingInherit    dateEncoding = iota
 	dateEncodingISO                     // iso (default): ISO-8601 TEXT
 	dateEncodingUnixEpoch               // unixepoch: INTEGER/REAL unix seconds
@@ -216,14 +221,6 @@ func (e dateEncoding) String() string {
 		return "iso"
 	}
 }
-
-// defaultDateEncoding is the active PROCESS-GLOBAL temporal encoding (the
-// --sqlite-date-encoding default). Read by [resolveDateEncoding] whenever a
-// reader's own encoding is dateEncodingInherit; written once at startup
-// before any engine connects. It is never dateEncodingInherit itself
-// (SetDefaultDateEncoding maps an absent/empty value to dateEncodingISO), so
-// inherit resolution terminates.
-var defaultDateEncoding = dateEncodingISO
 
 // errInvalidDateEncoding names the valid set for a bad encoding value;
 // callers wrap it with their own %q context (the --sqlite-date-encoding flag
@@ -251,29 +248,32 @@ func parseDateEncoding(s string) (dateEncoding, error) {
 	}
 }
 
-// SetDefaultDateEncoding sets the process-wide temporal encoding from the
-// operator's --sqlite-date-encoding value. Called once from main.go before
-// any engine opens a connection. An empty string keeps the iso default.
-//
-// Concurrency: process-wide global state set once at startup, before any
-// engine opens a connection. Don't call it from long-lived goroutines.
-func SetDefaultDateEncoding(s string) error {
-	enc, err := parseDateEncoding(s)
-	if err != nil {
-		return fmt.Errorf("sqlite: invalid --sqlite-date-encoding %q (%w)", s, err)
-	}
-	defaultDateEncoding = enc
-	return nil
-}
-
 // resolveDateEncoding collapses a reader's per-source encoding to a concrete
-// one: dateEncodingInherit defers to the process-global [defaultDateEncoding]
-// (which is never inherit), so the result is always a real encoding.
+// one at decode time: dateEncodingInherit resolves to the ISO default, so the
+// result is always a real encoding. The operator's --sqlite-date-encoding
+// default is NOT read here (it was formerly the defaultDateEncoding global);
+// it is folded onto the reader's encoding at OpenRowReader ([foldDateEncoding])
+// from the [Engine]'s per-instance value (task 2.5), so a reader that reaches
+// decode with inherit genuinely wants ISO (a bare-struct construction that set
+// neither the DSN param nor an engine default).
 func resolveDateEncoding(enc dateEncoding) dateEncoding {
 	if enc == dateEncodingInherit {
-		return defaultDateEncoding
+		return dateEncodingISO
 	}
 	return enc
+}
+
+// foldDateEncoding resolves a reader's per-source DSN encoding against the
+// engine's --sqlite-date-encoding default: the DSN param wins when set, else the
+// engine default (which may itself be dateEncodingInherit for an override-free
+// engine → the reader keeps inherit and [resolveDateEncoding] yields ISO). This
+// is the single fold every OpenRowReader funnels the DSN encoding through so the
+// engine default reaches readers without a decode-time global.
+func foldDateEncoding(dsnEnc, engineEnc dateEncoding) dateEncoding {
+	if dsnEnc != dateEncodingInherit {
+		return dsnEnc
+	}
+	return engineEnc
 }
 
 // decodeTemporal decodes a SQLite cell into its IR temporal value per the

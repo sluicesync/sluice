@@ -82,10 +82,30 @@ const d1MaxResponseBytes = 8 << 20
 // engine it holds no connection state; the zero value is usable. It shares this
 // package's [capabilities] (a migrate-source shape: CDCNone, no extension
 // types) — D1 is SQLite, so the declared shape is identical.
-type d1Engine struct{}
+type d1Engine struct {
+	// dateEncoding carries the operator's --sqlite-date-encoding default
+	// (ADR-0129), set via [d1Engine.WithDateEncoding] — the per-instance
+	// replacement for the former SetDefaultDateEncoding global (task 2.5). The
+	// zero value dateEncodingInherit resolves to ISO, so a bare NewD1Engine()
+	// reads temporal columns as ISO-8601 text exactly as before.
+	dateEncoding dateEncoding
+}
 
 // Name returns the engine's CLI identifier (`--source-driver d1`).
 func (d1Engine) Name() string { return "d1" }
+
+// WithDateEncoding returns a copy of the engine carrying the operator's
+// --sqlite-date-encoding default (ADR-0129; task 2.5). The per-source
+// `sqlite_date_encoding` DSN param still wins over this default. An empty string
+// keeps the iso default. Mirrors [Engine.WithDateEncoding].
+func (d d1Engine) WithDateEncoding(enc string) (ir.Engine, error) {
+	e, err := parseDateEncoding(enc)
+	if err != nil {
+		return nil, fmt.Errorf("d1: invalid --sqlite-date-encoding %q (%w)", enc, err)
+	}
+	d.dateEncoding = e
+	return d, nil
+}
 
 // Capabilities reuses the file engine's migrate-source capability declaration:
 // D1 is SQLite over HTTP, so the honest shape (no CDC, no extension types, flat
@@ -110,9 +130,9 @@ func (d1Engine) OpenSchemaReader(ctx context.Context, dsn string) (ir.SchemaRead
 
 // OpenRowReader returns a [D1RowReader] bound to the live D1 database named by
 // dsn. The per-source date encoding (`sqlite_date_encoding` DSN param, or the
-// process-global default — ADR-0129) is resolved here and carried for decode,
+// engine --sqlite-date-encoding default folded at OpenRowReader — ADR-0129 / task 2.5) is resolved here and carried for decode,
 // exactly as the file engine's OpenRowReader does.
-func (d1Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, error) {
+func (d d1Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, error) {
 	client, err := openD1Client(dsn)
 	if err != nil {
 		return nil, err
@@ -120,7 +140,9 @@ func (d1Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, er
 	if err := client.ping(ctx); err != nil {
 		return nil, err
 	}
-	return &D1RowReader{client: client, dateEnc: client.dateEnc}, nil
+	// The per-source DSN param wins; absent, the engine's --sqlite-date-encoding
+	// default applies (task 2.5). Both may be inherit → decode resolves to ISO.
+	return &D1RowReader{client: client, dateEnc: foldDateEncoding(client.dateEnc, d.dateEncoding)}, nil
 }
 
 // OpenSchemaWriter is not implemented: D1 is a migrate source only.
@@ -160,7 +182,7 @@ type d1Client struct {
 	token        string
 
 	// dateEnc is the per-source temporal encoding resolved from the DSN
-	// (ADR-0129); dateEncodingInherit defers to the process-global default.
+	// (ADR-0129); dateEncodingInherit is folded to the engine default at OpenRowReader (task 2.5), else ISO.
 	dateEnc dateEncoding
 }
 

@@ -26,7 +26,7 @@ func TestNativeCopyTableParallelismFromDSN(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parseDSN: %v", err)
 		}
-		n, err := nativeCopyTableParallelismFromDSN(cfg)
+		n, err := nativeCopyTableParallelismFromDSN(cfg, 0)
 		if err != nil {
 			t.Fatalf("parse: %v", err)
 		}
@@ -42,7 +42,7 @@ func TestNativeCopyTableParallelismFromDSN(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parseDSN: %v", err)
 		}
-		n, err := nativeCopyTableParallelismFromDSN(cfg)
+		n, err := nativeCopyTableParallelismFromDSN(cfg, 0)
 		if err != nil {
 			t.Fatalf("parse: %v", err)
 		}
@@ -63,7 +63,7 @@ func TestNativeCopyTableParallelismFromDSN(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parseDSN: %v", err)
 		}
-		n, err := nativeCopyTableParallelismFromDSN(cfg)
+		n, err := nativeCopyTableParallelismFromDSN(cfg, 0)
 		if err != nil {
 			t.Fatalf("parse: %v", err)
 		}
@@ -76,7 +76,7 @@ func TestNativeCopyTableParallelismFromDSN(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parseDSN: %v", err)
 		}
-		if _, err := nativeCopyTableParallelismFromDSN(cfg); err == nil {
+		if _, err := nativeCopyTableParallelismFromDSN(cfg, 0); err == nil {
 			t.Fatal("malformed copy_table_parallelism parsed without error; want a loud parse error")
 		}
 	})

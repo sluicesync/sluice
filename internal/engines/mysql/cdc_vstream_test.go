@@ -1844,8 +1844,7 @@ func TestDecodeVStreamRow_ZeroDatePolicy(t *testing.T) {
 	}
 
 	t.Run("error refuses loudly", func(t *testing.T) {
-		withZeroDatePolicy(t, zeroDateRefuse)
-		_, _, err := decodeVStreamRow(rowZero(), fields, "events", newBoolRangeWarner(), zeroDateInherit)
+		_, _, err := decodeVStreamRow(rowZero(), fields, "events", newBoolRangeWarner(), zeroDateRefuse)
 		if err == nil {
 			t.Fatal("err = nil; want a zero-date refusal")
 		}
@@ -1855,8 +1854,7 @@ func TestDecodeVStreamRow_ZeroDatePolicy(t *testing.T) {
 	})
 
 	t.Run("null carries nil", func(t *testing.T) {
-		withZeroDatePolicy(t, zeroDateAsNull)
-		out, _, err := decodeVStreamRow(rowZero(), fields, "events", newBoolRangeWarner(), zeroDateInherit)
+		out, _, err := decodeVStreamRow(rowZero(), fields, "events", newBoolRangeWarner(), zeroDateAsNull)
 		if err != nil {
 			t.Fatalf("err = %v; want nil under null policy", err)
 		}
@@ -1866,8 +1864,7 @@ func TestDecodeVStreamRow_ZeroDatePolicy(t *testing.T) {
 	})
 
 	t.Run("epoch substitutes floor", func(t *testing.T) {
-		withZeroDatePolicy(t, zeroDateAsEpoch)
-		out, _, err := decodeVStreamRow(rowZero(), fields, "events", newBoolRangeWarner(), zeroDateInherit)
+		out, _, err := decodeVStreamRow(rowZero(), fields, "events", newBoolRangeWarner(), zeroDateAsEpoch)
 		if err != nil {
 			t.Fatalf("err = %v; want nil under epoch policy", err)
 		}
@@ -1881,12 +1878,11 @@ func TestDecodeVStreamRow_ZeroDatePolicy(t *testing.T) {
 	})
 
 	t.Run("null on NOT NULL field refuses", func(t *testing.T) {
-		withZeroDatePolicy(t, zeroDateAsNull)
 		nnFields := []*query.Field{
 			{Name: "d", Type: query.Type_DATE, ColumnType: "date", Flags: mysqlNotNullFlag},
 		}
 		nnRow := &query.Row{Lengths: []int64{10}, Values: []byte("0000-00-00")}
-		_, _, err := decodeVStreamRow(nnRow, nnFields, "events", newBoolRangeWarner(), zeroDateInherit)
+		_, _, err := decodeVStreamRow(nnRow, nnFields, "events", newBoolRangeWarner(), zeroDateAsNull)
 		if err == nil {
 			t.Fatal("err = nil; want a NOT NULL refusal under --zero-date=null")
 		}

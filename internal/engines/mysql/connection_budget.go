@@ -285,7 +285,7 @@ func (e Engine) ProbeTargetConnectionBudget(ctx context.Context, dsn string, req
 	if err != nil {
 		return ir.ConnectionBudget{}, err
 	}
-	db, err := openDB(ctx, cfg)
+	db, err := openDB(ctx, cfg, e.opts.sqlMode)
 	if err != nil {
 		return ir.ConnectionBudget{}, err
 	}

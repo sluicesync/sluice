@@ -309,7 +309,7 @@ func (la *laneApplierAdapter) ApplyBarrierChange(ctx context.Context, c ir.Chang
 // (exactly-once for keyed tables; the keyless at-least-once guarantee is
 // unchanged because keyless changes take the single-row barrier path).
 func (a *ChangeApplier) applyBatchConcurrent(ctx context.Context, streamID string, changes <-chan ir.Change, maxBatchSize, lanes int) error {
-	laneDB, err := openDB(ctx, a.pipelineCfg)
+	laneDB, err := openDB(ctx, a.pipelineCfg, a.sqlMode)
 	if err != nil {
 		return classifyApplierError(fmt.Errorf("mysql: applier: open concurrent lane pool: %w", err))
 	}

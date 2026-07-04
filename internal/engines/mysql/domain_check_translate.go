@@ -104,6 +104,13 @@ var rangeHalfPattern = regexp.MustCompile(`(?s)^\(?\s*VALUE\s*(?P<op>>=|<=|>|<|=
 // translator without a comprehensive semantic-equivalence audit
 // would silently re-introduce the original Bug 113 silent-loss class.
 func translateDomainCheckToMySQL(col string, check ir.DomainCheck) (clause string, ok bool) {
+	return stdEmitter.translateDomainCheckToMySQL(col, check)
+}
+
+// translateDomainCheckToMySQL is the emitter method: the regex arm renders the
+// pattern as a SQL string literal ([mysqlEmitter.quoteSQLString]), so the
+// backslash-escaping follows this writer's resolved sql_mode (task 2.5).
+func (m mysqlEmitter) translateDomainCheckToMySQL(col string, check ir.DomainCheck) (clause string, ok bool) {
 	body := strings.TrimSpace(check.Body)
 	if body == "" {
 		return "", false
@@ -123,7 +130,7 @@ func translateDomainCheckToMySQL(col string, check ir.DomainCheck) (clause strin
 		return "", false
 	}
 
-	if c, ok := translateRegexCheckBody(col, body); ok {
+	if c, ok := m.translateRegexCheckBody(col, body); ok {
 		return c, true
 	}
 	if c, ok := translateRangeCheckBody(col, body); ok {
@@ -151,12 +158,12 @@ func translateDomainCheckToMySQL(col string, check ir.DomainCheck) (clause strin
 // backslash + any char). The mode-awareness also fixes v0.97.1's
 // residual: under NO_BACKSLASH_ESCAPES the old unconditional doubling
 // was itself wrong.
-func translateRegexCheckBody(col, body string) (string, bool) {
-	m := regexCheckBodyPattern.FindStringSubmatch(body)
-	if m == nil {
+func (m mysqlEmitter) translateRegexCheckBody(col, body string) (string, bool) {
+	sm := regexCheckBodyPattern.FindStringSubmatch(body)
+	if sm == nil {
 		return "", false
 	}
-	return fmt.Sprintf("CHECK (REGEXP_LIKE(%s, %s))", quoteIdent(col), quoteSQLString(m[1])), true
+	return fmt.Sprintf("CHECK (REGEXP_LIKE(%s, %s))", quoteIdent(col), m.quoteSQLString(sm[1])), true
 }
 
 // translateRangeCheckBody handles `VALUE >= X AND VALUE <= Y` and

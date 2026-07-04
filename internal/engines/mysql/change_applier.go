@@ -121,6 +121,12 @@ type ChangeApplier struct {
 	// (falls back to serial). Set by OpenChangeApplier.
 	pipelineCfg *mysql.Config
 
+	// sqlMode is the engine's resolved --mysql-sql-mode override (task 2.5),
+	// carried so the lazily-opened ADR-0104 concurrent lane pool injects the
+	// SAME session sql_mode as the serial pool. nil (the direct-API / unit
+	// construction default) resolves to the strict-by-default mode in openDB.
+	sqlMode *string
+
 	// applyConcurrency is the ADR-0104 (item 23(c)) key-hash apply LANE
 	// count W: the number of in-order apply lanes the merged change stream
 	// is fanned across by primary-key hash (same key → same lane → in-order,

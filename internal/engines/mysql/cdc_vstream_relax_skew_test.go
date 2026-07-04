@@ -43,11 +43,11 @@ func TestBuildVStreamRequest_MinimizeSkewRelax(t *testing.T) {
 }
 
 // TestVStreamPreserveSkewFromDSN pins the resolution precedence for the OPT-OUT
-// (ADR-0120, default flipped): the CLI override (when set) wins; otherwise the
-// source DSN's vstream_preserve_skew=true; default false = the new relaxed
-// default. The override is a package global, so reset it around the cases.
+// (ADR-0120, default flipped; task 2.5 per-instance form): the CLI override
+// (when set) wins; otherwise the source DSN's vstream_preserve_skew=true; default
+// false = the new relaxed default. The override is now the per-instance
+// engineOptions.preserveSkew passed to the resolver as an explicit argument.
 func TestVStreamPreserveSkewFromDSN(t *testing.T) {
-	defer vstreamPreserveSkewOverride.Store(false) // restore for other tests
 	mk := func(param string) *gomysql.Config {
 		cfg := gomysql.NewConfig()
 		if param != "" {
@@ -56,36 +56,43 @@ func TestVStreamPreserveSkewFromDSN(t *testing.T) {
 		return cfg
 	}
 
-	vstreamPreserveSkewOverride.Store(false)
 	// THE DEFAULT-FLIP PIN: nothing set ⇒ NOT preserving ⇒ relaxed default. So a
 	// reader built from a bare config relaxes skew (MinimizeSkew off).
-	if vstreamPreserveSkewFromDSN(mk("")) {
+	if vstreamPreserveSkewFromDSN(mk(""), false) {
 		t.Error("no DSN param + no override should be false (the new relaxed default)")
 	}
-	if relax := !vstreamPreserveSkewFromDSN(mk("")); !relax {
+	if relax := !vstreamPreserveSkewFromDSN(mk(""), false); !relax {
 		t.Error("default reader.relaxSkew must be true (MinimizeSkew off by default)")
 	}
-	if !vstreamPreserveSkewFromDSN(mk("true")) {
+	if !vstreamPreserveSkewFromDSN(mk("true"), false) {
 		t.Error("vstream_preserve_skew=true should resolve true (preserve = MinimizeSkew on)")
 	}
-	if vstreamPreserveSkewFromDSN(mk("false")) {
+	if vstreamPreserveSkewFromDSN(mk("false"), false) {
 		t.Error("vstream_preserve_skew=false should resolve false (stay relaxed)")
 	}
 
 	// Override wins over an absent / false DSN param.
-	SetVStreamPreserveSkewOverride(true)
-	if !vstreamPreserveSkewFromDSN(mk("")) {
+	if !vstreamPreserveSkewFromDSN(mk(""), true) {
 		t.Error("override true should win over an absent DSN param")
 	}
-	if !vstreamPreserveSkewFromDSN(mk("false")) {
+	if !vstreamPreserveSkewFromDSN(mk("false"), true) {
 		t.Error("override true should win over vstream_preserve_skew=false")
 	}
+}
 
-	// SetVStreamPreserveSkewOverride(false) is a no-op (write-once-true), so a
-	// non-CLI caller can never invert a prior explicit preserve — the zero-value
-	// safety contract (the safe/common behaviour is the relaxed zero value).
-	SetVStreamPreserveSkewOverride(false)
-	if !vstreamPreserveSkewOverride.Load() {
-		t.Error("SetVStreamPreserveSkewOverride(false) must not clear a prior true (write-once-true)")
+// TestWithVStreamPreserveSkew_WriteOnceTrue pins the zero-value-safety contract
+// (task 2.5): the builder records only a true value, so a non-CLI caller passing
+// false can never invert a prior explicit preserve — and a bare engine keeps the
+// relaxed (false) default.
+func TestWithVStreamPreserveSkew_WriteOnceTrue(t *testing.T) {
+	if (Engine{}).opts.preserveSkew {
+		t.Error("bare Engine{} must default to the relaxed (false) preserve-skew")
+	}
+	e := Engine{}.WithVStreamPreserveSkew(true)
+	if !e.opts.preserveSkew {
+		t.Error("WithVStreamPreserveSkew(true) must record preserve")
+	}
+	if e2 := e.WithVStreamPreserveSkew(false); !e2.opts.preserveSkew {
+		t.Error("WithVStreamPreserveSkew(false) must not clear a prior true (write-once-true)")
 	}
 }

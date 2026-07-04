@@ -48,7 +48,7 @@ func TestConnectAppliesStrictSQLModeOnSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseDSN: %v", err)
 	}
-	db, err := openDB(context.Background(), cfg)
+	db, err := openDB(context.Background(), cfg, nil)
 	if err != nil {
 		t.Fatalf("openDB: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestLoadDataWarningCountRefusesSilentClamp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseDSN: %v", err)
 	}
-	db, err := openDB(context.Background(), cfg)
+	db, err := openDB(context.Background(), cfg, nil)
 	if err != nil {
 		t.Fatalf("openDB: %v", err)
 	}
@@ -160,20 +160,20 @@ func TestLoadDataWarning_RelaxedModeWarnsNotRefuses(t *testing.T) {
 		dsn = sharedDSN(host, port, user, password, "mysql")
 	}
 
-	orig := sessionSQLMode
-	defer func() { sessionSQLMode = orig }()
-	SetSessionSQLMode("")
+	// The operator's --mysql-sql-mode='' escape hatch is now a per-instance
+	// override (task 2.5): a non-nil pointer to "" means "inject nothing".
+	emptyMode := ""
 
 	cfg, err := parseDSN(dsn)
 	if err != nil {
 		t.Fatalf("parseDSN: %v", err)
 	}
-	if _, ok := cfg.Params["sql_mode"]; ok {
-		t.Fatalf("sessionSQLMode='' should suppress cfg.Params[sql_mode]; got %q", cfg.Params["sql_mode"])
-	}
-	db, err := openDB(context.Background(), cfg)
+	db, err := openDB(context.Background(), cfg, &emptyMode)
 	if err != nil {
 		t.Fatalf("openDB: %v", err)
+	}
+	if _, ok := cfg.Params["sql_mode"]; ok {
+		t.Fatalf("--mysql-sql-mode='' should suppress the sql_mode injection; got %q", cfg.Params["sql_mode"])
 	}
 	defer db.Close()
 
@@ -223,7 +223,9 @@ func TestLoadDataWarning_RelaxedModeWarnsNotRefuses(t *testing.T) {
 	}
 
 	buf := captureSlog(t)
-	w := &RowWriter{}
+	// The writer carries the operator's --mysql-sql-mode='' escape hatch, so
+	// reportBulkWriteWarnings WARNs (not refuses) on a relaxed-mode coercion.
+	w := &RowWriter{sqlMode: &emptyMode}
 	if err := w.reportBulkWriteWarnings(ctx, conn, "sluice_loaddata_pin_legacy"); err != nil {
 		t.Fatalf("relaxed sql_mode must WARN, not refuse; got error: %v", err)
 	}
@@ -263,7 +265,7 @@ func TestConnectAppliesUtf8mb4OnResults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseDSN: %v", err)
 	}
-	db, err := openDB(context.Background(), cfg)
+	db, err := openDB(context.Background(), cfg, nil)
 	if err != nil {
 		t.Fatalf("openDB: %v", err)
 	}
@@ -300,7 +302,7 @@ func TestDirectInsertHonoursStrictMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseDSN: %v", err)
 	}
-	db, err := openDB(context.Background(), cfg)
+	db, err := openDB(context.Background(), cfg, nil)
 	if err != nil {
 		t.Fatalf("openDB: %v", err)
 	}
@@ -346,7 +348,7 @@ func TestWriteBatched_RelaxedModeWarnsOnClamp(t *testing.T) {
 	// Relax the server's GLOBAL sql_mode so freshly-pooled connections
 	// (the ones writeBatched pins) coerce instead of erroring. Restore on
 	// cleanup so other tests on the shared container stay strict.
-	admin, err := openDB(ctx, mustParseDSN(t, dsn))
+	admin, err := openDB(ctx, mustParseDSN(t, dsn), nil)
 	if err != nil {
 		t.Fatalf("admin openDB: %v", err)
 	}
@@ -360,11 +362,11 @@ func TestWriteBatched_RelaxedModeWarnsOnClamp(t *testing.T) {
 	}
 	defer func() { _, _ = admin.ExecContext(ctx, "SET GLOBAL sql_mode = ?", origGlobal) }()
 
-	orig := sessionSQLMode
-	defer func() { sessionSQLMode = orig }()
-	SetSessionSQLMode("") // don't re-force strict on sluice's pooled conns
+	// Escape hatch (task 2.5 per-instance form): don't re-force strict on
+	// sluice's pooled conns — a non-nil pointer to "" injects nothing.
+	emptyMode := ""
 
-	db, err := openDB(ctx, mustParseDSN(t, dsn))
+	db, err := openDB(ctx, mustParseDSN(t, dsn), &emptyMode)
 	if err != nil {
 		t.Fatalf("openDB: %v", err)
 	}
@@ -383,7 +385,7 @@ func TestWriteBatched_RelaxedModeWarnsOnClamp(t *testing.T) {
 	close(rowCh)
 
 	buf := captureSlog(t)
-	w := &RowWriter{db: db}
+	w := &RowWriter{db: db, sqlMode: &emptyMode}
 	tbl := &ir.Table{Name: "sluice_vectorb_batched", Columns: []*ir.Column{
 		{Name: "id", Type: ir.Integer{Width: 32}},
 		{Name: "small", Type: ir.Integer{Width: 8}},
@@ -423,7 +425,7 @@ func TestWriteBatchedIdempotent_RelaxedModeWarnsOnClamp(t *testing.T) {
 	dsn := sharedDSN(host, port, user, password, "mysql")
 	ctx := context.Background()
 
-	admin, err := openDB(ctx, mustParseDSN(t, dsn))
+	admin, err := openDB(ctx, mustParseDSN(t, dsn), nil)
 	if err != nil {
 		t.Fatalf("admin openDB: %v", err)
 	}
@@ -437,11 +439,10 @@ func TestWriteBatchedIdempotent_RelaxedModeWarnsOnClamp(t *testing.T) {
 	}
 	defer func() { _, _ = admin.ExecContext(ctx, "SET GLOBAL sql_mode = ?", origGlobal) }()
 
-	orig := sessionSQLMode
-	defer func() { sessionSQLMode = orig }()
-	SetSessionSQLMode("")
+	// Escape hatch (task 2.5 per-instance form): pooled conns inject nothing.
+	emptyMode := ""
 
-	db, err := openDB(ctx, mustParseDSN(t, dsn))
+	db, err := openDB(ctx, mustParseDSN(t, dsn), &emptyMode)
 	if err != nil {
 		t.Fatalf("openDB: %v", err)
 	}
@@ -460,7 +461,7 @@ func TestWriteBatchedIdempotent_RelaxedModeWarnsOnClamp(t *testing.T) {
 	close(rowCh)
 
 	buf := captureSlog(t)
-	w := &RowWriter{db: db}
+	w := &RowWriter{db: db, sqlMode: &emptyMode}
 	tbl := &ir.Table{
 		Name: "sluice_vectorb_idem",
 		Columns: []*ir.Column{

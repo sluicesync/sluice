@@ -14,6 +14,20 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline"
 )
 
+// testFleetGlobals returns a *Globals carrying the kong-default value-fidelity
+// flags (task 2.5), so fleet-build tests apply applyEngineOptions the same way a
+// real `sync run` does. The fleet tests assert on the resolved Streamer's
+// non-option fields (SourceDSN, StreamID, …), not the engine's opts, but a
+// properly-defaulted Globals keeps the strict-by-default sql_mode rather than the
+// escape-hatch a bare &Globals{} would imply.
+func testFleetGlobals() *Globals {
+	return &Globals{
+		MySQLSQLMode:       "STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO",
+		ZeroDate:           "error",
+		SQLiteDateEncoding: "iso",
+	}
+}
+
 // writeFleetYAML writes content to a temp file and returns its path.
 func writeFleetYAML(t *testing.T, content string) string {
 	t.Helper()
@@ -238,7 +252,7 @@ func TestReloadFleet_RefusesBadConfig(t *testing.T) {
 
 	t.Run("malformed yaml", func(t *testing.T) {
 		path := writeFleetYAML(t, "syncs: [this is : not valid yaml")
-		err := reloadFleet(context.Background(), path, sup)
+		err := reloadFleet(context.Background(), path, sup, testFleetGlobals())
 		if err == nil {
 			t.Fatal("reloadFleet on malformed yaml = nil; want a parse error")
 		}
@@ -258,7 +272,7 @@ syncs:
     target-driver: mysql
     target: mysql://u:p@dst:3306/app
 `)
-		err := reloadFleet(context.Background(), path, sup)
+		err := reloadFleet(context.Background(), path, sup, testFleetGlobals())
 		if err == nil {
 			t.Fatal("reloadFleet on slot-colliding config = nil; want a refusal")
 		}
@@ -281,7 +295,7 @@ syncs:
     target-driver: postgres
     target: postgres://u:p@dst:5432/app
 `)
-		err := reloadFleet(context.Background(), path, sup)
+		err := reloadFleet(context.Background(), path, sup, testFleetGlobals())
 		if err == nil || !strings.Contains(err.Error(), "duplicate stream-id") {
 			t.Fatalf("reloadFleet on duplicate stream-id = %v; want a duplicate-stream-id refusal", err)
 		}
@@ -351,7 +365,7 @@ func TestSharedTargetGroups(t *testing.T) {
 // helpers, exercised through buildStreamerFromSpec.
 func TestSyncSpecDefaults(t *testing.T) {
 	spec := pgSpec("a", "slot_a")
-	streamer, err := buildStreamerFromSpec(&spec)
+	streamer, err := buildStreamerFromSpec(&spec, testFleetGlobals())
 	if err != nil {
 		t.Fatalf("buildStreamerFromSpec: %v", err)
 	}

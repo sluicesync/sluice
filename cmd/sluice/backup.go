@@ -435,6 +435,11 @@ func (b *BackupFullCmd) run(g *Globals, env *envelopeRun) error {
 	if err != nil {
 		return fmt.Errorf("--source-driver: %w", err)
 	}
+	// Value-fidelity flags (task 2.5): a backup reads source values, so its reader
+	// honors --zero-date / --sqlite-date-encoding / --mysql-sql-mode.
+	if source, err = applyEngineOptions(source, g); err != nil {
+		return err
+	}
 	env.setEngines(source.Name(), "")
 	codec, err := pipeline.ParseCompression(b.Compression)
 	if err != nil {
@@ -605,10 +610,14 @@ type BackupIncrementalCmd struct {
 }
 
 // Run implements `sluice backup incremental`.
-func (b *BackupIncrementalCmd) Run(_ *Globals) error {
+func (b *BackupIncrementalCmd) Run(g *Globals) error {
 	source, err := resolveEngine(b.SourceDriver)
 	if err != nil {
 		return fmt.Errorf("--source-driver: %w", err)
+	}
+	// Value-fidelity flags (task 2.5): an incremental backup reads source values.
+	if source, err = applyEngineOptions(source, g); err != nil {
+		return err
 	}
 	if b.OutputDir == "" && b.Target == "" {
 		return errors.New("one of --output-dir or --target is required")
@@ -731,13 +740,17 @@ type BackupStreamCmd struct {
 }
 
 // Run implements `sluice backup stream run`.
-func (b *BackupStreamCmd) Run(_ *Globals) error {
+func (b *BackupStreamCmd) Run(g *Globals) error {
 	if b.ExitAfterAge != "" || b.ExitAfterChainLength != "" {
 		return errors.New("--exit-after-age / --exit-after-chain-length were REMOVED in v0.67.0 (ADR-0046): rotation is now always in-process. Use --retain-rotate-at=DUR and/or --retain-rotate-at-chain-length=N instead — the stream caps the open segment and opens a fresh one over the same CDC handle, no operator wrapper needed")
 	}
 	source, err := resolveEngine(b.SourceDriver)
 	if err != nil {
 		return fmt.Errorf("--source-driver: %w", err)
+	}
+	// Value-fidelity flags (task 2.5): a backup stream reads source values.
+	if source, err = applyEngineOptions(source, g); err != nil {
+		return err
 	}
 	codec, err := pipeline.ParseCompression(b.Compression)
 	if err != nil {
@@ -1254,6 +1267,11 @@ func (r *RestoreCmd) run(g *Globals, env *envelopeRun) error {
 	target, err := resolveEngine(r.TargetDriver)
 	if err != nil {
 		return fmt.Errorf("--target-driver: %w", err)
+	}
+	// Value-fidelity flags (task 2.5): restore WRITES values into the target, so
+	// the target connection's --mysql-sql-mode and the sql_mode-emit policy apply.
+	if target, err = applyEngineOptions(target, g); err != nil {
+		return err
 	}
 	env.setEngines("", target.Name())
 

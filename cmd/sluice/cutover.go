@@ -80,7 +80,7 @@ type CutoverCmd struct {
 // On any error the partial report is still rendered to stdout so
 // operators piping the output to a metrics tool see the per-table
 // detail of whatever did succeed before the failure.
-func (c *CutoverCmd) Run(_ *Globals) error {
+func (c *CutoverCmd) Run(g *Globals) error {
 	// ADR-0118 finding 3: one-time deprecation WARN, fired ONLY when the
 	// operator passed the OLD --cutover-sequence-margin spelling (kong has no
 	// per-alias set-tracking, so we read the literal token from os.Args, not
@@ -96,6 +96,13 @@ func (c *CutoverCmd) Run(_ *Globals) error {
 	target, err := resolveEngine(c.TargetDriver)
 	if err != nil {
 		return fmt.Errorf("--target-driver: %w", err)
+	}
+	// Value-fidelity flags (task 2.5): cutover opens source + target connections.
+	if source, err = applyEngineOptions(source, g); err != nil {
+		return err
+	}
+	if target, err = applyEngineOptions(target, g); err != nil {
+		return err
 	}
 
 	if len(c.IncludeTable) > 0 && len(c.ExcludeTable) > 0 {

@@ -93,7 +93,7 @@ func TestRowWriter_Fanout_ExactlyOnceWithReemissions(t *testing.T) {
 			PRIMARY KEY (id)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`)
 
-	db, err := openDB(ctx, mustParseDSN(t, dsn))
+	db, err := openDB(ctx, mustParseDSN(t, dsn), nil)
 	if err != nil {
 		t.Fatalf("openDB: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestRowWriter_Fanout_MidCopyDurableCheckpointDisabled(t *testing.T) {
 			PRIMARY KEY (id)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`)
 
-	db, err := openDB(ctx, mustParseDSN(t, dsn))
+	db, err := openDB(ctx, mustParseDSN(t, dsn), nil)
 	if err != nil {
 		t.Fatalf("openDB: %v", err)
 	}
@@ -298,7 +298,7 @@ func TestRowWriter_Fanout_WorkerErrorFailsLoudly(t *testing.T) {
 			PRIMARY KEY (id)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`)
 
-	db, err := openDB(ctx, mustParseDSN(t, dsn))
+	db, err := openDB(ctx, mustParseDSN(t, dsn), nil)
 	if err != nil {
 		t.Fatalf("openDB: %v", err)
 	}

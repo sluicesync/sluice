@@ -139,7 +139,7 @@ func TestBuildSupervisedFleet_TelemetryAttach(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	supervised, closeTelemetry, err := buildSupervisedFleet(ctx, fleet)
+	supervised, closeTelemetry, err := buildSupervisedFleet(ctx, fleet, testFleetGlobals())
 	if err != nil {
 		t.Fatalf("buildSupervisedFleet: %v", err)
 	}

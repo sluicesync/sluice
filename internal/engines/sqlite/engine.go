@@ -109,6 +109,7 @@ package sqlite
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	// Pure-Go (no-CGO) SQLite driver; registers database/sql driver
 	// name "sqlite" via its init(). Confined to this package.
@@ -124,15 +125,39 @@ import (
 // (Capabilities.CDC = CDCNone). Callers should check for it with [errors.Is].
 var ErrNotImplemented = errors.New("sqlite engine: not implemented (SQLite has no CDC / change-apply)")
 
-// Engine is the SQLite implementation of [ir.Engine]. It holds no
-// connection state; the zero value is fully usable. Each Open* call opens
-// an independent *sql.DB against the file (read-only for the source
-// reader surfaces, writable for the target writer surfaces).
-type Engine struct{}
+// Engine is the SQLite implementation of [ir.Engine]. Each Open* call opens
+// an independent *sql.DB against the file (read-only for the source reader
+// surfaces, writable for the target writer surfaces).
+//
+// dateEncoding carries the operator's --sqlite-date-encoding default (ADR-0129),
+// set via [Engine.WithDateEncoding] BEFORE the CLI opens any reader — the
+// per-instance replacement for the former process-wide SetDefaultDateEncoding
+// global (task 2.5 / finding A-4). The zero value dateEncodingInherit means
+// "unset" and resolves to the ISO default, so a bare Engine{} (registry, tests,
+// non-CLI callers) reads temporal columns as ISO-8601 text exactly as before.
+type Engine struct {
+	dateEncoding dateEncoding
+}
 
 // Name returns the engine's short identifier as used in configuration
 // and on the command line (`--source-driver sqlite`).
 func (Engine) Name() string { return "sqlite" }
+
+// WithDateEncoding returns a copy of the engine carrying the operator's
+// --sqlite-date-encoding default (ADR-0129; task 2.5, replacing
+// SetDefaultDateEncoding). It validates the value (kong already enum-checks it;
+// this re-checks defensively) and refuses loudly on a bad one. The per-source
+// `sqlite_date_encoding` DSN param still wins over this default at OpenRowReader.
+// An empty string keeps the iso default. Returns a configured copy — the
+// registry's engine value stays default-free — mirroring [ir.ConnectionLabeler].
+func (e Engine) WithDateEncoding(enc string) (ir.Engine, error) {
+	d, err := parseDateEncoding(enc)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: invalid --sqlite-date-encoding %q (%w)", enc, err)
+	}
+	e.dateEncoding = d
+	return e, nil
+}
 
 // Capabilities returns the static capability declaration for the SQLite
 // migrate source. Declared honestly: no CDC, no extension types, a flat
@@ -157,14 +182,16 @@ func (Engine) OpenSchemaReader(ctx context.Context, dsn string) (ir.SchemaReader
 // OpenRowReader returns a [RowReader] bound to the SQLite file
 // identified by dsn. The caller is responsible for closing the returned
 // reader. The per-source date encoding (the `sqlite_date_encoding` DSN
-// param, or the process-global default — ADR-0129) is resolved here and
+// param, or the engine --sqlite-date-encoding default folded at OpenRowReader — ADR-0129 / task 2.5) is resolved here and
 // carried on the reader for value decode.
-func (Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, error) {
+func (e Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, error) {
 	db, path, enc, tempPath, err := openReadOnly(ctx, dsn)
 	if err != nil {
 		return nil, err
 	}
-	return &RowReader{db: db, path: path, dateEnc: enc, tempPath: tempPath}, nil
+	// The per-source DSN param wins; absent, the engine's --sqlite-date-encoding
+	// default applies (task 2.5). Both may be inherit → decode resolves to ISO.
+	return &RowReader{db: db, path: path, dateEnc: foldDateEncoding(enc, e.dateEncoding), tempPath: tempPath}, nil
 }
 
 // OpenSchemaWriter returns a [SchemaWriter] bound to the SQLite target

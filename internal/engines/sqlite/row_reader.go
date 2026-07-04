@@ -169,7 +169,7 @@ func (r *RowReader) stream(ctx context.Context, rows *sql.Rows, tableName string
 	}
 
 	// Resolve the per-source temporal encoding once (inherit → the
-	// process-global default); decodeCell receives a concrete encoding.
+	// ISO default at decode; the engine default is folded at OpenRowReader, task 2.5); decodeCell receives a concrete encoding.
 	enc := resolveDateEncoding(r.dateEnc)
 
 	ordinal := int64(0)

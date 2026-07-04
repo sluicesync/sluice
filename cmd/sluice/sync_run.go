@@ -459,7 +459,7 @@ func (c *SyncRunCmd) Run(g *Globals) error {
 	warnSharedTargetBudget(fleet)
 
 	ctx := kongContext()
-	supervised, closeTelemetry, err := buildSupervisedFleet(ctx, fleet)
+	supervised, closeTelemetry, err := buildSupervisedFleet(ctx, fleet, g)
 	if err != nil {
 		return err
 	}
@@ -492,7 +492,7 @@ func (c *SyncRunCmd) Run(g *Globals) error {
 	// reconcile the live fleet without a process restart. POSIX-only — on
 	// Windows installReloadHandler is a no-op. A bad reload is refused
 	// loudly and the running fleet keeps going untouched.
-	installReloadHandler(ctx, g.Config, sup)
+	installReloadHandler(ctx, g.Config, sup, g)
 
 	return sup.Run(ctx)
 }
@@ -509,7 +509,7 @@ func (c *SyncRunCmd) Run(g *Globals) error {
 // provider polls independently of the Streamer's run loop, so it persists
 // across a sync's supervisor restarts — exactly as the single-sync provider
 // outlives a reactive re-snapshot.
-func buildSupervisedFleet(ctx context.Context, fleet *SyncFleetConfig) ([]pipeline.SupervisedSync, func() error, error) {
+func buildSupervisedFleet(ctx context.Context, fleet *SyncFleetConfig, g *Globals) ([]pipeline.SupervisedSync, func() error, error) {
 	supervised := make([]pipeline.SupervisedSync, 0, len(fleet.Syncs))
 	var providers []*pstelemetry.Provider
 	closeProviders := func() error {
@@ -521,7 +521,7 @@ func buildSupervisedFleet(ctx context.Context, fleet *SyncFleetConfig) ([]pipeli
 	}
 	for i := range fleet.Syncs {
 		spec := &fleet.Syncs[i]
-		streamer, err := buildStreamerFromSpec(spec)
+		streamer, err := buildStreamerFromSpec(spec, g)
 		if err != nil {
 			_ = closeProviders()
 			return nil, nil, fmt.Errorf("sync run: %s: %w", spec.describe(i), err)
@@ -556,7 +556,7 @@ func buildSupervisedFleet(ctx context.Context, fleet *SyncFleetConfig) ([]pipeli
 // error WITHOUT calling Reconcile, so the running fleet keeps going on
 // the old config unchanged. A malformed / colliding reloaded config can
 // never take down or corrupt the live fleet.
-func reloadFleet(ctx context.Context, path string, sup *pipeline.Supervisor) error {
+func reloadFleet(ctx context.Context, path string, sup *pipeline.Supervisor, g *Globals) error {
 	fleet, err := loadFleetConfig(path)
 	if err != nil {
 		return err
@@ -565,7 +565,7 @@ func reloadFleet(ctx context.Context, path string, sup *pipeline.Supervisor) err
 		return err
 	}
 	warnSharedTargetBudget(fleet)
-	supervised, closeTelemetry, err := buildSupervisedFleet(ctx, fleet)
+	supervised, closeTelemetry, err := buildSupervisedFleet(ctx, fleet, g)
 	if err != nil {
 		return err
 	}
@@ -605,7 +605,7 @@ func (s *SyncSpec) fingerprint() string {
 // buildStreamerFromSpec maps a SyncSpec to a *pipeline.Streamer, reusing
 // the exact `sync start` helpers so a fleet sync behaves identically to
 // the same flags on the standalone command.
-func buildStreamerFromSpec(spec *SyncSpec) (*pipeline.Streamer, error) {
+func buildStreamerFromSpec(spec *SyncSpec, g *Globals) (*pipeline.Streamer, error) {
 	source, err := resolveEngine(spec.SourceDriver)
 	if err != nil {
 		return nil, fmt.Errorf("source-driver: %w", err)
@@ -646,6 +646,19 @@ func buildStreamerFromSpec(spec *SyncSpec) (*pipeline.Streamer, error) {
 	// connection-resilience (1): label connections with the stream-id.
 	source = labelEngine(source, spec.StreamID)
 	target = labelEngine(target, spec.StreamID)
+
+	// Apply the fleet-wide value-fidelity flags (--mysql-sql-mode / --zero-date /
+	// --sqlite-date-encoding) onto this sync's engines (task 2.5, replacing the
+	// former process-wide globals main.go set for the whole `sync run`). Each
+	// sync's per-spec DSN param still wins over these defaults — in particular the
+	// per-spec zero-date is folded into the source DSN below, which overrides the
+	// engine default the same way a per-command DSN param does.
+	if source, err = applyEngineOptions(source, g); err != nil {
+		return nil, err
+	}
+	if target, err = applyEngineOptions(target, g); err != nil {
+		return nil, err
+	}
 
 	// Per-sync zero-date policy (ADR-0127): fold the `zero-date` key into the
 	// MySQL source DSN as `?zero_date=` so the source reader picks it up. Only

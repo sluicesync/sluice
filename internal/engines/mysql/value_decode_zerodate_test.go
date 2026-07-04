@@ -13,17 +13,6 @@ import (
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
-// withZeroDatePolicy sets the process-global zero-date policy for the
-// duration of a test and restores it afterward. The policy is a package
-// global (mirroring sessionSQLMode); tests that exercise it must isolate
-// the mutation.
-func withZeroDatePolicy(t *testing.T, mode zeroDateMode) {
-	t.Helper()
-	prev := zeroDatePolicy
-	zeroDatePolicy = mode
-	t.Cleanup(func() { zeroDatePolicy = prev })
-}
-
 // TestDecodeTimeZeroDateFamily pins the Vector A contract: MySQL zero and
 // partial dates surface as a *zeroDateValueError sentinel from the pure
 // decoder (never a silently-normalized time.Time), across the whole
@@ -136,8 +125,12 @@ func TestIsMySQLZeroDate(t *testing.T) {
 	}
 }
 
-func TestSetZeroDateMode(t *testing.T) {
-	withZeroDatePolicy(t, zeroDateRefuse)
+// TestWithZeroDate pins the --zero-date builder (task 2.5, replacing
+// SetZeroDateMode): each accepted value maps to its mode on the engine, and a bad
+// value refuses loudly. The engine default is folded onto readers via
+// resolveReaderZeroDate, so this also pins the per-instance precedence
+// (DSN mode > engine default > refuse).
+func TestWithZeroDate(t *testing.T) {
 	cases := []struct {
 		in   string
 		want zeroDateMode
@@ -148,15 +141,31 @@ func TestSetZeroDateMode(t *testing.T) {
 		{"epoch", zeroDateAsEpoch},
 	}
 	for _, c := range cases {
-		if err := SetZeroDateMode(c.in); err != nil {
-			t.Fatalf("SetZeroDateMode(%q) err = %v", c.in, err)
+		e, err := Engine{}.WithZeroDate(c.in)
+		if err != nil {
+			t.Fatalf("WithZeroDate(%q) err = %v", c.in, err)
 		}
-		if zeroDatePolicy != c.want {
-			t.Errorf("SetZeroDateMode(%q): policy = %v; want %v", c.in, zeroDatePolicy, c.want)
+		if got := e.(Engine).opts.zeroDate; got != c.want {
+			t.Errorf("WithZeroDate(%q): engine zeroDate = %v; want %v", c.in, got, c.want)
 		}
 	}
-	if err := SetZeroDateMode("bogus"); err == nil {
-		t.Error("SetZeroDateMode(\"bogus\") err = nil; want an error")
+	if _, err := (Engine{}).WithZeroDate("bogus"); err == nil {
+		t.Error("WithZeroDate(\"bogus\") err = nil; want an error")
+	}
+
+	// Per-instance precedence: the reader's DSN mode wins over the engine default;
+	// an unset (inherit) DSN mode falls back to the engine default; both unset →
+	// inherit (which applyZeroDatePolicy resolves to refuse).
+	eNull, _ := Engine{}.WithZeroDate("null")
+	en := eNull.(Engine)
+	if got := en.resolveReaderZeroDate(zeroDateAsEpoch); got != zeroDateAsEpoch {
+		t.Errorf("DSN epoch over engine null: got %v; want epoch", got)
+	}
+	if got := en.resolveReaderZeroDate(zeroDateInherit); got != zeroDateAsNull {
+		t.Errorf("unset DSN falls back to engine null: got %v; want null", got)
+	}
+	if got := (Engine{}).resolveReaderZeroDate(zeroDateInherit); got != zeroDateInherit {
+		t.Errorf("both unset stays inherit (→ refuse at decode): got %v; want inherit", got)
 	}
 }
 
@@ -168,8 +177,7 @@ func TestApplyZeroDatePolicy(t *testing.T) {
 	notNull := &ir.Column{Name: "d", Type: ir.Date{}, Nullable: false}
 
 	t.Run("error refuses", func(t *testing.T) {
-		withZeroDatePolicy(t, zeroDateRefuse)
-		_, err := applyZeroDatePolicy(zd, nullable, zeroDateInherit)
+		_, err := applyZeroDatePolicy(zd, nullable, zeroDateRefuse)
 		if err == nil {
 			t.Fatal("err = nil; want a refusal")
 		}
@@ -187,8 +195,7 @@ func TestApplyZeroDatePolicy(t *testing.T) {
 		}
 	})
 	t.Run("null on nullable yields NULL", func(t *testing.T) {
-		withZeroDatePolicy(t, zeroDateAsNull)
-		v, err := applyZeroDatePolicy(zd, nullable, zeroDateInherit)
+		v, err := applyZeroDatePolicy(zd, nullable, zeroDateAsNull)
 		if err != nil {
 			t.Fatalf("err = %v; want nil", err)
 		}
@@ -197,8 +204,7 @@ func TestApplyZeroDatePolicy(t *testing.T) {
 		}
 	})
 	t.Run("null on NOT NULL refuses loudly", func(t *testing.T) {
-		withZeroDatePolicy(t, zeroDateAsNull)
-		_, err := applyZeroDatePolicy(zd, notNull, zeroDateInherit)
+		_, err := applyZeroDatePolicy(zd, notNull, zeroDateAsNull)
 		if err == nil {
 			t.Fatal("err = nil; want a NOT NULL refusal")
 		}
@@ -209,8 +215,7 @@ func TestApplyZeroDatePolicy(t *testing.T) {
 		}
 	})
 	t.Run("epoch substitutes 1970-01-01 00:00:01", func(t *testing.T) {
-		withZeroDatePolicy(t, zeroDateAsEpoch)
-		v, err := applyZeroDatePolicy(zd, notNull, zeroDateInherit)
+		v, err := applyZeroDatePolicy(zd, notNull, zeroDateAsEpoch)
 		if err != nil {
 			t.Fatalf("err = %v; want nil", err)
 		}

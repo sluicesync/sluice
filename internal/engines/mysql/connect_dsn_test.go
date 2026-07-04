@@ -76,16 +76,19 @@ func TestParseDSN_UnixSocketNotRerouted(t *testing.T) {
 	}
 }
 
-// TestParseDSN_InjectsStrictSQLMode pins the v0.92.1 sql_mode plumbing
-// the cycle-time validation called into question. The post-handshake
-// SET path the driver emits depends on every entry in cfg.Params,
-// including this one — if the value isn't here, no SET happens, and
-// Bugs 102/103 silently re-open.
-func TestParseDSN_InjectsStrictSQLMode(t *testing.T) {
+// TestInjectStrictSQLMode pins the v0.92.1 sql_mode plumbing the cycle-time
+// validation called into question. The post-handshake SET path the driver emits
+// depends on every entry in cfg.Params, including this one — if the value isn't
+// here, no SET happens, and Bugs 102/103 silently re-open. Since task 2.5 the
+// injection happens in openDB via injectSessionSQLMode (the per-instance sql_mode
+// chokepoint), not parseDSN; this pins the strict-default injection there while
+// keeping the utf8mb4 collation assertion on the parse output.
+func TestInjectStrictSQLMode(t *testing.T) {
 	cfg, err := parseDSN("user:pw@tcp(host:3306)/mydb")
 	if err != nil {
 		t.Fatalf("parseDSN: %v", err)
 	}
+	injectSessionSQLMode(cfg, nil) // nil override → the strict default
 	val, ok := cfg.Params["sql_mode"]
 	if !ok {
 		t.Fatal("cfg.Params[\"sql_mode\"] absent — driver won't issue SET sql_mode at handshake")
@@ -101,14 +104,18 @@ func TestParseDSN_InjectsStrictSQLMode(t *testing.T) {
 	}
 }
 
-// TestParseDSN_DSNSqlModeWinsOverInjected confirms an operator-supplied
-// sql_mode in the DSN takes precedence over sluice's default. The two-
-// tier override policy documented in connect.go depends on this.
-func TestParseDSN_DSNSqlModeWinsOverInjected(t *testing.T) {
+// TestInjectSessionSQLMode_DSNWinsOverInjected confirms an operator-supplied
+// sql_mode in the DSN takes precedence over sluice's default. The two-tier
+// override policy documented in connect.go / injectSessionSQLMode depends on
+// this. sql_mode is injected at openDB (task 2.5), not parseDSN, so it is pinned
+// via [injectSessionSQLMode] directly.
+func TestInjectSessionSQLMode_DSNWinsOverInjected(t *testing.T) {
 	cfg, err := parseDSN("user:pw@tcp(host:3306)/mydb?sql_mode=%27ANSI_QUOTES%27")
 	if err != nil {
 		t.Fatalf("parseDSN: %v", err)
 	}
+	// nil sqlMode = the strict default; the DSN value must still win.
+	injectSessionSQLMode(cfg, nil)
 	val := cfg.Params["sql_mode"]
 	if !strings.Contains(val, "ANSI_QUOTES") {
 		t.Errorf("DSN-supplied sql_mode should win; got %q", val)
@@ -118,32 +125,45 @@ func TestParseDSN_DSNSqlModeWinsOverInjected(t *testing.T) {
 	}
 }
 
-// TestParseDSN_SetSessionSQLModeEmptyDisablesInjection covers the
-// legacy-data escape hatch (--mysql-sql-mode=”). Empty string means
-// "don't inject anything — let the server's default apply".
-func TestParseDSN_SetSessionSQLModeEmptyDisablesInjection(t *testing.T) {
-	orig := sessionSQLMode
-	defer func() { sessionSQLMode = orig }()
-	SetSessionSQLMode("")
+// TestInjectSessionSQLMode_EmptyDisablesInjection covers the legacy-data escape
+// hatch (--mysql-sql-mode=”). An explicit empty override (a non-nil pointer to
+// "") means "don't inject anything — let the server's default apply".
+func TestInjectSessionSQLMode_EmptyDisablesInjection(t *testing.T) {
 	cfg, err := parseDSN("user:pw@tcp(host:3306)/mydb")
 	if err != nil {
 		t.Fatalf("parseDSN: %v", err)
 	}
+	empty := ""
+	injectSessionSQLMode(cfg, &empty)
 	if _, ok := cfg.Params["sql_mode"]; ok {
 		t.Errorf("--mysql-sql-mode='' should suppress sql_mode injection; got cfg.Params[\"sql_mode\"]=%q", cfg.Params["sql_mode"])
 	}
 }
 
-// TestParseDSN_WarnsOnNBEDisagreement pins the SEC-1 re-review follow-up:
-// parseDSN WARNs once when an operator-supplied DSN `sql_mode` param disagrees
-// with sluice's configured session mode ([sessionSQLMode]) on
-// NO_BACKSLASH_ESCAPES — the one residual fail-open channel where the DDL
-// emitters' backslash-escaping decision (made against sessionSQLMode) diverges
-// from the mode the connection actually runs (the DSN param, which wins on the
-// wire). Both directions of disagreement WARN; the agreeing case is silent;
-// the WARN never blocks (parseDSN still succeeds). The value classifier
-// [sqlModeHasNBE] is exercised directly so the substring match is pinned too.
-func TestParseDSN_WarnsOnNBEDisagreement(t *testing.T) {
+// TestInjectSessionSQLMode_DefaultStrict pins that an override-free engine (nil
+// sqlMode) injects the strict-by-default mode — the Bug 102/103 protection.
+func TestInjectSessionSQLMode_DefaultStrict(t *testing.T) {
+	cfg, err := parseDSN("user:pw@tcp(host:3306)/mydb")
+	if err != nil {
+		t.Fatalf("parseDSN: %v", err)
+	}
+	injectSessionSQLMode(cfg, nil)
+	if v := cfg.Params["sql_mode"]; !strings.Contains(v, "STRICT_TRANS_TABLES") {
+		t.Errorf("nil override should inject the strict default; got %q", v)
+	}
+}
+
+// TestInjectSessionSQLMode_WarnsOnNBEDisagreement pins the SEC-1 re-review
+// follow-up, per-instance edition (task 2.5): injectSessionSQLMode WARNs once
+// when an operator-supplied DSN `sql_mode` param disagrees with the engine's
+// per-instance session mode (sqlMode) on NO_BACKSLASH_ESCAPES — the one
+// residual fail-open channel where the DDL emitters' backslash-escaping
+// decision (made against sqlMode) diverges from the mode the connection
+// actually runs (the DSN param, which wins on the wire). Both directions of
+// disagreement WARN; the agreeing cases are silent; the WARN never blocks. The
+// value classifier [sqlModeHasNBE] is exercised directly so the substring match
+// is pinned too.
+func TestInjectSessionSQLMode_WarnsOnNBEDisagreement(t *testing.T) {
 	// sqlModeHasNBE: quoted / mixed-case / comma-list forms all match, and no
 	// other flag is a false positive.
 	for mode, want := range map[string]bool{
@@ -159,53 +179,51 @@ func TestParseDSN_WarnsOnNBEDisagreement(t *testing.T) {
 		}
 	}
 
-	dsnWith := func(sqlMode string) string {
-		return "user:pw@tcp(host:3306)/mydb?sql_mode=" + url.QueryEscape("'"+sqlMode+"'")
-	}
-	capture := func(t *testing.T, session, dsnMode string) string {
+	strptr := func(s string) *string { return &s }
+	// capture drives injectSessionSQLMode with a DSN carrying sql_mode=dsnMode
+	// and the engine's per-instance session mode, returning the WARN output.
+	capture := func(t *testing.T, session *string, dsnMode string) string {
 		t.Helper()
-		orig := sessionSQLMode
-		defer func() { sessionSQLMode = orig }()
-		SetSessionSQLMode(session)
+		cfg, err := parseDSN("user:pw@tcp(host:3306)/mydb?sql_mode=" + url.QueryEscape("'"+dsnMode+"'"))
+		if err != nil {
+			t.Fatalf("parseDSN(%q): %v", dsnMode, err)
+		}
 		var buf bytes.Buffer
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 		defer slog.SetDefault(prev)
-		if _, err := parseDSN(dsnWith(dsnMode)); err != nil {
-			t.Fatalf("parseDSN(%q session=%q): %v", dsnMode, session, err)
-		}
+		injectSessionSQLMode(cfg, session)
 		return buf.String()
 	}
 
 	// Direction 1: session mode has NO_BACKSLASH_ESCAPES, DSN doesn't → WARN.
-	if out := capture(t, "STRICT_TRANS_TABLES,NO_BACKSLASH_ESCAPES", "STRICT_TRANS_TABLES"); !strings.Contains(out, "NO_BACKSLASH_ESCAPES") || !strings.Contains(out, "disagrees") {
+	if out := capture(t, strptr("STRICT_TRANS_TABLES,NO_BACKSLASH_ESCAPES"), "STRICT_TRANS_TABLES"); !strings.Contains(out, "NO_BACKSLASH_ESCAPES") || !strings.Contains(out, "disagrees") {
 		t.Errorf("session-NBE vs DSN-plain: want a NO_BACKSLASH_ESCAPES disagreement WARN; got %q", out)
 	}
 	// Direction 2: DSN mode has NO_BACKSLASH_ESCAPES, session doesn't → WARN.
-	if out := capture(t, "STRICT_TRANS_TABLES", "STRICT_TRANS_TABLES,NO_BACKSLASH_ESCAPES"); !strings.Contains(out, "NO_BACKSLASH_ESCAPES") || !strings.Contains(out, "disagrees") {
+	if out := capture(t, strptr("STRICT_TRANS_TABLES"), "STRICT_TRANS_TABLES,NO_BACKSLASH_ESCAPES"); !strings.Contains(out, "NO_BACKSLASH_ESCAPES") || !strings.Contains(out, "disagrees") {
 		t.Errorf("DSN-NBE vs session-plain: want a NO_BACKSLASH_ESCAPES disagreement WARN; got %q", out)
 	}
 	// Agreeing case (both plain): no WARN.
-	if out := capture(t, "STRICT_TRANS_TABLES", "STRICT_TRANS_TABLES"); strings.Contains(out, "disagrees") {
+	if out := capture(t, strptr("STRICT_TRANS_TABLES"), "STRICT_TRANS_TABLES"); strings.Contains(out, "disagrees") {
 		t.Errorf("agreeing modes must not WARN; got %q", out)
 	}
 	// Agreeing case (both NBE): no WARN.
-	if out := capture(t, "NO_BACKSLASH_ESCAPES", "NO_BACKSLASH_ESCAPES"); strings.Contains(out, "disagrees") {
+	if out := capture(t, strptr("NO_BACKSLASH_ESCAPES"), "NO_BACKSLASH_ESCAPES"); strings.Contains(out, "disagrees") {
 		t.Errorf("both-NBE must not WARN; got %q", out)
 	}
-	// No DSN sql_mode param at all → sluice injects sessionSQLMode itself, so
+	// No DSN sql_mode param at all → sluice injects the session mode itself, so
 	// there is nothing to disagree with: no WARN.
 	func() {
-		orig := sessionSQLMode
-		defer func() { sessionSQLMode = orig }()
-		SetSessionSQLMode("STRICT_TRANS_TABLES,NO_BACKSLASH_ESCAPES")
+		cfg, err := parseDSN("user:pw@tcp(host:3306)/mydb")
+		if err != nil {
+			t.Fatalf("parseDSN (no DSN sql_mode): %v", err)
+		}
 		var buf bytes.Buffer
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 		defer slog.SetDefault(prev)
-		if _, err := parseDSN("user:pw@tcp(host:3306)/mydb"); err != nil {
-			t.Fatalf("parseDSN (no DSN sql_mode): %v", err)
-		}
+		injectSessionSQLMode(cfg, strptr("STRICT_TRANS_TABLES,NO_BACKSLASH_ESCAPES"))
 		if strings.Contains(buf.String(), "disagrees") {
 			t.Errorf("no DSN sql_mode param must not WARN; got %q", buf.String())
 		}
@@ -241,9 +259,9 @@ func TestStripVStreamParams_RemovesAllVStreamKeys(t *testing.T) {
 	for _, k := range vstreamKeys {
 		cfg.Params[k] = "x"
 	}
-	// A non-vstream param that MUST survive the strip (sql_mode is
-	// injected by parseDSN; time_zone too) — the helper must be a
-	// prefix filter, not a blanket clear.
+	// A non-vstream param that MUST survive the strip (time_zone too) — the
+	// helper must be a prefix filter, not a blanket clear. (sql_mode is injected
+	// by openDB AFTER this strip since task 2.5, so it isn't present here.)
 	cfg.Params["custom_param"] = "keepme"
 
 	stripped := stripVStreamParams(cfg)
@@ -255,9 +273,6 @@ func TestStripVStreamParams_RemovesAllVStreamKeys(t *testing.T) {
 	}
 	if v := stripped.Params["custom_param"]; v != "keepme" {
 		t.Errorf("stripped.Params[custom_param] = %q; non-vstream params must survive the strip", v)
-	}
-	if v := stripped.Params["sql_mode"]; v == "" {
-		t.Error("stripped.Params[sql_mode] empty; the strict-mode injection must survive the strip")
 	}
 
 	// No-mutation guarantee: the helper Clone()s, so the caller's

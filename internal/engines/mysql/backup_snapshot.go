@@ -80,11 +80,13 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts irbacku
 	// Per-sync zero-date policy (ADR-0127): a backup of a legacy MySQL source
 	// honors the same source-DSN `zero_date` override as the migrate/sync read
 	// paths. Resolved here (loud refusal on an invalid value) and threaded into
-	// both the serial and coordinated openers.
+	// both the serial and coordinated openers. The DSN param wins; absent, the
+	// engine's --zero-date default applies.
 	zeroDate, err := readerZeroDateMode(cfg)
 	if err != nil {
 		return nil, err
 	}
+	zeroDate = e.resolveReaderZeroDate(zeroDate)
 
 	// ADR-0088: with a cross-table parallelism request, try the
 	// coordinated open — N reader transactions whose consistent
@@ -109,7 +111,7 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts irbacku
 // tx. It is the floor every coordinated-open failure path falls back
 // to, and the only path when ReaderParallelism <= 1.
 func (e Engine) openBackupSnapshotSerial(ctx context.Context, cfg *gomysql.Config, zeroDate zeroDateMode) (*irbackup.Snapshot, error) {
-	db, err := openDB(ctx, cfg)
+	db, err := openDB(ctx, cfg, e.opts.sqlMode)
 	if err != nil {
 		return nil, err
 	}
@@ -230,7 +232,7 @@ var backupReadersOpenedHook func()
 //     via its open REPEATABLE-READ tx.
 //  5. return Rows: R[0], ExtraReaders: R[1..N-1], CloseFn closing all.
 func (e Engine) openBackupSnapshotCoordinated(ctx context.Context, cfg *gomysql.Config, n int, zeroDate zeroDateMode) *irbackup.Snapshot {
-	db, err := openDB(ctx, cfg)
+	db, err := openDB(ctx, cfg, e.opts.sqlMode)
 	if err != nil {
 		// A pool-open failure is not specific to the coordinated path;
 		// let the serial floor surface the same error loudly.

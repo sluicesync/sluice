@@ -39,6 +39,15 @@ type SchemaWriter struct {
 	db     *sql.DB
 	schema string
 
+	// emitter carries this writer's resolved DDL-emit policy — the sql_mode
+	// backslash-escaping rule for SQL string literals (task 2.5). Built once at
+	// [Engine.OpenSchemaWriter] from the engine's --mysql-sql-mode override, so
+	// every string literal this writer emits is escaped for the SAME sql_mode its
+	// connections run under. The zero value (backslashEscapes=false) is NOT used:
+	// OpenSchemaWriter always sets it via [newMySQLEmitter]; a bare-struct test
+	// writer that needs the strict default sets emitter: stdEmitter explicitly.
+	emitter mysqlEmitter
+
 	// flavor records which MySQL-compatible service this writer targets,
 	// threaded from the engine at OpenSchemaWriter. The overlapped
 	// index-build path (ADR-0080) gates on it: PlanetScale/Vitess targets
@@ -125,7 +134,7 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 	w.maybeWarnRLSDrop(ctx, s)
 	w.maybeWarnDomainCheckDrop(ctx, s)
 	for _, table := range orderedTables(s) {
-		stmt, err := emitTableDefWithDomainChecks(table, w.inlineCheckSupported)
+		stmt, err := w.emitter.emitTableDefWithDomainChecks(table, w.inlineCheckSupported)
 		if err != nil {
 			return err
 		}
@@ -253,7 +262,7 @@ func (w *SchemaWriter) maybeWarnDomainCheckDrop(ctx context.Context, s *ir.Schem
 			}
 			baseSpelling := dom.Name
 			if dom.BaseType != nil {
-				if spelled, err := emitColumnType(dom.BaseType); err == nil {
+				if spelled, err := w.emitter.emitColumnType(dom.BaseType); err == nil {
 					baseSpelling = spelled
 				}
 			}
@@ -606,7 +615,7 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 
 	// Phase 1: tables.
 	for _, table := range orderedTables(s) {
-		stmt, err := emitTableDefWithDomainChecks(table, w.inlineCheckSupported)
+		stmt, err := w.emitter.emitTableDefWithDomainChecks(table, w.inlineCheckSupported)
 		if err != nil {
 			return nil, err
 		}
@@ -697,7 +706,7 @@ func trimTrailingSemicolon(s string) string {
 // in the DEFAULT-position loud-drop warn (nil-tolerant); MySQL's
 // emitter needs no other table context for any IR type.
 func (w *SchemaWriter) EmitColumnDef(_ context.Context, table *ir.Table, col *ir.Column) (string, error) {
-	return emitColumnDef(tableNameOrEmpty(table), col)
+	return w.emitter.emitColumnDef(tableNameOrEmpty(table), col)
 }
 
 // AlterAddColumn implements [ir.SchemaDeltaApplier] for MySQL. Used
@@ -732,7 +741,7 @@ func (w *SchemaWriter) AlterAddColumn(ctx context.Context, table *ir.Table, cols
 		// See CHANGELOG v0.73.1.
 		emitCol := *col
 		emitCol.Nullable = true
-		def, err := emitColumnDef(table.Name, &emitCol)
+		def, err := w.emitter.emitColumnDef(table.Name, &emitCol)
 		if err != nil {
 			return fmt.Errorf("alter add column: emit %q: %w", col.Name, err)
 		}
@@ -914,7 +923,7 @@ func (w *SchemaWriter) AlterColumnType(ctx context.Context, table *ir.Table, wan
 	if want == nil {
 		return errors.New("mysql: alter column type: want column is nil")
 	}
-	def, err := emitColumnDef(table.Name, want)
+	def, err := w.emitter.emitColumnDef(table.Name, want)
 	if err != nil {
 		return fmt.Errorf("alter column type: emit %q: %w", want.Name, err)
 	}
@@ -1002,7 +1011,7 @@ func (w *SchemaWriter) AlterColumnNullability(ctx context.Context, table *ir.Tab
 	if wantYes == currentYes {
 		return nil
 	}
-	def, err := emitColumnDef(table.Name, want)
+	def, err := w.emitter.emitColumnDef(table.Name, want)
 	if err != nil {
 		return fmt.Errorf("alter column nullability: emit %q: %w", want.Name, err)
 	}

@@ -102,12 +102,14 @@ const defaultNativeCopyTableParallelism = 4
 // fallback to serial.
 //
 // ADR-0118 finding 4 precedence: an explicit --copy-table-parallelism CLI flag
-// (recorded via SetNativeCopyTableParallelismOverride, value > 0) WINS over the
-// DSN param. The DSN form is still read + validated loudly when no CLI override
-// is set, so existing DSN-only setups are byte-identical.
-func nativeCopyTableParallelismFromDSN(cfg *gomysql.Config) (int, error) {
-	if cli := int(nativeCopyTableParallelismOverride.Load()); cli > 0 {
-		return cli, nil
+// (the per-instance cliOverride, value > 0 — formerly the
+// SetNativeCopyTableParallelismOverride global, now
+// engineOptions.copyTableParallelism, task 2.5) WINS over the DSN param. The DSN
+// form is still read + validated loudly when no CLI override is set, so existing
+// DSN-only setups are byte-identical.
+func nativeCopyTableParallelismFromDSN(cfg *gomysql.Config, cliOverride int) (int, error) {
+	if cliOverride > 0 {
+		return cliOverride, nil
 	}
 	v := cfg.Params["copy_table_parallelism"]
 	if v == "" {
@@ -154,18 +156,20 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 	}
 	// Per-sync zero-date policy (ADR-0127): the concurrent cold-copy honors the
 	// same source-DSN `zero_date` override as the serial path and the CDC
-	// reader. Resolved before openDB so an invalid value refuses loudly.
+	// reader. Resolved before openDB so an invalid value refuses loudly. The DSN
+	// param wins; absent, the engine's --zero-date default applies.
 	zeroDate, err := readerZeroDateMode(cfg)
 	if err != nil {
 		return nil, err
 	}
+	zeroDate = e.resolveReaderZeroDate(zeroDate)
 	// ADR-0109 §A: raise net_write_timeout / net_read_timeout on the
 	// concurrent snapshot pool too — every one of the N FTWRL-coordinated
 	// reader connections inherits it at session init, so a target stall
 	// backpressuring any reader doesn't trip the source's default 60s
 	// net_write_timeout. Bounded (10 min), operator-override-respecting.
 	applySourceReadSessionTimeouts(cfg)
-	db, err := openDB(ctx, cfg)
+	db, err := openDB(ctx, cfg, e.opts.sqlMode)
 	if err != nil {
 		return nil, err
 	}
@@ -258,7 +262,7 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 			return nil, nil, "", 0, perr
 		}
 		applySourceReadSessionTimeouts(rcfg)
-		rdb, derr := openDB(rctx, rcfg)
+		rdb, derr := openDB(rctx, rcfg, e.opts.sqlMode)
 		if derr != nil {
 			return nil, nil, "", 0, derr
 		}

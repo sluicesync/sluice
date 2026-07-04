@@ -352,6 +352,17 @@ func (m *MigrateCmd) run(g *Globals, env *envelopeRun) error {
 		m.Source = staged
 	}
 
+	// Apply the operator's value-fidelity flags (--mysql-sql-mode / --zero-date /
+	// --sqlite-date-encoding) onto the resolved engines (task 2.5, replacing the
+	// former process-wide globals). Applied AFTER any D1→SQLite staging re-resolve
+	// so the staged `sqlite` source carries the operator's --sqlite-date-encoding.
+	if source, err = applyEngineOptions(source, g); err != nil {
+		return err
+	}
+	if target, err = applyEngineOptions(target, g); err != nil {
+		return err
+	}
+
 	env.setEngines(source.Name(), target.Name())
 
 	// CLI-side mutual exclusion: catching this here means the
@@ -645,6 +656,47 @@ func labelEngine(e ir.Engine, id string) ir.Engine {
 		return l.WithConnectionLabel(id)
 	}
 	return e
+}
+
+// applyEngineOptions applies the operator's process-level value-fidelity flags
+// (--mysql-sql-mode / --zero-date / --sqlite-date-encoding) to a resolved engine,
+// mirroring [labelEngine]. These were formerly process-wide MUTABLE engine
+// globals set once in main.go (mysql.SetSessionSQLMode / SetZeroDateMode /
+// sqlite.SetDefaultDateEncoding); audit task 2.5 (finding A-4) moves each onto a
+// per-instance engine copy so a fleet `sync run` can carry DISTINCT values per
+// sync instead of one global spanning the whole process. Applied at engine
+// resolution on every command that opens a value-carrying source/target.
+//
+// An engine that does not implement a given option's optional interface (e.g.
+// Postgres has no sql_mode; MySQL no date-encoding) passes through unchanged. The
+// interfaces are declared inline (structural) so this stays out of the neutral
+// ir package — the option methods are engine-specific, unlike ir.ConnectionLabeler
+// which is a cross-engine concept. Every option's zero-value default reproduces
+// today's behaviour, so the DSN-per-source override precedence and the
+// unset-flag common case are byte-identical.
+func applyEngineOptions(e ir.Engine, g *Globals) (ir.Engine, error) {
+	if c, ok := e.(interface {
+		WithSQLMode(string) ir.Engine
+	}); ok {
+		e = c.WithSQLMode(g.MySQLSQLMode)
+	}
+	if c, ok := e.(interface {
+		WithZeroDate(string) (ir.Engine, error)
+	}); ok {
+		var err error
+		if e, err = c.WithZeroDate(g.ZeroDate); err != nil {
+			return nil, err
+		}
+	}
+	if c, ok := e.(interface {
+		WithDateEncoding(string) (ir.Engine, error)
+	}); ok {
+		var err error
+		if e, err = c.WithDateEncoding(g.SQLiteDateEncoding); err != nil {
+			return nil, err
+		}
+	}
+	return e, nil
 }
 
 // SyncCmd groups the continuous-sync subcommands. Continuous sync is
@@ -1420,19 +1472,31 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 	// value — see warnInertParallelismFlags).
 	warnInertParallelismFlags(kongContext(), source)
 
-	// ADR-0118 finding 4: thread the explicit read-axis CLI flags into the
-	// mysql engine at the composition root (the same idiom as
-	// --mysql-sql-mode / --zero-date). A value > 0 wins over the source DSN's
-	// vstream_copy_table_parallelism / copy_table_parallelism param; 0 (the
-	// default) leaves the DSN-then-default behaviour byte-identical.
-	mysql.SetVStreamCopyTableParallelismOverride(s.VStreamCopyTableParallelism)
-	mysql.SetNativeCopyTableParallelismOverride(s.CopyTableParallelism)
+	// Apply the operator's value-fidelity flags (--mysql-sql-mode / --zero-date /
+	// --sqlite-date-encoding) onto the resolved engines (task 2.5, replacing the
+	// former process-wide globals). Precedence is unchanged: the per-source DSN
+	// param still wins over these defaults inside each engine.
+	if source, err = applyEngineOptions(source, g); err != nil {
+		return err
+	}
+	if target, err = applyEngineOptions(target, g); err != nil {
+		return err
+	}
 
-	// ADR-0120 (default flipped): thread the explicit --vstream-preserve-skew CLI
-	// value into the mysql engine at the composition root. true wins over the
-	// source DSN's vstream_preserve_skew param and restores the old MinimizeSkew=
-	// on behaviour; false (the default) leaves the new relaxed MinimizeSkew=off.
-	mysql.SetVStreamPreserveSkewOverride(s.VStreamPreserveSkew)
+	// ADR-0118 finding 4 / ADR-0120: thread the explicit read-axis CLI flags onto
+	// the SOURCE engine (the same per-instance idiom, replacing the former
+	// SetVStreamCopyTableParallelismOverride / SetNativeCopyTableParallelismOverride
+	// / SetVStreamPreserveSkewOverride globals — task 2.5). A parallelism value > 0
+	// wins over the source DSN param; 0 leaves the DSN-then-default byte-identical.
+	// --vstream-preserve-skew true wins over the DSN and restores the old
+	// MinimizeSkew hold; false leaves the new relaxed default. These are
+	// MySQL/VStream-only knobs, so a non-MySQL source passes through unchanged.
+	if me, ok := source.(mysql.Engine); ok {
+		source = me.
+			WithVStreamCopyTableParallelism(s.VStreamCopyTableParallelism).
+			WithCopyTableParallelism(s.CopyTableParallelism).
+			WithVStreamPreserveSkew(s.VStreamPreserveSkew)
+	}
 
 	if len(s.IncludeTable) > 0 && len(s.ExcludeTable) > 0 {
 		return errors.New("--include-table and --exclude-table are mutually exclusive")
