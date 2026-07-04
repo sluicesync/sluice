@@ -1,0 +1,42 @@
+# Performance-technique parity matrix
+
+The living answer to "did this optimization reach every engine and mode it should have?" — created 2026-07-04 after the operator hit repeated cases of an optimization landing in one engine or mode but not its siblings (sync vs migrate, reader vs backup). Ground-truthed at `12feb24a` (v0.99.175); every cell cites code or names the absence.
+
+**Maintenance protocol.** This matrix is hand-maintained and therefore rots — the same failure mode as the CI shard list before `check-shard-coverage.sh`. Two defenses: (1) any chunk that adds or extends a performance technique MUST update its row in the same PR (the CLAUDE.md working agreement), and (2) the `perf-parity-checker` agent re-derives the matrix from code on demand and reports drift — run it after perf chunks land and before releases. A cell that is deliberately absent must say so and cite the rationale (ADR/bug/comment); an uncited ABSENT is presumed accidental and belongs on the gap list below.
+
+Modes: **MIG** migrate bulk-copy · **CS** sync cold-start (per source flavor) · **BK** backup write · **RST** restore (full) · **CR** chain-restore incremental replay · **BRK** broker/from-backup replay · **CDC** steady-state apply.
+
+| # Technique | MIG | CS | BK | RST | CR | BRK | CDC |
+|---|---|---|---|---|---|---|---|
+| 1. Cross-table parallelism | ✅ all engines, `--table-parallelism` 0→4 (`pipeline/chunk.go:96`, pool `migrate_table_pool.go:118`, ADR-0076) | SPLIT: PG-slot ✅ full pool (`streamer_coldstart_parallel.go:180`, gated on `SnapshotImporterOpener`); MySQL-binlog opt-in, default serial (`mysql/cdc_snapshot_concurrent.go:73`); VStream opt-in, default 1 (`cdc_vstream_copy_concurrency.go:30`); trigger flavors ABSENT (single pinned conn) | ✅ 0→4, snapshot-capability-gated else loud serial (`backup_table_pool.go:152,369`, ADR-0084/0088) | ✅ engine-generic (`restore_table_pool.go:115`) | full-leg via Restore; replay single-stream by nature | reset-leg via ChainRestore; knobs NOT plumbed (auto only) | n/a |
+| 2. Within-table chunking | ✅ int-PK divide + sampled keyset for string/uuid/composite, threshold 80k, ≤64 chunks, work-stealing (`chunk.go:87,215,333,492`, ADR-0019/0096/0123) | PG-slot ✅; MySQL-binlog concurrent path ✅; VStream ABSENT read-side (vtgate-internal); trigger flavors ABSENT; D1 deferred (`sqlite/d1_rows.go:54`) | **ABSENT — GAP #1** (one full-scan ReadRows per table, `backup.go:1088`) | ✅ write-side chunk fan-out (ADR-0112) | ABSENT (sequential stream) | ABSENT | n/a |
+| 3. Bulk write mechanism | PG binary COPY + grow-gate + upsert fallback (`pg/row_writer.go:447`); MySQL LOAD DATA else 500-row INSERT (`load_data_writer.go:41`, `row_writer.go:28`); SQLite multi-row under 900-param cap; D1-as-target ABSENT (stage-local instead) | same writers; VStream forced idempotent (Bug 125) | JSONL chunks + fast JSON codec (`backup_chunk_fast.go`) | same WriteRows | ChangeApplier | ChangeApplier | PG pipelined / MySQL coalesced |
+| 4. Raw same-engine byte-pipe (ADR-0078) | ✅ PG→PG only, 6-gate; MySQL ABSENT | PG-slot fast path inherits; others ABSENT | ABSENT (different product) | ABSENT | ABSENT | ABSENT | n/a |
+| 5. Deferred indexes/constraints | ✅ default; PG overlap ADR-0077; MySQL combined-ALTER ADR-0080; PS declines overlap (deliberate); `--upfront-indexes` both engines | ✅ deferred; `--upfront-indexes` deliberately not wired for sync (`streamer_coldstart_parallel.go:304`) | n/a | segment-0 carries indexes | same | same | index DDL not forwarded (item 24, demand-gated) |
+| 6. Buffered pipeline (64) | ✅ every hop EXCEPT redact tee (`redact.go:135`) + shard-stamp tee (`shard_value_wrap.go:63`) — GAP #6 | readers all 64; VStream drain unbuffered (DELIBERATE: 64 MiB byte-cap rowBuffer is the real buffer) | inherited | **UNBUFFERED `restore.go:816` — GAP #2** | **UNBUFFERED `chain_restore.go:539` — GAP #2** | **UNBUFFERED `broker.go:948` — GAP #2** | laneapply queues |
+| 7. Session/conn tuning | PG index-build mem+workers (`--index-build-mem`); MySQL `foreign_key_checks=0` DSN-wide; `unique_checks=0`/`sql_log_bin=0` never evaluated — GAP #11 | same | olap on full-scan reads | no bulk-load GUCs on restore | — | — | PG apply pins `synchronous_commit=on` (F7 durability) + `session_replication_role=replica` when superuser |
+| 8. Read batching / olap | keyset batch 5000 default; olap on VStream-flavor full scans only (Bug 132 keeps it off chunked reads — deliberate) | flavor-specific (VStream 50k/10s/64MiB; D1 1000) | ✅ olap applies; 100k chunks | stored 100k | batch 100 | same + 30s poll | AIMD-sized |
+| 9. Apply lanes (SetApplyConcurrency) | n/a | n/a | n/a | via broker plumb | ✅ 0→4 | ✅ | ✅ streamer; laneapply core |
+| 10. Pipelined apply (ADR-0092/0138) | n/a | n/a | n/a | inherits | PG-target only | PG-target only | PG-target only; MySQL substitutes coalescing (ADR-0139/0140, deliberate); sqlite/D1 no ChangeApplier (deliberate) |
+| 11. Connection budget/clamp | ✅ prober + product ceiling + AIMD shrink (ADR-0116) | budget −1 CDC conn | reader budget −1; no live headroom clamp — GAP #8 | ✅ + live CPU/mem headroom clamp (ADR-0115) | via broker | auto only | PG lanes probed; MySQL fixed-4, `--max-target-connections` inert — GAP #10 |
+| 12. Checkpoint amplification | ✅ O(1) per-table rows (migratestate, ADR-0082) | VStream durable watermark; native-MySQL in-memory only (cross-process resume DEFERRED — GAP #5) | ✅ O(1) on append stores; O(tables) on object stores (named wart) | chunk-granular | frontier | per chunk | laneapply frontier 2000-cadence |
+| 13. Compression | n/a | n/a | zstd SpeedDefault, level not tunable — GAP #9; 32% of backup CPU (roadmap frontier) | decode | same | same | n/a |
+| 14. Other | fast-loader ADR-0043; chunk-open retry ADR-0146; OLAP verify count ADR-0147 | write fan-out ADR-0097: MySQL-target only, PG-target serial — GAP #7 | resume re-streams partial tables (Bug 135, deliberate) | chunk fetch retry ADR-0117 | no chunk prefetch — GAP #4 | chain cache 2 GETs/idle | `--apply-delay` backpressure by design |
+
+## Ranked gap list (accidental asymmetries; see docs/research/perf-gap-analysis-2026-07.md for full detail)
+
+1. **Backup within-table read parallelism ABSENT** (`backup.go:1088`) — one huge table backs up single-stream while migrate chunks it and restore fans the writes. HIGH leverage, M–L effort.
+2. **Restore/chain-restore/broker channels unbuffered** (`restore.go:816`, `chain_restore.go:539`, `broker.go:948`) vs migrate's 64 everywhere. MEDIUM, S effort.
+3. **Sync cold-start parallelism defaults PG-only** — MySQL-binlog/VStream default serial where migrate defaults 4; trigger flavors have none. A MySQL user's first sync is ~4–15× slower than their migrate. HIGH, S (defaults) / L (trigger flavors).
+4. **No chunk prefetch in chain-replay** (`chain_restore.go:714-817`) — fetch N+1 never overlaps apply N. MEDIUM, S–M.
+5. **Native-MySQL snapshot cross-process resume deferred** (in-memory cursors only). MEDIUM, M.
+6. **Redact/shard-stamp tees unbuffered** on the migrate hot path when engaged. LOW-MED, S.
+7. **ADR-0097 write fan-out PG-target ABSENT** (MySQL-target only). MEDIUM, M.
+8. **Backup lacks restore's live headroom clamp** (ADR-0115 asymmetry). LOW-MED, S–M.
+9. **zstd level fixed** (32% of backup CPU). MEDIUM at scale, S knob / M parallel.
+10. **MySQL apply lanes fixed-4, budget flag inert** vs PG slot-probe. LOW-MED, M.
+11. **MySQL bulk-session tuning never evaluated** (`unique_checks=0`, `sql_log_bin=0`). Unknown gain (ADR-0042 found InnoDB floor), S to trial.
+
+## Deliberate absences (cited — do not "fix" without revisiting the rationale)
+
+VStream unbuffered ReadRows (byte-capped rowBuffer is the buffer) · olap off chunked reads (Bug 132) · `--upfront-indexes` sync omission (`streamer_coldstart_parallel.go:304`) · PS/Vitess index-overlap decline (ADR-0080) · MySQL no pgx.Batch pipelining (coalescing ADR-0139/0140 substitutes) · backup partial-table resume-from-scratch (Bug 135) · object-store O(tables) manifest rewrites (named wart) · sqlite/D1 not apply targets · D1 within-table chunking deferred (`d1_rows.go:54`) · raw-copy PG→PG-only gates (ADR-0078 "widen on evidence").

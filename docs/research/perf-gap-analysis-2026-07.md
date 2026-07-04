@@ -1,0 +1,41 @@
+# Research: closing the large-dataset performance gap (pgcopydb, PlanetScale-MySQL) + the cross-mode parity program
+
+Date: 2026-07-04 · Trigger: operator ask — "anything else performance related, especially closing the gap with pgcopydb for very large imports; PlanetScale-MySQL thoughts too; and ensure speed techniques stay equal across engines/modes/backup." · Method: two parallel investigations — an external state-of-the-art survey (pgcopydb docs + PlanetScale fork/scripts/limits, sources at bottom) and a full internal code inventory (every technique × engine × mode, cited) — synthesized here. The inventory's full matrix lives at `docs/dev/perf-parity-matrix.md` (a living doc with a maintenance protocol); this doc is the point-in-time analysis and recommendation set.
+
+## Headline conclusions
+
+1. **The PG→PG gap with pgcopydb is small and mostly one structural item.** sluice already implements the bulk of pgcopydb's playbook — cross-table pools, within-table splitting (broader than pgcopydb's: sampled keyset handles string/uuid/composite PKs where pgcopydb only splits integer PKs), raw COPY byte-pipe, index-build overlap, `--index-build-mem`, deferred constraints. Last measured gap was 1.33–1.42×, *before* the 64 KiB exporter-buffer fix (4.9× single-stream) landed; a re-measure is pending and likely narrows it further. pgcopydb's "2 TB/hour" is Metal-class infrastructure, not a software tactic sluice lacks. The one big structural remainder: **pgcopydb copies into truly index-free tables** (even the PK is built post-load by parallel sort via `CREATE UNIQUE INDEX` + `ADD CONSTRAINT … USING INDEX`), while sluice pays per-row B-tree maintenance on the inline PK.
+2. **On PlanetScale-MySQL writes, the operator's suspicion is confirmed: the structural levers are exhausted.** No LOAD DATA exists on Vitess (verified), writes are tier-CPU-bound not connection-bound (ADR-0116 ground truth: PS-10 pins at 100% CPU under a 2-wide copy), `workload=olap` is read-side only, and the 20 s transaction killer / 30 s DML timeout / 100k-row DML cap bound everything. **One real software lever remains**: byte-targeted ~1 MB INSERT statements (the pscale-dumper reference) instead of the fixed 500-row cap — narrow rows today produce 50–100 KB statements, leaving 10–20× round-trip amortization on the table for WAN imports.
+3. **All three feared parity asymmetries are real and now inventoried** (matrix gap list, 11 items): backup never got migrate's within-table read chunking; restore/chain-replay/broker never got migrate's buffered-pipeline discipline; sync cold-start parallelism defaults are PG-only. The parity program below makes this class structurally visible going forward.
+
+## PG→PG: the delta list vs pgcopydb (ranked by impact at 100 GB–1 TB × cost)
+
+1. **Shared exported snapshot across `migrate` parallel readers** (S effort). Verified gap: only `sync` cold-start pins its readers to one `pg_export_snapshot()` (ADR-0079 `SnapshotImporter`); `migrate`'s parallel readers each get their own view (`migrate_parallel.go:38-47`). pgcopydb always pins. Primarily a *consistency* win on live sources, and the hard prerequisite for CTID chunking (#3). Cost note: a long-held snapshot delays source vacuum — release it at copy-phase end (the PlanetScale-fork lesson).
+2. **Opt-in post-copy PK build** (`--deferred-pk`, L effort, one-shot migrate only). The largest remaining wall-clock lever at 1 TB: random-insert PK maintenance vs post-load parallel sort grows super-linearly with table size. Real correctness tradeoff: resume idempotency and the snapshot→CDC handoff depend on the PK for dup protection — gate the mode against `--resume` and CDC handoff, or re-derive exactness from chunk boundaries. Needs its own ADR.
+3. **CTID-range chunking for PK-less tables** (M effort, after #1). The one table class still single-streamed (a 200 GB no-PK table copies on one stream). CTID ranges are only stable under the pinned snapshot from #1. Keyless tables are already at-least-once territory, so semantics don't regress.
+4. **`--analyze-after`** (S): post-load target ANALYZE (pgcopydb does per-table `VACUUM ANALYZE` by default; sluice never issues it). Doesn't move copy wall-clock; moves post-cutover reality — first queries plan correctly.
+5. **Scoped bulk-load session GUC bundle** (S–M): `synchronous_commit=off` on the copy session only (sluice's own bench rig sets it server-side; the product never does) — must be provably scoped so it can never leak into CDC apply, whose `synchronous_commit=on` pin is the F7 durability contract. Optionally COPY FREEZE for unsplit fresh tables (incompatible with split concurrency — pgcopydb loses it there too).
+6. Coverage, not speed: large-object copy (`--large-objects-jobs` equivalent) is absent — a gap for LO-using databases, not a throughput item.
+
+## PlanetScale-MySQL: the honest lever list
+
+- **Byte-targeted ~1 MB statements for the PS bulk-load path** (M) — the one real gain; keep AIMD ownership of the ceiling and flush on the 20 s transaction budget. Extendable later with telemetry-driven adaptive sizing (the ADR-0107/0115 CPU-headroom clamp pattern applied to statement bytes).
+- **Surface the tier ceiling instead of fighting it** (S): a diagnose/hint line — "this tier is CPU-bound at copy-parallelism N; a larger tier or Metal is the lever" — prevents operators from chasing parallelism that cannot pay. Candidate for a `SLUICE-E` hint code.
+- **Not levers** (documented so nobody re-litigates): more connections (tier CPU binds first), `workload=olap` for writes (read-side feature), wire compression (the gap is latency-dominated), `--upfront-indexes` (a reliability escape hatch, 8–11× *slower* load). ADR-0148 deploy-request index builds stay demand-gated.
+- **Evidence before code**: a head-to-head vs PlanetScale Imports (VReplication) would settle whether parallel multi-row INSERT beats it on mid/large tiers — benchmark, no product change.
+
+## The parity program (operator-approved 2026-07-04)
+
+The structural fix for "an optimization landed in one engine/mode but not another," modeled on the run-filter guard and the restore-parity oracle: make the implicit inventory explicit, then guard it.
+
+1. **`docs/dev/perf-parity-matrix.md`** — the living technique × mode × engine matrix, every cell cited or marked ABSENT, deliberate absences distinguished from accidental with their rationale citations. Updated in the same PR as any perf chunk.
+2. **`perf-parity-checker` agent** (`.claude/agents/perf-parity-checker.md`) — re-derives the matrix from code on demand and reports drift, exactly as `roadmap-staleness-checker` does for the roadmap. Run after perf chunks and before releases.
+3. **CLAUDE.md working agreement** — a performance chunk's ADR/roadmap entry must state its engine × mode coverage cell-by-cell; unreached cells are filed as explicit gaps, never implied.
+
+## Consolidated recommendation order
+
+Quick wins first (all S, from the matrix gap list): buffer the restore/chain-replay/broker channels (gap 2), the redact/shard tees (gap 6), chain-replay chunk prefetch (gap 4), `--analyze-after` (delta 4), migrate shared snapshot (delta 1). Then the two M items with the widest audience: sync cold-start parallelism defaults for MySQL sources (gap 3 — the migrate-vs-sync asymmetry users actually feel) and backup within-table chunking (gap 1 — the backup wall-clock ceiling). Then the evidence-gated L items: `--deferred-pk` (delta 2, own ADR), CTID chunking (delta 3), PS byte-targeted batching (Q2 lever 1). Roadmap item 54 tracks the program.
+
+## Sources
+
+External: pgcopydb docs (concurrency, clone, copy refs), github.com/dimitri/pgcopydb, github.com/planetscale/pgcopydb + migration-scripts, PlanetScale docs (system limits, mysql-compatibility, postgres-migrate-pgcopydb), vitessio/vitess#2976 + #9115, postgresql.org populate docs. Internal ground truth: `docs/comparison-pgcopydb.md`, `docs/throughput-tuning.md`, `docs/dev/notes/pgcopydb-planetscale-fork-review.md`, `docs/dev/notes/index-build-phase-tuning.md`, ADRs 0019/0026/0042/0043/0076–0080/0084/0086/0088/0092/0096/0097/0099/0101/0103/0108/0110/0112/0115/0116/0117/0123/0138/0139/0140/0146/0147/0148, and the per-cell file:line citations in `docs/dev/perf-parity-matrix.md`.
