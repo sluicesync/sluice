@@ -41,7 +41,7 @@ func TestSQLiteRoute_GeneratedAndCheck_NonPortableRefused(t *testing.T) {
 			Name: "g", Type: ir.Integer{Width: 64},
 			GeneratedExpr: body, GeneratedStored: true, GeneratedExprDialect: "sqlite",
 		}
-		if _, err := emitColumnDef(col); err == nil {
+		if _, err := emitColumnDef("t", col); err == nil {
 			t.Errorf("emitColumnDef(sqlite gencol %q) err=nil; want a LOUD refusal (never verbatim)", body)
 		} else if !strings.Contains(err.Error(), "g") {
 			t.Errorf("emitColumnDef(%q) err=%v; want it to name the column", body, err)
@@ -63,7 +63,7 @@ func TestSQLiteRoute_PortableGenColEmits(t *testing.T) {
 		Name: "label", Type: ir.Text{},
 		GeneratedExpr: "a || '-' || b", GeneratedStored: true, GeneratedExprDialect: "sqlite",
 	}
-	def, err := emitColumnDef(col)
+	def, err := emitColumnDef("t", col)
 	if err != nil {
 		t.Fatalf("emitColumnDef(portable sqlite gencol): %v", err)
 	}
@@ -108,8 +108,8 @@ func TestSQLiteRoute_BackslashLiteral_RefusedNamed(t *testing.T) {
 		Name: "g_bs", Type: ir.Text{},
 		GeneratedExpr: `a || 'C:\temp'`, GeneratedStored: true, GeneratedExprDialect: "sqlite",
 	}
-	if _, err := emitColumnDef(col); err == nil {
-		t.Error(`emitColumnDef(gencol a || 'C:\temp') err=nil; want a LOUD backslash refusal`)
+	if _, err := emitColumnDef("t", col); err == nil {
+		t.Error(`emitColumnDef("t", gencol a || 'C:\temp') err=nil; want a LOUD backslash refusal`)
 	} else {
 		if !strings.Contains(err.Error(), "backslash") || !strings.Contains(err.Error(), "g_bs") {
 			t.Errorf("gencol refusal = %v; want it to name the backslash and the column", err)
@@ -146,8 +146,8 @@ func TestSQLiteRoute_BackslashLiteral_RefusedNamed(t *testing.T) {
 		Name: "d_bs", Type: ir.Varchar{Length: 50},
 		Default: ir.DefaultExpression{Expr: `coalesce(NULL, 'C:\temp')`, Dialect: "sqlite"},
 	}
-	if _, err := emitColumnDef(colD); err == nil {
-		t.Error(`emitColumnDef(DEFAULT ('C:\' || 'x')) err=nil; want a LOUD backslash refusal`)
+	if _, err := emitColumnDef("t", colD); err == nil {
+		t.Error(`emitColumnDef("t", DEFAULT ('C:\' || 'x')) err=nil; want a LOUD backslash refusal`)
 	} else {
 		if !strings.Contains(err.Error(), "backslash") || !strings.Contains(err.Error(), "d_bs") {
 			t.Errorf("DEFAULT refusal = %v; want it to name the backslash and the column", err)
@@ -167,14 +167,14 @@ func TestSQLiteRoute_BackslashLiteral_RefusedNamed(t *testing.T) {
 		Name: "g_ok", Type: ir.Text{},
 		GeneratedExpr: `a || 'C:temp'`, GeneratedStored: true, GeneratedExprDialect: "sqlite",
 	}
-	if _, err := emitColumnDef(okCol); err != nil {
+	if _, err := emitColumnDef("t", okCol); err != nil {
 		t.Errorf("emitColumnDef(backslash-free gencol) = %v; want nil", err)
 	}
 	okD := &ir.Column{
 		Name: "d_ok", Type: ir.Varchar{Length: 50},
 		Default: ir.DefaultExpression{Expr: `('a' || 'b')`, Dialect: "sqlite"},
 	}
-	if _, err := emitColumnDef(okD); err != nil {
+	if _, err := emitColumnDef("t", okD); err != nil {
 		t.Errorf("emitColumnDef(backslash-free sqlite DEFAULT) = %v; want nil", err)
 	}
 	if err := refuseBackslashSQLiteDefaultMySQL("d", ir.DefaultExpression{Expr: `'a\b'`, Dialect: "postgres"}); err != nil {
@@ -192,7 +192,7 @@ func TestSQLiteRoute_BackslashLiteral_RefusedNamed(t *testing.T) {
 		Name: "d_lit", Type: ir.Varchar{Length: 50},
 		Default: ir.DefaultLiteral{Value: `C:\temp`},
 	}
-	def, err := emitColumnDef(litCol)
+	def, err := emitColumnDef("t", litCol)
 	if err != nil {
 		t.Fatalf("emitColumnDef(DefaultLiteral with backslash) = %v; want nil (lossless re-escape)", err)
 	}
@@ -220,8 +220,8 @@ func TestSQLiteRoute_DoubleQuoted_RefusedNamed(t *testing.T) {
 		Name: "g_dq", Type: ir.Text{},
 		GeneratedExpr: `a || "C:\temp"`, GeneratedStored: true, GeneratedExprDialect: "sqlite",
 	}
-	if _, err := emitColumnDef(col); err == nil {
-		t.Error(`emitColumnDef(gencol a || "C:\temp") err=nil; want a LOUD double-quoted refusal`)
+	if _, err := emitColumnDef("t", col); err == nil {
+		t.Error(`emitColumnDef("t", gencol a || "C:\temp") err=nil; want a LOUD double-quoted refusal`)
 	} else if !strings.Contains(err.Error(), "double-quoted") || !strings.Contains(err.Error(), "g_dq") {
 		t.Errorf("gencol refusal = %v; want it to name the double-quoted token and the column", err)
 	}
@@ -262,8 +262,8 @@ func TestSQLiteRoute_DoubleQuoted_RefusedNamed(t *testing.T) {
 		Name: "d_dqbs", Type: ir.Varchar{Length: 50},
 		Default: ir.DefaultExpression{Expr: `"a\b"`, Dialect: "sqlite"},
 	}
-	if _, err := emitColumnDef(dqBs); err == nil {
-		t.Error(`emitColumnDef(DEFAULT "a\b") err=nil; want a LOUD backslash refusal`)
+	if _, err := emitColumnDef("t", dqBs); err == nil {
+		t.Error(`emitColumnDef("t", DEFAULT "a\b") err=nil; want a LOUD backslash refusal`)
 	} else if !strings.Contains(err.Error(), "backslash") || !strings.Contains(err.Error(), "d_dqbs") {
 		t.Errorf("DEFAULT dq-backslash refusal = %v; want it to name the backslash and the column", err)
 	}

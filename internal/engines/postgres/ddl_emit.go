@@ -437,14 +437,31 @@ func translateDefaultExpr(table *ir.Table, c *ir.Column, d ir.DefaultExpression,
 		if pg, ok := translateSQLiteDefaultExpr(d.Expr); ok {
 			return pg, true
 		}
-		// Double-quoted tokens are held back from the translator here: in
-		// DEFAULT position (constant expressions only — SQLite allows no
-		// column references there) a `"…"` token is always the
-		// double-quoted-string MISFEATURE, but the translator's PG policy
-		// carries it as an IDENTIFIER, which PG rejects in a DEFAULT
-		// ("cannot use column reference in default expression") — aborting
-		// the whole migration. Those keep the loud warn-drop below.
-		if !translate.SQLiteExprHasDoubleQuotedToken(d.Expr) {
+		// Three shapes are held back from the general translator so the
+		// arm keeps its never-abort contract (a bad DEFAULT must warn-drop,
+		// never fail the whole CREATE TABLE):
+		//
+		//   - a `"…"` double-quoted token: in DEFAULT position (constant
+		//     expressions only — SQLite allows no column references there)
+		//     it is always the double-quoted-string MISFEATURE, but the
+		//     translator's PG policy carries it as an IDENTIFIER, which PG
+		//     rejects in a DEFAULT ("cannot use column reference in
+		//     default expression");
+		//   - a 0x… hex literal: PG parses it only on PG 16+ (older
+		//     servers reject the spelling at CREATE TABLE), so the
+		//     version-dependent emit stays on the drop path;
+		//   - a bare TRUE/FALSE on a non-boolean column (SQLite's common
+		//     `INTEGER DEFAULT TRUE` bool encoding): PG types the keyword
+		//     boolean and aborts CREATE with 42804 on an integer column.
+		//     On an ir.Boolean column (a declared BOOL/BOOLEAN source
+		//     column, ADR-0129) it translates and lands faithfully.
+		trimmedExpr := strings.TrimSpace(d.Expr)
+		bareBool := strings.EqualFold(trimmedExpr, "TRUE") || strings.EqualFold(trimmedExpr, "FALSE")
+		_, boolCol := c.Type.(ir.Boolean)
+		eligible := !translate.SQLiteExprHasDoubleQuotedToken(d.Expr) &&
+			!translate.SQLiteExprHasHexLiteral(d.Expr) &&
+			(!bareBool || boolCol)
+		if eligible {
 			if pg, ok := translate.SQLiteExprToPG(d.Expr); ok {
 				return requotePGReservedIdents(pg), true
 			}

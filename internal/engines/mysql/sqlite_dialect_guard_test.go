@@ -74,10 +74,13 @@ func TestWriterDialectGuard_SQLiteVerbatim(t *testing.T) {
 // "postgres" body still translates, and the bitLiteralDialect arm is intact.
 // A "sqlite" body routes through the SQLite→MySQL translator instead: a
 // portable body TRANSLATES (`'a' || 'b'` means concat on SQLite but LOGICAL
-// OR to MySQL — verbatim carry silently evaluated to 0), while a body that
-// translator refuses stays verbatim, proving the PG→MySQL translator never
-// runs on it. emitDefault applies the MySQL function-default paren wrap, so
-// bodies land wrapped — the assertions are on translate-vs-not, not the wrap.
+// OR to MySQL — verbatim carry silently evaluated to 0); a refused body is
+// either a proven-faithful residue carried verbatim or is warn-DROPPED by
+// emitColumnDef's value-divergence pre-flight (MySQL parses `||`/`/`/`%`
+// bodies with different semantics, so "the parser rejects it loudly" does
+// not hold). emitDefault applies the MySQL function-default paren wrap, so
+// bodies land wrapped — the assertions are on translate-vs-drop-vs-carry,
+// not the wrap.
 func TestWriterDialectGuard_DefaultExpr_MySQL(t *testing.T) {
 	typ := ir.Varchar{Length: 50}
 
@@ -117,14 +120,51 @@ func TestWriterDialectGuard_DefaultExpr_MySQL(t *testing.T) {
 		t.Errorf("sqlite portable default = (%q, %v); want ((CONCAT('a', 'b')), true)", got, ok)
 	}
 
-	// A "sqlite" body the SQLite→MySQL translator refuses stays VERBATIM —
-	// myfunc() is unknown to the SQLite translator, and the PG→MySQL
-	// translator (which WOULD rewrite the `||` into CONCAT) must never run
-	// on a sqlite body. (gen_random_uuid() is no marker here: the legacy
-	// dialect-blind pgToMySQLDefaultExpr map rewrites it on every non-bit
-	// DEFAULT, translator or not.)
-	if got, ok := emitDefault(ir.DefaultExpression{Expr: `myfunc(a) || 'x'`, Dialect: "sqlite"}, typ); !ok || !strings.Contains(got, "||") || strings.Contains(got, "CONCAT") {
-		t.Errorf("sqlite non-portable default = (%q, %v); want the || carried verbatim (PG→MySQL translator must not run)", got, ok)
+	// The value-divergence drop boundary (review follow-up): a "sqlite"
+	// DEFAULT the translator refuses is NOT carried verbatim in general —
+	// MySQL PARSES these bodies with different semantics (`||` reads as
+	// logical OR → 0, `7/2` as decimal 3.5 vs SQLite's 3, `7.5 % 2` as 1.5
+	// vs SQLite's 1) — so emitColumnDef DROPS the DEFAULT with a loud warn
+	// instead of landing a silently wrong value. This also proves the
+	// PG→MySQL translator never runs on a sqlite body: it WOULD rewrite
+	// the `||` cells into CONCAT, but no DEFAULT clause is emitted at all.
+	for _, body := range []string{
+		`myfunc(a) || 'x'`,
+		`upper('a') || 'b'`,
+		`7/2`,
+		`7.5 % 2`,
+	} {
+		col := &ir.Column{
+			Name: "d", Type: ir.Varchar{Length: 50}, Nullable: true,
+			Default: ir.DefaultExpression{Expr: body, Dialect: "sqlite"},
+		}
+		def, err := emitColumnDef("t", col)
+		if err != nil {
+			t.Fatalf("emitColumnDef(sqlite DEFAULT %q) = %v; want nil (warn-drop, never a whole-migration abort)", body, err)
+		}
+		if strings.Contains(def, "DEFAULT") {
+			t.Errorf("sqlite DEFAULT %q emitted %q; want the DEFAULT clause DROPPED (MySQL parses this body with divergent semantics)", body, def)
+		}
+	}
+
+	// The proven-faithful verbatim residues survive the drop boundary: the
+	// bare "draft" misfeature token and an x'…' blob literal (MySQL's
+	// hex-string literal, same bytes).
+	for body, want := range map[string]string{
+		`"draft"`: `"draft"`,
+		`x'00ff'`: `x'00ff'`,
+	} {
+		col := &ir.Column{
+			Name: "d", Type: ir.Varchar{Length: 50}, Nullable: true,
+			Default: ir.DefaultExpression{Expr: body, Dialect: "sqlite"},
+		}
+		def, err := emitColumnDef("t", col)
+		if err != nil {
+			t.Fatalf("emitColumnDef(sqlite DEFAULT %q) = %v; want nil", body, err)
+		}
+		if !strings.Contains(def, "DEFAULT") || !strings.Contains(def, want) {
+			t.Errorf("sqlite DEFAULT %q emitted %q; want the verbatim residue %q carried", body, def, want)
+		}
 	}
 
 	// The bit-literal arm survives (only ever applies to defaults): b'…' bare.

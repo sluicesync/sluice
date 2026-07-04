@@ -534,12 +534,15 @@ func parseFKAction(s string) ir.FKAction {
 // The MySQL target routes the portable subset through the SQLite→MySQL
 // translator (`||` means concat on SQLite but LOGICAL OR under MySQL's
 // default sql_mode, so verbatim emission would compute a silently wrong
-// value) and emits the rest verbatim, relying on MySQL's parser rejecting
-// a non-portable default loudly — EXCEPT a body whose string literal
-// contains a backslash, which MySQL's parser would ACCEPT and silently
-// reinterpret (default sql_mode treats \ as an escape introducer); the
-// MySQL writer refuses those pre-emit (SEC-1,
-// refuseBackslashSQLiteDefaultMySQL). (A dropped DEFAULT is schema
+// value), carries only the proven-faithful residues verbatim (a bare
+// double-quoted misfeature token, an x'..' blob literal, a lone keyword),
+// and DROPS everything else with a loud table+column-named warn — MySQL
+// PARSES many non-portable spellings with different semantics, so relying
+// on its parser to reject them is unsafe. A body whose string literal
+// contains a backslash is REFUSED outright rather than dropped: MySQL's
+// parser would ACCEPT and silently reinterpret it (default sql_mode
+// treats \ as an escape introducer) — SEC-1,
+// refuseBackslashSQLiteDefaultMySQL. (A dropped DEFAULT is schema
 // metadata, NOT data loss: DEFAULTs affect only post-migration inserts,
 // never the migrated rows, which are inserted with explicit values.)
 func parseDefault(dflt sql.NullString) ir.DefaultValue {

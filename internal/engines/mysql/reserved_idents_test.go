@@ -142,7 +142,7 @@ func TestEmitColumnDef_GeneratedReservedWord(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			got, err := emitColumnDef(c.in)
+			got, err := emitColumnDef("t", c.in)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}

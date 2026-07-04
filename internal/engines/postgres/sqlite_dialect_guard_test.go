@@ -161,6 +161,24 @@ func TestWriterDialectGuard_DefaultExpr_SQLite(t *testing.T) {
 		t.Errorf("sqlite blob default = (%q, %v); want (\"\", false) — dropped", got, ok)
 	}
 
+	// Never-abort hold-backs (value-fidelity review follow-up): a 0x hex
+	// literal (PG 16+ only spelling — a PG 15 target would abort CREATE
+	// TABLE) and a bare TRUE on a NON-boolean column (PG types the keyword
+	// boolean and 42804-aborts on e.g. INTEGER DEFAULT TRUE, SQLite's
+	// common bool encoding) both stay on the warn-drop path.
+	if got, ok := guardDefault(ir.DefaultExpression{Expr: `0x1A`, Dialect: "sqlite"}, opts); ok || got != "" {
+		t.Errorf("sqlite hex default = (%q, %v); want (\"\", false) — dropped (version-dependent spelling)", got, ok)
+	}
+	intCol := &ir.Column{Name: "c", Type: ir.Integer{Width: 64}}
+	if got, ok := translateDefaultExpr(nil, intCol, ir.DefaultExpression{Expr: `TRUE`, Dialect: "sqlite"}, opts); ok || got != "" {
+		t.Errorf("sqlite TRUE default on integer column = (%q, %v); want (\"\", false) — dropped (42804 abort otherwise)", got, ok)
+	}
+	// On a declared-boolean column the keyword is faithful and translates.
+	boolCol := &ir.Column{Name: "c", Type: ir.Boolean{}}
+	if got, ok := translateDefaultExpr(nil, boolCol, ir.DefaultExpression{Expr: `TRUE`, Dialect: "sqlite"}, opts); !ok || got != "TRUE" {
+		t.Errorf("sqlite TRUE default on boolean column = (%q, %v); want (TRUE, true)", got, ok)
+	}
+
 	// The former silent-corruption case: DEFAULT "draft" (SQLite's double-
 	// quoted-string misfeature) is held back from the translator (its PG
 	// policy would carry it as an identifier, which PG rejects in a DEFAULT,

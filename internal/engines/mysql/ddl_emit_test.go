@@ -411,7 +411,7 @@ func TestEmitColumnDef_SuppressesDefaultOnForbidddenTypes(t *testing.T) {
 				Type:    c.colType,
 				Default: ir.DefaultExpression{Expr: "'{}'::jsonb"},
 			}
-			got, err := emitColumnDef(col)
+			got, err := emitColumnDef("t", col)
 			if err != nil {
 				t.Fatalf("emitColumnDef: %v", err)
 			}
@@ -424,7 +424,7 @@ func TestEmitColumnDef_SuppressesDefaultOnForbidddenTypes(t *testing.T) {
 		})
 		t.Run(c.name+"/without default unchanged", func(t *testing.T) {
 			col := &ir.Column{Name: "data", Type: c.colType}
-			got, err := emitColumnDef(col)
+			got, err := emitColumnDef("t", col)
 			if err != nil {
 				t.Fatalf("emitColumnDef: %v", err)
 			}
@@ -450,7 +450,7 @@ func TestEmitColumnDef_PreservesDefaultOnAllowedTypes(t *testing.T) {
 	for _, col := range cases {
 		col := col
 		t.Run(col.Name, func(t *testing.T) {
-			got, err := emitColumnDef(col)
+			got, err := emitColumnDef("t", col)
 			if err != nil {
 				t.Fatalf("emitColumnDef: %v", err)
 			}
@@ -564,7 +564,7 @@ func TestEmitColumnDef(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			got, err := emitColumnDef(c.in)
+			got, err := emitColumnDef("t", c.in)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -621,7 +621,7 @@ func TestEmitColumnDef_Generated(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			got, err := emitColumnDef(c.in)
+			got, err := emitColumnDef("t", c.in)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}

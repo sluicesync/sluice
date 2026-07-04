@@ -661,11 +661,11 @@ func trimTrailingSemicolon(s string) string {
 // column-def fragment (“ `name` TYPE [GENERATED ...] [NOT NULL]
 // [DEFAULT ...] [COMMENT '...']“) suitable for inlining into an
 // `ALTER TABLE ... ADD COLUMN` suggestion in the schema-diff
-// renderer (ADR-0029). MySQL's emitter doesn't need table context
-// for any IR type; the table parameter is accepted for interface
-// symmetry with the Postgres implementation and silently ignored.
-func (w *SchemaWriter) EmitColumnDef(_ context.Context, _ *ir.Table, col *ir.Column) (string, error) {
-	return emitColumnDef(col)
+// renderer (ADR-0029). The table is used only to NAME table.column
+// in the DEFAULT-position loud-drop warn (nil-tolerant); MySQL's
+// emitter needs no other table context for any IR type.
+func (w *SchemaWriter) EmitColumnDef(_ context.Context, table *ir.Table, col *ir.Column) (string, error) {
+	return emitColumnDef(tableNameOrEmpty(table), col)
 }
 
 // AlterAddColumn implements [ir.SchemaDeltaApplier] for MySQL. Used
@@ -700,7 +700,7 @@ func (w *SchemaWriter) AlterAddColumn(ctx context.Context, table *ir.Table, cols
 		// See CHANGELOG v0.73.1.
 		emitCol := *col
 		emitCol.Nullable = true
-		def, err := emitColumnDef(&emitCol)
+		def, err := emitColumnDef(table.Name, &emitCol)
 		if err != nil {
 			return fmt.Errorf("alter add column: emit %q: %w", col.Name, err)
 		}
@@ -882,7 +882,7 @@ func (w *SchemaWriter) AlterColumnType(ctx context.Context, table *ir.Table, wan
 	if want == nil {
 		return errors.New("mysql: alter column type: want column is nil")
 	}
-	def, err := emitColumnDef(want)
+	def, err := emitColumnDef(table.Name, want)
 	if err != nil {
 		return fmt.Errorf("alter column type: emit %q: %w", want.Name, err)
 	}
@@ -970,7 +970,7 @@ func (w *SchemaWriter) AlterColumnNullability(ctx context.Context, table *ir.Tab
 	if wantYes == currentYes {
 		return nil
 	}
-	def, err := emitColumnDef(want)
+	def, err := emitColumnDef(table.Name, want)
 	if err != nil {
 		return fmt.Errorf("alter column nullability: emit %q: %w", want.Name, err)
 	}

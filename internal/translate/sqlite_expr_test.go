@@ -120,6 +120,13 @@ func TestSQLiteExpr_TargetSpecific(t *testing.T) {
 	pgOnly := []struct{ in, want string }{
 		{"a / b", "(a / b)"},
 		{"cast(x AS numeric)", "CAST(x AS NUMERIC)"},
+		// 0x hex literal: an INTEGER on SQLite and on PG (16+; older
+		// servers reject the spelling LOUDLY at DDL time), but on MySQL a
+		// hexadecimal literal is a context-dependent BINARY STRING in
+		// string context (bytes \x1a where SQLite stores '26') — refuse
+		// there (value-fidelity review of the DEFAULT classification fix).
+		{"0x1A", "0x1A"},
+		{"a + 0x1A", "(a + 0x1A)"},
 	}
 	for _, c := range pgOnly {
 		if got, ok := SQLiteExprToPG(c.in); !ok || got != c.want {
@@ -318,6 +325,58 @@ func TestSQLiteExpr_NonPortableBoth(t *testing.T) {
 		}
 		if got, ok := SQLiteExprToMySQL(in); ok {
 			t.Errorf("SQLiteExprToMySQL(%q) = (%q, true); want ok=false", in, got)
+		}
+	}
+}
+
+// TestSQLiteExprHasHexLiteral pins the hex-literal detector the PG writer's
+// DEFAULT arm uses to keep 0x defaults on its warn-drop path (the spelling
+// is PG 16+ only).
+func TestSQLiteExprHasHexLiteral(t *testing.T) {
+	for in, want := range map[string]bool{
+		`0x1A`:       true,
+		`0X00FF`:     true,
+		`a + 0x1A`:   true,
+		`42`:         false,
+		`'0x1A'`:     false, // inside a string literal — not a hex token
+		`x'00ff'`:    false, // blob literal, not a 0x integer
+		`col0x`:      false, // identifier containing the letters, not a number
+		`'a' || 'b'`: false,
+		``:           false,
+	} {
+		if got := SQLiteExprHasHexLiteral(in); got != want {
+			t.Errorf("SQLiteExprHasHexLiteral(%q) = %v; want %v", in, got, want)
+		}
+	}
+}
+
+// TestSQLiteExprMySQLDefaultVerbatimSafe pins the verbatim-residue
+// allowlist behind the MySQL writer's DEFAULT-position drop boundary: only
+// bodies proven to read identically (or fail loudly) on MySQL may be
+// carried verbatim after a translator refusal — everything else MySQL may
+// PARSE with different semantics (`||` as logical OR, `/` decimal
+// division, `%` float modulo) and must be warn-dropped by the caller.
+func TestSQLiteExprMySQLDefaultVerbatimSafe(t *testing.T) {
+	for in, want := range map[string]bool{
+		// Safe residues.
+		`"draft"`:     true, // bare misfeature token — same string value on MySQL
+		`x'00ff'`:     true, // blob literal — MySQL hex-string, same bytes
+		`X'00FF'`:     true, // upper-case blob spelling
+		`SOMEKEYWORD`: true, // lone word — MySQL rejects loudly in DEFAULT position
+		// Value-divergence hazards → not safe.
+		`upper('a') || 'b'`: false, // parses as UPPER('a') OR 'b' → 0
+		`7/2`:               false, // decimal 3.5 vs SQLite's 3
+		`7.5 % 2`:           false, // 1.5 vs SQLite's 1
+		`myfunc(a) || 'x'`:  false,
+		`'a' || 'b'`:        false, // (portable — translator handles it, never reaches the residue check)
+		`0x1A`:              false, // context-dependent binary string on MySQL
+		`"a\b"`:             false, // backslash-bearing dq token (also refused upstream)
+		`'a\b'`:             false, // backslash literal (also refused upstream)
+		`"dq" || 'x'`:       false, // dq token alongside other tokens
+		``:                  false,
+	} {
+		if got := SQLiteExprMySQLDefaultVerbatimSafe(in); got != want {
+			t.Errorf("SQLiteExprMySQLDefaultVerbatimSafe(%q) = %v; want %v", in, got, want)
 		}
 	}
 }

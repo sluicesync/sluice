@@ -565,11 +565,16 @@ func emitDefault(d ir.DefaultValue, t ir.Type) (string, bool) {
 			// spelling: `||` is string concat on SQLite but LOGICAL OR
 			// under MySQL's default sql_mode, so a verbatim carry of
 			// `'a' || 'b'` lands a default MySQL silently evaluates to 0.
-			// Non-portable bodies keep the verbatim carry — the SEC-1
-			// refusal boundary (refuseBackslashSQLiteDefaultMySQL, checked
-			// before emitDefault runs) has already screened the
-			// silent-reinterpretation shapes, and MySQL's parser rejects
-			// the rest loudly.
+			// Non-portable bodies that reach this arm are only the
+			// proven-faithful verbatim residues (a bare `"draft"`
+			// misfeature token, an x'…' blob literal, a lone keyword) —
+			// emitColumnDef's pre-flights screen everything else BEFORE
+			// emitDefault runs: the SEC-1 backslash REFUSAL for the
+			// injection class, and warnDropNonPortableSQLiteDefaultMySQL's
+			// loud DROP for the value-divergence class. "MySQL's parser
+			// rejects a non-portable spelling loudly" does NOT hold in
+			// general — it parses `||`/`/`/`%` bodies with different
+			// semantics — which is exactly why the drop boundary exists.
 			if my, ok := translate.SQLiteExprToMySQL(expr); ok {
 				expr = my
 			}
@@ -736,7 +741,11 @@ func temporalPrecision(t ir.Type) int {
 // non-portable expressions (e.g. PG-specific functions) will error
 // at CREATE TABLE time rather than be guessed-at, in line with the
 // project's verbatim-passthrough translation policy.
-func emitColumnDef(c *ir.Column) (string, error) {
+// tableName is carried only so the DEFAULT-position loud-drop warn
+// (warnDropNonPortableSQLiteDefaultMySQL) can name table.column; it may be
+// empty at call sites that lack table context (the warn then names the
+// column alone).
+func emitColumnDef(tableName string, c *ir.Column) (string, error) {
 	if c == nil {
 		return "", fmt.Errorf("mysql: emitColumnDef: column is nil")
 	}
@@ -796,7 +805,17 @@ func emitColumnDef(c *ir.Column) (string, error) {
 	if err := refuseBackslashSQLiteDefaultMySQL(c.Name, c.Default); err != nil {
 		return "", err
 	}
-	if dflt, ok := emitDefault(c.Default, c.Type); ok {
+	// Value-divergence pre-flight (review follow-up to the SEC-1 sweep): a
+	// "sqlite"-dialect DEFAULT the translator can't prove portable is NOT
+	// safe to carry verbatim in general — MySQL PARSES many refused bodies
+	// with DIFFERENT semantics (`||` as logical OR, `/` as decimal
+	// division, `%` as float modulo) and would land a silently WRONG
+	// default with exit 0. Outside the proven-faithful verbatim residues,
+	// drop the DEFAULT with a loud warn (PG-arm parity — a DEFAULT is
+	// non-data metadata affecting only post-migration inserts).
+	if warnDropNonPortableSQLiteDefaultMySQL(tableName, c) {
+		// DEFAULT dropped loudly; no clause emitted.
+	} else if dflt, ok := emitDefault(c.Default, c.Type); ok {
 		// MySQL forbids DEFAULT on BLOB, TEXT, GEOMETRY, and JSON
 		// columns — the server rejects CREATE TABLE with Error 1101
 		// ("can't have a default value"). Cross-engine PG → MySQL
@@ -1134,7 +1153,7 @@ func emitTableDefWithDomainChecks(table *ir.Table, inlineCheckSupported bool) (s
 	hasUserChecks := len(table.CheckConstraints) > 0
 	hasDomainChecks := len(domainCheckClauses) > 0
 	for i, col := range table.Columns {
-		def, err := emitColumnDef(col)
+		def, err := emitColumnDef(table.Name, col)
 		if err != nil {
 			return "", err
 		}
@@ -1716,6 +1735,48 @@ func refuseBackslashSQLiteDefaultMySQL(colName string, d ir.DefaultValue) error 
 	)
 }
 
+// warnDropNonPortableSQLiteDefaultMySQL reports whether column c carries a
+// "sqlite"-dialect DEFAULT expression that must be DROPPED — with a loud,
+// table+column-named warn — rather than emitted. The drop class: the
+// SQLite→MySQL translator can't prove the body portable AND it is outside
+// the verbatim-safe residues ([translate.SQLiteExprMySQLDefaultVerbatimSafe]
+// — a bare `"draft"` misfeature token, an x'…' blob literal, a lone
+// keyword). Relying on "MySQL's parser rejects a non-portable spelling
+// loudly" is FALSE for this class: MySQL parses `upper('a') || 'b'` as
+// UPPER('a') OR 'b' (default lands 0), `7/2` as decimal 3.5 vs SQLite's 3,
+// `7.5 % 2` as 1.5 vs SQLite's 1 — all silently wrong with exit 0, the
+// same class the parseDefault misclassification fix closed one branch
+// over. A DEFAULT is non-data metadata (post-migration inserts only), so
+// PG-arm parity applies: loud drop, never silent, never a whole-migration
+// abort. The SEC-1 backslash class stays a REFUSAL (injection hazard), not
+// a drop — refuseBackslashSQLiteDefaultMySQL runs first.
+func warnDropNonPortableSQLiteDefaultMySQL(tableName string, c *ir.Column) bool {
+	v, ok := c.Default.(ir.DefaultExpression)
+	if !ok || v.Dialect != sqliteSourceDialect {
+		return false
+	}
+	if _, ok := translate.SQLiteExprToMySQL(v.Expr); ok {
+		return false
+	}
+	if translate.SQLiteExprMySQLDefaultVerbatimSafe(v.Expr) {
+		return false
+	}
+	slog.Warn(
+		fmt.Sprintf(
+			"mysql: dropped non-portable SQLite DEFAULT on %s.%s (SQLite expression %q has "+
+				"no provably-equivalent MySQL spelling, and MySQL may PARSE it with different "+
+				"semantics — e.g. || is logical OR — landing a silently wrong value); the "+
+				"column has no DEFAULT on the target — re-create one on the MySQL target "+
+				"post-migration if your application relies on it, or exclude the table",
+			quoteIdent(tableName), quoteIdent(c.Name), v.Expr,
+		),
+		slog.String("table", tableName),
+		slog.String("column", c.Name),
+		slog.String("expression", v.Expr),
+	)
+	return true
+}
+
 // sqliteIndexPortableMySQL reports whether every "sqlite"-dialect expression
 // body on idx translates to MySQL. When portable is false, offending names the
 // first body that doesn't (for the WARN). MySQL has no partial-index predicate
@@ -1802,4 +1863,14 @@ func logSuppressedDefault(c *ir.Column, suppressed string) {
 // error messages.
 func typeName(t ir.Type) string {
 	return fmt.Sprintf("%T", t)
+}
+
+// tableNameOrEmpty returns t.Name, tolerating a nil table (the ADR-0029
+// column-def preview call site may not carry one); emitColumnDef's
+// DEFAULT-drop warn then names the column alone.
+func tableNameOrEmpty(t *ir.Table) string {
+	if t == nil {
+		return ""
+	}
+	return t.Name
 }

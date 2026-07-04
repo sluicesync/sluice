@@ -71,6 +71,12 @@ package translate
 //     semantics — silently wrong regardless of content (see identNode). PG
 //     reads "…" as an identifier, matching SQLite's primary meaning, and an
 //     unknown column fails loudly (42703) — permissive there.
+//   - a 0x… hex integer literal, on MySQL ONLY: SQLite reads an INTEGER;
+//     MySQL reads a hexadecimal literal whose value is context-dependent — a
+//     BINARY STRING in string context (bytes \x1a where SQLite stores '26')
+//     — and the context can't be proven from the body. PG keeps it: PG 16+
+//     parses 0x as an integer exactly like SQLite, and older servers reject
+//     the spelling loudly at DDL time (see verbatimNode).
 //   - substr with a non-literal or < 1 start (negative counts from the end in
 //     SQLite, not in SUBSTRING); min/max on PG (LEAST/GREATEST skip NULLs, but
 //     SQLite scalar min/max propagate NULL).
@@ -147,6 +153,64 @@ func SQLiteExprHasDoubleQuotedToken(expr string) bool {
 	return false
 }
 
+// SQLiteExprHasHexLiteral reports whether the SQLite expression body
+// contains a 0x… hex integer literal. SQLite reads it as an INTEGER; MySQL
+// reads a hexadecimal literal as a context-dependent BINARY STRING (the
+// translator refuses it there — see verbatimNode), and PG only gained 0x
+// integer literals in PG 16 (older servers reject the spelling at DDL
+// time). The PG writer's DEFAULT arm uses this to keep hex defaults on its
+// loud warn-drop path instead of emitting a version-dependent spelling.
+func SQLiteExprHasHexLiteral(expr string) bool {
+	for _, tok := range tokenizeSQLiteExpr(expr) {
+		if tok.kind == sqWord && isHex0xWord(tok.text) {
+			return true
+		}
+	}
+	return false
+}
+
+// SQLiteExprMySQLDefaultVerbatimSafe reports whether a "sqlite"-dialect
+// DEFAULT body that the SQLite→MySQL translator REFUSED can still be
+// carried verbatim to MySQL without risking a silently divergent VALUE.
+// MySQL parses much of what the translator refuses — `||` as logical OR,
+// `/` as decimal division, `%` as float modulo, upper/round with different
+// semantics inside accepted syntax — so "the parser rejects a non-portable
+// spelling loudly" does NOT hold in general; the MySQL writer warn-drops
+// anything outside this allowlist (PG-arm parity). The safe residues, each
+// probed:
+//
+//   - a single "…" double-quoted token with no backslash (`"draft"` — the
+//     bare misfeature form SQLite accepts in DEFAULT position; MySQL reads
+//     the same string value)
+//   - a x'…' blob literal (MySQL's hex-string literal, same bytes)
+//   - a single bare word that is not a 0x… hex literal (an unknown
+//     keyword: MySQL rejects it loudly in DEFAULT position, never
+//     silently)
+//
+// Backslash-bearing shapes are also excluded here as belt-and-braces,
+// though the SEC-1 refusal boundary (the MySQL writer's
+// refuseBackslashSQLiteDefaultMySQL) aborts those before any emit
+// decision is reached.
+func SQLiteExprMySQLDefaultVerbatimSafe(expr string) bool {
+	toks := tokenizeSQLiteExpr(expr)
+	switch len(toks) {
+	case 1:
+		t := toks[0]
+		switch t.kind {
+		case sqIdent:
+			return strings.HasPrefix(t.text, `"`) && !strings.Contains(t.text, `\`)
+		case sqWord:
+			return !isHex0xWord(t.text)
+		}
+		return false
+	case 2:
+		// x'…' blob literal (the tokenizer splits it as word + string).
+		return toks[0].kind == sqWord && strings.EqualFold(toks[0].text, "x") &&
+			toks[1].kind == sqString && !strings.Contains(toks[1].text, `\`)
+	}
+	return false
+}
+
 // sqTarget selects the emit dialect.
 type sqTarget int
 
@@ -186,12 +250,32 @@ type sqNode interface {
 }
 
 // verbatimNode carries text that is identical on both targets: a bare column
-// reference, a numeric literal, NULL, or a current-instant keyword. String
-// literals and quoted identifiers are NOT verbatim — see stringNode and
-// identNode.
+// reference, a plain numeric literal, NULL, or a current-instant keyword.
+// String literals and quoted identifiers are NOT verbatim — see stringNode
+// and identNode. One carve-out (value-fidelity review of the DEFAULT
+// classification fix): a 0x… HEX literal is an integer on SQLite, but on
+// MySQL a hexadecimal literal is a CONTEXT-DEPENDENT value — a BINARY
+// STRING in string context (a varchar position gets bytes \x1a where SQLite
+// stores '26') and a number only in numeric context. The context can't be
+// proven from the expression body, so hex refuses on MySQL. PG keeps it:
+// PG's 0x literal (PG 16+) is an integer exactly like SQLite's, and an
+// older server rejects it LOUDLY at DDL time rather than diverging.
 type verbatimNode struct{ text string }
 
-func (n verbatimNode) emit(sqTarget) (string, bool) { return n.text, true }
+func (n verbatimNode) emit(t sqTarget) (string, bool) {
+	if t == sqMySQL && isHex0xWord(n.text) {
+		return "", false
+	}
+	return n.text, true
+}
+
+// isHex0xWord reports whether a word token is a 0x/0X hex integer literal.
+// The tokenizer only produces digit-led words for numbers, so the prefix
+// test cannot collide with a column reference (identifiers can't start
+// with a digit).
+func isHex0xWord(s string) bool {
+	return len(s) > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')
+}
 
 // stringNode carries a '…' single-quoted string literal (delimiters included,
 // interior quotes doubled — SQLite's own spelling, which is also valid on both
