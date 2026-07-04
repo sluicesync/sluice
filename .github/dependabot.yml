@@ -22,6 +22,16 @@ updates:
       day: "monday"
       time: "10:00"
       timezone: "America/Los_Angeles"
+    # Supply-chain cooldown (operator-approved 2026-07-03): wait 7 days
+    # after a release is published before opening its version-bump PR.
+    # Because dependabot-automerge.yml merges green patch/minor PRs with
+    # no human latency, a malicious upstream release (the xz-utils
+    # shape) would otherwise land on main within hours of publication —
+    # the cooldown gives the ecosystem time to detect and yank it first.
+    # Cooldown applies to VERSION updates only; Dependabot SECURITY
+    # updates ignore it and stay immediate.
+    cooldown:
+      default-days: 7
     # Cap the number of open update PRs to keep the queue manageable.
     open-pull-requests-limit: 5
     labels:
@@ -83,6 +93,9 @@ updates:
       time: "10:00"
       timezone: "America/Los_Angeles"
     open-pull-requests-limit: 5
+    # Same 7-day supply-chain cooldown as gomod; security updates unaffected.
+    cooldown:
+      default-days: 7
     labels:
       - "dependencies"
       - "github-actions"
@@ -113,6 +126,9 @@ updates:
       time: "10:00"
       timezone: "America/Los_Angeles"
     open-pull-requests-limit: 2
+    # Same 7-day supply-chain cooldown as gomod; security updates unaffected.
+    cooldown:
+      default-days: 7
     labels:
       - "dependencies"
       - "docker"

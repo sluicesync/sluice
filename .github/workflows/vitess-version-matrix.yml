@@ -2,9 +2,18 @@
 #
 # Boots the REAL multi-process Vitess cluster (the gated `vitesscluster`
 # build-tag harness) against a sweep of Vitess SERVER versions and runs the
-# Bug-27 VStream-POINT end-to-end test on each, proving the vendored
-# vitess.io/vitess v0.24.1 client streams correctly across newer-client ->
-# older-server skew (the direction Vitess supports for rolling upgrades).
+# full cluster correctness suite on each — Bug-27 VStream-POINT geometry,
+# OnlineDDL cutover zero-loss (both shape tests), and the PrimaryOnly
+# tablet-type pair — proving the vendored vitess.io/vitess v0.24.1 client
+# behaves correctly across newer-client -> older-server skew (the direction
+# Vitess supports for rolling upgrades).
+#
+# The weekly default was Bug-27-only until 2026-07-03 (a paid-minutes cost
+# call); with the repo public, standard runners are free, so the default
+# widened to the full suite (operator-approved). If a suite proves flaky on
+# hosted runners across a few weekly cycles, narrow the default back and
+# document the exclusion here. The scheduled default filter is pinned by
+# scripts/check-run-filter-coverage.sh (vitesscluster axis).
 #
 # This is NOT part of the per-PR `ci.yml` gate — it is a heavy, scheduled /
 # on-demand job (each matrix leg boots a 5-container cluster). It is never a
@@ -32,9 +41,9 @@ on:
   workflow_dispatch:
     inputs:
       run:
-        description: "go test -run filter (default: the Bug-27 geometry test; widen to TestVitessCluster for the full cutover suite)"
+        description: "go test -run filter (default: the full cluster suite; narrow to TestVitessCluster_Bug27 for the quick geometry-only sweep)"
         required: false
-        default: "TestVitessCluster_Bug27"
+        default: "TestVitessCluster"
 
 permissions:
   contents: read
@@ -72,7 +81,7 @@ jobs:
           echo "matrix=$entries" >> "$GITHUB_OUTPUT"
 
   cluster:
-    name: Bug 27 on Vitess ${{ matrix.version }}
+    name: Cluster suite on Vitess ${{ matrix.version }}
     needs: setup
     runs-on: ubuntu-latest
     # The :latest leg is a forward-compat canary — let it fail without failing
@@ -80,7 +89,10 @@ jobs:
     continue-on-error: ${{ matrix.canary }}
     permissions:
       packages: read
-    timeout-minutes: 30
+    # 45 (was 30 when the default ran only Bug-27): the full suite runs 5
+    # tests per leg against the booted cluster; the OnlineDDL cutover pair
+    # is the long pole.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -101,14 +113,14 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash scripts/ci-ghcr-pull.sh "${{ matrix.image }}"
 
-      # Boot the cluster on this version and run the Bug-27 end-to-end test.
+      # Boot the cluster on this version and run the cluster suite.
       # VITESS_LITE_IMAGE points the compose file + harness at the GHCR mirror;
       # the harness parses the major from the tag and layers the legacy-flag
       # override for major <= 22 (v21/v22).
-      - name: Boot cluster + run ${{ github.event.inputs.run || 'TestVitessCluster_Bug27' }}
+      - name: Boot cluster + run ${{ github.event.inputs.run || 'TestVitessCluster' }}
         env:
           VITESS_LITE_IMAGE: ${{ matrix.image }}
         run: |
-          go test -tags='integration vitesscluster' -count=1 -timeout=20m \
-            -run '${{ github.event.inputs.run || 'TestVitessCluster_Bug27' }}' \
+          go test -tags='integration vitesscluster' -count=1 -timeout=40m \
+            -run '${{ github.event.inputs.run || 'TestVitessCluster' }}' \
             -v ./internal/engines/mysql/...

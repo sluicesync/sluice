@@ -18,29 +18,37 @@
 #
 # MANIFEST — KEEP IN SYNC with the workflows. One line per (tag, job
 # leg), fields separated by `;`:
-#   tag ; the leg's -run regex ; package scopes ; leg label
+#   tag[!excl] ; the leg's -run regex ; package scopes ; leg label
 # A scope with a `/...` suffix covers the subtree (the job passes
 # `./x/...`); a bare scope is that ONE package (the job passes `./x/`).
+# A `!excl` suffix on the tag skips files that ALSO carry tag `excl` —
+# needed when a broader tag's files are a superset of a more specific
+# axis's: the chaos files carry `vitesscluster && chaos`, compile ONLY
+# in the chaos leg (the matrix job's tag set lacks `chaos`), and are
+# guarded by the chaos axis, so `vitesscluster!chaos` excludes them.
 # Legs today:
-#   - vstream       → ci.yml `integration-vstream` (mysql engine) +
-#                     extended-suites.yml `vstream-pipeline` (pipeline pkg)
-#   - postgis       → ci.yml `integration-postgis`
-#   - chaos         → extended-suites.yml `chaos`
-#   - vitessreshard → extended-suites.yml `reshard`
+#   - vstream        → ci.yml `integration-vstream` (mysql engine) +
+#                      extended-suites.yml `vstream-pipeline` (pipeline pkg)
+#   - postgis        → ci.yml `integration-postgis`
+#   - chaos          → extended-suites.yml `chaos`
+#   - vitessreshard  → extended-suites.yml `reshard`
+#   - vitesscluster  → vitess-version-matrix.yml `cluster` (weekly; pins
+#                      the SCHEDULED default filter — dispatch may
+#                      override it per-run)
 #
-# Tags deliberately WITHOUT an axis here: bare `vitesscluster` (the
-# local vitess-cluster-validator suite — no workflow runs it, by design),
-# `psverify` (cron off per operator), `kmsverify` (skip-scaffolding),
-# `jsonbench`/`compressbench`/`ddlfixture` (local/on-demand, no `-run`
-# filter to escape). The ci.yml pipeline integration shards need no axis
-# either: their -run/-skip regexes are a complete partition (the -skip
-# shard catches every name the other two don't), so no name can escape.
+# Tags deliberately WITHOUT an axis here: `psverify` (cron off per
+# operator), `kmsverify` (skip-scaffolding), `jsonbench`/`compressbench`/
+# `ddlfixture` (local/on-demand, no `-run` filter to escape). The ci.yml
+# pipeline integration shards need no axis either: their -run/-skip
+# regexes are a complete partition (the -skip shard catches every name
+# the other two don't), so no name can escape.
 MANIFEST='
 vstream;TestVStream_;internal/engines/mysql/...;ci.yml integration-vstream
 vstream;^(TestMigrate_VStream|TestStreamer_.*VStream|TestSpikeShapeA_);internal/pipeline;extended-suites.yml vstream-pipeline
 postgis;PostGIS_;internal/pipeline/... internal/engines/postgres/...;ci.yml integration-postgis
 chaos;^TestVitessChaos_;internal/engines/mysql/...;extended-suites.yml chaos
 vitessreshard;^TestVitessReshard_;internal/engines/mysql/...;extended-suites.yml reshard
+vitesscluster!chaos;TestVitessCluster;internal/engines/mysql/...;vitess-version-matrix.yml cluster (weekly default)
 '
 
 set -eu
@@ -80,16 +88,32 @@ EOF
 
 status=0
 
-for tag in $(printf '%s\n' "$MANIFEST" | sed '/^$/d' | cut -d';' -f1 | sort -u); do
+for axis in $(printf '%s\n' "$MANIFEST" | sed '/^$/d' | cut -d';' -f1 | sort -u); do
+	tag=${axis%%!*}
+	excl=
+	case "$axis" in
+	*!*) excl=${axis#*!} ;;
+	esac
+
 	# Every test file whose build expression includes this tag (word-
 	# bounded: `vitessreshard` must not match a hypothetical `reshard`).
 	# `git ls-files | xargs grep` rather than `git grep`: see the MSYS
 	# argument-mangling note in scripts/vet-tags.sh.
 	files=$(git ls-files -- '*_test.go' | xargs grep -lE "^//go:build.*\b$tag\b" || true)
 
+	# Drop files that also carry the axis's exclude tag (see the
+	# manifest header for why).
+	if [ -n "$excl" ]; then
+		kept=
+		for f in $files; do
+			grep -qE "^//go:build.*\b$excl\b" "$f" || kept="$kept $f"
+		done
+		files=$kept
+	fi
+
 	# Guard against vacuous success (empty discovery = broken discovery).
-	if [ -z "$files" ]; then
-		echo "::error::check-run-filter-coverage: axis '$tag' discovered no tagged test files — discovery is broken, refusing to pass vacuously."
+	if [ -z "${files# }" ]; then
+		echo "::error::check-run-filter-coverage: axis '$axis' discovered no tagged test files — discovery is broken, refusing to pass vacuously."
 		status=1
 		continue
 	fi
@@ -100,11 +124,11 @@ for tag in $(printf '%s\n' "$MANIFEST" | sed '/^$/d' | cut -d';' -f1 | sort -u);
 
 		# (1) package-path coverage: the file must sit inside some leg's
 		# package scope, or no job even hands it to `go test`.
-		if leg=$(leg_for_dir "$tag" "$d"); then
+		if leg=$(leg_for_dir "$axis" "$d"); then
 			pattern=${leg%%;*}
 			label=${leg#*;}
 		else
-			echo "::error::$f is $tag-tagged but its package ($d) is outside every $tag leg's package scope — add the package to the job's \`go test\` args AND to the MANIFEST in scripts/check-run-filter-coverage.sh"
+			echo "::error::$f is $tag-tagged but its package ($d) is outside every $axis leg's package scope — add the package to the job's \`go test\` args AND to the MANIFEST in scripts/check-run-filter-coverage.sh"
 			status=1
 			continue
 		fi
@@ -124,7 +148,7 @@ for tag in $(printf '%s\n' "$MANIFEST" | sed '/^$/d' | cut -d';' -f1 | sort -u);
 	# Vacuous-pass guard, name flavor: tagged files with zero discovered
 	# test functions means the func discovery broke, not that all is well.
 	if [ "$name_count" -eq 0 ]; then
-		echo "::error::check-run-filter-coverage: axis '$tag' has tagged files but zero discovered test functions — discovery is broken, refusing to pass vacuously."
+		echo "::error::check-run-filter-coverage: axis '$axis' has tagged files but zero discovered test functions — discovery is broken, refusing to pass vacuously."
 		status=1
 	fi
 done
