@@ -360,6 +360,7 @@ func TestSQLiteExprMySQLDefaultVerbatimSafe(t *testing.T) {
 	for in, want := range map[string]bool{
 		// Safe residues.
 		`"draft"`:     true, // bare misfeature token — same string value on MySQL
+		`"order"`:     true, // reserved-word CONTENT is still a plain string (carried requote-free)
 		`x'00ff'`:     true, // blob literal — MySQL hex-string, same bytes
 		`X'00FF'`:     true, // upper-case blob spelling
 		`SOMEKEYWORD`: true, // lone word — MySQL rejects loudly in DEFAULT position

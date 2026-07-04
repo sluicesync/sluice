@@ -575,10 +575,18 @@ func emitDefault(d ir.DefaultValue, t ir.Type) (string, bool) {
 			// rejects a non-portable spelling loudly" does NOT hold in
 			// general — it parses `||`/`/`/`%` bodies with different
 			// semantics — which is exactly why the drop boundary exists.
+			//
+			// The residues are carried BYTE-verbatim — no reserved-word
+			// requote. The requote walk recognises '…' strings and
+			// backticks but NOT "…" tokens, so it would backtick a
+			// reserved word INSIDE the double-quoted string — DEFAULT
+			// "order" would land with literal backticks around order,
+			// a silently different stored value — and by construction
+			// the residues contain no bare column references for the
+			// requote to legitimately fix.
 			if my, ok := translate.SQLiteExprToMySQL(expr); ok {
-				expr = my
+				expr = requoteMySQLReservedIdents(my)
 			}
-			expr = requoteMySQLReservedIdents(expr)
 		default:
 			// Same-dialect (or untagged) DEFAULT body. The MySQL read
 			// boundary strips backtick identifier quotes for IR

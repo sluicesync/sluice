@@ -191,6 +191,14 @@ func SQLiteExprHasHexLiteral(expr string) bool {
 // though the SEC-1 refusal boundary (the MySQL writer's
 // refuseBackslashSQLiteDefaultMySQL) aborts those before any emit
 // decision is reached.
+//
+// A residue this reports safe must be carried BYTE-verbatim — in
+// particular it must BYPASS the writer's reserved-word requote: the
+// requote walk recognises '…' strings and backticks but not "…" tokens,
+// so it would backtick a reserved word INSIDE a double-quoted string
+// (`"order"` landing with literal backticks around the word — a silently
+// different stored value). By construction the residues contain no bare
+// column references, so the requote has nothing legitimate to do on them.
 func SQLiteExprMySQLDefaultVerbatimSafe(expr string) bool {
 	toks := tokenizeSQLiteExpr(expr)
 	switch len(toks) {

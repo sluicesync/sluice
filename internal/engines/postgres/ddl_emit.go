@@ -454,7 +454,10 @@ func translateDefaultExpr(table *ir.Table, c *ir.Column, d ir.DefaultExpression,
 		//     `INTEGER DEFAULT TRUE` bool encoding): PG types the keyword
 		//     boolean and aborts CREATE with 42804 on an integer column.
 		//     On an ir.Boolean column (a declared BOOL/BOOLEAN source
-		//     column, ADR-0129) it translates and lands faithfully.
+		//     column, ADR-0129) it translates and lands faithfully. (A
+		//     COMPOUND boolean like `1 + TRUE` escapes this bare-token
+		//     check and still aborts loudly at CREATE on a mismatched
+		//     column — contrived, loud, accepted.)
 		trimmedExpr := strings.TrimSpace(d.Expr)
 		bareBool := strings.EqualFold(trimmedExpr, "TRUE") || strings.EqualFold(trimmedExpr, "FALSE")
 		_, boolCol := c.Type.(ir.Boolean)

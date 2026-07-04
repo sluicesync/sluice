@@ -148,10 +148,17 @@ func TestWriterDialectGuard_DefaultExpr_MySQL(t *testing.T) {
 	}
 
 	// The proven-faithful verbatim residues survive the drop boundary: the
-	// bare "draft" misfeature token and an x'…' blob literal (MySQL's
-	// hex-string literal, same bytes).
+	// bare "draft" misfeature token, its RESERVED-WORD-content sibling
+	// "order", and an x'…' blob literal (MySQL's hex-string literal, same
+	// bytes). Residues bypass the reserved-word requote entirely — the
+	// requote walk doesn't recognise "…" tokens, so it would backtick the
+	// word INSIDE the string ("order" landing with literal backticks
+	// around the word, a silently different stored value); the no-backtick
+	// assertion pins the reserved-content case byte-verbatim, not just the
+	// non-reserved representative.
 	for body, want := range map[string]string{
 		`"draft"`: `"draft"`,
+		`"order"`: `"order"`,
 		`x'00ff'`: `x'00ff'`,
 	} {
 		col := &ir.Column{
@@ -164,6 +171,11 @@ func TestWriterDialectGuard_DefaultExpr_MySQL(t *testing.T) {
 		}
 		if !strings.Contains(def, "DEFAULT") || !strings.Contains(def, want) {
 			t.Errorf("sqlite DEFAULT %q emitted %q; want the verbatim residue %q carried", body, def, want)
+		}
+		// Scope the no-backtick assertion to the DEFAULT clause — the
+		// column-def fragment legitimately backticks the column NAME.
+		if i := strings.Index(def, "DEFAULT"); i >= 0 && strings.Contains(def[i:], "`") {
+			t.Errorf("sqlite DEFAULT %q emitted %q; a backtick in the DEFAULT clause means the requote mangled the residue's content", body, def)
 		}
 	}
 
