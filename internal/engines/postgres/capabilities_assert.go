@@ -40,6 +40,7 @@ var (
 	_ ir.PositionOrderer                = Engine{}
 	_ ir.ServerCDCReaderOpener          = Engine{}
 	_ ir.SlotManagerOpener              = Engine{}
+	_ ir.SnapshotExporter               = Engine{}
 	_ ir.SnapshotImporterOpener         = Engine{}
 	_ ir.SnapshotStreamWithSlotOpener   = Engine{}
 	_ ir.TargetConnectionBudgetProber   = Engine{}

@@ -141,6 +141,69 @@ func (s *SnapshotStream) WaitCopyComplete(ctx context.Context) error {
 	return s.WaitCopyCompleteFn(ctx)
 }
 
+// ExportedSnapshot is the handle to a plain-SQL exported source
+// snapshot (perf research delta 1 — the migrate-path sibling of
+// [SnapshotStream]): a pinned [RowReader] observing the exporting
+// transaction's consistent view, plus the SHAREABLE snapshot name other
+// connections pass to the engine's [SnapshotImporter] to observe the
+// EXACT same view. Unlike [SnapshotStream] it involves NO replication
+// machinery — on Postgres it is a REPEATABLE READ transaction plus
+// pg_export_snapshot(), so it needs no wal_level=logical, no
+// replication privilege, and creates no slot. `sluice migrate` uses it
+// to pin ALL of its parallel bulk-copy readers (cross-table pool +
+// within-table chunks) to one MVCC view.
+//
+// Lifecycle mirrors [SnapshotStream]'s Close/ReleaseRows split:
+//
+//   - Release commits the exporting transaction as soon as the copy
+//     phase has drained, so the snapshot stops holding back source
+//     vacuum during the (potentially long) index/constraint phases.
+//     Rows stays USABLE afterward — its queries simply observe fresh
+//     per-statement views, which is exactly what the post-copy
+//     reconciliation re-reads want.
+//   - Close tears down the connection resources. Required exactly once;
+//     both closures are engine-supplied and MUST be idempotent.
+type ExportedSnapshot struct {
+	// Name is the engine's shareable exported-snapshot handle
+	// (Postgres: the pg_export_snapshot() return). Valid for import
+	// only while the exporting transaction is open — i.e. until
+	// Release/Close.
+	Name string
+
+	// Rows reads the source as of the exported snapshot, on the
+	// exporting transaction's own pinned connection. After Release it
+	// keeps working with fresh per-query views.
+	Rows RowReader
+
+	// ReleaseFn commits the exporting transaction (see Release).
+	// Engine-supplied; idempotent.
+	ReleaseFn func() error
+
+	// CloseFn releases the pinned connection and pool (see Close).
+	// Engine-supplied; idempotent, and implies Release when it hasn't
+	// run yet.
+	CloseFn func() error
+}
+
+// Release ends the snapshot's vacuum-pinning exporting transaction
+// while keeping Rows usable (fresh views). Call once the bulk-copy
+// phase has fully drained. Idempotent; nil-safe.
+func (s *ExportedSnapshot) Release() error {
+	if s == nil || s.ReleaseFn == nil {
+		return nil
+	}
+	return s.ReleaseFn()
+}
+
+// Close releases every underlying connection resource. After Close,
+// Rows is unusable. Idempotent; nil-safe.
+func (s *ExportedSnapshot) Close() error {
+	if s == nil || s.CloseFn == nil {
+		return nil
+	}
+	return s.CloseFn()
+}
+
 // PositionMonotonicChecker is the OPTIONAL engine surface the
 // inline-rotation FSM (ADR-0046 §2) uses to enforce its load-bearing
 // `S >= P_N` hard-fail assertion: the freshly-opened next segment's

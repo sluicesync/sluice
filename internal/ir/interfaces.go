@@ -1233,6 +1233,24 @@ type SnapshotImporterOpener interface {
 	OpenSnapshotImporter(ctx context.Context, dsn string) (SnapshotImporter, error)
 }
 
+// SnapshotExporter is the OPTIONAL engine interface for exporting a
+// plain-SQL shareable snapshot with NO replication machinery — the
+// migrate-path counterpart of the slot-anchored snapshot inside
+// [Engine.OpenSnapshotStream]. The orchestrator type-asserts for it
+// (together with [SnapshotImporterOpener]) when `sluice migrate` wants
+// its parallel bulk-copy readers pinned to one consistent MVCC view;
+// engines without a shareable snapshot (MySQL — per-session REPEATABLE
+// READ with no exportable name; SQLite) omit it and migrate keeps its
+// documented independent-per-connection readers (the ADR-0019 v1
+// window). Postgres implements it via BEGIN REPEATABLE READ READ ONLY +
+// pg_export_snapshot(), which needs no replication privilege and works
+// on any primary (pg_export_snapshot() is unavailable during recovery,
+// so a hot-standby source surfaces an error and the caller falls back
+// loudly).
+type SnapshotExporter interface {
+	ExportSnapshot(ctx context.Context, dsn string) (*ExportedSnapshot, error)
+}
+
 // CDCReader streams [Change] events from a source database starting at
 // the given Position. Engines whose [Capabilities.CDC] is [CDCNone]
 // return a non-nil error for any call to this interface.

@@ -35,16 +35,17 @@
 // progress-row upsert — ADR-0082) no longer shares the Chunks
 // backing storage with concurrent mutators.
 //
-// Snapshot consistency: the cold-start (`sluice migrate`) path does
-// not currently capture a source-side snapshot — each parallel reader
-// opens its own connection and observes its own per-connection
-// snapshot. For PG sources running OLTP traffic during the migration
-// the small inconsistency window is the v1 trade-off; ADR-0019
-// records this and proposes capturing a temporary replication-slot-
-// based snapshot as a future enhancement. The snapshot-stream path
-// (`sluice sync start` + cold-start branch) uses
-// [ir.SnapshotImporter] to pin all N readers to the same exported
-// snapshot when the engine implements the optional surface.
+// Snapshot consistency: when the source engine implements
+// [ir.SnapshotExporter] + [ir.SnapshotImporterOpener] (PG), the
+// migrate path pins ALL of its parallel readers — primary, per-table
+// pool, per-chunk — to ONE plain-SQL exported snapshot (perf research
+// delta 1; see migrate_snapshot.go), released at copy-phase end.
+// Sources without the surfaces (MySQL, SQLite) and export failures
+// fall back to the original shape: each parallel reader opens its own
+// connection and observes its own per-connection snapshot — the
+// ADR-0019 v1 window. The snapshot-stream path (`sluice sync start` +
+// cold-start branch) uses the same [ir.SnapshotImporter] machinery
+// pinned to its replication slot's exported snapshot (ADR-0079).
 
 package pipeline
 
@@ -129,25 +130,44 @@ type parallelBulkCopyDeps struct {
 	rawCopyFormat ir.RawCopyFormat
 
 	// chunkReaderFactory mints the SOURCE-side reader for each parallel
-	// chunk/table connection (ADR-0079). It is the ONE provenance seam
-	// distinguishing migrate from the sync cold-start:
+	// chunk/table connection (ADR-0079). Two callers wire it, both to
+	// snapshot-pinned minting:
 	//
-	//   - migrate (nil): [openOneChunkConn] opens an INDEPENDENT reader
-	//     via source.OpenRowReader, each observing its own per-connection
-	//     snapshot (the documented ADR-0019 v1 window). Byte-identical to
-	//     the pre-ADR-0079 behaviour.
+	//   - nil: [openOneChunkConn] opens an INDEPENDENT reader via
+	//     source.OpenRowReader, each observing its own per-connection
+	//     snapshot (the documented ADR-0019 v1 window) — a migrate whose
+	//     source lacks the exporter/importer surfaces (MySQL, SQLite) or
+	//     whose export fell back loudly.
 	//   - sync cold-start (non-nil): each reader is minted via the source
 	//     engine's [ir.SnapshotImporter] pinned to the ONE exported
 	//     snapshot ([ir.SnapshotStream.SnapshotName]), so all N readers
-	//     observe the SAME consistent_point view (gap-free, strictly
-	//     better than migrate's per-connection window). The factory owns
-	//     each reader's connection lifecycle; the caller closes it via the
+	//     observe the SAME consistent_point view. The factory owns each
+	//     reader's connection lifecycle; the caller closes it via the
 	//     same closeIf release path a normal chunk reader uses.
+	//   - migrate with a shared exported snapshot (non-nil, perf research
+	//     delta 1): identical shape, pinned to the plain-SQL
+	//     [ir.ExportedSnapshot] instead of a slot-exported one (see
+	//     migrate_snapshot.go).
 	//
 	// The factory returns ONE reader per call (lazy, matching the existing
 	// per-chunk acquisition shape); it must be safe for concurrent calls
 	// from peer chunk/table goroutines.
 	chunkReaderFactory func(ctx context.Context) (ir.RowReader, error)
+
+	// releaseSharedSnapshot, when non-nil, is invoked ONCE by
+	// [runBulkCopyTablePool] the moment its errgroup drains cleanly — the
+	// earliest point where every per-table / per-chunk reader has closed
+	// and nothing needs the migrate shared exported snapshot anymore. It
+	// commits the exporting transaction and closes the importer pool so
+	// the snapshot never pins source vacuum through the index/constraint
+	// phases (the long-pin source-bloat lesson; the Bug 21 class). Under
+	// the ADR-0077 overlapped copy+index phase this fires on the copy
+	// producer goroutine while index builds still run — deliberate: copy
+	// end, not phase end, is the release point. nil for the sync
+	// cold-start (its SnapshotStream.ReleaseRows owns that lifecycle) and
+	// for migrate runs without the shared snapshot; error unwinds are
+	// covered by the run-teardown close in runSingleDatabase.
+	releaseSharedSnapshot func(ctx context.Context)
 
 	// growGate is the run's shared cold-copy coordinated-pause primitive
 	// (ADR-0110). Constructed ONCE per cold-copy run and shared across all

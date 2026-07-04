@@ -157,7 +157,20 @@ func runBulkCopyTablePool(
 			return nil
 		})
 	}
-	return tg.Wait()
+	if err := tg.Wait(); err != nil {
+		return err
+	}
+	// Copy phase complete: every dedicated table pair and PK-range chunk
+	// connection has closed (their defers ran inside the pool goroutines),
+	// so the shared exported snapshot — when this migrate engaged one —
+	// has served its purpose. Release it NOW, before the index/constraint
+	// phases, so the exporting transaction stops pinning source vacuum
+	// (see parallelBulkCopyDeps.releaseSharedSnapshot). The free pair's
+	// primary reader stays usable post-release (fresh per-query views).
+	if parallel != nil && parallel.releaseSharedSnapshot != nil {
+		parallel.releaseSharedSnapshot(ctx)
+	}
+	return nil
 }
 
 // tablePair is one table's reader/writer pair. Whether it's the

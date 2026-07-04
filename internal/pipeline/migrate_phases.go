@@ -507,7 +507,12 @@ func (m *Migrator) phaseResolveCopyParallelism(ctx context.Context, rc resumeCon
 // only meaningful when the run-level gate held; per-table identity +
 // raw-surface checks still happen at dispatch) and assembles the
 // parallel bulk-copy dependency set handed to runBulkCopyPhases.
-func (m *Migrator) phaseBuildCopyDeps(ctx context.Context, schema *ir.Schema, rr ir.RowReader, rw ir.RowWriter, rawCopyOK bool, withinParallelism int) *parallelBulkCopyDeps {
+// sharedSnap, when non-nil, threads the run's shared exported snapshot
+// (perf research delta 1) into the deps: every per-table / per-chunk
+// reader is minted pinned to it, and the copy pool releases it the
+// moment the bulk-copy phase drains. nil keeps the independent
+// OpenRowReader minting unchanged.
+func (m *Migrator) phaseBuildCopyDeps(ctx context.Context, schema *ir.Schema, rr ir.RowReader, rw ir.RowWriter, rawCopyOK bool, withinParallelism int, sharedSnap *sharedSourceSnapshot) *parallelBulkCopyDeps {
 	// Raw-copy format negotiation (ADR-0078). Only meaningful when the
 	// gate held AND both the primary reader/writer implement the raw
 	// surfaces; negotiation probes both endpoints' server majors and
@@ -558,6 +563,16 @@ func (m *Migrator) phaseBuildCopyDeps(ctx context.Context, schema *ir.Schema, rr
 		// first (ADR-0113 scope); a no-op on PG, which never reparents into the
 		// silent-under-copy class.
 		reparentTracker: newReparentTracker(),
+	}
+	// Shared exported snapshot (perf research delta 1): pin every
+	// additional table/chunk reader to the run's one exported snapshot
+	// and let the copy pool release it at copy-phase end. nil sharedSnap
+	// (non-PG source / export fallback) leaves both fields nil — the
+	// factory-less openChunkReader path opens independent readers exactly
+	// as before.
+	if sharedSnap != nil {
+		parallelDeps.chunkReaderFactory = sharedSnap.readerFactory()
+		parallelDeps.releaseSharedSnapshot = sharedSnap.release
 	}
 
 	return parallelDeps

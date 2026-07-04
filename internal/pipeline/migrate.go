@@ -667,12 +667,31 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	}
 
 	// ---- 3-6. Schema apply (phase 1) → bulk copy → indexes → constraints.
-	rr, err := m.Source.OpenRowReader(ctx, m.SourceDSN)
-	if err != nil {
-		return wrapWithHint(PhaseConnect, markFailed(ctx, rc, state, ir.MigrationPhasePending,
-			fmt.Errorf("pipeline: open source row reader: %w", err)))
+	// Shared exported snapshot (perf research delta 1): when the SOURCE
+	// engine can export a plain-SQL shareable snapshot AND mint importer
+	// readers pinned to it (PG), the primary reader IS the exporting
+	// transaction's pinned reader and every additional table/chunk reader
+	// imports the same snapshot — ONE consistent MVCC view across both
+	// copy axes, the same ADR-0079 machinery the sync cold-start pins
+	// with. The snapshot is released at copy-phase end (see
+	// runBulkCopyTablePool), never held through the index/constraint
+	// phases. Engines without the surfaces (MySQL, SQLite) and export
+	// failures (hot-standby source) keep the independent per-connection
+	// readers — the documented ADR-0019 v1 window — unchanged.
+	var rr ir.RowReader
+	sharedSnap := m.openSharedSourceSnapshot(ctx)
+	if sharedSnap != nil {
+		defer sharedSnap.close()
+		rr = sharedSnap.snap.Rows
+	} else {
+		openedRR, err := m.Source.OpenRowReader(ctx, m.SourceDSN)
+		if err != nil {
+			return wrapWithHint(PhaseConnect, markFailed(ctx, rc, state, ir.MigrationPhasePending,
+				fmt.Errorf("pipeline: open source row reader: %w", err)))
+		}
+		defer closeIf(openedRR)
+		rr = openedRR
 	}
-	defer closeIf(rr)
 
 	// Resume / reset / populated-target gate: --resume rides
 	// TableProgress; --reset-target-data clears the target first;
@@ -692,8 +711,9 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	}
 
 	// Negotiate the raw-copy wire format (ADR-0078) and assemble the
-	// parallel bulk-copy dependency set.
-	parallelDeps := m.phaseBuildCopyDeps(ctx, schema, rr, rw, rawCopyOK, withinParallelism)
+	// parallel bulk-copy dependency set (including the shared-snapshot
+	// reader factory + copy-end release hook when engaged).
+	parallelDeps := m.phaseBuildCopyDeps(ctx, schema, rr, rw, rawCopyOK, withinParallelism, sharedSnap)
 
 	if err := runBulkCopyPhases(ctx, rc, &state, schema, rr, sw, rw, resuming, m.BulkBatchSize, parallelDeps, tableParallelism, m.Redactor, m.InjectShardColumn, m.UpfrontIndexes, m.AnalyzeAfter); err != nil {
 		return err
