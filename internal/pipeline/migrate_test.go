@@ -604,6 +604,14 @@ func (w *recordingSchemaWriter) CreateViews(context.Context, *ir.Schema) error {
 	return nil
 }
 
+// AnalyzeTable implements ir.TableAnalyzer so the --analyze-after phase
+// tests can assert its position. Existing exact-phase-list tests are
+// unaffected: the phase only runs when Migrator.AnalyzeAfter is set.
+func (w *recordingSchemaWriter) AnalyzeTable(_ context.Context, table *ir.Table) error {
+	*w.phaseLog = append(*w.phaseLog, "AnalyzeTable:"+table.Name)
+	return nil
+}
+
 type recordingRowReader struct{}
 
 func (*recordingRowReader) ReadRows(context.Context, *ir.Table) (<-chan ir.Row, error) {

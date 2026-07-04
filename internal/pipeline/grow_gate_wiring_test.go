@@ -65,6 +65,7 @@ func TestRunBulkCopyPhases_WiresGrowGateOntoTopLevelWriter(t *testing.T) {
 		nil,
 		ShardColumnSpec{},
 		false, // upfrontIndexes
+		false, // analyzeAfter
 	)
 	if err != nil {
 		t.Fatalf("runBulkCopyPhases(empty schema): %v", err)
@@ -88,7 +89,7 @@ func TestRunBulkCopyPhases_NilGrowGateIsNoOp(t *testing.T) {
 
 	err := runBulkCopyPhases(
 		ctx, resumeContext{}, &ir.MigrationState{}, &ir.Schema{},
-		noopRowReader{}, noopSchemaWriter{}, rw, false, 1000, deps, 1, nil, ShardColumnSpec{}, false,
+		noopRowReader{}, noopSchemaWriter{}, rw, false, 1000, deps, 1, nil, ShardColumnSpec{}, false, false,
 	)
 	if err != nil {
 		t.Fatalf("runBulkCopyPhases(nil gate): %v", err)

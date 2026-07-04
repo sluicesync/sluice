@@ -61,6 +61,7 @@ var (
 	_ ir.SchemaDeltaApplier      = (*SchemaWriter)(nil)
 	_ ir.SequencePrimer          = (*SchemaWriter)(nil)
 	_ ir.ShapeDeltaApplier       = (*SchemaWriter)(nil)
+	_ ir.TableAnalyzer           = (*SchemaWriter)(nil)
 	_ ir.TableIndexedNotifier    = (*SchemaWriter)(nil)
 
 	// RowReader optional surfaces.

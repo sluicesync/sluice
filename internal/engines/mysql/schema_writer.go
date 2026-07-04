@@ -490,6 +490,38 @@ func (w *SchemaWriter) CreateConstraints(ctx context.Context, s *ir.Schema) erro
 	return nil
 }
 
+// AnalyzeTable implements [ir.TableAnalyzer] — the migrate
+// orchestrator's opt-in `--analyze-after` post-migration statistics
+// refresh. MySQL's `ANALYZE TABLE` returns a RESULT SET and reports
+// per-table failures as rows (Msg_type='Error') rather than as a
+// statement error — running it through Exec would swallow those, a
+// silent-failure trap. So the statement is Queried and the result
+// scanned; any Error row surfaces loudly with the server's message.
+func (w *SchemaWriter) AnalyzeTable(ctx context.Context, table *ir.Table) error {
+	if table == nil {
+		return errors.New("mysql: AnalyzeTable: table is nil")
+	}
+	rows, err := w.db.QueryContext(ctx, "ANALYZE TABLE "+quoteIdent(table.Name))
+	if err != nil {
+		return fmt.Errorf("mysql: analyze table %q: %w", table.Name, err)
+	}
+	defer func() { _ = rows.Close() }()
+	// Result shape: Table | Op | Msg_type | Msg_text.
+	for rows.Next() {
+		var tbl, op, msgType, msgText string
+		if err := rows.Scan(&tbl, &op, &msgType, &msgText); err != nil {
+			return fmt.Errorf("mysql: analyze table %q: scan result: %w", table.Name, err)
+		}
+		if strings.EqualFold(msgType, "error") {
+			return fmt.Errorf("mysql: analyze table %q: %s", table.Name, msgText)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("mysql: analyze table %q: %w", table.Name, err)
+	}
+	return nil
+}
+
 // SyncIdentitySequences is a no-op on MySQL. InnoDB's AUTO_INCREMENT
 // counter is automatically advanced past explicit-value INSERTs at
 // transaction commit time, so a post-bulk-copy sync isn't needed —

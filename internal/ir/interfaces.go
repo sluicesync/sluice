@@ -1638,6 +1638,29 @@ type IndexBuildBudgetSetter interface {
 	SetIndexBuildBudget(connBudget int)
 }
 
+// TableAnalyzer is the OPTIONAL surface a [SchemaWriter] implements so
+// the migrate orchestrator's opt-in `--analyze-after` phase can refresh
+// the target's planner statistics per migrated table once constraints
+// and views are in place (perf research delta 4: a freshly bulk-loaded
+// table has stale/empty statistics, so the first post-cutover queries
+// plan badly until an autovacuum/background ANALYZE catches up —
+// pgcopydb runs a per-table VACUUM ANALYZE by default for the same
+// reason).
+//
+// The statement is engine-dialect-owned, exactly like every other DDL
+// surface: PG `ANALYZE <schema>.<table>`, MySQL `ANALYZE TABLE <table>`
+// (which reports failures in its result SET, not as an exec error — the
+// implementation must surface those loudly), SQLite `ANALYZE <table>`.
+//
+// The phase is ADVISORY: it runs after the migration's data and DDL are
+// durably complete, so the orchestrator WARNs per failed table and never
+// fails the run on an analyze error. Engines without the surface skip
+// the phase with one loud WARN (the operator asked for it explicitly).
+// All three shipping target engines implement it.
+type TableAnalyzer interface {
+	AnalyzeTable(ctx context.Context, table *Table) error
+}
+
 // TableScoper is the optional surface a [SchemaReader] can implement
 // to accept the operator's table filter *before* the schema scan, so
 // per-column type validation is scoped to the tables that will

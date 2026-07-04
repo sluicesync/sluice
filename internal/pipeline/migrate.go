@@ -494,6 +494,22 @@ type Migrator struct {
 	// (upfront) is correctly the opt-in; no inverted NoUpfront/Suppress name is
 	// needed.
 	UpfrontIndexes bool
+
+	// AnalyzeAfter, when true, runs a target-side per-table statistics
+	// refresh (PG ANALYZE / MySQL ANALYZE TABLE / SQLite ANALYZE, via the
+	// optional [ir.TableAnalyzer] surface) AFTER constraints and views
+	// complete (CLI: --analyze-after). A freshly bulk-loaded table has
+	// stale/empty planner statistics, so the first post-cutover queries
+	// plan badly until a background ANALYZE catches up; pgcopydb runs a
+	// per-table VACUUM ANALYZE by default for the same reason.
+	//
+	// The phase is ADVISORY and post-success: the migration's data and
+	// DDL are already durably complete when it runs, so a per-table
+	// analyze failure WARNs loudly (naming the table) and never fails the
+	// run, and no resume state is recorded for it. Default off — the
+	// pre-existing behaviour (leave statistics to the target's
+	// autovacuum/background machinery) is unchanged unless opted in.
+	AnalyzeAfter bool
 }
 
 // ShardColumnSpec carries the ADR-0048 Shape A discriminator
@@ -679,7 +695,7 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	// parallel bulk-copy dependency set.
 	parallelDeps := m.phaseBuildCopyDeps(ctx, schema, rr, rw, rawCopyOK, withinParallelism)
 
-	if err := runBulkCopyPhases(ctx, rc, &state, schema, rr, sw, rw, resuming, m.BulkBatchSize, parallelDeps, tableParallelism, m.Redactor, m.InjectShardColumn, m.UpfrontIndexes); err != nil {
+	if err := runBulkCopyPhases(ctx, rc, &state, schema, rr, sw, rw, resuming, m.BulkBatchSize, parallelDeps, tableParallelism, m.Redactor, m.InjectShardColumn, m.UpfrontIndexes, m.AnalyzeAfter); err != nil {
 		return err
 	}
 
@@ -1111,6 +1127,7 @@ func runBulkCopyPhases(
 	redactor *redact.Registry,
 	shard ShardColumnSpec,
 	upfrontIndexes bool,
+	analyzeAfter bool,
 ) error {
 	// ADR-0110 (v0.99.102): wire the run's coordinated grow-pause gate onto
 	// the TOP-LEVEL cold-copy writer here, centrally. The native-concurrent /
@@ -1353,6 +1370,15 @@ func runBulkCopyPhases(
 		return wrapWithHint(PhaseViews, markFailed(ctx, rc, *state, ir.MigrationPhaseViews, err))
 	}
 	slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseViews)))
+
+	// Advisory post-success phase: `--analyze-after` (perf research delta
+	// 4). Runs LAST — after constraints and views — so the refreshed
+	// statistics reflect the final table shape, and deliberately outside
+	// the resume state machine: it can never fail the run (per-table WARN
+	// only) and re-running it on a resume is a harmless re-ANALYZE.
+	if analyzeAfter {
+		runAnalyzeAfterPhase(ctx, schema, sw)
+	}
 
 	return nil
 }

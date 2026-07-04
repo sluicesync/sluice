@@ -24,6 +24,12 @@ type MigrationPlan struct {
 	TargetEngine string      `json:"target_engine"`
 	Views        int         `json:"views"`
 	Tables       []PlanTable `json:"tables"`
+
+	// AnalyzeAfter mirrors [Migrator.AnalyzeAfter] so a dry run shows the
+	// opt-in post-migration statistics-refresh phase in the plan. Omitted
+	// from the JSON when off (the default) — the plan payload is unchanged
+	// for operators who don't engage the flag.
+	AnalyzeAfter bool `json:"analyze_after,omitempty"`
 }
 
 // PlanTable is one table's dry-run summary. RowCount is -1 when the
@@ -51,6 +57,7 @@ func (m *Migrator) buildDryRunPlan(ctx context.Context, schema *ir.Schema) *Migr
 		TargetEngine: m.Target.Name(),
 		Views:        len(schema.Views),
 		Tables:       make([]PlanTable, 0, len(schema.Tables)),
+		AnalyzeAfter: m.AnalyzeAfter,
 	}
 	for _, t := range schema.Tables {
 		plan.Tables = append(plan.Tables, PlanTable{
@@ -101,6 +108,11 @@ func (m *Migrator) logPlan(ctx context.Context, plan *MigrationPlan) {
 			slog.Int("foreign_keys", t.ForeignKeys),
 			slog.Int64("row_count", t.RowCount),
 		)
+	}
+	if plan.AnalyzeAfter {
+		slog.InfoContext(ctx, "dry run: post-migration phase",
+			slog.String("phase", "analyze"),
+			slog.String("note", "--analyze-after: per-table target ANALYZE after constraints/views (advisory; failures WARN, never fail the run)"))
 	}
 	slog.InfoContext(ctx, "dry run: for full target DDL with translation notes and advisory hints, run `sluice schema preview` (ADR-0024)")
 }

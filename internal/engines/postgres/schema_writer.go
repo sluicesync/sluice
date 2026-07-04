@@ -997,6 +997,25 @@ func (w *SchemaWriter) syncOneIdentity(ctx context.Context, table *ir.Table, col
 	return nil
 }
 
+// AnalyzeTable implements [ir.TableAnalyzer] — the migrate
+// orchestrator's opt-in `--analyze-after` post-migration statistics
+// refresh. Plain per-table ANALYZE (not VACUUM ANALYZE: a freshly
+// bulk-loaded table has no dead tuples worth vacuuming; refreshing
+// planner statistics is the whole point). Qualified via the same
+// [SchemaWriter.qualifyTable] every other post-copy DDL emission uses,
+// so `--target-schema` analyzes the namespace the data actually landed
+// in.
+func (w *SchemaWriter) AnalyzeTable(ctx context.Context, table *ir.Table) error {
+	if table == nil {
+		return errors.New("postgres: AnalyzeTable: table is nil")
+	}
+	qualified := w.qualifyTable(table)
+	if _, err := w.db.ExecContext(ctx, "ANALYZE "+qualified); err != nil {
+		return fmt.Errorf("postgres: analyze %s: %w", qualified, err)
+	}
+	return nil
+}
+
 // emitOpts builds the [emitOpts] value to thread into every
 // emitter helper for this writer's lifetime. Centralised so
 // adding a new field (HasPostGIS → +TargetSchema → +EnabledExtensions)

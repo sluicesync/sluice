@@ -243,6 +243,8 @@ type MigrateCmd struct {
 
 	UpfrontIndexes bool `help:"Create secondary indexes before the bulk copy (maintained during load) instead of the default deferred post-copy build. Useful for large PlanetScale-MySQL targets where a deferred ADD INDEX can exceed the statement-time limit; trades slower load for no post-copy index build."`
 
+	AnalyzeAfter bool `help:"Refresh the target's planner statistics after the migration completes: one per-table ANALYZE (Postgres ANALYZE / MySQL ANALYZE TABLE / SQLite ANALYZE) once constraints and views are in place. A freshly bulk-loaded table has stale statistics, so the first post-cutover queries plan badly until autovacuum or a background ANALYZE catches up — this closes that window at cutover time (pgcopydb runs a per-table VACUUM ANALYZE by default for the same reason). Advisory: a per-table failure WARNs and never fails the migration. Default off."`
+
 	TargetSchema string `help:"Per-source target schema namespace (Postgres-only). When set, every emitted CREATE TABLE / ALTER TABLE / CREATE INDEX / CREATE TYPE prefixes the table reference with this schema. Use to land multiple sluice streams on the same target without table-name collisions (Shape B microservices → analytics warehouse, ADR-0031). The schema is auto-created on the target if it doesn't exist. The control table sluice_cdc_state stays in the DSN's default schema regardless. MySQL operators use a different --target DSN database instead — schemas and databases collapse on MySQL." placeholder:"NAME"`
 
 	EnablePGExtension []string `help:"Enable passthrough for a Postgres extension type (repeatable). Same-engine PG → PG passthrough preserves the source-native shape on the target. Cross-engine targets (MySQL) keep the loud-failure default except for hstore (→ JSON) and citext (→ VARCHAR with case-insensitive collation), which have built-in default translators. Each named extension must be installed on both source and target — sluice preflights via pg_extension before any data moves. Recognised: vector (pgvector), pg_trgm, hstore, citext. v1 shortlist per docs/research/pg-extensions-deployment-frequency.md. See ADR-0032." placeholder:"EXT"`
@@ -471,6 +473,7 @@ func (m *MigrateCmd) run(g *Globals, env *envelopeRun) error {
 		IndexBuildMem:         indexBuildMem,
 		IndexBuildParallelism: m.IndexBuildParallelism,
 		UpfrontIndexes:        m.UpfrontIndexes,
+		AnalyzeAfter:          m.AnalyzeAfter,
 		TargetSchema:          m.TargetSchema,
 		EnabledPGExtensions:   m.EnablePGExtension,
 		InjectShardColumn:     shardSpec,

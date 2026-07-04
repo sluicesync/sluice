@@ -302,5 +302,6 @@ func (s *Streamer) runColdStartParallel(
 		deps, tableParallelism,
 		s.Redactor, s.InjectShardColumn,
 		false, // upfrontIndexes: --upfront-indexes is a migrate-path flag; the sync cold-start keeps the deferred post-copy index build
+		false, // analyzeAfter: --analyze-after is a migrate-path flag; the sync target keeps receiving CDC writes, so its statistics churn regardless
 	)
 }

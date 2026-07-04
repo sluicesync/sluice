@@ -17,6 +17,7 @@ import (
 // target contracts (ADR-0134).
 var (
 	_ ir.SchemaWriter   = (*SchemaWriter)(nil)
+	_ ir.TableAnalyzer  = (*SchemaWriter)(nil)
 	_ ir.RowWriter      = (*RowWriter)(nil)
 	_ ir.TableTruncator = (*RowWriter)(nil)
 	_ ir.TableDropper   = (*RowWriter)(nil)
@@ -134,6 +135,21 @@ func (w *SchemaWriter) CreateIndexes(ctx context.Context, s *ir.Schema) error {
 				return fmt.Errorf("sqlite: create index %q on %q: %w", idx.Name, table.Name, err)
 			}
 		}
+	}
+	return nil
+}
+
+// AnalyzeTable implements [ir.TableAnalyzer] — the migrate
+// orchestrator's opt-in `--analyze-after` post-migration statistics
+// refresh. SQLite's per-table ANALYZE populates sqlite_stat1 for the
+// named table and its indexes; the query planner reads it on the next
+// statement.
+func (w *SchemaWriter) AnalyzeTable(ctx context.Context, table *ir.Table) error {
+	if table == nil {
+		return errors.New("sqlite: AnalyzeTable: table is nil")
+	}
+	if _, err := w.db.ExecContext(ctx, "ANALYZE "+quoteIdent(table.Name)); err != nil {
+		return fmt.Errorf("sqlite: analyze %q: %w", table.Name, err)
 	}
 	return nil
 }

@@ -76,6 +76,7 @@ var (
 	_ ir.SchemaSetter            = (*SchemaWriter)(nil)
 	_ ir.SequencePrimer          = (*SchemaWriter)(nil)
 	_ ir.ShapeDeltaApplier       = (*SchemaWriter)(nil)
+	_ ir.TableAnalyzer           = (*SchemaWriter)(nil)
 	_ ir.TableIndexedNotifier    = (*SchemaWriter)(nil)
 
 	// RowReader optional surfaces (RawCopy* is the ADR-0043 raw-COPY
