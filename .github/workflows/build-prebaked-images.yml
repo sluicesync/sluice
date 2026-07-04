@@ -113,7 +113,10 @@ jobs:
     # comfortably inside the same budget.
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      # SHA-pinned (not @v7): this workflow holds packages:write, so a
+      # re-pointed action tag would run arbitrary code with GHCR push
+      # rights — same supply-chain rationale as release.yml's pins.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # GHCR_TOKEN is the GITHUB_TOKEN piped through to the script
       # (the script accepts GHCR_TOKEN or GITHUB_TOKEN). GHCR_USER is

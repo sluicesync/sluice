@@ -75,7 +75,11 @@ fmt-check: ## Verify formatting without writing changes (exits non-zero if any f
 		exit 1; \
 	fi
 
-pre-commit: fmt-check vet vet-tags lint test ## Run the full local gate (mirrors CI: format, vet, tags-vet, lint, fast tests)
+coverage-guards: ## Run CI Lint's test-coverage guards (shard + PostGIS run-name)
+	sh scripts/check-shard-coverage.sh
+	sh scripts/check-postgis-coverage.sh
+
+pre-commit: fmt-check vet vet-tags coverage-guards lint test ## Run the full local gate (mirrors CI: format, vet, tags-vet, coverage guards, lint, fast tests)
 	@echo "OK — ready to commit."
 
 tidy: ## go mod tidy

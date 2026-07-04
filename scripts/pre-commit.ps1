@@ -72,6 +72,29 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
+# ---- CI coverage guards ----
+# These two run in CI's Lint job; without them here, adding
+# integration-tagged tests in an uncovered package (or a postgis test
+# whose name escapes the job's -run filter) passes the full local gate
+# and only fails in CI. They are POSIX-sh scripts; Git for Windows
+# ships sh.exe, so soft-skip only if sh is genuinely absent (CI remains
+# the source of truth, same policy as the golangci-lint soft-skip).
+$sh = Get-Command sh -ErrorAction SilentlyContinue
+if ($sh) {
+    & sh scripts/check-shard-coverage.sh
+    if ($LASTEXITCODE -ne 0) {
+        Red "check-shard-coverage failed (integration tests outside every CI shard)."
+        exit 1
+    }
+    & sh scripts/check-postgis-coverage.sh
+    if ($LASTEXITCODE -ne 0) {
+        Red "check-postgis-coverage failed (postgis test would never run in CI)."
+        exit 1
+    }
+} else {
+    Write-Host "sh not found; skipping coverage guards (they still run in CI's Lint job)" -ForegroundColor Yellow
+}
+
 # ---- go test (fast, no DB) ----
 # -race is preferred but requires cgo. On Windows without a C compiler
 # (the default for most Go installs) CGO_ENABLED=0, so -race won't

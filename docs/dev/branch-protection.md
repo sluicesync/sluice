@@ -21,6 +21,7 @@ Navigate to **Settings → Branches → Add rule** (or **Branch protection rules
   - `Test (ubuntu-latest)`
   - `Integration`
   - `Integration (PostGIS)` — added v0.29.0; gates the cross-engine geometry round-trip suite
+  - `Integration (vstream)` — added after Bug 125 (CRITICAL silent-loss) shipped without VStream coverage; see the warning in `ci.yml` before touching this job
   - `Lint`
   - `Build (ubuntu-latest)`
 
@@ -62,6 +63,7 @@ gh api -X PUT repos/sluicesync/sluice/branches/main/protection \
       "Test (ubuntu-latest)",
       "Integration",
       "Integration (PostGIS)",
+      "Integration (vstream)",
       "Lint",
       "Build (ubuntu-latest)"
     ]
