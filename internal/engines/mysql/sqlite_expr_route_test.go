@@ -224,6 +224,12 @@ func TestSQLiteRoute_DoubleQuoted_RefusedNamed(t *testing.T) {
 		t.Error(`emitColumnDef("t", gencol a || "C:\temp") err=nil; want a LOUD double-quoted refusal`)
 	} else if !strings.Contains(err.Error(), "double-quoted") || !strings.Contains(err.Error(), "g_dq") {
 		t.Errorf("gencol refusal = %v; want it to name the double-quoted token and the column", err)
+	} else if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeExprBackslashLiteral {
+		// Bug 176: the DQS refusal fired loudly but exited 1 uncoded while
+		// docs/operator/error-codes.md declares this code covers the
+		// double-quoted-token shape. The refusal must carry the code (and
+		// therefore refusal-class exit 3 + envelope status "refused").
+		t.Errorf("gencol DQS refusal carries code %v ok=%v; want %s (Bug 176)", ce, ok, sluicecode.CodeExprBackslashLiteral)
 	}
 
 	chk := &ir.CheckConstraint{Name: "ck_dq", Expr: `a <> "x\"`, ExprDialect: "sqlite"}

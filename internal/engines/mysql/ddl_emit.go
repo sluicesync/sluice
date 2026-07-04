@@ -1672,18 +1672,26 @@ func refuseNonPortableSQLiteExprMySQL(kind, name, expr, dialect string) error {
 	// content (an intended identifier becomes a string, vacating e.g. a
 	// CHECK; a trailing backslash swallows the closing quote).
 	if translate.SQLiteExprHasDoubleQuotedToken(expr) {
-		return fmt.Errorf(
-			"refuse loudly: %s %q carries SQLite expression %q containing a double-quoted "+
-				"token. SQLite reads a double-quoted token as an identifier (or, via the "+
-				"double-quoted-string misfeature, a string); MySQL under its default sql_mode "+
-				"(no ANSI_QUOTES) reads it as a string literal with backslash-escape semantics "+
-				"— and the expression is stored in the target schema and re-parsed under "+
-				"future sessions' sql_mode, which sluice does not control — so emitting it "+
-				"would silently change its meaning on the target. Operator recovery: rewrite "+
-				"the expression on the SQLite source using single quotes for strings (or bare "+
-				"names for identifiers), or drop the %s and re-create an equivalent one on the "+
-				"MySQL target post-migration",
-			kind, name, expr, kind,
+		// Same SLUICE-E code as the backslash shape above: the docs table
+		// (docs/operator/error-codes.md) shipped in v0.99.175 declaring the
+		// code covers "(or a double-quoted token)" — this wrap honors that
+		// contract (Bug 176: the refusal fired loudly but exited 1 uncoded).
+		return sluicecode.Wrap(
+			sluicecode.CodeExprBackslashLiteral,
+			"rewrite the expression on the SQLite source using single quotes for strings (or bare names for identifiers), or drop the constraint and re-create an equivalent one on the MySQL target post-migration",
+			fmt.Errorf(
+				"refuse loudly: %s %q carries SQLite expression %q containing a double-quoted "+
+					"token. SQLite reads a double-quoted token as an identifier (or, via the "+
+					"double-quoted-string misfeature, a string); MySQL under its default sql_mode "+
+					"(no ANSI_QUOTES) reads it as a string literal with backslash-escape semantics "+
+					"— and the expression is stored in the target schema and re-parsed under "+
+					"future sessions' sql_mode, which sluice does not control — so emitting it "+
+					"would silently change its meaning on the target. Operator recovery: rewrite "+
+					"the expression on the SQLite source using single quotes for strings (or bare "+
+					"names for identifiers), or drop the %s and re-create an equivalent one on the "+
+					"MySQL target post-migration",
+				kind, name, expr, kind,
+			),
 		)
 	}
 	return fmt.Errorf(
