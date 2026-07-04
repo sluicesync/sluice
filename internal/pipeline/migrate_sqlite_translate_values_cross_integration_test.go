@@ -205,12 +205,11 @@ func TestMigrate_SQLiteBackslashLiteral_RefusedToMySQL(t *testing.T) {
 	assertNamedRefusal(t, target, "gencol", "bs_gen", `a || 'C:\temp'`, "backslash", seedSQLiteGenCol)
 	// CHECK: the trailing-\ quote-swallow shape (satisfied by the seed row).
 	assertNamedRefusal(t, target, "CHECK", "bs_chk", `a <> 'x\'`, "backslash", seedSQLiteCheck)
-	// DEFAULT expression: the verbatim-carry boundary that never routes
-	// through the translator. The body must NOT begin with a quote: PRAGMA
-	// table_info strips the outer parens, and the SQLite reader's
-	// parseDefault classifies a quote-delimited dflt_value as a
-	// DefaultLiteral, which takes the quoteSQLString path instead of the
-	// expression carry this test pins.
+	// DEFAULT expression: the expression-carry boundary (portable bodies
+	// translate; this one is refused by the translator's backslash policy
+	// and so would fall to the verbatim carry — the refusal must fire
+	// first). PRAGMA table_info strips the outer parens, so the reader
+	// sees `coalesce(NULL, 'C:\temp')`.
 	assertNamedRefusal(t, target, "DEFAULT", "bs_def", `(coalesce(NULL, 'C:\temp'))`, "backslash", seedSQLiteDefaultExpr)
 }
 
@@ -219,9 +218,11 @@ func TestMigrate_SQLiteBackslashLiteral_RefusedToMySQL(t *testing.T) {
 // or the double-quoted-string misfeature to SQLite, but a STRING LITERAL
 // with escape semantics to MySQL's default sql_mode — must abort LOUDLY on a
 // MySQL target with an error naming the double-quoted token. (No DEFAULT
-// cell: SQLite itself rejects a double-quoted token in DEFAULT position. The
-// index cell WARN-skips rather than aborting and is pinned at unit level in
-// the mysql package.)
+// cell here: SQLite rejects a double-quoted token inside a parenthesised
+// DEFAULT expression as non-constant; the bare literal-value form it DOES
+// accept (`DEFAULT "a\b"`) is refused by the DEFAULT-position sweep and
+// pinned at unit level in the mysql package, as is the WARN-skipping index
+// cell.)
 func TestMigrate_SQLiteDoubleQuoted_RefusedToMySQL(t *testing.T) {
 	_, target, cleanup := startMySQL(t)
 	defer cleanup()
@@ -336,6 +337,116 @@ func TestMigrate_SQLiteBackslashDefaultLiteral_ToMySQL(t *testing.T) {
 	}
 	if dDflt.String != `C:\temp` || wDflt.String != `trail\` {
 		t.Errorf("target COLUMN_DEFAULTs = (%q, %q); want (C:\\temp, trail\\) — the stored default must be byte-identical", dDflt.String, wDflt.String)
+	}
+}
+
+// TestMigrate_SQLiteExpressionDefault_ToPostgres pins the parseDefault
+// misclassification fix end-to-end into PG. PRAGMA table_info strips the
+// outer parens off `DEFAULT ('a' || 'b')`, and pre-fix the reader's
+// endpoint check swallowed the reported `'a' || 'b'` as the silently WRONG
+// DefaultLiteral `a' || 'b` — which landed on the target as a mangled
+// string default with exit 0. Post-fix it classifies as a DefaultExpression
+// and the PG writer translates it through the SQLite→PG allowlist. Ground
+// truth is a TARGET-side DEFAULT-applied insert: the value must be 'ab',
+// and the stored default must not carry the mangled doubled-quote shape.
+func TestMigrate_SQLiteExpressionDefault_ToPostgres(t *testing.T) {
+	src := seedSQLiteDefaultExpr(t, "exdflt", `('a' || 'b')`)
+	_, pgTarget, cleanup := startPostgres(t)
+	defer cleanup()
+	migrateSQLite(t, "postgres", src, pgTarget)
+
+	pg, err := sql.Open("pgx", pgTarget)
+	if err != nil {
+		t.Fatalf("open pg: %v", err)
+	}
+	defer func() { _ = pg.Close() }()
+
+	// Copied row (SQLite applied the default at seed time).
+	assertRowsEqual(t, "exdflt copied row",
+		[][]string{{"ab"}},
+		readRowsAsStrings(t, pg, `SELECT d FROM exdflt WHERE id = 1`, 1))
+	// Target-side DEFAULT application: the re-created default must EVALUATE.
+	if _, err := pg.ExecContext(ctx2min(t), `INSERT INTO exdflt (id) VALUES (2)`); err != nil {
+		t.Fatalf("insert DEFAULT-applied row on target: %v", err)
+	}
+	assertRowsEqual(t, "exdflt target DEFAULT-applied row",
+		[][]string{{"ab"}},
+		readRowsAsStrings(t, pg, `SELECT d FROM exdflt WHERE id = 2`, 1))
+	// The pre-fix mangled-literal shape must be impossible in the stored
+	// default (it would surface as a doubled-quote literal body).
+	var colDefault sql.NullString
+	if err := pg.QueryRowContext(ctx2min(t), `SELECT column_default FROM information_schema.columns
+		WHERE table_name = 'exdflt' AND column_name = 'd'`).Scan(&colDefault); err != nil {
+		t.Fatalf("read target column_default: %v", err)
+	}
+	if !colDefault.Valid || colDefault.String == "" {
+		t.Error("target column_default is empty; want the translated concat expression (not a warn-drop)")
+	}
+	if strings.Contains(colDefault.String, `a'' || ''b`) {
+		t.Errorf("target column_default = %q; carries the pre-fix mangled literal", colDefault.String)
+	}
+}
+
+// TestMigrate_SQLiteExpressionDefault_ToMySQL is the MySQL half — doubly
+// load-bearing there: even carried as an expression, a verbatim `||` means
+// LOGICAL OR under MySQL's default sql_mode (the default would silently
+// evaluate to 0), so the writer must land CONCAT. Ground truth is a
+// target-side DEFAULT-applied insert evaluating to 'ab'. The column rides a
+// varchar type-override like TestMigrate_SQLiteBackslashDefaultLiteral_ToMySQL:
+// SQLite's affinity mapping lands the declared VARCHAR at ir.Text, and MySQL
+// forbids DEFAULT on TEXT (the writer warn-suppresses it), so without the
+// override there is no target DEFAULT to pin.
+func TestMigrate_SQLiteExpressionDefault_ToMySQL(t *testing.T) {
+	src := seedSQLiteDefaultExpr(t, "exdflt", `('a' || 'b')`)
+	_, myTarget, cleanup := startMySQL(t)
+	defer cleanup()
+
+	sqliteEng, ok := engines.Get("sqlite")
+	if !ok {
+		t.Fatal("sqlite engine not registered")
+	}
+	targetEng, ok := engines.Get("mysql")
+	if !ok {
+		t.Fatal("mysql engine not registered")
+	}
+	mig := &Migrator{
+		Source: sqliteEng, Target: targetEng, SourceDSN: src, TargetDSN: myTarget,
+		MigrationID: "exdflt",
+		Mappings: []config.Mapping{
+			{Table: "exdflt", Column: "d", TargetType: "varchar"},
+		},
+	}
+	if err := mig.Run(ctx2min(t)); err != nil {
+		t.Fatalf("Migrator.Run (SQLite→MySQL expression default): %v", err)
+	}
+
+	my, err := sql.Open("mysql", myTarget)
+	if err != nil {
+		t.Fatalf("open mysql: %v", err)
+	}
+	defer func() { _ = my.Close() }()
+
+	assertRowsEqual(t, "exdflt copied row",
+		[][]string{{"ab"}},
+		readRowsAsStrings(t, my, `SELECT d FROM exdflt WHERE id = 1`, 1))
+	if _, err := my.ExecContext(ctx2min(t), `INSERT INTO exdflt (id) VALUES (2)`); err != nil {
+		t.Fatalf("insert DEFAULT-applied row on target: %v", err)
+	}
+	assertRowsEqual(t, "exdflt target DEFAULT-applied row",
+		[][]string{{"ab"}},
+		readRowsAsStrings(t, my, `SELECT d FROM exdflt WHERE id = 2`, 1))
+	// Neither the mangled literal nor a raw `||` (logical OR) may survive in
+	// the stored default.
+	var colDefault sql.NullString
+	if err := my.QueryRowContext(ctx2min(t), `SELECT COLUMN_DEFAULT FROM information_schema.columns
+		WHERE table_schema = DATABASE() AND table_name = 'exdflt' AND column_name = 'd'`).Scan(&colDefault); err != nil {
+		t.Fatalf("read target COLUMN_DEFAULT: %v", err)
+	}
+	if strings.Contains(colDefault.String, `||`) {
+		t.Errorf("target COLUMN_DEFAULT = %q; a raw || would be MySQL logical OR (silently 0)", colDefault.String)
+	}
+	if strings.Contains(colDefault.String, `a' || 'b`) {
+		t.Errorf("target COLUMN_DEFAULT = %q; carries the pre-fix mangled literal", colDefault.String)
 	}
 }
 

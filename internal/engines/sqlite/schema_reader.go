@@ -504,31 +504,44 @@ func parseFKAction(s string) ir.FKAction {
 }
 
 // parseDefault classifies a PRAGMA table_info.dflt_value into the IR
-// DefaultValue sum. SQLite stores the default's raw SQL text:
+// DefaultValue sum. SQLite stores the default's raw SQL text, with one
+// surface trap (probed on modernc): PRAGMA reports a parenthesised
+// expression default with the OUTER parens stripped, so `DEFAULT
+// ('a' || 'b')` arrives as `'a' || 'b'` — a string that merely starts
+// and ends with a quote. String-literal classification therefore lexes
+// the whole text for well-formedness ([singleQuotedLiteral]) instead of
+// endpoint-checking it; the pre-fix endpoint check swallowed that
+// expression as the silently WRONG literal `a' || 'b`.
 //
 //   - NULL / absent / the NULL keyword → DefaultNone (no meaningful default)
-//   - 'text' string literal → DefaultLiteral with quotes stripped/unescaped
+//   - well-formed 'text' string literal → DefaultLiteral with quotes
+//     stripped and the doubled-quote escape unescaped
 //   - numeric literal → DefaultLiteral carrying the digits verbatim
-//   - anything else (CURRENT_TIMESTAMP, function calls, (expr), x'..') →
-//     DefaultExpression tagged dialect "sqlite"
+//   - anything else (CURRENT_TIMESTAMP, function calls, residual (expr)
+//     nesting, x'..' blobs, TRUE/FALSE, 0x hex, the double-quoted-string
+//     misfeature) → DefaultExpression tagged dialect "sqlite"
 //
 // A DefaultExpression tagged "sqlite" is handled by the target writer at
-// CREATE TABLE time. The Postgres writer (D1/SQLite robustness Chunk A)
-// translates the small portable set of "current instant" spellings
-// (datetime('now')/CURRENT_TIMESTAMP → CURRENT_TIMESTAMP, date('now')/
-// CURRENT_DATE, time('now')/CURRENT_TIME) and DROPS any other SQLite-only
-// expression (julianday(...), strftime(...), the double-quoted-string
-// misfeature, …) with a LOUD per-column warn naming the table+column —
-// never emitted verbatim (which aborted the whole migration at CREATE
-// TABLE) and never silently dropped. The MySQL target still emits the
-// expression verbatim and relies on its parser rejecting a non-portable
-// default loudly — EXCEPT a body whose string literal contains a
-// backslash, which MySQL's parser would ACCEPT and silently reinterpret
-// (default sql_mode treats \ as an escape introducer); the MySQL writer
-// refuses those pre-emit (SEC-1, refuseBackslashSQLiteDefaultMySQL).
-// (A dropped DEFAULT is schema metadata, NOT data loss:
-// DEFAULTs affect only post-migration inserts, never the migrated rows,
-// which are inserted with explicit values.)
+// CREATE TABLE time. The Postgres writer (D1/SQLite robustness Chunk A +
+// the ADR-0133 translator) translates the portable subset — the "current
+// instant" spellings (datetime('now')/CURRENT_TIMESTAMP → CURRENT_TIMESTAMP,
+// date('now')/CURRENT_DATE, time('now')/CURRENT_TIME) plus the shared
+// SQLite→PG expression allowlist ('a' || 'b', arithmetic, coalesce, …) —
+// and DROPS any other SQLite-only expression (julianday(...),
+// strftime(...), the double-quoted-string misfeature, …) with a LOUD
+// per-column warn naming the table+column — never emitted verbatim (which
+// aborted the whole migration at CREATE TABLE) and never silently dropped.
+// The MySQL target routes the portable subset through the SQLite→MySQL
+// translator (`||` means concat on SQLite but LOGICAL OR under MySQL's
+// default sql_mode, so verbatim emission would compute a silently wrong
+// value) and emits the rest verbatim, relying on MySQL's parser rejecting
+// a non-portable default loudly — EXCEPT a body whose string literal
+// contains a backslash, which MySQL's parser would ACCEPT and silently
+// reinterpret (default sql_mode treats \ as an escape introducer); the
+// MySQL writer refuses those pre-emit (SEC-1,
+// refuseBackslashSQLiteDefaultMySQL). (A dropped DEFAULT is schema
+// metadata, NOT data loss: DEFAULTs affect only post-migration inserts,
+// never the migrated rows, which are inserted with explicit values.)
 func parseDefault(dflt sql.NullString) ir.DefaultValue {
 	if !dflt.Valid {
 		return ir.DefaultNone{}
@@ -537,14 +550,47 @@ func parseDefault(dflt sql.NullString) ir.DefaultValue {
 	if s == "" || strings.EqualFold(s, "NULL") {
 		return ir.DefaultNone{}
 	}
-	if len(s) >= 2 && s[0] == '\'' && s[len(s)-1] == '\'' {
-		inner := strings.ReplaceAll(s[1:len(s)-1], "''", "'")
+	if inner, ok := singleQuotedLiteral(s); ok {
 		return ir.DefaultLiteral{Value: inner}
 	}
 	if isNumericLiteral(s) {
 		return ir.DefaultLiteral{Value: s}
 	}
 	return ir.DefaultExpression{Expr: s, Dialect: "sqlite"}
+}
+
+// singleQuotedLiteral reports whether s is EXACTLY one well-formed
+// single-quoted SQL string literal — an opening ', a body in which every
+// interior ' belongs to a doubled-quote escape pair, a closing ', and
+// nothing after it — and returns the unescaped body. An undoubled quote
+// followed by more text means s is an expression that merely BEGINS with a
+// string literal (`'a' || 'b'`), and an unterminated tail (a trailing
+// escape pair with no terminator) means s is not a literal at all; both
+// must classify as expressions, never be endpoint-guessed into a mangled
+// literal.
+func singleQuotedLiteral(s string) (string, bool) {
+	if len(s) < 2 || s[0] != '\'' {
+		return "", false
+	}
+	var b strings.Builder
+	for i := 1; i < len(s); i++ {
+		if s[i] != '\'' {
+			b.WriteByte(s[i])
+			continue
+		}
+		if i+1 < len(s) && s[i+1] == '\'' {
+			b.WriteByte('\'') // doubled '' escape → one literal quote
+			i++
+			continue
+		}
+		// Undoubled quote: the literal's terminator. Well-formed only
+		// when it is the final byte; residue after it means expression.
+		if i == len(s)-1 {
+			return b.String(), true
+		}
+		return "", false
+	}
+	return "", false // ran off the end without a terminator
 }
 
 // isNumericLiteral reports whether s is a plain integer or float literal

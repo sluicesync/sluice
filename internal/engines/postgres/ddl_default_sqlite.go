@@ -9,8 +9,9 @@ import "strings"
 // tag the SQLite engine stamps on every non-literal column DEFAULT (see
 // internal/engines/sqlite/schema_reader.go::parseDefault). The PG writer
 // recognises it on the DEFAULT path to translate the small portable set
-// below and to loud-drop everything else — it is NEVER fed through the
-// MySQL→PG expression translator (that path is gated on
+// below, then the shared SQLite→PG translator's allowlist (ADR-0133), and
+// to loud-drop everything else — it is NEVER fed through the MySQL→PG
+// expression translator (that path is gated on
 // translatableSourceDialect == "mysql").
 const sqliteSourceDialect = "sqlite"
 

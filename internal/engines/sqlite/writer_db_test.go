@@ -396,3 +396,90 @@ func assertValidSQLite(t *testing.T, path, table string, wantRows int) {
 		t.Errorf("produced db row count = %d; want %d", n, wantRows)
 	}
 }
+
+// TestWriterExpressionDefault_RoundTrip pins the writer half of the DEFAULT
+// classification fix on the real driver: SQLite's DEFAULT grammar accepts an
+// expression body ONLY parenthesised (`DEFAULT 'a' || 'b'` and `DEFAULT
+// datetime('now')` are syntax errors — probed on modernc), and the IR
+// carries expression bodies with PRAGMA's outer parens already stripped, so
+// the writer must re-wrap. Ground truth is INSERT DEFAULT VALUES: the
+// re-created default must EVALUATE ('ab'), and a re-read must classify it
+// back to the same IR expression (reader↔writer round trip).
+func TestWriterExpressionDefault_RoundTrip(t *testing.T) {
+	ctx := context.Background()
+	eng := Engine{}
+	dsn := filepath.Join(t.TempDir(), "dflt.db")
+
+	tbl := &ir.Table{
+		Name: "d",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{
+				Name: "cat", Type: ir.Text{Size: ir.TextLong}, Nullable: true,
+				Default: ir.DefaultExpression{Expr: `'a' || 'b'`, Dialect: "sqlite"},
+			},
+			{
+				Name: "ts", Type: ir.Text{Size: ir.TextLong}, Nullable: true,
+				Default: ir.DefaultExpression{Expr: `CURRENT_TIMESTAMP`, Dialect: "sqlite"},
+			},
+			{
+				Name: "lit", Type: ir.Text{Size: ir.TextLong}, Nullable: true,
+				Default: ir.DefaultLiteral{Value: "plain"},
+			},
+		},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}, Unique: true},
+	}
+
+	sw, err := eng.OpenSchemaWriter(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenSchemaWriter: %v", err)
+	}
+	if err := sw.CreateTablesWithoutConstraints(ctx, &ir.Schema{Tables: []*ir.Table{tbl}}); err != nil {
+		t.Fatalf("CreateTables (expression DEFAULT must be re-parenthesised): %v", err)
+	}
+	_ = sw.(*SchemaWriter).Close()
+
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.ExecContext(ctx, `INSERT INTO d (id) VALUES (1)`); err != nil {
+		t.Fatalf("insert DEFAULT-applied row: %v", err)
+	}
+	var cat, ts, lit string
+	if err := db.QueryRowContext(ctx, `SELECT cat, ts, lit FROM d WHERE id = 1`).Scan(&cat, &ts, &lit); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if cat != "ab" {
+		t.Errorf("cat DEFAULT evaluated to %q; want \"ab\"", cat)
+	}
+	if ts == "" {
+		t.Errorf("ts DEFAULT (CURRENT_TIMESTAMP) evaluated empty; want a timestamp")
+	}
+	if lit != "plain" {
+		t.Errorf("lit DEFAULT evaluated to %q; want \"plain\"", lit)
+	}
+
+	// Reader↔writer round trip: re-reading the written schema must classify
+	// the defaults back to the same IR shapes (PRAGMA strips the wrap parens).
+	sr, err := eng.OpenSchemaReader(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenSchemaReader: %v", err)
+	}
+	defer func() { _ = sr.(*SchemaReader).Close() }()
+	schema, err := sr.ReadSchema(ctx)
+	if err != nil {
+		t.Fatalf("ReadSchema: %v", err)
+	}
+	got := tableByName(schema, "d")
+	if got == nil {
+		t.Fatal("table d not re-read")
+	}
+	if d := columnByName(got, "cat").Default; d != (ir.DefaultExpression{Expr: `'a' || 'b'`, Dialect: "sqlite"}) {
+		t.Errorf("re-read cat Default = %#v; want the concat expression back", d)
+	}
+	if d := columnByName(got, "lit").Default; d != (ir.DefaultLiteral{Value: "plain"}) {
+		t.Errorf("re-read lit Default = %#v; want DefaultLiteral plain", d)
+	}
+}

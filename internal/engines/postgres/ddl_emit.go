@@ -420,20 +420,34 @@ func translateDefaultExpr(table *ir.Table, c *ir.Column, d ir.DefaultExpression,
 	// SQLite-source DEFAULT (D1/SQLite migration robustness, Chunk A). A
 	// small, well-known set of portable SQLite "current instant" spellings
 	// (datetime('now'), CURRENT_TIMESTAMP, …) translate to the matching PG
-	// keyword; any other SQLite-only expression (julianday/strftime/
-	// unixepoch/arbitrary, the double-quoted-string misfeature like
-	// `"draft"`, …) is DROPPED with a loud warn rather than emitted
-	// verbatim. Emitting verbatim aborted the ENTIRE migration at CREATE
-	// TABLE — e.g. a Flyway/Goose history table's `installed_on TEXT NOT
-	// NULL DEFAULT (datetime('now'))` failed PG with `function
-	// datetime(unknown) does not exist`, and because create-tables failed
-	// NO data loaded for ANY table. A DEFAULT is non-data metadata (it
-	// only affects future inserts, never the migrated rows, which carry
-	// explicit values), so dropping it with a named, loud warning is far
-	// better than failing the whole migration — loud, never silent.
+	// keyword; the shared SQLite→PG translator (ADR-0133) then covers the
+	// portable general subset (`'a' || 'b'`, arithmetic, coalesce, …); any
+	// other SQLite-only expression (julianday/strftime/unixepoch/arbitrary,
+	// the double-quoted-string misfeature like `"draft"`, …) is DROPPED
+	// with a loud warn rather than emitted verbatim. Emitting verbatim
+	// aborted the ENTIRE migration at CREATE TABLE — e.g. a Flyway/Goose
+	// history table's `installed_on TEXT NOT NULL DEFAULT
+	// (datetime('now'))` failed PG with `function datetime(unknown) does
+	// not exist`, and because create-tables failed NO data loaded for ANY
+	// table. A DEFAULT is non-data metadata (it only affects future
+	// inserts, never the migrated rows, which carry explicit values), so
+	// dropping it with a named, loud warning is far better than failing
+	// the whole migration — loud, never silent.
 	if d.Dialect == sqliteSourceDialect {
 		if pg, ok := translateSQLiteDefaultExpr(d.Expr); ok {
 			return pg, true
+		}
+		// Double-quoted tokens are held back from the translator here: in
+		// DEFAULT position (constant expressions only — SQLite allows no
+		// column references there) a `"…"` token is always the
+		// double-quoted-string MISFEATURE, but the translator's PG policy
+		// carries it as an IDENTIFIER, which PG rejects in a DEFAULT
+		// ("cannot use column reference in default expression") — aborting
+		// the whole migration. Those keep the loud warn-drop below.
+		if !translate.SQLiteExprHasDoubleQuotedToken(d.Expr) {
+			if pg, ok := translate.SQLiteExprToPG(d.Expr); ok {
+				return requotePGReservedIdents(pg), true
+			}
 		}
 		slog.Warn(
 			fmt.Sprintf(

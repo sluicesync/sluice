@@ -201,3 +201,25 @@ func TestEmitCreateView(t *testing.T) {
 		t.Errorf("emitCreateView = %q", got)
 	}
 }
+
+// TestWrapSQLiteExpressionDefault pins the DEFAULT-body re-parenthesisation:
+// SQLite's grammar accepts an expression DEFAULT only parenthesised, and the
+// IR carries bodies with PRAGMA's outer parens stripped — every bare family
+// wraps, an already-wrapped body passes through.
+func TestWrapSQLiteExpressionDefault(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{`'a' || 'b'`, `('a' || 'b')`},
+		{`datetime('now')`, `(datetime('now'))`},
+		{`CURRENT_TIMESTAMP`, `(CURRENT_TIMESTAMP)`},
+		{`x'00ff'`, `(x'00ff')`},
+		{`TRUE`, `(TRUE)`},
+		{`1+2`, `(1+2)`},
+		{`('x')`, `('x')`}, // already wrapped — pass through
+		{`(datetime('now'))`, `(datetime('now'))`},
+	}
+	for _, tc := range cases {
+		if got := wrapSQLiteExpressionDefault(tc.in); got != tc.want {
+			t.Errorf("wrapSQLiteExpressionDefault(%q) = %q; want %q", tc.in, got, tc.want)
+		}
+	}
+}

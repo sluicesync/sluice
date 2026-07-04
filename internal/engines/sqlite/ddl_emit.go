@@ -186,9 +186,28 @@ func emitDefault(d ir.DefaultValue) (string, bool) {
 		if v.Expr == "" {
 			return "", false
 		}
-		return v.Expr, true
+		return wrapSQLiteExpressionDefault(v.Expr), true
 	}
 	return "", false
+}
+
+// wrapSQLiteExpressionDefault re-parenthesises an expression DEFAULT body.
+// SQLite's DEFAULT grammar accepts only a literal value, a signed number,
+// or a PARENTHESISED expression — a bare `DEFAULT datetime('now')` or
+// `DEFAULT 'a' || 'b'` is a syntax error (probed on modernc). The IR
+// carries expression bodies with PRAGMA's outer parens already stripped,
+// so wrap unless the body already leads with one. The prefix/suffix check
+// is naive (same shape as the MySQL writer's wrapMySQLExpressionDefault):
+// a pathological `(a)||(b)` body emits unwrapped and fails LOUDLY at
+// CREATE TABLE rather than being guessed at; wrapping is uniformly valid
+// for every bare shape the reader produces (keywords, blobs, functions —
+// all probed), so no bare-keyword carve-out is needed.
+func wrapSQLiteExpressionDefault(expr string) string {
+	trimmed := strings.TrimSpace(expr)
+	if strings.HasPrefix(trimmed, "(") && strings.HasSuffix(trimmed, ")") {
+		return expr
+	}
+	return "(" + trimmed + ")"
 }
 
 // emitCheckConstraint renders an inline CHECK clause for the CREATE TABLE

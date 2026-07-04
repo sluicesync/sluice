@@ -1397,3 +1397,62 @@ func TestD1RowReader_TextVerbatim(t *testing.T) {
 		t.Errorf("unicode text = %q; want %q (verbatim)", got[1]["s"], unicode)
 	}
 }
+
+// TestD1SchemaReader_DefaultClassification pins default classification over
+// the D1 HTTP path: the remote reader shares parseDefault with the file
+// engine, and D1's PRAGMA table_xinfo reports the same paren-stripped forms
+// (so `DEFAULT ('a' || 'b')` arrives quote-endpointed). The mock replays the
+// REPORTED forms; each family must classify like the file engine — the
+// concat expression must NEVER be swallowed as the mangled literal.
+func TestD1SchemaReader_DefaultClassification(t *testing.T) {
+	client := startMockD1(t, func(sql string, _ []string) (int, []byte) {
+		switch {
+		case strings.Contains(sql, "SELECT sql FROM sqlite_master"):
+			return http.StatusOK, d1OK([]map[string]any{{"sql": nil}})
+		case strings.Contains(sql, "FROM sqlite_master"):
+			return http.StatusOK, d1OK([]map[string]any{{"name": "dflts"}})
+		case strings.Contains(sql, "table_xinfo('dflts')"):
+			return http.StatusOK, d1OK([]map[string]any{
+				{"cid": 0, "name": "id", "type": "INTEGER", "notnull": 1, "dflt_value": nil, "pk": 1, "hidden": 0},
+				{"cid": 1, "name": "lit_p", "type": "TEXT", "notnull": 0, "dflt_value": `'abc'`, "pk": 0, "hidden": 0},
+				{"cid": 2, "name": "lit_q", "type": "TEXT", "notnull": 0, "dflt_value": `'it''s'`, "pk": 0, "hidden": 0},
+				{"cid": 3, "name": "ex_cat", "type": "TEXT", "notnull": 0, "dflt_value": `'a' || 'b'`, "pk": 0, "hidden": 0},
+				{"cid": 4, "name": "ex_fn", "type": "INTEGER", "notnull": 0, "dflt_value": `abs(-1)`, "pk": 0, "hidden": 0},
+				{"cid": 5, "name": "kw_ts", "type": "TEXT", "notnull": 0, "dflt_value": `CURRENT_TIMESTAMP`, "pk": 0, "hidden": 0},
+				{"cid": 6, "name": "num_i", "type": "INTEGER", "notnull": 0, "dflt_value": `42`, "pk": 0, "hidden": 0},
+				{"cid": 7, "name": "nul_kw", "type": "TEXT", "notnull": 0, "dflt_value": `NULL`, "pk": 0, "hidden": 0},
+			})
+		case strings.Contains(sql, "foreign_key_list"), strings.Contains(sql, "index_list"):
+			return http.StatusOK, d1OK(nil)
+		default:
+			return http.StatusOK, d1OK(nil)
+		}
+	})
+	r := &D1SchemaReader{client: client}
+
+	sch, err := r.ReadSchema(context.Background())
+	if err != nil {
+		t.Fatalf("ReadSchema: %v", err)
+	}
+	if len(sch.Tables) != 1 {
+		t.Fatalf("got %d tables; want 1", len(sch.Tables))
+	}
+	want := map[string]ir.DefaultValue{
+		"lit_p":  ir.DefaultLiteral{Value: "abc"},
+		"lit_q":  ir.DefaultLiteral{Value: "it's"},
+		"ex_cat": ir.DefaultExpression{Expr: `'a' || 'b'`, Dialect: "sqlite"},
+		"ex_fn":  ir.DefaultExpression{Expr: `abs(-1)`, Dialect: "sqlite"},
+		"kw_ts":  ir.DefaultExpression{Expr: `CURRENT_TIMESTAMP`, Dialect: "sqlite"},
+		"num_i":  ir.DefaultLiteral{Value: "42"},
+		"nul_kw": ir.DefaultNone{},
+	}
+	for _, c := range sch.Tables[0].Columns {
+		w, ok := want[c.Name]
+		if !ok {
+			continue
+		}
+		if c.Default != w {
+			t.Errorf("d1 column %q Default = %#v; want %#v", c.Name, c.Default, w)
+		}
+	}
+}

@@ -97,9 +97,9 @@ func TestSQLiteRoute_Index_PortableEmitted(t *testing.T) {
 // writer across every construct family a SQLite string literal can reach:
 // generated column and CHECK refuse LOUDLY with an error NAMING the
 // backslash (not the generic non-portable message), the index-expression
-// path WARN-skips (never emits), and the DEFAULT-expression verbatim-carry
-// path — the one position that never routes through the translator —
-// refuses at emitColumnDef. Shapes cover the plain interior backslash and
+// path WARN-skips (never emits), and the DEFAULT-expression path (portable
+// bodies translate, non-portable keep the verbatim carry) refuses at
+// emitColumnDef. Shapes cover the plain interior backslash and
 // the trailing-\ quote-swallow; backslash-free controls prove no
 // false-fire.
 func TestSQLiteRoute_BackslashLiteral_RefusedNamed(t *testing.T) {
@@ -208,8 +208,13 @@ func TestSQLiteRoute_BackslashLiteral_RefusedNamed(t *testing.T) {
 // refuses LOUDLY naming the mechanism on the data-load-bearing constructs
 // (gencol, CHECK) and WARN-skips on the index path, REGARDLESS of backslash
 // content. The reviewer-derived cells: gencol `a || "C:\temp"`, CHECK
-// `a <> "x\"`, index `coalesce(a, "z\q")`; DEFAULT has no cell — SQLite
-// itself rejects a double-quoted token in DEFAULT position.
+// `a <> "x\"`, index `coalesce(a, "z\q")`. DEFAULT is asymmetric (probed on
+// modernc): SQLite rejects a double-quoted token inside a parenthesised
+// DEFAULT expression as non-constant, but ACCEPTS the bare literal-value
+// form `DEFAULT "a\b"` — so the DEFAULT sweep refuses only the
+// backslash-bearing double-quoted shape (the silent-reinterpretation
+// hazard) while the backslash-free `DEFAULT "draft"` keeps its verbatim
+// carry (both engines read the same string value there).
 func TestSQLiteRoute_DoubleQuoted_RefusedNamed(t *testing.T) {
 	col := &ir.Column{
 		Name: "g_dq", Type: ir.Text{},
@@ -246,6 +251,26 @@ func TestSQLiteRoute_DoubleQuoted_RefusedNamed(t *testing.T) {
 		t.Error(`emitCheckConstraint("status" <> '') err=nil; want a LOUD double-quoted refusal (no backslash needed)`)
 	} else if !strings.Contains(err.Error(), "double-quoted") {
 		t.Errorf("backslash-free DQS refusal = %v; want it to name the double-quoted token", err)
+	}
+
+	// DEFAULT position, the bare misfeature form SQLite accepts: a
+	// backslash inside the double-quoted token is the same silent-
+	// reinterpretation hazard as a single-quoted literal (MySQL reads
+	// "a\b" as a string WITH escape semantics), and the single-quote
+	// tokenizer check misses it — the DEFAULT sweep must refuse it.
+	dqBs := &ir.Column{
+		Name: "d_dqbs", Type: ir.Varchar{Length: 50},
+		Default: ir.DefaultExpression{Expr: `"a\b"`, Dialect: "sqlite"},
+	}
+	if _, err := emitColumnDef(dqBs); err == nil {
+		t.Error(`emitColumnDef(DEFAULT "a\b") err=nil; want a LOUD backslash refusal`)
+	} else if !strings.Contains(err.Error(), "backslash") || !strings.Contains(err.Error(), "d_dqbs") {
+		t.Errorf("DEFAULT dq-backslash refusal = %v; want it to name the backslash and the column", err)
+	}
+	// Backslash-free `DEFAULT "draft"` keeps its verbatim carry (pinned in
+	// TestWriterDialectGuard_DefaultExpr_MySQL) — no refusal.
+	if err := refuseBackslashSQLiteDefaultMySQL("d", ir.DefaultExpression{Expr: `"draft"`, Dialect: "sqlite"}); err != nil {
+		t.Errorf("refuseBackslashSQLiteDefaultMySQL(\"draft\") = %v; want nil (backslash-free misfeature keeps the verbatim carry)", err)
 	}
 }
 

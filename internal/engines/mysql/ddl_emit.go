@@ -529,15 +529,17 @@ func emitDefault(d ir.DefaultValue, t ir.Type) (string, bool) {
 			return v.Expr, true
 		}
 		expr := v.Expr
-		if v.Dialect == translatableSourceDialect {
+		switch v.Dialect {
+		case translatableSourceDialect:
 			// Translate ONLY from the one engine this writer's translator
-			// accepts (Postgres) — ADR-0133 §2. Self / untagged / SQLite /
-			// any unknown dialect takes the verbatim (else) arm below; this
+			// accepts (Postgres) — ADR-0133 §2. Self / untagged / any
+			// unknown dialect takes the verbatim (default) arm below; this
 			// closes the DEFAULT-path silent-mistranslate where a SQLite
 			// default such as `"draft"` (SQLite's double-quoted-string
 			// misfeature) would otherwise be run through translateExprForMySQL
 			// and rewritten into the backtick identifier `` `draft` `` (a
-			// column reference) — a silently-wrong default.
+			// column reference) — a silently-wrong default. (SQLite bodies
+			// now take their own translator arm below.)
 			//
 			// Cross-dialect DEFAULT body (Bug 64, MySQL side). Before
 			// ADR-0045 this arm had NO identifier re-quote and NO
@@ -556,7 +558,23 @@ func emitDefault(d ir.DefaultValue, t ir.Type) (string, bool) {
 			// output stays byte-identical and the cross-dialect outcomes
 			// for those three forms are preserved.
 			expr = requoteMySQLReservedIdents(translateExprForMySQL(expr))
-		} else {
+		case sqliteSourceDialect:
+			// SQLite source (ADR-0133 follow-up, DEFAULT position): route
+			// the portable subset through the shared SQLite→MySQL
+			// translator. This is load-bearing for MEANING, not just
+			// spelling: `||` is string concat on SQLite but LOGICAL OR
+			// under MySQL's default sql_mode, so a verbatim carry of
+			// `'a' || 'b'` lands a default MySQL silently evaluates to 0.
+			// Non-portable bodies keep the verbatim carry — the SEC-1
+			// refusal boundary (refuseBackslashSQLiteDefaultMySQL, checked
+			// before emitDefault runs) has already screened the
+			// silent-reinterpretation shapes, and MySQL's parser rejects
+			// the rest loudly.
+			if my, ok := translate.SQLiteExprToMySQL(expr); ok {
+				expr = my
+			}
+			expr = requoteMySQLReservedIdents(expr)
+		default:
 			// Same-dialect (or untagged) DEFAULT body. The MySQL read
 			// boundary strips backtick identifier quotes for IR
 			// portability (Bug 64 — symmetric with the generated /
@@ -572,6 +590,7 @@ func emitDefault(d ir.DefaultValue, t ir.Type) (string, bool) {
 			// emitted verbatim modulo the reserved-word requote.
 			expr = requoteMySQLReservedIdents(expr)
 		}
+
 		// Canonical PG-default-form coverage + MySQL DEFAULT-grammar
 		// shaping. This block is byte-identical to the pre-ADR-0045
 		// code and runs on every non-bit DefaultExpression (the lookup
@@ -768,10 +787,12 @@ func emitColumnDef(c *ir.Column) (string, error) {
 	// emitDefault returns ok=false and the clause is skipped naturally;
 	// we don't need a special case here.
 	//
-	// SEC-1 pre-flight: a "sqlite"-dialect DEFAULT expression whose string
-	// literal contains a backslash must never reach the verbatim-carry arm
-	// of emitDefault — MySQL would silently reinterpret it (see
-	// refuseBackslashSQLiteDefaultMySQL).
+	// SEC-1 pre-flight: a "sqlite"-dialect DEFAULT expression carrying a
+	// backslash in a string literal (single- OR double-quoted) must never
+	// reach emitDefault's verbatim-carry arm — MySQL would silently
+	// reinterpret it (see refuseBackslashSQLiteDefaultMySQL). The
+	// translator refuses the same class, so portable-path emission can
+	// never carry one either.
 	if err := refuseBackslashSQLiteDefaultMySQL(c.Name, c.Default); err != nil {
 		return "", err
 	}
@@ -1653,22 +1674,29 @@ func refuseNonPortableSQLiteExprMySQL(kind, name, expr, dialect string) error {
 
 // refuseBackslashSQLiteDefaultMySQL returns a loud refusal when a
 // "sqlite"-dialect DEFAULT expression carries a backslash inside a string
-// literal (SEC-1, DEFAULT-position sweep). SQLite-dialect DEFAULT bodies are
-// the one expression position that never routes through the SQLite→MySQL
-// translator — emitDefault carries them VERBATIM (ADR-0133 §2), relying on
-// the MySQL parser to reject a non-portable spelling loudly. A
-// backslash-bearing literal defeats that reliance: MySQL ACCEPTS it and
+// literal (SEC-1, DEFAULT-position sweep). SQLite-dialect DEFAULT bodies the
+// SQLite→MySQL translator can't prove portable are carried VERBATIM by
+// emitDefault (ADR-0133 §2), relying on the MySQL parser to reject a
+// non-portable spelling loudly (portable bodies translate — the translator
+// itself refuses backslash literals on MySQL, so the two boundaries agree).
+// A backslash-bearing literal defeats that reliance: MySQL ACCEPTS it and
 // silently reinterprets the backslash as an escape (or, for a literal ending
-// in \, swallows the closing quote — the DDL-position-escape shape). Same
-// named wart as the translator's stringNode refusal; DefaultLiteral and
-// non-sqlite dialects return nil (the literal path is quoted by
-// quoteSQLString, not carried).
+// in \, swallows the closing quote — the DDL-position-escape shape). The
+// same hazard rides a backslash-bearing DOUBLE-quoted token (`"a\b"` — the
+// bare double-quoted-string misfeature is valid in SQLite DEFAULT position;
+// MySQL under its default sql_mode reads it as a string literal WITH escape
+// semantics), which the single-quote tokenizer check misses — so that shape
+// is refused here too. Same named wart as the translator's stringNode
+// refusal; DefaultLiteral and non-sqlite dialects return nil (the literal
+// path is quoted by quoteSQLString, not carried).
 func refuseBackslashSQLiteDefaultMySQL(colName string, d ir.DefaultValue) error {
 	v, ok := d.(ir.DefaultExpression)
 	if !ok || v.Dialect != sqliteSourceDialect {
 		return nil
 	}
-	if !translate.SQLiteExprHasBackslashStringLiteral(v.Expr) {
+	hazard := translate.SQLiteExprHasBackslashStringLiteral(v.Expr) ||
+		(translate.SQLiteExprHasDoubleQuotedToken(v.Expr) && strings.Contains(v.Expr, `\`))
+	if !hazard {
 		return nil
 	}
 	return sluicecode.Wrap(

@@ -69,12 +69,15 @@ func TestWriterDialectGuard_SQLiteVerbatim(t *testing.T) {
 }
 
 // TestWriterDialectGuard_DefaultExpr_MySQL extends the guard to the DEFAULT-
-// expression dispatch (emitDefault): a "sqlite" / "" / unknown DEFAULT body is
-// NOT fed through translateExprForMySQL (the `||` concat stays `||`, not
-// CONCAT), a "postgres" body still translates, and the bitLiteralDialect arm is
-// intact. emitDefault applies the MySQL function-default paren wrap, so the
-// verbatim body lands wrapped — the assertion is on translate-vs-not, not the
-// wrap.
+// expression dispatch (emitDefault): an "" / unknown DEFAULT body is NOT fed
+// through translateExprForMySQL (the `||` concat stays `||`, not CONCAT), a
+// "postgres" body still translates, and the bitLiteralDialect arm is intact.
+// A "sqlite" body routes through the SQLite→MySQL translator instead: a
+// portable body TRANSLATES (`'a' || 'b'` means concat on SQLite but LOGICAL
+// OR to MySQL — verbatim carry silently evaluated to 0), while a body that
+// translator refuses stays verbatim, proving the PG→MySQL translator never
+// runs on it. emitDefault applies the MySQL function-default paren wrap, so
+// bodies land wrapped — the assertions are on translate-vs-not, not the wrap.
 func TestWriterDialectGuard_DefaultExpr_MySQL(t *testing.T) {
 	typ := ir.Varchar{Length: 50}
 
@@ -83,7 +86,6 @@ func TestWriterDialectGuard_DefaultExpr_MySQL(t *testing.T) {
 		dialect    string
 		wantConcat bool
 	}{
-		{"sqlite", "sqlite", false},
 		{"empty", "", false},
 		{"unknown", "duckdb", false},
 		{"postgres_translates", "postgres", true},
@@ -106,6 +108,23 @@ func TestWriterDialectGuard_DefaultExpr_MySQL(t *testing.T) {
 				}
 			}
 		})
+	}
+
+	// A portable "sqlite" DEFAULT body translates through the SQLite→MySQL
+	// translator — the parseDefault-misclassification fix's MySQL half: the
+	// concat must land as CONCAT, never as MySQL's logical-OR reading of ||.
+	if got, ok := emitDefault(ir.DefaultExpression{Expr: `'a' || 'b'`, Dialect: "sqlite"}, typ); !ok || got != `(CONCAT('a', 'b'))` {
+		t.Errorf("sqlite portable default = (%q, %v); want ((CONCAT('a', 'b')), true)", got, ok)
+	}
+
+	// A "sqlite" body the SQLite→MySQL translator refuses stays VERBATIM —
+	// myfunc() is unknown to the SQLite translator, and the PG→MySQL
+	// translator (which WOULD rewrite the `||` into CONCAT) must never run
+	// on a sqlite body. (gen_random_uuid() is no marker here: the legacy
+	// dialect-blind pgToMySQLDefaultExpr map rewrites it on every non-bit
+	// DEFAULT, translator or not.)
+	if got, ok := emitDefault(ir.DefaultExpression{Expr: `myfunc(a) || 'x'`, Dialect: "sqlite"}, typ); !ok || !strings.Contains(got, "||") || strings.Contains(got, "CONCAT") {
+		t.Errorf("sqlite non-portable default = (%q, %v); want the || carried verbatim (PG→MySQL translator must not run)", got, ok)
 	}
 
 	// The bit-literal arm survives (only ever applies to defaults): b'…' bare.

@@ -310,3 +310,96 @@ func columnByName(t *ir.Table, name string) *ir.Column {
 	}
 	return nil
 }
+
+// TestSchemaReader_DefaultClassification_RealDriver ground-truths default
+// classification through the REAL driver (modernc) end-to-end: each family of
+// the DEFAULT matrix is seeded as source DDL, PRAGMA reports it (stripping
+// the OUTER parens off parenthesised expressions — the surface trap that let
+// `DEFAULT ('a' || 'b')` masquerade as a quote-endpointed "literal"), and the
+// SchemaReader must classify the REPORTED form correctly. The companion
+// TestParseDefault_Classification pins the reported-form matrix at unit
+// level; this test proves the reported forms are what modernc actually
+// reports.
+func TestSchemaReader_DefaultClassification_RealDriver(t *testing.T) {
+	path := seedDB(
+		t,
+		`CREATE TABLE dflts (
+			id       INTEGER PRIMARY KEY,
+			lit_p    TEXT DEFAULT 'abc',
+			lit_q    TEXT DEFAULT 'it''s',
+			lit_t    TEXT DEFAULT 'x''',
+			lit_e    TEXT DEFAULT '',
+			lit_bs   TEXT DEFAULT 'a\b',
+			lit_par  TEXT DEFAULT ('wrapped'),
+			ex_cat   TEXT DEFAULT ('a' || 'b'),
+			ex_cat3  TEXT DEFAULT ('a' || 'b' || 'c'),
+			ex_fn    INTEGER DEFAULT (abs(-1)),
+			ex_nest  TEXT DEFAULT (('x')),
+			ex_arith INTEGER DEFAULT (1+2),
+			kw_ts    TEXT DEFAULT CURRENT_TIMESTAMP,
+			kw_true  INTEGER DEFAULT TRUE,
+			bl_hex   BLOB DEFAULT x'00ff',
+			nx_hex   INTEGER DEFAULT 0x1A,
+			dq_mis   TEXT DEFAULT "misfeature",
+			num_i    INTEGER DEFAULT 42,
+			num_n    INTEGER DEFAULT -7,
+			num_f    REAL DEFAULT 1.5,
+			no_dflt  TEXT,
+			nul_kw   TEXT DEFAULT NULL
+		)`,
+	)
+
+	eng := Engine{}
+	ctx := bgCtx()
+	sr, err := eng.OpenSchemaReader(ctx, path)
+	if err != nil {
+		t.Fatalf("OpenSchemaReader: %v", err)
+	}
+	defer func() { _ = sr.(*SchemaReader).Close() }()
+	schema, err := sr.ReadSchema(ctx)
+	if err != nil {
+		t.Fatalf("ReadSchema: %v", err)
+	}
+	tbl := tableByName(schema, "dflts")
+	if tbl == nil {
+		t.Fatal("table dflts not read")
+	}
+
+	lit := func(v string) ir.DefaultValue { return ir.DefaultLiteral{Value: v} }
+	expr := func(e string) ir.DefaultValue { return ir.DefaultExpression{Expr: e, Dialect: "sqlite"} }
+	want := map[string]ir.DefaultValue{
+		"lit_p":   lit("abc"),
+		"lit_q":   lit("it's"),
+		"lit_t":   lit("x'"),
+		"lit_e":   lit(""),
+		"lit_bs":  lit(`a\b`),
+		"lit_par": lit("wrapped"), // PRAGMA strips the parens → well-formed literal
+		// The bug class: PRAGMA strips the outer parens, so these arrive
+		// quote-endpointed and MUST still classify as expressions.
+		"ex_cat":   expr(`'a' || 'b'`),
+		"ex_cat3":  expr(`'a' || 'b' || 'c'`),
+		"ex_fn":    expr(`abs(-1)`),
+		"ex_nest":  expr(`('x')`), // PRAGMA strips only the outermost level
+		"ex_arith": expr(`1+2`),
+		"kw_ts":    expr(`CURRENT_TIMESTAMP`),
+		"kw_true":  expr(`TRUE`),
+		"bl_hex":   expr(`x'00ff'`),
+		"nx_hex":   expr(`0x1A`),
+		"dq_mis":   expr(`"misfeature"`),
+		"num_i":    lit("42"),
+		"num_n":    lit("-7"),
+		"num_f":    lit("1.5"),
+		"no_dflt":  ir.DefaultNone{},
+		"nul_kw":   ir.DefaultNone{},
+	}
+	for name, w := range want {
+		col := columnByName(tbl, name)
+		if col == nil {
+			t.Errorf("column %q not read", name)
+			continue
+		}
+		if col.Default != w {
+			t.Errorf("column %q Default = %#v; want %#v", name, col.Default, w)
+		}
+	}
+}

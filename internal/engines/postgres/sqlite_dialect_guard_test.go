@@ -130,10 +130,12 @@ func TestWriterDialectGuard_DefaultExpr_PG(t *testing.T) {
 }
 
 // TestWriterDialectGuard_DefaultExpr_SQLite pins the SQLite DEFAULT dispatch
-// (Chunk A): portable spellings translate to PG keywords; non-portable
-// SQLite-only bodies — including the double-quoted-string misfeature that
-// used to be the silent-corruption case — are DROPPED (ok=false), never fed
-// through the MySQL→PG translator and never emitted verbatim.
+// (Chunk A + the ADR-0133 translator): portable "current instant" spellings
+// translate to PG keywords, the portable general subset translates through
+// the SQLite→PG translator, and non-portable SQLite-only bodies — including
+// the double-quoted-string misfeature that used to be the silent-corruption
+// case — are DROPPED (ok=false), never fed through the MySQL→PG translator
+// and never emitted verbatim.
 func TestWriterDialectGuard_DefaultExpr_SQLite(t *testing.T) {
 	opts := emitOpts{}
 
@@ -141,17 +143,38 @@ func TestWriterDialectGuard_DefaultExpr_SQLite(t *testing.T) {
 		t.Errorf("sqlite portable default = (%q, %v); want (CURRENT_TIMESTAMP, true)", got, ok)
 	}
 
+	// The portable general subset (the parseDefault-misclassification fix's
+	// PG half): a concat DEFAULT lands working instead of warn-dropping, and
+	// the residual one-level paren nesting PRAGMA leaves on `(('x'))`
+	// collapses to the plain literal.
+	if got, ok := guardDefault(ir.DefaultExpression{Expr: `'a' || 'b'`, Dialect: "sqlite"}, opts); !ok || got != `('a' || 'b')` {
+		t.Errorf("sqlite concat default = (%q, %v); want (('a' || 'b'), true)", got, ok)
+	}
+	if got, ok := guardDefault(ir.DefaultExpression{Expr: `('x')`, Dialect: "sqlite"}, opts); !ok || got != `'x'` {
+		t.Errorf("sqlite paren-residual default = (%q, %v); want ('x', true)", got, ok)
+	}
+
+	// Blob literal x'…': the translator refuses it, so it warn-drops — PG
+	// reads X'…' as a hex BIT-STRING literal (type bit), not SQLite's blob,
+	// so a verbatim emit would silently change the type.
+	if got, ok := guardDefault(ir.DefaultExpression{Expr: `x'00ff'`, Dialect: "sqlite"}, opts); ok || got != "" {
+		t.Errorf("sqlite blob default = (%q, %v); want (\"\", false) — dropped", got, ok)
+	}
+
 	// The former silent-corruption case: DEFAULT "draft" (SQLite's double-
-	// quoted-string misfeature) is non-portable → dropped, NOT rewritten and
-	// NOT emitted verbatim into PG DDL.
+	// quoted-string misfeature) is held back from the translator (its PG
+	// policy would carry it as an identifier, which PG rejects in a DEFAULT,
+	// aborting the migration) → dropped, NOT rewritten and NOT emitted
+	// verbatim into PG DDL.
 	if got, ok := guardDefault(ir.DefaultExpression{Expr: `"draft"`, Dialect: "sqlite"}, opts); ok || got != "" {
 		t.Errorf(`sqlite DEFAULT "draft" = (%q, %v); want ("", false) — dropped`, got, ok)
 	}
 
-	// The MySQL-marker body proves the MySQL→PG translator never runs on a
-	// SQLite default: it's non-portable here, so it drops (it must NOT become
-	// COALESCE).
-	if got, ok := guardDefault(ir.DefaultExpression{Expr: guardBodyMySQL, Dialect: "sqlite"}, opts); ok || got != "" {
+	// The marker body proves the MySQL→PG translator never runs on a SQLite
+	// default: SQLite has no CONCAT function so the SQLite→PG translator
+	// refuses it, and the MySQL→PG translator (which WOULD rewrite it to
+	// (a || b)) must not run — so it drops.
+	if got, ok := guardDefault(ir.DefaultExpression{Expr: guardBodySQLiteNonPortable, Dialect: "sqlite"}, opts); ok || got != "" {
 		t.Errorf("sqlite non-portable default = (%q, %v); want (\"\", false) — dropped, translator must not run", got, ok)
 	}
 }
