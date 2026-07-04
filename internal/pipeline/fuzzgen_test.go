@@ -380,6 +380,29 @@ func TestOracle_ClassifyTruthTable(t *testing.T) {
 			t.Errorf("want FAIL/MISMATCH; got %v %q", v, msg)
 		}
 	})
+	t.Run("cross-engine rowcount pseudo-column mismatch → FAIL", func(t *testing.T) {
+		// The cross-engine regime (no faithful columns — every SQLite
+		// direction lives here) reports row presence under
+		// fuzzRowCountKey; a skew is a silent ROW loss.
+		gc := mkCase()
+		gc.columns = []genColumn{{name: "c"}}
+		src := map[string][]sql.NullString{fuzzRowCountKey: {{}, {}, {}}}
+		dst := map[string][]sql.NullString{fuzzRowCountKey: {{}, {}}}
+		v, msg := classify(gc, caseExpectation{}, nil, 2, src, dst)
+		if v != verdictFail || !strings.Contains(msg, "ROW COUNT MISMATCH") {
+			t.Errorf("want FAIL/ROW COUNT MISMATCH; got %v %q", v, msg)
+		}
+	})
+	t.Run("cross-engine rowcount pseudo-column equal → PASS", func(t *testing.T) {
+		gc := mkCase()
+		gc.columns = []genColumn{{name: "c"}}
+		src := map[string][]sql.NullString{fuzzRowCountKey: {{}, {}}}
+		dst := map[string][]sql.NullString{fuzzRowCountKey: {{}, {}}}
+		v, msg := classify(gc, caseExpectation{}, nil, 2, src, dst)
+		if v != verdictPass {
+			t.Errorf("got FAIL (%s); want PASS", msg)
+		}
+	})
 	t.Run("faithful, row count mismatch → FAIL", func(t *testing.T) {
 		gc := mkCase()
 		gc.columns = []genColumn{{name: "c"}}
@@ -492,6 +515,173 @@ func TestOracle_FaithfulColumnsFor(t *testing.T) {
 		}
 		if !want[c] {
 			t.Errorf("unexpected compared column %q", c)
+		}
+	}
+}
+
+// TestRegistry_SQLiteSourceScope pins the SQLite-SOURCE family set: the
+// storage-class core (int64/float8/bool/text/blob + the ADR-0129
+// declared date/time/timestamp), scalar-only (SQLite has no arrays),
+// and NOTHING else — every excluded family is a documented asymmetry
+// (see the registry() doc), so a family silently gaining or losing an
+// sqType is a review event, not drift.
+func TestRegistry_SQLiteSourceScope(t *testing.T) {
+	want := map[string]bool{
+		"int64": true, "float8": true, "bool": true, "text": true,
+		"blob": true, "date": true, "time": true, "timestamp": true,
+	}
+	for _, f := range registry() {
+		if want[f.name] {
+			if !f.canSource(engineSQLite, shapeScalar) {
+				t.Errorf("family %q must be a SQLite source (scalar)", f.name)
+			}
+			if f.canSource(engineSQLite, shape1DArray) || f.canSource(engineSQLite, shapeMultiDim) {
+				t.Errorf("family %q: SQLite has no array type — scalar only", f.name)
+			}
+			continue
+		}
+		if f.sqType != "" || f.canSource(engineSQLite, shapeScalar) {
+			t.Errorf("family %q must NOT be a SQLite source (documented exclusion — see registry())", f.name)
+		}
+	}
+}
+
+// TestRegistry_SQLiteExpectations pins expectedOutcome over the SQLite
+// directions — the truth table the whole oracle keys on, sourced from
+// ADR-0134 §1 (the writer's emit-refusal list) and the Phase-1
+// cross-engine scope note.
+func TestRegistry_SQLiteExpectations(t *testing.T) {
+	byName := map[string]*family{}
+	for _, f := range registry() {
+		byName[f.name] = f
+	}
+	sqToPG := direction{engineSQLite, enginePG}
+	sqToMy := direction{engineSQLite, engineMySQL}
+	pgToSQ := direction{enginePG, engineSQLite}
+	myToSQ := direction{engineMySQL, engineSQLite}
+
+	// SQLite as a SOURCE is always cross-engine here → lossy-documented
+	// for every family (never text-compared, never a refusal).
+	for _, fam := range []string{"int64", "float8", "bool", "text", "blob", "date", "time", "timestamp"} {
+		for _, d := range []direction{sqToPG, sqToMy} {
+			if got := expectedOutcome(byName[fam], d, shapeScalar); got != outcomeLossyDocument {
+				t.Errorf("%s %s scalar: got %s; want lossy-documented (cross-engine scope)", fam, d, got)
+			}
+		}
+	}
+
+	// SQLite as a TARGET: the ADR-0134 emit-refusal classes are LOUD.
+	for _, fam := range []string{"bit8", "varbit", "inet", "cidr", "macaddr"} {
+		f := byName[fam]
+		d := pgToSQ
+		if f.pgType == "" {
+			d = myToSQ
+		}
+		if got := expectedOutcome(f, d, shapeScalar); got != outcomeLoudRefuse {
+			t.Errorf("%s %s scalar: got %s; want loud-refuse (ADR-0134 §1)", fam, d, got)
+		}
+	}
+	if got := expectedOutcome(byName["bit8"], myToSQ, shapeScalar); got != outcomeLoudRefuse {
+		t.Errorf("bit8 mysql->sqlite: got %s; want loud-refuse", got)
+	}
+	// EVERY array shape into SQLite refuses (ir.Array is on the emit list)
+	// — including families that are faithful/lossy at scalar.
+	for _, tc := range []struct {
+		fam string
+		s   shape
+	}{
+		{"int8", shape1DArray},
+		{"text", shapeMultiDim},
+		{"uuid", shape1DArray},
+		{"timetz", shapeMultiDim},
+	} {
+		if got := expectedOutcome(byName[tc.fam], pgToSQ, tc.s); got != outcomeLoudRefuse {
+			t.Errorf("%s[] pg->sqlite %s: got %s; want loud-refuse (ir.Array, ADR-0134 §1)", tc.fam, tc.s, got)
+		}
+	}
+	// Non-refused scalars into SQLite are lossy-documented — the trap
+	// case is timetz, whose OWN closure falls through to faithful for a
+	// non-PG/MySQL target; expectedOutcome must shield it (the value is
+	// carried verbatim as TIME text — the ADR-0134 tz edge, a documented
+	// transformation, never text-compared).
+	for _, fam := range []string{"timetz", "text", "int64", "json", "numeric_unconstrained", "varchar_wide", "uint64", "enum"} {
+		f := byName[fam]
+		d := pgToSQ
+		if f.pgType == "" {
+			d = myToSQ
+		}
+		if got := expectedOutcome(f, d, shapeScalar); got != outcomeLossyDocument {
+			t.Errorf("%s %s scalar: got %s; want lossy-documented", fam, d, got)
+		}
+	}
+
+	// And the PG/MySQL matrix is untouched by the central lookup: it
+	// delegates to the per-family closures.
+	if got := expectedOutcome(byName["int32"], direction{enginePG, enginePG}, shapeScalar); got != outcomeFaithful {
+		t.Errorf("int32 pg->pg through expectedOutcome: got %s; want faithful", got)
+	}
+	if got := expectedOutcome(byName["timetz"], direction{enginePG, enginePG}, shape1DArray); got != outcomeLoudRefuse {
+		t.Errorf("timetz[] pg->pg through expectedOutcome: got %s; want loud-refuse", got)
+	}
+}
+
+// TestGenerator_SQLiteDialect pins the emitted source scripts for the
+// SQLite directions: SQLite sources speak SQLite (no PG casts/arrays, no
+// MySQL ENGINE clause, blobs as x'..', bools as 0/1), and every
+// generated column is scalar.
+func TestGenerator_SQLiteDialect(t *testing.T) {
+	for idx := 0; idx < 40; idx++ {
+		for _, d := range []direction{{engineSQLite, enginePG}, {engineSQLite, engineMySQL}} {
+			gc := generateCase(424242, idx, d)
+			if len(gc.columns) == 0 {
+				t.Fatalf("[%s case %d] zero columns generated (fallback broken for the narrower SQLite registry)", d, idx)
+			}
+			for _, c := range gc.columns {
+				if c.shp != shapeScalar {
+					t.Errorf("[%s case %d] non-scalar SQLite source column %s", d, idx, c.name)
+				}
+				for ri, v := range c.values {
+					switch c.fam.name {
+					case "blob":
+						if v != "NULL" && !strings.HasPrefix(v, "x'") {
+							t.Errorf("[%s case %d] blob row %d not a SQLite x'..' literal: %q", d, idx, ri, v)
+						}
+					case "bool":
+						if v != "NULL" && v != "0" && v != "1" {
+							t.Errorf("[%s case %d] bool row %d not 0/1 (ADR-0129 INTEGER bool): %q", d, idx, ri, v)
+						}
+					}
+				}
+			}
+			if strings.Contains(gc.ddl, "::") || strings.Contains(gc.ddl, "ARRAY[") ||
+				strings.Contains(gc.ddl, "ENGINE=") {
+				t.Errorf("[%s case %d] SQLite source script contains foreign dialect:\n%s", d, idx, gc.ddl)
+			}
+		}
+	}
+}
+
+// TestGenerator_SQLiteTargetBias pins the X→sqlite down-weighting: the
+// documented loud-refuse classes (arrays, bit/net families — ADR-0134)
+// must still be GENERATED (the refusal stays pinned), but must not
+// dominate — a healthy share of cases must expect SUCCESS, or the SQLite
+// write path is never value-fuzzed.
+func TestGenerator_SQLiteTargetBias(t *testing.T) {
+	for _, d := range []direction{{enginePG, engineSQLite}, {engineMySQL, engineSQLite}} {
+		refuse, success := 0, 0
+		for idx := 0; idx < 200; idx++ {
+			gc := generateCase(31337, idx, d)
+			if expectationFor(&gc).loudRefuse {
+				refuse++
+			} else {
+				success++
+			}
+		}
+		if refuse == 0 {
+			t.Errorf("[%s] no loud-refuse case in 200 — the ADR-0134 refusal class is unpinned", d)
+		}
+		if success < 50 {
+			t.Errorf("[%s] only %d/200 success cases — refusals dominate and the SQLite write path is barely value-fuzzed", d, success)
 		}
 	}
 }

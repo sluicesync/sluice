@@ -34,8 +34,10 @@
 //	                      budget; set high for nightly/pre-release).
 //	SLUICE_FUZZ_SEED   — master seed (default: a fixed value so CI is
 //	                      deterministic; override to explore).
-//	SLUICE_FUZZ_DIRS   — comma list of directions to run (default all
-//	                      four); e.g. "postgres->postgres,mysql->mysql".
+//	SLUICE_FUZZ_DIRS   — comma list of directions to run (default: every
+//	                      direction in allDirections(), incl. the SQLite
+//	                      source/target ones); e.g.
+//	                      "postgres->postgres,sqlite->postgres".
 //
 // A failure prints the seed + case index and dumps the replayable
 // source-dialect script to a fixtures dir, deterministically
@@ -53,12 +55,16 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 
+	_ "modernc.org/sqlite" // database/sql driver for the SQLite source/target files
+
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
+	_ "sluicesync.dev/sluice/internal/engines/sqlite"
 )
 
 const (
@@ -128,6 +134,10 @@ func bootDirection(t *testing.T, d direction) *fuzzEnv {
 	if !ok {
 		t.Fatal("mysql engine not registered")
 	}
+	sqEng, ok := engines.Get("sqlite")
+	if !ok {
+		t.Fatal("sqlite engine not registered")
+	}
 
 	fe := &fuzzEnv{}
 	var pgSrc, pgDst, mySrc, myDst string
@@ -135,6 +145,10 @@ func bootDirection(t *testing.T, d direction) *fuzzEnv {
 
 	needPG := d.src == enginePG || d.dst == enginePG
 	needMy := d.src == engineMySQL || d.dst == engineMySQL
+	// SQLite needs NO container: its DSN is a temp file path (created on
+	// first open), reused across the direction's iterations exactly like
+	// a container — per-case isolation comes from the unique table name +
+	// MigrationID, and t.TempDir() handles cleanup.
 
 	if needPG {
 		s, dst, c := startPostgres(t)
@@ -152,12 +166,16 @@ func bootDirection(t *testing.T, d direction) *fuzzEnv {
 		fe.srcDSN, fe.srcEng, fe.srcDriver = pgSrc, pgEng, "pgx"
 	case engineMySQL:
 		fe.srcDSN, fe.srcEng, fe.srcDriver = mySrc, myEng, "mysql"
+	case engineSQLite:
+		fe.srcDSN, fe.srcEng, fe.srcDriver = filepath.Join(t.TempDir(), "fuzz-src.db"), sqEng, "sqlite"
 	}
 	switch d.dst {
 	case enginePG:
 		fe.dstDSN, fe.dstEng, fe.dstDriver = pgDst, pgEng, "pgx"
 	case engineMySQL:
 		fe.dstDSN, fe.dstEng, fe.dstDriver = myDst, myEng, "mysql"
+	case engineSQLite:
+		fe.dstDSN, fe.dstEng, fe.dstDriver = filepath.Join(t.TempDir(), "fuzz-dst.db"), sqEng, "sqlite"
 	}
 	fe.cleanup = func() {
 		for _, c := range cleanups {
@@ -172,10 +190,32 @@ func bootDirection(t *testing.T, d direction) *fuzzEnv {
 // applier.
 func applySource(t *testing.T, d direction, dsn, ddl string) {
 	t.Helper()
-	if d.src == enginePG {
+	switch d.src {
+	case enginePG:
 		applyPGDDL(t, dsn, ddl)
-	} else {
+	case engineSQLite:
+		applySQLiteDDL(t, dsn, ddl)
+	default:
 		applyMySQLDDL(t, dsn, ddl)
+	}
+}
+
+// applySQLiteDDL runs an arbitrary multi-statement script against a
+// SQLite file via the modernc driver (which executes multi-statement
+// scripts natively in one Exec — the same mechanism the engine's dump
+// materializer relies on). Opening the path creates the file.
+func applySQLiteDDL(t *testing.T, path, ddl string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open sqlite %s: %v", path, err)
+	}
+	defer func() { _ = db.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if _, err := db.ExecContext(ctx, ddl); err != nil {
+		t.Fatalf("apply sqlite ddl: %v\n--- script ---\n%s", err, ddl)
 	}
 }
 
@@ -185,11 +225,17 @@ func applySource(t *testing.T, d direction, dsn, ddl string) {
 // real partial-DATA target (rows present — the corruption signature).
 func targetRowCount(ctx context.Context, db *sql.DB, table string, eng engineKind) int {
 	var n int
-	// information_schema.tables is portable across PG and MySQL; only
-	// the placeholder syntax differs ($1 vs ?).
-	q := `SELECT count(*) FROM information_schema.tables WHERE table_name = ?`
-	if eng == enginePG {
+	// information_schema.tables is portable across PG and MySQL (only
+	// the placeholder syntax differs, $1 vs ?); SQLite exposes the same
+	// fact through sqlite_master.
+	var q string
+	switch eng {
+	case enginePG:
 		q = `SELECT count(*) FROM information_schema.tables WHERE table_name = $1`
+	case engineSQLite:
+		q = `SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?`
+	default:
+		q = `SELECT count(*) FROM information_schema.tables WHERE table_name = ?`
 	}
 	if err := db.QueryRowContext(ctx, q, table).Scan(&n); err != nil || n == 0 {
 		return -1
@@ -210,9 +256,16 @@ func canonicalSelect(gc *genCase, cols []string, eng engineKind) string {
 	var sb strings.Builder
 	sb.WriteString("SELECT id")
 	for _, c := range cols {
-		if eng == enginePG {
+		switch eng {
+		case enginePG:
 			fmt.Fprintf(&sb, ", %s::text", c)
-		} else {
+		case engineSQLite:
+			// Defensive only: no same-engine SQLite direction exists, so
+			// faithful (text-compared) columns never occur here today —
+			// but a wrong quoting style must not be the silent reason a
+			// future one misreads.
+			fmt.Fprintf(&sb, ", %q", c)
+		default:
 			fmt.Fprintf(&sb, ", `%s`", c)
 		}
 	}
@@ -234,7 +287,7 @@ func readCanonical(ctx context.Context, db *sql.DB, gc *genCase, cols []string, 
 		}
 		out := map[string][]sql.NullString{}
 		for i := 0; i < n; i++ {
-			out["__rowcount__"] = append(out["__rowcount__"], sql.NullString{})
+			out[fuzzRowCountKey] = append(out[fuzzRowCountKey], sql.NullString{})
 		}
 		return out, nil
 	}

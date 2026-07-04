@@ -100,6 +100,21 @@ func generateCase(seed int64, idx int, dir direction) genCase {
 		if s < 0 {
 			continue
 		}
+		// SQLite-target refusal down-weighting: into a SQLite target,
+		// EVERY array shape and several whole families are documented
+		// loud-refuses (ADR-0134 §1). Unbiased draws would put a refused
+		// column in nearly every case, so the whole-case loud-refuse
+		// expectation would swallow the direction — the sqlite WRITE path
+		// would never be value-fuzzed. Keep the refusal class pinned (a
+		// 1-in-20 draw keeps it) but usually swap an array down to its
+		// scalar value path, and drop the always-refused families.
+		if dir.dst == engineSQLite && expectedOutcome(f, dir, shape(s)) == outcomeLoudRefuse && r.Intn(20) > 0 {
+			s = int(shapeScalar)
+			if !f.canSource(dir.src, shapeScalar) ||
+				expectedOutcome(f, dir, shapeScalar) == outcomeLoudRefuse {
+				continue
+			}
+		}
 		c := genColumn{
 			name: fmt.Sprintf("c%02d_%s_%s", colIdx, f.name, shapeTag(shape(s))),
 			fam:  f,
@@ -109,7 +124,7 @@ func generateCase(seed int64, idx int, dir direction) genCase {
 			// path; an all-NULL array would make the assertion vacuous
 			// (Findings 1 & 2).
 			forceNonNullLeaf: shape(s) != shapeScalar &&
-				f.expect(dir, shape(s)) == outcomeLoudRefuse,
+				expectedOutcome(f, dir, shape(s)) == outcomeLoudRefuse,
 		}
 		if f.name == "enum" && dir.src == enginePG {
 			enumType = enumTypeName
@@ -120,13 +135,20 @@ func generateCase(seed int64, idx int, dir direction) genCase {
 	}
 
 	// Guarantee at least one column (a degenerate empty table is
-	// uninteresting and some engines reject it).
+	// uninteresting and some engines reject it). The fallback is the
+	// first family the SOURCE can actually spell (int8 for PG/MySQL;
+	// int64 for SQLite, whose registry scope is narrower).
 	if len(cols) == 0 {
-		f := reg[0] // int8 — always source-capable everywhere
-		cols = append(cols, genColumn{
-			name: "c00_int8_s", fam: f, shp: shapeScalar,
-			ddl: f.columnDDL(dir.src, shapeScalar),
-		})
+		for _, f := range reg {
+			if !f.canSource(dir.src, shapeScalar) {
+				continue
+			}
+			cols = append(cols, genColumn{
+				name: "c00_" + f.name + "_s", fam: f, shp: shapeScalar,
+				ddl: f.columnDDL(dir.src, shapeScalar),
+			})
+			break
+		}
 	}
 
 	rowCount := 3 + r.Intn(4) // 3..6 rows

@@ -3,8 +3,10 @@
 # The in-tree fuzz harness (internal/pipeline/
 # migrate_fuzz_roundtrip_integration_test.go) runs inside the normal
 # integration suite at a tiny deterministic smoke budget (fixed seed,
-# 4 cases per direction) so every PR exercises the *harness*. That
-# fixed seed means PR CI replays the same ~16 cases forever — the
+# 4 cases per direction — the PG/MySQL four plus the SQLite
+# source/target four, see allDirections()) so every PR exercises the
+# *harness*. That fixed seed means PR CI replays the same ~32 cases
+# forever — the
 # generator's whole point (catching the Bug-74-style next-family-over
 # defect the hand-written matrix missed) needs case DIVERSITY, which
 # is what this job adds: a weekly run at a couple hundred cases per
@@ -50,10 +52,12 @@ jobs:
   fuzz:
     name: Fuzz roundtrip
     runs-on: ubuntu-latest
-    # 200 cases × 4 directions on real containers under -race needs a
-    # generous envelope; the inner go-test timeout stays below it so
-    # Go's diagnostic timeout-panic fires before a hard job kill.
-    timeout-minutes: 170
+    # 200 cases × 8 directions on real containers under -race needs a
+    # generous envelope (the 4 SQLite directions are lighter — one
+    # container each, scalar-only sources — but still real migrates);
+    # the inner go-test timeout stays below it so Go's diagnostic
+    # timeout-panic fires before a hard job kill.
+    timeout-minutes: 300
     env:
       TESTCONTAINERS_RYUK_DISABLED: "true"
     steps:
@@ -82,7 +86,7 @@ jobs:
           SLUICE_FUZZ_ITERS: ${{ github.event.inputs.iters || '200' }}
         run: |
           echo "fuzz: seed=$SLUICE_FUZZ_SEED iters/dir=$SLUICE_FUZZ_ITERS"
-          go test -tags=integration -race -count=1 -timeout=160m \
+          go test -tags=integration -race -count=1 -timeout=290m \
             -run '^TestMigrate_FuzzRoundtrip$' ./internal/pipeline/
 
       # Each failing case is dumped as a replayable fixture; keep them.

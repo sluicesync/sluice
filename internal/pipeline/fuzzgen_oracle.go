@@ -68,7 +68,7 @@ type caseExpectation struct {
 func expectationFor(gc *genCase) caseExpectation {
 	var ce caseExpectation
 	for _, c := range gc.columns {
-		switch c.fam.expect(gc.dir, c.shp) {
+		switch expectedOutcome(c.fam, gc.dir, c.shp) {
 		case outcomeLoudRefuse:
 			ce.loudRefuse = true
 			if ce.reason == "" {
@@ -86,6 +86,13 @@ func expectationFor(gc *genCase) caseExpectation {
 	}
 	return ce
 }
+
+// fuzzRowCountKey is the pseudo-column under which readCanonical (the
+// integration driver) reports per-row presence when a case has NO
+// faithfully-comparable columns — the cross-engine regime, where the
+// canonical text is engine-specific but a silent ROW loss must still be
+// caught. classify compares its cell counts.
+const fuzzRowCountKey = "__rowcount__"
 
 // verdict is the harness's classification of one executed case.
 type verdict int
@@ -152,6 +159,16 @@ func classify(
 			"ROW COUNT MISMATCH: src has %d rows, dst has %d (silent loss)", len(src), len(dst),
 		)
 	}
+	// The cross-engine (no-faithful-columns) regime reports row presence
+	// under fuzzRowCountKey — a src/dst cell-count skew there is a silent
+	// ROW loss even though no value is text-comparable.
+	if sc, ok := src[fuzzRowCountKey]; ok {
+		if dc := dst[fuzzRowCountKey]; len(dc) != len(sc) {
+			return verdictFail, fmt.Sprintf(
+				"ROW COUNT MISMATCH: src has %d rows, dst has %d (silent loss)", len(sc), len(dc),
+			)
+		}
+	}
 	for _, col := range ce.faithfulCols {
 		sv, ok := src[col]
 		if !ok {
@@ -190,7 +207,7 @@ func nullStr(n sql.NullString) string {
 func faithfulColumnsFor(gc *genCase) []string {
 	var out []string
 	for _, c := range gc.columns {
-		if c.fam.expect(gc.dir, c.shp) == outcomeFaithful {
+		if expectedOutcome(c.fam, gc.dir, c.shp) == outcomeFaithful {
 			out = append(out, c.name)
 		}
 	}

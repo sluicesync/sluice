@@ -35,12 +35,15 @@ import (
 // engineKind is the engine flavour axis. Phase 1 is vanilla mysql:8.0 /
 // postgres:16; Phase 2 (Track 1) adds Vitess/PlanetScale flavours by
 // extending this enum + the per-kind DDL/oracle branches — an extension,
-// not a rewrite (design decision #5).
+// not a rewrite (design decision #5). SQLite joined that way: a file-based
+// engine (no container), source AND target (ADR-0128/0129/0134), always
+// cross-engine here (no sqlite→sqlite direction — see allDirections).
 type engineKind int
 
 const (
 	enginePG engineKind = iota
 	engineMySQL
+	engineSQLite
 )
 
 func (e engineKind) String() string {
@@ -49,6 +52,8 @@ func (e engineKind) String() string {
 		return "postgres"
 	case engineMySQL:
 		return "mysql"
+	case engineSQLite:
+		return "sqlite"
 	default:
 		return "unknown"
 	}
@@ -124,14 +129,26 @@ type direction struct {
 
 func (d direction) String() string { return d.src.String() + "->" + d.dst.String() }
 
-// allDirections is the Phase-1 matrix: MySQL→PG, PG→MySQL, PG→PG,
-// MySQL→MySQL (design contract Phase-1 scope).
+// allDirections is the direction matrix: the Phase-1 four (MySQL→PG,
+// PG→MySQL, PG→PG, MySQL→MySQL) plus the SQLite directions the engine
+// matrix supports — SQLite as a migrate SOURCE (ADR-0128/0129) into both
+// server engines, and SQLite as a migrate TARGET (ADR-0134) from both.
+// There is deliberately NO sqlite→sqlite direction: the same-engine
+// faithful oracle compares canonical text, and the SQLite writer
+// re-canonicalises temporal text on write (ADR-0134 §2), so a byte-text
+// compare would need writer-canonicalisation alignment — the SQLite→X→SQLite
+// value identity is pinned by the hand-authored round-trip fixtures
+// (migrate_sqlite_target_cross_integration_test.go) instead.
 func allDirections() []direction {
 	return []direction{
 		{enginePG, enginePG},
 		{engineMySQL, engineMySQL},
 		{engineMySQL, enginePG},
 		{enginePG, engineMySQL},
+		{engineSQLite, enginePG},
+		{engineSQLite, engineMySQL},
+		{enginePG, engineSQLite},
+		{engineMySQL, engineSQLite},
 	}
 }
 
@@ -142,13 +159,26 @@ type family struct {
 	// failure reports (e.g. "int32", "numeric_unconstrained").
 	name string
 
-	// pgType / myType are the scalar column type spellings in each
-	// source dialect. Empty means the family has no native spelling in
-	// that source engine (it is then skipped as a *source* there — e.g.
-	// inet has no MySQL spelling; the MySQL reader would emit varchar,
-	// which is a different family already covered).
+	// pgType / myType / sqType are the scalar column type spellings in
+	// each source dialect. Empty means the family has no native spelling
+	// in that source engine (it is then skipped as a *source* there —
+	// e.g. inet has no MySQL spelling; the MySQL reader would emit
+	// varchar, which is a different family already covered). sqType is
+	// the SQLite DECLARED type; only families whose declared type resolves
+	// back to the same class under the reader's affinity + ADR-0129
+	// declared-temporal/bool rules carry one (see the exclusion notes in
+	// registry()).
 	pgType string
 	myType string
+	sqType string
+
+	// sqliteTargetRefused marks a family whose IR type the SQLite WRITER
+	// refuses loudly at schema emit (ADR-0134 §1: bit/varbit,
+	// inet/cidr/macaddr — no faithful SQLite storage, never coerced to
+	// silently-wrong text). Consumed by expectedOutcome for the
+	// X→sqlite directions; array shapes are refused there wholesale
+	// (ir.Array is on the same emit-refusal list) without needing a flag.
+	sqliteTargetRefused bool
 
 	// shapes lists which shapes this family supports as a source. Array
 	// shapes only apply to PG sources (MySQL has no array type); a
@@ -171,14 +201,22 @@ type family struct {
 // canSource reports whether this family can be a source column in the
 // given engine at the given shape.
 func (f *family) canSource(src engineKind, s shape) bool {
-	if src == engineMySQL && s != shapeScalar {
-		return false // MySQL has no array type — never an array source.
+	if src != enginePG && s != shapeScalar {
+		return false // only PG has an array type — never an array source elsewhere.
 	}
-	if src == enginePG && f.pgType == "" {
-		return false
-	}
-	if src == engineMySQL && f.myType == "" {
-		return false
+	switch src {
+	case enginePG:
+		if f.pgType == "" {
+			return false
+		}
+	case engineMySQL:
+		if f.myType == "" {
+			return false
+		}
+	case engineSQLite:
+		if f.sqType == "" {
+			return false
+		}
 	}
 	for _, have := range f.shapes {
 		if have == s {
@@ -194,8 +232,11 @@ func (f *family) canSource(src engineKind, s shape) bool {
 // intent and matches the battle-test fixtures).
 func (f *family) columnDDL(src engineKind, s shape) string {
 	base := f.pgType
-	if src == engineMySQL {
+	switch src {
+	case engineMySQL:
 		base = f.myType
+	case engineSQLite:
+		base = f.sqType
 	}
 	switch s {
 	case shape1DArray:
@@ -213,6 +254,8 @@ func (f *family) columnDDL(src engineKind, s shape) string {
 // ≥2-D nesting are generator-driven, exercising the Bug 73/74 class).
 // ---------------------------------------------------------------------
 
+// quotePG is standard SQL string quoting (doubled single quotes, no
+// backslash escapes) — PG and SQLite share it; MySQL needs quoteMy.
 func quotePG(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
 
 func quoteMy(s string) string {
@@ -287,9 +330,62 @@ func sameEngineFaithful(d direction, _ shape) outcome {
 // family can opt in deliberately rather than by oversight).
 func alwaysFaithful(d direction, s shape) outcome { return sameEngineFaithful(d, s) }
 
+// expectedOutcome is THE single expectation lookup — every consumer
+// (generator, oracle) resolves a (family, direction, shape) through it,
+// never through f.expect directly. It centralises the SQLite-TARGET
+// refusal classes (ADR-0134 §1: the writer refuses ir.Array — every
+// array shape — and the sqliteTargetRefused families loudly at schema
+// emit) so the per-family closures, written for the Phase-1 PG/MySQL
+// matrix, don't each need a d.dst==sqlite branch (several fall through
+// to outcomeFaithful for "any other direction", which would silently
+// misclassify a sqlite target). Every non-refused X→sqlite case is
+// lossy-documented per the Phase-1 cross-engine scope note above.
+func expectedOutcome(f *family, d direction, s shape) outcome {
+	if d.dst == engineSQLite {
+		if s != shapeScalar || f.sqliteTargetRefused {
+			return outcomeLoudRefuse // ADR-0134 emit refusal (array / bit / net)
+		}
+		return outcomeLossyDocument
+	}
+	return f.expect(d, s)
+}
+
+// withSQLite gives a family its SQLite source spelling (a DECLARED type
+// the reader resolves back to the same class via affinity + the ADR-0129
+// declared-temporal/bool rules). SQLite-source coverage is deliberately
+// the storage-class core — the excluded families are annotated inline in
+// registry() with the ADR that documents each asymmetry.
+func withSQLite(f *family, declared string) *family {
+	f.sqType = declared
+	return f
+}
+
 // registry is the curated set of families. Every family that produced a
 // v0.69.x bug is present and annotated with its Bug number. The axes
 // (family × shape) ARE the "pin the class" matrix.
+//
+// SQLite-SOURCE scope (which families carry an sqType): SQLite has five
+// storage classes plus the ADR-0129 declared-type overrides, so the
+// sqlite-source families are exactly int64/float8/bool/text/blob/date/
+// time/timestamp. The exclusions are documented asymmetries, NOT
+// oversights:
+//   - numeric_15_4 / numeric_unconstrained: SQLite NUMERIC/DECIMAL
+//     affinity silently coerces a decimal literal to REAL/INTEGER at
+//     INSERT (the Bug 162 / ADR-0134 §2 crux) — there is no declared
+//     type that stores exact decimal text AND reads back as ir.Decimal;
+//     a real-world decimal-as-TEXT source is the text family's domain.
+//   - json: a JSON-declared column resolves to NUMERIC affinity (the
+//     reader has no JSON resolution — ADR-0134 alternatives) and would
+//     loud-refuse the object text; JSON-as-TEXT is the text family.
+//   - timestamptz / timetz: SQLite is tz-naive (ADR-0134 tz wart).
+//   - int8/16/24/32 + all unsigned: SQLite integers are 64-bit signed
+//     with no width/sign spellings — int64 IS the class.
+//   - char/varchar (+wide): SQLite does not enforce declared length;
+//     they widen to TEXT (ADR-0134 §1) — the text family covers it.
+//   - varbinary: a VARBINARY-declared column has NUMERIC affinity under
+//     SQLite's rules (no BLOB substring) — blob (declared BLOB) is the
+//     faithful binary class.
+//   - bit/varbit/uuid/inet/cidr/macaddr/enum: no SQLite spelling.
 func registry() []*family {
 	return []*family{
 		// --- Integers: signed + unsigned, all widths (Bug-class:
@@ -298,7 +394,10 @@ func registry() []*family {
 		intFamily("int16", "smallint", "smallint", false, -32768, 32767),
 		intFamily("int24", "integer", "mediumint", false, -8388608, 8388607),
 		intFamily("int32", "integer", "int", false, -2147483648, 2147483647),
-		intFamily("int64", "bigint", "bigint", false, -9.0e18, 9.0e18),
+		// int64 is also the SQLite integer class — its generated range
+		// crosses 2^53 both ways, so the sqlite→X directions carry the
+		// exact-int discipline (ADR-0128/0132).
+		withSQLite(intFamily("int64", "bigint", "bigint", false, -9.0e18, 9.0e18), "INTEGER"),
 		// Unsigned MySQL ints. PG has no unsigned; cross-engine is a
 		// documented widen (faithful values, type-mapping.md §unsigned).
 		uintFamily("uint8", "tinyint unsigned", 0, 255),
@@ -314,32 +413,36 @@ func registry() []*family {
 		decimalConstrained(),
 		decimalUnconstrained(),
 
-		// --- Float.
+		// --- Float. float8 doubles as the SQLite REAL class (SQLite
+		//     reals are 8-byte).
 		floatFamily("float4", "real", "float", true),
-		floatFamily("float8", "double precision", "double", false),
+		withSQLite(floatFamily("float8", "double precision", "double", false), "REAL"),
 
-		// --- Boolean.
-		boolFamily(),
+		// --- Boolean (SQLite: ADR-0129 declared-BOOLEAN + 0/1 values).
+		withSQLite(boolFamily(), "BOOLEAN"),
 
 		// --- Char / Varchar / Text incl. WIDE varchar >16383 (Bug 72).
 		strFamily("char", "char(64)", "char(64)", 64),
 		strFamily("varchar", "varchar(255)", "varchar(255)", 255),
 		wideVarcharFamily(), // varchar(20000) — Bug 72 down-map class
-		textFamily(),
+		withSQLite(textFamily(), "TEXT"),
 
 		// --- Binary / Varbinary / Blob.
 		binFamily("varbinary", "bytea", "varbinary(64)"),
-		blobFamily(),
+		withSQLite(blobFamily(), "BLOB"),
 
 		// --- Bit / Varbit (Bug 75 silent corruption class).
 		bitFamily("bit8", "bit(8)", "bit(8)", 8),
 		varbitFamily(),
 
 		// --- Temporal: date/time/timestamp/timestamptz/timetz (Bug 71).
-		dateFamily(),
-		timeFamily(),
+		//     The SQLite spellings ride ADR-0129's declared-type override
+		//     with the default `iso` TEXT encoding (the generators emit
+		//     quoted ISO literals).
+		withSQLite(dateFamily(), "DATE"),
+		withSQLite(timeFamily(), "TIME"),
 		timetzFamily(), // Bug 71 — PG faithful, MySQL zone-flatten/array-refuse
-		timestampFamily(),
+		withSQLite(timestampFamily(), "DATETIME"),
 		timestamptzFamily(),
 
 		// --- JSON.
@@ -490,7 +593,10 @@ func boolFamily() *family {
 			if r.Intn(6) == 0 {
 				return "", true
 			}
-			if src == engineMySQL {
+			// MySQL tinyint(1) and SQLite BOOLEAN both take 0/1 (the
+			// ADR-0129 canonical INTEGER bool storage); PG takes the
+			// keywords.
+			if src != enginePG {
 				if r.Intn(2) == 0 {
 					return "1", false
 				}
@@ -571,8 +677,14 @@ func textFamily() *family {
 }
 
 // randHex emits up to maxBytes random bytes as a lowercase hex string
-// (possibly empty — exercises the zero-length binary edge case).
+// (possibly empty — exercises the zero-length binary edge case). A
+// 1-in-4 draw pins the byte-boundary values (0x00 / 0xFF / the int8
+// sign edge) so every run exercises them rather than leaving them to
+// chance.
 func randHex(r *rand.Rand, maxBytes int) string {
+	if r.Intn(4) == 0 {
+		return "00ff7f80"
+	}
 	n := r.Intn(maxBytes)
 	var b strings.Builder
 	for i := 0; i < n; i++ {
@@ -582,15 +694,19 @@ func randHex(r *rand.Rand, maxBytes int) string {
 }
 
 // binLiteral renders a hex byte string as a source-dialect binary
-// literal (MySQL 0x.. / PG bytea \x.., empty handled).
+// literal (MySQL 0x.. / SQLite x'..' / PG bytea \x.., empty handled).
 func binLiteral(h string, src engineKind) string {
-	if src == engineMySQL {
+	switch src {
+	case engineMySQL:
 		if h == "" {
 			return "''"
 		}
 		return "0x" + h
+	case engineSQLite:
+		return "x'" + h + "'" // x'' is the valid empty blob
+	default:
+		return castPG(quotePG("\\x"+h), "bytea")
 	}
-	return castPG(quotePG("\\x"+h), "bytea")
 }
 
 func binFamily(name, pg, my string) *family {
@@ -624,6 +740,9 @@ func blobFamily() *family {
 func bitFamily(name, pg, my string, n int) *family {
 	return &family{
 		name: name, pgType: pg, myType: my, shapes: scalarOnly(),
+		// ir.Bit has no faithful SQLite storage — the writer refuses it
+		// loudly at emit (ADR-0134 §1).
+		sqliteTargetRefused: true,
 		gen: func(r *rand.Rand, src engineKind) (string, bool) {
 			if r.Intn(6) == 0 {
 				return "", true
@@ -650,6 +769,9 @@ func bitFamily(name, pg, my string, n int) *family {
 func varbitFamily() *family {
 	return &family{
 		name: "varbit", pgType: "bit varying(16)", myType: "bit(16)", shapes: scalarOnly(),
+		// ir.Varbit/ir.Bit are on the SQLite writer's emit-refusal list
+		// (ADR-0134 §1).
+		sqliteTargetRefused: true,
 		gen: func(r *rand.Rand, src engineKind) (string, bool) {
 			if r.Intn(6) == 0 {
 				return "", true
@@ -746,12 +868,24 @@ func timetzFamily() *family {
 func timestampFamily() *family {
 	return &family{
 		name: "timestamp", pgType: "timestamp", myType: "datetime(6)", shapes: arrayShapes(),
-		gen: func(r *rand.Rand, _ engineKind) (string, bool) {
+		gen: func(r *rand.Rand, src engineKind) (string, bool) {
 			if r.Intn(6) == 0 {
 				return "", true
 			}
+			// PG timestamp / MySQL datetime take the full 1970..2049 spread.
+			year := 1970 + r.Intn(80)
+			if src == engineSQLite {
+				// A SQLite DATETIME reads back as ir.Timestamp (ADR-0129),
+				// which the MySQL writer emits as TIMESTAMP(6) — supported
+				// instants end 2038-01-19 (and exclude the 1970 epoch
+				// second). Stay inside 1971..2030 so sqlite→mysql values
+				// are representable — the same window timestamptzFamily
+				// uses for the same wall. An out-of-window value is a
+				// documented LOUD refusal (Error 1292), not a fuzz target.
+				year = 1971 + r.Intn(60)
+			}
 			return fmt.Sprintf("'%04d-%02d-%02d %02d:%02d:%02d'",
-				1970+r.Intn(80), 1+r.Intn(12), 1+r.Intn(28),
+				year, 1+r.Intn(12), 1+r.Intn(28),
 				r.Intn(24), r.Intn(60), r.Intn(60)), false
 		},
 		expect: alwaysFaithful,
@@ -833,6 +967,9 @@ func uuidFamily() *family {
 func netFamily(name, pgType string) *family {
 	return &family{
 		name: name, pgType: pgType, myType: "", shapes: arrayShapes(),
+		// ir.Inet/Cidr/Macaddr have no faithful SQLite storage — refused
+		// loudly at emit (ADR-0134 §1).
+		sqliteTargetRefused: true,
 		gen: func(r *rand.Rand, _ engineKind) (string, bool) {
 			if r.Intn(6) == 0 {
 				return "", true
