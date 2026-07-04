@@ -560,6 +560,53 @@ func TestBundle_RedactCLIArgs(t *testing.T) {
 	}
 }
 
+// TestBundle_RedactCLIArgs_SecretFlags pins the bare-secret flag
+// family: every credential-carrying flag (tokens, webhook URLs whose
+// path is the secret, passphrases) is masked WHOLE — in both the
+// `--flag value` and `--flag=value` forms — and no secret substring
+// survives into the bundled command line.
+func TestBundle_RedactCLIArgs_SecretFlags(t *testing.T) {
+	flags := []string{
+		"--planetscale-metrics-token",
+		"--planetscale-metrics-token-id",
+		"--notify-webhook",
+		"--notify-slack",
+		"--notify-smtp-password",
+		"--encryption-passphrase",
+	}
+	const secret = "hunter2-T00Vq/secret"
+	for _, flag := range flags {
+		t.Run(flag, func(t *testing.T) {
+			forms := [][]string{
+				{"sync", "start", flag, secret},
+				{"sync", "start", flag + "=" + secret},
+			}
+			for _, args := range forms {
+				got := RedactCLIArgs(args)
+				if len(got) != len(args) {
+					t.Fatalf("RedactCLIArgs(%v) length = %d, want %d", args, len(got), len(args))
+				}
+				joined := strings.Join(got, " ")
+				if strings.Contains(joined, secret) {
+					t.Errorf("RedactCLIArgs(%v) leaked the secret: %v", args, got)
+				}
+				if !strings.Contains(joined, "<redacted>") {
+					t.Errorf("RedactCLIArgs(%v) did not mask the value: %v", args, got)
+				}
+				if !strings.Contains(joined, flag) {
+					t.Errorf("RedactCLIArgs(%v) dropped the flag name: %v", args, got)
+				}
+			}
+		})
+	}
+	// A trailing secret flag with no value must not panic or index past
+	// the end.
+	got := RedactCLIArgs([]string{"sync", "--notify-slack"})
+	if len(got) != 2 || got[1] != "--notify-slack" {
+		t.Errorf("trailing valueless flag mangled: %v", got)
+	}
+}
+
 // TestBundle_RejectsUnsetPrivacyLevel pins the loud-failure contract
 // for misconfigured requests — the assembler must refuse rather than
 // silently default.

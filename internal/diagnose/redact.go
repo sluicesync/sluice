@@ -74,17 +74,26 @@ func RedactDSN(dsn string) string {
 	return "<dsn>"
 }
 
-// RedactCLIArgs returns a copy of args with any value of a flag whose
-// name matches a DSN-bearing pattern run through [RedactDSN]. The
-// recognised flag families:
+// redactedValue replaces the whole value of a bare-secret flag in the
+// bundled command line. Unlike [RedactDSN] there is no host/db locator
+// worth preserving — the value IS the credential.
+const redactedValue = "<redacted>"
+
+// RedactCLIArgs returns a copy of args with credential-bearing flag
+// values redacted. Two flag families are recognised:
 //
-//   - --source, --target (the canonical DSN flags)
-//   - --keyset-source, --backup-target, --position-from-manifest (URL-
-//     shaped flags that may carry embedded credentials)
+//   - DSN-bearing flags — --source, --target (the canonical DSN
+//     flags), --keyset-source, --backup-target,
+//     --position-from-manifest (URL-shaped flags that may carry
+//     embedded credentials) — are run through [RedactDSN], which
+//     preserves the host[:port][/db] locator.
+//   - Bare-secret flags ([isSecretFlag]) — tokens, webhook URLs whose
+//     path is the secret, passphrases — have their whole value
+//     replaced with [redactedValue].
 //
 // Both forms are handled: `--flag value` (two tokens) and
 // `--flag=value` (single token). Flags that aren't in the recognised
-// set are passed through untouched.
+// sets are passed through untouched.
 //
 // This is the surface the `standard` and `verbose` privacy levels use
 // to embed the operator's command-line in the bundle without leaking
@@ -99,15 +108,24 @@ func RedactCLIArgs(args []string) []string {
 			eq := strings.Index(arg, "=")
 			if eq > 0 {
 				name := arg[:eq]
-				if isDSNFlag(name) {
+				switch {
+				case isDSNFlag(name):
 					out[i] = name + "=" + RedactDSN(arg[eq+1:])
+				case isSecretFlag(name):
+					out[i] = name + "=" + redactedValue
 				}
 				continue
 			}
 			// --flag value form: redact the next argument.
-			if isDSNFlag(arg) && i+1 < len(out) {
-				out[i+1] = RedactDSN(out[i+1])
-				i++ // skip the value we just rewrote
+			if i+1 < len(out) {
+				switch {
+				case isDSNFlag(arg):
+					out[i+1] = RedactDSN(out[i+1])
+					i++ // skip the value we just rewrote
+				case isSecretFlag(arg):
+					out[i+1] = redactedValue
+					i++
+				}
 			}
 		}
 	}
@@ -125,6 +143,25 @@ func isDSNFlag(name string) bool {
 		"--keyset-source",
 		"--backup-target",
 		"--position-from-manifest":
+		return true
+	}
+	return false
+}
+
+// isSecretFlag reports whether the flag's value is itself a
+// credential and must be masked WHOLE ([redactedValue]), not run
+// through the DSN redactor: service tokens, webhook URLs (a Slack
+// incoming-webhook URL's path IS the secret), and passphrases. The
+// list is curated for the same reason as [isDSNFlag]'s — it mirrors
+// the cmd/sluice flags whose help text marks them as credentials.
+func isSecretFlag(name string) bool {
+	switch name {
+	case "--planetscale-metrics-token",
+		"--planetscale-metrics-token-id",
+		"--notify-webhook",
+		"--notify-slack",
+		"--notify-smtp-password",
+		"--encryption-passphrase":
 		return true
 	}
 	return false
