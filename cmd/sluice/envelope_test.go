@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/pipeline"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // captureEnvelope redirects the run's stdout writer into a buffer and
@@ -119,6 +120,46 @@ func TestEnvelope_RefusedVsFailedClassification(t *testing.T) {
 			}
 			if _, ok := doc["next_steps"]; ok {
 				t.Fatalf("next_steps must be omitted on %s: %v", tc.wantStatus, doc["next_steps"])
+			}
+		})
+	}
+}
+
+// TestEnvelope_CodedRefusalReclassifiesAfterEngage pins the
+// sluicecode merge point: a ClassRefusal CodedError surfacing AFTER
+// markEngaged still reports status "refused" (consistent with its
+// exit-3 taxonomy class) and lifts code + hint into the error object;
+// a ClassRuntime CodedError keeps the engagement classification
+// ("failed") while still carrying its code.
+func TestEnvelope_CodedRefusalReclassifiesAfterEngage(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		code       sluicecode.Code
+		wantStatus string
+	}{
+		{name: "refusal class wins over engagement", code: sluicecode.CodeColdStartTargetNotEmpty, wantStatus: "refused"},
+		{name: "runtime class keeps failed", code: sluicecode.CodeBulkCopyTableFailed, wantStatus: "failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnvelopeRun("migrate", "json")
+			buf := captureEnvelope(e)
+			e.markEngaged()
+
+			runErr := sluicecode.Wrap(tc.code, "pass --reset-target-data for a clean re-copy",
+				errors.New("cold-start refused: target table \"public.users\" already contains data"))
+			if got := e.finish(runErr); !errors.Is(got, runErr) {
+				t.Fatalf("finish must return the run error unchanged; got %v", got)
+			}
+			doc := decodeEnvelope(t, buf)
+			if doc["status"] != tc.wantStatus {
+				t.Fatalf("status: got %v, want %s", doc["status"], tc.wantStatus)
+			}
+			errObj := doc["error"].(map[string]any)
+			if errObj["code"] != string(tc.code) {
+				t.Fatalf("error.code: got %v, want %s", errObj["code"], tc.code)
+			}
+			if errObj["hint"] == "" || errObj["hint"] == nil {
+				t.Fatalf("error.hint must carry the remedy; got %v", errObj["hint"])
 			}
 		})
 	}

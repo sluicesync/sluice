@@ -19,13 +19,13 @@ package main
 //
 // Status classification: "refused" covers errors returned BEFORE the
 // pipeline engaged (CLI-side flag/config validation and preflight
-// resolution — sluice declined before touching any data work);
-// "failed" covers everything after markEngaged. Pipeline-internal
-// preflight refusals (e.g. the populated-target cold-start refusal)
-// currently classify as "failed" because the error values carry no
-// programmatic refusal marker — the planned error-code chunk adds a
-// `code` field to envelopeError (an additive change to this shape) and
-// can reclassify without breaking consumers.
+// resolution — sluice declined before touching any data work) AND any
+// error whose chain carries a ClassRefusal [sluicecode.CodedError]
+// (the loud-failure refusals: populated-target cold-start, extension
+// gates, value refusals, …) regardless of engagement — keeping the
+// envelope status consistent with the exit-code taxonomy, where a
+// refusal exits 3. "failed" covers everything else after markEngaged.
+// Uncoded pipeline errors classify by the engagement boundary alone.
 //
 // Redaction: no envelope field is built from a DSN — engines are names
 // only, plan hosts are pre-redacted, next-step suggestions use
@@ -47,6 +47,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/diagnose"
 	"sluicesync.dev/sluice/internal/pipeline"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // Envelope status values. Stable strings — agents branch on them.
@@ -92,6 +93,11 @@ type envelopeResume struct {
 // error-code chunk adds a stable `code` field alongside it.
 type envelopeError struct {
 	Message string `json:"message"`
+	// Code and Hint surface the stable SLUICE-E-* error code and its
+	// remedy when the failure carries one (docs/operator/error-codes.md);
+	// absent for uncoded errors.
+	Code string `json:"code,omitempty"`
+	Hint string `json:"hint,omitempty"`
 }
 
 // planEnvelope is the `--dry-run --format json` shape: the plan
@@ -246,6 +252,19 @@ func (e *envelopeRun) buildResult(err error) resultEnvelope {
 			env.Status = envelopeStatusRefused
 		}
 		env.Error = &envelopeError{Message: e.scrubText(err.Error())}
+		// A coded error lifts its stable code + remedy hint into the
+		// envelope, and a ClassRefusal reclassifies the status even
+		// after engagement — keeping the envelope consistent with the
+		// exit-code taxonomy (a refusal exits 3; an agent must never
+		// see exit 3 alongside status "failed"). Uncoded errors keep
+		// the engagement-boundary classification above.
+		if ce, ok := sluicecode.FromError(err); ok {
+			env.Error.Code = string(ce.Code)
+			env.Error.Hint = e.scrubText(ce.Hint)
+			if info, known := sluicecode.Describe(ce.Code); known && info.Class == sluicecode.ClassRefusal {
+				env.Status = envelopeStatusRefused
+			}
+		}
 		return env
 	}
 	env.NextSteps = e.nextSteps
