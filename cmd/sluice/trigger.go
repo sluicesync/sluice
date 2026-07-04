@@ -554,8 +554,3 @@ func printPruneResult(label string, cut, deleted, remainingMin, remaining int64,
 func triggerSetupExampleSchema(s string) string {
 	return strings.TrimSpace(s)
 }
-
-// _ ensures the context import stays referenced even if the kong
-// wiring ever moves Run signatures around. The Run method uses
-// kongContext() which returns context.Context.
-var _ = context.Background

@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"sort"
 	"text/tabwriter"
 	"time"
@@ -397,9 +396,3 @@ func renderStatusJSON(out io.Writer, streams []ir.StreamStatus, leases []ir.Shar
 	enc.SetIndent("", "  ")
 	return enc.Encode(doc)
 }
-
-// (intentionally unused parameter `os.Stdout` interception: the
-// runStatus* functions take an io.Writer so tests can capture
-// rendered output. The os import is kept for the kongContext default
-// in cli.go's caller path.)
-var _ = os.Stdout
