@@ -178,11 +178,13 @@ func (r *RowReader) CountRows(ctx context.Context, table *ir.Table) (int64, erro
 //     off-snapshot read is correct, and a fresh conn cannot race the
 //     pinned reader's in-flight stream — that connection conflict is
 //     exactly the regression a relaxed CountRows caused (the ETA probe
-//     firing on the pinned conn mid-copy → driver: bad connection). The
-//     exact-COUNT(*) fallback is DECLINED on a pinned reader: that full
-//     seq scan would run on the live snapshot connection (minutes on a
-//     huge table) — cost, not safety. So a pinned reader gets reltuples
-//     when stats exist and 0 otherwise.
+//     firing on the pinned conn mid-copy → driver: bad connection). On
+//     the never-ANALYZEd reltuples sentinel, the exact-COUNT(*)
+//     resolution splits by reader provenance — the migrate shared-
+//     snapshot primary runs it on the same fresh estimator conn
+//     (estimatorExactCount; the ADR-0042 N1 contract), sync-import
+//     readers decline it (the ADR-0079 v1.1 cost decision) — see
+//     [RowReader.reltuplesOffConn].
 //   - Non-pinned migrate reader (an *sql.DB-backed reader): query on r.q
 //     and KEEP the exact-COUNT(*) fallback, so migrate's chunk decision is
 //     byte-identical to its prior CountRows behaviour (ADR-0042 N1 — a
@@ -246,10 +248,23 @@ func (r *RowReader) reltuplesEstimate(ctx context.Context, q querier, table *ir.
 // untouched. Used by [RowReader.EstimateRowCount] on a snapshot-pinned
 // reader: pg_class.reltuples is snapshot-insensitive, so this off-snapshot
 // read is correct, and it cannot race the pinned reader's in-flight stream.
-// A negative reltuples (the never-ANALYZEd sentinel) or a missing
-// estimatorDSN reports 0 (→ single-stream); the exact-COUNT(*) fallback is
-// deliberately NOT taken on a pinned reader (a full seq scan on the live
-// snapshot conn — cost, not safety).
+//
+// On the never-ANALYZEd sentinel (reltuples <= 0), the exact-COUNT(*)
+// resolution is split by r.estimatorExactCount:
+//
+//   - true (the migrate shared-snapshot primary — see the field doc on
+//     [RowReader]): run the exact COUNT(*) on this SAME fresh estimator
+//     connection. The chunk DECISION has no consistency requirement (it
+//     is a size estimate; the chunk BOUNDS min/max and the row streams
+//     themselves stay on snapshot-pinned connections), so an autocommit
+//     off-snapshot count is correct — and it restores migrate's
+//     ADR-0042 N1 contract that a freshly-loaded, never-ANALYZEd source
+//     still parallelizes.
+//   - false (sync cold-start SnapshotImporter readers): report 0 →
+//     single-stream, the named ADR-0079 v1.1 limitation (declining the
+//     preflight seq scan there is a COST decision, unchanged).
+//
+// A missing estimatorDSN reports 0 (→ single-stream) either way.
 func (r *RowReader) reltuplesOffConn(ctx context.Context, table *ir.Table) (int64, error) {
 	if r.estimatorDSN == "" {
 		// No DSN threaded in (e.g. a NewSnapshotRowReader built by a
@@ -266,9 +281,11 @@ func (r *RowReader) reltuplesOffConn(ctx context.Context, table *ir.Table) (int6
 		return 0, err
 	}
 	if count <= 0 {
+		if r.estimatorExactCount {
+			return r.exactCountOn(ctx, db, table)
+		}
 		// never-ANALYZEd sentinel / genuinely empty: single-stream (the
-		// named ADR-0079 v1.1 limitation; the exact COUNT(*) is declined on
-		// a pinned reader by design).
+		// named ADR-0079 v1.1 limitation for sync-import readers).
 		return 0, nil
 	}
 	return count, nil
@@ -383,13 +400,22 @@ func (r *RowReader) sampleKeysetOn(ctx context.Context, q querier, table *ir.Tab
 	return out, nil
 }
 
-// exactCount runs SELECT COUNT(*) for the table. Used only as the
-// CountRows fallback when pg_class.reltuples is non-positive
-// (stale/never-analyzed or empty). Identifiers are quoted, not
-// parameterized — Postgres does not bind identifiers.
+// exactCount runs SELECT COUNT(*) for the table on the reader's own
+// querier. Used as the CountRows / non-pinned EstimateRowCount fallback
+// when pg_class.reltuples is non-positive (stale/never-analyzed or
+// empty).
 func (r *RowReader) exactCount(ctx context.Context, table *ir.Table) (int64, error) {
-	q := `SELECT COUNT(*) FROM ` + quoteIdent(r.effectiveSchema(table)) + `.` + quoteIdent(table.Name)
-	rows, err := r.q.QueryContext(ctx, q) //nolint:rowserrcheck,sqlclosecheck // handled below
+	return r.exactCountOn(ctx, r.q, table)
+}
+
+// exactCountOn runs SELECT COUNT(*) for the table against q — the
+// reader's own querier for the non-pinned paths, or the fresh
+// off-snapshot estimator connection for the pinned migrate-primary path
+// ([RowReader.reltuplesOffConn] with estimatorExactCount). Identifiers
+// are quoted, not parameterized — Postgres does not bind identifiers.
+func (r *RowReader) exactCountOn(ctx context.Context, q querier, table *ir.Table) (int64, error) {
+	stmt := `SELECT COUNT(*) FROM ` + quoteIdent(r.effectiveSchema(table)) + `.` + quoteIdent(table.Name)
+	rows, err := q.QueryContext(ctx, stmt) //nolint:rowserrcheck,sqlclosecheck // handled below
 	if err != nil {
 		return 0, fmt.Errorf("postgres: CountRows exact COUNT(*): %w", err)
 	}

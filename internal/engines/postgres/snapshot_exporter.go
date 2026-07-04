@@ -76,15 +76,23 @@ func (e Engine) ExportSnapshot(ctx context.Context, dsn string) (*ir.ExportedSna
 	// CountRows overlapping-query deadlock guard engages, and the
 	// estimator DSN threaded so the pre-stream chunk decision probes
 	// reltuples on a FRESH conn, never the pinned one (ADR-0079 v1.1).
-	// closer stays nil — the ExportedSnapshot closures own the lifecycle,
-	// exactly like the backup snapshot's reader.
+	// estimatorExactCount keeps migrate's ADR-0042 N1 chunk-decision
+	// contract: on the never-ANALYZEd reltuples sentinel the estimate
+	// resolves via an exact COUNT(*) on that same fresh off-snapshot
+	// conn (a size DECISION needs no snapshot consistency — the chunk
+	// BOUNDS and row streams stay pinned), so a freshly-loaded source
+	// still parallelizes exactly as it did when the migrate primary was
+	// a non-pinned *sql.DB reader. closer stays nil — the
+	// ExportedSnapshot closures own the lifecycle, exactly like the
+	// backup snapshot's reader.
 	rows := &RowReader{
-		q:              conn,
-		schema:         cfg.schema,
-		closer:         nil,
-		snapshotPinned: true,
-		estimatorDSN:   cfg.dsn,
-		estimatorAppID: cfg.appID,
+		q:                   conn,
+		schema:              cfg.schema,
+		closer:              nil,
+		snapshotPinned:      true,
+		estimatorDSN:        cfg.dsn,
+		estimatorAppID:      cfg.appID,
+		estimatorExactCount: true,
 	}
 
 	released := false

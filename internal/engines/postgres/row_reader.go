@@ -85,6 +85,23 @@ type RowReader struct {
 	// the "-" fallback).
 	estimatorAppID string
 
+	// estimatorExactCount opts the pinned-reader estimate path
+	// ([RowReader.reltuplesOffConn]) back into the exact-COUNT(*)
+	// fallback when pg_class.reltuples reports the never-ANALYZEd
+	// sentinel — running the COUNT on the SAME fresh off-snapshot
+	// estimator connection, never the pinned conn (safety is identical
+	// either way; the fallback question was always cost). Set ONLY by
+	// [Engine.ExportSnapshot] on the migrate shared-snapshot primary
+	// reader: migrate's chunk decision contractually parallelizes a
+	// freshly-loaded, never-ANALYZEd source (ADR-0042 N1), and losing
+	// the fallback when the primary became snapshot-pinned silently
+	// routed every such table to the single-reader path (the
+	// TestRawCopy_ChunkedZeroLoss regression). The sync cold-start's
+	// SnapshotImporter readers keep it false — declining the
+	// preflight seq scan there is the documented ADR-0079 v1.1
+	// limitation, unchanged.
+	estimatorExactCount bool
+
 	mu  sync.Mutex
 	err error // sticky error from the most recent ReadRows call
 }
