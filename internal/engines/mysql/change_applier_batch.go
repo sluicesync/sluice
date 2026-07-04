@@ -224,13 +224,8 @@ func (a *ChangeApplier) warnKeylessOnce(ctx context.Context, qn string) {
 	if !a.markWarnedKeyless(qn) {
 		return
 	}
-	slog.WarnContext(ctx,
-		"mysql: applier: table has no PRIMARY KEY or unique index — its INSERTs are not "+
-			"idempotent, so keyless CDC is at-least-once: a crash before the source "+
-			"transaction's commit checkpoint re-inserts this table's rows from the interrupted "+
-			"transaction on resume (keyed tables are exactly-once). Each change is applied as its "+
-			"own transaction to bound the window, but rows in the same source transaction still "+
-			"replay together. Add a PRIMARY KEY (or a UNIQUE index) for exactly-once, batched "+
-			"throughput (ADR-0089)",
-		slog.String("table", qn))
+	// MySQL's ON DUPLICATE KEY UPDATE keys off any unique index, so the
+	// diagnosis and advice name a plain UNIQUE index (PG needs NOT NULL —
+	// see appliershared.WarnKeyless).
+	appliershared.WarnKeyless(ctx, "mysql", qn, "unique index", "a UNIQUE index")
 }

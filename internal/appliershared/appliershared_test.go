@@ -4,8 +4,11 @@
 package appliershared
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -115,5 +118,53 @@ func TestTruncateToken(t *testing.T) {
 	}
 	if got := TruncateToken("abcde", 4); got != "abc…" {
 		t.Errorf("over-limit token: got %q; want %q", got, "abc…")
+	}
+}
+
+// TestWarnKeyless pins the shared ADR-0089 keyless WARN: the honest
+// at-least-once wording (Bug 143 — never the old "cannot duplicate"
+// over-promise) and the byte-exact per-engine assembled strings the two
+// engines emitted before the prose was hoisted here. Pinning both
+// assembled forms is the reconciliation guard: the two engine-specific
+// fragments ("usable" / NOT-NULL for PG) encode real semantics, so a
+// silent drift in either must fail here.
+func TestWarnKeyless(t *testing.T) {
+	capture := func(f func()) string {
+		buf := &bytes.Buffer{}
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(prev)
+		f()
+		return buf.String()
+	}
+
+	// The honest-wording invariant (Bug 143) holds for both engines.
+	for _, tc := range []struct {
+		engine, qn, missingIndex, indexAdvice string
+		wantMissing, wantAdvice               string
+	}{
+		{
+			"mysql", "app.events", "unique index", "a UNIQUE index",
+			"no PRIMARY KEY or unique index", "(or a UNIQUE index)",
+		},
+		{
+			"postgres", "public.events", "usable unique index", "NOT NULL UNIQUE index",
+			"no PRIMARY KEY or usable unique index", "(or NOT NULL UNIQUE index)",
+		},
+	} {
+		out := capture(func() {
+			WarnKeyless(context.Background(), tc.engine, tc.qn, tc.missingIndex, tc.indexAdvice)
+		})
+		if strings.Contains(out, "cannot duplicate") {
+			t.Errorf("%s: WARN must not claim crash-replay cannot duplicate rows (Bug 143); got %q", tc.engine, out)
+		}
+		for _, want := range []string{
+			tc.engine + ": applier:", "at-least-once", "not idempotent",
+			tc.qn, "ADR-0089", tc.wantMissing, tc.wantAdvice,
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("%s: WARN should contain %q; got %q", tc.engine, want, out)
+			}
+		}
 	}
 }

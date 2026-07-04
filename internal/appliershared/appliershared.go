@@ -12,6 +12,7 @@ package appliershared
 
 import (
 	"context"
+	"log/slog"
 	"maps"
 	"slices"
 	"time"
@@ -108,6 +109,40 @@ func NonGeneratedRowKeys(row ir.Row, colTypes map[string]*ir.Column) []string {
 		out = append(out, c)
 	}
 	return out
+}
+
+// WarnKeyless emits the ADR-0089 keyless-table WARN: the one-time,
+// per-table notice that a table with no PRIMARY KEY and no usable unique
+// index is getting single-row (non-batched) apply because its INSERTs
+// are not idempotent, so keyless CDC is at-least-once. The honest
+// at-least-once wording is load-bearing (Bug 143 — the original claim
+// that single-row apply "cannot duplicate" was false); centralising the
+// prose here keeps the two engines' copies from drifting back to the
+// over-promise independently.
+//
+// The caller owns the fire-once guard (each engine's markWarnedKeyless,
+// which touches applier-private cache state under its own lock) and
+// invokes this only on the first observation of qn. Two fragments stay
+// engine-parameterised because they encode real per-engine semantics,
+// NOT accidental drift:
+//
+//   - engine       — the log-line prefix engine name ("mysql"/"postgres").
+//   - missingIndex — how the diagnosis names the absent index. MySQL's
+//     ON DUPLICATE KEY UPDATE keys off any unique index, so "unique
+//     index"; PG's dispatch needs a NOT-NULL unique index to compute a
+//     usable conflict key, so "usable unique index".
+//   - indexAdvice  — the remediation index phrasing, same distinction:
+//     "a UNIQUE index" (MySQL) vs "NOT NULL UNIQUE index" (PG).
+func WarnKeyless(ctx context.Context, engine, qn, missingIndex, indexAdvice string) {
+	slog.WarnContext(ctx,
+		engine+": applier: table has no PRIMARY KEY or "+missingIndex+" — its INSERTs are "+
+			"not idempotent, so keyless CDC is at-least-once: a crash before the source "+
+			"transaction's commit checkpoint re-inserts this table's rows from the interrupted "+
+			"transaction on resume (keyed tables are exactly-once). Each change is applied as its "+
+			"own transaction to bound the window, but rows in the same source transaction still "+
+			"replay together. Add a PRIMARY KEY (or "+indexAdvice+") for exactly-once, batched "+
+			"throughput (ADR-0089)",
+		slog.String("table", qn))
 }
 
 // TruncateToken trims a position token to maxLen characters with an
