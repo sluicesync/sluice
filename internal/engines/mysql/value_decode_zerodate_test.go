@@ -5,10 +5,12 @@ package mysql
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // withZeroDatePolicy sets the process-global zero-date policy for the
@@ -167,8 +169,21 @@ func TestApplyZeroDatePolicy(t *testing.T) {
 
 	t.Run("error refuses", func(t *testing.T) {
 		withZeroDatePolicy(t, zeroDateRefuse)
-		if _, err := applyZeroDatePolicy(zd, nullable, zeroDateInherit); err == nil {
+		_, err := applyZeroDatePolicy(zd, nullable, zeroDateInherit)
+		if err == nil {
 			t.Fatal("err = nil; want a refusal")
+		}
+		// The refusal carries the stable code + flag hint as metadata
+		// (docs/operator/error-codes.md); the prose is unchanged.
+		ce, ok := sluicecode.FromError(err)
+		if !ok {
+			t.Fatal("zero-date refusal does not carry a CodedError")
+		}
+		if ce.Code != sluicecode.CodeValueZeroDate {
+			t.Errorf("Code = %q; want %q", ce.Code, sluicecode.CodeValueZeroDate)
+		}
+		if !strings.Contains(ce.Hint, "--zero-date") {
+			t.Errorf("Hint = %q; want the --zero-date remedy", ce.Hint)
 		}
 	})
 	t.Run("null on nullable yields NULL", func(t *testing.T) {
@@ -183,8 +198,14 @@ func TestApplyZeroDatePolicy(t *testing.T) {
 	})
 	t.Run("null on NOT NULL refuses loudly", func(t *testing.T) {
 		withZeroDatePolicy(t, zeroDateAsNull)
-		if _, err := applyZeroDatePolicy(zd, notNull, zeroDateInherit); err == nil {
+		_, err := applyZeroDatePolicy(zd, notNull, zeroDateInherit)
+		if err == nil {
 			t.Fatal("err = nil; want a NOT NULL refusal")
+		}
+		// Same code as the plain refusal — one code per class, both
+		// message shapes.
+		if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeValueZeroDate {
+			t.Errorf("NOT NULL refusal code = %v (found=%v); want %q", ce, ok, sluicecode.CodeValueZeroDate)
 		}
 	})
 	t.Run("epoch substitutes 1970-01-01 00:00:01", func(t *testing.T) {

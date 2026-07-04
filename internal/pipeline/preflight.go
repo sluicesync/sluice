@@ -46,6 +46,7 @@ import (
 	"log/slog"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // errColdStartRefused is the sentinel cause for a pre-flight refusal.
@@ -115,10 +116,18 @@ func preflightColdStart(ctx context.Context, schema *ir.Schema, rw ir.RowWriter,
 			return fmt.Errorf("pipeline: pre-flight probe of target table %q: %w", table.Name, err)
 		}
 		if !empty {
-			return wrapWithHint(PhaseSchemaApply, fmt.Errorf(
-				"%w: target table %q already contains data — %s",
-				errColdStartRefused, table.Name, recoveryHintFor(mode),
-			))
+			// The full recovery prose stays in the message (humans
+			// unchanged); the code + concise remedy additionally ride
+			// along as CodedError metadata so the exit boundary can
+			// emit `code`/`hint` attrs and exit 3 (named refusal).
+			return &sluicecode.CodedError{
+				Code: sluicecode.CodeColdStartTargetNotEmpty,
+				Hint: refusalHintFor(mode),
+				Err: fmt.Errorf(
+					"%w: target table %q already contains data — %s",
+					errColdStartRefused, table.Name, recoveryHintFor(mode),
+				),
+			}
 		}
 	}
 	return nil
@@ -156,4 +165,14 @@ func recoveryHintFor(mode preflightMode) string {
 			"(3) re-run the cold-start. Pass --force-cold-start to bulk-copy into the populated " +
 			"table anyway (use with caution — INSERT into a non-empty table will collide on PRIMARY KEY)"
 	}
+}
+
+// refusalHintFor is the CONCISE machine-readable remedy for the same
+// refusal — the CodedError.Hint counterpart to recoveryHintFor's full
+// operator prose (which stays in the error message).
+func refusalHintFor(mode preflightMode) string {
+	if mode == preflightModeSync {
+		return "re-run with --reset-target-data --yes to wipe the target tables and stale cdc-state, or pass --force-cold-start to bulk-copy into the populated table anyway"
+	}
+	return "use --resume on sluice migrate, or pass --force-cold-start to bulk-copy into the populated table anyway"
 }

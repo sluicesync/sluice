@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // TestPrepareValueBit pins the catalog Bug 75 fix: an ir.Bit value is
@@ -182,6 +183,15 @@ func TestPrepareValueNULByteRefused(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), "NUL byte") || !strings.Contains(err.Error(), "bytea") {
 				t.Errorf("err = %q; want it to name the NUL byte + the bytea remedy", err)
+			}
+			// Every text-family branch carries the stable refusal
+			// code (docs/operator/error-codes.md), not just one.
+			ce, ok := sluicecode.FromError(err)
+			if !ok {
+				t.Fatalf("%T NUL refusal does not carry a CodedError", tt.typ)
+			}
+			if ce.Code != sluicecode.CodeValueNULByte {
+				t.Errorf("Code = %q; want %q", ce.Code, sluicecode.CodeValueNULByte)
 			}
 		})
 	}

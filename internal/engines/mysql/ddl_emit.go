@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 	"sluicesync.dev/sluice/internal/translate"
 )
 
@@ -1516,6 +1517,12 @@ func translateIndexExpr(c ir.IndexColumn) string {
 // accepted by MySQL and compute a wrong value in a STORED generated column, so
 // we refuse rather than trust the target to reject it. Non-sqlite dialects and
 // translatable bodies return nil.
+// backslashLiteralHint is the concise CodedError remedy shared by the
+// SEC-1 backslash-literal refusals (expression positions here and the
+// DEFAULT-position sweep in refuseBackslashSQLiteDefaultMySQL). The
+// full refusal prose stays in each error message.
+const backslashLiteralHint = "rewrite the expression on the SQLite source without the backslash string literal, or re-create it on the MySQL target post-migration"
+
 func refuseNonPortableSQLiteExprMySQL(kind, name, expr, dialect string) error {
 	if dialect != sqliteSourceDialect {
 		return nil
@@ -1533,16 +1540,20 @@ func refuseNonPortableSQLiteExprMySQL(kind, name, expr, dialect string) error {
 	// target schema and is re-parsed under future sessions' sql_mode, which
 	// sluice does not control — so refusal, not re-escaping.
 	if translate.SQLiteExprHasBackslashStringLiteral(expr) {
-		return fmt.Errorf(
-			"refuse loudly: %s %q carries SQLite expression %q whose string literal "+
-				"contains a backslash. MySQL interprets backslashes in string literals as "+
-				"escape sequences under its default sql_mode, while SQLite treats them "+
-				"literally — and the expression is stored in the target schema and re-parsed "+
-				"under future sessions' sql_mode, which sluice does not control — so emitting "+
-				"it would silently change its meaning on the target. Operator recovery: "+
-				"rewrite the expression on the SQLite source without the backslash, or drop "+
-				"the %s and re-create an equivalent one on the MySQL target post-migration",
-			kind, name, expr, kind,
+		return sluicecode.Wrap(
+			sluicecode.CodeExprBackslashLiteral,
+			backslashLiteralHint,
+			fmt.Errorf(
+				"refuse loudly: %s %q carries SQLite expression %q whose string literal "+
+					"contains a backslash. MySQL interprets backslashes in string literals as "+
+					"escape sequences under its default sql_mode, while SQLite treats them "+
+					"literally — and the expression is stored in the target schema and re-parsed "+
+					"under future sessions' sql_mode, which sluice does not control — so emitting "+
+					"it would silently change its meaning on the target. Operator recovery: "+
+					"rewrite the expression on the SQLite source without the backslash, or drop "+
+					"the %s and re-create an equivalent one on the MySQL target post-migration",
+				kind, name, expr, kind,
+			),
 		)
 	}
 	// SEC-1 review gap 1: a "…" double-quoted token gets its own NAMED
@@ -1600,16 +1611,20 @@ func refuseBackslashSQLiteDefaultMySQL(colName string, d ir.DefaultValue) error 
 	if !translate.SQLiteExprHasBackslashStringLiteral(v.Expr) {
 		return nil
 	}
-	return fmt.Errorf(
-		"refuse loudly: column %q DEFAULT carries SQLite expression %q whose string "+
-			"literal contains a backslash. MySQL interprets backslashes in string literals "+
-			"as escape sequences under its default sql_mode, while SQLite treats them "+
-			"literally — and the DEFAULT expression is stored in the target schema and "+
-			"re-parsed under future sessions' sql_mode, which sluice does not control — so "+
-			"emitting it verbatim would silently change its meaning on the target. Operator "+
-			"recovery: drop or rewrite the DEFAULT on the SQLite source without the "+
-			"backslash, or re-create it on the MySQL target post-migration",
-		colName, v.Expr,
+	return sluicecode.Wrap(
+		sluicecode.CodeExprBackslashLiteral,
+		backslashLiteralHint,
+		fmt.Errorf(
+			"refuse loudly: column %q DEFAULT carries SQLite expression %q whose string "+
+				"literal contains a backslash. MySQL interprets backslashes in string literals "+
+				"as escape sequences under its default sql_mode, while SQLite treats them "+
+				"literally — and the DEFAULT expression is stored in the target schema and "+
+				"re-parsed under future sessions' sql_mode, which sluice does not control — so "+
+				"emitting it verbatim would silently change its meaning on the target. Operator "+
+				"recovery: drop or rewrite the DEFAULT on the SQLite source without the "+
+				"backslash, or re-create it on the MySQL target post-migration",
+			colName, v.Expr,
+		),
 	)
 }
 

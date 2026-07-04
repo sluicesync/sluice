@@ -44,6 +44,8 @@ package pipeline
 import (
 	"fmt"
 	"strings"
+
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // Phase identifiers used by [hintFor] and [wrapWithHint] to scope
@@ -73,6 +75,13 @@ type errorHint struct {
 	// hint is the line emitted after the wrapped error. No leading
 	// "hint:" prefix; that's added by wrapWithHint.
 	hint string
+
+	// code is the stable machine-parsable identifier for this hint's
+	// error class (docs/operator/error-codes.md). Every entry MUST
+	// carry one — a hint without a code is a registry bug the tests
+	// catch. wrapWithHint attaches it as [sluicecode.CodedError]
+	// metadata; the human-facing message is unchanged.
+	code sluicecode.Code
 }
 
 // hintRegistry is the ordered list of hints. Order matters because
@@ -88,11 +97,13 @@ var hintRegistry = []errorHint{
 		phase:    PhaseBulkCopy,
 		contains: "does not exist",
 		hint:     "target table not found — did the schema-apply phase fail or apply to a different schema?",
+		code:     sluicecode.CodeBulkCopyTargetMissing,
 	},
 	{
 		phase:    PhaseBulkCopy,
 		contains: "doesn't exist",
 		hint:     "target table not found — did the schema-apply phase fail or apply to a different schema?",
+		code:     sluicecode.CodeBulkCopyTargetMissing,
 	},
 
 	// Bulk-copy: any per-table failure that wasn't caught by a more
@@ -109,6 +120,7 @@ var hintRegistry = []errorHint{
 		phase:    PhaseBulkCopy,
 		contains: "pipeline: copy table",
 		hint:     "any earlier tables in this run have data but NOT their declared secondary indexes (the indexes phase runs after ALL tables finish bulk-copy); use --resume to continue after fixing the offending table, or --exclude-table=<name> to skip it",
+		code:     sluicecode.CodeBulkCopyTableFailed,
 	},
 
 	// Connect-time DSN errors. These three cover the bulk of
@@ -119,11 +131,13 @@ var hintRegistry = []errorHint{
 		phase:    PhaseConnect,
 		contains: "connection refused",
 		hint:     "verify the DSN host/port and that the database is reachable from this machine",
+		code:     sluicecode.CodeConnectRefused,
 	},
 	{
 		phase:    PhaseConnect,
 		contains: "password authentication failed",
 		hint:     "verify the DSN username and password",
+		code:     sluicecode.CodeConnectAuthFailed,
 	},
 	// Connect-phase "database does not exist": PG emits
 	// "database \"foo\" does not exist". The substring is narrow
@@ -133,6 +147,7 @@ var hintRegistry = []errorHint{
 		phase:    PhaseConnect,
 		contains: "does not exist",
 		hint:     "verify the --target DSN database name",
+		code:     sluicecode.CodeConnectDatabaseMissing,
 	},
 
 	// Schema-apply: target role lacks CREATE on the schema.
@@ -144,6 +159,7 @@ var hintRegistry = []errorHint{
 		phase:    PhaseSchemaApply,
 		contains: "permission denied for schema",
 		hint:     "the target role lacks CREATE on the schema; verify GRANT or use a different role",
+		code:     sluicecode.CodeSchemaPermissionDenied,
 	},
 
 	// Indexes: PlanetScale's max-statement-execution-time limit (MySQL
@@ -159,6 +175,7 @@ var hintRegistry = []errorHint{
 		phase:    PhaseIndexes,
 		contains: "maximum statement execution time",
 		hint:     "the index build hit PlanetScale's statement-time limit (errno 3024); the data is already copied, so --resume finishes just the indexes with NO re-copy (increase the PlanetScale resource size first — a larger cluster builds the index faster, more likely under the limit). Alternatively start fresh with --upfront-indexes to build indexes during the copy",
+		code:     sluicecode.CodeIndexStatementTimeLimit,
 	},
 	// Indexes: PlanetScale safe-migrations blocks direct DDL. With
 	// safe-migrations enabled on the target branch, a direct ALTER is
@@ -169,6 +186,7 @@ var hintRegistry = []errorHint{
 		phase:    PhaseIndexes,
 		contains: "direct ddl is disabled",
 		hint:     "PlanetScale safe-migrations is enabled on the target branch, which blocks direct DDL; disable it for the migration (sluice does not yet drive PlanetScale deploy requests)",
+		code:     sluicecode.CodeIndexDirectDDLDisabled,
 	},
 
 	// CDC: replication-role attribute missing. Postgres surfaces
@@ -179,6 +197,7 @@ var hintRegistry = []errorHint{
 		phase:    PhaseCDC,
 		contains: "permission denied for replication",
 		hint:     "the connecting role needs the REPLICATION attribute (ALTER ROLE x REPLICATION); see docs/postgres-source-prep.md",
+		code:     sluicecode.CodeCDCReplicationPermission,
 	},
 }
 
@@ -192,8 +211,18 @@ var hintRegistry = []errorHint{
 // phase-empty — the orchestrator always passes a concrete phase, so
 // this case is mostly for future use and tests.
 func hintFor(phase string, err error) string {
-	if err == nil {
+	h, ok := matchErrorHint(phase, err)
+	if !ok {
 		return ""
+	}
+	return h.hint
+}
+
+// matchErrorHint returns the first registry entry whose phase scope
+// and substring both match, and whether one matched.
+func matchErrorHint(phase string, err error) (errorHint, bool) {
+	if err == nil {
+		return errorHint{}, false
 	}
 	msg := strings.ToLower(err.Error())
 	for _, h := range hintRegistry {
@@ -203,9 +232,9 @@ func hintFor(phase string, err error) string {
 		if !strings.Contains(msg, strings.ToLower(h.contains)) {
 			continue
 		}
-		return h.hint
+		return h, true
 	}
-	return ""
+	return errorHint{}, false
 }
 
 // wrapWithHint returns err with a "hint: ..." line appended when
@@ -216,13 +245,22 @@ func hintFor(phase string, err error) string {
 // The wrapping uses %w, so [errors.Is] and [errors.As] still
 // traverse the chain normally — the hint is presentation, not
 // structure. A nil err returns nil.
+//
+// The matched entry's stable code + hint additionally ride along as
+// [sluicecode.CodedError] metadata, extractable at the CLI's exit/
+// logging boundary (the `code`/`hint` attrs under --log-format json).
+// The Error() text is byte-identical to the pre-metadata wrapping.
 func wrapWithHint(phase string, err error) error {
 	if err == nil {
 		return nil
 	}
-	h := hintFor(phase, err)
-	if h == "" {
+	h, ok := matchErrorHint(phase, err)
+	if !ok {
 		return err
 	}
-	return fmt.Errorf("%w\nhint: %s", err, h)
+	return &sluicecode.CodedError{
+		Code: h.code,
+		Hint: h.hint,
+		Err:  fmt.Errorf("%w\nhint: %s", err, h.hint),
+	}
 }

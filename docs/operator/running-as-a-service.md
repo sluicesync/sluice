@@ -54,6 +54,22 @@ sluice --log-format=json sync start --stream-id myapp-prod ...
 
 Logs go to stderr in both formats, so point your collector at the service's stderr stream — under systemd that's the journal; under docker and Kubernetes the container log driver picks it up automatically. `--log-level` (`debug`, `info`, `warn`, `error`) controls verbosity independently of the format.
 
+When a terminal error belongs to a class with a stable error code, the final ERROR record additionally carries `code` and `hint` attributes (e.g. `"code":"SLUICE-E-COLDSTART-TARGET-NOT-EMPTY"`), so a log pipeline or an agent can branch on the class without regexing the message text. The full code table lives in [error-codes](error-codes.md).
+
+## Exit codes
+
+The restart policies below key off the exit status, so here is the contract. sluice exits 0 only on success (for `sync start`, only when `sluice sync stop --wait` completed the drain); everything else is non-zero and warrants whatever your orchestrator's failure path is.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | Success / clean drain. |
+| 1 | Generic runtime failure (also: `verify`/`diff`/`sync-health` found drift — those commands' long-standing per-command meaning). |
+| 2 | Config error — the `--config` file could not be loaded or parsed (the read-side check commands have always used 2 for "could not run the check at all"). |
+| 3 | Named refusal — sluice refused to proceed and named the remedy (e.g. cold-start into a populated target). Restarting without acting on the hint fails identically, so pair `Restart=on-failure` with an alert on repeated exit-3s rather than counting on the retry. |
+| 80 | Usage error — kong (the CLI parser) rejects unknown flags/commands with exit 80 before sluice runs. |
+
+Codes 0 and 1 have meant this since the first release; 2 and 3 were carved out of the generic 1 later, so a script checking `!= 0` is unaffected while a script checking `== 1` specifically may need updating. Details and the error-code registry: [error-codes](error-codes.md).
+
 ## systemd
 
 `/etc/systemd/system/sluice-sync.service`:

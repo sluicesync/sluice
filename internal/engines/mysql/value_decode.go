@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // decodeValue converts a single value as returned by the go-sql-driver/mysql
@@ -579,18 +580,26 @@ func applyZeroDatePolicy(zd *zeroDateValueError, col *ir.Column, mode zeroDateMo
 	switch mode {
 	case zeroDateAsNull:
 		if !col.Nullable {
-			return nil, fmt.Errorf(
-				"%s; --zero-date=null cannot apply to a NOT NULL column (use --zero-date=epoch, or repair the source value)",
-				zd.Error(),
+			return nil, sluicecode.Wrap(
+				sluicecode.CodeValueZeroDate,
+				"use --zero-date=epoch, or repair the source value (--zero-date=null cannot apply to a NOT NULL column)",
+				fmt.Errorf(
+					"%s; --zero-date=null cannot apply to a NOT NULL column (use --zero-date=epoch, or repair the source value)",
+					zd.Error(),
+				),
 			)
 		}
 		return nil, nil
 	case zeroDateAsEpoch:
 		return zeroDateEpochValue, nil
 	default: // zeroDateRefuse
-		return nil, fmt.Errorf(
-			"%s; pass --zero-date=null or --zero-date=epoch to carry it (see docs/operator/migrating-legacy-mysql.md)",
-			zd.Error(),
+		return nil, sluicecode.Wrap(
+			sluicecode.CodeValueZeroDate,
+			"pass --zero-date=null or --zero-date=epoch to carry the value",
+			fmt.Errorf(
+				"%s; pass --zero-date=null or --zero-date=epoch to carry it (see docs/operator/migrating-legacy-mysql.md)",
+				zd.Error(),
+			),
 		)
 	}
 }

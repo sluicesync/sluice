@@ -7,6 +7,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // TestHintForRegistry covers each registry entry: a representative
@@ -218,6 +220,51 @@ func TestWrapWithHintPreservesErrorsIs(t *testing.T) {
 	wrapped := wrapWithHint(PhaseBulkCopy, inner)
 	if !errors.Is(wrapped, sentinel) {
 		t.Errorf("errors.Is should traverse through wrapWithHint; wrapped=%v sentinel=%v", wrapped, sentinel)
+	}
+}
+
+// TestHintRegistryEntriesAllCoded enforces the hints↔codes invariant:
+// every hint-registry entry carries a non-empty, REGISTERED
+// sluicecode.Code. A hint without a code (or with a typo'd one) would
+// silently emit empty/unregistered `code` attrs at the exit boundary.
+func TestHintRegistryEntriesAllCoded(t *testing.T) {
+	for i, h := range hintRegistry {
+		if h.code == "" {
+			t.Errorf("hintRegistry[%d] (contains=%q) has no code", i, h.contains)
+			continue
+		}
+		if _, ok := sluicecode.Describe(h.code); !ok {
+			t.Errorf("hintRegistry[%d] (contains=%q) carries unregistered code %q", i, h.contains, h.code)
+		}
+	}
+}
+
+// TestWrapWithHintAttachesCode pins the structured-metadata side of
+// wrapWithHint: the matched entry's stable code and hint are
+// extractable via sluicecode.FromError, while the Error() text keeps
+// the exact prose-plus-"hint:" shape the earlier tests assert.
+func TestWrapWithHintAttachesCode(t *testing.T) {
+	inner := errors.New(
+		`pipeline: create indexes: mysql: ALTER TABLE bench ADD INDEX idx_val: Error 3024: Query execution was interrupted, maximum statement execution time exceeded`,
+	)
+	wrapped := wrapWithHint(PhaseIndexes, inner)
+
+	ce, ok := sluicecode.FromError(wrapped)
+	if !ok {
+		t.Fatal("wrapWithHint did not attach a CodedError")
+	}
+	if ce.Code != sluicecode.CodeIndexStatementTimeLimit {
+		t.Errorf("Code = %q; want %q", ce.Code, sluicecode.CodeIndexStatementTimeLimit)
+	}
+	if want := hintFor(PhaseIndexes, inner); ce.Hint != want {
+		t.Errorf("Hint = %q; want the registry hint %q", ce.Hint, want)
+	}
+	if !strings.Contains(wrapped.Error(), inner.Error()) || !strings.Contains(wrapped.Error(), "\nhint: ") {
+		t.Errorf("Error() text changed shape: %q", wrapped.Error())
+	}
+	// A hinted runtime-class error keeps the traditional exit code 1.
+	if got := ce.ExitCode(); got != sluicecode.ExitFailure {
+		t.Errorf("runtime-class hint ExitCode() = %d; want %d", got, sluicecode.ExitFailure)
 	}
 }
 

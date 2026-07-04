@@ -4,10 +4,13 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 func TestLoadEmptyPath(t *testing.T) {
@@ -27,6 +30,16 @@ func TestLoadMissingFile(t *testing.T) {
 	_, err := Load("/nonexistent/sluice.yaml")
 	if err == nil {
 		t.Error("expected error for missing file; got nil")
+	}
+	// Load errors are typed as sluicecode.ConfigError so the CLI exit
+	// boundary maps them to exit code 2 (config error) — this package
+	// is the single wrapping chokepoint.
+	var ce *sluicecode.ConfigError
+	if !errors.As(err, &ce) {
+		t.Fatalf("Load error %v does not carry a sluicecode.ConfigError", err)
+	}
+	if got := ce.ExitCode(); got != sluicecode.ExitConfig {
+		t.Errorf("ExitCode() = %d; want %d", got, sluicecode.ExitConfig)
 	}
 }
 

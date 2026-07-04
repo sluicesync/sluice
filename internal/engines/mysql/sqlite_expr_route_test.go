@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // TestSQLiteRoute_GeneratedAndCheck_Portable pins the ADR-0133-follow-up
@@ -109,8 +110,15 @@ func TestSQLiteRoute_BackslashLiteral_RefusedNamed(t *testing.T) {
 	}
 	if _, err := emitColumnDef(col); err == nil {
 		t.Error(`emitColumnDef(gencol a || 'C:\temp') err=nil; want a LOUD backslash refusal`)
-	} else if !strings.Contains(err.Error(), "backslash") || !strings.Contains(err.Error(), "g_bs") {
-		t.Errorf("gencol refusal = %v; want it to name the backslash and the column", err)
+	} else {
+		if !strings.Contains(err.Error(), "backslash") || !strings.Contains(err.Error(), "g_bs") {
+			t.Errorf("gencol refusal = %v; want it to name the backslash and the column", err)
+		}
+		// The SEC-1 refusal carries the stable code as metadata
+		// (docs/operator/error-codes.md); prose unchanged.
+		if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeExprBackslashLiteral {
+			t.Errorf("gencol refusal code = %v (found=%v); want %q", ce, ok, sluicecode.CodeExprBackslashLiteral)
+		}
 	}
 
 	// CHECK: the trailing-\ quote-swallow shape.
@@ -140,8 +148,15 @@ func TestSQLiteRoute_BackslashLiteral_RefusedNamed(t *testing.T) {
 	}
 	if _, err := emitColumnDef(colD); err == nil {
 		t.Error(`emitColumnDef(DEFAULT ('C:\' || 'x')) err=nil; want a LOUD backslash refusal`)
-	} else if !strings.Contains(err.Error(), "backslash") || !strings.Contains(err.Error(), "d_bs") {
-		t.Errorf("DEFAULT refusal = %v; want it to name the backslash and the column", err)
+	} else {
+		if !strings.Contains(err.Error(), "backslash") || !strings.Contains(err.Error(), "d_bs") {
+			t.Errorf("DEFAULT refusal = %v; want it to name the backslash and the column", err)
+		}
+		// The DEFAULT-position sweep shares the same code as the
+		// expression positions — one code per class.
+		if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeExprBackslashLiteral {
+			t.Errorf("DEFAULT refusal code = %v (found=%v); want %q", ce, ok, sluicecode.CodeExprBackslashLiteral)
+		}
 	}
 
 	// Controls: identical shapes without the backslash still emit; the

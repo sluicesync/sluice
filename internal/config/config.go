@@ -28,6 +28,8 @@ import (
 	"github.com/knadh/koanf/providers/env"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
+
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // Config is the loaded runtime configuration. Nil-safe: every field
@@ -309,12 +311,15 @@ type Extensions struct {
 // An empty path is valid: the function returns an empty Config
 // (still merged with any env vars) without error. A non-empty path
 // that doesn't exist is an error.
+// Load errors are wrapped in [sluicecode.ConfigError] so the CLI's
+// exit boundary maps them to exit code 2 (config error) — this is the
+// single construction chokepoint, so no command file needs to know.
 func Load(path string) (*Config, error) {
 	k := koanf.New(".")
 
 	if path != "" {
 		if err := k.Load(file.Provider(path), yaml.Parser()); err != nil {
-			return nil, fmt.Errorf("config: load %q: %w", path, err)
+			return nil, &sluicecode.ConfigError{Err: fmt.Errorf("config: load %q: %w", path, err)}
 		}
 	}
 
@@ -326,12 +331,12 @@ func Load(path string) (*Config, error) {
 		return strings.ReplaceAll(strings.ToLower(strings.TrimPrefix(s, "SLUICE_")), "_", ".")
 	})
 	if err := k.Load(envProvider, nil); err != nil {
-		return nil, fmt.Errorf("config: load env: %w", err)
+		return nil, &sluicecode.ConfigError{Err: fmt.Errorf("config: load env: %w", err)}
 	}
 
 	var c Config
 	if err := k.Unmarshal("", &c); err != nil {
-		return nil, fmt.Errorf("config: unmarshal: %w", err)
+		return nil, &sluicecode.ConfigError{Err: fmt.Errorf("config: unmarshal: %w", err)}
 	}
 	return &c, nil
 }

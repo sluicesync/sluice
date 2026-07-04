@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // TestPgIndexName_GitHub26 covers the v0.49.0 pgIndexName fix:
@@ -367,6 +368,18 @@ func TestEmitColumnType_PgvectorDisabled(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "--enable-pg-extension") {
 		t.Errorf("err = %v; want contains \"--enable-pg-extension\"", err)
+	}
+	// The refusal carries the stable code + concise remedy as metadata
+	// (docs/operator/error-codes.md); prose above is unchanged.
+	ce, ok := sluicecode.FromError(err)
+	if !ok {
+		t.Fatal("extension refusal does not carry a CodedError")
+	}
+	if ce.Code != sluicecode.CodeSchemaExtensionNotEnabled {
+		t.Errorf("Code = %q; want %q", ce.Code, sluicecode.CodeSchemaExtensionNotEnabled)
+	}
+	if !strings.Contains(ce.Hint, "--enable-pg-extension vector") {
+		t.Errorf("Hint = %q; want the flag naming the extension", ce.Hint)
 	}
 }
 

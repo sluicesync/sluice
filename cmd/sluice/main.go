@@ -38,6 +38,7 @@ import (
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 	"sluicesync.dev/sluice/internal/engines/sqlite"
 	_ "sluicesync.dev/sluice/internal/engines/sqlite-trigger"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // version, commit, and date are populated at build time via -ldflags.
@@ -90,7 +91,32 @@ func main() {
 	// engine before any source opens (ADR-0129; mirrors SetZeroDateMode).
 	ctx.FatalIfErrorf(sqlite.SetDefaultDateEncoding(cli.SQLiteDateEncoding))
 	err := ctx.Run(&cli.Globals)
+	// Exit boundary: surface any stable error code + remedy hint as a
+	// structured slog record (the `code`/`hint` attrs agents branch on
+	// under --log-format json), then let kong print the unchanged prose
+	// to stderr and exit — via the ExitCoder contract, so a ClassRefusal
+	// CodedError exits 3, a ConfigError 2, everything else 1 (see
+	// docs/operator/error-codes.md for the taxonomy).
+	logCodedError(err)
 	ctx.FatalIfErrorf(err)
+}
+
+// logCodedError emits one ERROR-level slog record carrying the stable
+// error code and remedy hint when err's chain holds a
+// [sluicecode.CodedError]; uncoded errors emit nothing (kong's stderr
+// line already covers them). Split out of main for the capture-handler
+// unit test.
+func logCodedError(err error) {
+	ce, ok := sluicecode.FromError(err)
+	if !ok {
+		return
+	}
+	slog.ErrorContext(
+		context.Background(), "command failed",
+		slog.String("code", string(ce.Code)),
+		slog.String("hint", ce.Hint),
+		slog.String("err", err.Error()),
+	)
 }
 
 // applyMaxMemory installs the operator's --max-memory ceiling via

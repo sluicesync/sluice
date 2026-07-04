@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 	"sluicesync.dev/sluice/internal/translate"
 )
 
@@ -235,11 +236,15 @@ func emitColumnType(t ir.Type, opts emitOpts) (string, error) {
 	// DDL the target may not be able to parse.
 	case ir.ExtensionType:
 		if !opts.EnabledExtensions[v.Extension] {
-			return "", fmt.Errorf(
-				"postgres: column type %s is owned by extension %q which "+
-					"is not enabled; pass --enable-pg-extension %s "+
-					"on this command to opt in (ADR-0032)",
-				v.String(), v.Extension, v.Extension,
+			return "", sluicecode.Wrap(
+				sluicecode.CodeSchemaExtensionNotEnabled,
+				fmt.Sprintf("pass --enable-pg-extension %s to opt in", v.Extension),
+				fmt.Errorf(
+					"postgres: column type %s is owned by extension %q which "+
+						"is not enabled; pass --enable-pg-extension %s "+
+						"on this command to opt in (ADR-0032)",
+					v.String(), v.Extension, v.Extension,
+				),
 			)
 		}
 		return emitExtensionColumn(v)

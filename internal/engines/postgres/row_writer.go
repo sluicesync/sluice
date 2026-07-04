@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // defaultMaxRowsPerBatch caps how many rows go into a single INSERT
@@ -1067,8 +1068,12 @@ func prepareValue(v any, t ir.Type) (any, error) {
 	switch t.(type) {
 	case ir.Char, ir.Varchar, ir.Text:
 		if s, ok := v.(string); ok && strings.IndexByte(s, 0) >= 0 {
-			return nil, errors.New("value contains a NUL byte (0x00), which PostgreSQL text types cannot store; " +
-				"clean the source data, or map this column to bytea with --type-override (bytea holds arbitrary bytes incl. NUL)")
+			return nil, sluicecode.Wrap(
+				sluicecode.CodeValueNULByte,
+				"clean the source data, or map the column to bytea with --type-override COL=bytea",
+				errors.New("value contains a NUL byte (0x00), which PostgreSQL text types cannot store; "+
+					"clean the source data, or map this column to bytea with --type-override (bytea holds arbitrary bytes incl. NUL)"),
+			)
 		}
 	}
 

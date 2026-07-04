@@ -12,6 +12,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // SyncRunner is the unit of work the [Supervisor] manages: one full
@@ -479,11 +481,21 @@ func (s *Supervisor) superviseOne(ctx context.Context, sy SupervisedSync) {
 		consecutive := s.recordFailure(sy.ID, err, ran >= s.policy.HealthyRunThreshold)
 
 		if s.policy.MaxConsecutiveFailures > 0 && consecutive >= s.policy.MaxConsecutiveFailures {
-			slog.ErrorContext(
-				ctx, "supervisor: sync permanently failed; isolating (peers unaffected)",
+			// Terminal for this sync: attach the stable error code +
+			// remedy hint attrs when the failure carries them, so a
+			// log pipeline can branch on the class without regexing
+			// the prose (docs/operator/error-codes.md).
+			args := make([]any, 0, 5)
+			args = append(
+				args,
 				slog.String("stream_id", sy.ID),
 				slog.Int("consecutive_failures", consecutive),
 				slog.String("err", err.Error()),
+			)
+			args = append(args, sluicecode.Attrs(err)...)
+			slog.ErrorContext(
+				ctx, "supervisor: sync permanently failed; isolating (peers unaffected)",
+				args...,
 			)
 			s.setState(sy.ID, SyncFailed, err)
 			return

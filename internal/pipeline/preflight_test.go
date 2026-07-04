@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // stubEmptyChecker is a fake [ir.RowWriter] + [ir.TableEmptyChecker]
@@ -104,6 +105,35 @@ func TestPreflightColdStart_SyncModeHint(t *testing.T) {
 	}
 	if strings.Contains(msg, "sluice migrate") {
 		t.Errorf("sync-mode hint should NOT point at `sluice migrate --resume`; that's the migrate-mode hint and confuses operators in sync flows; got %q", msg)
+	}
+}
+
+// TestPreflightColdStart_RefusalCarriesCode pins the structured side
+// of the refusal (both preflight modes): the error carries the stable
+// SLUICE-E-COLDSTART-TARGET-NOT-EMPTY code, a mode-appropriate concise
+// hint, and the named-refusal exit code 3 — while errors.Is traversal
+// to errColdStartRefused (asserted above) keeps working.
+func TestPreflightColdStart_RefusalCarriesCode(t *testing.T) {
+	schema := &ir.Schema{Tables: []*ir.Table{{Name: "events"}}}
+	for mode, wantHint := range map[preflightMode]string{
+		preflightModeMigrate: "--resume",
+		preflightModeSync:    "--reset-target-data",
+	} {
+		rw := &stubEmptyChecker{empty: map[string]bool{"events": false}}
+		err := preflightColdStart(context.Background(), schema, rw, false, mode)
+		ce, ok := sluicecode.FromError(err)
+		if !ok {
+			t.Fatalf("mode %d: refusal does not carry a CodedError: %v", mode, err)
+		}
+		if ce.Code != sluicecode.CodeColdStartTargetNotEmpty {
+			t.Errorf("mode %d: Code = %q; want %q", mode, ce.Code, sluicecode.CodeColdStartTargetNotEmpty)
+		}
+		if !strings.Contains(ce.Hint, wantHint) {
+			t.Errorf("mode %d: Hint = %q; want mention of %q", mode, ce.Hint, wantHint)
+		}
+		if got := ce.ExitCode(); got != sluicecode.ExitRefusal {
+			t.Errorf("mode %d: ExitCode() = %d; want %d (named refusal)", mode, got, sluicecode.ExitRefusal)
+		}
 	}
 }
 

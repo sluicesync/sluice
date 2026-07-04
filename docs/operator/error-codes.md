@@ -1,0 +1,46 @@
+# Stable error codes and exit codes
+
+sluice's error messages have always named the remedy in prose — "pass `--zero-date=null`", "use `--resume`" — but prose is a poor branching surface for scripts, log pipelines, and AI agents driving the CLI. Every error class that carries an operator hint therefore also carries a **stable error code**: a frozen `SLUICE-E-<DOMAIN>-<SLUG>` identifier that machines can match exactly. The human-facing message is unchanged; the code and a concise remedy hint ride along as metadata.
+
+Where the metadata surfaces:
+
+- **Structured logs.** Under the global `--log-format json` flag, a terminal coded error emits one ERROR record with `code`, `hint`, and `err` attributes; a `sync` supervisor marking a stream permanently failed attaches the same `code`/`hint` attributes to its record. Text-format logging shows the identical record in slog's text shape.
+- **Exit codes.** Refusal-class codes map to exit code 3 (see the taxonomy below), so a caller can distinguish "sluice refused and named the remedy — retrying won't help" from a generic runtime failure without parsing anything.
+- **Go API.** Inside the codebase the metadata is a `sluicecode.CodedError` (`internal/sluicecode`), extractable at any boundary via `errors.As` — the JSON result-envelope work lifts `Code` and `Hint` from the same type.
+
+Codes are minted only for errors that already carry an operator hint or a named remedy, and the registry grows organically as new remedies earn one — it is deliberately not a catalogue of every possible error. Once shipped, a code string is frozen; renaming or removing one is a breaking change. The registry in `internal/sluicecode/sluicecode.go` is the single source of truth, and a unit test enforces that this table and the registry match in both directions.
+
+## Error codes
+
+| Code | Class | Meaning | Remedy |
+|---|---|---|---|
+| `SLUICE-E-CONNECT-REFUSED` | runtime | The database host/port is unreachable from this machine. | Verify the DSN host/port and network reachability. |
+| `SLUICE-E-CONNECT-AUTH-FAILED` | runtime | The database rejected the DSN credentials. | Verify the DSN username and password. |
+| `SLUICE-E-CONNECT-DATABASE-MISSING` | runtime | The DSN names a database that does not exist on the server. | Verify the DSN database name. |
+| `SLUICE-E-BULKCOPY-TARGET-TABLE-MISSING` | runtime | Bulk-copy hit a missing target table — schema-apply failed or wrote into a different schema. | Check the schema-apply phase's output and the target schema/database the DSN points at. |
+| `SLUICE-E-BULKCOPY-TABLE-FAILED` | runtime | A table failed mid-bulk-copy; earlier tables have data but not their declared secondary indexes yet (the indexes phase runs after all tables finish copying). | Fix the offending table and continue with `--resume`, or skip it with `--exclude-table=<name>`. |
+| `SLUICE-E-SCHEMA-PERMISSION-DENIED` | runtime | The target role lacks CREATE on the schema. | GRANT the privilege or use a different role. |
+| `SLUICE-E-INDEX-STATEMENT-TIME-LIMIT` | runtime | A post-copy index build hit PlanetScale's statement-time limit (MySQL errno 3024); the data is already copied. | `--resume` finishes just the indexes with no re-copy (grow the PlanetScale cluster first for a faster build), or start fresh with `--upfront-indexes`. |
+| `SLUICE-E-INDEX-DIRECT-DDL-DISABLED` | runtime | PlanetScale safe-migrations is enabled on the target branch and blocks direct DDL (errno 1105). | Disable safe-migrations on the branch for the migration; sluice does not yet drive PlanetScale deploy requests. |
+| `SLUICE-E-CDC-REPLICATION-PERMISSION` | runtime | The connecting role lacks the REPLICATION attribute. | `ALTER ROLE x REPLICATION`; see [postgres-source-prep](../postgres-source-prep.md). |
+| `SLUICE-E-COLDSTART-TARGET-NOT-EMPTY` | refusal | Cold-start refused: a target table already contains data (usually a previous run died mid-copy). | Sync: re-run with `--reset-target-data --yes`. Migrate: use `--resume`. Either mode: `--force-cold-start` to copy into the populated table anyway (collides on PRIMARY KEY in most cases). |
+| `SLUICE-E-SCHEMA-EXTENSION-NOT-ENABLED` | refusal | A column's type is owned by a PostgreSQL extension the operator has not opted into. | Pass `--enable-pg-extension <ext>`; see [type-mapping](../type-mapping.md). |
+| `SLUICE-E-VALUE-ZERO-DATE` | refusal | A MySQL zero/partial date (`0000-00-00 …`) has no valid calendar value the target can hold. | Pass `--zero-date=null` or `--zero-date=epoch` to carry it; see [migrating-legacy-mysql](migrating-legacy-mysql.md). |
+| `SLUICE-E-VALUE-NUL-BYTE` | refusal | A string value carries a NUL byte (0x00), which PostgreSQL text types cannot store. | Clean the source data, or map the column to bytea with `--type-override COL=bytea`. |
+| `SLUICE-E-EXPR-BACKSLASH-LITERAL` | refusal | A SQLite expression's string literal contains a backslash (or a double-quoted token), which MySQL would silently reinterpret under its default sql_mode. | Rewrite the expression on the SQLite source, or re-create it on the MySQL target post-migration. |
+
+The class column drives the exit code: a terminal `refusal` exits 3, a terminal `runtime` code exits 1 like any other failure — the code is still in the log record either way.
+
+## Exit codes
+
+sluice historically exited 0 on success and 1 on everything else. The taxonomy below keeps those two meanings stable and carves two classes out of the generic-failure bucket, so nothing that checks `!= 0` changes behaviour.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | Success. For `verify`, `diff`, and `sync-health`: success and clean. |
+| 1 | Generic runtime failure. For `verify`/`diff`/`sync-health` this is those commands' long-standing per-command meaning: the check ran and found a mismatch / drift / stale stream. |
+| 2 | Config error: the `--config` file could not be loaded or parsed. (The read-side commands `verify`/`diff`/`sync-health`/`metrics-watch` have always used 2 more broadly for "the check could not run at all" — that per-command contract is unchanged.) |
+| 3 | Named refusal: sluice declined to proceed (or to silently alter a value) and named the remedy — the refusal-class codes in the table above. Retrying without acting on the hint will fail identically. |
+| 80 | Usage error: kong (the CLI parser) exits 80 on unknown flags/commands and missing required arguments before any sluice code runs. sluice adopts this rather than remapping it. |
+
+**Backward compatibility.** Scripts and unit files that check `exit != 0` (including the systemd `Restart=on-failure` pattern in [running-as-a-service](running-as-a-service.md)) are unaffected — every failure class is still non-zero. Scripts that check `exit == 1` specifically should be updated: config errors and named refusals that previously exited 1 now exit 2 and 3 respectively.
