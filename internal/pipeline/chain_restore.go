@@ -82,6 +82,11 @@ type ChainRestore struct {
 	// semantics as [Restore.ChunkParallelism].
 	ChunkParallelism int
 
+	// Summary is threaded into the re-entrant [Restore] for every
+	// segment full so the CLI's `--format json` envelope sees chain
+	// restores too. Same semantics as [Restore.Summary]; nil disables.
+	Summary *RunSummary
+
 	// ApplyBatchSize is the upper bound on changes per target
 	// transaction during incremental replay. Same shape as
 	// [Streamer.ApplyBatchSize]. Zero falls back to 100 — chain
@@ -339,6 +344,7 @@ func (r *ChainRestore) applyFull(ctx context.Context, full *segmentRecord, dataO
 		MaxBufferBytes:    r.MaxBufferBytes,
 		TableParallelism:  r.TableParallelism,
 		ChunkParallelism:  r.ChunkParallelism,
+		Summary:           r.Summary,
 		SkipChainDispatch: true,
 		DataOnly:          dataOnly,
 		Envelope:          r.Envelope,

@@ -230,6 +230,12 @@ type Streamer struct {
 	// path that returns "no row" when the table doesn't exist yet.
 	DryRun bool
 
+	// PlanSink, when non-nil AND DryRun is set, receives the built
+	// [StreamPlan] INSTEAD of the human slog rendering — the CLI's
+	// `--dry-run --format json` hookup, mirroring
+	// [Migrator.PlanSink]. Ignored when DryRun is false.
+	PlanSink func(*StreamPlan)
+
 	// Filter selects which source tables participate in the
 	// stream. Applied to the cold-start schema (so bulk-copy and
 	// schema-apply only see allowed tables) and to the dispatch

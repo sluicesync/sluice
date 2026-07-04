@@ -94,6 +94,14 @@ type Restore struct {
 	// prober (MySQL) pass through unclamped.
 	ChunkParallelism int
 
+	// Summary, when non-nil, collects the end-of-run per-table facts
+	// the CLI's `--format json` result envelope renders — the rows
+	// each [Restore.restoreTable] applied (accumulated, so a chain
+	// restore that re-applies a table across segments sums up; the
+	// incremental change-replay leg is not counted). nil (the zero
+	// value) disables the bookkeeping. See [RunSummary].
+	Summary *RunSummary
+
 	// ApplyConcurrency is the key-hash concurrent-apply LANE count used
 	// ONLY when this restore targets a multi-incremental chain and so
 	// dispatches to [ChainRestore] (the incremental-replay leg). It has no
@@ -315,6 +323,7 @@ func (r *Restore) Run(ctx context.Context) error {
 				MaxBufferBytes:   r.MaxBufferBytes,
 				TableParallelism: r.TableParallelism,
 				ChunkParallelism: r.ChunkParallelism,
+				Summary:          r.Summary,
 				ApplyConcurrency: r.ApplyConcurrency,
 				Envelope:         r.Envelope,
 				TargetSchema:     r.TargetSchema,
@@ -711,6 +720,7 @@ func (r *Restore) restoreTable(
 	if len(entry.Chunks) == 0 {
 		slog.InfoContext(ctx, "restore: empty table; no chunks to apply",
 			slog.String("table", table.Name))
+		r.Summary.RecordTableRows(table.Schema, table.Name, 0)
 		return nil
 	}
 
@@ -769,6 +779,8 @@ func (r *Restore) restoreTable(
 		slog.Int("chunks", len(entry.Chunks)),
 		slog.Int("chunk_workers", len(groups)),
 	)
+	// Envelope bookkeeping: same number the line above announces.
+	r.Summary.RecordTableRows(table.Schema, table.Name, entry.RowCount)
 	return nil
 }
 

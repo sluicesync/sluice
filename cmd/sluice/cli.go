@@ -206,6 +206,8 @@ type MigrateCmd struct {
 
 	DryRun bool `help:"Read the source schema and print the migration plan without applying changes." short:"n"`
 
+	Format string `help:"Output format: 'text' (default) or 'json' (machine-readable: ONE result envelope on stdout at command end — status completed/refused/failed, per-table stats, next steps — or, with --dry-run, the migration plan as a JSON object instead of the text plan; the slog progress stream stays on stderr in both modes)." default:"text" enum:"text,json" placeholder:"FORMAT"`
+
 	Resume      bool   `help:"Resume a previously-failed migration. State is read from sluice_migrate_state on the target." short:"r"`
 	MigrationID string `help:"Stable migration identifier; key in sluice_migrate_state. Auto-generated from source/target host info when empty." placeholder:"ID"`
 
@@ -257,7 +259,6 @@ type MigrateCmd struct {
 	CrashHookFlags
 }
 
-// Run implements the migrate subcommand.
 // stageD1Source replicates the live Cloudflare D1 database named by d1DSN into a
 // temp-dir SQLite file (Strategy A) and returns the file path plus a cleanup
 // func that removes the temp dir. The migrate then runs against the local file,
@@ -278,7 +279,21 @@ func stageD1Source(ctx context.Context, d1DSN string) (path string, cleanup func
 	return path, cleanup, nil
 }
 
+// Run implements `sluice migrate`: it wraps the body in the
+// `--format json` result-envelope lifecycle (a pass-through in text
+// mode) so exactly one JSON object reaches stdout on every exit path.
 func (m *MigrateCmd) Run(g *Globals) error {
+	env := newEnvelopeRun("migrate", m.Format)
+	env.scrub(m.Source, m.Target)
+	env.setResume(true, "--resume")
+	env.setNextSteps(fmt.Sprintf(
+		"sluice verify --source-driver %s --source <SOURCE_DSN> --target-driver %s --target <TARGET_DSN>",
+		m.SourceDriver, m.TargetDriver,
+	))
+	return env.finish(m.run(g, env))
+}
+
+func (m *MigrateCmd) run(g *Globals, env *envelopeRun) error {
 	cfg, err := config.Load(g.Config)
 	if err != nil {
 		return err
@@ -334,6 +349,8 @@ func (m *MigrateCmd) Run(g *Globals) error {
 		m.SourceDriver = "sqlite"
 		m.Source = staged
 	}
+
+	env.setEngines(source.Name(), target.Name())
 
 	// CLI-side mutual exclusion: catching this here means the
 	// operator gets a clean "you can't do that" before any DSN
@@ -466,6 +483,13 @@ func (m *MigrateCmd) Run(g *Globals) error {
 		// (The Migrator zero value is false = no skip, the safe default for
 		// programmatic callers.)
 		SkipORMTables: resolveSkipORMTables(m.SourceDriver, m.TargetDriver, m.IncludeORMTables, m.SkipORMTables),
+		// --format json envelope hookups: the summary collector is nil
+		// in text mode (nil-safe no-ops), and the plan sink replaces
+		// the slog plan rendering only for `--dry-run --format json`.
+		Summary: env.summary,
+	}
+	if env.jsonMode && m.DryRun {
+		mig.PlanSink = env.captureMigratePlan
 	}
 	keysetSource := m.KeysetSource
 	if keysetSource == "" {
@@ -499,6 +523,9 @@ func (m *MigrateCmd) Run(g *Globals) error {
 	if err != nil {
 		return err
 	}
+	// Validation is done; errors past this point classify as "failed"
+	// (not "refused") in the --format json envelope.
+	env.markEngaged()
 	return crashWrap(mig.Run(kongContext()))
 }
 
@@ -834,6 +861,7 @@ type SyncStartCmd struct {
 	StreamID string `help:"Stream identifier; the key under which position is persisted on the target. Auto-generated from source/target host info when empty." placeholder:"ID"`
 	SlotName string `help:"Replication-slot name suffix for engines that have a slot concept (Postgres). Default 'sluice_slot'. Sluice prepends 'sluice_' if the supplied name doesn't already start with it (so '--slot-name shard_a' creates 'sluice_shard_a'); the convention lets operators find every sluice slot with 'pg_replication_slots WHERE slot_name LIKE sluice\\_%'. Set per-instance to run multiple concurrent sluice instances against the same source — without distinct slot names they collide on the default. Engines without slots (MySQL: binlog stream is the slot) silently ignore this flag." placeholder:"NAME"`
 	DryRun   bool   `short:"n" help:"Print what would happen — cold-start vs warm-resume, source schema summary or persisted position — without modifying the target or starting the stream."`
+	Format   string `help:"Output format: 'text' (default) or 'json' (machine-readable: ONE result envelope on stdout when the stream exits — status completed/refused/failed — or, with --dry-run, the stream plan as a JSON object instead of the text plan; the slog stream stays on stderr in both modes)." default:"text" enum:"text,json" placeholder:"FORMAT"`
 
 	ForceColdStart bool `help:"Skip the cold-start pre-flight check that refuses to bulk-copy into a populated target. Use with caution — INSERT into a non-empty table will collide on PRIMARY KEY. Ignored on the warm-resume path."`
 
@@ -1347,8 +1375,22 @@ func (s *SyncStartCmd) smtpConfig() notify.SMTPConfig {
 	}
 }
 
-//nolint:funlen // ratchet: pre-existing 212-line accretion; split when next touched (hold-the-line note in .golangci.yml)
+// Run implements `sluice sync start`: it wraps the body in the
+// `--format json` result-envelope lifecycle (a pass-through in text
+// mode) so exactly one JSON object reaches stdout on every exit path.
 func (s *SyncStartCmd) Run(g *Globals) error {
+	env := newEnvelopeRun("sync start", s.Format)
+	env.scrub(s.Source, s.Target)
+	env.setResume(true, "re-run with the same --stream-id to resume from the persisted position")
+	env.setNextSteps(fmt.Sprintf(
+		"sluice verify --source-driver %s --source <SOURCE_DSN> --target-driver %s --target <TARGET_DSN>",
+		s.SourceDriver, s.TargetDriver,
+	))
+	return env.finish(s.run(g, env))
+}
+
+//nolint:funlen // ratchet: pre-existing 212-line accretion; split when next touched (hold-the-line note in .golangci.yml)
+func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 	cfg, err := config.Load(g.Config)
 	if err != nil {
 		return err
@@ -1362,6 +1404,7 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 	if err != nil {
 		return fmt.Errorf("--target-driver: %w", err)
 	}
+	env.setEngines(source.Name(), target.Name())
 
 	// ADR-0118 finding 1(b): the FAST-cold-start parallelism flags are inert
 	// on a MySQL/VStream source (serial cold-start). If the operator set one
@@ -1690,6 +1733,15 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 	if err != nil {
 		return err
 	}
+	// --format json plan hookup: on `--dry-run --format json` the
+	// streamer hands the built plan to the envelope instead of the
+	// slog rendering.
+	if env.jsonMode && s.DryRun {
+		streamer.PlanSink = env.captureStreamPlan
+	}
+	// Validation is done; errors past this point classify as "failed"
+	// (not "refused") in the --format json envelope.
+	env.markEngaged()
 	return crashWrap(streamer.Run(kongContext()))
 }
 

@@ -77,6 +77,19 @@ type Migrator struct {
 	// migration plan.
 	DryRun bool
 
+	// PlanSink, when non-nil AND DryRun is set, receives the built
+	// [MigrationPlan] INSTEAD of the human slog rendering — the CLI's
+	// `--dry-run --format json` hookup. On a multi-database fan-out
+	// run the sink fires once per database; the caller merges. Ignored
+	// when DryRun is false. nil (the zero value) keeps the slog plan.
+	PlanSink func(*MigrationPlan)
+
+	// Summary, when non-nil, collects the end-of-run per-table facts
+	// the CLI's `--format json` result envelope renders. nil (the zero
+	// value) disables the bookkeeping — every recording call is a
+	// nil-safe no-op. See [RunSummary].
+	Summary *RunSummary
+
 	// Mappings is the per-column type-override list from sluice.yaml.
 	// Applied after ReadSchema and before the schema-write phase, so
 	// the named columns reach the target with the requested IR type.
@@ -570,7 +583,13 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	}
 
 	if m.DryRun {
-		return m.logPlan(ctx, schema)
+		plan := m.buildDryRunPlan(ctx, schema)
+		if m.PlanSink != nil {
+			m.PlanSink(plan)
+			return nil
+		}
+		m.logPlan(ctx, plan)
+		return nil
 	}
 
 	// ---- 1.75. Open the migration-state store (if the target engine
@@ -664,6 +683,14 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 		return err
 	}
 
+	// Envelope bookkeeping: mirror the "migration complete" table set
+	// into the optional Summary (nil-safe no-op otherwise). Rows stay
+	// unknown here — the bulk-copy path counts rows per chunk inside
+	// its progress tickers and never aggregates a per-table total, and
+	// inventing one for the envelope is out of scope by design.
+	for _, t := range schema.Tables {
+		m.Summary.RecordTable(t.Schema, t.Name)
+	}
 	markComplete(ctx, rc, state)
 	slog.InfoContext(ctx, "migration complete", slog.Int("tables", len(schema.Tables)))
 	return nil
@@ -1532,56 +1559,6 @@ func (m *Migrator) validate() error {
 		return err
 	}
 	return validateEnabledPGExtensions(m.Source, m.Target, m.EnabledPGExtensions)
-}
-
-// logPlan writes a human-readable summary of what Run would do via
-// slog, without performing any writes. Used when DryRun is true.
-//
-// The plan is logged at Info level so it surfaces under the default
-// handler. The header line is a single message; the per-table lines
-// follow with structured attributes so an aggregator can pick out
-// individual table summaries without parsing prose.
-//
-// Per-table row counts (v0.10.2) are best-effort. Sluice opens a
-// throwaway [ir.RowReader] on the source and type-asserts for
-// [ir.RowCounter]; engines that don't implement counting (or where
-// the count fails — permissions, locked table, etc.) get a `-1`
-// in the log so the operator sees "count unavailable" rather than
-// thinking the table is empty. Counts on huge tables can be slow
-// or approximate depending on the engine — see [ir.RowCounter]'s
-// doc-comment.
-func (m *Migrator) logPlan(ctx context.Context, schema *ir.Schema) error {
-	slog.InfoContext(
-		ctx, "dry run: migration plan",
-		slog.String("source", m.Source.Name()),
-		slog.String("target", m.Target.Name()),
-		slog.Int("tables", len(schema.Tables)),
-		slog.Int("views", len(schema.Views)),
-	)
-
-	// Open a throwaway RowReader for row counts. Best-effort: if it
-	// fails to open, we still emit the per-table summary lines —
-	// just with row_count=-1.
-	counts := dryRunRowCounts(ctx, m.Source, m.SourceDSN, schema)
-
-	for _, t := range schema.Tables {
-		// Field naming note: secondary_indexes excludes the primary
-		// key (which is reported separately via primary_key) — the IR
-		// stores PK on its own field, and operators comparing against
-		// psql / SHOW INDEX output have been confused by a bare
-		// "indexes" count that didn't include PK.
-		slog.InfoContext(
-			ctx, "dry run: table",
-			slog.String("name", t.Name),
-			slog.Int("columns", len(t.Columns)),
-			slog.Bool("primary_key", t.PrimaryKey != nil),
-			slog.Int("secondary_indexes", len(t.Indexes)),
-			slog.Int("foreign_keys", len(t.ForeignKeys)),
-			slog.Int64("row_count", counts[t.Name]),
-		)
-	}
-	slog.InfoContext(ctx, "dry run: for full target DDL with translation notes and advisory hints, run `sluice schema preview` (ADR-0024)")
-	return nil
 }
 
 // dryRunRowCounts returns a best-effort map of table-name → row count

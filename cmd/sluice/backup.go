@@ -405,11 +405,23 @@ type BackupFullCmd struct {
 	Redact       []string `help:"Redact a PII column in backup chunks (repeatable). Format: '[schema.]table.column=STRATEGY[:options]'. Strategies: null, static:<v>, hash:sha256, hash:hmac-sha256[:<keyname>], truncate:<n>, mask:inner:<m1>,<m2>[,<char>], mask:outer:<m1>,<m2>[,<char>], mask:ssn, mask:pan, mask:pan-relaxed, mask:email, mask:ca-sin, mask:uk-nin, mask:iban, mask:uuid, randomize:int:<min>,<max>, randomize:email, randomize:us-phone, randomize:uuid, randomize:ssn, randomize:pan[:<brand>], randomize:ca-sin, randomize:uk-nin, randomize:iban[:<country-code>], randomize:dict:<name>, tokenize:dict:<name>[:<keyname>] (Phase 3 v0.61.0+, keyset-sourced Phase 4 v0.62.0+; dictionaries declared in YAML) — same set as 'sluice migrate --redact'. PII Phase 1.5 (v0.55.0+): redaction applies during chunk write, so the on-disk backup is PII-clean. Restore from a redacted chain produces the same redacted shape; restore does NOT re-apply redactions (they were applied at backup time). See docs/dev/notes/prep-pii-redaction-phase-1.md." placeholder:"RULE" sep:"none"`
 	KeysetSource string   `help:"Operator keyset source (file:PATH | env:VARNAME | db:DSN) for keyset-using strategies (hash:hmac-sha256, tokenize:dict). PII Phase 4 (ADR-0041). Same forms as 'sluice migrate --keyset-source'." placeholder:"SRC"`
 
+	Format string `help:"Output format: 'text' (default) or 'json' (machine-readable: ONE result envelope on stdout at command end — status completed/refused/failed, per-table row counts, next steps; the slog progress stream stays on stderr in both modes)." default:"text" enum:"text,json" placeholder:"FORMAT"`
+
 	EncryptionFlags
 }
 
-// Run implements `sluice backup full`.
+// Run implements `sluice backup full`: it wraps the body in the
+// `--format json` result-envelope lifecycle (a pass-through in text
+// mode) so exactly one JSON object reaches stdout on every exit path.
 func (b *BackupFullCmd) Run(g *Globals) error {
+	env := newEnvelopeRun("backup full", b.Format)
+	env.scrub(b.Source)
+	env.setResume(true, "re-run the same backup command to resume a partial backup")
+	env.setNextSteps("sluice backup verify --output-dir <BACKUP_DIR>")
+	return env.finish(b.run(g, env))
+}
+
+func (b *BackupFullCmd) run(g *Globals, env *envelopeRun) error {
 	cfg, err := config.Load(g.Config)
 	if err != nil {
 		return err
@@ -419,6 +431,7 @@ func (b *BackupFullCmd) Run(g *Globals) error {
 	if err != nil {
 		return fmt.Errorf("--source-driver: %w", err)
 	}
+	env.setEngines(source.Name(), "")
 	codec, err := pipeline.ParseCompression(b.Compression)
 	if err != nil {
 		return fmt.Errorf("--compression: %w", err)
@@ -476,6 +489,8 @@ func (b *BackupFullCmd) Run(g *Globals) error {
 		ForceOverwrite:   b.ForceOverwrite,
 		Encryption:       encConfig,
 		Codec:            codec,
+		// --format json envelope hookup; nil in text mode (no-ops).
+		Summary: env.summary,
 	}
 	keysetSource := b.KeysetSource
 	if keysetSource == "" {
@@ -500,6 +515,9 @@ func (b *BackupFullCmd) Run(g *Globals) error {
 	backup.Redactor = redactor
 	logKeysetLoaded(keyset)
 	logRedactionConfig(redactor, "backup full")
+	// Validation is done; errors past this point classify as "failed"
+	// (not "refused") in the --format json envelope.
+	env.markEngaged()
 	return backup.Run(ctx)
 }
 
@@ -1203,11 +1221,25 @@ type RestoreCmd struct {
 	PlanetScaleMetricsBranch  string `name:"planetscale-metrics-branch" help:"Target branch to filter telemetry series to (defaults to 'main'). Only consulted when --planetscale-org is set." placeholder:"BRANCH"`
 	PlanetScaleMetricsDB      string `name:"planetscale-metrics-db" help:"Target database name to filter PlanetScale telemetry SD to. Defaults to the --target DSN's database. Only consulted when --planetscale-org is set." placeholder:"DATABASE"`
 
+	Format string `help:"Output format: 'text' (default) or 'json' (machine-readable: ONE result envelope on stdout at command end — status completed/refused/failed, per-table row counts; the slog progress stream stays on stderr in both modes)." default:"text" enum:"text,json" placeholder:"FORMAT"`
+
 	EncryptionFlags
 }
 
-// Run implements `sluice restore`.
+// Run implements `sluice restore`: it wraps the body in the
+// `--format json` result-envelope lifecycle (a pass-through in text
+// mode) so exactly one JSON object reaches stdout on every exit path.
 func (r *RestoreCmd) Run(g *Globals) error {
+	env := newEnvelopeRun("restore", r.Format)
+	env.scrub(r.Target)
+	env.setNextSteps(fmt.Sprintf(
+		"sluice verify --source-driver <SOURCE_DRIVER> --source <SOURCE_DSN> --target-driver %s --target <TARGET_DSN>",
+		r.TargetDriver,
+	))
+	return env.finish(r.run(g, env))
+}
+
+func (r *RestoreCmd) run(g *Globals, env *envelopeRun) error {
 	cfg, err := config.Load(g.Config)
 	if err != nil {
 		return err
@@ -1217,6 +1249,7 @@ func (r *RestoreCmd) Run(g *Globals) error {
 	if err != nil {
 		return fmt.Errorf("--target-driver: %w", err)
 	}
+	env.setEngines("", target.Name())
 
 	if len(r.IncludeTable) > 0 && len(r.ExcludeTable) > 0 {
 		return errors.New("--include-table and --exclude-table are mutually exclusive")
@@ -1295,9 +1328,14 @@ func (r *RestoreCmd) Run(g *Globals) error {
 		ApplyConcurrency: r.ApplyConcurrency,
 		Envelope:         envelope,
 		TargetSchema:     r.TargetSchema,
+		// --format json envelope hookup; nil in text mode (no-ops).
+		Summary: env.summary,
 		// telemetryProviderOrNil returns a TRUE nil interface when off, so the
 		// restore's `TargetTelemetry != nil` guard stays exact (no typed-nil trap).
 		TargetTelemetry: telemetryProviderOrNil(telemetryProvider),
 	}
+	// Validation is done; errors past this point classify as "failed"
+	// (not "refused") in the --format json envelope.
+	env.markEngaged()
 	return restore.Run(ctx)
 }

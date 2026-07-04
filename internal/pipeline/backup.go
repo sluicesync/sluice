@@ -281,6 +281,12 @@ type Backup struct {
 	// shape — the v0.16.x..v0.21.x default.
 	Encryption *BackupEncryption
 
+	// Summary, when non-nil, collects the end-of-run per-table facts
+	// the CLI's `--format json` result envelope renders — filled from
+	// the completed manifest's per-table row counts. nil (the zero
+	// value) disables the bookkeeping. See [RunSummary].
+	Summary *RunSummary
+
 	// Redactor, when non-nil and non-empty, applies operator-
 	// configured PII redaction to every row before it's written to a
 	// chunk (PII Phase 1.5, roadmap item 15a follow-on, v0.55.0).
@@ -670,11 +676,22 @@ func (b *Backup) Run(ctx context.Context) error {
 	// recorded-codec accelerator.
 	updateLineageForManifestBestEffort(ctx, b.Store, manifest, ManifestFileName, resolveCodec(b.Codec))
 
+	logBackupComplete(ctx, manifest, b.Summary)
+	return nil
+}
+
+// logBackupComplete emits the terminal "backup complete" summary line
+// and mirrors the completed manifest's per-table row counts into the
+// optional Summary (nil-safe no-op otherwise) for the CLI's
+// `--format json` envelope. Manifest table names already carry any
+// namespace prefix, so the schema slot stays empty.
+func logBackupComplete(ctx context.Context, manifest *irbackup.Manifest, summary *RunSummary) {
 	totalRows := int64(0)
 	totalChunks := 0
 	for _, t := range manifest.Tables {
 		totalRows += t.RowCount
 		totalChunks += len(t.Chunks)
+		summary.RecordTableRows("", t.Name, t.RowCount)
 	}
 	slog.InfoContext(
 		ctx, "backup complete",
@@ -682,7 +699,6 @@ func (b *Backup) Run(ctx context.Context) error {
 		slog.Int64("rows", totalRows),
 		slog.Int("chunks", totalChunks),
 	)
-	return nil
 }
 
 // resolveResumeState is Run's step 0: inspect any pre-existing manifest
