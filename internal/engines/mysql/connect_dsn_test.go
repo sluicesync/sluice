@@ -4,6 +4,9 @@
 package mysql
 
 import (
+	"bytes"
+	"log/slog"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -129,6 +132,84 @@ func TestParseDSN_SetSessionSQLModeEmptyDisablesInjection(t *testing.T) {
 	if _, ok := cfg.Params["sql_mode"]; ok {
 		t.Errorf("--mysql-sql-mode='' should suppress sql_mode injection; got cfg.Params[\"sql_mode\"]=%q", cfg.Params["sql_mode"])
 	}
+}
+
+// TestParseDSN_WarnsOnNBEDisagreement pins the SEC-1 re-review follow-up:
+// parseDSN WARNs once when an operator-supplied DSN `sql_mode` param disagrees
+// with sluice's configured session mode ([sessionSQLMode]) on
+// NO_BACKSLASH_ESCAPES — the one residual fail-open channel where the DDL
+// emitters' backslash-escaping decision (made against sessionSQLMode) diverges
+// from the mode the connection actually runs (the DSN param, which wins on the
+// wire). Both directions of disagreement WARN; the agreeing case is silent;
+// the WARN never blocks (parseDSN still succeeds). The value classifier
+// [sqlModeHasNBE] is exercised directly so the substring match is pinned too.
+func TestParseDSN_WarnsOnNBEDisagreement(t *testing.T) {
+	// sqlModeHasNBE: quoted / mixed-case / comma-list forms all match, and no
+	// other flag is a false positive.
+	for mode, want := range map[string]bool{
+		"'NO_BACKSLASH_ESCAPES'":                   true,
+		"no_backslash_escapes":                     true,
+		"STRICT_TRANS_TABLES,NO_BACKSLASH_ESCAPES": true,
+		"'STRICT_TRANS_TABLES,ANSI_QUOTES'":        false,
+		"":                                         false,
+		"NO_ZERO_DATE":                             false,
+	} {
+		if got := sqlModeHasNBE(mode); got != want {
+			t.Errorf("sqlModeHasNBE(%q) = %v; want %v", mode, got, want)
+		}
+	}
+
+	dsnWith := func(sqlMode string) string {
+		return "user:pw@tcp(host:3306)/mydb?sql_mode=" + url.QueryEscape("'"+sqlMode+"'")
+	}
+	capture := func(t *testing.T, session, dsnMode string) string {
+		t.Helper()
+		orig := sessionSQLMode
+		defer func() { sessionSQLMode = orig }()
+		SetSessionSQLMode(session)
+		var buf bytes.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(prev)
+		if _, err := parseDSN(dsnWith(dsnMode)); err != nil {
+			t.Fatalf("parseDSN(%q session=%q): %v", dsnMode, session, err)
+		}
+		return buf.String()
+	}
+
+	// Direction 1: session mode has NO_BACKSLASH_ESCAPES, DSN doesn't → WARN.
+	if out := capture(t, "STRICT_TRANS_TABLES,NO_BACKSLASH_ESCAPES", "STRICT_TRANS_TABLES"); !strings.Contains(out, "NO_BACKSLASH_ESCAPES") || !strings.Contains(out, "disagrees") {
+		t.Errorf("session-NBE vs DSN-plain: want a NO_BACKSLASH_ESCAPES disagreement WARN; got %q", out)
+	}
+	// Direction 2: DSN mode has NO_BACKSLASH_ESCAPES, session doesn't → WARN.
+	if out := capture(t, "STRICT_TRANS_TABLES", "STRICT_TRANS_TABLES,NO_BACKSLASH_ESCAPES"); !strings.Contains(out, "NO_BACKSLASH_ESCAPES") || !strings.Contains(out, "disagrees") {
+		t.Errorf("DSN-NBE vs session-plain: want a NO_BACKSLASH_ESCAPES disagreement WARN; got %q", out)
+	}
+	// Agreeing case (both plain): no WARN.
+	if out := capture(t, "STRICT_TRANS_TABLES", "STRICT_TRANS_TABLES"); strings.Contains(out, "disagrees") {
+		t.Errorf("agreeing modes must not WARN; got %q", out)
+	}
+	// Agreeing case (both NBE): no WARN.
+	if out := capture(t, "NO_BACKSLASH_ESCAPES", "NO_BACKSLASH_ESCAPES"); strings.Contains(out, "disagrees") {
+		t.Errorf("both-NBE must not WARN; got %q", out)
+	}
+	// No DSN sql_mode param at all → sluice injects sessionSQLMode itself, so
+	// there is nothing to disagree with: no WARN.
+	func() {
+		orig := sessionSQLMode
+		defer func() { sessionSQLMode = orig }()
+		SetSessionSQLMode("STRICT_TRANS_TABLES,NO_BACKSLASH_ESCAPES")
+		var buf bytes.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(prev)
+		if _, err := parseDSN("user:pw@tcp(host:3306)/mydb"); err != nil {
+			t.Fatalf("parseDSN (no DSN sql_mode): %v", err)
+		}
+		if strings.Contains(buf.String(), "disagrees") {
+			t.Errorf("no DSN sql_mode param must not WARN; got %q", buf.String())
+		}
+	}()
 }
 
 // TestStripVStreamParams_RemovesAllVStreamKeys pins the Bug 126

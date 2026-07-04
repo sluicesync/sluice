@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"strings"
 	"time"
@@ -90,6 +91,45 @@ func SetSessionSQLMode(modes string) {
 //     should set --mysql-sql-mode instead so the emitters see it.
 func backslashIsMySQLEscape() bool {
 	return !strings.Contains(strings.ToUpper(sessionSQLMode), "NO_BACKSLASH_ESCAPES")
+}
+
+// sqlModeHasNBE reports whether a raw sql_mode string enables
+// NO_BACKSLASH_ESCAPES (case-insensitively). The DSN-param form the
+// go-sql-driver stores may be single-quoted (`'...'`), comma-separated, and
+// mixed-case; a substring test is exact enough because NO_BACKSLASH_ESCAPES
+// is not a substring of any other MySQL sql_mode flag.
+func sqlModeHasNBE(mode string) bool {
+	return strings.Contains(strings.ToUpper(mode), "NO_BACKSLASH_ESCAPES")
+}
+
+// warnSQLModeNBEDisagreement logs a single WARN when an operator-supplied
+// DSN `sql_mode` param disagrees with the session mode sluice's DDL emitters
+// assume ([sessionSQLMode], set from --mysql-sql-mode) on NO_BACKSLASH_ESCAPES.
+// The emitters key their string-literal backslash escaping off
+// [backslashIsMySQLEscape] (which reads sessionSQLMode), but a DSN `sql_mode`
+// wins on the actual connection — so a mismatch means the escaping decision is
+// made against the wrong mode, silently doubling (or failing to double)
+// backslashes in DDL string literals. This is a WARN, not a refusal: the DSN
+// override is a legitimate operator choice, and the fix is to align
+// --mysql-sql-mode with it. Fires only when the operator set the DSN param
+// (when sluice injects sessionSQLMode itself, the two agree by construction).
+func warnSQLModeNBEDisagreement(dsnSQLMode string) {
+	dsnNBE := sqlModeHasNBE(dsnSQLMode)
+	sessionNBE := !backslashIsMySQLEscape()
+	if dsnNBE == sessionNBE {
+		return
+	}
+	slog.Warn(
+		"mysql: DSN sql_mode disagrees with --mysql-sql-mode on NO_BACKSLASH_ESCAPES; "+
+			"sluice's DDL emitters escape string-literal backslashes against the session mode, "+
+			"but the DSN sql_mode wins on the connection — a backslash-bearing DEFAULT / ENUM / "+
+			"COMMENT / expression literal may be silently mis-escaped on the target. Align "+
+			"--mysql-sql-mode with the DSN sql_mode (or drop the DSN override) to remove the mismatch",
+		slog.String("dsn_sql_mode", strings.Trim(dsnSQLMode, "'")),
+		slog.String("session_sql_mode", sessionSQLMode),
+		slog.Bool("dsn_no_backslash_escapes", dsnNBE),
+		slog.Bool("session_no_backslash_escapes", sessionNBE),
+	)
 }
 
 // dsnShapeHint inspects a DSN that failed to parse and returns a
@@ -263,8 +303,21 @@ func finishParseDSN(cfg *mysql.Config) *mysql.Config {
 	// If neither is set, [defaultStrictSQLMode] applies (the
 	// loud-failure-tenet default). The literal-quotes pattern matches
 	// the time_zone override above.
-	if _, ok := cfg.Params["sql_mode"]; !ok && sessionSQLMode != "" {
+	operatorSQLMode, operatorSetSQLMode := cfg.Params["sql_mode"]
+	if !operatorSetSQLMode && sessionSQLMode != "" {
 		cfg.Params["sql_mode"] = "'" + sessionSQLMode + "'"
+	}
+	// SEC-1 re-review follow-up: the DDL emitters' backslash-escaping
+	// decision ([quoteSQLString] / [backslashIsMySQLEscape]) reads the
+	// process-global [sessionSQLMode], but a DSN-level `sql_mode` param wins
+	// on the WIRE (the branch above defers to it). When the two disagree on
+	// NO_BACKSLASH_ESCAPES, the emitter doubles (or doesn't double) backslashes
+	// against the WRONG mode — the one residual fail-open channel SEC-1 left.
+	// WARN loudly once per connect, naming both values; never block (the
+	// operator's DSN override is legitimate — this only flags the mismatch so
+	// a silent-corruption surprise becomes a visible one).
+	if operatorSetSQLMode {
+		warnSQLModeNBEDisagreement(operatorSQLMode)
 	}
 	// Bug 106 (v0.92.1). Pre-fix the connection's default character
 	// set could fall back to 3-byte utf8 on older MySQL servers /
