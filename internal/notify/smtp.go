@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -130,6 +131,18 @@ func (c SMTPConfig) Validate() error {
 	case SMTPAuthPlain, SMTPAuthLogin:
 		if strings.TrimSpace(c.Username) == "" {
 			return fmt.Errorf("smtp: --notify-smtp-username is required for --notify-smtp-auth=%s", c.Auth)
+		}
+		if c.TLS == TLSNone {
+			// Loud-failure tenet (the vstream_insecure_tls precedent): this
+			// combination puts the SMTP credentials on the wire in CLEARTEXT.
+			// [TLSNone] exists for trusted local relays / test fakes, which
+			// don't authenticate — warn every time the combination is
+			// validated rather than hard-refuse, so an existing localhost
+			// config keeps working but can't silently downgrade a real
+			// credential's transport security.
+			slog.Warn("smtp: --notify-smtp-auth=" + string(c.Auth) + " with --notify-smtp-tls=none — SMTP " +
+				"credentials will be sent in CLEARTEXT (intended for trusted local relays only; " +
+				"use starttls or implicit TLS with a real relay)")
 		}
 	default:
 		return fmt.Errorf("smtp: unknown --notify-smtp-auth mode %q (want none|plain|login)", c.Auth)

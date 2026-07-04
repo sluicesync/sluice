@@ -748,6 +748,44 @@ func TestD1Client_TransportErrors(t *testing.T) {
 			t.Errorf("want loud no-result error; got %v", err)
 		}
 	})
+	t.Run("non_2xx_huge_body_truncated", func(t *testing.T) {
+		// SEC-3(b): a non-2xx body is echoed TRUNCATED (truncateForError), not
+		// verbatim — a giant error page must not flood the log/error chain.
+		huge := bytes.Repeat([]byte("A"), 64*1024)
+		client := startMockD1(t, func(string, []string) (int, []byte) {
+			return http.StatusBadGateway, huge
+		})
+		_, err := client.queryRows(context.Background(), "SELECT 1")
+		if err == nil || !strings.Contains(err.Error(), "502") {
+			t.Fatalf("want loud HTTP-status error; got %v", err)
+		}
+		if len(err.Error()) > 1024 {
+			t.Errorf("non-2xx error echoes an untruncated body (len=%d): %.200s…", len(err.Error()), err.Error())
+		}
+		if !strings.Contains(err.Error(), "…") {
+			t.Errorf("truncated echo should carry the ellipsis marker; got %v", err)
+		}
+	})
+}
+
+// TestD1QueryURL_PathEscaped pins SEC-3(a): account/database ids are
+// path-escaped into the query URL, so an id carrying `/` (or `?`, `#`)
+// cannot re-point the request at a different API path — Cloudflare then
+// refuses the unknown account/database loudly instead.
+func TestD1QueryURL_PathEscaped(t *testing.T) {
+	c := &d1Client{
+		endpointBase: "https://api.example",
+		accountID:    "acct/../evil",
+		databaseID:   "db?x=1#frag",
+	}
+	got := c.queryURL()
+	want := "https://api.example/accounts/acct%2F..%2Fevil/d1/database/db%3Fx=1%23frag/query"
+	if got != want {
+		t.Errorf("queryURL = %q; want %q", got, want)
+	}
+	if strings.Contains(got, "acct/../evil") || strings.Contains(got, "db?x=1") {
+		t.Errorf("queryURL leaks unescaped id segments: %q", got)
+	}
 }
 
 // ---- DSN + secrets --------------------------------------------------------

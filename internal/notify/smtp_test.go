@@ -4,7 +4,9 @@
 package notify
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -66,6 +68,43 @@ func TestSMTPConfig_Validate(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tc.wantErr) {
 				t.Errorf("error %q missing %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestSMTPConfig_Validate_PlaintextCredentialsWarns pins the SEC-3 posture:
+// auth credentials over --notify-smtp-tls=none validate (existing localhost
+// configs keep working) but emit a loud CLEARTEXT warning — the
+// vstream_insecure_tls warn-not-refuse precedent. TLS'd auth and
+// credential-less TLSNone stay silent.
+func TestSMTPConfig_Validate_PlaintextCredentialsWarns(t *testing.T) {
+	base := SMTPConfig{Host: "h", From: "a@b", To: []string{"c@d"}}
+	cases := []struct {
+		name     string
+		cfg      SMTPConfig
+		wantWarn bool
+	}{
+		{"plain over none warns", SMTPConfig{Host: "h", From: "a@b", To: []string{"c@d"}, TLS: TLSNone, Auth: SMTPAuthPlain, Username: "u"}, true},
+		{"login over none warns", SMTPConfig{Host: "h", From: "a@b", To: []string{"c@d"}, TLS: TLSNone, Auth: SMTPAuthLogin, Username: "u"}, true},
+		{"plain over starttls silent", SMTPConfig{Host: "h", From: "a@b", To: []string{"c@d"}, Auth: SMTPAuthPlain, Username: "u"}, false},
+		{"none-auth over none silent", SMTPConfig{Host: "h", From: "a@b", To: []string{"c@d"}, TLS: TLSNone}, false},
+		{"unconfigured silent", SMTPConfig{}, false},
+		{"complete default silent", base, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+			t.Cleanup(func() { slog.SetDefault(prev) })
+
+			if err := tc.cfg.Validate(); err != nil {
+				t.Fatalf("Validate must not hard-refuse this shape: %v", err)
+			}
+			gotWarn := strings.Contains(buf.String(), "CLEARTEXT")
+			if gotWarn != tc.wantWarn {
+				t.Errorf("warn emitted = %v, want %v; logs:\n%s", gotWarn, tc.wantWarn, buf.String())
 			}
 		})
 	}

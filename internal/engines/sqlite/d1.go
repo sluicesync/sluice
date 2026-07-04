@@ -45,6 +45,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -70,6 +71,12 @@ const (
 // [d1Client] (not a hard-coded literal at the call site) so tests can point the
 // client at an httptest.Server (ADR-0132: "make the endpoint base injectable").
 const defaultD1EndpointBase = "https://api.cloudflare.com/client/v4"
+
+// d1MaxResponseBytes bounds how much of a D1 response body is read.
+// Cloudflare caps D1 query responses at ~1 MiB, so 8 MiB is generous for
+// every legitimate response while an unbounded io.ReadAll against a
+// misdirected endpoint can't exhaust memory.
+const d1MaxResponseBytes = 8 << 20
 
 // d1Engine is the Cloudflare D1 implementation of [ir.Engine]. Like the file
 // engine it holds no connection state; the zero value is usable. It shares this
@@ -247,8 +254,13 @@ func parseD1DSN(dsn string) (accountID, databaseID string, enc dateEncoding, err
 }
 
 // queryURL builds the D1 query endpoint for this client's account + database.
+// Both ids are path-escaped (mirroring the PlanetScale telemetry client's
+// posture) so a DSN id carrying `/`, `?`, or `#` cannot re-point the request
+// at a different API path — a malformed id yields a Cloudflare "no such
+// account/database" error, loudly, instead of a silently redirected call.
 func (c *d1Client) queryURL() string {
-	return c.endpointBase + "/accounts/" + c.accountID + "/d1/database/" + c.databaseID + "/query"
+	return c.endpointBase + "/accounts/" + url.PathEscape(c.accountID) +
+		"/d1/database/" + url.PathEscape(c.databaseID) + "/query"
 }
 
 // d1Row is one result row: the column name → its RAW JSON value, so the caller
@@ -313,14 +325,17 @@ func (c *d1Client) queryRows(ctx context.Context, sql string, params ...string) 
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, err := io.ReadAll(resp.Body)
+	// Bound the read: Cloudflare caps a D1 response at ~1 MiB, so 8 MiB is
+	// generous headroom while a misdirected/hostile endpoint can't balloon
+	// memory (the same cap the PlanetScale telemetry client uses).
+	body, err := io.ReadAll(io.LimitReader(resp.Body, d1MaxResponseBytes))
 	if err != nil {
 		return nil, fmt.Errorf("d1: read response from database %q: %w", c.databaseID, err)
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("d1: query database %q failed: HTTP %d: %s",
-			c.databaseID, resp.StatusCode, strings.TrimSpace(string(body)))
+			c.databaseID, resp.StatusCode, truncateForError(body))
 	}
 
 	var env d1Envelope
