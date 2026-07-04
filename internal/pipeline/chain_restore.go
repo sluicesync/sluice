@@ -303,6 +303,21 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 		return wrapWithHint(PhaseSchemaApply, fmt.Errorf("chain restore: re-prime standalone sequences: %w", err))
 	}
 
+	// 5. Chain-tail identity-sequence re-sync (roadmap "Open bugs",
+	//    filed 2026-07-03; live-reproduced as a 23505 on the first
+	//    post-restore insert). The base full's restore ran
+	//    SyncIdentitySequences at ITS tail (restore.go Phase 3), but
+	//    the incremental links then applied rows with HIGHER ids
+	//    straight through the change applier — leaving every identity
+	//    column's sequence at the base full's max: a loud 23505 on
+	//    constrained tables, a SILENT duplicate on keyless ones.
+	//    Data-derived (MAX+1 read from the restored target), idempotent,
+	//    safe to run unconditionally — the identity analogue of the
+	//    standalone-sequence re-prime above.
+	if err := r.syncIdentitySequencesAtTail(ctx, links); err != nil {
+		return wrapWithHint(PhaseSchemaApply, fmt.Errorf("chain restore: sync identity sequences: %w", err))
+	}
+
 	slog.InfoContext(
 		ctx, "chain restore complete",
 		slog.Int("manifests_applied", len(links)),
@@ -364,6 +379,85 @@ func (r *ChainRestore) reprimeStandaloneSequences(ctx context.Context, links []s
 	slog.InfoContext(ctx, "chain restore: standalone sequences re-primed from newest link schema",
 		slog.Int("sequences", len(schema.Sequences)))
 	return nil
+}
+
+// syncIdentitySequencesAtTail re-syncs every identity column's sequence
+// from the restored rows after the chain's incremental links applied
+// ids past the base full's max. Unlike the standalone re-prime above no
+// optional engine surface is needed: SyncIdentitySequences is a
+// required [ir.SchemaWriter] method (a documented no-op on engines
+// whose counters auto-bump on direct INSERT — MySQL, SQLite), so the
+// call is engine-neutral by construction and the broker's
+// --reset-target-data ChainRestore inherits it for free. The table set
+// comes from the NEWEST link carrying a schema snapshot (same
+// resolution as the re-prime), retargeted and filtered exactly as the
+// base full's restore was so the MAX reads only touch tables that
+// exist on the target. Wrapped in the ADR-0114 reparent retry,
+// mirroring restore.go's Phase 3 call shape.
+func (r *ChainRestore) syncIdentitySequencesAtTail(ctx context.Context, links []segmentRecord) error {
+	var schema *ir.Schema
+	var sourceEngine string
+	for i := len(links) - 1; i >= 0; i-- {
+		if s := links[i].manifest.Schema; s != nil {
+			schema = s
+			sourceEngine = links[i].manifest.SourceEngine
+			break
+		}
+	}
+	if schema == nil {
+		return nil
+	}
+	// Retarget mirrors the full-restore path (identity for same-engine).
+	// The filter trims into a FRESH slice — the newest link's manifest
+	// schema must not be mutated (applyTableFilter trims in place, and
+	// same-engine retarget returns the input pointer).
+	schema = translate.RetargetForEngine(schema, sourceEngine, r.Target.Name())
+	tables := schema.Tables
+	if !r.Filter.IsEmpty() {
+		kept := make([]*ir.Table, 0, len(tables))
+		for _, t := range tables {
+			if t != nil && r.Filter.Allows(t.Name) {
+				kept = append(kept, t)
+			}
+		}
+		tables = kept
+	}
+	if !hasIdentityColumn(tables) {
+		return nil
+	}
+	sw, err := r.Target.OpenSchemaWriter(ctx, r.TargetDSN)
+	if err != nil {
+		return fmt.Errorf("open target schema writer: %w", err)
+	}
+	defer closeIf(sw)
+	applyTargetSchema(sw, r.TargetSchema)
+	syncSchema := &ir.Schema{Tables: tables}
+	if err := runDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
+		return sw.SyncIdentitySequences(ctx, syncSchema)
+	}); err != nil {
+		return err
+	}
+	slog.InfoContext(ctx, "chain restore: identity sequences re-synced from the restored rows",
+		slog.Int("tables", len(tables)))
+	return nil
+}
+
+// hasIdentityColumn reports whether any table carries an identity /
+// auto-increment integer column — the cheap pre-scan that lets the
+// chain tail skip opening a schema writer when there is nothing to
+// sync.
+func hasIdentityColumn(tables []*ir.Table) bool {
+	for _, t := range tables {
+		if t == nil {
+			continue
+		}
+		for _, c := range t.Columns {
+			if intT, ok := c.Type.(ir.Integer); ok && intT.AutoIncrement {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // validate sanity-checks required fields.

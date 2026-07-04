@@ -967,3 +967,106 @@ func TestChainRestore_DispatchFromRestore_Run(t *testing.T) {
 		t.Errorf("no phases recorded; restore must have dispatched to chain")
 	}
 }
+
+// writeTestChangeChunk serialises changes into one change chunk at
+// path within store and returns its manifest ChunkInfo. Shared fixture
+// for the multi-chunk replay pins below.
+func writeTestChangeChunk(t *testing.T, store irbackup.Store, path string, changes []ir.Change) *irbackup.ChunkInfo {
+	t.Helper()
+	buf := &bytes.Buffer{}
+	cw, err := newChangeChunkWriter(buf, nil, CodecGzip)
+	if err != nil {
+		t.Fatalf("newChangeChunkWriter: %v", err)
+	}
+	for _, c := range changes {
+		if err := cw.WriteChange(c); err != nil {
+			t.Fatalf("WriteChange: %v", err)
+		}
+	}
+	if err := cw.Close(); err != nil {
+		t.Fatalf("cw.Close: %v", err)
+	}
+	info := &irbackup.ChunkInfo{File: path, RowCount: int64(len(changes)), SHA256: cw.Hash()}
+	if err := store.Put(context.Background(), path, buf); err != nil {
+		t.Fatalf("store.Put(%s): %v", path, err)
+	}
+	return info
+}
+
+// seedMultiChunkIncremental writes a full + one incremental carrying
+// nine ordered Inserts split across three change chunks (3-3-3), and
+// returns the incremental's manifest. Fixture for the one-chunk
+// read-ahead pins.
+func seedMultiChunkIncremental(t *testing.T, store irbackup.Store, schema *ir.Schema) *irbackup.Manifest {
+	t.Helper()
+	full := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
+	full.Schema = schema
+	full.BackupID = irbackup.ComputeBackupID(full)
+	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+		t.Fatalf("write full: %v", err)
+	}
+	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, CodecGzip)
+
+	incr := makeManifest(t, irbackup.BackupKindIncremental, full, "0/300")
+	incr.Schema = schema
+	for chunkIdx := 0; chunkIdx < 3; chunkIdx++ {
+		var changes []ir.Change
+		for j := 0; j < 3; j++ {
+			id := chunkIdx*3 + j + 1
+			changes = append(changes, ir.Insert{
+				Position: ir.Position{Engine: "postgres", Token: fmt.Sprintf(`{"slot":"sluice_slot","lsn":"0/2%02d"}`, id)},
+				Table:    "users",
+				Row:      ir.Row{"id": int64(id)},
+			})
+		}
+		incr.ChangeChunks = append(incr.ChangeChunks,
+			writeTestChangeChunk(t, store, fmt.Sprintf("chunks/_changes/test/changes-%d.jsonl.gz", chunkIdx), changes))
+	}
+	incr.BackupID = irbackup.ComputeBackupID(incr)
+	incrPath := "manifests/incr-0001.json"
+	if err := writeManifestAt(context.Background(), store, incrPath, incr); err != nil {
+		t.Fatalf("write incr: %v", err)
+	}
+	updateLineageForManifestBestEffort(context.Background(), store, incr, incrPath, CodecGzip)
+	return incr
+}
+
+// TestChainRestore_IdentitySequencesSyncedAtTail_Dispatch pins the
+// chain-tail identity re-sync wiring (roadmap "Open bugs", filed
+// 2026-07-03): a chain whose schema carries an identity column must
+// invoke SyncIdentitySequences TWICE — once inside the base full's
+// restore (restore.go Phase 3) and once at the chain tail, AFTER the
+// incremental links applied their rows. Pre-fix the tail call did not
+// exist and the count was 1. The real 23505 shape is pinned by
+// TestBackup_ChainRestore_IdentitySequenceSyncedAtTail (integration).
+func TestChainRestore_IdentitySequencesSyncedAtTail_Dispatch(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := NewLocalStore(dir)
+	schema := &ir.Schema{Tables: []*ir.Table{{
+		Name:    "users",
+		Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64, AutoIncrement: true}}},
+	}}}
+	seedMultiChunkIncremental(t, store, schema)
+
+	tgt := &chainRestoreRecorderEngine{
+		restoreRecorderEngine: newRestoreRecorderEngine("postgres"),
+	}
+	chain := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: store}
+	if err := chain.Run(context.Background()); err != nil {
+		t.Fatalf("ChainRestore.Run: %v", err)
+	}
+
+	phases, _ := tgt.snapshot()
+	syncs := 0
+	for _, p := range phases {
+		if p == "SyncIdentitySequences" {
+			syncs++
+		}
+	}
+	if syncs != 2 {
+		t.Errorf("SyncIdentitySequences ran %d time(s); want 2 (base full + chain tail); phases=%v", syncs, phases)
+	}
+	if len(phases) == 0 || phases[len(phases)-1] != "SyncIdentitySequences" {
+		t.Errorf("last phase = %v; want the chain-tail SyncIdentitySequences (must run AFTER the links applied rows)", phases)
+	}
+}
