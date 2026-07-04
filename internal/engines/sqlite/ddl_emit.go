@@ -6,9 +6,11 @@ package sqlite
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/translate"
 )
 
 // This file is the WRITE-side counterpart to types.go: it renders an IR
@@ -271,6 +273,22 @@ func emitTableDef(table *ir.Table) (string, error) {
 			return "", err
 		}
 		parts = append(parts, def)
+	}
+
+	// Cross-engine collation-drop policy (docs/type-mapping.md "Charsets
+	// and collations"): SQLite's collation namespace (BINARY / NOCASE /
+	// RTRIM) shares no names with MySQL or PG, and the SQLite reader
+	// never populates ir Collation — so EVERY carried collation is
+	// foreign here. String columns land with SQLite's default BINARY
+	// collation; this WARN — one per table — makes the drop visible
+	// instead of silent. Passing "sqlite" (a dialect no collation ever
+	// carries) classifies all of them as dropped.
+	if dropped := translate.DroppedCollationColumns(table, "sqlite"); len(dropped) > 0 {
+		slog.Warn(
+			"sqlite: dropping cross-engine column collations (no SQLite equivalent; the target columns use SQLite's default BINARY collation, which may change sort/comparison semantics)",
+			slog.String("table", table.Name),
+			slog.String("columns", strings.Join(dropped, ", ")),
+		)
 	}
 
 	// Table-level PRIMARY KEY for the composite / non-integer case only.

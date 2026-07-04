@@ -52,7 +52,7 @@ func emitColumnType(t ir.Type) (string, error) {
 
 	// ---- Character ----
 	case ir.Char:
-		return emitCharType("CHAR", v.Length, v.Charset, v.Collation), nil
+		return emitCharType("CHAR", v.Length, v.Charset, mysqlEmittableCollation(v.Charset, v.Collation)), nil
 	case ir.Varchar:
 		// A bounded VARCHAR(N) wider than MySQL can represent
 		// (utf8mb4's ~16383-char creatable cap, and the 65535-byte
@@ -63,11 +63,11 @@ func emitColumnType(t ir.Type) (string, error) {
 		// `varchar(16383)` Error 1118 at create-tables (catalog
 		// Bug 72). Narrow VARCHARs (the common case) are unchanged.
 		if size, downmap := mysqlTextTierForWideVarchar(v.Length); downmap {
-			return emitTextType(size, v.Charset, v.Collation), nil
+			return emitTextType(size, v.Charset, mysqlEmittableCollation(v.Charset, v.Collation)), nil
 		}
-		return emitCharType("VARCHAR", v.Length, v.Charset, v.Collation), nil
+		return emitCharType("VARCHAR", v.Length, v.Charset, mysqlEmittableCollation(v.Charset, v.Collation)), nil
 	case ir.Text:
-		return emitTextType(v.Size, v.Charset, v.Collation), nil
+		return emitTextType(v.Size, v.Charset, mysqlEmittableCollation(v.Charset, v.Collation)), nil
 
 	// ---- Binary ----
 	case ir.Binary:
@@ -354,6 +354,53 @@ func emitGeometryType(subtype ir.GeometrySubtype) string {
 	default:
 		return "GEOMETRY"
 	}
+}
+
+// mysqlEmittableCollation filters a carried collation down to what a
+// MySQL target can actually declare: a PG-dialect collation (e.g. "C",
+// "en_US" — identified by the charset-paired rule, see
+// translate.CollationDialect) has no MySQL meaning and would raise a
+// raw Error 1273 "Unknown collation" mid-create-tables if forwarded
+// verbatim (the pre-policy behaviour). The drop is surfaced as a WARN
+// by the callers ([emitTableDef] per table, the ALTER paths per
+// column) — dropped-with-WARN policy, docs/type-mapping.md "Charsets
+// and collations". MySQL-dialect collations pass through unchanged so
+// MySQL → MySQL keeps its full charset/collation round-trip.
+func mysqlEmittableCollation(charset, collation string) string {
+	if translate.CollationDialect(charset, collation) != "mysql" {
+		return ""
+	}
+	return collation
+}
+
+// warnDroppedForeignCollation is the per-column WARN half of the
+// cross-engine collation-drop policy, mirroring the postgres emitter's
+// helper of the same name. Called on the low-volume ALTER paths
+// (AlterAddColumn / AlterColumnType); the CREATE TABLE path aggregates
+// one WARN per table in [emitTableDef]. PG-dialect collations are only
+// recorded when EXPLICIT on the source column (the PG reader excludes
+// defaults), so each drop here is a targeted, meaningful loss.
+func warnDroppedForeignCollation(table *ir.Table, colName string, t ir.Type) {
+	charset, collation := translate.ColumnCollation(t)
+	if collation == "" || translate.CollationDialect(charset, collation) == "mysql" {
+		return
+	}
+	slog.Warn(
+		"mysql: dropping cross-engine column collation (no MySQL equivalent; the target column uses the table/database default collation, which may change sort/comparison semantics)",
+		slog.String("table", mysqlTableNameForLog(table)),
+		slog.String("column", colName),
+		slog.String("collation", collation),
+	)
+}
+
+// mysqlTableNameForLog returns a non-empty table name for log lines
+// even without a table context (defensive; mirrors the postgres
+// emitter's tableNameForLog).
+func mysqlTableNameForLog(t *ir.Table) string {
+	if t == nil {
+		return "<unknown>"
+	}
+	return t.Name
 }
 
 // appendCharsetCollation appends CHARACTER SET / COLLATE clauses to
@@ -1005,6 +1052,19 @@ func emitTableDefWithDomainChecks(table *ir.Table, inlineCheckSupported bool) (s
 	// reject the CREATE TABLE with the opaque errno 1170.
 	if err := checkInlineKeyColumnsIndexable(table); err != nil {
 		return "", err
+	}
+	// Cross-engine collation-drop policy (docs/type-mapping.md
+	// "Charsets and collations"): a PG-dialect collation (explicit on
+	// the source column by construction — the PG reader excludes
+	// defaults) has no MySQL meaning; emitColumnType omits it instead
+	// of forwarding it into a raw Error 1273, and this WARN — one per
+	// table — makes the drop visible instead of silent.
+	if dropped := translate.DroppedCollationColumns(table, "mysql"); len(dropped) > 0 {
+		slog.Warn(
+			"mysql: dropping cross-engine column collations (no MySQL equivalent; the target columns use the table/database default collation, which may change sort/comparison semantics)",
+			slog.String("table", table.Name),
+			slog.String("columns", strings.Join(dropped, ", ")),
+		)
 	}
 	// Pre-compute the inline DOMAIN CHECK clauses so the column-list
 	// trailing-comma logic below can know up-front whether to emit a

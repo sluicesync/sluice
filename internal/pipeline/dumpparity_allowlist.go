@@ -46,9 +46,8 @@ var dumpParityAllowlist = []dumpParityAllowlistEntry{
 	},
 	{
 		Pattern: "CREATE TABLE public.customers",
-		Reason: "two deltas in this body (both logged): " +
-			"(1) per-column COLLATE is read into the IR (ir.Text/Varchar/Char.Collation) but the PG DDL emitter never writes a COLLATE clause, so customers.region_code loses COLLATE \"C\" on the target; " +
-			"(2) bare timestamptz materializes an explicit precision (timestamp(6) with time zone) — see the shipments entry for the class",
+		Reason: "bare timestamptz (created_at) materializes an explicit precision (timestamp(6) with time zone) — see the shipments entry for the class. " +
+			"The COLLATE delta this entry used to also cover is FIXED: the PG emitter now carries per-column COLLATE (pgCollateClause), so customers.region_code keeps COLLATE \"C\" on the target",
 		Citation: dumpParityTriageCitation,
 	},
 	{

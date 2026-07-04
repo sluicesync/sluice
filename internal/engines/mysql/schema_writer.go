@@ -704,6 +704,12 @@ func (w *SchemaWriter) AlterAddColumn(ctx context.Context, table *ir.Table, cols
 		if err != nil {
 			return fmt.Errorf("alter add column: emit %q: %w", col.Name, err)
 		}
+		// Cross-engine collation-drop WARN, per column: this forward
+		// path bypasses emitTableDef's per-table aggregation, and a
+		// forwarded ADD COLUMN carrying a PG-dialect collation would
+		// otherwise drop it silently (emitColumnType omits foreign
+		// collations).
+		warnDroppedForeignCollation(table, col.Name, col.Type)
 		stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s",
 			quoteIdent(table.Name), def)
 		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
@@ -880,6 +886,9 @@ func (w *SchemaWriter) AlterColumnType(ctx context.Context, table *ir.Table, wan
 	if err != nil {
 		return fmt.Errorf("alter column type: emit %q: %w", want.Name, err)
 	}
+	// Cross-engine collation-drop WARN, per column (mirrors
+	// AlterAddColumn — emitColumnType omits foreign collations).
+	warnDroppedForeignCollation(table, want.Name, want.Type)
 	stmt := fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s",
 		quoteIdent(table.Name), def)
 	if _, err := w.db.ExecContext(ctx, stmt); err != nil {

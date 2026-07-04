@@ -623,6 +623,15 @@ func emitColumnDef(table *ir.Table, c *ir.Column, opts emitOpts) (string, error)
 	sb.WriteString(quoteIdent(c.Name))
 	sb.WriteByte(' ')
 	sb.WriteString(typeStr)
+	// Explicit per-column collation carry (restore-parity oracle TRIAGE
+	// finding #2): a PG-dialect collation read into the IR re-emits as
+	// `COLLATE "<name>"` — dropping it silently changed sort/comparison
+	// order and any collation-dependent index/constraint behaviour on
+	// PG → PG. Foreign (MySQL-dialect) collations render nothing here;
+	// the drop is WARNed at the callers (emitTableDef per table, the
+	// ALTER paths per column). PG grammar: COLLATE sits directly after
+	// the data type, before GENERATED/NOT NULL/DEFAULT.
+	sb.WriteString(pgCollateClause(c.Type))
 	if c.IsGenerated() {
 		// SQLite source (ADR-0133 follow-up): a generated column is
 		// DATA-load-bearing (its value is COMPUTED on the target), so a body
@@ -704,6 +713,58 @@ func emitColumnDef(table *ir.Table, c *ir.Column, opts emitOpts) (string, error)
 		}
 	}
 	return sb.String(), nil
+}
+
+// pgCollateClause returns the ` COLLATE "<name>"` suffix for a column
+// whose IR string type carries a PG-dialect collation, or "" when there
+// is nothing emittable (no collation, a non-string type, or a foreign
+// MySQL-dialect collation — the latter is dropped-with-WARN policy; see
+// [warnDroppedForeignCollation]).
+//
+// Emission mirrors pg_dump's omission rule by construction: the PG
+// schema reader stores a collation only when pg_attribute.attcollation
+// names an explicit non-default collation (the pg_collation join in
+// populateColumns excludes oid 0 and 'default'), so a carried value is
+// always worth a clause and the database-default case stays clause-free
+// — no noise on ordinary columns.
+//
+// Normalization: the reader stores the BARE pg_collation.collname
+// ("C", "en_US", "en-x-icu") with no namespace, and the clause quotes
+// it as a single identifier — target-side resolution goes through the
+// session search_path, which covers pg_catalog collations (the
+// overwhelmingly common case). An operator-created collation living in
+// a non-search_path schema loses its qualification and fails loudly at
+// CREATE TABLE with SQLSTATE 42704 (sluice does not carry CREATE
+// COLLATION objects either) — a documented limitation, not silent loss.
+func pgCollateClause(t ir.Type) string {
+	charset, collation := translate.ColumnCollation(t)
+	if translate.CollationDialect(charset, collation) != "postgres" {
+		return ""
+	}
+	return " COLLATE " + quoteIdent(collation)
+}
+
+// warnDroppedForeignCollation surfaces the cross-engine collation-drop
+// policy for a single column: a MySQL-dialect collation (see
+// translate.CollationDialect) has no PG meaning, no name translation
+// exists, and pre-policy it was dropped silently — the WARN converts
+// that silence into a visible, named degradation (docs/type-mapping.md
+// "Charsets and collations"). Called per column only on the low-volume
+// ALTER paths (AlterAddColumn / AlterColumnType); the CREATE TABLE path
+// aggregates one WARN per table in [emitTableDef] because a MySQL
+// source tags EVERY string column with its (usually default) collation
+// and per-column WARNs would flood any real cross-engine migrate.
+func warnDroppedForeignCollation(table *ir.Table, colName string, t ir.Type) {
+	charset, collation := translate.ColumnCollation(t)
+	if collation == "" || translate.CollationDialect(charset, collation) == "postgres" {
+		return
+	}
+	slog.Warn(
+		"postgres: dropping cross-engine column collation (no PG equivalent; the target column uses the database default collation, which may change sort/comparison semantics)",
+		slog.String("table", tableNameForLog(table)),
+		slog.String("column", colName),
+		slog.String("collation", collation),
+	)
 }
 
 // tableNameForLog returns a non-empty table name for log lines, even
@@ -1078,6 +1139,20 @@ func emitTableDef(schema string, table *ir.Table, opts emitOpts) (string, error)
 			return "", err
 		}
 		parts = append(parts, def)
+	}
+
+	// Cross-engine collation-drop policy (docs/type-mapping.md
+	// "Charsets and collations"): MySQL-dialect collations have no PG
+	// meaning and no name translation; emitColumnDef omits them, and
+	// this WARN — one per table, because a MySQL source tags every
+	// string column with its (usually default) collation — makes the
+	// drop visible instead of silent.
+	if dropped := translate.DroppedCollationColumns(table, "postgres"); len(dropped) > 0 {
+		slog.Warn(
+			"postgres: dropping cross-engine column collations (no PG equivalent; the target columns use the database default collation, which may change sort/comparison semantics)",
+			slog.String("table", table.Name),
+			slog.String("columns", strings.Join(dropped, ", ")),
+		)
 	}
 
 	// SET columns get a table-level CHECK constraint enforcing the

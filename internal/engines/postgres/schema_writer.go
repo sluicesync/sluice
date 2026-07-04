@@ -1287,6 +1287,12 @@ func (w *SchemaWriter) AlterAddColumn(ctx context.Context, table *ir.Table, cols
 		if err != nil {
 			return fmt.Errorf("alter add column: emit %q: %w", col.Name, err)
 		}
+		// Cross-engine collation-drop WARN, per column: this forward
+		// path bypasses emitTableDef's per-table aggregation, and a
+		// forwarded ADD COLUMN carrying a MySQL-dialect collation would
+		// otherwise drop it silently (emitColumnDef only renders
+		// PG-dialect collations).
+		warnDroppedForeignCollation(table, col.Name, col.Type)
 		qualified := w.qualifyTable(table)
 		stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s", qualified, def)
 		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
@@ -1452,6 +1458,13 @@ func (w *SchemaWriter) AlterColumnType(ctx context.Context, table *ir.Table, wan
 	if err != nil {
 		return fmt.Errorf("alter column type: emit %q: %w", want.Name, err)
 	}
+	// Same COLLATE carry / cross-engine drop policy as emitColumnDef:
+	// `ALTER COLUMN ... TYPE <type> COLLATE "<name>"` is PG's spelling
+	// for retyping a column with an explicit collation; a foreign
+	// MySQL-dialect collation is dropped with a per-column WARN (this is
+	// a low-volume path — no per-table aggregation needed).
+	typeStr += pgCollateClause(want.Type)
+	warnDroppedForeignCollation(table, want.Name, want.Type)
 	qualified := w.qualifyTable(table)
 	stmt := fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s",
 		qualified, quoteIdent(want.Name), typeStr)
