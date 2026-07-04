@@ -99,13 +99,54 @@ func TestTranslateType(t *testing.T) {
 		{"bytea", columnMeta{DataType: "bytea"}, ir.Blob{Size: ir.BlobLong}},
 
 		// ---- Temporal ----
+		// TRIAGE #3 read matrix, pinned per family × shape (the Bug 74
+		// discipline): every family member × {bare (atttypmod -1 →
+		// PrecisionUnspecified, even though information_schema reports
+		// the default 6), explicit 0, explicit mid, explicit 6}.
+		// pg_attribute.atttypmod is the declaredness ground truth;
+		// datetime_precision alone cannot distinguish bare from an
+		// explicit (6).
 		{"date", columnMeta{DataType: "date"}, ir.Date{}},
-		{"time", columnMeta{DataType: "time without time zone", DTPrec: int64Val(6)}, ir.Time{Precision: 6}},
+		{"time bare", columnMeta{DataType: "time without time zone", DTPrec: int64Val(6), AttTypmod: -1}, ir.Time{PrecisionUnspecified: true}},
+		{"time(0)", columnMeta{DataType: "time without time zone", DTPrec: int64Val(0), AttTypmod: 0}, ir.Time{Precision: 0}},
+		{"time(4)", columnMeta{DataType: "time without time zone", DTPrec: int64Val(4), AttTypmod: 4}, ir.Time{Precision: 4}},
+		{"time(6)", columnMeta{DataType: "time without time zone", DTPrec: int64Val(6), AttTypmod: 6}, ir.Time{Precision: 6}},
 		// Bug 71: timetz must map distinctly from plain time, not
 		// collapse to ir.Time{} (OID 1083) and hard-fail the COPY writer.
-		{"timetz", columnMeta{DataType: "time with time zone", DTPrec: int64Val(6)}, ir.Time{Precision: 6, WithTimeZone: true}},
-		{"timestamp", columnMeta{DataType: "timestamp without time zone", DTPrec: int64Val(3)}, ir.DateTime{Precision: 3}},
-		{"timestamptz", columnMeta{DataType: "timestamp with time zone", DTPrec: int64Val(6)}, ir.Timestamp{Precision: 6, WithTimeZone: true}},
+		{"timetz bare", columnMeta{DataType: "time with time zone", DTPrec: int64Val(6), AttTypmod: -1}, ir.Time{WithTimeZone: true, PrecisionUnspecified: true}},
+		{"timetz(0)", columnMeta{DataType: "time with time zone", DTPrec: int64Val(0), AttTypmod: 0}, ir.Time{Precision: 0, WithTimeZone: true}},
+		{"timetz(2)", columnMeta{DataType: "time with time zone", DTPrec: int64Val(2), AttTypmod: 2}, ir.Time{Precision: 2, WithTimeZone: true}},
+		{"timetz(6)", columnMeta{DataType: "time with time zone", DTPrec: int64Val(6), AttTypmod: 6}, ir.Time{Precision: 6, WithTimeZone: true}},
+		{"timestamp bare", columnMeta{DataType: "timestamp without time zone", DTPrec: int64Val(6), AttTypmod: -1}, ir.DateTime{PrecisionUnspecified: true}},
+		{"timestamp(0)", columnMeta{DataType: "timestamp without time zone", DTPrec: int64Val(0), AttTypmod: 0}, ir.DateTime{Precision: 0}},
+		{"timestamp(3)", columnMeta{DataType: "timestamp without time zone", DTPrec: int64Val(3), AttTypmod: 3}, ir.DateTime{Precision: 3}},
+		{"timestamp(6)", columnMeta{DataType: "timestamp without time zone", DTPrec: int64Val(6), AttTypmod: 6}, ir.DateTime{Precision: 6}},
+		{"timestamptz bare", columnMeta{DataType: "timestamp with time zone", DTPrec: int64Val(6), AttTypmod: -1}, ir.Timestamp{WithTimeZone: true, PrecisionUnspecified: true}},
+		{"timestamptz(0)", columnMeta{DataType: "timestamp with time zone", DTPrec: int64Val(0), AttTypmod: 0}, ir.Timestamp{Precision: 0, WithTimeZone: true}},
+		{"timestamptz(3)", columnMeta{DataType: "timestamp with time zone", DTPrec: int64Val(3), AttTypmod: 3}, ir.Timestamp{Precision: 3, WithTimeZone: true}},
+		{"timestamptz(6)", columnMeta{DataType: "timestamp with time zone", DTPrec: int64Val(6), AttTypmod: 6}, ir.Timestamp{Precision: 6, WithTimeZone: true}},
+		// Array elements: the synthesized element meta carries the array
+		// column's atttypmod (a temporal typmod IS the precision) and no
+		// datetime_precision — bare arrays stay unspecified, declared
+		// precision carries.
+		{
+			"timestamptz[] bare element",
+			columnMeta{
+				DataType: "ARRAY", UDTName: "_timestamptz",
+				AttTypmod:    -1,
+				ArrayElement: &columnMeta{DataType: "timestamp with time zone", UDTName: "timestamptz", AttTypmod: -1},
+			},
+			ir.Array{Element: ir.Timestamp{WithTimeZone: true, PrecisionUnspecified: true}},
+		},
+		{
+			"timestamptz(3)[] element",
+			columnMeta{
+				DataType: "ARRAY", UDTName: "_timestamptz",
+				AttTypmod:    3,
+				ArrayElement: &columnMeta{DataType: "timestamp with time zone", UDTName: "timestamptz", AttTypmod: 3},
+			},
+			ir.Array{Element: ir.Timestamp{Precision: 3, WithTimeZone: true}},
+		},
 
 		// ---- Structured ----
 		{"json", columnMeta{DataType: "json"}, ir.JSON{Binary: false}},

@@ -426,11 +426,14 @@ func oidToType(oid uint32, typmod int32) (ir.Type, error) {
 		// column working symmetrically with the schema-read path.
 		return ir.Interval{}, nil
 	case pgtype.TimeOID, pgtype.TimetzOID:
-		return ir.Time{Precision: temporalTypmod(typmod)}, nil
+		p, unspec := temporalTypmod(typmod)
+		return ir.Time{Precision: p, PrecisionUnspecified: unspec}, nil
 	case pgtype.TimestampOID:
-		return ir.DateTime{Precision: temporalTypmod(typmod)}, nil
+		p, unspec := temporalTypmod(typmod)
+		return ir.DateTime{Precision: p, PrecisionUnspecified: unspec}, nil
 	case pgtype.TimestamptzOID:
-		return ir.Timestamp{Precision: temporalTypmod(typmod), WithTimeZone: true}, nil
+		p, unspec := temporalTypmod(typmod)
+		return ir.Timestamp{Precision: p, WithTimeZone: true, PrecisionUnspecified: unspec}, nil
 
 	// ---- Structured ----
 	case pgtype.JSONOID:
@@ -603,10 +606,15 @@ func numericTypmod(typmod int32) (precision, scale int) {
 
 // temporalTypmod returns the fractional-second precision N from a
 // TIMESTAMP(N) / TIME(N) typmod. Postgres stores precision directly
-// (no +4 offset for these types) with -1 meaning "default".
-func temporalTypmod(typmod int32) int {
+// (no +4 offset for these types); -1 is the bare declared form with
+// no precision (unspecified=true — the [ir.Timestamp]/[ir.Time]/
+// [ir.DateTime] PrecisionUnspecified state, TRIAGE #3), which behaves
+// as the engine default (6) but is catalog-distinct from an explicit
+// (6). Keeps the CDC projection in lockstep with the schema reader's
+// [temporalPrecisionOf].
+func temporalTypmod(typmod int32) (precision int, unspecified bool) {
 	if typmod < 0 {
-		return 0
+		return 0, true
 	}
-	return int(typmod)
+	return int(typmod), false
 }

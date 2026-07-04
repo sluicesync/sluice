@@ -273,17 +273,33 @@ func TestEmitColumnType(t *testing.T) {
 		{"bit(9) → BIT(9)", ir.Bit{Length: 9}, "BIT(9)"},
 
 		// ---- Temporal ----
+		// TRIAGE #3 emit matrix, pinned per family × shape (the Bug 74
+		// discipline): every family member — Time / TimeTZ / DateTime /
+		// Timestamp / TimestampTZ — × {unspecified → bare, explicit 0 →
+		// (0), mid explicit → (p), explicit 6 → (6)}. A KNOWN precision
+		// always emits, INCLUDING (0): the pre-fix 0-renders-bare rule
+		// silently widened an explicit (0) to the 6-behaving bare form.
 		{"date", ir.Date{}, "DATE"},
-		{"time precision 0", ir.Time{Precision: 0}, "TIME"},
+		{"time unspecified", ir.Time{PrecisionUnspecified: true}, "TIME"},
+		{"time precision 0", ir.Time{Precision: 0}, "TIME(0)"},
+		{"time precision 4", ir.Time{Precision: 4}, "TIME(4)"},
 		{"time precision 6", ir.Time{Precision: 6}, "TIME(6)"},
 		// Bug 71: timetz round-trips as TIME WITH TIME ZONE on a PG
 		// target (not collapsed to plain TIME).
-		{"timetz precision 0", ir.Time{Precision: 0, WithTimeZone: true}, "TIME WITH TIME ZONE"},
+		{"timetz unspecified", ir.Time{WithTimeZone: true, PrecisionUnspecified: true}, "TIME WITH TIME ZONE"},
+		{"timetz precision 0", ir.Time{Precision: 0, WithTimeZone: true}, "TIME(0) WITH TIME ZONE"},
+		{"timetz precision 2", ir.Time{Precision: 2, WithTimeZone: true}, "TIME(2) WITH TIME ZONE"},
 		{"timetz precision 6", ir.Time{Precision: 6, WithTimeZone: true}, "TIME(6) WITH TIME ZONE"},
-		{"datetime precision 0", ir.DateTime{Precision: 0}, "TIMESTAMP"},
+		{"datetime unspecified", ir.DateTime{PrecisionUnspecified: true}, "TIMESTAMP"},
+		{"datetime precision 0", ir.DateTime{Precision: 0}, "TIMESTAMP(0)"},
 		{"datetime precision 3", ir.DateTime{Precision: 3}, "TIMESTAMP(3)"},
-		{"timestamp", ir.Timestamp{Precision: 0, WithTimeZone: false}, "TIMESTAMP"},
-		{"timestamptz", ir.Timestamp{Precision: 6, WithTimeZone: true}, "TIMESTAMP(6) WITH TIME ZONE"},
+		{"datetime precision 6", ir.DateTime{Precision: 6}, "TIMESTAMP(6)"},
+		{"timestamp unspecified", ir.Timestamp{PrecisionUnspecified: true}, "TIMESTAMP"},
+		{"timestamp precision 0", ir.Timestamp{Precision: 0, WithTimeZone: false}, "TIMESTAMP(0)"},
+		{"timestamp precision 3", ir.Timestamp{Precision: 3}, "TIMESTAMP(3)"},
+		{"timestamptz unspecified", ir.Timestamp{WithTimeZone: true, PrecisionUnspecified: true}, "TIMESTAMP WITH TIME ZONE"},
+		{"timestamptz precision 0", ir.Timestamp{Precision: 0, WithTimeZone: true}, "TIMESTAMP(0) WITH TIME ZONE"},
+		{"timestamptz precision 6", ir.Timestamp{Precision: 6, WithTimeZone: true}, "TIMESTAMP(6) WITH TIME ZONE"},
 		// interval: MySQL TIME duration → PG INTERVAL override (Vector C).
 		{"interval", ir.Interval{}, "INTERVAL"},
 

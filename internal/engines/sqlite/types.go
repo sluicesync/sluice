@@ -111,11 +111,18 @@ func declaredTemporalBoolType(declaredType string) (ir.Type, bool) {
 	t := strings.ToUpper(strings.TrimSpace(declaredType))
 	switch {
 	case strings.Contains(t, "DATETIME"), strings.Contains(t, "TIMESTAMP"):
-		return ir.Timestamp{}, true
+		// PrecisionUnspecified: SQLite temporals are TEXT storage with
+		// no declared fractional-second precision — values may carry
+		// any sub-second detail. Carrying an explicit 0 here (the
+		// pre-TRIAGE-#3 zero value) would truncate fractional seconds
+		// on engines that honor a declared 0 (MySQL DATETIME(0), PG
+		// timestamp(0)); unspecified lets each writer pick its
+		// max-fidelity form (PG bare, MySQL (6)).
+		return ir.Timestamp{PrecisionUnspecified: true}, true
 	case strings.Contains(t, "DATE"):
 		return ir.Date{}, true
 	case strings.Contains(t, "TIME"):
-		return ir.Time{}, true
+		return ir.Time{PrecisionUnspecified: true}, true
 	case strings.Contains(t, "BOOL"):
 		return ir.Boolean{}, true
 	default:

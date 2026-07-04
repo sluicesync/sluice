@@ -91,6 +91,17 @@ type schemaTypeEnvelope struct {
 	// Temporal fields (Time, DateTime, Timestamp). Precision is reused.
 	WithTimeZone bool `json:"with_time_zone,omitempty"`
 
+	// Temporal precision-unspecified (restore-parity TRIAGE #3, the
+	// temporal counterpart of DecimalUnconstrained). True for the bare
+	// PG `time`/`timestamp`/`timestamptz` form with no declared
+	// precision (atttypmod -1). Append-only; older sluice ignores it
+	// and reads the column as precision 0 — which its emitter renders
+	// as the bare form, the pre-fix behaviour. Manifests written by
+	// OLDER binaries carry the materialized Precision=6 with this flag
+	// absent, and decode as an explicit (6) — restoring them keeps
+	// behaving exactly as it did pre-fix. No format bump needed.
+	TemporalPrecisionUnspecified bool `json:"temporal_precision_unspecified,omitempty"`
+
 	// JSON.
 	Binary bool `json:"binary,omitempty"`
 
@@ -209,13 +220,16 @@ func MarshalType(t Type) ([]byte, error) {
 		env.Kind = "Time"
 		env.Precision = v.Precision
 		env.WithTimeZone = v.WithTimeZone
+		env.TemporalPrecisionUnspecified = v.PrecisionUnspecified
 	case DateTime:
 		env.Kind = "DateTime"
 		env.Precision = v.Precision
+		env.TemporalPrecisionUnspecified = v.PrecisionUnspecified
 	case Timestamp:
 		env.Kind = "Timestamp"
 		env.Precision = v.Precision
 		env.WithTimeZone = v.WithTimeZone
+		env.TemporalPrecisionUnspecified = v.PrecisionUnspecified
 	case JSON:
 		env.Kind = "JSON"
 		env.Binary = v.Binary
@@ -336,11 +350,11 @@ func UnmarshalType(b []byte) (Type, error) {
 	case "Interval":
 		return Interval{}, nil
 	case "Time":
-		return Time{Precision: env.Precision, WithTimeZone: env.WithTimeZone}, nil
+		return Time{Precision: env.Precision, WithTimeZone: env.WithTimeZone, PrecisionUnspecified: env.TemporalPrecisionUnspecified}, nil
 	case "DateTime":
-		return DateTime{Precision: env.Precision}, nil
+		return DateTime{Precision: env.Precision, PrecisionUnspecified: env.TemporalPrecisionUnspecified}, nil
 	case "Timestamp":
-		return Timestamp{Precision: env.Precision, WithTimeZone: env.WithTimeZone}, nil
+		return Timestamp{Precision: env.Precision, WithTimeZone: env.WithTimeZone, PrecisionUnspecified: env.TemporalPrecisionUnspecified}, nil
 	case "JSON":
 		return JSON{Binary: env.Binary}, nil
 	case "Enum":

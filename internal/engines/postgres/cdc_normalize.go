@@ -196,20 +196,22 @@ func normalizeTypeForCDCComparison(t ir.Type) ir.Type {
 		}
 		return v
 	case ir.DateTime:
-		// Bug 86 (v0.78.1): the SchemaReader reads
+		// Bug 86 (v0.78.1): the SchemaReader historically read
 		// information_schema.columns.datetime_precision, which PG
 		// reports as 6 (the default) for any `TIMESTAMP` declared
-		// WITHOUT an explicit precision. The CDC OID-to-type mapper
-		// reads pg_attribute.atttypmod, which is -1 for the same
-		// "no explicit precision" case; temporalTypmod(-1) returns 0.
-		// Collapse the default-precision case to Precision=0 on the
-		// seed so it matches the CDC projection. Operators who
-		// explicitly declare TIMESTAMP(6) hit a false-negative ALTER
-		// (cold-start 6 → normalized to 0; CDC sees 6) — an accepted
-		// v1 limitation: classifier-level detection of explicit-
-		// precision-changes is out of scope, and the operator-visible
-		// behaviour is no worse than v0.78.0's blanket refusal of
-		// every TIMESTAMP-having table.
+		// WITHOUT an explicit precision; the CDC OID-to-type mapper
+		// reads pg_attribute.atttypmod, which is -1 for the same case.
+		// Both sides now model that bare form as PrecisionUnspecified
+		// (TRIAGE #3), but PERSISTED schema-history snapshots written
+		// by older binaries still carry the materialized Precision=6,
+		// so the collapse stays: bare ≡ (0) ≡ (6) for CDC comparison.
+		// Operators who explicitly declare TIMESTAMP(6) hit a
+		// false-negative ALTER — an accepted v1 limitation:
+		// classifier-level detection of explicit-precision-changes is
+		// out of scope, and the operator-visible behaviour is no worse
+		// than v0.78.0's blanket refusal of every TIMESTAMP-having
+		// table.
+		v.PrecisionUnspecified = false
 		if v.Precision == 6 {
 			v.Precision = 0
 		}
@@ -217,6 +219,7 @@ func normalizeTypeForCDCComparison(t ir.Type) ir.Type {
 	case ir.Time:
 		// Same TIMESTAMP-default-precision asymmetry as ir.DateTime
 		// above; PG `TIME` and `TIMETZ` default to precision 6 too.
+		v.PrecisionUnspecified = false
 		if v.Precision == 6 {
 			v.Precision = 0
 		}
@@ -224,6 +227,7 @@ func normalizeTypeForCDCComparison(t ir.Type) ir.Type {
 	case ir.Timestamp:
 		// Same TIMESTAMP-default-precision asymmetry; covers
 		// `TIMESTAMP WITH TIME ZONE` (TIMESTAMPTZ).
+		v.PrecisionUnspecified = false
 		if v.Precision == 6 {
 			v.Precision = 0
 		}

@@ -96,10 +96,13 @@ func TestResolveColumnType(t *testing.T) {
 		// Temporal/bool overrides (the new policy).
 		{"DATE", ir.Date{}},
 		{"date", ir.Date{}},
-		{"DATETIME", ir.Timestamp{}}, // DATETIME wins over the DATE/TIME substrings
-		{"TIMESTAMP", ir.Timestamp{}},
-		{"TIMESTAMPTZ", ir.Timestamp{}}, // still tz-naive in SQLite
-		{"TIME", ir.Time{}},
+		// PrecisionUnspecified: SQLite temporals carry no declared
+		// fractional-second precision (TRIAGE #3) — the PG writer emits
+		// the bare form, the MySQL writer materializes (6).
+		{"DATETIME", ir.Timestamp{PrecisionUnspecified: true}}, // DATETIME wins over the DATE/TIME substrings
+		{"TIMESTAMP", ir.Timestamp{PrecisionUnspecified: true}},
+		{"TIMESTAMPTZ", ir.Timestamp{PrecisionUnspecified: true}}, // still tz-naive in SQLite
+		{"TIME", ir.Time{PrecisionUnspecified: true}},
 		{"BOOL", ir.Boolean{}},
 		{"BOOLEAN", ir.Boolean{}},
 		{"boolean", ir.Boolean{}},
@@ -135,10 +138,10 @@ func TestDeclaredTemporalBoolType(t *testing.T) {
 		want     ir.Type
 		wantOK   bool
 	}{
-		{"DATETIME", ir.Timestamp{}, true},
-		{"TIMESTAMP", ir.Timestamp{}, true},
+		{"DATETIME", ir.Timestamp{PrecisionUnspecified: true}, true},
+		{"TIMESTAMP", ir.Timestamp{PrecisionUnspecified: true}, true},
 		{"DATE", ir.Date{}, true},
-		{"TIME", ir.Time{}, true},
+		{"TIME", ir.Time{PrecisionUnspecified: true}, true},
 		{"BOOLEAN", ir.Boolean{}, true},
 		{"BOOL", ir.Boolean{}, true},
 		{"INTEGER", nil, false},

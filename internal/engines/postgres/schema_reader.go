@@ -1079,6 +1079,12 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			meta.ArrayElement = &columnMeta{
 				DataType: elemDataType,
 				UDTName:  strings.TrimPrefix(udtName, "_"),
+				// The array column's typmod applies to its elements
+				// (`timestamptz(3)[]` carries atttypmod=3); thread it
+				// through so temporal elements resolve their precision
+				// (or precision-unspecified, typmod -1) exactly like
+				// the scalar path (TRIAGE #3).
+				AttTypmod: attTypmod,
 			}
 		}
 

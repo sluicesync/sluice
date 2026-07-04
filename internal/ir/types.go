@@ -322,9 +322,23 @@ func (Date) String() string { return "Date" }
 // have distinct OIDs (1266 vs 1083) and the tz-bearing form cannot be
 // encoded into the tz-less one — collapsing them mis-mapped timetz to
 // time and hard-failed the COPY writer (catalog Bug 71).
+//
+// PrecisionUnspecified models the bare declared form — a column
+// declared as `time` / `time with time zone` with NO precision
+// (pg_attribute.atttypmod = -1; behaves as the engine default, 6).
+// When true, Precision carries no meaning and MUST be zero; when
+// false, Precision is the explicitly declared value (0 is a real,
+// distinct declaration — `time(0)` rounds to whole seconds). The two
+// cases are genuinely distinct on the wire — PG renders bare `time`
+// vs `time(p)` — so the IR must distinguish them rather than
+// materializing information_schema's default-6 into the catalog (the
+// temporal counterpart of [Decimal].Unconstrained, catalog Bug 69;
+// restore-parity TRIAGE #3). Engines whose readers always know the
+// precision (MySQL reports 0 for bare TIME) never set it.
 type Time struct {
-	Precision    int
-	WithTimeZone bool
+	Precision            int
+	WithTimeZone         bool
+	PrecisionUnspecified bool
 }
 
 func (Time) isType()    {}
@@ -332,7 +346,13 @@ func (Time) Tier() Tier { return TierCore }
 
 func (t Time) String() string {
 	if t.WithTimeZone {
+		if t.PrecisionUnspecified {
+			return "TimeTZ(unspecified)"
+		}
 		return fmt.Sprintf("TimeTZ(%d)", t.Precision)
+	}
+	if t.PrecisionUnspecified {
+		return "Time(unspecified)"
 	}
 	return fmt.Sprintf("Time(%d)", t.Precision)
 }
@@ -357,19 +377,31 @@ func (Interval) Tier() Tier { return TierExtension }
 func (Interval) String() string { return "Interval" }
 
 // DateTime is a calendar date plus time-of-day, without a timezone.
+// PrecisionUnspecified mirrors [Time].PrecisionUnspecified — the bare
+// PG `timestamp` (typmod -1) form, distinct from `timestamp(p)`.
 type DateTime struct {
-	Precision int
+	Precision            int
+	PrecisionUnspecified bool
 }
 
 func (DateTime) isType()    {}
 func (DateTime) Tier() Tier { return TierCore }
 
-func (d DateTime) String() string { return fmt.Sprintf("DateTime(%d)", d.Precision) }
+func (d DateTime) String() string {
+	if d.PrecisionUnspecified {
+		return "DateTime(unspecified)"
+	}
+	return fmt.Sprintf("DateTime(%d)", d.Precision)
+}
 
 // Timestamp is a calendar date plus time-of-day with optional timezone.
+// PrecisionUnspecified mirrors [Time].PrecisionUnspecified — the bare
+// PG `timestamp with time zone` (typmod -1) form, distinct from
+// `timestamptz(p)`; when true, Precision MUST be zero.
 type Timestamp struct {
-	Precision    int
-	WithTimeZone bool
+	Precision            int
+	WithTimeZone         bool
+	PrecisionUnspecified bool
 }
 
 func (Timestamp) isType()    {}
@@ -377,7 +409,13 @@ func (Timestamp) Tier() Tier { return TierCore }
 
 func (t Timestamp) String() string {
 	if t.WithTimeZone {
+		if t.PrecisionUnspecified {
+			return "TimestampTZ(unspecified)"
+		}
 		return fmt.Sprintf("TimestampTZ(%d)", t.Precision)
+	}
+	if t.PrecisionUnspecified {
+		return "Timestamp(unspecified)"
 	}
 	return fmt.Sprintf("Timestamp(%d)", t.Precision)
 }

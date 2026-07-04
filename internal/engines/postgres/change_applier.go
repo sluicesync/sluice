@@ -1674,7 +1674,8 @@ func loadColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (map
 			c.column_default,
 			c.is_generated,
 			COALESCE(c.generation_expression, ''),
-			COALESCE(pg_catalog.format_type(a.atttypid, a.atttypmod), '')
+			COALESCE(pg_catalog.format_type(a.atttypid, a.atttypmod), ''),
+			COALESCE(a.atttypmod, -1)
 		FROM   information_schema.columns c
 		LEFT JOIN pg_class      cl   ON cl.relname    = c.table_name
 		                            AND cl.relnamespace = (
@@ -1704,12 +1705,13 @@ func loadColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (map
 			isGenerated                string
 			genExpr                    string
 			formatType                 string
+			attTypmod                  int32
 		)
 		if err := rows.Scan(
 			&colName, &dataType, &udtName,
 			&charMaxLen, &numPrec, &numScale, &dtPrec,
 			&isIdentity, &columnDefault, &isGenerated, &genExpr,
-			&formatType,
+			&formatType, &attTypmod,
 		); err != nil {
 			return nil, err
 		}
@@ -1723,6 +1725,7 @@ func loadColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (map
 			DTPrec:          nullInt64ToPtr(dtPrec),
 			IsAutoIncrement: isAutoIncrement(isIdentity, columnDefault),
 			FormatType:      formatType,
+			AttTypmod:       attTypmod,
 			// VerbatimEligible=true: the applier writes to a PG target,
 			// so ADR-0051/-0070 verbatim-carry types round-trip via
 			// ir.VerbatimType. Cross-engine sources (MySQL) cannot
@@ -1760,6 +1763,9 @@ func loadColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (map
 			meta.ArrayElement = &columnMeta{
 				DataType: elemDataType,
 				UDTName:  strings.TrimPrefix(udtName, "_"),
+				// Same as the schema reader: the array column's typmod
+				// applies to its elements (temporal precision / TRIAGE #3).
+				AttTypmod: attTypmod,
 			}
 		}
 

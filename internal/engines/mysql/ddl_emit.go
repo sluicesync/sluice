@@ -89,7 +89,7 @@ func emitColumnType(t ir.Type) (string, error) {
 	case ir.Date:
 		return "DATE", nil
 	case ir.Time:
-		return emitWithPrecision("TIME", v.Precision), nil
+		return emitWithPrecision("TIME", effectiveTemporalPrecision(v.Precision, v.PrecisionUnspecified)), nil
 	case ir.Interval:
 		// MySQL has no INTERVAL type. The `interval` override targets PG
 		// only; refuse loudly rather than silently degrade a duration to
@@ -98,12 +98,12 @@ func emitColumnType(t ir.Type) (string, error) {
 		return "", errors.New("mysql: no INTERVAL type — the `interval` type-override targets a Postgres target only " +
 			"(a MySQL TIME can't hold the full duration range); map this column to a MySQL-representable type instead")
 	case ir.DateTime:
-		return emitWithPrecision("DATETIME", v.Precision), nil
+		return emitWithPrecision("DATETIME", effectiveTemporalPrecision(v.Precision, v.PrecisionUnspecified)), nil
 	case ir.Timestamp:
 		// MySQL TIMESTAMP is always zoned (stored as UTC, converted
 		// on retrieval). DateTime-without-zone IR values would map
 		// to DATETIME, not TIMESTAMP.
-		return emitWithPrecision("TIMESTAMP", v.Precision), nil
+		return emitWithPrecision("TIMESTAMP", effectiveTemporalPrecision(v.Precision, v.PrecisionUnspecified)), nil
 
 	// ---- Structured ----
 	case ir.JSON:
@@ -326,12 +326,29 @@ func emitBlobType(size ir.BlobSize) string {
 
 // emitWithPrecision renders TYPE(N), or TYPE when precision is zero.
 // MySQL accepts both forms; omitting the precision produces a slightly
-// shorter, more conventional DDL.
+// shorter, more conventional DDL — and unlike PG, MySQL's bare
+// DATETIME/TIME/TIMESTAMP IS the (0) form, so collapsing 0 to bare is
+// faithful here (no PG-style bare-behaves-as-6 asymmetry).
 func emitWithPrecision(typeName string, precision int) string {
 	if precision == 0 {
 		return typeName
 	}
 	return fmt.Sprintf("%s(%d)", typeName, precision)
+}
+
+// effectiveTemporalPrecision materializes the precision MySQL must
+// declare for a temporal IR type. A precision-unspecified source (the
+// bare PG `time`/`timestamp`/`timestamptz` form, or a precision-less
+// SQLite temporal — TRIAGE #3) behaves as microsecond precision on the
+// source, and MySQL has no "engine-default 6" bare form (bare means 0
+// and would silently truncate fractional seconds), so unspecified
+// materializes as the explicit maximum, 6. Documented in
+// docs/type-mapping.md "Temporal precision".
+func effectiveTemporalPrecision(precision int, unspecified bool) int {
+	if unspecified {
+		return 6
+	}
+	return precision
 }
 
 // emitGeometryType returns the MySQL spatial type for the given subtype.
@@ -705,10 +722,11 @@ func isMySQLBareDefaultKeyword(s string) bool {
 // a TIMESTAMP(6) column. MySQL rejects "Invalid default value for X"
 // when the function call's precision doesn't match the column's
 // declared precision; the most common path that hits this is a PG
-// source migrating "TIMESTAMPTZ DEFAULT now()" to MySQL — PG reports
-// TIMESTAMPTZ as ir.Timestamp{Precision:6} (PG's default) and the
-// translator turns now() into CURRENT_TIMESTAMP, but without this
-// adjustment the precisions disagree on the target.
+// source migrating "TIMESTAMPTZ DEFAULT now()" to MySQL — PG reads a
+// bare TIMESTAMPTZ as ir.Timestamp{PrecisionUnspecified} (TRIAGE #3),
+// which this writer materializes as TIMESTAMP(6), and the translator
+// turns now() into CURRENT_TIMESTAMP, but without this adjustment the
+// precisions disagree on the target.
 //
 // Inputs that already carry a parenthesised precision (e.g.
 // CURRENT_TIMESTAMP(3)) pass through unchanged — the caller is
@@ -724,16 +742,20 @@ func matchTimestampDefaultPrecision(expr string, t ir.Type) string {
 	return fmt.Sprintf("CURRENT_TIMESTAMP(%d)", prec)
 }
 
-// temporalPrecision returns the fractional-second precision declared
-// on a temporal IR type, or 0 for non-temporal types.
+// temporalPrecision returns the fractional-second precision the MySQL
+// column will be DECLARED with for a temporal IR type, or 0 for
+// non-temporal types. Precision-unspecified sources materialize as 6
+// (see [effectiveTemporalPrecision]) — the CURRENT_TIMESTAMP default
+// suffix this feeds MUST match the column's declared precision or
+// MySQL rejects the DDL ("Invalid default value").
 func temporalPrecision(t ir.Type) int {
 	switch v := t.(type) {
 	case ir.Timestamp:
-		return v.Precision
+		return effectiveTemporalPrecision(v.Precision, v.PrecisionUnspecified)
 	case ir.DateTime:
-		return v.Precision
+		return effectiveTemporalPrecision(v.Precision, v.PrecisionUnspecified)
 	case ir.Time:
-		return v.Precision
+		return effectiveTemporalPrecision(v.Precision, v.PrecisionUnspecified)
 	}
 	return 0
 }

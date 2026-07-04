@@ -81,6 +81,15 @@ func TestEmitColumnType(t *testing.T) {
 		{"datetime precision 3", ir.DateTime{Precision: 3}, "DATETIME(3)"},
 		{"timestamp precision 0", ir.Timestamp{Precision: 0, WithTimeZone: true}, "TIMESTAMP"},
 		{"timestamp precision 6", ir.Timestamp{Precision: 6, WithTimeZone: true}, "TIMESTAMP(6)"},
+		// TRIAGE #3: a precision-unspecified source (PG bare temporal /
+		// SQLite temporal) behaves as microseconds on the source; MySQL
+		// has no 6-behaving bare form (bare == (0), which would silently
+		// truncate fractional seconds), so unspecified materializes as
+		// the explicit maximum — pinned per family, not one
+		// representative.
+		{"time unspecified → (6)", ir.Time{PrecisionUnspecified: true}, "TIME(6)"},
+		{"datetime unspecified → (6)", ir.DateTime{PrecisionUnspecified: true}, "DATETIME(6)"},
+		{"timestamp unspecified → (6)", ir.Timestamp{WithTimeZone: true, PrecisionUnspecified: true}, "TIMESTAMP(6)"},
 
 		// ---- Structured ----
 		{"json", ir.JSON{Binary: true}, "JSON"},
@@ -307,6 +316,12 @@ func TestEmitDefault(t *testing.T) {
 		{"pg now() on TIMESTAMP(6) is precision-matched", ir.DefaultExpression{Expr: "now()"}, ir.Timestamp{Precision: 6, WithTimeZone: true}, "CURRENT_TIMESTAMP(6)", true},
 		{"pg now() on TIMESTAMP(3) is precision-matched", ir.DefaultExpression{Expr: "now()"}, ir.Timestamp{Precision: 3}, "CURRENT_TIMESTAMP(3)", true},
 		{"current_timestamp on DATETIME(6) is precision-matched", ir.DefaultExpression{Expr: "CURRENT_TIMESTAMP"}, ir.DateTime{Precision: 6}, "CURRENT_TIMESTAMP(6)", true},
+		// TRIAGE #3: a PG BARE timestamptz now reads as
+		// PrecisionUnspecified (not the materialized 6); this writer
+		// declares the column TIMESTAMP(6), so the default must be
+		// precision-matched to (6) exactly as before, or MySQL rejects
+		// the DDL with "Invalid default value".
+		{"pg now() on bare timestamptz (unspecified) is precision-matched", ir.DefaultExpression{Expr: "now()"}, ir.Timestamp{WithTimeZone: true, PrecisionUnspecified: true}, "CURRENT_TIMESTAMP(6)", true},
 		// An expression that *already* declares a precision passes
 		// through unchanged — the caller is asserting that precision.
 		{"explicit precision passthrough", ir.DefaultExpression{Expr: "CURRENT_TIMESTAMP(6)"}, ir.Timestamp{Precision: 6}, "CURRENT_TIMESTAMP(6)", true},

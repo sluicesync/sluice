@@ -365,7 +365,8 @@ func translateType(c columnMeta) (ir.Type, error) {
 		// interval and is refused (emitColumnType / unsupportablePGtoMySQL).
 		return ir.Interval{}, nil
 	case "time without time zone", "time":
-		return ir.Time{Precision: int(int64Ptr(c.DTPrec))}, nil
+		p, unspec := temporalPrecisionOf(c)
+		return ir.Time{Precision: p, PrecisionUnspecified: unspec}, nil
 	case "time with time zone":
 		// `timetz` (PG OID 1266) is a distinct wire type from plain
 		// `time` (OID 1083); the tz-bearing value cannot be encoded
@@ -374,11 +375,14 @@ func translateType(c columnMeta) (ir.Type, error) {
 		// tz is dropped (MySQL has no tz-aware TIME) — same documented
 		// policy as timestamptz→MySQL; see docs/type-mapping.md.
 		// (catalog Bug 71.)
-		return ir.Time{Precision: int(int64Ptr(c.DTPrec)), WithTimeZone: true}, nil
+		p, unspec := temporalPrecisionOf(c)
+		return ir.Time{Precision: p, WithTimeZone: true, PrecisionUnspecified: unspec}, nil
 	case "timestamp without time zone", "timestamp":
-		return ir.DateTime{Precision: int(int64Ptr(c.DTPrec))}, nil
+		p, unspec := temporalPrecisionOf(c)
+		return ir.DateTime{Precision: p, PrecisionUnspecified: unspec}, nil
 	case "timestamp with time zone":
-		return ir.Timestamp{Precision: int(int64Ptr(c.DTPrec)), WithTimeZone: true}, nil
+		p, unspec := temporalPrecisionOf(c)
+		return ir.Timestamp{Precision: p, WithTimeZone: true, PrecisionUnspecified: unspec}, nil
 
 	// ---- Structured ----
 	case "json":
@@ -495,6 +499,28 @@ func int64Ptr(p *int64) int64 {
 		return 0
 	}
 	return *p
+}
+
+// temporalPrecisionOf resolves the (precision, unspecified) pair for a
+// temporal column (restore-parity TRIAGE #3, the temporal counterpart
+// of catalog Bug 69's unconstrained numeric). pg_attribute.atttypmod
+// is the ground truth for declaredness: -1 is the bare form (`time` /
+// `timestamp` / `timestamptz` with no precision) — information_schema
+// reports datetime_precision=6 (the engine DEFAULT) for that case, so
+// it cannot distinguish bare from an explicit (6), and reading it
+// verbatim materialized the default into the catalog. When a typmod
+// IS declared, datetime_precision carries it for scalar columns; for
+// array-element metas (whose synthesized columnMeta has no
+// datetime_precision) the typmod itself is the precision — PG stores
+// a temporal typmod as the raw precision value.
+func temporalPrecisionOf(c columnMeta) (precision int, unspecified bool) {
+	if c.AttTypmod < 0 {
+		return 0, true
+	}
+	if c.DTPrec != nil {
+		return int(*c.DTPrec), false
+	}
+	return int(c.AttTypmod), false
 }
 
 // parseGeometrySubtype maps the PostGIS subtype string from

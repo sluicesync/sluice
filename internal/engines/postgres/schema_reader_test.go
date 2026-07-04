@@ -126,9 +126,12 @@ func TestSchemaReader_TypeMatrix(t *testing.T) {
 		"ip_address":  ir.Inet{},
 		"network":     ir.Cidr{},
 		"mac":         ir.Macaddr{},
-		"created_at":  ir.Timestamp{Precision: 6, WithTimeZone: true},
-		"birthday":    ir.Date{},
-		"start_time":  ir.Time{Precision: 6},
+		// TRIAGE #3: the seed declares BARE TIMESTAMPTZ / TIME (no
+		// precision), which reads as PrecisionUnspecified — not the
+		// materialized information_schema default 6.
+		"created_at": ir.Timestamp{WithTimeZone: true, PrecisionUnspecified: true},
+		"birthday":   ir.Date{},
+		"start_time": ir.Time{PrecisionUnspecified: true},
 	}
 	for name, wantType := range wantTypes {
 		col := findColumn(users, name)

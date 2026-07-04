@@ -163,6 +163,13 @@ func TestStringSamples(t *testing.T) {
 		{Decimal{Precision: 18, Scale: 4}, "Decimal(18,4)"},
 		{Timestamp{Precision: 6, WithTimeZone: true}, "TimestampTZ(6)"},
 		{Timestamp{Precision: 0}, "Timestamp(0)"},
+		// TRIAGE #3: the precision-unspecified (bare PG) form renders
+		// distinctly from an explicit precision — per family.
+		{Timestamp{WithTimeZone: true, PrecisionUnspecified: true}, "TimestampTZ(unspecified)"},
+		{Timestamp{PrecisionUnspecified: true}, "Timestamp(unspecified)"},
+		{DateTime{PrecisionUnspecified: true}, "DateTime(unspecified)"},
+		{Time{PrecisionUnspecified: true}, "Time(unspecified)"},
+		{Time{WithTimeZone: true, PrecisionUnspecified: true}, "TimeTZ(unspecified)"},
 		{Array{Element: Integer{Width: 32}}, "Array<Int32>"},
 		{Enum{Values: []string{"red", "green"}}, "red,green"},
 		{ExtensionType{Extension: "vector", Name: "vector", Modifiers: []int{384}}, "vector.vector(384)"},

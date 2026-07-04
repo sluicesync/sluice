@@ -203,10 +203,11 @@ When the IR is emitted as MySQL DDL, the inverse mapping applies, with the follo
 | `text`                            | `Text{Size: Long}`                            | Postgres `text` is unbounded; map to widest MySQL equivalent. |
 | `bytea`                           | `Blob{Size: Long}`                            | |
 | `date`                            | `Date{}`                                      | |
-| `time(p)`                         | `Time{Precision: p}`                          | |
-| `time(p) with time zone` (`timetz`)| `Time{Precision: p, WithTimeZone: true}`     | PG→PG faithful; PG→MySQL drops the zone (no tz-aware MySQL time). Bug 71. |
-| `timestamp(p)`                    | `Timestamp{Precision: p, WithTimeZone: false}`| |
-| `timestamp(p) with time zone`     | `Timestamp{Precision: p, WithTimeZone: true}` | |
+| `time(p)`                         | `Time{Precision: p}`                          | Explicit `p` includes 0 — `time(0)` is catalog-distinct from bare `time`. |
+| `time` (bare, no precision)       | `Time{PrecisionUnspecified: true}`            | atttypmod -1; behaves as the engine default (6) but round-trips BARE. See [temporal precision](#temporal-fractional-second-precision-bare-vs-explicit--restore-parity-triage-3). |
+| `time(p) with time zone` (`timetz`)| `Time{Precision: p, WithTimeZone: true}`     | PG→PG faithful; PG→MySQL drops the zone (no tz-aware MySQL time). Bug 71. Bare form → `PrecisionUnspecified`. |
+| `timestamp(p)`                    | `DateTime{Precision: p}`                      | Bare form → `DateTime{PrecisionUnspecified: true}`. |
+| `timestamp(p) with time zone`     | `Timestamp{Precision: p, WithTimeZone: true}` | Bare form → `Timestamp{WithTimeZone: true, PrecisionUnspecified: true}`. |
 | user-defined `enum` type          | `Enum{Values: [...]}`                         | |
 | `json`                            | `JSON{Binary: false}`                         | |
 | `jsonb`                           | `JSON{Binary: true}`                          | |
@@ -222,6 +223,7 @@ When the IR is emitted as MySQL DDL, the inverse mapping applies, with the follo
 - `Set{}` from a MySQL source is emitted as `text[]` plus a `CHECK` constraint enforcing membership. Storage is larger but semantics are preserved.
 - `Decimal{Unconstrained: true}` is emitted as bare `NUMERIC` (no parentheses) — PostgreSQL's native arbitrary-precision form. Constrained `Decimal{Precision, Scale}` emits `NUMERIC(p,s)` unchanged. See the [unconstrained numeric](#unconstrained-postgres-numeric-no-precisionscale--owner-surface-design-call-v069x--bug-69) edge case.
 - `Boolean{}` is emitted as `boolean`.
+- Temporal types with `PrecisionUnspecified` emit the BARE form (`TIMESTAMP WITH TIME ZONE`, no parentheses); a known precision always emits explicitly, **including `(0)`** — the pre-fix `0 → bare` collapse silently widened an explicit `timestamptz(0)` (and a MySQL `DATETIME`, whose precision is genuinely 0) to the 6-behaving bare form. See [temporal precision](#temporal-fractional-second-precision-bare-vs-explicit--restore-parity-triage-3).
 - `JSON{Binary: false}` is emitted as `jsonb` by default, since `jsonb` is almost always the right choice on Postgres. Override available.
 - `Geometry{}` requires the PostGIS extension; if PostGIS is not in the allowlist, the run errors with an explicit message.
 
@@ -257,7 +259,7 @@ SQLite (and Cloudflare D1, which is SQLite over HTTP) is the one engine whose *v
 
 A column's IR type is resolved from its **declared type** in a load-bearing order ([ADR-0129](adr/adr-0129-sqlite-date-bool-policy.md) first, affinity second):
 
-1. **Declared temporal / bool spellings override affinity.** A column declared `DATE` → `ir.Date`; `DATETIME` / `TIMESTAMP` → `ir.Timestamp` (no tz; SQLite is tz-naive); `TIME` → `ir.Time`; `BOOL` / `BOOLEAN` → `ir.Boolean`. (`DATETIME` is checked before `DATE`/`TIME` because the string contains all three.) These spellings would otherwise fall to NUMERIC affinity and read as decimals.
+1. **Declared temporal / bool spellings override affinity.** A column declared `DATE` → `ir.Date`; `DATETIME` / `TIMESTAMP` → `ir.Timestamp` (no tz; SQLite is tz-naive); `TIME` → `ir.Time`; `BOOL` / `BOOLEAN` → `ir.Boolean`. (`DATETIME` is checked before `DATE`/`TIME` because the string contains all three.) These spellings would otherwise fall to NUMERIC affinity and read as decimals. Temporal types carry `PrecisionUnspecified` — SQLite has no fractional-second precision concept, so targets pick their max-fidelity form (PG bare, MySQL `(6)`; see [temporal precision](#temporal-fractional-second-precision-bare-vs-explicit--restore-parity-triage-3)).
 2. **Otherwise, affinity maps to IR:** INTEGER → `ir.Integer{Width:64}` (SQLite integers are 64-bit signed); TEXT → `ir.Text` (unbounded — declared `VARCHAR(n)` lengths are not enforced by SQLite, so no misleading bound is carried); BLOB (or no declared type) → `ir.Blob`; REAL → `ir.Float{Double}`; NUMERIC → `ir.Decimal{Unconstrained:true}`.
 
 The **value** of a declared temporal column is ambiguous (SQLite has no native date type — dates live as ISO text, unix integers, or Julian-day reals by app convention), so the encoding is an explicit operator choice, `--sqlite-date-encoding` (`iso` default / `unixepoch` / `unixmillis` / `julian`). A value whose storage class doesn't match the chosen encoding is **refused loudly** naming the row — never a silently-wrong date. Booleans decode `0`/`1` and truthy text; any other value is refused. The per-column escape hatch is `--type-override <col>=text` (carry the column raw). A per-source override is the `sqlite_date_encoding` DSN query param.
@@ -332,6 +334,16 @@ A PostgreSQL column declared as bare `numeric` / `decimal` with **no precision o
 **`numeric[]` (array of unconstrained numeric):** on a PG target the array round-trips as `NUMERIC[]` (each element bare `NUMERIC`, lossless, no advisory). On a MySQL target the whole array column lands as `JSON` (the [Postgres ARRAY → MySQL](#postgres-array--mysql) policy) — the values are stored as JSON text with no decimal-precision loss, so the widening advisory does **not** fire for the array case (there is nothing to narrow).
 
 **Override:** for a column that needs a specific precision/scale (to recover storage, or because values exceed 65/30), supply `--type-override TABLE.COL=decimal(N,M)` (or the per-column `mappings:` hook).
+
+### Temporal fractional-second precision (bare vs explicit) — restore-parity TRIAGE #3
+
+The temporal counterpart of the unconstrained-numeric case above. A PG column declared bare `time` / `timestamp` / `timestamptz` (no parenthesized precision, `pg_attribute.atttypmod = -1`) *behaves* as the engine default (6), and `information_schema.columns.datetime_precision` reports 6 for it — so reading that catalog view verbatim materialized `timestamp(6) with time zone` into every target, a catalog-visible divergence the restore-parity oracle flagged. The IR now models the bare form distinctly via `PrecisionUnspecified` on `ir.Time` / `ir.DateTime` / `ir.Timestamp`; the PG reader keys declaredness off `atttypmod` (the ground truth), and the same rule covers temporal ARRAY elements (`timestamptz(3)[]` carries its typmod to the element).
+
+- **PG target:** unspecified emits bare; a known precision always emits explicitly, **including `(0)`** — the pre-fix `0 → bare` emit rule silently widened an explicit `timestamptz(0)` (whole-second rounding semantics) to the 6-behaving bare form. A MySQL-sourced `DATETIME`/`TIME`/`TIMESTAMP` (precision genuinely 0 — see the asymmetry note below) now lands as `timestamp(0)` etc., which is the faithful carry; values are unchanged (MySQL sources never produce fractional seconds on a precision-0 column).
+- **MySQL target:** MySQL has no 6-behaving bare form (bare *is* `(0)` and would silently truncate fractional seconds), so unspecified **materializes as the explicit maximum, `(6)`** — same target DDL as before the fix, when the reader materialized 6. `CURRENT_TIMESTAMP` defaults are precision-matched to `(6)` accordingly. Behaviorally identical to the PG source; no advisory fires (nothing narrows).
+- **SQLite/D1:** SQLite temporals are TEXT storage with no precision concept; the SQLite reader emits `PrecisionUnspecified` and the SQLite writer ignores precision entirely. SQLite → MySQL therefore now lands `DATETIME(6)` (previously bare `DATETIME`, which truncated fractional seconds in SQLite text values — a silent-loss fix that rides along).
+- **Engine asymmetry (deliberate):** MySQL's reader *always* knows the precision — `information_schema` reports 0 for a bare `DATETIME`, and bare ≡ `(0)` in MySQL — so MySQL-sourced temporals never carry `PrecisionUnspecified`. Only engines with a genuine "no declared precision" catalog state (PG's typmod -1, SQLite's affinity typing) produce it.
+- **Cross-version:** backups/manifests written by older binaries carry the materialized `Precision: 6`; they decode as an explicit `(6)` and restore byte-identically to the old behaviour. The wire flag is append-only (`temporal_precision_unspecified`), no backup-format bump.
 
 ### MySQL ENUM and SET → Postgres
 

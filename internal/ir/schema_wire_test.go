@@ -34,6 +34,15 @@ func TestMarshalType_RoundTrip(t *testing.T) {
 		{"Time precision 6", Time{Precision: 6}},
 		{"DateTime precision 3", DateTime{Precision: 3}},
 		{"Timestamp tz", Timestamp{Precision: 6, WithTimeZone: true}},
+		// TRIAGE #3: the temporal precision-unspecified state (bare PG
+		// form) round-trips per family — the flag is append-only wire,
+		// mirroring DecimalUnconstrained.
+		{"Time unspecified", Time{PrecisionUnspecified: true}},
+		{"TimeTZ unspecified", Time{WithTimeZone: true, PrecisionUnspecified: true}},
+		{"DateTime unspecified", DateTime{PrecisionUnspecified: true}},
+		{"Timestamp tz unspecified", Timestamp{WithTimeZone: true, PrecisionUnspecified: true}},
+		{"Timestamp explicit 0", Timestamp{Precision: 0, WithTimeZone: true}},
+		{"Array of unspecified timestamptz", Array{Element: Timestamp{WithTimeZone: true, PrecisionUnspecified: true}}},
 		{"JSON binary", JSON{Binary: true}},
 		{"JSON text", JSON{Binary: false}},
 		{"Enum", Enum{Values: []string{"a", "b", "c"}}},
@@ -95,6 +104,36 @@ func TestUnmarshalType_NullAndUnknownKind(t *testing.T) {
 	got, err = UnmarshalType([]byte(`{"kind":"WatNotReal"}`))
 	if err == nil {
 		t.Fatalf("expected error on unknown kind; got %v", got)
+	}
+}
+
+// TestUnmarshalType_OldTemporalWireDecodesExplicit pins the TRIAGE #3
+// cross-version contract: a manifest written by an OLDER binary
+// carries the materialized Precision=6 for a bare temporal column and
+// NO temporal_precision_unspecified key. Decoding it must yield an
+// explicit (6) — restoring an old backup keeps emitting
+// `timestamp(6) with time zone`, byte-identical to the old binary's
+// restore behaviour (additive wire semantics, no format bump).
+func TestUnmarshalType_OldTemporalWireDecodesExplicit(t *testing.T) {
+	cases := []struct {
+		name string
+		wire string
+		want Type
+	}{
+		{"old Timestamp tz 6", `{"kind":"Timestamp","precision":6,"with_time_zone":true}`, Timestamp{Precision: 6, WithTimeZone: true}},
+		{"old DateTime 6", `{"kind":"DateTime","precision":6}`, DateTime{Precision: 6}},
+		{"old Time 6", `{"kind":"Time","precision":6}`, Time{Precision: 6}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := UnmarshalType([]byte(c.wire))
+			if err != nil {
+				t.Fatalf("UnmarshalType(%s): %v", c.wire, err)
+			}
+			if got != c.want {
+				t.Errorf("UnmarshalType(%s) = %#v; want %#v", c.wire, got, c.want)
+			}
+		})
 	}
 }
 

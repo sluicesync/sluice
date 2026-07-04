@@ -138,7 +138,7 @@ func emitColumnType(t ir.Type, opts emitOpts) (string, error) {
 	case ir.Date:
 		return "DATE", nil
 	case ir.Time:
-		base := emitWithPrecision("TIME", v.Precision)
+		base := emitTemporal("TIME", v.Precision, v.PrecisionUnspecified)
 		if v.WithTimeZone {
 			return base + " WITH TIME ZONE", nil
 		}
@@ -149,9 +149,9 @@ func emitColumnType(t ir.Type, opts emitOpts) (string, error) {
 		// textual value ("838:59:59", "-12:00:00").
 		return "INTERVAL", nil
 	case ir.DateTime:
-		return emitWithPrecision("TIMESTAMP", v.Precision), nil
+		return emitTemporal("TIMESTAMP", v.Precision, v.PrecisionUnspecified), nil
 	case ir.Timestamp:
-		base := emitWithPrecision("TIMESTAMP", v.Precision)
+		base := emitTemporal("TIMESTAMP", v.Precision, v.PrecisionUnspecified)
 		if v.WithTimeZone {
 			return base + " WITH TIME ZONE", nil
 		}
@@ -346,9 +346,16 @@ func postgresIntName(width int8) string {
 	return "BIGINT"
 }
 
-// emitWithPrecision renders TYPE(N), or TYPE when precision is zero.
-func emitWithPrecision(typeName string, precision int) string {
-	if precision == 0 {
+// emitTemporal renders a temporal type name with its declared
+// fractional-second precision. The bare (precision-unspecified) form
+// emits with no parenthesized precision — PG's engine default, 6-
+// behaving; a KNOWN precision always emits, INCLUDING (0): pre-TRIAGE-#3
+// this helper collapsed precision 0 to the bare form, which silently
+// widened an explicit `timestamptz(0)` (whole-second rounding) — and a
+// MySQL `DATETIME`/`TIME` source, whose precision is genuinely 0 — to
+// the 6-behaving bare form on the target.
+func emitTemporal(typeName string, precision int, unspecified bool) string {
+	if unspecified {
 		return typeName
 	}
 	return fmt.Sprintf("%s(%d)", typeName, precision)
