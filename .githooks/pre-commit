@@ -77,16 +77,16 @@ fi
 
 # ---- CI coverage guards ----
 # These two run in CI's Lint job; without them here, adding
-# integration-tagged tests in an uncovered package (or a postgis test
-# whose name escapes the job's -run filter) passes the full local gate
+# integration-tagged tests in an uncovered package (or a tagged test
+# whose name escapes its job's -run filter) passes the full local gate
 # and only fails in CI — contradicting "make pre-commit runs everything
 # CI runs". Both are pure git-ls-files/grep, sub-second.
 if ! sh scripts/check-shard-coverage.sh; then
 	red "pre-commit: check-shard-coverage failed (integration tests outside every CI shard)."
 	exit 1
 fi
-if ! sh scripts/check-postgis-coverage.sh; then
-	red "pre-commit: check-postgis-coverage failed (postgis test would never run in CI)."
+if ! sh scripts/check-run-filter-coverage.sh; then
+	red "pre-commit: check-run-filter-coverage failed (a tagged test would never run in any workflow)."
 	exit 1
 fi
 

@@ -6,7 +6,7 @@ package mysql
 // Unit tests for the Bug 146 / ADR-0093 VStream purged-GTID pre-flight
 // helpers. The live gtid_purged ⊆ resume behaviour (and the tablet-type
 // routing of @@global.gtid_purged that makes it correct) is pinned by the
-// real-cluster TestVitessCluster_PurgedGTID_ReactiveColdStart.
+// real-cluster TestVitessChaos_PurgedGTID_ReactiveColdStart.
 
 import (
 	"context"

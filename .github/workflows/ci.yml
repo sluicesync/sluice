@@ -430,7 +430,7 @@ jobs:
   # The `-run 'PostGIS_'` filter scopes the run to ONLY the postgis
   # integration suites (the build-tag additivity is unavoidable, but
   # `-run` selects which tests actually execute). The CONVENTION — made
-  # non-falsifiable by scripts/check-postgis-coverage.sh in the Lint job —
+  # non-falsifiable by scripts/check-run-filter-coverage.sh in the Lint job —
   # is: every test in a `//go:build … postgis`-tagged file MUST have a
   # `PostGIS_` segment in its name AND live in a package this job's path
   # list covers. The three suites today:
@@ -509,9 +509,11 @@ jobs:
   # vstream"` compiles BOTH the integration- and vstream-tagged files, so
   # `-run 'TestVStream_'` scopes execution to the vstream suite in the
   # mysql engine package (Bug 125 matrix + VTTestServer CDC/snapshot +
-  # schema-evolution). The two pipeline-package vstream tests
-  # (sharded-source, ShapeA consolidation) are a planned follow-up once
-  # this job's reliability is established.
+  # schema-evolution). Every vstream-tagged test in this package MUST
+  # carry the TestVStream_ prefix or this filter silently skips it —
+  # enforced by scripts/check-run-filter-coverage.sh in the Lint job.
+  # The pipeline-package vstream suite runs in extended-suites.yml's
+  # `vstream-pipeline` leg (weekly + dispatch), under the same guard.
   #
   # Images: vitess/vttestserver:mysql80 (Docker Hub, public — the source
   # cluster) + the pre-baked sluice-mysql target. 35m outer / 30m inner
@@ -590,14 +592,16 @@ jobs:
       - name: check integration shard coverage
         run: bash scripts/check-shard-coverage.sh
 
-      # Companion to the shard-coverage guard for the postgis suite: the
-      # Integration (PostGIS) job scopes execution with `-run 'PostGIS_'`
-      # over a hand-maintained path list, so a postgis test can compile
-      # vet-clean yet never RUN. This guard fails CI if any postgis-tagged
-      # test lacks a `PostGIS_` name segment or sits in an uncovered package
-      # (the mechanism that hid 11 postgis tests from CI through v0.99.53).
-      - name: check postgis run coverage
-        run: bash scripts/check-postgis-coverage.sh
+      # Companion to the shard-coverage guard for every `-run`-filtered
+      # job: build-tag additivity means a tagged test can compile
+      # vet-clean yet never RUN when its name escapes the job's `-run`
+      # regex or its package sits outside the job's path list. This
+      # guard fails CI on any escapee across the vstream, postgis,
+      # chaos, and reshard axes (the postgis-only predecessor caught
+      # the 11 tests hidden through v0.99.53; the generalization caught
+      # four more escapees on the vstream/chaos axes, 2026-07-03).
+      - name: check -run filter coverage
+        run: bash scripts/check-run-filter-coverage.sh
 
       - uses: golangci/golangci-lint-action@v9
         with:

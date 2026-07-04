@@ -12,7 +12,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
-// TestRowReader_VStream_OLAPScopedToFullScan_Bug132 pins the Bug 132 fix:
+// TestVStream_RowReader_OLAPScopedToFullScan_Bug132 pins the Bug 132 fix:
 // the PlanetScale (VStream) flavor's RowReader applies `workload=olap`
 // ONLY to the unbounded [RowReader.ReadRows] full scan (the no-PK path
 // vtgate's OLTP cap would silently truncate at ~100k rows), on a DEDICATED
@@ -30,7 +30,7 @@ import (
 //     ACCEPTED by vtgate (a Bug-126-class rejection would surface) and the
 //     full scan works. (The >100k cap-lift itself is the same SET as
 //     before, just scoped; validated at scale on the PlanetScale rig.)
-func TestRowReader_VStream_OLAPScopedToFullScan_Bug132(t *testing.T) {
+func TestVStream_RowReader_OLAPScopedToFullScan_Bug132(t *testing.T) {
 	mysqlDSN, grpcEndpoint, _, cleanup := startVTTestServer(t)
 	defer cleanup()
 

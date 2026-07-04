@@ -74,8 +74,8 @@ if ($LASTEXITCODE -ne 0) {
 
 # ---- CI coverage guards ----
 # These two run in CI's Lint job; without them here, adding
-# integration-tagged tests in an uncovered package (or a postgis test
-# whose name escapes the job's -run filter) passes the full local gate
+# integration-tagged tests in an uncovered package (or a tagged test
+# whose name escapes its job's -run filter) passes the full local gate
 # and only fails in CI. They are POSIX-sh scripts; Git for Windows
 # ships sh.exe, so soft-skip only if sh is genuinely absent (CI remains
 # the source of truth, same policy as the golangci-lint soft-skip).
@@ -86,9 +86,9 @@ if ($sh) {
         Red "check-shard-coverage failed (integration tests outside every CI shard)."
         exit 1
     }
-    & sh scripts/check-postgis-coverage.sh
+    & sh scripts/check-run-filter-coverage.sh
     if ($LASTEXITCODE -ne 0) {
-        Red "check-postgis-coverage failed (postgis test would never run in CI)."
+        Red "check-run-filter-coverage failed (a tagged test would never run in any workflow)."
         exit 1
     }
 } else {

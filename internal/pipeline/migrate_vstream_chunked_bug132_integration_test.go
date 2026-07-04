@@ -23,7 +23,7 @@
 // a few thousand rows copies fully even with the session-wide olap bug), so
 // at CI-tolerable sizes this is functional coverage, NOT a regression
 // catcher. The DETERMINISTIC regression pin — that olap is never session-
-// wide on a VStream reader — is TestRowReader_VStream_OLAPScopedToFullScan_
+// wide on a VStream reader — is TestVStream_RowReader_OLAPScopedToFullScan_
 // Bug132 (internal/engines/mysql), which fails fast if the session-wide
 // setting is reintroduced. The 1.5M-scale truncation is re-validated on the
 // PlanetScale rig.

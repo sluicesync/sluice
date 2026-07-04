@@ -110,10 +110,10 @@ func tabletActiveBinlog(t *testing.T, cc *chaosCluster) string {
 	return fields[0]
 }
 
-// TestVitessCluster_PurgedGTID_ReactiveColdStart pins ADR-0093: a VStream
+// TestVitessChaos_PurgedGTID_ReactiveColdStart pins ADR-0093: a VStream
 // resume from a position older than the tablet's retained binlogs surfaces
 // a reactive error that classifyReaderError maps to ir.ErrPositionInvalid.
-func TestVitessCluster_PurgedGTID_ReactiveColdStart(t *testing.T) {
+func TestVitessChaos_PurgedGTID_ReactiveColdStart(t *testing.T) {
 	cc := startChaosCluster(t)
 	defer cc.cleanup()
 

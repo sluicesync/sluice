@@ -10,7 +10,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
-// TestVitessFlavor_SelfHostedDefaults_StreamsWithoutTransportAuthParams is
+// TestVStream_VitessFlavor_SelfHostedDefaults_StreamsWithoutTransportAuthParams is
 // the self-hosted `vitess` flavor's reason to exist (ADR-0073(a)): it
 // connects to a self-hosted vtgate WITHOUT hand-set vstream_transport /
 // vstream_auth — the flavor defaults them to plaintext / none (the common
@@ -24,7 +24,7 @@ import (
 // (openVStreamSnapshotStreamFrom), which is the entry point the backup
 // path also funnels through — so it pins the defaults for every VStream
 // dial path, not just the CDC reader.
-func TestVitessFlavor_SelfHostedDefaults_StreamsWithoutTransportAuthParams(t *testing.T) {
+func TestVStream_VitessFlavor_SelfHostedDefaults_StreamsWithoutTransportAuthParams(t *testing.T) {
 	mysqlDSN, grpcEndpoint, _, cleanup := startVTTestServer(t)
 	defer cleanup()
 
