@@ -13,9 +13,9 @@
 // by a writer bug, exactly as the battle-test fixtures
 // (migrate_bug7374/75/69_integration_test.go) do it.
 //
-// No build tag: pure logic, unit-tested by fuzzgen_generator_test.go.
+// No build tag: pure logic, unit-tested by fuzzgen_test.go.
 
-package pipeline
+package fuzzgen
 
 import (
 	"fmt"
@@ -46,20 +46,21 @@ type genColumn struct {
 	forceNonNullLeaf bool
 }
 
-// genCase is a fully-rendered, replayable test case: the source-dialect
+// Case is a fully-rendered, replayable test case: the source-dialect
 // CREATE TABLE + INSERT script plus the metadata the oracle needs.
-type genCase struct {
-	seed     int64
-	caseIdx  int
-	dir      direction
-	tableNm  string
+type Case struct {
+	Seed      int64
+	CaseIdx   int
+	Dir       Direction
+	TableName string
+
 	enumType string // non-empty when an enum column needs a CREATE TYPE (PG src)
 	columns  []genColumn
 	rowCount int
 
-	// ddl is the full replayable script applied directly to the source
+	// DDL is the full replayable script applied directly to the source
 	// container (CREATE TYPE? + CREATE TABLE + INSERTs).
-	ddl string
+	DDL string
 }
 
 // arrayLeafScalars is how many scalar leaves a 1-D array holds; the
@@ -71,11 +72,11 @@ const (
 	multiDimSide     = 2
 )
 
-// generateCase builds case #idx for the given direction from the master
+// GenerateCase builds case #idx for the given direction from the master
 // seed. Deterministic: (seed, idx, dir) fully determines the output.
-func generateCase(seed int64, idx int, dir direction) genCase {
+func GenerateCase(seed int64, idx int, dir Direction) Case {
 	// Derive a per-case RNG so cases are independent yet reproducible.
-	r := rand.New(rand.NewSource(seed + int64(idx)*1_000_003 + int64(dir.src)*7 + int64(dir.dst)*131))
+	r := rand.New(rand.NewSource(seed + int64(idx)*1_000_003 + int64(dir.Src)*7 + int64(dir.Dst)*131))
 
 	reg := registry()
 
@@ -86,7 +87,7 @@ func generateCase(seed int64, idx int, dir direction) genCase {
 	enumTypeName := table + "_enum"
 
 	// Pick a random non-empty subset of families that can be a SOURCE
-	// in dir.src, each at a randomly chosen supported shape.
+	// in dir.Src, each at a randomly chosen supported shape.
 	var cols []genColumn
 	colIdx := 0
 	enumType := ""
@@ -96,7 +97,7 @@ func generateCase(seed int64, idx int, dir direction) genCase {
 		if r.Intn(10) < 3 {
 			continue
 		}
-		s := pickShape(r, f, dir.src)
+		s := pickShape(r, f, dir.Src)
 		if s < 0 {
 			continue
 		}
@@ -108,9 +109,9 @@ func generateCase(seed int64, idx int, dir direction) genCase {
 		// would never be value-fuzzed. Keep the refusal class pinned (a
 		// 1-in-20 draw keeps it) but usually swap an array down to its
 		// scalar value path, and drop the always-refused families.
-		if dir.dst == engineSQLite && expectedOutcome(f, dir, shape(s)) == outcomeLoudRefuse && r.Intn(20) > 0 {
+		if dir.Dst == EngineSQLite && expectedOutcome(f, dir, shape(s)) == outcomeLoudRefuse && r.Intn(20) > 0 {
 			s = int(shapeScalar)
-			if !f.canSource(dir.src, shapeScalar) ||
+			if !f.canSource(dir.Src, shapeScalar) ||
 				expectedOutcome(f, dir, shapeScalar) == outcomeLoudRefuse {
 				continue
 			}
@@ -119,14 +120,14 @@ func generateCase(seed int64, idx int, dir direction) genCase {
 			name: fmt.Sprintf("c%02d_%s_%s", colIdx, f.name, shapeTag(shape(s))),
 			fam:  f,
 			shp:  shape(s),
-			ddl:  f.columnDDL(dir.src, shape(s)),
+			ddl:  f.columnDDL(dir.Src, shape(s)),
 			// An array-shape loud-refuse column must force the refused
 			// path; an all-NULL array would make the assertion vacuous
 			// (Findings 1 & 2).
 			forceNonNullLeaf: shape(s) != shapeScalar &&
 				expectedOutcome(f, dir, shape(s)) == outcomeLoudRefuse,
 		}
-		if f.name == "enum" && dir.src == enginePG {
+		if f.name == "enum" && dir.Src == EnginePG {
 			enumType = enumTypeName
 			c.ddl = enumType
 		}
@@ -140,12 +141,12 @@ func generateCase(seed int64, idx int, dir direction) genCase {
 	// int64 for SQLite, whose registry scope is narrower).
 	if len(cols) == 0 {
 		for _, f := range reg {
-			if !f.canSource(dir.src, shapeScalar) {
+			if !f.canSource(dir.Src, shapeScalar) {
 				continue
 			}
 			cols = append(cols, genColumn{
 				name: "c00_" + f.name + "_s", fam: f, shp: shapeScalar,
-				ddl: f.columnDDL(dir.src, shapeScalar),
+				ddl: f.columnDDL(dir.Src, shapeScalar),
 			})
 			break
 		}
@@ -155,21 +156,21 @@ func generateCase(seed int64, idx int, dir direction) genCase {
 	for ci := range cols {
 		cols[ci].values = make([]string, rowCount)
 		for ri := 0; ri < rowCount; ri++ {
-			cols[ci].values[ri] = renderCell(r, &cols[ci], dir.src)
+			cols[ci].values[ri] = renderCell(r, &cols[ci], dir.Src)
 		}
 	}
 
-	gc := genCase{
-		seed: seed, caseIdx: idx, dir: dir,
-		tableNm: table, enumType: enumType,
+	gc := Case{
+		Seed: seed, CaseIdx: idx, Dir: dir,
+		TableName: table, enumType: enumType,
 		columns: cols, rowCount: rowCount,
 	}
-	gc.ddl = renderScript(&gc, dir.src)
+	gc.DDL = renderScript(&gc, dir.Src)
 	return gc
 }
 
 // pickShape chooses a supported shape for f as a source in src, or -1.
-func pickShape(r *rand.Rand, f *family, src engineKind) int {
+func pickShape(r *rand.Rand, f *family, src EngineKind) int {
 	var ok []shape
 	for s := shapeScalar; s <= shapeShapeLast; s++ {
 		if f.canSource(src, s) {
@@ -196,7 +197,7 @@ func shapeTag(s shape) string {
 // renderCell renders one cell. For arrays it assembles scalar leaves
 // (driven by the family's gen) into a source-dialect array literal,
 // folding in NULL-element and ≥2-D nesting — the Bug 73/74 axes.
-func renderCell(r *rand.Rand, c *genColumn, src engineKind) string {
+func renderCell(r *rand.Rand, c *genColumn, src EngineKind) string {
 	scalar := func() string {
 		lit, isNull := c.fam.gen(r, src)
 		if isNull {
@@ -291,17 +292,17 @@ func pgArrayWrap(c *genColumn, arr string) string {
 }
 
 // renderScript assembles the full replayable source-dialect script.
-func renderScript(gc *genCase, src engineKind) string {
+func renderScript(gc *Case, src EngineKind) string {
 	var b strings.Builder
-	if gc.enumType != "" && src == enginePG {
+	if gc.enumType != "" && src == EnginePG {
 		fmt.Fprintf(&b, "DROP TYPE IF EXISTS %s CASCADE;\n", gc.enumType)
 		fmt.Fprintf(&b, "CREATE TYPE %s AS ENUM ('red','green','blue');\n", gc.enumType)
 	}
-	fmt.Fprintf(&b, "DROP TABLE IF EXISTS %s;\n", gc.tableNm)
+	fmt.Fprintf(&b, "DROP TABLE IF EXISTS %s;\n", gc.TableName)
 
 	// id PK + each generated column.
-	b.WriteString("CREATE TABLE " + gc.tableNm + " (\n")
-	if src == engineMySQL {
+	b.WriteString("CREATE TABLE " + gc.TableName + " (\n")
+	if src == EngineMySQL {
 		b.WriteString("  id INT NOT NULL PRIMARY KEY")
 	} else {
 		b.WriteString("  id INT PRIMARY KEY")
@@ -309,7 +310,7 @@ func renderScript(gc *genCase, src engineKind) string {
 	for _, c := range gc.columns {
 		fmt.Fprintf(&b, ",\n  %s %s", c.name, c.ddl)
 	}
-	if src == engineMySQL {
+	if src == EngineMySQL {
 		b.WriteString("\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n")
 	} else {
 		b.WriteString("\n);\n")
@@ -320,7 +321,7 @@ func renderScript(gc *genCase, src engineKind) string {
 		colNames[i] = c.name
 	}
 	for ri := 0; ri < gc.rowCount; ri++ {
-		fmt.Fprintf(&b, "INSERT INTO %s (id", gc.tableNm)
+		fmt.Fprintf(&b, "INSERT INTO %s (id", gc.TableName)
 		for _, n := range colNames {
 			b.WriteString(", " + n)
 		}

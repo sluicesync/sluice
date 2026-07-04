@@ -35,7 +35,7 @@
 //	SLUICE_FUZZ_SEED   — master seed (default: a fixed value so CI is
 //	                      deterministic; override to explore).
 //	SLUICE_FUZZ_DIRS   — comma list of directions to run (default: every
-//	                      direction in allDirections(), incl. the SQLite
+//	                      direction in fuzzgen.AllDirections(), incl. the SQLite
 //	                      source/target ones); e.g.
 //	                      "postgres->postgres,sqlite->postgres".
 //
@@ -59,6 +59,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/internal/fuzzgen"
 
 	_ "modernc.org/sqlite" // database/sql driver for the SQLite source/target files
 
@@ -91,21 +92,21 @@ func fuzzEnvSeed() int64 {
 	return fuzzDefaultSeed
 }
 
-func fuzzSelectedDirections(t *testing.T) []direction {
+func fuzzSelectedDirections(t *testing.T) []fuzzgen.Direction {
 	want := os.Getenv("SLUICE_FUZZ_DIRS")
 	if want == "" {
-		return allDirections()
+		return fuzzgen.AllDirections()
 	}
-	byName := map[string]direction{}
-	for _, d := range allDirections() {
+	byName := map[string]fuzzgen.Direction{}
+	for _, d := range fuzzgen.AllDirections() {
 		byName[d.String()] = d
 	}
-	var out []direction
+	var out []fuzzgen.Direction
 	for _, name := range strings.Split(want, ",") {
 		name = strings.TrimSpace(name)
 		d, ok := byName[name]
 		if !ok {
-			t.Fatalf("SLUICE_FUZZ_DIRS: unknown direction %q (valid: %v)", name, allDirections())
+			t.Fatalf("SLUICE_FUZZ_DIRS: unknown direction %q (valid: %v)", name, fuzzgen.AllDirections())
 		}
 		out = append(out, d)
 	}
@@ -124,7 +125,7 @@ type fuzzEnv struct {
 	cleanup        func()
 }
 
-func bootDirection(t *testing.T, d direction) *fuzzEnv {
+func bootDirection(t *testing.T, d fuzzgen.Direction) *fuzzEnv {
 	t.Helper()
 	pgEng, ok := engines.Get("postgres")
 	if !ok {
@@ -143,8 +144,8 @@ func bootDirection(t *testing.T, d direction) *fuzzEnv {
 	var pgSrc, pgDst, mySrc, myDst string
 	var cleanups []func()
 
-	needPG := d.src == enginePG || d.dst == enginePG
-	needMy := d.src == engineMySQL || d.dst == engineMySQL
+	needPG := d.Src == fuzzgen.EnginePG || d.Dst == fuzzgen.EnginePG
+	needMy := d.Src == fuzzgen.EngineMySQL || d.Dst == fuzzgen.EngineMySQL
 	// SQLite needs NO container: its DSN is a temp file path (created on
 	// first open), reused across the direction's iterations exactly like
 	// a container — per-case isolation comes from the unique table name +
@@ -161,20 +162,20 @@ func bootDirection(t *testing.T, d direction) *fuzzEnv {
 		cleanups = append(cleanups, c)
 	}
 
-	switch d.src {
-	case enginePG:
+	switch d.Src {
+	case fuzzgen.EnginePG:
 		fe.srcDSN, fe.srcEng, fe.srcDriver = pgSrc, pgEng, "pgx"
-	case engineMySQL:
+	case fuzzgen.EngineMySQL:
 		fe.srcDSN, fe.srcEng, fe.srcDriver = mySrc, myEng, "mysql"
-	case engineSQLite:
+	case fuzzgen.EngineSQLite:
 		fe.srcDSN, fe.srcEng, fe.srcDriver = filepath.Join(t.TempDir(), "fuzz-src.db"), sqEng, "sqlite"
 	}
-	switch d.dst {
-	case enginePG:
+	switch d.Dst {
+	case fuzzgen.EnginePG:
 		fe.dstDSN, fe.dstEng, fe.dstDriver = pgDst, pgEng, "pgx"
-	case engineMySQL:
+	case fuzzgen.EngineMySQL:
 		fe.dstDSN, fe.dstEng, fe.dstDriver = myDst, myEng, "mysql"
-	case engineSQLite:
+	case fuzzgen.EngineSQLite:
 		fe.dstDSN, fe.dstEng, fe.dstDriver = filepath.Join(t.TempDir(), "fuzz-dst.db"), sqEng, "sqlite"
 	}
 	fe.cleanup = func() {
@@ -188,12 +189,12 @@ func bootDirection(t *testing.T, d direction) *fuzzEnv {
 // applySource applies the raw generated script directly to the source
 // DB — NOT through sluice. Reuses the engine-appropriate battle-test
 // applier.
-func applySource(t *testing.T, d direction, dsn, ddl string) {
+func applySource(t *testing.T, d fuzzgen.Direction, dsn, ddl string) {
 	t.Helper()
-	switch d.src {
-	case enginePG:
+	switch d.Src {
+	case fuzzgen.EnginePG:
 		applyPGDDL(t, dsn, ddl)
-	case engineSQLite:
+	case fuzzgen.EngineSQLite:
 		applySQLiteDDL(t, dsn, ddl)
 	default:
 		applyMySQLDDL(t, dsn, ddl)
@@ -223,16 +224,16 @@ func applySQLiteDDL(t *testing.T, path, ddl string) {
 // if the table does not exist. The classifier uses this to tell a
 // clean loud-refuse (table absent, or empty from refuse-at-copy) from a
 // real partial-DATA target (rows present — the corruption signature).
-func targetRowCount(ctx context.Context, db *sql.DB, table string, eng engineKind) int {
+func targetRowCount(ctx context.Context, db *sql.DB, table string, eng fuzzgen.EngineKind) int {
 	var n int
 	// information_schema.tables is portable across PG and MySQL (only
 	// the placeholder syntax differs, $1 vs ?); SQLite exposes the same
 	// fact through sqlite_master.
 	var q string
 	switch eng {
-	case enginePG:
+	case fuzzgen.EnginePG:
 		q = `SELECT count(*) FROM information_schema.tables WHERE table_name = $1`
-	case engineSQLite:
+	case fuzzgen.EngineSQLite:
 		q = `SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?`
 	default:
 		q = `SELECT count(*) FROM information_schema.tables WHERE table_name = ?`
@@ -252,14 +253,14 @@ func targetRowCount(ctx context.Context, db *sql.DB, table string, eng engineKin
 // the braces, dimensionality as nesting — the Bug 7374 oracle). MySQL:
 // the column raw (the driver yields the canonical rendering for the
 // scalar core types this harness compares same-engine on MySQL).
-func canonicalSelect(gc *genCase, cols []string, eng engineKind) string {
+func canonicalSelect(gc *fuzzgen.Case, cols []string, eng fuzzgen.EngineKind) string {
 	var sb strings.Builder
 	sb.WriteString("SELECT id")
 	for _, c := range cols {
 		switch eng {
-		case enginePG:
+		case fuzzgen.EnginePG:
 			fmt.Fprintf(&sb, ", %s::text", c)
-		case engineSQLite:
+		case fuzzgen.EngineSQLite:
 			// Defensive only: no same-engine SQLite direction exists, so
 			// faithful (text-compared) columns never occur here today —
 			// but a wrong quoting style must not be the silent reason a
@@ -269,7 +270,7 @@ func canonicalSelect(gc *genCase, cols []string, eng engineKind) string {
 			fmt.Fprintf(&sb, ", `%s`", c)
 		}
 	}
-	fmt.Fprintf(&sb, " FROM %s ORDER BY id", gc.tableNm)
+	fmt.Fprintf(&sb, " FROM %s ORDER BY id", gc.TableName)
 	return sb.String()
 }
 
@@ -277,17 +278,17 @@ func canonicalSelect(gc *genCase, cols []string, eng engineKind) string {
 // canonical text, keyed by column so the classifier compares like with
 // like regardless of column order. Generalised from
 // migrate_bug7374_integration_test.go's readAll.
-func readCanonical(ctx context.Context, db *sql.DB, gc *genCase, cols []string, eng engineKind) (map[string][]sql.NullString, error) {
+func readCanonical(ctx context.Context, db *sql.DB, gc *fuzzgen.Case, cols []string, eng fuzzgen.EngineKind) (map[string][]sql.NullString, error) {
 	if len(cols) == 0 {
 		// Nothing faithful to compare; still confirm row presence so a
 		// silent total row loss is caught.
 		var n int
-		if err := db.QueryRowContext(ctx, "SELECT count(*) FROM "+gc.tableNm).Scan(&n); err != nil {
-			return nil, fmt.Errorf("count %s: %w", gc.tableNm, err)
+		if err := db.QueryRowContext(ctx, "SELECT count(*) FROM "+gc.TableName).Scan(&n); err != nil {
+			return nil, fmt.Errorf("count %s: %w", gc.TableName, err)
 		}
 		out := map[string][]sql.NullString{}
 		for i := 0; i < n; i++ {
-			out[fuzzRowCountKey] = append(out[fuzzRowCountKey], sql.NullString{})
+			out[fuzzgen.RowCountKey] = append(out[fuzzgen.RowCountKey], sql.NullString{})
 		}
 		return out, nil
 	}
@@ -332,10 +333,10 @@ func readCanonical(ctx context.Context, db *sql.DB, gc *genCase, cols []string, 
 
 // runOneCase executes a single generated case end-to-end and returns
 // the verdict + a diagnostic message.
-func runOneCase(t *testing.T, fe *fuzzEnv, gc *genCase) (v verdict, diag string) {
+func runOneCase(t *testing.T, fe *fuzzEnv, gc *fuzzgen.Case) (v fuzzgen.Verdict, diag string) {
 	t.Helper()
 
-	applySource(t, gc.dir, fe.srcDSN, gc.ddl)
+	applySource(t, gc.Dir, fe.srcDSN, gc.DDL)
 
 	// Per-case isolation: the source+target containers are reused
 	// across a direction's iterations (container boot is expensive), so
@@ -350,50 +351,50 @@ func runOneCase(t *testing.T, fe *fuzzEnv, gc *genCase) (v verdict, diag string)
 		Target:      fe.dstEng,
 		SourceDSN:   fe.srcDSN,
 		TargetDSN:   fe.dstDSN,
-		Filter:      TableFilter{Include: []string{gc.tableNm}},
-		MigrationID: fmt.Sprintf("fuzz-%s-%d-%d", strings.ReplaceAll(gc.dir.String(), "->", "_"), gc.seed, gc.caseIdx),
+		Filter:      TableFilter{Include: []string{gc.TableName}},
+		MigrationID: fmt.Sprintf("fuzz-%s-%d-%d", strings.ReplaceAll(gc.Dir.String(), "->", "_"), gc.Seed, gc.CaseIdx),
 	}
 	ctx := ctx2min(t)
 	migErr := mig.Run(ctx)
 
-	ce := expectationFor(gc)
+	ce := fuzzgen.ExpectationFor(gc)
 
 	dstDB, err := sql.Open(fe.dstDriver, fe.dstDSN)
 	if err != nil {
-		return verdictFail, fmt.Sprintf("open target: %v", err)
+		return fuzzgen.VerdictFail, fmt.Sprintf("open target: %v", err)
 	}
 	defer func() { _ = dstDB.Close() }()
 
-	rowCount := targetRowCount(ctx, dstDB, gc.tableNm, gc.dir.dst)
+	rowCount := targetRowCount(ctx, dstDB, gc.TableName, gc.Dir.Dst)
 
 	var srcVals, dstVals map[string][]sql.NullString
-	if !ce.loudRefuse && migErr == nil {
-		cols := faithfulColumnsFor(gc)
+	if !ce.LoudRefuse && migErr == nil {
+		cols := fuzzgen.FaithfulColumnsFor(gc)
 
 		srcDB, err := sql.Open(fe.srcDriver, fe.srcDSN)
 		if err != nil {
-			return verdictFail, fmt.Sprintf("open source: %v", err)
+			return fuzzgen.VerdictFail, fmt.Sprintf("open source: %v", err)
 		}
 		defer func() { _ = srcDB.Close() }()
 
-		srcVals, err = readCanonical(ctx, srcDB, gc, cols, gc.dir.src)
+		srcVals, err = readCanonical(ctx, srcDB, gc, cols, gc.Dir.Src)
 		if err != nil {
-			return verdictFail, fmt.Sprintf("read source canonical: %v", err)
+			return fuzzgen.VerdictFail, fmt.Sprintf("read source canonical: %v", err)
 		}
-		dstVals, err = readCanonical(ctx, dstDB, gc, cols, gc.dir.dst)
+		dstVals, err = readCanonical(ctx, dstDB, gc, cols, gc.Dir.Dst)
 		if err != nil {
-			return verdictFail, fmt.Sprintf("read target canonical: %v", err)
+			return fuzzgen.VerdictFail, fmt.Sprintf("read target canonical: %v", err)
 		}
 	}
 
-	return classify(gc, ce, migErr, rowCount, srcVals, dstVals)
+	return fuzzgen.Classify(gc, ce, migErr, rowCount, srcVals, dstVals)
 }
 
 // dumpFixture writes the replayable source-dialect script so a failure
 // is deterministically reproducible (design decision #4). The path is
 // printed so an operator (or TestMigrate_FuzzRoundtrip_ReplayDumpedFixture) can
 // promote it to a permanent named pin.
-func dumpFixture(t *testing.T, gc *genCase, msg string) string {
+func dumpFixture(t *testing.T, gc *fuzzgen.Case, msg string) string {
 	t.Helper()
 	dir := fuzzFixturesPath
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -401,16 +402,16 @@ func dumpFixture(t *testing.T, gc *genCase, msg string) string {
 		return ""
 	}
 	name := fmt.Sprintf("seed%d_%s_case%d.sql",
-		gc.seed, strings.ReplaceAll(gc.dir.String(), "->", "_"), gc.caseIdx)
+		gc.Seed, strings.ReplaceAll(gc.Dir.String(), "->", "_"), gc.CaseIdx)
 	p := filepath.Join(dir, name)
 	header := fmt.Sprintf(
 		"-- FUZZ FAILURE — deterministically replayable\n"+
 			"-- seed=%d direction=%s caseIdx=%d\n"+
 			"-- verdict: %s\n"+
 			"-- replay: SLUICE_FUZZ_SEED=%d go test -tags=integration -run TestMigrate_FuzzRoundtrip_ReplayDumpedFixture ./internal/pipeline\n\n",
-		gc.seed, gc.dir, gc.caseIdx, msg, gc.seed,
+		gc.Seed, gc.Dir, gc.CaseIdx, msg, gc.Seed,
 	)
-	if err := os.WriteFile(p, []byte(header+gc.ddl), 0o600); err != nil {
+	if err := os.WriteFile(p, []byte(header+gc.DDL), 0o600); err != nil {
 		t.Logf("could not write fixture %s: %v", p, err)
 		return ""
 	}
@@ -436,16 +437,16 @@ func TestMigrate_FuzzRoundtrip(t *testing.T) {
 
 			pass, fail := 0, 0
 			for i := 0; i < iters; i++ {
-				gc := generateCase(seed, i, d)
+				gc := fuzzgen.GenerateCase(seed, i, d)
 				v, msg := runOneCase(t, fe, &gc)
-				if v == verdictPass {
+				if v == fuzzgen.VerdictPass {
 					pass++
 					continue
 				}
 				fail++
 				path := dumpFixture(t, &gc, msg)
 				t.Errorf("FUZZ FAIL [%s case %d seed %d]: %s\n  replayable fixture: %s\n  --- script ---\n%s",
-					d, i, seed, msg, path, gc.ddl)
+					d, i, seed, msg, path, gc.DDL)
 			}
 			t.Logf("direction %s: %d pass, %d fail (of %d)", d, pass, fail, iters)
 		})
@@ -459,13 +460,13 @@ func TestMigrate_FuzzRoundtrip(t *testing.T) {
 // file itself (the seed IS the fixture).
 func TestMigrate_FuzzRoundtrip_ReplayDumpedFixture(t *testing.T) {
 	seed := fuzzEnvSeed()
-	for _, d := range allDirections() {
+	for _, d := range fuzzgen.AllDirections() {
 		for i := 0; i < fuzzSmokeIters; i++ {
-			a := generateCase(seed, i, d)
-			b := generateCase(seed, i, d)
-			if a.ddl != b.ddl {
+			a := fuzzgen.GenerateCase(seed, i, d)
+			b := fuzzgen.GenerateCase(seed, i, d)
+			if a.DDL != b.DDL {
 				t.Fatalf("non-deterministic generation [%s case %d seed %d]:\n--- A ---\n%s\n--- B ---\n%s",
-					d, i, seed, a.ddl, b.ddl)
+					d, i, seed, a.DDL, b.DDL)
 			}
 		}
 	}

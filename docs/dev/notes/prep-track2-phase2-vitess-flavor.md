@@ -35,16 +35,16 @@ The Phase 1 harness is enum-parameterized, not interface-abstracted
 
 | Seam | File:line | Change |
 |---|---|---|
-| `engineKind` enum | `fuzzgen_registry.go:39-44` | add `engineVitess` + `String()` case `"vitess"` |
-| `family` struct | `fuzzgen_registry.go:140-169` | add `vitessType string` (3rd spelling) |
-| `columnDDL()` | `fuzzgen_registry.go:191` | 2-case → 3-case switch on `src` |
-| `canSource()` | `fuzzgen_registry.go:173` | Vitess: no arrays (like MySQL) |
-| `allDirections()` | `fuzzgen_registry.go:129-136` | add Vitess directions (see below) |
-| every `family()` ctor | `fuzzgen_registry.go:293-359` | populate `vitessType` (≈MySQL spelling for most) |
+| `engineKind` enum | `internal/fuzzgen/registry.go` | add `EngineVitess` + `String()` case `"vitess"` (symbols exported since the internal/fuzzgen move) |
+| `family` struct | `internal/fuzzgen/registry.go` | add `vitessType string` (3rd spelling) |
+| `columnDDL()` | `internal/fuzzgen/registry.go` | 2-case → 3-case switch on `src` |
+| `canSource()` | `internal/fuzzgen/registry.go` | Vitess: no arrays (like MySQL) |
+| `allDirections()` | `internal/fuzzgen/registry.go` | add Vitess directions (see below) |
+| every `family()` ctor | `internal/fuzzgen/registry.go` | populate `vitessType` (≈MySQL spelling for most) |
 | per-family `expect()` | each closure | add Vitess-direction branches |
-| `renderScript()` | `fuzzgen_generator.go:227-248` | Vitess DDL branch (≈MySQL: `ENGINE=InnoDB`, no arrays) |
+| `renderScript()` | `internal/fuzzgen/generator.go` | Vitess DDL branch (≈MySQL: `ENGINE=InnoDB`, no arrays) |
 | `bootDirection()` | `migrate_fuzz_roundtrip_integration_test.go:121-168` | `case engineVitess` → `startVitessTestServer()` |
-| oracle | `fuzzgen_oracle.go` | **no change** — canonical-text compare is engine-agnostic |
+| oracle | `internal/fuzzgen/oracle.go` | **no change** — canonical-text compare is engine-agnostic |
 
 **Reuse (do not rebuild):** `startShardedVTTestServer()` in
 `internal/pipeline/shapea_spike_vstream_integration_test.go:74-137`

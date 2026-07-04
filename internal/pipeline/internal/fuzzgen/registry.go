@@ -22,9 +22,9 @@
 // Decisions (d) are sourced verbatim from docs/type-mapping.md +
 // docs/dev/notes catalogued cross-engine limitations — NOT invented here.
 // This file carries no build tag: the registry is pure logic and is
-// unit-tested by fuzzgen_registry_test.go without Docker.
+// unit-tested by fuzzgen_test.go without Docker.
 
-package pipeline
+package fuzzgen
 
 import (
 	"fmt"
@@ -32,27 +32,29 @@ import (
 	"strings"
 )
 
-// engineKind is the engine flavour axis. Phase 1 is vanilla mysql:8.0 /
+// EngineKind is the engine flavour axis. Phase 1 is vanilla mysql:8.0 /
 // postgres:16; Phase 2 (Track 1) adds Vitess/PlanetScale flavours by
 // extending this enum + the per-kind DDL/oracle branches — an extension,
 // not a rewrite (design decision #5). SQLite joined that way: a file-based
 // engine (no container), source AND target (ADR-0128/0129/0134), always
-// cross-engine here (no sqlite→sqlite direction — see allDirections).
-type engineKind int
+// cross-engine here (no sqlite→sqlite direction — see AllDirections).
+type EngineKind int
 
+// EnginePG, EngineMySQL and EngineSQLite are the engines the harness
+// can speak as a source dialect and/or verify as a migrate target.
 const (
-	enginePG engineKind = iota
-	engineMySQL
-	engineSQLite
+	EnginePG EngineKind = iota
+	EngineMySQL
+	EngineSQLite
 )
 
-func (e engineKind) String() string {
+func (e EngineKind) String() string {
 	switch e {
-	case enginePG:
+	case EnginePG:
 		return "postgres"
-	case engineMySQL:
+	case EngineMySQL:
 		return "mysql"
-	case engineSQLite:
+	case EngineSQLite:
 		return "sqlite"
 	default:
 		return "unknown"
@@ -122,14 +124,14 @@ func (o outcome) String() string {
 	}
 }
 
-// direction is an ordered (source, target) engine-kind pair.
-type direction struct {
-	src, dst engineKind
+// Direction is an ordered (source, target) engine-kind pair.
+type Direction struct {
+	Src, Dst EngineKind
 }
 
-func (d direction) String() string { return d.src.String() + "->" + d.dst.String() }
+func (d Direction) String() string { return d.Src.String() + "->" + d.Dst.String() }
 
-// allDirections is the direction matrix: the Phase-1 four (MySQL→PG,
+// AllDirections is the direction matrix: the Phase-1 four (MySQL→PG,
 // PG→MySQL, PG→PG, MySQL→MySQL) plus the SQLite directions the engine
 // matrix supports — SQLite as a migrate SOURCE (ADR-0128/0129) into both
 // server engines, and SQLite as a migrate TARGET (ADR-0134) from both.
@@ -139,16 +141,16 @@ func (d direction) String() string { return d.src.String() + "->" + d.dst.String
 // compare would need writer-canonicalisation alignment — the SQLite→X→SQLite
 // value identity is pinned by the hand-authored round-trip fixtures
 // (migrate_sqlite_target_cross_integration_test.go) instead.
-func allDirections() []direction {
-	return []direction{
-		{enginePG, enginePG},
-		{engineMySQL, engineMySQL},
-		{engineMySQL, enginePG},
-		{enginePG, engineMySQL},
-		{engineSQLite, enginePG},
-		{engineSQLite, engineMySQL},
-		{enginePG, engineSQLite},
-		{engineMySQL, engineSQLite},
+func AllDirections() []Direction {
+	return []Direction{
+		{EnginePG, EnginePG},
+		{EngineMySQL, EngineMySQL},
+		{EngineMySQL, EnginePG},
+		{EnginePG, EngineMySQL},
+		{EngineSQLite, EnginePG},
+		{EngineSQLite, EngineMySQL},
+		{EnginePG, EngineSQLite},
+		{EngineMySQL, EngineSQLite},
 	}
 }
 
@@ -190,30 +192,30 @@ type family struct {
 	// the given source dialect) plus whether it is SQL NULL. Edge cases
 	// (min/max, boundary precision, multibyte, empty) are folded in via
 	// the rng so a long enough run hits them.
-	gen func(r *rand.Rand, src engineKind) (literal string, isNULL bool)
+	gen func(r *rand.Rand, src EngineKind) (literal string, isNULL bool)
 
-	// expect returns the expected outcome for (direction, shape). This
+	// expect returns the expected outcome for (Direction, shape). This
 	// is the load-bearing classification; its truth table is sourced
 	// from docs/type-mapping.md (cited inline at each non-faithful case).
-	expect func(d direction, s shape) outcome
+	expect func(d Direction, s shape) outcome
 }
 
 // canSource reports whether this family can be a source column in the
 // given engine at the given shape.
-func (f *family) canSource(src engineKind, s shape) bool {
-	if src != enginePG && s != shapeScalar {
+func (f *family) canSource(src EngineKind, s shape) bool {
+	if src != EnginePG && s != shapeScalar {
 		return false // only PG has an array type — never an array source elsewhere.
 	}
 	switch src {
-	case enginePG:
+	case EnginePG:
 		if f.pgType == "" {
 			return false
 		}
-	case engineMySQL:
+	case EngineMySQL:
 		if f.myType == "" {
 			return false
 		}
-	case engineSQLite:
+	case EngineSQLite:
 		if f.sqType == "" {
 			return false
 		}
@@ -230,12 +232,12 @@ func (f *family) canSource(src engineKind, s shape) bool {
 // PG arrays append `[]` per dimension; multi-dim PG arrays are declared
 // `T[][]` (PG ignores declared dimensionality but the spelling documents
 // intent and matches the battle-test fixtures).
-func (f *family) columnDDL(src engineKind, s shape) string {
+func (f *family) columnDDL(src EngineKind, s shape) string {
 	base := f.pgType
 	switch src {
-	case engineMySQL:
+	case EngineMySQL:
 		base = f.myType
-	case engineSQLite:
+	case EngineSQLite:
 		base = f.sqType
 	}
 	switch s {
@@ -317,8 +319,8 @@ func pickStr(r *rand.Rand, maxLen int) string {
 
 // sameEngineFaithful is the default expect: faithful for same-engine,
 // lossy-documented for cross-engine (see the scope note above).
-func sameEngineFaithful(d direction, _ shape) outcome {
-	if d.src == d.dst {
+func sameEngineFaithful(d Direction, _ shape) outcome {
+	if d.Src == d.Dst {
 		return outcomeFaithful
 	}
 	return outcomeLossyDocument
@@ -328,20 +330,20 @@ func sameEngineFaithful(d direction, _ shape) outcome {
 // canonical text is provably identical on both engines at scalar shape
 // AND every direction (currently none claim it — kept so a future
 // family can opt in deliberately rather than by oversight).
-func alwaysFaithful(d direction, s shape) outcome { return sameEngineFaithful(d, s) }
+func alwaysFaithful(d Direction, s shape) outcome { return sameEngineFaithful(d, s) }
 
 // expectedOutcome is THE single expectation lookup — every consumer
-// (generator, oracle) resolves a (family, direction, shape) through it,
+// (generator, oracle) resolves a (family, Direction, shape) through it,
 // never through f.expect directly. It centralises the SQLite-TARGET
 // refusal classes (ADR-0134 §1: the writer refuses ir.Array — every
 // array shape — and the sqliteTargetRefused families loudly at schema
 // emit) so the per-family closures, written for the Phase-1 PG/MySQL
-// matrix, don't each need a d.dst==sqlite branch (several fall through
+// matrix, don't each need a d.Dst==sqlite branch (several fall through
 // to outcomeFaithful for "any other direction", which would silently
 // misclassify a sqlite target). Every non-refused X→sqlite case is
 // lossy-documented per the Phase-1 cross-engine scope note above.
-func expectedOutcome(f *family, d direction, s shape) outcome {
-	if d.dst == engineSQLite {
+func expectedOutcome(f *family, d Direction, s shape) outcome {
+	if d.Dst == EngineSQLite {
 		if s != shapeScalar || f.sqliteTargetRefused {
 			return outcomeLoudRefuse // ADR-0134 emit refusal (array / bit / net)
 		}
@@ -469,7 +471,7 @@ func scalarOnly() []shape  { return []shape{shapeScalar} }
 func intFamily(name, pg, my string, _ bool, lo, hi float64) *family {
 	return &family{
 		name: name, pgType: pg, myType: my, shapes: arrayShapes(),
-		gen: func(r *rand.Rand, _ engineKind) (string, bool) {
+		gen: func(r *rand.Rand, _ EngineKind) (string, bool) {
 			if r.Intn(6) == 0 {
 				return "", true // NULL
 			}
@@ -489,7 +491,7 @@ func intFamily(name, pg, my string, _ bool, lo, hi float64) *family {
 func uintFamily(name, my string, lo, hi uint64) *family {
 	return &family{
 		name: name, pgType: "", myType: my, shapes: scalarOnly(),
-		gen: func(r *rand.Rand, _ engineKind) (string, bool) {
+		gen: func(r *rand.Rand, _ EngineKind) (string, bool) {
 			if r.Intn(6) == 0 {
 				return "", true
 			}
@@ -511,7 +513,7 @@ func uintFamily(name, my string, lo, hi uint64) *family {
 func uintBigFamily() *family {
 	return &family{
 		name: "uint64", pgType: "", myType: "bigint unsigned", shapes: scalarOnly(),
-		gen: func(r *rand.Rand, _ engineKind) (string, bool) {
+		gen: func(r *rand.Rand, _ EngineKind) (string, bool) {
 			if r.Intn(6) == 0 {
 				return "", true
 			}
@@ -529,7 +531,7 @@ func uintBigFamily() *family {
 func decimalConstrained() *family {
 	return &family{
 		name: "numeric_15_4", pgType: "numeric(15,4)", myType: "decimal(15,4)", shapes: arrayShapes(),
-		gen: func(r *rand.Rand, _ engineKind) (string, bool) {
+		gen: func(r *rand.Rand, _ EngineKind) (string, bool) {
 			if r.Intn(6) == 0 {
 				return "", true
 			}
@@ -544,13 +546,13 @@ func decimalConstrained() *family {
 func decimalUnconstrained() *family {
 	// Bug 69: unconstrained PG numeric. PG→PG faithful (bare NUMERIC);
 	// PG→MySQL is a documented widen to DECIMAL(65,30) — values are
-	// preserved but right-padded, so canonical text differs → classify
+	// preserved but right-padded, so canonical text differs → Classify
 	// lossy-documented for the scalar cross case (we assert migrate
 	// succeeds + column exists, not text-equality). The numeric[] array
 	// → MySQL JSON is also lossy-documented. type-mapping.md §69.
 	return &family{
 		name: "numeric_unconstrained", pgType: "numeric", myType: "", shapes: arrayShapes(),
-		gen: func(r *rand.Rand, _ engineKind) (string, bool) {
+		gen: func(r *rand.Rand, _ EngineKind) (string, bool) {
 			if r.Intn(6) == 0 {
 				return "", true
 			}
@@ -573,7 +575,7 @@ func decimalUnconstrained() *family {
 func floatFamily(name, pg, my string, _ bool) *family {
 	return &family{
 		name: name, pgType: pg, myType: my, shapes: arrayShapes(),
-		gen: func(r *rand.Rand, _ engineKind) (string, bool) {
+		gen: func(r *rand.Rand, _ EngineKind) (string, bool) {
 			if r.Intn(6) == 0 {
 				return "", true
 			}
@@ -589,14 +591,14 @@ func floatFamily(name, pg, my string, _ bool) *family {
 func boolFamily() *family {
 	return &family{
 		name: "bool", pgType: "boolean", myType: "tinyint(1)", shapes: arrayShapes(),
-		gen: func(r *rand.Rand, src engineKind) (string, bool) {
+		gen: func(r *rand.Rand, src EngineKind) (string, bool) {
 			if r.Intn(6) == 0 {
 				return "", true
 			}
 			// MySQL tinyint(1) and SQLite BOOLEAN both take 0/1 (the
 			// ADR-0129 canonical INTEGER bool storage); PG takes the
 			// keywords.
-			if src != enginePG {
+			if src != EnginePG {
 				if r.Intn(2) == 0 {
 					return "1", false
 				}
@@ -623,12 +625,12 @@ func boolFamily() *family {
 func strFamily(name, pg, my string, maxLen int) *family {
 	return &family{
 		name: name, pgType: pg, myType: my, shapes: scalarOnly(),
-		gen: func(r *rand.Rand, src engineKind) (string, bool) {
+		gen: func(r *rand.Rand, src EngineKind) (string, bool) {
 			if r.Intn(6) == 0 {
 				return "", true
 			}
 			s := pickStr(r, maxLen)
-			if src == engineMySQL {
+			if src == EngineMySQL {
 				return quoteMy(s), false
 			}
 			return quotePG(s), false
@@ -643,10 +645,10 @@ func wideVarcharFamily() *family {
 	// proceeds) — values preserved but the column TYPE differs; the
 	// canonical-text oracle still matches (text content is identical),
 	// but to avoid coupling to MySQL TEXT trailing-space semantics we
-	// classify the cross case lossy-documented. type-mapping.md §72.
+	// Classify the cross case lossy-documented. type-mapping.md §72.
 	return &family{
 		name: "varchar_wide", pgType: "varchar(20000)", myType: "", shapes: scalarOnly(),
-		gen: func(r *rand.Rand, _ engineKind) (string, bool) {
+		gen: func(r *rand.Rand, _ EngineKind) (string, bool) {
 			if r.Intn(6) == 0 {
 				return "", true
 			}
@@ -662,12 +664,12 @@ func wideVarcharFamily() *family {
 func textFamily() *family {
 	return &family{
 		name: "text", pgType: "text", myType: "text", shapes: arrayShapes(),
-		gen: func(r *rand.Rand, src engineKind) (string, bool) {
+		gen: func(r *rand.Rand, src EngineKind) (string, bool) {
 			if r.Intn(6) == 0 {
 				return "", true
 			}
 			s := pickStr(r, 200)
-			if src == engineMySQL {
+			if src == EngineMySQL {
 				return quoteMy(s), false
 			}
 			return quotePG(s), false
@@ -695,14 +697,14 @@ func randHex(r *rand.Rand, maxBytes int) string {
 
 // binLiteral renders a hex byte string as a source-dialect binary
 // literal (MySQL 0x.. / SQLite x'..' / PG bytea \x.., empty handled).
-func binLiteral(h string, src engineKind) string {
+func binLiteral(h string, src EngineKind) string {
 	switch src {
-	case engineMySQL:
+	case EngineMySQL:
 		if h == "" {
 			return "''"
 		}
 		return "0x" + h
-	case engineSQLite:
+	case EngineSQLite:
 		return "x'" + h + "'" // x'' is the valid empty blob
 	default:
 		return castPG(quotePG("\\x"+h), "bytea")
@@ -712,7 +714,7 @@ func binLiteral(h string, src engineKind) string {
 func binFamily(name, pg, my string) *family {
 	return &family{
 		name: name, pgType: pg, myType: my, shapes: scalarOnly(),
-		gen: func(r *rand.Rand, src engineKind) (string, bool) {
+		gen: func(r *rand.Rand, src EngineKind) (string, bool) {
 			if r.Intn(6) == 0 {
 				return "", true
 			}
@@ -727,7 +729,7 @@ func binFamily(name, pg, my string) *family {
 func blobFamily() *family {
 	return &family{
 		name: "blob", pgType: "bytea", myType: "blob", shapes: scalarOnly(),
-		gen: func(r *rand.Rand, src engineKind) (string, bool) {
+		gen: func(r *rand.Rand, src EngineKind) (string, bool) {
 			if r.Intn(6) == 0 {
 				return "", true
 			}
@@ -743,7 +745,7 @@ func bitFamily(name, pg, my string, n int) *family {
 		// ir.Bit has no faithful SQLite storage — the writer refuses it
 		// loudly at emit (ADR-0134 §1).
 		sqliteTargetRefused: true,
-		gen: func(r *rand.Rand, src engineKind) (string, bool) {
+		gen: func(r *rand.Rand, src EngineKind) (string, bool) {
 			if r.Intn(6) == 0 {
 				return "", true
 			}
@@ -755,7 +757,7 @@ func bitFamily(name, pg, my string, n int) *family {
 					b.WriteByte('1')
 				}
 			}
-			if src == engineMySQL {
+			if src == EngineMySQL {
 				return "b'" + b.String() + "'", false
 			}
 			return "B'" + b.String() + "'", false
@@ -772,7 +774,7 @@ func varbitFamily() *family {
 		// ir.Varbit/ir.Bit are on the SQLite writer's emit-refusal list
 		// (ADR-0134 §1).
 		sqliteTargetRefused: true,
-		gen: func(r *rand.Rand, src engineKind) (string, bool) {
+		gen: func(r *rand.Rand, src EngineKind) (string, bool) {
 			if r.Intn(6) == 0 {
 				return "", true
 			}
@@ -785,7 +787,7 @@ func varbitFamily() *family {
 					b.WriteByte('1')
 				}
 			}
-			if src == engineMySQL {
+			if src == EngineMySQL {
 				return "b'" + b.String() + "'", false
 			}
 			return "B'" + b.String() + "'", false
@@ -805,7 +807,7 @@ func varbitFamily() *family {
 func dateFamily() *family {
 	return &family{
 		name: "date", pgType: "date", myType: "date", shapes: arrayShapes(),
-		gen: func(r *rand.Rand, _ engineKind) (string, bool) {
+		gen: func(r *rand.Rand, _ EngineKind) (string, bool) {
 			if r.Intn(6) == 0 {
 				return "", true
 			}
@@ -821,7 +823,7 @@ func dateFamily() *family {
 func timeFamily() *family {
 	return &family{
 		name: "time", pgType: "time", myType: "time(6)", shapes: arrayShapes(),
-		gen: func(r *rand.Rand, _ engineKind) (string, bool) {
+		gen: func(r *rand.Rand, _ EngineKind) (string, bool) {
 			if r.Intn(6) == 0 {
 				return "", true
 			}
@@ -840,15 +842,15 @@ func timetzFamily() *family {
 	// loud-refuse-is-a-PASS case.
 	return &family{
 		name: "timetz", pgType: "timetz", myType: "", shapes: arrayShapes(),
-		gen: func(r *rand.Rand, _ engineKind) (string, bool) {
+		gen: func(r *rand.Rand, _ EngineKind) (string, bool) {
 			if r.Intn(6) == 0 {
 				return "", true
 			}
 			off := []string{"+00", "+05", "-07", "+05:30"}[r.Intn(4)]
 			return fmt.Sprintf("'%02d:%02d:%02d%s'", r.Intn(24), r.Intn(60), r.Intn(60), off), false
 		},
-		expect: func(d direction, s shape) outcome {
-			if d.src == enginePG && d.dst == enginePG {
+		expect: func(d Direction, s shape) outcome {
+			if d.Src == EnginePG && d.Dst == EnginePG {
 				if s == shapeScalar {
 					return outcomeFaithful
 				}
@@ -857,7 +859,7 @@ func timetzFamily() *family {
 				// migrate_bug7374_integration_test.go.
 				return outcomeLoudRefuse
 			}
-			if d.src == enginePG && d.dst == engineMySQL {
+			if d.Src == EnginePG && d.Dst == EngineMySQL {
 				return outcomeLossyDocument // zone-flatten / array→JSON
 			}
 			return outcomeFaithful
@@ -868,13 +870,13 @@ func timetzFamily() *family {
 func timestampFamily() *family {
 	return &family{
 		name: "timestamp", pgType: "timestamp", myType: "datetime(6)", shapes: arrayShapes(),
-		gen: func(r *rand.Rand, src engineKind) (string, bool) {
+		gen: func(r *rand.Rand, src EngineKind) (string, bool) {
 			if r.Intn(6) == 0 {
 				return "", true
 			}
 			// PG timestamp / MySQL datetime take the full 1970..2049 spread.
 			year := 1970 + r.Intn(80)
-			if src == engineSQLite {
+			if src == EngineSQLite {
 				// A SQLite DATETIME reads back as ir.Timestamp (ADR-0129),
 				// which the MySQL writer emits as TIMESTAMP(6) — supported
 				// instants end 2038-01-19 (and exclude the 1970 epoch
@@ -895,14 +897,14 @@ func timestampFamily() *family {
 func timestamptzFamily() *family {
 	return &family{
 		name: "timestamptz", pgType: "timestamptz", myType: "timestamp(6)", shapes: arrayShapes(),
-		gen: func(r *rand.Rand, src engineKind) (string, bool) {
+		gen: func(r *rand.Rand, src EngineKind) (string, bool) {
 			if r.Intn(6) == 0 {
 				return "", true
 			}
 			ts := fmt.Sprintf("%04d-%02d-%02d %02d:%02d:%02d",
 				1971+r.Intn(60), 1+r.Intn(12), 1+r.Intn(28),
 				r.Intn(24), r.Intn(60), r.Intn(60))
-			if src == enginePG {
+			if src == EnginePG {
 				// PG timestamptz accepts (and needs, to be unambiguous)
 				// an explicit zone; MySQL TIMESTAMP rejects the `+00`
 				// suffix (Error 1292) and stores UTC implicitly.
@@ -920,7 +922,7 @@ func timestamptzFamily() *family {
 func jsonFamily() *family {
 	return &family{
 		name: "json", pgType: "jsonb", myType: "json", shapes: scalarOnly(),
-		gen: func(r *rand.Rand, _ engineKind) (string, bool) {
+		gen: func(r *rand.Rand, _ EngineKind) (string, bool) {
 			if r.Intn(6) == 0 {
 				return "", true
 			}
@@ -947,7 +949,7 @@ func jsonFamily() *family {
 func uuidFamily() *family {
 	return &family{
 		name: "uuid", pgType: "uuid", myType: "", shapes: arrayShapes(),
-		gen: func(r *rand.Rand, _ engineKind) (string, bool) {
+		gen: func(r *rand.Rand, _ EngineKind) (string, bool) {
 			if r.Intn(6) == 0 {
 				return "", true
 			}
@@ -970,7 +972,7 @@ func netFamily(name, pgType string) *family {
 		// ir.Inet/Cidr/Macaddr have no faithful SQLite storage — refused
 		// loudly at emit (ADR-0134 §1).
 		sqliteTargetRefused: true,
-		gen: func(r *rand.Rand, _ engineKind) (string, bool) {
+		gen: func(r *rand.Rand, _ EngineKind) (string, bool) {
 			if r.Intn(6) == 0 {
 				return "", true
 			}
@@ -998,7 +1000,7 @@ func enumFamily() *family {
 	// type). Scalar only (no enum arrays in Phase 1).
 	return &family{
 		name: "enum", pgType: "__enum__", myType: "enum('red','green','blue')", shapes: scalarOnly(),
-		gen: func(r *rand.Rand, _ engineKind) (string, bool) {
+		gen: func(r *rand.Rand, _ EngineKind) (string, bool) {
 			if r.Intn(6) == 0 {
 				return "", true
 			}

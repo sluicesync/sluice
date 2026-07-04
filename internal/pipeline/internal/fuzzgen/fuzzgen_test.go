@@ -8,7 +8,7 @@
 // (migrate_fuzz_roundtrip_integration_test.go) exercises the same code
 // against real databases.
 
-package pipeline
+package fuzzgen
 
 import (
 	"database/sql"
@@ -109,7 +109,7 @@ func TestRegistry_TimetzArrayIsLoudRefuse(t *testing.T) {
 	if tz == nil {
 		t.Fatal("timetz family missing")
 	}
-	pgpg := direction{enginePG, enginePG}
+	pgpg := Direction{EnginePG, EnginePG}
 	if got := tz.expect(pgpg, shapeScalar); got != outcomeFaithful {
 		t.Errorf("timetz scalar PG→PG: got %s; want faithful", got)
 	}
@@ -124,33 +124,33 @@ func TestRegistry_TimetzArrayIsLoudRefuse(t *testing.T) {
 // TestRegistry_NoFalsePositiveOnDocumentedLossy guards the v0.69.0 #16
 // false-positive class: documented cross-engine degradations
 // (unconstrained numeric → MySQL, PG array → MySQL JSON, uuid/inet →
-// MySQL) MUST classify lossy-documented (NOT compared for equality, NOT
+// MySQL) MUST Classify lossy-documented (NOT compared for equality, NOT
 // a refusal), so the harness never FAILs a documented transformation.
 func TestRegistry_NoFalsePositiveOnDocumentedLossy(t *testing.T) {
 	cases := []struct {
 		fam string
-		d   direction
+		d   Direction
 		s   shape
 		exp outcome
 	}{
-		{"numeric_unconstrained", direction{enginePG, engineMySQL}, shapeScalar, outcomeLossyDocument},
-		{"numeric_unconstrained", direction{enginePG, enginePG}, shapeScalar, outcomeFaithful},
-		{"uuid", direction{enginePG, engineMySQL}, shapeScalar, outcomeLossyDocument},
-		{"uuid", direction{enginePG, enginePG}, shapeScalar, outcomeFaithful},
-		{"inet", direction{enginePG, engineMySQL}, shape1DArray, outcomeLossyDocument},
-		{"varchar_wide", direction{enginePG, engineMySQL}, shapeScalar, outcomeLossyDocument},
-		{"varchar_wide", direction{enginePG, enginePG}, shapeScalar, outcomeFaithful},
-		{"json", direction{enginePG, engineMySQL}, shapeScalar, outcomeLossyDocument},
+		{"numeric_unconstrained", Direction{EnginePG, EngineMySQL}, shapeScalar, outcomeLossyDocument},
+		{"numeric_unconstrained", Direction{EnginePG, EnginePG}, shapeScalar, outcomeFaithful},
+		{"uuid", Direction{EnginePG, EngineMySQL}, shapeScalar, outcomeLossyDocument},
+		{"uuid", Direction{EnginePG, EnginePG}, shapeScalar, outcomeFaithful},
+		{"inet", Direction{EnginePG, EngineMySQL}, shape1DArray, outcomeLossyDocument},
+		{"varchar_wide", Direction{EnginePG, EngineMySQL}, shapeScalar, outcomeLossyDocument},
+		{"varchar_wide", Direction{EnginePG, EnginePG}, shapeScalar, outcomeFaithful},
+		{"json", Direction{EnginePG, EngineMySQL}, shapeScalar, outcomeLossyDocument},
 		// Phase-1 scope: cross-engine canonical text is engine-specific,
 		// so even a lossless int round-trip is lossy-documented
 		// cross-engine (the #16-safe stance — see the scope note in
-		// fuzzgen_registry.go). Same-engine stays faithful.
-		{"int32", direction{engineMySQL, enginePG}, shapeScalar, outcomeLossyDocument},
-		{"int32", direction{enginePG, enginePG}, shapeScalar, outcomeFaithful},
-		{"int32", direction{engineMySQL, engineMySQL}, shapeScalar, outcomeFaithful},
-		{"bool", direction{engineMySQL, enginePG}, shapeScalar, outcomeLossyDocument},
-		{"varbinary", direction{engineMySQL, enginePG}, shapeScalar, outcomeLossyDocument},
-		{"int8", direction{enginePG, engineMySQL}, shape1DArray, outcomeLossyDocument},
+		// registry.go). Same-engine stays faithful.
+		{"int32", Direction{EngineMySQL, EnginePG}, shapeScalar, outcomeLossyDocument},
+		{"int32", Direction{EnginePG, EnginePG}, shapeScalar, outcomeFaithful},
+		{"int32", Direction{EngineMySQL, EngineMySQL}, shapeScalar, outcomeFaithful},
+		{"bool", Direction{EngineMySQL, EnginePG}, shapeScalar, outcomeLossyDocument},
+		{"varbinary", Direction{EngineMySQL, EnginePG}, shapeScalar, outcomeLossyDocument},
+		{"int8", Direction{EnginePG, EngineMySQL}, shape1DArray, outcomeLossyDocument},
 	}
 	byName := map[string]*family{}
 	for _, f := range registry() {
@@ -172,14 +172,14 @@ func TestRegistry_NoFalsePositiveOnDocumentedLossy(t *testing.T) {
 // (seed, idx, dir) regenerates a byte-identical script (design
 // decision #4 — reproducible replay).
 func TestGenerator_Deterministic(t *testing.T) {
-	for _, d := range allDirections() {
+	for _, d := range AllDirections() {
 		for i := 0; i < 25; i++ {
-			a := generateCase(1234567, i, d)
-			b := generateCase(1234567, i, d)
-			if a.ddl != b.ddl {
-				t.Fatalf("non-deterministic [%s case %d]:\nA:\n%s\nB:\n%s", d, i, a.ddl, b.ddl)
+			a := GenerateCase(1234567, i, d)
+			b := GenerateCase(1234567, i, d)
+			if a.DDL != b.DDL {
+				t.Fatalf("non-deterministic [%s case %d]:\nA:\n%s\nB:\n%s", d, i, a.DDL, b.DDL)
 			}
-			if a.ddl == "" {
+			if a.DDL == "" {
 				t.Fatalf("empty script [%s case %d]", d, i)
 			}
 		}
@@ -214,7 +214,7 @@ func TestGenerator_LoudRefuseArrayForcesNonNull(t *testing.T) {
 		}
 		r := rand.New(rand.NewSource(1))
 		for i := 0; i < 500; i++ {
-			out := renderCell(r, &c, enginePG)
+			out := renderCell(r, &c, EnginePG)
 			if out == "NULL" {
 				t.Fatalf("[%s] forced loud-refuse array rendered whole-column NULL at draw %d (vacuous-FP class)", shp, i)
 			}
@@ -224,18 +224,18 @@ func TestGenerator_LoudRefuseArrayForcesNonNull(t *testing.T) {
 		}
 	}
 
-	// (b) wiring: generateCase must SET forceNonNullLeaf for every
+	// (b) wiring: GenerateCase must SET forceNonNullLeaf for every
 	// timetz array column in the PG→PG direction, and none of that
 	// column's rendered values may be NULL / all-NULL.
-	var pgpg direction
-	for _, d := range allDirections() {
+	var pgpg Direction
+	for _, d := range AllDirections() {
 		if d.String() == "postgres->postgres" {
 			pgpg = d
 		}
 	}
 	sawTimetzArray := false
 	for idx := 0; idx < 120; idx++ {
-		gc := generateCase(987654321, idx, pgpg)
+		gc := GenerateCase(987654321, idx, pgpg)
 		for _, c := range gc.columns {
 			if c.fam.name != "timetz" || c.shp == shapeScalar {
 				continue
@@ -260,7 +260,7 @@ func TestGenerator_LoudRefuseArrayForcesNonNull(t *testing.T) {
 	// globally suppress NULL coverage.
 	var faithfulArr *family
 	for _, f := range registry() {
-		if f.canSource(enginePG, shape1DArray) && f.expect(pgpg, shape1DArray) != outcomeLoudRefuse {
+		if f.canSource(EnginePG, shape1DArray) && f.expect(pgpg, shape1DArray) != outcomeLoudRefuse {
 			faithfulArr = f
 			break
 		}
@@ -272,7 +272,7 @@ func TestGenerator_LoudRefuseArrayForcesNonNull(t *testing.T) {
 	r := rand.New(rand.NewSource(2))
 	sawNull := false
 	for i := 0; i < 500 && !sawNull; i++ {
-		if renderCell(r, &c, enginePG) == "NULL" {
+		if renderCell(r, &c, EnginePG) == "NULL" {
 			sawNull = true
 		}
 	}
@@ -285,27 +285,27 @@ func TestGenerator_LoudRefuseArrayForcesNonNull(t *testing.T) {
 // MySQL source never emits array columns / PG `::` casts; PG source
 // emits a CREATE TABLE; both always include the id PK and ≥1 column.
 func TestGenerator_SourceDialectShape(t *testing.T) {
-	for _, d := range allDirections() {
-		gc := generateCase(99, 7, d)
-		if !strings.Contains(gc.ddl, "CREATE TABLE "+gc.tableNm) {
-			t.Errorf("[%s] missing CREATE TABLE: %s", d, gc.ddl)
+	for _, d := range AllDirections() {
+		gc := GenerateCase(99, 7, d)
+		if !strings.Contains(gc.DDL, "CREATE TABLE "+gc.TableName) {
+			t.Errorf("[%s] missing CREATE TABLE: %s", d, gc.DDL)
 		}
-		if !strings.Contains(gc.ddl, "id INT") {
-			t.Errorf("[%s] missing id PK: %s", d, gc.ddl)
+		if !strings.Contains(gc.DDL, "id INT") {
+			t.Errorf("[%s] missing id PK: %s", d, gc.DDL)
 		}
 		if len(gc.columns) == 0 {
 			t.Errorf("[%s] zero columns generated", d)
 		}
-		if d.src == engineMySQL {
+		if d.Src == EngineMySQL {
 			for _, c := range gc.columns {
 				if c.shp != shapeScalar {
 					t.Errorf("[%s] MySQL source got non-scalar column %s shape=%s", d, c.name, c.shp)
 				}
 			}
-			if strings.Contains(gc.ddl, "::") || strings.Contains(gc.ddl, "ARRAY[") {
-				t.Errorf("[%s] MySQL source script contains PG syntax:\n%s", d, gc.ddl)
+			if strings.Contains(gc.DDL, "::") || strings.Contains(gc.DDL, "ARRAY[") {
+				t.Errorf("[%s] MySQL source script contains PG syntax:\n%s", d, gc.DDL)
 			}
-			if !strings.Contains(gc.ddl, "ENGINE=InnoDB") {
+			if !strings.Contains(gc.DDL, "ENGINE=InnoDB") {
 				t.Errorf("[%s] MySQL source script missing ENGINE clause", d)
 			}
 		}
@@ -316,13 +316,13 @@ func TestGenerator_SourceDialectShape(t *testing.T) {
 // three-outcome classifier — the load-bearing logic the design
 // contract calls out for adversarial review.
 func TestOracle_ClassifyTruthTable(t *testing.T) {
-	mkCase := func() *genCase { return &genCase{tableNm: "t", dir: direction{enginePG, enginePG}} }
+	mkCase := func() *Case { return &Case{TableName: "t", Dir: Direction{EnginePG, EnginePG}} }
 	ns := func(s string) sql.NullString { return sql.NullString{String: s, Valid: true} }
 
 	t.Run("loud-refuse expected, refused, target absent → PASS", func(t *testing.T) {
-		ce := caseExpectation{loudRefuse: true, reason: "timetz[]"}
-		v, msg := classify(mkCase(), ce, errBoom, -1, nil, nil)
-		if v != verdictPass {
+		ce := Expectation{LoudRefuse: true, reason: "timetz[]"}
+		v, msg := Classify(mkCase(), ce, errBoom, -1, nil, nil)
+		if v != VerdictPass {
 			t.Errorf("got FAIL (%s); want PASS", msg)
 		}
 	})
@@ -331,86 +331,86 @@ func TestOracle_ClassifyTruthTable(t *testing.T) {
 		// writer, AFTER create-tables, so an empty table necessarily
 		// exists. The Bug 73 battle fixture accepts exactly this; an
 		// empty table is NOT a partial-data target.
-		ce := caseExpectation{loudRefuse: true, reason: "timetz[]"}
-		v, msg := classify(mkCase(), ce, errBoom, 0, nil, nil)
-		if v != verdictPass {
+		ce := Expectation{LoudRefuse: true, reason: "timetz[]"}
+		v, msg := Classify(mkCase(), ce, errBoom, 0, nil, nil)
+		if v != VerdictPass {
 			t.Errorf("empty target after documented refuse-at-copy must PASS; got FAIL (%s)", msg)
 		}
 	})
 	t.Run("loud-refuse expected, migrate SUCCEEDED → FAIL (silent)", func(t *testing.T) {
-		ce := caseExpectation{loudRefuse: true, reason: "timetz[]"}
-		v, _ := classify(mkCase(), ce, nil, 3, nil, nil)
-		if v != verdictFail {
+		ce := Expectation{LoudRefuse: true, reason: "timetz[]"}
+		v, _ := Classify(mkCase(), ce, nil, 3, nil, nil)
+		if v != VerdictFail {
 			t.Error("expected FAIL on unexpected success of a loud-refuse case")
 		}
 	})
 	t.Run("loud-refuse expected, refused but PARTIAL DATA (rows>0) → FAIL", func(t *testing.T) {
-		ce := caseExpectation{loudRefuse: true, reason: "timetz[]"}
-		v, msg := classify(mkCase(), ce, errBoom, 2, nil, nil)
-		if v != verdictFail || !strings.Contains(msg, "PARTIAL TARGET DATA") {
+		ce := Expectation{LoudRefuse: true, reason: "timetz[]"}
+		v, msg := Classify(mkCase(), ce, errBoom, 2, nil, nil)
+		if v != VerdictFail || !strings.Contains(msg, "PARTIAL TARGET DATA") {
 			t.Errorf("want FAIL/PARTIAL TARGET DATA on rows after refusal; got %v %q", v, msg)
 		}
 	})
 	t.Run("faithful expected, unexpected refusal → FAIL (#16 class)", func(t *testing.T) {
-		ce := caseExpectation{faithfulCols: []string{"c"}}
-		v, msg := classify(mkCase(), ce, errBoom, -1, nil, nil)
-		if v != verdictFail || !strings.Contains(msg, "UNEXPECTED REFUSAL") {
+		ce := Expectation{faithfulCols: []string{"c"}}
+		v, msg := Classify(mkCase(), ce, errBoom, -1, nil, nil)
+		if v != VerdictFail || !strings.Contains(msg, "UNEXPECTED REFUSAL") {
 			t.Errorf("want FAIL/UNEXPECTED REFUSAL; got %v %q", v, msg)
 		}
 	})
 	t.Run("faithful, src==dst → PASS", func(t *testing.T) {
 		gc := mkCase()
 		gc.columns = []genColumn{{name: "c"}}
-		ce := caseExpectation{faithfulCols: []string{"c"}}
+		ce := Expectation{faithfulCols: []string{"c"}}
 		src := map[string][]sql.NullString{"c": {ns("a"), ns("b")}}
 		dst := map[string][]sql.NullString{"c": {ns("a"), ns("b")}}
-		v, msg := classify(gc, ce, nil, 2, src, dst)
-		if v != verdictPass {
+		v, msg := Classify(gc, ce, nil, 2, src, dst)
+		if v != VerdictPass {
 			t.Errorf("got FAIL (%s); want PASS", msg)
 		}
 	})
 	t.Run("faithful, src!=dst → FAIL (silent loss)", func(t *testing.T) {
 		gc := mkCase()
 		gc.columns = []genColumn{{name: "c"}}
-		ce := caseExpectation{faithfulCols: []string{"c"}}
+		ce := Expectation{faithfulCols: []string{"c"}}
 		src := map[string][]sql.NullString{"c": {ns("a"), ns("b")}}
 		dst := map[string][]sql.NullString{"c": {ns("a"), ns("X")}}
-		v, msg := classify(gc, ce, nil, 2, src, dst)
-		if v != verdictFail || !strings.Contains(msg, "MISMATCH") {
+		v, msg := Classify(gc, ce, nil, 2, src, dst)
+		if v != VerdictFail || !strings.Contains(msg, "MISMATCH") {
 			t.Errorf("want FAIL/MISMATCH; got %v %q", v, msg)
 		}
 	})
 	t.Run("cross-engine rowcount pseudo-column mismatch → FAIL", func(t *testing.T) {
 		// The cross-engine regime (no faithful columns — every SQLite
 		// direction lives here) reports row presence under
-		// fuzzRowCountKey; a skew is a silent ROW loss.
+		// RowCountKey; a skew is a silent ROW loss.
 		gc := mkCase()
 		gc.columns = []genColumn{{name: "c"}}
-		src := map[string][]sql.NullString{fuzzRowCountKey: {{}, {}, {}}}
-		dst := map[string][]sql.NullString{fuzzRowCountKey: {{}, {}}}
-		v, msg := classify(gc, caseExpectation{}, nil, 2, src, dst)
-		if v != verdictFail || !strings.Contains(msg, "ROW COUNT MISMATCH") {
+		src := map[string][]sql.NullString{RowCountKey: {{}, {}, {}}}
+		dst := map[string][]sql.NullString{RowCountKey: {{}, {}}}
+		v, msg := Classify(gc, Expectation{}, nil, 2, src, dst)
+		if v != VerdictFail || !strings.Contains(msg, "ROW COUNT MISMATCH") {
 			t.Errorf("want FAIL/ROW COUNT MISMATCH; got %v %q", v, msg)
 		}
 	})
 	t.Run("cross-engine rowcount pseudo-column equal → PASS", func(t *testing.T) {
 		gc := mkCase()
 		gc.columns = []genColumn{{name: "c"}}
-		src := map[string][]sql.NullString{fuzzRowCountKey: {{}, {}}}
-		dst := map[string][]sql.NullString{fuzzRowCountKey: {{}, {}}}
-		v, msg := classify(gc, caseExpectation{}, nil, 2, src, dst)
-		if v != verdictPass {
+		src := map[string][]sql.NullString{RowCountKey: {{}, {}}}
+		dst := map[string][]sql.NullString{RowCountKey: {{}, {}}}
+		v, msg := Classify(gc, Expectation{}, nil, 2, src, dst)
+		if v != VerdictPass {
 			t.Errorf("got FAIL (%s); want PASS", msg)
 		}
 	})
 	t.Run("faithful, row count mismatch → FAIL", func(t *testing.T) {
 		gc := mkCase()
 		gc.columns = []genColumn{{name: "c"}}
-		ce := caseExpectation{faithfulCols: []string{"c"}}
+		ce := Expectation{faithfulCols: []string{"c"}}
 		src := map[string][]sql.NullString{"c": {ns("a"), ns("b")}}
 		dst := map[string][]sql.NullString{"c": {ns("a")}}
-		v, _ := classify(gc, ce, nil, 1, src, dst)
-		if v != verdictFail {
+		v, _ := Classify(gc, ce, nil, 1, src, dst)
+		if v != VerdictFail {
 			t.Error("expected FAIL on row-count mismatch")
 		}
 	})
@@ -424,16 +424,16 @@ func TestOracle_ExpectationFor(t *testing.T) {
 	for _, f := range registry() {
 		byName[f.name] = f
 	}
-	gc := &genCase{
-		dir: direction{enginePG, enginePG},
+	gc := &Case{
+		Dir: Direction{EnginePG, EnginePG},
 		columns: []genColumn{
 			{name: "a", fam: byName["int32"], shp: shapeScalar},   // faithful
 			{name: "b", fam: byName["timetz"], shp: shape1DArray}, // loud-refuse
 			{name: "c", fam: byName["int8"], shp: shapeScalar},    // faithful
 		},
 	}
-	ce := expectationFor(gc)
-	if !ce.loudRefuse {
+	ce := ExpectationFor(gc)
+	if !ce.LoudRefuse {
 		t.Error("a case containing timetz[] PG→PG must expect a loud refusal")
 	}
 	if ce.reason == "" {
@@ -443,15 +443,15 @@ func TestOracle_ExpectationFor(t *testing.T) {
 	// Cross-engine (PG→MySQL): every column is lossy-documented per the
 	// Phase-1 scope, so NO faithful columns and NOT a refusal — the
 	// oracle will only assert migrate-succeeds + column-exists.
-	gc2 := &genCase{
-		dir: direction{enginePG, engineMySQL},
+	gc2 := &Case{
+		Dir: Direction{EnginePG, EngineMySQL},
 		columns: []genColumn{
 			{name: "a", fam: byName["int32"], shp: shapeScalar},
 			{name: "b", fam: byName["numeric_unconstrained"], shp: shapeScalar},
 		},
 	}
-	ce2 := expectationFor(gc2)
-	if ce2.loudRefuse {
+	ce2 := ExpectationFor(gc2)
+	if ce2.LoudRefuse {
 		t.Error("PG→MySQL unconstrained numeric is lossy-documented, NOT a refusal")
 	}
 	if len(ce2.faithfulCols) != 0 {
@@ -461,15 +461,15 @@ func TestOracle_ExpectationFor(t *testing.T) {
 	// Same-engine (PG→PG): faithful columns ARE compared; the lossy/
 	// refuse families collapse to faithful same-engine (except a
 	// genuine same-engine loud-refuse like timetz[]).
-	gc3 := &genCase{
-		dir: direction{enginePG, enginePG},
+	gc3 := &Case{
+		Dir: Direction{EnginePG, EnginePG},
 		columns: []genColumn{
 			{name: "a", fam: byName["int32"], shp: shapeScalar},
 			{name: "b", fam: byName["numeric_unconstrained"], shp: shapeScalar},
 		},
 	}
-	ce3 := expectationFor(gc3)
-	if ce3.loudRefuse {
+	ce3 := ExpectationFor(gc3)
+	if ce3.LoudRefuse {
 		t.Error("PG→PG int32 + unconstrained numeric must NOT be a refusal")
 	}
 	if len(ce3.faithfulCols) != 2 {
@@ -486,8 +486,8 @@ func TestOracle_FaithfulColumnsFor(t *testing.T) {
 	for _, f := range registry() {
 		byName[f.name] = f
 	}
-	gc := &genCase{
-		dir: direction{enginePG, engineMySQL},
+	gc := &Case{
+		Dir: Direction{EnginePG, EngineMySQL},
 		columns: []genColumn{
 			{name: "a", fam: byName["int32"], shp: shapeScalar},
 			{name: "b", fam: byName["numeric_unconstrained"], shp: shapeScalar},
@@ -497,17 +497,17 @@ func TestOracle_FaithfulColumnsFor(t *testing.T) {
 	}
 	// Cross-engine: NOTHING is text-compared (every family is
 	// lossy-documented in Phase 1 — the #16-safe stance).
-	if got := faithfulColumnsFor(gc); len(got) != 0 {
-		t.Errorf("PG→MySQL faithfulColumnsFor = %v; want empty (cross-engine lossy-documented)", got)
+	if got := FaithfulColumnsFor(gc); len(got) != 0 {
+		t.Errorf("PG→MySQL FaithfulColumnsFor = %v; want empty (cross-engine lossy-documented)", got)
 	}
 
 	// Same-engine PG→PG: the non-refuse columns ARE compared; timetz[]
 	// is a loud-refuse and must be excluded from the compared set.
-	gc.dir = direction{enginePG, enginePG}
-	got := faithfulColumnsFor(gc)
+	gc.Dir = Direction{EnginePG, EnginePG}
+	got := FaithfulColumnsFor(gc)
 	want := map[string]bool{"a": true, "b": true, "c": true}
 	if len(got) != len(want) {
-		t.Fatalf("PG→PG faithfulColumnsFor = %v; want %v (timetz[] excluded as loud-refuse)", got, want)
+		t.Fatalf("PG→PG FaithfulColumnsFor = %v; want %v (timetz[] excluded as loud-refuse)", got, want)
 	}
 	for _, c := range got {
 		if c == "d" {
@@ -532,15 +532,15 @@ func TestRegistry_SQLiteSourceScope(t *testing.T) {
 	}
 	for _, f := range registry() {
 		if want[f.name] {
-			if !f.canSource(engineSQLite, shapeScalar) {
+			if !f.canSource(EngineSQLite, shapeScalar) {
 				t.Errorf("family %q must be a SQLite source (scalar)", f.name)
 			}
-			if f.canSource(engineSQLite, shape1DArray) || f.canSource(engineSQLite, shapeMultiDim) {
+			if f.canSource(EngineSQLite, shape1DArray) || f.canSource(EngineSQLite, shapeMultiDim) {
 				t.Errorf("family %q: SQLite has no array type — scalar only", f.name)
 			}
 			continue
 		}
-		if f.sqType != "" || f.canSource(engineSQLite, shapeScalar) {
+		if f.sqType != "" || f.canSource(EngineSQLite, shapeScalar) {
 			t.Errorf("family %q must NOT be a SQLite source (documented exclusion — see registry())", f.name)
 		}
 	}
@@ -555,15 +555,15 @@ func TestRegistry_SQLiteExpectations(t *testing.T) {
 	for _, f := range registry() {
 		byName[f.name] = f
 	}
-	sqToPG := direction{engineSQLite, enginePG}
-	sqToMy := direction{engineSQLite, engineMySQL}
-	pgToSQ := direction{enginePG, engineSQLite}
-	myToSQ := direction{engineMySQL, engineSQLite}
+	sqToPG := Direction{EngineSQLite, EnginePG}
+	sqToMy := Direction{EngineSQLite, EngineMySQL}
+	pgToSQ := Direction{EnginePG, EngineSQLite}
+	myToSQ := Direction{EngineMySQL, EngineSQLite}
 
 	// SQLite as a SOURCE is always cross-engine here → lossy-documented
 	// for every family (never text-compared, never a refusal).
 	for _, fam := range []string{"int64", "float8", "bool", "text", "blob", "date", "time", "timestamp"} {
-		for _, d := range []direction{sqToPG, sqToMy} {
+		for _, d := range []Direction{sqToPG, sqToMy} {
 			if got := expectedOutcome(byName[fam], d, shapeScalar); got != outcomeLossyDocument {
 				t.Errorf("%s %s scalar: got %s; want lossy-documented (cross-engine scope)", fam, d, got)
 			}
@@ -617,10 +617,10 @@ func TestRegistry_SQLiteExpectations(t *testing.T) {
 
 	// And the PG/MySQL matrix is untouched by the central lookup: it
 	// delegates to the per-family closures.
-	if got := expectedOutcome(byName["int32"], direction{enginePG, enginePG}, shapeScalar); got != outcomeFaithful {
+	if got := expectedOutcome(byName["int32"], Direction{EnginePG, EnginePG}, shapeScalar); got != outcomeFaithful {
 		t.Errorf("int32 pg->pg through expectedOutcome: got %s; want faithful", got)
 	}
-	if got := expectedOutcome(byName["timetz"], direction{enginePG, enginePG}, shape1DArray); got != outcomeLoudRefuse {
+	if got := expectedOutcome(byName["timetz"], Direction{EnginePG, EnginePG}, shape1DArray); got != outcomeLoudRefuse {
 		t.Errorf("timetz[] pg->pg through expectedOutcome: got %s; want loud-refuse", got)
 	}
 }
@@ -631,8 +631,8 @@ func TestRegistry_SQLiteExpectations(t *testing.T) {
 // generated column is scalar.
 func TestGenerator_SQLiteDialect(t *testing.T) {
 	for idx := 0; idx < 40; idx++ {
-		for _, d := range []direction{{engineSQLite, enginePG}, {engineSQLite, engineMySQL}} {
-			gc := generateCase(424242, idx, d)
+		for _, d := range []Direction{{EngineSQLite, EnginePG}, {EngineSQLite, EngineMySQL}} {
+			gc := GenerateCase(424242, idx, d)
 			if len(gc.columns) == 0 {
 				t.Fatalf("[%s case %d] zero columns generated (fallback broken for the narrower SQLite registry)", d, idx)
 			}
@@ -653,9 +653,9 @@ func TestGenerator_SQLiteDialect(t *testing.T) {
 					}
 				}
 			}
-			if strings.Contains(gc.ddl, "::") || strings.Contains(gc.ddl, "ARRAY[") ||
-				strings.Contains(gc.ddl, "ENGINE=") {
-				t.Errorf("[%s case %d] SQLite source script contains foreign dialect:\n%s", d, idx, gc.ddl)
+			if strings.Contains(gc.DDL, "::") || strings.Contains(gc.DDL, "ARRAY[") ||
+				strings.Contains(gc.DDL, "ENGINE=") {
+				t.Errorf("[%s case %d] SQLite source script contains foreign dialect:\n%s", d, idx, gc.DDL)
 			}
 		}
 	}
@@ -667,11 +667,11 @@ func TestGenerator_SQLiteDialect(t *testing.T) {
 // dominate — a healthy share of cases must expect SUCCESS, or the SQLite
 // write path is never value-fuzzed.
 func TestGenerator_SQLiteTargetBias(t *testing.T) {
-	for _, d := range []direction{{enginePG, engineSQLite}, {engineMySQL, engineSQLite}} {
+	for _, d := range []Direction{{EnginePG, EngineSQLite}, {EngineMySQL, EngineSQLite}} {
 		refuse, success := 0, 0
 		for idx := 0; idx < 200; idx++ {
-			gc := generateCase(31337, idx, d)
-			if expectationFor(&gc).loudRefuse {
+			gc := GenerateCase(31337, idx, d)
+			if ExpectationFor(&gc).LoudRefuse {
 				refuse++
 			} else {
 				success++

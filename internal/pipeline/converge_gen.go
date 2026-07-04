@@ -112,6 +112,30 @@ import (
 	"pgregory.net/rapid"
 )
 
+// engineKind is the converge harness's engine axis — PG and MySQL,
+// the two engines the four convDirections span. It was originally
+// shared with the migrate fuzz harness's registry; when that machinery
+// moved to internal/pipeline/internal/fuzzgen (repo-audit 2026-07-03
+// finding A-3), this harness kept a minimal local copy rather than
+// importing the fuzz package back into the shipped pipeline compile
+// unit. (fuzzgen.EngineKind additionally carries SQLite, which the
+// converge property deliberately does not cover — no CDC source there.)
+type engineKind int
+
+const (
+	enginePG engineKind = iota
+	engineMySQL
+)
+
+// String renders the engine name convDirection.String() embeds in
+// case labels and replayable-script headers ("postgres->mysql").
+func (e engineKind) String() string {
+	if e == enginePG {
+		return "postgres"
+	}
+	return "mysql"
+}
+
 // convPKSpace is the PK keyspace (1..convPKSpace). Deliberately tiny
 // so deletes free PKs that later inserts reuse — the PK-reuse
 // interleaving falls out of the generator naturally instead of

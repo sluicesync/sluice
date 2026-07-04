@@ -32,23 +32,23 @@
 // No build tag on the pure classification helpers; the DB reads use
 // database/sql only and are invoked from the integration driver.
 
-package pipeline
+package fuzzgen
 
 import (
 	"database/sql"
 	"fmt"
 )
 
-// caseExpectation is the reduced, whole-case expectation derived from
+// Expectation is the reduced, whole-case expectation derived from
 // the per-column families: the worst (most permissive) outcome that any
 // column in the case justifies, plus the set of columns that are
 // faithfully comparable.
-type caseExpectation struct {
-	// loudRefuse is true iff at least one column's expected outcome for
+type Expectation struct {
+	// LoudRefuse is true iff at least one column's expected outcome for
 	// this direction+shape is outcomeLoudRefuse. A single loud-refuse
 	// column makes the whole migrate refuse (it aborts before any
 	// target rows) — so the whole case is expected to refuse.
-	loudRefuse bool
+	LoudRefuse bool
 
 	// faithfulCols are the column names whose expected outcome is
 	// outcomeFaithful and which must therefore compare src==dst exactly.
@@ -59,21 +59,21 @@ type caseExpectation struct {
 	reason string
 }
 
-// expectationFor reduces a genCase to its whole-case expectation. This
+// ExpectationFor reduces a Case to its whole-case expectation. This
 // is the known-loud-refuse SET, derived entirely from the per-family
 // expect() closures (which are themselves sourced from
 // docs/type-mapping.md + the catalogued cross-engine limitations — see
-// fuzzgen_registry.go). The harness never hard-codes a refuse list
+// registry.go). The harness never hard-codes a refuse list
 // here; the registry is the single source of truth.
-func expectationFor(gc *genCase) caseExpectation {
-	var ce caseExpectation
+func ExpectationFor(gc *Case) Expectation {
+	var ce Expectation
 	for _, c := range gc.columns {
-		switch expectedOutcome(c.fam, gc.dir, c.shp) {
+		switch expectedOutcome(c.fam, gc.Dir, c.shp) {
 		case outcomeLoudRefuse:
-			ce.loudRefuse = true
+			ce.LoudRefuse = true
 			if ce.reason == "" {
 				ce.reason = fmt.Sprintf("%s %s (%s) is a documented loud-refuse for %s",
-					c.name, c.fam.name, c.shp, gc.dir)
+					c.name, c.fam.name, c.shp, gc.Dir)
 			}
 		case outcomeFaithful:
 			ce.faithfulCols = append(ce.faithfulCols, c.name)
@@ -87,22 +87,25 @@ func expectationFor(gc *genCase) caseExpectation {
 	return ce
 }
 
-// fuzzRowCountKey is the pseudo-column under which readCanonical (the
+// RowCountKey is the pseudo-column under which readCanonical (the
 // integration driver) reports per-row presence when a case has NO
 // faithfully-comparable columns — the cross-engine regime, where the
 // canonical text is engine-specific but a silent ROW loss must still be
-// caught. classify compares its cell counts.
-const fuzzRowCountKey = "__rowcount__"
+// caught. Classify compares its cell counts.
+const RowCountKey = "__rowcount__"
 
-// verdict is the harness's classification of one executed case.
-type verdict int
+// Verdict is the harness's classification of one executed case.
+type Verdict int
 
+// VerdictPass and VerdictFail are the two ways a case can land: a PASS
+// covers faithful src==dst, a documented lossy degradation, and a
+// documented loud refusal with no partial target; everything else FAILs.
 const (
-	verdictPass verdict = iota
-	verdictFail
+	VerdictPass Verdict = iota
+	VerdictFail
 )
 
-// classify applies the three-outcome truth table. migErr is the error
+// Classify applies the three-outcome truth table. migErr is the error
 // returned by Migrator.Run (nil == exit 0). src/dst are the canonical
 // text reads keyed by column name → per-row values; targetRowCount is
 // the number of rows present in the target table (<0 == table absent),
@@ -118,33 +121,33 @@ const (
 // a target with ROWS (real partial data — the corruption signature),
 // NOT the mere existence of an empty table. An empty table after a
 // documented refuse-at-copy is the contracted behaviour, not a defect.
-func classify(
-	gc *genCase,
-	ce caseExpectation,
+func Classify(
+	gc *Case,
+	ce Expectation,
 	migErr error,
 	targetRowCount int,
 	src, dst map[string][]sql.NullString,
-) (v verdict, diag string) {
-	if ce.loudRefuse {
+) (v Verdict, diag string) {
+	if ce.LoudRefuse {
 		// Expected a loud refusal.
 		if migErr == nil {
-			return verdictFail, fmt.Sprintf(
+			return VerdictFail, fmt.Sprintf(
 				"UNEXPECTED SUCCESS: %s — expected a loud refusal but migrate exited 0 (silent corruption risk)",
 				ce.reason,
 			)
 		}
 		if targetRowCount > 0 {
-			return verdictFail, fmt.Sprintf(
+			return VerdictFail, fmt.Sprintf(
 				"PARTIAL TARGET DATA: %s — migrate refused (good) but %d row(s) reached the target (partial data is a FAIL)",
 				ce.reason, targetRowCount,
 			)
 		}
-		return verdictPass, "loud-refuse as documented (no partial data): " + ce.reason
+		return VerdictPass, "loud-refuse as documented (no partial data): " + ce.reason
 	}
 
 	// Not a loud-refuse case → migrate must succeed.
 	if migErr != nil {
-		return verdictFail, fmt.Sprintf(
+		return VerdictFail, fmt.Sprintf(
 			"UNEXPECTED REFUSAL: migrate errored on a case with no documented loud-refuse column (the v0.69.0 #16 false-positive class): %v",
 			migErr,
 		)
@@ -152,19 +155,19 @@ func classify(
 
 	// Faithful columns must compare src==dst exactly via canonical text.
 	if len(src) == 0 && len(gc.columns) > 0 {
-		return verdictFail, "migrate exited 0 but the source read returned no rows (harness/source error)"
+		return VerdictFail, "migrate exited 0 but the source read returned no rows (harness/source error)"
 	}
 	if len(dst) != len(src) {
-		return verdictFail, fmt.Sprintf(
+		return VerdictFail, fmt.Sprintf(
 			"ROW COUNT MISMATCH: src has %d rows, dst has %d (silent loss)", len(src), len(dst),
 		)
 	}
 	// The cross-engine (no-faithful-columns) regime reports row presence
-	// under fuzzRowCountKey — a src/dst cell-count skew there is a silent
+	// under RowCountKey — a src/dst cell-count skew there is a silent
 	// ROW loss even though no value is text-comparable.
-	if sc, ok := src[fuzzRowCountKey]; ok {
-		if dc := dst[fuzzRowCountKey]; len(dc) != len(sc) {
-			return verdictFail, fmt.Sprintf(
+	if sc, ok := src[RowCountKey]; ok {
+		if dc := dst[RowCountKey]; len(dc) != len(sc) {
+			return VerdictFail, fmt.Sprintf(
 				"ROW COUNT MISMATCH: src has %d rows, dst has %d (silent loss)", len(sc), len(dc),
 			)
 		}
@@ -176,13 +179,13 @@ func classify(
 		}
 		dv := dst[col]
 		if len(dv) != len(sv) {
-			return verdictFail, fmt.Sprintf(
+			return VerdictFail, fmt.Sprintf(
 				"col %s: src %d cells, dst %d cells (silent loss)", col, len(sv), len(dv),
 			)
 		}
 		for i := range sv {
 			if sv[i] != dv[i] {
-				return verdictFail, fmt.Sprintf(
+				return VerdictFail, fmt.Sprintf(
 					"MISMATCH col %s row %d: src=%q dst=%q "+
 						"(silent loss / flatten / corruption — faithful round-trip expected)",
 					col, i, nullStr(sv[i]), nullStr(dv[i]),
@@ -190,7 +193,7 @@ func classify(
 			}
 		}
 	}
-	return verdictPass, ""
+	return VerdictPass, ""
 }
 
 func nullStr(n sql.NullString) string {
@@ -200,14 +203,14 @@ func nullStr(n sql.NullString) string {
 	return n.String
 }
 
-// faithfulColumnsFor returns the subset of gc's columns whose expected
-// outcome is faithful for gc.dir — the columns the oracle compares
+// FaithfulColumnsFor returns the subset of gc's columns whose expected
+// outcome is faithful for gc.Dir — the columns the oracle compares
 // src==dst. Pure logic (unit-tested); the DB read that consumes it
 // lives in the integration driver.
-func faithfulColumnsFor(gc *genCase) []string {
+func FaithfulColumnsFor(gc *Case) []string {
 	var out []string
 	for _, c := range gc.columns {
-		if expectedOutcome(c.fam, gc.dir, c.shp) == outcomeFaithful {
+		if expectedOutcome(c.fam, gc.Dir, c.shp) == outcomeFaithful {
 			out = append(out, c.name)
 		}
 	}
