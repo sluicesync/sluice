@@ -81,6 +81,28 @@ rows); a value near `1` means the workload alternates kinds or has no
 runs to coalesce, so apply stays RTT-bound — in that case widen
 `--apply-concurrency` instead.
 
+## MySQL bulk-load INSERT batching (automatic, no flag)
+
+The bulk-copy counterpart to the coalescing above
+([ADR-0150](adr/adr-0150-mysql-byte-targeted-insert-batching.md)). On
+MySQL-flavor targets that can't take `LOAD DATA` — **PlanetScale/Vitess
+always** (no `LOAD DATA` support), vanilla MySQL when `local_infile=OFF`
+or a geometry column forces the fallback, and every idempotent write
+(resume, chunked copy, sync cold-start COPY) — bulk rows land via
+multi-row INSERT statements. Those statements are composed to a
+**~1 MiB estimated statement body** (the pscale-dumper's battle-tested
+size) rather than the old fixed 500 rows, which amortizes 10–20× more
+payload per WAN round trip on narrow-row tables. As with coalescing,
+every value still binds through the identical per-value codec — only the
+number of placeholder groups grows. `--max-buffer-bytes` below 1 MiB
+lowers the per-statement size; there is no knob to raise it.
+
+**PlanetScale tier ceiling.** When bulk-loading a PlanetScale target,
+sluice logs one INFO noting that writes there are **tier-CPU-bound, not
+connection-bound** (a PS-10 pins at 100% CPU under a two-wide copy;
+ADR-0116). Raising copy parallelism past the automatic budget will not
+scale throughput linearly — a larger tier (or Metal) is the real lever.
+
 ## Sync cold-start cross-table parallelism (per source flavor)
 
 `sluice sync start`'s initial cold-start copy parallelizes across tables like `sluice migrate` does, but the mechanism — and the default — depends on the source flavor, because each flavor has a different consistency story for "N readers, one CDC handoff position":
@@ -198,4 +220,5 @@ for the full rationale and the audit of where memory accumulates.
 - [ADR-0106 — Fast-by-default adaptive `--apply-concurrency`](adr/adr-0106-default-adaptive-apply-concurrency.md)
 - [ADR-0138 — Pipeline the concurrent PG apply lanes](adr/adr-0138-pipeline-concurrent-apply-lanes.md)
 - [ADR-0139 — MySQL multi-row INSERT coalescing](adr/adr-0139-mysql-multirow-insert-apply.md)
+- [ADR-0150 — Byte-targeted ~1 MiB INSERT batching for the MySQL bulk-load path](adr/adr-0150-mysql-byte-targeted-insert-batching.md)
 - [ADR-0140 — MySQL UPDATE/DELETE apply coalescing](adr/adr-0140-mysql-coalesce-update-delete-apply.md)

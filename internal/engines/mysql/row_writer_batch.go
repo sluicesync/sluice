@@ -272,10 +272,10 @@ func (w *RowWriter) WriteRowsParallel(ctx context.Context, table *ir.Table, work
 }
 
 // writeBatchedIdempotent is the upsert-form of [writeBatched]. The
-// per-batch flush mechanics are identical (flush on whichever of
-// row-count cap and byte-size cap fires first; ADR-0028); only the
-// SQL changes. It pins one connection and delegates the loop to
-// [writeBatchedIdempotentConn].
+// per-batch flush mechanics are identical (byte-targeted ~1 MiB
+// statements with the row-count safety ceiling, ADR-0150 — see
+// [RowWriter.newInsertBatcher]); only the SQL changes. It pins one
+// connection and delegates the loop to [writeBatchedIdempotentConn].
 func (w *RowWriter) writeBatchedIdempotent(ctx context.Context, table *ir.Table, rows <-chan ir.Row) error {
 	// Bug 125: the conflict key the upsert keys on is the table's PK
 	// when present, else a deterministic non-null UNIQUE index. MySQL's
@@ -331,23 +331,15 @@ func (w *RowWriter) writeBatchedIdempotent(ctx context.Context, table *ir.Table,
 // first-N exhaustive flushes and the final flush). No shared mutable
 // batch state crosses workers.
 func (w *RowWriter) writeBatchedIdempotentConn(ctx context.Context, conn *sql.Conn, table *ir.Table, keyCols []string, rows <-chan ir.Row, reportDurable bool) error {
-	limit := w.maxRowsPerBatch
-	if limit <= 0 {
-		limit = defaultMaxRowsPerBatch
-	}
-	byteCap := w.maxBufferBytes
-	if byteCap <= 0 {
-		byteCap = defaultMaxBufferBytes
-	}
+	w.noteTierCPUBoundTarget(ctx)
+	batch := w.newInsertBatcher(table)
 
-	batch := make([]ir.Row, 0, limit)
-	var batchBytes int64
 	flush := func() error {
-		if len(batch) == 0 {
+		if batch.empty() {
 			return nil
 		}
-		query := buildBatchUpsert(table, len(batch), keyCols)
-		args := flattenArgs(batch, table)
+		query := buildBatchUpsert(table, len(batch.rows), keyCols)
+		args := flattenArgs(batch.rows, table)
 		// ADR-0108: ride a transient target primary-reparent / "not
 		// serving". The exec + the session-scoped SHOW WARNINGS probe BOTH
 		// run on the conn flushWithReparentRetry hands us — the originally
@@ -356,9 +348,9 @@ func (w *RowWriter) writeBatchedIdempotentConn(ctx context.Context, conn *sql.Co
 		// never reused. The idempotent UPSERT absorbs an ambiguous-commit
 		// replay natively, so no 1062-on-retry tolerance is needed here
 		// (contrast the plain path's wart).
-		if err := w.flushWithReparentRetry(ctx, table.Name, len(batch), func(c *sql.Conn, _ bool) error {
+		if err := w.flushWithReparentRetry(ctx, table.Name, len(batch.rows), func(c *sql.Conn, _ bool) error {
 			if _, err := c.ExecContext(ctx, query, args...); err != nil {
-				return fmt.Errorf("mysql: idempotent insert into %q (%d rows): %w", table.Name, len(batch), err)
+				return fmt.Errorf("mysql: idempotent insert into %q (%d rows): %w", table.Name, len(batch.rows), err)
 			}
 			// Vector B: strict sql_mode errors at the upsert above; under
 			// --mysql-sql-mode='' MySQL silently clamps and only flags the
@@ -378,10 +370,12 @@ func (w *RowWriter) writeBatchedIdempotentConn(ctx context.Context, conn *sql.Co
 		// enqueue order, so a mid-COPY breadcrumb could land past an
 		// un-flushed early row (silent-loss-on-resume; ADR-0097 §3).
 		if reportDurable && w.copyDurableProgress != nil {
-			w.copyDurableProgress(int64(len(batch)))
+			w.copyDurableProgress(int64(len(batch.rows)))
 		}
-		batch = batch[:0]
-		batchBytes = 0
+		if bulkFlushHookForTest != nil {
+			bulkFlushHookForTest(len(batch.rows), batch.bytes)
+		}
+		batch.reset()
 		return nil
 	}
 
@@ -391,9 +385,8 @@ func (w *RowWriter) writeBatchedIdempotentConn(ctx context.Context, conn *sql.Co
 			if !ok {
 				return flush()
 			}
-			batch = append(batch, row)
-			batchBytes += ir.ApproximateRowBytes(row)
-			if len(batch) >= limit || batchBytes >= byteCap {
+			batch.add(row)
+			if batch.full() {
 				if err := flush(); err != nil {
 					return err
 				}

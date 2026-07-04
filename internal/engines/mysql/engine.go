@@ -172,6 +172,10 @@ func (e Engine) OpenRowWriter(ctx context.Context, dsn string) (ir.RowWriter, er
 		db:       db,
 		schema:   cfg.DBName,
 		bulkLoad: e.Capabilities().BulkLoad,
+		// ADR-0150 companion hint: only the HOSTED PlanetScale flavor
+		// is tier-CPU-bound (self-hosted vitess runs on the operator's
+		// own hardware, so the PS-tier ceiling doesn't apply).
+		tierCPUBoundTarget: e.Flavor == FlavorPlanetScale,
 	}, nil
 }
 

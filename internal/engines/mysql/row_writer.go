@@ -18,19 +18,27 @@ import (
 )
 
 // defaultMaxRowsPerBatch caps how many rows go into a single INSERT
-// statement. The cap is conservative to stay well under MySQL's
-// default max_allowed_packet (16 MiB pre-8.0, 64 MiB on 8.0+) for
-// realistic row sizes; tables with very wide rows can override.
-//
-// PlanetScale's pscale-cli dumper batches by ~1 MB of statement
-// body rather than row count; v0.7.0's --max-buffer-bytes is the
-// byte-driven cap that fires alongside the row-count cap (ADR-0028).
-const defaultMaxRowsPerBatch = 500
+// statement — a SAFETY CEILING, not the primary flush trigger. Since
+// ADR-0150 the batched bulk paths flush on the ~1 MiB estimated
+// statement byte target (defaultStatementByteTarget, the pscale-dumper
+// size — see row_writer_bytebatch.go), so this cap only binds for rows
+// so narrow that ten thousand of them still sit under the byte target;
+// it bounds per-batch heap and statement parse cost. It was 500 —
+// the pre-ADR-0150 primary trigger — which capped narrow-row
+// statements at 50–100 KB and left 10–20× of WAN round-trip
+// amortization unused on PlanetScale (the flavor with no LOAD DATA,
+// where batched INSERT IS the bulk-load path). The placeholder bound
+// (maxBulkInsertPlaceholders / columns) clamps it further for wide
+// tables; tests can override via maxRowsPerBatch.
+const defaultMaxRowsPerBatch = 10000
 
 // defaultMaxBufferBytes is the soft per-batch byte cap when the
 // caller doesn't set one explicitly. Bounds heap usage at ~64 MiB
 // for wide-row workloads; tunable via --max-buffer-bytes. See
-// ADR-0028.
+// ADR-0028. The batched bulk-INSERT paths now flush far earlier on
+// the ADR-0150 ~1 MiB statement byte target; this cap remains the
+// accumulation bound for the CDC apply-batch paths
+// (change_applier_batch.go / change_applier_concurrent.go).
 const defaultMaxBufferBytes int64 = 64 << 20 // 64 MiB
 
 // RowWriter performs bulk inserts into MySQL tables. It implements
@@ -63,14 +71,25 @@ type RowWriter struct {
 	// is used.
 	maxRowsPerBatch int
 
-	// maxBufferBytes is the soft byte-size cap on per-batch buffered
-	// row values for the BatchedInsert path. Implements
-	// [ir.MaxBufferBytesSetter] via [SetMaxBufferBytes]. Zero or
-	// negative means "no byte cap"; the row-count cap remains the
-	// only flush trigger. The LOAD DATA path is already streaming
+	// maxBufferBytes is the operator's byte-size cap on per-batch
+	// buffered row values for the BatchedInsert path. Implements
+	// [ir.MaxBufferBytesSetter] via [SetMaxBufferBytes]. Since
+	// ADR-0150 the batched paths flush on the ~1 MiB statement byte
+	// target (defaultStatementByteTarget); a value here BELOW that
+	// target lowers the effective per-statement byte trigger, while
+	// zero/negative or a larger value leaves the target in charge
+	// (the target already sits far under the ADR-0028 64 MiB
+	// accumulation default). The LOAD DATA path is already streaming
 	// (rows go through an io.Pipe to the driver) and is unaffected.
-	// See ADR-0028.
 	maxBufferBytes int64
+
+	// tierCPUBoundTarget marks a hosted-PlanetScale-flavor target;
+	// the first batched bulk flush per writer emits the ADR-0150
+	// tier-CPU-ceiling operator hint (see [noteTierCPUBoundTarget]).
+	// Set at [Engine.OpenRowWriter]; false on every other path, which
+	// makes the zero value the safe/silent default.
+	tierCPUBoundTarget bool
+	tierHintOnce       sync.Once
 
 	// copyDurableProgress is the durable-write reporter the cold-start
 	// COPY path wires (v0.99.9). When set, the idempotent batch writer
@@ -154,9 +173,10 @@ func (w *RowWriter) SetCopyDurableProgress(report ir.CopyDurableProgressFunc) {
 
 // SetMaxBufferBytes implements [ir.MaxBufferBytesSetter]. The
 // orchestrator calls this after [Engine.OpenRowWriter] returns when
-// --max-buffer-bytes is set, before WriteRows runs. Zero or negative
-// means "no byte cap"; the row-count cap remains the only flush
-// trigger.
+// --max-buffer-bytes is set, before WriteRows runs. A value below the
+// ADR-0150 ~1 MiB statement byte target lowers the effective
+// per-statement flush trigger; zero/negative or a larger value leaves
+// the target in charge (see the maxBufferBytes field comment).
 func (w *RowWriter) SetMaxBufferBytes(bytes int64) {
 	w.maxBufferBytes = bytes
 }
@@ -438,18 +458,20 @@ func (w *RowWriter) WriteRows(ctx context.Context, table *ir.Table, rows <-chan 
 	}
 }
 
-// writeBatched buffers rows up to maxRowsPerBatch and flushes them as
-// a single multi-row INSERT statement using parameter placeholders.
-// Letting the driver handle parameter encoding sidesteps the
-// per-type escaping problems that custom SQL generation would face.
+// writeBatched buffers rows and flushes them as a single multi-row
+// INSERT statement using parameter placeholders. Letting the driver
+// handle parameter encoding sidesteps the per-type escaping problems
+// that custom SQL generation would face.
 //
-// The flush trigger fires on whichever cap hits first: the row-count
-// cap (maxRowsPerBatch) or the byte-size cap (maxBufferBytes,
-// ADR-0028). The byte cap is a soft target — a single row larger
-// than the cap still applies (the row's already in `batch` when the
-// post-append check fires); the cap bounds *accumulation*, not
-// individual rows. This matches what pscale-cli's batcher does:
-// flush at ~1 MB of statement body rather than a fixed row count.
+// The flush trigger (ADR-0150): the batch flushes when the ESTIMATED
+// statement value bytes reach the ~1 MiB byte target — what
+// pscale-cli's batcher does, the primary trigger — or on the row-count
+// safety ceiling, whichever fires first (see [RowWriter.newInsertBatcher]
+// for the full trigger derivation incl. the placeholder bound). The
+// byte target is soft: a single row larger than it still ships as a
+// one-row statement (the row's already in the batch when the
+// post-append check fires); the target bounds *accumulation*, not
+// individual rows — rows are never split and never refused for size.
 func (w *RowWriter) writeBatched(ctx context.Context, table *ir.Table, rows <-chan ir.Row) error {
 	// Pin a single connection for the whole batched write so the
 	// post-flush warning check (Vector B) reads SHOW WARNINGS on the SAME
@@ -484,34 +506,25 @@ func (w *RowWriter) writeBatched(ctx context.Context, table *ir.Table, rows <-ch
 // (defensible: a systematic clamp still trips every worker's first-N
 // exhaustive flushes and its final flush).
 func (w *RowWriter) writeBatchedConn(ctx context.Context, conn *sql.Conn, table *ir.Table, rows <-chan ir.Row) error {
-	limit := w.maxRowsPerBatch
-	if limit <= 0 {
-		limit = defaultMaxRowsPerBatch
-	}
-	byteCap := w.maxBufferBytes
-	if byteCap <= 0 {
-		byteCap = defaultMaxBufferBytes
-	}
-
-	batch := make([]ir.Row, 0, limit)
-	var batchBytes int64
+	w.noteTierCPUBoundTarget(ctx)
+	batch := w.newInsertBatcher(table)
 	flushes := 0
 
 	// final=true on the channel-close flush: the table's last flush is
 	// always checked regardless of the sampling schedule below.
 	flush := func(final bool) error {
-		if len(batch) == 0 {
+		if batch.empty() {
 			return nil
 		}
-		query := buildBatchInsert(table, len(batch))
-		args := flattenArgs(batch, table)
+		query := buildBatchInsert(table, len(batch.rows))
+		args := flattenArgs(batch.rows, table)
 		// ADR-0108: ride a transient target primary-reparent / "not
 		// serving". The exec + the session-scoped SHOW WARNINGS probe BOTH
 		// run on the conn flushWithReparentRetry hands us — the originally
 		// pinned conn on the first try, a FRESH pool conn (reconnected to
 		// the new primary) on every retry. The dead post-reparent conn is
 		// never reused.
-		if err := w.flushWithReparentRetry(ctx, table.Name, len(batch), func(c *sql.Conn, isRetry bool) error {
+		if err := w.flushWithReparentRetry(ctx, table.Name, len(batch.rows), func(c *sql.Conn, isRetry bool) error {
 			if _, err := c.ExecContext(ctx, query, args...); err != nil {
 				// WART: tolerate-1062-on-retry (ADR-0108). A plain cold-copy
 				// batch is a SINGLE atomic multi-row INSERT. On a classified
@@ -535,11 +548,11 @@ func (w *RowWriter) writeBatchedConn(ctx context.Context, conn *sql.Conn, table 
 							"the prior attempt committed but lost its ack across the transient — the rows already landed, "+
 							"treating this byte-identical batch as durable (ADR-0108 tolerate-1062-on-retry)",
 						slog.String("table", table.Name),
-						slog.Int("rows", len(batch)),
+						slog.Int("rows", len(batch.rows)),
 					)
 					return nil
 				}
-				return fmt.Errorf("mysql: insert into %q (%d rows): %w", table.Name, len(batch), err)
+				return fmt.Errorf("mysql: insert into %q (%d rows): %w", table.Name, len(batch.rows), err)
 			}
 			// Strict sql_mode rejects an out-of-range value at the INSERT
 			// above (loud already); under --mysql-sql-mode='' MySQL silently
@@ -559,8 +572,10 @@ func (w *RowWriter) writeBatchedConn(ctx context.Context, conn *sql.Conn, table 
 		}, conn); err != nil {
 			return err
 		}
-		batch = batch[:0]
-		batchBytes = 0
+		if bulkFlushHookForTest != nil {
+			bulkFlushHookForTest(len(batch.rows), batch.bytes)
+		}
+		batch.reset()
 		return nil
 	}
 
@@ -570,9 +585,8 @@ func (w *RowWriter) writeBatchedConn(ctx context.Context, conn *sql.Conn, table 
 			if !ok {
 				return flush(true)
 			}
-			batch = append(batch, row)
-			batchBytes += ir.ApproximateRowBytes(row)
-			if len(batch) >= limit || batchBytes >= byteCap {
+			batch.add(row)
+			if batch.full() {
 				if err := flush(false); err != nil {
 					return err
 				}
@@ -586,9 +600,11 @@ func (w *RowWriter) writeBatchedConn(ctx context.Context, conn *sql.Conn, table 
 // Warning-check sampling schedule for the batched-INSERT bulk path
 // (repo-audit M3.5). SHOW WARNINGS is a full round-trip per flush; on
 // a cross-region PlanetScale target (~50 ms RTT) — the engine that can
-// ONLY use batched INSERT — checking every ≤500-row flush adds up to
-// ~2× per-flush latency (a 19M-row table is ~38k flushes ≈ ~30 min of
-// pure SHOW WARNINGS round-trips). The schedule: the first
+// ONLY use batched INSERT — checking every flush adds up to ~2× per-
+// flush latency (measured pre-ADR-0150 at ≤500-row flushes: a 19M-row
+// table was ~38k flushes ≈ ~30 min of pure SHOW WARNINGS round-trips;
+// the ~1 MiB statements cut the flush count ~10–20×, which shrinks the
+// absolute cost but leaves the per-flush ratio). The schedule: the first
 // [warningsExhaustiveFlushes] flushes are ALL checked (a systematic
 // coercion — wrong column type, bad mapping — clamps on every flush
 // and is caught immediately), then 1-in-[warningsSampleEvery], plus
