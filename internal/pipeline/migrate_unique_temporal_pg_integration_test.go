@@ -93,11 +93,12 @@ func TestMigrate_PG_TemporalPrecisionShapes(t *testing.T) {
 			tmtz_p0   TIME(0) WITH TIME ZONE,
 			tmtz_p2   TIME(2) WITH TIME ZONE,
 			tmtz_p6   TIME(6) WITH TIME ZONE,
-			ts_arr    TIMESTAMPTZ[]
+			ts_arr    TIMESTAMPTZ[],
+			eta_arr   TIMESTAMPTZ(3)[]
 		);
 		INSERT INTO temporal_shapes
 			(ts_bare, ts_p0, ts_p3, ts_p6, dt_bare, dt_p0, dt_p3, dt_p6,
-			 tm_bare, tm_p0, tm_p4, tm_p6, tmtz_bare, tmtz_p0, tmtz_p2, tmtz_p6, ts_arr)
+			 tm_bare, tm_p0, tm_p4, tm_p6, tmtz_bare, tmtz_p0, tmtz_p2, tmtz_p6, ts_arr, eta_arr)
 		VALUES
 			('2026-01-02 03:04:05.123456+00', '2026-01-02 03:04:05+00',
 			 '2026-01-02 03:04:05.123+00', '2026-01-02 03:04:05.123456+00',
@@ -105,7 +106,8 @@ func TestMigrate_PG_TemporalPrecisionShapes(t *testing.T) {
 			 '2026-01-02 03:04:05.123', '2026-01-02 03:04:05.123456',
 			 '03:04:05.123456', '03:04:05', '03:04:05.1234', '03:04:05.123456',
 			 '03:04:05.123456+02', '03:04:05+02', '03:04:05.12+02', '03:04:05.123456+02',
-			 ARRAY['2026-01-02 03:04:05.123456+00'::timestamptz]);`
+			 ARRAY['2026-01-02 03:04:05.123456+00'::timestamptz],
+			 ARRAY['2026-01-02 03:04:05.123+00'::timestamptz(3)]);`
 	applyPGDDL(t, sourceDSN, seedDDL)
 
 	pgEng, ok := engines.Get("postgres")
@@ -138,6 +140,14 @@ func TestMigrate_PG_TemporalPrecisionShapes(t *testing.T) {
 	}
 	if src["ts_p0"] != "timestamp(0) with time zone" {
 		t.Fatalf("source ts_p0 format_type = %q; harness assumption broken", src["ts_p0"])
+	}
+	// Declared-precision ARRAY element (the array cell of the TRIAGE #3
+	// matrix, previously covered only at reader-unit level): the array
+	// column's typmod IS the element precision and must carry to the
+	// target; the src==tgt loop above enforced equality, this pins the
+	// exact expected spelling.
+	if src["eta_arr"] != "timestamp(3) with time zone[]" {
+		t.Fatalf("source eta_arr format_type = %q; harness assumption broken", src["eta_arr"])
 	}
 }
 

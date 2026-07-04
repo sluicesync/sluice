@@ -107,6 +107,50 @@ func TestUnmarshalType_NullAndUnknownKind(t *testing.T) {
 	}
 }
 
+// TestMarshalTable_IndexConstraintBackedRoundTrip pins that
+// ir.Index.ConstraintBacked survives the backup / schema-history wire.
+// Today Table marshals Index via the default struct JSON, so the flag
+// rides for free — this test is the guard against a future custom
+// Index marshal silently reopening the TRIAGE-#4 demotion through the
+// backup door: a restore that loses the flag re-creates the source
+// UNIQUE constraint as a plain unique index, breaking ON CONFLICT ON
+// CONSTRAINT on the restored target.
+func TestMarshalTable_IndexConstraintBackedRoundTrip(t *testing.T) {
+	in := &Table{
+		Name:    "accounts",
+		Columns: []*Column{{Name: "email", Type: Text{Size: TextLong}}},
+		Indexes: []*Index{
+			{Name: "accounts_email_unique", Unique: true, ConstraintBacked: true, Columns: []IndexColumn{{Column: "email"}}},
+			{Name: "accounts_email_uidx", Unique: true, Columns: []IndexColumn{{Column: "email"}}},
+		},
+	}
+	b, err := MarshalTable(in)
+	if err != nil {
+		t.Fatalf("MarshalTable: %v", err)
+	}
+	out, err := UnmarshalTable(b)
+	if err != nil {
+		t.Fatalf("UnmarshalTable: %v", err)
+	}
+	if len(out.Indexes) != 2 {
+		t.Fatalf("round-trip indexes = %d; want 2 (json=%s)", len(out.Indexes), b)
+	}
+	if !out.Indexes[0].ConstraintBacked {
+		t.Errorf("ConstraintBacked lost through the wire on %q — a backup restore would demote the UNIQUE constraint to a plain index (json=%s)", out.Indexes[0].Name, b)
+	}
+	if out.Indexes[1].ConstraintBacked {
+		t.Errorf("plain unique index %q gained ConstraintBacked through the wire (json=%s)", out.Indexes[1].Name, b)
+	}
+	// Full-table DeepEqual is deliberately NOT asserted: the Column
+	// codec normalizes an absent Default to DefaultNone{} on decode
+	// (documented UnmarshalJSON behaviour). The Indexes slice — the
+	// surface this pin guards — must round-trip exactly.
+	if !reflect.DeepEqual(in.Indexes, out.Indexes) {
+		t.Errorf("index round-trip mismatch:\n in: %#v %#v\nout: %#v %#v",
+			in.Indexes[0], in.Indexes[1], out.Indexes[0], out.Indexes[1])
+	}
+}
+
 // TestUnmarshalType_OldTemporalWireDecodesExplicit pins the TRIAGE #3
 // cross-version contract: a manifest written by an OLDER binary
 // carries the materialized Precision=6 for a bare temporal column and

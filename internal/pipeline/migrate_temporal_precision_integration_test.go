@@ -58,17 +58,19 @@ func TestMigrate_MySQLToPostgres_TimestampPrecision(t *testing.T) {
 	// column's declared precision, the assertion catches it.
 	const seedDDL = `
 		CREATE TABLE temporal_precision (
-			id     BIGINT       NOT NULL PRIMARY KEY,
-			dt_0   DATETIME(0)  NOT NULL,
-			dt_3   DATETIME(3)  NOT NULL,
-			dt_6   DATETIME(6)  NOT NULL,
-			ts_0   TIMESTAMP(0) NOT NULL,
-			ts_3   TIMESTAMP(3) NOT NULL,
-			ts_6   TIMESTAMP(6) NOT NULL
+			id      BIGINT       NOT NULL PRIMARY KEY,
+			dt_bare DATETIME     NOT NULL,
+			dt_0    DATETIME(0)  NOT NULL,
+			dt_3    DATETIME(3)  NOT NULL,
+			dt_6    DATETIME(6)  NOT NULL,
+			ts_0    TIMESTAMP(0) NOT NULL,
+			ts_3    TIMESTAMP(3) NOT NULL,
+			ts_6    TIMESTAMP(6) NOT NULL
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-		INSERT INTO temporal_precision (id, dt_0, dt_3, dt_6, ts_0, ts_3, ts_6) VALUES
+		INSERT INTO temporal_precision (id, dt_bare, dt_0, dt_3, dt_6, ts_0, ts_3, ts_6) VALUES
 			(1,
+				'2026-05-06 12:34:56',
 				'2026-05-06 12:34:56',
 				'2026-05-06 12:34:56.123',
 				'2026-05-06 12:34:56.123456',
@@ -108,10 +110,30 @@ func TestMigrate_MySQLToPostgres_TimestampPrecision(t *testing.T) {
 	// Read each column back; expect a time.Time per column (pgx
 	// scans timestamps into time.Time directly). Precision-tier
 	// values defined alongside the seed.
-	var dt0, dt3, dt6, ts0, ts3, ts6 time.Time
-	const q = `SELECT dt_0, dt_3, dt_6, ts_0, ts_3, ts_6 FROM temporal_precision WHERE id = 1`
-	if err := tgt.QueryRowContext(ctx, q).Scan(&dt0, &dt3, &dt6, &ts0, &ts3, &ts6); err != nil {
+	var dtBare, dt0, dt3, dt6, ts0, ts3, ts6 time.Time
+	const q = `SELECT dt_bare, dt_0, dt_3, dt_6, ts_0, ts_3, ts_6 FROM temporal_precision WHERE id = 1`
+	if err := tgt.QueryRowContext(ctx, q).Scan(&dtBare, &dt0, &dt3, &dt6, &ts0, &ts3, &ts6); err != nil {
 		t.Fatalf("scan target row: %v", err)
+	}
+
+	// TRIAGE #3 catalog pin: MySQL's bare DATETIME is a REAL precision
+	// 0 (bare ≡ (0) in MySQL, and information_schema reports 0), so
+	// the PG target now carries it faithfully as timestamp(0) — not
+	// the pre-fix 0→bare emit collapse, which silently widened it to
+	// the 6-behaving bare form. format_type(atttypid, atttypmod) is
+	// the catalog-exact ground truth.
+	var bareFT string
+	if err := tgt.QueryRowContext(ctx, `
+		SELECT pg_catalog.format_type(a.atttypid, a.atttypmod)
+		FROM   pg_attribute a
+		JOIN   pg_class c     ON c.oid = a.attrelid
+		JOIN   pg_namespace n ON n.oid = c.relnamespace
+		WHERE  n.nspname = 'public' AND c.relname = 'temporal_precision'
+		  AND  a.attname = 'dt_bare'`).Scan(&bareFT); err != nil {
+		t.Fatalf("format_type(dt_bare): %v", err)
+	}
+	if bareFT != "timestamp(0) without time zone" {
+		t.Errorf("MySQL bare DATETIME → PG format_type = %q; want \"timestamp(0) without time zone\"", bareFT)
 	}
 
 	cases := []struct {
@@ -120,6 +142,7 @@ func TestMigrate_MySQLToPostgres_TimestampPrecision(t *testing.T) {
 		want    time.Time // value at the column's declared precision
 		precFmt string    // truncate-to-precision format for the comparison
 	}{
+		{"DATETIME bare (≡ 0)", dtBare, time.Date(2026, 5, 6, 12, 34, 56, 0, time.UTC), "2006-01-02 15:04:05"},
 		{"DATETIME(0)", dt0, time.Date(2026, 5, 6, 12, 34, 56, 0, time.UTC), "2006-01-02 15:04:05"},
 		{"DATETIME(3)", dt3, time.Date(2026, 5, 6, 12, 34, 56, 123000000, time.UTC), "2006-01-02 15:04:05.000"},
 		{"DATETIME(6)", dt6, time.Date(2026, 5, 6, 12, 34, 56, 123456000, time.UTC), "2006-01-02 15:04:05.000000"},

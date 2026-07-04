@@ -468,11 +468,16 @@ func seedSQLiteTemporal(t *testing.T, iso bool) string {
 				happened_on   DATE     NOT NULL,
 				happened_at   DATETIME NOT NULL,
 				happened_time TIME     NOT NULL,
+				logged_at     DATETIME NOT NULL,
 				is_active   BOOLEAN  NOT NULL
 			)`,
-			`INSERT INTO events (id, happened_on, happened_at, happened_time, is_active) VALUES
-				(1, '2024-01-02', '2024-01-02 03:04:05', '03:04:05', 1),
-				(2, '2025-12-31', '2025-12-31 23:59:59', '23:59:59', 0)`,
+			// logged_at carries MICROSECONDS — SQLite text temporals have
+			// no declared precision, so the fraction pins the TRIAGE #3
+			// silent-loss fix on precision-honoring targets (see
+			// runSQLiteTemporalRoundTrip).
+			`INSERT INTO events (id, happened_on, happened_at, happened_time, logged_at, is_active) VALUES
+				(1, '2024-01-02', '2024-01-02 03:04:05', '03:04:05', '2024-01-02 03:04:05.123456', 1),
+				(2, '2025-12-31', '2025-12-31 23:59:59', '23:59:59', '2025-12-31 23:59:59.999999', 0)`,
 		}
 	} else {
 		// The date encoding is GLOBAL per source, so under unixepoch BOTH
@@ -609,6 +614,39 @@ func runSQLiteTemporalRoundTrip(t *testing.T, targetName string, start func(*tes
 		// time.Time depending on the target reader) must carry 03:04:05.
 		if s := fmt.Sprint(rows[0]["happened_time"]); !strings.Contains(s, "03:04:05") {
 			t.Errorf("events[0].happened_time = %q; want it to contain 03:04:05", s)
+		}
+		// TRIAGE #3 silent-loss fix pin: SQLite temporals carry
+		// PrecisionUnspecified (no precision concept), and a MySQL target
+		// must materialize the declared maximum fsp 6 — pre-fix the
+		// column landed BARE (MySQL bare ≡ fsp 0) and silently truncated
+		// the fraction. PG's bare form is 6-behaving, so only MySQL needs
+		// the declared-precision assert; the VALUE assert below covers
+		// both targets.
+		if targetName == "mysql" {
+			c := findColumn(events, "logged_at")
+			if c == nil {
+				t.Fatal("events.logged_at missing on target")
+			}
+			var prec int
+			var unspec bool
+			switch v := c.Type.(type) {
+			case ir.Timestamp:
+				prec, unspec = v.Precision, v.PrecisionUnspecified
+			case ir.DateTime:
+				prec, unspec = v.Precision, v.PrecisionUnspecified
+			default:
+				t.Fatalf("events.logged_at landed as %T; want a timestamp/datetime family type", c.Type)
+			}
+			if unspec || prec != 6 {
+				t.Errorf("events.logged_at target precision = (%d, unspecified=%v); want declared fsp 6 — bare would silently truncate fractional seconds", prec, unspec)
+			}
+		}
+		// Microseconds preserved end-to-end on both targets.
+		if ts := asTime(t, rows[0]["logged_at"]).UTC().Format("2006-01-02 15:04:05.000000"); ts != "2024-01-02 03:04:05.123456" {
+			t.Errorf("events[0].logged_at = %q; want 2024-01-02 03:04:05.123456 (fractional seconds must survive)", ts)
+		}
+		if ts := asTime(t, rows[1]["logged_at"]).UTC().Format("2006-01-02 15:04:05.000000"); ts != "2025-12-31 23:59:59.999999" {
+			t.Errorf("events[1].logged_at = %q; want 2025-12-31 23:59:59.999999 (fractional seconds must survive)", ts)
 		}
 	}
 	// Row 2: 2025-12-31 / 2025-12-31 23:59:59 / false.
