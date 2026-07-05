@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package pipeline
+package migcore
 
 import (
 	"testing"
@@ -43,14 +43,14 @@ func TestDiffSchemas_IndexOrderIsNotAnAlter(t *testing.T) {
 	idx := after.Tables[0].Indexes
 	after.Tables[0].Indexes = []*ir.Index{idx[1], idx[2], idx[0]}
 
-	if deltas := diffSchemas(before, after); len(deltas) != 0 {
+	if deltas := DiffSchemas(before, after); len(deltas) != 0 {
 		t.Errorf("index reorder produced %d schema deltas; want 0 (kind=%v)", len(deltas), deltas[0].Kind)
 	}
 
 	// A REAL index difference must still surface as an alter.
 	altered := &ir.Schema{Tables: []*ir.Table{diffOrderTestTable()}}
 	altered.Tables[0].Indexes[1].Unique = true
-	deltas := diffSchemas(before, altered)
+	deltas := DiffSchemas(before, altered)
 	if len(deltas) != 1 || deltas[0].Kind != irbackup.SchemaDeltaAlterTable {
 		t.Errorf("real index change: deltas = %+v; want exactly one alter_table", deltas)
 	}
@@ -60,7 +60,7 @@ func TestDiffSchemas_IndexOrderIsNotAnAlter(t *testing.T) {
 	// real-difference detection.
 	renamed := &ir.Schema{Tables: []*ir.Table{diffOrderTestTable()}}
 	renamed.Tables[0].Indexes[0].Name = "medium_11_other_idx"
-	deltas = diffSchemas(before, renamed)
+	deltas = DiffSchemas(before, renamed)
 	if len(deltas) != 1 || deltas[0].Kind != irbackup.SchemaDeltaAlterTable {
 		t.Errorf("index rename: deltas = %+v; want exactly one alter_table", deltas)
 	}

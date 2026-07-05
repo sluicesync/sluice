@@ -386,7 +386,7 @@ func (r *Restore) Run(ctx context.Context) error {
 	//       schema, and BEFORE the table filter for path-consistency
 	//       with the chain (which also gates its root's full schema).
 	if manifest.SourceEngine != "" && manifest.SourceEngine != r.Target.Name() {
-		if err := checkCrossEngineSupportable(
+		if err := migcore.CheckCrossEngineSupportable(
 			manifest.Schema,
 			manifest.SourceEngine, r.Target.Name(),
 			fmt.Sprintf("restore: full %s", manifestBackupID(manifest)),

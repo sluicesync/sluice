@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package pipeline
+package migcore
 
 // Phase 3 schema-delta diff: turns a (before, after) pair of source
 // schemas into the [irbackup.SchemaDeltaEntry] slice that lands on the
@@ -26,7 +26,7 @@ import (
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
-// diffSchemas returns the structural delta from before to after.
+// DiffSchemas returns the structural delta from before to after.
 // Empty slice (not nil) when the two schemas are identical.
 //
 // The order of returned entries is: drops first (so a restore-side
@@ -35,7 +35,7 @@ import (
 // applier safe), then adds, then alters. Within each group, ordering
 // is the after-schema's table order (or before-schema's for drops),
 // which is stable across runs.
-func diffSchemas(before, after *ir.Schema) []*irbackup.SchemaDeltaEntry {
+func DiffSchemas(before, after *ir.Schema) []*irbackup.SchemaDeltaEntry {
 	var (
 		drops  []*irbackup.SchemaDeltaEntry
 		adds   []*irbackup.SchemaDeltaEntry
@@ -96,7 +96,7 @@ func diffSchemas(before, after *ir.Schema) []*irbackup.SchemaDeltaEntry {
 }
 
 // indexTablesByQualifiedName returns a "schema.name" → table map for
-// fast lookup during diffSchemas.
+// fast lookup during DiffSchemas.
 func indexTablesByQualifiedName(s *ir.Schema) map[string]*ir.Table {
 	if s == nil {
 		return nil
@@ -194,7 +194,7 @@ func columnsEqual(a, b *ir.Column) bool {
 	}
 	// Type.String() captures width / nullable / etc. on every concrete
 	// IR type — the same property the cross-engine diff relies on.
-	if typeString(a.Type) != typeString(b.Type) {
+	if TypeString(a.Type) != TypeString(b.Type) {
 		return false
 	}
 	if a.Nullable != b.Nullable {
@@ -257,10 +257,10 @@ func indicesEqual(a, b *ir.Index) bool {
 	return reflect.DeepEqual(a.Columns, b.Columns)
 }
 
-// typeString renders an IR Type to its canonical String form. nil
+// TypeString renders an IR Type to its canonical String form. nil
 // types format as "nil" so a column with an unset type doesn't equal
 // every other unset-type column on accident.
-func typeString(t ir.Type) string {
+func TypeString(t ir.Type) string {
 	if t == nil {
 		return "nil"
 	}

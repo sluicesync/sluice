@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package pipeline
+package migcore
 
 import (
 	"strings"
@@ -18,7 +18,7 @@ func TestCheckCrossEngineSupportable_SameEngineNil(t *testing.T) {
 			{Name: "loc", Type: ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326}},
 		},
 	}}}
-	if err := checkCrossEngineSupportable(s, "postgres", "postgres", "test"); err != nil {
+	if err := CheckCrossEngineSupportable(s, "postgres", "postgres", "test"); err != nil {
 		t.Errorf("same-engine err = %v; want nil", err)
 	}
 }
@@ -38,7 +38,7 @@ func TestCheckCrossEngineSupportable_PGtoMySQL_PostGISAllowed(t *testing.T) {
 			{Name: "loc", Type: ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326}},
 		},
 	}}}
-	if err := checkCrossEngineSupportable(s, "postgres", "mysql", "incremental incr-0001"); err != nil {
+	if err := CheckCrossEngineSupportable(s, "postgres", "mysql", "incremental incr-0001"); err != nil {
 		t.Errorf("err = %v; want nil (geometry now allowed PG → MySQL)", err)
 	}
 }
@@ -54,7 +54,7 @@ func TestCheckCrossEngineSupportable_PGtoMySQL_PortableTypesOK(t *testing.T) {
 			{Name: "data", Type: ir.JSON{Binary: true}},
 		},
 	}}}
-	if err := checkCrossEngineSupportable(s, "postgres", "mysql", "test"); err != nil {
+	if err := CheckCrossEngineSupportable(s, "postgres", "mysql", "test"); err != nil {
 		t.Errorf("portable types err = %v; want nil", err)
 	}
 }
@@ -68,7 +68,7 @@ func TestCheckCrossEngineSupportable_UnknownPairOK(t *testing.T) {
 	}}}
 	// future-engine pairs fall through as "supportable" — the engine
 	// emitter handles its own error.
-	if err := checkCrossEngineSupportable(s, "mysql", "future", "test"); err != nil {
+	if err := CheckCrossEngineSupportable(s, "mysql", "future", "test"); err != nil {
 		t.Errorf("unknown pair err = %v; want nil", err)
 	}
 }
@@ -89,7 +89,7 @@ func TestCheckCrossEngineSupportable_PGtoMySQL_ExcludeRefuses(t *testing.T) {
 			Definition: "EXCLUDE USING gist (builds_id_range WITH &&)",
 		}},
 	}}}
-	err := checkCrossEngineSupportable(s, "postgres", "mysql", "test")
+	err := CheckCrossEngineSupportable(s, "postgres", "mysql", "test")
 	if err == nil {
 		t.Fatal("PG → MySQL with EXCLUDE: expected refusal, got nil")
 	}
@@ -121,7 +121,7 @@ func TestCheckCrossEngineSupportable_PGtoPG_ExcludeAllowed(t *testing.T) {
 			Definition: "EXCLUDE USING gist (builds_id_range WITH &&)",
 		}},
 	}}}
-	if err := checkCrossEngineSupportable(s, "postgres", "postgres", "test"); err != nil {
+	if err := CheckCrossEngineSupportable(s, "postgres", "postgres", "test"); err != nil {
 		t.Errorf("PG → PG with EXCLUDE err = %v; want nil (same-engine carry)", err)
 	}
 }
@@ -143,7 +143,7 @@ func TestCheckCrossEngineDeltaSupportable_AddTableWithPostGISAllowed(t *testing.
 			},
 		},
 	}
-	if err := checkCrossEngineDeltaSupportable(deltas, "postgres", "mysql", "incr-0001"); err != nil {
+	if err := CheckCrossEngineDeltaSupportable(deltas, "postgres", "mysql", "incr-0001"); err != nil {
 		t.Errorf("err = %v; want nil (geometry now allowed PG → MySQL)", err)
 	}
 }
@@ -170,7 +170,7 @@ func TestCheckCrossEngineDeltaSupportable_AlterTableAddPostGISAllowed(t *testing
 			},
 		},
 	}
-	if err := checkCrossEngineDeltaSupportable(deltas, "postgres", "mysql", "incr-0002"); err != nil {
+	if err := CheckCrossEngineDeltaSupportable(deltas, "postgres", "mysql", "incr-0002"); err != nil {
 		t.Errorf("err = %v; want nil (geometry now allowed PG → MySQL)", err)
 	}
 }
@@ -180,7 +180,7 @@ func TestCheckCrossEngineDeltaSupportable_DropTableNoCheck(t *testing.T) {
 	deltas := []*irbackup.SchemaDeltaEntry{
 		{Kind: irbackup.SchemaDeltaDropTable, Table: "old"},
 	}
-	if err := checkCrossEngineDeltaSupportable(deltas, "postgres", "mysql", "incr-0001"); err != nil {
+	if err := CheckCrossEngineDeltaSupportable(deltas, "postgres", "mysql", "incr-0001"); err != nil {
 		t.Errorf("err = %v; want nil for drop-only delta", err)
 	}
 }
@@ -202,7 +202,7 @@ func TestCheckCrossEngineSupportable_PGtoMySQL_ExtensionTypeRefuses(t *testing.T
 			}},
 		},
 	}}}
-	err := checkCrossEngineSupportable(s, "postgres", "mysql", "items-migration")
+	err := CheckCrossEngineSupportable(s, "postgres", "mysql", "items-migration")
 	if err == nil {
 		t.Fatal("err = nil; want ExtensionType refusal")
 	}
@@ -230,7 +230,7 @@ func TestCheckCrossEngineSupportable_PGtoMySQL_VerbatimTypeRefuses(t *testing.T)
 			{Name: "path", Type: ir.VerbatimType{Definition: "ltree"}},
 		},
 	}}}
-	err := checkCrossEngineSupportable(s, "postgres", "mysql", "docs-migration")
+	err := CheckCrossEngineSupportable(s, "postgres", "mysql", "docs-migration")
 	if err == nil {
 		t.Fatal("err = nil; want VerbatimType cross-engine refusal")
 	}
@@ -252,7 +252,7 @@ func TestCheckCrossEngineSupportable_PGtoPG_VerbatimTypeOK(t *testing.T) {
 		Name:    "docs",
 		Columns: []*ir.Column{{Name: "path", Type: ir.VerbatimType{Definition: "ltree"}}},
 	}}}
-	if err := checkCrossEngineSupportable(s, "postgres", "postgres", "x"); err != nil {
+	if err := CheckCrossEngineSupportable(s, "postgres", "postgres", "x"); err != nil {
 		t.Errorf("same-engine PG → PG with VerbatimType should be OK; got %v", err)
 	}
 }
@@ -281,7 +281,7 @@ func TestCheckCrossEngineSupportable_PGtoMySQL_TrgmIndexRefuses(t *testing.T) {
 			},
 		},
 	}}}
-	err := checkCrossEngineSupportable(s, "postgres", "mysql", "documents-migration")
+	err := CheckCrossEngineSupportable(s, "postgres", "mysql", "documents-migration")
 	if err == nil {
 		t.Fatal("err = nil; want pg_trgm index refusal")
 	}
@@ -316,7 +316,7 @@ func TestCheckCrossEngineSupportable_PGtoMySQL_TrgmGistIndexRefuses(t *testing.T
 			},
 		},
 	}}}
-	err := checkCrossEngineSupportable(s, "postgres", "mysql", "documents-migration")
+	err := CheckCrossEngineSupportable(s, "postgres", "mysql", "documents-migration")
 	if err == nil {
 		t.Fatal("err = nil; want pg_trgm gist index refusal")
 	}
@@ -345,7 +345,7 @@ func TestCheckCrossEngineSupportable_SameEngineTrgmAllowed(t *testing.T) {
 			},
 		},
 	}}}
-	if err := checkCrossEngineSupportable(s, "postgres", "postgres", "documents-pg-pg"); err != nil {
+	if err := CheckCrossEngineSupportable(s, "postgres", "postgres", "documents-pg-pg"); err != nil {
 		t.Errorf("same-engine err = %v; want nil (pg_trgm passthrough on PG → PG)", err)
 	}
 }
@@ -379,7 +379,7 @@ func TestCheckCrossEngineSupportable_PGtoMySQL_GinKindRefuses_NoOpclass(t *testi
 			},
 		},
 	}}}
-	err := checkCrossEngineSupportable(s, "postgres", "mysql", "documents-pg-mysql")
+	err := CheckCrossEngineSupportable(s, "postgres", "mysql", "documents-pg-mysql")
 	if err == nil {
 		t.Fatal("err = nil; want refusal for PG GIN index with no MySQL counterpart")
 	}
@@ -411,7 +411,7 @@ func TestCheckCrossEngineSupportable_PGtoMySQL_GistKindRefuses_NoOpclass(t *test
 			},
 		},
 	}}}
-	err := checkCrossEngineSupportable(s, "postgres", "mysql", "documents-pg-mysql")
+	err := CheckCrossEngineSupportable(s, "postgres", "mysql", "documents-pg-mysql")
 	if err == nil {
 		t.Fatal("err = nil; want refusal for PG GiST index with no MySQL counterpart")
 	}
@@ -441,7 +441,7 @@ func TestCheckCrossEngineSupportable_PGtoMySQL_SPGistKindRefuses(t *testing.T) {
 			},
 		},
 	}}}
-	err := checkCrossEngineSupportable(s, "postgres", "mysql", "spatial-pg-mysql")
+	err := CheckCrossEngineSupportable(s, "postgres", "mysql", "spatial-pg-mysql")
 	if err == nil {
 		t.Fatal("err = nil; want refusal for PG SP-GiST index with no MySQL counterpart")
 	}
@@ -467,7 +467,7 @@ func TestCheckCrossEngineSupportable_PGtoMySQL_BRINKindRefuses(t *testing.T) {
 			},
 		},
 	}}}
-	err := checkCrossEngineSupportable(s, "postgres", "mysql", "spatial-pg-mysql")
+	err := CheckCrossEngineSupportable(s, "postgres", "mysql", "spatial-pg-mysql")
 	if err == nil {
 		t.Fatal("err = nil; want refusal for PG BRIN index with no MySQL counterpart")
 	}
@@ -490,7 +490,7 @@ func TestCheckCrossEngineSupportable_PGtoMySQL_HstoreSupportable(t *testing.T) {
 			{Name: "tags", Type: ir.ExtensionType{Extension: "hstore", Name: "hstore"}},
 		},
 	}}}
-	if err := checkCrossEngineSupportable(s, "postgres", "mysql", "attrs-migration"); err != nil {
+	if err := CheckCrossEngineSupportable(s, "postgres", "mysql", "attrs-migration"); err != nil {
 		t.Errorf("hstore PG → MySQL err = %v; want nil (default translator → JSON)", err)
 	}
 }
@@ -506,7 +506,7 @@ func TestCheckCrossEngineSupportable_PGtoMySQL_CiTextSupportable(t *testing.T) {
 			{Name: "email", Type: ir.ExtensionType{Extension: "citext", Name: "citext"}},
 		},
 	}}}
-	if err := checkCrossEngineSupportable(s, "postgres", "mysql", "users-migration"); err != nil {
+	if err := CheckCrossEngineSupportable(s, "postgres", "mysql", "users-migration"); err != nil {
 		t.Errorf("citext PG → MySQL err = %v; want nil (default translator → VARCHAR _ci)", err)
 	}
 }
@@ -559,7 +559,7 @@ func TestCheckCrossEngineSupportable_PGtoMySQL_BtreePassesThrough(t *testing.T) 
 			},
 		},
 	}}}
-	if err := checkCrossEngineSupportable(s, "postgres", "mysql", "users-pg-mysql"); err != nil {
+	if err := CheckCrossEngineSupportable(s, "postgres", "mysql", "users-pg-mysql"); err != nil {
 		t.Errorf("err = %v; want nil (btree is MySQL-portable)", err)
 	}
 }
@@ -586,11 +586,11 @@ func TestCheckCrossEngineSupportable_PGTriggerToMySQL_ExcludeRefuses(t *testing.
 		}},
 	}}}
 	// Trigger source must refuse identically to a `postgres` source.
-	trigErr := checkCrossEngineSupportable(s, "postgres-trigger", "mysql", "test")
+	trigErr := CheckCrossEngineSupportable(s, "postgres-trigger", "mysql", "test")
 	if trigErr == nil {
 		t.Fatal("postgres-trigger → MySQL with EXCLUDE: expected refusal, got nil")
 	}
-	pgErr := checkCrossEngineSupportable(s, "postgres", "mysql", "test")
+	pgErr := CheckCrossEngineSupportable(s, "postgres", "mysql", "test")
 	if pgErr == nil {
 		t.Fatal("postgres → MySQL with EXCLUDE: expected refusal, got nil (test fixture invalid)")
 	}
@@ -622,7 +622,7 @@ func TestCheckCrossEngineSupportable_PGTriggerToPlanetScale_GinIndexRefuses(t *t
 			},
 		},
 	}}}
-	err := checkCrossEngineSupportable(s, "postgres-trigger", "planetscale", "documents-migration")
+	err := CheckCrossEngineSupportable(s, "postgres-trigger", "planetscale", "documents-migration")
 	if err == nil {
 		t.Fatal("postgres-trigger → planetscale with GIN index: expected refusal, got nil")
 	}
@@ -643,14 +643,14 @@ func TestCheckCrossEngineSupportable_PGTriggerToPGTrigger_ExcludeAllowed(t *test
 			Definition: "EXCLUDE USING gist (builds_id_range WITH &&)",
 		}},
 	}}}
-	if err := checkCrossEngineSupportable(s, "postgres-trigger", "postgres-trigger", "test"); err != nil {
+	if err := CheckCrossEngineSupportable(s, "postgres-trigger", "postgres-trigger", "test"); err != nil {
 		t.Errorf("postgres-trigger → postgres-trigger with EXCLUDE err = %v; want nil (same-engine carry)", err)
 	}
 }
 
 // TestCheckCrossEngineDeltaSupportable_PGTriggerAddTableGeometryAllowed
 // confirms the delta path inherits the gate fix (it delegates to
-// checkCrossEngineSupportable): an incremental adding a geometry-bearing
+// CheckCrossEngineSupportable): an incremental adding a geometry-bearing
 // table from a postgres-trigger source no longer skips the (now-allowed)
 // PostGIS path, and a refusable shape still refuses. Geometry is allowed
 // post-ADR-0035, so this asserts the no-refuse case — proving the trigger
@@ -669,7 +669,7 @@ func TestCheckCrossEngineDeltaSupportable_PGTriggerAddTableGeometryAllowed(t *te
 			},
 		},
 	}
-	if err := checkCrossEngineDeltaSupportable(deltas, "postgres-trigger", "mysql", "incr-0001"); err != nil {
+	if err := CheckCrossEngineDeltaSupportable(deltas, "postgres-trigger", "mysql", "incr-0001"); err != nil {
 		t.Errorf("err = %v; want nil (geometry allowed PG-trigger → MySQL)", err)
 	}
 }
@@ -692,7 +692,7 @@ func TestCheckCrossEngineDeltaSupportable_PGTriggerAddTableExtensionRefuses(t *t
 			},
 		},
 	}
-	err := checkCrossEngineDeltaSupportable(deltas, "postgres-trigger", "mysql", "incr-0002")
+	err := CheckCrossEngineDeltaSupportable(deltas, "postgres-trigger", "mysql", "incr-0002")
 	if err == nil {
 		t.Fatal("postgres-trigger delta AddTable with ExtensionType: expected refusal, got nil")
 	}
@@ -724,8 +724,8 @@ func TestIsMySQLFamilyEngine(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			if got := isMySQLFamilyEngine(c.name); got != c.want {
-				t.Errorf("isMySQLFamilyEngine(%q) = %v; want %v", c.name, got, c.want)
+			if got := IsMySQLFamilyEngine(c.name); got != c.want {
+				t.Errorf("IsMySQLFamilyEngine(%q) = %v; want %v", c.name, got, c.want)
 			}
 		})
 	}
@@ -744,7 +744,7 @@ func TestCheckCrossEngineSupportable_PGToVitess_ExcludeRefuses(t *testing.T) {
 			Definition: "EXCLUDE USING gist (room WITH =, during WITH &&)",
 		}},
 	}}}
-	err := checkCrossEngineSupportable(s, "postgres", "vitess", "test")
+	err := CheckCrossEngineSupportable(s, "postgres", "vitess", "test")
 	if err == nil {
 		t.Fatal("postgres → vitess with EXCLUDE: expected loud refusal, got nil (silent constraint drop)")
 	}
@@ -776,57 +776,6 @@ func TestIsPGSourceEngine(t *testing.T) {
 	}
 }
 
-// stubNoShardColumnSetter is a target type that intentionally does
-// NOT implement ir.ShardColumnSetter. Used to pin the Shape-A
-// cross-engine refusal — a future engine that ships without the
-// surface must surface the refusal at openApplier-time before any
-// CDC apply runs.
-type stubNoShardColumnSetter struct{}
-
-func TestCheckShardColumnSupport_DisengagedSkips(t *testing.T) {
-	// Shape A not engaged → nil regardless of target shape.
-	if err := checkShardColumnSupport(stubNoShardColumnSetter{}, ShardColumnSpec{}, "sync"); err != nil {
-		t.Errorf("expected nil when not engaged; got %v", err)
-	}
-}
-
-// stubShardColumnSetter implements ir.ShardColumnSetter — the
-// engaged-but-supported happy path.
-type stubShardColumnSetter struct {
-	gotName string
-	gotVal  any
-}
-
-func (s *stubShardColumnSetter) SetShardColumn(name string, value any) {
-	s.gotName = name
-	s.gotVal = value
-}
-
-func TestCheckShardColumnSupport_EngagedSupportedOK(t *testing.T) {
-	target := &stubShardColumnSetter{}
-	err := checkShardColumnSupport(target, ShardColumnSpec{Name: "shard", Value: "v1"}, "sync")
-	if err != nil {
-		t.Errorf("expected nil when target implements setter; got %v", err)
-	}
-}
-
-func TestCheckShardColumnSupport_EngagedUnsupportedRefuses(t *testing.T) {
-	err := checkShardColumnSupport(stubNoShardColumnSetter{}, ShardColumnSpec{Name: "shard", Value: "v1"}, "sync")
-	if err == nil {
-		t.Fatal("expected refusal; got nil")
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "ir.ShardColumnSetter") {
-		t.Errorf("error %q missing interface name", msg)
-	}
-	if !strings.Contains(msg, "shard=v1") {
-		t.Errorf("error %q missing shard/value", msg)
-	}
-	if !strings.Contains(msg, "ADR-0048") {
-		t.Errorf("error %q missing ADR reference", msg)
-	}
-}
-
 // item-51: PG → MySQL-family with a standalone sequence must refuse
 // loudly, naming the sequence and the remedy. Pre-fix, the sequence
 // silently collapsed into AUTO_INCREMENT — post-migration inserts
@@ -847,7 +796,7 @@ func TestCheckCrossEngineSupportable_StandaloneSequenceRefuses(t *testing.T) {
 		Sequences: []*ir.Sequence{{Schema: "public", Name: "order_number_seq", Start: 1000, Increment: 5}},
 	}
 	for _, target := range []string{"mysql", "planetscale", "vitess"} {
-		err := checkCrossEngineSupportable(s, "postgres", target, "migrate")
+		err := CheckCrossEngineSupportable(s, "postgres", target, "migrate")
 		if err == nil {
 			t.Fatalf("postgres → %s with standalone sequence: want refusal; got nil", target)
 		}
@@ -860,12 +809,12 @@ func TestCheckCrossEngineSupportable_StandaloneSequenceRefuses(t *testing.T) {
 		}
 	}
 	// Same-engine PG → PG carries the sequence; no refusal.
-	if err := checkCrossEngineSupportable(s, "postgres", "postgres", "migrate"); err != nil {
+	if err := CheckCrossEngineSupportable(s, "postgres", "postgres", "migrate"); err != nil {
 		t.Errorf("postgres → postgres err = %v; want nil (sequence is carried)", err)
 	}
 	// postgres-trigger sources trip the same refusal (they delegate to
 	// the vanilla PG schema surface).
-	if err := checkCrossEngineSupportable(s, "postgres-trigger", "mysql", "migrate"); err == nil {
+	if err := CheckCrossEngineSupportable(s, "postgres-trigger", "mysql", "migrate"); err == nil {
 		t.Error("postgres-trigger → mysql with standalone sequence: want refusal; got nil")
 	}
 }

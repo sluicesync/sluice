@@ -119,7 +119,7 @@ func applyPGDDLInSchema(t *testing.T, dsn, schema, ddl string) {
 // allowlist = a real translation defect that must FAIL the leg.
 //
 // The allowlist is intentionally tight. Each branch:
-//   - matches on the IR Type *string* rendering (typeString), the same
+//   - matches on the IR Type *string* rendering (migcore.TypeString), the same
 //     stable form irdiff.Schemas compares, and
 //   - requires the delta to be a documented cross-engine policy, not a
 //     "close enough" guess.

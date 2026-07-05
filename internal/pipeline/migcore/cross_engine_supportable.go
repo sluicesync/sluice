@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package pipeline
+package migcore
 
 // Cross-engine supportability check. Phase 5 of the logical-backup
 // feature (`docs/dev/design/logical-backups-phase-5.md`): cross-engine
@@ -27,7 +27,7 @@ import (
 	"sluicesync.dev/sluice/internal/translate"
 )
 
-// checkCrossEngineSupportable scans the schema for column types that
+// CheckCrossEngineSupportable scans the schema for column types that
 // can't be cleanly translated from sourceEngine to targetEngine and
 // returns a non-nil error naming the first offending (table, column,
 // type) triple. Returns nil when every column either has a portable
@@ -38,7 +38,7 @@ import (
 // operator-actionable message. Same-engine pairs and unknown engine
 // pairs return nil — the latter on the principle that a new engine's
 // emitter will surface its own error if it can't handle a type.
-func checkCrossEngineSupportable(
+func CheckCrossEngineSupportable(
 	schema *ir.Schema,
 	sourceEngine, targetEngine string,
 	contextID string,
@@ -67,7 +67,7 @@ func checkCrossEngineSupportable(
 	// The literal (not pgtrigger.EngineName) keeps the orchestrator
 	// engine-neutral — the pipeline package never imports an engine
 	// package (see CLAUDE.md "IR-first" / "engine-neutral orchestrator").
-	pgToMySQL := isPGSourceEngine(sourceEngine) && isMySQLFamilyEngine(targetEngine)
+	pgToMySQL := isPGSourceEngine(sourceEngine) && IsMySQLFamilyEngine(targetEngine)
 	if !pgToMySQL {
 		return nil
 	}
@@ -117,7 +117,7 @@ func checkCrossEngineSupportable(
 		// 47 design), so any non-empty OperatorClass on a PG-source
 		// index is by construction extension-introduced; the cross-
 		// engine refusal mirrors the column-type refusal above.
-		if reason, idxName, colRef := unsupportablePGIndexToMySQL(tbl); reason != "" {
+		if reason, idxName, colRef := UnsupportablePGIndexToMySQL(tbl); reason != "" {
 			return fmt.Errorf(
 				"%s: index %q on table %q has %s (column %q) — "+
 					"no clean cross-engine translation. "+
@@ -161,7 +161,7 @@ func checkCrossEngineSupportable(
 	return translate.TextIndexRefusalError(schema, sourceEngine, targetEngine, contextID)
 }
 
-// unsupportablePGIndexToMySQL scans a table's indexes (including
+// UnsupportablePGIndexToMySQL scans a table's indexes (including
 // PrimaryKey) for any [ir.IndexColumn.OperatorClass] that's
 // non-empty. Returns a (reason, indexName, columnRef) triple naming
 // the offending shape, or empty strings when every index is
@@ -169,7 +169,7 @@ func checkCrossEngineSupportable(
 // only for extension-introduced opclasses (ADR-0032 / Bug 47); a
 // non-empty value passing through the IR therefore indicates an
 // extension-owned opclass with no MySQL counterpart.
-func unsupportablePGIndexToMySQL(tbl *ir.Table) (reason, indexName, columnRef string) {
+func UnsupportablePGIndexToMySQL(tbl *ir.Table) (reason, indexName, columnRef string) {
 	if tbl == nil {
 		return "", "", ""
 	}
@@ -311,13 +311,13 @@ func unsupportablePGtoMySQL(t ir.Type) string {
 // manifest — the source database is never connected (and its engine
 // need not even be registered in this binary) at restore time, so a
 // capability declaration isn't resolvable. The names ARE the durable
-// record. Keep this list and [isMySQLFamilyEngine] in lock-step with
+// record. Keep this list and [IsMySQLFamilyEngine] in lock-step with
 // the engine registrations.
 func isPGSourceEngine(engine string) bool {
 	return engine == "postgres" || engine == "postgres-trigger"
 }
 
-// isMySQLFamilyEngine reports whether engine is a MySQL-family target
+// IsMySQLFamilyEngine reports whether engine is a MySQL-family target
 // for cross-engine supportability purposes — an engine with no
 // PG-native type surface, so every PG-only shape (PostGIS Geometry,
 // extension opclasses, EXCLUDE constraints) must refuse loudly before
@@ -326,9 +326,9 @@ func isPGSourceEngine(engine string) bool {
 // PlanetScale's engine code and capabilities verbatim — ADR-0073(a)).
 //
 // A NAME check for the same reason as [isPGSourceEngine]: the engine
-// pair reaching [checkCrossEngineSupportable] is recorded-name-driven
+// pair reaching [CheckCrossEngineSupportable] is recorded-name-driven
 // (backup lineage), so capabilities aren't resolvable here.
-func isMySQLFamilyEngine(engine string) bool {
+func IsMySQLFamilyEngine(engine string) bool {
 	return engine == "mysql" || engine == "planetscale" || engine == "vitess"
 }
 
@@ -347,52 +347,13 @@ func isCrossEngineTranslatablePGExtension(name string) bool {
 	return false
 }
 
-// checkShardColumnSupport refuses loudly when the operator engaged
-// Shape A (`--inject-shard-column NAME=VALUE`) but the target engine
-// doesn't implement [ir.ShardColumnSetter] — without the applier-side
-// stamp CDC events would land on the consolidated target with the
-// discriminator column NULL, then violate the rewritten composite-PK
-// NOT NULL constraint, then silently mis-target rows across shards
-// on Update/Delete. Pre-flighting here keeps the loud-failure tenet
-// (no silent cross-shard corruption) when a future engine ships
-// without the surface; the two currently-shipping engines (mysql,
-// postgres) both implement it, so this is a defence-in-depth gate
-// rather than a routinely-fired refusal.
-//
-// `target` is a freshly-opened engine handle (typically a
-// [ir.ChangeApplier] for sync runs, or a [ir.RowWriter] for migrate
-// runs); the check uses the same type-assertion shape the runtime
-// wiring uses. Returns nil when the operator hasn't engaged Shape A
-// or when the target implements the setter.
-func checkShardColumnSupport(target any, shard ShardColumnSpec, contextID string) error {
-	if !shard.Engaged() {
-		return nil
-	}
-	if _, ok := target.(ir.ShardColumnSetter); ok {
-		return nil
-	}
-	return fmt.Errorf(
-		"%s: target engine does not implement ir.ShardColumnSetter — "+
-			"--inject-shard-column %s=%v requires the CDC/bulk-apply path "+
-			"to stamp the discriminator onto every row before SQL emission. "+
-			"Without it, consolidated CDC events would land with the column "+
-			"NULL and either violate the rewritten composite-PK NOT NULL "+
-			"constraint or silently mis-target rows across shards (ADR-0048). "+
-			"Recovery: pick a target engine that implements the surface "+
-			"(today's shipping mysql/postgres both do), or drop "+
-			"--inject-shard-column for this stream",
-		contextID, shard.Name, shard.Value,
-	)
-}
-
-// checkCrossEngineDeltaSupportable scans an incremental's schema-delta
 // entries for shapes whose translated form would not be cleanly
 // supportable on the target engine. Mirrors
-// [checkCrossEngineSupportable] but only inspects the after-shape of
+// [CheckCrossEngineSupportable] but only inspects the after-shape of
 // AddTable / AlterTable entries (DropTable / DropColumn don't carry a
 // portable-type concern). Returns nil for same-engine pairs and unknown
 // engine pairs; a wrapped error naming the offending column otherwise.
-func checkCrossEngineDeltaSupportable(
+func CheckCrossEngineDeltaSupportable(
 	deltas []*irbackup.SchemaDeltaEntry,
 	sourceEngine, targetEngine, backupID string,
 ) error {
@@ -408,7 +369,7 @@ func checkCrossEngineDeltaSupportable(
 			tbl := &ir.Schema{Tables: []*ir.Table{d.After}}
 			ctxID := fmt.Sprintf("chain restore: incremental %s schema delta on table %q",
 				backupID, d.Table)
-			if err := checkCrossEngineSupportable(tbl, sourceEngine, targetEngine, ctxID); err != nil {
+			if err := CheckCrossEngineSupportable(tbl, sourceEngine, targetEngine, ctxID); err != nil {
 				return err
 			}
 		}

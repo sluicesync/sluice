@@ -421,7 +421,7 @@ func TestMigrate_PG_PgTrgm_TargetMissing_RefusedAtPreflight(t *testing.T) {
 
 // TestMigrate_PG_PgTrgm_CrossEngineToMySQL_RefusedAtPreflight pins
 // the v0.30.1 wire-up: simple-mode migrate now runs
-// checkCrossEngineSupportable before any data moves, so a PG source
+// migcore.CheckCrossEngineSupportable before any data moves, so a PG source
 // with a pg_trgm-indexed table targeting MySQL fails at preflight
 // with an actionable refusal — NOT silently bulk-copies and then
 // dies cryptically at MySQL Error 1170 during the indexes phase.
@@ -460,7 +460,7 @@ func TestMigrate_PG_PgTrgm_CrossEngineToMySQL_RefusedAtPreflight(t *testing.T) {
 		// PG source that *happens* to have a pg_trgm-indexed table —
 		// the v0.30.0 cycle showed that without the v0.30.1 migrate-
 		// path preflight wire-up + the AM-based check in
-		// unsupportablePGIndexToMySQL, the operator gets MySQL Error
+		// migcore.UnsupportablePGIndexToMySQL, the operator gets MySQL Error
 		// 1170 after bulk-copy. Pinning that refusal here.
 	}
 
@@ -475,7 +475,7 @@ func TestMigrate_PG_PgTrgm_CrossEngineToMySQL_RefusedAtPreflight(t *testing.T) {
 	//      is paired with a non-PG target (source-side reader gate; the
 	//      earliest gate in the migrate pipeline).
 	//   2. The v0.30.1 migrate-path preflight via
-	//      unsupportablePGIndexToMySQL refuses on the opclass-bearing
+	//      migcore.UnsupportablePGIndexToMySQL refuses on the opclass-bearing
 	//      IndexColumn (runs after ApplyMappings; only fires when (1)
 	//      didn't already catch it).
 	// Either is correct — both happen before any data moves. Assert on

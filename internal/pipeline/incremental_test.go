@@ -17,6 +17,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // fakeCDCEngine is a backup-recorder analogue for incremental tests:
@@ -586,7 +587,7 @@ func TestDiffSchemas_AddDropAlter(t *testing.T) {
 		{Name: "fresh_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
 	}}
 
-	deltas := diffSchemas(before, after)
+	deltas := migcore.DiffSchemas(before, after)
 	// Expect: drop to_drop, add fresh_table, alter users.
 	kinds := map[string]int{}
 	for _, d := range deltas {
@@ -610,7 +611,7 @@ func TestDiffSchemas_NoChange(t *testing.T) {
 		Name:    "users",
 		Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
 	}}}
-	if got := diffSchemas(s, s); len(got) != 0 {
+	if got := migcore.DiffSchemas(s, s); len(got) != 0 {
 		t.Errorf("no-change diff = %+v; want empty", got)
 	}
 }

@@ -3,14 +3,14 @@
 
 // Unit pins for the Bug 136 wire-up: an index key part on a column
 // that lands on MySQL as TEXT/BLOB/JSON (no inline key length) must
-// refuse at checkCrossEngineSupportable — the shared pre-DDL
+// refuse at CheckCrossEngineSupportable — the shared pre-DDL
 // chokepoint for migrate, chain restore, and restore — instead of
 // failing with MySQL Error 1170 at create-indexes, after bulk copy.
 // The scan itself (full type-family × index-shape matrix) is pinned in
 // internal/translate/text_index_test.go; these tests pin the pipeline
 // wiring and the same-engine no-fire contract.
 
-package pipeline
+package migcore
 
 import (
 	"strings"
@@ -44,7 +44,7 @@ func bug136Schema() *ir.Schema {
 // index on a text column refuses BEFORE any DDL/data moves, naming the
 // row, the index, and the --type-override workaround.
 func TestCheckCrossEngineSupportable_PGtoMySQL_TextIndexRefuses(t *testing.T) {
-	err := checkCrossEngineSupportable(bug136Schema(), "postgres", "mysql", "migrate")
+	err := CheckCrossEngineSupportable(bug136Schema(), "postgres", "mysql", "migrate")
 	if err == nil {
 		t.Fatal("err = nil; want Bug 136 text-index refusal")
 	}
@@ -78,10 +78,10 @@ func TestCheckCrossEngineSupportable_SameEngineTextIndexAllowed(t *testing.T) {
 			Columns: []ir.IndexColumn{{Column: "body", Length: 64}},
 		}},
 	}}}
-	if err := checkCrossEngineSupportable(prefixed, "mysql", "mysql", "migrate"); err != nil {
+	if err := CheckCrossEngineSupportable(prefixed, "mysql", "mysql", "migrate"); err != nil {
 		t.Errorf("MySQL → MySQL prefix-indexed TEXT: err = %v; want nil", err)
 	}
-	if err := checkCrossEngineSupportable(bug136Schema(), "postgres", "postgres", "migrate"); err != nil {
+	if err := CheckCrossEngineSupportable(bug136Schema(), "postgres", "postgres", "migrate"); err != nil {
 		t.Errorf("PG → PG text index: err = %v; want nil", err)
 	}
 }
@@ -94,7 +94,7 @@ func TestCheckCrossEngineSupportable_SameEngineTextIndexAllowed(t *testing.T) {
 func TestCheckCrossEngineSupportable_PGtoMySQL_OverriddenTextIndexAllowed(t *testing.T) {
 	s := bug136Schema()
 	s.Tables[0].Columns[1].Type = ir.Varchar{Length: 255}
-	if err := checkCrossEngineSupportable(s, "postgres", "mysql", "migrate"); err != nil {
+	if err := CheckCrossEngineSupportable(s, "postgres", "mysql", "migrate"); err != nil {
 		t.Errorf("overridden column: err = %v; want nil", err)
 	}
 }
@@ -109,7 +109,7 @@ func TestCheckCrossEngineDeltaSupportable_TextIndexRefuses(t *testing.T) {
 		Table: "users",
 		After: bug136Schema().Tables[0],
 	}}
-	err := checkCrossEngineDeltaSupportable(deltas, "postgres", "mysql", "bk-1")
+	err := CheckCrossEngineDeltaSupportable(deltas, "postgres", "mysql", "bk-1")
 	if err == nil {
 		t.Fatal("err = nil; want Bug 136 refusal through the delta path")
 	}

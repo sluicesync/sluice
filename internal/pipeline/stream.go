@@ -1125,7 +1125,7 @@ func (b *BackupStream) refreshSchemaAndAttachDelta(
 	if err != nil {
 		return fmt.Errorf("rollover: read source schema: %w", err)
 	}
-	delta := diffSchemas(beforeSchema, afterSchema)
+	delta := migcore.DiffSchemas(beforeSchema, afterSchema)
 	if len(delta) == 0 {
 		// item 51: no-DDL rollovers still refresh the standalone-
 		// sequence positions (hash-invisible — see the incremental

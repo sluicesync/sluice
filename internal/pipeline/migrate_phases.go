@@ -242,7 +242,7 @@ func (m *Migrator) phaseTranslateAndGateSchema(ctx context.Context, sr ir.Schema
 	// refusal here so the recovery hint names the unsupportable
 	// shape before any data moves.
 	if m.Source.Name() != m.Target.Name() {
-		if err := checkCrossEngineSupportable(
+		if err := migcore.CheckCrossEngineSupportable(
 			schema, m.Source.Name(), m.Target.Name(), "migrate",
 		); err != nil {
 			return nil, false, err

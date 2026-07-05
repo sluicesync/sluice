@@ -193,7 +193,7 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	//    schema + every link's delta for unsupportable types.
 	crossEngine := root.manifest.SourceEngine != r.Target.Name() && root.manifest.SourceEngine != ""
 	if crossEngine {
-		if err := checkCrossEngineSupportable(
+		if err := migcore.CheckCrossEngineSupportable(
 			root.manifest.Schema,
 			root.manifest.SourceEngine, r.Target.Name(),
 			fmt.Sprintf("chain restore: full %s", manifestBackupID(root.manifest)),
@@ -201,7 +201,7 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 			return err
 		}
 		for _, link := range links[1:] {
-			if err := checkCrossEngineDeltaSupportable(
+			if err := migcore.CheckCrossEngineDeltaSupportable(
 				link.manifest.SchemaDelta,
 				root.manifest.SourceEngine, r.Target.Name(),
 				manifestBackupID(link.manifest),

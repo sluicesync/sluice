@@ -1827,7 +1827,7 @@ func applyStreamID(target any, streamID string) {
 //
 // Empty shard.Name is a no-op; the setter is only invoked when
 // Shape A is engaged. Cross-engine refusal lives separately in
-// [checkCrossEngineSupportable] (a target engine that doesn't
+// [migcore.CheckCrossEngineSupportable] (a target engine that doesn't
 // implement the setter is refused there before any data moves).
 func applyShardColumn(target any, shard ShardColumnSpec) {
 	if !shard.Engaged() {

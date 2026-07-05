@@ -540,7 +540,7 @@ func TestRestore_CrossEngine_RetargetsTypes(t *testing.T) {
 
 // TestRestore_CrossEngine_SingleManifest_RefusesUnsupportable pins
 // the Bug 134 fix: the SINGLE-MANIFEST restore branch (Restore.Run,
-// no incrementals) must run the same checkCrossEngineSupportable gate
+// no incrementals) must run the same migcore.CheckCrossEngineSupportable gate
 // the chain path has had since Phase 5. Pre-fix, a full-only PG
 // backup carrying an EXCLUDE constraint restored to a MySQL-family
 // target with exit 0 and the constraint silently downgraded to a
@@ -548,7 +548,7 @@ func TestRestore_CrossEngine_RetargetsTypes(t *testing.T) {
 // instance one branch over from the v0.99.32 chain-path fix.
 //
 // Matrix: {mysql, vitess, planetscale} targets refuse identically
-// (the family is "MySQL-family target", per the isMySQLFamilyEngine
+// (the family is "MySQL-family target", per the migcore.IsMySQLFamilyEngine
 // set the vitess gap was about); PG→PG passes (same-engine); a clean
 // schema passes the gate cross-engine. The per-CONSTRUCT family
 // coverage (opclasses, GIN, PostGIS, …) lives on the gate's own

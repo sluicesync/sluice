@@ -419,7 +419,7 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("incremental: read source schema (end): %w", err))
 	}
-	manifest.SchemaDelta = diffSchemas(beforeSchema, afterSchema)
+	manifest.SchemaDelta = migcore.DiffSchemas(beforeSchema, afterSchema)
 	if len(manifest.SchemaDelta) > 0 {
 		// The end-state schema is more useful for restore-side
 		// targeting than the start-state. Swap it in so the manifest's

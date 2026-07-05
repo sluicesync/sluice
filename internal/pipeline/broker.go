@@ -1020,7 +1020,7 @@ func (b *SyncFromBackup) applySchemaDeltas(ctx context.Context, link *segmentRec
 
 	sourceEngine := link.manifest.SourceEngine
 	targetEngine := b.Target.Name()
-	if err := checkCrossEngineDeltaSupportable(
+	if err := migcore.CheckCrossEngineDeltaSupportable(
 		link.manifest.SchemaDelta, sourceEngine, targetEngine,
 		manifestBackupID(link.manifest),
 	); err != nil {
