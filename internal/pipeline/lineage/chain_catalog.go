@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package pipeline
+package lineage
 
 // # lineage.json — native bounded-segment lineage catalog (ADR-0046)
 //
@@ -64,14 +64,14 @@ const LineageCatalogFileName = "lineage.json"
 // additive fields don't require a bump.
 const lineageCatalogFormatVersion = 1
 
-// LineageCatalog is the deserialised content of lineage.json. The
+// Catalog is the deserialised content of lineage.json. The
 // Segments slice is ordered: Segments[0] is the lineage root (the
 // first full + its incrementals), each subsequent segment opened by an
 // inline rotation. Segments[i].EndPosition <= Segments[i+1].StartPosition
 // by construction (the rotation FSM's S>=P_N hard-fail assertion); the
 // restore lineage-walk validates it with the SAME monotonicity check
 // it uses for intra-segment incremental boundaries.
-type LineageCatalog struct {
+type Catalog struct {
 	FormatVersion int       `json:"format_version"`
 	LineageID     string    `json:"lineage_id,omitempty"`
 	SluiceVersion string    `json:"sluice_version,omitempty"`
@@ -81,7 +81,7 @@ type LineageCatalog struct {
 
 	// Segments is the ordered segment list. One entry for a
 	// never-rotated backup; N for a backup rotated N-1 times.
-	Segments []LineageSegment `json:"segments"`
+	Segments []Segment `json:"segments"`
 
 	// RestorableFromSegment is the prune floor: the index of the
 	// oldest segment still fully restorable. Prune (ADR-0046 §4)
@@ -90,19 +90,19 @@ type LineageCatalog struct {
 	RestorableFromSegment int `json:"restorable_from_segment"`
 }
 
-// LineageSegment is one segment within a lineage: a `backup full`
+// Segment is one segment within a lineage: a `backup full`
 // anchor plus the incrementals chained off it, capped by policy.
 //
 // Wire shape matches ADR-0046 §1. CappedAt / CapReason are absent
 // (zero / empty) on the open (last) segment and set on every prior
 // segment by the rotation FSM's atomic COMMIT write.
-type LineageSegment struct {
+type Segment struct {
 	// SegmentID is a stable identifier for the segment (the full's
 	// BackupID). Used for log lines and operator inspection.
 	SegmentID string `json:"segment_id"`
 
 	// Dir is the segment's sub-directory relative to the lineage root,
-	// consumed via [newPrefixedStore]. EMPTY for segment 0 of a
+	// consumed via [NewPrefixedStore]. EMPTY for segment 0 of a
 	// never-rotated (or the root segment of a rotated) lineage — that
 	// segment lives at the conventional root paths so a one-segment
 	// lineage is byte-identical to a pre-ADR single chain. Rotation-
@@ -144,7 +144,7 @@ type LineageSegment struct {
 	// restore's segment-to-segment boundary) key off this field.
 	//
 	// Empty/absent resolves to StartPosition via
-	// [LineageSegment.incrementalCoverageStartOrStart] — the pre-ADR-0067
+	// [Segment.IncrementalCoverageStartOrStart] — the pre-ADR-0067
 	// behavior (never-rotated segments, segment 0, and every backup
 	// written before this field existed; additive, no format bump).
 	//
@@ -191,17 +191,17 @@ type LineageSegment struct {
 
 // hasVerbatimExtensionColumns reports whether the segment carries the
 // ADR-0047 PG-restore-only marker.
-func (s *LineageSegment) hasVerbatimExtensionColumns() bool {
+func (s *Segment) HasVerbatimExtensionColumns() bool {
 	return len(s.VerbatimExtensionColumns) > 0
 }
 
 // codecOrDefault returns the segment's recorded codec, resolving an
 // empty value to [blobcodec.DefaultCodec] (zstd).
-func (s *LineageSegment) codecOrDefault() blobcodec.Codec { return blobcodec.ResolveCodec(s.Codec) }
+func (s *Segment) CodecOrDefault() blobcodec.Codec { return blobcodec.ResolveCodec(s.Codec) }
 
 // incrementalCoverageStartOrStart returns the segment's earliest
 // incremental-coverage position (ADR-0067). When
-// [LineageSegment.IncrementalCoverageStart] is set (a rotation-opened
+// [Segment.IncrementalCoverageStart] is set (a rotation-opened
 // segment, where it equals the prior segment's EndPosition P_N) that
 // value wins; otherwise it resolves to StartPosition (never-rotated
 // segments, segment 0, and pre-ADR-0067 backups — the historical
@@ -209,7 +209,7 @@ func (s *LineageSegment) codecOrDefault() blobcodec.Codec { return blobcodec.Res
 // The two contiguity checks (compaction §14d + restore segment-to-
 // segment boundary) compare against THIS, not StartPosition, so a
 // rotated lineage reads as gapless.
-func (s *LineageSegment) incrementalCoverageStartOrStart() ir.Position {
+func (s *Segment) IncrementalCoverageStartOrStart() ir.Position {
 	if s.IncrementalCoverageStart.Engine == "" && s.IncrementalCoverageStart.Token == "" {
 		return s.StartPosition
 	}
@@ -217,21 +217,21 @@ func (s *LineageSegment) incrementalCoverageStartOrStart() ir.Position {
 }
 
 // open reports whether this is the open (last, uncapped) segment.
-func (s *LineageSegment) open() bool { return s.CappedAt == nil || s.CappedAt.IsZero() }
+func (s *Segment) Open() bool { return s.CappedAt == nil || s.CappedAt.IsZero() }
 
 // store returns the per-segment [irbackup.Store] view: the lineage
 // store narrowed to the segment's Dir (a no-op wrap when Dir == "",
 // the common one-segment / root-segment shape).
-func (s *LineageSegment) store(root irbackup.Store) irbackup.Store {
-	return newPrefixedStore(root, s.Dir)
+func (s *Segment) Store(root irbackup.Store) irbackup.Store {
+	return NewPrefixedStore(root, s.Dir)
 }
 
-// loadLineageCatalog reads lineage.json from store. Returns (catalog,
+// LoadLineageCatalog reads lineage.json from store. Returns (catalog,
 // true, nil) when present and parseable; (nil, false, nil) when
 // absent; (nil, false, err) for I/O / parse / version failures. The
 // "absent" case is the legacy one-segment fall-through callers handle
 // by synthesising a single root segment over the conventional layout.
-func loadLineageCatalog(ctx context.Context, store irbackup.Store) (*LineageCatalog, bool, error) {
+func LoadLineageCatalog(ctx context.Context, store irbackup.Store) (*Catalog, bool, error) {
 	exists, err := store.Exists(ctx, LineageCatalogFileName)
 	if err != nil {
 		return nil, false, fmt.Errorf("inspect %q: %w", LineageCatalogFileName, err)
@@ -248,7 +248,7 @@ func loadLineageCatalog(ctx context.Context, store irbackup.Store) (*LineageCata
 	if err != nil {
 		return nil, false, fmt.Errorf("read %q: %w", LineageCatalogFileName, err)
 	}
-	var cat LineageCatalog
+	var cat Catalog
 	if err := json.Unmarshal(body, &cat); err != nil {
 		return nil, false, fmt.Errorf("decode %q: %w", LineageCatalogFileName, err)
 	}
@@ -263,14 +263,14 @@ func loadLineageCatalog(ctx context.Context, store irbackup.Store) (*LineageCata
 	return &cat, true, nil
 }
 
-// writeLineageCatalog serialises cat as indented JSON and writes it to
+// WriteLineageCatalog serialises cat as indented JSON and writes it to
 // store via a single-object Put. **This single Put is the rotation
 // FSM's atomic linearization point** (ADR-0046 §2 COMMIT): it is
 // always issued AFTER the next segment's full is durable, so there is
 // no window in which the lineage is non-authoritative. Atomic at the
 // storage layer from any reader's perspective (object stores: a Put is
 // all-or-nothing; local FS: write-tmp + rename inside LocalStore).
-func writeLineageCatalog(ctx context.Context, store irbackup.Store, cat *LineageCatalog) error {
+func WriteLineageCatalog(ctx context.Context, store irbackup.Store, cat *Catalog) error {
 	cat.FormatVersion = lineageCatalogFormatVersion
 	b, err := json.MarshalIndent(cat, "", "  ")
 	if err != nil {
@@ -279,19 +279,19 @@ func writeLineageCatalog(ctx context.Context, store irbackup.Store, cat *Lineage
 	return store.Put(ctx, LineageCatalogFileName, bytes.NewReader(b))
 }
 
-// segmentRecord pairs a parsed manifest with the path it loaded from
+// SegmentRecord pairs a parsed manifest with the path it loaded from
 // AND the segment it belongs to. The chain-walk + restore code carries
 // the segment so it can resolve the per-segment store + codec without
-// re-deriving them. Embeds [manifestRecord] so existing helpers
-// (manifestBackupID etc.) work unchanged.
-type segmentRecord struct {
-	manifestRecord
-	segment *LineageSegment
+// re-deriving them. Embeds [ManifestRecord] so existing helpers
+// (ManifestBackupID etc.) work unchanged.
+type SegmentRecord struct {
+	ManifestRecord
+	Segment *Segment
 }
 
-// resolveLineage returns the lineage for store. When lineage.json is
+// ResolveLineage returns the lineage for store. When lineage.json is
 // present it's authoritative. When UNREADABLE (parse/version/IO
-// error), [loadLineageCatalog] already surfaced a loud error. When
+// error), [LoadLineageCatalog] already surfaced a loud error. When
 // ABSENT, a single synthetic root segment (Dir == "", codec
 // [blobcodec.DefaultCodec]) is constructed over the conventional layout — the
 // pre-ADR single-chain shape, a one-segment lineage by strict
@@ -300,10 +300,10 @@ type segmentRecord struct {
 // while lineage.json is absent, the backup is a rotated multi-segment
 // lineage that cannot be reconstructed from a bare walk: that is a
 // LOUD refusal, never a silent root-only partial (Bug 66 — the absent
-// case does NOT auto-surface from loadLineageCatalog the way the
-// unreadable case does, so resolveLineage must guard it here).
-func resolveLineage(ctx context.Context, store irbackup.Store) (*LineageCatalog, error) {
-	cat, ok, err := loadLineageCatalog(ctx, store)
+// case does NOT auto-surface from LoadLineageCatalog the way the
+// unreadable case does, so ResolveLineage must guard it here).
+func ResolveLineage(ctx context.Context, store irbackup.Store) (*Catalog, error) {
+	cat, ok, err := LoadLineageCatalog(ctx, store)
 	if err != nil {
 		return nil, fmt.Errorf("lineage catalog: %w", err)
 	}
@@ -320,9 +320,9 @@ func resolveLineage(ctx context.Context, store irbackup.Store) (*LineageCatalog,
 	// contract the unreadable-lineage.json path already honors). A
 	// genuine never-rotated / pre-ADR backup has no `seg-*` dirs and
 	// still synthesizes + restores below (strict generalization).
-	segEvidence, err := store.List(ctx, rotationSegmentDirPrefix)
+	segEvidence, err := store.List(ctx, RotationSegmentDirPrefix)
 	if err != nil {
-		return nil, fmt.Errorf("inspect rotation segments (%s*): %w", rotationSegmentDirPrefix, err)
+		return nil, fmt.Errorf("inspect rotation segments (%s*): %w", RotationSegmentDirPrefix, err)
 	}
 	if len(segEvidence) > 0 {
 		return nil, fmt.Errorf(
@@ -332,13 +332,13 @@ func resolveLineage(ctx context.Context, store irbackup.Store) (*LineageCatalog,
 				"Restore from a copy whose lineage.json is intact (it is the authoritative structural "+
 				"record for a rotated backup; `backup verify --rebuild-catalog` only rebuilds the "+
 				"legacy one-segment shape)",
-			rotationSegmentDirPrefix,
+			RotationSegmentDirPrefix,
 		)
 	}
 	// Absent and genuinely single-segment: synthesise the legacy
 	// lineage. The manifest list is discovered by a directory walk (the
 	// pre-v0.47.0 fall-through, preserved for the one-segment shape).
-	root := &LineageSegment{
+	root := &Segment{
 		Dir:              "",
 		FullManifestPath: ManifestFileName,
 		Codec:            blobcodec.DefaultCodec,
@@ -350,16 +350,16 @@ func resolveLineage(ctx context.Context, store irbackup.Store) (*LineageCatalog,
 	if !exists {
 		return nil, errors.New("no manifests found in store (no lineage.json, no manifest.json) — take a `sluice backup full` first")
 	}
-	fullM, err := readManifestAt(ctx, store, ManifestFileName)
+	fullM, err := ReadManifestAt(ctx, store, ManifestFileName)
 	if err != nil {
 		return nil, fmt.Errorf("read %q: %w", ManifestFileName, err)
 	}
-	root.SegmentID = manifestBackupID(fullM)
+	root.SegmentID = ManifestBackupID(fullM)
 	root.StartPosition = fullM.EndPosition
 	root.EndPosition = fullM.EndPosition
-	incs, err := store.List(ctx, incrementalManifestPrefix)
+	incs, err := store.List(ctx, IncrementalManifestPrefix)
 	if err != nil {
-		return nil, fmt.Errorf("list %q: %w", incrementalManifestPrefix, err)
+		return nil, fmt.Errorf("list %q: %w", IncrementalManifestPrefix, err)
 	}
 	sort.Strings(incs)
 	for _, p := range incs {
@@ -367,55 +367,55 @@ func resolveLineage(ctx context.Context, store irbackup.Store) (*LineageCatalog,
 			root.Incrementals = append(root.Incrementals, p)
 		}
 	}
-	return &LineageCatalog{
+	return &Catalog{
 		FormatVersion: lineageCatalogFormatVersion,
 		SourceEngine:  fullM.SourceEngine,
 		SluiceVersion: fullM.SluiceVersion,
-		Segments:      []LineageSegment{*root},
+		Segments:      []Segment{*root},
 	}, nil
 }
 
-// listAllSegmentManifests returns every manifest across every segment
+// ListAllSegmentManifests returns every manifest across every segment
 // of the lineage in lineage order (segment 0 full, segment 0
 // incrementals, segment 1 full, ...), each tagged with its segment so
 // callers know which per-segment store + codec to use. Replaces the
 // pre-ADR [listAllManifests] catalog/walk dispatch — the lineage is
 // the single dispatch point now.
-func listAllSegmentManifests(ctx context.Context, store irbackup.Store) ([]segmentRecord, error) {
-	cat, err := resolveLineage(ctx, store)
+func ListAllSegmentManifests(ctx context.Context, store irbackup.Store) ([]SegmentRecord, error) {
+	cat, err := ResolveLineage(ctx, store)
 	if err != nil {
 		return nil, err
 	}
-	var out []segmentRecord
+	var out []SegmentRecord
 	for i := range cat.Segments {
 		seg := &cat.Segments[i]
 		if err := blobcodec.ValidateRecordedCodec(seg.Codec); err != nil {
 			return nil, err
 		}
-		ss := seg.store(store)
-		fm, err := readManifestAt(ctx, ss, seg.FullManifestPath)
+		ss := seg.Store(store)
+		fm, err := ReadManifestAt(ctx, ss, seg.FullManifestPath)
 		if err != nil {
 			return nil, fmt.Errorf("segment %d (%s) full %q: %w", i, seg.SegmentID, seg.FullManifestPath, err)
 		}
-		out = append(out, segmentRecord{
-			manifestRecord: manifestRecord{path: seg.FullManifestPath, manifest: fm},
-			segment:        seg,
+		out = append(out, SegmentRecord{
+			ManifestRecord: ManifestRecord{Path: seg.FullManifestPath, Manifest: fm},
+			Segment:        seg,
 		})
 		for _, ip := range seg.Incrementals {
-			im, err := readManifestAt(ctx, ss, ip)
+			im, err := ReadManifestAt(ctx, ss, ip)
 			if err != nil {
 				return nil, fmt.Errorf("segment %d (%s) incremental %q: %w", i, seg.SegmentID, ip, err)
 			}
-			out = append(out, segmentRecord{
-				manifestRecord: manifestRecord{path: ip, manifest: im},
-				segment:        seg,
+			out = append(out, SegmentRecord{
+				ManifestRecord: ManifestRecord{Path: ip, Manifest: im},
+				Segment:        seg,
 			})
 		}
 	}
 	return out, nil
 }
 
-// updateLineageForManifestBestEffort keeps lineage.json in sync after
+// UpdateLineageForManifestBestEffort keeps lineage.json in sync after
 // a non-rotation manifest write (full backup completion, a normal
 // rollover's incremental). It appends/updates the manifest within the
 // OPEN segment and advances that segment's EndPosition. Rotation's
@@ -428,14 +428,14 @@ func listAllSegmentManifests(ctx context.Context, store irbackup.Store) ([]segme
 // WARN-logged and recovered on the next write. The codec is recorded
 // from the supplied value so the open segment's Codec is pinned on
 // first write and never changes mid-segment.
-func updateLineageForManifestBestEffort(
+func UpdateLineageForManifestBestEffort(
 	ctx context.Context,
 	store irbackup.Store,
 	manifest *irbackup.Manifest,
 	manifestPath string,
 	codec blobcodec.Codec,
 ) {
-	if err := updateLineageForManifest(ctx, store, manifest, manifestPath, codec); err != nil {
+	if err := UpdateLineageForManifest(ctx, store, manifest, manifestPath, codec); err != nil {
 		slog.WarnContext(
 			ctx, "lineage catalog update failed; lineage.json may be stale until next write",
 			slog.String("manifest_path", manifestPath),
@@ -444,7 +444,14 @@ func updateLineageForManifestBestEffort(
 	}
 }
 
-func updateLineageForManifest(
+// UpdateLineageForManifest is the fail-loud counterpart of
+// [UpdateLineageForManifestBestEffort]: it appends/updates the manifest
+// within the lineage's OPEN segment and advances that segment's
+// EndPosition (seeding a single root segment on the first write), and
+// returns any catalog-write error rather than swallowing it. Rotation's
+// segment-append + cap is a SEPARATE atomic write (the rotation FSM);
+// this helper never touches CappedAt / prior segments.
+func UpdateLineageForManifest(
 	ctx context.Context,
 	store irbackup.Store,
 	manifest *irbackup.Manifest,
@@ -454,7 +461,7 @@ func updateLineageForManifest(
 	if manifest == nil {
 		return errors.New("lineage catalog: nil manifest")
 	}
-	cat, ok, err := loadLineageCatalog(ctx, store)
+	cat, ok, err := LoadLineageCatalog(ctx, store)
 	if err != nil {
 		return err
 	}
@@ -462,13 +469,13 @@ func updateLineageForManifest(
 	if !ok {
 		// First lineage.json write for this backup. Seed a single root
 		// segment over the conventional layout (Dir == "").
-		cat = &LineageCatalog{
+		cat = &Catalog{
 			FormatVersion: lineageCatalogFormatVersion,
 			SourceEngine:  manifest.SourceEngine,
 			SluiceVersion: manifest.SluiceVersion,
 			CreatedAt:     now,
-			Segments: []LineageSegment{{
-				SegmentID:        manifestBackupID(manifest),
+			Segments: []Segment{{
+				SegmentID:        ManifestBackupID(manifest),
 				Dir:              "",
 				FullManifestPath: ManifestFileName,
 				Codec:            blobcodec.ResolveCodec(codec),
@@ -476,10 +483,10 @@ func updateLineageForManifest(
 		}
 	}
 	seg := &cat.Segments[len(cat.Segments)-1] // the open segment
-	switch canonicalKind(manifest.Kind) {
+	switch CanonicalKind(manifest.Kind) {
 	case irbackup.BackupKindFull:
 		seg.FullManifestPath = manifestPath
-		seg.SegmentID = manifestBackupID(manifest)
+		seg.SegmentID = ManifestBackupID(manifest)
 		seg.StartPosition = manifest.EndPosition
 		seg.EndPosition = manifest.EndPosition
 		if seg.Codec == "" {
@@ -491,7 +498,7 @@ func updateLineageForManifest(
 		// loudly. Recorded, never sniffed at restore (ADR-0046 idiom);
 		// stays nil for every non-verbatim backup so the field is
 		// absent in the common case (and legacy readers ignore it).
-		seg.VerbatimExtensionColumns = verbatimExtensionColumnsIn(manifest.Schema)
+		seg.VerbatimExtensionColumns = VerbatimExtensionColumnsIn(manifest.Schema)
 	case irbackup.BackupKindIncremental:
 		// ADR-0067: the FIRST incremental's StartPosition defines the
 		// segment's earliest incremental coverage. Record it ONLY when it
@@ -530,10 +537,10 @@ func updateLineageForManifest(
 		cat.CreatedAt = now
 	}
 	cat.UpdatedAt = now
-	return writeLineageCatalog(ctx, store, cat)
+	return WriteLineageCatalog(ctx, store, cat)
 }
 
-// openSegmentStore returns the open (last) segment's store view + the
+// OpenSegmentStore returns the open (last) segment's store view + the
 // codec recorded for it. For an absent lineage.json (the legacy
 // one-segment shape, or a freshly-written full not yet lineage-
 // catalogued) it returns the root store + the supplied write codec
@@ -547,8 +554,8 @@ func updateLineageForManifest(
 // incremental into a never-catalogued backup). When the lineage exists
 // the recorded codec wins (codec is recorded, never re-chosen
 // mid-segment — a segment is single-codec by construction).
-func openSegmentStore(ctx context.Context, store irbackup.Store, writeCodec blobcodec.Codec) (irbackup.Store, blobcodec.Codec, error) {
-	cat, ok, err := loadLineageCatalog(ctx, store)
+func OpenSegmentStore(ctx context.Context, store irbackup.Store, writeCodec blobcodec.Codec) (irbackup.Store, blobcodec.Codec, error) {
+	cat, ok, err := LoadLineageCatalog(ctx, store)
 	if err != nil {
 		return nil, "", err
 	}
@@ -563,13 +570,13 @@ func openSegmentStore(ctx context.Context, store irbackup.Store, writeCodec blob
 	if c == "" {
 		c = blobcodec.ResolveCodec(writeCodec)
 	}
-	return seg.store(store), blobcodec.ResolveCodec(c), nil
+	return seg.Store(store), blobcodec.ResolveCodec(c), nil
 }
 
-// canonicalKind normalises empty Kind to BackupKindFull. Mirror of
-// the ir.canonicalKind helper; duplicated here so the catalog code
+// CanonicalKind normalises empty Kind to BackupKindFull. Mirror of
+// the ir.CanonicalKind helper; duplicated here so the catalog code
 // doesn't pull in unexported ir helpers.
-func canonicalKind(kind string) string {
+func CanonicalKind(kind string) string {
 	if kind == "" {
 		return irbackup.BackupKindFull
 	}
@@ -585,7 +592,7 @@ func canonicalKind(kind string) string {
 // catalog, by design (the catalog IS the structural record for a
 // rotated backup). Returns the segment + manifest count.
 func RebuildLineageCatalogAt(ctx context.Context, store irbackup.Store) (segments, manifests int, err error) {
-	recs, err := listAllManifestsViaWalk(ctx, store)
+	recs, err := ListAllManifestsViaWalk(ctx, store)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -593,39 +600,39 @@ func RebuildLineageCatalogAt(ctx context.Context, store irbackup.Store) (segment
 		return 0, 0, errors.New("rebuild: no manifests found at the conventional layout")
 	}
 	now := time.Now().UTC()
-	root := LineageSegment{
+	root := Segment{
 		Dir:              "",
 		FullManifestPath: ManifestFileName,
 		Codec:            blobcodec.DefaultCodec,
 	}
 	for _, r := range recs {
-		switch canonicalKind(r.manifest.Kind) {
+		switch CanonicalKind(r.Manifest.Kind) {
 		case irbackup.BackupKindFull:
-			root.SegmentID = manifestBackupID(r.manifest)
-			root.StartPosition = r.manifest.EndPosition
+			root.SegmentID = ManifestBackupID(r.Manifest)
+			root.StartPosition = r.Manifest.EndPosition
 			if root.EndPosition.Engine == "" && root.EndPosition.Token == "" {
-				root.EndPosition = r.manifest.EndPosition
+				root.EndPosition = r.Manifest.EndPosition
 			}
 		case irbackup.BackupKindIncremental:
-			root.Incrementals = append(root.Incrementals, r.path)
-			root.EndPosition = r.manifest.EndPosition
+			root.Incrementals = append(root.Incrementals, r.Path)
+			root.EndPosition = r.Manifest.EndPosition
 		}
 	}
-	cat := &LineageCatalog{
+	cat := &Catalog{
 		FormatVersion: lineageCatalogFormatVersion,
-		SourceEngine:  recs[0].manifest.SourceEngine,
-		SluiceVersion: recs[0].manifest.SluiceVersion,
+		SourceEngine:  recs[0].Manifest.SourceEngine,
+		SluiceVersion: recs[0].Manifest.SluiceVersion,
 		CreatedAt:     now,
 		UpdatedAt:     now,
-		Segments:      []LineageSegment{root},
+		Segments:      []Segment{root},
 	}
-	if err := writeLineageCatalog(ctx, store, cat); err != nil {
+	if err := WriteLineageCatalog(ctx, store, cat); err != nil {
 		return 0, 0, err
 	}
 	return 1, len(recs), nil
 }
 
-// reconcileOpenSegmentCatalog heals the OPEN (last) segment's recorded
+// ReconcileOpenSegmentCatalog heals the OPEN (last) segment's recorded
 // Incrementals list against the on-disk manifest chain, called on stream
 // resume before the parent is resolved.
 //
@@ -654,27 +661,27 @@ func RebuildLineageCatalogAt(ctx context.Context, store irbackup.Store) (segment
 // chain off the full (a parentless incremental, a branch, or an
 // unreachable manifest) — those are left for restore's strict check to
 // surface rather than masked by a heuristic repair.
-func reconcileOpenSegmentCatalog(ctx context.Context, rootStore, segStore irbackup.Store) error {
-	cat, ok, err := loadLineageCatalog(ctx, rootStore)
+func ReconcileOpenSegmentCatalog(ctx context.Context, rootStore, segStore irbackup.Store) error {
+	cat, ok, err := LoadLineageCatalog(ctx, rootStore)
 	if err != nil || !ok || len(cat.Segments) == 0 {
 		return err // nothing catalogued yet — fresh start, nothing to heal
 	}
 	seg := &cat.Segments[len(cat.Segments)-1]
 
-	recs, err := listAllManifestsViaWalk(ctx, segStore)
+	recs, err := ListAllManifestsViaWalk(ctx, segStore)
 	if err != nil {
 		return err
 	}
 
 	// Index incrementals by parent BackupID and locate the full.
-	childByParent := make(map[string]manifestRecord, len(recs))
+	childByParent := make(map[string]ManifestRecord, len(recs))
 	var fullID string
 	for _, r := range recs {
-		switch canonicalKind(r.manifest.Kind) {
+		switch CanonicalKind(r.Manifest.Kind) {
 		case irbackup.BackupKindFull:
-			fullID = manifestBackupID(r.manifest)
+			fullID = ManifestBackupID(r.Manifest)
 		case irbackup.BackupKindIncremental:
-			pid := r.manifest.ParentBackupID
+			pid := r.Manifest.ParentBackupID
 			if pid == "" {
 				return nil // can't chain deterministically — stay strict
 			}
@@ -689,7 +696,7 @@ func reconcileOpenSegmentCatalog(ctx context.Context, rootStore, segStore irback
 	}
 
 	// Walk the linear chain from the full, consuming each link.
-	ordered := make([]manifestRecord, 0, len(childByParent))
+	ordered := make([]ManifestRecord, 0, len(childByParent))
 	for cur := fullID; ; {
 		child, found := childByParent[cur]
 		if !found {
@@ -697,7 +704,7 @@ func reconcileOpenSegmentCatalog(ctx context.Context, rootStore, segStore irback
 		}
 		ordered = append(ordered, child)
 		delete(childByParent, cur)
-		cur = manifestBackupID(child.manifest)
+		cur = ManifestBackupID(child.Manifest)
 	}
 	if len(childByParent) != 0 {
 		return nil // an incremental wasn't reachable from the full — stay strict
@@ -705,7 +712,7 @@ func reconcileOpenSegmentCatalog(ctx context.Context, rootStore, segStore irback
 
 	paths := make([]string, len(ordered))
 	for i, r := range ordered {
-		paths[i] = r.path
+		paths[i] = r.Path
 	}
 	if slices.Equal(seg.Incrementals, paths) {
 		return nil // catalog already matches disk — idempotent no-op
@@ -713,7 +720,7 @@ func reconcileOpenSegmentCatalog(ctx context.Context, rootStore, segStore irback
 
 	seg.Incrementals = paths
 	if len(ordered) > 0 {
-		first := ordered[0].manifest
+		first := ordered[0].Manifest
 		// ADR-0067: a rotation-opened segment's first incremental starts
 		// at the (P_N, S] overlap, which precedes the full's anchor; record
 		// that coverage start. A never-rotated segment's first incremental
@@ -721,7 +728,7 @@ func reconcileOpenSegmentCatalog(ctx context.Context, rootStore, segStore irback
 		if first.StartPosition != seg.StartPosition {
 			seg.IncrementalCoverageStart = first.StartPosition
 		}
-		seg.EndPosition = ordered[len(ordered)-1].manifest.EndPosition
+		seg.EndPosition = ordered[len(ordered)-1].Manifest.EndPosition
 	}
 	cat.UpdatedAt = time.Now().UTC()
 	slog.WarnContext(
@@ -731,5 +738,5 @@ func reconcileOpenSegmentCatalog(ctx context.Context, rootStore, segStore irback
 		slog.String("seg_dir", seg.Dir),
 		slog.Int("on_disk_incrementals", len(paths)),
 	)
-	return writeLineageCatalog(ctx, rootStore, cat)
+	return WriteLineageCatalog(ctx, rootStore, cat)
 }

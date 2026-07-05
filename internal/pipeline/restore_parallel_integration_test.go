@@ -32,6 +32,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -182,7 +183,7 @@ func TestRestoreParallel_PG_EncryptedPerChunkRoundTrip(t *testing.T) {
 		SourceDSN:  sourceDSN,
 		Store:      store,
 		ChunkRows:  40,
-		Encryption: &BackupEncryption{Envelope: env, Mode: crypto.EncryptModePerChunk},
+		Encryption: &lineage.BackupEncryption{Envelope: env, Mode: crypto.EncryptModePerChunk},
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
@@ -246,9 +247,9 @@ func TestChainRestoreParallel_PG_FullPlusIncremental(t *testing.T) {
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
-	full, err := readManifest(context.Background(), store)
+	full, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{
@@ -256,7 +257,7 @@ func TestChainRestoreParallel_PG_FullPlusIncremental(t *testing.T) {
 		Token:  fmt.Sprintf(`{"slot":"sluice_slot","lsn":%q}`, slotLSN),
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("rewrite full: %v", err)
 	}
 

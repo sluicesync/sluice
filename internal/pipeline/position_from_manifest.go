@@ -24,10 +24,11 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // LoadChainTerminalPosition walks the lineage, validates its shape
-// via [buildLineageChain] (the single boundary-monotonicity
+// via [lineage.BuildLineageChain] (the single boundary-monotonicity
 // invariant, intra- and inter-segment), and returns the [ir.Position]
 // at the lineage's terminal manifest (the open segment's last
 // committed incremental). Used as the position source by
@@ -46,20 +47,20 @@ func LoadChainTerminalPosition(ctx context.Context, store irbackup.Store) (ir.Po
 	// position; the structural + write-time guarantees suffice (no
 	// source engine instance available here without breaking the
 	// pipeline's no-engine-registry layering).
-	chain, err := buildLineageChain(ctx, store, nil)
+	chain, err := lineage.BuildLineageChain(ctx, store, nil)
 	if err != nil {
 		return ir.Position{}, fmt.Errorf("position-from-manifest: build lineage: %w", err)
 	}
 	if len(chain) == 0 {
 		return ir.Position{}, errors.New("position-from-manifest: store contains no manifests")
 	}
-	terminal := chain[len(chain)-1].manifest
+	terminal := chain[len(chain)-1].Manifest
 	if terminal.EndPosition.Engine == "" && terminal.EndPosition.Token == "" {
 		return ir.Position{}, fmt.Errorf(
 			"position-from-manifest: terminal manifest %q has no EndPosition recorded "+
 				"(pre-Phase-3.3 full backup or malformed chain). Take a fresh full backup "+
 				"with sluice v0.17.2+ to populate EndPosition automatically",
-			manifestBackupID(terminal),
+			lineage.ManifestBackupID(terminal),
 		)
 	}
 	return terminal.EndPosition, nil

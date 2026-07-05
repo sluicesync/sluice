@@ -36,19 +36,16 @@ package pipeline
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"sort"
-	"strings"
 	"time"
 
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
@@ -69,43 +66,6 @@ const DefaultIncrementalChunkChanges = 100_000
 // for the legacy row-chunk path doesn't accidentally enumerate
 // incremental change chunks.
 const changeChunksPrefix = "chunks/_changes/"
-
-// incrementalManifestPrefix is the path prefix incremental manifests
-// live under. The full's manifest stays at the legacy
-// [ManifestFileName] = "manifest.json" path; incrementals live under
-// `manifests/incr-…json` so the chain-restore walker can list them
-// without a per-name pattern match.
-const incrementalManifestPrefix = "manifests/"
-
-// incrementalManifestFilenamePrefix is the per-file prefix every
-// incremental manifest's basename starts with (see
-// [buildIncrementalManifestPath]). The chain-walker filters
-// `List(manifests/)` results on this prefix so non-manifest state
-// files that share the directory (e.g. Phase 4's
-// `manifests/stream_state.json`) are not mistaken for chain entries.
-const incrementalManifestFilenamePrefix = "incr-"
-
-// isIncrementalManifestPath reports whether path is shaped like a
-// chain-restore-eligible incremental manifest entry — i.e. it sits
-// directly under [incrementalManifestPrefix], its basename begins with
-// [incrementalManifestFilenamePrefix], and it ends in `.json`. Used
-// by chain-walker manifest discovery so additions to the
-// `manifests/` directory (such as `stream_state.json`) don't get
-// treated as chain entries.
-func isIncrementalManifestPath(path string) bool {
-	if !strings.HasPrefix(path, incrementalManifestPrefix) {
-		return false
-	}
-	rest := path[len(incrementalManifestPrefix):]
-	if strings.ContainsRune(rest, '/') {
-		// Something nested under manifests/ — not a chain entry shape.
-		return false
-	}
-	if !strings.HasPrefix(rest, incrementalManifestFilenamePrefix) {
-		return false
-	}
-	return strings.HasSuffix(rest, ".json")
-}
 
 // IncrementalBackup runs a single Phase 3.1 incremental backup
 // against Source / SourceDSN, taking the parent backup's terminal
@@ -162,12 +122,12 @@ type IncrementalBackup struct {
 	SluiceVersion string
 
 	// Encryption, when non-nil, encrypts every change chunk written
-	// during this incremental's window. See [BackupEncryption]. The
+	// during this incremental's window. See [lineage.BackupEncryption]. The
 	// chain root (the parent full's manifest) governs the chain's
 	// encryption shape; the orchestrator validates that this run's
 	// encryption matches the parent at start so a mixed-mode chain
 	// can't be created.
-	Encryption *BackupEncryption
+	Encryption *lineage.BackupEncryption
 
 	// Codec is the operator's --compression choice. Consulted only
 	// when the open segment's codec isn't already pinned in
@@ -222,7 +182,7 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	//    lineage's open segment, under its Dir, with its recorded
 	//    codec (ADR-0046). For a never-rotated backup that's the root
 	//    (Dir == "") — byte-identical to the pre-ADR single chain.
-	segStore, segCodec, err := openSegmentStore(ctx, b.Store, b.Codec)
+	segStore, segCodec, err := lineage.OpenSegmentStore(ctx, b.Store, b.Codec)
 	if err != nil {
 		return fmt.Errorf("incremental: resolve open segment: %w", err)
 	}
@@ -457,7 +417,7 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	manifest.PartialState = irbackup.BackupStateComplete
 
 	manifestPath := buildIncrementalManifestPath(manifest)
-	if err := writeManifestAt(ctx, b.segStore, manifestPath, manifest); err != nil {
+	if err := lineage.WriteManifestAt(ctx, b.segStore, manifestPath, manifest); err != nil {
 		return fmt.Errorf("incremental: write manifest: %w", err)
 	}
 	// The window is durable — let the slot release WAL up to its end.
@@ -469,7 +429,7 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	// ADR-0046: append this incremental to the open segment in
 	// lineage.json (best-effort for the non-rotation path; the
 	// manifest file is authoritative for the one-segment shape).
-	updateLineageForManifestBestEffort(ctx, b.Store, manifest, manifestPath, b.segCodec)
+	lineage.UpdateLineageForManifestBestEffort(ctx, b.Store, manifest, manifestPath, b.segCodec)
 
 	slog.InfoContext(
 		ctx, "incremental backup complete",
@@ -515,7 +475,7 @@ func (b *IncrementalBackup) resolveParent(ctx context.Context) (*irbackup.Manife
 	// An incremental chains off a manifest in the OPEN segment. Walk
 	// the open segment's manifests (b.segStore is already narrowed to
 	// its Dir).
-	manifests, err := listAllManifestsViaWalk(ctx, b.segStore)
+	manifests, err := lineage.ListAllManifestsViaWalk(ctx, b.segStore)
 	if err != nil {
 		return nil, "", err
 	}
@@ -524,15 +484,15 @@ func (b *IncrementalBackup) resolveParent(ctx context.Context) (*irbackup.Manife
 	}
 	if b.ParentRef != "" {
 		for _, m := range manifests {
-			id := m.manifest.BackupID
+			id := m.Manifest.BackupID
 			if id == "" {
-				id = irbackup.ComputeBackupID(m.manifest)
+				id = irbackup.ComputeBackupID(m.Manifest)
 			}
 			if id == b.ParentRef {
-				if err := refuseInProgressParent(m.manifest, m.path); err != nil {
+				if err := refuseInProgressParent(m.Manifest, m.Path); err != nil {
 					return nil, "", err
 				}
-				return m.manifest, m.path, nil
+				return m.Manifest, m.Path, nil
 			}
 		}
 		return nil, "", fmt.Errorf("parent backup %q not found in store; available: %s",
@@ -541,10 +501,10 @@ func (b *IncrementalBackup) resolveParent(ctx context.Context) (*irbackup.Manife
 	// Resume off the chain TAIL (open segment append order), NOT
 	// max CreatedAt. See [chainTailManifest].
 	tail := chainTailManifest(ctx, b.Store, manifests)
-	if err := refuseInProgressParent(tail.manifest, tail.path); err != nil {
+	if err := refuseInProgressParent(tail.Manifest, tail.Path); err != nil {
 		return nil, "", err
 	}
-	return tail.manifest, tail.path, nil
+	return tail.Manifest, tail.Path, nil
 }
 
 // refuseInProgressParent refuses to extend a chain off a manifest whose
@@ -569,13 +529,13 @@ func refuseInProgressParent(m *irbackup.Manifest, path string) error {
 
 // chainTailManifest returns the chain tail to resume an incremental
 // off of, given the open segment's store, the walk result over that
-// store ([listAllManifestsViaWalk]: the segment full first when
+// store ([lineage.ListAllManifestsViaWalk]: the segment full first when
 // present, then the incremental manifests in lexically-sorted path
 // order), and the catalog.
 //
 // The AUTHORITATIVE chain order is the open segment's lineage.json
 // `Incrementals` slice — it is written in append (commit) order by
-// [updateLineageForManifest], so its last entry is the chain tail
+// [lineage.UpdateLineageForManifest], so its last entry is the chain tail
 // (ADR-0046: lineage.json is the structural record). The tail
 // manifest is the one at that path. When the lineage is absent (the
 // legacy never-catalogued one-segment shape) or has no incrementals
@@ -587,7 +547,7 @@ func refuseInProgressParent(m *irbackup.Manifest, path string) error {
 // platform-dependent resolution, not unique nor strictly monotonic
 // with chain order, so two back-to-back rollovers landing in the
 // same millisecond made a post-restart resolveParent resume off the
-// second-to-last link. buildLineageChain's parent-link validator
+// second-to-last link. lineage.BuildLineageChain's parent-link validator
 // (correctly) refused the resulting branched lineage at restore
 // time. Resolving the parent from the lineage's recorded append
 // order keeps the restart's first incremental stitched exactly where
@@ -600,14 +560,14 @@ func refuseInProgressParent(m *irbackup.Manifest, path string) error {
 // a segment sub-dir); recs and the segment Incrementals paths are
 // both relative to the open segment's Dir, so they match by path.
 // recs must be non-empty (callers check len == 0 first).
-func chainTailManifest(ctx context.Context, rootStore irbackup.Store, recs []manifestRecord) manifestRecord {
-	cat, ok, err := loadLineageCatalog(ctx, rootStore)
+func chainTailManifest(ctx context.Context, rootStore irbackup.Store, recs []lineage.ManifestRecord) lineage.ManifestRecord {
+	cat, ok, err := lineage.LoadLineageCatalog(ctx, rootStore)
 	if err == nil && ok && len(cat.Segments) > 0 {
 		seg := &cat.Segments[len(cat.Segments)-1] // open segment
 		if n := len(seg.Incrementals); n > 0 {
 			tailPath := seg.Incrementals[n-1]
 			for i := range recs {
-				if recs[i].path == tailPath {
+				if recs[i].Path == tailPath {
 					return recs[i]
 				}
 			}
@@ -955,125 +915,22 @@ func buildIncrementalManifestPath(m *irbackup.Manifest) string {
 	}
 	return fmt.Sprintf(
 		"%sincr-%013d-%s.json",
-		incrementalManifestPrefix,
+		lineage.IncrementalManifestPrefix,
 		m.CreatedAt.UTC().UnixMilli(),
 		short,
 	)
 }
 
-// writeManifestAt is [writeManifest] generalised to a caller-supplied
-// path. The full-backup writer's [writeManifest] hard-codes
-// [ManifestFileName]; the incremental writer needs an arbitrary path.
-func writeManifestAt(ctx context.Context, store irbackup.Store, path string, manifest *irbackup.Manifest) error {
-	b, err := json.MarshalIndent(manifest, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal manifest: %w", err)
-	}
-	return store.Put(ctx, path, bytes.NewReader(b))
-}
-
-// unmarshalManifest decodes a manifest body. Pulled out so the
-// chain-walk path and the legacy single-manifest path share one
-// implementation.
-func unmarshalManifest(body []byte) (*irbackup.Manifest, error) {
-	var m irbackup.Manifest
-	if err := json.Unmarshal(body, &m); err != nil {
-		return nil, fmt.Errorf("decode manifest: %w", err)
-	}
-	return &m, nil
-}
-
-// manifestRecord pairs a parsed manifest with the path it was loaded
-// from. Used by chain-walk and parent-resolve logic.
-type manifestRecord struct {
-	path     string
-	manifest *irbackup.Manifest
-}
-
-// listAllManifestsViaWalk is the [store.List] + per-manifest
-// [readManifestAt] implementation over the conventional one-segment
-// layout (manifest.json + manifests/incr-*.json). ADR-0046: the
-// lineage catalog ([listAllSegmentManifests]) is the cross-segment
-// dispatch point now; this walk is used for a SINGLE segment's store
-// (the open-segment parent resolve in incremental/stream, and the
-// one-segment legacy / rebuild paths). It does NOT cross segment
-// sub-dirs by design.
-func listAllManifestsViaWalk(ctx context.Context, store irbackup.Store) ([]manifestRecord, error) {
-	var out []manifestRecord
-
-	// Full's manifest at the legacy path.
-	if exists, err := store.Exists(ctx, ManifestFileName); err != nil {
-		return nil, fmt.Errorf("inspect %q: %w", ManifestFileName, err)
-	} else if exists {
-		m, err := readManifestAt(ctx, store, ManifestFileName)
-		if err != nil {
-			return nil, fmt.Errorf("read %q: %w", ManifestFileName, err)
-		}
-		out = append(out, manifestRecord{path: ManifestFileName, manifest: m})
-	}
-
-	// Incremental manifests under `manifests/`. Filter the listing on
-	// shape so non-manifest state files in the same directory (e.g.
-	// Phase 4's `manifests/stream_state.json`) aren't mistaken for
-	// chain entries.
-	paths, err := store.List(ctx, incrementalManifestPrefix)
-	if err != nil {
-		return nil, fmt.Errorf("list %q: %w", incrementalManifestPrefix, err)
-	}
-	sort.Strings(paths) // lexically sortable by construction
-	for _, p := range paths {
-		if !isIncrementalManifestPath(p) {
-			continue
-		}
-		m, err := readManifestAt(ctx, store, p)
-		if err != nil {
-			return nil, fmt.Errorf("read %q: %w", p, err)
-		}
-		out = append(out, manifestRecord{path: p, manifest: m})
-	}
-	return out, nil
-}
-
-// readManifestAt is [readManifest] generalised to a caller-supplied
-// path. Same format-version gating and ADR-0086 sidecar replay as the
-// legacy helper — chain walkers reading a crashed full's in-progress
-// manifest (the ADR-0085 adoption surface) must see the reconstructed
-// truth too. The sidecar path recorded on the manifest is relative to
-// the same store root the manifest was read from.
-func readManifestAt(ctx context.Context, store irbackup.Store, path string) (*irbackup.Manifest, error) {
-	rc, err := store.Get(ctx, path)
-	if err != nil {
-		return nil, fmt.Errorf("get %q: %w", path, err)
-	}
-	defer func() { _ = rc.Close() }()
-	body, err := io.ReadAll(rc)
-	if err != nil {
-		return nil, fmt.Errorf("read body: %w", err)
-	}
-	m, err := unmarshalManifest(body)
-	if err != nil {
-		return nil, err
-	}
-	if m.FormatVersion > irbackup.BackupFormatVersion {
-		return nil, fmt.Errorf("manifest %q format version %d is newer than this build supports (%d); upgrade sluice",
-			path, m.FormatVersion, irbackup.BackupFormatVersion)
-	}
-	if err := replayManifestProgress(ctx, store, m); err != nil {
-		return nil, err
-	}
-	return m, nil
-}
-
 // manifestSummary returns a human-readable list of manifest IDs for
 // error messages.
-func manifestSummary(records []manifestRecord) string {
+func manifestSummary(records []lineage.ManifestRecord) string {
 	parts := make([]string, 0, len(records))
 	for _, r := range records {
-		id := r.manifest.BackupID
+		id := r.Manifest.BackupID
 		if id == "" {
-			id = irbackup.ComputeBackupID(r.manifest) + " (computed)"
+			id = irbackup.ComputeBackupID(r.Manifest) + " (computed)"
 		}
-		parts = append(parts, fmt.Sprintf("%s (%s, %s)", id, r.manifest.Kind, r.path))
+		parts = append(parts, fmt.Sprintf("%s (%s, %s)", id, r.Manifest.Kind, r.Path))
 	}
 	return joinComma(parts)
 }
@@ -1116,7 +973,7 @@ func joinComma(parts []string) string {
 // failed`. Tests that pre-build envelopes with the chain's known salt
 // don't supply RebuildForChain and pass through the cold-start path.
 func (b *IncrementalBackup) alignEncryption(ctx context.Context, parent *irbackup.Manifest) ([]byte, error) {
-	parentEnc := chainRootEncryption(ctx, b.segStore, parent)
+	parentEnc := lineage.ChainRootEncryption(ctx, b.segStore, parent)
 	switch {
 	case parentEnc == nil && b.Encryption == nil:
 		return nil, nil
@@ -1128,7 +985,7 @@ func (b *IncrementalBackup) alignEncryption(ctx context.Context, parent *irbacku
 	}
 	// Both non-nil: rebind the envelope to the chain's salt (Bug 43)
 	// before validating mode / unwrapping the chain CEK.
-	if err := b.Encryption.rebindForChain(parentEnc.Argon2id); err != nil {
+	if err := b.Encryption.RebindForChain(parentEnc.Argon2id); err != nil {
 		return nil, fmt.Errorf("incremental: rebuild envelope for chain: %w", err)
 	}
 	if b.Encryption.Envelope == nil {
@@ -1164,7 +1021,7 @@ func (b *IncrementalBackup) alignEncryption(ctx context.Context, parent *irbacku
 	// any rotation surfaces later at restore — same behaviour as
 	// pre-fix, no regression introduced.
 	if probe := firstPerChunkProbe(parent); probe != nil {
-		if err := probeChunkDecrypt(b.Encryption.Envelope, probe); err != nil {
+		if err := lineage.ProbeChunkDecrypt(b.Encryption.Envelope, probe); err != nil {
 			return nil, fmt.Errorf("incremental: %w", err)
 		}
 	}

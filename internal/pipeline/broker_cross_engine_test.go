@@ -34,6 +34,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // TestSyncFromBackup_DetectChainSourceEngine_PG verifies the helper
@@ -44,7 +45,7 @@ func TestSyncFromBackup_DetectChainSourceEngine_PG(t *testing.T) {
 	full := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
 	full.SourceEngine = "postgres"
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("write full: %v", err)
 	}
 	b := &SyncFromBackup{

@@ -12,6 +12,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // TestLoadChainTerminalPosition_FullOnly pins the simplest chain
@@ -35,7 +36,7 @@ func TestLoadChainTerminalPosition_FullOnly(t *testing.T) {
 		PartialState:  irbackup.BackupStateComplete,
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("write parent: %v", err)
 	}
 
@@ -65,7 +66,7 @@ func TestLoadChainTerminalPosition_FullPlusIncrementals(t *testing.T) {
 		PartialState:  irbackup.BackupStateComplete,
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("write full: %v", err)
 	}
 
@@ -81,7 +82,7 @@ func TestLoadChainTerminalPosition_FullPlusIncrementals(t *testing.T) {
 		PartialState:   irbackup.BackupStateComplete,
 	}
 	incr1.BackupID = irbackup.ComputeBackupID(incr1)
-	if err := writeManifestAt(context.Background(), store, "manifests/incr-001.json", incr1); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, "manifests/incr-001.json", incr1); err != nil {
 		t.Fatalf("write incr1: %v", err)
 	}
 
@@ -97,7 +98,7 @@ func TestLoadChainTerminalPosition_FullPlusIncrementals(t *testing.T) {
 		PartialState:   irbackup.BackupStateComplete,
 	}
 	incr2.BackupID = irbackup.ComputeBackupID(incr2)
-	if err := writeManifestAt(context.Background(), store, "manifests/incr-002.json", incr2); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, "manifests/incr-002.json", incr2); err != nil {
 		t.Fatalf("write incr2: %v", err)
 	}
 
@@ -128,7 +129,7 @@ func TestLoadChainTerminalPosition_EmptyEndPosition(t *testing.T) {
 		// No EndPosition.
 		PartialState: irbackup.BackupStateComplete,
 	}
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("write full: %v", err)
 	}
 

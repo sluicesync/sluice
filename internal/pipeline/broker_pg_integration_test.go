@@ -39,6 +39,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -98,14 +99,14 @@ func brokerTestStreamSetup(t *testing.T, seedDDL string) (
 		teardown()
 		t.Fatalf("Backup.Run: %v", err)
 	}
-	full, _ := readManifest(context.Background(), store)
+	full, _ := lineage.ReadManifest(context.Background(), store)
 	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{
 		Engine: "postgres",
 		Token:  fmt.Sprintf(`{"slot":"sluice_slot","lsn":%q}`, slotLSN),
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		teardown()
 		t.Fatalf("rewrite full manifest: %v", err)
 	}
@@ -722,10 +723,10 @@ func waitForIncrementals(t *testing.T, store *blobcodec.LocalStore, minCount int
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		records, _ := listAllManifestsViaWalk(context.Background(), store)
+		records, _ := lineage.ListAllManifestsViaWalk(context.Background(), store)
 		var n int
 		for _, r := range records {
-			if r.manifest.Kind == irbackup.BackupKindIncremental {
+			if r.Manifest.Kind == irbackup.BackupKindIncremental {
 				n++
 			}
 		}

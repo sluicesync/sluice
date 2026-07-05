@@ -15,6 +15,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // TestRolloverHook_FiresWithEnvVars verifies the post-rollover hook
@@ -172,10 +173,10 @@ func TestRolloverHook_FailureIsWarned(t *testing.T) {
 	}
 
 	// The rollover should still have committed.
-	records, _ := listAllManifestsViaWalk(context.Background(), store)
+	records, _ := lineage.ListAllManifestsViaWalk(context.Background(), store)
 	var sawIncr bool
 	for _, r := range records {
-		if r.manifest.Kind == irbackup.BackupKindIncremental {
+		if r.Manifest.Kind == irbackup.BackupKindIncremental {
 			sawIncr = true
 		}
 	}

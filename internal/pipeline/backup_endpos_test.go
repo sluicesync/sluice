@@ -15,6 +15,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // capturingSchemaReader is a [ir.SchemaReader] that also implements
@@ -111,9 +112,9 @@ func TestBackup_RecordsEndPosition(t *testing.T) {
 		t.Fatalf("Backup.Run: %v", err)
 	}
 
-	got, err := readManifest(context.Background(), store)
+	got, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	if got.EndPosition != captured {
 		t.Errorf("EndPosition = %+v; want %+v", got.EndPosition, captured)
@@ -156,9 +157,9 @@ func TestBackup_NoCDCSkipsEndPosition(t *testing.T) {
 	if err := b.Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
-	got, err := readManifest(context.Background(), store)
+	got, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	if got.EndPosition.Engine != "" || got.EndPosition.Token != "" {
 		t.Errorf("EndPosition = %+v; want zero (engine doesn't support CDC)", got.EndPosition)
@@ -325,9 +326,9 @@ func TestBackup_TableScopedSnapshotPrefersScopedOpener(t *testing.T) {
 		t.Errorf("scoped slotName = %q; want %q", src.gotScopedSlot, "ignored_on_vstream")
 	}
 
-	got, err := readManifest(context.Background(), store)
+	got, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	if got.EndPosition != snapshotPos {
 		t.Errorf("EndPosition = %+v; want scoped snapshot-anchored %+v", got.EndPosition, snapshotPos)
@@ -391,9 +392,9 @@ func TestBackup_BaseOnlySnapshotOpenerStillRoutesToBase(t *testing.T) {
 	if src.gotSnapshotSlot != "sluice_chain_slot" {
 		t.Errorf("OpenBackupSnapshot slotName = %q; want %q", src.gotSnapshotSlot, "sluice_chain_slot")
 	}
-	got, err := readManifest(context.Background(), store)
+	got, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	if got.EndPosition != snapshotPos {
 		t.Errorf("EndPosition = %+v; want base snapshot-anchored %+v", got.EndPosition, snapshotPos)
@@ -451,9 +452,9 @@ func TestBackup_RecordsSnapshotAnchoredEndPosition(t *testing.T) {
 		t.Fatalf("Backup.Run: %v", err)
 	}
 
-	got, err := readManifest(context.Background(), store)
+	got, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	if got.EndPosition != snapshotPos {
 		t.Errorf("EndPosition = %+v; want snapshot-anchored %+v", got.EndPosition, snapshotPos)
@@ -542,9 +543,9 @@ func TestBackup_SnapshotOpenerErrorFallsBackToCapturer(t *testing.T) {
 
 	// EndPosition should be the post-sweep capturer's position, NOT
 	// the (zero-valued) snapshot position.
-	got, err := readManifest(context.Background(), store)
+	got, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	if got.EndPosition != captured {
 		t.Errorf("EndPosition = %+v; want fallback-captured %+v", got.EndPosition, captured)
@@ -595,7 +596,7 @@ func TestBackup_FallbackWhenNoSnapshotOpener(t *testing.T) {
 	if err := b.Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
-	got, _ := readManifest(context.Background(), store)
+	got, _ := lineage.ReadManifest(context.Background(), store)
 	if got.EndPosition != captured {
 		t.Errorf("EndPosition = %+v; want fallback-captured %+v", got.EndPosition, captured)
 	}

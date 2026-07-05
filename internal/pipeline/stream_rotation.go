@@ -64,6 +64,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 const (
@@ -80,16 +81,6 @@ const (
 // RotationStateFileName is the crash-recovery marker at the lineage
 // root. Single small JSON object; rewritten at each FSM phase.
 const RotationStateFileName = "rotation_state.json"
-
-// rotationSegmentDirPrefix is the on-disk prefix of every
-// rotation-opened segment sub-directory (`seg-<unix-millis>/`). Single
-// source of truth shared by the producer ([performRotation]'s
-// provisional-dir construction) and the consumer ([resolveLineage]'s
-// missing-catalog multi-segment-evidence guard, Bug 66): if any
-// `seg-*` path exists but lineage.json is absent, the backup is a
-// rotated multi-segment lineage that cannot be reconstructed from a
-// bare walk — a loud refusal, never a silent root-only partial.
-const rotationSegmentDirPrefix = "seg-"
 
 // rotationPhase enumerates the FSM phases recorded in
 // rotation_state.json. The ordering matters for crash recovery: the
@@ -215,13 +206,13 @@ func (b *BackupStream) shouldRotate(ctx context.Context, openSegRolloverSeq int,
 		// Age is measured from the OPEN segment's full CreatedAt -- the
 		// stable anchor for "how old is this segment", robust across
 		// stream restarts mid-segment.
-		cat, ok, err := loadLineageCatalog(ctx, b.Store)
+		cat, ok, err := lineage.LoadLineageCatalog(ctx, b.Store)
 		if err != nil || !ok || len(cat.Segments) == 0 {
 			return ""
 		}
 		seg := &cat.Segments[len(cat.Segments)-1]
-		ss := seg.store(b.Store)
-		fm, err := readManifestAt(ctx, ss, seg.FullManifestPath)
+		ss := seg.Store(b.Store)
+		fm, err := lineage.ReadManifestAt(ctx, ss, seg.FullManifestPath)
 		if err != nil || fm.CreatedAt.IsZero() {
 			return ""
 		}
@@ -240,7 +231,7 @@ func (b *BackupStream) shouldRotate(ctx context.Context, openSegRolloverSeq int,
 func (b *BackupStream) performRotation(ctx context.Context, in rotateInputs) (rotateResult, error) {
 	var zero rotateResult
 
-	cat, ok, err := loadLineageCatalog(ctx, b.Store)
+	cat, ok, err := lineage.LoadLineageCatalog(ctx, b.Store)
 	if err != nil {
 		return zero, fmt.Errorf("load lineage: %w", err)
 	}
@@ -263,7 +254,7 @@ func (b *BackupStream) performRotation(ctx context.Context, in rotateInputs) (ro
 	}
 
 	now := in.now()
-	provisionalDir := fmt.Sprintf(rotationSegmentDirPrefix+"%013d", now.UTC().UnixMilli())
+	provisionalDir := fmt.Sprintf(lineage.RotationSegmentDirPrefix+"%013d", now.UTC().UnixMilli())
 	st := &rotationState{
 		Phase:           rotationPhaseDrain,
 		Reason:          in.reason,
@@ -288,7 +279,7 @@ func (b *BackupStream) performRotation(ctx context.Context, in rotateInputs) (ro
 	if err := writeRotationState(ctx, b.Store, st); err != nil {
 		return zero, abortStayOpen("write rotation_state (snapshot)", err)
 	}
-	segStore := newPrefixedStore(b.Store, provisionalDir)
+	segStore := lineage.NewPrefixedStore(b.Store, provisionalDir)
 	segCodec := blobcodec.ResolveCodec(b.Codec)
 
 	if err := crashAt("post-snapshot"); err != nil {
@@ -314,7 +305,7 @@ func (b *BackupStream) performRotation(ctx context.Context, in rotateInputs) (ro
 		b.discardProvisional(ctx, provisionalDir)
 		return zero, abortStayOpen("bulk-copy next segment full", err)
 	}
-	newFull, err := readManifestAt(ctx, segStore, ManifestFileName)
+	newFull, err := lineage.ReadManifestAt(ctx, segStore, lineage.ManifestFileName)
 	if err != nil {
 		b.discardProvisional(ctx, provisionalDir)
 		return zero, abortStayOpen("read new segment full manifest", err)
@@ -367,10 +358,10 @@ func (b *BackupStream) performRotation(ctx context.Context, in rotateInputs) (ro
 	prior.CappedAt = &cappedAt
 	prior.CapReason = in.reason
 	prior.EndPosition = pN
-	cat.Segments = append(cat.Segments, LineageSegment{
-		SegmentID:        manifestBackupID(newFull),
+	cat.Segments = append(cat.Segments, lineage.Segment{
+		SegmentID:        lineage.ManifestBackupID(newFull),
 		Dir:              provisionalDir,
-		FullManifestPath: ManifestFileName,
+		FullManifestPath: lineage.ManifestFileName,
 		StartPosition:    s,
 		EndPosition:      s,
 		// ADR-0067: IncrementalCoverageStart is intentionally left UNSET
@@ -383,7 +374,7 @@ func (b *BackupStream) performRotation(ctx context.Context, in rotateInputs) (ro
 		// and an unset stamp (resolving to StartPosition = S). So P_N is
 		// only the INTENDED coverage start here, not a durable fact. The
 		// field is recorded from the ACTUAL first incremental when it
-		// commits (updateLineageForManifest) — P_N in the normal case.
+		// commits (lineage.UpdateLineageForManifest) — P_N in the normal case.
 		// ADR-0087 (Bug 139): the next stream/incremental RESUME of such a
 		// stamp-less rotation-born open segment detects this shape
 		// (rotationBoundaryResumeStart) and resumes from P_N rather than S,
@@ -394,7 +385,7 @@ func (b *BackupStream) performRotation(ctx context.Context, in rotateInputs) (ro
 		Codec: segCodec,
 	})
 	cat.UpdatedAt = cappedAt
-	if err := writeLineageCatalog(ctx, b.Store, cat); err != nil {
+	if err := lineage.WriteLineageCatalog(ctx, b.Store, cat); err != nil {
 		// The atomic authority-flip write failed -> still <=COMMIT.
 		b.discardProvisional(ctx, provisionalDir)
 		return zero, abortStayOpen("atomic lineage commit", err)
@@ -467,7 +458,7 @@ func assertAnchorMonotonic(src ir.Engine, pN, s ir.Position) error {
 // the provisional dir is unreferenced; leaving it would just waste
 // space. Errors are WARN-logged -- they don't compound the abort.
 func (b *BackupStream) discardProvisional(ctx context.Context, dir string) {
-	ss := newPrefixedStore(b.Store, dir)
+	ss := lineage.NewPrefixedStore(b.Store, dir)
 	paths, err := ss.List(ctx, "")
 	if err != nil {
 		slog.WarnContext(ctx, "rotation: could not list provisional segment for cleanup",
@@ -530,7 +521,7 @@ func recoverRotationState(ctx context.Context, store irbackup.Store) error {
 		return nil
 	}
 
-	cat, ok, err := loadLineageCatalog(ctx, store)
+	cat, ok, err := lineage.LoadLineageCatalog(ctx, store)
 	if err != nil {
 		return fmt.Errorf("rotation recovery: load lineage: %w", err)
 	}
@@ -567,7 +558,7 @@ func recoverRotationState(ctx context.Context, store irbackup.Store) error {
 		slog.String("phase_at_crash", string(st.Phase)),
 		slog.String("prior_segment_dir", st.PriorSegmentDir),
 	)
-	ps := newPrefixedStore(store, st.ProvisionalDir)
+	ps := lineage.NewPrefixedStore(store, st.ProvisionalDir)
 	if paths, lerr := ps.List(ctx, ""); lerr == nil {
 		for _, p := range paths {
 			_ = ps.Delete(ctx, p)

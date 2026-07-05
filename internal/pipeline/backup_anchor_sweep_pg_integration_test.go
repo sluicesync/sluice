@@ -26,6 +26,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -125,13 +126,13 @@ func TestBackup_ResumeSweepsOrphanedAnchorSlot_Postgres(t *testing.T) {
 
 	// 2. Flip the manifest back to in-progress — the on-disk state a
 	//    crashed run leaves — so the next run takes the resume path.
-	manifest, err := readManifest(context.Background(), store)
+	manifest, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	manifest.PartialState = irbackup.BackupStateInProgress
-	if err := writeManifest(context.Background(), store, manifest); err != nil {
-		t.Fatalf("writeManifest in-progress: %v", err)
+	if err := lineage.WriteManifest(context.Background(), store, manifest); err != nil {
+		t.Fatalf("lineage.WriteManifest in-progress: %v", err)
 	}
 
 	// 3. RESUME run: completes AND sweeps the orphan, leaving the

@@ -27,6 +27,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 func TestBackup_ResumeAfterScanOrderChange_NoDuplicatesNoHoles(t *testing.T) {
@@ -57,9 +58,9 @@ func TestBackup_ResumeAfterScanOrderChange_NoDuplicatesNoHoles(t *testing.T) {
 	if err := b1.Run(context.Background()); err != nil {
 		t.Fatalf("first Run: %v", err)
 	}
-	full, err := readManifest(context.Background(), store)
+	full, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	if len(full.Tables) != 1 || len(full.Tables[0].Chunks) != 4 {
 		t.Fatalf("premise: want 4 chunks, got %+v", full.Tables)
@@ -81,8 +82,8 @@ func TestBackup_ResumeAfterScanOrderChange_NoDuplicatesNoHoles(t *testing.T) {
 			Chunks:   []*irbackup.ChunkInfo{full.Tables[0].Chunks[0], full.Tables[0].Chunks[1]},
 		}},
 	}
-	if err := writeManifest(context.Background(), store, partial); err != nil {
-		t.Fatalf("writeManifest partial: %v", err)
+	if err := lineage.WriteManifest(context.Background(), store, partial); err != nil {
+		t.Fatalf("lineage.WriteManifest partial: %v", err)
 	}
 
 	// Run 2 (the resume) streams the SAME seven rows DESCENDING —

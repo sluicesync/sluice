@@ -30,6 +30,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/crypto"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // stubKMS is a deterministic in-process [crypto.KMSAPI] implementation
@@ -84,7 +85,7 @@ func TestBackup_SetupChainEncryption_KMS(t *testing.T) {
 
 	manifest := &irbackup.Manifest{}
 	b := &Backup{
-		Encryption: &BackupEncryption{
+		Encryption: &lineage.BackupEncryption{
 			Envelope: env,
 			Mode:     crypto.EncryptModePerChain,
 			KEKRef:   arn,

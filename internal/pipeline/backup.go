@@ -70,12 +70,9 @@ package pipeline
 // every table instead.
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"path"
 	"strings"
@@ -86,95 +83,10 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/redact"
 )
-
-// BackupEncryption is the chunk-writer-side encryption configuration
-// shared by [Backup], [IncrementalBackup], and [BackupStream]. Nil
-// means plaintext (the v0.16.x..v0.21.x shape, preserved for backward
-// compatibility); non-nil means every chunk written by this run is
-// encrypted under the supplied envelope.
-//
-// The orchestrator generates the per-chain CEK on first use (per-chain
-// mode; the default), wraps it via the envelope, and records the
-// wrapped CEK + Argon2id params (passphrase mode) in the chain
-// manifest's [irbackup.ChainEncryption] field. Per-chunk mode generates a
-// fresh CEK + wrap per chunk; the wrapped CEK lands in
-// [irbackup.ChunkEncryption.WrappedCEK].
-type BackupEncryption struct {
-	// Envelope is the [crypto.EnvelopeEncryption] implementation used
-	// to wrap CEKs. Phase 6.1: a *crypto.PassphraseEnvelope. Required
-	// when the parent struct's encryption is enabled.
-	//
-	// Cold-start path: the orchestrator uses Envelope as-is to wrap a
-	// fresh chain CEK and stamps the envelope's params on the chain
-	// root's [irbackup.ChainEncryption].
-	//
-	// Chain-extension path: when the orchestrator detects an existing
-	// chain root (or in-progress full's prior manifest) carrying
-	// recorded [irbackup.Argon2idParams], it rebuilds the envelope via
-	// [BackupEncryption.RebuildForChain] (when supplied) so the KEK
-	// derives against the chain's salt rather than a freshly-minted
-	// one. Without RebuildForChain, the orchestrator uses Envelope
-	// as-is — correct for tests that build envelopes with a known
-	// salt, broken for production CLI calls that mint fresh salts.
-	// Bug 43 (v0.22.1): closes the gap by routing CLI passphrase
-	// envelopes through RebuildForChain.
-	Envelope crypto.EnvelopeEncryption
-
-	// RebuildForChain, when non-nil, is called by the orchestrator
-	// when extending an existing encrypted chain (incremental / stream
-	// against a chain with recorded Argon2id params, or backup-full
-	// resume against an in-progress encrypted manifest). The supplied
-	// params are the chain root's recorded [irbackup.Argon2idParams] (the
-	// salt that was used to derive the chain's KEK). Implementations
-	// should rebuild a [crypto.EnvelopeEncryption] tied to that salt
-	// + the operator's passphrase / KMS key.
-	//
-	// Returning a non-nil error aborts the orchestrator's startup
-	// loudly (e.g. wrong passphrase shape).
-	//
-	// Phase 6.1: passphrase mode populates this with a closure over
-	// the operator's passphrase. KMS modes (Phase 6.2/6.3) leave it
-	// nil — KMS unwrap doesn't depend on a chain-recorded salt.
-	RebuildForChain func(parentParams *irbackup.Argon2idParams) (crypto.EnvelopeEncryption, error)
-
-	// Mode is "per-chain" (default) or "per-chunk". See
-	// `docs/dev/design/logical-backups-phase-6.md` for the trade-off.
-	Mode string
-
-	// KEKRef is the operator-visible reference recorded in
-	// [irbackup.ChainEncryption.KEKRef]. Empty for passphrase mode (the
-	// salt + Argon2id params are the reference); KMS modes record the
-	// key ARN / resource name.
-	KEKRef string
-}
-
-// rebindForChain rebuilds the encryption envelope against the parent
-// chain's recorded Argon2id params and swaps it onto the receiver. A
-// no-op when params are nil or RebuildForChain is unset; callers fall
-// through to the cold-start envelope in that case.
-//
-// Bug 43 fix: the write-side previously built the envelope with a
-// fresh-minted Argon2id salt, so unwrapping the parent chain's
-// WrappedCEK (which was sealed under the parent's salt) failed with
-// `aes-gcm open: cipher: message authentication failed`. This helper
-// is the load-bearing mirror of the read-side
-// [EncryptionFlags.buildReadEnvelope] pattern: detect chain extension
-// via recorded Argon2id params, rebuild the envelope tied to those
-// params before any CEK unwrap.
-func (e *BackupEncryption) rebindForChain(parentParams *irbackup.Argon2idParams) error {
-	if e == nil || parentParams == nil || e.RebuildForChain == nil {
-		return nil
-	}
-	env, err := e.RebuildForChain(parentParams)
-	if err != nil {
-		return err
-	}
-	e.Envelope = env
-	return nil
-}
 
 // DefaultBackupChunkRows is the per-chunk row count when [Backup]'s
 // ChunkRows is left at zero. 100,000 rows is the proto-ADR default;
@@ -183,16 +95,12 @@ func (e *BackupEncryption) rebindForChain(parentParams *irbackup.Argon2idParams)
 // time on commodity hardware. Operators tune via --chunk-size.
 const DefaultBackupChunkRows = 100_000
 
-// ManifestFileName is the filename of the manifest within a backup
-// directory. Convention; restore looks here first.
-const ManifestFileName = "manifest.json"
-
 // ManifestProgressFileName is the filename of the in-progress
 // checkpoint sidecar next to the manifest (ADR-0086): one appended
 // JSON line per chunk-finished / table-finished event, so checkpoints
 // are O(1) instead of rewriting the whole manifest. Present only while
 // a sidecar-mode backup is in progress — the final manifest write
-// folds the progress back into [ManifestFileName] and deletes it.
+// folds the progress back into [lineage.ManifestFileName] and deletes it.
 const ManifestProgressFileName = "manifest.progress.jsonl"
 
 // Backup runs a single Phase 1 full backup against Source / SourceDSN
@@ -302,9 +210,9 @@ type Backup struct {
 	ForceOverwrite bool
 
 	// Encryption, when non-nil, encrypts every chunk this run writes.
-	// See [BackupEncryption]. Empty (nil) preserves the plaintext
+	// See [lineage.BackupEncryption]. Empty (nil) preserves the plaintext
 	// shape — the v0.16.x..v0.21.x default.
-	Encryption *BackupEncryption
+	Encryption *lineage.BackupEncryption
 
 	// Summary, when non-nil, collects the end-of-run per-table facts
 	// the CLI's `--format json` result envelope renders — filled from
@@ -381,7 +289,7 @@ func (b *Backup) Run(ctx context.Context) error {
 	// extension types verbatim. The restore-target engine is unknown
 	// at backup time, so this only enables CAPTURE — the PG-restore-
 	// only constraint is enforced later by the recorded lineage marker
-	// (verbatimExtensionColumnsIn → LineageSegment) + the loud
+	// (lineage.VerbatimExtensionColumnsIn → lineage.Segment) + the loud
 	// restore-time engine gate. A non-PG source never enables it.
 	applyVerbatimExtensionPassthrough(sr, verbatimBackupSourcePG(b.Source))
 
@@ -707,7 +615,7 @@ func (b *Backup) Run(ctx context.Context) error {
 	// Best-effort — the manifest file is authoritative for the
 	// one-segment shape; lineage.json is the O(1) segment-shape +
 	// recorded-codec accelerator.
-	updateLineageForManifestBestEffort(ctx, b.Store, manifest, ManifestFileName, blobcodec.ResolveCodec(b.Codec))
+	lineage.UpdateLineageForManifestBestEffort(ctx, b.Store, manifest, lineage.ManifestFileName, blobcodec.ResolveCodec(b.Codec))
 
 	logBackupComplete(ctx, manifest, b.Summary)
 	return nil
@@ -758,7 +666,7 @@ func logBackupComplete(ctx context.Context, manifest *irbackup.Manifest, summary
 // temporary-anchor shape (PersistChainSlot=false), so even a failed
 // resume leaves the chain slot standing.
 func (b *Backup) resolveResumeState(ctx context.Context) (prior *irbackup.Manifest, resumeAnchor ir.Position, err error) {
-	prior, err = readManifestIfPresent(ctx, b.Store)
+	prior, err = lineage.ReadManifestIfPresent(ctx, b.Store)
 	if err != nil {
 		return nil, ir.Position{}, fmt.Errorf("backup: inspect existing manifest: %w", err)
 	}
@@ -1200,33 +1108,6 @@ func nonGeneratedTableColumns(table *ir.Table) []*ir.Column {
 	return out
 }
 
-// writeManifest serialises manifest as JSON (indented for human
-// readability) and writes it to the store. The manifest is the
-// public contract; readability matters.
-func writeManifest(ctx context.Context, store irbackup.Store, manifest *irbackup.Manifest) error {
-	b, err := json.MarshalIndent(manifest, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal manifest: %w", err)
-	}
-	return store.Put(ctx, ManifestFileName, bytes.NewReader(b))
-}
-
-// readManifestIfPresent returns the prior manifest if one exists in
-// store, or (nil, nil) when no manifest is on disk. Distinct from
-// [readManifest] which surfaces a NotFound as an error: resume code
-// needs to distinguish "no prior backup" (fresh start) from "prior
-// manifest is unreadable" (operator-actionable failure).
-func readManifestIfPresent(ctx context.Context, store irbackup.Store) (*irbackup.Manifest, error) {
-	exists, err := store.Exists(ctx, ManifestFileName)
-	if err != nil {
-		return nil, err
-	}
-	if !exists {
-		return nil, nil
-	}
-	return readManifest(ctx, store)
-}
-
 // priorResumableTables returns the prior manifest's table list when
 // the manifest is in a state where its entries are eligible for
 // resume. Returns nil for a nil manifest.
@@ -1403,141 +1284,6 @@ func chunkAlreadyMatches(ctx context.Context, store irbackup.Store, key, expecte
 	return got == expectedSHA256, nil
 }
 
-// ReadRootManifest loads and decodes the chain-root manifest at
-// [ManifestFileName]. Returns (nil, nil) when no manifest is present
-// at the path (used by CLI helpers that want to inspect a chain's
-// encryption header before constructing a restore-side envelope).
-//
-// Distinct from [readManifest] which surfaces a NotFound as an error.
-func ReadRootManifest(ctx context.Context, store irbackup.Store) (*irbackup.Manifest, error) {
-	return readManifestIfPresent(ctx, store)
-}
-
-// chainRootEncryption returns the chain-root's [irbackup.ChainEncryption]
-// when an extending writer (incremental / stream) needs to align its
-// envelope. parent's ChainEncryption is returned directly when set
-// (the common case: parent is a full carrying the chain header).
-// When parent is itself an incremental (no ChainEncryption), the
-// chain root manifest is read from store and its ChainEncryption is
-// returned.
-//
-// Read errors are swallowed (returns nil) — the alignment logic
-// already handles a nil ChainEncryption shape gracefully and a noisy
-// store read at this point would mask the simpler "parent is
-// plaintext" path.
-func chainRootEncryption(ctx context.Context, store irbackup.Store, parent *irbackup.Manifest) *irbackup.ChainEncryption {
-	if parent != nil && parent.ChainEncryption != nil {
-		return parent.ChainEncryption
-	}
-	root, err := readManifestIfPresent(ctx, store)
-	if err != nil || root == nil {
-		return nil
-	}
-	return root.ChainEncryption
-}
-
-// readManifest loads and decodes the manifest from store. Used by
-// both restore and `sluice backup verify`. An in-progress manifest in
-// the ADR-0086 sidecar layout is reconstructed here (base + sidecar
-// replay), so EVERY reader downstream — resume, restore, verify, the
-// broker's chain-root preflight — sees one truth without knowing the
-// layout exists.
-func readManifest(ctx context.Context, store irbackup.Store) (*irbackup.Manifest, error) {
-	rc, err := store.Get(ctx, ManifestFileName)
-	if err != nil {
-		return nil, fmt.Errorf("read manifest: %w", err)
-	}
-	defer func() { _ = rc.Close() }()
-	b, err := io.ReadAll(rc)
-	if err != nil {
-		return nil, fmt.Errorf("read manifest body: %w", err)
-	}
-	var m irbackup.Manifest
-	if err := json.Unmarshal(b, &m); err != nil {
-		return nil, fmt.Errorf("decode manifest: %w", err)
-	}
-	if m.FormatVersion > irbackup.BackupFormatVersion {
-		return nil, fmt.Errorf("backup: manifest format version %d is newer than this build supports (%d); upgrade sluice",
-			m.FormatVersion, irbackup.BackupFormatVersion)
-	}
-	if err := replayManifestProgress(ctx, store, &m); err != nil {
-		return nil, err
-	}
-	return &m, nil
-}
-
-// replayManifestProgress reconstructs an in-progress sidecar-layout
-// manifest (ADR-0086): the base manifest under-reports progress by
-// design, and the truth is base + replay of the sidecar's
-// matching-attempt events. A no-op for every other manifest shape
-// (finalized, legacy in-progress, incremental/stream) — those carry no
-// sidecar reference.
-//
-// A missing sidecar is the crash-before-first-checkpoint window: the
-// base is authoritative. A torn final line and stale previous-attempt
-// lines are expected crash debris — tolerated, but logged loudly so
-// operators see them named. Anything else malformed fails loudly
-// (corruption must never silently shrink the reconstructed progress).
-//
-// The decoded manifest is then NORMALIZED to the self-contained shape
-// (sidecar reference cleared, schema-appropriate format version
-// restored): replay is not idempotent — re-applying chunk events onto
-// an already-reconstructed manifest would duplicate chunks — so the
-// in-memory representation must never be replayable again, nor
-// persistable in a shape that references a sidecar it already
-// absorbed. The on-disk base keeps the v3 stamp + reference; only the
-// decoded view is normalized.
-func replayManifestProgress(ctx context.Context, store irbackup.Store, m *irbackup.Manifest) error {
-	if m.PartialState != irbackup.BackupStateInProgress || m.ProgressSidecar == nil {
-		return nil
-	}
-	defer func() {
-		m.ProgressSidecar = nil
-		m.FormatVersion = irbackup.FormatVersionFor(m.Schema)
-	}()
-	sidecar := m.ProgressSidecar.File
-	exists, err := store.Exists(ctx, sidecar)
-	if err != nil {
-		return fmt.Errorf("inspect progress sidecar %q: %w", sidecar, err)
-	}
-	if !exists {
-		slog.DebugContext(
-			ctx, "backup: in-progress manifest has no progress sidecar yet (crash before the first checkpoint); base manifest is authoritative",
-			slog.String("sidecar", sidecar),
-		)
-		return nil
-	}
-	rc, err := store.Get(ctx, sidecar)
-	if err != nil {
-		return fmt.Errorf("read progress sidecar %q: %w", sidecar, err)
-	}
-	defer func() { _ = rc.Close() }()
-	stats, err := irbackup.ReplayProgress(m, rc)
-	if err != nil {
-		return fmt.Errorf("replay progress sidecar %q: %w", sidecar, err)
-	}
-	if stats.TornTail {
-		slog.WarnContext(
-			ctx, "backup: progress sidecar ends in a torn line (crash mid-append); the event it carried is lost and its table will re-stream on resume",
-			slog.String("sidecar", sidecar),
-		)
-	}
-	if stats.StaleLines > 0 {
-		slog.WarnContext(
-			ctx, "backup: progress sidecar carries lines from a previous attempt; skipped (attempt-id mismatch — debris from a crash between a base-manifest write and the sidecar reset)",
-			slog.String("sidecar", sidecar),
-			slog.Int("stale_lines", stats.StaleLines),
-		)
-	}
-	slog.DebugContext(
-		ctx, "backup: reconstructed in-progress manifest from progress sidecar",
-		slog.String("sidecar", sidecar),
-		slog.Int("chunks_applied", stats.ChunksApplied),
-		slog.Int("tables_completed", stats.TablesCompleted),
-	)
-	return nil
-}
-
 // setupChainEncryption configures the manifest's [irbackup.ChainEncryption]
 // header and returns the chain-level CEK (per-chain mode) or nil
 // (per-chunk mode). When encryption is disabled (b.Encryption == nil),
@@ -1598,7 +1344,7 @@ func (b *Backup) setupChainEncryption(manifest, prior *irbackup.Manifest) ([]byt
 		// recorded Argon2id salt before unwrapping. CLI envelopes
 		// are minted with a fresh salt; unwrap would fail with an
 		// auth-tag mismatch without this rebind.
-		if err := enc.rebindForChain(prior.ChainEncryption.Argon2id); err != nil {
+		if err := enc.RebindForChain(prior.ChainEncryption.Argon2id); err != nil {
 			return nil, fmt.Errorf("rebuild envelope for prior chain: %w", err)
 		}
 		// Unwrap to recover the in-flight CEK.

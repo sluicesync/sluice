@@ -163,7 +163,7 @@ func TestEncryptionFlags_BuildReadEnvelope_Encrypt(t *testing.T) {
 }
 
 // TestEncryptionFlags_BuildBackupEncryption_RebuildForChain pins
-// Bug 43's CLI surface: the BackupEncryption returned for an
+// Bug 43's CLI surface: the lineage.BackupEncryption returned for an
 // --encrypt run carries a non-nil RebuildForChain that, when called
 // with a chain's recorded Argon2id params, returns an envelope whose
 // KEK was derived against the chain's salt (not the cold-start
@@ -192,7 +192,7 @@ func TestEncryptionFlags_BuildBackupEncryption_RebuildForChain(t *testing.T) {
 		t.Fatalf("wrap cek: %v", err)
 	}
 
-	// Step 2: build the CLI-side BackupEncryption (cold-start salt).
+	// Step 2: build the CLI-side lineage.BackupEncryption (cold-start salt).
 	flags := &EncryptionFlags{
 		Encrypt:              true,
 		EncryptionPassphrase: passphrase,

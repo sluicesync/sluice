@@ -60,6 +60,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
@@ -795,5 +796,5 @@ func (c *manifestCommitter) commitLocked(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("marshal manifest: %w", err)
 	}
-	return c.store.Put(ctx, ManifestFileName, bytes.NewReader(b))
+	return c.store.Put(ctx, lineage.ManifestFileName, bytes.NewReader(b))
 }

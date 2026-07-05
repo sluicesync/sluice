@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // TestRotationBoundaryResumeStart is the unit pin for the ADR-0087
@@ -36,7 +37,7 @@ func TestRotationBoundaryResumeStart(t *testing.T) {
 			zeroIncrStampless: map[int]bool{1: true},
 			openLastSegment:   true,
 		})
-		cat, _, _ := loadLineageCatalog(context.Background(), store)
+		cat, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 		open := cat.Segments[1]
 		prior := cat.Segments[0]
 		// The caller passes startPos = parent.EndPosition; for the
@@ -57,7 +58,7 @@ func TestRotationBoundaryResumeStart(t *testing.T) {
 	})
 
 	// The downstream payoff: a first incremental committed at the healed
-	// startPos (P_N) makes updateLineageForManifest stamp the open
+	// startPos (P_N) makes lineage.UpdateLineageForManifest stamp the open
 	// segment's IncrementalCoverageStart = P_N, healing the gap so the
 	// next compact merges the boundary.
 	t.Run("first incremental at P_N stamps IncrementalCoverageStart", func(t *testing.T) {
@@ -66,7 +67,7 @@ func TestRotationBoundaryResumeStart(t *testing.T) {
 			zeroIncrStampless: map[int]bool{1: true},
 			openLastSegment:   true,
 		})
-		cat, _, _ := loadLineageCatalog(context.Background(), store)
+		cat, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 		open := cat.Segments[1]
 		pN := cat.Segments[0].EndPosition
 
@@ -82,15 +83,15 @@ func TestRotationBoundaryResumeStart(t *testing.T) {
 		first.EndPosition = ir.Position{Engine: open.StartPosition.Engine, Token: open.StartPosition.Token + "-end"}
 		first.BackupID = ""
 		ip := "manifests/incr-00001-heal.json"
-		segStore := open.store(store)
-		if err := writeManifestAt(context.Background(), segStore, ip, first); err != nil {
+		segStore := open.Store(store)
+		if err := lineage.WriteManifestAt(context.Background(), segStore, ip, first); err != nil {
 			t.Fatal(err)
 		}
-		if err := updateLineageForManifest(context.Background(), store, first, ip, open.Codec); err != nil {
+		if err := lineage.UpdateLineageForManifest(context.Background(), store, first, ip, open.Codec); err != nil {
 			t.Fatal(err)
 		}
 
-		got, _, _ := loadLineageCatalog(context.Background(), store)
+		got, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 		stamp := got.Segments[1].IncrementalCoverageStart
 		if stamp != pN {
 			t.Errorf("IncrementalCoverageStart = %+v; want P_N %+v (the segment is now born-contiguous)", stamp, pN)
@@ -100,7 +101,7 @@ func TestRotationBoundaryResumeStart(t *testing.T) {
 	t.Run("segment 0 (no prior) keeps S", func(t *testing.T) {
 		store := newMemStore()
 		seedSegmentsWithGapsOpts(t, store, now, nil, segmentSeedOpts{}) // single-segment lineage
-		cat, _, _ := loadLineageCatalog(context.Background(), store)
+		cat, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 		_, _, ok := rotationBoundaryResumeStart(context.Background(), store, cat.Segments[0].StartPosition)
 		if ok {
 			t.Error("ok=true for a single-segment lineage; want false (no prior segment)")
@@ -114,7 +115,7 @@ func TestRotationBoundaryResumeStart(t *testing.T) {
 		seedSegmentsWithGapsOpts(t, store, now, []time.Duration{time.Hour}, segmentSeedOpts{
 			rotatedOverlap: true,
 		})
-		cat, _, _ := loadLineageCatalog(context.Background(), store)
+		cat, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 		open := cat.Segments[1]
 		_, _, ok := rotationBoundaryResumeStart(context.Background(), store, open.StartPosition)
 		if ok {
@@ -128,7 +129,7 @@ func TestRotationBoundaryResumeStart(t *testing.T) {
 			zeroIncrStampless: map[int]bool{1: true},
 			openLastSegment:   true,
 		})
-		cat, _, _ := loadLineageCatalog(context.Background(), store)
+		cat, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 		// A startPos that does NOT equal the open segment's StartPosition
 		// (e.g. the prior segment's End) means the resolved parent is not
 		// the segment's full → no heal.
@@ -146,9 +147,9 @@ func TestRotationBoundaryResumeStart(t *testing.T) {
 			openLastSegment:   true,
 		})
 		// Corrupt the catalog so the prior segment's EndPosition is empty.
-		cat, _, _ := loadLineageCatalog(context.Background(), store)
+		cat, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 		cat.Segments[0].EndPosition = ir.Position{}
-		if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
+		if err := lineage.WriteLineageCatalog(context.Background(), store, cat); err != nil {
 			t.Fatal(err)
 		}
 		_, _, ok := rotationBoundaryResumeStart(context.Background(), store, cat.Segments[1].StartPosition)

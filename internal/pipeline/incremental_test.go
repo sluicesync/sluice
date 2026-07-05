@@ -17,6 +17,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
@@ -106,7 +107,7 @@ func (r *fakeCDCReader) Close() error { return nil }
 // incremental orchestrator has something to chain off.
 func writeParentFullManifest(t *testing.T, store *blobcodec.LocalStore, parent *irbackup.Manifest) {
 	t.Helper()
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, parent); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, parent); err != nil {
 		t.Fatalf("write parent: %v", err)
 	}
 }
@@ -256,9 +257,9 @@ func TestIncrementalBackup_RoundTrip(t *testing.T) {
 	}
 
 	// Find the new manifest in the store.
-	records, err := listAllManifestsViaWalk(context.Background(), store)
+	records, err := lineage.ListAllManifestsViaWalk(context.Background(), store)
 	if err != nil {
-		t.Fatalf("listAllManifestsViaWalk: %v", err)
+		t.Fatalf("lineage.ListAllManifestsViaWalk: %v", err)
 	}
 	if len(records) != 2 {
 		t.Fatalf("manifests in store = %d; want 2 (full + 1 incremental)", len(records))
@@ -266,9 +267,9 @@ func TestIncrementalBackup_RoundTrip(t *testing.T) {
 	var incr *irbackup.Manifest
 	var incrPath string
 	for _, r := range records {
-		if r.manifest.Kind == irbackup.BackupKindIncremental {
-			incr = r.manifest
-			incrPath = r.path
+		if r.Manifest.Kind == irbackup.BackupKindIncremental {
+			incr = r.Manifest
+			incrPath = r.Path
 		}
 	}
 	if incr == nil {
@@ -402,14 +403,14 @@ func TestIncrementalBackup_SchemaHistoryCapture(t *testing.T) {
 		t.Fatalf("IncrementalBackup.Run: %v", err)
 	}
 
-	records, err := listAllManifestsViaWalk(context.Background(), store)
+	records, err := lineage.ListAllManifestsViaWalk(context.Background(), store)
 	if err != nil {
-		t.Fatalf("listAllManifestsViaWalk: %v", err)
+		t.Fatalf("lineage.ListAllManifestsViaWalk: %v", err)
 	}
 	var incr *irbackup.Manifest
 	for _, r := range records {
-		if r.manifest.Kind == irbackup.BackupKindIncremental {
-			incr = r.manifest
+		if r.Manifest.Kind == irbackup.BackupKindIncremental {
+			incr = r.Manifest
 		}
 	}
 	if incr == nil {
@@ -548,11 +549,11 @@ func TestIncrementalBackup_SchemaDelta_AddColumn(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	records, _ := listAllManifestsViaWalk(context.Background(), store)
+	records, _ := lineage.ListAllManifestsViaWalk(context.Background(), store)
 	var incr *irbackup.Manifest
 	for _, r := range records {
-		if r.manifest.Kind == irbackup.BackupKindIncremental {
-			incr = r.manifest
+		if r.Manifest.Kind == irbackup.BackupKindIncremental {
+			incr = r.Manifest
 		}
 	}
 	if incr == nil {
@@ -722,18 +723,18 @@ func TestIncrementalBackup_TwoIncrementals_NoChunkCollision(t *testing.T) {
 		if err := b.Run(context.Background()); err != nil {
 			t.Fatalf("incremental Run: %v", err)
 		}
-		records, err := listAllManifestsViaWalk(context.Background(), store)
+		records, err := lineage.ListAllManifestsViaWalk(context.Background(), store)
 		if err != nil {
-			t.Fatalf("listAllManifestsViaWalk: %v", err)
+			t.Fatalf("lineage.ListAllManifestsViaWalk: %v", err)
 		}
 		// Pick the most recent incremental.
 		var newest *irbackup.Manifest
 		for _, r := range records {
-			if r.manifest.Kind != irbackup.BackupKindIncremental {
+			if r.Manifest.Kind != irbackup.BackupKindIncremental {
 				continue
 			}
-			if newest == nil || r.manifest.CreatedAt.After(newest.CreatedAt) {
-				newest = r.manifest
+			if newest == nil || r.Manifest.CreatedAt.After(newest.CreatedAt) {
+				newest = r.Manifest
 			}
 		}
 		if newest == nil {

@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package pipeline
+package lineage
 
 import (
 	"context"
@@ -16,7 +16,7 @@ import (
 // transparently prepended to every operation. Used by the rotate-at
 // rotation (GitHub #20 chunk 14b) so a new chain landing in
 // `<output-dir>/rotated-<unix-ms>/` can reuse the existing
-// [Backup.Run] machinery against the parent store without anyone
+// Backup.Run (root) machinery against the parent store without anyone
 // downstream having to know about the rotation subdirectory.
 //
 // The wrapper handles:
@@ -26,7 +26,7 @@ import (
 //     the way out so callers see relative paths just like a bare
 //     [BackupStore] would return.
 //
-// Construction is via [newPrefixedStore]; the prefix is normalised
+// Construction is via [NewPrefixedStore]; the prefix is normalised
 // (no leading/trailing slashes) and an empty prefix degenerates to
 // the wrapped store unchanged.
 type prefixedStore struct {
@@ -34,10 +34,10 @@ type prefixedStore struct {
 	prefix string // canonical form: no leading/trailing "/", may be empty
 }
 
-// newPrefixedStore wraps inner with a path prefix. An empty / "/" /
+// NewPrefixedStore wraps inner with a path prefix. An empty / "/" /
 // "." prefix returns the inner store directly (no wrapping cost
 // when the rotation is at chain root).
-func newPrefixedStore(inner irbackup.Store, prefix string) irbackup.Store {
+func NewPrefixedStore(inner irbackup.Store, prefix string) irbackup.Store {
 	canon := strings.Trim(path.Clean(prefix), "/")
 	if canon == "" || canon == "." {
 		return inner

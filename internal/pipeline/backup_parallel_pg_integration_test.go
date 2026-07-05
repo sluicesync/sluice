@@ -34,6 +34,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -139,9 +140,9 @@ func TestBackupParallel_PG_RoundTripChecksums(t *testing.T) {
 		t.Fatalf("dispatch = serial (reason %q); want the parallel sweep engaged on a PG source", *gotReason)
 	}
 
-	m, err := readManifest(context.Background(), store)
+	m, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	if m.PartialState != irbackup.BackupStateComplete {
 		t.Fatalf("PartialState = %q; want complete", m.PartialState)
@@ -221,9 +222,9 @@ func TestBackupParallel_PG_CancelBoundsPartialsAndResumeCompletes(t *testing.T) 
 		t.Fatal("cancelled Backup.Run returned nil; want a context error")
 	}
 
-	m, err := readManifest(context.Background(), inner)
+	m, err := lineage.ReadManifest(context.Background(), inner)
 	if err != nil {
-		t.Fatalf("readManifest after cancel: %v", err)
+		t.Fatalf("lineage.ReadManifest after cancel: %v", err)
 	}
 	if m.PartialState != irbackup.BackupStateInProgress {
 		t.Fatalf("PartialState = %q; want in_progress", m.PartialState)
@@ -256,9 +257,9 @@ func TestBackupParallel_PG_CancelBoundsPartialsAndResumeCompletes(t *testing.T) 
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("resume Backup.Run: %v", err)
 	}
-	m2, err := readManifest(context.Background(), inner)
+	m2, err := lineage.ReadManifest(context.Background(), inner)
 	if err != nil {
-		t.Fatalf("readManifest after resume: %v", err)
+		t.Fatalf("lineage.ReadManifest after resume: %v", err)
 	}
 	if m2.PartialState != irbackup.BackupStateComplete {
 		t.Fatalf("resumed PartialState = %q; want complete", m2.PartialState)
@@ -309,7 +310,7 @@ func TestBackupParallel_PG_EncryptedRoundTrip(t *testing.T) {
 				Store:            store,
 				ChunkRows:        40,
 				TableParallelism: 4,
-				Encryption:       &BackupEncryption{Envelope: env, Mode: mode},
+				Encryption:       &lineage.BackupEncryption{Envelope: env, Mode: mode},
 			}).Run(context.Background()); err != nil {
 				t.Fatalf("Backup.Run (%s): %v", mode, err)
 			}
@@ -359,9 +360,9 @@ func TestBackupParallel_PG_ManifestDeterminism(t *testing.T) {
 		}).Run(context.Background()); err != nil {
 			t.Fatalf("Backup.Run(parallelism=%d): %v", tableParallelism, err)
 		}
-		m, err := readManifest(context.Background(), store)
+		m, err := lineage.ReadManifest(context.Background(), store)
 		if err != nil {
-			t.Fatalf("readManifest: %v", err)
+			t.Fatalf("lineage.ReadManifest: %v", err)
 		}
 		return m
 	}

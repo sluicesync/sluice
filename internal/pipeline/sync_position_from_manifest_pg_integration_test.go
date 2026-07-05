@@ -33,6 +33,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 
@@ -75,9 +76,9 @@ func TestBackup_RecordsEndPosition_PostgresIntegration(t *testing.T) {
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
-	full, err := readManifest(context.Background(), store)
+	full, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	if full.EndPosition.Engine != "postgres" {
 		t.Errorf("EndPosition.Engine = %q; want postgres", full.EndPosition.Engine)

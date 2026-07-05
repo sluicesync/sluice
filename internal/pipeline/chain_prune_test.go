@@ -13,6 +13,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // TestPruneLineage_KeepIncrementalsDropsOldest: 1 full + 5
@@ -29,9 +30,9 @@ func TestPruneLineage_KeepIncrementalsDropsOldest(t *testing.T) {
 	if len(res.Pruned) != 3 {
 		t.Errorf("Pruned count = %d; want 3", len(res.Pruned))
 	}
-	cat, ok, err := loadLineageCatalog(context.Background(), store)
+	cat, ok, err := lineage.LoadLineageCatalog(context.Background(), store)
 	if err != nil || !ok {
-		t.Fatalf("post-prune loadLineageCatalog: ok=%v err=%v", ok, err)
+		t.Fatalf("post-prune lineage.LoadLineageCatalog: ok=%v err=%v", ok, err)
 	}
 	if len(cat.Segments) != 1 || len(cat.Segments[0].Incrementals) != 2 {
 		t.Errorf("post-prune segment = %+v; want 1 segment with 2 incrementals", cat.Segments)
@@ -67,7 +68,7 @@ func TestPruneLineage_KeepAllNoOp(t *testing.T) {
 	if len(res.Pruned) != 0 {
 		t.Errorf("Pruned = %d; want 0", len(res.Pruned))
 	}
-	cat, _, _ := loadLineageCatalog(context.Background(), store)
+	cat, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 	if len(cat.Segments[0].Incrementals) != 3 {
 		t.Errorf("incrementals = %d; want 3 (unchanged)", len(cat.Segments[0].Incrementals))
 	}
@@ -85,7 +86,7 @@ func TestPruneLineage_DryRunNoSideEffects(t *testing.T) {
 	if len(res.Pruned) != 3 || res.ChunksDeleted != 0 {
 		t.Errorf("dry-run Pruned=%d ChunksDeleted=%d; want 3,0", len(res.Pruned), res.ChunksDeleted)
 	}
-	cat, _, _ := loadLineageCatalog(context.Background(), store)
+	cat, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 	if len(cat.Segments[0].Incrementals) != 4 {
 		t.Errorf("post-dry-run incrementals = %d; want 4 (unchanged)", len(cat.Segments[0].Incrementals))
 	}
@@ -111,7 +112,7 @@ func TestPruneLineage_RefusesNeitherFlag(t *testing.T) {
 
 func TestPruneLineage_RefusesWhenCatalogAbsent(t *testing.T) {
 	store := newMemStore()
-	mustWriteManifest(t, store, ManifestFileName, &irbackup.Manifest{
+	mustWriteManifest(t, store, lineage.ManifestFileName, &irbackup.Manifest{
 		FormatVersion: irbackup.BackupFormatVersion, SourceEngine: "postgres",
 		BackupID: "full000", Kind: irbackup.BackupKindFull, CreatedAt: time.Now().UTC(),
 	})
@@ -141,23 +142,23 @@ func TestPruneLineage_MultiSegmentDropsLeadingWholeSegment(t *testing.T) {
 	i12 := seedIncr(t, store, "seg-1", "incr12", i11.BackupID, "0/500", "0/600", now.Add(5*time.Hour))
 
 	capt := now.Add(3 * time.Hour)
-	cat := &LineageCatalog{
+	cat := &lineage.Catalog{
 		FormatVersion: 1, SourceEngine: "postgres",
-		Segments: []LineageSegment{
+		Segments: []lineage.Segment{
 			{
-				SegmentID: f0.BackupID, Dir: "", FullManifestPath: ManifestFileName,
+				SegmentID: f0.BackupID, Dir: "", FullManifestPath: lineage.ManifestFileName,
 				Incrementals:  []string{"manifests/incr-01.json", "manifests/incr-02.json"},
 				StartPosition: f0.EndPosition, EndPosition: i02.EndPosition,
 				CappedAt: &capt, CapReason: rotationReasonAge, Codec: blobcodec.CodecGzip,
 			},
 			{
-				SegmentID: f1.BackupID, Dir: "seg-1", FullManifestPath: ManifestFileName,
+				SegmentID: f1.BackupID, Dir: "seg-1", FullManifestPath: lineage.ManifestFileName,
 				Incrementals:  []string{"manifests/incr-11.json", "manifests/incr-12.json"},
 				StartPosition: f1.EndPosition, EndPosition: i12.EndPosition, Codec: blobcodec.CodecGzip,
 			},
 		},
 	}
-	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
+	if err := lineage.WriteLineageCatalog(context.Background(), store, cat); err != nil {
 		t.Fatal(err)
 	}
 
@@ -168,7 +169,7 @@ func TestPruneLineage_MultiSegmentDropsLeadingWholeSegment(t *testing.T) {
 	if res.SegmentsDropped != 1 {
 		t.Errorf("SegmentsDropped = %d; want 1 (whole seg0)", res.SegmentsDropped)
 	}
-	got, _, _ := loadLineageCatalog(context.Background(), store)
+	got, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 	if len(got.Segments) != 1 || got.Segments[0].Dir != "seg-1" {
 		t.Fatalf("post-prune segments = %+v; want only seg-1", got.Segments)
 	}
@@ -176,7 +177,7 @@ func TestPruneLineage_MultiSegmentDropsLeadingWholeSegment(t *testing.T) {
 		t.Errorf("RestorableFromSegment = %d; want 0 (re-based to seg-1)", got.RestorableFromSegment)
 	}
 	// seg0 full + its chunks are gone; seg-1 full survives.
-	if ex, _ := store.Exists(context.Background(), ManifestFileName); ex {
+	if ex, _ := store.Exists(context.Background(), lineage.ManifestFileName); ex {
 		t.Error("seg0 root full not deleted after whole-segment prune")
 	}
 	if ex, _ := store.Exists(context.Background(), "seg-1/manifest.json"); !ex {
@@ -184,8 +185,8 @@ func TestPruneLineage_MultiSegmentDropsLeadingWholeSegment(t *testing.T) {
 	}
 	// Restore-after-prune correctness: the surviving lineage still
 	// validates (the kept segment full is a contiguous base).
-	if _, err := buildLineageChain(context.Background(), store, nil); err != nil {
-		t.Errorf("restore-after-prune buildLineageChain: %v; want valid", err)
+	if _, err := lineage.BuildLineageChain(context.Background(), store, nil); err != nil {
+		t.Errorf("restore-after-prune lineage.BuildLineageChain: %v; want valid", err)
 	}
 	_ = i02
 }
@@ -202,7 +203,7 @@ func seedFull(t *testing.T, root irbackup.Store, dir, startLSN, lsn string, crea
 		PartialState:  irbackup.BackupStateComplete,
 	}
 	m.BackupID = irbackup.ComputeBackupID(m)
-	if err := writeManifestAt(context.Background(), newPrefixedStore(root, dir), ManifestFileName, m); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), lineage.NewPrefixedStore(root, dir), lineage.ManifestFileName, m); err != nil {
 		t.Fatalf("seed full: %v", err)
 	}
 	return m
@@ -219,7 +220,7 @@ func seedIncr(t *testing.T, root irbackup.Store, dir, _id, parent, startLSN, lsn
 	}
 	m.BackupID = irbackup.ComputeBackupID(m)
 	p := "manifests/incr-" + strings.TrimPrefix(_id, "incr") + ".json"
-	if err := writeManifestAt(context.Background(), newPrefixedStore(root, dir), p, m); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), lineage.NewPrefixedStore(root, dir), p, m); err != nil {
 		t.Fatalf("seed incr: %v", err)
 	}
 	return m
@@ -313,8 +314,8 @@ func TestSchemaHistoryRetentionFloor_Incomparable(t *testing.T) {
 		PartialState: irbackup.BackupStateComplete,
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	mustWriteManifest(t, store, ManifestFileName, full)
-	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, blobcodec.CodecGzip)
+	mustWriteManifest(t, store, lineage.ManifestFileName, full)
+	lineage.UpdateLineageForManifestBestEffort(context.Background(), store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
 
 	live := ir.Position{Engine: "postgres", Token: "incomparable:B"}
 	_, _, err := SchemaHistoryRetentionFloor(context.Background(), store, live, stubOrderer{})
@@ -336,8 +337,8 @@ func seedLineageChain(t *testing.T, store irbackup.Store, incrementals int) time
 		PartialState: irbackup.BackupStateComplete,
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	mustWriteManifest(t, store, ManifestFileName, full)
-	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, blobcodec.CodecGzip)
+	mustWriteManifest(t, store, lineage.ManifestFileName, full)
+	lineage.UpdateLineageForManifestBestEffort(context.Background(), store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
 	parent := full.BackupID
 	for i := 1; i <= incrementals; i++ {
 		m := &irbackup.Manifest{
@@ -351,7 +352,7 @@ func seedLineageChain(t *testing.T, store irbackup.Store, incrementals int) time
 		m.BackupID = irbackup.ComputeBackupID(m)
 		path := "manifests/incr-000" + string(rune('0'+i)) + ".json"
 		mustWriteManifest(t, store, path, m)
-		updateLineageForManifestBestEffort(context.Background(), store, m, path, blobcodec.CodecGzip)
+		lineage.UpdateLineageForManifestBestEffort(context.Background(), store, m, path, blobcodec.CodecGzip)
 		parent = m.BackupID
 	}
 	return base

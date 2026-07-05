@@ -20,6 +20,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 )
@@ -62,9 +63,9 @@ func TestIncrementalBackup_MySQLChainRestore(t *testing.T) {
 	//    Use file+pos since the test container doesn't enable
 	//    gtid_mode; the MySQL CDC reader supports both modes.
 	binlogFile, binlogPos := readMySQLBinlogPos(t, sourceDSN)
-	full, err := readManifest(context.Background(), store)
+	full, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{
@@ -72,7 +73,7 @@ func TestIncrementalBackup_MySQLChainRestore(t *testing.T) {
 		Token:  fmt.Sprintf(`{"mode":"file_pos","file":%q,"pos":%d}`, binlogFile, binlogPos),
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("rewrite full manifest: %v", err)
 	}
 

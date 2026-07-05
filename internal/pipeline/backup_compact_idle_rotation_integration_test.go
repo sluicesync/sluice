@@ -32,6 +32,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -158,11 +159,11 @@ func seedAccountsChain(t *testing.T) (sourceDSN, targetDSN string, store *blobco
 // assertTrailingIdleStopShape verifies the lineage actually carries the
 // Bug-139 boundary (a multi-segment lineage whose last segment is
 // rotation-born, zero-incremental, and stamp-less). Returns the catalog.
-func assertTrailingIdleStopShape(t *testing.T, store *blobcodec.LocalStore) *LineageCatalog {
+func assertTrailingIdleStopShape(t *testing.T, store *blobcodec.LocalStore) *lineage.Catalog {
 	t.Helper()
-	cat, ok, err := loadLineageCatalog(context.Background(), store)
+	cat, ok, err := lineage.LoadLineageCatalog(context.Background(), store)
 	if err != nil || !ok {
-		t.Fatalf("loadLineageCatalog: ok=%v err=%v", ok, err)
+		t.Fatalf("lineage.LoadLineageCatalog: ok=%v err=%v", ok, err)
 	}
 	if len(cat.Segments) < 2 {
 		t.Fatalf("lineage segments = %d; want >= 2 (the idle-stop rotation didn't materialize — adjust churn/timing)", len(cat.Segments))
@@ -226,7 +227,7 @@ func TestADR0087_Bug139_IdleStopCompact_SplitsAndRestores_PG(t *testing.T) {
 			if res.GroupsMerged < 1 {
 				t.Fatalf("GroupsMerged = %d; want >= 1 (the pre-boundary run must merge)", res.GroupsMerged)
 			}
-			post, _, _ := loadLineageCatalog(context.Background(), store)
+			post, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 			if len(post.Segments) >= preSegments {
 				t.Errorf("post-compact segments = %d; want < %d (a merge happened)", len(post.Segments), preSegments)
 			}
@@ -309,8 +310,8 @@ func TestADR0087_Bug139_ResumeHeals_WholeChainCompacts_PG(t *testing.T) {
 
 	// The previously stamp-less segment must now be stamped + carry
 	// incrementals — the boundary is healed.
-	healed, _, _ := loadLineageCatalog(context.Background(), store)
-	var healSeg *LineageSegment
+	healed, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
+	var healSeg *lineage.Segment
 	for i := range healed.Segments {
 		if healed.Segments[i].Dir == healSegDir {
 			healSeg = &healed.Segments[i]
@@ -338,7 +339,7 @@ func TestADR0087_Bug139_ResumeHeals_WholeChainCompacts_PG(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CompactChain after resume heal: %v", err)
 	}
-	post, _, _ := loadLineageCatalog(context.Background(), store)
+	post, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 	if len(post.Segments) != 1 {
 		t.Errorf("post-compact segments = %d; want 1 (the healed chain is fully contiguous and collapses to one segment)", len(post.Segments))
 	}

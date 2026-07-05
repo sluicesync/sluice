@@ -12,6 +12,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // ADR-0067 unit pins: contiguous-segment rotation handoff. A
@@ -26,12 +27,12 @@ func pgPos(lsn string) ir.Position {
 }
 
 func TestIncrementalCoverageStartOrStart(t *testing.T) {
-	seg := LineageSegment{StartPosition: pgPos("0/300")}
-	if got := seg.incrementalCoverageStartOrStart(); got != seg.StartPosition {
+	seg := lineage.Segment{StartPosition: pgPos("0/300")}
+	if got := seg.IncrementalCoverageStartOrStart(); got != seg.StartPosition {
 		t.Errorf("unset: got %+v; want StartPosition %+v", got, seg.StartPosition)
 	}
 	seg.IncrementalCoverageStart = pgPos("0/200")
-	if got := seg.incrementalCoverageStartOrStart(); got != seg.IncrementalCoverageStart {
+	if got := seg.IncrementalCoverageStartOrStart(); got != seg.IncrementalCoverageStart {
 		t.Errorf("set: got %+v; want IncrementalCoverageStart %+v", got, seg.IncrementalCoverageStart)
 	}
 }
@@ -68,7 +69,7 @@ func TestValidateFirstIncrementalBoundary(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateFirstIncrementalBoundary(tc.cmp, tc.fullEnd, tc.recorded, tc.firstStart, "seg test")
+			err := lineage.ValidateFirstIncrementalBoundary(tc.cmp, tc.fullEnd, tc.recorded, tc.firstStart, "seg test")
 			if tc.wantErr == "" {
 				if err != nil {
 					t.Fatalf("got err %v; want nil", err)
@@ -110,8 +111,8 @@ func rotatedSecondSegment(t *testing.T, firstIncrLSN, coverageLSN string) (irbac
 
 	capt := time.Now().UTC()
 	s0.CappedAt, s0.CapReason = &capt, rotationReasonChainLength
-	cat := &LineageCatalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []LineageSegment{s0, s1}}
-	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
+	cat := &lineage.Catalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []lineage.Segment{s0, s1}}
+	if err := lineage.WriteLineageCatalog(context.Background(), store, cat); err != nil {
 		t.Fatal(err)
 	}
 	cmp := &fakeMonotonicEngine{order: map[string]int{
@@ -130,9 +131,9 @@ func rotatedSecondSegment(t *testing.T, firstIncrLSN, coverageLSN string) (irbac
 // the within-segment overlap is tolerated.
 func TestBuildLineageChain_RotatedOverlap_OK(t *testing.T) {
 	store, cmp := rotatedSecondSegment(t, "0/200", "0/200") // first incr at P_N
-	chain, err := buildLineageChain(context.Background(), store, cmp)
+	chain, err := lineage.BuildLineageChain(context.Background(), store, cmp)
 	if err != nil {
-		t.Fatalf("buildLineageChain: %v", err)
+		t.Fatalf("lineage.BuildLineageChain: %v", err)
 	}
 	if len(chain) != 4 { // f0, i0, f1, i1
 		t.Fatalf("chain len = %d; want 4", len(chain))
@@ -144,7 +145,7 @@ func TestBuildLineageChain_RotatedOverlap_OK(t *testing.T) {
 // forward gap and is refused loudly (no silent partial — DR data).
 func TestBuildLineageChain_RotatedForwardGap_Refuses(t *testing.T) {
 	store, cmp := rotatedSecondSegment(t, "0/400", "0/400") // first incr AHEAD of S=0/300
-	_, err := buildLineageChain(context.Background(), store, cmp)
+	_, err := lineage.BuildLineageChain(context.Background(), store, cmp)
 	if err == nil || !strings.Contains(err.Error(), "boundary mismatch") {
 		t.Fatalf("got err %v; want forward-gap boundary refusal", err)
 	}

@@ -32,6 +32,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -81,9 +82,9 @@ func TestChainRestore_PostgresToMySQL_CrossEngine(t *testing.T) {
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
-	full, err := readManifest(context.Background(), store)
+	full, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{
@@ -91,7 +92,7 @@ func TestChainRestore_PostgresToMySQL_CrossEngine(t *testing.T) {
 		Token:  fmt.Sprintf(`{"slot":"sluice_slot","lsn":%q}`, slotLSN),
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("rewrite full: %v", err)
 	}
 
@@ -182,14 +183,14 @@ func TestChainRestore_MySQLToPostgres_CrossEngine(t *testing.T) {
 		t.Fatalf("Backup.Run: %v", err)
 	}
 	binlogFile, binlogPos := readMySQLBinlogPos(t, mysqlSourceDSN)
-	full, _ := readManifest(context.Background(), store)
+	full, _ := lineage.ReadManifest(context.Background(), store)
 	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{
 		Engine: "mysql",
 		Token:  fmt.Sprintf(`{"mode":"file_pos","file":%q,"pos":%d}`, binlogFile, binlogPos),
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("rewrite full: %v", err)
 	}
 
@@ -289,14 +290,14 @@ func TestSyncFromBackup_CrossEngine_SchemaEvolution(t *testing.T) {
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
-	full, _ := readManifest(context.Background(), store)
+	full, _ := lineage.ReadManifest(context.Background(), store)
 	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{
 		Engine: "postgres",
 		Token:  fmt.Sprintf(`{"slot":"sluice_slot","lsn":%q}`, slotLSN),
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("rewrite full: %v", err)
 	}
 

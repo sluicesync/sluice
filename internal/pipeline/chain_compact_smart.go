@@ -63,6 +63,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // PKStrategy controls how smart-compact identifies "the same row"
@@ -727,7 +728,7 @@ func applySmartCompactionToStagedGroup(
 ) (*smartCompactResult, error) {
 	groupRes := newSmartCompactResult()
 	for _, incrPath := range pg.finalIncrementalPaths {
-		im, err := readManifestAt(ctx, stagingStore, incrPath)
+		im, err := lineage.ReadManifestAt(ctx, stagingStore, incrPath)
 		if err != nil {
 			return nil, fmt.Errorf("smart-compact: read staged incremental %q: %w", incrPath, err)
 		}
@@ -735,7 +736,7 @@ func applySmartCompactionToStagedGroup(
 		if err != nil {
 			return nil, fmt.Errorf("smart-compact: incremental %q: %w", incrPath, err)
 		}
-		if err := writeManifestAt(ctx, stagingStore, incrPath, im); err != nil {
+		if err := lineage.WriteManifestAt(ctx, stagingStore, incrPath, im); err != nil {
 			return nil, fmt.Errorf("smart-compact: rewrite staged incremental manifest %q: %w", incrPath, err)
 		}
 		groupRes.merge(incrRes)

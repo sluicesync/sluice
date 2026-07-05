@@ -20,6 +20,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // observeRestoreChunkDispatch installs the test-only within-table-axis
@@ -342,12 +343,12 @@ func TestRestore_WithinTableParallel_RowCountMismatchFailsHard(t *testing.T) {
 	store, _ := restoreChunkFixture(t, 1, 40, 10) // 1 table, 4 chunks
 
 	// Corrupt the manifest's table-level RowCount so Σ(decoded) != RowCount.
-	manifest, err := readManifest(context.Background(), store)
+	manifest, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	manifest.Tables[0].RowCount = 9999 // lie about the row count
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, manifest); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, manifest); err != nil {
 		t.Fatalf("rewrite manifest: %v", err)
 	}
 

@@ -32,12 +32,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"sort"
 
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/translate"
 )
@@ -159,8 +159,8 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	//    restore (positions are engine-native); cross-engine restore
 	//    passes nil and relies on the rotation FSM's write-time
 	//    S>=P_N hard-fail + the structural same-engine guarantee.
-	cmp := sameEngineComparator(ctx, r.Store, r.Target)
-	links, err := buildLineageChain(ctx, r.Store, cmp)
+	cmp := lineage.SameEngineComparator(ctx, r.Store, r.Target)
+	links, err := lineage.BuildLineageChain(ctx, r.Store, cmp)
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore: build lineage: %w", err))
 	}
@@ -171,7 +171,7 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	root := links[0]
 	incrementalCount := 0
 	for _, l := range links {
-		if canonicalKind(l.manifest.Kind) == irbackup.BackupKindIncremental {
+		if lineage.CanonicalKind(l.Manifest.Kind) == irbackup.BackupKindIncremental {
 			incrementalCount++
 		}
 	}
@@ -183,7 +183,7 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	//      Bug 66 / the ADR-0035 PostGIS-absent refusal). The marker
 	//      is read from lineage.json — the authoritative structural
 	//      record — never sniffed from chunk bytes.
-	if cat, err := resolveLineage(ctx, r.Store); err != nil {
+	if cat, err := lineage.ResolveLineage(ctx, r.Store); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore: %w", err))
 	} else if err := refuseVerbatimRestoreToNonPG(cat, r.Target); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, err)
@@ -191,34 +191,34 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 
 	// 2. Cross-engine routing (Phase 5). Pre-flight the root full's
 	//    schema + every link's delta for unsupportable types.
-	crossEngine := root.manifest.SourceEngine != r.Target.Name() && root.manifest.SourceEngine != ""
+	crossEngine := root.Manifest.SourceEngine != r.Target.Name() && root.Manifest.SourceEngine != ""
 	if crossEngine {
 		if err := migcore.CheckCrossEngineSupportable(
-			root.manifest.Schema,
-			root.manifest.SourceEngine, r.Target.Name(),
-			fmt.Sprintf("chain restore: full %s", manifestBackupID(root.manifest)),
+			root.Manifest.Schema,
+			root.Manifest.SourceEngine, r.Target.Name(),
+			fmt.Sprintf("chain restore: full %s", lineage.ManifestBackupID(root.Manifest)),
 		); err != nil {
 			return err
 		}
 		for _, link := range links[1:] {
 			if err := migcore.CheckCrossEngineDeltaSupportable(
-				link.manifest.SchemaDelta,
-				root.manifest.SourceEngine, r.Target.Name(),
-				manifestBackupID(link.manifest),
+				link.Manifest.SchemaDelta,
+				root.Manifest.SourceEngine, r.Target.Name(),
+				lineage.ManifestBackupID(link.Manifest),
 			); err != nil {
 				return err
 			}
 		}
 		slog.InfoContext(
 			ctx, "chain restore: cross-engine mode",
-			slog.String("source_engine", root.manifest.SourceEngine),
+			slog.String("source_engine", root.Manifest.SourceEngine),
 			slog.String("target_engine", r.Target.Name()),
 			slog.Int("incrementals", incrementalCount),
 		)
 	}
 
 	// 2.5. Encryption pre-flight at the lineage root.
-	if err := r.preflightEncryption(root.manifest); err != nil {
+	if err := r.preflightEncryption(root.Manifest); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore: %w", err))
 	}
 
@@ -252,7 +252,7 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	firstFullApplied := false
 	for i := range links {
 		link := &links[i]
-		switch canonicalKind(link.manifest.Kind) {
+		switch lineage.CanonicalKind(link.Manifest.Kind) {
 		case irbackup.BackupKindFull:
 			// Segment 0's full establishes the schema + indexes; every
 			// LATER segment full is a fresh snapshot of the same
@@ -262,33 +262,33 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 			dataOnly := firstFullApplied
 			slog.InfoContext(
 				ctx, "chain restore: applying segment full",
-				slog.String("segment_dir", link.segment.Dir),
-				slog.String("manifest_path", link.path),
-				slog.String("backup_id", manifestBackupID(link.manifest)),
-				slog.String("codec", string(link.segment.codecOrDefault())),
+				slog.String("segment_dir", link.Segment.Dir),
+				slog.String("manifest_path", link.Path),
+				slog.String("backup_id", lineage.ManifestBackupID(link.Manifest)),
+				slog.String("codec", string(link.Segment.CodecOrDefault())),
 				slog.Bool("data_only", dataOnly),
 			)
 			if err := r.applyFull(ctx, link, dataOnly); err != nil {
 				return migcore.WrapWithHint(migcore.PhaseBulkCopy, fmt.Errorf("chain restore: apply segment full %s: %w",
-					manifestBackupID(link.manifest), err))
+					lineage.ManifestBackupID(link.Manifest), err))
 			}
 			firstFullApplied = true
 		case irbackup.BackupKindIncremental:
 			slog.InfoContext(
 				ctx, "chain restore: applying incremental",
 				slog.Int("link", i),
-				slog.String("manifest_path", link.path),
-				slog.String("backup_id", manifestBackupID(link.manifest)),
-				slog.Int("change_chunks", len(link.manifest.ChangeChunks)),
-				slog.Int("schema_deltas", len(link.manifest.SchemaDelta)),
+				slog.String("manifest_path", link.Path),
+				slog.String("backup_id", lineage.ManifestBackupID(link.Manifest)),
+				slog.Int("change_chunks", len(link.Manifest.ChangeChunks)),
+				slog.Int("schema_deltas", len(link.Manifest.SchemaDelta)),
 			)
 			if err := r.applyIncremental(ctx, link, applier, batchSize); err != nil {
 				return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("chain restore: incremental %s: %w",
-					manifestBackupID(link.manifest), err))
+					lineage.ManifestBackupID(link.Manifest), err))
 			}
 		default:
 			return fmt.Errorf("chain restore: link %d (%s) has unknown kind %q",
-				i, link.path, link.manifest.Kind)
+				i, link.Path, link.Manifest.Kind)
 		}
 	}
 
@@ -350,10 +350,10 @@ type sequenceReprimer interface {
 // not a skip: reaching this point with sequences means the earlier
 // cross-engine refusals were bypassed, and silently leaving a stale
 // position is the exact class finding #2 closed.
-func (r *ChainRestore) reprimeStandaloneSequences(ctx context.Context, links []segmentRecord) error {
+func (r *ChainRestore) reprimeStandaloneSequences(ctx context.Context, links []lineage.SegmentRecord) error {
 	var schema *ir.Schema
 	for i := len(links) - 1; i >= 0; i-- {
-		if s := links[i].manifest.Schema; s != nil {
+		if s := links[i].Manifest.Schema; s != nil {
 			schema = s
 			break
 		}
@@ -396,13 +396,13 @@ func (r *ChainRestore) reprimeStandaloneSequences(ctx context.Context, links []s
 // base full's restore was so the MAX reads only touch tables that
 // exist on the target. Wrapped in the ADR-0114 reparent retry,
 // mirroring restore.go's Phase 3 call shape.
-func (r *ChainRestore) syncIdentitySequencesAtTail(ctx context.Context, links []segmentRecord) error {
+func (r *ChainRestore) syncIdentitySequencesAtTail(ctx context.Context, links []lineage.SegmentRecord) error {
 	var schema *ir.Schema
 	var sourceEngine string
 	for i := len(links) - 1; i >= 0; i-- {
-		if s := links[i].manifest.Schema; s != nil {
+		if s := links[i].Manifest.Schema; s != nil {
 			schema = s
-			sourceEngine = links[i].manifest.SourceEngine
+			sourceEngine = links[i].Manifest.SourceEngine
 			break
 		}
 	}
@@ -477,7 +477,7 @@ func (r *ChainRestore) validate() error {
 
 // applyFull delegates to the existing [Restore] path, scoped to the
 // segment's per-Dir store and recorded codec. The full's manifest
-// lives at the segment's FullManifestPath (== [ManifestFileName]
+// lives at the segment's FullManifestPath (== [lineage.ManifestFileName]
 // within the segment store — the segment-root layout). For a
 // one-segment lineage with Dir == "" this is byte-identical to the
 // pre-ADR single-full restore.
@@ -488,22 +488,22 @@ func (r *ChainRestore) validate() error {
 // upsert refresh only — re-running CreateIndexes/Constraints on the
 // already-built schema would error). Converges on the snapshot-at-S_n
 // view because seg[i].end <= seg[i+1].start (no gap).
-func (r *ChainRestore) applyFull(ctx context.Context, full *segmentRecord, dataOnly bool) error {
-	if full.path != full.segment.FullManifestPath {
+func (r *ChainRestore) applyFull(ctx context.Context, full *lineage.SegmentRecord, dataOnly bool) error {
+	if full.Path != full.Segment.FullManifestPath {
 		return fmt.Errorf("chain restore: segment full manifest is at %q; segment records %q",
-			full.path, full.segment.FullManifestPath)
+			full.Path, full.Segment.FullManifestPath)
 	}
-	if full.segment.FullManifestPath != ManifestFileName {
+	if full.Segment.FullManifestPath != lineage.ManifestFileName {
 		return fmt.Errorf("chain restore: segment full manifest path %q; expected %q (v0.67.0 segment-root layout)",
-			full.segment.FullManifestPath, ManifestFileName)
+			full.Segment.FullManifestPath, lineage.ManifestFileName)
 	}
-	if err := blobcodec.ValidateRecordedCodec(full.segment.Codec); err != nil {
+	if err := blobcodec.ValidateRecordedCodec(full.Segment.Codec); err != nil {
 		return err
 	}
 	rest := &Restore{
 		Target:            r.Target,
 		TargetDSN:         r.TargetDSN,
-		Store:             full.segment.store(r.Store),
+		Store:             full.Segment.Store(r.Store),
 		Filter:            r.Filter,
 		MaxBufferBytes:    r.MaxBufferBytes,
 		TableParallelism:  r.TableParallelism,
@@ -513,7 +513,7 @@ func (r *ChainRestore) applyFull(ctx context.Context, full *segmentRecord, dataO
 		DataOnly:          dataOnly,
 		Envelope:          r.Envelope,
 		TargetSchema:      r.TargetSchema,
-		segCodec:          full.segment.codecOrDefault(),
+		segCodec:          full.Segment.CodecOrDefault(),
 	}
 	return rest.Run(ctx)
 }
@@ -560,32 +560,32 @@ func (r *ChainRestore) preflightEncryption(rootManifest *irbackup.Manifest) erro
 // ChainEncryption); the uniformity is asserted within each segment.
 // Mixed-mode strongly suggests a tampered / mis-stitched lineage —
 // refuse loudly (DR data).
-func (r *ChainRestore) checkMixedModeChain(chain []segmentRecord) error {
+func (r *ChainRestore) checkMixedModeChain(chain []lineage.SegmentRecord) error {
 	if len(chain) < 2 {
 		return nil
 	}
 	segEnc := false // current segment's full's encryption shape
 	var segFullID string
 	for _, link := range chain {
-		if canonicalKind(link.manifest.Kind) == irbackup.BackupKindFull {
-			segEnc = link.manifest.ChainEncryption != nil
-			segFullID = manifestBackupID(link.manifest)
+		if lineage.CanonicalKind(link.Manifest.Kind) == irbackup.BackupKindFull {
+			segEnc = link.Manifest.ChainEncryption != nil
+			segFullID = lineage.ManifestBackupID(link.Manifest)
 			continue
 		}
 		incrHasChunkEnc := false
-		for _, c := range link.manifest.ChangeChunks {
+		for _, c := range link.Manifest.ChangeChunks {
 			if c != nil && c.Encryption != nil {
 				incrHasChunkEnc = true
 				break
 			}
 		}
-		if segEnc && !incrHasChunkEnc && len(link.manifest.ChangeChunks) > 0 {
+		if segEnc && !incrHasChunkEnc && len(link.Manifest.ChangeChunks) > 0 {
 			return fmt.Errorf("mixed-mode lineage: segment full %s is encrypted but incremental %s has plaintext change chunks; encryption must be uniform within a segment",
-				segFullID, manifestBackupID(link.manifest))
+				segFullID, lineage.ManifestBackupID(link.Manifest))
 		}
 		if !segEnc && incrHasChunkEnc {
 			return fmt.Errorf("mixed-mode lineage: segment full %s is plaintext but incremental %s has encrypted change chunks; encryption must be uniform within a segment",
-				segFullID, manifestBackupID(link.manifest))
+				segFullID, lineage.ManifestBackupID(link.Manifest))
 		}
 	}
 	return nil
@@ -595,7 +595,7 @@ func (r *ChainRestore) checkMixedModeChain(chain []segmentRecord) error {
 // streams its change chunks through the applier.
 func (r *ChainRestore) applyIncremental(
 	ctx context.Context,
-	link *segmentRecord,
+	link *lineage.SegmentRecord,
 	applier ir.ChangeApplier,
 	batchSize int,
 ) error {
@@ -606,7 +606,7 @@ func (r *ChainRestore) applyIncremental(
 	//    unless the target is the same engine as the source AND the
 	//    delta is a column-add we can cleanly express (the common
 	//    case for chain restore).
-	if len(link.manifest.SchemaDelta) > 0 {
+	if len(link.Manifest.SchemaDelta) > 0 {
 		if err := r.applySchemaDeltas(ctx, link); err != nil {
 			return fmt.Errorf("apply schema deltas: %w", err)
 		}
@@ -623,10 +623,10 @@ func (r *ChainRestore) applyIncremental(
 	//    even when ChangeChunks is empty (a window observed a DDL but
 	//    no DML, then closed). Replay the schema-history regardless so
 	//    a resumed stream finds the post-DDL version at backup.EndPosition.
-	if len(link.manifest.ChangeChunks) == 0 && len(link.manifest.SchemaHistory) == 0 {
+	if len(link.Manifest.ChangeChunks) == 0 && len(link.Manifest.SchemaHistory) == 0 {
 		slog.InfoContext(
 			ctx, "chain restore: incremental has no change chunks; schema deltas only",
-			slog.String("backup_id", manifestBackupID(link.manifest)),
+			slog.String("backup_id", lineage.ManifestBackupID(link.Manifest)),
 		)
 		return nil
 	}
@@ -700,7 +700,7 @@ func (r *ChainRestore) applyIncremental(
 // columns. New tables get created. Column additions (the common
 // alter case) are NOT picked up by this path; we surface a clear
 // log line and document the limitation.
-func (r *ChainRestore) applySchemaDeltas(ctx context.Context, link *segmentRecord) error {
+func (r *ChainRestore) applySchemaDeltas(ctx context.Context, link *lineage.SegmentRecord) error {
 	sw, err := r.Target.OpenSchemaWriter(ctx, r.TargetDSN)
 	if err != nil {
 		return fmt.Errorf("open schema writer: %w", err)
@@ -712,7 +712,7 @@ func (r *ChainRestore) applySchemaDeltas(ctx context.Context, link *segmentRecor
 	var (
 		adds, drops, alters int
 	)
-	for _, d := range link.manifest.SchemaDelta {
+	for _, d := range link.Manifest.SchemaDelta {
 		switch d.Kind {
 		case irbackup.SchemaDeltaAddTable:
 			adds++
@@ -729,11 +729,11 @@ func (r *ChainRestore) applySchemaDeltas(ctx context.Context, link *segmentRecor
 	// failure modes section. The "column dropped + new column with same
 	// name" pattern across deltas in a single manifest indicates ambiguous
 	// intent; for v1, refuse rather than risk wrong-shape application.
-	if err := detectAmbiguousDeltas(link.manifest.SchemaDelta); err != nil {
+	if err := lineage.DetectAmbiguousDeltas(link.Manifest.SchemaDelta); err != nil {
 		return fmt.Errorf(
 			"unsupportable schema delta in incremental %s: %w. "+
 				"Force a fresh full + new chain to recover",
-			manifestBackupID(link.manifest), err,
+			lineage.ManifestBackupID(link.Manifest), err,
 		)
 	}
 
@@ -741,12 +741,12 @@ func (r *ChainRestore) applySchemaDeltas(ctx context.Context, link *segmentRecor
 	// and call CreateTablesWithoutConstraints (idempotent).
 	if adds > 0 {
 		newTables := make([]*ir.Table, 0, adds)
-		for _, d := range link.manifest.SchemaDelta {
+		for _, d := range link.Manifest.SchemaDelta {
 			if d.Kind == irbackup.SchemaDeltaAddTable && d.After != nil {
 				newTables = append(newTables, d.After)
 			}
 		}
-		s := translate.RetargetForEngine(&ir.Schema{Tables: newTables}, link.manifest.SourceEngine, r.Target.Name())
+		s := translate.RetargetForEngine(&ir.Schema{Tables: newTables}, link.Manifest.SourceEngine, r.Target.Name())
 		if err := sw.CreateTablesWithoutConstraints(ctx, s); err != nil {
 			return fmt.Errorf("create added tables: %w", err)
 		}
@@ -765,11 +765,11 @@ func (r *ChainRestore) applySchemaDeltas(ctx context.Context, link *segmentRecor
 	// that's the operator's signal to take a fresh full.
 	if alters > 0 {
 		applier, _ := sw.(ir.SchemaDeltaApplier)
-		for _, d := range link.manifest.SchemaDelta {
+		for _, d := range link.Manifest.SchemaDelta {
 			if d.Kind != irbackup.SchemaDeltaAlterTable || d.Before == nil || d.After == nil {
 				continue
 			}
-			added := addedColumns(d.Before, d.After)
+			added := lineage.AddedColumns(d.Before, d.After)
 			if len(added) == 0 {
 				continue
 			}
@@ -785,10 +785,10 @@ func (r *ChainRestore) applySchemaDeltas(ctx context.Context, link *segmentRecor
 			// (UUID → CHAR(36) etc.) get rewritten before emit.
 			retargetSchema := translate.RetargetForEngine(
 				&ir.Schema{Tables: []*ir.Table{d.After}},
-				link.manifest.SourceEngine, r.Target.Name(),
+				link.Manifest.SourceEngine, r.Target.Name(),
 			)
 			retargetTable := retargetSchema.Tables[0]
-			retargetAdded := addedColumns(d.Before, retargetTable)
+			retargetAdded := lineage.AddedColumns(d.Before, retargetTable)
 			if err := applier.AlterAddColumn(ctx, retargetTable, retargetAdded); err != nil {
 				return fmt.Errorf("alter add column on %s: %w", d.Table, err)
 			}
@@ -832,14 +832,14 @@ func (r *ChainRestore) applySchemaDeltas(ctx context.Context, link *segmentRecor
 // no-ops.
 func (r *ChainRestore) streamIncrementalChanges(
 	ctx context.Context,
-	link *segmentRecord,
+	link *lineage.SegmentRecord,
 	out chan<- ir.Change,
 ) error {
 	if err := r.streamSchemaHistorySnapshots(ctx, link, out); err != nil {
 		return fmt.Errorf("apply schema history: %w", err)
 	}
-	segStore := link.segment.store(r.Store)
-	codec := link.segment.codecOrDefault()
+	segStore := link.Segment.Store(r.Store)
+	codec := link.Segment.CodecOrDefault()
 
 	// One-chunk read-ahead (perf-parity matrix gap 4): the fetcher
 	// goroutine GETs + SHA-verifies chunk N+1 while chunk N's changes
@@ -863,7 +863,7 @@ func (r *ChainRestore) streamIncrementalChanges(
 	fetchCh := make(chan fetchedChunk)
 	go func() {
 		defer close(fetchCh)
-		for chunkIdx, chunk := range link.manifest.ChangeChunks {
+		for chunkIdx, chunk := range link.Manifest.ChangeChunks {
 			src, err := blobcodec.FetchChunkVerified(fetchCtx, segStore, chunk.File, chunk.SHA256)
 			select {
 			case fetchCh <- fetchedChunk{idx: chunkIdx, chunk: chunk, src: src, err: err}:
@@ -887,7 +887,7 @@ func (r *ChainRestore) streamIncrementalChanges(
 		}
 		slog.DebugContext(
 			ctx, "chain restore: chunk verified and streamed",
-			slog.String("backup_id", manifestBackupID(link.manifest)),
+			slog.String("backup_id", lineage.ManifestBackupID(link.Manifest)),
 			slog.Int("chunk", f.idx),
 			slog.Int64("changes", f.chunk.RowCount),
 		)
@@ -896,7 +896,7 @@ func (r *ChainRestore) streamIncrementalChanges(
 }
 
 // streamSchemaHistorySnapshots converts each SchemaHistoryEntry on
-// link.manifest.SchemaHistory into a synthetic [ir.SchemaSnapshot] and
+// link.Manifest.SchemaHistory into a synthetic [ir.SchemaSnapshot] and
 // pushes it onto out. The applier's SchemaSnapshot dispatch persists
 // the version into sluice_cdc_schema_history (locked decision #4a:
 // same target tx as the position write — engine-side handled).
@@ -907,13 +907,13 @@ func (r *ChainRestore) streamIncrementalChanges(
 // composes with the engine applier's own nil-IR guard.
 func (r *ChainRestore) streamSchemaHistorySnapshots(
 	ctx context.Context,
-	link *segmentRecord,
+	link *lineage.SegmentRecord,
 	out chan<- ir.Change,
 ) error {
-	if len(link.manifest.SchemaHistory) == 0 {
+	if len(link.Manifest.SchemaHistory) == 0 {
 		return nil
 	}
-	for i, entry := range link.manifest.SchemaHistory {
+	for i, entry := range link.Manifest.SchemaHistory {
 		if entry == nil {
 			return fmt.Errorf("schema-history entry %d: nil", i)
 		}
@@ -940,8 +940,8 @@ func (r *ChainRestore) streamSchemaHistorySnapshots(
 	}
 	slog.DebugContext(
 		ctx, "chain restore: schema-history replayed",
-		slog.String("backup_id", manifestBackupID(link.manifest)),
-		slog.Int("entries", len(link.manifest.SchemaHistory)),
+		slog.String("backup_id", lineage.ManifestBackupID(link.Manifest)),
+		slog.Int("entries", len(link.Manifest.SchemaHistory)),
 	)
 	return nil
 }
@@ -984,399 +984,6 @@ func (r *ChainRestore) streamOneChangeChunk(
 		}
 	}
 	return cr.Close()
-}
-
-// validateBoundary is THE single boundary-monotonicity invariant
-// (ADR-0046 §3). It is called by [buildLineageChain] for BOTH an
-// intra-segment incremental boundary (prev link → next link within a
-// segment) AND a segment-to-segment boundary (prior segment's last
-// link → next segment's full) — the SAME code path, proving the
-// "one invariant, one check site" simplification. The invariant is
-// `prev.EndPosition == cur.StartPosition` (exact match: a backup chain
-// is a contiguous log, not merely non-decreasing — a gap loses data, a
-// regression duplicates / corrupts; either is a loud refusal, never a
-// silent partial assemble — DR data).
-//
-// The sole tolerance: an empty prev.EndPosition (a pre-Phase-3 / v0.16
-// full that recorded no position) skips the check, exactly as the
-// pre-ADR intra-chain validator did — preserving the legacy
-// one-segment behaviour byte-for-byte.
-// The exact flag selects the relation: intra-segment incremental
-// boundaries are CONTIGUOUS (curStart == prevEnd, by writer
-// construction — a gap loses events); segment-to-segment boundaries
-// are MONOTONIC (prevEnd <= curStart — the new full's snapshot anchor
-// S may legitimately be at-or-ahead of the prior segment's P_N, the
-// (P_N, S] window being covered by the new full). Both are the SAME
-// no-regression safety property checked at the SAME site; `exact`
-// only tightens the intra-segment case to also forbid a forward gap.
-// Monotonicity (the load-bearing property) is enforced via the
-// engine's [ir.PositionMonotonicChecker] when available (PG + MySQL),
-// the SAME mechanism as the rotation FSM's S>=P_N hard-fail.
-func validateBoundary(cmp ir.PositionMonotonicChecker, prevEnd, curStart ir.Position, exact bool, prevLabel, curLabel string) error {
-	if prevEnd.Engine == "" && prevEnd.Token == "" {
-		return nil // legacy v0.16 full with no recorded position
-	}
-	if exact {
-		if curStart != prevEnd {
-			return fmt.Errorf(
-				"lineage boundary mismatch at %s: StartPosition %+v does not equal preceding %s EndPosition %+v — refusing to silently assemble a gapped/regressed restore (DR data)",
-				curLabel, curStart, prevLabel, prevEnd,
-			)
-		}
-		return nil
-	}
-	// Inter-segment: prevEnd must precede-or-equal curStart (no
-	// regression). Exact contiguity is NOT required (S >= P_N).
-	if curStart == prevEnd {
-		return nil
-	}
-	if cmp != nil {
-		le, err := cmp.PrecedesOrEqual(prevEnd, curStart)
-		if err != nil {
-			return fmt.Errorf("lineage boundary at %s: cannot prove monotonic vs preceding %s (DR data, refusing): %w",
-				curLabel, prevLabel, err)
-		}
-		if !le {
-			return fmt.Errorf(
-				"lineage boundary REGRESSION at %s: StartPosition %+v precedes preceding %s EndPosition %+v — refusing to silently assemble a gapped/regressed restore (DR data)",
-				curLabel, curStart, prevLabel, prevEnd,
-			)
-		}
-		return nil
-	}
-	// No comparator: fall back to the structural same-engine guarantee
-	// (the rotation FSM already hard-asserted S>=P_N at write time).
-	if curStart.Engine != prevEnd.Engine {
-		return fmt.Errorf("lineage boundary at %s: engine %q != preceding %s engine %q (DR data, refusing)",
-			curLabel, curStart.Engine, prevLabel, prevEnd.Engine)
-	}
-	return nil
-}
-
-// validateFirstIncrementalBoundary validates a segment's full ->
-// first-incremental boundary, tolerating the ADR-0067 overlap. A
-// rotation-opened segment KEEPS the (P_N, S] window in its incrementals,
-// so its first incremental legitimately starts at P_N, which PRECEDES
-// the full's anchor (fullEnd == S). Two properties are checked:
-//
-//  1. INTEGRITY: the first incremental must start exactly at the
-//     segment's recorded coverage start (coverageStart ==
-//     IncrementalCoverageStart, or StartPosition when unset). This is
-//     what lets the no-comparator path trust the overlap: the rotation
-//     FSM hard-asserted P_N <= S when it recorded coverageStart = P_N at
-//     write time, so a first incremental that matches coverageStart is
-//     known-good even when restore can't re-order positions. It also
-//     catches a tampered/corrupt first incremental. Prune keeps
-//     coverageStart in sync when it trims leading incrementals (see
-//     PruneChain), so this does not spuriously fire post-prune.
-//  2. NO FORWARD GAP: the first incremental must start at-or-before the
-//     full's end -- the (firstStart, fullEnd] overlap re-applies
-//     idempotently on restore (ADR-0010); a first incremental AFTER the
-//     full's end would leave (fullEnd, firstStart) uncovered (a silent
-//     data gap -> loud refusal). For a never-rotated segment firstStart
-//     == fullEnd and this is the historical exact match.
-func validateFirstIncrementalBoundary(cmp ir.PositionMonotonicChecker, fullEnd, recordedCoverage, firstStart ir.Position, segLabel string) error {
-	if fullEnd.Engine == "" && fullEnd.Token == "" {
-		return nil // legacy full with no recorded position (historical tolerance)
-	}
-	// Where the first incremental must start:
-	//   - rotated segment (recordedCoverage set): the kept-overlap start
-	//     P_N (which precedes the full's anchor fullEnd == S);
-	//   - never-rotated segment (recordedCoverage unset): the full's own
-	//     end — the historical contiguous chain. We compare against the
-	//     full MANIFEST's EndPosition (authoritative), NOT the catalog's
-	//     StartPosition, which legacy/rebuilt catalogs may leave unset.
-	rotated := recordedCoverage.Engine != "" || recordedCoverage.Token != ""
-	expected := fullEnd
-	if rotated {
-		expected = recordedCoverage
-	}
-	if firstStart != expected {
-		return fmt.Errorf(
-			"lineage boundary mismatch at %s: first incremental StartPosition %+v does not equal the expected start %+v — refusing to silently assemble a gapped/regressed restore (DR data)",
-			segLabel, firstStart, expected,
-		)
-	}
-	if !rotated {
-		return nil // exact match against the full's end — historical behavior
-	}
-	// Rotated: the kept (recordedCoverage, fullEnd] overlap re-applies
-	// idempotently on restore (ADR-0010). Require no FORWARD gap — the
-	// coverage start must be at-or-before the full's end; a coverage start
-	// AHEAD of the full would leave (fullEnd, recordedCoverage) uncovered.
-	if recordedCoverage == fullEnd {
-		return nil
-	}
-	if cmp != nil {
-		le, err := cmp.PrecedesOrEqual(recordedCoverage, fullEnd)
-		if err != nil {
-			return fmt.Errorf("lineage %s: cannot prove first incremental start %+v <= full end %+v (DR data, refusing): %w",
-				segLabel, recordedCoverage, fullEnd, err)
-		}
-		if !le {
-			return fmt.Errorf(
-				"lineage boundary mismatch at %s: first incremental StartPosition %+v is AHEAD of the segment full's end %+v — a forward gap would lose events between them (DR data, refusing)",
-				segLabel, recordedCoverage, fullEnd,
-			)
-		}
-		return nil
-	}
-	// No comparator: the rotation FSM hard-asserted P_N <= S from the live
-	// source at write time when it recorded recordedCoverage; require the
-	// same engine as the structural guarantee.
-	if recordedCoverage.Engine != fullEnd.Engine {
-		return fmt.Errorf("lineage %s: first incremental engine %q != full engine %q (DR data, refusing)",
-			segLabel, recordedCoverage.Engine, fullEnd.Engine)
-	}
-	return nil
-}
-
-// buildLineageChain walks the lineage segment-by-segment and returns a
-// flat ordered link list (each segment's full followed by its
-// incrementals in chain order), validated by the SINGLE
-// [validateBoundary] invariant at every adjacency — intra-segment and
-// segment-to-segment alike. A malformed lineage (missing full,
-// out-of-order, position regression/gap across any boundary, branching,
-// cyclic) is a LOUD refusal — never a silent partial (ADR-0046 §3 /
-// loud-failure tenet).
-// cmp, when non-nil, is a [ir.PositionMonotonicChecker] for the
-// lineage's SOURCE engine (typically the target engine when restoring
-// same-engine — positions are then comparable). It enforces the
-// inter-segment no-regression check; nil degrades to the structural
-// same-engine guarantee (the rotation FSM already hard-asserted
-// S>=P_N at write time via the live source engine).
-func buildLineageChain(ctx context.Context, store irbackup.Store, cmp ir.PositionMonotonicChecker) ([]segmentRecord, error) {
-	cat, err := resolveLineage(ctx, store)
-	if err != nil {
-		return nil, err
-	}
-	if cat.RestorableFromSegment < 0 || cat.RestorableFromSegment >= len(cat.Segments) {
-		return nil, fmt.Errorf("lineage restorable_from_segment=%d out of range [0,%d) — corrupt lineage",
-			cat.RestorableFromSegment, len(cat.Segments))
-	}
-
-	var out []segmentRecord
-	var prevLink *segmentRecord // last link of the previously-walked segment
-	for si := cat.RestorableFromSegment; si < len(cat.Segments); si++ {
-		seg := &cat.Segments[si]
-		if err := blobcodec.ValidateRecordedCodec(seg.Codec); err != nil {
-			return nil, err
-		}
-		ss := seg.store(store)
-
-		// Segment full.
-		fm, err := readManifestAt(ctx, ss, seg.FullManifestPath)
-		if err != nil {
-			return nil, fmt.Errorf("segment %d (%s) full %q: %w", si, seg.SegmentID, seg.FullManifestPath, err)
-		}
-		if k := canonicalKind(fm.Kind); k != irbackup.BackupKindFull {
-			return nil, fmt.Errorf("segment %d (%s) full manifest %q has kind %q; expected full",
-				si, seg.SegmentID, seg.FullManifestPath, fm.Kind)
-		}
-		fullRec := segmentRecord{
-			manifestRecord: manifestRecord{path: seg.FullManifestPath, manifest: fm},
-			segment:        seg,
-		}
-		// Segment-to-segment boundary (MONOTONIC, not exact): the
-		// prior segment's last link EndPosition (P_N) must
-		// precede-or-equal this segment's recorded StartPosition (S
-		// from lineage.json — the rotation anchor, NOT the full
-		// manifest's empty StartPosition field). SAME validator as the
-		// intra-segment boundary below, `exact=false`.
-		if prevLink != nil {
-			if err := validateBoundary(cmp, prevLink.manifest.EndPosition, seg.incrementalCoverageStartOrStart(), false,
-				fmt.Sprintf("segment %d last link %s", si-1, manifestBackupID(prevLink.manifest)),
-				fmt.Sprintf("segment %d (%s) incremental coverage start", si, seg.SegmentID)); err != nil {
-				return nil, err
-			}
-		}
-		out = append(out, fullRec)
-		prevLink = &out[len(out)-1]
-
-		// Intra-segment incremental chain. The lineage records the
-		// ordered incremental paths; validate the parent-link + the
-		// SAME boundary invariant against the running prev link.
-		seenInc := make(map[string]string, len(seg.Incrementals))
-		parentID := manifestBackupID(fm)
-		for ii, ip := range seg.Incrementals {
-			im, err := readManifestAt(ctx, ss, ip)
-			if err != nil {
-				return nil, fmt.Errorf("segment %d (%s) incremental %q: %w", si, seg.SegmentID, ip, err)
-			}
-			if k := canonicalKind(im.Kind); k != irbackup.BackupKindIncremental {
-				return nil, fmt.Errorf("segment %d incremental %q has kind %q; expected incremental",
-					si, ip, im.Kind)
-			}
-			id := manifestBackupID(im)
-			if prevPath, dup := seenInc[id]; dup {
-				return nil, fmt.Errorf("segment %d duplicate incremental BackupID %q (paths %q and %q)",
-					si, id, prevPath, ip)
-			}
-			seenInc[id] = ip
-			if im.ParentBackupID != "" && im.ParentBackupID != parentID {
-				return nil, fmt.Errorf("segment %d incremental %q parent %q does not chain off preceding link %q — branching/mis-stitched lineage",
-					si, ip, im.ParentBackupID, parentID)
-			}
-			if ii == 0 {
-				// Full -> first-incremental boundary. ADR-0067: a
-				// rotation-opened segment KEEPS the (P_N, S] overlap, so
-				// its first incremental starts at IncrementalCoverageStart
-				// (P_N), which PRECEDES the full's anchor (full.End == S).
-				// Tolerate that backward overlap (it re-applies
-				// idempotently on restore); refuse only a FORWARD gap
-				// (first incremental starting AFTER the full's end would
-				// lose events). For a never-rotated segment the coverage
-				// start == full.End and this is the historical exact match.
-				if err := validateFirstIncrementalBoundary(cmp, fm.EndPosition, seg.IncrementalCoverageStart, im.StartPosition,
-					fmt.Sprintf("segment %d (%s)", si, seg.SegmentID)); err != nil {
-					return nil, err
-				}
-			} else if err := validateBoundary(cmp, prevLink.manifest.EndPosition, im.StartPosition, true,
-				fmt.Sprintf("segment %d link %d", si, ii),
-				fmt.Sprintf("segment %d incremental %s", si, id)); err != nil {
-				return nil, err
-			}
-			out = append(out, segmentRecord{
-				manifestRecord: manifestRecord{path: ip, manifest: im},
-				segment:        seg,
-			})
-			prevLink = &out[len(out)-1]
-			parentID = id
-		}
-	}
-	return out, nil
-}
-
-// sameEngineComparator returns eng as an [ir.PositionMonotonicChecker]
-// IFF eng implements it AND eng.Name() matches the lineage's recorded
-// source engine (positions are engine-native — a MySQL target cannot
-// order PG LSNs). Otherwise nil (the inter-segment check degrades to
-// the structural guarantee; the write-time S>=P_N hard-fail remains
-// the authoritative monotonicity gate). Best-effort: a lineage-read
-// hiccup yields nil rather than failing the restore here (the
-// subsequent buildLineageChain surfaces real lineage errors).
-func sameEngineComparator(ctx context.Context, store irbackup.Store, eng ir.Engine) ir.PositionMonotonicChecker {
-	chk, ok := eng.(ir.PositionMonotonicChecker)
-	if !ok {
-		return nil
-	}
-	cat, err := resolveLineage(ctx, store)
-	if err != nil || cat.SourceEngine == "" || cat.SourceEngine != eng.Name() {
-		return nil
-	}
-	return chk
-}
-
-// buildBrokerChain is the backup-broker (Phase 4.5) entry point. It
-// walks the full lineage — single OR multi-segment — and returns the
-// flat link list. The broker's apply loop skips every link whose
-// manifest Kind is BackupKindFull (`broker.go::replayNewIncrementals`),
-// so segment-N+1's rotation full is auto-skipped and the broker
-// continues with the new segment's incremental tail. ADR-0067's
-// born-contiguous rotation guarantees the new segment's first
-// incremental covers the `(P_N, S]` overlap from the prior segment's
-// end position; ADR-0010's idempotent applier handles the brief
-// re-application of changes that landed before the broker last
-// advanced its `last_applied_backup_id`. Phase 4.5 originally deferred
-// multi-segment broker following pending validation that the existing
-// chain-walker + idempotent-applier infrastructure actually covered
-// the seam; Round D's soak (2026-05-31) characterized the gap and
-// this commit closes it. Same comparator semantics as the single-
-// segment path — nil is fine because the rotation FSM's write-time
-// S>=P_N hard-assert is the authoritative monotonicity gate.
-// Broker call sites reach this through [brokerChainCache], which
-// memoizes the walk across ticks so an idle tick is O(1) store GETs
-// instead of O(chain-length).
-func buildBrokerChain(ctx context.Context, store irbackup.Store) ([]segmentRecord, error) {
-	return buildLineageChain(ctx, store, nil)
-}
-
-// detectAmbiguousDeltas returns a non-nil error when the slice
-// contains a clearly unsupportable pattern (today: drop+add of the
-// same column name within a single incremental, which the design
-// doc names as ambiguous and recommends "force fresh full").
-func detectAmbiguousDeltas(deltas []*irbackup.SchemaDeltaEntry) error {
-	for _, d := range deltas {
-		if d.Kind != irbackup.SchemaDeltaAlterTable {
-			continue
-		}
-		if d.Before == nil || d.After == nil {
-			continue
-		}
-		// Build column-name sets for before / after.
-		bef := make(map[string]bool, len(d.Before.Columns))
-		for _, c := range d.Before.Columns {
-			bef[c.Name] = true
-		}
-		aft := make(map[string]bool, len(d.After.Columns))
-		for _, c := range d.After.Columns {
-			aft[c.Name] = true
-		}
-		// "Drop+add of the same name" wouldn't show up at the
-		// incremental boundary (the diff only sees the start and end
-		// shape). The genuine ambiguous case is a column-rename: a
-		// before column missing from after AND an after column missing
-		// from before, with different names. Surface that as
-		// ambiguous so the operator can disambiguate.
-		var dropped, added []string
-		for name := range bef {
-			if !aft[name] {
-				dropped = append(dropped, name)
-			}
-		}
-		for name := range aft {
-			if !bef[name] {
-				added = append(added, name)
-			}
-		}
-		// Single drop + single add is the rename ambiguity. Multiple
-		// of either is a more complex shape that's still
-		// data-dependent; for v1 we stay conservative and refuse just
-		// the rename pattern.
-		if len(dropped) == 1 && len(added) == 1 {
-			sort.Strings(dropped)
-			sort.Strings(added)
-			return fmt.Errorf(
-				"table %q has dropped column %q and added column %q within one incremental window; ambiguous (rename vs independent edits)",
-				d.Table, dropped[0], added[0],
-			)
-		}
-	}
-	return nil
-}
-
-// addedColumns returns the columns in after but not in before,
-// preserving after's declaration order.
-func addedColumns(before, after *ir.Table) []*ir.Column {
-	if after == nil {
-		return nil
-	}
-	beforeNames := map[string]bool{}
-	if before != nil {
-		for _, c := range before.Columns {
-			beforeNames[c.Name] = true
-		}
-	}
-	out := make([]*ir.Column, 0, len(after.Columns))
-	for _, c := range after.Columns {
-		if !beforeNames[c.Name] {
-			out = append(out, c)
-		}
-	}
-	return out
-}
-
-// manifestBackupID returns m's stored or computed BackupID. Pre-
-// Phase-3 manifests have an empty BackupID; we compute it on demand
-// so chain code can identify links uniformly.
-func manifestBackupID(m *irbackup.Manifest) string {
-	if m == nil {
-		return ""
-	}
-	if m.BackupID != "" {
-		return m.BackupID
-	}
-	return irbackup.ComputeBackupID(m)
 }
 
 // changeChunkCEK resolves the CEK for a change chunk: per-chain mode

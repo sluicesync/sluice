@@ -13,6 +13,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // fakeMonotonicEngine is a fakeCDCEngine that also implements
@@ -116,8 +117,8 @@ func TestShouldRotate_AgeFromOpenSegmentFull(t *testing.T) {
 		PartialState: irbackup.BackupStateComplete,
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	mustWriteManifest(t, store, ManifestFileName, full)
-	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, blobcodec.CodecGzip)
+	mustWriteManifest(t, store, lineage.ManifestFileName, full)
+	lineage.UpdateLineageForManifestBestEffort(context.Background(), store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
 
 	b := &BackupStream{RetainRotateAt: time.Hour, Store: store}
 	if r := b.shouldRotate(context.Background(), 0, created.Add(2*time.Hour)); r != rotationReasonAge {
@@ -137,11 +138,11 @@ func TestShouldRotate_AgeFromOpenSegmentFull(t *testing.T) {
 // open segment intact.
 func TestRecoverRotationState_PreCommitDiscards(t *testing.T) {
 	store := newMemStore()
-	cat := &LineageCatalog{
+	cat := &lineage.Catalog{
 		FormatVersion: 1, SourceEngine: "postgres",
-		Segments: []LineageSegment{{SegmentID: "s0", Dir: "", FullManifestPath: ManifestFileName, Codec: blobcodec.CodecGzip}},
+		Segments: []lineage.Segment{{SegmentID: "s0", Dir: "", FullManifestPath: lineage.ManifestFileName, Codec: blobcodec.CodecGzip}},
 	}
-	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
+	if err := lineage.WriteLineageCatalog(context.Background(), store, cat); err != nil {
 		t.Fatal(err)
 	}
 	st := &rotationState{Phase: rotationPhaseBulkCopy, Reason: rotationReasonAge, ProvisionalDir: "seg-999"}
@@ -159,7 +160,7 @@ func TestRecoverRotationState_PreCommitDiscards(t *testing.T) {
 	if ex, _ := store.Exists(context.Background(), "seg-999/manifest.json"); ex {
 		t.Error("provisional segment not discarded after ≤COMMIT recovery")
 	}
-	got, _, _ := loadLineageCatalog(context.Background(), store)
+	got, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 	if len(got.Segments) != 1 {
 		t.Errorf("segments = %d; want 1 (prior segment intact)", len(got.Segments))
 	}
@@ -170,17 +171,17 @@ func TestRecoverRotationState_PreCommitDiscards(t *testing.T) {
 func TestRecoverRotationState_PostCommitKeeps(t *testing.T) {
 	store := newMemStore()
 	capped := time.Now().UTC()
-	cat := &LineageCatalog{
+	cat := &lineage.Catalog{
 		FormatVersion: 1, SourceEngine: "postgres",
-		Segments: []LineageSegment{
+		Segments: []lineage.Segment{
 			{
-				SegmentID: "s0", Dir: "", FullManifestPath: ManifestFileName,
+				SegmentID: "s0", Dir: "", FullManifestPath: lineage.ManifestFileName,
 				CappedAt: &capped, CapReason: rotationReasonAge, Codec: blobcodec.CodecGzip,
 			},
-			{SegmentID: "s1", Dir: "seg-777", FullManifestPath: ManifestFileName, Codec: blobcodec.CodecGzip},
+			{SegmentID: "s1", Dir: "seg-777", FullManifestPath: lineage.ManifestFileName, Codec: blobcodec.CodecGzip},
 		},
 	}
-	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
+	if err := lineage.WriteLineageCatalog(context.Background(), store, cat); err != nil {
 		t.Fatal(err)
 	}
 	st := &rotationState{Phase: rotationPhaseCommit, Reason: rotationReasonAge, ProvisionalDir: "seg-777"}
@@ -193,8 +194,8 @@ func TestRecoverRotationState_PostCommitKeeps(t *testing.T) {
 	if ex, _ := store.Exists(context.Background(), RotationStateFileName); ex {
 		t.Error("rotation_state.json not cleared after >COMMIT recovery")
 	}
-	got, _, _ := loadLineageCatalog(context.Background(), store)
-	if len(got.Segments) != 2 || got.Segments[0].open() {
+	got, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
+	if len(got.Segments) != 2 || got.Segments[0].Open() {
 		t.Errorf("post-COMMIT lineage = %+v; want 2 segments, seg0 capped", got.Segments)
 	}
 }

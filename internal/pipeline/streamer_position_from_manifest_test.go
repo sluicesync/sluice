@@ -18,6 +18,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // TestStreamer_PositionFromManifest_BypassesAppliedReadPosition pins
@@ -43,7 +44,7 @@ func TestStreamer_PositionFromManifest_BypassesAppliedReadPosition(t *testing.T)
 		PartialState:  irbackup.BackupStateComplete,
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("write manifest: %v", err)
 	}
 
@@ -115,7 +116,7 @@ func TestStreamer_PositionFromManifest_EmptyEndPosition(t *testing.T) {
 		// No EndPosition.
 		PartialState: irbackup.BackupStateComplete,
 	}
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("write manifest: %v", err)
 	}
 
@@ -163,7 +164,7 @@ func TestStreamer_PositionFromManifest_StrictPreflightWarningsRefuse(t *testing.
 		PartialState:  irbackup.BackupStateComplete,
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("write manifest: %v", err)
 	}
 
@@ -217,7 +218,7 @@ func TestStreamer_PositionFromManifest_PreflightRefusalAlwaysRefuses(t *testing.
 		PartialState:  irbackup.BackupStateComplete,
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("write manifest: %v", err)
 	}
 

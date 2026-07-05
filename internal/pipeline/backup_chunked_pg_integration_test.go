@@ -33,6 +33,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -161,9 +162,9 @@ func TestBackupChunked_PG_IntPKRoundTrip(t *testing.T) {
 		t.Errorf("small_int dispatch = %d ranges; want 1 (below --bulk-parallel-min-rows)", got)
 	}
 
-	m, err := readManifest(context.Background(), store)
+	m, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	if m.PartialState != irbackup.BackupStateComplete {
 		t.Fatalf("PartialState = %q; want complete", m.PartialState)
@@ -321,7 +322,7 @@ func TestBackupChunked_PG_EncryptedPerChunkCEK(t *testing.T) {
 		ChunkRows:           300,
 		BulkParallelism:     4,
 		BulkParallelMinRows: 400,
-		Encryption:          &BackupEncryption{Envelope: env, Mode: crypto.EncryptModePerChunk},
+		Encryption:          &lineage.BackupEncryption{Envelope: env, Mode: crypto.EncryptModePerChunk},
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
@@ -329,9 +330,9 @@ func TestBackupChunked_PG_EncryptedPerChunkCEK(t *testing.T) {
 		t.Fatalf("big_enc dispatch = single-stream (reason %q); want chunked", reason("big_enc"))
 	}
 	// Per-chunk mode: every manifest chunk must carry its own WrappedCEK.
-	m, err := readManifest(context.Background(), store)
+	m, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	for _, entry := range m.Tables {
 		for _, ci := range entry.Chunks {
@@ -395,9 +396,9 @@ func TestBackupChunked_PG_CancelRestreamsPartialTable(t *testing.T) {
 		t.Fatal("cancelled Backup.Run returned nil; want a context error")
 	}
 
-	m, err := readManifest(context.Background(), inner)
+	m, err := lineage.ReadManifest(context.Background(), inner)
 	if err != nil {
-		t.Fatalf("readManifest after cancel: %v", err)
+		t.Fatalf("lineage.ReadManifest after cancel: %v", err)
 	}
 	if m.PartialState != irbackup.BackupStateInProgress {
 		t.Fatalf("PartialState = %q; want in_progress", m.PartialState)
@@ -424,9 +425,9 @@ func TestBackupChunked_PG_CancelRestreamsPartialTable(t *testing.T) {
 	if got := ranges("big_resume"); got <= 1 {
 		t.Fatalf("resumed big_resume dispatch = single-stream (reason %q); want chunked", reason("big_resume"))
 	}
-	m2, err := readManifest(context.Background(), inner)
+	m2, err := lineage.ReadManifest(context.Background(), inner)
 	if err != nil {
-		t.Fatalf("readManifest after resume: %v", err)
+		t.Fatalf("lineage.ReadManifest after resume: %v", err)
 	}
 	if m2.PartialState != irbackup.BackupStateComplete {
 		t.Fatalf("resumed PartialState = %q; want complete", m2.PartialState)

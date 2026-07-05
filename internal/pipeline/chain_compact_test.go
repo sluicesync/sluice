@@ -16,6 +16,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // TestCompactChain_TwoSegmentGroup_Merges: a 2-segment in-window group
@@ -43,9 +44,9 @@ func TestCompactChain_TwoSegmentGroup_Merges(t *testing.T) {
 			res.BytesBefore, res.BytesAfter)
 	}
 
-	cat, ok, err := loadLineageCatalog(context.Background(), store)
+	cat, ok, err := lineage.LoadLineageCatalog(context.Background(), store)
 	if err != nil || !ok {
-		t.Fatalf("post-compact loadLineageCatalog: ok=%v err=%v", ok, err)
+		t.Fatalf("post-compact lineage.LoadLineageCatalog: ok=%v err=%v", ok, err)
 	}
 	if len(cat.Segments) != 1 {
 		t.Fatalf("post-compact segments = %d; want 1 merged segment", len(cat.Segments))
@@ -65,8 +66,8 @@ func TestCompactChain_TwoSegmentGroup_Merges(t *testing.T) {
 	}
 	// Merged segment's full + incrementals are addressable under the
 	// merged dir.
-	mergedStore := merged.store(store)
-	if ex, _ := mergedStore.Exists(context.Background(), ManifestFileName); !ex {
+	mergedStore := merged.Store(store)
+	if ex, _ := mergedStore.Exists(context.Background(), lineage.ManifestFileName); !ex {
 		t.Error("merged segment's full manifest is missing under its dir")
 	}
 	for _, ip := range merged.Incrementals {
@@ -75,7 +76,7 @@ func TestCompactChain_TwoSegmentGroup_Merges(t *testing.T) {
 		}
 	}
 	// Source dirs are swept (post-commit cleanup).
-	if ex, _ := store.Exists(context.Background(), ManifestFileName); ex {
+	if ex, _ := store.Exists(context.Background(), lineage.ManifestFileName); ex {
 		t.Error("source-0 root manifest survives compact; should have been swept")
 	}
 	if paths, _ := store.List(context.Background(), "seg-1/"); len(paths) != 0 {
@@ -105,7 +106,7 @@ func TestCompactChain_ThreeSegmentGroup_Merges(t *testing.T) {
 	if res.GroupsMerged != 1 || res.SegmentsRemoved != 2 {
 		t.Errorf("GroupsMerged=%d SegmentsRemoved=%d; want 1,2", res.GroupsMerged, res.SegmentsRemoved)
 	}
-	cat, _, _ := loadLineageCatalog(context.Background(), store)
+	cat, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 	if len(cat.Segments) != 1 {
 		t.Fatalf("post-compact segments = %d; want 1", len(cat.Segments))
 	}
@@ -129,7 +130,7 @@ func TestCompactChain_GroupOutsideWindow_Untouched(t *testing.T) {
 	if res.GroupsMerged != 0 || res.SegmentsRemoved != 0 {
 		t.Errorf("out-of-window groups merged: %+v", res)
 	}
-	cat, _, _ := loadLineageCatalog(context.Background(), store)
+	cat, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 	if len(cat.Segments) != 2 {
 		t.Errorf("segments = %d; want 2 (untouched)", len(cat.Segments))
 	}
@@ -158,7 +159,7 @@ func TestCompactChain_MixedInOutWindow(t *testing.T) {
 		t.Errorf("GroupsConsidered=%d GroupsMerged=%d SegmentsRemoved=%d; want 2,2,2",
 			res.GroupsConsidered, res.GroupsMerged, res.SegmentsRemoved)
 	}
-	cat, _, _ := loadLineageCatalog(context.Background(), store)
+	cat, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 	if len(cat.Segments) != 2 {
 		t.Errorf("post-compact segments = %d; want 2 merged segments", len(cat.Segments))
 	}
@@ -191,7 +192,7 @@ func TestCompactChain_KeysetBoundary_RefusesLoudly(t *testing.T) {
 	}
 	// Refusal is BEFORE any mutation: catalog should still hold both
 	// source segments unchanged.
-	cat, _, _ := loadLineageCatalog(context.Background(), store)
+	cat, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 	if len(cat.Segments) != 2 {
 		t.Errorf("post-refusal segments = %d; want 2 (no mutation)", len(cat.Segments))
 	}
@@ -241,7 +242,7 @@ func TestCompactChain_PositionGap_SplitsNotRefuses(t *testing.T) {
 		t.Errorf("GroupsMerged = %d; want 0 (the gap splits seg0 and seg1 into separate size-1 groups)", res.GroupsMerged)
 	}
 	// The lineage is untouched (both segments survive, nothing merged).
-	cat, _, _ := loadLineageCatalog(context.Background(), store)
+	cat, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 	if len(cat.Segments) != 2 {
 		t.Errorf("post-compact segments = %d; want 2 (no merge across the gap)", len(cat.Segments))
 	}
@@ -322,13 +323,13 @@ func TestCompactChain_Bug139_GapSplit(t *testing.T) {
 			if res.GroupsMerged != tc.wantMerged {
 				t.Errorf("GroupsMerged = %d; want %d", res.GroupsMerged, tc.wantMerged)
 			}
-			cat, _, _ := loadLineageCatalog(context.Background(), store)
+			cat, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 			if len(cat.Segments) != tc.wantSegmentsAfter {
 				t.Errorf("post-compact segments = %d; want %d", len(cat.Segments), tc.wantSegmentsAfter)
 			}
 			// The post-compact lineage must still restore-walk cleanly.
-			if _, err := buildLineageChain(context.Background(), store, nil); err != nil {
-				t.Errorf("post-compact buildLineageChain: %v", err)
+			if _, err := lineage.BuildLineageChain(context.Background(), store, nil); err != nil {
+				t.Errorf("post-compact lineage.BuildLineageChain: %v", err)
 			}
 		})
 	}
@@ -363,12 +364,12 @@ func TestCompactChain_Bug139_MidChainStampless_SplitsAroundBoundary(t *testing.T
 	if res.GroupsMerged != 2 {
 		t.Errorf("GroupsMerged = %d; want 2 (one merged group each side of the gap)", res.GroupsMerged)
 	}
-	cat, _, _ := loadLineageCatalog(context.Background(), store)
+	cat, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 	if len(cat.Segments) != 2 {
 		t.Errorf("post-compact segments = %d; want 2", len(cat.Segments))
 	}
-	if _, err := buildLineageChain(context.Background(), store, nil); err != nil {
-		t.Errorf("post-compact buildLineageChain: %v", err)
+	if _, err := lineage.BuildLineageChain(context.Background(), store, nil); err != nil {
+		t.Errorf("post-compact lineage.BuildLineageChain: %v", err)
 	}
 }
 
@@ -393,7 +394,7 @@ func TestCompactChain_FullyContiguousRotated_MergesExactly(t *testing.T) {
 		t.Errorf("GroupsMerged=%d SegmentsRemoved=%d; want 1,3 (4→1 exact merge)",
 			res.GroupsMerged, res.SegmentsRemoved)
 	}
-	cat, _, _ := loadLineageCatalog(context.Background(), store)
+	cat, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 	if len(cat.Segments) != 1 {
 		t.Errorf("post-compact segments = %d; want 1", len(cat.Segments))
 	}
@@ -433,7 +434,7 @@ func TestCompactChain_Bug139_DryRunSplits(t *testing.T) {
 		t.Errorf("dry-run plan groups: size2=%d size1=%d; want 1 size-2 (merge) + 1 size-1 (split-off)", size2, size1)
 	}
 	// Dry-run touched nothing: both segments survive on disk.
-	cat, _, _ := loadLineageCatalog(context.Background(), store)
+	cat, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 	if len(cat.Segments) != 3 {
 		t.Errorf("post-dry-run segments = %d; want 3 (untouched)", len(cat.Segments))
 	}
@@ -461,8 +462,8 @@ func TestCompactChain_RotatedOverlap_Merges(t *testing.T) {
 	// The post-compact lineage must still build (the restore-walk): the
 	// merged segment's full is the oldest (non-rotated) source's, the
 	// former inter-segment boundary is now an exact intra-segment one.
-	if _, err := buildLineageChain(context.Background(), store, nil); err != nil {
-		t.Errorf("post-compact buildLineageChain: %v", err)
+	if _, err := lineage.BuildLineageChain(context.Background(), store, nil); err != nil {
+		t.Errorf("post-compact lineage.BuildLineageChain: %v", err)
 	}
 }
 
@@ -525,7 +526,7 @@ func TestCompactChain_DryRun_NoSideEffects(t *testing.T) {
 		t.Errorf("dry-run Plan = %+v; want one entry with MergedSegmentID=would-merge", res.Plan)
 	}
 	// Catalog unchanged.
-	cat, _, _ := loadLineageCatalog(context.Background(), store)
+	cat, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 	if len(cat.Segments) != 2 {
 		t.Errorf("post-dry-run segments = %d; want 2 (no mutation)", len(cat.Segments))
 	}
@@ -558,7 +559,7 @@ func TestCompactChain_RefusesWhenCatalogAbsent(t *testing.T) {
 }
 
 // TestCompactChain_RestoreShape_PostCompact: the post-compact lineage
-// remains structurally valid for restore — buildLineageChain must
+// remains structurally valid for restore — lineage.BuildLineageChain must
 // succeed (the same way prune's analogous pin asserts).
 func TestCompactChain_RestoreShape_PostCompact(t *testing.T) {
 	store := newMemStore()
@@ -572,8 +573,8 @@ func TestCompactChain_RestoreShape_PostCompact(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("CompactChain: %v", err)
 	}
-	if _, err := buildLineageChain(context.Background(), store, nil); err != nil {
-		t.Errorf("post-compact buildLineageChain: %v; want valid lineage", err)
+	if _, err := lineage.BuildLineageChain(context.Background(), store, nil); err != nil {
+		t.Errorf("post-compact lineage.BuildLineageChain: %v; want valid lineage", err)
 	}
 }
 
@@ -635,7 +636,7 @@ func TestCompactChain_OrphanSweepDeleteFailure_Warns(t *testing.T) {
 	// second source's sub-dir — exercising BOTH sweep helpers.
 	store := &failingDeleteStore{
 		memStore:     newMemStore(),
-		failPrefixes: []string{ManifestFileName, "seg-1/"},
+		failPrefixes: []string{lineage.ManifestFileName, "seg-1/"},
 	}
 	now := time.Date(2026, 5, 16, 0, 0, 0, 0, time.UTC)
 	seedTwoSegmentLineage(t, store, now, time.Hour)
@@ -656,8 +657,8 @@ func TestCompactChain_OrphanSweepDeleteFailure_Warns(t *testing.T) {
 	if !strings.Contains(logs, "orphan sweep failed") {
 		t.Fatalf("no orphan-sweep WARN emitted; logs:\n%s", logs)
 	}
-	if !strings.Contains(logs, ManifestFileName) {
-		t.Errorf("WARN does not name the failing root manifest path %q; logs:\n%s", ManifestFileName, logs)
+	if !strings.Contains(logs, lineage.ManifestFileName) {
+		t.Errorf("WARN does not name the failing root manifest path %q; logs:\n%s", lineage.ManifestFileName, logs)
 	}
 	if !strings.Contains(logs, "seg-1/") {
 		t.Errorf("WARN does not name the failing seg-1/ paths; logs:\n%s", logs)
@@ -772,7 +773,7 @@ func seedSegmentsWithGapsOpts(t *testing.T, store irbackup.Store, base time.Time
 
 	// First, build segments and write their conventional files. Then
 	// hand-author the lineage.json describing the multi-segment shape.
-	cat := &LineageCatalog{
+	cat := &lineage.Catalog{
 		FormatVersion: 1,
 		SourceEngine:  "postgres",
 		CreatedAt:     base,
@@ -817,8 +818,8 @@ func seedSegmentsWithGapsOpts(t *testing.T, store irbackup.Store, base time.Time
 		}
 		// Full is a snapshot at fullAnchorLSN: Start == End == fullAnchorLSN.
 		full := compactSeedFullManifest(t, segCreatedAt, fullAnchorLSN, chainEnc)
-		segStore := newPrefixedStore(store, dir)
-		if err := writeManifestAt(context.Background(), segStore, ManifestFileName, full); err != nil {
+		segStore := lineage.NewPrefixedStore(store, dir)
+		if err := lineage.WriteManifestAt(context.Background(), segStore, lineage.ManifestFileName, full); err != nil {
 			t.Fatalf("seed full %d: %v", i, err)
 		}
 		// Two incrementals stepping LSN forward by 50 each — unless this is
@@ -839,7 +840,7 @@ func seedSegmentsWithGapsOpts(t *testing.T, store irbackup.Store, base time.Time
 					t.Fatalf("seed change chunk: %v", err)
 				}
 				im.ChangeChunks = []*irbackup.ChunkInfo{{File: chunkPath, RowCount: 1, SHA256: ""}}
-				if err := writeManifestAt(context.Background(), segStore, ip, im); err != nil {
+				if err := lineage.WriteManifestAt(context.Background(), segStore, ip, im); err != nil {
 					t.Fatalf("seed incr (%d,%d): %v", i, j, err)
 				}
 				incrPaths = append(incrPaths, ip)
@@ -848,10 +849,10 @@ func seedSegmentsWithGapsOpts(t *testing.T, store irbackup.Store, base time.Time
 		}
 		prevEndLSN = curLSN
 
-		segEntry := LineageSegment{
+		segEntry := lineage.Segment{
 			SegmentID:        full.BackupID,
 			Dir:              dir,
-			FullManifestPath: ManifestFileName,
+			FullManifestPath: lineage.ManifestFileName,
 			Incrementals:     incrPaths,
 			StartPosition:    full.EndPosition,
 			EndPosition:      ir.Position{Engine: "postgres", Token: lsnToken(curLSN)},
@@ -882,7 +883,7 @@ func seedSegmentsWithGapsOpts(t *testing.T, store irbackup.Store, base time.Time
 			cumulative += gaps[i]
 		}
 	}
-	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
+	if err := lineage.WriteLineageCatalog(context.Background(), store, cat); err != nil {
 		t.Fatalf("write lineage catalog: %v", err)
 	}
 }

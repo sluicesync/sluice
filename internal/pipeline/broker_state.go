@@ -30,15 +30,16 @@ import (
 	"time"
 
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // DefaultBrokerStateFilename is the path within the chain store the
 // broker liveness file is written to. Lives under
-// [incrementalManifestPrefix] alongside `stream_state.json` and the
+// [lineage.IncrementalManifestPrefix] alongside `stream_state.json` and the
 // chain manifests so a single `List(manifests/)` enumerates all of
 // them; the chain-walker filters by entry shape so neither state file
 // is mistaken for a chain entry.
-const DefaultBrokerStateFilename = incrementalManifestPrefix + "broker_state.json"
+const DefaultBrokerStateFilename = lineage.IncrementalManifestPrefix + "broker_state.json"
 
 // brokerState is the on-disk shape of `broker_state.json`. Mirrors
 // [streamState]'s field layout for operator pattern-matching:

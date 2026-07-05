@@ -18,6 +18,7 @@ import (
 	"time"
 
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // # `sluice backup compact` — naive lineage segment compaction (ADR-0046 §14d)
@@ -201,7 +202,7 @@ type CompactResult struct {
 
 // CompactPlanGroup is one merge group's plan-or-result entry.
 type CompactPlanGroup struct {
-	// SourceSegmentIDs lists the source segments' [LineageSegment.SegmentID]
+	// SourceSegmentIDs lists the source segments' [lineage.Segment.SegmentID]
 	// values in lineage (oldest-first) order.
 	SourceSegmentIDs []string
 
@@ -247,11 +248,11 @@ const compactStagingDirPrefix = ".compact-staging-"
 
 // mergedSegmentDirPrefix is the on-disk sub-dir name a successfully-
 // merged segment lives under. Mirrors the rotation FSM's
-// [rotationSegmentDirPrefix] shape so a post-compact lineage looks like
+// [lineage.RotationSegmentDirPrefix] shape so a post-compact lineage looks like
 // a naturally-rotated multi-segment lineage to every downstream reader.
 const mergedSegmentDirPrefix = "seg-merged-"
 
-// compactedCapReason is the [LineageSegment.CapReason] applied to a
+// compactedCapReason is the [lineage.Segment.CapReason] applied to a
 // merged segment. Distinguishes it from a naturally-rotated segment
 // (which uses [rotationReasonAge] / [rotationReasonChainLength]) for
 // operator inspection.
@@ -315,7 +316,7 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 		mintID = generateMergedSegmentID
 	}
 
-	cat, ok, err := loadLineageCatalog(ctx, store)
+	cat, ok, err := lineage.LoadLineageCatalog(ctx, store)
 	if err != nil {
 		return nil, fmt.Errorf("backup compact: load lineage catalog: %w", err)
 	}
@@ -336,8 +337,8 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 	metas := make([]segMeta, 0, len(eligible))
 	for i := range eligible {
 		seg := &eligible[i]
-		ss := seg.store(store)
-		fm, err := readManifestAt(ctx, ss, seg.FullManifestPath)
+		ss := seg.Store(store)
+		fm, err := lineage.ReadManifestAt(ctx, ss, seg.FullManifestPath)
 		if err != nil {
 			return nil, fmt.Errorf("backup compact: read segment %d full %q: %w", i, seg.FullManifestPath, err)
 		}
@@ -483,8 +484,8 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 		// chunks live at their final paths; pre-catalog-swap so a
 		// crash here leaves the merged segment authoritative-but-
 		// pre-compact (the catalog still references the sources).
-		mergedStore := newPrefixedStore(store, pg.plan.MergedSegmentDir)
-		codec := eligible[pg.span[0].idx].codecOrDefault()
+		mergedStore := lineage.NewPrefixedStore(store, pg.plan.MergedSegmentDir)
+		codec := eligible[pg.span[0].idx].CodecOrDefault()
 		// Encryption CEK: smart compaction needs to decrypt + re-
 		// encrypt under the segment's keyset. v1 keeps parity with
 		// the naive path's "no re-encryption" stance by REFUSING
@@ -544,7 +545,7 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 	cat.Segments = buildPostCompactSegments(cat, planned, now())
 	cat.RestorableFromSegment = 0
 	cat.UpdatedAt = now().UTC()
-	if err := writeLineageCatalog(ctx, store, cat); err != nil {
+	if err := lineage.WriteLineageCatalog(ctx, store, cat); err != nil {
 		return nil, fmt.Errorf("backup compact: rewrite lineage catalog: %w", err)
 	}
 
@@ -603,7 +604,7 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 
 // segmentByteTotal sums every chunk's byte length across the segment's
 // full + every incremental.
-func segmentByteTotal(ctx context.Context, ss irbackup.Store, seg *LineageSegment, fullMani *irbackup.Manifest) (int64, error) {
+func segmentByteTotal(ctx context.Context, ss irbackup.Store, seg *lineage.Segment, fullMani *irbackup.Manifest) (int64, error) {
 	var total int64
 	for _, t := range fullMani.Tables {
 		for _, ch := range t.Chunks {
@@ -615,7 +616,7 @@ func segmentByteTotal(ctx context.Context, ss irbackup.Store, seg *LineageSegmen
 		}
 	}
 	for _, ip := range seg.Incrementals {
-		im, err := readManifestAt(ctx, ss, ip)
+		im, err := lineage.ReadManifestAt(ctx, ss, ip)
 		if err != nil {
 			return 0, fmt.Errorf("read incremental %q: %w", ip, err)
 		}
@@ -649,10 +650,10 @@ func readByteSize(ctx context.Context, store irbackup.Store, path string) (int64
 
 // assertGroupCodecUniform refuses LOUDLY when source segments in a
 // merge group have different recorded codecs.
-func assertGroupCodecUniform(eligible []LineageSegment, span []segMeta) error {
-	codec := eligible[span[0].idx].codecOrDefault()
+func assertGroupCodecUniform(eligible []lineage.Segment, span []segMeta) error {
+	codec := eligible[span[0].idx].CodecOrDefault()
 	for i := 1; i < len(span); i++ {
-		c := eligible[span[i].idx].codecOrDefault()
+		c := eligible[span[i].idx].CodecOrDefault()
 		if c != codec {
 			return fmt.Errorf(
 				"%w: segment %s codec=%q vs segment %s codec=%q",
@@ -674,7 +675,7 @@ func assertGroupCodecUniform(eligible []LineageSegment, span []segMeta) error {
 // right one per chunk under sluice's per-chain (now per-segment)
 // encryption model. Refuse with an actionable recovery hint per task
 // spec.
-func assertGroupEncryptionKeysetUniform(eligible []LineageSegment, span []segMeta) error {
+func assertGroupEncryptionKeysetUniform(eligible []lineage.Segment, span []segMeta) error {
 	first := encryptionFingerprint(span[0].fullMani.ChainEncryption)
 	firstSeg := eligible[span[0].idx].SegmentID
 	for i := 1; i < len(span); i++ {
@@ -693,7 +694,7 @@ func assertGroupEncryptionKeysetUniform(eligible []LineageSegment, span []segMet
 // boundaryHasCoverageGap reports whether there is a position gap
 // between two consecutive sources: the prior segment's EndPosition does
 // not equal the next segment's earliest incremental coverage. The
-// comparison is against [LineageSegment.incrementalCoverageStartOrStart]
+// comparison is against [lineage.Segment.incrementalCoverageStartOrStart]
 // (ADR-0067), NOT StartPosition: a rotation-opened segment that DID
 // commit an incremental in its creating session keeps the (P_N, S]
 // overlap in its incrementals and records IncrementalCoverageStart =
@@ -704,8 +705,8 @@ func assertGroupEncryptionKeysetUniform(eligible []LineageSegment, span []segMet
 // (S), a few WAL bytes past P_N — a gap. We compare via raw engine +
 // token equality (positions across a rotation handoff share an engine,
 // so JSON-string equality is a sufficient, conservative discriminator).
-func boundaryHasCoverageGap(prev, cur *LineageSegment) bool {
-	curStart := cur.incrementalCoverageStartOrStart()
+func boundaryHasCoverageGap(prev, cur *lineage.Segment) bool {
+	curStart := cur.IncrementalCoverageStartOrStart()
 	return prev.EndPosition.Token != curStart.Token ||
 		prev.EndPosition.Engine != curStart.Engine
 }
@@ -719,7 +720,7 @@ func boundaryHasCoverageGap(prev, cur *LineageSegment) bool {
 // it is therefore a SUBDIVISION BUG (the split pass missed a gap),
 // caught loudly here before any byte-level merge drops the (P_N, S]
 // window — never silently lose DR data.
-func assertGroupBoundaryContiguous(eligible []LineageSegment, span []segMeta) error {
+func assertGroupBoundaryContiguous(eligible []lineage.Segment, span []segMeta) error {
 	for i := 1; i < len(span); i++ {
 		prev := &eligible[span[i-1].idx]
 		cur := &eligible[span[i].idx]
@@ -727,7 +728,7 @@ func assertGroupBoundaryContiguous(eligible []LineageSegment, span []segMeta) er
 			return fmt.Errorf(
 				"backup compact: internal invariant violated — a planned merge group has a position gap between segment %s (end=%+v) and segment %s (incremental coverage starts at %+v) that the ADR-0087 coverage-gap subdivision should have split. This is a sluice bug; refusing to merge (a byte-level merge would drop the events in that range, which live only in the later segment's full snapshot — DR data)",
 				prev.SegmentID, prev.EndPosition,
-				cur.SegmentID, cur.incrementalCoverageStartOrStart(),
+				cur.SegmentID, cur.IncrementalCoverageStartOrStart(),
 			)
 		}
 	}
@@ -741,7 +742,7 @@ func assertGroupBoundaryContiguous(eligible []LineageSegment, span []segMeta) er
 // accurate WARN. Size-1 subgroups are the existing size-1 no-op shape.
 // Pure (no storage I/O); safe to call on the --dry-run path so plans
 // carry the same subdivision + WARNs as a real run.
-func subdivideAtCoverageGaps(ctx context.Context, eligible []LineageSegment, metas []segMeta, groups []groupRange) []groupRange {
+func subdivideAtCoverageGaps(ctx context.Context, eligible []lineage.Segment, metas []segMeta, groups []groupRange) []groupRange {
 	out := make([]groupRange, 0, len(groups))
 	for _, g := range groups {
 		start := g.start
@@ -764,9 +765,9 @@ func subdivideAtCoverageGaps(ctx context.Context, eligible []LineageSegment, met
 // ADR-0087 subdivision boundary, naming both segments + the position
 // delta and explaining (in operator terms) WHY the boundary cannot
 // merge and that NO data is lost.
-func warnCoverageGapSplit(ctx context.Context, prev, cur *LineageSegment) {
-	curStart := cur.incrementalCoverageStartOrStart()
-	curRotationBorn := cur.Dir != "" || cur.CapReason != "" || cur.open()
+func warnCoverageGapSplit(ctx context.Context, prev, cur *lineage.Segment) {
+	curStart := cur.IncrementalCoverageStartOrStart()
+	curRotationBorn := cur.Dir != "" || cur.CapReason != "" || cur.Open()
 	slog.WarnContext(
 		ctx, "backup compact: merge group split at a rotation-boundary coverage gap — "+
 			"the later segment was born by a rotation and never committed an incremental in its "+
@@ -845,19 +846,19 @@ func generateMergedSegmentID() string {
 func executeMergeGroup(
 	ctx context.Context,
 	store irbackup.Store,
-	eligible []LineageSegment,
+	eligible []lineage.Segment,
 	pg *plannedGroup,
 ) error {
 	stagingDir := stagingDirFor(pg.plan.MergedSegmentID)
 	finalDir := pg.plan.MergedSegmentDir
-	stagingStore := newPrefixedStore(store, stagingDir)
+	stagingStore := lineage.NewPrefixedStore(store, stagingDir)
 
 	// 1. The oldest source's full becomes the merged segment's full.
 	oldest := &eligible[pg.span[0].idx]
-	oldestStore := oldest.store(store)
+	oldestStore := oldest.Store(store)
 	oldestFull := pg.span[0].fullMani
 
-	if err := copyFile(ctx, oldestStore, stagingStore, oldest.FullManifestPath, ManifestFileName); err != nil {
+	if err := copyFile(ctx, oldestStore, stagingStore, oldest.FullManifestPath, lineage.ManifestFileName); err != nil {
 		return fmt.Errorf("stage merged full manifest: %w", err)
 	}
 	for _, t := range oldestFull.Tables {
@@ -891,12 +892,12 @@ func executeMergeGroup(
 	// the only multi-segment merges reachable were position-aligned seed
 	// lineages whose incrementals carried no ParentBackupID, and live
 	// rotation chains refused at the position-gap pre-flight.)
-	prevLinkID := manifestBackupID(oldestFull)
+	prevLinkID := lineage.ManifestBackupID(oldestFull)
 	for _, s := range pg.span {
 		seg := &eligible[s.idx]
-		segStore := seg.store(store)
+		segStore := seg.Store(store)
 		for _, ip := range seg.Incrementals {
-			im, err := readManifestAt(ctx, segStore, ip)
+			im, err := lineage.ReadManifestAt(ctx, segStore, ip)
 			if err != nil {
 				return fmt.Errorf("read source incremental %q: %w", ip, err)
 			}
@@ -906,9 +907,9 @@ func executeMergeGroup(
 				}
 			}
 			im.ParentBackupID = prevLinkID
-			prevLinkID = manifestBackupID(im)
+			prevLinkID = lineage.ManifestBackupID(im)
 			newPath := fmt.Sprintf("%sincr-%05d-%s.json",
-				incrementalManifestPrefix, incrCount, manifestBackupID(im))
+				lineage.IncrementalManifestPrefix, incrCount, lineage.ManifestBackupID(im))
 			b, err := json.MarshalIndent(im, "", "  ")
 			if err != nil {
 				return fmt.Errorf("marshal staged incremental manifest: %w", err)
@@ -929,7 +930,7 @@ func executeMergeGroup(
 	return nil
 }
 
-// copyFile reads src.path → dst.path through the store-level Get/Put
+// copyFile reads src.Path → dst.Path through the store-level Get/Put
 // primitives. Idempotent: a re-run after a partial copy overwrites the
 // destination cleanly (BackupStore.Put is overwrite semantics).
 func copyFile(ctx context.Context, src, dst irbackup.Store, srcPath, dstPath string) error {
@@ -1001,10 +1002,10 @@ func cleanupStagingDirs(ctx context.Context, store irbackup.Store) error {
 // store disk. Missing files are not failures (both LocalStore and
 // BlobStore treat delete-of-absent as nil), so a re-run after a
 // partial sweep stays clean.
-func sweepRootSegmentArtifacts(ctx context.Context, store irbackup.Store, seg *LineageSegment) error {
+func sweepRootSegmentArtifacts(ctx context.Context, store irbackup.Store, seg *lineage.Segment) error {
 	var errs []error
-	if err := store.Delete(ctx, ManifestFileName); err != nil {
-		errs = append(errs, fmt.Errorf("delete %q: %w", ManifestFileName, err))
+	if err := store.Delete(ctx, lineage.ManifestFileName); err != nil {
+		errs = append(errs, fmt.Errorf("delete %q: %w", lineage.ManifestFileName, err))
 	}
 	for _, ip := range seg.Incrementals {
 		if err := store.Delete(ctx, ip); err != nil {
@@ -1047,7 +1048,7 @@ func sweepSegmentSubdir(ctx context.Context, store irbackup.Store, dir string) e
 // segment, either passes it through OR (if it's the OLDEST source of
 // a planned merge group) emits the merged segment and SKIPS the
 // remaining sources in the group.
-func buildPostCompactSegments(cat *LineageCatalog, planned []plannedGroup, now time.Time) []LineageSegment {
+func buildPostCompactSegments(cat *lineage.Catalog, planned []plannedGroup, now time.Time) []lineage.Segment {
 	type ref struct {
 		isOldest bool
 		group    int
@@ -1062,7 +1063,7 @@ func buildPostCompactSegments(cat *LineageCatalog, planned []plannedGroup, now t
 		}
 	}
 
-	out := make([]LineageSegment, 0, len(cat.Segments))
+	out := make([]lineage.Segment, 0, len(cat.Segments))
 	for i := range cat.Segments {
 		r, inGroup := mark[i]
 		if !inGroup {
@@ -1077,9 +1078,9 @@ func buildPostCompactSegments(cat *LineageCatalog, planned []plannedGroup, now t
 	return out
 }
 
-// mergedSegmentFromGroup builds the [LineageSegment] entry that
+// mergedSegmentFromGroup builds the [lineage.Segment] entry that
 // REPLACES a planned group's sources in the post-compact lineage.
-func mergedSegmentFromGroup(cat *LineageCatalog, pg *plannedGroup, now time.Time) LineageSegment {
+func mergedSegmentFromGroup(cat *lineage.Catalog, pg *plannedGroup, now time.Time) lineage.Segment {
 	oldest := &cat.Segments[pg.span[0].catIdx]
 	newest := &cat.Segments[pg.span[len(pg.span)-1].catIdx]
 
@@ -1100,10 +1101,10 @@ func mergedSegmentFromGroup(cat *LineageCatalog, pg *plannedGroup, now time.Time
 		verbatim = append([]string(nil), oldest.VerbatimExtensionColumns...)
 	}
 
-	return LineageSegment{
+	return lineage.Segment{
 		SegmentID:        pg.plan.MergedSegmentID,
 		Dir:              pg.plan.MergedSegmentDir,
-		FullManifestPath: ManifestFileName,
+		FullManifestPath: lineage.ManifestFileName,
 		Incrementals:     append([]string(nil), pg.finalIncrementalPaths...),
 		StartPosition:    oldest.StartPosition,
 		EndPosition:      newest.EndPosition,
@@ -1118,7 +1119,7 @@ func mergedSegmentFromGroup(cat *LineageCatalog, pg *plannedGroup, now time.Time
 		IncrementalCoverageStart: oldest.IncrementalCoverageStart,
 		CappedAt:                 &cappedAt,
 		CapReason:                compactedCapReason,
-		Codec:                    oldest.codecOrDefault(),
+		Codec:                    oldest.CodecOrDefault(),
 		VerbatimExtensionColumns: verbatim,
 	}
 }

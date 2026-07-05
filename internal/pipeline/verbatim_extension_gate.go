@@ -13,7 +13,7 @@ package pipeline
 // idioms (DefaultExpression.Dialect, the per-segment Codec, ADR-0046 /
 // Bug 66's "lineage.json is the authoritative structural record"), the
 // mechanism is a RECORDED marker on the lineage segment
-// ([LineageSegment.VerbatimExtensionColumns]) enforced LOUDLY at
+// ([lineage.Segment.VerbatimExtensionColumns]) enforced LOUDLY at
 // restore preflight against the actual target engine — never an
 // operator opt-in flag, never a silent drop/mangle.
 //
@@ -27,42 +27,8 @@ import (
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
-
-// verbatimExtensionColumnsIn returns the sorted "schema.table.column"
-// references in s whose IR type is [ir.VerbatimType] (ADR-0047). The
-// schema segment is omitted when empty (flat-scope engines). Returns
-// nil when the schema carries no verbatim columns — the common case,
-// so the marker stays absent on every non-verbatim backup.
-func verbatimExtensionColumnsIn(s *ir.Schema) []string {
-	if s == nil {
-		return nil
-	}
-	var refs []string
-	for _, tbl := range s.Tables {
-		if tbl == nil {
-			continue
-		}
-		for _, col := range tbl.Columns {
-			if col == nil {
-				continue
-			}
-			if _, ok := col.Type.(ir.VerbatimType); !ok {
-				continue
-			}
-			ref := tbl.Name + "." + col.Name
-			if tbl.Schema != "" {
-				ref = tbl.Schema + "." + ref
-			}
-			refs = append(refs, ref)
-		}
-	}
-	if len(refs) == 0 {
-		return nil
-	}
-	sort.Strings(refs)
-	return refs
-}
 
 // refuseVerbatimManifestRestoreToNonPG is the single-manifest-path
 // counterpart of [refuseVerbatimRestoreToNonPG]. The single-full
@@ -80,7 +46,7 @@ func refuseVerbatimManifestRestoreToNonPG(schema *ir.Schema, target ir.Engine) e
 	if target == nil || target.Capabilities().VerbatimExtensionTypes {
 		return nil // nil target is caught by the caller's validate()
 	}
-	refs := verbatimExtensionColumnsIn(schema)
+	refs := lineage.VerbatimExtensionColumnsIn(schema)
 	if len(refs) == 0 {
 		return nil
 	}
@@ -114,14 +80,14 @@ func refuseVerbatimManifestRestoreToNonPG(schema *ir.Schema, target ir.Engine) e
 // marker is the authoritative structural record (ADR-0046 / Bug 66
 // idiom). It fires before any data moves so the operator never gets a
 // partial cross-engine restore of a PG-only backup.
-func refuseVerbatimRestoreToNonPG(cat *LineageCatalog, target ir.Engine) error {
+func refuseVerbatimRestoreToNonPG(cat *lineage.Catalog, target ir.Engine) error {
 	if cat == nil || target == nil || target.Capabilities().VerbatimExtensionTypes {
 		return nil // nil target is caught by the caller's validate()
 	}
 	var marked []string
 	for i := range cat.Segments {
 		seg := &cat.Segments[i]
-		if seg.hasVerbatimExtensionColumns() {
+		if seg.HasVerbatimExtensionColumns() {
 			marked = append(marked, seg.VerbatimExtensionColumns...)
 		}
 	}

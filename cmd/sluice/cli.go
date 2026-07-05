@@ -28,6 +28,7 @@ import (
 	"sluicesync.dev/sluice/internal/notify"
 	"sluicesync.dev/sluice/internal/pipeline"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	pstelemetry "sluicesync.dev/sluice/internal/planetscale/telemetry"
 	"sluicesync.dev/sluice/internal/redact"
 )
@@ -804,7 +805,7 @@ func (s *SyncFromBackupCmd) Run(_ *Globals) error {
 
 	// Phase 6.1: load the chain root to extract Argon2id params for
 	// the read-side envelope.
-	rootManifest, err := pipeline.ReadRootManifest(ctx, store)
+	rootManifest, err := lineage.ReadRootManifest(ctx, store)
 	if err != nil {
 		return fmt.Errorf("from-backup: read root manifest: %w", err)
 	}

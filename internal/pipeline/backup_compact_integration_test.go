@@ -40,6 +40,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -127,9 +128,9 @@ func TestADR0067_BackupCompact_LiveRotationContiguous_Merges_PG(t *testing.T) {
 		t.Fatal("stream.Run did not exit within 20s of cancel")
 	}
 
-	lin, ok, err := loadLineageCatalog(context.Background(), store)
+	lin, ok, err := lineage.LoadLineageCatalog(context.Background(), store)
 	if err != nil || !ok {
-		t.Fatalf("loadLineageCatalog: ok=%v err=%v", ok, err)
+		t.Fatalf("lineage.LoadLineageCatalog: ok=%v err=%v", ok, err)
 	}
 	preCompactSegmentCount := len(lin.Segments)
 	if preCompactSegmentCount < 3 {
@@ -156,7 +157,7 @@ func TestADR0067_BackupCompact_LiveRotationContiguous_Merges_PG(t *testing.T) {
 	}
 
 	// Segments were merged: the count dropped.
-	postLin, _, _ := loadLineageCatalog(context.Background(), store)
+	postLin, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 	if len(postLin.Segments) >= preCompactSegmentCount {
 		t.Errorf("post-compact segments = %d; want < %d (merge reduces the segment count)",
 			len(postLin.Segments), preCompactSegmentCount)
@@ -168,10 +169,10 @@ func TestADR0067_BackupCompact_LiveRotationContiguous_Merges_PG(t *testing.T) {
 	// the re-stitched parent links chain cleanly across the former
 	// segment joins (DR data — a merge that can't restore would be worse
 	// than the old refusal).
-	cmp := sameEngineComparator(context.Background(), store, eng)
-	chain, err := buildLineageChain(context.Background(), store, cmp)
+	cmp := lineage.SameEngineComparator(context.Background(), store, eng)
+	chain, err := lineage.BuildLineageChain(context.Background(), store, cmp)
 	if err != nil {
-		t.Fatalf("post-compact buildLineageChain (restore-walk): %v", err)
+		t.Fatalf("post-compact lineage.BuildLineageChain (restore-walk): %v", err)
 	}
 	if len(chain) < 2 {
 		t.Fatalf("post-compact chain links = %d; want the merged full + its incrementals", len(chain))

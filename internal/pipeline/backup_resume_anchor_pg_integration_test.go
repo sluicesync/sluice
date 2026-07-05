@@ -39,6 +39,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -200,9 +201,9 @@ func runAnchoredResumeChainGapFlow(t *testing.T, chainSlot bool) {
 		t.Fatal("interrupted Run: expected injected crash; got nil")
 	}
 
-	inProgress, err := readManifest(context.Background(), store)
+	inProgress, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest (in-progress): %v", err)
+		t.Fatalf("lineage.ReadManifest (in-progress): %v", err)
 	}
 	if inProgress.PartialState != irbackup.BackupStateInProgress {
 		t.Fatalf("PartialState = %q; want in_progress", inProgress.PartialState)
@@ -230,9 +231,9 @@ func runAnchoredResumeChainGapFlow(t *testing.T, chainSlot bool) {
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("resume Run: %v (a --chain-slot resume must ADOPT the standing slot, not refuse on already-exists)", err)
 	}
-	final, err := readManifest(context.Background(), store)
+	final, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest (final): %v", err)
+		t.Fatalf("lineage.ReadManifest (final): %v", err)
 	}
 	if final.PartialState != irbackup.BackupStateComplete {
 		t.Fatalf("PartialState = %q; want complete", final.PartialState)

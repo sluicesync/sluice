@@ -10,10 +10,11 @@ import (
 	"io"
 
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // brokerChainCache memoizes the broker's lineage-chain walk across
-// ticks. [buildBrokerChain] costs one store GET + JSON decode PER
+// ticks. [lineage.BuildBrokerChain] costs one store GET + JSON decode PER
 // MANIFEST in the chain; a long-running `backup stream` at a
 // few-minute rollover grows the chain into the thousands, so an
 // *idle* broker tick (default every 30s) was O(chain-length) GETs
@@ -21,7 +22,7 @@ import (
 // two objects that can change while the chain's content changes:
 //
 //   - lineage.json's raw bytes. Every structural lineage change is a
-//     [writeLineageCatalog] rewrite of this single object: rotation's
+//     [lineage.WriteLineageCatalog] rewrite of this single object: rotation's
 //     segment-append COMMIT, compaction's atomic catalog swap, prune's
 //     restorable-floor advance, and each incremental append (which
 //     also bumps the open segment's EndPosition + UpdatedAt).
@@ -44,10 +45,10 @@ import (
 //
 // NOT goroutine-safe: confined to [SyncFromBackup.Run]'s single
 // goroutine (same posture as the chainCEK field). One-shot restore
-// paths keep calling [buildLineageChain] directly — they walk once
+// paths keep calling [lineage.BuildLineageChain] directly — they walk once
 // and have nothing to amortize.
 type brokerChainCache struct {
-	chain        []segmentRecord
+	chain        []lineage.SegmentRecord
 	catalogBytes []byte // raw lineage.json the chain was keyed on
 	tailBytes    []byte // raw tail-manifest bytes the chain was keyed on
 }
@@ -56,15 +57,15 @@ type brokerChainCache struct {
 // chain identity (lineage.json + tail manifest, see the type comment)
 // is byte-identical to the cached one. An idle hit costs exactly two
 // store GETs regardless of chain length; any mismatch rebuilds the
-// whole chain via [buildBrokerChain].
-func (c *brokerChainCache) get(ctx context.Context, store irbackup.Store) ([]segmentRecord, error) {
+// whole chain via [lineage.BuildBrokerChain].
+func (c *brokerChainCache) get(ctx context.Context, store irbackup.Store) ([]lineage.SegmentRecord, error) {
 	catalogBytes, tailBytes, identified := readChainIdentity(ctx, store)
 	if identified && c.chain != nil &&
 		bytes.Equal(catalogBytes, c.catalogBytes) && bytes.Equal(tailBytes, c.tailBytes) {
 		return c.chain, nil
 	}
 	c.invalidate()
-	chain, err := buildBrokerChain(ctx, store)
+	chain, err := lineage.BuildBrokerChain(ctx, store)
 	if err != nil {
 		return nil, err
 	}
@@ -85,14 +86,14 @@ func (c *brokerChainCache) invalidate() {
 // identified == false on any absence / parse / IO failure — "no cheap
 // identity, bypass the cache": the legacy catalog-less shape is
 // walk-discovered with no single head object, and an unreadable
-// catalog must flow through [buildBrokerChain]'s loud refusal rather
+// catalog must flow through [lineage.BuildBrokerChain]'s loud refusal rather
 // than a cache decision.
 func readChainIdentity(ctx context.Context, store irbackup.Store) (catalogBytes, tailBytes []byte, identified bool) {
-	catalogBytes, err := readAllAt(ctx, store, LineageCatalogFileName)
+	catalogBytes, err := readAllAt(ctx, store, lineage.LineageCatalogFileName)
 	if err != nil {
 		return nil, nil, false
 	}
-	var cat LineageCatalog
+	var cat lineage.Catalog
 	if err := json.Unmarshal(catalogBytes, &cat); err != nil || len(cat.Segments) == 0 {
 		return nil, nil, false
 	}
@@ -101,7 +102,7 @@ func readChainIdentity(ctx context.Context, store irbackup.Store) (catalogBytes,
 	if n := len(seg.Incrementals); n > 0 {
 		tailPath = seg.Incrementals[n-1]
 	}
-	tailBytes, err = readAllAt(ctx, seg.store(store), tailPath)
+	tailBytes, err = readAllAt(ctx, seg.Store(store), tailPath)
 	if err != nil {
 		return nil, nil, false
 	}

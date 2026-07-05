@@ -24,6 +24,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
@@ -408,7 +409,7 @@ func TestManifestCommitter_ConcurrentCheckpointsKeepSchemaOrder(t *testing.T) {
 	}
 	wg.Wait()
 
-	rc, err := store.Get(context.Background(), ManifestFileName)
+	rc, err := store.Get(context.Background(), lineage.ManifestFileName)
 	if err != nil {
 		t.Fatalf("Get manifest: %v", err)
 	}

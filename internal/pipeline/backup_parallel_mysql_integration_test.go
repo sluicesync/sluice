@@ -34,6 +34,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/engines/mysql"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // mysqlTableChecksum returns (row count, content checksum) for one
@@ -401,9 +402,9 @@ func TestBackupParallel_MySQLCancelResumeCompletes(t *testing.T) {
 		t.Fatalf("dispatch parallelism = %d; want the coordinated parallel sweep engaged before the cancel", *gotP)
 	}
 
-	m, err := readManifest(context.Background(), inner)
+	m, err := lineage.ReadManifest(context.Background(), inner)
 	if err != nil {
-		t.Fatalf("readManifest after cancel: %v", err)
+		t.Fatalf("lineage.ReadManifest after cancel: %v", err)
 	}
 	if len(m.Tables) != nTables {
 		t.Fatalf("staged tables = %d; want all %d (pre-staging invariant)", len(m.Tables), nTables)

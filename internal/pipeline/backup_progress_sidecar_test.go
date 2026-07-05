@@ -35,6 +35,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // accountingPutStore wraps memStore and accounts Put calls + bytes per
@@ -149,7 +150,7 @@ func TestManifestCommitter_SidecarMode_CheckpointsAppendDeltas(t *testing.T) {
 	if err := committer.commitBase(ctx); err != nil {
 		t.Fatalf("commitBase: %v", err)
 	}
-	if got := store.putCalls[ManifestFileName]; got != 1 {
+	if got := store.putCalls[lineage.ManifestFileName]; got != 1 {
 		t.Errorf("manifest Puts after commitBase = %d; want 1", got)
 	}
 	if _, ok := store.data[ManifestProgressFileName]; ok {
@@ -167,7 +168,7 @@ func TestManifestCommitter_SidecarMode_CheckpointsAppendDeltas(t *testing.T) {
 			t.Fatalf("finishTable[%d]: %v", i, err)
 		}
 	}
-	if got := store.putCalls[ManifestFileName]; got != 1 {
+	if got := store.putCalls[lineage.ManifestFileName]; got != 1 {
 		t.Errorf("manifest Puts after checkpoints = %d; want still 1 (checkpoints must append, not rewrite)", got)
 	}
 	if store.appendCalls != 4 {
@@ -180,7 +181,7 @@ func TestManifestCommitter_SidecarMode_CheckpointsAppendDeltas(t *testing.T) {
 	if err := committer.finalize(ctx); err != nil {
 		t.Fatalf("finalize: %v", err)
 	}
-	if got := store.putCalls[ManifestFileName]; got != 2 {
+	if got := store.putCalls[lineage.ManifestFileName]; got != 2 {
 		t.Errorf("manifest Puts after finalize = %d; want 2 (base + final)", got)
 	}
 	if m.FormatVersion != irbackup.FormatVersionFor(m.Schema) {
@@ -194,9 +195,9 @@ func TestManifestCommitter_SidecarMode_CheckpointsAppendDeltas(t *testing.T) {
 	}
 	// The replay path itself must agree the events landed: decode the
 	// final on-disk manifest and check both tables are complete.
-	final, err := readManifest(ctx, store)
+	final, err := lineage.ReadManifest(ctx, store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	for _, e := range final.Tables {
 		if e.Partial || len(e.Chunks) != 1 {
@@ -242,7 +243,7 @@ func TestManifestCommitter_LegacyMode_KeepsFullRewriteCheckpoints(t *testing.T) 
 	}
 	// base + 4 checkpoints + final = 6 full-manifest Puts — the legacy
 	// per-checkpoint rewrite, preserved exactly.
-	if got := store.putCalls[ManifestFileName]; got != 6 {
+	if got := store.putCalls[lineage.ManifestFileName]; got != 6 {
 		t.Errorf("legacy manifest Puts = %d; want 6 (per-checkpoint full rewrites preserved on append-less stores)", got)
 	}
 	if _, ok := store.data[ManifestProgressFileName]; ok {
@@ -273,7 +274,7 @@ func TestManifestCommitter_SidecarCheckpointCost_10kTables(t *testing.T) {
 	if err := committer.commitBase(ctx); err != nil {
 		t.Fatalf("commitBase: %v", err)
 	}
-	baseManifestBytes := store.putBytes[ManifestFileName]
+	baseManifestBytes := store.putBytes[lineage.ManifestFileName]
 
 	for i, e := range entries {
 		ci := &irbackup.ChunkInfo{File: fmt.Sprintf("chunks/%s/%s-0.jsonl.gz", e.Name, e.Name), RowCount: 100, SHA256: strings.Repeat("a", 64)}
@@ -284,11 +285,11 @@ func TestManifestCommitter_SidecarCheckpointCost_10kTables(t *testing.T) {
 			t.Fatalf("finishTable[%d]: %v", i, err)
 		}
 	}
-	if got := store.putCalls[ManifestFileName]; got != 1 {
+	if got := store.putCalls[lineage.ManifestFileName]; got != 1 {
 		t.Fatalf("manifest Puts during 20k checkpoints = %d; want 1 — a value > 1 means a checkpoint re-marshaled the manifest (the O(N²) regression)", got)
 	}
-	if store.putBytes[ManifestFileName] != baseManifestBytes {
-		t.Fatalf("manifest byte volume grew during checkpoints (%d → %d bytes); checkpoints must not rewrite it", baseManifestBytes, store.putBytes[ManifestFileName])
+	if store.putBytes[lineage.ManifestFileName] != baseManifestBytes {
+		t.Fatalf("manifest byte volume grew during checkpoints (%d → %d bytes); checkpoints must not rewrite it", baseManifestBytes, store.putBytes[lineage.ManifestFileName])
 	}
 	if store.appendCalls != 2*n {
 		t.Fatalf("appends = %d; want %d (one per event)", store.appendCalls, 2*n)
@@ -306,15 +307,15 @@ func TestManifestCommitter_SidecarCheckpointCost_10kTables(t *testing.T) {
 	if err := committer.finalize(ctx); err != nil {
 		t.Fatalf("finalize: %v", err)
 	}
-	if got := store.putCalls[ManifestFileName]; got != 2 {
+	if got := store.putCalls[lineage.ManifestFileName]; got != 2 {
 		t.Errorf("total manifest Puts = %d; want exactly 2 (base + final)", got)
 	}
 
 	// The reconstructed final manifest must carry all 10k tables
 	// complete — O(1) checkpoints must not trade away correctness.
-	final, err := readManifest(ctx, store)
+	final, err := lineage.ReadManifest(ctx, store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	for _, e := range final.Tables {
 		if e.Partial || len(e.Chunks) != 1 || e.RowCount != 100 {
@@ -377,9 +378,9 @@ func TestManifestCommitter_SidecarMode_ConcurrentCheckpoints(t *testing.T) {
 
 	// Reconstruct via the production read path: every table complete,
 	// chunks in per-table write order, staged (schema) order preserved.
-	got, err := readManifest(ctx, store)
+	got, err := lineage.ReadManifest(ctx, store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	if len(got.Tables) != nTables {
 		t.Fatalf("reconstructed tables = %d; want %d", len(got.Tables), nTables)
@@ -404,7 +405,7 @@ func TestManifestCommitter_SidecarMode_ConcurrentCheckpoints(t *testing.T) {
 // → resume shape on a real LocalStore: the RAW on-disk base manifest
 // under-reports progress by design (and is stamped FormatVersion=3 so
 // an older binary refuses it loudly instead of resuming off it);
-// readManifest reconstructs the truth from the sidecar; the resume
+// lineage.ReadManifest reconstructs the truth from the sidecar; the resume
 // keeps the completed table and finishes; the finalized layout is the
 // pre-ADR-0086 contract (schema-appropriate version, no sidecar).
 func TestBackup_SidecarCrashResume_EndToEnd(t *testing.T) {
@@ -437,7 +438,7 @@ func TestBackup_SidecarCrashResume_EndToEnd(t *testing.T) {
 	// RAW base manifest (decoded without replay): the sidecar layout's
 	// on-disk truth split.
 	raw := func() *irbackup.Manifest {
-		rc, err := inner.Get(ctx, ManifestFileName)
+		rc, err := inner.Get(ctx, lineage.ManifestFileName)
 		if err != nil {
 			t.Fatalf("Get raw manifest: %v", err)
 		}
@@ -465,10 +466,10 @@ func TestBackup_SidecarCrashResume_EndToEnd(t *testing.T) {
 		t.Fatal("progress sidecar missing after crash; the users checkpoints would be lost")
 	}
 
-	// readManifest reconstructs: users complete, posts still staged.
-	m1, err := readManifest(ctx, inner)
+	// lineage.ReadManifest reconstructs: users complete, posts still staged.
+	m1, err := lineage.ReadManifest(ctx, inner)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	if m1.Tables[0].Partial || len(m1.Tables[0].Chunks) != 1 || m1.Tables[0].RowCount != 2 {
 		t.Errorf("reconstructed users entry = %+v; want complete with 1 chunk / 2 rows", m1.Tables[0])
@@ -490,9 +491,9 @@ func TestBackup_SidecarCrashResume_EndToEnd(t *testing.T) {
 	if err := b2.Run(ctx); err != nil {
 		t.Fatalf("resume Run: %v", err)
 	}
-	final, err := readManifest(ctx, inner)
+	final, err := lineage.ReadManifest(ctx, inner)
 	if err != nil {
-		t.Fatalf("readManifest final: %v", err)
+		t.Fatalf("lineage.ReadManifest final: %v", err)
 	}
 	if final.PartialState != irbackup.BackupStateComplete {
 		t.Errorf("final PartialState = %q; want complete", final.PartialState)
@@ -537,8 +538,8 @@ func TestBackup_ResumesOldFormatInProgressManifest(t *testing.T) {
 		PartialState:  irbackup.BackupStateInProgress,
 		Tables:        []*irbackup.TableManifest{{Name: "t", Partial: true}},
 	}
-	if err := writeManifest(ctx, store, prior); err != nil {
-		t.Fatalf("writeManifest: %v", err)
+	if err := lineage.WriteManifest(ctx, store, prior); err != nil {
+		t.Fatalf("lineage.WriteManifest: %v", err)
 	}
 
 	b := &Backup{
@@ -548,9 +549,9 @@ func TestBackup_ResumesOldFormatInProgressManifest(t *testing.T) {
 	if err := b.Run(ctx); err != nil {
 		t.Fatalf("Run over old-format in-progress manifest: %v", err)
 	}
-	final, err := readManifest(ctx, store)
+	final, err := lineage.ReadManifest(ctx, store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	if final.PartialState != irbackup.BackupStateComplete || len(final.Tables) != 1 || final.Tables[0].RowCount != 1 {
 		t.Errorf("final manifest = %+v; want one completed table with 1 row", final)
@@ -573,12 +574,12 @@ func TestReadManifest_RefusesNewerFormatVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	if err := store.Put(ctx, ManifestFileName, bytes.NewReader(body)); err != nil {
+	if err := store.Put(ctx, lineage.ManifestFileName, bytes.NewReader(body)); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	_, err = readManifest(ctx, store)
+	_, err = lineage.ReadManifest(ctx, store)
 	if err == nil {
-		t.Fatal("readManifest accepted a newer-format manifest; want loud refusal")
+		t.Fatal("lineage.ReadManifest accepted a newer-format manifest; want loud refusal")
 	}
 	if !strings.Contains(err.Error(), "newer than this build supports") || !strings.Contains(err.Error(), "upgrade sluice") {
 		t.Errorf("refusal %q should name the version gap and the remedy", err)

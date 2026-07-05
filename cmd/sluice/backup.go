@@ -17,6 +17,7 @@ import (
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/redact"
 )
 
@@ -90,7 +91,7 @@ func (e *EncryptionFlags) resolvePassphrase() (string, error) {
 	return "", errors.New("internal: passphrase source resolution fell through")
 }
 
-// buildBackupEncryption constructs a [pipeline.BackupEncryption] for
+// buildBackupEncryption constructs a [lineage.BackupEncryption] for
 // the write side (backup full / incremental / stream) using whichever
 // key source the operator supplied (passphrase or AWS KMS). Returns
 // nil when e.Encrypt is false (plaintext backup).
@@ -102,7 +103,7 @@ func (e *EncryptionFlags) resolvePassphrase() (string, error) {
 // encrypted chain. KMS mode (Phase 6.2) leaves RebuildForChain nil —
 // KMS unwrap doesn't depend on a chain-recorded salt; the orchestrator's
 // `rebindForChain` is a no-op for it.
-func (e *EncryptionFlags) buildBackupEncryption() (*pipeline.BackupEncryption, error) {
+func (e *EncryptionFlags) buildBackupEncryption() (*lineage.BackupEncryption, error) {
 	if !e.Encrypt {
 		// Sanity: passphrase / KMS-key supplied without --encrypt is suspicious.
 		if e.EncryptionPassphrase != "" || e.EncryptionPassphraseEnv != "" || e.EncryptionPassphraseFile != "" {
@@ -132,7 +133,7 @@ func (e *EncryptionFlags) buildBackupEncryption() (*pipeline.BackupEncryption, e
 		if err != nil {
 			return nil, fmt.Errorf("encryption: build aws kms envelope: %w", err)
 		}
-		return &pipeline.BackupEncryption{
+		return &lineage.BackupEncryption{
 			Envelope: env,
 			Mode:     mode,
 			KEKRef:   e.KMSKeyARN,
@@ -142,7 +143,7 @@ func (e *EncryptionFlags) buildBackupEncryption() (*pipeline.BackupEncryption, e
 		if err != nil {
 			return nil, fmt.Errorf("encryption: build gcp kms envelope: %w", err)
 		}
-		return &pipeline.BackupEncryption{
+		return &lineage.BackupEncryption{
 			Envelope: env,
 			Mode:     mode,
 			KEKRef:   e.GCPKMSKeyResource,
@@ -152,7 +153,7 @@ func (e *EncryptionFlags) buildBackupEncryption() (*pipeline.BackupEncryption, e
 		if err != nil {
 			return nil, fmt.Errorf("encryption: build azure kms envelope: %w", err)
 		}
-		return &pipeline.BackupEncryption{
+		return &lineage.BackupEncryption{
 			Envelope: env,
 			Mode:     mode,
 			KEKRef:   e.AzureKeyVaultID,
@@ -170,7 +171,7 @@ func (e *EncryptionFlags) buildBackupEncryption() (*pipeline.BackupEncryption, e
 	if err != nil {
 		return nil, fmt.Errorf("encryption: build envelope: %w", err)
 	}
-	return &pipeline.BackupEncryption{
+	return &lineage.BackupEncryption{
 		Envelope:        env,
 		RebuildForChain: passphraseRebuildForChain(passphrase),
 		Mode:            mode,
@@ -909,7 +910,7 @@ func (v *BackupVerifyCmd) Run(_ *Globals) error {
 		defer func() { _ = closer() }()
 	}
 	if v.RebuildCatalog {
-		segments, manifests, err := pipeline.RebuildLineageCatalogAt(ctx, store)
+		segments, manifests, err := lineage.RebuildLineageCatalogAt(ctx, store)
 		if err != nil {
 			return fmt.Errorf("rebuild lineage catalog: %w", err)
 		}
@@ -925,7 +926,7 @@ func (v *BackupVerifyCmd) Run(_ *Globals) error {
 	// Argon2id KEK the writer used, then thread the envelope into
 	// VerifyBackupWith. SHA-only verify silently accepted per-chunk
 	// passphrase rotation; the decrypt probe refuses it.
-	rootManifest, err := pipeline.ReadRootManifest(ctx, store)
+	rootManifest, err := lineage.ReadRootManifest(ctx, store)
 	if err != nil {
 		return fmt.Errorf("verify: read root manifest: %w", err)
 	}
@@ -1313,7 +1314,7 @@ func (r *RestoreCmd) run(g *Globals, env *envelopeRun) error {
 	// Phase 6.1: read the chain-root manifest first to extract any
 	// recorded Argon2id params, so the restore-side envelope's KEK
 	// derivation matches the backup's.
-	rootManifest, err := pipeline.ReadRootManifest(ctx, store)
+	rootManifest, err := lineage.ReadRootManifest(ctx, store)
 	if err != nil {
 		return fmt.Errorf("restore: read root manifest: %w", err)
 	}

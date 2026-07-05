@@ -36,6 +36,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/translate"
 )
@@ -227,7 +228,7 @@ func (r *Restore) reparentMark() func(string) {
 // (== a pre-ADR single full) returns false so the single-manifest path
 // handles it with byte-identical behaviour.
 func (r *Restore) lineageNeedsWalk(ctx context.Context) (bool, error) {
-	cat, err := resolveLineage(ctx, r.Store)
+	cat, err := lineage.ResolveLineage(ctx, r.Store)
 	if err != nil {
 		return false, err
 	}
@@ -241,7 +242,7 @@ func (r *Restore) lineageNeedsWalk(ctx context.Context) (bool, error) {
 // segment). Absent lineage → gzip (pre-ADR default). The codec is
 // recorded, NEVER inferred from chunk bytes.
 func (r *Restore) rootSegmentCodec(ctx context.Context) (blobcodec.Codec, error) {
-	cat, err := resolveLineage(ctx, r.Store)
+	cat, err := lineage.ResolveLineage(ctx, r.Store)
 	if err != nil {
 		return "", err
 	}
@@ -249,7 +250,7 @@ func (r *Restore) rootSegmentCodec(ctx context.Context) (blobcodec.Codec, error)
 	if err := blobcodec.ValidateRecordedCodec(seg.Codec); err != nil {
 		return "", err
 	}
-	return seg.codecOrDefault(), nil
+	return seg.CodecOrDefault(), nil
 }
 
 // Run executes the restore. Returns nil on success; a wrapped error
@@ -297,8 +298,8 @@ func (r *Restore) Run(ctx context.Context) error {
 	}
 
 	// 1. Read manifest. Single-manifest path: this is the root
-	//    segment's full at the conventional ManifestFileName.
-	manifest, err := readManifest(ctx, r.Store)
+	//    segment's full at the conventional lineage.ManifestFileName.
+	manifest, err := lineage.ReadManifest(ctx, r.Store)
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("restore: %w", err))
 	}
@@ -351,7 +352,7 @@ func (r *Restore) Run(ctx context.Context) error {
 		if err := migcore.CheckCrossEngineSupportable(
 			manifest.Schema,
 			manifest.SourceEngine, r.Target.Name(),
-			fmt.Sprintf("restore: full %s", manifestBackupID(manifest)),
+			fmt.Sprintf("restore: full %s", lineage.ManifestBackupID(manifest)),
 		); err != nil {
 			return err
 		}
@@ -1158,7 +1159,7 @@ func VerifyBackup(ctx context.Context, store irbackup.Store) (total, failed int,
 // mid-chain (Bug 117) surfaces at verify-time instead of partial-failing
 // the restore.
 func VerifyBackupWith(ctx context.Context, store irbackup.Store, opts VerifyOptions) (total, failed int, err error) {
-	records, err := listAllSegmentManifests(ctx, store)
+	records, err := lineage.ListAllSegmentManifests(ctx, store)
 	if err != nil {
 		return 0, 0, fmt.Errorf("verify: %w", err)
 	}
@@ -1173,7 +1174,7 @@ func VerifyBackupWith(ctx context.Context, store irbackup.Store, opts VerifyOpti
 	// per-chunk mode it confirms the operator's envelope is
 	// well-formed before per-chunk probes run in the chunk loop.
 	if opts.Envelope != nil {
-		if rootEnc := records[0].manifest.ChainEncryption; rootEnc != nil {
+		if rootEnc := records[0].Manifest.ChainEncryption; rootEnc != nil {
 			if rootEnc.KEKMode != "" && opts.Envelope.Mode() != rootEnc.KEKMode {
 				return 0, 0, fmt.Errorf(
 					"verify: envelope mode %q does not match chain's recorded kek_mode %q",
@@ -1190,11 +1191,11 @@ func VerifyBackupWith(ctx context.Context, store irbackup.Store, opts VerifyOpti
 		}
 	}
 	for _, rec := range records {
-		manifest := rec.manifest
+		manifest := rec.Manifest
 		// Chunk files are addressed relative to the segment's store
 		// (Dir-prefixed). verify only rehashes bytes — codec is
 		// irrelevant for a byte-level SHA check.
-		segStore := rec.segment.store(store)
+		segStore := rec.Segment.Store(store)
 		// Row chunks (full backups).
 		for _, table := range manifest.Tables {
 			for _, chunk := range table.Chunks {
@@ -1203,18 +1204,18 @@ func VerifyBackupWith(ctx context.Context, store irbackup.Store, opts VerifyOpti
 					failed++
 					slog.ErrorContext(
 						ctx, "verify: chunk failed",
-						slog.String("manifest", rec.path),
+						slog.String("manifest", rec.Path),
 						slog.String("table", table.Name),
 						slog.String("file", chunk.File),
 						slog.String("error", err.Error()),
 					)
 					continue
 				}
-				if perr := probeChunkDecrypt(opts.Envelope, chunk); perr != nil {
+				if perr := lineage.ProbeChunkDecrypt(opts.Envelope, chunk); perr != nil {
 					failed++
 					slog.ErrorContext(
 						ctx, "verify: chunk decrypt probe failed",
-						slog.String("manifest", rec.path),
+						slog.String("manifest", rec.Path),
 						slog.String("table", table.Name),
 						slog.String("file", chunk.File),
 						slog.String("error", perr.Error()),
@@ -1223,7 +1224,7 @@ func VerifyBackupWith(ctx context.Context, store irbackup.Store, opts VerifyOpti
 				}
 				slog.DebugContext(
 					ctx, "verify: chunk OK",
-					slog.String("manifest", rec.path),
+					slog.String("manifest", rec.Path),
 					slog.String("table", table.Name),
 					slog.String("file", chunk.File),
 				)
@@ -1236,17 +1237,17 @@ func VerifyBackupWith(ctx context.Context, store irbackup.Store, opts VerifyOpti
 				failed++
 				slog.ErrorContext(
 					ctx, "verify: change chunk failed",
-					slog.String("manifest", rec.path),
+					slog.String("manifest", rec.Path),
 					slog.String("file", chunk.File),
 					slog.String("error", err.Error()),
 				)
 				continue
 			}
-			if perr := probeChunkDecrypt(opts.Envelope, chunk); perr != nil {
+			if perr := lineage.ProbeChunkDecrypt(opts.Envelope, chunk); perr != nil {
 				failed++
 				slog.ErrorContext(
 					ctx, "verify: change chunk decrypt probe failed",
-					slog.String("manifest", rec.path),
+					slog.String("manifest", rec.Path),
 					slog.String("file", chunk.File),
 					slog.String("error", perr.Error()),
 				)
@@ -1254,32 +1255,12 @@ func VerifyBackupWith(ctx context.Context, store irbackup.Store, opts VerifyOpti
 			}
 			slog.DebugContext(
 				ctx, "verify: change chunk OK",
-				slog.String("manifest", rec.path),
+				slog.String("manifest", rec.Path),
 				slog.String("file", chunk.File),
 			)
 		}
 	}
 	return total, failed, nil
-}
-
-// probeChunkDecrypt attempts to unwrap a per-chunk WrappedCEK using the
-// supplied envelope. No-op when the envelope is nil (no decrypt probe
-// requested), the chunk is plaintext (no Encryption metadata), or the
-// chunk is per-chain-mode (empty WrappedCEK; the chain root's probe
-// already covered it). Returns a wrapping error on unwrap failure so
-// the caller can surface "wrong passphrase for THIS chunk" — the
-// Bug 117 signal.
-func probeChunkDecrypt(env crypto.EnvelopeEncryption, chunk *irbackup.ChunkInfo) error {
-	if env == nil || chunk == nil || chunk.Encryption == nil {
-		return nil
-	}
-	if len(chunk.Encryption.WrappedCEK) == 0 {
-		return nil
-	}
-	if _, err := env.UnwrapCEK(chunk.Encryption.WrappedCEK); err != nil {
-		return fmt.Errorf("unwrap chunk cek (passphrase rotated mid-chain?): %w", err)
-	}
-	return nil
 }
 
 // verifyChunk fetches a chunk and recomputes its SHA-256, returning

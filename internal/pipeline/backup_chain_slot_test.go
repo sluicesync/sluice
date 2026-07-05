@@ -31,6 +31,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 func chainSlotTestEngine(t *testing.T) (*snapshotOpeningEngine, *ir.Schema) {
@@ -129,9 +130,9 @@ func TestBackup_ChainSlot_CommitTimingOnFailedRun(t *testing.T) {
 		}
 		// The durable in-progress manifest must carry the anchor the
 		// resume will adopt.
-		m, err := readManifest(context.Background(), store)
+		m, err := lineage.ReadManifest(context.Background(), store)
 		if err != nil {
-			t.Fatalf("readManifest: %v", err)
+			t.Fatalf("lineage.ReadManifest: %v", err)
 		}
 		if m.PartialState != irbackup.BackupStateInProgress {
 			t.Errorf("PartialState = %q; want in_progress", m.PartialState)

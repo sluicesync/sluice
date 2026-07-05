@@ -35,6 +35,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -48,14 +49,14 @@ func rotationSeedFull(t *testing.T, store irbackup.Store, eng ir.Engine, sourceD
 		Run(context.Background()); err != nil {
 		t.Fatalf("seed Backup.Run: %v", err)
 	}
-	full, _ := readManifest(context.Background(), store)
+	full, _ := lineage.ReadManifest(context.Background(), store)
 	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{
 		Engine: "postgres",
 		Token:  fmt.Sprintf(`{"slot":"sluice_slot","lsn":%q}`, slotLSN),
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("rewrite seed full: %v", err)
 	}
 	// Seed lineage.json so the open segment is catalogued (the first
@@ -66,7 +67,7 @@ func rotationSeedFull(t *testing.T, store irbackup.Store, eng ir.Engine, sourceD
 	// desyncs the recorded codec from the chunk bytes the moment the
 	// default flips (v0.67.0 gzip→zstd) → restore reads with the wrong
 	// codec. DefaultCodec tracks it.
-	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, blobcodec.DefaultCodec)
+	lineage.UpdateLineageForManifestBestEffort(context.Background(), store, full, lineage.ManifestFileName, blobcodec.DefaultCodec)
 	return full
 }
 
@@ -152,9 +153,9 @@ func TestADR0046_ZeroLossMultiSegmentRotation_PG(t *testing.T) {
 	}
 
 	// The lineage must have rotated (>1 segment) — proves the FSM ran.
-	lin, ok, err := loadLineageCatalog(context.Background(), store)
+	lin, ok, err := lineage.LoadLineageCatalog(context.Background(), store)
 	if err != nil || !ok {
-		t.Fatalf("loadLineageCatalog: ok=%v err=%v", ok, err)
+		t.Fatalf("lineage.LoadLineageCatalog: ok=%v err=%v", ok, err)
 	}
 	if len(lin.Segments) < 2 {
 		t.Fatalf("lineage segments = %d; want >= 2 (rotation did not fire)", len(lin.Segments))
@@ -344,7 +345,7 @@ func TestADR0046_CrashInjectionMatrix_PG(t *testing.T) {
 			if ex, _ := store.Exists(context.Background(), RotationStateFileName); ex {
 				t.Errorf("rotation_state.json still present after recovery (%s)", edge.name)
 			}
-			lin, _, _ := loadLineageCatalog(context.Background(), store)
+			lin, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 			if edge.postCommit {
 				if len(lin.Segments) < 2 {
 					t.Errorf(">COMMIT edge %q: segments=%d; want >=2 (new segment kept)",
@@ -423,12 +424,12 @@ func TestADR0046_NeverRotatedByteIdentical_PG(t *testing.T) {
 	cancel()
 	<-errc
 
-	lin, ok, _ := loadLineageCatalog(context.Background(), store)
+	lin, ok, _ := lineage.LoadLineageCatalog(context.Background(), store)
 	if !ok || len(lin.Segments) != 1 || lin.Segments[0].Dir != "" ||
-		lin.Segments[0].codecOrDefault() != blobcodec.DefaultCodec {
+		lin.Segments[0].CodecOrDefault() != blobcodec.DefaultCodec {
 		t.Fatalf("never-rotated lineage = %+v; want exactly one root segment (Dir='', codec=%s)", lin.Segments, blobcodec.DefaultCodec)
 	}
-	if !lin.Segments[0].open() {
+	if !lin.Segments[0].Open() {
 		t.Error("the only segment of a never-rotated lineage must be open (uncapped)")
 	}
 	if err := (&Restore{Target: eng, TargetDSN: targetDSN, Store: store}).
@@ -469,7 +470,7 @@ func TestADR0046_MixedCodecLineageRestores_PG(t *testing.T) {
 	store, _ := blobcodec.NewLocalStore(dir)
 
 	codecs := []blobcodec.Codec{blobcodec.CodecNone, blobcodec.CodecGzip, blobcodec.CodecZstd}
-	var segs []LineageSegment
+	var segs []lineage.Segment
 	for i, c := range codecs {
 		applyDDL(t, sourceDSN, fmt.Sprintf(
 			`TRUNCATE users; INSERT INTO users (email) VALUES ('seg%d-x@example.com'),('seg%d-y@example.com');`, i, i,
@@ -478,14 +479,14 @@ func TestADR0046_MixedCodecLineageRestores_PG(t *testing.T) {
 		if i > 0 {
 			segDir = fmt.Sprintf("seg-%d", i)
 		}
-		segStore := newPrefixedStore(store, segDir)
+		segStore := lineage.NewPrefixedStore(store, segDir)
 		if err := (&Backup{
 			Source: eng, SourceDSN: sourceDSN, Store: segStore,
 			SluiceVersion: "test", Codec: c,
 		}).Run(context.Background()); err != nil {
 			t.Fatalf("seg %d (%s) backup: %v", i, c, err)
 		}
-		fm, _ := readManifestAt(context.Background(), segStore, ManifestFileName)
+		fm, _ := lineage.ReadManifestAt(context.Background(), segStore, lineage.ManifestFileName)
 		fm.Kind = irbackup.BackupKindFull
 		// Synthetic contiguous boundary tokens so the lineage-walk's
 		// single monotonicity validator passes (these segments were
@@ -493,9 +494,9 @@ func TestADR0046_MixedCodecLineageRestores_PG(t *testing.T) {
 		fm.StartPosition = ir.Position{Engine: "postgres", Token: fmt.Sprintf("0/%d00", i)}
 		fm.EndPosition = ir.Position{Engine: "postgres", Token: fmt.Sprintf("0/%d00", i+1)}
 		fm.BackupID = irbackup.ComputeBackupID(fm)
-		_ = writeManifestAt(context.Background(), segStore, ManifestFileName, fm)
-		seg := LineageSegment{
-			SegmentID: fm.BackupID, Dir: segDir, FullManifestPath: ManifestFileName,
+		_ = lineage.WriteManifestAt(context.Background(), segStore, lineage.ManifestFileName, fm)
+		seg := lineage.Segment{
+			SegmentID: fm.BackupID, Dir: segDir, FullManifestPath: lineage.ManifestFileName,
 			StartPosition: fm.StartPosition, EndPosition: fm.EndPosition, Codec: c,
 		}
 		if i < len(codecs)-1 {
@@ -505,11 +506,11 @@ func TestADR0046_MixedCodecLineageRestores_PG(t *testing.T) {
 		}
 		segs = append(segs, seg)
 	}
-	cat := &LineageCatalog{
+	cat := &lineage.Catalog{
 		FormatVersion: 1, SourceEngine: "postgres",
 		CreatedAt: time.Now().UTC(), Segments: segs,
 	}
-	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
+	if err := lineage.WriteLineageCatalog(context.Background(), store, cat); err != nil {
 		t.Fatalf("write mixed-codec lineage: %v", err)
 	}
 
@@ -550,18 +551,18 @@ func TestADR0046_UnknownRecordedCodecRefused_PG(t *testing.T) {
 		Run(context.Background()); err != nil {
 		t.Fatalf("backup: %v", err)
 	}
-	fm, _ := readManifest(context.Background(), store)
+	fm, _ := lineage.ReadManifest(context.Background(), store)
 	fm.Kind = irbackup.BackupKindFull
 	fm.BackupID = irbackup.ComputeBackupID(fm)
-	_ = writeManifestAt(context.Background(), store, ManifestFileName, fm)
-	cat := &LineageCatalog{
+	_ = lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, fm)
+	cat := &lineage.Catalog{
 		FormatVersion: 1, SourceEngine: "postgres",
-		Segments: []LineageSegment{{
-			SegmentID: fm.BackupID, Dir: "", FullManifestPath: ManifestFileName,
+		Segments: []lineage.Segment{{
+			SegmentID: fm.BackupID, Dir: "", FullManifestPath: lineage.ManifestFileName,
 			Codec: blobcodec.Codec("snappy"), // unknown / garbled
 		}},
 	}
-	_ = writeLineageCatalog(context.Background(), store, cat)
+	_ = lineage.WriteLineageCatalog(context.Background(), store, cat)
 	err := (&Restore{Target: eng, TargetDSN: targetDSN, Store: store}).Run(context.Background())
 	if err == nil {
 		t.Fatal("restore with unknown recorded codec = nil; want loud refusal")

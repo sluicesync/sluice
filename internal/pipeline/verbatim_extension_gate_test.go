@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 func verbatimSchema() *ir.Schema {
@@ -33,7 +34,7 @@ func nonVerbatimSchema() *ir.Schema {
 // ir.VerbatimType columns are reported, schema-qualified, sorted, and
 // the common (no verbatim) case yields nil so the marker stays absent.
 func TestVerbatimExtensionColumnsIn(t *testing.T) {
-	got := verbatimExtensionColumnsIn(verbatimSchema())
+	got := lineage.VerbatimExtensionColumnsIn(verbatimSchema())
 	want := []string{"public.docs.loc", "public.docs.path"}
 	if len(got) != len(want) {
 		t.Fatalf("got %v; want %v", got, want)
@@ -43,10 +44,10 @@ func TestVerbatimExtensionColumnsIn(t *testing.T) {
 			t.Errorf("got[%d] = %q; want %q", i, got[i], want[i])
 		}
 	}
-	if verbatimExtensionColumnsIn(nonVerbatimSchema()) != nil {
+	if lineage.VerbatimExtensionColumnsIn(nonVerbatimSchema()) != nil {
 		t.Error("non-verbatim schema must yield nil (marker absent in common case)")
 	}
-	if verbatimExtensionColumnsIn(nil) != nil {
+	if lineage.VerbatimExtensionColumnsIn(nil) != nil {
 		t.Error("nil schema must yield nil")
 	}
 }
@@ -56,11 +57,11 @@ func TestVerbatimExtensionColumnsIn(t *testing.T) {
 // passes; an unmarked lineage is unaffected on any target (legacy /
 // non-verbatim backups keep working).
 func TestRefuseVerbatimRestoreToNonPG(t *testing.T) {
-	marked := &LineageCatalog{Segments: []LineageSegment{{
+	marked := &lineage.Catalog{Segments: []lineage.Segment{{
 		SegmentID:                "seg0",
 		VerbatimExtensionColumns: []string{"public.docs.path", "public.docs.loc"},
 	}}}
-	unmarked := &LineageCatalog{Segments: []LineageSegment{{SegmentID: "seg0"}}}
+	unmarked := &lineage.Catalog{Segments: []lineage.Segment{{SegmentID: "seg0"}}}
 
 	t.Run("marked → mysql refuses loudly", func(t *testing.T) {
 		err := refuseVerbatimRestoreToNonPG(marked, capsEngine{name: "mysql", caps: capsMySQL})
@@ -99,7 +100,7 @@ func TestRefuseVerbatimRestoreToNonPG(t *testing.T) {
 	})
 
 	t.Run("multi-segment: any marked segment trips the gate", func(t *testing.T) {
-		multi := &LineageCatalog{Segments: []LineageSegment{
+		multi := &lineage.Catalog{Segments: []lineage.Segment{
 			{SegmentID: "seg0"},
 			{SegmentID: "seg1", VerbatimExtensionColumns: []string{"public.t.c"}},
 		}}
@@ -126,10 +127,10 @@ func TestRefuseVerbatimManifestRestoreToNonPG(t *testing.T) {
 // TestLineageSegment_HasVerbatimExtensionColumns pins the marker
 // predicate.
 func TestLineageSegment_HasVerbatimExtensionColumns(t *testing.T) {
-	if (&LineageSegment{}).hasVerbatimExtensionColumns() {
+	if (&lineage.Segment{}).HasVerbatimExtensionColumns() {
 		t.Error("empty segment must not report verbatim columns")
 	}
-	if !(&LineageSegment{VerbatimExtensionColumns: []string{"a.b.c"}}).hasVerbatimExtensionColumns() {
+	if !(&lineage.Segment{VerbatimExtensionColumns: []string{"a.b.c"}}).HasVerbatimExtensionColumns() {
 		t.Error("segment with recorded verbatim columns must report true")
 	}
 }

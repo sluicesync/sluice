@@ -13,6 +13,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // TestBackupStream_Validate covers the same validation surface as
@@ -137,14 +138,14 @@ func TestBackupStream_RolloverOnMaxChanges(t *testing.T) {
 	// Verify we got 3 rollovers. Total changes across them = 30 (==
 	// source emitted). The third rollover closes because the CDC
 	// channel closes (no more changes), not because max-changes fires.
-	records, err := listAllManifestsViaWalk(context.Background(), store)
+	records, err := lineage.ListAllManifestsViaWalk(context.Background(), store)
 	if err != nil {
-		t.Fatalf("listAllManifestsViaWalk: %v", err)
+		t.Fatalf("lineage.ListAllManifestsViaWalk: %v", err)
 	}
 	var incrementals []*irbackup.Manifest
 	for _, r := range records {
-		if r.manifest.Kind == irbackup.BackupKindIncremental {
-			incrementals = append(incrementals, r.manifest)
+		if r.Manifest.Kind == irbackup.BackupKindIncremental {
+			incrementals = append(incrementals, r.Manifest)
 		}
 	}
 	if len(incrementals) != 3 {
@@ -224,10 +225,10 @@ func TestBackupStream_SkipEmptyRollover_OnChannelClose(t *testing.T) {
 	if err := stream.Run(context.Background()); err != nil {
 		t.Fatalf("stream.Run: %v", err)
 	}
-	records, _ := listAllManifestsViaWalk(context.Background(), store)
+	records, _ := lineage.ListAllManifestsViaWalk(context.Background(), store)
 	for _, r := range records {
-		if r.manifest.Kind == irbackup.BackupKindIncremental {
-			t.Errorf("unexpected incremental manifest committed for empty rollover: %+v", r.manifest)
+		if r.Manifest.Kind == irbackup.BackupKindIncremental {
+			t.Errorf("unexpected incremental manifest committed for empty rollover: %+v", r.Manifest)
 		}
 	}
 }
@@ -268,16 +269,16 @@ func TestBackupStream_IncludeEmptyRollover_WritesManifest(t *testing.T) {
 	if err := stream.Run(context.Background()); err != nil {
 		t.Fatalf("stream.Run: %v", err)
 	}
-	records, _ := listAllManifestsViaWalk(context.Background(), store)
+	records, _ := lineage.ListAllManifestsViaWalk(context.Background(), store)
 	var sawIncr bool
 	for _, r := range records {
-		if r.manifest.Kind == irbackup.BackupKindIncremental {
+		if r.Manifest.Kind == irbackup.BackupKindIncremental {
 			sawIncr = true
 			// Empty rollover's EndPosition should fall back to
 			// StartPosition (= parent's EndPosition).
-			if r.manifest.EndPosition != parent.EndPosition {
+			if r.Manifest.EndPosition != parent.EndPosition {
 				t.Errorf("empty rollover EndPosition = %+v; want parent's = %+v",
-					r.manifest.EndPosition, parent.EndPosition)
+					r.Manifest.EndPosition, parent.EndPosition)
 			}
 		}
 	}

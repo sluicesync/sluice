@@ -13,6 +13,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // TestVerifyBackupWith_DecryptProbe_Bug117 pins the Bug 117 (v0.94.1)
@@ -71,7 +72,7 @@ func TestVerifyBackupWith_DecryptProbe_Bug117(t *testing.T) {
 			ChunkRows: 1, // force 3 chunks
 		}
 		if env != nil {
-			b.Encryption = &BackupEncryption{Envelope: env, Mode: mode}
+			b.Encryption = &lineage.BackupEncryption{Envelope: env, Mode: mode}
 		}
 		if err := b.Run(context.Background()); err != nil {
 			t.Fatalf("Backup.Run: %v", err)
@@ -97,9 +98,9 @@ func TestVerifyBackupWith_DecryptProbe_Bug117(t *testing.T) {
 	// envelope unwraps the chain's WrappedCEK.
 	rebindForChain := func(t *testing.T, store irbackup.Store, pass string) crypto.EnvelopeEncryption {
 		t.Helper()
-		m, err := ReadRootManifest(context.Background(), store)
+		m, err := lineage.ReadRootManifest(context.Background(), store)
 		if err != nil {
-			t.Fatalf("ReadRootManifest: %v", err)
+			t.Fatalf("lineage.ReadRootManifest: %v", err)
 		}
 		if m.ChainEncryption == nil || m.ChainEncryption.Argon2id == nil {
 			t.Fatalf("chain root missing Argon2id params; cannot rebind envelope")
@@ -230,19 +231,19 @@ func (s *modeStubEnvelope) UnwrapCEK([]byte) ([]byte, error) {
 
 // TestProbeChunkDecrypt_NilSafe pins the small no-op branches.
 func TestProbeChunkDecrypt_NilSafe(t *testing.T) {
-	if err := probeChunkDecrypt(nil, nil); err != nil {
+	if err := lineage.ProbeChunkDecrypt(nil, nil); err != nil {
 		t.Errorf("nil env + nil chunk: %v", err)
 	}
-	if err := probeChunkDecrypt(nil, &irbackup.ChunkInfo{}); err != nil {
+	if err := lineage.ProbeChunkDecrypt(nil, &irbackup.ChunkInfo{}); err != nil {
 		t.Errorf("nil env + non-nil chunk: %v", err)
 	}
 	env := &modeStubEnvelope{mode: "test"}
-	if err := probeChunkDecrypt(env, &irbackup.ChunkInfo{}); err != nil {
+	if err := lineage.ProbeChunkDecrypt(env, &irbackup.ChunkInfo{}); err != nil {
 		t.Errorf("env + plaintext chunk (Encryption nil): %v", err)
 	}
 	// Per-chain mode chunk: Encryption non-nil but WrappedCEK empty
 	// → probe is a no-op (chain-level probe covers it).
-	if err := probeChunkDecrypt(env, &irbackup.ChunkInfo{Encryption: &irbackup.ChunkEncryption{}}); err != nil {
+	if err := lineage.ProbeChunkDecrypt(env, &irbackup.ChunkInfo{Encryption: &irbackup.ChunkEncryption{}}); err != nil {
 		t.Errorf("env + per-chain-mode chunk (empty WrappedCEK): %v", err)
 	}
 }

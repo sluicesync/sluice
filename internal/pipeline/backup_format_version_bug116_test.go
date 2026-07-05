@@ -11,6 +11,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // TestBackup_FormatVersion_Bug116 pins the v0.94.1 Bug 116 closure at
@@ -135,9 +136,9 @@ func TestBackup_FormatVersion_Bug116(t *testing.T) {
 			if err := b.Run(context.Background()); err != nil {
 				t.Fatalf("Backup.Run: %v", err)
 			}
-			m, err := readManifest(context.Background(), store)
+			m, err := lineage.ReadManifest(context.Background(), store)
 			if err != nil {
-				t.Fatalf("readManifest: %v", err)
+				t.Fatalf("lineage.ReadManifest: %v", err)
 			}
 			if m.FormatVersion != c.want {
 				t.Errorf("manifest.FormatVersion = %d; want %d (schema features: RLS=%v Policies=%d EXCLUDE=%d)",
@@ -189,11 +190,11 @@ func countExclude(s *ir.Schema) int {
 // TestBackup_ManifestRoundTrip_StandaloneSequences pins the item-51
 // backup-envelope contract end-to-end at the manifest write/read
 // boundary: a schema carrying a standalone sequence survives
-// Backup.Run → readManifest with every Sequence field intact (options,
+// Backup.Run → lineage.ReadManifest with every Sequence field intact (options,
 // ownership, captured position), alongside the FormatVersion=4 stamp
 // the table above pins. A restore on THIS build then re-creates the
 // sequence via the ordinary CreateTablesWithoutConstraints path; an
-// older build refuses at readManifest's version preflight instead of
+// older build refuses at lineage.ReadManifest's version preflight instead of
 // silently restoring sequence-less (the Bug 116 class).
 func TestBackup_ManifestRoundTrip_StandaloneSequences(t *testing.T) {
 	want := []*ir.Sequence{{
@@ -224,9 +225,9 @@ func TestBackup_ManifestRoundTrip_StandaloneSequences(t *testing.T) {
 	if err := (&Backup{Source: src, SourceDSN: "src", Store: store}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
-	m, err := readManifest(context.Background(), store)
+	m, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	if m.FormatVersion != irbackup.FormatVersionStandaloneSequences {
 		t.Errorf("FormatVersion = %d; want %d", m.FormatVersion, irbackup.FormatVersionStandaloneSequences)

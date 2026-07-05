@@ -70,6 +70,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/translate"
 )
@@ -585,8 +586,8 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 // brokerChain returns the lineage chain via the tick-spanning cache.
 // Every broker-side chain walk goes through here so a repeat walk
 // against an unchanged chain reuses the cached link list; the one-shot
-// restore paths keep calling [buildLineageChain] directly.
-func (b *SyncFromBackup) brokerChain(ctx context.Context) ([]segmentRecord, error) {
+// restore paths keep calling [lineage.BuildLineageChain] directly.
+func (b *SyncFromBackup) brokerChain(ctx context.Context) ([]lineage.SegmentRecord, error) {
 	return b.chainCache.get(ctx, b.Store)
 }
 
@@ -600,7 +601,7 @@ func (b *SyncFromBackup) detectChainSourceEngine(ctx context.Context) string {
 	if err != nil || len(chain) == 0 {
 		return ""
 	}
-	return chain[0].manifest.SourceEngine
+	return chain[0].Manifest.SourceEngine
 }
 
 // validate sanity-checks required fields.
@@ -678,7 +679,7 @@ func (b *SyncFromBackup) coldStartReset(ctx context.Context, applier ir.ChangeAp
 	if len(chain) == 0 {
 		return "", errors.New("broker: chain is empty; cannot --reset-target-data with no full backup in store")
 	}
-	tailManifest := chain[len(chain)-1].manifest
+	tailManifest := chain[len(chain)-1].Manifest
 
 	// Bug 40a fix: drop pre-existing target tables that match the
 	// chain's terminal schema. ChainRestore's CREATE TABLE IF NOT
@@ -702,7 +703,7 @@ func (b *SyncFromBackup) coldStartReset(ctx context.Context, applier ir.ChangeAp
 	if err := rest.Run(ctx); err != nil {
 		return "", fmt.Errorf("broker: chain restore failed: %w", err)
 	}
-	tailID := manifestBackupID(tailManifest)
+	tailID := lineage.ManifestBackupID(tailManifest)
 	if err := b.writePositionDirect(ctx, applier, tailID); err != nil {
 		return "", fmt.Errorf("broker: record post-restore position: %w", err)
 	}
@@ -760,7 +761,7 @@ func (b *SyncFromBackup) coldStartAtChainID(ctx context.Context, applier ir.Chan
 	}
 	found := false
 	for _, link := range chain {
-		if manifestBackupID(link.manifest) == b.AtChainID {
+		if lineage.ManifestBackupID(link.Manifest) == b.AtChainID {
 			found = true
 			break
 		}
@@ -768,7 +769,7 @@ func (b *SyncFromBackup) coldStartAtChainID(ctx context.Context, applier ir.Chan
 	if !found {
 		ids := make([]string, 0, len(chain))
 		for _, link := range chain {
-			ids = append(ids, manifestBackupID(link.manifest))
+			ids = append(ids, lineage.ManifestBackupID(link.Manifest))
 		}
 		return "", fmt.Errorf(
 			"broker: --at-chain-id=%q not found in chain (available: %s)",
@@ -853,7 +854,7 @@ func (b *SyncFromBackup) replayNewIncrementals(
 	if lastAppliedID != "" {
 		found := false
 		for i, link := range chain {
-			if manifestBackupID(link.manifest) == lastAppliedID {
+			if lineage.ManifestBackupID(link.Manifest) == lastAppliedID {
 				startIdx = i + 1
 				found = true
 				break
@@ -890,15 +891,15 @@ func (b *SyncFromBackup) replayNewIncrementals(
 		// Skip the full's manifest (i==0) when no last-applied is
 		// set; that case shouldn't happen on the warm-resume path
 		// but is harmless to guard.
-		if link.manifest.Kind == irbackup.BackupKindFull || link.manifest.Kind == "" {
+		if link.Manifest.Kind == irbackup.BackupKindFull || link.Manifest.Kind == "" {
 			continue
 		}
 		bytesApplied, applyErr := b.applyIncremental(ctx, applier, link, batchSize)
 		if applyErr != nil {
 			return newApplied, totalBytes, fmt.Errorf("incremental %s: %w",
-				manifestBackupID(link.manifest), applyErr)
+				lineage.ManifestBackupID(link.Manifest), applyErr)
 		}
-		newApplied = manifestBackupID(link.manifest)
+		newApplied = lineage.ManifestBackupID(link.Manifest)
 		totalBytes += bytesApplied
 		slog.InfoContext(
 			ctx, "broker: incremental applied",
@@ -921,11 +922,11 @@ func (b *SyncFromBackup) replayNewIncrementals(
 func (b *SyncFromBackup) applyIncremental(
 	ctx context.Context,
 	applier ir.ChangeApplier,
-	link *segmentRecord,
+	link *lineage.SegmentRecord,
 	batchSize int,
 ) (int64, error) {
 	// 1. Schema deltas first.
-	if len(link.manifest.SchemaDelta) > 0 {
+	if len(link.Manifest.SchemaDelta) > 0 {
 		if err := b.applySchemaDeltas(ctx, link); err != nil {
 			return 0, fmt.Errorf("apply schema deltas: %w", err)
 		}
@@ -935,8 +936,8 @@ func (b *SyncFromBackup) applyIncremental(
 	//    still need the broker's position to advance. Use the direct
 	//    position-writer path; the schema-delta apply above is
 	//    idempotent so a re-replay on broker crash is safe.
-	backupID := manifestBackupID(link.manifest)
-	if len(link.manifest.ChangeChunks) == 0 {
+	backupID := lineage.ManifestBackupID(link.Manifest)
+	if len(link.Manifest.ChangeChunks) == 0 {
 		if err := b.writePositionDirect(ctx, applier, backupID); err != nil {
 			return 0, fmt.Errorf("write position for empty incremental: %w", err)
 		}
@@ -989,7 +990,7 @@ func (b *SyncFromBackup) applyIncremental(
 	// but is a proxy that doesn't require re-reading the chunk for
 	// length; the tick log line is informational).
 	var rows int64
-	for _, c := range link.manifest.ChangeChunks {
+	for _, c := range link.Manifest.ChangeChunks {
 		rows += c.RowCount
 	}
 	return rows, nil
@@ -1009,20 +1010,20 @@ func (b *SyncFromBackup) applyIncremental(
 // Implementation duplicates the chain-restore logic intentionally
 // rather than refactoring chain_restore.go (Tenet: don't refactor
 // Phase 4 surfaces beyond what 4.5 requires).
-func (b *SyncFromBackup) applySchemaDeltas(ctx context.Context, link *segmentRecord) error {
-	if err := detectAmbiguousDeltas(link.manifest.SchemaDelta); err != nil {
+func (b *SyncFromBackup) applySchemaDeltas(ctx context.Context, link *lineage.SegmentRecord) error {
+	if err := lineage.DetectAmbiguousDeltas(link.Manifest.SchemaDelta); err != nil {
 		return fmt.Errorf(
 			"unsupportable schema delta in incremental %s: %w. "+
 				"Force a fresh full + new chain to recover",
-			manifestBackupID(link.manifest), err,
+			lineage.ManifestBackupID(link.Manifest), err,
 		)
 	}
 
-	sourceEngine := link.manifest.SourceEngine
+	sourceEngine := link.Manifest.SourceEngine
 	targetEngine := b.Target.Name()
 	if err := migcore.CheckCrossEngineDeltaSupportable(
-		link.manifest.SchemaDelta, sourceEngine, targetEngine,
-		manifestBackupID(link.manifest),
+		link.Manifest.SchemaDelta, sourceEngine, targetEngine,
+		lineage.ManifestBackupID(link.Manifest),
 	); err != nil {
 		return err
 	}
@@ -1034,7 +1035,7 @@ func (b *SyncFromBackup) applySchemaDeltas(ctx context.Context, link *segmentRec
 	defer closeIf(sw)
 
 	deltaApplier, _ := sw.(ir.SchemaDeltaApplier)
-	for _, d := range link.manifest.SchemaDelta {
+	for _, d := range link.Manifest.SchemaDelta {
 		switch d.Kind {
 		case irbackup.SchemaDeltaAddTable:
 			if d.After == nil {
@@ -1056,7 +1057,7 @@ func (b *SyncFromBackup) applySchemaDeltas(ctx context.Context, link *segmentRec
 			if d.Before == nil || d.After == nil {
 				continue
 			}
-			added := addedColumns(d.Before, d.After)
+			added := lineage.AddedColumns(d.Before, d.After)
 			if len(added) == 0 {
 				continue
 			}
@@ -1074,7 +1075,7 @@ func (b *SyncFromBackup) applySchemaDeltas(ctx context.Context, link *segmentRec
 				sourceEngine, targetEngine,
 			)
 			retargetedTable := retargetedSchema.Tables[0]
-			retargetedAdded := addedColumns(d.Before, retargetedTable)
+			retargetedAdded := lineage.AddedColumns(d.Before, retargetedTable)
 			if err := deltaApplier.AlterAddColumn(ctx, retargetedTable, retargetedAdded); err != nil {
 				return fmt.Errorf("alter add column on %s: %w", d.Table, err)
 			}
@@ -1110,13 +1111,13 @@ func (b *SyncFromBackup) applySchemaDeltas(ctx context.Context, link *segmentRec
 // matrix gap-#4 closure note (docs/dev/perf-parity-matrix.md).
 func (b *SyncFromBackup) streamIncrementalWithPosition(
 	ctx context.Context,
-	link *segmentRecord,
+	link *lineage.SegmentRecord,
 	pos ir.Position,
 	out chan<- ir.Change,
 ) error {
-	segStore := link.segment.store(b.Store)
-	codec := link.segment.codecOrDefault()
-	for chunkIdx, chunk := range link.manifest.ChangeChunks {
+	segStore := link.Segment.Store(b.Store)
+	codec := link.Segment.CodecOrDefault()
+	for chunkIdx, chunk := range link.Manifest.ChangeChunks {
 		if err := b.streamOneChunkWithPosition(ctx, segStore, codec, chunk, pos, out); err != nil {
 			return fmt.Errorf("chunk %d (%s): %w", chunkIdx, chunk.File, err)
 		}
@@ -1273,7 +1274,7 @@ func (b *SyncFromBackup) waitForNextTick(
 // [BackupStream.alignEncryption], so this preflight covers the broker
 // case fully.
 func (b *SyncFromBackup) preflightChainEncryption(ctx context.Context) error {
-	root, err := readManifestIfPresent(ctx, b.Store)
+	root, err := lineage.ReadManifestIfPresent(ctx, b.Store)
 	if err != nil {
 		return fmt.Errorf("read chain root manifest: %w", err)
 	}

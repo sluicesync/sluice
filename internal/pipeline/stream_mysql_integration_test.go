@@ -19,6 +19,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 )
@@ -60,14 +61,14 @@ func TestBackupStream_MySQL_RolloverByMaxChanges(t *testing.T) {
 		t.Fatalf("Backup.Run: %v", err)
 	}
 	binlogFile, binlogPos := readMySQLBinlogPos(t, sourceDSN)
-	full, _ := readManifest(context.Background(), store)
+	full, _ := lineage.ReadManifest(context.Background(), store)
 	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{
 		Engine: "mysql",
 		Token:  fmt.Sprintf(`{"mode":"file_pos","file":%q,"pos":%d}`, binlogFile, binlogPos),
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("rewrite full: %v", err)
 	}
 
@@ -110,10 +111,10 @@ func TestBackupStream_MySQL_RolloverByMaxChanges(t *testing.T) {
 	deadline := time.Now().Add(45 * time.Second)
 	var lastCount, stableTicks int
 	for time.Now().Before(deadline) {
-		records, _ := listAllManifestsViaWalk(context.Background(), store)
+		records, _ := lineage.ListAllManifestsViaWalk(context.Background(), store)
 		var incrCount int
 		for _, r := range records {
-			if r.manifest.Kind == irbackup.BackupKindIncremental {
+			if r.Manifest.Kind == irbackup.BackupKindIncremental {
 				incrCount++
 			}
 		}
@@ -139,11 +140,11 @@ func TestBackupStream_MySQL_RolloverByMaxChanges(t *testing.T) {
 		t.Fatal("stream.Run did not exit within 10s")
 	}
 
-	records, _ := listAllManifestsViaWalk(context.Background(), store)
+	records, _ := lineage.ListAllManifestsViaWalk(context.Background(), store)
 	var incrementals []*irbackup.Manifest
 	for _, r := range records {
-		if r.manifest.Kind == irbackup.BackupKindIncremental {
-			incrementals = append(incrementals, r.manifest)
+		if r.Manifest.Kind == irbackup.BackupKindIncremental {
+			incrementals = append(incrementals, r.Manifest)
 		}
 	}
 	if len(incrementals) < 2 {

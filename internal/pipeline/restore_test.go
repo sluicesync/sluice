@@ -14,6 +14,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // restoreRecorderEngine is a fake [ir.Engine] for restore tests: a
@@ -424,7 +425,7 @@ func TestRestore_HashMismatch_FailsLoudly(t *testing.T) {
 	// Corrupt the chunk file. Read the chunk's bytes via Get, close
 	// the handle (Windows holds an exclusive lock until close), then
 	// rewrite via Put.
-	manifest, _ := readManifest(context.Background(), store)
+	manifest, _ := lineage.ReadManifest(context.Background(), store)
 	chunkPath := manifest.Tables[0].Chunks[0].File
 	original := bytes.Buffer{}
 	rc, err := store.Get(context.Background(), chunkPath)
@@ -677,7 +678,7 @@ func TestVerifyBackup_DetectsMissingChunk(t *testing.T) {
 	if err := (&Backup{Source: src, SourceDSN: "src", Store: store}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup: %v", err)
 	}
-	manifest, _ := readManifest(context.Background(), store)
+	manifest, _ := lineage.ReadManifest(context.Background(), store)
 	if err := store.Delete(context.Background(), manifest.Tables[0].Chunks[0].File); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}

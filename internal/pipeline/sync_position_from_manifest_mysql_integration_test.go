@@ -18,6 +18,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 )
@@ -55,9 +56,9 @@ func TestBackup_RecordsEndPosition_MySQLIntegration(t *testing.T) {
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
-	full, err := readManifest(context.Background(), store)
+	full, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	if full.EndPosition.Engine != "mysql" {
 		t.Errorf("EndPosition.Engine = %q; want mysql", full.EndPosition.Engine)

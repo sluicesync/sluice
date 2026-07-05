@@ -15,6 +15,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // failOnNthPutStore wraps a [blobcodec.LocalStore] and returns ErrInjected on the
@@ -95,9 +96,9 @@ func TestBackup_ResumeSkipsAlreadyCompletedTables(t *testing.T) {
 
 	// The manifest committed after the first table should be on disk
 	// with PartialState == in_progress.
-	m1, err := readManifest(context.Background(), inner)
+	m1, err := lineage.ReadManifest(context.Background(), inner)
 	if err != nil {
-		t.Fatalf("readManifest after partial: %v", err)
+		t.Fatalf("lineage.ReadManifest after partial: %v", err)
 	}
 	if m1.PartialState != irbackup.BackupStateInProgress {
 		t.Errorf("PartialState = %q; want %q", m1.PartialState, irbackup.BackupStateInProgress)
@@ -132,9 +133,9 @@ func TestBackup_ResumeSkipsAlreadyCompletedTables(t *testing.T) {
 	}
 
 	// Confirm final manifest is complete with both tables.
-	m2, err := readManifest(context.Background(), inner)
+	m2, err := lineage.ReadManifest(context.Background(), inner)
 	if err != nil {
-		t.Fatalf("readManifest after resume: %v", err)
+		t.Fatalf("lineage.ReadManifest after resume: %v", err)
 	}
 	if m2.PartialState != irbackup.BackupStateComplete {
 		t.Errorf("final PartialState = %q; want %q", m2.PartialState, irbackup.BackupStateComplete)
@@ -330,9 +331,9 @@ func TestBackup_ResumeRestreamsPartialTableWithContentAddressedUploadSkip(t *tes
 	if err := b1.Run(context.Background()); err != nil {
 		t.Fatalf("first Run: %v", err)
 	}
-	full, err := readManifest(context.Background(), store)
+	full, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	if len(full.Tables) != 1 || len(full.Tables[0].Chunks) != 3 {
 		t.Fatalf("expected 3 chunks; got %+v", full.Tables)
@@ -365,8 +366,8 @@ func TestBackup_ResumeRestreamsPartialTableWithContentAddressedUploadSkip(t *tes
 			},
 		},
 	}
-	if err := writeManifest(context.Background(), store, partial); err != nil {
-		t.Fatalf("writeManifest partial: %v", err)
+	if err := lineage.WriteManifest(context.Background(), store, partial); err != nil {
+		t.Fatalf("lineage.WriteManifest partial: %v", err)
 	}
 	// Delete chunk 2's file so the resume actually has work to do for
 	// chunk 2 (and to assert chunks 0/1 aren't being re-uploaded).
@@ -387,9 +388,9 @@ func TestBackup_ResumeRestreamsPartialTableWithContentAddressedUploadSkip(t *tes
 	}
 
 	// Final manifest has 3 chunks again.
-	final, err := readManifest(context.Background(), store)
+	final, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest final: %v", err)
+		t.Fatalf("lineage.ReadManifest final: %v", err)
 	}
 	if final.PartialState != irbackup.BackupStateComplete {
 		t.Errorf("PartialState = %q; want complete", final.PartialState)
@@ -480,8 +481,8 @@ func TestBackup_ResumeWithMissingPriorChunksReruns(t *testing.T) {
 			},
 		},
 	}
-	if err := writeManifest(context.Background(), store, priorManifest); err != nil {
-		t.Fatalf("writeManifest: %v", err)
+	if err := lineage.WriteManifest(context.Background(), store, priorManifest); err != nil {
+		t.Fatalf("lineage.WriteManifest: %v", err)
 	}
 
 	// Stage 2: re-run; the chunk is missing so the table should be
@@ -491,7 +492,7 @@ func TestBackup_ResumeWithMissingPriorChunksReruns(t *testing.T) {
 	if err := b.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	final, _ := readManifest(context.Background(), store)
+	final, _ := lineage.ReadManifest(context.Background(), store)
 	if final.PartialState != irbackup.BackupStateComplete {
 		t.Errorf("PartialState = %q; want complete", final.PartialState)
 	}

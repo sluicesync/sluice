@@ -15,6 +15,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // makeManifest returns a manifest with deterministic CreatedAt and
@@ -30,7 +31,7 @@ func makeManifest(t *testing.T, kind string, parent *irbackup.Manifest, lsn stri
 		EndPosition:   ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"` + lsn + `"}`},
 	}
 	if parent != nil {
-		m.ParentBackupID = manifestBackupID(parent)
+		m.ParentBackupID = lineage.ManifestBackupID(parent)
 		m.StartPosition = parent.EndPosition
 	}
 	m.BackupID = irbackup.ComputeBackupID(m)
@@ -38,25 +39,25 @@ func makeManifest(t *testing.T, kind string, parent *irbackup.Manifest, lsn stri
 }
 
 // seedSegment writes a single segment's full + incrementals into a
-// per-segment store and returns the LineageSegment describing it. dir
+// per-segment store and returns the lineage.Segment describing it. dir
 // == "" is the root (one-segment) layout.
-func seedSegment(t *testing.T, root irbackup.Store, dir string, full *irbackup.Manifest, incrs []*irbackup.Manifest, codec blobcodec.Codec) LineageSegment {
+func seedSegment(t *testing.T, root irbackup.Store, dir string, full *irbackup.Manifest, incrs []*irbackup.Manifest, codec blobcodec.Codec) lineage.Segment {
 	t.Helper()
-	ss := newPrefixedStore(root, dir)
-	if err := writeManifestAt(context.Background(), ss, ManifestFileName, full); err != nil {
+	ss := lineage.NewPrefixedStore(root, dir)
+	if err := lineage.WriteManifestAt(context.Background(), ss, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("write seg full: %v", err)
 	}
-	seg := LineageSegment{
-		SegmentID:        manifestBackupID(full),
+	seg := lineage.Segment{
+		SegmentID:        lineage.ManifestBackupID(full),
 		Dir:              dir,
-		FullManifestPath: ManifestFileName,
+		FullManifestPath: lineage.ManifestFileName,
 		StartPosition:    full.EndPosition,
 		EndPosition:      full.EndPosition,
 		Codec:            codec,
 	}
 	for i, m := range incrs {
 		p := "manifests/incr-" + fmt.Sprintf("%04d", i) + ".json"
-		if err := writeManifestAt(context.Background(), ss, p, m); err != nil {
+		if err := lineage.WriteManifestAt(context.Background(), ss, p, m); err != nil {
 			t.Fatalf("write seg incr: %v", err)
 		}
 		seg.Incrementals = append(seg.Incrementals, p)
@@ -69,14 +70,14 @@ func TestBuildLineageChain_SingleSegmentNoIncrementals(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := blobcodec.NewLocalStore(dir)
 	full := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
-	_ = writeManifestAt(context.Background(), store, ManifestFileName, full)
-	// No lineage.json — resolveLineage synthesises a one-segment
+	_ = lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full)
+	// No lineage.json — lineage.ResolveLineage synthesises a one-segment
 	// lineage; behaviour byte-identical to a pre-ADR single full.
-	chain, err := buildLineageChain(context.Background(), store, nil)
+	chain, err := lineage.BuildLineageChain(context.Background(), store, nil)
 	if err != nil {
-		t.Fatalf("buildLineageChain: %v", err)
+		t.Fatalf("lineage.BuildLineageChain: %v", err)
 	}
-	if len(chain) != 1 || canonicalKind(chain[0].manifest.Kind) != irbackup.BackupKindFull {
+	if len(chain) != 1 || lineage.CanonicalKind(chain[0].Manifest.Kind) != irbackup.BackupKindFull {
 		t.Errorf("chain = %+v; want one full link", chain)
 	}
 }
@@ -88,18 +89,18 @@ func TestBuildLineageChain_LinearOK(t *testing.T) {
 	incr1 := makeManifest(t, irbackup.BackupKindIncremental, full, "0/200")
 	incr2 := makeManifest(t, irbackup.BackupKindIncremental, incr1, "0/300")
 	seg := seedSegment(t, store, "", full, []*irbackup.Manifest{incr1, incr2}, blobcodec.CodecGzip)
-	cat := &LineageCatalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []LineageSegment{seg}}
-	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
+	cat := &lineage.Catalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []lineage.Segment{seg}}
+	if err := lineage.WriteLineageCatalog(context.Background(), store, cat); err != nil {
 		t.Fatal(err)
 	}
-	chain, err := buildLineageChain(context.Background(), store, nil)
+	chain, err := lineage.BuildLineageChain(context.Background(), store, nil)
 	if err != nil {
-		t.Fatalf("buildLineageChain: %v", err)
+		t.Fatalf("lineage.BuildLineageChain: %v", err)
 	}
 	if len(chain) != 3 {
 		t.Fatalf("chain len = %d; want 3", len(chain))
 	}
-	if manifestBackupID(chain[2].manifest) != manifestBackupID(incr2) {
+	if lineage.ManifestBackupID(chain[2].Manifest) != lineage.ManifestBackupID(incr2) {
 		t.Errorf("chain[2] is not incr2")
 	}
 }
@@ -129,13 +130,13 @@ func TestBuildLineageChain_MultiSegmentBoundaryOK(t *testing.T) {
 	capt := time.Now().UTC()
 	s0.CappedAt, s0.CapReason = &capt, rotationReasonAge
 	s1.CappedAt, s1.CapReason = &capt, rotationReasonChainLength
-	cat := &LineageCatalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []LineageSegment{s0, s1, s2}}
-	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
+	cat := &lineage.Catalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []lineage.Segment{s0, s1, s2}}
+	if err := lineage.WriteLineageCatalog(context.Background(), store, cat); err != nil {
 		t.Fatal(err)
 	}
-	chain, err := buildLineageChain(context.Background(), store, nil)
+	chain, err := lineage.BuildLineageChain(context.Background(), store, nil)
 	if err != nil {
-		t.Fatalf("buildLineageChain (valid 3-segment): %v", err)
+		t.Fatalf("lineage.BuildLineageChain (valid 3-segment): %v", err)
 	}
 	// f0,i0,f1,i1,f2 = 5 links.
 	if len(chain) != 5 {
@@ -145,10 +146,10 @@ func TestBuildLineageChain_MultiSegmentBoundaryOK(t *testing.T) {
 
 // TestBuildBrokerChain_MultiSegmentFollows pins the post-Round-D
 // closure of the Phase 4.5 multi-segment-broker deferral. Pre-fix
-// buildBrokerChain refused loudly on any chain with >1 segment with
+// lineage.BuildBrokerChain refused loudly on any chain with >1 segment with
 // the documented "Broker following a multi-segment lineage is deferred
 // (ADR-0046 Phase 4.5); ..." error. Post-fix, the broker walks the
-// full lineage via buildLineageChain — same code path sluice restore
+// full lineage via lineage.BuildLineageChain — same code path sluice restore
 // uses for multi-segment chains.
 //
 // The broker's apply loop (broker.go::replayNewIncrementals) skips
@@ -189,14 +190,14 @@ func TestBuildBrokerChain_MultiSegmentFollows(t *testing.T) {
 	capt := time.Now().UTC()
 	s0.CappedAt, s0.CapReason = &capt, rotationReasonAge
 	s1.CappedAt, s1.CapReason = &capt, rotationReasonChainLength
-	cat := &LineageCatalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []LineageSegment{s0, s1, s2}}
-	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
+	cat := &lineage.Catalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []lineage.Segment{s0, s1, s2}}
+	if err := lineage.WriteLineageCatalog(context.Background(), store, cat); err != nil {
 		t.Fatal(err)
 	}
 
-	chain, err := buildBrokerChain(context.Background(), store)
+	chain, err := lineage.BuildBrokerChain(context.Background(), store)
 	if err != nil {
-		t.Fatalf("buildBrokerChain (3-segment): unexpected refusal: %v", err)
+		t.Fatalf("lineage.BuildBrokerChain (3-segment): unexpected refusal: %v", err)
 	}
 	// f0,i0,f1,i1,f2 = 5 links across 3 segments.
 	if len(chain) != 5 {
@@ -211,7 +212,7 @@ func TestBuildBrokerChain_MultiSegmentFollows(t *testing.T) {
 		irbackup.BackupKindFull, // seg2 (no incrementals)
 	}
 	for i, want := range expectedKinds {
-		got := canonicalKind(chain[i].manifest.Kind)
+		got := lineage.CanonicalKind(chain[i].Manifest.Kind)
 		if got != want {
 			t.Errorf("chain[%d].Kind = %q; want %q", i, got, want)
 		}
@@ -237,15 +238,15 @@ func TestBuildBrokerChain_DeferralRemoved(t *testing.T) {
 	s1 := seedSegment(t, store, "seg-1", f1, nil, blobcodec.CodecNone)
 	capt := time.Now().UTC()
 	s0.CappedAt, s0.CapReason = &capt, rotationReasonAge
-	cat := &LineageCatalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []LineageSegment{s0, s1}}
-	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
+	cat := &lineage.Catalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []lineage.Segment{s0, s1}}
+	if err := lineage.WriteLineageCatalog(context.Background(), store, cat); err != nil {
 		t.Fatal(err)
 	}
 
-	_, err := buildBrokerChain(context.Background(), store)
+	_, err := lineage.BuildBrokerChain(context.Background(), store)
 	if err != nil {
 		// Any error here is unexpected — the chain is well-formed.
-		t.Fatalf("buildBrokerChain on valid 2-segment lineage: unexpected error %v", err)
+		t.Fatalf("lineage.BuildBrokerChain on valid 2-segment lineage: unexpected error %v", err)
 	}
 }
 
@@ -262,32 +263,32 @@ func TestValidateBoundary_SameCodePathIntraAndInter(t *testing.T) {
 	behind := ir.Position{Engine: "postgres", Token: "0/199"}
 	cmp := &fakeMonotonicEngine{order: map[string]int{"0/199": 199, "0/200": 200, "0/300": 300}}
 
-	// SAME validateBoundary, intra-segment (exact=true): contiguous OK,
+	// SAME lineage.ValidateBoundary, intra-segment (exact=true): contiguous OK,
 	// any non-equality (gap OR regression) is a loud mismatch.
-	if err := validateBoundary(cmp, prevEnd, eq, true, "seg0 link1", "seg0 incrX"); err != nil {
+	if err := lineage.ValidateBoundary(cmp, prevEnd, eq, true, "seg0 link1", "seg0 incrX"); err != nil {
 		t.Errorf("intra contiguous: err = %v; want nil", err)
 	}
-	if err := validateBoundary(cmp, prevEnd, ahead, true, "seg0 link1", "seg0 incrX"); err == nil ||
+	if err := lineage.ValidateBoundary(cmp, prevEnd, ahead, true, "seg0 link1", "seg0 incrX"); err == nil ||
 		!strings.Contains(err.Error(), "lineage boundary mismatch") {
 		t.Errorf("intra forward-gap: err = %v; want loud mismatch (exact)", err)
 	}
-	if err := validateBoundary(cmp, prevEnd, behind, true, "seg0 link1", "seg0 incrX"); err == nil {
+	if err := lineage.ValidateBoundary(cmp, prevEnd, behind, true, "seg0 link1", "seg0 incrX"); err == nil {
 		t.Errorf("intra regression: err = nil; want loud mismatch")
 	}
-	// SAME validateBoundary, inter-segment (exact=false): equal OR
+	// SAME lineage.ValidateBoundary, inter-segment (exact=false): equal OR
 	// ahead OK (S >= P_N); only a REGRESSION is a loud refusal.
-	if err := validateBoundary(cmp, prevEnd, eq, false, "seg0 last", "seg1 start"); err != nil {
+	if err := lineage.ValidateBoundary(cmp, prevEnd, eq, false, "seg0 last", "seg1 start"); err != nil {
 		t.Errorf("inter equal: err = %v; want nil", err)
 	}
-	if err := validateBoundary(cmp, prevEnd, ahead, false, "seg0 last", "seg1 start"); err != nil {
+	if err := lineage.ValidateBoundary(cmp, prevEnd, ahead, false, "seg0 last", "seg1 start"); err != nil {
 		t.Errorf("inter S>P_N (ahead): err = %v; want nil (monotonic OK)", err)
 	}
-	if err := validateBoundary(cmp, prevEnd, behind, false, "seg0 last", "seg1 start"); err == nil ||
+	if err := lineage.ValidateBoundary(cmp, prevEnd, behind, false, "seg0 last", "seg1 start"); err == nil ||
 		!strings.Contains(err.Error(), "REGRESSION") {
 		t.Errorf("inter regression: err = %v; want loud REGRESSION refusal", err)
 	}
 	// Empty prevEnd tolerance (legacy v0.16 full) — skip either mode.
-	if err := validateBoundary(cmp, ir.Position{}, behind, true, "p", "c"); err != nil {
+	if err := lineage.ValidateBoundary(cmp, ir.Position{}, behind, true, "p", "c"); err != nil {
 		t.Errorf("empty-prev tolerance: err = %v; want nil", err)
 	}
 }
@@ -307,8 +308,8 @@ func TestBuildLineageChain_SegmentBoundaryRegressionRefuses(t *testing.T) {
 	s1.StartPosition = ir.Position{Engine: "postgres", Token: "BEFORE0"}
 	capt := time.Now().UTC()
 	s0.CappedAt = &capt
-	cat := &LineageCatalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []LineageSegment{s0, s1}}
-	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
+	cat := &lineage.Catalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []lineage.Segment{s0, s1}}
+	if err := lineage.WriteLineageCatalog(context.Background(), store, cat); err != nil {
 		t.Fatal(err)
 	}
 	// Ranking comparator: f0.End ("END0") ranks AFTER the regressed
@@ -318,7 +319,7 @@ func TestBuildLineageChain_SegmentBoundaryRegressionRefuses(t *testing.T) {
 		"BEFORE0":                             100,
 		`{"slot":"sluice_slot","lsn":"END1"}`: 300,
 	}}
-	_, err := buildLineageChain(context.Background(), store, cmp)
+	_, err := lineage.BuildLineageChain(context.Background(), store, cmp)
 	if err == nil || !strings.Contains(err.Error(), "REGRESSION") {
 		t.Errorf("err = %v; want loud segment-boundary REGRESSION refusal", err)
 	}
@@ -332,11 +333,11 @@ func TestBuildLineageChain_IntraSegmentMismatchRefuses(t *testing.T) {
 	tampered.StartPosition = ir.Position{Engine: "postgres", Token: `{"slot":"x","lsn":"WRONG"}`}
 	tampered.BackupID = irbackup.ComputeBackupID(tampered)
 	seg := seedSegment(t, store, "", full, []*irbackup.Manifest{tampered}, blobcodec.CodecGzip)
-	cat := &LineageCatalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []LineageSegment{seg}}
-	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
+	cat := &lineage.Catalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []lineage.Segment{seg}}
+	if err := lineage.WriteLineageCatalog(context.Background(), store, cat); err != nil {
 		t.Fatal(err)
 	}
-	_, err := buildLineageChain(context.Background(), store, nil)
+	_, err := lineage.BuildLineageChain(context.Background(), store, nil)
 	if err == nil || !strings.Contains(err.Error(), "lineage boundary mismatch") {
 		t.Errorf("err = %v; want intra-segment boundary refusal", err)
 	}
@@ -347,14 +348,14 @@ func TestBuildLineageChain_IntraSegmentMismatchRefuses(t *testing.T) {
 func TestBuildLineageChain_MissingFullRefuses(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := blobcodec.NewLocalStore(dir)
-	cat := &LineageCatalog{
+	cat := &lineage.Catalog{
 		FormatVersion: 1, SourceEngine: "postgres",
-		Segments: []LineageSegment{{SegmentID: "s0", Dir: "", FullManifestPath: ManifestFileName, Codec: blobcodec.CodecGzip}},
+		Segments: []lineage.Segment{{SegmentID: "s0", Dir: "", FullManifestPath: lineage.ManifestFileName, Codec: blobcodec.CodecGzip}},
 	}
-	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
+	if err := lineage.WriteLineageCatalog(context.Background(), store, cat); err != nil {
 		t.Fatal(err)
 	}
-	_, err := buildLineageChain(context.Background(), store, nil)
+	_, err := lineage.BuildLineageChain(context.Background(), store, nil)
 	if err == nil || !strings.Contains(err.Error(), "full") {
 		t.Errorf("err = %v; want missing-full refusal", err)
 	}
@@ -375,8 +376,8 @@ func TestDetectAmbiguousDeltas_RenameRefuses(t *testing.T) {
 			}},
 		},
 	}
-	if err := detectAmbiguousDeltas(deltas); err == nil {
-		t.Errorf("detectAmbiguousDeltas: nil; want refusal on rename ambiguity")
+	if err := lineage.DetectAmbiguousDeltas(deltas); err == nil {
+		t.Errorf("lineage.DetectAmbiguousDeltas: nil; want refusal on rename ambiguity")
 	}
 }
 
@@ -394,8 +395,8 @@ func TestDetectAmbiguousDeltas_AddOnlyOK(t *testing.T) {
 			}},
 		},
 	}
-	if err := detectAmbiguousDeltas(deltas); err != nil {
-		t.Errorf("detectAmbiguousDeltas: %v; want clean", err)
+	if err := lineage.DetectAmbiguousDeltas(deltas); err != nil {
+		t.Errorf("lineage.DetectAmbiguousDeltas: %v; want clean", err)
 	}
 }
 
@@ -467,14 +468,14 @@ func TestChainRestore_FullPlusOneIncremental_RoundTrip(t *testing.T) {
 	// Patch the full's manifest with an EndPosition + BackupID so the
 	// incremental can chain off it. (The full backup pipeline
 	// doesn't yet record EndPosition for fulls — Phase 3.3 work.)
-	full, err := readManifest(context.Background(), store)
+	full, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
 		t.Fatalf("read full manifest: %v", err)
 	}
 	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/100"}`}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("rewrite full manifest: %v", err)
 	}
 
@@ -583,10 +584,10 @@ func TestChainRestore_SchemaHistoryReplayed(t *testing.T) {
 	full := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
 	full.Schema = schema
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("write full: %v", err)
 	}
-	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, blobcodec.CodecGzip)
+	lineage.UpdateLineageForManifestBestEffort(context.Background(), store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
 
 	// Incremental: carries SchemaHistory + a single Insert event.
 	incr := makeManifest(t, irbackup.BackupKindIncremental, full, "0/200")
@@ -629,10 +630,10 @@ func TestChainRestore_SchemaHistoryReplayed(t *testing.T) {
 	}}
 	incr.BackupID = irbackup.ComputeBackupID(incr)
 	incrPath := "manifests/incr-0001.json"
-	if err := writeManifestAt(context.Background(), store, incrPath, incr); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, incrPath, incr); err != nil {
 		t.Fatalf("write incr: %v", err)
 	}
-	updateLineageForManifestBestEffort(context.Background(), store, incr, incrPath, blobcodec.CodecGzip)
+	lineage.UpdateLineageForManifestBestEffort(context.Background(), store, incr, incrPath, blobcodec.CodecGzip)
 
 	// Run restore.
 	tgt := &chainRestoreRecorderEngine{
@@ -698,10 +699,10 @@ func TestChainRestore_SchemaHistoryOnlyManifestReplayed(t *testing.T) {
 	full := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
 	full.Schema = schema
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("write full: %v", err)
 	}
-	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, blobcodec.CodecGzip)
+	lineage.UpdateLineageForManifestBestEffort(context.Background(), store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
 
 	incr := makeManifest(t, irbackup.BackupKindIncremental, full, "0/200")
 	incr.Schema = &ir.Schema{Tables: []*ir.Table{postDDL}}
@@ -716,10 +717,10 @@ func TestChainRestore_SchemaHistoryOnlyManifestReplayed(t *testing.T) {
 	incr.ChangeChunks = nil // no DML
 	incr.BackupID = irbackup.ComputeBackupID(incr)
 	incrPath := "manifests/incr-0001.json"
-	if err := writeManifestAt(context.Background(), store, incrPath, incr); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, incrPath, incr); err != nil {
 		t.Fatalf("write incr: %v", err)
 	}
-	updateLineageForManifestBestEffort(context.Background(), store, incr, incrPath, blobcodec.CodecGzip)
+	lineage.UpdateLineageForManifestBestEffort(context.Background(), store, incr, incrPath, blobcodec.CodecGzip)
 
 	tgt := &chainRestoreRecorderEngine{
 		restoreRecorderEngine: newRestoreRecorderEngine("postgres"),
@@ -753,10 +754,10 @@ func TestChainRestore_SchemaHistoryDecodeFailureIsLoud(t *testing.T) {
 
 	full := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("write full: %v", err)
 	}
-	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, blobcodec.CodecGzip)
+	lineage.UpdateLineageForManifestBestEffort(context.Background(), store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
 
 	incr := makeManifest(t, irbackup.BackupKindIncremental, full, "0/200")
 	// Corrupt SchemaHistory entry: TableJSON is "null" → UnmarshalTable
@@ -771,10 +772,10 @@ func TestChainRestore_SchemaHistoryDecodeFailureIsLoud(t *testing.T) {
 	}
 	incr.BackupID = irbackup.ComputeBackupID(incr)
 	incrPath := "manifests/incr-0001.json"
-	if err := writeManifestAt(context.Background(), store, incrPath, incr); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, incrPath, incr); err != nil {
 		t.Fatalf("write incr: %v", err)
 	}
-	updateLineageForManifestBestEffort(context.Background(), store, incr, incrPath, blobcodec.CodecGzip)
+	lineage.UpdateLineageForManifestBestEffort(context.Background(), store, incr, incrPath, blobcodec.CodecGzip)
 
 	tgt := &chainRestoreRecorderEngine{
 		restoreRecorderEngine: newRestoreRecorderEngine("postgres"),
@@ -810,10 +811,10 @@ func TestChainRestore_PreChunkDManifest_BackwardCompat(t *testing.T) {
 	full := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
 	full.Schema = schema
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("write full: %v", err)
 	}
-	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, blobcodec.CodecGzip)
+	lineage.UpdateLineageForManifestBestEffort(context.Background(), store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
 
 	incr := makeManifest(t, irbackup.BackupKindIncremental, full, "0/200")
 	incr.Schema = schema
@@ -836,8 +837,8 @@ func TestChainRestore_PreChunkDManifest_BackwardCompat(t *testing.T) {
 	}}
 	incr.BackupID = irbackup.ComputeBackupID(incr)
 	incrPath := "manifests/incr-0001.json"
-	_ = writeManifestAt(context.Background(), store, incrPath, incr)
-	updateLineageForManifestBestEffort(context.Background(), store, incr, incrPath, blobcodec.CodecGzip)
+	_ = lineage.WriteManifestAt(context.Background(), store, incrPath, incr)
+	lineage.UpdateLineageForManifestBestEffort(context.Background(), store, incr, incrPath, blobcodec.CodecGzip)
 
 	tgt := &chainRestoreRecorderEngine{
 		restoreRecorderEngine: newRestoreRecorderEngine("postgres"),
@@ -877,13 +878,13 @@ func TestChainRestore_CrossEngineWithIncrementalsSucceeds(t *testing.T) {
 	full := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
 	full.SourceEngine = "postgres"
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("write full: %v", err)
 	}
 	incr := makeManifest(t, irbackup.BackupKindIncremental, full, "0/200")
 	incr.SourceEngine = "postgres"
 	incr.BackupID = irbackup.ComputeBackupID(incr)
-	if err := writeManifestAt(context.Background(), store, "manifests/incr-0001.json", incr); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, "manifests/incr-0001.json", incr); err != nil {
 		t.Fatalf("write incr: %v", err)
 	}
 
@@ -932,10 +933,10 @@ func TestChainRestore_DispatchFromRestore_Run(t *testing.T) {
 	_ = (&Backup{Source: src, SourceDSN: "src", Store: store}).Run(context.Background())
 
 	// Patch the full with an EndPosition.
-	full, _ := readManifest(context.Background(), store)
+	full, _ := lineage.ReadManifest(context.Background(), store)
 	full.EndPosition = ir.Position{Engine: "postgres", Token: `{"slot":"x","lsn":"0/100"}`}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	_ = writeManifestAt(context.Background(), store, ManifestFileName, full)
+	_ = lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full)
 
 	// Add an empty incremental so the dispatch fires.
 	cdc := &fakeCDCEngine{
@@ -1003,10 +1004,10 @@ func seedMultiChunkIncremental(t *testing.T, store irbackup.Store, schema *ir.Sc
 	full := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
 	full.Schema = schema
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("write full: %v", err)
 	}
-	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, blobcodec.CodecGzip)
+	lineage.UpdateLineageForManifestBestEffort(context.Background(), store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
 
 	incr := makeManifest(t, irbackup.BackupKindIncremental, full, "0/300")
 	incr.Schema = schema
@@ -1025,10 +1026,10 @@ func seedMultiChunkIncremental(t *testing.T, store irbackup.Store, schema *ir.Sc
 	}
 	incr.BackupID = irbackup.ComputeBackupID(incr)
 	incrPath := "manifests/incr-0001.json"
-	if err := writeManifestAt(context.Background(), store, incrPath, incr); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, incrPath, incr); err != nil {
 		t.Fatalf("write incr: %v", err)
 	}
-	updateLineageForManifestBestEffort(context.Background(), store, incr, incrPath, blobcodec.CodecGzip)
+	lineage.UpdateLineageForManifestBestEffort(context.Background(), store, incr, incrPath, blobcodec.CodecGzip)
 	return incr
 }
 

@@ -13,6 +13,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // # `sluice backup prune` — lineage retention pruning (ADR-0046 §4)
@@ -112,7 +113,7 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 		now = time.Now
 	}
 
-	cat, ok, err := loadLineageCatalog(ctx, store)
+	cat, ok, err := lineage.LoadLineageCatalog(ctx, store)
 	if err != nil {
 		return nil, fmt.Errorf("prune: load lineage catalog: %w", err)
 	}
@@ -128,9 +129,9 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 	var flat []lineageIncr
 	for si := cat.RestorableFromSegment; si < len(cat.Segments); si++ {
 		seg := &cat.Segments[si]
-		ss := seg.store(store)
+		ss := seg.Store(store)
 		for ii, ip := range seg.Incrementals {
-			m, err := readManifestAt(ctx, ss, ip)
+			m, err := lineage.ReadManifestAt(ctx, ss, ip)
 			if err != nil {
 				return nil, fmt.Errorf("prune: read incremental %q (segment %d): %w", ip, si, err)
 			}
@@ -191,9 +192,9 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 	// 1. Whole leading segments [RestorableFromSegment, floorSeg).
 	for si := cat.RestorableFromSegment; si < floorSeg; si++ {
 		seg := &cat.Segments[si]
-		ss := seg.store(store)
+		ss := seg.Store(store)
 		// Full + its data chunks.
-		if fm, err := readManifestAt(ctx, ss, seg.FullManifestPath); err == nil {
+		if fm, err := lineage.ReadManifestAt(ctx, ss, seg.FullManifestPath); err == nil {
 			for _, t := range fm.Tables {
 				for _, ch := range t.Chunks {
 					res.Pruned = appendChunk(res, ch.File)
@@ -210,7 +211,7 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 		}
 		// Incrementals + their change chunks.
 		for _, ip := range seg.Incrementals {
-			if im, err := readManifestAt(ctx, ss, ip); err == nil {
+			if im, err := lineage.ReadManifestAt(ctx, ss, ip); err == nil {
 				for _, ch := range im.ChangeChunks {
 					if !opts.DryRun {
 						if derr := ss.Delete(ctx, ch.File); derr == nil {
@@ -229,7 +230,7 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 
 	// 2. Leading incrementals within the floor segment.
 	floor := &cat.Segments[floorSeg]
-	floorStore := floor.store(store)
+	floorStore := floor.Store(store)
 	keepFromInSeg := 0
 	if len(kept) > 0 && kept[0].segIdx == floorSeg {
 		keepFromInSeg = kept[0].inSegIdx
@@ -239,7 +240,7 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 	}
 	for ii := 0; ii < keepFromInSeg; ii++ {
 		ip := floor.Incrementals[ii]
-		if im, err := readManifestAt(ctx, floorStore, ip); err == nil {
+		if im, err := lineage.ReadManifestAt(ctx, floorStore, ip); err == nil {
 			for _, ch := range im.ChangeChunks {
 				if !opts.DryRun {
 					if derr := floorStore.Delete(ctx, ch.File); derr == nil {
@@ -256,7 +257,7 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 
 	// Build the post-prune lineage: drop whole leading segments, trim
 	// the floor segment's incrementals, advance the restore floor.
-	newSegs := make([]LineageSegment, 0, len(cat.Segments)-(floorSeg-cat.RestorableFromSegment))
+	newSegs := make([]lineage.Segment, 0, len(cat.Segments)-(floorSeg-cat.RestorableFromSegment))
 	for si := floorSeg; si < len(cat.Segments); si++ {
 		seg := cat.Segments[si]
 		if si == floorSeg {
@@ -293,12 +294,12 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 	cat.RestorableFromSegment = 0
 
 	if len(kept) > 0 {
-		res.EarliestRestorableBackupID = manifestBackupID(kept[0].manifest)
+		res.EarliestRestorableBackupID = lineage.ManifestBackupID(kept[0].manifest)
 	} else if len(newSegs) > 0 {
 		// No incrementals kept — the floor segment's full is the
 		// earliest restorable point.
-		if fm, err := readManifestAt(ctx, newSegs[0].store(store), newSegs[0].FullManifestPath); err == nil {
-			res.EarliestRestorableBackupID = manifestBackupID(fm)
+		if fm, err := lineage.ReadManifestAt(ctx, newSegs[0].Store(store), newSegs[0].FullManifestPath); err == nil {
+			res.EarliestRestorableBackupID = lineage.ManifestBackupID(fm)
 		}
 	}
 
@@ -306,7 +307,7 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 		return res, nil
 	}
 	cat.UpdatedAt = now().UTC()
-	if err := writeLineageCatalog(ctx, store, cat); err != nil {
+	if err := lineage.WriteLineageCatalog(ctx, store, cat); err != nil {
 		return nil, fmt.Errorf("prune: rewrite lineage catalog: %w", err)
 	}
 	slog.InfoContext(
@@ -320,7 +321,7 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 
 // r0 is the "nothing to prune" early return: report the full kept set
 // without mutating anything.
-func r0(cat *LineageCatalog, store irbackup.Store, ctx context.Context, why string) (*PruneResult, error) {
+func r0(cat *lineage.Catalog, store irbackup.Store, ctx context.Context, why string) (*PruneResult, error) {
 	res := &PruneResult{}
 	for si := cat.RestorableFromSegment; si < len(cat.Segments); si++ {
 		seg := &cat.Segments[si]
@@ -329,8 +330,8 @@ func r0(cat *LineageCatalog, store irbackup.Store, ctx context.Context, why stri
 			res.Kept = append(res.Kept, segQualify(seg.Dir, ip))
 		}
 		if res.EarliestRestorableBackupID == "" && len(seg.Incrementals) > 0 {
-			if m, err := readManifestAt(ctx, seg.store(store), seg.Incrementals[0]); err == nil {
-				res.EarliestRestorableBackupID = manifestBackupID(m)
+			if m, err := lineage.ReadManifestAt(ctx, seg.Store(store), seg.Incrementals[0]); err == nil {
+				res.EarliestRestorableBackupID = lineage.ManifestBackupID(m)
 			}
 		}
 	}
@@ -445,10 +446,10 @@ func SchemaHistoryRetentionFloor(
 //   - If neither is populated, no usable floor → ok=false.
 //
 // The "oldest retained" chain is the one at the lineage catalog's
-// [LineageCatalog.RestorableFromSegment] index (the first segment the
+// [lineage.Catalog.RestorableFromSegment] index (the first segment the
 // lineage considers restorable post-prune).
 func oldestRetainedBackupResumePosition(ctx context.Context, store irbackup.Store) (ir.Position, bool, error) {
-	cat, ok, err := loadLineageCatalog(ctx, store)
+	cat, ok, err := lineage.LoadLineageCatalog(ctx, store)
 	if err != nil {
 		return ir.Position{}, false, fmt.Errorf("load lineage: %w", err)
 	}
@@ -459,8 +460,8 @@ func oldestRetainedBackupResumePosition(ctx context.Context, store irbackup.Stor
 		return ir.Position{}, false, fmt.Errorf("lineage restorable_from_segment=%d out of range", cat.RestorableFromSegment)
 	}
 	seg := &cat.Segments[cat.RestorableFromSegment]
-	segStore := seg.store(store)
-	fm, err := readManifestAt(ctx, segStore, seg.FullManifestPath)
+	segStore := seg.Store(store)
+	fm, err := lineage.ReadManifestAt(ctx, segStore, seg.FullManifestPath)
 	if err != nil {
 		return ir.Position{}, false, fmt.Errorf("read oldest full %q: %w", seg.FullManifestPath, err)
 	}
@@ -471,7 +472,7 @@ func oldestRetainedBackupResumePosition(ctx context.Context, store irbackup.Stor
 	if len(seg.Incrementals) == 0 {
 		return ir.Position{}, false, nil
 	}
-	im, err := readManifestAt(ctx, segStore, seg.Incrementals[0])
+	im, err := lineage.ReadManifestAt(ctx, segStore, seg.Incrementals[0])
 	if err != nil {
 		return ir.Position{}, false, fmt.Errorf("read oldest incremental %q: %w", seg.Incrementals[0], err)
 	}

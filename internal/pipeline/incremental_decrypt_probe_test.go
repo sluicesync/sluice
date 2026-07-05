@@ -12,6 +12,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // TestIncrementalAlignEncryption_PerChunkDecryptProbe_Bug117_Ingestion
@@ -73,7 +74,7 @@ func TestIncrementalAlignEncryption_PerChunkDecryptProbe_Bug117_Ingestion(t *tes
 			ChunkRows: 1,
 		}
 		if env != nil {
-			b.Encryption = &BackupEncryption{Envelope: env, Mode: mode}
+			b.Encryption = &lineage.BackupEncryption{Envelope: env, Mode: mode}
 		}
 		if err := b.Run(context.Background()); err != nil {
 			t.Fatalf("Backup.Run: %v", err)
@@ -96,9 +97,9 @@ func TestIncrementalAlignEncryption_PerChunkDecryptProbe_Bug117_Ingestion(t *tes
 
 	rebindForChain := func(t *testing.T, store irbackup.Store, pass string) crypto.EnvelopeEncryption {
 		t.Helper()
-		m, err := ReadRootManifest(context.Background(), store)
+		m, err := lineage.ReadRootManifest(context.Background(), store)
 		if err != nil {
-			t.Fatalf("ReadRootManifest: %v", err)
+			t.Fatalf("lineage.ReadRootManifest: %v", err)
 		}
 		if m.ChainEncryption == nil || m.ChainEncryption.Argon2id == nil {
 			t.Fatalf("chain root missing Argon2id params; cannot rebind envelope")
@@ -120,9 +121,9 @@ func TestIncrementalAlignEncryption_PerChunkDecryptProbe_Bug117_Ingestion(t *tes
 
 	readRoot := func(t *testing.T, store irbackup.Store) *irbackup.Manifest {
 		t.Helper()
-		m, err := ReadRootManifest(context.Background(), store)
+		m, err := lineage.ReadRootManifest(context.Background(), store)
 		if err != nil {
-			t.Fatalf("ReadRootManifest: %v", err)
+			t.Fatalf("lineage.ReadRootManifest: %v", err)
 		}
 		return m
 	}
@@ -135,7 +136,7 @@ func TestIncrementalAlignEncryption_PerChunkDecryptProbe_Bug117_Ingestion(t *tes
 		readEnv := rebindForChain(t, store, "rotation-pass")
 		inc := &IncrementalBackup{
 			segStore:   store,
-			Encryption: &BackupEncryption{Envelope: readEnv, Mode: crypto.EncryptModePerChunk},
+			Encryption: &lineage.BackupEncryption{Envelope: readEnv, Mode: crypto.EncryptModePerChunk},
 		}
 		cek, err := inc.alignEncryption(context.Background(), parent)
 		if err != nil {
@@ -158,7 +159,7 @@ func TestIncrementalAlignEncryption_PerChunkDecryptProbe_Bug117_Ingestion(t *tes
 		wrong := rebindForChain(t, store, "ROTATED-pass")
 		inc := &IncrementalBackup{
 			segStore:   store,
-			Encryption: &BackupEncryption{Envelope: wrong, Mode: crypto.EncryptModePerChunk},
+			Encryption: &lineage.BackupEncryption{Envelope: wrong, Mode: crypto.EncryptModePerChunk},
 		}
 		_, err := inc.alignEncryption(context.Background(), parent)
 		if err == nil {
@@ -177,7 +178,7 @@ func TestIncrementalAlignEncryption_PerChunkDecryptProbe_Bug117_Ingestion(t *tes
 		readEnv := rebindForChain(t, store, "secret-pass")
 		inc := &IncrementalBackup{
 			segStore:   store,
-			Encryption: &BackupEncryption{Envelope: readEnv, Mode: crypto.EncryptModePerChain},
+			Encryption: &lineage.BackupEncryption{Envelope: readEnv, Mode: crypto.EncryptModePerChain},
 		}
 		cek, err := inc.alignEncryption(context.Background(), parent)
 		if err != nil {
@@ -196,7 +197,7 @@ func TestIncrementalAlignEncryption_PerChunkDecryptProbe_Bug117_Ingestion(t *tes
 		wrong := rebindForChain(t, store, "WRONG-pass")
 		inc := &IncrementalBackup{
 			segStore:   store,
-			Encryption: &BackupEncryption{Envelope: wrong, Mode: crypto.EncryptModePerChain},
+			Encryption: &lineage.BackupEncryption{Envelope: wrong, Mode: crypto.EncryptModePerChain},
 		}
 		_, err := inc.alignEncryption(context.Background(), parent)
 		if err == nil {

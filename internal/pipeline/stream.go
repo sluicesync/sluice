@@ -63,6 +63,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
@@ -86,11 +87,11 @@ const DefaultRolloverMaxChanges = 100_000
 const DefaultRolloverMaxBytes int64 = 64 << 20
 
 // DefaultStreamStateFilename is the path within the store the stream-
-// state liveness file is written to. Lives under [incrementalManifestPrefix]
+// state liveness file is written to. Lives under [lineage.IncrementalManifestPrefix]
 // so a single `List(manifests/)` call enumerates both manifests AND
 // the state file (callers that only want manifests filter on
 // `incr-` prefix).
-const DefaultStreamStateFilename = incrementalManifestPrefix + "stream_state.json"
+const DefaultStreamStateFilename = lineage.IncrementalManifestPrefix + "stream_state.json"
 
 // DefaultRolloverHookTimeout bounds how long the post-rollover hook is
 // allowed to run before the stream gives up and warns. 30 s matches
@@ -197,10 +198,10 @@ type BackupStream struct {
 	SluiceVersion string
 
 	// Encryption, when non-nil, encrypts every change chunk written
-	// during the stream's lifetime. See [BackupEncryption]. Aligns
+	// during the stream's lifetime. See [lineage.BackupEncryption]. Aligns
 	// against the parent's chain encryption at startup; mismatched
 	// shapes (encrypt mid-chain or vice versa) are refused there.
-	Encryption *BackupEncryption
+	Encryption *lineage.BackupEncryption
 
 	// RetryAttempts caps the number of consecutive retriable rollover
 	// failures the stream will absorb before giving up and returning
@@ -378,7 +379,7 @@ func (b *BackupStream) Run(ctx context.Context) error {
 	//    Dir + recorded codec (ADR-0046). For a never-rotated backup
 	//    that's the root (Dir == "") — byte-identical to the pre-ADR
 	//    single chain. Rotation repoints b.segStore / b.segCodec.
-	segStore, segCodec, err := openSegmentStore(ctx, b.Store, b.Codec)
+	segStore, segCodec, err := lineage.OpenSegmentStore(ctx, b.Store, b.Codec)
 	if err != nil {
 		return fmt.Errorf("stream: resolve open segment: %w", err)
 	}
@@ -392,7 +393,7 @@ func (b *BackupStream) Run(ctx context.Context) error {
 	//    resumed stream re-stitches off the on-disk tail while the catalog
 	//    keeps the head gap, and restore later refuses the segment as
 	//    mis-stitched. Best-effort + idempotent (retries next resume).
-	if rerr := reconcileOpenSegmentCatalog(ctx, b.Store, b.segStore); rerr != nil {
+	if rerr := lineage.ReconcileOpenSegmentCatalog(ctx, b.Store, b.segStore); rerr != nil {
 		slog.WarnContext(
 			ctx, "stream: open-segment catalog reconcile failed; continuing "+
 				"(a crash-orphaned incremental may keep restore refusing this segment until repaired)",
@@ -424,7 +425,7 @@ func (b *BackupStream) Run(ctx context.Context) error {
 	//    resume from the prior segment's EndPosition (P_N), exactly
 	//    reconstructing the creating session's post-COMMIT state (currentParent
 	//    = the segment's full, startPos = P_N): the first incremental then
-	//    starts at P_N, updateLineageForManifest stamps IncrementalCoverageStart
+	//    starts at P_N, lineage.UpdateLineageForManifest stamps IncrementalCoverageStart
 	//    = P_N, and the lineage becomes born-contiguous and compactable. The
 	//    (P_N, S] overlap re-applies idempotently on restore (ADR-0010 / the
 	//    snapshot->CDC handoff dedup). No skipThrough is needed: a fresh
@@ -565,7 +566,7 @@ func (b *BackupStream) Run(ctx context.Context) error {
 				if roll.Manifest != nil && len(roll.Manifest.ChangeChunks) > 0 {
 					commitCtx, commitCancel := context.WithTimeout(context.WithoutCancel(ctx), stopDrainTimeout)
 					manifestPath := buildIncrementalManifestPath(roll.Manifest)
-					if err := writeManifestAt(commitCtx, b.segStore, manifestPath, roll.Manifest); err != nil {
+					if err := lineage.WriteManifestAt(commitCtx, b.segStore, manifestPath, roll.Manifest); err != nil {
 						slog.WarnContext(
 							ctx, "stream: drain-commit of in-flight manifest failed",
 							slog.String("err", err.Error()),
@@ -573,7 +574,7 @@ func (b *BackupStream) Run(ctx context.Context) error {
 					} else {
 						// ADR-0046: append to the open segment in
 						// lineage.json on the drain-commit path too.
-						updateLineageForManifestBestEffort(commitCtx, b.Store, roll.Manifest, manifestPath, b.segCodec)
+						lineage.UpdateLineageForManifestBestEffort(commitCtx, b.Store, roll.Manifest, manifestPath, b.segCodec)
 						slog.InfoContext(
 							ctx, "stream rollover committed (drain on ctx-cancel)",
 							slog.String("manifest_path", manifestPath),
@@ -711,12 +712,12 @@ func (b *BackupStream) Run(ctx context.Context) error {
 		}
 
 		manifestPath := buildIncrementalManifestPath(roll.Manifest)
-		if err := writeManifestAt(ctx, b.segStore, manifestPath, roll.Manifest); err != nil {
+		if err := lineage.WriteManifestAt(ctx, b.segStore, manifestPath, roll.Manifest); err != nil {
 			return fmt.Errorf("stream: write rollover manifest: %w", err)
 		}
 		// ADR-0046: append this rollover to the open segment in
 		// lineage.json (best-effort for the non-rotation path).
-		updateLineageForManifestBestEffort(ctx, b.Store, roll.Manifest, manifestPath, b.segCodec)
+		lineage.UpdateLineageForManifestBestEffort(ctx, b.Store, roll.Manifest, manifestPath, b.segCodec)
 		// The rollover is durable — let the slot release its window's
 		// WAL (the chain-consumer ack holds everything else back; this
 		// is what bounds source WAL retention to ~one rollover window
@@ -895,7 +896,7 @@ func (b *BackupStream) validate() error {
 //
 // Returning P_N reconstructs the creating session's post-COMMIT state
 // (currentParent = the segment's full @ S, startPos = P_N): the first
-// incremental then begins at P_N, [updateLineageForManifest] stamps
+// incremental then begins at P_N, [lineage.UpdateLineageForManifest] stamps
 // IncrementalCoverageStart = P_N, and the lineage becomes
 // born-contiguous and compactable. The source still retains everything
 // after P_N because the slot's ack ceiling was only ever released
@@ -907,7 +908,7 @@ func (b *BackupStream) validate() error {
 // transient catalog read error returns ok=false (no heal) rather than
 // failing the chain extension.
 func rotationBoundaryResumeStart(ctx context.Context, store irbackup.Store, startPos ir.Position) (resumeStart, priorEnd ir.Position, ok bool) {
-	cat, found, err := loadLineageCatalog(ctx, store)
+	cat, found, err := lineage.LoadLineageCatalog(ctx, store)
 	if err != nil || !found || len(cat.Segments) < 2 {
 		return ir.Position{}, ir.Position{}, false
 	}
@@ -935,7 +936,7 @@ func rotationBoundaryResumeStart(ctx context.Context, store irbackup.Store, star
 func (b *BackupStream) resolveParent(ctx context.Context) (*irbackup.Manifest, string, error) {
 	// A stream chains off a manifest in the OPEN segment (b.segStore
 	// is already narrowed to its Dir).
-	manifests, err := listAllManifestsViaWalk(ctx, b.segStore)
+	manifests, err := lineage.ListAllManifestsViaWalk(ctx, b.segStore)
 	if err != nil {
 		return nil, "", err
 	}
@@ -944,17 +945,17 @@ func (b *BackupStream) resolveParent(ctx context.Context) (*irbackup.Manifest, s
 	}
 	if b.ParentRef != "" {
 		for _, m := range manifests {
-			id := m.manifest.BackupID
+			id := m.Manifest.BackupID
 			if id == "" {
-				id = irbackup.ComputeBackupID(m.manifest)
+				id = irbackup.ComputeBackupID(m.Manifest)
 			}
 			if id == b.ParentRef {
 				// Task #42 (ADR-0085): an in-progress parent (crashed
 				// full or window) cannot anchor a chain extension.
-				if err := refuseInProgressParent(m.manifest, m.path); err != nil {
+				if err := refuseInProgressParent(m.Manifest, m.Path); err != nil {
 					return nil, "", err
 				}
-				return m.manifest, m.path, nil
+				return m.Manifest, m.Path, nil
 			}
 		}
 		return nil, "", fmt.Errorf("parent backup %q not found in store; available: %s",
@@ -970,10 +971,10 @@ func (b *BackupStream) resolveParent(ctx context.Context) (*irbackup.Manifest, s
 	// off the second-to-last link and branch the lineage (ADR-0046
 	// crash-matrix `pre-commit-write` flake, v0.67.0).
 	tail := chainTailManifest(ctx, b.Store, manifests)
-	if err := refuseInProgressParent(tail.manifest, tail.path); err != nil {
+	if err := refuseInProgressParent(tail.Manifest, tail.Path); err != nil {
 		return nil, "", err
 	}
-	return tail.manifest, tail.path, nil
+	return tail.Manifest, tail.Path, nil
 }
 
 // rolloverOutcome bundles the multi-value result of a single rollover
@@ -1546,13 +1547,13 @@ func newShellCommand(ctx context.Context, cmdStr string) *exec.Cmd {
 // chain root's recorded shape, and returns the per-chain CEK (if any).
 //
 // Bug 43 (v0.22.1): the chain root's recorded Argon2id params are
-// passed to [BackupEncryption.rebindForChain] so the envelope's KEK
+// passed to [lineage.BackupEncryption.rebindForChain] so the envelope's KEK
 // derives against the chain's salt rather than the freshly-minted
 // salt the CLI started the run with. Without this rebind, the unwrap
 // of the parent's WrappedCEK fails with `aes-gcm open: cipher:
 // message authentication failed`.
 func (b *BackupStream) alignEncryption(ctx context.Context, parent *irbackup.Manifest) ([]byte, error) {
-	parentEnc := chainRootEncryption(ctx, b.segStore, parent)
+	parentEnc := lineage.ChainRootEncryption(ctx, b.segStore, parent)
 	switch {
 	case parentEnc == nil && b.Encryption == nil:
 		return nil, nil
@@ -1562,7 +1563,7 @@ func (b *BackupStream) alignEncryption(ctx context.Context, parent *irbackup.Man
 		return nil, fmt.Errorf("stream: parent chain is encrypted (algorithm=%q kek_mode=%q kek_ref=%q) but no --encrypt + key was supplied",
 			parentEnc.Algorithm, parentEnc.KEKMode, parentEnc.KEKRef)
 	}
-	if err := b.Encryption.rebindForChain(parentEnc.Argon2id); err != nil {
+	if err := b.Encryption.RebindForChain(parentEnc.Argon2id); err != nil {
 		return nil, fmt.Errorf("stream: rebuild envelope for chain: %w", err)
 	}
 	if b.Encryption.Envelope == nil {
@@ -1593,7 +1594,7 @@ func (b *BackupStream) alignEncryption(ctx context.Context, parent *irbackup.Man
 	// stream and incremental share the same risk shape on per-chunk
 	// rotation.
 	if probe := firstPerChunkProbe(parent); probe != nil {
-		if err := probeChunkDecrypt(b.Encryption.Envelope, probe); err != nil {
+		if err := lineage.ProbeChunkDecrypt(b.Encryption.Envelope, probe); err != nil {
 			return nil, fmt.Errorf("stream: %w", err)
 		}
 	}

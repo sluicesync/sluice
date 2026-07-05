@@ -34,6 +34,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -60,9 +61,9 @@ func newTestPassphraseEnvelope(t *testing.T, passphrase string) *crypto.Passphra
 // path's "read manifest, build envelope from recorded params" flow.
 func envelopeFromManifest(t *testing.T, store irbackup.Store, passphrase string) crypto.EnvelopeEncryption {
 	t.Helper()
-	root, err := ReadRootManifest(context.Background(), store)
+	root, err := lineage.ReadRootManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("ReadRootManifest: %v", err)
+		t.Fatalf("lineage.ReadRootManifest: %v", err)
 	}
 	if root == nil || root.ChainEncryption == nil || root.ChainEncryption.Argon2id == nil {
 		t.Fatalf("manifest missing ChainEncryption.Argon2id")
@@ -143,7 +144,7 @@ func TestBackup_PassphraseEncryption_RoundTrip(t *testing.T) {
 		SourceDSN:     sourceDSN,
 		Store:         store,
 		SluiceVersion: "v0.22.0-test",
-		Encryption: &BackupEncryption{
+		Encryption: &lineage.BackupEncryption{
 			Envelope: envBackup,
 			Mode:     crypto.EncryptModePerChain,
 		},
@@ -152,9 +153,9 @@ func TestBackup_PassphraseEncryption_RoundTrip(t *testing.T) {
 	}
 
 	// Manifest should carry encryption metadata.
-	root, err := readManifest(context.Background(), store)
+	root, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	if root.ChainEncryption == nil {
 		t.Fatal("ChainEncryption nil after encrypted backup")
@@ -240,7 +241,7 @@ func TestBackup_Encryption_WrongPassphrase(t *testing.T) {
 		Source:    pgEng,
 		SourceDSN: sourceDSN,
 		Store:     store,
-		Encryption: &BackupEncryption{
+		Encryption: &lineage.BackupEncryption{
 			Envelope: envBackup,
 			Mode:     crypto.EncryptModePerChain,
 		},
@@ -285,7 +286,7 @@ func TestBackup_Encryption_MissingKey(t *testing.T) {
 		Source:    pgEng,
 		SourceDSN: sourceDSN,
 		Store:     store,
-		Encryption: &BackupEncryption{
+		Encryption: &lineage.BackupEncryption{
 			Envelope: envBackup,
 			Mode:     crypto.EncryptModePerChain,
 		},
@@ -335,7 +336,7 @@ func TestBackup_Encryption_PerChunkMode(t *testing.T) {
 		SourceDSN: sourceDSN,
 		Store:     store,
 		ChunkRows: 1, // force multiple chunks
-		Encryption: &BackupEncryption{
+		Encryption: &lineage.BackupEncryption{
 			Envelope: envBackup,
 			Mode:     crypto.EncryptModePerChunk,
 		},
@@ -343,9 +344,9 @@ func TestBackup_Encryption_PerChunkMode(t *testing.T) {
 		t.Fatalf("Backup.Run: %v", err)
 	}
 
-	root, err := readManifest(context.Background(), store)
+	root, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	if root.ChainEncryption == nil {
 		t.Fatal("ChainEncryption nil")
@@ -422,9 +423,9 @@ func TestBackup_PlaintextBackwardCompat(t *testing.T) {
 		t.Fatalf("Backup.Run: %v", err)
 	}
 
-	root, err := readManifest(context.Background(), store)
+	root, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	if root.ChainEncryption != nil {
 		t.Errorf("plaintext backup: ChainEncryption should be nil; got %+v", root.ChainEncryption)
@@ -469,7 +470,7 @@ func TestBackupVerify_EncryptedChain_NoKey(t *testing.T) {
 		Source:    pgEng,
 		SourceDSN: sourceDSN,
 		Store:     store,
-		Encryption: &BackupEncryption{
+		Encryption: &lineage.BackupEncryption{
 			Envelope: env,
 			Mode:     crypto.EncryptModePerChain,
 		},
@@ -515,7 +516,7 @@ func TestBackup_Encryption_LocalStoreDir(t *testing.T) {
 		Source:    pgEng,
 		SourceDSN: sourceDSN,
 		Store:     store,
-		Encryption: &BackupEncryption{
+		Encryption: &lineage.BackupEncryption{
 			Envelope: env,
 			Mode:     crypto.EncryptModePerChain,
 		},
@@ -523,9 +524,9 @@ func TestBackup_Encryption_LocalStoreDir(t *testing.T) {
 		t.Fatalf("Backup.Run: %v", err)
 	}
 
-	root, err := readManifest(context.Background(), store)
+	root, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	for _, table := range root.Tables {
 		for _, c := range table.Chunks {

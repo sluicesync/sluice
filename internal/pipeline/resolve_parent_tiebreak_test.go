@@ -11,6 +11,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // TestResolveParent_CreatedAtTieDoesNotBranchChain pins the ADR-0046
@@ -22,7 +23,7 @@ import (
 // order — back-to-back small rollovers routinely share a millisecond.
 // The pre-fix `max(CreatedAt)` selection (strict `.After()`) returned
 // the SECOND-TO-LAST link on a tie, so the next incremental's
-// ParentBackupID pointed at the wrong link and buildLineageChain
+// ParentBackupID pointed at the wrong link and lineage.BuildLineageChain
 // correctly refused the branched lineage:
 //
 //	segment 0 incremental "…" parent "<incr1>" does not chain off
@@ -54,7 +55,7 @@ func TestResolveParent_CreatedAtTieDoesNotBranchChain(t *testing.T) {
 		PartialState:  irbackup.BackupStateComplete,
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("write full: %v", err)
 	}
 
@@ -91,26 +92,26 @@ func TestResolveParent_CreatedAtTieDoesNotBranchChain(t *testing.T) {
 	// Write in chain order; the manifest path encodes a strictly
 	// increasing unix-millis so List() returns them chain-ordered
 	// (incr-0001 = incr1, incr-0002 = incr2).
-	if err := writeManifestAt(context.Background(), store, "manifests/incr-0000000000001-aaaaaaaa.json", incr1); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, "manifests/incr-0000000000001-aaaaaaaa.json", incr1); err != nil {
 		t.Fatalf("write incr1: %v", err)
 	}
-	if err := writeManifestAt(context.Background(), store, "manifests/incr-0000000000002-bbbbbbbb.json", incr2); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, "manifests/incr-0000000000002-bbbbbbbb.json", incr2); err != nil {
 		t.Fatalf("write incr2: %v", err)
 	}
 
 	// Seed lineage.json in chain (append) order so an inconsistent
 	// resolveParent pick would branch it.
-	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, blobcodec.DefaultCodec)
-	updateLineageForManifestBestEffort(context.Background(), store, incr1, "manifests/incr-0000000000001-aaaaaaaa.json", blobcodec.DefaultCodec)
-	updateLineageForManifestBestEffort(context.Background(), store, incr2, "manifests/incr-0000000000002-bbbbbbbb.json", blobcodec.DefaultCodec)
+	lineage.UpdateLineageForManifestBestEffort(context.Background(), store, full, lineage.ManifestFileName, blobcodec.DefaultCodec)
+	lineage.UpdateLineageForManifestBestEffort(context.Background(), store, incr1, "manifests/incr-0000000000001-aaaaaaaa.json", blobcodec.DefaultCodec)
+	lineage.UpdateLineageForManifestBestEffort(context.Background(), store, incr2, "manifests/incr-0000000000002-bbbbbbbb.json", blobcodec.DefaultCodec)
 
 	src := &fakeCDCEngine{name: "postgres", schemaSequence: []*ir.Schema{schema}}
 
 	t.Run("BackupStream.resolveParent returns the chain tail", func(t *testing.T) {
 		b := &BackupStream{Source: src, SourceDSN: "x", Store: store}
-		seg, codec, err := openSegmentStore(context.Background(), store, b.Codec)
+		seg, codec, err := lineage.OpenSegmentStore(context.Background(), store, b.Codec)
 		if err != nil {
-			t.Fatalf("openSegmentStore: %v", err)
+			t.Fatalf("lineage.OpenSegmentStore: %v", err)
 		}
 		b.segStore, b.segCodec = seg, codec
 		got, _, err := b.resolveParent(context.Background())
@@ -127,9 +128,9 @@ func TestResolveParent_CreatedAtTieDoesNotBranchChain(t *testing.T) {
 
 	t.Run("IncrementalBackup.resolveParent returns the chain tail", func(t *testing.T) {
 		b := &IncrementalBackup{Source: src, SourceDSN: "x", Store: store}
-		seg, codec, err := openSegmentStore(context.Background(), store, b.Codec)
+		seg, codec, err := lineage.OpenSegmentStore(context.Background(), store, b.Codec)
 		if err != nil {
-			t.Fatalf("openSegmentStore: %v", err)
+			t.Fatalf("lineage.OpenSegmentStore: %v", err)
 		}
 		b.segStore, b.segCodec = seg, codec
 		got, _, err := b.resolveParent(context.Background())

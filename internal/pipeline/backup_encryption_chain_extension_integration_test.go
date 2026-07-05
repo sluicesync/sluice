@@ -15,7 +15,7 @@
 //
 // These tests pin the post-fix shape: a chain-extending writer
 // supplied with a passphrase + the chain's recorded Argon2id params
-// (via [BackupEncryption.RebuildForChain]) successfully extends the
+// (via [lineage.BackupEncryption.RebuildForChain]) successfully extends the
 // chain. Restore of the resulting chain lands every row from the
 // full + every change from the incremental.
 //
@@ -43,6 +43,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -117,7 +118,7 @@ func TestBackup_EncryptedChainExtension_Incremental_PG(t *testing.T) {
 		SourceDSN:     sourceDSN,
 		Store:         store,
 		SluiceVersion: "test-v0.22.1",
-		Encryption: &BackupEncryption{
+		Encryption: &lineage.BackupEncryption{
 			Envelope: envFull,
 			Mode:     crypto.EncryptModePerChain,
 		},
@@ -125,9 +126,9 @@ func TestBackup_EncryptedChainExtension_Incremental_PG(t *testing.T) {
 		t.Fatalf("Backup.Run (full): %v", err)
 	}
 
-	full, err := readManifest(context.Background(), store)
+	full, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	if full.ChainEncryption == nil || full.ChainEncryption.Argon2id == nil {
 		t.Fatal("full manifest missing ChainEncryption.Argon2id")
@@ -146,7 +147,7 @@ func TestBackup_EncryptedChainExtension_Incremental_PG(t *testing.T) {
 		Token:  fmt.Sprintf(`{"slot":"sluice_slot","lsn":%q}`, slotLSN),
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("rewrite full manifest: %v", err)
 	}
 
@@ -182,7 +183,7 @@ func TestBackup_EncryptedChainExtension_Incremental_PG(t *testing.T) {
 		MaxChanges:    20,
 		ChunkChanges:  10,
 		SluiceVersion: "test-v0.22.1",
-		Encryption: &BackupEncryption{
+		Encryption: &lineage.BackupEncryption{
 			Envelope:        envIncrColdStart,
 			RebuildForChain: passphraseRebuildHook(passphrase),
 			Mode:            crypto.EncryptModePerChain,
@@ -274,16 +275,16 @@ func TestBackup_EncryptedChainExtension_NoRebuildHook_Fails(t *testing.T) {
 		SourceDSN:     sourceDSN,
 		Store:         store,
 		SluiceVersion: "test-v0.22.1",
-		Encryption: &BackupEncryption{
+		Encryption: &lineage.BackupEncryption{
 			Envelope: envFull,
 			Mode:     crypto.EncryptModePerChain,
 		},
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run (full): %v", err)
 	}
-	full, err := readManifest(context.Background(), store)
+	full, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{
@@ -291,7 +292,7 @@ func TestBackup_EncryptedChainExtension_NoRebuildHook_Fails(t *testing.T) {
 		Token:  fmt.Sprintf(`{"slot":"sluice_slot","lsn":%q}`, slotLSN),
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("rewrite full manifest: %v", err)
 	}
 
@@ -314,7 +315,7 @@ func TestBackup_EncryptedChainExtension_NoRebuildHook_Fails(t *testing.T) {
 		MaxChanges:    5,
 		ChunkChanges:  5,
 		SluiceVersion: "test-v0.22.1",
-		Encryption: &BackupEncryption{
+		Encryption: &lineage.BackupEncryption{
 			Envelope: envCold,
 			// RebuildForChain intentionally nil — pin the
 			// pre-fix failure mode.

@@ -27,6 +27,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -81,9 +82,9 @@ func TestIncrementalBackup_PostgresChainRestore(t *testing.T) {
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
-	full, err := readManifest(context.Background(), store)
+	full, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{
@@ -91,7 +92,7 @@ func TestIncrementalBackup_PostgresChainRestore(t *testing.T) {
 		Token:  fmt.Sprintf(`{"slot":"sluice_slot","lsn":%q}`, slotLSN),
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("rewrite full manifest: %v", err)
 	}
 
@@ -127,17 +128,17 @@ func TestIncrementalBackup_PostgresChainRestore(t *testing.T) {
 	}
 
 	// 5. Verify the new manifest landed.
-	records, err := listAllManifestsViaWalk(context.Background(), store)
+	records, err := lineage.ListAllManifestsViaWalk(context.Background(), store)
 	if err != nil {
-		t.Fatalf("listAllManifestsViaWalk: %v", err)
+		t.Fatalf("lineage.ListAllManifestsViaWalk: %v", err)
 	}
 	if len(records) != 2 {
 		t.Fatalf("manifests = %d; want 2 (full + incremental)", len(records))
 	}
 	var incrMani *irbackup.Manifest
 	for _, r := range records {
-		if r.manifest.Kind == irbackup.BackupKindIncremental {
-			incrMani = r.manifest
+		if r.Manifest.Kind == irbackup.BackupKindIncremental {
+			incrMani = r.Manifest
 		}
 	}
 	if incrMani == nil {
@@ -220,14 +221,14 @@ func TestIncrementalBackup_PostgresChainRestore_SchemaEvolution(t *testing.T) {
 	if err := (&Backup{Source: pgEng, SourceDSN: sourceDSN, Store: store, SluiceVersion: "test"}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
-	full, _ := readManifest(context.Background(), store)
+	full, _ := lineage.ReadManifest(context.Background(), store)
 	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{
 		Engine: "postgres",
 		Token:  fmt.Sprintf(`{"slot":"sluice_slot","lsn":%q}`, slotLSN),
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("rewrite full: %v", err)
 	}
 
@@ -254,11 +255,11 @@ func TestIncrementalBackup_PostgresChainRestore_SchemaEvolution(t *testing.T) {
 	}
 
 	// Verify the manifest captured the schema delta.
-	records, _ := listAllManifestsViaWalk(context.Background(), store)
+	records, _ := lineage.ListAllManifestsViaWalk(context.Background(), store)
 	var incr *irbackup.Manifest
 	for _, r := range records {
-		if r.manifest.Kind == irbackup.BackupKindIncremental {
-			incr = r.manifest
+		if r.Manifest.Kind == irbackup.BackupKindIncremental {
+			incr = r.Manifest
 		}
 	}
 	if incr == nil {
@@ -357,9 +358,9 @@ func TestIncrementalBackup_PostgresChainRestore_TwoIncrementals(t *testing.T) {
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
-	full, err := readManifest(context.Background(), store)
+	full, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{
@@ -367,7 +368,7 @@ func TestIncrementalBackup_PostgresChainRestore_TwoIncrementals(t *testing.T) {
 		Token:  fmt.Sprintf(`{"slot":"sluice_slot","lsn":%q}`, slotLSN),
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("rewrite full manifest: %v", err)
 	}
 
@@ -399,14 +400,14 @@ func TestIncrementalBackup_PostgresChainRestore_TwoIncrementals(t *testing.T) {
 	}
 
 	// Inspect manifests.
-	records, err := listAllManifestsViaWalk(context.Background(), store)
+	records, err := lineage.ListAllManifestsViaWalk(context.Background(), store)
 	if err != nil {
-		t.Fatalf("listAllManifestsViaWalk: %v", err)
+		t.Fatalf("lineage.ListAllManifestsViaWalk: %v", err)
 	}
 	var incrs []*irbackup.Manifest
 	for _, r := range records {
-		if r.manifest.Kind == irbackup.BackupKindIncremental {
-			incrs = append(incrs, r.manifest)
+		if r.Manifest.Kind == irbackup.BackupKindIncremental {
+			incrs = append(incrs, r.Manifest)
 		}
 	}
 	if len(incrs) != 2 {
@@ -630,14 +631,14 @@ func TestIncrementalBackup_PostgresChainRestore_SchemaHistoryReplay(t *testing.T
 	if err := (&Backup{Source: pgEng, SourceDSN: sourceDSN, Store: store, SluiceVersion: "test"}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
-	full, _ := readManifest(context.Background(), store)
+	full, _ := lineage.ReadManifest(context.Background(), store)
 	full.Kind = irbackup.BackupKindFull
 	full.EndPosition = ir.Position{
 		Engine: "postgres",
 		Token:  fmt.Sprintf(`{"slot":"sluice_slot","lsn":%q}`, slotLSN),
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("rewrite full: %v", err)
 	}
 
@@ -667,11 +668,11 @@ func TestIncrementalBackup_PostgresChainRestore_SchemaHistoryReplay(t *testing.T
 
 	// The manifest must now carry SchemaHistory entries (ADR-0049
 	// Chunk D — supersedes the Chunk-B scope-fence skip).
-	records, _ := listAllManifestsViaWalk(context.Background(), store)
+	records, _ := lineage.ListAllManifestsViaWalk(context.Background(), store)
 	var incr *irbackup.Manifest
 	for _, r := range records {
-		if r.manifest.Kind == irbackup.BackupKindIncremental {
-			incr = r.manifest
+		if r.Manifest.Kind == irbackup.BackupKindIncremental {
+			incr = r.Manifest
 		}
 	}
 	if incr == nil {

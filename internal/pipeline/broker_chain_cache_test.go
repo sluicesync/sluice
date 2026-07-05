@@ -12,6 +12,7 @@ import (
 
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // countingGetStore counts every Get the broker chain code issues.
@@ -43,9 +44,9 @@ func seedLinearLineage(t *testing.T, store irbackup.Store, n int) []*irbackup.Ma
 		prev = m
 	}
 	seg := seedSegment(t, store, "", full, incrs, blobcodec.CodecGzip)
-	cat := &LineageCatalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []LineageSegment{seg}}
-	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
-		t.Fatalf("writeLineageCatalog: %v", err)
+	cat := &lineage.Catalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []lineage.Segment{seg}}
+	if err := lineage.WriteLineageCatalog(context.Background(), store, cat); err != nil {
+		t.Fatalf("lineage.WriteLineageCatalog: %v", err)
 	}
 	return manifests
 }
@@ -90,8 +91,8 @@ func TestBrokerChainCache_IdleTickGETsConstant(t *testing.T) {
 				if len(chain) != chainLinks {
 					t.Errorf("idle tick %d chain len = %d; want %d", tick, len(chain), chainLinks)
 				}
-				wantTail := manifestBackupID(manifests[len(manifests)-1])
-				if got := manifestBackupID(chain[len(chain)-1].manifest); got != wantTail {
+				wantTail := lineage.ManifestBackupID(manifests[len(manifests)-1])
+				if got := lineage.ManifestBackupID(chain[len(chain)-1].Manifest); got != wantTail {
 					t.Errorf("idle tick %d tail = %s; want %s", tick, got, wantTail)
 				}
 			}
@@ -119,8 +120,8 @@ func TestBrokerChainCache_AppendInvalidates(t *testing.T) {
 	next := makeManifest(t, irbackup.BackupKindIncremental, tail, "0/900")
 	const nextPath = "manifests/incr-0003.json"
 	mustWriteManifest(t, mem, nextPath, next)
-	if err := updateLineageForManifest(ctx, mem, next, nextPath, blobcodec.CodecGzip); err != nil {
-		t.Fatalf("updateLineageForManifest: %v", err)
+	if err := lineage.UpdateLineageForManifest(ctx, mem, next, nextPath, blobcodec.CodecGzip); err != nil {
+		t.Fatalf("lineage.UpdateLineageForManifest: %v", err)
 	}
 
 	chain, err := cache.get(ctx, mem)
@@ -130,8 +131,8 @@ func TestBrokerChainCache_AppendInvalidates(t *testing.T) {
 	if len(chain) != 4 {
 		t.Fatalf("post-append chain len = %d; want 4", len(chain))
 	}
-	if got := manifestBackupID(chain[3].manifest); got != manifestBackupID(next) {
-		t.Errorf("post-append tail = %s; want the appended incremental %s", got, manifestBackupID(next))
+	if got := lineage.ManifestBackupID(chain[3].Manifest); got != lineage.ManifestBackupID(next) {
+		t.Errorf("post-append tail = %s; want the appended incremental %s", got, lineage.ManifestBackupID(next))
 	}
 }
 
@@ -151,7 +152,7 @@ func TestBrokerChainCache_TailCheckpointRewriteInvalidates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("warm get: %v", err)
 	}
-	if got := len(chain[2].manifest.ChangeChunks); got != 0 {
+	if got := len(chain[2].Manifest.ChangeChunks); got != 0 {
 		t.Fatalf("pre-checkpoint tail chunks = %d; want 0", got)
 	}
 
@@ -166,7 +167,7 @@ func TestBrokerChainCache_TailCheckpointRewriteInvalidates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("post-checkpoint get: %v", err)
 	}
-	if got := len(chain[2].manifest.ChangeChunks); got != 1 {
+	if got := len(chain[2].Manifest.ChangeChunks); got != 1 {
 		t.Errorf("post-checkpoint tail chunks = %d; want 1 (stale cached chain served)", got)
 	}
 }
@@ -180,8 +181,8 @@ func TestBrokerChainCache_RotationInvalidates(t *testing.T) {
 	f0 := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
 	i0 := makeManifest(t, irbackup.BackupKindIncremental, f0, "0/200")
 	s0 := seedSegment(t, mem, "", f0, []*irbackup.Manifest{i0}, blobcodec.CodecGzip)
-	cat := &LineageCatalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []LineageSegment{s0}}
-	if err := writeLineageCatalog(ctx, mem, cat); err != nil {
+	cat := &lineage.Catalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []lineage.Segment{s0}}
+	if err := lineage.WriteLineageCatalog(ctx, mem, cat); err != nil {
 		t.Fatal(err)
 	}
 	var cache brokerChainCache
@@ -201,8 +202,8 @@ func TestBrokerChainCache_RotationInvalidates(t *testing.T) {
 	s1 := seedSegment(t, mem, "seg-1", f1, nil, blobcodec.CodecZstd)
 	capt := time.Now().UTC()
 	s0.CappedAt, s0.CapReason = &capt, rotationReasonAge
-	cat.Segments = []LineageSegment{s0, s1}
-	if err := writeLineageCatalog(ctx, mem, cat); err != nil {
+	cat.Segments = []lineage.Segment{s0, s1}
+	if err := lineage.WriteLineageCatalog(ctx, mem, cat); err != nil {
 		t.Fatal(err)
 	}
 
@@ -213,8 +214,8 @@ func TestBrokerChainCache_RotationInvalidates(t *testing.T) {
 	if len(chain) != 3 {
 		t.Fatalf("post-rotation chain len = %d; want 3 (f0,i0,f1)", len(chain))
 	}
-	if got := manifestBackupID(chain[2].manifest); got != manifestBackupID(f1) {
-		t.Errorf("post-rotation tail = %s; want the new segment full %s", got, manifestBackupID(f1))
+	if got := lineage.ManifestBackupID(chain[2].Manifest); got != lineage.ManifestBackupID(f1) {
+		t.Errorf("post-rotation tail = %s; want the new segment full %s", got, lineage.ManifestBackupID(f1))
 	}
 }
 
@@ -235,8 +236,8 @@ func TestBrokerChainCache_PruneFloorAdvanceInvalidates(t *testing.T) {
 	s1 := seedSegment(t, mem, "seg-1", f1, []*irbackup.Manifest{i1}, blobcodec.CodecZstd)
 	capt := time.Now().UTC()
 	s0.CappedAt, s0.CapReason = &capt, rotationReasonAge
-	cat := &LineageCatalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []LineageSegment{s0, s1}}
-	if err := writeLineageCatalog(ctx, mem, cat); err != nil {
+	cat := &lineage.Catalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []lineage.Segment{s0, s1}}
+	if err := lineage.WriteLineageCatalog(ctx, mem, cat); err != nil {
 		t.Fatal(err)
 	}
 	var cache brokerChainCache
@@ -249,7 +250,7 @@ func TestBrokerChainCache_PruneFloorAdvanceInvalidates(t *testing.T) {
 	}
 
 	cat.RestorableFromSegment = 1
-	if err := writeLineageCatalog(ctx, mem, cat); err != nil {
+	if err := lineage.WriteLineageCatalog(ctx, mem, cat); err != nil {
 		t.Fatal(err)
 	}
 	chain, err = cache.get(ctx, mem)
@@ -259,8 +260,8 @@ func TestBrokerChainCache_PruneFloorAdvanceInvalidates(t *testing.T) {
 	if len(chain) != 2 {
 		t.Fatalf("post-prune chain len = %d; want 2 (f1,i1 only)", len(chain))
 	}
-	if got := manifestBackupID(chain[0].manifest); got != manifestBackupID(f1) {
-		t.Errorf("post-prune head = %s; want segment-1 full %s", got, manifestBackupID(f1))
+	if got := lineage.ManifestBackupID(chain[0].Manifest); got != lineage.ManifestBackupID(f1) {
+		t.Errorf("post-prune head = %s; want segment-1 full %s", got, lineage.ManifestBackupID(f1))
 	}
 }
 
@@ -272,7 +273,7 @@ func TestBrokerChainCache_LegacyCatalogAbsentBypassesCache(t *testing.T) {
 	ctx := context.Background()
 	mem := newMemStore()
 	full := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
-	mustWriteManifest(t, mem, ManifestFileName, full)
+	mustWriteManifest(t, mem, lineage.ManifestFileName, full)
 	i0 := makeManifest(t, irbackup.BackupKindIncremental, full, "0/200")
 	mustWriteManifest(t, mem, "manifests/incr-0001.json", i0)
 
@@ -302,7 +303,7 @@ func TestBrokerChainCache_LegacyCatalogAbsentBypassesCache(t *testing.T) {
 }
 
 // TestBrokerChainCache_CorruptCatalogIsLoudNotStale: once the catalog
-// turns unreadable, get must surface buildLineageChain's loud refusal
+// turns unreadable, get must surface lineage.BuildLineageChain's loud refusal
 // — serving the previously-cached chain would mask DR-data corruption
 // behind a healthy-looking broker.
 func TestBrokerChainCache_CorruptCatalogIsLoudNotStale(t *testing.T) {
@@ -314,7 +315,7 @@ func TestBrokerChainCache_CorruptCatalogIsLoudNotStale(t *testing.T) {
 		t.Fatalf("warm get: %v", err)
 	}
 
-	mem.data[LineageCatalogFileName] = []byte("{not json")
+	mem.data[lineage.LineageCatalogFileName] = []byte("{not json")
 	if _, err := cache.get(ctx, mem); err == nil {
 		t.Fatal("get after catalog corruption returned nil error; want the loud lineage refusal, never the stale cached chain")
 	}

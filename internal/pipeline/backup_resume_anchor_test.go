@@ -35,6 +35,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // keyedTable builds a one-PK-column table descriptor; anchored resumes
@@ -111,9 +112,9 @@ func TestBackup_InProgressManifestCarriesAnchor(t *testing.T) {
 	}
 	crashAfterFirstTable(t, store, newAnchorTestEngine(schema, rows, anchorPosA1), false)
 
-	m, err := readManifest(context.Background(), store)
+	m, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	if m.PartialState != irbackup.BackupStateInProgress {
 		t.Fatalf("PartialState = %q; want in_progress", m.PartialState)
@@ -143,9 +144,9 @@ func TestBackup_ResumeAdoptsPriorAnchor(t *testing.T) {
 	}
 	crashAfterFirstTable(t, store, newAnchorTestEngine(schema, rows, anchorPosA1), false)
 	usersSHA := func() string {
-		m, err := readManifest(context.Background(), store)
+		m, err := lineage.ReadManifest(context.Background(), store)
 		if err != nil {
-			t.Fatalf("readManifest: %v", err)
+			t.Fatalf("lineage.ReadManifest: %v", err)
 		}
 		return m.Tables[0].Chunks[0].SHA256
 	}()
@@ -160,9 +161,9 @@ func TestBackup_ResumeAdoptsPriorAnchor(t *testing.T) {
 		t.Fatalf("resume Run: %v", err)
 	}
 
-	final, err := readManifest(context.Background(), store)
+	final, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest final: %v", err)
+		t.Fatalf("lineage.ReadManifest final: %v", err)
 	}
 	if final.PartialState != irbackup.BackupStateComplete {
 		t.Errorf("PartialState = %q; want complete", final.PartialState)
@@ -231,13 +232,13 @@ func TestBackup_ResumeWithoutPriorAnchorRestreamsEverything(t *testing.T) {
 
 	// Forge the pre-fix shape: strip the anchor from the crashed
 	// manifest (pre-fix binaries never stamped it while in progress).
-	m, err := readManifest(context.Background(), store)
+	m, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	m.EndPosition = ir.Position{}
-	if err := writeManifest(context.Background(), store, m); err != nil {
-		t.Fatalf("writeManifest (anchor stripped): %v", err)
+	if err := lineage.WriteManifest(context.Background(), store, m); err != nil {
+		t.Fatalf("lineage.WriteManifest (anchor stripped): %v", err)
 	}
 
 	src2 := newAnchorTestEngine(schema, rows, anchorPosA2)
@@ -253,9 +254,9 @@ func TestBackup_ResumeWithoutPriorAnchorRestreamsEverything(t *testing.T) {
 	if counting.reads["users"] != 1 || counting.reads["posts"] != 1 {
 		t.Errorf("re-stream reads = %v; want users and posts both read once (no kept tables without a prior anchor)", counting.reads)
 	}
-	final, err := readManifest(context.Background(), store)
+	final, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest final: %v", err)
+		t.Fatalf("lineage.ReadManifest final: %v", err)
 	}
 	// Nothing to adopt → this run's anchor is recorded.
 	if final.EndPosition != anchorPosA2 {
@@ -320,9 +321,9 @@ func TestBackup_AnchoredResumeRefusesKeylessRestream(t *testing.T) {
 		if err := b2.Run(context.Background()); err != nil {
 			t.Fatalf("resume Run: %v (kept keyless tables are exact at the anchor — must not refuse)", err)
 		}
-		final, err := readManifest(context.Background(), store)
+		final, err := lineage.ReadManifest(context.Background(), store)
 		if err != nil {
-			t.Fatalf("readManifest: %v", err)
+			t.Fatalf("lineage.ReadManifest: %v", err)
 		}
 		if final.EndPosition != anchorPosA1 {
 			t.Errorf("final EndPosition = %+v; want adopted %+v", final.EndPosition, anchorPosA1)
@@ -395,9 +396,9 @@ func TestBackup_ForceOverwriteDiscardsInProgressPrior(t *testing.T) {
 	if counting.reads["users"] != 1 || counting.reads["posts"] != 1 {
 		t.Errorf("re-stream reads = %v; want both tables read (fresh start)", counting.reads)
 	}
-	final, err := readManifest(context.Background(), store)
+	final, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	if final.EndPosition != anchorPosA2 {
 		t.Errorf("final EndPosition = %+v; want this fresh run's anchor %+v (nothing adopted)", final.EndPosition, anchorPosA2)
@@ -467,9 +468,9 @@ func TestBackup_ChainSlotResumeAdoptsSlot(t *testing.T) {
 	if src2.commitCalls != 0 {
 		t.Errorf("resume CommitFn calls = %d; want 0 (nothing to persist on the temporary-anchor shape)", src2.commitCalls)
 	}
-	final, err := readManifest(context.Background(), store)
+	final, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	if final.EndPosition != anchorPosA1 {
 		t.Errorf("final EndPosition = %+v; want adopted %+v", final.EndPosition, anchorPosA1)

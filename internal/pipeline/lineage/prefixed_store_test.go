@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package pipeline
+package lineage
 
 import (
 	"context"
@@ -16,7 +16,7 @@ import (
 // on List() so callers see relative paths.
 func TestPrefixedStore_RoundTrip(t *testing.T) {
 	inner := newMemStore()
-	wrapped := newPrefixedStore(inner, "rotated-1")
+	wrapped := NewPrefixedStore(inner, "rotated-1")
 
 	if err := wrapped.Put(context.Background(), "manifest.json", strings.NewReader("hello")); err != nil {
 		t.Fatalf("Put: %v", err)
@@ -54,10 +54,10 @@ func TestPrefixedStore_EmptyPrefixDegenerates(t *testing.T) {
 	inner := newMemStore()
 	cases := []string{"", "/", ".", "//", "./"}
 	for _, p := range cases {
-		got := newPrefixedStore(inner, p)
+		got := NewPrefixedStore(inner, p)
 		//nolint:errorlint // identity comparison is the assertion
 		if got != inner {
-			t.Errorf("newPrefixedStore(_, %q) returned a wrapper; want inner unchanged", p)
+			t.Errorf("NewPrefixedStore(_, %q) returned a wrapper; want inner unchanged", p)
 		}
 	}
 }
@@ -66,7 +66,7 @@ func TestPrefixedStore_EmptyPrefixDegenerates(t *testing.T) {
 // when the inner store returns paths that include sub-prefixes.
 func TestPrefixedStore_NestedList(t *testing.T) {
 	inner := newMemStore()
-	wrapped := newPrefixedStore(inner, "rotated-1")
+	wrapped := NewPrefixedStore(inner, "rotated-1")
 	for _, p := range []string{"manifests/incr-1.json", "manifests/incr-2.json", "chunks/users/0.gz"} {
 		_ = wrapped.Put(context.Background(), p, strings.NewReader("data"))
 	}

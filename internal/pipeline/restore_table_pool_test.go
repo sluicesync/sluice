@@ -20,6 +20,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
@@ -86,9 +87,9 @@ func restorePoolFixture(t *testing.T, names []string) (*Restore, []restoreTableT
 	if err := (&Backup{Source: src, SourceDSN: "src", Store: store}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
-	manifest, err := readManifest(context.Background(), store)
+	manifest, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	r := &Restore{Target: stubEngine{}, TargetDSN: "dsn", Store: store}
 	r.segCodec, err = r.rootSegmentCodec(context.Background())

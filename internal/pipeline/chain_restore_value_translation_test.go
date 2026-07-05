@@ -31,6 +31,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // writeOneChangeChunk encodes the supplied changes into a change
@@ -89,7 +90,7 @@ func TestChainRestore_CrossEngine_UUIDValuePreserved(t *testing.T) {
 		EndPosition:   pos,
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("write full: %v", err)
 	}
 
@@ -118,7 +119,7 @@ func TestChainRestore_CrossEngine_UUIDValuePreserved(t *testing.T) {
 		}},
 	}
 	incr.BackupID = irbackup.ComputeBackupID(incr)
-	if err := writeManifestAt(context.Background(), store, "manifests/incr-0001.json", incr); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, "manifests/incr-0001.json", incr); err != nil {
 		t.Fatalf("write incr: %v", err)
 	}
 
@@ -168,7 +169,7 @@ func TestChainRestore_CrossEngine_JSONbytesPreserved(t *testing.T) {
 		Schema: schema, EndPosition: pos,
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("write full: %v", err)
 	}
 
@@ -189,7 +190,7 @@ func TestChainRestore_CrossEngine_JSONbytesPreserved(t *testing.T) {
 		}},
 	}
 	incr.BackupID = irbackup.ComputeBackupID(incr)
-	if err := writeManifestAt(context.Background(), store, "manifests/incr-0001.json", incr); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, "manifests/incr-0001.json", incr); err != nil {
 		t.Fatalf("write incr: %v", err)
 	}
 
@@ -239,7 +240,7 @@ func TestChainRestore_CrossEngine_TimestampPreserved(t *testing.T) {
 		Schema: schema, EndPosition: pos,
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("write full: %v", err)
 	}
 
@@ -260,7 +261,7 @@ func TestChainRestore_CrossEngine_TimestampPreserved(t *testing.T) {
 		}},
 	}
 	incr.BackupID = irbackup.ComputeBackupID(incr)
-	if err := writeManifestAt(context.Background(), store, "manifests/incr-0001.json", incr); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, "manifests/incr-0001.json", incr); err != nil {
 		t.Fatalf("write incr: %v", err)
 	}
 
@@ -307,7 +308,7 @@ func TestChainRestore_CrossEngine_BoolValuePreserved(t *testing.T) {
 		Schema: schema, EndPosition: pos,
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("write full: %v", err)
 	}
 
@@ -331,7 +332,7 @@ func TestChainRestore_CrossEngine_BoolValuePreserved(t *testing.T) {
 		}},
 	}
 	incr.BackupID = irbackup.ComputeBackupID(incr)
-	if err := writeManifestAt(context.Background(), store, "manifests/incr-0001.json", incr); err != nil {
+	if err := lineage.WriteManifestAt(context.Background(), store, "manifests/incr-0001.json", incr); err != nil {
 		t.Fatalf("write incr: %v", err)
 	}
 

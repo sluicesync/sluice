@@ -20,6 +20,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // schemaDeltaRecorderEngine: an [ir.Engine] whose schema writer
@@ -133,9 +134,9 @@ func TestApplySchemaDeltas_CrossEngine_AddColumnUUIDtoChar36(t *testing.T) {
 	cr := &ChainRestore{
 		Target: tgt, TargetDSN: "tgt", Store: &blobcodec.LocalStore{},
 	}
-	link := &segmentRecord{segment: &LineageSegment{Codec: blobcodec.CodecGzip}, manifestRecord: manifestRecord{
-		path: "manifests/incr-0001.json",
-		manifest: &irbackup.Manifest{
+	link := &lineage.SegmentRecord{Segment: &lineage.Segment{Codec: blobcodec.CodecGzip}, ManifestRecord: lineage.ManifestRecord{
+		Path: "manifests/incr-0001.json",
+		Manifest: &irbackup.Manifest{
 			BackupID:     "incr-0001",
 			SourceEngine: "postgres",
 			Kind:         irbackup.BackupKindIncremental,
@@ -181,9 +182,9 @@ func TestApplySchemaDeltas_CrossEngine_AddColumnUUIDtoChar36(t *testing.T) {
 func TestApplySchemaDeltas_SameEngine_NoRetarget_TINYINTpassthrough(t *testing.T) {
 	tgt := newSchemaDeltaRecorderEngine("mysql")
 	cr := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: &blobcodec.LocalStore{}}
-	link := &segmentRecord{segment: &LineageSegment{Codec: blobcodec.CodecGzip}, manifestRecord: manifestRecord{
-		path: "manifests/incr-0001.json",
-		manifest: &irbackup.Manifest{
+	link := &lineage.SegmentRecord{Segment: &lineage.Segment{Codec: blobcodec.CodecGzip}, ManifestRecord: lineage.ManifestRecord{
+		Path: "manifests/incr-0001.json",
+		Manifest: &irbackup.Manifest{
 			BackupID:     "incr-0001",
 			SourceEngine: "mysql",
 			Kind:         irbackup.BackupKindIncremental,
@@ -231,9 +232,9 @@ func TestApplySchemaDeltas_SameEngine_NoRetarget_TINYINTpassthrough(t *testing.T
 func TestApplySchemaDeltas_CrossEngine_AddTableUUID_RetargetsCol(t *testing.T) {
 	tgt := newSchemaDeltaRecorderEngine("mysql")
 	cr := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: &blobcodec.LocalStore{}}
-	link := &segmentRecord{segment: &LineageSegment{Codec: blobcodec.CodecGzip}, manifestRecord: manifestRecord{
-		path: "manifests/incr-0001.json",
-		manifest: &irbackup.Manifest{
+	link := &lineage.SegmentRecord{Segment: &lineage.Segment{Codec: blobcodec.CodecGzip}, ManifestRecord: lineage.ManifestRecord{
+		Path: "manifests/incr-0001.json",
+		Manifest: &irbackup.Manifest{
 			BackupID:     "incr-0001",
 			SourceEngine: "postgres",
 			Kind:         irbackup.BackupKindIncremental,
@@ -276,9 +277,9 @@ func TestApplySchemaDeltas_AlterAddColumnError_Propagates(t *testing.T) {
 		err:                       want,
 	}
 	cr := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: &blobcodec.LocalStore{}}
-	link := &segmentRecord{segment: &LineageSegment{Codec: blobcodec.CodecGzip}, manifestRecord: manifestRecord{
-		path: "manifests/incr-0001.json",
-		manifest: &irbackup.Manifest{
+	link := &lineage.SegmentRecord{Segment: &lineage.Segment{Codec: blobcodec.CodecGzip}, ManifestRecord: lineage.ManifestRecord{
+		Path: "manifests/incr-0001.json",
+		Manifest: &irbackup.Manifest{
 			BackupID:     "incr-0001",
 			SourceEngine: "postgres",
 			Kind:         irbackup.BackupKindIncremental,

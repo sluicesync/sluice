@@ -10,30 +10,31 @@ import (
 
 	"sluicesync.dev/sluice/internal/crypto"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // TestBackupEncryption_RebindForChain_NilSafe exercises the safe
-// no-ops in [BackupEncryption.rebindForChain]: nil receiver, nil
+// no-ops in [lineage.BackupEncryption.rebindForChain]: nil receiver, nil
 // parent params, and missing builder fall through without error.
 func TestBackupEncryption_RebindForChain_NilSafe(t *testing.T) {
-	var nilEnc *BackupEncryption
-	if err := nilEnc.rebindForChain(&irbackup.Argon2idParams{}); err != nil {
+	var nilEnc *lineage.BackupEncryption
+	if err := nilEnc.RebindForChain(&irbackup.Argon2idParams{}); err != nil {
 		t.Errorf("nil receiver: unexpected error: %v", err)
 	}
 
-	encNoBuilder := &BackupEncryption{}
-	if err := encNoBuilder.rebindForChain(&irbackup.Argon2idParams{Salt: []byte("x")}); err != nil {
+	encNoBuilder := &lineage.BackupEncryption{}
+	if err := encNoBuilder.RebindForChain(&irbackup.Argon2idParams{Salt: []byte("x")}); err != nil {
 		t.Errorf("no builder: unexpected error: %v", err)
 	}
 
 	calls := 0
-	encWithBuilder := &BackupEncryption{
+	encWithBuilder := &lineage.BackupEncryption{
 		RebuildForChain: func(_ *irbackup.Argon2idParams) (crypto.EnvelopeEncryption, error) {
 			calls++
 			return nil, nil
 		},
 	}
-	if err := encWithBuilder.rebindForChain(nil); err != nil {
+	if err := encWithBuilder.RebindForChain(nil); err != nil {
 		t.Errorf("nil params: unexpected error: %v", err)
 	}
 	if calls != 0 {
@@ -67,7 +68,7 @@ func TestBackupEncryption_RebindForChain_SwapsEnvelope(t *testing.T) {
 		t.Fatalf("chain envelope: %v", err)
 	}
 
-	enc := &BackupEncryption{
+	enc := &lineage.BackupEncryption{
 		Envelope: coldEnv,
 		RebuildForChain: func(p *irbackup.Argon2idParams) (crypto.EnvelopeEncryption, error) {
 			if p == nil {
@@ -83,7 +84,7 @@ func TestBackupEncryption_RebindForChain_SwapsEnvelope(t *testing.T) {
 		Parallelism: chainParams.Parallelism,
 		KeyLen:      chainParams.KeyLen,
 	}
-	if err := enc.rebindForChain(parentParams); err != nil {
+	if err := enc.RebindForChain(parentParams); err != nil {
 		t.Fatalf("rebindForChain: %v", err)
 	}
 	if enc.Envelope != chainEnv {
@@ -137,7 +138,7 @@ func TestBackupEncryption_RebindForChain_EnablesUnwrap(t *testing.T) {
 	// Step 3: route the fresh envelope through rebindForChain with
 	// the chain's recorded params. Post-rebind, the Envelope must
 	// unwrap cleanly and recover the original CEK.
-	enc := &BackupEncryption{
+	enc := &lineage.BackupEncryption{
 		Envelope: freshEnv,
 		RebuildForChain: func(p *irbackup.Argon2idParams) (crypto.EnvelopeEncryption, error) {
 			params := crypto.Argon2idParams{
@@ -157,7 +158,7 @@ func TestBackupEncryption_RebindForChain_EnablesUnwrap(t *testing.T) {
 		Parallelism: chainParams.Parallelism,
 		KeyLen:      chainParams.KeyLen,
 	}
-	if err := enc.rebindForChain(recordedParams); err != nil {
+	if err := enc.RebindForChain(recordedParams); err != nil {
 		t.Fatalf("rebindForChain: %v", err)
 	}
 	got, err := enc.Envelope.UnwrapCEK(wrapped)
@@ -174,12 +175,12 @@ func TestBackupEncryption_RebindForChain_EnablesUnwrap(t *testing.T) {
 // shape" edge cases (e.g. KeyLen mismatch in the recorded params).
 func TestBackupEncryption_RebindForChain_BuilderError(t *testing.T) {
 	sentinel := errors.New("wrong passphrase shape")
-	enc := &BackupEncryption{
+	enc := &lineage.BackupEncryption{
 		RebuildForChain: func(_ *irbackup.Argon2idParams) (crypto.EnvelopeEncryption, error) {
 			return nil, sentinel
 		},
 	}
-	err := enc.rebindForChain(&irbackup.Argon2idParams{Salt: []byte("x")})
+	err := enc.RebindForChain(&irbackup.Argon2idParams{Salt: []byte("x")})
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("rebindForChain: got %v; want %v", err, sentinel)
 	}

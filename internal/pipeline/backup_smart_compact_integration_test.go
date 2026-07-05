@@ -30,6 +30,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -161,7 +162,7 @@ func TestADR0064_SmartCompaction_CollapsesUpdateChain_PG(t *testing.T) {
 			reduction)
 	}
 
-	cat, _, _ := loadLineageCatalog(context.Background(), store)
+	cat, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 	if len(cat.Segments) == 0 {
 		t.Fatal("post-compact catalog has no segments")
 	}

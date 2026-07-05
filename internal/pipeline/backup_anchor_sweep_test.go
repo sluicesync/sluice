@@ -19,6 +19,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // sweepingBackupEngine layers [irbackup.AnchorSweeper] onto the
@@ -62,8 +63,8 @@ func writeInProgressManifest(t *testing.T, store irbackup.Store, schema *ir.Sche
 		Schema:        schema,
 		PartialState:  irbackup.BackupStateInProgress,
 	}
-	if err := writeManifest(context.Background(), store, partial); err != nil {
-		t.Fatalf("writeManifest partial: %v", err)
+	if err := lineage.WriteManifest(context.Background(), store, partial); err != nil {
+		t.Fatalf("lineage.WriteManifest partial: %v", err)
 	}
 }
 
@@ -137,9 +138,9 @@ func TestBackup_ResumeSweepFailureDoesNotFailRun(t *testing.T) {
 	if src.sweepCalls != 1 {
 		t.Errorf("sweepCalls = %d; want 1", src.sweepCalls)
 	}
-	final, err := readManifest(context.Background(), store)
+	final, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	if final.PartialState != irbackup.BackupStateComplete {
 		t.Errorf("PartialState = %q; want complete", final.PartialState)

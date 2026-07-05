@@ -12,6 +12,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // backupRecorderEngine is a fake [ir.Engine] tailored to backup tests:
@@ -142,9 +143,9 @@ func TestBackup_RoundTrip_SingleTable(t *testing.T) {
 		t.Fatalf("Backup.Run: %v", err)
 	}
 
-	manifest, err := readManifest(context.Background(), store)
+	manifest, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	if manifest.SourceEngine != "postgres" {
 		t.Errorf("SourceEngine = %q; want postgres", manifest.SourceEngine)
@@ -198,9 +199,9 @@ func TestBackup_EmptyTableProducesNoChunks(t *testing.T) {
 	if err := b.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	m, err := readManifest(context.Background(), store)
+	m, err := lineage.ReadManifest(context.Background(), store)
 	if err != nil {
-		t.Fatalf("readManifest: %v", err)
+		t.Fatalf("lineage.ReadManifest: %v", err)
 	}
 	if len(m.Tables) != 1 {
 		t.Fatalf("Tables len = %d", len(m.Tables))
@@ -233,7 +234,7 @@ func TestBackup_FilterPrunesTables(t *testing.T) {
 	if err := b.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	m, _ := readManifest(context.Background(), store)
+	m, _ := lineage.ReadManifest(context.Background(), store)
 	if len(m.Tables) != 1 || m.Tables[0].Name != "users" {
 		t.Errorf("filter not applied: tables = %+v", m.Tables)
 	}

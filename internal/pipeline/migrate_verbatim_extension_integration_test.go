@@ -38,6 +38,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -316,9 +317,9 @@ func TestBackupRestore_PG_Verbatim_Ltree_MarkerAndExactRestore(t *testing.T) {
 	}
 
 	// 2. The lineage segment recorded the PG-restore-only marker.
-	cat, err := resolveLineage(ctx, store)
+	cat, err := lineage.ResolveLineage(ctx, store)
 	if err != nil {
-		t.Fatalf("resolveLineage: %v", err)
+		t.Fatalf("lineage.ResolveLineage: %v", err)
 	}
 	if len(cat.Segments) != 1 {
 		t.Fatalf("segments = %d; want 1", len(cat.Segments))

@@ -14,6 +14,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
 // TestCompactChain_SmartCompaction_CollapsesAcrossGroup pins the
@@ -56,7 +57,7 @@ func TestCompactChain_SmartCompaction_CollapsesAcrossGroup(t *testing.T) {
 	}
 
 	// Re-load the catalog and verify the merged segment exists.
-	cat, _, _ := loadLineageCatalog(context.Background(), store)
+	cat, _, _ := lineage.LoadLineageCatalog(context.Background(), store)
 	if len(cat.Segments) != 1 {
 		t.Fatalf("post-compact segments = %d; want 1", len(cat.Segments))
 	}
@@ -259,7 +260,7 @@ func seedSmartCompactLineageWithSchemaAndEnc(
 	rowsFn smartCompactRowsFn,
 ) {
 	t.Helper()
-	cat := &LineageCatalog{
+	cat := &lineage.Catalog{
 		FormatVersion: 1,
 		SourceEngine:  "postgres",
 		CreatedAt:     base,
@@ -275,7 +276,7 @@ func seedSmartCompactLineageWithSchemaAndEnc(
 		if i > 0 {
 			dir = fmt.Sprintf("seg-%d", i)
 		}
-		segStore := newPrefixedStore(store, dir)
+		segStore := lineage.NewPrefixedStore(store, dir)
 
 		// Full at startLSN = prior segment's end.
 		startLSN := curLSN
@@ -292,7 +293,7 @@ func seedSmartCompactLineageWithSchemaAndEnc(
 			full.ChainEncryption = enc
 		}
 		full.BackupID = irbackup.ComputeBackupID(full)
-		if err := writeManifestAt(context.Background(), segStore, ManifestFileName, full); err != nil {
+		if err := lineage.WriteManifestAt(context.Background(), segStore, lineage.ManifestFileName, full); err != nil {
 			t.Fatalf("seed full %d: %v", i, err)
 		}
 
@@ -337,17 +338,17 @@ func seedSmartCompactLineageWithSchemaAndEnc(
 			}
 			im.BackupID = irbackup.ComputeBackupID(im)
 			ip := fmt.Sprintf("manifests/incr-%05d-seg%d-%d.json", j, i, j)
-			if err := writeManifestAt(context.Background(), segStore, ip, im); err != nil {
+			if err := lineage.WriteManifestAt(context.Background(), segStore, ip, im); err != nil {
 				t.Fatalf("seed incremental: %v", err)
 			}
 			incrPaths = append(incrPaths, ip)
 			curLSN = nextLSN
 		}
 
-		segEntry := LineageSegment{
+		segEntry := lineage.Segment{
 			SegmentID:        full.BackupID,
 			Dir:              dir,
-			FullManifestPath: ManifestFileName,
+			FullManifestPath: lineage.ManifestFileName,
 			Incrementals:     incrPaths,
 			StartPosition:    pos(startLSN),
 			EndPosition:      pos(curLSN),
@@ -364,7 +365,7 @@ func seedSmartCompactLineageWithSchemaAndEnc(
 			cumulative += time.Hour // gap < merge window
 		}
 	}
-	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
+	if err := lineage.WriteLineageCatalog(context.Background(), store, cat); err != nil {
 		t.Fatalf("write lineage catalog: %v", err)
 	}
 }
