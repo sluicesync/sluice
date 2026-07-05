@@ -9,6 +9,7 @@ import (
 	"log/slog"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/translate"
 )
 
@@ -93,7 +94,7 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	if pe, ok := s.Source.(publicationEnsurer); ok {
 		tables := tableNamesForPublication(schema)
 		if err := pe.EnsurePublication(ctx, s.SourceDSN, tables); err != nil {
-			return nil, stop, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: ensure publication scope: %w", err))
+			return nil, stop, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: ensure publication scope: %w", err))
 		}
 	}
 
@@ -167,11 +168,11 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 func (s *Streamer) coldStartReadSourceSchema(ctx context.Context) (*ir.Schema, []string, error) {
 	sr, err := s.Source.OpenSchemaReader(ctx, s.SourceDSN)
 	if err != nil {
-		return nil, nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open source schema reader: %w", err))
+		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open source schema reader: %w", err))
 	}
 	if err := applyEnabledPGExtensions(ctx, sr, s.EnabledPGExtensions); err != nil {
 		closeIf(sr)
-		return nil, nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: enable PG extensions on source: %w", err))
+		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: enable PG extensions on source: %w", err))
 	}
 	// ADR-0047 tier (b): live PG → PG sync may carry uncatalogued
 	// extension types verbatim. Engine-name-only determination.
@@ -182,7 +183,7 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context) (*ir.Schema, [
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
 		closeIf(sr)
-		return nil, nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: read source schema: %w", err))
+		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: read source schema: %w", err))
 	}
 	if len(schema.Tables) == 0 {
 		closeIf(sr)
@@ -318,7 +319,7 @@ func (s *Streamer) coldStartPrepareSchema(schema *ir.Schema) (*ir.Schema, error)
 	if s.InjectShardColumn.Engaged() {
 		schema, err = translate.InjectShardColumn(schema, s.InjectShardColumn.Name, ir.Varchar{Length: 64})
 		if err != nil {
-			return nil, wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: inject shard column: %w", err))
+			return nil, migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: inject shard column: %w", err))
 		}
 	}
 
@@ -328,7 +329,7 @@ func (s *Streamer) coldStartPrepareSchema(schema *ir.Schema) (*ir.Schema, error)
 	// `--type-override=col=text` workaround short-circuits the
 	// refusal.
 	if err := preflightRedactTypes(s.Redactor, schema); err != nil {
-		return nil, wrapWithHint(PhaseConnect, err)
+		return nil, migcore.WrapWithHint(migcore.PhaseConnect, err)
 	}
 
 	return schema, nil
@@ -355,7 +356,7 @@ func (s *Streamer) coldStartOpenSnapshot(ctx context.Context, applier ir.ChangeA
 	if resumingCopy {
 		resumer, ok := s.Source.(ir.SnapshotStreamResumer)
 		if !ok {
-			return nil, wrapWithHint(PhaseSnapshot, fmt.Errorf(
+			return nil, migcore.WrapWithHint(migcore.PhaseSnapshot, fmt.Errorf(
 				"pipeline: source engine %q does not support resumable cold-start COPY but a resume cursor was supplied",
 				s.Source.Name(),
 			))
@@ -374,7 +375,7 @@ func (s *Streamer) coldStartOpenSnapshot(ctx context.Context, applier ir.ChangeA
 		stream, err = openSnapshotStreamScoped(ctx, s.Source, s.SourceDSN, s.SlotName, snapshotTables)
 	}
 	if err != nil {
-		return nil, wrapWithHint(PhaseSnapshot, fmt.Errorf("pipeline: open snapshot stream: %w", err))
+		return nil, migcore.WrapWithHint(migcore.PhaseSnapshot, fmt.Errorf("pipeline: open snapshot stream: %w", err))
 	}
 	// The snapshot+CDC handle stays alive past this function; the
 	// returned stop closure (set on the success path below) closes it
@@ -429,7 +430,7 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 	sw, err := s.Target.OpenSchemaWriter(ctx, s.TargetDSN)
 	if err != nil {
 		_ = stream.Abandon()
-		return nil, nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open target schema writer: %w", err))
+		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open target schema writer: %w", err))
 	}
 	applyTargetSchema(sw, s.TargetSchema)
 	applyIndexBuildMem(sw, s.IndexBuildMem)
@@ -437,13 +438,13 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 	if err := applyEnabledPGExtensions(ctx, sw, s.EnabledPGExtensions); err != nil {
 		closeIf(sw)
 		_ = stream.Abandon()
-		return nil, nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: enable PG extensions on target: %w", err))
+		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: enable PG extensions on target: %w", err))
 	}
 	rw, err := s.Target.OpenRowWriter(ctx, s.TargetDSN)
 	if err != nil {
 		closeIf(sw)
 		_ = stream.Abandon()
-		return nil, nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open target row writer: %w", err))
+		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open target row writer: %w", err))
 	}
 	applyTargetSchema(rw, s.TargetSchema)
 	applyMaxBufferBytes(rw, s.MaxBufferBytes)
@@ -752,7 +753,7 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 	// Position under mu, so this establishes the happens-before edge.
 	if err := stream.WaitCopyComplete(ctx); err != nil {
 		_ = stream.Abandon()
-		return nil, stop, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: wait for snapshot COPY completion: %w", err))
+		return nil, stop, migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: wait for snapshot COPY completion: %w", err))
 	}
 	// GitHub issue #15: persist the snapshot's anchor position on the
 	// target BEFORE the first CDC batch lands. Without this write, the
@@ -778,7 +779,7 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 	if pw, ok := applier.(ir.PositionWriter); ok {
 		if err := pw.WritePosition(ctx, streamID, stream.Position); err != nil {
 			_ = stream.Abandon()
-			return nil, stop, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: persist cold-start CDC anchor position: %w", err))
+			return nil, stop, migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: persist cold-start CDC anchor position: %w", err))
 		}
 		slog.DebugContext(
 			ctx, "cold-start CDC anchor persisted",
@@ -824,7 +825,7 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 	changes, err = stream.Changes.StreamChanges(ctx, stream.Position)
 	if err != nil {
 		_ = stream.Close()
-		return nil, stop, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: start cdc: %w", err))
+		return nil, stop, migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: start cdc: %w", err))
 	}
 	// Close the snapshot stream when Streamer.Run unwinds. stream.Close
 	// runs the engine CloseFn, which closes the CDC reader and joins the

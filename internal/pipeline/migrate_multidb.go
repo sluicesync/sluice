@@ -10,6 +10,7 @@ import (
 	"log/slog"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // Multi-database fan-out (ADR-0074). This file holds the orchestrator
@@ -85,7 +86,7 @@ func (m *Migrator) runMultiDatabase(ctx context.Context) error {
 
 	all, err := lister.ListDatabases(ctx, m.SourceDSN)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: list source namespaces: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: list source namespaces: %w", err))
 	}
 
 	// Resolve the selected SOURCE set (ADR-0142: map-only ⇒ the map keys
@@ -203,7 +204,7 @@ func (m *Migrator) runMultiDatabase(ctx context.Context) error {
 			// the routing is still derived for an accurate plan.
 			if !m.DryRun {
 				if err := targetDeriver.EnsureDatabase(ctx, m.TargetDSN, target); err != nil {
-					return wrapWithHint(PhaseSchemaApply,
+					return migcore.WrapWithHint(migcore.PhaseSchemaApply,
 						fmt.Errorf("pipeline: ensure target database %q: %w", target, err))
 				}
 			}
@@ -292,7 +293,7 @@ func preflightNamespaceFoldCollisions(ctx context.Context, target ir.Engine, tar
 	for _, src := range selected {
 		folded, err := folder.FoldNamespace(ctx, targetDSN, src)
 		if err != nil {
-			return wrapWithHint(PhaseConnect,
+			return migcore.WrapWithHint(migcore.PhaseConnect,
 				fmt.Errorf("pipeline: probe target namespace fold for %q: %w", src, err))
 		}
 		if prev, dup := seen[folded]; dup {
@@ -327,7 +328,7 @@ func (m *Migrator) preflightMultiDBSchema(
 	}
 	sr, err := m.Source.OpenSchemaReader(ctx, dsn)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open source schema reader for %q: %w", database, err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open source schema reader for %q: %w", database, err))
 	}
 	defer closeIf(sr)
 	applyTableScope(sr, m.Filter)
@@ -354,7 +355,7 @@ func (m *Migrator) preflightMultiDBSchema(
 func (m *Migrator) applyDeferredConstraints(ctx context.Context, scope *multiDBScope) error {
 	sr, err := m.Source.OpenSchemaReader(ctx, m.SourceDSN)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open source schema reader: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open source schema reader: %w", err))
 	}
 	defer closeIf(sr)
 	applyTableScope(sr, m.Filter)
@@ -362,7 +363,7 @@ func (m *Migrator) applyDeferredConstraints(ctx context.Context, scope *multiDBS
 
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: read source schema: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: read source schema: %w", err))
 	}
 	if err := applyTableFilter(ctx, schema, m.Filter); err != nil {
 		return err
@@ -375,13 +376,13 @@ func (m *Migrator) applyDeferredConstraints(ctx context.Context, scope *multiDBS
 
 	sw, err := m.Target.OpenSchemaWriter(ctx, m.TargetDSN)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open target schema writer: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open target schema writer: %w", err))
 	}
 	defer closeIf(sw)
 	applyTargetSchema(sw, m.TargetSchema)
 
 	if err := sw.CreateConstraints(ctx, schema); err != nil {
-		return wrapWithHint(PhaseConstraints, fmt.Errorf("pipeline: create constraints: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConstraints, fmt.Errorf("pipeline: create constraints: %w", err))
 	}
 	reportDegradedFKs(ctx, sw)
 	return nil

@@ -49,6 +49,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // DefaultIncrementalWindow is the default value of
@@ -319,13 +320,13 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	// writes. The preflight converts that into a loud refusal naming
 	// `backup full --chain-slot` as the fix (see [preflightChainResume]).
 	if err := preflightChainResume(ctx, b.Source, b.SourceDSN, startPos); err != nil {
-		return wrapWithHint(PhaseCDC, fmt.Errorf("incremental: chain preflight: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("incremental: chain preflight: %w", err))
 	}
 
 	// 3. Open CDC reader at parent's EndPosition.
 	cdc, err := b.openCDCReader(ctx)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("incremental: open cdc reader: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("incremental: open cdc reader: %w", err))
 	}
 	defer closeIf(cdc)
 
@@ -348,7 +349,7 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 		if errors.Is(err, ir.ErrPositionInvalid) {
 			return fmt.Errorf("incremental: source cannot serve the parent's terminal position (WAL/binlog pruned past it, or the source identity changed); take a fresh full backup — `backup full --chain-slot` provisions retention so this cannot recur — or shorten the chain interval. Underlying: %w", err)
 		}
-		return wrapWithHint(PhaseCDC, fmt.Errorf("incremental: start cdc stream: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("incremental: start cdc stream: %w", err))
 	}
 
 	// 4. Stream changes for the window, writing chunks as we go.
@@ -406,7 +407,7 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	deadline := clockNow().Add(windowDur)
 	endPos, totalChanges, captureErr := b.captureWindow(ctx, cdc, changesCh, manifest, chunkSize, deadline, b.MaxChanges, clockNow, chainCEK)
 	if captureErr != nil {
-		return wrapWithHint(PhaseCDC, fmt.Errorf("incremental: capture window: %w", captureErr))
+		return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("incremental: capture window: %w", captureErr))
 	}
 	manifest.EndPosition = endPos
 
@@ -416,7 +417,7 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	//    DDL); the Diff helper returns an empty slice in that case.
 	afterSchema, err := b.readSourceSchema(ctx)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("incremental: read source schema (end): %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("incremental: read source schema (end): %w", err))
 	}
 	manifest.SchemaDelta = diffSchemas(beforeSchema, afterSchema)
 	if len(manifest.SchemaDelta) > 0 {

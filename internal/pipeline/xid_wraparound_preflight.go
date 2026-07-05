@@ -64,6 +64,7 @@ import (
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // errXIDWraparoundRefused is the sentinel cause for an XID-wraparound
@@ -119,7 +120,7 @@ func preflightSourceXIDWraparound(ctx context.Context, handle any, sourceCaps ir
 
 	age, datname, err := prober.SourceXIDWraparoundHorizon(ctx)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf(
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf(
 			"pipeline: XID-wraparound preflight: probe source age(datfrozenxid): %w", err,
 		))
 	}
@@ -127,7 +128,7 @@ func preflightSourceXIDWraparound(ctx context.Context, handle any, sourceCaps ir
 		return nil
 	}
 
-	return wrapWithHint(PhaseConnect, fmt.Errorf(
+	return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf(
 		"%w: %s",
 		errXIDWraparoundRefused, formatXIDWraparoundRefusal(datname, age),
 	))

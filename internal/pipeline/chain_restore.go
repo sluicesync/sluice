@@ -162,7 +162,7 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	cmp := sameEngineComparator(ctx, r.Store, r.Target)
 	links, err := buildLineageChain(ctx, r.Store, cmp)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("chain restore: build lineage: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore: build lineage: %w", err))
 	}
 	if len(links) == 0 {
 		return errors.New("chain restore: store contains no manifests")
@@ -184,9 +184,9 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	//      is read from lineage.json — the authoritative structural
 	//      record — never sniffed from chunk bytes.
 	if cat, err := resolveLineage(ctx, r.Store); err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("chain restore: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore: %w", err))
 	} else if err := refuseVerbatimRestoreToNonPG(cat, r.Target); err != nil {
-		return wrapWithHint(PhaseConnect, err)
+		return migcore.WrapWithHint(migcore.PhaseConnect, err)
 	}
 
 	// 2. Cross-engine routing (Phase 5). Pre-flight the root full's
@@ -219,24 +219,24 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 
 	// 2.5. Encryption pre-flight at the lineage root.
 	if err := r.preflightEncryption(root.manifest); err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("chain restore: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore: %w", err))
 	}
 
 	// 2.6. Mixed-mode encryption refusal across the whole lineage.
 	if err := r.checkMixedModeChain(links); err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("chain restore: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore: %w", err))
 	}
 
 	applier, err := r.Target.OpenChangeApplier(ctx, r.TargetDSN)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("chain restore: open change applier: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore: open change applier: %w", err))
 	}
 	defer closeIf(applier)
 	applyMaxBufferBytes(applier, r.MaxBufferBytes)
 	applyTargetSchema(applier, r.TargetSchema)
 	applyApplyConcurrency(applier, resolveReplayApplyConcurrency(r.ApplyConcurrency))
 	if err := applier.EnsureControlTable(ctx); err != nil {
-		return wrapWithHint(PhaseSchemaApply, fmt.Errorf("chain restore: ensure control table: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("chain restore: ensure control table: %w", err))
 	}
 
 	batchSize := r.ApplyBatchSize
@@ -269,7 +269,7 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 				slog.Bool("data_only", dataOnly),
 			)
 			if err := r.applyFull(ctx, link, dataOnly); err != nil {
-				return wrapWithHint(PhaseBulkCopy, fmt.Errorf("chain restore: apply segment full %s: %w",
+				return migcore.WrapWithHint(migcore.PhaseBulkCopy, fmt.Errorf("chain restore: apply segment full %s: %w",
 					manifestBackupID(link.manifest), err))
 			}
 			firstFullApplied = true
@@ -283,7 +283,7 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 				slog.Int("schema_deltas", len(link.manifest.SchemaDelta)),
 			)
 			if err := r.applyIncremental(ctx, link, applier, batchSize); err != nil {
-				return wrapWithHint(PhaseCDC, fmt.Errorf("chain restore: incremental %s: %w",
+				return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("chain restore: incremental %s: %w",
 					manifestBackupID(link.manifest), err))
 			}
 		default:
@@ -302,7 +302,7 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	//    sequence), sourced from the NEWEST link that carries a
 	//    schema snapshot.
 	if err := r.reprimeStandaloneSequences(ctx, links); err != nil {
-		return wrapWithHint(PhaseSchemaApply, fmt.Errorf("chain restore: re-prime standalone sequences: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("chain restore: re-prime standalone sequences: %w", err))
 	}
 
 	// 5. Chain-tail identity-sequence re-sync (roadmap "Open bugs",
@@ -317,7 +317,7 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	//    safe to run unconditionally — the identity analogue of the
 	//    standalone-sequence re-prime above.
 	if err := r.syncIdentitySequencesAtTail(ctx, links); err != nil {
-		return wrapWithHint(PhaseSchemaApply, fmt.Errorf("chain restore: sync identity sequences: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("chain restore: sync identity sequences: %w", err))
 	}
 
 	slog.InfoContext(

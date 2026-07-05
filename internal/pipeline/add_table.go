@@ -54,6 +54,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/redact"
 	"sluicesync.dev/sluice/internal/translate"
 )
@@ -277,7 +278,7 @@ func (a *AddTable) Run(ctx context.Context) error {
 	// the snapshot-LSN ≥ slot-LSN invariant captured below.
 	applier, err := a.Target.OpenChangeApplier(ctx, a.TargetDSN)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: add-table: open target applier: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: add-table: open target applier: %w", err))
 	}
 	defer closeIf(applier)
 
@@ -289,12 +290,12 @@ func (a *AddTable) Run(ctx context.Context) error {
 	// ---- 2. Read the source schema; isolate the new table.
 	sr, err := a.Source.OpenSchemaReader(ctx, a.SourceDSN)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: add-table: open source schema reader: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: add-table: open source schema reader: %w", err))
 	}
 	fullSchema, err := sr.ReadSchema(ctx)
 	closeIf(sr)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: add-table: read source schema: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: add-table: read source schema: %w", err))
 	}
 
 	scoped, err := isolateTable(fullSchema, a.TableName)
@@ -324,13 +325,13 @@ func (a *AddTable) Run(ctx context.Context) error {
 	// but is empty.
 	sw, err := a.Target.OpenSchemaWriter(ctx, a.TargetDSN)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: add-table: open target schema writer: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: add-table: open target schema writer: %w", err))
 	}
 	defer closeIf(sw)
 
 	rw, err := a.Target.OpenRowWriter(ctx, a.TargetDSN)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: add-table: open target row writer: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: add-table: open target row writer: %w", err))
 	}
 	defer closeIf(rw)
 
@@ -388,7 +389,7 @@ func (a *AddTable) Run(ctx context.Context) error {
 	// correct shape — it removes engine-specific timing assumptions
 	// from the orchestrator.
 	if err := sw.CreateTablesWithoutConstraints(ctx, scoped); err != nil {
-		return wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: add-table: create target table: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: add-table: create target table: %w", err))
 	}
 
 	// ---- 4. Extend the publication scope (Postgres) BEFORE the
@@ -414,7 +415,7 @@ func (a *AddTable) Run(ctx context.Context) error {
 			slog.String("table", a.TableName),
 		)
 		if err := pa.AddPublicationTables(ctx, a.SourceDSN, []string{a.TableName}); err != nil {
-			return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: add-table: extend publication: %w", err))
+			return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: add-table: extend publication: %w", err))
 		}
 	} else {
 		slog.DebugContext(
@@ -547,7 +548,7 @@ func (a *AddTable) Run(ctx context.Context) error {
 			return errors.New("pipeline: add-table: --no-drain (binlog-source path): target applier no longer implements RecordLiveAddedTable; this is a regression in the dispatch ladder")
 		}
 		if err := writer.RecordLiveAddedTable(ctx, a.StreamID, a.TableName); err != nil {
-			return wrapWithHint(PhaseSchemaApply, fmt.Errorf(
+			return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf(
 				"pipeline: add-table: --no-drain: record live-added table on cdc-state: %w", err,
 			))
 		}
@@ -667,7 +668,7 @@ type addTablePreflight struct {
 func (a *AddTable) preflightStream(ctx context.Context, applier ir.ChangeApplier) (addTablePreflight, error) {
 	streams, err := applier.ListStreams(ctx)
 	if err != nil {
-		return addTablePreflight{}, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: add-table: list streams: %w", err))
+		return addTablePreflight{}, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: add-table: list streams: %w", err))
 	}
 	var (
 		found  bool
@@ -763,7 +764,7 @@ func (a *AddTable) preflightDrained(ctx context.Context, applier ir.ChangeApplie
 	}
 	stopRequested, err := reader.ReadStopRequested(ctx, a.StreamID)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: add-table: read stop flag: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: add-table: read stop flag: %w", err))
 	}
 	if stopRequested {
 		return fmt.Errorf("pipeline: add-table: stream %q has an in-flight stop request (stop_requested_at IS NOT NULL) — wait for `sluice sync stop --wait` to drain before running add-table (or pass --no-drain to use Phase 2 live add)", a.StreamID)
@@ -827,7 +828,7 @@ func (a *AddTable) preflightLivePG(ctx context.Context, status ir.StreamStatus) 
 	slotName := activeSlotName(status)
 	lsn, err := reader.ReadSlotPosition(ctx, a.SourceDSN, slotName)
 	if err != nil {
-		return addTablePreflight{}, wrapWithHint(PhaseConnect, fmt.Errorf(
+		return addTablePreflight{}, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf(
 			"pipeline: add-table: --no-drain: read slot position for %q: %w",
 			slotName, err,
 		))
@@ -1071,7 +1072,7 @@ func preflightAddTable(ctx context.Context, scoped *ir.Schema, rw ir.RowWriter) 
 			return fmt.Errorf("pipeline: add-table: pre-flight probe of target table %q: %w", t.Name, err)
 		}
 		if !empty {
-			return wrapWithHint(PhaseSchemaApply, fmt.Errorf(
+			return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf(
 				"pipeline: add-table: target table %q already exists with rows — drop it on the target (or pick a different table name on the source) and re-run add-table; this guard prevents accidentally double-copying onto a previously-imported table",
 				t.Name,
 			))
@@ -1093,13 +1094,13 @@ func (a *AddTable) openSnapshotForAdd(ctx context.Context) (string, *ir.Snapshot
 	if opener, ok := a.Source.(snapshotSlotOpener); ok && tempSlot != "" {
 		stream, err := opener.OpenSnapshotStreamWithSlot(ctx, a.SourceDSN, tempSlot)
 		if err != nil {
-			return "", nil, wrapWithHint(PhaseSnapshot, fmt.Errorf("pipeline: add-table: open snapshot stream: %w", err))
+			return "", nil, migcore.WrapWithHint(migcore.PhaseSnapshot, fmt.Errorf("pipeline: add-table: open snapshot stream: %w", err))
 		}
 		return tempSlot, stream, nil
 	}
 	stream, err := a.Source.OpenSnapshotStream(ctx, a.SourceDSN)
 	if err != nil {
-		return "", nil, wrapWithHint(PhaseSnapshot, fmt.Errorf("pipeline: add-table: open snapshot stream: %w", err))
+		return "", nil, migcore.WrapWithHint(migcore.PhaseSnapshot, fmt.Errorf("pipeline: add-table: open snapshot stream: %w", err))
 	}
 	return "", stream, nil
 }

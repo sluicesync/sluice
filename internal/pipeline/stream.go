@@ -63,6 +63,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // DefaultRolloverWindow is the wall-clock cadence each rollover commits
@@ -451,7 +452,7 @@ func (b *BackupStream) Run(ctx context.Context) error {
 
 	// 2.5. Chain-resume preflight (see [preflightChainResume]).
 	if err := preflightChainResume(ctx, b.Source, b.SourceDSN, startPos); err != nil {
-		return wrapWithHint(PhaseCDC, fmt.Errorf("stream: chain preflight: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("stream: chain preflight: %w", err))
 	}
 
 	// 3. Open CDC pump for the lifetime of the stream. The handle is
@@ -460,7 +461,7 @@ func (b *BackupStream) Run(ctx context.Context) error {
 	// pump without leaking the previous one.
 	cdc, err := openCDCReaderWithSlot(ctx, b.Source, b.SourceDSN, b.SlotName)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("stream: open cdc reader: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("stream: open cdc reader: %w", err))
 	}
 	defer func() { closeIf(cdc) }()
 
@@ -476,7 +477,7 @@ func (b *BackupStream) Run(ctx context.Context) error {
 		if errors.Is(err, ir.ErrPositionInvalid) {
 			return fmt.Errorf("stream: source has pruned past parent's terminal position; take a fresh full backup or shorten the chain interval. Underlying: %w", err)
 		}
-		return wrapWithHint(PhaseCDC, fmt.Errorf("stream: start cdc stream: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("stream: start cdc stream: %w", err))
 	}
 
 	// Retry policy for transient CDC-pump errors (GitHub #22). Mirrors
@@ -603,7 +604,7 @@ func (b *BackupStream) Run(ctx context.Context) error {
 			if retryAttempts > 1 && errors.As(rErr, &re) && re.Retriable() {
 				retryConsecutive++
 				if retryConsecutive >= retryAttempts {
-					return wrapWithHint(PhaseCDC, fmt.Errorf("stream: rollover %d: retry budget exhausted after %d consecutive failures: %w",
+					return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("stream: rollover %d: retry budget exhausted after %d consecutive failures: %w",
 						rolloverSeq, retryConsecutive, rErr))
 				}
 				backoff := computeRetryBackoff(retryConsecutive, retryBase, retryCap, re.RetryHint())
@@ -623,7 +624,7 @@ func (b *BackupStream) Run(ctx context.Context) error {
 				closeIf(cdc)
 				cdc, err = openCDCReaderWithSlot(ctx, b.Source, b.SourceDSN, b.SlotName)
 				if err != nil {
-					return wrapWithHint(PhaseConnect, fmt.Errorf("stream: reopen cdc reader after transient: %w", err))
+					return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("stream: reopen cdc reader after transient: %w", err))
 				}
 				// The fresh pump needs chain-consumer ack mode re-armed
 				// (it's per-reader state, set before StreamChanges).
@@ -634,11 +635,11 @@ func (b *BackupStream) Run(ctx context.Context) error {
 					if errors.Is(err, ir.ErrPositionInvalid) {
 						return fmt.Errorf("stream: after transient retry, source has pruned past parent's terminal position; take a fresh full backup or shorten the chain interval. Underlying: %w", err)
 					}
-					return wrapWithHint(PhaseCDC, fmt.Errorf("stream: restart cdc stream after transient: %w", err))
+					return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("stream: restart cdc stream after transient: %w", err))
 				}
 				continue
 			}
-			return wrapWithHint(PhaseCDC, fmt.Errorf("stream: rollover %d: %w", rolloverSeq, rErr))
+			return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("stream: rollover %d: %w", rolloverSeq, rErr))
 		}
 		// Successful rollover (whether empty or with a manifest):
 		// reset the consecutive-failure counter so a long-lived stream
@@ -815,7 +816,7 @@ func (b *BackupStream) Run(ctx context.Context) error {
 						slog.String("err", rotErr.Error()),
 					)
 				} else {
-					return wrapWithHint(PhaseCDC, fmt.Errorf("stream: rotation (%s): %w", reason, rotErr))
+					return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("stream: rotation (%s): %w", reason, rotErr))
 				}
 			} else {
 				// Rotation committed: the new segment is authoritative.

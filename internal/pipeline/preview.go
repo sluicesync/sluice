@@ -28,6 +28,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/redact"
 	"sluicesync.dev/sluice/internal/translate"
 )
@@ -268,11 +269,11 @@ func (p *Previewer) Run(ctx context.Context) error {
 	// ---- 1. Read source schema ----
 	sr, err := p.Source.OpenSchemaReader(ctx, p.SourceDSN)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("preview: open source schema reader: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("preview: open source schema reader: %w", err))
 	}
 	defer closeIf(sr)
 	if err := applyEnabledPGExtensions(ctx, sr, p.EnabledPGExtensions); err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("preview: enable PG extensions on source: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("preview: enable PG extensions on source: %w", err))
 	}
 
 	// ADR-0047 tier (b): enable verbatim passthrough for uncatalogued
@@ -287,7 +288,7 @@ func (p *Previewer) Run(ctx context.Context) error {
 
 	srcSchema, err := sr.ReadSchema(ctx)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("preview: read source schema: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("preview: read source schema: %w", err))
 	}
 	if len(srcSchema.Tables) == 0 {
 		return errors.New("preview: source schema has no tables")
@@ -453,11 +454,11 @@ func (p *Previewer) Run(ctx context.Context) error {
 	// ---- 4. Open the target schema writer; type-assert for preview. ----
 	sw, err := p.Target.OpenSchemaWriter(ctx, p.TargetDSN)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("preview: open target schema writer: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("preview: open target schema writer: %w", err))
 	}
 	applyTargetSchema(sw, p.TargetSchema)
 	if err := applyEnabledPGExtensions(ctx, sw, p.EnabledPGExtensions); err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("preview: enable PG extensions on target: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("preview: enable PG extensions on target: %w", err))
 	}
 	defer closeIf(sw)
 

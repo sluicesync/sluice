@@ -35,6 +35,7 @@ import (
 	"fmt"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // errCrossShardCollisionRefused is the sentinel cause for a Bug 152
@@ -85,7 +86,7 @@ func preflightCrossShardCollision(
 	}
 	shards, err := discoverer.DiscoverShards(ctx, sourceDSN)
 	if err != nil {
-		return wrapWithHint(PhaseSchemaApply, fmt.Errorf(
+		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf(
 			"%w: could not determine the source's shard layout (%v) — refusing rather than "+
 				"risk a silent cross-shard overwrite. If the source is unsharded or its keys are "+
 				"globally unique across shards, pass --allow-cross-shard-merge to proceed; if it "+
@@ -108,7 +109,7 @@ func preflightCrossShardCollision(
 			// merging shards into it loses nothing.
 			continue
 		}
-		return wrapWithHint(PhaseSchemaApply, fmt.Errorf(
+		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf(
 			"%w: the source is a sharded keyspace with %d shards (%v) that vtgate merges into one "+
 				"logical stream, but no shard discriminator is set — every shard's rows would be "+
 				"written into the single target table %q, whose %s means rows from different shards "+

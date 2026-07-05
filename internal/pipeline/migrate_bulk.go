@@ -37,6 +37,7 @@ import (
 	"sync/atomic"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/redact"
 )
 
@@ -97,7 +98,7 @@ func bulkCopyOneTable(
 			slog.String("table", table.Name))
 		if err := truncateForResume(ctx, rw, table); err != nil {
 			wrapped := fmt.Errorf("pipeline: truncate before resume: %w", err)
-			return wrapWithHint(PhaseBulkCopy, markFailedLocked(ctx, rc, state, stateMu, ir.MigrationPhaseBulkCopy, wrapped))
+			return migcore.WrapWithHint(migcore.PhaseBulkCopy, markFailedLocked(ctx, rc, state, stateMu, ir.MigrationPhaseBulkCopy, wrapped))
 		}
 	case resumeActionResumeFromCursor:
 		// Cursor-bearing resume: the per-batch path picks up the
@@ -230,7 +231,7 @@ func copyOneTableData(
 	// "fall through to the single-reader path".
 	if ran, err := tryParallelCopyTable(ctx, rc, state, stateMu, rows, rw, table, parallel, resuming, bulkBatchSize, redactor, shard); err != nil {
 		wrapped := fmt.Errorf("pipeline: copy table %q (parallel): %w", table.Name, err)
-		return wrapWithHint(PhaseBulkCopy, markFailedLocked(ctx, rc, state, stateMu, ir.MigrationPhaseBulkCopy, wrapped))
+		return migcore.WrapWithHint(migcore.PhaseBulkCopy, markFailedLocked(ctx, rc, state, stateMu, ir.MigrationPhaseBulkCopy, wrapped))
 	} else if ran {
 		return nil
 	}
@@ -253,7 +254,7 @@ func copyOneTableData(
 			rowsN, rawErr := runRawCopyChunk(ctx, exp, imp, table, nil, parallel.rawCopyFormat)
 			if rawErr != nil {
 				wrapped := fmt.Errorf("pipeline: copy table %q (raw copy): %w", table.Name, rawErr)
-				return wrapWithHint(PhaseBulkCopy, markFailedLocked(ctx, rc, state, stateMu, ir.MigrationPhaseBulkCopy, wrapped))
+				return migcore.WrapWithHint(migcore.PhaseBulkCopy, markFailedLocked(ctx, rc, state, stateMu, ir.MigrationPhaseBulkCopy, wrapped))
 			}
 			slog.InfoContext(ctx, "migration: table copied via raw-copy passthrough",
 				slog.String("table", table.Name),
@@ -288,7 +289,7 @@ func copyOneTableData(
 		setTableProgressAndWrite(ctx, rc, state, stateMu, table.Name, entry)
 		if err := copyTable(ctx, rows, rw, table, redactor, shard); err != nil {
 			wrapped := fmt.Errorf("pipeline: copy table %q: %w", table.Name, err)
-			return wrapWithHint(PhaseBulkCopy, markFailedLocked(ctx, rc, state, stateMu, ir.MigrationPhaseBulkCopy, wrapped))
+			return migcore.WrapWithHint(migcore.PhaseBulkCopy, markFailedLocked(ctx, rc, state, stateMu, ir.MigrationPhaseBulkCopy, wrapped))
 		}
 		setTableProgressAndWrite(ctx, rc, state, stateMu, table.Name, ir.TableProgress{State: ir.TableProgressComplete})
 		return nil
@@ -301,7 +302,7 @@ func copyOneTableData(
 	}
 	if err := copyTableWithCursor(ctx, rc, state, stateMu, rw, rows, table, limit, redactor, shard); err != nil {
 		wrapped := fmt.Errorf("pipeline: copy table %q: %w", table.Name, err)
-		return wrapWithHint(PhaseBulkCopy, markFailedLocked(ctx, rc, state, stateMu, ir.MigrationPhaseBulkCopy, wrapped))
+		return migcore.WrapWithHint(migcore.PhaseBulkCopy, markFailedLocked(ctx, rc, state, stateMu, ir.MigrationPhaseBulkCopy, wrapped))
 	}
 	setTableProgressAndWrite(ctx, rc, state, stateMu, table.Name, ir.TableProgress{State: ir.TableProgressComplete})
 	return nil

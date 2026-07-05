@@ -37,6 +37,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/redact"
 )
 
@@ -154,7 +155,7 @@ func runOverlappedCopyAndIndexPhase(
 		// in-flight one (index builds piggyback on it), so wrap as indexes
 		// only if the error came from the build side is hard to tell here —
 		// use the bulk-copy hint, the conservative attribution, and persist.
-		return wrapWithHint(PhaseBulkCopy, markFailedLocked(ctx, rc, state, stateMu, ir.MigrationPhaseBulkCopy, err))
+		return migcore.WrapWithHint(migcore.PhaseBulkCopy, markFailedLocked(ctx, rc, state, stateMu, ir.MigrationPhaseBulkCopy, err))
 	}
 	return nil
 }

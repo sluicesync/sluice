@@ -18,6 +18,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/notify"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/redact"
 )
 
@@ -1628,11 +1629,11 @@ func (s *Streamer) applyWithReshardFollow(
 			newChanges, wasReshard, rerr := s.sourceReshard.ReopenAfterReshard(applyCtx)
 			if wasReshard {
 				if rerr != nil {
-					return wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: reshard reopen: %w", rerr))
+					return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: reshard reopen: %w", rerr))
 				}
 				reshardReopens++
 				if reshardReopens > maxReshardReopensPerRun {
-					return wrapWithHint(PhaseCDC, fmt.Errorf(
+					return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf(
 						"pipeline: reshard reopen budget exhausted after %d reopens in one run "+
 							"(possible reshard storm or a reader re-signalling without progress); "+
 							"restart the sync to resume", reshardReopens,

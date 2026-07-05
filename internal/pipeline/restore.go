@@ -314,7 +314,7 @@ func (r *Restore) Run(ctx context.Context) error {
 	if !r.SkipChainDispatch {
 		multi, err := r.lineageNeedsWalk(ctx)
 		if err != nil {
-			return wrapWithHint(PhaseConnect, fmt.Errorf("restore: detect lineage: %w", err))
+			return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("restore: detect lineage: %w", err))
 		}
 		if multi {
 			chain := &ChainRestore{
@@ -338,14 +338,14 @@ func (r *Restore) Run(ctx context.Context) error {
 	//    segment's full at the conventional ManifestFileName.
 	manifest, err := readManifest(ctx, r.Store)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("restore: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("restore: %w", err))
 	}
 	// The root segment's recorded codec governs the full's chunks.
 	// Recorded, never sniffed (ADR-0046). Absent lineage → gzip.
 	if r.segCodec == "" {
 		r.segCodec, err = r.rootSegmentCodec(ctx)
 		if err != nil {
-			return wrapWithHint(PhaseConnect, fmt.Errorf("restore: %w", err))
+			return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("restore: %w", err))
 		}
 	}
 	slog.InfoContext(
@@ -369,7 +369,7 @@ func (r *Restore) Run(ctx context.Context) error {
 	//      manifest schema directly — the same schema the lineage
 	//      marker is derived from, so the two restore paths agree.
 	if err := refuseVerbatimManifestRestoreToNonPG(manifest.Schema, r.Target); err != nil {
-		return wrapWithHint(PhaseConnect, err)
+		return migcore.WrapWithHint(migcore.PhaseConnect, err)
 	}
 
 	// 1.45. Cross-engine supportability gate (Bug 134). The chain
@@ -406,7 +406,7 @@ func (r *Restore) Run(ctx context.Context) error {
 	// against an encrypted chain refuses up-front so no partial data
 	// lands on the target.
 	if err := r.preflightEncryption(manifest); err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("restore: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("restore: %w", err))
 	}
 
 	// 2. Filter tables — both at the schema level (so unwanted
@@ -422,11 +422,11 @@ func (r *Restore) Run(ctx context.Context) error {
 
 	// 4. Open target writers.
 	if err := validateTargetSchema(r.Target, r.TargetSchema); err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("restore: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("restore: %w", err))
 	}
 	sw, err := r.Target.OpenSchemaWriter(ctx, r.TargetDSN)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("restore: open target schema writer: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("restore: open target schema writer: %w", err))
 	}
 	applyTargetSchema(sw, r.TargetSchema)
 	defer closeIf(sw)
@@ -459,7 +459,7 @@ func (r *Restore) Run(ctx context.Context) error {
 	//    anyway, but we skip the whole schema surface for clarity).
 	if !r.DataOnly {
 		if err := sw.CreateTablesWithoutConstraints(ctx, schema); err != nil {
-			return wrapWithHint(PhaseSchemaApply, fmt.Errorf("restore: create tables: %w", err))
+			return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("restore: create tables: %w", err))
 		}
 		slog.InfoContext(ctx, "restore: tables created", slog.Int("count", len(schema.Tables)))
 	}
@@ -507,7 +507,7 @@ func (r *Restore) Run(ctx context.Context) error {
 	// immutable chunks so it exactly matches the manifest. No-op when no
 	// reparent occurred.
 	if err := r.reconcileReparentTouched(ctx, rw, tasks); err != nil {
-		return wrapWithHint(PhaseBulkCopy, err)
+		return migcore.WrapWithHint(migcore.PhaseBulkCopy, err)
 	}
 
 	if r.DataOnly {
@@ -525,27 +525,27 @@ func (r *Restore) Run(ctx context.Context) error {
 	if err := runDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
 		return sw.SyncIdentitySequences(ctx, schema)
 	}); err != nil {
-		return wrapWithHint(PhaseSchemaApply, fmt.Errorf("restore: sync identity sequences: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("restore: sync identity sequences: %w", err))
 	}
 
 	// 8. Phase 4: indexes.
 	if err := runDDLPhaseWithReparentRetry(ctx, "indexes", sw, func(ctx context.Context) error {
 		return sw.CreateIndexes(ctx, schema)
 	}); err != nil {
-		return wrapWithHint(PhaseIndexes, fmt.Errorf("restore: create indexes: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseIndexes, fmt.Errorf("restore: create indexes: %w", err))
 	}
 
 	// 9. Phase 5: constraints.
 	if err := runDDLPhaseWithReparentRetry(ctx, "constraints", sw, func(ctx context.Context) error {
 		return sw.CreateConstraints(ctx, schema)
 	}); err != nil {
-		return wrapWithHint(PhaseConstraints, fmt.Errorf("restore: create constraints: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConstraints, fmt.Errorf("restore: create constraints: %w", err))
 	}
 
 	// 10. Phase 6: views. runViewsPhase wraps its own per-view DDL in the
 	// reparent retry (ADR-0114) atop its dependency-pass retry.
 	if err := runViewsPhase(ctx, schema, sw); err != nil {
-		return wrapWithHint(PhaseViews, err)
+		return migcore.WrapWithHint(migcore.PhaseViews, err)
 	}
 
 	slog.InfoContext(ctx, "restore complete", slog.Int("tables", len(schema.Tables)))
@@ -574,7 +574,7 @@ func (r *Restore) validate() error {
 func (r *Restore) openTargetRowWriter(ctx context.Context) (ir.RowWriter, error) {
 	rw, err := r.Target.OpenRowWriter(ctx, r.TargetDSN)
 	if err != nil {
-		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("restore: open target row writer: %w", err))
+		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("restore: open target row writer: %w", err))
 	}
 	applyMaxBufferBytes(rw, r.MaxBufferBytes)
 	applyTargetSchema(rw, r.TargetSchema)

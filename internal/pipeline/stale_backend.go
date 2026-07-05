@@ -33,6 +33,7 @@ import (
 	"log/slog"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // preflightStaleBackends runs the stale-backend detector (and, on opt-in,
@@ -71,7 +72,7 @@ func preflightStaleBackends(
 		// A connection-open failure: the operator's target DSN is wrong.
 		// Surface it the same as any other Open* — not the safety check
 		// breaking a working migration, a broken DSN.
-		return wrapWithHint(PhaseConnect, err)
+		return migcore.WrapWithHint(migcore.PhaseConnect, err)
 	}
 
 	if report.ProbeFailed {

@@ -23,6 +23,7 @@ import (
 	"log/slog"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // resolveTargetCopyParallelism returns the bulk-copy parallelism to use
@@ -65,7 +66,7 @@ func resolveTargetCopyParallelism(
 		// A connection-open failure: the operator's target DSN is wrong.
 		// Surface it the same as any other Open* — this is not the
 		// safety check breaking a working migration, it's a broken DSN.
-		return 0, ir.ConnectionBudget{}, wrapWithHint(PhaseConnect, err)
+		return 0, ir.ConnectionBudget{}, migcore.WrapWithHint(migcore.PhaseConnect, err)
 	}
 
 	if report.ProbeFailed {
@@ -83,7 +84,7 @@ func resolveTargetCopyParallelism(
 
 	if report.Refuse {
 		// Loud refusal — never start a copy that can't finish.
-		return 0, ir.ConnectionBudget{}, wrapWithHint(PhaseConnect, report.RefusalError)
+		return 0, ir.ConnectionBudget{}, migcore.WrapWithHint(migcore.PhaseConnect, report.RefusalError)
 	}
 
 	if report.Capped {

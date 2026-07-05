@@ -29,6 +29,7 @@ import (
 	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/ir"
 	irdiff "sluicesync.dev/sluice/internal/ir/diff"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/translate"
 )
 
@@ -163,11 +164,11 @@ func (d *Differ) Run(ctx context.Context) (*irdiff.SchemaDiff, error) {
 	// ---- 1. Read source schema ----
 	sr, err := d.Source.OpenSchemaReader(ctx, d.SourceDSN)
 	if err != nil {
-		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("diff: open source schema reader: %w", err))
+		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("diff: open source schema reader: %w", err))
 	}
 	defer closeIf(sr)
 	if err := applyEnabledPGExtensions(ctx, sr, d.EnabledPGExtensions); err != nil {
-		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("diff: enable PG extensions on source: %w", err))
+		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("diff: enable PG extensions on source: %w", err))
 	}
 
 	// Engine-default exclusions (Bug 22): same shape as Migrator and
@@ -190,7 +191,7 @@ func (d *Differ) Run(ctx context.Context) (*irdiff.SchemaDiff, error) {
 
 	srcSchema, err := sr.ReadSchema(ctx)
 	if err != nil {
-		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("diff: read source schema: %w", err))
+		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("diff: read source schema: %w", err))
 	}
 	if len(srcSchema.Tables) == 0 {
 		return nil, errors.New("diff: source schema has no tables")
@@ -236,17 +237,17 @@ func (d *Differ) Run(ctx context.Context) (*irdiff.SchemaDiff, error) {
 	// at a "source" or a "target".
 	tr, err := d.Target.OpenSchemaReader(ctx, d.TargetDSN)
 	if err != nil {
-		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("diff: open target schema reader: %w", err))
+		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("diff: open target schema reader: %w", err))
 	}
 	applyTargetSchema(tr, d.TargetSchema)
 	if err := applyEnabledPGExtensions(ctx, tr, d.EnabledPGExtensions); err != nil {
-		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("diff: enable PG extensions on target: %w", err))
+		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("diff: enable PG extensions on target: %w", err))
 	}
 	defer closeIf(tr)
 
 	actual, err := tr.ReadSchema(ctx)
 	if err != nil {
-		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("diff: read target schema: %w", err))
+		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("diff: read target schema: %w", err))
 	}
 
 	// ---- 3. Compute the diff. ----
@@ -359,12 +360,12 @@ func previewMissingDDL(ctx context.Context, target ir.Engine, dsn, targetSchema 
 
 	sw, openErr := target.OpenSchemaWriter(ctx, dsn)
 	if openErr != nil {
-		return nil, nil, wrapWithHint(PhaseConnect, fmt.Errorf("diff: open target schema writer: %w", openErr))
+		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("diff: open target schema writer: %w", openErr))
 	}
 	applyTargetSchema(sw, targetSchema)
 	if err := applyEnabledPGExtensions(ctx, sw, enabledExtensions); err != nil {
 		closeIf(sw)
-		return nil, nil, wrapWithHint(PhaseConnect, fmt.Errorf("diff: enable PG extensions on target: %w", err))
+		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("diff: enable PG extensions on target: %w", err))
 	}
 	defer closeIf(sw)
 

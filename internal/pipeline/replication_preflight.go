@@ -54,6 +54,7 @@ import (
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // errReplicationRefused is the sentinel cause for a replication-
@@ -118,7 +119,7 @@ func preflightSourceReplication(ctx context.Context, handle any, sourceCaps ir.C
 
 	canReplicate, role, err := prober.SourceReplicationCapability(ctx)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf(
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf(
 			"pipeline: replication-capability preflight: probe source role REPLICATION attribute: %w", err,
 		))
 	}
@@ -127,7 +128,7 @@ func preflightSourceReplication(ctx context.Context, handle any, sourceCaps ir.C
 		return nil
 	}
 
-	return wrapWithHint(PhaseConnect, fmt.Errorf(
+	return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf(
 		"%w: %s",
 		errReplicationRefused, formatReplicationRefusal(role),
 	))

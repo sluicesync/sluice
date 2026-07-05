@@ -9,6 +9,7 @@ import (
 	"log/slog"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/translate"
 )
 
@@ -60,11 +61,11 @@ func (s *Streamer) buildDryRunPlan(ctx context.Context, streamID string, persist
 
 	sr, err := s.Source.OpenSchemaReader(ctx, s.SourceDSN)
 	if err != nil {
-		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: dry-run: open source schema reader: %w", err))
+		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: dry-run: open source schema reader: %w", err))
 	}
 	defer closeIf(sr)
 	if err := applyEnabledPGExtensions(ctx, sr, s.EnabledPGExtensions); err != nil {
-		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: dry-run: enable PG extensions on source: %w", err))
+		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: dry-run: enable PG extensions on source: %w", err))
 	}
 	// ADR-0047 tier (b): live PG → PG sync may carry uncatalogued
 	// extension types verbatim. Engine-name-only determination.
@@ -74,7 +75,7 @@ func (s *Streamer) buildDryRunPlan(ctx context.Context, streamID string, persist
 	applyTableScope(sr, s.Filter)
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
-		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: dry-run: read source schema: %w", err))
+		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: dry-run: read source schema: %w", err))
 	}
 	if len(schema.Tables) == 0 {
 		plan.noSourceTables = true

@@ -36,6 +36,7 @@ import (
 	"runtime"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // coldStartDispatchObserver is a TEST-ONLY seam: when non-nil it fires
@@ -189,11 +190,11 @@ func (s *Streamer) runColdStartParallel(
 	if !ok {
 		// Unreachable: coldStartFastEligible already asserted this. Loud
 		// rather than a silent fall-through to a nil-importer deref.
-		return wrapWithHint(PhaseSnapshot, errColdStartNoImporter)
+		return migcore.WrapWithHint(migcore.PhaseSnapshot, errColdStartNoImporter)
 	}
 	importer, err := opener.OpenSnapshotImporter(ctx, s.SourceDSN)
 	if err != nil {
-		return wrapWithHint(PhaseSnapshot, err)
+		return migcore.WrapWithHint(migcore.PhaseSnapshot, err)
 	}
 	defer func() {
 		if c, ok := importer.(interface{ Close() error }); ok {

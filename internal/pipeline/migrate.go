@@ -628,20 +628,20 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	// ---- 2. Open target writers ----
 	sw, err := m.Target.OpenSchemaWriter(ctx, m.TargetDSN)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, markFailed(ctx, rc, state, ir.MigrationPhasePending,
+		return migcore.WrapWithHint(migcore.PhaseConnect, markFailed(ctx, rc, state, ir.MigrationPhasePending,
 			fmt.Errorf("pipeline: open target schema writer: %w", err)))
 	}
 	applyTargetSchema(sw, m.TargetSchema)
 	applyIndexBuildMem(sw, m.IndexBuildMem)
 	applyIndexBuildParallelism(sw, m.IndexBuildParallelism)
 	if err := applyEnabledPGExtensions(ctx, sw, m.EnabledPGExtensions); err != nil {
-		return wrapWithHint(PhaseConnect, markFailed(ctx, rc, state, ir.MigrationPhasePending,
+		return migcore.WrapWithHint(migcore.PhaseConnect, markFailed(ctx, rc, state, ir.MigrationPhasePending,
 			fmt.Errorf("pipeline: enable PG extensions on target: %w", err)))
 	}
 	if m.AllowDegradedFKs {
 		a, ok := sw.(ir.DegradedFKAllower)
 		if !ok {
-			return wrapWithHint(PhaseConnect, markFailed(ctx, rc, state, ir.MigrationPhasePending,
+			return migcore.WrapWithHint(migcore.PhaseConnect, markFailed(ctx, rc, state, ir.MigrationPhasePending,
 				errors.New("pipeline: --allow-degraded-fks is set but the target engine doesn't support degraded FKs "+
 					"(PG-target only by design; MySQL's nearest analogue, FOREIGN_KEY_CHECKS=0, is a different contract — "+
 					"clean the source FK violations before migrating to a MySQL target)")))
@@ -652,7 +652,7 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 
 	rw, err := m.Target.OpenRowWriter(ctx, m.TargetDSN)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, markFailed(ctx, rc, state, ir.MigrationPhasePending,
+		return migcore.WrapWithHint(migcore.PhaseConnect, markFailed(ctx, rc, state, ir.MigrationPhasePending,
 			fmt.Errorf("pipeline: open target row writer: %w", err)))
 	}
 	applyTargetSchema(rw, m.TargetSchema)
@@ -687,7 +687,7 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	} else {
 		openedRR, err := m.Source.OpenRowReader(ctx, m.SourceDSN)
 		if err != nil {
-			return wrapWithHint(PhaseConnect, markFailed(ctx, rc, state, ir.MigrationPhasePending,
+			return migcore.WrapWithHint(migcore.PhaseConnect, markFailed(ctx, rc, state, ir.MigrationPhasePending,
 				fmt.Errorf("pipeline: open source row reader: %w", err)))
 		}
 		defer closeIf(openedRR)
@@ -746,7 +746,7 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 func (m *Migrator) openResumeContext(ctx context.Context, resetting bool) (resumeContext, ir.MigrationState, bool, error) {
 	store, err := openMigrationStateStore(ctx, m.Target, m.TargetDSN, m.TargetSchema)
 	if err != nil {
-		return resumeContext{}, ir.MigrationState{}, false, wrapWithHint(PhaseConnect, err)
+		return resumeContext{}, ir.MigrationState{}, false, migcore.WrapWithHint(migcore.PhaseConnect, err)
 	}
 	rc := resumeContext{
 		store:       store,
@@ -887,7 +887,7 @@ func runBulkCopyWithOpts(
 ) error {
 	if !opts.SkipSchemaApply {
 		if err := sw.CreateTablesWithoutConstraints(ctx, schema); err != nil {
-			return wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: create tables: %w", err))
+			return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: create tables: %w", err))
 		}
 	}
 	// Bug 125: the MySQL VStream snapshot reader re-emits COPY-phase
@@ -997,7 +997,7 @@ func runBulkCopyWithOpts(
 		for _, table := range schema.Tables {
 			if needsIdempotent {
 				if err := copyTableColdStartIdempotentMaybeParallel(ctx, rows, rw, table, opts.Redactor, opts.Shard, fanoutDegree); err != nil {
-					return wrapWithHint(PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", table.Name, err))
+					return migcore.WrapWithHint(migcore.PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", table.Name, err))
 				}
 				continue
 			}
@@ -1009,7 +1009,7 @@ func runBulkCopyWithOpts(
 			// implement ir.ParallelCopyWriter fall through to copyTable
 			// byte-identically.
 			if err := copyTablePlainMaybeParallel(ctx, rows, rw, table, opts.Redactor, opts.Shard, fanoutDegree); err != nil {
-				return wrapWithHint(PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", table.Name, err))
+				return migcore.WrapWithHint(migcore.PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", table.Name, err))
 			}
 		}
 	}
@@ -1019,12 +1019,12 @@ func runBulkCopyWithOpts(
 		if err := runDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
 			return sw.SyncIdentitySequences(ctx, schema)
 		}); err != nil {
-			return wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: sync identity sequences: %w", err))
+			return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: sync identity sequences: %w", err))
 		}
 		if err := runDDLPhaseWithReparentRetry(ctx, "indexes", sw, func(ctx context.Context) error {
 			return sw.CreateIndexes(ctx, schema)
 		}); err != nil {
-			return wrapWithHint(PhaseIndexes, fmt.Errorf("pipeline: create indexes: %w", err))
+			return migcore.WrapWithHint(migcore.PhaseIndexes, fmt.Errorf("pipeline: create indexes: %w", err))
 		}
 	}
 	if opts.SkipSchemaApply {
@@ -1035,11 +1035,11 @@ func runBulkCopyWithOpts(
 	if err := runDDLPhaseWithReparentRetry(ctx, "constraints", sw, func(ctx context.Context) error {
 		return sw.CreateConstraints(ctx, schema)
 	}); err != nil {
-		return wrapWithHint(PhaseConstraints, fmt.Errorf("pipeline: create constraints: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConstraints, fmt.Errorf("pipeline: create constraints: %w", err))
 	}
 	reportDegradedFKs(ctx, sw)
 	if err := runViewsPhase(ctx, schema, sw); err != nil {
-		return wrapWithHint(PhaseViews, err)
+		return migcore.WrapWithHint(migcore.PhaseViews, err)
 	}
 	return nil
 }
@@ -1081,32 +1081,32 @@ func runBulkCopyForAddTable(
 	streamID string,
 ) error {
 	if err := sw.CreateTablesWithoutConstraints(ctx, schema); err != nil {
-		return wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: create tables: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: create tables: %w", err))
 	}
 	for _, table := range schema.Tables {
 		if err := copyTableIdempotent(ctx, rows, rw, table, redactor, streamID); err != nil {
-			return wrapWithHint(PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", table.Name, err))
+			return migcore.WrapWithHint(migcore.PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", table.Name, err))
 		}
 	}
 	// ADR-0114: post-copy DDL phases ride a storage-grow/reparent.
 	if err := runDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
 		return sw.SyncIdentitySequences(ctx, schema)
 	}); err != nil {
-		return wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: sync identity sequences: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: sync identity sequences: %w", err))
 	}
 	if err := runDDLPhaseWithReparentRetry(ctx, "indexes", sw, func(ctx context.Context) error {
 		return sw.CreateIndexes(ctx, schema)
 	}); err != nil {
-		return wrapWithHint(PhaseIndexes, fmt.Errorf("pipeline: create indexes: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseIndexes, fmt.Errorf("pipeline: create indexes: %w", err))
 	}
 	if err := runDDLPhaseWithReparentRetry(ctx, "constraints", sw, func(ctx context.Context) error {
 		return sw.CreateConstraints(ctx, schema)
 	}); err != nil {
-		return wrapWithHint(PhaseConstraints, fmt.Errorf("pipeline: create constraints: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConstraints, fmt.Errorf("pipeline: create constraints: %w", err))
 	}
 	reportDegradedFKs(ctx, sw)
 	if err := runViewsPhase(ctx, schema, sw); err != nil {
-		return wrapWithHint(PhaseViews, err)
+		return migcore.WrapWithHint(migcore.PhaseViews, err)
 	}
 	return nil
 }
@@ -1203,7 +1203,7 @@ func runBulkCopyPhases(
 	}
 	if err := sw.CreateTablesWithoutConstraints(ctx, schema); err != nil {
 		err = fmt.Errorf("pipeline: create tables: %w", err)
-		return wrapWithHint(PhaseSchemaApply, markFailed(ctx, rc, *state, ir.MigrationPhaseTables, err))
+		return migcore.WrapWithHint(migcore.PhaseSchemaApply, markFailed(ctx, rc, *state, ir.MigrationPhaseTables, err))
 	}
 	slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseTables)))
 
@@ -1229,7 +1229,7 @@ func runBulkCopyPhases(
 			return sw.CreateIndexes(ctx, schema)
 		}); err != nil {
 			err = fmt.Errorf("pipeline: create indexes (upfront): %w", err)
-			return wrapWithHint(PhaseIndexes, markFailed(ctx, rc, *state, ir.MigrationPhaseIndexes, err))
+			return migcore.WrapWithHint(migcore.PhaseIndexes, markFailed(ctx, rc, *state, ir.MigrationPhaseIndexes, err))
 		}
 		slog.InfoContext(ctx, "migration: phase complete (upfront)", slog.String("phase", string(ir.MigrationPhaseIndexes)))
 	}
@@ -1285,7 +1285,7 @@ func runBulkCopyPhases(
 			return sw.SyncIdentitySequences(ctx, schema)
 		}); err != nil {
 			err = fmt.Errorf("pipeline: sync identity sequences: %w", err)
-			return wrapWithHint(PhaseSchemaApply, markFailed(ctx, rc, *state, ir.MigrationPhaseIdentitySync, err))
+			return migcore.WrapWithHint(migcore.PhaseSchemaApply, markFailed(ctx, rc, *state, ir.MigrationPhaseIdentitySync, err))
 		}
 		slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseIdentitySync)))
 	} else if ib, ok := sw.(ir.IncrementalIndexBuilder); ok {
@@ -1309,7 +1309,7 @@ func runBulkCopyPhases(
 			return sw.SyncIdentitySequences(ctx, schema)
 		}); err != nil {
 			err = fmt.Errorf("pipeline: sync identity sequences: %w", err)
-			return wrapWithHint(PhaseSchemaApply, markFailed(ctx, rc, *state, ir.MigrationPhaseIdentitySync, err))
+			return migcore.WrapWithHint(migcore.PhaseSchemaApply, markFailed(ctx, rc, *state, ir.MigrationPhaseIdentitySync, err))
 		}
 		slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseIdentitySync)))
 	} else {
@@ -1331,7 +1331,7 @@ func runBulkCopyPhases(
 			return sw.SyncIdentitySequences(ctx, schema)
 		}); err != nil {
 			err = fmt.Errorf("pipeline: sync identity sequences: %w", err)
-			return wrapWithHint(PhaseSchemaApply, markFailed(ctx, rc, *state, ir.MigrationPhaseIdentitySync, err))
+			return migcore.WrapWithHint(migcore.PhaseSchemaApply, markFailed(ctx, rc, *state, ir.MigrationPhaseIdentitySync, err))
 		}
 		slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseIdentitySync)))
 
@@ -1343,7 +1343,7 @@ func runBulkCopyPhases(
 			return sw.CreateIndexes(ctx, schema)
 		}); err != nil {
 			err = fmt.Errorf("pipeline: create indexes: %w", err)
-			return wrapWithHint(PhaseIndexes, markFailed(ctx, rc, *state, ir.MigrationPhaseIndexes, err))
+			return migcore.WrapWithHint(migcore.PhaseIndexes, markFailed(ctx, rc, *state, ir.MigrationPhaseIndexes, err))
 		}
 		slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseIndexes)))
 	}
@@ -1364,7 +1364,7 @@ func runBulkCopyPhases(
 	// no reparent occurred (the common case); only the MySQL writer marks today,
 	// so only a MySQL target ever reconciles.
 	if err := reconcileMigrateReparentTouched(ctx, schema, rows, rw, parallel, redactor, shard); err != nil {
-		return wrapWithHint(PhaseBulkCopy, markFailed(ctx, rc, *state, ir.MigrationPhaseBulkCopy, err))
+		return migcore.WrapWithHint(migcore.PhaseBulkCopy, markFailed(ctx, rc, *state, ir.MigrationPhaseBulkCopy, err))
 	}
 
 	// Phase 5: constraints.
@@ -1375,7 +1375,7 @@ func runBulkCopyPhases(
 		return sw.CreateConstraints(ctx, schema)
 	}); err != nil {
 		err = fmt.Errorf("pipeline: create constraints: %w", err)
-		return wrapWithHint(PhaseConstraints, markFailed(ctx, rc, *state, ir.MigrationPhaseConstraints, err))
+		return migcore.WrapWithHint(migcore.PhaseConstraints, markFailed(ctx, rc, *state, ir.MigrationPhaseConstraints, err))
 	}
 	reportDegradedFKs(ctx, sw)
 	slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseConstraints)))
@@ -1388,7 +1388,7 @@ func runBulkCopyPhases(
 		_ = err
 	}
 	if err := runViewsPhase(ctx, schema, sw); err != nil {
-		return wrapWithHint(PhaseViews, markFailed(ctx, rc, *state, ir.MigrationPhaseViews, err))
+		return migcore.WrapWithHint(migcore.PhaseViews, markFailed(ctx, rc, *state, ir.MigrationPhaseViews, err))
 	}
 	slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseViews)))
 

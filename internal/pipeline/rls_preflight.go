@@ -56,6 +56,7 @@ import (
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // errRLSRefused is the sentinel cause for an RLS-preflight refusal.
@@ -154,7 +155,7 @@ func preflightRLS(ctx context.Context, schema *ir.Schema, handle any, side rlsSi
 	// every table in that case.
 	bypass, role, err := prober.CurrentRoleBypassesRLS(ctx)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf(
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf(
 			"pipeline: RLS preflight: probe %s role BYPASSRLS: %w", side.label(), err,
 		))
 	}
@@ -171,7 +172,7 @@ func preflightRLS(ctx context.Context, schema *ir.Schema, handle any, side rlsSi
 		}
 		enabled, forced, err := prober.TableRLSStatus(ctx, table)
 		if err != nil {
-			return wrapWithHint(PhaseConnect, fmt.Errorf(
+			return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf(
 				"pipeline: RLS preflight: probe %s table %q RLS state: %w",
 				side.label(), table.Name, err,
 			))
@@ -186,7 +187,7 @@ func preflightRLS(ctx context.Context, schema *ir.Schema, handle any, side rlsSi
 	}
 
 	sort.Slice(violations, func(i, j int) bool { return violations[i].Table < violations[j].Table })
-	return wrapWithHint(PhaseConnect, fmt.Errorf(
+	return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf(
 		"%w: %s",
 		errRLSRefused, formatRLSRefusal(side, role, violations),
 	))

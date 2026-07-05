@@ -47,6 +47,7 @@ import (
 	"fmt"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // errShardConsolidationRefused is the sentinel cause for a Shape-A
@@ -153,7 +154,7 @@ func preflightShardConsolidation(
 		if emptyChecker != nil {
 			empty, err := emptyChecker.IsTableEmpty(ctx, table)
 			if err != nil {
-				return wrapWithHint(PhaseSchemaApply, fmt.Errorf(
+				return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf(
 					"pipeline: shard preflight: probe %q empty: %w", table.Name, err,
 				))
 			}
@@ -164,12 +165,12 @@ func preflightShardConsolidation(
 		// Check (1): no NULL discriminator on existing rows.
 		hasNull, err := prober.HasNullShardColumn(ctx, table, shardName)
 		if err != nil {
-			return wrapWithHint(PhaseSchemaApply, fmt.Errorf(
+			return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf(
 				"pipeline: shard preflight: probe %q NULL %q: %w", table.Name, shardName, err,
 			))
 		}
 		if hasNull {
-			return wrapWithHint(PhaseSchemaApply, fmt.Errorf(
+			return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf(
 				"%w: target table %q has rows with NULL %q — a previous non-shard-aware load contaminated the table; "+
 					"reconcile by either backfilling the discriminator (UPDATE %s SET %s = <shard_value> WHERE %s IS NULL) "+
 					"or by passing --reset-target-data + --yes to wipe the table and start clean. "+
@@ -180,13 +181,13 @@ func preflightShardConsolidation(
 		// Check (2): incoming shard's VALUE not already present.
 		present, err := prober.ShardValuePresent(ctx, table, shardName, shardValue)
 		if err != nil {
-			return wrapWithHint(PhaseSchemaApply, fmt.Errorf(
+			return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf(
 				"pipeline: shard preflight: probe %q value %v on %q: %w",
 				table.Name, shardValue, shardName, err,
 			))
 		}
 		if present {
-			return wrapWithHint(PhaseSchemaApply, fmt.Errorf(
+			return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf(
 				"%w: target table %q already has rows with %s = %v — this shard is already loaded "+
 					"or the operator reused a shard value (cross-shard collision risk). "+
 					"Recovery: (a) pick a fresh VALUE for --inject-shard-column NAME=VALUE if a sibling shard "+
@@ -198,12 +199,12 @@ func preflightShardConsolidation(
 		// Check (3): composite PK leads with the discriminator.
 		leads, err := prober.CompositePKLeadsWith(ctx, table, shardName)
 		if err != nil {
-			return wrapWithHint(PhaseSchemaApply, fmt.Errorf(
+			return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf(
 				"pipeline: shard preflight: probe %q PK lead %q: %w", table.Name, shardName, err,
 			))
 		}
 		if !leads {
-			return wrapWithHint(PhaseSchemaApply, fmt.Errorf(
+			return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf(
 				"%w: target table %q does not have a composite PRIMARY KEY leading with %q — "+
 					"the Shape A disjointness guarantee rests on (discriminator, …source PK); without it "+
 					"a CDC update from a sibling shard could silently mis-target this shard's row. "+

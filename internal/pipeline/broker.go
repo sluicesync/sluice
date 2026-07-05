@@ -70,6 +70,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/translate"
 )
 
@@ -376,13 +377,13 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 	// 1. Open the applier and ensure its control table exists.
 	applier, err := b.Target.OpenChangeApplier(ctx, b.TargetDSN)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("broker: open target change applier: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("broker: open target change applier: %w", err))
 	}
 	defer closeIf(applier)
 	applyMaxBufferBytes(applier, b.MaxBufferBytes)
 	applyApplyConcurrency(applier, resolveReplayApplyConcurrency(b.ApplyConcurrency))
 	if err := applier.EnsureControlTable(ctx); err != nil {
-		return wrapWithHint(PhaseSchemaApply, fmt.Errorf("broker: ensure control table: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("broker: ensure control table: %w", err))
 	}
 
 	// 2. Check existing position. Three branches downstream:
@@ -394,7 +395,7 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 	//     stream's resume state).
 	persisted, found, err := applier.ReadPosition(ctx, b.StreamID)
 	if err != nil {
-		return wrapWithHint(PhaseCDC, fmt.Errorf("broker: read position: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("broker: read position: %w", err))
 	}
 
 	// Bug 39 fix (v0.20.1): identify broker-owned rows via the
@@ -488,7 +489,7 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 	// first tick attempts to decrypt a change chunk. preflightChainEncryption
 	// is a no-op for plaintext chains.
 	if err := b.preflightChainEncryption(ctx); err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("broker: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("broker: %w", err))
 	}
 
 	// 5. Drive the tick loop. Each tick: list manifests, replay any
@@ -529,7 +530,7 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 				)
 				return nil
 			}
-			return wrapWithHint(PhaseCDC, fmt.Errorf("broker: tick: %w", applyErr))
+			return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("broker: tick: %w", applyErr))
 		}
 
 		// Advance in-memory cursor only on successful applies. The
@@ -672,7 +673,7 @@ func (b *SyncFromBackup) coldStart(ctx context.Context, applier ir.ChangeApplier
 func (b *SyncFromBackup) coldStartReset(ctx context.Context, applier ir.ChangeApplier) (string, error) {
 	chain, err := b.brokerChain(ctx)
 	if err != nil {
-		return "", wrapWithHint(PhaseConnect, fmt.Errorf("broker: build chain: %w", err))
+		return "", migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("broker: build chain: %w", err))
 	}
 	if len(chain) == 0 {
 		return "", errors.New("broker: chain is empty; cannot --reset-target-data with no full backup in store")
@@ -723,7 +724,7 @@ func (b *SyncFromBackup) coldStartReset(ctx context.Context, applier ir.ChangeAp
 func (b *SyncFromBackup) dropExistingTargetTables(ctx context.Context, schema *ir.Schema) error {
 	rw, err := b.Target.OpenRowWriter(ctx, b.TargetDSN)
 	if err != nil {
-		return wrapWithHint(PhaseConnect,
+		return migcore.WrapWithHint(migcore.PhaseConnect,
 			fmt.Errorf("broker: --reset-target-data: open row writer: %w", err))
 	}
 	defer closeIf(rw)
@@ -755,7 +756,7 @@ func (b *SyncFromBackup) dropExistingTargetTables(ctx context.Context, schema *i
 func (b *SyncFromBackup) coldStartAtChainID(ctx context.Context, applier ir.ChangeApplier) (string, error) {
 	chain, err := b.brokerChain(ctx)
 	if err != nil {
-		return "", wrapWithHint(PhaseConnect, fmt.Errorf("broker: build chain: %w", err))
+		return "", migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("broker: build chain: %w", err))
 	}
 	found := false
 	for _, link := range chain {

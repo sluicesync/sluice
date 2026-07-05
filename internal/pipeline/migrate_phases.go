@@ -10,6 +10,7 @@ import (
 	"runtime"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/translate"
 )
 
@@ -47,7 +48,7 @@ func (m *Migrator) phaseReadSourceSchema(ctx context.Context, scope *multiDBScop
 	// side is namespaced under --target-schema (ADR-0031).
 	sr, err := m.Source.OpenSchemaReader(ctx, m.SourceDSN)
 	if err != nil {
-		return nil, nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open source schema reader: %w", err))
+		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open source schema reader: %w", err))
 	}
 
 	// ADR-0032: thread the operator's --enable-pg-extension allowlist
@@ -56,7 +57,7 @@ func (m *Migrator) phaseReadSourceSchema(ctx context.Context, scope *multiDBScop
 	// missing on source) bubble up as a clean error before any data
 	// moves.
 	if err := applyEnabledPGExtensions(ctx, sr, m.EnabledPGExtensions); err != nil {
-		return sr, nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: enable PG extensions on source: %w", err))
+		return sr, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: enable PG extensions on source: %w", err))
 	}
 
 	// ADR-0047 tier (b): enable verbatim passthrough for uncatalogued
@@ -82,7 +83,7 @@ func (m *Migrator) phaseReadSourceSchema(ctx context.Context, scope *multiDBScop
 
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
-		return sr, nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: read source schema: %w", err))
+		return sr, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: read source schema: %w", err))
 	}
 	if len(schema.Tables) == 0 {
 		slog.InfoContext(ctx, "source schema has no tables; nothing to migrate")
@@ -199,7 +200,7 @@ func (m *Migrator) phaseTranslateAndGateSchema(ctx context.Context, sr ir.Schema
 	if m.InjectShardColumn.Engaged() {
 		schema, err = translate.InjectShardColumn(schema, m.InjectShardColumn.Name, ir.Varchar{Length: 64})
 		if err != nil {
-			return nil, false, wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: inject shard column: %w", err))
+			return nil, false, migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: inject shard column: %w", err))
 		}
 	}
 
@@ -227,7 +228,7 @@ func (m *Migrator) phaseTranslateAndGateSchema(ctx context.Context, sr ir.Schema
 	// a mid-bulk-copy pgx encode failure. Runs after ApplyMappings so
 	// `--type-override=col=text` short-circuits the refusal.
 	if err := preflightRedactTypes(m.Redactor, schema); err != nil {
-		return nil, false, wrapWithHint(PhaseConnect, err)
+		return nil, false, migcore.WrapWithHint(migcore.PhaseConnect, err)
 	}
 
 	// ---- 1.6. Cross-engine pre-flight refusal ----

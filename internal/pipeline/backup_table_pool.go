@@ -60,6 +60,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // backupDispatchObserver is a TEST-ONLY seam: when non-nil it fires
@@ -215,7 +216,7 @@ func (b *Backup) runBackupTablePool(
 			}
 			defer release()
 			if err := b.backupTableDispatch(tctx, rr, task, chunkRows, committer, chainCEK, within); err != nil {
-				return wrapWithHint(PhaseBulkCopy, fmt.Errorf("backup: table %q: %w", task.table.Name, err))
+				return migcore.WrapWithHint(migcore.PhaseBulkCopy, fmt.Errorf("backup: table %q: %w", task.table.Name, err))
 			}
 			return nil
 		})
@@ -516,7 +517,7 @@ func (b *Backup) openBackupReaderFactory(ctx context.Context, snap *irbackup.Sna
 	}
 	importer, err := opener.OpenSnapshotImporter(ctx, b.SourceDSN)
 	if err != nil {
-		return nil, func() {}, wrapWithHint(PhaseConnect, fmt.Errorf("backup: open snapshot importer: %w", err))
+		return nil, func() {}, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("backup: open snapshot importer: %w", err))
 	}
 	cleanup := func() {
 		if c, ok := importer.(interface{ Close() error }); ok {

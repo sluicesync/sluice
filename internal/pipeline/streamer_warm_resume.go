@@ -9,6 +9,7 @@ import (
 	"log/slog"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // warmResume opens a CDC reader on the source and starts streaming
@@ -47,7 +48,7 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position, lsnTra
 	)
 	cdc, err := openCDCReaderWithOptionalSlot(ctx, s.Source, s.SourceDSN, s.SlotName)
 	if err != nil {
-		return nil, stop, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: open cdc reader: %w", err))
+		return nil, stop, migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: open cdc reader: %w", err))
 	}
 	if lsnTracker != nil {
 		if attacher, ok := cdc.(lsnTrackerAttacher); ok {
@@ -77,7 +78,7 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position, lsnTra
 	changes, err = cdc.StreamChanges(ctx, persisted)
 	if err != nil {
 		closeIf(cdc)
-		return nil, stop, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: start cdc: %w", err))
+		return nil, stop, migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: start cdc: %w", err))
 	}
 	// Hand the caller a closure that closes the CDC reader. The reader's
 	// Close cancels its pump AND closes the underlying syncer/slot, so

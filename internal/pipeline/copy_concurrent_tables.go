@@ -50,6 +50,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/redact"
 )
 
@@ -213,7 +214,7 @@ func runConcurrentTableCopy(
 					cerr = copyTablePlainMaybeParallel(tctx, rows, rw, table, redactor, shard, fanoutDegree)
 				}
 				if cerr != nil {
-					return wrapWithHint(PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", name, cerr))
+					return migcore.WrapWithHint(migcore.PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", name, cerr))
 				}
 			}
 			return nil
@@ -359,7 +360,7 @@ func runWorkStealingTableCopy(
 					cerr = copyTablePlainMaybeParallel(tctx, src, rw, item.table, redactor, shard, fanoutDegree)
 				}
 				if cerr != nil {
-					return wrapWithHint(PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q (chunk %d): %w", item.table.Name, item.chunkIndex, cerr))
+					return migcore.WrapWithHint(migcore.PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q (chunk %d): %w", item.table.Name, item.chunkIndex, cerr))
 				}
 			}
 		})

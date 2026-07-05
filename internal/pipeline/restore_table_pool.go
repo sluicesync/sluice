@@ -72,6 +72,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // restoreDispatchObserver is a TEST-ONLY seam: when non-nil it fires
@@ -152,7 +153,7 @@ func (r *Restore) runRestoreTablePool(
 			// (resolveRestoreParallelism), so the open-connection ceiling
 			// holds by construction without a runtime semaphore.
 			if err := r.restoreTable(tctx, rw, task.table, task.entry, chunkParallelism, factory); err != nil {
-				return wrapWithHint(PhaseBulkCopy, fmt.Errorf("restore: table %q: %w", task.table.Name, err))
+				return migcore.WrapWithHint(migcore.PhaseBulkCopy, fmt.Errorf("restore: table %q: %w", task.table.Name, err))
 			}
 			return nil
 		})

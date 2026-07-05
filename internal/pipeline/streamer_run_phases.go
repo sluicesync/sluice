@@ -13,6 +13,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/appliercontrol"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // seedLiveAddedFilter performs a one-shot read of the per-target
@@ -128,25 +129,25 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 		applyApplyConcurrency(s.Applier, s.resolvedApplyConcurrency)
 		applyRedactor(s.Applier, s.Redactor)
 		if err := checkShardColumnSupport(s.Applier, s.InjectShardColumn, "sync"); err != nil {
-			return nil, false, wrapWithHint(PhaseConnect, err)
+			return nil, false, migcore.WrapWithHint(migcore.PhaseConnect, err)
 		}
 		applyShardColumn(s.Applier, s.InjectShardColumn)
 		// ADR-0054 Shape A Phase 2: engage live-coordination lease
 		// manager when the operator's flags + target engine allow.
 		if err := s.engageShardCoordination(ctx, s.Applier); err != nil {
-			return nil, false, wrapWithHint(PhaseConnect, err)
+			return nil, false, migcore.WrapWithHint(migcore.PhaseConnect, err)
 		}
 		// ADR-0058: engage single-stream ADD COLUMN forwarding when
 		// the operator opts in and Shape A is NOT engaged. No-op
 		// otherwise.
 		if err := s.engageAddColumnForward(ctx); err != nil {
-			return nil, false, wrapWithHint(PhaseConnect, err)
+			return nil, false, migcore.WrapWithHint(migcore.PhaseConnect, err)
 		}
 		return s.Applier, false, nil
 	}
 	a, err := s.Target.OpenChangeApplier(ctx, s.TargetDSN)
 	if err != nil {
-		return nil, false, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open target change applier: %w", err))
+		return nil, false, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open target change applier: %w", err))
 	}
 	applyMaxBufferBytes(a, s.MaxBufferBytes)
 	applyTargetSchema(a, s.TargetSchema)
@@ -155,21 +156,21 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 	applyRedactor(a, s.Redactor)
 	if err := checkShardColumnSupport(a, s.InjectShardColumn, "sync"); err != nil {
 		closeIf(a)
-		return nil, false, wrapWithHint(PhaseConnect, err)
+		return nil, false, migcore.WrapWithHint(migcore.PhaseConnect, err)
 	}
 	applyShardColumn(a, s.InjectShardColumn)
 	// ADR-0054 Shape A Phase 2: engage live-coordination lease
 	// manager when the operator's flags + target engine allow.
 	if err := s.engageShardCoordination(ctx, a); err != nil {
 		closeIf(a)
-		return nil, false, wrapWithHint(PhaseConnect, err)
+		return nil, false, migcore.WrapWithHint(migcore.PhaseConnect, err)
 	}
 	// ADR-0058: engage single-stream ADD COLUMN forwarding when
 	// the operator opts in and Shape A is NOT engaged. No-op
 	// otherwise.
 	if err := s.engageAddColumnForward(ctx); err != nil {
 		closeIf(a)
-		return nil, false, wrapWithHint(PhaseConnect, err)
+		return nil, false, migcore.WrapWithHint(migcore.PhaseConnect, err)
 	}
 	return a, true, nil
 }
@@ -284,7 +285,7 @@ func (s *Streamer) phaseStartMetricsServer(ctx context.Context, applier ir.Chang
 	}
 	metricsSrv, mErr := NewMetricsServer(s.MetricsListen, applier)
 	if mErr != nil {
-		return nil, func() {}, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: prepare metrics server: %w", mErr))
+		return nil, func() {}, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: prepare metrics server: %w", mErr))
 	}
 	metricsSrv.SetBuildInfo(s.BuildVersion, s.BuildCommit)
 	if aimdController != nil {
@@ -320,7 +321,7 @@ func (s *Streamer) phaseStartMetricsServer(ctx context.Context, applier ir.Chang
 	}
 	if mErr := metricsSrv.Start(); mErr != nil {
 		spillCleanup()
-		return nil, func() {}, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: start metrics server: %w", mErr))
+		return nil, func() {}, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: start metrics server: %w", mErr))
 	}
 	slog.InfoContext(ctx, "metrics server listening", slog.String("addr", s.MetricsListen))
 	return metricsSrv, spillCleanup, nil
@@ -347,12 +348,12 @@ func (s *Streamer) phasePrepareControlTable(ctx context.Context, applier ir.Chan
 				// target DSN with no database has nowhere to put the
 				// control table — name one and the per-source databases
 				// still route correctly.
-				return wrapWithHint(PhaseSchemaApply, fmt.Errorf(
+				return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf(
 					"pipeline: ensure control table (multi-database mode): the target DSN must name a database "+
 						"to host sluice_cdc_state (user data still routes to per-source-database namespaces): %w", err,
 				))
 			}
-			return wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: ensure control table: %w", err))
+			return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: ensure control table: %w", err))
 		}
 	}
 
@@ -364,7 +365,7 @@ func (s *Streamer) phasePrepareControlTable(ctx context.Context, applier ir.Chan
 	// same read-only reason as EnsureControlTable above.
 	if !s.DryRun {
 		if err := applier.ClearStopRequested(ctx, streamID); err != nil {
-			return wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: clear stop signal: %w", err))
+			return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: clear stop signal: %w", err))
 		}
 	}
 
@@ -420,10 +421,10 @@ func (s *Streamer) phasePrepareControlTable(ctx context.Context, applier ir.Chan
 		if fingerprint != "" {
 			existing, err := applier.ListStreams(ctx)
 			if err != nil {
-				return wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: list streams for fingerprint check: %w", err))
+				return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: list streams for fingerprint check: %w", err))
 			}
 			if err := checkStreamIDCollision(streamID, fingerprint, existing); err != nil {
-				return wrapWithHint(PhaseSchemaApply, err)
+				return migcore.WrapWithHint(migcore.PhaseSchemaApply, err)
 			}
 			applySourceFingerprint(applier, fingerprint)
 		}
@@ -452,14 +453,14 @@ func (s *Streamer) phaseLookupPosition(ctx context.Context, applier ir.ChangeApp
 	if s.PositionFromManifestStore != nil {
 		chainPos, err := LoadChainTerminalPosition(ctx, s.PositionFromManifestStore)
 		if err != nil {
-			return ir.Position{}, false, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: %w", err))
+			return ir.Position{}, false, migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: %w", err))
 		}
 		// Run Phase 3.3.C pre-flight checks before opening CDC. PG-only
 		// today; MySQL has no operator-attention surface here. Refuses
 		// when a check is fatal (slot lost / missing); warns otherwise
 		// (or refuses on warning when StrictPreflight is set).
 		if err := s.runPositionFromManifestPreflight(ctx, chainPos); err != nil {
-			return ir.Position{}, false, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: position-from-manifest preflight: %w", err))
+			return ir.Position{}, false, migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: position-from-manifest preflight: %w", err))
 		}
 		persisted = retagPositionForSource(chainPos, s.Source.Name())
 		found = true
@@ -473,7 +474,7 @@ func (s *Streamer) phaseLookupPosition(ctx context.Context, applier ir.ChangeApp
 		var err error
 		persisted, found, err = applier.ReadPosition(ctx, streamID)
 		if err != nil {
-			return ir.Position{}, false, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: read position: %w", err))
+			return ir.Position{}, false, migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: read position: %w", err))
 		}
 		// The applier stamps every row it reads back with the applier's
 		// own engine name (target's engine), but the position itself is a
@@ -725,7 +726,7 @@ func (s *Streamer) phasePrimeSchemaHistoryCache(ctx context.Context, applier ir.
 			primePos = persisted
 		}
 		if err := primer.PrimeSchemaHistoryCache(ctx, streamID, primePos); err != nil {
-			return wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: prime schema-history cache: %w", err))
+			return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: prime schema-history cache: %w", err))
 		}
 	}
 	return nil
@@ -951,7 +952,7 @@ func (s *Streamer) phaseSettleDispatch(ctx context.Context, applier ir.ChangeApp
 		_, isRetriable := classifyRetriable(dispatchErr)
 		isCtxTermination := errors.Is(dispatchErr, context.Canceled) || errors.Is(dispatchErr, context.DeadlineExceeded)
 		if isRetriable || !isCtxTermination {
-			return wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: apply changes: %w", dispatchErr))
+			return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: apply changes: %w", dispatchErr))
 		}
 		// Bare ctx termination from outer shutdown — fall through to the
 		// stop-cleanup path below; runOnce returns nil.
@@ -967,7 +968,7 @@ func (s *Streamer) phaseSettleDispatch(ctx context.Context, applier ir.ChangeApp
 	// applier.
 	if dispatchErr == nil {
 		if srcErr := surfaceSourceError(s.sourceErrFn); srcErr != nil {
-			return wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: source cdc reader: %w", srcErr))
+			return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: source cdc reader: %w", srcErr))
 		}
 	}
 	// On a stop-signal-driven graceful drain, clear stop_requested_at

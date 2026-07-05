@@ -41,6 +41,8 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // errCopySlotsExhausted is the sentinel the gate returns when the target
@@ -138,7 +140,7 @@ func (g *copyParallelismGate) shrinkAndBackoff(ctx context.Context, chunkIndex i
 	if decision.GiveUp {
 		giveUpEffective := g.effective
 		g.mu.Unlock()
-		return 0, wrapWithHint(PhaseConnect, fmt.Errorf(
+		return 0, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf(
 			"%w: still SQLSTATE 53300 after %d backoff(s) (parallelism reduced to %d, ~%s waited); "+
 				"free connections (close idle / orphaned sessions — see --reap-stale-backends), "+
 				"raise max_connections, or lower --bulk-parallelism / --max-target-connections",

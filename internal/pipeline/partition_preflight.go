@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // Bug 100 (v0.92.0). PG native declarative partitioning
@@ -75,7 +76,7 @@ func preflightPartitionedTables(ctx context.Context, handle any, sourceCaps ir.C
 	}
 	partitioned, err := prober.PartitionedTables(ctx)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf(
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf(
 			"pipeline: partition preflight: probe source for partitioned tables: %w", err,
 		))
 	}
@@ -108,7 +109,7 @@ func preflightPartitionedTables(ctx context.Context, handle any, sourceCaps ir.C
 		return nil
 	}
 
-	return wrapWithHint(PhaseConnect, fmt.Errorf(
+	return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf(
 		"%w: %s",
 		errPartitionedTableRefused, formatPartitionedRefusal(inScope),
 	))

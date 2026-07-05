@@ -10,6 +10,7 @@ import (
 	"log/slog"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/translate"
 )
 
@@ -99,7 +100,7 @@ func (s *Streamer) resolveStreamDatabases(ctx context.Context) (selected []strin
 
 	all, err := lister.ListDatabases(ctx, s.SourceDSN)
 	if err != nil {
-		return nil, nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: list source databases: %w", err))
+		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: list source databases: %w", err))
 	}
 
 	// Resolve the selected SOURCE set (ADR-0142: map-only ⇒ the map keys ARE
@@ -229,7 +230,7 @@ func (s *Streamer) coldStartMultiDatabase(
 			// identity when the source is unmapped.
 			target := s.NamespaceMap.Apply(database)
 			if err := targetDeriver.EnsureDatabase(ctx, s.TargetDSN, target); err != nil {
-				return nil, stop, wrapWithHint(PhaseSchemaApply,
+				return nil, stop, migcore.WrapWithHint(migcore.PhaseSchemaApply,
 					fmt.Errorf("pipeline: ensure target database %q: %w", target, err))
 			}
 		}
@@ -240,7 +241,7 @@ func (s *Streamer) coldStartMultiDatabase(
 	// the position handed to CDC below is captured at one consistent cut. ----
 	stream, err := opener.OpenMultiDatabaseSnapshotStream(ctx, s.SourceDSN, selected)
 	if err != nil {
-		return nil, stop, wrapWithHint(PhaseSnapshot, fmt.Errorf("pipeline: open multi-database snapshot stream: %w", err))
+		return nil, stop, migcore.WrapWithHint(migcore.PhaseSnapshot, fmt.Errorf("pipeline: open multi-database snapshot stream: %w", err))
 	}
 	// Once the snapshot is open every error path must tear it down. The
 	// pre-anchor rule (Bug 177, see coldStartOpenTargetWriters) picks
@@ -289,7 +290,7 @@ func (s *Streamer) coldStartMultiDatabase(
 	if pw, ok := applier.(ir.PositionWriter); ok {
 		if err := pw.WritePosition(ctx, streamID, stream.Position); err != nil {
 			abandonStream()
-			return nil, stop, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: persist multi-database cold-start CDC anchor position: %w", err))
+			return nil, stop, migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: persist multi-database cold-start CDC anchor position: %w", err))
 		}
 		slog.DebugContext(
 			ctx, "multi-database cold-start CDC anchor persisted",
@@ -353,7 +354,7 @@ func (s *Streamer) coldStartMultiDatabase(
 	changes, err = stream.Changes.StreamChanges(ctx, stream.Position)
 	if err != nil {
 		closeStream()
-		return nil, stop, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: start multi-database cdc: %w", err))
+		return nil, stop, migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: start multi-database cdc: %w", err))
 	}
 	stop = func() { _ = stream.Close() }
 	if errer, ok := stream.Changes.(interface{ Err() error }); ok {
@@ -442,7 +443,7 @@ func (s *Streamer) warmResumeMultiDatabase(
 	// Open the bare server-wide CDC reader (no snapshot, no copy).
 	cdc, err := opener.OpenServerCDCReader(ctx, s.SourceDSN)
 	if err != nil {
-		return nil, stop, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: open server-wide cdc reader: %w", err))
+		return nil, stop, migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: open server-wide cdc reader: %w", err))
 	}
 	// Once the reader is open every error path must close it.
 	closeReader := func() { closeIf(cdc) }
@@ -495,7 +496,7 @@ func (s *Streamer) warmResumeMultiDatabase(
 	changes, err = cdc.StreamChanges(ctx, persisted)
 	if err != nil {
 		closeReader()
-		return nil, stop, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: resume multi-database cdc: %w", err))
+		return nil, stop, migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: resume multi-database cdc: %w", err))
 	}
 	stop = func() { closeIf(cdc) }
 	if errer, ok := cdc.(interface{ Err() error }); ok {
@@ -547,7 +548,7 @@ func (s *Streamer) coldStartCopyOneDatabase(
 
 	sr, err := s.Source.OpenSchemaReader(ctx, srcDSN)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open source schema reader for %q: %w", database, err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open source schema reader for %q: %w", database, err))
 	}
 	applyTableScope(sr, s.Filter)
 	applyMultiDatabaseScope(sr, &multiDBScope{database: database, inScope: inScope})
@@ -624,7 +625,7 @@ func (s *Streamer) coldStartCopyOneDatabase(
 
 	sw, err := s.Target.OpenSchemaWriter(ctx, targetDSN)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open target schema writer for %q: %w", database, err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open target schema writer for %q: %w", database, err))
 	}
 	applyTargetSchema(sw, targetSchema)
 	applyIndexBuildMem(sw, s.IndexBuildMem)
@@ -633,7 +634,7 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	rw, err := s.Target.OpenRowWriter(ctx, targetDSN)
 	if err != nil {
 		closeIf(sw)
-		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open target row writer for %q: %w", database, err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open target row writer for %q: %w", database, err))
 	}
 	applyTargetSchema(rw, targetSchema)
 	applyMaxBufferBytes(rw, s.MaxBufferBytes)

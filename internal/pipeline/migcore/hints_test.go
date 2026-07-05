@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package pipeline
+package migcore
 
 import (
 	"errors"
@@ -167,9 +167,9 @@ func TestHintForCaseInsensitive(t *testing.T) {
 // the original error text intact above it.
 func TestWrapWithHintAppendsHintLine(t *testing.T) {
 	inner := errors.New(`postgres: insert into "users": ERROR: relation "users" does not exist`)
-	wrapped := wrapWithHint(PhaseBulkCopy, inner)
+	wrapped := WrapWithHint(PhaseBulkCopy, inner)
 	if wrapped == nil {
-		t.Fatal("wrapWithHint returned nil for a hintable error")
+		t.Fatal("WrapWithHint returned nil for a hintable error")
 	}
 	got := wrapped.Error()
 	if !strings.Contains(got, inner.Error()) {
@@ -187,20 +187,20 @@ func TestWrapWithHintAppendsHintLine(t *testing.T) {
 // no-allocation pass-through is the property we care about.
 func TestWrapWithHintNoMatchReturnsBareError(t *testing.T) {
 	inner := errors.New("unrelated boring error")
-	got := wrapWithHint(PhaseBulkCopy, inner)
+	got := WrapWithHint(PhaseBulkCopy, inner)
 	if got == nil || got.Error() != inner.Error() {
-		t.Errorf("wrapWithHint should return the bare error when no hint matches; got %v want %v", got, inner)
+		t.Errorf("WrapWithHint should return the bare error when no hint matches; got %v want %v", got, inner)
 	}
 	if strings.Contains(got.Error(), "hint:") {
-		t.Errorf("wrapWithHint added a hint when none should match: %q", got.Error())
+		t.Errorf("WrapWithHint added a hint when none should match: %q", got.Error())
 	}
 }
 
 // TestWrapWithHintNil ensures wrapping nil returns nil so callers
 // can use it inline at any error-return site without a guard.
 func TestWrapWithHintNil(t *testing.T) {
-	if got := wrapWithHint(PhaseBulkCopy, nil); got != nil {
-		t.Errorf("wrapWithHint(_, nil) = %v; want nil", got)
+	if got := WrapWithHint(PhaseBulkCopy, nil); got != nil {
+		t.Errorf("WrapWithHint(_, nil) = %v; want nil", got)
 	}
 }
 
@@ -217,9 +217,9 @@ func TestWrapWithHintPreservesErrorsIs(t *testing.T) {
 		base: sentinel,
 		msg:  `postgres: insert into "users": ERROR: relation "users" does not exist`,
 	}
-	wrapped := wrapWithHint(PhaseBulkCopy, inner)
+	wrapped := WrapWithHint(PhaseBulkCopy, inner)
 	if !errors.Is(wrapped, sentinel) {
-		t.Errorf("errors.Is should traverse through wrapWithHint; wrapped=%v sentinel=%v", wrapped, sentinel)
+		t.Errorf("errors.Is should traverse through WrapWithHint; wrapped=%v sentinel=%v", wrapped, sentinel)
 	}
 }
 
@@ -240,18 +240,18 @@ func TestHintRegistryEntriesAllCoded(t *testing.T) {
 }
 
 // TestWrapWithHintAttachesCode pins the structured-metadata side of
-// wrapWithHint: the matched entry's stable code and hint are
+// WrapWithHint: the matched entry's stable code and hint are
 // extractable via sluicecode.FromError, while the Error() text keeps
 // the exact prose-plus-"hint:" shape the earlier tests assert.
 func TestWrapWithHintAttachesCode(t *testing.T) {
 	inner := errors.New(
 		`pipeline: create indexes: mysql: ALTER TABLE bench ADD INDEX idx_val: Error 3024: Query execution was interrupted, maximum statement execution time exceeded`,
 	)
-	wrapped := wrapWithHint(PhaseIndexes, inner)
+	wrapped := WrapWithHint(PhaseIndexes, inner)
 
 	ce, ok := sluicecode.FromError(wrapped)
 	if !ok {
-		t.Fatal("wrapWithHint did not attach a CodedError")
+		t.Fatal("WrapWithHint did not attach a CodedError")
 	}
 	if ce.Code != sluicecode.CodeIndexStatementTimeLimit {
 		t.Errorf("Code = %q; want %q", ce.Code, sluicecode.CodeIndexStatementTimeLimit)

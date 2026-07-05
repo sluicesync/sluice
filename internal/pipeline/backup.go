@@ -373,7 +373,7 @@ func (b *Backup) Run(ctx context.Context) error {
 	// 1. Read source schema.
 	sr, err := b.Source.OpenSchemaReader(ctx, b.SourceDSN)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("backup: open source schema reader: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("backup: open source schema reader: %w", err))
 	}
 	defer closeIf(sr)
 
@@ -391,7 +391,7 @@ func (b *Backup) Run(ctx context.Context) error {
 
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("backup: read source schema: %w", err))
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("backup: read source schema: %w", err))
 	}
 	if len(schema.Tables) == 0 {
 		slog.InfoContext(ctx, "backup: source schema has no tables; manifest with empty table list will be written")
@@ -676,7 +676,7 @@ func (b *Backup) Run(ctx context.Context) error {
 		)
 	default:
 		if err := b.captureEndPosition(ctx, manifest); err != nil {
-			return wrapWithHint(PhaseConnect, fmt.Errorf("backup: capture end position: %w", err))
+			return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("backup: capture end position: %w", err))
 		}
 	}
 
@@ -996,7 +996,7 @@ func (b *Backup) openSnapshotOrFallback(ctx context.Context, schema *ir.Schema, 
 
 	rr, err := b.Source.OpenRowReader(ctx, b.SourceDSN)
 	if err != nil {
-		return nil, nil, nil, func() {}, wrapWithHint(PhaseConnect, fmt.Errorf("backup: open source row reader: %w", err))
+		return nil, nil, nil, func() {}, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("backup: open source row reader: %w", err))
 	}
 	cleanup := func() { closeIf(rr) }
 	return rr, nil, nil, cleanup, nil

@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package pipeline
+package migcore
 
 // Operator-facing hint layer for wrapped engine errors.
 //
@@ -48,7 +48,7 @@ import (
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
-// Phase identifiers used by [hintFor] and [wrapWithHint] to scope
+// Phase identifiers used by [hintFor] and [WrapWithHint] to scope
 // hint matching. The strings are stable: tests reference them, and
 // the registry keys off them. Empty string means "any phase".
 const (
@@ -73,13 +73,13 @@ type errorHint struct {
 	contains string
 
 	// hint is the line emitted after the wrapped error. No leading
-	// "hint:" prefix; that's added by wrapWithHint.
+	// "hint:" prefix; that's added by WrapWithHint.
 	hint string
 
 	// code is the stable machine-parsable identifier for this hint's
 	// error class (docs/operator/error-codes.md). Every entry MUST
 	// carry one — a hint without a code is a registry bug the tests
-	// catch. wrapWithHint attaches it as [sluicecode.CodedError]
+	// catch. WrapWithHint attaches it as [sluicecode.CodedError]
 	// metadata; the human-facing message is unchanged.
 	code sluicecode.Code
 }
@@ -237,7 +237,7 @@ func matchErrorHint(phase string, err error) (errorHint, bool) {
 	return errorHint{}, false
 }
 
-// wrapWithHint returns err with a "hint: ..." line appended when
+// WrapWithHint returns err with a "hint: ..." line appended when
 // the registry has a relevant entry for the given phase. When no
 // hint matches, returns err unchanged so the call site reads the
 // same as it did before this layer existed.
@@ -250,7 +250,7 @@ func matchErrorHint(phase string, err error) (errorHint, bool) {
 // [sluicecode.CodedError] metadata, extractable at the CLI's exit/
 // logging boundary (the `code`/`hint` attrs under --log-format json).
 // The Error() text is byte-identical to the pre-metadata wrapping.
-func wrapWithHint(phase string, err error) error {
+func WrapWithHint(phase string, err error) error {
 	if err == nil {
 		return nil
 	}
