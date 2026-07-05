@@ -39,6 +39,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -157,7 +158,7 @@ func TestMigrate_PG_Verbatim_Ltree_Passthrough(t *testing.T) {
 			va.SetVerbatimExtensionPassthrough(true)
 		}
 		s2, err := ir2.ReadSchema(ctx)
-		closeIf(ir2)
+		migcore.CloseIf(ir2)
 		if err != nil {
 			t.Fatalf("ReadSchema (opclass check): %v", err)
 		}
@@ -195,7 +196,7 @@ func TestMigrate_PG_Verbatim_Ltree_Passthrough(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSchemaReader: %v", err)
 	}
-	defer closeIf(rdr)
+	defer migcore.CloseIf(rdr)
 	if va, ok := rdr.(ir.VerbatimExtensionAware); ok {
 		va.SetVerbatimExtensionPassthrough(true)
 	} else {
@@ -246,7 +247,7 @@ func TestSchemaReader_PG_Verbatim_NotEnabled_StillLoudRefuses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSchemaReader: %v", err)
 	}
-	defer closeIf(rdr)
+	defer migcore.CloseIf(rdr)
 	// Deliberately DO NOT call SetVerbatimExtensionPassthrough — this
 	// is the cross-engine / no-same-engine-guarantee posture.
 	if _, err := rdr.ReadSchema(ctx); err == nil {

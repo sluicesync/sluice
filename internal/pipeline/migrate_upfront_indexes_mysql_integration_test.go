@@ -23,6 +23,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	// Register the mysql engine so engines.Get("mysql") works.
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
@@ -93,7 +94,7 @@ func TestMigrate_UpfrontIndexes_MySQLToMySQL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSchemaReader: %v", err)
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 
 	got, err := sr.ReadSchema(ctx)
 	if err != nil {
@@ -132,7 +133,7 @@ func TestMigrate_UpfrontIndexes_MySQLToMySQL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenRowReader: %v", err)
 	}
-	defer closeIf(rr)
+	defer migcore.CloseIf(rr)
 	usersRows := readAll(t, ctx, rr, users)
 	if len(usersRows) != 2 {
 		t.Fatalf("target users rows via reader = %d; want 2", len(usersRows))
@@ -215,7 +216,7 @@ func TestMigrate_UpfrontIndexes_ResumeUnderLiveUniqueIndex_MySQLToMySQL(t *testi
 		t.Fatalf("OpenSchemaReader (after failure): %v", err)
 	}
 	afterFail, err := sr.ReadSchema(ctx)
-	closeIf(sr)
+	migcore.CloseIf(sr)
 	if err != nil {
 		t.Fatalf("ReadSchema (after failure): %v", err)
 	}
@@ -250,7 +251,7 @@ func TestMigrate_UpfrontIndexes_ResumeUnderLiveUniqueIndex_MySQLToMySQL(t *testi
 	if err != nil {
 		t.Fatalf("OpenSchemaReader (final): %v", err)
 	}
-	defer closeIf(sr2)
+	defer migcore.CloseIf(sr2)
 	final, err := sr2.ReadSchema(ctx)
 	if err != nil {
 		t.Fatalf("ReadSchema (final): %v", err)

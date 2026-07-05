@@ -155,21 +155,21 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 	migcore.ApplyApplyConcurrency(a, s.resolvedApplyConcurrency)
 	applyRedactor(a, s.Redactor)
 	if err := checkShardColumnSupport(a, s.InjectShardColumn, "sync"); err != nil {
-		closeIf(a)
+		migcore.CloseIf(a)
 		return nil, false, migcore.WrapWithHint(migcore.PhaseConnect, err)
 	}
 	applyShardColumn(a, s.InjectShardColumn)
 	// ADR-0054 Shape A Phase 2: engage live-coordination lease
 	// manager when the operator's flags + target engine allow.
 	if err := s.engageShardCoordination(ctx, a); err != nil {
-		closeIf(a)
+		migcore.CloseIf(a)
 		return nil, false, migcore.WrapWithHint(migcore.PhaseConnect, err)
 	}
 	// ADR-0058: engage single-stream ADD COLUMN forwarding when
 	// the operator opts in and Shape A is NOT engaged. No-op
 	// otherwise.
 	if err := s.engageAddColumnForward(ctx); err != nil {
-		closeIf(a)
+		migcore.CloseIf(a)
 		return nil, false, migcore.WrapWithHint(migcore.PhaseConnect, err)
 	}
 	return a, true, nil
@@ -884,7 +884,7 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 					deps.backfill = &schemaForwardBackfill{
 						reader:    br,
 						streamID:  streamID,
-						batchSize: defaultBulkBatchSize,
+						batchSize: migcore.DefaultBulkBatchSize,
 					}
 				}
 			}

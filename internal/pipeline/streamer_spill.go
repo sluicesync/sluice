@@ -8,6 +8,7 @@ import (
 	"log/slog"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // attachSpillReporter opens a source-side [ir.SchemaReader], type-asserts
@@ -48,7 +49,7 @@ func (s *Streamer) attachSpillReporter(ctx context.Context, srv *MetricsServer, 
 		// Engine doesn't expose spill stats (today: MySQL). Close the
 		// reader we just opened so the connection doesn't sit idle for
 		// the streamer's lifetime.
-		closeIf(sr)
+		migcore.CloseIf(sr)
 		return noop
 	}
 	slot := s.SlotName
@@ -77,6 +78,6 @@ func (s *Streamer) attachSpillReporter(ctx context.Context, srv *MetricsServer, 
 	)
 	return func() {
 		srv.AttachSpillReporter(nil)
-		closeIf(sr)
+		migcore.CloseIf(sr)
 	}
 }

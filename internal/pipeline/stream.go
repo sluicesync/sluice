@@ -464,7 +464,7 @@ func (b *BackupStream) Run(ctx context.Context) error {
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("stream: open cdc reader: %w", err))
 	}
-	defer func() { closeIf(cdc) }()
+	defer func() { migcore.CloseIf(cdc) }()
 
 	// Chain-consumer ack mode (see [chainAckController]): the stream
 	// has no applier tracker, so without the hold the keepalive acks
@@ -622,7 +622,7 @@ func (b *BackupStream) Run(ctx context.Context) error {
 				case <-ctx.Done():
 					return ctx.Err()
 				}
-				closeIf(cdc)
+				migcore.CloseIf(cdc)
 				cdc, err = openCDCReaderWithSlot(ctx, b.Source, b.SourceDSN, b.SlotName)
 				if err != nil {
 					return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("stream: reopen cdc reader after transient: %w", err))
@@ -1121,7 +1121,7 @@ func (b *BackupStream) refreshSchemaAndAttachDelta(
 	if err != nil {
 		return fmt.Errorf("rollover: open schema reader: %w", err)
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 	afterSchema, err := sr.ReadSchema(ctx)
 	if err != nil {
 		return fmt.Errorf("rollover: read source schema: %w", err)

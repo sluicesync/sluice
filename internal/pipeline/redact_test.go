@@ -417,7 +417,7 @@ func TestRedactRow_RandomizeNoPKRefuses(t *testing.T) {
 
 // TestRedactRows_BufferedRelay pins the perf-parity matrix row-6 fix
 // (gap 6): the redact tee's relay channel carries the standard
-// rowChanBuffer so an engaged redaction never re-introduces an
+// migcore.RowChanBuffer so an engaged redaction never re-introduces an
 // unbuffered rendezvous hop into the bulk-copy hot path.
 func TestRedactRows_BufferedRelay(t *testing.T) {
 	r := redact.New()
@@ -425,7 +425,7 @@ func TestRedactRows_BufferedRelay(t *testing.T) {
 	src := make(chan ir.Row)
 	close(src)
 	out, _ := redactRows(context.Background(), src, r, "public", "users", nil, nil, "")
-	if got := cap(out); got != rowChanBuffer {
-		t.Errorf("redact relay channel cap = %d; want rowChanBuffer (%d)", got, rowChanBuffer)
+	if got := cap(out); got != migcore.RowChanBuffer {
+		t.Errorf("redact relay channel cap = %d; want migcore.RowChanBuffer (%d)", got, migcore.RowChanBuffer)
 	}
 }

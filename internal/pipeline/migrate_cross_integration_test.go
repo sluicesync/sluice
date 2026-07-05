@@ -26,6 +26,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	// Both engines must be registered for engines.Get to find them.
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
@@ -129,7 +130,7 @@ func TestMigrate_MySQLToPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSchemaReader: %v", err)
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 
 	got, err := sr.ReadSchema(ctx)
 	if err != nil {
@@ -245,7 +246,7 @@ func TestMigrate_MySQLToPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenRowReader: %v", err)
 	}
-	defer closeIf(rr)
+	defer migcore.CloseIf(rr)
 
 	usersRows := readAll(t, ctx, rr, users)
 	if len(usersRows) != 2 {
@@ -774,7 +775,7 @@ func TestMigrate_MySQLToPostgres_NoPKUniqueKey_IdempotentCopy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSchemaReader: %v", err)
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
 		t.Fatalf("ReadSchema: %v", err)
@@ -791,7 +792,7 @@ func TestMigrate_MySQLToPostgres_NoPKUniqueKey_IdempotentCopy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenRowWriter: %v", err)
 	}
-	defer closeIf(rw)
+	defer migcore.CloseIf(rw)
 	iw, ok := rw.(ir.IdempotentRowWriter)
 	if !ok {
 		t.Fatal("pg RowWriter does not implement IdempotentRowWriter")
@@ -844,7 +845,7 @@ func TestMigrate_MySQLToPostgres_KeylessRefusedOnIdempotentCopy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSchemaReader: %v", err)
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
 		t.Fatalf("ReadSchema: %v", err)
@@ -858,7 +859,7 @@ func TestMigrate_MySQLToPostgres_KeylessRefusedOnIdempotentCopy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenRowWriter: %v", err)
 	}
-	defer closeIf(rw)
+	defer migcore.CloseIf(rw)
 	iw := rw.(ir.IdempotentRowWriter)
 
 	rows := make(chan ir.Row)

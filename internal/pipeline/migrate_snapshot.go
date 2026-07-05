@@ -120,7 +120,7 @@ func (m *Migrator) openSharedSourceSnapshot(ctx context.Context) *sharedSourceSn
 // sync cold-start wires (streamer_coldstart_parallel.go): each reader is
 // a fresh connection inside its own REPEATABLE READ tx pinned to the
 // shared snapshot name, safe for concurrent calls from peer chunk/table
-// goroutines, its lifecycle owned by the caller's closeIf release path.
+// goroutines, its lifecycle owned by the caller's migcore.CloseIf release path.
 func (s *sharedSourceSnapshot) readerFactory() func(ctx context.Context) (ir.RowReader, error) {
 	snapshotName := s.snap.Name
 	maxBuffer := s.maxBufferBytes

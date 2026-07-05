@@ -166,7 +166,7 @@ func (d *Differ) Run(ctx context.Context) (*irdiff.SchemaDiff, error) {
 	if err != nil {
 		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("diff: open source schema reader: %w", err))
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 	if err := applyEnabledPGExtensions(ctx, sr, d.EnabledPGExtensions); err != nil {
 		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("diff: enable PG extensions on source: %w", err))
 	}
@@ -243,7 +243,7 @@ func (d *Differ) Run(ctx context.Context) (*irdiff.SchemaDiff, error) {
 	if err := applyEnabledPGExtensions(ctx, tr, d.EnabledPGExtensions); err != nil {
 		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("diff: enable PG extensions on target: %w", err))
 	}
-	defer closeIf(tr)
+	defer migcore.CloseIf(tr)
 
 	actual, err := tr.ReadSchema(ctx)
 	if err != nil {
@@ -364,10 +364,10 @@ func previewMissingDDL(ctx context.Context, target ir.Engine, dsn, targetSchema 
 	}
 	migcore.ApplyTargetSchema(sw, targetSchema)
 	if err := applyEnabledPGExtensions(ctx, sw, enabledExtensions); err != nil {
-		closeIf(sw)
+		migcore.CloseIf(sw)
 		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("diff: enable PG extensions on target: %w", err))
 	}
-	defer closeIf(sw)
+	defer migcore.CloseIf(sw)
 
 	tableDDL, err = previewDDLForTables(ctx, sw, expected, missingTables)
 	if err != nil {

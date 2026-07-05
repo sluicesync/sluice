@@ -164,7 +164,7 @@ func (s *Streamer) closeShardCoordination() {
 
 // closeIfErrIgnored is a tiny helper that closes anything implementing
 // Close() error and swallows the error (defer-friendly cleanup path).
-// Mirrors the existing closeIf helper without colliding on signature.
+// Mirrors the existing migcore.CloseIf helper without colliding on signature.
 func closeIfErrIgnored(v any) error {
 	if c, ok := v.(interface{ Close() error }); ok {
 		return c.Close()

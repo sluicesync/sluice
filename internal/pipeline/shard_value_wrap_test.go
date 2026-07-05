@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // TestShardStampRow_StampsAndEmptyNoop pins the load-bearing
@@ -136,14 +137,14 @@ func TestShardStampRows_StampsNonStringValue(t *testing.T) {
 
 // TestShardStampRows_BufferedRelay pins the perf-parity matrix row-6
 // fix (gap 6): the shard-stamp tee's relay channel carries the
-// standard rowChanBuffer so an engaged discriminator stamp never
+// standard migcore.RowChanBuffer so an engaged discriminator stamp never
 // re-introduces an unbuffered rendezvous hop into the bulk-copy hot
 // path.
 func TestShardStampRows_BufferedRelay(t *testing.T) {
 	src := make(chan ir.Row)
 	close(src)
 	out, _ := shardStampRows(context.Background(), src, "shard_id", "s1")
-	if got := cap(out); got != rowChanBuffer {
-		t.Errorf("shard-stamp relay channel cap = %d; want rowChanBuffer (%d)", got, rowChanBuffer)
+	if got := cap(out); got != migcore.RowChanBuffer {
+		t.Errorf("shard-stamp relay channel cap = %d; want migcore.RowChanBuffer (%d)", got, migcore.RowChanBuffer)
 	}
 }

@@ -30,6 +30,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	// Register the engines engines.Get needs.
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
@@ -223,7 +224,7 @@ func runSQLiteDumpRoundTrip(t *testing.T, targetName string, start func(*testing
 	if err != nil {
 		t.Fatalf("OpenSchemaReader: %v", err)
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 	got, err := sr.ReadSchema(ctx)
 	if err != nil {
 		t.Fatalf("ReadSchema: %v", err)
@@ -249,7 +250,7 @@ func assertSQLiteRoundTrip(t *testing.T, eng ir.Engine, dsn string) {
 	if err != nil {
 		t.Fatalf("OpenSchemaReader: %v", err)
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 	got, err := sr.ReadSchema(ctx)
 	if err != nil {
 		t.Fatalf("ReadSchema: %v", err)
@@ -277,7 +278,7 @@ func assertSQLiteRoundTrip(t *testing.T, eng ir.Engine, dsn string) {
 	if err != nil {
 		t.Fatalf("OpenRowReader: %v", err)
 	}
-	defer closeIf(rr)
+	defer migcore.CloseIf(rr)
 
 	usersRows := readAll(t, ctx, rr, users)
 	if len(usersRows) != 2 {
@@ -566,7 +567,7 @@ func runSQLiteTemporalRoundTrip(t *testing.T, targetName string, start func(*tes
 	if err != nil {
 		t.Fatalf("OpenSchemaReader: %v", err)
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 	got, err := sr.ReadSchema(ctx)
 	if err != nil {
 		t.Fatalf("ReadSchema: %v", err)
@@ -593,7 +594,7 @@ func runSQLiteTemporalRoundTrip(t *testing.T, targetName string, start func(*tes
 	if err != nil {
 		t.Fatalf("OpenRowReader: %v", err)
 	}
-	defer closeIf(rr)
+	defer migcore.CloseIf(rr)
 	rows := readAll(t, ctx, rr, events)
 	if len(rows) != 2 {
 		t.Fatalf("events rows = %d; want 2", len(rows))

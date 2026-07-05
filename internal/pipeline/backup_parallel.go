@@ -8,7 +8,7 @@
 // same table into PK ranges (ADR-0019/0096/0123) — perf-parity matrix
 // gap #1. This file closes it by reusing migrate's chunk machinery
 // verbatim — [migcore.CanParallelChunkTable], [migcore.ComputeChunkBoundaries],
-// [migcore.ComputeKeysetChunkBoundaries], [readChunkBatch],
+// [migcore.ComputeKeysetChunkBoundaries], [migcore.ReadChunkBatch],
 // [migcore.ClampParallelChunkCount] — inside the ADR-0084 table pool: an
 // eligible table's pool worker plans N disjoint half-open PK ranges
 // ((lower, upper]; nil = unbounded) on its snapshot-pinned reader,
@@ -242,7 +242,7 @@ func (b *Backup) planBackupTableChunks(
 	if !eligible {
 		return nil, reason, nil
 	}
-	// The range workers page via readChunkBatch, so the paging surface is
+	// The range workers page via migcore.ReadChunkBatch, so the paging surface is
 	// required for BOTH strategies; each strategy additionally needs its
 	// boundary surface, and keyset needs the SQL-side upper-bound clip
 	// (ADR-0096 exactly-once — the Go bytewise clip diverges from a
@@ -367,7 +367,7 @@ func (b *Backup) backupTableRanges(
 
 // backupRange streams one half-open PK range ((lower, upper]; nil =
 // unbounded) into chunk files through the shared streamer. It pages
-// the reader with the same cursor-driven [readChunkBatch] migrate's
+// the reader with the same cursor-driven [migcore.ReadChunkBatch] migrate's
 // copyChunk uses — SQL-side upper bound via [ir.BoundedBatchedRowReader]
 // where implemented, so the range partition is collation-correct and
 // exactly-once by construction (ADR-0096).
@@ -388,14 +388,14 @@ func (b *Backup) backupRange(
 	}
 	cursor := bound.LowerPK
 	for {
-		filtered, err := readChunkBatch(ctx, br, table, cursor, bound.UpperPK, pkCols, defaultBulkBatchSize)
+		filtered, err := migcore.ReadChunkBatch(ctx, br, table, cursor, bound.UpperPK, pkCols, migcore.DefaultBulkBatchSize)
 		if err != nil {
 			return fmt.Errorf("read range %d batch: %w", bound.ChunkIndex, err)
 		}
 		var batchCount int64
-		tracker := newPKTracker(pkCols)
+		tracker := migcore.NewPKTracker(pkCols)
 		for row := range filtered {
-			tracker.observe(row)
+			tracker.Observe(row)
 			batchCount++
 			if err := s.writeRow(ctx, row); err != nil {
 				return err
@@ -405,7 +405,7 @@ func (b *Backup) backupRange(
 		// closing the channel on a per-row failure — indistinguishable
 		// from a clean short/empty page. Check before interpreting
 		// batchCount.
-		if err := readerStreamErr(rr, table); err != nil {
+		if err := migcore.ReaderStreamErr(rr, table); err != nil {
 			return err
 		}
 		// A ctx-cancellation must NOT read as a clean end-of-range (the
@@ -420,12 +420,12 @@ func (b *Backup) backupRange(
 		if batchCount == 0 {
 			break // end of range
 		}
-		newCursor, ok := tracker.lastPK()
+		newCursor, ok := tracker.LastPK()
 		if !ok {
 			return errors.New("pipeline: backupRange: batch produced rows but PK tracker captured none")
 		}
 		cursor = newCursor
-		if batchCount < int64(defaultBulkBatchSize) {
+		if batchCount < int64(migcore.DefaultBulkBatchSize) {
 			break // short page ⇒ end of data within the range
 		}
 	}

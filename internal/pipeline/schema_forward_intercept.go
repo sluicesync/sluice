@@ -52,6 +52,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irdiff "sluicesync.dev/sluice/internal/ir/diff"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/translate"
 )
 
@@ -135,7 +136,7 @@ type schemaForwardBackfill struct {
 	streamID string
 
 	// batchSize bounds each SELECT's row count. Reuses the streamer's
-	// BulkBatchSize when > 0; otherwise [defaultBulkBatchSize].
+	// BulkBatchSize when > 0; otherwise [migcore.DefaultBulkBatchSize].
 	batchSize int
 }
 
@@ -951,7 +952,7 @@ func runBackfillForAddedColumn(
 	}
 	batchSize := bf.batchSize
 	if batchSize <= 0 {
-		batchSize = defaultBulkBatchSize
+		batchSize = migcore.DefaultBulkBatchSize
 	}
 	addedNames := make(map[string]struct{}, len(addedCols))
 	for _, c := range addedCols {

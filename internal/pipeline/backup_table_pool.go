@@ -261,7 +261,7 @@ func acquireBackupReader(
 		if err != nil {
 			return nil, func() {}, err
 		}
-		return r, func() { closeIf(r) }, nil
+		return r, func() { migcore.CloseIf(r) }, nil
 	}
 }
 

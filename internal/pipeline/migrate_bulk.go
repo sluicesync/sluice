@@ -41,20 +41,6 @@ import (
 	"sluicesync.dev/sluice/internal/redact"
 )
 
-// defaultBulkBatchSize is the per-batch row count when [Migrator]'s
-// BulkBatchSize is left at zero. 5000 rows is a middle ground:
-//
-//   - Small enough to keep the replay window short on crash. With
-//     5000-row batches a worst-case crash redrives ~1MB of data on a
-//     typical OLTP row.
-//   - Large enough to amortise per-batch tx commit overhead. At
-//     ~100 rows/batch the per-tx fsync becomes a noticeable fraction
-//     of throughput.
-//
-// Operators can tune via --bulk-batch-size; the help text on the CLI
-// flag covers the trade-off.
-const defaultBulkBatchSize = 5000
-
 // bulkCopyOneTable does the per-table bulk-copy work for both the
 // cold-start and resume paths. It reads the persisted progress entry
 // (if any), classifies the table, and dispatches to either the
@@ -155,7 +141,7 @@ func bulkCopyOneTable(
 		if err != nil {
 			return nil, nil, err
 		}
-		return rdr, func() { closeIf(rdr) }, nil
+		return rdr, func() { migcore.CloseIf(rdr) }, nil
 	}
 	truncate := func(ctx context.Context) error { return truncateForResume(ctx, rw, table) }
 	// ADR-0110: thread the run's shared coordinated-pause gate so a
@@ -298,7 +284,7 @@ func copyOneTableData(
 	// Per-batch checkpointed path.
 	limit := bulkBatchSize
 	if limit <= 0 {
-		limit = defaultBulkBatchSize
+		limit = migcore.DefaultBulkBatchSize
 	}
 	if err := copyTableWithCursor(ctx, rc, state, stateMu, rw, rows, table, limit, redactor, shard); err != nil {
 		wrapped := fmt.Errorf("pipeline: copy table %q: %w", table.Name, err)
@@ -443,7 +429,7 @@ func copyTableWithCursor(
 		}
 
 		var batchCount int64
-		tracker := newPKTracker(pkCols)
+		tracker := migcore.NewPKTracker(pkCols)
 		teed := teePKAndCount(batchCtx, rowsCh, tracker, &batchCount, pt.observeRow)
 		// PII Phase 1: same redact-wrap as [copyTable]. nil/empty
 		// Registry is the no-op fast path.
@@ -472,7 +458,7 @@ func copyTableWithCursor(
 		// before interpreting batchCount, so a decode failure on the
 		// first row of a batch fails the migrate instead of looking
 		// like "end of table".
-		if err := readerStreamErr(rr, table); err != nil {
+		if err := migcore.ReaderStreamErr(rr, table); err != nil {
 			return err
 		}
 
@@ -481,7 +467,7 @@ func copyTableWithCursor(
 		// single-reader --resume cursor path). The cross-table copy pool
 		// (ADR-0076) cancels its errgroup ctx on the FIRST table's terminal
 		// error so peers unwind; a peer table cancelled here closes its batch
-		// channel early (batchCount==0 or short), and readerStreamErr filters
+		// channel early (batchCount==0 or short), and migcore.ReaderStreamErr filters
 		// ctx.Canceled to nil — so without this check the cancelled table
 		// returns nil, the caller marks it State=Complete, and a later --resume
 		// SKIPS it with only a partial copy on disk → silent loss of its unread
@@ -497,7 +483,7 @@ func copyTableWithCursor(
 			return nil
 		}
 
-		newCursor, ok := tracker.lastPK()
+		newCursor, ok := tracker.LastPK()
 		if !ok {
 			// Should be impossible — the writer accepted batchCount > 0
 			// rows but the tracker never saw a row's PK. Surface it
@@ -534,69 +520,22 @@ func copyTableWithCursor(
 	}
 }
 
-// pkTracker captures the PK column values of the last row passing
-// through a batch. Used by [teePKAndCount] to extract the cursor for
-// the next iteration without changing the writer interface.
-//
-// The tracker is intentionally simple: it overwrites lastValues on
-// every row, and lastValues is a fresh slice per call so the writer's
-// downstream consumer can't mutate the captured values out from under
-// the orchestrator. Concurrent reads of [pkTracker.lastPK] are not
-// supported — the only caller is the orchestrator, which reads after
-// the writer has returned.
-type pkTracker struct {
-	pkCols []string
-	last   atomic.Pointer[[]any]
-}
-
-// newPKTracker returns a tracker for the given PK column names.
-func newPKTracker(pkCols []string) *pkTracker {
-	return &pkTracker{pkCols: pkCols}
-}
-
-// observe records the PK column values of row. nil row is a no-op
-// (defensive — should not happen in practice). Missing PK columns
-// produce a slice with nil entries; the next batch's WHERE predicate
-// would be incorrect, but classifyTableForResume rejects no-PK tables
-// upstream so the situation shouldn't arise.
-func (t *pkTracker) observe(row ir.Row) {
-	if row == nil || len(t.pkCols) == 0 {
-		return
-	}
-	pk := make([]any, len(t.pkCols))
-	for i, c := range t.pkCols {
-		pk[i] = row[c]
-	}
-	t.last.Store(&pk)
-}
-
-// lastPK returns the PK values of the most recently observed row,
-// plus a flag indicating whether any rows were seen. Returns (nil,
-// false) when no rows passed through.
-func (t *pkTracker) lastPK() ([]any, bool) {
-	p := t.last.Load()
-	if p == nil {
-		return nil, false
-	}
-	return *p, true
-}
-
 // teePKAndCount wraps the row channel with a tee that observes each
 // row's PK columns into the tracker, increments count, and invokes
 // onRow for the [progressTicker]. The downstream channel carries the
-// standard bounded buffer ([rowChanBuffer]) — back-pressure still
+// standard bounded buffer ([migcore.RowChanBuffer]) — back-pressure still
 // flows through the writer once the buffer fills; closing happens on
 // src close or ctx cancellation. The tracker may run ahead of the
 // writer by up to the buffered rows, which is safe because the resume
 // cursor is only persisted after the whole batch's WriteRows returns
-// (see the checkpoint note on [rowChanBuffer]).
+// (see the checkpoint note on [migcore.RowChanBuffer]).
 //
 // Mirrors [teeRows]'s shape but pulls the per-row hooks together since
 // the per-batch loop wants all three. onRow gets the row itself so
 // observers like [progressTicker.observeRow] can sum its byte cost
 // alongside the count.
-func teePKAndCount(ctx context.Context, src <-chan ir.Row, tracker *pkTracker, count *int64, onRow func(ir.Row)) <-chan ir.Row {
-	out := make(chan ir.Row, rowChanBuffer)
+func teePKAndCount(ctx context.Context, src <-chan ir.Row, tracker *migcore.PKTracker, count *int64, onRow func(ir.Row)) <-chan ir.Row {
+	out := make(chan ir.Row, migcore.RowChanBuffer)
 	go func() {
 		defer close(out)
 		for {
@@ -607,7 +546,7 @@ func teePKAndCount(ctx context.Context, src <-chan ir.Row, tracker *pkTracker, c
 				if !ok {
 					return
 				}
-				tracker.observe(row)
+				tracker.Observe(row)
 				atomic.AddInt64(count, 1)
 				if onRow != nil {
 					onRow(row)

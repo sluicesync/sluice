@@ -42,6 +42,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // progressTicker counts rows passing through the bulk-copy pipe and
@@ -325,30 +326,6 @@ func kickOffRowCount(ctx context.Context, rr ir.RowReader, table *ir.Table, pt *
 	}()
 }
 
-// rowChanBuffer is the buffer size for the bulk-copy row channels
-// (reader output, progress/PK tees, the fast-loader pump; mirrored by
-// a same-named constant in each engine's row reader) and for the
-// restore / chain-restore / broker replay hops (chunk decode → apply),
-// which adopted the same discipline when perf-parity matrix gap 2
-// closed (2026-07).
-//
-// Unbuffered channels force a rendezvous per row: source decode and
-// target write strictly ALTERNATE, so the per-row cost is
-// decode+write instead of max(decode, write). A small bounded buffer
-// restores read/write overlap while preserving back-pressure — when
-// the writer stalls, the buffer fills and the reader blocks exactly
-// as before (bounded is not unbounded). 64 keeps the worst-case
-// buffered footprint modest even on wide rows (64 × row size per
-// pipeline stage).
-//
-// Resume correctness is unaffected by buffering: the per-batch resume
-// cursor is persisted only AFTER the writer has consumed the entire
-// batch (see the runBatchedCopy loop in migrate_bulk.go — checkpoint
-// follows WriteRowsIdempotent's return), never from a tee's in-flight
-// position, so buffered-but-unwritten rows can never advance a
-// persisted cursor.
-const rowChanBuffer = 64
-
 // teeRows wraps an [ir.Row] channel and returns a new channel that
 // forwards every row downstream while invoking onRow. onRow gets
 // the row itself so call-sites can run any per-row bookkeeping
@@ -360,11 +337,11 @@ const rowChanBuffer = 64
 //
 // The tee goroutine is the only writer, and the [ir.RowWriter]
 // consumer is the only reader. The downstream channel carries a small
-// bounded buffer (see [rowChanBuffer]) so source decode and target
+// bounded buffer (see [migcore.RowChanBuffer]) so source decode and target
 // write overlap instead of rendezvous-alternating; back-pressure is
 // preserved because the buffer is bounded.
 func teeRows(ctx context.Context, src <-chan ir.Row, onRow func(ir.Row)) <-chan ir.Row {
-	out := make(chan ir.Row, rowChanBuffer)
+	out := make(chan ir.Row, migcore.RowChanBuffer)
 	go func() {
 		defer close(out)
 		for {

@@ -280,7 +280,7 @@ func (a *AddTable) Run(ctx context.Context) error {
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: add-table: open target applier: %w", err))
 	}
-	defer closeIf(applier)
+	defer migcore.CloseIf(applier)
 
 	preflight, err := a.preflightStream(ctx, applier)
 	if err != nil {
@@ -293,7 +293,7 @@ func (a *AddTable) Run(ctx context.Context) error {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: add-table: open source schema reader: %w", err))
 	}
 	fullSchema, err := sr.ReadSchema(ctx)
-	closeIf(sr)
+	migcore.CloseIf(sr)
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: add-table: read source schema: %w", err))
 	}
@@ -327,13 +327,13 @@ func (a *AddTable) Run(ctx context.Context) error {
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: add-table: open target schema writer: %w", err))
 	}
-	defer closeIf(sw)
+	defer migcore.CloseIf(sw)
 
 	rw, err := a.Target.OpenRowWriter(ctx, a.TargetDSN)
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: add-table: open target row writer: %w", err))
 	}
-	defer closeIf(rw)
+	defer migcore.CloseIf(rw)
 
 	// Bug 46: thread the resolved target-schema namespace into the
 	// schema writer + row writer + change applier so the new table
@@ -1155,7 +1155,7 @@ func (a *AddTable) dropTempSlot(ctx context.Context, slot string) {
 		)
 		return
 	}
-	defer closeIf(mgr)
+	defer migcore.CloseIf(mgr)
 
 	if err := mgr.Drop(ctx, slot, false); err != nil {
 		slog.WarnContext(

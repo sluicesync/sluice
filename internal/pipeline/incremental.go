@@ -288,7 +288,7 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("incremental: open cdc reader: %w", err))
 	}
-	defer closeIf(cdc)
+	defer migcore.CloseIf(cdc)
 
 	// Chain-consumer ack mode: without an applier there is no LSN
 	// tracker, and the reader's no-tracker keepalive fallback acks the
@@ -605,7 +605,7 @@ func (b *IncrementalBackup) readSourceSchema(ctx context.Context) (*ir.Schema, e
 	if err != nil {
 		return nil, fmt.Errorf("open schema reader: %w", err)
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 	if b.scope != nil {
 		if scoper, ok := sr.(ir.TableScoper); ok {
 			scoper.SetTableScope(b.scope)

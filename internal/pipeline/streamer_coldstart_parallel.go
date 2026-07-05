@@ -174,7 +174,7 @@ func resolveColdStartCopyBudget(
 //
 // Lifecycle: the snapshot-importer pool is closed when this returns. The
 // chunk/table readers it minted are closed by the pool's own release paths
-// (the same closeIf path a normal chunk reader uses). The exported-snapshot
+// (the same migcore.CloseIf path a normal chunk reader uses). The exported-snapshot
 // transaction itself is held open by the caller's `stream` until its
 // ReleaseRows runs AFTER bulk-copy — so every parallel reader's
 // `SET TRANSACTION SNAPSHOT` resolves against a still-live snapshot.
@@ -208,7 +208,7 @@ func (s *Streamer) runColdStartParallel(
 	// stream.Rows (chunk 0 / the free pair). The factory is called
 	// concurrently by peer chunk/table goroutines; ImportSnapshot opens its
 	// own *sql.Conn per call, so concurrent calls are safe. The returned
-	// reader's lifecycle is owned by the caller's closeIf release path.
+	// reader's lifecycle is owned by the caller's migcore.CloseIf release path.
 	//
 	// INVARIANT (load-bearing): these importer-minted readers are
 	// SINGLE-SCHEMA (qualifyBySchema=false). The fast lane therefore must

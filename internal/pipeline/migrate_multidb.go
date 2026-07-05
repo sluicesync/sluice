@@ -330,7 +330,7 @@ func (m *Migrator) preflightMultiDBSchema(
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open source schema reader for %q: %w", database, err))
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 	migcore.ApplyTableScope(sr, m.Filter)
 	applyMultiDatabaseScope(sr, &multiDBScope{database: database, inScope: inScope})
 	if _, err := sr.ReadSchema(ctx); err != nil {
@@ -357,7 +357,7 @@ func (m *Migrator) applyDeferredConstraints(ctx context.Context, scope *multiDBS
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open source schema reader: %w", err))
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 	migcore.ApplyTableScope(sr, m.Filter)
 	applyMultiDatabaseScope(sr, scope)
 
@@ -378,7 +378,7 @@ func (m *Migrator) applyDeferredConstraints(ctx context.Context, scope *multiDBS
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open target schema writer: %w", err))
 	}
-	defer closeIf(sw)
+	defer migcore.CloseIf(sw)
 	migcore.ApplyTargetSchema(sw, m.TargetSchema)
 
 	if err := sw.CreateConstraints(ctx, schema); err != nil {

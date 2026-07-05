@@ -8,6 +8,7 @@ import (
 	"log/slog"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // attachSlotHealthProbe opens a source-side [ir.SchemaReader], type-
@@ -55,7 +56,7 @@ func (s *Streamer) attachSlotHealthProbe(ctx context.Context, streamID string) *
 		// Engine doesn't expose slot health (today: MySQL). Close the
 		// reader so the connection doesn't sit idle for the streamer's
 		// lifetime.
-		closeIf(sr)
+		migcore.CloseIf(sr)
 		return noop
 	}
 	slot := s.SlotName
@@ -66,7 +67,7 @@ func (s *Streamer) attachSlotHealthProbe(ctx context.Context, streamID string) *
 	probeCtx, cancel := context.WithCancel(ctx)
 	att := &slotHealthProbeAttachment{
 		cancel: cancel,
-		close:  func() { closeIf(sr) },
+		close:  func() { migcore.CloseIf(sr) },
 	}
 
 	go slotHealthProbeLoop(probeCtx, reporter, slot, streamID, DefaultSlotHealthThresholds(), slotHealthProbeTickInterval)

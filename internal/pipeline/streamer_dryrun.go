@@ -63,7 +63,7 @@ func (s *Streamer) buildDryRunPlan(ctx context.Context, streamID string, persist
 	if err != nil {
 		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: dry-run: open source schema reader: %w", err))
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 	if err := applyEnabledPGExtensions(ctx, sr, s.EnabledPGExtensions); err != nil {
 		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: dry-run: enable PG extensions on source: %w", err))
 	}

@@ -108,7 +108,7 @@ type restoreWriterFactory func(ctx context.Context) (ir.RowWriter, error)
 // writer". Exactly one running table uses it at a time (claimed via a
 // 1-slot channel); peers open their own via factory and close it on
 // release. The free writer is NOT closed here (the caller owns its
-// lifecycle through Run's deferred closeIf).
+// lifecycle through Run's deferred migcore.CloseIf).
 //
 // The errgroup's derived ctx cancels on the first table's error so
 // peers unwind promptly (each through restoreTable's own Bug-40b
@@ -191,7 +191,7 @@ func acquireRestoreWriter(
 		if err != nil {
 			return nil, func() {}, err
 		}
-		return w, func() { closeIf(w) }, nil
+		return w, func() { migcore.CloseIf(w) }, nil
 	}
 }
 

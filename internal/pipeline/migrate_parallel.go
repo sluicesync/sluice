@@ -144,7 +144,7 @@ type parallelBulkCopyDeps struct {
 	//     snapshot ([ir.SnapshotStream.SnapshotName]), so all N readers
 	//     observe the SAME consistent_point view. The factory owns each
 	//     reader's connection lifecycle; the caller closes it via the
-	//     same closeIf release path a normal chunk reader uses.
+	//     same migcore.CloseIf release path a normal chunk reader uses.
 	//   - migrate with a shared exported snapshot (non-nil, perf research
 	//     delta 1): identical shape, pinned to the plain-SQL
 	//     [ir.ExportedSnapshot] instead of a slot-exported one (see
@@ -597,7 +597,7 @@ func runChunks(
 	pkCols := migcore.PrimaryKeyColumnNames(table)
 	limit := bulkBatchSize
 	if limit <= 0 {
-		limit = defaultBulkBatchSize
+		limit = migcore.DefaultBulkBatchSize
 	}
 
 	// ADR-0123: the run's SINGLE shared connection-budget gate caps
@@ -696,10 +696,10 @@ func acquireChunkConn(
 	}
 	closeConns := func() {
 		if wr != nil {
-			closeIf(wr)
+			migcore.CloseIf(wr)
 		}
 		if rdr != nil {
-			closeIf(rdr)
+			migcore.CloseIf(rdr)
 		}
 		release()
 	}
@@ -732,7 +732,7 @@ func openOneChunkConn(ctx context.Context, deps *parallelBulkCopyDeps) (ir.RowRe
 	}
 	wr, err := deps.target.OpenRowWriter(ctx, deps.targetDSN)
 	if err != nil {
-		closeIf(rdr)
+		migcore.CloseIf(rdr)
 		return nil, nil, err
 	}
 	migcore.ApplyMaxBufferBytes(wr, deps.maxBufferBytes)
@@ -900,14 +900,14 @@ func copyChunk(
 	for {
 		batchStart := time.Now() // ADR-0042 Phase A
 		batchCtx, cancel := context.WithCancel(ctx)
-		filtered, err := readChunkBatch(batchCtx, br, table, cursor, chunk.UpperPK, pkCols, limit)
+		filtered, err := migcore.ReadChunkBatch(batchCtx, br, table, cursor, chunk.UpperPK, pkCols, limit)
 		if err != nil {
 			cancel()
 			return fmt.Errorf("read chunk %d batch: %w", chunkIndex, err)
 		}
 
 		var batchCount int64
-		tracker := newPKTracker(pkCols)
+		tracker := migcore.NewPKTracker(pkCols)
 		teed := teePKAndCount(batchCtx, filtered, tracker, &batchCount, pt.observeRow)
 		// PII Phase 1: same redact-wrap as [copyTable].
 		redacted, redactErrFn := redactRows(batchCtx, teed, redactor, table.Schema, table.Name, table.Columns, pkCols, "")
@@ -947,7 +947,7 @@ func copyChunk(
 		// (see runChunks), so the sticky error is unambiguous here.
 		// Check before interpreting batchCount so a decode failure
 		// fails the migrate instead of looking like "end of chunk".
-		if err := readerStreamErr(rr, table); err != nil {
+		if err := migcore.ReaderStreamErr(rr, table); err != nil {
 			return err
 		}
 
@@ -955,7 +955,7 @@ func copyChunk(
 		// ctx-cancellation must NOT read as a clean end-of-chunk. A peer
 		// chunk's retriable source-read drop cancels the shared errgroup ctx;
 		// the reader then closes this chunk's batch channel early (batchCount==0
-		// or short), and readerStreamErr filters ctx.Canceled to nil — so
+		// or short), and migcore.ReaderStreamErr filters ctx.Canceled to nil — so
 		// without this check the chunk would break-out and be marked
 		// State=Complete with a partial copy, and the whole-table retry would
 		// SKIP it → silent loss of the unread tail. Returning the cancellation
@@ -970,7 +970,7 @@ func copyChunk(
 			break
 		}
 
-		newCursor, ok := tracker.lastPK()
+		newCursor, ok := tracker.LastPK()
 		if !ok {
 			return errors.New("pipeline: copyChunk: batch produced rows but PK tracker captured none")
 		}
@@ -1118,7 +1118,7 @@ func copyChunkFast(
 	streamCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	tracker := newPKTracker(pkCols)
+	tracker := migcore.NewPKTracker(pkCols)
 	var rowCount int64
 
 	// pump pages the reader cursor-by-cursor (memory-bounded: one
@@ -1129,23 +1129,23 @@ func copyChunkFast(
 	// LowerPK (nil => table start) and advances by the last PK seen;
 	// LastPK is guaranteed nil here (useFastLoader gate (2)) so there
 	// is no mid-chunk resume cursor to honour. The downstream channel
-	// carries the standard bounded buffer ([rowChanBuffer]) — the
+	// carries the standard bounded buffer ([migcore.RowChanBuffer]) — the
 	// writer still back-pressures the pump once it fills, but decode
 	// and COPY overlap instead of rendezvous-alternating.
-	out := make(chan ir.Row, rowChanBuffer)
+	out := make(chan ir.Row, migcore.RowChanBuffer)
 	pumpErr := make(chan error, 1)
 	go func() {
 		defer close(out)
 		cursor := chunk.LowerPK
 		for {
-			filtered, err := readChunkBatch(streamCtx, br, table, cursor, chunk.UpperPK, pkCols, limit)
+			filtered, err := migcore.ReadChunkBatch(streamCtx, br, table, cursor, chunk.UpperPK, pkCols, limit)
 			if err != nil {
 				pumpErr <- fmt.Errorf("read chunk %d batch: %w", chunkIndex, err)
 				return
 			}
 			var batchCount int64
 			for row := range filtered {
-				tracker.observe(row)
+				tracker.Observe(row)
 				pt.observeRow(row)
 				batchCount++
 				atomic.AddInt64(&rowCount, 1)
@@ -1163,14 +1163,14 @@ func copyChunkFast(
 			// reader error after the page drains, before interpreting
 			// batchCount, so a decode failure fails the migrate instead
 			// of silently ending the chunk's stream.
-			if err := readerStreamErr(br, table); err != nil {
+			if err := migcore.ReaderStreamErr(br, table); err != nil {
 				pumpErr <- err
 				return
 			}
 			// CRITICAL (ADR-0109 sibling-cancel silent-loss fix): a
 			// ctx-cancellation must NOT read as a clean end-of-chunk. The
 			// reader closes its page channel early on cancellation (yielding
-			// batchCount==0 or a short page), and readerStreamErr DELIBERATELY
+			// batchCount==0 or a short page), and migcore.ReaderStreamErr DELIBERATELY
 			// filters ctx.Canceled/DeadlineExceeded to nil (benign-cancel) — so
 			// without this check a chunk cancelled by a PEER chunk's retriable
 			// source-read drop (errgroup cancels gctx) would post pumpErr<-nil,
@@ -1188,7 +1188,7 @@ func copyChunkFast(
 				pumpErr <- nil // clean end of chunk range
 				return
 			}
-			newCursor, ok := tracker.lastPK()
+			newCursor, ok := tracker.LastPK()
 			if !ok {
 				pumpErr <- errors.New("pipeline: copyChunkFast: batch produced rows but PK tracker captured none")
 				return
@@ -1425,112 +1425,4 @@ func isIntegerSinglePK(table *ir.Table) bool {
 	}
 	_, ok := col.Type.(ir.Integer)
 	return ok
-}
-
-// readChunkBatch reads one PK-ordered page of a chunk, clipped to the
-// chunk's INCLUSIVE upper bound (UpperPK; nil for the last chunk).
-//
-// CRITICAL exactly-once contract (ADR-0096): the upper-bound clip MUST
-// agree with the engine's ORDER BY total order, which for string / char /
-// varchar / decimal PKs is the column's NATIVE DB COLLATION, not a byte
-// order. So when the reader implements [ir.BoundedBatchedRowReader] we
-// push the upper bound INTO the SQL WHERE (`(pk) <= upTo`) — same
-// collation, same PK index as the cursor's lower bound and the ORDER BY —
-// and do NO Go-side clip. This is the path BOTH shipping engines take.
-//
-// The Go-side bytewise [filterByUpperBound] is the FALLBACK for a reader
-// that lacks the bounded surface. It is correct only for families whose
-// byte order matches the collation order (integer, temporal, PG-native
-// uuid/bytea); string/decimal keyset tables are kept off this path by
-// [shouldParallelChunk], which requires BoundedBatchedRowReader for the
-// keyset strategy. The fallback never runs for those families, so it can
-// never silently drop a boundary-straddling collated row.
-func readChunkBatch(
-	ctx context.Context,
-	br ir.BatchedRowReader,
-	table *ir.Table,
-	cursor, upperPK []any,
-	pkCols []string,
-	limit int,
-) (<-chan ir.Row, error) {
-	if bb, ok := br.(ir.BoundedBatchedRowReader); ok {
-		// SQL-side upper bound: collation-correct by construction, no Go
-		// clip. upperPK nil (last chunk) => plain ReadRowsBatchBounded with
-		// no upper predicate, identical to ReadRowsBatch.
-		return bb.ReadRowsBatchBounded(ctx, table, cursor, upperPK, limit)
-	}
-	rowsCh, err := br.ReadRowsBatch(ctx, table, cursor, limit)
-	if err != nil {
-		return nil, err
-	}
-	return filterByUpperBound(ctx, rowsCh, pkCols, upperPK), nil
-}
-
-// filterByUpperBound wraps a row channel with a goroutine that drops
-// rows whose PK exceeds the chunk's INCLUSIVE upper bound. Returns the
-// downstream channel (forwarded as-is when upperPK is nil — the last
-// chunk has no upper bound).
-//
-// FALLBACK ONLY (see [readChunkBatch]): this Go-side clip is used only
-// for a reader that does NOT implement [ir.BoundedBatchedRowReader]. The
-// preferred path pushes the upper bound into SQL so it uses the column's
-// native collation. The comparison here is the full-tuple bytewise
-// [migcore.ComparePKTuple], which matches the engine's ORDER BY total order ONLY
-// for byte-ordered families (integer, temporal, PG-native uuid/bytea); it
-// would DIVERGE from a non-C string/decimal collation, so the keyset
-// strategy that covers those families requires the bounded surface and
-// never reaches this filter (enforced in [shouldParallelChunk]).
-//
-// Without a clip, chunk 0's batch could run past chunk 1's range and
-// double-copy. The filter terminates the channel early (closes downstream
-// so the reader goroutine unwinds) the first time it sees a row strictly
-// past upperPK; because rows arrive in PK order, every subsequent row is
-// also past the bound, so stopping is safe and complete. upperPK is
-// inclusive: a row whose PK equals upperPK belongs to THIS chunk, so only
-// migcore.ComparePKTuple > 0 is dropped.
-func filterByUpperBound(ctx context.Context, src <-chan ir.Row, pkCols []string, upperPK []any) <-chan ir.Row {
-	if upperPK == nil || len(pkCols) == 0 {
-		// No upper bound (last chunk) or degenerate PK — pass through.
-		return src
-	}
-	if len(upperPK) != len(pkCols) {
-		// Width mismatch should not happen (boundaries are width-checked
-		// at computation). Defensive pass-through keeps an unexpected
-		// caller safe rather than mis-clipping.
-		return src
-	}
-
-	// Bounded buffer for the same decode/write-overlap reason as the
-	// tees — see [rowChanBuffer].
-	out := make(chan ir.Row, rowChanBuffer)
-	go func() {
-		defer close(out)
-		rowPK := make([]any, len(pkCols))
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case row, ok := <-src:
-				if !ok {
-					return
-				}
-				for i, c := range pkCols {
-					rowPK[i] = row[c]
-				}
-				if migcore.ComparePKTuple(rowPK, upperPK) > 0 {
-					// Strictly past the chunk's inclusive upper bound;
-					// drop this row and stop. Rows arrive in PK order, so
-					// nothing after it can be within the bound. Returning
-					// closes `out` and the reader goroutine unwinds.
-					return
-				}
-				select {
-				case out <- row:
-				case <-ctx.Done():
-					return
-				}
-			}
-		}
-	}()
-	return out
 }

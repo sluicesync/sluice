@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // classifyRetriable inspects err and returns (matchedWrapper, true)
@@ -93,7 +94,7 @@ func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
 		}
 		return s.runOnceWithReactiveResnapshot(ctx)
 	}
-	defer closeIf(posReader)
+	defer migcore.CloseIf(posReader)
 
 	streamID := s.resolveStreamID()
 	var consecutive int

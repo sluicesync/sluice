@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -93,7 +94,7 @@ func TestMigrate_PostgresToPostgres_UTF8Identifiers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSchemaReader: %v", err)
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 
 	got, err := sr.ReadSchema(ctx)
 	if err != nil {

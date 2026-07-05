@@ -348,7 +348,7 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("broker: open target change applier: %w", err))
 	}
-	defer closeIf(applier)
+	defer migcore.CloseIf(applier)
 	migcore.ApplyMaxBufferBytes(applier, b.MaxBufferBytes)
 	migcore.ApplyApplyConcurrency(applier, migcore.ResolveReplayApplyConcurrency(b.ApplyConcurrency))
 	if err := applier.EnsureControlTable(ctx); err != nil {
@@ -696,7 +696,7 @@ func (b *SyncFromBackup) dropExistingTargetTables(ctx context.Context, schema *i
 		return migcore.WrapWithHint(migcore.PhaseConnect,
 			fmt.Errorf("broker: --reset-target-data: open row writer: %w", err))
 	}
-	defer closeIf(rw)
+	defer migcore.CloseIf(rw)
 	dropper, ok := rw.(ir.TableDropper)
 	if !ok {
 		return fmt.Errorf(
@@ -916,12 +916,12 @@ func (b *SyncFromBackup) applyIncremental(
 	//    change's position rewritten to the broker shape.
 	streamCtx, streamCancel := context.WithCancel(ctx)
 	defer streamCancel()
-	// Bounded buffer (see [rowChanBuffer]) so chunk decode and target
+	// Bounded buffer (see [migcore.RowChanBuffer]) so chunk decode and target
 	// apply overlap instead of rendezvous-alternating — same rationale
 	// as [ChainRestore.applyIncremental]'s replay hop (perf-parity
 	// matrix gap 2). Position durability is unaffected: the applier
 	// persists a position only after consuming the changes ahead of it.
-	changesCh := make(chan ir.Change, rowChanBuffer)
+	changesCh := make(chan ir.Change, migcore.RowChanBuffer)
 	errCh := make(chan error, 1)
 	pos := encodeBrokerPosition(b.ChainURL, backupID)
 	go func() {
@@ -1000,7 +1000,7 @@ func (b *SyncFromBackup) applySchemaDeltas(ctx context.Context, link *lineage.Se
 	if err != nil {
 		return fmt.Errorf("open schema writer: %w", err)
 	}
-	defer closeIf(sw)
+	defer migcore.CloseIf(sw)
 
 	deltaApplier, _ := sw.(ir.SchemaDeltaApplier)
 	for _, d := range link.Manifest.SchemaDelta {

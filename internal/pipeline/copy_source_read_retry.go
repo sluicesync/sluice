@@ -122,7 +122,7 @@ func coldCopySourceReadBackoff(attempt int) time.Duration {
 // decode/query fault, a schema mismatch) is NOT retriable, exactly as
 // today: the copy stays terminal. The MySQL reader populates this surface
 // by classifying its rows-iteration error through classifyApplierError
-// (row_reader.go); readerStreamErr's `%w` wrap keeps it reachable here.
+// (row_reader.go); migcore.ReaderStreamErr's `%w` wrap keeps it reachable here.
 func isRetriableSourceReadError(err error) bool {
 	if err == nil {
 		return false
@@ -171,7 +171,7 @@ const (
 // retries ONLY a classified transient (connection-reset / EOF / invalid-
 // connection / vttablet-unavailable). Any non-retriable (terminal) error
 // — including a real decode fault, a non-retriable query error, or a
-// ctx-cancel that survived readerStreamErr's benign-cancel filter —
+// ctx-cancel that survived migcore.ReaderStreamErr's benign-cancel filter —
 // returns unchanged, exactly as today (no retry, no truncate). On retry the
 // helper backs off (honoring ctx.Done()), opens a fresh reader, runs the
 // attempt, closes the reader, and tries again. On budget exhaustion it

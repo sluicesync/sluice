@@ -32,6 +32,7 @@ import (
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	// Both engines registered for the cross-engine test.
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
@@ -348,13 +349,13 @@ func TestBlobStore_MinIO_BackupRestoreRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open mysql row reader: %v", err)
 	}
-	defer closeIf(rr)
+	defer migcore.CloseIf(rr)
 
 	sr, err := mysqlEng.OpenSchemaReader(ctx, mysqlTarget)
 	if err != nil {
 		t.Fatalf("open mysql schema reader: %v", err)
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {

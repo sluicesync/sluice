@@ -35,6 +35,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -152,7 +153,7 @@ func TestMigrate_PostgresToMySQL_TypeBreadth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSchemaReader: %v", err)
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 	target, err := sr.ReadSchema(ctx)
 	if err != nil {
 		t.Fatalf("ReadSchema: %v", err)
@@ -168,7 +169,7 @@ func TestMigrate_PostgresToMySQL_TypeBreadth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenRowReader: %v", err)
 	}
-	defer closeIf(rr)
+	defer migcore.CloseIf(rr)
 	breadthRows := readAll(t, ctx, rr, breadth)
 	keyedRows := readAll(t, ctx, rr, keyed)
 	if len(breadthRows) != 2 {

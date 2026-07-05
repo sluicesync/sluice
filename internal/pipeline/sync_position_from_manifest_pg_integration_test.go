@@ -34,6 +34,7 @@ import (
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 
@@ -345,7 +346,7 @@ func TestStreamer_Preflight_PG_DetectsLowWalKeepSize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSchemaReader: %v", err)
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 
 	preflighter, ok := sr.(PositionFromManifestPreflight)
 	if !ok {
@@ -410,7 +411,7 @@ func TestStreamer_Preflight_PG_DetectsPhysicalSlot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSchemaReader: %v", err)
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 
 	preflighter, ok := sr.(PositionFromManifestPreflight)
 	if !ok {
@@ -454,7 +455,7 @@ func TestStreamer_Preflight_PG_DetectsClusterNameGUC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSchemaReader: %v", err)
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 
 	preflighter, ok := sr.(PositionFromManifestPreflight)
 	if !ok {
@@ -562,7 +563,7 @@ func TestStreamer_SyncStart_PatroniMode_Off_SuppressesWarning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSchemaReader: %v", err)
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 	preflighter := sr.(PositionFromManifestPreflight)
 	chainPos := ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/100"}`}
 	engineReport, err := preflighter.PreflightPositionFromManifest(context.Background(), chainPos, "sluice_slot")
@@ -595,7 +596,7 @@ func TestStreamer_SyncStart_PatroniMode_On_FiresOnVanilla(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSchemaReader: %v", err)
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 	preflighter := sr.(PositionFromManifestPreflight)
 	chainPos := ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/100"}`}
 	engineReport, err := preflighter.PreflightPositionFromManifest(context.Background(), chainPos, "sluice_slot")

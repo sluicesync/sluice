@@ -231,7 +231,7 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore: open change applier: %w", err))
 	}
-	defer closeIf(applier)
+	defer migcore.CloseIf(applier)
 	migcore.ApplyMaxBufferBytes(applier, r.MaxBufferBytes)
 	migcore.ApplyTargetSchema(applier, r.TargetSchema)
 	migcore.ApplyApplyConcurrency(applier, migcore.ResolveReplayApplyConcurrency(r.ApplyConcurrency))
@@ -365,7 +365,7 @@ func (r *ChainRestore) reprimeStandaloneSequences(ctx context.Context, links []l
 	if err != nil {
 		return fmt.Errorf("open target schema writer: %w", err)
 	}
-	defer closeIf(sw)
+	defer migcore.CloseIf(sw)
 	migcore.ApplyTargetSchema(sw, r.TargetSchema)
 	reprimer, ok := sw.(sequenceReprimer)
 	if !ok {
@@ -431,7 +431,7 @@ func (r *ChainRestore) syncIdentitySequencesAtTail(ctx context.Context, links []
 	if err != nil {
 		return fmt.Errorf("open target schema writer: %w", err)
 	}
-	defer closeIf(sw)
+	defer migcore.CloseIf(sw)
 	migcore.ApplyTargetSchema(sw, r.TargetSchema)
 	syncSchema := &ir.Schema{Tables: tables}
 	if err := runDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
@@ -632,13 +632,13 @@ func (r *ChainRestore) applyIncremental(
 	}
 	streamCtx, streamCancel := context.WithCancel(ctx)
 	defer streamCancel()
-	// Bounded buffer (see [rowChanBuffer]) so chunk decode and target
+	// Bounded buffer (see [migcore.RowChanBuffer]) so chunk decode and target
 	// apply overlap instead of rendezvous-alternating — the replay
 	// analog of migrate's bulk-copy hop discipline (perf-parity matrix
 	// gap 2). Positions stay exact: the applier persists a position
 	// only AFTER consuming the changes ahead of it, so buffered-but-
 	// unapplied changes can never advance the durable position.
-	changesCh := make(chan ir.Change, rowChanBuffer)
+	changesCh := make(chan ir.Change, migcore.RowChanBuffer)
 	errCh := make(chan error, 1)
 	go func() {
 		defer close(changesCh)
@@ -705,7 +705,7 @@ func (r *ChainRestore) applySchemaDeltas(ctx context.Context, link *lineage.Segm
 	if err != nil {
 		return fmt.Errorf("open schema writer: %w", err)
 	}
-	defer closeIf(sw)
+	defer migcore.CloseIf(sw)
 
 	// Bucket the deltas by kind for clear logging + clean strategy
 	// dispatch.

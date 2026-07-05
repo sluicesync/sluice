@@ -25,6 +25,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -232,7 +233,7 @@ func TestMigrate_PG_PgTrgm_GinIndexPassthrough(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSchemaReader on target: %v", err)
 	}
-	defer closeIf(pgRdr)
+	defer migcore.CloseIf(pgRdr)
 	if aware, ok := pgRdr.(ir.ExtensionAware); ok {
 		if err := aware.EnableExtensions(ctx, []string{"pg_trgm"}); err != nil {
 			t.Fatalf("EnableExtensions on target reader: %v", err)
@@ -620,7 +621,7 @@ func TestMigrate_PG_Bug65_ExpressionIndexWithOpclass(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSchemaReader on target: %v", err)
 	}
-	defer closeIf(pgRdr)
+	defer migcore.CloseIf(pgRdr)
 	if aware, ok := pgRdr.(ir.ExtensionAware); ok {
 		if err := aware.EnableExtensions(ctx, []string{"pg_trgm"}); err != nil {
 			t.Fatalf("EnableExtensions on target reader: %v", err)

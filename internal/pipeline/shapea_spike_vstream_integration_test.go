@@ -56,6 +56,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/translate"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
@@ -512,7 +513,7 @@ func runShardConsolidation(t *testing.T, p shardConsolidationParams) {
 		t.Fatalf("open source schema reader: %v", err)
 	}
 	schema, err := sr.ReadSchema(ctx)
-	closeIf(sr)
+	migcore.CloseIf(sr)
 	if err != nil {
 		t.Fatalf("read source schema: %v", err)
 	}
@@ -525,17 +526,17 @@ func runShardConsolidation(t *testing.T, p shardConsolidationParams) {
 	if err != nil {
 		t.Fatalf("open target schema writer: %v", err)
 	}
-	defer closeIf(sw)
+	defer migcore.CloseIf(sw)
 	rw, err := p.tgtEng.OpenRowWriter(ctx, p.tgtDSN)
 	if err != nil {
 		t.Fatalf("open target row writer: %v", err)
 	}
-	defer closeIf(rw)
+	defer migcore.CloseIf(rw)
 	rr, err := p.srcEng.OpenRowReader(ctx, p.srcDSN)
 	if err != nil {
 		t.Fatalf("open source row reader: %v", err)
 	}
-	defer closeIf(rr)
+	defer migcore.CloseIf(rr)
 
 	// Shape-A populated-target preflight: the LOUD replacement for
 	// --force-cold-start's silent skip. On the first pass (target

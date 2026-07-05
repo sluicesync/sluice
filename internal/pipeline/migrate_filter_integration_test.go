@@ -209,7 +209,7 @@ func pgTargetTableNames(t *testing.T, ctx context.Context, eng ir.Engine, dsn st
 	if err != nil {
 		t.Fatalf("OpenSchemaReader: %v", err)
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
 		t.Fatalf("ReadSchema: %v", err)

@@ -50,13 +50,13 @@ func redactRows(
 	if reg.Empty() {
 		return src, func() error { return nil }
 	}
-	// Standard bounded buffer ([rowChanBuffer], perf-parity matrix row 6):
+	// Standard bounded buffer ([migcore.RowChanBuffer], perf-parity matrix row 6):
 	// an unbuffered relay here re-introduced a rendezvous hop into the
 	// bulk-copy hot path whenever redaction was engaged, defeating the
 	// 64-buffer discipline of the surrounding pipeline. The buffer lets
 	// redact and the downstream write overlap; back-pressure is preserved
 	// once it fills.
-	out := make(chan ir.Row, rowChanBuffer)
+	out := make(chan ir.Row, migcore.RowChanBuffer)
 	var (
 		mu    sync.Mutex
 		fnErr error

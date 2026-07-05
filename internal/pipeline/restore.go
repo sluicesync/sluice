@@ -392,7 +392,7 @@ func (r *Restore) Run(ctx context.Context) error {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("restore: open target schema writer: %w", err))
 	}
 	migcore.ApplyTargetSchema(sw, r.TargetSchema)
-	defer closeIf(sw)
+	defer migcore.CloseIf(sw)
 
 	// Construct the run's shared coordinated grow-gate (ADR-0110) BEFORE
 	// opening any row writer, so every writer openTargetRowWriter hands out
@@ -414,7 +414,7 @@ func (r *Restore) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer closeIf(rw)
+	defer migcore.CloseIf(rw)
 
 	// 5. Phase 1: tables. Skipped in DataOnly mode (a later
 	//    rotation-segment full — schema already established by
@@ -714,7 +714,7 @@ func (r *Restore) restoreTable(
 				if err != nil {
 					return err
 				}
-				defer closeIf(w)
+				defer migcore.CloseIf(w)
 				worker = w
 			}
 			n, err := r.restoreChunkGroup(wctx, worker, table, group)
@@ -778,14 +778,14 @@ func (r *Restore) restoreChunkGroup(
 	streamCtx, streamCancel := context.WithCancel(ctx)
 	defer streamCancel()
 
-	// Bounded buffer (see [rowChanBuffer]) so chunk decode and target
+	// Bounded buffer (see [migcore.RowChanBuffer]) so chunk decode and target
 	// write overlap instead of rendezvous-alternating — the restore
 	// analog of migrate's bulk-copy hop discipline (perf-parity matrix
 	// gap 2). The Bug-40b cancel path below is unaffected: a writer
 	// error still cancels the producer, which unblocks from a full
 	// buffer via streamChunkRows' <-ctx.Done() arm exactly as it did
 	// from the unbuffered rendezvous.
-	rowCh := make(chan ir.Row, rowChanBuffer)
+	rowCh := make(chan ir.Row, migcore.RowChanBuffer)
 	// The producer reports either an error OR the count of rows it
 	// actually decoded+streamed for this group (the ACTUAL count, not
 	// the manifest sum — so the orchestrator's layer-2 cross-check is

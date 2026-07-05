@@ -167,7 +167,7 @@ func copyTablePlainParallel(
 	// The writers returned without error, but the reader may have aborted
 	// mid-table on a scan/decode failure (Bug 68). Surface it loudly so a
 	// silently-truncated table never reports success.
-	return readerStreamErr(rr, table)
+	return migcore.ReaderStreamErr(rr, table)
 }
 
 // copyTableColdStartIdempotentMaybeParallel routes a cold-start
@@ -266,7 +266,7 @@ func copyTableColdStartIdempotentParallel(
 	// The writers returned without error, but the reader may have
 	// aborted mid-table on a scan/decode failure (Bug 68). Surface it
 	// loudly so a silently-truncated table never reports success.
-	return readerStreamErr(rr, table)
+	return migcore.ReaderStreamErr(rr, table)
 }
 
 // partitionRowsByPK launches one dispatcher goroutine that reads every
@@ -290,7 +290,7 @@ func partitionRowsByPK(ctx context.Context, src <-chan ir.Row, table *ir.Table, 
 	chans := make([]chan ir.Row, degree)
 	out := make([]<-chan ir.Row, degree)
 	for i := range chans {
-		chans[i] = make(chan ir.Row, rowChanBuffer)
+		chans[i] = make(chan ir.Row, migcore.RowChanBuffer)
 		out[i] = chans[i]
 	}
 

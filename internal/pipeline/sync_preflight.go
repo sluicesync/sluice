@@ -31,6 +31,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // PatroniMode constants for [Streamer.PatroniMode]. The flag is a
@@ -119,7 +120,7 @@ func (s *Streamer) runPositionFromManifestPreflight(ctx context.Context, chainTe
 		)
 		return nil
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 
 	preflighter, ok := sr.(PositionFromManifestPreflight)
 	if !ok {

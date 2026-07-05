@@ -5,7 +5,6 @@ package pipeline
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 
@@ -53,7 +52,7 @@ func copyTableIdempotent(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, 
 		}
 		// The writer drained the stream; surface any sticky reader
 		// error so a mid-stream decode abort fails loudly (Bug 68).
-		return readerStreamErr(rr, table)
+		return migcore.ReaderStreamErr(rr, table)
 	}
 	if err := idem.WriteRowsIdempotent(copyCtx, table, redacted); err != nil {
 		return fmt.Errorf("write rows (idempotent): %w", err)
@@ -61,7 +60,7 @@ func copyTableIdempotent(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, 
 	if err := redactErrFn(); err != nil {
 		return fmt.Errorf("redact rows: %w", err)
 	}
-	return readerStreamErr(rr, table)
+	return migcore.ReaderStreamErr(rr, table)
 }
 
 // copyTable opens the source-side row stream, hands it off to the
@@ -88,43 +87,6 @@ func copyTableIdempotent(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, 
 // drop their pending sends, and exit cleanly. The parent ctx is
 // untouched, so the orchestrator can decide what to do next.
 //
-// readerStreamErr is the loud-failure gate for the bulk-copy paths
-// (Bug 68). A streaming [ir.RowReader] scans and decodes rows on a
-// background goroutine; a per-row scan/decode failure there closes
-// the row channel exactly like a clean end-of-table would. Without
-// observing [ir.RowReader.Err] after the channel drains, the
-// orchestrator cannot tell "table fully read" from "a row failed and
-// the stream aborted" — the writer simply sees fewer rows and the
-// migrate exits 0 with the table silently truncated (the worst
-// failure class under the project's loud-failure tenet). Every copy
-// path MUST call this after the writer returns success and propagate
-// a non-nil result as a hard failure. The error is wrapped so the
-// table name and the originating reader error are both visible in
-// the operator-facing message.
-//
-// context.Canceled / context.DeadlineExceeded are deliberately NOT
-// treated as a stream failure. The batched + parallel copy paths
-// cancel each batch's child context on purpose once the writer has
-// drained it (the Bug-9 clean-unwind shape); the reader goroutine
-// observes that cancel and stores it on its sticky error. That is a
-// benign orchestrator-driven teardown, not a data-integrity failure.
-// A genuine parent-context abort (operator Ctrl-C, deadline) is still
-// surfaced — the writer returns the same ctx error and the
-// orchestrator's own ctx checks fire — so suppressing it here cannot
-// hide a real cancellation, only the self-inflicted per-batch one.
-// The Bug-68 failure class (a scan/decode error) is never a context
-// error; it is a `postgres: column …` / `mysql: scan: …` value, so
-// this filter is precise.
-func readerStreamErr(rr ir.RowReader, table *ir.Table) error {
-	err := rr.Err()
-	if err == nil {
-		return nil
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return nil
-	}
-	return fmt.Errorf("source row stream for table %q failed: %w", table.Name, err)
-}
 
 func copyTable(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.Table, redactor *redact.Registry, shard ShardColumnSpec) (retErr error) {
 	copyCtx, cancel := context.WithCancel(ctx)
@@ -172,7 +134,7 @@ func copyTable(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.
 	// The writer returned without error, but it may have observed a
 	// truncated stream because the reader aborted mid-table on a
 	// scan/decode failure. Surface that loudly (Bug 68).
-	return readerStreamErr(rr, table)
+	return migcore.ReaderStreamErr(rr, table)
 }
 
 // copyTableColdStartIdempotent is the upsert-form of [copyTable] used
@@ -243,5 +205,5 @@ func copyTableColdStartIdempotent(ctx context.Context, rr ir.RowReader, rw ir.Ro
 	if err := redactErrFn(); err != nil {
 		return fmt.Errorf("redact rows: %w", err)
 	}
-	return readerStreamErr(rr, table)
+	return migcore.ReaderStreamErr(rr, table)
 }

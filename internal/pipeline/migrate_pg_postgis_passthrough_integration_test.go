@@ -254,7 +254,7 @@ func TestMigrate_PG_PostGIS_GistIndexPassthrough(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSchemaReader on target: %v", err)
 	}
-	defer closeIf(pgRdr)
+	defer migcore.CloseIf(pgRdr)
 	if aware, ok := pgRdr.(ir.ExtensionAware); ok {
 		if err := aware.EnableExtensions(ctx, []string{"postgis"}); err != nil {
 			t.Fatalf("EnableExtensions on target reader: %v", err)
@@ -481,7 +481,7 @@ func TestMigrate_PG_PostGIS_GeographyPassthrough(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSchemaReader on target: %v", err)
 	}
-	defer closeIf(pgRdr)
+	defer migcore.CloseIf(pgRdr)
 	if aware, ok := pgRdr.(ir.ExtensionAware); ok {
 		if err := aware.EnableExtensions(ctx, []string{"postgis"}); err != nil {
 			t.Fatalf("EnableExtensions on target reader: %v", err)

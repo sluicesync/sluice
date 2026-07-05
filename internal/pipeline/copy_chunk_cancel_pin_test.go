@@ -17,7 +17,7 @@ import (
 // chunk's retriable source-read drop cancels the parallel-copy errgroup,
 // the cancelled sibling chunk's reader closes its page channel early; both
 // the copyChunkFast pump and the copyChunk idempotent loop then read the
-// empty/short page as a CLEAN end-of-chunk and (because readerStreamErr
+// empty/short page as a CLEAN end-of-chunk and (because migcore.ReaderStreamErr
 // filters ctx.Canceled to nil) post success → the chunk is recorded
 // State=Complete with a PARTIAL/EMPTY copy → the whole-table retry SKIPS it
 // → silent loss of the chunk's unread tail.
@@ -31,7 +31,7 @@ import (
 // cancelObservingReader serves NO rows once its context is already
 // cancelled: it returns an immediately-closed channel and an Err() of
 // ctx.Err(), exactly as a real reader does when its query/stream is
-// cancelled mid-page (which readerStreamErr then filters to nil). It
+// cancelled mid-page (which migcore.ReaderStreamErr then filters to nil). It
 // models the sibling chunk whose read the errgroup cancelled.
 type cancelObservingReader struct{}
 

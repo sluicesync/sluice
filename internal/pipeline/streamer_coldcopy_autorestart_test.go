@@ -16,7 +16,7 @@ import (
 // coldCopyDropErr is the shape the MySQL reader's classifyApplierError
 // produces for a connection-drop class source-read error during cold-copy
 // (ADR-0109 §C reader-classification → ir.RetriableError). It propagates up
-// through readerStreamErr → coldStartRunCopy → coldStart → runOnce to
+// through migcore.ReaderStreamErr → coldStartRunCopy → coldStart → runOnce to
 // runWithRetry. Built with the package-local retriableWrapper test double so
 // the pipeline tests don't import the engine package.
 func coldCopyDropErr() error {

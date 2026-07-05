@@ -41,6 +41,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // DefaultSourceHeartbeatTableName is the source-side table the per-
@@ -246,7 +247,7 @@ func (s *Streamer) attachSourceHeartbeat(ctx context.Context, streamID string) *
 	if !ok {
 		// Engine doesn't expose the writer surface. Close the dedicated
 		// reader so the connection doesn't sit idle.
-		closeIf(sr)
+		migcore.CloseIf(sr)
 		slog.WarnContext(
 			ctx, "source heartbeat: source engine does not implement HeartbeatWriter — skipping",
 			slog.String("stream_id", streamID),
@@ -267,7 +268,7 @@ func (s *Streamer) attachSourceHeartbeat(ctx context.Context, streamID string) *
 				slog.String("see", "ADR-0061"),
 				slog.String("err", err.Error()),
 			)
-			closeIf(sr)
+			migcore.CloseIf(sr)
 			return noop
 		}
 		// Other DDL failures are also non-fatal — WARN, skip, continue.
@@ -278,14 +279,14 @@ func (s *Streamer) attachSourceHeartbeat(ctx context.Context, streamID string) *
 			slog.String("err", err.Error()),
 			slog.String("see", "ADR-0061"),
 		)
-		closeIf(sr)
+		migcore.CloseIf(sr)
 		return noop
 	}
 
 	probeCtx, cancel := context.WithCancel(ctx)
 	att := &sourceHeartbeatAttachment{
 		cancel: cancel,
-		close:  func() { closeIf(sr) },
+		close:  func() { migcore.CloseIf(sr) },
 	}
 
 	go sourceHeartbeatLoop(probeCtx, writer, tableName, streamID, s.SourceHeartbeatInterval, pruneWindow)

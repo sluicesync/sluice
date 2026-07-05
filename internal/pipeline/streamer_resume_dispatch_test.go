@@ -305,7 +305,7 @@ func (r *capturingCDCReader) StreamChanges(_ context.Context, from ir.Position) 
 }
 
 // Close makes capturingCDCReader an io.Closer so the streamer's
-// deterministic-teardown closure (warmResume's stop = closeIf(cdc))
+// deterministic-teardown closure (warmResume's stop = migcore.CloseIf(cdc))
 // can join it. Counting calls lets the pin assert Close fired —
 // and fired before Run returned.
 func (r *capturingCDCReader) Close() error {
@@ -324,7 +324,7 @@ func (r *capturingCDCReader) Close() error {
 // captureSlog, the go race detector flagged a write-vs-finished-read
 // on the global default logger across the test boundary.
 //
-// The fix gives warmResume/coldStart a `stop` closure (closeIf(cdc) /
+// The fix gives warmResume/coldStart a `stop` closure (migcore.CloseIf(cdc) /
 // stream.Close()) that runOnce defers — so the CDC reader is Closed,
 // and the engine-side goroutine joined, BEFORE Run returns and the
 // test that started it observes <-runErr. This pin asserts exactly

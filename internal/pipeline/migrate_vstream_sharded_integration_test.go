@@ -19,7 +19,7 @@
 //   - startShardedVTTestServer  (sharded vttestserver, N shards)
 //   - startMySQLTarget / startPGTarget (stock testcontainers targets)
 //   - applySQL / pgRowCount     (DDL/DML + read-back)
-//   - closeIf / ctx2min         (pipeline package helpers)
+//   - migcore.CloseIf / ctx2min         (pipeline package helpers)
 //
 // What this adds over the engine-level VStream suite: the FULL
 // Migrator path (schema read -> create -> bulk copy -> indexes ->

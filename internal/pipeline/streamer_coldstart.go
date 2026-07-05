@@ -92,7 +92,7 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// Run BEFORE OpenSnapshotStream so the snapshot's slot pins a
 	// catalog snapshot that already has the scoped publication.
 	if pe, ok := s.Source.(publicationEnsurer); ok {
-		tables := tableNamesForPublication(schema)
+		tables := migcore.TableNamesForPublication(schema)
 		if err := pe.EnsurePublication(ctx, s.SourceDSN, tables); err != nil {
 			return nil, stop, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: ensure publication scope: %w", err))
 		}
@@ -171,7 +171,7 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context) (*ir.Schema, [
 		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open source schema reader: %w", err))
 	}
 	if err := applyEnabledPGExtensions(ctx, sr, s.EnabledPGExtensions); err != nil {
-		closeIf(sr)
+		migcore.CloseIf(sr)
 		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: enable PG extensions on source: %w", err))
 	}
 	// ADR-0047 tier (b): live PG → PG sync may carry uncatalogued
@@ -182,11 +182,11 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context) (*ir.Schema, [
 	migcore.ApplyTableScope(sr, s.Filter)
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
-		closeIf(sr)
+		migcore.CloseIf(sr)
 		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: read source schema: %w", err))
 	}
 	if len(schema.Tables) == 0 {
-		closeIf(sr)
+		migcore.CloseIf(sr)
 		slog.InfoContext(ctx, "source schema has no tables; nothing to stream")
 		return nil, nil, nil
 	}
@@ -194,7 +194,7 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context) (*ir.Schema, [
 	// Prune by table filter before mappings + bulk-copy so the
 	// excluded tables never reach the target schema-apply phase.
 	if err := migcore.ApplyTableFilter(ctx, schema, s.Filter); err != nil {
-		closeIf(sr)
+		migcore.CloseIf(sr)
 		return nil, nil, err
 	}
 	applyViewFilter(ctx, schema, s.ViewFilter, s.SkipViews)
@@ -212,7 +212,7 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context) (*ir.Schema, [
 	// --include-table, so a large unrelated table in the same keyspace
 	// gets streamed/buffered and overflows --max-buffer-bytes (ADR-0071).
 	// Unqualified names — matches the VStream filter rule's Match scope.
-	snapshotTables := tableNamesForPublication(schema)
+	snapshotTables := migcore.TableNamesForPublication(schema)
 
 	// Source-side RLS preflight (task #52 sub-deliverable 1). Refuses
 	// loudly when any in-scope source table has RLS enabled AND the
@@ -222,7 +222,7 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context) (*ir.Schema, [
 	// short-circuits the refusal (one of the recovery hints). No-op
 	// on non-PG sources.
 	if err := preflightRLS(ctx, schema, sr, rlsSideSource); err != nil {
-		closeIf(sr)
+		migcore.CloseIf(sr)
 		return nil, nil, err
 	}
 
@@ -240,7 +240,7 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context) (*ir.Schema, [
 	// it; its CDCTriggers capability does) nor for MySQL. Runs against
 	// the still-open source SchemaReader (sr) before it's closed below.
 	if err := preflightSourceReplication(ctx, sr, s.Source.Capabilities()); err != nil {
-		closeIf(sr)
+		migcore.CloseIf(sr)
 		return nil, nil, err
 	}
 	// XID-wraparound preflight (pgcopydb PR #17 adoption). Refuses
@@ -250,17 +250,17 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context) (*ir.Schema, [
 	// worse. Gated on the PostgresBackend capability (postgres +
 	// postgres-trigger both declare it).
 	if err := preflightSourceXIDWraparound(ctx, sr, s.Source.Capabilities()); err != nil {
-		closeIf(sr)
+		migcore.CloseIf(sr)
 		return nil, nil, err
 	}
 	// Partition preflight (Bug 100 / v0.92.0). Same shape as the
 	// migrate preflight — refuses upfront when the source schema
 	// contains declaratively-partitioned tables.
 	if err := preflightPartitionedTables(ctx, sr, s.Source.Capabilities(), schema); err != nil {
-		closeIf(sr)
+		migcore.CloseIf(sr)
 		return nil, nil, err
 	}
-	closeIf(sr)
+	migcore.CloseIf(sr)
 
 	return schema, snapshotTables, nil
 }
@@ -436,13 +436,13 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 	applyIndexBuildMem(sw, s.IndexBuildMem)
 	applyIndexBuildParallelism(sw, s.IndexBuildParallelism)
 	if err := applyEnabledPGExtensions(ctx, sw, s.EnabledPGExtensions); err != nil {
-		closeIf(sw)
+		migcore.CloseIf(sw)
 		_ = stream.Abandon()
 		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: enable PG extensions on target: %w", err))
 	}
 	rw, err := s.Target.OpenRowWriter(ctx, s.TargetDSN)
 	if err != nil {
-		closeIf(sw)
+		migcore.CloseIf(sw)
 		_ = stream.Abandon()
 		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open target row writer: %w", err))
 	}
@@ -460,8 +460,8 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 		targetWriteSchemas(schema, s.TargetSchema),
 		s.ReapStaleBackends,
 	); err != nil {
-		closeIf(rw)
-		closeIf(sw)
+		migcore.CloseIf(rw)
+		migcore.CloseIf(sw)
 		_ = stream.Abandon()
 		return nil, nil, err
 	}
@@ -479,8 +479,8 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 	// effective value is discarded (the per-table fan-out degree governs
 	// the actual worker count).
 	if _, _, err := migcore.ResolveTargetCopyParallelism(ctx, s.Target, s.TargetDSN, resolveCopyFanoutDegree(s.CopyFanoutDegree), s.MaxTargetConnections); err != nil {
-		closeIf(rw)
-		closeIf(sw)
+		migcore.CloseIf(rw)
+		migcore.CloseIf(sw)
 		_ = stream.Abandon()
 		return nil, nil, err
 	}
@@ -494,8 +494,8 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 	// non-PG targets.
 	if !s.SchemaAlreadyApplied {
 		if err := preflightRLS(ctx, schema, rw, rlsSideTarget); err != nil {
-			closeIf(rw)
-			closeIf(sw)
+			migcore.CloseIf(rw)
+			migcore.CloseIf(sw)
 			_ = stream.Abandon()
 			return nil, nil, err
 		}
@@ -525,8 +525,8 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 	switch {
 	case s.ResetTargetData:
 		if err := resetTargetDataForStream(ctx, schema, rw, applier, streamID); err != nil {
-			closeIf(rw)
-			closeIf(sw)
+			migcore.CloseIf(rw)
+			migcore.CloseIf(sw)
 			_ = stream.Abandon()
 			return err
 		}
@@ -581,8 +581,8 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 		// the loud-failure fix for the misleading "the idempotent copy absorbs
 		// the overlap" hint, which only ever held for idempotent readers.
 		if err := resetTargetTablesForRestart(ctx, schema, rw); err != nil {
-			closeIf(rw)
-			closeIf(sw)
+			migcore.CloseIf(rw)
+			migcore.CloseIf(sw)
 			_ = stream.Abandon()
 			return err
 		}
@@ -597,14 +597,14 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 		// single-shard/non-sharded source. Runs first for the clearest
 		// diagnostic.
 		if err := preflightCrossShardCollision(ctx, s.Source, s.SourceDSN, schema, s.InjectShardColumn.Engaged(), s.AllowCrossShardMerge); err != nil {
-			closeIf(rw)
-			closeIf(sw)
+			migcore.CloseIf(rw)
+			migcore.CloseIf(sw)
 			_ = stream.Abandon()
 			return err
 		}
 		if err := preflightShardConsolidation(ctx, schema, rw, s.InjectShardColumn.Name, s.InjectShardColumn.Value); err != nil {
-			closeIf(rw)
-			closeIf(sw)
+			migcore.CloseIf(rw)
+			migcore.CloseIf(sw)
 			_ = stream.Abandon()
 			return err
 		}
@@ -627,8 +627,8 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 			// refused on a populated target — Bug 9. --force-cold-start keeps
 			// its existing skip semantics for either reader.)
 			if err := preflightColdStart(ctx, schema, rw, s.ForceColdStart || forceFresh, preflightModeSync); err != nil {
-				closeIf(rw)
-				closeIf(sw)
+				migcore.CloseIf(rw)
+				migcore.CloseIf(sw)
 				_ = stream.Abandon()
 				return err
 			}
@@ -708,13 +708,13 @@ func (s *Streamer) coldStartRunCopy(ctx context.Context, schema *ir.Schema, stre
 		copyErr = runBulkCopyWithOpts(ctx, schema, stream.Rows, sw, rw, bulkOpts)
 	}
 	if copyErr != nil {
-		closeIf(rw)
-		closeIf(sw)
+		migcore.CloseIf(rw)
+		migcore.CloseIf(sw)
 		_ = stream.Abandon()
 		return copyErr
 	}
-	closeIf(rw)
-	closeIf(sw)
+	migcore.CloseIf(rw)
+	migcore.CloseIf(sw)
 	// Release the snapshot transaction and import-side connections
 	// now that bulk-copy is done — without this, Postgres holds the
 	// snapshot tx as `idle in transaction` for the entire CDC
@@ -857,22 +857,6 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 	// goroutine deterministically (no longer left to process-exit
 	// reclaim — see the stop assignment above).
 	return changes, stop, nil
-}
-
-// tableNamesForPublication returns the bare table names from a
-// post-filter schema, in declaration order. Used by the publication-
-// scope step (Bug 13, ADR-0021) — schema-qualifying happens in the
-// engine because schema is an engine-side concept (PG namespaces vs.
-// MySQL databases vs. future engines).
-func tableNamesForPublication(schema *ir.Schema) []string {
-	if schema == nil {
-		return nil
-	}
-	out := make([]string, 0, len(schema.Tables))
-	for _, t := range schema.Tables {
-		out = append(out, t.Name)
-	}
-	return out
 }
 
 // openSnapshotStreamScoped opens the snapshot stream, preferring (in

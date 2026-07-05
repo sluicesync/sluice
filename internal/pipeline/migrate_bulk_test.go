@@ -16,13 +16,13 @@ import (
 // TestPKTracker_LastPK confirms the tracker captures the most recent
 // row's PK columns and ignores rows with missing PK keys gracefully.
 func TestPKTracker_LastPK(t *testing.T) {
-	tr := newPKTracker([]string{"tenant", "id"})
+	tr := migcore.NewPKTracker([]string{"tenant", "id"})
 
-	tr.observe(ir.Row{"tenant": "a", "id": int64(1), "name": "x"})
-	tr.observe(ir.Row{"tenant": "a", "id": int64(2), "name": "y"})
-	tr.observe(ir.Row{"tenant": "b", "id": int64(3), "name": "z"})
+	tr.Observe(ir.Row{"tenant": "a", "id": int64(1), "name": "x"})
+	tr.Observe(ir.Row{"tenant": "a", "id": int64(2), "name": "y"})
+	tr.Observe(ir.Row{"tenant": "b", "id": int64(3), "name": "z"})
 
-	got, ok := tr.lastPK()
+	got, ok := tr.LastPK()
 	if !ok {
 		t.Fatal("lastPK ok=false after observe(); want true")
 	}
@@ -35,8 +35,8 @@ func TestPKTracker_LastPK(t *testing.T) {
 // TestPKTracker_NoRows confirms the tracker reports ok=false before
 // any rows pass through.
 func TestPKTracker_NoRows(t *testing.T) {
-	tr := newPKTracker([]string{"id"})
-	got, ok := tr.lastPK()
+	tr := migcore.NewPKTracker([]string{"id"})
+	got, ok := tr.LastPK()
 	if ok {
 		t.Errorf("lastPK ok=true on empty tracker; want false (got %v)", got)
 	}
@@ -46,9 +46,9 @@ func TestPKTracker_NoRows(t *testing.T) {
 // row is a no-op rather than a panic. Defensive against pipeline
 // edge cases where a closed channel is mishandled.
 func TestPKTracker_NilRowDefensive(t *testing.T) {
-	tr := newPKTracker([]string{"id"})
-	tr.observe(nil)
-	if _, ok := tr.lastPK(); ok {
+	tr := migcore.NewPKTracker([]string{"id"})
+	tr.Observe(nil)
+	if _, ok := tr.LastPK(); ok {
 		t.Error("nil row produced a captured PK; want untouched tracker")
 	}
 }
@@ -58,9 +58,9 @@ func TestPKTracker_NilRowDefensive(t *testing.T) {
 // configured reader, but the tracker must not panic). The captured
 // value is whatever the row returns for the missing key (nil).
 func TestPKTracker_MissingPKColumn(t *testing.T) {
-	tr := newPKTracker([]string{"tenant", "id"})
-	tr.observe(ir.Row{"id": int64(7)}) // tenant missing
-	got, ok := tr.lastPK()
+	tr := migcore.NewPKTracker([]string{"tenant", "id"})
+	tr.Observe(ir.Row{"id": int64(7)}) // tenant missing
+	got, ok := tr.LastPK()
 	if !ok {
 		t.Fatal("lastPK ok=false; want true")
 	}
@@ -82,7 +82,7 @@ func TestTeePKAndCount(t *testing.T) {
 	src <- ir.Row{"id": int64(3)}
 	close(src)
 
-	tr := newPKTracker([]string{"id"})
+	tr := migcore.NewPKTracker([]string{"id"})
 	var count int64
 	tickCount := int64(0)
 	out := teePKAndCount(context.Background(), src, tr, &count, func(_ ir.Row) {
@@ -102,7 +102,7 @@ func TestTeePKAndCount(t *testing.T) {
 	if c := atomic.LoadInt64(&tickCount); c != 3 {
 		t.Errorf("ticker calls = %d; want 3", c)
 	}
-	got, ok := tr.lastPK()
+	got, ok := tr.LastPK()
 	if !ok || got[0] != int64(3) {
 		t.Errorf("lastPK = %v ok=%v; want [3] true", got, ok)
 	}

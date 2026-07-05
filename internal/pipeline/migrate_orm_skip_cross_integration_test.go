@@ -27,6 +27,7 @@ import (
 	_ "modernc.org/sqlite" // pure-Go driver for seeding the temp source file
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 	_ "sluicesync.dev/sluice/internal/engines/sqlite"
@@ -102,7 +103,7 @@ func migrateORMSkipToPG(t *testing.T, skip bool) map[string]bool {
 	if err != nil {
 		t.Fatalf("OpenSchemaReader: %v", err)
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 	got, err := sr.ReadSchema(ctx)
 	if err != nil {
 		t.Fatalf("ReadSchema: %v", err)

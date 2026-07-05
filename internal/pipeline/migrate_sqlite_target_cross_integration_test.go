@@ -29,6 +29,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // seedSQLiteRich writes a temp SQLite source covering every IR value family
@@ -115,7 +116,7 @@ func runSQLiteTargetRoundTrip(t *testing.T, midName string, start func(*testing.
 	if err != nil {
 		t.Fatalf("OpenSchemaReader(dst): %v", err)
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
 		t.Fatalf("ReadSchema(dst): %v", err)
@@ -144,7 +145,7 @@ func runSQLiteTargetRoundTrip(t *testing.T, midName string, start func(*testing.
 	if err != nil {
 		t.Fatalf("OpenRowReader(dst): %v", err)
 	}
-	defer closeIf(rr)
+	defer migcore.CloseIf(rr)
 	rows := readAll(t, ctx, rr, widgets)
 	if len(rows) != 2 {
 		t.Fatalf("final rows = %d; want 2", len(rows))
@@ -238,7 +239,7 @@ func TestMigrate_PostgresToSQLite_NativeTypes(t *testing.T) {
 	}
 
 	sr, _ := sqliteEng.OpenSchemaReader(ctx, dst)
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
 		t.Fatalf("ReadSchema: %v", err)
@@ -248,7 +249,7 @@ func TestMigrate_PostgresToSQLite_NativeTypes(t *testing.T) {
 		t.Fatalf("missing table n; have %v", targetTableNames(schema))
 	}
 	rr, _ := sqliteEng.OpenRowReader(ctx, dst)
-	defer closeIf(rr)
+	defer migcore.CloseIf(rr)
 	rows := readAll(t, ctx, rr, tbl)
 	if len(rows) != 1 {
 		t.Fatalf("rows = %d; want 1", len(rows))
@@ -318,7 +319,7 @@ func TestMigrate_SQLiteToSQLiteFKIntegrity(t *testing.T) {
 	}
 
 	sr, _ := sqliteEng.OpenSchemaReader(ctx, dst)
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 	schema, _ := sr.ReadSchema(ctx)
 	posts := findTable(schema, "posts")
 	if posts == nil || len(posts.ForeignKeys) != 1 {

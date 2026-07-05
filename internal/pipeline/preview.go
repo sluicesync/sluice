@@ -271,7 +271,7 @@ func (p *Previewer) Run(ctx context.Context) error {
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("preview: open source schema reader: %w", err))
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 	if err := applyEnabledPGExtensions(ctx, sr, p.EnabledPGExtensions); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("preview: enable PG extensions on source: %w", err))
 	}
@@ -460,7 +460,7 @@ func (p *Previewer) Run(ctx context.Context) error {
 	if err := applyEnabledPGExtensions(ctx, sw, p.EnabledPGExtensions); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("preview: enable PG extensions on target: %w", err))
 	}
-	defer closeIf(sw)
+	defer migcore.CloseIf(sw)
 
 	previewer, ok := sw.(ir.DDLPreviewer)
 	if !ok {

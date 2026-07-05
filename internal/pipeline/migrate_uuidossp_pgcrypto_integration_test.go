@@ -42,6 +42,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -258,7 +259,7 @@ func TestMigrate_PG_UUIDOSSP_FlagAbsent_RefusedAtSchemaRead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSchemaReader: %v", err)
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 
 	// Deliberately do NOT EnableExtensions. The Tier-3 schema-read
 	// gate must refuse.
@@ -438,7 +439,7 @@ func TestMigrate_PG_Pgcrypto_GeneratedColumn_Gated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSchemaReader: %v", err)
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 
 	// Flag absent → the generated-column path of the Tier-3 gate must
 	// refuse just like the DEFAULT path (otherwise generated is a
@@ -459,7 +460,7 @@ func TestMigrate_PG_Pgcrypto_GeneratedColumn_Gated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSchemaReader (2): %v", err)
 	}
-	defer closeIf(sr2)
+	defer migcore.CloseIf(sr2)
 	if aware, ok := sr2.(ir.ExtensionAware); ok {
 		if err := aware.EnableExtensions(ctx, []string{"pgcrypto"}); err != nil {
 			t.Fatalf("EnableExtensions: %v", err)

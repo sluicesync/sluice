@@ -31,6 +31,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	// Both engines must be registered for engines.Get to find them.
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
@@ -108,7 +109,7 @@ func TestMigrate_PostgresToMySQL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSchemaReader: %v", err)
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 
 	got, err := sr.ReadSchema(ctx)
 	if err != nil {
@@ -193,7 +194,7 @@ func TestMigrate_PostgresToMySQL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenRowReader: %v", err)
 	}
-	defer closeIf(rr)
+	defer migcore.CloseIf(rr)
 
 	usersRows := readAll(t, ctx, rr, users)
 	if len(usersRows) != 2 {

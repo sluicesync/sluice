@@ -29,6 +29,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -313,7 +314,7 @@ func TestStreamer_PG_StreamIDCollisionRefused(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenChangeApplier: %v", err)
 	}
-	defer closeIf(applier)
+	defer migcore.CloseIf(applier)
 	if err := applier.EnsureControlTable(ctx); err != nil {
 		t.Fatalf("EnsureControlTable: %v", err)
 	}

@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // shardStampRow stamps the operator-supplied discriminator
@@ -60,11 +61,11 @@ func shardStampRows(
 	if shardName == "" {
 		return src, func() error { return nil }
 	}
-	// Standard bounded buffer ([rowChanBuffer], perf-parity matrix row 6):
+	// Standard bounded buffer ([migcore.RowChanBuffer], perf-parity matrix row 6):
 	// same rationale as the [redactRows] tee — an unbuffered relay made the
 	// stamp a rendezvous hop in the bulk-copy hot path when Shape A was
 	// engaged. Buffered, stamping and the downstream write overlap.
-	out := make(chan ir.Row, rowChanBuffer)
+	out := make(chan ir.Row, migcore.RowChanBuffer)
 	var (
 		mu    sync.Mutex
 		fnErr error

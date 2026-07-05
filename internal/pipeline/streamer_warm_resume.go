@@ -77,14 +77,14 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position, lsnTra
 	}
 	changes, err = cdc.StreamChanges(ctx, persisted)
 	if err != nil {
-		closeIf(cdc)
+		migcore.CloseIf(cdc)
 		return nil, stop, migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: start cdc: %w", err))
 	}
 	// Hand the caller a closure that closes the CDC reader. The reader's
 	// Close cancels its pump AND closes the underlying syncer/slot, so
 	// the engine-side streaming goroutine is joined deterministically
 	// rather than left to run out its reconnect budget after ctx cancel.
-	stop = func() { closeIf(cdc) }
+	stop = func() { migcore.CloseIf(cdc) }
 	// GitHub issue #19: capture the reader's Err method so runOnce
 	// can surface a pump error (transient `read: connection reset`
 	// etc.) into the ADR-0038 retry loop after the changes channel

@@ -362,7 +362,7 @@ func TestIsRetriableSourceReadError_Classification(t *testing.T) {
 }
 
 // errorsJoin wraps wrapped under outer so errors.As walks to wrapped —
-// mirrors readerStreamErr's `%w` wrap of the reader's classified Err().
+// mirrors migcore.ReaderStreamErr's `%w` wrap of the reader's classified Err().
 func errorsJoin(outer, wrapped error) error {
 	return wrappedErr{outer: outer, inner: wrapped}
 }

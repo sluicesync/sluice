@@ -72,7 +72,7 @@ func corpusReadPGSchemaScoped(t *testing.T, dsn, schema string, wantMin int) *ir
 		t.Fatalf("postgres OpenSchemaReader (schema %q): %v", schema, err)
 	}
 	migcore.ApplyTargetSchema(sr, schema) // ir.SchemaSetter — pins reads to `schema`
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 	sch, err := sr.ReadSchema(ctx2min(t))
 	if err != nil {
 		t.Fatalf("postgres ReadSchema (schema %q): %v", schema, err)
@@ -472,7 +472,7 @@ func corpusReadMySQLSchema(t *testing.T, dsn string, wantMin int) *ir.Schema {
 	if err != nil {
 		t.Fatalf("mysql OpenSchemaReader: %v", err)
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 	sch, err := sr.ReadSchema(ctx2min(t))
 	if err != nil {
 		t.Fatalf("mysql ReadSchema: %v", err)

@@ -32,7 +32,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"sync"
 	"time"
@@ -580,7 +579,7 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	// case (already logged inside the phase).
 	sr, schema, err := m.phaseReadSourceSchema(ctx, scope)
 	if sr != nil {
-		defer closeIf(sr)
+		defer migcore.CloseIf(sr)
 	}
 	if err != nil {
 		return err
@@ -621,7 +620,7 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 		return nil
 	}
 	if rc.enabled {
-		defer closeIf(rc.store)
+		defer migcore.CloseIf(rc.store)
 	}
 	resuming := m.Resume && rc.enabled
 
@@ -648,7 +647,7 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 		}
 		a.EnableDegradedFKs()
 	}
-	defer closeIf(sw)
+	defer migcore.CloseIf(sw)
 
 	rw, err := m.Target.OpenRowWriter(ctx, m.TargetDSN)
 	if err != nil {
@@ -657,7 +656,7 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	}
 	migcore.ApplyTargetSchema(rw, m.TargetSchema)
 	migcore.ApplyMaxBufferBytes(rw, m.MaxBufferBytes)
-	defer closeIf(rw)
+	defer migcore.CloseIf(rw)
 
 	// ---- 2.5. Target-side preflights (RLS, stale backends) ----
 	// Stale-backend detection MUST precede both the cold-start
@@ -690,7 +689,7 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 			return migcore.WrapWithHint(migcore.PhaseConnect, markFailed(ctx, rc, state, ir.MigrationPhasePending,
 				fmt.Errorf("pipeline: open source row reader: %w", err)))
 		}
-		defer closeIf(openedRR)
+		defer migcore.CloseIf(openedRR)
 		rr = openedRR
 	}
 
@@ -756,7 +755,7 @@ func (m *Migrator) openResumeContext(ctx context.Context, resetting bool) (resum
 	state, exitClean, err := loadOrInitState(ctx, rc, m.Resume, resetting)
 	if err != nil {
 		if rc.enabled {
-			closeIf(rc.store)
+			migcore.CloseIf(rc.store)
 		}
 		return resumeContext{}, ir.MigrationState{}, false, err
 	}
@@ -1130,7 +1129,7 @@ func runBulkCopyForAddTable(
 //     and skip pre-existing entries.
 //
 // bulkBatchSize is the per-batch row count for the cursor-bearing
-// resume path. Zero falls back to defaultBulkBatchSize. Ignored on
+// resume path. Zero falls back to migcore.DefaultBulkBatchSize. Ignored on
 // the cold-start (non-resume) path which uses the faster plain-INSERT
 // or COPY-protocol shape.
 func runBulkCopyPhases(
@@ -1632,7 +1631,7 @@ func dryRunRowCounts(ctx context.Context, source ir.Engine, dsn string, schema *
 		)
 		return counts
 	}
-	defer closeIf(rr)
+	defer migcore.CloseIf(rr)
 
 	counter, ok := rr.(ir.RowCounter)
 	if !ok {
@@ -1656,14 +1655,6 @@ func dryRunRowCounts(ctx context.Context, source ir.Engine, dsn string, schema *
 		counts[t.Name] = n
 	}
 	return counts
-}
-
-// closeIf calls Close on v if it implements io.Closer. Used to clean
-// up the *sql.DB handles the engine readers/writers wrap.
-func closeIf(v any) {
-	if c, ok := v.(io.Closer); ok {
-		_ = c.Close()
-	}
 }
 
 // applyCopyCheckpoint wires the resumable COPY-cursor checkpoint sink

@@ -30,6 +30,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -223,7 +224,7 @@ func TestMigrate_PG_Hstore_Passthrough(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSchemaReader on target: %v", err)
 	}
-	defer closeIf(pgRdr)
+	defer migcore.CloseIf(pgRdr)
 	if aware, ok := pgRdr.(ir.ExtensionAware); ok {
 		if err := aware.EnableExtensions(ctx, []string{"hstore"}); err != nil {
 			t.Fatalf("EnableExtensions on target reader: %v", err)
@@ -344,7 +345,7 @@ func TestMigrate_PG_CiText_Passthrough(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSchemaReader: %v", err)
 	}
-	defer closeIf(pgRdr)
+	defer migcore.CloseIf(pgRdr)
 	if aware, ok := pgRdr.(ir.ExtensionAware); ok {
 		if err := aware.EnableExtensions(ctx, []string{"citext"}); err != nil {
 			t.Fatalf("EnableExtensions on target reader: %v", err)

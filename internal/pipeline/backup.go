@@ -283,7 +283,7 @@ func (b *Backup) Run(ctx context.Context) error {
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("backup: open source schema reader: %w", err))
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 
 	// ADR-0047 tier (b): a PG-source backup may carry uncatalogued
 	// extension types verbatim. The restore-target engine is unknown
@@ -813,7 +813,7 @@ func (b *Backup) openBackupSnapshotScoped(ctx context.Context, schema *ir.Schema
 		PersistChainSlot:  persistChainSlot,
 		ReaderParallelism: requestedReaders,
 	}
-	tables := tableNamesForPublication(schema)
+	tables := migcore.TableNamesForPublication(schema)
 	if len(tables) > 0 {
 		if scoped, ok := b.Source.(irbackup.TableScopedBackupSnapshotOpener); ok {
 			snap, err = scoped.OpenBackupSnapshotForTables(ctx, b.SourceDSN, opts, tables)
@@ -906,7 +906,7 @@ func (b *Backup) openSnapshotOrFallback(ctx context.Context, schema *ir.Schema, 
 	if err != nil {
 		return nil, nil, nil, func() {}, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("backup: open source row reader: %w", err))
 	}
-	cleanup := func() { closeIf(rr) }
+	cleanup := func() { migcore.CloseIf(rr) }
 	return rr, nil, nil, cleanup, nil
 }
 
@@ -945,7 +945,7 @@ func (b *Backup) captureEndPosition(ctx context.Context, manifest *irbackup.Mani
 	if err != nil {
 		return fmt.Errorf("open schema reader for position capture: %w", err)
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 
 	capturer, ok := sr.(irbackup.PositionCapturer)
 	if !ok {
@@ -1051,7 +1051,7 @@ func (b *Backup) backupTable(
 				// streaming goroutine (Bug 68 loud-failure gate; now a
 				// first-class [ir.RowReader.Err] surface, no longer an
 				// optional type assertion).
-				if err := readerStreamErr(rr, table); err != nil {
+				if err := migcore.ReaderStreamErr(rr, table); err != nil {
 					return err
 				}
 				// Per-table checkpoint: flip the entry to its terminal

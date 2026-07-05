@@ -21,7 +21,7 @@ import (
 // wraparound, partitioned tables) against the still-open reader.
 //
 // The returned SchemaReader is handed back to the caller, which owns
-// its lifetime (a single deferred closeIf spanning the whole run) —
+// its lifetime (a single deferred migcore.CloseIf spanning the whole run) —
 // it is returned non-nil even alongside an error so the caller's
 // defer releases it on every post-open failure path, exactly as the
 // pre-split inline defer did. A nil schema with a nil error is the

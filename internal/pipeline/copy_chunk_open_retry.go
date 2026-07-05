@@ -20,7 +20,7 @@
 //
 // Retry / double-copy safety (the crux — same argument as the 53300 path):
 // [openOneChunkConn] fails at reader-open OR writer-open, closes any partial
-// (closeIf(rdr)) and returns (nil, nil, err) — i.e. the open fails BEFORE any
+// (migcore.CloseIf(rdr)) and returns (nil, nil, err) — i.e. the open fails BEFORE any
 // COPY / WriteRows runs, exactly like a 53300. So reconnecting and re-running
 // the chunk from its recorded chunk.LastPK cursor (WHERE (pk) > LastPK, the
 // existing keyset resume in copy_source_read_retry.go / resumeFromChunkCursor)

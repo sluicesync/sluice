@@ -52,7 +52,7 @@ type fakeSourceStore struct {
 // drains — sequentially, on that ONE reader. An EARLIER cut of this fake
 // shared a single instance (and thus a single err) across concurrent chunk
 // readers, so a sibling chunk's emit could reset err=nil between the
-// dropping chunk's drop and its readerStreamErr check — masking the
+// dropping chunk's drop and its migcore.ReaderStreamErr check — masking the
 // retriable drop, which then read as a clean short-page end-of-chunk and
 // SILENTLY dropped the unread rows. That was a HARNESS modelling defect,
 // not a production bug: per-handle err reproduces the real isolation.
@@ -93,7 +93,7 @@ func (s *fakeSource) emit(ctx context.Context, after, upTo int64, limit int) <-c
 	s.err = nil
 	s.mu.Unlock()
 
-	out := make(chan ir.Row, rowChanBuffer)
+	out := make(chan ir.Row, migcore.RowChanBuffer)
 	go func() {
 		defer close(out)
 		sent := 0
@@ -488,7 +488,7 @@ func TestSourceReadRetryE2E_NonRetriableDecodeIsTerminal(t *testing.T) {
 type terminalDropSource struct{ *fakeSource }
 
 func (s *terminalDropSource) ReadRows(ctx context.Context, _ *ir.Table) (<-chan ir.Row, error) {
-	out := make(chan ir.Row, rowChanBuffer)
+	out := make(chan ir.Row, migcore.RowChanBuffer)
 	go func() {
 		defer close(out)
 		for id := int64(1); id <= 3; id++ {

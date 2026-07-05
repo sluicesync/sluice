@@ -192,13 +192,13 @@ func (v *Verifier) Run(ctx context.Context) (*VerifyResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("verify: open source schema reader: %w", err)
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 
 	tr, err := v.Target.OpenSchemaReader(ctx, v.TargetDSN)
 	if err != nil {
 		return nil, fmt.Errorf("verify: open target schema reader: %w", err)
 	}
-	defer closeIf(tr)
+	defer migcore.CloseIf(tr)
 
 	srcVerifier, ok := sr.(ir.Verifier)
 	if !ok {

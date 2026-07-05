@@ -446,7 +446,7 @@ func (s *Streamer) warmResumeMultiDatabase(
 		return nil, stop, migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: open server-wide cdc reader: %w", err))
 	}
 	// Once the reader is open every error path must close it.
-	closeReader := func() { closeIf(cdc) }
+	closeReader := func() { migcore.CloseIf(cdc) }
 
 	// Scope the server-wide binlog to the selected database set. The reader
 	// emits row/truncate events from EVERY selected database (each tagged
@@ -498,7 +498,7 @@ func (s *Streamer) warmResumeMultiDatabase(
 		closeReader()
 		return nil, stop, migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: resume multi-database cdc: %w", err))
 	}
-	stop = func() { closeIf(cdc) }
+	stop = func() { migcore.CloseIf(cdc) }
 	if errer, ok := cdc.(interface{ Err() error }); ok {
 		s.sourceErrFn = errer.Err
 	}
@@ -554,10 +554,10 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	applyMultiDatabaseScope(sr, &multiDBScope{database: database, inScope: inScope})
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
-		closeIf(sr)
+		migcore.CloseIf(sr)
 		return fmt.Errorf("pipeline: read source schema for %q: %w", database, err)
 	}
-	closeIf(sr)
+	migcore.CloseIf(sr)
 
 	if len(schema.Tables) == 0 {
 		slog.InfoContext(ctx, "multi-database: database has no tables; skipping copy",
@@ -633,7 +633,7 @@ func (s *Streamer) coldStartCopyOneDatabase(
 
 	rw, err := s.Target.OpenRowWriter(ctx, targetDSN)
 	if err != nil {
-		closeIf(sw)
+		migcore.CloseIf(sw)
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open target row writer for %q: %w", database, err))
 	}
 	migcore.ApplyTargetSchema(rw, targetSchema)
@@ -646,8 +646,8 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	switch {
 	case s.ResetTargetData:
 		if err := resetTargetDataForStream(ctx, schema, rw, applier, streamID); err != nil {
-			closeIf(rw)
-			closeIf(sw)
+			migcore.CloseIf(rw)
+			migcore.CloseIf(sw)
 			return fmt.Errorf("pipeline: reset target data for %q: %w", database, err)
 		}
 	case forceFresh && !copyReaderIsIdempotent(stream.Rows):
@@ -661,14 +661,14 @@ func (s *Streamer) coldStartCopyOneDatabase(
 		// but guarded for parity) keeps the absorb-the-overlap behaviour via
 		// the default branch.
 		if err := resetTargetTablesForRestart(ctx, schema, rw); err != nil {
-			closeIf(rw)
-			closeIf(sw)
+			migcore.CloseIf(rw)
+			migcore.CloseIf(sw)
 			return fmt.Errorf("pipeline: restart-from-scratch reset for %q: %w", database, err)
 		}
 	default:
 		if err := preflightColdStart(ctx, schema, rw, s.ForceColdStart || forceFresh, preflightModeSync); err != nil {
-			closeIf(rw)
-			closeIf(sw)
+			migcore.CloseIf(rw)
+			migcore.CloseIf(sw)
 			return fmt.Errorf("pipeline: cold-start preflight for %q: %w", database, err)
 		}
 	}
@@ -688,11 +688,11 @@ func (s *Streamer) coldStartCopyOneDatabase(
 
 	bulkOpts := bulkCopyOpts{Redactor: s.Redactor, NoIntraTableStealing: s.NoIntraTableStealing}
 	if err := runBulkCopyWithOpts(ctx, schema, stream.Rows, sw, rw, bulkOpts); err != nil {
-		closeIf(rw)
-		closeIf(sw)
+		migcore.CloseIf(rw)
+		migcore.CloseIf(sw)
 		return fmt.Errorf("pipeline: bulk-copy database %q: %w", database, err)
 	}
-	closeIf(rw)
-	closeIf(sw)
+	migcore.CloseIf(rw)
+	migcore.CloseIf(sw)
 	return nil
 }

@@ -39,6 +39,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 )
@@ -95,7 +96,7 @@ func TestMigrate_VStreamWriteConcurrency_TablesWrittenConcurrently(t *testing.T)
 		t.Fatalf("open source schema reader: %v", err)
 	}
 	schema, err := sr.ReadSchema(ctx)
-	closeIf(sr)
+	migcore.CloseIf(sr)
 	if err != nil {
 		t.Fatalf("read source schema: %v", err)
 	}
@@ -130,12 +131,12 @@ func TestMigrate_VStreamWriteConcurrency_TablesWrittenConcurrently(t *testing.T)
 	if err != nil {
 		t.Fatalf("open target schema writer: %v", err)
 	}
-	defer closeIf(sw)
+	defer migcore.CloseIf(sw)
 	rw, err := tgtEng.OpenRowWriter(ctx, targetDSN)
 	if err != nil {
 		t.Fatalf("open target row writer: %v", err)
 	}
-	defer closeIf(rw)
+	defer migcore.CloseIf(rw)
 
 	// Poll the target's per-table counts WHILE the copy runs; record the peak
 	// number of tables simultaneously "in progress" (count > 0 but < final).

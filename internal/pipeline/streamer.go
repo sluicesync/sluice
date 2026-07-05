@@ -1317,11 +1317,11 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 		return err
 	}
 	if ownsApplier {
-		defer closeIf(applier)
+		defer migcore.CloseIf(applier)
 	}
 	// ADR-0054 Phase 2d: release shape-coordination resources when
 	// engaged (SchemaWriter for per-shape DDL; the lease store /
-	// prober live on the applier and are released by closeIf above).
+	// prober live on the applier and are released by migcore.CloseIf above).
 	defer s.closeShardCoordination()
 	// ADR-0058: release the single-stream ADD COLUMN forwarding
 	// resources (SchemaWriter + optional source RowReader). No-op

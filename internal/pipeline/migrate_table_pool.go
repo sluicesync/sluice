@@ -52,6 +52,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/redact"
 )
 
@@ -73,7 +74,7 @@ func warnStateWriteFailed(ctx context.Context, tableName string, err error) {
 // writer pair — the "free pair". Exactly one running table reuses them at
 // a time (claimed via a 1-slot channel); peers open their own pair via
 // openTablePair and close it when done. The free pair is NOT closed here
-// (the caller owns its lifecycle through its deferred closeIf).
+// (the caller owns its lifecycle through its deferred migcore.CloseIf).
 //
 // The errgroup's derived ctx cancels on the first table's error so peers
 // unwind promptly; g.Wait returns the first error.
@@ -207,8 +208,8 @@ func acquireTablePair(
 		}
 		p := tablePair{rows: rows, rw: rw}
 		release := func() {
-			closeIf(p.rw)
-			closeIf(p.rows)
+			migcore.CloseIf(p.rw)
+			migcore.CloseIf(p.rows)
 		}
 		return p, release, nil
 	}

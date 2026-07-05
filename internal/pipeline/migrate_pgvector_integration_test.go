@@ -22,6 +22,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 
@@ -217,7 +218,7 @@ func TestMigrate_PG_Pgvector_Passthrough(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSchemaReader on target: %v", err)
 	}
-	defer closeIf(pgRdr)
+	defer migcore.CloseIf(pgRdr)
 	if aware, ok := pgRdr.(ir.ExtensionAware); ok {
 		if err := aware.EnableExtensions(ctx, []string{"vector"}); err != nil {
 			t.Fatalf("EnableExtensions on target reader: %v", err)
@@ -442,7 +443,7 @@ func TestSchemaReader_PG_VectorType_NotEnabled_FallsThroughToLoudFailure(t *test
 	if err != nil {
 		t.Fatalf("OpenSchemaReader: %v", err)
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 
 	// Deliberately do NOT call EnableExtensions. The reader's
 	// USER-DEFINED dispatch should refuse the vector column at type
@@ -475,7 +476,7 @@ func TestEnableExtensions_UnknownNameRefused(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSchemaReader: %v", err)
 	}
-	defer closeIf(sr)
+	defer migcore.CloseIf(sr)
 
 	aware, ok := sr.(ir.ExtensionAware)
 	if !ok {
