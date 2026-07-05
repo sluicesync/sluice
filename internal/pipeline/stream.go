@@ -319,219 +319,42 @@ type BackupStream struct {
 // change-chunk files under `chunks/_changes/<run-namespace>/`.
 // `stream_state.json` is updated with the rollover's commit timestamp.
 //
-//nolint:funlen // ratchet: pre-existing 355-line accretion — stream.go is the flagged M2.6-leftover split target; carve it then drop this
+// Setup (validate → preflights → open the CDC pump → initial state) lives
+// in [BackupStream.newRolloverLoop]; this function owns the pump's close
+// defer and drives the rollover loop, delegating each committed / empty
+// rollover to commitRollover / handleEmptyRollover and keeping the
+// transient-retry and in-process rotation-FSM logic inline.
 func (b *BackupStream) Run(ctx context.Context) error {
-	if err := b.validate(); err != nil {
+	init, err := b.newRolloverLoop(ctx)
+	if err != nil {
 		return err
 	}
-
-	clockNow := b.clockNow
-	if clockNow == nil {
-		clockNow = time.Now
-	}
-	now := time.Now
-	if b.Now != nil {
-		now = b.Now
-	}
-
-	rolloverWindow := b.RolloverWindow
-	if rolloverWindow <= 0 {
-		rolloverWindow = DefaultRolloverWindow
-	}
-	maxChanges := b.RolloverMaxChanges
-	if maxChanges <= 0 {
-		maxChanges = DefaultRolloverMaxChanges
-	}
-	maxBytes := b.RolloverMaxBytes
-	if maxBytes <= 0 {
-		maxBytes = DefaultRolloverMaxBytes
-	}
-	chunkSize := b.ChunkChanges
-	if chunkSize <= 0 {
-		chunkSize = DefaultIncrementalChunkChanges
-	}
-	statePath := b.streamStatePath
-	if statePath == "" {
-		statePath = DefaultStreamStateFilename
-	}
-	pidHost := b.pidHostFn
-	if pidHost == nil {
-		pidHost = defaultPidHost
-	}
-	pid, host := pidHost()
-
-	// 1. Concurrent-writer check (stream_state.json lives at the
-	//    lineage root — it's a stream-level liveness file, not
-	//    per-segment).
-	if err := b.preflightStreamState(ctx, statePath, rolloverWindow, pid, host, now()); err != nil {
-		return err
-	}
-
-	// 1.4. Crash recovery: reconcile any rotation_state.json left by a
-	//    crash mid-FSM BEFORE resolving the open segment, so the open
-	//    segment is the post-recovery truth (≤COMMIT → prior segment;
-	//    >COMMIT → the new segment the atomic write made authoritative).
-	if err := recoverRotationState(ctx, b.Store); err != nil {
-		return fmt.Errorf("stream: rotation recovery: %w", err)
-	}
-
-	// 1.5. Resolve the OPEN segment: rollovers append to it under its
-	//    Dir + recorded codec (ADR-0046). For a never-rotated backup
-	//    that's the root (Dir == "") — byte-identical to the pre-ADR
-	//    single chain. Rotation repoints b.segStore / b.segCodec.
-	segStore, segCodec, err := lineage.OpenSegmentStore(ctx, b.Store, b.Codec)
-	if err != nil {
-		return fmt.Errorf("stream: resolve open segment: %w", err)
-	}
-	b.segStore = segStore
-	b.segCodec = segCodec
-
-	// 1.6. Heal an open-segment catalog that a crash/cancel left out of
-	//    sync with disk (an incremental durable on disk but missing from
-	//    lineage.json's Incrementals list, because its best-effort catalog
-	//    append never landed). Must run BEFORE resolveParent: otherwise the
-	//    resumed stream re-stitches off the on-disk tail while the catalog
-	//    keeps the head gap, and restore later refuses the segment as
-	//    mis-stitched. Best-effort + idempotent (retries next resume).
-	if rerr := lineage.ReconcileOpenSegmentCatalog(ctx, b.Store, b.segStore); rerr != nil {
-		slog.WarnContext(
-			ctx, "stream: open-segment catalog reconcile failed; continuing "+
-				"(a crash-orphaned incremental may keep restore refusing this segment until repaired)",
-			slog.String("err", rerr.Error()),
-		)
-	}
-
-	// 2. Resolve parent manifest (within the open segment).
-	parent, parentPath, err := b.resolveParent(ctx)
-	if err != nil {
-		return fmt.Errorf("stream: resolve parent: %w", err)
-	}
-	startPos := parent.EndPosition
-	if startPos.Engine == "" && startPos.Token == "" {
-		slog.WarnContext(
-			ctx, "stream: parent manifest has no EndPosition; chain will start from CDC's current position",
-			slog.String("parent_path", parentPath),
-		)
-	}
-
-	// 2.1. ADR-0087 rotation-boundary resume heal (Bug 139). When this
-	//    resume lands on a rotation-born OPEN segment that never committed
-	//    an incremental in its creating session (source idle at the prior
-	//    stream stop, or a crash/end at the rotation boundary), the parent
-	//    is the segment's full and startPos == the full's anchor S. Resuming
-	//    from S would make the first incremental start at S, leaving the
-	//    segment permanently stamp-less and the (P_N, S] window forever
-	//    uncovered by any incremental — an un-compactable boundary. Instead
-	//    resume from the prior segment's EndPosition (P_N), exactly
-	//    reconstructing the creating session's post-COMMIT state (currentParent
-	//    = the segment's full, startPos = P_N): the first incremental then
-	//    starts at P_N, lineage.UpdateLineageForManifest stamps IncrementalCoverageStart
-	//    = P_N, and the lineage becomes born-contiguous and compactable. The
-	//    (P_N, S] overlap re-applies idempotently on restore (ADR-0010 / the
-	//    snapshot->CDC handoff dedup). No skipThrough is needed: a fresh
-	//    StreamChanges(P_N) resumes strictly-after P_N like any normal resume.
-	if healed, priorEnd, ok := rotationBoundaryResumeStart(ctx, b.Store, startPos); ok {
-		slog.InfoContext(
-			ctx, "stream: resuming a rotation-born segment from the prior segment's EndPosition (P_N) "+
-				"to re-establish ADR-0067 overlap coverage — the creating session stopped/crashed before "+
-				"committing this segment's first incremental, so the (P_N, S] window is replayed now and "+
-				"the segment's IncrementalCoverageStart is stamped on the first commit (Bug 139)",
-			slog.String("parent_path", parentPath),
-			slog.String("prior_end_pN", priorEnd.Token),
-			slog.String("full_anchor_S", startPos.Token),
-		)
-		startPos = healed
-	}
-
-	// 2.5. Phase 6.1: align with chain encryption. Refuses early if
-	// the parent's chain encryption shape doesn't match the operator's
-	// supplied envelope (or vice versa).
-	chainCEK, err := b.alignEncryption(ctx, parent)
-	if err != nil {
-		return fmt.Errorf("stream: encryption: %w", err)
-	}
-
-	// 2.5. Chain-resume preflight (see [migcore.PreflightChainResume]).
-	if err := migcore.PreflightChainResume(ctx, b.Source, b.SourceDSN, startPos); err != nil {
-		return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("stream: chain preflight: %w", err))
-	}
-
-	// 3. Open CDC pump for the lifetime of the stream. The handle is
-	// closed at function exit via a closure-captured defer so the
-	// transient-retry path (GitHub #22) can swap it for a fresh
-	// pump without leaking the previous one.
-	cdc, err := openCDCReaderWithSlot(ctx, b.Source, b.SourceDSN, b.SlotName)
-	if err != nil {
-		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("stream: open cdc reader: %w", err))
-	}
+	cdc := init.cdc
 	defer func() { migcore.CloseIf(cdc) }()
+	defer init.deregisterStopCh()
 
-	// Chain-consumer ack mode (see [chainAckController]): the stream
-	// has no applier tracker, so without the hold the keepalive acks
-	// streamed-but-not-yet-committed positions; each rollover commit
-	// below releases its window via releaseChainAckTo, bounding source
-	// WAL retention to ~one rollover window.
-	holdChainAck(cdc)
-
-	changesCh, err := cdc.StreamChanges(ctx, startPos)
-	if err != nil {
-		if errors.Is(err, ir.ErrPositionInvalid) {
-			return fmt.Errorf("stream: source has pruned past parent's terminal position; take a fresh full backup or shorten the chain interval. Underlying: %w", err)
-		}
-		return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("stream: start cdc stream: %w", err))
-	}
-
-	// Retry policy for transient CDC-pump errors (GitHub #22). Mirrors
-	// the sync-stream's runWithRetry shape: classify, bounded
-	// consecutive-failure counter that resets on a successful
-	// rollover, exponential backoff between attempts.
-	retryAttempts := b.RetryAttempts
-	if retryAttempts < 1 {
-		retryAttempts = 1
-	}
-	retryBase := b.RetryBackoffBase
-	if retryBase <= 0 {
-		retryBase = 100 * time.Millisecond
-	}
-	retryCap := b.RetryBackoffCap
-	if retryCap <= 0 {
-		retryCap = 30 * time.Second
-	}
-	var retryConsecutive int
-
-	// 4. Initial state file write.
-	state := &streamState{
-		PID:            pid,
-		Host:           host,
-		StartedAt:      now().UTC(),
-		LastRolloverAt: now().UTC(),
-	}
-	if err := writeStreamState(ctx, b.Store, statePath, state); err != nil {
-		return fmt.Errorf("stream: write initial state: %w", err)
-	}
-
-	// Register the in-process stop channel so a same-process
-	// RequestStreamStop can signal us instantaneously without going
-	// through the file-poll path (Bug 37 fix). Cross-process operators
-	// still go through the file (notifyStreamStop is a no-op for them).
-	stopCh, deregisterStopCh := registerStreamStopChan(b.Store)
-	defer deregisterStopCh()
-
-	slog.InfoContext(
-		ctx, "stream: started",
-		slog.String("source_engine", b.Source.Name()),
-		slog.String("parent_backup_id", parent.BackupID),
-		slog.Duration("rollover_window", rolloverWindow),
-		slog.Int("rollover_max_changes", maxChanges),
-		slog.Int64("rollover_max_bytes", maxBytes),
-	)
+	changesCh := init.changesCh
+	chainCEK := init.chainCEK
+	stopCh := init.stopCh
+	rolloverWindow := init.rolloverWindow
+	maxChanges := init.maxChanges
+	maxBytes := init.maxBytes
+	chunkSize := init.chunkSize
+	statePath := init.statePath
+	retryAttempts := init.retryAttempts
+	retryBase := init.retryBase
+	retryCap := init.retryCap
+	now := init.now
+	clockNow := init.clockNow
 
 	// 5. Drive the rollover loop. The loop runs until ctx is cancelled
 	//    or a stop request is observed via state file. Each iteration
 	//    is a bounded window producing zero or one manifest. Errors
 	//    abort the loop loudly.
-	currentParent := parent
+	currentParent := init.parent
+	startPos := init.startPos
 	rolloverSeq := 0
+	retryConsecutive := 0
 	for {
 		// Stop-request check (cross-machine stop). A ctx cancel here
 		// short-circuits the same way: the captureWindow loop sees
@@ -650,143 +473,21 @@ func (b *BackupStream) Run(ctx context.Context) error {
 		retryConsecutive = 0
 
 		if roll.Manifest == nil {
-			// Empty rollover that we skipped per IncludeEmptyRollovers.
-			slog.InfoContext(
-				ctx, "stream: rollover empty; skipping manifest write",
-				slog.Int("seq", rolloverSeq),
-				slog.Duration("elapsed", elapsed),
-			)
-			if roll.StopRequested {
-				// Stop signal observed during the empty window: exit
-				// cleanly without overwriting the state file (which now
-				// carries stop_requested_at written by the operator's
-				// `sluice backup stream stop`; clobbering it would
-				// confuse any drain-completion tooling watching the
-				// field).
-				slog.InfoContext(
-					ctx, "stream: stop requested via stream_state.json during rollover; exiting",
-					slog.Int("rollovers", rolloverSeq),
-				)
-				return nil
-			}
-			// Update state file's last_rollover_at as a heartbeat even
-			// when no manifest was committed — operators monitoring the
-			// state file's freshness should see the stream is alive.
-			//
-			// Bug 37 fix (v0.19.1): use writeStreamStateMergeHeartbeat
-			// (read-modify-write) so a concurrent stop_requested_at the
-			// operator wrote in the race window between our captureWindow
-			// stop-poll and this heartbeat survives intact. If the merge
-			// observed a stop, exit immediately rather than starting the
-			// next rollover.
-			state.LastRolloverAt = now().UTC()
-			stopObserved, err := writeStreamStateMergeHeartbeat(ctx, b.Store, statePath, state)
-			if err != nil {
-				slog.WarnContext(
-					ctx, "stream: failed to update state file after empty rollover",
-					slog.String("err", err.Error()),
-				)
-			}
-			if stopObserved {
-				slog.InfoContext(
-					ctx, "stream: heartbeat merge observed concurrent stop_requested_at; exiting",
-					slog.Int("rollovers", rolloverSeq),
-				)
-				return nil
-			}
-			rolloverSeq++
-			// Source-channel-closed and skip-empty: the source has gone
-			// away (test fakes that emit-then-close, or a long-running
-			// engine whose pump terminated). Without this exit, the loop
-			// would spin forever producing skip-empty rollovers. In
-			// production the same path triggers when the slot becomes
-			// invalid mid-stream — we want a loud exit, not a busy spin.
-			if roll.SourceClosed {
-				slog.InfoContext(
-					ctx, "stream: cdc channel closed; exiting after final empty rollover",
-					slog.Int("rollovers", rolloverSeq),
-				)
+			if b.handleEmptyRollover(ctx, roll, init.state, statePath, now, elapsed, &rolloverSeq) {
 				return nil
 			}
 			continue
 		}
 
-		manifestPath := buildIncrementalManifestPath(roll.Manifest)
-		if err := lineage.WriteManifestAt(ctx, b.segStore, manifestPath, roll.Manifest); err != nil {
-			return fmt.Errorf("stream: write rollover manifest: %w", err)
+		rc, err := b.commitRollover(ctx, roll, init.state, statePath, now, elapsed, cdc, rolloverSeq)
+		if err != nil {
+			return err
 		}
-		// ADR-0046: append this rollover to the open segment in
-		// lineage.json (best-effort for the non-rotation path).
-		lineage.UpdateLineageForManifestBestEffort(ctx, b.Store, roll.Manifest, manifestPath, b.segCodec)
-		// The rollover is durable — let the slot release its window's
-		// WAL (the chain-consumer ack holds everything else back; this
-		// is what bounds source WAL retention to ~one rollover window
-		// on a long-lived stream).
-		releaseChainAckTo(ctx, cdc, roll.Manifest.EndPosition)
-
-		if roll.StopRequested {
-			// Stop observed during the window: commit the in-flight
-			// manifest (already done above) but skip the
-			// state-file last_rollover_at heartbeat write — the
-			// state file now carries the operator's
-			// stop_requested_at, and writing our heartbeat here would
-			// clobber it. Exit cleanly.
-			slog.InfoContext(
-				ctx, "stream rollover committed; stop requested via stream_state.json — exiting",
-				slog.String("manifest_path", manifestPath),
-				slog.String("backup_id", roll.Manifest.BackupID),
-				slog.Int64("changes", roll.TotalChanges),
-				slog.Int64("bytes", roll.TotalBytes),
-				slog.Duration("elapsed", elapsed),
-			)
-			if b.RolloverHook != "" {
-				runRolloverHook(ctx, b.RolloverHook, roll.Manifest, manifestPath, roll.TotalChanges, roll.TotalBytes, elapsed)
-			}
+		if rc.exit {
 			return nil
 		}
-
-		// Advance state file's last_rollover_at to mark liveness.
-		//
-		// Bug 37 fix (v0.19.1): use writeStreamStateMergeHeartbeat
-		// (read-modify-write) so a concurrent stop_requested_at survives.
-		// If the merge observed a stop, exit immediately rather than
-		// starting the next rollover.
-		state.LastRolloverAt = now().UTC()
-		stopObserved, hbErr := writeStreamStateMergeHeartbeat(ctx, b.Store, statePath, state)
-		if hbErr != nil {
-			slog.WarnContext(
-				ctx, "stream: failed to update state file after rollover commit",
-				slog.String("err", hbErr.Error()),
-			)
-		}
-		if stopObserved {
-			slog.InfoContext(
-				ctx, "stream: heartbeat merge observed concurrent stop_requested_at; exiting after committed rollover",
-				slog.Int("rollovers", rolloverSeq),
-			)
-			return nil
-		}
-
-		slog.InfoContext(
-			ctx, "stream rollover committed",
-			slog.String("manifest_path", manifestPath),
-			slog.String("backup_id", roll.Manifest.BackupID),
-			slog.String("parent_backup_id", roll.Manifest.ParentBackupID),
-			slog.Int64("changes", roll.TotalChanges),
-			slog.Int64("bytes", roll.TotalBytes),
-			slog.Duration("elapsed", elapsed),
-		)
-
-		// Run the rollover hook (best-effort; failures don't fail the stream).
-		if b.RolloverHook != "" {
-			runRolloverHook(ctx, b.RolloverHook, roll.Manifest, manifestPath, roll.TotalChanges, roll.TotalBytes, elapsed)
-		}
-
-		// Advance the chain: next rollover's parent is this rollover's
-		// manifest; next rollover's StartPosition is this rollover's
-		// EndPosition.
-		currentParent = roll.Manifest
-		startPos = roll.Manifest.EndPosition
+		currentParent = rc.newParent
+		startPos = rc.newStartPos
 		rolloverSeq++
 
 		// ADR-0046 §2/§6: in-process rotation. After each successful
@@ -860,6 +561,398 @@ func (b *BackupStream) Run(ctx context.Context) error {
 			return nil
 		}
 	}
+}
+
+// rolloverInit is the fully-initialised state newRolloverLoop hands to
+// [BackupStream.Run]'s rollover loop: the open CDC pump + change channel,
+// the resolved parent + start position, the chain CEK, the liveness state
+// file, the in-process stop channel + its deregister hook, and the
+// resolved rollover-window / retry knobs. cdc is returned OPEN — Run owns
+// its close (and the transient-retry path may swap it) via a defer.
+type rolloverInit struct {
+	cdc              ir.CDCReader
+	changesCh        <-chan ir.Change
+	parent           *irbackup.Manifest
+	startPos         ir.Position
+	chainCEK         []byte
+	state            *streamState
+	stopCh           <-chan struct{}
+	deregisterStopCh func()
+
+	rolloverWindow time.Duration
+	maxChanges     int
+	maxBytes       int64
+	chunkSize      int
+	statePath      string
+	retryAttempts  int
+	retryBase      time.Duration
+	retryCap       time.Duration
+	now            func() time.Time
+	clockNow       func() time.Time
+}
+
+// newRolloverLoop runs [BackupStream.Run]'s setup: validate, resolve the
+// window/retry defaults, run the concurrent-writer + crash-recovery
+// preflights, resolve the open segment + parent (incl. the ADR-0087
+// rotation-boundary resume heal), align chain encryption, open the CDC
+// pump for the stream's lifetime, and write the initial liveness state.
+// On any error after the pump opens it closes the pump before returning
+// (Run's close-defer is not yet armed); on success the caller arms the
+// defer and drives the returned state.
+func (b *BackupStream) newRolloverLoop(ctx context.Context) (*rolloverInit, error) {
+	if err := b.validate(); err != nil {
+		return nil, err
+	}
+
+	clockNow := b.clockNow
+	if clockNow == nil {
+		clockNow = time.Now
+	}
+	now := time.Now
+	if b.Now != nil {
+		now = b.Now
+	}
+
+	rolloverWindow := b.RolloverWindow
+	if rolloverWindow <= 0 {
+		rolloverWindow = DefaultRolloverWindow
+	}
+	maxChanges := b.RolloverMaxChanges
+	if maxChanges <= 0 {
+		maxChanges = DefaultRolloverMaxChanges
+	}
+	maxBytes := b.RolloverMaxBytes
+	if maxBytes <= 0 {
+		maxBytes = DefaultRolloverMaxBytes
+	}
+	chunkSize := b.ChunkChanges
+	if chunkSize <= 0 {
+		chunkSize = DefaultIncrementalChunkChanges
+	}
+	statePath := b.streamStatePath
+	if statePath == "" {
+		statePath = DefaultStreamStateFilename
+	}
+	pidHost := b.pidHostFn
+	if pidHost == nil {
+		pidHost = defaultPidHost
+	}
+	pid, host := pidHost()
+
+	// 1. Concurrent-writer check (stream_state.json lives at the
+	//    lineage root — it's a stream-level liveness file, not
+	//    per-segment).
+	if err := b.preflightStreamState(ctx, statePath, rolloverWindow, pid, host, now()); err != nil {
+		return nil, err
+	}
+
+	// 1.4. Crash recovery: reconcile any rotation_state.json left by a
+	//    crash mid-FSM BEFORE resolving the open segment, so the open
+	//    segment is the post-recovery truth (≤COMMIT → prior segment;
+	//    >COMMIT → the new segment the atomic write made authoritative).
+	if err := recoverRotationState(ctx, b.Store); err != nil {
+		return nil, fmt.Errorf("stream: rotation recovery: %w", err)
+	}
+
+	// 1.5. Resolve the OPEN segment: rollovers append to it under its
+	//    Dir + recorded codec (ADR-0046). For a never-rotated backup
+	//    that's the root (Dir == "") — byte-identical to the pre-ADR
+	//    single chain. Rotation repoints b.segStore / b.segCodec.
+	segStore, segCodec, err := lineage.OpenSegmentStore(ctx, b.Store, b.Codec)
+	if err != nil {
+		return nil, fmt.Errorf("stream: resolve open segment: %w", err)
+	}
+	b.segStore = segStore
+	b.segCodec = segCodec
+
+	// 1.6. Heal an open-segment catalog that a crash/cancel left out of
+	//    sync with disk (an incremental durable on disk but missing from
+	//    lineage.json's Incrementals list, because its best-effort catalog
+	//    append never landed). Must run BEFORE resolveParent: otherwise the
+	//    resumed stream re-stitches off the on-disk tail while the catalog
+	//    keeps the head gap, and restore later refuses the segment as
+	//    mis-stitched. Best-effort + idempotent (retries next resume).
+	if rerr := lineage.ReconcileOpenSegmentCatalog(ctx, b.Store, b.segStore); rerr != nil {
+		slog.WarnContext(
+			ctx, "stream: open-segment catalog reconcile failed; continuing "+
+				"(a crash-orphaned incremental may keep restore refusing this segment until repaired)",
+			slog.String("err", rerr.Error()),
+		)
+	}
+
+	// 2. Resolve parent manifest (within the open segment).
+	parent, parentPath, err := b.resolveParent(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("stream: resolve parent: %w", err)
+	}
+	startPos := parent.EndPosition
+	if startPos.Engine == "" && startPos.Token == "" {
+		slog.WarnContext(
+			ctx, "stream: parent manifest has no EndPosition; chain will start from CDC's current position",
+			slog.String("parent_path", parentPath),
+		)
+	}
+
+	// 2.1. ADR-0087 rotation-boundary resume heal (Bug 139). When this
+	//    resume lands on a rotation-born OPEN segment that never committed
+	//    an incremental in its creating session (source idle at the prior
+	//    stream stop, or a crash/end at the rotation boundary), the parent
+	//    is the segment's full and startPos == the full's anchor S. Resuming
+	//    from S would make the first incremental start at S, leaving the
+	//    segment permanently stamp-less and the (P_N, S] window forever
+	//    uncovered by any incremental — an un-compactable boundary. Instead
+	//    resume from the prior segment's EndPosition (P_N), exactly
+	//    reconstructing the creating session's post-COMMIT state (currentParent
+	//    = the segment's full, startPos = P_N): the first incremental then
+	//    starts at P_N, lineage.UpdateLineageForManifest stamps IncrementalCoverageStart
+	//    = P_N, and the lineage becomes born-contiguous and compactable. The
+	//    (P_N, S] overlap re-applies idempotently on restore (ADR-0010 / the
+	//    snapshot->CDC handoff dedup). No skipThrough is needed: a fresh
+	//    StreamChanges(P_N) resumes strictly-after P_N like any normal resume.
+	if healed, priorEnd, ok := rotationBoundaryResumeStart(ctx, b.Store, startPos); ok {
+		slog.InfoContext(
+			ctx, "stream: resuming a rotation-born segment from the prior segment's EndPosition (P_N) "+
+				"to re-establish ADR-0067 overlap coverage — the creating session stopped/crashed before "+
+				"committing this segment's first incremental, so the (P_N, S] window is replayed now and "+
+				"the segment's IncrementalCoverageStart is stamped on the first commit (Bug 139)",
+			slog.String("parent_path", parentPath),
+			slog.String("prior_end_pN", priorEnd.Token),
+			slog.String("full_anchor_S", startPos.Token),
+		)
+		startPos = healed
+	}
+
+	// 2.5. Phase 6.1: align with chain encryption. Refuses early if
+	// the parent's chain encryption shape doesn't match the operator's
+	// supplied envelope (or vice versa).
+	chainCEK, err := b.alignEncryption(ctx, parent)
+	if err != nil {
+		return nil, fmt.Errorf("stream: encryption: %w", err)
+	}
+
+	// 2.5. Chain-resume preflight (see [migcore.PreflightChainResume]).
+	if err := migcore.PreflightChainResume(ctx, b.Source, b.SourceDSN, startPos); err != nil {
+		return nil, migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("stream: chain preflight: %w", err))
+	}
+
+	// 3. Open CDC pump for the lifetime of the stream. Returned OPEN;
+	// Run owns the close defer (and the transient-retry path may swap the
+	// handle) so the pump lives across rollovers. On an error AFTER this
+	// open, newRolloverLoop closes it here since Run's defer is not armed
+	// yet.
+	cdc, err := openCDCReaderWithSlot(ctx, b.Source, b.SourceDSN, b.SlotName)
+	if err != nil {
+		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("stream: open cdc reader: %w", err))
+	}
+
+	// Chain-consumer ack mode (see [chainAckController]): the stream
+	// has no applier tracker, so without the hold the keepalive acks
+	// streamed-but-not-yet-committed positions; each rollover commit
+	// below releases its window via releaseChainAckTo, bounding source
+	// WAL retention to ~one rollover window.
+	holdChainAck(cdc)
+
+	changesCh, err := cdc.StreamChanges(ctx, startPos)
+	if err != nil {
+		migcore.CloseIf(cdc)
+		if errors.Is(err, ir.ErrPositionInvalid) {
+			return nil, fmt.Errorf("stream: source has pruned past parent's terminal position; take a fresh full backup or shorten the chain interval. Underlying: %w", err)
+		}
+		return nil, migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("stream: start cdc stream: %w", err))
+	}
+
+	// Retry policy for transient CDC-pump errors (GitHub #22). Mirrors
+	// the sync-stream's runWithRetry shape: classify, bounded
+	// consecutive-failure counter that resets on a successful
+	// rollover, exponential backoff between attempts.
+	retryAttempts := b.RetryAttempts
+	if retryAttempts < 1 {
+		retryAttempts = 1
+	}
+	retryBase := b.RetryBackoffBase
+	if retryBase <= 0 {
+		retryBase = 100 * time.Millisecond
+	}
+	retryCap := b.RetryBackoffCap
+	if retryCap <= 0 {
+		retryCap = 30 * time.Second
+	}
+
+	// 4. Initial state file write.
+	state := &streamState{
+		PID:            pid,
+		Host:           host,
+		StartedAt:      now().UTC(),
+		LastRolloverAt: now().UTC(),
+	}
+	if err := writeStreamState(ctx, b.Store, statePath, state); err != nil {
+		migcore.CloseIf(cdc)
+		return nil, fmt.Errorf("stream: write initial state: %w", err)
+	}
+
+	// Register the in-process stop channel so a same-process
+	// RequestStreamStop can signal us instantaneously without going
+	// through the file-poll path (Bug 37 fix). Cross-process operators
+	// still go through the file (notifyStreamStop is a no-op for them).
+	// The deregister is returned (not deferred here) so Run holds it for
+	// the stream's lifetime — deferring it here would close the channel
+	// the moment this setup returns and make the loop see a phantom stop.
+	stopCh, deregisterStopCh := registerStreamStopChan(b.Store)
+
+	slog.InfoContext(
+		ctx, "stream: started",
+		slog.String("source_engine", b.Source.Name()),
+		slog.String("parent_backup_id", parent.BackupID),
+		slog.Duration("rollover_window", rolloverWindow),
+		slog.Int("rollover_max_changes", maxChanges),
+		slog.Int64("rollover_max_bytes", maxBytes),
+	)
+
+	return &rolloverInit{
+		cdc:              cdc,
+		changesCh:        changesCh,
+		parent:           parent,
+		startPos:         startPos,
+		chainCEK:         chainCEK,
+		state:            state,
+		stopCh:           stopCh,
+		deregisterStopCh: deregisterStopCh,
+		rolloverWindow:   rolloverWindow,
+		maxChanges:       maxChanges,
+		maxBytes:         maxBytes,
+		chunkSize:        chunkSize,
+		statePath:        statePath,
+		retryAttempts:    retryAttempts,
+		retryBase:        retryBase,
+		retryCap:         retryCap,
+		now:              now,
+		clockNow:         clockNow,
+	}, nil
+}
+
+// rolloverCommit is [BackupStream.commitRollover]'s result. exit=true
+// means the caller returns nil (a stop was observed); on the normal
+// advance path advanced=true carries the next parent + start position.
+type rolloverCommit struct {
+	exit        bool
+	advanced    bool
+	newParent   *irbackup.Manifest
+	newStartPos ir.Position
+}
+
+// handleEmptyRollover processes a skipped empty rollover: heartbeat the
+// liveness file (unless a stop was observed) and decide whether to exit.
+// Returns true when Run should exit cleanly (stop requested / observed, or
+// the CDC channel closed); false to continue the loop. *rolloverSeq is
+// advanced on the continue path.
+func (b *BackupStream) handleEmptyRollover(ctx context.Context, roll rolloverOutcome, state *streamState, statePath string, now func() time.Time, elapsed time.Duration, rolloverSeq *int) bool {
+	slog.InfoContext(
+		ctx, "stream: rollover empty; skipping manifest write",
+		slog.Int("seq", *rolloverSeq),
+		slog.Duration("elapsed", elapsed),
+	)
+	if roll.StopRequested {
+		slog.InfoContext(
+			ctx, "stream: stop requested via stream_state.json during rollover; exiting",
+			slog.Int("rollovers", *rolloverSeq),
+		)
+		return true
+	}
+	// Bug 37 fix (v0.19.1): read-modify-write heartbeat so a concurrent
+	// stop_requested_at the operator wrote in the race window survives.
+	state.LastRolloverAt = now().UTC()
+	stopObserved, err := writeStreamStateMergeHeartbeat(ctx, b.Store, statePath, state)
+	if err != nil {
+		slog.WarnContext(
+			ctx, "stream: failed to update state file after empty rollover",
+			slog.String("err", err.Error()),
+		)
+	}
+	if stopObserved {
+		slog.InfoContext(
+			ctx, "stream: heartbeat merge observed concurrent stop_requested_at; exiting",
+			slog.Int("rollovers", *rolloverSeq),
+		)
+		return true
+	}
+	*rolloverSeq++
+	// Source-channel-closed and skip-empty: the source has gone away, so
+	// exit rather than spin producing skip-empty rollovers forever. In
+	// production the same path fires when the slot goes invalid mid-stream.
+	if roll.SourceClosed {
+		slog.InfoContext(
+			ctx, "stream: cdc channel closed; exiting after final empty rollover",
+			slog.Int("rollovers", *rolloverSeq),
+		)
+		return true
+	}
+	return false
+}
+
+// commitRollover writes a rollover's manifest, appends it to the open
+// segment, releases the chain-ack window, and heartbeats the liveness
+// file. It returns exit=true when a stop was observed (Run returns nil),
+// or advanced=true with the next parent + start position on the normal
+// path. The rollover hook fires (best-effort) after a durable commit.
+func (b *BackupStream) commitRollover(ctx context.Context, roll rolloverOutcome, state *streamState, statePath string, now func() time.Time, elapsed time.Duration, cdc ir.CDCReader, rolloverSeq int) (rolloverCommit, error) {
+	manifestPath := buildIncrementalManifestPath(roll.Manifest)
+	if err := lineage.WriteManifestAt(ctx, b.segStore, manifestPath, roll.Manifest); err != nil {
+		return rolloverCommit{}, fmt.Errorf("stream: write rollover manifest: %w", err)
+	}
+	// ADR-0046: append this rollover to the open segment in lineage.json
+	// (best-effort for the non-rotation path).
+	lineage.UpdateLineageForManifestBestEffort(ctx, b.Store, roll.Manifest, manifestPath, b.segCodec)
+	// The rollover is durable — let the slot release its window's WAL (this
+	// is what bounds source WAL retention to ~one rollover window).
+	releaseChainAckTo(ctx, cdc, roll.Manifest.EndPosition)
+
+	if roll.StopRequested {
+		slog.InfoContext(
+			ctx, "stream rollover committed; stop requested via stream_state.json — exiting",
+			slog.String("manifest_path", manifestPath),
+			slog.String("backup_id", roll.Manifest.BackupID),
+			slog.Int64("changes", roll.TotalChanges),
+			slog.Int64("bytes", roll.TotalBytes),
+			slog.Duration("elapsed", elapsed),
+		)
+		if b.RolloverHook != "" {
+			runRolloverHook(ctx, b.RolloverHook, roll.Manifest, manifestPath, roll.TotalChanges, roll.TotalBytes, elapsed)
+		}
+		return rolloverCommit{exit: true}, nil
+	}
+
+	// Bug 37 fix (v0.19.1): read-modify-write heartbeat so a concurrent
+	// stop_requested_at survives; exit immediately if the merge saw a stop.
+	state.LastRolloverAt = now().UTC()
+	stopObserved, hbErr := writeStreamStateMergeHeartbeat(ctx, b.Store, statePath, state)
+	if hbErr != nil {
+		slog.WarnContext(
+			ctx, "stream: failed to update state file after rollover commit",
+			slog.String("err", hbErr.Error()),
+		)
+	}
+	if stopObserved {
+		slog.InfoContext(
+			ctx, "stream: heartbeat merge observed concurrent stop_requested_at; exiting after committed rollover",
+			slog.Int("rollovers", rolloverSeq),
+		)
+		return rolloverCommit{exit: true}, nil
+	}
+
+	slog.InfoContext(
+		ctx, "stream rollover committed",
+		slog.String("manifest_path", manifestPath),
+		slog.String("backup_id", roll.Manifest.BackupID),
+		slog.String("parent_backup_id", roll.Manifest.ParentBackupID),
+		slog.Int64("changes", roll.TotalChanges),
+		slog.Int64("bytes", roll.TotalBytes),
+		slog.Duration("elapsed", elapsed),
+	)
+	// Run the rollover hook (best-effort; failures don't fail the stream).
+	if b.RolloverHook != "" {
+		runRolloverHook(ctx, b.RolloverHook, roll.Manifest, manifestPath, roll.TotalChanges, roll.TotalBytes, elapsed)
+	}
+	return rolloverCommit{advanced: true, newParent: roll.Manifest, newStartPos: roll.Manifest.EndPosition}, nil
 }
 
 // validate sanity-checks required fields. Mirrors
@@ -1217,66 +1310,21 @@ func (b *BackupStream) captureWindow(
 	chainCEK []byte,
 ) (captureOutcome, error) {
 	var (
-		writer        *blobcodec.ChangeChunkWriter
-		buf           *bytes.Buffer
-		chunkIdx      int
 		inTransaction bool
 		out           captureOutcome
-		curWrappedCEK []byte
 	)
 
-	runNamespace := changeChunkRunNamespace(manifest)
-
-	flushTo := func(putCtx context.Context) error {
-		if writer == nil {
-			return nil
-		}
-		if err := writer.Close(); err != nil {
-			return fmt.Errorf("close chunk: %w", err)
-		}
-		path := changeChunkPath(runNamespace, chunkIdx)
-		hash := writer.Hash()
-		nb := int64(buf.Len())
-		if err := b.segStore.Put(putCtx, path, buf); err != nil {
-			return fmt.Errorf("store put %q: %w", path, err)
-		}
-		ci := &irbackup.ChunkInfo{
-			File:     path,
-			RowCount: writer.ChangeCount(),
-			SHA256:   hash,
-		}
-		if b.Encryption != nil {
-			ci.Encryption = &irbackup.ChunkEncryption{
-				Algorithm:  crypto.AlgorithmAESGCM,
-				NonceLen:   crypto.NonceLen,
-				AuthTagLen: crypto.AuthTagLen,
-				WrappedCEK: curWrappedCEK,
-			}
-		}
-		manifest.ChangeChunks = append(manifest.ChangeChunks, ci)
-		out.TotalBytes += nb
-		writer = nil
-		buf = nil
-		curWrappedCEK = nil
-		chunkIdx++
-		return nil
+	// The chunk-writer state (the open writer, its buffer, the running
+	// chunk index, the wrapped per-chunk CEK) lives on cb so flushTo /
+	// open / processChange share it as they roll chunks. flush closes over
+	// the window ctx + out for the boundary select cases below.
+	cb := &changeChunkBuffer{
+		b:            b,
+		manifest:     manifest,
+		runNamespace: changeChunkRunNamespace(manifest),
+		chainCEK:     chainCEK,
 	}
-	flush := func() error { return flushTo(ctx) }
-
-	openWriter := func() error {
-		buf = &bytes.Buffer{}
-		cek, wrapped, err := b.resolveChunkCEK(chainCEK)
-		if err != nil {
-			return fmt.Errorf("resolve chunk cek: %w", err)
-		}
-		curWrappedCEK = wrapped
-		w, err := blobcodec.NewChangeChunkWriter(buf, cek, b.segCodec)
-		if err != nil {
-			return fmt.Errorf("open chunk: %w", err)
-		}
-		writer = w
-		return nil
-	}
+	flush := func() error { return cb.flushTo(ctx, &out) }
 
 	timer := time.NewTimer(deadline.Sub(clockNow()))
 	defer timer.Stop()
@@ -1302,9 +1350,9 @@ func (b *BackupStream) captureWindow(
 			// stopDrainTimeout-bounded ctx for the chunk write so a
 			// store call against the just-cancelled parent ctx doesn't
 			// short-circuit the flush.
-			if !inTransaction && writer != nil {
+			if !inTransaction && cb.writer != nil {
 				flushCtx, flushCancel := context.WithTimeout(context.WithoutCancel(ctx), stopDrainTimeout)
-				if fErr := flushTo(flushCtx); fErr != nil {
+				if fErr := cb.flushTo(flushCtx, &out); fErr != nil {
 					slog.WarnContext(
 						ctx, "stream: drain-flush failed; in-flight chunk dropped",
 						slog.String("err", fErr.Error()),
@@ -1380,88 +1428,182 @@ func (b *BackupStream) captureWindow(
 				}
 				return out, nil
 			}
-			// Per-segment-boundary dedup floor (ADR-0067: floor = P_N,
-			// the prior segment's EndPosition). After a committed
-			// rotation the SAME pump resumes from ~P_N; drop only events
-			// already in the prior segment's tail (position <= P_N) so
-			// the new segment's first incremental begins strictly after
-			// P_N -- KEEPING the (P_N, S] overlap (which the new full's
-			// snapshot at S also captured) so the lineage is contiguous
-			// and compactable. Cleared on the first event past P_N.
-			if b.skipThrough != nil {
-				cp := change.Pos()
-				if cp.Engine == "" && cp.Token == "" {
-					// Position-less tx boundary while still skipping --
-					// drop it (it belongs to the skipped prefix).
-					continue
-				}
-				if chk, ok := b.Source.(ir.PositionMonotonicChecker); ok {
-					le, cerr := chk.PrecedesOrEqual(cp, *b.skipThrough)
-					if cerr == nil && le {
-						continue // event <= P_N: already in the prior segment
-					}
-				}
-				// First event strictly after P_N (or no comparator):
-				// stop skipping; this event starts the new segment.
-				b.skipThrough = nil
-			}
-			switch change.(type) {
-			case ir.TxBegin:
-				inTransaction = true
-			case ir.TxCommit:
-				inTransaction = false
-			}
-			if writer == nil {
-				if err := openWriter(); err != nil {
-					return out, err
-				}
-			}
-			if err := writer.WriteChange(change); err != nil {
+			terminate, err := cb.processChange(ctx, change, &out, &inTransaction, deadlinePassed, chunkSize, maxChanges, maxBytes)
+			if err != nil {
 				return out, err
 			}
-			out.TotalChanges++
-			pos := change.Pos()
-			if pos.Engine != "" || pos.Token != "" {
-				out.EndPos = pos
-			}
-			// Roll the chunk on per-chunk-row cap.
-			if writer.ChangeCount() >= int64(chunkSize) {
-				if err := flush(); err != nil {
-					return out, err
-				}
-			}
-			// Approximate max-changes cap: close at next tx boundary.
-			if maxChanges > 0 && out.TotalChanges >= int64(maxChanges) && !inTransaction {
-				if err := flush(); err != nil {
-					return out, err
-				}
-				return out, nil
-			}
-			// Approximate max-bytes cap: close at next tx boundary
-			// once the running total + the in-flight chunk's buffered
-			// bytes crosses the ceiling. Checked at chunk-flush
-			// boundaries so transient over-shoot is bounded by one
-			// chunk's compressed size.
-			if maxBytes > 0 && !inTransaction {
-				inflightBytes := int64(0)
-				if buf != nil {
-					inflightBytes = int64(buf.Len())
-				}
-				if out.TotalBytes+inflightBytes >= maxBytes {
-					if err := flush(); err != nil {
-						return out, err
-					}
-					return out, nil
-				}
-			}
-			if (deadlinePassed || out.StopRequested) && !inTransaction {
-				if err := flush(); err != nil {
-					return out, err
-				}
+			if terminate {
 				return out, nil
 			}
 		}
 	}
+}
+
+// changeChunkBuffer owns the in-flight change-chunk writer for one
+// [BackupStream.captureWindow] run: the open writer, its backing buffer,
+// the running chunk index, and the wrapped per-chunk CEK. Bundling this
+// mutable state (rather than leaving it as captureWindow closures) lets
+// flushTo / open / processChange share it while keeping captureWindow's
+// select loop under the complexity ceiling. Single-goroutine: every
+// method runs on captureWindow's own goroutine.
+type changeChunkBuffer struct {
+	b            *BackupStream
+	manifest     *irbackup.Manifest
+	runNamespace string
+	chainCEK     []byte
+
+	writer        *blobcodec.ChangeChunkWriter
+	buf           *bytes.Buffer
+	chunkIdx      int
+	curWrappedCEK []byte
+}
+
+// flushTo closes the open chunk writer, stores its buffer under the
+// per-run change-chunk path, appends the [irbackup.ChunkInfo] (with the
+// per-chunk encryption header when the stream encrypts) to the manifest,
+// adds the stored bytes to out.TotalBytes, and resets the buffer state
+// for the next chunk. A no-op when no chunk is open. putCtx is separate
+// from the window ctx so the ctx-cancel drain can flush under a fresh
+// stopDrainTimeout-bounded context.
+func (cb *changeChunkBuffer) flushTo(putCtx context.Context, out *captureOutcome) error {
+	if cb.writer == nil {
+		return nil
+	}
+	if err := cb.writer.Close(); err != nil {
+		return fmt.Errorf("close chunk: %w", err)
+	}
+	path := changeChunkPath(cb.runNamespace, cb.chunkIdx)
+	hash := cb.writer.Hash()
+	nb := int64(cb.buf.Len())
+	if err := cb.b.segStore.Put(putCtx, path, cb.buf); err != nil {
+		return fmt.Errorf("store put %q: %w", path, err)
+	}
+	ci := &irbackup.ChunkInfo{
+		File:     path,
+		RowCount: cb.writer.ChangeCount(),
+		SHA256:   hash,
+	}
+	if cb.b.Encryption != nil {
+		ci.Encryption = &irbackup.ChunkEncryption{
+			Algorithm:  crypto.AlgorithmAESGCM,
+			NonceLen:   crypto.NonceLen,
+			AuthTagLen: crypto.AuthTagLen,
+			WrappedCEK: cb.curWrappedCEK,
+		}
+	}
+	cb.manifest.ChangeChunks = append(cb.manifest.ChangeChunks, ci)
+	out.TotalBytes += nb
+	cb.writer = nil
+	cb.buf = nil
+	cb.curWrappedCEK = nil
+	cb.chunkIdx++
+	return nil
+}
+
+// open starts a fresh change-chunk writer over a new buffer, resolving
+// the per-chunk CEK (per-chunk-encryption mode) via the stream's
+// envelope. Called lazily by processChange when the first change of a
+// chunk arrives.
+func (cb *changeChunkBuffer) open() error {
+	cb.buf = &bytes.Buffer{}
+	cek, wrapped, err := cb.b.resolveChunkCEK(cb.chainCEK)
+	if err != nil {
+		return fmt.Errorf("resolve chunk cek: %w", err)
+	}
+	cb.curWrappedCEK = wrapped
+	w, err := blobcodec.NewChangeChunkWriter(cb.buf, cek, cb.b.segCodec)
+	if err != nil {
+		return fmt.Errorf("open chunk: %w", err)
+	}
+	cb.writer = w
+	return nil
+}
+
+// processChange applies one received change to the in-flight chunk and
+// evaluates the window-closing caps. It returns terminate=true when the
+// window should commit and return (a cap fired at a tx boundary, or an
+// error occurred with err non-nil); terminate=false means the select
+// loop should keep draining. inTransaction is updated in place on tx
+// boundaries so the caller's other select cases observe it.
+//
+// The ADR-0067 per-segment dedup floor is applied first: while
+// b.skipThrough is set, events at or before P_N (the prior segment's
+// EndPosition) are dropped (terminate=false), and the floor is cleared on
+// the first event strictly after P_N — KEEPING the (P_N, S] overlap so
+// the lineage is born-contiguous and compactable.
+func (cb *changeChunkBuffer) processChange(ctx context.Context, change ir.Change, out *captureOutcome, inTransaction *bool, deadlinePassed bool, chunkSize, maxChanges int, maxBytes int64) (terminate bool, err error) {
+	if cb.b.skipThrough != nil {
+		cp := change.Pos()
+		if cp.Engine == "" && cp.Token == "" {
+			// Position-less tx boundary while still skipping -- drop it
+			// (it belongs to the skipped prefix).
+			return false, nil
+		}
+		if chk, ok := cb.b.Source.(ir.PositionMonotonicChecker); ok {
+			le, cerr := chk.PrecedesOrEqual(cp, *cb.b.skipThrough)
+			if cerr == nil && le {
+				return false, nil // event <= P_N: already in the prior segment
+			}
+		}
+		// First event strictly after P_N (or no comparator): stop
+		// skipping; this event starts the new segment.
+		cb.b.skipThrough = nil
+	}
+	switch change.(type) {
+	case ir.TxBegin:
+		*inTransaction = true
+	case ir.TxCommit:
+		*inTransaction = false
+	}
+	if cb.writer == nil {
+		if err := cb.open(); err != nil {
+			return true, err
+		}
+	}
+	if err := cb.writer.WriteChange(change); err != nil {
+		return true, err
+	}
+	out.TotalChanges++
+	pos := change.Pos()
+	if pos.Engine != "" || pos.Token != "" {
+		out.EndPos = pos
+	}
+	// Roll the chunk on per-chunk-row cap.
+	if cb.writer.ChangeCount() >= int64(chunkSize) {
+		if err := cb.flushTo(ctx, out); err != nil {
+			return true, err
+		}
+	}
+	// Approximate max-changes cap: close at next tx boundary.
+	if maxChanges > 0 && out.TotalChanges >= int64(maxChanges) && !*inTransaction {
+		if err := cb.flushTo(ctx, out); err != nil {
+			return true, err
+		}
+		return true, nil
+	}
+	// Approximate max-bytes cap: close at next tx boundary once the
+	// running total + the in-flight chunk's buffered bytes crosses the
+	// ceiling. Checked at chunk-flush boundaries so transient over-shoot
+	// is bounded by one chunk's compressed size.
+	if maxBytes > 0 && !*inTransaction {
+		inflightBytes := int64(0)
+		if cb.buf != nil {
+			inflightBytes = int64(cb.buf.Len())
+		}
+		if out.TotalBytes+inflightBytes >= maxBytes {
+			if err := cb.flushTo(ctx, out); err != nil {
+				return true, err
+			}
+			return true, nil
+		}
+	}
+	if (deadlinePassed || out.StopRequested) && !*inTransaction {
+		if err := cb.flushTo(ctx, out); err != nil {
+			return true, err
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 // openCDCReaderWithSlot is the [BackupStream]/[IncrementalBackup]-
