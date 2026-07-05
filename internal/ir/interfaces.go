@@ -2682,9 +2682,9 @@ type TableScopedSnapshotOpener interface {
 // the operator almost never wants to migrate against this engine".
 // Implementing engines return a list of [path.Match]-style patterns
 // that the orchestrator merges into the operator's
-// [pipeline.TableFilter.Exclude] when the operator is in
+// [migcore.TableFilter.Exclude] when the operator is in
 // exclude-or-no-filter mode. Operator-supplied
-// [pipeline.TableFilter.Include] short-circuits the merge — if the
+// [migcore.TableFilter.Include] short-circuits the merge — if the
 // operator explicitly opts in to a table list, the engine doesn't
 // override it.
 //

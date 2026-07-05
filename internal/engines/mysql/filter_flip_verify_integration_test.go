@@ -53,6 +53,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // TestFilterFlip_Verify_PostFlipEventsDelivered is the load-bearing
@@ -82,7 +83,7 @@ func TestFilterFlip_Verify_PostFlipEventsDelivered(t *testing.T) {
 	mysqlEng := Engine{Flavor: FlavorVanilla}
 	const streamID = "test-filter-flip-verify"
 
-	filter, err := pipeline.NewTableFilter([]string{"users"}, nil)
+	filter, err := migcore.NewTableFilter([]string{"users"}, nil)
 	if err != nil {
 		t.Fatalf("NewTableFilter: %v", err)
 	}
