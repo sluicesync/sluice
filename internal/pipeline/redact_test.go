@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/redact"
 )
 
@@ -31,7 +32,7 @@ func TestRedactRow_NilRegistry(t *testing.T) {
 	row := ir.Row{"id": int64(1), "email": "alice@example.com"}
 	cols := []*ir.Column{col("id", false), col("email", false)}
 
-	if err := redactRow(nil, "public", "users", row, cols, nil, ""); err != nil {
+	if err := migcore.RedactRow(nil, "public", "users", row, cols, nil, ""); err != nil {
 		t.Fatalf("nil registry: unexpected error %v", err)
 	}
 	if row["email"] != "alice@example.com" {
@@ -46,7 +47,7 @@ func TestRedactRow_EmptyRegistry(t *testing.T) {
 	cols := []*ir.Column{col("id", false), col("email", false)}
 
 	r := redact.New()
-	if err := redactRow(r, "public", "users", row, cols, nil, ""); err != nil {
+	if err := migcore.RedactRow(r, "public", "users", row, cols, nil, ""); err != nil {
 		t.Fatalf("empty registry: unexpected error %v", err)
 	}
 	if row["email"] != "alice@example.com" {
@@ -68,7 +69,7 @@ func TestRedactRow_HashStrategy(t *testing.T) {
 	}
 	cols := []*ir.Column{col("id", false), col("email", true), col("name", true)}
 
-	if err := redactRow(r, "public", "users", row, cols, nil, ""); err != nil {
+	if err := migcore.RedactRow(r, "public", "users", row, cols, nil, ""); err != nil {
 		t.Fatalf("unexpected error %v", err)
 	}
 
@@ -114,7 +115,7 @@ func TestRedactRow_MultipleStrategies(t *testing.T) {
 		col("name", true),
 	}
 
-	if err := redactRow(r, "public", "users", row, cols, nil, ""); err != nil {
+	if err := migcore.RedactRow(r, "public", "users", row, cols, nil, ""); err != nil {
 		t.Fatalf("unexpected error %v", err)
 	}
 
@@ -139,7 +140,7 @@ func TestRedactRow_MultipleStrategies(t *testing.T) {
 }
 
 // TestRedactRow_CaseInsensitiveLookup confirms Registry's lowercase
-// key policy works through redactRow — operators on a case-folding
+// key policy works through migcore.RedactRow — operators on a case-folding
 // engine like MySQL can declare rules in any case.
 func TestRedactRow_CaseInsensitiveLookup(t *testing.T) {
 	r := redact.New()
@@ -148,7 +149,7 @@ func TestRedactRow_CaseInsensitiveLookup(t *testing.T) {
 	row := ir.Row{"email": "alice@example.com"}
 	cols := []*ir.Column{col("email", true)}
 
-	if err := redactRow(r, "public", "users", row, cols, nil, ""); err != nil {
+	if err := migcore.RedactRow(r, "public", "users", row, cols, nil, ""); err != nil {
 		t.Fatalf("unexpected error %v", err)
 	}
 	if s, ok := row["email"].(string); !ok || len(s) != 64 {
@@ -168,7 +169,7 @@ func TestRedactRow_RefusalWrapped(t *testing.T) {
 	// ssn declared NOT NULL — Null strategy must refuse.
 	cols := []*ir.Column{col("ssn", false)}
 
-	err := redactRow(r, "public", "users", row, cols, nil, "")
+	err := migcore.RedactRow(r, "public", "users", row, cols, nil, "")
 	if err == nil {
 		t.Fatal("expected refusal error; got nil")
 	}
@@ -192,7 +193,7 @@ func TestRedactRow_ColumnsNotInRow(t *testing.T) {
 	row := ir.Row{"id": int64(1)}
 	cols := []*ir.Column{col("id", false), col("email", true)}
 
-	if err := redactRow(r, "public", "users", row, cols, nil, ""); err != nil {
+	if err := migcore.RedactRow(r, "public", "users", row, cols, nil, ""); err != nil {
 		t.Fatalf("unexpected error %v", err)
 	}
 	// row["email"] was nil; Hash on nil passes through; final
@@ -212,7 +213,7 @@ func TestRedactRow_NoMatchingColumns(t *testing.T) {
 	row := ir.Row{"id": int64(1), "email": "alice@example.com"}
 	cols := []*ir.Column{col("id", false), col("email", true)}
 
-	if err := redactRow(r, "public", "users", row, cols, nil, ""); err != nil {
+	if err := migcore.RedactRow(r, "public", "users", row, cols, nil, ""); err != nil {
 		t.Fatalf("unexpected error %v", err)
 	}
 	if got := row["email"]; got != "alice@example.com" {
@@ -230,7 +231,7 @@ func TestRedactRow_NilColumnInList(t *testing.T) {
 	row := ir.Row{"email": "alice@example.com"}
 	cols := []*ir.Column{nil, col("email", true), nil}
 
-	if err := redactRow(r, "public", "users", row, cols, nil, ""); err != nil {
+	if err := migcore.RedactRow(r, "public", "users", row, cols, nil, ""); err != nil {
 		t.Fatalf("nil columns in list: unexpected error %v", err)
 	}
 	// email should still be hashed.
@@ -362,7 +363,7 @@ func TestRedactRows_HexUseAvoidsUnusedImport(_ *testing.T) {
 }
 
 // TestRedactRow_RandomizeWithPK pins the v0.59.0 plumbing: when a
-// randomize:* rule fires, pipeline.redactRow derives a seed from
+// randomize:* rule fires, pipeline.migcore.RedactRow derives a seed from
 // the PK values + streamID and feeds it to the strategy.
 // Replay-stable: same PK value across two calls produces the same
 // randomized output.
@@ -374,7 +375,7 @@ func TestRedactRow_RandomizeWithPK(t *testing.T) {
 	pk := []string{"id"}
 
 	row1 := ir.Row{"id": int64(7), "age": int64(35)}
-	if err := redactRow(r, "public", "users", row1, cols, pk, "stream-1"); err != nil {
+	if err := migcore.RedactRow(r, "public", "users", row1, cols, pk, "stream-1"); err != nil {
 		t.Fatalf("unexpected error %v", err)
 	}
 	a := row1["age"].(int64)
@@ -384,7 +385,7 @@ func TestRedactRow_RandomizeWithPK(t *testing.T) {
 
 	// Same PK + streamID → same value.
 	row2 := ir.Row{"id": int64(7), "age": int64(99)}
-	if err := redactRow(r, "public", "users", row2, cols, pk, "stream-1"); err != nil {
+	if err := migcore.RedactRow(r, "public", "users", row2, cols, pk, "stream-1"); err != nil {
 		t.Fatalf("unexpected error %v", err)
 	}
 	if row2["age"] != a {
@@ -393,7 +394,7 @@ func TestRedactRow_RandomizeWithPK(t *testing.T) {
 }
 
 // TestRedactRow_RandomizeNoPKRefuses pins the strategy-level
-// refusal contract via redactRow: a randomize:* rule on a no-PK
+// refusal contract via migcore.RedactRow: a randomize:* rule on a no-PK
 // table surfaces a clear error mentioning the strategy + column.
 // Preflight should normally catch this earlier; this is the
 // defense-in-depth check.
@@ -403,7 +404,7 @@ func TestRedactRow_RandomizeNoPKRefuses(t *testing.T) {
 	cols := []*ir.Column{col("rng", true)}
 
 	row := ir.Row{"rng": int64(0)}
-	err := redactRow(r, "public", "events", row, cols, nil, "stream-1")
+	err := migcore.RedactRow(r, "public", "events", row, cols, nil, "stream-1")
 	if err == nil {
 		t.Fatal("expected refusal for randomize on no-PK table")
 	}

@@ -687,7 +687,7 @@ type Streamer struct {
 	// PII Phase 1 (roadmap item 15a; GitHub issue #24). Same shape
 	// as [Migrator.Redactor] — see that field's doc for the design.
 	// CDC apply paths route every change row through
-	// [pipeline.redactRow] before dispatch when this field is
+	// [pipeline.migcore.RedactRow] before dispatch when this field is
 	// non-nil and non-empty.
 	Redactor *redact.Registry
 

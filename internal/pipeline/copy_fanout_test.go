@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // --- resolveCopyFanoutDegree: the zero-value-safe default trap (v0.99.51) ---
@@ -136,7 +137,7 @@ func TestPartitionRowsByPK_ExactlyOnce(t *testing.T) {
 
 func TestPkWorkerIndex_StableForSamePK(t *testing.T) {
 	table := pkTable()
-	pkCols := tablePKColumns(table)
+	pkCols := migcore.TablePKColumns(table)
 	const degree = 7
 	// The same PK value must always map to the same worker (re-emission
 	// safety), regardless of the non-PK columns.
@@ -162,7 +163,7 @@ func TestPkWorkerIndex_CompositePKNoCollisionFromConcat(t *testing.T) {
 			{Column: "a"}, {Column: "b"},
 		}},
 	}
-	pkCols := tablePKColumns(table)
+	pkCols := migcore.TablePKColumns(table)
 	// ("a","bc") vs ("ab","c") must not be forced to the same hash by
 	// naive concatenation — the NUL separator prevents that. They CAN
 	// coincidentally collide mod degree, so use degree large enough that

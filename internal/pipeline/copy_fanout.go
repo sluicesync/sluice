@@ -36,6 +36,7 @@ import (
 	"hash/fnv"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/redact"
 )
 
@@ -107,7 +108,7 @@ func copyTablePlainMaybeParallel(
 	degree int,
 ) error {
 	par, ok := rw.(ir.ParallelCopyWriter)
-	if !ok || degree <= 1 || len(tablePKColumns(table)) == 0 {
+	if !ok || degree <= 1 || len(migcore.TablePKColumns(table)) == 0 {
 		return copyTable(ctx, rr, rw, table, redactor, shard)
 	}
 	return copyTablePlainParallel(ctx, rr, par, table, redactor, shard, degree)
@@ -147,7 +148,7 @@ func copyTablePlainParallel(
 	defer func() { pt.Stop(ctx, retErr) }()
 
 	teed := teeRows(copyCtx, rows, pt.observeRow)
-	redacted, redactErrFn := redactRows(copyCtx, teed, redactor, table.Schema, table.Name, table.Columns, tablePKColumns(table), "")
+	redacted, redactErrFn := redactRows(copyCtx, teed, redactor, table.Schema, table.Name, table.Columns, migcore.TablePKColumns(table), "")
 	stamped, _ := shardStampRows(copyCtx, redacted, shard.Name, shard.Value)
 
 	// Partition the single (redacted, stamped) stream out to `degree`
@@ -193,7 +194,7 @@ func copyTableColdStartIdempotentMaybeParallel(
 	degree int,
 ) error {
 	par, ok := rw.(ir.ParallelIdempotentCopyWriter)
-	if !ok || degree <= 1 || len(tablePKColumns(table)) == 0 {
+	if !ok || degree <= 1 || len(migcore.TablePKColumns(table)) == 0 {
 		return copyTableColdStartIdempotent(ctx, rr, rw, table, redactor, shard)
 	}
 	return copyTableColdStartIdempotentParallel(ctx, rr, par, table, redactor, shard, degree)
@@ -246,7 +247,7 @@ func copyTableColdStartIdempotentParallel(
 	defer func() { pt.Stop(ctx, retErr) }()
 
 	teed := teeRows(copyCtx, rows, pt.observeRow)
-	redacted, redactErrFn := redactRows(copyCtx, teed, redactor, table.Schema, table.Name, table.Columns, tablePKColumns(table), "")
+	redacted, redactErrFn := redactRows(copyCtx, teed, redactor, table.Schema, table.Name, table.Columns, migcore.TablePKColumns(table), "")
 	stamped, _ := shardStampRows(copyCtx, redacted, shard.Name, shard.Value)
 
 	// Partition the single (redacted, stamped) stream out to `degree`
@@ -285,7 +286,7 @@ func copyTableColdStartIdempotentParallel(
 //     errored cancelled the shared ctx, which the dispatcher's selects
 //     observe.
 func partitionRowsByPK(ctx context.Context, src <-chan ir.Row, table *ir.Table, degree int) []<-chan ir.Row {
-	pkCols := tablePKColumns(table)
+	pkCols := migcore.TablePKColumns(table)
 	chans := make([]chan ir.Row, degree)
 	out := make([]<-chan ir.Row, degree)
 	for i := range chans {

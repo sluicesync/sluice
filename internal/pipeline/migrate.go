@@ -297,7 +297,7 @@ type Migrator struct {
 	// the registry's lookup → Strategy.Redact step before reaching
 	// the per-engine prepareValue. nil or empty Registry is the
 	// no-redactions hot path (zero-cost passthrough; see
-	// [pipeline.redactRow]).
+	// [pipeline.migcore.RedactRow]).
 	//
 	// Phase 1's surface is internal-only: the CLI flag wiring is
 	// deferred to a follow-up commit so the prep-doc's open design
@@ -841,7 +841,7 @@ type bulkCopyOpts struct {
 
 	// Redactor is the operator-configured PII redaction policy
 	// (Phase 1, roadmap item 15a). nil/empty Registry is the
-	// no-redactions hot path; see [redactRow] and [redactRows] for
+	// no-redactions hot path; see [migcore.RedactRow] and [redactRows] for
 	// the wrap semantics.
 	Redactor *redact.Registry
 

@@ -489,7 +489,7 @@ func (b *Backup) newBackupChunkStreamer(
 		chunkRows: chunkRows,
 		cols:      cols,
 		colNames:  colNames,
-		pkCols:    tablePKColumns(table),
+		pkCols:    migcore.TablePKColumns(table),
 		chunkIdx:  chunkIdx,
 		rowsTotal: rowsTotal,
 	}
@@ -516,7 +516,7 @@ func (s *backupChunkStreamer) writeRow(ctx context.Context, row ir.Row) error {
 	// streamID is empty for full-backup runs (one-shot snapshots); the
 	// per-row randomize:* seed is determined purely by table + column +
 	// PK values, so re-running produces the same redacted values.
-	if err := redactRow(s.b.Redactor, s.table.Schema, s.table.Name, row, s.cols, s.pkCols, ""); err != nil {
+	if err := migcore.RedactRow(s.b.Redactor, s.table.Schema, s.table.Name, row, s.cols, s.pkCols, ""); err != nil {
 		return fmt.Errorf("redact row: %w", err)
 	}
 	if err := s.writer.WriteRow(row, s.cols); err != nil {

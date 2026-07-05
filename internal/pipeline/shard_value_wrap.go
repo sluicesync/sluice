@@ -18,7 +18,7 @@ import (
 //
 // The row map is mutated in place (not copied) because the row is
 // owned by the caller's read goroutine and not aliased after this
-// call — same contract as [redactRow]. Stamping unconditionally
+// call — same contract as [migcore.RedactRow]. Stamping unconditionally
 // overwrites any existing value at row[name]: the column is a
 // sluice-injected column on the consolidated target, so the
 // source's row stream should never carry a key with that name in

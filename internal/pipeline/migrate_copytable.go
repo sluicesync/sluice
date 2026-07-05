@@ -10,6 +10,7 @@ import (
 	"log/slog"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/redact"
 )
 
@@ -37,7 +38,7 @@ func copyTableIdempotent(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, 
 	teed := teeRows(copyCtx, rows, pt.observeRow)
 	// PII Phase 1: same wrap as [copyTable] — nil/empty Registry
 	// short-circuits to pass-through.
-	redacted, redactErrFn := redactRows(copyCtx, teed, redactor, table.Schema, table.Name, table.Columns, tablePKColumns(table), streamID)
+	redacted, redactErrFn := redactRows(copyCtx, teed, redactor, table.Schema, table.Name, table.Columns, migcore.TablePKColumns(table), streamID)
 	idem, ok := rw.(ir.IdempotentRowWriter)
 	if !ok {
 		slog.DebugContext(
@@ -155,7 +156,7 @@ func copyTable(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.
 	// by table + column + PK values. PK-less tables refuse on a
 	// randomize:* rule via the strategy's own seed-required check;
 	// preflight catches the same case earlier with a richer message.
-	redacted, redactErrFn := redactRows(copyCtx, teed, redactor, table.Schema, table.Name, table.Columns, tablePKColumns(table), "")
+	redacted, redactErrFn := redactRows(copyCtx, teed, redactor, table.Schema, table.Name, table.Columns, migcore.TablePKColumns(table), "")
 	// ADR-0048 Shape A: stamp the operator-supplied discriminator
 	// onto every row before the writer sees it (the value half
 	// of DP-1's two-surface split; sibling to the optional
@@ -209,7 +210,7 @@ func copyTableColdStartIdempotent(ctx context.Context, rr ir.RowReader, rw ir.Ro
 	// silently corrupt. PK tables are safe on any idempotent writer
 	// (ON CONFLICT / ON DUPLICATE KEY on the PK absorbs re-emissions),
 	// so the guard only fires for PK-less tables.
-	if len(tablePKColumns(table)) == 0 {
+	if len(migcore.TablePKColumns(table)) == 0 {
 		icw, capable := idem.(ir.IdempotentCopyWriter)
 		if !capable || !icw.HandlesNoPKIdempotentCopy() {
 			return fmt.Errorf(
@@ -234,7 +235,7 @@ func copyTableColdStartIdempotent(ctx context.Context, rr ir.RowReader, rw ir.Ro
 	defer func() { pt.Stop(ctx, retErr) }()
 
 	teed := teeRows(copyCtx, rows, pt.observeRow)
-	redacted, redactErrFn := redactRows(copyCtx, teed, redactor, table.Schema, table.Name, table.Columns, tablePKColumns(table), "")
+	redacted, redactErrFn := redactRows(copyCtx, teed, redactor, table.Schema, table.Name, table.Columns, migcore.TablePKColumns(table), "")
 	stamped, _ := shardStampRows(copyCtx, redacted, shard.Name, shard.Value)
 	if err := idem.WriteRowsIdempotent(copyCtx, table, stamped); err != nil {
 		return fmt.Errorf("write rows (idempotent): %w", err)
