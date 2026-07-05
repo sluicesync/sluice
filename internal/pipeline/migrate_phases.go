@@ -563,7 +563,7 @@ func (m *Migrator) phaseBuildCopyDeps(ctx context.Context, schema *ir.Schema, rr
 		// setter today, so this is the confirmed-affected PlanetScale-MySQL path
 		// first (ADR-0113 scope); a no-op on PG, which never reparents into the
 		// silent-under-copy class.
-		reparentTracker: newReparentTracker(),
+		reparentTracker: migcore.NewReparentTracker(),
 	}
 	// Shared exported snapshot (perf research delta 1): pin every
 	// additional table/chunk reader to the run's one exported snapshot

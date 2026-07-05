@@ -1437,7 +1437,7 @@ func reconcileMigrateReparentTouched(
 		byName[t.Name] = t
 	}
 	for round := 1; ; round++ {
-		touched := parallel.reparentTracker.drain()
+		touched := parallel.reparentTracker.Drain()
 		if len(touched) == 0 {
 			return nil
 		}

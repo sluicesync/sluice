@@ -28,7 +28,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"sync"
 	"sync/atomic"
 
 	"golang.org/x/sync/errgroup"
@@ -210,44 +209,7 @@ type Restore struct {
 	// + serial redo, or idempotent re-apply for a chain segment) so each
 	// matches the manifest regardless of what the reparent dropped. nil ⇒
 	// no tracking (direct unit-test callers that bypass Run).
-	reparentTracker *reparentTracker
-}
-
-// reparentTracker is the thread-safe set of reparent-touched tables fed by
-// the writers' [ir.ReparentObserverSetter] callback and drained by the
-// restore reconciliation phase (ADR-0113).
-type reparentTracker struct {
-	mu      sync.Mutex
-	touched map[string]bool
-}
-
-func newReparentTracker() *reparentTracker {
-	return &reparentTracker{touched: map[string]bool{}}
-}
-
-// mark records table as reparent-touched. Safe for concurrent calls from
-// every restore writer.
-func (t *reparentTracker) mark(table string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.touched[table] = true
-}
-
-// drain returns the current touched set and clears it, so a reconciliation
-// round can re-derive those tables while a concurrent redo that itself hits
-// a reparent re-marks for the next round.
-func (t *reparentTracker) drain() []string {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if len(t.touched) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(t.touched))
-	for k := range t.touched {
-		out = append(out, k)
-	}
-	t.touched = map[string]bool{}
-	return out
+	reparentTracker *migcore.ReparentTracker
 }
 
 // reparentMark returns the observer callback to wire onto each writer, or
@@ -256,7 +218,7 @@ func (r *Restore) reparentMark() func(string) {
 	if r.reparentTracker == nil {
 		return nil
 	}
-	return r.reparentTracker.mark
+	return r.reparentTracker.Mark
 }
 
 // lineageNeedsWalk reports whether the store's lineage requires the
@@ -445,7 +407,7 @@ func (r *Restore) Run(ctx context.Context) error {
 	// exactly those from their chunks (recovering rows the reparent dropped
 	// that the gate cannot). Constructed before any writer opens so every
 	// writer receives the observer through openTargetRowWriter.
-	r.reparentTracker = newReparentTracker()
+	r.reparentTracker = migcore.NewReparentTracker()
 
 	rw, err := r.openTargetRowWriter(ctx)
 	if err != nil {
@@ -631,7 +593,7 @@ func (r *Restore) reconcileReparentTouched(ctx context.Context, rw ir.RowWriter,
 		byName[t.table.Name] = t
 	}
 	for round := 1; ; round++ {
-		touched := r.reparentTracker.drain()
+		touched := r.reparentTracker.Drain()
 		if len(touched) == 0 {
 			return nil
 		}

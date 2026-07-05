@@ -219,7 +219,7 @@ type parallelBulkCopyDeps struct {
 	// [applyReparentObserver] (the same observer the restore wires). nil ⇒ no
 	// tracking (pre-ADR-0141 behaviour, byte-for-byte — e.g. the sync
 	// cold-start deps, which build no tracker).
-	reparentTracker *reparentTracker
+	reparentTracker *migcore.ReparentTracker
 }
 
 // reparentMark returns the observer callback to wire onto each cold-copy
@@ -229,7 +229,7 @@ func (d *parallelBulkCopyDeps) reparentMark() func(string) {
 	if d == nil || d.reparentTracker == nil {
 		return nil
 	}
-	return d.reparentTracker.mark
+	return d.reparentTracker.Mark
 }
 
 // copyChunkLifecycleObserver is a TEST-ONLY seam (nil in production — a single
