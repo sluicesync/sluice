@@ -616,7 +616,7 @@ jobs:
       - name: check -run filter coverage
         run: bash scripts/check-run-filter-coverage.sh
 
-      - uses: golangci/golangci-lint-action@v9
+      - uses: golangci/golangci-lint-action@v9.2.1
         with:
           # @v8+ of the action natively requires golangci-lint v2 (the
           # major-version split happened in early 2026). Our
