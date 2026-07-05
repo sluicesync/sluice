@@ -24,8 +24,8 @@ same input, or the streams' applied rows would diverge over time.
 
 1. **Provision a keyset** — either a file, env var, or the
    `sluice_keysets` control table on the target.
-2. **Declare redactions** — `--redact TABLE.COL=STRATEGY:opt=val,...`
-   on the CLI or `redactions:` in your `sluice.yaml`.
+2. **Declare redactions** — `--redact TABLE.COL=STRATEGY[:arg[:arg]]`
+   on the CLI (colon-separated args) or `redactions:` in your `sluice.yaml`.
 3. **Run migrate / sync as usual** — the redaction layer is composed
    into the existing IR pipeline.
 
@@ -47,7 +47,7 @@ keys:
 ```sh
 sluice migrate ... \
     --keyset-source 'file:/etc/sluice/keyset.yaml' \
-    --redact 'public.users.email=hash:hmac-sha256,key=email_v1'
+    --redact 'public.users.email=hash:hmac-sha256:email_v1'
 ```
 
 ### Option B: env-backed
@@ -58,7 +58,7 @@ export SLUICE_KEYSET_pan_v1='base64-of-32-random-bytes-here...'
 
 sluice migrate ... \
     --keyset-source 'env:SLUICE_KEYSET_' \
-    --redact 'public.users.email=hash:hmac-sha256,key=email_v1'
+    --redact 'public.users.email=hash:hmac-sha256:email_v1'
 ```
 
 ### Option C: control-table-backed
@@ -70,7 +70,7 @@ database. Sluice startup reads them once into memory.
 ```sh
 sluice migrate ... \
     --keyset-source 'db:public.sluice_keysets' \
-    --redact 'public.users.email=hash:hmac-sha256,key=email_v1'
+    --redact 'public.users.email=hash:hmac-sha256:email_v1'
 ```
 
 Operator-side management of the table (rotation, lookup, deletion) is
@@ -84,10 +84,10 @@ sluice migrate \
     --source-driver postgres --source ... \
     --target-driver postgres --target ... \
     --keyset-source 'file:/etc/sluice/keyset.yaml' \
-    --redact 'public.users.email=hash:hmac-sha256,key=email_v1' \
+    --redact 'public.users.email=hash:hmac-sha256:email_v1' \
     --redact 'public.users.ssn=mask:ssn' \
     --redact 'public.payments.pan=mask:pan' \
-    --redact 'public.users.name=randomize:dict,dict=fake_names'
+    --redact 'public.users.name=randomize:dict:fake_names'
 ```
 
 Or via YAML:

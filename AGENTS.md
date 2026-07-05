@@ -60,4 +60,5 @@ Stable machine-parsable error codes (`SLUICE-E-*`) with remedy hints ride on the
 
 - Docs site index for assistants: `https://sluicesync.com/llms.txt` (full text: `/llms-full.txt`)
 - In-repo markdown: `README.md`, `docs/` (architecture, type/value contracts, cookbook recipes, operator guides, `docs/operator/error-codes.md`)
+- **Agent skills** (`skills/`): task-scoped playbooks that drive sluice for one job each — `migrate-preflight`, `fidelity-verify`, `sluice-error-triage`, `backup-chain-operator`, `cdc-sync-operator`, `planetscale-migration`, `fleet-operator`, `redaction-setup`, `sqlite-d1-import`. Install with `skills/install.sh`; see `skills/README.md`. They reference this file and `error-codes.md` as canonical rather than duplicating them.
 - `sluice --help` and `sluice <command> --help` are complete and accurate; help text is maintained as the primary flag documentation.
