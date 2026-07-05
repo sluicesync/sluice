@@ -12,6 +12,7 @@ import (
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
@@ -65,7 +66,7 @@ func TestVerifyBackupWith_DecryptProbe_Bug117(t *testing.T) {
 			t.Fatalf("NewLocalStore: %v", err)
 		}
 		src := newBackupRecorderEngine("postgres", schema, rows)
-		b := &Backup{
+		b := &backup.Backup{
 			Source:    src,
 			SourceDSN: "src",
 			Store:     store,
@@ -122,7 +123,7 @@ func TestVerifyBackupWith_DecryptProbe_Bug117(t *testing.T) {
 
 	t.Run("plaintext chain + nil envelope → SHA-only OK", func(t *testing.T) {
 		store := runBackup(t, "", nil)
-		total, failed, err := VerifyBackupWith(context.Background(), store, VerifyOptions{})
+		total, failed, err := backup.VerifyBackupWith(context.Background(), store, backup.VerifyOptions{})
 		if err != nil {
 			t.Fatalf("VerifyBackupWith: %v", err)
 		}
@@ -135,7 +136,7 @@ func TestVerifyBackupWith_DecryptProbe_Bug117(t *testing.T) {
 		env := newEnv(t, "secret-pass")
 		store := runBackup(t, crypto.EncryptModePerChain, env)
 		readEnv := rebindForChain(t, store, "secret-pass")
-		total, failed, err := VerifyBackupWith(context.Background(), store, VerifyOptions{Envelope: readEnv})
+		total, failed, err := backup.VerifyBackupWith(context.Background(), store, backup.VerifyOptions{Envelope: readEnv})
 		if err != nil {
 			t.Fatalf("VerifyBackupWith: %v", err)
 		}
@@ -148,7 +149,7 @@ func TestVerifyBackupWith_DecryptProbe_Bug117(t *testing.T) {
 		env := newEnv(t, "secret-pass")
 		store := runBackup(t, crypto.EncryptModePerChain, env)
 		wrong := rebindForChain(t, store, "WRONG-pass") // same params, different passphrase
-		_, _, err := VerifyBackupWith(context.Background(), store, VerifyOptions{Envelope: wrong})
+		_, _, err := backup.VerifyBackupWith(context.Background(), store, backup.VerifyOptions{Envelope: wrong})
 		if err == nil {
 			t.Fatalf("VerifyBackupWith: want error for wrong passphrase; got nil")
 		}
@@ -161,7 +162,7 @@ func TestVerifyBackupWith_DecryptProbe_Bug117(t *testing.T) {
 		env := newEnv(t, "rotation-pass")
 		store := runBackup(t, crypto.EncryptModePerChunk, env)
 		readEnv := rebindForChain(t, store, "rotation-pass")
-		total, failed, err := VerifyBackupWith(context.Background(), store, VerifyOptions{Envelope: readEnv})
+		total, failed, err := backup.VerifyBackupWith(context.Background(), store, backup.VerifyOptions{Envelope: readEnv})
 		if err != nil {
 			t.Fatalf("VerifyBackupWith: %v", err)
 		}
@@ -176,7 +177,7 @@ func TestVerifyBackupWith_DecryptProbe_Bug117(t *testing.T) {
 		// Bug 117 scenario: operator rotated to a NEW passphrase
 		// post-backup. SHA-only verify (legacy) passes silently.
 		wrong := rebindForChain(t, store, "ROTATED-pass")
-		total, failed, err := VerifyBackupWith(context.Background(), store, VerifyOptions{Envelope: wrong})
+		total, failed, err := backup.VerifyBackupWith(context.Background(), store, backup.VerifyOptions{Envelope: wrong})
 		if err != nil {
 			t.Fatalf("VerifyBackupWith: unexpected irrecoverable err: %v", err)
 		}
@@ -189,7 +190,7 @@ func TestVerifyBackupWith_DecryptProbe_Bug117(t *testing.T) {
 
 		// Belt-and-suspenders: confirm SHA-only verify on the SAME
 		// store still reports 0 failed (the bug-class signature).
-		shaTotal, shaFailed, shaErr := VerifyBackup(context.Background(), store)
+		shaTotal, shaFailed, shaErr := backup.VerifyBackup(context.Background(), store)
 		if shaErr != nil {
 			t.Fatalf("legacy VerifyBackup: %v", shaErr)
 		}
@@ -205,7 +206,7 @@ func TestVerifyBackupWith_DecryptProbe_Bug117(t *testing.T) {
 		// up-front kek_mode check triggers without us needing a real
 		// KMS-backed envelope. UnwrapCEK is unreachable on this path.
 		stub := &modeStubEnvelope{mode: crypto.KEKModeAWSKMS}
-		_, _, err := VerifyBackupWith(context.Background(), store, VerifyOptions{Envelope: stub})
+		_, _, err := backup.VerifyBackupWith(context.Background(), store, backup.VerifyOptions{Envelope: stub})
 		if err == nil {
 			t.Fatalf("VerifyBackupWith: want envelope-mode mismatch error; got nil")
 		}

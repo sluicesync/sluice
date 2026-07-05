@@ -33,6 +33,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
@@ -104,10 +105,10 @@ func assertTablesMatchPG(t *testing.T, sourceDSN, targetDSN string, tables []str
 func observeBackupDispatch(t *testing.T) (gotParallelism *int, gotReason *string) {
 	t.Helper()
 	p, r := 0, ""
-	backupDispatchObserver = func(tableParallelism int, reason string) {
+	backup.BackupDispatchObserver = func(tableParallelism int, reason string) {
 		p, r = tableParallelism, reason
 	}
-	t.Cleanup(func() { backupDispatchObserver = nil })
+	t.Cleanup(func() { backup.BackupDispatchObserver = nil })
 	return &p, &r
 }
 
@@ -127,7 +128,7 @@ func TestBackupParallel_PG_RoundTripChecksums(t *testing.T) {
 	}
 
 	gotP, gotReason := observeBackupDispatch(t)
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:           pgEng,
 		SourceDSN:        sourceDSN,
 		Store:            store,
@@ -158,7 +159,7 @@ func TestBackupParallel_PG_RoundTripChecksums(t *testing.T) {
 		}
 	}
 
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target:    pgEng,
 		TargetDSN: targetDSN,
 		Store:     store,
@@ -211,7 +212,7 @@ func TestBackupParallel_PG_CancelBoundsPartialsAndResumeCompletes(t *testing.T) 
 	runCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store := &cancelAfterChunkPutsStore{LocalStore: inner, n: 10, cancel: cancel}
-	err = (&Backup{
+	err = (&backup.Backup{
 		Source:           pgEng,
 		SourceDSN:        sourceDSN,
 		Store:            store,
@@ -248,7 +249,7 @@ func TestBackupParallel_PG_CancelBoundsPartialsAndResumeCompletes(t *testing.T) 
 
 	// Resume: a plain re-run against the same store completes the
 	// backup (whole-table skips + per-chunk resume + fresh streams).
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:           pgEng,
 		SourceDSN:        sourceDSN,
 		Store:            inner,
@@ -265,7 +266,7 @@ func TestBackupParallel_PG_CancelBoundsPartialsAndResumeCompletes(t *testing.T) 
 		t.Fatalf("resumed PartialState = %q; want complete", m2.PartialState)
 	}
 
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target:    pgEng,
 		TargetDSN: targetDSN,
 		Store:     inner,
@@ -304,7 +305,7 @@ func TestBackupParallel_PG_EncryptedRoundTrip(t *testing.T) {
 			}
 
 			gotP, gotReason := observeBackupDispatch(t)
-			if err := (&Backup{
+			if err := (&backup.Backup{
 				Source:           pgEng,
 				SourceDSN:        sourceDSN,
 				Store:            store,
@@ -319,7 +320,7 @@ func TestBackupParallel_PG_EncryptedRoundTrip(t *testing.T) {
 			}
 
 			envRestore := envelopeFromManifest(t, store, passphrase)
-			if err := (&Restore{
+			if err := (&backup.Restore{
 				Target:    pgEng,
 				TargetDSN: targetDSN,
 				Store:     store,
@@ -351,7 +352,7 @@ func TestBackupParallel_PG_ManifestDeterminism(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewLocalStore: %v", err)
 		}
-		if err := (&Backup{
+		if err := (&backup.Backup{
 			Source:           pgEng,
 			SourceDSN:        sourceDSN,
 			Store:            store,

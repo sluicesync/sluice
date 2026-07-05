@@ -26,6 +26,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
@@ -76,7 +77,7 @@ func TestIncrementalBackup_PostgresChainRestore(t *testing.T) {
 	defer dropPGLogicalSlot(t, sourceDSN, "sluice_slot")
 
 	// 2. Full backup.
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: pgEng, SourceDSN: sourceDSN, Store: store,
 		SluiceVersion: "test",
 	}).Run(context.Background()); err != nil {
@@ -152,7 +153,7 @@ func TestIncrementalBackup_PostgresChainRestore(t *testing.T) {
 	}
 
 	// 6. Verify chain.
-	total, mismatches, err := VerifyBackup(context.Background(), store)
+	total, mismatches, err := backup.VerifyBackup(context.Background(), store)
 	if err != nil {
 		t.Fatalf("VerifyBackup: %v", err)
 	}
@@ -161,7 +162,7 @@ func TestIncrementalBackup_PostgresChainRestore(t *testing.T) {
 	}
 
 	// 7. Chain restore.
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target:    pgEng,
 		TargetDSN: targetDSN,
 		Store:     store,
@@ -218,7 +219,7 @@ func TestIncrementalBackup_PostgresChainRestore_SchemaEvolution(t *testing.T) {
 	}
 	defer dropPGLogicalSlot(t, sourceDSN, "sluice_slot")
 
-	if err := (&Backup{Source: pgEng, SourceDSN: sourceDSN, Store: store, SluiceVersion: "test"}).Run(context.Background()); err != nil {
+	if err := (&backup.Backup{Source: pgEng, SourceDSN: sourceDSN, Store: store, SluiceVersion: "test"}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
 	full, _ := lineage.ReadManifest(context.Background(), store)
@@ -295,7 +296,7 @@ func TestIncrementalBackup_PostgresChainRestore_SchemaEvolution(t *testing.T) {
 	// What we DO verify here: the restore completes cleanly, the
 	// alice/bob rows arrive, and the SchemaDelta entry records the
 	// shape change for the next chain consumer to act on.
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target:    pgEng,
 		TargetDSN: targetDSN,
 		Store:     store,
@@ -353,7 +354,7 @@ func TestIncrementalBackup_PostgresChainRestore_TwoIncrementals(t *testing.T) {
 	defer dropPGLogicalSlot(t, sourceDSN, "sluice_slot")
 
 	// Full backup.
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: pgEng, SourceDSN: sourceDSN, Store: store, SluiceVersion: "test",
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
@@ -436,7 +437,7 @@ func TestIncrementalBackup_PostgresChainRestore_TwoIncrementals(t *testing.T) {
 	// Full chain verify — pre-fix this surfaced
 	// `chunk SHA-256 mismatch` because incr1's manifest hash didn't
 	// match the bytes incr2 had written to the same path.
-	total, mismatches, err := VerifyBackup(context.Background(), store)
+	total, mismatches, err := backup.VerifyBackup(context.Background(), store)
 	if err != nil {
 		t.Fatalf("VerifyBackup: %v", err)
 	}
@@ -445,7 +446,7 @@ func TestIncrementalBackup_PostgresChainRestore_TwoIncrementals(t *testing.T) {
 	}
 
 	// Chain restore into a fresh target.
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target:    pgEng,
 		TargetDSN: targetDSN,
 		Store:     store,
@@ -628,7 +629,7 @@ func TestIncrementalBackup_PostgresChainRestore_SchemaHistoryReplay(t *testing.T
 	}
 	defer dropPGLogicalSlot(t, sourceDSN, "sluice_slot")
 
-	if err := (&Backup{Source: pgEng, SourceDSN: sourceDSN, Store: store, SluiceVersion: "test"}).Run(context.Background()); err != nil {
+	if err := (&backup.Backup{Source: pgEng, SourceDSN: sourceDSN, Store: store, SluiceVersion: "test"}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
 	full, _ := lineage.ReadManifest(context.Background(), store)
@@ -684,7 +685,7 @@ func TestIncrementalBackup_PostgresChainRestore_SchemaHistoryReplay(t *testing.T
 	t.Logf("captured %d SchemaHistory entries on the incremental manifest", len(incr.SchemaHistory))
 
 	// Chain restore.
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target:    pgEng,
 		TargetDSN: targetDSN,
 		Store:     store,
@@ -704,27 +705,12 @@ func TestIncrementalBackup_PostgresChainRestore_SchemaHistoryReplay(t *testing.T
 	if err := tgtDB.QueryRowContext(
 		context.Background(),
 		`SELECT COUNT(*) FROM "public"."sluice_cdc_schema_history" WHERE stream_id = $1`,
-		ChainRestoreStreamID,
+		backup.ChainRestoreStreamID,
 	).Scan(&historyCount); err != nil {
 		t.Fatalf("count schema history: %v", err)
 	}
 	if historyCount == 0 {
-		t.Fatalf("sluice_cdc_schema_history rows after restore = 0 (Chunk D should have seeded entries for stream %q)", ChainRestoreStreamID)
+		t.Fatalf("sluice_cdc_schema_history rows after restore = 0 (Chunk D should have seeded entries for stream %q)", backup.ChainRestoreStreamID)
 	}
-	t.Logf("target sluice_cdc_schema_history rows after restore: %d (stream %q)", historyCount, ChainRestoreStreamID)
-
-	// UPSERT-on-version_key idempotency of writeSchemaVersion is
-	// pinned independently: structurally enforced by the SQL
-	// (`INSERT ... ON CONFLICT (version_key) DO UPDATE` on PG;
-	// `... ON DUPLICATE KEY UPDATE` on MySQL — see Chunk A's
-	// engine schema_history.go) and exercised by the Chunk-A
-	// integration tests on the engine side. The earlier
-	// re-Restore.Run idempotency check here was the wrong assay:
-	// chain restore is intentionally NOT idempotent at the
-	// data-table level (re-running re-attempts the full bulk copy →
-	// duplicate-PK conflict on `users` — observed in CI run
-	// 26134035839 after the SetStreamID fix unblocked the first
-	// restore's seeding). The headline assertion (rows seeded after
-	// the first restore = the Chunk D value-prop) is sufficient
-	// here; the UPSERT property lives in the engine-side tests.
+	t.Logf("target sluice_cdc_schema_history rows after restore: %d (stream %q)", historyCount, backup.ChainRestoreStreamID)
 }

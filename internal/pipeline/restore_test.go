@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
@@ -85,12 +86,6 @@ func (e *restoreRecorderEngine) recordPhase(name string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.phases = append(e.phases, name)
-}
-
-func (e *restoreRecorderEngine) recordRow(table string, row ir.Row) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.rows[table] = append(e.rows[table], row)
 }
 
 func (e *restoreRecorderEngine) snapshot() (phases []string, rows map[string][]ir.Row) {
@@ -202,12 +197,12 @@ func (w *restoreRecordingRowWriter) SetGrowGate(gate ir.GrowGate) {
 func TestRestore_Validate(t *testing.T) {
 	cases := []struct {
 		name string
-		r    *Restore
+		r    *backup.Restore
 		want string
 	}{
-		{"nil target", &Restore{TargetDSN: "x", Store: &blobcodec.LocalStore{}}, "Target engine is nil"},
-		{"empty DSN", &Restore{Target: stubEngine{}, Store: &blobcodec.LocalStore{}}, "TargetDSN is empty"},
-		{"nil store", &Restore{Target: stubEngine{}, TargetDSN: "x"}, "Store is nil"},
+		{"nil target", &backup.Restore{TargetDSN: "x", Store: &blobcodec.LocalStore{}}, "Target engine is nil"},
+		{"empty DSN", &backup.Restore{Target: stubEngine{}, Store: &blobcodec.LocalStore{}}, "TargetDSN is empty"},
+		{"nil store", &backup.Restore{Target: stubEngine{}, TargetDSN: "x"}, "Store is nil"},
 	}
 	for _, c := range cases {
 		c := c
@@ -262,14 +257,14 @@ func TestBackupRestore_FullRoundTrip(t *testing.T) {
 
 	// Backup phase.
 	src := newBackupRecorderEngine("postgres", schema, rows)
-	b := &Backup{Source: src, SourceDSN: "src", Store: store, ChunkRows: 10}
+	b := &backup.Backup{Source: src, SourceDSN: "src", Store: store, ChunkRows: 10}
 	if err := b.Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
 
 	// Restore phase.
 	tgt := newRestoreRecorderEngine("postgres") // same engine; cross-engine covered by separate test
-	r := &Restore{Target: tgt, TargetDSN: "tgt", Store: store}
+	r := &backup.Restore{Target: tgt, TargetDSN: "tgt", Store: store}
 	if err := r.Run(context.Background()); err != nil {
 		t.Fatalf("Restore.Run: %v", err)
 	}
@@ -336,12 +331,12 @@ func TestRestore_WiresGrowGate(t *testing.T) {
 	rows := map[string][]ir.Row{"t": {{"id": int64(1)}, {"id": int64(2)}}}
 
 	src := newBackupRecorderEngine("postgres", schema, rows)
-	if err := (&Backup{Source: src, SourceDSN: "src", Store: store, ChunkRows: 10}).Run(context.Background()); err != nil {
+	if err := (&backup.Backup{Source: src, SourceDSN: "src", Store: store, ChunkRows: 10}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
 
 	tgt := newRestoreRecorderEngine("postgres")
-	if err := (&Restore{Target: tgt, TargetDSN: "tgt", Store: store}).Run(context.Background()); err != nil {
+	if err := (&backup.Restore{Target: tgt, TargetDSN: "tgt", Store: store}).Run(context.Background()); err != nil {
 		t.Fatalf("Restore.Run: %v", err)
 	}
 
@@ -374,13 +369,13 @@ func TestRestore_ReparentReconciliation_RecoversDroppedRows(t *testing.T) {
 		"u": {{"id": int64(10)}, {"id": int64(11)}, {"id": int64(12)}},
 	}
 	src := newBackupRecorderEngine("postgres", schema, rows)
-	if err := (&Backup{Source: src, SourceDSN: "src", Store: store, ChunkRows: 100}).Run(context.Background()); err != nil {
+	if err := (&backup.Backup{Source: src, SourceDSN: "src", Store: store, ChunkRows: 100}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
 
 	tgt := newRestoreRecorderEngine("postgres")
 	tgt.dropTable = "t" // simulate the reparent dropping a row from table t
-	if err := (&Restore{Target: tgt, TargetDSN: "tgt", Store: store}).Run(context.Background()); err != nil {
+	if err := (&backup.Restore{Target: tgt, TargetDSN: "tgt", Store: store}).Run(context.Background()); err != nil {
 		t.Fatalf("Restore.Run: %v", err)
 	}
 
@@ -418,7 +413,7 @@ func TestRestore_HashMismatch_FailsLoudly(t *testing.T) {
 		"users": {{"id": int64(1)}, {"id": int64(2)}},
 	}
 	src := newBackupRecorderEngine("mysql", schema, rows)
-	if err := (&Backup{Source: src, SourceDSN: "src", Store: store}).Run(context.Background()); err != nil {
+	if err := (&backup.Backup{Source: src, SourceDSN: "src", Store: store}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
 
@@ -450,7 +445,7 @@ func TestRestore_HashMismatch_FailsLoudly(t *testing.T) {
 	}
 
 	// VerifyBackup should report the mismatch.
-	total, mismatches, err := VerifyBackup(context.Background(), store)
+	total, mismatches, err := backup.VerifyBackup(context.Background(), store)
 	if err != nil {
 		t.Fatalf("VerifyBackup: %v", err)
 	}
@@ -461,7 +456,7 @@ func TestRestore_HashMismatch_FailsLoudly(t *testing.T) {
 	// Restore should also fail loudly. Wrap target in recorder so
 	// Run can attempt the restore.
 	tgt := newRestoreRecorderEngine("mysql")
-	err = (&Restore{Target: tgt, TargetDSN: "tgt", Store: store}).Run(context.Background())
+	err = (&backup.Restore{Target: tgt, TargetDSN: "tgt", Store: store}).Run(context.Background())
 	if err == nil {
 		t.Fatal("Restore.Run on corrupted chunk: nil err; want ErrChunkHashMismatch")
 	}
@@ -510,7 +505,7 @@ func TestRestore_CrossEngine_RetargetsTypes(t *testing.T) {
 		}},
 	}
 	src := newBackupRecorderEngine("postgres", schema, rows)
-	if err := (&Backup{Source: src, SourceDSN: "src", Store: store}).Run(context.Background()); err != nil {
+	if err := (&backup.Backup{Source: src, SourceDSN: "src", Store: store}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup: %v", err)
 	}
 
@@ -518,7 +513,7 @@ func TestRestore_CrossEngine_RetargetsTypes(t *testing.T) {
 	tgt := &capturingTargetEngine{
 		restoreRecorderEngine: newRestoreRecorderEngine("mysql"),
 	}
-	if err := (&Restore{Target: tgt, TargetDSN: "tgt", Store: store}).Run(context.Background()); err != nil {
+	if err := (&backup.Restore{Target: tgt, TargetDSN: "tgt", Store: store}).Run(context.Background()); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
 
@@ -574,11 +569,11 @@ func TestRestore_CrossEngine_SingleManifest_RefusesUnsupportable(t *testing.T) {
 			dir := t.TempDir()
 			store, _ := blobcodec.NewLocalStore(dir)
 			src := newBackupRecorderEngine("postgres", excludeSchema, rows)
-			if err := (&Backup{Source: src, SourceDSN: "src", Store: store}).Run(context.Background()); err != nil {
+			if err := (&backup.Backup{Source: src, SourceDSN: "src", Store: store}).Run(context.Background()); err != nil {
 				t.Fatalf("Backup: %v", err)
 			}
 			tgt := newRestoreRecorderEngine(target)
-			err := (&Restore{Target: tgt, TargetDSN: "tgt", Store: store}).Run(context.Background())
+			err := (&backup.Restore{Target: tgt, TargetDSN: "tgt", Store: store}).Run(context.Background())
 			if err == nil {
 				t.Fatalf("restore to %s with EXCLUDE constraint succeeded; want loud refusal (Bug 134)", target)
 			}
@@ -596,11 +591,11 @@ func TestRestore_CrossEngine_SingleManifest_RefusesUnsupportable(t *testing.T) {
 		dir := t.TempDir()
 		store, _ := blobcodec.NewLocalStore(dir)
 		src := newBackupRecorderEngine("postgres", excludeSchema, rows)
-		if err := (&Backup{Source: src, SourceDSN: "src", Store: store}).Run(context.Background()); err != nil {
+		if err := (&backup.Backup{Source: src, SourceDSN: "src", Store: store}).Run(context.Background()); err != nil {
 			t.Fatalf("Backup: %v", err)
 		}
 		tgt := newRestoreRecorderEngine("postgres")
-		if err := (&Restore{Target: tgt, TargetDSN: "tgt", Store: store}).Run(context.Background()); err != nil {
+		if err := (&backup.Restore{Target: tgt, TargetDSN: "tgt", Store: store}).Run(context.Background()); err != nil {
 			t.Fatalf("same-engine restore must pass the gate: %v", err)
 		}
 	})
@@ -613,11 +608,11 @@ func TestRestore_CrossEngine_SingleManifest_RefusesUnsupportable(t *testing.T) {
 			Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
 		}}}
 		src := newBackupRecorderEngine("postgres", clean, map[string][]ir.Row{"users": {{"id": int64(1)}}})
-		if err := (&Backup{Source: src, SourceDSN: "src", Store: store}).Run(context.Background()); err != nil {
+		if err := (&backup.Backup{Source: src, SourceDSN: "src", Store: store}).Run(context.Background()); err != nil {
 			t.Fatalf("Backup: %v", err)
 		}
 		tgt := newRestoreRecorderEngine("mysql")
-		if err := (&Restore{Target: tgt, TargetDSN: "tgt", Store: store}).Run(context.Background()); err != nil {
+		if err := (&backup.Restore{Target: tgt, TargetDSN: "tgt", Store: store}).Run(context.Background()); err != nil {
 			t.Fatalf("clean cross-engine restore must pass the gate: %v", err)
 		}
 	})
@@ -675,14 +670,14 @@ func TestVerifyBackup_DetectsMissingChunk(t *testing.T) {
 	}
 	rows := map[string][]ir.Row{"x": {{"id": int64(1)}}}
 	src := newBackupRecorderEngine("mysql", schema, rows)
-	if err := (&Backup{Source: src, SourceDSN: "src", Store: store}).Run(context.Background()); err != nil {
+	if err := (&backup.Backup{Source: src, SourceDSN: "src", Store: store}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup: %v", err)
 	}
 	manifest, _ := lineage.ReadManifest(context.Background(), store)
 	if err := store.Delete(context.Background(), manifest.Tables[0].Chunks[0].File); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	total, mismatches, err := VerifyBackup(context.Background(), store)
+	total, mismatches, err := backup.VerifyBackup(context.Background(), store)
 	if err != nil {
 		t.Fatalf("VerifyBackup: %v", err)
 	}

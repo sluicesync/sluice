@@ -33,6 +33,7 @@ import (
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/engines"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
@@ -139,7 +140,7 @@ func TestBackup_PassphraseEncryption_RoundTrip(t *testing.T) {
 	const passphrase = "correct horse battery staple"
 	envBackup := newTestPassphraseEnvelope(t, passphrase)
 
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:        pgEng,
 		SourceDSN:     sourceDSN,
 		Store:         store,
@@ -196,7 +197,7 @@ func TestBackup_PassphraseEncryption_RoundTrip(t *testing.T) {
 
 	// Restore with the matching passphrase.
 	envRestore := envelopeFromManifest(t, store, passphrase)
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target:    pgEng,
 		TargetDSN: targetDSN,
 		Store:     store,
@@ -237,7 +238,7 @@ func TestBackup_Encryption_WrongPassphrase(t *testing.T) {
 	}
 
 	envBackup := newTestPassphraseEnvelope(t, "right-pass")
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:    pgEng,
 		SourceDSN: sourceDSN,
 		Store:     store,
@@ -252,7 +253,7 @@ func TestBackup_Encryption_WrongPassphrase(t *testing.T) {
 	// Restore with a wrong passphrase should fail before any data
 	// lands on the target.
 	envWrong := envelopeFromManifest(t, store, "wrong-pass")
-	err = (&Restore{
+	err = (&backup.Restore{
 		Target:    pgEng,
 		TargetDSN: targetDSN,
 		Store:     store,
@@ -282,7 +283,7 @@ func TestBackup_Encryption_MissingKey(t *testing.T) {
 	}
 
 	envBackup := newTestPassphraseEnvelope(t, "secret")
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:    pgEng,
 		SourceDSN: sourceDSN,
 		Store:     store,
@@ -295,7 +296,7 @@ func TestBackup_Encryption_MissingKey(t *testing.T) {
 	}
 
 	// No envelope → must refuse at preflight.
-	err = (&Restore{
+	err = (&backup.Restore{
 		Target:    pgEng,
 		TargetDSN: targetDSN,
 		Store:     store,
@@ -331,7 +332,7 @@ func TestBackup_Encryption_PerChunkMode(t *testing.T) {
 	}
 
 	envBackup := newTestPassphraseEnvelope(t, "per-chunk-pass")
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:    pgEng,
 		SourceDSN: sourceDSN,
 		Store:     store,
@@ -378,7 +379,7 @@ func TestBackup_Encryption_PerChunkMode(t *testing.T) {
 
 	// Round-trip restore.
 	envRestore := envelopeFromManifest(t, store, "per-chunk-pass")
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target:    pgEng,
 		TargetDSN: targetDSN,
 		Store:     store,
@@ -415,7 +416,7 @@ func TestBackup_PlaintextBackwardCompat(t *testing.T) {
 	}
 
 	// Plaintext backup (no Encryption field).
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:    pgEng,
 		SourceDSN: sourceDSN,
 		Store:     store,
@@ -432,7 +433,7 @@ func TestBackup_PlaintextBackwardCompat(t *testing.T) {
 	}
 
 	// Restore without envelope; must succeed.
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target:    pgEng,
 		TargetDSN: targetDSN,
 		Store:     store,
@@ -466,7 +467,7 @@ func TestBackupVerify_EncryptedChain_NoKey(t *testing.T) {
 	}
 
 	env := newTestPassphraseEnvelope(t, "verify-pass")
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:    pgEng,
 		SourceDSN: sourceDSN,
 		Store:     store,
@@ -479,7 +480,7 @@ func TestBackupVerify_EncryptedChain_NoKey(t *testing.T) {
 	}
 
 	// Verify without any envelope.
-	total, mismatches, err := VerifyBackup(context.Background(), store)
+	total, mismatches, err := backup.VerifyBackup(context.Background(), store)
 	if err != nil {
 		t.Fatalf("VerifyBackup: %v", err)
 	}
@@ -512,7 +513,7 @@ func TestBackup_Encryption_LocalStoreDir(t *testing.T) {
 	}
 
 	env := newTestPassphraseEnvelope(t, "forensic-pass")
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:    pgEng,
 		SourceDSN: sourceDSN,
 		Store:     store,

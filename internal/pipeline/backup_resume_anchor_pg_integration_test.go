@@ -38,6 +38,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
@@ -193,7 +194,7 @@ func runAnchoredResumeChainGapFlow(t *testing.T, chainSlot bool) {
 	// 1. Interrupted full: kept_t completes, then the first late_t
 	// chunk upload "crashes". TableParallelism=1 pins sweep order.
 	crashing := &failOnPathMatchPutStore{LocalStore: store, match: "late_t"}
-	err = (&Backup{
+	err = (&backup.Backup{
 		Source: pgEng, SourceDSN: sourceDSN, Store: crashing,
 		SluiceVersion: "test", ChainSlot: chainSlot, TableParallelism: 1,
 	}).Run(context.Background())
@@ -225,7 +226,7 @@ func runAnchoredResumeChainGapFlow(t *testing.T, chainSlot bool) {
 
 	// 3. Resume: the SAME command. Must adopt — no already-exists
 	// refusal, EndPosition == A1, chain slot untouched.
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: pgEng, SourceDSN: sourceDSN, Store: store,
 		SluiceVersion: "test", ChainSlot: chainSlot, TableParallelism: 1,
 	}).Run(context.Background()); err != nil {
@@ -263,7 +264,7 @@ func runAnchoredResumeChainGapFlow(t *testing.T, chainSlot bool) {
 	}).Run(ctx); err != nil {
 		t.Fatalf("IncrementalBackup.Run: %v", err)
 	}
-	if err := (&ChainRestore{
+	if err := (&backup.ChainRestore{
 		Target: pgEng, TargetDSN: targetDSN, Store: store,
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("ChainRestore.Run: %v", err)
@@ -314,14 +315,14 @@ func TestBackup_ResumeAnchorAdoption_KeylessRestreamRefused(t *testing.T) {
 	}
 
 	crashing := &failOnPathMatchPutStore{LocalStore: store, match: "keyless_t"}
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: pgEng, SourceDSN: sourceDSN, Store: crashing,
 		SluiceVersion: "test", TableParallelism: 1,
 	}).Run(context.Background()); err == nil {
 		t.Fatal("interrupted Run: expected injected crash; got nil")
 	}
 
-	err = (&Backup{
+	err = (&backup.Backup{
 		Source: pgEng, SourceDSN: sourceDSN, Store: store,
 		SluiceVersion: "test", TableParallelism: 1,
 	}).Run(context.Background())
@@ -335,7 +336,7 @@ func TestBackup_ResumeAnchorAdoption_KeylessRestreamRefused(t *testing.T) {
 	}
 
 	// The named escape hatch works: --force-overwrite starts fresh.
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: pgEng, SourceDSN: sourceDSN, Store: store,
 		SluiceVersion: "test", TableParallelism: 1, ForceOverwrite: true,
 	}).Run(context.Background()); err != nil {

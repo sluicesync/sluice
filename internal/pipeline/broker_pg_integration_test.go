@@ -38,6 +38,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
@@ -93,7 +94,7 @@ func brokerTestStreamSetup(t *testing.T, seedDDL string) (
 	}
 	t.Cleanup(func() { dropPGLogicalSlot(t, sourceDSN, "sluice_slot") })
 
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: pgEng, SourceDSN: sourceDSN, Store: store, SluiceVersion: "test",
 	}).Run(context.Background()); err != nil {
 		teardown()
@@ -206,7 +207,7 @@ func TestSyncFromBackup_Postgres_HappyPath(t *testing.T) {
 	// alternative — operator passes --reset-target-data — is covered
 	// by TestSyncFromBackup_ColdStartWithReset.
 	pgEng, _ := engines.Get("postgres")
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target: pgEng, TargetDSN: brokerTargetDSN, Store: store,
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("seed restore: %v", err)
@@ -294,7 +295,7 @@ func TestSyncFromBackup_SchemaEvolution(t *testing.T) {
 	defer teardown()
 
 	pgEng, _ := engines.Get("postgres")
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target: pgEng, TargetDSN: brokerTargetDSN, Store: store,
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("seed restore: %v", err)
@@ -378,7 +379,7 @@ func TestSyncFromBackup_StopCommand(t *testing.T) {
 	defer teardown()
 
 	pgEng, _ := engines.Get("postgres")
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target: pgEng, TargetDSN: brokerTargetDSN, Store: store,
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("seed restore: %v", err)
@@ -433,7 +434,7 @@ func TestSyncFromBackup_RestartResumes(t *testing.T) {
 	defer teardown()
 
 	pgEng, _ := engines.Get("postgres")
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target: pgEng, TargetDSN: brokerTargetDSN, Store: store,
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("seed restore: %v", err)

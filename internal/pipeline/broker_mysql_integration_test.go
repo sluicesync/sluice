@@ -18,6 +18,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
@@ -50,7 +51,7 @@ func TestSyncFromBackup_MySQL_HappyPath(t *testing.T) {
 
 	// Take the full + patch in EndPosition so the stream chain has a
 	// resume point. Mirrors the existing MySQL incremental tests.
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: mysqlEng, SourceDSN: sourceDSN, Store: store, SluiceVersion: "test",
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
@@ -69,7 +70,7 @@ func TestSyncFromBackup_MySQL_HappyPath(t *testing.T) {
 
 	// Pre-restore the full into the broker target so the broker has
 	// the schema + the alice row.
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target: mysqlEng, TargetDSN: brokerTargetDSN, Store: store,
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("seed restore: %v", err)

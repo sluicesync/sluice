@@ -14,6 +14,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
@@ -100,7 +101,7 @@ func TestBackup_RecordsEndPosition(t *testing.T) {
 	}
 
 	now := time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC)
-	b := &Backup{
+	b := &backup.Backup{
 		Source:        src,
 		SourceDSN:     "src",
 		Store:         store,
@@ -153,7 +154,7 @@ func TestBackup_NoCDCSkipsEndPosition(t *testing.T) {
 	src := newBackupRecorderEngine("postgres", schema, map[string][]ir.Row{
 		"users": {{"id": int64(1)}},
 	})
-	b := &Backup{Source: src, SourceDSN: "src", Store: store}
+	b := &backup.Backup{Source: src, SourceDSN: "src", Store: store}
 	if err := b.Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
@@ -294,7 +295,7 @@ func TestBackup_TableScopedSnapshotPrefersScopedOpener(t *testing.T) {
 	}
 
 	now := time.Date(2026, 6, 6, 12, 0, 0, 0, time.UTC)
-	b := &Backup{
+	b := &backup.Backup{
 		Source:        src,
 		SourceDSN:     "src",
 		Store:         store,
@@ -376,7 +377,7 @@ func TestBackup_BaseOnlySnapshotOpenerStillRoutesToBase(t *testing.T) {
 		t.Fatal("snapshotOpeningEngine must NOT implement TableScopedBackupSnapshotOpener for this test")
 	}
 
-	b := &Backup{
+	b := &backup.Backup{
 		Source:    src,
 		SourceDSN: "src",
 		Store:     store,
@@ -440,7 +441,7 @@ func TestBackup_RecordsSnapshotAnchoredEndPosition(t *testing.T) {
 	}
 
 	now := time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC)
-	b := &Backup{
+	b := &backup.Backup{
 		Source:        src,
 		SourceDSN:     "src",
 		Store:         store,
@@ -522,7 +523,7 @@ func TestBackup_SnapshotOpenerErrorFallsBackToCapturer(t *testing.T) {
 		snapshotErr: errors.New(`postgres: cdc: wal_level is "replica"; must be 'logical' for logical replication`),
 	}
 
-	b := &Backup{
+	b := &backup.Backup{
 		Source:    src,
 		SourceDSN: "src",
 		Store:     store,
@@ -592,7 +593,7 @@ func TestBackup_FallbackWhenNoSnapshotOpener(t *testing.T) {
 		cdc:    ir.CDCLogicalReplication,
 		reader: reader,
 	}
-	b := &Backup{Source: src, SourceDSN: "src", Store: store, SlotName: "sluice_chain_slot"}
+	b := &backup.Backup{Source: src, SourceDSN: "src", Store: store, SlotName: "sluice_chain_slot"}
 	if err := b.Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
@@ -623,7 +624,7 @@ func TestBackup_CapturerErrorSurfacesAsRunFailure(t *testing.T) {
 		cdc:    ir.CDCLogicalReplication,
 		reader: reader,
 	}
-	b := &Backup{Source: src, SourceDSN: "src", Store: store}
+	b := &backup.Backup{Source: src, SourceDSN: "src", Store: store}
 	err := b.Run(context.Background())
 	if err == nil {
 		t.Fatal("Backup.Run: nil; want error from capturer failure")

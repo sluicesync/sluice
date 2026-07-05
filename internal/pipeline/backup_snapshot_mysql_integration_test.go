@@ -26,6 +26,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
@@ -100,7 +101,7 @@ func TestBackup_SnapshotAnchoredEndPosition_MySQLGapClosed(t *testing.T) {
 		}
 	}()
 
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:        mysqlEng,
 		SourceDSN:     sourceDSN,
 		Store:         store,
@@ -135,7 +136,7 @@ func TestBackup_SnapshotAnchoredEndPosition_MySQLGapClosed(t *testing.T) {
 		t.Fatalf("IncrementalBackup.Run: %v", err)
 	}
 
-	total, mismatches, err := VerifyBackup(context.Background(), store)
+	total, mismatches, err := backup.VerifyBackup(context.Background(), store)
 	if err != nil {
 		t.Fatalf("VerifyBackup: %v", err)
 	}
@@ -143,7 +144,7 @@ func TestBackup_SnapshotAnchoredEndPosition_MySQLGapClosed(t *testing.T) {
 		t.Errorf("VerifyBackup: %d of %d chunks failed", mismatches, total)
 	}
 
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target:    mysqlEng,
 		TargetDSN: targetDSN,
 		Store:     store,

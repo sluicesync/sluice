@@ -30,6 +30,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
@@ -62,7 +63,7 @@ func TestBackup_ChainSlot_CommitsSnapshotOnSuccess(t *testing.T) {
 	}
 	src, _ := chainSlotTestEngine(t)
 
-	b := &Backup{
+	b := &backup.Backup{
 		Source:    src,
 		SourceDSN: "src",
 		Store:     store,
@@ -113,7 +114,7 @@ func TestBackup_ChainSlot_CommitTimingOnFailedRun(t *testing.T) {
 		src.useSnapshotRows = true
 		src.snapshotRowsHook = func() ir.RowReader { return erroringSnapshotRowReader{} }
 
-		b := &Backup{
+		b := &backup.Backup{
 			Source:    src,
 			SourceDSN: "src",
 			Store:     store,
@@ -148,7 +149,7 @@ func TestBackup_ChainSlot_CommitTimingOnFailedRun(t *testing.T) {
 			t.Fatalf("NewLocalStore: %v", err)
 		}
 		src, _ := chainSlotTestEngine(t)
-		b := &Backup{
+		b := &backup.Backup{
 			Source:    src,
 			SourceDSN: "src",
 			Store:     newFailOnNthPutStore(inner, 1), // the pre-sweep manifest write
@@ -175,7 +176,7 @@ func TestBackup_ChainSlot_RefusesSnapshotFallback(t *testing.T) {
 	t.Run("snapshot open error", func(t *testing.T) {
 		src, _ := chainSlotTestEngine(t)
 		src.snapshotErr = errors.New("wal_level is replica")
-		b := &Backup{Source: src, SourceDSN: "src", Store: store, ChainSlot: true}
+		b := &backup.Backup{Source: src, SourceDSN: "src", Store: store, ChainSlot: true}
 		err := b.Run(context.Background())
 		if err == nil || !strings.Contains(err.Error(), "--chain-slot") {
 			t.Errorf("err = %v; want loud --chain-slot refusal instead of the v0.17.x fallback", err)
@@ -192,7 +193,7 @@ func TestBackup_ChainSlot_RefusesSnapshotFallback(t *testing.T) {
 			cdc:                  ir.CDCLogicalReplication,
 			reader:               &capturingSchemaReader{schema: schema},
 		}
-		b := &Backup{Source: src, SourceDSN: "src", Store: store, ChainSlot: true}
+		b := &backup.Backup{Source: src, SourceDSN: "src", Store: store, ChainSlot: true}
 		err := b.Run(context.Background())
 		if err == nil || !strings.Contains(err.Error(), "--chain-slot") {
 			t.Errorf("err = %v; want loud --chain-slot refusal (engine has no snapshot opener)", err)
@@ -225,7 +226,7 @@ func TestIncremental_ChainPreflightRefusalStopsBeforeCDC(t *testing.T) {
 
 	// Seed the store with a completed full (the parent) the
 	// incremental chains off.
-	full := &Backup{Source: src, SourceDSN: "src", Store: store, SlotName: "sluice_slot"}
+	full := &backup.Backup{Source: src, SourceDSN: "src", Store: store, SlotName: "sluice_slot"}
 	if err := full.Run(context.Background()); err != nil {
 		t.Fatalf("seed full backup: %v", err)
 	}

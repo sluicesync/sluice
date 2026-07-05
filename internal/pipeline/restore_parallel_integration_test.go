@@ -31,6 +31,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
@@ -53,7 +54,7 @@ func TestRestoreParallel_PG_RoundTripChecksums(t *testing.T) {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
 
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:    pgEng,
 		SourceDSN: sourceDSN,
 		Store:     store,
@@ -63,7 +64,7 @@ func TestRestoreParallel_PG_RoundTripChecksums(t *testing.T) {
 	}
 
 	gotP, gotReason := observeRestoreDispatch(t)
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target:           pgEng,
 		TargetDSN:        targetDSN,
 		Store:            store,
@@ -128,7 +129,7 @@ func TestRestoreParallel_PGToMySQL_CrossEngine(t *testing.T) {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
 
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:    pgEng,
 		SourceDSN: pgSourceDSN,
 		Store:     store,
@@ -138,7 +139,7 @@ func TestRestoreParallel_PGToMySQL_CrossEngine(t *testing.T) {
 	}
 
 	gotP, gotReason := observeRestoreDispatch(t)
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target:           mysqlEng,
 		TargetDSN:        mysqlTargetDSN,
 		Store:            store,
@@ -178,7 +179,7 @@ func TestRestoreParallel_PG_EncryptedPerChunkRoundTrip(t *testing.T) {
 
 	const passphrase = "parallel-restore-test-passphrase"
 	env := newTestPassphraseEnvelope(t, passphrase)
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:     pgEng,
 		SourceDSN:  sourceDSN,
 		Store:      store,
@@ -189,7 +190,7 @@ func TestRestoreParallel_PG_EncryptedPerChunkRoundTrip(t *testing.T) {
 	}
 
 	gotP, gotReason := observeRestoreDispatch(t)
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target:           pgEng,
 		TargetDSN:        targetDSN,
 		Store:            store,
@@ -241,7 +242,7 @@ func TestChainRestoreParallel_PG_FullPlusIncremental(t *testing.T) {
 	defer dropPGLogicalSlot(t, sourceDSN, "sluice_slot")
 
 	// 1. Full backup, anchored at the slot's consistent point.
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: pgEng, SourceDSN: sourceDSN, Store: store,
 		ChunkRows: 40, SluiceVersion: "test",
 	}).Run(context.Background()); err != nil {
@@ -282,7 +283,7 @@ func TestChainRestoreParallel_PG_FullPlusIncremental(t *testing.T) {
 	//    engages the pool (clamped to the 4 tables); the incremental
 	//    replay path is untouched.
 	gotP, gotReason := observeRestoreDispatch(t)
-	if err := (&ChainRestore{
+	if err := (&backup.ChainRestore{
 		Target:           pgEng,
 		TargetDSN:        targetDSN,
 		Store:            store,

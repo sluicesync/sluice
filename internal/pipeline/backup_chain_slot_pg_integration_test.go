@@ -27,6 +27,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -88,7 +89,7 @@ func TestBackup_ChainSlot_EndToEndChain(t *testing.T) {
 
 	// 1. Full backup with chain provisioning. Note: NO manual
 	// publication, NO manual slot.
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: pgEng, SourceDSN: sourceDSN, Store: store,
 		SluiceVersion: "test", ChainSlot: true,
 	}).Run(context.Background()); err != nil {
@@ -122,7 +123,7 @@ func TestBackup_ChainSlot_EndToEndChain(t *testing.T) {
 
 	// 4. Chain-restore into the fresh target and checksum (count +
 	// sum(id) + active-count — value content, not just row count).
-	if err := (&ChainRestore{
+	if err := (&backup.ChainRestore{
 		Target: pgEng, TargetDSN: targetDSN, Store: store,
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("ChainRestore.Run: %v", err)
@@ -168,7 +169,7 @@ func TestIncremental_LateCreatedSlotRefused(t *testing.T) {
 	}
 
 	// 1. Anchored full WITHOUT chain provisioning (the default).
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: pgEng, SourceDSN: sourceDSN, Store: store, SluiceVersion: "test",
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
@@ -213,7 +214,7 @@ func TestIncremental_MissingSlotRefusedWithGuidance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: pgEng, SourceDSN: sourceDSN, Store: store, SluiceVersion: "test",
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
@@ -253,7 +254,7 @@ func TestBackup_ChainSlot_ExistingSlotRefused(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
-	err = (&Backup{
+	err = (&backup.Backup{
 		Source: pgEng, SourceDSN: sourceDSN, Store: store,
 		SluiceVersion: "test", ChainSlot: true,
 	}).Run(context.Background())

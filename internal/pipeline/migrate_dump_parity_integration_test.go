@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	// Register the postgres engine so engines.Get("postgres") works.
@@ -206,19 +207,19 @@ func TestMigrate_DumpParity_PGKitchenSink(t *testing.T) {
 	dumpParityExec(t, ctx, ctr,
 		"pg_dump -U test --schema-only source_db | psql -q -U test -v ON_ERROR_STOP=1 -d parity_pgdump")
 
-	sluiceStmts := parseSchemaDump(dumpParitySchemaDump(t, ctx, ctr, "parity_sluice"))
-	oracleStmts := parseSchemaDump(dumpParitySchemaDump(t, ctx, ctr, "parity_pgdump"))
+	sluiceStmts := backup.ParseSchemaDump(dumpParitySchemaDump(t, ctx, ctr, "parity_sluice"))
+	oracleStmts := backup.ParseSchemaDump(dumpParitySchemaDump(t, ctx, ctr, "parity_pgdump"))
 
 	// Vacuous-pass guard BEFORE diffing: an empty diff because the
 	// comparator ate everything must not read as parity.
-	if n := countCreateStatements(oracleStmts); n < dumpParityOracleCreateFloor {
+	if n := backup.CountCreateStatements(oracleStmts); n < dumpParityOracleCreateFloor {
 		t.Fatalf("vacuous-pass guard: oracle dump yielded %d CREATE statements; seed declares >= %d — the comparator is eating statements", n, dumpParityOracleCreateFloor)
 	}
-	if n := countCreateStatements(sluiceStmts); n < dumpParitySluiceCreateFloor {
+	if n := backup.CountCreateStatements(sluiceStmts); n < dumpParitySluiceCreateFloor {
 		t.Fatalf("vacuous-pass guard: sluice dump yielded %d CREATE statements; seed declares >= %d — the comparator is eating statements", n, dumpParitySluiceCreateFloor)
 	}
 
-	diff := diffDumpStatements(sluiceStmts, oracleStmts)
+	diff := backup.DiffDumpStatements(sluiceStmts, oracleStmts)
 	if diff.Empty() {
 		t.Log("dump parity: FULL PARITY (no divergences)")
 		return
@@ -228,14 +229,14 @@ func TestMigrate_DumpParity_PGKitchenSink(t *testing.T) {
 	// TRIAGE entries banner-marked) or a failure.
 	var unlisted int
 	report := func(side, key, detail string) {
-		e := matchDumpParityAllowlist(key, dumpParityAllowlist)
+		e := backup.MatchDumpParityAllowlist(key, backup.DumpParityAllowlist)
 		if e == nil {
 			unlisted++
 			t.Errorf("UNLISTED PARITY DIVERGENCE [%s] %s\n  %s", side, key, detail)
 			return
 		}
 		marker := "ALLOWLISTED"
-		if e.Citation == dumpParityTriageCitation {
+		if e.Citation == backup.DumpParityTriageCitation {
 			marker = "TRIAGE (latent gap under investigation)"
 		}
 		t.Logf("%s [%s] %s\n  reason: %s\n  citation: %s\n  %s", marker, side, key, e.Reason, e.Citation, detail)

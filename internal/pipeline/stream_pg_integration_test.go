@@ -32,6 +32,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
@@ -77,7 +78,7 @@ func TestBackupStream_Postgres_RolloverByMaxChanges(t *testing.T) {
 	defer dropPGLogicalSlot(t, sourceDSN, "sluice_slot")
 
 	// Full backup (parent for the stream chain).
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: pgEng, SourceDSN: sourceDSN, Store: store, SluiceVersion: "test",
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
@@ -176,7 +177,7 @@ func TestBackupStream_Postgres_RolloverByMaxChanges(t *testing.T) {
 	}
 
 	// Verify chain (every chunk's hash matches what's on disk).
-	total, mismatches, err := VerifyBackup(context.Background(), store)
+	total, mismatches, err := backup.VerifyBackup(context.Background(), store)
 	if err != nil {
 		t.Fatalf("VerifyBackup: %v", err)
 	}
@@ -185,7 +186,7 @@ func TestBackupStream_Postgres_RolloverByMaxChanges(t *testing.T) {
 	}
 
 	// Chain restore into the fresh target.
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target: pgEng, TargetDSN: targetDSN, Store: store,
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Restore.Run: %v", err)
@@ -246,7 +247,7 @@ func TestBackupStream_Postgres_StopCommandRequestsExit(t *testing.T) {
 	}
 	defer dropPGLogicalSlot(t, sourceDSN, "sluice_slot")
 
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: pgEng, SourceDSN: sourceDSN, Store: store, SluiceVersion: "test",
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
@@ -325,7 +326,7 @@ func TestBackupStream_Postgres_ConcurrentWriterRefused(t *testing.T) {
 	}
 	defer dropPGLogicalSlot(t, sourceDSN, "sluice_slot")
 
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: pgEng, SourceDSN: sourceDSN, Store: store, SluiceVersion: "test",
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
@@ -431,7 +432,7 @@ func TestBackupStream_Postgres_QuietSourceTimeBoundRollover(t *testing.T) {
 	}
 	defer dropPGLogicalSlot(t, sourceDSN, "sluice_slot")
 
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: pgEng, SourceDSN: sourceDSN, Store: store, SluiceVersion: "test",
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
@@ -515,7 +516,7 @@ func TestBackupStream_Postgres_SignalDrainExitsClean(t *testing.T) {
 	}
 	defer dropPGLogicalSlot(t, sourceDSN, "sluice_slot")
 
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: pgEng, SourceDSN: sourceDSN, Store: store, SluiceVersion: "test",
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)

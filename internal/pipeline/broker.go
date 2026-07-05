@@ -69,6 +69,7 @@ import (
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
@@ -659,7 +660,7 @@ func (b *SyncFromBackup) coldStartReset(ctx context.Context, applier ir.ChangeAp
 		}
 	}
 
-	rest := &ChainRestore{
+	rest := &backup.ChainRestore{
 		Target:           b.Target,
 		TargetDSN:        b.TargetDSN,
 		Store:            b.Store,
@@ -844,7 +845,7 @@ func (b *SyncFromBackup) replayNewIncrementals(
 
 	batchSize := b.ApplyBatchSize
 	if batchSize <= 0 {
-		batchSize = DefaultChainRestoreBatchSize
+		batchSize = backup.DefaultChainRestoreBatchSize
 	}
 
 	for i := startIdx; i < len(chain); i++ {

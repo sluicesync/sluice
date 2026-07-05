@@ -32,6 +32,7 @@ import (
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/engines"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
@@ -50,13 +51,13 @@ func observeBackupChunkDispatch(t *testing.T) (ranges func(table string) int, re
 		r  = map[string]int{}
 		w  = map[string]string{}
 	)
-	backupChunkDispatchObserver = func(table string, n int, why string) {
+	backup.BackupChunkDispatchObserver = func(table string, n int, why string) {
 		mu.Lock()
 		defer mu.Unlock()
 		r[table] = n
 		w[table] = why
 	}
-	t.Cleanup(func() { backupChunkDispatchObserver = nil })
+	t.Cleanup(func() { backup.BackupChunkDispatchObserver = nil })
 	ranges = func(table string) int {
 		mu.Lock()
 		defer mu.Unlock()
@@ -143,7 +144,7 @@ func TestBackupChunked_PG_IntPKRoundTrip(t *testing.T) {
 	}
 
 	ranges, reason := observeBackupChunkDispatch(t)
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:              pgEng,
 		SourceDSN:           sourceDSN,
 		Store:               store,
@@ -198,7 +199,7 @@ func TestBackupChunked_PG_IntPKRoundTrip(t *testing.T) {
 		}
 	}
 
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target:    pgEng,
 		TargetDSN: targetDSN,
 		Store:     store,
@@ -248,7 +249,7 @@ func TestBackupChunked_PG_KeysetPKFamilies(t *testing.T) {
 	}
 
 	ranges, reason := observeBackupChunkDispatch(t)
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:              pgEng,
 		SourceDSN:           sourceDSN,
 		Store:               store,
@@ -265,7 +266,7 @@ func TestBackupChunked_PG_KeysetPKFamilies(t *testing.T) {
 		}
 	}
 
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target:    pgEng,
 		TargetDSN: targetDSN,
 		Store:     store,
@@ -315,7 +316,7 @@ func TestBackupChunked_PG_EncryptedPerChunkCEK(t *testing.T) {
 	}
 
 	ranges, reason := observeBackupChunkDispatch(t)
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:              pgEng,
 		SourceDSN:           sourceDSN,
 		Store:               store,
@@ -343,7 +344,7 @@ func TestBackupChunked_PG_EncryptedPerChunkCEK(t *testing.T) {
 	}
 
 	envRestore := envelopeFromManifest(t, store, passphrase)
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target:    pgEng,
 		TargetDSN: targetDSN,
 		Store:     store,
@@ -384,7 +385,7 @@ func TestBackupChunked_PG_CancelRestreamsPartialTable(t *testing.T) {
 	runCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store := &cancelAfterChunkPutsStore{LocalStore: inner, n: 4, cancel: cancel}
-	err = (&Backup{
+	err = (&backup.Backup{
 		Source:              pgEng,
 		SourceDSN:           sourceDSN,
 		Store:               store,
@@ -412,7 +413,7 @@ func TestBackupChunked_PG_CancelRestreamsPartialTable(t *testing.T) {
 	// Resume: plain re-run (chunking active again) must re-stream the
 	// partial table from scratch and complete.
 	ranges, reason := observeBackupChunkDispatch(t)
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:              pgEng,
 		SourceDSN:           sourceDSN,
 		Store:               inner,
@@ -448,7 +449,7 @@ func TestBackupChunked_PG_CancelRestreamsPartialTable(t *testing.T) {
 		}
 	}
 
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target:    pgEng,
 		TargetDSN: targetDSN,
 		Store:     inner,

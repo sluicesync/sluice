@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
@@ -122,10 +123,10 @@ func TestADR0064_SmartCompaction_CollapsesUpdateChain_PG(t *testing.T) {
 	// here would be an ADR-0067 regression (the genuine-gap refusal is
 	// unit-covered for pre-0067 / corrupted lineages).
 	startCompact := time.Now()
-	res, err := CompactChain(context.Background(), store, CompactOpts{
+	res, err := backup.CompactChain(context.Background(), store, backup.CompactOpts{
 		MergeWindow:     time.Hour,
 		SmartCompaction: true,
-		PKStrategy:      PKStrategyPK,
+		PKStrategy:      backup.PKStrategyPK,
 	})
 	compactWall := time.Since(startCompact)
 
@@ -167,7 +168,7 @@ func TestADR0064_SmartCompaction_CollapsesUpdateChain_PG(t *testing.T) {
 		t.Fatal("post-compact catalog has no segments")
 	}
 	if cat.Segments[len(cat.Segments)-1].CapReason != "" &&
-		cat.Segments[len(cat.Segments)-1].CapReason != compactedCapReason &&
+		cat.Segments[len(cat.Segments)-1].CapReason != backup.CompactedCapReason &&
 		cat.Segments[len(cat.Segments)-1].CapReason != rotationReasonAge &&
 		cat.Segments[len(cat.Segments)-1].CapReason != rotationReasonChainLength {
 		t.Errorf("unexpected CapReason on last segment: %q", cat.Segments[len(cat.Segments)-1].CapReason)

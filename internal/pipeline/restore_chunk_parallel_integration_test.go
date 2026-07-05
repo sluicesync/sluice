@@ -30,6 +30,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
@@ -77,7 +78,7 @@ func TestRestoreChunkParallel_PG_ByteIdenticalToSerial(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: pgEng, SourceDSN: sourceDSN, Store: store,
 		ChunkRows: 25, // 200 rows → 8 chunks
 	}).Run(context.Background()); err != nil {
@@ -85,7 +86,7 @@ func TestRestoreChunkParallel_PG_ByteIdenticalToSerial(t *testing.T) {
 	}
 
 	// Serial restore (ChunkParallelism=1) into target_db.
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target: pgEng, TargetDSN: serialDSN, Store: store,
 		TableParallelism: 1, ChunkParallelism: 1,
 	}).Run(context.Background()); err != nil {
@@ -94,7 +95,7 @@ func TestRestoreChunkParallel_PG_ByteIdenticalToSerial(t *testing.T) {
 
 	// Parallel within-table restore (ChunkParallelism=4) into target_parallel.
 	gotChunkP, gotReason := observeRestoreChunkDispatch(t)
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target: pgEng, TargetDSN: parallelDSN, Store: store,
 		TableParallelism: 1, ChunkParallelism: 4,
 	}).Run(context.Background()); err != nil {
@@ -133,14 +134,14 @@ func TestRestoreChunkParallel_PG_SingleChunkStaysSerial(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: pgEng, SourceDSN: sourceDSN, Store: store,
 		ChunkRows: 100, // 5 rows → 1 chunk
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
 
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target: pgEng, TargetDSN: targetDSN, Store: store,
 		TableParallelism: 1, ChunkParallelism: 4,
 	}).Run(context.Background()); err != nil {
@@ -184,14 +185,14 @@ func TestRestoreChunkParallel_MySQL_ByteIdenticalToSerial(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: mysqlEng, SourceDSN: sourceDSN, Store: store,
 		ChunkRows: 25, // 200 rows → 8 chunks
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
 
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target: mysqlEng, TargetDSN: serialDSN, Store: store,
 		TableParallelism: 1, ChunkParallelism: 1,
 	}).Run(context.Background()); err != nil {
@@ -199,7 +200,7 @@ func TestRestoreChunkParallel_MySQL_ByteIdenticalToSerial(t *testing.T) {
 	}
 
 	gotChunkP, gotReason := observeRestoreChunkDispatch(t)
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target: mysqlEng, TargetDSN: parallelDSN, Store: store,
 		TableParallelism: 1, ChunkParallelism: 4,
 	}).Run(context.Background()); err != nil {

@@ -12,6 +12,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
@@ -23,7 +24,7 @@ func TestPruneLineage_KeepIncrementalsDropsOldest(t *testing.T) {
 	store := newMemStore()
 	seedLineageChain(t, store, 5)
 
-	res, err := PruneChain(context.Background(), store, PruneOpts{KeepIncrementals: 2})
+	res, err := backup.PruneChain(context.Background(), store, backup.PruneOpts{KeepIncrementals: 2})
 	if err != nil {
 		t.Fatalf("PruneChain: %v", err)
 	}
@@ -46,7 +47,7 @@ func TestPruneLineage_KeepDuration(t *testing.T) {
 	base := seedLineageChain(t, store, 5)
 	now := func() time.Time { return base.Add(5*time.Hour + time.Minute) }
 
-	res, err := PruneChain(context.Background(), store, PruneOpts{KeepDuration: 2 * time.Hour, Now: now})
+	res, err := backup.PruneChain(context.Background(), store, backup.PruneOpts{KeepDuration: 2 * time.Hour, Now: now})
 	if err != nil {
 		t.Fatalf("PruneChain: %v", err)
 	}
@@ -61,7 +62,7 @@ func TestPruneLineage_KeepDuration(t *testing.T) {
 func TestPruneLineage_KeepAllNoOp(t *testing.T) {
 	store := newMemStore()
 	seedLineageChain(t, store, 3)
-	res, err := PruneChain(context.Background(), store, PruneOpts{KeepIncrementals: 10})
+	res, err := backup.PruneChain(context.Background(), store, backup.PruneOpts{KeepIncrementals: 10})
 	if err != nil {
 		t.Fatalf("PruneChain: %v", err)
 	}
@@ -79,7 +80,7 @@ func TestPruneLineage_KeepAllNoOp(t *testing.T) {
 func TestPruneLineage_DryRunNoSideEffects(t *testing.T) {
 	store := newMemStore()
 	seedLineageChain(t, store, 4)
-	res, err := PruneChain(context.Background(), store, PruneOpts{KeepIncrementals: 1, DryRun: true})
+	res, err := backup.PruneChain(context.Background(), store, backup.PruneOpts{KeepIncrementals: 1, DryRun: true})
 	if err != nil {
 		t.Fatalf("PruneChain dry-run: %v", err)
 	}
@@ -95,7 +96,7 @@ func TestPruneLineage_DryRunNoSideEffects(t *testing.T) {
 func TestPruneLineage_RefusesBothFlags(t *testing.T) {
 	store := newMemStore()
 	seedLineageChain(t, store, 2)
-	_, err := PruneChain(context.Background(), store, PruneOpts{KeepIncrementals: 1, KeepDuration: time.Hour})
+	_, err := backup.PruneChain(context.Background(), store, backup.PruneOpts{KeepIncrementals: 1, KeepDuration: time.Hour})
 	if err == nil || !strings.Contains(err.Error(), "exactly one") {
 		t.Errorf("err = %v; want mutual-exclusion", err)
 	}
@@ -104,7 +105,7 @@ func TestPruneLineage_RefusesBothFlags(t *testing.T) {
 func TestPruneLineage_RefusesNeitherFlag(t *testing.T) {
 	store := newMemStore()
 	seedLineageChain(t, store, 2)
-	_, err := PruneChain(context.Background(), store, PruneOpts{})
+	_, err := backup.PruneChain(context.Background(), store, backup.PruneOpts{})
 	if err == nil || !strings.Contains(err.Error(), "exactly one") {
 		t.Errorf("err = %v; want at-least-one", err)
 	}
@@ -116,7 +117,7 @@ func TestPruneLineage_RefusesWhenCatalogAbsent(t *testing.T) {
 		FormatVersion: irbackup.BackupFormatVersion, SourceEngine: "postgres",
 		BackupID: "full000", Kind: irbackup.BackupKindFull, CreatedAt: time.Now().UTC(),
 	})
-	_, err := PruneChain(context.Background(), store, PruneOpts{KeepIncrementals: 1})
+	_, err := backup.PruneChain(context.Background(), store, backup.PruneOpts{KeepIncrementals: 1})
 	if err == nil || !strings.Contains(err.Error(), "lineage.json not found") {
 		t.Errorf("err = %v; want lineage.json-not-found refusal", err)
 	}
@@ -162,7 +163,7 @@ func TestPruneLineage_MultiSegmentDropsLeadingWholeSegment(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := PruneChain(context.Background(), store, PruneOpts{KeepIncrementals: 2})
+	res, err := backup.PruneChain(context.Background(), store, backup.PruneOpts{KeepIncrementals: 2})
 	if err != nil {
 		t.Fatalf("PruneChain: %v", err)
 	}
@@ -260,7 +261,7 @@ func TestSchemaHistoryRetentionFloor_PicksOlder_LiveOlder(t *testing.T) {
 	live := ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"0/050"}`}
 	// Use a stub orderer that treats string-compare as the order (matches
 	// the seeded lineage's tokens). 0/050 < 0/100, so live is older.
-	floor, ok, err := SchemaHistoryRetentionFloor(context.Background(), store, live, stubOrderer{})
+	floor, ok, err := backup.SchemaHistoryRetentionFloor(context.Background(), store, live, stubOrderer{})
 	if err != nil || !ok {
 		t.Fatalf("expected ok floor; got ok=%v err=%v", ok, err)
 	}
@@ -277,7 +278,7 @@ func TestSchemaHistoryRetentionFloor_PicksOlder_BackupOlder(t *testing.T) {
 	seedLineageChain(t, store, 2) // backup oldest token = `{"slot":"s","lsn":"0/100"}`
 
 	live := ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"0/999"}`}
-	floor, ok, err := SchemaHistoryRetentionFloor(context.Background(), store, live, stubOrderer{})
+	floor, ok, err := backup.SchemaHistoryRetentionFloor(context.Background(), store, live, stubOrderer{})
 	if err != nil || !ok {
 		t.Fatalf("expected ok floor; got ok=%v err=%v", ok, err)
 	}
@@ -292,7 +293,7 @@ func TestSchemaHistoryRetentionFloor_PicksOlder_BackupOlder(t *testing.T) {
 func TestSchemaHistoryRetentionFloor_NoBackup_NoLive(t *testing.T) {
 	store := newMemStore()
 	// No lineage seeded.
-	floor, ok, err := SchemaHistoryRetentionFloor(context.Background(), store, ir.Position{}, stubOrderer{})
+	floor, ok, err := backup.SchemaHistoryRetentionFloor(context.Background(), store, ir.Position{}, stubOrderer{})
 	if err != nil {
 		t.Fatalf("err = %v", err)
 	}
@@ -318,7 +319,7 @@ func TestSchemaHistoryRetentionFloor_Incomparable(t *testing.T) {
 	lineage.UpdateLineageForManifestBestEffort(context.Background(), store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
 
 	live := ir.Position{Engine: "postgres", Token: "incomparable:B"}
-	_, _, err := SchemaHistoryRetentionFloor(context.Background(), store, live, stubOrderer{})
+	_, _, err := backup.SchemaHistoryRetentionFloor(context.Background(), store, live, stubOrderer{})
 	if err == nil {
 		t.Fatal("incomparable positions must refuse LOUDLY; got nil err")
 	}

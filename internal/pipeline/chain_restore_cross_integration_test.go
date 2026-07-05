@@ -31,6 +31,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
@@ -77,7 +78,7 @@ func TestChainRestore_PostgresToMySQL_CrossEngine(t *testing.T) {
 	defer dropPGLogicalSlot(t, pgSourceDSN, "sluice_slot")
 
 	// 1. Full backup.
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: pgEng, SourceDSN: pgSourceDSN, Store: store, SluiceVersion: "test",
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
@@ -124,7 +125,7 @@ func TestChainRestore_PostgresToMySQL_CrossEngine(t *testing.T) {
 	}
 
 	// 4. Cross-engine chain restore into MySQL.
-	if err := (&ChainRestore{
+	if err := (&backup.ChainRestore{
 		Target: mysqlEng, TargetDSN: mysqlTargetDSN, Store: store,
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("ChainRestore.Run (PG → MySQL): %v", err)
@@ -177,7 +178,7 @@ func TestChainRestore_MySQLToPostgres_CrossEngine(t *testing.T) {
 	store, _ := blobcodec.NewLocalStore(dir)
 
 	// 1. Full backup.
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: mysqlEng, SourceDSN: mysqlSourceDSN, Store: store, SluiceVersion: "test",
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
@@ -228,7 +229,7 @@ func TestChainRestore_MySQLToPostgres_CrossEngine(t *testing.T) {
 	}
 
 	// 4. Cross-engine chain restore into PG.
-	if err := (&ChainRestore{
+	if err := (&backup.ChainRestore{
 		Target: pgEng, TargetDSN: pgTargetDSN, Store: store,
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("ChainRestore.Run (MySQL → PG): %v", err)
@@ -285,7 +286,7 @@ func TestSyncFromBackup_CrossEngine_SchemaEvolution(t *testing.T) {
 	defer dropPGLogicalSlot(t, pgSourceDSN, "sluice_slot")
 
 	// 1. Full backup.
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: pgEng, SourceDSN: pgSourceDSN, Store: store, SluiceVersion: "test",
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
@@ -305,7 +306,7 @@ func TestSyncFromBackup_CrossEngine_SchemaEvolution(t *testing.T) {
 	//    the base shape; then run the broker against the chain. This
 	//    is the warm-resume sub-shape: target carries the full's data,
 	//    broker picks up incrementals from there.
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target: mysqlEng, TargetDSN: mysqlTargetDSN, Store: store,
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("seed Restore (full only): %v", err)

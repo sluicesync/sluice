@@ -14,6 +14,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
@@ -462,7 +463,7 @@ func TestChainRestore_FullPlusOneIncremental_RoundTrip(t *testing.T) {
 	src := newBackupRecorderEngine("postgres", schema, map[string][]ir.Row{
 		"users": {{"id": int64(1)}, {"id": int64(2)}},
 	})
-	if err := (&Backup{Source: src, SourceDSN: "src", Store: store}).Run(context.Background()); err != nil {
+	if err := (&backup.Backup{Source: src, SourceDSN: "src", Store: store}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
 	// Patch the full's manifest with an EndPosition + BackupID so the
@@ -511,7 +512,7 @@ func TestChainRestore_FullPlusOneIncremental_RoundTrip(t *testing.T) {
 	tgt := &chainRestoreRecorderEngine{
 		restoreRecorderEngine: newRestoreRecorderEngine("postgres"),
 	}
-	chain := &ChainRestore{
+	chain := &backup.ChainRestore{
 		Target:    tgt,
 		TargetDSN: "tgt",
 		Store:     store,
@@ -639,7 +640,7 @@ func TestChainRestore_SchemaHistoryReplayed(t *testing.T) {
 	tgt := &chainRestoreRecorderEngine{
 		restoreRecorderEngine: newRestoreRecorderEngine("postgres"),
 	}
-	chain := &ChainRestore{
+	chain := &backup.ChainRestore{
 		Target:    tgt,
 		TargetDSN: "tgt",
 		Store:     store,
@@ -725,7 +726,7 @@ func TestChainRestore_SchemaHistoryOnlyManifestReplayed(t *testing.T) {
 	tgt := &chainRestoreRecorderEngine{
 		restoreRecorderEngine: newRestoreRecorderEngine("postgres"),
 	}
-	chain := &ChainRestore{
+	chain := &backup.ChainRestore{
 		Target:    tgt,
 		TargetDSN: "tgt",
 		Store:     store,
@@ -780,7 +781,7 @@ func TestChainRestore_SchemaHistoryDecodeFailureIsLoud(t *testing.T) {
 	tgt := &chainRestoreRecorderEngine{
 		restoreRecorderEngine: newRestoreRecorderEngine("postgres"),
 	}
-	chain := &ChainRestore{
+	chain := &backup.ChainRestore{
 		Target:    tgt,
 		TargetDSN: "tgt",
 		Store:     store,
@@ -843,7 +844,7 @@ func TestChainRestore_PreChunkDManifest_BackwardCompat(t *testing.T) {
 	tgt := &chainRestoreRecorderEngine{
 		restoreRecorderEngine: newRestoreRecorderEngine("postgres"),
 	}
-	chain := &ChainRestore{
+	chain := &backup.ChainRestore{
 		Target:    tgt,
 		TargetDSN: "tgt",
 		Store:     store,
@@ -895,7 +896,7 @@ func TestChainRestore_CrossEngineWithIncrementalsSucceeds(t *testing.T) {
 	tgt := &chainRestoreRecorderEngine{
 		restoreRecorderEngine: newRestoreRecorderEngine("mysql"),
 	}
-	chain := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: store}
+	chain := &backup.ChainRestore{Target: tgt, TargetDSN: "tgt", Store: store}
 	if err := chain.Run(context.Background()); err != nil {
 		t.Fatalf("chain restore: %v", err)
 	}
@@ -930,7 +931,7 @@ func TestChainRestore_DispatchFromRestore_Run(t *testing.T) {
 		Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
 	}}}
 	src := newBackupRecorderEngine("postgres", schema, map[string][]ir.Row{"users": {{"id": int64(1)}}})
-	_ = (&Backup{Source: src, SourceDSN: "src", Store: store}).Run(context.Background())
+	_ = (&backup.Backup{Source: src, SourceDSN: "src", Store: store}).Run(context.Background())
 
 	// Patch the full with an EndPosition.
 	full, _ := lineage.ReadManifest(context.Background(), store)
@@ -957,7 +958,7 @@ func TestChainRestore_DispatchFromRestore_Run(t *testing.T) {
 	tgt := &chainRestoreRecorderEngine{
 		restoreRecorderEngine: newRestoreRecorderEngine("postgres"),
 	}
-	r := &Restore{Target: tgt, TargetDSN: "tgt", Store: store}
+	r := &backup.Restore{Target: tgt, TargetDSN: "tgt", Store: store}
 	if err := r.Run(context.Background()); err != nil {
 		t.Fatalf("Restore.Run: %v", err)
 	}
@@ -1051,7 +1052,7 @@ func TestChainRestore_MultiChunkReplay_PrefetchPreservesOrder(t *testing.T) {
 	tgt := &chainRestoreRecorderEngine{
 		restoreRecorderEngine: newRestoreRecorderEngine("postgres"),
 	}
-	chain := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: store}
+	chain := &backup.ChainRestore{Target: tgt, TargetDSN: "tgt", Store: store}
 	if err := chain.Run(context.Background()); err != nil {
 		t.Fatalf("ChainRestore.Run: %v", err)
 	}
@@ -1097,7 +1098,7 @@ func TestChainRestore_CorruptChangeChunk_FailsLoud(t *testing.T) {
 	tgt := &chainRestoreRecorderEngine{
 		restoreRecorderEngine: newRestoreRecorderEngine("postgres"),
 	}
-	chain := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: store}
+	chain := &backup.ChainRestore{Target: tgt, TargetDSN: "tgt", Store: store}
 	err := chain.Run(context.Background())
 	if err == nil {
 		t.Fatal("ChainRestore.Run succeeded on a corrupt change chunk; want a loud hash-mismatch failure")
@@ -1127,7 +1128,7 @@ func TestChainRestore_IdentitySequencesSyncedAtTail_Dispatch(t *testing.T) {
 	tgt := &chainRestoreRecorderEngine{
 		restoreRecorderEngine: newRestoreRecorderEngine("postgres"),
 	}
-	chain := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: store}
+	chain := &backup.ChainRestore{Target: tgt, TargetDSN: "tgt", Store: store}
 	if err := chain.Run(context.Background()); err != nil {
 		t.Fatalf("ChainRestore.Run: %v", err)
 	}

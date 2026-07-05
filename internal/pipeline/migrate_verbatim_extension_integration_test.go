@@ -37,6 +37,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
@@ -311,7 +312,7 @@ func TestBackupRestore_PG_Verbatim_Ltree_MarkerAndExactRestore(t *testing.T) {
 	defer cancel()
 
 	// 1. Full backup (source is PG → verbatim CAPTURE enabled).
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: pgEng, SourceDSN: srcDSN, Store: store, SluiceVersion: "test",
 	}).Run(ctx); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
@@ -333,7 +334,7 @@ func TestBackupRestore_PG_Verbatim_Ltree_MarkerAndExactRestore(t *testing.T) {
 	// 3. Restore to MySQL → LOUD refusal at preflight (the safety pin).
 	_, mysqlTargetDSN, myCleanup := startMySQL(t)
 	defer myCleanup()
-	err = (&Restore{
+	err = (&backup.Restore{
 		Target: mysqlEng, TargetDSN: mysqlTargetDSN, Store: store,
 	}).Run(ctx)
 	if err == nil {
@@ -345,7 +346,7 @@ func TestBackupRestore_PG_Verbatim_Ltree_MarkerAndExactRestore(t *testing.T) {
 	}
 
 	// 4. Restore to PG → exact reproduction.
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target: pgEng, TargetDSN: restoreDSN, Store: store,
 	}).Run(ctx); err != nil {
 		t.Fatalf("PG Restore.Run: %v", err)

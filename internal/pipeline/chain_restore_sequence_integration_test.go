@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
@@ -81,7 +82,7 @@ func TestBackup_ChainRestore_StandaloneSequenceReprimedAtTail(t *testing.T) {
 	}
 	defer dropPGLogicalSlot(t, sourceDSN, "sluice_slot")
 
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:        pgEng,
 		SourceDSN:     sourceDSN,
 		Store:         store,
@@ -117,7 +118,7 @@ func TestBackup_ChainRestore_StandaloneSequenceReprimedAtTail(t *testing.T) {
 		t.Fatalf("IncrementalBackup.Run: %v", err)
 	}
 
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target:    pgEng,
 		TargetDSN: targetDSN,
 		Store:     store,
@@ -203,7 +204,7 @@ func TestBackup_ChainRestore_IdentitySequenceSyncedAtTail(t *testing.T) {
 	}
 	defer dropPGLogicalSlot(t, sourceDSN, "sluice_slot")
 
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:        pgEng,
 		SourceDSN:     sourceDSN,
 		Store:         store,
@@ -239,7 +240,7 @@ func TestBackup_ChainRestore_IdentitySequenceSyncedAtTail(t *testing.T) {
 		t.Fatalf("IncrementalBackup.Run: %v", err)
 	}
 
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target:    pgEng,
 		TargetDSN: targetDSN,
 		Store:     store,

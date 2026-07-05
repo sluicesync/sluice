@@ -34,6 +34,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
@@ -88,7 +89,7 @@ var (
 //	3: second table chunk 0  ← injected failure
 func crashAfterFirstTable(t *testing.T, store *blobcodec.LocalStore, src *snapshotOpeningEngine, chainSlot bool) {
 	t.Helper()
-	b := &Backup{
+	b := &backup.Backup{
 		Source: src, SourceDSN: "src", Store: newFailOnNthPutStore(store, 3),
 		ChunkRows: 100, ChainSlot: chainSlot,
 	}
@@ -153,7 +154,7 @@ func TestBackup_ResumeAdoptsPriorAnchor(t *testing.T) {
 
 	// Resume with a LATER snapshot anchor — the pre-fix bug recorded
 	// this one, gapping kept tables' writes in (A1, A2].
-	b2 := &Backup{
+	b2 := &backup.Backup{
 		Source:    newAnchorTestEngine(schema, rows, anchorPosA2),
 		SourceDSN: "src", Store: store, ChunkRows: 100,
 	}
@@ -245,7 +246,7 @@ func TestBackup_ResumeWithoutPriorAnchorRestreamsEverything(t *testing.T) {
 	counting := &countingRowReader{inner: &fakeRowReader{rows: rows}}
 	src2.useSnapshotRows = true
 	src2.snapshotRowsHook = func() ir.RowReader { return counting }
-	b2 := &Backup{Source: src2, SourceDSN: "src", Store: store, ChunkRows: 100}
+	b2 := &backup.Backup{Source: src2, SourceDSN: "src", Store: store, ChunkRows: 100}
 	if err := b2.Run(context.Background()); err != nil {
 		t.Fatalf("resume Run: %v", err)
 	}
@@ -286,7 +287,7 @@ func TestBackup_AnchoredResumeRefusesKeylessRestream(t *testing.T) {
 		}
 		crashAfterFirstTable(t, store, newAnchorTestEngine(schema, rows, anchorPosA1), false)
 
-		b2 := &Backup{
+		b2 := &backup.Backup{
 			Source:    newAnchorTestEngine(schema, rows, anchorPosA2),
 			SourceDSN: "src", Store: store, ChunkRows: 100,
 		}
@@ -314,7 +315,7 @@ func TestBackup_AnchoredResumeRefusesKeylessRestream(t *testing.T) {
 		}
 		crashAfterFirstTable(t, store, newAnchorTestEngine(schema, rows, anchorPosA1), false)
 
-		b2 := &Backup{
+		b2 := &backup.Backup{
 			Source:    newAnchorTestEngine(schema, rows, anchorPosA2),
 			SourceDSN: "src", Store: store, ChunkRows: 100,
 		}
@@ -351,7 +352,7 @@ func TestBackup_AnchoredResumeRefusesSchemaDrift(t *testing.T) {
 	drifted := &ir.Schema{Tables: []*ir.Table{keyedTable("users"), keyedTable("posts")}}
 	drifted.Tables[0].Columns = append(drifted.Tables[0].Columns, &ir.Column{Name: "added", Type: ir.Varchar{Length: 10}, Nullable: true})
 
-	b2 := &Backup{
+	b2 := &backup.Backup{
 		Source:    newAnchorTestEngine(drifted, rows, anchorPosA2),
 		SourceDSN: "src", Store: store, ChunkRows: 100,
 	}
@@ -386,7 +387,7 @@ func TestBackup_ForceOverwriteDiscardsInProgressPrior(t *testing.T) {
 	counting := &countingRowReader{inner: &fakeRowReader{rows: rows}}
 	src2.useSnapshotRows = true
 	src2.snapshotRowsHook = func() ir.RowReader { return counting }
-	b2 := &Backup{
+	b2 := &backup.Backup{
 		Source: src2, SourceDSN: "src", Store: store,
 		ChunkRows: 100, ForceOverwrite: true,
 	}
@@ -449,7 +450,7 @@ func TestBackup_ChainSlotResumeAdoptsSlot(t *testing.T) {
 	}
 
 	src2 := &chainResumeBackupEngine{snapshotOpeningEngine: newAnchorTestEngine(schema, rows, anchorPosA2)}
-	b2 := &Backup{
+	b2 := &backup.Backup{
 		Source:    src2,
 		SourceDSN: "src", Store: store, ChunkRows: 100, ChainSlot: true,
 	}
@@ -497,7 +498,7 @@ func TestBackup_ChainSlotResumePreflightRefusalStopsRun(t *testing.T) {
 		snapshotOpeningEngine: newAnchorTestEngine(schema, rows, anchorPosA2),
 		preflightErr:          errors.New(`slot "sluice_slot" does not exist on the source`),
 	}
-	b2 := &Backup{
+	b2 := &backup.Backup{
 		Source:    src2,
 		SourceDSN: "src", Store: store, ChunkRows: 100, ChainSlot: true,
 	}

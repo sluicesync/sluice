@@ -18,6 +18,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
@@ -80,7 +81,7 @@ func TestBackup_FreshRunDoesNotSweepAnchors(t *testing.T) {
 	schema, rows := anchorSweepFixture()
 	src := &sweepingBackupEngine{backupRecorderEngine: newBackupRecorderEngine("postgres", schema, rows)}
 
-	b := &Backup{Source: src, SourceDSN: "src-dsn", Store: store}
+	b := &backup.Backup{Source: src, SourceDSN: "src-dsn", Store: store}
 	if err := b.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -102,7 +103,7 @@ func TestBackup_ResumeSweepsAnchorsOnce(t *testing.T) {
 	writeInProgressManifest(t, store, schema)
 
 	src := &sweepingBackupEngine{backupRecorderEngine: newBackupRecorderEngine("postgres", schema, rows)}
-	b := &Backup{Source: src, SourceDSN: "src-dsn", Store: store}
+	b := &backup.Backup{Source: src, SourceDSN: "src-dsn", Store: store}
 	if err := b.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -131,7 +132,7 @@ func TestBackup_ResumeSweepFailureDoesNotFailRun(t *testing.T) {
 		backupRecorderEngine: newBackupRecorderEngine("postgres", schema, rows),
 		sweepErr:             errors.New("synthetic sweep failure"),
 	}
-	b := &Backup{Source: src, SourceDSN: "src-dsn", Store: store}
+	b := &backup.Backup{Source: src, SourceDSN: "src-dsn", Store: store}
 	if err := b.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v (sweep failures must not fail the resume)", err)
 	}

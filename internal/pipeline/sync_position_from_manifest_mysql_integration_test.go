@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
@@ -50,7 +51,7 @@ func TestBackup_RecordsEndPosition_MySQLIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: mysqlEng, SourceDSN: sourceDSN, Store: store,
 		SluiceVersion: "v0.17.2-test",
 	}).Run(context.Background()); err != nil {
@@ -98,7 +99,7 @@ func TestStreamer_SyncStart_PositionFromManifest_MySQL_HappyPath(t *testing.T) {
 	store, _ := blobcodec.NewLocalStore(dir)
 
 	// 1. Full backup — Phase 3.3.A records EndPosition automatically.
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: mysqlEng, SourceDSN: sourceDSN, Store: store,
 		SluiceVersion: "v0.17.2-test",
 	}).Run(context.Background()); err != nil {
@@ -106,7 +107,7 @@ func TestStreamer_SyncStart_PositionFromManifest_MySQL_HappyPath(t *testing.T) {
 	}
 
 	// 2. Restore into target.
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target: mysqlEng, TargetDSN: targetDSN, Store: store,
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Restore.Run: %v", err)

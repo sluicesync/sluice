@@ -63,6 +63,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
@@ -290,7 +291,7 @@ func (b *BackupStream) performRotation(ctx context.Context, in rotateInputs) (ro
 	if err := writeRotationState(ctx, b.Store, st); err != nil {
 		return zero, abortStayOpen("write rotation_state (bulkcopy)", err)
 	}
-	full := &Backup{
+	full := &backup.Backup{
 		Source:        b.Source,
 		SourceDSN:     b.SourceDSN,
 		Store:         segStore,

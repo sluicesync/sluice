@@ -37,6 +37,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
@@ -140,7 +141,7 @@ func TestBackup_SnapshotAnchoredEndPosition_PostgresGapClosed(t *testing.T) {
 		}
 	}()
 
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:        pgEng,
 		SourceDSN:     sourceDSN,
 		Store:         store,
@@ -188,7 +189,7 @@ func TestBackup_SnapshotAnchoredEndPosition_PostgresGapClosed(t *testing.T) {
 
 	// 3. Verify the chain integrity (every chunk's SHA-256 still
 	//    matches its recorded value).
-	total, mismatches, err := VerifyBackup(context.Background(), store)
+	total, mismatches, err := backup.VerifyBackup(context.Background(), store)
 	if err != nil {
 		t.Fatalf("VerifyBackup: %v", err)
 	}
@@ -197,7 +198,7 @@ func TestBackup_SnapshotAnchoredEndPosition_PostgresGapClosed(t *testing.T) {
 	}
 
 	// 4. Chain restore.
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target:    pgEng,
 		TargetDSN: targetDSN,
 		Store:     store,

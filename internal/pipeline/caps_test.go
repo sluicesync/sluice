@@ -39,17 +39,3 @@ var (
 		DDLDialect: ir.DDLDialectMySQL,
 	}
 )
-
-// capsEngine is a minimal [ir.Engine] stub declaring an explicit
-// (name, Capabilities) pair for gates that consume a full engine
-// handle. The embedded stubEngine panics on every Open* call, so a
-// gate that reaches past Name()/Capabilities() fails the test loudly.
-type capsEngine struct {
-	stubEngine
-
-	name string
-	caps ir.Capabilities
-}
-
-func (e capsEngine) Name() string                  { return e.name }
-func (e capsEngine) Capabilities() ir.Capabilities { return e.caps }

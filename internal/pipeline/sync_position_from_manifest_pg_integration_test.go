@@ -32,6 +32,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
@@ -70,7 +71,7 @@ func TestBackup_RecordsEndPosition_PostgresIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: pgEng, SourceDSN: sourceDSN, Store: store,
 		SluiceVersion: "v0.17.2-test",
 		SlotName:      "sluice_slot",
@@ -131,7 +132,7 @@ func TestStreamer_SyncStart_PositionFromManifest_PG_SlotExists(t *testing.T) {
 	defer dropPGLogicalSlot(t, sourceDSN, "sluice_slot")
 
 	// Take the full — Phase 3.3.A records EndPosition automatically.
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: pgEng, SourceDSN: sourceDSN, Store: store,
 		SluiceVersion: "v0.17.2-test",
 		SlotName:      "sluice_slot",
@@ -143,7 +144,7 @@ func TestStreamer_SyncStart_PositionFromManifest_PG_SlotExists(t *testing.T) {
 	// just the full). After restore, target has alice but the
 	// sluice_cdc_state row is absent — that's the surface
 	// --position-from-manifest is designed for.
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target: pgEng, TargetDSN: targetDSN, Store: store,
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Restore.Run: %v", err)
@@ -219,13 +220,13 @@ func TestStreamer_SyncStart_PositionFromManifest_PG_SlotMissing_Refuses(t *testi
 		t.Fatalf("create slot: %v", err)
 	}
 
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: pgEng, SourceDSN: sourceDSN, Store: store,
 		SluiceVersion: "v0.17.2-test", SlotName: "sluice_slot",
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
-	if err := (&Restore{Target: pgEng, TargetDSN: targetDSN, Store: store}).Run(context.Background()); err != nil {
+	if err := (&backup.Restore{Target: pgEng, TargetDSN: targetDSN, Store: store}).Run(context.Background()); err != nil {
 		t.Fatalf("Restore.Run: %v", err)
 	}
 
@@ -283,13 +284,13 @@ func TestStreamer_SyncStart_PositionFromManifest_PG_StrictPreflight_LowWalKeep(t
 	}
 	defer dropPGLogicalSlot(t, sourceDSN, "sluice_slot")
 
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: pgEng, SourceDSN: sourceDSN, Store: store,
 		SluiceVersion: "v0.17.2-test", SlotName: "sluice_slot",
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
-	if err := (&Restore{Target: pgEng, TargetDSN: targetDSN, Store: store}).Run(context.Background()); err != nil {
+	if err := (&backup.Restore{Target: pgEng, TargetDSN: targetDSN, Store: store}).Run(context.Background()); err != nil {
 		t.Fatalf("Restore.Run: %v", err)
 	}
 

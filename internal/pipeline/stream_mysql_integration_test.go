@@ -18,6 +18,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
@@ -55,7 +56,7 @@ func TestBackupStream_MySQL_RolloverByMaxChanges(t *testing.T) {
 	}
 
 	// Full backup.
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: mysqlEng, SourceDSN: sourceDSN, Store: store, SluiceVersion: "test",
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
@@ -151,7 +152,7 @@ func TestBackupStream_MySQL_RolloverByMaxChanges(t *testing.T) {
 		t.Fatalf("incremental rollovers = %d; want >= 2", len(incrementals))
 	}
 
-	total, mismatches, err := VerifyBackup(context.Background(), store)
+	total, mismatches, err := backup.VerifyBackup(context.Background(), store)
 	if err != nil {
 		t.Fatalf("VerifyBackup: %v", err)
 	}
@@ -160,7 +161,7 @@ func TestBackupStream_MySQL_RolloverByMaxChanges(t *testing.T) {
 	}
 
 	// Chain restore into a fresh target.
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target: mysqlEng, TargetDSN: targetDSN, Store: store,
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("Restore.Run: %v", err)

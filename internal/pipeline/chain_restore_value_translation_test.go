@@ -30,6 +30,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
@@ -126,7 +127,7 @@ func TestChainRestore_CrossEngine_UUIDValuePreserved(t *testing.T) {
 	tgt := &chainRestoreRecorderEngine{
 		restoreRecorderEngine: newRestoreRecorderEngine("mysql"),
 	}
-	cr := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: store}
+	cr := &backup.ChainRestore{Target: tgt, TargetDSN: "tgt", Store: store}
 	if err := cr.Run(context.Background()); err != nil {
 		t.Fatalf("ChainRestore.Run: %v", err)
 	}
@@ -197,7 +198,7 @@ func TestChainRestore_CrossEngine_JSONbytesPreserved(t *testing.T) {
 	tgt := &chainRestoreRecorderEngine{
 		restoreRecorderEngine: newRestoreRecorderEngine("mysql"),
 	}
-	cr := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: store}
+	cr := &backup.ChainRestore{Target: tgt, TargetDSN: "tgt", Store: store}
 	if err := cr.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -268,7 +269,7 @@ func TestChainRestore_CrossEngine_TimestampPreserved(t *testing.T) {
 	tgt := &chainRestoreRecorderEngine{
 		restoreRecorderEngine: newRestoreRecorderEngine("mysql"),
 	}
-	cr := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: store}
+	cr := &backup.ChainRestore{Target: tgt, TargetDSN: "tgt", Store: store}
 	if err := cr.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -339,7 +340,7 @@ func TestChainRestore_CrossEngine_BoolValuePreserved(t *testing.T) {
 	tgt := &chainRestoreRecorderEngine{
 		restoreRecorderEngine: newRestoreRecorderEngine("postgres"),
 	}
-	cr := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: store}
+	cr := &backup.ChainRestore{Target: tgt, TargetDSN: "tgt", Store: store}
 	if err := cr.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}

@@ -25,6 +25,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
@@ -113,7 +114,7 @@ func TestBackup_ResumeSweepsOrphanedAnchorSlot_Postgres(t *testing.T) {
 	//    prior manifest → no proof of a crashed run → hands off), and
 	//    must not leave its own anchor behind (protocol-TEMPORARY,
 	//    released on graceful close).
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:    pgEng,
 		SourceDSN: sourceDSN,
 		Store:     store,
@@ -139,7 +140,7 @@ func TestBackup_ResumeSweepsOrphanedAnchorSlot_Postgres(t *testing.T) {
 	//    source with zero anchor slots — nothing left pinning WAL.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:    pgEng,
 		SourceDSN: sourceDSN,
 		Store:     store,

@@ -33,6 +33,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/engines/mysql"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
@@ -126,7 +127,7 @@ func TestBackupParallel_MySQLCoordinated_RoundTripParity(t *testing.T) {
 	}
 
 	gotP, gotReason := observeBackupDispatch(t)
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:           mysqlEng,
 		SourceDSN:        sourceDSN,
 		Store:            store,
@@ -139,7 +140,7 @@ func TestBackupParallel_MySQLCoordinated_RoundTripParity(t *testing.T) {
 		t.Fatalf("dispatch = serial (reason %q); want the coordinated parallel sweep engaged on a vanilla MySQL source", *gotReason)
 	}
 
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target:    mysqlEng,
 		TargetDSN: targetDSN,
 		Store:     store,
@@ -207,7 +208,7 @@ func TestBackupParallel_MySQLConsistencyOracle(t *testing.T) {
 	t.Cleanup(func() { mysql.SetBackupReadersOpenedHookForTest(nil) })
 
 	gotP, gotReason := observeBackupDispatch(t)
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:           mysqlEng,
 		SourceDSN:        sourceDSN,
 		Store:            store,
@@ -223,7 +224,7 @@ func TestBackupParallel_MySQLConsistencyOracle(t *testing.T) {
 		t.Fatalf("readers-opened hook fired %d times; want exactly 1 (the coordinated open must have run)", hookFired)
 	}
 
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target:    mysqlEng,
 		TargetDSN: targetDSN,
 		Store:     store,
@@ -268,7 +269,7 @@ func TestBackupParallel_MySQLConsistencyOracle_SerialControl(t *testing.T) {
 	t.Cleanup(func() { mysql.SetBackupReadersOpenedHookForTest(nil) })
 
 	gotP, _ := observeBackupDispatch(t)
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:           mysqlEng,
 		SourceDSN:        sourceDSN,
 		Store:            store,
@@ -284,7 +285,7 @@ func TestBackupParallel_MySQLConsistencyOracle_SerialControl(t *testing.T) {
 		t.Fatalf("readers-opened hook fired %d times on the serial path; want 0 (no coordinated open)", hookFired)
 	}
 
-	if err := (&Restore{Target: mysqlEng, TargetDSN: targetDSN, Store: store}).Run(context.Background()); err != nil {
+	if err := (&backup.Restore{Target: mysqlEng, TargetDSN: targetDSN, Store: store}).Run(context.Background()); err != nil {
 		t.Fatalf("Restore.Run: %v", err)
 	}
 	for _, table := range tables {
@@ -328,7 +329,7 @@ func TestBackupParallel_MySQLFTWRLDeniedFallsBackToSerial(t *testing.T) {
 	t.Cleanup(func() { mysql.SetBackupReadersOpenedHookForTest(nil) })
 
 	gotP, gotReason := observeBackupDispatch(t)
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:           mysqlEng,
 		SourceDSN:        limitedDSN,
 		Store:            store,
@@ -349,7 +350,7 @@ func TestBackupParallel_MySQLFTWRLDeniedFallsBackToSerial(t *testing.T) {
 
 	// Restore with the full-privilege DSN (target is its own db) and
 	// confirm zero-loss parity despite the serial fallback.
-	if err := (&Restore{Target: mysqlEng, TargetDSN: targetDSN, Store: store}).Run(context.Background()); err != nil {
+	if err := (&backup.Restore{Target: mysqlEng, TargetDSN: targetDSN, Store: store}).Run(context.Background()); err != nil {
 		t.Fatalf("Restore.Run: %v", err)
 	}
 	for _, table := range tables {
@@ -388,7 +389,7 @@ func TestBackupParallel_MySQLCancelResumeCompletes(t *testing.T) {
 	defer cancel()
 	store := &cancelAfterChunkPutsStore{LocalStore: inner, n: 8, cancel: cancel}
 	gotP, _ := observeBackupDispatch(t)
-	err = (&Backup{
+	err = (&backup.Backup{
 		Source:           mysqlEng,
 		SourceDSN:        sourceDSN,
 		Store:            store,
@@ -416,7 +417,7 @@ func TestBackupParallel_MySQLCancelResumeCompletes(t *testing.T) {
 	}
 
 	// Plain re-run (no force-overwrite) resumes to completion.
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:           mysqlEng,
 		SourceDSN:        sourceDSN,
 		Store:            inner,
@@ -426,7 +427,7 @@ func TestBackupParallel_MySQLCancelResumeCompletes(t *testing.T) {
 		t.Fatalf("resume Backup.Run: %v", err)
 	}
 
-	if err := (&Restore{Target: mysqlEng, TargetDSN: targetDSN, Store: inner}).Run(context.Background()); err != nil {
+	if err := (&backup.Restore{Target: mysqlEng, TargetDSN: targetDSN, Store: inner}).Run(context.Background()); err != nil {
 		t.Fatalf("Restore.Run: %v", err)
 	}
 	for _, table := range tables {

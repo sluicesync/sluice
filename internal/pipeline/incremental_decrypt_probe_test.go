@@ -11,6 +11,7 @@ import (
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
@@ -67,7 +68,7 @@ func TestIncrementalAlignEncryption_PerChunkDecryptProbe_Bug117_Ingestion(t *tes
 			t.Fatalf("NewLocalStore: %v", err)
 		}
 		src := newBackupRecorderEngine("postgres", schema, rows)
-		b := &Backup{
+		b := &backup.Backup{
 			Source:    src,
 			SourceDSN: "src",
 			Store:     store,

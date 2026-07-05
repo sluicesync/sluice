@@ -42,6 +42,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
@@ -113,7 +114,7 @@ func TestBackup_EncryptedChainExtension_Incremental_PG(t *testing.T) {
 
 	// 1. Encrypted full backup. Envelope A holds salt-A.
 	envFull := newTestPassphraseEnvelope(t, passphrase)
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:        pgEng,
 		SourceDSN:     sourceDSN,
 		Store:         store,
@@ -193,7 +194,7 @@ func TestBackup_EncryptedChainExtension_Incremental_PG(t *testing.T) {
 	}
 
 	// 4. Verify chain integrity.
-	total, mismatches, err := VerifyBackup(context.Background(), store)
+	total, mismatches, err := backup.VerifyBackup(context.Background(), store)
 	if err != nil {
 		t.Fatalf("VerifyBackup: %v", err)
 	}
@@ -205,7 +206,7 @@ func TestBackup_EncryptedChainExtension_Incremental_PG(t *testing.T) {
 	// recorded salt (envelopeFromManifest mirrors the production CLI
 	// path's buildReadEnvelope shape).
 	envRestore := envelopeFromManifest(t, store, passphrase)
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target:    pgEng,
 		TargetDSN: targetDSN,
 		Store:     store,
@@ -270,7 +271,7 @@ func TestBackup_EncryptedChainExtension_NoRebuildHook_Fails(t *testing.T) {
 	defer dropPGLogicalSlot(t, sourceDSN, "sluice_slot")
 
 	envFull := newTestPassphraseEnvelope(t, passphrase)
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:        pgEng,
 		SourceDSN:     sourceDSN,
 		Store:         store,

@@ -34,6 +34,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
@@ -45,7 +46,7 @@ import (
 // off it (mirrors the existing stream PG tests' setup).
 func rotationSeedFull(t *testing.T, store irbackup.Store, eng ir.Engine, sourceDSN, slotLSN string) *irbackup.Manifest {
 	t.Helper()
-	if err := (&Backup{Source: eng, SourceDSN: sourceDSN, Store: store, SluiceVersion: "test"}).
+	if err := (&backup.Backup{Source: eng, SourceDSN: sourceDSN, Store: store, SluiceVersion: "test"}).
 		Run(context.Background()); err != nil {
 		t.Fatalf("seed Backup.Run: %v", err)
 	}
@@ -163,13 +164,13 @@ func TestADR0046_ZeroLossMultiSegmentRotation_PG(t *testing.T) {
 	t.Logf("ADR-0046 zero-loss: lineage has %d segments", len(lin.Segments))
 
 	// Verify every chunk's bytes still hash (cross-segment).
-	tot, mis, err := VerifyBackup(context.Background(), store)
+	tot, mis, err := backup.VerifyBackup(context.Background(), store)
 	if err != nil || mis != 0 {
 		t.Fatalf("VerifyBackup: total=%d mismatches=%d err=%v", tot, mis, err)
 	}
 
 	// Restore the multi-segment lineage and assert EXACT final state.
-	if err := (&Restore{Target: eng, TargetDSN: targetDSN, Store: store}).
+	if err := (&backup.Restore{Target: eng, TargetDSN: targetDSN, Store: store}).
 		Run(context.Background()); err != nil {
 		t.Fatalf("Restore.Run (multi-segment lineage): %v", err)
 	}
@@ -357,7 +358,7 @@ func TestADR0046_CrashInjectionMatrix_PG(t *testing.T) {
 			// loss). Exact dup-freedom is asserted by the dedicated
 			// zero-loss test; here the gate is "recovery + restore
 			// correct, no loss".
-			if err := (&Restore{Target: eng, TargetDSN: targetDSN, Store: store}).
+			if err := (&backup.Restore{Target: eng, TargetDSN: targetDSN, Store: store}).
 				Run(context.Background()); err != nil {
 				t.Fatalf("restore after %s recovery: %v", edge.name, err)
 			}
@@ -432,7 +433,7 @@ func TestADR0046_NeverRotatedByteIdentical_PG(t *testing.T) {
 	if !lin.Segments[0].Open() {
 		t.Error("the only segment of a never-rotated lineage must be open (uncapped)")
 	}
-	if err := (&Restore{Target: eng, TargetDSN: targetDSN, Store: store}).
+	if err := (&backup.Restore{Target: eng, TargetDSN: targetDSN, Store: store}).
 		Run(context.Background()); err != nil {
 		t.Fatalf("restore one-segment lineage: %v", err)
 	}
@@ -480,7 +481,7 @@ func TestADR0046_MixedCodecLineageRestores_PG(t *testing.T) {
 			segDir = fmt.Sprintf("seg-%d", i)
 		}
 		segStore := lineage.NewPrefixedStore(store, segDir)
-		if err := (&Backup{
+		if err := (&backup.Backup{
 			Source: eng, SourceDSN: sourceDSN, Store: segStore,
 			SluiceVersion: "test", Codec: c,
 		}).Run(context.Background()); err != nil {
@@ -515,12 +516,12 @@ func TestADR0046_MixedCodecLineageRestores_PG(t *testing.T) {
 	}
 
 	// VerifyBackup is codec-agnostic (byte hash) but must pass.
-	if _, mis, err := VerifyBackup(context.Background(), store); err != nil || mis != 0 {
+	if _, mis, err := backup.VerifyBackup(context.Background(), store); err != nil || mis != 0 {
 		t.Fatalf("VerifyBackup mixed-codec: mis=%d err=%v", mis, err)
 	}
 	// Restore walks all 3 segments, decoding each with ITS recorded
 	// codec. The last segment's full (zstd) is the final state.
-	if err := (&Restore{Target: eng, TargetDSN: targetDSN, Store: store}).
+	if err := (&backup.Restore{Target: eng, TargetDSN: targetDSN, Store: store}).
 		Run(context.Background()); err != nil {
 		t.Fatalf("restore mixed-codec lineage: %v", err)
 	}
@@ -547,7 +548,7 @@ func TestADR0046_UnknownRecordedCodecRefused_PG(t *testing.T) {
 	eng, _ := engines.Get("postgres")
 	dir := t.TempDir()
 	store, _ := blobcodec.NewLocalStore(dir)
-	if err := (&Backup{Source: eng, SourceDSN: sourceDSN, Store: store, SluiceVersion: "test"}).
+	if err := (&backup.Backup{Source: eng, SourceDSN: sourceDSN, Store: store, SluiceVersion: "test"}).
 		Run(context.Background()); err != nil {
 		t.Fatalf("backup: %v", err)
 	}
@@ -563,7 +564,7 @@ func TestADR0046_UnknownRecordedCodecRefused_PG(t *testing.T) {
 		}},
 	}
 	_ = lineage.WriteLineageCatalog(context.Background(), store, cat)
-	err := (&Restore{Target: eng, TargetDSN: targetDSN, Store: store}).Run(context.Background())
+	err := (&backup.Restore{Target: eng, TargetDSN: targetDSN, Store: store}).Run(context.Background())
 	if err == nil {
 		t.Fatal("restore with unknown recorded codec = nil; want loud refusal")
 	}

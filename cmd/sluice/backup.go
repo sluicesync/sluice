@@ -16,6 +16,7 @@ import (
 	"sluicesync.dev/sluice/internal/crypto"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
@@ -488,7 +489,7 @@ func (b *BackupFullCmd) run(g *Globals, env *envelopeRun) error {
 	if err != nil {
 		return err
 	}
-	backup := &pipeline.Backup{
+	bk := &backup.Backup{
 		Source:              source,
 		SourceDSN:           b.Source,
 		Store:               store,
@@ -526,13 +527,13 @@ func (b *BackupFullCmd) run(g *Globals, env *envelopeRun) error {
 	if err != nil {
 		return fmt.Errorf("redactions (YAML): %w", err)
 	}
-	backup.Redactor = redactor
+	bk.Redactor = redactor
 	logKeysetLoaded(keyset)
 	logRedactionConfig(redactor, "backup full")
 	// Validation is done; errors past this point classify as "failed"
 	// (not "refused") in the --format json envelope.
 	env.markEngaged()
-	return backup.Run(ctx)
+	return bk.Run(ctx)
 }
 
 // openBackupStore opens the right [irbackup.Store] for the operator's
@@ -947,7 +948,7 @@ func (v *BackupVerifyCmd) Run(_ *Globals) error {
 			slog.String("kek_ref", rootManifest.ChainEncryption.KEKRef),
 		)
 	}
-	total, mismatches, err := pipeline.VerifyBackupWith(ctx, store, pipeline.VerifyOptions{
+	total, mismatches, err := backup.VerifyBackupWith(ctx, store, backup.VerifyOptions{
 		Envelope: envelope,
 	})
 	if err != nil {
@@ -1023,7 +1024,7 @@ func (p *BackupPruneCmd) Run(_ *Globals) error {
 		defer func() { _ = closer() }()
 	}
 
-	res, err := pipeline.PruneChain(ctx, store, pipeline.PruneOpts{
+	res, err := backup.PruneChain(ctx, store, backup.PruneOpts{
 		KeepIncrementals: p.KeepIncrementals,
 		KeepDuration:     p.KeepDuration,
 		DryRun:           p.DryRun,
@@ -1130,11 +1131,11 @@ func (c *BackupCompactCmd) Run(_ *Globals) error {
 		defer func() { _ = closer() }()
 	}
 
-	res, err := pipeline.CompactChain(ctx, store, pipeline.CompactOpts{
+	res, err := backup.CompactChain(ctx, store, backup.CompactOpts{
 		MergeWindow:     c.MergeWindow,
 		DryRun:          c.DryRun,
 		SmartCompaction: c.SmartCompaction,
-		PKStrategy:      pipeline.PKStrategy(c.CompactionPKStrategy),
+		PKStrategy:      backup.PKStrategy(c.CompactionPKStrategy),
 	})
 	if err != nil {
 		return err
@@ -1344,7 +1345,7 @@ func (r *RestoreCmd) run(g *Globals, env *envelopeRun) error {
 		defer func() { _ = telemetryProvider.Close() }()
 	}
 
-	restore := &pipeline.Restore{
+	restore := &backup.Restore{
 		Target:           target,
 		TargetDSN:        r.Target,
 		Store:            store,

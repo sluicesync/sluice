@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -54,7 +55,7 @@ func TestSyncFromBackup_FanOut(t *testing.T) {
 	pgEng, _ := engines.Get("postgres")
 
 	// Pre-restore the full into BOTH broker targets.
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target: pgEng, TargetDSN: brokerTarget1DSN, Store: store,
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("seed restore (target 1): %v", err)
@@ -65,7 +66,7 @@ func TestSyncFromBackup_FanOut(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewLocalStore (store2): %v", err)
 	}
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target: pgEng, TargetDSN: brokerTarget2DSN, Store: store2,
 	}).Run(context.Background()); err != nil {
 		t.Fatalf("seed restore (target 2): %v", err)

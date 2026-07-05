@@ -30,6 +30,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
@@ -323,7 +324,7 @@ func TestBlobStore_MinIO_BackupRestoreRoundTrip(t *testing.T) {
 	ctx, ctxCancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer ctxCancel()
 
-	bk := &Backup{
+	bk := &backup.Backup{
 		Source:        pgEng,
 		SourceDSN:     pgSource,
 		Store:         store,
@@ -335,7 +336,7 @@ func TestBlobStore_MinIO_BackupRestoreRoundTrip(t *testing.T) {
 	}
 
 	// Phase 2: restore MinIO → MySQL.
-	rs := &Restore{
+	rs := &backup.Restore{
 		Target:    mysqlEng,
 		TargetDSN: mysqlTarget,
 		Store:     store,
@@ -421,7 +422,7 @@ func TestBlobStore_MinIO_ResumableBackup(t *testing.T) {
 	// checkpoint, while uploading t2 chunk 0 — see the unit test for
 	// the same pattern).
 	failing := &failOnNthPutBlob{BlobStore: store, failOn: 3}
-	bk1 := &Backup{
+	bk1 := &backup.Backup{
 		Source:    pgEng,
 		SourceDSN: pgSource,
 		Store:     failing,
@@ -432,7 +433,7 @@ func TestBlobStore_MinIO_ResumableBackup(t *testing.T) {
 	}
 
 	// Resume: re-run against the same destination.
-	bk2 := &Backup{
+	bk2 := &backup.Backup{
 		Source:    pgEng,
 		SourceDSN: pgSource,
 		Store:     store,
@@ -454,7 +455,7 @@ func TestBlobStore_MinIO_ResumableBackup(t *testing.T) {
 	}
 
 	// Confirm the bytes are good.
-	total, mismatches, err := VerifyBackup(ctx, store)
+	total, mismatches, err := backup.VerifyBackup(ctx, store)
 	if err != nil {
 		t.Fatalf("VerifyBackup: %v", err)
 	}

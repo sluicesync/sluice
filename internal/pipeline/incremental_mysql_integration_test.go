@@ -19,6 +19,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
@@ -53,7 +54,7 @@ func TestIncrementalBackup_MySQLChainRestore(t *testing.T) {
 	}
 
 	// 1. Full backup.
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source: mysqlEng, SourceDSN: sourceDSN, Store: store,
 		SluiceVersion: "test",
 	}).Run(context.Background()); err != nil {
@@ -102,7 +103,7 @@ func TestIncrementalBackup_MySQLChainRestore(t *testing.T) {
 	}
 
 	// 5. Verify chunks intact.
-	total, mismatches, err := VerifyBackup(context.Background(), store)
+	total, mismatches, err := backup.VerifyBackup(context.Background(), store)
 	if err != nil {
 		t.Fatalf("VerifyBackup: %v", err)
 	}
@@ -111,7 +112,7 @@ func TestIncrementalBackup_MySQLChainRestore(t *testing.T) {
 	}
 
 	// 6. Chain restore.
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target:    mysqlEng,
 		TargetDSN: targetDSN,
 		Store:     store,

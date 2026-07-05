@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -58,14 +59,14 @@ func TestBackupRestore_PG_NonFiniteFloats(t *testing.T) {
 	defer cancel()
 
 	// Pre-fix this was the Bug-138 failure point.
-	if err := (&Backup{
+	if err := (&backup.Backup{
 		Source:    pgEng,
 		SourceDSN: sourceDSN,
 		Store:     store,
 	}).Run(ctx); err != nil {
 		t.Fatalf("Backup.Run refused the non-finite corpus (the Bug-138 shape): %v", err)
 	}
-	if err := (&Restore{
+	if err := (&backup.Restore{
 		Target:    pgEng,
 		TargetDSN: targetDSN,
 		Store:     store,

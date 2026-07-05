@@ -10,6 +10,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
@@ -128,7 +129,7 @@ func TestBackup_FormatVersion_Bug116(t *testing.T) {
 			// Empty rows are fine — Bug 116 is a manifest-level
 			// version-stamp check, not a row-content check.
 			src := newBackupRecorderEngine("postgres", c.schema, map[string][]ir.Row{})
-			b := &Backup{
+			b := &backup.Backup{
 				Source:    src,
 				SourceDSN: "src",
 				Store:     store,
@@ -222,7 +223,7 @@ func TestBackup_ManifestRoundTrip_StandaloneSequences(t *testing.T) {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
 	src := newBackupRecorderEngine("postgres", schema, map[string][]ir.Row{})
-	if err := (&Backup{Source: src, SourceDSN: "src", Store: store}).Run(context.Background()); err != nil {
+	if err := (&backup.Backup{Source: src, SourceDSN: "src", Store: store}).Run(context.Background()); err != nil {
 		t.Fatalf("Backup.Run: %v", err)
 	}
 	m, err := lineage.ReadManifest(context.Background(), store)

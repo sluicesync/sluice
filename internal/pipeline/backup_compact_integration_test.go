@@ -39,6 +39,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
@@ -143,7 +144,7 @@ func TestADR0067_BackupCompact_LiveRotationContiguous_Merges_PG(t *testing.T) {
 	// so consecutive segments are CONTIGUOUS and naive compact MERGES
 	// them — where pre-ADR-0067 the strict S > P_N handoff forced a
 	// position-gap refusal. This is the Bug 95 regression pin.
-	res, err := CompactChain(context.Background(), store, CompactOpts{
+	res, err := backup.CompactChain(context.Background(), store, backup.CompactOpts{
 		MergeWindow: time.Hour, // window captures every rotation
 	})
 	if err != nil {

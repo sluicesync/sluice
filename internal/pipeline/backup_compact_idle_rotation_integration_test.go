@@ -31,6 +31,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 
@@ -177,7 +178,7 @@ func assertTrailingIdleStopShape(t *testing.T, store *blobcodec.LocalStore) *lin
 	}
 	// Confirm the boundary is a genuine coverage gap (the whole point).
 	prev := cat.Segments[len(cat.Segments)-2]
-	if !boundaryHasCoverageGap(&prev, &last) {
+	if !backup.BoundaryHasCoverageGap(&prev, &last) {
 		t.Fatalf("trailing boundary is not a coverage gap; the Bug-139 shape requires prev.End != last's coverage start")
 	}
 	return cat
@@ -210,10 +211,10 @@ func TestADR0087_Bug139_IdleStopCompact_SplitsAndRestores_PG(t *testing.T) {
 			}
 
 			// Compact with a window wide enough to group every segment.
-			res, err := CompactChain(context.Background(), store, CompactOpts{
+			res, err := backup.CompactChain(context.Background(), store, backup.CompactOpts{
 				MergeWindow:     time.Hour,
 				SmartCompaction: smart,
-				PKStrategy:      PKStrategyPK,
+				PKStrategy:      backup.PKStrategyPK,
 			})
 			if err != nil {
 				if strings.Contains(err.Error(), "position gap") {
@@ -240,7 +241,7 @@ func TestADR0087_Bug139_IdleStopCompact_SplitsAndRestores_PG(t *testing.T) {
 
 			// Restore the compacted chain into the fresh target and assert it
 			// equals the source oracle byte/count-for-content.
-			if err := (&ChainRestore{Target: engineMust(t), TargetDSN: targetDSN, Store: store}).Run(context.Background()); err != nil {
+			if err := (&backup.ChainRestore{Target: engineMust(t), TargetDSN: targetDSN, Store: store}).Run(context.Background()); err != nil {
 				t.Fatalf("ChainRestore of compacted chain: %v", err)
 			}
 			got := bug139Read(t, targetDSN)
@@ -331,10 +332,10 @@ func TestADR0087_Bug139_ResumeHeals_WholeChainCompacts_PG(t *testing.T) {
 	oracle := bug139Read(t, sourceDSN)
 
 	// Now the WHOLE chain is contiguous: compact merges everything.
-	res, err := CompactChain(context.Background(), store, CompactOpts{
+	res, err := backup.CompactChain(context.Background(), store, backup.CompactOpts{
 		MergeWindow:     time.Hour,
 		SmartCompaction: true,
-		PKStrategy:      PKStrategyPK,
+		PKStrategy:      backup.PKStrategyPK,
 	})
 	if err != nil {
 		t.Fatalf("CompactChain after resume heal: %v", err)
@@ -347,7 +348,7 @@ func TestADR0087_Bug139_ResumeHeals_WholeChainCompacts_PG(t *testing.T) {
 		t.Errorf("GroupsMerged = %d; want 1 (one whole-chain merge)", res.GroupsMerged)
 	}
 
-	if err := (&ChainRestore{Target: eng, TargetDSN: targetDSN, Store: store}).Run(context.Background()); err != nil {
+	if err := (&backup.ChainRestore{Target: eng, TargetDSN: targetDSN, Store: store}).Run(context.Background()); err != nil {
 		t.Fatalf("ChainRestore of healed+compacted chain: %v", err)
 	}
 	got := bug139Read(t, targetDSN)

@@ -26,6 +26,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
@@ -51,7 +52,7 @@ func TestBackup_ResumeAfterScanOrderChange_NoDuplicatesNoHoles(t *testing.T) {
 
 	// Run 1 streams ids 1..7 ascending; chunk-rows=2 → chunks of
 	// (1,2)(3,4)(5,6)(7).
-	b1 := &Backup{
+	b1 := &backup.Backup{
 		Source:    newBackupRecorderEngine("postgres", schema, map[string][]ir.Row{"events": rowsAsc}),
 		SourceDSN: "src", Store: store, ChunkRows: 2,
 	}
@@ -91,7 +92,7 @@ func TestBackup_ResumeAfterScanOrderChange_NoDuplicatesNoHoles(t *testing.T) {
 	// Pre-fix, the per-chunk reuse kept chunks (1,2)(3,4) and discarded
 	// the new stream's first four rows (7,6,5,4), appending (3,2,1):
 	// duplicates {1,2,3}, holes {5,6,7}, exit 0.
-	b2 := &Backup{
+	b2 := &backup.Backup{
 		Source:    newBackupRecorderEngine("postgres", schema, map[string][]ir.Row{"events": rowsDesc}),
 		SourceDSN: "src", Store: store, ChunkRows: 2,
 	}
@@ -102,7 +103,7 @@ func TestBackup_ResumeAfterScanOrderChange_NoDuplicatesNoHoles(t *testing.T) {
 	// Restore the artifact into a recording target and assert the id
 	// MULTISET is exactly {1..7} — no duplicates, no holes.
 	target := newRestoreRecorderEngine("postgres")
-	r := &Restore{Target: target, TargetDSN: "dst", Store: store}
+	r := &backup.Restore{Target: target, TargetDSN: "dst", Store: store}
 	if err := r.Run(context.Background()); err != nil {
 		t.Fatalf("Restore.Run: %v", err)
 	}
