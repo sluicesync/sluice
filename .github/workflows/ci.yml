@@ -293,8 +293,17 @@ jobs:
           # rather than trying to parse `(...)` as a subshell. Without
           # the quotes, the v0.72.3 first deploy failed at the shell-
           # parse step with `syntax error near unexpected token '('`.
+          # internal/pipeline/backup carries the backup/restore/chain
+          # orchestration carved out of the flat pipeline root (audit
+          # 3.7b-2). Its tests are unit-only today, but the package is
+          # listed here so any future integration-tagged backup/restore
+          # test actually RUNS — the shard-coverage guard's prefix match
+          # (internal/pipeline covers the subtree) would otherwise pass
+          # green while this non-recursive `./internal/pipeline/` shard
+          # silently skipped it (the exact false-confidence class the
+          # guard exists to prevent).
           - name: pipeline-rest-other
-            packages: "./internal/pipeline/"
+            packages: "./internal/pipeline/ ./internal/pipeline/backup/"
             goflags: "-skip '^(TestMigrate_|TestStreamer_)'"
           - name: engines-mysql
             packages: "./internal/engines/mysql/..."
