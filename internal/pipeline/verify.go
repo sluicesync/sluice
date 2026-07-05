@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // VerifyDepth selects which depth of verification to run. Count is the
@@ -83,7 +84,7 @@ type Verifier struct {
 
 	// Filter selects which source tables participate. Empty (zero
 	// value) keeps every source table.
-	Filter TableFilter
+	Filter migcore.TableFilter
 
 	// Format is "text" (default) or "json".
 	Format string
@@ -215,7 +216,7 @@ func (v *Verifier) Run(ctx context.Context) (*VerifyResult, error) {
 	if len(srcSchema.Tables) == 0 {
 		return nil, errors.New("verify: source schema has no tables")
 	}
-	if err := applyTableFilter(ctx, srcSchema, v.Filter); err != nil {
+	if err := migcore.ApplyTableFilter(ctx, srcSchema, v.Filter); err != nil {
 		return nil, err
 	}
 

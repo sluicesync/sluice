@@ -35,6 +35,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 
@@ -178,9 +179,9 @@ func TestMigrate_PG_PostGIS_GistIndexPassthrough(t *testing.T) {
 	// Cold-start preflight refuses to bulk-copy into a non-empty
 	// target table; exclude spatial_ref_sys + skip views to scope the
 	// test to operator-owned tables only.
-	filter, fErr := NewTableFilter(nil, []string{"spatial_ref_sys"})
+	filter, fErr := migcore.NewTableFilter(nil, []string{"spatial_ref_sys"})
 	if fErr != nil {
-		t.Fatalf("NewTableFilter: %v", fErr)
+		t.Fatalf("migcore.NewTableFilter: %v", fErr)
 	}
 	mig := &Migrator{
 		Source:              pgEng,
@@ -336,9 +337,9 @@ func TestMigrate_PG_PostGIS_GistNdIndexPassthrough(t *testing.T) {
 	// Cold-start preflight refuses to bulk-copy into a non-empty
 	// target table; exclude spatial_ref_sys + skip views to scope the
 	// test to operator-owned tables only.
-	filter, fErr := NewTableFilter(nil, []string{"spatial_ref_sys"})
+	filter, fErr := migcore.NewTableFilter(nil, []string{"spatial_ref_sys"})
 	if fErr != nil {
-		t.Fatalf("NewTableFilter: %v", fErr)
+		t.Fatalf("migcore.NewTableFilter: %v", fErr)
 	}
 	mig := &Migrator{
 		Source:              pgEng,
@@ -420,9 +421,9 @@ func TestMigrate_PG_PostGIS_GeographyPassthrough(t *testing.T) {
 	applyPGDDL(t, sourceDSN, seedDDL)
 
 	pgEng, _ := engines.Get("postgres")
-	filter, fErr := NewTableFilter(nil, []string{"spatial_ref_sys"})
+	filter, fErr := migcore.NewTableFilter(nil, []string{"spatial_ref_sys"})
 	if fErr != nil {
-		t.Fatalf("NewTableFilter: %v", fErr)
+		t.Fatalf("migcore.NewTableFilter: %v", fErr)
 	}
 	mig := &Migrator{
 		Source:              pgEng,
@@ -538,9 +539,9 @@ func TestMigrate_PG_PostGIS_SPGistIndexPassthrough(t *testing.T) {
 	applyPGDDL(t, sourceDSN, seedDDL)
 
 	pgEng, _ := engines.Get("postgres")
-	filter, fErr := NewTableFilter(nil, []string{"spatial_ref_sys"})
+	filter, fErr := migcore.NewTableFilter(nil, []string{"spatial_ref_sys"})
 	if fErr != nil {
-		t.Fatalf("NewTableFilter: %v", fErr)
+		t.Fatalf("migcore.NewTableFilter: %v", fErr)
 	}
 	mig := &Migrator{
 		Source:              pgEng,
@@ -613,9 +614,9 @@ func TestMigrate_PG_PostGIS_BRINIndexPassthrough(t *testing.T) {
 	applyPGDDL(t, sourceDSN, seedDDL)
 
 	pgEng, _ := engines.Get("postgres")
-	filter, fErr := NewTableFilter(nil, []string{"spatial_ref_sys"})
+	filter, fErr := migcore.NewTableFilter(nil, []string{"spatial_ref_sys"})
 	if fErr != nil {
-		t.Fatalf("NewTableFilter: %v", fErr)
+		t.Fatalf("migcore.NewTableFilter: %v", fErr)
 	}
 	mig := &Migrator{
 		Source:              pgEng,
@@ -687,7 +688,7 @@ func TestMigrate_PG_PostGIS_GeographySubtypePreserved(t *testing.T) {
 	applyPGDDL(t, sourceDSN, seedDDL)
 
 	pgEng, _ := engines.Get("postgres")
-	filter, _ := NewTableFilter(nil, []string{"spatial_ref_sys"})
+	filter, _ := migcore.NewTableFilter(nil, []string{"spatial_ref_sys"})
 	mig := &Migrator{
 		Source:              pgEng,
 		Target:              pgEng,
@@ -752,7 +753,7 @@ func TestMigrate_PG_PostGIS_PointZPassthrough(t *testing.T) {
 	applyPGDDL(t, sourceDSN, seedDDL)
 
 	pgEng, _ := engines.Get("postgres")
-	filter, _ := NewTableFilter(nil, []string{"spatial_ref_sys"})
+	filter, _ := migcore.NewTableFilter(nil, []string{"spatial_ref_sys"})
 	mig := &Migrator{
 		Source:              pgEng,
 		Target:              pgEng,
@@ -859,7 +860,7 @@ func TestMigrate_PG_PostGIS_PolygonZMPassthrough(t *testing.T) {
 	applyPGDDL(t, sourceDSN, seedDDL)
 
 	pgEng, _ := engines.Get("postgres")
-	filter, _ := NewTableFilter(nil, []string{"spatial_ref_sys"})
+	filter, _ := migcore.NewTableFilter(nil, []string{"spatial_ref_sys"})
 	mig := &Migrator{
 		Source:              pgEng,
 		Target:              pgEng,
@@ -929,7 +930,7 @@ func TestMigrate_PG_PostGIS_LineStringMPassthrough(t *testing.T) {
 	applyPGDDL(t, sourceDSN, seedDDL)
 
 	pgEng, _ := engines.Get("postgres")
-	filter, _ := NewTableFilter(nil, []string{"spatial_ref_sys"})
+	filter, _ := migcore.NewTableFilter(nil, []string{"spatial_ref_sys"})
 	mig := &Migrator{
 		Source:              pgEng,
 		Target:              pgEng,
@@ -989,9 +990,9 @@ func TestMigrate_PG_PostGIS_TargetMissing_RefusedAtPreflight(t *testing.T) {
 	// Cold-start preflight refuses to bulk-copy into a non-empty
 	// target table; exclude spatial_ref_sys + skip views to scope the
 	// test to operator-owned tables only.
-	filter, fErr := NewTableFilter(nil, []string{"spatial_ref_sys"})
+	filter, fErr := migcore.NewTableFilter(nil, []string{"spatial_ref_sys"})
 	if fErr != nil {
-		t.Fatalf("NewTableFilter: %v", fErr)
+		t.Fatalf("migcore.NewTableFilter: %v", fErr)
 	}
 	mig := &Migrator{
 		Source:              pgEng,

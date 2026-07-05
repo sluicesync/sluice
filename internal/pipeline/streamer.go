@@ -249,7 +249,7 @@ type Streamer struct {
 	// WAL/binlog retention. In practice every workload mixes
 	// allowed and dropped events and the next applied event
 	// advances the position past the dropped ones.
-	Filter TableFilter
+	Filter migcore.TableFilter
 
 	// ViewFilter selects which source views are created on the
 	// target during the cold-start phase. CDC events for views

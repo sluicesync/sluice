@@ -11,6 +11,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // CutoverCmd implements `sluice cutover`. The two-phase sequence
@@ -118,7 +119,7 @@ func (c *CutoverCmd) Run(g *Globals) error {
 		return errors.New("--target is required")
 	}
 
-	filter, err := pipeline.NewTableFilter(c.IncludeTable, c.ExcludeTable)
+	filter, err := migcore.NewTableFilter(c.IncludeTable, c.ExcludeTable)
 	if err != nil {
 		return err
 	}

@@ -37,6 +37,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -537,7 +538,7 @@ func runMigrateScoped(t *testing.T, srcName, tgtName, srcDSN, tgtDSN, migrationI
 		SourceDSN:   srcDSN,
 		TargetDSN:   tgtDSN,
 		MigrationID: migrationID,
-		Filter:      TableFilter{Include: includeTables},
+		Filter:      migcore.TableFilter{Include: includeTables},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()

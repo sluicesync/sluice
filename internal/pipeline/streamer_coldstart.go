@@ -193,7 +193,7 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context) (*ir.Schema, [
 
 	// Prune by table filter before mappings + bulk-copy so the
 	// excluded tables never reach the target schema-apply phase.
-	if err := applyTableFilter(ctx, schema, s.Filter); err != nil {
+	if err := migcore.ApplyTableFilter(ctx, schema, s.Filter); err != nil {
 		closeIf(sr)
 		return nil, nil, err
 	}

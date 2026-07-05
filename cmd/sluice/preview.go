@@ -9,6 +9,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/pipeline"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/redact"
 )
 
@@ -96,7 +97,7 @@ func (s *SchemaPreviewCmd) Run(g *Globals) error {
 		return errors.New("--include-view and --exclude-view are mutually exclusive")
 	}
 	include, exclude := resolveTableFilterArgs(s.IncludeTable, s.ExcludeTable, cfg)
-	filter, err := pipeline.NewTableFilter(include, exclude)
+	filter, err := migcore.NewTableFilter(include, exclude)
 	if err != nil {
 		return err
 	}

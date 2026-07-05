@@ -257,7 +257,7 @@ func (s *Streamer) phaseResolveStreamIdentity(ctx context.Context) (string, erro
 	// either by the planetscale flavor flag or by a vanilla-mysql DSN
 	// pointing at a PlanetScale endpoint. Replaced in-place;
 	// Streamer is single-shot per Run.
-	if eff, added := effectiveTableFilter(s.Filter, s.Source, s.SourceDSN); len(added) > 0 {
+	if eff, added := migcore.EffectiveTableFilter(s.Filter, s.Source, s.SourceDSN); len(added) > 0 {
 		slog.InfoContext(
 			ctx, "applying engine-default table exclusions",
 			slog.String("engine", s.Source.Name()),

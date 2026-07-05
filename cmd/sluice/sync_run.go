@@ -24,6 +24,7 @@ import (
 	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/notify"
 	"sluicesync.dev/sluice/internal/pipeline"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	pstelemetry "sluicesync.dev/sluice/internal/planetscale/telemetry"
 )
 
@@ -618,7 +619,7 @@ func buildStreamerFromSpec(spec *SyncSpec, g *Globals) (*pipeline.Streamer, erro
 	if len(spec.IncludeTable) > 0 && len(spec.ExcludeTable) > 0 {
 		return nil, errors.New("include-table and exclude-table are mutually exclusive")
 	}
-	filter, err := pipeline.NewTableFilter(spec.IncludeTable, spec.ExcludeTable)
+	filter, err := migcore.NewTableFilter(spec.IncludeTable, spec.ExcludeTable)
 	if err != nil {
 		return nil, err
 	}

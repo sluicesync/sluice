@@ -78,7 +78,7 @@ func (d dumpParityDiff) Empty() bool {
 
 // dumpParityAllowlistEntry declares one KNOWN divergence class. The
 // pattern matches statement keys under stdlib path.Match semantics
-// (same glob dialect as TableFilter); every entry must carry a
+// (same glob dialect as migcore.TableFilter); every entry must carry a
 // human-readable reason plus a citation — the doc/ADR/source file
 // that declares the degradation, or the literal
 // dumpParityTriageCitation for a latent gap under investigation.

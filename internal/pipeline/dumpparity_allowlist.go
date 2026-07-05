@@ -24,7 +24,7 @@ var dumpParityAllowlist = []dumpParityAllowlistEntry{
 	},
 	{
 		Pattern:  "*public.events*",
-		Reason:   "PG declarative partitioning is refused loudly (Bug 100); the harness excludes the partitioned parent + children via TableFilter, so the whole partition family exists only on the oracle side",
+		Reason:   "PG declarative partitioning is refused loudly (Bug 100); the harness excludes the partitioned parent + children via migcore.TableFilter, so the whole partition family exists only on the oracle side",
 		Citation: "internal/pipeline/partition_preflight.go (Bug 100, v0.92.0)",
 	},
 	// item-51 finding #1 CLOSED: the standalone order_number_seq (and

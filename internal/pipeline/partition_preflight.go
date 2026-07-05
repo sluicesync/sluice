@@ -58,7 +58,7 @@ type partitionPreflightProber interface {
 //     opportunistic-skip posture matches [preflightRLS]).
 //   - No table in the active schema is partitioned.
 //   - Every partitioned parent is excluded via the operator's
-//     [TableFilter] (so a `--exclude-table=parent` operator-supplied
+//     [migcore.TableFilter] (so a `--exclude-table=parent` operator-supplied
 //     workaround actually works, instead of refusing on a table the
 //     operator already excluded).
 //

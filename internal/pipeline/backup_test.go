@@ -13,6 +13,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // backupRecorderEngine is a fake [ir.Engine] tailored to backup tests:
@@ -229,7 +230,7 @@ func TestBackup_FilterPrunesTables(t *testing.T) {
 
 	b := &Backup{
 		Source: src, SourceDSN: "src", Store: store,
-		Filter: TableFilter{Exclude: []string{"audit_*"}},
+		Filter: migcore.TableFilter{Exclude: []string{"audit_*"}},
 	}
 	if err := b.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)

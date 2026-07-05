@@ -81,7 +81,7 @@ func (s *Streamer) buildDryRunPlan(ctx context.Context, streamID string, persist
 		plan.noSourceTables = true
 		return plan, nil
 	}
-	if err := applyTableFilter(ctx, schema, s.Filter); err != nil {
+	if err := migcore.ApplyTableFilter(ctx, schema, s.Filter); err != nil {
 		return nil, err
 	}
 	applyViewFilter(ctx, schema, s.ViewFilter, s.SkipViews)

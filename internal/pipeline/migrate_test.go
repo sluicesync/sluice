@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // safeBuffer is a mutex-protected [bytes.Buffer] wrapper used as the
@@ -415,7 +416,7 @@ func TestRunFilterPrunesTables(t *testing.T) {
 	m := &Migrator{
 		Source: src, Target: tgt,
 		SourceDSN: "src", TargetDSN: "tgt",
-		Filter: TableFilter{Exclude: []string{"audit_*"}},
+		Filter: migcore.TableFilter{Exclude: []string{"audit_*"}},
 	}
 	if err := m.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
@@ -450,7 +451,7 @@ func TestRunFilterEmptyResultErrors(t *testing.T) {
 	m := &Migrator{
 		Source: src, Target: tgt,
 		SourceDSN: "src", TargetDSN: "tgt",
-		Filter: TableFilter{Include: []string{"nonexistent"}},
+		Filter: migcore.TableFilter{Include: []string{"nonexistent"}},
 	}
 	err := m.Run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "every source table") {

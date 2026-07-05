@@ -12,7 +12,7 @@
 // with an error naming the unrelated table. Phase-A: code-read —
 // loud + deterministic; the read→validate→filter ordering put the
 // per-column validation (populateColumns) before the pipeline's
-// post-read applyTableFilter, with no push-down. Fix: ir.TableScoper
+// post-read migcore.ApplyTableFilter, with no push-down. Fix: ir.TableScoper
 // push-down so readTables drops out-of-scope tables before their
 // columns are read/validated.
 //
@@ -28,6 +28,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -54,9 +55,9 @@ func TestMigrate_PostgresToPostgres_Bug76FilterBeforeColumnValidate(t *testing.T
 	}
 
 	t.Run("include-only good migrates despite money/interval in bad", func(t *testing.T) {
-		filter, err := NewTableFilter([]string{"good"}, nil)
+		filter, err := migcore.NewTableFilter([]string{"good"}, nil)
 		if err != nil {
-			t.Fatalf("NewTableFilter: %v", err)
+			t.Fatalf("migcore.NewTableFilter: %v", err)
 		}
 		mig := &Migrator{
 			Source:    pgEng,
@@ -101,9 +102,9 @@ func TestMigrate_PostgresToPostgres_Bug76FilterBeforeColumnValidate(t *testing.T
 		_, targetDSN2, cleanup2 := startPostgres(t)
 		defer cleanup2()
 
-		filter, err := NewTableFilter(nil, []string{"bad"})
+		filter, err := migcore.NewTableFilter(nil, []string{"bad"})
 		if err != nil {
-			t.Fatalf("NewTableFilter: %v", err)
+			t.Fatalf("migcore.NewTableFilter: %v", err)
 		}
 		mig := &Migrator{
 			Source:    pgEng,

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // TestLiveAddedFilter_ContainsAndSet pins the load-bearing surface of
@@ -85,77 +86,77 @@ func TestLiveAddedFilter_Snapshot(t *testing.T) {
 func TestChangeAllowedWithLiveAdd_OrSemantics(t *testing.T) {
 	cases := []struct {
 		name    string
-		base    TableFilter
+		base    migcore.TableFilter
 		live    []string
 		change  ir.Change
 		allowed bool
 	}{
 		{
 			name:    "empty base + empty live → all pass",
-			base:    TableFilter{},
+			base:    migcore.TableFilter{},
 			live:    nil,
 			change:  ir.Insert{Schema: "s", Table: "users"},
 			allowed: true,
 		},
 		{
 			name:    "include allows the table → pass",
-			base:    TableFilter{Include: []string{"users"}},
+			base:    migcore.TableFilter{Include: []string{"users"}},
 			live:    nil,
 			change:  ir.Insert{Schema: "s", Table: "users"},
 			allowed: true,
 		},
 		{
 			name:    "include drops the table; live empty → drop",
-			base:    TableFilter{Include: []string{"users"}},
+			base:    migcore.TableFilter{Include: []string{"users"}},
 			live:    nil,
 			change:  ir.Insert{Schema: "s", Table: "orders"},
 			allowed: false,
 		},
 		{
 			name:    "include drops the table; live admits it → pass (additive)",
-			base:    TableFilter{Include: []string{"users"}},
+			base:    migcore.TableFilter{Include: []string{"users"}},
 			live:    []string{"orders"},
 			change:  ir.Insert{Schema: "s", Table: "orders"},
 			allowed: true,
 		},
 		{
 			name:    "include drops the table; live empty (other tables) → drop",
-			base:    TableFilter{Include: []string{"users"}},
+			base:    migcore.TableFilter{Include: []string{"users"}},
 			live:    []string{"events"},
 			change:  ir.Insert{Schema: "s", Table: "orders"},
 			allowed: false,
 		},
 		{
 			name:    "exclude drops the table; live admits it → pass (additive override)",
-			base:    TableFilter{Exclude: []string{"audit_*"}},
+			base:    migcore.TableFilter{Exclude: []string{"audit_*"}},
 			live:    []string{"audit_special"},
 			change:  ir.Insert{Schema: "s", Table: "audit_special"},
 			allowed: true,
 		},
 		{
 			name:    "exclude drops the table; live empty → drop",
-			base:    TableFilter{Exclude: []string{"audit_*"}},
+			base:    migcore.TableFilter{Exclude: []string{"audit_*"}},
 			live:    nil,
 			change:  ir.Insert{Schema: "s", Table: "audit_log"},
 			allowed: false,
 		},
 		{
 			name:    "tx-begin bypasses both filters",
-			base:    TableFilter{Include: []string{"users"}},
+			base:    migcore.TableFilter{Include: []string{"users"}},
 			live:    nil,
 			change:  ir.TxBegin{},
 			allowed: true,
 		},
 		{
 			name:    "tx-commit bypasses both filters",
-			base:    TableFilter{Include: []string{"users"}},
+			base:    migcore.TableFilter{Include: []string{"users"}},
 			live:    nil,
 			change:  ir.TxCommit{},
 			allowed: true,
 		},
 		{
 			name:    "schema-prefixed name strips schema before lookup",
-			base:    TableFilter{Include: []string{"users"}},
+			base:    migcore.TableFilter{Include: []string{"users"}},
 			live:    []string{"orders"},
 			change:  ir.Insert{Schema: "public", Table: "orders"},
 			allowed: true,
@@ -181,7 +182,7 @@ func TestChangeAllowedWithLiveAdd_OrSemantics(t *testing.T) {
 // the input channel verbatim with no goroutine.
 func TestFilterChangesWithLiveAdd_PassThroughEmpty(t *testing.T) {
 	in := make(chan ir.Change)
-	got := filterChangesWithLiveAdd(context.Background(), in, TableFilter{}, nil)
+	got := filterChangesWithLiveAdd(context.Background(), in, migcore.TableFilter{}, nil)
 	if got != in {
 		t.Errorf("empty filter + nil live: filterChangesWithLiveAdd returned a wrapped channel; want the same channel pointer (zero-overhead fast path)")
 	}
@@ -192,7 +193,7 @@ func TestFilterChangesWithLiveAdd_PassThroughEmpty(t *testing.T) {
 // includes it must allow the change through. This is the load-bearing
 // shape of the ADR-0034 add-table flow.
 func TestFilterChangesWithLiveAdd_LiveAdmitsExcluded(t *testing.T) {
-	base := TableFilter{Include: []string{"users"}}
+	base := migcore.TableFilter{Include: []string{"users"}}
 	live := &liveAddedFilter{}
 	live.Set([]string{"orders"})
 

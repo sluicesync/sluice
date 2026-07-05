@@ -127,7 +127,7 @@ type Migrator struct {
 	// and before any subsequent phase (schema apply, bulk copy,
 	// indexes, constraints) so each phase consumes the pruned
 	// schema implicitly.
-	Filter TableFilter
+	Filter migcore.TableFilter
 
 	// ViewFilter selects which source views participate in the
 	// migration's view-creation phase. Independent of [Filter] so

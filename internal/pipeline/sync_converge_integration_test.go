@@ -61,6 +61,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -380,7 +381,7 @@ func runConvCheck(rt *rapid.T, t *testing.T, env *convLiveEnv, c *convCase) {
 		TargetDSN:      env.dstDSN,
 		StreamID:       streamID,
 		SlotName:       slotName, // PG only; engines without slots ignore it
-		Filter:         TableFilter{Include: []string{table}},
+		Filter:         migcore.TableFilter{Include: []string{table}},
 		ApplyBatchSize: c.applyBatch,
 	}
 	ctx, cancel := context.WithCancel(context.Background())

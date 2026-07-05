@@ -565,7 +565,7 @@ func (s *Streamer) coldStartCopyOneDatabase(
 		return nil
 	}
 
-	if err := applyTableFilter(ctx, schema, s.Filter); err != nil {
+	if err := migcore.ApplyTableFilter(ctx, schema, s.Filter); err != nil {
 		return fmt.Errorf("pipeline: filter tables for %q: %w", database, err)
 	}
 	applyViewFilter(ctx, schema, s.ViewFilter, s.SkipViews)

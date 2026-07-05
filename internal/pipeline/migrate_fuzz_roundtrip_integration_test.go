@@ -60,6 +60,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/internal/fuzzgen"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	_ "modernc.org/sqlite" // database/sql driver for the SQLite source/target files
 
@@ -351,7 +352,7 @@ func runOneCase(t *testing.T, fe *fuzzEnv, gc *fuzzgen.Case) (v fuzzgen.Verdict,
 		Target:      fe.dstEng,
 		SourceDSN:   fe.srcDSN,
 		TargetDSN:   fe.dstDSN,
-		Filter:      TableFilter{Include: []string{gc.TableName}},
+		Filter:      migcore.TableFilter{Include: []string{gc.TableName}},
 		MigrationID: fmt.Sprintf("fuzz-%s-%d-%d", strings.ReplaceAll(gc.Dir.String(), "->", "_"), gc.Seed, gc.CaseIdx),
 	}
 	ctx := ctx2min(t)

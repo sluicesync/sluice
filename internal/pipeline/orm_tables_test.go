@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // ormCol / ormTbl are terse builders for the recognition fixtures.
@@ -208,7 +209,7 @@ func TestApplyORMTableSkipPrunes(t *testing.T) {
 		ormTbl("orders", ormCol("id", anInt)),
 		ormTbl("_prisma_migrations", ormCol("id", aVarch)),
 	}}
-	applyORMTableSkip(context.Background(), schema, true, TableFilter{})
+	applyORMTableSkip(context.Background(), schema, true, migcore.TableFilter{})
 
 	got := tableNames(schema)
 	want := []string{"users", "orders"}
@@ -231,7 +232,7 @@ func TestApplyORMTableSkipDisabledIsIdentity(t *testing.T) {
 		ormTbl("users", ormCol("id", anInt)),
 		ormTbl("flyway_schema_history", ormCol("installed_rank", anInt)),
 	}}
-	applyORMTableSkip(context.Background(), schema, false, TableFilter{})
+	applyORMTableSkip(context.Background(), schema, false, migcore.TableFilter{})
 	if got, want := tableNames(schema), []string{"users", "flyway_schema_history"}; !equalStrings(got, want) {
 		t.Fatalf("skip=false changed schema: got %v; want %v", got, want)
 	}
@@ -245,7 +246,7 @@ func TestApplyORMTableSkipExplicitIncludeWins(t *testing.T) {
 		ormTbl("flyway_schema_history", ormCol("installed_rank", anInt)),
 	}}
 	// Include-mode filter naming the ORM table explicitly (case-insensitive).
-	filter := TableFilter{Include: []string{"users", "FLYWAY_SCHEMA_HISTORY"}}
+	filter := migcore.TableFilter{Include: []string{"users", "FLYWAY_SCHEMA_HISTORY"}}
 	applyORMTableSkip(context.Background(), schema, true, filter)
 	if got, want := tableNames(schema), []string{"users", "flyway_schema_history"}; !equalStrings(got, want) {
 		t.Fatalf("explicit --include-table not honored: got %v; want %v", got, want)
@@ -262,7 +263,7 @@ func TestApplyORMTableSkipCollisionKept(t *testing.T) {
 		ormTbl("users", ormCol("id", anInt)),
 		appMigrations,
 	}}
-	applyORMTableSkip(context.Background(), schema, true, TableFilter{})
+	applyORMTableSkip(context.Background(), schema, true, migcore.TableFilter{})
 	if got, want := tableNames(schema), []string{"users", "migrations"}; !equalStrings(got, want) {
 		t.Fatalf("collision table dropped: got %v; want %v", got, want)
 	}

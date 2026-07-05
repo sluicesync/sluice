@@ -62,7 +62,7 @@ type Differ struct {
 
 	// Filter selects which source tables participate. Empty (zero
 	// value) keeps every source table the reader returns.
-	Filter TableFilter
+	Filter migcore.TableFilter
 
 	// ViewFilter selects which source views participate in the
 	// diff. Empty keeps every view; SkipViews=true drops them all.
@@ -176,7 +176,7 @@ func (d *Differ) Run(ctx context.Context) (*irdiff.SchemaDiff, error) {
 	// `_vt_*`) when the operator is in exclude-or-no-filter mode.
 	// Computed before the read so the Bug-76 scope push-down (below)
 	// matches the authoritative post-read prune.
-	if eff, added := effectiveTableFilter(d.Filter, d.Source, d.SourceDSN); len(added) > 0 {
+	if eff, added := migcore.EffectiveTableFilter(d.Filter, d.Source, d.SourceDSN); len(added) > 0 {
 		slog.InfoContext(
 			ctx, "applying engine-default table exclusions",
 			slog.String("engine", d.Source.Name()),
@@ -197,7 +197,7 @@ func (d *Differ) Run(ctx context.Context) (*irdiff.SchemaDiff, error) {
 		return nil, errors.New("diff: source schema has no tables")
 	}
 
-	if err := applyTableFilter(ctx, srcSchema, d.Filter); err != nil {
+	if err := migcore.ApplyTableFilter(ctx, srcSchema, d.Filter); err != nil {
 		return nil, err
 	}
 	applyViewFilter(ctx, srcSchema, d.ViewFilter, d.SkipViews)

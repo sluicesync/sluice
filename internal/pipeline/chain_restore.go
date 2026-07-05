@@ -62,7 +62,7 @@ type ChainRestore struct {
 	Store irbackup.Store
 
 	// Filter selects which tables from the chain participate.
-	Filter TableFilter
+	Filter migcore.TableFilter
 
 	// MaxBufferBytes is the soft byte cap on per-batch buffered
 	// memory. Same semantics as [Migrator.MaxBufferBytes].
@@ -411,7 +411,7 @@ func (r *ChainRestore) syncIdentitySequencesAtTail(ctx context.Context, links []
 	}
 	// Retarget mirrors the full-restore path (identity for same-engine).
 	// The filter trims into a FRESH slice — the newest link's manifest
-	// schema must not be mutated (applyTableFilter trims in place, and
+	// schema must not be mutated (migcore.ApplyTableFilter trims in place, and
 	// same-engine retarget returns the input pointer).
 	schema = translate.RetargetForEngine(schema, sourceEngine, r.Target.Name())
 	tables := schema.Tables

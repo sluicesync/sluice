@@ -20,6 +20,7 @@ import (
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // validateTargetSchema enforces the engine-capability gate for
@@ -175,16 +176,16 @@ func applyVerbatimExtensionPassthrough(target any, enabled bool) {
 // surface, so per-column type validation is scoped to the
 // to-be-migrated tables (catalog Bug 76). Engines that don't implement
 // TableScoper (today: MySQL) skip cleanly — the authoritative
-// post-read [applyTableFilter] still prunes the schema there; only the
+// post-read [migcore.ApplyTableFilter] still prunes the schema there; only the
 // Bug-76 usability gap (a scoped-out unsupported column aborting the
 // run) remains until that engine grows the same push-down.
 //
 // An empty filter is still threaded: the predicate then admits every
 // table, which is exactly the unscoped behaviour, so this is safe to
 // call unconditionally. The filter passed here MUST already have
-// engine-default exclusions merged (effectiveTableFilter) so the
+// engine-default exclusions merged (migcore.EffectiveTableFilter) so the
 // push-down matches the post-read prune.
-func applyTableScope(reader any, filter TableFilter) {
+func applyTableScope(reader any, filter migcore.TableFilter) {
 	scoper, ok := reader.(ir.TableScoper)
 	if !ok {
 		return

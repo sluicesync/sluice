@@ -11,13 +11,14 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // TestNewTableFilterMutualExclusion checks that supplying both
 // Include and Exclude is rejected up front, before the filter
 // participates in any migration.
 func TestNewTableFilterMutualExclusion(t *testing.T) {
-	_, err := NewTableFilter([]string{"users"}, []string{"audit_log"})
+	_, err := migcore.NewTableFilter([]string{"users"}, []string{"audit_log"})
 	if err == nil {
 		t.Fatal("expected error for both include and exclude; got nil")
 	}
@@ -42,7 +43,7 @@ func TestNewTableFilterRejectsBadPattern(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			if _, err := NewTableFilter(c.include, c.exclude); err == nil {
+			if _, err := migcore.NewTableFilter(c.include, c.exclude); err == nil {
 				t.Errorf("expected error for malformed pattern; got nil")
 			}
 		})
@@ -54,31 +55,31 @@ func TestNewTableFilterRejectsBadPattern(t *testing.T) {
 func TestTableFilterAllows(t *testing.T) {
 	cases := []struct {
 		name   string
-		filter TableFilter
+		filter migcore.TableFilter
 		table  string
 		want   bool
 	}{
-		{"empty filter passes everything", TableFilter{}, "users", true},
-		{"empty filter passes empty name", TableFilter{}, "", true},
+		{"empty filter passes everything", migcore.TableFilter{}, "users", true},
+		{"empty filter passes empty name", migcore.TableFilter{}, "", true},
 
-		{"include literal match", TableFilter{Include: []string{"users"}}, "users", true},
-		{"include literal miss", TableFilter{Include: []string{"users"}}, "orders", false},
-		{"include multi-literal hit", TableFilter{Include: []string{"users", "orders"}}, "orders", true},
-		{"include glob hit", TableFilter{Include: []string{"audit_*"}}, "audit_log", true},
-		{"include glob miss", TableFilter{Include: []string{"audit_*"}}, "users", false},
-		{"include glob and literal", TableFilter{Include: []string{"users", "audit_*"}}, "audit_login", true},
-		{"include question-mark glob", TableFilter{Include: []string{"t?bl"}}, "tabl", true},
-		{"include character class", TableFilter{Include: []string{"[ab]_thing"}}, "a_thing", true},
-		{"include character class miss", TableFilter{Include: []string{"[ab]_thing"}}, "c_thing", false},
+		{"include literal match", migcore.TableFilter{Include: []string{"users"}}, "users", true},
+		{"include literal miss", migcore.TableFilter{Include: []string{"users"}}, "orders", false},
+		{"include multi-literal hit", migcore.TableFilter{Include: []string{"users", "orders"}}, "orders", true},
+		{"include glob hit", migcore.TableFilter{Include: []string{"audit_*"}}, "audit_log", true},
+		{"include glob miss", migcore.TableFilter{Include: []string{"audit_*"}}, "users", false},
+		{"include glob and literal", migcore.TableFilter{Include: []string{"users", "audit_*"}}, "audit_login", true},
+		{"include question-mark glob", migcore.TableFilter{Include: []string{"t?bl"}}, "tabl", true},
+		{"include character class", migcore.TableFilter{Include: []string{"[ab]_thing"}}, "a_thing", true},
+		{"include character class miss", migcore.TableFilter{Include: []string{"[ab]_thing"}}, "c_thing", false},
 
-		{"exclude literal match", TableFilter{Exclude: []string{"audit_log"}}, "audit_log", false},
-		{"exclude literal miss", TableFilter{Exclude: []string{"audit_log"}}, "users", true},
-		{"exclude glob match", TableFilter{Exclude: []string{"tmp_*"}}, "tmp_export", false},
-		{"exclude glob miss", TableFilter{Exclude: []string{"tmp_*"}}, "users", true},
-		{"exclude multi", TableFilter{Exclude: []string{"audit_log", "sessions"}}, "sessions", false},
+		{"exclude literal match", migcore.TableFilter{Exclude: []string{"audit_log"}}, "audit_log", false},
+		{"exclude literal miss", migcore.TableFilter{Exclude: []string{"audit_log"}}, "users", true},
+		{"exclude glob match", migcore.TableFilter{Exclude: []string{"tmp_*"}}, "tmp_export", false},
+		{"exclude glob miss", migcore.TableFilter{Exclude: []string{"tmp_*"}}, "users", true},
+		{"exclude multi", migcore.TableFilter{Exclude: []string{"audit_log", "sessions"}}, "sessions", false},
 
-		{"name with special characters survives literal", TableFilter{Include: []string{"users-archive"}}, "users-archive", true},
-		{"empty string with literal include miss", TableFilter{Include: []string{"users"}}, "", false},
+		{"name with special characters survives literal", migcore.TableFilter{Include: []string{"users-archive"}}, "users-archive", true},
+		{"empty string with literal include miss", migcore.TableFilter{Include: []string{"users"}}, "", false},
 	}
 	for _, c := range cases {
 		c := c
@@ -93,13 +94,13 @@ func TestTableFilterAllows(t *testing.T) {
 // TestTableFilterIsEmpty confirms the helper distinguishes the
 // zero-value filter (no rules) from any populated filter.
 func TestTableFilterIsEmpty(t *testing.T) {
-	if !(TableFilter{}).IsEmpty() {
-		t.Error("zero-value TableFilter should be empty")
+	if !(migcore.TableFilter{}).IsEmpty() {
+		t.Error("zero-value migcore.TableFilter should be empty")
 	}
-	if (TableFilter{Include: []string{"x"}}).IsEmpty() {
+	if (migcore.TableFilter{Include: []string{"x"}}).IsEmpty() {
 		t.Error("filter with Include should not be empty")
 	}
-	if (TableFilter{Exclude: []string{"x"}}).IsEmpty() {
+	if (migcore.TableFilter{Exclude: []string{"x"}}).IsEmpty() {
 		t.Error("filter with Exclude should not be empty")
 	}
 }
@@ -119,9 +120,9 @@ func TestApplyTableFilterPrunes(t *testing.T) {
 			{Name: "audit_log"},
 		},
 	}
-	filter := TableFilter{Exclude: []string{"audit_*"}}
-	if err := applyTableFilter(context.Background(), schema, filter); err != nil {
-		t.Fatalf("applyTableFilter: %v", err)
+	filter := migcore.TableFilter{Exclude: []string{"audit_*"}}
+	if err := migcore.ApplyTableFilter(context.Background(), schema, filter); err != nil {
+		t.Fatalf("migcore.ApplyTableFilter: %v", err)
 	}
 	if len(schema.Tables) != 2 {
 		t.Fatalf("schema.Tables = %d; want 2", len(schema.Tables))
@@ -151,8 +152,8 @@ func TestApplyTableFilterEmptyResultErrors(t *testing.T) {
 	schema := &ir.Schema{
 		Tables: []*ir.Table{{Name: "users"}, {Name: "orders"}},
 	}
-	filter := TableFilter{Include: []string{"nonexistent"}}
-	err := applyTableFilter(context.Background(), schema, filter)
+	filter := migcore.TableFilter{Include: []string{"nonexistent"}}
+	err := migcore.ApplyTableFilter(context.Background(), schema, filter)
 	if err == nil {
 		t.Fatal("expected error for empty-result filter; got nil")
 	}
@@ -170,8 +171,8 @@ func TestApplyTableFilterEmptyFilterNoOp(t *testing.T) {
 	schema := &ir.Schema{
 		Tables: []*ir.Table{{Name: "users"}, {Name: "orders"}},
 	}
-	if err := applyTableFilter(context.Background(), schema, TableFilter{}); err != nil {
-		t.Fatalf("applyTableFilter: %v", err)
+	if err := migcore.ApplyTableFilter(context.Background(), schema, migcore.TableFilter{}); err != nil {
+		t.Fatalf("migcore.ApplyTableFilter: %v", err)
 	}
 	if len(schema.Tables) != 2 {
 		t.Errorf("empty filter should not prune; got %d tables", len(schema.Tables))
@@ -196,7 +197,7 @@ func TestFilterChangesDropsExcluded(t *testing.T) {
 	in <- ir.Insert{Schema: "", Table: "orders", Row: ir.Row{"id": 4}}
 	close(in)
 
-	filter := TableFilter{Exclude: []string{"audit_*"}}
+	filter := migcore.TableFilter{Exclude: []string{"audit_*"}}
 	out := filterChanges(ctx, in, filter)
 
 	received := make([]string, 0, 4)
@@ -226,7 +227,7 @@ func TestFilterChangesEmptyFilterPassthrough(t *testing.T) {
 	in <- ir.Insert{Table: "users", Row: ir.Row{"id": int64(7)}}
 	close(in)
 
-	out := filterChanges(ctx, in, TableFilter{})
+	out := filterChanges(ctx, in, migcore.TableFilter{})
 	c, ok := <-out
 	if !ok {
 		t.Fatalf("expected event from empty-filter channel")
@@ -255,7 +256,7 @@ func TestFilterChangesDebugLogOnly(t *testing.T) {
 	in := make(chan ir.Change, 1)
 	in <- ir.Insert{Table: "audit_log"}
 	close(in)
-	out := filterChanges(ctx, in, TableFilter{Exclude: []string{"audit_*"}})
+	out := filterChanges(ctx, in, migcore.TableFilter{Exclude: []string{"audit_*"}})
 	for range out {
 	}
 	if strings.Contains(buf.String(), "cdc event dropped") {
@@ -270,25 +271,25 @@ func TestChangeAllowedStripsSchemaPrefix(t *testing.T) {
 	cases := []struct {
 		name   string
 		change ir.Change
-		filter TableFilter
+		filter migcore.TableFilter
 		want   bool
 	}{
 		{
 			"schema-qualified passes literal include",
 			ir.Insert{Schema: "public", Table: "users"},
-			TableFilter{Include: []string{"users"}},
+			migcore.TableFilter{Include: []string{"users"}},
 			true,
 		},
 		{
 			"schema-qualified caught by exclude",
 			ir.Insert{Schema: "public", Table: "audit_log"},
-			TableFilter{Exclude: []string{"audit_*"}},
+			migcore.TableFilter{Exclude: []string{"audit_*"}},
 			false,
 		},
 		{
 			"unqualified passes",
 			ir.Insert{Table: "users"},
-			TableFilter{Include: []string{"users"}},
+			migcore.TableFilter{Include: []string{"users"}},
 			true,
 		},
 	}
@@ -326,31 +327,31 @@ func TestEffectiveTableFilter_MergesEngineDefaults(t *testing.T) {
 
 	cases := []struct {
 		name        string
-		in          TableFilter
+		in          migcore.TableFilter
 		wantExclude []string
 		wantAdded   []string
 	}{
 		{
 			"empty filter gets engine defaults appended",
-			TableFilter{},
+			migcore.TableFilter{},
 			[]string{"_vt_*"},
 			[]string{"_vt_*"},
 		},
 		{
 			"operator exclude is preserved and engine defaults appended",
-			TableFilter{Exclude: []string{"audit_*"}},
+			migcore.TableFilter{Exclude: []string{"audit_*"}},
 			[]string{"audit_*", "_vt_*"},
 			[]string{"_vt_*"},
 		},
 		{
 			"operator include short-circuits the merge",
-			TableFilter{Include: []string{"users"}},
+			migcore.TableFilter{Include: []string{"users"}},
 			nil, // unchanged: Include preserved, Exclude stays empty
 			nil,
 		},
 		{
 			"engine pattern already in operator exclude is deduplicated",
-			TableFilter{Exclude: []string{"_vt_*", "audit_*"}},
+			migcore.TableFilter{Exclude: []string{"_vt_*", "audit_*"}},
 			[]string{"_vt_*", "audit_*"},
 			nil, // nothing added — operator already had it
 		},
@@ -358,7 +359,7 @@ func TestEffectiveTableFilter_MergesEngineDefaults(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			got, added := effectiveTableFilter(c.in, engine, "")
+			got, added := migcore.EffectiveTableFilter(c.in, engine, "")
 			if !equalSlices(added, c.wantAdded) {
 				t.Errorf("added = %v; want %v", added, c.wantAdded)
 			}
@@ -379,8 +380,8 @@ func TestEffectiveTableFilter_MergesEngineDefaults(t *testing.T) {
 // Vanilla MySQL (which has no `_vt_*` reserved prefix) goes through
 // this path.
 func TestEffectiveTableFilter_NonExcluderEngine(t *testing.T) {
-	in := TableFilter{Exclude: []string{"audit_*"}}
-	got, added := effectiveTableFilter(in, stubEngine{}, "")
+	in := migcore.TableFilter{Exclude: []string{"audit_*"}}
+	got, added := migcore.EffectiveTableFilter(in, stubEngine{}, "")
 	if added != nil {
 		t.Errorf("added = %v; want nil (engine doesn't implement the interface)", added)
 	}
@@ -394,8 +395,8 @@ func TestEffectiveTableFilter_NonExcluderEngine(t *testing.T) {
 // vanilla MySQL once the shared mysql.Engine grows the method).
 // Equivalent to no opt-in.
 func TestEffectiveTableFilter_EmptyDefaults(t *testing.T) {
-	in := TableFilter{Exclude: []string{"audit_*"}}
-	got, added := effectiveTableFilter(in, fakeExcluder{patterns: nil}, "")
+	in := migcore.TableFilter{Exclude: []string{"audit_*"}}
+	got, added := migcore.EffectiveTableFilter(in, fakeExcluder{patterns: nil}, "")
 	if added != nil {
 		t.Errorf("added = %v; want nil (no defaults declared)", added)
 	}

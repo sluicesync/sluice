@@ -43,6 +43,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/engines/pgtrigger"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	// Side-effect imports register both engines.
 	_ "sluicesync.dev/sluice/internal/engines/pgtrigger"
@@ -332,12 +333,12 @@ func TestMigratePGTrigger_BulkCopyPlusCDCRoundTrip(t *testing.T) {
 	}
 }
 
-// mustNewFilter wraps NewTableFilter so the test code stays compact.
-func mustNewFilter(t *testing.T, include, exclude []string) TableFilter {
+// mustNewFilter wraps migcore.NewTableFilter so the test code stays compact.
+func mustNewFilter(t *testing.T, include, exclude []string) migcore.TableFilter {
 	t.Helper()
-	f, err := NewTableFilter(include, exclude)
+	f, err := migcore.NewTableFilter(include, exclude)
 	if err != nil {
-		t.Fatalf("NewTableFilter: %v", err)
+		t.Fatalf("migcore.NewTableFilter: %v", err)
 	}
 	return f
 }

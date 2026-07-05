@@ -123,7 +123,7 @@ type Backup struct {
 	// Filter selects which source tables participate in the backup.
 	// Empty filter (zero value) keeps every table the schema reader
 	// returns.
-	Filter TableFilter
+	Filter migcore.TableFilter
 
 	// ChunkRows is the per-chunk row count. Zero falls back to
 	// [DefaultBackupChunkRows]. The writer rolls over to a new chunk
@@ -259,7 +259,7 @@ func (b *Backup) Run(ctx context.Context) error {
 	// Engine-default exclusions (Bug 22): merge in PlanetScale's
 	// `_vt_*` shadow tables when the source signals them via the
 	// optional [ir.DefaultTableExcluder] surface.
-	if eff, added := effectiveTableFilter(b.Filter, b.Source, b.SourceDSN); len(added) > 0 {
+	if eff, added := migcore.EffectiveTableFilter(b.Filter, b.Source, b.SourceDSN); len(added) > 0 {
 		slog.InfoContext(
 			ctx, "backup: applying engine-default table exclusions",
 			slog.String("engine", b.Source.Name()),
@@ -306,8 +306,8 @@ func (b *Backup) Run(ctx context.Context) error {
 	}
 
 	// 2. Apply table filter.
-	if err := applyTableFilter(ctx, schema, b.Filter); err != nil {
-		// applyTableFilter errors when the filter excludes everything.
+	if err := migcore.ApplyTableFilter(ctx, schema, b.Filter); err != nil {
+		// migcore.ApplyTableFilter errors when the filter excludes everything.
 		// For backups that's still a valid intent in some workflows
 		// (e.g. "snapshot-time-only"), but matching the migrate shape
 		// — surface the error so the operator notices.
@@ -796,7 +796,7 @@ func (b *Backup) resolveResumeState(ctx context.Context) (prior *irbackup.Manife
 //     non-snapshot fallback.
 //
 // The schema passed here is already filtered to the included tables by
-// [applyTableFilter] (called earlier in Run), so its table names are the
+// [migcore.ApplyTableFilter] (called earlier in Run), so its table names are the
 // backup's effective scope. implemented reports whether ANY snapshot
 // opener was found; err carries an open failure (the caller falls back to
 // the v0.17.x path on a non-nil err exactly as the base OpenBackupSnapshot

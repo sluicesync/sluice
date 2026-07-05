@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 )
@@ -64,9 +65,9 @@ func TestStreamer_AddTable_LiveMode_MySQL(t *testing.T) {
 	}
 
 	const streamID = "test-live-add-mysql-happy"
-	filter, err := NewTableFilter([]string{"users"}, nil)
+	filter, err := migcore.NewTableFilter([]string{"users"}, nil)
 	if err != nil {
-		t.Fatalf("NewTableFilter: %v", err)
+		t.Fatalf("migcore.NewTableFilter: %v", err)
 	}
 
 	streamer := &Streamer{
@@ -185,9 +186,9 @@ func TestStreamer_AddTable_LiveMode_MySQL_UnderLoad(t *testing.T) {
 	}
 
 	const streamID = "test-live-add-mysql-under-load"
-	filter, err := NewTableFilter([]string{"users"}, nil)
+	filter, err := migcore.NewTableFilter([]string{"users"}, nil)
 	if err != nil {
-		t.Fatalf("NewTableFilter: %v", err)
+		t.Fatalf("migcore.NewTableFilter: %v", err)
 	}
 
 	streamer := &Streamer{
@@ -367,9 +368,9 @@ func TestStreamer_AddTable_LiveMode_MySQL_FilterRespectedAfterFlip(t *testing.T)
 	}
 
 	const streamID = "test-live-add-mysql-additive"
-	filter, err := NewTableFilter([]string{"users"}, nil)
+	filter, err := migcore.NewTableFilter([]string{"users"}, nil)
 	if err != nil {
-		t.Fatalf("NewTableFilter: %v", err)
+		t.Fatalf("migcore.NewTableFilter: %v", err)
 	}
 
 	streamer := &Streamer{

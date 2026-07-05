@@ -18,6 +18,7 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/redact"
 )
 
@@ -458,7 +459,7 @@ func (b *BackupFullCmd) run(g *Globals, env *envelopeRun) error {
 		return errors.New("--output-dir and --target are mutually exclusive")
 	}
 	include, exclude := resolveTableFilterArgs(b.IncludeTable, b.ExcludeTable, cfg)
-	filter, err := pipeline.NewTableFilter(include, exclude)
+	filter, err := migcore.NewTableFilter(include, exclude)
 	if err != nil {
 		return err
 	}
@@ -1287,7 +1288,7 @@ func (r *RestoreCmd) run(g *Globals, env *envelopeRun) error {
 		return errors.New("--from-dir and --from are mutually exclusive")
 	}
 	include, exclude := resolveTableFilterArgs(r.IncludeTable, r.ExcludeTable, cfg)
-	filter, err := pipeline.NewTableFilter(include, exclude)
+	filter, err := migcore.NewTableFilter(include, exclude)
 	if err != nil {
 		return err
 	}

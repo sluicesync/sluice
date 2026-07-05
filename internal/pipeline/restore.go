@@ -59,7 +59,7 @@ type Restore struct {
 
 	// Filter selects which tables from the manifest participate.
 	// Empty (zero value) restores every table.
-	Filter TableFilter
+	Filter migcore.TableFilter
 
 	// MaxBufferBytes is the soft byte cap on per-batch buffered
 	// memory in the row writer. Same semantics as [Migrator.MaxBufferBytes].
@@ -375,7 +375,7 @@ func (r *Restore) Run(ctx context.Context) error {
 	// 2. Filter tables — both at the schema level (so unwanted
 	//    tables never get created) and at the manifest-table level
 	//    (so unwanted chunks never get streamed).
-	if err := applyTableFilter(ctx, manifest.Schema, r.Filter); err != nil {
+	if err := migcore.ApplyTableFilter(ctx, manifest.Schema, r.Filter); err != nil {
 		return err
 	}
 	manifest.Tables = filterManifestTables(manifest.Tables, r.Filter)
@@ -993,7 +993,7 @@ func (r *Restore) streamChunkRows(
 // filterManifestTables filters the manifest's table list against the
 // supplied filter, mirroring the schema-side filtering. Empty filter
 // returns the input unchanged.
-func filterManifestTables(in []*irbackup.TableManifest, filter TableFilter) []*irbackup.TableManifest {
+func filterManifestTables(in []*irbackup.TableManifest, filter migcore.TableFilter) []*irbackup.TableManifest {
 	if filter.IsEmpty() {
 		return in
 	}

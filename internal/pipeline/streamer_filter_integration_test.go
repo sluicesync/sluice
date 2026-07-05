@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -57,9 +58,9 @@ func TestStreamer_FilterExcludesCDCEvents(t *testing.T) {
 	mysqlEng, _ := engines.Get("mysql")
 	pgEng, _ := engines.Get("postgres")
 
-	filter, err := NewTableFilter(nil, []string{"audit_log"})
+	filter, err := migcore.NewTableFilter(nil, []string{"audit_log"})
 	if err != nil {
-		t.Fatalf("NewTableFilter: %v", err)
+		t.Fatalf("migcore.NewTableFilter: %v", err)
 	}
 
 	streamer := &Streamer{

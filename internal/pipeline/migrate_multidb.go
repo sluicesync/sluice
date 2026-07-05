@@ -365,7 +365,7 @@ func (m *Migrator) applyDeferredConstraints(ctx context.Context, scope *multiDBS
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: read source schema: %w", err))
 	}
-	if err := applyTableFilter(ctx, schema, m.Filter); err != nil {
+	if err := migcore.ApplyTableFilter(ctx, schema, m.Filter); err != nil {
 		return err
 	}
 	// ADR-0143: prune the ORM tables here too so this deferred cross-database

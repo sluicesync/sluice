@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -92,7 +93,7 @@ func TestStreamer_ApplyConcurrencyDefault_EngagesAndConvergesWithSerial(t *testi
 			TargetDSN:        targetDSN,
 			StreamID:         streamID,
 			SlotName:         "slot_" + streamID,
-			Filter:           TableFilter{Include: []string{table}},
+			Filter:           migcore.TableFilter{Include: []string{table}},
 			ApplyConcurrency: applyConcurrency,
 			// AutoTune + ApplyBatchSize>1 so the per-lane controllers (and the
 			// engagement INFO) are constructed when W>1; convergence is

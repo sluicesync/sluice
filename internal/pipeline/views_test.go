@@ -100,7 +100,7 @@ func TestApplyViewFilter_FiltersByPattern(t *testing.T) {
 }
 
 // TestApplyViewFilter_EmptyResultIsOK verifies that filtering down to
-// zero views is NOT an error (unlike applyTableFilter which rejects
+// zero views is NOT an error (unlike migcore.ApplyTableFilter which rejects
 // the all-empty case). Many schemas have no views; filtering all of
 // them away is a legitimate operator choice.
 func TestApplyViewFilter_EmptyResultIsOK(t *testing.T) {

@@ -39,6 +39,7 @@ import (
 	"strings"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // ormRemediation is the shared "why this is skipped / what to do instead"
@@ -253,7 +254,7 @@ func ormNameCollision(t *ir.Table) (orm string, collided bool) {
 // literal in --include-table. An explicit include always wins over ORM-skip:
 // the operator named the table, so sluice keeps it. A glob include that
 // merely happens to match does NOT count — naming is exact.
-func explicitlyIncluded(tableName string, filter TableFilter) bool {
+func explicitlyIncluded(tableName string, filter migcore.TableFilter) bool {
 	for _, p := range filter.Include {
 		if strings.EqualFold(p, tableName) {
 			return true
@@ -275,7 +276,7 @@ func explicitlyIncluded(tableName string, filter TableFilter) bool {
 // KEPT (it is application data) with a one-time name-collision warning, so a
 // real application table is never silently dropped — the loud-failure /
 // no-silent-loss discipline applied to a false-positive skip.
-func applyORMTableSkip(ctx context.Context, schema *ir.Schema, skip bool, filter TableFilter) {
+func applyORMTableSkip(ctx context.Context, schema *ir.Schema, skip bool, filter migcore.TableFilter) {
 	if !skip {
 		return
 	}

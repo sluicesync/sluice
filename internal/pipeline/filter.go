@@ -31,170 +31,16 @@ package pipeline
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"path"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
-// TableFilter decides whether a table participates in the migration
-// or sync stream. At most one of Include / Exclude is non-empty; the
-// orchestrator validates this at construction time. Match patterns
-// are stdlib [path.Match] glob style: literal names match exactly;
-// "audit_*" matches any name starting with "audit_".
-//
-// The zero value is the "everything passes" filter — nil/empty
-// Include and Exclude means no filtering. That matches the previous
-// behaviour for callers who don't supply a filter.
-type TableFilter struct {
-	// Include, when non-empty, is the allow-list: a table name must
-	// match at least one pattern to participate. Mutually exclusive
-	// with Exclude.
-	Include []string
-
-	// Exclude, when non-empty, is the deny-list: a table name that
-	// matches any pattern is dropped. Mutually exclusive with
-	// Include.
-	Exclude []string
-}
-
-// NewTableFilter validates that Include and Exclude are not both
-// populated and that every pattern is well-formed under
-// [path.Match]. Returns a usable TableFilter or a clear error
-// suitable for surfacing to the operator.
-func NewTableFilter(include, exclude []string) (TableFilter, error) {
-	if len(include) > 0 && len(exclude) > 0 {
-		return TableFilter{}, fmt.Errorf(
-			"pipeline: --include-table and --exclude-table are mutually exclusive (got include=%v exclude=%v)",
-			include, exclude,
-		)
-	}
-	for _, p := range include {
-		if _, err := path.Match(p, ""); err != nil {
-			return TableFilter{}, fmt.Errorf("pipeline: invalid include pattern %q: %w", p, err)
-		}
-	}
-	for _, p := range exclude {
-		if _, err := path.Match(p, ""); err != nil {
-			return TableFilter{}, fmt.Errorf("pipeline: invalid exclude pattern %q: %w", p, err)
-		}
-	}
-	return TableFilter{Include: include, Exclude: exclude}, nil
-}
-
-// IsEmpty reports whether the filter has no rules — i.e. whether
-// every table passes. Useful for skipping the post-prune
-// "filter applied" log line when there's nothing to report.
-func (f TableFilter) IsEmpty() bool {
-	return len(f.Include) == 0 && len(f.Exclude) == 0
-}
-
-// Allows reports whether table participates in the migration. The
-// match check uses [path.Match] semantics; an invalid pattern is
-// treated as "no match" (a defensive choice — NewTableFilter rejects
-// invalid patterns up front, so this branch is only reachable if a
-// caller bypasses the constructor).
-func (f TableFilter) Allows(tableName string) bool {
-	if len(f.Include) > 0 {
-		return matchesAny(f.Include, tableName)
-	}
-	if len(f.Exclude) > 0 {
-		return !matchesAny(f.Exclude, tableName)
-	}
-	return true
-}
-
-// effectiveTableFilter merges engine-supplied default exclusion
-// patterns into the operator's filter when the engine implements
-// [ir.DefaultTableExcluder]. Used today for PlanetScale's `_vt_*`
-// Vitess shadow-table prefix (Bug 22) — operators almost never want
-// those in a migration or stream, and forgetting to exclude them
-// generates quiet write churn against the target.
-//
-// Merge rules:
-//
-//   - Operator supplied --include-table: defaults are skipped
-//     (include-mode is an explicit allow-list; the operator opted
-//     into a precise table set and engine defaults shouldn't undermine
-//     that). If the operator wants `_vt_*` tables, --include-table is
-//     the override.
-//   - Operator supplied --exclude-table or no filter: defaults are
-//     appended to Exclude. Patterns the operator already specified
-//     are deduplicated by string equality.
-//   - Engine doesn't implement [ir.DefaultTableExcluder]: filter
-//     returned unchanged.
-//
-// Returns the merged filter and the slice of patterns that came from
-// engine defaults (for the "applying engine default exclusions" log
-// line, distinct from the "operator filter applied" line).
-func effectiveTableFilter(filter TableFilter, source ir.Engine, sourceDSN string) (effective TableFilter, addedDefaults []string) {
-	excluder, ok := source.(ir.DefaultTableExcluder)
-	if !ok {
-		return filter, nil
-	}
-	defaults := excluder.DefaultExcludePatterns(sourceDSN)
-	if len(defaults) == 0 {
-		return filter, nil
-	}
-	if len(filter.Include) > 0 {
-		// Explicit allow-list — engine defaults don't apply.
-		return filter, nil
-	}
-	added := make([]string, 0, len(defaults))
-	excludeSet := make(map[string]struct{}, len(filter.Exclude))
-	for _, p := range filter.Exclude {
-		excludeSet[p] = struct{}{}
-	}
-	merged := make([]string, 0, len(filter.Exclude)+len(defaults))
-	merged = append(merged, filter.Exclude...)
-	for _, p := range defaults {
-		if _, dup := excludeSet[p]; dup {
-			continue
-		}
-		merged = append(merged, p)
-		added = append(added, p)
-	}
-	if len(added) == 0 {
-		return filter, nil
-	}
-	return TableFilter{Include: nil, Exclude: merged}, added
-}
-
-// applyTableFilter mutates schema.Tables in place, retaining only
-// the tables the filter allows. Logs the count at info level so
-// operators can verify the filter matched what they expected. An
-// all-empty result is treated as user error (the filter excluded
-// every table) and surfaces a clear error.
-//
-// No-op when the filter is empty: avoids a noisy info line on every
-// migration where no filter is configured.
-func applyTableFilter(ctx context.Context, schema *ir.Schema, filter TableFilter) error {
-	if filter.IsEmpty() {
-		return nil
-	}
-	original := len(schema.Tables)
-	kept := schema.Tables[:0]
-	for _, t := range schema.Tables {
-		if filter.Allows(t.Name) {
-			kept = append(kept, t)
-		}
-	}
-	schema.Tables = kept
-	slog.InfoContext(
-		ctx, "table filter applied",
-		slog.Int("matched", len(kept)),
-		slog.Int("excluded", original-len(kept)),
-	)
-	if len(kept) == 0 {
-		return errors.New("pipeline: table filter excluded every source table; nothing to migrate (check --include-table / --exclude-table)")
-	}
-	return nil
-}
-
 // ViewFilter selects which views participate in the migration / sync /
-// preview / diff. Same shape and semantics as [TableFilter]; views are
+// preview / diff. Same shape and semantics as [migcore.TableFilter]; views are
 // filtered independently of tables so an operator can opt out of view
 // processing entirely (`--skip-views`) or include / exclude a subset
 // without touching the table filter.
@@ -203,7 +49,7 @@ type ViewFilter struct {
 	Exclude []string
 }
 
-// NewViewFilter mirrors [NewTableFilter]: validates mutual exclusion of
+// NewViewFilter mirrors [migcore.NewTableFilter]: validates mutual exclusion of
 // Include / Exclude and pattern shape.
 func NewViewFilter(include, exclude []string) (ViewFilter, error) {
 	if len(include) > 0 && len(exclude) > 0 {
@@ -231,7 +77,7 @@ func (f ViewFilter) IsEmpty() bool {
 }
 
 // Allows reports whether viewName is included by the filter. Same
-// semantics as [TableFilter.Allows].
+// semantics as [migcore.TableFilter.Allows].
 func (f ViewFilter) Allows(viewName string) bool {
 	if len(f.Include) > 0 {
 		return matchesAny(f.Include, viewName)
@@ -246,7 +92,7 @@ func (f ViewFilter) Allows(viewName string) bool {
 // views the filter allows. When skipAll is true, every view is dropped
 // regardless of the filter — used to wire `--skip-views` from the CLI.
 //
-// Unlike [applyTableFilter], an empty result is NOT an error: many
+// Unlike [migcore.ApplyTableFilter], an empty result is NOT an error: many
 // schemas have no views, and a filter that drops them all is a
 // legitimate operator choice. Schema-with-no-views was already a
 // supported state before view-support landed.
@@ -285,7 +131,7 @@ func applyViewFilter(ctx context.Context, schema *ir.Schema, filter ViewFilter, 
 
 // DatabaseFilter selects which source databases participate in a
 // multi-database fan-out migration (ADR-0074). Same shape and semantics
-// as [TableFilter]: at most one of Include / Exclude is non-empty
+// as [migcore.TableFilter]: at most one of Include / Exclude is non-empty
 // ([path.Match] glob patterns), validated at construction. The zero
 // value is the "everything passes" filter.
 //
@@ -298,7 +144,7 @@ type DatabaseFilter struct {
 	Exclude []string
 }
 
-// NewDatabaseFilter mirrors [NewTableFilter]: validates mutual exclusion
+// NewDatabaseFilter mirrors [migcore.NewTableFilter]: validates mutual exclusion
 // of Include / Exclude and that each pattern is well-formed under
 // [path.Match].
 func NewDatabaseFilter(include, exclude []string) (DatabaseFilter, error) {
@@ -327,7 +173,7 @@ func (f DatabaseFilter) IsEmpty() bool {
 }
 
 // Allows reports whether database participates. Same [path.Match]
-// semantics as [TableFilter.Allows].
+// semantics as [migcore.TableFilter.Allows].
 func (f DatabaseFilter) Allows(database string) bool {
 	if len(f.Include) > 0 {
 		return matchesAny(f.Include, database)
@@ -356,7 +202,7 @@ func (f DatabaseFilter) Allows(database string) bool {
 // events for a long time accumulates position lag bounded by the
 // source's WAL/binlog retention; in normal mixed-traffic workloads
 // this is invisible.
-func filterChanges(ctx context.Context, in <-chan ir.Change, filter TableFilter) <-chan ir.Change {
+func filterChanges(ctx context.Context, in <-chan ir.Change, filter migcore.TableFilter) <-chan ir.Change {
 	if filter.IsEmpty() {
 		return in
 	}
@@ -401,7 +247,7 @@ func filterChanges(ctx context.Context, in <-chan ir.Change, filter TableFilter)
 // entirely — they're applier-internal signals (ADR-0027), not
 // per-table data, and dropping them would defeat the
 // transaction-aware batch flush.
-func changeAllowed(c ir.Change, filter TableFilter) bool {
+func changeAllowed(c ir.Change, filter migcore.TableFilter) bool {
 	switch c.(type) {
 	case ir.TxBegin, ir.TxCommit:
 		return true
@@ -421,7 +267,7 @@ func changeAllowed(c ir.Change, filter TableFilter) bool {
 
 // matchesAny returns true when name matches at least one pattern
 // under [path.Match]. Errors from path.Match (only possible from
-// malformed character classes that NewTableFilter would already
+// malformed character classes that migcore.NewTableFilter would already
 // have rejected) are silently treated as non-match.
 func matchesAny(patterns []string, name string) bool {
 	for _, p := range patterns {

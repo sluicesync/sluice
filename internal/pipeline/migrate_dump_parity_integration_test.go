@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	// Register the postgres engine so engines.Get("postgres") works.
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -183,7 +184,7 @@ func TestMigrate_DumpParity_PGKitchenSink(t *testing.T) {
 		t.Fatalf("build sluice-target DSN: %v", err)
 	}
 
-	filter, err := NewTableFilter(nil, []string{"events", "events_*"})
+	filter, err := migcore.NewTableFilter(nil, []string{"events", "events_*"})
 	if err != nil {
 		t.Fatalf("build filter: %v", err)
 	}

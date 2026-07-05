@@ -34,7 +34,7 @@ func (m *Migrator) phaseReadSourceSchema(ctx context.Context, scope *multiDBScop
 	// pointing at a PlanetScale endpoint. Operator-supplied
 	// --include-table short-circuits the merge. Replace the field
 	// in-place because the orchestrator is single-shot per Run.
-	if eff, added := effectiveTableFilter(m.Filter, m.Source, m.SourceDSN); len(added) > 0 {
+	if eff, added := migcore.EffectiveTableFilter(m.Filter, m.Source, m.SourceDSN); len(added) > 0 {
 		slog.InfoContext(
 			ctx, "applying engine-default table exclusions",
 			slog.String("engine", m.Source.Name()),
@@ -70,7 +70,7 @@ func (m *Migrator) phaseReadSourceSchema(ctx context.Context, scope *multiDBScop
 	// catalog Bug 76: scope per-column type validation to the
 	// to-be-migrated tables. m.Filter already has engine-default
 	// exclusions merged just above, so this push-down matches the
-	// authoritative post-read applyTableFilter prune below.
+	// authoritative post-read migcore.ApplyTableFilter prune below.
 	applyTableScope(sr, m.Filter)
 
 	// Multi-database fan-out (ADR-0074): tell the source reader it is
@@ -94,13 +94,13 @@ func (m *Migrator) phaseReadSourceSchema(ctx context.Context, scope *multiDBScop
 	// Pruning here means every downstream phase (schema apply, bulk
 	// copy, indexes, constraints) operates on the filtered set
 	// implicitly — engines stay agnostic to the filter spec.
-	if err := applyTableFilter(ctx, schema, m.Filter); err != nil {
+	if err := migcore.ApplyTableFilter(ctx, schema, m.Filter); err != nil {
 		return sr, nil, err
 	}
 	applyViewFilter(ctx, schema, m.ViewFilter, m.SkipViews)
 
 	// ---- 1.3. Skip ORM/framework migration-bookkeeping tables (ADR-0143) ----
-	// Runs AFTER applyTableFilter so an explicit --include-table wins. No-op
+	// Runs AFTER migcore.ApplyTableFilter so an explicit --include-table wins. No-op
 	// unless SkipORMTables is set (the CLI default); the zero value for every
 	// programmatic caller is "don't skip", byte-identical to before. Covers
 	// the multi-database per-database migrate runs too (they reuse this phase).

@@ -8,7 +8,7 @@
 // poll goroutine reads that column on its existing tick cadence and
 // merges any new entries into the dispatch filter additively.
 //
-// The base [TableFilter] (operator's `--include-table` /
+// The base [migcore.TableFilter] (operator's `--include-table` /
 // `--exclude-table`) is never mutated. The merge is performed at
 // dispatch time via [changeAllowedWithLiveAdd], which permits a change
 // when EITHER the base filter allows the table OR the live-added set
@@ -37,6 +37,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // liveAddedTablesReader is the optional applier-side surface the
@@ -147,10 +148,10 @@ func (f *liveAddedFilter) Snapshot() []string {
 // channel verbatim — same zero-overhead shape as [filterChanges].
 //
 // The two-input shape lets the caller swap one without touching the
-// other; the streamer wires the operator-supplied [TableFilter] as
+// other; the streamer wires the operator-supplied [migcore.TableFilter] as
 // `base` and the running [liveAddedFilter] (whose contents change
 // over the run) as `live`.
-func filterChangesWithLiveAdd(ctx context.Context, in <-chan ir.Change, base TableFilter, live *liveAddedFilter) <-chan ir.Change {
+func filterChangesWithLiveAdd(ctx context.Context, in <-chan ir.Change, base migcore.TableFilter, live *liveAddedFilter) <-chan ir.Change {
 	// Fast path: no base filter and no live-add infra → pass-through.
 	// `live` may still be non-nil but empty; we let it through to the
 	// goroutine path because subsequent live-adds need to take effect
@@ -194,7 +195,7 @@ func filterChangesWithLiveAdd(ctx context.Context, in <-chan ir.Change, base Tab
 // Source-tx boundary events ([ir.TxBegin], [ir.TxCommit]) bypass both
 // (same shape as [changeAllowed]) — they're applier-internal signals,
 // not per-table data.
-func changeAllowedWithLiveAdd(c ir.Change, base TableFilter, live *liveAddedFilter) bool {
+func changeAllowedWithLiveAdd(c ir.Change, base migcore.TableFilter, live *liveAddedFilter) bool {
 	switch c.(type) {
 	case ir.TxBegin, ir.TxCommit:
 		return true

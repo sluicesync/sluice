@@ -29,6 +29,7 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	pstelemetry "sluicesync.dev/sluice/internal/planetscale/telemetry"
 	"sluicesync.dev/sluice/internal/redact"
 )
@@ -409,7 +410,7 @@ func (m *MigrateCmd) run(g *Globals, env *envelopeRun) error {
 		return errors.New("--resume and --reset-target-data are mutually exclusive")
 	}
 	include, exclude := resolveTableFilterArgs(m.IncludeTable, m.ExcludeTable, cfg)
-	filter, err := pipeline.NewTableFilter(include, exclude)
+	filter, err := migcore.NewTableFilter(include, exclude)
 	if err != nil {
 		return err
 	}
@@ -1554,7 +1555,7 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 		return err
 	}
 	include, exclude := resolveTableFilterArgs(s.IncludeTable, s.ExcludeTable, cfg)
-	filter, err := pipeline.NewTableFilter(include, exclude)
+	filter, err := migcore.NewTableFilter(include, exclude)
 	if err != nil {
 		return err
 	}

@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // TestCutover_ValidatesInputs pins the validate-first ordering — any
@@ -241,9 +242,9 @@ func TestCutover_FilterScopesSchema(t *testing.T) {
 	primer := &cutoverPrimerWriter{}
 	tgt := &cutoverEngine{name: "tgt", writer: primer}
 
-	filter, err := NewTableFilter(nil, []string{"internal_audit"})
+	filter, err := migcore.NewTableFilter(nil, []string{"internal_audit"})
 	if err != nil {
-		t.Fatalf("NewTableFilter err = %v", err)
+		t.Fatalf("migcore.NewTableFilter err = %v", err)
 	}
 
 	c := &Cutover{

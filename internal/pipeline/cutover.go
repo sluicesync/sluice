@@ -11,6 +11,7 @@ import (
 	"log/slog"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // Cutover drives the two-phase cutover sequence priming pass —
@@ -56,7 +57,7 @@ type Cutover struct {
 
 	// Filter restricts which tables participate in the priming pass.
 	// The zero value matches every table in the source schema.
-	Filter TableFilter
+	Filter migcore.TableFilter
 
 	// TargetSchema mirrors the migrator's per-source-namespace flag
 	// for Postgres targets (ADR-0031). Threaded to the SchemaWriter
@@ -175,7 +176,7 @@ func (c *Cutover) Run(ctx context.Context) (*ir.SequencePrimeReport, error) {
 
 // filterSchemaTables returns a shallow-copied schema with non-matching
 // tables filtered out. An empty filter returns schema verbatim.
-func filterSchemaTables(schema *ir.Schema, filter TableFilter) *ir.Schema {
+func filterSchemaTables(schema *ir.Schema, filter migcore.TableFilter) *ir.Schema {
 	if schema == nil {
 		return nil
 	}

@@ -66,7 +66,7 @@ type Previewer struct {
 	// Filter selects which source tables participate in the preview.
 	// Empty (zero value) keeps every table the source schema reader
 	// returns.
-	Filter TableFilter
+	Filter migcore.TableFilter
 
 	// ViewFilter selects which source views participate in the
 	// preview. Empty zero-value keeps every view; SkipViews=true
@@ -299,7 +299,7 @@ func (p *Previewer) Run(ctx context.Context) error {
 	// Streamer — merge engine-supplied patterns (e.g. PlanetScale's
 	// `_vt_*`) when the operator is in exclude-or-no-filter mode.
 	// Replace the field in-place; Previewer is single-shot per Run.
-	if eff, added := effectiveTableFilter(p.Filter, p.Source, p.SourceDSN); len(added) > 0 {
+	if eff, added := migcore.EffectiveTableFilter(p.Filter, p.Source, p.SourceDSN); len(added) > 0 {
 		slog.InfoContext(
 			ctx, "applying engine-default table exclusions",
 			slog.String("engine", p.Source.Name()),
@@ -307,7 +307,7 @@ func (p *Previewer) Run(ctx context.Context) error {
 		)
 		p.Filter = eff
 	}
-	if err := applyTableFilter(ctx, srcSchema, p.Filter); err != nil {
+	if err := migcore.ApplyTableFilter(ctx, srcSchema, p.Filter); err != nil {
 		return err
 	}
 	applyViewFilter(ctx, srcSchema, p.ViewFilter, p.SkipViews)

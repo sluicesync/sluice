@@ -11,6 +11,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/pipeline"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // VerifyCmd implements `sluice verify`. v0.12.0 ships count-mode
@@ -70,7 +71,7 @@ func (v *VerifyCmd) Run(g *Globals) error {
 		return operationalError{err: errors.New("--include-table and --exclude-table are mutually exclusive")}
 	}
 	include, exclude := resolveTableFilterArgs(v.IncludeTable, v.ExcludeTable, cfg)
-	filter, err := pipeline.NewTableFilter(include, exclude)
+	filter, err := migcore.NewTableFilter(include, exclude)
 	if err != nil {
 		return operationalError{err: err}
 	}

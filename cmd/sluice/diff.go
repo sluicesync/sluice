@@ -7,6 +7,7 @@ import (
 	"sluicesync.dev/sluice/internal/config"
 	irdiff "sluicesync.dev/sluice/internal/ir/diff"
 	"sluicesync.dev/sluice/internal/pipeline"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // SchemaDiffCmd implements `sluice schema diff` (ADR-0029). Reads the
@@ -84,7 +85,7 @@ func (s *SchemaDiffCmd) Run(g *Globals) error {
 		return operationalError{err: errors.New("--include-view and --exclude-view are mutually exclusive")}
 	}
 	include, exclude := resolveTableFilterArgs(s.IncludeTable, s.ExcludeTable, cfg)
-	filter, err := pipeline.NewTableFilter(include, exclude)
+	filter, err := migcore.NewTableFilter(include, exclude)
 	if err != nil {
 		return operationalError{err: err}
 	}
