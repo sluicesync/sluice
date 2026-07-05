@@ -169,31 +169,7 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 		_ = conn.Close()
 		return nil, err
 	}
-	livenessWindow, err := vstreamLivenessWindowFromDSN(cfg)
-	if err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	progressWindow, err := vstreamProgressWindowFromDSN(cfg)
-	if err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	copyProgressWindow, err := vstreamCopyProgressWindowFromDSN(cfg)
-	if err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	idleWarnWindow, err := vstreamIdleWarnWindowFromDSN(cfg)
-	if err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	// ADR-0099: cross-table COPY concurrency. The raw operator intent is
-	// parsed here (loud on a malformed value); the effective stream count is
-	// resolved against the in-scope table count below, once auto-shard
-	// eligibility is known.
-	rawTableParallelism, err := vstreamCopyTableParallelismFromDSN(cfg, e.opts.vstreamCopyTableParallelism)
+	tuning, err := e.resolveVStreamSnapshotTuning(cfg)
 	if err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -259,7 +235,7 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 	// estimator wired, so it uses the deterministic round-robin floor.
 	var concurrentGroups [][]string
 	if autoShard {
-		if k := resolveCopyTableParallelism(rawTableParallelism, len(tables)); k > 1 {
+		if k := resolveCopyTableParallelism(tuning.rawTableParallelism, len(tables)); k > 1 {
 			concurrentGroups = partitionTablesForStreams(tables, k, nil)
 		}
 	}
@@ -349,29 +325,7 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 	if autoShard {
 		reconnectScope = []string{tables[0]}
 		seq = tables
-		switch {
-		case concurrent:
-			slog.InfoContext(ctx, "mysql/vstream: snapshot: cross-table concurrent COPY enabled (ADR-0099)",
-				slog.String("keyspace", keyspace),
-				slog.Int("tables", len(tables)),
-				slog.Int("streams", len(concurrentGroups)))
-		case resumeSeedTable != "":
-			slog.InfoContext(ctx, "mysql/vstream: snapshot: auto-shard-by-table COPY RESUME (one table at a time, bounded memory; in-progress table seeded from cursor)",
-				slog.String("keyspace", keyspace),
-				slog.Int("tables", len(tables)),
-				slog.String("resume_table", resumeSeedTable))
-		default:
-			// Perf-parity gap 3: the sequential default is DELIBERATE on the
-			// VStream path (see defaultCopyTableParallelism's rationale —
-			// resume-partition stability + the per-stream buffer split), so
-			// the multi-table cold-copy names the throughput knob loudly
-			// instead of leaving a hidden serial ceiling.
-			slog.InfoContext(ctx, "mysql/vstream: snapshot: auto-shard-by-table COPY (one table at a time, bounded memory); "+
-				"cold-copy runs SEQUENTIAL by default on VStream sources — N concurrent COPY streams are available via "+
-				"--vstream-copy-table-parallelism (see docs/throughput-tuning.md)",
-				slog.String("keyspace", keyspace),
-				slog.Int("tables", len(tables)))
-		}
+		logAutoShardCopyMode(ctx, keyspace, tables, concurrent, resumeSeedTable, concurrentGroups)
 	}
 
 	snap := &vstreamSnapshotStream{
@@ -396,10 +350,10 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 		maxBufferBytes:       defaultSnapshotMaxBufferBytes,
 		checkpointRows:       defaultCopyCheckpointRows,
 		checkpointInterval:   defaultCopyCheckpointInterval,
-		livenessWindow:       livenessWindow,
-		progressWindow:       progressWindow,
-		copyProgressWindow:   copyProgressWindow,
-		idleWarnWindow:       idleWarnWindow,
+		livenessWindow:       tuning.livenessWindow,
+		progressWindow:       tuning.progressWindow,
+		copyProgressWindow:   tuning.copyProgressWindow,
+		idleWarnWindow:       tuning.idleWarnWindow,
 		conn:                 conn,
 		grpcStream:           grpcStream,
 		grpcCancel:           streamCancel,
@@ -471,6 +425,74 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 	}
 
 	return stream, nil
+}
+
+// vstreamSnapshotTuning bundles the per-DSN window + parallelism knobs
+// openVStreamSnapshotStreamFrom threads onto the snapshot stream, so the
+// five loud-on-malformed parses read as one call instead of five
+// conn-close-on-error blocks inline.
+type vstreamSnapshotTuning struct {
+	livenessWindow      time.Duration
+	progressWindow      time.Duration
+	copyProgressWindow  time.Duration
+	idleWarnWindow      time.Duration
+	rawTableParallelism int
+}
+
+// resolveVStreamSnapshotTuning parses the snapshot stream's DSN tuning
+// knobs, returning loudly on the first malformed value. The caller owns
+// the gRPC conn and closes it on error — this helper only parses cfg.
+// rawTableParallelism is the raw operator intent (ADR-0099); its
+// effective stream count is resolved against the in-scope table count
+// later, once auto-shard eligibility is known.
+func (e Engine) resolveVStreamSnapshotTuning(cfg *gomysql.Config) (vstreamSnapshotTuning, error) {
+	var (
+		t   vstreamSnapshotTuning
+		err error
+	)
+	if t.livenessWindow, err = vstreamLivenessWindowFromDSN(cfg); err != nil {
+		return t, err
+	}
+	if t.progressWindow, err = vstreamProgressWindowFromDSN(cfg); err != nil {
+		return t, err
+	}
+	if t.copyProgressWindow, err = vstreamCopyProgressWindowFromDSN(cfg); err != nil {
+		return t, err
+	}
+	if t.idleWarnWindow, err = vstreamIdleWarnWindowFromDSN(cfg); err != nil {
+		return t, err
+	}
+	if t.rawTableParallelism, err = vstreamCopyTableParallelismFromDSN(cfg, e.opts.vstreamCopyTableParallelism); err != nil {
+		return t, err
+	}
+	return t, nil
+}
+
+// logAutoShardCopyMode emits the one-time INFO line naming which
+// auto-shard-by-table COPY mode engaged (ADR-0095 / 0098 / 0099):
+// cross-table concurrent, a cursor-seeded resume, or the sequential
+// default. The default line names the throughput knob loudly (perf-parity
+// gap 3) so the deliberate serial ceiling on the VStream path is visible
+// rather than hidden.
+func logAutoShardCopyMode(ctx context.Context, keyspace string, tables []string, concurrent bool, resumeSeedTable string, concurrentGroups [][]string) {
+	switch {
+	case concurrent:
+		slog.InfoContext(ctx, "mysql/vstream: snapshot: cross-table concurrent COPY enabled (ADR-0099)",
+			slog.String("keyspace", keyspace),
+			slog.Int("tables", len(tables)),
+			slog.Int("streams", len(concurrentGroups)))
+	case resumeSeedTable != "":
+		slog.InfoContext(ctx, "mysql/vstream: snapshot: auto-shard-by-table COPY RESUME (one table at a time, bounded memory; in-progress table seeded from cursor)",
+			slog.String("keyspace", keyspace),
+			slog.Int("tables", len(tables)),
+			slog.String("resume_table", resumeSeedTable))
+	default:
+		slog.InfoContext(ctx, "mysql/vstream: snapshot: auto-shard-by-table COPY (one table at a time, bounded memory); "+
+			"cold-copy runs SEQUENTIAL by default on VStream sources — N concurrent COPY streams are available via "+
+			"--vstream-copy-table-parallelism (see docs/throughput-tuning.md)",
+			slog.String("keyspace", keyspace),
+			slog.Int("tables", len(tables)))
+	}
 }
 
 // vstreamCopySingleStreamFromDSN reports whether the operator opted OUT
