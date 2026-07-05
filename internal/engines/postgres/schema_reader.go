@@ -911,252 +911,314 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
-		var (
-			tableName, colName   string
-			ordinal              int
-			columnDefault        sql.NullString
-			isNullable, dataType string
-			udtName              string
-			charMaxLen, numPrec  sql.NullInt64
-			numScale, dtPrec     sql.NullInt64
-			isIdentity           string
-			isGenerated, genExpr string
-			collation            string
-			attTypmod            int32
-			formatType           string
-			columnTypeKind       string
-			columnTypeName       string
-		)
+		var cr columnRow
 		if err := rows.Scan(
-			&tableName, &colName, &ordinal,
-			&columnDefault, &isNullable,
-			&dataType, &udtName,
-			&charMaxLen, &numPrec, &numScale, &dtPrec,
-			&isIdentity,
-			&isGenerated, &genExpr,
-			&collation,
-			&attTypmod,
-			&formatType,
-			&columnTypeKind,
-			&columnTypeName,
+			&cr.tableName, &cr.colName, &cr.ordinal,
+			&cr.columnDefault, &cr.isNullable,
+			&cr.dataType, &cr.udtName,
+			&cr.charMaxLen, &cr.numPrec, &cr.numScale, &cr.dtPrec,
+			&cr.isIdentity,
+			&cr.isGenerated, &cr.genExpr,
+			&cr.collation,
+			&cr.attTypmod,
+			&cr.formatType,
+			&cr.columnTypeKind,
+			&cr.columnTypeName,
 		); err != nil {
 			return err
 		}
 
-		t, ok := tables[tableName]
+		t, ok := tables[cr.tableName]
 		if !ok {
 			continue
 		}
 
-		meta := columnMeta{
-			DataType:        dataType,
-			UDTName:         udtName,
-			CharMaxLen:      nullInt64ToPtr(charMaxLen),
-			NumPrec:         nullInt64ToPtr(numPrec),
-			NumScale:        nullInt64ToPtr(numScale),
-			DTPrec:          nullInt64ToPtr(dtPrec),
-			IsAutoIncrement: r.classifyAutoIncrement(isIdentity, columnDefault, tableName, colName, serialSeqs),
-			Collation:       collation,
-			AttTypmod:       attTypmod,
-			FormatType:      formatType,
-		}
-
-		// Bug 113 round-trip carry (v0.95.2). A column whose
-		// pg_type.typtype == 'd' references an operator-declared
-		// DOMAIN. information_schema.columns unwraps DOMAINs to the
-		// base type at every column it exposes, so the existing
-		// translateType call below produces the BASE IR type for
-		// free; the DOMAIN-specific metadata (name + CHECKs) is
-		// wrapped on AFTER translateType returns. IsDomain +
-		// DomainName carry through columnMeta so the wrap site
-		// has everything it needs without re-reading the catalog.
-		// v0.95.1 refused loudly here; v0.95.2 rotates to
-		// round-trip carry per the bug-catalog's preferred closure.
-		if columnTypeKind == "d" {
-			meta.IsDomain = true
-			// pg_type.typname is the actual DOMAIN identifier (e.g.
-			// "email_address"). udt_name unwraps to the base type
-			// (information_schema column-projection), so the pg_type
-			// join is the only source of the real name.
-			meta.DomainName = columnTypeName
-			if meta.DomainName == "" {
-				meta.DomainName = udtName
-			}
-		}
-
-		// Resolve enum values for USER-DEFINED columns.
-		if dataType == "user-defined" || dataType == "USER-DEFINED" {
-			if values, ok := enumValues[udtName]; ok {
-				meta.EnumValues = values
-				// Bug 19c: carry the source enum type name so a
-				// same-engine PG → PG migration preserves it verbatim
-				// instead of synthesizing a per-column name.
-				meta.EnumTypeName = udtName
-			}
-			// PostGIS geometry / geography: look up subtype + SRID from
-			// the per-column info we read out of geometry_columns /
-			// geography_columns. A missing entry is fine — the
-			// translator handles GeometryInfo=nil by emitting
-			// GeometryUnspecified. The geography_columns entry carries
-			// IsGeography=true, which propagates through to
-			// [ir.Geometry.IsGeography].
-			switch udtName {
-			case "geometry":
-				if info, ok := geomInfo[tableName+"."+colName]; ok {
-					info := info
-					meta.GeometryInfo = &info
-				}
-			case "geography":
-				if info, ok := geogInfo[tableName+"."+colName]; ok {
-					info := info
-					meta.GeometryInfo = &info
-				} else {
-					// Fallback: the operator may have a `geography`
-					// column declared without a typmod (no row in
-					// geography_columns? — rare, since PostGIS always
-					// populates the view). Synthesize a minimal entry
-					// so the translator dispatches to the geography
-					// branch with default subtype/SRID rather than
-					// falling through to the user-defined hint path.
-					meta.GeometryInfo = &geometryColumnInfo{IsGeography: true}
-				}
-			}
-
-			// ADR-0032: when the operator opted into one or more
-			// extensions via `--enable-pg-extension`, route the udt
-			// name through pgExtensionCatalog. Recognised → emit as
-			// ir.ExtensionType (carrying typmod-derived Modifiers);
-			// unrecognised → fall through to the existing dispatch
-			// (enum resolution / loud failure on user-defined types
-			// the IR doesn't model).
-			if ext, name, ok := lookupExtensionForType(udtName, r.enabledExtensions); ok {
-				meta.ExtensionName = ext
-				meta.ExtensionTypeName = name
-			} else if verbatimTierFor(r.verbatimPassthrough) == verbatimTierVerbatim {
-				// ADR-0047 tier (b): the column is USER-DEFINED and NOT
-				// catalogued (the catalog lookup above missed), and the
-				// run carries a same-engine-PG guarantee (live PG → PG
-				// or a PG backup). Flag it for verbatim capture; the
-				// translator emits ir.VerbatimType with the exact
-				// format_type spelling. Catalogued types never reach
-				// here (the lookup above set ExtensionName). Enum /
-				// geometry still win in translateType (they have
-				// first-class IR shapes); the verbatim flag is the
-				// last-resort carry before the loud refusal, so it does
-				// not regress them. Tier (c) (verbatimPassthrough
-				// false) leaves this unset → the existing loud refusal
-				// in translateType is preserved unchanged.
-				meta.VerbatimEligible = true
-			}
-		}
-
-		// Bug 17: core PG types with no rich cross-engine IR shape
-		// (tsvector, tsquery) are carried verbatim on a same-engine-PG
-		// run, mirroring the ADR-0047 USER-DEFINED verbatim tier. The
-		// USER-DEFINED branch above already set (or deliberately
-		// withheld) VerbatimEligible per the catalog lookup; only the
-		// non-USER-DEFINED path needs this. The flag is consulted by
-		// translateType strictly as a last resort, AFTER every
-		// first-class core-type case has returned, so it never shadows
-		// a mapped type — it only converts the final "unsupported
-		// data_type" refusal into a verbatim carry. Cross-engine
-		// (verbatimPassthrough false) leaves it unset, preserving the
-		// loud refusal (tsvector has no MySQL equivalent).
-		isUserDefined := dataType == "user-defined" || dataType == "USER-DEFINED"
-		if !isUserDefined &&
-			verbatimTierFor(r.verbatimPassthrough) == verbatimTierVerbatim {
-			meta.VerbatimEligible = true
-		}
-
-		// Resolve element type for arrays. For now, only built-in
-		// element types are supported (the most common case).
-		if dataType == "array" || dataType == "ARRAY" {
-			elemDataType, ok := arrayElementDataType(udtName)
-			if !ok {
-				return fmt.Errorf("postgres: array column %s.%s has unsupported element type %q",
-					tableName, colName, udtName)
-			}
-			meta.ArrayElement = &columnMeta{
-				DataType: elemDataType,
-				UDTName:  strings.TrimPrefix(udtName, "_"),
-				// The array column's typmod applies to its elements
-				// (`timestamptz(3)[]` carries atttypmod=3); thread it
-				// through so temporal elements resolve their precision
-				// (or precision-unspecified, typmod -1) exactly like
-				// the scalar path (TRIAGE #3).
-				AttTypmod: attTypmod,
-			}
-		}
-
-		typ, err := translateType(meta)
+		col, err := r.columnFromRow(cr, columnLookups{
+			enumValues:   enumValues,
+			geomInfo:     geomInfo,
+			geogInfo:     geogInfo,
+			domainChecks: domainChecks,
+			serialSeqs:   serialSeqs,
+		})
 		if err != nil {
-			return fmt.Errorf("table %q column %q: %w", tableName, colName, err)
-		}
-
-		// Bug 113 round-trip carry (v0.95.2). When the column
-		// references a DOMAIN (pg_type.typtype='d'), wrap the
-		// just-translated BASE IR type in ir.Domain with the name
-		// resolved from pg_type.typname and the CHECK definitions
-		// pre-read by readDomainChecks. The writer's Phase 1a' emits
-		// CREATE DOMAIN before tables that reference it; emitTableDef
-		// uses the DOMAIN name (not the base type spelling) when
-		// emitting the column type.
-		if meta.IsDomain {
-			typ = ir.Domain{
-				Name:     meta.DomainName,
-				BaseType: typ,
-				Checks:   domainChecks[meta.DomainName],
-			}
-		}
-
-		col := &ir.Column{
-			Name:     colName,
-			Type:     typ,
-			Nullable: strings.EqualFold(isNullable, "YES"),
-			Default:  translateDefault(columnDefault, meta.IsAutoIncrement),
-		}
-
-		// ADR-0044 Tier-3 schema-read gate (DEFAULT case). When the
-		// classified default is an expression (not a literal /
-		// auto-increment), scan it for a catalog-declared
-		// extension-owned function (uuid-ossp's uuid_generate_v4,
-		// pgcrypto's digest, …). If the owning extension was not
-		// opted into via --enable-pg-extension, refuse loudly and
-		// early here rather than letting the verbatim passthrough
-		// fail with a raw PG parse error at CREATE TABLE apply time.
-		// Core functions (gen_random_uuid(), now(), …) are in no
-		// catalog set and so are never gated.
-		if de, ok := col.Default.(ir.DefaultExpression); ok {
-			if err := extensionFunctionDefaultGate(
-				tableName, colName, "DEFAULT", de.Expr, r.enabledExtensions,
-			); err != nil {
-				return err
-			}
-		}
-
-		// Postgres only supports STORED generated columns today;
-		// is_generated = 'ALWAYS' implies STORED. The expression
-		// passes through verbatim — translation policy is "loud
-		// failure beats silent corruption", so non-portable
-		// expressions surface as a target rejection at apply time
-		// rather than a guess at translation.
-		if strings.EqualFold(isGenerated, "ALWAYS") && genExpr != "" {
-			// ADR-0044: gate generated-column expressions identically
-			// to DEFAULTs — the recon confirmed both ride the same
-			// verbatim passthrough, so leaving generated ungated would
-			// be a silent bypass of the Tier-3 opt-in.
-			if err := extensionFunctionDefaultGate(
-				tableName, colName, "GENERATED", genExpr, r.enabledExtensions,
-			); err != nil {
-				return err
-			}
-			col.GeneratedExpr = genExpr
-			col.GeneratedStored = true
-			col.GeneratedExprDialect = dialectName
+			return err
 		}
 		t.Columns = append(t.Columns, col)
 	}
 	return rows.Err()
+}
+
+// columnRow is one scanned row of populateColumns' catalog query: the
+// information_schema.columns projection plus the pg_attribute / pg_type
+// augmentation (collation, atttypmod, format_type, DOMAIN kind/name).
+// Bundling it lets the per-column translation read as a single
+// columnFromRow call instead of a 19-value scan threaded through a helper
+// signature.
+type columnRow struct {
+	tableName, colName string
+	ordinal            int
+	columnDefault      sql.NullString
+	isNullable         string
+	dataType, udtName  string
+	charMaxLen         sql.NullInt64
+	numPrec            sql.NullInt64
+	numScale           sql.NullInt64
+	dtPrec             sql.NullInt64
+	isIdentity         string
+	isGenerated        string
+	genExpr            string
+	collation          string
+	attTypmod          int32
+	formatType         string
+	columnTypeKind     string
+	columnTypeName     string
+}
+
+// columnLookups bundles the side tables populateColumns resolves once up
+// front (enum values, PostGIS geometry/geography metadata, DOMAIN CHECK
+// definitions, serial-sequence owners) and threads into every column's
+// translation.
+type columnLookups struct {
+	enumValues   map[string][]string
+	geomInfo     map[string]geometryColumnInfo
+	geogInfo     map[string]geometryColumnInfo
+	domainChecks map[string][]ir.DomainCheck
+	serialSeqs   map[string]pgSequenceOwner
+}
+
+// columnFromRow translates one scanned catalog row into an [ir.Column]:
+// resolve the columnMeta (enum / geometry / extension / verbatim / array
+// element), run translateType, wrap DOMAINs (Bug 113), and apply the
+// ADR-0044 Tier-3 extension-function gate to DEFAULT / GENERATED
+// expressions. Split out of populateColumns so the query+scan loop reads
+// as "for each row, build a column."
+func (r *SchemaReader) columnFromRow(cr columnRow, lk columnLookups) (*ir.Column, error) {
+	// Locals mirror the names the translation logic below used when it
+	// lived inline in populateColumns, so this stays a verbatim
+	// extract-method.
+	tableName, colName := cr.tableName, cr.colName
+	columnDefault := cr.columnDefault
+	isNullable := cr.isNullable
+	dataType, udtName := cr.dataType, cr.udtName
+	charMaxLen, numPrec, numScale, dtPrec := cr.charMaxLen, cr.numPrec, cr.numScale, cr.dtPrec
+	isIdentity := cr.isIdentity
+	isGenerated, genExpr := cr.isGenerated, cr.genExpr
+	collation := cr.collation
+	attTypmod := cr.attTypmod
+	formatType := cr.formatType
+	columnTypeKind, columnTypeName := cr.columnTypeKind, cr.columnTypeName
+	enumValues := lk.enumValues
+	geomInfo, geogInfo := lk.geomInfo, lk.geogInfo
+	domainChecks := lk.domainChecks
+	serialSeqs := lk.serialSeqs
+
+	meta := columnMeta{
+		DataType:        dataType,
+		UDTName:         udtName,
+		CharMaxLen:      nullInt64ToPtr(charMaxLen),
+		NumPrec:         nullInt64ToPtr(numPrec),
+		NumScale:        nullInt64ToPtr(numScale),
+		DTPrec:          nullInt64ToPtr(dtPrec),
+		IsAutoIncrement: r.classifyAutoIncrement(isIdentity, columnDefault, tableName, colName, serialSeqs),
+		Collation:       collation,
+		AttTypmod:       attTypmod,
+		FormatType:      formatType,
+	}
+
+	// Bug 113 round-trip carry (v0.95.2). A column whose
+	// pg_type.typtype == 'd' references an operator-declared
+	// DOMAIN. information_schema.columns unwraps DOMAINs to the
+	// base type at every column it exposes, so the existing
+	// translateType call below produces the BASE IR type for
+	// free; the DOMAIN-specific metadata (name + CHECKs) is
+	// wrapped on AFTER translateType returns. IsDomain +
+	// DomainName carry through columnMeta so the wrap site
+	// has everything it needs without re-reading the catalog.
+	// v0.95.1 refused loudly here; v0.95.2 rotates to
+	// round-trip carry per the bug-catalog's preferred closure.
+	if columnTypeKind == "d" {
+		meta.IsDomain = true
+		// pg_type.typname is the actual DOMAIN identifier (e.g.
+		// "email_address"). udt_name unwraps to the base type
+		// (information_schema column-projection), so the pg_type
+		// join is the only source of the real name.
+		meta.DomainName = columnTypeName
+		if meta.DomainName == "" {
+			meta.DomainName = udtName
+		}
+	}
+
+	// Resolve enum values for USER-DEFINED columns.
+	if dataType == "user-defined" || dataType == "USER-DEFINED" {
+		if values, ok := enumValues[udtName]; ok {
+			meta.EnumValues = values
+			// Bug 19c: carry the source enum type name so a
+			// same-engine PG → PG migration preserves it verbatim
+			// instead of synthesizing a per-column name.
+			meta.EnumTypeName = udtName
+		}
+		// PostGIS geometry / geography: look up subtype + SRID from
+		// the per-column info we read out of geometry_columns /
+		// geography_columns. A missing entry is fine — the
+		// translator handles GeometryInfo=nil by emitting
+		// GeometryUnspecified. The geography_columns entry carries
+		// IsGeography=true, which propagates through to
+		// [ir.Geometry.IsGeography].
+		switch udtName {
+		case "geometry":
+			if info, ok := geomInfo[tableName+"."+colName]; ok {
+				info := info
+				meta.GeometryInfo = &info
+			}
+		case "geography":
+			if info, ok := geogInfo[tableName+"."+colName]; ok {
+				info := info
+				meta.GeometryInfo = &info
+			} else {
+				// Fallback: the operator may have a `geography`
+				// column declared without a typmod (no row in
+				// geography_columns? — rare, since PostGIS always
+				// populates the view). Synthesize a minimal entry
+				// so the translator dispatches to the geography
+				// branch with default subtype/SRID rather than
+				// falling through to the user-defined hint path.
+				meta.GeometryInfo = &geometryColumnInfo{IsGeography: true}
+			}
+		}
+
+		// ADR-0032: when the operator opted into one or more
+		// extensions via `--enable-pg-extension`, route the udt
+		// name through pgExtensionCatalog. Recognised → emit as
+		// ir.ExtensionType (carrying typmod-derived Modifiers);
+		// unrecognised → fall through to the existing dispatch
+		// (enum resolution / loud failure on user-defined types
+		// the IR doesn't model).
+		if ext, name, ok := lookupExtensionForType(udtName, r.enabledExtensions); ok {
+			meta.ExtensionName = ext
+			meta.ExtensionTypeName = name
+		} else if verbatimTierFor(r.verbatimPassthrough) == verbatimTierVerbatim {
+			// ADR-0047 tier (b): the column is USER-DEFINED and NOT
+			// catalogued (the catalog lookup above missed), and the
+			// run carries a same-engine-PG guarantee (live PG → PG
+			// or a PG backup). Flag it for verbatim capture; the
+			// translator emits ir.VerbatimType with the exact
+			// format_type spelling. Catalogued types never reach
+			// here (the lookup above set ExtensionName). Enum /
+			// geometry still win in translateType (they have
+			// first-class IR shapes); the verbatim flag is the
+			// last-resort carry before the loud refusal, so it does
+			// not regress them. Tier (c) (verbatimPassthrough
+			// false) leaves this unset → the existing loud refusal
+			// in translateType is preserved unchanged.
+			meta.VerbatimEligible = true
+		}
+	}
+
+	// Bug 17: core PG types with no rich cross-engine IR shape
+	// (tsvector, tsquery) are carried verbatim on a same-engine-PG
+	// run, mirroring the ADR-0047 USER-DEFINED verbatim tier. The
+	// USER-DEFINED branch above already set (or deliberately
+	// withheld) VerbatimEligible per the catalog lookup; only the
+	// non-USER-DEFINED path needs this. The flag is consulted by
+	// translateType strictly as a last resort, AFTER every
+	// first-class core-type case has returned, so it never shadows
+	// a mapped type — it only converts the final "unsupported
+	// data_type" refusal into a verbatim carry. Cross-engine
+	// (verbatimPassthrough false) leaves it unset, preserving the
+	// loud refusal (tsvector has no MySQL equivalent).
+	isUserDefined := dataType == "user-defined" || dataType == "USER-DEFINED"
+	if !isUserDefined &&
+		verbatimTierFor(r.verbatimPassthrough) == verbatimTierVerbatim {
+		meta.VerbatimEligible = true
+	}
+
+	// Resolve element type for arrays. For now, only built-in
+	// element types are supported (the most common case).
+	if dataType == "array" || dataType == "ARRAY" {
+		elemDataType, ok := arrayElementDataType(udtName)
+		if !ok {
+			return nil, fmt.Errorf("postgres: array column %s.%s has unsupported element type %q",
+				tableName, colName, udtName)
+		}
+		meta.ArrayElement = &columnMeta{
+			DataType: elemDataType,
+			UDTName:  strings.TrimPrefix(udtName, "_"),
+			// The array column's typmod applies to its elements
+			// (`timestamptz(3)[]` carries atttypmod=3); thread it
+			// through so temporal elements resolve their precision
+			// (or precision-unspecified, typmod -1) exactly like
+			// the scalar path (TRIAGE #3).
+			AttTypmod: attTypmod,
+		}
+	}
+
+	typ, err := translateType(meta)
+	if err != nil {
+		return nil, fmt.Errorf("table %q column %q: %w", tableName, colName, err)
+	}
+
+	// Bug 113 round-trip carry (v0.95.2). When the column
+	// references a DOMAIN (pg_type.typtype='d'), wrap the
+	// just-translated BASE IR type in ir.Domain with the name
+	// resolved from pg_type.typname and the CHECK definitions
+	// pre-read by readDomainChecks. The writer's Phase 1a' emits
+	// CREATE DOMAIN before tables that reference it; emitTableDef
+	// uses the DOMAIN name (not the base type spelling) when
+	// emitting the column type.
+	if meta.IsDomain {
+		typ = ir.Domain{
+			Name:     meta.DomainName,
+			BaseType: typ,
+			Checks:   domainChecks[meta.DomainName],
+		}
+	}
+
+	col := &ir.Column{
+		Name:     colName,
+		Type:     typ,
+		Nullable: strings.EqualFold(isNullable, "YES"),
+		Default:  translateDefault(columnDefault, meta.IsAutoIncrement),
+	}
+
+	// ADR-0044 Tier-3 schema-read gate (DEFAULT case). When the
+	// classified default is an expression (not a literal /
+	// auto-increment), scan it for a catalog-declared
+	// extension-owned function (uuid-ossp's uuid_generate_v4,
+	// pgcrypto's digest, …). If the owning extension was not
+	// opted into via --enable-pg-extension, refuse loudly and
+	// early here rather than letting the verbatim passthrough
+	// fail with a raw PG parse error at CREATE TABLE apply time.
+	// Core functions (gen_random_uuid(), now(), …) are in no
+	// catalog set and so are never gated.
+	if de, ok := col.Default.(ir.DefaultExpression); ok {
+		if err := extensionFunctionDefaultGate(
+			tableName, colName, "DEFAULT", de.Expr, r.enabledExtensions,
+		); err != nil {
+			return nil, err
+		}
+	}
+
+	// Postgres only supports STORED generated columns today;
+	// is_generated = 'ALWAYS' implies STORED. The expression
+	// passes through verbatim — translation policy is "loud
+	// failure beats silent corruption", so non-portable
+	// expressions surface as a target rejection at apply time
+	// rather than a guess at translation.
+	if strings.EqualFold(isGenerated, "ALWAYS") && genExpr != "" {
+		// ADR-0044: gate generated-column expressions identically
+		// to DEFAULTs — the recon confirmed both ride the same
+		// verbatim passthrough, so leaving generated ungated would
+		// be a silent bypass of the Tier-3 opt-in.
+		if err := extensionFunctionDefaultGate(
+			tableName, colName, "GENERATED", genExpr, r.enabledExtensions,
+		); err != nil {
+			return nil, err
+		}
+		col.GeneratedExpr = genExpr
+		col.GeneratedStored = true
+		col.GeneratedExprDialect = dialectName
+	}
+	return col, nil
 }
 
 // populateIndexes fills in Index lists. PRIMARY indexes go to the
@@ -1271,235 +1333,52 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 	primary := map[string]string{} // table → primary index name
 
 	for rows.Next() {
-		var (
-			tableName, indexName, method, colName string
-			isUnique, isPrimary                   bool
-			ord                                   int
-			opclass                               string
-			opclassDefault                        bool
-			exprText                              string
-			nKeyAtts                              int
-			indOption                             int
-			predicate                             string
-			constraintBacked                      bool
-			amExtOwned, opclassExtOwned           bool
-		)
+		var row indexRow
 		if err := rows.Scan(
-			&tableName, &indexName, &method,
-			&isUnique, &isPrimary,
-			&colName, &ord, &opclass, &opclassDefault, &exprText,
-			&nKeyAtts, &indOption, &predicate,
-			&constraintBacked,
-			&amExtOwned, &opclassExtOwned,
+			&row.tableName, &row.indexName, &row.method,
+			&row.isUnique, &row.isPrimary,
+			&row.colName, &row.ord, &row.opclass, &row.opclassDefault, &row.exprText,
+			&row.nKeyAtts, &row.indOption, &row.predicate,
+			&row.constraintBacked,
+			&row.amExtOwned, &row.opclassExtOwned,
 		); err != nil {
 			return err
 		}
-		if _, ok := tables[tableName]; !ok {
+		if _, ok := tables[row.tableName]; !ok {
 			continue
 		}
-		// Expression-index entry (catalog Bug 65): the indkey slot is
-		// the `0` sentinel, so the pg_attribute join yields no column
-		// name. Before ADR-0045 this entry was silently dropped, losing
-		// the whole functional index from the IR — a schema-fidelity
-		// loss that violates the loud-failure tenet. D3 (locked):
-		// full-carry. pg_get_indexdef(idx, ord, true) renders just this
-		// key's expression text (PG dialect); surface it into the IR's
-		// existing IndexColumn.Expression field tagged
-		// ExpressionDialect="postgres", the PG-source analogue of the
-		// MySQL-source post-Bug-16 path. The opclass (Bug 47) still
-		// comes from the independent opc.opcname join below, so an
-		// opclass-bearing expression index is not regressed.
-		isExpr := colName == "" && strings.TrimSpace(exprText) != ""
-		if colName == "" && !isExpr {
+		// Expression-index entry (catalog Bug 65): the indkey slot is the
+		// 0 sentinel, so the pg_attribute join yields no column name;
+		// pg_get_indexdef renders just this key's expression text (PG
+		// dialect) into IndexColumn.Expression (ADR-0045 full-carry, the
+		// PG-source analogue of the MySQL-source post-Bug-16 path).
+		row.isExpr = row.colName == "" && strings.TrimSpace(row.exprText) != ""
+		if row.colName == "" && !row.isExpr {
 			// Genuinely empty (defensive — shouldn't happen for a real
 			// index column). Preserve the historical skip.
 			continue
 		}
 
-		k := tableObjectKey{table: tableName, name: indexName}
+		k := tableObjectKey{table: row.tableName, name: row.indexName}
 		idx, ok := collected[k]
 		if !ok {
-			kind := indexKindFrom(method)
-			idx = &ir.Index{
-				Name:   indexName,
-				Unique: isUnique,
-				Kind:   kind,
-				// TRIAGE #4: a UNIQUE-constraint-owned index re-emits
-				// as ALTER TABLE ... ADD CONSTRAINT, not CREATE UNIQUE
-				// INDEX. Never true for PK indexes (contype 'p').
-				ConstraintBacked: constraintBacked && isUnique && !isPrimary,
-			}
-			// ADR-0032: preserve extension-introduced access-method
-			// names (ivfflat, hnsw) verbatim so the same-engine writer
-			// can re-emit `USING <method>`. Only fires when the
-			// operator opted into the owning extension; otherwise the
-			// IR keeps its existing IndexKindUnspecified shape and the
-			// writer falls through to the default (btree).
-			if kind == ir.IndexKindUnspecified &&
-				extensionAccessMethodEnabled(method, r.enabledExtensions) {
-				idx.Method = method
-			}
-			// ADR-0047 tier (b): an UNcatalogued, extension-owned
-			// access method (TimescaleD's `hypercore`, an in-house
-			// AM, …) on a same-engine-PG / PG-backup run is carried
-			// verbatim so the PG writer re-emits `USING <method>`.
-			// Gated on amExtOwned so a core PG AM (btree/gin/…) never
-			// gets pinned into Method (those round-trip via Kind, and
-			// pinning the bareword would clutter diffs / regress the
-			// Bug 47-style "only-non-core is explicit" property). The
-			// catalogued-AM branch above already won for the ADR-0032
-			// seven; this is the long-tail carry below the catalog.
-			// !extensionAccessMethodRegistered excludes a CATALOGUED
-			// extension's AM (pgvector ivfflat/hnsw): when catalogued
-			// but not enabled it must DROP per the loud-failure default,
-			// never be poached into Method by the verbatim tier (which
-			// is uncatalogued-only, ADR-0047 §Scope). Without this the
-			// v0.68.0 CI gate caught TestMigrate_PG_PgTrgm_NotEnabled_
-			// DropsOpclass — the symmetric opclass case is fixed below.
-			if idx.Method == "" && kind == ir.IndexKindUnspecified &&
-				amExtOwned && !extensionAccessMethodRegistered(method) &&
-				verbatimTierFor(r.verbatimPassthrough) == verbatimTierVerbatim {
-				idx.Method = method
-			}
-			// Bug 19a: a partial index's WHERE predicate. pg_get_expr
-			// renders it in PG dialect with table-qualified column refs;
-			// tag the dialect so a cross-dialect target runs the
-			// ADR-0016 translator (same policy as expression-index
-			// bodies). Empty for a full index.
-			if p := strings.TrimSpace(predicate); p != "" {
-				idx.Predicate = p
-				idx.PredicateDialect = dialectName
-			}
+			idx = r.newIndexFromRow(row)
 			collected[k] = idx
-			if isPrimary {
-				primary[tableName] = indexName
+			if row.isPrimary {
+				primary[row.tableName] = row.indexName
 			}
 		}
-		// Bug 47: only carry opclass forward for extension-introduced
-		// access methods. btree/hash/gin/gist all have sensible default
-		// opclasses for built-in types; emitting the opcname there
-		// would (a) be redundant (b) clutter the DDL diffs (c) risk
-		// surfacing internal opcname differences across PG versions.
-		// Extension AMs (pgvector's ivfflat / hnsw) genuinely need the
-		// opclass on every column entry — hnsw rejects the index at
-		// CREATE without it.
-		//
-		// pg_trgm extension (Tier 2 lite, no new column type, no new
-		// AM) introduces operator classes (`gin_trgm_ops` /
-		// `gist_trgm_ops`) that ride on core PG `gin` / `gist`. The
-		// `idx.Method != ""` gate above only fires for extension-
-		// introduced AMs, so we additionally consult
-		// extensionOperatorClassEnabled here to capture opclasses
-		// owned by an enabled extension even when the AM is core. The
-		// double-gate preserves Bug 47's "no spurious opclass on
-		// built-in indexes" property: a non-extension opclass (or one
-		// whose owning extension wasn't enabled) is dropped, just
-		// like before.
-		// Bug 19b: ordinals beyond indnkeyatts are non-key INCLUDE
-		// payload columns, not part of the index key. They carry a
-		// real column name (never expressions — PG forbids expressions
-		// in INCLUDE) and have no ordering/opclass semantics, so they
-		// go to a separate slot. Flattening them into the key list
-		// silently changes the index's comparison/uniqueness scope.
-		if nKeyAtts > 0 && ord > nKeyAtts && colName != "" {
-			idx.IncludeColumns = append(idx.IncludeColumns, colName)
+		// Bug 19b: ordinals beyond indnkeyatts are non-key INCLUDE payload
+		// columns, not part of the index key. They carry a real column
+		// name (never expressions) and have no ordering/opclass semantics,
+		// so they go to a separate slot — flattening them into the key
+		// list would silently change the index's comparison/uniqueness
+		// scope.
+		if row.nKeyAtts > 0 && row.ord > row.nKeyAtts && row.colName != "" {
+			idx.IncludeColumns = append(idx.IncludeColumns, row.colName)
 			continue
 		}
-
-		col := ir.IndexColumn{Column: colName}
-		if isExpr {
-			col.Column = ""
-			col.Expression = strings.TrimSpace(exprText)
-			col.ExpressionDialect = dialectName
-		}
-		// Bug 19a: per-column ordering from pg_index.indoption. Bit 0
-		// (value 1) = DESC; bit 1 (value 2) = NULLS FIRST. PG's
-		// implicit defaults are NULLS LAST for ASC and NULLS FIRST for
-		// DESC; only record NullsFirst when the stored ordering
-		// deviates from that default so emitted DDL stays minimal and
-		// diff-stable (the writer emits the clause only when non-nil).
-		col.Desc = indOption&1 != 0
-		nullsFirst := indOption&2 != 0
-		defaultNullsFirst := col.Desc // ASC→NULLS LAST(false); DESC→NULLS FIRST(true)
-		if nullsFirst != defaultNullsFirst {
-			nf := nullsFirst
-			col.NullsFirst = &nf
-		}
-		switch {
-		case opclass != "" && idx.Method != "":
-			col.OperatorClass = opclass
-		case opclass != "" && extensionOperatorClassEnabled(opclass, r.enabledExtensions):
-			col.OperatorClass = opclass
-		case opclass != "" && !opclassExtOwned && !opclassDefault:
-			// Bug 115 (v0.95.0): operator-explicit non-default CORE
-			// PG opclass on a core access method. Examples observed in
-			// the wild that pre-fix silently dropped:
-			//
-			//   - btree (col text_pattern_ops)     — required for
-			//     LIKE 'prefix%' to use the index in the C locale
-			//   - btree (col varchar_pattern_ops)  — same; varchar
-			//   - gin   (col jsonb_path_ops)       — half-size,
-			//     substantially faster for @> containment vs default
-			//     jsonb_ops
-			//
-			// PG records the same indclass OID whether the operator
-			// typed it explicitly or the planner defaulted; the
-			// distinction is in pg_opclass.opcdefault. A non-default
-			// core opclass is operator-significant and must carry to
-			// the target via OperatorClass; a default opclass is
-			// implicit noise the catalog round-trip drops correctly
-			// per the pre-existing Bug 47 design ("no spurious
-			// opclass on built-in indexes" for default opclasses
-			// stays). Cross-engine PG → MySQL: the writer drops with
-			// a WARN, mirroring the pg_trgm-not-enabled branch below.
-			col.OperatorClass = opclass
-		case opclass != "" && opclassExtOwned &&
-			!extensionOperatorClassRegistered(opclass) &&
-			verbatimTierFor(r.verbatimPassthrough) == verbatimTierVerbatim:
-			// ADR-0047 tier (b): an UNcatalogued, genuinely
-			// extension-owned operator class (pg_depend deptype 'e')
-			// on a same-engine-PG / PG-backup run. Carry it verbatim.
-			// !extensionOperatorClassRegistered is load-bearing: a
-			// CATALOGUED extension's opclass (pg_trgm's gin_trgm_ops,
-			// PostGIS's gist_geometry_ops_2d, …) must NOT be poached by
-			// the verbatim tier — it belongs to the ADR-0032 path
-			// (enabled → case above; not-enabled → the drop+WARN case
-			// below, the pre-existing Bug 47 / loud-failure default).
-			// The verbatim tier is uncatalogued-only (ADR-0047 §Scope);
-			// omitting this guard regressed TestMigrate_PG_PgTrgm_
-			// NotEnabled_DropsOpclass (v0.68.0 CI gate, caught pre-tag).
-			// so the same-engine writer re-emits `<col> <opclass>`.
-			// opclassExtOwned is the Bug 47 invariant made literal:
-			// only EXTENSION-owned opclasses ever set OperatorClass,
-			// so a non-empty value passing through the IR is by
-			// construction extension-introduced — which is exactly
-			// what makes a verbatim backup correctly refuse a
-			// cross-engine restore for free (the existing non-empty-
-			// OperatorClass cross-engine signal). Core / default
-			// opclasses have opclassExtOwned=false and stay
-			// unpopulated, unchanged.
-			col.OperatorClass = opclass
-		case opclass != "" && extensionOperatorClassRegistered(opclass):
-			// Operator-owned extension opclass on a core-PG access
-			// method (pg_trgm's `gin_trgm_ops` / `gist_trgm_ops`),
-			// but the owning extension is not in the operator's
-			// `--enable-pg-extension` allowlist. Drop the opclass
-			// from the IR per the loud-failure default, but emit
-			// a WARN so the operator can attribute the inevitable
-			// CREATE INDEX failure on the target to the missing
-			// flag rather than to a sluice-side bug.
-			ext := extensionOwningOperatorClass(opclass)
-			slog.WarnContext(
-				ctx,
-				"postgres: schema reader: dropping extension-owned index opclass; pass --enable-pg-extension to preserve it",
-				slog.String("index", idx.Name),
-				slog.String("column", colName),
-				slog.String("opclass", opclass),
-				slog.String("extension", ext),
-				slog.String("hint", "--enable-pg-extension "+ext),
-			)
-		}
-		idx.Columns = append(idx.Columns, col)
+		idx.Columns = append(idx.Columns, r.indexColumnFromRow(ctx, row, idx))
 	}
 	if err := rows.Err(); err != nil {
 		return err
@@ -1507,6 +1386,206 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 
 	attachCollectedIndexes(tables, collected, primary)
 	return nil
+}
+
+// indexRow is one scanned row of populateIndexes' unnested pg_index
+// query — one (index, column, position) tuple plus the per-column
+// ordering / opclass / predicate metadata. isExpr is derived after the
+// scan (an expression key has an empty column name).
+type indexRow struct {
+	tableName, indexName, method, colName string
+	isUnique, isPrimary                   bool
+	ord                                   int
+	opclass                               string
+	opclassDefault                        bool
+	exprText                              string
+	nKeyAtts                              int
+	indOption                             int
+	predicate                             string
+	constraintBacked                      bool
+	amExtOwned, opclassExtOwned           bool
+	isExpr                                bool
+}
+
+// newIndexFromRow builds the [ir.Index] shell the first time a given
+// (table, index) key is seen: kind from the access method, the TRIAGE #4
+// constraint-backed flag, the ADR-0032 / ADR-0047 access-method carry,
+// and the Bug 19a partial-index predicate. Per-column details are added
+// by indexColumnFromRow on this and subsequent rows for the same index.
+func (r *SchemaReader) newIndexFromRow(row indexRow) *ir.Index {
+	indexName := row.indexName
+	method := row.method
+	isUnique, isPrimary := row.isUnique, row.isPrimary
+	constraintBacked := row.constraintBacked
+	amExtOwned := row.amExtOwned
+	predicate := row.predicate
+
+	kind := indexKindFrom(method)
+	idx := &ir.Index{
+		Name:   indexName,
+		Unique: isUnique,
+		Kind:   kind,
+		// TRIAGE #4: a UNIQUE-constraint-owned index re-emits
+		// as ALTER TABLE ... ADD CONSTRAINT, not CREATE UNIQUE
+		// INDEX. Never true for PK indexes (contype 'p').
+		ConstraintBacked: constraintBacked && isUnique && !isPrimary,
+	}
+	// ADR-0032: preserve extension-introduced access-method
+	// names (ivfflat, hnsw) verbatim so the same-engine writer
+	// can re-emit `USING <method>`. Only fires when the
+	// operator opted into the owning extension; otherwise the
+	// IR keeps its existing IndexKindUnspecified shape and the
+	// writer falls through to the default (btree).
+	if kind == ir.IndexKindUnspecified &&
+		extensionAccessMethodEnabled(method, r.enabledExtensions) {
+		idx.Method = method
+	}
+	// ADR-0047 tier (b): an UNcatalogued, extension-owned
+	// access method (TimescaleD's `hypercore`, an in-house
+	// AM, …) on a same-engine-PG / PG-backup run is carried
+	// verbatim so the PG writer re-emits `USING <method>`.
+	// Gated on amExtOwned so a core PG AM (btree/gin/…) never
+	// gets pinned into Method (those round-trip via Kind, and
+	// pinning the bareword would clutter diffs / regress the
+	// Bug 47-style "only-non-core is explicit" property). The
+	// catalogued-AM branch above already won for the ADR-0032
+	// seven; this is the long-tail carry below the catalog.
+	// !extensionAccessMethodRegistered excludes a CATALOGUED
+	// extension's AM (pgvector ivfflat/hnsw): when catalogued
+	// but not enabled it must DROP per the loud-failure default,
+	// never be poached into Method by the verbatim tier (which
+	// is uncatalogued-only, ADR-0047 §Scope). Without this the
+	// v0.68.0 CI gate caught TestMigrate_PG_PgTrgm_NotEnabled_
+	// DropsOpclass — the symmetric opclass case is fixed below.
+	if idx.Method == "" && kind == ir.IndexKindUnspecified &&
+		amExtOwned && !extensionAccessMethodRegistered(method) &&
+		verbatimTierFor(r.verbatimPassthrough) == verbatimTierVerbatim {
+		idx.Method = method
+	}
+	// Bug 19a: a partial index's WHERE predicate. pg_get_expr
+	// renders it in PG dialect with table-qualified column refs;
+	// tag the dialect so a cross-dialect target runs the
+	// ADR-0016 translator (same policy as expression-index
+	// bodies). Empty for a full index.
+	if p := strings.TrimSpace(predicate); p != "" {
+		idx.Predicate = p
+		idx.PredicateDialect = dialectName
+	}
+	return idx
+}
+
+// indexColumnFromRow builds one [ir.IndexColumn] from a scanned index
+// row: the column-or-expression key, the Bug 19a DESC / NULLS-FIRST
+// ordering bits, and the Bug 47 / ADR-0047 operator-class carry. Only
+// extension-owned opclasses or operator-explicit non-default core
+// opclasses (text_pattern_ops, jsonb_path_ops, …) survive; default core
+// opclasses stay unpopulated so a non-empty OperatorClass remains an
+// honest extension-owned marker the cross-engine refusal keys on. ctx
+// carries the drop-WARN for a not-enabled extension opclass; idx supplies
+// Method and Name.
+func (r *SchemaReader) indexColumnFromRow(ctx context.Context, row indexRow, idx *ir.Index) ir.IndexColumn {
+	colName := row.colName
+	isExpr := row.isExpr
+	exprText := row.exprText
+	indOption := row.indOption
+	opclass := row.opclass
+	opclassDefault := row.opclassDefault
+	opclassExtOwned := row.opclassExtOwned
+
+	col := ir.IndexColumn{Column: colName}
+	if isExpr {
+		col.Column = ""
+		col.Expression = strings.TrimSpace(exprText)
+		col.ExpressionDialect = dialectName
+	}
+	// Bug 19a: per-column ordering from pg_index.indoption. Bit 0
+	// (value 1) = DESC; bit 1 (value 2) = NULLS FIRST. PG's
+	// implicit defaults are NULLS LAST for ASC and NULLS FIRST for
+	// DESC; only record NullsFirst when the stored ordering
+	// deviates from that default so emitted DDL stays minimal and
+	// diff-stable (the writer emits the clause only when non-nil).
+	col.Desc = indOption&1 != 0
+	nullsFirst := indOption&2 != 0
+	defaultNullsFirst := col.Desc // ASC→NULLS LAST(false); DESC→NULLS FIRST(true)
+	if nullsFirst != defaultNullsFirst {
+		nf := nullsFirst
+		col.NullsFirst = &nf
+	}
+	switch {
+	case opclass != "" && idx.Method != "":
+		col.OperatorClass = opclass
+	case opclass != "" && extensionOperatorClassEnabled(opclass, r.enabledExtensions):
+		col.OperatorClass = opclass
+	case opclass != "" && !opclassExtOwned && !opclassDefault:
+		// Bug 115 (v0.95.0): operator-explicit non-default CORE
+		// PG opclass on a core access method. Examples observed in
+		// the wild that pre-fix silently dropped:
+		//
+		//   - btree (col text_pattern_ops)     — required for
+		//     LIKE 'prefix%' to use the index in the C locale
+		//   - btree (col varchar_pattern_ops)  — same; varchar
+		//   - gin   (col jsonb_path_ops)       — half-size,
+		//     substantially faster for @> containment vs default
+		//     jsonb_ops
+		//
+		// PG records the same indclass OID whether the operator
+		// typed it explicitly or the planner defaulted; the
+		// distinction is in pg_opclass.opcdefault. A non-default
+		// core opclass is operator-significant and must carry to
+		// the target via OperatorClass; a default opclass is
+		// implicit noise the catalog round-trip drops correctly
+		// per the pre-existing Bug 47 design ("no spurious
+		// opclass on built-in indexes" for default opclasses
+		// stays). Cross-engine PG → MySQL: the writer drops with
+		// a WARN, mirroring the pg_trgm-not-enabled branch below.
+		col.OperatorClass = opclass
+	case opclass != "" && opclassExtOwned &&
+		!extensionOperatorClassRegistered(opclass) &&
+		verbatimTierFor(r.verbatimPassthrough) == verbatimTierVerbatim:
+		// ADR-0047 tier (b): an UNcatalogued, genuinely
+		// extension-owned operator class (pg_depend deptype 'e')
+		// on a same-engine-PG / PG-backup run. Carry it verbatim.
+		// !extensionOperatorClassRegistered is load-bearing: a
+		// CATALOGUED extension's opclass (pg_trgm's gin_trgm_ops,
+		// PostGIS's gist_geometry_ops_2d, …) must NOT be poached by
+		// the verbatim tier — it belongs to the ADR-0032 path
+		// (enabled → case above; not-enabled → the drop+WARN case
+		// below, the pre-existing Bug 47 / loud-failure default).
+		// The verbatim tier is uncatalogued-only (ADR-0047 §Scope);
+		// omitting this guard regressed TestMigrate_PG_PgTrgm_
+		// NotEnabled_DropsOpclass (v0.68.0 CI gate, caught pre-tag).
+		// so the same-engine writer re-emits `<col> <opclass>`.
+		// opclassExtOwned is the Bug 47 invariant made literal:
+		// only EXTENSION-owned opclasses ever set OperatorClass,
+		// so a non-empty value passing through the IR is by
+		// construction extension-introduced — which is exactly
+		// what makes a verbatim backup correctly refuse a
+		// cross-engine restore for free (the existing non-empty-
+		// OperatorClass cross-engine signal). Core / default
+		// opclasses have opclassExtOwned=false and stay
+		// unpopulated, unchanged.
+		col.OperatorClass = opclass
+	case opclass != "" && extensionOperatorClassRegistered(opclass):
+		// Operator-owned extension opclass on a core-PG access
+		// method (pg_trgm's `gin_trgm_ops` / `gist_trgm_ops`),
+		// but the owning extension is not in the operator's
+		// `--enable-pg-extension` allowlist. Drop the opclass
+		// from the IR per the loud-failure default, but emit
+		// a WARN so the operator can attribute the inevitable
+		// CREATE INDEX failure on the target to the missing
+		// flag rather than to a sluice-side bug.
+		ext := extensionOwningOperatorClass(opclass)
+		slog.WarnContext(
+			ctx,
+			"postgres: schema reader: dropping extension-owned index opclass; pass --enable-pg-extension to preserve it",
+			slog.String("index", idx.Name),
+			slog.String("column", colName),
+			slog.String("opclass", opclass),
+			slog.String("extension", ext),
+			slog.String("hint", "--enable-pg-extension "+ext),
+		)
+	}
+	return col
 }
 
 // attachCollectedIndexes drains the populateIndexes accumulator onto

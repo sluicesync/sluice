@@ -120,28 +120,7 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts irbacku
 	}
 	if info != nil {
 		_ = db.Close()
-		if opts.PersistChainSlot {
-			// Recovery wording (task #42, ADR-0085): a crashed
-			// --chain-slot backup's slot is the WAL-retention guarantee
-			// for a sound resume — re-running the same backup ADOPTS it
-			// (the resume opens a temporary anchor, so it never reaches
-			// this refusal). The pre-fix message advised drop+retry as
-			// crash recovery, which released the gap-covering WAL and
-			// funneled straight into the silent chain gap.
-			return nil, fmt.Errorf(
-				"postgres: backup snapshot: --chain-slot: replication slot %q already exists. "+
-					"It may belong to a running `sluice sync` (which already retains WAL for chaining — omit --chain-slot and chain off its position), "+
-					"an interrupted --chain-slot backup (re-run the SAME `backup full` command against the same destination — resume adopts the slot and its anchor; "+
-					"do NOT drop the slot to recover, that releases the WAL the resume needs), "+
-					"or another consumer (pass a different --slot-name). "+
-					"Only for a deliberate fresh start: drop it via `sluice slot drop %s` and pass --force-overwrite",
-				anchorSlot, anchorSlot,
-			)
-		}
-		return nil, fmt.Errorf(
-			"postgres: backup snapshot: anchor slot %q already exists; this should be impossible (timestamped name) — drop manually and retry",
-			anchorSlot,
-		)
+		return nil, anchorSlotExistsErr(anchorSlot, opts.PersistChainSlot)
 	}
 
 	// --chain-slot: ensure the publication the chain's incrementals
@@ -346,6 +325,30 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts irbacku
 		}
 	}
 	return snap, nil
+}
+
+// anchorSlotExistsErr builds the loud refusal for a pre-existing slot at
+// the anchor name. On --chain-slot it carries the task #42 (ADR-0085)
+// recovery wording — a crashed --chain-slot backup's slot is the
+// WAL-retention guarantee for a sound resume, so the operator must
+// re-run (adopt) rather than drop; on the timestamped-default shape a
+// collision is near-impossible and signals a stale leak.
+func anchorSlotExistsErr(anchorSlot string, persistChainSlot bool) error {
+	if persistChainSlot {
+		return fmt.Errorf(
+			"postgres: backup snapshot: --chain-slot: replication slot %q already exists. "+
+				"It may belong to a running `sluice sync` (which already retains WAL for chaining — omit --chain-slot and chain off its position), "+
+				"an interrupted --chain-slot backup (re-run the SAME `backup full` command against the same destination — resume adopts the slot and its anchor; "+
+				"do NOT drop the slot to recover, that releases the WAL the resume needs), "+
+				"or another consumer (pass a different --slot-name). "+
+				"Only for a deliberate fresh start: drop it via `sluice slot drop %s` and pass --force-overwrite",
+			anchorSlot, anchorSlot,
+		)
+	}
+	return fmt.Errorf(
+		"postgres: backup snapshot: anchor slot %q already exists; this should be impossible (timestamped name) — drop manually and retry",
+		anchorSlot,
+	)
 }
 
 // isSlotAlreadyGoneErr reports whether err is a "slot does not exist"

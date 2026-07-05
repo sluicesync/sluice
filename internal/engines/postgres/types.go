@@ -182,115 +182,134 @@ func translateType(c columnMeta) (ir.Type, error) {
 		return ir.Array{Element: elem}, nil
 	}
 
-	// USER-DEFINED covers enums, composites, and domain types. We
-	// support enums and PostGIS's geometry; composites/domains are
-	// not modelled in the IR.
+	// USER-DEFINED covers enums, composites, and domain types, dispatched
+	// to a dedicated helper so each family reads as its own unit and the
+	// whole translator stays under the complexity ceiling.
 	if c.DataType == "user-defined" || c.DataType == "USER-DEFINED" {
-		// ADR-0032: extension passthrough. When the schema reader
-		// recognised this column's udt_name as belonging to an
-		// operator-enabled extension, dispatch to the catalog's
-		// build function so the IR carries [ir.ExtensionType] with
-		// the per-extension Modifiers.
-		if c.ExtensionName != "" {
-			def, ok := pgExtensionCatalog[c.ExtensionName]
-			if !ok {
-				return nil, fmt.Errorf(
-					"postgres: extension %q is not in the catalog "+
-						"(internal error — schema reader recognised it "+
-						"earlier in the pipeline)",
-					c.ExtensionName,
-				)
-			}
-			return def.build(c.ExtensionTypeName, c.AttTypmod)
-		}
-		if c.EnumValues != nil {
-			return ir.Enum{Values: c.EnumValues, TypeName: c.EnumTypeName}, nil
-		}
-		// PostGIS geometry / geography. information_schema reports
-		// both as USER-DEFINED with udt_name="geometry" / "geography";
-		// subtype + SRID live in PostGIS's own geometry_columns /
-		// geography_columns views, which the schema reader queries
-		// separately and stashes on the columnMeta before invoking the
-		// translator. When that lookup returns nothing (PostGIS not
-		// installed, view doesn't know this column, or the schema
-		// reader is the older unaware version), we degrade gracefully
-		// to GeometryUnspecified+SRID=0. The IsGeography flag rides
-		// on c.GeometryInfo so the IR's [ir.Geometry.IsGeography]
-		// preserves the source's geography-vs-geometry distinction
-		// for same-engine PG → PG; cross-engine targets ignore the
-		// flag and flatten to their generic spatial type.
-		if c.UDTName == "geometry" || c.UDTName == "geography" {
-			if c.GeometryInfo == nil {
-				return ir.Geometry{
-					Subtype:     ir.GeometryUnspecified,
-					IsGeography: c.UDTName == "geography",
-				}, nil
-			}
-			subtype, parsedZ, parsedM := parseGeometrySubtype(c.GeometryInfo.Subtype)
-			return ir.Geometry{
-				Subtype:     subtype,
-				SRID:        c.GeometryInfo.SRID,
-				IsGeography: c.GeometryInfo.IsGeography,
-				// OR-merge: the type-string parsing covers the M-only
-				// case where PostGIS records the suffix in `type`; the
-				// schema reader's coord_dimension capture covers the Z
-				// and ZM cases where PostGIS records the dimension out
-				// of band in coord_dimension. Bug 53.
-				HasZ: parsedZ || c.GeometryInfo.HasZ,
-				HasM: parsedM || c.GeometryInfo.HasM,
-			}, nil
-		}
-		// ADR-0047 tier (b): an UNcatalogued USER-DEFINED type the run
-		// is allowed to carry verbatim (provably same-engine PG → PG,
-		// or a PG backup whose PG-restore-only constraint is enforced
-		// by the lineage marker + restore-time engine gate). Reached
-		// only after the catalogued (ExtensionName), enum (EnumValues),
-		// and geometry/geography branches above all declined — so it
-		// never shadows a first-class IR shape. Carries the exact
-		// pg_catalog.format_type spelling; the PG writer re-emits it
-		// literally and values round-trip via the type's text I/O.
-		// VerbatimEligible is false for tier (c) (cross-engine / no
-		// same-engine guarantee), so that path still falls through to
-		// the loud refusal below — the cross-engine default is NOT
-		// weakened.
-		if c.VerbatimEligible {
-			if c.FormatType == "" {
-				return nil, fmt.Errorf(
-					"postgres: user-defined type %q is eligible for "+
-						"verbatim passthrough but pg_catalog.format_type "+
-						"returned empty (cannot re-emit a column with no "+
-						"type spelling) — this is a sluice bug; please "+
-						"report it",
-					c.UDTName,
-				)
-			}
-			return ir.VerbatimType{Definition: c.FormatType}, nil
-		}
-
-		// ADR-0032 hint: if udt_name matches a known extension type
-		// the operator didn't opt into, surface the actionable flag
-		// rather than the vague "not a recognised enum" wording. The
-		// extension-owning lookup runs unconditionally — the catalog
-		// is small, the data point is already there from the
-		// `--enable-pg-extension` allowlist machinery.
-		if owningExt := extensionOwningType(c.UDTName); owningExt != "" {
-			return nil, fmt.Errorf(
-				"postgres: user-defined type %q is owned by extension %q; "+
-					"pass --enable-pg-extension %s to enable passthrough "+
-					"(ADR-0032)",
-				c.UDTName, owningExt, owningExt,
-			)
-		}
-		return nil, fmt.Errorf(
-			"postgres: user-defined type %q is not supported (it is not a "+
-				"recognised enum, a catalogued extension type, or a "+
-				"verbatim-passthrough type — composite and domain types are "+
-				"not modelled in the IR) — exclude the table with "+
-				"--exclude-table to proceed",
-			c.UDTName,
-		)
+		return translateUserDefinedType(c)
 	}
 
+	return translateScalarType(c)
+}
+
+// translateUserDefinedType maps a Postgres information_schema
+// data_type=USER-DEFINED column to an IR type: catalogued extension
+// (ADR-0032), enum, PostGIS geometry/geography, the ADR-0047 verbatim
+// tier, and finally the loud refusal. Split out of [translateType] so
+// each type family reads as its own unit. Precondition: the caller has
+// established c.DataType is USER-DEFINED.
+func translateUserDefinedType(c columnMeta) (ir.Type, error) {
+	// ADR-0032: extension passthrough. When the schema reader
+	// recognised this column's udt_name as belonging to an
+	// operator-enabled extension, dispatch to the catalog's
+	// build function so the IR carries [ir.ExtensionType] with
+	// the per-extension Modifiers.
+	if c.ExtensionName != "" {
+		def, ok := pgExtensionCatalog[c.ExtensionName]
+		if !ok {
+			return nil, fmt.Errorf(
+				"postgres: extension %q is not in the catalog "+
+					"(internal error — schema reader recognised it "+
+					"earlier in the pipeline)",
+				c.ExtensionName,
+			)
+		}
+		return def.build(c.ExtensionTypeName, c.AttTypmod)
+	}
+	if c.EnumValues != nil {
+		return ir.Enum{Values: c.EnumValues, TypeName: c.EnumTypeName}, nil
+	}
+	// PostGIS geometry / geography. information_schema reports
+	// both as USER-DEFINED with udt_name="geometry" / "geography";
+	// subtype + SRID live in PostGIS's own geometry_columns /
+	// geography_columns views, which the schema reader queries
+	// separately and stashes on the columnMeta before invoking the
+	// translator. When that lookup returns nothing (PostGIS not
+	// installed, view doesn't know this column, or the schema
+	// reader is the older unaware version), we degrade gracefully
+	// to GeometryUnspecified+SRID=0. The IsGeography flag rides
+	// on c.GeometryInfo so the IR's [ir.Geometry.IsGeography]
+	// preserves the source's geography-vs-geometry distinction
+	// for same-engine PG → PG; cross-engine targets ignore the
+	// flag and flatten to their generic spatial type.
+	if c.UDTName == "geometry" || c.UDTName == "geography" {
+		if c.GeometryInfo == nil {
+			return ir.Geometry{
+				Subtype:     ir.GeometryUnspecified,
+				IsGeography: c.UDTName == "geography",
+			}, nil
+		}
+		subtype, parsedZ, parsedM := parseGeometrySubtype(c.GeometryInfo.Subtype)
+		return ir.Geometry{
+			Subtype:     subtype,
+			SRID:        c.GeometryInfo.SRID,
+			IsGeography: c.GeometryInfo.IsGeography,
+			// OR-merge: the type-string parsing covers the M-only
+			// case where PostGIS records the suffix in `type`; the
+			// schema reader's coord_dimension capture covers the Z
+			// and ZM cases where PostGIS records the dimension out
+			// of band in coord_dimension. Bug 53.
+			HasZ: parsedZ || c.GeometryInfo.HasZ,
+			HasM: parsedM || c.GeometryInfo.HasM,
+		}, nil
+	}
+	// ADR-0047 tier (b): an UNcatalogued USER-DEFINED type the run
+	// is allowed to carry verbatim (provably same-engine PG → PG,
+	// or a PG backup whose PG-restore-only constraint is enforced
+	// by the lineage marker + restore-time engine gate). Reached
+	// only after the catalogued (ExtensionName), enum (EnumValues),
+	// and geometry/geography branches above all declined — so it
+	// never shadows a first-class IR shape. Carries the exact
+	// pg_catalog.format_type spelling; the PG writer re-emits it
+	// literally and values round-trip via the type's text I/O.
+	// VerbatimEligible is false for tier (c) (cross-engine / no
+	// same-engine guarantee), so that path still falls through to
+	// the loud refusal below — the cross-engine default is NOT
+	// weakened.
+	if c.VerbatimEligible {
+		if c.FormatType == "" {
+			return nil, fmt.Errorf(
+				"postgres: user-defined type %q is eligible for "+
+					"verbatim passthrough but pg_catalog.format_type "+
+					"returned empty (cannot re-emit a column with no "+
+					"type spelling) — this is a sluice bug; please "+
+					"report it",
+				c.UDTName,
+			)
+		}
+		return ir.VerbatimType{Definition: c.FormatType}, nil
+	}
+
+	// ADR-0032 hint: if udt_name matches a known extension type
+	// the operator didn't opt into, surface the actionable flag
+	// rather than the vague "not a recognised enum" wording. The
+	// extension-owning lookup runs unconditionally — the catalog
+	// is small, the data point is already there from the
+	// `--enable-pg-extension` allowlist machinery.
+	if owningExt := extensionOwningType(c.UDTName); owningExt != "" {
+		return nil, fmt.Errorf(
+			"postgres: user-defined type %q is owned by extension %q; "+
+				"pass --enable-pg-extension %s to enable passthrough "+
+				"(ADR-0032)",
+			c.UDTName, owningExt, owningExt,
+		)
+	}
+	return nil, fmt.Errorf(
+		"postgres: user-defined type %q is not supported (it is not a "+
+			"recognised enum, a catalogued extension type, or a "+
+			"verbatim-passthrough type — composite and domain types are "+
+			"not modelled in the IR) — exclude the table with "+
+			"--exclude-table to proceed",
+		c.UDTName,
+	)
+}
+
+// translateScalarType maps a Postgres scalar (non-array, non-USER-
+// DEFINED) column to an IR type via a data_type switch, with the
+// ADR-0051 core-verbatim allowlist as the last carry before the loud
+// refusal. Split out of [translateType] to keep the dispatch switch
+// under the complexity ceiling.
+func translateScalarType(c columnMeta) (ir.Type, error) {
 	switch c.DataType {
 	// ---- Boolean ----
 	case "boolean":
