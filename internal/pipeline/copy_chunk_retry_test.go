@@ -61,9 +61,9 @@ func (e *slotRetryEngine) IsConnectionSlotExhausted(err error) bool {
 
 // zeroDelayGate builds a gate with a no-wait policy so the retry tests
 // never actually sleep, but the retry bound is still enforced.
-func zeroDelayGate(parallelism, MaxRetries int) *migcore.CopyParallelismGate {
+func zeroDelayGate(parallelism, maxRetries int) *migcore.CopyParallelismGate {
 	return migcore.NewCopyParallelismGate(parallelism, migcore.CopyBackoffPolicy{
-		MaxRetries:   MaxRetries,
+		MaxRetries:   maxRetries,
 		BaseDelay:    0,
 		MaxDelay:     0,
 		MaxTotalWait: 1 << 62, // effectively unbounded for these tests

@@ -185,6 +185,10 @@ func ResolveBulkParallelMinRows(configured int64, tableCount int) int64 {
 //     takes the single-reader path.
 type ChunkStrategy int
 
+// The chunk strategies: StrategyNone (single-reader fall-back),
+// StrategyMinMaxDivide (ADR-0019 integer-PK MIN/MAX/divide), and
+// StrategyKeysetSample (ADR-0096 sampled-keyset for non-integer /
+// composite PKs). See [CanParallelChunkTable] for the dispatch.
 const (
 	StrategyNone ChunkStrategy = iota
 	StrategyMinMaxDivide

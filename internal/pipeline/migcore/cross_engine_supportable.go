@@ -347,6 +347,7 @@ func isCrossEngineTranslatablePGExtension(name string) bool {
 	return false
 }
 
+// CheckCrossEngineDeltaSupportable scans an incremental's schema-delta
 // entries for shapes whose translated form would not be cleanly
 // supportable on the target engine. Mirrors
 // [CheckCrossEngineSupportable] but only inspects the after-shape of
