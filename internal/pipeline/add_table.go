@@ -393,44 +393,13 @@ func (a *AddTable) Run(ctx context.Context) error {
 	}
 
 	// ---- 4. Extend the publication scope (Postgres) BEFORE the
-	// snapshot's slot is created so the slot's pinned catalog
-	// snapshot already includes the new table in publication scope.
-	// Same ordering rationale as cold-start's EnsurePublication
-	// (Bug 13, ADR-0021). Engines without publications are no-ops.
-	//
-	// ADR-0036 (Path D Phase A) M2/M3 instrumentation: capture
-	// pg_current_wal_lsn() before AND after publication-add so the
-	// diagnostic test can name a concrete LSN window for the catalog
-	// change. The "before" value bounds where pgoutput's per-LSN
-	// catalog snapshot must still exclude the new table; the "after"
-	// value is an upper bound on LSN_pubadd (the actual commit-LSN
-	// of the ALTER PUBLICATION DDL). Together with the BEGIN/COMMIT
-	// LSN logging in cdc_reader's dispatchWAL, the captured trace
-	// answers M1 (long txns straddling the boundary) and M3
-	// (pgoutput catalog-snapshot lag).
-	lsnBeforePubAdd := a.diagReadCurrentWAL(ctx, "before-publication-add")
-	if pa, ok := a.Source.(publicationAdder); ok {
-		slog.InfoContext(
-			ctx, "add-table: extending source publication scope",
-			slog.String("table", a.TableName),
-		)
-		if err := pa.AddPublicationTables(ctx, a.SourceDSN, []string{a.TableName}); err != nil {
-			return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: add-table: extend publication: %w", err))
-		}
-	} else {
-		slog.DebugContext(
-			ctx, "add-table: source engine has no publication concept; skipping extend step",
-			slog.String("source", a.Source.Name()),
-		)
+	// snapshot's slot is created so the slot's pinned catalog snapshot
+	// already includes the new table (Bug 13 / ADR-0021 ordering), and
+	// capture the ADR-0036 pg_current_wal_lsn() window around the ALTER.
+	lsnBeforePubAdd, lsnAfterPubAdd, err := a.extendPublicationScope(ctx)
+	if err != nil {
+		return err
 	}
-	lsnAfterPubAdd := a.diagReadCurrentWAL(ctx, "after-publication-add")
-	slog.DebugContext(
-		ctx, "addtable.diag: publication-add LSN window",
-		slog.String("phase", "pub-add-window"),
-		slog.String("table", a.TableName),
-		slog.String("lsn_before_pub_add", lsnBeforePubAdd),
-		slog.String("lsn_after_pub_add", lsnAfterPubAdd),
-	)
 
 	// ---- 5. Open a snapshot stream restricted to the new table.
 	// PG: temp slot to avoid colliding with the main `sluice_slot`
@@ -453,25 +422,9 @@ func (a *AddTable) Run(ctx context.Context) error {
 		slog.String("position_token", stream.Position.Token),
 	)
 
-	// ADR-0036 (Path D Phase A) M2: surface the snapshot's
-	// consistent-point LSN alongside the publication-add LSN window
-	// so the diagnostic test can compare LSN_S against LSN_before_pubadd
-	// and LSN_after_pubadd. The "snapshot consistent-point race"
-	// hypothesis predicts loss when LSN_S < LSN_pubadd; the captured
-	// trace answers it directly.
-	if extractor, ok := a.Source.(snapshotLSNExtractor); ok {
-		if snapLSN, present, err := extractor.ExtractSnapshotLSN(stream.Position); err == nil && present {
-			slog.DebugContext(
-				ctx, "addtable.diag: snapshot consistent-point",
-				slog.String("phase", "snapshot-open"),
-				slog.String("table", a.TableName),
-				slog.String("lsn_snapshot", snapLSN),
-				slog.String("lsn_before_pub_add", lsnBeforePubAdd),
-				slog.String("lsn_after_pub_add", lsnAfterPubAdd),
-				slog.String("temp_slot", tempSlot),
-			)
-		}
-	}
+	// ---- 5b. ADR-0036 Path D Phase A M2 diagnostics: the snapshot's
+	// consistent-point LSN against the publication-add LSN window.
+	a.diagSnapshotConsistentPoint(ctx, stream.Position, lsnBeforePubAdd, lsnAfterPubAdd, tempSlot)
 
 	// ---- 5a. Live-mode invariant (PG path only): snapshot-LSN ≥ slot
 	// confirmed_flush_lsn captured before publication-add. ADR-0030.
@@ -526,53 +479,125 @@ func (a *AddTable) Run(ctx context.Context) error {
 		)
 	}
 
-	// ---- 7. MySQL-side filter-flip: record the new table on the per-
-	// target sluice_cdc_state.live_added_tables column so the running
-	// streamer's poll goroutine merges it into the dispatch filter on
-	// its next tick. ADR-0034.
-	//
-	// Runs only in live mode and only on the binlog-source path
-	// (preflight.mode == liveModeBinlogFilterFlip). The PG path's
-	// equivalent step is the `ALTER PUBLICATION ... ADD TABLE` issued
-	// in step 4 BEFORE the snapshot — pgoutput's per-LSN catalog
-	// snapshot semantics make pre-snapshot publication-add the right
-	// ordering (see ADR-0030 for the correctness story). MySQL has no
-	// publication concept; the streamer's filter is the gate, so the
-	// flip lands AFTER bulk-copy succeeds.
-	if a.LiveMode && preflight.mode == liveModeBinlogFilterFlip {
-		writer, ok := applier.(liveAddedTablesWriter)
-		if !ok {
-			// Shouldn't happen — preflightLive's structural-interface
-			// check already guarded this — but be loud if a regression
-			// in the dispatch ladder slips through.
-			return errors.New("pipeline: add-table: --no-drain (binlog-source path): target applier no longer implements RecordLiveAddedTable; this is a regression in the dispatch ladder")
-		}
-		if err := writer.RecordLiveAddedTable(ctx, a.StreamID, a.TableName); err != nil {
-			return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf(
-				"pipeline: add-table: --no-drain: record live-added table on cdc-state: %w", err,
-			))
-		}
-		slog.InfoContext(
-			ctx, "add-table: live mode: recorded table on cdc-state.live_added_tables; running streamer's poll will merge into dispatch filter on next tick (ADR-0034)",
-			slog.String("table", a.TableName),
-			slog.String("stream_id", a.StreamID),
-		)
+	// ---- 7. MySQL-side filter-flip (ADR-0034): record the new table on
+	// cdc-state.live_added_tables so the running streamer's poll merges
+	// it into the dispatch filter. No-op on the drained and PG paths.
+	if err := a.recordLiveAddedTable(ctx, applier, preflight); err != nil {
+		return err
 	}
 
+	a.logAddComplete(ctx)
+	return nil
+}
+
+// extendPublicationScope extends the source publication to include the
+// new table (Postgres) before the snapshot slot is created, so the
+// slot's pinned catalog snapshot already sees it in scope (Bug 13 /
+// ADR-0021 ordering). Engines without publications are a no-op. Returns
+// the pg_current_wal_lsn() readings taken immediately before and after
+// the ALTER (ADR-0036 Path D Phase A M2/M3 instrumentation) so the
+// snapshot diagnostic can name the catalog-change LSN window: the
+// "before" value bounds where pgoutput's per-LSN catalog snapshot must
+// still exclude the new table; the "after" value upper-bounds the ALTER
+// PUBLICATION commit-LSN.
+func (a *AddTable) extendPublicationScope(ctx context.Context) (lsnBefore, lsnAfter string, err error) {
+	lsnBefore = a.diagReadCurrentWAL(ctx, "before-publication-add")
+	if pa, ok := a.Source.(publicationAdder); ok {
+		slog.InfoContext(
+			ctx, "add-table: extending source publication scope",
+			slog.String("table", a.TableName),
+		)
+		if err := pa.AddPublicationTables(ctx, a.SourceDSN, []string{a.TableName}); err != nil {
+			return "", "", migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: add-table: extend publication: %w", err))
+		}
+	} else {
+		slog.DebugContext(
+			ctx, "add-table: source engine has no publication concept; skipping extend step",
+			slog.String("source", a.Source.Name()),
+		)
+	}
+	lsnAfter = a.diagReadCurrentWAL(ctx, "after-publication-add")
+	slog.DebugContext(
+		ctx, "addtable.diag: publication-add LSN window",
+		slog.String("phase", "pub-add-window"),
+		slog.String("table", a.TableName),
+		slog.String("lsn_before_pub_add", lsnBefore),
+		slog.String("lsn_after_pub_add", lsnAfter),
+	)
+	return lsnBefore, lsnAfter, nil
+}
+
+// diagSnapshotConsistentPoint logs the snapshot's consistent-point LSN
+// next to the publication-add LSN window (ADR-0036 Path D Phase A M2) so
+// the diagnostic test can compare LSN_S against the pub-add window. Pure
+// instrumentation; best-effort (a missing extractor or decode error is
+// silently skipped).
+func (a *AddTable) diagSnapshotConsistentPoint(ctx context.Context, pos ir.Position, lsnBefore, lsnAfter, tempSlot string) {
+	extractor, ok := a.Source.(snapshotLSNExtractor)
+	if !ok {
+		return
+	}
+	if snapLSN, present, err := extractor.ExtractSnapshotLSN(pos); err == nil && present {
+		slog.DebugContext(
+			ctx, "addtable.diag: snapshot consistent-point",
+			slog.String("phase", "snapshot-open"),
+			slog.String("table", a.TableName),
+			slog.String("lsn_snapshot", snapLSN),
+			slog.String("lsn_before_pub_add", lsnBefore),
+			slog.String("lsn_after_pub_add", lsnAfter),
+			slog.String("temp_slot", tempSlot),
+		)
+	}
+}
+
+// recordLiveAddedTable performs the MySQL-side filter-flip (ADR-0034):
+// in live binlog-source mode it records the new table on the per-target
+// sluice_cdc_state.live_added_tables column so the running streamer's
+// poll goroutine merges it into the dispatch filter on its next tick. A
+// no-op on the drained path and on the PG publication-add path (whose
+// equivalent step ran before the snapshot in extendPublicationScope).
+func (a *AddTable) recordLiveAddedTable(ctx context.Context, applier ir.ChangeApplier, preflight addTablePreflight) error {
+	if !a.LiveMode || preflight.mode != liveModeBinlogFilterFlip {
+		return nil
+	}
+	writer, ok := applier.(liveAddedTablesWriter)
+	if !ok {
+		// Shouldn't happen — preflightLive's structural-interface check
+		// already guarded this — but be loud if a regression in the
+		// dispatch ladder slips through.
+		return errors.New("pipeline: add-table: --no-drain (binlog-source path): target applier no longer implements RecordLiveAddedTable; this is a regression in the dispatch ladder")
+	}
+	if err := writer.RecordLiveAddedTable(ctx, a.StreamID, a.TableName); err != nil {
+		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf(
+			"pipeline: add-table: --no-drain: record live-added table on cdc-state: %w", err,
+		))
+	}
+	slog.InfoContext(
+		ctx, "add-table: live mode: recorded table on cdc-state.live_added_tables; running streamer's poll will merge into dispatch filter on next tick (ADR-0034)",
+		slog.String("table", a.TableName),
+		slog.String("stream_id", a.StreamID),
+	)
+	return nil
+}
+
+// logAddComplete emits the terminal success line, tailored to whether
+// the add ran live (the active stream picks up new-table events on its
+// next consumption) or drained (operator must `sluice sync start
+// --resume`).
+func (a *AddTable) logAddComplete(ctx context.Context) {
 	if a.LiveMode {
 		slog.InfoContext(
 			ctx, "add-table: live add complete; the active stream's tail will pick up new-table events on its next consumption",
 			slog.String("table", a.TableName),
 			slog.String("stream_id", a.StreamID),
 		)
-	} else {
-		slog.InfoContext(
-			ctx, "add-table: complete; resume the stream with `sluice sync start --resume` to pick up CDC for the new table",
-			slog.String("table", a.TableName),
-			slog.String("stream_id", a.StreamID),
-		)
+		return
 	}
-	return nil
+	slog.InfoContext(
+		ctx, "add-table: complete; resume the stream with `sluice sync start --resume` to pick up CDC for the new table",
+		slog.String("table", a.TableName),
+		slog.String("stream_id", a.StreamID),
+	)
 }
 
 // validate enforces the required-fields contract.

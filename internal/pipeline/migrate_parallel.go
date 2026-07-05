@@ -1022,14 +1022,19 @@ func copyChunk(
 			slog.String("err", err.Error()))
 	}
 
-	// ADR-0042 Phase A — per-chunk summary. chunkEnd vs peer chunks'
-	// [t_start,t_end] decides H1: overlapping intervals => true
-	// parallelism; chunk N starting only after N-1's t_end =>
-	// writer serialisation. rows_per_sec + batch_wall_share isolate
-	// H2: a high non-batch remainder (chunk_wall - batch_wall_total)
-	// points at fixed per-chunk overhead (rowcount kickoff,
-	// checkpoint writes); a flat low rows_per_sec with full
-	// batch_wall_share points at the read+write protocol path.
+	logChunkSummary(ctx, table.Name, chunkIndex, chunkStart, rowsCopied, batchN, totalBatchWall)
+	return nil
+}
+
+// logChunkSummary emits the ADR-0042 Phase A per-chunk timing summary at
+// DEBUG. chunkEnd vs peer chunks' [t_start,t_end] decides H1 (overlapping
+// intervals => true parallelism; chunk N starting only after N-1's t_end
+// => writer serialisation); rows_per_sec + batch_wall_share isolate H2 (a
+// high non-batch remainder — chunk_wall minus batch_wall_total — points
+// at fixed per-chunk overhead like the rowcount kickoff and checkpoint
+// writes; a flat low rows_per_sec with full batch_wall_share points at
+// the read+write protocol path).
+func logChunkSummary(ctx context.Context, tableName string, chunkIndex int, chunkStart time.Time, rowsCopied int64, batchN int, totalBatchWall time.Duration) {
 	chunkEnd := time.Now()
 	chunkWall := chunkEnd.Sub(chunkStart)
 	var rowsPerSec float64
@@ -1037,7 +1042,7 @@ func copyChunk(
 		rowsPerSec = float64(rowsCopied) / s
 	}
 	slog.DebugContext(ctx, "adr0042: chunk done",
-		slog.String("table", table.Name),
+		slog.String("table", tableName),
 		slog.Int("chunk", chunkIndex),
 		slog.Int64("rows", rowsCopied),
 		slog.Int("batches", batchN),
@@ -1047,8 +1052,6 @@ func copyChunk(
 		slog.Duration("batch_wall_total", totalBatchWall),
 		slog.Duration("non_batch_wall", chunkWall-totalBatchWall),
 		slog.Float64("rows_per_sec", rowsPerSec))
-
-	return nil
 }
 
 // copyChunkFast is the ADR-0043 fast-loader branch for a fresh,
