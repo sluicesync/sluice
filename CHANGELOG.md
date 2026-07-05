@@ -4,6 +4,16 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.181] - 2026-07-05
+
+### Fixed
+
+- **MySQL LOAD DATA bulk copy hung indefinitely under `NO_BACKSLASH_ESCAPES` (Bug 178; liveness, zero silent-loss; latent since v0.10.0).** A MySQL-target migrate over the LOAD DATA LOCAL INFILE fast path (`local_infile=ON`, the default) could hang forever — rows streamed, then no `phase complete`, no error, zero rows committed, process wedged — when `NO_BACKSLASH_ESCAPES` (NBE) was active on the target connection (via `--mysql-sql-mode` or a DSN `sql_mode` param). Root cause: `buildLoadDataStmt` spelled the field/escape/line framing as backslash-escaped SQL string literals (`'\t'`/`'\\'`/`'\n'`), which the server parses under the session sql_mode; under NBE `'\\'` is two backslash bytes, tripping MySQL's "ESCAPED BY must be a single character" check and aborting the statement with Error 1083 BEFORE it requests the infile stream — so the driver never invoked the registered reader, nobody drained the `io.Pipe`, and the encoder goroutine deadlocked on its buffered pipe write (a fast exec error became an indefinite hang). The framing is now emitted as `sql_mode`-invariant hex literals (`X'09'`/`X'5C'`/`X'0A'` — byte-identical output, NBE-invariant parse), and `writeLoadData` closes the pipe reader before awaiting the encoder so ANY pre-transfer statement error surfaces loudly instead of deadlocking (defence in depth). Batched-INSERT (`local_infile=OFF`) was always immune. Pinned by a unit assertion on the hex framing plus a real-MySQL integration test that drives the writer with NBE active across the framing torture class (literal backslash, backslash+field/line terminator, `\N`-looking and `\0`-looking values, real NUL, real NULL) under a hard deadline so a regression re-hangs as a FAIL, not a hung process.
+
+### Internal
+
+- **Wire-format + storage leaf extracted to `internal/pipeline/blobcodec` (audit A-1 down-payment).** The backup chunk codec, fast-JSON chunk writer, change-chunk reader/writer, blob store, compression codec, and local-FS store (~3.3k prod LOC + ~2.5k test LOC) moved out of the flat `internal/pipeline` package into a new leaf sub-package that imports only the IR backup contract — a cycle-free first slice of the pipeline decomposition (finding A-1), shrinking the root package and de-risking the larger backup/restore carve. Pure move: chunk/manifest/codec formats and the backup→restore round-trip are byte-identical (proven by the existing LocalStore + MinIO integration round-trips across the new package boundary); `git mv` history preserved.
+
 ## [0.99.180] - 2026-07-04
 
 ### Added
