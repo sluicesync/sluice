@@ -999,6 +999,21 @@ func (b *IncrementalBackup) alignEncryption(ctx context.Context, parent *irbacku
 	if mode == "" {
 		mode = crypto.EncryptModePerChain
 	}
+	// Bug 179: the chain's encryption mode is authoritative for EVERY
+	// segment. --encrypt-mode sets the mode only for a fresh full; an
+	// incremental extending an existing chain must use the chain's mode.
+	// Refuse an explicit conflicting --encrypt-mode LOUDLY here — otherwise
+	// the incremental builds and verifies but is un-restorable, because the
+	// restore resolves a single chain mode/CEK from the root full while the
+	// sibling resolveChunkCEK would write this segment's chunks under the
+	// operator's (mismatched) mode. Inherit it when omitted so
+	// resolveChunkCEK agrees with the chain.
+	if b.Encryption.Mode != "" && b.Encryption.Mode != mode {
+		return nil, fmt.Errorf("incremental: --encrypt-mode=%q conflicts with the chain's encryption mode %q; "+
+			"an encrypted chain uses one mode for every segment (omit --encrypt-mode to inherit it, or start a fresh full backup)",
+			b.Encryption.Mode, mode)
+	}
+	b.Encryption.Mode = mode
 	if mode == crypto.EncryptModePerChain {
 		if len(parentEnc.WrappedCEK) == 0 {
 			return nil, errors.New("incremental: parent's chain encryption is per-chain but WrappedCEK is empty")
