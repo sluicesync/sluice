@@ -3,7 +3,11 @@
 
 package pipeline
 
-import "testing"
+import (
+	"testing"
+
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
+)
 
 // TestResolveBrokerApplyConcurrency pins the ADR-0106 raw-int contract for the
 // broker's incremental-replay lane count: 0 (unset) → the fast adaptive
@@ -17,7 +21,7 @@ func TestResolveBrokerApplyConcurrency(t *testing.T) {
 		in   int
 		want int
 	}{
-		{"unset resolves to fast default", 0, defaultApplyConcurrency},
+		{"unset resolves to fast default", 0, migcore.DefaultApplyConcurrency},
 		{"negative clamps to serial", -1, 1},
 		{"explicit serial opt-out", 1, 1},
 		{"operator override honored", 8, 8},
@@ -25,15 +29,15 @@ func TestResolveBrokerApplyConcurrency(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := resolveReplayApplyConcurrency(c.in); got != c.want {
-				t.Errorf("resolveReplayApplyConcurrency(%d) = %d; want %d", c.in, got, c.want)
+			if got := migcore.ResolveReplayApplyConcurrency(c.in); got != c.want {
+				t.Errorf("migcore.ResolveReplayApplyConcurrency(%d) = %d; want %d", c.in, got, c.want)
 			}
 		})
 	}
 }
 
 // TestBrokerApplyConcurrency_PlumbEngages pins that the broker's resolved lane
-// count flows through the shared applyApplyConcurrency helper onto the applier:
+// count flows through the shared migcore.ApplyApplyConcurrency helper onto the applier:
 // the fast default (from an unset field) engages the setter, while an explicit
 // 1 (serial opt-out) leaves it untouched. This is the broker-side counterpart
 // to the streamer's openApplier plumb (streamer_run_phases.go) — the same
@@ -41,14 +45,14 @@ func TestResolveBrokerApplyConcurrency(t *testing.T) {
 func TestBrokerApplyConcurrency_PlumbEngages(t *testing.T) {
 	// Unset broker field (0) → fast default → setter engaged with W = default.
 	rec := &recordingConcurrencySetter{}
-	applyApplyConcurrency(rec, resolveReplayApplyConcurrency(0))
-	if rec.calls != 1 || rec.lanes != defaultApplyConcurrency {
-		t.Errorf("unset: setter calls=%d lanes=%d; want calls=1 lanes=%d", rec.calls, rec.lanes, defaultApplyConcurrency)
+	migcore.ApplyApplyConcurrency(rec, migcore.ResolveReplayApplyConcurrency(0))
+	if rec.calls != 1 || rec.lanes != migcore.DefaultApplyConcurrency {
+		t.Errorf("unset: setter calls=%d lanes=%d; want calls=1 lanes=%d", rec.calls, rec.lanes, migcore.DefaultApplyConcurrency)
 	}
 
 	// Explicit serial opt-out (1) → no-op, applier stays on the serial path.
 	recSerial := &recordingConcurrencySetter{}
-	applyApplyConcurrency(recSerial, resolveReplayApplyConcurrency(1))
+	migcore.ApplyApplyConcurrency(recSerial, migcore.ResolveReplayApplyConcurrency(1))
 	if recSerial.calls != 0 {
 		t.Errorf("serial opt-out engaged the setter %d times; want 0", recSerial.calls)
 	}

@@ -1717,28 +1717,6 @@ func applyExecTimeout(target any, d time.Duration) {
 	}
 }
 
-// applyApplyConcurrency plumbs the streamer-side resolved apply-concurrency
-// value to a target [ir.ChangeApplier] that opts into the ADR-0104 (item
-// 23(c), MySQL) / ADR-0105 (item 26, Postgres) key-hash concurrent apply via
-// [ir.ApplyConcurrencySetter]. Both shipping engines implement the setter;
-// any future engine that doesn't inherits its existing serial apply path
-// unchanged (type-assertion fails closed).
-//
-// lanes is the ADR-0106-resolved value (auto:N for an unset
-// --apply-concurrency, an explicit 1 for serial opt-out, N>1 honored), not
-// the operator's raw field. lanes <= 1 is a no-op (serial default kept); the
-// setter is invoked ONLY for W > 1. Called immediately after each engine
-// applier opens, before any ApplyBatch dispatch (sibling to applyExecTimeout
-// / migcore.ApplyMaxBufferBytes).
-func applyApplyConcurrency(target any, lanes int) {
-	if lanes <= 1 {
-		return
-	}
-	if setter, ok := target.(ir.ApplyConcurrencySetter); ok {
-		setter.SetApplyConcurrency(lanes)
-	}
-}
-
 // applyRedactor plumbs the streamer-side --redact registry to a
 // target [ir.ChangeApplier] that opts into PII redaction via
 // [ir.RedactorSetter]. PII Phase 1.5: completes the operator

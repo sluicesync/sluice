@@ -107,7 +107,7 @@ type ChainRestore struct {
 	// applying an 8M-change incremental into cross-region PlanetScale-PG).
 	// This is the chain-restore analog of that fix: the full-restore COPY
 	// is already parallel (ADR-0112); this closes the incremental-apply
-	// leg. Resolved through [resolveReplayApplyConcurrency] (ADR-0106:
+	// leg. Resolved through [migcore.ResolveReplayApplyConcurrency] (ADR-0106:
 	// 0 = auto:N fast default, 1 = serial opt-out, N > 1 honored), so the
 	// zero value gets the fast default (no zero-value-safe-default trap).
 	ApplyConcurrency int
@@ -234,7 +234,7 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	defer closeIf(applier)
 	migcore.ApplyMaxBufferBytes(applier, r.MaxBufferBytes)
 	migcore.ApplyTargetSchema(applier, r.TargetSchema)
-	applyApplyConcurrency(applier, resolveReplayApplyConcurrency(r.ApplyConcurrency))
+	migcore.ApplyApplyConcurrency(applier, migcore.ResolveReplayApplyConcurrency(r.ApplyConcurrency))
 	if err := applier.EnsureControlTable(ctx); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("chain restore: ensure control table: %w", err))
 	}

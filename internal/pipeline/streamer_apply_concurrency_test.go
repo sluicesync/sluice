@@ -10,6 +10,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/appliercontrol"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // --- ADR-0106 (item 31): fast-by-default apply-concurrency resolution ---
@@ -36,7 +37,7 @@ func TestResolveApplyConcurrency_ContractMapping(t *testing.T) {
 		{"explicit serial opt-out", 1, 1},
 		{"explicit two honored", 2, 2},
 		{"explicit eight honored above default", 8, 8},
-		{"unset resolves to auto default", 0, defaultApplyConcurrency},
+		{"unset resolves to auto default", 0, migcore.DefaultApplyConcurrency},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -62,8 +63,8 @@ func TestResolveApplyConcurrency_UnsetIsNotSerial(t *testing.T) {
 	if got <= 1 {
 		t.Fatalf("unset --apply-concurrency resolved to %d (serial) — the ADR-0106 default must be auto:N > 1", got)
 	}
-	if got != defaultApplyConcurrency {
-		t.Errorf("unset auto default = %d; want %d", got, defaultApplyConcurrency)
+	if got != migcore.DefaultApplyConcurrency {
+		t.Errorf("unset auto default = %d; want %d", got, migcore.DefaultApplyConcurrency)
 	}
 }
 
@@ -77,8 +78,8 @@ func TestResolveApplyConcurrency_MySQLFixedCeiling(t *testing.T) {
 		Target:               noProberEngine{},
 		MaxTargetConnections: 2, // inert on a non-prober target — must NOT clamp
 	}
-	if got := s.resolveApplyConcurrency(context.Background()); got != defaultApplyConcurrency {
-		t.Errorf("MySQL-shaped target unset auto = %d; want fixed ceiling %d (--max-target-connections inert)", got, defaultApplyConcurrency)
+	if got := s.resolveApplyConcurrency(context.Background()); got != migcore.DefaultApplyConcurrency {
+		t.Errorf("MySQL-shaped target unset auto = %d; want fixed ceiling %d (--max-target-connections inert)", got, migcore.DefaultApplyConcurrency)
 	}
 }
 
@@ -97,8 +98,8 @@ func TestResolveApplyConcurrency_PGBudgetBoundsLanes(t *testing.T) {
 		t.Fatalf("constrained PG target auto = %d; want 2 (budget-bounded)", got)
 	}
 	// The probe must be asked for the desired default, bounded by the ceiling.
-	if eng.gotReq != defaultApplyConcurrency {
-		t.Errorf("probe requested = %d; want %d (the desired lane count)", eng.gotReq, defaultApplyConcurrency)
+	if eng.gotReq != migcore.DefaultApplyConcurrency {
+		t.Errorf("probe requested = %d; want %d (the desired lane count)", eng.gotReq, migcore.DefaultApplyConcurrency)
 	}
 	if eng.probeCall != 1 {
 		t.Errorf("probe called %d times; want exactly 1", eng.probeCall)
@@ -107,16 +108,16 @@ func TestResolveApplyConcurrency_PGBudgetBoundsLanes(t *testing.T) {
 
 // TestResolveApplyConcurrency_PGBudgetCapsToDefault pins the upper bound: a
 // generous PG instance whose probe would allow more than the default lanes is
-// still capped to defaultApplyConcurrency (the auto value is conservative; an
+// still capped to migcore.DefaultApplyConcurrency (the auto value is conservative; an
 // operator raises it explicitly).
 func TestResolveApplyConcurrency_PGBudgetCapsToDefault(t *testing.T) {
 	eng := &budgetProberEngine{report: ir.ConnectionBudget{
-		EffectiveParallelism: defaultApplyConcurrency, // probe was asked for 4 and granted 4
+		EffectiveParallelism: migcore.DefaultApplyConcurrency, // probe was asked for 4 and granted 4
 		CopyBudget:           200,
 	}}
 	s := &Streamer{Source: noProberEngine{}, Target: eng, TargetDSN: "dsn"}
-	if got := s.resolveApplyConcurrency(context.Background()); got != defaultApplyConcurrency {
-		t.Errorf("generous PG target auto = %d; want capped at %d", got, defaultApplyConcurrency)
+	if got := s.resolveApplyConcurrency(context.Background()); got != migcore.DefaultApplyConcurrency {
+		t.Errorf("generous PG target auto = %d; want capped at %d", got, migcore.DefaultApplyConcurrency)
 	}
 }
 
@@ -181,14 +182,14 @@ func TestResolveApplyConcurrency_ExplicitValueSkipsProbe(t *testing.T) {
 // --- ADR-0107 Phase 3 (a): headroom-clamped auto:N ---
 
 // TestClampConcurrencyByHeadroom pins the startup headroom bias on the auto:N
-// base (MySQL-shaped target, base = defaultApplyConcurrency = 4). Healthy
+// base (MySQL-shaped target, base = migcore.DefaultApplyConcurrency = 4). Healthy
 // headroom keeps the full base; approaching the mark halves it; at/above the
 // high-water mark quarters it; and every degrade path (no provider, no fresh
 // signal, neither CPU nor mem observed) returns the base UNCHANGED — the
 // advisory contract. The clamp never RAISES the base.
 func TestClampConcurrencyByHeadroom(t *testing.T) {
 	hw := appliercontrol.DefaultTelemetryHighWater
-	base := defaultApplyConcurrency // 4
+	base := migcore.DefaultApplyConcurrency // 4
 	cases := []struct {
 		name string
 		prov ir.TargetTelemetry
@@ -274,8 +275,8 @@ func TestAutoApplyConcurrency_HeadroomClampWiredIn(t *testing.T) {
 	sat := &fakeTelemetry{ok: true, snap: ir.TargetHealthSnapshot{SampledAt: freshNow(), CPUUtil: 0.92, CPUKnown: true}}
 	s := &Streamer{Source: noProberEngine{}, Target: noProberEngine{}, TargetTelemetry: sat} // unset → auto:N
 	got := s.resolveApplyConcurrency(context.Background())
-	if got != defaultApplyConcurrency/4 {
-		t.Fatalf("saturated-target auto = %d; want %d (default %d quartered)", got, defaultApplyConcurrency/4, defaultApplyConcurrency)
+	if got != migcore.DefaultApplyConcurrency/4 {
+		t.Fatalf("saturated-target auto = %d; want %d (default %d quartered)", got, migcore.DefaultApplyConcurrency/4, migcore.DefaultApplyConcurrency)
 	}
 }
 
@@ -285,8 +286,8 @@ func TestAutoApplyConcurrency_HeadroomClampWiredIn(t *testing.T) {
 func TestAutoApplyConcurrency_DryRunSkipsHeadroomClamp(t *testing.T) {
 	sat := &fakeTelemetry{ok: true, snap: ir.TargetHealthSnapshot{SampledAt: freshNow(), CPUUtil: 0.99, CPUKnown: true}}
 	s := &Streamer{Source: noProberEngine{}, Target: noProberEngine{}, TargetTelemetry: sat, DryRun: true}
-	if got := s.resolveApplyConcurrency(context.Background()); got != defaultApplyConcurrency {
-		t.Errorf("dry-run saturated auto = %d; want fixed default %d (clamp skipped)", got, defaultApplyConcurrency)
+	if got := s.resolveApplyConcurrency(context.Background()); got != migcore.DefaultApplyConcurrency {
+		t.Errorf("dry-run saturated auto = %d; want fixed default %d (clamp skipped)", got, migcore.DefaultApplyConcurrency)
 	}
 }
 
@@ -304,7 +305,7 @@ func (r *recordingConcurrencySetter) SetApplyConcurrency(lanes int) {
 }
 
 // plainApplierStub implements no optional setters — models a programmatic /
-// test applier with no dedicated lane pool. applyApplyConcurrency must be a
+// test applier with no dedicated lane pool. migcore.ApplyApplyConcurrency must be a
 // no-op on it (it stays serial), bounding the blast radius of the new default.
 type plainApplierStub struct{}
 
@@ -315,17 +316,17 @@ type plainApplierStub struct{}
 // programmatic/broker/test callers.
 func TestApplyApplyConcurrency_NoSetterStaysSerial(t *testing.T) {
 	// Must not panic / must be a clean no-op on a non-setter applier.
-	applyApplyConcurrency(plainApplierStub{}, defaultApplyConcurrency)
+	migcore.ApplyApplyConcurrency(plainApplierStub{}, migcore.DefaultApplyConcurrency)
 
 	// And the setter-bearing applier only engages for the resolved W > 1.
 	rec := &recordingConcurrencySetter{}
-	applyApplyConcurrency(rec, 1) // explicit serial → no-op
+	migcore.ApplyApplyConcurrency(rec, 1) // explicit serial → no-op
 	if rec.calls != 0 {
 		t.Errorf("lanes=1 engaged the setter %d times; want 0 (serial)", rec.calls)
 	}
-	applyApplyConcurrency(rec, defaultApplyConcurrency) // auto:N → engage
-	if rec.calls != 1 || rec.lanes != defaultApplyConcurrency {
-		t.Errorf("lanes=%d: setter calls=%d lanes=%d; want calls=1 lanes=%d", defaultApplyConcurrency, rec.calls, rec.lanes, defaultApplyConcurrency)
+	migcore.ApplyApplyConcurrency(rec, migcore.DefaultApplyConcurrency) // auto:N → engage
+	if rec.calls != 1 || rec.lanes != migcore.DefaultApplyConcurrency {
+		t.Errorf("lanes=%d: setter calls=%d lanes=%d; want calls=1 lanes=%d", migcore.DefaultApplyConcurrency, rec.calls, rec.lanes, migcore.DefaultApplyConcurrency)
 	}
 }
 
@@ -335,8 +336,8 @@ func TestApplyApplyConcurrency_NoSetterStaysSerial(t *testing.T) {
 func TestResolveApplyConcurrency_DryRunSkipsProbe(t *testing.T) {
 	eng := &budgetProberEngine{report: ir.ConnectionBudget{EffectiveParallelism: 2}}
 	s := &Streamer{Source: noProberEngine{}, Target: eng, TargetDSN: "dsn", DryRun: true}
-	if got := s.resolveApplyConcurrency(context.Background()); got != defaultApplyConcurrency {
-		t.Errorf("dry-run auto = %d; want fixed default %d", got, defaultApplyConcurrency)
+	if got := s.resolveApplyConcurrency(context.Background()); got != migcore.DefaultApplyConcurrency {
+		t.Errorf("dry-run auto = %d; want fixed default %d", got, migcore.DefaultApplyConcurrency)
 	}
 	if eng.probeCall != 0 {
 		t.Errorf("dry-run probed %d times; want 0", eng.probeCall)

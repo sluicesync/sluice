@@ -9,17 +9,8 @@ import (
 
 	"sluicesync.dev/sluice/internal/appliercontrol"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
-
-// defaultApplyConcurrency is the conservative adaptive default LANE count W
-// the CDC key-hash apply path resolves `--apply-concurrency 0` (unset) to
-// (ADR-0106, item 31). It deliberately equals the cold-copy axes'
-// auto:4 ([migcore.DefaultTableParallelism] / [defaultCopyFanoutDegree]) so the whole
-// pipeline has one mental model: "sluice fans out ~4-wide by default, bounded
-// by the target's connection budget." NOT aggressive — the live PS-10 (1/8
-// vCPU) evidence (ADR-0106 Context) showed 4 budget-bounded lanes stay safe
-// on the worst-case tiny instance, with per-lane AIMD available to back off.
-const defaultApplyConcurrency = 4
 
 // resolveApplyConcurrency maps the operator's [Streamer.ApplyConcurrency]
 // field to the effective LANE count for this attempt, applying the ADR-0106
@@ -41,7 +32,7 @@ const defaultApplyConcurrency = 4
 //
 // auto:N is connection-budget-aware:
 //
-//   - Postgres target: N = min(defaultApplyConcurrency, budget) where budget
+//   - Postgres target: N = min(migcore.DefaultApplyConcurrency, budget) where budget
 //     comes from the existing connection-slot probe ([ir.TargetConnectionBudgetProber],
 //     the same machinery --max-target-connections drives). On a constrained
 //     instance the probe yields fewer lanes automatically; if the probe
@@ -50,7 +41,7 @@ const defaultApplyConcurrency = 4
 //     cold-start connection-budget preflight owns the loud refusal, and a
 //     warm-resume that can't spare lane slots is correct to run serial.
 //   - MySQL / PlanetScale-MySQL target (and any engine without a slot
-//     probe): N = defaultApplyConcurrency, a fixed conservative ceiling.
+//     probe): N = migcore.DefaultApplyConcurrency, a fixed conservative ceiling.
 //     --max-target-connections is documented inert against engines without a
 //     connection-slot model, so there is no budget to probe; PlanetScale
 //     per-branch connection limits are generous relative to 4 lanes + 4
@@ -73,14 +64,6 @@ func (s *Streamer) resolveApplyConcurrency(ctx context.Context) int {
 	return s.autoApplyConcurrency(ctx)
 }
 
-// concurrencyHeadroomApproaching is the busiest-of-CPU/mem utilisation at
-// which the auto:N lane count is HALVED at startup, a step below the
-// high-water mark ([appliercontrol.DefaultTelemetryHighWater]) at which it is
-// quartered. ADR-0107 Phase 3 (a): start fewer lanes when the target is
-// already hot, rather than piling the default fan-out onto a saturated
-// instance and relying purely on the reactive per-lane AIMD to claw it back.
-const concurrencyHeadroomApproaching = 0.70
-
 // autoApplyConcurrency computes the adaptive auto:N lane count for an unset
 // --apply-concurrency. See [resolveApplyConcurrency] for the per-engine
 // policy. Split out so [resolveApplyConcurrency]'s contract switch stays a
@@ -93,7 +76,7 @@ func (s *Streamer) autoApplyConcurrency(ctx context.Context) int {
 	// I/O. The lanes never actually engage on a dry-run, and we skip the
 	// headroom clamp too so the plan reflects the policy, not a transient load.
 	if s.DryRun {
-		return defaultApplyConcurrency
+		return migcore.DefaultApplyConcurrency
 	}
 
 	return s.clampConcurrencyByHeadroom(ctx, s.budgetBoundedAutoConcurrency(ctx))
@@ -108,13 +91,13 @@ func (s *Streamer) budgetBoundedAutoConcurrency(ctx context.Context) int {
 		// No connection-slot model (today: MySQL / PlanetScale-MySQL). The
 		// fixed conservative ceiling stands; --max-target-connections is inert
 		// here, so there is nothing to probe.
-		return defaultApplyConcurrency
+		return migcore.DefaultApplyConcurrency
 	}
 
 	// Probe for the desired lane count, bounded by --max-target-connections.
 	// EffectiveParallelism is clamped to [1, min(CopyBudget, ceiling)], so a
 	// constrained instance yields fewer lanes automatically.
-	report, err := prober.ProbeTargetConnectionBudget(ctx, s.TargetDSN, defaultApplyConcurrency, s.MaxTargetConnections)
+	report, err := prober.ProbeTargetConnectionBudget(ctx, s.TargetDSN, migcore.DefaultApplyConcurrency, s.MaxTargetConnections)
 	if err != nil || report.ProbeFailed || report.Refuse {
 		// A broken DSN surfaces loudly at the applier open immediately after
 		// this; a degraded probe or an exhausted budget should not crash the
@@ -134,8 +117,8 @@ func (s *Streamer) budgetBoundedAutoConcurrency(ctx context.Context) int {
 	if lanes < 1 {
 		lanes = 1
 	}
-	if lanes > defaultApplyConcurrency {
-		lanes = defaultApplyConcurrency
+	if lanes > migcore.DefaultApplyConcurrency {
+		lanes = migcore.DefaultApplyConcurrency
 	}
 	return lanes
 }
@@ -162,7 +145,7 @@ func (s *Streamer) clampConcurrencyByHeadroom(ctx context.Context, base int) int
 	if base <= 1 {
 		return base
 	}
-	divisor, util, ok := headroomDivisor(ctx, s.TargetTelemetry)
+	divisor, util, ok := migcore.HeadroomDivisor(ctx, s.TargetTelemetry)
 	if !ok || divisor <= 1 {
 		return base // no telemetry verdict, or healthy headroom: keep the base.
 	}
@@ -179,66 +162,4 @@ func (s *Streamer) clampConcurrencyByHeadroom(ctx context.Context, base int) int
 		slog.Float64("high_water", appliercontrol.DefaultTelemetryHighWater),
 	)
 	return lanes
-}
-
-// headroomDivisor returns the factor by which an AUTO concurrency / parallelism
-// value should be reduced given the target's LIVE resource headroom: 1 =
-// healthy (no reduction), 2 = approaching the high-water, 4 = at/over it. ok is
-// false (divisor 1) when telemetry is absent / stale / neither CPU nor mem
-// observed — the caller leaves its value unchanged (today's behaviour).
-// busiestUtil is the deciding utilisation, returned for the caller's log.
-//
-// This is the SINGLE source of the headroom thresholds, shared by the CDC
-// apply lane clamp ([clampConcurrencyByHeadroom], ADR-0107 Phase 3) and the
-// restore parallelism clamp ([Restore.clampRestoreParallelismByHeadroom],
-// ADR-0115) so the two paths can never disagree on what "tight" means. It is
-// the engine-neutral telemetry-consumer contract: a partial snapshot still
-// drives the verdict on whichever of CPU/mem is present (maxKnownUtil), and an
-// unobserved metric never counts as 0.
-func headroomDivisor(ctx context.Context, tel ir.TargetTelemetry) (divisor int, busiestUtil float64, ok bool) {
-	if tel == nil {
-		return 1, 0, false
-	}
-	snap, sok := tel.Sample(ctx)
-	if !sok {
-		return 1, 0, false
-	}
-	util, known := maxKnownUtil(snap)
-	if !known {
-		return 1, 0, false
-	}
-	switch {
-	case util >= appliercontrol.DefaultTelemetryHighWater:
-		// Already saturated — quarter the auto fan-out; the reactive
-		// controllers (per-lane AIMD / chunk retry) grow it back if headroom
-		// opens up.
-		return 4, util, true
-	case util >= concurrencyHeadroomApproaching:
-		// Approaching the mark — halve.
-		return 2, util, true
-	default:
-		// Healthy headroom: no reduction.
-		return 1, util, true
-	}
-}
-
-// maxKnownUtil returns the busiest of the snapshot's observed CPU / memory
-// utilisations and whether AT LEAST ONE was known. An unobserved metric never
-// counts as 0 (the honesty contract): known=false only when neither CPU nor
-// mem was observed, so a partial snapshot still drives the clamp on whichever
-// half is present.
-func maxKnownUtil(snap ir.TargetHealthSnapshot) (float64, bool) {
-	var (
-		u     float64
-		known bool
-	)
-	if snap.CPUKnown {
-		u = snap.CPUUtil
-		known = true
-	}
-	if snap.MemKnown && (!known || snap.MemUtil > u) {
-		u = snap.MemUtil
-		known = true
-	}
-	return u, known
 }

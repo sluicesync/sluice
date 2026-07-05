@@ -283,7 +283,7 @@ func (r *Restore) resolveRestoreParallelism(ctx context.Context, taskCount int) 
 // clampRestoreParallelismByHeadroom reduces the AUTO-resolved restore fan-out
 // product (table × chunk) when the target's LIVE resource headroom is tight
 // (ADR-0115), the restore analog of [Streamer.clampConcurrencyByHeadroom]. It
-// shares the SAME [headroomDivisor] thresholds as the CDC apply clamp, so the
+// shares the SAME [migcore.HeadroomDivisor] thresholds as the CDC apply clamp, so the
 // two paths agree on what "tight" means.
 //
 // PlanetScale-correct: the connection-budget split ([migcore.ResolveCopyParallelismBudget])
@@ -304,7 +304,7 @@ func (r *Restore) clampRestoreParallelismByHeadroom(ctx context.Context, tableP,
 	if tableP*chunkP <= 1 {
 		return tableP, chunkP // nothing to clamp
 	}
-	divisor, util, ok := headroomDivisor(ctx, r.TargetTelemetry)
+	divisor, util, ok := migcore.HeadroomDivisor(ctx, r.TargetTelemetry)
 	if !ok || divisor <= 1 {
 		return tableP, chunkP // no telemetry verdict, or healthy headroom.
 	}

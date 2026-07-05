@@ -113,7 +113,7 @@ type Restore struct {
 	// large incremental doesn't replay through the single-stream applier
 	// and stall on a high-latency / cross-region target (the chain-restore
 	// analog of the broker's concurrent-replay fix). Resolved through
-	// [resolveReplayApplyConcurrency] (ADR-0106: 0 = auto:N, 1 = serial,
+	// [migcore.ResolveReplayApplyConcurrency] (ADR-0106: 0 = auto:N, 1 = serial,
 	// N > 1 honored) inside ChainRestore.
 	ApplyConcurrency int
 
