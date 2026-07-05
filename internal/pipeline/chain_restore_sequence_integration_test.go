@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -66,7 +67,7 @@ func TestBackup_ChainRestore_StandaloneSequenceReprimedAtTail(t *testing.T) {
 		t.Fatal("postgres engine not registered")
 	}
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -190,7 +191,7 @@ func TestBackup_ChainRestore_IdentitySequenceSyncedAtTail(t *testing.T) {
 		t.Fatal("postgres engine not registered")
 	}
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}

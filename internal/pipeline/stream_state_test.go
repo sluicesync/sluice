@@ -11,13 +11,14 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // TestStreamState_RoundTrip verifies the JSON round-trip of the state
 // file shape: write, read, fields preserved.
 func TestStreamState_RoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	then := time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC)
 	stop := then.Add(5 * time.Minute)
@@ -55,7 +56,7 @@ func TestStreamState_RoundTrip(t *testing.T) {
 // TestStreamState_ReadMissing returns (nil, nil) when no file exists.
 func TestStreamState_ReadMissing(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	got, err := readStreamState(context.Background(), store, "manifests/stream_state.json")
 	if err != nil {
 		t.Errorf("err = %v; want nil for missing file", err)
@@ -69,7 +70,7 @@ func TestStreamState_ReadMissing(t *testing.T) {
 // fresh-start path: no state file, preflight succeeds.
 func TestPreflightStreamState_NoExistingFile_ClearStart(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	b := &BackupStream{Store: store}
 	err := b.preflightStreamState(context.Background(), "manifests/stream_state.json", time.Minute, 1, "h", time.Now())
 	if err != nil {
@@ -82,7 +83,7 @@ func TestPreflightStreamState_NoExistingFile_ClearStart(t *testing.T) {
 // WARN log; preflight succeeds without --force.
 func TestPreflightStreamState_StaleState_TakesOver(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	now := time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC)
 	stale := &streamState{
 		PID: 999, Host: "old.example.com",
@@ -102,7 +103,7 @@ func TestPreflightStreamState_StaleState_TakesOver(t *testing.T) {
 // operator-actionable error.
 func TestPreflightStreamState_FreshConflict_Refuses(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	now := time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC)
 	fresh := &streamState{
 		PID: 999, Host: "other.example.com",
@@ -127,7 +128,7 @@ func TestPreflightStreamState_FreshConflict_Refuses(t *testing.T) {
 // makes a fresh-conflict succeed (operator-confirmed takeover).
 func TestPreflightStreamState_ForceOverride_Bypasses(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	now := time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC)
 	fresh := &streamState{
 		PID: 999, Host: "other.example.com",
@@ -147,7 +148,7 @@ func TestPreflightStreamState_ForceOverride_Bypasses(t *testing.T) {
 // check (operator's pid was reused after a clean restart).
 func TestPreflightStreamState_SameProcessRestart_Bypasses(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	now := time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC)
 	prev := &streamState{
 		PID: 1234, Host: "us.example.com",
@@ -170,7 +171,7 @@ func TestPreflightStreamState_SameProcessRestart_Bypasses(t *testing.T) {
 // forward.
 func TestWriteStreamStateMergeHeartbeat_PreservesStop(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	t0 := time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC)
 	stop := t0.Add(-time.Second) // operator wrote stop just before our heartbeat
 
@@ -223,7 +224,7 @@ func TestWriteStreamStateMergeHeartbeat_PreservesStop(t *testing.T) {
 // LastRolloverAt.
 func TestWriteStreamStateMergeHeartbeat_NoStopReturnsFalse(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	t0 := time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC)
 
 	prior := &streamState{
@@ -257,7 +258,7 @@ func TestWriteStreamStateMergeHeartbeat_NoStopReturnsFalse(t *testing.T) {
 // write stop_requested_at, observe via readStreamStopRequested.
 func TestRequestStreamStop_Roundtrip(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	now := time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC)
 	prev := &streamState{
 		PID: 1234, Host: "h",
@@ -290,7 +291,7 @@ func TestRequestStreamStop_Roundtrip(t *testing.T) {
 // running.
 func TestRequestStreamStop_NoStateFile(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	_, err := RequestStreamStop(context.Background(), store, time.Now())
 	if err == nil {
 		t.Fatal("err = nil; want error when no state file present")
@@ -304,7 +305,7 @@ func TestRequestStreamStop_NoStateFile(t *testing.T) {
 // the original timestamp (doesn't reset the clock).
 func TestRequestStreamStop_Idempotent(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	t0 := time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC)
 	t1 := t0.Add(5 * time.Minute)
 
@@ -334,7 +335,7 @@ func TestRequestStreamStop_Idempotent(t *testing.T) {
 // preflight refusal end-to-end through Run.
 func TestBackupStream_Run_RefusesFreshConcurrentWriter(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	parent := &irbackup.Manifest{
 		FormatVersion: irbackup.BackupFormatVersion,

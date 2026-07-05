@@ -63,6 +63,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 const (
@@ -189,7 +190,7 @@ type rotateInputs struct {
 // segment after a committed rotation.
 type rotateResult struct {
 	newSegStore irbackup.Store
-	newSegCodec Codec
+	newSegCodec blobcodec.Codec
 	newSegDir   string
 	newFull     *irbackup.Manifest
 	resumePos   ir.Position // S -- the new segment's full anchor
@@ -288,7 +289,7 @@ func (b *BackupStream) performRotation(ctx context.Context, in rotateInputs) (ro
 		return zero, abortStayOpen("write rotation_state (snapshot)", err)
 	}
 	segStore := newPrefixedStore(b.Store, provisionalDir)
-	segCodec := resolveCodec(b.Codec)
+	segCodec := blobcodec.ResolveCodec(b.Codec)
 
 	if err := crashAt("post-snapshot"); err != nil {
 		b.discardProvisional(ctx, provisionalDir)

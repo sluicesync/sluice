@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package pipeline
+package blobcodec
 
 // Cloud-blob implementation of [irbackup.Store] over `gocloud.dev/blob`.
 //

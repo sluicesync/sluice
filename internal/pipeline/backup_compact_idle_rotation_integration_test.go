@@ -31,6 +31,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -65,7 +66,7 @@ func bug139Read(t *testing.T, dsn string) bug139Sums {
 // write triggers one committed rollover whose age check rotates with S ==
 // P_N. The shape is timing-sensitive, so the caller wraps this in a bounded
 // retry on a fresh chain.
-func driveIdleStopRotationChain(t *testing.T, sourceDSN string, store *LocalStore) {
+func driveIdleStopRotationChain(t *testing.T, sourceDSN string, store *blobcodec.LocalStore) {
 	t.Helper()
 	eng, _ := engines.Get("postgres")
 
@@ -130,7 +131,7 @@ func driveIdleStopRotationChain(t *testing.T, sourceDSN string, store *LocalStor
 // seedAccountsChain boots a PG source, creates the accounts table +
 // publication + slot, takes the anchored full, and returns the DSNs +
 // store. Shared by both legs.
-func seedAccountsChain(t *testing.T) (sourceDSN, targetDSN string, store *LocalStore, cleanup func()) {
+func seedAccountsChain(t *testing.T) (sourceDSN, targetDSN string, store *blobcodec.LocalStore, cleanup func()) {
 	t.Helper()
 	sourceDSN, targetDSN, cleanup = startPostgresLogical(t)
 	applyDDL(t, sourceDSN, `
@@ -149,7 +150,7 @@ func seedAccountsChain(t *testing.T) (sourceDSN, targetDSN string, store *LocalS
 	t.Cleanup(func() { dropPGLogicalSlot(t, sourceDSN, "sluice_slot") })
 
 	eng, _ := engines.Get("postgres")
-	store, _ = NewLocalStore(t.TempDir())
+	store, _ = blobcodec.NewLocalStore(t.TempDir())
 	rotationSeedFull(t, store, eng, sourceDSN, slotLSN)
 	return sourceDSN, targetDSN, store, cleanup
 }
@@ -157,7 +158,7 @@ func seedAccountsChain(t *testing.T) (sourceDSN, targetDSN string, store *LocalS
 // assertTrailingIdleStopShape verifies the lineage actually carries the
 // Bug-139 boundary (a multi-segment lineage whose last segment is
 // rotation-born, zero-incremental, and stamp-less). Returns the catalog.
-func assertTrailingIdleStopShape(t *testing.T, store *LocalStore) *LineageCatalog {
+func assertTrailingIdleStopShape(t *testing.T, store *blobcodec.LocalStore) *LineageCatalog {
 	t.Helper()
 	cat, ok, err := loadLineageCatalog(context.Background(), store)
 	if err != nil || !ok {

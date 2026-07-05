@@ -33,6 +33,7 @@ import (
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/engines"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -129,7 +130,7 @@ func TestBackup_PassphraseEncryption_RoundTrip(t *testing.T) {
 	}
 
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -229,7 +230,7 @@ func TestBackup_Encryption_WrongPassphrase(t *testing.T) {
 
 	pgEng, _ := engines.Get("postgres")
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -274,7 +275,7 @@ func TestBackup_Encryption_MissingKey(t *testing.T) {
 
 	pgEng, _ := engines.Get("postgres")
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -323,7 +324,7 @@ func TestBackup_Encryption_PerChunkMode(t *testing.T) {
 
 	pgEng, _ := engines.Get("postgres")
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -407,7 +408,7 @@ func TestBackup_PlaintextBackwardCompat(t *testing.T) {
 
 	pgEng, _ := engines.Get("postgres")
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -458,7 +459,7 @@ func TestBackupVerify_EncryptedChain_NoKey(t *testing.T) {
 
 	pgEng, _ := engines.Get("postgres")
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -504,7 +505,7 @@ func TestBackup_Encryption_LocalStoreDir(t *testing.T) {
 
 	pgEng, _ := engines.Get("postgres")
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}

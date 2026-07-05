@@ -48,6 +48,7 @@ import (
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // DefaultIncrementalWindow is the default value of
@@ -172,11 +173,11 @@ type IncrementalBackup struct {
 	// lineage.json (a segment is single-codec by construction; the
 	// recorded codec wins once set). Empty resolves to gzip (pre-ADR
 	// default).
-	Codec Codec
+	Codec blobcodec.Codec
 
 	// segCodec is the codec resolved for the open segment at Run
 	// start; threaded into the change-chunk writer. Set by Run.
-	segCodec Codec
+	segCodec blobcodec.Codec
 
 	// segStore is the open-segment store view (b.Store narrowed to
 	// the open segment's Dir; a no-op wrap for the common one-segment
@@ -696,7 +697,7 @@ func (b *IncrementalBackup) captureWindow(
 	chainCEK []byte,
 ) (ir.Position, int64, error) {
 	var (
-		writer        *changeChunkWriter
+		writer        *blobcodec.ChangeChunkWriter
 		buf           *bytes.Buffer
 		chunkIdx      int
 		totalChanges  int64
@@ -812,7 +813,7 @@ func (b *IncrementalBackup) captureWindow(
 			return fmt.Errorf("resolve chunk cek: %w", err)
 		}
 		curWrappedCEK = wrapped
-		w, err := newChangeChunkWriter(buf, cek, b.segCodec)
+		w, err := blobcodec.NewChangeChunkWriter(buf, cek, b.segCodec)
 		if err != nil {
 			return fmt.Errorf("open chunk: %w", err)
 		}

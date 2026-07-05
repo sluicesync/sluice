@@ -16,6 +16,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // fakeCDCEngine is a backup-recorder analogue for incremental tests:
@@ -102,7 +103,7 @@ func (r *fakeCDCReader) Close() error { return nil }
 
 // helper: write a fake "parent full" manifest into the store so the
 // incremental orchestrator has something to chain off.
-func writeParentFullManifest(t *testing.T, store *LocalStore, parent *irbackup.Manifest) {
+func writeParentFullManifest(t *testing.T, store *blobcodec.LocalStore, parent *irbackup.Manifest) {
 	t.Helper()
 	if err := writeManifestAt(context.Background(), store, ManifestFileName, parent); err != nil {
 		t.Fatalf("write parent: %v", err)
@@ -115,8 +116,8 @@ func TestIncrementalBackup_Validate(t *testing.T) {
 		b    *IncrementalBackup
 		want string
 	}{
-		{"nil source", &IncrementalBackup{SourceDSN: "x", Store: &LocalStore{}}, "Source engine is nil"},
-		{"empty DSN", &IncrementalBackup{Source: &fakeCDCEngine{name: "postgres"}, Store: &LocalStore{}}, "SourceDSN is empty"},
+		{"nil source", &IncrementalBackup{SourceDSN: "x", Store: &blobcodec.LocalStore{}}, "Source engine is nil"},
+		{"empty DSN", &IncrementalBackup{Source: &fakeCDCEngine{name: "postgres"}, Store: &blobcodec.LocalStore{}}, "SourceDSN is empty"},
 		{"nil store", &IncrementalBackup{Source: &fakeCDCEngine{name: "postgres"}, SourceDSN: "x"}, "Store is nil"},
 	}
 	for _, c := range cases {
@@ -136,7 +137,7 @@ func TestIncrementalBackup_Validate_NoCDC(t *testing.T) {
 	// Override capabilities by wrapping.
 	wrapped := &noCDCCapEngine{src: src}
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	b := &IncrementalBackup{Source: wrapped, SourceDSN: "x", Store: store, ParentRef: ""}
 	err := b.Run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "does not declare CDC support") {
@@ -185,7 +186,7 @@ func (e *noCDCCapEngine) OpenSnapshotStream(ctx context.Context, dsn string) (*i
 // for Phase 3.1 acceptance criterion 1.
 func TestIncrementalBackup_RoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -331,7 +332,7 @@ func TestIncrementalBackup_RoundTrip(t *testing.T) {
 // snapshot fired twice → one entry).
 func TestIncrementalBackup_SchemaHistoryCapture(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -458,7 +459,7 @@ func TestIncrementalBackup_SchemaHistoryCapture(t *testing.T) {
 // rather than a silent success.
 func TestIncrementalBackup_PositionInvalid_LoudFailure(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	parent := &irbackup.Manifest{
 		FormatVersion: irbackup.BackupFormatVersion,
@@ -499,7 +500,7 @@ func TestIncrementalBackup_PositionInvalid_LoudFailure(t *testing.T) {
 // reads surfaces as a SchemaDelta entry on the manifest.
 func TestIncrementalBackup_SchemaDelta_AddColumn(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	beforeSchema := &ir.Schema{Tables: []*ir.Table{{
 		Name:    "users",
@@ -618,7 +619,7 @@ func TestDiffSchemas_NoChange(t *testing.T) {
 // manifests.
 func TestIncrementalBackup_NoParent(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	src := &fakeCDCEngine{name: "postgres", schemaSequence: []*ir.Schema{{}}}
 	b := &IncrementalBackup{Source: src, SourceDSN: "x", Store: store}
 	err := b.Run(context.Background())
@@ -631,7 +632,7 @@ func TestIncrementalBackup_NoParent(t *testing.T) {
 // supplied ParentRef doesn't match anything.
 func TestIncrementalBackup_UnknownParentRef(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	parent := &irbackup.Manifest{
 		FormatVersion: irbackup.BackupFormatVersion,
 		CreatedAt:     time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC),
@@ -668,7 +669,7 @@ func TestIncrementalBackup_UnknownParentRef(t *testing.T) {
 //     mismatch that this assertion guards against).
 func TestIncrementalBackup_TwoIncrementals_NoChunkCollision(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // TestEncodeDecodeBrokerPosition pins the round-trip contract for the
@@ -120,7 +121,7 @@ func TestRewritePosition_AllChangeShapes(t *testing.T) {
 // on Run's first step: empty fields produce clear errors.
 func TestSyncFromBackup_Validate_RequiresFields(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	cases := []struct {
 		name string
 		b    SyncFromBackup
@@ -156,7 +157,7 @@ func TestSyncFromBackup_Validate_RequiresFields(t *testing.T) {
 // write a state, read it back, observe equal fields.
 func TestBrokerState_RoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	now := time.Now().UTC().Truncate(time.Second)
 	state := &brokerState{
 		PID:         12345,
@@ -184,7 +185,7 @@ func TestBrokerState_RoundTrip(t *testing.T) {
 // of readBrokerState: a missing file returns (nil, nil), not an error.
 func TestBrokerState_ReadMissingReturnsNil(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	got, err := readBrokerState(context.Background(), store, "missing.json")
 	if err != nil {
 		t.Fatalf("readBrokerState: %v", err)
@@ -200,7 +201,7 @@ func TestBrokerState_ReadMissingReturnsNil(t *testing.T) {
 // the stop forward + reports it.
 func TestWriteBrokerStateMergeHeartbeat_PreservesStop(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	now := time.Now().UTC().Truncate(time.Second)
 	stopT := now.Add(-time.Minute)
 	prior := &brokerState{
@@ -236,7 +237,7 @@ func TestWriteBrokerStateMergeHeartbeat_PreservesStop(t *testing.T) {
 // rather than silently writing a phantom file.
 func TestRequestSyncFromBackupStop_RefusesMissingFile(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	_, err := RequestSyncFromBackupStop(context.Background(), store, time.Now())
 	if err == nil {
 		t.Fatal("err = nil; want refusal")
@@ -250,7 +251,7 @@ func TestRequestSyncFromBackupStop_RefusesMissingFile(t *testing.T) {
 // lifecycle.
 func TestBrokerStopRegistry(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	ch, deregister := registerBrokerStopChan(store)
 	defer deregister()
@@ -273,7 +274,7 @@ func TestBrokerStopRegistry(t *testing.T) {
 // where no broker is registered in this process.
 func TestBrokerStopRegistry_NoEntryReturnsFalse(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	if notifyBrokerStop(store) {
 		t.Error("notifyBrokerStop = true with no entry; want false")
 	}

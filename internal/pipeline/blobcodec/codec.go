@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package pipeline
+package blobcodec
 
 // Per-segment compression codec (ADR-0046 §5). Each lineage segment
 // records its codec in lineage.json; restore reads the recorded codec
@@ -36,7 +36,7 @@ import (
 )
 
 // Codec is the per-segment compression codec recorded in lineage.json.
-// The zero value is invalid; callers resolve via [resolveCodec] /
+// The zero value is invalid; callers resolve via [ResolveCodec] /
 // [parseCodec] so [DefaultCodec] (zstd) is applied consistently.
 type Codec string
 
@@ -65,12 +65,12 @@ const (
 // the flip is a clean break (zero-users tenet — no back-compat shim).
 const DefaultCodec = CodecZstd
 
-// resolveCodec applies the "empty → default" rule. An empty Codec
+// ResolveCodec applies the "empty → default" rule. An empty Codec
 // (operator left --compression unset, or a segment recorded none)
 // resolves to [DefaultCodec] (zstd). A v0.67.0+ backup always records
 // its codec explicitly; the empty case is the operator-unset write
 // default.
-func resolveCodec(c Codec) Codec {
+func ResolveCodec(c Codec) Codec {
 	if c == "" {
 		return DefaultCodec
 	}
@@ -101,12 +101,12 @@ func parseCodec(s string) (Codec, error) {
 // refusal (never a silent fallback — DR data).
 func ParseCompression(s string) (Codec, error) { return parseCodec(s) }
 
-// validateRecordedCodec rejects an unknown / garbled codec recorded on
+// ValidateRecordedCodec rejects an unknown / garbled codec recorded on
 // a segment. The codec is read from lineage.json, never sniffed; an
 // unrecognised recorded value means a tampered / corrupt catalog and
 // the loud-failure tenet says refuse, never silently assemble.
-func validateRecordedCodec(c Codec) error {
-	switch resolveCodec(c) {
+func ValidateRecordedCodec(c Codec) error {
+	switch ResolveCodec(c) {
 	case CodecNone, CodecGzip, CodecZstd:
 		return nil
 	default:
@@ -137,7 +137,7 @@ func (nopCodecWriteCloser) Close() error                  { return nil }
 // writers change by exactly one line. zstd is constructed at
 // SpeedDefault per ADR-0046 §5.
 func newCodecWriter(dst io.Writer, c Codec) (codecWriteCloser, error) {
-	switch resolveCodec(c) {
+	switch ResolveCodec(c) {
 	case CodecNone:
 		return nopCodecWriteCloser{w: dst}, nil
 	case CodecGzip:
@@ -186,7 +186,7 @@ func (z zstdReadCloser) Close() error               { z.d.Close(); return nil }
 // the one RECORDED for the segment in lineage.json — callers pass it
 // through from the segment metadata, never sniff it from the bytes.
 func newCodecReader(src io.Reader, c Codec) (codecReadCloser, error) {
-	switch resolveCodec(c) {
+	switch ResolveCodec(c) {
 	case CodecNone:
 		return nopCodecReadCloser{r: src}, nil
 	case CodecGzip:

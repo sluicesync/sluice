@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package pipeline
+package blobcodec
 
 import (
 	"bytes"
@@ -18,7 +18,7 @@ import (
 // retryFakeStore is a minimal irbackup.Store whose Get returns a scripted
 // sequence of bodies — modelling a flaky object store that truncates a read
 // before serving the full object. Only Get is exercised by
-// fetchChunkVerified; the rest satisfy the interface.
+// FetchChunkVerified; the rest satisfy the interface.
 type retryFakeStore struct {
 	bodies [][]byte // one per Get call, in order; last reused if calls exceed len
 	getErr []error  // optional per-call error (nil = serve bodies[i])
@@ -71,9 +71,9 @@ func TestFetchChunkVerified_RetriesTruncatedRead(t *testing.T) {
 	want := sha256Hex(full)
 
 	store := &retryFakeStore{bodies: [][]byte{truncated, full}}
-	rc, err := fetchChunkVerified(context.Background(), store, "chunks/t/t-0.jsonl.gz", want)
+	rc, err := FetchChunkVerified(context.Background(), store, "chunks/t/t-0.jsonl.gz", want)
 	if err != nil {
-		t.Fatalf("fetchChunkVerified: %v", err)
+		t.Fatalf("FetchChunkVerified: %v", err)
 	}
 	got := drain(t, rc)
 	if !bytes.Equal(got, full) {
@@ -90,9 +90,9 @@ func TestFetchChunkVerified_RetriesTruncatedRead(t *testing.T) {
 func TestFetchChunkVerified_HappyPathNoRetry(t *testing.T) {
 	full := []byte("complete on first read")
 	store := &retryFakeStore{bodies: [][]byte{full}}
-	rc, err := fetchChunkVerified(context.Background(), store, "c", sha256Hex(full))
+	rc, err := FetchChunkVerified(context.Background(), store, "c", sha256Hex(full))
 	if err != nil {
-		t.Fatalf("fetchChunkVerified: %v", err)
+		t.Fatalf("FetchChunkVerified: %v", err)
 	}
 	_ = drain(t, rc)
 	if store.calls != 1 {
@@ -110,7 +110,7 @@ func TestFetchChunkVerified_PersistentMismatchSurfacesLoudly(t *testing.T) {
 	wantSHA := sha256Hex([]byte("the bytes the manifest expected"))
 
 	store := &retryFakeStore{bodies: [][]byte{corrupt}}
-	_, err := fetchChunkVerified(context.Background(), store, "c", wantSHA)
+	_, err := FetchChunkVerified(context.Background(), store, "c", wantSHA)
 	if err == nil {
 		t.Fatal("expected an error on persistent corruption; got nil")
 	}
@@ -131,9 +131,9 @@ func TestFetchChunkVerified_TransientGetErrorRetried(t *testing.T) {
 		bodies: [][]byte{nil, full},
 		getErr: []error{errors.New("connection reset by peer"), nil},
 	}
-	rc, err := fetchChunkVerified(context.Background(), store, "c", sha256Hex(full))
+	rc, err := FetchChunkVerified(context.Background(), store, "c", sha256Hex(full))
 	if err != nil {
-		t.Fatalf("fetchChunkVerified: %v", err)
+		t.Fatalf("FetchChunkVerified: %v", err)
 	}
 	_ = drain(t, rc)
 	if store.calls != 2 {
@@ -150,7 +150,7 @@ func TestFetchChunkVerified_CtxCancelStopsRetry(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel before the call
 
-	_, err := fetchChunkVerified(ctx, store, "c", sha256Hex(full))
+	_, err := FetchChunkVerified(ctx, store, "c", sha256Hex(full))
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("error = %v; want context.Canceled", err)
 	}

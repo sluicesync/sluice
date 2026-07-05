@@ -23,6 +23,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // importerStubEngine is a stubEngine that additionally satisfies
@@ -119,7 +120,7 @@ func TestBackupParallelEligible(t *testing.T) {
 // backup stays serial (and never opens an importer) even when the gate
 // would otherwise engage.
 func TestResolveBackupTableParallelism_TaskCountClamp(t *testing.T) {
-	b := &Backup{Source: importerStubEngine{}, SourceDSN: "dsn", Store: &LocalStore{}}
+	b := &Backup{Source: importerStubEngine{}, SourceDSN: "dsn", Store: &blobcodec.LocalStore{}}
 	got, _, err := b.resolveBackupTableParallelism(context.Background(), &irbackup.Snapshot{SnapshotName: "snap-1"}, 1)
 	if err != nil {
 		t.Fatalf("resolveBackupTableParallelism: %v", err)
@@ -133,7 +134,7 @@ func TestResolveBackupTableParallelism_TaskCountClamp(t *testing.T) {
 // resolution on an eligible source without a connection-budget prober
 // (no measured ceiling → the requested value stands).
 func TestResolveBackupTableParallelism_AutoDefault(t *testing.T) {
-	b := &Backup{Source: importerStubEngine{}, SourceDSN: "dsn", Store: &LocalStore{}}
+	b := &Backup{Source: importerStubEngine{}, SourceDSN: "dsn", Store: &blobcodec.LocalStore{}}
 	got, _, err := b.resolveBackupTableParallelism(context.Background(), &irbackup.Snapshot{SnapshotName: "snap-1"}, 10)
 	if err != nil {
 		t.Fatalf("resolveBackupTableParallelism: %v", err)
@@ -197,7 +198,7 @@ func (r *backupPoolFakeReader) Close() error {
 // simple one-column tables, each with one row.
 func poolTestFixture(t *testing.T, nTables int) (*Backup, *manifestCommitter, []backupTableTask, map[string][]ir.Row) {
 	t.Helper()
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -366,7 +367,7 @@ func TestBackupTablePool_NilFactoryDedicatedBranchIsLoud(t *testing.T) {
 // order equals the staged (schema) order regardless of completion
 // order. -race in CI is the load-bearing leg of this pin.
 func TestManifestCommitter_ConcurrentCheckpointsKeepSchemaOrder(t *testing.T) {
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}

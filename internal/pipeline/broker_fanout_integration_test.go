@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -60,7 +61,7 @@ func TestSyncFromBackup_FanOut(t *testing.T) {
 	}
 	// Restore into target 2 via a second store pointer so the
 	// pre-restore against the same root reuses the chain.
-	store2, err := NewLocalStore(store.Root())
+	store2, err := blobcodec.NewLocalStore(store.Root())
 	if err != nil {
 		t.Fatalf("NewLocalStore (store2): %v", err)
 	}

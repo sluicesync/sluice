@@ -31,6 +31,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -46,7 +47,7 @@ func TestRestoreParallel_PG_RoundTripChecksums(t *testing.T) {
 
 	tables := seedParallelBackupTables(t, sourceDSN, 6, 150)
 	pgEng, _ := engines.Get("postgres")
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -121,7 +122,7 @@ func TestRestoreParallel_PGToMySQL_CrossEngine(t *testing.T) {
 
 	pgEng, _ := engines.Get("postgres")
 	mysqlEng, _ := engines.Get("mysql")
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -169,7 +170,7 @@ func TestRestoreParallel_PG_EncryptedPerChunkRoundTrip(t *testing.T) {
 
 	tables := seedParallelBackupTables(t, sourceDSN, 4, 120)
 	pgEng, _ := engines.Get("postgres")
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -226,7 +227,7 @@ func TestChainRestoreParallel_PG_FullPlusIncremental(t *testing.T) {
 	tables = append(tables, "users")
 
 	pgEng, _ := engines.Get("postgres")
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}

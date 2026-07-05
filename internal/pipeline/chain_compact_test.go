@@ -15,6 +15,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // TestCompactChain_TwoSegmentGroup_Merges: a 2-segment in-window group
@@ -201,7 +202,7 @@ func TestCompactChain_KeysetBoundary_RefusesLoudly(t *testing.T) {
 func TestCompactChain_CodecBoundary_RefusesLoudly(t *testing.T) {
 	store := newMemStore()
 	now := time.Date(2026, 5, 16, 0, 0, 0, 0, time.UTC)
-	seedTwoSegmentLineageWithCodecs(t, store, now, CodecGzip, CodecZstd)
+	seedTwoSegmentLineageWithCodecs(t, store, now, blobcodec.CodecGzip, blobcodec.CodecZstd)
 
 	_, err := CompactChain(context.Background(), store, CompactOpts{
 		MergeWindow: 2 * time.Hour,
@@ -724,7 +725,7 @@ func seedSegmentsWithGaps(t *testing.T, store irbackup.Store, base time.Time, ga
 
 type segmentSeedOpts struct {
 	// codecsPerSegment, when len > 0, overrides the per-segment codec.
-	codecsPerSegment []Codec
+	codecsPerSegment []blobcodec.Codec
 	// encPerSegment, when len > 0, attaches ChainEncryption to each
 	// segment's full.
 	encPerSegment []*irbackup.ChainEncryption
@@ -784,7 +785,7 @@ func seedSegmentsWithGapsOpts(t *testing.T, store irbackup.Store, base time.Time
 		if i > 0 {
 			dir = fmt.Sprintf("seg-%d", i)
 		}
-		codec := CodecGzip
+		codec := blobcodec.CodecGzip
 		if i < len(opts.codecsPerSegment) {
 			codec = opts.codecsPerSegment[i]
 		}
@@ -929,9 +930,9 @@ func seedTwoSegmentLineageWithEncryption(t *testing.T, store irbackup.Store, now
 	})
 }
 
-func seedTwoSegmentLineageWithCodecs(t *testing.T, store irbackup.Store, now time.Time, codecA, codecB Codec) {
+func seedTwoSegmentLineageWithCodecs(t *testing.T, store irbackup.Store, now time.Time, codecA, codecB blobcodec.Codec) {
 	t.Helper()
 	seedSegmentsWithGapsOpts(t, store, now, []time.Duration{time.Hour}, segmentSeedOpts{
-		codecsPerSegment: []Codec{codecA, codecB},
+		codecsPerSegment: []blobcodec.Codec{codecA, codecB},
 	})
 }

@@ -26,10 +26,11 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 func TestBackup_ResumeAfterScanOrderChange_NoDuplicatesNoHoles(t *testing.T) {
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}

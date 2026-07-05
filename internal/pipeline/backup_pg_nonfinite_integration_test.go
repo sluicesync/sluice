@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -48,7 +49,7 @@ func TestBackupRestore_PG_NonFiniteFloats(t *testing.T) {
 	applyPGDDL(t, sourceDSN, seedDDL)
 
 	pgEng, _ := engines.Get("postgres")
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}

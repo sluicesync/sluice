@@ -16,6 +16,7 @@ import (
 	"sluicesync.dev/sluice/internal/crypto"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/redact"
 )
 
@@ -441,7 +442,7 @@ func (b *BackupFullCmd) run(g *Globals, env *envelopeRun) error {
 		return err
 	}
 	env.setEngines(source.Name(), "")
-	codec, err := pipeline.ParseCompression(b.Compression)
+	codec, err := blobcodec.ParseCompression(b.Compression)
 	if err != nil {
 		return fmt.Errorf("--compression: %w", err)
 	}
@@ -462,7 +463,7 @@ func (b *BackupFullCmd) run(g *Globals, env *envelopeRun) error {
 	}
 
 	ctx := kongContext()
-	store, storeDesc, closer, err := openBackupStore(ctx, b.OutputDir, b.Target, pipeline.BlobStoreOptions{
+	store, storeDesc, closer, err := openBackupStore(ctx, b.OutputDir, b.Target, blobcodec.BlobStoreOptions{
 		Endpoint:  b.BackupEndpoint,
 		Region:    b.BackupRegion,
 		PathStyle: b.BackupPathStyle,
@@ -540,18 +541,18 @@ func (b *BackupFullCmd) run(g *Globals, env *envelopeRun) error {
 func openBackupStore(
 	ctx context.Context,
 	outputDir, target string,
-	opts pipeline.BlobStoreOptions,
+	opts blobcodec.BlobStoreOptions,
 ) (store irbackup.Store, description string, closer func() error, err error) {
 	switch {
 	case outputDir != "":
-		s, err := pipeline.NewLocalStore(outputDir)
+		s, err := blobcodec.NewLocalStore(outputDir)
 		if err != nil {
 			return nil, "", nil, fmt.Errorf("open output directory: %w", err)
 		}
 		root := s.Root()
 		return s, root, nil, nil
 	case target != "":
-		s, err := pipeline.OpenBlobStore(ctx, target, opts)
+		s, err := blobcodec.OpenBlobStore(ctx, target, opts)
 		if err != nil {
 			return nil, "", nil, fmt.Errorf("open backup destination: %w", err)
 		}
@@ -626,7 +627,7 @@ func (b *BackupIncrementalCmd) Run(g *Globals) error {
 		return errors.New("--output-dir and --target are mutually exclusive")
 	}
 	ctx := kongContext()
-	store, storeDesc, closer, err := openBackupStore(ctx, b.OutputDir, b.Target, pipeline.BlobStoreOptions{
+	store, storeDesc, closer, err := openBackupStore(ctx, b.OutputDir, b.Target, blobcodec.BlobStoreOptions{
 		Endpoint:  b.BackupEndpoint,
 		Region:    b.BackupRegion,
 		PathStyle: b.BackupPathStyle,
@@ -752,7 +753,7 @@ func (b *BackupStreamCmd) Run(g *Globals) error {
 	if source, err = applyEngineOptions(source, g); err != nil {
 		return err
 	}
-	codec, err := pipeline.ParseCompression(b.Compression)
+	codec, err := blobcodec.ParseCompression(b.Compression)
 	if err != nil {
 		return fmt.Errorf("--compression: %w", err)
 	}
@@ -763,7 +764,7 @@ func (b *BackupStreamCmd) Run(g *Globals) error {
 		return errors.New("--output-dir and --target are mutually exclusive")
 	}
 	ctx := kongContext()
-	store, storeDesc, closer, err := openBackupStore(ctx, b.OutputDir, b.Target, pipeline.BlobStoreOptions{
+	store, storeDesc, closer, err := openBackupStore(ctx, b.OutputDir, b.Target, blobcodec.BlobStoreOptions{
 		Endpoint:  b.BackupEndpoint,
 		Region:    b.BackupRegion,
 		PathStyle: b.BackupPathStyle,
@@ -836,7 +837,7 @@ func (b *BackupStreamStopCmd) Run(_ *Globals) error {
 		return errors.New("--output-dir and --target are mutually exclusive")
 	}
 	ctx := kongContext()
-	store, storeDesc, closer, err := openBackupStore(ctx, b.OutputDir, b.Target, pipeline.BlobStoreOptions{
+	store, storeDesc, closer, err := openBackupStore(ctx, b.OutputDir, b.Target, blobcodec.BlobStoreOptions{
 		Endpoint:  b.BackupEndpoint,
 		Region:    b.BackupRegion,
 		PathStyle: b.BackupPathStyle,
@@ -896,7 +897,7 @@ func (v *BackupVerifyCmd) Run(_ *Globals) error {
 		return errors.New("--from-dir and --from are mutually exclusive")
 	}
 	ctx := kongContext()
-	store, _, closer, err := openBackupStore(ctx, v.FromDir, v.From, pipeline.BlobStoreOptions{
+	store, _, closer, err := openBackupStore(ctx, v.FromDir, v.From, blobcodec.BlobStoreOptions{
 		Endpoint:  v.BackupEndpoint,
 		Region:    v.BackupRegion,
 		PathStyle: v.BackupPathStyle,
@@ -1008,7 +1009,7 @@ func (p *BackupPruneCmd) Run(_ *Globals) error {
 		return errors.New("exactly one of --keep-incrementals or --keep-duration is required")
 	}
 	ctx := kongContext()
-	store, _, closer, err := openBackupStore(ctx, p.FromDir, p.From, pipeline.BlobStoreOptions{
+	store, _, closer, err := openBackupStore(ctx, p.FromDir, p.From, blobcodec.BlobStoreOptions{
 		Endpoint:  p.BackupEndpoint,
 		Region:    p.BackupRegion,
 		PathStyle: p.BackupPathStyle,
@@ -1115,7 +1116,7 @@ func (c *BackupCompactCmd) Run(_ *Globals) error {
 		return errors.New("--smart-compaction and --smart-compaction-off are mutually exclusive")
 	}
 	ctx := kongContext()
-	store, _, closer, err := openBackupStore(ctx, c.FromDir, c.From, pipeline.BlobStoreOptions{
+	store, _, closer, err := openBackupStore(ctx, c.FromDir, c.From, blobcodec.BlobStoreOptions{
 		Endpoint:  c.BackupEndpoint,
 		Region:    c.BackupRegion,
 		PathStyle: c.BackupPathStyle,
@@ -1291,7 +1292,7 @@ func (r *RestoreCmd) run(g *Globals, env *envelopeRun) error {
 	}
 
 	ctx := kongContext()
-	store, storeDesc, closer, err := openBackupStore(ctx, r.FromDir, r.From, pipeline.BlobStoreOptions{
+	store, storeDesc, closer, err := openBackupStore(ctx, r.FromDir, r.From, blobcodec.BlobStoreOptions{
 		Endpoint:  r.BackupEndpoint,
 		Region:    r.BackupRegion,
 		PathStyle: r.BackupPathStyle,

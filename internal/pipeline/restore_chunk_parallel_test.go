@@ -19,6 +19,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // observeRestoreChunkDispatch installs the test-only within-table-axis
@@ -111,7 +112,7 @@ func TestResolveRestoreParallelism_TwoAxisBudget(t *testing.T) {
 			EffectiveParallelism: 4,
 			CopyBudget:           6,
 		}}
-		r := &Restore{Target: eng, TargetDSN: "dsn", Store: &LocalStore{}, TableParallelism: 8, ChunkParallelism: 4}
+		r := &Restore{Target: eng, TargetDSN: "dsn", Store: &blobcodec.LocalStore{}, TableParallelism: 8, ChunkParallelism: 4}
 		gotTableP, gotReason := observeRestoreDispatch(t)
 		gotChunkP, _ := observeRestoreChunkDispatch(t)
 		table, chunk, err := r.resolveRestoreParallelism(context.Background(), 12)
@@ -140,7 +141,7 @@ func TestResolveRestoreParallelism_TwoAxisBudget(t *testing.T) {
 			EffectiveParallelism: 3,
 			CopyBudget:           12,
 		}}
-		r := &Restore{Target: eng, TargetDSN: "dsn", Store: &LocalStore{}, TableParallelism: 4, ChunkParallelism: 3}
+		r := &Restore{Target: eng, TargetDSN: "dsn", Store: &blobcodec.LocalStore{}, TableParallelism: 4, ChunkParallelism: 3}
 		table, chunk, err := r.resolveRestoreParallelism(context.Background(), 10)
 		if err != nil {
 			t.Fatalf("resolveRestoreParallelism: %v", err)
@@ -154,7 +155,7 @@ func TestResolveRestoreParallelism_TwoAxisBudget(t *testing.T) {
 	})
 
 	t.Run("mysql no-prober passes both axes unclamped", func(t *testing.T) {
-		r := &Restore{Target: noProberEngine{}, TargetDSN: "dsn", Store: &LocalStore{}, TableParallelism: 5, ChunkParallelism: 7}
+		r := &Restore{Target: noProberEngine{}, TargetDSN: "dsn", Store: &blobcodec.LocalStore{}, TableParallelism: 5, ChunkParallelism: 7}
 		table, chunk, err := r.resolveRestoreParallelism(context.Background(), 10)
 		if err != nil {
 			t.Fatalf("resolveRestoreParallelism: %v", err)
@@ -168,7 +169,7 @@ func TestResolveRestoreParallelism_TwoAxisBudget(t *testing.T) {
 	})
 
 	t.Run("bulk-parallelism=1 collapses within axis loudly", func(t *testing.T) {
-		r := &Restore{Target: noProberEngine{}, TargetDSN: "dsn", Store: &LocalStore{}, TableParallelism: 4, ChunkParallelism: 1}
+		r := &Restore{Target: noProberEngine{}, TargetDSN: "dsn", Store: &blobcodec.LocalStore{}, TableParallelism: 4, ChunkParallelism: 1}
 		gotChunkP, gotChunkReason := observeRestoreChunkDispatch(t)
 		_, chunk, err := r.resolveRestoreParallelism(context.Background(), 10)
 		if err != nil {
@@ -188,7 +189,7 @@ func TestResolveRestoreParallelism_TwoAxisBudget(t *testing.T) {
 // with >= 2 chunks; a single-chunk table collapses to serial with a
 // loud INFO (named reason), even when the axis is globally eligible.
 func TestResolveTableChunkParallelism_PerTableEngagement(t *testing.T) {
-	r := &Restore{Target: noProberEngine{}, TargetDSN: "dsn", Store: &LocalStore{}}
+	r := &Restore{Target: noProberEngine{}, TargetDSN: "dsn", Store: &blobcodec.LocalStore{}}
 	tbl := &ir.Table{Name: "t"}
 
 	if got := r.resolveTableChunkParallelism(context.Background(), tbl, 5, 4); got != 4 {
@@ -212,7 +213,7 @@ func TestResolveTableChunkParallelism_PerTableEngagement(t *testing.T) {
 // so a parallel restore must reproduce the exact row set per table.
 func restoreChunkFixture(t *testing.T, nTables, rowsPerTable, chunkRows int) (store irbackup.Store, want map[string][]ir.Row) {
 	t.Helper()
-	s, err := NewLocalStore(t.TempDir())
+	s, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}

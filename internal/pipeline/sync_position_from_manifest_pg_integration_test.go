@@ -32,6 +32,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 
@@ -63,7 +64,7 @@ func TestBackup_RecordsEndPosition_PostgresIntegration(t *testing.T) {
 	}
 
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -117,7 +118,7 @@ func TestStreamer_SyncStart_PositionFromManifest_PG_SlotExists(t *testing.T) {
 
 	pgEng, _ := engines.Get("postgres")
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	// Create publication + slot BEFORE the backup so the slot's
 	// restart_lsn covers the EndPosition recorded by the full.
@@ -206,7 +207,7 @@ func TestStreamer_SyncStart_PositionFromManifest_PG_SlotMissing_Refuses(t *testi
 	`)
 	pgEng, _ := engines.Get("postgres")
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	// Create slot, take backup, then DROP slot before sync — simulates
 	// the "the slot was abandoned long enough that something cleaned
@@ -272,7 +273,7 @@ func TestStreamer_SyncStart_PositionFromManifest_PG_StrictPreflight_LowWalKeep(t
 	`)
 	pgEng, _ := engines.Get("postgres")
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	applyDDL(t, sourceDSN, `CREATE PUBLICATION sluice_pub FOR ALL TABLES`)
 	if _, err := createPGLogicalSlotReturningLSN(t, sourceDSN, "sluice_slot"); err != nil {

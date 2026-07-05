@@ -10,6 +10,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // TestResolveParent_CreatedAtTieDoesNotBranchChain pins the ADR-0046
@@ -31,7 +32,7 @@ import (
 // terminal one is the chain head a restart must continue from.
 func TestResolveParent_CreatedAtTieDoesNotBranchChain(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -99,9 +100,9 @@ func TestResolveParent_CreatedAtTieDoesNotBranchChain(t *testing.T) {
 
 	// Seed lineage.json in chain (append) order so an inconsistent
 	// resolveParent pick would branch it.
-	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, DefaultCodec)
-	updateLineageForManifestBestEffort(context.Background(), store, incr1, "manifests/incr-0000000000001-aaaaaaaa.json", DefaultCodec)
-	updateLineageForManifestBestEffort(context.Background(), store, incr2, "manifests/incr-0000000000002-bbbbbbbb.json", DefaultCodec)
+	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, blobcodec.DefaultCodec)
+	updateLineageForManifestBestEffort(context.Background(), store, incr1, "manifests/incr-0000000000001-aaaaaaaa.json", blobcodec.DefaultCodec)
+	updateLineageForManifestBestEffort(context.Background(), store, incr2, "manifests/incr-0000000000002-bbbbbbbb.json", blobcodec.DefaultCodec)
 
 	src := &fakeCDCEngine{name: "postgres", schemaSequence: []*ir.Schema{schema}}
 

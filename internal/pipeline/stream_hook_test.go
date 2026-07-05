@@ -14,6 +14,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // TestRolloverHook_FiresWithEnvVars verifies the post-rollover hook
@@ -22,7 +23,7 @@ import (
 // caller-supplied output file the test inspects.
 func TestRolloverHook_FiresWithEnvVars(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	parent := &irbackup.Manifest{
 		FormatVersion: irbackup.BackupFormatVersion,
@@ -130,7 +131,7 @@ func hookCmdForScript(path string) string {
 // exit) doesn't fail the stream — the rollover already committed.
 func TestRolloverHook_FailureIsWarned(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	parent := &irbackup.Manifest{
 		FormatVersion: irbackup.BackupFormatVersion,

@@ -11,6 +11,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // ADR-0067 unit pins: contiguous-segment rotation handoff. A
@@ -90,11 +91,11 @@ func TestValidateFirstIncrementalBoundary(t *testing.T) {
 func rotatedSecondSegment(t *testing.T, firstIncrLSN, coverageLSN string) (irbackup.Store, ir.PositionMonotonicChecker) {
 	t.Helper()
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	f0 := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
 	i0 := makeManifest(t, irbackup.BackupKindIncremental, f0, "0/200") // P_N = 0/200
-	s0 := seedSegment(t, store, "", f0, []*irbackup.Manifest{i0}, CodecGzip)
+	s0 := seedSegment(t, store, "", f0, []*irbackup.Manifest{i0}, blobcodec.CodecGzip)
 
 	// seg1 full anchored at S = 0/300 (> P_N).
 	f1 := makeManifest(t, irbackup.BackupKindFull, nil, "0/300")
@@ -103,7 +104,7 @@ func rotatedSecondSegment(t *testing.T, firstIncrLSN, coverageLSN string) (irbac
 	i1 := makeManifest(t, irbackup.BackupKindIncremental, f1, "0/350")
 	i1.StartPosition = pgPos(firstIncrLSN)
 	i1.BackupID = irbackup.ComputeBackupID(i1)
-	s1 := seedSegment(t, store, "seg-1", f1, []*irbackup.Manifest{i1}, CodecNone)
+	s1 := seedSegment(t, store, "seg-1", f1, []*irbackup.Manifest{i1}, blobcodec.CodecNone)
 	// ADR-0067: record the kept-overlap coverage start.
 	s1.IncrementalCoverageStart = pgPos(coverageLSN)
 

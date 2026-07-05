@@ -5,6 +5,8 @@ package pipeline
 
 import (
 	"testing"
+
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // TestStreamStopRegistry_RegisterNotifyDeregister exercises the full
@@ -14,7 +16,7 @@ import (
 // on for Bug 37's same-process fix.
 func TestStreamStopRegistry_RegisterNotifyDeregister(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	ch, deregister := registerStreamStopChan(store)
 	defer deregister()
@@ -54,7 +56,7 @@ func TestStreamStopRegistry_RegisterNotifyDeregister(t *testing.T) {
 // the cross-machine rendezvous.
 func TestStreamStopRegistry_NotifyUnknownStore(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	if notifyStreamStop(store) {
 		t.Error("notifyStreamStop = true on unregistered store; want false")
@@ -67,7 +69,7 @@ func TestStreamStopRegistry_NotifyUnknownStore(t *testing.T) {
 // so any goroutine still holding a reference exits its select cleanly.
 func TestStreamStopRegistry_DeregisterClosesChannelIfStillOpen(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	ch, deregister := registerStreamStopChan(store)
 	deregister()
@@ -90,7 +92,7 @@ func TestStreamStopRegistry_DeregisterClosesChannelIfStillOpen(t *testing.T) {
 // the second call is a no-op (sync.Once-guarded).
 func TestStreamStopRegistry_DeregisterIdempotent(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	_, deregister := registerStreamStopChan(store)
 	deregister()

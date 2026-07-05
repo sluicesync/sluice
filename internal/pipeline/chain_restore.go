@@ -37,6 +37,7 @@ import (
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/translate"
 )
 
@@ -495,7 +496,7 @@ func (r *ChainRestore) applyFull(ctx context.Context, full *segmentRecord, dataO
 		return fmt.Errorf("chain restore: segment full manifest path %q; expected %q (v0.67.0 segment-root layout)",
 			full.segment.FullManifestPath, ManifestFileName)
 	}
-	if err := validateRecordedCodec(full.segment.Codec); err != nil {
+	if err := blobcodec.ValidateRecordedCodec(full.segment.Codec); err != nil {
 		return err
 	}
 	rest := &Restore{
@@ -862,7 +863,7 @@ func (r *ChainRestore) streamIncrementalChanges(
 	go func() {
 		defer close(fetchCh)
 		for chunkIdx, chunk := range link.manifest.ChangeChunks {
-			src, err := fetchChunkVerified(fetchCtx, segStore, chunk.File, chunk.SHA256)
+			src, err := blobcodec.FetchChunkVerified(fetchCtx, segStore, chunk.File, chunk.SHA256)
 			select {
 			case fetchCh <- fetchedChunk{idx: chunkIdx, chunk: chunk, src: src, err: err}:
 			case <-fetchCtx.Done():
@@ -951,7 +952,7 @@ func (r *ChainRestore) streamSchemaHistorySnapshots(
 // (never sniffed from the bytes — ADR-0046 §5).
 func (r *ChainRestore) streamOneChangeChunk(
 	ctx context.Context,
-	codec Codec,
+	codec blobcodec.Codec,
 	chunk *irbackup.ChunkInfo,
 	src io.ReadCloser,
 	out chan<- ir.Change,
@@ -961,7 +962,7 @@ func (r *ChainRestore) streamOneChangeChunk(
 		_ = src.Close()
 		return fmt.Errorf("resolve change chunk cek: %w", err)
 	}
-	cr, err := newChangeChunkReader(src, chunk.SHA256, cek, codec)
+	cr, err := blobcodec.NewChangeChunkReader(src, chunk.SHA256, cek, codec)
 	if err != nil {
 		return fmt.Errorf("open chunk reader: %w", err)
 	}
@@ -1157,7 +1158,7 @@ func buildLineageChain(ctx context.Context, store irbackup.Store, cmp ir.Positio
 	var prevLink *segmentRecord // last link of the previously-walked segment
 	for si := cat.RestorableFromSegment; si < len(cat.Segments); si++ {
 		seg := &cat.Segments[si]
-		if err := validateRecordedCodec(seg.Codec); err != nil {
+		if err := blobcodec.ValidateRecordedCodec(seg.Codec); err != nil {
 			return nil, err
 		}
 		ss := seg.store(store)

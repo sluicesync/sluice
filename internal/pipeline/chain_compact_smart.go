@@ -62,6 +62,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // PKStrategy controls how smart-compact identifies "the same row"
@@ -720,7 +721,7 @@ func applySmartCompactionToStagedGroup(
 	ctx context.Context,
 	stagingStore irbackup.Store,
 	pg *plannedGroup,
-	codec Codec,
+	codec blobcodec.Codec,
 	cek []byte,
 	pkStrategy PKStrategy,
 ) (*smartCompactResult, error) {
@@ -765,7 +766,7 @@ func applySmartCompactionToIncremental(
 	ctx context.Context,
 	store irbackup.Store,
 	im *irbackup.Manifest,
-	codec Codec,
+	codec blobcodec.Codec,
 	cek []byte,
 	pkStrategy PKStrategy,
 ) (*smartCompactResult, error) {
@@ -791,7 +792,7 @@ func applySmartCompactionToIncremental(
 		// "Access is denied" (task #9; TestADR0064 on this exact shape).
 		var size int64
 		counter := &countingReader{src: rc, n: &size}
-		ccr, err := newChangeChunkReader(counter, "", cek, codec)
+		ccr, err := blobcodec.NewChangeChunkReader(counter, "", cek, codec)
 		if err != nil {
 			_ = rc.Close()
 			return nil, fmt.Errorf("open chunk %q: %w", ch.File, err)
@@ -835,7 +836,7 @@ func applySmartCompactionToIncremental(
 	bytesAfter := int64(0)
 	for i, ch := range im.ChangeChunks {
 		buf := &bytes.Buffer{}
-		cw, err := newChangeChunkWriter(buf, cek, codec)
+		cw, err := blobcodec.NewChangeChunkWriter(buf, cek, codec)
 		if err != nil {
 			return nil, fmt.Errorf("open chunk writer %q: %w", ch.File, err)
 		}

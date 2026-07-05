@@ -30,6 +30,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 func chainSlotTestEngine(t *testing.T) (*snapshotOpeningEngine, *ir.Schema) {
@@ -54,7 +55,7 @@ func chainSlotTestEngine(t *testing.T) (*snapshotOpeningEngine, *ir.Schema) {
 }
 
 func TestBackup_ChainSlot_CommitsSnapshotOnSuccess(t *testing.T) {
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -103,7 +104,7 @@ func (erroringSnapshotRowReader) Err() error { return nil }
 //     slot, since no on-store record references it.
 func TestBackup_ChainSlot_CommitTimingOnFailedRun(t *testing.T) {
 	t.Run("mid-sweep failure: committed (resumable manifest references the slot)", func(t *testing.T) {
-		store, err := NewLocalStore(t.TempDir())
+		store, err := blobcodec.NewLocalStore(t.TempDir())
 		if err != nil {
 			t.Fatalf("NewLocalStore: %v", err)
 		}
@@ -141,7 +142,7 @@ func TestBackup_ChainSlot_CommitTimingOnFailedRun(t *testing.T) {
 	})
 
 	t.Run("pre-manifest failure: uncommitted (Close drops the slot)", func(t *testing.T) {
-		inner, err := NewLocalStore(t.TempDir())
+		inner, err := blobcodec.NewLocalStore(t.TempDir())
 		if err != nil {
 			t.Fatalf("NewLocalStore: %v", err)
 		}
@@ -165,7 +166,7 @@ func TestBackup_ChainSlot_CommitTimingOnFailedRun(t *testing.T) {
 }
 
 func TestBackup_ChainSlot_RefusesSnapshotFallback(t *testing.T) {
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -215,7 +216,7 @@ func (e *preflightingBackupEngine) PreflightChainResume(_ context.Context, _ str
 }
 
 func TestIncremental_ChainPreflightRefusalStopsBeforeCDC(t *testing.T) {
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}

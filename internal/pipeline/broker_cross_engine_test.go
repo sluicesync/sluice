@@ -33,13 +33,14 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // TestSyncFromBackup_DetectChainSourceEngine_PG verifies the helper
 // reads the full's SourceEngine from a PG-rooted chain.
 func TestSyncFromBackup_DetectChainSourceEngine_PG(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	full := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
 	full.SourceEngine = "postgres"
 	full.BackupID = irbackup.ComputeBackupID(full)
@@ -59,7 +60,7 @@ func TestSyncFromBackup_DetectChainSourceEngine_PG(t *testing.T) {
 // loop's tick error surfaces normally.
 func TestSyncFromBackup_DetectChainSourceEngine_EmptyOnNoChain(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	b := &SyncFromBackup{
 		Target: stubTargetEngine{}, TargetDSN: "x", Store: store, StreamID: "s",
 	}

@@ -34,6 +34,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -65,7 +66,7 @@ func rotationSeedFull(t *testing.T, store irbackup.Store, eng ir.Engine, sourceD
 	// desyncs the recorded codec from the chunk bytes the moment the
 	// default flips (v0.67.0 gzip→zstd) → restore reads with the wrong
 	// codec. DefaultCodec tracks it.
-	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, DefaultCodec)
+	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, blobcodec.DefaultCodec)
 	return full
 }
 
@@ -95,7 +96,7 @@ func TestADR0046_ZeroLossMultiSegmentRotation_PG(t *testing.T) {
 
 	eng, _ := engines.Get("postgres")
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	full := rotationSeedFull(t, store, eng, sourceDSN, slotLSN)
 
 	// Continuous writer: a known, ordered sequence so the final-state
@@ -237,7 +238,7 @@ func TestADR0046_CrashInjectionMatrix_PG(t *testing.T) {
 
 			eng, _ := engines.Get("postgres")
 			dir := t.TempDir()
-			store, _ := NewLocalStore(dir)
+			store, _ := blobcodec.NewLocalStore(dir)
 			full := rotationSeedFull(t, store, eng, sourceDSN, slotLSN)
 
 			// Drive a handful of writes so a rollover commits, then the
@@ -399,7 +400,7 @@ func TestADR0046_NeverRotatedByteIdentical_PG(t *testing.T) {
 
 	eng, _ := engines.Get("postgres")
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	full := rotationSeedFull(t, store, eng, sourceDSN, slotLSN)
 
 	for i := 0; i < 10; i++ {
@@ -424,8 +425,8 @@ func TestADR0046_NeverRotatedByteIdentical_PG(t *testing.T) {
 
 	lin, ok, _ := loadLineageCatalog(context.Background(), store)
 	if !ok || len(lin.Segments) != 1 || lin.Segments[0].Dir != "" ||
-		lin.Segments[0].codecOrDefault() != DefaultCodec {
-		t.Fatalf("never-rotated lineage = %+v; want exactly one root segment (Dir='', codec=%s)", lin.Segments, DefaultCodec)
+		lin.Segments[0].codecOrDefault() != blobcodec.DefaultCodec {
+		t.Fatalf("never-rotated lineage = %+v; want exactly one root segment (Dir='', codec=%s)", lin.Segments, blobcodec.DefaultCodec)
 	}
 	if !lin.Segments[0].open() {
 		t.Error("the only segment of a never-rotated lineage must be open (uncapped)")
@@ -465,9 +466,9 @@ func TestADR0046_MixedCodecLineageRestores_PG(t *testing.T) {
 	`)
 	eng, _ := engines.Get("postgres")
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
-	codecs := []Codec{CodecNone, CodecGzip, CodecZstd}
+	codecs := []blobcodec.Codec{blobcodec.CodecNone, blobcodec.CodecGzip, blobcodec.CodecZstd}
 	var segs []LineageSegment
 	for i, c := range codecs {
 		applyDDL(t, sourceDSN, fmt.Sprintf(
@@ -544,7 +545,7 @@ func TestADR0046_UnknownRecordedCodecRefused_PG(t *testing.T) {
 		INSERT INTO users VALUES (1,'x@example.com');`)
 	eng, _ := engines.Get("postgres")
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	if err := (&Backup{Source: eng, SourceDSN: sourceDSN, Store: store, SluiceVersion: "test"}).
 		Run(context.Background()); err != nil {
 		t.Fatalf("backup: %v", err)
@@ -557,7 +558,7 @@ func TestADR0046_UnknownRecordedCodecRefused_PG(t *testing.T) {
 		FormatVersion: 1, SourceEngine: "postgres",
 		Segments: []LineageSegment{{
 			SegmentID: fm.BackupID, Dir: "", FullManifestPath: ManifestFileName,
-			Codec: Codec("snappy"), // unknown / garbled
+			Codec: blobcodec.Codec("snappy"), // unknown / garbled
 		}},
 	}
 	_ = writeLineageCatalog(context.Background(), store, cat)

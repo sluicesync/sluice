@@ -11,6 +11,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // TestLoadChainTerminalPosition_FullOnly pins the simplest chain
@@ -18,7 +19,7 @@ import (
 // manifest is the full itself.
 func TestLoadChainTerminalPosition_FullOnly(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	endPos := ir.Position{
 		Engine: "postgres",
@@ -52,7 +53,7 @@ func TestLoadChainTerminalPosition_FullOnly(t *testing.T) {
 // what gets returned, not the full's.
 func TestLoadChainTerminalPosition_FullPlusIncrementals(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	full := &irbackup.Manifest{
 		FormatVersion: irbackup.BackupFormatVersion,
@@ -116,7 +117,7 @@ func TestLoadChainTerminalPosition_FullPlusIncrementals(t *testing.T) {
 // at.
 func TestLoadChainTerminalPosition_EmptyEndPosition(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	full := &irbackup.Manifest{
 		FormatVersion: irbackup.BackupFormatVersion,
@@ -148,7 +149,7 @@ func TestLoadChainTerminalPosition_EmptyEndPosition(t *testing.T) {
 // silent zero-position return.
 func TestLoadChainTerminalPosition_EmptyStore(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	_, err := LoadChainTerminalPosition(context.Background(), store)
 	if err == nil {
 		t.Fatal("LoadChainTerminalPosition: nil; want error")

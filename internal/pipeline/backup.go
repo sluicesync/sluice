@@ -85,6 +85,7 @@ import (
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/redact"
 )
 
@@ -324,10 +325,10 @@ type Backup struct {
 	// Codec is the per-segment compression codec (ADR-0046 §5) every
 	// chunk this run writes is compressed with. Recorded on the
 	// lineage's segment 0; restore reads it from there, never sniffs
-	// it. Empty resolves to [DefaultCodec] (zstd, v0.67.0+). A
+	// it. Empty resolves to [blobcodec.DefaultCodec] (zstd, v0.67.0+). A
 	// one-segment never-rotated lineage takes the same single-segment
 	// restore path as a pre-ADR single chain (codec aside).
-	Codec Codec
+	Codec blobcodec.Codec
 
 	// Now, when set, overrides the wall-clock-time source for
 	// [Manifest.CreatedAt]. Used by tests to pin timestamps; in
@@ -705,7 +706,7 @@ func (b *Backup) Run(ctx context.Context) error {
 	// Best-effort — the manifest file is authoritative for the
 	// one-segment shape; lineage.json is the O(1) segment-shape +
 	// recorded-codec accelerator.
-	updateLineageForManifestBestEffort(ctx, b.Store, manifest, ManifestFileName, resolveCodec(b.Codec))
+	updateLineageForManifestBestEffort(ctx, b.Store, manifest, ManifestFileName, blobcodec.ResolveCodec(b.Codec))
 
 	logBackupComplete(ctx, manifest, b.Summary)
 	return nil
@@ -1394,7 +1395,7 @@ func chunkAlreadyMatches(ctx context.Context, store irbackup.Store, key, expecte
 		return false, fmt.Errorf("get %q: %w", key, err)
 	}
 	defer func() { _ = rc.Close() }()
-	got, err := hashChunkBytes(ctx, rc)
+	got, err := blobcodec.HashChunkBytes(ctx, rc)
 	if err != nil {
 		return false, fmt.Errorf("hash %q: %w", key, err)
 	}

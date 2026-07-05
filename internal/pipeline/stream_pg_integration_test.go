@@ -32,6 +32,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -62,7 +63,7 @@ func TestBackupStream_Postgres_RolloverByMaxChanges(t *testing.T) {
 	}
 
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -235,7 +236,7 @@ func TestBackupStream_Postgres_StopCommandRequestsExit(t *testing.T) {
 
 	pgEng, _ := engines.Get("postgres")
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	applyDDL(t, sourceDSN, `CREATE PUBLICATION sluice_pub FOR ALL TABLES`)
 	slotLSN, err := createPGLogicalSlotReturningLSN(t, sourceDSN, "sluice_slot")
@@ -314,7 +315,7 @@ func TestBackupStream_Postgres_ConcurrentWriterRefused(t *testing.T) {
 
 	pgEng, _ := engines.Get("postgres")
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	applyDDL(t, sourceDSN, `CREATE PUBLICATION sluice_pub FOR ALL TABLES`)
 	slotLSN, err := createPGLogicalSlotReturningLSN(t, sourceDSN, "sluice_slot")
@@ -420,7 +421,7 @@ func TestBackupStream_Postgres_QuietSourceTimeBoundRollover(t *testing.T) {
 
 	pgEng, _ := engines.Get("postgres")
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	applyDDL(t, sourceDSN, `CREATE PUBLICATION sluice_pub FOR ALL TABLES`)
 	slotLSN, err := createPGLogicalSlotReturningLSN(t, sourceDSN, "sluice_slot")
@@ -504,7 +505,7 @@ func TestBackupStream_Postgres_SignalDrainExitsClean(t *testing.T) {
 
 	pgEng, _ := engines.Get("postgres")
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	applyDDL(t, sourceDSN, `CREATE PUBLICATION sluice_pub FOR ALL TABLES`)
 	slotLSN, err := createPGLogicalSlotReturningLSN(t, sourceDSN, "sluice_slot")

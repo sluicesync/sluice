@@ -12,6 +12,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // fakeMonotonicEngine is a fakeCDCEngine that also implements
@@ -116,7 +117,7 @@ func TestShouldRotate_AgeFromOpenSegmentFull(t *testing.T) {
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
 	mustWriteManifest(t, store, ManifestFileName, full)
-	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, CodecGzip)
+	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, blobcodec.CodecGzip)
 
 	b := &BackupStream{RetainRotateAt: time.Hour, Store: store}
 	if r := b.shouldRotate(context.Background(), 0, created.Add(2*time.Hour)); r != rotationReasonAge {
@@ -138,7 +139,7 @@ func TestRecoverRotationState_PreCommitDiscards(t *testing.T) {
 	store := newMemStore()
 	cat := &LineageCatalog{
 		FormatVersion: 1, SourceEngine: "postgres",
-		Segments: []LineageSegment{{SegmentID: "s0", Dir: "", FullManifestPath: ManifestFileName, Codec: CodecGzip}},
+		Segments: []LineageSegment{{SegmentID: "s0", Dir: "", FullManifestPath: ManifestFileName, Codec: blobcodec.CodecGzip}},
 	}
 	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
 		t.Fatal(err)
@@ -174,9 +175,9 @@ func TestRecoverRotationState_PostCommitKeeps(t *testing.T) {
 		Segments: []LineageSegment{
 			{
 				SegmentID: "s0", Dir: "", FullManifestPath: ManifestFileName,
-				CappedAt: &capped, CapReason: rotationReasonAge, Codec: CodecGzip,
+				CappedAt: &capped, CapReason: rotationReasonAge, Codec: blobcodec.CodecGzip,
 			},
-			{SegmentID: "s1", Dir: "seg-777", FullManifestPath: ManifestFileName, Codec: CodecGzip},
+			{SegmentID: "s1", Dir: "seg-777", FullManifestPath: ManifestFileName, Codec: blobcodec.CodecGzip},
 		},
 	}
 	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {

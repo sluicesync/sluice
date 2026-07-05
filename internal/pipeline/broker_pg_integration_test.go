@@ -38,6 +38,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -54,7 +55,7 @@ import (
 // the slot was created.
 func brokerTestStreamSetup(t *testing.T, seedDDL string) (
 	sourceDSN, brokerTargetDSN string,
-	store *LocalStore,
+	store *blobcodec.LocalStore,
 	fullBackupID string,
 	teardown func(),
 ) {
@@ -77,7 +78,7 @@ func brokerTestStreamSetup(t *testing.T, seedDDL string) (
 
 	dir := t.TempDir()
 	var err error
-	store, err = NewLocalStore(dir)
+	store, err = blobcodec.NewLocalStore(dir)
 	if err != nil {
 		teardown()
 		t.Fatalf("NewLocalStore: %v", err)
@@ -117,7 +118,7 @@ func brokerTestStreamSetup(t *testing.T, seedDDL string) (
 // Returns a cancel func + a channel that fires when stream.Run
 // returns. Callers wait on the channel after cancelling to confirm a
 // clean exit.
-func runStreamInGoroutine(t *testing.T, sourceDSN, parentRef string, store *LocalStore) (cancel context.CancelFunc, done <-chan error) {
+func runStreamInGoroutine(t *testing.T, sourceDSN, parentRef string, store *blobcodec.LocalStore) (cancel context.CancelFunc, done <-chan error) {
 	t.Helper()
 	pgEng, _ := engines.Get("postgres")
 	stream := &BackupStream{
@@ -141,7 +142,7 @@ func runStreamInGoroutine(t *testing.T, sourceDSN, parentRef string, store *Loca
 // runBrokerInGoroutine launches a SyncFromBackup against the supplied
 // store + broker target DSN. Returns a cancel func + a channel that
 // fires when broker.Run returns.
-func runBrokerInGoroutine(t *testing.T, brokerTargetDSN, streamID string, store *LocalStore, opts brokerOpts) (cancel context.CancelFunc, done <-chan error) {
+func runBrokerInGoroutine(t *testing.T, brokerTargetDSN, streamID string, store *blobcodec.LocalStore, opts brokerOpts) (cancel context.CancelFunc, done <-chan error) {
 	t.Helper()
 	pgEng, _ := engines.Get("postgres")
 	broker := &SyncFromBackup{
@@ -717,7 +718,7 @@ func TestSyncFromBackup_ColdStartWithReset_StaleSchema(t *testing.T) {
 // waitForIncrementals blocks until at least minCount incremental
 // manifests are in the chain or the deadline fires. Returns silently
 // in either case; assertions are the caller's job.
-func waitForIncrementals(t *testing.T, store *LocalStore, minCount int, timeout time.Duration) {
+func waitForIncrementals(t *testing.T, store *blobcodec.LocalStore, minCount int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {

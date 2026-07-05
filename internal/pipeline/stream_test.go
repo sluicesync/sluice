@@ -12,6 +12,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // TestBackupStream_Validate covers the same validation surface as
@@ -22,8 +23,8 @@ func TestBackupStream_Validate(t *testing.T) {
 		b    *BackupStream
 		want string
 	}{
-		{"nil source", &BackupStream{SourceDSN: "x", Store: &LocalStore{}}, "Source engine is nil"},
-		{"empty DSN", &BackupStream{Source: &fakeCDCEngine{name: "postgres"}, Store: &LocalStore{}}, "SourceDSN is empty"},
+		{"nil source", &BackupStream{SourceDSN: "x", Store: &blobcodec.LocalStore{}}, "Source engine is nil"},
+		{"empty DSN", &BackupStream{Source: &fakeCDCEngine{name: "postgres"}, Store: &blobcodec.LocalStore{}}, "SourceDSN is empty"},
 		{"nil store", &BackupStream{Source: &fakeCDCEngine{name: "postgres"}, SourceDSN: "x"}, "Store is nil"},
 	}
 	for _, c := range cases {
@@ -43,7 +44,7 @@ func TestBackupStream_Validate_NoCDC(t *testing.T) {
 	src := &fakeCDCEngine{name: "postgres", schemaSequence: []*ir.Schema{{}}}
 	wrapped := &noCDCCapEngine{src: src}
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	b := &BackupStream{Source: wrapped, SourceDSN: "x", Store: store}
 	err := b.Run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "does not declare CDC support") {
@@ -60,7 +61,7 @@ func TestBackupStream_Validate_NoCDC(t *testing.T) {
 // source-side end-of-stream" is the cleanest unit-test shape.
 func TestBackupStream_RolloverOnMaxChanges(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -191,7 +192,7 @@ func TestBackupStream_RolloverOnMaxChanges(t *testing.T) {
 // committed (skip-empty-rollover default).
 func TestBackupStream_SkipEmptyRollover_OnChannelClose(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	parent := &irbackup.Manifest{
 		FormatVersion: irbackup.BackupFormatVersion,
@@ -236,7 +237,7 @@ func TestBackupStream_SkipEmptyRollover_OnChannelClose(t *testing.T) {
 // changes.
 func TestBackupStream_IncludeEmptyRollover_WritesManifest(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	parent := &irbackup.Manifest{
 		FormatVersion: irbackup.BackupFormatVersion,
@@ -290,7 +291,7 @@ func TestBackupStream_IncludeEmptyRollover_WritesManifest(t *testing.T) {
 // IncrementalBackup.
 func TestBackupStream_PositionInvalid_LoudFailure(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	parent := &irbackup.Manifest{
 		FormatVersion: irbackup.BackupFormatVersion,
@@ -335,7 +336,7 @@ func TestBackupStream_PositionInvalid_LoudFailure(t *testing.T) {
 // on a delay so the rollover loop is mid-window when ctx fires.
 func TestBackupStream_ContextCancel_DuringRollover_CleanExit(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	parent := &irbackup.Manifest{
 		FormatVersion: irbackup.BackupFormatVersion,

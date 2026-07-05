@@ -27,6 +27,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -80,7 +81,7 @@ func TestBackup_ChainSlot_EndToEndChain(t *testing.T) {
 	applyDDL(t, sourceDSN, chainSeedDDL)
 
 	pgEng, _ := engines.Get("postgres")
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -161,7 +162,7 @@ func TestIncremental_LateCreatedSlotRefused(t *testing.T) {
 	applyDDL(t, sourceDSN, `CREATE PUBLICATION sluice_pub FOR ALL TABLES`)
 
 	pgEng, _ := engines.Get("postgres")
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -208,7 +209,7 @@ func TestIncremental_MissingSlotRefusedWithGuidance(t *testing.T) {
 	applyDDL(t, sourceDSN, chainSeedDDL)
 
 	pgEng, _ := engines.Get("postgres")
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -248,7 +249,7 @@ func TestBackup_ChainSlot_ExistingSlotRefused(t *testing.T) {
 	defer dropPGLogicalSlot(t, sourceDSN, "sluice_slot")
 
 	pgEng, _ := engines.Get("postgres")
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}

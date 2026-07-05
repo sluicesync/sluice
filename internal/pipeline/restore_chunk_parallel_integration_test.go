@@ -30,6 +30,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -72,7 +73,7 @@ func TestRestoreChunkParallel_PG_ByteIdenticalToSerial(t *testing.T) {
 	`, table, table))
 
 	pgEng, _ := engines.Get("postgres")
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -128,7 +129,7 @@ func TestRestoreChunkParallel_PG_SingleChunkStaysSerial(t *testing.T) {
 	`, table, table))
 
 	pgEng, _ := engines.Get("postgres")
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -179,7 +180,7 @@ func TestRestoreChunkParallel_MySQL_ByteIdenticalToSerial(t *testing.T) {
 	seedMySQLVariedRows(t, sourceDSN, table, 200)
 
 	mysqlEng, _ := engines.Get("mysql")
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}

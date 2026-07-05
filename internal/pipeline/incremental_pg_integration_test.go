@@ -26,6 +26,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -56,7 +57,7 @@ func TestIncrementalBackup_PostgresChainRestore(t *testing.T) {
 	}
 
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -207,7 +208,7 @@ func TestIncrementalBackup_PostgresChainRestore_SchemaEvolution(t *testing.T) {
 
 	pgEng, _ := engines.Get("postgres")
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	applyDDL(t, sourceDSN, `CREATE PUBLICATION sluice_pub FOR ALL TABLES`)
 	slotLSN, err := createPGLogicalSlotReturningLSN(t, sourceDSN, "sluice_slot")
@@ -336,7 +337,7 @@ func TestIncrementalBackup_PostgresChainRestore_TwoIncrementals(t *testing.T) {
 	}
 
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -617,7 +618,7 @@ func TestIncrementalBackup_PostgresChainRestore_SchemaHistoryReplay(t *testing.T
 
 	pgEng, _ := engines.Get("postgres")
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	applyDDL(t, sourceDSN, `CREATE PUBLICATION sluice_pub FOR ALL TABLES`)
 	slotLSN, err := createPGLogicalSlotReturningLSN(t, sourceDSN, "sluice_slot")

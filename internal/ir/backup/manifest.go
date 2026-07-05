@@ -264,7 +264,7 @@ type SchemaHistoryEntry struct {
 }
 
 // Store is the storage abstraction for logical backups. Phase 1
-// ships a single implementation ([pipeline.LocalStore]) backed by the
+// ships a single implementation ([blobcodec.LocalStore]) backed by the
 // local filesystem; Phase 2 will add S3, GCS, and Azure Blob backends
 // behind the same interface so the writer / restore paths don't change.
 //

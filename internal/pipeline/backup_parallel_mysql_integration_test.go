@@ -33,6 +33,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/engines/mysql"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // mysqlTableChecksum returns (row count, content checksum) for one
@@ -118,7 +119,7 @@ func TestBackupParallel_MySQLCoordinated_RoundTripParity(t *testing.T) {
 	if !ok {
 		t.Fatal("mysql engine not registered")
 	}
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -176,7 +177,7 @@ func TestBackupParallel_MySQLConsistencyOracle(t *testing.T) {
 	if !ok {
 		t.Fatal("mysql engine not registered")
 	}
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -256,7 +257,7 @@ func TestBackupParallel_MySQLConsistencyOracle_SerialControl(t *testing.T) {
 	tables := seedMySQLBackupCorpus(t, sourceDSN, 2, 40)
 
 	mysqlEng, _ := engines.Get("mysql")
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -314,7 +315,7 @@ func TestBackupParallel_MySQLFTWRLDeniedFallsBackToSerial(t *testing.T) {
 	limitedDSN := withMySQLUser(t, sourceDSN, "norelo", "norelopw")
 
 	mysqlEng, _ := engines.Get("mysql")
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -375,7 +376,7 @@ func TestBackupParallel_MySQLCancelResumeCompletes(t *testing.T) {
 	tables := seedMySQLBackupCorpus(t, sourceDSN, nTables, 120)
 
 	mysqlEng, _ := engines.Get("mysql")
-	inner, err := NewLocalStore(t.TempDir())
+	inner, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}

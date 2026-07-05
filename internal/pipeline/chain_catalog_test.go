@@ -14,6 +14,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // TestLineage_LoadAbsent: a store without lineage.json reports
@@ -41,8 +42,8 @@ func TestLineage_LoadAbsent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveLineage: %v", err)
 	}
-	if len(rl.Segments) != 1 || rl.Segments[0].Dir != "" || rl.Segments[0].codecOrDefault() != DefaultCodec {
-		t.Fatalf("synthetic lineage = %+v; want one root segment, Dir='', codec=%s", rl.Segments, DefaultCodec)
+	if len(rl.Segments) != 1 || rl.Segments[0].Dir != "" || rl.Segments[0].codecOrDefault() != blobcodec.DefaultCodec {
+		t.Fatalf("synthetic lineage = %+v; want one root segment, Dir='', codec=%s", rl.Segments, blobcodec.DefaultCodec)
 	}
 }
 
@@ -63,20 +64,20 @@ func TestLineage_RoundTrip_MixedCodec(t *testing.T) {
 				Incrementals:  []string{"manifests/incr-1.json"},
 				StartPosition: ir.Position{Engine: "postgres", Token: "0/100"},
 				EndPosition:   ir.Position{Engine: "postgres", Token: "0/200"},
-				CappedAt:      &cap0, CapReason: rotationReasonAge, Codec: CodecNone,
+				CappedAt:      &cap0, CapReason: rotationReasonAge, Codec: blobcodec.CodecNone,
 			},
 			{
 				SegmentID: "s1", Dir: "seg-1", FullManifestPath: ManifestFileName,
 				StartPosition: ir.Position{Engine: "postgres", Token: "0/200"},
 				EndPosition:   ir.Position{Engine: "postgres", Token: "0/300"},
-				CappedAt:      &cap1, CapReason: rotationReasonChainLength, Codec: CodecGzip,
+				CappedAt:      &cap1, CapReason: rotationReasonChainLength, Codec: blobcodec.CodecGzip,
 			},
 			{
 				SegmentID: "s2", Dir: "seg-2", FullManifestPath: ManifestFileName,
 				StartPosition: ir.Position{Engine: "postgres", Token: "0/300"},
 				EndPosition:   ir.Position{Engine: "postgres", Token: "0/300"},
-				Codec:         CodecZstd,
-			}, // open segment: no CappedAt
+				Codec:         blobcodec.CodecZstd,
+			},
 		},
 	}
 	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
@@ -89,7 +90,7 @@ func TestLineage_RoundTrip_MixedCodec(t *testing.T) {
 	if len(got.Segments) != 3 {
 		t.Fatalf("segments = %d; want 3", len(got.Segments))
 	}
-	wantCodecs := []Codec{CodecNone, CodecGzip, CodecZstd}
+	wantCodecs := []blobcodec.Codec{blobcodec.CodecNone, blobcodec.CodecGzip, blobcodec.CodecZstd}
 	for i, wc := range wantCodecs {
 		if got.Segments[i].codecOrDefault() != wc {
 			t.Errorf("segment %d codec = %q; want %q", i, got.Segments[i].Codec, wc)
@@ -141,7 +142,7 @@ func TestUpdateLineageForManifest_RecordsVerbatimMarker(t *testing.T) {
 				},
 			}}},
 		}
-		if err := updateLineageForManifest(context.Background(), store, m, ManifestFileName, CodecZstd); err != nil {
+		if err := updateLineageForManifest(context.Background(), store, m, ManifestFileName, blobcodec.CodecZstd); err != nil {
 			t.Fatalf("updateLineageForManifest: %v", err)
 		}
 		cat, ok, err := loadLineageCatalog(context.Background(), store)
@@ -168,7 +169,7 @@ func TestUpdateLineageForManifest_RecordsVerbatimMarker(t *testing.T) {
 				Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
 			}}},
 		}
-		if err := updateLineageForManifest(context.Background(), store, m, ManifestFileName, CodecZstd); err != nil {
+		if err := updateLineageForManifest(context.Background(), store, m, ManifestFileName, blobcodec.CodecZstd); err != nil {
 			t.Fatalf("updateLineageForManifest: %v", err)
 		}
 		raw, _ := store.Get(context.Background(), LineageCatalogFileName)
@@ -213,9 +214,9 @@ func TestUpdateLineageForManifest_SeedsAndAppends(t *testing.T) {
 		PartialState: irbackup.BackupStateComplete,
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, CodecZstd)
+	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, blobcodec.CodecZstd)
 	cat, ok, _ := loadLineageCatalog(context.Background(), store)
-	if !ok || len(cat.Segments) != 1 || cat.Segments[0].codecOrDefault() != CodecZstd {
+	if !ok || len(cat.Segments) != 1 || cat.Segments[0].codecOrDefault() != blobcodec.CodecZstd {
 		t.Fatalf("after full: %+v; want one zstd segment", cat)
 	}
 
@@ -228,7 +229,7 @@ func TestUpdateLineageForManifest_SeedsAndAppends(t *testing.T) {
 		PartialState:   irbackup.BackupStateComplete,
 	}
 	incr.BackupID = irbackup.ComputeBackupID(incr)
-	updateLineageForManifestBestEffort(context.Background(), store, incr, "manifests/incr-1.json", CodecZstd)
+	updateLineageForManifestBestEffort(context.Background(), store, incr, "manifests/incr-1.json", blobcodec.CodecZstd)
 	cat, _, _ = loadLineageCatalog(context.Background(), store)
 	if len(cat.Segments) != 1 || len(cat.Segments[0].Incrementals) != 1 ||
 		cat.Segments[0].Incrementals[0] != "manifests/incr-1.json" {
@@ -238,7 +239,7 @@ func TestUpdateLineageForManifest_SeedsAndAppends(t *testing.T) {
 		t.Errorf("open segment EndPosition = %q; want 0/200", cat.Segments[0].EndPosition.Token)
 	}
 	// Dedup: re-writing the same path doesn't double-append.
-	updateLineageForManifestBestEffort(context.Background(), store, incr, "manifests/incr-1.json", CodecZstd)
+	updateLineageForManifestBestEffort(context.Background(), store, incr, "manifests/incr-1.json", blobcodec.CodecZstd)
 	cat, _, _ = loadLineageCatalog(context.Background(), store)
 	if len(cat.Segments[0].Incrementals) != 1 {
 		t.Errorf("re-write incrementals = %d; want 1 (deduped)", len(cat.Segments[0].Incrementals))
@@ -248,12 +249,12 @@ func TestUpdateLineageForManifest_SeedsAndAppends(t *testing.T) {
 // TestValidateRecordedCodec_UnknownRefused: an unknown recorded codec
 // is a loud refusal — codec is recorded, never inferred (ADR-0046 §5).
 func TestValidateRecordedCodec_UnknownRefused(t *testing.T) {
-	if err := validateRecordedCodec(Codec("snappy")); err == nil ||
+	if err := blobcodec.ValidateRecordedCodec(blobcodec.Codec("snappy")); err == nil ||
 		!strings.Contains(err.Error(), "unknown compression codec") {
 		t.Fatalf("err = %v; want unknown-codec refusal", err)
 	}
-	for _, c := range []Codec{"", CodecNone, CodecGzip, CodecZstd} {
-		if err := validateRecordedCodec(c); err != nil {
+	for _, c := range []blobcodec.Codec{"", blobcodec.CodecNone, blobcodec.CodecGzip, blobcodec.CodecZstd} {
+		if err := blobcodec.ValidateRecordedCodec(c); err != nil {
 			t.Errorf("validateRecordedCodec(%q) = %v; want nil", c, err)
 		}
 	}
@@ -265,19 +266,19 @@ func TestValidateRecordedCodec_UnknownRefused(t *testing.T) {
 // gzip-default shim). A regression here silently changes every new
 // backup's codec.
 func TestParseCompression(t *testing.T) {
-	if DefaultCodec != CodecZstd {
-		t.Fatalf("DefaultCodec = %q; want zstd (v0.67.0 flip)", DefaultCodec)
+	if blobcodec.DefaultCodec != blobcodec.CodecZstd {
+		t.Fatalf("DefaultCodec = %q; want zstd (v0.67.0 flip)", blobcodec.DefaultCodec)
 	}
-	for in, want := range map[string]Codec{"": CodecZstd, "gzip": CodecGzip, "none": CodecNone, "zstd": CodecZstd} {
-		got, err := ParseCompression(in)
+	for in, want := range map[string]blobcodec.Codec{"": blobcodec.CodecZstd, "gzip": blobcodec.CodecGzip, "none": blobcodec.CodecNone, "zstd": blobcodec.CodecZstd} {
+		got, err := blobcodec.ParseCompression(in)
 		if err != nil || got != want {
 			t.Errorf("ParseCompression(%q) = (%q,%v); want (%q,nil)", in, got, err, want)
 		}
 	}
-	if got := resolveCodec(""); got != CodecZstd {
+	if got := blobcodec.ResolveCodec(""); got != blobcodec.CodecZstd {
 		t.Errorf("resolveCodec(\"\") = %q; want zstd (the operator-unset write default)", got)
 	}
-	if _, err := ParseCompression("lz4"); err == nil {
+	if _, err := blobcodec.ParseCompression("lz4"); err == nil {
 		t.Error("ParseCompression(lz4) = nil; want unknown-codec error")
 	}
 }
@@ -344,11 +345,11 @@ func TestReconcileOpenSegmentCatalog_HealsHeadOrphan(t *testing.T) {
 		SourceEngine:  "postgres",
 		SluiceVersion: "test",
 		Segments: []LineageSegment{
-			{Dir: "", SegmentID: full0.BackupID, FullManifestPath: ManifestFileName, StartPosition: full0.EndPosition, EndPosition: full0.EndPosition, Codec: CodecZstd, CappedAt: &capped},
+			{Dir: "", SegmentID: full0.BackupID, FullManifestPath: ManifestFileName, StartPosition: full0.EndPosition, EndPosition: full0.EndPosition, Codec: blobcodec.CodecZstd, CappedAt: &capped},
 			// The bug shape: A is missing from Incrementals, so the list
 			// HEAD (B) parents off the orphan A, and the recorded coverage
 			// start is B.start (wrong) instead of A.start.
-			{Dir: "seg-1", SegmentID: full1.BackupID, FullManifestPath: ManifestFileName, StartPosition: full1.EndPosition, Incrementals: []string{pathB, pathC}, IncrementalCoverageStart: b.StartPosition, EndPosition: c.EndPosition, Codec: CodecZstd},
+			{Dir: "seg-1", SegmentID: full1.BackupID, FullManifestPath: ManifestFileName, StartPosition: full1.EndPosition, Incrementals: []string{pathB, pathC}, IncrementalCoverageStart: b.StartPosition, EndPosition: c.EndPosition, Codec: blobcodec.CodecZstd},
 		},
 	}
 	if err := writeLineageCatalog(ctx, root, cat); err != nil {
@@ -400,7 +401,7 @@ func TestReconcileOpenSegmentCatalog_NoOpWhenConsistent(t *testing.T) {
 	mustWriteManifest(t, root, pathA, a)
 	cat := &LineageCatalog{
 		FormatVersion: lineageCatalogFormatVersion, SourceEngine: "postgres", SluiceVersion: "test",
-		Segments: []LineageSegment{{Dir: "", SegmentID: full.BackupID, FullManifestPath: ManifestFileName, StartPosition: full.EndPosition, Incrementals: []string{pathA}, EndPosition: a.EndPosition, Codec: CodecZstd}},
+		Segments: []LineageSegment{{Dir: "", SegmentID: full.BackupID, FullManifestPath: ManifestFileName, StartPosition: full.EndPosition, Incrementals: []string{pathA}, EndPosition: a.EndPosition, Codec: blobcodec.CodecZstd}},
 	}
 	if err := writeLineageCatalog(ctx, root, cat); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -430,7 +431,7 @@ func TestReconcileOpenSegmentCatalog_RefusesToGuessOnBranch(t *testing.T) {
 	mustWriteManifest(t, root, "manifests/incr-1000000000002-bbbbbbbb.json", b2)
 	cat := &LineageCatalog{
 		FormatVersion: lineageCatalogFormatVersion, SourceEngine: "postgres", SluiceVersion: "test",
-		Segments: []LineageSegment{{Dir: "", SegmentID: full.BackupID, FullManifestPath: ManifestFileName, StartPosition: full.EndPosition, Codec: CodecZstd}},
+		Segments: []LineageSegment{{Dir: "", SegmentID: full.BackupID, FullManifestPath: ManifestFileName, StartPosition: full.EndPosition, Codec: blobcodec.CodecZstd}},
 	}
 	if err := writeLineageCatalog(ctx, root, cat); err != nil {
 		t.Fatalf("seed: %v", err)

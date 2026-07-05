@@ -19,6 +19,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // schemaDeltaRecorderEngine: an [ir.Engine] whose schema writer
@@ -130,9 +131,9 @@ func (w *erroringSchemaWriter) AlterAddColumn(_ context.Context, _ *ir.Table, _ 
 func TestApplySchemaDeltas_CrossEngine_AddColumnUUIDtoChar36(t *testing.T) {
 	tgt := newSchemaDeltaRecorderEngine("mysql")
 	cr := &ChainRestore{
-		Target: tgt, TargetDSN: "tgt", Store: &LocalStore{},
+		Target: tgt, TargetDSN: "tgt", Store: &blobcodec.LocalStore{},
 	}
-	link := &segmentRecord{segment: &LineageSegment{Codec: CodecGzip}, manifestRecord: manifestRecord{
+	link := &segmentRecord{segment: &LineageSegment{Codec: blobcodec.CodecGzip}, manifestRecord: manifestRecord{
 		path: "manifests/incr-0001.json",
 		manifest: &irbackup.Manifest{
 			BackupID:     "incr-0001",
@@ -179,8 +180,8 @@ func TestApplySchemaDeltas_CrossEngine_AddColumnUUIDtoChar36(t *testing.T) {
 // at the target's applier.
 func TestApplySchemaDeltas_SameEngine_NoRetarget_TINYINTpassthrough(t *testing.T) {
 	tgt := newSchemaDeltaRecorderEngine("mysql")
-	cr := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: &LocalStore{}}
-	link := &segmentRecord{segment: &LineageSegment{Codec: CodecGzip}, manifestRecord: manifestRecord{
+	cr := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: &blobcodec.LocalStore{}}
+	link := &segmentRecord{segment: &LineageSegment{Codec: blobcodec.CodecGzip}, manifestRecord: manifestRecord{
 		path: "manifests/incr-0001.json",
 		manifest: &irbackup.Manifest{
 			BackupID:     "incr-0001",
@@ -229,8 +230,8 @@ func TestApplySchemaDeltas_SameEngine_NoRetarget_TINYINTpassthrough(t *testing.T
 // to CHAR(36).
 func TestApplySchemaDeltas_CrossEngine_AddTableUUID_RetargetsCol(t *testing.T) {
 	tgt := newSchemaDeltaRecorderEngine("mysql")
-	cr := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: &LocalStore{}}
-	link := &segmentRecord{segment: &LineageSegment{Codec: CodecGzip}, manifestRecord: manifestRecord{
+	cr := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: &blobcodec.LocalStore{}}
+	link := &segmentRecord{segment: &LineageSegment{Codec: blobcodec.CodecGzip}, manifestRecord: manifestRecord{
 		path: "manifests/incr-0001.json",
 		manifest: &irbackup.Manifest{
 			BackupID:     "incr-0001",
@@ -274,8 +275,8 @@ func TestApplySchemaDeltas_AlterAddColumnError_Propagates(t *testing.T) {
 		schemaDeltaRecorderEngine: newSchemaDeltaRecorderEngine("mysql"),
 		err:                       want,
 	}
-	cr := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: &LocalStore{}}
-	link := &segmentRecord{segment: &LineageSegment{Codec: CodecGzip}, manifestRecord: manifestRecord{
+	cr := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: &blobcodec.LocalStore{}}
+	link := &segmentRecord{segment: &LineageSegment{Codec: blobcodec.CodecGzip}, manifestRecord: manifestRecord{
 		path: "manifests/incr-0001.json",
 		manifest: &irbackup.Manifest{
 			BackupID:     "incr-0001",

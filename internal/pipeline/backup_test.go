@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // backupRecorderEngine is a fake [ir.Engine] tailored to backup tests:
@@ -85,8 +86,8 @@ func TestBackup_Validate(t *testing.T) {
 		b    *Backup
 		want string
 	}{
-		{"nil source", &Backup{SourceDSN: "x", Store: &LocalStore{}}, "Source engine is nil"},
-		{"empty DSN", &Backup{Source: stubEngine{}, Store: &LocalStore{}}, "SourceDSN is empty"},
+		{"nil source", &Backup{SourceDSN: "x", Store: &blobcodec.LocalStore{}}, "Source engine is nil"},
+		{"empty DSN", &Backup{Source: stubEngine{}, Store: &blobcodec.LocalStore{}}, "SourceDSN is empty"},
 		{"nil store", &Backup{Source: stubEngine{}, SourceDSN: "x"}, "Store is nil"},
 	}
 	for _, c := range cases {
@@ -102,7 +103,7 @@ func TestBackup_Validate(t *testing.T) {
 
 func TestBackup_RoundTrip_SingleTable(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -185,7 +186,7 @@ func TestBackup_RoundTrip_SingleTable(t *testing.T) {
 
 func TestBackup_EmptyTableProducesNoChunks(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	schema := &ir.Schema{
 		Tables: []*ir.Table{
 			{Name: "empty", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
@@ -212,7 +213,7 @@ func TestBackup_EmptyTableProducesNoChunks(t *testing.T) {
 
 func TestBackup_FilterPrunesTables(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	schema := &ir.Schema{
 		Tables: []*ir.Table{
 			{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},

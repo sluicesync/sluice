@@ -39,6 +39,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -74,7 +75,7 @@ func TestADR0067_BackupCompact_LiveRotationContiguous_Merges_PG(t *testing.T) {
 
 	eng, _ := engines.Get("postgres")
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	full := rotationSeedFull(t, store, eng, sourceDSN, slotLSN)
 
 	const total = 30

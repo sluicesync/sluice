@@ -14,6 +14,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // capturingSchemaReader is a [ir.SchemaReader] that also implements
@@ -73,7 +74,7 @@ func (e *capturingBackupEngine) OpenSchemaReader(context.Context, string) (ir.Sc
 // warning.
 func TestBackup_RecordsEndPosition(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -137,7 +138,7 @@ func TestBackup_RecordsEndPosition(t *testing.T) {
 // v0.16.x shape so the chain-walker treats it as orphan).
 func TestBackup_NoCDCSkipsEndPosition(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -266,7 +267,7 @@ func (e *scopedSnapshotOpeningEngine) OpenBackupSnapshotForTables(_ context.Cont
 // over-streaming the entire keyspace (ADR-0071 buffer overflow).
 func TestBackup_TableScopedSnapshotPrefersScopedOpener(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -345,7 +346,7 @@ func TestBackup_TableScopedSnapshotPrefersScopedOpener(t *testing.T) {
 // interface.
 func TestBackup_BaseOnlySnapshotOpenerStillRoutesToBase(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -406,7 +407,7 @@ func TestBackup_BaseOnlySnapshotOpenerStillRoutesToBase(t *testing.T) {
 // and never calls the post-sweep CaptureBackupPosition fallback.
 func TestBackup_RecordsSnapshotAnchoredEndPosition(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -493,7 +494,7 @@ func TestBackup_SnapshotOpenerErrorFallsBackToCapturer(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -573,7 +574,7 @@ func TestBackup_SnapshotOpenerErrorFallsBackToCapturer(t *testing.T) {
 // write-window gap is documented; this test pins the dispatch.
 func TestBackup_FallbackWhenNoSnapshotOpener(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	schema := &ir.Schema{
 		Tables: []*ir.Table{{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}},
 	}
@@ -609,7 +610,7 @@ func TestBackup_FallbackWhenNoSnapshotOpener(t *testing.T) {
 // the position the chain machinery depends on.
 func TestBackup_CapturerErrorSurfacesAsRunFailure(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	schema := &ir.Schema{
 		Tables: []*ir.Table{{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}},
 	}

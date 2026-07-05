@@ -34,6 +34,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // keyedTable builds a one-PK-column table descriptor; anchored resumes
@@ -84,7 +85,7 @@ var (
 //	1: pre-sweep in-progress base manifest (anchor-stamped)
 //	2: first table chunk 0 (+ appended chunk + table-complete events)
 //	3: second table chunk 0  ← injected failure
-func crashAfterFirstTable(t *testing.T, store *LocalStore, src *snapshotOpeningEngine, chainSlot bool) {
+func crashAfterFirstTable(t *testing.T, store *blobcodec.LocalStore, src *snapshotOpeningEngine, chainSlot bool) {
 	t.Helper()
 	b := &Backup{
 		Source: src, SourceDSN: "src", Store: newFailOnNthPutStore(store, 3),
@@ -99,7 +100,7 @@ func crashAfterFirstTable(t *testing.T, store *LocalStore, src *snapshotOpeningE
 // manifest a crashed run leaves behind already carries the snapshot
 // anchor, so a resume can adopt it.
 func TestBackup_InProgressManifestCarriesAnchor(t *testing.T) {
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -131,7 +132,7 @@ func TestBackup_ResumeAdoptsPriorAnchor(t *testing.T) {
 	var logBuf bytes.Buffer
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -217,7 +218,7 @@ func TestBackup_ResumeWithoutPriorAnchorRestreamsEverything(t *testing.T) {
 	var logBuf bytes.Buffer
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -272,7 +273,7 @@ func TestBackup_ResumeWithoutPriorAnchorRestreamsEverything(t *testing.T) {
 // duplicates). A KEPT keyless table is fine: exact at the anchor.
 func TestBackup_AnchoredResumeRefusesKeylessRestream(t *testing.T) {
 	t.Run("keyless table to re-stream: refused", func(t *testing.T) {
-		store, err := NewLocalStore(t.TempDir())
+		store, err := blobcodec.NewLocalStore(t.TempDir())
 		if err != nil {
 			t.Fatalf("NewLocalStore: %v", err)
 		}
@@ -300,7 +301,7 @@ func TestBackup_AnchoredResumeRefusesKeylessRestream(t *testing.T) {
 	})
 
 	t.Run("keyless table kept verbatim: allowed", func(t *testing.T) {
-		store, err := NewLocalStore(t.TempDir())
+		store, err := blobcodec.NewLocalStore(t.TempDir())
 		if err != nil {
 			t.Fatalf("NewLocalStore: %v", err)
 		}
@@ -334,7 +335,7 @@ func TestBackup_AnchoredResumeRefusesKeylessRestream(t *testing.T) {
 // replay claim — refuse loudly rather than pair old-anchor chunks with
 // a schema they were not read under.
 func TestBackup_AnchoredResumeRefusesSchemaDrift(t *testing.T) {
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -369,7 +370,7 @@ func TestBackup_AnchoredResumeRefusesSchemaDrift(t *testing.T) {
 // in-progress prior and starts fresh (recording THIS run's anchor,
 // re-streaming everything).
 func TestBackup_ForceOverwriteDiscardsInProgressPrior(t *testing.T) {
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -426,7 +427,7 @@ func (e *chainResumeBackupEngine) PreflightChainResume(_ context.Context, _ stri
 // adopted slot is never re-created, never committed, and never dropped
 // by this run), and records the adopted anchor.
 func TestBackup_ChainSlotResumeAdoptsSlot(t *testing.T) {
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -480,7 +481,7 @@ func TestBackup_ChainSlotResumeAdoptsSlot(t *testing.T) {
 // by another consumer): refuse BEFORE opening any snapshot, naming
 // --force-overwrite.
 func TestBackup_ChainSlotResumePreflightRefusalStopsRun(t *testing.T) {
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -518,7 +519,7 @@ func TestBackup_ChainSlotResumePreflightRefusalStopsRun(t *testing.T) {
 // silently chain off a crashed full (its row chunks are incomplete —
 // restore would be missing tables, exit 0).
 func TestIncremental_RefusesInProgressParent(t *testing.T) {
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}

@@ -34,6 +34,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // accountingPutStore wraps memStore and accounts Put calls + bytes per
@@ -332,7 +333,7 @@ func TestManifestCommitter_SidecarCheckpointCost_10kTables(t *testing.T) {
 // new shared-state-adjacent code).
 func TestManifestCommitter_SidecarMode_ConcurrentCheckpoints(t *testing.T) {
 	ctx := context.Background()
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -408,7 +409,7 @@ func TestManifestCommitter_SidecarMode_ConcurrentCheckpoints(t *testing.T) {
 // pre-ADR-0086 contract (schema-appropriate version, no sidecar).
 func TestBackup_SidecarCrashResume_EndToEnd(t *testing.T) {
 	ctx := context.Background()
-	inner, err := NewLocalStore(t.TempDir())
+	inner, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -522,7 +523,7 @@ func TestBackup_SidecarCrashResume_EndToEnd(t *testing.T) {
 // version, no sidecar reference) resumes exactly as before.
 func TestBackup_ResumesOldFormatInProgressManifest(t *testing.T) {
 	ctx := context.Background()
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}

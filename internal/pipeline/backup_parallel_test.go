@@ -21,6 +21,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 func TestBackupWithinChunkingEligible(t *testing.T) {
@@ -358,7 +359,7 @@ func TestResolveBackupReadParallelism_TableFirstSplit(t *testing.T) {
 				CopyBudget:           c.copyBudget,
 			}}
 			b := &Backup{
-				Source: eng, SourceDSN: "dsn", Store: &LocalStore{},
+				Source: eng, SourceDSN: "dsn", Store: &blobcodec.LocalStore{},
 				TableParallelism: c.reqTable,
 				BulkParallelism:  c.reqWithin,
 			}
@@ -383,7 +384,7 @@ func TestResolveBackupReadParallelism_TableFirstSplit(t *testing.T) {
 // gapless, the manifest entry records every flush exactly once, and the
 // row-count sum is exact.
 func TestBackupChunkStreamer_ConcurrentIndexAllocation(t *testing.T) {
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -470,7 +471,7 @@ func TestBackupChunkStreamer_ConcurrentIndexAllocation(t *testing.T) {
 // unspecified; the SET is complete), and finishTable records the
 // terminal count.
 func TestManifestCommitter_ConcurrentSameEntryAppends(t *testing.T) {
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}

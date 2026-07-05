@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // restorePoolFakeWriter is a per-test [ir.RowWriter] whose behaviour is
@@ -67,7 +68,7 @@ func (w *restorePoolFakeWriter) Close() error {
 // tasks in schema order.
 func restorePoolFixture(t *testing.T, names []string) (*Restore, []restoreTableTask) {
 	t.Helper()
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -232,7 +233,7 @@ func TestResolveRestoreParallelism(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			r := &Restore{Target: stubEngine{}, TargetDSN: "dsn", Store: &LocalStore{}, TableParallelism: c.configured}
+			r := &Restore{Target: stubEngine{}, TargetDSN: "dsn", Store: &blobcodec.LocalStore{}, TableParallelism: c.configured}
 			gotP, gotReason := observeRestoreDispatch(t)
 			got, _, err := r.resolveRestoreParallelism(context.Background(), c.taskCount)
 			if err != nil {
@@ -289,7 +290,7 @@ func (w *idempotentRecordingRowWriter) WriteRowsIdempotent(_ context.Context, ta
 // own dispatch decision), never plain WriteRows, and every row still
 // arrives.
 func TestRestore_DataOnlyParallel_DispatchesIdempotentPerWorker(t *testing.T) {
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -342,7 +343,7 @@ func TestRestore_DataOnlyParallel_DispatchesIdempotentPerWorker(t *testing.T) {
 // 6-table backup engages the pool (observer-asserted) and every
 // table's rows arrive intact.
 func TestRestore_ParallelRun_RoundTripAllRowsArrive(t *testing.T) {
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}

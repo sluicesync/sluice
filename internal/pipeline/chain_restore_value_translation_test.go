@@ -30,6 +30,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // writeOneChangeChunk encodes the supplied changes into a change
@@ -42,7 +43,7 @@ func writeOneChangeChunk(t *testing.T, store irbackup.Store, chunkPath string, c
 	// DefaultCodec so encode here agrees with the restore read-default
 	// (these tests fix no codec in the manifest; codec is incidental to
 	// value translation). v0.67.0: DefaultCodec is zstd.
-	cw, err := newChangeChunkWriter(&buf, nil, DefaultCodec)
+	cw, err := blobcodec.NewChangeChunkWriter(&buf, nil, blobcodec.DefaultCodec)
 	if err != nil {
 		t.Fatalf("newChangeChunkWriter: %v", err)
 	}
@@ -68,7 +69,7 @@ func writeOneChangeChunk(t *testing.T, store irbackup.Store, chunkPath string, c
 // binds the string to the MySQL CHAR(36) target column.
 func TestChainRestore_CrossEngine_UUIDValuePreserved(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	schema := &ir.Schema{Tables: []*ir.Table{{
 		Name: "tokens",
@@ -152,7 +153,7 @@ func TestChainRestore_CrossEngine_UUIDValuePreserved(t *testing.T) {
 // charset prefix that breaks Vitess JSON inserts.
 func TestChainRestore_CrossEngine_JSONbytesPreserved(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	schema := &ir.Schema{Tables: []*ir.Table{{
 		Name: "events",
 		Columns: []*ir.Column{
@@ -223,7 +224,7 @@ func TestChainRestore_CrossEngine_JSONbytesPreserved(t *testing.T) {
 // a UTC-anchored datetime per the docs/value-types.md contract.
 func TestChainRestore_CrossEngine_TimestampPreserved(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	schema := &ir.Schema{Tables: []*ir.Table{{
 		Name: "events",
 		Columns: []*ir.Column{
@@ -291,7 +292,7 @@ func TestChainRestore_CrossEngine_TimestampPreserved(t *testing.T) {
 // target's applier accepts bool natively for BOOLEAN columns via pgx.
 func TestChainRestore_CrossEngine_BoolValuePreserved(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	schema := &ir.Schema{Tables: []*ir.Table{{
 		Name: "users",
 		Columns: []*ir.Column{

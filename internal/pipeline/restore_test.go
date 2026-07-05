@@ -10,8 +10,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // restoreRecorderEngine is a fake [ir.Engine] for restore tests: a
@@ -202,8 +204,8 @@ func TestRestore_Validate(t *testing.T) {
 		r    *Restore
 		want string
 	}{
-		{"nil target", &Restore{TargetDSN: "x", Store: &LocalStore{}}, "Target engine is nil"},
-		{"empty DSN", &Restore{Target: stubEngine{}, Store: &LocalStore{}}, "TargetDSN is empty"},
+		{"nil target", &Restore{TargetDSN: "x", Store: &blobcodec.LocalStore{}}, "Target engine is nil"},
+		{"empty DSN", &Restore{Target: stubEngine{}, Store: &blobcodec.LocalStore{}}, "TargetDSN is empty"},
 		{"nil store", &Restore{Target: stubEngine{}, TargetDSN: "x"}, "Store is nil"},
 	}
 	for _, c := range cases {
@@ -223,7 +225,7 @@ func TestRestore_Validate(t *testing.T) {
 // row arrives at the target with correct values.
 func TestBackupRestore_FullRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -322,7 +324,7 @@ func TestBackupRestore_FullRoundTrip(t *testing.T) {
 // gate, so SetGrowGate was never called.
 func TestRestore_WiresGrowGate(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -358,7 +360,7 @@ func TestRestore_WiresGrowGate(t *testing.T) {
 // would be permanently short (the Track-C silent-under-copy class).
 func TestRestore_ReparentReconciliation_RecoversDroppedRows(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -401,7 +403,7 @@ func TestRestore_ReparentReconciliation_RecoversDroppedRows(t *testing.T) {
 // restore phase surfaces ErrChunkHashMismatch (loud-failure tenet).
 func TestRestore_HashMismatch_FailsLoudly(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	schema := &ir.Schema{
 		Tables: []*ir.Table{{
@@ -469,7 +471,7 @@ func TestRestore_HashMismatch_FailsLoudly(t *testing.T) {
 	// the nil-check above) is that restore refused to proceed silently;
 	// this only classifies the error as corruption-shaped, codec-neutral.
 	es := err.Error()
-	corruptionShaped := errors.Is(err, ErrChunkHashMismatch) ||
+	corruptionShaped := errors.Is(err, blobcodec.ErrChunkHashMismatch) ||
 		strings.Contains(es, "gzip") || strings.Contains(es, "zstd") ||
 		strings.Contains(es, "magic") || strings.Contains(es, "decode") ||
 		strings.Contains(es, "exceeded") || strings.Contains(es, "corrupt") ||
@@ -487,7 +489,7 @@ func TestRestore_HashMismatch_FailsLoudly(t *testing.T) {
 // arrive in their retargeted shape.
 func TestRestore_CrossEngine_RetargetsTypes(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	schema := &ir.Schema{
 		Tables: []*ir.Table{{
@@ -569,7 +571,7 @@ func TestRestore_CrossEngine_SingleManifest_RefusesUnsupportable(t *testing.T) {
 	for _, target := range []string{"mysql", "vitess", "planetscale"} {
 		t.Run("refuses_"+target, func(t *testing.T) {
 			dir := t.TempDir()
-			store, _ := NewLocalStore(dir)
+			store, _ := blobcodec.NewLocalStore(dir)
 			src := newBackupRecorderEngine("postgres", excludeSchema, rows)
 			if err := (&Backup{Source: src, SourceDSN: "src", Store: store}).Run(context.Background()); err != nil {
 				t.Fatalf("Backup: %v", err)
@@ -591,7 +593,7 @@ func TestRestore_CrossEngine_SingleManifest_RefusesUnsupportable(t *testing.T) {
 
 	t.Run("pg_to_pg_passes", func(t *testing.T) {
 		dir := t.TempDir()
-		store, _ := NewLocalStore(dir)
+		store, _ := blobcodec.NewLocalStore(dir)
 		src := newBackupRecorderEngine("postgres", excludeSchema, rows)
 		if err := (&Backup{Source: src, SourceDSN: "src", Store: store}).Run(context.Background()); err != nil {
 			t.Fatalf("Backup: %v", err)
@@ -604,7 +606,7 @@ func TestRestore_CrossEngine_SingleManifest_RefusesUnsupportable(t *testing.T) {
 
 	t.Run("clean_schema_passes_cross_engine", func(t *testing.T) {
 		dir := t.TempDir()
-		store, _ := NewLocalStore(dir)
+		store, _ := blobcodec.NewLocalStore(dir)
 		clean := &ir.Schema{Tables: []*ir.Table{{
 			Name:    "users",
 			Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
@@ -666,7 +668,7 @@ func (w *capturingSchemaWriter) CreateViews(ctx context.Context, s *ir.Schema) e
 // loud-failure path.
 func TestVerifyBackup_DetectsMissingChunk(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	schema := &ir.Schema{
 		Tables: []*ir.Table{{Name: "x", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}},
 	}
@@ -686,4 +688,60 @@ func TestVerifyBackup_DetectsMissingChunk(t *testing.T) {
 	if total != 1 || mismatches != 1 {
 		t.Errorf("VerifyBackup total/mismatches = %d/%d; want 1/1", total, mismatches)
 	}
+}
+
+// valuesEquivalent compares two values across the encode/decode cycle's
+// type-normalisation. JSON's number model collapses int kinds to
+// int64; time values are compared via Equal (handles location/wall).
+// Local copy of the identically-named helper in internal/pipeline/blobcodec
+// (private test helpers don't cross package boundaries).
+func valuesEquivalent(a, b any) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	switch av := a.(type) {
+	case time.Time:
+		bv, ok := b.(time.Time)
+		return ok && av.Equal(bv)
+	case []byte:
+		bv, ok := b.([]byte)
+		if !ok {
+			return false
+		}
+		return bytes.Equal(av, bv)
+	case int64:
+		switch bv := b.(type) {
+		case int64:
+			return av == bv
+		case int:
+			return av == int64(bv)
+		}
+		return false
+	case int:
+		switch bv := b.(type) {
+		case int:
+			return av == bv
+		case int64:
+			return int64(av) == bv
+		}
+		return false
+	case []string:
+		bv, ok := b.([]string)
+		if !ok {
+			return false
+		}
+		if len(av) != len(bv) {
+			return false
+		}
+		for i := range av {
+			if av[i] != bv[i] {
+				return false
+			}
+		}
+		return true
+	}
+	return a == b
 }

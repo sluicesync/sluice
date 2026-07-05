@@ -10,6 +10,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // TestBackup_FormatVersion_Bug116 pins the v0.94.1 Bug 116 closure at
@@ -119,7 +120,7 @@ func TestBackup_FormatVersion_Bug116(t *testing.T) {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
 			dir := t.TempDir()
-			store, err := NewLocalStore(dir)
+			store, err := blobcodec.NewLocalStore(dir)
 			if err != nil {
 				t.Fatalf("NewLocalStore: %v", err)
 			}
@@ -215,7 +216,7 @@ func TestBackup_ManifestRoundTrip_StandaloneSequences(t *testing.T) {
 		Sequences: want,
 	}
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}

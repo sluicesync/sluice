@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package pipeline
+package blobcodec
 
 // Change-event chunk format for Phase 3 incremental backups.
 //
@@ -50,11 +50,11 @@ type changeChunkHeader struct {
 
 const changeChunkKind = "changes"
 
-// changeChunkWriter streams [ir.Change] events into a gzip-compressed
+// ChangeChunkWriter streams [ir.Change] events into a gzip-compressed
 // JSON Lines stream while tracking SHA-256 over the bytes that land on
 // disk (post-encryption when in encrypted mode). Lifecycle mirrors
-// [chunkWriter]: New → WriteChange* → Close.
-type changeChunkWriter struct {
+// [ChunkWriter]: New → WriteChange* → Close.
+type ChangeChunkWriter struct {
 	out         io.Writer
 	hasher      hash.Hash
 	gzWriter    codecWriteCloser
@@ -62,7 +62,7 @@ type changeChunkWriter struct {
 	changeCount int64
 	closed      bool
 
-	// cek, when non-nil, enables encrypted mode (mirrors chunkWriter).
+	// cek, when non-nil, enables encrypted mode (mirrors ChunkWriter).
 	cek   []byte
 	gzBuf *bytes.Buffer
 
@@ -75,7 +75,7 @@ type changeChunkWriter struct {
 	snapshots []ir.SchemaSnapshot
 }
 
-// newChangeChunkWriter wraps out (typically a pipe-buffer destined
+// NewChangeChunkWriter wraps out (typically a pipe-buffer destined
 // for [irbackup.Store.Put]) with the gzip + JSONL machinery and
 // writes the chunk header. Caller must call Close to flush.
 //
@@ -83,7 +83,7 @@ type changeChunkWriter struct {
 // and AES-256-GCM-encrypted at Close time before being written to out.
 // The hasher covers post-encryption bytes so `backup verify`'s
 // sha256-only check matches what's on disk.
-func newChangeChunkWriter(out io.Writer, cek []byte, codec Codec) (*changeChunkWriter, error) {
+func NewChangeChunkWriter(out io.Writer, cek []byte, codec Codec) (*ChangeChunkWriter, error) {
 	if cek != nil && len(cek) != crypto.CEKLen {
 		return nil, fmt.Errorf("change chunk writer: cek length %d != %d", len(cek), crypto.CEKLen)
 	}
@@ -115,7 +115,7 @@ func newChangeChunkWriter(out io.Writer, cek []byte, codec Codec) (*changeChunkW
 	if err := bw.WriteByte('\n'); err != nil {
 		return nil, fmt.Errorf("change chunk header newline: %w", err)
 	}
-	return &changeChunkWriter{
+	return &ChangeChunkWriter{
 		out:      out,
 		hasher:   hasher,
 		gzWriter: gz,
@@ -128,7 +128,7 @@ func newChangeChunkWriter(out io.Writer, cek []byte, codec Codec) (*changeChunkW
 // WriteChange encodes c as a JSONL record. Returns an error on
 // unknown change kinds (a future ir.Change variant would land here as
 // "unknown"; loud-failure surface).
-func (w *changeChunkWriter) WriteChange(c ir.Change) error {
+func (w *ChangeChunkWriter) WriteChange(c ir.Change) error {
 	if w.closed {
 		return errors.New("change chunk writer closed")
 	}
@@ -168,7 +168,7 @@ func (w *changeChunkWriter) WriteChange(c ir.Change) error {
 // Close flushes the buffered writer and gzip stream. Idempotent. In
 // encrypted mode, encrypts the gzipped buffer and writes the
 // ciphertext to out before returning.
-func (w *changeChunkWriter) Close() error {
+func (w *ChangeChunkWriter) Close() error {
 	if w.closed {
 		return nil
 	}
@@ -195,12 +195,12 @@ func (w *changeChunkWriter) Close() error {
 }
 
 // Hash returns the hex-encoded SHA-256 of the gzipped bytes.
-func (w *changeChunkWriter) Hash() string {
+func (w *ChangeChunkWriter) Hash() string {
 	return fmt.Sprintf("%x", w.hasher.Sum(nil))
 }
 
 // ChangeCount returns the number of changes written so far.
-func (w *changeChunkWriter) ChangeCount() int64 { return w.changeCount }
+func (w *ChangeChunkWriter) ChangeCount() int64 { return w.changeCount }
 
 // Snapshots returns the [ir.SchemaSnapshot] events observed during
 // this writer's lifetime so the incremental-backup orchestrator can
@@ -210,12 +210,12 @@ func (w *changeChunkWriter) ChangeCount() int64 { return w.changeCount }
 // Manifest. The returned slice is the writer's own backing slice
 // (callers should not mutate it; this is the same convention as
 // other internal-pipeline accessors).
-func (w *changeChunkWriter) Snapshots() []ir.SchemaSnapshot { return w.snapshots }
+func (w *ChangeChunkWriter) Snapshots() []ir.SchemaSnapshot { return w.snapshots }
 
-// changeChunkReader is the inverse: streams [ir.Change] events back
+// ChangeChunkReader is the inverse: streams [ir.Change] events back
 // from a change chunk while validating SHA-256. When cek is non-nil,
-// the chunk's bytes are decrypted up-front (mirrors [chunkReader]).
-type changeChunkReader struct {
+// the chunk's bytes are decrypted up-front (mirrors [ChunkReader]).
+type ChangeChunkReader struct {
 	src      io.ReadCloser
 	hasher   hash.Hash
 	gzReader codecReadCloser
@@ -227,11 +227,14 @@ type changeChunkReader struct {
 	consumedSrc bool
 }
 
+// NewChangeChunkReader opens a change-event chunk for reading, verifying
+// its SHA-256 as events are streamed. The inverse of [NewChangeChunkWriter].
+//
 // codec is the codec RECORDED for this chunk's segment in
 // lineage.json — never inferred from the bytes (DR data; an inferred
 // codec is a latent corruption path).
-func newChangeChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte, codec Codec) (*changeChunkReader, error) {
-	// Ownership guard: same as newChunkReader — every early-return error
+func NewChangeChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte, codec Codec) (*ChangeChunkReader, error) {
+	// Ownership guard: same as NewChunkReader — every early-return error
 	// path releases the store handle + any constructed codec reader so a
 	// corrupt / bad-codec / hash-mismatch change-chunk open doesn't leak
 	// an FD (and on Windows block temp-dir cleanup). One named guard,
@@ -299,7 +302,7 @@ func newChangeChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte, 
 	if hdr.ChunkKind != changeChunkKind {
 		return nil, fmt.Errorf("change chunk reader: chunk_kind = %q; want %q", hdr.ChunkKind, changeChunkKind)
 	}
-	r := &changeChunkReader{
+	r := &ChangeChunkReader{
 		src:         src,
 		hasher:      hasher,
 		gzReader:    gz,
@@ -315,7 +318,7 @@ func newChangeChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte, 
 
 // ReadChange returns the next [ir.Change] from the chunk, or
 // (nil, io.EOF) at end-of-stream.
-func (r *changeChunkReader) ReadChange() (ir.Change, error) {
+func (r *ChangeChunkReader) ReadChange() (ir.Change, error) {
 	if !r.scanner.Scan() {
 		if err := r.scanner.Err(); err != nil {
 			return nil, fmt.Errorf("change chunk reader: scan: %w", err)
@@ -336,7 +339,7 @@ func (r *changeChunkReader) ReadChange() (ir.Change, error) {
 // Close drains the remaining bytes through the hasher and verifies
 // the SHA-256 against the expected value from the manifest. Returns
 // [ErrChunkHashMismatch] on mismatch.
-func (r *changeChunkReader) Close() error {
+func (r *ChangeChunkReader) Close() error {
 	if _, err := io.Copy(io.Discard, r.gzReader); err != nil {
 		_ = r.gzReader.Close()
 		_ = r.src.Close()

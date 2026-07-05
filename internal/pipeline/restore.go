@@ -36,6 +36,7 @@ import (
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/translate"
 )
 
@@ -183,7 +184,7 @@ type Restore struct {
 	// the specific segment ChainRestore is applying when it re-enters
 	// with SkipChainDispatch). Recorded, never sniffed (ADR-0046 §5).
 	// Set by Run / by ChainRestore.applyFull.
-	segCodec Codec
+	segCodec blobcodec.Codec
 
 	// growGate is the run's shared coordinated cold-copy grow-window pause
 	// (ADR-0110), constructed unconditionally in Run and applied to EVERY
@@ -276,13 +277,13 @@ func (r *Restore) lineageNeedsWalk(ctx context.Context) (bool, error) {
 // rootSegmentCodec returns the codec recorded for segment 0 (the root
 // segment). Absent lineage → gzip (pre-ADR default). The codec is
 // recorded, NEVER inferred from chunk bytes.
-func (r *Restore) rootSegmentCodec(ctx context.Context) (Codec, error) {
+func (r *Restore) rootSegmentCodec(ctx context.Context) (blobcodec.Codec, error) {
 	cat, err := resolveLineage(ctx, r.Store)
 	if err != nil {
 		return "", err
 	}
 	seg := &cat.Segments[0]
-	if err := validateRecordedCodec(seg.Codec); err != nil {
+	if err := blobcodec.ValidateRecordedCodec(seg.Codec); err != nil {
 		return "", err
 	}
 	return seg.codecOrDefault(), nil
@@ -980,7 +981,7 @@ func (r *Restore) streamChunkRows(
 	chunk *irbackup.ChunkInfo,
 	rowCh chan<- ir.Row,
 ) (int64, error) {
-	src, err := fetchChunkVerified(ctx, r.Store, chunk.File, chunk.SHA256)
+	src, err := blobcodec.FetchChunkVerified(ctx, r.Store, chunk.File, chunk.SHA256)
 	if err != nil {
 		return 0, fmt.Errorf("open chunk: %w", err)
 	}
@@ -989,7 +990,7 @@ func (r *Restore) streamChunkRows(
 		_ = src.Close()
 		return 0, fmt.Errorf("resolve chunk cek: %w", err)
 	}
-	cr, err := newChunkReader(src, chunk.SHA256, cek, r.segCodec)
+	cr, err := blobcodec.NewChunkReader(src, chunk.SHA256, cek, r.segCodec)
 	if err != nil {
 		return 0, fmt.Errorf("open chunk reader: %w", err)
 	}
@@ -1325,7 +1326,7 @@ func probeChunkDecrypt(env crypto.EnvelopeEncryption, chunk *irbackup.ChunkInfo)
 // chunk-read path gained); a genuine at-rest corruption persists across
 // the retries and still surfaces loudly.
 func verifyChunk(ctx context.Context, store irbackup.Store, chunk *irbackup.ChunkInfo) error {
-	rc, err := fetchChunkVerified(ctx, store, chunk.File, chunk.SHA256)
+	rc, err := blobcodec.FetchChunkVerified(ctx, store, chunk.File, chunk.SHA256)
 	if err != nil {
 		return err
 	}

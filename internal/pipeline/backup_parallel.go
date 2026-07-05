@@ -66,6 +66,7 @@ import (
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // backupChunkDispatchObserver is a TEST-ONLY seam (nil in production —
@@ -458,7 +459,7 @@ type backupChunkStreamer struct {
 	chunkIdx  *atomic.Int64
 	rowsTotal *atomic.Int64
 
-	writer        *chunkWriter
+	writer        *blobcodec.ChunkWriter
 	buf           *bytes.Buffer
 	curWrappedCEK []byte // populated only in per-chunk encryption mode
 }
@@ -505,7 +506,7 @@ func (s *backupChunkStreamer) writeRow(ctx context.Context, row ir.Row) error {
 			return fmt.Errorf("resolve chunk cek: %w", err)
 		}
 		s.curWrappedCEK = wrapped
-		w, err := newChunkWriter(s.buf, s.colNames, cek, s.b.Codec)
+		w, err := blobcodec.NewChunkWriter(s.buf, s.colNames, cek, s.b.Codec)
 		if err != nil {
 			return fmt.Errorf("open chunk: %w", err)
 		}

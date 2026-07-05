@@ -27,6 +27,7 @@ import (
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/notify"
 	"sluicesync.dev/sluice/internal/pipeline"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	pstelemetry "sluicesync.dev/sluice/internal/planetscale/telemetry"
 	"sluicesync.dev/sluice/internal/redact"
 )
@@ -777,7 +778,7 @@ func (s *SyncFromBackupCmd) Run(_ *Globals) error {
 	}
 
 	ctx := kongContext()
-	store, storeDesc, closer, err := openBackupStore(ctx, s.BackupDir, s.BackupTarget, pipeline.BlobStoreOptions{
+	store, storeDesc, closer, err := openBackupStore(ctx, s.BackupDir, s.BackupTarget, blobcodec.BlobStoreOptions{
 		Endpoint:  s.BackupEndpoint,
 		Region:    s.BackupRegion,
 		PathStyle: s.BackupPathStyle,
@@ -854,7 +855,7 @@ func (s *SyncFromBackupStopCmd) Run(_ *Globals) error {
 		return errors.New("--backup-dir and --backup-target are mutually exclusive")
 	}
 	ctx := kongContext()
-	store, storeDesc, closer, err := openBackupStore(ctx, s.BackupDir, s.BackupTarget, pipeline.BlobStoreOptions{
+	store, storeDesc, closer, err := openBackupStore(ctx, s.BackupDir, s.BackupTarget, blobcodec.BlobStoreOptions{
 		Endpoint:  s.BackupEndpoint,
 		Region:    s.BackupRegion,
 		PathStyle: s.BackupPathStyle,
@@ -1599,7 +1600,7 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 	var manifestStoreCloser func() error
 	if s.PositionFromManifest != "" {
 		ctx := kongContext()
-		store, _, closer, err := openBackupStore(ctx, "", s.PositionFromManifest, pipeline.BlobStoreOptions{
+		store, _, closer, err := openBackupStore(ctx, "", s.PositionFromManifest, blobcodec.BlobStoreOptions{
 			Endpoint:  s.BackupEndpoint,
 			Region:    s.BackupRegion,
 			PathStyle: s.BackupPathStyle,

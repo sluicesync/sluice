@@ -12,6 +12,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // TestPruneLineage_KeepIncrementalsDropsOldest: 1 full + 5
@@ -147,12 +148,12 @@ func TestPruneLineage_MultiSegmentDropsLeadingWholeSegment(t *testing.T) {
 				SegmentID: f0.BackupID, Dir: "", FullManifestPath: ManifestFileName,
 				Incrementals:  []string{"manifests/incr-01.json", "manifests/incr-02.json"},
 				StartPosition: f0.EndPosition, EndPosition: i02.EndPosition,
-				CappedAt: &capt, CapReason: rotationReasonAge, Codec: CodecGzip,
+				CappedAt: &capt, CapReason: rotationReasonAge, Codec: blobcodec.CodecGzip,
 			},
 			{
 				SegmentID: f1.BackupID, Dir: "seg-1", FullManifestPath: ManifestFileName,
 				Incrementals:  []string{"manifests/incr-11.json", "manifests/incr-12.json"},
-				StartPosition: f1.EndPosition, EndPosition: i12.EndPosition, Codec: CodecGzip,
+				StartPosition: f1.EndPosition, EndPosition: i12.EndPosition, Codec: blobcodec.CodecGzip,
 			},
 		},
 	}
@@ -313,7 +314,7 @@ func TestSchemaHistoryRetentionFloor_Incomparable(t *testing.T) {
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
 	mustWriteManifest(t, store, ManifestFileName, full)
-	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, CodecGzip)
+	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, blobcodec.CodecGzip)
 
 	live := ir.Position{Engine: "postgres", Token: "incomparable:B"}
 	_, _, err := SchemaHistoryRetentionFloor(context.Background(), store, live, stubOrderer{})
@@ -336,7 +337,7 @@ func seedLineageChain(t *testing.T, store irbackup.Store, incrementals int) time
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
 	mustWriteManifest(t, store, ManifestFileName, full)
-	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, CodecGzip)
+	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, blobcodec.CodecGzip)
 	parent := full.BackupID
 	for i := 1; i <= incrementals; i++ {
 		m := &irbackup.Manifest{
@@ -350,7 +351,7 @@ func seedLineageChain(t *testing.T, store irbackup.Store, incrementals int) time
 		m.BackupID = irbackup.ComputeBackupID(m)
 		path := "manifests/incr-000" + string(rune('0'+i)) + ".json"
 		mustWriteManifest(t, store, path, m)
-		updateLineageForManifestBestEffort(context.Background(), store, m, path, CodecGzip)
+		updateLineageForManifestBestEffort(context.Background(), store, m, path, blobcodec.CodecGzip)
 		parent = m.BackupID
 	}
 	return base

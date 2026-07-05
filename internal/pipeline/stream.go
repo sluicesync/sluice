@@ -62,6 +62,7 @@ import (
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // DefaultRolloverWindow is the wall-clock cadence each rollover commits
@@ -257,7 +258,7 @@ type BackupStream struct {
 	// segment's codec; the lineage's recorded codec wins once set.
 	// Each rotation-opened segment is written with this codec. Empty
 	// resolves to gzip (pre-ADR default).
-	Codec Codec
+	Codec blobcodec.Codec
 
 	// Now, when set, overrides the wall-clock-time source for
 	// [irbackup.Manifest.CreatedAt] and `stream_state.json` timestamps. Used
@@ -289,7 +290,7 @@ type BackupStream struct {
 
 	// segCodec is the codec of the open segment, threaded into the
 	// change-chunk writer. Set by Run; repointed by rotation.
-	segCodec Codec
+	segCodec blobcodec.Codec
 
 	// skipThrough, when non-nil, is the per-segment-boundary dedup
 	// floor. ADR-0067: it is set to P_N (the prior segment's
@@ -1214,7 +1215,7 @@ func (b *BackupStream) captureWindow(
 	chainCEK []byte,
 ) (captureOutcome, error) {
 	var (
-		writer        *changeChunkWriter
+		writer        *blobcodec.ChangeChunkWriter
 		buf           *bytes.Buffer
 		chunkIdx      int
 		inTransaction bool
@@ -1267,7 +1268,7 @@ func (b *BackupStream) captureWindow(
 			return fmt.Errorf("resolve chunk cek: %w", err)
 		}
 		curWrappedCEK = wrapped
-		w, err := newChangeChunkWriter(buf, cek, b.segCodec)
+		w, err := blobcodec.NewChangeChunkWriter(buf, cek, b.segCodec)
 		if err != nil {
 			return fmt.Errorf("open chunk: %w", err)
 		}

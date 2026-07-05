@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package pipeline
+package blobcodec
 
 // Fast row codec for the Phase 1 chunk format — the per-row hot path
 // of `backup full` (encode) and `restore` (decode).
@@ -322,7 +322,7 @@ func appendJSONString(dst []byte, s string) []byte {
 // Decode side
 // ============================================================
 
-// fastRowDecoder is the per-chunkReader fast decode state: a bounded
+// fastRowDecoder is the per-ChunkReader fast decode state: a bounded
 // cache canonicalizing repeated JSON object keys (column names repeat
 // every row; the cache turns the per-row key allocation into a no-op
 // map lookup — `m[string(b)]` does not allocate).

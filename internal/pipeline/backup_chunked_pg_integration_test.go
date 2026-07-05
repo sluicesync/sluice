@@ -32,6 +32,7 @@ import (
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/engines"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -135,7 +136,7 @@ func TestBackupChunked_PG_IntPKRoundTrip(t *testing.T) {
 	`, bigRows))
 
 	pgEng, _ := engines.Get("postgres")
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -240,7 +241,7 @@ func TestBackupChunked_PG_KeysetPKFamilies(t *testing.T) {
 	`, rowsPer, rowsPer))
 
 	pgEng, _ := engines.Get("postgres")
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -298,7 +299,7 @@ func TestBackupChunked_PG_EncryptedPerChunkCEK(t *testing.T) {
 	`, bigRows))
 
 	pgEng, _ := engines.Get("postgres")
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -372,7 +373,7 @@ func TestBackupChunked_PG_CancelRestreamsPartialTable(t *testing.T) {
 	`, bigRows))
 
 	pgEng, _ := engines.Get("postgres")
-	inner, err := NewLocalStore(t.TempDir())
+	inner, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}

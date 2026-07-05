@@ -17,6 +17,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // TestStreamer_PositionFromManifest_BypassesAppliedReadPosition pins
@@ -26,7 +27,7 @@ import (
 // as the resume position instead.
 func TestStreamer_PositionFromManifest_BypassesAppliedReadPosition(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	chainTerminal := ir.Position{
 		Engine: "postgres",
@@ -104,7 +105,7 @@ func TestStreamer_PositionFromManifest_BypassesAppliedReadPosition(t *testing.T)
 // fall-through to cold-start would re-bulk and defeat the purpose.
 func TestStreamer_PositionFromManifest_EmptyEndPosition(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	full := &irbackup.Manifest{
 		FormatVersion: irbackup.BackupFormatVersion,
 		CreatedAt:     time.Date(2026, 5, 7, 10, 0, 0, 0, time.UTC),
@@ -147,7 +148,7 @@ func TestStreamer_PositionFromManifest_EmptyEndPosition(t *testing.T) {
 // CDC opens.
 func TestStreamer_PositionFromManifest_StrictPreflightWarningsRefuse(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	chainTerminal := ir.Position{
 		Engine: "postgres",
 		Token:  `{"slot":"sluice_slot","lsn":"1/300"}`,
@@ -201,7 +202,7 @@ func TestStreamer_PositionFromManifest_StrictPreflightWarningsRefuse(t *testing.
 // regardless of StrictPreflight.
 func TestStreamer_PositionFromManifest_PreflightRefusalAlwaysRefuses(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	chainTerminal := ir.Position{
 		Engine: "postgres",
 		Token:  `{"slot":"sluice_slot","lsn":"1/300"}`,

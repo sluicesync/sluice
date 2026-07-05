@@ -33,6 +33,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -119,7 +120,7 @@ func TestBackupParallel_PG_RoundTripChecksums(t *testing.T) {
 
 	tables := seedParallelBackupTables(t, sourceDSN, 6, 150)
 	pgEng, _ := engines.Get("postgres")
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -170,7 +171,7 @@ func TestBackupParallel_PG_RoundTripChecksums(t *testing.T) {
 // CancelFunc once n chunk Puts (keys under chunks/) have landed —
 // a deterministic stand-in for "the process died mid-sweep".
 type cancelAfterChunkPutsStore struct {
-	*LocalStore
+	*blobcodec.LocalStore
 	n      int64
 	puts   atomic.Int64
 	cancel context.CancelFunc
@@ -199,7 +200,7 @@ func TestBackupParallel_PG_CancelBoundsPartialsAndResumeCompletes(t *testing.T) 
 	const nTables, tableParallelism = 8, 4
 	tables := seedParallelBackupTables(t, sourceDSN, nTables, 200)
 	pgEng, _ := engines.Get("postgres")
-	inner, err := NewLocalStore(t.TempDir())
+	inner, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -286,7 +287,7 @@ func TestBackupParallel_PG_EncryptedRoundTrip(t *testing.T) {
 
 			tables := seedParallelBackupTables(t, sourceDSN, 4, 120)
 			pgEng, _ := engines.Get("postgres")
-			store, err := NewLocalStore(t.TempDir())
+			store, err := blobcodec.NewLocalStore(t.TempDir())
 			if err != nil {
 				t.Fatalf("NewLocalStore: %v", err)
 			}
@@ -345,7 +346,7 @@ func TestBackupParallel_PG_ManifestDeterminism(t *testing.T) {
 
 	runOne := func(tableParallelism int) *irbackup.Manifest {
 		t.Helper()
-		store, err := NewLocalStore(t.TempDir())
+		store, err := blobcodec.NewLocalStore(t.TempDir())
 		if err != nil {
 			t.Fatalf("NewLocalStore: %v", err)
 		}

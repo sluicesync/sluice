@@ -18,6 +18,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // sweepingBackupEngine layers [irbackup.AnchorSweeper] onto the
@@ -71,7 +72,7 @@ func writeInProgressManifest(t *testing.T, store irbackup.Store, schema *ir.Sche
 // surface must not be touched.
 func TestBackup_FreshRunDoesNotSweepAnchors(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -92,7 +93,7 @@ func TestBackup_FreshRunDoesNotSweepAnchors(t *testing.T) {
 // source DSN.
 func TestBackup_ResumeSweepsAnchorsOnce(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -118,7 +119,7 @@ func TestBackup_ResumeSweepsAnchorsOnce(t *testing.T) {
 // for.
 func TestBackup_ResumeSweepFailureDoesNotFailRun(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}

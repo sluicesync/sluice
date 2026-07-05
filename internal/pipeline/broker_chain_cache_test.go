@@ -11,6 +11,7 @@ import (
 	"time"
 
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // countingGetStore counts every Get the broker chain code issues.
@@ -41,7 +42,7 @@ func seedLinearLineage(t *testing.T, store irbackup.Store, n int) []*irbackup.Ma
 		manifests = append(manifests, m)
 		prev = m
 	}
-	seg := seedSegment(t, store, "", full, incrs, CodecGzip)
+	seg := seedSegment(t, store, "", full, incrs, blobcodec.CodecGzip)
 	cat := &LineageCatalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []LineageSegment{seg}}
 	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
 		t.Fatalf("writeLineageCatalog: %v", err)
@@ -118,7 +119,7 @@ func TestBrokerChainCache_AppendInvalidates(t *testing.T) {
 	next := makeManifest(t, irbackup.BackupKindIncremental, tail, "0/900")
 	const nextPath = "manifests/incr-0003.json"
 	mustWriteManifest(t, mem, nextPath, next)
-	if err := updateLineageForManifest(ctx, mem, next, nextPath, CodecGzip); err != nil {
+	if err := updateLineageForManifest(ctx, mem, next, nextPath, blobcodec.CodecGzip); err != nil {
 		t.Fatalf("updateLineageForManifest: %v", err)
 	}
 
@@ -178,7 +179,7 @@ func TestBrokerChainCache_RotationInvalidates(t *testing.T) {
 	mem := newMemStore()
 	f0 := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
 	i0 := makeManifest(t, irbackup.BackupKindIncremental, f0, "0/200")
-	s0 := seedSegment(t, mem, "", f0, []*irbackup.Manifest{i0}, CodecGzip)
+	s0 := seedSegment(t, mem, "", f0, []*irbackup.Manifest{i0}, blobcodec.CodecGzip)
 	cat := &LineageCatalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []LineageSegment{s0}}
 	if err := writeLineageCatalog(ctx, mem, cat); err != nil {
 		t.Fatal(err)
@@ -197,7 +198,7 @@ func TestBrokerChainCache_RotationInvalidates(t *testing.T) {
 	f1 := makeManifest(t, irbackup.BackupKindFull, nil, "0/300")
 	f1.StartPosition = i0.EndPosition
 	f1.BackupID = irbackup.ComputeBackupID(f1)
-	s1 := seedSegment(t, mem, "seg-1", f1, nil, CodecZstd)
+	s1 := seedSegment(t, mem, "seg-1", f1, nil, blobcodec.CodecZstd)
 	capt := time.Now().UTC()
 	s0.CappedAt, s0.CapReason = &capt, rotationReasonAge
 	cat.Segments = []LineageSegment{s0, s1}
@@ -226,12 +227,12 @@ func TestBrokerChainCache_PruneFloorAdvanceInvalidates(t *testing.T) {
 	mem := newMemStore()
 	f0 := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
 	i0 := makeManifest(t, irbackup.BackupKindIncremental, f0, "0/200")
-	s0 := seedSegment(t, mem, "", f0, []*irbackup.Manifest{i0}, CodecGzip)
+	s0 := seedSegment(t, mem, "", f0, []*irbackup.Manifest{i0}, blobcodec.CodecGzip)
 	f1 := makeManifest(t, irbackup.BackupKindFull, nil, "0/300")
 	f1.StartPosition = i0.EndPosition
 	f1.BackupID = irbackup.ComputeBackupID(f1)
 	i1 := makeManifest(t, irbackup.BackupKindIncremental, f1, "0/400")
-	s1 := seedSegment(t, mem, "seg-1", f1, []*irbackup.Manifest{i1}, CodecZstd)
+	s1 := seedSegment(t, mem, "seg-1", f1, []*irbackup.Manifest{i1}, blobcodec.CodecZstd)
 	capt := time.Now().UTC()
 	s0.CappedAt, s0.CapReason = &capt, rotationReasonAge
 	cat := &LineageCatalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []LineageSegment{s0, s1}}

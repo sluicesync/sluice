@@ -69,6 +69,7 @@ import (
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/translate"
 )
 
@@ -1128,12 +1129,12 @@ func (b *SyncFromBackup) streamIncrementalWithPosition(
 func (b *SyncFromBackup) streamOneChunkWithPosition(
 	ctx context.Context,
 	segStore irbackup.Store,
-	codec Codec,
+	codec blobcodec.Codec,
 	chunk *irbackup.ChunkInfo,
 	pos ir.Position,
 	out chan<- ir.Change,
 ) error {
-	src, err := fetchChunkVerified(ctx, segStore, chunk.File, chunk.SHA256)
+	src, err := blobcodec.FetchChunkVerified(ctx, segStore, chunk.File, chunk.SHA256)
 	if err != nil {
 		return fmt.Errorf("open chunk: %w", err)
 	}
@@ -1142,7 +1143,7 @@ func (b *SyncFromBackup) streamOneChunkWithPosition(
 		_ = src.Close()
 		return fmt.Errorf("resolve chunk cek: %w", err)
 	}
-	cr, err := newChangeChunkReader(src, chunk.SHA256, cek, codec)
+	cr, err := blobcodec.NewChangeChunkReader(src, chunk.SHA256, cek, codec)
 	if err != nil {
 		return fmt.Errorf("open chunk reader: %w", err)
 	}

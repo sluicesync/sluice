@@ -38,6 +38,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -48,7 +49,7 @@ import (
 // per-table checkpoint committed. Substring (not prefix) because chunk
 // paths are schema-qualified (`chunks/public__late_t/…`).
 type failOnPathMatchPutStore struct {
-	*LocalStore
+	*blobcodec.LocalStore
 
 	match  string
 	failed bool
@@ -183,7 +184,7 @@ func runAnchoredResumeChainGapFlow(t *testing.T, chainSlot bool) {
 	defer dropPGLogicalSlot(t, sourceDSN, "sluice_slot")
 
 	pgEng, _ := engines.Get("postgres")
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -306,7 +307,7 @@ func TestBackup_ResumeAnchorAdoption_KeylessRestreamRefused(t *testing.T) {
 	`)
 
 	pgEng, _ := engines.Get("postgres")
-	store, err := NewLocalStore(t.TempDir())
+	store, err := blobcodec.NewLocalStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}

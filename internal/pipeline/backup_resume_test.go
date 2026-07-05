@@ -14,20 +14,21 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
-// failOnNthPutStore wraps a [LocalStore] and returns ErrInjected on the
+// failOnNthPutStore wraps a [blobcodec.LocalStore] and returns ErrInjected on the
 // Nth Put call (1-indexed). Used to simulate a crash mid-backup so the
 // resume path is exercised.
 type failOnNthPutStore struct {
-	*LocalStore
+	*blobcodec.LocalStore
 
 	failOn  int
 	putN    int
 	failErr error
 }
 
-func newFailOnNthPutStore(inner *LocalStore, failOn int) *failOnNthPutStore {
+func newFailOnNthPutStore(inner *blobcodec.LocalStore, failOn int) *failOnNthPutStore {
 	return &failOnNthPutStore{
 		LocalStore: inner,
 		failOn:     failOn,
@@ -49,7 +50,7 @@ func (s *failOnNthPutStore) Put(ctx context.Context, path string, r io.Reader) e
 // streamed AND the first table's chunks aren't re-uploaded.
 func TestBackup_ResumeSkipsAlreadyCompletedTables(t *testing.T) {
 	dir := t.TempDir()
-	inner, err := NewLocalStore(dir)
+	inner, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -178,7 +179,7 @@ func TestBackup_ResumeSkipsAlreadyCompletedTables(t *testing.T) {
 
 // countingPutStore records how many Puts the orchestrator issued.
 type countingPutStore struct {
-	*LocalStore
+	*blobcodec.LocalStore
 
 	puts int
 }
@@ -193,7 +194,7 @@ func (s *countingPutStore) Put(ctx context.Context, path string, r io.Reader) er
 // operator passes ForceOverwrite.
 func TestBackup_RefusesOverwriteOfCompleteWithoutForce(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	schema := &ir.Schema{
 		Tables: []*ir.Table{
 			{Name: "t", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
@@ -242,7 +243,7 @@ func TestBackup_RefusesOverwriteOfCompleteWithoutForce(t *testing.T) {
 // test above covers the end-to-end shape.)
 func TestBackup_ChunkAlreadyMatchesHelper(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	want := []byte("a chunk's worth of bytes")
 	// Use the same hashing path the writer uses so the comparison is
@@ -250,7 +251,7 @@ func TestBackup_ChunkAlreadyMatchesHelper(t *testing.T) {
 	if err := store.Put(context.Background(), "chunks/x.bin", bytes.NewReader(want)); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	expected, err := hashChunkBytes(context.Background(), bytes.NewReader(want))
+	expected, err := blobcodec.HashChunkBytes(context.Background(), bytes.NewReader(want))
 	if err != nil {
 		t.Fatalf("hashChunkBytes: %v", err)
 	}
@@ -295,7 +296,7 @@ func TestBackup_ChunkAlreadyMatchesHelper(t *testing.T) {
 // 0 and 1 are NOT re-uploaded (Put count proves it) and chunk 2 is.
 func TestBackup_ResumeRestreamsPartialTableWithContentAddressedUploadSkip(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -434,7 +435,7 @@ func TestBackup_ResumeRestreamsPartialTableWithContentAddressedUploadSkip(t *tes
 // the per-chunk-skip test to verify already-uploaded chunks aren't
 // re-Put on resume.
 type countingPutPerPathStore struct {
-	*LocalStore
+	*blobcodec.LocalStore
 
 	putsTo map[string]int
 }
@@ -453,7 +454,7 @@ func (s *countingPutPerPathStore) Put(ctx context.Context, path string, r io.Rea
 // re-streams the table rather than blindly preserving the entry.
 func TestBackup_ResumeWithMissingPriorChunksReruns(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	schema := &ir.Schema{
 		Tables: []*ir.Table{
 			{Name: "t", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},

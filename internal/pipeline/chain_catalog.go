@@ -22,7 +22,7 @@ package pipeline
 // paths). That shape takes the same single-segment restore path as a
 // pre-ADR single chain — a strict generalization, not a heavier common
 // path. (The segment's codec is whatever --compression selected;
-// v0.67.0+ defaults to zstd, not gzip — see [DefaultCodec].)
+// v0.67.0+ defaults to zstd, not gzip — see [blobcodec.DefaultCodec].)
 //
 // lineage.json is an accelerator for segment-shape queries the same
 // way chain.json was for chain-shape queries, but it is ALSO the
@@ -51,6 +51,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // LineageCatalogFileName is the filename of the lineage catalog within
@@ -169,9 +170,9 @@ type LineageSegment struct {
 
 	// Codec is the compression codec every chunk in this segment was
 	// written with (ADR-0046 §5). Recorded here, NEVER inferred from
-	// the chunk bytes on restore. Empty resolves to [DefaultCodec]
+	// the chunk bytes on restore. Empty resolves to [blobcodec.DefaultCodec]
 	// (zstd, v0.67.0+); a v0.67.0+ backup always records it explicitly.
-	Codec Codec `json:"codec,omitempty"`
+	Codec blobcodec.Codec `json:"codec,omitempty"`
 
 	// VerbatimExtensionColumns is the ADR-0047 backup capability
 	// marker: the "schema.table.column" references in this segment's
@@ -195,8 +196,8 @@ func (s *LineageSegment) hasVerbatimExtensionColumns() bool {
 }
 
 // codecOrDefault returns the segment's recorded codec, resolving an
-// empty value to [DefaultCodec] (zstd).
-func (s *LineageSegment) codecOrDefault() Codec { return resolveCodec(s.Codec) }
+// empty value to [blobcodec.DefaultCodec] (zstd).
+func (s *LineageSegment) codecOrDefault() blobcodec.Codec { return blobcodec.ResolveCodec(s.Codec) }
 
 // incrementalCoverageStartOrStart returns the segment's earliest
 // incremental-coverage position (ADR-0067). When
@@ -292,7 +293,7 @@ type segmentRecord struct {
 // present it's authoritative. When UNREADABLE (parse/version/IO
 // error), [loadLineageCatalog] already surfaced a loud error. When
 // ABSENT, a single synthetic root segment (Dir == "", codec
-// [DefaultCodec]) is constructed over the conventional layout — the
+// [blobcodec.DefaultCodec]) is constructed over the conventional layout — the
 // pre-ADR single-chain shape, a one-segment lineage by strict
 // generalization — BUT only if the on-disk shape is genuinely
 // single-segment. If rotation-opened segment sub-dirs (`seg-*`) exist
@@ -340,7 +341,7 @@ func resolveLineage(ctx context.Context, store irbackup.Store) (*LineageCatalog,
 	root := &LineageSegment{
 		Dir:              "",
 		FullManifestPath: ManifestFileName,
-		Codec:            DefaultCodec,
+		Codec:            blobcodec.DefaultCodec,
 	}
 	exists, err := store.Exists(ctx, ManifestFileName)
 	if err != nil {
@@ -388,7 +389,7 @@ func listAllSegmentManifests(ctx context.Context, store irbackup.Store) ([]segme
 	var out []segmentRecord
 	for i := range cat.Segments {
 		seg := &cat.Segments[i]
-		if err := validateRecordedCodec(seg.Codec); err != nil {
+		if err := blobcodec.ValidateRecordedCodec(seg.Codec); err != nil {
 			return nil, err
 		}
 		ss := seg.store(store)
@@ -432,7 +433,7 @@ func updateLineageForManifestBestEffort(
 	store irbackup.Store,
 	manifest *irbackup.Manifest,
 	manifestPath string,
-	codec Codec,
+	codec blobcodec.Codec,
 ) {
 	if err := updateLineageForManifest(ctx, store, manifest, manifestPath, codec); err != nil {
 		slog.WarnContext(
@@ -448,7 +449,7 @@ func updateLineageForManifest(
 	store irbackup.Store,
 	manifest *irbackup.Manifest,
 	manifestPath string,
-	codec Codec,
+	codec blobcodec.Codec,
 ) error {
 	if manifest == nil {
 		return errors.New("lineage catalog: nil manifest")
@@ -470,7 +471,7 @@ func updateLineageForManifest(
 				SegmentID:        manifestBackupID(manifest),
 				Dir:              "",
 				FullManifestPath: ManifestFileName,
-				Codec:            resolveCodec(codec),
+				Codec:            blobcodec.ResolveCodec(codec),
 			}},
 		}
 	}
@@ -482,7 +483,7 @@ func updateLineageForManifest(
 		seg.StartPosition = manifest.EndPosition
 		seg.EndPosition = manifest.EndPosition
 		if seg.Codec == "" {
-			seg.Codec = resolveCodec(codec)
+			seg.Codec = blobcodec.ResolveCodec(codec)
 		}
 		// ADR-0047 backup capability marker. The full carries the
 		// authoritative schema; record the verbatim-typed columns so
@@ -546,23 +547,23 @@ func updateLineageForManifest(
 // incremental into a never-catalogued backup). When the lineage exists
 // the recorded codec wins (codec is recorded, never re-chosen
 // mid-segment — a segment is single-codec by construction).
-func openSegmentStore(ctx context.Context, store irbackup.Store, writeCodec Codec) (irbackup.Store, Codec, error) {
+func openSegmentStore(ctx context.Context, store irbackup.Store, writeCodec blobcodec.Codec) (irbackup.Store, blobcodec.Codec, error) {
 	cat, ok, err := loadLineageCatalog(ctx, store)
 	if err != nil {
 		return nil, "", err
 	}
 	if !ok {
-		return store, resolveCodec(writeCodec), nil
+		return store, blobcodec.ResolveCodec(writeCodec), nil
 	}
 	seg := &cat.Segments[len(cat.Segments)-1]
-	if err := validateRecordedCodec(seg.Codec); err != nil {
+	if err := blobcodec.ValidateRecordedCodec(seg.Codec); err != nil {
 		return nil, "", err
 	}
 	c := seg.Codec
 	if c == "" {
-		c = resolveCodec(writeCodec)
+		c = blobcodec.ResolveCodec(writeCodec)
 	}
-	return seg.store(store), resolveCodec(c), nil
+	return seg.store(store), blobcodec.ResolveCodec(c), nil
 }
 
 // canonicalKind normalises empty Kind to BackupKindFull. Mirror of
@@ -595,7 +596,7 @@ func RebuildLineageCatalogAt(ctx context.Context, store irbackup.Store) (segment
 	root := LineageSegment{
 		Dir:              "",
 		FullManifestPath: ManifestFileName,
-		Codec:            DefaultCodec,
+		Codec:            blobcodec.DefaultCodec,
 	}
 	for _, r := range recs {
 		switch canonicalKind(r.manifest.Kind) {

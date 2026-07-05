@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -59,7 +60,7 @@ func TestADR0064_SmartCompaction_CollapsesUpdateChain_PG(t *testing.T) {
 
 	eng, _ := engines.Get("postgres")
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 	full := rotationSeedFull(t, store, eng, sourceDSN, slotLSN)
 
 	// Produce an update-heavy workload: 100 accounts, each updated 10

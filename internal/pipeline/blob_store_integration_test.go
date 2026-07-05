@@ -5,7 +5,7 @@
 
 // Phase-2 cloud-backend integration tests. Spins up a MinIO container
 // (S3-compatible), creates a bucket, and roundtrips Put/Get/Exists/
-// Delete/List against [BlobStore] over the S3 path. Also runs a full
+// Delete/List against [blobcodec.BlobStore] over the S3 path. Also runs a full
 // PG-source backup → cross-engine MySQL restore through the blob
 // store, validating the cross-engine + cloud combination called out
 // as a Phase-2 done criterion.
@@ -30,6 +30,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 
 	// Both engines registered for the cross-engine test.
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
@@ -140,13 +141,13 @@ func createMinIOBucket(ctx context.Context, endpoint, name string) error {
 // test MinIO endpoint and pre-populates the AWS env vars the SDK
 // resolves for credentials. Returns the store + a cleanup that
 // restores any prior env values.
-func minioBlobStore(t *testing.T, endpoint, bucket, prefix string) (*BlobStore, func()) {
+func minioBlobStore(t *testing.T, endpoint, bucket, prefix string) (*blobcodec.BlobStore, func()) {
 	t.Helper()
 	t.Setenv("AWS_ACCESS_KEY_ID", minioAccessKey)
 	t.Setenv("AWS_SECRET_ACCESS_KEY", minioSecretKey)
 	t.Setenv("AWS_REGION", minioRegion)
 	url := fmt.Sprintf("s3://%s/%s", bucket, strings.TrimPrefix(prefix, "/"))
-	store, err := OpenBlobStore(context.Background(), url, BlobStoreOptions{
+	store, err := blobcodec.OpenBlobStore(context.Background(), url, blobcodec.BlobStoreOptions{
 		Endpoint:  endpoint,
 		Region:    minioRegion,
 		PathStyle: true,
@@ -460,12 +461,12 @@ func TestBlobStore_MinIO_ResumableBackup(t *testing.T) {
 	}
 }
 
-// failOnNthPutBlob wraps a [BlobStore] so the Nth Put returns an
+// failOnNthPutBlob wraps a [blobcodec.BlobStore] so the Nth Put returns an
 // injected failure, simulating a mid-backup crash for the resumable-
 // writer test. Identical shape to the unit-test version but wraps the
 // blob-backed store.
 type failOnNthPutBlob struct {
-	*BlobStore
+	*blobcodec.BlobStore
 
 	failOn int
 	putN   int
@@ -477,4 +478,19 @@ func (s *failOnNthPutBlob) Put(ctx context.Context, path string, r io.Reader) er
 		return fmt.Errorf("injected failure on Put #%d", s.putN)
 	}
 	return s.BlobStore.Put(ctx, path, r)
+}
+
+// equalStrSlices reports whether two string slices are element-equal.
+// Local copy of the identically-named helper in internal/pipeline/blobcodec
+// (private test helpers don't cross package boundaries).
+func equalStrSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

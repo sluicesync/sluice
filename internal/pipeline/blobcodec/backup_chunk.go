@@ -1,7 +1,14 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package pipeline
+// Package blobcodec is the wire-format + storage leaf of the logical-backup
+// stack: the on-disk chunk codec (row chunks and change-event chunks — gzip/
+// zstd-compressed JSON Lines with per-chunk SHA-256 verification and optional
+// encryption), the per-segment compression [Codec], and the [irbackup.Store]
+// backends ([LocalStore] and the cloud [BlobStore]). It depends only on the
+// IR backup contract and knows nothing about orchestration; the backup /
+// restore / broker / chain code in the parent pipeline package consumes it.
+package blobcodec
 
 // Chunk-file format for Phase 1 logical backups.
 //
@@ -80,7 +87,7 @@ type chunkHeader struct {
 	Columns []string `json:"columns"`
 }
 
-// chunkWriter streams JSON-Lines rows to a gzip-compressed [io.Writer]
+// ChunkWriter streams JSON-Lines rows to a gzip-compressed [io.Writer]
 // while computing a SHA-256 over the bytes that land on disk (so
 // restore-time verification matches what's actually on disk / in
 // object storage).
@@ -97,11 +104,11 @@ type chunkHeader struct {
 //     manifest's recorded SHA-256 covers ciphertext bytes — `backup
 //     verify` (sha256-only) doesn't need decryption.
 //
-// Lifecycle: newChunkWriter → WriteRow* → Close. Close MUST be called
+// Lifecycle: NewChunkWriter → WriteRow* → Close. Close MUST be called
 // (it flushes the gzip buffer and, in encrypted mode, performs the
 // encryption + write). Hash() returns the final hex SHA-256 only
 // after Close.
-type chunkWriter struct {
+type ChunkWriter struct {
 	out      io.Writer
 	hasher   hash.Hash
 	gzWriter codecWriteCloser
@@ -110,7 +117,7 @@ type chunkWriter struct {
 	closed   bool
 
 	// cek, when non-nil, enables encrypted mode. It's the Content
-	// Encryption Key handed in by the orchestrator; chunkWriter is
+	// Encryption Key handed in by the orchestrator; ChunkWriter is
 	// not responsible for generating or wrapping it.
 	cek []byte
 
@@ -130,14 +137,14 @@ type chunkWriter struct {
 	colsLen     int
 }
 
-// newChunkWriter wraps out (the destination — typically a pipe to
+// NewChunkWriter wraps out (the destination — typically a pipe to
 // [irbackup.Store.Put]) with gzip + JSON-Lines machinery and writes
 // the format header. Caller must call Close to flush.
 //
 // When cek is non-nil, encryption is applied at Close time (see
-// [chunkWriter] for the two modes). cek must be exactly
+// [ChunkWriter] for the two modes). cek must be exactly
 // [crypto.CEKLen] bytes.
-func newChunkWriter(out io.Writer, columns []string, cek []byte, codec Codec) (*chunkWriter, error) {
+func NewChunkWriter(out io.Writer, columns []string, cek []byte, codec Codec) (*ChunkWriter, error) {
 	if cek != nil && len(cek) != crypto.CEKLen {
 		return nil, fmt.Errorf("chunk writer: cek length %d != %d", len(cek), crypto.CEKLen)
 	}
@@ -173,7 +180,7 @@ func newChunkWriter(out io.Writer, columns []string, cek []byte, codec Codec) (*
 	if err := bw.WriteByte('\n'); err != nil {
 		return nil, fmt.Errorf("chunk header newline: %w", err)
 	}
-	return &chunkWriter{
+	return &ChunkWriter{
 		out:      out,
 		hasher:   hasher,
 		gzWriter: gz,
@@ -190,7 +197,7 @@ func newChunkWriter(out io.Writer, columns []string, cek []byte, codec Codec) (*
 // byte-identical output); values the fast path doesn't model — alien
 // Go types, non-finite floats — fall back to the legacy reflection
 // marshal below, which owns both their bytes and their errors.
-func (w *chunkWriter) WriteRow(row ir.Row, columns []*ir.Column) error {
+func (w *ChunkWriter) WriteRow(row ir.Row, columns []*ir.Column) error {
 	if w.closed {
 		return errors.New("chunk writer closed")
 	}
@@ -214,7 +221,7 @@ func (w *chunkWriter) WriteRow(row ir.Row, columns []*ir.Column) error {
 // semantic + error oracle for the fast path, and the fallback for
 // shapes the fast path bails on. The differential tests in
 // backup_chunk_fast_test.go pin the two paths byte-identical.
-func (w *chunkWriter) writeRowLegacy(row ir.Row, columns []*ir.Column) error {
+func (w *ChunkWriter) writeRowLegacy(row ir.Row, columns []*ir.Column) error {
 	enc := make(map[string]any, len(columns))
 	for _, c := range columns {
 		v, ok := row[c.Name]
@@ -241,7 +248,7 @@ func (w *chunkWriter) writeRowLegacy(row ir.Row, columns []*ir.Column) error {
 // columnNamesSorted returns columns' names in stdlib map-key order,
 // cached against the slice's identity (the production caller passes
 // the same slice every row of a table).
-func (w *chunkWriter) columnNamesSorted(columns []*ir.Column) []string {
+func (w *ChunkWriter) columnNamesSorted(columns []*ir.Column) []string {
 	if len(columns) == 0 {
 		if w.sortedNames == nil {
 			w.sortedNames = []string{}
@@ -261,7 +268,7 @@ func (w *chunkWriter) columnNamesSorted(columns []*ir.Column) []string {
 // twice; the second call is a no-op. Returns the SHA-256 hex digest
 // of the chunk's bytes (post-encryption when in encrypted mode) after
 // Close completes.
-func (w *chunkWriter) Close() error {
+func (w *ChunkWriter) Close() error {
 	if w.closed {
 		return nil
 	}
@@ -293,23 +300,23 @@ func (w *chunkWriter) Close() error {
 
 // Hash returns the hex-encoded SHA-256 of the gzipped chunk bytes.
 // Only valid after Close.
-func (w *chunkWriter) Hash() string {
+func (w *ChunkWriter) Hash() string {
 	return fmt.Sprintf("%x", w.hasher.Sum(nil))
 }
 
 // RowCount returns the number of rows written so far.
-func (w *chunkWriter) RowCount() int64 { return w.rowCount }
+func (w *ChunkWriter) RowCount() int64 { return w.rowCount }
 
-// chunkReader is the inverse of [chunkWriter]: streams rows from a
+// ChunkReader is the inverse of [ChunkWriter]: streams rows from a
 // gzip-compressed JSON Lines stream while computing a SHA-256 to
 // compare against the manifest entry. Returns ErrChunkHashMismatch
 // at EOF if the recomputed hash doesn't match the expected value.
 //
 // When the chunk is encrypted, the entire ciphertext is read + hashed
-// + decrypted up front in [newChunkReader]; the rest of the read path
+// + decrypted up front in [NewChunkReader]; the rest of the read path
 // then feeds plaintext bytes through the gzip reader as if the chunk
 // were never encrypted.
-type chunkReader struct {
+type ChunkReader struct {
 	src      io.ReadCloser
 	hasher   hash.Hash
 	gzReader codecReadCloser
@@ -317,7 +324,7 @@ type chunkReader struct {
 	expected string
 	header   chunkHeader
 
-	// encrypted reports whether [newChunkReader] consumed src
+	// encrypted reports whether [NewChunkReader] consumed src
 	// up-front and is feeding the gzip reader from an in-memory
 	// plaintext buffer.
 	encrypted bool
@@ -338,7 +345,7 @@ type chunkReader struct {
 // failure tenet — backup integrity is the load-bearing claim).
 var ErrChunkHashMismatch = errors.New("backup: chunk SHA-256 mismatch")
 
-// newChunkReader wraps src with the inverse machinery of [chunkWriter].
+// NewChunkReader wraps src with the inverse machinery of [ChunkWriter].
 // expectedSHA256 is the hex digest from the manifest; on Close the
 // reader compares the recomputed hash and returns
 // [ErrChunkHashMismatch] if they differ.
@@ -353,9 +360,9 @@ var ErrChunkHashMismatch = errors.New("backup: chunk SHA-256 mismatch")
 // codec is the codec RECORDED for this chunk's segment in
 // lineage.json — never inferred from the bytes. The caller threads it
 // through from segment metadata; an unknown recorded codec is rejected
-// loudly by [validateRecordedCodec] before this is reached.
-func newChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte, codec Codec) (*chunkReader, error) {
-	// Ownership guard: until the chunkReader is successfully built (and
+// loudly by [ValidateRecordedCodec] before this is reached.
+func NewChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte, codec Codec) (*ChunkReader, error) {
+	// Ownership guard: until the ChunkReader is successfully built (and
 	// thereafter owns Close of both the codec reader and src), EVERY
 	// early-return error path must release the underlying store handle
 	// and any constructed codec reader. Without this a corrupt / bad-
@@ -428,7 +435,7 @@ func newChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte, codec 
 		return nil, fmt.Errorf("chunk reader: unsupported chunk format version %d (this build supports %d)",
 			hdr.Version, chunkHeaderVersion)
 	}
-	r := &chunkReader{
+	r := &ChunkReader{
 		src:         src,
 		hasher:      hasher,
 		gzReader:    gz,
@@ -443,7 +450,7 @@ func newChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte, codec 
 }
 
 // Header returns the chunk's header (column list + format version).
-func (r *chunkReader) Header() chunkHeader { return r.header }
+func (r *ChunkReader) Header() chunkHeader { return r.header }
 
 // ReadRow returns the next row from the chunk, or (nil, io.EOF) at
 // end-of-stream. The caller should drain to EOF and then call Close
@@ -453,7 +460,7 @@ func (r *chunkReader) Header() chunkHeader { return r.header }
 // lines it doesn't model — alien envelope shapes, grammar violations
 // — fall back to the legacy double-unmarshal below, which owns both
 // their semantics and their errors.
-func (r *chunkReader) ReadRow() (ir.Row, error) {
+func (r *ChunkReader) ReadRow() (ir.Row, error) {
 	if !r.scanner.Scan() {
 		if err := r.scanner.Err(); err != nil {
 			return nil, fmt.Errorf("chunk reader: scan: %w", err)
@@ -490,7 +497,7 @@ func readRowLegacy(line []byte) (ir.Row, error) {
 // Close finishes reading the underlying stream so the SHA-256 covers
 // every byte, then compares against the expected hash from the
 // manifest. Returns [ErrChunkHashMismatch] on mismatch.
-func (r *chunkReader) Close() error {
+func (r *ChunkReader) Close() error {
 	// Drain any unread bytes so the hasher sees the full stream.
 	// (Most callers will have read to EOF already; this is defensive
 	// for early-exit paths.)
@@ -507,7 +514,7 @@ func (r *chunkReader) Close() error {
 		// Drain the underlying source through the tee so the hasher
 		// sees any trailing bytes the gzip stream didn't consume.
 		// Encrypted chunks have already had src fully consumed inside
-		// newChunkReader; skip to avoid reading nothing twice.
+		// NewChunkReader; skip to avoid reading nothing twice.
 		if _, err := io.Copy(io.Discard, r.src); err != nil {
 			_ = r.src.Close()
 			return fmt.Errorf("chunk reader: drain underlying: %w", err)
@@ -524,24 +531,24 @@ func (r *chunkReader) Close() error {
 }
 
 // chunkFetchMaxAttempts is the bounded number of times
-// [fetchChunkVerified] re-fetches a content chunk whose object-store read
+// [FetchChunkVerified] re-fetches a content chunk whose object-store read
 // came back transiently short / failed. Four attempts (1 + 3 retries) with
 // the backoff below covers the flaky-S3-body case the live Track-C restore
 // hit; a genuinely corrupt-at-rest chunk still surfaces loudly after the
 // attempts are exhausted (re-fetching identical bad bytes can't fix it).
 const chunkFetchMaxAttempts = 4
 
-// chunkFetchBackoff is the inter-attempt delay for [fetchChunkVerified]:
+// chunkFetchBackoff is the inter-attempt delay for [FetchChunkVerified]:
 // 200ms, 400ms, 800ms. Short because a truncated read is a transport blip,
 // not a reparent — the next GET almost always returns the full object.
 func chunkFetchBackoff(attempt int) time.Duration {
 	return time.Duration(200*(1<<(attempt-1))) * time.Millisecond
 }
 
-// fetchChunkVerified reads the entire content chunk at `file` into memory,
+// FetchChunkVerified reads the entire content chunk at `file` into memory,
 // retrying on a transient object-store read failure, and returns a
-// bytes-backed reader the caller hands to [newChunkReader] /
-// [newChangeChunkReader] unchanged.
+// bytes-backed reader the caller hands to [NewChunkReader] /
+// [NewChangeChunkReader] unchanged.
 //
 // Why this exists: a streaming chunk read straight into the restore's COPY
 // emits rows as it decodes, so a truncated / short object-store GET (a
@@ -564,7 +571,7 @@ func chunkFetchBackoff(attempt int) time.Duration {
 // reader re-verifies the SHA on Close (a cheap in-memory double-check).
 // A persistent mismatch — genuine at-rest corruption — surfaces loudly as
 // [ErrChunkHashMismatch] once the attempts are exhausted.
-func fetchChunkVerified(ctx context.Context, store irbackup.Store, file, expectedSHA256 string) (io.ReadCloser, error) {
+func FetchChunkVerified(ctx context.Context, store irbackup.Store, file, expectedSHA256 string) (io.ReadCloser, error) {
 	var lastErr error
 	for attempt := 1; attempt <= chunkFetchMaxAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -601,7 +608,7 @@ func fetchChunkVerified(ctx context.Context, store irbackup.Store, file, expecte
 // readChunkBytesAndHash GETs file from store, reads the whole body into a
 // buffer, and returns the bytes plus their SHA-256 hex digest. The
 // TeeReader hashes during the single read pass so a short body is detected
-// by [fetchChunkVerified]'s digest comparison rather than slipping into the
+// by [FetchChunkVerified]'s digest comparison rather than slipping into the
 // decoder. Closes the store handle before returning.
 func readChunkBytesAndHash(ctx context.Context, store irbackup.Store, file string) (data []byte, sha string, err error) {
 	src, err := store.Get(ctx, file)
@@ -617,10 +624,10 @@ func readChunkBytesAndHash(ctx context.Context, store irbackup.Store, file strin
 	return buf, fmt.Sprintf("%x", h.Sum(nil)), nil
 }
 
-// hashChunkBytes streams r through a SHA-256 hasher and returns the
+// HashChunkBytes streams r through a SHA-256 hasher and returns the
 // hex digest. Used by `sluice backup verify` to recompute a chunk's
 // hash without decoding rows.
-func hashChunkBytes(ctx context.Context, r io.Reader) (string, error) {
+func HashChunkBytes(ctx context.Context, r io.Reader) (string, error) {
 	h := sha256.New()
 	buf := make([]byte, 64*1024)
 	for {

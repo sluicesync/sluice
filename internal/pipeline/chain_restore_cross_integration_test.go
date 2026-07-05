@@ -31,6 +31,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
@@ -62,7 +63,7 @@ func TestChainRestore_PostgresToMySQL_CrossEngine(t *testing.T) {
 	mysqlEng, _ := engines.Get("mysql")
 
 	dir := t.TempDir()
-	store, err := NewLocalStore(dir)
+	store, err := blobcodec.NewLocalStore(dir)
 	if err != nil {
 		t.Fatalf("NewLocalStore: %v", err)
 	}
@@ -172,7 +173,7 @@ func TestChainRestore_MySQLToPostgres_CrossEngine(t *testing.T) {
 	pgEng, _ := engines.Get("postgres")
 
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	// 1. Full backup.
 	if err := (&Backup{
@@ -273,7 +274,7 @@ func TestSyncFromBackup_CrossEngine_SchemaEvolution(t *testing.T) {
 	mysqlEng, _ := engines.Get("mysql")
 
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
+	store, _ := blobcodec.NewLocalStore(dir)
 
 	applyDDL(t, pgSourceDSN, `CREATE PUBLICATION sluice_pub FOR ALL TABLES`)
 	slotLSN, err := createPGLogicalSlotReturningLSN(t, pgSourceDSN, "sluice_slot")

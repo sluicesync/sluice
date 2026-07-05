@@ -13,6 +13,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // TestCompactChain_SmartCompaction_CollapsesAcrossGroup pins the
@@ -305,7 +306,7 @@ func seedSmartCompactLineageWithSchemaAndEnc(
 			// compact has bytes to decode.
 			chunkPath := fmt.Sprintf("chunks/_changes/seg%d-incr%d.jsonl.gz", i, j)
 			buf := &bytes.Buffer{}
-			cw, err := newChangeChunkWriter(buf, nil, CodecGzip)
+			cw, err := blobcodec.NewChangeChunkWriter(buf, nil, blobcodec.CodecGzip)
 			if err != nil {
 				t.Fatalf("chunk writer: %v", err)
 			}
@@ -350,7 +351,7 @@ func seedSmartCompactLineageWithSchemaAndEnc(
 			Incrementals:     incrPaths,
 			StartPosition:    pos(startLSN),
 			EndPosition:      pos(curLSN),
-			Codec:            CodecGzip,
+			Codec:            blobcodec.CodecGzip,
 		}
 		if i < segmentCount-1 {
 			cappedAt := segCreatedAt.Add(30 * time.Minute)

@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package pipeline
+package blobcodec
 
 import (
 	"bytes"
@@ -60,9 +60,9 @@ func TestChangeChunk_RoundTrip(t *testing.T) {
 
 	// Encode.
 	buf := &bytes.Buffer{}
-	w, err := newChangeChunkWriter(buf, nil, CodecGzip)
+	w, err := NewChangeChunkWriter(buf, nil, CodecGzip)
 	if err != nil {
-		t.Fatalf("newChangeChunkWriter: %v", err)
+		t.Fatalf("NewChangeChunkWriter: %v", err)
 	}
 	for _, c := range in {
 		if err := w.WriteChange(c); err != nil {
@@ -81,9 +81,9 @@ func TestChangeChunk_RoundTrip(t *testing.T) {
 	}
 
 	// Decode and compare.
-	r, err := newChangeChunkReader(nopReadCloserFromBytes(buf.Bytes()), hash, nil, CodecGzip)
+	r, err := NewChangeChunkReader(nopReadCloserFromBytes(buf.Bytes()), hash, nil, CodecGzip)
 	if err != nil {
-		t.Fatalf("newChangeChunkReader: %v", err)
+		t.Fatalf("NewChangeChunkReader: %v", err)
 	}
 	var got []ir.Change
 	for {
@@ -196,9 +196,9 @@ func TestChangeChunk_Int64Precision_Bug172(t *testing.T) {
 	}
 
 	buf := &bytes.Buffer{}
-	w, err := newChangeChunkWriter(buf, nil, CodecGzip)
+	w, err := NewChangeChunkWriter(buf, nil, CodecGzip)
 	if err != nil {
-		t.Fatalf("newChangeChunkWriter: %v", err)
+		t.Fatalf("NewChangeChunkWriter: %v", err)
 	}
 	for _, c := range in {
 		if err := w.WriteChange(c); err != nil {
@@ -209,9 +209,9 @@ func TestChangeChunk_Int64Precision_Bug172(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	r, err := newChangeChunkReader(nopReadCloserFromBytes(buf.Bytes()), w.Hash(), nil, CodecGzip)
+	r, err := NewChangeChunkReader(nopReadCloserFromBytes(buf.Bytes()), w.Hash(), nil, CodecGzip)
 	if err != nil {
-		t.Fatalf("newChangeChunkReader: %v", err)
+		t.Fatalf("NewChangeChunkReader: %v", err)
 	}
 	var got []ir.Change
 	for {
@@ -280,7 +280,7 @@ func TestChangeChunk_Int64Precision_Bug172(t *testing.T) {
 // ErrChunkHashMismatch on Close.
 func TestChangeChunk_HashMismatch(t *testing.T) {
 	buf := &bytes.Buffer{}
-	w, _ := newChangeChunkWriter(buf, nil, CodecGzip)
+	w, _ := NewChangeChunkWriter(buf, nil, CodecGzip)
 	_ = w.WriteChange(ir.Insert{
 		Position: ir.Position{Engine: "postgres", Token: `{"slot":"x","lsn":"0/1"}`},
 		Schema:   "public",
@@ -290,9 +290,9 @@ func TestChangeChunk_HashMismatch(t *testing.T) {
 	_ = w.Close()
 
 	bogusHash := "00000000000000000000000000000000000000000000000000000000deadbeef"
-	r, err := newChangeChunkReader(nopReadCloserFromBytes(buf.Bytes()), bogusHash, nil, CodecGzip)
+	r, err := NewChangeChunkReader(nopReadCloserFromBytes(buf.Bytes()), bogusHash, nil, CodecGzip)
 	if err != nil {
-		t.Fatalf("newChangeChunkReader: %v", err)
+		t.Fatalf("NewChangeChunkReader: %v", err)
 	}
 	for {
 		_, err := r.ReadChange()
@@ -350,9 +350,9 @@ func rowsEquivalent(a, b ir.Row) bool {
 // invariant flips to "collected for the manifest envelope".
 func TestChangeChunk_SchemaSnapshot_CollectedNotEncoded(t *testing.T) {
 	buf := &bytes.Buffer{}
-	w, err := newChangeChunkWriter(buf, nil, CodecGzip)
+	w, err := NewChangeChunkWriter(buf, nil, CodecGzip)
 	if err != nil {
-		t.Fatalf("newChangeChunkWriter: %v", err)
+		t.Fatalf("NewChangeChunkWriter: %v", err)
 	}
 	snap := ir.SchemaSnapshot{
 		Position: ir.Position{Engine: "mysql", Token: "gtid:1-9"},
@@ -412,9 +412,9 @@ func TestChangeChunk_NonFiniteFloats(t *testing.T) {
 	}
 
 	buf := &bytes.Buffer{}
-	w, err := newChangeChunkWriter(buf, nil, CodecGzip)
+	w, err := NewChangeChunkWriter(buf, nil, CodecGzip)
 	if err != nil {
-		t.Fatalf("newChangeChunkWriter: %v", err)
+		t.Fatalf("NewChangeChunkWriter: %v", err)
 	}
 	if err := w.WriteChange(in); err != nil {
 		t.Fatalf("WriteChange refused the non-finite row (the Bug-138 shape on the CDC path): %v", err)
@@ -423,9 +423,9 @@ func TestChangeChunk_NonFiniteFloats(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	r, err := newChangeChunkReader(nopReadCloserFromBytes(buf.Bytes()), w.Hash(), nil, CodecGzip)
+	r, err := NewChangeChunkReader(nopReadCloserFromBytes(buf.Bytes()), w.Hash(), nil, CodecGzip)
 	if err != nil {
-		t.Fatalf("newChangeChunkReader: %v", err)
+		t.Fatalf("NewChangeChunkReader: %v", err)
 	}
 	c, err := r.ReadChange()
 	if err != nil {

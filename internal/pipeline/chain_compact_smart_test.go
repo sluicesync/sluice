@@ -14,6 +14,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // ADR-0064 §14e smart-compaction unit pin matrix.
@@ -608,7 +609,7 @@ func TestSmart_ChunkRewrite_RoundTrip(t *testing.T) {
 	// Build a chunk with 1000 INSERTs + 1000 UPDATEs on 100 rows
 	// → expected reduction from 2000 → 100 events.
 	buf := &bytes.Buffer{}
-	cw, err := newChangeChunkWriter(buf, nil, CodecGzip)
+	cw, err := blobcodec.NewChangeChunkWriter(buf, nil, blobcodec.CodecGzip)
 	if err != nil {
 		t.Fatalf("writer: %v", err)
 	}
@@ -665,7 +666,7 @@ func TestSmart_ChunkRewrite_RoundTrip(t *testing.T) {
 	}
 
 	res, err := applySmartCompactionToIncremental(
-		context.Background(), store, im, CodecGzip, nil, PKStrategyPK,
+		context.Background(), store, im, blobcodec.CodecGzip, nil, PKStrategyPK,
 	)
 	if err != nil {
 		t.Fatalf("applySmartCompactionToIncremental: %v", err)
@@ -697,7 +698,7 @@ func TestSmart_ChunkRewrite_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get chunk: %v", err)
 	}
-	cr, err := newChangeChunkReader(rc, "", nil, CodecGzip)
+	cr, err := blobcodec.NewChangeChunkReader(rc, "", nil, blobcodec.CodecGzip)
 	if err != nil {
 		t.Fatalf("reader: %v", err)
 	}
@@ -778,7 +779,7 @@ func TestSmart_ChunkRewrite_ClosesSourceHandles(t *testing.T) {
 	var lsn uint64 = 100
 	for _, p := range paths {
 		buf := &bytes.Buffer{}
-		cw, err := newChangeChunkWriter(buf, nil, CodecGzip)
+		cw, err := blobcodec.NewChangeChunkWriter(buf, nil, blobcodec.CodecGzip)
 		if err != nil {
 			t.Fatalf("writer: %v", err)
 		}
@@ -812,7 +813,7 @@ func TestSmart_ChunkRewrite_ClosesSourceHandles(t *testing.T) {
 		ChangeChunks:  chunks,
 	}
 	if _, err := applySmartCompactionToIncremental(
-		context.Background(), store, im, CodecGzip, nil, PKStrategyPK,
+		context.Background(), store, im, blobcodec.CodecGzip, nil, PKStrategyPK,
 	); err != nil {
 		t.Fatalf("applySmartCompactionToIncremental: %v", err)
 	}

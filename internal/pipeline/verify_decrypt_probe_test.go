@@ -12,6 +12,7 @@ import (
 	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 )
 
 // TestVerifyBackupWith_DecryptProbe_Bug117 pins the Bug 117 (v0.94.1)
@@ -58,7 +59,7 @@ func TestVerifyBackupWith_DecryptProbe_Bug117(t *testing.T) {
 	runBackup := func(t *testing.T, mode string, env crypto.EnvelopeEncryption) irbackup.Store {
 		t.Helper()
 		dir := t.TempDir()
-		store, err := NewLocalStore(dir)
+		store, err := blobcodec.NewLocalStore(dir)
 		if err != nil {
 			t.Fatalf("NewLocalStore: %v", err)
 		}
