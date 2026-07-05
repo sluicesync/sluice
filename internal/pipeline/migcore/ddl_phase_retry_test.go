@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package pipeline
+package migcore
 
 import (
 	"context"
@@ -47,7 +47,7 @@ func TestRunDDLPhaseWithReparentRetry_RetriesTransientThenSucceeds(t *testing.T)
 		}
 		return nil
 	}
-	if err := runDDLPhaseWithReparentRetry(context.Background(), "indexes", cl, do); err != nil {
+	if err := RunDDLPhaseWithReparentRetry(context.Background(), "indexes", cl, do); err != nil {
 		t.Fatalf("expected success after transient retries, got %v", err)
 	}
 	if calls != 4 {
@@ -65,7 +65,7 @@ func TestRunDDLPhaseWithReparentRetry_TerminalErrorReturnsImmediately(t *testing
 	calls := 0
 	do := func(context.Context) error { calls++; return fault }
 
-	err := runDDLPhaseWithReparentRetry(context.Background(), "constraints", cl, do)
+	err := RunDDLPhaseWithReparentRetry(context.Background(), "constraints", cl, do)
 	if !errors.Is(err, fault) {
 		t.Fatalf("expected the terminal fault unchanged, got %v", err)
 	}
@@ -82,7 +82,7 @@ func TestRunDDLPhaseWithReparentRetry_NoClassifierSingleAttempt(t *testing.T) {
 	calls := 0
 	do := func(context.Context) error { calls++; return fault }
 
-	err := runDDLPhaseWithReparentRetry(context.Background(), "indexes", nil, do)
+	err := RunDDLPhaseWithReparentRetry(context.Background(), "indexes", nil, do)
 	if !errors.Is(err, fault) {
 		t.Fatalf("expected the fault unchanged, got %v", err)
 	}
@@ -102,7 +102,7 @@ func TestRunDDLPhaseWithReparentRetry_ExhaustionIsLoudAndWraps(t *testing.T) {
 	calls := 0
 	do := func(context.Context) error { calls++; return transient }
 
-	err := runDDLPhaseWithReparentRetry(context.Background(), "indexes", cl, do)
+	err := RunDDLPhaseWithReparentRetry(context.Background(), "indexes", cl, do)
 	if err == nil {
 		t.Fatal("expected a loud terminal error on exhaustion, got nil")
 	}
@@ -127,7 +127,7 @@ func TestRunDDLPhaseWithReparentRetry_CtxCancelUnwinds(t *testing.T) {
 		}
 		return transient
 	}
-	err := runDDLPhaseWithReparentRetry(ctx, "indexes", cl, do)
+	err := RunDDLPhaseWithReparentRetry(ctx, "indexes", cl, do)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled on cancel during backoff, got %v", err)
 	}
@@ -142,7 +142,7 @@ func TestRunDDLPhaseWithReparentRetry_SuccessFirstTryNoClassifierCall(t *testing
 	calls := 0
 	do := func(context.Context) error { calls++; return nil }
 
-	if err := runDDLPhaseWithReparentRetry(context.Background(), "views", cl, do); err != nil {
+	if err := RunDDLPhaseWithReparentRetry(context.Background(), "views", cl, do); err != nil {
 		t.Fatalf("expected success, got %v", err)
 	}
 	if calls != 1 {

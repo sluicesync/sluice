@@ -434,7 +434,7 @@ func (r *ChainRestore) syncIdentitySequencesAtTail(ctx context.Context, links []
 	defer migcore.CloseIf(sw)
 	migcore.ApplyTargetSchema(sw, r.TargetSchema)
 	syncSchema := &ir.Schema{Tables: tables}
-	if err := runDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
+	if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
 		return sw.SyncIdentitySequences(ctx, syncSchema)
 	}); err != nil {
 		return err

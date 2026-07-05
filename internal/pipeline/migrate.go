@@ -1015,12 +1015,12 @@ func runBulkCopyWithOpts(
 	if !opts.SkipSchemaApply {
 		// ADR-0114: each post-copy DDL phase rides a storage-grow/reparent
 		// instead of aborting the whole migration after a correct data copy.
-		if err := runDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
+		if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
 			return sw.SyncIdentitySequences(ctx, schema)
 		}); err != nil {
 			return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: sync identity sequences: %w", err))
 		}
-		if err := runDDLPhaseWithReparentRetry(ctx, "indexes", sw, func(ctx context.Context) error {
+		if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "indexes", sw, func(ctx context.Context) error {
 			return sw.CreateIndexes(ctx, schema)
 		}); err != nil {
 			return migcore.WrapWithHint(migcore.PhaseIndexes, fmt.Errorf("pipeline: create indexes: %w", err))
@@ -1031,13 +1031,13 @@ func runBulkCopyWithOpts(
 		// by the loop below short-circuiting them in the same block.
 		return nil
 	}
-	if err := runDDLPhaseWithReparentRetry(ctx, "constraints", sw, func(ctx context.Context) error {
+	if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "constraints", sw, func(ctx context.Context) error {
 		return sw.CreateConstraints(ctx, schema)
 	}); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConstraints, fmt.Errorf("pipeline: create constraints: %w", err))
 	}
 	reportDegradedFKs(ctx, sw)
-	if err := runViewsPhase(ctx, schema, sw); err != nil {
+	if err := migcore.RunViewsPhase(ctx, schema, sw); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseViews, err)
 	}
 	return nil
@@ -1088,23 +1088,23 @@ func runBulkCopyForAddTable(
 		}
 	}
 	// ADR-0114: post-copy DDL phases ride a storage-grow/reparent.
-	if err := runDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
+	if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
 		return sw.SyncIdentitySequences(ctx, schema)
 	}); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: sync identity sequences: %w", err))
 	}
-	if err := runDDLPhaseWithReparentRetry(ctx, "indexes", sw, func(ctx context.Context) error {
+	if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "indexes", sw, func(ctx context.Context) error {
 		return sw.CreateIndexes(ctx, schema)
 	}); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseIndexes, fmt.Errorf("pipeline: create indexes: %w", err))
 	}
-	if err := runDDLPhaseWithReparentRetry(ctx, "constraints", sw, func(ctx context.Context) error {
+	if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "constraints", sw, func(ctx context.Context) error {
 		return sw.CreateConstraints(ctx, schema)
 	}); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConstraints, fmt.Errorf("pipeline: create constraints: %w", err))
 	}
 	reportDegradedFKs(ctx, sw)
-	if err := runViewsPhase(ctx, schema, sw); err != nil {
+	if err := migcore.RunViewsPhase(ctx, schema, sw); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseViews, err)
 	}
 	return nil
@@ -1212,7 +1212,7 @@ func runBulkCopyPhases(
 	// PlanetScale-MySQL target a deferred `ALTER … ADD INDEX` can run past the
 	// max-statement-execution-time limit (errno 3024) and die after a correct
 	// copy; building indexes upfront avoids the post-hoc ALTER entirely. This
-	// relocates the SAME runDDLPhaseWithReparentRetry("indexes", … CreateIndexes)
+	// relocates the SAME migcore.RunDDLPhaseWithReparentRetry("indexes", … CreateIndexes)
 	// block the deferred path uses (engine-neutral, same reparent-retry + hint)
 	// — it is not rewritten. Indexes-only: SyncIdentitySequences and the FK
 	// CreateConstraints keep their positions below, so FK ordering is preserved
@@ -1224,7 +1224,7 @@ func runBulkCopyPhases(
 		if err := markPhase(ctx, rc, state, ir.MigrationPhaseIndexes); err != nil {
 			_ = err
 		}
-		if err := runDDLPhaseWithReparentRetry(ctx, "indexes", sw, func(ctx context.Context) error {
+		if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "indexes", sw, func(ctx context.Context) error {
 			return sw.CreateIndexes(ctx, schema)
 		}); err != nil {
 			err = fmt.Errorf("pipeline: create indexes (upfront): %w", err)
@@ -1280,7 +1280,7 @@ func runBulkCopyPhases(
 		if err := markPhase(ctx, rc, state, ir.MigrationPhaseIdentitySync); err != nil {
 			_ = err
 		}
-		if err := runDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
+		if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
 			return sw.SyncIdentitySequences(ctx, schema)
 		}); err != nil {
 			err = fmt.Errorf("pipeline: sync identity sequences: %w", err)
@@ -1304,7 +1304,7 @@ func runBulkCopyPhases(
 		if err := markPhase(ctx, rc, state, ir.MigrationPhaseIdentitySync); err != nil {
 			_ = err
 		}
-		if err := runDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
+		if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
 			return sw.SyncIdentitySequences(ctx, schema)
 		}); err != nil {
 			err = fmt.Errorf("pipeline: sync identity sequences: %w", err)
@@ -1326,7 +1326,7 @@ func runBulkCopyPhases(
 		if err := markPhase(ctx, rc, state, ir.MigrationPhaseIdentitySync); err != nil {
 			_ = err
 		}
-		if err := runDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
+		if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
 			return sw.SyncIdentitySequences(ctx, schema)
 		}); err != nil {
 			err = fmt.Errorf("pipeline: sync identity sequences: %w", err)
@@ -1338,7 +1338,7 @@ func runBulkCopyPhases(
 		if err := markPhase(ctx, rc, state, ir.MigrationPhaseIndexes); err != nil {
 			_ = err
 		}
-		if err := runDDLPhaseWithReparentRetry(ctx, "indexes", sw, func(ctx context.Context) error {
+		if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "indexes", sw, func(ctx context.Context) error {
 			return sw.CreateIndexes(ctx, schema)
 		}); err != nil {
 			err = fmt.Errorf("pipeline: create indexes: %w", err)
@@ -1370,7 +1370,7 @@ func runBulkCopyPhases(
 	if err := markPhase(ctx, rc, state, ir.MigrationPhaseConstraints); err != nil {
 		_ = err
 	}
-	if err := runDDLPhaseWithReparentRetry(ctx, "constraints", sw, func(ctx context.Context) error {
+	if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "constraints", sw, func(ctx context.Context) error {
 		return sw.CreateConstraints(ctx, schema)
 	}); err != nil {
 		err = fmt.Errorf("pipeline: create constraints: %w", err)
@@ -1382,11 +1382,11 @@ func runBulkCopyPhases(
 	// Phase 6: views. Final phase so all referenced base tables
 	// exist by the time the view is created. View-to-view dependency
 	// ordering uses a single-pass-with-retries policy (see
-	// [runViewsPhase]) — no SQL parser, no topological sort.
+	// [migcore.RunViewsPhase]) — no SQL parser, no topological sort.
 	if err := markPhase(ctx, rc, state, ir.MigrationPhaseViews); err != nil {
 		_ = err
 	}
-	if err := runViewsPhase(ctx, schema, sw); err != nil {
+	if err := migcore.RunViewsPhase(ctx, schema, sw); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseViews, markFailed(ctx, rc, *state, ir.MigrationPhaseViews, err))
 	}
 	slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseViews)))
@@ -1495,95 +1495,6 @@ func reapplyMigrateTableForReconcile(
 		return fmt.Errorf("truncate before redo: %w", err)
 	}
 	return copyTable(ctx, rows, rw, table, redactor, shard)
-}
-
-// runViewsPhase emits CREATE VIEW for every view in schema.Views with
-// a retry policy that handles view-to-view dependency ordering without
-// implementing a full SQL parser. The policy: emit views in declared
-// order; on failure, accumulate the failed view in a retry list; after
-// the first pass, retry the failed views up to 2 more times. If the
-// retry list is non-empty after the third pass, surface the
-// accumulated errors.
-//
-// Why retry rather than topological sort: parsing the view's SELECT
-// body to extract referenced views requires a real SQL parser, which
-// is out of scope for Phase 1 (and arguably ever — different engines
-// have different SELECT grammars). Real-world view dependency depths
-// are shallow (typically 1-2 levels of view-on-view); two retry
-// passes covers the common cases. Operators with deeper dependency
-// graphs (>2 levels of view-on-view chains) get a clear error
-// pointing at the still-failing views and can manually reorder
-// `--include-view` invocations to bootstrap the dependency chain.
-//
-// No-op on schemas without views; cheap when none fail.
-func runViewsPhase(ctx context.Context, schema *ir.Schema, sw ir.SchemaWriter) error {
-	if schema == nil || len(schema.Views) == 0 {
-		return nil
-	}
-
-	// First pass: try every view. retry collects views that failed.
-	pending := append([]*ir.View(nil), schema.Views...)
-	var lastErrs []error
-
-	const maxPasses = 3 // 1 initial + 2 retries
-	for pass := 0; pass < maxPasses && len(pending) > 0; pass++ {
-		var nextPending []*ir.View
-		lastErrs = nil
-		for _, v := range pending {
-			single := &ir.Schema{Views: []*ir.View{v}}
-			// ADR-0114: ride a storage-grow/reparent that lands on the view
-			// DDL, atop the dependency-pass retry below. A non-transient
-			// failure (e.g. an unresolved view-on-view dependency) returns
-			// promptly and is handled by the pass-retry exactly as before.
-			cv := func(ctx context.Context) error { return sw.CreateViews(ctx, single) }
-			if err := runDDLPhaseWithReparentRetry(ctx, "views", sw, cv); err != nil {
-				if pass == maxPasses-1 {
-					// Last pass — accumulate the error for the caller.
-					lastErrs = append(lastErrs, fmt.Errorf("view %q: %w", v.Name, err))
-				} else {
-					slog.DebugContext(
-						ctx, "view create failed, will retry",
-						slog.String("view", v.Name),
-						slog.Int("pass", pass+1),
-						slog.String("error", err.Error()),
-					)
-				}
-				nextPending = append(nextPending, v)
-			}
-		}
-		if len(nextPending) == len(pending) && pass < maxPasses-1 {
-			// No progress this pass — abort early. Trying again wouldn't
-			// help (no view-create succeeded to unblock the rest). Force
-			// the next iteration to be the last so the caller gets the
-			// accumulated errors.
-			slog.DebugContext(
-				ctx, "no progress in views phase; bailing to error report",
-				slog.Int("pending", len(nextPending)),
-				slog.Int("pass", pass+1),
-			)
-			pass = maxPasses - 2 // next iteration is the last (records errors)
-		}
-		pending = nextPending
-	}
-
-	if len(pending) > 0 {
-		// Build a single combined error so the operator sees every
-		// still-failing view at once rather than just the first.
-		names := make([]string, 0, len(pending))
-		for _, v := range pending {
-			names = append(names, v.Name)
-		}
-		base := fmt.Errorf("pipeline: create views failed after %d retries (%d still failing: %v); "+
-			"view-to-view dependency depth may exceed retry budget — review and reorder declared view list",
-			maxPasses-1, len(pending), names)
-		if len(lastErrs) > 0 {
-			return errors.Join(append([]error{base}, lastErrs...)...)
-		}
-		return base
-	}
-
-	slog.InfoContext(ctx, "views created", slog.Int("count", len(schema.Views)))
-	return nil
 }
 
 // validate checks that all required fields are populated. Errors here

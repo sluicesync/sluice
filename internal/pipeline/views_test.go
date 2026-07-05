@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // TestNewViewFilter_MutualExclusion mirrors the table-filter check:
@@ -116,7 +117,7 @@ func TestApplyViewFilter_EmptyResultIsOK(t *testing.T) {
 }
 
 // viewWriterStub records CreateViews calls and lets a test inject a
-// per-call error policy. Used to exercise runViewsPhase's retry
+// per-call error policy. Used to exercise migcore.RunViewsPhase's retry
 // logic without standing up a real engine.
 type viewWriterStub struct {
 	// failOnce records a set of view names that should fail on their
@@ -163,7 +164,7 @@ func (w *viewWriterStub) CreateViews(_ context.Context, s *ir.Schema) error {
 // without any views.
 func TestRunViewsPhase_NoOp(t *testing.T) {
 	w := &viewWriterStub{}
-	if err := runViewsPhase(context.Background(), &ir.Schema{}, w); err != nil {
+	if err := migcore.RunViewsPhase(context.Background(), &ir.Schema{}, w); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(w.callLog) != 0 {
@@ -179,7 +180,7 @@ func TestRunViewsPhase_Success(t *testing.T) {
 		{Name: "v1"},
 		{Name: "v2"},
 	}}
-	if err := runViewsPhase(context.Background(), s, w); err != nil {
+	if err := migcore.RunViewsPhase(context.Background(), s, w); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(w.callLog) != 2 {
@@ -200,7 +201,7 @@ func TestRunViewsPhase_RetryOnFailure(t *testing.T) {
 		{Name: "v_dependent"}, // declared first; depends on v_base
 		{Name: "v_base"},      // declared second; v_dependent's prereq
 	}}
-	if err := runViewsPhase(context.Background(), s, w); err != nil {
+	if err := migcore.RunViewsPhase(context.Background(), s, w); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	// Expected sequence: v_dependent (fail), v_base (succeed),
@@ -220,7 +221,7 @@ func TestRunViewsPhase_MaxPassesError(t *testing.T) {
 	s := &ir.Schema{Views: []*ir.View{
 		{Name: "broken"},
 	}}
-	err := runViewsPhase(context.Background(), s, w)
+	err := migcore.RunViewsPhase(context.Background(), s, w)
 	if err == nil {
 		t.Fatal("expected error after retry budget exhaustion; got nil")
 	}
@@ -244,7 +245,7 @@ func TestRunViewsPhase_NoProgressBailsEarly(t *testing.T) {
 		{Name: "a"},
 		{Name: "b"},
 	}}
-	err := runViewsPhase(context.Background(), s, w)
+	err := migcore.RunViewsPhase(context.Background(), s, w)
 	if err == nil {
 		t.Fatal("expected error; got nil")
 	}

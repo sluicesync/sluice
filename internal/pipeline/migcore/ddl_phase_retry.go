@@ -48,7 +48,7 @@
 // engine, a test stub) degrades to a single attempt — pre-ADR-0114
 // behaviour, byte-for-byte.
 
-package pipeline
+package migcore
 
 import (
 	"context"
@@ -90,7 +90,7 @@ func ddlPhaseBackoff(attempt int) time.Duration {
 	return b
 }
 
-// runDDLPhaseWithReparentRetry runs one idempotent post-copy DDL phase
+// RunDDLPhaseWithReparentRetry runs one idempotent post-copy DDL phase
 // (do) with the ADR-0114 bounded reparent/transient retry around it. It is
 // the ONE place the DDL-phase retry policy lives so every DDL entry point
 // (restore + migrate, all variants) shares one shape, one log, one bound —
@@ -109,7 +109,7 @@ func ddlPhaseBackoff(attempt int) time.Duration {
 // returns unchanged — no retry — exactly as before. On budget exhaustion it
 // returns a LOUD terminal error wrapping the most recent transient (never
 // silent, never infinite).
-func runDDLPhaseWithReparentRetry(
+func RunDDLPhaseWithReparentRetry(
 	ctx context.Context,
 	phase string,
 	classifierSrc any,
