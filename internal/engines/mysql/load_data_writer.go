@@ -125,6 +125,21 @@ func (w *RowWriter) writeLoadData(ctx context.Context, table *ir.Table, rows <-c
 	stmt := buildLoadDataStmt(w.schema, table.Name, cols, name)
 	_, execErr := conn.ExecContext(ctx, stmt)
 
+	// Liveness guard (Bug 178): if the LOAD DATA statement errors during
+	// parse/validation — BEFORE the server requests the LOCAL INFILE
+	// stream — the driver never invokes the registered reader, so nobody
+	// drains `pr` and the encoder goroutine blocks forever on its buffered
+	// pipe write. That turns a fast, informative exec error into an
+	// indefinite hang at `<-encErr` below (the ctx cancel can't reach a
+	// goroutine parked in io.Pipe.Write). Closing the read side unblocks a
+	// stuck encoder with io.ErrClosedPipe (tolerated by the errors.Is check
+	// below), so the real execErr surfaces LOUDLY instead of deadlocking.
+	// On the success path the driver has already drained and closed the
+	// pipe, so this is a no-op. This is defence-in-depth: the hex-literal
+	// framing in buildLoadDataStmt removes the NBE trigger that first
+	// surfaced this, but ANY early statement error must fail loud, not hang.
+	_ = pr.CloseWithError(io.ErrClosedPipe)
+
 	// Wait for the encoder so we don't leak a goroutine.
 	serErr := <-encErr
 
@@ -291,6 +306,21 @@ func (w *RowWriter) checkLocalInfile(ctx context.Context) (bool, error) {
 //
 // Generated columns are skipped upstream so the column list and the
 // per-row TSV stream stay in lockstep.
+//
+// The FIELDS/ESCAPED/LINES framing bytes are written as HEX string
+// literals (X'09' tab, X'5C' backslash, X'0A' newline) rather than
+// backslash-escaped literals ('\t', '\\', '\n'). This is deliberate and
+// load-bearing (Bug 178): those clauses are ordinary MySQL string
+// literals, so the server parses them under the session's sql_mode. Under
+// NO_BACKSLASH_ESCAPES a `'\\'` literal is TWO backslash bytes, not one —
+// which trips MySQL's "ESCAPED BY must be a single character" check and
+// aborts the statement with Error 1083 BEFORE it requests the LOCAL INFILE
+// stream, deadlocking the writer (the driver never drains the reader; see
+// writeLoadData). Hex literals are NBE-invariant — the server yields the
+// same bytes regardless of sql_mode — so the framing the writer emits
+// (real 0x09 / 0x5C / 0x0A via appendEscapedByte) always matches what
+// LOAD DATA parses. The bytes are identical to the old escaped form; only
+// the source-literal spelling changed.
 func buildLoadDataStmt(schema, tableName string, cols []*ir.Column, readerName string) string {
 	target := quoteIdent(tableName)
 	if schema != "" {
@@ -310,8 +340,8 @@ func buildLoadDataStmt(schema, tableName string, cols []*ir.Column, readerName s
 	return fmt.Sprintf(
 		"LOAD DATA LOCAL INFILE 'Reader::%s' INTO TABLE %s "+
 			"CHARACTER SET binary "+
-			"FIELDS TERMINATED BY '\\t' ESCAPED BY '\\\\' "+
-			"LINES TERMINATED BY '\\n' "+
+			"FIELDS TERMINATED BY X'09' ESCAPED BY X'5C' "+
+			"LINES TERMINATED BY X'0A' "+
 			"(%s) SET %s",
 		readerName, target,
 		strings.Join(vars, ", "),

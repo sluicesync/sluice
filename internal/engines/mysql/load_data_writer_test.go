@@ -199,10 +199,18 @@ func TestBuildLoadDataStmt(t *testing.T) {
 		{Name: "data", Type: ir.Blob{Size: ir.BlobRegular}},
 	}
 	got := buildLoadDataStmt("mydb", "users", cols, "sluice_loaddata_abc123")
+	// The FIELDS/ESCAPED/LINES framing is spelled with HEX literals
+	// (X'09'/X'5C'/X'0A'), NOT backslash-escaped literals — Bug 178. Hex
+	// literals are NBE-invariant: under NO_BACKSLASH_ESCAPES on the target
+	// session a `'\\'` literal parses as two backslash bytes, tripping
+	// MySQL's single-char ESCAPED-BY check (Error 1083) before the LOCAL
+	// INFILE request and hanging the writer. The bytes are identical to the
+	// old escaped form (tab / backslash / newline); only the spelling that
+	// survives NBE changed. Do NOT "simplify" these back to '\t'/'\\'/'\n'.
 	want := "LOAD DATA LOCAL INFILE 'Reader::sluice_loaddata_abc123' INTO TABLE `mydb`.`users` " +
 		"CHARACTER SET binary " +
-		"FIELDS TERMINATED BY '\\t' ESCAPED BY '\\\\' " +
-		"LINES TERMINATED BY '\\n' " +
+		"FIELDS TERMINATED BY X'09' ESCAPED BY X'5C' " +
+		"LINES TERMINATED BY X'0A' " +
 		"(@c0, @c1, @c2, @c3) SET " +
 		"`id` = @c0, " +
 		"`weird``col` = CONVERT(@c1 USING utf8mb4), " +
@@ -210,6 +218,13 @@ func TestBuildLoadDataStmt(t *testing.T) {
 		"`data` = @c3"
 	if got != want {
 		t.Errorf("buildLoadDataStmt:\n got  %q\n want %q", got, want)
+	}
+	// Guard the intent directly: no backslash-escaped framing literal may
+	// creep back in (that is exactly the NBE-fragile form).
+	for _, bad := range []string{`'\t'`, `'\\'`, `'\n'`} {
+		if strings.Contains(got, bad) {
+			t.Errorf("buildLoadDataStmt emits NBE-fragile framing literal %s; use hex (X'..') form", bad)
+		}
 	}
 }
 

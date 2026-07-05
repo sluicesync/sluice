@@ -327,6 +327,130 @@ func TestRowWriter_LoadDataInfile_FallbackWhenLocalInfileOff(t *testing.T) {
 	}
 }
 
+// TestRowWriter_LoadDataInfile_NoBackslashEscapes pins Bug 178: a
+// MySQL-target bulk copy over the LOAD DATA LOCAL INFILE path hung
+// indefinitely (0 rows, no error) when NO_BACKSLASH_ESCAPES was active on
+// the target connection. Root cause: buildLoadDataStmt spelled the
+// FIELDS/ESCAPED/LINES framing as backslash-escaped SQL string literals
+// ('\t'/'\\'/'\n'); under NBE the server parses '\\' as TWO backslashes,
+// tripping the "ESCAPED BY must be a single character" check (Error 1083)
+// BEFORE the LOCAL INFILE request — so the driver never drained the
+// reader and the encoder goroutine deadlocked on its pipe write. The fix
+// makes the framing NBE-invariant via hex literals (X'09'/X'5C'/X'0A'),
+// plus a liveness guard so any early exec error fails loud, not hangs.
+//
+// The pin drives the writer with NBE active and asserts it COMPLETES
+// byte-exact — including the framing torture class (a literal backslash;
+// backslash+field-terminator; backslash+line-terminator; a `\N`-looking
+// value that must NOT collapse to SQL NULL; a `\0`-looking value; a real
+// NUL byte). WriteRows runs under a hard deadline so a regression re-hangs
+// as a test FAILURE, never a hung process.
+func TestRowWriter_LoadDataInfile_NoBackslashEscapes(t *testing.T) {
+	dsn, cleanup := startMySQL(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	enableLocalInfile(t, dsn)
+
+	const ddl = `
+		CREATE TABLE nbe_escapes (
+			id INT             NOT NULL,
+			s  VARCHAR(255)    NULL,
+			b  VARBINARY(255)  NULL,
+			PRIMARY KEY (id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+	`
+	applyDDL(t, dsn, ddl)
+
+	sr, err := Engine{}.OpenSchemaReader(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenSchemaReader: %v", err)
+	}
+	defer closeIf(sr)
+	schema, err := sr.ReadSchema(ctx)
+	if err != nil {
+		t.Fatalf("ReadSchema: %v", err)
+	}
+	table := findTable(schema, "nbe_escapes")
+	if table == nil {
+		t.Fatalf("nbe_escapes table not found")
+	}
+
+	// Open a target DB whose session carries NO_BACKSLASH_ESCAPES — the
+	// exact trigger. Strict is kept alongside NBE so the writer's warning
+	// path stays in its refuse-on-clamp mode (none of the torture rows
+	// produce a type-conversion warning, so it stays quiet).
+	nbeMode := "STRICT_TRANS_TABLES,NO_BACKSLASH_ESCAPES"
+	db, err := openDB(ctx, mustParseDSN(t, dsn), &nbeMode)
+	if err != nil {
+		t.Fatalf("openDB(NBE): %v", err)
+	}
+	defer db.Close()
+
+	// Self-validate the trigger actually took on sluice's pooled conn;
+	// otherwise the pin would be a false green.
+	var sessionMode string
+	if err := db.QueryRowContext(ctx, "SELECT @@SESSION.sql_mode").Scan(&sessionMode); err != nil {
+		t.Fatalf("read @@SESSION.sql_mode: %v", err)
+	}
+	if !strings.Contains(sessionMode, "NO_BACKSLASH_ESCAPES") {
+		t.Fatalf("session sql_mode %q lacks NO_BACKSLASH_ESCAPES; trigger not active", sessionMode)
+	}
+
+	// The framing torture class: every shape where the byte stream the
+	// serializer emits interacts with the field/line/escape framing.
+	wantRows := []ir.Row{
+		{"id": int64(1), "s": "plain", "b": []byte("plain")},
+		{"id": int64(2), "s": `one\backslash`, "b": []byte{'\\'}},                // literal backslash
+		{"id": int64(3), "s": "tab\tafter", "b": []byte{'\\', '\t'}},             // backslash + field terminator
+		{"id": int64(4), "s": "line\nafter", "b": []byte{'\\', '\n'}},            // backslash + line terminator
+		{"id": int64(5), "s": `looks\Nlike-null`, "b": []byte{'\\', 'N'}},        // must NOT become SQL NULL
+		{"id": int64(6), "s": `looks\0like-nul`, "b": []byte{'\\', '0'}},         // \0-looking
+		{"id": int64(7), "s": "carriage\rreturn", "b": []byte{0x00, '\\', 0x00}}, // NUL around backslash
+		{"id": int64(8), "s": nil, "b": nil},                                     // real NULL, distinct from \N
+	}
+
+	w := &RowWriter{db: db, sqlMode: &nbeMode, bulkLoad: ir.BulkLoadLoadDataInfile}
+
+	in := make(chan ir.Row, len(wantRows))
+	for _, r := range wantRows {
+		in <- r
+	}
+	close(in)
+
+	// Hard deadline INDEPENDENT of ctx: pre-fix, WriteRows deadlocked on
+	// the encoder pipe write, which no ctx cancel could unwind — so a
+	// regression must surface as a FAIL here, not a hung test binary.
+	done := make(chan error, 1)
+	go func() { done <- w.WriteRows(ctx, table, in) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("WriteRows under NBE must complete; got: %v", err)
+		}
+	case <-time.After(45 * time.Second):
+		t.Fatalf("WriteRows under NBE HUNG (Bug 178 regression: LOAD DATA framing not NBE-invariant, or the encoder-deadlock guard removed)")
+	}
+
+	got := readRowsRaw(t, dsn, "SELECT id, s, b FROM nbe_escapes ORDER BY id")
+	if len(got) != len(wantRows) {
+		t.Fatalf("read back %d rows; want %d", len(got), len(wantRows))
+	}
+	for i, wr := range wantRows {
+		if got[i]["id"].(int64) != wr["id"].(int64) {
+			t.Errorf("row[%d] id = %d; want %d", i, got[i]["id"], wr["id"])
+		}
+		if !valEqual(got[i]["s"], wr["s"]) {
+			t.Errorf("row[%d] s = %#v; want %#v", i, got[i]["s"], wr["s"])
+		}
+		if !valEqual(got[i]["b"], wr["b"]) {
+			t.Errorf("row[%d] b = %#v; want %#v", i, got[i]["b"], wr["b"])
+		}
+	}
+}
+
 // --- helpers ---------------------------------------------------------
 
 func openRowWriter(t *testing.T, ctx context.Context, dsn string) ir.RowWriter {
