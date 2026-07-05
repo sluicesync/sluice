@@ -356,47 +356,10 @@ func (b *Backup) Run(ctx context.Context) error {
 		chunkRows = DefaultBackupChunkRows
 	}
 
-	now := time.Now
-	if b.Now != nil {
-		now = b.Now
-	}
-
 	// Pre-build the in-progress manifest with the schema. Tables get
 	// appended (or copied from the prior run) as they finish; the
 	// manifest is committed after each table completes.
-	manifest := &irbackup.Manifest{
-		// Bug 116 closure: stamp the smallest format version safe for
-		// this schema. Schemas using RLS / policies / exclude
-		// constraints get FormatVersion=2 so older binaries refuse
-		// rather than silently drop those fields; innocent schemas
-		// stay on FormatVersion=1 for max backward compatibility.
-		FormatVersion: irbackup.FormatVersionFor(schema),
-		SluiceVersion: b.SluiceVersion,
-		CreatedAt:     now().UTC(),
-		SourceEngine:  b.Source.Name(),
-		Schema:        schema,
-		Tables:        make([]*irbackup.TableManifest, 0, len(schema.Tables)),
-		PartialState:  irbackup.BackupStateInProgress,
-		Kind:          irbackup.BackupKindFull,
-	}
-	if prior != nil {
-		// Preserve the original CreatedAt across resume so the
-		// "when was this backup taken?" answer is the snapshot point,
-		// not the resume point.
-		manifest.CreatedAt = prior.CreatedAt
-	}
-	// Task #42 (ADR-0085): stamp the chain anchor on the IN-PROGRESS
-	// manifest from its first write, so a crashed run leaves the anchor
-	// a future resume must adopt. A resumed run stamps the ADOPTED
-	// prior-attempt anchor — never this run's fresh snapshot position.
-	// The non-snapshot fallback path has no anchor yet and keeps its
-	// post-sweep capture (step 4.5).
-	switch {
-	case adopting:
-		manifest.EndPosition = resumeAnchor
-	case snapshotPos != nil:
-		manifest.EndPosition = *snapshotPos
-	}
+	manifest := b.buildInProgressManifest(schema, prior, adopting, resumeAnchor, snapshotPos)
 
 	// Phase 6.1: when encryption is enabled, generate the chain-level
 	// CEK (per-chain mode) up-front, wrap it via the envelope, and
@@ -436,30 +399,8 @@ func (b *Backup) Run(ctx context.Context) error {
 	// with pre-v0.16.1 manifests) AND all its chunks still on the store
 	// is a "fully complete" table (skip whole table). Partial=true with
 	// some chunks present falls into the per-chunk resume path.
-	if prior != nil && prior.PartialState == irbackup.BackupStateInProgress {
-		var alreadyComplete, toResume []string
-		for _, table := range schema.Tables {
-			key := manifestTableKey(table.Schema, table.Name)
-			existing, ok := priorTables[key]
-			if !ok {
-				toResume = append(toResume, table.Name)
-				continue
-			}
-			full, err := tableManifestFullyComplete(ctx, b.Store, existing)
-			if err != nil {
-				return fmt.Errorf("backup: re-validate prior table %q: %w", table.Name, err)
-			}
-			if full {
-				alreadyComplete = append(alreadyComplete, table.Name)
-			} else {
-				toResume = append(toResume, table.Name)
-			}
-		}
-		slog.InfoContext(
-			ctx, "resume plan",
-			slog.Int("tables_already_complete", len(alreadyComplete)),
-			slog.Any("tables_to_resume", toResume),
-		)
+	if err := b.logResumePlan(ctx, schema, prior, priorTables); err != nil {
+		return err
 	}
 
 	// Pre-stage every table's manifest entry in schema order, then sweep
@@ -543,49 +484,10 @@ func (b *Backup) Run(ctx context.Context) error {
 		return err
 	}
 
-	// 4.5. Record EndPosition. Three paths:
-	//
-	//   - anchored resume (task #42, ADR-0085): the manifest keeps the
-	//     ADOPTED prior-attempt anchor stamped at creation. This run's
-	//     fresh snapshot position must NOT overwrite it — kept tables
-	//     are exact at the adopted anchor, and CDC from there covers
-	//     everything after it (re-streamed tables' overlap converges
-	//     under the idempotent chain appliers).
-	//   - v0.18.0 snapshot-anchored: snapshotPos was captured at
-	//     snapshot START before the row sweep. The row sweep's reads
-	//     all observe the source AS-OF this position, and CDC from
-	//     this position forward covers every write after the snapshot.
-	//     The during-backup window gap is closed.
-	//   - v0.17.x fallback: the engine doesn't implement
-	//     BackupSnapshotOpener so we capture the position now,
-	//     post-sweep, via the optional [irbackup.PositionCapturer].
-	//     This is the v0.17.2 shape with the documented during-backup
-	//     write-window gap; the openSnapshotOrFallback step has
-	//     already logged a WARN line so operators know.
-	switch {
-	case adopting:
-		manifest.EndPosition = resumeAnchor // re-assert: nothing may overwrite the adopted anchor
-		thisRunToken := "<none — v0.17.x fallback read>"
-		if snapshotPos != nil {
-			thisRunToken = snapshotPos.Token
-		}
-		slog.WarnContext(
-			ctx, "backup: resumed run recorded the interrupted attempt's anchor as EndPosition (adoption); this run's snapshot served only read consistency for re-streamed tables",
-			slog.String("engine", manifest.SourceEngine),
-			slog.String("adopted_position_token", resumeAnchor.Token),
-			slog.String("this_run_snapshot_token", thisRunToken),
-		)
-	case snapshotPos != nil:
-		manifest.EndPosition = *snapshotPos
-		slog.InfoContext(
-			ctx, "backup: recorded end position (snapshot-anchored)",
-			slog.String("engine", manifest.SourceEngine),
-			slog.String("position_token", snapshotPos.Token),
-		)
-	default:
-		if err := b.captureEndPosition(ctx, manifest); err != nil {
-			return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("backup: capture end position: %w", err))
-		}
+	// 4.5. Record EndPosition — anchored-resume adoption / snapshot-
+	// anchored / v0.17.x post-sweep fallback (see recordEndPosition).
+	if err := b.recordEndPosition(ctx, manifest, adopting, resumeAnchor, snapshotPos); err != nil {
+		return err
 	}
 
 	// Compute BackupID once EndPosition is known. The id is used by
@@ -640,6 +542,121 @@ func logBackupComplete(ctx context.Context, manifest *irbackup.Manifest, summary
 		slog.Int64("rows", totalRows),
 		slog.Int("chunks", totalChunks),
 	)
+}
+
+// buildInProgressManifest constructs the in-progress manifest Run
+// checkpoints after each table completes. A resumed run preserves the
+// prior CreatedAt (the "when was this backup taken?" answer is the
+// snapshot point, not the resume point) and stamps the ADOPTED prior
+// anchor; a fresh snapshot-anchored run stamps this run's snapshot
+// position; the non-snapshot fallback leaves EndPosition unset for the
+// post-sweep capture (step 4.5).
+func (b *Backup) buildInProgressManifest(schema *ir.Schema, prior *irbackup.Manifest, adopting bool, resumeAnchor ir.Position, snapshotPos *ir.Position) *irbackup.Manifest {
+	now := time.Now
+	if b.Now != nil {
+		now = b.Now
+	}
+	manifest := &irbackup.Manifest{
+		// Bug 116 closure: stamp the smallest format version safe for
+		// this schema. Schemas using RLS / policies / exclude
+		// constraints get FormatVersion=2 so older binaries refuse
+		// rather than silently drop those fields; innocent schemas
+		// stay on FormatVersion=1 for max backward compatibility.
+		FormatVersion: irbackup.FormatVersionFor(schema),
+		SluiceVersion: b.SluiceVersion,
+		CreatedAt:     now().UTC(),
+		SourceEngine:  b.Source.Name(),
+		Schema:        schema,
+		Tables:        make([]*irbackup.TableManifest, 0, len(schema.Tables)),
+		PartialState:  irbackup.BackupStateInProgress,
+		Kind:          irbackup.BackupKindFull,
+	}
+	if prior != nil {
+		manifest.CreatedAt = prior.CreatedAt
+	}
+	// Task #42 (ADR-0085): stamp the chain anchor on the IN-PROGRESS
+	// manifest from its first write, so a crashed run leaves the anchor a
+	// future resume must adopt. A resumed run stamps the ADOPTED
+	// prior-attempt anchor — never this run's fresh snapshot position.
+	switch {
+	case adopting:
+		manifest.EndPosition = resumeAnchor
+	case snapshotPos != nil:
+		manifest.EndPosition = *snapshotPos
+	}
+	return manifest
+}
+
+// logResumePlan fans the resume decision out per-table — which prior
+// tables are already fully complete (chunks still present on the store)
+// vs which will be re-streamed — and logs the headline plan. Surface-
+// level only: the actual skip / re-stream happens in the sweep.
+// Re-validating a prior table's chunk presence can fail, which surfaces
+// here as an error. A nil / non-in-progress prior is a no-op.
+func (b *Backup) logResumePlan(ctx context.Context, schema *ir.Schema, prior *irbackup.Manifest, priorTables map[string]*irbackup.TableManifest) error {
+	if prior == nil || prior.PartialState != irbackup.BackupStateInProgress {
+		return nil
+	}
+	var alreadyComplete, toResume []string
+	for _, table := range schema.Tables {
+		key := manifestTableKey(table.Schema, table.Name)
+		existing, ok := priorTables[key]
+		if !ok {
+			toResume = append(toResume, table.Name)
+			continue
+		}
+		full, err := tableManifestFullyComplete(ctx, b.Store, existing)
+		if err != nil {
+			return fmt.Errorf("backup: re-validate prior table %q: %w", table.Name, err)
+		}
+		if full {
+			alreadyComplete = append(alreadyComplete, table.Name)
+		} else {
+			toResume = append(toResume, table.Name)
+		}
+	}
+	slog.InfoContext(
+		ctx, "resume plan",
+		slog.Int("tables_already_complete", len(alreadyComplete)),
+		slog.Any("tables_to_resume", toResume),
+	)
+	return nil
+}
+
+// recordEndPosition stamps manifest.EndPosition after the row sweep via
+// one of three paths: an anchored resume re-asserts the ADOPTED prior
+// anchor (nothing may overwrite it — kept tables are exact there and CDC
+// from it covers the rest); a snapshot-anchored run uses the position
+// captured at snapshot start; the v0.17.x fallback captures the position
+// now, post-sweep, via the optional PositionCapturer (the documented
+// during-backup write-window gap, already WARN-logged at snapshot open).
+func (b *Backup) recordEndPosition(ctx context.Context, manifest *irbackup.Manifest, adopting bool, resumeAnchor ir.Position, snapshotPos *ir.Position) error {
+	switch {
+	case adopting:
+		manifest.EndPosition = resumeAnchor // re-assert: nothing may overwrite the adopted anchor
+		thisRunToken := "<none — v0.17.x fallback read>"
+		if snapshotPos != nil {
+			thisRunToken = snapshotPos.Token
+		}
+		slog.WarnContext(
+			ctx, "backup: resumed run recorded the interrupted attempt's anchor as EndPosition (adoption); this run's snapshot served only read consistency for re-streamed tables",
+			slog.String("engine", manifest.SourceEngine),
+			slog.String("adopted_position_token", resumeAnchor.Token),
+			slog.String("this_run_snapshot_token", thisRunToken),
+		)
+	case snapshotPos != nil:
+		manifest.EndPosition = *snapshotPos
+		slog.InfoContext(
+			ctx, "backup: recorded end position (snapshot-anchored)",
+			slog.String("engine", manifest.SourceEngine),
+			slog.String("position_token", snapshotPos.Token),
+		)
+	default:
+		if err := b.captureEndPosition(ctx, manifest); err != nil {
+			return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("backup: capture end position: %w", err))
+		}
+	}
+	return nil
 }
 
 // resolveResumeState is Run's step 0: inspect any pre-existing manifest

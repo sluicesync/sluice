@@ -189,46 +189,10 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 		Pruned: make([]string, 0, len(dropped)),
 	}
 
-	// 1. Whole leading segments [RestorableFromSegment, floorSeg).
-	for si := cat.RestorableFromSegment; si < floorSeg; si++ {
-		seg := &cat.Segments[si]
-		ss := seg.Store(store)
-		// Full + its data chunks.
-		if fm, err := lineage.ReadManifestAt(ctx, ss, seg.FullManifestPath); err == nil {
-			for _, t := range fm.Tables {
-				for _, ch := range t.Chunks {
-					res.Pruned = appendChunk(res, ch.File)
-					if !opts.DryRun {
-						if derr := ss.Delete(ctx, ch.File); derr == nil {
-							res.ChunksDeleted++
-						}
-					}
-				}
-			}
-		}
-		if !opts.DryRun {
-			_ = ss.Delete(ctx, seg.FullManifestPath)
-		}
-		// Incrementals + their change chunks.
-		for _, ip := range seg.Incrementals {
-			if im, err := lineage.ReadManifestAt(ctx, ss, ip); err == nil {
-				for _, ch := range im.ChangeChunks {
-					if !opts.DryRun {
-						if derr := ss.Delete(ctx, ch.File); derr == nil {
-							res.ChunksDeleted++
-						}
-					}
-				}
-			}
-			res.Pruned = append(res.Pruned, segQualify(seg.Dir, ip))
-			if !opts.DryRun {
-				_ = ss.Delete(ctx, ip)
-			}
-		}
-		res.SegmentsDropped++
-	}
+	// 1. Delete whole leading segments [RestorableFromSegment, floorSeg).
+	pruneWholeSegments(ctx, store, cat, floorSeg, opts.DryRun, res)
 
-	// 2. Leading incrementals within the floor segment.
+	// 2. Delete the leading incrementals within the floor segment.
 	floor := &cat.Segments[floorSeg]
 	floorStore := floor.Store(store)
 	keepFromInSeg := 0
@@ -238,22 +202,7 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 		// Everything dropped — keep the floor segment's full only.
 		keepFromInSeg = len(floor.Incrementals)
 	}
-	for ii := 0; ii < keepFromInSeg; ii++ {
-		ip := floor.Incrementals[ii]
-		if im, err := lineage.ReadManifestAt(ctx, floorStore, ip); err == nil {
-			for _, ch := range im.ChangeChunks {
-				if !opts.DryRun {
-					if derr := floorStore.Delete(ctx, ch.File); derr == nil {
-						res.ChunksDeleted++
-					}
-				}
-			}
-		}
-		res.Pruned = append(res.Pruned, segQualify(floor.Dir, ip))
-		if !opts.DryRun {
-			_ = floorStore.Delete(ctx, ip)
-		}
-	}
+	pruneFloorLeadingIncrementals(ctx, floor, floorStore, keepFromInSeg, opts.DryRun, res)
 
 	// Build the post-prune lineage: drop whole leading segments, trim
 	// the floor segment's incrementals, advance the restore floor.
@@ -317,6 +266,78 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 		slog.Int("chunks_deleted", res.ChunksDeleted),
 	)
 	return res, nil
+}
+
+// pruneWholeSegments physically deletes every segment in
+// [cat.RestorableFromSegment, floorSeg): each segment's full manifest +
+// its data chunks and every incremental + its change chunks. Records the
+// dropped paths and chunk-delete count on res (and bumps
+// res.SegmentsDropped per segment). DryRun records the paths without
+// deleting. A segment full is a self-contained snapshot, so dropping
+// whole segments strictly older than the floor is unconditionally
+// restore-safe.
+func pruneWholeSegments(ctx context.Context, store irbackup.Store, cat *lineage.Catalog, floorSeg int, dryRun bool, res *PruneResult) {
+	for si := cat.RestorableFromSegment; si < floorSeg; si++ {
+		seg := &cat.Segments[si]
+		ss := seg.Store(store)
+		// Full + its data chunks.
+		if fm, err := lineage.ReadManifestAt(ctx, ss, seg.FullManifestPath); err == nil {
+			for _, t := range fm.Tables {
+				for _, ch := range t.Chunks {
+					res.Pruned = appendChunk(res, ch.File)
+					if !dryRun {
+						if derr := ss.Delete(ctx, ch.File); derr == nil {
+							res.ChunksDeleted++
+						}
+					}
+				}
+			}
+		}
+		if !dryRun {
+			_ = ss.Delete(ctx, seg.FullManifestPath)
+		}
+		// Incrementals + their change chunks.
+		for _, ip := range seg.Incrementals {
+			if im, err := lineage.ReadManifestAt(ctx, ss, ip); err == nil {
+				for _, ch := range im.ChangeChunks {
+					if !dryRun {
+						if derr := ss.Delete(ctx, ch.File); derr == nil {
+							res.ChunksDeleted++
+						}
+					}
+				}
+			}
+			res.Pruned = append(res.Pruned, segQualify(seg.Dir, ip))
+			if !dryRun {
+				_ = ss.Delete(ctx, ip)
+			}
+		}
+		res.SegmentsDropped++
+	}
+}
+
+// pruneFloorLeadingIncrementals physically deletes the first
+// keepFromInSeg incrementals (+ their change chunks) of the floor
+// segment — the incrementals older than the retained window whose full
+// is kept as the restore base. Records dropped paths + chunk-delete
+// count on res; DryRun records without deleting.
+func pruneFloorLeadingIncrementals(ctx context.Context, floor *lineage.Segment, floorStore irbackup.Store, keepFromInSeg int, dryRun bool, res *PruneResult) {
+	for ii := 0; ii < keepFromInSeg; ii++ {
+		ip := floor.Incrementals[ii]
+		if im, err := lineage.ReadManifestAt(ctx, floorStore, ip); err == nil {
+			for _, ch := range im.ChangeChunks {
+				if !dryRun {
+					if derr := floorStore.Delete(ctx, ch.File); derr == nil {
+						res.ChunksDeleted++
+					}
+				}
+			}
+		}
+		res.Pruned = append(res.Pruned, segQualify(floor.Dir, ip))
+		if !dryRun {
+			_ = floorStore.Delete(ctx, ip)
+		}
+	}
 }
 
 // r0 is the "nothing to prune" early return: report the full kept set
