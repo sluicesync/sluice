@@ -3,7 +3,11 @@
 
 package migcore
 
-import "sync"
+import (
+	"sync"
+
+	"sluicesync.dev/sluice/internal/ir"
+)
 
 // ReparentTracker is the thread-safe set of reparent-touched tables fed by
 // the writers' [ir.ReparentObserverSetter] callback and drained by the
@@ -44,3 +48,27 @@ func (t *ReparentTracker) Drain() []string {
 	t.touched = map[string]bool{}
 	return out
 }
+
+// ApplyReparentObserver wires the run's reparent-touched observer (ADR-0113)
+// onto a freshly-opened writer that opts in via [ir.ReparentObserverSetter].
+// nil observe (no tracker constructed) or an engine that doesn't implement
+// the setter is a no-op — pre-ADR-0113 behaviour, byte-for-byte. Called
+// alongside ApplyGrowGate, on the single openTargetRowWriter path, so every
+// restore/migrate writer reports through the same tracker. Shared by
+// pipeline-root's migrate cold-copy and the carved-out backup/restore domain.
+func ApplyReparentObserver(target any, observe func(table string)) {
+	if observe == nil {
+		return
+	}
+	if setter, ok := target.(ir.ReparentObserverSetter); ok {
+		setter.SetReparentObserver(observe)
+	}
+}
+
+// ReconcileMaxRounds bounds the ADR-0113 reconciliation loop: a target that
+// reparents on EVERY serial redo is wedged (not a transient grow), so after
+// this many rounds the migrate/restore reconciliation surfaces loudly rather
+// than looping forever. In practice one round suffices — by reconciliation
+// time the volume has grown to its final size, so a redo writes into an
+// already-grown volume and triggers no fresh reparent.
+const ReconcileMaxRounds = 10

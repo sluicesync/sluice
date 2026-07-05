@@ -8,7 +8,6 @@ import (
 	"log/slog"
 
 	"sluicesync.dev/sluice/internal/ir"
-	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
 // chainAckController is the structural seam to the engine CDC reader's
@@ -31,22 +30,6 @@ type chainAckController interface {
 	HoldSlotAckAtCommitted()
 	// ReleaseSlotAckTo ratchets the ack ceiling to pos (monotonic).
 	ReleaseSlotAckTo(pos ir.Position) error
-}
-
-// preflightChainResume runs the engine's [irbackup.ChainResumePreflighter]
-// (when implemented) against the chain's resume position before any
-// CDC stream opens. Shared by [IncrementalBackup.Run] and
-// [BackupStream.Run] — the refusal semantics are identical: a slot
-// that is missing or has advanced past `from` cannot serve the chain
-// gap-free, and starting the stream anyway would silently skip the
-// WAL in between. The zero position (a "from now" chain start) skips
-// the check; engines without the surface (MySQL) skip it too.
-func preflightChainResume(ctx context.Context, source ir.Engine, dsn string, from ir.Position) error {
-	pf, ok := source.(irbackup.ChainResumePreflighter)
-	if !ok || (from.Engine == "" && from.Token == "") {
-		return nil
-	}
-	return pf.PreflightChainResume(ctx, dsn, from)
 }
 
 // holdChainAck switches cdc into chain-consumer ack mode when the

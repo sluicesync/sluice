@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // ADR-0141: migrate reparent-reconciliation. These tests pin the migrate
@@ -347,13 +348,13 @@ func TestMigrate_ReparentReconciliation_NonConvergenceFailsLoudly(t *testing.T) 
 	if !strings.Contains(es, `"t"`) && !strings.Contains(es, "[t]") {
 		t.Errorf("err = %v; want the still-touched table t named", err)
 	}
-	// The bound is reconcileMaxRounds redos before giving up (one TRUNCATE per
-	// round) — never an unbounded spin.
+	// The bound is migcore.ReconcileMaxRounds redos before giving up (one
+	// TRUNCATE per round) — never an unbounded spin.
 	tgt.mu.Lock()
 	redos := tgt.truncateCount["t"]
 	tgt.mu.Unlock()
-	if redos != reconcileMaxRounds {
-		t.Errorf("table t redos = %d; want exactly %d (the bounded round cap)", redos, reconcileMaxRounds)
+	if redos != migcore.ReconcileMaxRounds {
+		t.Errorf("table t redos = %d; want exactly %d (the bounded round cap)", redos, migcore.ReconcileMaxRounds)
 	}
 }
 

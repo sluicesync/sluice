@@ -278,8 +278,8 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	// the walsender silently fast-forward past the WAL in between —
 	// the incremental SUCCEEDS while the chain silently misses those
 	// writes. The preflight converts that into a loud refusal naming
-	// `backup full --chain-slot` as the fix (see [preflightChainResume]).
-	if err := preflightChainResume(ctx, b.Source, b.SourceDSN, startPos); err != nil {
+	// `backup full --chain-slot` as the fix (see [migcore.PreflightChainResume]).
+	if err := migcore.PreflightChainResume(ctx, b.Source, b.SourceDSN, startPos); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("incremental: chain preflight: %w", err))
 	}
 

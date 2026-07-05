@@ -451,8 +451,8 @@ func (b *BackupStream) Run(ctx context.Context) error {
 		return fmt.Errorf("stream: encryption: %w", err)
 	}
 
-	// 2.5. Chain-resume preflight (see [preflightChainResume]).
-	if err := preflightChainResume(ctx, b.Source, b.SourceDSN, startPos); err != nil {
+	// 2.5. Chain-resume preflight (see [migcore.PreflightChainResume]).
+	if err := migcore.PreflightChainResume(ctx, b.Source, b.SourceDSN, startPos); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("stream: chain preflight: %w", err))
 	}
 

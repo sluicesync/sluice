@@ -214,7 +214,7 @@ type Restore struct {
 }
 
 // reparentMark returns the observer callback to wire onto each writer, or
-// nil when no tracker is constructed (so applyReparentObserver no-ops).
+// nil when no tracker is constructed (so migcore.ApplyReparentObserver no-ops).
 func (r *Restore) reparentMark() func(string) {
 	if r.reparentTracker == nil {
 		return nil
@@ -551,32 +551,9 @@ func (r *Restore) openTargetRowWriter(ctx context.Context) (ir.RowWriter, error)
 	// table it sees hit a grow/reparent transient — the reconciliation
 	// phase re-derives those tables. nil observer (no tracker / non-restore
 	// callers) is a no-op.
-	applyReparentObserver(rw, r.reparentMark())
+	migcore.ApplyReparentObserver(rw, r.reparentMark())
 	return rw, nil
 }
-
-// applyReparentObserver wires the run's reparent-touched observer (ADR-0113)
-// onto a freshly-opened writer that opts in via [ir.ReparentObserverSetter].
-// nil observe (no tracker constructed) or an engine that doesn't implement
-// the setter is a no-op — pre-ADR-0113 behaviour, byte-for-byte. Called
-// alongside migcore.ApplyGrowGate, on the single openTargetRowWriter path, so every
-// restore writer reports through the same tracker.
-func applyReparentObserver(target any, observe func(table string)) {
-	if observe == nil {
-		return
-	}
-	if setter, ok := target.(ir.ReparentObserverSetter); ok {
-		setter.SetReparentObserver(observe)
-	}
-}
-
-// reconcileMaxRounds bounds the ADR-0113 reconciliation loop: a target that
-// reparents on EVERY serial redo is wedged (not a transient grow), so after
-// this many rounds the restore surfaces loudly rather than looping forever.
-// In practice one round suffices — by reconciliation time the volume has
-// grown to its final size, so a redo writes into an already-grown volume and
-// triggers no fresh reparent.
-const reconcileMaxRounds = 10
 
 // reconcileReparentTouched re-derives every reparent-touched table from its
 // chunks (ADR-0113) so it exactly matches the manifest, recovering rows a
@@ -598,10 +575,10 @@ func (r *Restore) reconcileReparentTouched(ctx context.Context, rw ir.RowWriter,
 		if len(touched) == 0 {
 			return nil
 		}
-		if round > reconcileMaxRounds {
+		if round > migcore.ReconcileMaxRounds {
 			return fmt.Errorf(
 				"restore: reparent reconciliation did not converge after %d rounds — the target keeps reparenting during the serial redo (still-touched: %v); re-run with --bulk-parallelism 1 or restore into a pre-sized / Metal target",
-				reconcileMaxRounds, touched,
+				migcore.ReconcileMaxRounds, touched,
 			)
 		}
 		slog.WarnContext(

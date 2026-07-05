@@ -559,7 +559,7 @@ func (m *Migrator) phaseBuildCopyDeps(ctx context.Context, schema *ir.Schema, rr
 		// grow-gate cannot. Constructed unconditionally (no EnableX config bool,
 		// the v0.99.51 zero-value trap); inert when no reparent fires (the
 		// common case — drain is empty, zero cost). Wired onto every cold-copy
-		// writer via applyReparentObserver. Only MySQL implements the observer
+		// writer via migcore.ApplyReparentObserver. Only MySQL implements the observer
 		// setter today, so this is the confirmed-affected PlanetScale-MySQL path
 		// first (ADR-0113 scope); a no-op on PG, which never reparents into the
 		// silent-under-copy class.

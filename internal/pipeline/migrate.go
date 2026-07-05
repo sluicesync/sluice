@@ -1171,7 +1171,7 @@ func runBulkCopyPhases(
 		// re-derives the touched tables, reusing this same rw so a redo that
 		// itself reparents re-marks for another round. nil-safe (no tracker /
 		// non-MySQL writer).
-		applyReparentObserver(rw, parallel.reparentMark())
+		migcore.ApplyReparentObserver(rw, parallel.reparentMark())
 	}
 
 	// ADR-0123: build the run's SINGLE connection-budget gate — one shared
@@ -1416,7 +1416,7 @@ func runBulkCopyPhases(
 // observer), so a redo that itself hits a reparent re-marks its table for the
 // next round; the loop ends when a full pass drains empty — the sound proxy
 // for "no reparent ⇒ no loss", since a reparent is the only loss vector.
-// Bounded by [reconcileMaxRounds] so a target that reparents on every serial
+// Bounded by [migcore.ReconcileMaxRounds] so a target that reparents on every serial
 // redo surfaces loudly rather than looping forever. No-op when no reparent
 // occurred (the common case — the tracker drains empty at zero cost).
 func reconcileMigrateReparentTouched(
@@ -1440,10 +1440,10 @@ func reconcileMigrateReparentTouched(
 		if len(touched) == 0 {
 			return nil
 		}
-		if round > reconcileMaxRounds {
+		if round > migcore.ReconcileMaxRounds {
 			return fmt.Errorf(
 				"migrate: reparent reconciliation did not converge after %d rounds — the target keeps reparenting during the serial redo (still-touched: %v); re-run with --bulk-parallelism 1 or migrate into a pre-sized / Metal target",
-				reconcileMaxRounds, touched,
+				migcore.ReconcileMaxRounds, touched,
 			)
 		}
 		slog.WarnContext(

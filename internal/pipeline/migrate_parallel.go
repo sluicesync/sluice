@@ -216,7 +216,7 @@ type parallelBulkCopyDeps struct {
 	// the (replayable, static-precondition) SOURCE so each matches the source
 	// regardless of what the reparent dropped. Constructed once per migrate run
 	// in [Migrator.phaseBuildCopyDeps]; wired onto every cold-copy writer via
-	// [applyReparentObserver] (the same observer the restore wires). nil ⇒ no
+	// [migcore.ApplyReparentObserver] (the same observer the restore wires). nil ⇒ no
 	// tracking (pre-ADR-0141 behaviour, byte-for-byte — e.g. the sync
 	// cold-start deps, which build no tracker).
 	reparentTracker *migcore.ReparentTracker
@@ -224,7 +224,7 @@ type parallelBulkCopyDeps struct {
 
 // reparentMark returns the observer callback to wire onto each cold-copy
 // writer (ADR-0141), or nil when no tracker is constructed so
-// [applyReparentObserver] no-ops. Mirrors [Restore.reparentMark].
+// [migcore.ApplyReparentObserver] no-ops. Mirrors [Restore.reparentMark].
 func (d *parallelBulkCopyDeps) reparentMark() func(string) {
 	if d == nil || d.reparentTracker == nil {
 		return nil
@@ -747,7 +747,7 @@ func openOneChunkConn(ctx context.Context, deps *parallelBulkCopyDeps) (ir.RowRe
 	// migrate reconciliation phase re-derives every reparent-touched table.
 	// nil-safe (no-op when the run built no tracker — the migrate path always
 	// does — or the engine doesn't implement ir.ReparentObserverSetter).
-	applyReparentObserver(wr, deps.reparentMark())
+	migcore.ApplyReparentObserver(wr, deps.reparentMark())
 	return rdr, wr, nil
 }
 

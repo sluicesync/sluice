@@ -727,7 +727,7 @@ func (b *Backup) resolveResumeState(ctx context.Context) (prior *irbackup.Manife
 	}
 
 	if b.ChainSlot && (resumeAnchor.Engine != "" || resumeAnchor.Token != "") {
-		if err := preflightChainResume(ctx, b.Source, b.SourceDSN, resumeAnchor); err != nil {
+		if err := migcore.PreflightChainResume(ctx, b.Source, b.SourceDSN, resumeAnchor); err != nil {
 			return nil, ir.Position{}, fmt.Errorf(
 				"backup: resume --chain-slot: the chain slot cannot serve the interrupted attempt's anchor, so resuming would silently gap the chain: %w. "+
 					"To deliberately start over instead, pass --force-overwrite (and drop the slot via `sluice slot drop` if it still exists)", err,
