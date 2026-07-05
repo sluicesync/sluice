@@ -616,12 +616,12 @@ jobs:
       - name: check -run filter coverage
         run: bash scripts/check-run-filter-coverage.sh
 
-      # skills↔CLI doc-sync: every --flag in skills/ must resolve to a real
-      # kong flag in cmd/sluice (explicit name: tag OR the field kong
-      # auto-derives it from). A renamed/removed flag fails here, not in a
-      # user's agent session — the in-repo advantage the skills pack exists
-      # for (docs/research/ai-skills-pack.md, "Repo location").
-      - name: check skills flag coverage
+      # skills↔CLI doc-sync: every --flag AND `sluice <subcommand>` referenced
+      # in skills/ must resolve to a real kong flag / command in cmd/sluice. A
+      # renamed/removed flag or subcommand fails here, not in a user's agent
+      # session — the in-repo advantage the skills pack exists for
+      # (docs/research/ai-skills-pack.md, "Repo location").
+      - name: check skills CLI-surface coverage
         run: bash scripts/check-skills-flags.sh
 
       - uses: golangci/golangci-lint-action@v9.2.1

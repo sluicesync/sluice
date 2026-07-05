@@ -8,9 +8,9 @@
 # in-repo advantage the skills pack was placed in this repo for (see
 # docs/research/ai-skills-pack.md, "Repo location").
 #
-# Deliberately scoped to FLAGS (the most drift-prone + copy-paste-hazardous
-# surface). Subcommand drift is caught less directly by the same authoring
-# discipline; extend here if it becomes a problem.
+# Covers both --flags (verified against kong flag definitions) and the
+# `sluice <subcommand>` paths skills reference (verified against the kong
+# command tree). A renamed/removed flag OR subcommand fails CI here.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -54,9 +54,39 @@ for f in $flags; do
 	missing=1
 done
 
-if [ "$missing" != 0 ]; then
-	echo ""
-	echo "check-skills-flags FAILED: fix the skill to name the current flag, or add the flag. (skills are the in-repo playbooks under skills/.)"
+# --- Subcommands -----------------------------------------------------------
+# Every command word a skill uses inside a backtick `sluice …` span (before any
+# flag) must be a real kong command. The command-name set is the explicit
+# cmd:"name" tags plus the kebab-cased field name of every cmd:"" (auto-named)
+# subcommand field. Backtick-scoping avoids prose false positives, and
+# `<placeholder>` spans are excluded (the [a-z -] class has no '<').
+cmdset="$(mktemp)"
+{
+	grep -rhoE 'cmd:"[a-z][a-z-]+"' cmd/sluice/*.go 2>/dev/null | sed -E 's/cmd:"([a-z-]+)"/\1/'
+	grep -rhE '`[^`]*cmd:""' cmd/sluice/*.go 2>/dev/null |
+		grep -oE '^[[:space:]]+[A-Z][A-Za-z0-9]+' | sed 's/[[:space:]]//g' |
+		sed -E 's/([a-z0-9])([A-Z])/\1-\2/g' | tr 'A-Z' 'a-z'
+} | sort -u >"$cmdset"
+
+if [ ! -s "$cmdset" ]; then
+	echo "check-skills-flags: extracted ZERO kong commands from cmd/sluice — extraction broke. Failing."
+	rm -f "$cmdset"
 	exit 1
 fi
-echo "check-skills-flags: all $(echo "$flags" | wc -l | tr -d ' ') distinct skill flags resolve to a real CLI flag."
+
+cmd_words=$(grep -rhoE '`sluice [a-z][a-z -]*`' skills/ 2>/dev/null |
+	sed 's/`//g; s/^sluice //; s/ --.*$//' |
+	tr ' ' '\n' | grep -E '^[a-z][a-z-]+$' | sort -u || true)
+for c in $cmd_words; do
+	grep -qxF "$c" "$cmdset" && continue
+	echo "SKILLS-DRIFT: subcommand '${c}' is referenced (\`sluice … ${c} …\`) in skills/ but is not a kong command in cmd/sluice/"
+	missing=1
+done
+rm -f "$cmdset"
+
+if [ "$missing" != 0 ]; then
+	echo ""
+	echo "check-skills-flags FAILED: a skill names a flag or subcommand that no longer exists in the CLI. Fix the skill, or add the flag/command. (skills are the in-repo playbooks under skills/.)"
+	exit 1
+fi
+echo "check-skills-flags: all $(echo "$flags" | wc -l | tr -d ' ') skill flags and $(echo "$cmd_words" | wc -l | tr -d ' ') skill subcommands resolve to a real CLI surface."
