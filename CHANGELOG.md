@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.185] - 2026-07-05
+
+### Fixed
+
+- **`--encrypt-mode` omission now actually inherits an existing chain's mode from the CLI (Bug 180; completes the v0.99.184 Bug 179 fix).** v0.99.184 added an "inherit the chain's mode when `--encrypt-mode` is omitted" branch, but it was unreachable from the CLI: the flag carried a kong `default:"per-chain"` and `buildBackupEncryption` collapsed `""`→per-chain, so an omitted flag arrived as an explicit `per-chain`. Extending a `per-chunk` encrypted chain while omitting the flag was therefore *refused* (`--encrypt-mode=per-chain conflicts with the chain's mode per-chunk`), and the tool's own hint ("omit `--encrypt-mode` to inherit it") could not be satisfied — the operator had to pass `--encrypt-mode=per-chunk` explicitly. Loud and zero-loss (the un-restorable *class* stayed closed — a mode mismatch is refused at build, never silently un-restorable), but it defeated the release's headline behavior and printed remediation. Fixed at all three points where the mode was prematurely defaulted: the kong flag drops its per-chain default and admits the empty value so omission resolves to `""` (distinguishable from an explicit `per-chain`); `buildBackupEncryption` forwards `""` instead of collapsing it, leaving the inherit/default decision to the orchestrator; and `setupChainEncryption` writes the resolved mode back so the chunk-writer agrees with the manifest on a full-*resume* inherit. A fresh full with an omitted flag still defaults to `per-chain` (unchanged), and an explicit conflicting mode is still refused loudly. Pinned *through* the kong parser (not by setting the field directly — the Bug-74 lesson: the earlier programmatic pin greened a code path no CLI user could reach): an omitted `--encrypt-mode` parses to `""`, explicit values are preserved, an invalid value is rejected by the enum, and `buildBackupEncryption` forwards `""`.
+
 ## [0.99.184] - 2026-07-05
 
 ### Fixed
