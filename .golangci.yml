@@ -71,22 +71,26 @@ linters:
     - gocyclo       # cyclomatic-complexity ceiling
 
   settings:
-    # Ceilings sit just above TODAY's high-water marks (funlen: 202 =
-    # postgres populateColumns; gocyclo: 58 = BackupStream.Run in the
-    # still-unsplit stream.go) so they land with zero nolint debt while
-    # still failing the next 700-line/complexity-95 accretion (what
-    # runOnce was before the M2.6 carve). RATCHET DOWN as the remaining
-    # large functions get split — target 150/30 once stream.go has had
-    # its pass; never raise these to admit new code.
+    # First ratchet turn (audit 3.5, post-3.7b carve): lowered from the
+    # original 210/60 high-water marks to 180/45 after splitting the 14
+    # functions that exceeded them — the postgres populate*/translateType
+    # readers, the backup/stream/migrate orchestrators (incl. carving
+    # BackupStream.Run into newRolloverLoop + commit/empty steps and
+    # dropping its funlen nolint), the appliershared batch loop, the CLI
+    # .run dispatchers, and the mysql VStream snapshot opener. The
+    # ceilings still sit ABOVE anything the refactored code hits, so a
+    # trip means "carve a phase out", not "fight the linter". RATCHET
+    # DOWN further as large functions get split — next target 150/30;
+    # never raise these to admit new code.
     funlen:
-      lines: 210
+      lines: 180
       # Count lines only; a statement ceiling double-charges dense
       # table literals without adding signal on top of `lines`.
       statements: -1
       ignore-comments: true
 
     gocyclo:
-      min-complexity: 60
+      min-complexity: 45
 
     errcheck:
       # Don't require checking errors from these functions. Adjust as
