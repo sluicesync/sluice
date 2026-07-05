@@ -1339,6 +1339,12 @@ func (b *Backup) setupChainEncryption(manifest, prior *irbackup.Manifest) ([]byt
 	if mode == "" {
 		mode = crypto.EncryptModePerChain
 	}
+	// Bug 180: make the resolved mode authoritative for the sibling
+	// resolveChunkCEK too (it reads b.Encryption.Mode). Without this, an
+	// omitted --encrypt-mode resuming a per-chunk full would stamp the
+	// manifest per-chunk here while resolveChunkCEK defaulted per-chain — the
+	// same un-restorable mode-source split the chain-extend fix closes.
+	enc.Mode = mode
 	chainEnc := &irbackup.ChainEncryption{
 		Algorithm: crypto.AlgorithmAESGCM,
 		Mode:      mode,

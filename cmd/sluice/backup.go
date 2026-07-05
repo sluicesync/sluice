@@ -44,7 +44,14 @@ type EncryptionFlags struct {
 	AzureKeyVaultID    string `name:"azure-key-vault-id" help:"Azure Key Vault key identifier URL for envelope encryption (Phase 6.3). Format: https://VAULT.vault.azure.net/keys/KEY[/VERSION] (or managedhsm.azure.net for HSM-backed vaults). Mutually exclusive with other --*-key flags. Auth via DefaultAzureCredential (az login, managed identity, or AZURE_* env vars)." placeholder:"URL"`
 	AzureWrapAlgorithm string `name:"azure-wrap-algorithm" help:"Override the Azure Key Vault wrap algorithm. Defaults to RSA-OAEP-256 (works for software-protected RSA keys). HSM-backed AES keys need 'A256KW'." placeholder:"ALG"`
 
-	EncryptMode string `name:"encrypt-mode" enum:"per-chain,per-chunk" default:"per-chain" help:"Encryption mode: 'per-chain' (single CEK per chain; default; one KEK derive / KMS Decrypt per restore) or 'per-chunk' (one CEK per chunk; defense-in-depth at the cost of per-chunk wrap)."`
+	// No kong default: an OMITTED --encrypt-mode must stay empty so the
+	// backup orchestrator can distinguish "operator didn't choose" (inherit
+	// the chain's mode when extending an encrypted chain; default to
+	// per-chain for a fresh full) from an explicit choice (which is enforced
+	// against the chain's mode — Bug 179/180). A kong default of "per-chain"
+	// made omission indistinguishable from an explicit per-chain and left
+	// the inherit path unreachable. The trailing comma admits the empty value.
+	EncryptMode string `name:"encrypt-mode" enum:"per-chain,per-chunk," default:"" help:"Encryption mode. Omit to inherit an existing chain's mode (a fresh full defaults to per-chain): 'per-chain' (single CEK per chain; one KEK derive / KMS Decrypt per restore) or 'per-chunk' (one CEK per chunk; defense-in-depth at the cost of per-chunk wrap). Must match the chain's mode when extending an encrypted chain."`
 }
 
 // resolvePassphrase returns the operator's passphrase from whichever
@@ -125,10 +132,11 @@ func (e *EncryptionFlags) buildBackupEncryption() (*lineage.BackupEncryption, er
 	if err := e.validateKeySources(); err != nil {
 		return nil, err
 	}
+	// Pass an omitted mode through as "" — the orchestrator resolves it
+	// (inherit the chain's mode / default a fresh full to per-chain). Do NOT
+	// collapse it to per-chain here; that is the Bug 180 defect that made the
+	// inherit branch unreachable from the CLI.
 	mode := e.EncryptMode
-	if mode == "" {
-		mode = crypto.EncryptModePerChain
-	}
 	switch {
 	case e.KMSKeyARN != "":
 		env, err := crypto.NewKMSEnvelope(kongContext(), e.KMSKeyARN, kmsOpts(e.KMSRegion)...)
