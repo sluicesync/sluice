@@ -439,7 +439,7 @@ func (r *Restore) Run(ctx context.Context) error {
 	// first classified grow-transient on any worker quiesces ALL workers so
 	// a concurrent restore can't outrun the target's replication across a
 	// storage-grow reparent (the Track-C live silent-under-copy fix).
-	r.growGate = growGateOrNil(newGrowGate(ctx, nil))
+	r.growGate = migcore.GrowGateOrNil(migcore.NewGrowGate(ctx, nil))
 	// ADR-0113: the reparent tracker collects tables that hit a grow/reparent
 	// transient during apply, so the reconciliation phase below can re-derive
 	// exactly those from their chunks (recovering rows the reparent dropped
@@ -583,7 +583,7 @@ func (r *Restore) openTargetRowWriter(ctx context.Context) (ir.RowWriter, error)
 	// all concurrent restore workers through a storage-grow reparent instead
 	// of independently hammering (the Track-C silent-under-copy fix). nil
 	// gate (direct unit-test callers that don't go through Run) is a no-op.
-	applyGrowGate(rw, r.growGate)
+	migcore.ApplyGrowGate(rw, r.growGate)
 	// ADR-0113: wire the run's reparent observer so this writer reports any
 	// table it sees hit a grow/reparent transient — the reconciliation
 	// phase re-derives those tables. nil observer (no tracker / non-restore
@@ -596,7 +596,7 @@ func (r *Restore) openTargetRowWriter(ctx context.Context) (ir.RowWriter, error)
 // onto a freshly-opened writer that opts in via [ir.ReparentObserverSetter].
 // nil observe (no tracker constructed) or an engine that doesn't implement
 // the setter is a no-op — pre-ADR-0113 behaviour, byte-for-byte. Called
-// alongside applyGrowGate, on the single openTargetRowWriter path, so every
+// alongside migcore.ApplyGrowGate, on the single openTargetRowWriter path, so every
 // restore writer reports through the same tracker.
 func applyReparentObserver(target any, observe func(table string)) {
 	if observe == nil {

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // recordingGateWriter is a minimal ir.RowWriter that ALSO implements
@@ -43,7 +44,7 @@ func (w *recordingGateWriter) SetGrowGate(g ir.GrowGate) {
 // at the top of runBulkCopyPhases is exercised.
 func TestRunBulkCopyPhases_WiresGrowGateOntoTopLevelWriter(t *testing.T) {
 	ctx := context.Background()
-	gate := growGateOrNil(newGrowGate(ctx, nil))
+	gate := migcore.GrowGateOrNil(migcore.NewGrowGate(ctx, nil))
 	if gate == nil {
 		t.Fatal("test setup: gate should be non-nil")
 	}
@@ -95,6 +96,6 @@ func TestRunBulkCopyPhases_NilGrowGateIsNoOp(t *testing.T) {
 		t.Fatalf("runBulkCopyPhases(nil gate): %v", err)
 	}
 	if rw.setCalled {
-		t.Error("SetGrowGate was called with a nil run gate — applyGrowGate must no-op on a nil gate (pre-ADR-0110 behaviour)")
+		t.Error("SetGrowGate was called with a nil run gate — migcore.ApplyGrowGate must no-op on a nil gate (pre-ADR-0110 behaviour)")
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // These tests drive the FULL migrate per-table copy (bulkCopyOneTable +
@@ -369,7 +370,7 @@ func TestSourceReadRetryE2E_GrowGate_QuiescesAndConverges(t *testing.T) {
 	eng := &fakeTargetEngine{target: tgt, source: src}
 
 	deps := chunkDeps(eng)
-	gate := newGrowGate(context.Background(), nil)
+	gate := migcore.NewGrowGate(context.Background(), nil)
 	var tripped, awaited int64
 	obs := &observingGate{inner: gate, trips: &tripped, awaits: &awaited}
 	deps.growGate = obs
@@ -390,7 +391,7 @@ func TestSourceReadRetryE2E_GrowGate_QuiescesAndConverges(t *testing.T) {
 // preserving the real FSM behaviour (so the e2e exercises the actual
 // coordinator, not a no-op stub).
 type observingGate struct {
-	inner  *growGate
+	inner  *migcore.GrowGate
 	trips  *int64
 	awaits *int64
 }

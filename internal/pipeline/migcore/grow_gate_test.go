@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package pipeline
+package migcore
 
 import (
 	"context"
@@ -19,21 +19,21 @@ import (
 // withFastSourceReadBackoff.
 func withFastGrowGate(t *testing.T) {
 	t.Helper()
-	base, capDur, maxHold := growGateBackoffBase, growGateBackoffCap, growGateMaxHold
-	growGateBackoffBase = time.Millisecond
-	growGateBackoffCap = time.Millisecond
-	growGateMaxHold = 5 * time.Second
+	base, capDur, maxHold := GrowGateBackoffBase, GrowGateBackoffCap, GrowGateMaxHold
+	GrowGateBackoffBase = time.Millisecond
+	GrowGateBackoffCap = time.Millisecond
+	GrowGateMaxHold = 5 * time.Second
 	t.Cleanup(func() {
-		growGateBackoffBase = base
-		growGateBackoffCap = capDur
-		growGateMaxHold = maxHold
+		GrowGateBackoffBase = base
+		GrowGateBackoffCap = capDur
+		GrowGateMaxHold = maxHold
 	})
 }
 
 // TestGrowGate_OpenAwaitIsInstant pins the hot-path fast read: an
 // un-tripped gate returns from Await immediately (no block).
 func TestGrowGate_OpenAwaitIsInstant(t *testing.T) {
-	g := newGrowGate(context.Background(), nil)
+	g := NewGrowGate(context.Background(), nil)
 	done := make(chan error, 1)
 	go func() { done <- g.Await(context.Background()) }()
 	select {
@@ -50,17 +50,17 @@ func TestGrowGate_OpenAwaitIsInstant(t *testing.T) {
 // pre-ADR-0110 behaviour: a nil ir.GrowGate (via the package helpers) makes
 // Await an instant nil and Trip a no-op — no panic, no block.
 func TestGrowGate_NilGateHelpersArePreADRNoOps(t *testing.T) {
-	if err := awaitGrowGate(context.Background(), nil); err != nil {
-		t.Fatalf("awaitGrowGate(nil) = %v, want nil", err)
+	if err := AwaitGrowGate(context.Background(), nil); err != nil {
+		t.Fatalf("AwaitGrowGate(nil) = %v, want nil", err)
 	}
-	tripGrowGate(nil, "no-op") // must not panic
-	// growGateOrNil(nil) must be a TRUE nil interface (no typed-nil trap).
-	if got := growGateOrNil(nil); got != nil {
-		t.Fatal("growGateOrNil(nil) must be a true nil interface")
+	TripGrowGate(nil, "no-op") // must not panic
+	// GrowGateOrNil(nil) must be a TRUE nil interface (no typed-nil trap).
+	if got := GrowGateOrNil(nil); got != nil {
+		t.Fatal("GrowGateOrNil(nil) must be a true nil interface")
 	}
 	// And a non-nil concrete gate round-trips to a non-nil interface.
-	if got := growGateOrNil(newGrowGate(context.Background(), nil)); got == nil {
-		t.Fatal("growGateOrNil(non-nil) must yield a non-nil interface")
+	if got := GrowGateOrNil(NewGrowGate(context.Background(), nil)); got == nil {
+		t.Fatal("GrowGateOrNil(non-nil) must yield a non-nil interface")
 	}
 }
 
@@ -71,7 +71,7 @@ func TestGrowGate_TripPausesThenReopens(t *testing.T) {
 	captureSlog(t)
 	withFastGrowGate(t)
 
-	g := newGrowGate(context.Background(), nil)
+	g := NewGrowGate(context.Background(), nil)
 	g.Trip("storage grow")
 
 	done := make(chan error, 1)
@@ -94,7 +94,7 @@ func TestGrowGate_ReopenWakesAllParkedAwaiters(t *testing.T) {
 	captureSlog(t)
 	withFastGrowGate(t)
 
-	g := newGrowGate(context.Background(), nil)
+	g := NewGrowGate(context.Background(), nil)
 	g.Trip("grow")
 
 	const n = 32
@@ -132,10 +132,10 @@ func TestGrowGate_ConcurrentTripsCoalesceOneWindow(t *testing.T) {
 	captureSlog(t)
 	withFastGrowGate(t)
 	// Hold long enough that the whole concurrent burst lands while closed.
-	growGateBackoffBase = 50 * time.Millisecond
-	growGateBackoffCap = 50 * time.Millisecond
+	GrowGateBackoffBase = 50 * time.Millisecond
+	GrowGateBackoffCap = 50 * time.Millisecond
 
-	g := newGrowGate(context.Background(), nil)
+	g := NewGrowGate(context.Background(), nil)
 	var owners atomic.Int32
 	g.onOwnerStart = func() { owners.Add(1) }
 
@@ -169,17 +169,17 @@ func TestGrowGate_CtxCancelUnwindsAllParked(t *testing.T) {
 	captureSlog(t)
 	// A long hold so the gate stays closed for the whole test — the only
 	// thing that should release the Awaiters is the ctx cancel.
-	base, capDur, maxHold := growGateBackoffBase, growGateBackoffCap, growGateMaxHold
-	growGateBackoffBase = time.Hour
-	growGateBackoffCap = time.Hour
-	growGateMaxHold = time.Hour
+	base, capDur, maxHold := GrowGateBackoffBase, GrowGateBackoffCap, GrowGateMaxHold
+	GrowGateBackoffBase = time.Hour
+	GrowGateBackoffCap = time.Hour
+	GrowGateMaxHold = time.Hour
 	t.Cleanup(func() {
-		growGateBackoffBase = base
-		growGateBackoffCap = capDur
-		growGateMaxHold = maxHold
+		GrowGateBackoffBase = base
+		GrowGateBackoffCap = capDur
+		GrowGateMaxHold = maxHold
 	})
 
-	g := newGrowGate(context.Background(), nil)
+	g := NewGrowGate(context.Background(), nil)
 	g.Trip("grow that won't lift on its own")
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -212,18 +212,18 @@ func TestGrowGate_CtxCancelUnwindsAllParked(t *testing.T) {
 func TestGrowGate_OwnerExitsOnRunCtxCancel(t *testing.T) {
 	captureSlog(t)
 	// Long holds so only the run-ctx cancel can end the window.
-	base, capDur, maxHold := growGateBackoffBase, growGateBackoffCap, growGateMaxHold
-	growGateBackoffBase = time.Hour
-	growGateBackoffCap = time.Hour
-	growGateMaxHold = time.Hour
+	base, capDur, maxHold := GrowGateBackoffBase, GrowGateBackoffCap, GrowGateMaxHold
+	GrowGateBackoffBase = time.Hour
+	GrowGateBackoffCap = time.Hour
+	GrowGateMaxHold = time.Hour
 	t.Cleanup(func() {
-		growGateBackoffBase = base
-		growGateBackoffCap = capDur
-		growGateMaxHold = maxHold
+		GrowGateBackoffBase = base
+		GrowGateBackoffCap = capDur
+		GrowGateMaxHold = maxHold
 	})
 
 	runCtx, cancelRun := context.WithCancel(context.Background())
-	g := newGrowGate(runCtx, nil)
+	g := NewGrowGate(runCtx, nil)
 	g.Trip("grow")
 
 	// Park one Awaiter on its own ctx (not the run ctx) so the ONLY thing
@@ -251,17 +251,17 @@ func TestGrowGate_OwnerExitsOnRunCtxCancel(t *testing.T) {
 // gate reopens within a bounded multiple of it.
 func TestGrowGate_MaxHoldBoundsAGenuinelyDeadTarget(t *testing.T) {
 	captureSlog(t)
-	base, capDur, maxHold := growGateBackoffBase, growGateBackoffCap, growGateMaxHold
-	growGateBackoffBase = time.Millisecond
-	growGateBackoffCap = time.Millisecond
-	growGateMaxHold = 50 * time.Millisecond
+	base, capDur, maxHold := GrowGateBackoffBase, GrowGateBackoffCap, GrowGateMaxHold
+	GrowGateBackoffBase = time.Millisecond
+	GrowGateBackoffCap = time.Millisecond
+	GrowGateMaxHold = 50 * time.Millisecond
 	t.Cleanup(func() {
-		growGateBackoffBase = base
-		growGateBackoffCap = capDur
-		growGateMaxHold = maxHold
+		GrowGateBackoffBase = base
+		GrowGateBackoffCap = capDur
+		GrowGateMaxHold = maxHold
 	})
 
-	g := newGrowGate(context.Background(), nil)
+	g := NewGrowGate(context.Background(), nil)
 	g.Trip("dead target")
 
 	// Hammer re-trips so the window keeps trying to extend; max-hold must
@@ -299,18 +299,18 @@ func TestGrowGate_MaxHoldBoundsAGenuinelyDeadTarget(t *testing.T) {
 // lane error.
 func TestGrowGate_ProactiveReleasesOnRecovery(t *testing.T) {
 	captureSlog(t)
-	base, capDur, maxHold := growGateBackoffBase, growGateBackoffCap, growGateMaxHold
-	growGateBackoffBase = 5 * time.Millisecond
-	growGateBackoffCap = 5 * time.Millisecond
-	growGateMaxHold = time.Hour // far away — recovery must be what reopens
+	base, capDur, maxHold := GrowGateBackoffBase, GrowGateBackoffCap, GrowGateMaxHold
+	GrowGateBackoffBase = 5 * time.Millisecond
+	GrowGateBackoffCap = 5 * time.Millisecond
+	GrowGateMaxHold = time.Hour // far away — recovery must be what reopens
 	t.Cleanup(func() {
-		growGateBackoffBase = base
-		growGateBackoffCap = capDur
-		growGateMaxHold = maxHold
+		GrowGateBackoffBase = base
+		GrowGateBackoffCap = capDur
+		GrowGateMaxHold = maxHold
 	})
 
 	var healthy atomic.Bool // starts false (not recovered)
-	g := newGrowGate(context.Background(), healthy.Load)
+	g := NewGrowGate(context.Background(), healthy.Load)
 	g.Trip("proactive: storage near boundary")
 
 	// Continuously re-trip so the QUIET-CYCLE reopen is suppressed (retripped
@@ -359,20 +359,20 @@ func TestGrowGate_ProactiveReleasesOnRecovery(t *testing.T) {
 // proactive pause rode the full max-hold (a flat ~20-min stall live).
 func TestGrowGate_ProactiveQuietCyclesNotHeldToMaxHold(t *testing.T) {
 	captureSlog(t)
-	base, capDur, maxHold := growGateBackoffBase, growGateBackoffCap, growGateMaxHold
-	growGateBackoffBase = 5 * time.Millisecond
-	growGateBackoffCap = 5 * time.Millisecond
-	growGateMaxHold = time.Hour // far away — the quiet cycle, NOT max-hold, must reopen
+	base, capDur, maxHold := GrowGateBackoffBase, GrowGateBackoffCap, GrowGateMaxHold
+	GrowGateBackoffBase = 5 * time.Millisecond
+	GrowGateBackoffCap = 5 * time.Millisecond
+	GrowGateMaxHold = time.Hour // far away — the quiet cycle, NOT max-hold, must reopen
 	t.Cleanup(func() {
-		growGateBackoffBase = base
-		growGateBackoffCap = capDur
-		growGateMaxHold = maxHold
+		GrowGateBackoffBase = base
+		GrowGateBackoffCap = capDur
+		GrowGateMaxHold = maxHold
 	})
 
 	// recovered probe that NEVER recovers (mimics the gauges being absent/high
 	// across a reparent) — so ONLY the quiet cycle can reopen it.
 	neverRecovered := func() bool { return false }
-	g := newGrowGate(context.Background(), neverRecovered)
+	g := NewGrowGate(context.Background(), neverRecovered)
 	g.Trip("proactive: storage near boundary") // no further re-trips
 
 	done := make(chan error, 1)
@@ -393,7 +393,7 @@ func TestGrowGate_BackoffShape(t *testing.T) {
 	// Drive the per-instance backoff method directly (the production default
 	// envelope, snapshotted at construction) — no package-global mutation,
 	// so nothing can race a still-running owner from another test.
-	g := newGrowGate(context.Background(), nil)
+	g := NewGrowGate(context.Background(), nil)
 	g.backoffBase = 100 * time.Millisecond
 	g.backoffCap = 30 * time.Second
 
@@ -425,7 +425,7 @@ func TestGrowGate_ReTripAfterReopenStartsFreshWindow(t *testing.T) {
 	captureSlog(t)
 	withFastGrowGate(t)
 
-	g := newGrowGate(context.Background(), nil)
+	g := NewGrowGate(context.Background(), nil)
 	var owners atomic.Int32
 	g.onOwnerStart = func() { owners.Add(1) }
 

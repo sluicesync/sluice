@@ -682,8 +682,8 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	// database's cold-copy writer — runBulkCopyWithOpts reuses this rw
 	// across all fan-out workers (see coldStartRunCopy for the rationale).
 	// One gate per database cold-copy; nil provider ⇒ signal-driven only.
-	gate := growGateOrNil(newGrowGate(ctx, storageRecoveredProbe(ctx, s.TargetTelemetry)))
-	applyGrowGate(rw, gate)
+	gate := migcore.GrowGateOrNil(migcore.NewGrowGate(ctx, storageRecoveredProbe(ctx, s.TargetTelemetry)))
+	migcore.ApplyGrowGate(rw, gate)
 	s.startStorageHeadroomWatch(ctx, streamID, gate)
 
 	bulkOpts := bulkCopyOpts{Redactor: s.Redactor, NoIntraTableStealing: s.NoIntraTableStealing}

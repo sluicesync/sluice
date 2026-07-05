@@ -1163,7 +1163,7 @@ func runBulkCopyPhases(
 	// while the writers rode 74 real grow-window retries independently. nil gate
 	// or a non-setter writer ⇒ no-op (pre-ADR-0110 behaviour, byte-for-byte).
 	if parallel != nil {
-		applyGrowGate(rw, parallel.growGate)
+		migcore.ApplyGrowGate(rw, parallel.growGate)
 		// ADR-0141: wire the run's reparent observer onto the TOP-LEVEL writer
 		// here too, centrally, alongside the grow-gate — the single-reader /
 		// chunk-0 / fan-out lanes all flush through THIS rw, so a grow/reparent
@@ -1663,26 +1663,6 @@ func dryRunRowCounts(ctx context.Context, source ir.Engine, dsn string, schema *
 func closeIf(v any) {
 	if c, ok := v.(io.Closer); ok {
 		_ = c.Close()
-	}
-}
-
-// applyGrowGate wires the cold-copy run's shared coordinated-pause gate
-// (ADR-0110) onto a freshly-opened writer that opts into it via
-// [ir.GrowGateSetter]. Both engines implement the setter today (MySQL and
-// Postgres), so on a cold-copy run — where the gate is constructed
-// unconditionally (see [newGrowGate] in migrate_phases.go) — the writer
-// receives a non-nil gate and takes its grow-aware path. Any future engine
-// that does NOT implement the setter retains its per-lane behaviour
-// unchanged. A nil gate (non-cold-copy callers / direct unit tests) is a
-// no-op: the writer keeps its zero-value nil gate (pre-ADR-0110 behaviour).
-// Called immediately after each chunk/table writer opens, alongside
-// migcore.ApplyMaxBufferBytes, before any flush.
-func applyGrowGate(target any, gate ir.GrowGate) {
-	if gate == nil {
-		return
-	}
-	if setter, ok := target.(ir.GrowGateSetter); ok {
-		setter.SetGrowGate(gate)
 	}
 }
 

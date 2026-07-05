@@ -15,7 +15,7 @@
 // and breeding secondary 1205 lock-wait-timeouts. The target completes
 // the transition faster if left alone.
 //
-// growGate is ONE engine-neutral coordinated-pause primitive shared
+// GrowGate is ONE engine-neutral coordinated-pause primitive shared
 // across every cold-copy write lane in a run, tripped from two sources
 // driving the SAME mechanism:
 //
@@ -36,8 +36,8 @@
 // v0.99.51 zero-value trap — and the default for a non-PlanetScale /
 // no-config run is "signal-driven gate active"): with no trip source
 // firing it is inert (Await fast-paths the open read; the owner goroutine
-// is only spawned by the first Trip). A nil *growGate is threaded as a
-// nil [ir.GrowGate] via [growGateOrNil] so the typed-nil trap can't make a
+// is only spawned by the first Trip). A nil *GrowGate is threaded as a
+// nil [ir.GrowGate] via [GrowGateOrNil] so the typed-nil trap can't make a
 // nil concrete value look like a non-nil interface.
 //
 // What it does NOT do (the correctness contract, unchanged from
@@ -48,7 +48,7 @@
 // authoritative loud-on-exhaustion floor; the gate has its own max-hold
 // so a genuinely-dead target still surfaces rather than parking forever.
 
-package pipeline
+package migcore
 
 import (
 	"context"
@@ -62,7 +62,7 @@ import (
 // Cold-copy coordinated-pause bounds. The backoff SHAPE mirrors
 // ADR-0108/0109's per-lane retry envelope (100ms → … → 30s cap) so the
 // coordinated pause window matches the retry window the lanes already
-// tolerate. growGateMaxHold bounds the total coordinated pause: after
+// tolerate. GrowGateMaxHold bounds the total coordinated pause: after
 // this much continuous quiesce the gate force-reopens so each lane's own
 // retry budget (the authoritative floor) can take over and surface a
 // genuinely-dead target loudly. Each close→reopen cycle holds for one
@@ -76,27 +76,27 @@ import (
 // the cold-copy reparent-retry / source-read-retry helpers use.
 //
 // CRITICAL (the -race lesson, v0.99.100): these globals are read ONLY at
-// gate CONSTRUCTION — newGrowGate snapshots them into per-instance fields
+// gate CONSTRUCTION — NewGrowGate snapshots them into per-instance fields
 // (backoffBase / backoffCap / maxHold). The owner goroutine reads the
 // gate's OWN fields, never these globals, so a test's shrink-then-restore
 // of a global can never race a still-running owner from an earlier gate.
-// The first cut read growGateBackoffCap directly in runOwner and the
+// The first cut read GrowGateBackoffCap directly in runOwner and the
 // -race gate caught it racing a test's t.Cleanup restore; snapshotting at
 // construction removes the shared-mutable-global read from the hot path.
 var (
-	growGateBackoffBase = 100 * time.Millisecond
-	growGateBackoffCap  = 30 * time.Second
-	// growGateMaxHold ≈ the reparent-retry envelope (~15-20 min): long
+	GrowGateBackoffBase = 100 * time.Millisecond
+	GrowGateBackoffCap  = 30 * time.Second
+	// GrowGateMaxHold ≈ the reparent-retry envelope (~15-20 min): long
 	// enough to ride a prolonged multi-step storage-grow, short enough
 	// that a genuinely-wedged target surfaces via the lanes' own budgets
 	// rather than hiding behind a forever-closed gate.
-	growGateMaxHold = 20 * time.Minute
+	GrowGateMaxHold = 20 * time.Minute
 )
 
-// growGate is the concrete [ir.GrowGate] coordinator. State is open/closed
+// GrowGate is the concrete [ir.GrowGate] coordinator. State is open/closed
 // guarded by mu plus a closed-channel-broadcast reopenCh (re-created on
 // each close→open) so Await can park without holding mu across the block.
-type growGate struct {
+type GrowGate struct {
 	mu sync.Mutex
 
 	// closed is the gate state. When false (the common case) Await returns
@@ -131,7 +131,7 @@ type growGate struct {
 
 	// backoffBase / backoffCap / maxHold are the gate's OWN copy of the
 	// timing envelope, snapshotted from the package defaults at
-	// construction (newGrowGate). The owner goroutine reads these — never
+	// construction (NewGrowGate). The owner goroutine reads these — never
 	// the package globals — so a test that shrinks a global and restores it
 	// on cleanup can never race a still-running owner (the v0.99.100 -race
 	// lesson). Production always gets the package defaults; tests shrink a
@@ -150,22 +150,22 @@ type growGate struct {
 	onOwnerStart func()
 }
 
-// newGrowGate constructs the run's shared coordinator. ctx is the
+// NewGrowGate constructs the run's shared coordinator. ctx is the
 // cold-copy run context: when it is cancelled (e.g. the errgroup unwinds
 // on a lane's terminal error) the owner goroutine exits and any pause is
 // abandoned — every parked Await then unwinds via its own ctx.Done(),
 // the load-bearing no-deadlock contract. recovered is the optional
 // telemetry-recovery probe (nil for the signal-only path).
-func newGrowGate(ctx context.Context, recovered func() bool) *growGate {
-	return &growGate{
+func NewGrowGate(ctx context.Context, recovered func() bool) *GrowGate {
+	return &GrowGate{
 		ownerCtx:  ctx,
 		recovered: recovered,
 		// Snapshot the timing envelope at construction so the owner
 		// goroutine reads instance fields, never the mutable package
 		// globals (the -race safety property; see the var block above).
-		backoffBase: growGateBackoffBase,
-		backoffCap:  growGateBackoffCap,
-		maxHold:     growGateMaxHold,
+		backoffBase: GrowGateBackoffBase,
+		backoffCap:  GrowGateBackoffCap,
+		maxHold:     GrowGateMaxHold,
 	}
 }
 
@@ -175,7 +175,7 @@ func newGrowGate(ctx context.Context, recovered func() bool) *growGate {
 // the per-instance fields (snapshotted at construction) — never the package
 // globals — is what keeps the owner goroutine race-free against a test's
 // global shrink/restore. Mirrors coldCopyReparentBackoff's shape.
-func (g *growGate) backoff(cycle int) time.Duration {
+func (g *GrowGate) backoff(cycle int) time.Duration {
 	b := g.backoffBase
 	for i := 1; i < cycle; i++ {
 		b *= 2
@@ -191,7 +191,7 @@ func (g *growGate) backoff(cycle int) time.Duration {
 // current reopenCh and parks on {reopenCh, ctx.Done()} WITHOUT holding mu,
 // re-checking the state on each wake so a coalesced extend (which leaves
 // the gate closed but does not re-create reopenCh) keeps it parked.
-func (g *growGate) Await(ctx context.Context) error {
+func (g *GrowGate) Await(ctx context.Context) error {
 	for {
 		g.mu.Lock()
 		if !g.closed {
@@ -219,7 +219,7 @@ func (g *growGate) Await(ctx context.Context) error {
 // extend, so a re-trip during the probe window does NOT spawn a second
 // owner. Idempotent and concurrency-safe; concurrent trips from many lanes
 // + the telemetry sidecar collapse into ONE window.
-func (g *growGate) Trip(reason string) {
+func (g *GrowGate) Trip(reason string) {
 	g.mu.Lock()
 	g.reason = reason
 	if g.extend != nil {
@@ -269,7 +269,7 @@ func (g *growGate) Trip(reason string) {
 //   - RECOVERED (proactive pauses only): recovered() reports the target's
 //     storage headroom restored — reopen immediately (the earlier of
 //     {max-hold | recovery}).
-//   - MAX-HOLD: the cumulative pause hit growGateMaxHold. Reopen so each
+//   - MAX-HOLD: the cumulative pause hit GrowGateMaxHold. Reopen so each
 //     lane's own bounded retry budget (the AUTHORITATIVE floor) takes over
 //     and surfaces a genuinely-dead target loudly, rather than the gate
 //     hiding it behind a forever-closed door.
@@ -280,7 +280,7 @@ func (g *growGate) Trip(reason string) {
 // observes it at the end of the cycle and holds another (longer) cycle —
 // this is how concurrent trips from ~16 lanes collapse into one extending
 // window.
-func (g *growGate) runOwner(reopenCh, extend chan struct{}) {
+func (g *GrowGate) runOwner(reopenCh, extend chan struct{}) {
 	if g.onOwnerStart != nil {
 		g.onOwnerStart()
 	}
@@ -363,7 +363,7 @@ func (g *growGate) runOwner(reopenCh, extend chan struct{}) {
 // defensive double-finish is a no-op rather than a close-of-closed panic.
 // Every owner-exit path goes through here, so a parked Await never hangs
 // and g.extend is never left dangling.
-func (g *growGate) finishWindow(reopenCh chan struct{}, why string) {
+func (g *GrowGate) finishWindow(reopenCh chan struct{}, why string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if !g.closed || g.reopenCh != reopenCh {
@@ -380,48 +380,67 @@ func (g *growGate) finishWindow(reopenCh chan struct{}, why string) {
 	)
 }
 
-func (g *growGate) now() time.Time {
+func (g *GrowGate) now() time.Time {
 	if g.nowFn != nil {
 		return g.nowFn()
 	}
 	return time.Now()
 }
 
-func (g *growGate) after(d time.Duration) <-chan time.Time {
+func (g *GrowGate) after(d time.Duration) <-chan time.Time {
 	if g.afterFn != nil {
 		return g.afterFn(d)
 	}
 	return time.After(d)
 }
 
-// growGateOrNil converts a possibly-nil *growGate into the [ir.GrowGate]
-// interface WITHOUT the typed-nil trap: assigning a nil *growGate straight
+// GrowGateOrNil converts a possibly-nil *GrowGate into the [ir.GrowGate]
+// interface WITHOUT the typed-nil trap: assigning a nil *GrowGate straight
 // to an interface yields a NON-nil interface (concrete type, nil value),
 // which would make a `gate != nil` guard wrongly fire and then nil-deref.
 // Returning a true nil interface keeps "no gate ⇒ pre-ADR-0110 behaviour"
 // exact. Mirrors telemetryHintOrNil.
-func growGateOrNil(g *growGate) ir.GrowGate {
+func GrowGateOrNil(g *GrowGate) ir.GrowGate {
 	if g == nil {
 		return nil
 	}
 	return g
 }
 
-// awaitGrowGate blocks while the gate is closed and returns ctx.Err()
+// AwaitGrowGate blocks while the gate is closed and returns ctx.Err()
 // promptly on cancel. A nil gate ⇒ instant nil (pre-ADR-0110 behaviour).
 // The pipeline-side nil-guard counterpart to the MySQL writer's
-// awaitGrowGate method, used by the source-read retry helper.
-func awaitGrowGate(ctx context.Context, gate ir.GrowGate) error {
+// AwaitGrowGate method, used by the source-read retry helper.
+func AwaitGrowGate(ctx context.Context, gate ir.GrowGate) error {
 	if gate == nil {
 		return nil
 	}
 	return gate.Await(ctx)
 }
 
-// tripGrowGate trips the gate so sibling lanes quiesce. A nil gate ⇒ no-op.
-func tripGrowGate(gate ir.GrowGate, reason string) {
+// TripGrowGate trips the gate so sibling lanes quiesce. A nil gate ⇒ no-op.
+func TripGrowGate(gate ir.GrowGate, reason string) {
 	if gate == nil {
 		return
 	}
 	gate.Trip(reason)
+}
+
+// ApplyGrowGate wires the cold-copy run's shared coordinated-pause gate
+// (ADR-0110) onto a freshly-opened writer that opts into it via
+// [ir.GrowGateSetter]. Both engines implement the setter today (MySQL and
+// Postgres), so on a cold-copy run — where the gate is constructed
+// unconditionally (see [NewGrowGate]) — the writer receives a non-nil gate
+// and takes its grow-aware path. Any future engine that does NOT implement
+// the setter retains its per-lane behaviour unchanged. A nil gate
+// (non-cold-copy callers / direct unit tests) is a no-op: the writer keeps
+// its zero-value nil gate (pre-ADR-0110 behaviour). Called immediately after
+// each chunk/table writer opens, alongside ApplyMaxBufferBytes, before any flush.
+func ApplyGrowGate(target any, gate ir.GrowGate) {
+	if gate == nil {
+		return
+	}
+	if setter, ok := target.(ir.GrowGateSetter); ok {
+		setter.SetGrowGate(gate)
+	}
 }

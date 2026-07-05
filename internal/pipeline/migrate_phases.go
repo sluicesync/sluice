@@ -551,7 +551,7 @@ func (m *Migrator) phaseBuildCopyDeps(ctx context.Context, schema *ir.Schema, rr
 		// the SIGNAL-driven gate (recovered=nil): the first classified
 		// grow-transient on any lane quiesces the rest. ctx is the run ctx,
 		// so the gate's owner goroutine exits on run unwind.
-		growGate: growGateOrNil(newGrowGate(ctx, nil)),
+		growGate: migcore.GrowGateOrNil(migcore.NewGrowGate(ctx, nil)),
 		// ADR-0141: the reparent tracker collects tables that hit a grow/
 		// reparent transient during the cold-copy so the migrate reconciliation
 		// phase (runBulkCopyPhases' MySQL fallback branch) can re-derive exactly

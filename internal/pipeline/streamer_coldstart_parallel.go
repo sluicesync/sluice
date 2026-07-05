@@ -268,7 +268,7 @@ func (s *Streamer) runColdStartParallel(
 	// storage-headroom trip (from the gated headroom watch below) reopens on
 	// the earlier of {max-hold | storage headroom recovered}. nil provider ⇒
 	// the probe is nil and the gate is signal-driven only.
-	gate := growGateOrNil(newGrowGate(ctx, storageRecoveredProbe(ctx, s.TargetTelemetry)))
+	gate := migcore.GrowGateOrNil(migcore.NewGrowGate(ctx, storageRecoveredProbe(ctx, s.TargetTelemetry)))
 	// Run a cold-copy-phase storage-headroom watch that trips the gate
 	// proactively on the rising edge. Scoped to the cold-copy ctx so it
 	// exits when the copy completes / unwinds; nil provider ⇒ no goroutine.

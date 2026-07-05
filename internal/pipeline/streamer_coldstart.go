@@ -694,8 +694,8 @@ func (s *Streamer) coldStartRunCopy(ctx context.Context, schema *ir.Schema, stre
 		// TargetTelemetry (recovery probe + headroom watch) is in scope; the
 		// fast path (above) constructs its own gate in runColdStartParallel.
 		// nil provider ⇒ signal-driven only; nil gate ⇒ pre-ADR-0110 no-op.
-		gate := growGateOrNil(newGrowGate(ctx, storageRecoveredProbe(ctx, s.TargetTelemetry)))
-		applyGrowGate(rw, gate)
+		gate := migcore.GrowGateOrNil(migcore.NewGrowGate(ctx, storageRecoveredProbe(ctx, s.TargetTelemetry)))
+		migcore.ApplyGrowGate(rw, gate)
 		s.startStorageHeadroomWatch(ctx, streamID, gate)
 
 		bulkOpts := bulkCopyOpts{

@@ -64,6 +64,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // Cold-copy source-read retry bounds. Zero-value-safe by construction:
@@ -191,7 +192,7 @@ func copyTableWithSourceReadRetry(
 	// coordinated grow-window pause is in effect before reading. Await is a
 	// cheap open read when no pause is active and returns ctx.Err() promptly
 	// on cancel. nil gate ⇒ instant return (pre-ADR-0110 behaviour).
-	if aerr := awaitGrowGate(ctx, gate); aerr != nil {
+	if aerr := migcore.AwaitGrowGate(ctx, gate); aerr != nil {
 		return aerr
 	}
 	err := attempt(ctx, firstReader, firstResuming)
@@ -217,7 +218,7 @@ func copyTableWithSourceReadRetry(
 		// induces). TRIP the shared gate so sibling lanes quiesce together
 		// for the grow window. Coalescing + idempotent; this lane keeps its
 		// own bounded retry below as the authoritative floor.
-		tripGrowGate(gate, "pipeline cold-copy source-read transient: "+err.Error())
+		migcore.TripGrowGate(gate, "pipeline cold-copy source-read transient: "+err.Error())
 		if time.Now().After(deadline) || try >= coldCopySourceReadRetryAttempts {
 			return fmt.Errorf(
 				"pipeline: cold-copy of %q: source read still failing after riding the reconnect-and-resume window "+
@@ -260,7 +261,7 @@ func copyTableWithSourceReadRetry(
 		// pause again — if the gate is still closed for the grow window this
 		// lane parks calmly instead of opening a fresh reader against a
 		// stalled target. Returns promptly on ctx-cancel; nil gate ⇒ instant.
-		if aerr := awaitGrowGate(ctx, gate); aerr != nil {
+		if aerr := migcore.AwaitGrowGate(ctx, gate); aerr != nil {
 			return aerr
 		}
 		// Open a FRESH source reader — the post-drop reader is dead; the
