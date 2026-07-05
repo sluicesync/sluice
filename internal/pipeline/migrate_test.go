@@ -673,7 +673,7 @@ func (r *recordingExecTimeoutSetter) SetExecTimeout(d time.Duration) {
 //   - Positive values call SetExecTimeout exactly once with the value.
 //   - Non-setter targets pass through silently (engines that don't opt
 //     into the optional surface degrade gracefully — same shape as
-//     [applyMaxBufferBytes]).
+//     [migcore.ApplyMaxBufferBytes]).
 func TestApplyExecTimeout(t *testing.T) {
 	t.Run("zero is a no-op", func(t *testing.T) {
 		r := &recordingExecTimeoutSetter{}

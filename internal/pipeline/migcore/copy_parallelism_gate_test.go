@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package pipeline
+package migcore
 
 import (
 	"context"
@@ -15,25 +15,25 @@ import (
 // behaviour: a gate seeded with N tokens lets N acquires through and the
 // (N+1)th blocks until a release.
 func TestCopyParallelismGate_AcquireRelease(t *testing.T) {
-	g := newCopyParallelismGate(2, defaultCopyBackoffPolicy)
+	g := NewCopyParallelismGate(2, DefaultCopyBackoffPolicy)
 	ctx := context.Background()
 
-	if err := g.acquire(ctx); err != nil {
+	if err := g.Acquire(ctx); err != nil {
 		t.Fatalf("acquire 1: %v", err)
 	}
-	if err := g.acquire(ctx); err != nil {
+	if err := g.Acquire(ctx); err != nil {
 		t.Fatalf("acquire 2: %v", err)
 	}
 
 	// Third acquire must block until a release frees a token.
 	blocked := make(chan error, 1)
-	go func() { blocked <- g.acquire(ctx) }()
+	go func() { blocked <- g.Acquire(ctx) }()
 	select {
 	case err := <-blocked:
 		t.Fatalf("third acquire should block on a 2-token gate, returned %v", err)
 	case <-time.After(20 * time.Millisecond):
 	}
-	g.release()
+	g.Release()
 	select {
 	case err := <-blocked:
 		if err != nil {
@@ -47,13 +47,13 @@ func TestCopyParallelismGate_AcquireRelease(t *testing.T) {
 // TestCopyParallelismGate_AcquireHonoursCtx pins that a blocked acquire
 // returns the ctx error on cancellation rather than hanging.
 func TestCopyParallelismGate_AcquireHonoursCtx(t *testing.T) {
-	g := newCopyParallelismGate(1, defaultCopyBackoffPolicy)
-	if err := g.acquire(context.Background()); err != nil {
+	g := NewCopyParallelismGate(1, DefaultCopyBackoffPolicy)
+	if err := g.Acquire(context.Background()); err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := g.acquire(ctx); !errors.Is(err, context.Canceled) {
+	if err := g.Acquire(ctx); !errors.Is(err, context.Canceled) {
 		t.Errorf("acquire on cancelled ctx = %v, want context.Canceled", err)
 	}
 }
@@ -63,15 +63,15 @@ func TestCopyParallelismGate_AcquireHonoursCtx(t *testing.T) {
 // the retired tokens so the live pool drains to the new cap.
 func TestCopyParallelismGate_ShrinkRetiresTokens(t *testing.T) {
 	// Zero-delay policy so the test never actually sleeps.
-	p := copyBackoffPolicy{maxRetries: 10, baseDelay: 0, maxDelay: 0, maxTotalWait: time.Hour}
-	g := newCopyParallelismGate(4, p)
+	p := CopyBackoffPolicy{MaxRetries: 10, BaseDelay: 0, MaxDelay: 0, MaxTotalWait: time.Hour}
+	g := NewCopyParallelismGate(4, p)
 	ctx := context.Background()
 
 	// One worker holds a token and triggers a shrink (4 → 2).
-	if err := g.acquire(ctx); err != nil {
+	if err := g.Acquire(ctx); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	if _, err := g.shrinkAndBackoff(ctx, 1); err != nil {
+	if _, err := g.ShrinkAndBackoff(ctx, 1); err != nil {
 		t.Fatalf("shrinkAndBackoff: %v", err)
 	}
 
@@ -92,7 +92,7 @@ func TestCopyParallelismGate_ShrinkRetiresTokens(t *testing.T) {
 	// is the new cap (2) minus the one this test still holds = 1 free.
 	// Simulate: 3 peers each acquire then release.
 	for i := 0; i < 3; i++ {
-		if err := g.acquire(ctx); err != nil {
+		if err := g.Acquire(ctx); err != nil {
 			t.Fatalf("peer acquire %d: %v", i, err)
 		}
 	}
@@ -101,7 +101,7 @@ func TestCopyParallelismGate_ShrinkRetiresTokens(t *testing.T) {
 	// first 2 releases are swallowed (retire 2→0), the 3rd returns a real
 	// token.
 	for i := 0; i < 3; i++ {
-		g.release()
+		g.Release()
 	}
 	g.mu.Lock()
 	if g.retire != 0 {
@@ -111,14 +111,14 @@ func TestCopyParallelismGate_ShrinkRetiresTokens(t *testing.T) {
 
 	// Exactly one token should now be free (the 3rd release). A second
 	// acquire must block.
-	if err := g.acquire(ctx); err != nil {
+	if err := g.Acquire(ctx); err != nil {
 		t.Fatalf("acquire the one surviving free token: %v", err)
 	}
 	blocked := make(chan error, 1)
 	go func() {
 		c, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 		defer cancel()
-		blocked <- g.acquire(c)
+		blocked <- g.Acquire(c)
 	}()
 	if err := <-blocked; !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("after shrink to cap 2 with 2 held, extra acquire = %v, want DeadlineExceeded (no free tokens)", err)
@@ -127,36 +127,36 @@ func TestCopyParallelismGate_ShrinkRetiresTokens(t *testing.T) {
 
 // TestCopyParallelismGate_GivesUpLoudly pins the bounded give-up: after
 // the policy's retry bound is exhausted, shrinkAndBackoff returns a loud
-// error wrapping errCopySlotsExhausted rather than looping forever.
+// error wrapping ErrCopySlotsExhausted rather than looping forever.
 func TestCopyParallelismGate_GivesUpLoudly(t *testing.T) {
-	p := copyBackoffPolicy{maxRetries: 3, baseDelay: 0, maxDelay: 0, maxTotalWait: time.Hour}
-	g := newCopyParallelismGate(8, p)
+	p := CopyBackoffPolicy{MaxRetries: 3, BaseDelay: 0, MaxDelay: 0, MaxTotalWait: time.Hour}
+	g := NewCopyParallelismGate(8, p)
 	ctx := context.Background()
 
 	// Attempts 1..3 proceed.
 	for i := 1; i <= 3; i++ {
-		if _, err := g.shrinkAndBackoff(ctx, 0); err != nil {
+		if _, err := g.ShrinkAndBackoff(ctx, 0); err != nil {
 			t.Fatalf("attempt %d unexpectedly gave up: %v", i, err)
 		}
 	}
 	// Attempt 4 gives up loudly.
-	_, err := g.shrinkAndBackoff(ctx, 0)
+	_, err := g.ShrinkAndBackoff(ctx, 0)
 	if err == nil {
-		t.Fatal("expected a give-up error after exhausting maxRetries, got nil")
+		t.Fatal("expected a give-up error after exhausting MaxRetries, got nil")
 	}
-	if !errors.Is(err, errCopySlotsExhausted) {
-		t.Errorf("give-up error should wrap errCopySlotsExhausted; got %v", err)
+	if !errors.Is(err, ErrCopySlotsExhausted) {
+		t.Errorf("give-up error should wrap ErrCopySlotsExhausted; got %v", err)
 	}
 }
 
 // TestCopyParallelismGate_ConcurrentShrinkBackoffBound pins, under the
 // race detector, that the shared backoff bound is enforced across peer
 // goroutines: many chunks hammering shrinkAndBackoff concurrently produce
-// exactly maxRetries successes and the rest give up, with no data race on
+// exactly MaxRetries successes and the rest give up, with no data race on
 // the shared counters.
 func TestCopyParallelismGate_ConcurrentShrinkBackoffBound(t *testing.T) {
-	p := copyBackoffPolicy{maxRetries: 5, baseDelay: 0, maxDelay: 0, maxTotalWait: time.Hour}
-	g := newCopyParallelismGate(16, p)
+	p := CopyBackoffPolicy{MaxRetries: 5, BaseDelay: 0, MaxDelay: 0, MaxTotalWait: time.Hour}
+	g := NewCopyParallelismGate(16, p)
 	ctx := context.Background()
 
 	const peers = 16
@@ -170,7 +170,7 @@ func TestCopyParallelismGate_ConcurrentShrinkBackoffBound(t *testing.T) {
 		wg.Add(1)
 		go func(chunk int) {
 			defer wg.Done()
-			_, err := g.shrinkAndBackoff(ctx, chunk)
+			_, err := g.ShrinkAndBackoff(ctx, chunk)
 			mu.Lock()
 			if err == nil {
 				proceeds++
@@ -182,11 +182,11 @@ func TestCopyParallelismGate_ConcurrentShrinkBackoffBound(t *testing.T) {
 	}
 	wg.Wait()
 
-	if proceeds != p.maxRetries {
-		t.Errorf("concurrent proceeds = %d, want exactly maxRetries=%d", proceeds, p.maxRetries)
+	if proceeds != p.MaxRetries {
+		t.Errorf("concurrent proceeds = %d, want exactly MaxRetries=%d", proceeds, p.MaxRetries)
 	}
-	if giveUps != peers-p.maxRetries {
-		t.Errorf("concurrent give-ups = %d, want %d", giveUps, peers-p.maxRetries)
+	if giveUps != peers-p.MaxRetries {
+		t.Errorf("concurrent give-ups = %d, want %d", giveUps, peers-p.MaxRetries)
 	}
 	// Effective parallelism must never drop below the floor of 1.
 	g.mu.Lock()

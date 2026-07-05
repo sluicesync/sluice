@@ -37,6 +37,7 @@ import (
 	"sync"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // migrateSharedSnapshotExportedObserver is a TEST-ONLY seam (nil in
@@ -129,7 +130,7 @@ func (s *sharedSourceSnapshot) readerFactory() func(ctx context.Context) (ir.Row
 		if err != nil {
 			return nil, err
 		}
-		applyMaxBufferBytes(readers[0], maxBuffer)
+		migcore.ApplyMaxBufferBytes(readers[0], maxBuffer)
 		return readers[0], nil
 	}
 }

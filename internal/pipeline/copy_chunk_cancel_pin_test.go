@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // These pins lock the ADR-0109 sibling-cancel silent-loss fix
@@ -72,7 +73,7 @@ func TestCopyChunkFast_CancelNeverCompletes(t *testing.T) {
 	captureSlog(t)
 
 	table := intPKTable("dropping")
-	pkCols := primaryKeyColumnNames(table)
+	pkCols := migcore.PrimaryKeyColumnNames(table)
 	state, chunk := chunkOneInProgress(table)
 	tgt := newFakeTarget()
 	var mu sync.Mutex
@@ -124,7 +125,7 @@ func TestCopyChunk_CancelNeverCompletes(t *testing.T) {
 	captureSlog(t)
 
 	table := intPKTable("dropping")
-	pkCols := primaryKeyColumnNames(table)
+	pkCols := migcore.PrimaryKeyColumnNames(table)
 	state, _ := chunkOneInProgress(table)
 	tgt := newFakeTarget()
 	var mu sync.Mutex

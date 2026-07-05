@@ -433,9 +433,9 @@ func (m *Migrator) phaseResolveCopyParallelism(ctx context.Context, rc resumeCon
 	// --bulk-parallelism can't exhaust a small target's slots mid-COPY.
 	// No-op on engines without a connection-slot model (MySQL); refuses
 	// loudly if the target has no free budget at all.
-	copyParallelism, budgetReport, err := resolveTargetCopyParallelism(
+	copyParallelism, budgetReport, err := migcore.ResolveTargetCopyParallelism(
 		ctx, m.Target, m.TargetDSN,
-		resolveBulkParallelism(m.BulkParallelism, runtime.NumCPU()),
+		migcore.ResolveBulkParallelism(m.BulkParallelism, runtime.NumCPU()),
 		m.MaxTargetConnections,
 	)
 	if err != nil {
@@ -446,7 +446,7 @@ func (m *Migrator) phaseResolveCopyParallelism(ctx context.Context, rc resumeCon
 	// When index builds OVERLAP the copy (the target engine implements
 	// [ir.IncrementalIndexBuilder] — PG), copy and index connections are
 	// open SIMULTANEOUSLY, so the single measured budget has to cover BOTH.
-	// splitCopyAndIndexBudget reserves a small slice for the index pool and
+	// migcore.SplitCopyAndIndexBudget reserves a small slice for the index pool and
 	// hands the copy axes only the remainder, with the invariant
 	// indexBudget + copyBudget' <= CopyBudget enforced here at the single
 	// chokepoint (no runtime semaphore). The index slice is threaded to the
@@ -466,7 +466,7 @@ func (m *Migrator) phaseResolveCopyParallelism(ctx context.Context, rc resumeCon
 	copyBudgetForAxes := budgetReport.CopyBudget
 	indexBudget := 0
 	if _, overlaps := sw.(ir.IncrementalIndexBuilder); overlaps && !m.UpfrontIndexes {
-		ib, copyRemaining := splitCopyAndIndexBudget(budgetReport.CopyBudget, copyParallelism)
+		ib, copyRemaining := migcore.SplitCopyAndIndexBudget(budgetReport.CopyBudget, copyParallelism)
 		if ib > 0 {
 			indexBudget = ib
 			copyBudgetForAxes = copyRemaining
@@ -485,9 +485,9 @@ func (m *Migrator) phaseResolveCopyParallelism(ctx context.Context, rc resumeCon
 	//
 	// copyBudgetForAxes is the copy axes' slice after the ADR-0077 index
 	// reservation (== CopyBudget when overlap isn't engaged).
-	tableParallelism, withinParallelism = resolveCopyParallelismBudget(
+	tableParallelism, withinParallelism = migcore.ResolveCopyParallelismBudget(
 		copyParallelism,
-		resolveTableParallelism(m.TableParallelism),
+		migcore.ResolveTableParallelism(m.TableParallelism),
 		copyBudgetForAxes,
 		m.MaxTargetConnections,
 	)
@@ -532,7 +532,7 @@ func (m *Migrator) phaseBuildCopyDeps(ctx context.Context, schema *ir.Schema, rr
 		sourceDSN:      m.SourceDSN,
 		targetDSN:      m.TargetDSN,
 		parallelism:    withinParallelism,
-		minRows:        resolveBulkParallelMinRows(m.BulkParallelMinRows, len(schema.Tables)),
+		minRows:        migcore.ResolveBulkParallelMinRows(m.BulkParallelMinRows, len(schema.Tables)),
 		maxBufferBytes: m.MaxBufferBytes,
 		// ADR-0043 gate (3): --force-cold-start skipped the Bug 9
 		// preflight, so the target may hold rows; the fast non-upsert

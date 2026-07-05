@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package pipeline
+package migcore
 
 import "testing"
 
@@ -81,9 +81,9 @@ func TestSplitCopyAndIndexBudget(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			gotIndex, gotCopy := splitCopyAndIndexBudget(tt.copyBudget, tt.withinParallelism)
+			gotIndex, gotCopy := SplitCopyAndIndexBudget(tt.copyBudget, tt.withinParallelism)
 			if gotIndex != tt.wantIndex || gotCopy != tt.wantCopy {
-				t.Errorf("splitCopyAndIndexBudget(budget=%d, within=%d) = (%d,%d); want (%d,%d)",
+				t.Errorf("SplitCopyAndIndexBudget(budget=%d, within=%d) = (%d,%d); want (%d,%d)",
 					tt.copyBudget, tt.withinParallelism, gotIndex, gotCopy, tt.wantIndex, tt.wantCopy)
 			}
 		})
@@ -101,7 +101,7 @@ func TestSplitCopyAndIndexBudget(t *testing.T) {
 func TestSplitCopyAndIndexBudget_Invariant(t *testing.T) {
 	for budget := 0; budget <= 64; budget++ {
 		for within := 0; within <= 16; within++ {
-			idx, cpy := splitCopyAndIndexBudget(budget, within)
+			idx, cpy := SplitCopyAndIndexBudget(budget, within)
 
 			if budget < 1 {
 				if idx != 0 || cpy != 0 {
@@ -116,8 +116,8 @@ func TestSplitCopyAndIndexBudget_Invariant(t *testing.T) {
 					budget, within, idx, cpy, idx+cpy)
 			}
 			// Index slice bounds.
-			if idx < 0 || idx > indexBudgetCeiling {
-				t.Fatalf("index slice out of [0,%d]: budget=%d within=%d → index=%d", indexBudgetCeiling, budget, within, idx)
+			if idx < 0 || idx > IndexBudgetCeiling {
+				t.Fatalf("index slice out of [0,%d]: budget=%d within=%d → index=%d", IndexBudgetCeiling, budget, within, idx)
 			}
 			// When overlap engages (idx>0), copy keeps at least the within
 			// floor (a single table's worth of connections).

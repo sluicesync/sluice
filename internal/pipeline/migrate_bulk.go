@@ -397,7 +397,7 @@ func copyTableWithCursor(
 		return errors.New("pipeline: row writer does not implement IdempotentRowWriter (caller should have classified this case earlier)")
 	}
 
-	pkCols := primaryKeyColumnNames(table)
+	pkCols := migcore.PrimaryKeyColumnNames(table)
 
 	// Read the entry under the lock: peer tables in the cross-table pool
 	// (ADR-0076) write distinct keys of this shared map concurrently.
@@ -532,22 +532,6 @@ func copyTableWithCursor(
 			return nil
 		}
 	}
-}
-
-// primaryKeyColumnNames returns the PK column names in declaration
-// order, or nil when the table has no PK. The orchestrator routes
-// no-PK tables away from the cursor path before this gets called;
-// the helper is defensive about a nil PK so future callers can use
-// it safely.
-func primaryKeyColumnNames(table *ir.Table) []string {
-	if table == nil || table.PrimaryKey == nil {
-		return nil
-	}
-	out := make([]string, len(table.PrimaryKey.Columns))
-	for i, c := range table.PrimaryKey.Columns {
-		out[i] = c.Column
-	}
-	return out
 }
 
 // pkTracker captures the PK column values of the last row passing

@@ -35,6 +35,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -422,7 +423,7 @@ func distinctTruncated(n int) []string {
 // the original suite lacked (it only self-checked the Go comparator). It
 // ground-truths the partition against the REAL database: it samples actual
 // keyset boundaries from a collated-string table, assembles the half-open
-// (lower, upper] chunks via computeKeysetChunkBoundaries, drains EACH chunk
+// (lower, upper] chunks via migcore.ComputeKeysetChunkBoundaries, drains EACH chunk
 // through ReadRowsBatchBounded (the same SQL bounded read the orchestrator
 // uses), and asserts the chunks together cover EVERY source PK EXACTLY
 // ONCE. Under the old bytewise Go clip on a non-C collation this fails
@@ -480,9 +481,9 @@ func TestKeysetPartition_MatchesDBOrder_StringPK(t *testing.T) {
 	}
 
 	const n = 4
-	bounds, err := computeKeysetChunkBoundaries(ctx, sampler, table, n)
+	bounds, err := migcore.ComputeKeysetChunkBoundaries(ctx, sampler, table, n)
 	if err != nil {
-		t.Fatalf("computeKeysetChunkBoundaries: %v", err)
+		t.Fatalf("migcore.ComputeKeysetChunkBoundaries: %v", err)
 	}
 	if len(bounds) < 2 {
 		t.Fatalf("expected >= 2 chunks for ground-truth partition; got %d", len(bounds))
@@ -491,11 +492,11 @@ func TestKeysetPartition_MatchesDBOrder_StringPK(t *testing.T) {
 	// Drain every chunk and tally how many chunks each PK appears in.
 	seen := map[string]int{}
 	for _, b := range bounds {
-		cursor := b.lowerPK
+		cursor := b.LowerPK
 		for {
-			ch, err := bounded.ReadRowsBatchBounded(ctx, table, cursor, b.upperPK, 2000)
+			ch, err := bounded.ReadRowsBatchBounded(ctx, table, cursor, b.UpperPK, 2000)
 			if err != nil {
-				t.Fatalf("ReadRowsBatchBounded chunk %d: %v", b.chunkIndex, err)
+				t.Fatalf("ReadRowsBatchBounded chunk %d: %v", b.ChunkIndex, err)
 			}
 			var last []any
 			batch := 0
@@ -506,7 +507,7 @@ func TestKeysetPartition_MatchesDBOrder_StringPK(t *testing.T) {
 				batch++
 			}
 			if rerr := rr.Err(); rerr != nil {
-				t.Fatalf("reader err on chunk %d: %v", b.chunkIndex, rerr)
+				t.Fatalf("reader err on chunk %d: %v", b.ChunkIndex, rerr)
 			}
 			if batch == 0 {
 				break

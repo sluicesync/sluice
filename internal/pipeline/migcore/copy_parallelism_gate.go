@@ -27,12 +27,12 @@
 //     by mu so the AIMD give-up bound is enforced across all peer chunks,
 //     not per-goroutine. A permanently-saturated target therefore gives
 //     up after a bounded *total* number of retries across the whole
-//     table, not maxRetries-per-chunk.
+//     table, not MaxRetries-per-chunk.
 //
 // All shared mutable state is touched only under mu or via the channel,
 // so there are no data races on the cap or the backoff counters.
 
-package pipeline
+package migcore
 
 import (
 	"context"
@@ -41,20 +41,18 @@ import (
 	"log/slog"
 	"sync"
 	"time"
-
-	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
-// errCopySlotsExhausted is the sentinel the gate returns when the target
+// ErrCopySlotsExhausted is the sentinel the gate returns when the target
 // stayed slot-exhausted past the AIMD give-up bound. Wrapped with the
 // concrete numbers; tests assert on it via errors.Is without coupling to
 // the message text.
-var errCopySlotsExhausted = errors.New("pipeline: target connection slots stayed exhausted during parallel copy")
+var ErrCopySlotsExhausted = errors.New("pipeline: target connection slots stayed exhausted during parallel copy")
 
-// copyParallelismGate caps concurrently-open chunk connections and
+// CopyParallelismGate caps concurrently-open chunk connections and
 // applies the Phase 2b AIMD backoff. One gate is shared by all chunk
 // goroutines copying a single table.
-type copyParallelismGate struct {
+type CopyParallelismGate struct {
 	tokens chan struct{}
 
 	mu sync.Mutex
@@ -71,12 +69,12 @@ type copyParallelismGate struct {
 	attempts  int
 	totalWait time.Duration
 
-	policy copyBackoffPolicy
+	policy CopyBackoffPolicy
 }
 
-// newCopyParallelismGate builds a gate seeded with `parallelism` tokens.
+// NewCopyParallelismGate builds a gate seeded with `parallelism` tokens.
 // parallelism is the post-preflight effective parallelism (>= 1).
-func newCopyParallelismGate(parallelism int, policy copyBackoffPolicy) *copyParallelismGate {
+func NewCopyParallelismGate(parallelism int, policy CopyBackoffPolicy) *CopyParallelismGate {
 	if parallelism < 1 {
 		parallelism = 1
 	}
@@ -84,17 +82,28 @@ func newCopyParallelismGate(parallelism int, policy copyBackoffPolicy) *copyPara
 	for i := 0; i < parallelism; i++ {
 		tokens <- struct{}{}
 	}
-	return &copyParallelismGate{
+	return &CopyParallelismGate{
 		tokens:    tokens,
 		effective: parallelism,
 		policy:    policy,
 	}
 }
 
+// Effective returns the gate's current logical cap — the effective
+// parallelism after any slot-exhaustion shrinks. Thread-safe. Exposed
+// for observability + the acquire-retry tests in pipeline-root, which
+// assert the multiplicative-decrease shrank the cap; it takes mu so the
+// read never races a concurrent ShrinkAndBackoff.
+func (g *CopyParallelismGate) Effective() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.effective
+}
+
 // acquire takes one token, blocking until one is free or ctx is done.
 // A worker holds the token for the duration of its chunk and returns it
 // via release (unless the token was retired by a shrink).
-func (g *copyParallelismGate) acquire(ctx context.Context) error {
+func (g *CopyParallelismGate) Acquire(ctx context.Context) error {
 	select {
 	case <-g.tokens:
 		return nil
@@ -107,7 +116,7 @@ func (g *copyParallelismGate) acquire(ctx context.Context) error {
 // which case the token is swallowed so the live pool drains down to the
 // shrunk cap. Called once per successful acquire, after the chunk's
 // connections are closed.
-func (g *copyParallelismGate) release() {
+func (g *CopyParallelismGate) Release() {
 	g.mu.Lock()
 	if g.retire > 0 {
 		g.retire--
@@ -122,29 +131,29 @@ func (g *copyParallelismGate) release() {
 // pure AIMD decision, and on a non-give-up verdict halves the effective
 // cap (retiring the difference in tokens) and returns the backoff delay
 // the caller should wait before retrying its chunk. On a give-up verdict
-// it returns a loud, bounded error wrapping errCopySlotsExhausted.
+// it returns a loud, bounded error wrapping ErrCopySlotsExhausted.
 //
 // The token the failing worker currently holds is NOT returned here —
 // the caller keeps it across the wait+retry so the retry re-uses the
 // same slot (one fewer connection in flight during the backoff), and
 // returns it via release when the chunk ultimately finishes. The retire
 // count therefore targets *other* live tokens.
-func (g *copyParallelismGate) shrinkAndBackoff(ctx context.Context, chunkIndex int) (time.Duration, error) {
+func (g *CopyParallelismGate) ShrinkAndBackoff(ctx context.Context, chunkIndex int) (time.Duration, error) {
 	g.mu.Lock()
 	g.attempts++
 	attempt := g.attempts
 	current := g.effective
 	prior := g.totalWait
 
-	decision := nextCopyBackoff(current, attempt, prior, g.policy)
+	decision := NextCopyBackoff(current, attempt, prior, g.policy)
 	if decision.GiveUp {
 		giveUpEffective := g.effective
 		g.mu.Unlock()
-		return 0, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf(
+		return 0, WrapWithHint(PhaseConnect, fmt.Errorf(
 			"%w: still SQLSTATE 53300 after %d backoff(s) (parallelism reduced to %d, ~%s waited); "+
 				"free connections (close idle / orphaned sessions — see --reap-stale-backends), "+
 				"raise max_connections, or lower --bulk-parallelism / --max-target-connections",
-			errCopySlotsExhausted, attempt-1, giveUpEffective, prior.Round(time.Millisecond),
+			ErrCopySlotsExhausted, attempt-1, giveUpEffective, prior.Round(time.Millisecond),
 		))
 	}
 

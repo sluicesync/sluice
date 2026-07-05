@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // TestPKTracker_LastPK confirms the tracker captures the most recent
@@ -197,10 +198,10 @@ func TestCanResumePerBatch_Classification(t *testing.T) {
 // TestPrimaryKeyColumnNames confirms the helper returns nil for
 // tables without a PK and the declaration order otherwise.
 func TestPrimaryKeyColumnNames(t *testing.T) {
-	if got := primaryKeyColumnNames(nil); got != nil {
+	if got := migcore.PrimaryKeyColumnNames(nil); got != nil {
 		t.Errorf("nil table: got %v; want nil", got)
 	}
-	if got := primaryKeyColumnNames(&ir.Table{}); got != nil {
+	if got := migcore.PrimaryKeyColumnNames(&ir.Table{}); got != nil {
 		t.Errorf("table without PK: got %v; want nil", got)
 	}
 	table := &ir.Table{
@@ -208,7 +209,7 @@ func TestPrimaryKeyColumnNames(t *testing.T) {
 			{Column: "a"}, {Column: "b"},
 		}},
 	}
-	got := primaryKeyColumnNames(table)
+	got := migcore.PrimaryKeyColumnNames(table)
 	if len(got) != 2 || got[0] != "a" || got[1] != "b" {
 		t.Errorf("got %v; want [a b]", got)
 	}

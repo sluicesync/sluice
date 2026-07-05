@@ -14,7 +14,7 @@ import (
 // defaultApplyConcurrency is the conservative adaptive default LANE count W
 // the CDC key-hash apply path resolves `--apply-concurrency 0` (unset) to
 // (ADR-0106, item 31). It deliberately equals the cold-copy axes'
-// auto:4 ([defaultTableParallelism] / [defaultCopyFanoutDegree]) so the whole
+// auto:4 ([migcore.DefaultTableParallelism] / [defaultCopyFanoutDegree]) so the whole
 // pipeline has one mental model: "sluice fans out ~4-wide by default, bounded
 // by the target's connection budget." NOT aggressive — the live PS-10 (1/8
 // vCPU) evidence (ADR-0106 Context) showed 4 budget-bounded lanes stay safe

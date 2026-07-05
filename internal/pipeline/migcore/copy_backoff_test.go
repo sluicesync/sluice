@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package pipeline
+package migcore
 
 import (
 	"testing"
@@ -10,11 +10,11 @@ import (
 
 // testBackoffPolicy is a small, deterministic policy for the pure-decision
 // tests: 3 retries, 10ms base doubling to a 40ms cap, 100ms total-wait.
-var testBackoffPolicy = copyBackoffPolicy{
-	maxRetries:   3,
-	baseDelay:    10 * time.Millisecond,
-	maxDelay:     40 * time.Millisecond,
-	maxTotalWait: 100 * time.Millisecond,
+var testBackoffPolicy = CopyBackoffPolicy{
+	MaxRetries:   3,
+	BaseDelay:    10 * time.Millisecond,
+	MaxDelay:     40 * time.Millisecond,
+	MaxTotalWait: 100 * time.Millisecond,
 }
 
 // TestNextCopyBackoff_HalvesAndFloors pins the multiplicative-decrease:
@@ -31,22 +31,22 @@ func TestNextCopyBackoff_HalvesAndFloors(t *testing.T) {
 		{1, 1}, // already at floor, stays at floor
 	}
 	for _, tc := range cases {
-		d := nextCopyBackoff(tc.current, 1, 0, testBackoffPolicy)
+		d := NextCopyBackoff(tc.current, 1, 0, testBackoffPolicy)
 		if d.GiveUp {
 			t.Fatalf("current=%d attempt=1: unexpected give-up", tc.current)
 		}
 		if d.NextParallelism != tc.want {
-			t.Errorf("nextCopyBackoff(%d) parallelism = %d, want %d", tc.current, d.NextParallelism, tc.want)
+			t.Errorf("NextCopyBackoff(%d) parallelism = %d, want %d", tc.current, d.NextParallelism, tc.want)
 		}
 	}
 }
 
 // TestNextCopyBackoff_ExponentialDelayCapped pins the bounded exponential
-// backoff: baseDelay * 2^(attempt-1), capped at maxDelay.
+// backoff: BaseDelay * 2^(attempt-1), capped at MaxDelay.
 func TestNextCopyBackoff_ExponentialDelayCapped(t *testing.T) {
 	// Use a high retry/total-wait bound so only the delay shape is under
 	// test here, not the give-up triggers.
-	p := copyBackoffPolicy{maxRetries: 100, baseDelay: 10 * time.Millisecond, maxDelay: 40 * time.Millisecond, maxTotalWait: time.Hour}
+	p := CopyBackoffPolicy{MaxRetries: 100, BaseDelay: 10 * time.Millisecond, MaxDelay: 40 * time.Millisecond, MaxTotalWait: time.Hour}
 	cases := []struct {
 		attempt int
 		want    time.Duration
@@ -58,7 +58,7 @@ func TestNextCopyBackoff_ExponentialDelayCapped(t *testing.T) {
 		{9, 40 * time.Millisecond}, // far past the cap, no overflow
 	}
 	for _, tc := range cases {
-		d := nextCopyBackoff(8, tc.attempt, 0, p)
+		d := NextCopyBackoff(8, tc.attempt, 0, p)
 		if d.GiveUp {
 			t.Fatalf("attempt=%d: unexpected give-up", tc.attempt)
 		}
@@ -69,33 +69,33 @@ func TestNextCopyBackoff_ExponentialDelayCapped(t *testing.T) {
 }
 
 // TestNextCopyBackoff_GivesUpOnMaxRetries pins the loud bounded give-up:
-// once the attempt exceeds maxRetries, the decision gives up.
+// once the attempt exceeds MaxRetries, the decision gives up.
 func TestNextCopyBackoff_GivesUpOnMaxRetries(t *testing.T) {
-	// maxRetries=3, so attempts 1..3 proceed, attempt 4 gives up.
-	for attempt := 1; attempt <= testBackoffPolicy.maxRetries; attempt++ {
-		if d := nextCopyBackoff(8, attempt, 0, testBackoffPolicy); d.GiveUp {
-			t.Fatalf("attempt=%d (<= maxRetries=%d): unexpected give-up", attempt, testBackoffPolicy.maxRetries)
+	// MaxRetries=3, so attempts 1..3 proceed, attempt 4 gives up.
+	for attempt := 1; attempt <= testBackoffPolicy.MaxRetries; attempt++ {
+		if d := NextCopyBackoff(8, attempt, 0, testBackoffPolicy); d.GiveUp {
+			t.Fatalf("attempt=%d (<= MaxRetries=%d): unexpected give-up", attempt, testBackoffPolicy.MaxRetries)
 		}
 	}
-	if d := nextCopyBackoff(8, testBackoffPolicy.maxRetries+1, 0, testBackoffPolicy); !d.GiveUp {
-		t.Errorf("attempt=%d (> maxRetries): expected give-up", testBackoffPolicy.maxRetries+1)
+	if d := NextCopyBackoff(8, testBackoffPolicy.MaxRetries+1, 0, testBackoffPolicy); !d.GiveUp {
+		t.Errorf("attempt=%d (> MaxRetries): expected give-up", testBackoffPolicy.MaxRetries+1)
 	}
 }
 
 // TestNextCopyBackoff_GivesUpOnTotalWaitCeiling pins the second give-up
 // trigger: even with retries remaining, once this attempt's delay would
-// carry the accumulated wait past maxTotalWait, give up.
+// carry the accumulated wait past MaxTotalWait, give up.
 func TestNextCopyBackoff_GivesUpOnTotalWaitCeiling(t *testing.T) {
-	// maxTotalWait=100ms. With 95ms already spent, attempt 1's 10ms delay
+	// MaxTotalWait=100ms. With 95ms already spent, attempt 1's 10ms delay
 	// would reach 105ms > 100ms → give up, despite retries remaining.
-	d := nextCopyBackoff(8, 1, 95*time.Millisecond, testBackoffPolicy)
+	d := NextCopyBackoff(8, 1, 95*time.Millisecond, testBackoffPolicy)
 	if !d.GiveUp {
 		t.Errorf("prior=95ms + 10ms delay > 100ms cap: expected give-up, got %+v", d)
 	}
 
 	// With only 80ms spent, attempt 1's 10ms delay reaches 90ms < 100ms →
 	// proceed.
-	d = nextCopyBackoff(8, 1, 80*time.Millisecond, testBackoffPolicy)
+	d = NextCopyBackoff(8, 1, 80*time.Millisecond, testBackoffPolicy)
 	if d.GiveUp {
 		t.Errorf("prior=80ms + 10ms delay < 100ms cap: expected proceed, got give-up")
 	}
@@ -105,14 +105,14 @@ func TestNextCopyBackoff_GivesUpOnTotalWaitCeiling(t *testing.T) {
 // policy can never spin forever: it has a positive retry bound and a
 // positive total-wait ceiling.
 func TestDefaultCopyBackoffPolicy_IsBounded(t *testing.T) {
-	p := defaultCopyBackoffPolicy
-	if p.maxRetries <= 0 {
-		t.Errorf("default policy maxRetries = %d, must be > 0 (no infinite spin)", p.maxRetries)
+	p := DefaultCopyBackoffPolicy
+	if p.MaxRetries <= 0 {
+		t.Errorf("default policy MaxRetries = %d, must be > 0 (no infinite spin)", p.MaxRetries)
 	}
-	if p.maxTotalWait <= 0 {
-		t.Errorf("default policy maxTotalWait = %s, must be > 0 (bounded wall-clock)", p.maxTotalWait)
+	if p.MaxTotalWait <= 0 {
+		t.Errorf("default policy MaxTotalWait = %s, must be > 0 (bounded wall-clock)", p.MaxTotalWait)
 	}
-	if p.baseDelay <= 0 || p.maxDelay < p.baseDelay {
-		t.Errorf("default policy delays invalid: base=%s max=%s", p.baseDelay, p.maxDelay)
+	if p.BaseDelay <= 0 || p.MaxDelay < p.BaseDelay {
+		t.Errorf("default policy delays invalid: base=%s max=%s", p.BaseDelay, p.MaxDelay)
 	}
 }

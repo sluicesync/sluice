@@ -3,7 +3,7 @@
 
 // Unit tests for the chunk-boundary computation.
 
-package pipeline
+package migcore
 
 import (
 	"context"
@@ -57,12 +57,12 @@ func TestCanParallelChunkTable_Eligibility(t *testing.T) {
 		table        *ir.Table
 		parallelism  int
 		want         bool
-		wantStrategy chunkStrategy
+		wantStrategy ChunkStrategy
 		wantSubstr   string
 	}{
-		{"happy_integer", integerPKTable(), 4, true, strategyMinMaxDivide, ""},
-		{"parallelism_1", integerPKTable(), 1, false, strategyNone, "single-reader"},
-		{"no_pk", &ir.Table{Name: "log", Columns: []*ir.Column{{Name: "x", Type: ir.Integer{Width: 64}}}}, 4, false, strategyNone, "no primary key"},
+		{"happy_integer", integerPKTable(), 4, true, StrategyMinMaxDivide, ""},
+		{"parallelism_1", integerPKTable(), 1, false, StrategyNone, "single-reader"},
+		{"no_pk", &ir.Table{Name: "log", Columns: []*ir.Column{{Name: "x", Type: ir.Integer{Width: 64}}}}, 4, false, StrategyNone, "no primary key"},
 		{
 			// Composite PK is now keyset-eligible (ADR-0096).
 			"composite_pk_keyset",
@@ -74,7 +74,7 @@ func TestCanParallelChunkTable_Eligibility(t *testing.T) {
 				},
 				PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "a"}, {Column: "b"}}},
 			},
-			4, true, strategyKeysetSample, "",
+			4, true, StrategyKeysetSample, "",
 		},
 		{
 			// Single non-integer orderable PK → keyset (ADR-0096).
@@ -84,7 +84,7 @@ func TestCanParallelChunkTable_Eligibility(t *testing.T) {
 				Columns:    []*ir.Column{{Name: "id", Type: ir.UUID{}}},
 				PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
 			},
-			4, true, strategyKeysetSample, "",
+			4, true, StrategyKeysetSample, "",
 		},
 		{
 			"varchar_pk_keyset",
@@ -93,11 +93,11 @@ func TestCanParallelChunkTable_Eligibility(t *testing.T) {
 				Columns:    []*ir.Column{{Name: "email", Type: ir.Varchar{Length: 255}}},
 				PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "email"}}},
 			},
-			4, true, strategyKeysetSample, "",
+			4, true, StrategyKeysetSample, "",
 		},
 		{
 			// Non-orderable PK type → single-reader fallback.
-			"json_pk_fallback", jsonPK, 4, false, strategyNone, "not an orderable chunk key",
+			"json_pk_fallback", jsonPK, 4, false, StrategyNone, "not an orderable chunk key",
 		},
 		{
 			// ADR-0048 Shape A: --inject-shard-column rewrites the PK as a
@@ -116,7 +116,7 @@ func TestCanParallelChunkTable_Eligibility(t *testing.T) {
 				},
 				PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "shard_id"}, {Column: "id"}}},
 			},
-			4, false, strategyNone, "sluice-injected",
+			4, false, StrategyNone, "sluice-injected",
 		},
 		{
 			// Pin the CLASS, not the shard-leading representative: ANY
@@ -129,14 +129,14 @@ func TestCanParallelChunkTable_Eligibility(t *testing.T) {
 				Columns:    []*ir.Column{{Name: "shard_id", Type: ir.Varchar{Length: 64}, SluiceInjected: true}},
 				PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "shard_id"}}},
 			},
-			4, false, strategyNone, "sluice-injected",
+			4, false, StrategyNone, "sluice-injected",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			ok, strategy, reason := canParallelChunkTable(tc.table, tc.parallelism)
+			ok, strategy, reason := CanParallelChunkTable(tc.table, tc.parallelism)
 			if ok != tc.want {
-				t.Errorf("canParallelChunkTable: got %v, %q; want %v", ok, reason, tc.want)
+				t.Errorf("CanParallelChunkTable: got %v, %q; want %v", ok, reason, tc.want)
 			}
 			if ok && strategy != tc.wantStrategy {
 				t.Errorf("strategy: got %d; want %d", strategy, tc.wantStrategy)
@@ -152,31 +152,31 @@ func TestCanParallelChunkTable_Eligibility(t *testing.T) {
 // into N near-equal slices with the expected nil-bound shape.
 func TestComputeChunkBoundaries_HappyPath(t *testing.T) {
 	q := stubRangeQuerier{minVal: int64(1), maxVal: int64(100)}
-	bounds, err := computeChunkBoundaries(context.Background(), q, integerPKTable(), 4)
+	bounds, err := ComputeChunkBoundaries(context.Background(), q, integerPKTable(), 4)
 	if err != nil {
-		t.Fatalf("computeChunkBoundaries: %v", err)
+		t.Fatalf("ComputeChunkBoundaries: %v", err)
 	}
 	if len(bounds) != 4 {
 		t.Fatalf("got %d chunks; want 4", len(bounds))
 	}
 	// Chunk 0: lower=nil, upper=26 (1 + 100/4 = 26)
-	if bounds[0].lowerPK != nil {
-		t.Errorf("chunk 0 lower: got %v; want nil", bounds[0].lowerPK)
+	if bounds[0].LowerPK != nil {
+		t.Errorf("chunk 0 lower: got %v; want nil", bounds[0].LowerPK)
 	}
-	if !reflect.DeepEqual(bounds[0].upperPK, []any{int64(26)}) {
-		t.Errorf("chunk 0 upper: got %v; want [26]", bounds[0].upperPK)
+	if !reflect.DeepEqual(bounds[0].UpperPK, []any{int64(26)}) {
+		t.Errorf("chunk 0 upper: got %v; want [26]", bounds[0].UpperPK)
 	}
 	// Chunk 3 (last): lower=76, upper=nil
-	if !reflect.DeepEqual(bounds[3].lowerPK, []any{int64(76)}) {
-		t.Errorf("chunk 3 lower: got %v; want [76]", bounds[3].lowerPK)
+	if !reflect.DeepEqual(bounds[3].LowerPK, []any{int64(76)}) {
+		t.Errorf("chunk 3 lower: got %v; want [76]", bounds[3].LowerPK)
 	}
-	if bounds[3].upperPK != nil {
-		t.Errorf("chunk 3 upper: got %v; want nil", bounds[3].upperPK)
+	if bounds[3].UpperPK != nil {
+		t.Errorf("chunk 3 upper: got %v; want nil", bounds[3].UpperPK)
 	}
 	// Chunk indices are monotonic.
 	for i, b := range bounds {
-		if b.chunkIndex != i {
-			t.Errorf("bounds[%d].chunkIndex = %d; want %d", i, b.chunkIndex, i)
+		if b.ChunkIndex != i {
+			t.Errorf("bounds[%d].ChunkIndex = %d; want %d", i, b.ChunkIndex, i)
 		}
 	}
 }
@@ -186,16 +186,16 @@ func TestComputeChunkBoundaries_HappyPath(t *testing.T) {
 // path collapses to single-reader without a separate code path.
 func TestComputeChunkBoundaries_EmptyTable(t *testing.T) {
 	q := stubRangeQuerier{minVal: nil, maxVal: nil}
-	bounds, err := computeChunkBoundaries(context.Background(), q, integerPKTable(), 4)
+	bounds, err := ComputeChunkBoundaries(context.Background(), q, integerPKTable(), 4)
 	if err != nil {
-		t.Fatalf("computeChunkBoundaries: %v", err)
+		t.Fatalf("ComputeChunkBoundaries: %v", err)
 	}
 	if len(bounds) != 1 {
 		t.Fatalf("got %d chunks; want 1 for empty table", len(bounds))
 	}
-	if bounds[0].lowerPK != nil || bounds[0].upperPK != nil {
+	if bounds[0].LowerPK != nil || bounds[0].UpperPK != nil {
 		t.Errorf("empty-table chunk: got bounds %v..%v; want nil..nil",
-			bounds[0].lowerPK, bounds[0].upperPK)
+			bounds[0].LowerPK, bounds[0].UpperPK)
 	}
 }
 
@@ -204,9 +204,9 @@ func TestComputeChunkBoundaries_EmptyTable(t *testing.T) {
 // gracefully rather than producing empty chunks.
 func TestComputeChunkBoundaries_FewerRowsThanChunks(t *testing.T) {
 	q := stubRangeQuerier{minVal: int64(1), maxVal: int64(3)}
-	bounds, err := computeChunkBoundaries(context.Background(), q, integerPKTable(), 8)
+	bounds, err := ComputeChunkBoundaries(context.Background(), q, integerPKTable(), 8)
 	if err != nil {
-		t.Fatalf("computeChunkBoundaries: %v", err)
+		t.Fatalf("ComputeChunkBoundaries: %v", err)
 	}
 	// span = 3 (rows 1, 2, 3); we asked for 8 chunks but got 3.
 	if len(bounds) != 3 {
@@ -218,73 +218,12 @@ func TestComputeChunkBoundaries_FewerRowsThanChunks(t *testing.T) {
 // (min==max) produce one chunk covering the whole row.
 func TestComputeChunkBoundaries_SingleRow(t *testing.T) {
 	q := stubRangeQuerier{minVal: int64(42), maxVal: int64(42)}
-	bounds, err := computeChunkBoundaries(context.Background(), q, integerPKTable(), 4)
+	bounds, err := ComputeChunkBoundaries(context.Background(), q, integerPKTable(), 4)
 	if err != nil {
-		t.Fatalf("computeChunkBoundaries: %v", err)
+		t.Fatalf("ComputeChunkBoundaries: %v", err)
 	}
 	if len(bounds) != 1 {
 		t.Errorf("got %d chunks; want 1 for single-row table", len(bounds))
-	}
-}
-
-// TestUseFastLoader is the ADR-0043 four-gate truth table. The gate
-// is "fast loader IFF NOT resuming AND zero prior progress AND NOT
-// force-cold-start". Gate (4) (live-add) is structurally vacuous for
-// copyChunk and intentionally not a parameter (see useFastLoader's
-// doc-comment), so it does not appear here.
-func TestUseFastLoader(t *testing.T) {
-	fresh := ir.TableChunkProgress{State: ir.TableProgressInProgress}
-	withCursor := ir.TableChunkProgress{
-		State:      ir.TableProgressInProgress,
-		LastPK:     []any{int64(500)},
-		RowsCopied: 500,
-	}
-	rowsOnly := ir.TableChunkProgress{
-		State:      ir.TableProgressInProgress,
-		RowsCopied: 12,
-	}
-	pkOnly := ir.TableChunkProgress{
-		State:  ir.TableProgressInProgress,
-		LastPK: []any{int64(1)},
-	}
-	complete := ir.TableChunkProgress{State: ir.TableProgressComplete}
-
-	cases := []struct {
-		name           string
-		resuming       bool
-		forceColdStart bool
-		chunk          ir.TableChunkProgress
-		want           bool
-	}{
-		// The single true row: cold, fresh, no force, zero progress.
-		{"cold_fresh_noforce", false, false, fresh, true},
-
-		// Gate (1): resume always disables the fast loader, even on a
-		// zero-progress chunk (the crash-replay safety property).
-		{"resume_even_if_fresh", true, false, fresh, false},
-		{"resume_with_cursor", true, false, withCursor, false},
-
-		// Gate (2): any recorded prior progress disables it.
-		{"prior_cursor_and_rows", false, false, withCursor, false},
-		{"prior_rows_only", false, false, rowsOnly, false},
-		{"prior_pk_only", false, false, pkOnly, false},
-		{"prior_state_complete", false, false, complete, false},
-
-		// Gate (3): --force-cold-start disables it (target may be
-		// populated; non-upsert WriteRows would collide).
-		{"force_cold_start_even_if_fresh", false, true, fresh, false},
-
-		// All gates failing simultaneously.
-		{"resume_and_force_and_progress", true, true, withCursor, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := useFastLoader(tc.resuming, tc.forceColdStart, tc.chunk)
-			if got != tc.want {
-				t.Errorf("useFastLoader(resuming=%v, force=%v, chunk=%+v) = %v; want %v",
-					tc.resuming, tc.forceColdStart, tc.chunk, got, tc.want)
-			}
-		})
 	}
 }
 
@@ -302,9 +241,9 @@ func TestResolveBulkParallelism(t *testing.T) {
 		{1, 16, 1},   // explicit 1 honoured
 	}
 	for _, c := range cases {
-		got := resolveBulkParallelism(c.configured, c.numCPU)
+		got := ResolveBulkParallelism(c.configured, c.numCPU)
 		if got != c.want {
-			t.Errorf("resolveBulkParallelism(%d, %d) = %d; want %d",
+			t.Errorf("ResolveBulkParallelism(%d, %d) = %d; want %d",
 				c.configured, c.numCPU, got, c.want)
 		}
 	}
@@ -337,18 +276,18 @@ func TestResolveBulkParallelMinRows(t *testing.T) {
 	}
 	prev := int64(1<<62 - 1)
 	for _, c := range cases {
-		got := resolveBulkParallelMinRows(c.configured, c.tableCount)
+		got := ResolveBulkParallelMinRows(c.configured, c.tableCount)
 		if got != c.want {
-			t.Errorf("%s: resolveBulkParallelMinRows(%d, %d) = %d; want %d",
+			t.Errorf("%s: ResolveBulkParallelMinRows(%d, %d) = %d; want %d",
 				c.name, c.configured, c.tableCount, got, c.want)
 		}
-		if got < adaptiveBulkParallelMinRowsFloor && c.configured <= 0 {
-			t.Errorf("%s: auto result %d below floor %d", c.name, got, adaptiveBulkParallelMinRowsFloor)
+		if got < AdaptiveBulkParallelMinRowsFloor && c.configured <= 0 {
+			t.Errorf("%s: auto result %d below floor %d", c.name, got, AdaptiveBulkParallelMinRowsFloor)
 		}
 	}
 	// Monotonic non-increasing as the table count rises (auto path).
 	for tc := 1; tc <= 64; tc++ {
-		got := resolveBulkParallelMinRows(0, tc)
+		got := ResolveBulkParallelMinRows(0, tc)
 		if got > prev {
 			t.Errorf("auto threshold not monotonic: tableCount=%d gave %d > previous %d", tc, got, prev)
 		}
@@ -374,9 +313,9 @@ func TestCoerceInt64(t *testing.T) {
 		{nil, 0, false},           // defensive
 	}
 	for _, c := range cases {
-		got, ok := coerceInt64(c.in)
+		got, ok := CoerceInt64(c.in)
 		if got != c.want || ok != c.ok {
-			t.Errorf("coerceInt64(%v %T): got (%d, %v); want (%d, %v)",
+			t.Errorf("CoerceInt64(%v %T): got (%d, %v); want (%d, %v)",
 				c.in, c.in, got, ok, c.want, c.ok)
 		}
 	}
@@ -443,7 +382,7 @@ func TestApproximateRowCount_PrefersEstimator(t *testing.T) {
 			estimateVal: 5000, estimateUsed: &estUsed,
 			countVal: 0, countUsed: &cntUsed,
 		}}
-		got, err := approximateRowCount(context.Background(), r, table)
+		got, err := ApproximateRowCount(context.Background(), r, table)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -461,7 +400,7 @@ func TestApproximateRowCount_PrefersEstimator(t *testing.T) {
 	t.Run("falls back to CountRows when only RowCounter", func(t *testing.T) {
 		var cntUsed bool
 		r := &countOnlyReader{countProbeReader{countVal: 1234, countUsed: &cntUsed}}
-		got, err := approximateRowCount(context.Background(), r, table)
+		got, err := ApproximateRowCount(context.Background(), r, table)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -474,7 +413,7 @@ func TestApproximateRowCount_PrefersEstimator(t *testing.T) {
 	})
 
 	t.Run("returns 0 when neither implemented", func(t *testing.T) {
-		got, err := approximateRowCount(context.Background(), &plainReader{}, table)
+		got, err := ApproximateRowCount(context.Background(), &plainReader{}, table)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}

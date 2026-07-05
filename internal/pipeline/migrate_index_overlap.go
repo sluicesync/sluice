@@ -17,7 +17,7 @@
 // table onto a buffered channel; the index builder
 // (ir.IncrementalIndexBuilder) drains it and builds that table's secondary
 // indexes concurrently with the still-copying tables, sized from the
-// connection slice splitCopyAndIndexBudget reserved for the index axis
+// connection slice migcore.SplitCopyAndIndexBudget reserved for the index axis
 // (so copy + index connections held simultaneously never exceed the
 // measured budget). A copy error cancels the index pool via the shared
 // ctx and vice versa.

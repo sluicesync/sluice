@@ -274,7 +274,7 @@ type Backup struct {
 	// budget-split); 1 = disable within-table chunking (the pre-ADR-0149
 	// behaviour). Engages per table only when the snapshot is shareable
 	// via the LAZY importer path ([backupWithinChunkingEligible]), the
-	// table's PK shape is chunkable ([canParallelChunkTable]) and its
+	// table's PK shape is chunkable ([migcore.CanParallelChunkTable]) and its
 	// estimated row count clears BulkParallelMinRows; everything else
 	// streams single-reader with the reason logged. The
 	// TableParallelism × BulkParallelism product is bounded by the
@@ -286,7 +286,7 @@ type Backup struct {
 	// BulkParallelMinRows is the estimated-row-count threshold below
 	// which a table streams single-reader regardless of BulkParallelism
 	// — the same knob and auto-adaptation as migrate's
-	// --bulk-parallel-min-rows ([resolveBulkParallelMinRows]). 0 = auto
+	// --bulk-parallel-min-rows ([migcore.ResolveBulkParallelMinRows]). 0 = auto
 	// (base 80k, dialled down on many-table schemas).
 	BulkParallelMinRows int64
 

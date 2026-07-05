@@ -16,17 +16,16 @@
 // catalog queries that produce the report live in the postgres engine —
 // no PG specifics leak here beyond the small report struct.
 
-package pipeline
+package migcore
 
 import (
 	"context"
 	"log/slog"
 
 	"sluicesync.dev/sluice/internal/ir"
-	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
-// resolveTargetCopyParallelism returns the bulk-copy parallelism to use
+// ResolveTargetCopyParallelism returns the bulk-copy parallelism to use
 // after the connection-budget preflight. The contract:
 //
 //   - If the target engine doesn't implement the budget prober (MySQL),
@@ -40,15 +39,15 @@ import (
 //     cap was actually applied (N→M).
 //
 // requested is the already-resolved --bulk-parallelism (post
-// [resolveBulkParallelism], so the min(8, NumCPU) default is concrete).
+// [ResolveBulkParallelism], so the min(8, NumCPU) default is concrete).
 // ceiling is the operator's --max-target-connections (0 = auto only).
 //
 // The returned [ir.ConnectionBudget] is the raw probe report (zero value
 // on the no-prober / degraded / broken-DSN paths). The cross-table pool
 // (ADR-0076) reads its CopyBudget to split the budget across the two
-// concurrency axes via [resolveCopyParallelismBudget]; a zero-value
+// concurrency axes via [ResolveCopyParallelismBudget]; a zero-value
 // report there reads as "no measured ceiling".
-func resolveTargetCopyParallelism(
+func ResolveTargetCopyParallelism(
 	ctx context.Context,
 	target ir.Engine,
 	targetDSN string,
@@ -66,7 +65,7 @@ func resolveTargetCopyParallelism(
 		// A connection-open failure: the operator's target DSN is wrong.
 		// Surface it the same as any other Open* — this is not the
 		// safety check breaking a working migration, it's a broken DSN.
-		return 0, ir.ConnectionBudget{}, migcore.WrapWithHint(migcore.PhaseConnect, err)
+		return 0, ir.ConnectionBudget{}, WrapWithHint(PhaseConnect, err)
 	}
 
 	if report.ProbeFailed {
@@ -84,7 +83,7 @@ func resolveTargetCopyParallelism(
 
 	if report.Refuse {
 		// Loud refusal — never start a copy that can't finish.
-		return 0, ir.ConnectionBudget{}, migcore.WrapWithHint(migcore.PhaseConnect, report.RefusalError)
+		return 0, ir.ConnectionBudget{}, WrapWithHint(PhaseConnect, report.RefusalError)
 	}
 
 	if report.Capped {
@@ -108,24 +107,24 @@ func resolveTargetCopyParallelism(
 	return report.EffectiveParallelism, report, nil
 }
 
-// resolveCopyParallelismBudget splits a single connection budget across
+// ResolveCopyParallelismBudget splits a single connection budget across
 // the TWO concurrency axes the cold migrate now drives — cross-table
 // (roadmap item 3(a)) and within-table (--bulk-parallelism, ADR-0019) —
 // such that the PRODUCT of the two factors never exceeds the budget
 // (ADR-0076; roadmap item 3 gotcha 2). Enforcing the ceiling on the
 // product, at the SINGLE budget chokepoint, is the load-bearing
-// constraint: each table's own copyParallelismGate is seeded with
+// constraint: each table's own CopyParallelismGate is seeded with
 // <= withinP tokens and the table pool is capped at tableP, so
 // tableP*withinP open target connections is the construction-time
 // ceiling — no global shared runtime semaphore is needed.
 //
 // Inputs:
 //   - resolvedWithin is the within-table factor after
-//     [resolveTargetCopyParallelism]'s budget/ceiling cap (= the value
+//     [ResolveTargetCopyParallelism]'s budget/ceiling cap (= the value
 //     that function returns; always >= 1 in practice, clamped here
 //     defensively).
 //   - requestedTable is the operator's --table-parallelism after the
-//     auto/disable resolution ([resolveTableParallelism]). Always >= 1.
+//     auto/disable resolution ([ResolveTableParallelism]). Always >= 1.
 //   - copyBudget is report.CopyBudget — the target's measured total
 //     connection ceiling. 0 (or negative) means "no measured ceiling"
 //     (a non-prober target like MySQL, or a degraded probe).
@@ -149,7 +148,7 @@ func resolveTargetCopyParallelism(
 //
 // Returns (tableP, withinP); both >= 1, and tableP*withinP <= budget
 // whenever budget >= 1.
-func resolveCopyParallelismBudget(resolvedWithin, requestedTable, copyBudget, ceiling int) (tableP, withinP int) {
+func ResolveCopyParallelismBudget(resolvedWithin, requestedTable, copyBudget, ceiling int) (tableP, withinP int) {
 	withinP = resolvedWithin
 	if withinP < 1 {
 		withinP = 1
@@ -173,7 +172,7 @@ func resolveCopyParallelismBudget(resolvedWithin, requestedTable, copyBudget, ce
 	// whatever whole multiples of withinP remain. Floor at 1 so a budget
 	// smaller than withinP still copies one table at a time (budget=1 →
 	// 1x1; the within factor was already clamped to copyBudget upstream by
-	// resolveTargetCopyParallelism, so withinP <= copyBudget holds — and
+	// ResolveTargetCopyParallelism, so withinP <= copyBudget holds — and
 	// when ceiling is the tighter bound it likewise clamped within).
 	maxTable := budget / withinP
 	if maxTable < 1 {
@@ -190,13 +189,13 @@ func resolveCopyParallelismBudget(resolvedWithin, requestedTable, copyBudget, ce
 // mirrors pgcopydb's default 4 table-jobs / 4 index-jobs balance from the
 // at-scale comparison; the index pool's auto concurrency self-caps at
 // indexBuildConcurrencyHardCap (8) anyway, so reserving more than that is
-// wasted — hence the [1, indexBudgetCeiling] clamp.
+// wasted — hence the [1, IndexBudgetCeiling] clamp.
 const (
 	indexBudgetFraction = 0.25
-	indexBudgetCeiling  = 8 // == postgres.indexBuildConcurrencyHardCap
+	IndexBudgetCeiling  = 8 // == postgres.indexBuildConcurrencyHardCap
 )
 
-// splitCopyAndIndexBudget carves the single measured connection budget
+// SplitCopyAndIndexBudget carves the single measured connection budget
 // into a slice for the overlapped index-build pool and the remainder for
 // the copy pool, when index builds OVERLAP the bulk copy (ADR-0077,
 // roadmap item 3b(a)). Both pools now hold connections open SIMULTANEOUSLY,
@@ -210,7 +209,7 @@ const (
 //     measured ceiling" (a non-prober target like MySQL, or a degraded
 //     probe).
 //   - withinParallelism is the within-table copy factor AFTER the budget
-//     cap (the value resolveTargetCopyParallelism returned). It is the
+//     cap (the value ResolveTargetCopyParallelism returned). It is the
 //     minimum the copy axis needs to copy a single table, so the copy
 //     slice is never trimmed below it.
 //
@@ -222,7 +221,7 @@ const (
 //     whole-schema fallback anyway — and the degraded-probe path).
 //
 //   - else: indexBudget = clamp(round(indexBudgetFraction × copyBudget),
-//     1, indexBudgetCeiling); copyBudget' = max(copyBudget − indexBudget,
+//     1, IndexBudgetCeiling); copyBudget' = max(copyBudget − indexBudget,
 //     withinParallelism), then indexBudget is trimmed to
 //     copyBudget − copyBudget' so the INVARIANT holds:
 //
@@ -235,10 +234,10 @@ const (
 //     for the index pool, so it falls back to the post-copy phase rather
 //     than starving copy.
 //
-// The returned copyBudget' is fed back into resolveCopyParallelismBudget
+// The returned copyBudget' is fed back into ResolveCopyParallelismBudget
 // so the copy axes only ever see their slice; indexBudget is handed to
 // the SchemaWriter via SetIndexBuildBudget.
-func splitCopyAndIndexBudget(copyBudget, withinParallelism int) (indexBudget, copyBudgetRemaining int) {
+func SplitCopyAndIndexBudget(copyBudget, withinParallelism int) (indexBudget, copyBudgetRemaining int) {
 	if copyBudget < 1 {
 		// No measured ceiling: don't engage the split. Both axes stay
 		// unclamped (the pre-ADR-0077 behaviour); MySQL overlaps via the
@@ -253,8 +252,8 @@ func splitCopyAndIndexBudget(copyBudget, withinParallelism int) (indexBudget, co
 	if indexBudget < 1 {
 		indexBudget = 1
 	}
-	if indexBudget > indexBudgetCeiling {
-		indexBudget = indexBudgetCeiling
+	if indexBudget > IndexBudgetCeiling {
+		indexBudget = IndexBudgetCeiling
 	}
 
 	copyBudgetRemaining = copyBudget - indexBudget

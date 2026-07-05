@@ -24,6 +24,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // importerStubEngine is a stubEngine that additionally satisfies
@@ -139,8 +140,8 @@ func TestResolveBackupTableParallelism_AutoDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveBackupTableParallelism: %v", err)
 	}
-	if got != defaultTableParallelism {
-		t.Errorf("tableParallelism = %d; want auto default %d", got, defaultTableParallelism)
+	if got != migcore.DefaultTableParallelism {
+		t.Errorf("tableParallelism = %d; want auto default %d", got, migcore.DefaultTableParallelism)
 	}
 }
 

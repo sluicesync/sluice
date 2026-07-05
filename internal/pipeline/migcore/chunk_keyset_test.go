@@ -13,7 +13,7 @@
 // (integer, string/uuid/binary-as-bytes, decimal-as-bytes, temporal)
 // and shape (single-column + composite).
 
-package pipeline
+package migcore
 
 import (
 	"context"
@@ -61,7 +61,7 @@ func compositePKTable() *ir.Table {
 	}
 }
 
-// ---- comparePKTuple / comparePKValue family matrix ----
+// ---- ComparePKTuple / comparePKValue family matrix ----
 
 func TestComparePKValue_Families(t *testing.T) {
 	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -122,8 +122,8 @@ func TestComparePKTuple_Lexicographic(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := comparePKTuple(tc.a, tc.b); got != tc.want {
-				t.Errorf("comparePKTuple(%v,%v) = %d; want %d", tc.a, tc.b, got, tc.want)
+			if got := ComparePKTuple(tc.a, tc.b); got != tc.want {
+				t.Errorf("ComparePKTuple(%v,%v) = %d; want %d", tc.a, tc.b, got, tc.want)
 			}
 		})
 	}
@@ -136,28 +136,28 @@ func TestComparePKTuple_Lexicographic(t *testing.T) {
 // failure) — mirroring the orchestrator's lower-exclusive/upper-inclusive
 // boundary semantics enforced by filterByUpperBound + the cursor's
 // LowerPK start.
-func assignChunk(bounds []chunkBoundary, pk []any) int {
+func assignChunk(bounds []ChunkBoundary, pk []any) int {
 	owner := -1
 	for _, b := range bounds {
 		// lower bound: pk > LowerPK (nil => no lower bound)
-		if b.lowerPK != nil && comparePKTuple(pk, b.lowerPK) <= 0 {
+		if b.LowerPK != nil && ComparePKTuple(pk, b.LowerPK) <= 0 {
 			continue
 		}
 		// upper bound: pk <= UpperPK (nil => no upper bound)
-		if b.upperPK != nil && comparePKTuple(pk, b.upperPK) > 0 {
+		if b.UpperPK != nil && ComparePKTuple(pk, b.UpperPK) > 0 {
 			continue
 		}
 		if owner != -1 {
 			// Row matched two chunks — disjointness violated.
 			return -2
 		}
-		owner = b.chunkIndex
+		owner = b.ChunkIndex
 	}
 	return owner
 }
 
 // assertExactlyOnce checks every probe pk lands in exactly one chunk.
-func assertExactlyOnce(t *testing.T, bounds []chunkBoundary, probes [][]any) {
+func assertExactlyOnce(t *testing.T, bounds []ChunkBoundary, probes [][]any) {
 	t.Helper()
 	for _, pk := range probes {
 		switch assignChunk(bounds, pk) {
@@ -176,22 +176,22 @@ func TestComputeKeysetChunkBoundaries_IntegerComposite_ExactlyOnce(t *testing.T)
 		{int64(2), int64(10)},
 		{int64(3), int64(99)},
 	}}
-	bounds, err := computeKeysetChunkBoundaries(context.Background(), s, compositePKTable(), 4)
+	bounds, err := ComputeKeysetChunkBoundaries(context.Background(), s, compositePKTable(), 4)
 	if err != nil {
-		t.Fatalf("computeKeysetChunkBoundaries: %v", err)
+		t.Fatalf("ComputeKeysetChunkBoundaries: %v", err)
 	}
 	if len(bounds) != 4 {
 		t.Fatalf("got %d chunks; want 4", len(bounds))
 	}
 	// Shape: chunk 0 nil-lower, chunk 3 nil-upper, boundaries chained.
-	if bounds[0].lowerPK != nil {
-		t.Errorf("chunk 0 lower: got %v; want nil", bounds[0].lowerPK)
+	if bounds[0].LowerPK != nil {
+		t.Errorf("chunk 0 lower: got %v; want nil", bounds[0].LowerPK)
 	}
-	if bounds[3].upperPK != nil {
-		t.Errorf("chunk 3 upper: got %v; want nil", bounds[3].upperPK)
+	if bounds[3].UpperPK != nil {
+		t.Errorf("chunk 3 upper: got %v; want nil", bounds[3].UpperPK)
 	}
-	if !reflect.DeepEqual(bounds[1].lowerPK, []any{int64(1), int64(50)}) {
-		t.Errorf("chunk 1 lower: got %v; want [1 50]", bounds[1].lowerPK)
+	if !reflect.DeepEqual(bounds[1].LowerPK, []any{int64(1), int64(50)}) {
+		t.Errorf("chunk 1 lower: got %v; want [1 50]", bounds[1].LowerPK)
 	}
 	// Exactly-once over probes that bracket every boundary, including
 	// the boundary values themselves (which must land in the LOWER chunk
@@ -215,9 +215,9 @@ func TestComputeKeysetChunkBoundaries_StringPK_ExactlyOnce(t *testing.T) {
 		{"m"},
 		{"t"},
 	}}
-	bounds, err := computeKeysetChunkBoundaries(context.Background(), s, uuidPKTable(), 4)
+	bounds, err := ComputeKeysetChunkBoundaries(context.Background(), s, uuidPKTable(), 4)
 	if err != nil {
-		t.Fatalf("computeKeysetChunkBoundaries: %v", err)
+		t.Fatalf("ComputeKeysetChunkBoundaries: %v", err)
 	}
 	if len(bounds) != 4 {
 		t.Fatalf("got %d chunks; want 4", len(bounds))
@@ -248,9 +248,9 @@ func TestComputeKeysetChunkBoundaries_TemporalPK_ExactlyOnce(t *testing.T) {
 		Columns:    []*ir.Column{{Name: "ts", Type: ir.Timestamp{}}},
 		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "ts"}}},
 	}
-	bounds, err := computeKeysetChunkBoundaries(context.Background(), s, tbl, 3)
+	bounds, err := ComputeKeysetChunkBoundaries(context.Background(), s, tbl, 3)
 	if err != nil {
-		t.Fatalf("computeKeysetChunkBoundaries: %v", err)
+		t.Fatalf("ComputeKeysetChunkBoundaries: %v", err)
 	}
 	if len(bounds) != 3 {
 		t.Fatalf("got %d chunks; want 3", len(bounds))
@@ -276,9 +276,9 @@ func TestComputeKeysetChunkBoundaries_DuplicateBoundaries(t *testing.T) {
 		{"m"}, // duplicate — would create an empty ("m","m"] chunk
 		{"t"},
 	}}
-	bounds, err := computeKeysetChunkBoundaries(context.Background(), s, uuidPKTable(), 4)
+	bounds, err := ComputeKeysetChunkBoundaries(context.Background(), s, uuidPKTable(), 4)
 	if err != nil {
-		t.Fatalf("computeKeysetChunkBoundaries: %v", err)
+		t.Fatalf("ComputeKeysetChunkBoundaries: %v", err)
 	}
 	// 2 distinct boundaries → 3 chunks, not 4.
 	if len(bounds) != 3 {
@@ -292,15 +292,15 @@ func TestComputeKeysetChunkBoundaries_DuplicateBoundaries(t *testing.T) {
 // nil-bounded chunk (→ single-reader).
 func TestComputeKeysetChunkBoundaries_EmptyTable(t *testing.T) {
 	s := stubKeysetSampler{boundaries: nil}
-	bounds, err := computeKeysetChunkBoundaries(context.Background(), s, uuidPKTable(), 4)
+	bounds, err := ComputeKeysetChunkBoundaries(context.Background(), s, uuidPKTable(), 4)
 	if err != nil {
-		t.Fatalf("computeKeysetChunkBoundaries: %v", err)
+		t.Fatalf("ComputeKeysetChunkBoundaries: %v", err)
 	}
 	if len(bounds) != 1 {
 		t.Fatalf("got %d chunks; want 1 for empty table", len(bounds))
 	}
-	if bounds[0].lowerPK != nil || bounds[0].upperPK != nil {
-		t.Errorf("empty chunk: got %v..%v; want nil..nil", bounds[0].lowerPK, bounds[0].upperPK)
+	if bounds[0].LowerPK != nil || bounds[0].UpperPK != nil {
+		t.Errorf("empty chunk: got %v..%v; want nil..nil", bounds[0].LowerPK, bounds[0].UpperPK)
 	}
 }
 
@@ -309,7 +309,7 @@ func TestComputeKeysetChunkBoundaries_EmptyTable(t *testing.T) {
 // programming error, surfaced rather than silently mis-bounded.
 func TestComputeKeysetChunkBoundaries_WidthMismatch(t *testing.T) {
 	s := stubKeysetSampler{boundaries: [][]any{{int64(1), int64(2)}}} // 2-wide on a 1-col PK
-	_, err := computeKeysetChunkBoundaries(context.Background(), s, integerPKTable(), 2)
+	_, err := ComputeKeysetChunkBoundaries(context.Background(), s, integerPKTable(), 2)
 	if err == nil {
 		t.Fatal("expected width-mismatch error; got nil")
 	}
@@ -320,7 +320,7 @@ func TestComputeKeysetChunkBoundaries_WidthMismatch(t *testing.T) {
 // path's job) — the strategy split is enforced at the boundary fn too.
 func TestComputeKeysetChunkBoundaries_RejectsIntegerTable(t *testing.T) {
 	s := stubKeysetSampler{boundaries: [][]any{{int64(50)}}}
-	_, err := computeKeysetChunkBoundaries(context.Background(), s, integerPKTable(), 2)
+	_, err := ComputeKeysetChunkBoundaries(context.Background(), s, integerPKTable(), 2)
 	if err == nil {
 		t.Fatal("expected keyset path to reject integer-PK table; got nil")
 	}
@@ -330,64 +330,6 @@ func TestComputeKeysetChunkBoundaries_RejectsIntegerTable(t *testing.T) {
 // chunk's last batch must drop rows strictly past UpperPK while KEEPING
 // the row equal to UpperPK (inclusive upper). Rows arrive in PK order;
 // the filter stops at the first over-bound row.
-func TestFilterByUpperBound_TupleClip(t *testing.T) {
-	t.Run("single_column", func(t *testing.T) {
-		src := make(chan ir.Row, 8)
-		// Ascending PK order, straddling the upper bound 20 (inclusive).
-		for _, id := range []int64{10, 15, 20, 21, 25} {
-			src <- ir.Row{"id": id}
-		}
-		close(src)
-		out := filterByUpperBound(context.Background(), src, []string{"id"}, []any{int64(20)})
-		var got []int64
-		for row := range out {
-			got = append(got, row["id"].(int64))
-		}
-		want := []int64{10, 15, 20} // 20 kept (inclusive); 21,25 dropped
-		if !reflect.DeepEqual(got, want) {
-			t.Errorf("clipped PKs: got %v; want %v", got, want)
-		}
-	})
-
-	t.Run("composite", func(t *testing.T) {
-		src := make(chan ir.Row, 8)
-		rows := []ir.Row{
-			{"tenant_id": int64(1), "user_id": int64(5)},
-			{"tenant_id": int64(2), "user_id": int64(10)}, // == upper → keep
-			{"tenant_id": int64(2), "user_id": int64(11)}, // past upper → drop
-			{"tenant_id": int64(3), "user_id": int64(1)},  // past → drop
-		}
-		for _, r := range rows {
-			src <- r
-		}
-		close(src)
-		out := filterByUpperBound(context.Background(), src, []string{"tenant_id", "user_id"}, []any{int64(2), int64(10)})
-		var got [][]int64
-		for row := range out {
-			got = append(got, []int64{row["tenant_id"].(int64), row["user_id"].(int64)})
-		}
-		want := [][]int64{{1, 5}, {2, 10}}
-		if !reflect.DeepEqual(got, want) {
-			t.Errorf("clipped composite PKs: got %v; want %v", got, want)
-		}
-	})
-
-	t.Run("nil_upper_passthrough", func(t *testing.T) {
-		src := make(chan ir.Row, 2)
-		src <- ir.Row{"id": int64(1)}
-		src <- ir.Row{"id": int64(9_999_999)}
-		close(src)
-		out := filterByUpperBound(context.Background(), src, []string{"id"}, nil)
-		n := 0
-		for range out {
-			n++
-		}
-		if n != 2 {
-			t.Errorf("nil upper bound should pass all rows; got %d", n)
-		}
-	})
-}
-
 // TestIsOrderablePKType pins the orderable family set.
 func TestIsOrderablePKType(t *testing.T) {
 	orderable := []ir.Type{
@@ -408,14 +350,14 @@ func TestIsOrderablePKType(t *testing.T) {
 		ir.Domain{BaseType: ir.UUID{}},
 	}
 	for _, ty := range orderable {
-		if !isOrderablePKType(ty) {
-			t.Errorf("isOrderablePKType(%s) = false; want true", ty.String())
+		if !IsOrderablePKType(ty) {
+			t.Errorf("IsOrderablePKType(%s) = false; want true", ty.String())
 		}
 	}
 	notOrderable := []ir.Type{ir.JSON{}, ir.Array{}, ir.Geometry{}, ir.Domain{}}
 	for _, ty := range notOrderable {
-		if isOrderablePKType(ty) {
-			t.Errorf("isOrderablePKType(%s) = true; want false", ty.String())
+		if IsOrderablePKType(ty) {
+			t.Errorf("IsOrderablePKType(%s) = true; want false", ty.String())
 		}
 	}
 }

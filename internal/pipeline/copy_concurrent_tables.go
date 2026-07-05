@@ -223,14 +223,6 @@ func runConcurrentTableCopy(
 	return tg.Wait()
 }
 
-// maxChunksPerTable caps how many intra-table PK-range chunks one table is
-// split into (ADR-0119 Decision 1). The split reclaims the tail; past a point
-// extra chunks only add per-chunk overhead (a boundary tuple, a claim, a SQL
-// page) without widening the copy beyond the N pinned readers. 64 is generous
-// (a table N× the threshold still chunks fully up to the cap) while bounding the
-// work list.
-const maxChunksPerTable = 64
-
 // copyWorkItem is the unit of stealable work the work-stealing copy claims off
 // the shared cursor (ADR-0119 Decision 1). A whole-table item (chunkIndex < 0,
 // both bounds nil) is byte-identical to tier (a); a chunk item carries the
@@ -372,7 +364,7 @@ func runWorkStealingTableCopy(
 // work-stealing copy claims (ADR-0119 Decision 1). For each table it emits one
 // whole-table item, OR M ≥ 2 chunk items when ALL of: the reader is
 // chunk-capable ([ir.ChunkedWorkStealingCopyReader]); intra-table stealing is
-// not opted out; the table is chunk-eligible ([canParallelChunkTable] — an
+// not opted out; the table is chunk-eligible ([migcore.CanParallelChunkTable] — an
 // orderable, non-sluice-injected single/composite PK, so keyless / no-PK tables
 // stay whole and the keyless at-least-once contract is unchanged); and its
 // CountRows estimate clears the within-table threshold.
@@ -395,7 +387,7 @@ func buildCopyWorkItems(
 	rc, _ := ws.(ir.RowCounter)
 	// The within-table threshold adapts to the table count exactly as the
 	// migrate path's parallel chunker does (0 = the auto sentinel).
-	threshold := resolveBulkParallelMinRows(0, len(allTables))
+	threshold := migcore.ResolveBulkParallelMinRows(0, len(allTables))
 
 	var items []copyWorkItem
 	for _, name := range allTables {
@@ -437,9 +429,9 @@ func chunkItemsFor(
 	}
 	// Eligibility: an orderable single/composite PK (keyless / sluice-injected /
 	// non-orderable → whole, so the keyless at-least-once contract is unchanged).
-	// Pass parallelism 2 — canParallelChunkTable only gates parallelism <= 1, and
+	// Pass parallelism 2 — migcore.CanParallelChunkTable only gates parallelism <= 1, and
 	// the work-stealing reader always has N > 1 connections.
-	eligible, strategy, _ := canParallelChunkTable(table, 2)
+	eligible, strategy, _ := migcore.CanParallelChunkTable(table, 2)
 	if !eligible {
 		return whole
 	}
@@ -453,28 +445,28 @@ func chunkItemsFor(
 	if est < threshold {
 		return whole
 	}
-	// M = clamp(ceil(est/threshold), 2, maxChunksPerTable). threshold > 0
-	// (resolveBulkParallelMinRows floors it), so the ceil-divide is safe.
+	// M = clamp(ceil(est/threshold), 2, migcore.MaxChunksPerTable). threshold > 0
+	// (migcore.ResolveBulkParallelMinRows floors it), so the ceil-divide is safe.
 	m := int((est + threshold - 1) / threshold)
 	if m < 2 {
 		m = 2
 	}
-	if m > maxChunksPerTable {
-		m = maxChunksPerTable
+	if m > migcore.MaxChunksPerTable {
+		m = migcore.MaxChunksPerTable
 	}
 
 	// Compute boundaries on the side metadata pool via the SAME functions the
 	// migrate parallel copy pins (ADR-0019 integer MIN/MAX/divide, ADR-0096
-	// keyset), picking by the strategy canParallelChunkTable returned.
+	// keyset), picking by the strategy migcore.CanParallelChunkTable returned.
 	var (
-		boundaries []chunkBoundary
+		boundaries []migcore.ChunkBoundary
 		berr       error
 	)
 	switch strategy {
-	case strategyMinMaxDivide:
-		boundaries, berr = computeChunkBoundaries(ctx, cws, table, m)
-	case strategyKeysetSample:
-		boundaries, berr = computeKeysetChunkBoundaries(ctx, cws, table, m)
+	case migcore.StrategyMinMaxDivide:
+		boundaries, berr = migcore.ComputeChunkBoundaries(ctx, cws, table, m)
+	case migcore.StrategyKeysetSample:
+		boundaries, berr = migcore.ComputeKeysetChunkBoundaries(ctx, cws, table, m)
 	default:
 		return whole
 	}
@@ -495,9 +487,9 @@ func chunkItemsFor(
 	for _, b := range boundaries {
 		items = append(items, copyWorkItem{
 			table:      table,
-			chunkIndex: b.chunkIndex,
-			lowerPK:    b.lowerPK,
-			upperPK:    b.upperPK,
+			chunkIndex: b.ChunkIndex,
+			lowerPK:    b.LowerPK,
+			upperPK:    b.UpperPK,
 		})
 	}
 	return items

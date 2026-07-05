@@ -551,8 +551,8 @@ type Streamer struct {
 	// [ir.SnapshotImporterOpener] (Postgres). On every other source
 	// (MySQL, VStream) the cold-start stays serial and these are inert.
 	// Semantics mirror the identically-named [Migrator] fields verbatim;
-	// see [resolveBulkParallelism] / [resolveTableParallelism] /
-	// [resolveBulkParallelMinRows] for the 0=auto rules.
+	// see [migcore.ResolveBulkParallelism] / [migcore.ResolveTableParallelism] /
+	// [migcore.ResolveBulkParallelMinRows] for the 0=auto rules.
 	BulkParallelism     int
 	TableParallelism    int
 	BulkParallelMinRows int64

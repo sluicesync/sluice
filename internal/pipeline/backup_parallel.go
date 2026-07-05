@@ -7,9 +7,9 @@
 // ONE huge table still backed up single-stream while migrate split the
 // same table into PK ranges (ADR-0019/0096/0123) — perf-parity matrix
 // gap #1. This file closes it by reusing migrate's chunk machinery
-// verbatim — [canParallelChunkTable], [computeChunkBoundaries],
-// [computeKeysetChunkBoundaries], [readChunkBatch],
-// [clampParallelChunkCount] — inside the ADR-0084 table pool: an
+// verbatim — [migcore.CanParallelChunkTable], [migcore.ComputeChunkBoundaries],
+// [migcore.ComputeKeysetChunkBoundaries], [readChunkBatch],
+// [migcore.ClampParallelChunkCount] — inside the ADR-0084 table pool: an
 // eligible table's pool worker plans N disjoint half-open PK ranges
 // ((lower, upper]; nil = unbounded) on its snapshot-pinned reader,
 // then streams them concurrently, every range reader minted against
@@ -26,11 +26,11 @@
 //     readers) and the v0.17.x non-snapshot fallback has no consistent
 //     multi-reader view at all — both stay single-stream per table,
 //     named by one INFO at run start ([Backup.resolveBackupWithinTable]).
-//   - [canParallelChunkTable] returns a strategy, the reader implements
+//   - [migcore.CanParallelChunkTable] returns a strategy, the reader implements
 //     the strategy's surfaces (+[ir.BatchedRowReader] for the range
 //     paging itself), and the reader does not veto cursor reads via
 //     [ir.BatchedReadDisqualifier].
-//   - The row-count estimate clears the same [resolveBulkParallelMinRows]
+//   - The row-count estimate clears the same [migcore.ResolveBulkParallelMinRows]
 //     threshold migrate uses. On the snapshot-pinned PG readers the
 //     estimate runs off-snapshot with the exact-COUNT never-ANALYZEd
 //     fallback (the 59c55e27 estimate/bounds split; see
@@ -67,6 +67,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // backupChunkDispatchObserver is a TEST-ONLY seam (nil in production —
@@ -87,12 +88,12 @@ type backupWithinTable struct {
 	parallelism int
 
 	// minRows is the chunk-eligibility row threshold, resolved via
-	// [resolveBulkParallelMinRows] exactly as migrate resolves it.
+	// [migcore.ResolveBulkParallelMinRows] exactly as migrate resolves it.
 	minRows int64
 
 	// readBudget is the tableParallelism × parallelism product the
 	// run's reader connections are bounded by; it also caps the finer
-	// per-table chunk count ([clampParallelChunkCount]) so one large
+	// per-table chunk count ([migcore.ClampParallelChunkCount]) so one large
 	// table can fill the whole budget at the tail (ADR-0123).
 	readBudget int
 
@@ -102,7 +103,7 @@ type backupWithinTable struct {
 	// so cross-table + within-table readers never exceed the budget —
 	// and a large table's surplus ranges steal tokens freed by finished
 	// peer tables (the migrate copyGate discipline, ADR-0123).
-	gate *copyParallelismGate
+	gate *migcore.CopyParallelismGate
 
 	// freeReader / factory are the pool's reader supply, filled in by
 	// [Backup.runBackupTablePool] before the sweep starts: range workers
@@ -164,9 +165,9 @@ func (b *Backup) resolveBackupWithinTable(
 	budget := tableParallelism * requestedWithin
 	w := &backupWithinTable{
 		parallelism: requestedWithin,
-		minRows:     resolveBulkParallelMinRows(b.BulkParallelMinRows, taskCount),
+		minRows:     migcore.ResolveBulkParallelMinRows(b.BulkParallelMinRows, taskCount),
 		readBudget:  budget,
-		gate:        newCopyParallelismGate(budget, defaultCopyBackoffPolicy),
+		gate:        migcore.NewCopyParallelismGate(budget, migcore.DefaultCopyBackoffPolicy),
 	}
 	slog.InfoContext(
 		ctx, "backup: within-table read chunking enabled (ADR-0149)",
@@ -233,11 +234,11 @@ func (b *Backup) planBackupTableChunks(
 	rr ir.RowReader,
 	table *ir.Table,
 	within *backupWithinTable,
-) (bounds []chunkBoundary, reason string, err error) {
+) (bounds []migcore.ChunkBoundary, reason string, err error) {
 	if within == nil {
 		return nil, "within-table chunking not engaged for this run", nil
 	}
-	eligible, strategy, reason := canParallelChunkTable(table, within.parallelism)
+	eligible, strategy, reason := migcore.CanParallelChunkTable(table, within.parallelism)
 	if !eligible {
 		return nil, reason, nil
 	}
@@ -250,12 +251,12 @@ func (b *Backup) planBackupTableChunks(
 		return nil, "reader does not implement BatchedRowReader; single-reader path", nil
 	}
 	switch strategy {
-	case strategyMinMaxDivide:
-		if _, ok := rr.(rangeQuerier); !ok {
+	case migcore.StrategyMinMaxDivide:
+		if _, ok := rr.(migcore.RangeQuerier); !ok {
 			return nil, "reader does not implement RangeBoundsQuerier; single-reader path", nil
 		}
-	case strategyKeysetSample:
-		if _, ok := rr.(keysetSampler); !ok {
+	case migcore.StrategyKeysetSample:
+		if _, ok := rr.(migcore.KeysetSampler); !ok {
 			return nil, "reader does not implement KeysetSampler (non-integer/composite PK); single-reader path", nil
 		}
 		if _, ok := rr.(ir.BoundedBatchedRowReader); !ok {
@@ -267,7 +268,7 @@ func (b *Backup) planBackupTableChunks(
 			return nil, fmt.Sprintf("reader disqualifies cursor reads for this table: %s", why), nil
 		}
 	}
-	est, err := approximateRowCount(ctx, rr, table)
+	est, err := migcore.ApproximateRowCount(ctx, rr, table)
 	if err != nil {
 		// Best-effort fallback, mirroring shouldParallelChunk: the data
 		// path is the load-bearing thing; chunking is a perf detail.
@@ -280,12 +281,12 @@ func (b *Backup) planBackupTableChunks(
 		return nil, fmt.Sprintf("table has ~%d rows; below --bulk-parallel-min-rows=%d", est, within.minRows), nil
 	}
 
-	m := clampParallelChunkCount(est, within.minRows, within.parallelism, within.readBudget)
+	m := migcore.ClampParallelChunkCount(est, within.minRows, within.parallelism, within.readBudget)
 	switch strategy {
-	case strategyMinMaxDivide:
-		bounds, err = computeChunkBoundaries(ctx, rr.(rangeQuerier), table, m)
-	case strategyKeysetSample:
-		bounds, err = computeKeysetChunkBoundaries(ctx, rr.(keysetSampler), table, m)
+	case migcore.StrategyMinMaxDivide:
+		bounds, err = migcore.ComputeChunkBoundaries(ctx, rr.(migcore.RangeQuerier), table, m)
+	case migcore.StrategyKeysetSample:
+		bounds, err = migcore.ComputeKeysetChunkBoundaries(ctx, rr.(migcore.KeysetSampler), table, m)
 	default:
 		return nil, "", fmt.Errorf("pipeline: backup: table %q has unknown chunk strategy %d", table.Name, strategy)
 	}
@@ -317,10 +318,10 @@ func (b *Backup) backupTableRanges(
 	committer *manifestCommitter,
 	chainCEK []byte,
 	within *backupWithinTable,
-	bounds []chunkBoundary,
+	bounds []migcore.ChunkBoundary,
 ) error {
 	table, entry := task.table, task.entry
-	pkCols := primaryKeyColumnNames(table)
+	pkCols := migcore.PrimaryKeyColumnNames(table)
 
 	var (
 		chunkIdx  atomic.Int64
@@ -331,15 +332,15 @@ func (b *Backup) backupTableRanges(
 		bound := bound
 		g.Go(func() error {
 			s := b.newBackupChunkStreamer(table, entry, chunkRows, committer, chainCEK, &chunkIdx, &rowsTotal)
-			if bound.chunkIndex == 0 {
+			if bound.ChunkIndex == 0 {
 				// Range 0 streams on the worker's held reader — already
 				// budgeted by the worker's base gate token.
 				return b.backupRange(gctx, rr, table, s, bound, pkCols)
 			}
-			if err := within.gate.acquire(gctx); err != nil {
+			if err := within.gate.Acquire(gctx); err != nil {
 				return err
 			}
-			defer within.gate.release()
+			defer within.gate.Release()
 			rangeRR, release, err := acquireBackupReader(gctx, within.freeReader, within.factory)
 			if err != nil {
 				return err
@@ -375,7 +376,7 @@ func (b *Backup) backupRange(
 	rr ir.RowReader,
 	table *ir.Table,
 	s *backupChunkStreamer,
-	bound chunkBoundary,
+	bound migcore.ChunkBoundary,
 	pkCols []string,
 ) error {
 	br, ok := rr.(ir.BatchedRowReader)
@@ -385,11 +386,11 @@ func (b *Backup) backupRange(
 		// engine. Loud rather than a silently-skipped range.
 		return fmt.Errorf("pipeline: backupRange: row reader %T does not implement BatchedRowReader", rr)
 	}
-	cursor := bound.lowerPK
+	cursor := bound.LowerPK
 	for {
-		filtered, err := readChunkBatch(ctx, br, table, cursor, bound.upperPK, pkCols, defaultBulkBatchSize)
+		filtered, err := readChunkBatch(ctx, br, table, cursor, bound.UpperPK, pkCols, defaultBulkBatchSize)
 		if err != nil {
-			return fmt.Errorf("read range %d batch: %w", bound.chunkIndex, err)
+			return fmt.Errorf("read range %d batch: %w", bound.ChunkIndex, err)
 		}
 		var batchCount int64
 		tracker := newPKTracker(pkCols)

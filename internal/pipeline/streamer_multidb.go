@@ -257,7 +257,7 @@ func (s *Streamer) coldStartMultiDatabase(
 
 	slog.InfoContext(ctx, "multi-database cold start; single spanning snapshot captured",
 		slog.String("stream_id", streamID))
-	applyMaxBufferBytes(stream.Rows, s.MaxBufferBytes)
+	migcore.ApplyMaxBufferBytes(stream.Rows, s.MaxBufferBytes)
 
 	// ---- 4. Per-database schema read + bulk-copy from the SHARED spanning
 	// RowReader. Each database's tables carry Table.Schema = its source
@@ -637,7 +637,7 @@ func (s *Streamer) coldStartCopyOneDatabase(
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open target row writer for %q: %w", database, err))
 	}
 	applyTargetSchema(rw, targetSchema)
-	applyMaxBufferBytes(rw, s.MaxBufferBytes)
+	migcore.ApplyMaxBufferBytes(rw, s.MaxBufferBytes)
 
 	// Cold-start preflight: refuse if any target table already holds data
 	// (Bug 9). --force-cold-start / --restart-from-scratch / --reset-target-

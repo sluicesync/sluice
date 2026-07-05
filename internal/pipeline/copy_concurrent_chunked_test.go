@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // --- ADR-0119 intra-table PK-range work-stealing: work-item construction pins ---
@@ -158,7 +159,7 @@ func assertContiguousTiling(t *testing.T, items []copyWorkItem, wantTable string
 	}
 	for i := 1; i < len(items); i++ {
 		// previous chunk's INCLUSIVE upper == this chunk's EXCLUSIVE lower.
-		if comparePKTuple(items[i-1].upperPK, items[i].lowerPK) != 0 {
+		if migcore.ComparePKTuple(items[i-1].upperPK, items[i].lowerPK) != 0 {
 			t.Errorf("gap/overlap between chunk %d (upper=%v) and chunk %d (lower=%v)",
 				i-1, items[i-1].upperPK, i, items[i].lowerPK)
 		}
@@ -198,10 +199,10 @@ func TestBuildCopyWorkItems_KeysetChunkTiling(t *testing.T) {
 	}
 	assertContiguousTiling(t, items, "s")
 	// Ground the actual split points.
-	if comparePKTuple(items[0].upperPK, []any{"m"}) != 0 {
+	if migcore.ComparePKTuple(items[0].upperPK, []any{"m"}) != 0 {
 		t.Errorf("chunk 0 upper = %v; want [m]", items[0].upperPK)
 	}
-	if comparePKTuple(items[1].upperPK, []any{"t"}) != 0 {
+	if migcore.ComparePKTuple(items[1].upperPK, []any{"t"}) != 0 {
 		t.Errorf("chunk 1 upper = %v; want [t]", items[1].upperPK)
 	}
 }
@@ -289,15 +290,15 @@ func TestBuildCopyWorkItems_MClamp(t *testing.T) {
 		n: 4,
 		// est / threshold = 1000, far above the cap.
 		counts: map[string]int64{"huge": 80_000 * 1000},
-		// span 100_000 ≥ maxChunksPerTable, so the boundary code does not collapse n.
+		// span 100_000 ≥ migcore.MaxChunksPerTable, so the boundary code does not collapse n.
 		ranges: map[string][2]int64{"huge": {1, 100_000}},
 	}
 	items, err := buildCopyWorkItems(context.Background(), namesOf(tbl), byNameOf(tbl), reader, false)
 	if err != nil {
 		t.Fatalf("buildCopyWorkItems: %v", err)
 	}
-	if len(items) != maxChunksPerTable {
-		t.Fatalf("M clamp produced %d items; want %d (maxChunksPerTable)", len(items), maxChunksPerTable)
+	if len(items) != migcore.MaxChunksPerTable {
+		t.Fatalf("M clamp produced %d items; want %d (migcore.MaxChunksPerTable)", len(items), migcore.MaxChunksPerTable)
 	}
 	assertContiguousTiling(t, items, "huge")
 }
@@ -405,7 +406,7 @@ func (w *idCapturingWriter) WriteRows(ctx context.Context, _ *ir.Table, rows <-c
 // target exactly once — the exactly-once silent-loss surface (ADR-0119 Decision
 // 5). It also pins via the observer that chunking actually engaged.
 func TestRunWorkStealingTableCopy_ChunkedExactlyOnce(t *testing.T) {
-	// One table, so resolveBulkParallelMinRows(0,1) == 80_000. Make it large
+	// One table, so migcore.ResolveBulkParallelMinRows(0,1) == 80_000. Make it large
 	// enough to chunk: 5× threshold → 5 chunks.
 	const rows = 80_000 * 5
 	groups := [][]string{{"big"}}

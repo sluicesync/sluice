@@ -231,7 +231,7 @@ type Migrator struct {
 	// The two multiply: at most TableParallelism × (effective
 	// within-table parallelism) target connections are open at once, and
 	// that product is bounded by the target's connection budget at the
-	// single budget chokepoint (see [resolveCopyParallelismBudget]).
+	// single budget chokepoint (see [migcore.ResolveCopyParallelismBudget]).
 	//
 	// Zero means use the default — a small constant (4, matching
 	// pgcopydb's --table-jobs default) bounded by the connection budget.
@@ -656,7 +656,7 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 			fmt.Errorf("pipeline: open target row writer: %w", err)))
 	}
 	applyTargetSchema(rw, m.TargetSchema)
-	applyMaxBufferBytes(rw, m.MaxBufferBytes)
+	migcore.ApplyMaxBufferBytes(rw, m.MaxBufferBytes)
 	defer closeIf(rw)
 
 	// ---- 2.5. Target-side preflights (RLS, stale backends) ----
@@ -1192,7 +1192,7 @@ func runBulkCopyPhases(
 		if budget < 1 {
 			budget = 1
 		}
-		parallel.copyGate = newCopyParallelismGate(budget, defaultCopyBackoffPolicy)
+		parallel.copyGate = migcore.NewCopyParallelismGate(budget, migcore.DefaultCopyBackoffPolicy)
 		parallel.copyBudget = budget
 	}
 
@@ -1666,24 +1666,6 @@ func closeIf(v any) {
 	}
 }
 
-// applyMaxBufferBytes plumbs the orchestrator-side --max-buffer-bytes
-// value to an engine-side surface that opts into byte-bounded
-// batching via [ir.MaxBufferBytesSetter]. Engines that don't
-// implement the setter retain their pre-v0.7.0 row-count-only
-// behaviour. Zero or negative bytes is the no-cap value (engines
-// fall back to their built-in default if they have one).
-//
-// Called immediately after each engine writer/applier opens, before
-// any WriteRows / ApplyBatch dispatch. See ADR-0028.
-func applyMaxBufferBytes(target any, bytes int64) {
-	if bytes <= 0 {
-		return
-	}
-	if setter, ok := target.(ir.MaxBufferBytesSetter); ok {
-		setter.SetMaxBufferBytes(bytes)
-	}
-}
-
 // applyGrowGate wires the cold-copy run's shared coordinated-pause gate
 // (ADR-0110) onto a freshly-opened writer that opts into it via
 // [ir.GrowGateSetter]. Both engines implement the setter today (MySQL and
@@ -1694,7 +1676,7 @@ func applyMaxBufferBytes(target any, bytes int64) {
 // unchanged. A nil gate (non-cold-copy callers / direct unit tests) is a
 // no-op: the writer keeps its zero-value nil gate (pre-ADR-0110 behaviour).
 // Called immediately after each chunk/table writer opens, alongside
-// applyMaxBufferBytes, before any flush.
+// migcore.ApplyMaxBufferBytes, before any flush.
 func applyGrowGate(target any, gate ir.GrowGate) {
 	if gate == nil {
 		return
@@ -1767,7 +1749,7 @@ func applyExecTimeout(target any, d time.Duration) {
 // the operator's raw field. lanes <= 1 is a no-op (serial default kept); the
 // setter is invoked ONLY for W > 1. Called immediately after each engine
 // applier opens, before any ApplyBatch dispatch (sibling to applyExecTimeout
-// / applyMaxBufferBytes).
+// / migcore.ApplyMaxBufferBytes).
 func applyApplyConcurrency(target any, lanes int) {
 	if lanes <= 1 {
 		return

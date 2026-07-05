@@ -123,7 +123,7 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 		// + target-schema override so a stub that wants to honour
 		// them can. Real production callers leave Applier nil and
 		// hit the OpenChangeApplier branch below.
-		applyMaxBufferBytes(s.Applier, s.MaxBufferBytes)
+		migcore.ApplyMaxBufferBytes(s.Applier, s.MaxBufferBytes)
 		applyTargetSchema(s.Applier, s.TargetSchema)
 		applyExecTimeout(s.Applier, s.ApplyExecTimeout)
 		applyApplyConcurrency(s.Applier, s.resolvedApplyConcurrency)
@@ -149,7 +149,7 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 	if err != nil {
 		return nil, false, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open target change applier: %w", err))
 	}
-	applyMaxBufferBytes(a, s.MaxBufferBytes)
+	migcore.ApplyMaxBufferBytes(a, s.MaxBufferBytes)
 	applyTargetSchema(a, s.TargetSchema)
 	applyExecTimeout(a, s.ApplyExecTimeout)
 	applyApplyConcurrency(a, s.resolvedApplyConcurrency)

@@ -61,6 +61,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/redact"
 )
 
@@ -89,12 +90,12 @@ type parallelBulkCopyDeps struct {
 	targetDSN string
 
 	// parallelism is the configured --bulk-parallelism after
-	// resolveBulkParallelism applied the "0 = min(8, NumCPU)" rule.
+	// migcore.ResolveBulkParallelism applied the "0 = min(8, NumCPU)" rule.
 	// Always >= 1.
 	parallelism int
 
 	// minRows is the configured --bulk-parallel-min-rows after
-	// resolveBulkParallelMinRows. Tables below this threshold use the
+	// migcore.ResolveBulkParallelMinRows. Tables below this threshold use the
 	// single-reader path regardless of parallelism.
 	minRows int64
 
@@ -195,14 +196,14 @@ type parallelBulkCopyDeps struct {
 	// fixed-width gate. nil ⇒ pre-ADR-0123 behaviour: the table pool does no
 	// base gating and [runChunks] falls back to a per-table gate (serial
 	// cold-start, a no-measured-budget target, or a unit test).
-	copyGate *copyParallelismGate
+	copyGate *migcore.CopyParallelismGate
 
 	// copyBudget is the resolved connection budget (tableParallelism ×
 	// parallelism) the copyGate is sized to (ADR-0123). It bounds the finer
-	// chunk count so even a budget > maxChunksPerTable is fully fillable by a
-	// single large table at the tail (the chunk cap is max(maxChunksPerTable,
+	// chunk count so even a budget > migcore.MaxChunksPerTable is fully fillable by a
+	// single large table at the tail (the chunk cap is max(migcore.MaxChunksPerTable,
 	// copyBudget) in [resolveParallelChunkCount]). 0 ⇒ no measured budget; the
-	// cap falls back to maxChunksPerTable.
+	// cap falls back to migcore.MaxChunksPerTable.
 	copyBudget int
 
 	// reparentTracker collects the set of tables a writer reported as
@@ -294,16 +295,16 @@ func useFastLoader(resuming, forceColdStart bool, chunk ir.TableChunkProgress) b
 // to fall back to single-reader. The reason string is logged at info
 // level so operators can audit dispatch decisions.
 //
-// The check is split out from [canParallelChunkTable] because it adds
+// The check is split out from [migcore.CanParallelChunkTable] because it adds
 // the row-count threshold (orchestrator-level) to the table-shape
 // (chunk-level) eligibility. Calling order: orchestrator dispatches
-// → shouldParallelChunk → if true, computeChunkBoundaries (which
+// → shouldParallelChunk → if true, migcore.ComputeChunkBoundaries (which
 // re-runs the table-shape checks defensively).
 func shouldParallelChunk(ctx context.Context, deps *parallelBulkCopyDeps, rows ir.RowReader, table *ir.Table) (chunk bool, reason string) {
 	if deps == nil || deps.parallelism <= 1 {
 		return false, "parallelism is 1; single-reader path"
 	}
-	eligible, strategy, reason := canParallelChunkTable(table, deps.parallelism)
+	eligible, strategy, reason := migcore.CanParallelChunkTable(table, deps.parallelism)
 	if !eligible {
 		return false, reason
 	}
@@ -312,12 +313,12 @@ func shouldParallelChunk(ctx context.Context, deps *parallelBulkCopyDeps, rows i
 	// resolveChunks. (ADR-0096: keyset needs KeysetSampler; MIN/MAX needs
 	// RangeBoundsQuerier — both shipping engines implement both.)
 	switch strategy {
-	case strategyMinMaxDivide:
-		if _, ok := rows.(rangeQuerier); !ok {
+	case migcore.StrategyMinMaxDivide:
+		if _, ok := rows.(migcore.RangeQuerier); !ok {
 			return false, "reader does not implement RangeBoundsQuerier; single-reader path"
 		}
-	case strategyKeysetSample:
-		if _, ok := rows.(keysetSampler); !ok {
+	case migcore.StrategyKeysetSample:
+		if _, ok := rows.(migcore.KeysetSampler); !ok {
 			return false, "reader does not implement KeysetSampler (non-integer/composite PK); single-reader path"
 		}
 		// ADR-0096 exactly-once: the keyset path covers string / varchar /
@@ -332,7 +333,7 @@ func shouldParallelChunk(ctx context.Context, deps *parallelBulkCopyDeps, rows i
 			return false, "reader does not implement BoundedBatchedRowReader; keyset upper-bound clip would diverge from DB collation; single-reader path"
 		}
 	}
-	count, err := approximateRowCount(ctx, rows, table)
+	count, err := migcore.ApproximateRowCount(ctx, rows, table)
 	if err != nil {
 		// Best-effort fall-back: if the row-count probe fails (engine
 		// doesn't implement RowCounter, table doesn't exist yet,
@@ -348,26 +349,6 @@ func shouldParallelChunk(ctx context.Context, deps *parallelBulkCopyDeps, rows i
 		return false, fmt.Sprintf("table has ~%d rows; below --bulk-parallel-min-rows=%d", count, deps.minRows)
 	}
 	return true, ""
-}
-
-// approximateRowCount queries the row reader for an estimate of the
-// table's row count used to decide within-table parallel chunking. This
-// is the chunk-DECISION path (caller A) and runs STRICTLY pre-stream, so
-// it prefers the [ir.RowCountEstimator] surface — which a snapshot-pinned
-// PG reader implements by reading reltuples off a FRESH conn, enabling
-// within-table chunking on the sync fast cold-start without ever probing
-// the pinned conn that the ETA path ([kickOffRowCount]) must keep clear
-// (ADR-0079 v1.1). When the reader implements only [ir.RowCounter] (or
-// neither), it falls back to CountRows / (0, nil); the caller treats "0
-// rows" as below any threshold and routes to the single-reader path.
-func approximateRowCount(ctx context.Context, rows ir.RowReader, table *ir.Table) (int64, error) {
-	if est, ok := rows.(ir.RowCountEstimator); ok {
-		return est.EstimateRowCount(ctx, table)
-	}
-	if rc, ok := rows.(ir.RowCounter); ok {
-		return rc.CountRows(ctx, table)
-	}
-	return 0, nil
 }
 
 // tryParallelCopyTable is the dispatcher entry point. Returns
@@ -488,34 +469,34 @@ func resolveChunks(
 	// strategy is derived from the table's PK shape (ADR-0096):
 	// single integer PK → MIN/MAX/divide; non-integer / composite
 	// orderable PK → sampled-keyset.
-	eligible, strategy, reason := canParallelChunkTable(table, parallelism)
+	eligible, strategy, reason := migcore.CanParallelChunkTable(table, parallelism)
 	if !eligible {
 		return nil, fmt.Errorf("pipeline: table %q not chunk-eligible: %s", table.Name, reason)
 	}
 	// ADR-0123: derive a FINER chunk count from the row-count estimate so a
 	// large table can fill the WHOLE budget at the tail, not just
 	// --bulk-parallelism. Boundaries stay a deterministic pure function of the
-	// sorted PK set (same computeChunkBoundaries / computeKeysetChunkBoundaries,
+	// sorted PK set (same migcore.ComputeChunkBoundaries / migcore.ComputeKeysetChunkBoundaries,
 	// just a larger n) and are persisted below, so resume re-derives the
 	// identical set. Pre-ADR-0123 this was exactly `parallelism` chunks.
 	m := resolveParallelChunkCount(ctx, primaryRows, table, deps)
 	var (
-		bounds []chunkBoundary
+		bounds []migcore.ChunkBoundary
 		err    error
 	)
 	switch strategy {
-	case strategyMinMaxDivide:
-		rangeQ, ok := primaryRows.(rangeQuerier)
+	case migcore.StrategyMinMaxDivide:
+		rangeQ, ok := primaryRows.(migcore.RangeQuerier)
 		if !ok {
 			return nil, errors.New("pipeline: primary row reader does not implement RangeBoundsQuerier")
 		}
-		bounds, err = computeChunkBoundaries(ctx, rangeQ, table, m)
-	case strategyKeysetSample:
-		sampler, ok := primaryRows.(keysetSampler)
+		bounds, err = migcore.ComputeChunkBoundaries(ctx, rangeQ, table, m)
+	case migcore.StrategyKeysetSample:
+		sampler, ok := primaryRows.(migcore.KeysetSampler)
 		if !ok {
 			return nil, errors.New("pipeline: primary row reader does not implement KeysetSampler")
 		}
-		bounds, err = computeKeysetChunkBoundaries(ctx, sampler, table, m)
+		bounds, err = migcore.ComputeKeysetChunkBoundaries(ctx, sampler, table, m)
 	default:
 		return nil, fmt.Errorf("pipeline: table %q has unknown chunk strategy %d", table.Name, strategy)
 	}
@@ -525,9 +506,9 @@ func resolveChunks(
 	chunks := make([]ir.TableChunkProgress, len(bounds))
 	for i, b := range bounds {
 		chunks[i] = ir.TableChunkProgress{
-			ChunkIndex: b.chunkIndex,
-			LowerPK:    b.lowerPK,
-			UpperPK:    b.upperPK,
+			ChunkIndex: b.ChunkIndex,
+			LowerPK:    b.LowerPK,
+			UpperPK:    b.UpperPK,
 			State:      ir.TableProgressInProgress,
 		}
 	}
@@ -550,57 +531,28 @@ func resolveChunks(
 // table fill the WHOLE shared budget at the tail (the surplus chunks steal
 // freed tokens off [parallelBulkCopyDeps.copyGate]).
 //
-//		M = clamp(ceil(est / threshold), parallelism, max(maxChunksPerTable, budget))
+//		M = clamp(ceil(est / threshold), parallelism, max(migcore.MaxChunksPerTable, budget))
 //
-//	  - threshold is the same resolveBulkParallelMinRows the eligibility gate
+//	  - threshold is the same migcore.ResolveBulkParallelMinRows the eligibility gate
 //	    uses, so each chunk targets ~one threshold's worth of rows;
 //	  - the FLOOR is `parallelism` (the old fixed M), so no eligible table ever
 //	    gets FEWER chunks than pre-ADR-0123 — strictly >= the old width;
-//	  - the CAP is max(maxChunksPerTable, copyBudget) so even a budget larger
-//	    than maxChunksPerTable is fully fillable while bounding per-chunk
+//	  - the CAP is max(migcore.MaxChunksPerTable, copyBudget) so even a budget larger
+//	    than migcore.MaxChunksPerTable is fully fillable while bounding per-chunk
 //	    overhead in the common case.
 //
 // Mirrors ADR-0119's chunkItemsFor clamp. Deterministic given (est, threshold,
 // budget); resume does not call this (it reloads the persisted chunk set), so
 // the only requirement is internal consistency within a fresh run.
 func resolveParallelChunkCount(ctx context.Context, rows ir.RowReader, table *ir.Table, deps *parallelBulkCopyDeps) int {
-	est, _ := approximateRowCount(ctx, rows, table)
-	return clampParallelChunkCount(est, deps.minRows, deps.parallelism, deps.copyBudget)
-}
-
-// clampParallelChunkCount is the pure core of [resolveParallelChunkCount]
-// — the ADR-0123 Decision 2 clamp with no I/O — shared with the backup
-// within-table read planner (ADR-0149), which derives its chunk count
-// from the same (estimate, threshold, parallelism, budget) inputs so the
-// two modes' chunking behaviour cannot drift apart.
-func clampParallelChunkCount(est, threshold int64, parallelism, copyBudget int) int {
-	if threshold < 1 {
-		threshold = 1
-	}
-	if est < 0 {
-		est = 0
-	}
-	m := int((est + threshold - 1) / threshold) // ceiling of est over threshold
-	if m < parallelism {
-		m = parallelism
-	}
-	if m < 2 {
-		m = 2
-	}
-	chunkCap := maxChunksPerTable
-	if copyBudget > chunkCap {
-		chunkCap = copyBudget
-	}
-	if m > chunkCap {
-		m = chunkCap
-	}
-	return m
+	est, _ := migcore.ApproximateRowCount(ctx, rows, table)
+	return migcore.ClampParallelChunkCount(est, deps.minRows, deps.parallelism, deps.copyBudget)
 }
 
 // runChunks spawns one goroutine per chunk via errgroup. Chunk 0 reuses
 // the orchestrator's already-open primary connections; chunks 1..N-1
 // acquire their own reader/writer connections lazily, inside the
-// goroutine, through a shared [copyParallelismGate] that caps how many
+// goroutine, through a shared [migcore.CopyParallelismGate] that caps how many
 // chunk connections are concurrently open and applies the Phase 2b
 // adaptive backoff on connection-slot exhaustion (SQLSTATE 53300). The
 // first non-retryable error cancels the shared ctx so peers unwind
@@ -642,7 +594,7 @@ func runChunks(
 	shard ShardColumnSpec,
 	resuming bool,
 ) error {
-	pkCols := primaryKeyColumnNames(table)
+	pkCols := migcore.PrimaryKeyColumnNames(table)
 	limit := bulkBatchSize
 	if limit <= 0 {
 		limit = defaultBulkBatchSize
@@ -659,7 +611,7 @@ func runChunks(
 	// byte-identical to the old behaviour.
 	gate := deps.copyGate
 	if gate == nil {
-		gate = newCopyParallelismGate(len(chunks), defaultCopyBackoffPolicy)
+		gate = migcore.NewCopyParallelismGate(len(chunks), migcore.DefaultCopyBackoffPolicy)
 	}
 
 	// classifySlotExhaustion is the engine-supplied predicate that decides
@@ -715,19 +667,19 @@ func runChunks(
 func acquireChunkConn(
 	ctx context.Context,
 	deps *parallelBulkCopyDeps,
-	gate *copyParallelismGate,
+	gate *migcore.CopyParallelismGate,
 	isSlotExhausted func(error) bool,
 	chunkIndex int,
 	tableName string,
 ) (ir.RowReader, ir.RowWriter, func(), error) {
-	if err := gate.acquire(ctx); err != nil {
+	if err := gate.Acquire(ctx); err != nil {
 		return nil, nil, nil, err
 	}
 	// The token is held for the whole lifetime of this chunk's connections
 	// (across every transient/slot retry — the same chunk keeps its budget
 	// slot); release() returns it (or swallows it if a shrink retired it)
 	// when the caller's deferred releaseConn runs, or on any error exit here.
-	release := func() { gate.release() }
+	release := func() { gate.Release() }
 
 	rdr, wr, err := openChunkConnWithRetry(
 		ctx, chunkIndex, tableName,
@@ -735,7 +687,7 @@ func acquireChunkConn(
 			return openOneChunkConn(ctx, deps)
 		},
 		isSlotExhausted,
-		gate.shrinkAndBackoff,
+		gate.ShrinkAndBackoff,
 	)
 	if err != nil {
 		// Return the token so peers aren't starved while the errgroup unwinds.
@@ -783,7 +735,7 @@ func openOneChunkConn(ctx context.Context, deps *parallelBulkCopyDeps) (ir.RowRe
 		closeIf(rdr)
 		return nil, nil, err
 	}
-	applyMaxBufferBytes(wr, deps.maxBufferBytes)
+	migcore.ApplyMaxBufferBytes(wr, deps.maxBufferBytes)
 	// ADR-0110: share the run's coordinated grow-pause gate with this
 	// chunk/table writer so every cold-copy lane quiesces together for a
 	// target storage-grow window. nil-safe (no-op when the run has no gate
@@ -1352,7 +1304,7 @@ func copyChunkFast(
 //
 // v1 supports a SINGLE integer PK column (the orchestrator's chunk
 // machinery already restricts itself to that shape via
-// canParallelChunkTable); the chunk's [ir.TableChunkProgress] PK tuples
+// migcore.CanParallelChunkTable); the chunk's [ir.TableChunkProgress] PK tuples
 // are 1-wide, so we project the lone bound. A defensively-empty pkCols
 // or a missing first chunk-PK element is a programming error (chunking
 // would not have produced this chunk), surfaced loudly rather than
@@ -1467,7 +1419,7 @@ func isIntegerSinglePK(table *ir.Table) bool {
 	if table == nil || table.PrimaryKey == nil || len(table.PrimaryKey.Columns) != 1 {
 		return false
 	}
-	col := lookupColumn(table, table.PrimaryKey.Columns[0].Column)
+	col := migcore.LookupColumn(table, table.PrimaryKey.Columns[0].Column)
 	if col == nil {
 		return false
 	}
@@ -1476,7 +1428,7 @@ func isIntegerSinglePK(table *ir.Table) bool {
 }
 
 // readChunkBatch reads one PK-ordered page of a chunk, clipped to the
-// chunk's INCLUSIVE upper bound (upperPK; nil for the last chunk).
+// chunk's INCLUSIVE upper bound (UpperPK; nil for the last chunk).
 //
 // CRITICAL exactly-once contract (ADR-0096): the upper-bound clip MUST
 // agree with the engine's ORDER BY total order, which for string / char /
@@ -1523,7 +1475,7 @@ func readChunkBatch(
 // for a reader that does NOT implement [ir.BoundedBatchedRowReader]. The
 // preferred path pushes the upper bound into SQL so it uses the column's
 // native collation. The comparison here is the full-tuple bytewise
-// [comparePKTuple], which matches the engine's ORDER BY total order ONLY
+// [migcore.ComparePKTuple], which matches the engine's ORDER BY total order ONLY
 // for byte-ordered families (integer, temporal, PG-native uuid/bytea); it
 // would DIVERGE from a non-C string/decimal collation, so the keyset
 // strategy that covers those families requires the bounded surface and
@@ -1532,10 +1484,10 @@ func readChunkBatch(
 // Without a clip, chunk 0's batch could run past chunk 1's range and
 // double-copy. The filter terminates the channel early (closes downstream
 // so the reader goroutine unwinds) the first time it sees a row strictly
-// past UpperPK; because rows arrive in PK order, every subsequent row is
-// also past the bound, so stopping is safe and complete. UpperPK is
-// inclusive: a row whose PK equals UpperPK belongs to THIS chunk, so only
-// comparePKTuple > 0 is dropped.
+// past upperPK; because rows arrive in PK order, every subsequent row is
+// also past the bound, so stopping is safe and complete. upperPK is
+// inclusive: a row whose PK equals upperPK belongs to THIS chunk, so only
+// migcore.ComparePKTuple > 0 is dropped.
 func filterByUpperBound(ctx context.Context, src <-chan ir.Row, pkCols []string, upperPK []any) <-chan ir.Row {
 	if upperPK == nil || len(pkCols) == 0 {
 		// No upper bound (last chunk) or degenerate PK — pass through.
@@ -1565,7 +1517,7 @@ func filterByUpperBound(ctx context.Context, src <-chan ir.Row, pkCols []string,
 				for i, c := range pkCols {
 					rowPK[i] = row[c]
 				}
-				if comparePKTuple(rowPK, upperPK) > 0 {
+				if migcore.ComparePKTuple(rowPK, upperPK) > 0 {
 					// Strictly past the chunk's inclusive upper bound;
 					// drop this row and stop. Rows arrive in PK order, so
 					// nothing after it can be within the bound. Returning

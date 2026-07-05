@@ -205,10 +205,10 @@ func (b *Backup) runBackupTablePool(
 				// worker's own held reader counts against the same
 				// table × within read budget the extra range readers draw
 				// from, so the product ceiling holds by construction.
-				if err := within.gate.acquire(tctx); err != nil {
+				if err := within.gate.Acquire(tctx); err != nil {
 					return err
 				}
-				defer within.gate.release()
+				defer within.gate.Release()
 			}
 			rr, release, err := acquireBackupReader(tctx, freeReader, factory)
 			if err != nil {
@@ -333,7 +333,7 @@ func (b *Backup) stageBackupTables(
 
 // resolveRequestedReaderParallelism is the pre-snapshot-open half of
 // the parallelism resolution (ADR-0088): the operator's requested
-// value (0 = auto = 4, [resolveTableParallelism]) bounded by the table
+// value (0 = auto = 4, [migcore.ResolveTableParallelism]) bounded by the table
 // count and by the SOURCE's measured connection budget — but WITHOUT
 // the [backupParallelEligible] gate and WITHOUT firing the dispatch
 // observer. The orchestrator calls it before the snapshot opens so an
@@ -351,15 +351,15 @@ func (b *Backup) resolveRequestedReaderParallelism(ctx context.Context, taskCoun
 // SOURCE's measured connection budget: the cross-table fan-out
 // (ADR-0084/0088) and the ADR-0149 within-table range-reader factor
 // (--bulk-parallelism, 0 = auto = min(8, NumCPU) via
-// [resolveBulkParallelism]).
+// [migcore.ResolveBulkParallelism]).
 //
-// The budget chokepoint reuses [resolveTargetCopyParallelism] against
+// The budget chokepoint reuses [migcore.ResolveTargetCopyParallelism] against
 // the SOURCE DSN (backups open reader connections there; the prober is
 // engine-optional — MySQL has none, so both requests stand unbounded by
 // this step), then RESERVES one slot for the coordinator /
 // slot-creation conn that stays open during the open window (the
 // ADR-0079 CDC-conn reservation pattern), then splits the remainder
-// across the two axes via [resolveCopyParallelismBudget] with the axes
+// across the two axes via [migcore.ResolveCopyParallelismBudget] with the axes
 // SWAPPED relative to migrate: backup satisfies the shipped
 // CROSS-TABLE axis first (its cell of the parity matrix predates
 // within-table chunking, and a default flip that shrank it would
@@ -372,11 +372,11 @@ func (b *Backup) resolveBackupReadParallelism(ctx context.Context, taskCount int
 	if taskCount == 0 {
 		return 0, 1, nil // nothing to sweep; no probe needed
 	}
-	tableP = resolveTableParallelism(b.TableParallelism)
+	tableP = migcore.ResolveTableParallelism(b.TableParallelism)
 	if tableP > taskCount {
 		tableP = taskCount // never fan out wider than there are tables to sweep
 	}
-	withinP = resolveBulkParallelism(b.BulkParallelism, runtime.NumCPU())
+	withinP = migcore.ResolveBulkParallelism(b.BulkParallelism, runtime.NumCPU())
 	if withinP < 1 {
 		withinP = 1
 	}
@@ -387,7 +387,7 @@ func (b *Backup) resolveBackupReadParallelism(ctx context.Context, taskCount int
 	if probeWidth < 1 {
 		probeWidth = 1
 	}
-	effective, report, err := resolveTargetCopyParallelism(ctx, b.Source, b.SourceDSN, probeWidth, 0)
+	effective, report, err := migcore.ResolveTargetCopyParallelism(ctx, b.Source, b.SourceDSN, probeWidth, 0)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -397,7 +397,7 @@ func (b *Backup) resolveBackupReadParallelism(ctx context.Context, taskCount int
 		if budget < 1 {
 			// A budget of exactly 1 left only the reserved slot; the sweep
 			// still needs at least one reader. Floor at 1 — the loud
-			// refusal in resolveTargetCopyParallelism already fired if the
+			// refusal in migcore.ResolveTargetCopyParallelism already fired if the
 			// source had truly zero free slots.
 			budget = 1
 		}
@@ -412,7 +412,7 @@ func (b *Backup) resolveBackupReadParallelism(ctx context.Context, taskCount int
 	// satisfies its FIRST argument first and clamps the second to whole
 	// multiples of it, so passing (table, within) yields
 	// (withinClamped, tableUnchanged).
-	withinP, tableP = resolveCopyParallelismBudget(effective, withinP, budget, 0)
+	withinP, tableP = migcore.ResolveCopyParallelismBudget(effective, withinP, budget, 0)
 	return tableP, withinP, nil
 }
 

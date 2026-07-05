@@ -380,7 +380,7 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("broker: open target change applier: %w", err))
 	}
 	defer closeIf(applier)
-	applyMaxBufferBytes(applier, b.MaxBufferBytes)
+	migcore.ApplyMaxBufferBytes(applier, b.MaxBufferBytes)
 	applyApplyConcurrency(applier, resolveReplayApplyConcurrency(b.ApplyConcurrency))
 	if err := applier.EnsureControlTable(ctx); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("broker: ensure control table: %w", err))

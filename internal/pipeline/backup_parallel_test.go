@@ -22,6 +22,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 func TestBackupWithinChunkingEligible(t *testing.T) {
@@ -270,7 +271,7 @@ func TestPlanBackupTableChunks_FallbackReasons(t *testing.T) {
 // TestPlanBackupTableChunks_Engages pins the happy paths: both
 // strategies produce >1 disjoint bounds when every gate condition
 // holds, and the chunk count follows the shared
-// [clampParallelChunkCount] semantics (est/threshold ceiling, floored
+// [migcore.ClampParallelChunkCount] semantics (est/threshold ceiling, floored
 // at parallelism, capped at the read budget).
 func TestPlanBackupTableChunks_Engages(t *testing.T) {
 	b := &Backup{}
@@ -286,9 +287,9 @@ func TestPlanBackupTableChunks_Engages(t *testing.T) {
 		if len(bounds) != 4 || reason != "" {
 			t.Fatalf("bounds = %d (reason %q); want 4 chunked ranges", len(bounds), reason)
 		}
-		if bounds[0].lowerPK != nil || bounds[len(bounds)-1].upperPK != nil {
+		if bounds[0].LowerPK != nil || bounds[len(bounds)-1].UpperPK != nil {
 			t.Errorf("outer bounds must be nil-unbounded: first.lower=%v last.upper=%v",
-				bounds[0].lowerPK, bounds[len(bounds)-1].upperPK)
+				bounds[0].LowerPK, bounds[len(bounds)-1].UpperPK)
 		}
 	})
 
@@ -355,7 +356,7 @@ func TestResolveBackupReadParallelism_TableFirstSplit(t *testing.T) {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
 			eng := &budgetProberEngine{report: ir.ConnectionBudget{
-				EffectiveParallelism: min(resolveTableParallelism(c.reqTable), min(c.tables, c.copyBudget)),
+				EffectiveParallelism: min(migcore.ResolveTableParallelism(c.reqTable), min(c.tables, c.copyBudget)),
 				CopyBudget:           c.copyBudget,
 			}}
 			b := &Backup{

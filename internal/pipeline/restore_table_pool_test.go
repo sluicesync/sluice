@@ -20,6 +20,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // restorePoolFakeWriter is a per-test [ir.RowWriter] whose behaviour is
@@ -224,7 +225,7 @@ func TestResolveRestoreParallelism(t *testing.T) {
 		want       int
 		wantReason string
 	}{
-		{"auto default", 0, 10, defaultTableParallelism, ""},
+		{"auto default", 0, 10, migcore.DefaultTableParallelism, ""},
 		{"clamp to task count", 0, 2, 2, ""},
 		{"single table collapses", 4, 1, 1, "at most one table"},
 		{"operator serial", 1, 5, 1, "--table-parallelism=1"},

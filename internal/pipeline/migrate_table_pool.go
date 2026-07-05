@@ -14,9 +14,9 @@
 // the within-table axis.
 //
 // The two axes multiply. The combined connection budget is enforced at
-// the SINGLE budget chokepoint (resolveCopyParallelismBudget): the table
+// the SINGLE budget chokepoint (migcore.ResolveCopyParallelismBudget): the table
 // pool is capped at tableParallelism and each table's own
-// copyParallelismGate is seeded with <= withinParallelism tokens, so the
+// migcore.CopyParallelismGate is seeded with <= withinParallelism tokens, so the
 // product tableParallelism × withinParallelism is the construction-time
 // ceiling on concurrently-open target connections — no global shared
 // runtime semaphore (ADR-0076 rejected option (ii)).
@@ -132,10 +132,10 @@ func runBulkCopyTablePool(
 			// cold-start / no measured budget / a unit test) ⇒ no base gating,
 			// byte-identical to pre-ADR-0123.
 			if parallel != nil && parallel.copyGate != nil {
-				if err := parallel.copyGate.acquire(tctx); err != nil {
+				if err := parallel.copyGate.Acquire(tctx); err != nil {
 					return err
 				}
-				defer parallel.copyGate.release()
+				defer parallel.copyGate.Release()
 			}
 			pair, release, err := acquireTablePair(tctx, freePair, parallel)
 			if err != nil {

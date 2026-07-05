@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // budgetProberEngine is a fake ir.Engine that implements
@@ -40,7 +41,7 @@ func (b *budgetProberEngine) ProbeTargetConnectionBudget(_ context.Context, _ st
 type noProberEngine struct{ stubEngine }
 
 func TestResolveTargetCopyParallelism_NoProberIsNoOp(t *testing.T) {
-	got, _, err := resolveTargetCopyParallelism(context.Background(), noProberEngine{}, "dsn", 8, 0)
+	got, _, err := migcore.ResolveTargetCopyParallelism(context.Background(), noProberEngine{}, "dsn", 8, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -55,7 +56,7 @@ func TestResolveTargetCopyParallelism_CapsDown(t *testing.T) {
 		Capped:               true,
 		CopyBudget:           3,
 	}}
-	got, _, err := resolveTargetCopyParallelism(context.Background(), eng, "dsn", 8, 0)
+	got, _, err := migcore.ResolveTargetCopyParallelism(context.Background(), eng, "dsn", 8, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -69,7 +70,7 @@ func TestResolveTargetCopyParallelism_CapsDown(t *testing.T) {
 
 func TestResolveTargetCopyParallelism_PassesCeiling(t *testing.T) {
 	eng := &budgetProberEngine{report: ir.ConnectionBudget{EffectiveParallelism: 5}}
-	if _, _, err := resolveTargetCopyParallelism(context.Background(), eng, "dsn", 8, 5); err != nil {
+	if _, _, err := migcore.ResolveTargetCopyParallelism(context.Background(), eng, "dsn", 8, 5); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if eng.gotCeil != 5 {
@@ -83,7 +84,7 @@ func TestResolveTargetCopyParallelism_RefuseSurfacesError(t *testing.T) {
 		Refuse:       true,
 		RefusalError: sentinel,
 	}}
-	_, _, err := resolveTargetCopyParallelism(context.Background(), eng, "dsn", 8, 0)
+	_, _, err := migcore.ResolveTargetCopyParallelism(context.Background(), eng, "dsn", 8, 0)
 	if err == nil {
 		t.Fatal("expected a refusal error, got nil")
 	}
@@ -97,7 +98,7 @@ func TestResolveTargetCopyParallelism_ProbeFailedDegrades(t *testing.T) {
 		ProbeFailed: true,
 		Warning:     "catalog quirk",
 	}}
-	got, _, err := resolveTargetCopyParallelism(context.Background(), eng, "dsn", 8, 0)
+	got, _, err := migcore.ResolveTargetCopyParallelism(context.Background(), eng, "dsn", 8, 0)
 	if err != nil {
 		t.Fatalf("probe-failed must NOT error (degrade to blind behaviour); got %v", err)
 	}
@@ -108,7 +109,7 @@ func TestResolveTargetCopyParallelism_ProbeFailedDegrades(t *testing.T) {
 
 func TestResolveTargetCopyParallelism_OpenErrorSurfaces(t *testing.T) {
 	eng := &budgetProberEngine{openErr: errors.New("bad dsn")}
-	_, _, err := resolveTargetCopyParallelism(context.Background(), eng, "dsn", 8, 0)
+	_, _, err := migcore.ResolveTargetCopyParallelism(context.Background(), eng, "dsn", 8, 0)
 	if err == nil {
 		t.Fatal("a connection-open error should surface, not be swallowed")
 	}

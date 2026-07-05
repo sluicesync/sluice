@@ -182,7 +182,7 @@ func redactRows(
 
 // tablePKColumns returns the PK column names of table in declaration
 // order, or nil for tables without a primary key. Mirrors
-// [primaryKeyColumnNames] in migrate_bulk.go; lives here because
+// [migcore.PrimaryKeyColumnNames] in migrate_bulk.go; lives here because
 // callers in non-bulk paths (copyTable, backup, etc.) also need
 // it for randomize:* seed plumbing. Defensive on nil table.
 func tablePKColumns(table *ir.Table) []string {

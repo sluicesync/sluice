@@ -190,7 +190,7 @@ func TestResolveColdStartCopyBudget_CDCReservation(t *testing.T) {
 
 	t.Run("no measured ceiling (MySQL target) -> no reservation, axes unclamped", func(t *testing.T) {
 		// recordingEngine doesn't implement the budget prober, so
-		// resolveTargetCopyParallelism returns the requested value with a
+		// migcore.ResolveTargetCopyParallelism returns the requested value with a
 		// zero-value ConnectionBudget (CopyBudget 0 = no ceiling).
 		src := newRecordingEngine("postgres")
 		s := &Streamer{Target: src, BulkParallelism: 3, TableParallelism: 5}

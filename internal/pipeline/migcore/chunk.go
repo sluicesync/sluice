@@ -32,7 +32,7 @@
 // (cursor-bearing resume on the resume branch, plain INSERT/COPY on
 // the cold-start branch).
 
-package pipeline
+package migcore
 
 import (
 	"context"
@@ -67,12 +67,12 @@ import (
 // Nothing in the design depends on the specific value.
 const defaultBulkParallelMinRows int64 = 80_000
 
-// adaptiveBulkParallelMinRowsFloor is the lowest the auto threshold is
+// AdaptiveBulkParallelMinRowsFloor is the lowest the auto threshold is
 // dialled to on a many-table schema (roadmap item 3, phase (b)). Below
 // this, per-chunk overhead (extra connections, MIN/MAX query, per-chunk
 // state writes) outweighs the parallelism gain even when many tables are
 // waiting, so genuinely small tables still take the single-reader path.
-const adaptiveBulkParallelMinRowsFloor int64 = 10_000
+const AdaptiveBulkParallelMinRowsFloor int64 = 10_000
 
 // defaultBulkParallelism is the per-table reader/writer pair count
 // when --bulk-parallelism is left at zero. The orchestrator caps it at
@@ -86,32 +86,32 @@ const adaptiveBulkParallelMinRowsFloor int64 = 10_000
 // I/O, both of which max out well before 8 parallel writers.
 const defaultBulkParallelism = 8
 
-// defaultTableParallelism is the cross-table copy-pool width when
+// DefaultTableParallelism is the cross-table copy-pool width when
 // --table-parallelism is left at the 0 = auto sentinel (ADR-0076). It
 // matches pgcopydb's --table-jobs default of 4: enough to keep cores
 // busy across a many-medium-table schema without aggressively
 // oversubscribing the target's connection budget (the auto value is
-// further bounded by the budget split in [resolveCopyParallelismBudget],
+// further bounded by the budget split in [ResolveCopyParallelismBudget],
 // so this constant is the upper end of the auto range, not a hard floor).
-const defaultTableParallelism = 4
+const DefaultTableParallelism = 4
 
-// resolveTableParallelism returns the effective cross-table parallelism,
-// applying the "0 = use defaultTableParallelism" rule. 1 disables
+// ResolveTableParallelism returns the effective cross-table parallelism,
+// applying the "0 = use DefaultTableParallelism" rule. 1 disables
 // cross-table concurrency (the pre-ADR-0076 serial-table behaviour);
 // negative values clamp to 1 (defensive against bad CLI input). The
 // budget split downstream further bounds this so the table × within
 // product fits the target's connection budget.
-func resolveTableParallelism(configured int) int {
+func ResolveTableParallelism(configured int) int {
 	if configured < 0 {
 		return 1
 	}
 	if configured == 0 {
-		return defaultTableParallelism
+		return DefaultTableParallelism
 	}
 	return configured
 }
 
-// chunkBoundary describes one chunk's PK range. LowerPK is the
+// ChunkBoundary describes one chunk's PK range. LowerPK is the
 // exclusive lower bound (rows with PK > LowerPK), UpperPK is the
 // inclusive upper bound (rows with PK <= UpperPK). nil bounds mean
 // "no bound" — chunk 0's LowerPK is nil, chunk N-1's UpperPK is nil.
@@ -119,16 +119,16 @@ func resolveTableParallelism(configured int) int {
 // The shape mirrors [ir.TableChunkProgress] so the orchestrator can
 // transcribe boundaries into per-chunk progress entries on the first
 // attempt and reuse them across resume runs.
-type chunkBoundary struct {
-	chunkIndex int
-	lowerPK    []any
-	upperPK    []any
+type ChunkBoundary struct {
+	ChunkIndex int
+	LowerPK    []any
+	UpperPK    []any
 }
 
-// resolveBulkParallelism returns the effective parallelism, applying
+// ResolveBulkParallelism returns the effective parallelism, applying
 // the "0 = use min(defaultBulkParallelism, NumCPU)" rule. Negative
 // values clamp to 1 (defensive against bad CLI input).
-func resolveBulkParallelism(configured, numCPU int) int {
+func ResolveBulkParallelism(configured, numCPU int) int {
 	if configured < 0 {
 		return 1
 	}
@@ -141,7 +141,7 @@ func resolveBulkParallelism(configured, numCPU int) int {
 	return configured
 }
 
-// resolveBulkParallelMinRows resolves the within-table-split threshold.
+// ResolveBulkParallelMinRows resolves the within-table-split threshold.
 //
 // An explicit operator value (configured > 0) is honoured verbatim — we
 // never override a knob the operator set.
@@ -150,7 +150,7 @@ func resolveBulkParallelism(configured, numCPU int) int {
 // the threshold to the table count (roadmap item 3, phase (b)): a
 // single/few-table schema keeps the full default (preserving the
 // single-large-table auto-split win), but as the table count rises the
-// threshold is dialled DOWN — toward adaptiveBulkParallelMinRowsFloor — so a
+// threshold is dialled DOWN — toward AdaptiveBulkParallelMinRowsFloor — so a
 // many-medium-table schema engages within-table parallelism instead of
 // copying each medium table serially AND single-streamed (the pgcopydb
 // many-table gap: 30 medium tables sat below the fixed 80k threshold, so
@@ -158,7 +158,7 @@ func resolveBulkParallelism(configured, numCPU int) int {
 // leaving cores idle). The curve is default/tableCount clamped to
 // [floor, default]: monotonic, tableCount==1 is unchanged, and small tables
 // still skip chunking via the floor.
-func resolveBulkParallelMinRows(configured int64, tableCount int) int64 {
+func ResolveBulkParallelMinRows(configured int64, tableCount int) int64 {
 	if configured > 0 {
 		return configured
 	}
@@ -166,32 +166,32 @@ func resolveBulkParallelMinRows(configured int64, tableCount int) int64 {
 		return defaultBulkParallelMinRows
 	}
 	adapted := defaultBulkParallelMinRows / int64(tableCount)
-	if adapted < adaptiveBulkParallelMinRowsFloor {
-		return adaptiveBulkParallelMinRowsFloor
+	if adapted < AdaptiveBulkParallelMinRowsFloor {
+		return AdaptiveBulkParallelMinRowsFloor
 	}
 	return adapted
 }
 
-// chunkStrategy names how a table's PK range is divided into chunks.
+// ChunkStrategy names how a table's PK range is divided into chunks.
 //
-//   - strategyMinMaxDivide: ADR-0019's MIN/MAX/divide on a single
+//   - StrategyMinMaxDivide: ADR-0019's MIN/MAX/divide on a single
 //     integer PK column. One cheap two-aggregate query; no skew on
 //     dense integer keys. Requires [ir.RangeBoundsQuerier].
-//   - strategyKeysetSample: ADR-0096's sampled-keyset (ROW_NUMBER()
+//   - StrategyKeysetSample: ADR-0096's sampled-keyset (ROW_NUMBER()
 //     over the PK index, split by row count → skew-free) for a single
 //     non-integer orderable PK or a composite PK. Requires
 //     [ir.KeysetSampler].
-//   - strategyNone: the table is not eligible for parallel chunking and
+//   - StrategyNone: the table is not eligible for parallel chunking and
 //     takes the single-reader path.
-type chunkStrategy int
+type ChunkStrategy int
 
 const (
-	strategyNone chunkStrategy = iota
-	strategyMinMaxDivide
-	strategyKeysetSample
+	StrategyNone ChunkStrategy = iota
+	StrategyMinMaxDivide
+	StrategyKeysetSample
 )
 
-// canParallelChunkTable reports whether table is eligible for the
+// CanParallelChunkTable reports whether table is eligible for the
 // parallel-copy path and, if so, which boundary strategy applies.
 //
 // A table is chunkable when parallelism is > 1, it has a primary key,
@@ -199,8 +199,8 @@ const (
 // comparison cursor — ReadRowsBatch — already ORDER BYs and compares
 // correctly). The strategy is then:
 //
-//   - strategyMinMaxDivide for a single integer PK (ADR-0019), and
-//   - strategyKeysetSample for everything else orderable — a single
+//   - StrategyMinMaxDivide for a single integer PK (ADR-0019), and
+//   - StrategyKeysetSample for everything else orderable — a single
 //     non-integer PK (UUID/string/binary/decimal/temporal) or a
 //     composite PK (ADR-0096).
 //
@@ -209,26 +209,26 @@ const (
 // to single-reader: we never invent a chunking that could miss or
 // double-copy rows.
 //
-// Returns (true, strategy, "") when eligible, (false, strategyNone,
+// Returns (true, strategy, "") when eligible, (false, StrategyNone,
 // reason) otherwise. The reason string is suitable for a single-line
 // operator-facing log message.
-func canParallelChunkTable(table *ir.Table, parallelism int) (eligible bool, strategy chunkStrategy, reason string) {
+func CanParallelChunkTable(table *ir.Table, parallelism int) (eligible bool, strategy ChunkStrategy, reason string) {
 	if parallelism <= 1 {
-		return false, strategyNone, "parallelism is 1; single-reader path"
+		return false, StrategyNone, "parallelism is 1; single-reader path"
 	}
 	if table == nil {
-		return false, strategyNone, "table is nil"
+		return false, StrategyNone, "table is nil"
 	}
 	if table.PrimaryKey == nil || len(table.PrimaryKey.Columns) == 0 {
-		return false, strategyNone, "table has no primary key"
+		return false, StrategyNone, "table has no primary key"
 	}
 
 	// Every PK column must be orderable for the keyset cursor + boundary
 	// comparison to be well-defined.
 	for _, pkc := range table.PrimaryKey.Columns {
-		col := lookupColumn(table, pkc.Column)
+		col := LookupColumn(table, pkc.Column)
 		if col == nil {
-			return false, strategyNone, fmt.Sprintf("primary key column %q not found in column list", pkc.Column)
+			return false, StrategyNone, fmt.Sprintf("primary key column %q not found in column list", pkc.Column)
 		}
 		// A sluice-injected PK column (ADR-0048 Shape A: the leading
 		// discriminator of the rewritten composite PK) exists ONLY on the
@@ -242,43 +242,43 @@ func canParallelChunkTable(table *ir.Table, parallelism int) (eligible bool, str
 		// restores the pre-ADR-0096 behaviour: a shard-injected table has a
 		// composite PK, which was never chunk-eligible before keyset landed.)
 		if col.SluiceInjected {
-			return false, strategyNone, fmt.Sprintf("primary key column %q is sluice-injected (not present on source); single-reader path", pkc.Column)
+			return false, StrategyNone, fmt.Sprintf("primary key column %q is sluice-injected (not present on source); single-reader path", pkc.Column)
 		}
-		if !isOrderablePKType(col.Type) {
-			return false, strategyNone, fmt.Sprintf("primary key column %q is %s; not an orderable chunk key", pkc.Column, col.Type.String())
+		if !IsOrderablePKType(col.Type) {
+			return false, StrategyNone, fmt.Sprintf("primary key column %q is %s; not an orderable chunk key", pkc.Column, col.Type.String())
 		}
 	}
 
 	// Single integer PK → the cheap MIN/MAX/divide path (ADR-0019).
 	if len(table.PrimaryKey.Columns) == 1 {
-		col := lookupColumn(table, table.PrimaryKey.Columns[0].Column)
+		col := LookupColumn(table, table.PrimaryKey.Columns[0].Column)
 		if _, ok := col.Type.(ir.Integer); ok {
-			return true, strategyMinMaxDivide, ""
+			return true, StrategyMinMaxDivide, ""
 		}
 	}
 
 	// Single non-integer orderable PK, or composite orderable PK → the
 	// sampled-keyset path (ADR-0096).
-	return true, strategyKeysetSample, ""
+	return true, StrategyKeysetSample, ""
 }
 
-// isOrderablePKType reports whether an IR type can serve as (part of) a
+// IsOrderablePKType reports whether an IR type can serve as (part of) a
 // chunk key: it sorts deterministically under SQL ORDER BY and its
 // values round-trip through a parameter placeholder for the row-
 // comparison predicate. This is exactly the set the engines'
 // ReadRowsBatch already orders and compares (ADR-0018), and the set the
-// boundary comparator [comparePKTuple] handles per family.
+// boundary comparator [ComparePKTuple] handles per family.
 //
 // ir.Bit is included: the cursor reader orders it and the comparator
 // treats it as its string bit-form. ir.Domain unwraps to its base type.
 // JSON / Array / Geometry / Set / Enum and unknown types are NOT
 // orderable as keys and route the table to single-reader.
-func isOrderablePKType(t ir.Type) bool {
+func IsOrderablePKType(t ir.Type) bool {
 	if dom, ok := t.(ir.Domain); ok {
 		if dom.BaseType == nil {
 			return false
 		}
-		return isOrderablePKType(dom.BaseType)
+		return IsOrderablePKType(dom.BaseType)
 	}
 	switch t.(type) {
 	case ir.Integer, ir.Decimal,
@@ -291,14 +291,14 @@ func isOrderablePKType(t ir.Type) bool {
 	}
 }
 
-// lookupColumn returns the column with the given name, or nil if not
+// LookupColumn returns the column with the given name, or nil if not
 // found. Linear scan; tables typically have <100 columns. Spelled
 // "lookup" to avoid colliding with the test-only [findColumn] helper
 // in [migrate_cross_integration_test.go]; both could share an
 // implementation but the test helper has a different signature
 // (`*testing.T`-returning shape) and renaming the test would touch
 // every cross-engine integration test.
-func lookupColumn(table *ir.Table, name string) *ir.Column {
+func LookupColumn(table *ir.Table, name string) *ir.Column {
 	for _, c := range table.Columns {
 		if c.Name == name {
 			return c
@@ -307,7 +307,7 @@ func lookupColumn(table *ir.Table, name string) *ir.Column {
 	return nil
 }
 
-// computeChunkBoundaries divides the PK range of an integer-PK table
+// ComputeChunkBoundaries divides the PK range of an integer-PK table
 // into n disjoint chunks using MIN/MAX/divide.
 //
 // The implementation runs a single SELECT MIN(pk), MAX(pk) on the
@@ -330,12 +330,12 @@ func lookupColumn(table *ir.Table, name string) *ir.Column {
 // LowerPK==nil; chunk N-1 has UpperPK==nil. This matches the
 // `WHERE (lower IS NULL OR pk > lower) AND (upper IS NULL OR pk <= upper)`
 // shape the parallel reader emits.
-func computeChunkBoundaries(ctx context.Context, q rangeQuerier, table *ir.Table, n int) ([]chunkBoundary, error) {
+func ComputeChunkBoundaries(ctx context.Context, q RangeQuerier, table *ir.Table, n int) ([]ChunkBoundary, error) {
 	if n <= 0 {
-		return nil, errors.New("pipeline: computeChunkBoundaries: n must be > 0")
+		return nil, errors.New("pipeline: ComputeChunkBoundaries: n must be > 0")
 	}
-	if eligible, _, reason := canParallelChunkTable(table, n); !eligible {
-		return nil, fmt.Errorf("pipeline: computeChunkBoundaries: table %q not eligible: %s", table.Name, reason)
+	if eligible, _, reason := CanParallelChunkTable(table, n); !eligible {
+		return nil, fmt.Errorf("pipeline: ComputeChunkBoundaries: table %q not eligible: %s", table.Name, reason)
 	}
 
 	pkCol := table.PrimaryKey.Columns[0].Column
@@ -348,15 +348,15 @@ func computeChunkBoundaries(ctx context.Context, q rangeQuerier, table *ir.Table
 	// range. The parallel path collapses to single-reader on a
 	// one-chunk return.
 	if minVal == nil || maxVal == nil {
-		return []chunkBoundary{{chunkIndex: 0}}, nil
+		return []ChunkBoundary{{ChunkIndex: 0}}, nil
 	}
 
-	minInt, ok := coerceInt64(minVal)
+	minInt, ok := CoerceInt64(minVal)
 	if !ok {
 		return nil, fmt.Errorf("pipeline: MIN(%s) returned non-integer %T (%v); expected integer PK",
 			pkCol, minVal, minVal)
 	}
-	maxInt, ok := coerceInt64(maxVal)
+	maxInt, ok := CoerceInt64(maxVal)
 	if !ok {
 		return nil, fmt.Errorf("pipeline: MAX(%s) returned non-integer %T (%v); expected integer PK",
 			pkCol, maxVal, maxVal)
@@ -395,7 +395,7 @@ func computeChunkBoundaries(ctx context.Context, q rangeQuerier, table *ir.Table
 		step = 1
 	}
 
-	out := make([]chunkBoundary, 0, n)
+	out := make([]ChunkBoundary, 0, n)
 	for k := 0; k < n; k++ {
 		var lower, upper []any
 		// Lower bound: chunk 0 has nil; subsequent chunks pick up
@@ -410,23 +410,23 @@ func computeChunkBoundaries(ctx context.Context, q rangeQuerier, table *ir.Table
 		if k < n-1 {
 			upper = []any{minInt + int64(k+1)*step}
 		}
-		out = append(out, chunkBoundary{
-			chunkIndex: k,
-			lowerPK:    lower,
-			upperPK:    upper,
+		out = append(out, ChunkBoundary{
+			ChunkIndex: k,
+			LowerPK:    lower,
+			UpperPK:    upper,
 		})
 	}
 	return out, nil
 }
 
-// coerceInt64 normalises common integer-typed driver-return values
+// CoerceInt64 normalises common integer-typed driver-return values
 // into int64. *sql.DB scan behaviour returns int64 for most SQL
 // integer types, but range-bounds queries that go through QueryRow
 // can produce either int64 or — for certain drivers — *big.Int /
 // uint64. The helper handles the realistic shapes; anything else
 // fails the parallel-eligibility check so the table falls back to
 // single-reader.
-func coerceInt64(v any) (int64, bool) {
+func CoerceInt64(v any) (int64, bool) {
 	switch n := v.(type) {
 	case int64:
 		return n, true
@@ -438,7 +438,7 @@ func coerceInt64(v any) (int64, bool) {
 		// Truncating to int64 would lose values >= 2^63, but in
 		// practice no production PK uses uint64 above that range; the
 		// MIN/MAX query would return a value driver-encoded as int64
-		// anyway. If we hit it, the canParallelChunkTable check will
+		// anyway. If we hit it, the CanParallelChunkTable check will
 		// have already routed to fallback.
 		if n > (1<<63 - 1) {
 			return 0, false
@@ -449,28 +449,28 @@ func coerceInt64(v any) (int64, bool) {
 	case []byte:
 		// Some drivers return DECIMAL/NUMERIC as []byte even when the
 		// declared SQL type is integer; we reject the shape rather
-		// than parse, since computeChunkBoundaries is only called for
+		// than parse, since ComputeChunkBoundaries is only called for
 		// columns the IR has classified as ir.Integer.
 		return 0, false
 	}
 	return 0, false
 }
 
-// rangeQuerier is a local alias for [ir.RangeBoundsQuerier]. The
+// RangeQuerier is a local alias for [ir.RangeBoundsQuerier]. The
 // type-asserted shape on the row reader is the canonical surface; the
 // alias here lets the chunk-boundary code be a small focused unit
 // without the test fixtures having to refer to the IR import.
-type rangeQuerier = ir.RangeBoundsQuerier
+type RangeQuerier = ir.RangeBoundsQuerier
 
-// keysetSampler is a local alias for [ir.KeysetSampler] (ADR-0096).
-type keysetSampler = ir.KeysetSampler
+// KeysetSampler is a local alias for [ir.KeysetSampler] (ADR-0096).
+type KeysetSampler = ir.KeysetSampler
 
-// computeKeysetChunkBoundaries divides a non-integer / composite-PK
+// ComputeKeysetChunkBoundaries divides a non-integer / composite-PK
 // table into chunks using the sampled-keyset strategy (ADR-0096). It
 // asks the sampler for n-1 interior boundary tuples (each split point an
 // actual row's PK, so the split is by row count and skew-free), then
 // assembles them into half-open (LowerPK, UpperPK] chunk ranges with the
-// same nil-bound convention computeChunkBoundaries uses for integers:
+// same nil-bound convention ComputeChunkBoundaries uses for integers:
 // chunk 0 has LowerPK==nil, chunk N-1 has UpperPK==nil, and boundary[k]
 // is the INCLUSIVE upper of chunk k and the EXCLUSIVE lower of chunk k+1.
 //
@@ -489,15 +489,15 @@ type keysetSampler = ir.KeysetSampler
 // Boundary tuples must be width == len(pkCols); the sampler contract
 // guarantees it, and a mismatch is a loud programming error rather than
 // a silent partial bound.
-func computeKeysetChunkBoundaries(ctx context.Context, s keysetSampler, table *ir.Table, n int) ([]chunkBoundary, error) {
+func ComputeKeysetChunkBoundaries(ctx context.Context, s KeysetSampler, table *ir.Table, n int) ([]ChunkBoundary, error) {
 	if n <= 0 {
-		return nil, errors.New("pipeline: computeKeysetChunkBoundaries: n must be > 0")
+		return nil, errors.New("pipeline: ComputeKeysetChunkBoundaries: n must be > 0")
 	}
-	if eligible, strategy, reason := canParallelChunkTable(table, n); !eligible || strategy != strategyKeysetSample {
-		return nil, fmt.Errorf("pipeline: computeKeysetChunkBoundaries: table %q not keyset-eligible: %s", table.Name, reason)
+	if eligible, strategy, reason := CanParallelChunkTable(table, n); !eligible || strategy != StrategyKeysetSample {
+		return nil, fmt.Errorf("pipeline: ComputeKeysetChunkBoundaries: table %q not keyset-eligible: %s", table.Name, reason)
 	}
 
-	pkCols := primaryKeyColumnNames(table)
+	pkCols := PrimaryKeyColumnNames(table)
 	boundaries, err := s.SampleKeysetBoundaries(ctx, table, pkCols, n)
 	if err != nil {
 		return nil, fmt.Errorf("pipeline: sample keyset boundaries for %q: %w", table.Name, err)
@@ -511,7 +511,7 @@ func computeKeysetChunkBoundaries(ctx context.Context, s keysetSampler, table *i
 			return nil, fmt.Errorf("pipeline: keyset boundary for %q has %d values; want %d PK columns",
 				table.Name, len(b), len(pkCols))
 		}
-		if len(deduped) > 0 && comparePKTuple(deduped[len(deduped)-1], b) == 0 {
+		if len(deduped) > 0 && ComparePKTuple(deduped[len(deduped)-1], b) == 0 {
 			// Equal to the previous boundary: the interior chunk between
 			// them would be empty (pk > prev AND pk <= b with prev == b).
 			// Drop it so we don't burn a connection on a no-row chunk.
@@ -522,13 +522,13 @@ func computeKeysetChunkBoundaries(ctx context.Context, s keysetSampler, table *i
 
 	// 0 boundaries → single nil-bounded chunk (collapses to single-reader).
 	if len(deduped) == 0 {
-		return []chunkBoundary{{chunkIndex: 0}}, nil
+		return []ChunkBoundary{{ChunkIndex: 0}}, nil
 	}
 
 	// k boundaries → k+1 chunks. Chunk i:
 	//   lower = boundary[i-1] (nil for i==0),
 	//   upper = boundary[i]   (nil for the last chunk).
-	out := make([]chunkBoundary, 0, len(deduped)+1)
+	out := make([]ChunkBoundary, 0, len(deduped)+1)
 	for i := 0; i <= len(deduped); i++ {
 		var lower, upper []any
 		if i > 0 {
@@ -537,12 +537,12 @@ func computeKeysetChunkBoundaries(ctx context.Context, s keysetSampler, table *i
 		if i < len(deduped) {
 			upper = deduped[i]
 		}
-		out = append(out, chunkBoundary{chunkIndex: i, lowerPK: lower, upperPK: upper})
+		out = append(out, ChunkBoundary{ChunkIndex: i, LowerPK: lower, UpperPK: upper})
 	}
 	return out, nil
 }
 
-// comparePKTuple compares two PK tuples under the SAME total order the
+// ComparePKTuple compares two PK tuples under the SAME total order the
 // engines' row-comparison cursor uses (ORDER BY pk1, pk2, ... and
 // WHERE (pk1,...) > (...)): lexicographic, column by column, with each
 // column compared per its value family. Returns -1, 0, or +1.
@@ -557,7 +557,7 @@ func computeKeysetChunkBoundaries(ctx context.Context, s keysetSampler, table *i
 // Tuples must be equal width (the orchestrator only ever compares a row's
 // PK projection against a same-width boundary). A nil/empty tuple sorts
 // before any non-empty one; equal-prefix-but-shorter sorts first.
-func comparePKTuple(a, b []any) int {
+func ComparePKTuple(a, b []any) int {
 	n := len(a)
 	if len(b) < n {
 		n = len(b)
@@ -578,7 +578,7 @@ func comparePKTuple(a, b []any) int {
 }
 
 // comparePKValue compares two single PK column values within their
-// family. The families mirror [isOrderablePKType]:
+// family. The families mirror [IsOrderablePKType]:
 //
 //   - integer-like (int64/int32/int/uint64/uint32) → numeric compare.
 //   - everything else is normalised to a comparable scalar:
@@ -594,8 +594,8 @@ func comparePKTuple(a, b []any) int {
 // sorts before any value rather than silently equal.
 func comparePKValue(a, b any) int {
 	// Integer family first (the common case + the MIN/MAX/divide path).
-	ai, aok := coerceInt64(a)
-	bi, bok := coerceInt64(b)
+	ai, aok := CoerceInt64(a)
+	bi, bok := CoerceInt64(b)
 	if aok && bok {
 		switch {
 		case ai < bi:

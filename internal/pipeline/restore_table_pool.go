@@ -221,10 +221,10 @@ var restoreChunkDispatchObserver func(chunkParallelism int, reason string)
 // table × chunk never exceeds the target's measured CopyBudget.
 //
 // Both requested values apply the auto/serial rules first: cross-table
-// via [resolveTableParallelism] (0 = 4), within-table via
-// [resolveBulkParallelism] (0 = min(8, NumCPU)). The within factor is
-// budget-capped via [resolveTargetCopyParallelism] against the TARGET
-// DSN; the table factor is then clamped by [resolveCopyParallelismBudget]
+// via [migcore.ResolveTableParallelism] (0 = 4), within-table via
+// [migcore.ResolveBulkParallelism] (0 = min(8, NumCPU)). The within factor is
+// budget-capped via [migcore.ResolveTargetCopyParallelism] against the TARGET
+// DSN; the table factor is then clamped by [migcore.ResolveCopyParallelismBudget]
 // to whole multiples of the within factor that fit the product budget.
 // Targets without a prober (MySQL) pass through unclamped — the same
 // contract as migrate and as the restore cross-table pool. The schema
@@ -236,7 +236,7 @@ var restoreChunkDispatchObserver func(chunkParallelism int, reason string)
 // knob did nothing). Returns (tableParallelism, chunkParallelism), both
 // >= 1.
 func (r *Restore) resolveRestoreParallelism(ctx context.Context, taskCount int) (tableParallelism, chunkParallelism int, err error) {
-	requestedTable := resolveTableParallelism(r.TableParallelism)
+	requestedTable := migcore.ResolveTableParallelism(r.TableParallelism)
 	if requestedTable > taskCount {
 		requestedTable = taskCount // never fan out wider than there are tables to apply
 	}
@@ -244,8 +244,8 @@ func (r *Restore) resolveRestoreParallelism(ctx context.Context, taskCount int) 
 	// Within-table axis FIRST, budget-capped at the chokepoint. Restore
 	// has no --max-target-connections flag, so ceiling=0 (auto only) —
 	// the measured CopyBudget is the sole product bound.
-	requestedChunk := resolveBulkParallelism(r.ChunkParallelism, runtime.NumCPU())
-	resolvedChunk, budgetReport, err := resolveTargetCopyParallelism(
+	requestedChunk := migcore.ResolveBulkParallelism(r.ChunkParallelism, runtime.NumCPU())
+	resolvedChunk, budgetReport, err := migcore.ResolveTargetCopyParallelism(
 		ctx, r.Target, r.TargetDSN, requestedChunk, 0,
 	)
 	if err != nil {
@@ -256,7 +256,7 @@ func (r *Restore) resolveRestoreParallelism(ctx context.Context, taskCount int) 
 	// its budget-capped value, the table factor gets whatever whole
 	// multiples of within fit the product budget (0 budget = MySQL /
 	// degraded probe = unclamped).
-	tableP, chunkP := resolveCopyParallelismBudget(
+	tableP, chunkP := migcore.ResolveCopyParallelismBudget(
 		resolvedChunk, requestedTable, budgetReport.CopyBudget, 0,
 	)
 
@@ -286,7 +286,7 @@ func (r *Restore) resolveRestoreParallelism(ctx context.Context, taskCount int) 
 // shares the SAME [headroomDivisor] thresholds as the CDC apply clamp, so the
 // two paths agree on what "tight" means.
 //
-// PlanetScale-correct: the connection-budget split ([resolveCopyParallelismBudget])
+// PlanetScale-correct: the connection-budget split ([migcore.ResolveCopyParallelismBudget])
 // only bounds engines with a budget prober (Postgres); a MySQL/PlanetScale auto
 // fan-out otherwise passes through unbounded — and on PlanetScale connections
 // are abundant while CPU is the scarce resource on small tiers, so a CPU/mem

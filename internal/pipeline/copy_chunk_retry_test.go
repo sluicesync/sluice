@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // --- minimal RowReader / RowWriter stubs ---
@@ -60,12 +61,12 @@ func (e *slotRetryEngine) IsConnectionSlotExhausted(err error) bool {
 
 // zeroDelayGate builds a gate with a no-wait policy so the retry tests
 // never actually sleep, but the retry bound is still enforced.
-func zeroDelayGate(parallelism, maxRetries int) *copyParallelismGate {
-	return newCopyParallelismGate(parallelism, copyBackoffPolicy{
-		maxRetries:   maxRetries,
-		baseDelay:    0,
-		maxDelay:     0,
-		maxTotalWait: 1 << 62, // effectively unbounded for these tests
+func zeroDelayGate(parallelism, MaxRetries int) *migcore.CopyParallelismGate {
+	return migcore.NewCopyParallelismGate(parallelism, migcore.CopyBackoffPolicy{
+		MaxRetries:   MaxRetries,
+		BaseDelay:    0,
+		MaxDelay:     0,
+		MaxTotalWait: 1 << 62, // effectively unbounded for these tests
 	})
 }
 
@@ -91,9 +92,7 @@ func TestAcquireChunkConn_RetriesOnSlotExhaustionThenSucceeds(t *testing.T) {
 		t.Errorf("reader opens = %d, want 3 (2 failed + 1 success)", got)
 	}
 	// Parallelism shrank twice (4→2→1) across the two retries.
-	gate.mu.Lock()
-	eff := gate.effective
-	gate.mu.Unlock()
+	eff := gate.Effective()
 	if eff != 1 {
 		t.Errorf("effective parallelism after 2 shrinks = %d, want 1", eff)
 	}
@@ -124,8 +123,8 @@ func TestAcquireChunkConn_NonRetryableFailsLoudly(t *testing.T) {
 }
 
 // TestAcquireChunkConn_GivesUpAfterBound pins the loud bounded give-up: a
-// permanently slot-exhausted target fails after maxRetries with
-// errCopySlotsExhausted rather than spinning forever.
+// permanently slot-exhausted target fails after MaxRetries with
+// migcore.ErrCopySlotsExhausted rather than spinning forever.
 func TestAcquireChunkConn_GivesUpAfterBound(t *testing.T) {
 	slotErr := errors.New("too many clients (SQLSTATE 53300)")
 	// Never succeeds.
@@ -137,10 +136,10 @@ func TestAcquireChunkConn_GivesUpAfterBound(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected a give-up error on a permanently-exhausted target, got nil")
 	}
-	if !errors.Is(err, errCopySlotsExhausted) {
-		t.Errorf("give-up error should wrap errCopySlotsExhausted; got %v", err)
+	if !errors.Is(err, migcore.ErrCopySlotsExhausted) {
+		t.Errorf("give-up error should wrap migcore.ErrCopySlotsExhausted; got %v", err)
 	}
-	// maxRetries=3 → opens attempted: initial + 3 retries = 4.
+	// MaxRetries=3 → opens attempted: initial + 3 retries = 4.
 	if got := atomic.LoadInt32(&eng.readerOpens); got != 4 {
 		t.Errorf("reader opens = %d, want 4 (initial + 3 retries)", got)
 	}

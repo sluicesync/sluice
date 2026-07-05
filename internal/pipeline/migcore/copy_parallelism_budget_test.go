@@ -1,7 +1,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-package pipeline
+package migcore
 
 import (
 	"fmt"
@@ -83,11 +83,11 @@ func TestResolveCopyParallelismBudget(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			gotTable, gotWithin := resolveCopyParallelismBudget(
+			gotTable, gotWithin := ResolveCopyParallelismBudget(
 				tt.resolvedWithin, tt.requestedTable, tt.copyBudget, tt.ceiling,
 			)
 			if gotTable != tt.wantTable || gotWithin != tt.wantWithin {
-				t.Errorf("resolveCopyParallelismBudget(within=%d,table=%d,budget=%d,ceiling=%d) = (%d,%d); want (%d,%d)",
+				t.Errorf("ResolveCopyParallelismBudget(within=%d,table=%d,budget=%d,ceiling=%d) = (%d,%d); want (%d,%d)",
 					tt.resolvedWithin, tt.requestedTable, tt.copyBudget, tt.ceiling,
 					gotTable, gotWithin, tt.wantTable, tt.wantWithin)
 			}
@@ -98,7 +98,7 @@ func TestResolveCopyParallelismBudget(t *testing.T) {
 			// The load-bearing invariant: the product fits the effective
 			// budget whenever a budget is in force AND within fits the
 			// budget. The within factor is PINNED (the well-tuned axis is
-			// never lowered by the split — that is resolveTargetCopyParallelism's
+			// never lowered by the split — that is ResolveTargetCopyParallelism's
 			// job, and it guarantees withinP <= copyBudget upstream); so in
 			// the degenerate within > budget case the best the split can do
 			// is floor the table axis at 1, which this guard excludes.
@@ -120,10 +120,10 @@ func TestResolveCopyParallelismBudget_ProductBoundExhaustive(t *testing.T) {
 		for table := 1; table <= 8; table++ {
 			for budget := 0; budget <= 32; budget++ {
 				for _, ceiling := range []int{0, 4, 12, 24} {
-					gotTable, gotWithin := resolveCopyParallelismBudget(within, table, budget, ceiling)
+					gotTable, gotWithin := ResolveCopyParallelismBudget(within, table, budget, ceiling)
 					effective := minNonZeroBudget(budget, ceiling)
 					// Product bound holds whenever within fits the budget —
-					// the contract resolveTargetCopyParallelism guarantees
+					// the contract ResolveTargetCopyParallelism guarantees
 					// upstream (withinP <= copyBudget). The degenerate
 					// within > budget case can't arise in production; the
 					// split floors table at 1 there.
@@ -158,7 +158,7 @@ func TestResolveTableParallelism(t *testing.T) {
 	cases := []struct {
 		in, want int
 	}{
-		{0, defaultTableParallelism},
+		{0, DefaultTableParallelism},
 		{1, 1},
 		{4, 4},
 		{16, 16},
@@ -166,8 +166,8 @@ func TestResolveTableParallelism(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(fmt.Sprintf("in=%d", c.in), func(t *testing.T) {
-			if got := resolveTableParallelism(c.in); got != c.want {
-				t.Errorf("resolveTableParallelism(%d) = %d; want %d", c.in, got, c.want)
+			if got := ResolveTableParallelism(c.in); got != c.want {
+				t.Errorf("ResolveTableParallelism(%d) = %d; want %d", c.in, got, c.want)
 			}
 		})
 	}

@@ -39,41 +39,41 @@
 // at a lower parallelism than a (possibly) now-freed target could
 // sustain, which the next migration's preflight re-measures from scratch.
 
-package pipeline
+package migcore
 
 import "time"
 
-// copyBackoffPolicy parameterises the AIMD decision. The defaults
-// ([defaultCopyBackoffPolicy]) are what the pool uses; tests construct
+// CopyBackoffPolicy parameterises the AIMD decision. The defaults
+// ([DefaultCopyBackoffPolicy]) are what the pool uses; tests construct
 // their own to exercise the bounds without real waits.
-type copyBackoffPolicy struct {
-	// maxRetries bounds the total number of slot-exhaustion retries
+type CopyBackoffPolicy struct {
+	// MaxRetries bounds the total number of slot-exhaustion retries
 	// across the whole parallel copy of one table. Once exceeded, the
 	// decision gives up loudly. A permanently-saturated target therefore
 	// fails after a bounded number of attempts instead of spinning
 	// forever.
-	maxRetries int
+	MaxRetries int
 
-	// baseDelay is the wait before the first retry. Each subsequent
-	// retry waits baseDelay * 2^(attempt-1), capped at maxDelay — a
+	// BaseDelay is the wait before the first retry. Each subsequent
+	// retry waits BaseDelay * 2^(attempt-1), capped at MaxDelay — a
 	// standard bounded exponential backoff so a brief contention spike
 	// clears on the first short wait while a sustained shortage backs off
 	// to the cap.
-	baseDelay time.Duration
+	BaseDelay time.Duration
 
-	// maxDelay caps a single backoff wait so the exponential term can't
+	// MaxDelay caps a single backoff wait so the exponential term can't
 	// grow without bound.
-	maxDelay time.Duration
+	MaxDelay time.Duration
 
-	// maxTotalWait bounds the summed backoff waits across the whole copy.
-	// It is the second give-up trigger (alongside maxRetries): even if
+	// MaxTotalWait bounds the summed backoff waits across the whole copy.
+	// It is the second give-up trigger (alongside MaxRetries): even if
 	// retries remain, once the accumulated wait reaches this ceiling the
 	// decision gives up loudly so a permanently-saturated target can't
 	// stall the migration for an unbounded wall-clock duration.
-	maxTotalWait time.Duration
+	MaxTotalWait time.Duration
 }
 
-// defaultCopyBackoffPolicy is the policy the parallel-copy pool uses.
+// DefaultCopyBackoffPolicy is the policy the parallel-copy pool uses.
 //
 //   - 6 retries with a 250ms base doubling to a 4s cap covers a transient
 //     contention spike (a peer run finishing, an operator psql closing)
@@ -85,14 +85,14 @@ type copyBackoffPolicy struct {
 //
 // Nothing in the design depends on the exact numbers; they are tuned for
 // "clears a blip, fails a wall" and can move without changing the shape.
-var defaultCopyBackoffPolicy = copyBackoffPolicy{
-	maxRetries:   6,
-	baseDelay:    250 * time.Millisecond,
-	maxDelay:     4 * time.Second,
-	maxTotalWait: 30 * time.Second,
+var DefaultCopyBackoffPolicy = CopyBackoffPolicy{
+	MaxRetries:   6,
+	BaseDelay:    250 * time.Millisecond,
+	MaxDelay:     4 * time.Second,
+	MaxTotalWait: 30 * time.Second,
 }
 
-// copyBackoffDecision is the verdict [nextCopyBackoff] returns for one
+// copyBackoffDecision is the verdict [NextCopyBackoff] returns for one
 // slot-exhaustion event.
 type copyBackoffDecision struct {
 	// NextParallelism is the multiplicatively-decreased effective
@@ -110,7 +110,7 @@ type copyBackoffDecision struct {
 	GiveUp bool
 }
 
-// nextCopyBackoff is the pure AIMD decision for a single
+// NextCopyBackoff is the pure AIMD decision for a single
 // connection-slot-exhaustion event during the parallel bulk copy.
 //
 // Inputs:
@@ -125,15 +125,15 @@ type copyBackoffDecision struct {
 //
 // Decision:
 //
-//   - If attempt > p.maxRetries, or adding this attempt's delay would
-//     push priorTotalWait past p.maxTotalWait, GiveUp = true.
+//   - If attempt > p.MaxRetries, or adding this attempt's delay would
+//     push priorTotalWait past p.MaxTotalWait, GiveUp = true.
 //   - Otherwise NextParallelism = max(1, currentParallelism/2) and Delay
-//     = min(p.baseDelay * 2^(attempt-1), p.maxDelay).
+//     = min(p.BaseDelay * 2^(attempt-1), p.MaxDelay).
 //
 // Pure: no I/O, no clock read, no state mutation — the wait itself and
 // the total-wait accumulation happen in the caller. Table-unit-testable.
-func nextCopyBackoff(currentParallelism, attempt int, priorTotalWait time.Duration, p copyBackoffPolicy) copyBackoffDecision {
-	if attempt > p.maxRetries {
+func NextCopyBackoff(currentParallelism, attempt int, priorTotalWait time.Duration, p CopyBackoffPolicy) copyBackoffDecision {
+	if attempt > p.MaxRetries {
 		return copyBackoffDecision{GiveUp: true}
 	}
 
@@ -143,7 +143,7 @@ func nextCopyBackoff(currentParallelism, attempt int, priorTotalWait time.Durati
 	// past the cap, give up now rather than wait-then-discover. A target
 	// that is genuinely saturated should fail loudly and bounded, not
 	// stall the operator for an open-ended duration.
-	if priorTotalWait+delay > p.maxTotalWait {
+	if priorTotalWait+delay > p.MaxTotalWait {
 		return copyBackoffDecision{GiveUp: true}
 	}
 
@@ -158,22 +158,22 @@ func nextCopyBackoff(currentParallelism, attempt int, priorTotalWait time.Durati
 }
 
 // backoffDelay computes the bounded exponential wait for a 1-based
-// attempt: baseDelay * 2^(attempt-1), capped at maxDelay. Split out so
+// attempt: BaseDelay * 2^(attempt-1), capped at MaxDelay. Split out so
 // the doubling/cap is independently testable and the shift can't
-// overflow (it saturates to maxDelay long before the exponent is large).
-func backoffDelay(attempt int, p copyBackoffPolicy) time.Duration {
+// overflow (it saturates to MaxDelay long before the exponent is large).
+func backoffDelay(attempt int, p CopyBackoffPolicy) time.Duration {
 	if attempt < 1 {
 		attempt = 1
 	}
-	delay := p.baseDelay
+	delay := p.BaseDelay
 	for i := 1; i < attempt; i++ {
 		delay *= 2
-		if delay >= p.maxDelay {
-			return p.maxDelay
+		if delay >= p.MaxDelay {
+			return p.MaxDelay
 		}
 	}
-	if delay > p.maxDelay {
-		return p.maxDelay
+	if delay > p.MaxDelay {
+		return p.MaxDelay
 	}
 	return delay
 }

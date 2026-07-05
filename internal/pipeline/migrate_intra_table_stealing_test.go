@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // chunkCountReader is a stub ir.RowReader that also implements the boundary
@@ -204,7 +205,7 @@ func assertChunkTilingContiguous(t *testing.T, chunks []ir.TableChunkProgress) {
 		t.Errorf("last chunk upper = %v; want nil (open end)", chunks[len(chunks)-1].UpperPK)
 	}
 	for i := 1; i < len(chunks); i++ {
-		if comparePKTuple(chunks[i].LowerPK, chunks[i-1].UpperPK) != 0 {
+		if migcore.ComparePKTuple(chunks[i].LowerPK, chunks[i-1].UpperPK) != 0 {
 			t.Errorf("chunk %d lower %v != chunk %d upper %v (gap/overlap)", i, chunks[i].LowerPK, i-1, chunks[i-1].UpperPK)
 		}
 	}

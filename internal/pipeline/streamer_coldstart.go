@@ -398,7 +398,7 @@ func (s *Streamer) coldStartOpenSnapshot(ctx context.Context, applier ir.ChangeA
 	// setter. Applied before bulk-copy drains the stream so the pump's
 	// backpressure uses the operator's cap rather than the 64 MiB
 	// default the engine seeds at open.
-	applyMaxBufferBytes(stream.Rows, s.MaxBufferBytes)
+	migcore.ApplyMaxBufferBytes(stream.Rows, s.MaxBufferBytes)
 
 	// Wire the resumable COPY-cursor checkpoint sink (ADR-0072 Phase B).
 	// Engines whose snapshot reader carries a mid-COPY resume cursor (the
@@ -447,7 +447,7 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open target row writer: %w", err))
 	}
 	applyTargetSchema(rw, s.TargetSchema)
-	applyMaxBufferBytes(rw, s.MaxBufferBytes)
+	migcore.ApplyMaxBufferBytes(rw, s.MaxBufferBytes)
 
 	// Stale-backend preflight (connection-resilience Phase 2, item 2).
 	// Detect sluice's OWN orphaned backends on the target before the
@@ -478,7 +478,7 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 	// slot-modelled fan-out target). We run it for the refusal; the
 	// effective value is discarded (the per-table fan-out degree governs
 	// the actual worker count).
-	if _, _, err := resolveTargetCopyParallelism(ctx, s.Target, s.TargetDSN, resolveCopyFanoutDegree(s.CopyFanoutDegree), s.MaxTargetConnections); err != nil {
+	if _, _, err := migcore.ResolveTargetCopyParallelism(ctx, s.Target, s.TargetDSN, resolveCopyFanoutDegree(s.CopyFanoutDegree), s.MaxTargetConnections); err != nil {
 		closeIf(rw)
 		closeIf(sw)
 		_ = stream.Abandon()

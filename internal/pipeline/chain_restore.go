@@ -232,7 +232,7 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore: open change applier: %w", err))
 	}
 	defer closeIf(applier)
-	applyMaxBufferBytes(applier, r.MaxBufferBytes)
+	migcore.ApplyMaxBufferBytes(applier, r.MaxBufferBytes)
 	applyTargetSchema(applier, r.TargetSchema)
 	applyApplyConcurrency(applier, resolveReplayApplyConcurrency(r.ApplyConcurrency))
 	if err := applier.EnsureControlTable(ctx); err != nil {

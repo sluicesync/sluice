@@ -173,7 +173,7 @@ func isRetriableChunkOpenError(err error) bool {
 //     production path this is a closure over openOneChunkConn(ctx, deps);
 //     tests pass a fake.
 //   - isSlotExhausted is the engine-supplied 53300 predicate.
-//   - slotBackoff is gate.shrinkAndBackoff — it shrinks parallelism and
+//   - slotBackoff is gate.ShrinkAndBackoff — it shrinks parallelism and
 //     returns the delay to wait, or a loud give-up error at the AIMD bound.
 //
 // Error routing per open failure:

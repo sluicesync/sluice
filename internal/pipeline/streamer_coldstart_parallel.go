@@ -110,8 +110,8 @@ func resolveColdStartCopyBudget(
 	s *Streamer,
 	overlapsIndexes bool,
 ) (tableP, withinP, indexBudget int, err error) {
-	withinRequested := resolveBulkParallelism(s.BulkParallelism, runtime.NumCPU())
-	copyParallelism, budgetReport, err := resolveTargetCopyParallelism(
+	withinRequested := migcore.ResolveBulkParallelism(s.BulkParallelism, runtime.NumCPU())
+	copyParallelism, budgetReport, err := migcore.ResolveTargetCopyParallelism(
 		ctx, s.Target, s.TargetDSN, withinRequested, s.MaxTargetConnections,
 	)
 	if err != nil {
@@ -130,7 +130,7 @@ func resolveColdStartCopyBudget(
 			// that copy + CDC briefly share the headroom — the cold-start
 			// copy finishes and ReleaseRows fires before CDC's steady
 			// state, so the overlap is transient (and the loud refusal in
-			// resolveTargetCopyParallelism already fired if the target had
+			// migcore.ResolveTargetCopyParallelism already fired if the target had
 			// truly zero free slots).
 			copyBudget = 1
 		}
@@ -138,16 +138,16 @@ func resolveColdStartCopyBudget(
 
 	copyBudgetForAxes := copyBudget
 	if overlapsIndexes && copyBudget >= 1 {
-		ib, copyRemaining := splitCopyAndIndexBudget(copyBudget, copyParallelism)
+		ib, copyRemaining := migcore.SplitCopyAndIndexBudget(copyBudget, copyParallelism)
 		if ib > 0 {
 			indexBudget = ib
 			copyBudgetForAxes = copyRemaining
 		}
 	}
 
-	tableP, withinP = resolveCopyParallelismBudget(
+	tableP, withinP = migcore.ResolveCopyParallelismBudget(
 		copyParallelism,
-		resolveTableParallelism(s.TableParallelism),
+		migcore.ResolveTableParallelism(s.TableParallelism),
 		copyBudgetForAxes,
 		s.MaxTargetConnections,
 	)
@@ -230,7 +230,7 @@ func (s *Streamer) runColdStartParallel(
 		if err != nil {
 			return nil, err
 		}
-		applyMaxBufferBytes(readers[0], maxBuffer)
+		migcore.ApplyMaxBufferBytes(readers[0], maxBuffer)
 		return readers[0], nil
 	}
 
@@ -280,7 +280,7 @@ func (s *Streamer) runColdStartParallel(
 		sourceDSN:          s.SourceDSN,
 		targetDSN:          s.TargetDSN,
 		parallelism:        withinParallelism,
-		minRows:            resolveBulkParallelMinRows(s.BulkParallelMinRows, len(schema.Tables)),
+		minRows:            migcore.ResolveBulkParallelMinRows(s.BulkParallelMinRows, len(schema.Tables)),
 		maxBufferBytes:     s.MaxBufferBytes,
 		forceColdStart:     false, // fresh cold-start: the fast non-upsert loader is safe (Bug 9 preflight ran)
 		rawCopyOK:          rawCopyOK,

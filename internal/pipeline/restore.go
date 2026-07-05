@@ -89,8 +89,8 @@ type Restore struct {
 	// partition of the table's rows, so parallel INSERT cannot collide
 	// on a PK on a cold target (ADR-0112 §Correctness). The two axes
 	// MULTIPLY (table × chunk) and are bounded at the SAME connection-
-	// budget chokepoint migrate uses (resolveTargetCopyParallelism +
-	// resolveCopyParallelismBudget, ADR-0076): within-table is satisfied
+	// budget chokepoint migrate uses (migcore.ResolveTargetCopyParallelism +
+	// migcore.ResolveCopyParallelismBudget, ADR-0076): within-table is satisfied
 	// first, the table axis takes the remainder, the product never
 	// exceeds the target's measured CopyBudget. Targets without a budget
 	// prober (MySQL) pass through unclamped.
@@ -576,7 +576,7 @@ func (r *Restore) openTargetRowWriter(ctx context.Context) (ir.RowWriter, error)
 	if err != nil {
 		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("restore: open target row writer: %w", err))
 	}
-	applyMaxBufferBytes(rw, r.MaxBufferBytes)
+	migcore.ApplyMaxBufferBytes(rw, r.MaxBufferBytes)
 	applyTargetSchema(rw, r.TargetSchema)
 	// Wire the run's shared grow-gate (ADR-0110) onto every writer so the
 	// MySQL writer's flushWithReparentRetry awaits/trips it — coordinating
