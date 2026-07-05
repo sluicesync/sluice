@@ -194,6 +194,11 @@ func TestVitessReshard_RelaxSkewMagnitudeSweep(t *testing.T) {
 	}
 	t.Logf("SETUP: resharded 1 -> 2; shards now %v; 80- replica routed through toxiproxy (latency swept per scenario)", shards)
 
+	// Wait through the post-SwitchTraffic "no healthy tablet for PRIMARY"
+	// window before the sweep opens CDC readers / burst-writes to `acct`
+	// (scatter probe routes to primaries, direct — see waitReshardPrimariesRoutable).
+	c.waitReshardPrimariesRoutable(t, "acct")
+
 	// --- the scenario matrix (one axis at a time around the baseline) ---
 	// Latency sweep is CAPPED at the cleanly-measurable single-host band
 	// (50/250/500ms — the realistic cross-region RTT range, where BOTH modes

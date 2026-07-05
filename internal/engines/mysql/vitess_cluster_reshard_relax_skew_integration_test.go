@@ -176,6 +176,11 @@ func TestVitessReshard_RelaxSkewConcurrentDrainAB(t *testing.T) {
 	}
 	t.Logf("SETUP: resharded 1 -> 2; vtgate shards now %v", shards)
 
+	// Wait through the post-SwitchTraffic "no healthy tablet for PRIMARY"
+	// window before the A/B opens a CDC reader / burst-writes to `acct`
+	// (else the first op races the cutover and fails 1105 — the CI-only flake).
+	c.waitReshardPrimariesRoutable(t, "acct")
+
 	// --- the A/B: same scenario, skew OFF then skew ON ---
 	runA := runRelaxSkewScenario(t, c, false, 100_000_000)
 	runB := runRelaxSkewScenario(t, c, true, 200_000_000)

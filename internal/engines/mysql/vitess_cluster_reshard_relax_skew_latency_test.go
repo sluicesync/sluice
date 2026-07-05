@@ -273,6 +273,12 @@ func TestVitessReshard_RelaxSkewPerShardLatencyAB(t *testing.T) {
 	}
 	t.Logf("SETUP: resharded 1 -> 2; vtgate shards now %v; 80- replica routed through +%dms toxiproxy latency", shards, vrLatLatencyMs)
 
+	// Wait through the post-SwitchTraffic "no healthy tablet for PRIMARY"
+	// window before the A/B opens a CDC reader / burst-writes to `acct`. The
+	// scatter probe routes to PRIMARIES (never rerouted through toxiproxy), so
+	// the +latency on the 80- replica does not affect this gate.
+	c.waitReshardPrimariesRoutable(t, "acct")
+
 	// --- the A/B: same scenario, skew ON then skew OFF ---
 	runA := runRelaxSkewScenario(t, c, false, 100_000_000)
 	runB := runRelaxSkewScenario(t, c, true, 200_000_000)

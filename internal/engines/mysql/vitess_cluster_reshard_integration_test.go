@@ -753,6 +753,40 @@ func (c *vitessReshardCluster) vrCountEventually(t *testing.T, q string, want in
 	return last
 }
 
+// waitReshardPrimariesRoutable blocks until a PRIMARY-routed scatter query
+// against `table` succeeds, retrying the same transient "no healthy tablet
+// available for PRIMARY" window (Error 1105) that vrCountEventually documents:
+// the resharded shard primaries become routable a beat AFTER Reshard
+// SwitchTraffic's RPC returns. An A/B setup that opens a CDC reader or
+// burst-writes immediately after SwitchTraffic must call this first, or the
+// first write races the window and fails spuriously — the CI-only flake that
+// kept the RelaxSkew reshard suite red since it landed (it passes on a
+// warmer/faster local host, so the gap was invisible without CI signal).
+func (c *vitessReshardCluster) waitReshardPrimariesRoutable(t *testing.T, table string) {
+	t.Helper()
+	db, err := sql.Open("mysql", c.mysqlDSN)
+	if err != nil {
+		t.Fatalf("waitReshardPrimariesRoutable: open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	deadline := time.Now().Add(90 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		// A scatter COUNT(*) routes to EVERY shard PRIMARY; it succeeds only
+		// once all resharded primaries are healthy and routable.
+		lastErr = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+table).Scan(new(int))
+		cancel()
+		if lastErr == nil {
+			return
+		}
+		time.Sleep(2 * time.Second)
+	}
+	t.Fatalf("post-reshard primaries never became routable within 90s "+
+		"(last scatter probe on %s: %v)", table, lastErr)
+}
+
 // =====================================================================
 // THE HEADLINE TEST: reshard-chaos exactly-once oracle.
 //

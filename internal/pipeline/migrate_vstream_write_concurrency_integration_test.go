@@ -44,6 +44,70 @@ import (
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 )
 
+// writeConcurrencyProbe wraps the target [ir.RowWriter] and records the PEAK
+// number of per-table WriteRows / WriteRowsIdempotent calls executing at
+// once. W tables written concurrently (ADR-0100) == W writer calls in flight,
+// so this is a deterministic, load-independent measure of write concurrency —
+// unlike the earlier 150ms target-COUNT(*) poller, which sampled a copy window
+// that can be shorter than one tick under a loaded CI runner and then reports a
+// spurious peak=0 (sampler starvation, not serialization). The MySQL target
+// implements [ir.IdempotentRowWriter] and [ir.MaxBufferBytesSetter]; the probe
+// forwards both so the copy path and buffer-budget threading are unchanged.
+type writeConcurrencyProbe struct {
+	inner ir.RowWriter
+	idem  ir.IdempotentRowWriter // == inner when it implements the surface
+
+	mu       sync.Mutex
+	inFlight int
+	peak     int
+}
+
+func newWriteConcurrencyProbe(inner ir.RowWriter) *writeConcurrencyProbe {
+	p := &writeConcurrencyProbe{inner: inner}
+	if iw, ok := inner.(ir.IdempotentRowWriter); ok {
+		p.idem = iw
+	}
+	return p
+}
+
+// enter marks one writer call in flight, updates the peak, and returns the
+// matching exit hook (defer enter()()).
+func (p *writeConcurrencyProbe) enter() func() {
+	p.mu.Lock()
+	p.inFlight++
+	if p.inFlight > p.peak {
+		p.peak = p.inFlight
+	}
+	p.mu.Unlock()
+	return func() {
+		p.mu.Lock()
+		p.inFlight--
+		p.mu.Unlock()
+	}
+}
+
+func (p *writeConcurrencyProbe) WriteRows(ctx context.Context, table *ir.Table, rows <-chan ir.Row) error {
+	defer p.enter()()
+	return p.inner.WriteRows(ctx, table, rows)
+}
+
+func (p *writeConcurrencyProbe) WriteRowsIdempotent(ctx context.Context, table *ir.Table, rows <-chan ir.Row) error {
+	defer p.enter()()
+	return p.idem.WriteRowsIdempotent(ctx, table, rows)
+}
+
+func (p *writeConcurrencyProbe) SetMaxBufferBytes(bytes int64) {
+	if s, ok := p.inner.(ir.MaxBufferBytesSetter); ok {
+		s.SetMaxBufferBytes(bytes)
+	}
+}
+
+func (p *writeConcurrencyProbe) peakConcurrent() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.peak
+}
+
 // TestMigrate_VStreamWriteConcurrency_TablesWrittenConcurrently is the
 // load-bearing ADR-0100 integration pin: it proves the WRITE side is
 // concurrent across tables (W = K), not just the read side (ADR-0099).
@@ -140,60 +204,28 @@ func TestMigrate_VStreamWriteConcurrency_TablesWrittenConcurrently(t *testing.T)
 
 	// Poll the target's per-table counts WHILE the copy runs; record the peak
 	// number of tables simultaneously "in progress" (count > 0 but < final).
+	// The final exactly-once check reads per-table target counts directly.
 	tdb, err := sql.Open("mysql", targetDSN)
 	if err != nil {
-		t.Fatalf("open target poll db: %v", err)
+		t.Fatalf("open target count db: %v", err)
 	}
 	defer func() { _ = tdb.Close() }()
 
-	var (
-		pollMu       sync.Mutex
-		peakInFlight int
-	)
-	pollCtx, stopPoll := context.WithCancel(ctx)
-	pollDone := make(chan struct{})
-	go func() {
-		defer close(pollDone)
-		tick := time.NewTicker(150 * time.Millisecond)
-		defer tick.Stop()
-		for {
-			select {
-			case <-pollCtx.Done():
-				return
-			case <-tick.C:
-				inFlight := 0
-				for _, tbl := range tables {
-					var n int
-					// CREATE TABLE may not exist yet on the very first ticks;
-					// ignore errors and treat as 0.
-					_ = tdb.QueryRowContext(pollCtx, "SELECT COUNT(*) FROM "+tbl).Scan(&n)
-					if n > 0 && n < rowsPer[tbl] {
-						inFlight++
-					}
-				}
-				pollMu.Lock()
-				if inFlight > peakInFlight {
-					peakInFlight = inFlight
-				}
-				pollMu.Unlock()
-			}
-		}
-	}()
+	// Measure ADR-0100 WRITE concurrency deterministically by wrapping the
+	// target writer (see writeConcurrencyProbe) — peak in-flight per-table
+	// writer calls, no wall-clock sampling.
+	probe := newWriteConcurrencyProbe(rw)
 
 	// Drive the EXACT cold-copy consumer with a D-way fan-out so W × D both
 	// engage (W from the surfaced partition, D = 4 here).
-	copyErr := runBulkCopyWithOpts(ctx, schema, stream.Rows, sw, rw, bulkCopyOpts{CopyFanoutDegree: 4})
-	stopPoll()
-	<-pollDone
+	copyErr := runBulkCopyWithOpts(ctx, schema, stream.Rows, sw, probe, bulkCopyOpts{CopyFanoutDegree: 4})
 	if copyErr != nil {
 		t.Fatalf("runBulkCopyWithOpts: %v", copyErr)
 	}
 
-	pollMu.Lock()
-	peak := peakInFlight
-	pollMu.Unlock()
+	peak := probe.peakConcurrent()
 	if peak < 2 {
-		t.Fatalf("peak concurrently-in-progress tables = %d; want ≥ 2 "+
+		t.Fatalf("peak concurrently-writing tables = %d; want ≥ 2 "+
 			"(ADR-0100: the serial consumer wrote ONE table at a time — this is the regression guard)", peak)
 	}
 	t.Logf("ADR-0100: peak %d tables written concurrently (W>1 confirmed)", peak)

@@ -194,6 +194,11 @@ func TestVitessReshard_RelaxSkewEngineeredSkewHoldAB(t *testing.T) {
 	}
 	t.Logf("SETUP: resharded 1 -> 2; vtgate shards now %v", shards)
 
+	// Wait through the post-SwitchTraffic "no healthy tablet for PRIMARY"
+	// window before the A/B burst-writes to `acct` (else the first burst
+	// races the cutover and fails 1105 — the CI-only flake).
+	c.waitReshardPrimariesRoutable(t, "acct")
+
 	// --- the A/B: same engineered-skew scenario, skew ON then skew OFF ---
 	runA := runEngineeredSkewScenario(t, c, false, 100_000_000)
 	runB := runEngineeredSkewScenario(t, c, true, 200_000_000)
