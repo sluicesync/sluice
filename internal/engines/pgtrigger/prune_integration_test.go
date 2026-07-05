@@ -163,8 +163,8 @@ func TestPruneConsumedChangeLog_PooledTicksAndFrontierInvariant(t *testing.T) {
 	}
 	// Tick 1 was the recount tick (anchored at 5 remaining); tick 2's
 	// arithmetic subtracts its 3 deletions.
-	if cr.pruneBook.remaining != 2 {
-		t.Errorf("remaining estimate = %d; want 2 (matches the true count)", cr.pruneBook.remaining)
+	if cr.pruneBook.Remaining() != 2 {
+		t.Errorf("remaining estimate = %d; want 2 (matches the true count)", cr.pruneBook.Remaining())
 	}
 
 	if err := cr.Close(); err != nil {

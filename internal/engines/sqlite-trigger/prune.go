@@ -7,7 +7,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"time"
+
+	"sluicesync.dev/sluice/internal/engines/internal/triggercdc"
 )
 
 // Change-log retention for the trigger-CDC SOURCE (ADR-0137, Bug 165). The
@@ -19,112 +20,17 @@ import (
 // not-yet-applied rows → silent loss on warm-resume). This package only executes
 // the DELETE; computing a safe `cut` is the CLI's job (ADR-0137 §1).
 
-// Batching + cadence tuning for the prune DELETE (repo-audit P-1). A monolithic
-// `DELETE ... WHERE id <= cut` over a large backlog stalls the single-writer
-// source (local SQLite: the SOURCE APPLICATION's writes block for its whole
-// duration) or blows D1's per-query CPU ceiling (a failed tick retries an even
-// bigger delete — prune falls behind permanently). The prune instead steps the
-// id keyset in bounded batches (id is the change-log's AUTOINCREMENT PK, so
-// each step is an index range scan), one short statement per batch, so the
-// source's writer interleaves between batches and a failure or budget-stop
-// loses at most one batch of progress. Per-transport batch sizes live next to
-// their executors ([localPruneBatchSize] / [d1PruneBatchSize]).
-const (
-	// pruneTimeBudget bounds one AUTO-PRUNE tick (ADR-0137 Phase B). The
-	// sidecar's cadence is 5 min; stopping well short of it means a huge
-	// backlog is worked off across ticks instead of holding the change-log
-	// hostage for minutes. The operator-run CLI [Prune] / [PruneD1] pass no
-	// budget (0) — an explicit `sluice trigger prune` runs to completion.
-	pruneTimeBudget = 30 * time.Second
-
-	// pruneRecountEvery re-anchors the auto-prune sidecar's remaining-rows
-	// estimate with a true COUNT(*) every Nth tick (the default 5-min cadence
-	// makes that hourly). Between recounts the estimate is rows-affected
-	// arithmetic — the P-1 fix for the per-tick COUNT(*) full scan.
-	pruneRecountEvery = 12
-)
-
-// pruneBatchFunc deletes one keyset step — change-log rows with
-// floor < id <= upper — and returns the rows deleted. upper never exceeds the
-// caller's cut, which is how the batching preserves the ADR-0137 invariant:
-// only rows at-or-below the durably-applied frontier are ever deleted, no
-// matter how the batching steps. [executor.pruneChangeLogBatch] satisfies it.
-type pruneBatchFunc func(ctx context.Context, floor, upper int64) (int64, error)
-
-// pruneInBatches reaps change-log rows with id <= cut in bounded keyset steps
-// of `step` ids, starting from minID (the change-log's current MIN(id) —
-// indexed and cheap). done=false means the time budget ran out with rows still
-// below cut; the caller resumes on its next tick (the floor re-derives from
-// MIN(id), so resumption is free). budget <= 0 disables the budget (the
-// operator-run CLI path). ctx is consulted between batches so a shutdown never
-// waits behind a multi-batch backlog.
-func pruneInBatches(
-	ctx context.Context, minID, cut, step int64, budget time.Duration, del pruneBatchFunc,
-) (deleted int64, done bool, err error) {
-	if minID <= 0 || minID > cut {
-		// Empty change-log, or nothing at-or-below the cut.
-		return 0, true, nil
-	}
-	var deadline time.Time
-	if budget > 0 {
-		deadline = time.Now().Add(budget)
-	}
-	for floor := minID - 1; floor < cut; {
-		if err := ctx.Err(); err != nil {
-			return deleted, false, err
-		}
-		upper := min(cut, floor+step)
-		n, err := del(ctx, floor, upper)
-		if err != nil {
-			return deleted, false, err
-		}
-		deleted += n
-		floor = upper
-		if !deadline.IsZero() && floor < cut && time.Now().After(deadline) {
-			// Budget exhausted mid-backlog: stop here; the next tick resumes.
-			return deleted, false, nil
-		}
-	}
-	return deleted, true, nil
-}
-
-// pruneBookkeeper tracks the auto-prune sidecar's remaining-rows estimate
-// across ticks so per-tick observability doesn't cost a COUNT(*) full scan of
-// the change-log (P-1). The estimate is one-sided arithmetic — it subtracts
-// each tick's deleted rows but cannot see the capture triggers' concurrent
-// inserts — so every [pruneRecountEvery]-th tick runs one true COUNT to
-// re-anchor it. Not concurrency-safe; the single auto-prune sidecar goroutine
-// owns it (the same ownership contract as the pipeline's autoPruneGate).
-type pruneBookkeeper struct {
-	ticks     int64 // prune ticks observed (drives the recount cadence)
-	remaining int64 // estimated change-log rows left; meaningful only once anchored
-	anchored  bool  // a true recount has run at least once
-}
-
-// tick advances the tick counter and reports whether THIS tick should
-// re-anchor the estimate with a true COUNT (the first tick, then every
-// pruneRecountEvery-th).
-func (b *pruneBookkeeper) tick() (recount bool) {
-	b.ticks++
-	return b.ticks == 1 || b.ticks%pruneRecountEvery == 0
-}
-
-// noteDeleted subtracts a tick's deletions from the estimate (floored at 0).
-func (b *pruneBookkeeper) noteDeleted(n int64) {
-	if !b.anchored {
-		return
-	}
-	b.remaining -= n
-	if b.remaining < 0 {
-		b.remaining = 0
-	}
-}
-
-// anchor resets the estimate from a true recount.
-func (b *pruneBookkeeper) anchor(count int64) {
-	b.remaining = count
-	b.anchored = true
-}
+// Batching note (repo-audit P-1). A monolithic `DELETE ... WHERE id <= cut` over
+// a large backlog stalls the single-writer source (local SQLite: the SOURCE
+// APPLICATION's writes block for its whole duration) or blows D1's per-query CPU
+// ceiling (a failed tick retries an even bigger delete — prune falls behind
+// permanently). [triggercdc.InBatches] steps the id keyset in bounded batches
+// instead (id is the change-log's AUTOINCREMENT PK, so each step is an index
+// range scan), one short statement per batch, so the source's writer interleaves
+// between batches and a failure or budget-stop loses at most one batch of
+// progress. Per-transport batch sizes live next to their executors
+// ([localPruneBatchSize] / [d1PruneBatchSize]); the tick budget + recount cadence
+// live in [triggercdc] (shared across trigger engines).
 
 // PruneOptions controls a change-log prune. Cut is the inclusive upper bound —
 // rows with id <= Cut are deleted. The caller guarantees Cut is a safe bound (at
@@ -172,8 +78,8 @@ func PruneD1(ctx context.Context, dsn string, opts PruneOptions) (*PruneResult, 
 // durably-persisted position token. The decode stays engine-owned — it reuses
 // [AppliedLastID] (which refuses a FOREIGN token loudly) to extract the applied
 // frontier, then reaps `id <= appliedLastID - keep` in bounded keyset batches
-// under [pruneTimeBudget] (a partial tick resumes on the next cadence). A
-// non-positive cut is a safe no-op. The DELETEs run on a FRESH writable executor
+// under [triggercdc.AutoPruneTickBudget] (a partial tick resumes on the next
+// cadence). A non-positive cut is a safe no-op. The DELETEs run on a FRESH writable executor
 // opened from the reader's backend (not the read-only poll executor), so they
 // never contend with — or race the Close of — the polling connection; unlike
 // pgtrigger's pooled prune connection, the per-tick open is deliberate here: a
@@ -198,8 +104,8 @@ func (r *CDCReader) PruneConsumedChangeLog(ctx context.Context, durablePositionT
 	if err != nil {
 		return 0, fmt.Errorf("%s: prune: min id: %w", r.b.driver, err)
 	}
-	deleted, done, err := pruneInBatches(
-		ctx, minID, cut, exec.pruneBatchSize(), pruneTimeBudget, exec.pruneChangeLogBatch,
+	deleted, done, err := triggercdc.InBatches(
+		ctx, minID, cut, exec.pruneBatchSize(), triggercdc.AutoPruneTickBudget, exec.pruneChangeLogBatch,
 	)
 	if err != nil {
 		return deleted, fmt.Errorf("%s: prune: delete: %w", r.b.driver, err)
@@ -209,18 +115,18 @@ func (r *CDCReader) PruneConsumedChangeLog(ctx context.Context, durablePositionT
 }
 
 // notePruneTick maintains the sidecar's remaining-rows estimate: rows-affected
-// arithmetic per tick, re-anchored by a true COUNT every [pruneRecountEvery]-th
+// arithmetic per tick, re-anchored by a true COUNT every [triggercdc.RecountEvery]-th
 // tick (P-1 — never a per-tick COUNT(*) full scan). Purely observability; a
 // failed recount keeps the stale estimate and the next recount tick retries.
 func (r *CDCReader) notePruneTick(ctx context.Context, exec executor, deleted int64, done bool) {
-	if r.pruneBook.tick() {
+	if r.pruneBook.Tick() {
 		if minID, count, err := exec.changeLogStats(ctx); err == nil {
-			r.pruneBook.anchor(count)
+			r.pruneBook.Anchor(count)
 			slog.DebugContext(ctx, r.b.driver+": auto-prune recount",
 				slog.Int64("remaining", count), slog.Int64("min_id", minID))
 		}
 	} else {
-		r.pruneBook.noteDeleted(deleted)
+		r.pruneBook.NoteDeleted(deleted)
 	}
 	if !done {
 		slog.DebugContext(ctx, r.b.driver+": auto-prune tick budget exhausted; resuming next tick",
@@ -266,7 +172,7 @@ func prune(ctx context.Context, b backend, opts PruneOptions) (*PruneResult, err
 	if err != nil {
 		return nil, fmt.Errorf("%s: prune: min id: %w", b.driver, err)
 	}
-	if res.Deleted, _, err = pruneInBatches(
+	if res.Deleted, _, err = triggercdc.InBatches(
 		ctx, minID, opts.Cut, exec.pruneBatchSize(), 0, exec.pruneChangeLogBatch,
 	); err != nil {
 		return nil, fmt.Errorf("%s: prune: delete: %w", b.driver, err)

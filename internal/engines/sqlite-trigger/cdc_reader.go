@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"sluicesync.dev/sluice/internal/engines/internal/triggercdc"
 	"sluicesync.dev/sluice/internal/engines/sqlite"
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -79,7 +80,7 @@ type CDCReader struct {
 
 	// pruneBook tracks the auto-prune remaining-rows estimate (P-1). Owned by
 	// the single auto-prune sidecar goroutine; no locking.
-	pruneBook pruneBookkeeper
+	pruneBook triggercdc.Bookkeeper
 
 	mu  sync.Mutex
 	err error

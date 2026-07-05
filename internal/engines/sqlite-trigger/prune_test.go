@@ -11,6 +11,8 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go driver — no cgo, no container needed
+
+	"sluicesync.dev/sluice/internal/engines/internal/triggercdc"
 )
 
 // These are real-SQLite-file UNIT tests: modernc.org/sqlite is pure Go, so a
@@ -253,117 +255,15 @@ func TestPruneConsumedChangeLog_RefusesForeignToken(t *testing.T) {
 }
 
 // --- P-1 batched-prune pins --------------------------------------------------
+// The pure batching + bookkeeping pins (StepsBoundedKeyset, NothingBelowCut,
+// BudgetStopsEarly, CtxCanceled, the Bookkeeper cadence) live in the shared
+// internal/engines/internal/triggercdc package now. The pins BELOW are
+// engine-specific: they drive the REAL bounded-DELETE SQL against a temp SQLite
+// file (or the fake D1 executor) through [triggercdc.InBatches].
 
-// recordedBatch is one (floor, upper] keyset step a fake pruneBatchFunc saw.
+// recordedBatch is one (floor, upper] keyset step a prune DELETE stepped through
+// — used by the SQLite + D1 prune pins to assert the batching bounds.
 type recordedBatch struct{ floor, upper int64 }
-
-// TestPruneInBatches_StepsBoundedKeyset pins the batching shape: a backlog is
-// reaped as multiple bounded `floor < id <= upper` steps — never one monolithic
-// statement — with every upper clamped at the cut (the invariant carrier) and
-// the floor starting at MIN(id)-1 (not 0, so a high-id log doesn't step through
-// millions of empty ranges).
-func TestPruneInBatches_StepsBoundedKeyset(t *testing.T) {
-	cases := []struct {
-		name        string
-		minID, cut  int64
-		step        int64
-		wantBatches []recordedBatch
-	}{
-		{
-			name: "low ids", minID: 1, cut: 25, step: 10,
-			wantBatches: []recordedBatch{{0, 10}, {10, 20}, {20, 25}},
-		},
-		{
-			name: "floor starts at MIN(id)-1", minID: 101, cut: 125, step: 10,
-			wantBatches: []recordedBatch{{100, 110}, {110, 120}, {120, 125}},
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			var batches []recordedBatch
-			del := func(_ context.Context, floor, upper int64) (int64, error) {
-				batches = append(batches, recordedBatch{floor, upper})
-				return upper - floor, nil
-			}
-			deleted, done, err := pruneInBatches(context.Background(), tc.minID, tc.cut, tc.step, 0, del)
-			if err != nil {
-				t.Fatalf("pruneInBatches: %v", err)
-			}
-			if !done {
-				t.Error("done = false; want true (no budget)")
-			}
-			if want := tc.cut - (tc.minID - 1); deleted != want {
-				t.Errorf("deleted = %d; want %d", deleted, want)
-			}
-			if len(batches) != len(tc.wantBatches) {
-				t.Fatalf("batches = %v; want %v", batches, tc.wantBatches)
-			}
-			for i, b := range batches {
-				if b != tc.wantBatches[i] {
-					t.Errorf("batch[%d] = %v; want %v", i, b, tc.wantBatches[i])
-				}
-				if b.upper > tc.cut {
-					t.Errorf("batch[%d] upper %d exceeds cut %d — rows above the cut must NEVER be touched", i, b.upper, tc.cut)
-				}
-			}
-		})
-	}
-}
-
-// TestPruneInBatches_NothingBelowCut pins the two no-work shapes: an empty
-// change-log (minID=0) and a log whose lowest row is already above the cut.
-func TestPruneInBatches_NothingBelowCut(t *testing.T) {
-	del := func(context.Context, int64, int64) (int64, error) {
-		t.Fatal("del must not be called when there is nothing below the cut")
-		return 0, nil
-	}
-	for _, minID := range []int64{0, 6} {
-		deleted, done, err := pruneInBatches(context.Background(), minID, 5, 10, 0, del)
-		if err != nil || !done || deleted != 0 {
-			t.Errorf("minID=%d: got (deleted=%d, done=%v, err=%v); want (0, true, nil)", minID, deleted, done, err)
-		}
-	}
-}
-
-// TestPruneInBatches_BudgetStopsEarly pins the time-budget early exit: when the
-// budget is exhausted mid-backlog the loop stops after the current batch with
-// done=false (no error — the next tick resumes). The fake del sleeps so the
-// clock provably advances past the 1ns deadline after the first batch.
-func TestPruneInBatches_BudgetStopsEarly(t *testing.T) {
-	var batches int
-	del := func(context.Context, int64, int64) (int64, error) {
-		batches++
-		time.Sleep(2 * time.Millisecond)
-		return 10, nil
-	}
-	deleted, done, err := pruneInBatches(context.Background(), 1, 100, 10, time.Nanosecond, del)
-	if err != nil {
-		t.Fatalf("pruneInBatches: %v", err)
-	}
-	if done {
-		t.Error("done = true; want false (budget exhausted with rows still below cut)")
-	}
-	if batches != 1 {
-		t.Errorf("batches = %d; want 1 (stop after the batch that exhausted the budget)", batches)
-	}
-	if deleted != 10 {
-		t.Errorf("deleted = %d; want 10", deleted)
-	}
-}
-
-// TestPruneInBatches_CtxCanceled pins the between-batch ctx check: a shutdown
-// never waits behind a multi-batch backlog.
-func TestPruneInBatches_CtxCanceled(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	del := func(context.Context, int64, int64) (int64, error) {
-		t.Fatal("del must not run under a canceled ctx")
-		return 0, nil
-	}
-	if _, _, err := pruneInBatches(ctx, 1, 100, 10, 0, del); err == nil {
-		t.Error("pruneInBatches under canceled ctx returned nil; want ctx error")
-	}
-}
 
 // TestPruneInBatches_RealExecutorBudgetResumes drives the REAL bounded-DELETE
 // SQL through a budget-exhausted first tick and a resuming second tick, and is
@@ -387,7 +287,7 @@ func TestPruneInBatches_RealExecutorBudgetResumes(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 		return n, err
 	}
-	deleted, done, err := pruneInBatches(ctx, 1, 8, 3, time.Nanosecond, slowDel)
+	deleted, done, err := triggercdc.InBatches(ctx, 1, 8, 3, time.Nanosecond, slowDel)
 	if err != nil {
 		t.Fatalf("tick 1: %v", err)
 	}
@@ -406,7 +306,7 @@ func TestPruneInBatches_RealExecutorBudgetResumes(t *testing.T) {
 	if minID != 4 {
 		t.Fatalf("minChangeLogID = %d; want 4", minID)
 	}
-	deleted, done, err = pruneInBatches(ctx, minID, 8, 3, 0, e.pruneChangeLogBatch)
+	deleted, done, err = triggercdc.InBatches(ctx, minID, 8, 3, 0, e.pruneChangeLogBatch)
 	if err != nil {
 		t.Fatalf("tick 2: %v", err)
 	}
@@ -472,38 +372,6 @@ func TestPrune_LargeBacklogBatchesToCompletion(t *testing.T) {
 	}
 }
 
-// TestPruneBookkeeper_RecountCadenceAndArithmetic pins the P-1 estimate
-// bookkeeping: recount on the first tick and every pruneRecountEvery-th after,
-// rows-affected arithmetic (floored at 0) between, no effect until anchored.
-func TestPruneBookkeeper_RecountCadenceAndArithmetic(t *testing.T) {
-	var b pruneBookkeeper
-	b.noteDeleted(99) // unanchored: must be a no-op, not a bogus negative
-	if b.anchored || b.remaining != 0 {
-		t.Fatalf("unanchored noteDeleted mutated the bookkeeper: %+v", b)
-	}
-	if !b.tick() {
-		t.Error("tick 1 must recount (nothing anchored yet)")
-	}
-	b.anchor(100)
-	for i := int64(2); i < pruneRecountEvery; i++ {
-		if b.tick() {
-			t.Errorf("tick %d recounted; want arithmetic-only between recounts", i)
-		}
-		b.noteDeleted(5)
-	}
-	if b.remaining != 100-5*(pruneRecountEvery-2) {
-		t.Errorf("remaining = %d; want %d", b.remaining, 100-5*(pruneRecountEvery-2))
-	}
-	if !b.tick() {
-		t.Errorf("tick %d must recount", pruneRecountEvery)
-	}
-	b.anchor(40)
-	b.noteDeleted(1000)
-	if b.remaining != 0 {
-		t.Errorf("remaining = %d; want 0 (floored, never negative)", b.remaining)
-	}
-}
-
 // TestPruneConsumedChangeLog_RemainingEstimateConsistent drives the sidecar
 // entry point across ticks and pins that the arithmetic estimate matches the
 // change-log's TRUE row count at every step, and that a forced recount tick
@@ -517,7 +385,7 @@ func TestPruneConsumedChangeLog_RemainingEstimateConsistent(t *testing.T) {
 	if _, err := r.PruneConsumedChangeLog(ctx, `{"last_id":30}`, 0); err != nil {
 		t.Fatalf("tick 1: %v", err)
 	}
-	if !r.pruneBook.anchored || r.pruneBook.remaining != 70 {
+	if !r.pruneBook.Anchored() || r.pruneBook.Remaining() != 70 {
 		t.Fatalf("after tick 1 estimate = %+v; want anchored remaining=70", r.pruneBook)
 	}
 
@@ -525,18 +393,18 @@ func TestPruneConsumedChangeLog_RemainingEstimateConsistent(t *testing.T) {
 	if _, err := r.PruneConsumedChangeLog(ctx, `{"last_id":50}`, 0); err != nil {
 		t.Fatalf("tick 2: %v", err)
 	}
-	if truth := int64(len(remainingIDs(t, path))); r.pruneBook.remaining != 50 || truth != 50 {
-		t.Fatalf("after tick 2 estimate = %d, truth = %d; want both 50", r.pruneBook.remaining, truth)
+	if truth := int64(len(remainingIDs(t, path))); r.pruneBook.Remaining() != 50 || truth != 50 {
+		t.Fatalf("after tick 2 estimate = %d, truth = %d; want both 50", r.pruneBook.Remaining(), truth)
 	}
 
 	// Force the next tick onto the recount cadence and assert the true COUNT
 	// re-anchors to the same value the arithmetic would have reached.
-	r.pruneBook.ticks = pruneRecountEvery - 1
+	r.pruneBook.PrimeRecount()
 	if _, err := r.PruneConsumedChangeLog(ctx, `{"last_id":60}`, 0); err != nil {
 		t.Fatalf("tick 3: %v", err)
 	}
-	if truth := int64(len(remainingIDs(t, path))); r.pruneBook.remaining != 40 || truth != 40 {
-		t.Errorf("after recount tick estimate = %d, truth = %d; want both 40", r.pruneBook.remaining, truth)
+	if truth := int64(len(remainingIDs(t, path))); r.pruneBook.Remaining() != 40 || truth != 40 {
+		t.Errorf("after recount tick estimate = %d, truth = %d; want both 40", r.pruneBook.Remaining(), truth)
 	}
 }
 
