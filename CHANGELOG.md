@@ -4,6 +4,13 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.182] - 2026-07-05
+
+### Internal
+
+- **Shared trigger-CDC core extracted behind a dialect seam (audit A-2).** `pgtrigger` and `sqlite-trigger` (and, by transport substitution, `d1-trigger`) duplicated the trigger-CDC position codec and the change-log prune-batching engine. The genuinely-identical protocol — the `{"last_id":N}` position token codec and the keyset-batched prune loop with its bookkeeper/time-budget — now lives once in `internal/engines/internal/triggercdc`, parameterized by a small dialect contract: the accepted engine-name family is a dialect-provided list (so `pgtrigger` accepts `{postgres-trigger}`, `sqlite-trigger` accepts `{sqlite-trigger, d1-trigger}` per the Bug-166 fix, and a future trigger engine widens its own list with no codec change), and the per-transport prune batch size is a parameter. The **divergent** semantics were deliberately kept per-engine — pgtrigger's contiguous-committed-prefix + xmin safety-lag snapshot anchor versus sqlite's single-writer `MAX(id)` anchor — because merging them would be a silent-loss regression, not a dedup. Byte-identical behavior; every existing pgtrigger/sqlite-trigger/d1-trigger unit and integration pin passes unchanged, with the shared codec's family-acceptance now pinned as a class (1-, 2-, and synthetic 3-engine families × round-trip/cross-accept/foreign-refuse).
+- **Shared migration-engine core extracted to `internal/pipeline/migcore` (audit A-1, first structural carve).** The flat `internal/pipeline` package had backup/restore/streamer layered on top of a shared migration engine that migrate also uses, with root reaching back into backup — a bidirectional coupling that blocked decomposing the package. The engine-neutral core now lives downstream in `migcore`, imported by pipeline-root and importing nothing from it (verified acyclic): the chunk-boundary planners (MIN/MAX-divide + sampled-keyset) and PK-orderability logic, the copy-parallelism gate + AIMD backoff + connection-budget resolver, the grow-gate coordinator, the schema-diff + cross-engine-supportable checks, the reparent tracker, and the `RunSummary`/`WrapWithHint`/phase-constant surfaces (~3k prod LOC out of root). The copy *orchestration* (welded to resume-state, migration-state, redaction, shard-stamping) deliberately stays in root — only the neutral core moved. This unblocks the backup/restore carve (a later chunk). Pure move: chunk/gate/budget/grow-gate/reparent behavior is byte-identical, proven by the same- and cross-engine parallel-copy, resume, and backup/restore integration round-trips across the new package boundary.
+
 ## [0.99.181] - 2026-07-05
 
 ### Fixed
