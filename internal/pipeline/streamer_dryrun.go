@@ -69,10 +69,10 @@ func (s *Streamer) buildDryRunPlan(ctx context.Context, streamID string, persist
 	}
 	// ADR-0047 tier (b): live PG → PG sync may carry uncatalogued
 	// extension types verbatim. Engine-name-only determination.
-	applyVerbatimExtensionPassthrough(sr, verbatimLiveSameEnginePG(s.Source, s.Target))
+	migcore.ApplyVerbatimExtensionPassthrough(sr, verbatimLiveSameEnginePG(s.Source, s.Target))
 	// catalog Bug 76: scope per-column type validation to the filtered
 	// table set (s.Filter already has engine defaults merged in Run).
-	applyTableScope(sr, s.Filter)
+	migcore.ApplyTableScope(sr, s.Filter)
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
 		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: dry-run: read source schema: %w", err))

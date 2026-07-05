@@ -631,7 +631,7 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 		return migcore.WrapWithHint(migcore.PhaseConnect, markFailed(ctx, rc, state, ir.MigrationPhasePending,
 			fmt.Errorf("pipeline: open target schema writer: %w", err)))
 	}
-	applyTargetSchema(sw, m.TargetSchema)
+	migcore.ApplyTargetSchema(sw, m.TargetSchema)
 	applyIndexBuildMem(sw, m.IndexBuildMem)
 	applyIndexBuildParallelism(sw, m.IndexBuildParallelism)
 	if err := applyEnabledPGExtensions(ctx, sw, m.EnabledPGExtensions); err != nil {
@@ -655,7 +655,7 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 		return migcore.WrapWithHint(migcore.PhaseConnect, markFailed(ctx, rc, state, ir.MigrationPhasePending,
 			fmt.Errorf("pipeline: open target row writer: %w", err)))
 	}
-	applyTargetSchema(rw, m.TargetSchema)
+	migcore.ApplyTargetSchema(rw, m.TargetSchema)
 	migcore.ApplyMaxBufferBytes(rw, m.MaxBufferBytes)
 	defer closeIf(rw)
 
@@ -1602,7 +1602,7 @@ func (m *Migrator) validate() error {
 	case m.Resume && m.ResetTargetData:
 		return errors.New("pipeline: --resume and --reset-target-data are mutually exclusive")
 	}
-	if err := validateTargetSchema(m.Target, m.TargetSchema); err != nil {
+	if err := migcore.ValidateTargetSchema(m.Target, m.TargetSchema); err != nil {
 		return err
 	}
 	return validateEnabledPGExtensions(m.Source, m.Target, m.EnabledPGExtensions)

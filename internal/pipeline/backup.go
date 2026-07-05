@@ -291,11 +291,11 @@ func (b *Backup) Run(ctx context.Context) error {
 	// only constraint is enforced later by the recorded lineage marker
 	// (lineage.VerbatimExtensionColumnsIn → lineage.Segment) + the loud
 	// restore-time engine gate. A non-PG source never enables it.
-	applyVerbatimExtensionPassthrough(sr, verbatimBackupSourcePG(b.Source))
+	migcore.ApplyVerbatimExtensionPassthrough(sr, migcore.VerbatimBackupSourcePG(b.Source))
 
 	// catalog Bug 76: scope per-column type validation to the filtered
 	// table set (b.Filter already has engine defaults merged above).
-	applyTableScope(sr, b.Filter)
+	migcore.ApplyTableScope(sr, b.Filter)
 
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {

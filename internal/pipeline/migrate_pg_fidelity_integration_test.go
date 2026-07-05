@@ -79,7 +79,7 @@ func TestMigrate_PG_SchemaFidelity_Pass3(t *testing.T) {
 
 	// #23 preview/migrate parity: `schema preview` must NOT loud-refuse
 	// a type `migrate` carries verbatim. Pre-fix, preview never called
-	// applyVerbatimExtensionPassthrough, so it refused the `search
+	// migcore.ApplyVerbatimExtensionPassthrough, so it refused the `search
 	// tsvector` column while migrate (below) carried it fine — a
 	// preview/migrate inconsistency. Run the previewer over the SAME
 	// tsvector-bearing PG source and assert it succeeds and renders the

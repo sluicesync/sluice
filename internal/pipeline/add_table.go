@@ -343,9 +343,9 @@ func (a *AddTable) Run(ctx context.Context) error {
 	// preserves the DSN-default schema (pre-Bug-46 behaviour for
 	// streams that didn't pass --target-schema).
 	if preflight.resolvedTargetSchema != "" {
-		applyTargetSchema(sw, preflight.resolvedTargetSchema)
-		applyTargetSchema(rw, preflight.resolvedTargetSchema)
-		applyTargetSchema(applier, preflight.resolvedTargetSchema)
+		migcore.ApplyTargetSchema(sw, preflight.resolvedTargetSchema)
+		migcore.ApplyTargetSchema(rw, preflight.resolvedTargetSchema)
+		migcore.ApplyTargetSchema(applier, preflight.resolvedTargetSchema)
 		slog.InfoContext(
 			ctx, "add-table: resolved target schema",
 			slog.String("target_schema", preflight.resolvedTargetSchema),
@@ -593,10 +593,10 @@ func (a *AddTable) validate() error {
 	case a.Source.Capabilities().CDC == ir.CDCNone:
 		return fmt.Errorf("pipeline: add-table: Source engine %q declares CDC=None; mid-stream add-table only applies to CDC sources", a.Source.Name())
 	}
-	// --target-schema is PG-only (ADR-0031, validated by validateTargetSchema
+	// --target-schema is PG-only (ADR-0031, validated by migcore.ValidateTargetSchema
 	// against the target's SchemaScope capability). MySQL operators get a
 	// clear refusal naming the DSN-choice workaround.
-	return validateTargetSchema(a.Target, a.TargetSchema)
+	return migcore.ValidateTargetSchema(a.Target, a.TargetSchema)
 }
 
 // liveAddMode encodes which Phase 2 mechanism the orchestrator picked

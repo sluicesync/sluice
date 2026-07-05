@@ -384,14 +384,14 @@ func (r *Restore) Run(ctx context.Context) error {
 	schema := translate.RetargetForEngine(manifest.Schema, manifest.SourceEngine, r.Target.Name())
 
 	// 4. Open target writers.
-	if err := validateTargetSchema(r.Target, r.TargetSchema); err != nil {
+	if err := migcore.ValidateTargetSchema(r.Target, r.TargetSchema); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("restore: %w", err))
 	}
 	sw, err := r.Target.OpenSchemaWriter(ctx, r.TargetDSN)
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("restore: open target schema writer: %w", err))
 	}
-	applyTargetSchema(sw, r.TargetSchema)
+	migcore.ApplyTargetSchema(sw, r.TargetSchema)
 	defer closeIf(sw)
 
 	// Construct the run's shared coordinated grow-gate (ADR-0110) BEFORE
@@ -540,7 +540,7 @@ func (r *Restore) openTargetRowWriter(ctx context.Context) (ir.RowWriter, error)
 		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("restore: open target row writer: %w", err))
 	}
 	migcore.ApplyMaxBufferBytes(rw, r.MaxBufferBytes)
-	applyTargetSchema(rw, r.TargetSchema)
+	migcore.ApplyTargetSchema(rw, r.TargetSchema)
 	// Wire the run's shared grow-gate (ADR-0110) onto every writer so the
 	// MySQL writer's flushWithReparentRetry awaits/trips it — coordinating
 	// all concurrent restore workers through a storage-grow reparent instead

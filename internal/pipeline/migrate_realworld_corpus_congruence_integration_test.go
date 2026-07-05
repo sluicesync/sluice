@@ -49,13 +49,14 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	irdiff "sluicesync.dev/sluice/internal/ir/diff"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
 
 // corpusReadPGSchemaScoped opens the PG engine schema reader pinned to
-// the named PG schema (via ir.SchemaSetter / applyTargetSchema) and
+// the named PG schema (via ir.SchemaSetter / migcore.ApplyTargetSchema) and
 // returns the IR schema. FAILs on a read error or when fewer than min
 // tables were read — the non-vacuous guard, extended to the
 // schema-scoped congruence path so a leg cannot pass if either side
@@ -70,7 +71,7 @@ func corpusReadPGSchemaScoped(t *testing.T, dsn, schema string, wantMin int) *ir
 	if err != nil {
 		t.Fatalf("postgres OpenSchemaReader (schema %q): %v", schema, err)
 	}
-	applyTargetSchema(sr, schema) // ir.SchemaSetter — pins reads to `schema`
+	migcore.ApplyTargetSchema(sr, schema) // ir.SchemaSetter — pins reads to `schema`
 	defer closeIf(sr)
 	sch, err := sr.ReadSchema(ctx2min(t))
 	if err != nil {
@@ -429,7 +430,7 @@ func TestMigrate_Corpus_Joomla_Congruence_MySQLEmittedVsAuthoredPG(t *testing.T)
 // translation of the authored PG side and compare it against the
 // expert-authored MySQL side. MySQL has no schema namespace
 // (SchemaScopeFlat → Migrator.TargetSchema is refused for MySQL
-// targets, validateTargetSchema), so the emitted/authored separation
+// targets, migcore.ValidateTargetSchema), so the emitted/authored separation
 // is by DATABASE on one MySQL container instead of by schema:
 //
 //   - authored MySQL DDL → database `authored_db`

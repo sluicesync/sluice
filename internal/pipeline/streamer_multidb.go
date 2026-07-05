@@ -550,7 +550,7 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open source schema reader for %q: %w", database, err))
 	}
-	applyTableScope(sr, s.Filter)
+	migcore.ApplyTableScope(sr, s.Filter)
 	applyMultiDatabaseScope(sr, &multiDBScope{database: database, inScope: inScope})
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
@@ -627,7 +627,7 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open target schema writer for %q: %w", database, err))
 	}
-	applyTargetSchema(sw, targetSchema)
+	migcore.ApplyTargetSchema(sw, targetSchema)
 	applyIndexBuildMem(sw, s.IndexBuildMem)
 	applyIndexBuildParallelism(sw, s.IndexBuildParallelism)
 
@@ -636,7 +636,7 @@ func (s *Streamer) coldStartCopyOneDatabase(
 		closeIf(sw)
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open target row writer for %q: %w", database, err))
 	}
-	applyTargetSchema(rw, targetSchema)
+	migcore.ApplyTargetSchema(rw, targetSchema)
 	migcore.ApplyMaxBufferBytes(rw, s.MaxBufferBytes)
 
 	// Cold-start preflight: refuse if any target table already holds data

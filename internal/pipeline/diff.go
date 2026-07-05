@@ -154,7 +154,7 @@ func (d *Differ) Run(ctx context.Context) (*irdiff.SchemaDiff, error) {
 	if err := d.validate(); err != nil {
 		return nil, err
 	}
-	if err := validateTargetSchema(d.Target, d.TargetSchema); err != nil {
+	if err := migcore.ValidateTargetSchema(d.Target, d.TargetSchema); err != nil {
 		return nil, err
 	}
 	if err := validateEnabledPGExtensions(d.Source, d.Target, d.EnabledPGExtensions); err != nil {
@@ -187,7 +187,7 @@ func (d *Differ) Run(ctx context.Context) (*irdiff.SchemaDiff, error) {
 
 	// catalog Bug 76: scope per-column type validation to the filtered
 	// table set before the schema scan.
-	applyTableScope(sr, d.Filter)
+	migcore.ApplyTableScope(sr, d.Filter)
 
 	srcSchema, err := sr.ReadSchema(ctx)
 	if err != nil {
@@ -239,7 +239,7 @@ func (d *Differ) Run(ctx context.Context) (*irdiff.SchemaDiff, error) {
 	if err != nil {
 		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("diff: open target schema reader: %w", err))
 	}
-	applyTargetSchema(tr, d.TargetSchema)
+	migcore.ApplyTargetSchema(tr, d.TargetSchema)
 	if err := applyEnabledPGExtensions(ctx, tr, d.EnabledPGExtensions); err != nil {
 		return nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("diff: enable PG extensions on target: %w", err))
 	}
@@ -362,7 +362,7 @@ func previewMissingDDL(ctx context.Context, target ir.Engine, dsn, targetSchema 
 	if openErr != nil {
 		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("diff: open target schema writer: %w", openErr))
 	}
-	applyTargetSchema(sw, targetSchema)
+	migcore.ApplyTargetSchema(sw, targetSchema)
 	if err := applyEnabledPGExtensions(ctx, sw, enabledExtensions); err != nil {
 		closeIf(sw)
 		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("diff: enable PG extensions on target: %w", err))

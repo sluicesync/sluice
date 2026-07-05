@@ -124,7 +124,7 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 		// them can. Real production callers leave Applier nil and
 		// hit the OpenChangeApplier branch below.
 		migcore.ApplyMaxBufferBytes(s.Applier, s.MaxBufferBytes)
-		applyTargetSchema(s.Applier, s.TargetSchema)
+		migcore.ApplyTargetSchema(s.Applier, s.TargetSchema)
 		applyExecTimeout(s.Applier, s.ApplyExecTimeout)
 		applyApplyConcurrency(s.Applier, s.resolvedApplyConcurrency)
 		applyRedactor(s.Applier, s.Redactor)
@@ -150,7 +150,7 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 		return nil, false, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open target change applier: %w", err))
 	}
 	migcore.ApplyMaxBufferBytes(a, s.MaxBufferBytes)
-	applyTargetSchema(a, s.TargetSchema)
+	migcore.ApplyTargetSchema(a, s.TargetSchema)
 	applyExecTimeout(a, s.ApplyExecTimeout)
 	applyApplyConcurrency(a, s.resolvedApplyConcurrency)
 	applyRedactor(a, s.Redactor)

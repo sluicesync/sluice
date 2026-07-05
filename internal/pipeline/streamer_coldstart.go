@@ -176,10 +176,10 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context) (*ir.Schema, [
 	}
 	// ADR-0047 tier (b): live PG → PG sync may carry uncatalogued
 	// extension types verbatim. Engine-name-only determination.
-	applyVerbatimExtensionPassthrough(sr, verbatimLiveSameEnginePG(s.Source, s.Target))
+	migcore.ApplyVerbatimExtensionPassthrough(sr, verbatimLiveSameEnginePG(s.Source, s.Target))
 	// catalog Bug 76: scope per-column type validation to the filtered
 	// table set (s.Filter already has engine defaults merged in Run).
-	applyTableScope(sr, s.Filter)
+	migcore.ApplyTableScope(sr, s.Filter)
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
 		closeIf(sr)
@@ -432,7 +432,7 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 		_ = stream.Abandon()
 		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open target schema writer: %w", err))
 	}
-	applyTargetSchema(sw, s.TargetSchema)
+	migcore.ApplyTargetSchema(sw, s.TargetSchema)
 	applyIndexBuildMem(sw, s.IndexBuildMem)
 	applyIndexBuildParallelism(sw, s.IndexBuildParallelism)
 	if err := applyEnabledPGExtensions(ctx, sw, s.EnabledPGExtensions); err != nil {
@@ -446,7 +446,7 @@ func (s *Streamer) coldStartOpenTargetWriters(ctx context.Context, schema *ir.Sc
 		_ = stream.Abandon()
 		return nil, nil, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open target row writer: %w", err))
 	}
-	applyTargetSchema(rw, s.TargetSchema)
+	migcore.ApplyTargetSchema(rw, s.TargetSchema)
 	migcore.ApplyMaxBufferBytes(rw, s.MaxBufferBytes)
 
 	// Stale-backend preflight (connection-resilience Phase 2, item 2).

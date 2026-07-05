@@ -65,13 +65,13 @@ func (m *Migrator) phaseReadSourceSchema(ctx context.Context, scope *multiDBScop
 	// PG → PG (engine-name-only determination; the orchestrator stays
 	// engine-neutral). Cross-engine / non-PG runs never enable it, so
 	// the existing loud refusal (tier (c)) is preserved unchanged.
-	applyVerbatimExtensionPassthrough(sr, verbatimLiveSameEnginePG(m.Source, m.Target))
+	migcore.ApplyVerbatimExtensionPassthrough(sr, verbatimLiveSameEnginePG(m.Source, m.Target))
 
 	// catalog Bug 76: scope per-column type validation to the
 	// to-be-migrated tables. m.Filter already has engine-default
 	// exclusions merged just above, so this push-down matches the
 	// authoritative post-read migcore.ApplyTableFilter prune below.
-	applyTableScope(sr, m.Filter)
+	migcore.ApplyTableScope(sr, m.Filter)
 
 	// Multi-database fan-out (ADR-0074): tell the source reader it is
 	// reading one database of the selected set so it stamps

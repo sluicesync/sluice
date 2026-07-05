@@ -13,7 +13,7 @@
 //   - Stream-id collision detection refuses on different fingerprint.
 //
 // MySQL refusal is exercised at the unit-test level (no container
-// needed; the validateTargetSchema gate runs before any DB I/O).
+// needed; the migcore.ValidateTargetSchema gate runs before any DB I/O).
 
 package pipeline
 

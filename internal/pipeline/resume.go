@@ -106,7 +106,7 @@ func openMigrationStateStore(ctx context.Context, target ir.Engine, dsn, targetS
 	// `sluice_migrate_state` rows across every namespace. Migration IDs
 	// already disambiguate across overlapping target schemas.
 	//
-	// We deliberately do NOT call applyTargetSchema(store, targetSchema)
+	// We deliberately do NOT call migcore.ApplyTargetSchema(store, targetSchema)
 	// here; the parameter is accepted for symmetry with the streamer's
 	// applier path (which also keeps `sluice_cdc_state` in the default
 	// schema). The unused parameter is documented rather than removed

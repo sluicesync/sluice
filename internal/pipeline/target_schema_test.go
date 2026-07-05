@@ -10,10 +10,11 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // stubNamespacedEngine is a stubEngine that declares
-// SchemaScope=Namespaced (PG-shaped) so validateTargetSchema accepts
+// SchemaScope=Namespaced (PG-shaped) so migcore.ValidateTargetSchema accepts
 // the override. Used by tests that exercise the orchestrator's
 // target-schema field round-trip without booting a real PG container.
 type stubNamespacedEngine struct{ stubEngine }
@@ -24,7 +25,7 @@ func (stubNamespacedEngine) Capabilities() ir.Capabilities {
 
 func (stubNamespacedEngine) Name() string { return "stub-namespaced" }
 
-// stubFlatEngine declares SchemaScope=Flat so validateTargetSchema
+// stubFlatEngine declares SchemaScope=Flat so migcore.ValidateTargetSchema
 // refuses the override. Used to assert the MySQL-shaped refusal.
 type stubFlatEngine struct{ stubEngine }
 
@@ -36,19 +37,19 @@ func (stubFlatEngine) Name() string { return "stub-flat" }
 
 func TestValidateTargetSchema(t *testing.T) {
 	t.Run("empty target schema is always allowed", func(t *testing.T) {
-		if err := validateTargetSchema(stubFlatEngine{}, ""); err != nil {
+		if err := migcore.ValidateTargetSchema(stubFlatEngine{}, ""); err != nil {
 			t.Errorf("got %v; want nil for empty target schema even on flat engine", err)
 		}
 	})
 
 	t.Run("namespaced engine accepts override", func(t *testing.T) {
-		if err := validateTargetSchema(stubNamespacedEngine{}, "customer_svc"); err != nil {
+		if err := migcore.ValidateTargetSchema(stubNamespacedEngine{}, "customer_svc"); err != nil {
 			t.Errorf("got %v; want nil", err)
 		}
 	})
 
 	t.Run("flat engine refuses with PG-only message", func(t *testing.T) {
-		err := validateTargetSchema(stubFlatEngine{}, "customer_svc")
+		err := migcore.ValidateTargetSchema(stubFlatEngine{}, "customer_svc")
 		if err == nil {
 			t.Fatal("got nil; want refusal")
 		}
@@ -454,7 +455,7 @@ func TestCheckStreamIDCollision(t *testing.T) {
 func TestApplyTargetSchema(t *testing.T) {
 	t.Run("empty name is no-op", func(t *testing.T) {
 		s := &recordingSchemaSetter{}
-		applyTargetSchema(s, "")
+		migcore.ApplyTargetSchema(s, "")
 		if s.lastSchema != "" || s.calls != 0 {
 			t.Errorf("recordingSchemaSetter = %+v; want no calls", s)
 		}
@@ -462,7 +463,7 @@ func TestApplyTargetSchema(t *testing.T) {
 
 	t.Run("non-empty name calls SetSchema", func(t *testing.T) {
 		s := &recordingSchemaSetter{}
-		applyTargetSchema(s, "customer_svc")
+		migcore.ApplyTargetSchema(s, "customer_svc")
 		if s.lastSchema != "customer_svc" || s.calls != 1 {
 			t.Errorf("recordingSchemaSetter = %+v; want lastSchema=customer_svc calls=1", s)
 		}
@@ -472,7 +473,7 @@ func TestApplyTargetSchema(t *testing.T) {
 		// A bare struct without SetSchema. The helper must not panic
 		// (engines that don't implement the optional surface degrade
 		// gracefully — same shape as MaxBufferBytesSetter).
-		applyTargetSchema(struct{}{}, "customer_svc")
+		migcore.ApplyTargetSchema(struct{}{}, "customer_svc")
 	})
 }
 

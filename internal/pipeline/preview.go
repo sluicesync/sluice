@@ -259,7 +259,7 @@ func (p *Previewer) Run(ctx context.Context) error {
 	if err := p.validate(); err != nil {
 		return err
 	}
-	if err := validateTargetSchema(p.Target, p.TargetSchema); err != nil {
+	if err := migcore.ValidateTargetSchema(p.Target, p.TargetSchema); err != nil {
 		return err
 	}
 	if err := validateEnabledPGExtensions(p.Source, p.Target, p.EnabledPGExtensions); err != nil {
@@ -284,7 +284,7 @@ func (p *Previewer) Run(ctx context.Context) error {
 	// so the reader must make the identical tier decision. Without it
 	// `schema preview` loud-refused a type `migrate` carries fine
 	// (Bug 23 preview/migrate inconsistency).
-	applyVerbatimExtensionPassthrough(sr, verbatimLiveSameEnginePG(p.Source, p.Target))
+	migcore.ApplyVerbatimExtensionPassthrough(sr, verbatimLiveSameEnginePG(p.Source, p.Target))
 
 	srcSchema, err := sr.ReadSchema(ctx)
 	if err != nil {
@@ -456,7 +456,7 @@ func (p *Previewer) Run(ctx context.Context) error {
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("preview: open target schema writer: %w", err))
 	}
-	applyTargetSchema(sw, p.TargetSchema)
+	migcore.ApplyTargetSchema(sw, p.TargetSchema)
 	if err := applyEnabledPGExtensions(ctx, sw, p.EnabledPGExtensions); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("preview: enable PG extensions on target: %w", err))
 	}

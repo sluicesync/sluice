@@ -817,7 +817,7 @@ type fakeApplier struct {
 }
 
 // SetSchema implements [ir.SchemaSetter] so add-table's
-// applyTargetSchema(applier, ...) call lands a non-empty
+// migcore.ApplyTargetSchema(applier, ...) call lands a non-empty
 // targetSchemaCalls value when the orchestrator threads through a
 // resolved namespace (Bug 46).
 func (f *fakeApplier) SetSchema(name string) {
@@ -948,7 +948,7 @@ func (e *addTableTargetEngineWithLiveAdd) OpenRowWriter(_ context.Context, _ str
 }
 
 // addTableNamespacedTargetEngine wraps an addTableTargetEngine with
-// SchemaScope=Namespaced so validateTargetSchema accepts the
+// SchemaScope=Namespaced so migcore.ValidateTargetSchema accepts the
 // --target-schema flag in Bug 46's resolution tests. The default
 // recordingEngine declares Flat (zero-value Capabilities), which the
 // validate-time gate refuses upstream.
@@ -1048,7 +1048,7 @@ func TestAddTable_TargetSchemaInheritsRecorded(t *testing.T) {
 	// The schema-setter on each writer should have been called with
 	// the inherited "customer_svc". The recordingSchemaWriter and
 	// recordingRowWriterEmpty don't implement SchemaSetter (no need
-	// for them), so the type-assert in applyTargetSchema is a no-op
+	// for them), so the type-assert in migcore.ApplyTargetSchema is a no-op
 	// here. The fakeApplier's TargetSchemaCalls counter is the
 	// asserting surface: it implements SchemaSetter so we can confirm
 	// the inherited value reached the applier.

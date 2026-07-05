@@ -233,7 +233,7 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	}
 	defer closeIf(applier)
 	migcore.ApplyMaxBufferBytes(applier, r.MaxBufferBytes)
-	applyTargetSchema(applier, r.TargetSchema)
+	migcore.ApplyTargetSchema(applier, r.TargetSchema)
 	applyApplyConcurrency(applier, resolveReplayApplyConcurrency(r.ApplyConcurrency))
 	if err := applier.EnsureControlTable(ctx); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("chain restore: ensure control table: %w", err))
@@ -366,7 +366,7 @@ func (r *ChainRestore) reprimeStandaloneSequences(ctx context.Context, links []l
 		return fmt.Errorf("open target schema writer: %w", err)
 	}
 	defer closeIf(sw)
-	applyTargetSchema(sw, r.TargetSchema)
+	migcore.ApplyTargetSchema(sw, r.TargetSchema)
 	reprimer, ok := sw.(sequenceReprimer)
 	if !ok {
 		return fmt.Errorf(
@@ -432,7 +432,7 @@ func (r *ChainRestore) syncIdentitySequencesAtTail(ctx context.Context, links []
 		return fmt.Errorf("open target schema writer: %w", err)
 	}
 	defer closeIf(sw)
-	applyTargetSchema(sw, r.TargetSchema)
+	migcore.ApplyTargetSchema(sw, r.TargetSchema)
 	syncSchema := &ir.Schema{Tables: tables}
 	if err := runDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
 		return sw.SyncIdentitySequences(ctx, syncSchema)

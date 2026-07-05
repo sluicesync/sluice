@@ -331,7 +331,7 @@ func (m *Migrator) preflightMultiDBSchema(
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open source schema reader for %q: %w", database, err))
 	}
 	defer closeIf(sr)
-	applyTableScope(sr, m.Filter)
+	migcore.ApplyTableScope(sr, m.Filter)
 	applyMultiDatabaseScope(sr, &multiDBScope{database: database, inScope: inScope})
 	if _, err := sr.ReadSchema(ctx); err != nil {
 		// The out-of-scope FK refusal surfaces here; name the database
@@ -358,7 +358,7 @@ func (m *Migrator) applyDeferredConstraints(ctx context.Context, scope *multiDBS
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open source schema reader: %w", err))
 	}
 	defer closeIf(sr)
-	applyTableScope(sr, m.Filter)
+	migcore.ApplyTableScope(sr, m.Filter)
 	applyMultiDatabaseScope(sr, scope)
 
 	schema, err := sr.ReadSchema(ctx)
@@ -379,7 +379,7 @@ func (m *Migrator) applyDeferredConstraints(ctx context.Context, scope *multiDBS
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: open target schema writer: %w", err))
 	}
 	defer closeIf(sw)
-	applyTargetSchema(sw, m.TargetSchema)
+	migcore.ApplyTargetSchema(sw, m.TargetSchema)
 
 	if err := sw.CreateConstraints(ctx, schema); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConstraints, fmt.Errorf("pipeline: create constraints: %w", err))
