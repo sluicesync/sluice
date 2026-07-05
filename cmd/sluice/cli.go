@@ -304,67 +304,11 @@ func (m *MigrateCmd) run(g *Globals, env *envelopeRun) error {
 		return err
 	}
 
-	source, err := resolveEngine(m.SourceDriver)
+	source, target, cleanup, err := m.resolveEngines(g)
 	if err != nil {
-		return fmt.Errorf("--source-driver: %w", err)
-	}
-	target, err := resolveEngine(m.TargetDriver)
-	if err != nil {
-		return fmt.Errorf("--target-driver: %w", err)
-	}
-
-	// --infer-types is SQLite/D1-only (ADR-0144). Refuse loudly here — before
-	// any DSN dialing — against any other source; richly-typed sources (MySQL/
-	// PG) already carry the type info, so inference there is risk with no gain.
-	if m.InferTypes && source.Name() != "sqlite" && source.Name() != "d1" {
-		return errors.New("--infer-types is only supported for SQLite/D1 sources")
-	}
-
-	// Local staging (Strategy A, ADR-0145): replicate the live D1 into a local
-	// SQLite file up front, then migrate from that file via the `sqlite` engine.
-	// This runs before any other source dialing so the rest of Run operates on
-	// the local file (and --infer-types validates against modernc, sidestepping
-	// D1's HTTP query CPU/pattern limits). Engaged when --stage-local is set OR
-	// auto-engaged for --infer-types against a D1 source (the direct path is
-	// rejected by D1's LIKE/GLOB pattern-complexity limit), unless opted out with
-	// --no-stage-local. Both flags are D1-only.
-	if m.StageLocal && m.NoStageLocal {
-		return errors.New("--stage-local and --no-stage-local are mutually exclusive")
-	}
-	if m.StageLocal && source.Name() != "d1" {
-		return errors.New("--stage-local is only supported for a Cloudflare D1 source (--source-driver d1)")
-	}
-	autoStage := m.InferTypes && source.Name() == "d1" && !m.StageLocal && !m.NoStageLocal
-	if (m.StageLocal || autoStage) && source.Name() == "d1" {
-		if autoStage {
-			slog.Warn("--infer-types on a live Cloudflare D1 requires local staging — " +
-				"D1 rejects the rich-type validation patterns (error code 7500). Replicating the " +
-				"database to a local SQLite file first; pass --no-stage-local to use the direct path instead.")
-		}
-		staged, cleanup, err := stageD1Source(context.Background(), m.Source)
-		if err != nil {
-			return err
-		}
-		defer cleanup()
-		sqliteSource, err := resolveEngine("sqlite")
-		if err != nil {
-			return err
-		}
-		source = sqliteSource
-		m.SourceDriver = "sqlite"
-		m.Source = staged
-	}
-
-	// Apply the operator's value-fidelity flags (--mysql-sql-mode / --zero-date /
-	// --sqlite-date-encoding) onto the resolved engines (task 2.5, replacing the
-	// former process-wide globals). Applied AFTER any D1→SQLite staging re-resolve
-	// so the staged `sqlite` source carries the operator's --sqlite-date-encoding.
-	if source, err = applyEngineOptions(source, g); err != nil {
 		return err
 	}
-	if target, err = applyEngineOptions(target, g); err != nil {
-		return err
-	}
+	defer cleanup()
 
 	env.setEngines(source.Name(), target.Name())
 
@@ -544,6 +488,79 @@ func (m *MigrateCmd) run(g *Globals, env *envelopeRun) error {
 	// (not "refused") in the --format json envelope.
 	env.markEngaged()
 	return crashWrap(mig.Run(kongContext()))
+}
+
+// resolveEngines resolves the source + target engines for a migrate run,
+// including the D1→SQLite local-staging re-resolve (Strategy A, ADR-0145)
+// and the per-instance value-fidelity options (task 2.5). It refuses the
+// SQLite/D1-only flags loudly before any DSN dialing. On the staging path
+// it re-points m.Source / m.SourceDriver at the staged file and returns
+// the staged-file cleanup; every non-staging path returns a no-op
+// cleanup. The caller defers cleanup for the lifetime of the run.
+func (m *MigrateCmd) resolveEngines(g *Globals) (source, target ir.Engine, cleanup func(), err error) {
+	cleanup = func() {}
+	source, err = resolveEngine(m.SourceDriver)
+	if err != nil {
+		return nil, nil, cleanup, fmt.Errorf("--source-driver: %w", err)
+	}
+	target, err = resolveEngine(m.TargetDriver)
+	if err != nil {
+		return nil, nil, cleanup, fmt.Errorf("--target-driver: %w", err)
+	}
+
+	// --infer-types is SQLite/D1-only (ADR-0144). Refuse loudly here — before
+	// any DSN dialing — against any other source; richly-typed sources (MySQL/
+	// PG) already carry the type info, so inference there is risk with no gain.
+	if m.InferTypes && source.Name() != "sqlite" && source.Name() != "d1" {
+		return nil, nil, cleanup, errors.New("--infer-types is only supported for SQLite/D1 sources")
+	}
+
+	// Local staging (Strategy A, ADR-0145): replicate the live D1 into a local
+	// SQLite file up front, then migrate from that file via the `sqlite` engine.
+	// This runs before any other source dialing so the rest of Run operates on
+	// the local file (and --infer-types validates against modernc, sidestepping
+	// D1's HTTP query CPU/pattern limits). Engaged when --stage-local is set OR
+	// auto-engaged for --infer-types against a D1 source (the direct path is
+	// rejected by D1's LIKE/GLOB pattern-complexity limit), unless opted out with
+	// --no-stage-local. Both flags are D1-only.
+	if m.StageLocal && m.NoStageLocal {
+		return nil, nil, cleanup, errors.New("--stage-local and --no-stage-local are mutually exclusive")
+	}
+	if m.StageLocal && source.Name() != "d1" {
+		return nil, nil, cleanup, errors.New("--stage-local is only supported for a Cloudflare D1 source (--source-driver d1)")
+	}
+	autoStage := m.InferTypes && source.Name() == "d1" && !m.StageLocal && !m.NoStageLocal
+	if (m.StageLocal || autoStage) && source.Name() == "d1" {
+		if autoStage {
+			slog.Warn("--infer-types on a live Cloudflare D1 requires local staging — " +
+				"D1 rejects the rich-type validation patterns (error code 7500). Replicating the " +
+				"database to a local SQLite file first; pass --no-stage-local to use the direct path instead.")
+		}
+		staged, stageCleanup, serr := stageD1Source(context.Background(), m.Source)
+		if serr != nil {
+			return nil, nil, cleanup, serr
+		}
+		cleanup = stageCleanup
+		sqliteSource, rerr := resolveEngine("sqlite")
+		if rerr != nil {
+			return nil, nil, cleanup, rerr
+		}
+		source = sqliteSource
+		m.SourceDriver = "sqlite"
+		m.Source = staged
+	}
+
+	// Apply the operator's value-fidelity flags (--mysql-sql-mode / --zero-date /
+	// --sqlite-date-encoding) onto the resolved engines (task 2.5, replacing the
+	// former process-wide globals). Applied AFTER any D1→SQLite staging re-resolve
+	// so the staged `sqlite` source carries the operator's --sqlite-date-encoding.
+	if source, err = applyEngineOptions(source, g); err != nil {
+		return nil, nil, cleanup, err
+	}
+	if target, err = applyEngineOptions(target, g); err != nil {
+		return nil, nil, cleanup, err
+	}
+	return source, target, cleanup, nil
 }
 
 // resolveTableFilterArgs picks the include/exclude list to use,
@@ -1450,56 +1467,25 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 	return env.finish(s.run(g, env))
 }
 
-//nolint:funlen // ratchet: pre-existing 212-line accretion; split when next touched (hold-the-line note in .golangci.yml)
+// The residual length is the composition-root Streamer literal — a flat
+// 1:1 CLI-flag→struct-field mapping. The engine-resolution and namespace
+// phases (and the gocyclo the .golangci.yml note flagged) are split out
+// into resolveEngines / resolveNamespaces; extracting the wide literal
+// behind a carrier struct would add indirection without clarity, so the
+// funlen suppression stays scoped to this flat mapping.
+//
+//nolint:funlen // flat composition-root Streamer literal; logic phases already extracted (audit 3.5)
 func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 	cfg, err := config.Load(g.Config)
 	if err != nil {
 		return err
 	}
 
-	source, err := resolveEngine(s.SourceDriver)
+	source, target, err := s.resolveEngines(g)
 	if err != nil {
-		return fmt.Errorf("--source-driver: %w", err)
-	}
-	target, err := resolveEngine(s.TargetDriver)
-	if err != nil {
-		return fmt.Errorf("--target-driver: %w", err)
+		return err
 	}
 	env.setEngines(source.Name(), target.Name())
-
-	// ADR-0118 finding 1(b): the FAST-cold-start parallelism flags are inert
-	// on a MySQL/VStream source (its cold-copy parallelism is the
-	// engine-internal copy-table axis instead). If the operator set one
-	// EXPLICITLY against such a source, turn the silent no-op into a one-time
-	// loud WARN (detection is by the literal argv spelling, not the resolved
-	// value — see warnInertParallelismFlags).
-	warnInertParallelismFlags(kongContext(), source)
-
-	// Apply the operator's value-fidelity flags (--mysql-sql-mode / --zero-date /
-	// --sqlite-date-encoding) onto the resolved engines (task 2.5, replacing the
-	// former process-wide globals). Precedence is unchanged: the per-source DSN
-	// param still wins over these defaults inside each engine.
-	if source, err = applyEngineOptions(source, g); err != nil {
-		return err
-	}
-	if target, err = applyEngineOptions(target, g); err != nil {
-		return err
-	}
-
-	// ADR-0118 finding 4 / ADR-0120: thread the explicit read-axis CLI flags onto
-	// the SOURCE engine (the same per-instance idiom, replacing the former
-	// SetVStreamCopyTableParallelismOverride / SetNativeCopyTableParallelismOverride
-	// / SetVStreamPreserveSkewOverride globals — task 2.5). A parallelism value > 0
-	// wins over the source DSN param; 0 leaves the DSN-then-default byte-identical.
-	// --vstream-preserve-skew true wins over the DSN and restores the old
-	// MinimizeSkew hold; false leaves the new relaxed default. These are
-	// MySQL/VStream-only knobs, so a non-MySQL source passes through unchanged.
-	if me, ok := source.(mysql.Engine); ok {
-		source = me.
-			WithVStreamCopyTableParallelism(s.VStreamCopyTableParallelism).
-			WithCopyTableParallelism(s.CopyTableParallelism).
-			WithVStreamPreserveSkew(s.VStreamPreserveSkew)
-	}
 
 	if len(s.IncludeTable) > 0 && len(s.ExcludeTable) > 0 {
 		return errors.New("--include-table and --exclude-table are mutually exclusive")
@@ -1516,31 +1502,7 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 	if len(s.IncludeView) > 0 && len(s.ExcludeView) > 0 {
 		return errors.New("--include-view and --exclude-view are mutually exclusive")
 	}
-	// Multi-database fan-out (ADR-0074 Phase 1b.2) / multi-schema fan-out
-	// (ADR-0075). The --*-schema and --*-database forms are synonyms; mixing
-	// them is a loud error.
-	includeNS, excludeNS, allNS, err := resolveNamespaceScopeArgs(
-		s.IncludeDatabase, s.ExcludeDatabase, s.AllDatabases,
-		s.IncludeSchema, s.ExcludeSchema, s.AllSchemas,
-	)
-	if err != nil {
-		return err
-	}
-	if len(includeNS) > 0 && len(excludeNS) > 0 {
-		return errors.New("--include-database/--include-schema and --exclude-database/--exclude-schema are mutually exclusive")
-	}
-	if allNS && (len(includeNS) > 0 || len(excludeNS) > 0) {
-		return errors.New("--all-databases/--all-schemas is mutually exclusive with --include-* / --exclude-* namespace scope")
-	}
-	databaseFilter, err := pipeline.NewDatabaseFilter(includeNS, excludeNS)
-	if err != nil {
-		return err
-	}
-	mapPairs, err := resolveNamespaceMapArgs(s.MapDatabase, s.MapSchema, cfg)
-	if err != nil {
-		return err
-	}
-	namespaceMap, err := pipeline.NewNamespaceRenameMap(mapPairs)
+	databaseFilter, namespaceMap, allNS, err := s.resolveNamespaces(cfg)
 	if err != nil {
 		return err
 	}
@@ -1817,6 +1779,81 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 	// (not "refused") in the --format json envelope.
 	env.markEngaged()
 	return crashWrap(streamer.Run(kongContext()))
+}
+
+// resolveEngines resolves the source + target engines for a sync run,
+// applies the per-instance value-fidelity options (task 2.5), warns once
+// about FAST-cold-start parallelism flags that are inert on a MySQL/
+// VStream source (ADR-0118 finding 1(b)), and threads the explicit
+// read-axis flags onto a MySQL source (ADR-0118 finding 4 / ADR-0120).
+func (s *SyncStartCmd) resolveEngines(g *Globals) (source, target ir.Engine, err error) {
+	source, err = resolveEngine(s.SourceDriver)
+	if err != nil {
+		return nil, nil, fmt.Errorf("--source-driver: %w", err)
+	}
+	target, err = resolveEngine(s.TargetDriver)
+	if err != nil {
+		return nil, nil, fmt.Errorf("--target-driver: %w", err)
+	}
+
+	// The inert-flag WARN detects by the literal argv spelling, not the
+	// resolved value — see warnInertParallelismFlags.
+	warnInertParallelismFlags(kongContext(), source)
+
+	// Precedence is unchanged: the per-source DSN param still wins over
+	// these defaults inside each engine.
+	if source, err = applyEngineOptions(source, g); err != nil {
+		return nil, nil, err
+	}
+	if target, err = applyEngineOptions(target, g); err != nil {
+		return nil, nil, err
+	}
+
+	// A parallelism value > 0 wins over the source DSN param; 0 leaves the
+	// DSN-then-default byte-identical. --vstream-preserve-skew true wins
+	// over the DSN and restores the old MinimizeSkew hold; false leaves the
+	// new relaxed default. MySQL/VStream-only, so a non-MySQL source passes
+	// through unchanged.
+	if me, ok := source.(mysql.Engine); ok {
+		source = me.
+			WithVStreamCopyTableParallelism(s.VStreamCopyTableParallelism).
+			WithCopyTableParallelism(s.CopyTableParallelism).
+			WithVStreamPreserveSkew(s.VStreamPreserveSkew)
+	}
+	return source, target, nil
+}
+
+// resolveNamespaces merges the multi-database (ADR-0074) / multi-schema
+// (ADR-0075) fan-out flags into the internal DatabaseFilter + rename map
+// + all-namespaces flag, enforcing the include/exclude and all-vs-scoped
+// mutual exclusions. The --*-schema and --*-database forms are synonyms.
+func (s *SyncStartCmd) resolveNamespaces(cfg *config.Config) (databaseFilter pipeline.DatabaseFilter, namespaceMap pipeline.NamespaceRenameMap, allDatabases bool, err error) {
+	includeNS, excludeNS, allNS, err := resolveNamespaceScopeArgs(
+		s.IncludeDatabase, s.ExcludeDatabase, s.AllDatabases,
+		s.IncludeSchema, s.ExcludeSchema, s.AllSchemas,
+	)
+	if err != nil {
+		return databaseFilter, namespaceMap, false, err
+	}
+	if len(includeNS) > 0 && len(excludeNS) > 0 {
+		return databaseFilter, namespaceMap, false, errors.New("--include-database/--include-schema and --exclude-database/--exclude-schema are mutually exclusive")
+	}
+	if allNS && (len(includeNS) > 0 || len(excludeNS) > 0) {
+		return databaseFilter, namespaceMap, false, errors.New("--all-databases/--all-schemas is mutually exclusive with --include-* / --exclude-* namespace scope")
+	}
+	databaseFilter, err = pipeline.NewDatabaseFilter(includeNS, excludeNS)
+	if err != nil {
+		return databaseFilter, namespaceMap, false, err
+	}
+	mapPairs, err := resolveNamespaceMapArgs(s.MapDatabase, s.MapSchema, cfg)
+	if err != nil {
+		return databaseFilter, namespaceMap, false, err
+	}
+	namespaceMap, err = pipeline.NewNamespaceRenameMap(mapPairs)
+	if err != nil {
+		return databaseFilter, namespaceMap, false, err
+	}
+	return databaseFilter, namespaceMap, allNS, nil
 }
 
 // SyncStatusCmd reports the state of every continuous-sync stream
