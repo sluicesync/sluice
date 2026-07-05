@@ -363,52 +363,17 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 		}
 	}()
 
-	// Wait for the first row-bearing change before opening the tx.
-	// Opening the tx then blocking with no work to do would hold a
-	// connection idle from the pool for arbitrarily long; we'd
-	// rather wait on the channel. TxBegin / TxCommit boundary
-	// events received before any row event are consumed in this
-	// pre-tx loop (ADR-0027 — they're useful to the inner loop
-	// where they bracket actual row work).
-	var first ir.Change
-	for {
-		select {
-		case c, ok := <-changes:
-			if !ok {
-				return 0, ir.Position{}, true, nil
-			}
-			switch c.(type) {
-			case ir.TxBegin:
-				// Source-tx start with no batch open yet — a no-op; keep
-				// waiting for the first row event of the transaction.
-				continue
-			case ir.TxCommit:
-				// A source-transaction boundary that arrived on an empty
-				// batch: either an empty tx (BEGIN → COMMIT with no rows,
-				// e.g. a heartbeat) or — the load-bearing case under
-				// CheckpointOnlyAtTxBoundary — the trailing COMMIT of a tx
-				// whose rows already committed in prior batches (its last
-				// row filled a batch before this COMMIT was read; common at
-				// AIMD batch-size 1). When mid-tx flushes skip the position
-				// write, this is the ONLY place the boundary can be
-				// persisted, so do it here in a dedicated position-only tx;
-				// the rows are already durable (serial in-order apply), so
-				// advancing the checkpoint to this boundary is safe and
-				// keeps warm-resume restarting at a clean tx boundary.
-				// Without the flag (PG) this stays a pure no-op: PG already
-				// advanced its position on the rows' own flushes.
-				if cfg.CheckpointOnlyAtTxBoundary {
-					if err := writeBoundaryOnly(ctx, cfg, streamID, c.Pos().Token); err != nil {
-						return 0, ir.Position{}, false, err
-					}
-				}
-				continue
-			}
-			first = c
-		case <-ctx.Done():
-			return 0, ir.Position{}, false, ctx.Err()
-		}
-		break
+	// Wait for the first row-bearing change before opening the tx
+	// (see waitForFirstChange). A closed channel here is the clean
+	// shutdown signal; a ctx cancel or a boundary-only position-write
+	// failure surfaces as an error — batchStart is still zero on both,
+	// so the defer's IsZero guard keeps them out of the AIMD window.
+	first, chClosed, werr := waitForFirstChange(ctx, cfg, streamID, changes)
+	if werr != nil {
+		return 0, ir.Position{}, false, werr
+	}
+	if chClosed {
+		return 0, ir.Position{}, true, nil
 	}
 
 	// TransactionalDDL=false (MySQL): a schema event as the first
@@ -627,6 +592,50 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 	}
 
 	return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, false)
+}
+
+// waitForFirstChange blocks until the first row-bearing change of a
+// batch arrives, returning it. Opening the batch tx then blocking with
+// no work would hold a pool connection idle arbitrarily long, so the
+// wait happens on the channel with no tx open (ADR-0027). A closed
+// channel returns channelClosed=true (clean shutdown); a ctx cancel
+// returns its error. TxBegin / TxCommit boundary events observed on the
+// empty batch are consumed here:
+//
+//   - TxBegin: a source-tx start with no batch open yet — a no-op; keep
+//     waiting for the transaction's first row event.
+//   - TxCommit: an empty tx (BEGIN → COMMIT with no rows, e.g. a
+//     heartbeat) or — the load-bearing case under
+//     CheckpointOnlyAtTxBoundary — the trailing COMMIT of a tx whose
+//     rows already committed in prior batches. When mid-tx flushes skip
+//     the position write, this is the ONLY place the boundary can be
+//     persisted, so writeBoundaryOnly advances it in a dedicated
+//     position-only tx (the rows are already durable via serial in-order
+//     apply). Without the flag (PG) this is a pure no-op — PG already
+//     advanced its position on the rows' own flushes.
+func waitForFirstChange(ctx context.Context, cfg *BatchConfig, streamID string, changes <-chan ir.Change) (first ir.Change, channelClosed bool, err error) {
+	for {
+		select {
+		case c, ok := <-changes:
+			if !ok {
+				return nil, true, nil
+			}
+			switch c.(type) {
+			case ir.TxBegin:
+				continue
+			case ir.TxCommit:
+				if cfg.CheckpointOnlyAtTxBoundary {
+					if err := writeBoundaryOnly(ctx, cfg, streamID, c.Pos().Token); err != nil {
+						return nil, false, err
+					}
+				}
+				continue
+			}
+			return c, false, nil
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		}
+	}
 }
 
 // commitBatch writes the position then commits the open tx, then
