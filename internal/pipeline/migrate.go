@@ -39,6 +39,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/redact"
 )
 
@@ -87,8 +88,8 @@ type Migrator struct {
 	// Summary, when non-nil, collects the end-of-run per-table facts
 	// the CLI's `--format json` result envelope renders. nil (the zero
 	// value) disables the bookkeeping — every recording call is a
-	// nil-safe no-op. See [RunSummary].
-	Summary *RunSummary
+	// nil-safe no-op. See [migcore.RunSummary].
+	Summary *migcore.RunSummary
 
 	// Mappings is the per-column type-override list from sluice.yaml.
 	// Applied after ReadSchema and before the schema-write phase, so

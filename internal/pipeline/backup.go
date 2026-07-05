@@ -86,6 +86,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/redact"
 )
 
@@ -308,8 +309,8 @@ type Backup struct {
 	// Summary, when non-nil, collects the end-of-run per-table facts
 	// the CLI's `--format json` result envelope renders — filled from
 	// the completed manifest's per-table row counts. nil (the zero
-	// value) disables the bookkeeping. See [RunSummary].
-	Summary *RunSummary
+	// value) disables the bookkeeping. See [migcore.RunSummary].
+	Summary *migcore.RunSummary
 
 	// Redactor, when non-nil and non-empty, applies operator-
 	// configured PII redaction to every row before it's written to a
@@ -717,7 +718,7 @@ func (b *Backup) Run(ctx context.Context) error {
 // optional Summary (nil-safe no-op otherwise) for the CLI's
 // `--format json` envelope. Manifest table names already carry any
 // namespace prefix, so the schema slot stays empty.
-func logBackupComplete(ctx context.Context, manifest *irbackup.Manifest, summary *RunSummary) {
+func logBackupComplete(ctx context.Context, manifest *irbackup.Manifest, summary *migcore.RunSummary) {
 	totalRows := int64(0)
 	totalChunks := 0
 	for _, t := range manifest.Tables {

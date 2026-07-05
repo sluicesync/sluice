@@ -38,6 +38,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/translate"
 )
 
@@ -86,7 +87,7 @@ type ChainRestore struct {
 	// Summary is threaded into the re-entrant [Restore] for every
 	// segment full so the CLI's `--format json` envelope sees chain
 	// restores too. Same semantics as [Restore.Summary]; nil disables.
-	Summary *RunSummary
+	Summary *migcore.RunSummary
 
 	// ApplyBatchSize is the upper bound on changes per target
 	// transaction during incremental replay. Same shape as

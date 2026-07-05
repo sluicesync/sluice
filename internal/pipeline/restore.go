@@ -37,6 +37,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/translate"
 )
 
@@ -100,8 +101,8 @@ type Restore struct {
 	// each [Restore.restoreTable] applied (accumulated, so a chain
 	// restore that re-applies a table across segments sums up; the
 	// incremental change-replay leg is not counted). nil (the zero
-	// value) disables the bookkeeping. See [RunSummary].
-	Summary *RunSummary
+	// value) disables the bookkeeping. See [migcore.RunSummary].
+	Summary *migcore.RunSummary
 
 	// ApplyConcurrency is the key-hash concurrent-apply LANE count used
 	// ONLY when this restore targets a multi-incremental chain and so

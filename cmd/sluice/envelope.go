@@ -47,6 +47,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/diagnose"
 	"sluicesync.dev/sluice/internal/pipeline"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
@@ -124,7 +125,7 @@ type envelopeRun struct {
 	scrubDSNs []string
 	resume    *envelopeResume
 	nextSteps []string
-	summary   *pipeline.RunSummary
+	summary   *migcore.RunSummary
 	plan      any
 	engaged   bool
 }
@@ -141,7 +142,7 @@ func newEnvelopeRun(command, format string) *envelopeRun {
 		out:      os.Stdout,
 	}
 	if e.jsonMode {
-		e.summary = &pipeline.RunSummary{}
+		e.summary = &migcore.RunSummary{}
 	}
 	return e
 }
