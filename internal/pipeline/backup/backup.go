@@ -1321,6 +1321,21 @@ func (b *Backup) setupChainEncryption(manifest, prior *irbackup.Manifest) ([]byt
 		return nil, errors.New("backup: encryption envelope is nil")
 	}
 	mode := enc.Mode
+	// Bug 179 (full-resume edition): a resumed in-progress full must keep the
+	// mode the chain root already committed. Inherit it when --encrypt-mode is
+	// omitted; refuse an explicit conflicting mode loudly — otherwise the
+	// resumed manifest records one mode while the prior chunks are the other,
+	// producing an un-restorable chain (the same shape the chain-extend fix
+	// closes in alignEncryption).
+	if prior != nil && prior.ChainEncryption != nil && prior.ChainEncryption.Mode != "" {
+		priorMode := prior.ChainEncryption.Mode
+		if mode == "" {
+			mode = priorMode
+		} else if mode != priorMode {
+			return nil, fmt.Errorf("backup: --encrypt-mode=%q conflicts with the in-progress chain's mode %q; "+
+				"resume with the same mode or omit --encrypt-mode to inherit it", mode, priorMode)
+		}
+	}
 	if mode == "" {
 		mode = crypto.EncryptModePerChain
 	}
