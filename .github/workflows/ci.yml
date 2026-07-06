@@ -624,7 +624,7 @@ jobs:
       - name: check skills CLI-surface coverage
         run: bash scripts/check-skills-flags.sh
 
-      - uses: golangci/golangci-lint-action@v9.2.1
+      - uses: golangci/golangci-lint-action@v9.3.0
         with:
           # @v8+ of the action natively requires golangci-lint v2 (the
           # major-version split happened in early 2026). Our
