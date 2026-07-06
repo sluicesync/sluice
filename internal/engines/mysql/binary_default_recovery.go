@@ -275,6 +275,14 @@ func parseShowCreateColumnDefault(createStmt, colName string) (raw []byte, ok bo
 // own indented line and is deliberately NOT matched here — only the closing `)`
 // line is inspected. Returns ok=false when there is no table COMMENT clause.
 //
+// Known theoretical edge (out of scope, fails safe): the only other free-text
+// quoted table option is a FEDERATED-engine `CONNECTION='…'`. If such a value
+// both contained a ` COMMENT='…'` substring AND were emitted before the real
+// COMMENT option, the first-match could point inside it; in realistic shapes the
+// subsequent decode fails (→ ok=false → keep the information_schema value), and
+// FEDERATED is outside sluice's MySQL↔PG/InnoDB scope, so this is not defended
+// against beyond the fail-safe.
+//
 // This is the TABLE_COMMENT sibling of parseShowCreateColumnDefault: like
 // COLUMN_DEFAULT, information_schema.tables.TABLE_COMMENT C-string-truncates a
 // comment at its first NUL byte, so a comment carrying a 0x00 is read short
