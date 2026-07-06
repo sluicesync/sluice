@@ -142,8 +142,8 @@ The same flavor handles three deployment shapes:
 
 | Deployment | Transport | Auth | Shard convention |
 |------------|-----------|------|------------------|
-| PlanetScale (hosted) | TLS (default) | Basic (default; service-token name+value) | `-` (default) |
-| Self-hosted Vitess + TLS + auth | TLS | Basic | varies |
+| PlanetScale (hosted) | TLS (default) | Basic (default; service-token name+value) | auto-discovered (default) |
+| Self-hosted Vitess + TLS + auth | TLS | Basic | auto-discovered (or pin `vstream_shards`) |
 | Self-hosted Vitess plaintext (vttestserver, dev) | `?vstream_transport=plaintext` | `?vstream_auth=none` | usually `?vstream_shards=0` |
 
 Key constraints inherited from the Vitess platform:
@@ -154,10 +154,11 @@ Key constraints inherited from the Vitess platform:
   capability check accepts it.
 - No user-defined PARTITION BY (Vitess sharding handles partitioning).
 - Sharded keyspaces are supported on both the standalone CDC path
-  and the snapshot+CDC handoff path: list the shards explicitly
-  via `vstream_shards` or set `vstream_auto_discover_shards=true`
-  to have sluice query `SHOW VITESS_SHARDS LIKE '<keyspace>/%'` at
-  Open time. The reader streams from all shards concurrently
+  and the snapshot+CDC handoff path with no extra configuration:
+  unless you pin the layout with `vstream_shards`, sluice
+  auto-discovers the keyspace's shards at Open time by querying
+  `SHOW VITESS_SHARDS` (a single `-` for an unsharded keyspace, the
+  real shards for a sharded one). The reader streams from all shards concurrently
   (vtgate fans out the COPY phase per shard, then the same gRPC
   stream tails CDC across all shards). Per-scope `COPY_COMPLETED`
   events are progress markers; only the *global* COPY_COMPLETED
@@ -190,16 +191,20 @@ on the standard MySQL DSN as additional `?key=value` parameters:
 - `vstream_auth={basic|none}` — default `basic`. None skips the
   Authorization header entirely; matches vanilla Vitess
   deployments that don't authenticate VStream calls.
-- `vstream_shards=<comma-separated>` — default `-`. PlanetScale
-  convention; vttestserver typically uses `0` for an unsharded
-  keyspace. List every shard for a sharded keyspace
-  (`vstream_shards=-80,80-`).
-- `vstream_auto_discover_shards=true` — discover the keyspace's
-  shard layout at Open time via `SHOW VITESS_SHARDS LIKE
-  '<keyspace>/%'`. Default `false`. Mutually exclusive with
-  `vstream_shards`. Recommended for sharded sources where the
-  shard layout isn't known statically; for unsharded keyspaces
-  the explicit-default path (`-`) is cheaper.
+- `vstream_shards=<comma-separated>` — explicit override that pins
+  the shard layout and skips discovery. PlanetScale convention is
+  `-`; vttestserver typically uses `0` for an unsharded keyspace.
+  List every shard for a sharded keyspace (`vstream_shards=-80,80-`).
+  Absent, sluice auto-discovers (below).
+- `vstream_auto_discover_shards=true` — discovery is now the
+  DEFAULT: whenever `vstream_shards` is unset, sluice queries the
+  keyspace's shard layout at Open time via `SHOW VITESS_SHARDS`
+  (single `-` for unsharded, every shard for sharded). This flag is
+  retained for back-compat — it names the default behavior — and is
+  mutually exclusive with `vstream_shards`. Discovery-by-default is
+  what makes a sharded source cold-copy correctly; a silent `-`
+  default made the cold-copy build a keyspace-wide VGTID that vtgate
+  rejects, copying zero rows.
 
 Reshards are surfaced as `ShardLayoutChangedError` (carries the
 new shard layout). Callers can match it with `errors.Is(err,

@@ -756,11 +756,19 @@ func TestStripKeyspaceFromTable(t *testing.T) {
 }
 
 // TestResolveVStreamShards covers the open-time shard-resolution
-// policy: explicit list wins, auto-discover requires the explicit
-// list to be empty, and the contradictory-flags case errors loudly.
+// policy: an explicit list wins (and is honored verbatim), the
+// contradictory-flags case errors loudly, and — the load-bearing
+// change — the DEFAULT (no explicit `vstream_shards`) now ROUTES TO
+// DISCOVERY rather than silently returning ["-"]. Discovery-by-default
+// is what fixes the sharded-source cold-copy: a sharded keyspace must
+// have its real shards read, not be assumed unsharded.
 //
-// Auto-discovery's network branch is exercised by the integration
-// suite; here we only assert the validation logic.
+// Discovery's own network branch (unsharded → ["-"], sharded → real
+// shards) needs a live vtgate and is pinned by the integration suite
+// (TestVitessReshard_ShardedColdCopy_AllShardsCopied). Here we assert
+// only that the no-explicit path INVOKES discovery — proven by the
+// discovery-wrapped error against the unreachable test endpoint, which
+// would be impossible if the code still short-circuited to ["-"].
 func TestResolveVStreamShards(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
@@ -773,8 +781,21 @@ func TestResolveVStreamShards(t *testing.T) {
 		errSubstr string
 	}{
 		{
-			name: "default — single unsharded shard",
-			want: []string{"-"},
+			// The default no longer returns ["-"]: it goes to discovery,
+			// which fails loudly against the unreachable endpoint here.
+			// A silent ["-"] default (the pre-fix behavior) would return
+			// nil error + ["-"] and fail this assertion.
+			name:      "default (no explicit) → discovery attempted, not silent \"-\"",
+			wantErr:   true,
+			errSubstr: "shard auto-discovery",
+		},
+		{
+			// Back-compat: the flag still names the (now default) behavior;
+			// it must route to the same discovery path.
+			name:      "vstream_auto_discover_shards=true → discovery attempted",
+			params:    map[string]string{"vstream_auto_discover_shards": "true"},
+			wantErr:   true,
+			errSubstr: "shard auto-discovery",
 		},
 		{
 			name:   "explicit single shard",
@@ -795,9 +816,6 @@ func TestResolveVStreamShards(t *testing.T) {
 			wantErr:   true,
 			errSubstr: "mutually exclusive",
 		},
-		// Auto-discovery without explicit shards isn't tested here:
-		// it would require a live MySQL endpoint. The integration
-		// suite covers it; this layer just validates the policy.
 	}
 	for _, c := range cases {
 		c := c

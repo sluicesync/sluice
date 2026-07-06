@@ -240,16 +240,21 @@ const vstreamChannelBuffer = 256
 //   - vstream_auth={basic|none} — default basic. None skips the
 //     Authorization header entirely; matches vanilla Vitess
 //     deployments that don't authenticate VStream calls.
-//   - vstream_shards=<comma-separated> — default "-". The
-//     PlanetScale convention is "-" for an unsharded keyspace;
-//     vttestserver uses "0" for the same case. Multi-shard
-//     keyspaces list every shard ("-80,80-").
-//   - vstream_auto_discover_shards=true — discover the keyspace's
-//     shard layout at Open time via `SHOW VITESS_SHARDS LIKE
-//     '<keyspace>/%'` against the standard MySQL endpoint.
-//     Mutually exclusive with `vstream_shards`. Default false to
-//     keep existing single-shard deployments working without
-//     changes.
+//   - vstream_shards=<comma-separated> — EXPLICIT OVERRIDE that pins
+//     the shard layout and skips discovery. The PlanetScale
+//     convention is "-" for an unsharded keyspace; vttestserver uses
+//     "0" for the same case. Multi-shard keyspaces list every shard
+//     ("-80,80-"). Absent, sluice auto-discovers (see below).
+//   - vstream_auto_discover_shards=true — the discovery-by-default is
+//     now the standard path: whenever `vstream_shards` is unset,
+//     sluice queries the keyspace's shard layout at Open time via
+//     `SHOW VITESS_SHARDS` against the standard MySQL endpoint. This
+//     flag is retained for back-compat (it names the default
+//     behavior); it is mutually exclusive with `vstream_shards`.
+//     Discovery returns a single "-" for an unsharded keyspace (so
+//     that path is byte-identical to the old default) and the real
+//     shards for a sharded one — the fix for the sharded-source
+//     cold-copy that a silent ["-"] default broke.
 //   - vstream_tablet_type={primary|replica|rdonly} — default
 //     replica. The tablet type the PURE CDC TAIL streams from.
 //     PlanetScale production reads from replicas, so replica is the
@@ -432,18 +437,32 @@ func vstreamShardsFromDSN(cfg *gomysql.Config) []string {
 }
 
 // resolveVStreamShards picks the shard layout for the reader at
-// Open time. It applies the DSN policy:
+// Open time. Auto-discovery is the DEFAULT: unless the operator pins
+// an explicit list, sluice asks vtgate for the keyspace's real shard
+// layout. The DSN policy:
 //
 //   - If `vstream_shards` is set: parse it (delegates to
-//     [vstreamShardsFromDSN]).
-//   - If `vstream_auto_discover_shards=true` AND `vstream_shards`
-//     is unset: query the vtgate via [discoverShards] and use that
-//     list.
-//   - If both flags are set: error. They're contradictory and the
-//     operator's intent is ambiguous.
-//   - Default (neither set): the explicit-default path —
-//     ["-"] (PlanetScale's unsharded convention). Backwards-
-//     compatible with every existing caller.
+//     [vstreamShardsFromDSN]). This is the explicit override — pin
+//     the shards, skip the discovery query. Needed for setups where
+//     the layout is known statically or `SHOW VITESS_SHARDS` can't
+//     run (e.g. vttestserver's "0" convention).
+//   - Otherwise (no explicit shards): query the vtgate via
+//     [discoverShards] and use that list. Correct for BOTH an
+//     unsharded keyspace (`SHOW VITESS_SHARDS` returns a single "-",
+//     so the layout is byte-identical to the old ["-"] default) AND a
+//     sharded one (returns every shard, e.g. ["-80","80-"]). Silently
+//     defaulting to ["-"] on a sharded keyspace made the cold-copy
+//     build a keyspace-wide {Shard:"-"} VGTID that vtgate rejects with
+//     FailedPrecondition ("shard provided in VGTID, -, not found"),
+//     copying zero rows — the sharded-source cold-copy bug this
+//     discovery-by-default closes.
+//   - `vstream_auto_discover_shards=true` is now the default behavior;
+//     it is still accepted for back-compat. Setting it AND an explicit
+//     `vstream_shards` is contradictory and errors loudly.
+//
+// Loud failure: discovery returning zero shards is an error, never a
+// silent fall back to ["-"] (that would resurrect the same wrong-layout
+// bug on a keyspace whose shards momentarily can't be read).
 func resolveVStreamShards(ctx context.Context, cfg *gomysql.Config) ([]string, error) {
 	explicit := strings.TrimSpace(cfg.Params["vstream_shards"])
 	autoDiscover := cfg.Params["vstream_auto_discover_shards"] == "true"
@@ -453,10 +472,13 @@ func resolveVStreamShards(ctx context.Context, cfg *gomysql.Config) ([]string, e
 			"mysql/vstream: vstream_shards and vstream_auto_discover_shards=true are mutually exclusive; pick one",
 		)
 	}
-	if !autoDiscover {
+	// Explicit shards win: pin the layout, skip the discovery query.
+	if explicit != "" {
 		return vstreamShardsFromDSN(cfg), nil
 	}
 
+	// Default: discover the real shard layout. Correct for unsharded
+	// (single "-") and sharded (every shard) keyspaces alike.
 	shards, err := discoverShards(ctx, cfg, cfg.DBName)
 	if err != nil {
 		return nil, fmt.Errorf("mysql/vstream: shard auto-discovery: %w", err)
