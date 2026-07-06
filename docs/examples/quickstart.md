@@ -93,15 +93,14 @@ $ sluice migrate \
     --target "postgres://postgres:postgres@localhost:5432/pagila?sslmode=disable" \
     --dry-run
 
-DRY RUN — would migrate mysql → postgres
-  16 tables to create, populate, and constrain:
-    - actor          (4 columns, 2 indexes, 0 foreign keys)
-    - address        (8 columns, 2 indexes, 1 foreign keys)
-    - category       (3 columns, 1 indexes, 0 foreign keys)
-    ...
+time=2026-… level=INFO msg="dry run: migration plan" source=mysql target=postgres tables=16
+time=2026-… level=INFO msg="dry run: table" name=actor
+time=2026-… level=INFO msg="dry run: table" name=address
+time=2026-… level=INFO msg="dry run: table" name=category
+...
 ```
 
-Dry-run reads the source schema and prints what would happen. No writes to the target.
+Dry-run reads the source schema and prints the plan as structured logs — one `dry run: table` line per table — then exits without writing to the target. For a machine-readable plan (for an agent or a script), add `--format json`: instead of the log lines it emits a single JSON envelope, `{"command":"migrate","dry_run":true,"plan":{…}}`.
 
 ### 4c. Apply the migration
 
