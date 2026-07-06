@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.192] - 2026-07-06
+
+### Fixed
+
+- **Pointing the vanilla `mysql` driver at a PlanetScale endpoint now refuses loudly up front (exit 3, `SLUICE-E-DRIVER-HOST-MISMATCH`) instead of failing obscurely partway through a run (UX/foot-gun fix; no data effect; the obscure mid-run failure was present in every prior release).** A `*.connect.psdb.cloud` / `*.private-connect.psdb.cloud` host needs the `planetscale` driver: the vanilla `mysql` flavor uses binlog CDC and `LOAD DATA` cold-copy, both blocked by Vitess/PlanetScale, so `--source-driver mysql` / `--target-driver mysql` against a PlanetScale host previously connected and then failed deep in the run with a confusing low-level error. A new preflight — the optional `ir.DSNValidator` engine surface (modeled on `ir.ShardDiscoverer`), implemented by the mysql engine and consulted for both the source and the target at the very top of migrate and sync — now inspects the DSN host alone, before any reader/writer opens, and the vanilla flavor refuses a PlanetScale host with a role-prefixed coded error naming the host, explaining that binlog CDC and `LOAD DATA` are Vitess-blocked, and hinting `pass --source-driver planetscale` / `pass --target-driver planetscale` (source checked before target). No effect on non-PlanetScale hosts or on the `planetscale`/`vitess` flavors (the correct drivers for that host), and no data-path or format change. Pinned by unit matrices over the mysql `ValidateDSN` (both PSDB suffixes × all three flavors, plus no false positives on normal/garbage/socket/empty DSNs) and over the pipeline preflight (coded refusal, role prefix, source-before-target, no-op without the surface).
+
 ## [0.99.191] - 2026-07-06
 
 ### Fixed
