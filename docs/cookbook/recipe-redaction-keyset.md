@@ -39,9 +39,18 @@ reference a key from the keyset by name via the `key:` rule option.
 
 ```yaml
 # /etc/sluice/keyset.yaml — protect with 0600 permissions.
-keys:
-  email_v1: "base64-of-32-random-bytes-here..."
-  pan_v1: "base64-of-32-random-bytes-here..."
+keyset:
+  keys:
+    - name: email_v1
+      active: 1                    # generation used for NEW surrogates
+      generations:
+        - generation: 1
+          bytes: "base64-of-32-random-bytes-here..."
+    - name: pan_v1
+      active: 1
+      generations:
+        - generation: 1
+          bytes: "base64-of-32-random-bytes-here..."
 ```
 
 ```sh
