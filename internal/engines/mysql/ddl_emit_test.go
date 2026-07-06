@@ -294,6 +294,37 @@ func TestEmitDefault(t *testing.T) {
 			"b'1111000011110000'", true,
 		},
 
+		// BINARY(N) DEFAULT round-trip: a hex-literal default on a
+		// BINARY/VARBINARY column is emitted BARE (`DEFAULT 0x…`), NOT
+		// string-quoted. Quoting it (`'0x3139…'`) lands a 30-char ASCII
+		// string on a 14-byte column and MySQL rejects the DDL with Error
+		// 1067. Pin the CLASS: every width, uppercase/lowercase hex digits,
+		// a NUL-bearing value, VARBINARY sibling — all emit bare.
+		{
+			"binary(14) hex-literal default emitted bare",
+			ir.DefaultExpression{Expr: "0x3139373030313031303030303030", Dialect: hexLiteralDialect},
+			ir.Binary{Length: 14},
+			"0x3139373030313031303030303030", true,
+		},
+		{
+			"varbinary hex-literal default emitted bare",
+			ir.DefaultExpression{Expr: "0x68656C6C6F", Dialect: hexLiteralDialect},
+			ir.Varbinary{Length: 20},
+			"0x68656C6C6F", true,
+		},
+		{
+			"binary hex-literal default with NUL-bearing bytes emitted bare",
+			ir.DefaultExpression{Expr: "0x00FF00FF", Dialect: hexLiteralDialect},
+			ir.Binary{Length: 4},
+			"0x00FF00FF", true,
+		},
+		{
+			"binary hex-literal default lowercase digits emitted bare",
+			ir.DefaultExpression{Expr: "0xdeadbeef", Dialect: hexLiteralDialect},
+			ir.Binary{Length: 4},
+			"0xdeadbeef", true,
+		},
+
 		// PG → MySQL DefaultExpression translation. PG's canonical
 		// "current timestamp" function is now(); MySQL's is
 		// CURRENT_TIMESTAMP. Lookup is case-insensitive after trim.

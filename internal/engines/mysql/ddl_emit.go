@@ -588,6 +588,17 @@ func (m mysqlEmitter) emitDefault(d ir.DefaultValue, t ir.Type) (string, bool) {
 		if v.Dialect == bitLiteralDialect {
 			return v.Expr, true
 		}
+		if v.Dialect == hexLiteralDialect {
+			// Hex-literal default on a BINARY/VARBINARY column (BINARY(N)
+			// DEFAULT round-trip). The reader tags MySQL's stored `0x<hex>`
+			// form; MySQL accepts it BARE (`DEFAULT 0x3139…`) and stores the
+			// byte-exact value — no outer-paren wrap (that path is for
+			// function-call defaults) and, critically, no string quoting
+			// (`'0x3139…'` would land the 30-char ASCII text on a 14-byte
+			// column and MySQL rejects it, Error 1067). Symmetric with the
+			// bit-literal arm above.
+			return v.Expr, true
+		}
 		expr := v.Expr
 		switch v.Dialect {
 		case translatableSourceDialect:

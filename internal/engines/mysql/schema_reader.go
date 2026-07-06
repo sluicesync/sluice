@@ -987,7 +987,83 @@ func translateDefault(def sql.NullString, extra string, typ ir.Type) ir.DefaultV
 		expr := normalizeMySQLExpressionText(def.String)
 		return ir.DefaultExpression{Expr: expr, Dialect: "mysql"}
 	}
+	// Binary-column literal default (Bug: BINARY(N) DEFAULT round-trip).
+	// MySQL 8 reports a BINARY/VARBINARY column's literal default in
+	// information_schema.COLUMN_DEFAULT as a bare hex literal — e.g.
+	// `BINARY(14) NOT NULL DEFAULT '19700101000000'` comes back as
+	// `0x3139373030313031303030303030` (extra is EMPTY — it is a literal,
+	// not a DEFAULT_GENERATED expression). Carried as a plain
+	// ir.DefaultLiteral it would be re-quoted by the writer as the STRING
+	// `'0x3139…'` — a 30-char value on a 14-byte column — and MySQL rejects
+	// the re-emitted DDL with Error 1067 (Invalid default value). Preserve
+	// it as a tagged hex-literal DefaultExpression so the writer renders it
+	// BARE (`DEFAULT 0x3139…`), which MySQL round-trips byte-exactly.
+	//
+	// The recognition is gated on the column being a binary-family type: a
+	// genuine string default whose text happens to look like hex — e.g.
+	// `VARCHAR(20) DEFAULT '0x1234'` — reports the IDENTICAL surface form
+	// `0x1234` in COLUMN_DEFAULT and must stay a quoted string literal. The
+	// column type is the only signal that disambiguates the two. Covers the
+	// whole BINARY/VARBINARY family (any width, NUL-bearing/non-printable
+	// values that MySQL reports as a well-formed `0x…` literal); a value
+	// MySQL itself mangles in information_schema (leading-NUL non-UTF8
+	// defaults report a truncated `0x` with no digits) fails this recogniser
+	// and falls through to the verbatim literal path — a MySQL
+	// information_schema limitation sluice cannot read around.
+	if isBinaryFamilyType(typ) {
+		if hexDef, ok := hexLiteralDefault(def.String); ok {
+			return ir.DefaultExpression{Expr: hexDef, Dialect: hexLiteralDialect}
+		}
+	}
 	return ir.DefaultLiteral{Value: def.String}
+}
+
+// hexLiteralDialect tags a MySQL hex-literal default (`0x<hex>`) on a
+// BINARY/VARBINARY column so the writers' default path renders it bare
+// (MySQL's `DEFAULT 0x…` form) rather than quoting it as a string. Kept
+// distinct from the "mysql" dialect tag: routing a hex literal through the
+// general MySQL→PG expression translator would emit it verbatim, and it is
+// value-neutral (only its surface syntax is MySQL-specific), mirroring the
+// bit-literal precedent.
+const hexLiteralDialect = "hexbytes"
+
+// isBinaryFamilyType reports whether t is a fixed- or variable-width MySQL
+// binary string type (BINARY / VARBINARY). BLOB is excluded — MySQL forbids
+// a DEFAULT on BLOB, so a hex-literal default never arises there.
+func isBinaryFamilyType(t ir.Type) bool {
+	switch t.(type) {
+	case ir.Binary, ir.Varbinary:
+		return true
+	default:
+		return false
+	}
+}
+
+// hexLiteralDefault recognises the bare MySQL hex-literal form
+// `0x<hex-digits>` that information_schema.COLUMN_DEFAULT reports for a
+// BINARY/VARBINARY column's literal default, and returns it verbatim for
+// re-emission. Requires the `0x`/`0X` prefix followed by a non-empty, EVEN
+// number of hex digits (a byte-aligned literal — the only well-formed form
+// MySQL emits). Anything else — including the truncated `0x` MySQL reports
+// for a non-UTF8/leading-NUL default it cannot represent — returns ok=false
+// so the caller falls back to the verbatim literal path.
+func hexLiteralDefault(raw string) (string, bool) {
+	s := strings.TrimSpace(raw)
+	if len(s) < 3 || s[0] != '0' || (s[1] != 'x' && s[1] != 'X') {
+		return "", false
+	}
+	digits := s[2:]
+	if len(digits)%2 != 0 {
+		return "", false
+	}
+	for i := 0; i < len(digits); i++ {
+		c := digits[i]
+		isHex := (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+		if !isHex {
+			return "", false
+		}
+	}
+	return s, true
 }
 
 // bitLiteralDialect tags a bit-literal [ir.DefaultExpression] so the

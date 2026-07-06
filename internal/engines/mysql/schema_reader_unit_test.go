@@ -218,6 +218,64 @@ func TestTranslateDefault_BitAndIntroducer(t *testing.T) {
 			t.Fatalf("got %T; want ir.DefaultNone", got)
 		}
 	})
+
+	// BINARY(N) DEFAULT round-trip: MySQL 8 reports a BINARY/VARBINARY
+	// column's literal default as a bare hex literal (`0x…`, extra EMPTY).
+	// It must become a hexLiteralDialect DefaultExpression so the writer
+	// emits it bare — carried as a plain literal it would re-quote to the
+	// STRING `'0x…'` and MySQL rejects the DDL with Error 1067. Pin the
+	// class: BINARY + VARBINARY, various widths, NUL-bearing/uppercase hex.
+	binaryHexCases := []struct {
+		name string
+		raw  string
+		typ  ir.Type
+	}{
+		{"binary(14) timestamp-string default", "0x3139373030313031303030303030", ir.Binary{Length: 14}},
+		{"varbinary hello default", "0x68656C6C6F", ir.Varbinary{Length: 20}},
+		{"binary NUL-bearing default", "0x00FF00FF", ir.Binary{Length: 4}},
+		{"binary lowercase hex default", "0xdeadbeef", ir.Binary{Length: 4}},
+	}
+	for _, tc := range binaryHexCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := translateDefault(sql.NullString{String: tc.raw, Valid: true}, "", tc.typ)
+			exp, ok := got.(ir.DefaultExpression)
+			if !ok {
+				t.Fatalf("got %T; want ir.DefaultExpression", got)
+			}
+			if exp.Expr != tc.raw || exp.Dialect != hexLiteralDialect {
+				t.Errorf("Expr=%q Dialect=%q; want %q / %q", exp.Expr, exp.Dialect, tc.raw, hexLiteralDialect)
+			}
+		})
+	}
+
+	// Disambiguation: a genuine string default on a CHAR/VARCHAR column
+	// whose text merely LOOKS like hex (`0x1234`) reports the identical
+	// surface form in COLUMN_DEFAULT but MUST stay a quoted string literal
+	// — the column type is the only signal. Also: the truncated `0x` MySQL
+	// reports for a value it can't represent in information_schema must NOT
+	// be treated as a hex literal (no digits → verbatim literal fallback).
+	t.Run("varchar default that looks like hex stays a string literal", func(t *testing.T) {
+		got := translateDefault(sql.NullString{String: "0x1234", Valid: true}, "", ir.Varchar{Length: 20})
+		lit, ok := got.(ir.DefaultLiteral)
+		if !ok {
+			t.Fatalf("got %T; want ir.DefaultLiteral (a VARCHAR '0x1234' is a string, not a hex literal)", got)
+		}
+		if lit.Value != "0x1234" {
+			t.Errorf("Value = %q; want %q", lit.Value, "0x1234")
+		}
+	})
+	t.Run("binary truncated 0x (no digits) falls through to verbatim literal", func(t *testing.T) {
+		got := translateDefault(sql.NullString{String: "0x", Valid: true}, "", ir.Binary{Length: 4})
+		if _, ok := got.(ir.DefaultLiteral); !ok {
+			t.Fatalf("got %T; want ir.DefaultLiteral (malformed 0x is not a hex literal)", got)
+		}
+	})
+	t.Run("binary odd-length hex falls through to verbatim literal", func(t *testing.T) {
+		got := translateDefault(sql.NullString{String: "0xABC", Valid: true}, "", ir.Binary{Length: 4})
+		if _, ok := got.(ir.DefaultLiteral); !ok {
+			t.Fatalf("got %T; want ir.DefaultLiteral (odd-length hex is not byte-aligned)", got)
+		}
+	})
 }
 
 func TestStripMySQLIdentifierQuotes(t *testing.T) {
