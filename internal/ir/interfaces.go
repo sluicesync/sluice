@@ -1197,6 +1197,31 @@ type ShardDiscoverer interface {
 	DiscoverShards(ctx context.Context, dsn string) ([]string, error)
 }
 
+// DSNValidator is the optional surface an [Engine] implements to reject
+// a DSN it can tell — from the DSN string alone, with no connection —
+// is misconfigured for this engine BEFORE any work begins. The
+// orchestrator calls it for the source and the target at the very top
+// of migrate and sync, so a driver/host mismatch fails loudly up front
+// instead of obscurely mid-run.
+//
+// Engines that don't implement it are a silent no-op (the common case).
+// The vanilla MySQL flavor uses it to catch a PlanetScale endpoint
+// (*.connect.psdb.cloud / *.private-connect.psdb.cloud): the vanilla
+// flavor's binlog CDC and LOAD DATA cold-copy are both blocked by
+// Vitess/PlanetScale, so --source-driver / --target-driver mysql
+// against a PlanetScale host fails obscurely partway through the copy —
+// ValidateDSN turns that into an up-front refusal recommending the
+// `planetscale` driver.
+//
+// The returned error is role-AGNOSTIC: ValidateDSN doesn't know whether
+// the DSN it was handed is the source or the target, so it names the
+// host and the reason without naming a flag. The orchestrator prefixes
+// the role ("source"/"target") and the exact --source-driver /
+// --target-driver flag when it surfaces the refusal.
+type DSNValidator interface {
+	ValidateDSN(dsn string) error
+}
+
 // ReshardReopener is the optional surface a [CDCReader] implements to
 // follow a source reshard (a Vitess shard split / merge / MoveTables)
 // without losing or duplicating events across the seam (ADR-0094).

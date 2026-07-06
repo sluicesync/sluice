@@ -553,6 +553,15 @@ func (m *Migrator) Run(ctx context.Context) error {
 		return err
 	}
 
+	// Driver/host mismatch pre-flight — runs before any reader/writer is
+	// opened (it only needs the engines + DSNs). Refuses e.g. the vanilla
+	// mysql driver pointed at a PlanetScale host, naming the
+	// --source-driver / --target-driver flag to fix. No-op for engines
+	// without ir.DSNValidator.
+	if err := preflightDSNValidation(m.Source, m.SourceDSN, m.Target, m.TargetDSN); err != nil {
+		return err
+	}
+
 	// Multi-database fan-out (ADR-0074). When any database-scope flag is
 	// set, resolve the database set and run a per-database snapshot loop;
 	// each iteration re-opens a single-database reader/writer (a DSN

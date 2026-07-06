@@ -638,6 +638,35 @@ func (e Engine) DiscoverShards(ctx context.Context, dsn string) ([]string, error
 	return discoverShards(ctx, cfg, cfg.DBName)
 }
 
+// ValidateDSN implements [ir.DSNValidator]: it refuses, from the DSN
+// string alone (no connection), a DSN this flavor cannot faithfully
+// drive. The one such case today is the vanilla MySQL flavor pointed
+// at a PlanetScale endpoint (*.connect.psdb.cloud): the vanilla flavor
+// uses binlog CDC and LOAD DATA cold-copy, both of which Vitess blocks,
+// so the run would otherwise fail obscurely partway through — the
+// operator wants the `planetscale` driver for a PlanetScale host.
+//
+// The VStream flavors (planetscale / vitess) correctly drive such a
+// host and are a no-op here. The error is role-AGNOSTIC — ValidateDSN
+// doesn't know whether this DSN is the source or the target — so it
+// names the host and the reason; the pipeline supplies the role and
+// the exact --source-driver / --target-driver flag.
+func (e Engine) ValidateDSN(dsn string) error {
+	if e.Flavor.usesVStream() {
+		return nil
+	}
+	host, ok := planetScaleMySQLHost(dsn)
+	if !ok {
+		return nil
+	}
+	return fmt.Errorf(
+		"the DSN host %q is a PlanetScale endpoint, which the vanilla mysql flavor cannot drive: "+
+			"it uses binlog CDC and LOAD DATA cold-copy, both blocked by Vitess/PlanetScale — "+
+			"use the planetscale driver for this host instead",
+		host,
+	)
+}
+
 // planetScaleMySQLHostSuffixes is the closed set of DNS suffixes
 // PlanetScale's MySQL service uses today. Lowercase comparison; the
 // wider PSDB platform may add suffixes (region-specific shards,
@@ -648,31 +677,39 @@ var planetScaleMySQLHostSuffixes = []string{
 	".private-connect.psdb.cloud",
 }
 
-// isPlanetScaleMySQLHost reports whether dsn parses to a hostname
-// matching one of the documented PlanetScale MySQL endpoint
-// suffixes. Returns false on parse failure or non-host DSN forms
-// (Unix socket, etc.) — those configurations don't match PSDB by
-// construction. Lowercases the host before matching: PSDB hostnames
-// are case-insensitive and operators sometimes paste mixed-case.
-func isPlanetScaleMySQLHost(dsn string) bool {
+// planetScaleMySQLHost reports whether dsn parses to a hostname matching
+// one of the documented PlanetScale MySQL endpoint suffixes, returning
+// the matched (lowercased) host so callers can name it. Returns
+// ("", false) on parse failure or non-host DSN forms (Unix socket,
+// etc.) — those configurations don't match PSDB by construction. The
+// host is lowercased before matching: PSDB hostnames are
+// case-insensitive and operators sometimes paste mixed-case.
+func planetScaleMySQLHost(dsn string) (string, bool) {
 	if dsn == "" {
-		return false
+		return "", false
 	}
 	cfg, err := parseDSN(dsn)
 	if err != nil {
-		return false
+		return "", false
 	}
 	host, _, err := hostPortFromAddr(cfg.Addr)
 	if err != nil {
-		return false
+		return "", false
 	}
 	host = strings.ToLower(host)
 	for _, suffix := range planetScaleMySQLHostSuffixes {
 		if strings.HasSuffix(host, suffix) {
-			return true
+			return host, true
 		}
 	}
-	return false
+	return "", false
+}
+
+// isPlanetScaleMySQLHost reports whether dsn is a PlanetScale MySQL
+// endpoint (see [planetScaleMySQLHost]).
+func isPlanetScaleMySQLHost(dsn string) bool {
+	_, ok := planetScaleMySQLHost(dsn)
+	return ok
 }
 
 // init registers each supported flavor under its own name in the

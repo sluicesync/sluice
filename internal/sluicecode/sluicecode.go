@@ -61,6 +61,7 @@ const (
 	CodeValueNULByte              Code = "SLUICE-E-VALUE-NUL-BYTE"
 	CodeExprBackslashLiteral      Code = "SLUICE-E-EXPR-BACKSLASH-LITERAL"
 	CodeConfirmationRequired      Code = "SLUICE-E-CONFIRMATION-REQUIRED"
+	CodeDriverHostMismatch        Code = "SLUICE-E-DRIVER-HOST-MISMATCH"
 )
 
 // Class partitions codes by how the process should exit when the
@@ -107,6 +108,7 @@ var registry = map[Code]Info{
 	CodeValueNULByte:              {ClassRefusal, "string value carries a NUL byte PostgreSQL text types cannot store"},
 	CodeExprBackslashLiteral:      {ClassRefusal, "SQLite expression string literal with a backslash has no faithful MySQL spelling"},
 	CodeConfirmationRequired:      {ClassRefusal, "destructive operation requires explicit --yes confirmation"},
+	CodeDriverHostMismatch:        {ClassRefusal, "the driver cannot drive the DSN's host (e.g. mysql pointed at a PlanetScale endpoint)"},
 }
 
 // Describe returns the registry metadata for c, and whether c is a

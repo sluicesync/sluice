@@ -29,6 +29,7 @@ Codes are minted only for errors that already carry an operator hint or a named 
 | `SLUICE-E-VALUE-NUL-BYTE` | refusal | A string value carries a NUL byte (0x00), which PostgreSQL text types cannot store. | Clean the source data, or map the column to bytea with `--type-override COL=bytea`. |
 | `SLUICE-E-EXPR-BACKSLASH-LITERAL` | refusal | A SQLite expression's string literal contains a backslash (or a double-quoted token), which MySQL would silently reinterpret under its default sql_mode. | Rewrite the expression on the SQLite source, or re-create it on the MySQL target post-migration. |
 | `SLUICE-E-CONFIRMATION-REQUIRED` | refusal | A destructive command was run without `--yes`. sluice is non-interactive and never prompts, so it refuses loudly instead of blocking on a prompt (`slot drop` is the current caller). | Re-run with `--yes` (or `-y`) to confirm the destructive operation. |
+| `SLUICE-E-DRIVER-HOST-MISMATCH` | refusal | The chosen driver cannot drive the DSN's host — today: the vanilla `mysql` driver pointed at a PlanetScale endpoint (`*.connect.psdb.cloud`), whose binlog CDC and `LOAD DATA` cold-copy Vitess blocks. Caught up front, before any connection. | Pass `--source-driver planetscale` / `--target-driver planetscale` for the PlanetScale endpoint. |
 
 The class column drives the exit code: a terminal `refusal` exits 3, a terminal `runtime` code exits 1 like any other failure — the code is still in the log record either way.
 

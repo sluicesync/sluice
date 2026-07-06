@@ -1154,6 +1154,15 @@ type Streamer struct {
 // Resources (snapshot stream, target writers, applier) are
 // released by each [runOnce] iteration regardless of outcome.
 func (s *Streamer) Run(ctx context.Context) error {
+	// Driver/host mismatch pre-flight — runs once here (the DSNs can't
+	// change between retry attempts) and before any reader/writer is
+	// opened. Refuses e.g. the vanilla mysql driver pointed at a
+	// PlanetScale host, naming the --source-driver / --target-driver flag
+	// to fix. No-op for engines without ir.DSNValidator.
+	if err := preflightDSNValidation(s.Source, s.SourceDSN, s.Target, s.TargetDSN); err != nil {
+		return err
+	}
+
 	// GitHub #18 Phase 2: static safety-rail. Warn (don't refuse)
 	// when an operator combination is known to hit Vitess's 20s
 	// tx-killer under sustained load. The threshold matches the
