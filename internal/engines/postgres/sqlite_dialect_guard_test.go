@@ -129,6 +129,39 @@ func TestWriterDialectGuard_DefaultExpr_PG(t *testing.T) {
 	}
 }
 
+// TestTranslateDefaultExpr_HexLiteralBytea pins the BINARY/VARBINARY DEFAULT
+// round-trip on the PG side: MySQL's stored `0x<hex>` form (dialect "hexbytes")
+// renders as a PG BYTEA hex literal `'\x<hex>'::bytea` — byte-exact, never the
+// leaked `0x…` MySQL spelling PG can't parse as bytea. Covers the class:
+//
+//   - exact-width fixed BINARY(14) → unchanged payload;
+//   - VARBINARY (Length carried, but width-agnostic on storage) → NEVER padded;
+//   - NUL-padded shorter-than-width BINARY(8): MySQL reports the UNpadded
+//     literal `0x6162` but stores 8 bytes, so the writer must zero-fill to the
+//     declared width — the load-bearing cross-engine fidelity case a
+//     width-agnostic BYTEA can't re-pad at INSERT time.
+func TestTranslateDefaultExpr_HexLiteralBytea(t *testing.T) {
+	opts := emitOpts{}
+	for _, tc := range []struct {
+		name string
+		typ  ir.Type
+		in   string
+		want string
+	}{
+		{"binary_exact", ir.Binary{Length: 14}, "0x3139373030313031303030303030", `'\x3139373030313031303030303030'::bytea`},
+		{"varbinary_unpadded", ir.Varbinary{Length: 20}, "0x68656c6c6f", `'\x68656c6c6f'::bytea`},
+		{"binary_nul_padded", ir.Binary{Length: 8}, "0x6162", `'\x6162000000000000'::bytea`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			col := &ir.Column{Name: "c", Type: tc.typ}
+			got, ok := translateDefaultExpr(nil, col, ir.DefaultExpression{Expr: tc.in, Dialect: hexLiteralDialect}, opts)
+			if !ok || got != tc.want {
+				t.Errorf("hex-literal default %q on %s = (%q, %v); want (%q, true)", tc.in, tc.typ, got, ok, tc.want)
+			}
+		})
+	}
+}
+
 // TestWriterDialectGuard_DefaultExpr_SQLite pins the SQLite DEFAULT dispatch
 // (Chunk A + the ADR-0133 translator): portable "current instant" spellings
 // translate to PG keywords, the portable general subset translates through

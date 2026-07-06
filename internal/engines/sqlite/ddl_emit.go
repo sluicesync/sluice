@@ -163,7 +163,7 @@ func emitColumnDef(c *ir.Column, inlinePK bool) (string, error) {
 	if !c.Nullable && !inlinePK {
 		sb.WriteString(" NOT NULL")
 	}
-	if dflt, ok := emitDefault(c.Default); ok {
+	if dflt, ok := emitDefault(c.Default, c.Type); ok {
 		sb.WriteString(" DEFAULT ")
 		sb.WriteString(dflt)
 	}
@@ -176,7 +176,7 @@ func emitColumnDef(c *ir.Column, inlinePK bool) (string, error) {
 // literal); an expression emits verbatim in its source dialect (a
 // non-portable function fails loudly at CREATE TABLE). Defaults affect
 // only post-migration inserts, never the explicit-value migrated rows.
-func emitDefault(d ir.DefaultValue) (string, bool) {
+func emitDefault(d ir.DefaultValue, colType ir.Type) (string, bool) {
 	switch v := d.(type) {
 	case nil, ir.DefaultNone:
 		return "", false
@@ -186,9 +186,85 @@ func emitDefault(d ir.DefaultValue) (string, bool) {
 		if v.Expr == "" {
 			return "", false
 		}
+		if v.Dialect == hexLiteralDialect {
+			// Hex-literal default on a BINARY/VARBINARY column (BINARY(N)
+			// DEFAULT round-trip, SQLite side). The MySQL reader tags the
+			// stored `0x<hex>` form (the raw source bytes); the SQLite target
+			// type is BLOB (BINARY/VARBINARY → BLOB, emitColumnType), whose
+			// literal is `X'<hex>'`. Value is identical — only the surface
+			// syntax differs. It is critical NOT to take the generic
+			// wrapSQLiteExpressionDefault path here: that emits `(0x<hex>)`,
+			// which SQLite parses as an INTEGER (overflowing for any
+			// multi-byte value), silently landing a wrong default.
+			//
+			// FIXED-width BINARY(N) is NUL-padded to N bytes: MySQL reports
+			// the UNpadded literal but STORES it right-padded (a same-engine
+			// MySQL target re-pads on INSERT); a width-agnostic SQLite BLOB
+			// cannot re-pad, so the zero-fill is baked into the literal here.
+			// VARBINARY (padBytes 0) is stored as-written, never padded.
+			//
+			// Anything not in the expected `0x…` shape falls through to the
+			// wrap path (loud failure on target beats a silent guess) — the
+			// reader's hexLiteralDefault already validated the digits.
+			if lit, ok := sqliteBlobHexLiteral(v.Expr, binaryPadBytes(colType)); ok {
+				return lit, true
+			}
+		}
 		return wrapSQLiteExpressionDefault(v.Expr), true
 	}
 	return "", false
+}
+
+// hexLiteralDialect mirrors the MySQL reader's hex-literal dialect tag
+// (mysql.hexLiteralDialect). Package-local copy: engine packages are peers,
+// wired only through the IR + registry, so the SQLite writer can't import the
+// mysql package; the IR's DefaultExpression dialect tag is the cross-package
+// contract and this constant names the value the SQLite writer recognises on
+// it. Tags a MySQL BINARY/VARBINARY hex-literal DEFAULT (`0x<hex>`) so the
+// DEFAULT path renders it as a SQLite BLOB literal `X'<hex>'` rather than the
+// generic `(0x…)` wrap, which SQLite would parse as an overflowing integer.
+const hexLiteralDialect = "hexbytes"
+
+// sqliteBlobHexLiteral converts a MySQL hex-literal default `0x<hex>` (as the
+// reader tags it) into the SQLite BLOB literal `X'<hex>'`, right-padding the
+// payload with NUL bytes to padBytes when the column is a FIXED-width BINARY
+// (padBytes>0; 0 = VARBINARY / no padding). The `0x`/`0X` prefix is stripped
+// and the remaining digits — already validated even-length hex by the
+// reader's hexLiteralDefault — are wrapped in `X'…'`. Returns ok=false for a
+// payload lacking the `0x` prefix (the caller then falls to the generic wrap
+// path, failing loudly rather than guessing). A blob literal is a bare SQLite
+// DEFAULT literal (no surrounding parens needed).
+func sqliteBlobHexLiteral(hexExpr string, padBytes int) (string, bool) {
+	s := strings.TrimSpace(hexExpr)
+	if len(s) < 2 || s[0] != '0' || (s[1] != 'x' && s[1] != 'X') {
+		return "", false
+	}
+	return "X'" + padBinaryHex(s[2:], padBytes) + "'", true
+}
+
+// binaryPadBytes returns the fixed-width byte count a hex-literal default must
+// be NUL-padded to for column type t: the declared width of a fixed
+// ir.Binary(N), or 0 for ir.Varbinary (and anything else) — VARBINARY is
+// stored as-written, never zero-filled. See sqliteBlobHexLiteral for why the
+// zero-fill has to be baked into the cross-engine literal.
+func binaryPadBytes(t ir.Type) int {
+	if b, ok := t.(ir.Binary); ok {
+		return b.Length
+	}
+	return 0
+}
+
+// padBinaryHex right-pads a hex-digit payload with trailing "00" byte-pairs to
+// padBytes bytes (2*padBytes hex digits), reproducing MySQL's BINARY(N)
+// zero-fill on a width-agnostic target. A payload already at or beyond the
+// target width is returned unchanged (defensive — MySQL never reports a
+// default wider than the column). padBytes<=0 (VARBINARY) is a no-op.
+func padBinaryHex(digits string, padBytes int) string {
+	want := padBytes * 2
+	if want <= len(digits) {
+		return digits
+	}
+	return digits + strings.Repeat("0", want-len(digits))
 }
 
 // wrapSQLiteExpressionDefault re-parenthesises an expression DEFAULT body.

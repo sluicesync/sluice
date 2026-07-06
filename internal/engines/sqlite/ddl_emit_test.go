@@ -224,6 +224,41 @@ func TestWrapSQLiteExpressionDefault(t *testing.T) {
 	}
 }
 
+// TestEmitDefault_HexLiteralBlob pins the BINARY/VARBINARY DEFAULT round-trip
+// on the SQLite side: a hexLiteralDialect-tagged `0x<hex>` default (the MySQL
+// reader's tag) renders as a SQLite BLOB literal `X'<hex>'`, NOT the generic
+// `(0x…)` wrap — which SQLite parses as an overflowing integer, silently
+// landing a wrong default. Covers the class:
+//
+//   - exact-width fixed BINARY(14) → unchanged payload;
+//   - VARBINARY → NEVER padded (width-agnostic on storage);
+//   - NUL-padded shorter-than-width BINARY(8): MySQL reports the UNpadded
+//     literal `0x6162` but stores 8 bytes, so the writer zero-fills to the
+//     declared width — a width-agnostic BLOB can't re-pad at INSERT time.
+func TestEmitDefault_HexLiteralBlob(t *testing.T) {
+	cases := []struct {
+		name string
+		typ  ir.Type
+		in   string
+		want string
+	}{
+		{"binary_exact", ir.Binary{Length: 14}, "0x3139373030313031303030303030", `X'3139373030313031303030303030'`},
+		{"varbinary_unpadded", ir.Varbinary{Length: 20}, "0x68656c6c6f", `X'68656c6c6f'`},
+		{"binary_nul_padded", ir.Binary{Length: 8}, "0x6162", `X'6162000000000000'`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := emitDefault(ir.DefaultExpression{Expr: tc.in, Dialect: hexLiteralDialect}, tc.typ)
+			if !ok {
+				t.Fatalf("emitDefault(%q) ok=false; want it emitted", tc.in)
+			}
+			if got != tc.want {
+				t.Errorf("emitDefault(%q) on %s = %q; want %q (BLOB literal, not (0x…) integer wrap)", tc.in, tc.typ, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestQuoteSQLString_BackslashDeliberatelyNotEscaped is the SEC-1b
 // reverse-direction pin (MySQL-source backslash-bearing literals → SQLite
 // target). SQLite's quoteSQLString doubles ONLY the interior single quote; it

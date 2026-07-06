@@ -424,6 +424,34 @@ func translateDefaultExpr(table *ir.Table, c *ir.Column, d ir.DefaultExpression,
 		}
 		return d.Expr, true
 	}
+	if d.Dialect == hexLiteralDialect {
+		// Hex-literal default on a BINARY/VARBINARY column (BINARY(N) DEFAULT
+		// round-trip, PG side). The MySQL reader tags the stored `0x<hex>`
+		// form (the raw source bytes); the cross-engine PG column type is
+		// BYTEA (BINARY/VARBINARY → BYTEA, emitColumnType above), whose
+		// hex-format input literal is `'\x<hex>'::bytea`. Value is identical
+		// — only the surface syntax differs from MySQL's bare `0x…` form.
+		// Emitting `0x…` verbatim would fail on PG (`0x…` is an integer, not
+		// bytea, and only parses at all on PG 16+).
+		//
+		// FIXED-width BINARY(N) needs NUL-padding to N bytes: MySQL reports
+		// the UNpadded default literal (`0x6162` for BINARY(8) DEFAULT 'ab')
+		// but STORES it right-padded to N bytes (`0x6162000000000000`), and a
+		// same-engine MySQL target re-pads on INSERT. PG BYTEA is
+		// width-agnostic and cannot re-pad, so the writer must bake the
+		// zero-fill into the literal — otherwise a DEFAULT-only row lands 2
+		// bytes on PG vs 8 on MySQL (silent divergence). VARBINARY (padBytes
+		// 0) is never padded — MySQL stores it as-written.
+		//
+		// Anything not in the expected `0x…` shape falls through verbatim
+		// (loud failure on target beats a silent guess) — hexLiteralDefault
+		// already validated the digits at the read boundary. Symmetric with
+		// the bit-literal arm.
+		if lit, ok := pgByteaHexLiteral(d.Expr, binaryPadBytes(c.Type)); ok {
+			return lit, true
+		}
+		return d.Expr, true
+	}
 	// SQLite-source DEFAULT (D1/SQLite migration robustness, Chunk A). A
 	// small, well-known set of portable SQLite "current instant" spellings
 	// (datetime('now'), CURRENT_TIMESTAMP, …) translate to the matching PG
@@ -519,6 +547,62 @@ func translateDefaultExpr(table *ir.Table, c *ir.Column, d ir.DefaultExpression,
 // dialect tag is the cross-package contract; this constant names the
 // value the PG writer recognises on it (catalog Bug 62).
 const bitLiteralDialect = "bit"
+
+// hexLiteralDialect mirrors the MySQL reader's hex-literal dialect tag
+// (mysql.hexLiteralDialect). Package-local copy — same rationale as
+// bitLiteralDialect: engine packages are peers, wired only through the IR +
+// registry, so the PG writer can't import the mysql package; the IR's
+// DefaultExpression dialect tag is the cross-package contract and this
+// constant names the value the PG writer recognises on it. Tags a MySQL
+// BINARY/VARBINARY hex-literal DEFAULT (`0x<hex>`) so the DEFAULT path
+// renders it as a PG BYTEA hex literal instead of leaking the MySQL `0x…`
+// spelling (which PG can't parse as bytea).
+const hexLiteralDialect = "hexbytes"
+
+// pgByteaHexLiteral converts a MySQL hex-literal default `0x<hex>` (as the
+// reader tags it) into the PG BYTEA hex-format literal `'\x<hex>'::bytea`,
+// right-padding the payload with NUL bytes to padBytes when the column is a
+// FIXED-width BINARY (padBytes>0; 0 = VARBINARY / no padding). The `0x`/`0X`
+// prefix is stripped and the remaining digits — already validated even-length
+// hex by the reader's hexLiteralDefault — are wrapped in PG's `\x`-prefixed
+// bytea input syntax with an explicit `::bytea` cast so the literal is
+// unambiguous in any DEFAULT context. Returns ok=false for a payload lacking
+// the `0x` prefix (the caller then emits verbatim, failing loudly on the
+// target rather than guessing). standard_conforming_strings (on by default
+// since PG 9.1) keeps the backslash literal, so no escape-string (E-prefixed)
+// form is needed — the bytea input function receives the raw `\x<hex>` string.
+func pgByteaHexLiteral(hexExpr string, padBytes int) (string, bool) {
+	s := strings.TrimSpace(hexExpr)
+	if len(s) < 2 || s[0] != '0' || (s[1] != 'x' && s[1] != 'X') {
+		return "", false
+	}
+	return `'\x` + padBinaryHex(s[2:], padBytes) + `'::bytea`, true
+}
+
+// binaryPadBytes returns the fixed-width byte count a hex-literal default must
+// be NUL-padded to for column type t: the declared width of a fixed
+// ir.Binary(N), or 0 for ir.Varbinary (and anything else) — VARBINARY is
+// stored as-written, never zero-filled. See pgByteaHexLiteral for why the
+// zero-fill has to be baked into the cross-engine literal.
+func binaryPadBytes(t ir.Type) int {
+	if b, ok := t.(ir.Binary); ok {
+		return b.Length
+	}
+	return 0
+}
+
+// padBinaryHex right-pads a hex-digit payload with trailing "00" byte-pairs to
+// padBytes bytes (2*padBytes hex digits), reproducing MySQL's BINARY(N)
+// zero-fill on a width-agnostic target. A payload already at or beyond the
+// target width is returned unchanged (defensive — MySQL never reports a
+// default wider than the column). padBytes<=0 (VARBINARY) is a no-op.
+func padBinaryHex(digits string, padBytes int) string {
+	want := padBytes * 2
+	if want <= len(digits) {
+		return digits
+	}
+	return digits + strings.Repeat("0", want-len(digits))
+}
 
 // setDefaultToArrayLiteral converts a MySQL-style comma-separated
 // SET default ("a,b" or "" for the empty default) to a Postgres
