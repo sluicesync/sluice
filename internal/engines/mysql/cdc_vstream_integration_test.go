@@ -753,22 +753,24 @@ func TestVStream_VTTestServer_MultiShard(t *testing.T) {
 		}
 	}()
 
-	// Confirm auto-discovery populated both shards. The reader
-	// exposes its shard list as the unexported `shards` field; we
-	// assert via the typed pointer the engine returns.
 	cdcRdr, ok := rdr.(*vstreamCDCReader)
 	if !ok {
 		t.Fatalf("OpenCDCReader returned %T; want *vstreamCDCReader", rdr)
 	}
-	if len(cdcRdr.shards) != 2 {
-		t.Fatalf("auto-discovered shards = %v; want 2 entries (-80, 80-)", cdcRdr.shards)
-	}
-	t.Logf("auto-discovered shards for keyspace %q: %v", keyspace, cdcRdr.shards)
 
 	changes, err := rdr.StreamChanges(ctx, ir.Position{})
 	if err != nil {
 		t.Fatalf("StreamChanges: %v", err)
 	}
+
+	// Confirm auto-discovery populated both shards. Discovery is deferred to
+	// StreamChanges (reader construction is deliberately connection-free), so
+	// assert the shard list AFTER opening the stream — the reader exposes it
+	// as the unexported `shards` field, read via the typed pointer.
+	if len(cdcRdr.shards) != 2 {
+		t.Fatalf("auto-discovered shards = %v; want 2 entries (-80, 80-)", cdcRdr.shards)
+	}
+	t.Logf("auto-discovered shards for keyspace %q: %v", keyspace, cdcRdr.shards)
 
 	time.Sleep(3 * time.Second)
 
