@@ -4,6 +4,7 @@
 package mysql
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -120,8 +121,26 @@ func classifyReaderError(err error) error {
 	// (errors.As, so the pump's `recv: %w` wrap resolves) — a real
 	// gRPC status. A non-gRPC error yields ok=false and falls through
 	// to the SQL classifier; it is NOT misread as codes.Unknown.
-	if st, ok := status.FromError(err); ok && isRetriableGRPCCode(st.Code()) {
-		return &retriableMySQLError{err: err}
+	if st, ok := status.FromError(err); ok {
+		switch st.Code() {
+		case codes.Canceled, codes.DeadlineExceeded:
+			// The source VStream being torn down on an operator `sync stop`
+			// (or a Ctrl-C / outer-ctx cancel) surfaces from Recv as a gRPC
+			// Canceled / DeadlineExceeded status — NOT a fault. Normalize it
+			// to the standard context sentinel so the engine-neutral streamer's
+			// errors.Is(context.Canceled) ctx-termination check recognizes it
+			// as a clean stop. Without this the raw gRPC status is treated as
+			// terminal: the stop-flag clear is skipped and `sync stop --wait`
+			// reports a false drain timeout even though the stream did stop.
+			// The original status stays on the chain (%w) for diagnostics.
+			if st.Code() == codes.DeadlineExceeded {
+				return fmt.Errorf("source vstream deadline exceeded: %w (%w)", context.DeadlineExceeded, err)
+			}
+			return fmt.Errorf("source vstream cancelled: %w (%w)", context.Canceled, err)
+		}
+		if isRetriableGRPCCode(st.Code()) {
+			return &retriableMySQLError{err: err}
+		}
 	}
 	return classifyApplierError(err)
 }

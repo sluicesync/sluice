@@ -509,10 +509,18 @@ func discoverShards(ctx context.Context, cfg *gomysql.Config, keyspace string) (
 	}
 	defer func() { _ = db.Close() }()
 
-	pattern := keyspace + "/%"
-	rows, err := db.QueryContext(ctx, "SHOW VITESS_SHARDS LIKE ?", pattern)
+	// Read the full shard list with a plain, parameterless `SHOW VITESS_SHARDS`
+	// and filter to our keyspace client-side (below). We deliberately do NOT
+	// use a `LIKE` filter: `SHOW VITESS_SHARDS LIKE ?` reaches vtgate as a
+	// `:v1` bind variable it cannot parse ("syntax error ... near ':v1'"),
+	// which made shard discovery fail and forced operators to pass
+	// --allow-cross-shard-merge on ordinary *unsharded* PlanetScale databases.
+	// A plain SHOW takes no parameter, so there is nothing for vtgate to choke
+	// on; an unsharded keyspace returns a single `<keyspace>/-` row.
+	const shardsStmt = "SHOW VITESS_SHARDS"
+	rows, err := db.QueryContext(ctx, shardsStmt)
 	if err != nil {
-		return nil, fmt.Errorf("SHOW VITESS_SHARDS LIKE %q: %w", pattern, err)
+		return nil, fmt.Errorf("%s: %w", shardsStmt, err)
 	}
 	defer func() { _ = rows.Close() }()
 
@@ -531,9 +539,11 @@ func discoverShards(ctx context.Context, cfg *gomysql.Config, keyspace string) (
 		}
 		ks, shard := ksShard[:idx], ksShard[idx+1:]
 		if ks != keyspace {
-			// Defensive: the LIKE filter should have constrained
-			// keyspace, but a vtgate quirk could surface a foreign
-			// row; skip rather than fold it into our shard list.
+			// `SHOW VITESS_SHARDS` returns every keyspace the vtgate
+			// serves; keep only the rows for our keyspace. (A PlanetScale
+			// vtgate usually serves one, but self-hosted Vitess can serve
+			// several — this is the primary keyspace filter, not a
+			// backstop.)
 			continue
 		}
 		if shard != "" {

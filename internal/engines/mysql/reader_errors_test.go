@@ -4,6 +4,7 @@
 package mysql
 
 import (
+	"context"
 	"database/sql/driver"
 	"errors"
 	"fmt"
@@ -246,6 +247,45 @@ func TestClassifyReaderError_GRPCStatusCodes(t *testing.T) {
 			// still works from the consumer side.
 			if st, ok := status.FromError(got); !ok || st.Code() != c.code {
 				t.Errorf("classifyReaderError(grpc %s) lost the underlying status (ok=%v code=%v)", c.code, ok, st.Code())
+			}
+		})
+	}
+}
+
+// A VStream teardown on an operator `sync stop` (or Ctrl-C / outer-ctx cancel)
+// surfaces from Recv as a gRPC Canceled / DeadlineExceeded status. The reader
+// classifier normalizes those to the standard context sentinels so the
+// engine-neutral streamer's errors.Is(context.Canceled) ctx-termination check
+// recognizes the clean stop and completes the `sync stop --wait` drain
+// handshake — rather than treating the raw gRPC status as terminal, which left
+// stop_requested_at set and produced a FALSE drain timeout. NOT retriable (a
+// cancel is intentional, not transient); the original status stays reachable.
+func TestClassifyReaderError_CancellationNormalized(t *testing.T) {
+	cases := []struct {
+		name     string
+		code     codes.Code
+		sentinel error
+	}{
+		{"Canceled -> context.Canceled", codes.Canceled, context.Canceled},
+		{"DeadlineExceeded -> context.DeadlineExceeded", codes.DeadlineExceeded, context.DeadlineExceeded},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			raw := status.Error(c.code, "context canceled")
+			wrapped := fmt.Errorf("mysql/vstream: recv: %w", raw)
+
+			got := classifyReaderError(wrapped)
+			if !errors.Is(got, c.sentinel) {
+				t.Errorf("classifyReaderError(grpc %s): errors.Is(%v)=false; the streamer won't recognize the clean stop", c.code, c.sentinel)
+			}
+			var re ir.RetriableError
+			if errors.As(got, &re) {
+				t.Errorf("classifyReaderError(grpc %s) was classified retriable; a cancel is intentional, not a transient", c.code)
+			}
+			// The underlying gRPC status stays on the chain for diagnostics.
+			if st, ok := status.FromError(got); !ok || st.Code() != c.code {
+				t.Errorf("classifyReaderError(grpc %s) lost the underlying status (ok=%v)", c.code, ok)
 			}
 		})
 	}
