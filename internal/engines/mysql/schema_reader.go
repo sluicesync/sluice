@@ -269,9 +269,9 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 	// Binary-family columns whose literal default information_schema reports
 	// as a hex literal (`0x…`) get a second, authoritative read from SHOW
 	// CREATE TABLE after the scan — information_schema C-string-truncates any
-	// such default at its first NUL byte (see recoverBinaryLiteralDefaults).
+	// such default at its first NUL byte (see recoverFromShowCreate).
 	// Collected here so the recovery runs one SHOW CREATE per affected table,
-	// not per column.
+	// not per column (and shares that fetch with table-comment recovery).
 	var pending []pendingBinaryDefault
 
 	for rows.Next() {
@@ -336,7 +336,10 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	return r.recoverBinaryLiteralDefaults(ctx, pending)
+	// One SHOW CREATE pass recovers BOTH the NUL-truncated binary defaults
+	// collected above AND any NUL-truncated table comments (set in
+	// readTables) — a table needing either is re-read exactly once.
+	return r.recoverFromShowCreate(ctx, tables, pending)
 }
 
 // populateIndexes fills in Index lists for each table, separating the
@@ -1026,7 +1029,7 @@ func translateDefault(def sql.NullString, extra string, typ ir.Type) ir.DefaultV
 	// well-formed but SHORT literal, e.g. 0x2700 → `0x27`). populateColumns
 	// re-reads any such column's true bytes from SHOW CREATE TABLE and
 	// overwrites this value — see binaryLiteralDefaultNeedsRecovery /
-	// recoverBinaryLiteralDefaults (Finding C). translateDefault itself stays
+	// recoverFromShowCreate (Finding C). translateDefault itself stays
 	// pure (no DB handle) and is exercised directly by the reader unit tests.
 	if isBinaryFamilyType(typ) {
 		if hexDef, ok := hexLiteralDefault(def.String); ok {

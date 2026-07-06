@@ -13,9 +13,25 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
-// Binary column-default recovery — working around a MySQL
-// information_schema limitation (Finding C, the silent-loss residue of the
-// v0.99.186 BINARY-default fix).
+// SHOW CREATE TABLE recovery — working around two MySQL information_schema
+// lossy-read limitations that both need the authoritative CREATE TABLE text:
+//
+//   - BINARY/VARBINARY column literal defaults (Finding C, the silent-loss
+//     residue of the v0.99.186 BINARY-default fix), detailed below.
+//   - the table-level COMMENT (readTables): information_schema.tables
+//     .TABLE_COMMENT C-string-truncates at the first NUL byte exactly like
+//     COLUMN_DEFAULT, so a comment carrying a 0x00 is read short. (COLUMN_COMMENT
+//     does NOT truncate — only TABLE_COMMENT — so column comments are left
+//     alone.) Recovered by parsing the `COMMENT='…'` clause out of SHOW CREATE.
+//
+// recoverFromShowCreate runs a SINGLE SHOW CREATE per affected table (cached),
+// recovering both a table's binary defaults and its comment in one fetch so a
+// table needing either — or both — is read exactly once. A table with no binary
+// default to recover AND an empty information_schema comment is skipped entirely
+// (the common case), so the extra query cost is one SHOW CREATE per table that
+// actually carries a binary default or a non-empty comment.
+//
+// Binary column-default recovery specifics:
 //
 // MySQL's information_schema.COLUMN_DEFAULT is a text column, and MySQL
 // C-string-truncates a BINARY/VARBINARY column's literal default at its
@@ -95,58 +111,98 @@ func hasHexLiteralPrefix(s string) bool {
 	return len(s) >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')
 }
 
-// recoverBinaryLiteralDefaults re-reads each pending column's true default
-// bytes from SHOW CREATE TABLE (once per table, cached) and overwrites the
-// column's provisional Default with a byte-exact hexLiteralDialect
-// DefaultExpression. A column whose default cannot be recovered or parsed is
-// dropped with a loud WARN (loud-failure tenet — a wrong default is silent
-// corruption; a missing default is not).
-func (r *SchemaReader) recoverBinaryLiteralDefaults(ctx context.Context, pending []pendingBinaryDefault) error {
-	if len(pending) == 0 {
-		return nil
-	}
-	ddlByTable := map[string]string{}
-	failedTable := map[string]bool{}
-
+// recoverFromShowCreate re-reads the authoritative SHOW CREATE TABLE text for
+// every table that needs it and overwrites the information_schema-lossy values:
+// each pending binary column's provisional Default with a byte-exact
+// hexLiteralDialect DefaultExpression, and a NUL-truncated table Comment with
+// the faithful decoded string. It runs one SHOW CREATE per affected table
+// (amortising both recoveries onto a single fetch — see
+// tablesNeedingShowCreate). A binary default that cannot be recovered or parsed
+// is dropped with a loud WARN (loud-failure tenet — a wrong default is silent
+// corruption; a missing default is not); a comment that cannot be re-read keeps
+// the (possibly-truncated) information_schema value with a WARN — a short
+// comment is cosmetic, not corrupting.
+func (r *SchemaReader) recoverFromShowCreate(ctx context.Context, tables map[string]*ir.Table, pending []pendingBinaryDefault) error {
+	pendingCols := map[string][]*ir.Column{}
 	for _, p := range pending {
-		ddl, have := ddlByTable[p.table]
-		if !have && !failedTable[p.table] {
-			var err error
-			ddl, err = r.showCreateTable(ctx, p.table)
-			if err != nil {
-				failedTable[p.table] = true
+		pendingCols[p.table] = append(pendingCols[p.table], p.col)
+	}
+
+	for _, table := range tablesNeedingShowCreate(tables, pendingCols) {
+		ddl, err := r.showCreateTable(ctx, table)
+		if err != nil {
+			for _, col := range pendingCols[table] {
 				slog.WarnContext(
 					ctx,
 					"mysql: could not re-read SHOW CREATE TABLE to recover binary column defaults; "+
 						"dropping their DEFAULT (target column becomes DEFAULT-less) rather than carrying a "+
 						"NUL-truncated wrong value from information_schema",
-					slog.String("table", r.qualifiedName(p.table)),
+					slog.String("column", r.qualifiedName(table)+"."+col.Name),
 					slog.Any("error", err),
 				)
-			} else {
-				ddlByTable[p.table] = ddl
+				col.Default = ir.DefaultNone{}
 			}
-		}
-		if failedTable[p.table] {
-			p.col.Default = ir.DefaultNone{}
+			if t := tables[table]; t != nil && t.Comment != "" {
+				slog.WarnContext(
+					ctx,
+					"mysql: could not re-read SHOW CREATE TABLE to recover a possibly NUL-truncated table "+
+						"comment; keeping the information_schema value (a short comment is cosmetic, not corrupting)",
+					slog.String("table", r.qualifiedName(table)),
+					slog.Any("error", err),
+				)
+			}
 			continue
 		}
 
-		raw, ok := parseShowCreateColumnDefault(ddl, p.col.Name)
-		if !ok || len(raw) == 0 {
-			slog.WarnContext(
-				ctx,
-				"mysql: could not parse the binary column's DEFAULT clause from SHOW CREATE TABLE; "+
-					"dropping the DEFAULT (target column becomes DEFAULT-less) rather than carrying a "+
-					"NUL-truncated wrong value from information_schema",
-				slog.String("column", r.qualifiedName(p.table)+"."+p.col.Name),
-			)
-			p.col.Default = ir.DefaultNone{}
-			continue
+		for _, col := range pendingCols[table] {
+			raw, ok := parseShowCreateColumnDefault(ddl, col.Name)
+			if !ok || len(raw) == 0 {
+				slog.WarnContext(
+					ctx,
+					"mysql: could not parse the binary column's DEFAULT clause from SHOW CREATE TABLE; "+
+						"dropping the DEFAULT (target column becomes DEFAULT-less) rather than carrying a "+
+						"NUL-truncated wrong value from information_schema",
+					slog.String("column", r.qualifiedName(table)+"."+col.Name),
+				)
+				col.Default = ir.DefaultNone{}
+				continue
+			}
+			col.Default = ir.DefaultExpression{Expr: bytesToHexLiteral(raw), Dialect: hexLiteralDialect}
 		}
-		p.col.Default = ir.DefaultExpression{Expr: bytesToHexLiteral(raw), Dialect: hexLiteralDialect}
+
+		// Recover the table comment. Only reached for a non-empty
+		// information_schema comment (tablesNeedingShowCreate gate), so a
+		// SHOW CREATE that reports no COMMENT clause is anomalous — keep the
+		// information_schema value rather than blanking a real comment.
+		if t := tables[table]; t != nil && t.Comment != "" {
+			if c, ok := parseShowCreateTableComment(ddl); ok {
+				t.Comment = c
+			}
+		}
 	}
 	return nil
+}
+
+// tablesNeedingShowCreate returns the sorted set of table names that require a
+// SHOW CREATE TABLE re-read: a table with at least one pending binary default
+// OR a non-empty (possibly NUL-truncated) information_schema comment. A table
+// with neither is skipped — the common no-comment, no-binary-default case pays
+// no extra query. Deduplicated so a table needing BOTH is fetched once.
+//
+// A comment that BEGINS with a NUL byte is C-string-truncated to empty by
+// information_schema and so reads as "no comment" — it is not recoverable here
+// and is treated as absent, matching the "non-empty comment only" gate.
+func tablesNeedingShowCreate(tables map[string]*ir.Table, pendingCols map[string][]*ir.Column) []string {
+	need := map[string]struct{}{}
+	for table := range pendingCols {
+		need[table] = struct{}{}
+	}
+	for name, t := range tables {
+		if t.Comment != "" {
+			need[name] = struct{}{}
+		}
+	}
+	return sortedKeys(need)
 }
 
 // qualifiedName renders schema.table for log messages, using the reader's bound
@@ -211,6 +267,44 @@ func parseShowCreateColumnDefault(createStmt, colName string) (raw []byte, ok bo
 	return nil, false
 }
 
+// parseShowCreateTableComment extracts the table-level COMMENT clause from a
+// SHOW CREATE TABLE statement and decodes it to a Go string. MySQL renders the
+// table comment in the trailing table-options section, on the same line as the
+// column-list's closing `)`, as `COMMENT='<escaped>'` (with the `=`); a
+// COLUMN-level comment is `COMMENT '<escaped>'` (space, no `=`) on that column's
+// own indented line and is deliberately NOT matched here — only the closing `)`
+// line is inspected. Returns ok=false when there is no table COMMENT clause.
+//
+// This is the TABLE_COMMENT sibling of parseShowCreateColumnDefault: like
+// COLUMN_DEFAULT, information_schema.tables.TABLE_COMMENT C-string-truncates a
+// comment at its first NUL byte, so a comment carrying a 0x00 is read short
+// (or, for a leading-NUL comment, empty); SHOW CREATE TABLE is faithful.
+func parseShowCreateTableComment(createStmt string) (comment string, ok bool) {
+	for _, line := range strings.Split(createStmt, "\n") {
+		trimmed := strings.TrimLeft(line, " \t")
+		if !strings.HasPrefix(trimmed, ")") {
+			continue
+		}
+		// The table options are space-separated on this line; the table
+		// comment is the ` COMMENT=` token (the leading space distinguishes
+		// it from any option value that ends in "COMMENT"). The quoted value
+		// may itself contain ` COMMENT=` — decodeMySQLQuotedString scans it
+		// as one escaped literal, so the first ` COMMENT=` is always the real
+		// option opener.
+		idx := strings.Index(trimmed, " COMMENT=")
+		if idx < 0 {
+			return "", false
+		}
+		rest := trimmed[idx+len(" COMMENT="):]
+		raw, decOK := decodeMySQLQuotedString(rest)
+		if !decOK {
+			return "", false
+		}
+		return string(raw), true
+	}
+	return "", false
+}
+
 // parseMySQLDefaultLiteralBytes decodes the value token at the start of s (the
 // text immediately after a `DEFAULT ` keyword in SHOW CREATE output) into raw
 // bytes. It handles the two forms MySQL uses for a binary column's literal
@@ -258,10 +352,24 @@ func decodeMySQLHexToken(s string) (raw []byte, ok bool) {
 // byte through. An
 // unknown `\x` escape decodes to the literal `x`, matching MySQL's own
 // string-literal parsing. Returns ok=false for a dangling backslash or a string
-// with no closing quote.
+// with no closing quote. Trailing text after the closing quote is ignored.
 func decodeMySQLQuotedString(s string) (raw []byte, ok bool) {
+	raw, _, ok = scanMySQLQuotedString(s)
+	return raw, ok
+}
+
+// scanMySQLQuotedString is the escape-aware scanner underneath
+// decodeMySQLQuotedString: it decodes the single-quoted literal at the start of
+// s (opening `'` at s[0]) and ALSO reports `end`, the index of the first byte
+// past the closing delimiter, so callers that split a comma-separated list of
+// quoted labels (parseEnumOrSet) can advance without re-scanning. The escape
+// handling is shared so split + decode agree byte-for-byte on where each label
+// ends — a naive `,`/`'` split would mis-terminate a label containing an escaped
+// quote (`”`/`\'`), an escaped comma, or a `\0`. Returns ok=false for a
+// dangling backslash or a string with no closing quote.
+func scanMySQLQuotedString(s string) (raw []byte, end int, ok bool) {
 	if s == "" || s[0] != '\'' {
-		return nil, false
+		return nil, 0, false
 	}
 	out := make([]byte, 0, len(s))
 	for i := 1; i < len(s); {
@@ -269,7 +377,7 @@ func decodeMySQLQuotedString(s string) (raw []byte, ok bool) {
 		switch c {
 		case '\\':
 			if i+1 >= len(s) {
-				return nil, false // dangling backslash
+				return nil, 0, false // dangling backslash
 			}
 			out = append(out, decodeMySQLStringEscape(s[i+1]))
 			i += 2
@@ -279,13 +387,13 @@ func decodeMySQLQuotedString(s string) (raw []byte, ok bool) {
 				i += 2
 				continue
 			}
-			return out, true // closing delimiter
+			return out, i + 1, true // closing delimiter at i
 		default:
 			out = append(out, c)
 			i++
 		}
 	}
-	return nil, false // no closing quote
+	return nil, 0, false // no closing quote
 }
 
 // decodeMySQLStringEscape maps the byte following a backslash to the byte MySQL

@@ -251,22 +251,24 @@ func bitWidth(columnType string) int {
 
 // parseEnumOrSet pulls the value list out of an ENUM/SET column_type.
 //
-// MySQL formats these as enum('red','green','blue') and similar; values
-// containing escaped single quotes (doubled inside the literal) are
-// handled by the inner loop. The kind prefix (`enum`/`set`) is matched
-// case-insensitively against the column_type string — the *values*
-// inside the parens preserve their source-side casing.
+// MySQL formats these as enum('red','green','blue') and similar. The kind
+// prefix (`enum`/`set`) is matched case-insensitively against the column_type
+// string — the *values* inside the parens preserve their source-side casing.
 //
-// Backslashes arrive DOUBLED: information_schema renders a stored label
-// `a\b` as `enum('a\\b')` — verified on MySQL 8.0, and (unlike SHOW
-// CREATE TABLE's quoting) the rendering does NOT change under a
-// NO_BACKSLASH_ESCAPES session. The inner loop decodes the pair back to
-// one backslash so the IR holds the RAW label, symmetric with
-// COLUMN_DEFAULT / COLUMN_COMMENT (which information_schema reports
-// already decoded). The writer's quoteSQLString re-escapes on emit
-// (SEC-1 review gap 2); pre-fix the escaped form only round-tripped
-// MySQL→MySQL by accidental symmetry and landed on PG with a doubled
-// backslash.
+// information_schema.columns.COLUMN_TYPE RE-ESCAPES a stored label with MySQL's
+// FULL single-backslash string-escape set (`\0 \b \t \n \r \\`, plus the
+// SQL-standard doubled `”`) — a control byte inside a label is NOT reported raw
+// (unlike COLUMN_DEFAULT / COLUMN_COMMENT, which information_schema reports
+// already decoded). So each label is decoded with the same MySQL string decoder
+// the binary-default recovery uses (scanMySQLQuotedString), NOT a 2-escape
+// shortcut: a genuinely NUL-bearing label like `enum('nul\0y')` must land in the
+// IR as the real bytes (`nul` + 0x00 + `y`), not the literal 8-char string
+// `nul\0y`. The scan is escape-aware, so the comma/quote split honours an escaped
+// quote (`”`/`\'`), an escaped comma, or a `\0` inside a label. The writer's
+// quoteSQLString re-escapes the raw label on emit (SEC-1 review gap 2), so
+// MySQL→MySQL round-trips byte-exact; a NUL-bearing label to a PG text/enum
+// target loud-fails at apply (PG text cannot hold a NUL) — correct loud-failure,
+// not a regression.
 func parseEnumOrSet(columnType, kind string) ([]string, error) {
 	expected := kind + "("
 	lower := strings.ToLower(columnType)
@@ -285,33 +287,16 @@ func parseEnumOrSet(columnType, kind string) ([]string, error) {
 		if body[0] != '\'' {
 			return nil, fmt.Errorf("mysql: malformed %s value list near %q", strings.ToUpper(kind), body)
 		}
-		// Find the closing quote, accounting for doubled-quote escapes and
-		// decoding information_schema's doubled backslashes (see doc above).
-		var sb strings.Builder
-		i := 1
-		for i < len(body) {
-			if body[i] == '\'' {
-				if i+1 < len(body) && body[i+1] == '\'' {
-					sb.WriteByte('\'')
-					i += 2
-					continue
-				}
-				break
-			}
-			if body[i] == '\\' && i+1 < len(body) && body[i+1] == '\\' {
-				sb.WriteByte('\\')
-				i += 2
-				continue
-			}
-			sb.WriteByte(body[i])
-			i++
-		}
-		if i >= len(body) {
+		// Decode one quoted label with the full MySQL string-escape decoder,
+		// which also reports where the label ends so the split stays
+		// escape-aware (a `,`/`'`/`\0` inside a label does not terminate it).
+		raw, end, ok := scanMySQLQuotedString(body)
+		if !ok {
 			return nil, fmt.Errorf("mysql: unterminated %s value: %q", strings.ToUpper(kind), columnType)
 		}
-		values = append(values, sb.String())
+		values = append(values, string(raw))
 
-		body = body[i+1:]
+		body = body[end:]
 		switch {
 		case body == "":
 			// done

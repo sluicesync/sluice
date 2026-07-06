@@ -13,6 +13,7 @@ package mysql
 import (
 	"bytes"
 	"database/sql"
+	"reflect"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -217,6 +218,100 @@ func TestBinaryLiteralDefaultNeedsRecovery(t *testing.T) {
 					c.typ, c.extra, c.def.String, got, c.want)
 			}
 		})
+	}
+}
+
+// TestParseShowCreateTableComment pins the table-level COMMENT extraction from
+// SHOW CREATE output: the NUL-bearing comment that TABLE_COMMENT truncates (the
+// bug), the escaped forms MySQL emits, the "no comment" case, and the two
+// false-match traps — a COLUMN-level COMMENT (must NOT be picked up) and a table
+// comment whose TEXT contains `COMMENT=` (the first ` COMMENT=` is still the real
+// option opener).
+func TestParseShowCreateTableComment(t *testing.T) {
+	head := "CREATE TABLE `t` (\n  `id` int NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+	cases := []struct {
+		name    string
+		stmt    string
+		want    string
+		wantOK  bool
+		comment string
+	}{
+		{
+			name:    "NUL-bearing comment (the truncation bug)",
+			stmt:    head + " COMMENT='a\\0b'",
+			want:    "a\x00b",
+			wantOK:  true,
+			comment: "0x00 escaped as \\0 by SHOW CREATE; TABLE_COMMENT would truncate to 'a'",
+		},
+		{"plain comment", head + " COMMENT='hello world'", "hello world", true, "ordinary ASCII"},
+		{"doubled quote", head + " COMMENT='it''s here'", "it's here", true, "SQL-standard doubled quote"},
+		{"newline + tab escapes", head + " COMMENT='line1\\nline2\\tend'", "line1\nline2\tend", true, "control escapes decoded"},
+		{
+			name:    "comment text contains COMMENT=",
+			stmt:    head + " COMMENT='see COMMENT=''x'''",
+			want:    "see COMMENT='x'",
+			wantOK:  true,
+			comment: "first ` COMMENT=` is the real option; the embedded one is inside the quoted value",
+		},
+		{
+			name:    "trailing table option after COMMENT",
+			stmt:    head + " COMMENT='c' ROW_FORMAT=DYNAMIC",
+			want:    "c",
+			wantOK:  true,
+			comment: "decoder stops at the closing quote; trailing options ignored",
+		},
+		{"no comment", head, "", false, "no COMMENT clause on the closing line"},
+		{
+			name: "column COMMENT must not be matched",
+			stmt: "CREATE TABLE `t` (\n  `id` int NOT NULL,\n  `c` int DEFAULT NULL COMMENT 'col cmt',\n" +
+				"  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+			want:    "",
+			wantOK:  false,
+			comment: "column COMMENT is `COMMENT 'x'` (space, no =) on a column line; only the `)` line is inspected",
+		},
+		{
+			name: "column COMMENT present AND table COMMENT present",
+			stmt: "CREATE TABLE `t` (\n  `id` int NOT NULL,\n  `c` int DEFAULT NULL COMMENT 'col cmt',\n" +
+				"  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='table cmt'",
+			want:    "table cmt",
+			wantOK:  true,
+			comment: "only the table-level comment is returned",
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := parseShowCreateTableComment(c.stmt)
+			if ok != c.wantOK {
+				t.Fatalf("ok=%v; want %v (%s)", ok, c.wantOK, c.comment)
+			}
+			if c.wantOK && got != c.want {
+				t.Errorf("%s: got %q; want %q", c.comment, got, c.want)
+			}
+		})
+	}
+}
+
+// TestTablesNeedingShowCreate pins the amortization gate: a table pays the extra
+// SHOW CREATE ONLY when it has a binary default to recover or a non-empty
+// comment. The common no-comment / no-binary-default table is skipped, a table
+// needing both is fetched once, and the result is sorted+deduped.
+func TestTablesNeedingShowCreate(t *testing.T) {
+	tables := map[string]*ir.Table{
+		"plain":         {Name: "plain"},                      // no comment, no pending → skipped
+		"commented":     {Name: "commented", Comment: "hi"},   // comment → fetch
+		"bindefault":    {Name: "bindefault"},                 // pending only → fetch
+		"both":          {Name: "both", Comment: "c"},         // comment + pending → fetch once
+		"empty_comment": {Name: "empty_comment", Comment: ""}, // empty comment → skipped
+	}
+	pendingCols := map[string][]*ir.Column{
+		"bindefault": {{Name: "b"}},
+		"both":       {{Name: "b"}},
+	}
+	got := tablesNeedingShowCreate(tables, pendingCols)
+	want := []string{"bindefault", "both", "commented"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("tablesNeedingShowCreate = %v; want %v (plain/empty_comment must be skipped; both deduped)", got, want)
 	}
 }
 

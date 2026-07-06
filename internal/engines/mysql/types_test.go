@@ -263,12 +263,30 @@ func TestParseEnumOrSet(t *testing.T) {
 		{"multi", "enum('a','b','c')", "enum", []string{"a", "b", "c"}},
 		{"set", "set('x','y','z')", "set", []string{"x", "y", "z"}},
 		{"escaped quote", `enum('it''s','ok')`, "enum", []string{"it's", "ok"}},
+		{"escaped quote via backslash", `enum('it\'s','ok')`, "enum", []string{"it's", "ok"}},
 		{"empty value", "enum('','b')", "enum", []string{"", "b"}},
 		// information_schema renders a stored backslash DOUBLED in COLUMN_TYPE
 		// (verified on MySQL 8.0, session-mode-independent); the parser decodes
 		// it so the IR holds the raw label (SEC-1 review gap 2).
 		{"escaped backslash", `enum('a\\b','x')`, "enum", []string{`a\b`, "x"}},
 		{"trailing escaped backslash", `enum('t\\')`, "enum", []string{`t\`}},
+
+		// --- Full MySQL string-escape matrix (the fix). COLUMN_TYPE re-escapes
+		// control bytes with single-backslash escapes; each must decode to the
+		// real byte, not pass through literally. Inputs are raw Go strings
+		// (backticks) so `\0`/`\n`/… are the literal two-char sequences
+		// information_schema emits. Exercised across ENUM and SET.
+		{"NUL escape (the headline bug)", `enum('nul_x\0y')`, "enum", []string{"nul_x\x00y"}},
+		{"newline escape", `enum('a\nb')`, "enum", []string{"a\nb"}},
+		{"carriage-return escape", `enum('a\rb')`, "enum", []string{"a\rb"}},
+		{"tab escape", `enum('a\tb')`, "enum", []string{"a\tb"}},
+		{"backspace escape", `enum('a\bb')`, "enum", []string{"a\bb"}},
+		{"NUL in SET label", `set('x\0y','z')`, "set", []string{"x\x00y", "z"}},
+		{"comma inside a label", `enum('a,b','c')`, "enum", []string{"a,b", "c"}},
+		{"comma inside a SET label", `set('a,b','c')`, "set", []string{"a,b", "c"}},
+		{"raw printable stays identical", "enum('plain ASCII 123')", "enum", []string{"plain ASCII 123"}},
+		{"mixed escapes in one label", `enum('tab\there\nnl\0nul')`, "enum", []string{"tab\there\nnl\x00nul"}},
+		{"multi-label with a NUL label mid-list", `enum('a','b\0c','d')`, "enum", []string{"a", "b\x00c", "d"}},
 	}
 	for _, c := range cases {
 		c := c
