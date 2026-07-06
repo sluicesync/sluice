@@ -197,6 +197,16 @@ scoops:
 # Install (once accepted upstream): `winget install sluicesync.sluice`
 winget:
   - name: sluice
+    # winget is submitted MANUALLY and SELECTIVELY (microsoft/winget-pkgs reviews
+    # every version, and slowly), so the release must NOT auto-push it. Beyond the
+    # intent, the auto-push to the sluicesync/winget-pkgs fork intermittently fails
+    # on GitHub API flakiness (a 500, then a 403 "Timed out validating rule", e.g.
+    # v0.99.187) which would otherwise FAIL the whole release AFTER the binaries +
+    # GHCR image + homebrew + scoop have already published. skip_upload generates
+    # the manifest (it lands in dist/winget/ for a manual fork PR when a version
+    # warrants one) but never pushes it, so winget can never block a release. Set
+    # to "false" to re-enable the auto fork-push.
+    skip_upload: "true"
     publisher: sluicesync
     publisher_url: "https://sluicesync.com"
     package_identifier: sluicesync.sluice
