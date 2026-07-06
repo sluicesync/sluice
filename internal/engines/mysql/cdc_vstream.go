@@ -326,7 +326,9 @@ func applyVStreamFlavorDefaults(cfg *gomysql.Config, flavor Flavor) {
 	}
 }
 
-func openVStreamReader(ctx context.Context, dsn string, flavor Flavor, opts engineOptions) (ir.CDCReader, error) {
+// ctx is unused: reader construction is deliberately connection-free (shard
+// discovery is deferred to StreamChanges, which takes its own ctx).
+func openVStreamReader(_ context.Context, dsn string, flavor Flavor, opts engineOptions) (ir.CDCReader, error) {
 	cfg, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err
@@ -349,11 +351,6 @@ func openVStreamReader(ctx context.Context, dsn string, flavor Flavor, opts engi
 	}
 
 	dialOpts, authHeader, err := vstreamDialOptions(cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	shards, err := resolveVStreamShards(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -394,7 +391,6 @@ func openVStreamReader(ctx context.Context, dsn string, flavor Flavor, opts engi
 		keyspace:             cfg.DBName,
 		cfg:                  cfg,
 		zeroDate:             zeroDate,
-		shards:               shards,
 		tabletType:           tabletType,
 		relaxSkew:            !vstreamPreserveSkewFromDSN(cfg, opts.preserveSkew),
 		livenessWindow:       livenessWindow,
@@ -721,6 +717,20 @@ func (r *vstreamCDCReader) Err() error {
 //     beforehand.
 //   - Decoded shardGtid slice: resume from the persisted position.
 func (r *vstreamCDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan ir.Change, error) {
+	// Shard discovery is deferred from reader construction to stream open:
+	// building the reader stays connection-free (a warm-resume path may
+	// construct a reader it never streams, and the shape guard
+	// TestCDCReader_PlanetScaleReturnsVStreamReader relies on it), and the
+	// layout is read fresh against the live vtgate here. An explicit
+	// vstream_shards short-circuits the query (vstreamShardsFromDSN, no
+	// connection); auto-discovery fills r.shards once, on first stream open.
+	if len(r.shards) == 0 {
+		shards, err := resolveVStreamShards(ctx, r.cfg)
+		if err != nil {
+			return nil, err
+		}
+		r.shards = shards
+	}
 	startPos, err := r.resolveStartPosition(from)
 	if err != nil {
 		return nil, err
