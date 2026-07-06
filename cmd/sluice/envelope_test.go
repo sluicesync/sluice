@@ -101,7 +101,7 @@ func TestEnvelope_RefusedVsFailedClassification(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			e := newEnvelopeRun("backup full", "json")
 			buf := captureEnvelope(e)
-			e.setNextSteps("sluice backup verify --output-dir <BACKUP_DIR>")
+			e.setNextSteps("sluice backup verify --from-dir <BACKUP_DIR>")
 			if tc.engaged {
 				e.markEngaged()
 			}

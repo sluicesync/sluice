@@ -11,6 +11,7 @@ import (
 	"text/tabwriter"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // SlotCmd groups the operator-facing replication-slot management
@@ -66,8 +67,9 @@ func (s *SlotListCmd) Run(_ *Globals) error {
 	return nil
 }
 
-// SlotDropCmd drops a named replication slot. Destructive; prompts
-// for confirmation by default.
+// SlotDropCmd drops a named replication slot. Destructive; refuses
+// loudly (a ClassRefusal coded error, exit 3) without --yes rather
+// than prompting — every sluice command is non-interactive.
 type SlotDropCmd struct {
 	SourceDriver string `help:"Source engine name (e.g. postgres). See 'sluice engines'." required:"" placeholder:"NAME" group:"source"`
 	Source       string `help:"Source database DSN." required:"" env:"SLUICE_SOURCE" placeholder:"DSN" group:"source"`
@@ -75,13 +77,25 @@ type SlotDropCmd struct {
 	Name     string `arg:"" help:"Slot name to drop." placeholder:"NAME"`
 	IfExists bool   `help:"Treat a missing slot as success rather than an error."`
 	Force    bool   `help:"Drop the slot even if it is active (a CDC consumer is currently connected). Use with care."`
-	Yes      bool   `help:"Skip the confirmation prompt." short:"y"`
+	Yes      bool   `help:"Confirm this destructive operation. Required: without it, drop refuses loudly rather than prompting." short:"y"`
 }
 
 // Run implements `sluice slot drop`.
 func (s *SlotDropCmd) Run(_ *Globals) error {
 	if s.Name == "" {
 		return errors.New("slot name is required")
+	}
+
+	// Non-interactive by contract (AGENTS.md): rather than prompt (which
+	// on a non-TTY reads EOF and silently no-ops), refuse loudly and name
+	// the remedy before touching the source. --yes is the explicit opt-in
+	// every destructive op needs.
+	if !s.Yes {
+		return &sluicecode.CodedError{
+			Code: sluicecode.CodeConfirmationRequired,
+			Hint: "pass --yes (or -y) to confirm",
+			Err:  fmt.Errorf("dropping replication slot %q on the source is destructive", s.Name),
+		}
 	}
 
 	mgr, err := openSlotManager(s.SourceDriver, s.Source)
@@ -91,18 +105,6 @@ func (s *SlotDropCmd) Run(_ *Globals) error {
 	defer func() { _ = mgr.Close() }()
 
 	ctx := kongContext()
-	if !s.Yes {
-		ok, err := confirmDestructive(os.Stdin, os.Stdout,
-			fmt.Sprintf("Drop replication slot %q on the source? [y/N] ", s.Name))
-		if err != nil {
-			return err
-		}
-		if !ok {
-			fmt.Fprintln(os.Stdout, "aborted")
-			return nil
-		}
-	}
-
 	if err := mgr.Drop(ctx, s.Name, s.Force); err != nil {
 		if s.IfExists && isSlotNotFoundErr(err) {
 			fmt.Fprintf(os.Stdout, "slot %q does not exist; nothing to do\n", s.Name)

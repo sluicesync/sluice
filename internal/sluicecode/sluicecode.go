@@ -60,6 +60,7 @@ const (
 	CodeValueZeroDate             Code = "SLUICE-E-VALUE-ZERO-DATE"
 	CodeValueNULByte              Code = "SLUICE-E-VALUE-NUL-BYTE"
 	CodeExprBackslashLiteral      Code = "SLUICE-E-EXPR-BACKSLASH-LITERAL"
+	CodeConfirmationRequired      Code = "SLUICE-E-CONFIRMATION-REQUIRED"
 )
 
 // Class partitions codes by how the process should exit when the
@@ -105,6 +106,7 @@ var registry = map[Code]Info{
 	CodeValueZeroDate:             {ClassRefusal, "MySQL zero/partial date has no valid calendar value"},
 	CodeValueNULByte:              {ClassRefusal, "string value carries a NUL byte PostgreSQL text types cannot store"},
 	CodeExprBackslashLiteral:      {ClassRefusal, "SQLite expression string literal with a backslash has no faithful MySQL spelling"},
+	CodeConfirmationRequired:      {ClassRefusal, "destructive operation requires explicit --yes confirmation"},
 }
 
 // Describe returns the registry metadata for c, and whether c is a

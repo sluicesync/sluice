@@ -433,7 +433,7 @@ func (b *BackupFullCmd) Run(g *Globals) error {
 	env := newEnvelopeRun("backup full", b.Format)
 	env.scrub(b.Source)
 	env.setResume(true, "re-run the same backup command to resume a partial backup")
-	env.setNextSteps("sluice backup verify --output-dir <BACKUP_DIR>")
+	env.setNextSteps("sluice backup verify --from-dir <BACKUP_DIR>")
 	return env.finish(b.run(g, env))
 }
 
