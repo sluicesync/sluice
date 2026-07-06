@@ -33,7 +33,7 @@ The user wants a logical backup, an incremental chained off a prior backup, an e
 - **Plan:** full/incremental cadence, destination, encryption mode (one per chain), retention intent.
 - **Commands run + results:** backup IDs, chunk counts, `backup verify` outcome, and the **test-restore + fidelity-verify** result (the trust signal).
 - **Destructive steps (if any):** the exact `prune`/`compact` invocation, its `--dry-run` output, flagged as needing human approval before the non-dry-run.
-- **Slot note (PG `--chain-slot`):** the retained slot is named **`sluice_<name>`** — sluice prefixes the `--slot-name` value. Abandoning the chain means dropping it with `sluice slot drop --source-driver <drv> --source "$SLUICE_SOURCE" sluice_<name>` — the slot name is a **positional argument, not `--slot-name`** (passing `--slot-name` is exit 80). Note `slot drop` currently prompts `[y/N]` and aborts if unconfirmed, so it needs an interactive confirm (a known rough edge for non-interactive/agent use).
+- **Slot note (PG `--chain-slot`):** the retained slot is named **`sluice_<name>`** — sluice prefixes the `--slot-name` value. Abandoning the chain means dropping it with `sluice slot drop --source-driver <drv> --source "$SLUICE_SOURCE" sluice_<name>` — the slot name is a **positional argument, not `--slot-name`** (passing `--slot-name` is exit 80). Because dropping a slot is destructive, pass `--yes` (`-y`) to confirm it non-interactively — without `--yes`, `slot drop` currently prompts `[y/N]` and, with no TTY, aborts to a silent no-op (a known rough edge; the drop needs the explicit `--yes`).
 
 Never run `prune`/`compact` for real, or overwrite a prior backup with `--force-overwrite`, without explicit approval for that invocation.
 
