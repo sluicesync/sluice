@@ -4,6 +4,17 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.189] - 2026-07-06
+
+### Fixed
+
+- **`sluice slot drop` without `--yes` now refuses loudly (exit 3, `SLUICE-E-CONFIRMATION-REQUIRED`) instead of prompting — which on any non-TTY silently aborted a destructive command (agent-contract fidelity; low severity, no data loss; surfaced by the Tier-1 agent-skills live validation).** AGENTS.md guarantees every sluice command is non-interactive ("no prompts, ever"), but `slot drop` without `--yes` printed an interactive `Drop replication slot "…"? [y/N]` confirmation via `confirmDestructive`. On a non-TTY — any agent, CI job, or script — the read hit EOF, was read as "no", printed `aborted`, and returned exit 0: a destructive command silently no-op'ing, exactly the failure the "refuse loudly" tenet exists to prevent (the caller believed the slot was dropped when it was not). `slot drop` without `--yes` now returns a `ClassRefusal` coded error — the new `SLUICE-E-CONFIRMATION-REQUIRED` code (exit 3) — naming the slot with the hint `pass --yes (or -y) to confirm`, and the refusal fires fail-fast *before* any source connection is opened. `--yes`/`-y` clears the gate and proceeds exactly as before; `--if-exists` and `--force` are unchanged, and `confirmDestructive` is retained (the `trigger` teardown path still uses it). Pinned by two unit tests: without `--yes`, `Run` returns the exit-3 coded refusal naming the slot without reading stdin (no database needed); with `--yes` it clears the gate and reaches the engine-resolution path.
+- **`backup full`'s `next_steps` hint now points at `--from-dir`, the flag `backup verify` actually accepts.** The success envelope suggested `sluice backup verify --output-dir <BACKUP_DIR>`, but `backup verify`'s flag is `--from-dir` (`--output-dir` is a usage error there), so the binary's own suggested next command failed for anyone who copy-pasted it. The hint now emits `--from-dir`; the identical wrong string was corrected in the envelope test that pinned it.
+
+### Changed
+
+- **Three Tier-1 agent skills hardened from the same live-validation pass (docs/skills only; no shipped-binary change).** `fidelity-verify` now states that cross-engine `verify` is count-only and a clean count is not a value-level fidelity guarantee (closing a false-FAITHFUL reading); `sluice-error-triage` now handles the generic-`code`-with-the-real-cause-in-`message` shape, adds a wrong-hint warning and a codeless-failure branch, and lists the full connect-error codes; `backup-chain-operator` corrects `incremental` (no `--format`), `prune` (no `--encrypt`), and the `slot drop` invocation (positional name, `--yes` for non-interactive confirm rather than an interactive prompt). Agent guidance only — the sluice binary behaves identically.
+
 ## [0.99.188] - 2026-07-06
 
 ### Fixed
