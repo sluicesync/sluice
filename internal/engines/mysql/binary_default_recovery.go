@@ -196,12 +196,16 @@ func parseShowCreateColumnDefault(createStmt, colName string) (raw []byte, ok bo
 		}
 		// The type of a binary column carries no `DEFAULT` token and any
 		// COMMENT clause follows the DEFAULT, so the first ` DEFAULT ` is the
-		// column's real default clause.
-		idx := strings.Index(trimmed, " DEFAULT ")
+		// column's real default clause. Search *past* the matched name so a
+		// pathological column whose NAME contains " DEFAULT " (e.g. a column
+		// literally named `x DEFAULT 0xAA`) can't mislocate the keyword inside
+		// the name and parse bytes out of it.
+		afterName := trimmed[len(prefix):]
+		idx := strings.Index(afterName, " DEFAULT ")
 		if idx < 0 {
 			return nil, false
 		}
-		rest := strings.TrimLeft(trimmed[idx+len(" DEFAULT "):], " ")
+		rest := strings.TrimLeft(afterName[idx+len(" DEFAULT "):], " ")
 		return parseMySQLDefaultLiteralBytes(rest)
 	}
 	return nil, false

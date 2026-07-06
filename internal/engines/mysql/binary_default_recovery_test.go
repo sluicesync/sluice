@@ -143,6 +143,8 @@ func TestParseShowCreateColumnDefault(t *testing.T) {
 		"  `padded` binary(8) DEFAULT 'ab\\0\\0\\0\\0\\0\\0',\n" +
 		"  `quote_nul` binary(2) DEFAULT '''\\0',\n" +
 		"  `commented` binary(2) DEFAULT 0xAB00 COMMENT 'has DEFAULT in text',\n" +
+		"  `esc` binary(2) DEFAULT '\\t\\\\',\n" +
+		"  `x DEFAULT 0xAA` binary(2) DEFAULT 0xCC00,\n" +
 		"  PRIMARY KEY (`id`)\n" +
 		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
 
@@ -159,6 +161,8 @@ func TestParseShowCreateColumnDefault(t *testing.T) {
 		{"padded", []byte{0x61, 0x62, 0, 0, 0, 0, 0, 0}, true, "BINARY(8) padded"},
 		{"quote_nul", []byte{0x27, 0x00}, true, "doubled-quote + NUL"},
 		{"commented", []byte{0xAB, 0x00}, true, "COMMENT after DEFAULT must not confuse the parse"},
+		{"esc", []byte{0x09, 0x5C}, true, "tab + backslash escapes decoded end-to-end"},
+		{"x DEFAULT 0xAA", []byte{0xCC, 0x00}, true, "name containing ' DEFAULT ' + hex must not mislocate the keyword"},
 		{"id", nil, false, "no DEFAULT clause"},
 		{"absent", nil, false, "column not present"},
 	}
