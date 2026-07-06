@@ -19,6 +19,12 @@
 # sqllogictest corpus harness is a fixture sweep, not a regression
 # suite; run it on demand before/after schema-reader changes.
 #
+# The `corpus` leg (roadmap item 52) runs the real-world OSS-schema
+# corpus on the weekly schedule (fetch-on-demand dumps + the item-51
+# restore-parity oracle + sample-row verify over those schemas). It also
+# compiles in the per-PR pipeline-migrate shard, but SKIPs there because
+# the dumps are gitignored — this leg fetches them and is where they run.
+#
 # Deliberately NOT here: the `kmsverify` suite
 # (internal/pipeline/backup_kms_localstack_integration_test.go) is
 # scaffolding — every test body t.Skip()s pending localstack + AWS
@@ -38,7 +44,7 @@ on:
         required: false
         default: "all"
         type: choice
-        options: [all, chaos, reshard, vstream-pipeline, ddlfixture]
+        options: [all, chaos, reshard, vstream-pipeline, corpus, ddlfixture]
 
 permissions:
   contents: read
@@ -187,6 +193,62 @@ jobs:
         run: |
           go test -tags='integration vstream' -race -count=1 -timeout=40m \
             -run '^(TestMigrate_VStream|TestStreamer_.*VStream|TestSpikeShapeA_)' -v ./internal/pipeline/
+
+  # The real-world-schema corpus (roadmap item 52): migrate popular OSS
+  # app schemas (GitLab / WordPress / Joomla / MediaWiki / Chinook /
+  # Employees / Vitess) through sluice on the deliberate weekly cadence
+  # the item intends. The corpus tests ALSO compile in the per-PR
+  # pipeline-migrate shard, but the *.sql dumps are fetch-on-demand
+  # (gitignored), so there they SKIP — this leg is where they actually
+  # run: it fetches the corpus first, then executes it. That includes
+  # the item-51 restore-parity oracle over the corpus schemas
+  # (TestMigrate_Corpus_DumpParity_*) and the sample-row verify legs
+  # (TestMigrate_Corpus_SampleVerify_*).
+  #
+  # -race because the migrate path the corpus drives is goroutine-bearing
+  # (parallel copy); a weekly -race sweep over real schemas is cheap
+  # insurance. Non-required (a red run files a bug, never blocks a merge)
+  # — the corpus deliberately includes characterization legs (GitLab at
+  # 1444 tables) that log rather than hard-assert, and fetch.sh reaches
+  # upstream over the network, so a transient fetch flake must not gate
+  # merges.
+  #
+  # The -run filter is scoped by the shared TestMigrate_Corpus_ prefix.
+  # These carry only the `integration` tag (no dedicated axis tag), so
+  # they are NOT covered by scripts/check-run-filter-coverage.sh — keep
+  # every corpus test named TestMigrate_Corpus_* so this filter finds it.
+  corpus:
+    name: Real-world corpus suite
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'corpus' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TESTCONTAINERS_RYUK_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Log in to ghcr.io + pre-pull DB images (bounded retry)
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash scripts/ci-ghcr-pull.sh \
+            ghcr.io/sluicesync/sluice-mysql:8.0-prebaked \
+            ghcr.io/sluicesync/sluice-postgres:16-prebaked
+
+      # Fetch the corpus dumps (schema-only, data-stripped; gitignored /
+      # fetch-on-demand). Provenance + rebuild recipe live in
+      # internal/pipeline/testdata/real-world-corpus/{MANIFEST.md,fetch.sh}.
+      - name: Fetch the real-world corpus
+        run: bash internal/pipeline/testdata/real-world-corpus/fetch.sh
+
+      - name: Run the corpus suite
+        run: |
+          go test -tags=integration -race -count=1 -timeout=40m \
+            -run '^TestMigrate_Corpus_' -v ./internal/pipeline/
 
   # The DDL-fixture harness (internal/translate/ddl_fixture_test.go):
   # sweep the Dolt sqllogictest createtable1 corpus (~4,575 CREATE
