@@ -118,9 +118,110 @@ func ParseSchemaDump(dump string) []dumpStatement {
 		if body == "" {
 			continue
 		}
+		body = canonicalizeIntLiteralDefaults(body)
 		out = append(out, dumpStatement{Key: dumpStatementKey(body), Body: body})
 	}
 	return out
+}
+
+// pgIntCastTypes are the integer type names sluice may render in a
+// `'<n>'::<type>` default cast that pg_dump re-emits bare. Restricting the
+// strip to these (AND to all-digit literals) is what keeps the
+// normalization from ever touching a non-integer typed default (an
+// empty-string text default, a timestamptz literal) or a genuine value change.
+var pgIntCastTypes = map[string]bool{
+	"smallint": true,
+	"integer":  true,
+	"bigint":   true,
+	"int2":     true,
+	"int4":     true,
+	"int8":     true,
+}
+
+// canonicalizeIntLiteralDefaults rewrites every `'<int>'::<int-type>`
+// token in a normalized dump body to its bare `<int>` form and returns
+// the result. sluice materializes an integer column default as a
+// quoted+cast literal (`DEFAULT '0'::smallint`); pg_dump re-renders the
+// SAME value bare (`DEFAULT 0`). The value is identical on every insert —
+// a documented cosmetic rendering divergence (docs/type-mapping.md
+// "Typed-literal default rendering", operator-approved 2026-07-03).
+//
+// This is the corpus counterpart of the kitchen-sink's per-table
+// `CREATE TABLE public.orders` allowlist entry: over a real 64-table
+// schema the divergence lands under ~15 arbitrary CREATE TABLE keys, and
+// a `CREATE TABLE public.*` allowlist glob would mask EVERY table-body
+// divergence in the corpus (a genuine column type/nullability change
+// included) — defeating the oracle for its most important object kind. So
+// the cosmetic is collapsed surgically instead: stripping ONLY the
+// quote+cast wrapper on an all-digit literal cast to an integer type
+// leaves a genuine default-VALUE change (0 vs 1) or a type change fully
+// under comparison. Applied symmetrically to both dumps, it is a no-op on
+// the already-bare (oracle) side.
+func canonicalizeIntLiteralDefaults(body string) string {
+	if !strings.Contains(body, "::") {
+		return body
+	}
+	f := strings.Fields(body)
+	changed := false
+	for i, tok := range f {
+		if bare, ok := bareIntFromTypedDefault(tok); ok {
+			f[i] = bare
+			changed = true
+		}
+	}
+	if !changed {
+		return body
+	}
+	return strings.Join(f, " ")
+}
+
+// bareIntFromTypedDefault reports whether tok is a `'<int>'::<int-type>`
+// typed-literal (optionally followed by trailing `,`/`)` punctuation from
+// the surrounding element list) and, if so, returns the bare-integer
+// rewrite carrying that trailing punctuation. Any other shape — a
+// non-integer literal, a non-integer cast target, or a token that is not
+// a quoted-literal cast at all — returns ("", false) untouched.
+func bareIntFromTypedDefault(tok string) (string, bool) {
+	if len(tok) < 2 || tok[0] != '\'' {
+		return "", false
+	}
+	q := strings.IndexByte(tok[1:], '\'')
+	if q < 0 {
+		return "", false
+	}
+	lit := tok[1 : 1+q]
+	rest := tok[1+q+1:]
+	if !strings.HasPrefix(rest, "::") {
+		return "", false
+	}
+	rest = rest[2:]
+	end := len(rest)
+	for end > 0 && (rest[end-1] == ',' || rest[end-1] == ')') {
+		end--
+	}
+	typeName, trailing := rest[:end], rest[end:]
+	if !pgIntCastTypes[strings.ToLower(typeName)] || !isIntLiteral(lit) {
+		return "", false
+	}
+	return lit + trailing, true
+}
+
+// isIntLiteral reports whether s is an optionally-signed run of decimal
+// digits (the only literal shape canonicalizeIntLiteralDefaults strips).
+func isIntLiteral(s string) bool {
+	i := 0
+	if s != "" && (s[0] == '-' || s[0] == '+') {
+		i = 1
+	}
+	if i == len(s) {
+		return false
+	}
+	for ; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // CountCreateStatements returns how many parsed statements are CREATE
@@ -389,7 +490,126 @@ func DiffDumpStatements(sluice, oracle []dumpStatement) dumpParityDiff {
 			d.OnlyInOracle = append(d.OnlyInOracle, dumpStatement{Key: k, Body: body})
 		}
 	}
+	// Phase 2: pair renamed indexes by body equivalence. Phase 1 keys on
+	// object identity (verb+kind+NAME); sluice deliberately renames
+	// Postgres indexes (pgIndexName qualification, GitHub #26), so a
+	// renamed-but-identical index shows up as a false only-in-sluice /
+	// only-in-oracle pair. pairRenamedIndexes cancels those, leaving only
+	// genuine drops/adds/body-changes.
+	pairRenamedIndexes(&d)
 	return d
+}
+
+// indexBodySignature returns a NAME-INDEPENDENT signature for a
+// `CREATE [UNIQUE] INDEX <name> ON …` statement body and true, or
+// ("", false) for any statement that is not a CREATE INDEX. The
+// signature is everything that DEFINES the index except its name:
+// uniqueness, the target table, the ordered column/expression list, the
+// index method, the partial-index WHERE predicate, and any trailing
+// INCLUDE / WITH / TABLESPACE clause — i.e. every token from `ON` onward,
+// prefixed by the uniqueness flag. Two indexes with equal signatures are
+// the same index under a different name (sluice's deliberate pgIndexName
+// qualification): a NON-loss rename, not a divergence.
+//
+// Both dumps compared are pg_dump output of the SAME pg_dump binary
+// against catalogs that differ only in the index NAME, so the post-name
+// remainder renders byte-identically for a true rename — the signature
+// needs no deeper normalization, and a genuine definition change (column
+// set, method, predicate, uniqueness) still yields a different signature
+// and stays a divergence.
+func indexBodySignature(body string) (string, bool) {
+	f := strings.Fields(body)
+	if len(f) < 4 || !strings.EqualFold(f[0], "CREATE") {
+		return "", false
+	}
+	p := 1
+	unique := false
+	if strings.EqualFold(f[p], "UNIQUE") {
+		unique = true
+		p++
+	}
+	if p >= len(f) || !strings.EqualFold(f[p], "INDEX") {
+		return "", false
+	}
+	p++
+	// pg_dump --schema-only emits neither CONCURRENTLY nor IF NOT EXISTS,
+	// but tolerate both so a hand-fed dump can't slip a mis-parse past the
+	// pairing (which would silently drop the index off the signature map).
+	if p < len(f) && strings.EqualFold(f[p], "CONCURRENTLY") {
+		p++
+	}
+	if p+2 < len(f) && strings.EqualFold(f[p], "IF") &&
+		strings.EqualFold(f[p+1], "NOT") && strings.EqualFold(f[p+2], "EXISTS") {
+		p += 3
+	}
+	// f[p] is the index name; the definition proper starts at `ON`.
+	p++
+	if p >= len(f) || !strings.EqualFold(f[p], "ON") {
+		return "", false
+	}
+	sig := strings.Join(f[p:], " ")
+	if unique {
+		return "UNIQUE " + sig, true
+	}
+	return sig, true
+}
+
+// pairRenamedIndexes runs Phase 2 of the diff: among the leftover
+// unpaired CREATE INDEX statements from Phase 1, it pairs a sluice-only
+// index with an oracle-only index carrying the same body signature and
+// removes BOTH from the divergence set — a rename (sluice's pgIndexName
+// qualification, GitHub #26), not a loss.
+//
+// The pairing is conservative by construction: a signature is paired
+// only when it is UNIQUE on both sides (exactly one sluice-only and one
+// oracle-only index bear it). Any ambiguity — a signature borne by two
+// indexes on either side (degenerate identical-body indexes) or an
+// unequal count — leaves EVERY index bearing it in the divergence set.
+// Surfacing a false rename is a tolerable false-positive; masking a real
+// drop/add is the false-negative the oracle exists to prevent, so the
+// tie always breaks toward surfacing. A genuinely dropped index (present
+// oracle-side, no sluice-side body match) never acquires a partner and
+// stays a divergence; likewise a genuinely added index, and a
+// renamed-AND-body-changed index (its signature matches nothing) surfaces
+// as a drop+add.
+func pairRenamedIndexes(d *dumpParityDiff) {
+	collect := func(stmts []dumpStatement) map[string][]int {
+		bySig := make(map[string][]int)
+		for i, s := range stmts {
+			if sig, ok := indexBodySignature(s.Body); ok {
+				bySig[sig] = append(bySig[sig], i)
+			}
+		}
+		return bySig
+	}
+	left := collect(d.OnlyInSluice)
+	right := collect(d.OnlyInOracle)
+
+	dropLeft := make(map[int]bool)
+	dropRight := make(map[int]bool)
+	for sig, ls := range left {
+		if rs := right[sig]; len(ls) == 1 && len(rs) == 1 {
+			dropLeft[ls[0]] = true
+			dropRight[rs[0]] = true
+		}
+	}
+	d.OnlyInSluice = dropStatements(d.OnlyInSluice, dropLeft)
+	d.OnlyInOracle = dropStatements(d.OnlyInOracle, dropRight)
+}
+
+// dropStatements returns stmts with the indices flagged in drop removed,
+// preserving order. Returns the input unchanged when nothing is dropped.
+func dropStatements(stmts []dumpStatement, drop map[int]bool) []dumpStatement {
+	if len(drop) == 0 {
+		return stmts
+	}
+	out := make([]dumpStatement, 0, len(stmts)-len(drop))
+	for i, s := range stmts {
+		if !drop[i] {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // removeCommonBodies drops the multiset intersection from both sides

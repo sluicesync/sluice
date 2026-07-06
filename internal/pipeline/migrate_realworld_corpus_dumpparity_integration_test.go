@@ -268,15 +268,22 @@ func TestMigrate_Corpus_DumpParity_Chinook_MySQLToMySQL(t *testing.T) {
 	runCorpusDumpParityMySQL(t, "chinook_mysql.ddl.sql", "", 11, 40)
 }
 
-// Larger corpus members (MediaWiki, Joomla, WordPress) are DELIBERATELY
-// not wired as dump-parity legs yet — see the file header and
-// docs/dev/notes/prep-new-test-surfaces.md. Pointing this identity-keyed
-// comparator at their short, non-table-scoped index names makes sluice's
-// deliberate pgIndexName qualification (GitHub #26; internal/engines/
-// postgres/ddl_emit.go) diverge the index IDENTITY on every secondary
-// index — a documented, non-loss rename that the glob-key allowlist
-// cannot express without a blanket `CREATE INDEX *` that would also mask
-// a genuinely dropped index. Chinook (few secondary indexes, all
-// table-scoped) is the clean tractable floor; broadening the corpus here
-// needs a body-equivalence pairing pass in the comparator, tracked as a
-// follow-up rather than half-solved with an unsafe allowlist.
+// --- MediaWiki: the larger real distribution (64 tables, generated from
+// one abstract schema). ---
+//
+// MediaWiki uses short, table-scoped index names (`wl_user` on
+// `watchlist`) — exactly what sluice's deliberate pgIndexName
+// qualification (GitHub #26; internal/engines/postgres/ddl_emit.go)
+// renames on the PG target (`wl_user` -> `watchlist_wl_user`). Under the
+// identity (verb+kind+NAME) key those renames diverged EVERY secondary
+// index, which is why the corpus could not be wired here before. The
+// comparator's Phase-2 body-equivalence pairing (Finding B;
+// backup.pairRenamedIndexes) now recognizes a renamed-but-identical index
+// as the same index and cancels it — WITHOUT masking a genuinely dropped
+// index (a body signature that finds no partner still surfaces). That is
+// the payoff that makes this leg tractable; a blanket `CREATE INDEX *`
+// allowlist entry would have masked real drops, which is precisely what
+// the pairing pass avoids.
+func TestMigrate_Corpus_DumpParity_MediaWiki_PGToPG(t *testing.T) {
+	runCorpusDumpParityPG(t, "mediawiki_postgres.ddl.sql", nil, 60)
+}
