@@ -266,6 +266,14 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 	}
 	defer rows.Close()
 
+	// Binary-family columns whose literal default information_schema reports
+	// as a hex literal (`0x…`) get a second, authoritative read from SHOW
+	// CREATE TABLE after the scan — information_schema C-string-truncates any
+	// such default at its first NUL byte (see recoverBinaryLiteralDefaults).
+	// Collected here so the recovery runs one SHOW CREATE per affected table,
+	// not per column.
+	var pending []pendingBinaryDefault
+
 	for rows.Next() {
 		var (
 			tableName  string
@@ -320,8 +328,15 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 		}
 		applyGenerated(col, genExpr, meta.Extra)
 		t.Columns = append(t.Columns, col)
+
+		if binaryLiteralDefaultNeedsRecovery(typ, meta.Extra, defaultVal) {
+			pending = append(pending, pendingBinaryDefault{table: tableName, col: col})
+		}
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return r.recoverBinaryLiteralDefaults(ctx, pending)
 }
 
 // populateIndexes fills in Index lists for each table, separating the
@@ -1003,13 +1018,16 @@ func translateDefault(def sql.NullString, extra string, typ ir.Type) ir.DefaultV
 	// genuine string default whose text happens to look like hex — e.g.
 	// `VARCHAR(20) DEFAULT '0x1234'` — reports the IDENTICAL surface form
 	// `0x1234` in COLUMN_DEFAULT and must stay a quoted string literal. The
-	// column type is the only signal that disambiguates the two. Covers the
-	// whole BINARY/VARBINARY family (any width, NUL-bearing/non-printable
-	// values that MySQL reports as a well-formed `0x…` literal); a value
-	// MySQL itself mangles in information_schema (leading-NUL non-UTF8
-	// defaults report a truncated `0x` with no digits) fails this recogniser
-	// and falls through to the verbatim literal path — a MySQL
-	// information_schema limitation sluice cannot read around.
+	// column type is the only signal that disambiguates the two.
+	//
+	// This produces only a PROVISIONAL default: information_schema
+	// C-string-truncates a binary default at its first NUL byte (a leading-NUL
+	// default reports the bare `0x`; a mid/trailing-NUL default reports a
+	// well-formed but SHORT literal, e.g. 0x2700 → `0x27`). populateColumns
+	// re-reads any such column's true bytes from SHOW CREATE TABLE and
+	// overwrites this value — see binaryLiteralDefaultNeedsRecovery /
+	// recoverBinaryLiteralDefaults (Finding C). translateDefault itself stays
+	// pure (no DB handle) and is exercised directly by the reader unit tests.
 	if isBinaryFamilyType(typ) {
 		if hexDef, ok := hexLiteralDefault(def.String); ok {
 			return ir.DefaultExpression{Expr: hexDef, Dialect: hexLiteralDialect}
