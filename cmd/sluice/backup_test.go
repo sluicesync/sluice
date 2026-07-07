@@ -135,6 +135,35 @@ func TestBackupCmdParse(t *testing.T) {
 			expectErr: "target-driver",
 		},
 		{
+			name: "restore --control-keyspace parses",
+			args: []string{
+				"restore",
+				"--from-dir=/tmp/backup",
+				"--target-driver=mysql",
+				"--target=mysql://localhost/db",
+				"--control-keyspace=sidecar",
+			},
+			check: func(t *testing.T, cli *CLI) {
+				if cli.Restore.ControlKeyspace != "sidecar" {
+					t.Errorf("ControlKeyspace = %q; want %q", cli.Restore.ControlKeyspace, "sidecar")
+				}
+			},
+		},
+		{
+			name: "restore --control-keyspace defaults empty",
+			args: []string{
+				"restore",
+				"--from-dir=/tmp/backup",
+				"--target-driver=postgres",
+				"--target=postgres://localhost/db",
+			},
+			check: func(t *testing.T, cli *CLI) {
+				if cli.Restore.ControlKeyspace != "" {
+					t.Errorf("ControlKeyspace default = %q; want empty", cli.Restore.ControlKeyspace)
+				}
+			},
+		},
+		{
 			// Phase 2: --output-dir is no longer required by kong because
 			// --target (URL) is the alternative for cloud backups. The
 			// runtime check inside Run() catches the both-empty case.
@@ -246,4 +275,55 @@ func TestBackupCmdParse(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestRestoreControlKeyspace_ReachesTargetEngine pins that RestoreCmd's
+// --control-keyspace REACHES the target-engine construction via the same
+// applyControlKeyspace chain `sync start` uses (task: chain-restore into a
+// sharded PlanetScale/Vitess target). On a MySQL target an INVALID value is
+// refused loudly by [mysql.Engine.WithControlKeyspace] BEFORE any store / DB
+// access — proving the flag is threaded onto the engine that reaches
+// ChainRestore's OpenChangeApplier, not dropped. An explicit flag needs no
+// vtgate probe (ResolveControlKeyspace returns it verbatim), so this stays a
+// unit test. On a non-MySQL (Postgres) target applyControlKeyspace is inert, so
+// the same invalid value is NOT refused at the keyspace step — the run fails
+// later, elsewhere.
+func TestRestoreControlKeyspace_ReachesTargetEngine(t *testing.T) {
+	const badKeyspace = "bad keyspace.name"
+
+	t.Run("invalid control-keyspace on a MySQL target → loud refusal", func(t *testing.T) {
+		r := &RestoreCmd{
+			FromDir:         t.TempDir(),
+			TargetDriver:    "mysql",
+			Target:          "mysql://u:p@dst:3306/app",
+			ControlKeyspace: badKeyspace,
+			Format:          "text",
+		}
+		env := newEnvelopeRun("restore", r.Format)
+		err := r.run(testFleetGlobals(), env)
+		if err == nil {
+			t.Fatal("run with invalid --control-keyspace on a mysql target = nil; want a loud refusal naming the bad keyspace")
+		}
+		if !strings.Contains(err.Error(), "control-keyspace") {
+			t.Errorf("err = %v; want it to name --control-keyspace (proves the flag reached the engine)", err)
+		}
+	})
+
+	t.Run("invalid control-keyspace on a non-MySQL target → inert (not refused at keyspace)", func(t *testing.T) {
+		r := &RestoreCmd{
+			FromDir:         t.TempDir(),
+			TargetDriver:    "postgres",
+			Target:          "postgres://u:p@dst:5432/app",
+			ControlKeyspace: badKeyspace,
+			Format:          "text",
+		}
+		env := newEnvelopeRun("restore", r.Format)
+		err := r.run(testFleetGlobals(), env)
+		// A Postgres target makes applyControlKeyspace inert, so the run
+		// proceeds past it and fails later (reading the absent manifest from
+		// the empty temp dir) — never at the control-keyspace step.
+		if err != nil && strings.Contains(err.Error(), "control-keyspace") {
+			t.Errorf("err = %v; a non-MySQL target must not refuse at --control-keyspace (it is inert there)", err)
+		}
+	})
 }
