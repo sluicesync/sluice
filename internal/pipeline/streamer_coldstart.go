@@ -108,6 +108,17 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		return nil, stop, err
 	}
 
+	// --skip-foreign-keys (opt-in): create no FK constraints on the target at
+	// cold-start (runBulkCopyWithOpts → CreateConstraints would otherwise
+	// create them), but keep each skipped FK's referencing column tuple
+	// indexed so joins stay fast on a target with no FKs. Applied on the
+	// finalized schema (after coldStartPrepareSchema's mappings / expression
+	// overrides / shard injection) and before any target DDL. CDC apply never
+	// creates FKs, so steady-state is unaffected. No-op when unset.
+	if s.SkipForeignKeys {
+		logSkipForeignKeys(ctx, applySkipForeignKeys(schema))
+	}
+
 	// Cross-engine schema-narrowing advisory notices (Bug 157 Q2). The
 	// same advisory WARNs the migrate path emits (unsigned-bigint
 	// narrowing / unconstrained-numeric widening / wide-varchar down-map)

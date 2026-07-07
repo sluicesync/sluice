@@ -264,6 +264,18 @@ type Streamer struct {
 	// to round-trip the definitions on cold-start.
 	SkipViews bool
 
+	// SkipForeignKeys, when true, creates NO foreign-key constraints on the
+	// target at cold-start (`--skip-foreign-keys`), while keeping each
+	// skipped FK's referencing column tuple indexed — a deterministic backing
+	// index is synthesized for any FK whose columns no existing target index
+	// already covers as a left-prefix (see applySkipForeignKeys). Only the
+	// cold-start DDL path creates FKs (runBulkCopyWithOpts → CreateConstraints);
+	// steady-state CDC apply never does, so this is a cold-start-only shaping
+	// step. The primary use case is a continuous-sync transition onto a target
+	// with limited FK support (Vitess/PlanetScale sharded keyspaces) or when
+	// FKs are managed out-of-band. Default off — byte-identical to before.
+	SkipForeignKeys bool
+
 	// SkipORMTables, when true, drops recognized ORM/framework
 	// migration-bookkeeping tables (flyway_schema_history,
 	// _prisma_migrations, schema_migrations, …) from the cold-start

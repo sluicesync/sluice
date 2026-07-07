@@ -255,11 +255,19 @@ func (m *Migrator) runMultiDatabase(ctx context.Context) error {
 			slog.Int("databases", len(selected)))
 		return nil
 	}
-	for i, perDB := range perRuns {
-		database := selected[i]
-		scope := &multiDBScope{database: database, inScope: inScope}
-		if err := perDB.applyDeferredConstraints(ctx, scope); err != nil {
-			return fmt.Errorf("pipeline: apply foreign keys for database %q: %w", database, err)
+	// --skip-foreign-keys: each per-database run already stripped its FKs and
+	// synthesized the backing indexes (see phaseReadSourceSchema), so the
+	// cross-database FK pass must NOT run — there are no FKs to create.
+	if m.SkipForeignKeys {
+		slog.InfoContext(ctx, "multi-database migrate: --skip-foreign-keys set; foreign keys not created "+
+			"(each database kept its referencing columns indexed)", slog.Int("databases", len(selected)))
+	} else {
+		for i, perDB := range perRuns {
+			database := selected[i]
+			scope := &multiDBScope{database: database, inScope: inScope}
+			if err := perDB.applyDeferredConstraints(ctx, scope); err != nil {
+				return fmt.Errorf("pipeline: apply foreign keys for database %q: %w", database, err)
+			}
 		}
 	}
 

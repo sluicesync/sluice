@@ -601,7 +601,16 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	// cross-database FK pass can be added when demand surfaces. Strip them
 	// so the per-database CreateConstraints emits nothing cross-database
 	// that doesn't yet exist on the target.
-	stripForeignKeys(schema)
+	//
+	// --skip-foreign-keys additionally synthesizes the backing indexes for
+	// each FK's referencing columns before stripping (this multi-database
+	// path never re-creates the FKs, so index synthesis is the only extra
+	// work versus the plain deferral).
+	if s.SkipForeignKeys {
+		logSkipForeignKeys(ctx, applySkipForeignKeys(schema))
+	} else {
+		stripForeignKeys(schema)
+	}
 
 	// ---- Per-database target writers. ----
 	// target is the source namespace's renamed TARGET (ADR-0142; identity

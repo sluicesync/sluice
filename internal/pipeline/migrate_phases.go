@@ -117,7 +117,17 @@ func (m *Migrator) phaseReadSourceSchema(ctx context.Context, scope *multiDBScop
 	// the same deferral — uniform and harmless. The carve-out's
 	// out-of-scope refusal already fired at ReadSchema, so the FKs
 	// reaching here are all in-scope and safe to re-apply later.
-	if m.multiDBDeferFKs {
+	//
+	// --skip-foreign-keys takes precedence over the multi-database deferral:
+	// both strip FKs, but skip-foreign-keys ALSO synthesizes the backing
+	// indexes for each FK's referencing columns (so joins stay fast on a
+	// target with no FKs) AND suppresses the final cross-database FK pass
+	// (see runMultiDatabase). Applied here — right where the deferral strips
+	// FKs — so every downstream phase (dry-run plan, index phase, constraints
+	// phase) sees the transformed schema. No-op when unset (byte-identical).
+	if m.SkipForeignKeys {
+		logSkipForeignKeys(ctx, applySkipForeignKeys(schema))
+	} else if m.multiDBDeferFKs {
 		stripForeignKeys(schema)
 	}
 

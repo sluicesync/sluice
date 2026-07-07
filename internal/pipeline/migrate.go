@@ -453,6 +453,24 @@ type Migrator struct {
 	// `docs/dev/notes/pgcopydb-planetscale-fork-review.md`.
 	AllowDegradedFKs bool
 
+	// SkipForeignKeys opts into creating NO foreign-key constraints on the
+	// target (`--skip-foreign-keys`) while keeping each skipped FK's
+	// referencing column tuple indexed: for every FK, if no existing target
+	// index already covers its referencing columns as a left-prefix, a
+	// deterministic non-unique backing index is synthesized on that tuple.
+	// The transform runs once on the finalized schema, before any DDL phase
+	// (see applySkipForeignKeys), so the FK phase (CreateConstraints) creates
+	// nothing and the synthesized indexes ride the ordinary idempotent
+	// CreateIndexes phase. Engine-agnostic; the primary use case is targets
+	// with limited FK support (Vitess/PlanetScale sharded keyspaces) or when
+	// FKs are managed out-of-band. On a MySQL target it also preserves the
+	// backing index MySQL would otherwise create only alongside the FK.
+	//
+	// Mutually exclusive with AllowDegradedFKs (opposite intents: one skips
+	// FK creation entirely, the other creates FKs and tolerates dirty rows) —
+	// refused loudly in validate. Default off — byte-identical to before.
+	SkipForeignKeys bool
+
 	// SkipORMTables, when true, drops recognized ORM/framework
 	// migration-bookkeeping tables (flyway_schema_history,
 	// _prisma_migrations, schema_migrations, …) from the source schema
@@ -1520,6 +1538,9 @@ func (m *Migrator) validate() error {
 		return errors.New("pipeline: TargetDSN is empty")
 	case m.Resume && m.ResetTargetData:
 		return errors.New("pipeline: --resume and --reset-target-data are mutually exclusive")
+	case m.SkipForeignKeys && m.AllowDegradedFKs:
+		return errors.New("pipeline: --skip-foreign-keys and --allow-degraded-fks are mutually exclusive " +
+			"(one skips FK creation entirely; the other creates FKs and tolerates dirty source rows)")
 	}
 	if err := migcore.ValidateTargetSchema(m.Target, m.TargetSchema); err != nil {
 		return err

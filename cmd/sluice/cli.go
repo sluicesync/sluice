@@ -258,6 +258,8 @@ type MigrateCmd struct {
 
 	AllowDegradedFKs bool `help:"Tolerate dirty foreign-key sources: when ALTER TABLE ... ADD CONSTRAINT FOREIGN KEY fails with SQLSTATE 23503 (orphan rows on the child table), retry as NOT VALID and surface the degraded constraint at the end of the run. The FK is still attached on the target catalog and rejects new writes that would orphan rows; the operator runs ALTER TABLE ... VALIDATE CONSTRAINT <name> after fixing the orphans. Default off — loud-failure-on-dirty-source stays baseline. PG-target only (mirrors pgcopydb PR #27): MySQL has no per-constraint NOT VALID semantic and refuses loudly when this flag is set against a MySQL target. See docs/dev/notes/pgcopydb-planetscale-fork-review.md."`
 
+	SkipForeignKeys bool `help:"Skip creating foreign-key constraints on the target, and instead ensure each skipped FK's referencing column tuple is indexed (an index is synthesized only if an existing target index doesn't already cover those columns as a left-prefix). Engine-agnostic. Primary use case: targets with limited FK support (Vitess/PlanetScale sharded keyspaces) or when FKs are managed out-of-band — transition an FK-bearing source WITHOUT stripping FKs from it first. On a MySQL target this also preserves the backing index MySQL would otherwise create only alongside the FK. Mutually exclusive with --allow-degraded-fks (opposite intents: one skips FK creation, the other creates FKs and tolerates dirty rows)."`
+
 	Redact       []string `help:"Redact a PII column (repeatable). Format: '[schema.]table.column=STRATEGY[:options]'. Strategies: null (NULLABLE columns only), static:<value>, hash:sha256, hash:hmac-sha256[:<keyname>] (requires --keyset-source), truncate:<n>, mask:inner:<m1>,<m2>[,<char>], mask:outer:<m1>,<m2>[,<char>], mask:ssn, mask:pan, mask:pan-relaxed, mask:email, mask:ca-sin, mask:uk-nin, mask:iban, mask:uuid (Phase 2.b country/format presets, v0.57.0+), randomize:int:<min>,<max>, randomize:email, randomize:us-phone, randomize:uuid (Phase 2.c first wave, v0.59.0+), randomize:ssn, randomize:pan[:<brand>], randomize:ca-sin, randomize:uk-nin, randomize:iban[:<country-code>] (Phase 2.c second wave, v0.60.0+; brand: visa|mastercard|amex; country: DE|GB|FR; all randomize:* require a PK on the source table), randomize:dict:<name>, tokenize:dict:<name>[:<keyname>] (Phase 3 v0.61.0+, keyset-sourced in Phase 4 v0.62.0+; dictionaries declared in YAML 'dictionaries:' block — CLI form REQUIRES YAML config to declare the dictionary content). Examples: --redact users.email=hash:sha256, --redact users.pan=mask:pan, --redact users.id=mask:uuid, --redact users.age=randomize:int:18,90, --redact users.first_name=tokenize:dict:first_names. Bulk-copy + CDC paths both honour --redact. YAML form available under config 'redactions:' block. See docs/dev/notes/prep-pii-redaction-phase-1.md." placeholder:"RULE" sep:"none"`
 	KeysetSource string   `help:"Operator keyset source for keyset-using redaction strategies (hash:hmac-sha256, tokenize:dict). PII Phase 4 (ADR-0041). Forms: 'file:PATH' (keyset YAML on disk), 'env:VARNAME' (keyset YAML in an env var), 'db:DSN' (sluice_keysets table on the named DSN — shared across streams for cross-stream surrogate stability). Resolved ONCE at startup; rotation takes effect on next process restart only (no hot-reload). Required when any --redact / YAML rule uses hash:hmac-sha256 or tokenize:dict — the Phase 1 --redact-key-source flag and the built-in v0.61.0 tokenize key were removed." placeholder:"SRC"`
 
@@ -321,6 +323,10 @@ func (m *MigrateCmd) run(g *Globals, env *envelopeRun) error {
 	}
 	if m.IncludeORMTables && m.SkipORMTables {
 		return errors.New("--include-orm-tables and --skip-orm-tables are mutually exclusive")
+	}
+	if m.SkipForeignKeys && m.AllowDegradedFKs {
+		return errors.New("--skip-foreign-keys and --allow-degraded-fks are mutually exclusive " +
+			"(one skips FK creation entirely; the other creates FKs and tolerates dirty source rows)")
 	}
 	includeNS, excludeNS, allNS, err := resolveNamespaceScopeArgs(
 		m.IncludeDatabase, m.ExcludeDatabase, m.AllDatabases,
@@ -437,6 +443,7 @@ func (m *MigrateCmd) run(g *Globals, env *envelopeRun) error {
 		InjectShardColumn:     shardSpec,
 		AllowCrossShardMerge:  m.AllowCrossShardMerge,
 		AllowDegradedFKs:      m.AllowDegradedFKs,
+		SkipForeignKeys:       m.SkipForeignKeys,
 		// ADR-0143: skip ORM migration-history tables by default ONLY on a
 		// CROSS-engine migration (the source's migration history is invalid on a
 		// different target engine); a same-engine migration KEEPS them by default
@@ -925,6 +932,8 @@ type SyncStartCmd struct {
 	IncludeView []string `help:"Only create these views on the target during cold-start (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --exclude-view. Views are not replicated by CDC; this filter only affects the cold-start schema-apply phase." sep:"," placeholder:"VIEW"`
 	ExcludeView []string `help:"Skip these views during cold-start schema-apply (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-view." sep:"," placeholder:"VIEW"`
 	SkipViews   bool     `help:"Skip view creation entirely on cold-start. Views are not replicated by CDC, so this only affects the initial schema-apply step."`
+
+	SkipForeignKeys bool `help:"Skip creating foreign-key constraints on the target at cold-start, and instead ensure each skipped FK's referencing column tuple is indexed (an index is synthesized only if an existing target index doesn't already cover those columns as a left-prefix). Only the cold-start schema-apply creates FKs — steady-state CDC apply never does — so this affects the initial cold-start only. Primary use case: a continuous-sync transition onto a target with limited FK support (Vitess/PlanetScale sharded keyspaces) or when FKs are managed out-of-band. On a MySQL target this also preserves the backing index MySQL would otherwise create only alongside the FK."`
 
 	IncludeORMTables bool `help:"Keep ORM/framework migration-bookkeeping tables (flyway_schema_history, _prisma_migrations, …). On a CROSS-engine migration they are skipped by default (the source's migration history is invalid on a different target engine); this flag forces keeping them. Mutually exclusive with --skip-orm-tables."`
 	SkipORMTables    bool `help:"Skip ORM/framework migration-bookkeeping tables (flyway_schema_history, _prisma_migrations, …). On a SAME-engine migration they are kept by default (the migration history is valid); this flag forces skipping them. Mutually exclusive with --include-orm-tables."`
@@ -1646,6 +1655,7 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 		Filter:             filter,
 		ViewFilter:         viewFilter,
 		SkipViews:          s.SkipViews,
+		SkipForeignKeys:    s.SkipForeignKeys,
 		// ADR-0143: skip ORM migration-history tables by default ONLY on a
 		// CROSS-engine sync; a same-engine sync KEEPS them by default (the history
 		// is valid). --include-orm-tables / --skip-orm-tables override. (The
