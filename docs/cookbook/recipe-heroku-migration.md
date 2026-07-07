@@ -8,8 +8,8 @@ included if you've ever tried.
 
 This recipe is the **slot-less path**: a one-shot migrate via
 `sluice migrate`, then ongoing replication via sluice's
-`postgres-trigger` engine (when it ships its sync surface) or a
-`pg_dump`-style operational cutover (today). The recipe also covers
+`postgres-trigger` engine (a slot-less, trigger-based CDC path) or a
+`pg_dump`-style operational cutover. The recipe also covers
 the *correct* expectations to set going in — Heroku Postgres won't
 behave like an unrestricted PG, and a few sluice features intentionally
 refuse loudly when pointed at it.
@@ -71,32 +71,37 @@ get handled cleanly per [case-gitlab.md](case-gitlab.md).
 
 `sluice sync start` for the **slot-based** PG CDC reader refuses
 loudly when the source role lacks `rolreplication`. The error names
-the missing attribute and points at the documented recovery (which
-on Heroku is "use a different target tier" or "use trigger-based
-sync when it ships"). This is the correct behavior — silently
-falling back to a polling model would hide the constraint from the
-operator and produce surprising latency.
+the missing attribute and points at the documented recovery — on
+Heroku, `--source-driver=postgres-trigger` (the slot-less path
+below). This is the correct behavior — silently falling back to a
+polling model would hide the constraint from the operator and
+produce surprising latency.
 
-## The postgres-trigger path (where it ships)
+## The postgres-trigger path (slot-less CDC)
 
 sluice's `postgres-trigger` engine is the slot-less CDC variant:
 plpgsql triggers on the source tables write into a
 `sluice_change_log` capture table; the reader tails the log.
 **Setup is `sluice trigger setup --dsn=... --tables=...`**
 on the Heroku source, then the same `sluice sync start` you'd
-use for slot-based CDC.
+use for slot-based CDC, and `sluice trigger teardown` when done.
 
-Today the `postgres-trigger` engine is the focus of an active
-work track — see the [postgres-vs-bucardo comparison](../comparison-bucardo.md)
-for the measured head-to-head. The recipe block below is the
-shape it lands as when the sync surface ships; for migrate today,
-use the `sluice migrate` block above.
+This is a shipped, first-class engine — see the
+[postgres-vs-bucardo comparison](../comparison-bucardo.md) for the
+measured head-to-head, and the full
+[Managed Postgres (slot-less)](https://sluicesync.com/docs/managed-postgres-slotless/)
+guide for the complete setup → run → teardown walkthrough. On Heroku
+specifically, the connecting role can't `CREATE EVENT TRIGGER`, so
+opt into the polled schema-fingerprint fallback for DDL detection
+with `--allow-polled-fingerprint` (the command refuses loudly
+without it, so the weaker DDL-detection mode is an explicit choice):
 
 ```sh
-# (forthcoming) Slot-less CDC sync on Heroku:
+# Slot-less CDC sync on Heroku:
 sluice trigger setup \
     --dsn "$(heroku config:get DATABASE_URL --app myapp)?sslmode=require" \
-    --tables 'users,orders,items'
+    --tables 'users,orders,items' \
+    --allow-polled-fingerprint
 
 sluice sync start \
     --source-driver postgres-trigger \
@@ -212,6 +217,12 @@ collisions.
 
 ## See also
 
+- [Managed Postgres (slot-less)](https://sluicesync.com/docs/managed-postgres-slotless/)
+  — the full `postgres-trigger` setup → run → teardown guide.
+- [`sluicesync/sluice-heroku-migrator`](https://github.com/sluicesync/sluice-heroku-migrator)
+  — a hands-off, dashboard-driven wrapper (a fork of PlanetScale's
+  `heroku-migrator` with Bucardo swapped for sluice's `postgres-trigger`
+  engine) that automates this exact setup → sync → cutover flow.
 - [`docs/postgres-source-prep.md`](../postgres-source-prep.md) — the
   per-feature PG source requirements.
 - [`docs/comparison-bucardo.md`](../comparison-bucardo.md) — the
