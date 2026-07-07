@@ -72,6 +72,16 @@ type SyncSpec struct {
 	SlotName     string `koanf:"slot-name"`
 	TargetSchema string `koanf:"target-schema"`
 
+	// ControlKeyspace is the per-sync --control-keyspace (the sidecar-keyspace
+	// feature), mirroring `sync start --control-keyspace` for the fleet: on a
+	// SHARDED MySQL/PlanetScale/Vitess TARGET the stream's vindex-less CDC
+	// control tables must live in a separate UNSHARDED keyspace. Empty defers to
+	// the SAME auto-detect the single-target flag uses (sharded target ⇒ pick the
+	// sole unsharded sidecar keyspace; unsharded/non-Vitess target ⇒ the data
+	// keyspace, unchanged). Set it to override. Threaded to the target engine via
+	// applyControlKeyspace for BOTH `sync run` and `sync status --all`.
+	ControlKeyspace string `koanf:"control-keyspace"`
+
 	// ZeroDate is the per-sync MySQL zero/partial-date policy (ADR-0127):
 	// error | null | epoch. Empty defers to the process-global --zero-date.
 	// Sugar over the source DSN's `zero_date` param — it is validated at
@@ -522,7 +532,7 @@ func buildSupervisedFleet(ctx context.Context, fleet *SyncFleetConfig, g *Global
 	}
 	for i := range fleet.Syncs {
 		spec := &fleet.Syncs[i]
-		streamer, err := buildStreamerFromSpec(spec, g)
+		streamer, err := buildStreamerFromSpec(ctx, spec, g)
 		if err != nil {
 			_ = closeProviders()
 			return nil, nil, fmt.Errorf("sync run: %s: %w", spec.describe(i), err)
@@ -605,8 +615,11 @@ func (s *SyncSpec) fingerprint() string {
 
 // buildStreamerFromSpec maps a SyncSpec to a *pipeline.Streamer, reusing
 // the exact `sync start` helpers so a fleet sync behaves identically to
-// the same flags on the standalone command.
-func buildStreamerFromSpec(spec *SyncSpec, g *Globals) (*pipeline.Streamer, error) {
+// the same flags on the standalone command. ctx scopes the one live probe
+// the mapping may issue — the --control-keyspace auto-detect on a MySQL/
+// VStream target (empty spec.ControlKeyspace + sharded target); every other
+// target resolves it without connecting.
+func buildStreamerFromSpec(ctx context.Context, spec *SyncSpec, g *Globals) (*pipeline.Streamer, error) {
 	source, err := resolveEngine(spec.SourceDriver)
 	if err != nil {
 		return nil, fmt.Errorf("source-driver: %w", err)
@@ -658,6 +671,15 @@ func buildStreamerFromSpec(spec *SyncSpec, g *Globals) (*pipeline.Streamer, erro
 		return nil, err
 	}
 	if target, err = applyEngineOptions(target, g); err != nil {
+		return nil, err
+	}
+
+	// --control-keyspace parity with `sync start` (task 1): resolve + record the
+	// sidecar control keyspace on the MySQL/VStream target so a sharded-target
+	// fleet sync routes its CDC control tables to the right unsharded keyspace.
+	// Empty defers to the same auto-detect; a non-MySQL or unsharded target is
+	// inert (returned unchanged).
+	if target, err = applyControlKeyspace(ctx, target, spec.ControlKeyspace, spec.Target); err != nil {
 		return nil, err
 	}
 

@@ -365,7 +365,7 @@ func TestSharedTargetGroups(t *testing.T) {
 // helpers, exercised through buildStreamerFromSpec.
 func TestSyncSpecDefaults(t *testing.T) {
 	spec := pgSpec("a", "slot_a")
-	streamer, err := buildStreamerFromSpec(&spec, testFleetGlobals())
+	streamer, err := buildStreamerFromSpec(context.Background(), &spec, testFleetGlobals())
 	if err != nil {
 		t.Fatalf("buildStreamerFromSpec: %v", err)
 	}
@@ -391,4 +391,56 @@ func TestSyncSpecDefaults(t *testing.T) {
 	if streamer.ApplyBatchSize != 1000 {
 		t.Errorf("ApplyBatchSize = %d; want 1000 (auto → mysql/postgres ceiling)", streamer.ApplyBatchSize)
 	}
+}
+
+// TestLoadFleetConfig_ParsesControlKeyspace pins that the koanf loader decodes
+// the `control-keyspace` YAML key into SyncSpec.ControlKeyspace (task 1).
+func TestLoadFleetConfig_ParsesControlKeyspace(t *testing.T) {
+	path := writeFleetYAML(t, `
+syncs:
+  - stream-id: orders
+    source-driver: postgres
+    source: postgres://u:p@src:5432/app
+    target-driver: planetscale
+    target: mysql://u:p@dst:3306/app
+    slot-name: orders
+    control-keyspace: sidecar
+`)
+	fleet, err := loadFleetConfig(path)
+	if err != nil {
+		t.Fatalf("loadFleetConfig: %v", err)
+	}
+	if got := fleet.Syncs[0].ControlKeyspace; got != "sidecar" {
+		t.Errorf("ControlKeyspace = %q; want %q", got, "sidecar")
+	}
+}
+
+// TestBuildStreamerFromSpec_ControlKeyspace pins that a spec's control-keyspace
+// REACHES the target engine-construction path (task 1): an explicit value is
+// recorded on the MySQL/VStream target engine via the same applyControlKeyspace
+// chain `sync start` uses, and an INVALID value is refused there — proving the
+// value is threaded through, not dropped. An explicit flag needs no vtgate probe
+// (ResolveControlKeyspace returns it verbatim), so these stay unit tests.
+func TestBuildStreamerFromSpec_ControlKeyspace(t *testing.T) {
+	t.Run("valid control-keyspace on a MySQL target → recorded, no error", func(t *testing.T) {
+		spec := pgSpec("a", "slot_a") // pgSpec targets a mysql engine
+		spec.ControlKeyspace = "sidecar"
+		if _, err := buildStreamerFromSpec(context.Background(), &spec, testFleetGlobals()); err != nil {
+			t.Fatalf("buildStreamerFromSpec with valid control-keyspace: %v", err)
+		}
+	})
+	t.Run("invalid control-keyspace → loud refusal from the engine path", func(t *testing.T) {
+		spec := pgSpec("a", "slot_a") // pgSpec targets a mysql engine
+		spec.ControlKeyspace = "bad keyspace.name"
+		_, err := buildStreamerFromSpec(context.Background(), &spec, testFleetGlobals())
+		if err == nil {
+			t.Fatal("buildStreamerFromSpec with invalid control-keyspace = nil; want an error naming the bad keyspace")
+		}
+	})
+	t.Run("unset control-keyspace on a non-VStream target → inert, no error", func(t *testing.T) {
+		spec := pgSpec("a", "slot_a")
+		if _, err := buildStreamerFromSpec(context.Background(), &spec, testFleetGlobals()); err != nil {
+			t.Fatalf("buildStreamerFromSpec with unset control-keyspace: %v", err)
+		}
+	})
 }

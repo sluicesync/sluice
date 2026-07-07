@@ -102,6 +102,7 @@ syncs:
     target-driver: mysql
     target: mysql://user:pass@dst:3306/app
     slot-name: orders          # distinct per Postgres source — see §4
+    control-keyspace: ""       # MySQL/PlanetScale/Vitess target only; unsharded sidecar keyspace for CDC control tables. Omit to auto-detect on a sharded target.
     apply-concurrency: 4
     apply-delay: 0s
     notify-slack: ""           # credential via env, as today
@@ -113,6 +114,9 @@ restart:
 
 Per-sync knobs are a CURATED SUBSET of `Streamer`'s fields — the ones that matter
 for a fleet: source/target driver+DSN, stream-id, slot-name, target-schema,
+control-keyspace (the MySQL/PlanetScale/Vitess sidecar keyspace for CDC control
+tables — empty auto-detects on a sharded target, mirroring `sync start
+--control-keyspace`; threaded through for both `sync run` and `sync status --all`),
 table filters, type/expr overrides, apply-concurrency / apply-batch-size /
 no-auto-tune / apply-delay / max-buffer-bytes / apply-exec-timeout / apply-retry-*,
 metrics-listen, heartbeat-interval, poll-interval, schema-changes, and the

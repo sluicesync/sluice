@@ -58,31 +58,37 @@ func runStatusAllWatch(ctx context.Context, fleet *SyncFleetConfig, out io.Write
 
 // targetStreamLister lists the streams recorded on one target. Injected
 // so the fleet aggregation (dedup + failure-isolation) is unit-testable
-// without real databases; production passes listTargetStreams.
-type targetStreamLister func(ctx context.Context, driver, dsn string) ([]ir.StreamStatus, error)
+// without real databases; production passes listTargetStreams. controlKeyspace
+// is the per-sync --control-keyspace (task 1) — the sidecar keyspace whose
+// control tables the streams live in on a sharded MySQL/VStream target.
+type targetStreamLister func(ctx context.Context, driver, dsn, controlKeyspace string) ([]ir.StreamStatus, error)
 
 // collectFleetStreams opens each distinct target applier in the fleet,
 // lists its streams, and returns the merged set. Distinct targets are
-// keyed by driver+DSN so a shared target is queried once. An applier
-// open / list failure for one target is reported to out and skipped, so
-// one unreachable target doesn't blank the rest of the fleet view.
+// keyed by driver+DSN+control-keyspace so a shared target is queried once —
+// but two syncs pointing at the same server through DIFFERENT control
+// keyspaces are queried separately, since their control tables (and thus
+// their stream rows) live in different keyspaces. An applier open / list
+// failure for one target is reported to out and skipped, so one unreachable
+// target doesn't blank the rest of the fleet view.
 func collectFleetStreams(ctx context.Context, fleet *SyncFleetConfig, out io.Writer, list targetStreamLister) ([]ir.StreamStatus, error) {
 	type targetRef struct {
-		driver string
-		dsn    string
+		driver          string
+		dsn             string
+		controlKeyspace string
 	}
 	seen := make(map[targetRef]bool)
 	var merged []ir.StreamStatus
 
 	for i := range fleet.Syncs {
 		spec := &fleet.Syncs[i]
-		ref := targetRef{driver: spec.TargetDriver, dsn: spec.Target}
+		ref := targetRef{driver: spec.TargetDriver, dsn: spec.Target, controlKeyspace: spec.ControlKeyspace}
 		if seen[ref] {
 			continue
 		}
 		seen[ref] = true
 
-		streams, err := list(ctx, ref.driver, ref.dsn)
+		streams, err := list(ctx, ref.driver, ref.dsn, ref.controlKeyspace)
 		if err != nil {
 			// Failure-isolated: report and keep going.
 			fmt.Fprintf(out, "status --all: target %s://%s unreachable: %v\n",
@@ -95,11 +101,17 @@ func collectFleetStreams(ctx context.Context, fleet *SyncFleetConfig, out io.Wri
 }
 
 // listTargetStreams opens a one-shot applier for the given target and
-// returns its recorded streams. The applier is closed before returning.
-func listTargetStreams(ctx context.Context, driver, dsn string) ([]ir.StreamStatus, error) {
+// returns its recorded streams. controlKeyspace is resolved + recorded on the
+// engine (same applyControlKeyspace chain as `sync start`) BEFORE the applier
+// opens, so a sharded MySQL/VStream target's control tables are read from the
+// right sidecar keyspace. The applier is closed before returning.
+func listTargetStreams(ctx context.Context, driver, dsn, controlKeyspace string) ([]ir.StreamStatus, error) {
 	target, err := resolveEngine(driver)
 	if err != nil {
 		return nil, fmt.Errorf("target-driver: %w", err)
+	}
+	if target, err = applyControlKeyspace(ctx, target, controlKeyspace, dsn); err != nil {
+		return nil, err
 	}
 	applier, err := target.OpenChangeApplier(ctx, dsn)
 	if err != nil {

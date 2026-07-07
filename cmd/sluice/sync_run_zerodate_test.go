@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -119,7 +120,7 @@ func TestIsMySQLSourceDriver(t *testing.T) {
 func TestBuildStreamerFromSpec_ZeroDate(t *testing.T) {
 	t.Run("mysql source → param folded into SourceDSN", func(t *testing.T) {
 		spec := mysqlSpecZeroDate("a", "epoch")
-		streamer, err := buildStreamerFromSpec(&spec, testFleetGlobals())
+		streamer, err := buildStreamerFromSpec(context.Background(), &spec, testFleetGlobals())
 		if err != nil {
 			t.Fatalf("buildStreamerFromSpec: %v", err)
 		}
@@ -129,7 +130,7 @@ func TestBuildStreamerFromSpec_ZeroDate(t *testing.T) {
 	})
 	t.Run("mysql source, unset → SourceDSN unchanged", func(t *testing.T) {
 		spec := mysqlSpec("a")
-		streamer, err := buildStreamerFromSpec(&spec, testFleetGlobals())
+		streamer, err := buildStreamerFromSpec(context.Background(), &spec, testFleetGlobals())
 		if err != nil {
 			t.Fatalf("buildStreamerFromSpec: %v", err)
 		}
@@ -139,7 +140,7 @@ func TestBuildStreamerFromSpec_ZeroDate(t *testing.T) {
 	})
 	t.Run("postgres source → SourceDSN unchanged", func(t *testing.T) {
 		spec := pgSpec("a", "slot_a")
-		streamer, err := buildStreamerFromSpec(&spec, testFleetGlobals())
+		streamer, err := buildStreamerFromSpec(context.Background(), &spec, testFleetGlobals())
 		if err != nil {
 			t.Fatalf("buildStreamerFromSpec: %v", err)
 		}

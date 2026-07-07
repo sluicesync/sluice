@@ -11,7 +11,7 @@ Run and monitor a fleet of syncs from a single `sluice sync run` process, each f
 The user has multiple source→target sync streams and wants one supervised process managing them, with fleet-wide monitoring — instead of one `sync start` per pair.
 
 ## Inputs you need
-- A `syncs.yaml` **fleet config** (the global `--config` file): a `syncs:` list plus an optional `restart:` policy. Each entry is a curated subset of the `sync start` flags (kebab-case keys: `stream-id`, `source-driver`, `source`, `target-driver`, `target`, `slot-name`, `include-table`, `type-override`, `apply-batch-size`, `poll-interval`, per-leg `notify-*`, optional per-leg `planetscale-*`, `zero-date`, …).
+- A `syncs.yaml` **fleet config** (the global `--config` file): a `syncs:` list plus an optional `restart:` policy. Each entry is a curated subset of the `sync start` flags (kebab-case keys: `stream-id`, `source-driver`, `source`, `target-driver`, `target`, `slot-name`, `target-schema`, `control-keyspace` (MySQL/PlanetScale/Vitess target only — the unsharded sidecar keyspace for CDC control tables; omit to auto-detect on a sharded target), `include-table`, `type-override`, `apply-batch-size`, `poll-interval`, per-leg `notify-*`, optional per-leg `planetscale-*`, `zero-date`, …).
 - Credentials via env, never committed to the YAML: DSNs' secrets, `SLUICE_NOTIFY_*`, `PLANETSCALE_METRICS_TOKEN_ID`/`_TOKEN`.
 
 ## Steps

@@ -118,13 +118,17 @@ func (e Engine) ResolveControlKeyspace(ctx context.Context, dsn, explicitFlag st
 
 // discoverUnshardedKeyspaces returns the connected keyspace's shard count plus
 // the names of every UNSHARDED keyspace the vtgate serves. Today it derives both
-// from a single [discoverAllShards] (SHOW VITESS_SHARDS returns every served
-// keyspace's shards, so one round trip classifies them all). If a future
+// from a single [discoverAllShardsForKeyspace] (SHOW VITESS_SHARDS returns every
+// served keyspace's shards, so one round trip classifies them all; the wrapper
+// adds the fresh-keyspace retry-on-empty). If a future
 // PlanetScale scoping change hides sibling keyspaces from that statement, swap
 // the enumeration here for SHOW KEYSPACES + a per-keyspace SHOW VITESS_SHARDS
 // classification — [selectControlKeyspace] and its callers are unaffected.
 func discoverUnshardedKeyspaces(ctx context.Context, cfg *gomysql.Config) (targetShardCount int, unsharded []string, err error) {
-	shardMap, err := discoverAllShards(ctx, cfg)
+	// Retry-on-empty (2a): a fresh keyspace can transiently report zero shards
+	// for cfg.DBName; ride that the same bounded way the reader's enumeration
+	// does before classifying the target as unsharded (which resolves to "").
+	shardMap, err := discoverAllShardsForKeyspace(ctx, cfg, cfg.DBName)
 	if err != nil {
 		return 0, nil, err
 	}

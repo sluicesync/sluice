@@ -509,7 +509,7 @@ func discoverShards(ctx context.Context, cfg *gomysql.Config, keyspace string) (
 	if keyspace == "" {
 		return nil, errors.New("mysql/vstream: discoverShards: empty keyspace")
 	}
-	all, err := discoverAllShards(ctx, cfg)
+	all, err := discoverAllShardsForKeyspace(ctx, cfg, keyspace)
 	if err != nil {
 		return nil, err
 	}
@@ -522,6 +522,97 @@ func discoverShards(ctx context.Context, cfg *gomysql.Config, keyspace string) (
 	// particular order from SHOW VITESS_SHARDS.
 	sort.Strings(out)
 	return out, nil
+}
+
+// # Shard-discovery retry-on-empty (2a)
+//
+// SHOW VITESS_SHARDS against a FRESHLY-provisioned PlanetScale/Vitess keyspace
+// can transiently return ZERO shards for the target keyspace before the
+// vtgate's serving graph settles — the query succeeds, the keyspace just isn't
+// in the result yet. Treating that first empty read as fatal forced operator
+// relaunches, so discovery re-runs a few times with a short capped backoff when
+// the TARGET keyspace comes back empty. A keyspace that genuinely isn't served
+// stays empty after the cap, so the caller's existing loud failure — the
+// "returned no shards" refusal in [resolveVStreamShards] or the "" auto-detect
+// fallback in [discoverUnshardedKeyspaces] — fires unchanged. The retry only
+// buys the transient case a few chances; it never masks a real absence.
+//
+// These are vars (not consts) so tests can shrink the backoff; production never
+// mutates them.
+var (
+	shardDiscoveryRetryAttemptsVar    = 4
+	shardDiscoveryRetryBackoffBaseVar = 500 * time.Millisecond
+	shardDiscoveryRetryBackoffCapVar  = 2 * time.Second
+)
+
+// shardDiscoveryBackoff returns the per-retry backoff: exponential doubling
+// from shardDiscoveryRetryBackoffBaseVar, capped at shardDiscoveryRetryBackoffCapVar.
+// attempt is 1-based (attempt 1 is the wait BEFORE the second discovery try).
+// Mirrors [coldCopyReparentBackoff]'s shape.
+func shardDiscoveryBackoff(attempt int) time.Duration {
+	b := shardDiscoveryRetryBackoffBaseVar
+	for i := 1; i < attempt; i++ {
+		b *= 2
+		if b > shardDiscoveryRetryBackoffCapVar {
+			return shardDiscoveryRetryBackoffCapVar
+		}
+	}
+	return b
+}
+
+// discoverAllShardsForKeyspace runs [discoverAllShards], retrying on empty
+// (bounded, ctx-aware) when keyspace has zero shards in the result. It is the
+// shared retry-on-empty entry point for BOTH shard consumers — the reader's
+// shard enumeration ([discoverShards], and via it [resolveVStreamShards] +
+// [Engine.DiscoverShards]) and the --control-keyspace auto-detect
+// ([discoverUnshardedKeyspaces]) — so a fresh-keyspace transient is ridden the
+// same way for each. keyspace is the connected/data keyspace whose presence in
+// the result gates the retry; a healthy vtgate always returns >=1 shard ("-"
+// for unsharded, N for sharded) for a served keyspace.
+func discoverAllShardsForKeyspace(ctx context.Context, cfg *gomysql.Config, keyspace string) (map[string][]string, error) {
+	return retryShardDiscoveryOnEmpty(ctx, keyspace, func(ctx context.Context) (map[string][]string, error) {
+		return discoverAllShards(ctx, cfg)
+	})
+}
+
+// retryShardDiscoveryOnEmpty is the pure retry-on-empty loop, split from the
+// live [discoverAllShards] call so it is unit-testable with a fake discover
+// func. It returns the FIRST result whose keyspace has >=1 shard; if every
+// attempt is empty for keyspace it returns the LAST result (NOT an error of its
+// own) so the caller applies its existing empty-handling. A discover ERROR is
+// returned immediately — a connection/parse failure is not the transient-empty
+// case this retries. ctx cancellation during a backoff wait aborts promptly.
+func retryShardDiscoveryOnEmpty(
+	ctx context.Context,
+	keyspace string,
+	discover func(context.Context) (map[string][]string, error),
+) (map[string][]string, error) {
+	var last map[string][]string
+	for attempt := 1; attempt <= shardDiscoveryRetryAttemptsVar; attempt++ {
+		m, err := discover(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if len(m[keyspace]) > 0 {
+			return m, nil // fast path: shards present, no added latency
+		}
+		last = m
+		if attempt == shardDiscoveryRetryAttemptsVar {
+			break // budget exhausted; hand the empty result to the caller
+		}
+		backoff := shardDiscoveryBackoff(attempt)
+		slog.DebugContext(ctx, "mysql/vstream: shard discovery returned no shards for keyspace; retrying",
+			slog.String("keyspace", keyspace),
+			slog.Int("attempt", attempt),
+			slog.Int("max_attempts", shardDiscoveryRetryAttemptsVar),
+			slog.Duration("backoff", backoff))
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return last, nil
 }
 
 // discoverAllShards runs SHOW VITESS_SHARDS once and returns a map of every
