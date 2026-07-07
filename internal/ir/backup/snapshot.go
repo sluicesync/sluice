@@ -110,6 +110,29 @@ type Snapshot struct {
 	// skips dropping committed resources. nil when the engine has
 	// nothing to persist (the default temporary-anchor shape).
 	CommitFn func(ctx context.Context) error
+
+	// FinalizePositionFn is the OPTIONAL post-COPY anchor for engines
+	// whose Position is only known AFTER the row sweep drains, not at
+	// snapshot open. When set, the backup orchestrator calls it once
+	// after the sweep and records its result as [Manifest.EndPosition]
+	// instead of the open-time Position.
+	//
+	// nil for engines whose open-time Position is authoritative
+	// (Postgres exported-snapshot LSN, vanilla MySQL in-transaction
+	// GTID) — those record the open-time Position unchanged.
+	//
+	// The Vitess/PlanetScale VStream path sets it: ADR-0071 made the
+	// COPY pump concurrent, so the snapshot's terminal VGTID is produced
+	// by the pump and is only readable after joining the copy-completion
+	// barrier ([ir.SnapshotStream.WaitCopyComplete]). Reading Position at
+	// constructor return there yields the zero value (`{Engine:"",
+	// Token:""}`) — the empty EndPosition that broke chain-resume off a
+	// VStream full backup (same race #243 the cold-start handoff fixed).
+	// The finalizer joins the barrier (which happens-before the pump's
+	// finalized Position write) and returns the real VGTID. Additive,
+	// optional — orchestrators that don't recognise it fall back to the
+	// open-time Position.
+	FinalizePositionFn func(ctx context.Context) (ir.Position, error)
 }
 
 // Close releases the snapshot transaction and the underlying

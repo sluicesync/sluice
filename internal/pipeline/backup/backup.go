@@ -486,7 +486,7 @@ func (b *Backup) Run(ctx context.Context) error {
 
 	// 4.5. Record EndPosition — anchored-resume adoption / snapshot-
 	// anchored / v0.17.x post-sweep fallback (see recordEndPosition).
-	if err := b.recordEndPosition(ctx, manifest, adopting, resumeAnchor, snapshotPos); err != nil {
+	if err := b.recordEndPosition(ctx, manifest, adopting, resumeAnchor, snapshotPos, snap); err != nil {
 		return err
 	}
 
@@ -630,7 +630,16 @@ func (b *Backup) logResumePlan(ctx context.Context, schema *ir.Schema, prior *ir
 // captured at snapshot start; the v0.17.x fallback captures the position
 // now, post-sweep, via the optional PositionCapturer (the documented
 // during-backup write-window gap, already WARN-logged at snapshot open).
-func (b *Backup) recordEndPosition(ctx context.Context, manifest *irbackup.Manifest, adopting bool, resumeAnchor ir.Position, snapshotPos *ir.Position) error {
+//
+// snap is the snapshot opened for this run (nil on the v0.17.x non-
+// snapshot fallback). On the snapshot-anchored path, if the snapshot
+// carries a [irbackup.Snapshot.FinalizePositionFn] — the VStream case,
+// whose terminal VGTID is only known AFTER the concurrent COPY pump
+// drains (ADR-0071) — its post-sweep result is recorded instead of the
+// zero-at-open snapshotPos. Engines whose open-time position is
+// authoritative (Postgres, vanilla MySQL) leave FinalizePositionFn nil
+// and record snapshotPos unchanged (byte-identical to before).
+func (b *Backup) recordEndPosition(ctx context.Context, manifest *irbackup.Manifest, adopting bool, resumeAnchor ir.Position, snapshotPos *ir.Position, snap *irbackup.Snapshot) error {
 	switch {
 	case adopting:
 		manifest.EndPosition = resumeAnchor // re-assert: nothing may overwrite the adopted anchor
@@ -645,11 +654,31 @@ func (b *Backup) recordEndPosition(ctx context.Context, manifest *irbackup.Manif
 			slog.String("this_run_snapshot_token", thisRunToken),
 		)
 	case snapshotPos != nil:
-		manifest.EndPosition = *snapshotPos
+		endPos := *snapshotPos
+		// VStream: the open-time snapshotPos is the ZERO value because the
+		// terminal VGTID is produced by the concurrent COPY pump (ADR-0071)
+		// and is only readable after the sweep drains. FinalizePositionFn
+		// joins the copy-completion barrier and returns the real anchor;
+		// recording snapshotPos here instead would stamp an EMPTY
+		// EndPosition, breaking chain-resume off a VStream full backup.
+		if snap != nil && snap.FinalizePositionFn != nil {
+			finalized, err := snap.FinalizePositionFn(ctx)
+			if err != nil {
+				return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("backup: finalize end position: %w", err))
+			}
+			endPos = finalized
+			slog.InfoContext(
+				ctx, "backup: finalized end position after row sweep (post-COPY anchor)",
+				slog.String("engine", manifest.SourceEngine),
+				slog.String("open_time_token", snapshotPos.Token),
+				slog.String("finalized_token", endPos.Token),
+			)
+		}
+		manifest.EndPosition = endPos
 		slog.InfoContext(
 			ctx, "backup: recorded end position (snapshot-anchored)",
 			slog.String("engine", manifest.SourceEngine),
-			slog.String("position_token", snapshotPos.Token),
+			slog.String("position_token", endPos.Token),
 		)
 	default:
 		if err := b.captureEndPosition(ctx, manifest); err != nil {

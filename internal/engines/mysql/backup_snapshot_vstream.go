@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
 
@@ -74,9 +75,18 @@ import (
 // openBackupSnapshotVStream is the PlanetScale-flavor implementation
 // of [Engine.OpenBackupSnapshot] / [Engine.OpenBackupSnapshotForTables].
 // Opens a VStream COPY-mode snapshot stream (the same mechanism the
-// live-sync coldStart path uses), drains the COPY phase synchronously,
-// and wraps the result in an [irbackup.Snapshot] for the backup
-// orchestrator.
+// live-sync coldStart path uses) and wraps the result in an
+// [irbackup.Snapshot] for the backup orchestrator.
+//
+// The COPY phase is drained CONCURRENTLY, not synchronously: ADR-0071
+// made the COPY pump a goroutine that finalises the snapshot's terminal
+// VGTID only once the backup row sweep has consumed every table's rows.
+// So the anchor position is NOT known at constructor return — it is the
+// zero value there. The orchestrator recovers the real anchor after the
+// sweep via [irbackup.Snapshot.FinalizePositionFn], which joins the COPY
+// completion barrier before reading the finalised Position (the empty-
+// EndPosition chain-root bug; same race #243 the cold-start handoff
+// fixed, overlooked on the backup path).
 //
 // There is no slotName parameter — VStream doesn't expose a slot concept
 // to clients (the underlying binlog position is in the captured vgtid),
@@ -119,9 +129,26 @@ func (e Engine) openBackupSnapshotVStream(ctx context.Context, dsn string, table
 	// underlying gRPC stream stays open (the pump goroutine never
 	// starts since startPump is only called via Changes.StreamChanges),
 	// and CloseFn cleans it up when BackupSnapshot.Close fires.
+	//
+	// snap.Position is the ZERO value here: the concurrent COPY pump
+	// (ADR-0071) finalises the terminal VGTID only after the backup sweep
+	// drains every row. FinalizePositionFn recovers it post-sweep — it
+	// joins the copy-completion barrier (copyDone), which the pump closes
+	// only AFTER writing the finalised Position under mu (#243 / ADR-0095),
+	// so the join happens-before our Position read. The finalised value is
+	// the encodeVStreamPos VGTID (unsharded finishCopy / sharded
+	// finishCopyAutoShard stitched-min) — the encoding
+	// incremental / `backup stream run` chain-resume decodes, NOT the
+	// binlog-shape CaptureBackupPosition fallback (GitHub #16).
 	return &irbackup.Snapshot{
 		Position: snap.Position,
 		Rows:     snap.Rows,
 		CloseFn:  snap.CloseFn,
+		FinalizePositionFn: func(ctx context.Context) (ir.Position, error) {
+			if err := snap.WaitCopyComplete(ctx); err != nil {
+				return ir.Position{}, fmt.Errorf("mysql: backup snapshot (vstream): finalize position: %w", err)
+			}
+			return snap.Position, nil
+		},
 	}, nil
 }
