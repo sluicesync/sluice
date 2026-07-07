@@ -50,6 +50,16 @@ type engineOptions struct {
 	// preserveSkew is the --vstream-preserve-skew opt-out (ADR-0120): true
 	// forces the old MinimizeSkew hold, winning over the DSN param.
 	preserveSkew bool
+
+	// controlKeyspace is the operator's --control-keyspace override (the
+	// sidecar-keyspace feature): when non-empty, the applier keyspace-
+	// qualifies the three CDC control tables (sluice_cdc_state,
+	// sluice_cdc_schema_history, sluice_shard_consolidation_lease) so a
+	// sync against a SHARDED PlanetScale/Vitess target can place them in a
+	// separate UNSHARDED keyspace that accepts vindex-less tables. Empty
+	// (the zero value / default) = today's behaviour: bare table names in
+	// the connection's default keyspace. See [Engine.WithControlKeyspace].
+	controlKeyspace string
 }
 
 // WithSQLMode returns a copy of the engine whose MySQL connections force the
@@ -116,6 +126,29 @@ func (e Engine) WithVStreamPreserveSkew(preserve bool) Engine {
 		e.opts.preserveSkew = true
 	}
 	return e
+}
+
+// WithControlKeyspace returns a copy of the engine whose applier keyspace-
+// qualifies the three CDC control tables into name (the sidecar-keyspace
+// feature). It is opt-in and MySQL/PlanetScale-only: with name set, every
+// control-table statement becomes `name`.`sluice_cdc_state` (etc.) and the
+// information_schema column probes scope to name instead of DATABASE(), so a
+// sync against a SHARDED target can keep its control tables in a separate
+// UNSHARDED keyspace (a sharded Vitess keyspace requires a vindex on every
+// table — the control tables have none, so today they fail with VT09001).
+//
+// An empty name is the zero-value default and leaves the bare-name / DATABASE()
+// behaviour byte-identical, so every non-CLI construction (tests, broker/chain
+// paths, engines.Get callers) is unaffected. A non-empty name must be a plain
+// Vitess identifier; a name that can't be safely quoted is refused loudly
+// (loud-failure tenet — a broken identifier would otherwise corrupt every
+// control-table statement).
+func (e Engine) WithControlKeyspace(name string) (ir.Engine, error) {
+	if err := validateControlKeyspace(name); err != nil {
+		return nil, fmt.Errorf("mysql: invalid --control-keyspace %q (%w)", name, err)
+	}
+	e.opts.controlKeyspace = name
+	return e, nil
 }
 
 // resolveReaderZeroDate collapses a reader's per-source DSN mode against the

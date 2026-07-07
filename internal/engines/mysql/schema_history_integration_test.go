@@ -105,7 +105,7 @@ func TestSchemaHistory_WriteResolveRoundTrip(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	if err := ensureSchemaHistoryTable(ctx, db); err != nil {
+	if err := ensureSchemaHistoryTable(ctx, db, ""); err != nil {
 		t.Fatalf("ensureSchemaHistoryTable: %v", err)
 	}
 
@@ -121,21 +121,21 @@ func TestSchemaHistory_WriteResolveRoundTrip(t *testing.T) {
 		{Name: "email", Type: ir.Varchar{Length: 255}, Nullable: true},
 	}}
 
-	if err := writeSchemaVersion(ctx, db, "stream-1", "", "users", anchorOld, tblOld); err != nil {
+	if err := writeSchemaVersion(ctx, db, "", "stream-1", "", "users", anchorOld, tblOld); err != nil {
 		t.Fatalf("writeSchemaVersion old: %v", err)
 	}
-	if err := writeSchemaVersion(ctx, db, "stream-1", "", "users", anchorNew, tblNew); err != nil {
+	if err := writeSchemaVersion(ctx, db, "", "stream-1", "", "users", anchorNew, tblNew); err != nil {
 		t.Fatalf("writeSchemaVersion new: %v", err)
 	}
 	// Idempotent re-write of the same anchor.
-	if err := writeSchemaVersion(ctx, db, "stream-1", "", "users", anchorNew, tblNew); err != nil {
+	if err := writeSchemaVersion(ctx, db, "", "stream-1", "", "users", anchorNew, tblNew); err != nil {
 		t.Fatalf("writeSchemaVersion new (idempotent): %v", err)
 	}
 
 	// Event at GTID 1-15 → between old and new → resolves to the OLD
 	// (pre-ALTER) schema, the position-anchored-correctness property.
 	pBetween := ir.Position{Engine: engineNameMySQL, Token: `{"mode":"gtid","gtid_set":"` + u + `:1-15"}`}
-	got, err := resolveSchemaVersion(ctx, db, eng, "stream-1", "", "users", pBetween)
+	got, err := resolveSchemaVersion(ctx, db, "", eng, "stream-1", "", "users", pBetween)
 	if err != nil {
 		t.Fatalf("resolve between: %v", err)
 	}
@@ -145,7 +145,7 @@ func TestSchemaHistory_WriteResolveRoundTrip(t *testing.T) {
 
 	// Event at GTID 1-25 → at-or-after new → resolves to the NEW schema.
 	pAfter := ir.Position{Engine: engineNameMySQL, Token: `{"mode":"gtid","gtid_set":"` + u + `:1-25"}`}
-	got, err = resolveSchemaVersion(ctx, db, eng, "stream-1", "", "users", pAfter)
+	got, err = resolveSchemaVersion(ctx, db, "", eng, "stream-1", "", "users", pAfter)
 	if err != nil {
 		t.Fatalf("resolve after: %v", err)
 	}
@@ -156,7 +156,7 @@ func TestSchemaHistory_WriteResolveRoundTrip(t *testing.T) {
 	// Event at GTID 1-5 → before the oldest retained anchor → loud
 	// ErrPositionInvalid (DP-2 floor → ADR-0022 cold-start).
 	pBelow := ir.Position{Engine: engineNameMySQL, Token: `{"mode":"gtid","gtid_set":"` + u + `:1-5"}`}
-	if _, err := resolveSchemaVersion(ctx, db, eng, "stream-1", "", "users", pBelow); !errors.Is(err, ir.ErrPositionInvalid) {
+	if _, err := resolveSchemaVersion(ctx, db, "", eng, "stream-1", "", "users", pBelow); !errors.Is(err, ir.ErrPositionInvalid) {
 		t.Fatalf("below-floor resolve must wrap ir.ErrPositionInvalid; got %v", err)
 	}
 }
@@ -195,7 +195,7 @@ func TestSchemaHistory_VersionAndPosition_SameTxAtomicity(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	if err := ensureControlTable(ctx, db); err != nil {
+	if err := ensureControlTable(ctx, db, ""); err != nil {
 		t.Fatalf("ensureControlTable: %v", err)
 	}
 	// Deliberately do NOT create sluice_cdc_schema_history so the
@@ -207,13 +207,13 @@ func TestSchemaHistory_VersionAndPosition_SameTxAtomicity(t *testing.T) {
 	}
 	// Position write succeeds first (mirrors applyOne ordering: data
 	// + version on the tx, then writePositionTx).
-	if err := writePositionTx(ctx, tx, "atomic-stream", "tok-after-ddl", "", "", ""); err != nil {
+	if err := writePositionTx(ctx, tx, "", "atomic-stream", "tok-after-ddl", "", "", ""); err != nil {
 		_ = tx.Rollback()
 		t.Fatalf("writePositionTx: %v", err)
 	}
 	// Version write on the SAME tx fails (no schema-history table).
 	anchor := ir.Position{Engine: engineNameMySQL, Token: "tok-after-ddl"}
-	verr := writeSchemaVersion(ctx, tx, "atomic-stream", "", "users", anchor,
+	verr := writeSchemaVersion(ctx, tx, "", "atomic-stream", "", "users", anchor,
 		&ir.Table{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}})
 	if verr == nil {
 		_ = tx.Rollback()
@@ -225,7 +225,7 @@ func TestSchemaHistory_VersionAndPosition_SameTxAtomicity(t *testing.T) {
 		t.Fatalf("rollback: %v", err)
 	}
 
-	_, ok, err := readPosition(ctx, db, "atomic-stream")
+	_, ok, err := readPosition(ctx, db, "", "atomic-stream")
 	if err != nil {
 		t.Fatalf("readPosition: %v", err)
 	}
@@ -267,7 +267,7 @@ func TestSchemaHistory_LoadPreservesSourceEngine_CrossEngine(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	if err := ensureSchemaHistoryTable(ctx, db); err != nil {
+	if err := ensureSchemaHistoryTable(ctx, db, ""); err != nil {
 		t.Fatalf("ensureSchemaHistoryTable: %v", err)
 	}
 
@@ -281,11 +281,11 @@ func TestSchemaHistory_LoadPreservesSourceEngine_CrossEngine(t *testing.T) {
 	tbl := &ir.Table{Name: "widgets", Columns: []*ir.Column{
 		{Name: "id", Type: ir.Integer{Width: 64}},
 	}}
-	if err := writeSchemaVersion(ctx, db, "sluice_chain_restore", "src_app", "widgets", crossEngineAnchor, tbl); err != nil {
+	if err := writeSchemaVersion(ctx, db, "", "sluice_chain_restore", "src_app", "widgets", crossEngineAnchor, tbl); err != nil {
 		t.Fatalf("writeSchemaVersion cross-engine: %v", err)
 	}
 
-	versions, err := loadRetainedSchemaVersions(ctx, db, "sluice_chain_restore", "src_app", "widgets")
+	versions, err := loadRetainedSchemaVersions(ctx, db, "", "sluice_chain_restore", "src_app", "widgets")
 	if err != nil {
 		t.Fatalf("loadRetainedSchemaVersions: %v", err)
 	}
@@ -323,7 +323,7 @@ func TestSchemaHistory_LoadFallsBackForLegacyNullSourceEngine(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	if err := ensureSchemaHistoryTable(ctx, db); err != nil {
+	if err := ensureSchemaHistoryTable(ctx, db, ""); err != nil {
 		t.Fatalf("ensureSchemaHistoryTable: %v", err)
 	}
 
@@ -346,7 +346,7 @@ func TestSchemaHistory_LoadFallsBackForLegacyNullSourceEngine(t *testing.T) {
 		t.Fatalf("insert legacy row: %v", err)
 	}
 
-	versions, err := loadRetainedSchemaVersions(ctx, db, "legacy-stream", "src_app", "widgets")
+	versions, err := loadRetainedSchemaVersions(ctx, db, "", "legacy-stream", "src_app", "widgets")
 	if err != nil {
 		t.Fatalf("loadRetainedSchemaVersions: %v", err)
 	}
@@ -410,7 +410,7 @@ func TestEnsureSchemaHistoryTable_UpgradeAddsSourceEngineColumn(t *testing.T) {
 
 	// Run the v0.70.1 ensureSchemaHistoryTable: must add the column,
 	// not error, and not touch the existing row.
-	if err := ensureSchemaHistoryTable(ctx, db); err != nil {
+	if err := ensureSchemaHistoryTable(ctx, db, ""); err != nil {
 		t.Fatalf("ensureSchemaHistoryTable (upgrade): %v", err)
 	}
 
@@ -451,7 +451,7 @@ func TestEnsureSchemaHistoryTable_UpgradeAddsSourceEngineColumn(t *testing.T) {
 
 	// Second ensure call is a no-op (detect-then-ALTER skips when
 	// column already exists).
-	if err := ensureSchemaHistoryTable(ctx, db); err != nil {
+	if err := ensureSchemaHistoryTable(ctx, db, ""); err != nil {
 		t.Fatalf("ensureSchemaHistoryTable (idempotent): %v", err)
 	}
 }

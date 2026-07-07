@@ -1006,6 +1006,8 @@ type SyncStartCmd struct {
 	// Threaded into the mysql engine in SyncStartCmd.Run.
 	VStreamPreserveSkew bool `name:"vstream-preserve-skew" help:"VStream CDC (Vitess/PlanetScale source) only: OPT OUT of the default and restore vtgate's MinimizeSkew hold (commit-time-ordered merged stream) on the steady-state multi-shard stream. Since ADR-0120 (default flipped) MinimizeSkew is OFF by default — both shards stream and drain CONCURRENTLY — because the old ON default was shown by a real cross-region A/B to FREEZE the lagging shard under an apply-deficit backlog. Set this only if you specifically need strict cross-shard commit-time delivery and accept the catch-up wedge risk. The DSN form vstream_preserve_skew=true also works; this flag wins. Inert on PG / native-MySQL sources and on a single-shard keyspace."`
 
+	ControlKeyspace string `name:"control-keyspace" help:"MySQL/PlanetScale/Vitess target only: place sluice's three CDC control tables (sluice_cdc_state, sluice_cdc_schema_history, sluice_shard_consolidation_lease) in this UNSHARDED sidecar keyspace instead of the connection's default keyspace. A SHARDED PlanetScale/Vitess keyspace requires a primary vindex on every table; the control tables have none, so a sync against a sharded target otherwise dies with 'VT09001: table sluice_cdc_state does not have a primary vindex'. Point this at a separate unsharded keyspace (which accepts vindex-less tables) to unblock that case. Usually you can OMIT this: against a sharded target sluice auto-detects the sole unsharded sidecar keyspace and refuses loudly if there are zero or several. The position write still rides the same transaction as the data write, so on a sharded target it becomes a best-effort cross-keyspace commit (acceptable — the sharded apply is already cross-shard/non-atomic and resume is idempotent). Empty (default) + unsharded/non-Vitess target = unchanged: bare table names in the default keyspace. Inert on non-MySQL targets." placeholder:"KEYSPACE"`
+
 	NoIntraTableStealing bool `name:"no-intra-table-stealing" help:"Native-MySQL concurrent cold-copy (--copy-table-parallelism > 1; the engine default is auto: 4) only: DISABLE intra-table PK-range work-stealing (ADR-0119). By default a large, chunk-eligible table (single/composite orderable PK, above the within-table row threshold) is split into PK-range chunks so idle reader connections can steal a CHUNK of the last big table — keeping the copy N-wide to the tail instead of tapering to one whole table. With this flag set, every table is copied as one whole-table work item (the prior tier-(a) whole-table-stealing behaviour). A throughput knob, not a correctness one: chunk coverage is gap-free + overlap-free either way. Inert on PG / VStream sources and on a serial (--copy-table-parallelism=1) cold-copy."`
 
 	RawCopyFormat string `help:"FAST cold-start (ADR-0079, same-engine PG→PG) only: wire format for the raw-copy passthrough fast lane (ADR-0078). 'text' (default) is cross-major safe; 'binary' is used only when source and target server majors match (downgrades to text loudly otherwise); 'auto' requests binary. The lane engages ONLY for a no-transform copy (no --redact / --type-override / --expr-override / --inject-shard-column). Inert on MySQL/VStream sources (no raw-copy lane there)." default:"text" enum:"text,binary,auto" placeholder:"text|binary|auto"`
@@ -1481,7 +1483,7 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 		return err
 	}
 
-	source, target, err := s.resolveEngines(g)
+	source, target, err := s.resolveEngines(kongContext(), g)
 	if err != nil {
 		return err
 	}
@@ -1786,7 +1788,7 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 // about FAST-cold-start parallelism flags that are inert on a MySQL/
 // VStream source (ADR-0118 finding 1(b)), and threads the explicit
 // read-axis flags onto a MySQL source (ADR-0118 finding 4 / ADR-0120).
-func (s *SyncStartCmd) resolveEngines(g *Globals) (source, target ir.Engine, err error) {
+func (s *SyncStartCmd) resolveEngines(ctx context.Context, g *Globals) (source, target ir.Engine, err error) {
 	source, err = resolveEngine(s.SourceDriver)
 	if err != nil {
 		return nil, nil, fmt.Errorf("--source-driver: %w", err)
@@ -1820,7 +1822,39 @@ func (s *SyncStartCmd) resolveEngines(g *Globals) (source, target ir.Engine, err
 			WithCopyTableParallelism(s.CopyTableParallelism).
 			WithVStreamPreserveSkew(s.VStreamPreserveSkew)
 	}
+
+	// --control-keyspace is a TARGET concept (the control tables live on the
+	// target): the sidecar-keyspace feature places them in a separate unsharded
+	// keyspace so a sharded PlanetScale/Vitess target accepts them. Resolve it
+	// (explicit flag, else auto-detect) and record it on the target engine.
+	if target, err = applyControlKeyspace(ctx, target, s.ControlKeyspace, s.Target); err != nil {
+		return nil, nil, err
+	}
 	return source, target, nil
+}
+
+// applyControlKeyspace resolves and records the --control-keyspace option on a
+// target engine before it opens a ChangeApplier. On a MySQL/PlanetScale/Vitess
+// target it resolves the control keyspace via
+// [mysql.Engine.ResolveControlKeyspace] — the explicit flag verbatim, else
+// auto-detected: "" for an unsharded/vanilla target (unchanged behaviour), the
+// sole unsharded sidecar keyspace for a sharded VStream target, or a loud error
+// when a sharded target has zero or several unsharded candidates — then records
+// it via [mysql.Engine.WithControlKeyspace] so every control-table statement the
+// command issues is keyspace-qualified. A non-MySQL target is inert (returned
+// unchanged). Threaded through every sync-family command that opens a target
+// applier so a control-keyspace stream can be started, stopped, and inspected
+// consistently.
+func applyControlKeyspace(ctx context.Context, target ir.Engine, explicitFlag, targetDSN string) (ir.Engine, error) {
+	me, ok := target.(mysql.Engine)
+	if !ok {
+		return target, nil
+	}
+	resolved, err := me.ResolveControlKeyspace(ctx, targetDSN, explicitFlag)
+	if err != nil {
+		return nil, err
+	}
+	return me.WithControlKeyspace(resolved)
 }
 
 // resolveNamespaces merges the multi-database (ADR-0074) / multi-schema
@@ -1884,6 +1918,8 @@ type SyncStatusCmd struct {
 	Format       string        `help:"Output format: 'text' (human-readable table, default) or 'json' (machine-readable, suitable for jq pipes)." default:"text" enum:"text,json"`
 	Watch        time.Duration `help:"Live-refresh mode: re-render every DURATION until interrupted. 0 (default) disables. Use --watch 2s for the typical operator polling cadence." placeholder:"DURATION"`
 	Summary      bool          `help:"Prepend an aggregate-summary header (stream count, oldest/most-recent ages). Useful when a fleet of streams is hard to skim row-by-row."`
+
+	ControlKeyspace string `name:"control-keyspace" help:"MySQL/PlanetScale/Vitess target only: the unsharded sidecar keyspace the stream's control tables live in (see 'sync start --control-keyspace'). Omit to auto-detect on a sharded target. Ignored in --all fleet mode. Empty + unsharded/non-Vitess target = the default keyspace." placeholder:"KEYSPACE"`
 }
 
 // Run implements `sluice sync status`.
@@ -1920,6 +1956,9 @@ func (s *SyncStatusCmd) Run(g *Globals) error {
 	if err != nil {
 		return fmt.Errorf("--target-driver: %w", err)
 	}
+	if target, err = applyControlKeyspace(ctx, target, s.ControlKeyspace, s.Target); err != nil {
+		return err
+	}
 
 	applier, err := target.OpenChangeApplier(ctx, s.Target)
 	if err != nil {
@@ -1953,11 +1992,12 @@ func (s *SyncStatusCmd) Run(g *Globals) error {
 // needing PID files or cross-process signal delivery. See
 // internal/pipeline/stop_signal.go for the full design rationale.
 type SyncStopCmd struct {
-	TargetDriver string        `help:"Target engine name (e.g. mysql, postgres). See 'sluice engines'." required:"" placeholder:"NAME" group:"target"`
-	Target       string        `help:"Target database DSN." required:"" env:"SLUICE_TARGET" placeholder:"DSN" group:"target"`
-	StreamID     string        `help:"Stream identifier to stop." required:"" placeholder:"ID"`
-	Wait         bool          `help:"Block until the running streamer drains and clears its stop signal. Use to coordinate ALTER windows or scripted teardowns." short:"w"`
-	Timeout      time.Duration `help:"Maximum wait when --wait is set. On timeout the CLI exits non-zero; the stop request remains in place and the streamer will eventually drain." default:"5m"`
+	TargetDriver    string        `help:"Target engine name (e.g. mysql, postgres). See 'sluice engines'." required:"" placeholder:"NAME" group:"target"`
+	Target          string        `help:"Target database DSN." required:"" env:"SLUICE_TARGET" placeholder:"DSN" group:"target"`
+	StreamID        string        `help:"Stream identifier to stop." required:"" placeholder:"ID"`
+	Wait            bool          `help:"Block until the running streamer drains and clears its stop signal. Use to coordinate ALTER windows or scripted teardowns." short:"w"`
+	Timeout         time.Duration `help:"Maximum wait when --wait is set. On timeout the CLI exits non-zero; the stop request remains in place and the streamer will eventually drain." default:"5m"`
+	ControlKeyspace string        `name:"control-keyspace" help:"MySQL/PlanetScale/Vitess target only: the unsharded sidecar keyspace the stream's control tables live in (see 'sync start --control-keyspace'). Omit to auto-detect on a sharded target; must match what the stream was started with. Empty + unsharded/non-Vitess target = the default keyspace." placeholder:"KEYSPACE"`
 }
 
 // Run implements `sluice sync stop`.
@@ -1984,6 +2024,9 @@ func (s *SyncStopCmd) Run(_ *Globals) error {
 	}
 
 	ctx := kongContext()
+	if target, err = applyControlKeyspace(ctx, target, s.ControlKeyspace, s.Target); err != nil {
+		return err
+	}
 	applier, err := target.OpenChangeApplier(ctx, s.Target)
 	if err != nil {
 		return fmt.Errorf("open target applier: %w", err)

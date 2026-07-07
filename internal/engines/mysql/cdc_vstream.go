@@ -509,32 +509,47 @@ func discoverShards(ctx context.Context, cfg *gomysql.Config, keyspace string) (
 	if keyspace == "" {
 		return nil, errors.New("mysql/vstream: discoverShards: empty keyspace")
 	}
-	// openDB strips sluice's vstream_* DSN flags before opening the
-	// connection (Bug 126, see [stripVStreamParams]): the
-	// go-sql-driver's session-init emits the DSN's Params map as
-	// `SET <key>=<value>, ...`, and vtgate's MySQL parser rejects
-	// unknown variable names with a syntax error. (The flags are
-	// sluice-internal — they belong in cfg.Params for the VStream
-	// reader's eyes only, not in a SET statement on the wire.) We
-	// pass cfg through directly; openDB Clone()s, so the caller's
-	// cfg.Params is left intact.
-	// nil sqlMode = the strict default: a shard-discovery probe issues only
-	// read-only meta queries (SHOW VITESS_SHARDS), so the session sql_mode is
-	// immaterial here — the --mysql-sql-mode override belongs on the value paths.
+	all, err := discoverAllShards(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	// `SHOW VITESS_SHARDS` returns every keyspace the vtgate serves; keep only
+	// our keyspace's shards. Non-nil empty slice when the keyspace isn't served
+	// (preserves the pre-refactor return shape for callers that len()-check).
+	out := make([]string, 0, len(all[keyspace]))
+	out = append(out, all[keyspace]...)
+	// Sort for deterministic output; vtgate doesn't guarantee any
+	// particular order from SHOW VITESS_SHARDS.
+	sort.Strings(out)
+	return out, nil
+}
+
+// discoverAllShards runs SHOW VITESS_SHARDS once and returns a map of every
+// keyspace the vtgate serves to its shard names — an UNSHARDED keyspace maps to
+// a single "-" shard, a sharded one to N shards. Shared by [discoverShards]
+// (which filters to one keyspace) and the --control-keyspace auto-detect
+// ([Engine.ResolveControlKeyspace] via [discoverUnshardedKeyspaces]), which
+// needs the full keyspace inventory to find the unsharded sidecar.
+//
+// openDB strips sluice's vstream_* DSN flags before opening the connection
+// (Bug 126, see [stripVStreamParams]): the go-sql-driver's session-init emits
+// the DSN's Params map as `SET <key>=<value>, ...`, and vtgate's MySQL parser
+// rejects unknown variable names with a syntax error. We pass cfg through
+// directly; openDB Clone()s, so the caller's cfg.Params is left intact. nil
+// sqlMode = the strict default: a shard-discovery probe issues only read-only
+// meta queries, so the session sql_mode is immaterial here.
+//
+// We deliberately use a plain, parameterless `SHOW VITESS_SHARDS` rather than a
+// `LIKE` filter: `SHOW VITESS_SHARDS LIKE ?` reaches vtgate as a `:v1` bind
+// variable it cannot parse ("syntax error ... near ':v1'"). A plain SHOW takes
+// no parameter, so there is nothing for vtgate to choke on.
+func discoverAllShards(ctx context.Context, cfg *gomysql.Config) (map[string][]string, error) {
 	db, err := openDB(ctx, cfg, nil)
 	if err != nil {
 		return nil, fmt.Errorf("open mysql for shard discovery: %w", err)
 	}
 	defer func() { _ = db.Close() }()
 
-	// Read the full shard list with a plain, parameterless `SHOW VITESS_SHARDS`
-	// and filter to our keyspace client-side (below). We deliberately do NOT
-	// use a `LIKE` filter: `SHOW VITESS_SHARDS LIKE ?` reaches vtgate as a
-	// `:v1` bind variable it cannot parse ("syntax error ... near ':v1'"),
-	// which made shard discovery fail and forced operators to pass
-	// --allow-cross-shard-merge on ordinary *unsharded* PlanetScale databases.
-	// A plain SHOW takes no parameter, so there is nothing for vtgate to choke
-	// on; an unsharded keyspace returns a single `<keyspace>/-` row.
 	const shardsStmt = "SHOW VITESS_SHARDS"
 	rows, err := db.QueryContext(ctx, shardsStmt)
 	if err != nil {
@@ -542,39 +557,26 @@ func discoverShards(ctx context.Context, cfg *gomysql.Config, keyspace string) (
 	}
 	defer func() { _ = rows.Close() }()
 
-	out := make([]string, 0, 4)
+	out := map[string][]string{}
 	for rows.Next() {
 		var ksShard string
 		if err := rows.Scan(&ksShard); err != nil {
 			return nil, fmt.Errorf("scan shard row: %w", err)
 		}
-		// SHOW VITESS_SHARDS rows have the shape "keyspace/shard"; we
-		// strip the keyspace prefix and validate the suffix is the
-		// shard name we expected.
+		// SHOW VITESS_SHARDS rows have the shape "keyspace/shard"; split on
+		// the '/' separator.
 		idx := strings.IndexByte(ksShard, '/')
 		if idx < 0 {
 			return nil, fmt.Errorf("unexpected SHOW VITESS_SHARDS row %q (no '/' separator)", ksShard)
 		}
 		ks, shard := ksShard[:idx], ksShard[idx+1:]
-		if ks != keyspace {
-			// `SHOW VITESS_SHARDS` returns every keyspace the vtgate
-			// serves; keep only the rows for our keyspace. (A PlanetScale
-			// vtgate usually serves one, but self-hosted Vitess can serve
-			// several — this is the primary keyspace filter, not a
-			// backstop.)
-			continue
-		}
 		if shard != "" {
-			out = append(out, shard)
+			out[ks] = append(out[ks], shard)
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate shard rows: %w", err)
 	}
-
-	// Sort for deterministic output; vtgate doesn't guarantee any
-	// particular order from SHOW VITESS_SHARDS.
-	sort.Strings(out)
 	return out, nil
 }
 

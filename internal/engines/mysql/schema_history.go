@@ -82,9 +82,9 @@ type schemaHistoryQueryer interface {
 // silently overwrite each other (a silent-loss class). The surrogate
 // is collision-free and index-safe; the natural columns remain stored
 // (NOT NULL) so the resolver round-trips the full anchor token.
-func ensureSchemaHistoryTable(ctx context.Context, db *sql.DB) error {
-	const ddl = `
-		CREATE TABLE IF NOT EXISTS ` + "`" + schemaHistoryTableName + "`" + ` (
+func ensureSchemaHistoryTable(ctx context.Context, db *sql.DB, controlKeyspace string) error {
+	ddl := `
+		CREATE TABLE IF NOT EXISTS ` + controlTableRef(controlKeyspace, schemaHistoryTableName) + ` (
 			version_key     CHAR(64)     NOT NULL,
 			stream_id       VARCHAR(255) NOT NULL,
 			schema_name     VARCHAR(255) NOT NULL,
@@ -107,7 +107,7 @@ func ensureSchemaHistoryTable(ctx context.Context, db *sql.DB) error {
 	// legacy rows have NULL, the read path falls back to
 	// engineNameMySQL (the pre-fix behaviour, correct for same-engine
 	// streams).
-	return ensureSchemaHistorySourceEngineColumn(ctx, db)
+	return ensureSchemaHistorySourceEngineColumn(ctx, db, controlKeyspace)
 }
 
 // ensureSchemaHistorySourceEngineColumn adds the source_engine column
@@ -115,21 +115,19 @@ func ensureSchemaHistoryTable(ctx context.Context, db *sql.DB) error {
 // detect-then-ALTER shape as ensureCrossEngineParityColumn — keeps the
 // migration portable across MySQL 8.0.x versions older than 8.0.29
 // (which is where ADD COLUMN IF NOT EXISTS landed). Bug 78 fix.
-func ensureSchemaHistorySourceEngineColumn(ctx context.Context, db *sql.DB) error {
-	const checkQ = `
-		SELECT COUNT(*)
-		FROM   information_schema.COLUMNS
-		WHERE  TABLE_SCHEMA = DATABASE()
-		  AND  TABLE_NAME   = ?
-		  AND  COLUMN_NAME  = 'source_engine'`
+func ensureSchemaHistorySourceEngineColumn(ctx context.Context, db *sql.DB, controlKeyspace string) error {
+	schemaRHS, schemaArgs := controlSchemaPredicate(controlKeyspace)
+	checkQ := "SELECT COUNT(*) FROM information_schema.COLUMNS " +
+		"WHERE TABLE_SCHEMA = " + schemaRHS + " AND TABLE_NAME = ? AND COLUMN_NAME = 'source_engine'"
+	args := append(append([]any{}, schemaArgs...), schemaHistoryTableName)
 	var n int
-	if err := db.QueryRowContext(ctx, checkQ, schemaHistoryTableName).Scan(&n); err != nil {
+	if err := db.QueryRowContext(ctx, checkQ, args...).Scan(&n); err != nil {
 		return fmt.Errorf("mysql: ensure schema-history table: detect source_engine: %w", err)
 	}
 	if n > 0 {
 		return nil
 	}
-	const alter = "ALTER TABLE `" + schemaHistoryTableName + "` ADD COLUMN source_engine VARCHAR(64) NULL"
+	alter := "ALTER TABLE " + controlTableRef(controlKeyspace, schemaHistoryTableName) + " ADD COLUMN source_engine VARCHAR(64) NULL"
 	if _, err := db.ExecContext(ctx, alter); err != nil {
 		return fmt.Errorf("mysql: ensure schema-history table: add source_engine: %w", err)
 	}
@@ -156,7 +154,7 @@ func ensureSchemaHistorySourceEngineColumn(ctx context.Context, db *sql.DB) erro
 // integration-tagged round-trip test, which the unused linter (run
 // without the integration tag) can't see — same documented pattern as
 // control_table.go's readStopRequested.
-func writeSchemaVersion(ctx context.Context, exec schemaHistoryExecer, streamID, schema, table string, anchor ir.Position, t *ir.Table) error {
+func writeSchemaVersion(ctx context.Context, exec schemaHistoryExecer, controlKeyspace, streamID, schema, table string, anchor ir.Position, t *ir.Table) error {
 	if t == nil {
 		return errors.New("mysql: write schema version: table is nil")
 	}
@@ -173,12 +171,13 @@ func writeSchemaVersion(ctx context.Context, exec schemaHistoryExecer, streamID,
 	// the empty case is defensive. COALESCE on the conflict path means
 	// a non-empty incoming value overwrites and an empty value
 	// preserves the existing row's tag.
-	const q = "INSERT INTO `" + schemaHistoryTableName + "` " +
+	ref := controlTableRef(controlKeyspace, schemaHistoryTableName)
+	q := "INSERT INTO " + ref + " " +
 		"(version_key, stream_id, schema_name, table_name, anchor_position, ir_schema_json, source_engine) " +
 		"VALUES (?, ?, ?, ?, ?, ?, NULLIF(?, '')) " +
 		"AS new ON DUPLICATE KEY UPDATE " +
 		"ir_schema_json = new.ir_schema_json, " +
-		"source_engine = COALESCE(new.source_engine, `" + schemaHistoryTableName + "`.source_engine)"
+		"source_engine = COALESCE(new.source_engine, " + ref + ".source_engine)"
 	if _, err := exec.ExecContext(ctx, q, vk, streamID, schema, table, anchor.Token, string(payload), anchor.Engine); err != nil {
 		return fmt.Errorf("mysql: write schema version: %w", err)
 	}
@@ -199,8 +198,8 @@ func writeSchemaVersion(ctx context.Context, exec schemaHistoryExecer, streamID,
 // applier's own engine name" — i.e. the pre-fix behaviour. That is
 // correct for same-engine streams (target == source), which are the
 // only streams that worked pre-fix.
-func loadRetainedSchemaVersions(ctx context.Context, q schemaHistoryQueryer, streamID, schema, table string) ([]ir.RetainedSchemaVersion, error) {
-	const sel = "SELECT anchor_position, ir_schema_json, COALESCE(source_engine, '') FROM `" + schemaHistoryTableName + "` " +
+func loadRetainedSchemaVersions(ctx context.Context, q schemaHistoryQueryer, controlKeyspace, streamID, schema, table string) ([]ir.RetainedSchemaVersion, error) {
+	sel := "SELECT anchor_position, ir_schema_json, COALESCE(source_engine, '') FROM " + controlTableRef(controlKeyspace, schemaHistoryTableName) + " " +
 		"WHERE stream_id = ? AND schema_name = ? AND table_name = ?"
 	rows, err := q.QueryContext(ctx, sel, streamID, schema, table)
 	if err != nil {
@@ -244,8 +243,8 @@ func loadRetainedSchemaVersions(ctx context.Context, q schemaHistoryQueryer, str
 // [ir.PositionOrderer]. A position below the retention floor / before
 // the first boundary surfaces as an error wrapping
 // [ir.ErrPositionInvalid] (→ ADR-0022 cold-start).
-func resolveSchemaVersion(ctx context.Context, q schemaHistoryQueryer, orderer ir.PositionOrderer, streamID, schema, table string, p ir.Position) (*ir.Table, error) {
-	versions, err := loadRetainedSchemaVersions(ctx, q, streamID, schema, table)
+func resolveSchemaVersion(ctx context.Context, q schemaHistoryQueryer, controlKeyspace string, orderer ir.PositionOrderer, streamID, schema, table string, p ir.Position) (*ir.Table, error) {
+	versions, err := loadRetainedSchemaVersions(ctx, q, controlKeyspace, streamID, schema, table)
 	if err != nil {
 		return nil, err
 	}
@@ -276,7 +275,7 @@ type schemaHistoryExecQuerier interface {
 //
 // Returns the count of rows deleted (operator-facing for `sluice backup
 // prune --vv` diagnostics).
-func compactSchemaHistoryBelow(ctx context.Context, exec schemaHistoryExecQuerier, orderer ir.PositionOrderer, floor ir.Position) (int, error) {
+func compactSchemaHistoryBelow(ctx context.Context, exec schemaHistoryExecQuerier, controlKeyspace string, orderer ir.PositionOrderer, floor ir.Position) (int, error) {
 	if orderer == nil {
 		return 0, errors.New("mysql: compact schema-history: orderer is nil; ordering is a correctness primitive (loud-failure tenet)")
 	}
@@ -293,7 +292,7 @@ func compactSchemaHistoryBelow(ctx context.Context, exec schemaHistoryExecQuerie
 	// the bug is latent today, but the class is the same — fix both
 	// per the pin-the-class discipline. NULL row (pre-v0.70.1
 	// storage) falls back to engineNameMySQL, the pre-fix behaviour.
-	const sel = "SELECT version_key, anchor_position, COALESCE(source_engine, '') FROM `" + schemaHistoryTableName + "`"
+	sel := "SELECT version_key, anchor_position, COALESCE(source_engine, '') FROM " + controlTableRef(controlKeyspace, schemaHistoryTableName)
 	rows, err := exec.QueryContext(ctx, sel)
 	if err != nil {
 		return 0, fmt.Errorf("mysql: compact schema-history: select: %w", err)
@@ -342,7 +341,7 @@ func compactSchemaHistoryBelow(ctx context.Context, exec schemaHistoryExecQuerie
 	if len(toDelete) == 0 {
 		return 0, nil
 	}
-	const del = "DELETE FROM `" + schemaHistoryTableName + "` WHERE version_key = ?"
+	del := "DELETE FROM " + controlTableRef(controlKeyspace, schemaHistoryTableName) + " WHERE version_key = ?"
 	for _, vk := range toDelete {
 		if _, err := exec.ExecContext(ctx, del, vk); err != nil {
 			return 0, fmt.Errorf("mysql: compact schema-history: delete %q: %w", vk, err)

@@ -79,6 +79,8 @@ type SchemaAddTableCmd struct {
 
 	DryRun bool `help:"Print the plan (which table, source publication update, target DDL summary) without modifying the source publication, target schema, or capturing a snapshot." short:"n"`
 	Yes    bool `help:"Skip the typed-confirmation prompt." short:"y"`
+
+	ControlKeyspace string `name:"control-keyspace" help:"MySQL/PlanetScale/Vitess target only: the unsharded sidecar keyspace the stream's control tables live in (see 'sync start --control-keyspace'). Omit to auto-detect on a sharded target; must match what the stream was started with. Empty + unsharded/non-Vitess target = the default keyspace." placeholder:"KEYSPACE"`
 }
 
 // Run implements `sluice schema add-table`.
@@ -102,6 +104,12 @@ func (s *SchemaAddTableCmd) Run(g *Globals) error {
 		return err
 	}
 	if target, err = applyEngineOptions(target, g); err != nil {
+		return err
+	}
+	// Sidecar control keyspace (explicit flag or auto-detect) so the
+	// live-add's control-table reads/writes hit the same qualified tables the
+	// running stream uses. Inert on non-MySQL / unsharded targets.
+	if target, err = applyControlKeyspace(kongContext(), target, s.ControlKeyspace, s.Target); err != nil {
 		return err
 	}
 

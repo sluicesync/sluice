@@ -36,7 +36,7 @@ func (a *ChangeApplier) ListSchemaHistory(ctx context.Context, streamID string, 
 		limit = 100
 	}
 	q := "SELECT version_key, stream_id, schema_name, table_name, anchor_position, ir_schema_json " +
-		"FROM `" + schemaHistoryTableName + "` " +
+		"FROM " + controlTableRef(a.controlKeyspace, schemaHistoryTableName) + " " +
 		"WHERE stream_id = ? " +
 		"ORDER BY created_at DESC " +
 		"LIMIT ?"

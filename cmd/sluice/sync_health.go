@@ -44,6 +44,8 @@ type SyncHealthCmd struct {
 
 	Format string `help:"Output format: 'text' (default) or 'json' (machine-readable for alertmanager / scripting pipes)." default:"text" enum:"text,json" placeholder:"FORMAT"`
 	Output string `help:"Write to FILE instead of stdout. Atomic." short:"o" placeholder:"FILE"`
+
+	ControlKeyspace string `name:"control-keyspace" help:"MySQL/PlanetScale/Vitess target only: the unsharded sidecar keyspace the stream's control tables live in (see 'sync start --control-keyspace'). Omit to auto-detect on a sharded target. Empty + unsharded/non-Vitess target = the default keyspace." placeholder:"KEYSPACE"`
 }
 
 // HealthResult is the structured output of `sluice sync health`. Same
@@ -102,6 +104,9 @@ func (s *SyncHealthCmd) Run(_ *Globals) error {
 	defer func() { _ = finalize(runErr) }()
 
 	ctx := kongContext()
+	if target, err = applyControlKeyspace(ctx, target, s.ControlKeyspace, s.Target); err != nil {
+		return operationalError{err: err}
+	}
 	applier, err := target.OpenChangeApplier(ctx, s.Target)
 	if err != nil {
 		return operationalError{err: fmt.Errorf("open target applier: %w", err)}

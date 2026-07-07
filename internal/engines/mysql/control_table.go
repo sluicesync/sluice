@@ -45,13 +45,81 @@ var controlCfg = &appliershared.ControlTableConfig{
 	RowsAffectedIsChangedRows: true,
 }
 
+// controlTableRef returns the backtick-quoted reference to a control table,
+// keyspace-qualified when controlKeyspace is non-empty (the sidecar-keyspace
+// feature: the CDC control tables live in an UNSHARDED keyspace, separate
+// from the sharded DATA keyspace, so a sharded PlanetScale/Vitess target —
+// which requires a vindex on every table in the sharded keyspace — accepts
+// them). Each identifier is quoted in its OWN pair of backticks:
+// `ctl`.`sluice_cdc_state`, NEVER `ctl.sluice_cdc_state` (a single, wrong
+// identifier). Empty controlKeyspace reproduces the pre-feature bare name
+// byte-for-byte, so the default single-keyspace path is unchanged.
+func controlTableRef(controlKeyspace, table string) string {
+	if controlKeyspace == "" {
+		return "`" + table + "`"
+	}
+	return "`" + controlKeyspace + "`.`" + table + "`"
+}
+
+// controlSchemaPredicate returns the information_schema TABLE_SCHEMA right-hand
+// side (the value in `TABLE_SCHEMA = …`) plus any bound argument it needs. The
+// control-table column-existence probes scope to one database; with a sidecar
+// control keyspace they must inspect THAT keyspace's information_schema rows,
+// not the connection's default database. Empty controlKeyspace → the bare
+// `DATABASE()` form with no extra arg (byte-identical to the single-keyspace
+// path); set → a `?` placeholder BOUND to the keyspace name — bound, not
+// interpolated, so an operator-supplied name can never reshape the query. The
+// predicate is always the first term in these WHERE clauses, so its arg is
+// prepended ahead of the table-name arg.
+func controlSchemaPredicate(controlKeyspace string) (rhs string, args []any) {
+	if controlKeyspace == "" {
+		return "DATABASE()", nil
+	}
+	return "?", []any{controlKeyspace}
+}
+
+// validateControlKeyspace refuses a --control-keyspace value that is not a
+// plain Vitess/PlanetScale keyspace identifier. A control keyspace flows into
+// backtick-quoted identifiers ([controlTableRef]) in every control-table
+// statement, so a name containing a backtick (or other non-identifier byte)
+// would silently corrupt that quoting; per the loud-failure tenet we reject it
+// up front rather than emit a malformed statement. Empty is the "unset"
+// sentinel and is accepted (it means "no qualification").
+//
+// Hyphens ARE allowed: a PlanetScale database's default unsharded keyspace is
+// named after the database (e.g. `sluice-ck-dst`), which legally contains
+// hyphens — the intended default sidecar. Genuinely illegal input (backtick,
+// whitespace, dot, quote, semicolon) is still refused loudly.
+func validateControlKeyspace(name string) error {
+	if name == "" {
+		return nil
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9',
+			r == '_',
+			r == '-':
+			// ok
+		default:
+			return fmt.Errorf("must be a plain identifier [A-Za-z0-9_-]; got %q", name)
+		}
+	}
+	return nil
+}
+
 // ensureControlTable creates the per-target sluice_cdc_state table
 // if it doesn't exist. Idempotent — second-and-later calls are no-
 // ops courtesy of CREATE TABLE IF NOT EXISTS.
 //
 // The table lives in the connection's default database (DBName from
 // the DSN). MySQL has a flat namespace so no schema-qualification is
-// needed; the database is implicit in the connection.
+// needed; the database is implicit in the connection. The sidecar-
+// keyspace feature is the one exception: a non-empty controlKeyspace
+// keyspace-qualifies the DDL (`ks`.`sluice_cdc_state`) so the table is
+// created in a separate UNSHARDED keyspace on a sharded PlanetScale/
+// Vitess target (see [controlTableRef]).
 //
 // MySQL does not allow CREATE TABLE inside an explicit transaction
 // (DDL implicit-commits), so callers run this from the *sql.DB pool
@@ -79,9 +147,9 @@ var controlCfg = &appliershared.ControlTableConfig{
 //     parity lets MySQL targets faithfully record what the streamer
 //     supplies — no behavior change for MySQL → MySQL flows where
 //     the streamer doesn't supply any of these values.
-func ensureControlTable(ctx context.Context, db *sql.DB) error {
-	const ddl = `
-		CREATE TABLE IF NOT EXISTS ` + "`" + controlTableName + "`" + ` (
+func ensureControlTable(ctx context.Context, db *sql.DB, controlKeyspace string) error {
+	ddl := `
+		CREATE TABLE IF NOT EXISTS ` + controlTableRef(controlKeyspace, controlTableName) + ` (
 			stream_id              VARCHAR(255) NOT NULL,
 			source_position        TEXT         NOT NULL,
 			updated_at             TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -95,19 +163,19 @@ func ensureControlTable(ctx context.Context, db *sql.DB) error {
 	if _, err := db.ExecContext(ctx, ddl); err != nil {
 		return fmt.Errorf("mysql: ensure control table: %w", wrapDDLError(err))
 	}
-	if err := ensureStopRequestedColumn(ctx, db); err != nil {
+	if err := ensureStopRequestedColumn(ctx, db, controlKeyspace); err != nil {
 		return err
 	}
-	if err := ensureLiveAddedTablesColumn(ctx, db); err != nil {
+	if err := ensureLiveAddedTablesColumn(ctx, db, controlKeyspace); err != nil {
 		return err
 	}
-	if err := ensureCrossEngineParityColumn(ctx, db, "slot_name", "VARCHAR(255) NULL"); err != nil {
+	if err := ensureCrossEngineParityColumn(ctx, db, controlKeyspace, "slot_name", "VARCHAR(255) NULL"); err != nil {
 		return err
 	}
-	if err := ensureCrossEngineParityColumn(ctx, db, "source_dsn_fingerprint", "VARCHAR(255) NULL"); err != nil {
+	if err := ensureCrossEngineParityColumn(ctx, db, controlKeyspace, "source_dsn_fingerprint", "VARCHAR(255) NULL"); err != nil {
 		return err
 	}
-	return ensureCrossEngineParityColumn(ctx, db, "target_schema", "VARCHAR(255) NULL")
+	return ensureCrossEngineParityColumn(ctx, db, controlKeyspace, "target_schema", "VARCHAR(255) NULL")
 }
 
 // shardConsolidationLeaseRow aliases the shared lease-row mirror of
@@ -124,11 +192,11 @@ type shardConsolidationLeaseRow = appliershared.ShardLeaseRow
 // of the racing INSERT. Without this a contended shard fails spuriously
 // (reproduced by TestPhase2e_MySQL_3ShardContention_*; classifyApplierError
 // already treats 1213 as retriable on the apply path).
-func tryAcquireShardLease(ctx context.Context, db *sql.DB, tableName, streamID string, expires time.Time) (acquired bool, current shardConsolidationLeaseRow, err error) {
+func tryAcquireShardLease(ctx context.Context, db *sql.DB, controlKeyspace, tableName, streamID string, expires time.Time) (acquired bool, current shardConsolidationLeaseRow, err error) {
 	const maxAttempts = 8
 	backoff := 5 * time.Millisecond
 	for attempt := 1; ; attempt++ {
-		acquired, current, err = tryAcquireShardLeaseOnce(ctx, db, tableName, streamID, expires)
+		acquired, current, err = tryAcquireShardLeaseOnce(ctx, db, controlKeyspace, tableName, streamID, expires)
 		if err == nil || attempt >= maxAttempts || !isMySQLDeadlock(err) {
 			return acquired, current, err
 		}
@@ -155,7 +223,8 @@ func tryAcquireShardLease(ctx context.Context, db *sql.DB, tableName, streamID s
 // acquires, then INSERT / UPDATE / no-op based on the loaded row's
 // state. The row-level lock on the lease row scopes contention to
 // the consolidated target table, so other tables proceed in parallel.
-func tryAcquireShardLeaseOnce(ctx context.Context, db *sql.DB, tableName, streamID string, expires time.Time) (acquired bool, current shardConsolidationLeaseRow, err error) {
+func tryAcquireShardLeaseOnce(ctx context.Context, db *sql.DB, controlKeyspace, tableName, streamID string, expires time.Time) (acquired bool, current shardConsolidationLeaseRow, err error) {
+	leaseRef := controlTableRef(controlKeyspace, shardConsolidationLeaseTableName)
 	tx, beginErr := db.BeginTx(ctx, nil)
 	if beginErr != nil {
 		return false, shardConsolidationLeaseRow{}, fmt.Errorf("mysql: lease acquire: begin tx: %w", beginErr)
@@ -167,17 +236,17 @@ func tryAcquireShardLeaseOnce(ctx context.Context, db *sql.DB, tableName, stream
 		}
 	}()
 
-	const selectQ = "SELECT target_table_full_name, COALESCE(lease_holder_stream_id, ''), " +
+	selectQ := "SELECT target_table_full_name, COALESCE(lease_holder_stream_id, ''), " +
 		"lease_expires_at, COALESCE(ddl_text, ''), COALESCE(ddl_checksum, ''), " +
 		"applied_schema_version, applied_at, anchor_position, source_engine " +
-		"FROM `" + shardConsolidationLeaseTableName + "` " +
+		"FROM " + leaseRef + " " +
 		"WHERE target_table_full_name = ? FOR UPDATE"
 	var row shardConsolidationLeaseRow
 	scanErr := appliershared.ScanShardLeaseRow(tx.QueryRowContext(ctx, selectQ, tableName), &row)
 	switch {
 	case errors.Is(scanErr, sql.ErrNoRows):
 		// ABSENT: insert fresh row.
-		const insertQ = "INSERT INTO `" + shardConsolidationLeaseTableName + "` " +
+		insertQ := "INSERT INTO " + leaseRef + " " +
 			"(target_table_full_name, lease_holder_stream_id, lease_expires_at, applied_schema_version) " +
 			"VALUES (?, ?, ?, 0)"
 		if _, execErr := tx.ExecContext(ctx, insertQ, tableName, streamID, expires); execErr != nil {
@@ -228,7 +297,7 @@ func tryAcquireShardLeaseOnce(ctx context.Context, db *sql.DB, tableName, stream
 	// EXPIRED takeover-eligible. UPDATE holder + expires; PRESERVE
 	// ddl_text so probe-and-record on the caller side has the prior
 	// holder's recorded text.
-	const updateQ = "UPDATE `" + shardConsolidationLeaseTableName + "` SET " +
+	updateQ := "UPDATE " + leaseRef + " SET " +
 		"lease_holder_stream_id = ?, lease_expires_at = ? " +
 		"WHERE target_table_full_name = ?"
 	if _, execErr := tx.ExecContext(ctx, updateQ, streamID, expires, tableName); execErr != nil {
@@ -247,8 +316,8 @@ func tryAcquireShardLeaseOnce(ctx context.Context, db *sql.DB, tableName, stream
 
 // heartbeatShardLease extends lease_expires_at iff the row is still
 // held by streamID.
-func heartbeatShardLease(ctx context.Context, db *sql.DB, tableName, streamID string, expires time.Time) (extended bool, err error) {
-	const q = "UPDATE `" + shardConsolidationLeaseTableName + "` SET lease_expires_at = ? " +
+func heartbeatShardLease(ctx context.Context, db *sql.DB, controlKeyspace, tableName, streamID string, expires time.Time) (extended bool, err error) {
+	q := "UPDATE " + controlTableRef(controlKeyspace, shardConsolidationLeaseTableName) + " SET lease_expires_at = ? " +
 		"WHERE target_table_full_name = ? " +
 		"AND lease_holder_stream_id = ? " +
 		"AND applied_at IS NULL"
@@ -256,8 +325,8 @@ func heartbeatShardLease(ctx context.Context, db *sql.DB, tableName, streamID st
 }
 
 // recordShardLeaseDDLText UPDATEs ddl_text for the held lease.
-func recordShardLeaseDDLText(ctx context.Context, db *sql.DB, tableName, streamID, ddlText string) (recorded bool, err error) {
-	const q = "UPDATE `" + shardConsolidationLeaseTableName + "` SET ddl_text = ? " +
+func recordShardLeaseDDLText(ctx context.Context, db *sql.DB, controlKeyspace, tableName, streamID, ddlText string) (recorded bool, err error) {
+	q := "UPDATE " + controlTableRef(controlKeyspace, shardConsolidationLeaseTableName) + " SET ddl_text = ? " +
 		"WHERE target_table_full_name = ? " +
 		"AND lease_holder_stream_id = ? " +
 		"AND applied_at IS NULL"
@@ -276,8 +345,8 @@ func recordShardLeaseDDLText(ctx context.Context, db *sql.DB, tableName, streamI
 // boundary was observed at (v0.76.0+). Empty strings store NULL via the
 // NULLIF wrapper so legacy callers / unit-test fakes preserve the
 // pre-anchor shape.
-func finalizeShardLeaseApply(ctx context.Context, db *sql.DB, tableName, streamID, ddlText, ddlChecksum string, version int64, anchorPos, anchorEngine string) (finalized bool, err error) {
-	const q = "UPDATE `" + shardConsolidationLeaseTableName + "` SET " +
+func finalizeShardLeaseApply(ctx context.Context, db *sql.DB, controlKeyspace, tableName, streamID, ddlText, ddlChecksum string, version int64, anchorPos, anchorEngine string) (finalized bool, err error) {
+	q := "UPDATE " + controlTableRef(controlKeyspace, shardConsolidationLeaseTableName) + " SET " +
 		"ddl_text = ?, ddl_checksum = ?, applied_schema_version = ?, applied_at = CURRENT_TIMESTAMP, " +
 		"anchor_position = NULLIF(?, ''), source_engine = NULLIF(?, '') " +
 		"WHERE target_table_full_name = ? " +
@@ -291,11 +360,11 @@ func finalizeShardLeaseApply(ctx context.Context, db *sql.DB, tableName, streamI
 // Tolerant of the table being absent. ADR-0054 §6 operator-visibility
 // surface used by `sluice sync status`, plus the v0.76.0 lease GC
 // sweep's enumeration source.
-func listShardLeases(ctx context.Context, db *sql.DB) ([]shardConsolidationLeaseRow, error) {
-	const q = "SELECT target_table_full_name, COALESCE(lease_holder_stream_id, ''), " +
+func listShardLeases(ctx context.Context, db *sql.DB, controlKeyspace string) ([]shardConsolidationLeaseRow, error) {
+	q := "SELECT target_table_full_name, COALESCE(lease_holder_stream_id, ''), " +
 		"lease_expires_at, COALESCE(ddl_text, ''), COALESCE(ddl_checksum, ''), " +
 		"applied_schema_version, applied_at, anchor_position, source_engine " +
-		"FROM `" + shardConsolidationLeaseTableName + "`"
+		"FROM " + controlTableRef(controlKeyspace, shardConsolidationLeaseTableName)
 	return appliershared.ListShardLeases(ctx, db, controlCfg, q)
 }
 
@@ -303,19 +372,19 @@ func listShardLeases(ctx context.Context, db *sql.DB) ([]shardConsolidationLease
 // row being absent (DELETE on a missing PK is a no-op) and of the table
 // itself being absent (returns nil so a GC sweep against a pre-Ensure
 // target is a no-op). v0.76.0 lease GC sweep (task #21).
-func deleteShardLease(ctx context.Context, db *sql.DB, tableName string) error {
-	const q = "DELETE FROM `" + shardConsolidationLeaseTableName + "` WHERE target_table_full_name = ?"
+func deleteShardLease(ctx context.Context, db *sql.DB, controlKeyspace, tableName string) error {
+	q := "DELETE FROM " + controlTableRef(controlKeyspace, shardConsolidationLeaseTableName) + " WHERE target_table_full_name = ?"
 	return appliershared.TolerantExec(ctx, db, controlCfg, "lease delete", q, tableName)
 }
 
 // selectShardLease loads the row for tableName. Returns ok=false when
 // no row exists OR when the table itself is missing (pre-Ensure
 // inspection path).
-func selectShardLease(ctx context.Context, db *sql.DB, tableName string) (row shardConsolidationLeaseRow, ok bool, err error) {
-	const q = "SELECT target_table_full_name, COALESCE(lease_holder_stream_id, ''), " +
+func selectShardLease(ctx context.Context, db *sql.DB, controlKeyspace, tableName string) (row shardConsolidationLeaseRow, ok bool, err error) {
+	q := "SELECT target_table_full_name, COALESCE(lease_holder_stream_id, ''), " +
 		"lease_expires_at, COALESCE(ddl_text, ''), COALESCE(ddl_checksum, ''), " +
 		"applied_schema_version, applied_at, anchor_position, source_engine " +
-		"FROM `" + shardConsolidationLeaseTableName + "` " +
+		"FROM " + controlTableRef(controlKeyspace, shardConsolidationLeaseTableName) + " " +
 		"WHERE target_table_full_name = ?"
 	return appliershared.SelectShardLease(ctx, db, controlCfg, q, tableName)
 }
@@ -332,9 +401,9 @@ func selectShardLease(ctx context.Context, db *sql.DB, tableName string) (row sh
 //
 // See ADR-0054 §1 for the row schema and state machine, §2 for the
 // timing defaults that govern lease_expires_at extension cadence.
-func ensureShardConsolidationLeaseTable(ctx context.Context, db *sql.DB) error {
-	const ddl = `
-		CREATE TABLE IF NOT EXISTS ` + "`" + shardConsolidationLeaseTableName + "`" + ` (
+func ensureShardConsolidationLeaseTable(ctx context.Context, db *sql.DB, controlKeyspace string) error {
+	ddl := `
+		CREATE TABLE IF NOT EXISTS ` + controlTableRef(controlKeyspace, shardConsolidationLeaseTableName) + ` (
 			target_table_full_name        VARCHAR(512) NOT NULL,
 			lease_holder_stream_id        VARCHAR(64)  NULL,
 			lease_expires_at              TIMESTAMP    NULL,
@@ -361,7 +430,7 @@ func ensureShardConsolidationLeaseTable(ctx context.Context, db *sql.DB) error {
 		{"anchor_position", "TEXT NULL"},
 		{"source_engine", "TEXT NULL"},
 	} {
-		if err := ensureShardLeaseColumn(ctx, db, col.name, col.def); err != nil {
+		if err := ensureShardLeaseColumn(ctx, db, controlKeyspace, col.name, col.def); err != nil {
 			return err
 		}
 	}
@@ -372,21 +441,19 @@ func ensureShardConsolidationLeaseTable(ctx context.Context, db *sql.DB) error {
 // missing. Same shape as ensureCrossEngineParityColumn but scoped to the
 // lease table — keeps the additive migration portable to MySQL 8.0.x
 // versions older than 8.0.29 (no ADD COLUMN IF NOT EXISTS).
-func ensureShardLeaseColumn(ctx context.Context, db *sql.DB, columnName, columnDef string) error {
-	const checkQ = `
-		SELECT COUNT(*)
-		FROM   information_schema.COLUMNS
-		WHERE  TABLE_SCHEMA = DATABASE()
-		  AND  TABLE_NAME   = ?
-		  AND  COLUMN_NAME  = ?`
+func ensureShardLeaseColumn(ctx context.Context, db *sql.DB, controlKeyspace, columnName, columnDef string) error {
+	schemaRHS, schemaArgs := controlSchemaPredicate(controlKeyspace)
+	checkQ := "SELECT COUNT(*) FROM information_schema.COLUMNS " +
+		"WHERE TABLE_SCHEMA = " + schemaRHS + " AND TABLE_NAME = ? AND COLUMN_NAME = ?"
+	args := append(append([]any{}, schemaArgs...), shardConsolidationLeaseTableName, columnName)
 	var n int
-	if err := db.QueryRowContext(ctx, checkQ, shardConsolidationLeaseTableName, columnName).Scan(&n); err != nil {
+	if err := db.QueryRowContext(ctx, checkQ, args...).Scan(&n); err != nil {
 		return fmt.Errorf("mysql: ensure shard consolidation lease table: detect %s: %w", columnName, err)
 	}
 	if n > 0 {
 		return nil
 	}
-	alter := "ALTER TABLE `" + shardConsolidationLeaseTableName + "` ADD COLUMN `" + columnName + "` " + columnDef
+	alter := "ALTER TABLE " + controlTableRef(controlKeyspace, shardConsolidationLeaseTableName) + " ADD COLUMN `" + columnName + "` " + columnDef
 	if _, err := db.ExecContext(ctx, alter); err != nil {
 		return fmt.Errorf("mysql: ensure shard consolidation lease table: add %s: %w", columnName, err)
 	}
@@ -405,21 +472,19 @@ func ensureShardLeaseColumn(ctx context.Context, db *sql.DB, columnName, columnD
 // columnDef is the bare type + nullability spec (e.g. "VARCHAR(255)
 // NULL"). columnName is interpolated unsafely into the SQL — callers
 // supply only internally-defined constants, never operator input.
-func ensureCrossEngineParityColumn(ctx context.Context, db *sql.DB, columnName, columnDef string) error {
-	const checkQ = `
-		SELECT COUNT(*)
-		FROM   information_schema.COLUMNS
-		WHERE  TABLE_SCHEMA = DATABASE()
-		  AND  TABLE_NAME   = ?
-		  AND  COLUMN_NAME  = ?`
+func ensureCrossEngineParityColumn(ctx context.Context, db *sql.DB, controlKeyspace, columnName, columnDef string) error {
+	schemaRHS, schemaArgs := controlSchemaPredicate(controlKeyspace)
+	checkQ := "SELECT COUNT(*) FROM information_schema.COLUMNS " +
+		"WHERE TABLE_SCHEMA = " + schemaRHS + " AND TABLE_NAME = ? AND COLUMN_NAME = ?"
+	args := append(append([]any{}, schemaArgs...), controlTableName, columnName)
 	var n int
-	if err := db.QueryRowContext(ctx, checkQ, controlTableName, columnName).Scan(&n); err != nil {
+	if err := db.QueryRowContext(ctx, checkQ, args...).Scan(&n); err != nil {
 		return fmt.Errorf("mysql: ensure control table: detect %s: %w", columnName, err)
 	}
 	if n > 0 {
 		return nil
 	}
-	alter := "ALTER TABLE `" + controlTableName + "` ADD COLUMN `" + columnName + "` " + columnDef
+	alter := "ALTER TABLE " + controlTableRef(controlKeyspace, controlTableName) + " ADD COLUMN `" + columnName + "` " + columnDef
 	if _, err := db.ExecContext(ctx, alter); err != nil {
 		return fmt.Errorf("mysql: ensure control table: add %s: %w", columnName, err)
 	}
@@ -437,21 +502,19 @@ func ensureCrossEngineParityColumn(ctx context.Context, db *sql.DB, columnName, 
 // stream's scope. NULL on legacy rows; the orchestrator's
 // add-table --no-drain path UPSERTs the value via
 // recordLiveAddedTable.
-func ensureLiveAddedTablesColumn(ctx context.Context, db *sql.DB) error {
-	const checkQ = `
-		SELECT COUNT(*)
-		FROM   information_schema.COLUMNS
-		WHERE  TABLE_SCHEMA = DATABASE()
-		  AND  TABLE_NAME   = ?
-		  AND  COLUMN_NAME  = 'live_added_tables'`
+func ensureLiveAddedTablesColumn(ctx context.Context, db *sql.DB, controlKeyspace string) error {
+	schemaRHS, schemaArgs := controlSchemaPredicate(controlKeyspace)
+	checkQ := "SELECT COUNT(*) FROM information_schema.COLUMNS " +
+		"WHERE TABLE_SCHEMA = " + schemaRHS + " AND TABLE_NAME = ? AND COLUMN_NAME = 'live_added_tables'"
+	args := append(append([]any{}, schemaArgs...), controlTableName)
 	var n int
-	if err := db.QueryRowContext(ctx, checkQ, controlTableName).Scan(&n); err != nil {
+	if err := db.QueryRowContext(ctx, checkQ, args...).Scan(&n); err != nil {
 		return fmt.Errorf("mysql: ensure control table: detect live_added_tables: %w", err)
 	}
 	if n > 0 {
 		return nil
 	}
-	const alter = "ALTER TABLE `" + controlTableName + "` ADD COLUMN live_added_tables TEXT NULL"
+	alter := "ALTER TABLE " + controlTableRef(controlKeyspace, controlTableName) + " ADD COLUMN live_added_tables TEXT NULL"
 	if _, err := db.ExecContext(ctx, alter); err != nil {
 		return fmt.Errorf("mysql: ensure control table: add live_added_tables: %w", err)
 	}
@@ -461,23 +524,23 @@ func ensureLiveAddedTablesColumn(ctx context.Context, db *sql.DB) error {
 // ensureStopRequestedColumn adds the stop_requested_at column to an
 // existing control table when missing. Detect-then-ALTER avoids the
 // MySQL 8.0.29 floor that ADD COLUMN IF NOT EXISTS would impose;
-// sluice broadly supports 8.0+. The lookup uses DATABASE() so the
-// query naturally scopes to the connection's default database.
-func ensureStopRequestedColumn(ctx context.Context, db *sql.DB) error {
-	const checkQ = `
-		SELECT COUNT(*)
-		FROM   information_schema.COLUMNS
-		WHERE  TABLE_SCHEMA = DATABASE()
-		  AND  TABLE_NAME   = ?
-		  AND  COLUMN_NAME  = 'stop_requested_at'`
+// sluice broadly supports 8.0+. The lookup scopes to DATABASE() (the
+// connection's default database) or, under the sidecar-keyspace
+// feature, to the explicit control keyspace (see
+// [controlSchemaPredicate]).
+func ensureStopRequestedColumn(ctx context.Context, db *sql.DB, controlKeyspace string) error {
+	schemaRHS, schemaArgs := controlSchemaPredicate(controlKeyspace)
+	checkQ := "SELECT COUNT(*) FROM information_schema.COLUMNS " +
+		"WHERE TABLE_SCHEMA = " + schemaRHS + " AND TABLE_NAME = ? AND COLUMN_NAME = 'stop_requested_at'"
+	args := append(append([]any{}, schemaArgs...), controlTableName)
 	var n int
-	if err := db.QueryRowContext(ctx, checkQ, controlTableName).Scan(&n); err != nil {
+	if err := db.QueryRowContext(ctx, checkQ, args...).Scan(&n); err != nil {
 		return fmt.Errorf("mysql: ensure control table: detect stop_requested_at: %w", err)
 	}
 	if n > 0 {
 		return nil
 	}
-	const alter = "ALTER TABLE `" + controlTableName + "` ADD COLUMN stop_requested_at TIMESTAMP NULL"
+	alter := "ALTER TABLE " + controlTableRef(controlKeyspace, controlTableName) + " ADD COLUMN stop_requested_at TIMESTAMP NULL"
 	if _, err := db.ExecContext(ctx, alter); err != nil {
 		return fmt.Errorf("mysql: ensure control table: add stop_requested_at: %w", err)
 	}
@@ -491,8 +554,8 @@ func ensureStopRequestedColumn(ctx context.Context, db *sql.DB) error {
 // wrote). Missing-table tolerance and error shape live in the shared
 // skeleton; the same string-match classifier powers ListStreams's
 // missing-table fallback.
-func readPosition(ctx context.Context, db *sql.DB, streamID string) (token string, ok bool, err error) {
-	const q = "SELECT source_position FROM `" + controlTableName + "` WHERE stream_id = ?"
+func readPosition(ctx context.Context, db *sql.DB, controlKeyspace, streamID string) (token string, ok bool, err error) {
+	q := "SELECT source_position FROM " + controlTableRef(controlKeyspace, controlTableName) + " WHERE stream_id = ?"
 	return appliershared.ReadPosition(ctx, db, controlCfg, q, streamID)
 }
 
@@ -508,18 +571,18 @@ func readPosition(ctx context.Context, db *sql.DB, streamID string) (token strin
 // EnsureControlTable's ALTER concurrently but this connection's
 // query was already planned against the old schema. Defence in
 // depth; the fallback returns empty strings for the missing fields.
-func listStreams(ctx context.Context, db *sql.DB, engineName string) ([]ir.StreamStatus, error) {
-	const q = "SELECT stream_id, source_position, updated_at, " +
+func listStreams(ctx context.Context, db *sql.DB, controlKeyspace, engineName string) ([]ir.StreamStatus, error) {
+	q := "SELECT stream_id, source_position, updated_at, " +
 		"COALESCE(slot_name, ''), " +
 		"COALESCE(source_dsn_fingerprint, ''), " +
 		"COALESCE(target_schema, '') " +
-		"FROM `" + controlTableName + "`"
+		"FROM " + controlTableRef(controlKeyspace, controlTableName)
 	cfg := *controlCfg
 	cfg.ListStreamsFallback = func(ctx context.Context, queryErr error) ([]ir.StreamStatus, bool, error) {
 		if !isMySQLUnknownColumnErr(queryErr) {
 			return nil, false, nil
 		}
-		out, err := listStreamsLegacy(ctx, db, engineName)
+		out, err := listStreamsLegacy(ctx, db, controlKeyspace, engineName)
 		return out, true, err
 	}
 	return appliershared.ListStreams(ctx, db, &cfg, q, engineName)
@@ -531,8 +594,8 @@ func listStreams(ctx context.Context, db *sql.DB, engineName string) ([]ir.Strea
 // The returned StreamStatus values have empty SlotName /
 // SourceDSNFingerprint / TargetSchema — the columns are simply not
 // present yet on this control table.
-func listStreamsLegacy(ctx context.Context, db *sql.DB, engineName string) ([]ir.StreamStatus, error) {
-	const q = "SELECT stream_id, source_position, updated_at FROM `" + controlTableName + "`"
+func listStreamsLegacy(ctx context.Context, db *sql.DB, controlKeyspace, engineName string) ([]ir.StreamStatus, error) {
+	q := "SELECT stream_id, source_position, updated_at FROM " + controlTableRef(controlKeyspace, controlTableName)
 	rows, err := db.QueryContext(ctx, q)
 	if err != nil {
 		if isMySQLMissingTableErr(err) {
@@ -605,19 +668,41 @@ func isMySQLMissingTableErr(err error) bool {
 // is structural-optional and the applier no-ops empty input)
 // produce NULL columns on the row — identical to the pre-v0.32.2
 // shape on the MySQL side.
-func writePositionTx(ctx context.Context, tx *sql.Tx, streamID, token, slotName, sourceFingerprint, targetSchema string) error {
-	const q = "INSERT INTO `" + controlTableName + "` " +
+func writePositionTx(ctx context.Context, tx *sql.Tx, controlKeyspace, streamID, token, slotName, sourceFingerprint, targetSchema string) error {
+	// Sidecar-keyspace feature: when controlKeyspace is set, this UPSERT
+	// still rides the SAME per-change *sql.Tx as the data write (ADR-0007 /
+	// ADR-0049 #4a atomicity) — it is deliberately NOT decoupled onto a
+	// separate connection. On a sharded target that makes the position write
+	// and the data write span two keyspaces, so vtgate can only best-effort
+	// the cross-keyspace commit (no 2PC). That is acceptable here: the
+	// sharded-target apply is already cross-shard / non-atomic, and keyed
+	// idempotent apply makes a torn resume safe (a position that committed
+	// without its data, or vice versa, replays cleanly on restart). Empty
+	// controlKeyspace is unchanged single-keyspace, genuinely atomic behaviour.
+	if _, err := tx.ExecContext(ctx, writePositionUpsertSQL(controlKeyspace), streamID, token, slotName, sourceFingerprint, targetSchema); err != nil {
+		return fmt.Errorf("mysql: write position: %w", err)
+	}
+	return nil
+}
+
+// writePositionUpsertSQL builds the ADR-0007 position-write UPSERT, keyspace-
+// qualified per controlKeyspace (empty = bare, byte-identical to the historical
+// statement). Extracted as a pure function so the byte-exactness of this
+// atomicity-critical statement is unit-pinnable for both the bare and the
+// sidecar-qualified shapes without a live target. The `ref.slot_name` COALESCE
+// sources use the SAME fully-qualified reference as the table, so a qualified
+// name yields a valid three-part `ks`.`table`.column reference and the bare
+// name yields the historical `table`.column form.
+func writePositionUpsertSQL(controlKeyspace string) string {
+	ref := controlTableRef(controlKeyspace, controlTableName)
+	return "INSERT INTO " + ref + " " +
 		"(stream_id, source_position, slot_name, source_dsn_fingerprint, target_schema) " +
 		"VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, '')) " +
 		"AS new ON DUPLICATE KEY UPDATE " +
 		"source_position = new.source_position, " +
-		"slot_name = COALESCE(new.slot_name, `" + controlTableName + "`.slot_name), " +
-		"source_dsn_fingerprint = COALESCE(new.source_dsn_fingerprint, `" + controlTableName + "`.source_dsn_fingerprint), " +
-		"target_schema = COALESCE(new.target_schema, `" + controlTableName + "`.target_schema)"
-	if _, err := tx.ExecContext(ctx, q, streamID, token, slotName, sourceFingerprint, targetSchema); err != nil {
-		return fmt.Errorf("mysql: write position: %w", err)
-	}
-	return nil
+		"slot_name = COALESCE(new.slot_name, " + ref + ".slot_name), " +
+		"source_dsn_fingerprint = COALESCE(new.source_dsn_fingerprint, " + ref + ".source_dsn_fingerprint), " +
+		"target_schema = COALESCE(new.target_schema, " + ref + ".target_schema)"
 }
 
 // readStopRequested returns true when the named stream's row has a
@@ -629,8 +714,8 @@ func writePositionTx(ctx context.Context, tx *sql.Tx, streamID, token, slotName,
 // hence the nolint.
 //
 //nolint:unused // called by pipeline poll loop via ChangeApplier receiver
-func readStopRequested(ctx context.Context, db *sql.DB, streamID string) (bool, error) {
-	const q = "SELECT stop_requested_at IS NOT NULL FROM `" + controlTableName + "` WHERE stream_id = ?"
+func readStopRequested(ctx context.Context, db *sql.DB, controlKeyspace, streamID string) (bool, error) {
+	q := "SELECT stop_requested_at IS NOT NULL FROM " + controlTableRef(controlKeyspace, controlTableName) + " WHERE stream_id = ?"
 	return appliershared.ReadStopRequested(ctx, db, controlCfg, q, streamID)
 }
 
@@ -644,9 +729,10 @@ func readStopRequested(ctx context.Context, db *sql.DB, streamID string) (bool, 
 // The existence probe + unconditional UPDATE pair (rather than a
 // rows-affected check) is the shared skeleton's changed-rows branch —
 // see ControlTableConfig.RowsAffectedIsChangedRows on controlCfg.
-func requestStop(ctx context.Context, db *sql.DB, streamID string) error {
-	const existsQ = "SELECT 1 FROM `" + controlTableName + "` WHERE stream_id = ?"
-	const updateQ = "UPDATE `" + controlTableName + "` SET stop_requested_at = CURRENT_TIMESTAMP WHERE stream_id = ?"
+func requestStop(ctx context.Context, db *sql.DB, controlKeyspace, streamID string) error {
+	ref := controlTableRef(controlKeyspace, controlTableName)
+	existsQ := "SELECT 1 FROM " + ref + " WHERE stream_id = ?"
+	updateQ := "UPDATE " + ref + " SET stop_requested_at = CURRENT_TIMESTAMP WHERE stream_id = ?"
 	return appliershared.RequestStop(ctx, db, controlCfg, existsQ, updateQ, streamID)
 }
 
@@ -664,8 +750,8 @@ var errStreamNotFound = errors.New("mysql: stream not found")
 // position-write commit will populate the row. (EnsureControlTable
 // runs first, but a brand-new target may have an in-flight
 // schema-apply.)
-func clearStopRequested(ctx context.Context, db *sql.DB, streamID string) error {
-	const q = "UPDATE `" + controlTableName + "` SET stop_requested_at = NULL WHERE stream_id = ?"
+func clearStopRequested(ctx context.Context, db *sql.DB, controlKeyspace, streamID string) error {
+	q := "UPDATE " + controlTableRef(controlKeyspace, controlTableName) + " SET stop_requested_at = NULL WHERE stream_id = ?"
 	return appliershared.TolerantExec(ctx, db, controlCfg, "clear stop signal", q, streamID)
 }
 
@@ -673,8 +759,8 @@ func clearStopRequested(ctx context.Context, db *sql.DB, streamID string) error 
 // control table. Idempotent and tolerant of a missing row or table —
 // re-running `--reset-target-data` after a partial failure proceeds
 // cleanly. See [ChangeApplier.ClearStream] for the recovery flow.
-func clearStream(ctx context.Context, db *sql.DB, streamID string) error {
-	const q = "DELETE FROM `" + controlTableName + "` WHERE stream_id = ?"
+func clearStream(ctx context.Context, db *sql.DB, controlKeyspace, streamID string) error {
+	q := "DELETE FROM " + controlTableRef(controlKeyspace, controlTableName) + " WHERE stream_id = ?"
 	return appliershared.TolerantExec(ctx, db, controlCfg, "clear stream", q, streamID)
 }
 
@@ -688,8 +774,8 @@ func clearStream(ctx context.Context, db *sql.DB, streamID string) error {
 // of legacy/missing surfaces means a streamer running against a
 // pre-v0.27.0 control table degrades to "no live-adds" rather than
 // erroring on every tick.
-func readLiveAddedTables(ctx context.Context, db *sql.DB, streamID string) ([]string, error) {
-	const q = "SELECT live_added_tables FROM `" + controlTableName + "` WHERE stream_id = ?"
+func readLiveAddedTables(ctx context.Context, db *sql.DB, controlKeyspace, streamID string) ([]string, error) {
+	q := "SELECT live_added_tables FROM " + controlTableRef(controlKeyspace, controlTableName) + " WHERE stream_id = ?"
 	var raw sql.NullString
 	err := db.QueryRowContext(ctx, q, streamID).Scan(&raw)
 	switch {
@@ -721,7 +807,7 @@ func readLiveAddedTables(ctx context.Context, db *sql.DB, streamID string) ([]st
 // ListStreams, but the function still surfaces a clear error if the
 // row vanishes between preflight and write (rare; operator
 // concurrently ran sync stop --wait + delete).
-func recordLiveAddedTable(ctx context.Context, db *sql.DB, streamID, tableName string) error {
+func recordLiveAddedTable(ctx context.Context, db *sql.DB, controlKeyspace, streamID, tableName string) error {
 	tableName = strings.TrimSpace(tableName)
 	if tableName == "" {
 		return errors.New("mysql: record live-added table: tableName is empty")
@@ -732,7 +818,8 @@ func recordLiveAddedTable(ctx context.Context, db *sql.DB, streamID, tableName s
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	const selectQ = "SELECT live_added_tables FROM `" + controlTableName + "` WHERE stream_id = ? FOR UPDATE"
+	ref := controlTableRef(controlKeyspace, controlTableName)
+	selectQ := "SELECT live_added_tables FROM " + ref + " WHERE stream_id = ? FOR UPDATE"
 	var raw sql.NullString
 	if err := tx.QueryRowContext(ctx, selectQ, streamID).Scan(&raw); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -748,7 +835,7 @@ func recordLiveAddedTable(ctx context.Context, db *sql.DB, streamID, tableName s
 	merged := mergeLiveAddedTables(existing, tableName)
 	joined := strings.Join(merged, ",")
 
-	const updateQ = "UPDATE `" + controlTableName + "` SET live_added_tables = ? WHERE stream_id = ?"
+	updateQ := "UPDATE " + ref + " SET live_added_tables = ? WHERE stream_id = ?"
 	if _, err := tx.ExecContext(ctx, updateQ, joined, streamID); err != nil {
 		return fmt.Errorf("mysql: record live-added table: update: %w", err)
 	}

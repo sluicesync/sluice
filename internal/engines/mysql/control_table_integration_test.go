@@ -147,7 +147,7 @@ func TestRequestStop_RoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	if err := writePositionTx(ctx, tx, "test-stream", "tok", "", "", ""); err != nil {
+	if err := writePositionTx(ctx, tx, "", "test-stream", "tok", "", "", ""); err != nil {
 		t.Fatalf("writePositionTx: %v", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -327,6 +327,126 @@ func TestEnsureControlTable_AddsCrossEngineParityColumns(t *testing.T) {
 	// Calling EnsureControlTable again is still a no-op (idempotent).
 	if err := applier.EnsureControlTable(ctx); err != nil {
 		t.Fatalf("second EnsureControlTable: %v", err)
+	}
+}
+
+// TestControlKeyspace_SidecarRoutesControlTables pins the sidecar-keyspace
+// prototype (--control-keyspace) on a real server. On a SHARDED PlanetScale/
+// Vitess target the control tables can't live in the sharded data keyspace (no
+// vindex); the operator points --control-keyspace at a separate UNSHARDED
+// keyspace. Vanilla MySQL has a flat namespace, so a "keyspace" is just a
+// database — that lets us prove, without a Vitess cluster, that:
+//
+//   - EnsureControlTable creates all THREE control tables in the sidecar
+//     database, NOT in the connection's default database.
+//   - A position write (which rides the atomicity-critical writePositionTx
+//     three-part `ks`.`table`.column UPSERT) and RequestStop / ReadStopRequested
+//     round-trip through the sidecar-qualified statements.
+//
+// The live sharded-cluster validation is run separately by the operator; this
+// same-engine test guards the SQL-shape / routing contract the prototype rests
+// on so a malformed qualified statement can't slip through.
+func TestControlKeyspace_SidecarRoutesControlTables(t *testing.T) {
+	dsn, cleanup := startMySQLForApplier(t)
+	defer cleanup()
+
+	const sidecar = "sluice_ctl_sidecar"
+	// The operator pre-creates the unsharded sidecar keyspace; here that is a
+	// database. DROP first so the shared container stays deterministic across
+	// reruns; drop again on cleanup so we don't leak it to sibling tests.
+	applyMySQLApplier(t, dsn, "DROP DATABASE IF EXISTS `"+sidecar+"`; CREATE DATABASE `"+sidecar+"`;")
+	t.Cleanup(func() { applyMySQLApplier(t, dsn, "DROP DATABASE IF EXISTS `"+sidecar+"`;") })
+
+	engIR, err := (Engine{Flavor: FlavorVanilla}).WithControlKeyspace(sidecar)
+	if err != nil {
+		t.Fatalf("WithControlKeyspace: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	applier, err := engIR.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+	if err := applier.EnsureControlTable(ctx); err != nil {
+		t.Fatalf("EnsureControlTable: %v", err)
+	}
+
+	// Seed a position via WritePosition — exercises the sidecar-qualified
+	// writePositionTx UPSERT (the three-part column reference).
+	pw, ok := applier.(interface {
+		WritePosition(ctx context.Context, streamID string, pos ir.Position) error
+	})
+	if !ok {
+		t.Fatal("ChangeApplier does not implement ir.PositionWriter")
+	}
+	if err := pw.WritePosition(ctx, "sidecar-stream", ir.Position{Engine: engineNameMySQL, Token: "tok1"}); err != nil {
+		t.Fatalf("WritePosition: %v", err)
+	}
+
+	myApplier := applier.(*ChangeApplier)
+	pos, found, err := myApplier.ReadPosition(ctx, "sidecar-stream")
+	if err != nil {
+		t.Fatalf("ReadPosition: %v", err)
+	}
+	if !found || pos.Token != "tok1" {
+		t.Fatalf("ReadPosition = (%+v, %v); want token tok1, found true", pos, found)
+	}
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	// Every control table must live in the sidecar database and NOT in the
+	// connection's default database (target_db).
+	for _, tbl := range []string{
+		"sluice_cdc_state",
+		"sluice_cdc_schema_history",
+		"sluice_shard_consolidation_lease",
+	} {
+		var inSidecar int
+		if err := db.QueryRowContext(
+			ctx,
+			"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+			sidecar, tbl,
+		).Scan(&inSidecar); err != nil {
+			t.Fatalf("sidecar lookup %s: %v", tbl, err)
+		}
+		if inSidecar != 1 {
+			t.Errorf("%s not created in sidecar keyspace %q; count = %d", tbl, sidecar, inSidecar)
+		}
+
+		var inDefault int
+		if err := db.QueryRowContext(
+			ctx,
+			"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
+			tbl,
+		).Scan(&inDefault); err != nil {
+			t.Fatalf("default-db lookup %s: %v", tbl, err)
+		}
+		if inDefault != 0 {
+			t.Errorf("%s leaked into the default database; count = %d (want 0)", tbl, inDefault)
+		}
+	}
+
+	// RequestStop / ReadStopRequested round-trip through the sidecar table.
+	if err := applier.RequestStop(ctx, "sidecar-stream"); err != nil {
+		t.Fatalf("RequestStop: %v", err)
+	}
+	stop, err := myApplier.ReadStopRequested(ctx, "sidecar-stream")
+	if err != nil {
+		t.Fatalf("ReadStopRequested: %v", err)
+	}
+	if !stop {
+		t.Fatal("ReadStopRequested(after stop) = false; want true")
 	}
 }
 

@@ -138,8 +138,8 @@ func (a *ChangeApplier) invalidateTargetCachesForBoundary(s ir.SchemaSnapshot) {
 // A stream with no retained versions returns an empty slice; the
 // prime then has nothing to do (cold-start before any boundary, or
 // the brand-new-stream sentinel filtered upstream).
-func distinctSchemaTablesForStream(ctx context.Context, q schemaHistoryQueryer, streamID string) ([]struct{ Schema, Table string }, error) {
-	const sel = "SELECT DISTINCT schema_name, table_name FROM `" + schemaHistoryTableName + "` " +
+func distinctSchemaTablesForStream(ctx context.Context, q schemaHistoryQueryer, controlKeyspace, streamID string) ([]struct{ Schema, Table string }, error) {
+	sel := "SELECT DISTINCT schema_name, table_name FROM " + controlTableRef(controlKeyspace, schemaHistoryTableName) + " " +
 		"WHERE stream_id = ?"
 	rows, err := q.QueryContext(ctx, sel, streamID)
 	if err != nil {
@@ -208,7 +208,7 @@ func (a *ChangeApplier) PrimeSchemaHistoryCache(ctx context.Context, streamID st
 		return errors.New("mysql: applier: PrimeSchemaHistoryCache: db is nil")
 	}
 
-	tables, err := distinctSchemaTablesForStream(ctx, a.db, streamID)
+	tables, err := distinctSchemaTablesForStream(ctx, a.db, a.controlKeyspace, streamID)
 	if err != nil {
 		return err
 	}
@@ -273,7 +273,7 @@ func (a *ChangeApplier) PrimeSchemaHistoryCache(ctx context.Context, streamID st
 		// Test-only counter: each iteration is one storage hit
 		// (loadRetainedSchemaVersions) + one in-memory resolve.
 		a.resolveCallsForTest.Add(1)
-		t, err := resolveSchemaVersion(ctx, a.db, orderer, streamID, st.Schema, st.Table, currentPos)
+		t, err := resolveSchemaVersion(ctx, a.db, a.controlKeyspace, orderer, streamID, st.Schema, st.Table, currentPos)
 		if err != nil {
 			return fmt.Errorf("mysql: applier: prime schema-history cache for %s.%s: %w",
 				st.Schema, st.Table, err)

@@ -384,13 +384,14 @@ func (e Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeApp
 		// SetApplyConcurrency). sqlMode is the engine's resolved --mysql-sql-mode
 		// override (task 2.5) so the lazily-opened lane pool injects the SAME
 		// session sql_mode as the serial pool.
-		pipelineCfg:   cfg,
-		sqlMode:       e.opts.sqlMode,
-		pkCache:       make(map[string][]string),
-		colTypeCache:  make(map[string]map[string]*ir.Column),
-		keylessCache:  make(map[string]bool),
-		warnedKeyless: make(map[string]bool),
-		activeSchema:  make(map[string]activeSchemaVersion),
+		pipelineCfg:     cfg,
+		sqlMode:         e.opts.sqlMode,
+		controlKeyspace: e.opts.controlKeyspace,
+		pkCache:         make(map[string][]string),
+		colTypeCache:    make(map[string]map[string]*ir.Column),
+		keylessCache:    make(map[string]bool),
+		warnedKeyless:   make(map[string]bool),
+		activeSchema:    make(map[string]activeSchemaVersion),
 	}, nil
 }
 

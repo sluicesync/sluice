@@ -127,6 +127,18 @@ type ChangeApplier struct {
 	// construction default) resolves to the strict-by-default mode in openDB.
 	sqlMode *string
 
+	// controlKeyspace is the engine's --control-keyspace override (the
+	// sidecar-keyspace feature). When non-empty, EVERY control-table
+	// statement this applier issues (sluice_cdc_state,
+	// sluice_cdc_schema_history, sluice_shard_consolidation_lease) is
+	// keyspace-qualified via [controlTableRef] and its information_schema
+	// probes scope to this keyspace, so a sync against a SHARDED target can
+	// keep the vindex-less control tables in a separate UNSHARDED keyspace.
+	// Empty (the direct-API / unit / non-CLI default) is byte-identical to
+	// the historical bare-name behaviour. Set from e.opts.controlKeyspace by
+	// [Engine.OpenChangeApplier].
+	controlKeyspace string
+
 	// applyConcurrency is the ADR-0104 (item 23(c)) key-hash apply LANE
 	// count W: the number of in-order apply lanes the merged change stream
 	// is fanned across by primary-key hash (same key → same lane → in-order,
@@ -721,13 +733,13 @@ func (a *ChangeApplier) Close() error {
 // the Streamer drives this at startup. The schema-history ensure is
 // strictly additive — it never touches sluice_cdc_state data.
 func (a *ChangeApplier) EnsureControlTable(ctx context.Context) error {
-	if err := ensureControlTable(ctx, a.db); err != nil {
+	if err := ensureControlTable(ctx, a.db, a.controlKeyspace); err != nil {
 		return err
 	}
-	if err := ensureSchemaHistoryTable(ctx, a.db); err != nil {
+	if err := ensureSchemaHistoryTable(ctx, a.db, a.controlKeyspace); err != nil {
 		return err
 	}
-	return ensureShardConsolidationLeaseTable(ctx, a.db)
+	return ensureShardConsolidationLeaseTable(ctx, a.db, a.controlKeyspace)
 }
 
 // CompactSchemaHistoryBelow implements [ir.SchemaHistoryCompactor]
@@ -736,7 +748,7 @@ func (a *ChangeApplier) EnsureControlTable(ctx context.Context) error {
 // [ir.PositionOrderer]. See compactSchemaHistoryBelow for the
 // strict-older semantics + loud-floor preservation invariant.
 func (a *ChangeApplier) CompactSchemaHistoryBelow(ctx context.Context, floor ir.Position) (int, error) {
-	return compactSchemaHistoryBelow(ctx, a.db, Engine{}, floor)
+	return compactSchemaHistoryBelow(ctx, a.db, a.controlKeyspace, Engine{}, floor)
 }
 
 // ReadPosition returns the last persisted source position for
@@ -744,7 +756,7 @@ func (a *ChangeApplier) CompactSchemaHistoryBelow(ctx context.Context, floor ir.
 // always has Engine = "mysql"; only the Token survives across
 // runs (the engine reading is implicitly the engine that wrote).
 func (a *ChangeApplier) ReadPosition(ctx context.Context, streamID string) (ir.Position, bool, error) {
-	token, ok, err := readPosition(ctx, a.db, streamID)
+	token, ok, err := readPosition(ctx, a.db, a.controlKeyspace, streamID)
 	if err != nil {
 		return ir.Position{}, false, err
 	}
@@ -763,7 +775,7 @@ func (a *ChangeApplier) ReadPosition(ctx context.Context, streamID string) (ir.P
 // of the table being absent — operators querying status against a
 // fresh target should see "no streams" rather than an error.
 func (a *ChangeApplier) ListStreams(ctx context.Context) ([]ir.StreamStatus, error) {
-	return listStreams(ctx, a.db, engineNameMySQL)
+	return listStreams(ctx, a.db, a.controlKeyspace, engineNameMySQL)
 }
 
 // RequestStop flips the stop flag on the named stream's row. The
@@ -778,7 +790,7 @@ func (a *ChangeApplier) RequestStop(ctx context.Context, streamID string) error 
 	if streamID == "" {
 		return errors.New("mysql: applier: RequestStop: streamID is empty")
 	}
-	return requestStop(ctx, a.db, streamID)
+	return requestStop(ctx, a.db, a.controlKeyspace, streamID)
 }
 
 // ReadStopRequested returns true when the named stream's row has a
@@ -788,7 +800,7 @@ func (a *ChangeApplier) RequestStop(ctx context.Context, streamID string) error 
 // set rules require an exported method to satisfy an interface from
 // another package — even when that interface is itself unexported.
 func (a *ChangeApplier) ReadStopRequested(ctx context.Context, streamID string) (bool, error) {
-	return readStopRequested(ctx, a.db, streamID)
+	return readStopRequested(ctx, a.db, a.controlKeyspace, streamID)
 }
 
 // ClearStopRequested resets stop_requested_at to NULL for the named
@@ -800,7 +812,7 @@ func (a *ChangeApplier) ClearStopRequested(ctx context.Context, streamID string)
 	if streamID == "" {
 		return errors.New("mysql: applier: ClearStopRequested: streamID is empty")
 	}
-	return clearStopRequested(ctx, a.db, streamID)
+	return clearStopRequested(ctx, a.db, a.controlKeyspace, streamID)
 }
 
 // ClearStream deletes the named stream's row from the per-target
@@ -811,7 +823,7 @@ func (a *ChangeApplier) ClearStream(ctx context.Context, streamID string) error 
 	if streamID == "" {
 		return errors.New("mysql: applier: ClearStream: streamID is empty")
 	}
-	return clearStream(ctx, a.db, streamID)
+	return clearStream(ctx, a.db, a.controlKeyspace, streamID)
 }
 
 // ReadLiveAddedTables returns the comma-parsed live_added_tables
@@ -829,7 +841,7 @@ func (a *ChangeApplier) ReadLiveAddedTables(ctx context.Context, streamID string
 	if streamID == "" {
 		return nil, errors.New("mysql: applier: ReadLiveAddedTables: streamID is empty")
 	}
-	return readLiveAddedTables(ctx, a.db, streamID)
+	return readLiveAddedTables(ctx, a.db, a.controlKeyspace, streamID)
 }
 
 // RecordLiveAddedTable appends tableName to the per-target row's
@@ -851,7 +863,7 @@ func (a *ChangeApplier) RecordLiveAddedTable(ctx context.Context, streamID, tabl
 	if streamID == "" {
 		return errors.New("mysql: applier: RecordLiveAddedTable: streamID is empty")
 	}
-	return recordLiveAddedTable(ctx, a.db, streamID, tableName)
+	return recordLiveAddedTable(ctx, a.db, a.controlKeyspace, streamID, tableName)
 }
 
 // WritePosition implements [ir.PositionWriter]: upserts the position
@@ -871,7 +883,7 @@ func (a *ChangeApplier) WritePosition(ctx context.Context, streamID string, pos 
 		return fmt.Errorf("mysql: applier: WritePosition: begin tx: %w", err)
 	}
 	posCtx, posCancel := a.execTimeoutCtx(ctx)
-	err = writePositionTx(posCtx, tx, streamID, pos.Token, a.slotName, a.sourceFingerprint, a.targetSchema)
+	err = writePositionTx(posCtx, tx, a.controlKeyspace, streamID, pos.Token, a.slotName, a.sourceFingerprint, a.targetSchema)
 	posCancel()
 	if err != nil {
 		_ = tx.Rollback()
@@ -1001,7 +1013,7 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 	}
 	if writePosition {
 		posCtx, posCancel := a.execTimeoutCtx(ctx)
-		err = writePositionTx(posCtx, tx, streamID, c.Pos().Token, a.slotName, a.sourceFingerprint, a.targetSchema)
+		err = writePositionTx(posCtx, tx, a.controlKeyspace, streamID, c.Pos().Token, a.slotName, a.sourceFingerprint, a.targetSchema)
 		posCancel()
 		if err != nil {
 			_ = tx.Rollback()
@@ -1152,7 +1164,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if v.IR == nil {
 			return errors.New("mysql: applier: schema snapshot has nil IR table")
 		}
-		if err := writeSchemaVersion(ctx, tx, streamID, v.Schema, v.Table, v.Position, v.IR); err != nil {
+		if err := writeSchemaVersion(ctx, tx, a.controlKeyspace, streamID, v.Schema, v.Table, v.Position, v.IR); err != nil {
 			return fmt.Errorf("mysql: applier: write schema version for %s.%s: %w", v.Schema, v.Table, err)
 		}
 		return nil

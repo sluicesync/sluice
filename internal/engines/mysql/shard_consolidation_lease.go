@@ -30,7 +30,7 @@ func (a *ChangeApplier) TryAcquireLease(
 	tableName, streamID string,
 	expires time.Time,
 ) (bool, ir.ShardConsolidationLeaseRow, error) {
-	acquired, row, err := tryAcquireShardLease(ctx, a.db, tableName, streamID, expires)
+	acquired, row, err := tryAcquireShardLease(ctx, a.db, a.controlKeyspace, tableName, streamID, expires)
 	if err != nil {
 		return false, ir.ShardConsolidationLeaseRow{}, err
 	}
@@ -43,7 +43,7 @@ func (a *ChangeApplier) HeartbeatLease(
 	tableName, streamID string,
 	expires time.Time,
 ) (bool, error) {
-	return heartbeatShardLease(ctx, a.db, tableName, streamID, expires)
+	return heartbeatShardLease(ctx, a.db, a.controlKeyspace, tableName, streamID, expires)
 }
 
 // RecordDDLText implements [ir.ShardConsolidationLeaseStore].
@@ -51,7 +51,7 @@ func (a *ChangeApplier) RecordDDLText(
 	ctx context.Context,
 	tableName, streamID, ddlText string,
 ) (bool, error) {
-	return recordShardLeaseDDLText(ctx, a.db, tableName, streamID, ddlText)
+	return recordShardLeaseDDLText(ctx, a.db, a.controlKeyspace, tableName, streamID, ddlText)
 }
 
 // FinalizeLeaseApply implements [ir.ShardConsolidationLeaseStore].
@@ -68,7 +68,7 @@ func (a *ChangeApplier) FinalizeLeaseApply(
 	anchor ir.Position,
 ) (bool, error) {
 	return finalizeShardLeaseApply(
-		ctx, a.db,
+		ctx, a.db, a.controlKeyspace,
 		tableName, streamID, ddlText, ddlChecksum,
 		appliedSchemaVersion,
 		anchor.Token, anchor.Engine,
@@ -79,7 +79,7 @@ func (a *ChangeApplier) FinalizeLeaseApply(
 // lease GC sweep (task #21). Tolerant of the row or the lease control
 // table itself being absent (returns nil).
 func (a *ChangeApplier) DeleteLease(ctx context.Context, tableName string) error {
-	return deleteShardLease(ctx, a.db, tableName)
+	return deleteShardLease(ctx, a.db, a.controlKeyspace, tableName)
 }
 
 // ObserveLease implements [ir.ShardConsolidationLeaseStore].
@@ -87,7 +87,7 @@ func (a *ChangeApplier) ObserveLease(
 	ctx context.Context,
 	tableName string,
 ) (ir.ShardConsolidationLeaseRow, bool, error) {
-	row, ok, err := selectShardLease(ctx, a.db, tableName)
+	row, ok, err := selectShardLease(ctx, a.db, a.controlKeyspace, tableName)
 	if err != nil {
 		return ir.ShardConsolidationLeaseRow{}, false, err
 	}
@@ -101,7 +101,7 @@ func (a *ChangeApplier) ObserveLease(
 // every row in the per-target lease control table for the `sluice
 // sync status` ADR-0054 §6 surface.
 func (a *ChangeApplier) ListLeases(ctx context.Context) ([]ir.ShardConsolidationLeaseRow, error) {
-	rows, err := listShardLeases(ctx, a.db)
+	rows, err := listShardLeases(ctx, a.db, a.controlKeyspace)
 	if err != nil {
 		return nil, err
 	}
