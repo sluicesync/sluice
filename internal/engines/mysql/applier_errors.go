@@ -58,17 +58,27 @@ import (
 // (ADR-0052; the v0.99.69 sustained-tx-killer finding) — a batch the
 // target rolled back for exceeding its tx-timeout window must shrink,
 // not re-submit at the same size and be killed again.
+//
+// idleProgressTimeout additionally satisfies [ir.LivenessProgressTimeoutError]
+// when the classified transient is the VStream Phase-2 "established then went
+// idle" progress timeout ([vstreamProgressTimeoutError]). The pipeline's
+// retry loop reads that surface to keep an idle-but-healthy source's benign
+// reconnects OUT of the give-up budget (loose end 2b). It is set ONLY by the
+// Phase-2 constructor; a Phase-1 liveness timeout / connection error leaves it
+// false so a stream that never established still fails loudly.
 type retriableMySQLError struct {
-	err      error
-	hint     time.Duration
-	txKilled bool
+	err                 error
+	hint                time.Duration
+	txKilled            bool
+	idleProgressTimeout bool
 }
 
-func (e *retriableMySQLError) Error() string            { return e.err.Error() }
-func (e *retriableMySQLError) Unwrap() error            { return e.err }
-func (e *retriableMySQLError) Retriable() bool          { return true }
-func (e *retriableMySQLError) RetryHint() time.Duration { return e.hint }
-func (e *retriableMySQLError) TransactionKilled() bool  { return e.txKilled }
+func (e *retriableMySQLError) Error() string               { return e.err.Error() }
+func (e *retriableMySQLError) Unwrap() error               { return e.err }
+func (e *retriableMySQLError) Retriable() bool             { return true }
+func (e *retriableMySQLError) RetryHint() time.Duration    { return e.hint }
+func (e *retriableMySQLError) TransactionKilled() bool     { return e.txKilled }
+func (e *retriableMySQLError) IsIdleProgressTimeout() bool { return e.idleProgressTimeout }
 
 // isMySQLDeadlock reports whether err is (or wraps) an InnoDB deadlock —
 // MySQL error 1213 / SQLSTATE 40001. The deadlock victim's transaction is

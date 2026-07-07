@@ -426,7 +426,19 @@ func (b *BackupStream) Run(ctx context.Context) error {
 			// successful rollover.
 			var re ir.RetriableError
 			if retryAttempts > 1 && errors.As(rErr, &re) && re.Retriable() {
-				retryConsecutive++
+				// Loose end 2b sibling: an established-then-idle VStream
+				// Phase-2 progress timeout (ir.LivenessProgressTimeoutError)
+				// is NOT a consecutive failure — the pump re-established and
+				// proved a serving tablet, then the source was quiet. Don't
+				// advance the give-up budget for it, so a genuinely idle
+				// backup source doesn't die after retryAttempts idle
+				// reconnects (same rationale + invariant as the sync-stream
+				// loop in streamer_retry.go). A Phase-1 / open error carries
+				// no marker and still counts, so a stream that can never
+				// establish still fails loudly after the budget.
+				if !isIdleProgressTimeout(rErr) {
+					retryConsecutive++
+				}
 				if retryConsecutive >= retryAttempts {
 					return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("stream: rollover %d: retry budget exhausted after %d consecutive failures: %w",
 						rolloverSeq, retryConsecutive, rErr))

@@ -7,8 +7,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // retriableWrapper is a test double satisfying [ir.RetriableError]
@@ -25,6 +28,42 @@ func (e *retriableWrapper) Error() string            { return e.err.Error() }
 func (e *retriableWrapper) Unwrap() error            { return e.err }
 func (e *retriableWrapper) Retriable() bool          { return true }
 func (e *retriableWrapper) RetryHint() time.Duration { return 0 }
+
+// idleProgressWrapper is a test double satisfying BOTH [ir.RetriableError]
+// and [ir.LivenessProgressTimeoutError] with IsIdleProgressTimeout()==true —
+// the engine-neutral shape a VStream Phase-2 "established then went idle"
+// progress timeout (mysql.vstreamProgressTimeoutError) produces, without
+// importing the mysql engine package (which would create a cycle).
+type idleProgressWrapper struct {
+	err error
+}
+
+func (e *idleProgressWrapper) Error() string               { return e.err.Error() }
+func (e *idleProgressWrapper) Unwrap() error               { return e.err }
+func (e *idleProgressWrapper) Retriable() bool             { return true }
+func (e *idleProgressWrapper) RetryHint() time.Duration    { return 0 }
+func (e *idleProgressWrapper) IsIdleProgressTimeout() bool { return true }
+
+// Compile-time proof the double stays in sync with the marker interface, so a
+// signature drift fails the build rather than silently skipping the exemption.
+var _ ir.LivenessProgressTimeoutError = (*idleProgressWrapper)(nil)
+
+// idleProgressErr builds the benign, retriable idle-progress-timeout error
+// (marker present) an established-then-idle CDC reconnect surfaces.
+func idleProgressErr() error {
+	return &idleProgressWrapper{err: errors.New(
+		"mysql/vstream: stream produced no events for 45s after data had been flowing; reconnecting from the last position",
+	)}
+}
+
+// neverEstablishedErr builds a NO-MARKER retriable error — the shape a
+// Phase-1 liveness timeout / open-or-connection failure surfaces (the stream
+// never established). It must still count toward the give-up budget.
+func neverEstablishedErr() error {
+	return &retriableWrapper{err: errors.New(
+		"mysql/vstream: no events within 30s of opening the stream",
+	)}
+}
 
 // TestErrIsRetriable_Bug57 pins the load-bearing classification
 // contract for the v0.52.2 fix (Bug 57). Both runOnce and runWithRetry
@@ -104,6 +143,92 @@ func TestErrIsRetriable_NonRetriable(t *testing.T) {
 				t.Errorf("%v misclassified as retriable; would loop forever instead of cleanly returning", c.err)
 			}
 		})
+	}
+}
+
+// TestRunWithRetry_IdleProgressTimeoutSurvivesBudget pins loose end 2b (case
+// a): a healthy-but-IDLE source whose every reconnect surfaces the Phase-2
+// established-then-idle progress timeout (marker present) must survive
+// INDEFINITELY — its benign idle reconnects must NOT advance the give-up
+// budget. foundPos=true models the CDC phase (a cdc-state row exists with a
+// stable token, so the position never advances and the progressed-reset never
+// fires); pre-fix this was GUARANTEED to give up after ApplyRetryAttempts idle
+// cycles (~6 min against an idle PlanetScale source).
+func TestRunWithRetry_IdleProgressTimeoutSurvivesBudget(t *testing.T) {
+	const attempts = 8
+	const idleCycles = attempts*3 + 1 // far past the budget
+	s := fastRetryStreamer(t, true /* CDC phase */, attempts)
+	var calls int
+	s.runOnceFn = func(context.Context) error {
+		calls++
+		if calls <= idleCycles {
+			return idleProgressErr()
+		}
+		return nil // the source finally emits an event; the run completes
+	}
+	if err := s.Run(context.Background()); err != nil {
+		t.Fatalf("Run returned error; an idle-but-healthy source must survive %d idle reconnects (> the %d-attempt budget): %v",
+			idleCycles, attempts, err)
+	}
+	if calls != idleCycles+1 {
+		t.Fatalf("runOnce called %d times; want %d — idle-progress timeouts must never exhaust the budget", calls, idleCycles+1)
+	}
+}
+
+// TestRunWithRetry_NeverEstablishedExhaustsBudget pins the loud-failure
+// invariant (case b): a stream that can NEVER establish — a Phase-1 liveness
+// timeout / open error on every reconnect (NO marker) — must STILL exhaust the
+// budget and fail loudly, never loop forever. foundPos=true (CDC phase, stable
+// token) so the only thing keeping it alive would be a bogus marker exemption;
+// there is none, so it gives up after exactly ApplyRetryAttempts.
+func TestRunWithRetry_NeverEstablishedExhaustsBudget(t *testing.T) {
+	const attempts = 5
+	s := fastRetryStreamer(t, true, attempts)
+	var calls int
+	s.runOnceFn = func(context.Context) error {
+		calls++
+		return neverEstablishedErr() // never establishes; no idle marker
+	}
+	err := s.Run(context.Background())
+	if err == nil {
+		t.Fatal("Run returned nil; a stream that can never establish must fail loudly after the budget")
+	}
+	if calls != attempts {
+		t.Fatalf("runOnce called %d times; a never-establishing stream must give up at the %d-attempt budget", calls, attempts)
+	}
+	if !strings.Contains(err.Error(), "retry budget exhausted") {
+		t.Errorf("want a loud budget-exhaustion error; got %v", err)
+	}
+}
+
+// TestRunWithRetry_MixedIdleAndRealStillGivesUp pins case (c): real failures
+// interspersed with benign idle-progress timeouts still PROGRESS toward the
+// cap. The idle timeouts are skipped (neither increment nor reset), so the
+// real failures accumulate across them and the budget still exhausts — the
+// exemption must not become a loophole that resets a genuine failure streak.
+func TestRunWithRetry_MixedIdleAndRealStillGivesUp(t *testing.T) {
+	const attempts = 3
+	s := fastRetryStreamer(t, true, attempts)
+	var calls int
+	s.runOnceFn = func(context.Context) error {
+		calls++
+		// Alternate benign idle (odd calls, skipped) with real failures
+		// (even calls, counted): idle,real,idle,real,idle,real — the 3rd real
+		// hits the cap on call 6.
+		if calls%2 == 1 {
+			return idleProgressErr()
+		}
+		return neverEstablishedErr()
+	}
+	err := s.Run(context.Background())
+	if err == nil {
+		t.Fatal("Run returned nil; real failures interspersed with benign idles must still exhaust the budget")
+	}
+	if calls != 6 {
+		t.Fatalf("runOnce called %d times; want 6 (3 skipped idles + 3 counted real failures reaching the %d-attempt cap)", calls, attempts)
+	}
+	if !strings.Contains(err.Error(), "retry budget exhausted") {
+		t.Errorf("want a loud budget-exhaustion error; got %v", err)
 	}
 }
 

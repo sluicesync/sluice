@@ -1545,6 +1545,36 @@ func TestVStreamWatchdogTimeouts_AreRetriable(t *testing.T) {
 	}
 }
 
+// TestVStreamProgressTimeout_IsIdleMarker pins loose end 2b: the Phase-2
+// "established then went idle" progress timeout satisfies
+// ir.LivenessProgressTimeoutError with IsIdleProgressTimeout()==true, while
+// the Phase-1 liveness timeout (the stream NEVER established) does NOT. The
+// streamer's give-up budget exempts ONLY the former; putting the marker on
+// the Phase-1 error would let a genuinely dead / no-tablet stream loop
+// forever, violating the loud-failure tenet — so this pins BOTH verdicts.
+func TestVStreamProgressTimeout_IsIdleMarker(t *testing.T) {
+	phase1 := vstreamLivenessTimeoutError(30*time.Second, topodata.TabletType_REPLICA, "main", []string{"0"})
+	phase2 := vstreamProgressTimeoutError(45*time.Second, topodata.TabletType_PRIMARY, "main", []string{"0"})
+
+	// Phase 2 (established then idle) MUST carry the marker with a true verdict.
+	var pe ir.LivenessProgressTimeoutError
+	if !errors.As(phase2, &pe) {
+		t.Fatalf("Phase-2 progress timeout does not satisfy ir.LivenessProgressTimeoutError; got %T", phase2)
+	}
+	if !pe.IsIdleProgressTimeout() {
+		t.Error("Phase-2 progress timeout IsIdleProgressTimeout()==false; the streamer would count it toward the give-up budget and kill an idle-but-healthy source")
+	}
+
+	// Phase 1 (never established) MUST NOT report an idle verdict. It may or
+	// may not satisfy the interface shape (the shared retriableMySQLError has
+	// the method), but the VERDICT must be false so it still counts — the
+	// loud-failure invariant.
+	var pe1 ir.LivenessProgressTimeoutError
+	if errors.As(phase1, &pe1) && pe1.IsIdleProgressTimeout() {
+		t.Error("Phase-1 liveness timeout reported IsIdleProgressTimeout()==true; a never-established stream would then loop forever instead of failing loudly after the budget")
+	}
+}
+
 // fakeTimerPair hands the watchdog two distinct fake timers via [factory]:
 // the FIRST newTimer call (the hard phase timer) gets hard, the SECOND (the
 // soft idle-WARN timer) gets soft. The existing single-fake [fakeLivenessTimer]

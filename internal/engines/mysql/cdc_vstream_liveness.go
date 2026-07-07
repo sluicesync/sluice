@@ -545,13 +545,31 @@ func vstreamLivenessTimeoutError(window time.Duration, tabletType topodata.Table
 // StreamChanges reconnects to the new primary after a failover, and rides
 // out a throttle until it clears). This replaces the prior terminal exit,
 // which under a supervisor became a tight crash-loop that never converged.
+//
+// IDLE-PROGRESS marker (loose end 2b): also flagged
+// idleProgressTimeout=true, so it satisfies
+// [ir.LivenessProgressTimeoutError] with IsIdleProgressTimeout()==true. This
+// error is by construction "the stream ESTABLISHED, then went silent": the
+// watchdog only arms Phase 2 AFTER Phase 1 cleared on the initial attach
+// VGTID (serving proof), so every path that reaches this constructor already
+// proved liveness. The streamer's retry loop uses the marker to keep these
+// benign idle reconnects OUT of the consecutive-failure give-up budget — a
+// genuinely idle-but-healthy source (no idle heartbeats over the public
+// vstream endpoint) processes zero events per reconnect, never advances the
+// position, and would otherwise be GUARANTEED to exhaust the budget in
+// ~ApplyRetryAttempts cycles (~6 min). The Phase-1 constructor
+// ([vstreamLivenessTimeoutError]) deliberately does NOT set this flag: a
+// stream that never established must still fail loudly after the budget.
 func vstreamProgressTimeoutError(window time.Duration, tabletType topodata.TabletType, keyspace string, shards []string) error {
-	return &retriableMySQLError{err: fmt.Errorf(
-		"mysql/vstream: stream produced no events for %s after data had been flowing; the %s stream for keyspace %q shards %v "+
-			"may have hung after a tablet failover/reparent (EmergencyReparentShard / PlannedReparentShard), or a sustained "+
-			"source-tablet throttle / large-transaction stall is withholding events — reconnecting from the last position",
-		window, tabletType, keyspace, shards,
-	)}
+	return &retriableMySQLError{
+		err: fmt.Errorf(
+			"mysql/vstream: stream produced no events for %s after data had been flowing; the %s stream for keyspace %q shards %v "+
+				"may have hung after a tablet failover/reparent (EmergencyReparentShard / PlannedReparentShard), or a sustained "+
+				"source-tablet throttle / large-transaction stall is withholding events — reconnecting from the last position",
+			window, tabletType, keyspace, shards,
+		),
+		idleProgressTimeout: true,
+	}
 }
 
 // vstreamIdleWarnMessage builds the loud, rate-limited heads-up the

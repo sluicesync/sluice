@@ -38,6 +38,23 @@ func classifyRetriable(err error) (ir.RetriableError, bool) {
 	return nil, false
 }
 
+// isIdleProgressTimeout reports whether err carries an
+// [ir.LivenessProgressTimeoutError] whose IsIdleProgressTimeout() verdict is
+// true — the VStream Phase-2 "established, then went idle" progress timeout
+// (loose end 2b). Such a retry re-attached and PROVED a serving tablet
+// (Phase 2 only arms after the initial attach cleared Phase 1), then observed
+// silence, so it is NOT a consecutive failure and must not advance the
+// give-up budget.
+//
+// INVARIANT (loud-failure tenet): a stream that NEVER established — a Phase-1
+// liveness timeout ([mysql.vstreamLivenessTimeoutError]) or an open /
+// connection error — does NOT satisfy this surface, so it still counts toward
+// the budget and fails loudly. Only the established-then-idle case is exempt.
+func isIdleProgressTimeout(err error) bool {
+	var pe ir.LivenessProgressTimeoutError
+	return errors.As(err, &pe) && pe.IsIdleProgressTimeout()
+}
+
 // runWithRetry wraps [runOnce] with the ADR-0038 retry loop. Opens
 // a side-channel applier to read the persisted CDC position between
 // attempts so the consecutive-failure counter can reset whenever an
@@ -190,9 +207,35 @@ func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
 			// Cold-copy phase: force a clean re-establishment of the copy.
 			s.RestartFromScratch = true
 		}
-		if progressed {
+		// Loose end 2b: a VStream Phase-2 "established then went idle"
+		// progress timeout (mysql.vstreamProgressTimeoutError, carrying
+		// ir.LivenessProgressTimeoutError) is NOT a consecutive failure — the
+		// stream re-attached and PROVED a serving tablet (Phase 2 only arms
+		// AFTER the initial attach VGTID cleared Phase 1), then the source was
+		// simply quiet. Counting it would GUARANTEE a genuinely idle-but-
+		// healthy source gives up after ApplyRetryAttempts idle reconnects
+		// (the ~6-min idle-PlanetScale give-up over the public vstream
+		// endpoint, where no idle heartbeats reach us): each idle reconnect
+		// warm-resumes fine but processes zero events, so the position never
+		// advances and the progressed-reset never fires. So leave the budget
+		// UNTOUCHED for this shape.
+		//
+		// INVARIANT (loud-failure tenet): ONLY the established-then-idle
+		// Phase-2 timeout is exempt. A Phase-1 liveness timeout
+		// (mysql.vstreamLivenessTimeoutError — the stream NEVER established:
+		// no serving tablet / primary-only wedge) and any connection/open
+		// error carry NO marker, so they take the progressed/default branch
+		// and STILL exhaust the budget — a stream that can never connect fails
+		// loudly, never loops forever. A real failure interspersed with benign
+		// idle timeouts also takes the default branch, so it still accumulates
+		// toward the cap.
+		switch {
+		case isIdleProgressTimeout(err):
+			// Non-incrementing: leave consecutive as-is (do NOT reset — a
+			// real failure between idles must keep its accumulated count).
+		case progressed:
 			consecutive = 1
-		} else {
+		default:
 			consecutive++
 		}
 

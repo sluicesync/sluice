@@ -78,3 +78,45 @@ type TransactionKilledError interface {
 	// is not itself the signal.
 	TransactionKilled() bool
 }
+
+// LivenessProgressTimeoutError is the optional surface a [RetriableError]
+// can additionally implement to tell the pipeline's retry loop (ADR-0038)
+// that the failure was a source-stream "established, then went idle"
+// progress timeout — a CDC stream that PROVED liveness (its reader's
+// first-event / serving-tablet gate cleared) and THEN received no events for
+// the progress window — as distinct from a stream that FAILED TO ESTABLISH
+// at all.
+//
+// The distinction is load-bearing for the give-up budget (loose end 2b). The
+// streamer's bounded-retry loop (ADR-0038) resets its consecutive-failure
+// counter only when the persisted CDC position advances. A genuinely
+// idle-but-healthy source re-attaches, warm-resumes, processes ZERO events,
+// and so NEVER advances the position — its counter would climb to
+// ApplyRetryAttempts and the sync would give up even though nothing is wrong
+// (the idle-PlanetScale ~6-min give-up over the public vstream endpoint,
+// where no idle heartbeats reach us). An error carrying this marker with
+// IsIdleProgressTimeout()==true is treated as NON-incrementing so a truly
+// idle source survives indefinitely.
+//
+// INVARIANT (loud-failure tenet): implementations MUST set the flag ONLY for
+// the "established then idle" case. An error for a stream that NEVER
+// established — a first-event/liveness timeout, an open/connection failure —
+// MUST NOT carry the flag, so it still exhausts the budget and fails LOUDLY:
+// a genuinely dead / no-tablet stream must never loop forever.
+//
+// Engine-neutral: the streamer checks for this surface via [errors.As]
+// without importing any engine package, mirroring [RetriableError] and
+// [TransactionKilledError]. An error that implements this MUST also implement
+// [RetriableError] with Retriable()==true — an idle-progress timeout is
+// always retriable (reconnecting from the last position is the correct
+// recovery).
+type LivenessProgressTimeoutError interface {
+	RetriableError
+
+	// IsIdleProgressTimeout reports whether this error is the
+	// "established then went idle" progress timeout (exempt from the
+	// give-up budget). Implementations that set the flag conditionally
+	// return the per-error verdict; the bare presence of the method is
+	// not itself the signal.
+	IsIdleProgressTimeout() bool
+}
