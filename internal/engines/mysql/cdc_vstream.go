@@ -615,12 +615,12 @@ func retryShardDiscoveryOnEmpty(
 	return last, nil
 }
 
-// discoverAllShards runs SHOW VITESS_SHARDS once and returns a map of every
-// keyspace the vtgate serves to its shard names — an UNSHARDED keyspace maps to
-// a single "-" shard, a sharded one to N shards. Shared by [discoverShards]
-// (which filters to one keyspace) and the --control-keyspace auto-detect
-// ([Engine.ResolveControlKeyspace] via [discoverUnshardedKeyspaces]), which
-// needs the full keyspace inventory to find the unsharded sidecar.
+// discoverAllShardsViaShards runs SHOW VITESS_SHARDS once and returns a map of
+// every keyspace the vtgate serves to its shard names — an UNSHARDED keyspace
+// maps to a single "-" shard, a sharded one to N shards. It is the PRIMARY of
+// the two shard-discovery sources [discoverAllShards] reconciles (the other is
+// [discoverAllShardsViaTablets]); on its own it is what shard discovery used
+// before the SHOW VITESS_TABLETS cross-check.
 //
 // openDB strips sluice's vstream_* DSN flags before opening the connection
 // (Bug 126, see [stripVStreamParams]): the go-sql-driver's session-init emits
@@ -634,7 +634,7 @@ func retryShardDiscoveryOnEmpty(
 // `LIKE` filter: `SHOW VITESS_SHARDS LIKE ?` reaches vtgate as a `:v1` bind
 // variable it cannot parse ("syntax error ... near ':v1'"). A plain SHOW takes
 // no parameter, so there is nothing for vtgate to choke on.
-func discoverAllShards(ctx context.Context, cfg *gomysql.Config) (map[string][]string, error) {
+func discoverAllShardsViaShards(ctx context.Context, cfg *gomysql.Config) (map[string][]string, error) {
 	db, err := openDB(ctx, cfg, nil)
 	if err != nil {
 		return nil, fmt.Errorf("open mysql for shard discovery: %w", err)
