@@ -907,9 +907,11 @@ func resolvedSlotName(name string) string {
 
 // dsnEndpoint extracts a coarse host:port endpoint from a DSN for the
 // shared-target-budget WARN and the dry-run plan. Best-effort: handles
-// URL-form (scheme://[user[:pass]@]host[:port]/...) and keyword-form
-// (host=... port=...). Falls back to the full DSN string when it can't
-// find a host (so distinct DSNs never collapse to one bucket).
+// URL-form (scheme://[user[:pass]@]host[:port]/...), keyword-form
+// (host=... port=...), and the go-sql-driver form
+// (user:pass@net(addr)/db). A genuinely unparseable DSN is REDACTED, never
+// returned raw — this value is logged (shared-target WARN, status --all), so
+// it must never carry a credential.
 func dsnEndpoint(dsn string) string {
 	if dsn == "" {
 		return ""
@@ -944,7 +946,28 @@ func dsnEndpoint(dsn string) string {
 		}
 		return host
 	}
-	return dsn
+	// go-sql-driver form: [user[:pass]@][net[(addr)]]/dbname (the common
+	// MySQL/PlanetScale shape, which matches neither branch above). Strip
+	// the userinfo, pull the addr out of net(addr), drop the db — the raw
+	// DSN carries the password and must never be returned (this value feeds
+	// the shared-target-budget WARN and the `status --all` unreachable line).
+	rest := dsn
+	if at := strings.LastIndex(rest, "@"); at >= 0 {
+		rest = rest[at+1:]
+	}
+	if open := strings.IndexByte(rest, '('); open >= 0 {
+		if closeIdx := strings.IndexByte(rest, ')'); closeIdx > open {
+			rest = rest[open+1 : closeIdx]
+		}
+	}
+	if slash := strings.IndexByte(rest, '/'); slash >= 0 {
+		rest = rest[:slash]
+	}
+	if rest != "" {
+		return rest
+	}
+	// Genuinely unparseable: redact rather than leak a credential.
+	return "<redacted-dsn>"
 }
 
 func firstNonEmpty(v, fallback string) string {

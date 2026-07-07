@@ -334,6 +334,11 @@ func TestDSNEndpoint(t *testing.T) {
 		"host=host-e user=u":               "host-e",
 		"some-opaque-dsn-with-no-host":     "some-opaque-dsn-with-no-host",
 		"":                                 "",
+		// go-sql-driver form (MySQL/PlanetScale): the userinfo (with the
+		// password) MUST be stripped — this value is logged. Regression pin
+		// for the sync run --dry-run / shared-target-WARN / status --all leak.
+		"u:pscale_pw_secret@tcp(aws.connect.psdb.cloud:3306)/db?tls=true": "aws.connect.psdb.cloud:3306",
+		"root:rootpw@tcp(127.0.0.1:3306)/mydb":                            "127.0.0.1:3306",
 	}
 	for in, want := range cases {
 		if got := dsnEndpoint(in); got != want {
