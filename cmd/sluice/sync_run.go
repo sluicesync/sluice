@@ -22,6 +22,7 @@ import (
 	"github.com/knadh/koanf/v2"
 
 	"sluicesync.dev/sluice/internal/config"
+	"sluicesync.dev/sluice/internal/diagnose"
 	"sluicesync.dev/sluice/internal/notify"
 	"sluicesync.dev/sluice/internal/pipeline"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
@@ -89,6 +90,21 @@ type SyncSpec struct {
 	// explicit `zero_date` already in the DSN wins (the foundational
 	// mechanism). Ignored (with a config-load refusal) for non-MySQL sources.
 	ZeroDate string `koanf:"zero-date"`
+
+	// InjectShardColumn / AllowCrossShardMerge mirror `sync start`'s
+	// --inject-shard-column / --allow-cross-shard-merge (ADR-0048 / Bug 152):
+	// the two ways to move a SHARDED source (a keyspace with >1 shard that
+	// vtgate merges into one logical stream) into a PK/UNIQUE target without
+	// tripping preflightCrossShardCollision. InjectShardColumn is the
+	// structural fix — the same NAME=VALUE string the CLI flag takes; sluice
+	// appends a per-shard discriminator column + composite PK so cross-shard
+	// rows land disjoint. AllowCrossShardMerge is the "my keys are globally
+	// unique across shards" override. They are mutually exclusive IN EFFECT
+	// (the discriminator makes the override inert), so validateCrossShard
+	// refuses BOTH set on one entry rather than let the operator believe an
+	// inert override took effect.
+	InjectShardColumn    string `koanf:"inject-shard-column"`
+	AllowCrossShardMerge bool   `koanf:"allow-cross-shard-merge"`
 
 	IncludeTable []string `koanf:"include-table"`
 	ExcludeTable []string `koanf:"exclude-table"`
@@ -177,6 +193,15 @@ func loadFleetConfig(path string) (*SyncFleetConfig, error) {
 				kms.StringToSliceHookFunc(","),
 			),
 			TagName: "koanf",
+			// ErrorUnused makes an unknown/typo'd YAML key a LOUD load
+			// failure instead of a silent drop (the trap: `allow-cross-shard-
+			// merge` misspelled, or a `sync start` flag that isn't part of the
+			// curated fleet subset, would otherwise be ignored and the operator
+			// would never know their knob had no effect). Every key documented
+			// in the syncs.yaml samples (ADR-0122 / ADR-0126, docs/, and the
+			// fleet-operator skill) IS a SyncSpec / RestartConfig field, so this
+			// only rejects genuinely-unsupported keys.
+			ErrorUnused: true,
 		},
 	}); err != nil {
 		return nil, fmt.Errorf("sync run: parse %q: %w", path, err)
@@ -260,6 +285,39 @@ func (f *SyncFleetConfig) validate() error {
 		// meaning (rather than silently ignored).
 		if err := s.validateZeroDate(who); err != nil {
 			return err
+		}
+
+		// Cross-shard opt-ins (ADR-0048 / Bug 152): refuse a contradictory
+		// inject-shard-column + allow-cross-shard-merge combination, and
+		// surface a malformed inject-shard-column NAME=VALUE at config-load
+		// (named by stream-id) rather than at cold-start.
+		if err := s.validateCrossShard(who); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateCrossShard enforces the per-sync cross-shard contract. It refuses a
+// fleet entry that sets BOTH inject-shard-column AND allow-cross-shard-merge —
+// they are the two alternative ways past preflightCrossShardCollision and are
+// mutually exclusive IN EFFECT (engaging the discriminator makes the merge
+// override inert; see [pipeline.Migrator.AllowCrossShardMerge]). `sync start`
+// lets inject-shard-column silently win when both are passed; the fleet is a
+// CURATED config surface, so it refuses the contradiction loudly at config-load
+// rather than let an operator believe an inert override took effect. It also
+// validates the inject-shard-column NAME=VALUE shape up front so a malformed
+// value is named by stream-id at load, not at the first cold-start.
+func (s *SyncSpec) validateCrossShard(who string) error {
+	if s.InjectShardColumn != "" && s.AllowCrossShardMerge {
+		return fmt.Errorf(
+			"sync run: %s: inject-shard-column and allow-cross-shard-merge are mutually exclusive — inject-shard-column adds a per-shard discriminator that already keeps cross-shard rows disjoint, so allow-cross-shard-merge would be inert; set exactly one",
+			who,
+		)
+	}
+	if s.InjectShardColumn != "" {
+		if _, err := parseInjectShardColumn(s.InjectShardColumn); err != nil {
+			return fmt.Errorf("sync run: %s: %w", who, err)
 		}
 	}
 	return nil
@@ -637,6 +695,17 @@ func buildStreamerFromSpec(ctx context.Context, spec *SyncSpec, g *Globals) (*pi
 		return nil, err
 	}
 
+	// Cross-shard opt-ins (ADR-0048 / Bug 152), threaded onto the Streamer the
+	// same way `sync start` sets them. inject-shard-column is the NAME=VALUE
+	// discriminator (parsed via the shared parser); allow-cross-shard-merge is
+	// the globally-unique-key override. The load-time validateCrossShard guard
+	// has already refused the contradictory both-set case and any malformed
+	// NAME=VALUE, so a re-parse here can only succeed on the real fleet paths.
+	shardSpec, err := parseInjectShardColumn(spec.InjectShardColumn)
+	if err != nil {
+		return nil, err
+	}
+
 	empty := &config.Config{}
 	mappings, err := resolveMappings(spec.TypeOverride, empty)
 	if err != nil {
@@ -703,12 +772,16 @@ func buildStreamerFromSpec(ctx context.Context, spec *SyncSpec, g *Globals) (*pi
 		ExpressionMappings: exprMappings,
 		Filter:             filter,
 		TargetSchema:       spec.TargetSchema,
-		ApplyBatchSize:     applyBatchSize,
-		AutoTune:           !spec.NoAutoTune,
-		ApplyConcurrency:   spec.ApplyConcurrency,
-		ApplyDelay:         spec.ApplyDelay,
-		MaxBufferBytes:     firstNonZeroInt64(spec.MaxBufferBytes, defaultMaxBufferBytes),
-		ApplyExecTimeout:   firstNonZeroDuration(spec.ApplyExecTimeout, defaultApplyExecTimeout),
+
+		InjectShardColumn:    shardSpec,
+		AllowCrossShardMerge: spec.AllowCrossShardMerge,
+
+		ApplyBatchSize:   applyBatchSize,
+		AutoTune:         !spec.NoAutoTune,
+		ApplyConcurrency: spec.ApplyConcurrency,
+		ApplyDelay:       spec.ApplyDelay,
+		MaxBufferBytes:   firstNonZeroInt64(spec.MaxBufferBytes, defaultMaxBufferBytes),
+		ApplyExecTimeout: firstNonZeroDuration(spec.ApplyExecTimeout, defaultApplyExecTimeout),
 
 		ApplyRetryAttempts:    firstNonZeroInt(spec.ApplyRetryAttempts, defaultApplyRetryAttempts),
 		ApplyRetryBackoffBase: firstNonZeroDuration(spec.ApplyRetryBackoffBase, defaultApplyRetryBackoffBase),
@@ -761,6 +834,10 @@ func (s *SyncSpec) smtpConfig() notify.SMTPConfig {
 
 // printFleetPlan renders the resolved fleet for --dry-run: one line per
 // sync (stream-id, source→target, resolved slot) plus the restart policy.
+// Source/target DSNs pass through [diagnose.RedactDSN] so a --dry-run plan
+// never leaks credentials — dsnEndpoint alone falls through to the raw DSN
+// for a scheme-less go-sql-driver DSN (user:pw@tcp(host)/db, the common
+// MySQL/PlanetScale shape), which would print the password.
 func printFleetPlan(out *os.File, fleet *SyncFleetConfig) error {
 	if _, err := fmt.Fprintf(out, "fleet: %d %s\n", len(fleet.Syncs), pluralize("sync", len(fleet.Syncs))); err != nil {
 		return err
@@ -773,8 +850,8 @@ func printFleetPlan(out *os.File, fleet *SyncFleetConfig) error {
 		}
 		if _, err := fmt.Fprintf(
 			out, "  %s\t%s://%s -> %s://%s\tslot=%s\ttelemetry=%s\n",
-			s.StreamID, s.SourceDriver, dsnEndpoint(s.Source),
-			s.TargetDriver, dsnEndpoint(s.Target), slot, telemetryPlanLabel(s),
+			s.StreamID, s.SourceDriver, diagnose.RedactDSN(s.Source),
+			s.TargetDriver, diagnose.RedactDSN(s.Target), slot, telemetryPlanLabel(s),
 		); err != nil {
 			return err
 		}
