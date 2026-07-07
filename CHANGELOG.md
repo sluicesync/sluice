@@ -4,6 +4,16 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.197] - 2026-07-07
+
+### Security
+
+- **An invalid-URI DSN no longer leaks its password (or any userinfo token) into sluice's error output or logs (credential-in-logs exposure; LOW likelihood — only an INVALID-URI DSN triggers it — but a real credential disclosure; long-standing, present at the postgres DSN-parse site since v0.1.0, at pgtrigger since v0.85.0, and at fleettui since v0.99.137, all through v0.99.196).** Go's `net/url.Parse` embeds the ENTIRE raw input — including a DSN's `user:PASSWORD` userinfo — verbatim in its `*url.Error` string (`.URL` field), so a DSN that fails to parse as a URI (e.g. a password carrying an un-encoded control or special character) produced an error like `parse "postgres://user:PASSWORD@host…": net/url: invalid control character in URL`, password included. sluice wrapped that error with `%w` at several DSN-parse sites and let it propagate, so any surface that printed it — the `sync status --all` unreachable line, a `migrate`/`sync`/`verify` failure, a captured log — disclosed the credential. A valid DSN parses cleanly and was already redacted (userinfo + query string stripped, including the v0.99.194 `dsnEndpoint` work), so only a malformed DSN reaches this path — but a malformed DSN can carry a real secret, making it the same credential-in-logs class the v0.99.194 redaction targeted, reached through the parse-error door. Fix: a new `diagnose.SafeParseError` helper unwraps the `*url.Error` via `errors.As` (reaching it even after a caller re-wraps with `%w`) and returns its `.Err` field — the credential-free failure reason — dropping the `.URL` field that carries the DSN. Applied at every DSN-parse site that propagates the error: `internal/engines/postgres` (`parseURIDSN`, `withReplicationParam`, `withSchemaURI`), `internal/engines/pgtrigger` (`parseURIDSN`), and `internal/fleettui` (`NormalizeURL`, which also stopped echoing the raw connect address that can carry basic-auth userinfo). A whole-tree grep confirmed no other in-class sites (the `err == nil`-guarded parses never touch the error; blobcodec's query-string echoes carry a documented no-secret invariant; the Azure KMS key ID is a public resource locator). Valid-DSN handling is byte-identical — only the parse-ERROR branch is sanitized. Pinned at three layers: a `diagnose` unit test (ground-truths the raw error contains the secret, then asserts the sanitized one does not but keeps the reason), a postgres engine-site test at `parseURIDSN`, and a `fleettui` `NormalizeURL` test.
+
+### Changed
+
+- On a malformed URI DSN (or a malformed fleet-TUI connect address), the parse-failure error message now shows the underlying reason (e.g. "net/url: invalid control character in URL") without echoing the DSN/connect string. Valid DSNs and all data paths are unchanged.
+
 ## [0.99.196] - 2026-07-07
 
 ### Fixed
