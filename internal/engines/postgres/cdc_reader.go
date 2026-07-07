@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 
+	"sluicesync.dev/sluice/internal/diagnose"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/netkeepalive"
 )
@@ -2480,7 +2481,7 @@ func withReplicationParam(dsn string) (string, error) {
 	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
 		u, err := url.Parse(dsn)
 		if err != nil {
-			return "", err
+			return "", diagnose.SafeParseError(err)
 		}
 		q := u.Query()
 		// schema is sluice-specific; pgconn doesn't recognise it and

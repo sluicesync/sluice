@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 
+	"sluicesync.dev/sluice/internal/diagnose"
 	"sluicesync.dev/sluice/internal/netkeepalive"
 )
 
@@ -68,7 +69,7 @@ func (e Engine) parseDSN(dsn string) (*pgConfig, error) {
 func parseURIDSN(dsn string) (*pgConfig, error) {
 	u, err := url.Parse(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("postgres: invalid DSN URI: %w", err)
+		return nil, fmt.Errorf("postgres: invalid DSN URI: %w", diagnose.SafeParseError(err))
 	}
 	if strings.TrimPrefix(u.Path, "/") == "" {
 		return nil, errors.New("postgres: DSN must include a database name")

@@ -23,7 +23,42 @@
 // the operator-bundle shape does.
 package diagnose
 
-import "strings"
+import (
+	"errors"
+	"net/url"
+	"strings"
+)
+
+// SafeParseError sanitizes an error produced by [net/url.Parse] so it
+// can be wrapped, logged, or surfaced to the operator without leaking a
+// DSN's credentials.
+//
+// Go's `net/url.Parse` embeds the ENTIRE raw input in its error string
+// (a `*url.Error` whose `.URL` field is the verbatim argument). For a
+// DSN that fails to parse — e.g. a password carrying an un-encoded
+// control character — that raw input includes the userinfo:
+//
+//	parse "postgres://user:PASSWORD@host\x7f/db": net/url: invalid control character in URL
+//
+// Wrapping such an error with `%w` at a DSN-parse site and letting it
+// propagate (a `sync status --all` unreachable line, a migrate/sync/
+// verify failure, any log) prints the password. This is the same
+// credential-in-logs class [RedactDSN] guards, reached through the
+// parse-error door.
+//
+// SafeParseError unwraps a `*url.Error` and returns its `.Err` field —
+// the underlying reason (e.g. "net/url: invalid control character in
+// URL"), which is the useful, credential-free part — dropping the
+// `.URL` field that carries the DSN. A non-`*url.Error` (and nil) is
+// returned unchanged: this only sanitizes the parse-ERROR path, never
+// alters valid-DSN handling.
+func SafeParseError(err error) error {
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		return uerr.Err
+	}
+	return err
+}
 
 // RedactDSN returns a credential-safe locator for the given DSN —
 // host[:port][/db] only, with userinfo + query string stripped.

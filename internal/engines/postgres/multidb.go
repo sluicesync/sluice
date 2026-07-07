@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 
+	"sluicesync.dev/sluice/internal/diagnose"
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -137,7 +138,7 @@ func (Engine) WithDatabase(dsn, schema string) (string, error) {
 func withSchemaURI(dsn, schema string) (string, error) {
 	u, err := url.Parse(dsn)
 	if err != nil {
-		return "", fmt.Errorf("postgres: WithDatabase: invalid DSN URI: %w", err)
+		return "", fmt.Errorf("postgres: WithDatabase: invalid DSN URI: %w", diagnose.SafeParseError(err))
 	}
 	q := u.Query()
 	q.Set("schema", schema)

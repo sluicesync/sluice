@@ -28,6 +28,8 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+
+	"sluicesync.dev/sluice/internal/diagnose"
 )
 
 // fleetReport is the `/api/fleet` JSON envelope. It mirrors the shape
@@ -272,7 +274,10 @@ func NormalizeURL(connect string) (string, error) {
 	}
 	u, err := url.Parse(s)
 	if err != nil {
-		return "", fmt.Errorf("parse connect address %q: %w", connect, err)
+		// Drop the raw connect address: url.Parse embeds it verbatim in
+		// its error, and a connect address can carry basic-auth
+		// userinfo. SafeParseError keeps just the reason.
+		return "", fmt.Errorf("parse connect address: %w", diagnose.SafeParseError(err))
 	}
 	if u.Host == "" {
 		return "", fmt.Errorf("connect address %q has no host", connect)

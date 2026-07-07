@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+
+	"sluicesync.dev/sluice/internal/diagnose"
 )
 
 // pgConfig is the engine-local mirror of the vanilla postgres
@@ -36,7 +38,7 @@ func parseDSNCompat(dsn string) (*pgConfig, error) {
 func parseURIDSN(dsn string) (*pgConfig, error) {
 	u, err := url.Parse(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("pgtrigger: invalid DSN URI: %w", err)
+		return nil, fmt.Errorf("pgtrigger: invalid DSN URI: %w", diagnose.SafeParseError(err))
 	}
 	if strings.TrimPrefix(u.Path, "/") == "" {
 		return nil, errors.New("pgtrigger: DSN must include a database name")

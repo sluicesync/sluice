@@ -7,6 +7,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -45,6 +46,24 @@ func TestNormalizeURL(t *testing.T) {
 				t.Fatalf("NormalizeURL(%q) = %q, want %q", c.in, got, c.want)
 			}
 		})
+	}
+}
+
+// TestNormalizeURL_InvalidConnectDoesNotLeakCredential pins the
+// credential-in-logs fix at the fleettui site: a connect address that
+// carries basic-auth and fails url.Parse must not echo the userinfo in
+// its error. url.Parse embeds the raw input verbatim; NormalizeURL
+// routes it through diagnose.SafeParseError to strip it.
+func TestNormalizeURL_InvalidConnectDoesNotLeakCredential(t *testing.T) {
+	const secret = "SUPERSECRET"
+	// The \x7f control byte makes url.Parse fail after it has captured
+	// the userinfo.
+	_, err := NormalizeURL("http://admin:" + secret + "@host\x7f/api/fleet")
+	if err == nil {
+		t.Fatal("expected NormalizeURL to reject the control-char address")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Errorf("NormalizeURL leaked the credential in its error: %q", err.Error())
 	}
 }
 
