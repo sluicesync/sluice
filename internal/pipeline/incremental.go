@@ -973,7 +973,13 @@ func joinComma(parts []string) string {
 // failed`. Tests that pre-build envelopes with the chain's known salt
 // don't supply RebuildForChain and pass through the cold-start path.
 func (b *IncrementalBackup) alignEncryption(ctx context.Context, parent *irbackup.Manifest) ([]byte, error) {
-	parentEnc := lineage.ChainRootEncryption(ctx, b.segStore, parent)
+	parentEnc, err := lineage.ChainRootEncryption(ctx, b.segStore, parent)
+	if err != nil {
+		// Audit N-6: a failed root-manifest read must NOT be conflated
+		// with "parent chain is plaintext" — that branch decides whether
+		// this segment's chunks are written encrypted or plaintext.
+		return nil, fmt.Errorf("incremental: cannot determine parent chain encryption state (refusing to assume plaintext): %w", err)
+	}
 	switch {
 	case parentEnc == nil && b.Encryption == nil:
 		return nil, nil

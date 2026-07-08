@@ -105,19 +105,27 @@ func (e *BackupEncryption) RebindForChain(parentParams *irbackup.Argon2idParams)
 // chain root manifest is read from store and its ChainEncryption is
 // returned.
 //
-// Read errors are swallowed (returns nil) — the alignment logic
-// already handles a nil ChainEncryption shape gracefully and a noisy
-// store read at this point would mask the simpler "parent is
-// plaintext" path.
-func ChainRootEncryption(ctx context.Context, store irbackup.Store, parent *irbackup.Manifest) *irbackup.ChainEncryption {
+// A (nil, nil) return means the chain is GENUINELY plaintext: the root
+// manifest exists and carries no ChainEncryption, or no root manifest
+// exists at all ([ReadManifestIfPresent]'s not-found shape). A store
+// read/parse failure is an error, never nil — callers branch nil =
+// "parent chain is plaintext", so swallowing a transient read error
+// here (the pre-audit-N-6 behaviour) either wrongly refused an
+// operator's --encrypt with "parent chain is plaintext…" (steering them
+// to drop the flag) or, with no --encrypt, silently extended an
+// ENCRYPTED chain with plaintext chunks at exit 0.
+func ChainRootEncryption(ctx context.Context, store irbackup.Store, parent *irbackup.Manifest) (*irbackup.ChainEncryption, error) {
 	if parent != nil && parent.ChainEncryption != nil {
-		return parent.ChainEncryption
+		return parent.ChainEncryption, nil
 	}
 	root, err := ReadManifestIfPresent(ctx, store)
-	if err != nil || root == nil {
-		return nil
+	if err != nil {
+		return nil, fmt.Errorf("read chain root manifest: %w", err)
 	}
-	return root.ChainEncryption
+	if root == nil {
+		return nil, nil
+	}
+	return root.ChainEncryption, nil
 }
 
 // ProbeChunkDecrypt attempts to unwrap a per-chunk WrappedCEK using the
