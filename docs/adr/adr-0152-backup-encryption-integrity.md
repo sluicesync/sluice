@@ -1,0 +1,96 @@
+# ADR-0152: Backup-encryption integrity — chunk position binding, CEK identity binding, chunk-header/schema-hash verification, Azure key-version pinning
+
+Status: Accepted (2026-07-08)
+
+## Context
+
+The 2026-07-08 audit cross-check (findings N-8 + N-9) verified that encrypted backups provided **confidentiality only**, while two in-code comments and SECURITY.md's shared-storage framing implied integrity that did not exist:
+
+1. Chunk encryption was `gcm.Seal(nonce, nonce, plaintext, nil)` / `gcm.Open(…, nil)` — **nil AAD** (`internal/crypto/envelope.go`). Per-chain mode (the default) shares ONE CEK across every chunk in a chain, so any valid ciphertext chunk decrypted cleanly wherever a rewritten manifest pointed it. A store-level adversary (the exact party SECURITY.md's shared-storage section warns about) could splice, replay, reorder, or substitute chunks between positions and between backups in the same chain, fix up the manifest's SHA-256 entries (unauthenticated, adversary-writable), and the restore exited 0.
+2. **Zero KMS `EncryptionContext`/AAD** anywhere in `internal/crypto` — any CEK ever wrapped under a key unwrapped for any chain, with nothing in CloudTrail / Cloud Audit Logs tying the unwrap to a backup.
+3. `pipeline/blobcodec/backup_chunk.go` claimed a column rename "surfaces as a header mismatch on restore" — but `ChunkReader.Header()` had **no non-test callers**. Lying comment; a chunk written against a renamed column silently mis-keyed rows.
+4. `ir/backup/manifest.go` claimed chain-restore uses `SchemaHash` as a tamper sanity check — it was computed and written at the incremental/stream sites and **compared nowhere**. Lying comment.
+5. **N-9:** `internal/crypto/azure_kms.go` unwrapped against the LATEST key version (empty version argument) and discarded the WrapKey response `KID`, while its comment claimed Azure recovers the wrap-time version from the wrapped blob's metadata. That is AWS/GCP behavior — their ciphertexts self-identify their wrapping key version; **Azure key-wrap ciphertext carries none**. Enabling key auto-rotation (a common vault policy) made restores of older chains fail with a misleading "wrong key or tampered" error.
+
+## Decision
+
+One design, gated by a new manifest **FormatVersion 5** (`FormatVersionEncryptedChunkBinding`), following the Bug-116 loud-refusal discipline: the recorded version — never a guess, never try-both — decides the decrypt shape on both sides.
+
+### 1. Chunk position binding (GCM AAD)
+
+Chunks written under a FormatVersion-5 manifest carry AES-GCM AAD binding the ciphertext to **(manifest identity, chunk path)** — and, for change chunks, additionally the **list ordinal**:
+
+- `backup.ChunkAAD(m, file)` — row chunks: `"sluice-chunk-aad/v1\n" + created_at/source_engine/kind + "\nfile=" + ChunkInfo.File`.
+- `backup.ChangeChunkAAD(m, file, index)` — change chunks: the same plus `"\nindex=" + list position`. Change-**replay order is semantic**; without the ordinal, swapping two self-consistent manifest entries (each with its intact File+SHA) would replay events out of source order — silent corruption the path binding alone cannot catch. Row chunks deliberately do NOT bind the ordinal: a table's rows are a set, and the ADR-0149 range workers legitimately append entries out of index order.
+- **The manifest identity is the `(CreatedAt, SourceEngine, Kind)` prefix of `ComputeBackupID` — deliberately NOT the BackupID itself.** BackupID hashes EndPosition, which for incrementals is only known when the window CLOSES, after every chunk has been written. The prefix is fixed at manifest construction, preserved verbatim by every rewrite path (full-backup resume adopts the prior CreatedAt; compaction copies chunks/manifests with `ch.File` and identity intact and re-stitches only ParentBackupID, which the binding excludes for exactly that reason), and unique per backup within a store in practice (the change-chunk run namespace already keys on CreatedAt — Bug 35). A pin (`TestChunkAAD_DistinctPerIdentityAndPosition`) freezes the exclusion of EndPosition/ParentBackupID so a well-meaning future addition doesn't strand resumed/compacted chains.
+- The derivations are **on-disk contract** (golden-pinned); changing them requires a new FormatVersion with its own gate.
+- **Version gating lives in ONE function per shape** (`ChunkAAD` / `ChunkAADFor` and the change-chunk twins): pre-v5 manifests derive nil → the byte-identical legacy nil-AAD path; v5+ derive the binding. The read-side `…For` variants additionally gate on the chunk's own recorded `Encryption` metadata (only encrypted chunks have ciphertext to bind; stripping that field doesn't downgrade silently — the reader then treats ciphertext as a plaintext codec stream and fails loudly at the codec header).
+- A tampered/spliced/reordered chunk fails the GCM auth check **at open, before any row/event is emitted**, with an error naming the class: "wrong key, tampered ciphertext, or a chunk that does not belong at this position in this backup — spliced/replayed store?".
+
+### 2. FormatVersion 5 stamping (proportional, Bug-116 discipline)
+
+- Stamped **only on encrypted manifests** (fulls in `setupChainEncryption`, incrementals/stream rollovers after `alignEncryption`). Plaintext backups stay on 1/2/4 and keep restoring on older binaries.
+- An encrypted incremental extending an OLD (pre-v5) chain is itself stamped v5 — its chunks are freshly written and bound; each link's chunks are gated by its OWN recorded version, so mixed chains read correctly per link. Older binaries refuse the new incremental loudly at the manifest preflight (they would otherwise fail its chunks with a misleading bare auth error).
+- **One exception, mirroring the Bug-179 inherit-the-chain's-shape rule: RESUMING a pre-v5 encrypted in-progress full keeps the prior version and the unbound chunk shape** — the kept chunks on the store were written unbound, and a v5 stamp would send the restore down the AAD path against them.
+- The ADR-0086 in-progress sidecar stamp (`max(FormatVersionProgressSidecar, finalVersion)`) carries v5 through unchanged; the read-side normalization in `replayManifestProgress` now preserves any recorded version above the sidecar tier instead of recomputing from the schema (recomputing would strip the v5 stamp in memory and mis-route bound chunks down the nil-AAD path).
+
+### 3. CEK identity binding (KMS EncryptionContext / AAD)
+
+The chain CEK's wrap is bound to the identity of the manifest that records it (`backup.CEKBinding(m)`, same identity prefix), through a new optional envelope surface:
+
+- `crypto.BoundEnvelope` — `WrapCEKBound` / `UnwrapCEKBound`. Implemented by **AWS KMS** (`EncryptionContext{"sluice_cek_binding": binding}` — authenticated by the service, logged in CloudTrail, enforceable by key policy), **GCP KMS** (`AdditionalAuthenticatedData`), and the **passphrase envelope** (GCM AAD on the CEK wrap).
+- **Azure Key Vault deliberately does NOT implement it** — the WrapKey/UnwrapKey API has no context/AAD parameter for the RSA wrap algorithms sluice defaults to. Faking the binding by silently discarding it would claim integrity the service cannot provide; a test (`TestAzureKMSEnvelope_DoesNotImplementBoundEnvelope`) pins the non-implementation. Azure chains' splice resistance rests entirely on the chunk-level GCM AAD (which is the load-bearing security property everywhere — see Consequences), and Azure's compensating control is the N-9 version pin below.
+- All wrap/unwrap sites route through TWO chokepoints in `lineage` — `WrapChainCEK(env, cek, owner)` / `UnwrapChainCEK(env, wrapped, owner)` — which gate on the owner manifest's recorded FormatVersion and the envelope's capability, so the two sides can never disagree (the §4.5 audit reframing: one guarded dispatch, not per-site type asserts). Callers: fresh wrap + resume unwrap (`setupChainEncryption`), restore/chain-restore/broker/verify preflights, incremental/stream chain extension.
+- **Per-chunk-mode CEK wraps stay unbound (explicit non-goal).** Binding them adds no splice resistance — a per-chunk-wrapped CEK moved to another manifest would decrypt only its own chunk, whose GCM AAD already refuses the foreign position — and would thread manifest identity through every hot wrap path for an audit-log-only gain. Documented here so the absence reads as a decision, not a miss.
+
+### 4. Azure key-version pinning (N-9)
+
+- `AzureKMSEnvelope` now **pins a concrete key version**: the GetKey preflight resolves an unversioned operator URL to the current version; WrapKey responses' `KID` reinforces the pin (covers preflight-skipped constructions and keeps a per-chunk-mode run on ONE version across a mid-run rotation).
+- `ResolvedKEKRef()` (new optional `crypto.ResolvedKEKReferencer` surface) reports the versioned key URL, and the orchestrator records it in `ChainEncryption.KEKRef` instead of the operator-typed unversioned URL — for per-chain AND per-chunk modes.
+- On unwrap, `UnwrapChainCEK` invokes the new `crypto.ChainKEKRebinder` surface with the recorded KEKRef, retargeting the envelope at the **wrap-time** version before the unwrap. Advisory by contract (the ref comes from an unauthenticated manifest): a malformed/foreign ref or a conflict with an operator-explicit version WARNs and keeps the current target — the unwrap then fails loudly if that target is wrong.
+- Old manifests (unversioned KEKRef): current latest-version behavior, plus a once-per-envelope WARN naming the rotation hazard and the recovery (pass the wrap-time version explicitly).
+- The lying "Azure recovers the wrap-time version from the wrapped blob's metadata" comment is corrected to state the real semantics.
+- Behavior note: `backup compact`'s encryption-binding compatibility tuple includes KEKRef, so Azure segments wrapped under different key versions now refuse to merge (loud, correct: their unwrap targets genuinely differ).
+
+### 5. Restore-side chunk-header validation (makes comment 3 true)
+
+`Restore.streamChunkRows` now compares every chunk header's column list (via the previously-caller-less `ChunkReader.Header()`) against the manifest schema's non-generated column set — as SETS (order-insensitive; header order is declaration order, which is not the guarantee that matters) — refusing loudly with the table, chunk, and both column deltas before any row is emitted. Runs for plaintext and encrypted chunks alike; the expected set comes from the PRE-retarget manifest schema (the writer's column list is source-shaped). The chunk-format doc comment now points at the enforcement site instead of promising one that didn't exist. Applies to single-full restore, every chain-segment full, and the broker's reset leg (all flow through `Restore`).
+
+### 6. SchemaHash verification in chain-restore (makes comment 4 true)
+
+- `ChainRestore.verifySchemaHashes` recomputes `ComputeSchemaHash(link.Manifest.Schema)` for every link carrying a recorded hash and refuses on mismatch **before anything lands on the target**. This is honestly a **corruption check** (bit-rot, truncated rewrite, mangled schema JSON), not tamper-proofing — the hash lives in the same unsigned manifest as the schema; the field's doc comment now says so.
+- Write-side companion fixes: **fulls now record SchemaHash** (previously only incrementals/streams did), and the item-51 no-DDL sequence-refresh swap now **re-stamps the hash over the swapped schema** — closing the wart the old incremental-path comment predicted ("a future hash-verifying chain walker … would reject legitimate chains written by this binary") for all new manifests.
+- One named carve-out: a **pre-v5 manifest carrying standalone sequences** can legitimately mismatch (old writers swapped sequence state without re-hashing when sequence OPTIONS changed inside a no-DDL window). That shape WARNs and proceeds — refusing legitimate old chains on the DR path would be worse than the narrow miss. v5+ manifests get no carve-out (current writers re-stamp).
+
+## What this does NOT protect against (honest boundary)
+
+The manifest is **unsigned**. An adversary who controls the store can still present a complete, self-consistent OLDER (manifest + chunks) pair — a whole-backup rollback — or truncate the TAIL of a change-chunk list while fixing up the counts/positions the same manifest records. The binding authenticates chunks AGAINST the manifest that names them; it does not authenticate the manifest itself. Closing that requires a signed/MAC'd manifest (a keyed trust root and rotation story of its own) and is out of scope here; SECURITY.md states the boundary. Within-list omission IS caught for change chunks (subsequent ordinals shift), and any chunk-content substitution/splice/reorder/cross-backup replay is caught by the AAD.
+
+## Compatibility
+
+- **Old chains restore byte-identically**: pre-v5 manifests route every chunk through the legacy nil-AAD decrypt and every CEK through the legacy unbound unwrap (`EncryptChunk`/`DecryptChunk` and the plain `WrapCEK`/`UnwrapCEK` are byte-identical to the pre-ADR code). Pinned by `TestChunkBinding_PreBindingChainStillRestores` (fixture assembled with the same primitives the old writer used — nil-AAD `NewChunkWriter` output is byte-identical to the old writer's — plus the old version stamp) and the pre-v5 unwrap pins.
+- **Old binaries refuse v5 manifests loudly** at the existing FormatVersion preflight ("newer than this build supports; upgrade sluice") instead of failing bound chunks with a misleading bare GCM error. Plaintext backups are unaffected (proportional stamp).
+- `BackupFormatVersion` ceiling bumped 4 → 5.
+
+## Consequences
+
+- The load-bearing splice defense is the **chunk AAD** (works for every envelope mode including Azure and passphrase); the KMS context is defense-in-depth plus provider-side auditability/policy.
+- Chunk-file index allocation for row chunks moved from flush to OPEN (the writer must know its path to bind it). Properties preserved: the atomic Add stays collision-free across ADR-0149 range workers; every successfully-streamed table flushes every writer it opens, so a completed table's index set is gapless exactly as before.
+- `ChainRootEncryption` now also returns the root manifest (its version gates the CEK unwrap); `NewChunkWriter`/`NewChunkReader`/`NewChangeChunkWriter`/`NewChangeChunkReader` gained an `aad` parameter (compile-break by design — every call site had to choose; `aad` without `cek` refuses loudly on both sides).
+- Azure chains recorded by ≥ this version pin their KEK version in the manifest; rotating the key no longer breaks their restores. Chains recorded before it keep latest-version behavior + the WARN.
+
+## Test coverage (family × format-version discipline)
+
+- **Crypto:** AAD accept/refuse matrix on the chunk primitive; `boundEnvelopeMatrix` run over ALL THREE BoundEnvelope families (passphrase GCM / AWS EncryptionContext / GCP AAD — different wire mechanisms, per the Bug-74 rule), with the fakes upgraded to ENFORCE context/AAD equality the way the real services do; Azure non-implementation pin; Azure version-pin/ResolvedKEKRef/rebind matrix including a simulated auto-rotation (the fake now reproduces the no-version-metadata KW semantics).
+- **irbackup:** version-gate pin over every historical FormatVersion; golden derivation pins (on-disk contract); identity/position/ordinal distinctness incl. the deliberate EndPosition/ParentBackupID exclusions; read-side chunk-encryption gating.
+- **blobcodec:** the full accept/refuse matrix over BOTH codec families (row + change chunks).
+- **Pipeline e2e (`TestChunkBinding_TamperMatrix`):** untampered encrypted chain restores; chunk contents swapped between positions with SHAs fixed up → refuse; manifest entries reordered (files untouched) → refuse; chunk replayed from a sibling backup in the same chain (same per-chain CEK) → refuse. Plus the pre-v5 compat restore, the renamed-column header refusal (with SHA fixed up), the SchemaHash mismatch refusal (before any target phase runs), the pre-v5-sequences WARN carve-out, the v5/pre-v5 resume stamp pins, and the sidecar-normalization keep-v5 pin.
+
+## Alternatives considered
+
+- **AAD = BackupID + chunk path** (the audit's sketch). Rejected: BackupID hashes EndPosition, unknown at chunk-write time for incrementals/streams; a write-time identity that later changes would strand the chunks. The CreatedAt/engine/kind prefix is the stable, rewrite-safe subset of the same identity.
+- **A random per-run binding ID recorded in the manifest.** Rejected: equivalent security (both are adversary-writable manifest fields; the CEK is what they can't forge), but a NEW field must survive every manifest-rewrite path forever — the identity prefix is already load-bearing for resume/BackupID and preserved by construction.
+- **Signing/MAC'ing the manifest.** Out of scope: a real trust-root/rotation design; the honest-boundary section documents what remains open without it.
+- **Try-both decrypt (AAD, then nil) for mixed-era chains.** Rejected outright: "never guess" — try-both converts the integrity check into a silent downgrade oracle.
+- **Binding per-chunk-mode CEK wraps.** Rejected as a non-goal (see §3): no added splice resistance, real plumbing cost.
+- **Faking a context parameter for Azure** (e.g. folding the binding into the key name or an envelope-side KDF). Rejected: dishonest surface; the API has no such parameter and inventing one client-side would not be service-authenticated.
