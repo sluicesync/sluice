@@ -211,6 +211,77 @@ func TestFleetValidate(t *testing.T) {
 	}
 }
 
+// TestFleetSchemaChanges_ValidatedThroughLoadPath pins the audit N-2 fix
+// through the REAL fleet-config load path (the Bug-180 lesson: a direct
+// SyncSpec unit test can green a branch the parser never reaches). The
+// consumer treats every non-"refuse" string as "forward", so pre-fix a
+// typo'd `schema-changes: refused` passed the unknown-key guard and
+// silently ENABLED DDL forwarding against explicit operator intent.
+func TestFleetSchemaChanges_ValidatedThroughLoadPath(t *testing.T) {
+	yamlFor := func(schemaChanges string) string {
+		return `
+syncs:
+  - stream-id: orders
+    source-driver: postgres
+    source: postgres://u:p@src:5432/app
+    target-driver: mysql
+    target: mysql://u:p@dst:3306/app
+    slot-name: orders
+    schema-changes: ` + schemaChanges + "\n"
+	}
+	cases := []struct {
+		value       string
+		wantErr     bool
+		wantSubstrs []string
+	}{
+		{value: "forward", wantErr: false},
+		{value: "refuse", wantErr: false},
+		// Case-insensitive, mirroring the consumer's EqualFold.
+		{value: "Refuse", wantErr: false},
+		// The N-2 shapes: each would have silently forwarded DDL.
+		{value: "refused", wantErr: true, wantSubstrs: []string{"orders", `"refused"`, "forward, refuse"}},
+		{value: "off", wantErr: true, wantSubstrs: []string{`"off"`, "forward, refuse"}},
+		{value: "no", wantErr: true, wantSubstrs: []string{`"no"`}},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.value, func(t *testing.T) {
+			fleet, err := loadFleetConfig(writeFleetYAML(t, yamlFor(c.value)))
+			if err != nil {
+				t.Fatalf("loadFleetConfig: %v", err)
+			}
+			err = fleet.validate()
+			if c.wantErr != (err != nil) {
+				t.Fatalf("validate() err = %v; wantErr = %v", err, c.wantErr)
+			}
+			for _, sub := range c.wantSubstrs {
+				if err != nil && !strings.Contains(err.Error(), sub) {
+					t.Errorf("error %q missing substring %q", err.Error(), sub)
+				}
+			}
+		})
+	}
+
+	// Omitted key: defers to the fleet default ("forward") — still valid.
+	t.Run("omitted", func(t *testing.T) {
+		fleet, err := loadFleetConfig(writeFleetYAML(t, `
+syncs:
+  - stream-id: orders
+    source-driver: postgres
+    source: postgres://u:p@src:5432/app
+    target-driver: mysql
+    target: mysql://u:p@dst:3306/app
+    slot-name: orders
+`))
+		if err != nil {
+			t.Fatalf("loadFleetConfig: %v", err)
+		}
+		if err := fleet.validate(); err != nil {
+			t.Fatalf("validate() with omitted schema-changes: %v", err)
+		}
+	})
+}
+
 // TestSyncSpecFingerprint pins that the hot-reload fingerprint is stable
 // (equal specs hash identically) and discriminating (any field change
 // produces a different hash) — the basis for Reconcile's changed-vs-

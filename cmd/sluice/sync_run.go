@@ -287,6 +287,17 @@ func (f *SyncFleetConfig) validate() error {
 			return err
 		}
 
+		// Per-sync schema-changes mode (ADR-0091): validated to the two
+		// modes at config-load. The sole consumer treats anything that is
+		// not "refuse" as "forward" (see pipeline.Streamer's
+		// forwardSchemaEnabled), so a typo — `refused`, `off`, `no` — would
+		// otherwise silently ENABLE DDL forwarding against explicit
+		// operator intent. `sync start` is covered by the kong enum on
+		// --schema-changes; the fleet YAML is the only other entry point.
+		if err := s.validateSchemaChanges(who); err != nil {
+			return err
+		}
+
 		// Cross-shard opt-ins (ADR-0048 / Bug 152): refuse a contradictory
 		// inject-shard-column + allow-cross-shard-merge combination, and
 		// surface a malformed inject-shard-column NAME=VALUE at config-load
@@ -347,6 +358,25 @@ func (s *SyncSpec) validateZeroDate(who string) error {
 		)
 	}
 	return nil
+}
+
+// validateSchemaChanges enforces the per-sync schema-changes contract
+// (ADR-0091): an empty value defers to the fleet default ("forward"); a set
+// value must be forward|refuse, case-insensitive to mirror the consumer's
+// EqualFold. Anything else is refused loudly at config-load — the consumer
+// treats every non-"refuse" string as "forward", so an unvalidated typo
+// would silently invert an operator's refuse-on-DDL intent.
+func (s *SyncSpec) validateSchemaChanges(who string) error {
+	switch {
+	case s.SchemaChanges == "",
+		strings.EqualFold(s.SchemaChanges, "forward"),
+		strings.EqualFold(s.SchemaChanges, "refuse"):
+		return nil
+	}
+	return fmt.Errorf(
+		"sync run: %s: invalid schema-changes %q (want one of: forward, refuse)",
+		who, s.SchemaChanges,
+	)
 }
 
 // isMySQLSourceDriver reports whether the named source driver is a member of
