@@ -12,9 +12,12 @@
 //
 //  1. Defaults baked into the Config struct's zero values.
 //  2. Values from the YAML file at the given path.
-//  3. Environment variables prefixed with SLUICE_, with each
-//     underscore in the variable name interpreted as a key separator
-//     (SLUICE_FOO_BAR → foo.bar).
+//  3. Environment variables prefixed with SLUICE_, resolved against
+//     the Config struct's koanf keys: flat keys keep their
+//     underscores (SLUICE_KEYSET_SOURCE → keyset_source), nested keys
+//     map to dotted paths (SLUICE_EXTENSIONS_ALLOW →
+//     extensions.allow), and map-valued keys take the variable's tail
+//     as the map key (SLUICE_NAMESPACE_MAP_APP → namespace_map.app).
 //
 // CLI flags are not part of this layering — they are kong's concern
 // and override anything the orchestrator reads from Config.
@@ -22,8 +25,12 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
+	"reflect"
+	"sort"
 	"strings"
 
+	"github.com/go-viper/mapstructure/v2"
 	"github.com/knadh/koanf/parsers/yaml"
 	"github.com/knadh/koanf/providers/env"
 	"github.com/knadh/koanf/providers/file"
@@ -323,20 +330,168 @@ func Load(path string) (*Config, error) {
 		}
 	}
 
-	// Environment variables. SLUICE_FOO_BAR maps to foo.bar in the
-	// koanf key namespace; SLUICE_EXTENSIONS_ALLOW would map to
-	// extensions.allow (which is a slice — koanf will split a comma-
-	// separated env value into a slice via the unmarshal step).
+	// Environment variables. Each SLUICE_* variable is resolved against
+	// the Config struct's koanf keys (see [envKeyIndex]); a slice-typed
+	// key accepts a comma-separated value (koanf's default unmarshal
+	// splits it), e.g. SLUICE_EXTENSIONS_ALLOW="citext,pg_trgm".
+	//
+	// Pre-audit-N-10 the mapping replaced EVERY underscore with a dot,
+	// which made any underscore-keyed field (keyset_source,
+	// include_tables, exclude_tables, …) silently unreachable from the
+	// environment. A variable that resolves to no known key is now
+	// skipped from the overlay with a loud WARN naming it and the valid
+	// keys — deliberately NOT a hard error, because SLUICE_-prefixed
+	// names are also legitimate outside this file: kong env bindings
+	// (SLUICE_SOURCE / SLUICE_TARGET / SLUICE_NOTIFY_*) and operator-
+	// chosen secret holders (--encrypt-passphrase-source
+	// env:SLUICE_BACKUP_PASS, --keyset-source env:SLUICE_KEYSET — both
+	// documented shapes) would all break under a refusal here.
+	idx := buildEnvKeyIndex()
+	var unknown []string
 	envProvider := env.Provider("SLUICE_", ".", func(s string) string {
-		return strings.ReplaceAll(strings.ToLower(strings.TrimPrefix(s, "SLUICE_")), "_", ".")
+		key, ok := idx.resolve(s)
+		if !ok {
+			if !isProcessLevelEnvVar(s) {
+				unknown = append(unknown, s)
+			}
+			return "" // koanf skips empty keys — the var is not a config key
+		}
+		return key
 	})
 	if err := k.Load(envProvider, nil); err != nil {
 		return nil, &sluicecode.ConfigError{Err: fmt.Errorf("config: load env: %w", err)}
 	}
+	for _, name := range unknown {
+		slog.Warn(
+			"config: ignoring SLUICE_ environment variable that matches no config key (typo?)",
+			slog.String("var", name),
+			slog.String("valid_keys", strings.Join(idx.validKeys(), ", ")),
+		)
+	}
 
+	// The explicit StringToSliceHookFunc makes a comma-separated env
+	// value land as a []string ("citext,pg_trgm" → [citext pg_trgm]) —
+	// koanf's default unmarshal leaves it a one-element slice. Mirrors
+	// the fleet loader's decoder config (cmd/sluice/sync_run.go).
 	var c Config
-	if err := k.Unmarshal("", &c); err != nil {
+	if err := k.UnmarshalWithConf("", &c, koanf.UnmarshalConf{
+		Tag: "koanf",
+		DecoderConfig: &mapstructure.DecoderConfig{
+			DecodeHook:       mapstructure.StringToSliceHookFunc(","),
+			Result:           &c,
+			WeaklyTypedInput: true,
+			TagName:          "koanf",
+		},
+	}); err != nil {
 		return nil, &sluicecode.ConfigError{Err: fmt.Errorf("config: unmarshal: %w", err)}
 	}
 	return &c, nil
+}
+
+// envKeyIndex maps SLUICE_* environment variable names onto the Config
+// struct's koanf key namespace. Built by reflection over the koanf tags
+// so a new Config field is automatically addressable from the
+// environment without touching a hand-maintained table.
+type envKeyIndex struct {
+	// exact maps the underscored form of every env-settable key to its
+	// canonical dotted koanf path: "keyset_source" → "keyset_source",
+	// "extensions_allow" → "extensions.allow".
+	exact map[string]string
+
+	// mapPrefix maps the underscored path of every map[string]string
+	// field to its dotted path; the remainder of the variable name
+	// becomes the (lowercased) map key: SLUICE_NAMESPACE_MAP_APP →
+	// namespace_map.app.
+	mapPrefix map[string]string
+}
+
+func buildEnvKeyIndex() *envKeyIndex {
+	idx := &envKeyIndex{exact: map[string]string{}, mapPrefix: map[string]string{}}
+	addEnvKeys(reflect.TypeOf(Config{}), "", idx)
+	return idx
+}
+
+// addEnvKeys walks t's koanf-tagged fields, registering each
+// env-settable key path on idx. Slice-of-struct and map-of-struct
+// blocks (mappings, redactions, dictionaries, …) are YAML-only — an
+// environment variable can't express them — so they are deliberately
+// NOT registered; an attempt to set one from env warns as unknown
+// rather than half-parsing.
+func addEnvKeys(t reflect.Type, dotted string, idx *envKeyIndex) {
+	for i := range t.NumField() {
+		f := t.Field(i)
+		tag := f.Tag.Get("koanf")
+		if tag == "" || !f.IsExported() {
+			continue
+		}
+		path := tag
+		if dotted != "" {
+			path = dotted + "." + tag
+		}
+		ft := f.Type
+		for ft.Kind() == reflect.Pointer {
+			ft = ft.Elem()
+		}
+		switch ft.Kind() {
+		case reflect.Struct:
+			addEnvKeys(ft, path, idx)
+		case reflect.Map:
+			if ft.Elem().Kind() == reflect.String {
+				idx.mapPrefix[underscored(path)] = path
+			}
+		case reflect.Slice:
+			if ft.Elem().Kind() != reflect.Struct {
+				idx.exact[underscored(path)] = path
+			}
+		default:
+			idx.exact[underscored(path)] = path
+		}
+	}
+}
+
+func underscored(dotted string) string { return strings.ReplaceAll(dotted, ".", "_") }
+
+// resolve maps one SLUICE_* environment variable name to its koanf
+// key. ok=false means the variable names no known config key.
+func (idx *envKeyIndex) resolve(envName string) (key string, ok bool) {
+	rest := strings.ToLower(strings.TrimPrefix(envName, "SLUICE_"))
+	if key, ok := idx.exact[rest]; ok {
+		return key, true
+	}
+	for prefix, dotted := range idx.mapPrefix {
+		if strings.HasPrefix(rest, prefix+"_") && len(rest) > len(prefix)+1 {
+			return dotted + "." + rest[len(prefix)+1:], true
+		}
+	}
+	return "", false
+}
+
+// validKeys renders the settable key set for the unknown-variable WARN,
+// sorted for stable output. Map-valued keys are shown as `path.*`.
+func (idx *envKeyIndex) validKeys() []string {
+	keys := make([]string, 0, len(idx.exact)+len(idx.mapPrefix))
+	for _, dotted := range idx.exact {
+		keys = append(keys, dotted)
+	}
+	for _, dotted := range idx.mapPrefix {
+		keys = append(keys, dotted+".*")
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// isProcessLevelEnvVar reports whether name is a SLUICE_-prefixed
+// variable that belongs to the CLI / hook surface rather than the
+// config file — those are consumed elsewhere (kong `env:` tags,
+// os.Getenv) and must neither overlay the config nor trip the
+// unknown-variable WARN. The set mirrors the kong bindings in
+// cmd/sluice; SLUICE_ROLLOVER_* is the env sluice itself exports to
+// backup rollover hooks.
+func isProcessLevelEnvVar(name string) bool {
+	switch name {
+	case "SLUICE_SOURCE", "SLUICE_TARGET",
+		"SLUICE_NOTIFY_WEBHOOK", "SLUICE_NOTIFY_SLACK", "SLUICE_NOTIFY_SMTP_PASSWORD":
+		return true
+	}
+	return strings.HasPrefix(name, "SLUICE_ROLLOVER_")
 }

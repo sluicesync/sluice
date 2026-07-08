@@ -4,8 +4,16 @@
 # similar). Every key is optional; CLI flags and SLUICE_-prefixed
 # environment variables override anything set here.
 #
-# Environment variable mapping: SLUICE_FOO_BAR overrides foo.bar.
-# Example: SLUICE_EXTENSIONS_ALLOW="citext,pg_trgm".
+# Environment variable mapping: SLUICE_<KEY> overrides the config key
+# of the same name — flat keys keep their underscores
+# (SLUICE_KEYSET_SOURCE → keyset_source, SLUICE_INCLUDE_TABLES →
+# include_tables), nested keys map to dotted paths
+# (SLUICE_EXTENSIONS_ALLOW → extensions.allow), and map-valued keys
+# take the variable's tail as the map key (SLUICE_NAMESPACE_MAP_APP →
+# namespace_map.app). List-valued keys accept comma-separated values:
+# SLUICE_EXTENSIONS_ALLOW="citext,pg_trgm". A SLUICE_ variable that
+# matches no config key is ignored with a warning (block-structured
+# keys like mappings/redactions/dictionaries are YAML-only).
 
 # ---------------------------------------------------------------------
 # mappings:
