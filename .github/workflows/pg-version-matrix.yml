@@ -132,11 +132,15 @@ jobs:
       # non-version-pinned per-test boot in engines/postgres onto this
       # leg's image. RYUK stays disabled (CI Option B): the ephemeral
       # runner self-cleans and the reaper pull is its own flake source.
+      # The dispatch input reaches the script via env (shell-expanded),
+      # never interpolated into the `run:` text — the fuzz-roundtrip.yml
+      # env-indirection pattern.
       - name: Run engines/postgres integration suite on ${{ matrix.image }}
         env:
           SLUICE_TEST_PG_IMAGE: ${{ matrix.image }}
           TESTCONTAINERS_RYUK_DISABLED: "true"
+          RUN_FILTER: ${{ github.event.inputs.run || '.' }}
         run: |
           go test -tags=integration -race -count=1 -timeout=35m \
-            -run '${{ github.event.inputs.run || '.' }}' \
+            -run "$RUN_FILTER" \
             ./internal/engines/postgres/...

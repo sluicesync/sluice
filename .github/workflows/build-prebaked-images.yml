@@ -62,11 +62,14 @@ on:
   # the bake logic is exercised end-to-end before merge. Without this
   # the first cron run after merge becomes the integration test for
   # the bake itself, which has bitten this kind of CI plumbing before.
-  # SECURITY: pull_request from forks gets a read-only GITHUB_TOKEN
-  # by default, so the push step would fail — but the build step
-  # still exercises the bake. For PRs from the same repo (the common
-  # case for sluicesync/sluice work), the token has packages:write and
-  # the bake fully publishes.
+  # SECURITY: the PR path is BUILD-ONLY (the bake-pr job below runs
+  # with a read-only token and SKIP_PUSH=1) — a pull_request run
+  # executes the PR branch's copy of the bake script, so granting it
+  # packages:write would let unreviewed PR code publish the prod-tag
+  # images every CI integration job boots. Forks and same-repo PRs
+  # behave identically: build exercised, nothing published. Publishing
+  # happens only on the trusted triggers (cron / dispatch / push to
+  # main), via the bake job.
   pull_request:
     paths:
       - "scripts/build-prebaked-images.sh"
@@ -74,14 +77,12 @@ on:
       - "scripts/pg-versions.txt"
       - ".github/workflows/build-prebaked-images.yml"
 
-# Need to write to GHCR (the registry under the repo's GH org).
-# `packages: write` grants the GITHUB_TOKEN that scope so we don't need
-# a separate PAT. `contents: read` is the default and required for
-# actions/checkout. id-token unused — using docker login with the
-# GITHUB_TOKEN is sufficient for ghcr.io within the same org.
+# Default-deny at the workflow level; the GHCR write scope is granted
+# job-scoped, ONLY to the publishing job (bake) — never to the
+# pull_request build-only job. `contents: read` is required for
+# actions/checkout.
 permissions:
   contents: read
-  packages: write
 
 # Cancel a queued run if a new push to this workflow lands. Cron runs
 # don't interfere with each other (different ref each time).
@@ -94,9 +95,20 @@ defaults:
     shell: bash
 
 jobs:
+  # The publishing job: trusted triggers only (cron / dispatch / push
+  # to main — code that has already landed). This is the ONLY job that
+  # holds packages:write.
   bake:
     name: Bake ${{ matrix.engine }} image
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    # Job-scoped GHCR write (see the workflow-level permissions note).
+    # `packages: write` grants the GITHUB_TOKEN that scope so we don't
+    # need a separate PAT. id-token unused — docker login with the
+    # GITHUB_TOKEN is sufficient for ghcr.io within the same org.
+    permissions:
+      contents: read
+      packages: write
     # Pre-baking is independent per engine; run them in parallel.
     # If one engine fails the others still publish — partial progress
     # is better than none, and the failed engine's CI shard will
@@ -113,7 +125,7 @@ jobs:
     # comfortably inside the same budget.
     timeout-minutes: 30
     steps:
-      # SHA-pinned (not @v7): this workflow holds packages:write, so a
+      # SHA-pinned (not @v7): this job holds packages:write, so a
       # re-pointed action tag would run arbitrary code with GHCR push
       # rights — same supply-chain rationale as release.yml's pins.
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -133,9 +145,39 @@ jobs:
           # base-image digest hasn't moved but the bake LOGIC has — the
           # script's default base-digest-match skip would silently
           # reuse the old image (this bit PR #70's first iteration of
-          # the pg_hba.conf fix). Force a rebuild on push and PR
+          # the pg_hba.conf fix). Force a rebuild on push and dispatch
           # triggers; the weekly cron stays optimised against the
           # base-digest check.
-          FORCE_REBUILD: ${{ (github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && '1' || '0' }}
+          FORCE_REBUILD: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '1' || '0' }}
+        run: |
+          bash scripts/build-prebaked-images.sh
+
+  # The PR job: build-only proof that the bake logic still works,
+  # with a read-only token and SKIP_PUSH=1 (the script skips ghcr
+  # login entirely under SKIP_PUSH, so no credential is needed or
+  # granted). Unreviewed PR code can never publish the prod-tag
+  # images this way — see the pull_request trigger comment above.
+  bake-pr:
+    name: Bake ${{ matrix.engine }} image (PR, build-only)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [mysql, postgres, postgis, pgvector, vitess, mirrors]
+    timeout-minutes: 30
+    steps:
+      # SHA-pinned to match the publishing job (one pin to maintain).
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Build ${{ matrix.engine }} image (no push)
+        env:
+          ENGINES: ${{ matrix.engine }}
+          SKIP_PUSH: "1"
+          # PR runs change the bake LOGIC, not the base digest — force
+          # the rebuild so the changed logic is what gets exercised.
+          FORCE_REBUILD: "1"
         run: |
           bash scripts/build-prebaked-images.sh

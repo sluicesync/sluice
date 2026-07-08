@@ -61,8 +61,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      # SHA-pinned (not the mutable tags): this workflow handles live
+      # PlanetScale DSN secrets, so a re-pointed action tag would run
+      # arbitrary code with access to them — same supply-chain
+      # rationale (and same pins) as release.yml.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: "go.mod"
       - run: go mod download

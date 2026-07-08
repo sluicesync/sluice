@@ -117,10 +117,14 @@ jobs:
       # VITESS_LITE_IMAGE points the compose file + harness at the GHCR mirror;
       # the harness parses the major from the tag and layers the legacy-flag
       # override for major <= 22 (v21/v22).
+      # The dispatch input reaches the script via env (shell-expanded),
+      # never interpolated into the `run:` text — the fuzz-roundtrip.yml
+      # env-indirection pattern.
       - name: Boot cluster + run ${{ github.event.inputs.run || 'TestVitessCluster' }}
         env:
           VITESS_LITE_IMAGE: ${{ matrix.image }}
+          RUN_FILTER: ${{ github.event.inputs.run || 'TestVitessCluster' }}
         run: |
           go test -tags='integration vitesscluster' -count=1 -timeout=40m \
-            -run '${{ github.event.inputs.run || 'TestVitessCluster' }}' \
+            -run "$RUN_FILTER" \
             -v ./internal/engines/mysql/...
