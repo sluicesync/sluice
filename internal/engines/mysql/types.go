@@ -255,20 +255,25 @@ func bitWidth(columnType string) int {
 // prefix (`enum`/`set`) is matched case-insensitively against the column_type
 // string — the *values* inside the parens preserve their source-side casing.
 //
-// information_schema.columns.COLUMN_TYPE RE-ESCAPES a stored label with MySQL's
-// FULL single-backslash string-escape set (`\0 \b \t \n \r \\`, plus the
-// SQL-standard doubled `”`) — a control byte inside a label is NOT reported raw
-// (unlike COLUMN_DEFAULT / COLUMN_COMMENT, which information_schema reports
-// already decoded). So each label is decoded with the same MySQL string decoder
-// the binary-default recovery uses (scanMySQLQuotedString), NOT a 2-escape
-// shortcut: a genuinely NUL-bearing label like `enum('nul\0y')` must land in the
-// IR as the real bytes (`nul` + 0x00 + `y`), not the literal 8-char string
-// `nul\0y`. The scan is escape-aware, so the comma/quote split honours an escaped
-// quote (`”`/`\'`), an escaped comma, or a `\0` inside a label. The writer's
-// quoteSQLString re-escapes the raw label on emit (SEC-1 review gap 2), so
-// MySQL→MySQL round-trips byte-exact; a NUL-bearing label to a PG text/enum
-// target loud-fails at apply (PG text cannot hold a NUL) — correct loud-failure,
-// not a regression.
+// information_schema.columns.COLUMN_TYPE RE-ESCAPES a stored label with the
+// single-backslash escape set MySQL uses for all schema-metadata printing
+// (`\0 \n \r \\`, plus the SQL-standard doubled `”`; other control bytes such
+// as 0x08/0x09/0x1A arrive RAW — observed on 8.0.46/8.4.10) — a NUL inside a
+// label is NOT reported raw (unlike COLUMN_DEFAULT / COLUMN_COMMENT, which
+// information_schema reports already decoded). So each label is decoded with
+// the same MySQL string decoder the binary-default recovery uses
+// (scanMySQLQuotedString, which also accepts the wider `\b \t \Z` set for
+// robustness), NOT a 2-escape shortcut: a genuinely NUL-bearing label like
+// `enum('nul\0y')` must land in the IR as the real bytes (`nul` + 0x00 + `y`),
+// not the literal 8-char string `nul\0y`. The scan is escape-aware, so the
+// comma/quote split honours an escaped quote (`”`/`\'`), an escaped comma, or
+// a `\0` inside a label. This re-escaping is sql_mode-INDEPENDENT — the same
+// form arrives under NO_BACKSLASH_ESCAPES sessions (audit finding N-5, pinned
+// live by TestSchemaLiteralDecode_SQLModeMatrix_ByteExact) — so the decode is
+// correctly unconditional. The writer's quoteSQLString re-escapes the raw
+// label on emit (SEC-1 review gap 2), so MySQL→MySQL round-trips byte-exact;
+// a NUL-bearing label to a PG text/enum target loud-fails at apply (PG text
+// cannot hold a NUL) — correct loud-failure, not a regression.
 func parseEnumOrSet(columnType, kind string) ([]string, error) {
 	expected := kind + "("
 	lower := strings.ToLower(columnType)

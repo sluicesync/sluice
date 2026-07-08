@@ -54,18 +54,29 @@ import (
 //
 // SHOW CREATE TABLE reports the byte-exact stored default (BINARY zero-padded
 // to its declared width, VARBINARY as-written) in one of two forms, empirically
-// enumerated on MySQL 8.0:
+// enumerated on MySQL 8.0.46 and 8.4.10:
 //
 //   - hex literal `0x<even-hex>` — used when the value contains any byte ≥ 0x80.
 //   - single-quoted escaped string `'…'` — used otherwise. The escape set MySQL
-//     emits is: `\0`→0x00, `\b`→0x08, `\t`→0x09, `\n`→0x0A, `\r`→0x0D,
-//     `\\`→0x5C, and a doubled single-quote →0x27 (the SQL-standard quote
-//     escape). Every other byte < 0x80 — including 0x01, 0x1A, 0x7F, `"`, space,
-//     `%`, `_` and all printable ASCII — is emitted RAW (MySQL does NOT emit
-//     `\Z`/`\"`/`\'` here in this position). The decoder
-//     below also accepts those documented escapes and treats an unknown `\x` as
-//     the literal `x` (MySQL's own string-literal rule), so it is robust to any
-//     form MySQL might emit.
+//     emits is: `\0`→0x00, `\n`→0x0A, `\r`→0x0D, `\\`→0x5C, and a doubled
+//     single-quote →0x27 (the SQL-standard quote escape). Every other byte
+//     < 0x80 — including 0x08, 0x09, 0x1A, 0x7F, `"`, space, `%`, `_` and all
+//     printable ASCII — is emitted RAW. The decoder below ALSO accepts the
+//     wider documented MySQL escape set (`\b \t \Z \' \"`) and treats an
+//     unknown `\x` as the literal `x` (MySQL's own string-literal rule), so it
+//     is robust to any form a MySQL release might emit.
+//
+// Mode-independent print discipline (audit finding N-5, refuted live): the
+// rendering above does NOT vary with the session's sql_mode. NO_BACKSLASH_ESCAPES
+// changes how the server PARSES string literals — which is why the DDL-emit
+// side threads [backslashIsMySQLEscape] (ddl_emit.go, the SEC-1 fix) — but not
+// how SHOW CREATE TABLE / information_schema PRINT them: ground-truthed on
+// MySQL 8.0.46 + 8.4.10 across {default, NBE} read session × {default, NBE}
+// creation session, all four cells byte-identical, and pinned on a real server
+// by TestSchemaLiteralDecode_SQLModeMatrix_ByteExact. The decoders in this file
+// (and parseEnumOrSet over COLUMN_TYPE) are therefore correctly UNCONDITIONAL —
+// do not thread the session sql_mode into them: an NBE-aware "raw" decode would
+// itself corrupt (`'C:\\temp'` read raw is two backslashes, not one).
 //
 // The recovered bytes are re-encoded to the same `0x<hex>` hexLiteralDialect
 // DefaultExpression the v0.99.186 emitters already consume (MySQL bare `0x…`,
@@ -375,6 +386,13 @@ func decodeMySQLQuotedString(s string) (raw []byte, ok bool) {
 // ends — a naive `,`/`'` split would mis-terminate a label containing an escaped
 // quote (`”`/`\'`), an escaped comma, or a `\0`. Returns ok=false for a
 // dangling backslash or a string with no closing quote.
+//
+// Deliberately sql_mode-UNCONDITIONAL: MySQL prints these literals with the
+// same fixed escape discipline whether or not the session runs under
+// NO_BACKSLASH_ESCAPES (see the mode-independent-print-discipline note in the
+// package doc above; pinned live by TestSchemaLiteralDecode_SQLModeMatrix_ByteExact).
+// Do not thread [backslashIsMySQLEscape] in here — that policy exists for the
+// EMIT direction only, where the server's parser is mode-sensitive.
 func scanMySQLQuotedString(s string) (raw []byte, end int, ok bool) {
 	if s == "" || s[0] != '\'' {
 		return nil, 0, false

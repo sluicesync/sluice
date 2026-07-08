@@ -78,6 +78,14 @@ func resolveSessionSQLMode(sqlMode *string) string {
 //     visible to the emitters; an operator combining a DSN-only
 //     NO_BACKSLASH_ESCAPES override with backslash-bearing string values
 //     should set --mysql-sql-mode instead so the emitters see it.
+//
+// EMIT-direction only: NO_BACKSLASH_ESCAPES changes how the server PARSES
+// string literals sluice sends, not how it PRINTS them — SHOW CREATE TABLE and
+// information_schema COLUMN_TYPE render literals with the same fixed escape
+// discipline under every sql_mode (ground-truthed on 8.0.46/8.4.10; audit
+// finding N-5, pinned by TestSchemaLiteralDecode_SQLModeMatrix_ByteExact). The
+// reader-side decoders (scanMySQLQuotedString and its callers) are therefore
+// deliberately unconditional and must NOT consult this policy.
 func backslashIsMySQLEscape(sqlMode *string) bool {
 	return !strings.Contains(strings.ToUpper(resolveSessionSQLMode(sqlMode)), "NO_BACKSLASH_ESCAPES")
 }
