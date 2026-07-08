@@ -11,8 +11,8 @@
 // draining the completed-tables channel and creating NO index at all.
 //
 // This boots the cheap single-shard vttestserver as the Vitess target
-// (Engine{Flavor: FlavorVitess} → usesVStream() true → the drain-then-serial
-// build branch), creates the tables, drives the pipeline's overlap consumer,
+// (Engine{Flavor: FlavorVitess} → usesVStream() true → the build-as-copied
+// serial branch), creates the tables, drives the pipeline's overlap consumer,
 // and ground-truths EVERY secondary-index family via
 // information_schema.statistics: plain BTREE, UNIQUE single-column, composite
 // multi-column, and an FK-backing plain KEY. It then exercises the
@@ -67,7 +67,7 @@ func TestVStream_VTTestServer_SecondaryIndexesBuildAndVerify(t *testing.T) {
 	}
 	defer func() { _ = sw.Close() }()
 	if !sw.flavor.usesVStream() {
-		t.Fatal("test precondition: writer flavor must be a VStream flavor so the drain-then-serial build branch is exercised")
+		t.Fatal("test precondition: writer flavor must be a VStream flavor so the build-as-copied serial branch is exercised")
 	}
 
 	// One table carrying every secondary-index family (pin the class, not one
@@ -99,7 +99,7 @@ func TestVStream_VTTestServer_SecondaryIndexesBuildAndVerify(t *testing.T) {
 	// Phase 2: drive the overlap consumer EXACTLY as the pipeline does — feed
 	// each just-copied table onto the channel, close it, and let
 	// BuildTableIndexesFromChannel build the indexes. On the VStream flavor
-	// this is the drain-then-serial-build branch under test.
+	// this is the build-as-copied serial branch under test.
 	ch := make(chan *ir.Table, len(schema.Tables))
 	for _, tbl := range schema.Tables {
 		ch <- tbl

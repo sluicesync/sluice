@@ -137,11 +137,11 @@ func referenceCreateIndexNames(table *ir.Table) []string {
 
 // TestBuildTableIndexesFromChannel_VStreamBuildsSerially is the regression
 // lock for the CRITICAL silent-index-loss bug: a PlanetScale/Vitess writer
-// (flavor.usesVStream()) DRAINS the completed-tables channel and then BUILDS
-// each drained table's secondary indexes SERIALLY — it is NOT a no-op. The
-// prior gate drained into a pure no-op and relied on a post-copy
-// CreateIndexes that never ran on the overlapped path, so a MySQL VStream
-// target silently created NO secondary indexes at all.
+// (flavor.usesVStream()) reads the completed-tables channel and BUILDS each
+// received table's secondary indexes SERIALLY — it is NOT a no-op. The prior
+// gate drained into a pure no-op and relied on a post-copy CreateIndexes that
+// never ran on the overlapped path, so a MySQL VStream target silently created
+// NO secondary indexes at all.
 //
 // Pins:
 //   - every fed table gets an ALTER … ADD INDEX emitted (recorded by the fake
@@ -254,6 +254,69 @@ func TestBuildTableIndexesFromChannel_VStreamBuildErrorLeavesUnmarked(t *testing
 	defer mu.Unlock()
 	if len(fired) != 0 {
 		t.Errorf("IndexesBuilt fired for %v after a build failure; build-then-mark requires no table be marked when its (or an earlier) build failed", fired)
+	}
+}
+
+// TestBuildTableIndexesFromChannel_VStreamBuildsAsReceived pins the OVERLAP
+// property the build-as-copied rework added: the vstream serial builder builds
+// each table's indexes the MOMENT that table is received — it does NOT wait for
+// the channel to close. It feeds one table at a time over an UNBUFFERED channel
+// and asserts that table's IndexesBuilt callback fires (its ALTER emitted)
+// before the next table is ever sent, and long before close. The prior
+// drain-all-then-build implementation would block until close and never fire a
+// callback here, so this test times out (fails) against the old behaviour —
+// exactly the regression guard we want. It also pins per-received-table build
+// ORDER (t0 then t1), the serial one-ALTER-at-a-time contract.
+func TestBuildTableIndexesFromChannel_VStreamBuildsAsReceived(t *testing.T) {
+	rec := &indexRecorder{exists: false} // indexes don't exist yet → build them
+	db := newIndexFakeDB(t, rec)
+	w := &SchemaWriter{db: db, schema: "testdb", flavor: FlavorPlanetScale}
+
+	// Each table's build fires exactly one callback; buffered so the builder
+	// goroutine never blocks pushing the signal.
+	fired := make(chan string, 4)
+	w.SetTableIndexedCallback(func(table *ir.Table) { fired <- table.Name })
+
+	// UNBUFFERED: a send blocks until the builder's loop receives it, so we
+	// drive the receive→build→fire sequence one table at a time and observe
+	// each build land before we release the next table.
+	ch := make(chan *ir.Table)
+	schema := &ir.Schema{Tables: []*ir.Table{indexedTable("t0"), indexedTable("t1")}}
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- w.BuildTableIndexesFromChannel(context.Background(), schema, ch) }()
+
+	// awaitFire returns the next table whose callback fired, failing the test
+	// if none fires within the timeout (the old drain-all path would hang here).
+	awaitFire := func(want string) {
+		t.Helper()
+		select {
+		case got := <-fired:
+			if got != want {
+				t.Fatalf("IndexesBuilt fired for %q; want %q (receive order)", got, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for %q to build — the builder waited for channel close instead of building as-received", want)
+		}
+	}
+
+	ch <- schema.Tables[0] // release t0
+	awaitFire("t0")        // t0 built + marked before t1 is ever sent…
+	if n := rec.alterCountFor("t1"); n != 0 {
+		t.Fatalf("t1 built (%d ALTERs) before it was sent — builds must be per-received-table, serial", n)
+	}
+
+	ch <- schema.Tables[1] // release t1
+	awaitFire("t1")        // …and t1 built only after it was received
+
+	close(ch) // signal end; the builder returns nil
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("BuildTableIndexesFromChannel (build-as-received): %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("BuildTableIndexesFromChannel did not return after channel close")
 	}
 }
 
