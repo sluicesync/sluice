@@ -209,6 +209,19 @@ caps each batch's accumulated byte size, flushing whichever cap
 hits first. See [ADR-0028](adr/adr-0028-memory-bounded-streaming.md)
 for the full rationale and the audit of where memory accumulates.
 
+## Post-load statistics refresh: `--analyze-after`
+
+A freshly bulk-loaded table has stale planner statistics, so the
+first post-cutover queries plan badly until autovacuum or a
+background ANALYZE catches up. `migrate --analyze-after` closes
+that window at cutover time: once constraints and views are in
+place, sluice runs one per-table statistics refresh on the target
+(Postgres `ANALYZE`, MySQL `ANALYZE TABLE`, SQLite `ANALYZE`) —
+the same reason pgcopydb runs a per-table `VACUUM ANALYZE` by
+default. Advisory: a per-table failure WARNs and never fails the
+migration. Default off. Migrate-only — a sync target's statistics
+churn under continuous CDC apply, so the flag doesn't apply there.
+
 ## See also
 
 - [ADR-0017 — Batched CDC apply](adr/adr-0017-batched-cdc-apply.md)

@@ -175,6 +175,44 @@ Key constraints inherited from the Vitess platform:
 Use `--source-driver=planetscale` (or the equivalent in
 `sluice.yaml`) when targeting any Vitess deployment.
 
+### Foreign keys on Vitess/PlanetScale targets: `--skip-foreign-keys`
+
+Vitess/PlanetScale keyspaces have limited FK support (sharded
+keyspaces reject cross-shard FKs outright; hosted PlanetScale
+requires an explicit settings toggle even for unsharded ones), so
+migrating an FK-bearing source often fails at the constraint
+phase. `--skip-foreign-keys` (on `migrate` and `sync start`)
+skips creating FK constraints on the target and instead ensures
+each skipped FK's referencing column tuple is indexed — an index
+is synthesized only if an existing target index doesn't already
+cover those columns as a left-prefix (on a MySQL target this also
+preserves the backing index MySQL would otherwise create only
+alongside the FK). Engine-agnostic; use it to transition an
+FK-bearing source without stripping FKs from it first, or when
+FKs are managed out-of-band. Mutually exclusive with
+`--allow-degraded-fks` (opposite intents: one skips FK creation,
+the other creates FKs and tolerates dirty rows by retrying as
+`NOT VALID` — PG-target only).
+
+### Sharded targets: control tables and `--control-keyspace`
+
+A continuous sync stores three control tables on the target
+(`sluice_cdc_state`, `sluice_cdc_schema_history`,
+`sluice_shard_consolidation_lease`). A SHARDED Vitess/PlanetScale
+target keyspace requires a primary vindex on every table, which
+the control tables don't have — so a sync against a sharded
+target otherwise dies with `VT09001: table sluice_cdc_state does
+not have a primary vindex`. `--control-keyspace` (on `sync
+start`, `sync stop`, `sync status`, and `restore`; also the
+per-sync `control-keyspace:` key in the `sync run` fleet config,
+[ADR-0122](adr/adr-0122-sync-supervisor-command-center.md))
+places them in an unsharded sidecar keyspace instead. Usually you
+can omit it: against a sharded target sluice auto-detects the
+sole unsharded sidecar keyspace and refuses loudly if there are
+zero or several. Empty + unsharded/non-Vitess target = unchanged
+(bare table names in the default keyspace); inert on non-MySQL
+targets.
+
 ### VStream DSN flags
 
 All optional, all default to PlanetScale-friendly behaviour. Ride

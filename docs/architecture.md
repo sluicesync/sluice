@@ -83,6 +83,10 @@ sluice/
 │   │   ├── sqlite-trigger/     # Trigger-based SQLite CDC (composes the base sqlite engine)
 │   │   └── d1-trigger/         # Trigger-based Cloudflare D1 CDC over the D1 HTTP query API
 │   ├── pipeline/               # Orchestrators: simple-mode Migrator, continuous-sync Streamer, metrics, backup/restore
+│   │   ├── migcore/            # Engine-neutral shared migration core (chunking, filtering, plan helpers) all orchestrators consume
+│   │   ├── backup/             # Backup / restore / chain-lineage orchestration
+│   │   ├── lineage/            # Backup manifest IO + lineage catalog + chunk-encryption substrate
+│   │   └── blobcodec/          # Logical-backup wire format + storage leaf (chunk encode/decode, blob stores)
 │   ├── appliershared/          # Engine-neutral helpers shared by the engine ChangeAppliers
 │   ├── appliercontrol/         # AIMD controller governing --apply-batch-size per stream
 │   ├── laneapply/              # Engine-neutral concurrent key-hash CDC apply core
@@ -95,7 +99,8 @@ sluice/
 │   ├── notify/                 # Notification sinks (webhook / Slack / SMTP) with failure isolation
 │   ├── planetscale/
 │   │   └── telemetry/          # Optional PlanetScale control-plane target-health provider
-│   └── redact/                 # PII redaction strategies + per-column rule registry
+│   ├── redact/                 # PII redaction strategies + per-column rule registry
+│   └── sluicecode/             # The SLUICE-E-* coded-error + exit-code taxonomy (stable operator-facing errors)
 └── docs/
 ```
 

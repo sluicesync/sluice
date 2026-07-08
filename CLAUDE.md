@@ -26,7 +26,7 @@ These take precedence over feature throughput. Code that violates them is not do
 
 `internal/ir` defines a typed schema/value model and the `Engine`, `SchemaReader`, `SchemaWriter`, `RowReader`, `RowWriter`, `CDCReader`, `ChangeApplier` interfaces; pure-function helpers and feature-scoped contracts over the IR live in sub-packages (`internal/ir/diff` — schema diff + drift reports; `internal/ir/backup` — the logical-backup manifest/chain/snapshot contract) that depend on core `ir`, never the reverse. Each engine package (`internal/engines/mysql`, `internal/engines/postgres`) implements those interfaces and self-registers via `init()`. `internal/pipeline.Migrator` is the simple-mode orchestrator: read source schema → optional dry-run plan → create target tables (no constraints) → bulk-copy rows → create indexes → create constraints. `cmd/sluice` is a kong-based CLI; config loading is via koanf YAML+env. Engines are looked up by name from `engines.Get(...)`; the pipeline package never imports specific engine packages.
 
-MySQL has flavors (Vanilla, PlanetScale) — same engine code, different `Capabilities` declarations, registered under different names. Postgres will follow the same pattern when service variants matter.
+MySQL has flavors (Vanilla, PlanetScale, Vitess) — same engine code, different `Capabilities` declarations, registered under different names. Postgres will follow the same pattern when service variants matter.
 
 ## Local workflow
 

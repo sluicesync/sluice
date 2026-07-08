@@ -48,7 +48,7 @@ The test suite is layered by infrastructure cost; each layer is opt-in via a bui
 
 - **Unit tests** (no tag) run on every push: `go test -race -count=1 ./internal/...`. Mock engines (`stubEngine`, `recordingEngine` in the pipeline package), no Docker.
 - **Integration tests** (`integration` tag): testcontainers-go boots `mysql:8.0` and `postgres:16` — `go test -tags=integration -race -count=1 ./internal/...`. Run on Linux in CI; same-engine tests live in each engine package, cross-engine tests in `internal/pipeline`.
-- **PostGIS tests** (`integration && postgis` tag): adds the `postgis/postgis:16-3.4` image (~600 MB). Single test (`TestMigrate_PostGIS_MySQLToPG`) gated behind a separate tag so the default integration suite doesn't pull the heavier image.
+- **PostGIS tests** (`integration && postgis` tag): adds the PostGIS image (~600 MB). The `PostGIS_`-named suites — MySQL↔PG geometry round-trips, the PG→PG geometry/geography/spatial-index passthrough, and the pipelined-apply geometry-equivalence pin — gated behind a separate tag so the default integration suite doesn't pull the heavier image (the exact suite list lives in the `integration-postgis` job comment in `ci.yml`).
 - **VStream tests** (`integration && vstream` tag): adds the `vitess/vttestserver:mysql80` image (~700 MB). The FlavorPlanetScale CDC + snapshot suite against a vanilla Vitess cluster — same image cost concern as PostGIS, hence the separate tag.
 - **PlanetScale verification tests** (`psverify` tag): hits a real PlanetScale account via env vars / a repo-root `PLANETSCALE_CREDENTIALS.env` file. Manual-trigger only via `.github/workflows/psverify.yml`; never runs on push. Use these to validate against actual product quirks the in-container tests can't reach.
 
@@ -71,11 +71,10 @@ Branch protection requires six checks to merge: `Test (ubuntu-latest)`, `Integra
 
 ## Releases
 
-Sluice follows [Semantic Versioning](https://semver.org/). The release shape is:
+Sluice follows [Semantic Versioning](https://semver.org/). Releases are cut from `main` and published via GoReleaser behind a **draft-review gate**; the full mechanics (including the failure-recovery paths) live in [CLAUDE.md](CLAUDE.md)'s "Release process" section. The shape:
 
-1. Land changes on `main` with a normal feature/fix commit. The CHANGELOG accumulates them under `## [Unreleased]`.
-2. When cutting a release, a `chore: cut vX.Y.Z — <one-line summary>` commit promotes `## [Unreleased]` to `## [vX.Y.Z] - YYYY-MM-DD` with a header paragraph and adds an empty `## [Unreleased]` above it.
-3. An annotated tag points at the cut commit:
+1. Land changes on `main` with normal feature/fix commits (pre-commit hook clean; never `--no-verify`).
+2. Cut an annotated tag from the commit to ship and push both:
 
    ```bash
    git tag -a vX.Y.Z -m "vX.Y.Z"
@@ -83,7 +82,9 @@ Sluice follows [Semantic Versioning](https://semver.org/). The release shape is:
    git push origin vX.Y.Z
    ```
 
-4. The GitHub release notes follow the structure in [docs/dev/release-template.md](docs/dev/release-template.md) — Highlights / Fixed / Compatibility / Who-needs-this. The template carries enough context to fill in for any release.
+   `release.yml` builds the cross-platform binaries + the GHCR runtime image and creates a **draft** release with auto-generated notes.
+3. Replace the auto-generated notes with curated ones following [docs/dev/release-template.md](docs/dev/release-template.md) — Highlights / Fixed / Compatibility / Who-needs-this. A `docs(release): CHANGELOG vX.Y.Z + release notes` commit adds the CHANGELOG entry and archives the release-notes block to `docs/releases/release-notes-vX.Y.Z.md`.
+4. Publish (`gh release edit vX.Y.Z --draft=false`) only after the five-check gate passes: `release.yml` green on the tag; `ci.yml` green on the tag (or its descendant `main` commit); release assets present; curated (non-auto-generated) notes in place; the tag unique on the remote. Never publish with a gate check failing or unverified.
 
 Patch releases (`vX.Y.Z` with non-zero Z) are reserved for bug fixes that don't change behaviour for unaffected users; minor releases (`vX.Y.0`) bundle features and any breaking interface changes the project has committed to honoring.
 

@@ -169,7 +169,7 @@ The lesson all six share: **the integration test was green** at the surface that
 
 ## Architecture in one paragraph
 
-[`internal/ir`](internal/ir) defines a typed dialect-neutral schema and value model plus the `Engine`, `SchemaReader`, `SchemaWriter`, `RowReader`, `RowWriter`, `CDCReader`, `ChangeApplier` interfaces. Each engine package (`internal/engines/mysql`, `internal/engines/postgres`, `internal/engines/sqlite`, the trigger-CDC engines under `internal/engines/{pgtrigger,sqlite-trigger,d1-trigger}`) implements those interfaces and self-registers via `init()` — nine registered engines today (`sluice engines` lists them): `mysql`, `planetscale`, `vitess`, `postgres`, `sqlite`, `d1`, `postgres-trigger`, `sqlite-trigger`, `d1-trigger`. `internal/pipeline.Migrator` is the simple-mode orchestrator: read source schema → optional dry-run plan → create target tables (no constraints) → bulk-copy rows → create indexes → create constraints. `cmd/sluice` is a [kong](https://github.com/alecthomas/kong)-based CLI; config loading is via [koanf](https://github.com/knadh/koanf) YAML + env. Engines are looked up by name from `engines.Get(...)`; the pipeline package never imports specific engine packages. MySQL has flavors (Vanilla, PlanetScale) — same engine code, different `Capabilities` declarations, registered under different names. Additional engines slot in without touching the orchestrator.
+[`internal/ir`](internal/ir) defines a typed dialect-neutral schema and value model plus the `Engine`, `SchemaReader`, `SchemaWriter`, `RowReader`, `RowWriter`, `CDCReader`, `ChangeApplier` interfaces. Each engine package (`internal/engines/mysql`, `internal/engines/postgres`, `internal/engines/sqlite`, the trigger-CDC engines under `internal/engines/{pgtrigger,sqlite-trigger,d1-trigger}`) implements those interfaces and self-registers via `init()` — nine registered engines today (`sluice engines` lists them): `mysql`, `planetscale`, `vitess`, `postgres`, `sqlite`, `d1`, `postgres-trigger`, `sqlite-trigger`, `d1-trigger`. `internal/pipeline.Migrator` is the simple-mode orchestrator: read source schema → optional dry-run plan → create target tables (no constraints) → bulk-copy rows → create indexes → create constraints. `cmd/sluice` is a [kong](https://github.com/alecthomas/kong)-based CLI; config loading is via [koanf](https://github.com/knadh/koanf) YAML + env. Engines are looked up by name from `engines.Get(...)`; the pipeline package never imports specific engine packages. MySQL has flavors (Vanilla, PlanetScale, Vitess) — same engine code, different `Capabilities` declarations, registered under different names. Additional engines slot in without touching the orchestrator.
 
 The longer story lives in [`docs/architecture.md`](docs/architecture.md).
 
@@ -274,9 +274,11 @@ Commands:
   backup                   Take and verify encrypted logical backups (full + incremental chains).
   restore                  Restore a logical backup chain into a target database.
   trigger setup            Install trigger-CDC state (postgres-trigger / sqlite-trigger / d1-trigger).
+  trigger teardown         Remove every trace of the trigger engine from the source database.
   trigger prune            Reap durably-applied rows from a trigger change-log (ADR-0137).
   schema preview           Print the target DDL sluice would emit.
   schema diff              Diff a target against what sluice would produce.
+  schema add-table         Bring a new source table into an active stream's scope.
   verify                   Compare row counts between source and target.
   matview refresh          Refresh PostgreSQL materialized views (PG-only).
   slot list / slot drop    Manage Postgres replication slots.
