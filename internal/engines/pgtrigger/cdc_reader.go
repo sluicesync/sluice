@@ -596,20 +596,29 @@ SELECT COALESCE(
 // idempotent re-apply — plus everything later, instead of trusting a
 // MAX(id) that a not-yet-visible lower id may be hiding behind.
 //
-// KNOWN RESIDUAL HOLE — the invisible in-flight low-id window
-// (pre-existing since the Bug-94 fix, epoch-independent;
-// live-confirmed on PG 16, 2026-07-08): a change-log row INSERTed by
-// a transaction still uncommitted when this query runs is INVISIBLE
-// to it (MVCC), so the MIN arm cannot see — and therefore cannot
-// anchor below — an in-flight txn's already-allocated id when that id
-// is LOWER than every visible not-yet-settled row. Concretely: A
-// inserts change-log id=1 and stays open; B inserts id=2 and commits;
-// the query computes MIN(2)−1 = 1, but the gap-free anchor is 0 (A's
-// id=1 is in neither the bulk-copy snapshot nor `id > 1`). Closing it
-// needs handoff-time knowledge of the snapshot's in-progress xid set
-// (pg_snapshot_xip + a wait-for-settle on the CDC pool — the same
-// wait a slot-based CREATE_REPLICATION_SLOT performs); that is a
-// follow-up, deliberately NOT bundled into the xid8-domain fix.
+// MVCC BLIND SPOT — the invisible in-flight low-id window (epoch-
+// independent; live-confirmed on PG 16, 2026-07-08; CLOSED at the
+// handoff, see below): a change-log row INSERTed by a transaction
+// still uncommitted when this query runs is INVISIBLE to it (MVCC),
+// so the MIN arm cannot see — and therefore cannot anchor below — an
+// in-flight txn's already-allocated id when that id is LOWER than
+// every visible not-yet-settled row. Concretely: A inserts change-log
+// id=1 and stays open; B inserts id=2 and commits; this query
+// computes MIN(2)−1 = 1, but the gap-free anchor is 0 (A's id=1 is in
+// neither the bulk-copy snapshot nor `id > 1`). This query therefore
+// returns an anchor that is correct ONLY relative to rows visible in
+// its snapshot; [Engine.OpenSnapshotStream] — the sole handoff caller
+// — closes the blind spot by exporting the same snapshot's visibility
+// horizon ([captureSnapshotText]), assigning a txid upper bound,
+// waiting for every pre-bound transaction to settle (bounded, loud on
+// timeout — [waitForPreSnapshotTxnsToSettle], which also states the
+// full gap-freedom invariant and why the bound must be a freshly
+// ASSIGNED xid rather than the snapshot's xmax or xip set), and
+// clamping the anchor below the now-visible change-log ids the
+// snapshot couldn't see ([minChangeLogIDForInvisibleTxns]). Any new
+// caller anchoring a snapshot handoff MUST pair this query with that
+// settle+clamp step. Pinned by
+// TestSnapshotStream_InFlightTxnAnchor_NoGap.
 //
 // q MUST be the same connection/transaction the snapshot Rows read on,
 // so `pg_current_snapshot()` reflects the snapshot the bulk copy sees.

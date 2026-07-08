@@ -35,7 +35,11 @@ import (
 //     [readChangeLogAnchor] for the gap-freedom proof). Everything ≤
 //     anchor is in the snapshot (copied by Rows); everything > anchor
 //     is replayed by Changes. Over-replay is safe (idempotent applier,
-//     ADR-0010); a gap is forbidden.
+//     ADR-0010); a gap is forbidden. Transactions still in flight at
+//     snapshot time — whose change-log rows are MVCC-invisible to the
+//     anchor query — are waited out (bounded; loud refusal naming the
+//     stuck txids on timeout) and the anchor clamped below their ids
+//     (see [waitForPreSnapshotTxnsToSettle] for the invariant).
 //   - Rows = a snapshot-pinned [postgres.RowReader] over the USER
 //     tables (the orchestrator drives it per-table from the filtered
 //     IR schema; the engine-managed capture tables are excluded from
@@ -113,6 +117,49 @@ func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.Snapsho
 		_ = conn.Close()
 		_ = db.Close()
 		return nil, fmt.Errorf("pgtrigger: snapshot: read CDC anchor: %w", err)
+	}
+
+	// The anchor query alone cannot see change-log rows INSERTed by
+	// transactions still in flight at snapshot time (MVCC) — and such a
+	// txn may hold an already-allocated id BELOW the anchor (the
+	// invisible in-flight low-id window; live-confirmed 2026-07-08).
+	// Export the snapshot's visibility horizon from the SAME pinned
+	// conn the anchor used, assign a txid upper bound on the pool, wait
+	// until every pre-bound transaction settles (fresh snapshot per
+	// poll, on the pool — the pinned conn can never observe them
+	// settling), then clamp the anchor below the now-visible change-log
+	// ids that are NOT in the copy's snapshot. See
+	// waitForPreSnapshotTxnsToSettle for the gap-freedom invariant. A
+	// quiescent source pays three extra round-trips and no waiting.
+	snapText, err := captureSnapshotText(ctx, conn)
+	if err != nil {
+		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		_ = conn.Close()
+		_ = db.Close()
+		return nil, fmt.Errorf("pgtrigger: snapshot: export snapshot horizon: %w", err)
+	}
+	upperBound, err := captureTxidUpperBound(ctx, db)
+	if err != nil {
+		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		_ = conn.Close()
+		_ = db.Close()
+		return nil, fmt.Errorf("pgtrigger: snapshot: assign settle-wait txid bound: %w", err)
+	}
+	if err := waitForPreSnapshotTxnsToSettle(ctx, db, upperBound, anchorSettleTimeout); err != nil {
+		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		_ = conn.Close()
+		_ = db.Close()
+		return nil, fmt.Errorf("pgtrigger: snapshot: %w", err)
+	}
+	minID, found, err := minChangeLogIDForInvisibleTxns(ctx, db, cfg.schema, snapText, upperBound)
+	if err != nil {
+		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		_ = conn.Close()
+		_ = db.Close()
+		return nil, fmt.Errorf("pgtrigger: snapshot: clamp anchor below snapshot-invisible change-log ids: %w", err)
+	}
+	if found && minID <= anchor {
+		anchor = minID - 1
 	}
 
 	position, err := encodePos(pgTriggerPos{LastID: anchor})
