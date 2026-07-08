@@ -53,6 +53,7 @@ const (
 	CodeSchemaPermissionDenied   Code = "SLUICE-E-SCHEMA-PERMISSION-DENIED"
 	CodeIndexStatementTimeLimit  Code = "SLUICE-E-INDEX-STATEMENT-TIME-LIMIT"
 	CodeIndexDirectDDLDisabled   Code = "SLUICE-E-INDEX-DIRECT-DDL-DISABLED"
+	CodeIndexMissing             Code = "SLUICE-E-INDEX-MISSING"
 	CodeCDCReplicationPermission Code = "SLUICE-E-CDC-REPLICATION-PERMISSION"
 
 	CodeColdStartTargetNotEmpty   Code = "SLUICE-E-COLDSTART-TARGET-NOT-EMPTY"
@@ -109,6 +110,7 @@ var registry = map[Code]Info{
 	CodeExprBackslashLiteral:      {ClassRefusal, "SQLite expression string literal with a backslash has no faithful MySQL spelling"},
 	CodeConfirmationRequired:      {ClassRefusal, "destructive operation requires explicit --yes confirmation"},
 	CodeDriverHostMismatch:        {ClassRefusal, "the driver cannot drive the DSN's host (e.g. mysql pointed at a PlanetScale endpoint)"},
+	CodeIndexMissing:              {ClassRefusal, "a secondary index the migration was expected to build is absent on the target"},
 }
 
 // Describe returns the registry metadata for c, and whether c is a

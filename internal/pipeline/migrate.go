@@ -1052,6 +1052,14 @@ func runBulkCopyWithOpts(
 		}); err != nil {
 			return migcore.WrapWithHint(migcore.PhaseIndexes, fmt.Errorf("pipeline: create indexes: %w", err))
 		}
+		// Loud-failure safety net (SLUICE-E-INDEX-MISSING): the serial cold-start
+		// path builds indexes via CreateIndexes directly (not the bug's overlap
+		// path), but the net runs here too so the guarantee "no successful run
+		// ships a schema missing an index it should have built" holds on EVERY
+		// path. Engines without ir.IndexVerifier are a no-op.
+		if err := verifyBuiltIndexes(ctx, sw, schema); err != nil {
+			return migcore.WrapWithHint(migcore.PhaseIndexes, fmt.Errorf("pipeline: verify indexes: %w", err))
+		}
 	}
 	if opts.SkipSchemaApply {
 		// Skip the trailing constraints/views phases too — handled
@@ -1372,6 +1380,20 @@ func runBulkCopyPhases(
 			return migcore.WrapWithHint(migcore.PhaseIndexes, markFailed(ctx, rc, *state, ir.MigrationPhaseIndexes, err))
 		}
 		slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseIndexes)))
+	}
+
+	// Loud-failure safety net (SLUICE-E-INDEX-MISSING): every branch above —
+	// upfront, overlapped, and the non-IIB fallback — is meant to have built
+	// every secondary index by now. Verify it, so a silent index-build no-op
+	// (the v0.99.x VStream miss, where a MySQL/PlanetScale target created NO
+	// secondary indexes yet reported success) can never recur unnoticed. This
+	// covers BOTH migrate and the fast-parallel sync cold-start, since both run
+	// runBulkCopyPhases. Runs before the reparent reconcile (index EXISTENCE is
+	// unaffected by the reconcile's TRUNCATE + re-INSERT). Engines without the
+	// ir.IndexVerifier surface are a no-op.
+	if err := verifyBuiltIndexes(ctx, sw, schema); err != nil {
+		err = fmt.Errorf("pipeline: verify indexes: %w", err)
+		return migcore.WrapWithHint(migcore.PhaseIndexes, markFailed(ctx, rc, *state, ir.MigrationPhaseIndexes, err))
 	}
 
 	// ADR-0141: reconcile any reparent-touched table AFTER the bulk-copy (and its

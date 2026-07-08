@@ -5,8 +5,13 @@ package mysql
 
 import (
 	"context"
+	"database/sql"
+	"database/sql/driver"
+	"errors"
+	"io"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -130,38 +135,41 @@ func referenceCreateIndexNames(table *ir.Table) []string {
 	return out
 }
 
-// TestBuildTableIndexesFromChannel_FlavorGate pins the ADR-0080 flavor gate:
-// a PlanetScale/Vitess writer (flavor.usesVStream()) DECLINES the overlap —
-// it drains the channel WITHOUT touching the database (no ALTER … ADD INDEX),
-// returns nil, but STILL fires the per-table callback for every table so
-// resume IndexesBuilt accounting stays correct (the post-copy CreateIndexes
-// then builds the indexes).
+// TestBuildTableIndexesFromChannel_VStreamBuildsSerially is the regression
+// lock for the CRITICAL silent-index-loss bug: a PlanetScale/Vitess writer
+// (flavor.usesVStream()) DRAINS the completed-tables channel and then BUILDS
+// each drained table's secondary indexes SERIALLY — it is NOT a no-op. The
+// prior gate drained into a pure no-op and relied on a post-copy
+// CreateIndexes that never ran on the overlapped path, so a MySQL VStream
+// target silently created NO secondary indexes at all.
 //
-// The decline path never touches w.db, so a nil-db writer is a valid probe:
-// any attempt to build would panic on the nil pool, making "no DB touch" an
-// observable invariant rather than just an assertion on counts.
-func TestBuildTableIndexesFromChannel_FlavorGate(t *testing.T) {
+// Pins:
+//   - every fed table gets an ALTER … ADD INDEX emitted (recorded by the fake
+//     driver) — the build genuinely happens;
+//   - the per-table IndexesBuilt callback fires for every table, and fires
+//     ONLY AFTER that table's ALTER was emitted (build-then-mark);
+//   - both usesVStream flavors are exercised (pin the class: PlanetScale AND
+//     Vitess share the code path but are asserted independently).
+func TestBuildTableIndexesFromChannel_VStreamBuildsSerially(t *testing.T) {
 	for _, flavor := range []Flavor{FlavorPlanetScale, FlavorVitess} {
 		t.Run(flavor.String(), func(t *testing.T) {
+			rec := &indexRecorder{exists: false} // indexes don't exist yet → build them
+			db := newIndexFakeDB(t, rec)
+			w := &SchemaWriter{db: db, schema: "testdb", flavor: flavor}
+
 			var mu sync.Mutex
 			var fired []string
-			w := &SchemaWriter{
-				db:     nil, // building would panic — proves the gate declines
-				flavor: flavor,
-			}
+			var markedBeforeBuild []string // tables whose callback fired with NO ALTER recorded yet
 			w.SetTableIndexedCallback(func(table *ir.Table) {
 				mu.Lock()
 				fired = append(fired, table.Name)
+				if rec.alterCountFor(table.Name) == 0 {
+					markedBeforeBuild = append(markedBeforeBuild, table.Name)
+				}
 				mu.Unlock()
 			})
 
-			// Tables that DO carry secondary indexes — if the gate leaked into
-			// the build path it would deref the nil db and panic.
-			tables := []*ir.Table{
-				indexedTable("t0"),
-				indexedTable("t1"),
-				indexedTable("t2"),
-			}
+			tables := []*ir.Table{indexedTable("t0"), indexedTable("t1"), indexedTable("t2")}
 			schema := &ir.Schema{Tables: tables}
 			ch := make(chan *ir.Table, len(tables))
 			for _, tbl := range tables {
@@ -172,17 +180,80 @@ func TestBuildTableIndexesFromChannel_FlavorGate(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			if err := w.BuildTableIndexesFromChannel(ctx, schema, ch); err != nil {
-				t.Fatalf("BuildTableIndexesFromChannel (declined): %v", err)
+				t.Fatalf("BuildTableIndexesFromChannel (vstream serial build): %v", err)
+			}
+
+			// Every table's index was actually built (not silently skipped).
+			for _, name := range []string{"t0", "t1", "t2"} {
+				if rec.alterCountFor(name) == 0 {
+					t.Errorf("no ALTER … ADD INDEX emitted for %q — the vstream path silently skipped it (the bug)", name)
+				}
+			}
+			// And every emitted statement is an ADD INDEX (proves it's index DDL).
+			for _, stmt := range rec.snapshot() {
+				if !strings.Contains(stmt, "ADD INDEX") {
+					t.Errorf("recorded statement is not an ADD INDEX: %q", stmt)
+				}
 			}
 
 			mu.Lock()
 			sort.Strings(fired)
+			gotMarkedEarly := append([]string(nil), markedBeforeBuild...)
 			mu.Unlock()
-			want := []string{"t0", "t1", "t2"}
-			if !reflect.DeepEqual(fired, want) {
-				t.Errorf("callback fired for %v; want %v (every table, so resume accounting holds)", fired, want)
+			if want := []string{"t0", "t1", "t2"}; !reflect.DeepEqual(fired, want) {
+				t.Errorf("callback fired for %v; want %v", fired, want)
+			}
+			if len(gotMarkedEarly) != 0 {
+				t.Errorf("build-then-mark violated: IndexesBuilt fired before the ALTER for %v", gotMarkedEarly)
 			}
 		})
+	}
+}
+
+// TestBuildTableIndexesFromChannel_VStreamBuildErrorLeavesUnmarked pins the
+// build-then-mark failure contract: when a table's index build FAILS mid-way,
+// BuildTableIndexesFromChannel returns the error loudly and does NOT fire the
+// IndexesBuilt callback for that table (nor for any not-yet-built table), so a
+// --resume rebuilds them rather than stranding them marked-done.
+func TestBuildTableIndexesFromChannel_VStreamBuildErrorLeavesUnmarked(t *testing.T) {
+	buildErr := errors.New("vtgate: ADD INDEX rejected")
+	rec := &indexRecorder{
+		exists:   false,
+		failTbls: map[string]error{"t0": buildErr}, // t0's ALTER fails
+	}
+	db := newIndexFakeDB(t, rec)
+	w := &SchemaWriter{db: db, schema: "testdb", flavor: FlavorPlanetScale}
+
+	var mu sync.Mutex
+	var fired []string
+	w.SetTableIndexedCallback(func(table *ir.Table) {
+		mu.Lock()
+		fired = append(fired, table.Name)
+		mu.Unlock()
+	})
+
+	// t0 is drained first (FIFO) and its build fails → t1 never reached.
+	tables := []*ir.Table{indexedTable("t0"), indexedTable("t1")}
+	schema := &ir.Schema{Tables: tables}
+	ch := make(chan *ir.Table, len(tables))
+	for _, tbl := range tables {
+		ch <- tbl
+	}
+	close(ch)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := w.BuildTableIndexesFromChannel(ctx, schema, ch)
+	if err == nil {
+		t.Fatal("a mid-build failure must fail the phase LOUDLY; got nil")
+	}
+	if !errors.Is(err, buildErr) {
+		t.Errorf("returned error should wrap the underlying build error; got %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(fired) != 0 {
+		t.Errorf("IndexesBuilt fired for %v after a build failure; build-then-mark requires no table be marked when its (or an earlier) build failed", fired)
 	}
 }
 
@@ -242,4 +313,116 @@ func indexedTable(name string) *ir.Table {
 
 func pk() *ir.Index {
 	return &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}}
+}
+
+// --- fake database/sql driver for the index-build + verification pins ---
+//
+// indexFakeDriver answers the indexExists EXISTS probe from a configurable
+// existence flag and records every ALTER … ADD INDEX statement, so a unit
+// test can assert the vstream serial builder actually emits ADD INDEX (not a
+// silent no-op) and that VerifyIndexes flags a missing index — no
+// testcontainers. Mirrors the scriptDriver pattern in
+// row_writer_reparent_retry_test.go.
+
+// indexRecorder holds the fake driver's scripted behaviour + instrumentation.
+// It is populated before the DB is opened and, on the serial vstream build
+// path, only ever touched from the single build goroutine; the mutex guards
+// the callback's concurrent snapshot reads regardless.
+type indexRecorder struct {
+	mu       sync.Mutex
+	execs    []string         // recorded ALTER statements, in order
+	exists   bool             // EXISTS-probe result (false ⇒ build the index)
+	failTbls map[string]error // tableName ⇒ error returned when its ALTER runs
+}
+
+func (r *indexRecorder) record(q string) {
+	r.mu.Lock()
+	r.execs = append(r.execs, q)
+	r.mu.Unlock()
+}
+
+func (r *indexRecorder) snapshot() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.execs...)
+}
+
+// alterCountFor counts recorded ALTERs naming the quoted table.
+func (r *indexRecorder) alterCountFor(table string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, q := range r.execs {
+		if strings.Contains(q, "`"+table+"`") {
+			n++
+		}
+	}
+	return n
+}
+
+type indexFakeDriver struct{ rec *indexRecorder }
+
+// identical single-field shape; staticcheck S1016 prefers the conversion.
+func (d indexFakeDriver) Open(string) (driver.Conn, error) { return indexFakeConn(d), nil }
+
+type indexFakeConn struct{ rec *indexRecorder }
+
+func (indexFakeConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("not supported") }
+func (indexFakeConn) Close() error                        { return nil }
+func (indexFakeConn) Begin() (driver.Tx, error)           { return nil, errors.New("not supported") }
+
+func (c indexFakeConn) ExecContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
+	if strings.HasPrefix(strings.TrimSpace(query), "ALTER") {
+		c.rec.record(query)
+		for tbl, err := range c.rec.failTbls {
+			if err != nil && strings.Contains(query, "`"+tbl+"`") {
+				return nil, err
+			}
+		}
+	}
+	return driver.RowsAffected(0), nil
+}
+
+// QueryContext serves the indexExists EXISTS probe (the only query these
+// paths issue) as a single bool row driven by rec.exists.
+func (c indexFakeConn) QueryContext(_ context.Context, _ string, _ []driver.NamedValue) (driver.Rows, error) {
+	v := int64(0)
+	if c.rec.exists {
+		v = 1
+	}
+	return &boolRow{val: v}, nil
+}
+
+// boolRow is a one-column, one-row result carrying an int64 (0/1) the
+// database/sql layer converts into the bool indexExists scans.
+type boolRow struct {
+	val  int64
+	done bool
+}
+
+func (*boolRow) Columns() []string { return []string{"exists"} }
+func (*boolRow) Close() error      { return nil }
+
+func (r *boolRow) Next(dest []driver.Value) error {
+	if r.done {
+		return io.EOF
+	}
+	r.done = true
+	dest[0] = r.val
+	return nil
+}
+
+// newIndexFakeDB registers a driver bound to rec and returns a *sql.DB over
+// it. sql.Register is global and panics on a duplicate name; t.Name() is
+// unique per test within a run, so the name is safe.
+func newIndexFakeDB(t *testing.T, rec *indexRecorder) *sql.DB {
+	t.Helper()
+	name := "sluice-index-fake-" + t.Name()
+	sql.Register(name, indexFakeDriver{rec: rec})
+	db, err := sql.Open(name, "")
+	if err != nil {
+		t.Fatalf("open index fake db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
 }

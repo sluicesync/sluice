@@ -32,13 +32,20 @@
 //     feature. The pool sizes itself from a fixed-N policy
 //     ([resolveIndexBuildWorkers]) instead.
 //   - Flavor gate. PlanetScale/Vitess targets (flavor.usesVStream())
-//     DECLINE the overlap: BuildTableIndexesFromChannel drains the channel
-//     into a no-op that STILL fires the per-table callback (so resume
-//     IndexesBuilt accounting stays correct) and returns nil, letting the
-//     post-copy whole-schema CreateIndexes run as today. Concurrent
-//     `ALTER … ADD INDEX` against vtgate fights their online-DDL /
-//     Safe-Migrations queue. The gate is an internal early-return (the type
-//     still satisfies the surface) so the code path stays uniform.
+//     DECLINE the CONCURRENT overlap — concurrent `ALTER … ADD INDEX`
+//     against vtgate fights their online-DDL / Safe-Migrations queue — but
+//     still build every index: BuildTableIndexesFromChannel DRAINS the
+//     completed-tables channel to completion (so the copy producer is never
+//     blocked), then builds each drained table's secondary indexes SERIALLY
+//     on the pooled connection (one table at a time, so there are never
+//     concurrent ALTERs on the vstream target). It is BUILD-THEN-MARK: a
+//     table's IndexesBuilt callback fires only AFTER its build succeeds, so
+//     a mid-build failure leaves the unbuilt tables IndexesBuilt=false and a
+//     --resume rebuilds them. (Historical wart — the v0.99.x VStream miss:
+//     this gate once drained into a pure no-op and relied on the post-copy
+//     whole-schema CreateIndexes running instead, but that fall-through only
+//     existed in the orchestrator's UNREACHABLE non-IIB else branch, so a
+//     MySQL VStream target silently created NO secondary indexes at all.)
 
 package mysql
 
@@ -108,18 +115,22 @@ func (w *SchemaWriter) SetTableIndexedCallback(fn func(table *ir.Table)) {
 // once the channel is closed AND every queued build has finished — or the
 // first build error (which cancels its peers via the shared errgroup ctx).
 //
-// PlanetScale/Vitess targets DECLINE the overlap (the flavor gate): the
-// channel is drained into a no-op that still fires the per-table callback
-// (so resume IndexesBuilt accounting stays correct) and returns nil, leaving
-// the post-copy whole-schema CreateIndexes to build the indexes as today.
+// PlanetScale/Vitess targets DECLINE the CONCURRENT overlap (the flavor
+// gate) but still build every index: the channel is drained to completion,
+// then each drained table's indexes build SERIALLY on the pooled connection
+// (build-then-mark — the per-table callback fires only after that table's
+// build succeeds).
 func (w *SchemaWriter) BuildTableIndexesFromChannel(ctx context.Context, s *ir.Schema, completedTables <-chan *ir.Table) error {
 	// Flavor gate (ADR-0080): VStream flavors route DDL through their own
-	// online-DDL / Safe-Migrations queue; concurrent ALTER … ADD INDEX
-	// against vtgate fights that machinery. Drain into a no-op (firing the
-	// per-table callback so resume accounting stays correct) and defer to
-	// the post-copy CreateIndexes.
+	// online-DDL / Safe-Migrations queue; CONCURRENT ALTER … ADD INDEX
+	// against vtgate fights that machinery. So drain the channel fully (never
+	// blocking the copy producer), then build each drained table's indexes
+	// SERIALLY on the pool — one ALTER at a time, no concurrency against
+	// vtgate — firing IndexesBuilt only after each table's build succeeds.
+	// (This replaced a silent no-op that never built any secondary index on
+	// vstream targets — the project's #1 silent-loss class.)
 	if w.flavor.usesVStream() {
-		return w.drainTablesFiringCallback(ctx, completedTables)
+		return w.drainThenBuildSerial(ctx, completedTables)
 	}
 
 	if s == nil {
@@ -254,12 +265,68 @@ func (w *SchemaWriter) indexBuildWorkerTracked(ctx context.Context, jobCh <-chan
 	}
 }
 
+// drainThenBuildSerial is the VStream flavor gate's builder (the fix for the
+// v0.99.x silent-index-loss miss). It runs in two phases:
+//
+//	Phase 1 — DRAIN. Read completedTables to completion, collecting each
+//	table, building NOTHING yet. Draining first keeps the copy producer from
+//	ever blocking on a busy build (index builds must not backpressure the
+//	copy pool). No IndexesBuilt callback fires during the drain.
+//
+//	Phase 2 — BUILD SERIALLY. Once the channel closes (the copy pool has
+//	finished, so no producer goroutine still touches shared state), build
+//	each drained table's secondary indexes one table at a time on the pooled
+//	w.db — never concurrently, so the ALTERs don't fight vtgate's online-DDL
+//	/ Safe-Migrations queue (the reason the concurrent overlap is declined).
+//	The build reuses the SAME indexBuildJobsForTables + buildTableIndexes
+//	machinery CreateIndexes uses, so the emitted SQL (inline-skip set,
+//	alphabetical order, combined ALTER, idempotent detect-then-skip) is
+//	byte-identical.
+//
+// BUILD-THEN-MARK: a table's IndexesBuilt callback fires only AFTER that
+// table's build succeeds. A mid-build failure returns the error (failing the
+// phase loudly) and leaves every not-yet-built table IndexesBuilt=false, so a
+// --resume re-feeds and rebuilds them rather than stranding them marked-done.
+func (w *SchemaWriter) drainThenBuildSerial(ctx context.Context, completedTables <-chan *ir.Table) error {
+	var drained []*ir.Table
+drain:
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case table, ok := <-completedTables:
+			if !ok {
+				break drain
+			}
+			drained = append(drained, table)
+		}
+	}
+
+	for _, table := range drained {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		// One job per table (combined-ALTER model); a table with no eligible
+		// secondary index yields no job and is "indexed" the moment its copy
+		// landed — the callback below still fires for it.
+		for _, job := range w.indexBuildJobsForTables([]*ir.Table{table}) {
+			if err := w.buildTableIndexes(ctx, w.db, job); err != nil {
+				return err
+			}
+		}
+		// build-then-mark: only now, after this table's indexes are durably
+		// built, record IndexesBuilt.
+		w.fireTableIndexed(table)
+	}
+	return nil
+}
+
 // drainTablesFiringCallback consumes completedTables until it closes (or ctx
 // cancels), building NOTHING but firing the per-table callback for each so
-// resume IndexesBuilt accounting stays correct. Used by the VStream flavor
-// gate (the overlap is declined; the post-copy CreateIndexes builds the
-// indexes) and the no-schema / no-index degenerate cases. Keeps the producer
-// from blocking on an unread channel.
+// resume IndexesBuilt accounting stays correct. Used by the no-schema /
+// no-index degenerate cases of the vanilla overlap path (nothing to build, so
+// draining and marking is the whole job). Keeps the producer from blocking on
+// an unread channel.
 func (w *SchemaWriter) drainTablesFiringCallback(ctx context.Context, completedTables <-chan *ir.Table) error {
 	for {
 		select {

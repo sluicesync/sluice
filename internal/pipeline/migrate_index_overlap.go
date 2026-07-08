@@ -198,3 +198,24 @@ func alreadyIndexed(state *ir.MigrationState, stateMu *sync.Mutex, tableName str
 	defer stateMu.Unlock()
 	return state.TableProgress[tableName].IndexesBuilt
 }
+
+// verifyBuiltIndexes runs the post-index-phase loud-failure safety net
+// (SLUICE-E-INDEX-MISSING): if the target writer implements
+// [ir.IndexVerifier], every secondary index the build phase was supposed to
+// create must now exist on the target, or the phase fails loudly naming the
+// missing table.index list.
+//
+// This guards the silent-schema-loss CLASS — a build path that silently
+// no-ops (the v0.99.x VStream miss, where a MySQL/PlanetScale target created
+// NO secondary indexes yet reported success) — so it can never recur
+// unnoticed even if a future refactor re-breaks the build path. It is invoked
+// on every index-building path: runBulkCopyPhases (migrate + fast-parallel
+// sync cold-start) and runBulkCopyWithOpts (serial sync cold-start). Writers
+// without the surface are a no-op.
+func verifyBuiltIndexes(ctx context.Context, sw ir.SchemaWriter, schema *ir.Schema) error {
+	verifier, ok := sw.(ir.IndexVerifier)
+	if !ok {
+		return nil
+	}
+	return verifier.VerifyIndexes(ctx, schema)
+}

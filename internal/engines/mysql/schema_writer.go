@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // SchemaWriter applies an IR Schema to a MySQL database in three
@@ -345,6 +346,57 @@ func (w *SchemaWriter) CreateIndexes(ctx context.Context, s *ir.Schema) error {
 	}
 	return nil
 }
+
+// VerifyIndexes implements the [ir.IndexVerifier] loud-failure safety net:
+// after the index phase, every secondary index the build TARGETED must exist
+// on the target, or it returns a SLUICE-E-INDEX-MISSING refusal naming the
+// missing `table.index` list.
+//
+// It reuses [indexBuildJobsForTables] so the verified set is EXACTLY the set
+// the build path built — same inline-skip carve-out (the GitHub #25
+// AUTO_INCREMENT supporting key + the Bug 125 PK-less COPY unique key are
+// emitted at CREATE TABLE, never by the index phase, so probing for them here
+// would false-flag). Each expected index is probed via the same [indexExists]
+// information_schema.statistics read the idempotent build uses — cheap, one
+// catalog read apiece.
+//
+// This net exists because the VStream/PlanetScale index-build path silently
+// no-op'd (built NO secondary indexes) for releases — the project's #1
+// silent-loss class. It runs for EVERY MySQL flavor (a general net, not scoped
+// to the vstream path) so no future refactor can re-break the build path
+// unnoticed.
+func (w *SchemaWriter) VerifyIndexes(ctx context.Context, s *ir.Schema) error {
+	if s == nil {
+		return errors.New("mysql: VerifyIndexes: schema is nil")
+	}
+	var missing []string
+	for _, job := range w.indexBuildJobsForTables(orderedTables(s)) {
+		for _, idx := range job.idxs {
+			exists, err := indexExists(ctx, w.db, w.schema, job.tableName, idx.Name)
+			if err != nil {
+				return fmt.Errorf("mysql: VerifyIndexes: probe index %q on %q: %w", idx.Name, job.tableName, err)
+			}
+			if !exists {
+				missing = append(missing, job.tableName+"."+idx.Name)
+			}
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	return sluicecode.Wrap(
+		sluicecode.CodeIndexMissing,
+		"re-run with --resume to rebuild the missing indexes; if it recurs the target rejected the index DDL — check its DDL/online-migration policy",
+		fmt.Errorf("mysql: VerifyIndexes: %d expected secondary index(es) absent on the target after the index phase: %s",
+			len(missing), strings.Join(missing, ", ")),
+	)
+}
+
+// Compile-time proof the SchemaWriter exposes the post-index-phase
+// loud-failure verification net (SLUICE-E-INDEX-MISSING) so the orchestrator's
+// [ir.IndexVerifier] check engages on both the migrate and sync cold-start
+// paths.
+var _ ir.IndexVerifier = (*SchemaWriter)(nil)
 
 // indexBuildJob is one TABLE's secondary-index work the index-build paths
 // consume (ADR-0080 follow-up). All of the table's eligible indexes travel

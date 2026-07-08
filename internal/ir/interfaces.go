@@ -1717,6 +1717,30 @@ type IndexBuildBudgetSetter interface {
 	SetIndexBuildBudget(connBudget int)
 }
 
+// IndexVerifier is the OPTIONAL loud-failure safety net a [SchemaWriter]
+// implements so the orchestrator can VERIFY, immediately after the index
+// phase, that every secondary index the build was supposed to create
+// actually exists on the target — and refuse loudly (naming the missing
+// `table.index` list) if any is absent.
+//
+// This exists because a silent index-build no-op is the project's #1
+// tenet violation (silent schema loss): a MySQL-target migrate/sync into a
+// PlanetScale/Vitess endpoint once drained the completed-tables channel
+// without building ANY secondary index, reporting success against a schema
+// that was missing every non-primary index. VerifyIndexes turns that whole
+// CLASS into a named refusal so no future refactor can re-break the build
+// path unnoticed. It runs for ALL targets that implement it, on both the
+// migrate and sync cold-start paths, and is cheap — one catalog read per
+// expected index.
+//
+// The verified set MUST be the SAME eligible set the build targeted (the
+// inline-emitted indexes a CREATE TABLE already carries are excluded, so
+// they are never falsely flagged). A writer that does not implement the
+// surface is a no-op — the net simply doesn't run for that engine.
+type IndexVerifier interface {
+	VerifyIndexes(ctx context.Context, s *Schema) error
+}
+
 // TableAnalyzer is the OPTIONAL surface a [SchemaWriter] implements so
 // the migrate orchestrator's opt-in `--analyze-after` phase can refresh
 // the target's planner statistics per migrated table once constraints

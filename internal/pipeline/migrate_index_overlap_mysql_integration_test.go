@@ -24,10 +24,13 @@
 //     already-indexed tables (the per-table index-build-start counter proves
 //     the short-circuit; partial sets are a no-op via indexExists).
 //
-// The PlanetScale/Vitess flavor gate (the overlap is DECLINED there) is
-// covered by a unit-level behavioral test in the mysql engine package —
-// vttestserver may not model online-DDL, so the gate is pinned without a
-// container (see schema_writer_index_overlap_test.go).
+// The PlanetScale/Vitess flavor gate DECLINES the CONCURRENT overlap but
+// still builds every index SERIALLY (drain-then-serial-build) — a MySQL
+// VStream target once silently built NO secondary index, the project's #1
+// silent-loss class. That branch is pinned by unit tests in the mysql engine
+// package (schema_writer_index_overlap_test.go) plus a real-Vitess-target
+// integration pin under `integration && vstream`
+// (schema_writer_index_vstream_integration_test.go).
 
 package pipeline
 
