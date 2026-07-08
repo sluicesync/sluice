@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+
+	"sluicesync.dev/sluice/internal/diagnose"
 )
 
 // sdTarget is one element of the PlanetScale per-org metrics
@@ -54,7 +56,7 @@ func (c *client) discover(ctx context.Context, database, branch string) (sdTarge
 		strings.TrimRight(c.baseURL, "/"), url.PathEscape(c.org))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, http.NoBody)
 	if err != nil {
-		return sdTarget{}, fmt.Errorf("telemetry: build SD request: %w", err)
+		return sdTarget{}, fmt.Errorf("telemetry: build SD request: %w", diagnose.SafeParseError(err))
 	}
 	// PlanetScale service-token auth: `Authorization: {TOKEN_ID}:{TOKEN}`.
 	// The token value is NEVER logged; only this header carries it.
@@ -63,7 +65,10 @@ func (c *client) discover(ctx context.Context, database, branch string) (sdTarge
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return sdTarget{}, fmt.Errorf("telemetry: SD request failed: %w", err)
+		// client.Do wraps failures in *url.Error, whose Error() embeds the
+		// full request URL; SafeParseError strips the wrapper (audit N-12 —
+		// same treatment as the signed scrape leg below, for consistency).
+		return sdTarget{}, fmt.Errorf("telemetry: SD request failed: %w", diagnose.SafeParseError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
@@ -121,11 +126,16 @@ func (c *client) scrape(ctx context.Context, t sdTarget) (string, error) {
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, scrapeURL, http.NoBody)
 	if err != nil {
-		return "", fmt.Errorf("telemetry: build scrape request: %w", err)
+		return "", fmt.Errorf("telemetry: build scrape request: %w", diagnose.SafeParseError(err))
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("telemetry: scrape request failed: %w", err)
+		// The scrape URL is SIGNED (sig + exp query params) — it is a
+		// bearer credential for the metrics endpoint until exp. client.Do
+		// wraps failures in *url.Error, whose Error() embeds that full URL;
+		// SafeParseError strips the wrapper so the signature never reaches
+		// a WARN log (audit N-12).
+		return "", fmt.Errorf("telemetry: scrape request failed: %w", diagnose.SafeParseError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {

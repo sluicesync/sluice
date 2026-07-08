@@ -31,7 +31,7 @@ type slackPayload struct {
 // Notify composes a readable one-line Slack message and POSTs it. A non-2xx
 // response is an error.
 func (s *SlackNotifier) Notify(ctx context.Context, n Notification) error {
-	return postJSON(ctx, s.client(), s.WebhookURL, slackPayload{Text: slackText(n)})
+	return postJSON(ctx, s.client(), s.Name(), s.WebhookURL, slackPayload{Text: slackText(n)})
 }
 
 // Name implements [Notifier].

@@ -11,6 +11,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"sluicesync.dev/sluice/internal/diagnose"
 )
 
 // defaultHTTPTimeout bounds a single notification POST. A notification is
@@ -58,7 +60,7 @@ func (w *WebhookNotifier) Notify(ctx context.Context, n Notification) error {
 		Threshold: n.Threshold,
 		At:        n.At,
 	}
-	return postJSON(ctx, w.client(), w.URL, body)
+	return postJSON(ctx, w.client(), w.Name(), w.URL, body)
 }
 
 // Name implements [Notifier].
@@ -73,22 +75,29 @@ func (w *WebhookNotifier) client() *http.Client {
 
 // postJSON marshals v and POSTs it to url with a JSON content type,
 // returning an error for any transport failure or non-2xx status. Shared by
-// the webhook and Slack sinks. The response body is drained+closed so the
-// connection can be reused; on a non-2xx it is read (bounded) into the
-// error for diagnosis.
-func postJSON(ctx context.Context, client *http.Client, url string, v any) error {
+// the webhook and Slack sinks; sink names the caller in error messages. The
+// response body is drained+closed so the connection can be reused; on a
+// non-2xx it is read (bounded) into the error for diagnosis.
+//
+// URL-leak wart (audit N-12): the URL here IS a credential — its path is
+// the secret for webhook/Slack sinks (see diagnose/redact.go) — and both
+// url.Parse (inside NewRequest) and client.Do wrap failures in *url.Error,
+// whose Error() embeds the full URL. The alerter WARN-logs err.Error(), so
+// every error below passes through [diagnose.SafeParseError] to strip the
+// *url.Error wrapper, keeping the sink name + underlying cause only.
+func postJSON(ctx context.Context, client *http.Client, sink, url string, v any) error {
 	buf, err := json.Marshal(v)
 	if err != nil {
 		return fmt.Errorf("marshal payload: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(buf))
 	if err != nil {
-		return fmt.Errorf("build request: %w", err)
+		return fmt.Errorf("build %s request: %w", sink, diagnose.SafeParseError(err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("post: %w", err)
+		return fmt.Errorf("post to %s sink: %w", sink, diagnose.SafeParseError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
