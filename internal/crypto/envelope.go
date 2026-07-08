@@ -140,6 +140,73 @@ func DefaultArgon2idParams() (Argon2idParams, error) {
 	}, nil
 }
 
+// Upper bounds on Argon2id params accepted at KEK-derivation time.
+//
+// The params are copied VERBATIM from a backup manifest's JSON and fed
+// to argon2.IDKey BEFORE anything about the manifest is authenticated —
+// the KEK the auth tags depend on is itself derived from them — so
+// without bounds a tampered manifest is a pre-auth memory/CPU bomb on
+// restore: `memory_kib: 4294967295` asks for ~4 TiB, and a huge
+// iteration count spins for hours (the classic unauthenticated-KDF-param
+// bomb; audit N-7). The bounds sit far above anything sluice ever
+// writes: the only construction site is [DefaultArgon2idParams]
+// (64 MiB / 3 iterations / parallelism 4 / [SaltLen]-byte salt) and
+// there is no flag to raise those, so a legitimate sluice-written chain
+// can never trip them.
+const (
+	// MaxArgon2idMemoryKiB caps the memory cost at 2 GiB.
+	MaxArgon2idMemoryKiB = 2 * 1024 * 1024
+
+	// MaxArgon2idIterations caps the time cost.
+	MaxArgon2idIterations = 64
+
+	// MaxArgon2idParallelism caps the lane count.
+	MaxArgon2idParallelism = 32
+
+	// MaxArgon2idSaltLen caps the salt length at 1 KiB; sluice writes
+	// [SaltLen] (16) bytes.
+	MaxArgon2idSaltLen = 1024
+)
+
+// validateArgon2idParams enforces the non-zero floors and the
+// untrusted-manifest ceilings above. Split from [NewPassphraseEnvelope]
+// so the bounds are unit-testable without paying an actual (potentially
+// multi-GiB) Argon2id derivation at the boundary values.
+func validateArgon2idParams(params Argon2idParams) error {
+	if len(params.Salt) == 0 {
+		return errors.New("crypto: argon2id salt is empty")
+	}
+	if len(params.Salt) > MaxArgon2idSaltLen {
+		return fmt.Errorf("crypto: argon2id salt length %d exceeds the %d-byte bound (tampered manifest?)",
+			len(params.Salt), MaxArgon2idSaltLen)
+	}
+	if params.Memory == 0 {
+		return errors.New("crypto: argon2id memory is zero")
+	}
+	if params.Memory > MaxArgon2idMemoryKiB {
+		return fmt.Errorf("crypto: argon2id memory %d KiB exceeds the %d KiB (2 GiB) bound (tampered manifest?)",
+			params.Memory, MaxArgon2idMemoryKiB)
+	}
+	if params.Iterations == 0 {
+		return errors.New("crypto: argon2id iterations is zero")
+	}
+	if params.Iterations > MaxArgon2idIterations {
+		return fmt.Errorf("crypto: argon2id iterations %d exceeds the %d bound (tampered manifest?)",
+			params.Iterations, MaxArgon2idIterations)
+	}
+	if params.Parallelism == 0 {
+		return errors.New("crypto: argon2id parallelism is zero")
+	}
+	if params.Parallelism > MaxArgon2idParallelism {
+		return fmt.Errorf("crypto: argon2id parallelism %d exceeds the %d bound (tampered manifest?)",
+			params.Parallelism, MaxArgon2idParallelism)
+	}
+	if params.KeyLen != KEKLen {
+		return fmt.Errorf("crypto: argon2id key_len %d does not match KEKLen %d", params.KeyLen, KEKLen)
+	}
+	return nil
+}
+
 // EnvelopeEncryption abstracts CEK wrap/unwrap so Phase 6.1's
 // passphrase mode and Phase 6.2/6.3's KMS modes plug into the same
 // chunk writer/reader. Implementations are responsible for any caching
@@ -184,7 +251,11 @@ type PassphraseEnvelope struct {
 // NewPassphraseEnvelope constructs a PassphraseEnvelope by deriving the
 // KEK from passphrase + params.Salt via Argon2id. Returns an error if
 // passphrase is empty or params are malformed (zero salt, zero
-// memory/iterations/parallelism, key length mismatch).
+// memory/iterations/parallelism, key length mismatch) — or exceed the
+// untrusted-manifest ceilings (Max* consts above): restore-side callers
+// feed manifest-recorded params straight in, so this constructor is the
+// single chokepoint where a KDF-param bomb must be refused before
+// argon2.IDKey runs.
 //
 // The derivation runs eagerly — at NewPassphraseEnvelope time, not at
 // first Wrap/Unwrap — so a typo passphrase fails before the chain
@@ -195,20 +266,8 @@ func NewPassphraseEnvelope(passphrase string, params Argon2idParams) (*Passphras
 	if passphrase == "" {
 		return nil, errors.New("crypto: passphrase is empty")
 	}
-	if len(params.Salt) == 0 {
-		return nil, errors.New("crypto: argon2id salt is empty")
-	}
-	if params.Memory == 0 {
-		return nil, errors.New("crypto: argon2id memory is zero")
-	}
-	if params.Iterations == 0 {
-		return nil, errors.New("crypto: argon2id iterations is zero")
-	}
-	if params.Parallelism == 0 {
-		return nil, errors.New("crypto: argon2id parallelism is zero")
-	}
-	if params.KeyLen != KEKLen {
-		return nil, fmt.Errorf("crypto: argon2id key_len %d does not match KEKLen %d", params.KeyLen, KEKLen)
+	if err := validateArgon2idParams(params); err != nil {
+		return nil, err
 	}
 	kek := argon2.IDKey(
 		[]byte(passphrase),

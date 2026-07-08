@@ -149,6 +149,78 @@ func TestPassphraseEnvelope_BadParams(t *testing.T) {
 	}
 }
 
+// TestArgon2idParams_UntrustedManifestBounds pins the audit N-7 clamp:
+// Argon2id params arrive VERBATIM from a backup manifest and hit
+// argon2.IDKey before any authentication, so each bound must refuse
+// loudly (naming the param, value, and bound) while the at-bound value
+// still passes. The at-bound cases go through validateArgon2idParams
+// directly — deliberately not NewPassphraseEnvelope — so the memory
+// boundary (2 GiB) is pinned without allocating 2 GiB in a unit test;
+// the over-bound cases go through the real constructor to prove the
+// refusal fires before the derivation.
+func TestArgon2idParams_UntrustedManifestBounds(t *testing.T) {
+	base := func() Argon2idParams {
+		return Argon2idParams{
+			Salt:        []byte("abcdefghijklmnop"),
+			Memory:      1024,
+			Iterations:  1,
+			Parallelism: 1,
+			KeyLen:      KEKLen,
+		}
+	}
+
+	t.Run("at-bound values pass validation", func(t *testing.T) {
+		cases := []struct {
+			name   string
+			mutate func(*Argon2idParams)
+		}{
+			{"memory at 2 GiB", func(p *Argon2idParams) { p.Memory = MaxArgon2idMemoryKiB }},
+			{"iterations at bound", func(p *Argon2idParams) { p.Iterations = MaxArgon2idIterations }},
+			{"parallelism at bound", func(p *Argon2idParams) { p.Parallelism = MaxArgon2idParallelism; p.Memory = 8 * MaxArgon2idParallelism }},
+			{"salt at bound", func(p *Argon2idParams) { p.Salt = make([]byte, MaxArgon2idSaltLen) }},
+		}
+		for _, tc := range cases {
+			tc := tc
+			t.Run(tc.name, func(t *testing.T) {
+				p := base()
+				tc.mutate(&p)
+				if err := validateArgon2idParams(p); err != nil {
+					t.Fatalf("at-bound params refused: %v", err)
+				}
+			})
+		}
+	})
+
+	t.Run("over-bound values refuse via the constructor", func(t *testing.T) {
+		cases := []struct {
+			name    string
+			mutate  func(*Argon2idParams)
+			wantSub string
+		}{
+			// The headline bomb: memory_kib maxed out asks for ~4 TiB.
+			{"memory bomb", func(p *Argon2idParams) { p.Memory = 4294967295 }, "memory 4294967295 KiB exceeds"},
+			{"memory one over bound", func(p *Argon2idParams) { p.Memory = MaxArgon2idMemoryKiB + 1 }, "memory"},
+			{"iterations bomb", func(p *Argon2idParams) { p.Iterations = MaxArgon2idIterations + 1 }, "iterations 65 exceeds"},
+			{"parallelism over bound", func(p *Argon2idParams) { p.Parallelism = MaxArgon2idParallelism + 1 }, "parallelism 33 exceeds"},
+			{"oversized salt", func(p *Argon2idParams) { p.Salt = make([]byte, MaxArgon2idSaltLen+1) }, "salt length 1025 exceeds"},
+		}
+		for _, tc := range cases {
+			tc := tc
+			t.Run(tc.name, func(t *testing.T) {
+				p := base()
+				tc.mutate(&p)
+				_, err := NewPassphraseEnvelope("pass", p)
+				if err == nil {
+					t.Fatal("over-bound params accepted; the pre-auth KDF-bomb clamp is gone")
+				}
+				if !strings.Contains(err.Error(), tc.wantSub) {
+					t.Errorf("error %q missing substring %q (must name the param + value + bound)", err.Error(), tc.wantSub)
+				}
+			})
+		}
+	})
+}
+
 func TestArgon2idParams_Determinism(t *testing.T) {
 	// Same passphrase + same salt + same params → same KEK.
 	params := Argon2idParams{
