@@ -14,7 +14,7 @@
 //
 // It deliberately does NOT own the pieces whose SEMANTICS diverge — most
 // importantly the snapshot→CDC handoff ANCHOR: pgtrigger's contiguous-committed-
-// prefix + xmin safety-lag anchor vs sqlite-trigger's single-writer MAX(id)
+// prefix + txid safety-lag anchor vs sqlite-trigger's single-writer MAX(id)
 // anchor are different correctness arguments (ADR-0135 §4 vs the Bug-94 formula);
 // merging them would be a silent-loss regression, so they stay in their engines.
 // Likewise the setup DDL, the poll SQL, and the value-image decode are dialect
@@ -39,7 +39,7 @@ import (
 type Pos struct {
 	// LastID is the change-log id of the last successfully-applied change. The
 	// polling reader resumes by scanning rows with id > LastID (each engine
-	// layers its own gap-freedom predicate on top: PG's xmin safety-lag, SQLite's
+	// layers its own gap-freedom predicate on top: PG's txid safety-lag, SQLite's
 	// single-writer total order).
 	LastID int64 `json:"last_id"`
 }

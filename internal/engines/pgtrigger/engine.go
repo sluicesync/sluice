@@ -22,7 +22,7 @@
 //   - [Setup] / [Teardown] for the `sluice trigger setup/teardown` CLI
 //     to call (§10).
 //   - A polling [CDCReader] (§2, §6) that scans `sluice_change_log`
-//     using the §2 xmin safety-lag query.
+//     using the §2 txid safety-lag query.
 //   - Refuse-loudly preflights for the §14 boundaries.
 //   - Same-engine `postgres-trigger → postgres-trigger` bulk-copy + CDC.
 //

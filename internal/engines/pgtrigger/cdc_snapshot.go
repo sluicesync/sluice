@@ -130,7 +130,7 @@ func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.Snapsho
 
 	// Changes: the trigger poller, resuming from the anchor. It opens
 	// its OWN *sql.DB pool and NEVER creates or uses a replication slot
-	// (it scans sluice_change_log via the §2 xmin safety-lag predicate).
+	// (it scans sluice_change_log via the §2 txid safety-lag predicate).
 	cdcReader, err := openCDCReader(ctx, dsn, e.appID)
 	if err != nil {
 		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")

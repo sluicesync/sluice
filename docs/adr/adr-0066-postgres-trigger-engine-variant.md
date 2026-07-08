@@ -11,6 +11,12 @@ applier inherits its replay tolerance directly) and ADR-0007 (position-
 and-data atomicity — the polling reader's "watermark" is a `Position` in
 the same shape every other engine uses).
 
+### Implementation notes (drift from this spec)
+
+- **The §2/§6 safety-lag predicate and the Bug-94 snapshot anchor compare the `txid` column, not the row's system `xmin` (2026-07-08).** This ADR's concrete SQL sketch (`xmin < pg_snapshot_xmin(pg_current_snapshot())`) compares the on-row 32-bit epoch-less `xid` against a 64-bit epoch-carrying `xid8`; once the cluster's lifetime txid count crosses 2^32 that predicate is always true — in-flight rows are no longer held back and the overlap-commit gap reopens silently — and the anchor's `>=` arm never matches, degrading to `MAX(id)` (the Bug-94 cold-start gap). The shipped queries compare the trigger-recorded `txid` column (`pg_current_xact_id()::text::bigint`, xid8 domain on both sides) — which is what §2's own `txid` rationale ("the safety-lag query above reads it") intended. Live-verified on a `pg_resetwal -e 5` epoch-bumped PG 16; pinned by `TestCDCReader_XIDEpochBump`.
+- **The version floor is PG 13, not 9.4.** §14's floor was written for JSONB (9.4), but the capture trigger records `pg_current_xact_id()` and the poller calls `pg_current_snapshot()` — both PG 13+ and both present since the engine's first release. Setup's preflight refuses `version_num < 130000` (a PG 12 source would otherwise pass setup and then fail every write to every triggered table at first DML).
+- **The anchor's gap-freedom claim in §2's sketch is narrower than written (known residual hole, epoch-independent).** A still-uncommitted transaction's change-log row is invisible to the anchor query (MVCC), so the `MIN(id) − 1` arm cannot anchor below an in-flight txn's already-allocated id when that id is lower than every *visible* not-yet-settled row. Live-confirmed on PG 16 (epoch 0). Closing it needs the snapshot's `pg_snapshot_xip` set plus a wait-for-settle at handoff (the same wait slot-based `CREATE_REPLICATION_SLOT` performs); tracked as a follow-up, deliberately not bundled with the xid8-domain fix. See the `readChangeLogAnchor` doc comment.
+
 ## Context
 
 The existing `postgres` engine consumes change events via PG's logical

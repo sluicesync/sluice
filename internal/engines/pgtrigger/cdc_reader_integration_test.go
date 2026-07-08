@@ -6,7 +6,7 @@
 // Same-engine integration test for the postgres-trigger CDC reader.
 // Boots a PG container (or attaches to one), runs Setup against the
 // shared schema, exercises INSERT / UPDATE / DELETE + JSONB-numeric
-// round-trip + xmin safety-lag correctness, asserts the reader emits
+// round-trip + txid safety-lag correctness, asserts the reader emits
 // the expected ir.Change events.
 
 package pgtrigger
@@ -221,7 +221,7 @@ func TestCDCReader_BasicChangeStream(t *testing.T) {
 // correctness pin. Two transactions overlap: tx-A allocates id=N,
 // tx-B allocates id=N+1, tx-B commits FIRST, tx-A commits SECOND.
 // A naive reader observing id=N+1 before id=N is durable would skip
-// id=N forever — the xmin safety-lag query holds back id=N+1 until
+// id=N forever — the txid safety-lag query holds back id=N+1 until
 // tx-A is also visible.
 //
 // The test uses two concurrent connections so the overlap is real
@@ -258,7 +258,7 @@ func TestCDCReader_SafetyLag_OverlappingTxns(t *testing.T) {
 	// Two overlapping txns. txA opens first (allocating id=1 in the
 	// change-log via the trigger), txB opens second (allocating
 	// id=2), txB commits FIRST, txA commits SECOND. A reader that
-	// doesn't apply the xmin safety-lag would see id=2 land before
+	// doesn't apply the txid safety-lag would see id=2 land before
 	// id=1 in pg_class but skip id=1 forever.
 	dbA, err := sql.Open("pgx", dsn)
 	if err != nil {
@@ -298,7 +298,7 @@ func TestCDCReader_SafetyLag_OverlappingTxns(t *testing.T) {
 	}
 	// Hold A open briefly so the reader has a chance to poll
 	// without A's row visible. The safety-lag predicate should
-	// keep B's row OUT of the first poll because B's xmin is
+	// keep B's row OUT of the first poll because B's txid is
 	// still >= the snapshot's xmin (A is in-flight).
 	time.Sleep(2 * time.Second)
 	if err := txA.Commit(); err != nil {

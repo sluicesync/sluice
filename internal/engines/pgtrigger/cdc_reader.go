@@ -210,7 +210,7 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 }
 
 // pump is the polling-loop body. ADR-0066 §2 / §6: each iteration
-// runs the safety-lag query (`xmin < pg_snapshot_xmin(...)`) plus
+// runs the safety-lag query (`txid < pg_snapshot_xmin(...)`) plus
 // `id > $lastSeen` to fetch the next batch in commit-safe id order.
 // When a poll returns exactly batchSize rows the next poll fires
 // immediately so the back-pressure pull saturates against bursty
@@ -262,28 +262,50 @@ func (r *CDCReader) pump(ctx context.Context, startID int64, out chan<- ir.Chang
 	}
 }
 
-// poll runs one safety-lag-bounded fetch. Returns the events, the
-// new high-water id, and (when non-empty) the human-readable DDL
-// command tag that fired a refuse-loudly path. A zero-row, zero-DDL
-// return is the steady-state "nothing new" shape.
-func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (events []ir.Change, newLast int64, ddl string, err error) {
-	// §2 safety-lag query: `xmin < pg_snapshot_xmin(pg_current_snapshot())`
-	// holds back any row whose allocating txid is still in-flight.
-	// Without this an overlapping txn that allocated id=5 but
-	// committed AFTER id=6 would be skipped by a reader that
-	// observed id=6 first.
-	//
-	// `xmin::text::bigint` is the standard portable shape: PG 12's
-	// xmin is xid (32-bit, wraparound); the JSON Number we'd surface
-	// later would lose precision on the 32-bit edge. Cast to text →
-	// bigint to keep the comparison stable across PG versions.
-	tableRef := quoteIdent(r.schema) + "." + quoteIdent(ChangeLogTable)
-	q := "SELECT id, txid, EXTRACT(epoch FROM committed_at)::bigint, schema_name, table_name, op, " +
+// pollQuery renders the one-poll fetch with the §2 safety-lag
+// hold-back: `txid < pg_snapshot_xmin(pg_current_snapshot())` holds
+// back any row whose allocating transaction is still in-flight.
+// Without it an overlapping txn that allocated id=5 but committed
+// AFTER id=6 would be skipped forever by a reader that observed id=6
+// first (the watermark advances past 5 before 5 becomes visible).
+//
+// BOTH sides of the hold-back comparison live in the 64-bit
+// epoch-carrying xid8 domain: `txid` is the allocating transaction's
+// `pg_current_xact_id()::text::bigint`, recorded by the capture
+// trigger at insert time (ADR-0066 §2 — the column exists precisely so
+// this query can read it, and it has been NOT NULL since the engine's
+// first release, so there are no legacy rows to special-case), and the
+// right side is the poll snapshot's xmin through the same cast. The
+// text → bigint cast keeps both values on the driver's int64 path (a
+// JSON-number float64 would lose precision above 2^53).
+//
+// The row's system `xmin` column MUST NOT be used on the left side:
+// xmin is the 32-bit epoch-LESS xid, while pg_snapshot_xmin() is
+// epoch-carrying, so once the cluster's lifetime txid count crosses
+// 2^32 (routine on long-lived busy PG) the cross-domain comparison is
+// ALWAYS true and the hold-back silently stops — reopening the
+// overlap-commit gap this predicate exists to prevent. That regression
+// shipped (the original implementation compared `xmin::text::bigint`;
+// live-confirmed on a pg_resetwal-epoch-bumped PG 16, 2026-07-08).
+// Pinned by TestPollQuery_ComparesInXID8Domain and
+// TestCDCReader_XIDEpochBump.
+func pollQuery(tableRef string) string {
+	return "SELECT id, txid, EXTRACT(epoch FROM committed_at)::bigint, schema_name, table_name, op, " +
 		"pk_jsonb::text, before_jsonb::text, after_jsonb::text " +
 		"FROM " + tableRef + " " +
 		"WHERE id > $1 " +
-		"  AND xmin::text::bigint < pg_snapshot_xmin(pg_current_snapshot())::text::bigint " +
+		"  AND txid < pg_snapshot_xmin(pg_current_snapshot())::text::bigint " +
 		"ORDER BY id ASC LIMIT $2"
+}
+
+// poll runs one safety-lag-bounded fetch (see [pollQuery] for the
+// hold-back predicate and its xid8-domain rationale). Returns the
+// events, the new high-water id, and (when non-empty) the
+// human-readable DDL command tag that fired a refuse-loudly path. A
+// zero-row, zero-DDL return is the steady-state "nothing new" shape.
+func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (events []ir.Change, newLast int64, ddl string, err error) {
+	tableRef := quoteIdent(r.schema) + "." + quoteIdent(ChangeLogTable)
+	q := pollQuery(tableRef)
 	//nolint:rowserrcheck,sqlclosecheck // closed via defer below; linter can't track the early-return path
 	rows, qErr := r.db.QueryContext(ctx, q, lastSeen, r.batchSize)
 	if qErr != nil {
@@ -389,10 +411,12 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (events []ir.Chang
 			return nil, lastSeen, "", fmt.Errorf("unknown op %q at id=%d", op, id)
 		}
 		// txid is scanned (the SELECT projects it for schema-shape
-		// stability with the trigger's audit table) but not yet consumed:
-		// ordering uses the bigserial id alone. It becomes load-bearing
-		// if/when transactional batching lands. committed is consumed
-		// above as the sync-lag commit timestamp (roadmap item 45).
+		// stability with the trigger's audit table) but not consumed in
+		// Go: ordering uses the bigserial id alone, and the safety-lag
+		// hold-back consumes txid inside the SQL WHERE (see [pollQuery]).
+		// It becomes load-bearing in Go if/when transactional batching
+		// lands. committed is consumed above as the sync-lag commit
+		// timestamp (roadmap item 45).
 		_ = txid
 	}
 	if err := rows.Err(); err != nil {
@@ -524,9 +548,28 @@ type anchorQuerier interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-// readChangeLogAnchor computes the CDC handoff anchor as the CONTIGUOUS
-// COMMITTED-PREFIX high-water of the capture log. This is the
-// load-bearing correctness point of the snapshot→CDC handoff (Bug 94).
+// anchorQuery renders the CDC-handoff anchor computation (semantics in
+// [readChangeLogAnchor]). The `txid >=` arm must compare in the 64-bit
+// epoch-carrying xid8 domain for the same reason as [pollQuery]: with
+// the row's 32-bit epoch-less `xmin` on the left, the comparison
+// against pg_snapshot_xmin() is false for EVERY row once the cluster's
+// lifetime txid count crosses 2^32, the arm never matches, and
+// COALESCE silently falls through to MAX(id) — the exact too-high
+// anchor Bug 94 exists to prevent. Pinned by
+// TestAnchorQuery_ComparesInXID8Domain and TestCDCReader_XIDEpochBump.
+func anchorQuery(tableRef string) string {
+	return `
+SELECT COALESCE(
+  (SELECT MIN(id) - 1 FROM ` + tableRef + `
+     WHERE txid >= pg_snapshot_xmin(pg_current_snapshot())::text::bigint),
+  (SELECT COALESCE(MAX(id), 0) FROM ` + tableRef + `)
+)`
+}
+
+// readChangeLogAnchor computes the CDC handoff anchor: the highest
+// change-log id we can prove is committed AND inside the reading
+// transaction's snapshot. This is the load-bearing correctness point
+// of the snapshot→CDC handoff (Bug 94).
 //
 // Why not MAX(id): the BIGSERIAL `id` is allocated at INSERT time but
 // is NOT commit-ordered. A transaction can allocate a LOW id and commit
@@ -536,49 +579,42 @@ type anchorQuerier interface {
 // CDC (which replays `id > anchor`) skips the low id forever once it
 // commits. Silent data loss is FORBIDDEN under the loud-failure tenet.
 //
-// The anchor is instead "(first not-yet-safe id) − 1, else MAX(id) when
-// nothing is in-flight":
+// The anchor is instead "(first not-provably-settled id) − 1, else
+// MAX(id)" — see [anchorQuery] for the SQL. `txid >=
+// pg_snapshot_xmin(current)` selects visible rows whose allocating
+// transaction is NOT definitely-finished-before-our-snapshot — the
+// rows the [pollQuery] steady-state hold-back would currently keep
+// back. Anchoring below the FIRST such id means CDC replays all of
+// them. Over-replay (anchor too LOW) is SAFE: the applier is
+// idempotent (ADR-0010), so an event whose row is ALSO in the
+// bulk-copy snapshot just re-applies to the same value. A GAP (anchor
+// too HIGH) is silent loss and is forbidden.
 //
-//	SELECT COALESCE(
-//	  (SELECT MIN(id) - 1 FROM <schema>.sluice_change_log
-//	     WHERE xmin::text::bigint >= pg_snapshot_xmin(pg_current_snapshot())::text::bigint),
-//	  (SELECT COALESCE(MAX(id), 0) FROM <schema>.sluice_change_log)
-//	)
+// Worked example: committed id=6 whose txid is ≥ the snapshot's xmin
+// (an older transaction was still running when it committed). The arm
+// selects id=6 ⇒ anchor = 5 ⇒ CDC replays id=6 — a harmless
+// idempotent re-apply — plus everything later, instead of trusting a
+// MAX(id) that a not-yet-visible lower id may be hiding behind.
 //
-// `xmin >= pg_snapshot_xmin(current)` selects rows whose allocating txid
-// is NOT yet definitely-committed-old relative to the reading
-// transaction's snapshot — i.e. the rows the §2 steady-state safety-lag
-// predicate (`xmin < pg_snapshot_xmin`) would currently hold back. The
-// FIRST such id minus one is the highest id we can prove is committed
-// AND in our REPEATABLE READ snapshot. Everything ≤ anchor is
-// committed-old (in the snapshot, copied by Rows); everything > anchor
-// is replayed by CDC.
-//
-// Over-replay (anchor too LOW) is SAFE: the applier is idempotent
-// (ADR-0010), so an event whose row is ALSO in the bulk-copy snapshot
-// just re-applies to the same value. A GAP (anchor too HIGH) is silent
-// loss and is forbidden. When in doubt the formula anchors LOWER (it
-// subtracts one from the first in-flight id rather than trusting MAX).
-//
-// Worked example (the one the task asks be pinned in a comment):
-// in-flight id=5 (its txid still ≥ snapshot xmin) + committed id=6.
-// MIN(id) WHERE in-flight = 5 ⇒ anchor = 5 − 1 = 4. CDC replays id > 4,
-// i.e. BOTH 5 and 6. id=6 is also in the REPEATABLE READ snapshot and
-// thus already bulk-copied, but the idempotent applier makes the
-// re-apply a no-op. id=5 commits and is replayed by CDC. No gap. A
-// MAX(id)=6 anchor would have skipped id=5 forever once it committed —
-// the silent-loss bug this formula exists to prevent.
+// KNOWN RESIDUAL HOLE — the invisible in-flight low-id window
+// (pre-existing since the Bug-94 fix, epoch-independent;
+// live-confirmed on PG 16, 2026-07-08): a change-log row INSERTed by
+// a transaction still uncommitted when this query runs is INVISIBLE
+// to it (MVCC), so the MIN arm cannot see — and therefore cannot
+// anchor below — an in-flight txn's already-allocated id when that id
+// is LOWER than every visible not-yet-settled row. Concretely: A
+// inserts change-log id=1 and stays open; B inserts id=2 and commits;
+// the query computes MIN(2)−1 = 1, but the gap-free anchor is 0 (A's
+// id=1 is in neither the bulk-copy snapshot nor `id > 1`). Closing it
+// needs handoff-time knowledge of the snapshot's in-progress xid set
+// (pg_snapshot_xip + a wait-for-settle on the CDC pool — the same
+// wait a slot-based CREATE_REPLICATION_SLOT performs); that is a
+// follow-up, deliberately NOT bundled into the xid8-domain fix.
 //
 // q MUST be the same connection/transaction the snapshot Rows read on,
 // so `pg_current_snapshot()` reflects the snapshot the bulk copy sees.
 func readChangeLogAnchor(ctx context.Context, q anchorQuerier, schema string) (int64, error) {
-	tableRef := quoteIdent(schema) + "." + quoteIdent(ChangeLogTable)
-	query := `
-SELECT COALESCE(
-  (SELECT MIN(id) - 1 FROM ` + tableRef + `
-     WHERE xmin::text::bigint >= pg_snapshot_xmin(pg_current_snapshot())::text::bigint),
-  (SELECT COALESCE(MAX(id), 0) FROM ` + tableRef + `)
-)`
+	query := anchorQuery(quoteIdent(schema) + "." + quoteIdent(ChangeLogTable))
 	var anchor int64
 	if err := q.QueryRowContext(ctx, query).Scan(&anchor); err != nil {
 		return 0, err

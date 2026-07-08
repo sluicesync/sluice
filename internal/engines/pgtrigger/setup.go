@@ -233,16 +233,25 @@ func Setup(ctx context.Context, dsn string, opts SetupOptions) (*Plan, error) {
 		return nil, fmt.Errorf("pgtrigger: setup: ping: %w", err)
 	}
 
-	// Refuse loudly on PG < 9.4 (JSONB unavailable, §14).
+	// Refuse loudly on PG < 13. The §14 floor was written as 9.4
+	// (JSONB), but the engine has REQUIRED PG 13 since its first
+	// release: the capture trigger records pg_current_xact_id() (the
+	// 64-bit epoch-carrying xid8 the safety-lag hold-back compares in —
+	// see pollQuery) and the poller calls pg_current_snapshot() /
+	// pg_snapshot_xmin() — all PG 13+. Refusing here replaces the
+	// catastrophic late failure a PG 12 source would otherwise hit:
+	// Setup succeeds (plpgsql bodies are only syntax-checked at CREATE
+	// time) and then EVERY write to EVERY triggered table fails at its
+	// first DML — a source-wide write outage, not a setup error.
 	pgver, err := readPGVersionNum(ctx, db)
 	if err != nil {
 		return nil, fmt.Errorf("pgtrigger: setup: read PG version: %w", err)
 	}
-	if pgver < 90400 {
+	if pgver < 130000 {
 		return nil, fmt.Errorf(
-			"pgtrigger: setup: source PG version_num = %d (< 9.4); the trigger engine requires JSONB — %s",
+			"pgtrigger: setup: source PG version_num = %d (< 13); the trigger engine requires PG 13+ (pg_current_xact_id / pg_current_snapshot for the gap-free safety lag) — %s",
 			pgver,
-			"upgrade the source server to PG 9.4 or later",
+			"upgrade the source server to PG 13 or later, or use the slot-based `postgres` engine if the source tier allows replication slots",
 		)
 	}
 
@@ -433,8 +442,8 @@ func renderSetupDDL(schema string, tables []string, canEventTrigger bool, payloa
 		// Drop any pre-existing trigger with the canonical name so
 		// re-running Setup with a different PK list refreshes the
 		// TG_ARGV payload. PG does not have CREATE OR REPLACE TRIGGER
-		// on row triggers (it does on PG 14+, but we target 9.4+); a
-		// DROP IF EXISTS + CREATE is the portable shape.
+		// on row triggers (it does on PG 14+, but the engine's floor
+		// is PG 13); a DROP IF EXISTS + CREATE is the portable shape.
 		fqTable := quoteIdent(schema) + "." + quoteIdent(t)
 		out = append(
 			out,
