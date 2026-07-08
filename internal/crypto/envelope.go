@@ -212,6 +212,18 @@ func validateArgon2idParams(params Argon2idParams) error {
 // chunk writer/reader. Implementations are responsible for any caching
 // (e.g. passphrase mode caches the derived KEK after first use; KMS
 // mode caches the unwrapped CEK after first KMS Decrypt call).
+//
+// Optional companion surfaces (audit N-8/N-9, ADR-0152):
+//
+//   - [BoundEnvelope] — wrap/unwrap with an authenticated binding
+//     string (KMS EncryptionContext / GCM AAD) so a wrapped CEK only
+//     unwraps for the backup it was wrapped for.
+//   - [ChainKEKRebinder] — retarget unwrap at the exact KEK version a
+//     manifest recorded (Azure Key Vault, whose key-wrap ciphertext
+//     carries no version metadata).
+//   - [ResolvedKEKReferencer] — report the exact KEK reference a wrap
+//     actually used (again Azure: the version-pinned key URL) so the
+//     manifest records something unwrap can be retargeted at later.
 type EnvelopeEncryption interface {
 	// WrapCEK encrypts cek with the implementation's KEK and returns
 	// the wrapped (opaque) bytes that should be recorded in the
@@ -230,6 +242,65 @@ type EnvelopeEncryption interface {
 	// inspecting an encrypted manifest see this value; restore-side
 	// validation matches it against the supplied envelope's Mode().
 	Mode() string
+}
+
+// BoundEnvelope is the optional [EnvelopeEncryption] extension for
+// implementations whose wrap primitive can authenticate an additional
+// binding string: AWS KMS EncryptionContext, GCP KMS AAD, and the
+// passphrase mode's own AES-GCM wrap AAD. Binding a chain CEK's wrap
+// to the identity of the manifest that records it means a wrapped CEK
+// lifted from one backup refuses to unwrap when presented inside
+// another (audit N-8) — and, on the KMS modes, the binding lands in
+// the provider's audit log (CloudTrail / Cloud Audit Logs) and is
+// enforceable by key policy.
+//
+// The binding string must be byte-identical on wrap and unwrap; the
+// orchestrator derives it deterministically from the owning manifest
+// ([backup.CEKBinding]) and gates its use on the manifest's recorded
+// FormatVersion — never guessed. Azure Key Vault's WrapKey/UnwrapKey
+// API has no context/AAD parameter for the RSA wrap algorithms sluice
+// defaults to, so AzureKMSEnvelope deliberately does NOT implement
+// this interface (its compensating controls are the version-pinned
+// KEK reference + the chunk-level GCM AAD; see ADR-0152).
+type BoundEnvelope interface {
+	EnvelopeEncryption
+
+	// WrapCEKBound is WrapCEK with an authenticated binding string.
+	WrapCEKBound(cek []byte, binding string) ([]byte, error)
+
+	// UnwrapCEKBound is the inverse of WrapCEKBound. The unwrap fails
+	// when binding differs from the wrap-time value.
+	UnwrapCEKBound(wrapped []byte, binding string) ([]byte, error)
+}
+
+// ChainKEKRebinder is the optional [EnvelopeEncryption] extension for
+// implementations whose unwrap must be retargeted at the exact KEK
+// reference a manifest recorded. Today that is Azure Key Vault only:
+// AWS KMS and GCP KMS ciphertexts carry their own key(-version)
+// metadata, but Azure key-wrap ciphertext does not — an unwrap against
+// an unversioned key URL always targets the LATEST version, which
+// breaks restores of older chains once key auto-rotation is enabled
+// (audit N-9). Callers holding a chain's recorded
+// [backup.ChainEncryption.KEKRef] invoke this before unwrapping.
+//
+// Implementations must treat a mismatched or unparseable recorded ref
+// as advisory (WARN and keep the current target — the unwrap then
+// fails loudly if the target is wrong), never as a hard error: the
+// recorded ref comes from an unauthenticated manifest.
+type ChainKEKRebinder interface {
+	RebindChainKEKRef(recordedRef string)
+}
+
+// ResolvedKEKReferencer is the optional [EnvelopeEncryption] extension
+// for implementations whose effective KEK reference is more precise
+// than what the operator supplied — Azure Key Vault resolving an
+// unversioned key URL to the exact version it wraps under. The
+// orchestrator records the resolved reference in
+// [backup.ChainEncryption.KEKRef] so a later unwrap (via
+// [ChainKEKRebinder]) targets the wrap-time version even after key
+// rotation. Returns "" when no more-precise reference is known.
+type ResolvedKEKReferencer interface {
+	ResolvedKEKRef() string
 }
 
 // PassphraseEnvelope is the Phase 6.1 implementation of
@@ -293,17 +364,32 @@ func (e *PassphraseEnvelope) Params() Argon2idParams { return e.params }
 // caller records in the manifest's [backup.ChainEncryption.WrappedCEK] (or
 // [backup.ChunkEncryption.WrappedCEK] for per-chunk mode).
 func (e *PassphraseEnvelope) WrapCEK(cek []byte) ([]byte, error) {
-	if len(cek) != CEKLen {
-		return nil, fmt.Errorf("crypto: wrap cek length %d != %d", len(cek), CEKLen)
-	}
-	return EncryptChunk(cek, e.kek)
+	return e.WrapCEKBound(cek, "")
 }
 
 // UnwrapCEK is the inverse of WrapCEK. Returns an error if the wrapped
 // bytes were produced by a different KEK (wrong passphrase) or
 // tampered with (auth-tag mismatch).
 func (e *PassphraseEnvelope) UnwrapCEK(wrapped []byte) ([]byte, error) {
-	cek, err := DecryptChunk(wrapped, e.kek)
+	return e.UnwrapCEKBound(wrapped, "")
+}
+
+// WrapCEKBound implements [BoundEnvelope]: the binding string rides as
+// GCM AAD on the CEK wrap, so the wrap only opens with the identical
+// binding. Empty binding is the legacy unbound wrap (byte-identical to
+// pre-ADR-0152 output).
+func (e *PassphraseEnvelope) WrapCEKBound(cek []byte, binding string) ([]byte, error) {
+	if len(cek) != CEKLen {
+		return nil, fmt.Errorf("crypto: wrap cek length %d != %d", len(cek), CEKLen)
+	}
+	return EncryptChunkWithAAD(cek, e.kek, bindingAAD(binding))
+}
+
+// UnwrapCEKBound implements [BoundEnvelope]. Fails when the binding
+// differs from the wrap-time value (or the passphrase is wrong — GCM
+// cannot distinguish the two).
+func (e *PassphraseEnvelope) UnwrapCEKBound(wrapped []byte, binding string) ([]byte, error) {
+	cek, err := DecryptChunkWithAAD(wrapped, e.kek, bindingAAD(binding))
 	if err != nil {
 		return nil, fmt.Errorf("crypto: unwrap cek: %w", err)
 	}
@@ -311,6 +397,17 @@ func (e *PassphraseEnvelope) UnwrapCEK(wrapped []byte) ([]byte, error) {
 		return nil, fmt.Errorf("crypto: unwrapped cek length %d != %d", len(cek), CEKLen)
 	}
 	return cek, nil
+}
+
+// bindingAAD maps a binding string to the AAD argument of the GCM
+// helpers: "" → nil (the legacy unbound shape), anything else → its
+// bytes. Shared by the passphrase wrap so "no binding" and "empty
+// binding" cannot drift into distinct ciphertext classes.
+func bindingAAD(binding string) []byte {
+	if binding == "" {
+		return nil
+	}
+	return []byte(binding)
 }
 
 // GenerateCEK returns a fresh 32-byte random Content Encryption Key
@@ -331,7 +428,23 @@ func GenerateCEK() ([]byte, error) {
 // The composed shape is what the chunk writer hands to
 // [backup.Store.Put]; the chunk reader splits it back into
 // nonce + ciphertext on the way out.
+//
+// No AAD — the pre-ADR-0152 (pre-FormatVersion-5) chunk shape,
+// preserved byte-identical for old chains and for the CEK wraps.
+// New-format chunks go through [EncryptChunkWithAAD].
 func EncryptChunk(plaintext, cek []byte) ([]byte, error) {
+	return EncryptChunkWithAAD(plaintext, cek, nil)
+}
+
+// EncryptChunkWithAAD is [EncryptChunk] with additional authenticated
+// data: aad is authenticated by the GCM tag but not encrypted or
+// stored, so decryption succeeds only when the decryptor supplies the
+// identical aad. The backup writer binds each chunk to its position
+// ([backup.ChunkAAD] — manifest identity + chunk path), which is what
+// makes a chunk spliced to a different position / backup fail loudly
+// instead of decrypting cleanly (audit N-8). nil aad is the legacy
+// unbound shape.
+func EncryptChunkWithAAD(plaintext, cek, aad []byte) ([]byte, error) {
 	if len(cek) != CEKLen {
 		return nil, fmt.Errorf("crypto: encrypt cek length %d != %d", len(cek), CEKLen)
 	}
@@ -350,7 +463,7 @@ func EncryptChunk(plaintext, cek []byte) ([]byte, error) {
 	// gcm.Seal appends ciphertext+tag onto the destination; passing
 	// nonce as both prefix and the nonce arg gives us
 	// `[nonce | ciphertext | authtag]` in one allocation.
-	ct := gcm.Seal(nonce, nonce, plaintext, nil)
+	ct := gcm.Seal(nonce, nonce, plaintext, aad)
 	return ct, nil
 }
 
@@ -359,7 +472,21 @@ func EncryptChunk(plaintext, cek []byte) ([]byte, error) {
 // plaintext on success. Returns an error if the input is too short to
 // contain a valid envelope or if the auth-tag check fails (wrong CEK
 // or tampered ciphertext).
+//
+// No AAD — the read path for pre-FormatVersion-5 chunks and CEK
+// unwraps. The caller decides which path a chunk takes from its
+// manifest's RECORDED FormatVersion (via [backup.ChunkAAD]) — never by
+// trying both.
 func DecryptChunk(ciphertext, cek []byte) ([]byte, error) {
+	return DecryptChunkWithAAD(ciphertext, cek, nil)
+}
+
+// DecryptChunkWithAAD is the inverse of [EncryptChunkWithAAD]. The
+// auth-tag check fails — and the chunk is refused — when aad differs
+// from the encryption-time value, when the CEK is wrong, or when the
+// ciphertext was tampered with; GCM cannot distinguish the three, so
+// the error names all of them when an aad is in play.
+func DecryptChunkWithAAD(ciphertext, cek, aad []byte) ([]byte, error) {
 	if len(cek) != CEKLen {
 		return nil, fmt.Errorf("crypto: decrypt cek length %d != %d", len(cek), CEKLen)
 	}
@@ -376,11 +503,14 @@ func DecryptChunk(ciphertext, cek []byte) ([]byte, error) {
 	}
 	nonce := ciphertext[:NonceLen]
 	ct := ciphertext[NonceLen:]
-	pt, err := gcm.Open(nil, nonce, ct, nil)
+	pt, err := gcm.Open(nil, nonce, ct, aad)
 	if err != nil {
 		// AES-GCM Open returns an opaque error on auth-tag failure;
 		// wrap with operator-actionable context. Distinct from
 		// short-input above so callers can branch on shape vs auth.
+		if aad != nil {
+			return nil, fmt.Errorf("crypto: aes-gcm open: %w (wrong key, tampered ciphertext, or a chunk that does not belong at this position in this backup — spliced/replayed store?)", err)
+		}
 		return nil, fmt.Errorf("crypto: aes-gcm open: %w (wrong key or tampered ciphertext)", err)
 	}
 	return pt, nil

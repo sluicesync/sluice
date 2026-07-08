@@ -33,8 +33,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
@@ -145,9 +147,28 @@ type AzureKMSEnvelope struct {
 	keyID         string // operator-supplied (full URL)
 	vaultURL      string // parsed: e.g. https://my-vault.vault.azure.net
 	keyName       string // parsed: e.g. my-key
-	keyVersion    string // parsed: empty → "latest"
 	wrapAlgorithm azkeys.EncryptionAlgorithm
 	client        AzureKMSAPI
+
+	// mu guards keyVersion + warnedUnversioned. keyVersion starts as
+	// the version parsed from the operator's key URL (empty → latest)
+	// and is PINNED to a concrete version at the first opportunity —
+	// the GetKey preflight, a WrapKey response's KID, or a manifest's
+	// recorded KEKRef via [AzureKMSEnvelope.RebindChainKEKRef]. The pin
+	// exists because Azure key-wrap ciphertext carries NO key-version
+	// metadata (unlike AWS/GCP): an unpinned unwrap always targets the
+	// vault's LATEST version, which breaks restores of older chains
+	// once key auto-rotation is enabled (audit N-9). Pinning at wrap
+	// time also keeps a per-chunk-mode run on ONE version even if the
+	// key rotates mid-run.
+	//
+	// versionExplicit records that the OPERATOR's key URL named a
+	// version; an explicit version is never overridden by a manifest's
+	// recorded ref (the operator may be deliberately retargeting).
+	mu                sync.Mutex
+	keyVersion        string
+	versionExplicit   bool
+	warnedUnversioned bool
 }
 
 // NewAzureKMSEnvelope constructs an AzureKMSEnvelope against the
@@ -155,8 +176,10 @@ type AzureKMSEnvelope struct {
 //
 //   - Versioned key: `https://VAULT.vault.azure.net/keys/KEY/VERSION`
 //   - Latest version: `https://VAULT.vault.azure.net/keys/KEY` (empty
-//     version → Key Vault uses the current version on wrap; on unwrap
-//     the version is recovered from the wrapped blob's metadata)
+//     version → resolved to the key's CURRENT version by the GetKey
+//     preflight and pinned; Azure key-wrap ciphertext carries no
+//     version metadata, so unwrap must be told the wrap-time version —
+//     see [AzureKMSEnvelope.RebindChainKEKRef] / audit N-9)
 //   - Managed HSM: `https://VAULT.managedhsm.azure.net/keys/KEY[/VERSION]`
 //
 // Returns an error when keyID is empty or unparseable, the default
@@ -184,11 +207,12 @@ func NewAzureKMSEnvelope(ctx context.Context, keyID string, opts ...AzureKMSOpti
 	}
 
 	env := &AzureKMSEnvelope{
-		keyID:         keyID,
-		vaultURL:      vaultURL,
-		keyName:       name,
-		keyVersion:    version,
-		wrapAlgorithm: o.wrapAlgorithm,
+		keyID:           keyID,
+		vaultURL:        vaultURL,
+		keyName:         name,
+		keyVersion:      version,
+		versionExplicit: version != "",
+		wrapAlgorithm:   o.wrapAlgorithm,
 	}
 
 	if o.client != nil {
@@ -220,11 +244,44 @@ func NewAzureKMSEnvelope(ctx context.Context, keyID string, opts ...AzureKMSOpti
 	}
 
 	if !o.skipPreflight {
-		if _, err := env.client.GetKey(ctx, name, version, nil); err != nil {
+		resp, err := env.client.GetKey(ctx, name, version, nil)
+		if err != nil {
 			return nil, translateAzureKMSError(err, keyID, "describe")
+		}
+		// Pin the concrete key version now (audit N-9): with an
+		// unversioned operator URL, GetKey resolved "latest" to an
+		// exact version — adopt it so every wrap this run performs
+		// lands on ONE version and the manifest can record it
+		// (ResolvedKEKRef). Versioned operator URLs pass through
+		// unchanged (GetKey echoes the same version back).
+		if resp.Key != nil && resp.Key.KID != nil {
+			env.pinKeyVersion(resp.Key.KID.Version())
 		}
 	}
 	return env, nil
+}
+
+// pinKeyVersion records version as the envelope's concrete key-version
+// target, once: the first non-empty pin wins and later calls are
+// no-ops (wraps that already happened used the first pin). Empty
+// version is ignored.
+func (e *AzureKMSEnvelope) pinKeyVersion(version string) {
+	if version == "" {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.keyVersion == "" {
+		e.keyVersion = version
+	}
+}
+
+// currentKeyVersion returns the pinned (or operator-supplied) key
+// version, or "" when unresolved ("latest").
+func (e *AzureKMSEnvelope) currentKeyVersion() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.keyVersion
 }
 
 // Mode returns [KEKModeAzureKMS] — the tag recorded in
@@ -241,12 +298,18 @@ func (e *AzureKMSEnvelope) KeyID() string { return e.keyID }
 // against the envelope's key. The returned bytes are the service's
 // Result field — an opaque byte slice that UnwrapKey round-trips
 // back to the original plaintext.
+//
+// The response's KID names the exact key VERSION the service wrapped
+// under; it is pinned on the envelope so (a) every later wrap this run
+// performs stays on the same version even if the key rotates mid-run,
+// and (b) [AzureKMSEnvelope.ResolvedKEKRef] can hand the orchestrator
+// a versioned reference to record in the manifest (audit N-9).
 func (e *AzureKMSEnvelope) WrapCEK(cek []byte) ([]byte, error) {
 	if len(cek) != CEKLen {
 		return nil, fmt.Errorf("crypto: azure kms wrap cek length %d != %d", len(cek), CEKLen)
 	}
 	alg := e.wrapAlgorithm
-	out, err := e.client.WrapKey(context.Background(), e.keyName, e.keyVersion,
+	out, err := e.client.WrapKey(context.Background(), e.keyName, e.currentKeyVersion(),
 		azkeys.KeyOperationParameters{
 			Algorithm: &alg,
 			Value:     cek,
@@ -257,20 +320,34 @@ func (e *AzureKMSEnvelope) WrapCEK(cek []byte) ([]byte, error) {
 	if len(out.Result) == 0 {
 		return nil, errors.New("crypto: azure kms wrap returned empty Result")
 	}
+	if out.KID != nil {
+		e.pinKeyVersion(out.KID.Version())
+	}
 	return out.Result, nil
 }
 
 // UnwrapCEK is the inverse of WrapCEK: hands the wrapped bytes to
-// the service's UnwrapKey RPC, returns the plaintext CEK. Azure Key
-// Vault tracks the wrap-time key version internally; the unwrap call
-// recovers it from the wrapped blob's metadata so a rotated key
-// doesn't break already-wrapped chains.
+// the service's UnwrapKey RPC, returns the plaintext CEK.
+//
+// Version targeting (audit N-9): Azure key-wrap ciphertext carries NO
+// key-version metadata — unlike AWS KMS / GCP KMS, whose ciphertexts
+// self-identify their wrapping key version — so the unwrap targets
+// whatever version this envelope is pinned at. FormatVersion-5+
+// manifests record the wrap-time versioned key URL in
+// [backup.ChainEncryption.KEKRef] and the orchestrator retargets the
+// envelope at it via [AzureKMSEnvelope.RebindChainKEKRef] before
+// unwrapping. When no version is known (a pre-FormatVersion-5
+// manifest + an unversioned operator URL + no preflight resolution),
+// the unwrap falls to the vault's LATEST version — correct until the
+// key auto-rotates, after which restores of older chains fail with an
+// auth error; a WARN names that hazard up front.
 func (e *AzureKMSEnvelope) UnwrapCEK(wrapped []byte) ([]byte, error) {
 	if len(wrapped) == 0 {
 		return nil, errors.New("crypto: azure kms unwrap wrapped bytes are empty")
 	}
+	e.warnIfUnversionedUnwrap()
 	alg := e.wrapAlgorithm
-	out, err := e.client.UnwrapKey(context.Background(), e.keyName, e.keyVersion,
+	out, err := e.client.UnwrapKey(context.Background(), e.keyName, e.currentKeyVersion(),
 		azkeys.KeyOperationParameters{
 			Algorithm: &alg,
 			Value:     wrapped,
@@ -282,6 +359,77 @@ func (e *AzureKMSEnvelope) UnwrapCEK(wrapped []byte) ([]byte, error) {
 		return nil, fmt.Errorf("crypto: azure kms unwrap returned plaintext of length %d (want %d)", len(out.Result), CEKLen)
 	}
 	return out.Result, nil
+}
+
+// ResolvedKEKRef implements [ResolvedKEKReferencer]: the versioned Key
+// Vault key URL the envelope's wraps actually target, or "" when no
+// concrete version is known yet. The orchestrator records this in
+// [backup.ChainEncryption.KEKRef] so restore-side unwraps can be
+// retargeted at the wrap-time version after key rotation.
+func (e *AzureKMSEnvelope) ResolvedKEKRef() string {
+	v := e.currentKeyVersion()
+	if v == "" {
+		return ""
+	}
+	return e.vaultURL + "/keys/" + e.keyName + "/" + v
+}
+
+// RebindChainKEKRef implements [ChainKEKRebinder]: retarget this
+// envelope's wrap/unwrap at the key VERSION recordedRef names — the
+// version the chain's CEK was actually wrapped under. Advisory by
+// contract (the ref comes from an unauthenticated manifest): a
+// malformed / different-key ref, or a conflict with an
+// operator-explicit version, logs a WARN and keeps the current target
+// — the unwrap then fails loudly if that target is wrong. A recorded
+// ref without a version (pre-FormatVersion-5 manifests) keeps the
+// current behavior and lets the unwrap-time rotation-hazard WARN fire.
+func (e *AzureKMSEnvelope) RebindChainKEKRef(recordedRef string) {
+	if recordedRef == "" {
+		return
+	}
+	vault, name, version, err := parseAzureKeyID(recordedRef)
+	if err != nil {
+		slog.Warn("crypto: azure kms: manifest's recorded kek_ref is not a parseable Key Vault key URL; keeping the operator-supplied key target",
+			slog.String("recorded_kek_ref", recordedRef), slog.String("err", err.Error()))
+		return
+	}
+	if !strings.EqualFold(vault, e.vaultURL) || name != e.keyName {
+		slog.Warn("crypto: azure kms: manifest's recorded kek_ref names a different vault/key than the operator-supplied one; keeping the operator's (the unwrap fails loudly if it is the wrong key)",
+			slog.String("recorded_kek_ref", recordedRef), slog.String("operator_key_id", e.keyID))
+		return
+	}
+	if version == "" {
+		// Old manifest (recorded before the versioned-KEKRef stamp):
+		// nothing to retarget at; the unwrap-time WARN covers the
+		// rotation hazard.
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.versionExplicit {
+		if e.keyVersion != version {
+			slog.Warn("crypto: azure kms: operator-supplied key version differs from the chain's recorded wrap-time version; honoring the operator's",
+				slog.String("operator_version", e.keyVersion), slog.String("recorded_version", version))
+		}
+		return
+	}
+	e.keyVersion = version
+}
+
+// warnIfUnversionedUnwrap emits the once-per-envelope rotation-hazard
+// WARN when an unwrap is about to target the vault's latest key
+// version because no wrap-time version is known (audit N-9's failure
+// mode: enable key auto-rotation and restores of older chains fail
+// with a misleading auth error).
+func (e *AzureKMSEnvelope) warnIfUnversionedUnwrap() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.keyVersion != "" || e.warnedUnversioned {
+		return
+	}
+	e.warnedUnversioned = true
+	slog.Warn("crypto: azure kms: unwrapping against the key's LATEST version — this chain's manifest records no wrap-time key version (written before sluice recorded versioned Azure kek_refs) and the supplied --azure-key-vault-id names none. If the key has auto-rotated since the backup, the unwrap will fail with an auth error; pass the wrap-time version explicitly (https://VAULT.vault.azure.net/keys/KEY/VERSION) to recover",
+		slog.String("key_id", e.keyID))
 }
 
 // parseAzureKeyID validates and decomposes an Azure Key Vault key

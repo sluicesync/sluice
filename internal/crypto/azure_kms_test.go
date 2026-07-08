@@ -27,22 +27,37 @@ type fakeAzureKMS struct {
 	unwraps int64
 	gets    int64
 	errOnOp map[string]error
+
+	// latestVersion is the version the stub reports as current ("v1"
+	// by default); N-9 tests bump it to simulate key auto-rotation.
+	// lastWrapVersion / lastUnwrapVersion record the version argument
+	// the envelope targeted on the most recent call (sequential tests;
+	// no locking).
+	latestVersion     string
+	lastWrapVersion   string
+	lastUnwrapVersion string
 }
 
 func newFakeAzureKMS(keyName string) *fakeAzureKMS {
-	return &fakeAzureKMS{keyName: keyName, errOnOp: map[string]error{}}
+	return &fakeAzureKMS{keyName: keyName, errOnOp: map[string]error{}, latestVersion: "v1"}
 }
 
-func (f *fakeAzureKMS) WrapKey(_ context.Context, name, _ string, params azkeys.KeyOperationParameters, _ *azkeys.WrapKeyOptions) (azkeys.WrapKeyResponse, error) {
+func (f *fakeAzureKMS) WrapKey(_ context.Context, name, version string, params azkeys.KeyOperationParameters, _ *azkeys.WrapKeyOptions) (azkeys.WrapKeyResponse, error) {
 	atomic.AddInt64(&f.wraps, 1)
+	f.lastWrapVersion = version
 	if err := f.popErr("wrap"); err != nil {
 		return azkeys.WrapKeyResponse{}, err
 	}
 	if name != f.keyName {
 		return azkeys.WrapKeyResponse{}, fakeAzureAPIError("KeyNotFound", 404, "key not found")
 	}
-	blob := append([]byte("azkv:"+f.keyName+"|"), params.Value...)
-	kid := azkeys.ID("https://stub.vault.azure.net/keys/" + f.keyName + "/v1")
+	// An empty version targets the latest, like the real service.
+	effective := version
+	if effective == "" {
+		effective = f.latestVersion
+	}
+	blob := append([]byte("azkv:"+f.keyName+"/"+effective+"|"), params.Value...)
+	kid := azkeys.ID("https://stub.vault.azure.net/keys/" + f.keyName + "/" + effective)
 	return azkeys.WrapKeyResponse{
 		KeyOperationResult: azkeys.KeyOperationResult{
 			Result: blob,
@@ -51,22 +66,31 @@ func (f *fakeAzureKMS) WrapKey(_ context.Context, name, _ string, params azkeys.
 	}, nil
 }
 
-func (f *fakeAzureKMS) UnwrapKey(_ context.Context, name, _ string, params azkeys.KeyOperationParameters, _ *azkeys.UnwrapKeyOptions) (azkeys.UnwrapKeyResponse, error) {
+func (f *fakeAzureKMS) UnwrapKey(_ context.Context, name, version string, params azkeys.KeyOperationParameters, _ *azkeys.UnwrapKeyOptions) (azkeys.UnwrapKeyResponse, error) {
 	atomic.AddInt64(&f.unwraps, 1)
+	f.lastUnwrapVersion = version
 	if err := f.popErr("unwrap"); err != nil {
 		return azkeys.UnwrapKeyResponse{}, err
 	}
 	if name != f.keyName {
 		return azkeys.UnwrapKeyResponse{}, fakeAzureAPIError("KeyNotFound", 404, "key not found")
 	}
-	prefix := "azkv:" + f.keyName + "|"
+	// Azure key-wrap ciphertext carries NO version metadata — the
+	// unwrap succeeds only against the version that wrapped it (the
+	// audit-N-9 mechanism this stub reproduces). Empty version →
+	// latest, like the real service.
+	effective := version
+	if effective == "" {
+		effective = f.latestVersion
+	}
+	prefix := "azkv:" + f.keyName + "/" + effective + "|"
 	if !bytes.HasPrefix(params.Value, []byte(prefix)) {
-		// Azure surfaces wrong-key unwrap as a BadParameter; the
-		// translator branches on that error code.
-		return azkeys.UnwrapKeyResponse{}, fakeAzureAPIError("BadParameter", 400, "ciphertext was not wrapped by this key")
+		// Azure surfaces wrong-key/wrong-version unwrap as a
+		// BadParameter; the translator branches on that error code.
+		return azkeys.UnwrapKeyResponse{}, fakeAzureAPIError("BadParameter", 400, "ciphertext was not wrapped by this key version")
 	}
 	plain := params.Value[len(prefix):]
-	kid := azkeys.ID("https://stub.vault.azure.net/keys/" + f.keyName + "/v1")
+	kid := azkeys.ID("https://stub.vault.azure.net/keys/" + f.keyName + "/" + effective)
 	return azkeys.UnwrapKeyResponse{
 		KeyOperationResult: azkeys.KeyOperationResult{
 			Result: plain,
@@ -83,7 +107,7 @@ func (f *fakeAzureKMS) GetKey(_ context.Context, name, _ string, _ *azkeys.GetKe
 	if name != f.keyName {
 		return azkeys.GetKeyResponse{}, fakeAzureAPIError("KeyNotFound", 404, "key not found")
 	}
-	kid := azkeys.ID("https://stub.vault.azure.net/keys/" + f.keyName + "/v1")
+	kid := azkeys.ID("https://stub.vault.azure.net/keys/" + f.keyName + "/" + f.latestVersion)
 	enabled := true
 	return azkeys.GetKeyResponse{
 		KeyBundle: azkeys.KeyBundle{

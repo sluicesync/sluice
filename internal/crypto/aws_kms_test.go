@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -51,9 +52,11 @@ func (f *fakeKMS) Encrypt(_ context.Context, in *kms.EncryptInput, _ ...func(*km
 	if err := f.popErr("encrypt"); err != nil {
 		return nil, err
 	}
-	// Wrap the plaintext with a key-tagged marker so a Decrypt call
-	// against the wrong fakeKMS instance can detect the mismatch.
-	blob := append([]byte("kms:"+f.keyID+"|"), in.Plaintext...)
+	// Wrap the plaintext with a key-tagged + context-tagged marker so
+	// a Decrypt against the wrong instance OR the wrong
+	// EncryptionContext detects the mismatch — mirroring the real
+	// service, which authenticates the context (ADR-0152).
+	blob := append([]byte("kms:"+f.keyID+"|ctx:"+flattenKMSContext(in.EncryptionContext)+"\x00"), in.Plaintext...)
 	return &kms.EncryptOutput{CiphertextBlob: blob, KeyId: aws.String(f.keyID)}, nil
 }
 
@@ -66,8 +69,33 @@ func (f *fakeKMS) Decrypt(_ context.Context, in *kms.DecryptInput, _ ...func(*km
 	if !bytes.HasPrefix(in.CiphertextBlob, []byte(prefix)) {
 		return nil, &kmstypes.IncorrectKeyException{Message: aws.String("ciphertext was not produced by key " + f.keyID)}
 	}
-	plain := in.CiphertextBlob[len(prefix):]
+	rest := in.CiphertextBlob[len(prefix):]
+	sep := bytes.IndexByte(rest, 0)
+	if sep < 0 || !bytes.HasPrefix(rest, []byte("ctx:")) {
+		return nil, &kmstypes.InvalidCiphertextException{Message: aws.String("malformed fake ciphertext")}
+	}
+	if got := string(rest[len("ctx:"):sep]); got != flattenKMSContext(in.EncryptionContext) {
+		// The real service's shape when the supplied EncryptionContext
+		// does not match the encryption-time one.
+		return nil, &kmstypes.InvalidCiphertextException{Message: aws.String("encryption context mismatch")}
+	}
+	plain := rest[sep+1:]
 	return &kms.DecryptOutput{Plaintext: plain, KeyId: aws.String(f.keyID)}, nil
+}
+
+// flattenKMSContext renders an EncryptionContext deterministically for
+// the fake's marker (single-entry maps in practice; sorted for safety).
+func flattenKMSContext(ctx map[string]string) string {
+	keys := make([]string, 0, len(ctx))
+	for k := range ctx {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		b.WriteString(k + "=" + ctx[k] + ";")
+	}
+	return b.String()
 }
 
 func (f *fakeKMS) DescribeKey(_ context.Context, _ *kms.DescribeKeyInput, _ ...func(*kms.Options)) (*kms.DescribeKeyOutput, error) {

@@ -139,16 +139,17 @@ func TestChooseFormatVersion_Bug116(t *testing.T) {
 }
 
 // TestBackupFormatVersion_Bumped pins the version ladder: the build
-// ceiling is the standalone-sequences version, the ADR-0086
-// in-progress sidecar version and the Bug 116 security-metadata
-// version keep their historical slots, and the legacy value is
-// frozen. If a future change reorders these without updating the
-// chooseFormatVersion / sidecar contracts, this test catches the
-// regression at build time.
+// ceiling is the ADR-0152 encrypted-chunk-binding version, the
+// standalone-sequences version, the ADR-0086 in-progress sidecar
+// version and the Bug 116 security-metadata version keep their
+// historical slots, and the legacy value is frozen. If a future change
+// reorders these without updating the chooseFormatVersion / sidecar /
+// chunk-binding contracts, this test catches the regression at build
+// time.
 func TestBackupFormatVersion_Bumped(t *testing.T) {
-	if BackupFormatVersion != FormatVersionStandaloneSequences {
-		t.Errorf("BackupFormatVersion = %d; want FormatVersionStandaloneSequences=%d (item-51 sequences ceiling)",
-			BackupFormatVersion, FormatVersionStandaloneSequences)
+	if BackupFormatVersion != FormatVersionEncryptedChunkBinding {
+		t.Errorf("BackupFormatVersion = %d; want FormatVersionEncryptedChunkBinding=%d (ADR-0152 ceiling)",
+			BackupFormatVersion, FormatVersionEncryptedChunkBinding)
 	}
 	if FormatVersionLegacy != 1 {
 		t.Errorf("FormatVersionLegacy = %d; must stay 1 (load-bearing for older-binary preflight semantics)", FormatVersionLegacy)
@@ -164,5 +165,9 @@ func TestBackupFormatVersion_Bumped(t *testing.T) {
 	if FormatVersionStandaloneSequences <= FormatVersionProgressSidecar {
 		t.Errorf("FormatVersionStandaloneSequences (%d) must be strictly greater than FormatVersionProgressSidecar (%d) — sequence-bearing manifests must refuse on every pre-sequence binary, including sidecar-capable ones",
 			FormatVersionStandaloneSequences, FormatVersionProgressSidecar)
+	}
+	if FormatVersionEncryptedChunkBinding <= FormatVersionStandaloneSequences {
+		t.Errorf("FormatVersionEncryptedChunkBinding (%d) must be strictly greater than FormatVersionStandaloneSequences (%d) — chunk-binding manifests must refuse on every pre-binding binary, whose nil-AAD decrypt would fail with a MISLEADING bare auth error",
+			FormatVersionEncryptedChunkBinding, FormatVersionStandaloneSequences)
 	}
 }

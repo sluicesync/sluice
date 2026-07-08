@@ -186,12 +186,22 @@ func (e *KMSEnvelope) KeyARN() string { return e.keyARN }
 // writer's loop; the KMS Encrypt for the chain CEK happens once at
 // chain start, well before any cancel-on-failure cleanup runs.
 func (e *KMSEnvelope) WrapCEK(cek []byte) ([]byte, error) {
+	return e.WrapCEKBound(cek, "")
+}
+
+// WrapCEKBound implements [BoundEnvelope]: the binding string becomes
+// the KMS EncryptionContext, which KMS authenticates (the Decrypt
+// fails with InvalidCiphertextException unless the identical context
+// is supplied), records in CloudTrail, and lets key policies enforce.
+// Empty binding is the legacy context-free wrap.
+func (e *KMSEnvelope) WrapCEKBound(cek []byte, binding string) ([]byte, error) {
 	if len(cek) != CEKLen {
 		return nil, fmt.Errorf("crypto: kms wrap cek length %d != %d", len(cek), CEKLen)
 	}
 	out, err := e.client.Encrypt(context.Background(), &kms.EncryptInput{
-		KeyId:     aws.String(e.keyARN),
-		Plaintext: cek,
+		KeyId:             aws.String(e.keyARN),
+		Plaintext:         cek,
+		EncryptionContext: kmsEncryptionContext(binding),
 	})
 	if err != nil {
 		return nil, translateKMSError(err, e.keyARN, "encrypt")
@@ -212,12 +222,21 @@ func (e *KMSEnvelope) WrapCEK(cek []byte) ([]byte, error) {
 // belt-and-braces guard against accidental cross-key decryption when
 // the operator misconfigures aliases.
 func (e *KMSEnvelope) UnwrapCEK(wrapped []byte) ([]byte, error) {
+	return e.UnwrapCEKBound(wrapped, "")
+}
+
+// UnwrapCEKBound implements [BoundEnvelope]. The binding must equal
+// the wrap-time EncryptionContext exactly; KMS refuses otherwise
+// (InvalidCiphertextException), which is the loud "this CEK was
+// wrapped for a different backup" signal.
+func (e *KMSEnvelope) UnwrapCEKBound(wrapped []byte, binding string) ([]byte, error) {
 	if len(wrapped) == 0 {
 		return nil, errors.New("crypto: kms unwrap wrapped bytes are empty")
 	}
 	out, err := e.client.Decrypt(context.Background(), &kms.DecryptInput{
-		KeyId:          aws.String(e.keyARN),
-		CiphertextBlob: wrapped,
+		KeyId:             aws.String(e.keyARN),
+		CiphertextBlob:    wrapped,
+		EncryptionContext: kmsEncryptionContext(binding),
 	})
 	if err != nil {
 		return nil, translateKMSError(err, e.keyARN, "decrypt")
@@ -226,6 +245,23 @@ func (e *KMSEnvelope) UnwrapCEK(wrapped []byte) ([]byte, error) {
 		return nil, fmt.Errorf("crypto: kms unwrap returned plaintext of length %d (want %d)", len(out.Plaintext), CEKLen)
 	}
 	return out.Plaintext, nil
+}
+
+// kmsEncryptionContextKey is the EncryptionContext map key sluice's
+// CEK binding rides under. Part of the wrapped-CEK contract for
+// FormatVersion-5+ manifests (ADR-0152); renaming would strand every
+// chain wrapped since.
+const kmsEncryptionContextKey = "sluice_cek_binding"
+
+// kmsEncryptionContext maps a binding string to the KMS
+// EncryptionContext argument: "" → nil (the legacy context-free wrap,
+// required for pre-FormatVersion-5 chains), anything else → the
+// one-entry sluice context.
+func kmsEncryptionContext(binding string) map[string]string {
+	if binding == "" {
+		return nil
+	}
+	return map[string]string{kmsEncryptionContextKey: binding}
 }
 
 // translateKMSError maps a raw aws-sdk-go-v2 KMS error to an

@@ -202,12 +202,23 @@ func (e *GCPKMSEnvelope) KeyResource() string { return e.keyResource }
 // writer's loop; the KMS Encrypt for the chain CEK happens once at
 // chain start, well before any cancel-on-failure cleanup runs.
 func (e *GCPKMSEnvelope) WrapCEK(cek []byte) ([]byte, error) {
+	return e.WrapCEKBound(cek, "")
+}
+
+// WrapCEKBound implements [BoundEnvelope]: the binding string becomes
+// the Cloud KMS AdditionalAuthenticatedData, which the service
+// authenticates — Decrypt fails unless the identical AAD is supplied —
+// and which key policy / Cloud Audit Logs can observe. Empty binding
+// is the legacy AAD-free wrap. Mirrors the AWS EncryptionContext
+// shape.
+func (e *GCPKMSEnvelope) WrapCEKBound(cek []byte, binding string) ([]byte, error) {
 	if len(cek) != CEKLen {
 		return nil, fmt.Errorf("crypto: gcp kms wrap cek length %d != %d", len(cek), CEKLen)
 	}
 	out, err := e.client.Encrypt(context.Background(), &kmspb.EncryptRequest{
-		Name:      e.keyResource,
-		Plaintext: cek,
+		Name:                        e.keyResource,
+		Plaintext:                   cek,
+		AdditionalAuthenticatedData: bindingAAD(binding),
 	})
 	if err != nil {
 		return nil, translateGCPKMSError(err, e.keyResource, "encrypt")
@@ -228,12 +239,21 @@ func (e *GCPKMSEnvelope) WrapCEK(cek []byte) ([]byte, error) {
 // Passing a versioned resource also works as long as it matches the
 // version the ciphertext was wrapped under.
 func (e *GCPKMSEnvelope) UnwrapCEK(wrapped []byte) ([]byte, error) {
+	return e.UnwrapCEKBound(wrapped, "")
+}
+
+// UnwrapCEKBound implements [BoundEnvelope]. The binding must equal
+// the wrap-time AdditionalAuthenticatedData exactly; Cloud KMS refuses
+// otherwise, which is the loud "this CEK was wrapped for a different
+// backup" signal.
+func (e *GCPKMSEnvelope) UnwrapCEKBound(wrapped []byte, binding string) ([]byte, error) {
 	if len(wrapped) == 0 {
 		return nil, errors.New("crypto: gcp kms unwrap wrapped bytes are empty")
 	}
 	out, err := e.client.Decrypt(context.Background(), &kmspb.DecryptRequest{
-		Name:       cryptoKeyForResource(e.keyResource),
-		Ciphertext: wrapped,
+		Name:                        cryptoKeyForResource(e.keyResource),
+		Ciphertext:                  wrapped,
+		AdditionalAuthenticatedData: bindingAAD(binding),
 	})
 	if err != nil {
 		return nil, translateGCPKMSError(err, e.keyResource, "decrypt")

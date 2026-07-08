@@ -93,7 +93,21 @@ import (
 // preflight instead, before anything lands on the target.
 // Proportional as always: only manifests whose schema actually
 // carries standalone sequences are stamped 4.
-const BackupFormatVersion = 4
+//
+// v0.99.202+ introduces FormatVersion=5 for ENCRYPTED manifests
+// (ADR-0152, audit N-8): chunks written under a FormatVersion-5
+// manifest carry a GCM AAD binding to (manifest identity + chunk
+// path), and the chain CEK's wrap is bound to the manifest identity
+// (KMS EncryptionContext / GCP AAD / passphrase-wrap AAD; the
+// versioned Azure kek_ref). Readers derive the decrypt shape from the
+// RECORDED version — v5+ requires the binding, pre-v5 decrypts with
+// the legacy nil-AAD path — never by trying both. Proportional per
+// the Bug-116 discipline: plaintext manifests stay on 1/2/4 and keep
+// restoring on older binaries; only encrypted backups (whose chunks
+// an older binary would fail to decrypt with a MISLEADING bare
+// auth-tag error anyway) are stamped 5, turning that into the loud
+// version-refusal at the manifest preflight.
+const BackupFormatVersion = 5
 
 // FormatVersionLegacy / FormatVersionSecurityMetadata name the
 // historically-recorded values so callers don't sprinkle bare ints
@@ -126,6 +140,19 @@ const (
 	// nextval() topology diverges from the source's); the bump makes
 	// them refuse loudly at the manifest preflight instead.
 	FormatVersionStandaloneSequences = 4
+
+	// FormatVersionEncryptedChunkBinding is the v0.99.202+ version
+	// stamped on ENCRYPTED manifests (ADR-0152, audit N-8/N-9). It is
+	// the read-side gate for the integrity layer: chunks belonging to
+	// a manifest at this version or above were written with the GCM
+	// AAD binding ([ChunkAAD]) and their chain CEK wrap with the
+	// identity binding ([CEKBinding]); readers MUST supply them.
+	// Chunks belonging to older manifests decrypt via the legacy
+	// nil-AAD path. The recorded version decides — never guess, never
+	// try both. Stamped only when encryption is enabled (proportional
+	// per Bug 116); the writers additionally never stamp it onto a
+	// RESUMED pre-v5 encrypted run, whose kept chunks are unbound.
+	FormatVersionEncryptedChunkBinding = 5
 )
 
 // chooseFormatVersion returns the smallest manifest format version
@@ -453,9 +480,13 @@ type Manifest struct {
 
 	// SchemaHash is a deterministic fingerprint of [ir.Schema] at the
 	// point the manifest was written. Computed via SHA-256 over the
-	// canonical JSON serialisation (encoding/json with the existing
-	// IR marshalling). Used by chain-restore as a sanity check that
-	// the chain's schema lineage hasn't been tampered with.
+	// canonical JSON serialisation ([ComputeSchemaHash]). Chain-restore
+	// recomputes it from the carried Schema and refuses on mismatch
+	// (ChainRestore.verifySchemaHashes) — a CORRUPTION check, not
+	// tamper-proofing: the hash lives in the same unsigned manifest as
+	// the schema, so an adversary who can rewrite one can rewrite both
+	// (ADR-0152 documents the boundary). Empty on manifests written
+	// before the field existed; the check skips those.
 	SchemaHash string `json:"schema_hash,omitempty"`
 
 	// SchemaDelta records structural changes observed during an

@@ -41,7 +41,11 @@ func (f *fakeGCPKMS) Encrypt(_ context.Context, in *kmspb.EncryptRequest, _ ...g
 	if err := f.popErr("encrypt"); err != nil {
 		return nil, err
 	}
-	blob := append([]byte("gcpkms:"+f.keyResource+"|"), in.Plaintext...)
+	// Key-tagged + AAD-tagged marker so a Decrypt with the wrong key
+	// OR the wrong AdditionalAuthenticatedData detects the mismatch —
+	// mirroring the real service, which authenticates the AAD
+	// (ADR-0152).
+	blob := append([]byte("gcpkms:"+f.keyResource+"|aad:"+string(in.AdditionalAuthenticatedData)+"\x00"), in.Plaintext...)
 	return &kmspb.EncryptResponse{Ciphertext: blob, Name: f.keyResource}, nil
 }
 
@@ -56,7 +60,16 @@ func (f *fakeGCPKMS) Decrypt(_ context.Context, in *kmspb.DecryptRequest, _ ...g
 		// InvalidArgument; the translator branches on that.
 		return nil, status.Error(codes.InvalidArgument, "ciphertext was not produced by key "+f.keyResource)
 	}
-	plain := in.Ciphertext[len(prefix):]
+	rest := in.Ciphertext[len(prefix):]
+	sep := bytes.IndexByte(rest, 0)
+	if sep < 0 || !bytes.HasPrefix(rest, []byte("aad:")) {
+		return nil, status.Error(codes.InvalidArgument, "malformed fake ciphertext")
+	}
+	if got := string(rest[len("aad:"):sep]); got != string(in.AdditionalAuthenticatedData) {
+		// The real service refuses an AAD mismatch the same way.
+		return nil, status.Error(codes.InvalidArgument, "additional authenticated data mismatch")
+	}
+	plain := rest[sep+1:]
 	return &kmspb.DecryptResponse{Plaintext: plain}, nil
 }
 
