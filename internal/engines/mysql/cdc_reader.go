@@ -5,6 +5,7 @@ package mysql
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"encoding/binary"
 	"errors"
@@ -134,6 +135,24 @@ type CDCReader struct {
 	// account needs REPLICATION SLAVE (and REPLICATION CLIENT, for
 	// the SHOW MASTER STATUS / @@gtid_executed queries) at minimum.
 	user, password string
+
+	// binlogTLS is the TLS config the binlog syncer dials with, derived
+	// from the source DSN's `tls=` param at construction
+	// ([binlogTLSFromConfig]). Historically the replication stream was
+	// ALWAYS plaintext regardless of the DSN — only the database/sql
+	// query connections honoured tls= — a silent transport downgrade
+	// for every replicated row (audit finding N-3). nil — the zero
+	// value for any reader built without a DSN, and the mapping for
+	// tls absent/false — keeps the historical plaintext stream, so
+	// non-DSN constructions are byte-identical to pre-fix behavior.
+	binlogTLS *tls.Config
+
+	// binlogTLSMode is the raw DSN tls= value ("", "false", "true",
+	// "skip-verify", "preferred", or a registered custom config name),
+	// kept solely to shape the transport WARN at stream open
+	// ([CDCReader.warnBinlogTransport]); the dial behavior itself is
+	// entirely carried by binlogTLS.
+	binlogTLSMode string
 
 	// serverID is the replica identifier the syncer registers with
 	// the source. Must be unique across all replicas of the source —
@@ -377,6 +396,11 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 	}
 	r.posMode = startPos.Mode
 
+	// Surface the binlog transport posture once per stream open (the
+	// reader is single-stream): plaintext and unverified-TLS modes WARN
+	// loudly, verifying TLS says nothing. Audit finding N-3.
+	r.warnBinlogTransport(ctx)
+
 	syncerCfg := replication.BinlogSyncerConfig{
 		ServerID: r.serverID,
 		Flavor:   mysql.MySQLFlavor,
@@ -413,6 +437,15 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 		// the decoder's contract. DATETIME isn't affected (its
 		// binlog encoding is the broken-down date/time directly).
 		TimestampStringLocation: time.UTC,
+		// TLSConfig carries the DSN's tls= mode onto the replication
+		// stream (audit finding N-3): before this the binlog
+		// connection was ALWAYS plaintext even when tls=true
+		// encrypted every query connection — a silent transport
+		// downgrade for every replicated row. nil (no tls param /
+		// tls=false / a reader built without a DSN) preserves the
+		// historical plaintext stream; warnBinlogTransport above
+		// says which transport is in effect either way.
+		TLSConfig: r.binlogTLS,
 		// MaxConnAttempts bounds the BinlogSyncer's internal retry
 		// loop (onStream → retrySync). Default 0 = infinite retries.
 		// In long-lived production streams that's the right default

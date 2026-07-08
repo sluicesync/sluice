@@ -306,13 +306,18 @@ func openBinlogCDCReaderShared(ctx context.Context, dsn string, serverScope bool
 		return nil, fmt.Errorf("mysql: parse host/port: %w", err)
 	}
 	return &CDCReader{
-		db:             db,
-		schema:         cfg.DBName,
-		zeroDate:       zeroDate,
-		host:           host,
-		port:           port,
-		user:           cfg.User,
-		password:       cfg.Passwd,
+		db:       db,
+		schema:   cfg.DBName,
+		zeroDate: zeroDate,
+		host:     host,
+		port:     port,
+		user:     cfg.User,
+		password: cfg.Passwd,
+		// The binlog stream inherits the DSN's tls= transport (audit
+		// finding N-3); an unregistered custom tls config name never
+		// reaches here — parseDSN already refused it loudly.
+		binlogTLS:      binlogTLSFromConfig(cfg, host),
+		binlogTLSMode:  cfg.TLSConfig,
 		serverID:       generateServerID(),
 		tableMap:       make(map[uint64]string),
 		schemaCache:    make(map[string]*tableSchema),
