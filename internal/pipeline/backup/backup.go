@@ -359,7 +359,10 @@ func (b *Backup) Run(ctx context.Context) error {
 	// Pre-build the in-progress manifest with the schema. Tables get
 	// appended (or copied from the prior run) as they finish; the
 	// manifest is committed after each table completes.
-	manifest := b.buildInProgressManifest(schema, prior, adopting, resumeAnchor, snapshotPos)
+	manifest, err := b.buildInProgressManifest(schema, prior, adopting, resumeAnchor, snapshotPos)
+	if err != nil {
+		return err
+	}
 
 	// Phase 6.1: when encryption is enabled, generate the chain-level
 	// CEK (per-chain mode) up-front, wrap it via the envelope, and
@@ -551,10 +554,17 @@ func logBackupComplete(ctx context.Context, manifest *irbackup.Manifest, summary
 // anchor; a fresh snapshot-anchored run stamps this run's snapshot
 // position; the non-snapshot fallback leaves EndPosition unset for the
 // post-sweep capture (step 4.5).
-func (b *Backup) buildInProgressManifest(schema *ir.Schema, prior *irbackup.Manifest, adopting bool, resumeAnchor ir.Position, snapshotPos *ir.Position) *irbackup.Manifest {
+func (b *Backup) buildInProgressManifest(schema *ir.Schema, prior *irbackup.Manifest, adopting bool, resumeAnchor ir.Position, snapshotPos *ir.Position) (*irbackup.Manifest, error) {
 	now := time.Now
 	if b.Now != nil {
 		now = b.Now
+	}
+	// ADR-0152: fulls record the schema fingerprint too (incrementals
+	// always have), extending chain-restore's recompute-and-compare
+	// corruption check to the chain root.
+	schemaHash, err := irbackup.ComputeSchemaHash(schema)
+	if err != nil {
+		return nil, fmt.Errorf("backup: hash source schema: %w", err)
 	}
 	manifest := &irbackup.Manifest{
 		// Bug 116 closure: stamp the smallest format version safe for
@@ -562,11 +572,14 @@ func (b *Backup) buildInProgressManifest(schema *ir.Schema, prior *irbackup.Mani
 		// constraints get FormatVersion=2 so older binaries refuse
 		// rather than silently drop those fields; innocent schemas
 		// stay on FormatVersion=1 for max backward compatibility.
+		// (Encrypted runs are bumped further by setupChainEncryption —
+		// ADR-0152.)
 		FormatVersion: irbackup.FormatVersionFor(schema),
 		SluiceVersion: b.SluiceVersion,
 		CreatedAt:     now().UTC(),
 		SourceEngine:  b.Source.Name(),
 		Schema:        schema,
+		SchemaHash:    schemaHash,
 		Tables:        make([]*irbackup.TableManifest, 0, len(schema.Tables)),
 		PartialState:  irbackup.BackupStateInProgress,
 		Kind:          irbackup.BackupKindFull,
@@ -584,7 +597,7 @@ func (b *Backup) buildInProgressManifest(schema *ir.Schema, prior *irbackup.Mani
 	case snapshotPos != nil:
 		manifest.EndPosition = *snapshotPos
 	}
-	return manifest
+	return manifest, nil
 }
 
 // logResumePlan fans the resume decision out per-table — which prior
@@ -1374,6 +1387,25 @@ func (b *Backup) setupChainEncryption(manifest, prior *irbackup.Manifest) ([]byt
 	// manifest per-chunk here while resolveChunkCEK defaulted per-chain — the
 	// same un-restorable mode-source split the chain-extend fix closes.
 	enc.Mode = mode
+
+	// ADR-0152: an encrypted manifest is stamped the chunk-binding
+	// format version — its chunks carry the GCM AAD position binding
+	// and its CEK wrap the identity binding; readers derive both from
+	// this recorded stamp. One exception, mirroring the Bug-179
+	// inherit-the-chain's-shape rule: RESUMING a pre-v5 encrypted
+	// in-progress run keeps the prior version, because the kept chunks
+	// on the store were written UNBOUND and a v5 stamp would send the
+	// restore down the AAD path against them. The stamp must precede
+	// the CEK wrap below so [irbackup.CEKBinding] gates consistently.
+	resumingPreBinding := prior != nil && prior.ChainEncryption != nil &&
+		prior.FormatVersion < irbackup.FormatVersionEncryptedChunkBinding
+	if resumingPreBinding {
+		slog.Info("backup: resuming an encrypted run written before the chunk-binding format; its format version and unbound chunk shape are kept for the whole run",
+			slog.Int("format_version", prior.FormatVersion))
+	} else {
+		manifest.FormatVersion = max(manifest.FormatVersion, irbackup.FormatVersionEncryptedChunkBinding)
+	}
+
 	chainEnc := &irbackup.ChainEncryption{
 		Algorithm: crypto.AlgorithmAESGCM,
 		Mode:      mode,
@@ -1394,8 +1426,11 @@ func (b *Backup) setupChainEncryption(manifest, prior *irbackup.Manifest) ([]byt
 	}
 
 	// Per-chunk mode: chain-level WrappedCEK stays empty; each chunk
-	// generates its own CEK.
+	// generates its own CEK. The KEKRef still records the envelope's
+	// resolved (Azure: version-pinned) reference so per-chunk unwraps
+	// can be retargeted after key rotation (audit N-9).
 	if mode == crypto.EncryptModePerChunk {
+		chainEnc.KEKRef = lineage.ResolvedKEKRef(enc.Envelope, chainEnc.KEKRef)
 		manifest.ChainEncryption = chainEnc
 		return nil, nil
 	}
@@ -1414,8 +1449,12 @@ func (b *Backup) setupChainEncryption(manifest, prior *irbackup.Manifest) ([]byt
 		if err := enc.RebindForChain(prior.ChainEncryption.Argon2id); err != nil {
 			return nil, fmt.Errorf("rebuild envelope for prior chain: %w", err)
 		}
-		// Unwrap to recover the in-flight CEK.
-		cek, err := enc.Envelope.UnwrapCEK(prior.ChainEncryption.WrappedCEK)
+		// Unwrap to recover the in-flight CEK. Routed through the
+		// ADR-0152 chokepoint: the PRIOR manifest owns the wrap, so its
+		// recorded FormatVersion decides bound-vs-unbound and its
+		// identity is the binding (identical to this run's — resume
+		// adopts the prior CreatedAt).
+		cek, err := lineage.UnwrapChainCEK(enc.Envelope, prior.ChainEncryption.WrappedCEK, prior)
 		if err != nil {
 			return nil, fmt.Errorf("unwrap prior chain cek: %w", err)
 		}
@@ -1433,12 +1472,19 @@ func (b *Backup) setupChainEncryption(manifest, prior *irbackup.Manifest) ([]byt
 		if err != nil {
 			return nil, fmt.Errorf("generate chain cek: %w", err)
 		}
-		wrapped, err := enc.Envelope.WrapCEK(cek)
+		// ADR-0152 chokepoint: bound to THIS manifest's identity when
+		// it is stamped v5 and the envelope supports bindings.
+		wrapped, err := lineage.WrapChainCEK(enc.Envelope, cek, manifest)
 		if err != nil {
 			return nil, fmt.Errorf("wrap chain cek: %w", err)
 		}
 		chainCEK = cek
 		chainEnc.WrappedCEK = wrapped
+		// Audit N-9: prefer the envelope's resolved (Azure: versioned)
+		// key reference over the operator-typed one, so restore-side
+		// unwraps can be retargeted at the wrap-time key version after
+		// rotation. Identity fallback for every other envelope.
+		chainEnc.KEKRef = lineage.ResolvedKEKRef(enc.Envelope, chainEnc.KEKRef)
 	}
 	manifest.ChainEncryption = chainEnc
 	return chainCEK, nil

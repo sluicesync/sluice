@@ -45,7 +45,7 @@ func writeOneChangeChunk(t *testing.T, store irbackup.Store, chunkPath string, c
 	// DefaultCodec so encode here agrees with the restore read-default
 	// (these tests fix no codec in the manifest; codec is incidental to
 	// value translation). v0.67.0: DefaultCodec is zstd.
-	cw, err := blobcodec.NewChangeChunkWriter(&buf, nil, blobcodec.DefaultCodec)
+	cw, err := blobcodec.NewChangeChunkWriter(&buf, nil, blobcodec.DefaultCodec, nil)
 	if err != nil {
 		t.Fatalf("newChangeChunkWriter: %v", err)
 	}

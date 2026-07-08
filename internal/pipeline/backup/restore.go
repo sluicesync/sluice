@@ -211,6 +211,25 @@ type Restore struct {
 	// matches the manifest regardless of what the reparent dropped. nil ⇒
 	// no tracking (direct unit-test callers that bypass Run).
 	reparentTracker *migcore.ReparentTracker
+
+	// manifest is the manifest being restored, kept for the chunk-read
+	// integrity layer (ADR-0152): its recorded FormatVersion + identity
+	// derive each chunk's expected GCM position binding
+	// ([irbackup.ChunkAAD]). Set by Run after the manifest read.
+	manifest *irbackup.Manifest
+
+	// chunkColumns maps manifestTableKey → the SOURCE schema's
+	// non-generated column names — exactly the header column list the
+	// backup writer pinned into every chunk. streamChunkRows compares
+	// each chunk's header against it (set equality) so a chunk written
+	// against a different schema version (renamed / added / removed
+	// column) refuses loudly instead of mis-keying rows — the check the
+	// chunk-header doc promised and, pre-ADR-0152, nothing performed
+	// (audit N-8 item 3). Built from the PRE-retarget manifest schema:
+	// the writer's column list is source-shaped, and cross-engine
+	// retarget preserves column names but not necessarily other
+	// attributes. Set by Run after the manifest read.
+	chunkColumns map[string][]string
 }
 
 // reparentMark returns the observer callback to wire onto each writer, or
@@ -379,6 +398,14 @@ func (r *Restore) Run(ctx context.Context) error {
 		return err
 	}
 	manifest.Tables = filterManifestTables(manifest.Tables, r.Filter)
+
+	// 2.5. Chunk-read integrity inputs (ADR-0152): the manifest whose
+	//      recorded FormatVersion + identity derive each chunk's GCM
+	//      position binding, and the SOURCE-schema column sets each
+	//      chunk's header is validated against. Captured BEFORE the
+	//      retarget — the backup writer's column list is source-shaped.
+	r.manifest = manifest
+	r.chunkColumns = sourceChunkColumns(manifest.Schema)
 
 	// 3. Cross-engine retarget (identity for same-engine).
 	schema := translate.RetargetForEngine(manifest.Schema, manifest.SourceEngine, r.Target.Name())
@@ -783,7 +810,7 @@ func (r *Restore) restoreChunkGroup(
 			// cross-checks the decoded count against the chunk's manifest
 			// RowCount (the per-chunk layer-2 check); a mismatch on either
 			// is a hard failure surfaced here.
-			chunkRows, err := r.streamChunkRows(streamCtx, chunk, rowCh)
+			chunkRows, err := r.streamChunkRows(streamCtx, table, chunk, rowCh)
 			if err != nil {
 				resCh <- groupResult{err: fmt.Errorf("chunk %d (%s): %w", chunkIdx, chunk.File, err)}
 				return
@@ -913,12 +940,14 @@ func (r *Restore) resolveTableChunkParallelism(ctx context.Context, table *ir.Ta
 	return effective
 }
 
-// streamChunkRows opens chunk in the store, decodes every row, sends
-// each into rowCh, and verifies the SHA-256 on close. Returns the
-// row count read from this chunk, which the caller compares against
-// the manifest entry's RowCount for layer-2 verification.
+// streamChunkRows opens chunk in the store, validates its header
+// against table's source column set, decodes every row, sends each
+// into rowCh, and verifies the SHA-256 on close. Returns the row count
+// read from this chunk, which the caller compares against the manifest
+// entry's RowCount for layer-2 verification.
 func (r *Restore) streamChunkRows(
 	ctx context.Context,
+	table *ir.Table,
 	chunk *irbackup.ChunkInfo,
 	rowCh chan<- ir.Row,
 ) (int64, error) {
@@ -931,9 +960,18 @@ func (r *Restore) streamChunkRows(
 		_ = src.Close()
 		return 0, fmt.Errorf("resolve chunk cek: %w", err)
 	}
-	cr, err := blobcodec.NewChunkReader(src, chunk.SHA256, cek, r.segCodec)
+	cr, err := blobcodec.NewChunkReader(src, chunk.SHA256, cek, r.segCodec, irbackup.ChunkAADFor(r.manifest, chunk))
 	if err != nil {
 		return 0, fmt.Errorf("open chunk reader: %w", err)
+	}
+	// Chunk-header ↔ schema cross-check (ADR-0152, audit N-8 item 3):
+	// the header pins the column list the chunk was written against; a
+	// mismatch against the manifest schema's column set means the chunk
+	// does not belong to this schema version — rows would silently
+	// mis-key — so refuse loudly before emitting any.
+	if err := r.checkChunkHeaderColumns(table, chunk, cr.Header().Columns); err != nil {
+		_ = cr.Close()
+		return 0, err
 	}
 
 	var rows int64
@@ -965,6 +1003,80 @@ func (r *Restore) streamChunkRows(
 			chunk.File, chunk.RowCount, rows)
 	}
 	return rows, nil
+}
+
+// sourceChunkColumns maps every manifest-schema table to its
+// non-generated column-name list — the exact set [blobcodec.ChunkWriter]
+// pins into each chunk's header (generated columns are never backed
+// up). Keys are [manifestTableKey]-shaped, matching how restore pairs
+// schema tables with their manifest entries.
+func sourceChunkColumns(schema *ir.Schema) map[string][]string {
+	out := make(map[string][]string, len(schema.Tables))
+	for _, t := range schema.Tables {
+		if t == nil {
+			continue
+		}
+		cols := nonGeneratedTableColumns(t)
+		names := make([]string, len(cols))
+		for i, c := range cols {
+			names[i] = c.Name
+		}
+		out[manifestTableKey(t.Schema, t.Name)] = names
+	}
+	return out
+}
+
+// checkChunkHeaderColumns compares a chunk's header column list
+// against the manifest schema's expected set for table, as SETS —
+// order-insensitive, because the header records declaration order
+// while the guarantee that matters is "same columns". Any missing or
+// unexpected column is a loud refusal naming both sides: the chunk was
+// written against a DIFFERENT schema version than the manifest carries
+// (a renamed column being the canonical case), and streaming it would
+// silently mis-key rows. ADR-0152 (audit N-8 item 3) — this is the
+// enforcement the chunk-header format doc had promised since Phase 1.
+//
+// Runs for every chunk, plaintext and encrypted alike (the header is
+// inside the codec stream, so it is covered by GCM on encrypted
+// chunks and only by SHA-256 on plaintext ones — either way the
+// cross-check against the manifest schema is what catches the
+// mis-assembled pairing).
+func (r *Restore) checkChunkHeaderColumns(table *ir.Table, chunk *irbackup.ChunkInfo, headerCols []string) error {
+	key := manifestTableKey(table.Schema, table.Name)
+	expected, ok := r.chunkColumns[key]
+	if !ok {
+		// Programming error: every restored table came out of the same
+		// manifest schema the map was built from. Loud, not skipped.
+		return fmt.Errorf("restore: internal: no source column set for table %q (chunk %s)", key, chunk.File)
+	}
+	missing, extra := diffColumnSets(expected, headerCols)
+	if len(missing) == 0 && len(extra) == 0 {
+		return nil
+	}
+	return fmt.Errorf("restore: chunk %s does not match table %q's schema: header is missing columns %v and carries unexpected columns %v — the chunk was written against a different schema version than this manifest records (renamed/altered column, or a mis-assembled/tampered backup store); refusing before any row lands",
+		chunk.File, key, missing, extra)
+}
+
+// diffColumnSets returns expected-minus-got (missing) and
+// got-minus-expected (extra), each in first-seen order.
+func diffColumnSets(expected, got []string) (missing, extra []string) {
+	gotSet := make(map[string]struct{}, len(got))
+	for _, c := range got {
+		gotSet[c] = struct{}{}
+	}
+	expSet := make(map[string]struct{}, len(expected))
+	for _, c := range expected {
+		expSet[c] = struct{}{}
+		if _, ok := gotSet[c]; !ok {
+			missing = append(missing, c)
+		}
+	}
+	for _, c := range got {
+		if _, ok := expSet[c]; !ok {
+			extra = append(extra, c)
+		}
+	}
+	return missing, extra
 }
 
 // filterManifestTables filters the manifest's table list against the
@@ -1037,12 +1149,19 @@ func (r *Restore) preflightEncryption(manifest *irbackup.Manifest) error {
 		if len(enc.WrappedCEK) == 0 {
 			return errors.New("encrypted chain in per-chain mode but ChainEncryption.WrappedCEK is empty (manifest corrupted?)")
 		}
-		cek, err := r.Envelope.UnwrapCEK(enc.WrappedCEK)
+		// ADR-0152 chokepoint: identity-bound unwrap for v5+ manifests,
+		// legacy unwrap below; plus the Azure wrap-time key-version
+		// retarget (audit N-9).
+		cek, err := lineage.UnwrapChainCEK(r.Envelope, enc.WrappedCEK, manifest)
 		if err != nil {
 			return fmt.Errorf("unwrap chain cek (wrong passphrase / KMS key?): %w", err)
 		}
 		r.chainCEK = cek
+		return nil
 	}
+	// Per-chunk mode: no chain-level CEK, but the envelope still needs
+	// the Azure version retarget before the per-chunk unwraps run.
+	lineage.RebindEnvelopeKEK(r.Envelope, manifest)
 	return nil
 }
 
@@ -1159,11 +1278,17 @@ func VerifyBackupWith(ctx context.Context, store irbackup.Store, opts VerifyOpti
 				)
 			}
 			if len(rootEnc.WrappedCEK) > 0 {
-				if _, uerr := opts.Envelope.UnwrapCEK(rootEnc.WrappedCEK); uerr != nil {
+				// ADR-0152 chokepoint: bound unwrap for v5+ roots +
+				// the Azure key-version retarget (audit N-9).
+				if _, uerr := lineage.UnwrapChainCEK(opts.Envelope, rootEnc.WrappedCEK, records[0].Manifest); uerr != nil {
 					return 0, 0, fmt.Errorf(
 						"verify: unwrap chain cek (wrong passphrase / KMS key?): %w", uerr,
 					)
 				}
+			} else {
+				// Per-chunk mode: retarget the envelope's key version
+				// before the per-chunk probes in the loop below.
+				lineage.RebindEnvelopeKEK(opts.Envelope, records[0].Manifest)
 			}
 		}
 	}

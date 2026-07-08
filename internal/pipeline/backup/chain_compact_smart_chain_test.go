@@ -307,7 +307,7 @@ func seedSmartCompactLineageWithSchemaAndEnc(
 			// compact has bytes to decode.
 			chunkPath := fmt.Sprintf("chunks/_changes/seg%d-incr%d.jsonl.gz", i, j)
 			buf := &bytes.Buffer{}
-			cw, err := blobcodec.NewChangeChunkWriter(buf, nil, blobcodec.CodecGzip)
+			cw, err := blobcodec.NewChangeChunkWriter(buf, nil, blobcodec.CodecGzip, nil)
 			if err != nil {
 				t.Fatalf("chunk writer: %v", err)
 			}

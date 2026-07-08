@@ -63,7 +63,10 @@ type ChangeChunkWriter struct {
 	closed      bool
 
 	// cek, when non-nil, enables encrypted mode (mirrors ChunkWriter).
+	// aad, when additionally non-nil, is the chunk's position binding
+	// applied at Close-time encryption ([irbackup.ChunkAAD]).
 	cek   []byte
+	aad   []byte
 	gzBuf *bytes.Buffer
 
 	// snapshots collects every ir.SchemaSnapshot observed during this
@@ -82,10 +85,16 @@ type ChangeChunkWriter struct {
 // When cek is non-nil, the gzipped JSONL bytes are buffered in memory
 // and AES-256-GCM-encrypted at Close time before being written to out.
 // The hasher covers post-encryption bytes so `backup verify`'s
-// sha256-only check matches what's on disk.
-func NewChangeChunkWriter(out io.Writer, cek []byte, codec Codec) (*ChangeChunkWriter, error) {
+// sha256-only check matches what's on disk. aad mirrors
+// [NewChunkWriter]: the chunk's position binding ([irbackup.ChunkAAD],
+// nil for plaintext and pre-FormatVersion-5 chains); aad without cek
+// is refused.
+func NewChangeChunkWriter(out io.Writer, cek []byte, codec Codec, aad []byte) (*ChangeChunkWriter, error) {
 	if cek != nil && len(cek) != crypto.CEKLen {
 		return nil, fmt.Errorf("change chunk writer: cek length %d != %d", len(cek), crypto.CEKLen)
+	}
+	if cek == nil && aad != nil {
+		return nil, errors.New("change chunk writer: aad supplied without a cek (plaintext chunks cannot carry a position binding)")
 	}
 	hasher := sha256.New()
 	var (
@@ -121,6 +130,7 @@ func NewChangeChunkWriter(out io.Writer, cek []byte, codec Codec) (*ChangeChunkW
 		gzWriter: gz,
 		bufW:     bw,
 		cek:      cek,
+		aad:      aad,
 		gzBuf:    gzBuf,
 	}, nil
 }
@@ -180,7 +190,7 @@ func (w *ChangeChunkWriter) Close() error {
 		return fmt.Errorf("change chunk writer gzip close: %w", err)
 	}
 	if w.cek != nil {
-		ct, err := crypto.EncryptChunk(w.gzBuf.Bytes(), w.cek)
+		ct, err := crypto.EncryptChunkWithAAD(w.gzBuf.Bytes(), w.cek, w.aad)
 		if err != nil {
 			return fmt.Errorf("change chunk writer encrypt: %w", err)
 		}
@@ -233,7 +243,12 @@ type ChangeChunkReader struct {
 // codec is the codec RECORDED for this chunk's segment in
 // lineage.json — never inferred from the bytes (DR data; an inferred
 // codec is a latent corruption path).
-func NewChangeChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte, codec Codec) (*ChangeChunkReader, error) {
+//
+// aad mirrors [NewChunkReader]: the chunk's position binding, derived
+// from the owning manifest's RECORDED FormatVersion
+// ([irbackup.ChunkAAD]); a bound chunk opened with the wrong (or
+// missing) aad fails the GCM auth check before any event is emitted.
+func NewChangeChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte, codec Codec, aad []byte) (*ChangeChunkReader, error) {
 	// Ownership guard: same as NewChunkReader — every early-return error
 	// path releases the store handle + any constructed codec reader so a
 	// corrupt / bad-codec / hash-mismatch change-chunk open doesn't leak
@@ -254,6 +269,9 @@ func NewChangeChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte, 
 	if cek != nil && len(cek) != crypto.CEKLen {
 		return nil, fmt.Errorf("change chunk reader: cek length %d != %d", len(cek), crypto.CEKLen)
 	}
+	if cek == nil && aad != nil {
+		return nil, errors.New("change chunk reader: aad supplied without a cek (plaintext chunks carry no position binding)")
+	}
 	hasher := sha256.New()
 	var (
 		gzSrc       io.Reader
@@ -270,7 +288,7 @@ func NewChangeChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte, 
 		if _, err := hasher.Write(ct); err != nil {
 			return nil, fmt.Errorf("change chunk reader: hash ciphertext: %w", err)
 		}
-		pt, err := crypto.DecryptChunk(ct, cek)
+		pt, err := crypto.DecryptChunkWithAAD(ct, cek, aad)
 		if err != nil {
 			return nil, fmt.Errorf("change chunk reader: decrypt: %w", err)
 		}

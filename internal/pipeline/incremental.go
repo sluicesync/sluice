@@ -363,6 +363,15 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("incremental: encryption: %w", err)
 	}
+	// ADR-0152: an encrypted incremental's chunks are freshly written
+	// this run, so they always carry the chunk-position binding and the
+	// manifest is stamped accordingly — even when it extends an OLDER
+	// (pre-v5) chain, whose root keeps its own version and unbound
+	// shape (each link's chunks are gated by its OWN recorded version).
+	// Must precede captureWindow so [irbackup.ChunkAAD] gates on.
+	if b.Encryption != nil {
+		manifest.FormatVersion = max(manifest.FormatVersion, irbackup.FormatVersionEncryptedChunkBinding)
+	}
 
 	deadline := clockNow().Add(windowDur)
 	endPos, totalChanges, captureErr := b.captureWindow(ctx, cdc, changesCh, manifest, chunkSize, deadline, b.MaxChanges, clockNow, chainCEK)
@@ -399,17 +408,23 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 		// standalone-sequence positions - positions advance with DML,
 		// so the delta gate above never re-stamps for them, and the
 		// chain-tail re-prime would otherwise read positions the
-		// window's own changes already consumed. Table shape (and the
-		// recorded SchemaHash) stay the before-schema contract:
-		// ComputeSchemaHash canonicalizes positions away, so the swap
-		// is hash-invisible for POSITION-only drift. If sequence
-		// OPTIONS changed inside this no-DDL window, the swapped
-		// schema would no longer re-hash to the recorded SchemaHash —
-		// harmless today (no read-side hash verification exists), but
-		// a future hash-verifying chain walker must canonicalize the
-		// same way before comparing, or it would reject legitimate
-		// chains written by this binary.
+		// window's own changes already consumed. ComputeSchemaHash
+		// canonicalizes positions away, so the swap is hash-invisible
+		// for POSITION-only drift — but sequence OPTIONS changed inside
+		// a no-DDL window DO shift the fingerprint, and chain-restore
+		// now verifies recorded-vs-recomputed (ADR-0152), so the hash
+		// is re-stamped over the swapped schema. Recorded hash ==
+		// hash(recorded schema) is the invariant; the adjacent-link
+		// continuity reading stays intact because the next link's
+		// before-hash is computed from THIS recorded schema. (Pre-
+		// ADR-0152 manifests skipped the re-stamp; the chain-restore
+		// verifier carries a named WARN carve-out for that shape.)
 		manifest.Schema = schemaWithRefreshedSequences(manifest.Schema, afterSchema)
+		refreshedHash, err := irbackup.ComputeSchemaHash(manifest.Schema)
+		if err != nil {
+			return fmt.Errorf("incremental: hash refreshed schema: %w", err)
+		}
+		manifest.SchemaHash = refreshedHash
 	}
 
 	// 6. Compute BackupID and finalise.
@@ -774,7 +789,11 @@ func (b *IncrementalBackup) captureWindow(
 			return fmt.Errorf("resolve chunk cek: %w", err)
 		}
 		curWrappedCEK = wrapped
-		w, err := blobcodec.NewChangeChunkWriter(buf, cek, b.segCodec)
+		// ADR-0152: bind the chunk to the path + list ordinal flush
+		// will record it at (chunkIdx only advances at flush, so open
+		// and flush agree; the ordinal guards change-REPLAY order).
+		path := changeChunkPath(runNamespace, chunkIdx)
+		w, err := blobcodec.NewChangeChunkWriter(buf, cek, b.segCodec, irbackup.ChangeChunkAAD(manifest, path, chunkIdx))
 		if err != nil {
 			return fmt.Errorf("open chunk: %w", err)
 		}
@@ -973,7 +992,7 @@ func joinComma(parts []string) string {
 // failed`. Tests that pre-build envelopes with the chain's known salt
 // don't supply RebuildForChain and pass through the cold-start path.
 func (b *IncrementalBackup) alignEncryption(ctx context.Context, parent *irbackup.Manifest) ([]byte, error) {
-	parentEnc, err := lineage.ChainRootEncryption(ctx, b.segStore, parent)
+	rootManifest, parentEnc, err := lineage.ChainRootEncryption(ctx, b.segStore, parent)
 	if err != nil {
 		// Audit N-6: a failed root-manifest read must NOT be conflated
 		// with "parent chain is plaintext" — that branch decides whether
@@ -1024,12 +1043,18 @@ func (b *IncrementalBackup) alignEncryption(ctx context.Context, parent *irbacku
 		if len(parentEnc.WrappedCEK) == 0 {
 			return nil, errors.New("incremental: parent's chain encryption is per-chain but WrappedCEK is empty")
 		}
-		cek, err := b.Encryption.Envelope.UnwrapCEK(parentEnc.WrappedCEK)
+		// ADR-0152 chokepoint: the chain-root manifest OWNS the wrap —
+		// its recorded FormatVersion decides bound-vs-legacy, and the
+		// Azure key-version retarget (audit N-9) rides along.
+		cek, err := lineage.UnwrapChainCEK(b.Encryption.Envelope, parentEnc.WrappedCEK, rootManifest)
 		if err != nil {
 			return nil, fmt.Errorf("incremental: unwrap parent chain cek (wrong passphrase?): %w", err)
 		}
 		return cek, nil
 	}
+	// Per-chunk mode: retarget the envelope's key version before the
+	// probe below / the per-chunk wraps this run performs.
+	lineage.RebindEnvelopeKEK(b.Encryption.Envelope, rootManifest)
 	// Per-chunk mode: no chain-level CEK to unwrap (each chunk wraps
 	// its own CEK). Probe the operator's envelope against one of the
 	// parent's existing chunk WrappedCEKs so a rotated passphrase

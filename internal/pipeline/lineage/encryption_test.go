@@ -51,7 +51,7 @@ func TestChainRootEncryption_ReadFailureIsAnError(t *testing.T) {
 
 	t.Run("failing Exists probe → error", func(t *testing.T) {
 		store := &failingExistsStore{memStore: newMemStore(), err: errors.New("transient store outage")}
-		enc, err := ChainRootEncryption(ctx, store, incParent)
+		_, enc, err := ChainRootEncryption(ctx, store, incParent)
 		if err == nil {
 			t.Fatalf("want error on failing store read; got enc=%v err=nil (the N-6 swallow is back)", enc)
 		}
@@ -62,7 +62,7 @@ func TestChainRootEncryption_ReadFailureIsAnError(t *testing.T) {
 
 	t.Run("failing Get → error", func(t *testing.T) {
 		store := &failingGetStore{memStore: newMemStore(), err: errors.New("connection reset")}
-		if _, err := ChainRootEncryption(ctx, store, incParent); err == nil {
+		if _, _, err := ChainRootEncryption(ctx, store, incParent); err == nil {
 			t.Fatal("want error on failing manifest Get; got nil")
 		}
 	})
@@ -72,7 +72,7 @@ func TestChainRootEncryption_ReadFailureIsAnError(t *testing.T) {
 		// question — the fast path must not touch the store.
 		store := &failingExistsStore{memStore: newMemStore(), err: errors.New("must not be reached")}
 		want := &irbackup.ChainEncryption{Algorithm: "AES-256-GCM", KEKMode: "passphrase-argon2id"}
-		enc, err := ChainRootEncryption(ctx, store, &irbackup.Manifest{ChainEncryption: want})
+		_, enc, err := ChainRootEncryption(ctx, store, &irbackup.Manifest{ChainEncryption: want})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -82,7 +82,7 @@ func TestChainRootEncryption_ReadFailureIsAnError(t *testing.T) {
 	})
 
 	t.Run("absent root manifest → (nil, nil) = genuinely plaintext", func(t *testing.T) {
-		enc, err := ChainRootEncryption(ctx, newMemStore(), incParent)
+		_, enc, err := ChainRootEncryption(ctx, newMemStore(), incParent)
 		if err != nil {
 			t.Fatalf("absent root manifest must stay the plaintext shape, not an error: %v", err)
 		}
@@ -97,7 +97,7 @@ func TestChainRootEncryption_ReadFailureIsAnError(t *testing.T) {
 		if err := WriteManifest(ctx, store, root); err != nil {
 			t.Fatalf("WriteManifest: %v", err)
 		}
-		enc, err := ChainRootEncryption(ctx, store, incParent)
+		_, enc, err := ChainRootEncryption(ctx, store, incParent)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}

@@ -778,7 +778,7 @@ func applySmartCompactionToIncremental(
 	// Step 1: decode every chunk in order, feed the compactor.
 	compactor := newSmartCompactor(pkStrategy, im.Schema)
 	bytesBefore := int64(0)
-	for _, ch := range im.ChangeChunks {
+	for chIdx, ch := range im.ChangeChunks {
 		rc, err := store.Get(ctx, ch.File)
 		if err != nil {
 			return nil, fmt.Errorf("read chunk %q: %w", ch.File, err)
@@ -793,7 +793,11 @@ func applySmartCompactionToIncremental(
 		// "Access is denied" (task #9; TestADR0064 on this exact shape).
 		var size int64
 		counter := &countingReader{src: rc, n: &size}
-		ccr, err := blobcodec.NewChangeChunkReader(counter, "", cek, codec)
+		// ADR-0152: the chunk's position binding is derived from the
+		// OWNING manifest's recorded FormatVersion + identity — nil for
+		// pre-v5 chains — and the rewrite below re-binds under the same
+		// (path-stable, identity-stable) manifest.
+		ccr, err := blobcodec.NewChangeChunkReader(counter, "", cek, codec, irbackup.ChangeChunkAADFor(im, ch, chIdx))
 		if err != nil {
 			_ = rc.Close()
 			return nil, fmt.Errorf("open chunk %q: %w", ch.File, err)
@@ -837,7 +841,7 @@ func applySmartCompactionToIncremental(
 	bytesAfter := int64(0)
 	for i, ch := range im.ChangeChunks {
 		buf := &bytes.Buffer{}
-		cw, err := blobcodec.NewChangeChunkWriter(buf, cek, codec)
+		cw, err := blobcodec.NewChangeChunkWriter(buf, cek, codec, irbackup.ChangeChunkAADFor(im, ch, i))
 		if err != nil {
 			return nil, fmt.Errorf("open chunk writer %q: %w", ch.File, err)
 		}

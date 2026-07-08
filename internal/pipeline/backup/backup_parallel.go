@@ -453,6 +453,14 @@ type backupChunkStreamer struct {
 	chainCEK  []byte
 	chunkRows int
 
+	// manifest is the run's in-flight manifest (the committer's), read
+	// here ONLY for its immutable identity fields (FormatVersion,
+	// CreatedAt, SourceEngine, Kind — all fixed before the table pool
+	// starts): [irbackup.ChunkAAD] derives each chunk's position
+	// binding from them (ADR-0152). Mutable manifest state stays
+	// behind the committer's mutex.
+	manifest *irbackup.Manifest
+
 	cols     []*ir.Column
 	colNames []string
 	pkCols   []string
@@ -462,6 +470,7 @@ type backupChunkStreamer struct {
 
 	writer        *blobcodec.ChunkWriter
 	buf           *bytes.Buffer
+	curPath       string // this chunk's store path, allocated at open (the AAD binds to it)
 	curWrappedCEK []byte // populated only in per-chunk encryption mode
 }
 
@@ -487,6 +496,7 @@ func (b *Backup) newBackupChunkStreamer(
 		committer: committer,
 		chainCEK:  chainCEK,
 		chunkRows: chunkRows,
+		manifest:  committer.manifest,
 		cols:      cols,
 		colNames:  colNames,
 		pkCols:    migcore.TablePKColumns(table),
@@ -507,7 +517,18 @@ func (s *backupChunkStreamer) writeRow(ctx context.Context, row ir.Row) error {
 			return fmt.Errorf("resolve chunk cek: %w", err)
 		}
 		s.curWrappedCEK = wrapped
-		w, err := blobcodec.NewChunkWriter(s.buf, s.colNames, cek, s.b.Codec)
+		// The chunk's manifest-unique index — and with it the store
+		// path — is allocated at OPEN so the writer can bind the
+		// ciphertext to it (ADR-0152: AAD = manifest identity + path).
+		// Allocation moved here from flush; the properties flush's doc
+		// relied on hold unchanged: the atomic Add stays collision-free
+		// across concurrent range workers, and every successfully-
+		// streamed table flushes every writer it opens, so a completed
+		// table's index set is gapless exactly as before (an errored
+		// table re-streams from scratch either way — Bug 135).
+		idx := int(s.chunkIdx.Add(1) - 1)
+		s.curPath = chunkFilePath(s.table, idx)
+		w, err := blobcodec.NewChunkWriter(s.buf, s.colNames, cek, s.b.Codec, irbackup.ChunkAAD(s.manifest, s.curPath))
 		if err != nil {
 			return fmt.Errorf("open chunk: %w", err)
 		}
@@ -530,7 +551,7 @@ func (s *backupChunkStreamer) writeRow(ctx context.Context, row ir.Row) error {
 }
 
 // flush closes the open chunk (no-op when none is open — empty tables
-// produce zero chunks), allocates its manifest-unique index, uploads it
+// produce zero chunks), uploads it to the path allocated at open
 // unless the content-addressed same-path SHA comparison says the bytes
 // are already there (resumable-write defence; mismatches overwrite —
 // a corrupted partial upload must not survive a re-run), and
@@ -542,8 +563,7 @@ func (s *backupChunkStreamer) flush(ctx context.Context) error {
 	if err := s.writer.Close(); err != nil {
 		return fmt.Errorf("close chunk: %w", err)
 	}
-	idx := int(s.chunkIdx.Add(1) - 1)
-	chunkPath := chunkFilePath(s.table, idx)
+	chunkPath := s.curPath
 	hash := s.writer.Hash()
 	skip, err := chunkAlreadyMatches(ctx, s.b.Store, chunkPath, hash)
 	if err != nil {
@@ -569,13 +589,14 @@ func (s *backupChunkStreamer) flush(ctx context.Context) error {
 	}
 	s.writer = nil
 	s.buf = nil
+	s.curPath = ""
 	s.curWrappedCEK = nil
 	// Per-chunk checkpoint: observability + it keeps the same-path SHA
 	// fast-skip effective across a re-run. Resume never REUSES partial
 	// chunk lists (Bug 135). The committer serializes the entry mutation
 	// + manifest write against peer tables AND peer range workers.
 	if err := s.committer.appendChunk(ctx, s.entry, ci); err != nil {
-		return fmt.Errorf("checkpoint manifest after chunk %d: %w", idx, err)
+		return fmt.Errorf("checkpoint manifest after chunk %q: %w", chunkPath, err)
 	}
 	return nil
 }

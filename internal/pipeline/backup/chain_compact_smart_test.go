@@ -609,7 +609,7 @@ func TestSmart_ChunkRewrite_RoundTrip(t *testing.T) {
 	// Build a chunk with 1000 INSERTs + 1000 UPDATEs on 100 rows
 	// → expected reduction from 2000 → 100 events.
 	buf := &bytes.Buffer{}
-	cw, err := blobcodec.NewChangeChunkWriter(buf, nil, blobcodec.CodecGzip)
+	cw, err := blobcodec.NewChangeChunkWriter(buf, nil, blobcodec.CodecGzip, nil)
 	if err != nil {
 		t.Fatalf("writer: %v", err)
 	}
@@ -698,7 +698,7 @@ func TestSmart_ChunkRewrite_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get chunk: %v", err)
 	}
-	cr, err := blobcodec.NewChangeChunkReader(rc, "", nil, blobcodec.CodecGzip)
+	cr, err := blobcodec.NewChangeChunkReader(rc, "", nil, blobcodec.CodecGzip, nil)
 	if err != nil {
 		t.Fatalf("reader: %v", err)
 	}
@@ -779,7 +779,7 @@ func TestSmart_ChunkRewrite_ClosesSourceHandles(t *testing.T) {
 	var lsn uint64 = 100
 	for _, p := range paths {
 		buf := &bytes.Buffer{}
-		cw, err := blobcodec.NewChangeChunkWriter(buf, nil, blobcodec.CodecGzip)
+		cw, err := blobcodec.NewChangeChunkWriter(buf, nil, blobcodec.CodecGzip, nil)
 		if err != nil {
 			t.Fatalf("writer: %v", err)
 		}

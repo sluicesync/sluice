@@ -604,7 +604,7 @@ func TestChainRestore_SchemaHistoryReplayed(t *testing.T) {
 	}
 	// Build a single-Insert change chunk via the writer.
 	buf := &bytes.Buffer{}
-	cw, err := blobcodec.NewChangeChunkWriter(buf, nil, blobcodec.CodecGzip)
+	cw, err := blobcodec.NewChangeChunkWriter(buf, nil, blobcodec.CodecGzip, nil)
 	if err != nil {
 		t.Fatalf("newChangeChunkWriter: %v", err)
 	}
@@ -822,7 +822,7 @@ func TestChainRestore_PreChunkDManifest_BackwardCompat(t *testing.T) {
 	// SchemaHistory deliberately nil (pre-Chunk-D shape).
 	incr.SchemaHistory = nil
 	buf := &bytes.Buffer{}
-	cw, _ := blobcodec.NewChangeChunkWriter(buf, nil, blobcodec.CodecGzip)
+	cw, _ := blobcodec.NewChangeChunkWriter(buf, nil, blobcodec.CodecGzip, nil)
 	_ = cw.WriteChange(ir.Insert{
 		Position: ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/180"}`},
 		Table:    "users",
@@ -977,7 +977,7 @@ func TestChainRestore_DispatchFromRestore_Run(t *testing.T) {
 func writeTestChangeChunk(t *testing.T, store irbackup.Store, path string, changes []ir.Change) *irbackup.ChunkInfo {
 	t.Helper()
 	buf := &bytes.Buffer{}
-	cw, err := blobcodec.NewChangeChunkWriter(buf, nil, blobcodec.CodecGzip)
+	cw, err := blobcodec.NewChangeChunkWriter(buf, nil, blobcodec.CodecGzip, nil)
 	if err != nil {
 		t.Fatalf("newChangeChunkWriter: %v", err)
 	}

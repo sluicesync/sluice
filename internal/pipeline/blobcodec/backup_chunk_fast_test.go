@@ -436,7 +436,7 @@ func TestFastRowCodec_FamilyMatrixRoundTrip(t *testing.T) {
 				{Name: "scalar"}, {Name: "inlist"}, {Name: "inmap"}, {Name: "isnull"},
 			}
 			var buf bytes.Buffer
-			w, err := NewChunkWriter(&buf, []string{"scalar", "inlist", "inmap", "isnull"}, nil, CodecGzip)
+			w, err := NewChunkWriter(&buf, []string{"scalar", "inlist", "inmap", "isnull"}, nil, CodecGzip, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -446,7 +446,7 @@ func TestFastRowCodec_FamilyMatrixRoundTrip(t *testing.T) {
 			if err := w.Close(); err != nil {
 				t.Fatal(err)
 			}
-			r, err := NewChunkReader(io.NopCloser(bytes.NewReader(buf.Bytes())), w.Hash(), nil, CodecGzip)
+			r, err := NewChunkReader(io.NopCloser(bytes.NewReader(buf.Bytes())), w.Hash(), nil, CodecGzip, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -523,7 +523,7 @@ func TestChunkCodec_NonFiniteFloats(t *testing.T) {
 					{Name: "sibling"},
 				}
 				var buf bytes.Buffer
-				w, err := NewChunkWriter(&buf, []string{"scalar", "inlist", "inmap", "numstr", "sibling"}, nil, CodecGzip)
+				w, err := NewChunkWriter(&buf, []string{"scalar", "inlist", "inmap", "numstr", "sibling"}, nil, CodecGzip, nil)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -533,7 +533,7 @@ func TestChunkCodec_NonFiniteFloats(t *testing.T) {
 				if err := w.Close(); err != nil {
 					t.Fatal(err)
 				}
-				r, err := NewChunkReader(io.NopCloser(bytes.NewReader(buf.Bytes())), w.Hash(), nil, CodecGzip)
+				r, err := NewChunkReader(io.NopCloser(bytes.NewReader(buf.Bytes())), w.Hash(), nil, CodecGzip, nil)
 				if err != nil {
 					t.Fatal(err)
 				}

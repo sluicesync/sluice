@@ -227,6 +227,13 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore: %w", err))
 	}
 
+	// 2.7. Schema-fingerprint corruption check across every link
+	// (ADR-0152 — the check [irbackup.Manifest.SchemaHash] documents),
+	// before anything lands on the target.
+	if err := r.verifySchemaHashes(ctx, links); err != nil {
+		return migcore.WrapWithHint(migcore.PhaseConnect, err)
+	}
+
 	applier, err := r.Target.OpenChangeApplier(ctx, r.TargetDSN)
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore: open change applier: %w", err))
@@ -544,11 +551,64 @@ func (r *ChainRestore) preflightEncryption(rootManifest *irbackup.Manifest) erro
 		if len(enc.WrappedCEK) == 0 {
 			return errors.New("encrypted chain in per-chain mode but ChainEncryption.WrappedCEK is empty")
 		}
-		cek, err := r.Envelope.UnwrapCEK(enc.WrappedCEK)
+		// ADR-0152 chokepoint: identity-bound unwrap for v5+ roots,
+		// legacy unwrap below; plus the Azure wrap-time key-version
+		// retarget (audit N-9).
+		cek, err := lineage.UnwrapChainCEK(r.Envelope, enc.WrappedCEK, rootManifest)
 		if err != nil {
 			return fmt.Errorf("unwrap chain cek (wrong passphrase / KMS key?): %w", err)
 		}
 		r.chainCEK = cek
+		return nil
+	}
+	// Per-chunk mode: no chain-level CEK, but the envelope still needs
+	// the Azure version retarget before the per-chunk unwraps run.
+	lineage.RebindEnvelopeKEK(r.Envelope, rootManifest)
+	return nil
+}
+
+// verifySchemaHashes recomputes every link's schema fingerprint and
+// compares it against the manifest-recorded [irbackup.Manifest.SchemaHash]
+// BEFORE anything lands on the target — the check the SchemaHash field
+// doc promised and, pre-ADR-0152, nothing performed (audit N-8 item 4).
+// This is CORRUPTION detection (bit-rot, truncated rewrite, mangled
+// schema JSON), not tamper-proofing: the hash lives in the same
+// unsigned manifest as the schema.
+//
+// Links without a recorded hash (fulls written before ADR-0152,
+// pre-Phase-3 manifests) are skipped. One named carve-out: a pre-v5
+// manifest carrying STANDALONE sequences can legitimately mismatch —
+// older writers re-stamped the recorded Schema with end-of-window
+// sequence state without re-stamping the hash when sequence OPTIONS
+// changed inside a no-DDL window (the wart the incremental writer's
+// item-51 comment predicted a "future hash-verifying chain walker"
+// would trip on; current writers re-hash after the swap). That shape
+// WARNs instead of refusing — refusing legitimate old chains on the DR
+// path would be worse than the narrow miss.
+func (r *ChainRestore) verifySchemaHashes(ctx context.Context, links []lineage.SegmentRecord) error {
+	for i := range links {
+		m := links[i].Manifest
+		if m == nil || m.SchemaHash == "" {
+			continue
+		}
+		got, err := irbackup.ComputeSchemaHash(m.Schema)
+		if err != nil {
+			return fmt.Errorf("chain restore: link %s: recompute schema hash: %w", links[i].Path, err)
+		}
+		if got == m.SchemaHash {
+			continue
+		}
+		if len(m.Schema.Sequences) > 0 && m.FormatVersion < irbackup.FormatVersionEncryptedChunkBinding {
+			slog.WarnContext(
+				ctx, "chain restore: manifest's recorded schema hash does not match its schema; tolerated on this manifest shape (pre-v5 manifest with standalone sequences — older writers re-stamped sequence state without re-hashing when sequence options changed mid-window). Verify the restored sequences' options against the source",
+				slog.String("manifest", links[i].Path),
+				slog.String("recorded", m.SchemaHash),
+				slog.String("recomputed", got),
+			)
+			continue
+		}
+		return fmt.Errorf("chain restore: manifest %s (backup %s) schema hash mismatch: recorded %s, recomputed %s — the manifest's schema does not match the fingerprint written with it (corrupted or partially-rewritten manifest); refusing before any data lands",
+			links[i].Path, lineage.ManifestBackupID(m), m.SchemaHash, got)
 	}
 	return nil
 }
@@ -882,7 +942,7 @@ func (r *ChainRestore) streamIncrementalChanges(
 		if f.err != nil {
 			return fmt.Errorf("chunk %d (%s): open chunk: %w", f.idx, f.chunk.File, f.err)
 		}
-		if err := r.streamOneChangeChunk(ctx, codec, f.chunk, f.src, out); err != nil {
+		if err := r.streamOneChangeChunk(ctx, link, codec, f.idx, f.chunk, f.src, out); err != nil {
 			return fmt.Errorf("chunk %d (%s): %w", f.idx, f.chunk.File, err)
 		}
 		slog.DebugContext(
@@ -953,7 +1013,9 @@ func (r *ChainRestore) streamSchemaHistorySnapshots(
 // (never sniffed from the bytes — ADR-0046 §5).
 func (r *ChainRestore) streamOneChangeChunk(
 	ctx context.Context,
+	link *lineage.SegmentRecord,
 	codec blobcodec.Codec,
+	chunkIdx int,
 	chunk *irbackup.ChunkInfo,
 	src io.ReadCloser,
 	out chan<- ir.Change,
@@ -963,7 +1025,12 @@ func (r *ChainRestore) streamOneChangeChunk(
 		_ = src.Close()
 		return fmt.Errorf("resolve change chunk cek: %w", err)
 	}
-	cr, err := blobcodec.NewChangeChunkReader(src, chunk.SHA256, cek, codec)
+	// ADR-0152: the position binding comes from the chunk's OWNING
+	// manifest — its recorded FormatVersion gates bound (v5+) vs the
+	// legacy nil-AAD shape, per link, so a mixed chain (old full + new
+	// incrementals) reads each side correctly. The list ordinal rides
+	// in the binding because change-REPLAY order is semantic.
+	cr, err := blobcodec.NewChangeChunkReader(src, chunk.SHA256, cek, codec, irbackup.ChangeChunkAADFor(link.Manifest, chunk, chunkIdx))
 	if err != nil {
 		return fmt.Errorf("open chunk reader: %w", err)
 	}

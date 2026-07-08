@@ -1087,7 +1087,7 @@ func (b *SyncFromBackup) streamIncrementalWithPosition(
 	segStore := link.Segment.Store(b.Store)
 	codec := link.Segment.CodecOrDefault()
 	for chunkIdx, chunk := range link.Manifest.ChangeChunks {
-		if err := b.streamOneChunkWithPosition(ctx, segStore, codec, chunk, pos, out); err != nil {
+		if err := b.streamOneChunkWithPosition(ctx, segStore, codec, link.Manifest, chunkIdx, chunk, pos, out); err != nil {
 			return fmt.Errorf("chunk %d (%s): %w", chunkIdx, chunk.File, err)
 		}
 	}
@@ -1096,11 +1096,16 @@ func (b *SyncFromBackup) streamIncrementalWithPosition(
 
 // streamOneChunkWithPosition reads one chunk's events and pushes them
 // onto out with each change's Position field rewritten to pos.
-// segStore/codec come from the chunk's segment (recorded, not sniffed).
+// segStore/codec come from the chunk's segment (recorded, not
+// sniffed); owner is the manifest recording the chunk, whose
+// FormatVersion + identity derive the chunk's GCM position binding
+// (ADR-0152).
 func (b *SyncFromBackup) streamOneChunkWithPosition(
 	ctx context.Context,
 	segStore irbackup.Store,
 	codec blobcodec.Codec,
+	owner *irbackup.Manifest,
+	chunkIdx int,
 	chunk *irbackup.ChunkInfo,
 	pos ir.Position,
 	out chan<- ir.Change,
@@ -1114,7 +1119,7 @@ func (b *SyncFromBackup) streamOneChunkWithPosition(
 		_ = src.Close()
 		return fmt.Errorf("resolve chunk cek: %w", err)
 	}
-	cr, err := blobcodec.NewChangeChunkReader(src, chunk.SHA256, cek, codec)
+	cr, err := blobcodec.NewChangeChunkReader(src, chunk.SHA256, cek, codec, irbackup.ChangeChunkAADFor(owner, chunk, chunkIdx))
 	if err != nil {
 		return fmt.Errorf("open chunk reader: %w", err)
 	}
@@ -1267,12 +1272,18 @@ func (b *SyncFromBackup) preflightChainEncryption(ctx context.Context) error {
 		if len(enc.WrappedCEK) == 0 {
 			return errors.New("encrypted chain in per-chain mode but ChainEncryption.WrappedCEK is empty")
 		}
-		cek, err := b.Envelope.UnwrapCEK(enc.WrappedCEK)
+		// ADR-0152 chokepoint: identity-bound unwrap for v5+ roots +
+		// the Azure key-version retarget (audit N-9).
+		cek, err := lineage.UnwrapChainCEK(b.Envelope, enc.WrappedCEK, root)
 		if err != nil {
 			return fmt.Errorf("unwrap chain cek (wrong passphrase?): %w", err)
 		}
 		b.chainCEK = cek
+		return nil
 	}
+	// Per-chunk mode: retarget the envelope's key version before the
+	// per-chunk unwraps in chunkCEK.
+	lineage.RebindEnvelopeKEK(b.Envelope, root)
 	return nil
 }
 

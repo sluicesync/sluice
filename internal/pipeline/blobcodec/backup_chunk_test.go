@@ -75,7 +75,7 @@ func TestChunkRoundTrip(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	w, err := NewChunkWriter(&buf, colNames, nil, CodecGzip)
+	w, err := NewChunkWriter(&buf, colNames, nil, CodecGzip, nil)
 	if err != nil {
 		t.Fatalf("NewChunkWriter: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestChunkRoundTrip(t *testing.T) {
 
 	// Read back.
 	src := io.NopCloser(bytes.NewReader(buf.Bytes()))
-	rdr, err := NewChunkReader(src, hash, nil, CodecGzip)
+	rdr, err := NewChunkReader(src, hash, nil, CodecGzip, nil)
 	if err != nil {
 		t.Fatalf("NewChunkReader: %v", err)
 	}
@@ -130,12 +130,12 @@ func TestChunkRoundTrip(t *testing.T) {
 func TestChunkReader_HashMismatch(t *testing.T) {
 	cols := []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}
 	var buf bytes.Buffer
-	w, _ := NewChunkWriter(&buf, []string{"id"}, nil, CodecGzip)
+	w, _ := NewChunkWriter(&buf, []string{"id"}, nil, CodecGzip, nil)
 	_ = w.WriteRow(ir.Row{"id": int64(1)}, cols)
 	_ = w.Close()
 
 	src := io.NopCloser(bytes.NewReader(buf.Bytes()))
-	rdr, err := NewChunkReader(src, "0000deadbeef", nil, CodecGzip)
+	rdr, err := NewChunkReader(src, "0000deadbeef", nil, CodecGzip, nil)
 	if err != nil {
 		t.Fatalf("NewChunkReader: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestChunkEncryptedRoundTrip(t *testing.T) {
 		t.Fatalf("GenerateCEK: %v", err)
 	}
 	var buf bytes.Buffer
-	w, err := NewChunkWriter(&buf, colNames, cek, CodecGzip)
+	w, err := NewChunkWriter(&buf, colNames, cek, CodecGzip, nil)
 	if err != nil {
 		t.Fatalf("NewChunkWriter: %v", err)
 	}
@@ -204,7 +204,7 @@ func TestChunkEncryptedRoundTrip(t *testing.T) {
 		}
 	}
 	src := io.NopCloser(bytes.NewReader(buf.Bytes()))
-	rdr, err := NewChunkReader(src, hash, cek, CodecGzip)
+	rdr, err := NewChunkReader(src, hash, cek, CodecGzip, nil)
 	if err != nil {
 		t.Fatalf("NewChunkReader: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestChunkEncrypted_WrongCEK(t *testing.T) {
 	cek1, _ := crypto.GenerateCEK()
 	cek2, _ := crypto.GenerateCEK()
 	var buf bytes.Buffer
-	w, err := NewChunkWriter(&buf, []string{"id"}, cek1, CodecGzip)
+	w, err := NewChunkWriter(&buf, []string{"id"}, cek1, CodecGzip, nil)
 	if err != nil {
 		t.Fatalf("NewChunkWriter: %v", err)
 	}
@@ -241,7 +241,7 @@ func TestChunkEncrypted_WrongCEK(t *testing.T) {
 	_ = w.Close()
 	hash := w.Hash()
 	src := io.NopCloser(bytes.NewReader(buf.Bytes()))
-	if _, err := NewChunkReader(src, hash, cek2, CodecGzip); err == nil {
+	if _, err := NewChunkReader(src, hash, cek2, CodecGzip, nil); err == nil {
 		t.Fatalf("wrong-cek decrypt expected to fail; got nil")
 	}
 }
@@ -249,7 +249,7 @@ func TestChunkEncrypted_WrongCEK(t *testing.T) {
 func TestChunkReader_FormatVersionMismatch(t *testing.T) {
 	// Hand-craft a chunk file with a future format-version.
 	var buf bytes.Buffer
-	w, _ := NewChunkWriter(&buf, []string{"id"}, nil, CodecGzip)
+	w, _ := NewChunkWriter(&buf, []string{"id"}, nil, CodecGzip, nil)
 	_ = w.Close()
 	// Patching the actual gzip stream is fragile; instead just verify
 	// behaviour via the decoder directly: write a bogus header line
@@ -257,7 +257,7 @@ func TestChunkReader_FormatVersionMismatch(t *testing.T) {
 	// (This check exercises the version-rejection branch without
 	// needing a hand-rolled gzip frame.)
 	bad := []byte("not gzip")
-	rdr, err := NewChunkReader(io.NopCloser(bytes.NewReader(bad)), "", nil, CodecGzip)
+	rdr, err := NewChunkReader(io.NopCloser(bytes.NewReader(bad)), "", nil, CodecGzip, nil)
 	if err == nil {
 		_ = rdr.Close()
 		t.Errorf("expected gzip-header error on non-gzip input; got nil")

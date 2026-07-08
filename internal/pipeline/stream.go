@@ -1143,6 +1143,14 @@ func (b *BackupStream) runRollover(
 	if manifest.ParentBackupID == "" {
 		manifest.ParentBackupID = irbackup.ComputeBackupID(parent)
 	}
+	// ADR-0152: encrypted rollovers write freshly-bound chunks, so the
+	// manifest is stamped the chunk-binding version — regardless of the
+	// (possibly older) chain root's own stamp; each link's chunks are
+	// gated by its OWN recorded version. Must precede captureWindow so
+	// [irbackup.ChunkAAD] gates on.
+	if b.Encryption != nil {
+		manifest.FormatVersion = max(manifest.FormatVersion, irbackup.FormatVersionEncryptedChunkBinding)
+	}
 
 	deadline := clockNow().Add(window)
 	captured, captureErr := b.captureWindow(ctx, cdc, changesCh, manifest, chunkSize, deadline, maxChanges, maxBytes, statePath, clockNow, stopCh, chainCEK)
@@ -1234,9 +1242,17 @@ func (b *BackupStream) refreshSchemaAndAttachDelta(
 	delta := migcore.DiffSchemas(beforeSchema, afterSchema)
 	if len(delta) == 0 {
 		// item 51: no-DDL rollovers still refresh the standalone-
-		// sequence positions (hash-invisible — see the incremental
-		// path's twin swap and schemaWithRefreshedSequences).
+		// sequence positions, then re-stamp the hash over the swapped
+		// schema so chain-restore's recorded-vs-recomputed check
+		// (ADR-0152) holds even when sequence OPTIONS changed inside
+		// the window (position-only drift is hash-invisible — see the
+		// incremental path's twin swap).
 		manifest.Schema = schemaWithRefreshedSequences(manifest.Schema, afterSchema)
+		refreshedHash, err := irbackup.ComputeSchemaHash(manifest.Schema)
+		if err != nil {
+			return fmt.Errorf("rollover: hash refreshed schema: %w", err)
+		}
+		manifest.SchemaHash = refreshedHash
 		return nil
 	}
 	manifest.SchemaDelta = delta
@@ -1523,7 +1539,11 @@ func (cb *changeChunkBuffer) open() error {
 		return fmt.Errorf("resolve chunk cek: %w", err)
 	}
 	cb.curWrappedCEK = wrapped
-	w, err := blobcodec.NewChangeChunkWriter(cb.buf, cek, cb.b.segCodec)
+	// ADR-0152: bind the chunk to the path + list ordinal flushTo
+	// will record it at (chunkIdx only advances at flush, so open and
+	// flush agree; the ordinal guards change-REPLAY order).
+	path := changeChunkPath(cb.runNamespace, cb.chunkIdx)
+	w, err := blobcodec.NewChangeChunkWriter(cb.buf, cek, cb.b.segCodec, irbackup.ChangeChunkAAD(cb.manifest, path, cb.chunkIdx))
 	if err != nil {
 		return fmt.Errorf("open chunk: %w", err)
 	}
@@ -1707,7 +1727,7 @@ func newShellCommand(ctx context.Context, cmdStr string) *exec.Cmd {
 // of the parent's WrappedCEK fails with `aes-gcm open: cipher:
 // message authentication failed`.
 func (b *BackupStream) alignEncryption(ctx context.Context, parent *irbackup.Manifest) ([]byte, error) {
-	parentEnc, err := lineage.ChainRootEncryption(ctx, b.segStore, parent)
+	rootManifest, parentEnc, err := lineage.ChainRootEncryption(ctx, b.segStore, parent)
 	if err != nil {
 		// Audit N-6: a failed root-manifest read must NOT be conflated
 		// with "parent chain is plaintext" — that branch decides whether
@@ -1756,12 +1776,18 @@ func (b *BackupStream) alignEncryption(ctx context.Context, parent *irbackup.Man
 		if len(parentEnc.WrappedCEK) == 0 {
 			return nil, errors.New("stream: parent's chain encryption is per-chain but WrappedCEK is empty")
 		}
-		cek, err := b.Encryption.Envelope.UnwrapCEK(parentEnc.WrappedCEK)
+		// ADR-0152 chokepoint: the chain-root manifest OWNS the wrap —
+		// its recorded FormatVersion decides bound-vs-legacy, and the
+		// Azure key-version retarget (audit N-9) rides along.
+		cek, err := lineage.UnwrapChainCEK(b.Encryption.Envelope, parentEnc.WrappedCEK, rootManifest)
 		if err != nil {
 			return nil, fmt.Errorf("stream: unwrap parent chain cek: %w", err)
 		}
 		return cek, nil
 	}
+	// Per-chunk mode: retarget the envelope's key version before the
+	// probe below / the per-chunk wraps this run performs.
+	lineage.RebindEnvelopeKEK(b.Encryption.Envelope, rootManifest)
 	// Per-chunk mode: probe the operator's envelope against one of the
 	// parent's existing chunk WrappedCEKs so a rotated passphrase
 	// surfaces loudly at stream-extend start. Mirrors the Bug 117

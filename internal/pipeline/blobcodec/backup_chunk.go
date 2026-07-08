@@ -53,7 +53,11 @@ package blobcodec
 // can sanity-check it's reading a sluice chunk before parsing rows;
 // (2) the column list pins the schema the chunk was written against,
 // so a column-rename across schema versions surfaces as a header
-// mismatch on restore rather than silent data loss.
+// mismatch on restore rather than silent data loss. The restore-side
+// enforcement of (2) lives in the pipeline (Restore.streamChunkRows
+// compares [ChunkReader.Header]'s column set against the manifest
+// schema's non-generated columns) — added by ADR-0152; before that
+// this comment promised a check nothing performed (audit N-8 item 3).
 
 import (
 	"bufio"
@@ -121,6 +125,14 @@ type ChunkWriter struct {
 	// not responsible for generating or wrapping it.
 	cek []byte
 
+	// aad, when non-nil, is the GCM additional-authenticated-data the
+	// Close-time encryption binds this chunk to — the manifest
+	// identity + chunk path ([irbackup.ChunkAAD], FormatVersion 5+).
+	// nil writes the legacy unbound ciphertext (pre-v5 chains). Only
+	// meaningful with a non-nil cek; the constructor refuses the
+	// aad-without-cek combination loudly.
+	aad []byte
+
 	// gzBuf is the in-memory buffer used in encrypted mode. The gzip
 	// writer writes here instead of `out` directly; on Close the
 	// bytes get encrypted and pushed to `out`.
@@ -143,10 +155,17 @@ type ChunkWriter struct {
 //
 // When cek is non-nil, encryption is applied at Close time (see
 // [ChunkWriter] for the two modes). cek must be exactly
-// [crypto.CEKLen] bytes.
-func NewChunkWriter(out io.Writer, columns []string, cek []byte, codec Codec) (*ChunkWriter, error) {
+// [crypto.CEKLen] bytes. aad is the chunk's position binding
+// ([irbackup.ChunkAAD]) — nil for plaintext chunks and for pre-
+// FormatVersion-5 encrypted chains; supplying aad without cek is a
+// caller bug and is refused (an unencrypted chunk cannot carry an
+// authenticated binding — silently dropping it would fake integrity).
+func NewChunkWriter(out io.Writer, columns []string, cek []byte, codec Codec, aad []byte) (*ChunkWriter, error) {
 	if cek != nil && len(cek) != crypto.CEKLen {
 		return nil, fmt.Errorf("chunk writer: cek length %d != %d", len(cek), crypto.CEKLen)
+	}
+	if cek == nil && aad != nil {
+		return nil, errors.New("chunk writer: aad supplied without a cek (plaintext chunks cannot carry a position binding)")
 	}
 	hasher := sha256.New()
 	var (
@@ -186,6 +205,7 @@ func NewChunkWriter(out io.Writer, columns []string, cek []byte, codec Codec) (*
 		gzWriter: gz,
 		bufW:     bw,
 		cek:      cek,
+		aad:      aad,
 		gzBuf:    gzBuf,
 	}, nil
 }
@@ -283,8 +303,9 @@ func (w *ChunkWriter) Close() error {
 		// Encrypted mode: encrypt the buffered gzipped bytes and emit
 		// `[nonce | ciphertext | authtag]` to out + hasher. The
 		// manifest's recorded SHA-256 covers ciphertext, matching
-		// what `backup verify` re-hashes off disk.
-		ct, err := crypto.EncryptChunk(w.gzBuf.Bytes(), w.cek)
+		// what `backup verify` re-hashes off disk. The AAD (when set)
+		// binds the ciphertext to this chunk's manifest position.
+		ct, err := crypto.EncryptChunkWithAAD(w.gzBuf.Bytes(), w.cek, w.aad)
 		if err != nil {
 			return fmt.Errorf("chunk writer encrypt: %w", err)
 		}
@@ -361,7 +382,13 @@ var ErrChunkHashMismatch = errors.New("backup: chunk SHA-256 mismatch")
 // lineage.json — never inferred from the bytes. The caller threads it
 // through from segment metadata; an unknown recorded codec is rejected
 // loudly by [ValidateRecordedCodec] before this is reached.
-func NewChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte, codec Codec) (*ChunkReader, error) {
+//
+// aad mirrors [NewChunkWriter]: the chunk's position binding, derived
+// by the caller from the owning manifest's RECORDED FormatVersion
+// ([irbackup.ChunkAAD] — nil for plaintext and pre-v5 chunks). A
+// bound chunk opened with the wrong (or missing) aad fails the GCM
+// auth check here, before a single row is emitted.
+func NewChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte, codec Codec, aad []byte) (*ChunkReader, error) {
 	// Ownership guard: until the ChunkReader is successfully built (and
 	// thereafter owns Close of both the codec reader and src), EVERY
 	// early-return error path must release the underlying store handle
@@ -385,6 +412,9 @@ func NewChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte, codec 
 	if cek != nil && len(cek) != crypto.CEKLen {
 		return nil, fmt.Errorf("chunk reader: cek length %d != %d", len(cek), crypto.CEKLen)
 	}
+	if cek == nil && aad != nil {
+		return nil, errors.New("chunk reader: aad supplied without a cek (plaintext chunks carry no position binding)")
+	}
 	hasher := sha256.New()
 
 	var (
@@ -404,7 +434,7 @@ func NewChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte, codec 
 		if _, err := hasher.Write(ct); err != nil {
 			return nil, fmt.Errorf("chunk reader: hash ciphertext: %w", err)
 		}
-		pt, err := crypto.DecryptChunk(ct, cek)
+		pt, err := crypto.DecryptChunkWithAAD(ct, cek, aad)
 		if err != nil {
 			return nil, fmt.Errorf("chunk reader: decrypt: %w", err)
 		}

@@ -250,7 +250,18 @@ func replayManifestProgress(ctx context.Context, store irbackup.Store, m *irback
 	}
 	defer func() {
 		m.ProgressSidecar = nil
-		m.FormatVersion = irbackup.FormatVersionFor(m.Schema)
+		// Restore the schema-appropriate final version — but only when
+		// the in-progress stamp was the plain sidecar tier. A recorded
+		// version ABOVE the sidecar tier is the writer's finalVersion
+		// showing through (the commit stamp is max(sidecar, final)):
+		// today that is 4 (standalone sequences) or 5 (encrypted
+		// chunk-binding, ADR-0152), and it must survive normalization —
+		// recomputing from the schema would strip the v5 stamp and send
+		// every reader down the legacy nil-AAD decrypt path for chunks
+		// that were written BOUND.
+		if m.FormatVersion <= irbackup.FormatVersionProgressSidecar {
+			m.FormatVersion = irbackup.FormatVersionFor(m.Schema)
+		}
 	}()
 	sidecar := m.ProgressSidecar.File
 	exists, err := store.Exists(ctx, sidecar)

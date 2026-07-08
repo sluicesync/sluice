@@ -96,6 +96,10 @@ func restorePoolFixture(t *testing.T, names []string) (*Restore, []restoreTableT
 	if err != nil {
 		t.Fatalf("rootSegmentCodec: %v", err)
 	}
+	// The chunk-read integrity inputs Run would have set (ADR-0152);
+	// these pool tests enter below Run.
+	r.manifest = manifest
+	r.chunkColumns = sourceChunkColumns(manifest.Schema)
 	tablesByName := indexManifestTables(manifest.Tables)
 	tasks := make([]restoreTableTask, 0, len(names))
 	for _, table := range schema.Tables {

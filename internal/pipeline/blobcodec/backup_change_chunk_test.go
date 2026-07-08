@@ -60,7 +60,7 @@ func TestChangeChunk_RoundTrip(t *testing.T) {
 
 	// Encode.
 	buf := &bytes.Buffer{}
-	w, err := NewChangeChunkWriter(buf, nil, CodecGzip)
+	w, err := NewChangeChunkWriter(buf, nil, CodecGzip, nil)
 	if err != nil {
 		t.Fatalf("NewChangeChunkWriter: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestChangeChunk_RoundTrip(t *testing.T) {
 	}
 
 	// Decode and compare.
-	r, err := NewChangeChunkReader(nopReadCloserFromBytes(buf.Bytes()), hash, nil, CodecGzip)
+	r, err := NewChangeChunkReader(nopReadCloserFromBytes(buf.Bytes()), hash, nil, CodecGzip, nil)
 	if err != nil {
 		t.Fatalf("NewChangeChunkReader: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestChangeChunk_Int64Precision_Bug172(t *testing.T) {
 	}
 
 	buf := &bytes.Buffer{}
-	w, err := NewChangeChunkWriter(buf, nil, CodecGzip)
+	w, err := NewChangeChunkWriter(buf, nil, CodecGzip, nil)
 	if err != nil {
 		t.Fatalf("NewChangeChunkWriter: %v", err)
 	}
@@ -209,7 +209,7 @@ func TestChangeChunk_Int64Precision_Bug172(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	r, err := NewChangeChunkReader(nopReadCloserFromBytes(buf.Bytes()), w.Hash(), nil, CodecGzip)
+	r, err := NewChangeChunkReader(nopReadCloserFromBytes(buf.Bytes()), w.Hash(), nil, CodecGzip, nil)
 	if err != nil {
 		t.Fatalf("NewChangeChunkReader: %v", err)
 	}
@@ -280,7 +280,7 @@ func TestChangeChunk_Int64Precision_Bug172(t *testing.T) {
 // ErrChunkHashMismatch on Close.
 func TestChangeChunk_HashMismatch(t *testing.T) {
 	buf := &bytes.Buffer{}
-	w, _ := NewChangeChunkWriter(buf, nil, CodecGzip)
+	w, _ := NewChangeChunkWriter(buf, nil, CodecGzip, nil)
 	_ = w.WriteChange(ir.Insert{
 		Position: ir.Position{Engine: "postgres", Token: `{"slot":"x","lsn":"0/1"}`},
 		Schema:   "public",
@@ -290,7 +290,7 @@ func TestChangeChunk_HashMismatch(t *testing.T) {
 	_ = w.Close()
 
 	bogusHash := "00000000000000000000000000000000000000000000000000000000deadbeef"
-	r, err := NewChangeChunkReader(nopReadCloserFromBytes(buf.Bytes()), bogusHash, nil, CodecGzip)
+	r, err := NewChangeChunkReader(nopReadCloserFromBytes(buf.Bytes()), bogusHash, nil, CodecGzip, nil)
 	if err != nil {
 		t.Fatalf("NewChangeChunkReader: %v", err)
 	}
@@ -350,7 +350,7 @@ func rowsEquivalent(a, b ir.Row) bool {
 // invariant flips to "collected for the manifest envelope".
 func TestChangeChunk_SchemaSnapshot_CollectedNotEncoded(t *testing.T) {
 	buf := &bytes.Buffer{}
-	w, err := NewChangeChunkWriter(buf, nil, CodecGzip)
+	w, err := NewChangeChunkWriter(buf, nil, CodecGzip, nil)
 	if err != nil {
 		t.Fatalf("NewChangeChunkWriter: %v", err)
 	}
@@ -412,7 +412,7 @@ func TestChangeChunk_NonFiniteFloats(t *testing.T) {
 	}
 
 	buf := &bytes.Buffer{}
-	w, err := NewChangeChunkWriter(buf, nil, CodecGzip)
+	w, err := NewChangeChunkWriter(buf, nil, CodecGzip, nil)
 	if err != nil {
 		t.Fatalf("NewChangeChunkWriter: %v", err)
 	}
@@ -423,7 +423,7 @@ func TestChangeChunk_NonFiniteFloats(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	r, err := NewChangeChunkReader(nopReadCloserFromBytes(buf.Bytes()), w.Hash(), nil, CodecGzip)
+	r, err := NewChangeChunkReader(nopReadCloserFromBytes(buf.Bytes()), w.Hash(), nil, CodecGzip, nil)
 	if err != nil {
 		t.Fatalf("NewChangeChunkReader: %v", err)
 	}
