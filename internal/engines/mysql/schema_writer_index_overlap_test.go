@@ -396,12 +396,58 @@ type indexRecorder struct {
 	execs    []string         // recorded ALTER statements, in order
 	exists   bool             // EXISTS-probe result (false ⇒ build the index)
 	failTbls map[string]error // tableName ⇒ error returned when its ALTER runs
+
+	// transientFailsLeft scripts the reparent-retry pins (audit N-15b):
+	// the table's first N ALTERs return a CLASSIFIED transient
+	// (errSimulatedReparent) AFTER being recorded — modelling an ALTER the
+	// reparent killed (or that committed server-side but died unacked).
+	transientFailsLeft map[string]int
+	// probeBuilt flips the EXISTS probe from the static `exists` flag to
+	// "answer from recorded ALTERs": an index whose ALTER was already
+	// emitted probes as existing — the committed-but-unacked shape the
+	// detect-then-skip idempotency (no-double-create) pin needs.
+	probeBuilt bool
 }
+
+// errSimulatedReparent classifies retriable via classifyApplierError's
+// ADR-0108 "reparent" text fallback — the exact production shape an
+// un-framed PlanetScale/vtgate reparent surfaces.
+var errSimulatedReparent = errors.New("vttablet: operation interrupted by emergency reparent (simulated)")
 
 func (r *indexRecorder) record(q string) {
 	r.mu.Lock()
 	r.execs = append(r.execs, q)
 	r.mu.Unlock()
+}
+
+// takeTransientFail reports whether the table's ALTER should fail with the
+// simulated reparent transient this time, consuming one scripted failure.
+func (r *indexRecorder) takeTransientFail(q string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for tbl, left := range r.transientFailsLeft {
+		if left > 0 && strings.Contains(q, "`"+tbl+"`") {
+			r.transientFailsLeft[tbl] = left - 1
+			return true
+		}
+	}
+	return false
+}
+
+// indexProbeAnswer serves the indexExists EXISTS probe: probeBuilt mode
+// answers from the recorded ALTERs (emitted ⇒ landed), else the static flag.
+func (r *indexRecorder) indexProbeAnswer(indexName string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.probeBuilt {
+		return r.exists
+	}
+	for _, q := range r.execs {
+		if strings.Contains(q, "`"+indexName+"`") {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *indexRecorder) snapshot() []string {
@@ -437,6 +483,9 @@ func (indexFakeConn) Begin() (driver.Tx, error)           { return nil, errors.N
 func (c indexFakeConn) ExecContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
 	if strings.HasPrefix(strings.TrimSpace(query), "ALTER") {
 		c.rec.record(query)
+		if c.rec.takeTransientFail(query) {
+			return nil, errSimulatedReparent
+		}
 		for tbl, err := range c.rec.failTbls {
 			if err != nil && strings.Contains(query, "`"+tbl+"`") {
 				return nil, err
@@ -447,10 +496,18 @@ func (c indexFakeConn) ExecContext(_ context.Context, query string, _ []driver.N
 }
 
 // QueryContext serves the indexExists EXISTS probe (the only query these
-// paths issue) as a single bool row driven by rec.exists.
-func (c indexFakeConn) QueryContext(_ context.Context, _ string, _ []driver.NamedValue) (driver.Rows, error) {
+// paths issue) as a single bool row: rec.probeBuilt answers from the
+// recorded ALTERs (the probe args carry (schema, table, indexName)), else
+// the static rec.exists flag.
+func (c indexFakeConn) QueryContext(_ context.Context, _ string, args []driver.NamedValue) (driver.Rows, error) {
+	indexName := ""
+	if len(args) >= 3 {
+		if s, ok := args[2].Value.(string); ok {
+			indexName = s
+		}
+	}
 	v := int64(0)
-	if c.rec.exists {
+	if c.rec.indexProbeAnswer(indexName) {
 		v = 1
 	}
 	return &boolRow{val: v}, nil

@@ -77,12 +77,13 @@ const (
 
 // onIndexBuildStartObserver is a TEST-ONLY observability seam (ADR-0080):
 // when non-nil it fires with a table's name the moment an overlap-path
-// worker begins building one of that table's indexes. The overlap
-// integration test records min(indexBuildStart) and asserts it precedes
+// build begins for that table — from the vanilla concurrent workers AND
+// from the VStream serial build-as-copied branch. The overlap integration
+// tests record min(indexBuildStart) and assert it precedes
 // max(copyComplete) — proving an index build genuinely STARTED before the
 // last copy finished (the overlap actually happened, not a silent
-// regression to sequential). nil in production. Mirrors the PG seam of the
-// same name.
+// regression to sequential) — on both branches. nil in production. Mirrors
+// the PG seam of the same name.
 var onIndexBuildStartObserver func(tableName string)
 
 // SetIndexBuildBudget implements [ir.IndexBuildBudgetSetter] (ADR-0080).
@@ -250,7 +251,15 @@ func (w *SchemaWriter) indexBuildWorkerTracked(ctx context.Context, jobCh <-chan
 	if err != nil {
 		return fmt.Errorf("mysql: BuildTableIndexesFromChannel: acquire worker connection: %w", err)
 	}
-	defer func() { _ = conn.Close() }()
+	// conn is reassigned by the reparent-retry when it re-acquires a fresh
+	// connection after a storage-grow/reparent kills the pinned one, so the
+	// deferred close targets whatever the CURRENT conn is (nil-guarded — an
+	// exhausted acquire can leave it nil). Mirrors the PG worker.
+	defer func() {
+		if conn != nil {
+			_ = conn.Close()
+		}
+	}()
 
 	for {
 		select {
@@ -263,8 +272,15 @@ func (w *SchemaWriter) indexBuildWorkerTracked(ctx context.Context, jobCh <-chan
 			if hook := onIndexBuildStartObserver; hook != nil {
 				hook(job.tableName)
 			}
-			if err := w.buildTableIndexes(ctx, conn, job); err != nil {
-				return err
+			// ADR-0114 parity (audit N-15b): a storage-grow reparent landing
+			// on this ALTER … ADD INDEX would otherwise abort the whole
+			// migration. Ride it out in-engine — the pipeline-level DDL retry
+			// can't reach this per-table build (it runs interleaved with the
+			// copy, inside the engine). The retry may replace the dead conn.
+			var rerr error
+			conn, rerr = w.buildTableIndexesWithReparentRetry(ctx, conn, job)
+			if rerr != nil {
+				return rerr
 			}
 			tracker.complete(job.tableName)
 		}
@@ -312,7 +328,15 @@ func (w *SchemaWriter) buildEachAsCopiedSerial(ctx context.Context, completedTab
 			// eligible secondary index yields no job and is "indexed" the
 			// moment its copy landed — the callback below still fires for it.
 			for _, job := range w.indexBuildJobsForTables([]*ir.Table{table}) {
-				if err := w.buildTableIndexes(ctx, w.db, job); err != nil {
+				if hook := onIndexBuildStartObserver; hook != nil {
+					hook(job.tableName)
+				}
+				// ADR-0114 parity (audit N-15b): ride out a storage-grow
+				// reparent mid-ALTER instead of aborting — this serial branch
+				// is the one every production PlanetScale/Vitess target takes,
+				// i.e. exactly the platform where reparents happen. The pooled
+				// *sql.DB re-acquires a fresh connection implicitly on retry.
+				if err := w.buildTableIndexesOnPoolWithReparentRetry(ctx, job); err != nil {
 					return err
 				}
 			}
