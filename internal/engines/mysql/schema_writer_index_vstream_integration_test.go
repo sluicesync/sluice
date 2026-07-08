@@ -20,11 +20,14 @@
 // correctly-built target, and SLUICE-E-INDEX-MISSING when an expected index is
 // absent.
 //
-// The full pipeline-level migrate + sync-cold-start end-to-end against a
-// Vitess target is a heavier harness (target-side vtgate DDL under the
-// pipeline orchestrator); this engine-level pin exercises the identical
-// load-bearing method both paths call, on a real Vitess target. See the report
-// note on the remaining pipeline-level e2e vstream pin (CI vstream shard).
+// The pipeline-level end-to-end companion — a real migrate through the live
+// overlap wiring against a vttestserver TARGET (the flavor-routing axis this
+// engine-level pin can't see) — is
+// TestMigrate_VStreamTarget_IndexOverlap_EngagesAndBuildsAll
+// (internal/pipeline/migrate_index_overlap_vstream_integration_test.go, the
+// extended-suites vstream-pipeline leg). This engine-level pin remains the
+// per-index-family ground truth on the identical load-bearing method both
+// migrate and sync cold-start call.
 //
 // Usage (Windows; see CLAUDE.md for the Rancher Desktop env):
 //
