@@ -4,9 +4,9 @@ This document describes the local-dev tooling for sluice contributors. The goal 
 
 ## Tools
 
-The CI pipeline runs three checks: `gofumpt` formatting, `go vet`, and `go test`. To match CI locally you'll want:
+The CI gate covers formatting (`gofumpt`), vetting (`go vet`, including every build-tag combination via `scripts/vet-tags.sh`), the golangci-lint set, the test-coverage guards, and the unit tests. To match CI locally you'll want:
 
-- **Go** — version per `go.mod`'s `go` directive (currently 1.25.x).
+- **Go** — version per `go.mod`'s `go` directive (currently 1.26.x).
 - **[gofumpt](https://github.com/mvdan/gofumpt)** — stricter cousin of `gofmt`. Catches the formatting nits CI fails on.
 - **[golangci-lint](https://golangci-lint.run/welcome/install/)** — runs the rest of the linter set (errcheck, revive, gocritic, etc.).
 
@@ -14,8 +14,10 @@ Install both Go-based tools with `go install`:
 
 ```bash
 go install mvdan.cc/gofumpt@latest
-go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
 ```
+
+(Note the `/v2/` in the lint path — the project's `.golangci.yml` is v2-schema, and the un-suffixed module path silently installs v1, which rejects the config. CI installs it the same way.)
 
 These land in `$GOBIN` (typically `~/go/bin` or `%USERPROFILE%\go\bin` on Windows). Make sure that directory is on your `PATH`.
 
@@ -24,16 +26,18 @@ These land in `$GOBIN` (typically `~/go/bin` or `%USERPROFILE%\go\bin` on Window
 The Makefile is the canonical entry point. Run `make help` for the full list; the ones you'll use most:
 
 ```
-make fmt          # apply gofumpt to every .go file
-make fmt-check    # verify formatting without writing changes; CI-shaped
-make vet          # go vet ./...
-make lint         # go vet + golangci-lint run
-make test         # unit tests, race detector, no DB
-make test-it      # unit + integration; needs Docker for testcontainers
-make pre-commit   # the bundled fmt-check + vet + test gate
+make fmt              # apply gofumpt to every .go file
+make fmt-check        # verify formatting without writing changes; CI-shaped
+make vet              # go vet ./...
+make vet-tags         # type-check every build-tag combination (incl. tagged test files)
+make coverage-guards  # CI Lint's test-coverage guards (shard + -run-filter)
+make lint             # go vet + golangci-lint run
+make test             # unit tests, race detector, no DB
+make test-it          # unit + integration; needs Docker for testcontainers
+make pre-commit       # the full gate: fmt-check + vet + vet-tags + coverage-guards + lint + test
 ```
 
-`make pre-commit` is the single command that mirrors what the CI lint and Test jobs check. Run it before pushing and you'll catch the easy stuff that's been bouncing off CI.
+`make pre-commit` is the single command that mirrors what the CI Lint and Test jobs check — formatting, vet (including the build-tag matrix), the test-coverage guards, golangci-lint, and the fast unit tests. Run it before pushing and you'll catch the easy stuff that's been bouncing off CI.
 
 ## Git pre-commit hook
 
@@ -43,7 +47,7 @@ For automatic enforcement, install the bundled pre-commit hook:
 git config core.hooksPath .githooks
 ```
 
-This is a one-time per-clone setup. Once configured, every `git commit` runs `.githooks/pre-commit`, which executes `make pre-commit` against staged Go files only (commits that don't touch `.go` files skip straight through).
+This is a one-time per-clone setup. Once configured, every `git commit` runs `.githooks/pre-commit`, which calls the tools directly (gofumpt, `go vet`, the tags-vet and coverage-guard scripts, golangci-lint, `go test`) rather than going through `make`, so it works even where `make` isn't installed. Commits that don't touch `.go` files skip the Go checks (a conflict-marker check still runs on everything staged).
 
 If a check fails, the commit aborts with the failing command. Fix the issue, `git add` the changes, and re-commit.
 
