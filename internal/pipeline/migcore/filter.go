@@ -169,8 +169,10 @@ func EffectiveTableFilter(filter TableFilter, source ir.Engine, sourceDSN string
 }
 
 // ApplyTableFilter mutates schema.Tables in place, retaining only
-// the tables the filter allows. Logs the count at info level so
-// operators can verify the filter matched what they expected. An
+// the tables the filter allows, and prunes standalone sequences whose
+// owning table the filter excluded (see
+// [dropSequencesOwnedByFilteredTables]). Logs the count at info level
+// so operators can verify the filter matched what they expected. An
 // all-empty result is treated as user error (the filter excluded
 // every table) and surfaces a clear error.
 //
@@ -188,6 +190,7 @@ func ApplyTableFilter(ctx context.Context, schema *ir.Schema, filter TableFilter
 		}
 	}
 	schema.Tables = kept
+	dropSequencesOwnedByFilteredTables(ctx, schema, filter)
 	slog.InfoContext(
 		ctx, "table filter applied",
 		slog.Int("matched", len(kept)),
@@ -197,6 +200,41 @@ func ApplyTableFilter(ctx context.Context, schema *ir.Schema, filter TableFilter
 		return errors.New("pipeline: table filter excluded every source table; nothing to migrate (check --include-table / --exclude-table)")
 	}
 	return nil
+}
+
+// dropSequencesOwnedByFilteredTables prunes schema.Sequences of every
+// standalone sequence whose owning table the filter excluded, WARN-
+// logging each drop. Unowned standalone sequences always pass through.
+//
+// Why (audit N-4): a sequence carrying OwnedByTable/OwnedByColumn makes
+// the target writer emit `ALTER SEQUENCE … OWNED BY table.column` after
+// the tables phase (the postgres writer's bindSequenceOwners). With the
+// owner filtered out, that ALTER references a table that was never
+// created and the run dies with 42P01 — deterministically failing the
+// shipped copy-table-subset use case for any source with a re-optioned
+// serial outside the subset. Dropping the WHOLE sequence rather than
+// just its ownership is deliberate: OWNED BY ties the sequence's
+// lifecycle to the excluded column, so carrying it unowned would
+// silently change its semantics on the target; the WARN names the
+// sequence and its excluded owner so an operator who wants it can widen
+// the filter.
+func dropSequencesOwnedByFilteredTables(ctx context.Context, schema *ir.Schema, filter TableFilter) {
+	if len(schema.Sequences) == 0 {
+		return
+	}
+	kept := schema.Sequences[:0]
+	for _, seq := range schema.Sequences {
+		if seq != nil && seq.OwnedByTable != "" && !filter.Allows(seq.OwnedByTable) {
+			slog.WarnContext(
+				ctx, "table filter dropped a standalone sequence owned by an excluded table (its OWNED BY would reference a table the filter left uncreated)",
+				slog.String("sequence", seq.Name),
+				slog.String("owned_by", seq.OwnedByTable+"."+seq.OwnedByColumn),
+			)
+			continue
+		}
+		kept = append(kept, seq)
+	}
+	schema.Sequences = kept
 }
 
 // matchesAny returns true when name matches at least one pattern
