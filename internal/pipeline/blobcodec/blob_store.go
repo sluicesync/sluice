@@ -27,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/url"
 	"strings"
 
@@ -98,6 +99,17 @@ func OpenBlobStore(ctx context.Context, urlStr string, opts BlobStoreOptions) (*
 	full, err := annotateBlobURL(urlStr, opts)
 	if err != nil {
 		return nil, err
+	}
+	if isFileBlobURL(full) {
+		// The hardened owner-only store is LocalStore (0600 files /
+		// 0700 dirs — see NewLocalStore); fileblob writes files at
+		// 0666-minus-umask and offers no per-file mode option, so a
+		// file:// destination is world-readable on typical umasks.
+		// annotateBlobURL defaults the DIRECTORY mode to 0700, but the
+		// files themselves stay loose — warn rather than silently
+		// diverging from the documented fileblob behaviour.
+		slog.WarnContext(ctx, "blob store: file:// URLs use gocloud's fileblob backend, whose files are created world-readable by default (0666 minus umask); prefer --output-dir for the hardened owner-only (0600 files / 0700 dirs) local store",
+			slog.String("url", redactBlobURL(full)))
 	}
 	bucket, err := blob.OpenBucket(ctx, full)
 	if err != nil {
@@ -330,6 +342,20 @@ func annotateBlobURL(urlStr string, opts BlobStoreOptions) (string, error) {
 	if hasS3Opts && u.Scheme != "s3" {
 		return "", fmt.Errorf("blob store: --backup-endpoint / --backup-region / --backup-path-style are only meaningful for s3:// URLs; URL scheme is %q", u.Scheme)
 	}
+	if u.Scheme == "file" {
+		// fileblob's default directory mode is 0777 (world-traversable).
+		// Default the driver's dir_file_mode option to owner-only 0700 —
+		// the value is DECIMAL 448 because fileblob parses it base-10 —
+		// unless the operator set their own. The per-FILE mode has no
+		// fileblob option (files land 0666 minus umask), which is why
+		// OpenBlobStore warns in favour of --output-dir's LocalStore.
+		q := u.Query()
+		if q.Get("dir_file_mode") == "" {
+			q.Set("dir_file_mode", "448") // 0o700
+			u.RawQuery = q.Encode()
+		}
+		return u.String(), nil
+	}
 	if !hasS3Opts {
 		return urlStr, nil
 	}
@@ -354,6 +380,16 @@ func annotateBlobURL(urlStr string, opts BlobStoreOptions) (string, error) {
 	}
 	u.RawQuery = q.Encode()
 	return u.String(), nil
+}
+
+// isFileBlobURL reports whether the (annotated) URL routes to gocloud's
+// fileblob driver — the one backend whose on-disk permission posture
+// diverges from LocalStore's hardened 0600/0700 (see the WARN in
+// [OpenBlobStore]). A parse failure reports false; OpenBucket will
+// surface the real error.
+func isFileBlobURL(urlStr string) bool {
+	u, err := url.Parse(urlStr)
+	return err == nil && u.Scheme == "file"
 }
 
 // redactBlobURL strips the query string from a URL for logging. None

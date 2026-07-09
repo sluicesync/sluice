@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -237,6 +238,84 @@ func TestBlobStore_AnnotateURL_S3Params(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestBlobStore_AnnotateURL_FileDirMode pins the file:// permission
+// posture: the fileblob dir_file_mode option defaults to owner-only
+// 0700 (decimal 448 — fileblob parses base-10), an operator-set value
+// is preserved, and non-file schemes are untouched.
+func TestBlobStore_AnnotateURL_FileDirMode(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"file URL gains 0700 dirs", "file:///backups/x", "dir_file_mode=448"},
+		{"operator-set mode preserved", "file:///backups/x?dir_file_mode=511", "dir_file_mode=511"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got, err := annotateBlobURL(c.in, BlobStoreOptions{})
+			if err != nil {
+				t.Fatalf("annotateBlobURL: %v", err)
+			}
+			if !strings.Contains(got, c.want) {
+				t.Errorf("got %q; want substring %q", got, c.want)
+			}
+			if c.want == "dir_file_mode=511" && strings.Contains(got, "448") {
+				t.Errorf("got %q; operator-set dir_file_mode was overridden", got)
+			}
+		})
+	}
+	t.Run("s3 URL untouched", func(t *testing.T) {
+		got, err := annotateBlobURL("s3://bucket/prefix", BlobStoreOptions{})
+		if err != nil {
+			t.Fatalf("annotateBlobURL: %v", err)
+		}
+		if strings.Contains(got, "dir_file_mode") {
+			t.Errorf("got %q; dir_file_mode must not leak onto non-file schemes", got)
+		}
+	})
+}
+
+// TestBlobStore_FileURLWarnsWorldReadable pins the audit posture WARN:
+// opening a file:// backup destination (the gocloud fileblob route,
+// 0666-minus-umask files) must warn in favour of --output-dir's
+// hardened LocalStore; non-file schemes must stay silent.
+func TestBlobStore_FileURLWarnsWorldReadable(t *testing.T) {
+	capture := func(t *testing.T) *bytes.Buffer {
+		t.Helper()
+		buf := &bytes.Buffer{}
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		t.Cleanup(func() { slog.SetDefault(prev) })
+		return buf
+	}
+
+	t.Run("file URL warns", func(t *testing.T) {
+		buf := capture(t)
+		store, err := OpenBlobStore(context.Background(), fileBlobURL(t, t.TempDir()), BlobStoreOptions{})
+		if err != nil {
+			t.Fatalf("OpenBlobStore: %v", err)
+		}
+		defer func() { _ = store.Close() }()
+		out := buf.String()
+		if !strings.Contains(out, "world-readable") || !strings.Contains(out, "--output-dir") {
+			t.Errorf("file:// open did not warn about the fileblob permission posture; log output: %q", out)
+		}
+	})
+	t.Run("non-file URL is silent", func(t *testing.T) {
+		buf := capture(t)
+		store, err := OpenBlobStore(context.Background(), "mem://bucket", BlobStoreOptions{})
+		if err != nil {
+			t.Fatalf("OpenBlobStore(mem://): %v", err)
+		}
+		defer func() { _ = store.Close() }()
+		if out := buf.String(); strings.Contains(out, "world-readable") {
+			t.Errorf("non-file scheme triggered the fileblob WARN: %q", out)
+		}
+	})
 }
 
 func TestBlobStore_GCSAndAzureURLsAccepted(t *testing.T) {
