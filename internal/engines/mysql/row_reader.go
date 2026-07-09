@@ -291,13 +291,35 @@ func buildSelect(table *ir.Table, qualifyBySchema bool) string {
 // is aliased back to the original column name so positional and
 // name-based consumers are unchanged. The CAST is in the SELECT list
 // only; ORDER BY / WHERE predicates (e.g. the keyset cursor) reference
-// the real column, so pagination is unaffected. All other columns read
-// directly.
+// the real column, so pagination is unaffected.
+//
+// Single-precision FLOAT columns are read through CAST(... AS DOUBLE)
+// for the same silent-corruption reason, on the other protocol: MySQL
+// does NOT round-trip FLOAT in its float→text conversion (ground-truthed
+// on 8.0.46: a stored float32 8388608 — verifiably exact via `fl =
+// 8388608` — renders "8388610" through CAST AS CHAR and the text wire
+// form alike), so any TEXT-protocol page (the arg-less full scan, and a
+// cursor-paged read's first unbounded page — pages without bind args go
+// COM_QUERY) silently display-rounded FLOAT values on every release
+// before ADR-0153's fidelity sweep found it. DOUBLE needs no detour —
+// MySQL prints DOUBLE shortest-round-trip (pinned by the ADR-0153 read
+// torture matrix) — and the widening float32→double CAST is exact and
+// sign-preserving (−0.0 included), identical to what the binary
+// protocol's float32 delivers after decodeFloat's widening. The alias
+// keeps positional and name-based consumers unchanged, NULL passes
+// through CAST as NULL, and predicates still reference the real column.
+// All other columns read directly.
 func selectColumnExpr(c *ir.Column) string {
-	switch c.Type.(type) {
+	switch t := c.Type.(type) {
 	case ir.Date, ir.DateTime, ir.Timestamp:
 		ident := quoteIdent(c.Name)
 		return "CAST(" + ident + " AS CHAR) AS " + ident
+	case ir.Float:
+		if t.Precision == ir.FloatSingle {
+			ident := quoteIdent(c.Name)
+			return "CAST(" + ident + " AS DOUBLE) AS " + ident
+		}
+		return quoteIdent(c.Name)
 	default:
 		return quoteIdent(c.Name)
 	}

@@ -899,10 +899,10 @@ func TestInterpolation_ReadRowsBatch_DecodeParity(t *testing.T) {
 	for i := range ctl {
 		for col, cv := range ctl[i] {
 			iv := itp[i][col]
-			if col == "fl" {
-				assertFloatReadClass(t, i, cv, iv)
-				continue
-			}
+			// fl compares STRICTLY like everything else: the FLOAT
+			// CAST(... AS DOUBLE) read projection (selectColumnExpr)
+			// makes the text wire form exact, so the two protocols
+			// agree bit-for-bit — see TestRowReader_FloatFullScan_ExactRoundTrip.
 			if readShapesEquivalent(cv, iv) {
 				continue
 			}
@@ -910,44 +910,6 @@ func TestInterpolation_ReadRowsBatch_DecodeParity(t *testing.T) {
 				t.Errorf("read parity: row %d col %q: binary=%#v (%T), interpolation=%#v (%T)", i, col, cv, cv, iv, iv)
 			}
 		}
-	}
-}
-
-// assertFloatReadClass is the FLOAT-column exception to strict read parity
-// — and the documented REASON row-data read sessions are exempt from the
-// ADR-0153 flavor default: MySQL DOES NOT round-trip FLOAT in its
-// float→text conversion (ground-truthed on 8.0.46: stored float32 8388608
-// renders "8388610" via CAST AS CHAR and the text wire form alike, while
-// DOUBLE renders shortest-round-trip), so a TEXT-protocol read of a FLOAT
-// column materializes a display-rounded value. The binary leg must carry
-// the EXACT stored float32; the text leg may differ only within FLOAT
-// display precision (~6-7 significant digits) — anything larger is a real
-// decode divergence.
-func assertFloatReadClass(t *testing.T, rowIdx int, cv, iv any) {
-	t.Helper()
-	if cv == nil || iv == nil {
-		if cv != nil || iv != nil {
-			t.Errorf("read parity: row %d col \"fl\": NULL mismatch: binary=%#v, interpolation=%#v", rowIdx, cv, iv)
-		}
-		return
-	}
-	cf, cok := cv.(float64)
-	if2, iok := iv.(float64)
-	if !cok || !iok {
-		t.Errorf("read parity: row %d col \"fl\": non-float64 carrier: binary=%#v (%T), interpolation=%#v (%T)", rowIdx, cv, cv, iv, iv)
-		return
-	}
-	// The binary leg is the exact stored float32 widened; the seed values
-	// are all float32-representable, so it must equal the corpus value
-	// exactly (checked implicitly: binary == float64(float32(binary))).
-	if cf != float64(float32(cf)) {
-		t.Errorf("read parity: row %d col \"fl\": binary leg %v is not a widened float32", rowIdx, cf)
-	}
-	if cf == if2 || (cf == 0 && if2 == 0) {
-		return
-	}
-	if diff := math.Abs(if2-cf) / math.Max(math.Abs(cf), math.SmallestNonzeroFloat64); diff > 1e-5 {
-		t.Errorf("read parity: row %d col \"fl\": text leg %v diverges from binary %v beyond FLOAT display rounding (rel %g)", rowIdx, if2, cf, diff)
 	}
 }
 

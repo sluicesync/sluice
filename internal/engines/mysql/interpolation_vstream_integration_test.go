@@ -119,4 +119,36 @@ func TestVStream_InterpolationResidualFamilies_ByteExact(t *testing.T) {
 		assertStoredNegZero(t, "vtgate "+leg.name, cols, row, "dbl")
 		assertStoredNegZero(t, "vtgate "+leg.name, cols, row, "fl")
 	}
+
+	// The FLOAT read projection (selectColumnExpr's CAST(... AS DOUBLE),
+	// the full-scan display-rounding fix) must PARSE and evaluate through
+	// vtgate too: a real full-scan read over the vtgate MySQL port must
+	// hand back the exact float32-widened doubles, −0 sign included.
+	rr, err := Engine{}.OpenRowReader(ctx, ctlDSN)
+	if err != nil {
+		t.Fatalf("vtgate OpenRowReader: %v", err)
+	}
+	defer closeIf(rr)
+	ch, err := rr.ReadRows(ctx, tblCtl)
+	if err != nil {
+		t.Fatalf("vtgate ReadRows: %v", err)
+	}
+	var negZeroRow ir.Row
+	for row := range ch {
+		if id, _ := row["id"].(int64); id == 3 {
+			negZeroRow = row
+		}
+	}
+	if err := rr.(*RowReader).Err(); err != nil {
+		t.Fatalf("vtgate ReadRows stream: %v", err)
+	}
+	if negZeroRow == nil {
+		t.Fatal("vtgate full scan did not return row 3")
+	}
+	for _, col := range []string{"fl", "dbl"} {
+		f, ok := negZeroRow[col].(float64)
+		if !ok || f != 0 || !math.Signbit(f) {
+			t.Errorf("vtgate full-scan %s = %#v (%T); want exact −0.0 through the CAST projection", col, negZeroRow[col], negZeroRow[col])
+		}
+	}
 }

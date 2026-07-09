@@ -128,17 +128,19 @@ func (e Engine) OpenSchemaWriter(ctx context.Context, dsn string) (ir.SchemaWrit
 // (via its Close method) to release the underlying connection pool.
 func (e Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, error) {
 	// ADR-0153 read-fidelity exemption: ROW-DATA READ sessions keep the
-	// binary protocol — deliberately NOT parseDSNForFlavor. With
-	// interpolation on, arg-bearing SELECTs (the PK-paged ReadRowsBatch)
-	// return TEXT-protocol results, and MySQL FLOAT→text conversion does
-	// not round-trip float32 (ground-truthed on 8.0.46: stored 8388608
-	// prints "8388610" — CAST AS CHAR and the text wire form alike, while
-	// DOUBLE prints shortest-round-trip). Flipping this path would
-	// display-round every FLOAT column read by a chunked cold-copy. An
-	// explicit operator interpolateParams=true in the DSN still wins, as
-	// everywhere. (The arg-less full-scan ReadRows has ALWAYS been text
-	// protocol and carries this FLOAT rounding on every release — a
-	// pre-existing wart independent of ADR-0153, named in the ADR.)
+	// binary protocol — deliberately NOT parseDSNForFlavor. The exemption
+	// was forced by ground truth: MySQL FLOAT→text conversion does not
+	// round-trip float32 (8.0.46: stored 8388608 prints "8388610"), so a
+	// TEXT-protocol page display-rounds FLOAT columns. That specific
+	// hazard is now ALSO closed at the projection — selectColumnExpr
+	// reads FLOAT through CAST(... AS DOUBLE), which fixed the arg-less
+	// full-scan/first-page pages that were text-protocol on every release
+	// (the pre-existing wart the ADR-0153 sweep found) — but the read
+	// sessions stay on the binary protocol as defense in depth: the
+	// prepared path is the one whose value fidelity does not depend on
+	// the server's text formatter at all. Revisit (and re-run the read
+	// parity matrix) if the chunk-read RTT ever measures as material. An
+	// explicit operator interpolateParams=true in the DSN still wins.
 	cfg, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err
