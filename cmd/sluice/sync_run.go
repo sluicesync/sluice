@@ -131,16 +131,17 @@ type SyncSpec struct {
 	MaxBufferBytes   *int64         `koanf:"max-buffer-bytes"`
 	ApplyExecTimeout *time.Duration `koanf:"apply-exec-timeout"`
 
-	// The apply-retry-* trio stays VALUE-typed (N-11 class (b)): 0 is not a
-	// meaningful value for any of the three — `sync start` REFUSES 0 as out of
-	// the ADR-0038 ranges ("1 = no retry") — so "unset" and "explicit 0" need
-	// no distinction; both take the ADR-0038 defaults via firstNonZero*. The
-	// accepted wart: an explicit 0 here is absorbed into the default rather
-	// than refused the way the flag is; 0 has no valid reading, and the
-	// out-of-range refusal still catches every other bad value.
-	ApplyRetryAttempts    int           `koanf:"apply-retry-attempts"`
-	ApplyRetryBackoffBase time.Duration `koanf:"apply-retry-backoff-base"`
-	ApplyRetryBackoffCap  time.Duration `koanf:"apply-retry-backoff-cap"`
+	// The apply-retry-* trio is pointer-typed for N-11's REFUSAL side rather
+	// than a meaningful 0: `sync start` refuses 0 as out of the ADR-0038
+	// ranges ("1 = no retry"), so nil = key omitted → the ADR-0038 defaults,
+	// while an explicit value — INCLUDING 0 — reaches validateRetryFlags
+	// verbatim and is refused with the CLI's exact out-of-range message. The
+	// old firstNonZero* coercion silently absorbed an explicit 0 into the
+	// default instead — the same silent-config-inversion class as the
+	// "0 disables" knobs above, cured the same way.
+	ApplyRetryAttempts    *int           `koanf:"apply-retry-attempts"`
+	ApplyRetryBackoffBase *time.Duration `koanf:"apply-retry-backoff-base"`
+	ApplyRetryBackoffCap  *time.Duration `koanf:"apply-retry-backoff-cap"`
 
 	MetricsListen string `koanf:"metrics-listen"`
 
@@ -285,13 +286,14 @@ func (f *SyncFleetConfig) validate() error {
 			seenSlot[slot] = s.StreamID
 		}
 
-		// N-11 class (b): the retry knobs coerce 0 → default (see the
-		// SyncSpec field comment) BEFORE the ADR-0038 range validation, so
-		// an unset knob never trips the out-of-range refusal.
+		// N-11: an omitted retry knob (nil) takes the ADR-0038 default and
+		// never trips the range refusal; an explicit value — INCLUDING 0 —
+		// is validated verbatim, so the fleet refuses exactly what the
+		// `sync start` flags refuse (see the SyncSpec field comment).
 		if err := validateRetryFlags(
-			firstNonZeroInt(s.ApplyRetryAttempts, defaultApplyRetryAttempts),
-			firstNonZeroDuration(s.ApplyRetryBackoffBase, defaultApplyRetryBackoffBase),
-			firstNonZeroDuration(s.ApplyRetryBackoffCap, defaultApplyRetryBackoffCap),
+			orDefault(s.ApplyRetryAttempts, defaultApplyRetryAttempts),
+			orDefault(s.ApplyRetryBackoffBase, defaultApplyRetryBackoffBase),
+			orDefault(s.ApplyRetryBackoffCap, defaultApplyRetryBackoffCap),
 		); err != nil {
 			return fmt.Errorf("sync run: %s: %w", who, err)
 		}
@@ -842,9 +844,9 @@ func buildStreamerFromSpec(ctx context.Context, spec *SyncSpec, g *Globals) (*pi
 		MaxBufferBytes:   orDefault(spec.MaxBufferBytes, defaultMaxBufferBytes),
 		ApplyExecTimeout: orDefault(spec.ApplyExecTimeout, defaultApplyExecTimeout),
 
-		ApplyRetryAttempts:    firstNonZeroInt(spec.ApplyRetryAttempts, defaultApplyRetryAttempts),
-		ApplyRetryBackoffBase: firstNonZeroDuration(spec.ApplyRetryBackoffBase, defaultApplyRetryBackoffBase),
-		ApplyRetryBackoffCap:  firstNonZeroDuration(spec.ApplyRetryBackoffCap, defaultApplyRetryBackoffCap),
+		ApplyRetryAttempts:    orDefault(spec.ApplyRetryAttempts, defaultApplyRetryAttempts),
+		ApplyRetryBackoffBase: orDefault(spec.ApplyRetryBackoffBase, defaultApplyRetryBackoffBase),
+		ApplyRetryBackoffCap:  orDefault(spec.ApplyRetryBackoffCap, defaultApplyRetryBackoffCap),
 
 		MetricsListen:     spec.MetricsListen,
 		HeartbeatInterval: orDefault(spec.HeartbeatInterval, defaultHeartbeatInterval),
@@ -1042,13 +1044,9 @@ func firstNonEmpty(v, fallback string) string {
 	return v
 }
 
-func firstNonZeroInt(v, fallback int) int {
-	if v == 0 {
-		return fallback
-	}
-	return v
-}
-
+// firstNonZeroDuration survives only for [printFleetPlan]'s display-side
+// mirror of [pipeline.RestartPolicy]'s withDefaults; every per-sync knob now
+// resolves through [orDefault] (audit N-11).
 func firstNonZeroDuration(v, fallback time.Duration) time.Duration {
 	if v == 0 {
 		return fallback
@@ -1058,9 +1056,9 @@ func firstNonZeroDuration(v, fallback time.Duration) time.Duration {
 
 // orDefault resolves a pointer-typed fleet knob (audit N-11): nil — the YAML
 // key was omitted — falls back to the `sync start` flag default; a present
-// value, INCLUDING an explicit 0 (which the matching flags document as
-// "0 disables" / no cap), passes through verbatim. Contrast firstNonZero*
-// above, which the value-typed knobs keep because 0 is meaningless for them.
+// value, INCLUDING an explicit 0, passes through verbatim — to disable, for
+// the knobs whose flags document "0 disables" / no cap, or into the ADR-0038
+// range refusal, for the apply-retry-* knobs whose flags refuse 0.
 func orDefault[T any](v *T, fallback T) T {
 	if v == nil {
 		return fallback

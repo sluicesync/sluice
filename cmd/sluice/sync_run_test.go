@@ -186,7 +186,8 @@ func TestFleetValidate(t *testing.T) {
 			name: "out-of-range retry attempts → refused",
 			fleet: fleetFromSpecs(func() SyncSpec {
 				s := pgSpec("a", "slot_a")
-				s.ApplyRetryAttempts = 1000
+				attempts := 1000
+				s.ApplyRetryAttempts = &attempts
 				return s
 			}()),
 			wantErr:     true,

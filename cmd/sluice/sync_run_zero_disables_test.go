@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -160,6 +161,95 @@ func TestSyncStartFleetParity_ExplicitZero_N11(t *testing.T) {
 		}
 		if fs.HeartbeatInterval != s.HeartbeatInterval {
 			t.Errorf("fleet HeartbeatInterval = %s; sync start default = %s (parity broken)", fs.HeartbeatInterval, s.HeartbeatInterval)
+		}
+	})
+}
+
+// TestFleetRetryZeroRefused_ThroughLoadPath_N11 pins the refusal side of
+// N-11: an EXPLICIT 0 on any apply-retry-* key reaches validateRetryFlags
+// verbatim through the real load path and is refused with the CLI's EXACT
+// out-of-range message (computed here by calling validateRetryFlags the way
+// `sync start` does), instead of being silently absorbed into the ADR-0038
+// default — the pre-fix behaviour, the same silent-config-inversion class
+// as the "0 disables" knobs. Omitted keys still take the defaults.
+func TestFleetRetryZeroRefused_ThroughLoadPath_N11(t *testing.T) {
+	loadAndValidate := func(t *testing.T, knobs string) error {
+		t.Helper()
+		fleet, err := loadFleetConfig(writeFleetYAML(t, `
+syncs:
+  - stream-id: orders
+    source-driver: postgres
+    source: postgres://u:p@src:5432/app
+    target-driver: mysql
+    target: mysql://u:p@dst:3306/app
+    slot-name: orders
+`+knobs))
+		if err != nil {
+			t.Fatalf("loadFleetConfig: %v", err)
+		}
+		return fleet.validate()
+	}
+
+	cases := []struct {
+		name    string
+		knobs   string
+		wantMsg string
+	}{
+		{
+			name:    "apply-retry-attempts: 0",
+			knobs:   "    apply-retry-attempts: 0\n",
+			wantMsg: validateRetryFlags(0, defaultApplyRetryBackoffBase, defaultApplyRetryBackoffCap).Error(),
+		},
+		{
+			name:    "apply-retry-backoff-base: 0",
+			knobs:   "    apply-retry-backoff-base: 0\n",
+			wantMsg: validateRetryFlags(defaultApplyRetryAttempts, 0, defaultApplyRetryBackoffCap).Error(),
+		},
+		{
+			name:    "apply-retry-backoff-cap: 0",
+			knobs:   "    apply-retry-backoff-cap: 0\n",
+			wantMsg: validateRetryFlags(defaultApplyRetryAttempts, defaultApplyRetryBackoffBase, 0).Error(),
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			err := loadAndValidate(t, c.knobs)
+			if err == nil {
+				t.Fatal("explicit 0 validated clean; want the CLI out-of-range refusal")
+			}
+			if !strings.Contains(err.Error(), c.wantMsg) {
+				t.Errorf("refusal %q missing the CLI-identical message %q", err.Error(), c.wantMsg)
+			}
+		})
+	}
+
+	t.Run("omitted → ADR-0038 defaults, validates clean", func(t *testing.T) {
+		s := buildFleetStreamer(t, "") // runs validate() on the way
+		if s.ApplyRetryAttempts != defaultApplyRetryAttempts {
+			t.Errorf("ApplyRetryAttempts = %d; want default %d", s.ApplyRetryAttempts, defaultApplyRetryAttempts)
+		}
+		if s.ApplyRetryBackoffBase != defaultApplyRetryBackoffBase {
+			t.Errorf("ApplyRetryBackoffBase = %s; want default %s", s.ApplyRetryBackoffBase, defaultApplyRetryBackoffBase)
+		}
+		if s.ApplyRetryBackoffCap != defaultApplyRetryBackoffCap {
+			t.Errorf("ApplyRetryBackoffCap = %s; want default %s", s.ApplyRetryBackoffCap, defaultApplyRetryBackoffCap)
+		}
+	})
+
+	t.Run("explicit in-range values → verbatim", func(t *testing.T) {
+		s := buildFleetStreamer(t,
+			"    apply-retry-attempts: 3\n"+
+				"    apply-retry-backoff-base: 300ms\n"+
+				"    apply-retry-backoff-cap: 5s\n")
+		if s.ApplyRetryAttempts != 3 {
+			t.Errorf("ApplyRetryAttempts = %d; want 3", s.ApplyRetryAttempts)
+		}
+		if s.ApplyRetryBackoffBase != 300*time.Millisecond {
+			t.Errorf("ApplyRetryBackoffBase = %s; want 300ms", s.ApplyRetryBackoffBase)
+		}
+		if s.ApplyRetryBackoffCap != 5*time.Second {
+			t.Errorf("ApplyRetryBackoffCap = %s; want 5s", s.ApplyRetryBackoffCap)
 		}
 	})
 }
