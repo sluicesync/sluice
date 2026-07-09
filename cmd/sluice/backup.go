@@ -67,8 +67,8 @@ type EncryptionFlags struct {
 	// verify) and is REQUIRED to verify an asymmetrically-signed chain (the
 	// KEK does not verify an asymmetric signature). Both accept `env:VAR`, a
 	// file path, or a `kms://<provider>/<key-ref>` reference.
-	SignKey   string `name:"sign-key" help:"Sign the backup with an Ed25519 PRIVATE key (ADR-0154 Phase 2, PKCS#8 PEM), OR via a cloud KMS key given as 'kms://aws/<key-arn>' (Phase 3 — the private key stays in the HSM; needs kms:Sign on a SIGN_VERIFY key, which may differ from the --kms-key-arn encryption key). Selects the asymmetric scheme over the --sign HMAC-off-KEK default; works on BOTH plaintext AND encrypted backups. Accepts a file path, 'env:VAR', or 'kms://...'. Generate an Ed25519 pair with 'sluice backup keygen'. Never logged. Mutually exclusive with --sign." placeholder:"PATH|env:VAR|kms://..."`
-	VerifyKey string `name:"verify-key" help:"PUBLIC key that verifies an asymmetrically-signed chain (ADR-0154 Phase 2/3) on restore / verify — an SPKI PEM file (Ed25519 / ECDSA / RSA; the offline DR path, verified locally per the recorded algorithm) OR 'kms://aws/<key-arn>' to fetch the trusted key's public half online. REQUIRED for such a chain — the KEK does NOT verify an asymmetric signature, even on an encrypted chain. The recorded manifest key reference is NEVER trusted; verification anchors on the key YOU name here. Absent it, the chain WARNs present-but-unverified and proceeds (DR-safe) unless --require-signature. Accepts a file path, 'env:VAR', or 'kms://...'." placeholder:"PATH|env:VAR|kms://..."`
+	SignKey   string `name:"sign-key" help:"Sign the backup with an Ed25519 PRIVATE key (ADR-0154 Phase 2, PKCS#8 PEM), OR via a cloud KMS key given as 'kms://<provider>/<key-ref>' (Phase 3 — the private key stays in the HSM; needs the provider's Sign permission on a signing key, which may differ from the --kms-key-arn encryption key). Providers: 'aws' (key ARN/id; ECDSA P-256/384/521 or RSA-PSS), 'gcp' (a versioned .../cryptoKeyVersions/N resource; ECDSA P-256/384, RSA-PSS, or Ed25519), 'azure' (a Key Vault key-identifier URL; ECDSA P-256/384/521 or RSA-PSS). Selects the asymmetric scheme over the --sign HMAC-off-KEK default; works on BOTH plaintext AND encrypted backups. Accepts a file path, 'env:VAR', or 'kms://...'. Generate an Ed25519 pair with 'sluice backup keygen'. Never logged. Mutually exclusive with --sign." placeholder:"PATH|env:VAR|kms://..."`
+	VerifyKey string `name:"verify-key" help:"PUBLIC key that verifies an asymmetrically-signed chain (ADR-0154 Phase 2/3) on restore / verify — an SPKI PEM file (Ed25519 / ECDSA / RSA; the offline DR path, verified locally per the recorded algorithm) OR 'kms://<provider>/<key-ref>' ('aws' / 'gcp' / 'azure') to fetch the trusted key's public half online. REQUIRED for such a chain — the KEK does NOT verify an asymmetric signature, even on an encrypted chain. The recorded manifest key reference is NEVER trusted; verification anchors on the key YOU name here. Absent it, the chain WARNs present-but-unverified and proceeds (DR-safe) unless --require-signature. Accepts a file path, 'env:VAR', or 'kms://...'." placeholder:"PATH|env:VAR|kms://..."`
 }
 
 // readKeyMaterial resolves a `--sign-key` / `--verify-key` spec: `env:VAR`
@@ -181,8 +181,12 @@ func parseKMSURI(spec string) (provider, keyRef string, err error) {
 	return rest[:slash], rest[slash+1:], nil
 }
 
-// buildKMSSigner constructs the write-side KMS signer for provider. Phase
-// 3a wires AWS; GCP/Azure are Phase 3b fast-follows.
+// buildKMSSigner constructs the write-side KMS signer for provider. AWS
+// (Phase 3a), GCP + Azure (Phase 3b). The key reference is the provider's
+// native form: an AWS key ARN/id, a GCP versioned CryptoKeyVersion
+// resource, or an Azure Key Vault key-identifier URL. `region` is
+// AWS-only (GCP bakes the location into the resource, Azure into the vault
+// URL).
 func buildKMSSigner(provider, keyRef, region string) (*lineage.Signer, error) {
 	switch provider {
 	case "aws":
@@ -191,10 +195,20 @@ func buildKMSSigner(provider, keyRef, region string) (*lineage.Signer, error) {
 			return nil, err
 		}
 		return lineage.NewKMSSigner(adapter), nil
-	case "gcp", "azure":
-		return nil, fmt.Errorf("kms:// signing provider %q is ADR-0154 Phase 3b (only 'aws' is available in Phase 3a)", provider)
+	case "gcp":
+		adapter, err := crypto.NewGCPKMSSigner(kongContext(), keyRef)
+		if err != nil {
+			return nil, err
+		}
+		return lineage.NewKMSSigner(adapter), nil
+	case "azure":
+		adapter, err := crypto.NewAzureKMSSigner(kongContext(), keyRef)
+		if err != nil {
+			return nil, err
+		}
+		return lineage.NewKMSSigner(adapter), nil
 	default:
-		return nil, fmt.Errorf("unknown kms:// signing provider %q (expected 'aws')", provider)
+		return nil, fmt.Errorf("unknown kms:// signing provider %q (expected 'aws', 'gcp', or 'azure')", provider)
 	}
 }
 
@@ -204,10 +218,12 @@ func fetchKMSPublicKey(provider, keyRef, region string) (stdcrypto.PublicKey, er
 	switch provider {
 	case "aws":
 		return crypto.FetchAWSKMSPublicKey(kongContext(), keyRef, awsKMSSignOpts(region)...)
-	case "gcp", "azure":
-		return nil, fmt.Errorf("kms:// verify provider %q is ADR-0154 Phase 3b (only 'aws' is available in Phase 3a)", provider)
+	case "gcp":
+		return crypto.FetchGCPKMSPublicKey(kongContext(), keyRef)
+	case "azure":
+		return crypto.FetchAzureKMSPublicKey(kongContext(), keyRef)
 	default:
-		return nil, fmt.Errorf("unknown kms:// verify provider %q (expected 'aws')", provider)
+		return nil, fmt.Errorf("unknown kms:// verify provider %q (expected 'aws', 'gcp', or 'azure')", provider)
 	}
 }
 
