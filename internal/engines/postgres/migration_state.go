@@ -120,8 +120,9 @@ func (s *MigrationStateStore) Close() error {
 // binary. Idempotent — safe to call on every start.
 //
 // state_format DEFAULT 1: an existing row that pre-dates the column
-// reads back as FormatLegacyBlob, which is exactly what it is — the
-// first Read upgrades it to per-table progress rows.
+// reads back as FormatLegacyBlob, which is exactly what it is — Read
+// detects it and the first write upgrades it to per-table progress
+// rows.
 func (s *MigrationStateStore) EnsureControlTable(ctx context.Context) error {
 	hdr := quoteIdent(s.schema) + "." + quoteIdent(migrateStateTableName)
 	prog := quoteIdent(s.schema) + "." + quoteIdent(migrateProgressTableName)
@@ -161,8 +162,9 @@ func (s *MigrationStateStore) EnsureControlTable(ctx context.Context) error {
 // Read returns the merged header + per-table state for migrationID,
 // or ok=false when no row exists. Tolerant of the header table being
 // absent (treated as "no row") so dry-run / pre-EnsureControlTable
-// inspection paths don't error. A legacy single-blob row is upgraded
-// to per-table progress rows on first Read (one transaction; see
+// inspection paths don't error. A legacy single-blob row is detected
+// here and upgraded to per-table progress rows on the first write
+// (one transaction; Read itself never writes — see
 // internal/migratestate).
 func (s *MigrationStateStore) Read(ctx context.Context, migrationID string) (ir.MigrationState, bool, error) {
 	return s.shared.Read(ctx, migrationID)

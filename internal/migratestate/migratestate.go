@@ -41,14 +41,20 @@
 //
 // A header row written by a ≤v0.99.x binary has state_format 1 (the
 // column's default after the additive migration) and the whole map in
-// table_progress. [Store.Read] explodes such a row into per-table
-// progress rows ONCE, inside a single transaction, and overwrites the
-// blob with [UpgradedBlobSentinel] — deliberately NOT valid JSON, so
-// an old binary that later reads the row fails loudly at decode
-// instead of silently treating the migration as "no progress" and
-// re-copying tables. Crash-safety: the transaction either commits
-// whole (format 2, rows authoritative) or rolls back (format 1, blob
-// authoritative) — the next Read simply re-runs the upgrade, and the
+// table_progress. [Store.Read] DETECTS such a row and decodes the blob
+// without writing anything — a Read must stay a read, so inspection
+// under a read-only target user (and dry-run paths) works on legacy
+// rows. The one-time upgrade — explode the blob into per-table
+// progress rows inside a single transaction and overwrite the blob
+// with [UpgradedBlobSentinel] — runs on the FIRST WRITE path
+// ([Store.Write] / [Store.WriteTableProgress]) for that migration_id,
+// which was going to mutate the store anyway. The sentinel is
+// deliberately NOT valid JSON, so an old binary that later reads the
+// row fails loudly at decode instead of silently treating the
+// migration as "no progress" and re-copying tables. Crash-safety: the
+// transaction either commits whole (format 2, rows authoritative) or
+// rolls back (format 1, blob authoritative) — the next Read re-detects
+// the legacy row and the next write re-runs the upgrade, and the
 // delete-rows-first step inside the transaction makes the re-run
 // immune to orphan progress rows from any earlier life of the same
 // migration_id.
@@ -61,6 +67,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -170,6 +177,14 @@ type Store struct {
 	DB     *sql.DB
 	Config Config
 	SQL    SQL
+
+	// mu guards pendingUpgrades — the legacy rows Read has detected
+	// whose one-time per-table-rows upgrade is deferred to the first
+	// write path (see the package comment). The mutex is held across
+	// the upgrade transaction itself so concurrent per-table writers
+	// run it exactly once.
+	mu              sync.Mutex
+	pendingUpgrades map[string]map[string]ir.TableProgress
 }
 
 // Read returns the state for migrationID, or ok=false when no header
@@ -177,10 +192,12 @@ type Store struct {
 // "no row") so dry-run / pre-EnsureControlTable inspection paths
 // don't error.
 //
-// On a FormatLegacyBlob row Read performs the one-time upgrade to
-// per-table rows (see the package comment) before returning; an
-// upgrade failure is returned loudly rather than leaving a row that
-// per-table writes would silently not reach. Requires
+// Read never writes. On a FormatLegacyBlob row it decodes the blob and
+// RECORDS the row as needing the one-time per-table-rows upgrade; the
+// first write path (Write / WriteTableProgress) for that migration_id
+// performs it (see the package comment). This keeps Read working under
+// a read-only target user, and keeps a legacy row readable by older
+// binaries until this binary actually mutates it. Requires
 // EnsureControlTable to have run for legacy-shaped tables — the
 // header SELECT references state_format, which the ensure migration
 // adds.
@@ -198,8 +215,10 @@ func (s *Store) Read(ctx context.Context, migrationID string) (ir.MigrationState
 	)
 	switch err := row.Scan(&phase, &tableProgress, &format, &startedAt, &updatedAt, &lastError); {
 	case errors.Is(err, sql.ErrNoRows):
+		s.dropPendingUpgrade(migrationID)
 		return ir.MigrationState{}, false, nil
 	case s.Config.IsMissingTable(err):
+		s.dropPendingUpgrade(migrationID)
 		return ir.MigrationState{}, false, nil
 	case err != nil:
 		return ir.MigrationState{}, false, fmt.Errorf("%s: read migrate-state: %w", s.Config.EngineName, err)
@@ -214,6 +233,10 @@ func (s *Store) Read(ctx context.Context, migrationID string) (ir.MigrationState
 	}
 
 	if format >= FormatPerTableRows {
+		// The row is already at the per-table layout — clear any stale
+		// needs-upgrade note (e.g. another process upgraded between two
+		// Reads) so a later write can't replay old blob progress.
+		s.dropPendingUpgrade(migrationID)
 		progress, latest, err := s.readProgressRows(ctx, migrationID)
 		if err != nil {
 			return ir.MigrationState{}, false, err
@@ -228,17 +251,60 @@ func (s *Store) Read(ctx context.Context, migrationID string) (ir.MigrationState
 		return state, true, nil
 	}
 
-	// FormatLegacyBlob: a ≤v0.99.x row. Decode the whole-map blob,
-	// then upgrade it to per-table rows once, transactionally.
+	// FormatLegacyBlob: a ≤v0.99.x row. Decode the whole-map blob and
+	// note the row for the write-deferred one-time upgrade — Read
+	// itself must not write (read-only target users inspect through
+	// here).
 	progress, err := decodeLegacyTableProgress(tableProgress.String)
 	if err != nil {
 		return ir.MigrationState{}, false, fmt.Errorf("%s: decode table_progress: %w", s.Config.EngineName, err)
 	}
 	state.TableProgress = progress
-	if err := s.upgradeLegacyRow(ctx, migrationID, progress); err != nil {
-		return ir.MigrationState{}, false, fmt.Errorf("%s: upgrade migrate-state row to per-table progress: %w", s.Config.EngineName, err)
-	}
+	s.notePendingUpgrade(migrationID, progress)
 	return state, true, nil
+}
+
+// notePendingUpgrade records that migrationID's header row was seen at
+// FormatLegacyBlob with the given decoded blob progress. The first
+// write path replays it into per-table rows via upgradeIfPending.
+func (s *Store) notePendingUpgrade(migrationID string, progress map[string]ir.TableProgress) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pendingUpgrades == nil {
+		s.pendingUpgrades = map[string]map[string]ir.TableProgress{}
+	}
+	s.pendingUpgrades[migrationID] = progress
+}
+
+// dropPendingUpgrade forgets a needs-upgrade note — the row is gone or
+// already at the per-table layout, so replaying the old blob would
+// resurrect stale progress.
+func (s *Store) dropPendingUpgrade(migrationID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.pendingUpgrades, migrationID)
+}
+
+// upgradeIfPending runs the one-time legacy upgrade when Read flagged
+// migrationID's header as FormatLegacyBlob, and is a no-op otherwise.
+// Every write path calls it first, so the write it precedes always
+// lands on a per-table-layout row (a progress row upserted under a
+// still-legacy header would be invisible to Read). The mutex is held
+// across the upgrade transaction so the Migrator's concurrent
+// per-table writers run it exactly once; a failure leaves the note in
+// place (blob authoritative) for the next write to retry.
+func (s *Store) upgradeIfPending(ctx context.Context, migrationID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	progress, ok := s.pendingUpgrades[migrationID]
+	if !ok {
+		return nil
+	}
+	if err := s.upgradeLegacyRow(ctx, migrationID, progress); err != nil {
+		return fmt.Errorf("%s: upgrade migrate-state row to per-table progress: %w", s.Config.EngineName, err)
+	}
+	delete(s.pendingUpgrades, migrationID)
+	return nil
 }
 
 // readProgressRows loads every progress row for migrationID plus the
@@ -287,9 +353,11 @@ func (s *Store) readProgressRows(ctx context.Context, migrationID string) (map[s
 
 // upgradeLegacyRow explodes a legacy blob's entries into per-table
 // progress rows and flips the header to FormatPerTableRows, all in
-// one transaction. Crash-safe by tx atomicity: a crash before commit
-// leaves the row at FormatLegacyBlob with the blob intact, and the
-// next Read re-runs the whole upgrade. The delete-first step clears
+// one transaction. Called from upgradeIfPending (under the store
+// mutex) on the first write path after Read detected a legacy row.
+// Crash-safe by tx atomicity: a crash before commit leaves the row at
+// FormatLegacyBlob with the blob intact, and the next Read + write
+// pair re-runs the whole upgrade. The delete-first step clears
 // any orphan progress rows a previous life of this migration_id left
 // behind (e.g. an old binary's ClearMigration deleted only the header
 // row it knew about), so stale entries can never shadow the blob's.
@@ -346,6 +414,13 @@ func (s *Store) Write(ctx context.Context, state ir.MigrationState) error {
 	if state.Phase == "" {
 		return fmt.Errorf("%s: migrate-state Write: Phase is empty", s.Config.EngineName)
 	}
+	// A legacy row Read flagged must be exploded into per-table rows
+	// BEFORE the header flips to FormatPerTableRows below — a
+	// header-only Write on a legacy row would otherwise replace the
+	// blob with the sentinel and lose the recorded progress.
+	if err := s.upgradeIfPending(ctx, state.MigrationID); err != nil {
+		return err
+	}
 	headerArgs := []any{
 		state.MigrationID,
 		string(state.Phase),
@@ -395,18 +470,22 @@ func (s *Store) Write(ctx context.Context, state ir.MigrationState) error {
 // workers checkpointing different tables hit different rows instead
 // of contending on one hot header.
 //
-// Contract: the caller has already established the header at
-// FormatPerTableRows for this migrationID (the pipeline's
-// loadOrInitState always Reads — which upgrades legacy rows — or
-// Writes a fresh header before any per-table write happens). A
-// progress row written under a still-legacy header would be invisible
-// to Read; the pipeline ordering makes that unreachable.
+// Contract: the caller has already established the header for this
+// migrationID (the pipeline's loadOrInitState always Reads — which
+// flags legacy rows for the write-deferred upgrade this method then
+// performs — or Writes a fresh header before any per-table write
+// happens). A progress row written under a still-legacy header would
+// be invisible to Read; upgradeIfPending plus the pipeline ordering
+// makes that unreachable.
 func (s *Store) WriteTableProgress(ctx context.Context, migrationID, tableName string, progress ir.TableProgress) error {
 	if migrationID == "" {
 		return fmt.Errorf("%s: migrate-state WriteTableProgress: migrationID is empty", s.Config.EngineName)
 	}
 	if tableName == "" {
 		return fmt.Errorf("%s: migrate-state WriteTableProgress: tableName is empty", s.Config.EngineName)
+	}
+	if err := s.upgradeIfPending(ctx, migrationID); err != nil {
+		return err
 	}
 	encoded, err := encodeProgressEntry(progress)
 	if err != nil {
@@ -437,6 +516,9 @@ func (s *Store) ClearMigration(ctx context.Context, migrationID string) error {
 	if _, err := s.DB.ExecContext(ctx, s.SQL.DeleteHeader, migrationID); err != nil && !s.Config.IsMissingTable(err) {
 		return fmt.Errorf("%s: clear migrate-state: %w", s.Config.EngineName, err)
 	}
+	// The row is gone — a needs-upgrade note left behind would make a
+	// later same-id write resurrect the cleared blob's progress rows.
+	s.dropPendingUpgrade(migrationID)
 	return nil
 }
 

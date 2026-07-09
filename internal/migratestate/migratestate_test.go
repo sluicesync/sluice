@@ -249,20 +249,15 @@ func TestRead_MissingTableAndMissingRowTolerated(t *testing.T) {
 	})
 }
 
-// TestRead_LegacyBlobUpgradesOnce pins the ADR-0082 one-time upgrade:
-// a format-1 header explodes its blob into per-table rows inside ONE
-// transaction — orphan-row delete first, inserts in sorted table
-// order (the deadlock-ordering contract), then the sentinel+format
-// flip — and the returned state carries the blob's progress.
-func TestRead_LegacyBlobUpgradesOnce(t *testing.T) {
+// TestRead_LegacyBlobIsReadOnly pins the audit-2026-07-08 §4.4 split:
+// Read on a format-1 header decodes the blob and returns the state
+// WITHOUT writing anything — no upgrade transaction, so inspection
+// works under a read-only target user and older binaries stay locked
+// out only once a write actually mutates the row.
+func TestRead_LegacyBlobIsReadOnly(t *testing.T) {
 	blob := `{"users":"complete","orders":{"state":"in_progress","last_pk":[7],"rows_copied":7},"events":"no_pk_truncate_and_redo"}`
 	store, _, seen := newScriptedStore([]msStep{
 		{rows: headerRow("bulk_copy", blob, FormatLegacyBlob, t1, t2, nil)},
-		{}, // DELETE_PROGRESS
-		{}, // UPSERT_PROGRESS events
-		{}, // UPSERT_PROGRESS orders
-		{}, // UPSERT_PROGRESS users
-		{}, // MARK_UPGRADED
 	})
 
 	got, ok, err := store.Read(context.Background(), "m1")
@@ -278,6 +273,43 @@ func TestRead_LegacyBlobUpgradesOnce(t *testing.T) {
 	if got.TableProgress["orders"].RowsCopied != 7 {
 		t.Errorf("orders rows_copied = %d; want 7", got.TableProgress["orders"].RowsCopied)
 	}
+	// THE pin: the header SELECT is the only statement — a legacy Read
+	// issues no writes.
+	assertSeen(t, *seen, []string{"READ_HEADER | m1"})
+}
+
+// TestWrite_LegacyRowUpgradesOnFirstWrite pins the write-deferred
+// ADR-0082 one-time upgrade: after Read flags a format-1 header, the
+// FIRST write path explodes the blob into per-table rows inside ONE
+// transaction — orphan-row delete first, inserts in sorted table
+// order (the deadlock-ordering contract), then the sentinel+format
+// flip — BEFORE its own statement, and only once.
+func TestWrite_LegacyRowUpgradesOnFirstWrite(t *testing.T) {
+	blob := `{"users":"complete","orders":{"state":"in_progress","last_pk":[7],"rows_copied":7},"events":"no_pk_truncate_and_redo"}`
+	store, _, seen := newScriptedStore([]msStep{
+		{rows: headerRow("bulk_copy", blob, FormatLegacyBlob, t1, t2, nil)},
+		{}, // DELETE_PROGRESS   (upgrade tx)
+		{}, // UPSERT_PROGRESS events
+		{}, // UPSERT_PROGRESS orders
+		{}, // UPSERT_PROGRESS users
+		{}, // MARK_UPGRADED
+		{}, // UPSERT_PROGRESS orders (the write itself)
+		{}, // UPSERT_PROGRESS users  (second write — no re-upgrade)
+	})
+
+	ctx := context.Background()
+	if _, _, err := store.Read(ctx, "m1"); err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if err := store.WriteTableProgress(ctx, "m1", "orders",
+		ir.TableProgress{State: ir.TableProgressInProgress, LastPK: []any{int64(9)}, RowsCopied: 9}); err != nil {
+		t.Fatalf("WriteTableProgress: %v", err)
+	}
+	// Second write must NOT re-run the upgrade.
+	if err := store.WriteTableProgress(ctx, "m1", "users",
+		ir.TableProgress{State: ir.TableProgressComplete}); err != nil {
+		t.Fatalf("second WriteTableProgress: %v", err)
+	}
 	want := []string{
 		"READ_HEADER | m1",
 		"BEGIN",
@@ -287,51 +319,113 @@ func TestRead_LegacyBlobUpgradesOnce(t *testing.T) {
 		`UPSERT_PROGRESS | m1,users,"complete"`,
 		"MARK_UPGRADED | " + UpgradedBlobSentinel + ",2,m1",
 		"COMMIT",
+		`UPSERT_PROGRESS | m1,orders,{"state":"in_progress","last_pk":[9],"rows_copied":9}`,
+		`UPSERT_PROGRESS | m1,users,"complete"`,
 	}
 	assertSeen(t, *seen, want)
 }
 
-// TestRead_LegacyUpgradeFailureRollsBackAndErrors pins the
-// crash-safety shape: an upgrade-statement failure rolls the tx back
-// and surfaces loudly — the header stays format 1 with the blob
-// intact, so the next Read re-runs the whole upgrade.
-func TestRead_LegacyUpgradeFailureRollsBackAndErrors(t *testing.T) {
+// TestWrite_HeaderOnlyOnLegacyRowUpgradesFirst pins the loss guard: a
+// header-only Write on a Read-flagged legacy row must explode the blob
+// into per-table rows BEFORE the header upsert replaces the blob with
+// the sentinel — otherwise the recorded progress would be lost.
+func TestWrite_HeaderOnlyOnLegacyRowUpgradesFirst(t *testing.T) {
+	store, _, seen := newScriptedStore([]msStep{
+		{rows: headerRow("bulk_copy", `{"users":"complete"}`, FormatLegacyBlob, t1, t2, nil)},
+		{}, // DELETE_PROGRESS   (upgrade tx)
+		{}, // UPSERT_PROGRESS users
+		{}, // MARK_UPGRADED
+		{}, // UPSERT_HEADER (the write itself)
+	})
+
+	ctx := context.Background()
+	if _, _, err := store.Read(ctx, "m1"); err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if err := store.Write(ctx, ir.MigrationState{MigrationID: "m1", Phase: ir.MigrationPhaseTables}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	want := []string{
+		"READ_HEADER | m1",
+		"BEGIN",
+		"DELETE_PROGRESS | m1",
+		`UPSERT_PROGRESS | m1,users,"complete"`,
+		"MARK_UPGRADED | " + UpgradedBlobSentinel + ",2,m1",
+		"COMMIT",
+		"UPSERT_HEADER | m1,tables," + UpgradedBlobSentinel + ",2,<nil>",
+	}
+	assertSeen(t, *seen, want)
+}
+
+// TestWrite_LegacyUpgradeFailureRollsBackAndErrors pins the
+// crash-safety shape: an upgrade-statement failure on the write path
+// rolls the tx back and surfaces loudly — the header stays format 1
+// with the blob intact, and the note stays pending so the NEXT write
+// re-runs the whole upgrade.
+func TestWrite_LegacyUpgradeFailureRollsBackAndErrors(t *testing.T) {
 	store, _, seen := newScriptedStore([]msStep{
 		{rows: headerRow("bulk_copy", `{"users":"complete"}`, FormatLegacyBlob, t1, t2, nil)},
 		{},                             // DELETE_PROGRESS
 		{err: errors.New("disk full")}, // UPSERT_PROGRESS users
+		{},                             // DELETE_PROGRESS  (retry)
+		{},                             // UPSERT_PROGRESS users
+		{},                             // MARK_UPGRADED
+		{},                             // UPSERT_PROGRESS orders (the write)
 	})
 
-	_, _, err := store.Read(context.Background(), "m1")
+	ctx := context.Background()
+	if _, _, err := store.Read(ctx, "m1"); err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	err := store.WriteTableProgress(ctx, "m1", "orders", ir.TableProgress{State: ir.TableProgressComplete})
 	if err == nil {
-		t.Fatal("Read succeeded; want upgrade error")
+		t.Fatal("WriteTableProgress succeeded; want upgrade error")
 	}
 	if !strings.Contains(err.Error(), "upgrade migrate-state row") {
 		t.Errorf("err = %v; want upgrade wording", err)
 	}
-	last := (*seen)[len(*seen)-1]
-	if last != "ROLLBACK" {
+	if last := (*seen)[len(*seen)-1]; last != "ROLLBACK" {
 		t.Errorf("last statement = %q; want ROLLBACK", last)
 	}
+	// The retry (note stayed pending) upgrades, then the write lands.
+	if err := store.WriteTableProgress(ctx, "m1", "orders", ir.TableProgress{State: ir.TableProgressComplete}); err != nil {
+		t.Fatalf("retry WriteTableProgress: %v", err)
+	}
+	tail := (*seen)[len(*seen)-6:]
+	wantTail := []string{
+		"BEGIN",
+		"DELETE_PROGRESS | m1",
+		`UPSERT_PROGRESS | m1,users,"complete"`,
+		"MARK_UPGRADED | " + UpgradedBlobSentinel + ",2,m1",
+		"COMMIT",
+		`UPSERT_PROGRESS | m1,orders,"complete"`,
+	}
+	assertSeen(t, tail, wantTail)
 }
 
-// TestRead_LegacyEmptyBlobStillUpgrades pins the pending-row shape: a
-// format-1 header whose blob is NULL (fresh pending row from an old
-// binary) still flips to format 2 + sentinel so later per-table
-// writes are never invisible behind a legacy header.
-func TestRead_LegacyEmptyBlobStillUpgrades(t *testing.T) {
+// TestRead_LegacyEmptyBlobStillUpgradesOnWrite pins the pending-row
+// shape: a format-1 header whose blob is NULL (fresh pending row from
+// an old binary) still flips to format 2 + sentinel on the first write
+// so later per-table writes are never invisible behind a legacy
+// header.
+func TestRead_LegacyEmptyBlobStillUpgradesOnWrite(t *testing.T) {
 	store, _, seen := newScriptedStore([]msStep{
 		{rows: headerRow("pending", nil, FormatLegacyBlob, t1, t2, nil)},
-		{}, // DELETE_PROGRESS
+		{}, // DELETE_PROGRESS   (upgrade tx)
 		{}, // MARK_UPGRADED
+		{}, // UPSERT_HEADER (the write itself)
 	})
 
-	got, ok, err := store.Read(context.Background(), "m1")
+	ctx := context.Background()
+	got, ok, err := store.Read(ctx, "m1")
 	if err != nil || !ok {
 		t.Fatalf("Read = ok=%v err=%v; want ok=true err=nil", ok, err)
 	}
 	if got.TableProgress != nil {
 		t.Errorf("TableProgress = %v; want nil", got.TableProgress)
+	}
+	if err := store.Write(ctx, ir.MigrationState{MigrationID: "m1", Phase: ir.MigrationPhaseBulkCopy}); err != nil {
+		t.Fatalf("Write: %v", err)
 	}
 	want := []string{
 		"READ_HEADER | m1",
@@ -339,6 +433,38 @@ func TestRead_LegacyEmptyBlobStillUpgrades(t *testing.T) {
 		"DELETE_PROGRESS | m1",
 		"MARK_UPGRADED | " + UpgradedBlobSentinel + ",2,m1",
 		"COMMIT",
+		"UPSERT_HEADER | m1,bulk_copy," + UpgradedBlobSentinel + ",2,<nil>",
+	}
+	assertSeen(t, *seen, want)
+}
+
+// TestClearMigration_DropsPendingUpgradeNote pins that clearing a
+// Read-flagged legacy migration forgets its needs-upgrade note: a
+// subsequent same-id write must NOT resurrect the cleared blob's
+// progress rows.
+func TestClearMigration_DropsPendingUpgradeNote(t *testing.T) {
+	store, _, seen := newScriptedStore([]msStep{
+		{rows: headerRow("bulk_copy", `{"users":"complete"}`, FormatLegacyBlob, t1, t2, nil)},
+		{}, // DELETE_PROGRESS (clear)
+		{}, // DELETE_HEADER   (clear)
+		{}, // UPSERT_HEADER   (fresh write — no upgrade tx)
+	})
+
+	ctx := context.Background()
+	if _, _, err := store.Read(ctx, "m1"); err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if err := store.ClearMigration(ctx, "m1"); err != nil {
+		t.Fatalf("ClearMigration: %v", err)
+	}
+	if err := store.Write(ctx, ir.MigrationState{MigrationID: "m1", Phase: ir.MigrationPhasePending}); err != nil {
+		t.Fatalf("Write after clear: %v", err)
+	}
+	want := []string{
+		"READ_HEADER | m1",
+		"DELETE_PROGRESS | m1",
+		"DELETE_HEADER | m1",
+		"UPSERT_HEADER | m1,pending," + UpgradedBlobSentinel + ",2,<nil>",
 	}
 	assertSeen(t, *seen, want)
 }

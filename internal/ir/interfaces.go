@@ -2489,8 +2489,10 @@ type TableChunkProgress struct {
 //
 // Read merges the two back into the Go map; UpdatedAt carries the
 // most recent of the header's and the progress rows' timestamps. A
-// legacy single-blob row (state_format 1) is upgraded to per-table
-// rows once, on first Read — see internal/migratestate. nil
+// legacy single-blob row (state_format 1) is detected on Read and
+// upgraded to per-table rows once, on the first WRITE (Read itself
+// never writes, so it works under a read-only target user) — see
+// internal/migratestate. nil
 // TableProgress is fine — first-run writes before any table starts
 // use an empty map.
 type MigrationState struct {

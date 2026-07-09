@@ -156,11 +156,12 @@ func TestMigrationStateStore_LegacyBlobUpgrade(t *testing.T) {
 		t.Fatalf("insert orphan progress row: %v", err)
 	}
 
-	// 4. First Read performs the one-time upgrade and returns the
-	// blob's progress.
+	// 4. First Read decodes the blob and returns the progress WITHOUT
+	// writing — the row stays byte-identical on disk (audit 2026-07-08
+	// §4.4: a Read must stay a read).
 	got, ok, err := store.Read(ctx, "legacy-mig")
 	if err != nil {
-		t.Fatalf("Read (upgrade): %v", err)
+		t.Fatalf("Read (legacy): %v", err)
 	}
 	if !ok {
 		t.Fatal("Read ok=false on legacy row")
@@ -176,12 +177,59 @@ func TestMigrationStateStore_LegacyBlobUpgrade(t *testing.T) {
 	}
 	assertUpgradedProgressFamilies(t, got.TableProgress)
 
-	// 5. On-disk shape after the upgrade: format 2, sentinel blob,
-	// exactly the fixture's 7 progress rows (orphan gone).
 	var (
 		format int
 		blob   string
+		rows   int
 	)
+	if err := db.QueryRowContext(ctx,
+		"SELECT state_format, table_progress FROM sluice_migrate_state WHERE migration_id = $1",
+		"legacy-mig").Scan(&format, &blob); err != nil {
+		t.Fatalf("inspect header after Read: %v", err)
+	}
+	if format != migratestate.FormatLegacyBlob || blob != legacyBlobFixture {
+		t.Errorf("Read mutated the legacy row: format=%d blob=%q; want format 1 + the original blob", format, blob)
+	}
+	if err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM sluice_migrate_table_progress WHERE migration_id = $1",
+		"legacy-mig").Scan(&rows); err != nil {
+		t.Fatalf("count progress rows after Read: %v", err)
+	}
+	if rows != 1 {
+		t.Errorf("progress rows after Read = %d; want 1 (only the orphan — Read wrote nothing)", rows)
+	}
+
+	// 4b. The audit's exact failure mode: Read on a legacy row under a
+	// READ-ONLY connection must succeed (the old read-time upgrade
+	// failed here with a write refused by the server).
+	var dbName string
+	if err := db.QueryRowContext(ctx, "SELECT current_database()").Scan(&dbName); err != nil {
+		t.Fatalf("current_database: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "ALTER DATABASE "+dbName+" SET default_transaction_read_only = on"); err != nil {
+		t.Fatalf("set read-only: %v", err)
+	}
+	roStore, err := eng.OpenMigrationStateStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenMigrationStateStore (read-only): %v", err)
+	}
+	roGot, ok, roErr := roStore.Read(ctx, "legacy-mig")
+	_ = roStore.Close()
+	if _, err := db.ExecContext(ctx, "ALTER DATABASE "+dbName+" SET default_transaction_read_only = off"); err != nil {
+		t.Fatalf("unset read-only: %v", err)
+	}
+	if roErr != nil || !ok {
+		t.Fatalf("Read under read-only connection = ok=%v err=%v; want ok=true err=nil", ok, roErr)
+	}
+	assertUpgradedProgressFamilies(t, roGot.TableProgress)
+
+	// 5. The FIRST WRITE path performs the one-time upgrade before its
+	// own statement: format 2, sentinel blob, the fixture's 7 progress
+	// rows (orphan gone), and the written entry landed on top.
+	if err := store.WriteTableProgress(ctx, "legacy-mig", "orders",
+		ir.TableProgress{State: ir.TableProgressInProgress, LastPK: []any{int64(20000)}, RowsCopied: 20000}); err != nil {
+		t.Fatalf("WriteTableProgress (upgrade): %v", err)
+	}
 	if err := db.QueryRowContext(ctx,
 		"SELECT state_format, table_progress FROM sluice_migrate_state WHERE migration_id = $1",
 		"legacy-mig").Scan(&format, &blob); err != nil {
@@ -193,7 +241,6 @@ func TestMigrationStateStore_LegacyBlobUpgrade(t *testing.T) {
 	if blob != migratestate.UpgradedBlobSentinel {
 		t.Errorf("table_progress = %q; want the upgrade sentinel", blob)
 	}
-	var rows int
 	if err := db.QueryRowContext(ctx,
 		"SELECT COUNT(*) FROM sluice_migrate_table_progress WHERE migration_id = $1",
 		"legacy-mig").Scan(&rows); err != nil {
@@ -212,22 +259,11 @@ func TestMigrationStateStore_LegacyBlobUpgrade(t *testing.T) {
 		t.Error("sentinel decoded cleanly under the legacy decoder; want loud failure")
 	}
 
-	// 7. Idempotence: a second Read sees format 2 and changes nothing.
-	again, ok, err := store.Read(ctx, "legacy-mig")
+	// 7. Read after the upgrade merges the per-table rows: the written
+	// entry updated, peers untouched.
+	after, ok, err := store.Read(ctx, "legacy-mig")
 	if err != nil || !ok {
-		t.Fatalf("second Read = ok=%v err=%v", ok, err)
-	}
-	assertUpgradedProgressFamilies(t, again.TableProgress)
-
-	// 8. The hot path lands on the upgraded layout: a per-table write
-	// updates one row, peers untouched.
-	if err := store.WriteTableProgress(ctx, "legacy-mig", "orders",
-		ir.TableProgress{State: ir.TableProgressInProgress, LastPK: []any{int64(20000)}, RowsCopied: 20000}); err != nil {
-		t.Fatalf("WriteTableProgress: %v", err)
-	}
-	after, _, err := store.Read(ctx, "legacy-mig")
-	if err != nil {
-		t.Fatalf("Read after per-table write: %v", err)
+		t.Fatalf("Read after upgrade = ok=%v err=%v", ok, err)
 	}
 	if after.TableProgress["orders"].RowsCopied != 20000 {
 		t.Errorf("orders after per-table write = %+v; want rows_copied 20000", after.TableProgress["orders"])
