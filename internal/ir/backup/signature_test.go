@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -123,6 +124,60 @@ func TestCanonicalManifestBytes_FullGolden(t *testing.T) {
 	const want = "d194bad3abdbb5cdde7fbb2f66d9324aa4866a71abe3e59a4cfc2ddbdd5e1579"
 	if got := hex.EncodeToString(sum[:]); got != want {
 		t.Fatalf("full canonical SHA drift (on-disk contract): got %s want %s\n(canonical bytes:\n%q)", got, want, b)
+	}
+}
+
+// TestCanonicalManifestBytes_V2PreservedGolden is the BACK-COMPAT guard:
+// the v2 canonicalization must byte-match what the shipped Phase-1
+// (v0.99.208) binary signed — the SHA is the ORIGINAL v2 full golden, and
+// the minimal v2 rendering has NO scheme token. Changing v2 would strand
+// every chain the Phase-1 binary wrote, so this pin must never move.
+func TestCanonicalManifestBytes_V2PreservedGolden(t *testing.T) {
+	// Full-fixture SHA — identical to what v0.99.208's CanonicalManifestBytes
+	// (the pre-scheme-token function) emitted.
+	b, err := CanonicalManifestBytesForVersion(fixedSignedManifest(), 2, ManifestCanonVersionV2, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(b)
+	const wantSHA = "ebabd37f70c0da8d71b266991bc7ea8074f37abb3138be34f891b2c2267f4185"
+	if got := hex.EncodeToString(sum[:]); got != wantSHA {
+		t.Fatalf("v2 canonical SHA drift — this BREAKS every Phase-1-signed chain: got %s want %s", got, wantSHA)
+	}
+	// Minimal v2 rendering: v2 tag, NO scheme token, then the shared body.
+	m := &Manifest{
+		FormatVersion: FormatVersionSignedManifest,
+		CreatedAt:     time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+		SourceEngine:  "postgres",
+		Kind:          BackupKindFull,
+	}
+	minB, err := CanonicalManifestBytesForVersion(m, 0, ManifestCanonVersionV2, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.Join([]string{
+		"24:sluice-manifest-canon/v2",
+		"14:format_version", "1:6",
+		"13:source_engine", "8:postgres",
+		"10:created_at", "20:2026-07-09T12:00:00Z",
+		"4:kind", "4:full",
+		"9:backup_id", "0:",
+		"16:parent_backup_id", "0:",
+		"11:schema_hash", "0:",
+		"8:sequence", "1:0",
+		"11:chunk_count", "1:0",
+		"14:start_position", "0:", "0:",
+		"12:end_position", "0:", "0:",
+		"16:chain_encryption", "4:none",
+		"",
+	}, "\n")
+	if string(minB) != want {
+		t.Fatalf("v2 minimal canonical drift:\n got %q\nwant %q", minB, want)
+	}
+	// An unknown (future) version is refused with ErrUnsupportedCanonVersion,
+	// NOT a silent wrong-bytes render.
+	if _, err := CanonicalManifestBytesForVersion(m, 0, "sluice-manifest-canon/v4", ""); !errors.Is(err, ErrUnsupportedCanonVersion) {
+		t.Fatalf("future canon version: got %v, want ErrUnsupportedCanonVersion", err)
 	}
 }
 

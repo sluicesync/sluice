@@ -24,6 +24,7 @@ package backup
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -57,7 +58,24 @@ const (
 	// INCLUDING that scheme — so an adversary who relabels an HMAC
 	// signature as `ed25519` (or vice versa) to force a different/weaker
 	// verification path changes the signed bytes and fails verification.
+	//
+	// The WRITER always emits the newest version (this constant); the
+	// VERIFIER is DUAL-VERSION — it recomputes at the signature's OWN
+	// recorded [ManifestSignature.CanonVersion] via
+	// [CanonicalManifestBytesForVersion], so a v2 signature written by the
+	// shipped Phase-1 (v0.99.208) binary still verifies GREEN on a Phase-2
+	// binary (the "newer sluice always reads older" invariant). v2 has NO
+	// scheme token — Phase 1 only had HMAC-off-KEK — so a v2 signature's
+	// scheme is implicitly [SignatureSchemeHMACKEK].
 	ManifestCanonVersion = "sluice-manifest-canon/v3"
+
+	// ManifestCanonVersionV2 is the Phase-1 (v0.99.208) canonical
+	// serialization the shipped binary signed with: byte-identical to
+	// [CanonicalManifestBytes] MINUS the scheme token, tagged v2. Preserved
+	// verbatim as ON-DISK CONTRACT so the dual-version verifier can still
+	// authenticate every chain the Phase-1 binary wrote. NEVER change the
+	// v2 rendering — it must byte-match what v0.99.208 emitted.
+	ManifestCanonVersionV2 = "sluice-manifest-canon/v2"
 
 	// SignatureSchemeHMACKEK is the Phase 1 scheme tag recorded in the
 	// detached signature: HMAC-SHA-256 keyed off a key HKDF-derived from
@@ -86,8 +104,13 @@ const (
 // authenticates them; a verifier recomputes the canonical bytes from the
 // on-disk manifest + the expected sequence and checks the MAC.
 type ManifestSignature struct {
-	// CanonVersion is the [ManifestCanonVersion] the signer used; a
-	// verifier keyed on a different scheme refuses rather than guess.
+	// CanonVersion is the canonical-serialization version the signer used
+	// ([ManifestCanonVersion] for new signatures; [ManifestCanonVersionV2]
+	// for signatures written by the shipped Phase-1 binary). The verifier
+	// is DUAL-VERSION: it recomputes at THIS recorded version
+	// ([CanonicalManifestBytesForVersion]) so an older signature still
+	// verifies, and refuses a NEWER version with an "upgrade" message
+	// ([ErrUnsupportedCanonVersion]), never as tamper.
 	CanonVersion string `json:"canon_version"`
 
 	// Scheme is the signature scheme ([SignatureSchemeHMACKEK] in Phase
@@ -159,9 +182,43 @@ func ManifestChunkCount(m *Manifest) int {
 // error only if a SchemaDelta table cannot be fingerprinted. It is
 // ON-DISK CONTRACT (golden-pinned) — see the package doc.
 func CanonicalManifestBytes(m *Manifest, seq int, scheme string) ([]byte, error) {
+	return CanonicalManifestBytesForVersion(m, seq, ManifestCanonVersion, scheme)
+}
+
+// ErrUnsupportedCanonVersion is returned when a detached signature records
+// a canonical-serialization version this build does not know how to
+// recompute (a signature written by a NEWER sluice). It is NOT a tamper
+// signal — the caller surfaces it as "upgrade sluice", never as
+// SIGNATURE-INVALID.
+var ErrUnsupportedCanonVersion = errors.New("backup manifest signed with a newer canonicalization than this build supports; upgrade sluice to restore/verify it")
+
+// manifestCanonHasScheme maps each SUPPORTED manifest canon version to
+// whether it folds the scheme token in. v2 (Phase 1) does not; v3 (Phase
+// 2) does. A version absent from this map is unsupported (future).
+var manifestCanonHasScheme = map[string]bool{
+	ManifestCanonVersionV2: false,
+	ManifestCanonVersion:   true,
+}
+
+// CanonicalManifestBytesForVersion renders the canonical bytes at a
+// SPECIFIC canon version — the dual-version verify entry point. The
+// writer always uses [ManifestCanonVersion] (via [CanonicalManifestBytes]);
+// the verifier passes the signature's recorded version so a Phase-1 v2
+// signature is recomputed WITHOUT the scheme token (byte-matching what
+// v0.99.208 signed) and a v3 signature WITH it. Everything AFTER the
+// version+scheme prefix is identical across versions — v2 and v3 differ
+// only in the version tag and the presence of the scheme token.
+// Returns [ErrUnsupportedCanonVersion] for an unknown (newer) version.
+func CanonicalManifestBytesForVersion(m *Manifest, seq int, canonVersion, scheme string) ([]byte, error) {
+	withScheme, ok := manifestCanonHasScheme[canonVersion]
+	if !ok {
+		return nil, fmt.Errorf("%w (canon version %q)", ErrUnsupportedCanonVersion, canonVersion)
+	}
 	var b strings.Builder
-	tok(&b, ManifestCanonVersion)
-	field(&b, "scheme", scheme)
+	tok(&b, canonVersion)
+	if withScheme {
+		field(&b, "scheme", scheme)
+	}
 	field(&b, "format_version", strconv.Itoa(m.FormatVersion))
 	field(&b, "source_engine", m.SourceEngine)
 	field(&b, "created_at", m.CreatedAt.UTC().Format(time.RFC3339Nano))

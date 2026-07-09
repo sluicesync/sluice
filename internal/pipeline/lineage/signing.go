@@ -40,7 +40,21 @@ import (
 //
 // v3 (ADR-0154 Phase 2): the signature scheme is folded into the
 // canonical catalog bytes, mirroring the per-manifest scheme-binding.
+// The verifier is DUAL-VERSION (v2/v3) so a Phase-1 (v0.99.208) lineage
+// signature still verifies — see [CanonicalCatalogBytesForVersion].
 const LineageCatalogCanonVersion = "sluice-lineage-canon/v3"
+
+// LineageCatalogCanonVersionV2 is the Phase-1 lineage canonicalization
+// (no scheme token), preserved verbatim as ON-DISK CONTRACT for the
+// dual-version verifier. NEVER change its rendering.
+const LineageCatalogCanonVersionV2 = "sluice-lineage-canon/v2"
+
+// lineageCatalogHasScheme maps each SUPPORTED lineage canon version to
+// whether it folds the scheme token in (v2 no, v3 yes). Absent == future.
+var lineageCatalogHasScheme = map[string]bool{
+	LineageCatalogCanonVersionV2: false,
+	LineageCatalogCanonVersion:   true,
+}
 
 // LineageSigFileName is the detached signature object for lineage.json.
 const LineageSigFileName = LineageCatalogFileName + irbackup.SignatureFileSuffix
@@ -58,7 +72,36 @@ var (
 	// present but does not verify (tampered / rolled-back / wrong key /
 	// scheme mismatch).
 	ErrSignatureInvalid = errors.New("detached signature failed verification")
+
+	// ErrSignatureUnsupportedVersion is returned when a detached signature
+	// records a canonicalization version NEWER than this build supports
+	// (it was written by a newer sluice). This is NOT a tamper signal —
+	// the operator's fix is to upgrade sluice, not to distrust the backup —
+	// so it maps to its own message, never SIGNATURE-INVALID.
+	ErrSignatureUnsupportedVersion = errors.New("detached signature uses a newer canonicalization than this build supports; upgrade sluice")
 )
+
+// effectiveManifestScheme returns the scheme a manifest signature at the
+// given canon version binds to. A v2 (Phase-1) signature predates the
+// scheme token, so its scheme is IMPLICITLY [irbackup.SignatureSchemeHMACKEK]
+// regardless of what its (possibly relabeled) Scheme field claims — this
+// preserves the Phase-1 refuse-on-relabel behavior for v2 signatures.
+// v3+ signatures bind the claimed scheme.
+func effectiveManifestScheme(canonVersion, claimed string) string {
+	if canonVersion == irbackup.ManifestCanonVersionV2 {
+		return irbackup.SignatureSchemeHMACKEK
+	}
+	return claimed
+}
+
+// effectiveLineageScheme is [effectiveManifestScheme] for the lineage
+// catalog signature (its own v2 constant).
+func effectiveLineageScheme(canonVersion, claimed string) string {
+	if canonVersion == LineageCatalogCanonVersionV2 {
+		return irbackup.SignatureSchemeHMACKEK
+	}
+	return claimed
+}
 
 // Signer carries the material to sign and/or verify a manifest +
 // lineage catalog under one of the ADR-0154 schemes. It dispatches on
@@ -259,18 +302,20 @@ func VerifyManifest(ctx context.Context, store irbackup.Store, manifestPath stri
 	if !ok {
 		return fmt.Errorf("manifest %q at sequence %d: %w", manifestPath, seq, ErrSignatureMissing)
 	}
-	if sig.CanonVersion != irbackup.ManifestCanonVersion {
-		return fmt.Errorf("manifest %q: signature canon version %q != %q: %w",
-			manifestPath, sig.CanonVersion, irbackup.ManifestCanonVersion, ErrSignatureInvalid)
-	}
-	// Scheme-binding: the claimed scheme MUST match the verifier's scheme.
-	// A mismatch is a relabel-tamper signal (an HMAC `.sig` relabeled
-	// ed25519, or vice versa) — refuse. The claimed scheme is ALSO folded
-	// into the canonical bytes below, so even if this explicit check were
-	// bypassed the MAC would fail; the check gives a precise error first.
-	if sig.Scheme != s.schemeTag() {
+	// DUAL-VERSION: recompute at the signature's OWN recorded canon version
+	// so a Phase-1 v2 signature still verifies on a Phase-2 binary. The
+	// effective scheme of a v2 signature is implicitly HMAC-off-KEK (v2
+	// predates the scheme token), which keeps the Phase-1 refuse-on-relabel
+	// behavior for v2.
+	wantScheme := effectiveManifestScheme(sig.CanonVersion, sig.Scheme)
+	// Scheme-binding: the effective scheme MUST match the verifier's. A
+	// mismatch is a relabel-tamper signal (an HMAC `.sig` relabeled
+	// ed25519, or vice versa) — refuse. For v3 the scheme is ALSO folded
+	// into the canonical bytes below, so even if this check were bypassed
+	// the MAC would fail; the check gives a precise error first.
+	if wantScheme != s.schemeTag() {
 		return fmt.Errorf("manifest %q: signature scheme %q != verifier scheme %q (relabel-tamper?): %w",
-			manifestPath, sig.Scheme, s.schemeTag(), ErrSignatureInvalid)
+			manifestPath, wantScheme, s.schemeTag(), ErrSignatureInvalid)
 	}
 	if sig.Sequence != seq {
 		return fmt.Errorf("manifest %q: signed sequence %d != expected chain position %d (rolled-back / reordered link?): %w",
@@ -284,7 +329,10 @@ func VerifyManifest(ctx context.Context, store irbackup.Store, manifestPath stri
 	if err != nil {
 		return fmt.Errorf("manifest %q: decode signature mac: %w: %w", manifestPath, err, ErrSignatureInvalid)
 	}
-	payload, err := irbackup.CanonicalManifestBytes(m, seq, s.schemeTag())
+	payload, err := irbackup.CanonicalManifestBytesForVersion(m, seq, sig.CanonVersion, wantScheme)
+	if errors.Is(err, irbackup.ErrUnsupportedCanonVersion) {
+		return fmt.Errorf("manifest %q: %w", manifestPath, ErrSignatureUnsupportedVersion)
+	}
 	if err != nil {
 		return fmt.Errorf("manifest %q: recompute canonical bytes: %w", manifestPath, err)
 	}
@@ -305,11 +353,33 @@ func VerifyManifest(ctx context.Context, store irbackup.Store, manifestPath stri
 //
 // scheme is folded in (as in [irbackup.CanonicalManifestBytes]) so the
 // lineage signature is scheme-bound identically to the per-manifest ones.
+// The writer always emits [LineageCatalogCanonVersion]; the DUAL-VERSION
+// verifier recomputes at the signature's own version via
+// [CanonicalCatalogBytesForVersion].
 func CanonicalCatalogBytes(cat *Catalog, scheme string) []byte {
+	// The writer path only ever emits the current version, which is always
+	// supported, so the error is impossible here.
+	b, _ := CanonicalCatalogBytesForVersion(cat, LineageCatalogCanonVersion, scheme)
+	return b
+}
+
+// CanonicalCatalogBytesForVersion renders the lineage-catalog canonical
+// bytes at a SPECIFIC canon version (dual-version verify): v2 (Phase 1)
+// omits the scheme token, byte-matching what v0.99.208 signed; v3 folds
+// it in. Everything after the version+scheme prefix is identical across
+// versions. Returns [irbackup.ErrUnsupportedCanonVersion] for a newer
+// version this build cannot recompute.
+func CanonicalCatalogBytesForVersion(cat *Catalog, canonVersion, scheme string) ([]byte, error) {
+	withScheme, ok := lineageCatalogHasScheme[canonVersion]
+	if !ok {
+		return nil, fmt.Errorf("%w (lineage canon version %q)", irbackup.ErrUnsupportedCanonVersion, canonVersion)
+	}
 	var b strings.Builder
-	lpTok(&b, LineageCatalogCanonVersion)
-	lpTok(&b, "scheme")
-	lpTok(&b, scheme)
+	lpTok(&b, canonVersion)
+	if withScheme {
+		lpTok(&b, "scheme")
+		lpTok(&b, scheme)
+	}
 	lpTok(&b, "format_version")
 	lpTok(&b, strconv.Itoa(cat.FormatVersion))
 	lpTok(&b, "source_engine")
@@ -335,7 +405,7 @@ func CanonicalCatalogBytes(cat *Catalog, scheme string) []byte {
 			lpTok(&b, ip)
 		}
 	}
-	return []byte(b.String())
+	return []byte(b.String()), nil
 }
 
 // lpTok appends one length-prefixed token (`<len>:<bytes>\n`) — the same
@@ -405,15 +475,13 @@ func VerifyLineage(ctx context.Context, store irbackup.Store, cat *Catalog, s *S
 	if !present {
 		return fmt.Errorf("lineage catalog %q: %w", LineageCatalogFileName, ErrSignatureMissing)
 	}
-	if sig.CanonVersion != LineageCatalogCanonVersion {
-		return fmt.Errorf("lineage catalog: signature canon version %q != %q: %w",
-			sig.CanonVersion, LineageCatalogCanonVersion, ErrSignatureInvalid)
-	}
-	// Scheme-binding (as in [VerifyManifest]): a claimed scheme that
-	// differs from the verifier's is a relabel-tamper signal → refuse.
-	if sig.Scheme != s.schemeTag() {
+	// DUAL-VERSION (as in [VerifyManifest]): recompute at the signature's
+	// own recorded version; a v2 (Phase-1) lineage signature verifies on a
+	// Phase-2 binary. A v2 signature's scheme is implicitly HMAC-off-KEK.
+	wantScheme := effectiveLineageScheme(sig.CanonVersion, sig.Scheme)
+	if wantScheme != s.schemeTag() {
 		return fmt.Errorf("lineage catalog: signature scheme %q != verifier scheme %q (relabel-tamper?): %w",
-			sig.Scheme, s.schemeTag(), ErrSignatureInvalid)
+			wantScheme, s.schemeTag(), ErrSignatureInvalid)
 	}
 	if got := totalManifestCount(cat); sig.Sequence != got {
 		return fmt.Errorf("lineage catalog: signed link count %d != actual %d (dropped-newest-link?): %w",
@@ -423,7 +491,14 @@ func VerifyLineage(ctx context.Context, store irbackup.Store, cat *Catalog, s *S
 	if err != nil {
 		return fmt.Errorf("lineage catalog: decode signature mac: %w: %w", err, ErrSignatureInvalid)
 	}
-	if !s.verify(CanonicalCatalogBytes(cat, s.schemeTag()), mac) {
+	payload, err := CanonicalCatalogBytesForVersion(cat, sig.CanonVersion, wantScheme)
+	if errors.Is(err, irbackup.ErrUnsupportedCanonVersion) {
+		return fmt.Errorf("lineage catalog: %w", ErrSignatureUnsupportedVersion)
+	}
+	if err != nil {
+		return fmt.Errorf("lineage catalog: recompute canonical bytes: %w", err)
+	}
+	if !s.verify(payload, mac) {
 		return fmt.Errorf("lineage catalog (key_id recorded %q, verifying %q): %w",
 			sig.KeyID, s.KeyID, ErrSignatureInvalid)
 	}
@@ -442,11 +517,16 @@ func VerifyLineage(ctx context.Context, store irbackup.Store, cat *Catalog, s *S
 // from it is SAFE: if the operator lacks material for the claimed scheme,
 // the read side takes the unverifiable warn/refuse path; if they have it,
 // a relabel fails the MAC (the scheme is folded into the signed bytes).
+//
+// A v2 (Phase-1) signature is reported as HMAC-off-KEK regardless of its
+// (possibly relabeled) Scheme field — v2 predates the scheme token, so
+// its scheme is definitionally HMAC — which keeps a relabeled v2 chain on
+// the strict HMAC-verify path (matching Phase 1's refuse-on-relabel).
 func ChainSignatureScheme(ctx context.Context, store irbackup.Store) (scheme string, ok bool, err error) {
 	if sig, present, lerr := readLineageSig(ctx, store); lerr != nil {
 		return "", false, lerr
 	} else if present {
-		return sig.Scheme, true, nil
+		return effectiveLineageScheme(sig.CanonVersion, sig.Scheme), true, nil
 	}
 	sig, present, err := ReadManifestSig(ctx, store, ManifestFileName)
 	if err != nil {
@@ -455,7 +535,7 @@ func ChainSignatureScheme(ctx context.Context, store irbackup.Store) (scheme str
 	if !present {
 		return "", false, nil
 	}
-	return sig.Scheme, true, nil
+	return effectiveManifestScheme(sig.CanonVersion, sig.Scheme), true, nil
 }
 
 // readLineageSig reads and decodes lineage.json.sig. present is false
