@@ -12,7 +12,12 @@ import (
 )
 
 // Config bundles the operator-configurable knobs for a [Controller].
-// Zero-valued fields fall back to the ADR-0052-recommended defaults.
+// Zero-valued fields fall back to the ADR-0052-recommended defaults —
+// except the SIZING trio (Floor, Ceiling, InitialSize): Ceiling has no
+// package default (it is the operator's --apply-batch-size cap), so an
+// all-zero sizing config is refused loudly by [New] rather than
+// silently degenerating to permanent 1-row batches. Set Ceiling; the
+// other two then default (Floor 1, InitialSize = Ceiling).
 type Config struct {
 	// StreamID identifies the controller's owning stream. Stamped on
 	// every emitted slog line and used as the Prometheus label so
@@ -246,6 +251,16 @@ type Controller struct {
 func New(cfg Config) (*Controller, error) {
 	if cfg.TargetLatency < 0 {
 		return nil, errors.New("applier_control: TargetLatency must be non-negative")
+	}
+	if cfg.Floor <= 0 && cfg.Ceiling <= 0 && cfg.InitialSize <= 0 {
+		// An all-zero sizing config would silently clamp to Floor=
+		// Ceiling=InitialSize=1 — permanent 1-row batches, the worst
+		// possible throughput, with no signal that anything is wrong.
+		// There is no sensible package default for Ceiling (it is the
+		// operator's --apply-batch-size cap), so refuse loudly instead
+		// of degenerating. A deliberate PARTIAL config keeps its
+		// documented clamps (e.g. Ceiling set, Floor zero → Floor 1).
+		return nil, errors.New("applier_control: Config sizing is all zero (Floor, Ceiling, InitialSize); set Ceiling to the apply-batch-size cap — the remaining sizing fields then default (Floor 1, InitialSize = Ceiling)")
 	}
 	cfg = cfg.withDefaults()
 	if cfg.Ceiling < cfg.Floor {

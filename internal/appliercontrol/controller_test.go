@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -325,6 +326,41 @@ func TestController_RejectsNegativeTargetLatency(t *testing.T) {
 	if _, err := New(Config{StreamID: "s", TargetLatency: -1 * time.Second}); err == nil {
 		t.Fatalf("New with negative TargetLatency = nil; want error")
 	}
+}
+
+// TestController_RefusesAllZeroSizing pins the audit-2026-07-08 §4.4
+// loud refusal: an all-zero sizing trio (Floor, Ceiling, InitialSize)
+// must NOT silently degenerate to permanent 1-row batches. The error
+// names the fields and the way out (set Ceiling; the rest defaults).
+func TestController_RefusesAllZeroSizing(t *testing.T) {
+	_, err := New(Config{StreamID: "s", TargetLatency: 5 * time.Second})
+	if err == nil {
+		t.Fatal("New with all-zero sizing = nil error; want loud refusal")
+	}
+	for _, want := range []string{"Floor", "Ceiling", "InitialSize", "apply-batch-size"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q does not name %q", err.Error(), want)
+		}
+	}
+}
+
+// TestController_PartialSizingKeepsDocumentedClamps pins that a
+// DELIBERATE partial config still takes the documented clamp ladder:
+// Ceiling alone → Floor 1, InitialSize = Ceiling; Floor alone →
+// Ceiling = InitialSize = Floor.
+func TestController_PartialSizingKeepsDocumentedClamps(t *testing.T) {
+	t.Run("ceiling only", func(t *testing.T) {
+		c := mustController(t, Config{StreamID: "s", Ceiling: 200, TargetLatency: 5 * time.Second})
+		if got := c.NextBatchSize(); got != 200 {
+			t.Fatalf("NextBatchSize = %d; want InitialSize=Ceiling=200", got)
+		}
+	})
+	t.Run("floor only", func(t *testing.T) {
+		c := mustController(t, Config{StreamID: "s", Floor: 5, TargetLatency: 5 * time.Second})
+		if got := c.NextBatchSize(); got != 5 {
+			t.Fatalf("NextBatchSize = %d; want Floor-clamped 5", got)
+		}
+	})
 }
 
 func TestController_NonRetriableErrorDoesNotMD(t *testing.T) {
