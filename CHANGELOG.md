@@ -4,6 +4,23 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.206] - 2026-07-09
+
+### Fixed
+
+- A declined `schema add-table` confirmation now exits 1 via the wave-4b declined sentinel (`errConfirmDeclined`) instead of printing a bare "aborted" line and returning nil (exit 0) — this was the one destructive-confirm decline still outside the wave-4b abort contract the `--reset-target-data` sites got in v0.99.205, so a wrapper keyed on exit 0 read a declined, no-op run as success. `schema add-table` has no `--format` flag, so text is the whole surface. Pinned by `TestSchemaAddTableConfirm_CommandPath` through the real `Run()`: a decline yields the sentinel; typing the table name passes the gate and proceeds to the downstream target-applier open. Behavior change (see Changed).
+
+### Changed
+
+- A declined `schema add-table` confirmation now exits 1 (was 0). Automation that treated exit 0 as "table added" on a declined `schema add-table` must update. The change is in the loud-over-silent direction — a declined run was always a no-op, it just reported success.
+- The weekly Vitess-version-matrix cluster suite (`vitesscluster`) now runs under `-race`, closing the last real-cluster leg outside the race gate (the chaos/reshard legs in `extended-suites.yml` have carried it since the 2026-07-03 audit). Timeouts move ~1.5× (inner 40m → 60m, job 45 → 70) to absorb the detector overhead, inner kept below outer so Go's diagnostic timeout-panic fires before the hard job kill.
+- `TestStreamer_PostgresToPostgres_BatchedApply` now pins the coalescing mechanism directly (a new `batchApplyObserverForTest` `ir.BatchObserver` seam on the serial ADR-0092 batch loop: every source row flowed through an observed coalesced flush, mean rows/flush ≥ 10) instead of a timing-sensitive `pg_stat_database` commit-delta constant that flaked once on a loaded `-race` runner. No product change.
+- ADR-0154 (signed backup manifests) Accepted as a design/docs item — closes the ADR-0152 residual (whole-manifest rollback and change-list tail truncation) via optional detached manifest+lineage signing under a new FormatVersion 6. Phase 1 implementation is in progress and unreleased; nothing about signing ships in this release.
+
+### Known issues
+
+- **NEW — VStream COPY silently display-rounds single-precision FLOAT columns to 6 significant digits on PlanetScale/Vitess sources (MED-HIGH, silent-precision class; found ground-truthing the ADR-0153 G4 residual on real vttestserver; no fix in this release — a fix is in progress for a following release).** A VStream cold-start COPY — the `sync` cold-start snapshot and `backup full` on the VStream path (every consumer of `openVStreamSnapshotStream`) — lands `FLOAT`/`REAL` values display-rounded to 6 significant digits, exit 0, because vttablet's rowstreamer issues a bare-column `SELECT` over MySQL's text protocol (mysqld's own 6-sig-digit FLOAT rendering) — the exact class ADR-0153's `(col * 1E0)` projection fixed on the SQL reader, but built inside vttablet and unreachable client-side. Ground truth (vttestserver mysql80, 2026-07-09): 7/11 torture values land as a different float32 (`8388608` → `8388610`, `-123456.789` → `-123457`). Not affected: `DOUBLE`, the CDC/binlog leg (vttablet re-encodes float32 bits shortest-round-trip — float32-exact, pinned), float `-0.0` (pinned), and every non-PlanetScale/Vitess source. Affected releases: the cold-start COPY since **v0.1.0** and the `backup full`-on-VStream leg since **v0.44.0**, through **v0.99.205**. Pinned in `TestVStream_FloatCarrierParity` with the COPY float32-exactness assertions behind a documented `t.Skipf` (the fix's ready failing pin). Until the fix ships, treat every PlanetScale/Vitess-source cold copy of a `FLOAT` column as lossy past 6 significant digits.
+
 ## [0.99.205] - 2026-07-09
 
 ### Security
