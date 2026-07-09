@@ -203,6 +203,56 @@ func TestResetTargetDataConfirm_CommandPaths(t *testing.T) {
 	}
 }
 
+// TestSchemaAddTableConfirm_CommandPath pins the schema add-table
+// typed-confirm gate through the real Run(), {confirm, decline} — the
+// wave-4b abort contract extended to a decline site that used to print
+// a bare "aborted" line and exit 0:
+//
+//   - A decline returns errConfirmDeclined — non-zero exit, same
+//     sentinel as the --reset-target-data sites.
+//   - Typing the table name passes the gate: the run proceeds and
+//     fails on the downstream target-applier open against the
+//     unreachable port-1 DSN, proving the gate consumed the answer.
+//
+// The command has no --format flag, so only the text shape applies.
+func TestSchemaAddTableConfirm_CommandPath(t *testing.T) {
+	run := func() error {
+		cmd := &SchemaAddTableCmd{}
+		cmd.SourceDriver = "postgres"
+		cmd.Source = "postgres://u:pw@127.0.0.1:1/src?sslmode=disable"
+		cmd.TargetDriver = "postgres"
+		cmd.Target = "postgres://u:pw@127.0.0.1:1/dst?sslmode=disable"
+		cmd.Table = "users_v2"
+		cmd.StreamID = "s1"
+		return cmd.Run(&Globals{})
+	}
+
+	t.Run("decline", func(t *testing.T) {
+		var err error
+		stdout, _ := withCommandIO(t, "no\n", func() { err = run() })
+		if !errors.Is(err, errConfirmDeclined) {
+			t.Fatalf("declined confirm must return errConfirmDeclined; got %v", err)
+		}
+		if !strings.Contains(stdout, `Type "users_v2" to confirm`) {
+			t.Errorf("prompt must land on stdout; stdout = %q", stdout)
+		}
+	})
+
+	t.Run("confirm", func(t *testing.T) {
+		var err error
+		_, _ = withCommandIO(t, "users_v2\n", func() { err = run() })
+		if err == nil {
+			t.Fatal("expected the downstream target-applier dial failure after a confirmed prompt")
+		}
+		if errors.Is(err, errConfirmDeclined) {
+			t.Fatalf("typed token must pass the gate; got the declined sentinel: %v", err)
+		}
+		if !strings.Contains(err.Error(), "open target applier") {
+			t.Fatalf("run must fail on the post-prompt applier open — a different error means the prompt was never reached; got: %v", err)
+		}
+	})
+}
+
 // TestConfirmTypedDestructive_CtxCancelAbortsPrompt pins the
 // Ctrl-C-at-the-prompt fix: once signal.NotifyContext is installed, a
 // SIGINT cancels the context instead of killing the process, and the

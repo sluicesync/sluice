@@ -161,8 +161,11 @@ func (s *SchemaAddTableCmd) Run(g *Globals) error {
 			return err
 		}
 		if !ok {
-			fmt.Fprintln(os.Stdout, "aborted")
-			return nil
+			// Same declined sentinel as the --reset-target-data sites
+			// (wave 4b abort contract): a decline is a non-zero exit,
+			// never a silent success. The command has no --format flag,
+			// so the sentinel's text rendering is the whole surface.
+			return errConfirmDeclined
 		}
 	}
 
