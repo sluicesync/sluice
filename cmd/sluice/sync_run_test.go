@@ -437,8 +437,10 @@ func TestSharedTargetGroups(t *testing.T) {
 }
 
 // TestSyncSpecDefaults pins that the fleet defaults mirror sync start —
-// empty knobs fall back to the documented defaults via the firstNonZero*
-// helpers, exercised through buildStreamerFromSpec.
+// omitted knobs fall back to the documented defaults via the orDefault /
+// firstNonZero* helpers, exercised through buildStreamerFromSpec. (The
+// explicit-0 side of the pointer-typed knobs is pinned through the real
+// YAML load path in sync_run_zero_disables_test.go — audit N-11.)
 func TestSyncSpecDefaults(t *testing.T) {
 	spec := pgSpec("a", "slot_a")
 	streamer, err := buildStreamerFromSpec(context.Background(), &spec, testFleetGlobals())

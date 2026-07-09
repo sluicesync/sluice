@@ -115,18 +115,41 @@ type SyncSpec struct {
 	ApplyBatchSize   string `koanf:"apply-batch-size"`
 	NoAutoTune       bool   `koanf:"no-auto-tune"`
 
-	ApplyDelay       time.Duration `koanf:"apply-delay"`
-	MaxBufferBytes   int64         `koanf:"max-buffer-bytes"`
-	ApplyExecTimeout time.Duration `koanf:"apply-exec-timeout"`
+	ApplyDelay time.Duration `koanf:"apply-delay"`
 
+	// MaxBufferBytes, ApplyExecTimeout, and HeartbeatInterval (below) are
+	// POINTER-typed (audit N-11) because an explicit 0 is documented-meaningful
+	// on the matching `sync start` flags — --apply-exec-timeout and
+	// --heartbeat-interval say "0 disables", and --max-buffer-bytes=0 means no
+	// orchestrator cap (migcore.ApplyMaxBufferBytes skips the setter and the
+	// engine's built-in batching default applies). nil = key omitted → the
+	// `sync start` flag default; a present value — INCLUDING 0 — passes through
+	// verbatim ([orDefault]), so the fleet key behaves byte-identically to the
+	// flag. A value-typed field cannot tell "unset" from "explicit 0" (the
+	// zero-value-collapse class): the old firstNonZero* coercion silently
+	// turned an operator's `apply-exec-timeout: 0` into the 60s default.
+	MaxBufferBytes   *int64         `koanf:"max-buffer-bytes"`
+	ApplyExecTimeout *time.Duration `koanf:"apply-exec-timeout"`
+
+	// The apply-retry-* trio stays VALUE-typed (N-11 class (b)): 0 is not a
+	// meaningful value for any of the three — `sync start` REFUSES 0 as out of
+	// the ADR-0038 ranges ("1 = no retry") — so "unset" and "explicit 0" need
+	// no distinction; both take the ADR-0038 defaults via firstNonZero*. The
+	// accepted wart: an explicit 0 here is absorbed into the default rather
+	// than refused the way the flag is; 0 has no valid reading, and the
+	// out-of-range refusal still catches every other bad value.
 	ApplyRetryAttempts    int           `koanf:"apply-retry-attempts"`
 	ApplyRetryBackoffBase time.Duration `koanf:"apply-retry-backoff-base"`
 	ApplyRetryBackoffCap  time.Duration `koanf:"apply-retry-backoff-cap"`
 
-	MetricsListen     string        `koanf:"metrics-listen"`
-	HeartbeatInterval time.Duration `koanf:"heartbeat-interval"`
-	PollInterval      time.Duration `koanf:"poll-interval"`
-	SchemaChanges     string        `koanf:"schema-changes"`
+	MetricsListen string `koanf:"metrics-listen"`
+
+	// HeartbeatInterval is pointer-typed for the same N-11 reason as
+	// ApplyExecTimeout above: the flag documents "0 disables".
+	HeartbeatInterval *time.Duration `koanf:"heartbeat-interval"`
+
+	PollInterval  time.Duration `koanf:"poll-interval"`
+	SchemaChanges string        `koanf:"schema-changes"`
 
 	// Notify sinks. The webhook/slack URLs and the SMTP password are
 	// credentials; supply them via the SLUICE_NOTIFY_* env vars, not in
@@ -262,6 +285,9 @@ func (f *SyncFleetConfig) validate() error {
 			seenSlot[slot] = s.StreamID
 		}
 
+		// N-11 class (b): the retry knobs coerce 0 → default (see the
+		// SyncSpec field comment) BEFORE the ADR-0038 range validation, so
+		// an unset knob never trips the out-of-range refusal.
 		if err := validateRetryFlags(
 			firstNonZeroInt(s.ApplyRetryAttempts, defaultApplyRetryAttempts),
 			firstNonZeroDuration(s.ApplyRetryBackoffBase, defaultApplyRetryBackoffBase),
@@ -810,15 +836,18 @@ func buildStreamerFromSpec(ctx context.Context, spec *SyncSpec, g *Globals) (*pi
 		AutoTune:         !spec.NoAutoTune,
 		ApplyConcurrency: spec.ApplyConcurrency,
 		ApplyDelay:       spec.ApplyDelay,
-		MaxBufferBytes:   firstNonZeroInt64(spec.MaxBufferBytes, defaultMaxBufferBytes),
-		ApplyExecTimeout: firstNonZeroDuration(spec.ApplyExecTimeout, defaultApplyExecTimeout),
+		// N-11: nil = key omitted → the `sync start` flag default; an explicit
+		// 0 passes through as 0 ("0 disables" / no orchestrator cap), exactly
+		// as the same value on the `sync start` flag does.
+		MaxBufferBytes:   orDefault(spec.MaxBufferBytes, defaultMaxBufferBytes),
+		ApplyExecTimeout: orDefault(spec.ApplyExecTimeout, defaultApplyExecTimeout),
 
 		ApplyRetryAttempts:    firstNonZeroInt(spec.ApplyRetryAttempts, defaultApplyRetryAttempts),
 		ApplyRetryBackoffBase: firstNonZeroDuration(spec.ApplyRetryBackoffBase, defaultApplyRetryBackoffBase),
 		ApplyRetryBackoffCap:  firstNonZeroDuration(spec.ApplyRetryBackoffCap, defaultApplyRetryBackoffCap),
 
 		MetricsListen:     spec.MetricsListen,
-		HeartbeatInterval: firstNonZeroDuration(spec.HeartbeatInterval, defaultHeartbeatInterval),
+		HeartbeatInterval: orDefault(spec.HeartbeatInterval, defaultHeartbeatInterval),
 		PollInterval:      spec.PollInterval,
 		SchemaChanges:     firstNonEmpty(spec.SchemaChanges, defaultSchemaChanges),
 
@@ -887,6 +916,12 @@ func printFleetPlan(out *os.File, fleet *SyncFleetConfig) error {
 		}
 	}
 	p := fleet.Restart.toPolicy()
+	// The firstNonZeroDuration here is DISPLAY-ONLY parity with
+	// [pipeline.RestartPolicy]'s withDefaults (N-11 class (b)): zero is
+	// documented as "fall back to the policy defaults" on RestartConfig and a
+	// 0 backoff has no valid reading, so the plan shows the values the
+	// supervisor will actually run with. The policy itself receives the raw
+	// fields and applies the same defaults internally.
 	_, err := fmt.Fprintf(
 		out, "restart: backoff %s..%s, max-consecutive-failures=%d (0=unbounded)\n",
 		firstNonZeroDuration(p.BackoffBase, time.Second),
@@ -1014,16 +1049,21 @@ func firstNonZeroInt(v, fallback int) int {
 	return v
 }
 
-func firstNonZeroInt64(v, fallback int64) int64 {
+func firstNonZeroDuration(v, fallback time.Duration) time.Duration {
 	if v == 0 {
 		return fallback
 	}
 	return v
 }
 
-func firstNonZeroDuration(v, fallback time.Duration) time.Duration {
-	if v == 0 {
+// orDefault resolves a pointer-typed fleet knob (audit N-11): nil — the YAML
+// key was omitted — falls back to the `sync start` flag default; a present
+// value, INCLUDING an explicit 0 (which the matching flags document as
+// "0 disables" / no cap), passes through verbatim. Contrast firstNonZero*
+// above, which the value-typed knobs keep because 0 is meaningless for them.
+func orDefault[T any](v *T, fallback T) T {
+	if v == nil {
 		return fallback
 	}
-	return v
+	return *v
 }
