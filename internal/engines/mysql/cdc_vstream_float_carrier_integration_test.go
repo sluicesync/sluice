@@ -200,10 +200,43 @@ func TestVStream_FloatCarrierParity(t *testing.T) {
 		}
 	}
 
-	t.Run("copy-float32-exact", func(t *testing.T) {
-		t.Skipf("KNOWN-LOSSY: VStream COPY FLOAT display-rounding (mysqld 6-sig-digit text via vttablet's bare-column rowstreamer SELECT; 8388608 lands 8388610) — see the docs/dev/roadmap.md open-bugs entry (2026-07-09). Un-skip as the Phase-A failing pin when that fix lands.")
-		for i, want := range flVals {
-			checkFloat("COPY", int64(i+1), copyRows[int64(i+1)], want)
+	// The RAW VStream COPY reader STILL display-rounds single-precision
+	// FLOAT — that is inherent to vttablet's rowstreamer (its bare-column
+	// SELECT is built server-side, out of sluice's reach) and the fix does
+	// NOT change it. The mitigation lives ONE LAYER UP: the sync cold-start
+	// pipeline re-reads FLOAT columns EXACTLY over a separate SQL connection
+	// (the ADR-0153 `(col * 1E0)` projection) and UPDATEs the target by PK
+	// before CDC begins. The float32-exactness-on-the-TARGET pin therefore
+	// lives at the pipeline layer (internal/pipeline,
+	// TestVStream_FloatRepair_ColdStart*), where a target is observable; here
+	// we pin the READER-level ground truth that the display-rounding is real
+	// and unrepaired at the reader — so a future upstream Vitess rowstreamer
+	// fix (which WOULD make this reader exact) surfaces loudly here instead
+	// of silently.
+	t.Run("copy-reader-still-display-rounds", func(t *testing.T) {
+		// 8388608 is the canonical repro: mysqld prints it as 8388610 (a
+		// DIFFERENT float32) over the text protocol vttablet's rowstreamer
+		// uses. Find its row and assert the reader hands back a real
+		// float32-level loss.
+		var idx int = -1
+		for i, v := range flVals {
+			if v == float64(float32(8388608)) {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			t.Skip("torture set does not contain 8388608; reader-rounding ground-truth pin skipped")
+		}
+		row := copyRows[int64(idx+1)]
+		fl, ok := row["fl"].(float64)
+		if !ok {
+			t.Fatalf("row %d fl = %#v (%T); want float64", idx+1, row["fl"], row["fl"])
+		}
+		if class := classifyFloatCarrier(fl, flVals[idx]); class != "float32-loss" {
+			t.Errorf("VStream COPY reader classified %s for stored 8388608 (got %v); expected float32-loss — "+
+				"if the reader is now exact, upstream Vitess fixed the rowstreamer and the pipeline re-read repair "+
+				"(TestVStream_FloatRepair_ColdStart*) can be retired", class, fl)
 		}
 	})
 

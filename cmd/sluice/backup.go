@@ -418,6 +418,10 @@ type BackupFullCmd struct {
 
 	ForceOverwrite bool `help:"Discard whatever is at the destination and start fresh. By default 'sluice backup full' refuses to overwrite a successful prior backup and RESUMES a partial (in-progress) one, adopting the interrupted attempt's chain anchor (ADR-0085); pass this to discard either. It is also the escape hatch the resume guards (schema drift, keyless re-stream, chain-slot preflight) name. A discarded --chain-slot attempt's slot must be dropped separately ('sluice slot drop')."`
 
+	StrictFloat bool `name:"strict-float" help:"VStream (PlanetScale/Vitess source) only: REFUSE the backup (SLUICE-E-VSTREAM-FLOAT-LOSSY, exit 3) when the source schema has single-precision FLOAT columns, instead of archiving them. vttablet's rowstreamer renders FLOAT at mysqld's 6-significant-digit display precision (8388608 → 8388610). By DEFAULT sluice re-reads FLOAT columns exactly from the source and patches the archived rows (exact float32, at the cost of a bounded within-row temporal skew that self-heals on a chain restore); --no-float-exact-reread archives the rounded-but-consistent values. Pass --strict-float if you'd rather fail than archive anything imperfect. Inert on non-VStream sources."`
+
+	NoFloatExactReread bool `name:"no-float-exact-reread" help:"VStream (PlanetScale/Vitess source) only: archive single-precision FLOAT columns as the COPY's display-rounded values instead of re-reading them exactly. By DEFAULT 'backup full' re-reads FLOAT columns exactly from the source (the ADR-0153 (col * 1E0) projection) and patches the archived rows, so backups store exact float32 — at the cost of a bounded within-row temporal skew (the FLOAT reflects a read instant slightly after the snapshot VGTID; ZERO on a quiescent source; SELF-HEALS on a chain restore because incrementals replay from the full's position forward; persists only for a standalone-full restore of a source with concurrent FLOAT writes). Set this to keep the rounded-but-PERFECTLY-CONSISTENT snapshot, for operators who value within-row consistency over FLOAT precision. A keyless table (no PK to target the re-read) retains the rounding regardless. Inert on non-VStream sources."`
+
 	Redact       []string `help:"Redact a PII column in backup chunks (repeatable). Format: '[schema.]table.column=STRATEGY[:options]'. Strategies: null, static:<v>, hash:sha256, hash:hmac-sha256[:<keyname>], truncate:<n>, mask:inner:<m1>,<m2>[,<char>], mask:outer:<m1>,<m2>[,<char>], mask:ssn, mask:pan, mask:pan-relaxed, mask:email, mask:ca-sin, mask:uk-nin, mask:iban, mask:uuid, randomize:int:<min>,<max>, randomize:email, randomize:us-phone, randomize:uuid, randomize:ssn, randomize:pan[:<brand>], randomize:ca-sin, randomize:uk-nin, randomize:iban[:<country-code>], randomize:dict:<name>, tokenize:dict:<name>[:<keyname>] (Phase 3 v0.61.0+, keyset-sourced Phase 4 v0.62.0+; dictionaries declared in YAML) — same set as 'sluice migrate --redact'. PII Phase 1.5 (v0.55.0+): redaction applies during chunk write, so the on-disk backup is PII-clean. Restore from a redacted chain produces the same redacted shape; restore does NOT re-apply redactions (they were applied at backup time). See docs/dev/notes/prep-pii-redaction-phase-1.md." placeholder:"RULE" sep:"none"`
 	KeysetSource string   `help:"Operator keyset source (file:PATH | env:VARNAME | db:DSN) for keyset-using strategies (hash:hmac-sha256, tokenize:dict). PII Phase 4 (ADR-0041). Same forms as 'sluice migrate --keyset-source'." placeholder:"SRC"`
 
@@ -506,6 +510,8 @@ func (b *BackupFullCmd) run(g *Globals, env *envelopeRun) error {
 		SluiceVersion:       version,
 		SlotName:            pipeline.ResolveSlotName(b.SlotName),
 		ChainSlot:           b.ChainSlot,
+		StrictFloat:         b.StrictFloat,
+		NoFloatExactReread:  b.NoFloatExactReread,
 		TableParallelism:    b.TableParallelism,
 		BulkParallelism:     b.BulkParallelism,
 		BulkParallelMinRows: b.BulkParallelMinRows,

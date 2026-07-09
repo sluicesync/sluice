@@ -635,6 +635,66 @@ type IdempotentCopyReader interface {
 	CopyNeedsIdempotentWriter() bool
 }
 
+// LossyFloatCopyReader is the OPTIONAL surface a snapshot [RowReader]
+// implements to declare that its cold-start COPY DISPLAY-ROUNDS
+// single-precision FLOAT columns — the value lands at mysqld's
+// 6-significant-digit text precision rather than float32-exact (the
+// VStream-COPY FLOAT display-rounding class, roadmap open-bug 2026-07-09).
+//
+// Only the MySQL VStream cold-start reader (PlanetScale/Vitess flavors)
+// implements it and returns true: its rows arrive over vttablet's
+// rowstreamer, whose bare-column SELECT is built inside vttablet and
+// renders FLOAT through mysqld's float→text formatter (8388608 → 8388610).
+// The projection ADR-0153's SQL reader uses to fix this (`(col * 1E0)`)
+// cannot be injected into that server-side SELECT. Vanilla-MySQL binlog
+// snapshot + Postgres snapshot readers do NOT implement it — their COPY
+// is already float-exact.
+//
+// The pipeline uses this as the GATE for the post-COPY FLOAT re-read
+// repair (sync cold-start) and the schema-triggered WARN / --strict-float
+// refusal (backup): a reader that returns true triggers the mitigation;
+// one that doesn't (or doesn't implement the surface) leaves the path
+// byte-identical. Distinct from [IdempotentCopyReader]: a reader can be
+// idempotent without display-rounding floats, and vice versa — coupling
+// the two would be the wrong signal.
+type LossyFloatCopyReader interface {
+	RowReader
+
+	// CopyDisplayRoundsFloats reports whether this reader's COPY phase
+	// display-rounds single-precision FLOAT columns (so the cold-start
+	// must re-read them exactly, or a backup must WARN/refuse).
+	CopyDisplayRoundsFloats() bool
+}
+
+// FloatRepairWriter is the OPTIONAL target surface the post-COPY FLOAT
+// re-read repair uses to correct single-precision FLOAT columns a
+// [LossyFloatCopyReader]'s COPY landed display-rounded (roadmap open-bug
+// 2026-07-09). After the cold-start COPY completes and BEFORE CDC apply
+// begins, the pipeline re-reads the affected FLOAT columns EXACTLY over a
+// separate SQL path (float32-exact projection) and hands the rows here to
+// UPDATE the target rows by primary key.
+//
+// Each streamed [Row] carries the table's PRIMARY-KEY column values plus
+// the single-precision FLOAT column values to set — nothing else.
+// pkColumns names the PK columns (the remaining Row keys are the FLOAT
+// columns). The writer issues one `UPDATE <table> SET <float...> WHERE
+// <pk...>` per row, in bounded transactions. It is IDEMPOTENT and
+// PK-keyed: re-running lands the same values, and a row absent on the
+// target (deleted between COPY and re-read) is a zero-rows-affected no-op,
+// not an error — the subsequent CDC replay from the copy anchor is the
+// authority on such rows.
+//
+// The MySQL and Postgres targets implement it. A target that does not
+// (SQLite/D1, or a future engine) leaves the repair un-runnable; the
+// pipeline then falls back to the WARN-only backup posture for that run
+// rather than silently proceeding as if repaired.
+type FloatRepairWriter interface {
+	// UpdateFloatColumnsByPK sets the FLOAT columns of each streamed row
+	// on the row identified by its pkColumns values. Returns loudly on any
+	// target error; a zero-rows-affected UPDATE (row gone) is not an error.
+	UpdateFloatColumnsByPK(ctx context.Context, table *Table, pkColumns []string, rows <-chan Row) error
+}
+
 // ConcurrentCopyPartitioner is the OPTIONAL surface a snapshot
 // [RowReader] implements to declare that its cold-start COPY may be
 // drained CONCURRENTLY across disjoint table groups (ADR-0100, the

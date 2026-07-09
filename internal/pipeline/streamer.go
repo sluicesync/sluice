@@ -593,6 +593,18 @@ type Streamer struct {
 	// that isn't the native-MySQL multi-snapshot work-stealing reader.
 	NoIntraTableStealing bool
 
+	// NoFloatExactReread opts OUT of the post-COPY single-precision FLOAT
+	// exact re-read repair on a VStream (PlanetScale/Vitess) cold-start
+	// (roadmap open-bug 2026-07-09). The VStream COPY lands FLOAT columns
+	// display-rounded to 6 significant digits; by default the cold-start
+	// re-reads them EXACTLY from the source over SQL and UPDATEs the target
+	// by PK before CDC begins. Set this to skip the repair (the values
+	// retain the rounding). OPT-OUT-named so the Go zero value (false) keeps
+	// the repair ON — the correct default — for every non-CLI construction
+	// (the v0.99.51 zero-value trap). Inert on every source whose snapshot
+	// reader does not display-round FLOAT (vanilla MySQL, Postgres).
+	NoFloatExactReread bool
+
 	// ReapStaleBackends opts the operator into terminating sluice's own
 	// orphaned backends on the target during the cold-start preflight
 	// (connection-resilience Phase 2, item 2). Detection runs always and

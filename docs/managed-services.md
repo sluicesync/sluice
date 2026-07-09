@@ -194,6 +194,48 @@ FKs are managed out-of-band. Mutually exclusive with
 the other creates FKs and tolerates dirty rows by retrying as
 `NOT VALID` — PG-target only).
 
+### FLOAT precision on VStream sources: exact by default (`--strict-float` / `--no-float-exact-reread`)
+
+A VStream cold-start COPY streams over vttablet's rowstreamer, whose
+bare-column SELECT renders single-precision `FLOAT` at MySQL's
+6-significant-digit text precision (`8388608` → `8388610`). sluice
+**repairs** this by default on both paths:
+
+- **`sluice sync start`** re-reads each single-precision `FLOAT` column
+  exactly from the source (the `(col * 1E0)` projection) and UPDATEs the
+  copied rows by primary key after the copy and before CDC begins.
+  Exact, and eventually-consistent (CDC replays from the copy anchor
+  forward, so any value that changed during the re-read is re-applied to
+  its final value).
+- **`sluice backup full`** re-reads the same columns and patches the
+  archived rows, so backups store exact float32 by default. The cost is a
+  bounded **within-row temporal skew**: the exact `FLOAT` reflects a read
+  instant slightly after the snapshot VGTID, so a row whose `FLOAT`
+  changed during the read window carries a `FLOAT` newer than the rest of
+  its (VGTID-snapshot) columns. This skew is **zero** on a quiescent
+  source; it **self-heals** on a chain restore, because the incrementals
+  replay from the full's recorded position forward and re-apply every
+  post-VGTID change; and it persists only for a **standalone-full
+  restore** of a source with concurrent `FLOAT` writes (where a logical
+  VStream snapshot is already per-shard-fuzzy, not a global instant).
+
+Escape hatches, on both `sync start` and `backup full`:
+
+- **`--no-float-exact-reread`** keeps the display-rounded `FLOAT` values
+  (a rounded-but-**perfectly-consistent** snapshot — every column at one
+  instant). Choose this if within-row consistency matters more than
+  sub-6-significant-digit `FLOAT` precision.
+- **`--strict-float`** (backup) refuses loudly
+  (`SLUICE-E-VSTREAM-FLOAT-LOSSY`, exit 3) rather than archive anything
+  imperfect — for operators who'd rather fail than store either a rounded
+  or a skewed value.
+
+`DOUBLE` columns and the CDC/binlog leg are exact and untouched either
+way. A **keyless** `FLOAT` table (no primary key to target the re-read)
+retains the rounding regardless (WARNed), and `--strict-float` refuses it.
+A target-side `--type-override` to `DOUBLE` does **not** help — the source
+value is already rounded on the wire.
+
 ### Sharded targets: control tables and `--control-keyspace`
 
 A continuous sync stores three control tables on the target

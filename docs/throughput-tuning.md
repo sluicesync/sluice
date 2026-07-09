@@ -158,6 +158,16 @@ path for that statement.
 - **Vitess / PlanetScale (VStream) source:** sequential single-stream by default, DELIBERATELY — the cold-copy INFO log names the knob. N concurrent COPY streams are one flag away (`--vstream-copy-table-parallelism`, ADR-0099), but the default stays 1 because the stream count K is not persisted in the resume token: a changed default would silently re-derive a different table→stream partition for an interrupted copy resumed across a version upgrade (ADR-0099 §5). If you set K > 1, resume with the same K.
 - **Trigger-CDC flavors (pgtrigger / sqlite-trigger / d1-trigger):** serial by design — the snapshot/anchor consistency argument is bound to a single connection; there is no parallel knob. The cold-start INFO log says so.
 
+## VStream FLOAT exact re-read: `--no-float-exact-reread` (PlanetScale/Vitess source)
+
+vttablet's rowstreamer streams a VStream cold-start COPY over the text protocol, and MySQL's `FLOAT`→text conversion display-rounds single-precision floats to 6 significant digits (a stored `8388608` arrives as `8388610`). sluice's SQL read projection fixes this with a `(col * 1E0)` DOUBLE promotion, but that projection can't be injected into vttablet's server-side SELECT — so the COPY value itself is rounded.
+
+By **default**, `sluice sync start` (and `sluice backup full`) on a PlanetScale/Vitess source **repairs** this: after the bulk copy completes and before CDC begins, sluice re-reads each single-precision `FLOAT` column exactly from the source over a separate SQL connection and UPDATEs the copied rows by primary key (on backup, it patches the archived rows). `DOUBLE` columns and the CDC leg are already exact and untouched.
+
+The cost is one extra source read pass over each table that has a single-precision `FLOAT` column and a primary key — bounded to the PK + FLOAT columns, cursor-paginated on the sync path (bounded memory), and buffered one table at a time on the backup path. On a schema with no single-precision `FLOAT` columns, or a non-VStream source, there is zero cost.
+
+`--no-float-exact-reread` skips the re-read: the `FLOAT` columns retain the 6-significant-digit rounding, and a loud WARN names each affected column. Use it only if you don't care about sub-6-significant-digit `FLOAT` precision (or specifically want the backup's within-row consistency — see `docs/managed-services.md`). A **keyless** table (no primary key to target the re-read) can't be repaired regardless — it WARNs and retains the rounding.
+
 ## Parallel within-table bulk copy: `--bulk-parallelism` + `--bulk-parallel-min-rows`
 
 Default: `min(8, NumCPU)` parallel readers per table; tables under

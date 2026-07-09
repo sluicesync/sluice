@@ -2633,6 +2633,21 @@ func (r *vstreamSnapshotRows) Err() error {
 // the writer absorbs the overlap idempotently.
 func (r *vstreamSnapshotRows) CopyNeedsIdempotentWriter() bool { return true }
 
+// CopyDisplayRoundsFloats implements [ir.LossyFloatCopyReader]. The
+// VStream COPY phase streams rows over vttablet's rowstreamer, whose
+// bare-column SELECT (built inside vttablet, out of sluice's reach)
+// renders single-precision FLOAT through mysqld's float→text formatter —
+// so a stored float32 8388608 lands as 8388610, a REAL float32-level loss
+// (ground-truthed on vttestserver mysql80; see the roadmap open-bug and
+// TestVStream_FloatCarrierParity). Returning true makes the pipeline
+// re-read FLOAT columns EXACTLY over a separate SQL path after the COPY
+// (sync cold-start) and WARN / --strict-float refuse (backup). The CDC
+// leg is float32-exact and DOUBLE transits both legs exactly, so only the
+// single-precision COPY value needs the mitigation — but the flag is a
+// per-reader property (this reader's COPY), and the pipeline scopes the
+// repair to the actual FLOAT columns it finds in the schema.
+func (r *vstreamSnapshotRows) CopyDisplayRoundsFloats() bool { return true }
+
 // ConcurrentCopyGroups implements [ir.ConcurrentCopyPartitioner]
 // (ADR-0100). It returns the disjoint table partition the concurrent
 // producer driver runs (ADR-0099) so the pipeline can run one read→write

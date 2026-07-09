@@ -63,6 +63,7 @@ const (
 	CodeExprBackslashLiteral      Code = "SLUICE-E-EXPR-BACKSLASH-LITERAL"
 	CodeConfirmationRequired      Code = "SLUICE-E-CONFIRMATION-REQUIRED"
 	CodeDriverHostMismatch        Code = "SLUICE-E-DRIVER-HOST-MISMATCH"
+	CodeVStreamFloatLossy         Code = "SLUICE-E-VSTREAM-FLOAT-LOSSY"
 )
 
 // Class partitions codes by how the process should exit when the
@@ -111,6 +112,7 @@ var registry = map[Code]Info{
 	CodeConfirmationRequired:      {ClassRefusal, "destructive operation requires explicit --yes confirmation"},
 	CodeDriverHostMismatch:        {ClassRefusal, "the driver cannot drive the DSN's host (e.g. mysql pointed at a PlanetScale endpoint)"},
 	CodeIndexMissing:              {ClassRefusal, "a secondary index the migration was expected to build is absent on the target"},
+	CodeVStreamFloatLossy:         {ClassRefusal, "a VStream-COPY backup would archive single-precision FLOAT columns display-rounded (--strict-float)"},
 }
 
 // Describe returns the registry metadata for c, and whether c is a

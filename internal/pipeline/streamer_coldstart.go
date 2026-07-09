@@ -84,6 +84,14 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		return nil, stop, nil
 	}
 
+	// Capture the single-precision FLOAT re-read plan from the PRISTINE
+	// source schema (before ApplyMappings can rewrite a FLOAT→DOUBLE
+	// type-override out from under the display-rounding detection). Used
+	// only when the snapshot reader is the display-rounding VStream COPY
+	// reader (gated below); nil/empty on every other source. See
+	// streamer_coldstart_float_repair.go.
+	floatPlan := planFloatRepair(schema)
+
 	// ---- Scope the source-side publication to the filtered table
 	// list (Bug 13, ADR-0021). On engines that don't have
 	// publications (MySQL), this is a no-op; on Postgres, this is
@@ -140,6 +148,17 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		return nil, stop, err
 	}
 
+	// VStream-COPY FLOAT display-rounding (roadmap open-bug 2026-07-09):
+	// when the snapshot reader is the display-rounding VStream cold-start
+	// reader AND the source has single-precision FLOAT columns, WARN once
+	// per column at COPY start (schema-triggered — the wire value is
+	// already rounded, so per-value loss is undetectable). The post-copy
+	// exact re-read that actually repairs it runs below, after bulk-copy.
+	floatCopyRounds := floatCopyDisplayRounds(stream) && len(floatPlan) > 0
+	if floatCopyRounds {
+		warnFloatDisplayRounding(ctx, floatPlan, s.NoFloatExactReread)
+	}
+
 	// Open the target-side writers and run the target-side preflights
 	// (stale backends, connection budget, RLS) against them. On error
 	// the phase has already closed the writers AND the snapshot stream.
@@ -160,6 +179,25 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// transaction (Bug 21) on success.
 	if err := s.coldStartRunCopy(ctx, schema, stream, sw, rw, streamID, resumingCopy); err != nil {
 		return nil, stop, err
+	}
+
+	// VStream-COPY FLOAT display-rounding repair (roadmap open-bug
+	// 2026-07-09). Re-read the single-precision FLOAT columns EXACTLY from
+	// the source and UPDATE the target rows by PK — AFTER bulk-copy
+	// completes and BEFORE the CDC anchor is persisted / CDC begins. The
+	// ordering is load-bearing: CDC replays from the copy anchor, so any
+	// value that changed between the copy and this re-read is re-applied by
+	// CDC to its final value; and because the anchor is not yet persisted,
+	// a crash mid-repair re-cold-starts rather than warm-resuming a
+	// partially-repaired target. Skipped by --no-float-exact-reread (the
+	// WARN above then states the rounding is retained). No-op on every
+	// non-VStream source. Uses the finalized (post-mapping) schema for the
+	// target column types the UPDATE binds against.
+	if floatCopyRounds && !s.NoFloatExactReread {
+		if err := s.repairColdStartFloats(ctx, floatPlan, schema); err != nil {
+			_ = stream.Abandon()
+			return nil, stop, err
+		}
 	}
 
 	// Persist the cold-start CDC anchor (GitHub #15), then start CDC

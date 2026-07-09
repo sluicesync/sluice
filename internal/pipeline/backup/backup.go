@@ -86,6 +86,7 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/redact"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // DefaultBackupChunkRows is the per-chunk row count when [Backup]'s
@@ -163,6 +164,31 @@ type Backup struct {
 	// guarantee a resumed run adopts (task #42, ADR-0085). See
 	// [irbackup.SnapshotOptions].
 	ChainSlot bool
+
+	// StrictFloat makes a `backup full` on a VStream (PlanetScale/Vitess)
+	// source REFUSE loudly (SLUICE-E-VSTREAM-FLOAT-LOSSY) when the source
+	// schema has single-precision FLOAT columns, instead of archiving them
+	// display-rounded (roadmap open-bug 2026-07-09). The VStream COPY lands
+	// FLOAT at mysqld's 6-significant-digit display precision, and the
+	// backup path has no CDC leg to heal per-row skew, so — unlike the sync
+	// cold-start — it does NOT re-read: the only exact options are an
+	// upstream Vitess rowstreamer fix or a non-VStream snapshot. OPT-IN: the
+	// default (false) archives with a WARN, for operators who'd rather have
+	// a rounded archive than no archive. Inert on every non-VStream source.
+	StrictFloat bool
+
+	// NoFloatExactReread opts OUT of the default exact FLOAT re-read on a
+	// VStream `backup full` (roadmap open-bug 2026-07-09): by default the
+	// backup re-reads single-precision FLOAT columns exactly and patches the
+	// archived rows (exact float32, at the cost of a bounded within-row
+	// temporal skew — see [floatExactPatchReader]). Set this to archive the
+	// COPY's display-rounded values instead — a rounded-but-perfectly-
+	// consistent snapshot, for operators who value within-row consistency
+	// over FLOAT precision. OPT-OUT-named so the Go zero value (false) keeps
+	// the exact re-read ON (the correct default) for every non-CLI
+	// construction. Mutually distinct from --strict-float (which refuses).
+	// Inert on every non-VStream source.
+	NoFloatExactReread bool
 
 	// TableParallelism caps how many tables stream CONCURRENTLY during
 	// the row sweep (ADR-0084, the backup sibling of migrate's
@@ -886,6 +912,96 @@ func (b *Backup) openBackupSnapshotScoped(ctx context.Context, schema *ir.Schema
 	return nil, false, nil
 }
 
+// applyVStreamFloatPolicy handles the VStream-COPY FLOAT display-rounding
+// class for `backup full` (roadmap open-bug 2026-07-09). When the just-
+// opened snapshot's reader display-rounds single-precision FLOAT columns
+// (VStream) AND the schema has any, it selects one of three postures and,
+// in the default case, WRAPS snap.Rows so the archived rows carry EXACT
+// float32:
+//
+//   - --strict-float → REFUSE loudly (SLUICE-E-VSTREAM-FLOAT-LOSSY, exit 3).
+//   - --no-float-exact-reread → WARN per column and archive ROUNDED (the
+//     rounded-but-perfectly-consistent archive).
+//   - default → WARN per column (with the temporal-skew note) and wrap
+//     snap.Rows in a [floatExactPatchReader] so every repairable FLOAT
+//     table's rows are patched with exact source values before archiving.
+//     Keyless / float-PK-only tables cannot be patched — they WARN and
+//     archive rounded (the WARN-only fallback).
+//
+// Position correctness is untouched (see [floatExactPatchReader]). No-op on
+// every non-VStream source and when the schema has no single-precision
+// FLOAT column. Returns an error only for the --strict-float refusal.
+func (b *Backup) applyVStreamFloatPolicy(ctx context.Context, snap *irbackup.Snapshot, schema *ir.Schema) error {
+	lossy, ok := snap.Rows.(ir.LossyFloatCopyReader)
+	if !ok || !lossy.CopyDisplayRoundsFloats() {
+		return nil
+	}
+	plan := planBackupFloatRepair(schema)
+	// Column list for the WARN / refusal message, tagged repairable.
+	type floatCol struct {
+		qualified  string
+		repairable bool
+	}
+	var cols []floatCol
+	for _, t := range schema.Tables {
+		_, repairable := plan[t.Name]
+		for _, c := range migcore.SinglePrecisionFloatColumns(t) {
+			cols = append(cols, floatCol{t.Name + "." + c.Name, repairable})
+		}
+	}
+	if len(cols) == 0 {
+		return nil
+	}
+
+	if b.StrictFloat {
+		names := make([]string, len(cols))
+		for i, c := range cols {
+			names[i] = c.qualified
+		}
+		return sluicecode.Wrap(sluicecode.CodeVStreamFloatLossy, "drop --strict-float to archive (exact re-read by default, or rounded with --no-float-exact-reread)",
+			fmt.Errorf("backup: --strict-float: the VStream COPY renders %d single-precision FLOAT column(s) "+
+				"display-rounded to 6 significant digits (%s). Drop --strict-float to archive (sluice re-reads FLOAT "+
+				"columns exactly by default; --no-float-exact-reread keeps the rounded-but-consistent archive), snapshot "+
+				"via a non-VStream path, or wait for an upstream Vitess rowstreamer fix. A target-side --type-override to "+
+				"DOUBLE does NOT help — the source value is already rounded on the wire", len(cols), strings.Join(names, ", ")))
+	}
+
+	if b.NoFloatExactReread {
+		for _, c := range cols {
+			slog.WarnContext(ctx,
+				"backup: VStream COPY archives this single-precision FLOAT column display-rounded to 6 significant digits; "+
+					"the exact re-read is DISABLED (--no-float-exact-reread), so the rounding is retained (a "+
+					"perfectly-consistent snapshot). Drop the flag to archive exact float32 instead",
+				slog.String("column", c.qualified))
+		}
+		return nil
+	}
+
+	// Default: exact re-read.
+	for _, c := range cols {
+		if c.repairable {
+			slog.WarnContext(ctx,
+				"backup: VStream COPY display-rounds this single-precision FLOAT column; sluice re-reads it EXACTLY from "+
+					"the source before archiving. Cost: a bounded within-row temporal skew — the FLOAT value reflects a read "+
+					"instant slightly after the snapshot VGTID (ZERO on a quiescent source; SELF-HEALS on a chain restore "+
+					"since incrementals replay from the full's position forward; persists only for a standalone-full restore "+
+					"of a source with concurrent FLOAT writes). Pass --no-float-exact-reread for a rounded-but-consistent "+
+					"archive, or --strict-float to refuse",
+				slog.String("column", c.qualified))
+		} else {
+			slog.WarnContext(ctx,
+				"backup: VStream COPY display-rounds this single-precision FLOAT column and it CANNOT be re-read exactly — "+
+					"the table has no primary key to target the re-read (or the FLOAT is part of the PK). The rounding is "+
+					"retained for this column. Pass --strict-float to refuse instead",
+				slog.String("column", c.qualified))
+		}
+	}
+	if len(plan) > 0 {
+		snap.Rows = newFloatExactPatchReader(snap.Rows, b.Source, b.SourceDSN, plan)
+	}
+	return nil
+}
+
 func (b *Backup) openSnapshotOrFallback(ctx context.Context, schema *ir.Schema, persistChainSlot bool) (ir.RowReader, *ir.Position, *irbackup.Snapshot, func(), error) {
 	// ADR-0088: resolve the REQUESTED cross-table parallelism BEFORE the
 	// snapshot opens, so an engine that opens coincident readers eagerly
@@ -900,6 +1016,19 @@ func (b *Backup) openSnapshotOrFallback(ctx context.Context, schema *ir.Schema, 
 	}
 	if snap, ok, err := b.openBackupSnapshotScoped(ctx, schema, persistChainSlot, requestedReaders); ok {
 		if err == nil {
+			// VStream-COPY FLOAT display-rounding (roadmap open-bug
+			// 2026-07-09): a VStream snapshot renders single-precision FLOAT
+			// at mysqld's 6-significant-digit display precision. By default
+			// sluice re-reads FLOAT columns EXACTLY and patches the archived
+			// rows (wraps snap.Rows here); --no-float-exact-reread archives
+			// rounded-but-consistent; --strict-float refuses loudly.
+			if err := b.applyVStreamFloatPolicy(ctx, snap, schema); err != nil {
+				if cerr := snap.Close(); cerr != nil {
+					slog.WarnContext(ctx, "backup: snapshot close after --strict-float refusal failed",
+						slog.String("err", cerr.Error()))
+				}
+				return nil, nil, nil, func() {}, err
+			}
 			slog.InfoContext(
 				ctx, "backup: opened snapshot-anchored consistent view",
 				slog.String("engine", b.Source.Name()),
