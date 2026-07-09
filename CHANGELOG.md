@@ -4,6 +4,16 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.211] - 2026-07-09
+
+### Changed
+
+- **An unrecognized backup signature scheme or KMS algorithm now fails as an "upgrade sluice" refusal (`SLUICE-E-BACKUP-SIGNATURE-UNSUPPORTED`), not a false tamper accusation (ADR-0154 Phase 3a follow-up).** The "newer sluice signed this, so upgrade rather than distrust the backup" treatment that already covered a newer canonicalization version (`ErrSignatureUnsupportedVersion`) now also covers an unrecognized signature scheme FAMILY (a hypothetical future post-quantum scheme) and a `kms/<algorithm>` whose algorithm this build cannot verify. Previously both fell through to a known verification primitive and failed the MAC as `SLUICE-E-BACKUP-SIGNATURE-INVALID` — the alarming "your backup is compromised" signal — when the real situation is a forward-incompatibility: a newer sluice wrote a signature format this build does not understand. The verifier now recognizes the unknown scheme up front (`crypto.IsSupportedKMSAlgorithm` gates the kms algorithm; an unknown family hits an explicit arm) and refuses with the new coded class `SLUICE-E-BACKUP-SIGNATURE-UNSUPPORTED` (a fail-closed refusal, exit 3, with an "upgrade sluice" remedy) instead of `-INVALID`. It remains fail-closed — this build will not restore/verify a signature it cannot check — but it no longer tells an operator their backup is tampered when it is merely newer. The empty-scheme probe path (`--require-signature` on an unsigned or fully-stripped chain) is split into its own branch so it keeps reporting the precise `SLUICE-E-BACKUP-SIGNATURE-MISSING`.
+
+### Fixed
+
+- **Pinned that a v3→v2 canon-version relabel of a signature can never verify (downgrade-oracle hardening; test-only, no behavior change).** A store-write adversary relabeling a canon-v3 signature — whose MAC covers bytes that INCLUDE the scheme token — down to canon v2, which the dual-version verifier recomputes WITHOUT the scheme token, produces different bytes and fails: the signature is not a downgrade oracle. This was already true by construction (the twin of the existing v2→ed25519 relabel refusal); v0.99.211 adds the regression pin (`TestVerifyManifest_V3RelabelToV2Refused`, hmac + ed25519 arms) so it cannot silently regress.
+
 ## [0.99.210] - 2026-07-09
 
 ### Security
