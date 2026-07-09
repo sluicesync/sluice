@@ -121,6 +121,9 @@ func TestInterpolationFlavorDefault_ApplierLanePoolCfg(t *testing.T) {
 		{"planetscale", "&interpolateParams=false", false},
 		{"vitess", "", true},
 		{"mysql", "", false},
+		// The vanilla DSN opt-in (docs/throughput-tuning.md): the resolved
+		// state — not the flavor — is what reaches every derived pool.
+		{"mysql", "&interpolateParams=true", true},
 	}
 	for _, c := range cases {
 		eng, ok := engines.Get(c.engine)

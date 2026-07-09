@@ -372,14 +372,22 @@ var interpolationUnsafeCollations = map[string]bool{
 	"gb18030_unicode_520_ci": true,
 }
 
-// interpolationDefaultLogOnce keeps the resolved-protocol INFO line to one
-// per process (the default engages on every parse of every open path; the
+// interpolationProtocolLogOnce keeps the resolved-protocol INFO line to one
+// per process (the resolution runs on every parse of every open path; the
 // operator needs the fact once, not thirty times).
-var interpolationDefaultLogOnce sync.Once
+var interpolationProtocolLogOnce sync.Once
 
-// applyFlavorInterpolationDefault applies the ADR-0153 statement-protocol
-// default to a parsed cfg: PlanetScale / Vitess flavors get client-side
-// interpolation unless the operator said otherwise.
+// applyFlavorInterpolationDefault resolves the ADR-0153 statement protocol
+// on a parsed cfg: PlanetScale / Vitess flavors get client-side
+// interpolation unless the operator said otherwise, and the RESOLVED state
+// — whatever its source (flavor default, or an explicit
+// interpolateParams=true DSN opt-in on ANY flavor, vanilla included; the
+// documented high-RTT lever, docs/throughput-tuning.md) — is announced with
+// the same once-per-process INFO line. Every guard downstream of here keys
+// on the resolved cfg.InterpolateParams, never on the flavor: the driver's
+// unsafe-collation refusal, its maxAllowedPacket ErrSkip→prepared fallback,
+// and its NBE status-flag escaper all read the cfg/connection state, so a
+// vanilla opt-in gets identical protections by construction.
 //
 // Explicit-DSN-wins contract: mysql.ParseDSN CONSUMES an interpolateParams
 // param into a bool, collapsing "explicitly false" and "absent" — so
@@ -396,9 +404,19 @@ var interpolationDefaultLogOnce sync.Once
 // flip is sluice's perf default, not an operator request, and refusing would
 // break a config that worked on every release before ADR-0153. An operator
 // who EXPLICITLY combines interpolateParams=true with an unsafe collation is
-// refused by the driver itself at ParseDSN, loudly, before this runs.
+// refused by the driver itself at ParseDSN, loudly, before this runs — on
+// every flavor (the driver check is flavor-blind).
 func applyFlavorInterpolationDefault(cfg *mysql.Config, rawDSN string, flavor Flavor) {
-	if cfg == nil || !flavor.usesVStream() || cfg.InterpolateParams || dsnSetsInterpolateParams(rawDSN) {
+	if cfg == nil {
+		return
+	}
+	if cfg.InterpolateParams {
+		// Explicit DSN opt-in (any flavor) — the protocol is already
+		// resolved; just announce it identically to the default path.
+		noteInterpolationResolved("explicit interpolateParams=true in the DSN")
+		return
+	}
+	if !flavor.usesVStream() || dsnSetsInterpolateParams(rawDSN) {
 		return
 	}
 	if interpolationUnsafeCollations[cfg.Collation] {
@@ -413,9 +431,14 @@ func applyFlavorInterpolationDefault(cfg *mysql.Config, rawDSN string, flavor Fl
 		return
 	}
 	cfg.InterpolateParams = true
-	interpolationDefaultLogOnce.Do(func() {
-		slog.Info("mysql: write path: client-side interpolation (PlanetScale/Vitess default, 1 round trip " +
-			"per statement; override with interpolateParams=false in the DSN)")
+	noteInterpolationResolved("PlanetScale/Vitess flavor default; override with interpolateParams=false in the DSN")
+}
+
+// noteInterpolationResolved emits the once-per-process resolved-protocol
+// INFO line, naming how interpolation was engaged.
+func noteInterpolationResolved(source string) {
+	interpolationProtocolLogOnce.Do(func() {
+		slog.Info("mysql: write path: client-side interpolation (1 round trip per statement; " + source + ")")
 	})
 }
 

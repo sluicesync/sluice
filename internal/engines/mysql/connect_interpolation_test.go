@@ -116,14 +116,19 @@ func TestInterpolationDefault_UnsafeCollationSkipsDefault(t *testing.T) {
 // the operator-explicit unsafe combination: the DRIVER refuses it at
 // ParseDSN, loudly, before sluice's default logic ever runs — the loud
 // failure the graceful step-aside above deliberately does not replicate.
+// Pinned on EVERY flavor: the guards key on the resolved interpolation
+// state, not the flavor, so a vanilla-MySQL operator taking the documented
+// DSN opt-in (docs/throughput-tuning.md) gets the identical protection.
 func TestInterpolationDefault_ExplicitTrueUnsafeCollation_RefusedByDriver(t *testing.T) {
 	dsn := "user:pw@tcp(db.example.com:3306)/appdb?collation=sjis_bin&interpolateParams=true"
-	_, err := parseDSNForFlavor(dsn, FlavorPlanetScale)
-	if err == nil {
-		t.Fatal("explicit interpolateParams=true + unsafe collation parsed clean; want the driver's loud refusal")
-	}
-	if !strings.Contains(err.Error(), "unsafe collations") {
-		t.Errorf("refusal %q; want the driver's 'unsafe collations' message", err)
+	for _, flavor := range []Flavor{FlavorVanilla, FlavorPlanetScale, FlavorVitess} {
+		_, err := parseDSNForFlavor(dsn, flavor)
+		if err == nil {
+			t.Fatalf("%s: explicit interpolateParams=true + unsafe collation parsed clean; want the driver's loud refusal", flavor)
+		}
+		if !strings.Contains(err.Error(), "unsafe collations") {
+			t.Errorf("%s: refusal %q; want the driver's 'unsafe collations' message", flavor, err)
+		}
 	}
 }
 
