@@ -17,11 +17,15 @@ package mysql
 // per-instance [Engine] value (engineOptions.{vstream,}CopyTableParallelism, set
 // via [Engine.WithVStreamCopyTableParallelism] / [Engine.WithCopyTableParallelism]),
 // so a fleet `sync run` can carry distinct values per sync. The resolution logic
-// below is unchanged from the global era — an override > 0 wins over the DSN param;
+// is unchanged from the global era — an override > 0 wins over the DSN param;
 // 0 (the zero value, unset) falls through to the DSN param then the engine default
 // — only the SOURCE of the override moved from the global to the passed value.
 //
-// The resolver helpers below take the override as an explicit int argument so the
-// From-DSN readers stay pure functions of (engine override, cfg); every caller is
-// an [Engine] method (or a helper an Engine method threads the value into), so the
-// per-instance override reaches them without a package global.
+// The resolver helpers — vstreamCopyTableParallelismFromDSN
+// (cdc_vstream_copy_concurrency.go) and nativeCopyTableParallelismFromDSN
+// (cdc_snapshot_concurrent.go) — take the override as an explicit int argument so
+// the From-DSN readers stay pure functions of (engine override, cfg); every caller
+// is an [Engine] method (or a helper an Engine method threads the value into), so
+// the per-instance override reaches them without a package global. This file holds
+// only this precedence note; it was named *_override.go for the globals that A-4
+// removed.
