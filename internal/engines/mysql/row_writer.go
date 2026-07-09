@@ -446,13 +446,13 @@ func (w *RowWriter) columnExistsOnTarget(ctx context.Context, tableName, column 
 //     preparation (notably, []string-to-CSV for Set columns).
 func (w *RowWriter) WriteRows(ctx context.Context, table *ir.Table, rows <-chan ir.Row) error {
 	if table == nil {
-		return fmt.Errorf("mysql: WriteRows: table is nil")
+		return errors.New("mysql: WriteRows: table is nil")
 	}
 	if len(table.Columns) == 0 {
 		return fmt.Errorf("mysql: WriteRows: table %q has no columns", table.Name)
 	}
 	if rows == nil {
-		return fmt.Errorf("mysql: WriteRows: rows channel is nil")
+		return errors.New("mysql: WriteRows: rows channel is nil")
 	}
 
 	switch w.bulkLoad {
@@ -1353,7 +1353,7 @@ func splitPGArrayTokens(body string) ([]any, error) {
 			break
 		}
 		if body[i] == '{' || body[i] == '}' {
-			return nil, fmt.Errorf("nested arrays not supported in PG array literal")
+			return nil, errors.New("nested arrays not supported in PG array literal")
 		}
 
 		var (

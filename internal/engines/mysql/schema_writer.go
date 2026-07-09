@@ -130,7 +130,7 @@ func (w *SchemaWriter) Close() error {
 // later phases.
 func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir.Schema) error {
 	if s == nil {
-		return fmt.Errorf("mysql: CreateTablesWithoutConstraints: schema is nil")
+		return errors.New("mysql: CreateTablesWithoutConstraints: schema is nil")
 	}
 	w.maybeWarnRLSDrop(ctx, s)
 	w.maybeWarnDomainCheckDrop(ctx, s)
@@ -331,7 +331,7 @@ var _ ir.TransientClassifier = (*SchemaWriter)(nil)
 // creation order doesn't affect correctness.
 func (w *SchemaWriter) CreateIndexes(ctx context.Context, s *ir.Schema) error {
 	if s == nil {
-		return fmt.Errorf("mysql: CreateIndexes: schema is nil")
+		return errors.New("mysql: CreateIndexes: schema is nil")
 	}
 	// Flatten the whole schema into the same per-table work-list the
 	// overlapped builder (ADR-0080) queues, then build each table's indexes
@@ -538,7 +538,7 @@ func inlineSkipIndexNames(table *ir.Table) map[string]struct{} {
 // The order is (child table name, constraint name) lexicographic.
 func (w *SchemaWriter) CreateConstraints(ctx context.Context, s *ir.Schema) error {
 	if s == nil {
-		return fmt.Errorf("mysql: CreateConstraints: schema is nil")
+		return errors.New("mysql: CreateConstraints: schema is nil")
 	}
 	tables := orderedTables(s)
 	// Idempotent resume (Bug 131 same-class): a prior run that already added
@@ -644,7 +644,7 @@ func (w *SchemaWriter) SyncIdentitySequences(_ context.Context, _ *ir.Schema) er
 // tripped form as equal.
 func (w *SchemaWriter) CreateViews(ctx context.Context, s *ir.Schema) error {
 	if s == nil {
-		return fmt.Errorf("mysql: CreateViews: schema is nil")
+		return errors.New("mysql: CreateViews: schema is nil")
 	}
 	for _, view := range s.Views {
 		if view == nil || view.Name == "" {
@@ -693,7 +693,7 @@ func orderedTables(s *ir.Schema) []*ir.Table {
 // formatter re-adds them for human readability.
 func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStatement, error) {
 	if s == nil {
-		return nil, fmt.Errorf("mysql: PreviewDDL: schema is nil")
+		return nil, errors.New("mysql: PreviewDDL: schema is nil")
 	}
 
 	out := make([]ir.DDLStatement, 0, len(s.Tables)*2)

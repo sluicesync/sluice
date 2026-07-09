@@ -333,14 +333,14 @@ func (e Engine) PrecedesOrEqual(a, b ir.Position) (bool, error) {
 		return false, fmt.Errorf("postgres: monotonic check: decode a: %w", err)
 	}
 	if !oka {
-		return false, fmt.Errorf("postgres: monotonic check: position a is the empty 'from now' sentinel; cannot compare")
+		return false, errors.New("postgres: monotonic check: position a is the empty 'from now' sentinel; cannot compare")
 	}
 	db, okb, err := decodePGPos(b)
 	if err != nil {
 		return false, fmt.Errorf("postgres: monotonic check: decode b: %w", err)
 	}
 	if !okb {
-		return false, fmt.Errorf("postgres: monotonic check: position b is the empty 'from now' sentinel; cannot compare")
+		return false, errors.New("postgres: monotonic check: position b is the empty 'from now' sentinel; cannot compare")
 	}
 	cmp, err := e.CompareLSN(da.LSN, db.LSN)
 	if err != nil {

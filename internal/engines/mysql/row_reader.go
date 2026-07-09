@@ -99,7 +99,7 @@ func (r *RowReader) Err() error {
 // goroutine.
 func (r *RowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.Row, error) {
 	if table == nil {
-		return nil, fmt.Errorf("mysql: ReadRows: table is nil")
+		return nil, errors.New("mysql: ReadRows: table is nil")
 	}
 	if len(table.Columns) == 0 {
 		return nil, fmt.Errorf("mysql: ReadRows: table %q has no columns", table.Name)

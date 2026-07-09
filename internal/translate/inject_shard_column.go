@@ -4,6 +4,7 @@
 package translate
 
 import (
+	"errors"
 	"fmt"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -40,13 +41,13 @@ import (
 // else shares pointers with `s`.
 func InjectShardColumn(s *ir.Schema, name string, valueType ir.Type) (*ir.Schema, error) {
 	if s == nil {
-		return nil, fmt.Errorf("translate: InjectShardColumn: schema is nil")
+		return nil, errors.New("translate: InjectShardColumn: schema is nil")
 	}
 	if name == "" {
-		return nil, fmt.Errorf("translate: InjectShardColumn: column name is empty")
+		return nil, errors.New("translate: InjectShardColumn: column name is empty")
 	}
 	if valueType == nil {
-		return nil, fmt.Errorf("translate: InjectShardColumn: value type is nil")
+		return nil, errors.New("translate: InjectShardColumn: value type is nil")
 	}
 
 	out := &ir.Schema{

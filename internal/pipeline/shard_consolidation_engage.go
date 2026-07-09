@@ -25,6 +25,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -102,7 +103,7 @@ func (s *Streamer) engageShardCoordination(ctx context.Context, applier ir.Chang
 	// writer's lifetime is owned by the Streamer; closed via
 	// closeShardCoordination on Run exit.
 	if s.Target == nil {
-		return fmt.Errorf("pipeline: engage shard consolidation: nil target engine")
+		return errors.New("pipeline: engage shard consolidation: nil target engine")
 	}
 	sw, err := s.Target.OpenSchemaWriter(ctx, s.TargetDSN)
 	if err != nil {

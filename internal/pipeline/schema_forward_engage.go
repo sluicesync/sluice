@@ -14,6 +14,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -103,10 +104,10 @@ func (s *Streamer) engageAddColumnForward(ctx context.Context) error {
 		return nil
 	}
 	if s.Target == nil {
-		return fmt.Errorf("pipeline: engage add-column-forward: nil target engine")
+		return errors.New("pipeline: engage add-column-forward: nil target engine")
 	}
 	if s.Source == nil {
-		return fmt.Errorf("pipeline: engage add-column-forward: nil source engine")
+		return errors.New("pipeline: engage add-column-forward: nil source engine")
 	}
 	if s.addColumnForwardWriter == nil {
 		sw, err := s.Target.OpenSchemaWriter(ctx, s.TargetDSN)

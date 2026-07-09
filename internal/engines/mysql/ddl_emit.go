@@ -835,7 +835,7 @@ func emitColumnDef(tableName string, c *ir.Column) (string, error) {
 
 func (m mysqlEmitter) emitColumnDef(tableName string, c *ir.Column) (string, error) {
 	if c == nil {
-		return "", fmt.Errorf("mysql: emitColumnDef: column is nil")
+		return "", errors.New("mysql: emitColumnDef: column is nil")
 	}
 	typeStr, err := m.emitColumnType(c.Type)
 	if err != nil {
@@ -1174,7 +1174,7 @@ func emitTableDefWithDomainChecks(table *ir.Table, inlineCheckSupported bool) (s
 
 func (m mysqlEmitter) emitTableDefWithDomainChecks(table *ir.Table, inlineCheckSupported bool) (string, error) {
 	if table == nil {
-		return "", fmt.Errorf("mysql: emitTableDef: table is nil")
+		return "", errors.New("mysql: emitTableDef: table is nil")
 	}
 	if len(table.Columns) == 0 {
 		return "", fmt.Errorf("mysql: emitTableDef: table %q has no columns", table.Name)
@@ -1411,10 +1411,10 @@ func emitCreateIndex(tableName string, idx *ir.Index) (string, error) {
 // v0.99.30 SPATIAL/FULLTEXT prefix suppression and the USING storage hint.
 func emitAddIndexClause(idx *ir.Index) (string, error) {
 	if idx == nil {
-		return "", fmt.Errorf("mysql: emitAddIndexClause: index is nil")
+		return "", errors.New("mysql: emitAddIndexClause: index is nil")
 	}
 	if strings.EqualFold(idx.Name, "PRIMARY") {
-		return "", fmt.Errorf("mysql: emitAddIndexClause: PRIMARY index is inline in CREATE TABLE")
+		return "", errors.New("mysql: emitAddIndexClause: PRIMARY index is inline in CREATE TABLE")
 	}
 	if len(idx.Columns) == 0 {
 		return "", fmt.Errorf("mysql: emitAddIndexClause: index %q has no columns", idx.Name)
@@ -1513,7 +1513,7 @@ func emitCreateIndexesCombined(tableName string, idxs []*ir.Index) ([]string, er
 // statement for a foreign key on the given child table.
 func emitAddForeignKey(childSchema, childTable string, fk *ir.ForeignKey) (string, error) {
 	if fk == nil {
-		return "", fmt.Errorf("mysql: emitAddForeignKey: fk is nil")
+		return "", errors.New("mysql: emitAddForeignKey: fk is nil")
 	}
 	if len(fk.Columns) == 0 || len(fk.ReferencedColumns) == 0 {
 		return "", fmt.Errorf("mysql: emitAddForeignKey: fk %q has no columns", fk.Name)

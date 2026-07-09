@@ -4,6 +4,7 @@
 package postgres
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/jackc/pglogrepl"
@@ -36,14 +37,14 @@ func (Engine) PositionAtOrAfter(p, anchor ir.Position) (bool, error) {
 		return false, fmt.Errorf("postgres: position-orderer: decode p: %w", err)
 	}
 	if !ok {
-		return false, fmt.Errorf("postgres: position-orderer: p is the empty/from-now sentinel, not an orderable position")
+		return false, errors.New("postgres: position-orderer: p is the empty/from-now sentinel, not an orderable position")
 	}
 	ap, ok, err := decodePGPos(anchor)
 	if err != nil {
 		return false, fmt.Errorf("postgres: position-orderer: decode anchor: %w", err)
 	}
 	if !ok {
-		return false, fmt.Errorf("postgres: position-orderer: anchor is the empty/from-now sentinel, not an orderable position")
+		return false, errors.New("postgres: position-orderer: anchor is the empty/from-now sentinel, not an orderable position")
 	}
 
 	// Different slots → different WAL timelines; LSNs are not

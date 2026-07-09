@@ -103,7 +103,7 @@ func (w *RowWriter) WriteRows(ctx context.Context, table *ir.Table, rows <-chan 
 		return fmt.Errorf("sqlite: WriteRows: table %q has no columns", table.Name)
 	}
 	if rows == nil {
-		return fmt.Errorf("sqlite: WriteRows: rows channel is nil")
+		return errors.New("sqlite: WriteRows: rows channel is nil")
 	}
 
 	cols := nonGeneratedColumns(table.Columns)
