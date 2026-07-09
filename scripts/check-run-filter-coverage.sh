@@ -48,7 +48,7 @@ chaos;^TestVitessChaos_;internal/engines/mysql/...;extended-suites.yml chaos
 vitessreshard;^TestVitessReshard_;internal/engines/mysql/...;extended-suites.yml reshard
 vitesscluster!chaos;TestVitessCluster;internal/engines/mysql/...;vitess-version-matrix.yml cluster (weekly default)
 ddlfixture;^TestDDLFixture;internal/translate/...;extended-suites.yml ddlfixture
-kmsverify;^TestBackup_KMSEncryption_;internal/pipeline;extended-suites.yml kmsverify
+kmsverify;^TestBackup_KMS;internal/pipeline;extended-suites.yml kmsverify
 '
 
 # Tags deliberately WITHOUT a manifest axis. Each entry needs a

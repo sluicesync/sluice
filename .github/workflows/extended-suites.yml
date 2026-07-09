@@ -261,7 +261,7 @@ jobs:
   # stubbed SDK (internal/crypto/aws_kms_test.go), so this is the one
   # place a real Encrypt/Decrypt wire round-trip runs.
   #
-  # Any kmsverify-tagged test MUST carry the TestBackup_KMSEncryption_
+  # Any kmsverify-tagged test MUST carry the TestBackup_KMS
   # prefix or the -run filter below silently skips it (enforced by
   # scripts/check-run-filter-coverage.sh in ci.yml's Lint job; keep
   # that script's manifest in sync with this filter).
@@ -299,7 +299,7 @@ jobs:
       - name: Run the KMS localstack suite
         run: |
           go test -tags='integration kmsverify' -race -count=1 -timeout=25m \
-            -run '^TestBackup_KMSEncryption_' -v ./internal/pipeline/
+            -run '^TestBackup_KMS' -v ./internal/pipeline/
 
   # The DDL-fixture harness (internal/translate/ddl_fixture_test.go):
   # sweep the Dolt sqllogictest createtable1 corpus (~4,575 CREATE
