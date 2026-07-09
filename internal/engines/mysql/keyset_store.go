@@ -34,6 +34,12 @@ type mysqlKeysetStore struct {
 }
 
 // openKeysetStore parses the DSN, opens a *sql.DB, and pings it.
+//
+// Package-level parseDSN (not the flavor-aware parseDSNForFlavor): the
+// keyset store is opened via the redact registry with no engine — and
+// therefore no Flavor — in scope, so it conservatively keeps the driver's
+// binary-protocol default. Its statements are single-row control-table
+// reads/writes; the ADR-0153 RTT saving is immaterial here.
 func openKeysetStore(ctx context.Context, dsn string) (redact.KeysetStore, error) {
 	cfg, err := parseDSN(dsn)
 	if err != nil {

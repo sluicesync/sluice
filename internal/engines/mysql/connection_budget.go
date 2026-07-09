@@ -281,7 +281,7 @@ func probeRoleLimit(ctx context.Context, db *sql.DB) int {
 // a connection-open failure surfaces as a non-nil error (the operator's
 // own DSN is wrong — worth failing on).
 func (e Engine) ProbeTargetConnectionBudget(ctx context.Context, dsn string, requested, ceiling int) (ir.ConnectionBudget, error) {
-	cfg, err := parseDSN(dsn)
+	cfg, err := parseDSNForFlavor(dsn, e.Flavor)
 	if err != nil {
 		return ir.ConnectionBudget{}, err
 	}

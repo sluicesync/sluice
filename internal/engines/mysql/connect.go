@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
@@ -300,6 +301,146 @@ func finishParseDSN(cfg *mysql.Config) *mysql.Config {
 	}
 
 	return cfg
+}
+
+// parseDSNForFlavor is the flavor-aware sibling of [parseDSN] — the ONE choke
+// point where the ADR-0153 statement-protocol default is resolved. Every
+// Engine open path (schema reader/writer, row reader/writer, change applier,
+// migration state, snapshot openers, VStream reader) parses through it; the
+// resulting cfg carries the decision, so every connection derived from that
+// cfg — pool conns, the ADR-0104 lane pool (pipelineCfg), the VStream
+// shard-discovery and purged-GTID probes (Clone()s of the reader cfg) —
+// inherits it with no per-site logic.
+//
+// The rule (audit N-15a, benched on real PlanetScale 2026-07-08): the
+// PlanetScale / Vitess flavors default to client-side interpolation
+// (`interpolateParams=true`, 1 COM_QUERY round trip per statement) because
+// their write path is WAN-RTT-bound and the per-statement hidden
+// COM_STMT_PREPARE measured −33% bulk copy / −26% CDC burst drain at ~100 ms
+// RTT. Vanilla MySQL keeps the driver's binary-protocol default (typically
+// LAN RTT; protocol conservatism is free there). An explicit
+// `interpolateParams=` in the DSN always wins — see
+// [applyFlavorInterpolationDefault].
+func parseDSNForFlavor(dsn string, flavor Flavor) (*mysql.Config, error) {
+	cfg, err := parseDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+	applyFlavorInterpolationDefault(cfg, dsn, flavor)
+	return cfg, nil
+}
+
+// parseServerDSNForFlavor is the database-OPTIONAL sibling of
+// [parseDSNForFlavor], mirroring parseServerDSN vs parseDSN.
+func parseServerDSNForFlavor(dsn string, flavor Flavor) (*mysql.Config, error) {
+	cfg, err := parseServerDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+	applyFlavorInterpolationDefault(cfg, dsn, flavor)
+	return cfg, nil
+}
+
+// interpolationUnsafeCollations mirrors go-sql-driver's unexported
+// unsafeCollations denylist (collations whose multibyte encodings may carry
+// 0x5C in trailing bytes, making backslash-escaping interpolation
+// injection-unsafe). The driver REFUSES interpolateParams=true with these at
+// Config.normalize(); sluice consults the copy so the FLAVOR DEFAULT can
+// step aside gracefully instead of turning a previously-working
+// unsafe-collation DSN into a connect failure — a perf default must never
+// break a working configuration (see [applyFlavorInterpolationDefault]).
+//
+// Drift posture: TestInterpolationUnsafeCollations_SubsetOfDriver pins that
+// every entry here is refused by the driver (this list ⊆ the driver's). If a
+// future driver release ADDS a collation we don't list, the default flip on
+// such a DSN fails LOUDLY at connector build ("interpolateParams can not be
+// used with unsafe collations") rather than silently — the operator remedy
+// (interpolateParams=false in the DSN) is in the same error path, and the
+// list gains the entry on the driver upgrade pass.
+var interpolationUnsafeCollations = map[string]bool{
+	"big5_chinese_ci":        true,
+	"sjis_japanese_ci":       true,
+	"gbk_chinese_ci":         true,
+	"big5_bin":               true,
+	"gb2312_bin":             true,
+	"gbk_bin":                true,
+	"sjis_bin":               true,
+	"cp932_japanese_ci":      true,
+	"cp932_bin":              true,
+	"gb18030_chinese_ci":     true,
+	"gb18030_bin":            true,
+	"gb18030_unicode_520_ci": true,
+}
+
+// interpolationDefaultLogOnce keeps the resolved-protocol INFO line to one
+// per process (the default engages on every parse of every open path; the
+// operator needs the fact once, not thirty times).
+var interpolationDefaultLogOnce sync.Once
+
+// applyFlavorInterpolationDefault applies the ADR-0153 statement-protocol
+// default to a parsed cfg: PlanetScale / Vitess flavors get client-side
+// interpolation unless the operator said otherwise.
+//
+// Explicit-DSN-wins contract: mysql.ParseDSN CONSUMES an interpolateParams
+// param into a bool, collapsing "explicitly false" and "absent" — so
+// explicitness is detected by inspecting the RAW DSN string
+// ([dsnSetsInterpolateParams]) and any explicit setting (true or false) is
+// respected verbatim. Zero-value safety (the v0.99.51 trap): there is no
+// config bool whose zero value could invert — the default derives from the
+// Flavor at parse time, and the zero Flavor (vanilla) means no flip.
+//
+// The unsafe-collation skip: the driver refuses interpolation under the
+// big5/cp932/gb2312/gbk/sjis/gb18030 collation families
+// ([interpolationUnsafeCollations]). An operator who pinned such a collation
+// in the DSN keeps the binary protocol — WARNED, not refused, because the
+// flip is sluice's perf default, not an operator request, and refusing would
+// break a config that worked on every release before ADR-0153. An operator
+// who EXPLICITLY combines interpolateParams=true with an unsafe collation is
+// refused by the driver itself at ParseDSN, loudly, before this runs.
+func applyFlavorInterpolationDefault(cfg *mysql.Config, rawDSN string, flavor Flavor) {
+	if cfg == nil || !flavor.usesVStream() || cfg.InterpolateParams || dsnSetsInterpolateParams(rawDSN) {
+		return
+	}
+	if interpolationUnsafeCollations[cfg.Collation] {
+		slog.Warn(
+			"mysql: skipping the PlanetScale/Vitess client-side-interpolation default: the DSN's collation "+
+				"is unsafe for interpolation (go-sql-driver denylist: multibyte encodings that can carry 0x5C "+
+				"in trailing bytes); staying on the binary protocol. Use a *_general_ci / utf8mb4 collation to "+
+				"regain the 1-RTT write path, or set interpolateParams=false in the DSN to silence this warning",
+			slog.String("collation", cfg.Collation),
+			slog.String("flavor", flavor.String()),
+		)
+		return
+	}
+	cfg.InterpolateParams = true
+	interpolationDefaultLogOnce.Do(func() {
+		slog.Info("mysql: write path: client-side interpolation (PlanetScale/Vitess default, 1 round trip " +
+			"per statement; override with interpolateParams=false in the DSN)")
+	})
+}
+
+// dsnSetsInterpolateParams reports whether the raw DSN string explicitly
+// carries an `interpolateParams=` parameter. It mirrors the driver's own DSN
+// anatomy — everything after the LAST '/' is `dbname?params` (addresses and
+// passwords may legally contain '/' and '?', which is why a substring search
+// over the whole DSN would be wrong) — and the driver's param split (a
+// segment without '=' is ignored by ParseDSN, so it is not explicit).
+func dsnSetsInterpolateParams(dsn string) bool {
+	slash := strings.LastIndexByte(dsn, '/')
+	if slash < 0 {
+		return false
+	}
+	rest := dsn[slash+1:]
+	q := strings.IndexByte(rest, '?')
+	if q < 0 {
+		return false
+	}
+	for _, seg := range strings.Split(rest[q+1:], "&") {
+		if key, _, ok := strings.Cut(seg, "="); ok && key == "interpolateParams" {
+			return true
+		}
+	}
+	return false
 }
 
 // sourceReadSessionTimeoutSeconds is the bounded value sluice applies to

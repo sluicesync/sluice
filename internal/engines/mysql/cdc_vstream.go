@@ -329,7 +329,7 @@ func applyVStreamFlavorDefaults(cfg *gomysql.Config, flavor Flavor) {
 // ctx is unused: reader construction is deliberately connection-free (shard
 // discovery is deferred to StreamChanges, which takes its own ctx).
 func openVStreamReader(_ context.Context, dsn string, flavor Flavor, opts engineOptions) (ir.CDCReader, error) {
-	cfg, err := parseDSN(dsn)
+	cfg, err := parseDSNForFlavor(dsn, flavor)
 	if err != nil {
 		return nil, err
 	}

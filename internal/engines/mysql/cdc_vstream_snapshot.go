@@ -128,7 +128,7 @@ func vstreamCopyFilterRules(tables []string) []*binlogdata.Rule {
 // overflow). The scope is captured on the stream (copyTables) so an
 // in-place [reconnectCopy] re-applies it.
 func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, start []shardGtid, tables []string) (*ir.SnapshotStream, error) {
-	cfg, err := parseDSN(dsn)
+	cfg, err := parseDSNForFlavor(dsn, e.Flavor)
 	if err != nil {
 		return nil, err
 	}

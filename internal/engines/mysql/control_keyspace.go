@@ -93,7 +93,7 @@ func (e Engine) ResolveControlKeyspace(ctx context.Context, dsn, explicitFlag st
 	if !e.Flavor.usesVStream() {
 		return "", nil
 	}
-	cfg, err := parseDSN(dsn)
+	cfg, err := parseDSNForFlavor(dsn, e.Flavor)
 	if err != nil {
 		return "", fmt.Errorf("mysql: resolve control keyspace: %w", err)
 	}

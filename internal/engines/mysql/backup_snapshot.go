@@ -73,7 +73,7 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts irbacku
 		// on OpenBackupSnapshotForTables (irbackup.TableScopedBackupSnapshotOpener).
 		return e.openBackupSnapshotVStream(ctx, dsn, nil)
 	}
-	cfg, err := parseDSN(dsn)
+	cfg, err := parseDSNForFlavor(dsn, e.Flavor)
 	if err != nil {
 		return nil, err
 	}

@@ -80,7 +80,7 @@ func (e Engine) Capabilities() ir.Capabilities { return e.Flavor.capabilities() 
 // returned SchemaReader (via its Close method) to release the
 // underlying connection pool.
 func (e Engine) OpenSchemaReader(ctx context.Context, dsn string) (ir.SchemaReader, error) {
-	cfg, err := parseDSN(dsn)
+	cfg, err := parseDSNForFlavor(dsn, e.Flavor)
 	if err != nil {
 		return nil, err
 	}
@@ -96,7 +96,7 @@ func (e Engine) OpenSchemaReader(ctx context.Context, dsn string) (ir.SchemaRead
 // returned SchemaWriter (via its Close method) to release the
 // underlying connection pool.
 func (e Engine) OpenSchemaWriter(ctx context.Context, dsn string) (ir.SchemaWriter, error) {
-	cfg, err := parseDSN(dsn)
+	cfg, err := parseDSNForFlavor(dsn, e.Flavor)
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +127,7 @@ func (e Engine) OpenSchemaWriter(ctx context.Context, dsn string) (ir.SchemaWrit
 // by dsn. The caller is responsible for closing the returned RowReader
 // (via its Close method) to release the underlying connection pool.
 func (e Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, error) {
-	cfg, err := parseDSN(dsn)
+	cfg, err := parseDSNForFlavor(dsn, e.Flavor)
 	if err != nil {
 		return nil, err
 	}
@@ -179,7 +179,7 @@ func (e Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, er
 // for closing the returned RowWriter (via its Close method) to release
 // the underlying connection pool.
 func (e Engine) OpenRowWriter(ctx context.Context, dsn string) (ir.RowWriter, error) {
-	cfg, err := parseDSN(dsn)
+	cfg, err := parseDSNForFlavor(dsn, e.Flavor)
 	if err != nil {
 		return nil, err
 	}
@@ -280,6 +280,11 @@ func (e Engine) OpenServerCDCReader(ctx context.Context, dsn string) (ir.CDCRead
 }
 
 func openBinlogCDCReaderShared(ctx context.Context, dsn string, serverScope bool, opts engineOptions) (ir.CDCReader, error) {
+	// Package-level parse (not parseDSNForFlavor): every caller is the
+	// binlog path, reachable only from the vanilla flavor (the VStream
+	// flavors branch to openVStreamReader before this), and vanilla keeps
+	// the binary-protocol default under ADR-0153. A future binlog-based
+	// non-vanilla flavor should switch this to parseDSNForFlavor.
 	parse := parseDSN
 	if serverScope {
 		parse = parseServerDSN
@@ -332,7 +337,7 @@ func openBinlogCDCReaderShared(ctx context.Context, dsn string, serverScope bool
 // asserts on this method so engines without a SQL surface for
 // resumable migrations can omit it.
 func (e Engine) OpenMigrationStateStore(ctx context.Context, dsn string) (ir.MigrationStateStore, error) {
-	cfg, err := parseDSN(dsn)
+	cfg, err := parseDSNForFlavor(dsn, e.Flavor)
 	if err != nil {
 		return nil, err
 	}
@@ -353,7 +358,7 @@ func (e Engine) OpenMigrationStateStore(ctx context.Context, dsn string) (ir.Mig
 // See the [ChangeApplier] doc comment for important details about
 // no-PK and unique-key-without-PK tables.
 func (e Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeApplier, error) {
-	cfg, err := parseDSN(dsn)
+	cfg, err := parseDSNForFlavor(dsn, e.Flavor)
 	if err != nil {
 		return nil, err
 	}
@@ -425,7 +430,7 @@ var systemDatabases = map[string]struct{}{
 // databases (information_schema, performance_schema, mysql, sys) are
 // filtered out unconditionally per the ADR.
 func (e Engine) ListDatabases(ctx context.Context, dsn string) ([]string, error) {
-	cfg, err := parseServerDSN(dsn)
+	cfg, err := parseServerDSNForFlavor(dsn, e.Flavor)
 	if err != nil {
 		return nil, err
 	}
@@ -481,6 +486,22 @@ func (Engine) WithDatabase(dsn, database string) (string, error) {
 	}
 	clone := cfg.Clone()
 	clone.DBName = database
+	// ADR-0153 explicit-DSN-wins preservation: FormatDSN omits any param
+	// whose cfg value equals the driver default, so an operator's explicit
+	// `interpolateParams=false` would silently VANISH from the derived DSN
+	// — and a downstream flavor-aware parse would then apply the
+	// PlanetScale/Vitess interpolation default the operator opted out of.
+	// Re-materialize the explicit false as a Params entry so FormatDSN
+	// carries it. (Explicit true survives on its own: a non-default cfg
+	// field is always emitted. Today's multi-database fan-out is
+	// vanilla-only, where no default exists — this guards the contract for
+	// any future VStream multi-database path.)
+	if dsnSetsInterpolateParams(dsn) && !clone.InterpolateParams {
+		if clone.Params == nil {
+			clone.Params = map[string]string{}
+		}
+		clone.Params["interpolateParams"] = "false"
+	}
 	return clone.FormatDSN(), nil
 }
 
@@ -503,7 +524,9 @@ func (e Engine) EnsureDatabase(ctx context.Context, dsn, database string) error 
 		return err
 	}
 	// Connect at the server level — the target database may not exist
-	// yet, so a database-scoped DSN would fail to connect.
+	// yet, so a database-scoped DSN would fail to connect. (The
+	// interpolation flavor default is immaterial on this single-DDL
+	// probe connection but applied for consistency.)
 	cfg = cfg.Clone()
 	cfg.DBName = ""
 	db, err := openDB(ctx, cfg, e.opts.sqlMode)
@@ -637,7 +660,7 @@ func (e Engine) DiscoverShards(ctx context.Context, dsn string) ([]string, error
 	if !e.Flavor.usesVStream() {
 		return nil, nil
 	}
-	cfg, err := parseDSN(dsn)
+	cfg, err := parseDSNForFlavor(dsn, e.Flavor)
 	if err != nil {
 		return nil, fmt.Errorf("mysql: discover shards: %w", err)
 	}

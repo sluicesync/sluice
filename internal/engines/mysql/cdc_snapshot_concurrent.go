@@ -150,7 +150,7 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 		return e.openBinlogSnapshotStreamShared(ctx, dsn, false)
 	}
 
-	cfg, err := parseDSN(dsn)
+	cfg, err := parseDSNForFlavor(dsn, e.Flavor)
 	if err != nil {
 		return nil, err
 	}
@@ -257,7 +257,7 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 	rows.anchorToken = position.Token
 	rows.anchorSet = true
 	rows.resnapshot = func(rctx context.Context) ([]*sql.Conn, *sql.DB, string, uint32, error) {
-		rcfg, perr := parseDSN(dsn)
+		rcfg, perr := parseDSNForFlavor(dsn, e.Flavor)
 		if perr != nil {
 			return nil, nil, "", 0, perr
 		}

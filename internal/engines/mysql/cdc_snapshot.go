@@ -77,7 +77,7 @@ func (e Engine) OpenSnapshotStreamForTables(ctx context.Context, dsn string, tab
 	// single-snapshot path below (the zero-value-safe floor, the v0.99.51
 	// trap avoided by keeping the default in the resolver chain). A malformed
 	// knob is a LOUD parse error, not a silent serial fallback.
-	cfg, err := parseDSN(dsn)
+	cfg, err := parseDSNForFlavor(dsn, e.Flavor)
 	if err != nil {
 		return nil, err
 	}
