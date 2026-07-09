@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"strings"
 	"sync"
 
@@ -525,7 +526,10 @@ func (w *RowWriter) writeBatchedConn(ctx context.Context, conn *sql.Conn, table 
 			return nil
 		}
 		query := buildBatchInsert(table, len(batch.rows))
-		args := flattenArgs(batch.rows, table)
+		args, err := flattenArgs(batch.rows, table)
+		if err != nil {
+			return fmt.Errorf("mysql: insert into %q: %w", table.Name, err)
+		}
 		// ADR-0108: ride a transient target primary-reparent / "not
 		// serving". The exec + the session-scoped SHOW WARNINGS probe BOTH
 		// run on the conn flushWithReparentRetry hands us — the originally
@@ -686,16 +690,22 @@ func buildRowPlaceholder(numCols int) string {
 // flat []any the driver expects. Values are passed through prepareValue
 // to handle the IR-Set-to-string conversion and similar adjustments.
 // Generated columns are skipped so the column-list and value-list
-// stay in lockstep with buildBatchInsert.
-func flattenArgs(batch []ir.Row, table *ir.Table) []any {
+// stay in lockstep with buildBatchInsert. A prepareValue refusal (the
+// SLUICE-E-VALUE-UNREPRESENTABLE float guard) surfaces here naming the
+// offending row's position in the batch.
+func flattenArgs(batch []ir.Row, table *ir.Table) ([]any, error) {
 	cols := nonGeneratedColumns(table.Columns)
 	args := make([]any, 0, len(batch)*len(cols))
-	for _, row := range batch {
+	for i, row := range batch {
 		for _, col := range cols {
-			args = append(args, prepareValue(row[col.Name], col))
+			v, err := prepareValue(row[col.Name], col)
+			if err != nil {
+				return nil, fmt.Errorf("row %d of batch: %w", i+1, err)
+			}
+			args = append(args, v)
 		}
 	}
-	return args
+	return args, nil
 }
 
 // prepareValue adjusts a Row value to a form the driver accepts.
@@ -734,12 +744,20 @@ func flattenArgs(batch []ir.Row, table *ir.Table) []any {
 // tolerated: the value passes through unchanged, matching the
 // pre-Bug-6 fallback shape and keeping defensive applier callers
 // safe.
-func prepareValue(v any, col *ir.Column) any {
+//
+// The error return is the SLUICE-E-VALUE-UNREPRESENTABLE refusal
+// ([refuseUnrepresentableFloat]) — the one value class MySQL cannot hold
+// under ANY statement protocol. It fires before the driver ever sees the
+// value; every other branch is infallible.
+func prepareValue(v any, col *ir.Column) (any, error) {
+	if err := refuseUnrepresentableFloat(v, col); err != nil {
+		return nil, err
+	}
 	if v == nil {
-		return nil
+		return nil, nil
 	}
 	if col == nil {
-		return v
+		return v, nil
 	}
 	t := col.Type
 	// Bug 122 (v0.95.3): an ir.Domain column in the schema unwraps to
@@ -752,7 +770,7 @@ func prepareValue(v any, col *ir.Column) any {
 	// reaches its existing case.
 	if dom, isDomain := t.(ir.Domain); isDomain {
 		if dom.BaseType == nil {
-			return v
+			return v, nil
 		}
 		baseCol := *col
 		baseCol.Type = dom.BaseType
@@ -760,7 +778,25 @@ func prepareValue(v any, col *ir.Column) any {
 	}
 	if _, isSet := t.(ir.Set); isSet {
 		if ss, ok := v.([]string); ok {
-			return strings.Join(ss, ",")
+			return strings.Join(ss, ","), nil
+		}
+	}
+	// ADR-0153 named wart — the negative-zero literal mangle. MySQL's SQL
+	// parser reads the literal `-0` as unary minus applied to an unsigned
+	// zero, which evaluates to PLAIN +0 — so client-side interpolation
+	// (which renders a float64 -0.0 arg as the literal -0) silently drops
+	// the IEEE sign bit that the binary protocol's raw bits preserve. That
+	// is a per-value silent divergence between the two statement protocols
+	// (caught by the Phase-1 family matrix of the N-15a flip). Encoding
+	// negative zero as the STRING '-0' routes it through MySQL's
+	// string→double DATA CONVERSION instead of the expression parser,
+	// which preserves the sign — identically on BOTH protocols, keeping
+	// them byte-exact. Pinned by
+	// TestInterpolation_BulkWrite_FamilyMatrix_ByteExact and
+	// TestInterpolation_CDCApply_FamilyMatrix_ByteExact.
+	if _, isFloat := t.(ir.Float); isFloat {
+		if f, ok := v.(float64); ok && f == 0 && math.Signbit(f) {
+			return "-0", nil
 		}
 	}
 	// MySQL has no native array type, so emitColumnType (ddl_emit.go)
@@ -776,10 +812,10 @@ func prepareValue(v any, col *ir.Column) any {
 	_, isArray := t.(ir.Array)
 	if isJSON || isArray {
 		if converted, ok := convertArrayLikeToJSON(v, col); ok {
-			return converted
+			return converted, nil
 		}
 		if b, ok := v.([]byte); ok {
-			return string(b)
+			return string(b), nil
 		}
 	}
 	// catalog Bug 71: a PG `timetz` (ir.Time{WithTimeZone:true}) value
@@ -792,10 +828,10 @@ func prepareValue(v any, col *ir.Column) any {
 	// (WithTimeZone:false) is untouched.
 	if tt, isTime := t.(ir.Time); isTime && tt.WithTimeZone {
 		if s, ok := v.(string); ok {
-			return stripTimeZoneOffset(s)
+			return stripTimeZoneOffset(s), nil
 		}
 		if b, ok := v.([]byte); ok {
-			return stripTimeZoneOffset(string(b))
+			return stripTimeZoneOffset(string(b)), nil
 		}
 	}
 	// task #72 / Bug-74 family pin: cross-engine trigger-CDC temporal
@@ -816,10 +852,10 @@ func prepareValue(v any, col *ir.Column) any {
 	switch t.(type) {
 	case ir.Timestamp, ir.DateTime:
 		if s, ok := v.(string); ok {
-			return stripTimeZoneOffset(s)
+			return stripTimeZoneOffset(s), nil
 		}
 		if b, ok := v.([]byte); ok {
-			return stripTimeZoneOffset(string(b))
+			return stripTimeZoneOffset(string(b)), nil
 		}
 	}
 	// task #72 / Bug-74 family pin: cross-engine trigger-CDC bytea values.
@@ -836,7 +872,7 @@ func prepareValue(v any, col *ir.Column) any {
 	case ir.Binary, ir.Varbinary, ir.Blob:
 		if s, ok := v.(string); ok {
 			if b, decoded := decodeHexByteaText(s); decoded {
-				return b
+				return b, nil
 			}
 		}
 	}
@@ -851,7 +887,7 @@ func prepareValue(v any, col *ir.Column) any {
 			out[2] = byte(srid >> 16)
 			out[3] = byte(srid >> 24)
 			copy(out[4:], b)
-			return out
+			return out, nil
 		}
 	}
 	// ADR-0032: PG extension passthrough types. The MySQL writer's
@@ -869,11 +905,11 @@ func prepareValue(v any, col *ir.Column) any {
 	if ext, isExt := t.(ir.ExtensionType); isExt {
 		switch ext.Extension {
 		case "hstore":
-			return prepareHstoreToJSON(v)
+			return prepareHstoreToJSON(v), nil
 		case "citext":
 			// Identity — string passes through.
 			if b, ok := v.([]byte); ok {
-				return string(b)
+				return string(b), nil
 			}
 		}
 	}
@@ -891,11 +927,41 @@ func prepareValue(v any, col *ir.Column) any {
 	if _, isBit := t.(ir.Bit); isBit {
 		if s, ok := v.(string); ok {
 			if n, err := ir.BitStringToUint64(s); err == nil {
-				return n
+				return n, nil
 			}
 		}
 	}
-	return v
+	return v, nil
+}
+
+// refuseUnrepresentableFloat is the SLUICE-E-VALUE-UNREPRESENTABLE guard
+// (ADR-0153): MySQL FLOAT/DOUBLE cannot hold NaN or ±Inf under ANY statement
+// protocol, and the two protocols fail in DIFFERENT downstream shapes — the
+// binary protocol's IEEE bits draw a terminal server error, but client-side
+// interpolation renders the literal `NaN`, which MySQL rejects as Error 1054
+// ER_BAD_FIELD_ERROR ("Unknown column 'NaN'"), the SAME code the applier's
+// schema-drift self-healing (Bug F8) deliberately classifies as RETRIABLE —
+// so an unguarded NaN would spin the cold-copy reparent-retry window (~30
+// min) or a CDC sync's drift backoff FOREVER instead of failing loudly.
+// (PG DOUBLE PRECISION legitimately carries NaN/Infinity, so a PG→MySQL run
+// can absolutely feed one in.) Refusing HERE, before the driver sees the
+// value, makes both protocols fail identically, immediately, naming the
+// column and the remedy.
+func refuseUnrepresentableFloat(v any, col *ir.Column) error {
+	f, ok := v.(float64)
+	if !ok || (!math.IsNaN(f) && !math.IsInf(f, 0)) {
+		return nil
+	}
+	colName := "(unknown column)"
+	if col != nil {
+		colName = col.Name
+	}
+	return fmt.Errorf(
+		"SLUICE-E-VALUE-UNREPRESENTABLE: column %q carries %v, which MySQL FLOAT/DOUBLE cannot represent "+
+			"(MySQL has no NaN/Infinity); refusing loudly rather than corrupting the value or retry-looping on the "+
+			"server's misleading error — filter or transform the source value (e.g. NULLIF / CASE on the source query)",
+		colName, f,
+	)
 }
 
 // stripTimeZoneOffset removes a trailing timezone offset from a PG

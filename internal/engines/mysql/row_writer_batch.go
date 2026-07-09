@@ -339,7 +339,10 @@ func (w *RowWriter) writeBatchedIdempotentConn(ctx context.Context, conn *sql.Co
 			return nil
 		}
 		query := buildBatchUpsert(table, len(batch.rows), keyCols)
-		args := flattenArgs(batch.rows, table)
+		args, err := flattenArgs(batch.rows, table)
+		if err != nil {
+			return fmt.Errorf("mysql: idempotent insert into %q: %w", table.Name, err)
+		}
 		// ADR-0108: ride a transient target primary-reparent / "not
 		// serving". The exec + the session-scoped SHOW WARNINGS probe BOTH
 		// run on the conn flushWithReparentRetry hands us — the originally

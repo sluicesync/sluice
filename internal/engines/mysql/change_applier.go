@@ -1470,10 +1470,11 @@ func placeholderFor(colTypes map[string]*ir.Column, colName string) string {
 // to prepareValue (for future IR types) are automatically picked up
 // by the applier without touching this file.
 //
-// The error return is always nil today (MySQL's prepareValue is
-// infallible) — it is the PG-applier signature convergence (repo-audit
-// M2.1), reserved so a future refusing value rule propagates loudly
-// through the builders without a signature change.
+// The error return (the PG-applier signature convergence, repo-audit M2.1)
+// carries prepareValue's SLUICE-E-VALUE-UNREPRESENTABLE refusal (ADR-0153:
+// NaN/±Inf float64, which MySQL cannot hold and whose server-side error
+// shape under interpolation collides with the Bug-F8 schema-drift retry) —
+// it propagates loudly through the builders.
 func prepareApplierValue(v any, colTypes map[string]*ir.Column, colName string) (any, error) {
 	if colTypes == nil {
 		return v, nil
@@ -1482,7 +1483,7 @@ func prepareApplierValue(v any, colTypes map[string]*ir.Column, colName string) 
 	if !ok || col == nil {
 		return v, nil
 	}
-	return prepareValue(v, col), nil
+	return prepareValue(v, col)
 }
 
 // (sortedKeys is shared with the schema reader — see schema_reader.go

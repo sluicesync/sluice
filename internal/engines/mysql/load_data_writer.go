@@ -450,8 +450,10 @@ func encodeRowsTSV(ctx context.Context, w io.Writer, cols []*ir.Column, rows <-c
 						continue
 					}
 				}
-				v := prepareValue(raw, c)
-				var err error
+				v, err := prepareValue(raw, c)
+				if err != nil {
+					return err
+				}
 				buf, err = tsvEncode(buf, v)
 				if err != nil {
 					return err

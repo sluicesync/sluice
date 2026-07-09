@@ -5,7 +5,9 @@ package mysql
 
 import (
 	"encoding/json"
+	"math"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -80,7 +82,7 @@ func TestFlattenArgs(t *testing.T) {
 		{"a": int64(1), "b": "first"},
 		{"a": int64(2), "b": "second"},
 	}
-	got := flattenArgs(batch, table)
+	got := mustFlattenArgs(t, batch, table)
 	want := []any{int64(1), "first", int64(2), "second"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("flattenArgs:\n got  %#v\n want %#v", got, want)
@@ -101,7 +103,7 @@ func TestFlattenArgsMissingValueIsNil(t *testing.T) {
 	batch := []ir.Row{
 		{"a": int64(1)}, // b is omitted
 	}
-	got := flattenArgs(batch, table)
+	got := mustFlattenArgs(t, batch, table)
 	want := []any{int64(1), nil}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("flattenArgs (missing value):\n got  %#v\n want %#v", got, want)
@@ -273,7 +275,7 @@ func TestPrepareValue(t *testing.T) {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
 			col := &ir.Column{Name: "c", Type: c.t, SourceColumnType: c.src}
-			got := prepareValue(c.in, col)
+			got := mustPrepareValue(t, c.in, col)
 			if !reflect.DeepEqual(got, c.want) {
 				t.Errorf("prepareValue(%#v, %T) = %#v; want %#v", c.in, c.t, got, c.want)
 			}
@@ -288,7 +290,7 @@ func TestPrepareValue(t *testing.T) {
 // re-shaped.
 func TestPrepareValue_PGArrayLiteralOnNonJSONPassesThrough(t *testing.T) {
 	col := &ir.Column{Name: "c", Type: ir.Text{Size: ir.TextLong}}
-	got := prepareValue("{a,b,c}", col)
+	got := mustPrepareValue(t, "{a,b,c}", col)
 	if got != "{a,b,c}" {
 		t.Errorf("prepareValue text-target: got %#v; want \"{a,b,c}\"", got)
 	}
@@ -301,7 +303,7 @@ func TestPrepareValue_PGArrayLiteralOnNonJSONPassesThrough(t *testing.T) {
 func TestPrepareValue_AnySliceOnNonJSONPassesThrough(t *testing.T) {
 	in := []any{int64(1), int64(2)}
 	col := &ir.Column{Name: "c", Type: ir.Varchar{Length: 32}}
-	got := prepareValue(in, col)
+	got := mustPrepareValue(t, in, col)
 	if !reflect.DeepEqual(got, in) {
 		t.Errorf("prepareValue varchar-target: got %#v; want %#v", got, in)
 	}
@@ -391,7 +393,7 @@ func TestPrepareValue_PGArrayColumnToJSON(t *testing.T) {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
 			col := &ir.Column{Name: "c", Type: c.t}
-			got := prepareValue(c.in, col)
+			got := mustPrepareValue(t, c.in, col)
 			if !reflect.DeepEqual(got, c.want) {
 				t.Errorf("prepareValue(%#v, %s) = %#v; want %#v", c.in, c.t, got, c.want)
 			}
@@ -529,7 +531,7 @@ func TestPrepareValue_PGTriggerCDCValueFamilies(t *testing.T) {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
 			col := &ir.Column{Name: "c", Type: c.t}
-			got := prepareValue(c.in, col)
+			got := mustPrepareValue(t, c.in, col)
 			if !reflect.DeepEqual(got, c.want) {
 				t.Errorf("prepareValue(%#v, %T) = %#v (%T); want %#v (%T)",
 					c.in, c.t, got, got, c.want, c.want)
@@ -625,7 +627,7 @@ func TestPrepareValue_HstoreToJSON(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			got := prepareValue(c.in, hstoreCol)
+			got := mustPrepareValue(t, c.in, hstoreCol)
 			if !reflect.DeepEqual(got, c.want) {
 				t.Errorf("prepareValue(%#v, hstore) = %#v; want %#v", c.in, got, c.want)
 			}
@@ -656,7 +658,7 @@ func TestPrepareValue_CiTextIdentity(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			got := prepareValue(c.in, citextCol)
+			got := mustPrepareValue(t, c.in, citextCol)
 			if !reflect.DeepEqual(got, c.want) {
 				t.Errorf("prepareValue(%#v, citext) = %#v; want %#v", c.in, got, c.want)
 			}
@@ -754,5 +756,66 @@ func TestParseHstoreText_Errors(t *testing.T) {
 				t.Errorf("parseHstoreText(%q) = nil; want error", in)
 			}
 		})
+	}
+}
+
+// mustPrepareValue unwraps prepareValue's error return for the shaping
+// tests above — none of their corpora trip the
+// SLUICE-E-VALUE-UNREPRESENTABLE float guard (that refusal has its own
+// pins in TestPrepareValue_RefusesNaNAndInf).
+func mustPrepareValue(t *testing.T, v any, col *ir.Column) any {
+	t.Helper()
+	got, err := prepareValue(v, col)
+	if err != nil {
+		t.Fatalf("prepareValue(%#v): unexpected refusal: %v", v, err)
+	}
+	return got
+}
+
+// mustFlattenArgs is the flattenArgs sibling of mustPrepareValue.
+func mustFlattenArgs(t *testing.T, batch []ir.Row, table *ir.Table) []any {
+	t.Helper()
+	got, err := flattenArgs(batch, table)
+	if err != nil {
+		t.Fatalf("flattenArgs: unexpected refusal: %v", err)
+	}
+	return got
+}
+
+// TestPrepareValue_RefusesNaNAndInf pins the SLUICE-E-VALUE-UNREPRESENTABLE
+// guard (ADR-0153): float64 NaN / ±Inf are refused by prepareValue BEFORE
+// the driver sees them — on both statement protocols the server's own
+// failure shape is misleading (interpolation renders a bare `NaN` literal
+// that draws Error 1054, the code the Bug-F8 schema-drift self-healing
+// deliberately RETRIES — an unguarded NaN would spin the retry window
+// instead of failing loudly). The refusal names the column and the code.
+func TestPrepareValue_RefusesNaNAndInf(t *testing.T) {
+	col := &ir.Column{Name: "dbl", Type: ir.Float{Precision: ir.FloatDouble}}
+	for _, v := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		if _, err := prepareValue(v, col); err == nil {
+			t.Errorf("prepareValue(%v) = nil error; want SLUICE-E-VALUE-UNREPRESENTABLE refusal", v)
+		} else {
+			if !strings.Contains(err.Error(), "SLUICE-E-VALUE-UNREPRESENTABLE") || !strings.Contains(err.Error(), `"dbl"`) {
+				t.Errorf("prepareValue(%v) error %q; want the SLUICE-E-VALUE-UNREPRESENTABLE code naming column dbl", v, err)
+			}
+		}
+		// The guard fires even with a nil column descriptor (defensive
+		// applier path) — the value is unrepresentable regardless.
+		if _, err := prepareValue(v, nil); err == nil {
+			t.Errorf("prepareValue(%v, nil col) = nil error; want refusal", v)
+		}
+		// And through flattenArgs, naming the batch row.
+		table := &ir.Table{Name: "t", Columns: []*ir.Column{col}}
+		if _, err := flattenArgs([]ir.Row{{"dbl": 1.5}, {"dbl": v}}, table); err == nil {
+			t.Errorf("flattenArgs with %v = nil error; want refusal", v)
+		} else if !strings.Contains(err.Error(), "row 2") {
+			t.Errorf("flattenArgs refusal %q; want it to name row 2 of the batch", err)
+		}
+	}
+	// Ordinary extremes pass: the guard is NaN/Inf-only.
+	for _, v := range []float64{math.MaxFloat64, -math.MaxFloat64, math.SmallestNonzeroFloat64, math.Copysign(0, -1)} {
+		if _, err := prepareValue(v, col); err != nil {
+			t.Errorf("prepareValue(%v) refused a representable float: %v", v, err)
+		}
 	}
 }
