@@ -221,6 +221,12 @@ func parseDSN(dsn string) (*mysql.Config, error) {
 	if cfg.DBName == "" {
 		return nil, errors.New("mysql: DSN must include a database name")
 	}
+	// ADR-0153: the driver polices interpolation × unsafe COLLATION at
+	// ParseDSN but ignores the charset= param; sluice refuses the
+	// explicit unsafe-charset combination here, for every connection path.
+	if err := refuseExplicitInterpolationUnsafeCharset(cfg, dsn); err != nil {
+		return nil, err
+	}
 	return finishParseDSN(cfg), nil
 }
 
@@ -245,6 +251,11 @@ func parseServerDSN(dsn string) (*mysql.Config, error) {
 			return nil, fmt.Errorf("mysql: invalid DSN: %s%s", dsnShapeHint(dsn), msg[len(dupPrefix):])
 		}
 		return nil, fmt.Errorf("mysql: invalid DSN: %s%w", dsnShapeHint(dsn), err)
+	}
+	// ADR-0153: same explicit interpolation × unsafe-charset refusal as
+	// [parseDSN] — the server-DSN paths open real connections too.
+	if err := refuseExplicitInterpolationUnsafeCharset(cfg, dsn); err != nil {
+		return nil, err
 	}
 	return finishParseDSN(cfg), nil
 }
@@ -419,13 +430,22 @@ func applyFlavorInterpolationDefault(cfg *mysql.Config, rawDSN string, flavor Fl
 	if !flavor.usesVStream() || dsnSetsInterpolateParams(rawDSN) {
 		return
 	}
-	if interpolationUnsafeCollations[cfg.Collation] {
+	unsafeName := cfg.Collation
+	unsafe := interpolationUnsafeCollations[cfg.Collation]
+	if !unsafe {
+		// The driver's own denylist checks only the collation; the
+		// charset= param (its unexported cfg.charsets → SET NAMES) is
+		// the same injection hazard through a hole the driver does not
+		// police — see [interpolationUnsafeCharsets].
+		unsafeName, unsafe = dsnUnsafeInterpolationCharset(rawDSN)
+	}
+	if unsafe {
 		slog.Warn(
-			"mysql: skipping the PlanetScale/Vitess client-side-interpolation default: the DSN's collation "+
-				"is unsafe for interpolation (go-sql-driver denylist: multibyte encodings that can carry 0x5C "+
-				"in trailing bytes); staying on the binary protocol. Use a *_general_ci / utf8mb4 collation to "+
+			"mysql: skipping the PlanetScale/Vitess client-side-interpolation default: the DSN's collation/charset "+
+				"is unsafe for interpolation (go-sql-driver denylist class: multibyte encodings that can carry 0x5C "+
+				"in trailing bytes); staying on the binary protocol. Use a *_general_ci / utf8mb4 collation+charset to "+
 				"regain the 1-RTT write path, or set interpolateParams=false in the DSN to silence this warning",
-			slog.String("collation", cfg.Collation),
+			slog.String("collation_or_charset", unsafeName),
 			slog.String("flavor", flavor.String()),
 		)
 		return
@@ -443,27 +463,104 @@ func noteInterpolationResolved(source string) {
 }
 
 // dsnSetsInterpolateParams reports whether the raw DSN string explicitly
-// carries an `interpolateParams=` parameter. It mirrors the driver's own DSN
-// anatomy — everything after the LAST '/' is `dbname?params` (addresses and
-// passwords may legally contain '/' and '?', which is why a substring search
-// over the whole DSN would be wrong) — and the driver's param split (a
-// segment without '=' is ignored by ParseDSN, so it is not explicit).
+// carries an `interpolateParams=` parameter. See [dsnParamValue] for the
+// DSN-anatomy discipline; a segment without '=' is ignored by ParseDSN, so
+// it is not explicit.
 func dsnSetsInterpolateParams(dsn string) bool {
+	_, ok := dsnParamValue(dsn, "interpolateParams")
+	return ok
+}
+
+// dsnParamValue returns the raw value of the named parameter from a DSN's
+// query section, and whether the key was present at all. It mirrors the
+// driver's own DSN anatomy — everything after the LAST '/' is
+// `dbname?params` (addresses and passwords may legally contain '/' and '?',
+// which is why a substring search over the whole DSN would be wrong) — and
+// the driver's param split (segments without '=' are skipped, exact
+// case-sensitive key match). Needed because ParseDSN consumes recognised
+// params into Config fields, some of them UNEXPORTED (cfg.charsets) or
+// explicitness-collapsing (cfg.InterpolateParams).
+func dsnParamValue(dsn, key string) (string, bool) {
 	slash := strings.LastIndexByte(dsn, '/')
 	if slash < 0 {
-		return false
+		return "", false
 	}
 	rest := dsn[slash+1:]
 	q := strings.IndexByte(rest, '?')
 	if q < 0 {
-		return false
+		return "", false
 	}
 	for _, seg := range strings.Split(rest[q+1:], "&") {
-		if key, _, ok := strings.Cut(seg, "="); ok && key == "interpolateParams" {
-			return true
+		if k, v, ok := strings.Cut(seg, "="); ok && k == key {
+			return v, true
 		}
 	}
-	return false
+	return "", false
+}
+
+// interpolationUnsafeCharsets is the CHARSET-family counterpart of
+// [interpolationUnsafeCollations]: the multibyte connection charsets whose
+// trailing bytes may carry 0x5C, making backslash-escaping interpolation
+// injection-unsafe. go-sql-driver's own refusal (Config.normalize,
+// v1.10.0 dsn.go:173) checks ONLY cfg.Collation and entirely ignores the
+// separate `charset=` DSN param (its unexported cfg.charsets, which drive
+// the connection's SET NAMES) — so `...?charset=gbk` sails through the
+// driver with interpolation on. sluice closes that hole for its own
+// connections: the flavor default steps aside on any unsafe entry, and an
+// EXPLICIT interpolateParams=true + unsafe charset is refused at parse
+// ([refuseExplicitInterpolationUnsafeCharset]), matching the loud posture
+// the driver itself applies to the collation shape.
+var interpolationUnsafeCharsets = map[string]bool{
+	"big5":    true,
+	"cp932":   true,
+	"gb2312":  true,
+	"gbk":     true,
+	"sjis":    true,
+	"gb18030": true,
+}
+
+// dsnUnsafeInterpolationCharset reports the first entry of the DSN's
+// `charset=` list (the driver's SET NAMES candidates, tried in order until
+// one succeeds) that is interpolation-unsafe. ANY unsafe entry disqualifies:
+// which candidate wins depends on the server's charset support at connect
+// time, so the connection charset cannot be assumed safe if an unsafe one
+// is in the list.
+func dsnUnsafeInterpolationCharset(dsn string) (string, bool) {
+	raw, ok := dsnParamValue(dsn, "charset")
+	if !ok {
+		return "", false
+	}
+	for _, cs := range strings.Split(raw, ",") {
+		if interpolationUnsafeCharsets[strings.ToLower(strings.TrimSpace(cs))] {
+			return cs, true
+		}
+	}
+	return "", false
+}
+
+// refuseExplicitInterpolationUnsafeCharset is the parse-time loud refusal
+// for the operator-explicit combination the DRIVER fails to police:
+// interpolateParams=true together with an injection-unsafe `charset=` entry
+// (the driver refuses the equivalent COLLATION combination at ParseDSN but
+// ignores charset= — see [interpolationUnsafeCharsets]). Called from
+// [parseDSN]/[parseServerDSN] so EVERY connection path is covered,
+// mirroring where the driver's own collation refusal lives. The flavor
+// DEFAULT never reaches this: it steps aside with a WARN instead
+// ([applyFlavorInterpolationDefault]).
+func refuseExplicitInterpolationUnsafeCharset(cfg *mysql.Config, dsn string) error {
+	if !cfg.InterpolateParams {
+		return nil
+	}
+	cs, unsafe := dsnUnsafeInterpolationCharset(dsn)
+	if !unsafe {
+		return nil
+	}
+	return fmt.Errorf(
+		"mysql: invalid DSN: interpolateParams=true cannot be combined with connection charset %q "+
+			"(a multibyte encoding whose trailing bytes may carry 0x5C — injection-unsafe for client-side "+
+			"interpolation, the same class the driver refuses for collations); remove interpolateParams "+
+			"or use a safe charset such as utf8mb4", cs,
+	)
 }
 
 // sourceReadSessionTimeoutSeconds is the bounded value sluice applies to

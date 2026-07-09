@@ -206,3 +206,69 @@ func TestWithDatabase_PreservesExplicitInterpolateFalse(t *testing.T) {
 		t.Errorf("derived DSN %q grew an interpolateParams param the operator never set", derived)
 	}
 }
+
+// TestInterpolationDefault_UnsafeCharsetSkipsDefault is the CHARSET-family
+// counterpart of TestInterpolationDefault_UnsafeCollationSkipsDefault
+// (value-fidelity review MUST-FIX 1): the driver's own unsafe check reads
+// ONLY cfg.Collation and ignores the `charset=` param entirely (v1.10.0
+// dsn.go:173), so without sluice's own charset check the flavor default
+// would flip interpolation ON over an injection-unsafe SET NAMES
+// connection — a DSN that was safe on every release before ADR-0153. ANY
+// unsafe entry in the fallback list disqualifies (which candidate wins
+// depends on the server at connect time).
+func TestInterpolationDefault_UnsafeCharsetSkipsDefault(t *testing.T) {
+	cases := []string{
+		"user:pw@tcp(db.example.com:3306)/appdb?charset=gbk",
+		"user:pw@tcp(db.example.com:3306)/appdb?charset=gbk,utf8mb4",
+		"user:pw@tcp(db.example.com:3306)/appdb?charset=utf8mb4,sjis",
+		"user:pw@tcp(db.example.com:3306)/appdb?charset=GB18030", // case-folded
+	}
+	for _, dsn := range cases {
+		cfg, err := parseDSNForFlavor(dsn, FlavorPlanetScale)
+		if err != nil {
+			t.Errorf("%q: parse error: %v", dsn, err)
+			continue
+		}
+		if cfg.InterpolateParams {
+			t.Errorf("%q: InterpolateParams = true; the flavor default must step aside for an unsafe connection charset", dsn)
+		}
+	}
+
+	// A fully-safe charset list keeps the default.
+	cfg, err := parseDSNForFlavor("user:pw@tcp(db.example.com:3306)/appdb?charset=utf8mb4,utf8", FlavorPlanetScale)
+	if err != nil {
+		t.Fatalf("safe charset parse: %v", err)
+	}
+	if !cfg.InterpolateParams {
+		t.Error("safe charset list: InterpolateParams = false; the flavor default should apply")
+	}
+}
+
+// TestInterpolationDefault_ExplicitTrueUnsafeCharset_RefusedBySluice pins
+// the explicit combination the DRIVER fails to police (it refuses the
+// collation shape but ignores charset=): sluice refuses at parse, on every
+// flavor and on the server-DSN sibling, matching the collation posture.
+func TestInterpolationDefault_ExplicitTrueUnsafeCharset_RefusedBySluice(t *testing.T) {
+	dsn := "user:pw@tcp(db.example.com:3306)/appdb?charset=gbk&interpolateParams=true"
+	for _, flavor := range []Flavor{FlavorVanilla, FlavorPlanetScale, FlavorVitess} {
+		_, err := parseDSNForFlavor(dsn, flavor)
+		if err == nil {
+			t.Fatalf("%s: explicit interpolateParams=true + unsafe charset parsed clean; want the loud refusal", flavor)
+		}
+		if !strings.Contains(err.Error(), "injection-unsafe") || !strings.Contains(err.Error(), "gbk") {
+			t.Errorf("%s: refusal %q; want it to name the charset and the injection hazard", flavor, err)
+		}
+	}
+	// The package-level parses refuse too — every connection path is
+	// covered, not just the flavor-aware ones.
+	if _, err := parseDSN(dsn); err == nil {
+		t.Error("parseDSN: explicit interpolateParams=true + unsafe charset parsed clean; want refusal")
+	}
+	if _, err := parseServerDSN("user:pw@tcp(db.example.com:3306)/?charset=cp932,utf8mb4&interpolateParams=true"); err == nil {
+		t.Error("parseServerDSN: explicit interpolateParams=true + unsafe charset parsed clean; want refusal")
+	}
+	// Explicit FALSE + unsafe charset is fine — binary protocol, no hazard.
+	if _, err := parseDSN("user:pw@tcp(db.example.com:3306)/appdb?charset=gbk&interpolateParams=false"); err != nil {
+		t.Errorf("explicit false + unsafe charset should parse clean: %v", err)
+	}
+}

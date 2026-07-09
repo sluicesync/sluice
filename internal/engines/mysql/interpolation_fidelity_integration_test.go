@@ -54,6 +54,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -77,6 +78,7 @@ func interpFidelityDDL(table string) string {
 			dec206  DECIMAL(20,6) NULL,
 			dec6530 DECIMAL(65,30) NULL,
 			dbl     DOUBLE NULL,
+			fl      FLOAT NULL,
 			vb      VARBINARY(255) NULL,
 			bl      BLOB NULL,
 			vc      VARCHAR(255) NULL,
@@ -124,8 +126,8 @@ func mkInterpFidelityRows() []ir.Row {
 	nullRow := func(id int64) ir.Row {
 		return ir.Row{
 			"id": id, "dt6": nil, "ts6": nil, "dcol": nil, "tm6": nil, "yr": nil,
-			"dec206": nil, "dec6530": nil, "dbl": nil, "vb": nil, "bl": nil,
-			"vc": nil, "bi": nil, "ubi": nil, "flag": nil, "js": nil,
+			"dec206": nil, "dec6530": nil, "dbl": nil, "fl": nil, "vb": nil,
+			"bl": nil, "vc": nil, "bi": nil, "ubi": nil, "flag": nil, "js": nil,
 			"b1": nil, "b8": nil, "b64": nil, "st": nil, "en": nil, "geo": nil,
 		}
 	}
@@ -172,15 +174,19 @@ func mkInterpFidelityRows() []ir.Row {
 		}),
 		with(6, ir.Row{"dec206": "-99999999999999.999999", "dec6530": "-0." + strings.Repeat("0", 29) + "1"}),
 		with(7, ir.Row{"dec206": "0.000001", "dec6530": "0." + strings.Repeat("0", 30)}),
-		// DOUBLE extremes: ±max, smallest denormal, smallest normal,
-		// negative zero, mid-range exponents.
-		with(8, ir.Row{"dbl": math.MaxFloat64}),
-		with(9, ir.Row{"dbl": -math.MaxFloat64}),
-		with(10, ir.Row{"dbl": math.SmallestNonzeroFloat64}),
-		with(11, ir.Row{"dbl": 2.2250738585072014e-308}),
-		with(12, ir.Row{"dbl": math.Copysign(0, -1)}),
-		with(13, ir.Row{"dbl": 1e300}),
-		with(14, ir.Row{"dbl": -1e-300}),
+		// DOUBLE + FLOAT extremes: ±max, smallest denormal, smallest
+		// normal, negative zero, mid-range exponents. The fl values are
+		// float32-range edges as the reader carries them (decodeFloat
+		// widens FLOAT columns to float64); the negative-zero wart in
+		// prepareValue fires for EVERY ir.Float precision, so FLOAT gets
+		// its own −0 leg (row 12).
+		with(8, ir.Row{"dbl": math.MaxFloat64, "fl": float64(math.MaxFloat32)}),
+		with(9, ir.Row{"dbl": -math.MaxFloat64, "fl": -float64(math.MaxFloat32)}),
+		with(10, ir.Row{"dbl": math.SmallestNonzeroFloat64, "fl": float64(math.SmallestNonzeroFloat32)}),
+		with(11, ir.Row{"dbl": 2.2250738585072014e-308, "fl": 1.1754943508222875e-38}),
+		with(12, ir.Row{"dbl": math.Copysign(0, -1), "fl": math.Copysign(0, -1)}),
+		with(13, ir.Row{"dbl": 1e300, "fl": float64(1 << 23)}),
+		with(14, ir.Row{"dbl": -1e-300, "fl": -0.5}),
 		// Binary: every octet 0x00..0xFF in BLOB; escape-relevant bytes
 		// (NUL, ', ", \, ^Z, \n, \r, high bit) in VARBINARY; empty-vs-NULL.
 		with(15, ir.Row{
@@ -220,7 +226,7 @@ func mkInterpFidelityRows() []ir.Row {
 			"ts6":  time.Date(2026, 7, 8, 1, 2, 3, 4000, time.UTC),
 			"dcol": time.Date(2026, 7, 8, 0, 0, 0, 0, time.UTC), "tm6": "01:02:03.000004",
 			"yr": int64(2026), "dec206": "12345678.900000", "dec6530": "1.5",
-			"dbl": 3.141592653589793, "vb": []byte("v\x00b"), "bl": []byte{0xde, 0xad},
+			"dbl": 3.141592653589793, "fl": 1.5, "vb": []byte("v\x00b"), "bl": []byte{0xde, 0xad},
 			"vc": "dense", "bi": int64(-42), "ubi": uint64(42), "flag": true,
 			"js": []byte(`{"k": 1}`), "b1": true, "b8": "1", "b64": "101",
 			"st": []string{"a"}, "en": "beta", "geo": pointWKB(0, 0),
@@ -279,6 +285,46 @@ func snapshotTableBytes(t *testing.T, dsn, table string) (cols []string, rows []
 		t.Fatalf("snapshot rows.Err: %v", err)
 	}
 	return cols, rows
+}
+
+// snapCell returns the named column's cell from a snapshot row.
+func snapCell(t *testing.T, cols []string, row []tableCell, col string) tableCell {
+	t.Helper()
+	for i, c := range cols {
+		if c == col {
+			return row[i]
+		}
+	}
+	t.Fatalf("column %q not in snapshot columns %v", col, cols)
+	return tableCell{}
+}
+
+// findSnapRow returns the snapshot row whose first column (the PK id, as
+// server text) equals id.
+func findSnapRow(t *testing.T, snap [][]tableCell, id string) []tableCell {
+	t.Helper()
+	for _, row := range snap {
+		if !row[0].null && string(row[0].b) == id {
+			return row
+		}
+	}
+	t.Fatalf("no snapshot row with id %s", id)
+	return nil
+}
+
+// assertStoredNegZero asserts the named float column of the given row
+// stores the ABSOLUTE server text "-0" — not merely the same bytes as the
+// other protocol's leg. The differential alone is structurally blind here:
+// both legs bind through the same prepareValue, so if the server's
+// string→double conversion ever dropped the sign, BOTH legs would store
+// "0" and still compare equal. The absolute assertion (plus the raw
+// binary-param control in the bulk test) closes that hole.
+func assertStoredNegZero(t *testing.T, label string, cols []string, row []tableCell, col string) {
+	t.Helper()
+	cell := snapCell(t, cols, row, col)
+	if cell.null || string(cell.b) != "-0" {
+		t.Errorf("%s: column %q stored %q (null=%v); want the absolute negative-zero text \"-0\"", label, col, cell.b, cell.null)
+	}
 }
 
 // compareSnapshots asserts two stored-bytes snapshots are cell-for-cell
@@ -367,6 +413,74 @@ func TestInterpolation_BulkWrite_FamilyMatrix_ByteExact(t *testing.T) {
 		t.Fatalf("control wrote %d rows; want %d", len(ctl), len(rows))
 	}
 	compareSnapshots(t, "bulk batched-INSERT", cols, ctl, itp)
+
+	// Negative zero is asserted ABSOLUTELY (stored text "-0"), on both
+	// legs and both float precisions — see assertStoredNegZero for why
+	// the differential alone cannot catch a sign drop.
+	for _, leg := range []struct {
+		name string
+		snap [][]tableCell
+	}{{"binary control", ctl}, {"interpolation", itp}} {
+		row := findSnapRow(t, leg.snap, "12")
+		assertStoredNegZero(t, "bulk "+leg.name, cols, row, "dbl")
+		assertStoredNegZero(t, "bulk "+leg.name, cols, row, "fl")
+	}
+
+	// Raw driver control: bind float64 −0.0 as a BINARY-protocol
+	// parameter through database/sql directly — no sluice value shaping,
+	// exactly the pre-ADR-0153 vanilla write path — and require sluice's
+	// stored bytes to match it. The '-0'-string wart changed the value
+	// every protocol binds (it now rides string→double conversion), so
+	// this pins that the wart is byte-equivalent to the untouched binary
+	// behavior of every release before it.
+	applyDDL(t, dsn, "CREATE TABLE negzero_raw (id BIGINT NOT NULL, dbl DOUBLE NULL, fl FLOAT NULL, PRIMARY KEY (id)) ENGINE=InnoDB;")
+	rawDB, err := sql.Open("mysql", dsn) // no interpolateParams: args → prepared/binary
+	if err != nil {
+		t.Fatalf("raw control open: %v", err)
+	}
+	defer func() { _ = rawDB.Close() }()
+	if _, err := rawDB.ExecContext(ctx, "INSERT INTO negzero_raw (id, dbl, fl) VALUES (?, ?, ?)",
+		int64(1), math.Copysign(0, -1), math.Copysign(0, -1)); err != nil {
+		t.Fatalf("raw control insert: %v", err)
+	}
+	rawCols, rawSnap := snapshotTableBytes(t, dsn, "negzero_raw")
+	rawRow := findSnapRow(t, rawSnap, "1")
+	assertStoredNegZero(t, "raw binary-param control", rawCols, rawRow, "dbl")
+	assertStoredNegZero(t, "raw binary-param control", rawCols, rawRow, "fl")
+	sluiceRow := findSnapRow(t, ctl, "12")
+	for _, col := range []string{"dbl", "fl"} {
+		if got, want := snapCell(t, cols, sluiceRow, col), snapCell(t, rawCols, rawRow, col); got.null != want.null || !bytes.Equal(got.b, want.b) {
+			t.Errorf("negative-zero %s: sluice stored %q, raw binary-param control stored %q — the '-0' wart diverged from pre-change binary behavior", col, got.b, want.b)
+		}
+	}
+}
+
+// TestInterpolation_FloatOutOfRange_BothProtocolsRefuse pins the FLOAT
+// range boundary: a float64 outside float32 range must fail LOUDLY on both
+// protocols under the strict sql_mode default (server 1264 out-of-range on
+// the narrowing conversion) — never silently clamp. The error text may
+// differ per protocol; the loud-failure contract may not.
+func TestInterpolation_FloatOutOfRange_BothProtocolsRefuse(t *testing.T) {
+	dsn, cleanup := newSharedDB(t, "interp_flrange")
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	for _, proto := range []string{"false", "true"} {
+		table := "flrange_" + proto
+		applyDDL(t, dsn, fmt.Sprintf("CREATE TABLE %s (id BIGINT NOT NULL, fl FLOAT NULL, PRIMARY KEY (id)) ENGINE=InnoDB;", table))
+		tbl := readTableIR(t, ctx, dsn, table)
+		start := time.Now()
+		err := writeRowsBatched(t, ctx, dsn+"&interpolateParams="+proto, tbl, []ir.Row{{"id": int64(1), "fl": 1e300}})
+		if err == nil {
+			_, got := snapshotTableBytes(t, dsn, table)
+			t.Errorf("interpolateParams=%s: out-of-FLOAT-range write succeeded (stored: %v); want loud refusal", proto, got)
+			continue
+		}
+		if elapsed := time.Since(start); elapsed > 10*time.Second {
+			t.Errorf("interpolateParams=%s: refusal took %s; a range error must not ride the retry window", proto, elapsed)
+		}
+	}
 }
 
 // TestInterpolation_BulkWrite_NaNInfRefusal pins the not-a-number posture on
@@ -435,8 +549,8 @@ func mkInterpCDCStream() []ir.Change {
 	base := func(id int64) ir.Row {
 		return ir.Row{
 			"id": id, "dt6": nil, "ts6": nil, "dcol": nil, "tm6": nil, "yr": nil,
-			"dec206": nil, "dec6530": nil, "dbl": nil, "vb": nil, "bl": nil,
-			"vc": nil, "bi": nil, "ubi": nil, "flag": nil, "js": nil,
+			"dec206": nil, "dec6530": nil, "dbl": nil, "fl": nil, "vb": nil,
+			"bl": nil, "vc": nil, "bi": nil, "ubi": nil, "flag": nil, "js": nil,
 			"b1": nil, "b8": nil, "b64": nil, "st": nil, "en": nil, "geo": nil,
 		}
 	}
@@ -452,9 +566,9 @@ func mkInterpCDCStream() []ir.Change {
 	ins(with(1, ir.Row{"dt6": "9999-12-31 23:59:59.999999", "ts6": "2038-01-19 03:14:07.999999", "dcol": "2024-02-29", "tm6": "838:59:59.000000", "yr": int64(2155)}))
 	ins(with(2, ir.Row{"dt6": "1000-01-01 00:00:00.000000", "ts6": "1970-01-01 00:00:01.000001", "tm6": "-838:59:59.000000", "yr": int64(1901)}))
 	ins(with(3, ir.Row{"dec206": "-99999999999999.999999", "dec6530": strings.Repeat("9", 35) + "." + strings.Repeat("9", 30)}))
-	ins(with(4, ir.Row{"dbl": math.MaxFloat64, "bi": int64(math.MinInt64), "ubi": uint64(math.MaxUint64), "flag": false}))
-	ins(with(5, ir.Row{"dbl": math.SmallestNonzeroFloat64}))
-	ins(with(6, ir.Row{"dbl": math.Copysign(0, -1)}))
+	ins(with(4, ir.Row{"dbl": math.MaxFloat64, "fl": float64(math.MaxFloat32), "bi": int64(math.MinInt64), "ubi": uint64(math.MaxUint64), "flag": false}))
+	ins(with(5, ir.Row{"dbl": math.SmallestNonzeroFloat64, "fl": float64(math.SmallestNonzeroFloat32)}))
+	ins(with(6, ir.Row{"dbl": math.Copysign(0, -1), "fl": math.Copysign(0, -1)}))
 	ins(with(7, ir.Row{"vb": []byte{0x00, 0x27, 0x5c, 0x22, 0x1a, 0x0a, 0x80, 0xff}, "bl": allBytes()}))
 	ins(with(8, ir.Row{"vc": "🐘 'q' \"dq\" \\b\\ \nnl 中文", "js": `{"a\\b": "c\"d", "e": [1, null]}`}))
 	ins(with(9, ir.Row{"js": []byte(`{"emoji": "🚀", "n": -0.5}`)}))
@@ -529,6 +643,69 @@ func TestInterpolation_CDCApply_FamilyMatrix_ByteExact(t *testing.T) {
 		t.Fatal("control pass applied no rows")
 	}
 	compareSnapshots(t, "CDC coalesced apply", cols, ctl, itp)
+
+	// Negative zero asserted ABSOLUTELY on the CDC path too (row id 6
+	// carries −0.0 in both float precisions) — same structural-blindness
+	// rationale as the bulk matrix (see assertStoredNegZero).
+	for _, leg := range []struct {
+		name string
+		snap [][]tableCell
+	}{{"binary control", ctl}, {"interpolation", itp}} {
+		row := findSnapRow(t, leg.snap, "6")
+		assertStoredNegZero(t, "CDC "+leg.name, cols, row, "dbl")
+		assertStoredNegZero(t, "CDC "+leg.name, cols, row, "fl")
+	}
+}
+
+// TestInterpolation_ApplierNaN_RefusedNoRetry pins the SLUICE-E-VALUE-
+// UNREPRESENTABLE guard at the APPLIER layer — the layer the Bug-F8
+// collision actually threatens: an interpolated `NaN` literal draws Error
+// 1054, which the applier's schema-drift self-healing deliberately
+// classifies RETRIABLE, so an unguarded NaN would put a CDC sync into a
+// perpetual "waiting for the operator to add the column" backoff. The
+// refusal must surface from ApplyBatch immediately (no server round trip,
+// no retry ride), identically on both protocols.
+func TestInterpolation_ApplierNaN_RefusedNoRetry(t *testing.T) {
+	for _, proto := range []string{"false", "true"} {
+		dsn, cleanup := startMySQLForApplier(t)
+		defer cleanup()
+		applyMySQLApplier(t, dsn, "CREATE TABLE nan_apply (id BIGINT NOT NULL, dbl DOUBLE NULL, PRIMARY KEY (id)) ENGINE=InnoDB;")
+
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		a, err := Engine{Flavor: FlavorPlanetScale}.OpenChangeApplier(ctx, dsn+"&interpolateParams="+proto)
+		if err != nil {
+			t.Fatalf("OpenChangeApplier(%s): %v", proto, err)
+		}
+		defer closeApplier(a)
+		if err := a.EnsureControlTable(ctx); err != nil {
+			t.Fatalf("EnsureControlTable: %v", err)
+		}
+		batched := a.(ir.BatchedChangeApplier)
+
+		ch := make(chan ir.Change, 1)
+		ch <- ir.Insert{
+			Position: ir.Position{Engine: engineNameMySQL, Token: "nan-1"},
+			Schema:   "target_db", Table: "nan_apply",
+			Row: ir.Row{"id": int64(1), "dbl": math.NaN()},
+		}
+		close(ch)
+		start := time.Now()
+		err = batched.ApplyBatch(ctx, "interp-nan", ch, 10)
+		if err == nil {
+			t.Fatalf("interpolateParams=%s: ApplyBatch(NaN) succeeded; want the SLUICE-E-VALUE-UNREPRESENTABLE refusal", proto)
+		}
+		if !strings.Contains(err.Error(), "SLUICE-E-VALUE-UNREPRESENTABLE") {
+			t.Errorf("interpolateParams=%s: ApplyBatch(NaN) error %q; want the SLUICE-E-VALUE-UNREPRESENTABLE guard, not a server-side error", proto, err)
+		}
+		var re ir.RetriableError
+		if errors.As(err, &re) && re.Retriable() {
+			t.Errorf("interpolateParams=%s: the NaN refusal classified RETRIABLE — the Bug-F8 drift backoff would ride it forever", proto)
+		}
+		if elapsed := time.Since(start); elapsed > 10*time.Second {
+			t.Errorf("interpolateParams=%s: refusal took %s; want immediate (no retry ride)", proto, elapsed)
+		}
+	}
 }
 
 // TestInterpolation_NBE_SessionMode_ByteExact ground-truths the ADR-0153
@@ -722,6 +899,10 @@ func TestInterpolation_ReadRowsBatch_DecodeParity(t *testing.T) {
 	for i := range ctl {
 		for col, cv := range ctl[i] {
 			iv := itp[i][col]
+			if col == "fl" {
+				assertFloatReadClass(t, i, cv, iv)
+				continue
+			}
 			if readShapesEquivalent(cv, iv) {
 				continue
 			}
@@ -729,6 +910,44 @@ func TestInterpolation_ReadRowsBatch_DecodeParity(t *testing.T) {
 				t.Errorf("read parity: row %d col %q: binary=%#v (%T), interpolation=%#v (%T)", i, col, cv, cv, iv, iv)
 			}
 		}
+	}
+}
+
+// assertFloatReadClass is the FLOAT-column exception to strict read parity
+// — and the documented REASON row-data read sessions are exempt from the
+// ADR-0153 flavor default: MySQL DOES NOT round-trip FLOAT in its
+// float→text conversion (ground-truthed on 8.0.46: stored float32 8388608
+// renders "8388610" via CAST AS CHAR and the text wire form alike, while
+// DOUBLE renders shortest-round-trip), so a TEXT-protocol read of a FLOAT
+// column materializes a display-rounded value. The binary leg must carry
+// the EXACT stored float32; the text leg may differ only within FLOAT
+// display precision (~6-7 significant digits) — anything larger is a real
+// decode divergence.
+func assertFloatReadClass(t *testing.T, rowIdx int, cv, iv any) {
+	t.Helper()
+	if cv == nil || iv == nil {
+		if cv != nil || iv != nil {
+			t.Errorf("read parity: row %d col \"fl\": NULL mismatch: binary=%#v, interpolation=%#v", rowIdx, cv, iv)
+		}
+		return
+	}
+	cf, cok := cv.(float64)
+	if2, iok := iv.(float64)
+	if !cok || !iok {
+		t.Errorf("read parity: row %d col \"fl\": non-float64 carrier: binary=%#v (%T), interpolation=%#v (%T)", rowIdx, cv, cv, iv, iv)
+		return
+	}
+	// The binary leg is the exact stored float32 widened; the seed values
+	// are all float32-representable, so it must equal the corpus value
+	// exactly (checked implicitly: binary == float64(float32(binary))).
+	if cf != float64(float32(cf)) {
+		t.Errorf("read parity: row %d col \"fl\": binary leg %v is not a widened float32", rowIdx, cf)
+	}
+	if cf == if2 || (cf == 0 && if2 == 0) {
+		return
+	}
+	if diff := math.Abs(if2-cf) / math.Max(math.Abs(cf), math.SmallestNonzeroFloat64); diff > 1e-5 {
+		t.Errorf("read parity: row %d col \"fl\": text leg %v diverges from binary %v beyond FLOAT display rounding (rel %g)", rowIdx, if2, cf, diff)
 	}
 }
 

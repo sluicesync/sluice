@@ -141,3 +141,66 @@ func TestInterpolationFlavorDefault_ApplierLanePoolCfg(t *testing.T) {
 		}
 	}
 }
+
+// TestInterpolationFlavorDefault_RowReaderKeepsBinaryProtocol pins the
+// ADR-0153 read-fidelity exemption end-to-end: a planetscale-flavor
+// RowReader on a param-free DSN must keep the prepared/binary protocol for
+// its arg-bearing PK-paged reads — because MySQL's FLOAT→text conversion
+// does not round-trip float32 (stored 8388608 renders "8388610"), a
+// text-protocol chunk read would silently display-round every FLOAT
+// column. The pin seeds the poster-child value and requires the EXACT
+// stored float32 back, plus wire evidence (COM_STMT_PREPAREs > 0) that the
+// read really ran prepared.
+func TestInterpolationFlavorDefault_RowReaderKeepsBinaryProtocol(t *testing.T) {
+	dsn, cleanup := newSharedDB(t, "interp_readbin")
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	applyDDL(t, dsn, "CREATE TABLE fl_read (id BIGINT NOT NULL, fl FLOAT NULL, PRIMARY KEY (id)) ENGINE=InnoDB;")
+	seed, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("seed open: %v", err)
+	}
+	defer func() { _ = seed.Close() }()
+	// Bind as a binary-protocol param so the stored float32 is exactly 2^23.
+	if _, err := seed.ExecContext(ctx, "INSERT INTO fl_read (id, fl) VALUES (?, ?)", int64(1), float64(1<<23)); err != nil {
+		t.Fatalf("seed insert: %v", err)
+	}
+
+	eng, ok := engines.Get("planetscale")
+	if !ok {
+		t.Fatal("planetscale engine not registered")
+	}
+	rr, err := eng.OpenRowReader(ctx, dsn) // param-free: the exemption must hold
+	if err != nil {
+		t.Fatalf("OpenRowReader: %v", err)
+	}
+	defer closeIf(rr)
+	reader := rr.(*RowReader)
+	tbl := readTableIR(t, ctx, dsn, "fl_read")
+
+	before := comStmtPrepareCount(t, dsn)
+	// after-cursor bound arg → the statement shape the protocol governs.
+	ch, err := reader.ReadRowsBatch(ctx, tbl, []any{int64(0)}, 10)
+	if err != nil {
+		t.Fatalf("ReadRowsBatch: %v", err)
+	}
+	var got []ir.Row
+	for row := range ch {
+		got = append(got, row)
+	}
+	if err := reader.Err(); err != nil {
+		t.Fatalf("ReadRowsBatch stream: %v", err)
+	}
+	if delta := comStmtPrepareCount(t, dsn) - before; delta == 0 {
+		t.Error("planetscale-flavor chunk read issued 0 COM_STMT_PREPAREs; the read-fidelity exemption did not hold (text-protocol FLOAT display-rounding would follow)")
+	}
+	if len(got) != 1 {
+		t.Fatalf("read %d rows; want 1", len(got))
+	}
+	fl, ok := got[0]["fl"].(float64)
+	if !ok || fl != float64(1<<23) {
+		t.Errorf("fl read back as %#v (%T); want exactly %v — the FLOAT display-rounding class leaked into the chunked read", got[0]["fl"], got[0]["fl"], float64(1<<23))
+	}
+}

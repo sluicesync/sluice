@@ -112,8 +112,11 @@ collapses that to **one `COM_QUERY` round trip** by rendering values
 into the SQL text client-side. Since
 [ADR-0153](adr/adr-0153-mysql-flavor-interpolation-default.md), the
 **`planetscale` and `vitess` drivers default this ON** (their
-deployments are WAN-RTT-shaped); putting `interpolateParams=false` in
-the DSN restores the binary protocol.
+deployments are WAN-RTT-shaped) for every connection EXCEPT row-data
+read sessions — reads keep the prepared/binary protocol because
+MySQL's FLOAT→text conversion does not round-trip float32 values
+(ADR-0153's read-fidelity exemption); putting `interpolateParams=false`
+in the DSN restores the binary protocol everywhere.
 
 **Vanilla MySQL keeps the binary protocol by default, but the opt-in
 works on any flavor:** append `interpolateParams=true` to the DSN (it

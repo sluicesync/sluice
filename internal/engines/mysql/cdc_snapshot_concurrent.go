@@ -150,7 +150,9 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 		return e.openBinlogSnapshotStreamShared(ctx, dsn, false)
 	}
 
-	cfg, err := parseDSNForFlavor(dsn, e.Flavor)
+	// ADR-0153 read-fidelity exemption: snapshot ROW-DATA reads keep the
+	// binary protocol (FLOAT text display-rounding — see OpenRowReader).
+	cfg, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -257,7 +259,8 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 	rows.anchorToken = position.Token
 	rows.anchorSet = true
 	rows.resnapshot = func(rctx context.Context) ([]*sql.Conn, *sql.DB, string, uint32, error) {
-		rcfg, perr := parseDSNForFlavor(dsn, e.Flavor)
+		// Same ADR-0153 read-fidelity exemption as the initial open.
+		rcfg, perr := parseDSN(dsn)
 		if perr != nil {
 			return nil, nil, "", 0, perr
 		}

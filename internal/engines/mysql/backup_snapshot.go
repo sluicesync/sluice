@@ -73,7 +73,9 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn string, opts irbacku
 		// on OpenBackupSnapshotForTables (irbackup.TableScopedBackupSnapshotOpener).
 		return e.openBackupSnapshotVStream(ctx, dsn, nil)
 	}
-	cfg, err := parseDSNForFlavor(dsn, e.Flavor)
+	// ADR-0153 read-fidelity exemption: backup ROW-DATA reads keep the
+	// binary protocol (FLOAT text display-rounding — see OpenRowReader).
+	cfg, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err
 	}

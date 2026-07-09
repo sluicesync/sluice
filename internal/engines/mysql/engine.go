@@ -127,7 +127,19 @@ func (e Engine) OpenSchemaWriter(ctx context.Context, dsn string) (ir.SchemaWrit
 // by dsn. The caller is responsible for closing the returned RowReader
 // (via its Close method) to release the underlying connection pool.
 func (e Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, error) {
-	cfg, err := parseDSNForFlavor(dsn, e.Flavor)
+	// ADR-0153 read-fidelity exemption: ROW-DATA READ sessions keep the
+	// binary protocol — deliberately NOT parseDSNForFlavor. With
+	// interpolation on, arg-bearing SELECTs (the PK-paged ReadRowsBatch)
+	// return TEXT-protocol results, and MySQL FLOAT→text conversion does
+	// not round-trip float32 (ground-truthed on 8.0.46: stored 8388608
+	// prints "8388610" — CAST AS CHAR and the text wire form alike, while
+	// DOUBLE prints shortest-round-trip). Flipping this path would
+	// display-round every FLOAT column read by a chunked cold-copy. An
+	// explicit operator interpolateParams=true in the DSN still wins, as
+	// everywhere. (The arg-less full-scan ReadRows has ALWAYS been text
+	// protocol and carries this FLOAT rounding on every release — a
+	// pre-existing wart independent of ADR-0153, named in the ADR.)
+	cfg, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err
 	}

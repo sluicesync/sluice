@@ -1477,11 +1477,16 @@ func placeholderFor(colTypes map[string]*ir.Column, colName string) string {
 // it propagates loudly through the builders.
 func prepareApplierValue(v any, colTypes map[string]*ir.Column, colName string) (any, error) {
 	if colTypes == nil {
-		return v, nil
+		// Defensive cold-cache path: no type-driven shaping, but still
+		// route through prepareValue so its type-independent
+		// SLUICE-E-VALUE-UNREPRESENTABLE guard fires — a NaN must never
+		// reach the driver through the pathological branch either
+		// (prepareValue with a nil col is otherwise a pure passthrough).
+		return prepareValue(v, nil)
 	}
 	col, ok := colTypes[colName]
 	if !ok || col == nil {
-		return v, nil
+		return prepareValue(v, nil)
 	}
 	return prepareValue(v, col)
 }

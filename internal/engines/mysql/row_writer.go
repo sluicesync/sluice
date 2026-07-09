@@ -957,9 +957,10 @@ func refuseUnrepresentableFloat(v any, col *ir.Column) error {
 		colName = col.Name
 	}
 	return fmt.Errorf(
-		"SLUICE-E-VALUE-UNREPRESENTABLE: column %q carries %v, which MySQL FLOAT/DOUBLE cannot represent "+
-			"(MySQL has no NaN/Infinity); refusing loudly rather than corrupting the value or retry-looping on the "+
-			"server's misleading error — filter or transform the source value (e.g. NULLIF / CASE on the source query)",
+		"SLUICE-E-VALUE-UNREPRESENTABLE: column %q carries the float64 value %v, which no MySQL column type "+
+			"can represent (MySQL has no NaN/Infinity); refusing loudly rather than corrupting the value or "+
+			"retry-looping on the server's misleading error — filter or transform the source value "+
+			"(e.g. NULLIF / CASE on the source query)",
 		colName, f,
 	)
 }
