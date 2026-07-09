@@ -262,6 +262,15 @@ type Backup struct {
 	// (proportional per Bug 116 — an unsigned backup stays on 5).
 	Sign bool
 
+	// Ed25519Signer, when non-nil, signs the manifest + lineage with an
+	// asymmetric Ed25519 keypair (ADR-0154 Phase 2, `--sign-key`) instead
+	// of the HMAC-off-KEK default that [Backup.Sign] selects. Unlike Sign,
+	// it works on PLAINTEXT AND encrypted chains (the keypair is
+	// independent of the encryption keystore) and on KMS-encrypted chains
+	// (Ed25519 signs the manifest, KMS wraps the CEK — orthogonal). Set by
+	// the CLI from the operator's private key; mutually exclusive with Sign.
+	Ed25519Signer *lineage.Signer
+
 	// Summary, when non-nil, collects the end-of-run per-table facts
 	// the CLI's `--format json` result envelope renders — filled from
 	// the completed manifest's per-table row counts. nil (the zero
@@ -420,6 +429,14 @@ func (b *Backup) Run(ctx context.Context) error {
 	chainCEK, err := b.setupChainEncryption(manifest, prior)
 	if err != nil {
 		return fmt.Errorf("backup: setup encryption: %w", err)
+	}
+	// ADR-0154 Phase 2: a PLAINTEXT Ed25519-signed backup (--sign-key, no
+	// --encrypt) is stamped the signed-manifest version here — the
+	// encrypted path already stamped it inside setupChainEncryption. This
+	// is the plaintext-signing enablement Phase 1 lacked (it had no key to
+	// sign a plaintext manifest with).
+	if b.Ed25519Signer != nil && b.Encryption == nil {
+		manifest.FormatVersion = max(manifest.FormatVersion, irbackup.FormatVersionSignedManifest)
 	}
 
 	priorTables := indexManifestTables(priorResumableTables(prior))
@@ -588,15 +605,12 @@ func (b *Backup) Run(ctx context.Context) error {
 // signability was already validated in setupChainEncryption, so a failure
 // here is an I/O problem, not a misconfiguration.
 func (b *Backup) signBackupArtifacts(ctx context.Context, manifest *irbackup.Manifest) error {
-	if !b.Sign {
+	if !b.signingRequested() {
 		return nil
 	}
-	signer, ok, err := lineage.NewSigner(b.Encryption.Envelope)
+	signer, err := b.buildWriteSigner()
 	if err != nil {
 		return err
-	}
-	if !ok {
-		return errors.New("signing envelope became non-signable after preflight (internal inconsistency)")
 	}
 	if err := lineage.WriteManifestSig(ctx, b.Store, lineage.ManifestFileName, manifest, 0, signer); err != nil {
 		return fmt.Errorf("write manifest signature: %w", err)
@@ -605,9 +619,36 @@ func (b *Backup) signBackupArtifacts(ctx context.Context, manifest *irbackup.Man
 		return fmt.Errorf("write lineage signature: %w", err)
 	}
 	slog.InfoContext(ctx, "backup: wrote detached signatures (ADR-0154)",
+		slog.String("scheme", signer.Scheme),
 		slog.String("key_id", signer.KeyID),
 		slog.Int("format_version", manifest.FormatVersion))
 	return nil
+}
+
+// signingRequested reports whether this run must sign — either the
+// HMAC-off-KEK default ([Backup.Sign]) or an explicit Ed25519 keypair
+// ([Backup.Ed25519Signer], `--sign-key`).
+func (b *Backup) signingRequested() bool {
+	return b.Sign || b.Ed25519Signer != nil
+}
+
+// buildWriteSigner resolves the signer for a signing run: the pre-built
+// Ed25519 signer (Phase 2) takes precedence over the HMAC-off-KEK signer
+// derived from the chain envelope (Phase 1). Signability was validated in
+// setupChainEncryption (HMAC) / the CLI (Ed25519), so a failure here is an
+// internal inconsistency, not a misconfiguration.
+func (b *Backup) buildWriteSigner() (*lineage.Signer, error) {
+	if b.Ed25519Signer != nil {
+		return b.Ed25519Signer, nil
+	}
+	signer, ok, err := lineage.NewSigner(b.Encryption.Envelope)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, errors.New("signing envelope became non-signable after preflight (internal inconsistency)")
+	}
+	return signer, nil
 }
 
 // logBackupComplete emits the terminal "backup complete" summary line
@@ -1229,10 +1270,15 @@ func (b *Backup) validate() error {
 		return errors.New("backup: SourceDSN is empty")
 	case b.Store == nil:
 		return errors.New("backup: Store is nil")
+	case b.Sign && b.Ed25519Signer != nil:
+		// The two schemes are mutually exclusive; the CLI refuses --sign +
+		// --sign-key, but guard defensively so a mixed-scheme chain can
+		// never be produced.
+		return errors.New("backup: --sign (HMAC-off-KEK) and --sign-key (Ed25519) are mutually exclusive — choose one signing scheme")
 	case b.Sign && b.Encryption == nil:
-		// ADR-0154 Phase 1 has no plaintext signing path (that is Ed25519,
-		// Phase 2). Signing an encrypted chain keys the HMAC off its KEK.
-		return errors.New("backup: --sign needs an encrypted chain in this build: signing a plaintext backup needs an explicit signing key, not available until ADR-0154 Phase 2 — add --encrypt (with a passphrase) to sign an encrypted chain")
+		// HMAC-off-KEK (--sign) keys the HMAC off the chain KEK, so it needs
+		// an encrypted chain. Plaintext signing uses --sign-key (Ed25519).
+		return errors.New("backup: --sign (HMAC-off-KEK) needs an encrypted chain — add --encrypt (with a passphrase), or use --sign-key to sign a plaintext backup with an Ed25519 keypair")
 	}
 	return nil
 }
@@ -1608,14 +1654,20 @@ func (b *Backup) setupChainEncryption(manifest, prior *irbackup.Manifest) ([]byt
 	// non-signable envelope (KMS: Phase 3) or a resumed pre-binding chain
 	// (unbound chunks can't be brought under a signature) — refusing here,
 	// before the sweep, beats writing chunks we then can't sign.
-	if b.Sign {
+	if b.signingRequested() {
 		if resumingPreBinding {
-			return nil, errors.New("backup: --sign cannot extend a resumed pre-chunk-binding encrypted run; start a fresh signed chain with --force-overwrite")
+			return nil, errors.New("backup: signing cannot extend a resumed pre-chunk-binding encrypted run; start a fresh signed chain with --force-overwrite")
 		}
-		if _, ok, err := lineage.NewSigner(enc.Envelope); err != nil {
-			return nil, fmt.Errorf("backup: --sign: %w", err)
-		} else if !ok {
-			return nil, errors.New("backup: --sign on this encrypted chain is unsupported in ADR-0154 Phase 1: HMAC signing needs a local passphrase-derived key, but a KMS-encrypted chain's KEK never leaves the HSM (KMS Sign is Phase 3). Use passphrase encryption to sign in Phase 1")
+		// HMAC-off-KEK (--sign) needs a signable local KEK; Ed25519
+		// (--sign-key) is independent of the envelope, so it is allowed on
+		// ANY encrypted chain including KMS (Ed25519 signs the manifest,
+		// KMS wraps the CEK — orthogonal).
+		if b.Sign {
+			if _, ok, err := lineage.NewSigner(enc.Envelope); err != nil {
+				return nil, fmt.Errorf("backup: --sign: %w", err)
+			} else if !ok {
+				return nil, errors.New("backup: --sign on this encrypted chain is unsupported in ADR-0154 Phase 1: HMAC signing needs a local passphrase-derived key, but a KMS-encrypted chain's KEK never leaves the HSM (KMS Sign is Phase 3). Use --sign-key (Ed25519) to sign a KMS-encrypted chain")
+			}
 		}
 		manifest.FormatVersion = max(manifest.FormatVersion, irbackup.FormatVersionSignedManifest)
 	}

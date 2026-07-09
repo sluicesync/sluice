@@ -102,7 +102,7 @@ func buildSignedChain(t *testing.T) (*memStore, crypto.EnvelopeEncryption, []lin
 // TestVerifyChainSignatures_Untampered pins the happy path.
 func TestVerifyChainSignatures_Untampered(t *testing.T) {
 	store, env, links := buildSignedChain(t)
-	if err := verifyChainSignatures(context.Background(), store, links, env, false); err != nil {
+	if err := verifyChainSignatures(context.Background(), store, links, verifyMaterial{env: env}, false); err != nil {
 		t.Fatalf("untampered signed chain refused: %v", err)
 	}
 }
@@ -151,7 +151,7 @@ func TestVerifyChainSignatures_TamperMatrix(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			store, env, links := buildSignedChain(t)
 			tc.tamper(store, links)
-			err := verifyChainSignatures(ctx, store, links, env, false)
+			err := verifyChainSignatures(ctx, store, links, verifyMaterial{env: env}, false)
 			if err == nil {
 				t.Fatal("tamper was not refused")
 			}
@@ -174,7 +174,7 @@ func TestVerifyChainSignatures_FormatVersionDowngrade(t *testing.T) {
 	for i := range links {
 		links[i].Manifest.FormatVersion = irbackup.FormatVersionEncryptedChunkBinding // v6 -> v5
 	}
-	err := verifyChainSignatures(context.Background(), store, links, env, false)
+	err := verifyChainSignatures(context.Background(), store, links, verifyMaterial{env: env}, false)
 	if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeBackupSignatureInvalid {
 		t.Fatalf("v6->v5 downgrade with sigs present: got %v, want SIGNATURE-INVALID (verification must not trust FormatVersion)", err)
 	}
@@ -196,11 +196,11 @@ func TestVerifyChainSignatures_DowngradeAndStripRequiresStrict(t *testing.T) {
 	_ = store.Delete(ctx, lineage.LineageSigFileName)
 
 	// Default policy: no artifacts, not strict → documented residual (no-op).
-	if err := verifyChainSignatures(ctx, store, links, env, false); err != nil {
+	if err := verifyChainSignatures(ctx, store, links, verifyMaterial{env: env}, false); err != nil {
 		t.Fatalf("fully-stripped chain, default policy: got %v, want nil (documented option-b residual)", err)
 	}
 	// Strict: the operator asserts it should be signed → refuse.
-	err := verifyChainSignatures(ctx, store, links, env, true)
+	err := verifyChainSignatures(ctx, store, links, verifyMaterial{env: env}, true)
 	if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeBackupSignatureMissing {
 		t.Fatalf("fully-stripped chain, --require-signature: got %v, want SIGNATURE-MISSING", err)
 	}
@@ -210,7 +210,7 @@ func TestVerifyChainSignatures_DowngradeAndStripRequiresStrict(t *testing.T) {
 func TestVerifyChainSignatures_WrongKey(t *testing.T) {
 	store, _, links := buildSignedChain(t)
 	wrongKEK := make([]byte, crypto.KEKLen) // all zeros != 0x5a chain
-	err := verifyChainSignatures(context.Background(), store, links, sigFakeEnv{kek: wrongKEK}, false)
+	err := verifyChainSignatures(context.Background(), store, links, verifyMaterial{env: sigFakeEnv{kek: wrongKEK}}, false)
 	if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeBackupSignatureInvalid {
 		t.Fatalf("wrong key: got %v, want SIGNATURE-INVALID", err)
 	}
@@ -237,7 +237,7 @@ func TestVerifyChainSignatures_PreV6NoOp(t *testing.T) {
 		t.Fatal(err)
 	}
 	// No signer supplied and no sigs present — must be a clean no-op.
-	if err := verifyChainSignatures(ctx, store, links, nil, false); err != nil {
+	if err := verifyChainSignatures(ctx, store, links, verifyMaterial{}, false); err != nil {
 		t.Fatalf("pre-v6 chain refused: %v", err)
 	}
 }
@@ -249,11 +249,11 @@ func TestVerifyChainSignatures_UnverifiablePolicy(t *testing.T) {
 	store, _, links := buildSignedChain(t)
 	ctx := context.Background()
 	// No envelope → cannot verify. Default: proceed.
-	if err := verifyChainSignatures(ctx, store, links, nil, false); err != nil {
+	if err := verifyChainSignatures(ctx, store, links, verifyMaterial{}, false); err != nil {
 		t.Fatalf("default policy should warn-and-proceed, got %v", err)
 	}
 	// Strict: refuse with the coded SIGNATURE-MISSING class.
-	err := verifyChainSignatures(ctx, store, links, nil, true)
+	err := verifyChainSignatures(ctx, store, links, verifyMaterial{}, true)
 	if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeBackupSignatureMissing {
 		t.Fatalf("strict policy: got %v, want SIGNATURE-MISSING", err)
 	}

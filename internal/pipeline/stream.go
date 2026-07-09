@@ -1566,7 +1566,7 @@ func (cb *changeChunkBuffer) open() error {
 	// will record it at (chunkIdx only advances at flush, so open and
 	// flush agree; the ordinal guards change-REPLAY order).
 	path := changeChunkPath(cb.runNamespace, cb.chunkIdx)
-	w, err := blobcodec.NewChangeChunkWriter(cb.buf, cek, cb.b.segCodec, irbackup.ChangeChunkAAD(cb.manifest, path, cb.chunkIdx))
+	w, err := blobcodec.NewChangeChunkWriter(cb.buf, cek, cb.b.segCodec, irbackup.ChangeChunkAADForWrite(cb.manifest, path, cb.chunkIdx, cek))
 	if err != nil {
 		return fmt.Errorf("open chunk: %w", err)
 	}

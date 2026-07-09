@@ -28,6 +28,7 @@ package backup
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"io"
@@ -117,11 +118,17 @@ type ChainRestore struct {
 	// chains. See [Restore.Envelope].
 	Envelope crypto.EnvelopeEncryption
 
+	// VerifyKey, when non-nil, is the Ed25519 PUBLIC key (`--verify-key`)
+	// that verifies an ADR-0154 Phase 2 (Ed25519-scheme) signed chain.
+	// Required to verify such a chain; orthogonal to Envelope. See
+	// [Restore.VerifyKey].
+	VerifyKey ed25519.PublicKey
+
 	// RequireSignature makes the ADR-0154 policy strict-always: a v6
-	// (signed) chain that cannot be verified (no KEK-holding key) refuses
-	// instead of WARN-and-proceeding. The default (false) never fails a
-	// legitimate DR restore for a signature it cannot check; an INVALID
-	// signature always refuses regardless.
+	// (signed) chain that cannot be verified (no matching verify key)
+	// refuses instead of WARN-and-proceeding. The default (false) never
+	// fails a legitimate DR restore for a signature it cannot check; an
+	// INVALID signature always refuses regardless.
 	RequireSignature bool
 
 	// TargetSchema is the per-source target-schema namespace override
@@ -245,7 +252,7 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	// A signed (v6) chain refuses loudly on a missing/invalid/rolled-back
 	// signature, a truncated change-list, or a dropped-newest-link BEFORE
 	// anything lands on the target. Pre-v6 chains are a no-op.
-	if err := verifyChainSignatures(ctx, r.Store, links, r.Envelope, r.RequireSignature); err != nil {
+	if err := verifyChainSignatures(ctx, r.Store, links, verifyMaterial{env: r.Envelope, verifyKey: r.VerifyKey}, r.RequireSignature); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore: %w", err))
 	}
 

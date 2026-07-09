@@ -5,10 +5,12 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -56,8 +58,71 @@ type EncryptionFlags struct {
 	// ADR-0154 Phase 1 signing. Sign gates the WRITE side (backup full /
 	// incremental); RequireSignature gates the READ side (restore /
 	// verify) strict-always policy.
-	Sign             bool `name:"sign" help:"Sign the backup manifest + lineage catalog with a detached HMAC-SHA-256 keyed off the chain KEK (ADR-0154 Phase 1). Requires --encrypt (Phase 1 signs only encrypted chains) with a passphrase (KMS signing is Phase 3). A signed backup refuses at restore/verify on a tampered, rolled-back, or truncated manifest. Extending an already-signed chain signs automatically."`
-	RequireSignature bool `name:"require-signature" help:"Strict-always signature policy on restore/verify: a signed (v6) backup that cannot be verified (no key supplied) is refused rather than warned. An INVALID signature is always refused regardless of this flag. Leave off for the DR-safe default (never fail a restore for a signature it cannot check)."`
+	Sign             bool `name:"sign" help:"Sign the backup manifest + lineage catalog with a detached HMAC-SHA-256 keyed off the chain KEK (ADR-0154 Phase 1). Requires --encrypt (HMAC-off-KEK signs only encrypted chains) with a passphrase (KMS signing is Phase 3). For plaintext signing or key-separated verification, use --sign-key (Ed25519) instead. Extending an already-signed chain signs automatically."`
+	RequireSignature bool `name:"require-signature" help:"Strict-always signature policy on restore/verify: a signed (v6) backup that cannot be verified (no matching key supplied) is refused rather than warned. An INVALID signature is always refused regardless of this flag. Leave off for the DR-safe default (never fail a restore for a signature it cannot check)."`
+
+	// ADR-0154 Phase 2 (Ed25519 asymmetric signing). SignKey gates the
+	// WRITE side (backup full / incremental) and EXPLICITLY selects the
+	// Ed25519 scheme; VerifyKey gates the READ side (restore / verify) and
+	// is REQUIRED to verify an Ed25519-signed chain (the KEK does not
+	// verify an Ed25519 signature). Both accept `env:VAR` or a file path.
+	SignKey   string `name:"sign-key" help:"Sign the backup with an Ed25519 PRIVATE key (ADR-0154 Phase 2, PKCS#8 PEM), selecting the Ed25519 scheme over the --sign HMAC-off-KEK default. Works on BOTH plaintext AND encrypted (incl. KMS) backups — the keypair is independent of the encryption keystore. Accepts a file path or 'env:VAR'. Generate with 'sluice backup keygen'. The private key is never logged. Mutually exclusive with --sign." placeholder:"PATH|env:VAR"`
+	VerifyKey string `name:"verify-key" help:"Ed25519 PUBLIC key (ADR-0154 Phase 2, SPKI PEM) that verifies an Ed25519-signed chain on restore / verify. REQUIRED for such a chain — the KEK does NOT verify an Ed25519 signature, even on an encrypted chain. Absent it, an Ed25519-signed chain WARNs present-but-unverified and proceeds (DR-safe) unless --require-signature. Accepts a file path or 'env:VAR'." placeholder:"PATH|env:VAR"`
+}
+
+// readKeyMaterial resolves a `--sign-key` / `--verify-key` spec: `env:VAR`
+// reads the named environment variable (the recommended form — the key
+// bytes never land in shell history or a bundle), anything else is a file
+// path. The RESOLVED bytes are a signing secret for a private key; the
+// SPEC itself (a path or a variable NAME) is not, so it is safe to log.
+func readKeyMaterial(spec string) ([]byte, error) {
+	if v, ok := strings.CutPrefix(spec, "env:"); ok {
+		val := os.Getenv(v)
+		if val == "" {
+			return nil, fmt.Errorf("key source env:%s: environment variable is empty", v)
+		}
+		return []byte(val), nil
+	}
+	raw, err := os.ReadFile(spec)
+	if err != nil {
+		return nil, fmt.Errorf("key source %q: %w", spec, err)
+	}
+	return raw, nil
+}
+
+// buildEd25519Signer builds the Ed25519 write-side signer from --sign-key,
+// or nil when the flag is unset. The private key is parsed but never
+// logged.
+func (e *EncryptionFlags) buildEd25519Signer() (*lineage.Signer, error) {
+	if e.SignKey == "" {
+		return nil, nil
+	}
+	raw, err := readKeyMaterial(e.SignKey)
+	if err != nil {
+		return nil, fmt.Errorf("--sign-key: %w", err)
+	}
+	priv, err := crypto.ParseEd25519PrivateKeyPEM(raw)
+	if err != nil {
+		return nil, fmt.Errorf("--sign-key: %w", err)
+	}
+	return lineage.NewEd25519Signer(priv), nil
+}
+
+// resolveVerifyKey resolves the Ed25519 PUBLIC verify key from
+// --verify-key, or nil when unset.
+func (e *EncryptionFlags) resolveVerifyKey() (ed25519.PublicKey, error) {
+	if e.VerifyKey == "" {
+		return nil, nil
+	}
+	raw, err := readKeyMaterial(e.VerifyKey)
+	if err != nil {
+		return nil, fmt.Errorf("--verify-key: %w", err)
+	}
+	pub, err := crypto.ParseEd25519PublicKeyPEM(raw)
+	if err != nil {
+		return nil, fmt.Errorf("--verify-key: %w", err)
+	}
+	return pub, nil
 }
 
 // resolvePassphrase returns the operator's passphrase from whichever
@@ -362,6 +427,31 @@ func (e *EncryptionFlags) buildReadEnvelope(rootManifest *irbackup.Manifest) (cr
 // (KMS — Phase 3). Reads the chain-root manifest for the Argon2id
 // params, mirroring buildReadEnvelope.
 func (e *EncryptionFlags) buildSigner(ctx context.Context, store irbackup.Store) (*lineage.Signer, error) {
+	signer, err := e.buildMaintenanceSigner(ctx, store)
+	if err != nil || signer == nil {
+		return nil, err
+	}
+	// A signed chain must be re-signed under its EXISTING scheme — a
+	// compact/prune must never convert an Ed25519 chain to HMAC (or vice
+	// versa). Refuse loudly on a scheme mismatch before any mutation.
+	scheme, ok, err := lineage.ChainSignatureScheme(ctx, store)
+	if err != nil {
+		return nil, err
+	}
+	if ok && scheme != signer.Scheme {
+		return nil, fmt.Errorf("this chain is %q-signed (ADR-0154); re-signing it during compact/prune needs the matching key material (%q supplied) — pass the chain's --encrypt passphrase for hmac-kek, or --sign-key for ed25519", scheme, signer.Scheme)
+	}
+	return signer, nil
+}
+
+// buildMaintenanceSigner resolves the re-sign signer from the operator's
+// flags: Ed25519 (--sign-key) takes precedence and is independent of
+// --encrypt; otherwise HMAC-off-KEK from the chain envelope. nil when
+// neither is supplied (a signed chain then refuses to compact/prune).
+func (e *EncryptionFlags) buildMaintenanceSigner(ctx context.Context, store irbackup.Store) (*lineage.Signer, error) {
+	if e.SignKey != "" {
+		return e.buildEd25519Signer()
+	}
 	if !e.Encrypt {
 		return nil, nil
 	}
@@ -397,6 +487,84 @@ type BackupCmd struct {
 	Verify      BackupVerifyCmd      `cmd:"" help:"Re-checksum every chunk in an existing backup chain and report any mismatches."`
 	Prune       BackupPruneCmd       `cmd:"" help:"Drop the oldest incrementals from an existing chain to bound disk + restore time (GitHub #20 chunk 14c)."`
 	Compact     BackupCompactCmd     `cmd:"" help:"Concatenate consecutive segments whose CreatedAt gaps fall within --merge-window into a single segment (GitHub #20 chunk 14d, Task #15)."`
+	Keygen      BackupKeygenCmd      `cmd:"" help:"Generate an Ed25519 signing keypair for --sign-key / --verify-key (ADR-0154 Phase 2)."`
+}
+
+// BackupKeygenCmd runs `sluice backup keygen`. Generates an Ed25519
+// keypair and writes the private key (PKCS#8 PEM, 0600) + public key
+// (SPKI PEM). The private key signs backups (`--sign-key`); the public
+// key — distributable freely — verifies them (`--verify-key`).
+type BackupKeygenCmd struct {
+	OutDir string `name:"out-dir" help:"Directory to write the keypair into as sluice-sign-key.pem (private, 0600) + sluice-verify-key.pem (public). Created if absent. Mutually exclusive with --priv/--pub." placeholder:"DIR"`
+	Priv   string `name:"priv" help:"Explicit path for the PRIVATE key file (PKCS#8 PEM, written 0600). Use with --pub. Mutually exclusive with --out-dir." placeholder:"PATH"`
+	Pub    string `name:"pub" help:"Explicit path for the PUBLIC key file (SPKI PEM). Use with --priv. Mutually exclusive with --out-dir." placeholder:"PATH"`
+	Force  bool   `name:"force" help:"Overwrite existing key files. By default keygen refuses to clobber an existing private key (losing/replacing it strands the signing of any chain it already signed)."`
+}
+
+// Run implements `sluice backup keygen`.
+func (k *BackupKeygenCmd) Run(_ *Globals) error {
+	privPath, pubPath, err := k.resolvePaths()
+	if err != nil {
+		return err
+	}
+	if !k.Force {
+		for _, p := range []string{privPath, pubPath} {
+			if _, statErr := os.Stat(p); statErr == nil {
+				return fmt.Errorf("keygen: %q already exists; pass --force to overwrite (overwriting a private key strands any chain it already signed)", p)
+			}
+		}
+	}
+	pub, priv, err := crypto.GenerateEd25519Keypair()
+	if err != nil {
+		return err
+	}
+	privPEM, err := crypto.MarshalEd25519PrivateKeyPEM(priv)
+	if err != nil {
+		return err
+	}
+	pubPEM, err := crypto.MarshalEd25519PublicKeyPEM(pub)
+	if err != nil {
+		return err
+	}
+	if dir := filepath.Dir(privPath); dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("keygen: create dir %q: %w", dir, err)
+		}
+	}
+	// Private key 0600 — the whole point of key-separated signing is that
+	// this file is the ONLY signing secret; it must not be world-readable.
+	if err := os.WriteFile(privPath, privPEM, 0o600); err != nil {
+		return fmt.Errorf("keygen: write private key %q: %w", privPath, err)
+	}
+	if err := os.WriteFile(pubPath, pubPEM, 0o644); err != nil {
+		return fmt.Errorf("keygen: write public key %q: %w", pubPath, err)
+	}
+	slog.Info(
+		"backup keygen: wrote Ed25519 keypair (ADR-0154 Phase 2)",
+		slog.String("private_key", privPath),
+		slog.String("public_key", pubPath),
+		slog.String("key_id", crypto.Ed25519KeyID(pub)),
+	)
+	return nil
+}
+
+// resolvePaths validates the flag combination and returns the private +
+// public key file paths.
+func (k *BackupKeygenCmd) resolvePaths() (priv, pub string, err error) {
+	hasOutDir := k.OutDir != ""
+	hasExplicit := k.Priv != "" || k.Pub != ""
+	switch {
+	case hasOutDir && hasExplicit:
+		return "", "", errors.New("keygen: --out-dir is mutually exclusive with --priv/--pub")
+	case hasOutDir:
+		return filepath.Join(k.OutDir, "sluice-sign-key.pem"), filepath.Join(k.OutDir, "sluice-verify-key.pem"), nil
+	case k.Priv != "" && k.Pub != "":
+		return k.Priv, k.Pub, nil
+	case hasExplicit:
+		return "", "", errors.New("keygen: --priv and --pub must both be set together")
+	default:
+		return "", "", errors.New("keygen: one of --out-dir or (--priv and --pub) is required")
+	}
 }
 
 // BackupFullCmd runs `sluice backup full`. Reads the source schema,
@@ -537,6 +705,13 @@ func (b *BackupFullCmd) run(g *Globals, env *envelopeRun) error {
 	if err != nil {
 		return err
 	}
+	signer, err := b.buildEd25519Signer()
+	if err != nil {
+		return err
+	}
+	if b.Sign && signer != nil {
+		return errors.New("--sign (HMAC-off-KEK) and --sign-key (Ed25519) are mutually exclusive — choose one signing scheme")
+	}
 	bk := &backup.Backup{
 		Source:              source,
 		SourceDSN:           b.Source,
@@ -555,6 +730,7 @@ func (b *BackupFullCmd) run(g *Globals, env *envelopeRun) error {
 		ForceOverwrite:      b.ForceOverwrite,
 		Encryption:          encConfig,
 		Sign:                b.Sign,
+		Ed25519Signer:       signer,
 		Codec:               codec,
 		// --format json envelope hookup; nil in text mode (no-ops).
 		Summary: env.summary,
@@ -706,6 +882,13 @@ func (b *BackupIncrementalCmd) Run(g *Globals) error {
 	if err != nil {
 		return err
 	}
+	signer, err := b.buildEd25519Signer()
+	if err != nil {
+		return err
+	}
+	if b.Sign && signer != nil {
+		return errors.New("--sign (HMAC-off-KEK) and --sign-key (Ed25519) are mutually exclusive — choose one signing scheme")
+	}
 	incr := &pipeline.IncrementalBackup{
 		Source:        source,
 		SourceDSN:     b.Source,
@@ -718,6 +901,7 @@ func (b *BackupIncrementalCmd) Run(g *Globals) error {
 		SluiceVersion: version,
 		Encryption:    encConfig,
 		Sign:          b.Sign,
+		Ed25519Signer: signer,
 	}
 	return incr.Run(ctx)
 }
@@ -1015,8 +1199,13 @@ func (v *BackupVerifyCmd) Run(_ *Globals) error {
 			slog.String("kek_ref", rootManifest.ChainEncryption.KEKRef),
 		)
 	}
+	verifyKey, err := v.resolveVerifyKey()
+	if err != nil {
+		return err
+	}
 	total, mismatches, err := backup.VerifyBackupWith(ctx, store, backup.VerifyOptions{
 		Envelope:         envelope,
+		VerifyKey:        verifyKey,
 		RequireSignature: v.RequireSignature,
 	})
 	if err != nil {
@@ -1458,6 +1647,10 @@ func (r *RestoreCmd) run(g *Globals, env *envelopeRun) error {
 		defer func() { _ = telemetryProvider.Close() }()
 	}
 
+	verifyKey, err := r.resolveVerifyKey()
+	if err != nil {
+		return err
+	}
 	restore := &backup.Restore{
 		Target:           target,
 		TargetDSN:        r.Target,
@@ -1468,6 +1661,7 @@ func (r *RestoreCmd) run(g *Globals, env *envelopeRun) error {
 		ChunkParallelism: r.BulkParallelism,
 		ApplyConcurrency: r.ApplyConcurrency,
 		Envelope:         envelope,
+		VerifyKey:        verifyKey,
 		RequireSignature: r.RequireSignature,
 		TargetSchema:     r.TargetSchema,
 		// --format json envelope hookup; nil in text mode (no-ops).

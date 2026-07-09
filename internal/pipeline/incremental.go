@@ -138,6 +138,13 @@ type IncrementalBackup struct {
 	// envelope), rather than emit an unsigned successor.
 	Sign bool
 
+	// Ed25519Signer, when non-nil, signs this incremental with an
+	// asymmetric Ed25519 keypair (ADR-0154 Phase 2, `--sign-key`) instead
+	// of the HMAC-off-KEK default. Required to EXTEND an Ed25519-signed
+	// chain (the chain's scheme must not be mixed); works on plaintext +
+	// encrypted (incl. KMS) chains. Mutually exclusive with Sign.
+	Ed25519Signer *lineage.Signer
+
 	// Codec is the operator's --compression choice. Consulted only
 	// when the open segment's codec isn't already pinned in
 	// lineage.json (a segment is single-codec by construction; the
@@ -497,33 +504,74 @@ func (b *IncrementalBackup) resolveSigning(ctx context.Context, manifest *irback
 	if err != nil {
 		return false, fmt.Errorf("incremental: probe signed chain: %w", err)
 	}
-	if !b.Sign && !chainSigned {
+	if !b.Sign && b.Ed25519Signer == nil && !chainSigned {
 		return false, nil
 	}
-	if b.Encryption == nil {
-		return false, errors.New("incremental: cannot sign a plaintext chain (ADR-0154 Phase 1 signs only encrypted chains); the parent is unsigned/plaintext")
-	}
-	if _, ok, serr := lineage.NewSigner(b.Encryption.Envelope); serr != nil {
-		return false, fmt.Errorf("incremental: signing: %w", serr)
-	} else if !ok {
-		return false, errors.New("incremental: extending a signed chain needs a passphrase-derived signing key, but the envelope cannot key an HMAC off its KEK (KMS Sign is ADR-0154 Phase 3); refusing to emit an unsigned successor to a signed chain")
+	if _, err := b.incrementalWriteSigner(ctx, chainSigned); err != nil {
+		return false, err
 	}
 	manifest.FormatVersion = max(manifest.FormatVersion, irbackup.FormatVersionSignedManifest)
 	return true, nil
 }
 
-// signIncrementalArtifacts signs this incremental's manifest at its
-// lineage position and re-signs the lineage catalog (ADR-0154 Phase 1).
-// It first ensures the lineage update is durable (fail-loud, idempotent)
-// — the best-effort update above is inadequate for a signed chain, whose
-// freshness anchor is the signed link enumeration.
-func (b *IncrementalBackup) signIncrementalArtifacts(ctx context.Context, manifest *irbackup.Manifest, manifestPath string) error {
+// incrementalWriteSigner resolves the signer for this incremental,
+// enforcing that it matches the EXISTING chain's signature scheme when
+// extending a signed chain — a chain must never mix HMAC and Ed25519
+// links (mixing would make the "all links same scheme" verify probe pick
+// the wrong verifier). Ed25519 (`--sign-key`) is allowed on plaintext,
+// encrypted, and KMS chains; HMAC-off-KEK (`--sign`) needs a local
+// passphrase-derived KEK.
+func (b *IncrementalBackup) incrementalWriteSigner(ctx context.Context, chainSigned bool) (*lineage.Signer, error) {
+	var chainScheme string
+	if chainSigned {
+		s, ok, err := lineage.ChainSignatureScheme(ctx, b.Store)
+		if err != nil {
+			return nil, fmt.Errorf("incremental: probe chain scheme: %w", err)
+		}
+		if ok {
+			chainScheme = s
+		}
+	}
+	if b.Ed25519Signer != nil {
+		if chainScheme != "" && chainScheme != irbackup.SignatureSchemeEd25519 {
+			return nil, fmt.Errorf("incremental: --sign-key (Ed25519) cannot extend a %q-signed chain — extend it with the scheme it was signed under; refusing to mix signature schemes in one chain", chainScheme)
+		}
+		return b.Ed25519Signer, nil
+	}
+	// HMAC-off-KEK path (`--sign`, or extending an HMAC-signed chain).
+	if chainScheme == irbackup.SignatureSchemeEd25519 {
+		return nil, errors.New("incremental: this chain is Ed25519-signed (ADR-0154 Phase 2) — extend it with `backup incremental --sign-key <private-key>`; refusing to emit an unsigned/mis-signed successor to a signed chain")
+	}
+	if b.Encryption == nil {
+		return nil, errors.New("incremental: cannot HMAC-sign a plaintext chain (ADR-0154 HMAC-off-KEK needs a KEK); use --sign-key (Ed25519) for a plaintext chain, or the parent is unsigned/plaintext")
+	}
 	signer, ok, err := lineage.NewSigner(b.Encryption.Envelope)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("incremental: signing: %w", err)
 	}
 	if !ok {
-		return errors.New("signing envelope became non-signable after preflight (internal inconsistency)")
+		return nil, errors.New("incremental: extending a signed chain needs a passphrase-derived signing key, but the envelope cannot key an HMAC off its KEK (use --sign-key for Ed25519; KMS Sign is ADR-0154 Phase 3); refusing to emit an unsigned successor to a signed chain")
+	}
+	return signer, nil
+}
+
+// signIncrementalArtifacts signs this incremental's manifest at its
+// lineage position and re-signs the lineage catalog (ADR-0154). It first
+// ensures the lineage update is durable (fail-loud, idempotent) — the
+// best-effort update above is inadequate for a signed chain, whose
+// freshness anchor is the signed link enumeration.
+func (b *IncrementalBackup) signIncrementalArtifacts(ctx context.Context, manifest *irbackup.Manifest, manifestPath string) error {
+	// The chain is signed by the time we sign (resolveSigning committed to
+	// it); probe the scheme to pick the same signer resolveSigning
+	// validated. Extending an unsigned parent with --sign has chainSigned
+	// false at this point, so pass the current probe.
+	chainSigned, err := lineage.ChainIsSigned(ctx, b.Store)
+	if err != nil {
+		return fmt.Errorf("incremental: probe signed chain: %w", err)
+	}
+	signer, err := b.incrementalWriteSigner(ctx, chainSigned)
+	if err != nil {
+		return err
 	}
 	// Ensure the catalog durably includes this incremental before we sign
 	// its enumeration (idempotent: dedups on manifest path).
@@ -549,6 +597,7 @@ func (b *IncrementalBackup) signIncrementalArtifacts(ctx context.Context, manife
 		return fmt.Errorf("write lineage signature: %w", err)
 	}
 	slog.InfoContext(ctx, "incremental: wrote detached signatures (ADR-0154)",
+		slog.String("scheme", signer.Scheme),
 		slog.String("key_id", signer.KeyID),
 		slog.Int("sequence", seq))
 	return nil
@@ -888,7 +937,7 @@ func (b *IncrementalBackup) captureWindow(
 		// will record it at (chunkIdx only advances at flush, so open
 		// and flush agree; the ordinal guards change-REPLAY order).
 		path := changeChunkPath(runNamespace, chunkIdx)
-		w, err := blobcodec.NewChangeChunkWriter(buf, cek, b.segCodec, irbackup.ChangeChunkAAD(manifest, path, chunkIdx))
+		w, err := blobcodec.NewChangeChunkWriter(buf, cek, b.segCodec, irbackup.ChangeChunkAADForWrite(manifest, path, chunkIdx, cek))
 		if err != nil {
 			return fmt.Errorf("open chunk: %w", err)
 		}

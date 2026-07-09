@@ -65,10 +65,20 @@ func bindingIdentity(m *Manifest) string {
 // at the given manifest-recorded path carries — or nil when the
 // manifest predates [FormatVersionEncryptedChunkBinding], whose chunks
 // were written unbound and MUST decrypt via the legacy nil-AAD path.
-// This function is the single version gate for both sides: writers
-// call it with the freshly-stamped manifest (v5 when encryption is
-// on), readers with the manifest as read from the store, so the shape
-// is always derived from the RECORDED version and never guessed.
+// This function is the single VERSION gate for both sides: writers call
+// it with the freshly-stamped manifest, readers with the manifest as
+// read from the store, so the shape is always derived from the RECORDED
+// version and never guessed.
+//
+// It does NOT gate on encryption — an incremental's manifest records no
+// ChainEncryption of its own (the chain CEK lives on the segment full),
+// so an encryption gate here would strip the binding off encrypted
+// change chunks. The ENCRYPTION gate is the caller's: writers pass this
+// AAD only when they hold a CEK ([ChunkAADForWrite]); readers gate on
+// the chunk's recorded [ChunkInfo.Encryption] ([ChunkAADFor]). Since
+// ADR-0154 Phase 2 a plaintext v6 (Ed25519-signed) backup has v6 but no
+// CEK, so those caller-side gates — not the version — are what keep a
+// plaintext chunk unbound (its signature covers SHA + position instead).
 //
 // file is the chunk's manifest-recorded path ([ChunkInfo.File]) —
 // segment-relative, exactly as stored, which is what keeps the binding
@@ -78,6 +88,28 @@ func ChunkAAD(m *Manifest, file string) []byte {
 		return nil
 	}
 	return []byte(chunkAADPrefix + bindingIdentity(m) + "\nfile=" + file)
+}
+
+// ChunkAADForWrite is the WRITE-side gate for [ChunkAAD]: it returns the
+// position binding only when the chunk is actually being encrypted (a
+// non-nil CEK). A plaintext chunk — including one under a v6
+// (Ed25519-signed) manifest — has no ciphertext to bind, so it must be
+// written with a nil AAD (the chunk writer refuses an AAD without a CEK).
+// The manifest signature covers a plaintext chunk's SHA + position.
+func ChunkAADForWrite(m *Manifest, file string, cek []byte) []byte {
+	if len(cek) == 0 {
+		return nil
+	}
+	return ChunkAAD(m, file)
+}
+
+// ChangeChunkAADForWrite is [ChunkAADForWrite] for change chunks (adds the
+// replay ordinal). nil for a plaintext (no-CEK) change chunk.
+func ChangeChunkAADForWrite(m *Manifest, file string, index int, cek []byte) []byte {
+	if len(cek) == 0 {
+		return nil
+	}
+	return ChangeChunkAAD(m, file, index)
 }
 
 // ChunkAADFor is the READ-side form of [ChunkAAD]: it additionally

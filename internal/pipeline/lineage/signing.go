@@ -21,6 +21,7 @@ package lineage
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -36,7 +37,10 @@ import (
 // LineageCatalogCanonVersion versions the lineage-catalog canonical
 // serialization the `lineage.json.sig` signature covers. Same on-disk
 // contract discipline as [irbackup.ManifestCanonVersion].
-const LineageCatalogCanonVersion = "sluice-lineage-canon/v2"
+//
+// v3 (ADR-0154 Phase 2): the signature scheme is folded into the
+// canonical catalog bytes, mirroring the per-manifest scheme-binding.
+const LineageCatalogCanonVersion = "sluice-lineage-canon/v3"
 
 // LineageSigFileName is the detached signature object for lineage.json.
 const LineageSigFileName = LineageCatalogFileName + irbackup.SignatureFileSuffix
@@ -56,17 +60,82 @@ var (
 	ErrSignatureInvalid = errors.New("detached signature failed verification")
 )
 
-// Signer carries the derived HMAC signing key + its public fingerprint.
-// Constructed once per run from the chain envelope; reused to sign /
-// verify every manifest + the lineage catalog.
+// Signer carries the material to sign and/or verify a manifest +
+// lineage catalog under one of the ADR-0154 schemes. It dispatches on
+// [Signer.Scheme]:
+//
+//   - [irbackup.SignatureSchemeHMACKEK] (Phase 1): symmetric HMAC keyed
+//     off the chain KEK. [Signer.Key] holds the derived HMAC key; the
+//     same material signs and verifies.
+//   - [irbackup.SignatureSchemeEd25519] (Phase 2): asymmetric Ed25519.
+//     edPub verifies; edPriv (nil for a verify-only signer) signs.
+//
+// An empty Scheme is treated as HMAC-off-KEK for backward compatibility
+// (pre-Phase-2 constructions that set only Key/KeyID).
 type Signer struct {
-	Key   []byte
+	// Scheme selects the sign/verify primitive. "" == HMAC-off-KEK.
+	Scheme string
+
+	// KeyID is a stable, non-secret fingerprint of the signing key,
+	// recorded in the detached signature.
 	KeyID string
+
+	// Key is the HMAC-SHA-256 key (HMAC-off-KEK scheme only).
+	Key []byte
+
+	// edPriv / edPub hold the Ed25519 keypair halves (ed25519 scheme).
+	// edPriv is nil for a verify-only signer built from a public key.
+	edPriv ed25519.PrivateKey
+	edPub  ed25519.PublicKey
 }
 
-// NewSigner derives the ADR-0154 Phase 1 signing key from env. ok is
-// false (with a nil error) when env cannot key an HMAC off its KEK —
-// env is nil, or it is a KMS envelope that does not implement
+// schemeTag returns the on-disk scheme string for this signer, defaulting
+// an empty Scheme to HMAC-off-KEK (backward compat).
+func (s *Signer) schemeTag() string {
+	if s.Scheme == "" {
+		return irbackup.SignatureSchemeHMACKEK
+	}
+	return s.Scheme
+}
+
+// canSign reports whether this signer holds material to PRODUCE a
+// signature (not just verify one). An Ed25519 verify-only signer cannot.
+func (s *Signer) canSign() bool {
+	switch s.schemeTag() {
+	case irbackup.SignatureSchemeEd25519:
+		return len(s.edPriv) == ed25519.PrivateKeySize
+	default:
+		return len(s.Key) > 0
+	}
+}
+
+// sign returns the MAC/signature over payload under this signer's scheme.
+func (s *Signer) sign(payload []byte) ([]byte, error) {
+	switch s.schemeTag() {
+	case irbackup.SignatureSchemeEd25519:
+		if len(s.edPriv) != ed25519.PrivateKeySize {
+			return nil, errors.New("lineage: ed25519 signer is verify-only (no private key) and cannot sign")
+		}
+		return crypto.SignManifestEd25519(s.edPriv, payload), nil
+	default:
+		return crypto.SignManifestHMAC(s.Key, payload), nil
+	}
+}
+
+// verify reports whether sig authenticates payload under this signer's
+// scheme (constant-time for HMAC; ed25519.Verify for Ed25519).
+func (s *Signer) verify(payload, sig []byte) bool {
+	switch s.schemeTag() {
+	case irbackup.SignatureSchemeEd25519:
+		return crypto.VerifyManifestEd25519(s.edPub, payload, sig)
+	default:
+		return crypto.VerifyManifestHMAC(s.Key, payload, sig)
+	}
+}
+
+// NewSigner derives the ADR-0154 Phase 1 HMAC-off-KEK signing key from
+// env. ok is false (with a nil error) when env cannot key an HMAC off its
+// KEK — env is nil, or it is a KMS envelope that does not implement
 // [crypto.ManifestSigner] (Phase 1 signs only passphrase-encrypted
 // chains; KMS Sign is Phase 3). A non-nil error is a real derivation
 // failure. The write side turns ok==false into a loud refusal when
@@ -81,7 +150,31 @@ func NewSigner(env crypto.EnvelopeEncryption) (s *Signer, ok bool, err error) {
 	if err != nil {
 		return nil, false, fmt.Errorf("derive manifest signing key: %w", err)
 	}
-	return &Signer{Key: key, KeyID: crypto.ManifestSigKeyID(key)}, true, nil
+	return &Signer{Scheme: irbackup.SignatureSchemeHMACKEK, Key: key, KeyID: crypto.ManifestSigKeyID(key)}, true, nil
+}
+
+// NewEd25519Signer builds a sign+verify Ed25519 signer from a private
+// key (ADR-0154 Phase 2). The KeyID is derived from the PUBLIC half so it
+// matches what a verifier holding only the public key computes.
+func NewEd25519Signer(priv ed25519.PrivateKey) *Signer {
+	pub, _ := priv.Public().(ed25519.PublicKey)
+	return &Signer{
+		Scheme: irbackup.SignatureSchemeEd25519,
+		KeyID:  crypto.Ed25519KeyID(pub),
+		edPriv: priv,
+		edPub:  pub,
+	}
+}
+
+// NewEd25519Verifier builds a verify-only Ed25519 signer from a public
+// key — the key-separated verification Phase 2 unlocks (a CI/restore host
+// holds only this, never a signing secret).
+func NewEd25519Verifier(pub ed25519.PublicKey) *Signer {
+	return &Signer{
+		Scheme: irbackup.SignatureSchemeEd25519,
+		KeyID:  crypto.Ed25519KeyID(pub),
+		edPub:  pub,
+	}
 }
 
 // ManifestSigPath returns the detached-signature object path for a
@@ -92,14 +185,17 @@ func ManifestSigPath(manifestPath string) string {
 
 // SignManifest builds the detached signature for m at chain position seq.
 func (s *Signer) SignManifest(m *irbackup.Manifest, seq int) (*irbackup.ManifestSignature, error) {
-	payload, err := irbackup.CanonicalManifestBytes(m, seq)
+	payload, err := irbackup.CanonicalManifestBytes(m, seq, s.schemeTag())
 	if err != nil {
 		return nil, err
 	}
-	mac := crypto.SignManifestHMAC(s.Key, payload)
+	mac, err := s.sign(payload)
+	if err != nil {
+		return nil, err
+	}
 	return &irbackup.ManifestSignature{
 		CanonVersion: irbackup.ManifestCanonVersion,
-		Scheme:       irbackup.SignatureSchemeHMACKEK,
+		Scheme:       s.schemeTag(),
 		KeyID:        s.KeyID,
 		Sequence:     seq,
 		ChunkCount:   irbackup.ManifestChunkCount(m),
@@ -167,9 +263,14 @@ func VerifyManifest(ctx context.Context, store irbackup.Store, manifestPath stri
 		return fmt.Errorf("manifest %q: signature canon version %q != %q: %w",
 			manifestPath, sig.CanonVersion, irbackup.ManifestCanonVersion, ErrSignatureInvalid)
 	}
-	if sig.Scheme != irbackup.SignatureSchemeHMACKEK {
-		return fmt.Errorf("manifest %q: signature scheme %q is not %q (Phase 1 verifies HMAC-off-KEK only): %w",
-			manifestPath, sig.Scheme, irbackup.SignatureSchemeHMACKEK, ErrSignatureInvalid)
+	// Scheme-binding: the claimed scheme MUST match the verifier's scheme.
+	// A mismatch is a relabel-tamper signal (an HMAC `.sig` relabeled
+	// ed25519, or vice versa) — refuse. The claimed scheme is ALSO folded
+	// into the canonical bytes below, so even if this explicit check were
+	// bypassed the MAC would fail; the check gives a precise error first.
+	if sig.Scheme != s.schemeTag() {
+		return fmt.Errorf("manifest %q: signature scheme %q != verifier scheme %q (relabel-tamper?): %w",
+			manifestPath, sig.Scheme, s.schemeTag(), ErrSignatureInvalid)
 	}
 	if sig.Sequence != seq {
 		return fmt.Errorf("manifest %q: signed sequence %d != expected chain position %d (rolled-back / reordered link?): %w",
@@ -183,11 +284,11 @@ func VerifyManifest(ctx context.Context, store irbackup.Store, manifestPath stri
 	if err != nil {
 		return fmt.Errorf("manifest %q: decode signature mac: %w: %w", manifestPath, err, ErrSignatureInvalid)
 	}
-	payload, err := irbackup.CanonicalManifestBytes(m, seq)
+	payload, err := irbackup.CanonicalManifestBytes(m, seq, s.schemeTag())
 	if err != nil {
 		return fmt.Errorf("manifest %q: recompute canonical bytes: %w", manifestPath, err)
 	}
-	if !crypto.VerifyManifestHMAC(s.Key, payload, mac) {
+	if !s.verify(payload, mac) {
 		return fmt.Errorf("manifest %q (key_id recorded %q, verifying %q): %w",
 			manifestPath, sig.KeyID, s.KeyID, ErrSignatureInvalid)
 	}
@@ -201,9 +302,14 @@ func VerifyManifest(ctx context.Context, store irbackup.Store, manifestPath stri
 // store and lineage.json) shrinks this; the signature over it refuses.
 // The Segments and Incrementals are already order-significant, so no
 // sorting is needed (nor wanted — order is part of the structure).
-func CanonicalCatalogBytes(cat *Catalog) []byte {
+//
+// scheme is folded in (as in [irbackup.CanonicalManifestBytes]) so the
+// lineage signature is scheme-bound identically to the per-manifest ones.
+func CanonicalCatalogBytes(cat *Catalog, scheme string) []byte {
 	var b strings.Builder
 	lpTok(&b, LineageCatalogCanonVersion)
+	lpTok(&b, "scheme")
+	lpTok(&b, scheme)
 	lpTok(&b, "format_version")
 	lpTok(&b, strconv.Itoa(cat.FormatVersion))
 	lpTok(&b, "source_engine")
@@ -246,21 +352,27 @@ func lpTok(b *strings.Builder, s string) {
 // reuses the [irbackup.ManifestSignature] envelope (Sequence carries the
 // total manifest count across the lineage — the tip high-water; ChunkCount
 // is unused and left 0).
-func (s *Signer) SignLineage(cat *Catalog) *irbackup.ManifestSignature {
-	payload := CanonicalCatalogBytes(cat)
-	mac := crypto.SignManifestHMAC(s.Key, payload)
+func (s *Signer) SignLineage(cat *Catalog) (*irbackup.ManifestSignature, error) {
+	payload := CanonicalCatalogBytes(cat, s.schemeTag())
+	mac, err := s.sign(payload)
+	if err != nil {
+		return nil, err
+	}
 	return &irbackup.ManifestSignature{
 		CanonVersion: LineageCatalogCanonVersion,
-		Scheme:       irbackup.SignatureSchemeHMACKEK,
+		Scheme:       s.schemeTag(),
 		KeyID:        s.KeyID,
 		Sequence:     totalManifestCount(cat),
 		MAC:          hex.EncodeToString(mac),
-	}
+	}, nil
 }
 
 // WriteLineageSig signs cat and writes lineage.json.sig.
 func WriteLineageSig(ctx context.Context, store irbackup.Store, cat *Catalog, s *Signer) error {
-	sig := s.SignLineage(cat)
+	sig, err := s.SignLineage(cat)
+	if err != nil {
+		return err
+	}
 	body, err := irbackup.MarshalManifestSignature(sig)
 	if err != nil {
 		return err
@@ -286,29 +398,22 @@ func SignLineageCatalog(ctx context.Context, store irbackup.Store, s *Signer) er
 // VerifyLineage reads and verifies lineage.json.sig against cat. Same
 // missing/invalid contract as [VerifyManifest].
 func VerifyLineage(ctx context.Context, store irbackup.Store, cat *Catalog, s *Signer) error {
-	exists, err := store.Exists(ctx, LineageSigFileName)
-	if err != nil {
-		return fmt.Errorf("inspect %q: %w", LineageSigFileName, err)
-	}
-	if !exists {
-		return fmt.Errorf("lineage catalog %q: %w", LineageCatalogFileName, ErrSignatureMissing)
-	}
-	rc, err := store.Get(ctx, LineageSigFileName)
-	if err != nil {
-		return fmt.Errorf("get %q: %w", LineageSigFileName, err)
-	}
-	defer func() { _ = rc.Close() }()
-	body, err := io.ReadAll(rc)
-	if err != nil {
-		return fmt.Errorf("read %q: %w", LineageSigFileName, err)
-	}
-	sig, err := irbackup.UnmarshalManifestSignature(body)
+	sig, present, err := readLineageSig(ctx, store)
 	if err != nil {
 		return err
 	}
-	if sig.CanonVersion != LineageCatalogCanonVersion || sig.Scheme != irbackup.SignatureSchemeHMACKEK {
-		return fmt.Errorf("lineage catalog: signature canon/scheme %q/%q unexpected: %w",
-			sig.CanonVersion, sig.Scheme, ErrSignatureInvalid)
+	if !present {
+		return fmt.Errorf("lineage catalog %q: %w", LineageCatalogFileName, ErrSignatureMissing)
+	}
+	if sig.CanonVersion != LineageCatalogCanonVersion {
+		return fmt.Errorf("lineage catalog: signature canon version %q != %q: %w",
+			sig.CanonVersion, LineageCatalogCanonVersion, ErrSignatureInvalid)
+	}
+	// Scheme-binding (as in [VerifyManifest]): a claimed scheme that
+	// differs from the verifier's is a relabel-tamper signal → refuse.
+	if sig.Scheme != s.schemeTag() {
+		return fmt.Errorf("lineage catalog: signature scheme %q != verifier scheme %q (relabel-tamper?): %w",
+			sig.Scheme, s.schemeTag(), ErrSignatureInvalid)
 	}
 	if got := totalManifestCount(cat); sig.Sequence != got {
 		return fmt.Errorf("lineage catalog: signed link count %d != actual %d (dropped-newest-link?): %w",
@@ -318,11 +423,65 @@ func VerifyLineage(ctx context.Context, store irbackup.Store, cat *Catalog, s *S
 	if err != nil {
 		return fmt.Errorf("lineage catalog: decode signature mac: %w: %w", err, ErrSignatureInvalid)
 	}
-	if !crypto.VerifyManifestHMAC(s.Key, CanonicalCatalogBytes(cat), mac) {
+	if !s.verify(CanonicalCatalogBytes(cat, s.schemeTag()), mac) {
 		return fmt.Errorf("lineage catalog (key_id recorded %q, verifying %q): %w",
 			sig.KeyID, s.KeyID, ErrSignatureInvalid)
 	}
 	return nil
+}
+
+// ChainSignatureScheme probes the scheme a signed chain claims, so the
+// read side can select the matching verification material (an HMAC-off-KEK
+// chain verifies with the envelope KEK; an Ed25519 chain with a
+// `--verify-key`). It reads the claimed scheme from `lineage.json.sig`
+// (present on every well-formed signed chain), falling back to the root
+// manifest's `.sig`. ok is false when no signature object is present.
+//
+// The claimed scheme is attacker-controllable (it is not itself under an
+// outer signature until verification runs), but selecting the verifier
+// from it is SAFE: if the operator lacks material for the claimed scheme,
+// the read side takes the unverifiable warn/refuse path; if they have it,
+// a relabel fails the MAC (the scheme is folded into the signed bytes).
+func ChainSignatureScheme(ctx context.Context, store irbackup.Store) (scheme string, ok bool, err error) {
+	if sig, present, lerr := readLineageSig(ctx, store); lerr != nil {
+		return "", false, lerr
+	} else if present {
+		return sig.Scheme, true, nil
+	}
+	sig, present, err := ReadManifestSig(ctx, store, ManifestFileName)
+	if err != nil {
+		return "", false, err
+	}
+	if !present {
+		return "", false, nil
+	}
+	return sig.Scheme, true, nil
+}
+
+// readLineageSig reads and decodes lineage.json.sig. present is false
+// (nil error) when the object is absent.
+func readLineageSig(ctx context.Context, store irbackup.Store) (sig *irbackup.ManifestSignature, present bool, err error) {
+	exists, err := store.Exists(ctx, LineageSigFileName)
+	if err != nil {
+		return nil, false, fmt.Errorf("inspect %q: %w", LineageSigFileName, err)
+	}
+	if !exists {
+		return nil, false, nil
+	}
+	rc, err := store.Get(ctx, LineageSigFileName)
+	if err != nil {
+		return nil, false, fmt.Errorf("get %q: %w", LineageSigFileName, err)
+	}
+	defer func() { _ = rc.Close() }()
+	body, err := io.ReadAll(rc)
+	if err != nil {
+		return nil, false, fmt.Errorf("read %q: %w", LineageSigFileName, err)
+	}
+	sig, err = irbackup.UnmarshalManifestSignature(body)
+	if err != nil {
+		return nil, false, err
+	}
+	return sig, true, nil
 }
 
 // ChainIsSigned reports whether the chain in store is signed (ADR-0154):
@@ -339,6 +498,9 @@ func ChainIsSigned(ctx context.Context, store irbackup.Store) (bool, error) {
 // re-signed — not just the merged successor — for the sequence-gap-free
 // check to hold at restore.
 func ResignLineage(ctx context.Context, store irbackup.Store, s *Signer) error {
+	if !s.canSign() {
+		return errors.New("resign: signer holds no signing key (verify-only) — a compact/prune of a signed chain needs the signing key material (--sign-key for Ed25519, or the chain --encrypt passphrase for HMAC-off-KEK)")
+	}
 	recs, err := ListAllSegmentManifests(ctx, store)
 	if err != nil {
 		return fmt.Errorf("resign: list manifests: %w", err)

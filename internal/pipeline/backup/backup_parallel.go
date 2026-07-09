@@ -528,7 +528,7 @@ func (s *backupChunkStreamer) writeRow(ctx context.Context, row ir.Row) error {
 		// table re-streams from scratch either way — Bug 135).
 		idx := int(s.chunkIdx.Add(1) - 1)
 		s.curPath = chunkFilePath(s.table, idx)
-		w, err := blobcodec.NewChunkWriter(s.buf, s.colNames, cek, s.b.Codec, irbackup.ChunkAAD(s.manifest, s.curPath))
+		w, err := blobcodec.NewChunkWriter(s.buf, s.colNames, cek, s.b.Codec, irbackup.ChunkAADForWrite(s.manifest, s.curPath, cek))
 		if err != nil {
 			return fmt.Errorf("open chunk: %w", err)
 		}

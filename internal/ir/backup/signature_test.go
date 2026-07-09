@@ -4,6 +4,7 @@
 package backup
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"strings"
@@ -71,7 +72,7 @@ func fixedSignedManifest() *Manifest {
 
 func canon(t *testing.T, m *Manifest, seq int) string {
 	t.Helper()
-	b, err := CanonicalManifestBytes(m, seq)
+	b, err := CanonicalManifestBytes(m, seq, SignatureSchemeHMACKEK)
 	if err != nil {
 		t.Fatalf("CanonicalManifestBytes: %v", err)
 	}
@@ -90,7 +91,8 @@ func TestCanonicalManifestBytes_MinimalGolden(t *testing.T) {
 		Kind:          BackupKindFull,
 	}
 	want := strings.Join([]string{
-		"24:sluice-manifest-canon/v2",
+		"24:sluice-manifest-canon/v3",
+		"6:scheme", "8:hmac-kek",
 		"14:format_version", "1:6",
 		"13:source_engine", "8:postgres",
 		"10:created_at", "20:2026-07-09T12:00:00Z",
@@ -113,12 +115,12 @@ func TestCanonicalManifestBytes_MinimalGolden(t *testing.T) {
 // TestCanonicalManifestBytes_FullGolden pins the SHA-256 of the full
 // fixture's canonical bytes — a compact golden over every folded field.
 func TestCanonicalManifestBytes_FullGolden(t *testing.T) {
-	b, err := CanonicalManifestBytes(fixedSignedManifest(), 2)
+	b, err := CanonicalManifestBytes(fixedSignedManifest(), 2, SignatureSchemeHMACKEK)
 	if err != nil {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(b)
-	const want = "ebabd37f70c0da8d71b266991bc7ea8074f37abb3138be34f891b2c2267f4185"
+	const want = "d194bad3abdbb5cdde7fbb2f66d9324aa4866a71abe3e59a4cfc2ddbdd5e1579"
 	if got := hex.EncodeToString(sum[:]); got != want {
 		t.Fatalf("full canonical SHA drift (on-disk contract): got %s want %s\n(canonical bytes:\n%q)", got, want, b)
 	}
@@ -210,6 +212,26 @@ func TestCanonicalManifestBytes_TamperSensitivity(t *testing.T) {
 	m.SluiceVersion = "different"
 	if canon(t, m, 2) != base {
 		t.Error("SluiceVersion (informational) unexpectedly changed the canonical bytes")
+	}
+}
+
+// TestCanonicalManifestBytes_SchemeBinding is the Phase 2 scheme-confusion
+// pin: the signature scheme is folded into the canonical bytes, so signing
+// the SAME manifest under a different scheme produces DIFFERENT bytes. An
+// adversary who relabels an HMAC `.sig` as ed25519 (or vice versa) cannot
+// make the recomputed bytes match — the primitive AND the bytes differ.
+func TestCanonicalManifestBytes_SchemeBinding(t *testing.T) {
+	m := fixedSignedManifest()
+	hmacBytes, err := CanonicalManifestBytes(m, 2, SignatureSchemeHMACKEK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edBytes, err := CanonicalManifestBytes(m, 2, SignatureSchemeEd25519)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(hmacBytes, edBytes) {
+		t.Error("hmac-kek and ed25519 canonical bytes collided — scheme is NOT bound into the signature")
 	}
 }
 

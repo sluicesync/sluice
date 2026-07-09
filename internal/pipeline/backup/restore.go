@@ -24,6 +24,7 @@ package backup
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"io"
@@ -174,6 +175,13 @@ type Restore struct {
 	// lands on the target.
 	Envelope crypto.EnvelopeEncryption
 
+	// VerifyKey, when non-nil, is the Ed25519 PUBLIC key that verifies an
+	// ADR-0154 Phase 2 (Ed25519-scheme) signed chain (`--verify-key`). It
+	// is REQUIRED to verify such a chain — the KEK does not verify an
+	// Ed25519 signature — and is orthogonal to [Restore.Envelope] (a chain
+	// may be encrypted AND Ed25519-signed). Absent for HMAC-off-KEK chains.
+	VerifyKey ed25519.PublicKey
+
 	// RequireSignature makes the ADR-0154 signature policy strict-always
 	// (see [ChainRestore.RequireSignature]). Threaded into the chain
 	// dispatch. Default false — a legitimate DR restore never fails for a
@@ -316,6 +324,7 @@ func (r *Restore) Run(ctx context.Context) error {
 				Summary:          r.Summary,
 				ApplyConcurrency: r.ApplyConcurrency,
 				Envelope:         r.Envelope,
+				VerifyKey:        r.VerifyKey,
 				RequireSignature: r.RequireSignature,
 				TargetSchema:     r.TargetSchema,
 			}
@@ -404,7 +413,7 @@ func (r *Restore) Run(ctx context.Context) error {
 	// walked position — re-verifying here would use the wrong sequence
 	// for a later segment's full, so skip.
 	if !r.SkipChainDispatch {
-		if err := verifyManifestSignaturePolicy(ctx, r.Store, lineage.ManifestFileName, manifest, 0, r.Envelope, r.RequireSignature); err != nil {
+		if err := verifyManifestSignaturePolicy(ctx, r.Store, lineage.ManifestFileName, manifest, 0, verifyMaterial{env: r.Envelope, verifyKey: r.VerifyKey}, r.RequireSignature); err != nil {
 			return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("restore: %w", err))
 		}
 	}
@@ -1240,8 +1249,13 @@ type VerifyOptions struct {
 	// mismatch returns an irrecoverable error from VerifyBackup.
 	Envelope crypto.EnvelopeEncryption
 
+	// VerifyKey, when non-nil, is the Ed25519 PUBLIC key (`--verify-key`)
+	// that verifies an ADR-0154 Phase 2 (Ed25519-scheme) signed chain.
+	// Required to verify such a chain; orthogonal to Envelope.
+	VerifyKey ed25519.PublicKey
+
 	// RequireSignature makes an UNVERIFIABLE signed (v6) chain — one with
-	// no KEK-holding key — a verify failure rather than a WARN. An
+	// no matching verify key — a verify failure rather than a WARN. An
 	// INVALID signature is always a failure regardless. Default false.
 	RequireSignature bool
 }

@@ -47,6 +47,23 @@ func TestChunkAAD_VersionGate(t *testing.T) {
 	if ChunkAAD(nil, "x") != nil || CEKBinding(nil) != "" {
 		t.Error("nil manifest must derive no bindings")
 	}
+	// ADR-0154 Phase 2: the WRITE-side gate ([ChunkAADForWrite] /
+	// [ChangeChunkAADForWrite]) returns nil when there is no CEK — a
+	// plaintext chunk under a v6 (Ed25519-signed) manifest has no
+	// ciphertext to bind (its signature covers SHA + position instead).
+	// Without this the chunk writer is handed an AAD with no CEK and fails
+	// loudly. The version-only [ChunkAAD] still derives bytes for v6 (its
+	// encrypted callers gate on the CEK / recorded chunk encryption).
+	v6 := bindingTestManifest(FormatVersionSignedManifest)
+	if ChunkAADForWrite(v6, "chunks/t-0.jsonl.gz", nil) != nil {
+		t.Error("plaintext (no-CEK) v6 chunk derived a write AAD; nothing to bind")
+	}
+	if ChangeChunkAADForWrite(v6, "chunks/c-0.jsonl.gz", 0, nil) != nil {
+		t.Error("plaintext (no-CEK) v6 change chunk derived a write AAD; nothing to bind")
+	}
+	if ChunkAADForWrite(v6, "chunks/t-0.jsonl.gz", []byte("cek")) == nil {
+		t.Error("encrypted v6 chunk derived NO write AAD; the binding is lost")
+	}
 }
 
 // TestChunkAAD_GoldenDerivation pins the exact derived bytes — the

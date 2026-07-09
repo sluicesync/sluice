@@ -39,21 +39,37 @@ const (
 	// [CanonicalManifestBytes]; it is the first field of the canonical
 	// payload, so a verifier keyed on an old scheme fails closed.
 	//
-	// v2 (this build): the encoding is now length-prefixed (provably
-	// INJECTIVE — distinct field tuples can never render to identical
-	// bytes, closing the raw-concatenation forgery where an embedded
-	// newline / delimiter in a source-derived table name or chunk path
-	// let two distinct manifests collide), and it additionally folds
-	// [Manifest.SchemaDelta] (restore drives DDL from it),
-	// [Manifest.SchemaHistory] (replayed into the schema-history table),
-	// and [Manifest.StartPosition]/[Manifest.EndPosition] (resume anchors)
-	// under the signature.
-	ManifestCanonVersion = "sluice-manifest-canon/v2"
+	// v2: the encoding became length-prefixed (provably INJECTIVE —
+	// distinct field tuples can never render to identical bytes, closing
+	// the raw-concatenation forgery where an embedded newline / delimiter
+	// in a source-derived table name or chunk path let two distinct
+	// manifests collide), and folded [Manifest.SchemaDelta] (restore
+	// drives DDL from it), [Manifest.SchemaHistory] (replayed into the
+	// schema-history table), and [Manifest.StartPosition]/[Manifest.EndPosition]
+	// (resume anchors) under the signature.
+	//
+	// v3 (this build, ADR-0154 Phase 2): the signature SCHEME
+	// ([SignatureSchemeHMACKEK] / [SignatureSchemeEd25519]) is now folded
+	// into the canonical bytes as a dedicated token. This is the
+	// scheme-BINDING that prevents scheme confusion: the verifier reads
+	// the claimed scheme from the detached `.sig`, selects the matching
+	// verification primitive, and recomputes the canonical bytes
+	// INCLUDING that scheme — so an adversary who relabels an HMAC
+	// signature as `ed25519` (or vice versa) to force a different/weaker
+	// verification path changes the signed bytes and fails verification.
+	ManifestCanonVersion = "sluice-manifest-canon/v3"
 
 	// SignatureSchemeHMACKEK is the Phase 1 scheme tag recorded in the
 	// detached signature: HMAC-SHA-256 keyed off a key HKDF-derived from
-	// the chain KEK. Phases 2-3 add "ed25519" / "kms".
+	// the chain KEK (symmetric, encrypted-chains-only, zero new key mgmt).
 	SignatureSchemeHMACKEK = "hmac-kek"
+
+	// SignatureSchemeEd25519 is the Phase 2 scheme tag: an asymmetric
+	// Ed25519 signature under an operator-managed keypair. The private key
+	// signs; the public key (via `--verify-key`) verifies. Works for
+	// plaintext AND encrypted chains — the keypair is independent of the
+	// encryption keystore. Phase 3 adds "kms".
+	SignatureSchemeEd25519 = "ed25519"
 
 	// SignatureFileSuffix is appended to a manifest's path to name its
 	// detached signature object (`manifest.json` → `manifest.json.sig`).
@@ -116,14 +132,22 @@ func ManifestChunkCount(m *Manifest) int {
 
 // CanonicalManifestBytes returns the deterministic serialization of the
 // manifest's security-relevant fields that the ADR-0154 signature
-// covers: format version, identity (created_at / source_engine / kind /
-// backup_id), the lineage parent pointer, the schema fingerprint, the
-// resume anchors (start/end position), the chain-encryption descriptor,
-// the table→row-count mapping, the full chunk list (row chunks by path;
-// change chunks by ordinal, because change-replay order is semantic — the
-// ADR-0152 rationale), the schema deltas (restore drives DDL from them)
-// and schema-history entries (replayed into the schema-history table),
-// and the freshness anchors (sequence + chunk count).
+// covers: the canon version, the signature SCHEME (the Phase 2
+// scheme-binding — see below), format version, identity (created_at /
+// source_engine / kind / backup_id), the lineage parent pointer, the
+// schema fingerprint, the resume anchors (start/end position), the
+// chain-encryption descriptor, the table→row-count mapping, the full
+// chunk list (row chunks by path; change chunks by ordinal, because
+// change-replay order is semantic — the ADR-0152 rationale), the schema
+// deltas (restore drives DDL from them) and schema-history entries
+// (replayed into the schema-history table), and the freshness anchors
+// (sequence + chunk count).
+//
+// scheme ([SignatureSchemeHMACKEK] / [SignatureSchemeEd25519]) is folded
+// in as a dedicated token so a scheme swap changes the signed bytes: an
+// adversary cannot relabel an HMAC `.sig` as Ed25519 (or vice versa) to
+// force a weaker verification path, because the verifier recomputes these
+// bytes with the CLAIMED scheme and its scheme-specific primitive fails.
 //
 // The output is a sequence of LENGTH-PREFIXED tokens (`<len>:<bytes>\n`).
 // Length-prefixing makes the encoding provably injective: the byte stream
@@ -134,9 +158,10 @@ func ManifestChunkCount(m *Manifest) int {
 // Collections whose order is not semantic are sorted first. Returns an
 // error only if a SchemaDelta table cannot be fingerprinted. It is
 // ON-DISK CONTRACT (golden-pinned) — see the package doc.
-func CanonicalManifestBytes(m *Manifest, seq int) ([]byte, error) {
+func CanonicalManifestBytes(m *Manifest, seq int, scheme string) ([]byte, error) {
 	var b strings.Builder
 	tok(&b, ManifestCanonVersion)
+	field(&b, "scheme", scheme)
 	field(&b, "format_version", strconv.Itoa(m.FormatVersion))
 	field(&b, "source_engine", m.SourceEngine)
 	field(&b, "created_at", m.CreatedAt.UTC().Format(time.RFC3339Nano))

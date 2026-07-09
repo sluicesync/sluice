@@ -26,6 +26,7 @@ package backup
 
 import (
 	"context"
+	"crypto/ed25519"
 	"fmt"
 	"log/slog"
 
@@ -34,15 +35,68 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
-// signatureVerifier derives the ADR-0154 verify key from env, or reports
-// that verification is impossible with this envelope. ok is false when
-// env is nil or cannot key an HMAC off its KEK (KMS — Phase 3). A non-nil
-// error is a real derivation failure.
-func signatureVerifier(env crypto.EnvelopeEncryption) (s *lineage.Signer, ok bool, err error) {
+// verifyMaterial carries the two possible ADR-0154 verify-key sources —
+// the encryption envelope (HMAC-off-KEK, Phase 1) and an Ed25519 PUBLIC
+// key (`--verify-key`, Phase 2). The verifier for a given chain is chosen
+// from the chain's CLAIMED scheme against whichever of these is present:
+// an HMAC-off-KEK chain needs the envelope; an Ed25519 chain needs the
+// public key (the KEK does NOT verify an Ed25519 signature — the schemes
+// are cryptographically independent).
+type verifyMaterial struct {
+	env       crypto.EnvelopeEncryption
+	verifyKey ed25519.PublicKey
+}
+
+// signerForScheme builds the [lineage.Signer] that verifies scheme's
+// signatures from the available material. ok is false when no material
+// for that scheme is supplied (the caller then takes the unverifiable
+// warn/refuse path — NEVER a "different scheme so skip" path, so an
+// Ed25519 chain presented with only a KEK does not silently pass). A
+// non-nil error is a real key-derivation failure.
+//
+// Selecting the verifier from the claimed scheme is safe: a relabel to a
+// scheme the operator CAN verify still fails, because the scheme is
+// folded into the signed canonical bytes and each per-artifact verify
+// re-checks sig.Scheme against the verifier's scheme.
+func (m verifyMaterial) signerForScheme(scheme string) (s *lineage.Signer, ok bool, err error) {
+	switch scheme {
+	case irbackup.SignatureSchemeEd25519:
+		if len(m.verifyKey) == 0 {
+			return nil, false, nil
+		}
+		return lineage.NewEd25519Verifier(m.verifyKey), true, nil
+	case irbackup.SignatureSchemeHMACKEK:
+		return hmacVerifier(m.env)
+	default:
+		// Unknown / unprobeable scheme (e.g. --require-signature on a chain
+		// with no signature objects at all): prefer an explicit verify key,
+		// else the envelope, so a subsequent VerifyManifest reports the
+		// precise MISSING/INVALID error rather than skipping.
+		if len(m.verifyKey) > 0 {
+			return lineage.NewEd25519Verifier(m.verifyKey), true, nil
+		}
+		return hmacVerifier(m.env)
+	}
+}
+
+// hmacVerifier derives the Phase 1 HMAC-off-KEK verifier from env. ok is
+// false when env is nil or cannot key an HMAC off its KEK (KMS — Phase 3).
+func hmacVerifier(env crypto.EnvelopeEncryption) (s *lineage.Signer, ok bool, err error) {
 	if env == nil {
 		return nil, false, nil
 	}
 	return lineage.NewSigner(env)
+}
+
+// chainVerifier probes the chain's claimed signature scheme and returns
+// the matching verifier from mat. ok is false when no material for the
+// claimed scheme is supplied.
+func chainVerifier(ctx context.Context, store irbackup.Store, mat verifyMaterial) (s *lineage.Signer, ok bool, err error) {
+	scheme, _, serr := lineage.ChainSignatureScheme(ctx, store)
+	if serr != nil {
+		return nil, false, serr
+	}
+	return mat.signerForScheme(scheme)
 }
 
 // manifestSigPresent reports whether the detached `.sig` object for
@@ -90,7 +144,7 @@ func verifyManifestSignaturePolicy(
 	manifestPath string,
 	manifest *irbackup.Manifest,
 	seq int,
-	env crypto.EnvelopeEncryption,
+	mat verifyMaterial,
 	requireStrict bool,
 ) error {
 	sigPresent, err := manifestSigPresent(ctx, segStore, manifestPath)
@@ -104,7 +158,7 @@ func verifyManifestSignaturePolicy(
 	if !requireStrict && !sigPresent && !lineageSigPresent {
 		return nil // genuinely unsigned (or fully-stripped residual — option b)
 	}
-	signer, ok, err := signatureVerifier(env)
+	signer, ok, err := chainVerifier(ctx, segStore, mat)
 	if err != nil {
 		return err
 	}
@@ -133,7 +187,7 @@ func verifyChainSignatures(
 	ctx context.Context,
 	rootStore irbackup.Store,
 	links []lineage.SegmentRecord,
-	env crypto.EnvelopeEncryption,
+	mat verifyMaterial,
 	requireStrict bool,
 ) error {
 	hasArtifacts, err := chainHasSignatureArtifacts(ctx, rootStore, links)
@@ -143,7 +197,7 @@ func verifyChainSignatures(
 	if !requireStrict && !hasArtifacts {
 		return nil
 	}
-	signer, ok, err := signatureVerifier(env)
+	signer, ok, err := chainVerifier(ctx, rootStore, mat)
 	if err != nil {
 		return err
 	}
@@ -190,17 +244,17 @@ func verifyBackupSignatures(ctx context.Context, store irbackup.Store, records [
 		slog.InfoContext(ctx, "backup verify: chain is unsigned (pre-ADR-0154 / no signature objects); no signatures to check")
 		return 0
 	}
-	signer, ok, err := signatureVerifier(opts.Envelope)
+	signer, ok, err := chainVerifier(ctx, store, verifyMaterial{env: opts.Envelope, verifyKey: opts.VerifyKey})
 	if err != nil {
 		slog.ErrorContext(ctx, "backup verify: cannot derive verify key", slog.String("error", err.Error()))
 		return 1
 	}
 	if !ok {
 		if opts.RequireSignature {
-			slog.ErrorContext(ctx, "backup verify: signed chain but no verification key supplied and --require-signature set")
+			slog.ErrorContext(ctx, "backup verify: signed chain but no matching verification key supplied and --require-signature set")
 			return 1
 		}
-		slog.WarnContext(ctx, "backup verify: chain is signed but no verification key supplied — signatures are present-but-unverified. Re-run with --encrypt + the chain's passphrase to verify.")
+		slog.WarnContext(ctx, "backup verify: chain is signed but no matching verification key supplied — signatures are present-but-unverified. Re-run with the chain's --encrypt passphrase (HMAC-off-KEK) or --verify-key (Ed25519) to verify.")
 		return 0
 	}
 	failed := 0
