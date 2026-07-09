@@ -330,6 +330,35 @@ func TestNewGCPKMSSigner_RequiresVersion(t *testing.T) {
 	}
 }
 
+// TestGCPKMSSigner_UnversionedRefusedBeforeClientBuild pins Bug 181: the
+// versioned-CryptoKeyVersion refusal is SYNTACTIC and must fire BEFORE the
+// client build (which performs the ADC credential lookup), so a host with no
+// GCP credentials still gets the precise "needs a version" message instead of
+// an opaque "default credentials not found". Uses NO injected client so the
+// credential path is live — the sibling _RequiresVersion test injects a fake
+// (skipping ADC) and therefore could not catch the ordering bug.
+func TestGCPKMSSigner_UnversionedRefusedBeforeClientBuild(t *testing.T) {
+	const bare = "projects/p/locations/us/keyRings/r/cryptoKeys/k" // no /cryptoKeyVersions/
+	cases := []struct {
+		name string
+		call func() error
+	}{
+		{"sign", func() error { _, err := NewGCPKMSSigner(context.Background(), bare); return err }},
+		{"verify-fetch", func() error { _, err := FetchGCPKMSPublicKey(context.Background(), bare); return err }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.call()
+			if err == nil {
+				t.Fatal("accepted a bare crypto-key (no version)")
+			}
+			if !strings.Contains(err.Error(), "cryptoKeyVersion") {
+				t.Fatalf("want the versioned-CryptoKeyVersion refusal ahead of any credential lookup (Bug 181), got: %v", err)
+			}
+		})
+	}
+}
+
 // TestGCPKMSSigner_SignatureCRCMismatch pins that a signature whose
 // SignatureCrc32C does not match (a corrupted-in-transit signature) is
 // refused loudly — the GCP-specific wire-integrity check, no panic.

@@ -127,6 +127,12 @@ func NewGCPKMSSigner(ctx context.Context, keyResource string, opts ...GCPKMSSign
 	if strings.TrimSpace(keyResource) == "" {
 		return nil, errors.New("crypto: GCP KMS signing key resource is empty")
 	}
+	// Syntactic versioned-resource check BEFORE building the client: client
+	// construction does the ADC credential lookup, which on an unconfigured
+	// host fails first and masks this precise, actionable message (Bug 181).
+	if err := requireGCPVersionedResource(keyResource); err != nil {
+		return nil, err
+	}
 	o := &gcpKMSSignerOptions{}
 	for _, opt := range opts {
 		opt(o)
@@ -274,6 +280,11 @@ func FetchGCPKMSPublicKey(ctx context.Context, keyResource string, opts ...GCPKM
 	if strings.TrimSpace(keyResource) == "" {
 		return nil, errors.New("crypto: GCP KMS verify key resource is empty")
 	}
+	// Syntactic versioned-resource check before the ADC credential lookup
+	// (Bug 181) — see NewGCPKMSSigner.
+	if err := requireGCPVersionedResource(keyResource); err != nil {
+		return nil, err
+	}
 	o := &gcpKMSSignerOptions{}
 	for _, opt := range opts {
 		opt(o)
@@ -289,6 +300,20 @@ func FetchGCPKMSPublicKey(ctx context.Context, keyResource string, opts ...GCPKM
 	return pub, err
 }
 
+// requireGCPVersionedResource refuses a GCP key reference that is not a
+// versioned CryptoKeyVersion — GCP signs (and exports a public key) for a
+// specific version, not a bare crypto-key. This is a purely SYNTACTIC check
+// so it can run before any network/credential access, giving the operator
+// the precise fix rather than an opaque "default credentials not found"
+// (Bug 181). It is the GCP sibling of the parse-layer provider/malformed-ref
+// checks in cmd/sluice.
+func requireGCPVersionedResource(keyResource string) error {
+	if !strings.Contains(keyResource, "/cryptoKeyVersions/") {
+		return fmt.Errorf("crypto: GCP KMS key %q must be a versioned CryptoKeyVersion resource (.../cryptoKeys/KEY/cryptoKeyVersions/N) — GCP signs with a specific key version", keyResource)
+	}
+	return nil
+}
+
 // getGCPKMSPublicKey calls GetPublicKey, verifies the PEM's CRC32C,
 // requires a versioned resource, and parses the SPKI PEM into a stdlib
 // public key alongside the version's algorithm enum. The algorithm is the
@@ -296,8 +321,10 @@ func FetchGCPKMSPublicKey(ctx context.Context, keyResource string, opts ...GCPKM
 // no purpose field), so a non-signing key is refused by the caller's
 // [gcpAlgorithmForKeyVersionAlgorithm] mapping.
 func getGCPKMSPublicKey(ctx context.Context, client GCPKMSSignAPI, keyResource string) (stdcrypto.PublicKey, kmspb.CryptoKeyVersion_CryptoKeyVersionAlgorithm, error) {
-	if !strings.Contains(keyResource, "/cryptoKeyVersions/") {
-		return nil, 0, fmt.Errorf("crypto: GCP KMS signing key %q must be a versioned CryptoKeyVersion resource (.../cryptoKeys/KEY/cryptoKeyVersions/N) — GCP signs with a specific key version", keyResource)
+	// Defense-in-depth: the exported entry points check this before building
+	// the client (Bug 181), but re-assert at the point of use.
+	if err := requireGCPVersionedResource(keyResource); err != nil {
+		return nil, 0, err
 	}
 	out, err := client.GetPublicKey(ctx, &kmspb.GetPublicKeyRequest{Name: keyResource})
 	if err != nil {
