@@ -6,6 +6,7 @@ package pgtrigger
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -256,8 +257,9 @@ func Setup(ctx context.Context, dsn string, opts SetupOptions) (*Plan, error) {
 	}
 
 	// §14 per-table preflight: no-PK, UNLOGGED, generated columns,
-	// custom domain-over-UDT.
-	refusals, err := preflightTables(ctx, db, opts.Schema, opts.Tables)
+	// custom domain-over-UDT. Also loads each table's PK column list —
+	// renderSetupDDL bakes it into the capture trigger's TG_ARGV (N-16).
+	refusals, pkColsByTable, err := preflightTables(ctx, db, opts.Schema, opts.Tables)
 	if err != nil {
 		return nil, fmt.Errorf("pgtrigger: setup: preflight: %w", err)
 	}
@@ -280,7 +282,11 @@ func Setup(ctx context.Context, dsn string, opts SetupOptions) (*Plan, error) {
 		EventTriggerSupported: canEventTrigger,
 		PGVersionNum:          pgver,
 	}
-	plan.Statements = renderSetupDDL(opts.Schema, opts.Tables, canEventTrigger, opts.CapturePayload)
+	specs := make([]tableTriggerSpec, len(opts.Tables))
+	for i, t := range opts.Tables {
+		specs[i] = tableTriggerSpec{Name: t, PKCols: pkColsByTable[t]}
+	}
+	plan.Statements = renderSetupDDL(opts.Schema, specs, canEventTrigger, opts.CapturePayload)
 
 	if len(refusals) > 0 {
 		// Refusals block the run even on dry-run — the operator
@@ -392,11 +398,33 @@ func filterEngineInternalTables(tables []string) (kept, excluded []string) {
 	return kept, excluded
 }
 
+// tableTriggerSpec pairs one replicated table with the PK column list
+// [renderSetupDDL] bakes into its capture trigger's TG_ARGV (ADR-0066
+// §3, N-16). PKCols is in PK-constraint (conkey) order; it is empty
+// only for the §14-refused no-PK shape, which setup never applies.
+type tableTriggerSpec struct {
+	Name   string
+	PKCols []string
+}
+
+// pkColsJSON renders a trigger's TG_ARGV[0] payload: the PK column list
+// as a JSON array (`["tenant_id","order_id"]`). An empty list renders
+// `[]` — reachable only in a dry-run plan for a table the §14 preflight
+// refused; the trigger body refuses it too, defensively.
+func pkColsJSON(cols []string) string {
+	if len(cols) == 0 {
+		return "[]"
+	}
+	// json.Marshal of a []string cannot fail (no unsupported types).
+	b, _ := json.Marshal(cols)
+	return string(b)
+}
+
 // renderSetupDDL produces the ordered DDL statements that install the
 // engine. Order matters: the change-log table must exist before the
 // capture function references it; the function must exist before the
 // per-table triggers reference it.
-func renderSetupDDL(schema string, tables []string, canEventTrigger bool, payload CapturePayload) []string {
+func renderSetupDDL(schema string, tables []tableTriggerSpec, canEventTrigger bool, payload CapturePayload) []string {
 	tableRef := func(name string) string {
 		return quoteIdent(schema) + "." + quoteIdent(name)
 	}
@@ -412,8 +440,20 @@ func renderSetupDDL(schema string, tables []string, canEventTrigger bool, payloa
     before_jsonb  JSONB,
     after_jsonb   JSONB
 )`,
-		"CREATE INDEX IF NOT EXISTS sluice_change_log_id_idx ON " + tableRef(ChangeLogTable) + " (id)",
-		"CREATE INDEX IF NOT EXISTS sluice_change_log_table_idx ON " + tableRef(ChangeLogTable) + " (schema_name, table_name, id)",
+
+		// N-16 (change-log index diet): earlier releases also
+		// created sluice_change_log_id_idx ON (id) — an exact duplicate
+		// of the BIGSERIAL PK's implicit index — and
+		// sluice_change_log_table_idx ON (schema_name, table_name, id),
+		// which no engine query has ever read (poll / anchor /
+		// settle-clamp / prune / stats all key on id and txid alone).
+		// Both were maintained on EVERY captured source DML for zero
+		// read benefit — pure write amplification on tiers where the
+		// operator pays IOPS. The idempotent DROPs converge any
+		// pre-existing install to the lean shape; on a fresh install
+		// they are no-ops.
+		"DROP INDEX IF EXISTS " + tableRef("sluice_change_log_id_idx"),
+		"DROP INDEX IF EXISTS " + tableRef("sluice_change_log_table_idx"),
 
 		"CREATE TABLE IF NOT EXISTS " + tableRef(ChangeLogMetaTable) + ` (
     singleton_pk   BOOLEAN PRIMARY KEY DEFAULT TRUE,
@@ -426,11 +466,11 @@ func renderSetupDDL(schema string, tables []string, canEventTrigger bool, payloa
 			tableRef(ChangeLogMetaTable), ChangeLogSchemaVer,
 		),
 
-		// Row-event capture function. TG_RELID drives a catalog
-		// lookup at fire time to discover the source table's PK
-		// column list; jsonb_object_agg projects pk_jsonb out of
-		// OLD/NEW. The capture-payload mode (ADR-0068) selects the
-		// per-op v_before / v_after assignment block.
+		// Row-event capture function. TG_ARGV[0] carries the table's
+		// PK column list, baked in per-trigger below (N-16);
+		// jsonb_object_agg projects pk_jsonb out of OLD/NEW. The
+		// capture-payload mode (ADR-0068) selects the per-op
+		// v_before / v_after assignment block.
 		renderCaptureRowFunction(schema, tableRef(ChangeLogTable), payload),
 
 		// TRUNCATE companion — separate function because TRUNCATE
@@ -444,7 +484,7 @@ func renderSetupDDL(schema string, tables []string, canEventTrigger bool, payloa
 		// TG_ARGV payload. PG does not have CREATE OR REPLACE TRIGGER
 		// on row triggers (it does on PG 14+, but the engine's floor
 		// is PG 13); a DROP IF EXISTS + CREATE is the portable shape.
-		fqTable := quoteIdent(schema) + "." + quoteIdent(t)
+		fqTable := quoteIdent(schema) + "." + quoteIdent(t.Name)
 		out = append(
 			out,
 			fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON %s", quoteIdent(CaptureTriggerRow), fqTable),
@@ -453,7 +493,7 @@ func renderSetupDDL(schema string, tables []string, canEventTrigger bool, payloa
 				quoteIdent(CaptureTriggerRow),
 				fqTable,
 				tableRef(CaptureFunctionRow),
-				quoteSQLString(t),
+				quoteSQLString(pkColsJSON(t.PKCols)),
 			),
 			// TRUNCATE trigger.
 			fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON %s", quoteIdent("sluice_capture_truncate"), fqTable),
@@ -501,20 +541,22 @@ func ddlFnRef(schema string) string {
 // statement for the shared row-event capture function. ADR-0066 §3,
 // ADR-0068 (the capture-payload modes).
 //
-// TG_ARGV[0] carries the source-table-qualified name; the function
-// reads pg_attribute through information_schema to derive the PK
-// column list at trigger fire time. Storing the PK list in TG_ARGV
-// at CREATE TRIGGER time is the §3-described shape, but for v1 the
-// simpler form is to look the PK up via to_jsonb-mediated catalog
-// access. The catalog hit per row is fine for Phase 1's design
-// ceiling (§11) — the §11 5000/sec ceiling is on the change-log
-// write path, not the function's complexity.
+// TG_ARGV[0] carries the table's PK column list as a JSON array, baked
+// in at setup time by [renderSetupDDL] — the §3-described shape (N-16).
+// v1 instead re-derived the list from a pg_constraint/pg_attribute join
+// at trigger fire time: a per-fired-row catalog join for a list that
+// only changes on ALTER TABLE, i.e. pure source-write amplification on
+// every captured DML. The baked list can go stale if the table's PK is
+// ALTERed after setup; the projection guard in the body refuses such
+// writes loudly (see its comment for the tier-by-tier posture), and
+// re-running Setup re-bakes it (the per-table DROP + CREATE TRIGGER
+// refreshes TG_ARGV).
 //
-// The PK-discovery block, the INSERT branch, the INSERT INTO
-// scaffolding, SECURITY DEFINER, and SET search_path are SHARED across
-// all three payload modes — only the UPDATE/DELETE v_before/v_after
-// assignment block differs (ADR-0068). The per-mode block is produced
-// by captureUpdateDeleteBlock so the shared scaffold lives in exactly
+// The PK-list block, the INSERT branch, the INSERT INTO scaffolding,
+// SECURITY DEFINER, and SET search_path are SHARED across all three
+// payload modes — only the UPDATE/DELETE v_before/v_after assignment
+// block differs (ADR-0068). The per-mode block is produced by
+// captureUpdateDeleteBlock so the shared scaffold lives in exactly
 // one place.
 func renderCaptureRowFunction(schema, changeLogTableRef string, payload CapturePayload) string {
 	// Hand-written SQL — the source string is operator-readable and
@@ -541,21 +583,23 @@ DECLARE
     v_new_json JSONB;
     v_old_json JSONB;
 BEGIN
-    -- Discover the source table's PK column list at fire time.
-    SELECT array_agg(att.attname::text ORDER BY array_position(con.conkey, att.attnum))
-      INTO v_pk_cols
-      FROM pg_constraint con
-      JOIN pg_attribute  att
-        ON att.attrelid = con.conrelid
-       AND att.attnum   = ANY(con.conkey)
-     WHERE con.conrelid = TG_RELID
-       AND con.contype  = 'p';
+    -- The PK column list is baked into TG_ARGV[0] at setup time as a
+    -- JSON array (ADR-0066 §3, N-16). Earlier releases re-derived it
+    -- from the PK catalogs on EVERY fired row. Staleness (PK ALTERed
+    -- after setup) fails loudly at the projection guard before the
+    -- INSERT below.
+    IF TG_NARGS = 0 OR TG_ARGV[0] IS NULL THEN
+        RAISE EXCEPTION 'sluice_capture_change: trigger on %.% carries no baked PK column list (TG_ARGV[0]); re-run sluice trigger setup to reinstall the trigger',
+            TG_TABLE_SCHEMA, TG_TABLE_NAME;
+    END IF;
+    v_pk_cols := ARRAY(SELECT jsonb_array_elements_text(TG_ARGV[0]::jsonb));
 
-    IF v_pk_cols IS NULL OR array_length(v_pk_cols, 1) IS NULL THEN
+    IF cardinality(v_pk_cols) = 0 THEN
         -- No PK on the source table. The setup preflight refuses this
-        -- shape (§14), but a defensive guard here keeps a manually-
-        -- attached trigger from silently producing pk_jsonb=NULL rows
-        -- that the applier can't dispatch.
+        -- shape (§14) and only ever renders an empty list into a
+        -- dry-run plan it refuses to apply, but a defensive guard here
+        -- keeps a manually-attached trigger from silently producing
+        -- pk_jsonb=NULL rows that the applier can't dispatch.
         RAISE EXCEPTION 'sluice_capture_change: table %.% has no PRIMARY KEY; refuse-loudly per ADR-0066 §14',
             TG_TABLE_SCHEMA, TG_TABLE_NAME;
     END IF;
@@ -569,6 +613,22 @@ BEGIN
         v_pk     := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(v_after) WHERE key = ANY(v_pk_cols));
 ` + captureUpdateDeleteBlock(payload) + `    ELSE
         RAISE EXCEPTION 'sluice_capture_change: unexpected TG_OP %', TG_OP;
+    END IF;
+
+    -- Stale-baked-list guard (loud failure beats silent corruption):
+    -- every baked PK column must project out of the row image, and PK
+    -- columns are NOT NULL, so a missing key can only mean the table's
+    -- PK no longer matches what setup baked (ALTERed / column renamed
+    -- after setup). On the event-trigger tier the ALTER independently
+    -- refuses the stream at its op='X' row BEFORE any post-ALTER DML
+    -- row is consumed (ALTER TABLE's ACCESS EXCLUSIVE lock orders the
+    -- X row ahead of them); this guard is the net for the
+    -- polled-fingerprint tier and for manual trigger surgery, where a
+    -- stale list would otherwise capture rows keyed on the wrong
+    -- columns. Recovery is a setup re-run, which re-bakes TG_ARGV.
+    IF v_pk IS NULL OR (SELECT count(*) FROM jsonb_object_keys(v_pk)) <> cardinality(v_pk_cols) THEN
+        RAISE EXCEPTION 'sluice_capture_change: baked PK column list % no longer matches the row image of %.% (PRIMARY KEY altered after setup?); re-run sluice trigger setup to re-bake the capture trigger',
+            v_pk_cols, TG_TABLE_SCHEMA, TG_TABLE_NAME;
     END IF;
 
     INSERT INTO ` + changeLogTableRef + `
@@ -782,15 +842,19 @@ func renderTeardownDDL(schema string, tables []string, keepData bool) []string {
 // preflightTables runs the §14 per-table refuse-loudly checks. Each
 // refusal carries an operator-actionable Hint string. Returns nil
 // (not an empty slice) on a clean preflight so callers can distinguish
-// "nothing to refuse" from "preflight ran".
-func preflightTables(ctx context.Context, db *sql.DB, schema string, tables []string) ([]TableRefusal, error) {
+// "nothing to refuse" from "preflight ran". The second return maps each
+// table to its PK column list (conkey order) — the setup-time source of
+// the trigger's baked TG_ARGV payload (N-16).
+func preflightTables(ctx context.Context, db *sql.DB, schema string, tables []string) ([]TableRefusal, map[string][]string, error) {
 	var refusals []TableRefusal
+	pkColsByTable := make(map[string][]string, len(tables))
 	for _, t := range tables {
-		hasPK, isUnlogged, hasGenerated, hasUnrecognisedDomain, err := loadTableShape(ctx, db, schema, t)
+		pkCols, isUnlogged, hasGenerated, hasUnrecognisedDomain, err := loadTableShape(ctx, db, schema, t)
 		if err != nil {
-			return nil, fmt.Errorf("load table shape %s.%s: %w", schema, t, err)
+			return nil, nil, fmt.Errorf("load table shape %s.%s: %w", schema, t, err)
 		}
-		if !hasPK {
+		pkColsByTable[t] = pkCols
+		if len(pkCols) == 0 {
 			refusals = append(refusals, TableRefusal{
 				Schema: schema, Table: t,
 				Reason: "no-primary-key",
@@ -819,24 +883,31 @@ func preflightTables(ctx context.Context, db *sql.DB, schema string, tables []st
 			})
 		}
 	}
-	return refusals, nil
+	return refusals, pkColsByTable, nil
 }
 
-// loadTableShape returns the per-table boolean flags the preflight
-// classifies on. A missing relation (the table doesn't exist) is
-// returned as hasPK=false; the no-primary-key refusal then fires
-// downstream, which is the right operator-facing message ("add a PK
-// to a table that doesn't exist" reads weird but it's better than a
-// raw catalog error).
-func loadTableShape(ctx context.Context, db *sql.DB, schema, table string) (hasPK, isUnlogged, hasGenerated, hasUnrecognisedDomain bool, err error) {
+// loadTableShape returns the per-table flags the preflight classifies
+// on, plus the table's PK column list in PK-constraint (conkey) order —
+// the same catalog derivation the capture trigger ran per fired row
+// before N-16 baked it into TG_ARGV at setup time. A missing relation
+// (the table doesn't exist) returns an empty pkCols; the no-primary-key
+// refusal then fires downstream, which is the right operator-facing
+// message ("add a PK to a table that doesn't exist" reads weird but
+// it's better than a raw catalog error). The list crosses the wire as
+// a JSON array (`to_jsonb(...)::text`) because database/sql has no
+// portable text[] scan; encoding/json decodes it exactly.
+func loadTableShape(ctx context.Context, db *sql.DB, schema, table string) (pkCols []string, isUnlogged, hasGenerated, hasUnrecognisedDomain bool, err error) {
 	const q = `
 SELECT
-    EXISTS (
-        SELECT 1
-          FROM pg_constraint c
-         WHERE c.conrelid = (SELECT oid FROM pg_class WHERE relname = $2 AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1))
-           AND c.contype = 'p'
-    ) AS has_pk,
+    COALESCE((
+        SELECT to_jsonb(array_agg(att.attname::text ORDER BY array_position(con.conkey, att.attnum)))::text
+          FROM pg_constraint con
+          JOIN pg_attribute  att
+            ON att.attrelid = con.conrelid
+           AND att.attnum   = ANY(con.conkey)
+         WHERE con.conrelid = (SELECT oid FROM pg_class WHERE relname = $2 AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1))
+           AND con.contype  = 'p'
+    ), '[]') AS pk_cols,
     COALESCE(
         (SELECT relpersistence = 'u'
            FROM pg_class
@@ -866,11 +937,15 @@ SELECT
            AND bt.typtype IN ('c', 'e', 'd', 'p')    -- composite/enum/domain/pseudo: refuse
     ) AS has_unrecognised_domain
 `
+	var pkColsJSONText string
 	row := db.QueryRowContext(ctx, q, schema, table)
-	if err := row.Scan(&hasPK, &isUnlogged, &hasGenerated, &hasUnrecognisedDomain); err != nil {
-		return false, false, false, false, err
+	if err := row.Scan(&pkColsJSONText, &isUnlogged, &hasGenerated, &hasUnrecognisedDomain); err != nil {
+		return nil, false, false, false, err
 	}
-	return hasPK, isUnlogged, hasGenerated, hasUnrecognisedDomain, nil
+	if err := json.Unmarshal([]byte(pkColsJSONText), &pkCols); err != nil {
+		return nil, false, false, false, fmt.Errorf("decode PK column list %q: %w", pkColsJSONText, err)
+	}
+	return pkCols, isUnlogged, hasGenerated, hasUnrecognisedDomain, nil
 }
 
 // canCreateEventTrigger reports whether the connecting role is a
