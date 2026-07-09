@@ -307,7 +307,7 @@ func (m *MigrateCmd) run(g *Globals, env *envelopeRun) error {
 		return err
 	}
 
-	source, target, cleanup, err := m.resolveEngines(g)
+	source, target, cleanup, err := m.resolveEngines(kongContext(), g)
 	if err != nil {
 		return err
 	}
@@ -504,7 +504,11 @@ func (m *MigrateCmd) run(g *Globals, env *envelopeRun) error {
 // it re-points m.Source / m.SourceDriver at the staged file and returns
 // the staged-file cleanup; every non-staging path returns a no-op
 // cleanup. The caller defers cleanup for the lifetime of the run.
-func (m *MigrateCmd) resolveEngines(g *Globals) (source, target ir.Engine, cleanup func(), err error) {
+// ctx must be the signal-aware command context: the D1 staging replica
+// can run for minutes, and a context.Background() here made it
+// Ctrl-C-deaf (the operator's interrupt neither stopped the HTTP
+// paging nor released the temp dir until process kill).
+func (m *MigrateCmd) resolveEngines(ctx context.Context, g *Globals) (source, target ir.Engine, cleanup func(), err error) {
 	cleanup = func() {}
 	source, err = resolveEngine(m.SourceDriver)
 	if err != nil {
@@ -543,7 +547,7 @@ func (m *MigrateCmd) resolveEngines(g *Globals) (source, target ir.Engine, clean
 				"D1 rejects the rich-type validation patterns (error code 7500). Replicating the " +
 				"database to a local SQLite file first; pass --no-stage-local to use the direct path instead.")
 		}
-		staged, stageCleanup, serr := stageD1Source(context.Background(), m.Source)
+		staged, stageCleanup, serr := stageD1Source(ctx, m.Source)
 		if serr != nil {
 			return nil, nil, cleanup, serr
 		}
