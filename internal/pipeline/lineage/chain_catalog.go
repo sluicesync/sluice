@@ -49,6 +49,7 @@ import (
 	"sort"
 	"time"
 
+	"sluicesync.dev/sluice/internal/crypto"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
@@ -292,8 +293,9 @@ type SegmentRecord struct {
 // ResolveLineage returns the lineage for store. When lineage.json is
 // present it's authoritative. When UNREADABLE (parse/version/IO
 // error), [LoadLineageCatalog] already surfaced a loud error. When
-// ABSENT, a single synthetic root segment (Dir == "", codec
-// [blobcodec.DefaultCodec]) is constructed over the conventional layout — the
+// ABSENT, a single synthetic root segment (Dir == "", codec sniffed
+// from chunk magic — [blobcodec.DefaultCodec] only as the assumed
+// fallback, audit N-14) is constructed over the conventional layout — the
 // pre-ADR single-chain shape, a one-segment lineage by strict
 // generalization — BUT only if the on-disk shape is genuinely
 // single-segment. If rotation-opened segment sub-dirs (`seg-*`) exist
@@ -341,7 +343,6 @@ func ResolveLineage(ctx context.Context, store irbackup.Store) (*Catalog, error)
 	root := &Segment{
 		Dir:              "",
 		FullManifestPath: ManifestFileName,
-		Codec:            blobcodec.DefaultCodec,
 	}
 	exists, err := store.Exists(ctx, ManifestFileName)
 	if err != nil {
@@ -366,6 +367,33 @@ func ResolveLineage(ctx context.Context, store irbackup.Store) (*Catalog, error)
 		if isIncrementalManifestPath(p) {
 			root.Incrementals = append(root.Incrementals, p)
 		}
+	}
+	// The synthetic root's codec is SNIFFED from chunk magic bytes, not
+	// assumed (audit N-14): a gzip/none-era chain whose lineage.json was
+	// lost previously got DefaultCodec stamped here and every consumer
+	// (restore / verify / chain-walk) then hit a bare zstd decode error.
+	// Best-effort posture — this result is in-memory (re-derived per
+	// call, never written), so on any probe failure the write default is
+	// assumed with a WARN naming the assumption; a wrong assumption
+	// still fails LOUDLY at the first chunk decode, and `backup verify
+	// --rebuild-catalog` (which sniffs strictly, with key material for
+	// encrypted chains) records the truth durably.
+	root.Codec = blobcodec.DefaultCodec
+	sniffed, found, sniffErr := sniffLegacyRootCodec(ctx, store, fullM, root.Incrementals)
+	switch {
+	case sniffErr != nil:
+		slog.WarnContext(
+			ctx, "lineage: cannot sniff the codec for the synthetic root segment; assuming the write default — if chunk decodes fail, run `sluice backup verify --rebuild-catalog` (with --encrypt + key material for an encrypted chain) to sniff and record the true codec",
+			slog.String("assumed_codec", string(blobcodec.DefaultCodec)),
+			slog.String("reason", sniffErr.Error()),
+		)
+	case !found:
+		slog.WarnContext(
+			ctx, "lineage: chain references no chunks; assuming the write default codec for the synthetic root segment",
+			slog.String("assumed_codec", string(blobcodec.DefaultCodec)),
+		)
+	default:
+		root.Codec = sniffed
 	}
 	return &Catalog{
 		FormatVersion: lineageCatalogFormatVersion,
@@ -591,7 +619,20 @@ func CanonicalKind(kind string) string {
 // rotated lineage's sub-dir structure is not recoverable without the
 // catalog, by design (the catalog IS the structural record for a
 // rotated backup). Returns the segment + manifest count.
-func RebuildLineageCatalogAt(ctx context.Context, store irbackup.Store) (segments, manifests int, err error) {
+//
+// The rebuilt segment's codec is SNIFFED from chunk magic bytes and
+// VERIFIED across the chain ([SniffChainCodec] — audit N-14; the
+// pre-fix rebuild stamped [blobcodec.DefaultCodec] unconditionally, so
+// a gzip/none chain got a rebuilt record that LIED and restore failed
+// with a bare zstd decode error whose remediation hint pointed back at
+// this very tool). Because this path writes the DURABLE record restore
+// will trust, every ambiguity refuses loudly: mixed probes, unreadable
+// chunks, unknown magic, and encrypted chunks without env (the codec is
+// sealed inside the encryption envelope — supply the chain's read
+// envelope, built from the operator's --encrypt flags; nil is fine for
+// plaintext chains). Only a chain with NO chunks at all falls back to
+// [blobcodec.DefaultCodec], with a WARN naming the assumption.
+func RebuildLineageCatalogAt(ctx context.Context, store irbackup.Store, env crypto.EnvelopeEncryption) (segments, manifests int, err error) {
 	recs, err := ListAllManifestsViaWalk(ctx, store)
 	if err != nil {
 		return 0, 0, err
@@ -599,11 +640,33 @@ func RebuildLineageCatalogAt(ctx context.Context, store irbackup.Store) (segment
 	if len(recs) == 0 {
 		return 0, 0, errors.New("rebuild: no manifests found at the conventional layout")
 	}
+	codec, found, err := SniffChainCodec(ctx, store, recs, env)
+	switch {
+	case errors.Is(err, ErrCodecSniffEncrypted):
+		return 0, 0, fmt.Errorf(
+			"rebuild: %w — re-run `sluice backup verify --rebuild-catalog` with --encrypt and the chain's "+
+				"passphrase / KMS reference so the codec can be read from a decrypted chunk; recording a guessed "+
+				"codec is the exact wrong-heal this rebuild used to perform (audit N-14)", err,
+		)
+	case err != nil:
+		return 0, 0, fmt.Errorf("rebuild: sniff segment codec: %w", err)
+	case !found:
+		codec = blobcodec.DefaultCodec
+		slog.WarnContext(
+			ctx, "rebuild: chain references no chunks; recording the write-default codec on the rebuilt segment (assumption — nothing to probe)",
+			slog.String("assumed_codec", string(codec)),
+		)
+	default:
+		slog.InfoContext(
+			ctx, "rebuild: segment codec sniffed from chunk magic bytes",
+			slog.String("codec", string(codec)),
+		)
+	}
 	now := time.Now().UTC()
 	root := Segment{
 		Dir:              "",
 		FullManifestPath: ManifestFileName,
-		Codec:            blobcodec.DefaultCodec,
+		Codec:            codec,
 	}
 	for _, r := range recs {
 		switch CanonicalKind(r.Manifest.Kind) {

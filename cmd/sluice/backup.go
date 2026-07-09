@@ -894,7 +894,7 @@ type BackupVerifyCmd struct {
 	BackupRegion    string `help:"Override the S3 region. Only meaningful when --from is an s3:// URL." placeholder:"REGION"`
 	BackupPathStyle bool   `help:"Force path-style addressing. Only meaningful when --from is an s3:// URL."`
 
-	RebuildCatalog bool `help:"Rebuild lineage.json from scratch by walking the conventional one-segment layout (manifest.json + manifests/incr-*.json), then exit. Use after manual mutation of a single-segment backup. NOTE: a multi-segment (rotated) lineage's sub-dir structure is NOT reconstructable from a bare walk by design — lineage.json IS the structural record for a rotated backup."`
+	RebuildCatalog bool `help:"Rebuild lineage.json from scratch by walking the conventional one-segment layout (manifest.json + manifests/incr-*.json), then exit. Use after manual mutation of a single-segment backup. The segment's compression codec is sniffed from chunk magic bytes; for an ENCRYPTED chain also pass --encrypt + the chain's passphrase / KMS reference (the codec is sealed inside the encryption envelope). NOTE: a multi-segment (rotated) lineage's sub-dir structure is NOT reconstructable from a bare walk by design — lineage.json IS the structural record for a rotated backup."`
 
 	EncryptionFlags
 }
@@ -920,7 +920,21 @@ func (v *BackupVerifyCmd) Run(_ *Globals) error {
 		defer func() { _ = closer() }()
 	}
 	if v.RebuildCatalog {
-		segments, manifests, err := lineage.RebuildLineageCatalogAt(ctx, store)
+		// The rebuilt record's codec is sniffed from chunk bytes (audit
+		// N-14). For an ENCRYPTED chain the codec sits inside the
+		// encryption envelope, so build the read envelope from the
+		// operator's --encrypt flags first (nil when not passed — fine
+		// for plaintext chains; the rebuild refuses loudly if it turns
+		// out to need one).
+		rootManifest, err := lineage.ReadRootManifest(ctx, store)
+		if err != nil {
+			return fmt.Errorf("rebuild lineage catalog: read root manifest: %w", err)
+		}
+		envelope, err := v.buildReadEnvelope(rootManifest)
+		if err != nil {
+			return err
+		}
+		segments, manifests, err := lineage.RebuildLineageCatalogAt(ctx, store, envelope)
 		if err != nil {
 			return fmt.Errorf("rebuild lineage catalog: %w", err)
 		}

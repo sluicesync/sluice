@@ -17,6 +17,12 @@ package blobcodec
 // from the segment, full stop. An unknown / garbled recorded codec is
 // a loud refusal (DR data — loud-fail, never silent-assemble).
 //
+// The ONE exception is record-(re)creation time: when lineage.json
+// itself was lost, `backup verify --rebuild-catalog` re-derives the
+// record from chunk magic bytes ([SniffCodec], audit N-14 — stamping
+// the default there wrote a record that lied for gzip/none chains).
+// Restore still trusts the record; only the record's rebirth sniffs.
+//
 // zstd uses klauspost/compress/zstd at SpeedDefault and is the
 // v0.67.0+ default ([DefaultCodec]). Grounded in
 // docs/dev/notes/compression-benchmark.md's decode-inclusive evidence:
