@@ -141,3 +141,91 @@ func TestHTTPFetcherUnreachableIsError(t *testing.T) {
 		t.Fatalf("unreachable server should be an error")
 	}
 }
+
+// TestRedactConnect pins the display-redaction helper: a basic-auth
+// password never survives into the redacted form, across the URL,
+// bare-host, and unparseable shapes.
+func TestRedactConnect(t *testing.T) {
+	const secret = "s3cretpw"
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "no userinfo unchanged", in: "http://host:9300", want: "http://host:9300"},
+		{name: "bare host unchanged", in: "localhost:9300", want: "localhost:9300"},
+		{name: "url userinfo redacted", in: "http://admin:" + secret + "@host:9300", want: "http://admin:xxxxx@host:9300"},
+		{name: "bare userinfo redacted", in: "admin:" + secret + "@host:9300", want: "admin:xxxxx@host:9300"},
+		{name: "username only kept", in: "http://admin@host:9300", want: "http://admin@host:9300"},
+		{name: "unparseable falls back to post-@", in: "admin:" + secret + "@ho st\x7f:9300", want: "ho st\x7f:9300"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := redactConnect(c.in)
+			if got != c.want {
+				t.Errorf("redactConnect(%q) = %q, want %q", c.in, got, c.want)
+			}
+			if strings.Contains(got, secret) {
+				t.Errorf("redactConnect(%q) leaked the password: %q", c.in, got)
+			}
+		})
+	}
+}
+
+// TestNormalizeURL_KeepsUserinfoForFetch pins that the FETCH endpoint
+// (unlike the display surfaces) retains basic-auth userinfo — Go's
+// HTTP client sends it as an Authorization header, so stripping it
+// here would silently break an auth-fronted dashboard.
+func TestNormalizeURL_KeepsUserinfoForFetch(t *testing.T) {
+	got, err := NormalizeURL("http://admin:pw@host:9300")
+	if err != nil {
+		t.Fatalf("NormalizeURL: %v", err)
+	}
+	if got != "http://admin:pw@host:9300/api/fleet" {
+		t.Fatalf("endpoint = %q; want the userinfo retained", got)
+	}
+}
+
+// TestHTTPFetcher_ErrorsRedactUserinfo pins that a --connect endpoint
+// carrying basic-auth never leaks the password into fetch-error text —
+// the errors surface verbatim in the unreachable banner. Covers both
+// error shapes that name the endpoint: transport failure and non-200.
+func TestHTTPFetcher_ErrorsRedactUserinfo(t *testing.T) {
+	const secret = "s3cretpw"
+
+	t.Run("transport error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		host := strings.TrimPrefix(srv.URL, "http://")
+		srv.Close()
+		endpoint, err := NormalizeURL("http://admin:" + secret + "@" + host)
+		if err != nil {
+			t.Fatalf("normalize: %v", err)
+		}
+		_, err = HTTPFetcher(endpoint, 1*time.Second)(context.Background())
+		if err == nil {
+			t.Fatal("expected a transport error from the closed server")
+		}
+		if strings.Contains(err.Error(), secret) {
+			t.Errorf("fetch error leaked the password: %q", err.Error())
+		}
+	})
+
+	t.Run("non-200 status", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer srv.Close()
+		host := strings.TrimPrefix(srv.URL, "http://")
+		endpoint, err := NormalizeURL("http://admin:" + secret + "@" + host)
+		if err != nil {
+			t.Fatalf("normalize: %v", err)
+		}
+		_, err = HTTPFetcher(endpoint, 5*time.Second)(context.Background())
+		if err == nil {
+			t.Fatal("expected a non-200 error")
+		}
+		if strings.Contains(err.Error(), secret) {
+			t.Errorf("fetch error leaked the password: %q", err.Error())
+		}
+	})
+}

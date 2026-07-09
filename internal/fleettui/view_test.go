@@ -125,6 +125,27 @@ func TestViewBannerOnConnErrKeepsTable(t *testing.T) {
 	}
 }
 
+// TestViewBannerRedactsConnectUserinfo pins the production New →
+// banner path: a --connect value carrying basic-auth userinfo must
+// never render its password bytes in the unreachable banner. The
+// username survives (it locates the endpoint); only the password is
+// masked.
+func TestViewBannerRedactsConnectUserinfo(t *testing.T) {
+	const secret = "s3cretpw"
+	m, err := New("http://admin:"+secret+"@localhost:9300", 2*time.Second)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	m.connErr = os.ErrDeadlineExceeded
+	out := m.View()
+	if strings.Contains(out, secret) {
+		t.Fatalf("banner leaked the connect password:\n%s", out)
+	}
+	if !strings.Contains(out, "admin:xxxxx@localhost:9300") {
+		t.Errorf("banner should show the redacted connect address\n%s", out)
+	}
+}
+
 func TestViewEmptyFleet(t *testing.T) {
 	m := NewWithFetch(":9300", time.Second, stubFetch(fleetReport{}))
 	mm, _ := m.Update(fleetMsg(fleetReport{}))

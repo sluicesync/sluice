@@ -92,12 +92,17 @@ type Model struct {
 // New builds a production Model: it normalizes connect into the
 // `/api/fleet` URL, wires the HTTP fetcher, and records connect as the
 // banner address. refresh is the poll interval (and the footer hint).
+// The banner address is stored pre-redacted: a --connect value can
+// carry basic-auth userinfo, and the banner (View) must never render
+// the password. The un-redacted endpoint still drives the fetch —
+// userinfo is functional there (Go's HTTP client sends it as basic
+// auth).
 func New(connect string, refresh time.Duration) (Model, error) {
 	endpoint, err := NormalizeURL(connect)
 	if err != nil {
 		return Model{}, err
 	}
-	return NewWithFetch(connect, refresh, HTTPFetcher(endpoint, fetchTimeout(refresh))), nil
+	return NewWithFetch(redactConnect(connect), refresh, HTTPFetcher(endpoint, fetchTimeout(refresh))), nil
 }
 
 // NewWithFetch builds a Model with an injected fetcher. The production
@@ -234,8 +239,13 @@ func fetchTimeout(refresh time.Duration) time.Duration {
 // and decodes the report. Every failure (build, transport, non-200,
 // decode) is wrapped so the banner names what went wrong. timeout
 // bounds each request.
+//
+// Error messages name the endpoint through its redacted form: the
+// endpoint may carry basic-auth userinfo (which the fetch itself
+// uses), and these errors surface verbatim in the unreachable banner.
 func HTTPFetcher(endpoint string, timeout time.Duration) FetchFunc {
 	client := &http.Client{Timeout: timeout}
+	display := redactConnect(endpoint)
 	return func(ctx context.Context) (fleetReport, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, http.NoBody)
 		if err != nil {
@@ -243,11 +253,11 @@ func HTTPFetcher(endpoint string, timeout time.Duration) FetchFunc {
 		}
 		resp, err := client.Do(req)
 		if err != nil {
-			return fleetReport{}, fmt.Errorf("fetch %s: %w", endpoint, err)
+			return fleetReport{}, fmt.Errorf("fetch %s: %w", display, err)
 		}
 		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != http.StatusOK {
-			return fleetReport{}, fmt.Errorf("fetch %s: unexpected status %s", endpoint, resp.Status)
+			return fleetReport{}, fmt.Errorf("fetch %s: unexpected status %s", display, resp.Status)
 		}
 		var rep fleetReport
 		if err := json.NewDecoder(resp.Body).Decode(&rep); err != nil {
@@ -289,4 +299,36 @@ func NormalizeURL(connect string) (string, error) {
 		u.Path = trimmed
 	}
 	return u.String(), nil
+}
+
+// redactConnect returns s with any basic-auth password replaced by
+// url.URL.Redacted's "xxxxx" placeholder, for DISPLAY surfaces only
+// (the banner address and fetch-error text). A --connect value can
+// carry userinfo, and every rendered copy of it must be credential-
+// free; the un-redacted form keeps driving the actual fetch. If s
+// doesn't parse as a URL, the fallback keeps only the part after the
+// last "@" — guaranteed to drop the userinfo rather than risk echoing
+// it.
+func redactConnect(s string) string {
+	raw := strings.TrimSpace(s)
+	parseable := raw
+	if !strings.Contains(parseable, "://") {
+		// Mirror NormalizeURL's scheme default so a bare
+		// "user:pass@host:port" parses (and redacts) the same way.
+		parseable = "http://" + parseable
+	}
+	if u, err := url.Parse(parseable); err == nil {
+		if u.User == nil {
+			return raw
+		}
+		red := u.Redacted()
+		if !strings.Contains(raw, "://") {
+			red = strings.TrimPrefix(red, "http://")
+		}
+		return red
+	}
+	if i := strings.LastIndex(raw, "@"); i >= 0 {
+		return raw[i+1:]
+	}
+	return raw
 }
