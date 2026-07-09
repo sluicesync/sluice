@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // exactSourceEngine is a stubEngine whose OpenRowReader hands back a fake
@@ -109,7 +110,7 @@ func TestFloatExactPatchReader_PatchesRoundedFloats(t *testing.T) {
 	if _, ok := plan["metrics"]; !ok {
 		t.Fatal("metrics must be in the backup float plan")
 	}
-	pr := newFloatExactPatchReader(inner, src, "dsn", plan)
+	pr := newFloatExactPatchReader(inner, src, "dsn", plan, 0, false)
 
 	ch, err := pr.ReadRows(context.Background(), table)
 	if err != nil {
@@ -159,7 +160,7 @@ func TestFloatExactPatchReader_NonPlanTablePassthrough(t *testing.T) {
 	inner := &fakeInnerReader{rows: []ir.Row{{"id": int64(1)}}}
 	// Empty plan → passthrough; source OpenRowReader must never be called
 	// (stubEngine panics if it is).
-	pr := newFloatExactPatchReader(inner, exactSourceEngine{}, "dsn", map[string]floatPatchTable{})
+	pr := newFloatExactPatchReader(inner, exactSourceEngine{}, "dsn", map[string]floatPatchTable{}, 0, false)
 	ch, err := pr.ReadRows(context.Background(), table)
 	if err != nil {
 		t.Fatalf("ReadRows: %v", err)
@@ -170,6 +171,79 @@ func TestFloatExactPatchReader_NonPlanTablePassthrough(t *testing.T) {
 	}
 	if n != 1 {
 		t.Errorf("passthrough row count = %d; want 1", n)
+	}
+}
+
+// floatTable + floatRows build a small repairable metrics table + its
+// inner (rounded) rows and exact source, shared by the over-cap pins.
+func floatTable() *ir.Table {
+	return &ir.Table{
+		Name: "metrics",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "fl", Type: ir.Float{Precision: ir.FloatSingle}, Nullable: true},
+		},
+		PrimaryKey: &ir.Index{Name: "pk", Columns: []ir.IndexColumn{{Column: "id"}}},
+	}
+}
+
+// TestFloatExactPatchReader_OverCap_DefaultFallsBackRounded pins the
+// bounded-memory floor: a table whose exact re-read would exceed the row
+// cap falls back to the rounded COPY values (no unbounded buffer, no error)
+// under the default posture.
+func TestFloatExactPatchReader_OverCap_DefaultFallsBackRounded(t *testing.T) {
+	table := floatTable()
+	inner := &fakeInnerReader{rows: []ir.Row{
+		{"id": int64(1), "fl": float64(8388610)}, // rounded
+		{"id": int64(2), "fl": float64(-123457)},
+	}}
+	src := exactSourceEngine{rows: []ir.Row{
+		{"id": int64(1), "fl": float64(float32(8388608))},
+		{"id": int64(2), "fl": float64(float32(-123456.789))},
+	}}
+	plan := planBackupFloatRepair(&ir.Schema{Tables: []*ir.Table{table}})
+
+	// maxRows = 1, but the exact scan has 2 rows → over cap → rounded fallback.
+	pr := newFloatExactPatchReader(inner, src, "dsn", plan, 1, false)
+	ch, err := pr.ReadRows(context.Background(), table)
+	if err != nil {
+		t.Fatalf("over-cap default must NOT error; got: %v", err)
+	}
+	got := map[int64]float64{}
+	for row := range ch {
+		got[row["id"].(int64)] = row["fl"].(float64)
+	}
+	// Values are the inner (rounded) ones — the exact map was never applied.
+	if got[1] != 8388610 || got[2] != -123457 {
+		t.Errorf("over-cap default: fl values = %v; want the rounded COPY values (no exact patch)", got)
+	}
+}
+
+// TestFloatExactPatchReader_OverCap_StrictRefuses pins that under
+// --strict-float an over-cap table refuses with the coded error rather than
+// archiving rounded.
+func TestFloatExactPatchReader_OverCap_StrictRefuses(t *testing.T) {
+	table := floatTable()
+	inner := &fakeInnerReader{rows: []ir.Row{{"id": int64(1), "fl": float64(8388610)}, {"id": int64(2), "fl": float64(1)}}}
+	src := exactSourceEngine{rows: []ir.Row{
+		{"id": int64(1), "fl": float64(float32(8388608))},
+		{"id": int64(2), "fl": float64(float32(1))},
+	}}
+	plan := planBackupFloatRepair(&ir.Schema{Tables: []*ir.Table{table}})
+
+	pr := newFloatExactPatchReader(inner, src, "dsn", plan, 1, true)
+	_, err := pr.ReadRows(context.Background(), table)
+	if err == nil {
+		t.Fatal("over-cap under --strict-float must refuse; got nil")
+	}
+	ce, ok := sluicecode.FromError(err)
+	if !ok || ce.Code != sluicecode.CodeVStreamFloatLossy {
+		t.Errorf("over-cap strict refusal code = %v (ok=%v); want %s", func() any {
+			if ce != nil {
+				return ce.Code
+			}
+			return nil
+		}(), ok, sluicecode.CodeVStreamFloatLossy)
 	}
 }
 

@@ -112,7 +112,7 @@ var registry = map[Code]Info{
 	CodeConfirmationRequired:      {ClassRefusal, "destructive operation requires explicit --yes confirmation"},
 	CodeDriverHostMismatch:        {ClassRefusal, "the driver cannot drive the DSN's host (e.g. mysql pointed at a PlanetScale endpoint)"},
 	CodeIndexMissing:              {ClassRefusal, "a secondary index the migration was expected to build is absent on the target"},
-	CodeVStreamFloatLossy:         {ClassRefusal, "a VStream-COPY backup would archive single-precision FLOAT columns display-rounded (--strict-float)"},
+	CodeVStreamFloatLossy:         {ClassRefusal, "--strict-float: a VStream-COPY backup FLOAT column cannot be re-read exactly (keyless / over the row cap)"},
 }
 
 // Describe returns the registry metadata for c, and whether c is a

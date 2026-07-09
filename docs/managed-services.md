@@ -219,22 +219,36 @@ bare-column SELECT renders single-precision `FLOAT` at MySQL's
   restore** of a source with concurrent `FLOAT` writes (where a logical
   VStream snapshot is already per-shard-fuzzy, not a global instant).
 
+  The backup re-read is **bounded-memory**: unlike the sync path (which
+  streams the re-read cursor-paginated), the backup buffers a per-table
+  primary-key → `FLOAT` map to patch rows the VStream COPY delivers out of
+  primary-key order (Vitess scans by a cheaper unique key and re-emits
+  rows during catchup — a merge-join can't rely on ordering). That map is
+  capped at **`--float-reread-max-rows`** (default 2,000,000 rows ≈ a few
+  hundred MB worst case; the VStream backup sweep is serial, so only one
+  table's map is held at a time). A `FLOAT`-bearing table **larger than
+  the cap** falls back loudly — it is **never** buffered unbounded (no
+  silent OOM): by default that table is archived rounded with a WARN;
+  raise `--float-reread-max-rows` to repair a bigger table exactly.
+
 Escape hatches, on both `sync start` and `backup full`:
 
 - **`--no-float-exact-reread`** keeps the display-rounded `FLOAT` values
   (a rounded-but-**perfectly-consistent** snapshot — every column at one
   instant). Choose this if within-row consistency matters more than
   sub-6-significant-digit `FLOAT` precision.
-- **`--strict-float`** (backup) refuses loudly
-  (`SLUICE-E-VSTREAM-FLOAT-LOSSY`, exit 3) rather than archive anything
-  imperfect — for operators who'd rather fail than store either a rounded
-  or a skewed value.
+- **`--strict-float`** (backup) means **exact-or-fail**: it keeps the
+  exact archive for every table it can repair, but refuses loudly
+  (`SLUICE-E-VSTREAM-FLOAT-LOSSY`, exit 3) for any `FLOAT` column it
+  **can't** make exact — a keyless / float-PK-only table (refused upfront)
+  or a table over `--float-reread-max-rows` (refused when reached). For
+  operators who'd rather fail than store a rounded or skewed value.
 
 `DOUBLE` columns and the CDC/binlog leg are exact and untouched either
 way. A **keyless** `FLOAT` table (no primary key to target the re-read)
-retains the rounding regardless (WARNed), and `--strict-float` refuses it.
-A target-side `--type-override` to `DOUBLE` does **not** help — the source
-value is already rounded on the wire.
+retains the rounding under the default (WARNed) and is refused under
+`--strict-float`. A target-side `--type-override` to `DOUBLE` does **not**
+help — the source value is already rounded on the wire.
 
 ### Sharded targets: control tables and `--control-keyspace`
 

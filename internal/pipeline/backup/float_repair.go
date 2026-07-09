@@ -6,12 +6,35 @@ package backup
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
+
+// defaultFloatRereadMaxRows caps the per-table PK→exact-FLOAT map the
+// backup exact re-read buffers, so the repair is BOUNDED-memory (a
+// whole-table buffer would OOM by default on a large FLOAT table — the
+// ADR-0071 tenet). A table WHOSE re-read would exceed this many distinct
+// rows falls back LOUDLY (default: WARN + rounded; --strict-float: refuse)
+// rather than buffering unbounded. 2,000,000 rows is a few hundred MB
+// worst case (~PK key + a small float map per row); operators raise it
+// with --float-reread-max-rows when they have the headroom and want exact
+// on a bigger table.
+//
+// Why a bounded MERGE-JOIN isn't used instead (which would be O(1) memory
+// and need no cap): the VStream COPY row stream is NOT PK-ordered — Vitess
+// can scan by a cheaper unique key than the table's PK AND re-emits rows
+// already past the scan during binlog catchup (out of order, with
+// duplicates; see [ir.IdempotentCopyReader] + cdc_vstream_snapshot.go's
+// CopyNeedsIdempotentWriter). A merge-join against the PK-ordered exact
+// scan needs monotonic keys on both sides; the COPY side has neither, so a
+// safe global merge-join is infeasible. The capped buffer is bounded +
+// honest for every case (unsharded, sharded, re-emitting).
+const defaultFloatRereadMaxRows = 2_000_000
 
 // # VStream-COPY FLOAT display-rounding repair — the backup path
 //
@@ -69,18 +92,29 @@ type floatExactPatchReader struct {
 	sourceDSN string
 	plan      map[string]floatPatchTable
 	batchSize int
+	// maxRows bounds the per-table PK→float map; a table that would exceed
+	// it falls back loudly (see [defaultFloatRereadMaxRows]).
+	maxRows int
+	// strict makes an over-cap table REFUSE (--strict-float) instead of
+	// falling back to the rounded archive.
+	strict bool
 
 	mu  sync.Mutex
 	err error
 }
 
-func newFloatExactPatchReader(inner ir.RowReader, source ir.Engine, sourceDSN string, plan map[string]floatPatchTable) *floatExactPatchReader {
+func newFloatExactPatchReader(inner ir.RowReader, source ir.Engine, sourceDSN string, plan map[string]floatPatchTable, maxRows int, strict bool) *floatExactPatchReader {
+	if maxRows <= 0 {
+		maxRows = defaultFloatRereadMaxRows
+	}
 	return &floatExactPatchReader{
 		inner:     inner,
 		source:    source,
 		sourceDSN: sourceDSN,
 		plan:      plan,
 		batchSize: migcore.DefaultBulkBatchSize,
+		maxRows:   maxRows,
+		strict:    strict,
 	}
 }
 
@@ -91,9 +125,27 @@ func (r *floatExactPatchReader) ReadRows(ctx context.Context, table *ir.Table) (
 	if !ok {
 		return r.inner.ReadRows(ctx, table)
 	}
-	exact, err := r.buildExactMap(ctx, p)
+	exact, overCap, err := r.buildExactMap(ctx, p)
 	if err != nil {
 		return nil, fmt.Errorf("backup: float re-read %q: %w", table.Name, err)
+	}
+	if overCap {
+		// Bounded-memory floor: the exact re-read would need more than
+		// maxRows buffered PK→float entries. Never buffer unbounded (OOM);
+		// fall back LOUDLY.
+		if r.strict {
+			return nil, sluicecode.Wrap(sluicecode.CodeVStreamFloatLossy,
+				"raise --float-reread-max-rows, or use --no-float-exact-reread (rounded, consistent)",
+				fmt.Errorf("backup: --strict-float: table %q has more than %d rows — too large for the in-memory exact "+
+					"FLOAT re-read (bounded-memory floor). Raise --float-reread-max-rows if you have the headroom, or use "+
+					"--no-float-exact-reread to archive the rounded-but-consistent values", table.Name, r.maxRows))
+		}
+		slog.WarnContext(ctx,
+			"backup: table too large for in-memory exact FLOAT re-read — archiving the display-rounded values for this "+
+				"table (bounded-memory floor). Raise --float-reread-max-rows to repair it exactly, --no-float-exact-reread "+
+				"to silence this per-table (rounded everywhere), or --strict-float to refuse instead",
+			slog.String("table", table.Name), slog.Int("max_rows", r.maxRows))
+		return r.inner.ReadRows(ctx, table)
 	}
 	inCh, err := r.inner.ReadRows(ctx, table)
 	if err != nil {
@@ -131,27 +183,30 @@ func (r *floatExactPatchReader) Err() error {
 }
 
 // buildExactMap cursor-scans the source for (PK, FLOAT) tuples and returns
-// a map from the PK key to the exact FLOAT column values. Bounded to this
-// one table's PK+float footprint (serial sweep).
-func (r *floatExactPatchReader) buildExactMap(ctx context.Context, p floatPatchTable) (map[string]map[string]any, error) {
+// a map from the PK key to the exact FLOAT column values. It stops and
+// returns overCap=true the moment the map would exceed r.maxRows entries —
+// so the buffer is BOUNDED (never a whole-table OOM); the caller then falls
+// back loudly. Bounded to this one table's PK+float footprint (serial
+// sweep).
+func (r *floatExactPatchReader) buildExactMap(ctx context.Context, p floatPatchTable) (exact map[string]map[string]any, overCap bool, err error) {
 	rr, err := r.source.OpenRowReader(ctx, r.sourceDSN)
 	if err != nil {
-		return nil, fmt.Errorf("open source reader: %w", err)
+		return nil, false, fmt.Errorf("open source reader: %w", err)
 	}
 	defer migcore.CloseIf(rr)
 	br, ok := rr.(ir.BatchedRowReader)
 	if !ok {
-		return nil, fmt.Errorf("source reader does not support cursor-paginated reads")
+		return nil, false, fmt.Errorf("source reader does not support cursor-paginated reads")
 	}
 
-	exact := make(map[string]map[string]any)
+	exact = make(map[string]map[string]any)
 	var cursor []any
 	for {
 		batchCtx, cancel := context.WithCancel(ctx)
-		rowsCh, err := br.ReadRowsBatch(batchCtx, p.srcRead, cursor, r.batchSize)
-		if err != nil {
+		rowsCh, berr := br.ReadRowsBatch(batchCtx, p.srcRead, cursor, r.batchSize)
+		if berr != nil {
 			cancel()
-			return nil, fmt.Errorf("read batch: %w", err)
+			return nil, false, fmt.Errorf("read batch: %w", berr)
 		}
 		var last []any
 		n := 0
@@ -163,20 +218,26 @@ func (r *floatExactPatchReader) buildExactMap(ctx context.Context, p floatPatchT
 			exact[floatPatchKey(row, p.pkCols)] = floats
 			last = pkValues(row, p.pkCols)
 			n++
+			if len(exact) > r.maxRows {
+				// Over the bounded-memory floor — stop scanning and drop the
+				// partial map so the caller falls back loudly.
+				cancel()
+				return nil, true, nil
+			}
 		}
 		cancel()
 		if serr := migcore.ReaderStreamErr(rr, p.srcRead); serr != nil {
-			return nil, serr
+			return nil, false, serr
 		}
-		if err := ctx.Err(); err != nil {
-			return nil, err
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, false, cerr
 		}
 		if n == 0 {
 			break
 		}
 		cursor = last
 	}
-	return exact, nil
+	return exact, false, nil
 }
 
 // floatPatchKey renders a collision-safe key from a row's PK values, in PK

@@ -32,16 +32,42 @@ func floatSchema() *ir.Schema {
 	}}}
 }
 
-// TestCheckVStreamFloatLossy_StrictRefuses pins that --strict-float refuses
-// with the SLUICE-E-VSTREAM-FLOAT-LOSSY coded error (exit-3 refusal class)
-// when the VStream snapshot has single-precision FLOAT columns.
-func TestCheckVStreamFloatLossy_StrictRefuses(t *testing.T) {
+// TestCheckVStreamFloatLossy_StrictRepairableWraps pins that --strict-float
+// on a REPAIRABLE table (PK + non-PK FLOAT) does NOT refuse upfront — it
+// wraps for the exact re-read (exact-or-fail: exact here, since it can).
+func TestCheckVStreamFloatLossy_StrictRepairableWraps(t *testing.T) {
 	b := &Backup{StrictFloat: true}
 	snap := &irbackup.Snapshot{Rows: lossyFloatRows{rounds: true}}
 
-	err := b.applyVStreamFloatPolicy(context.Background(), snap, floatSchema())
+	if err := b.applyVStreamFloatPolicy(context.Background(), snap, floatSchema()); err != nil {
+		t.Fatalf("--strict-float on a repairable table must wrap (not refuse upfront); got: %v", err)
+	}
+	pr, ok := snap.Rows.(*floatExactPatchReader)
+	if !ok {
+		t.Fatalf("--strict-float must WRAP snap.Rows for the exact re-read; got %T", snap.Rows)
+	}
+	if !pr.strict {
+		t.Error("the wrapped reader must carry strict=true so an over-cap table refuses")
+	}
+}
+
+// TestCheckVStreamFloatLossy_StrictKeylessRefuses pins that --strict-float
+// refuses UPFRONT with the coded error when a FLOAT column cannot be
+// re-read exactly (keyless table) — "exact, or fail".
+func TestCheckVStreamFloatLossy_StrictKeylessRefuses(t *testing.T) {
+	b := &Backup{StrictFloat: true}
+	snap := &irbackup.Snapshot{Rows: lossyFloatRows{rounds: true}}
+	schema := &ir.Schema{Tables: []*ir.Table{{
+		Name: "keyless",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "reading", Type: ir.Float{Precision: ir.FloatSingle}, Nullable: true},
+		},
+	}}}
+
+	err := b.applyVStreamFloatPolicy(context.Background(), snap, schema)
 	if err == nil {
-		t.Fatal("--strict-float with single-precision FLOAT columns must refuse; got nil")
+		t.Fatal("--strict-float with an un-repairable (keyless) FLOAT table must refuse; got nil")
 	}
 	ce, ok := sluicecode.FromError(err)
 	if !ok {
