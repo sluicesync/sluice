@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strings"
 
 	"sluicesync.dev/sluice/internal/engines/pgtrigger"
 	sqlitetrigger "sluicesync.dev/sluice/internal/engines/sqlite-trigger"
@@ -543,14 +542,4 @@ func printPruneResult(label string, cut, deleted, remainingMin, remaining int64,
 	if vacuumed {
 		fmt.Fprintln(os.Stdout, "  VACUUM applied (file space reclaimed)")
 	}
-}
-
-// triggerSetupExampleSchema is a tiny helper the help-text generator
-// could reach for if we ever wanted to render an example DSN in the
-// command's --help output. Kept around but unused for now; keeps the
-// strings import non-conditional.
-//
-//nolint:unused
-func triggerSetupExampleSchema(s string) string {
-	return strings.TrimSpace(s)
 }

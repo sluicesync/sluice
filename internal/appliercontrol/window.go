@@ -124,13 +124,3 @@ func (w *LatencyWindow) percentile(q float64) time.Duration {
 	frac := rank - float64(lo)
 	return time.Duration(loV + (hiV-loV)*frac)
 }
-
-// Reset clears all samples. Used by the controller on engine-side
-// teardown if it ever wires that; today the controller's lifetime
-// matches the applier's so the reset is unused.
-//
-//nolint:unused // kept for symmetry with the controller's lifecycle
-func (w *LatencyWindow) Reset() {
-	w.samples = w.samples[:0]
-	w.head = 0
-}

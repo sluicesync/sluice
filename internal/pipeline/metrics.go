@@ -37,7 +37,6 @@ import (
 	"net"
 	"net/http"
 	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -759,30 +758,4 @@ func emitGoRuntimeMetrics(w io.Writer) {
 	fmt.Fprintln(w, "# HELP sluice_go_gc_pause_seconds_total Cumulative stop-the-world GC pause time, in seconds.")
 	fmt.Fprintln(w, "# TYPE sluice_go_gc_pause_seconds_total counter")
 	fmt.Fprintf(w, "sluice_go_gc_pause_seconds_total %s\n", formatPrometheusSeconds(time.Duration(ms.PauseTotalNs))) //nolint:gosec // PauseTotalNs fits int64 in practice
-}
-
-// quoteForPrometheusLabelValue escapes a string for use as a
-// Prometheus label value. Currently unused (the StreamID flows
-// through %q which is sufficient for ASCII stream IDs); kept here
-// for future use when label values may carry non-ASCII content
-// requiring strict quoting per the exposition format spec.
-//
-//nolint:unused // forward-compat utility
-func quoteForPrometheusLabelValue(s string) string {
-	var sb strings.Builder
-	sb.WriteByte('"')
-	for _, r := range s {
-		switch r {
-		case '\\':
-			sb.WriteString(`\\`)
-		case '"':
-			sb.WriteString(`\"`)
-		case '\n':
-			sb.WriteString(`\n`)
-		default:
-			sb.WriteRune(r)
-		}
-	}
-	sb.WriteByte('"')
-	return sb.String()
 }
