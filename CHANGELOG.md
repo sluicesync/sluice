@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.213] - 2026-07-09
+
+### Fixed
+
+- **GCP KMS `--sign-key`/`--verify-key` now report the "needs a versioned CryptoKeyVersion" error before the credential lookup, instead of masking it behind "default credentials not found" (Bug 181; LOW, diagnostic-only, zero data risk).** GCP signs with a specific key version, so a `kms://gcp/<resource>` that names a bare crypto-key (no `.../cryptoKeyVersions/N`) is refused — but that syntactic check ran *after* the KMS client was constructed, and client construction performs the Application Default Credentials lookup. On a host without GCP credentials the credential lookup failed first, so the operator saw an opaque "could not find default credentials" rather than the precise, actionable "must be a versioned CryptoKeyVersion resource". The check is now hoisted into a named helper called at the top of both entry points before any client build or network access, matching the sibling parse-time refusals (unknown provider, malformed `kms://` reference) that already fire pre-network. Loud either way — this only improves *which* loud error you get when both a malformed GCP reference and absent credentials coexist; no signing, verification, or restore behavior changes. Found by the v0.99.212 post-release regression cycle; pinned by a test that exercises the live credential path (no injected client).
+
 ## [0.99.212] - 2026-07-09
 
 ### Security
