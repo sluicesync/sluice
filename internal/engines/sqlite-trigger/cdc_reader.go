@@ -33,6 +33,15 @@ const (
 	// checkpoint on a quiescent WAL is near-instant) while capping a runaway.
 	// The D1 path's checkpointWAL is a no-op, so this is inert there.
 	defaultCheckpointInterval = 30 * time.Second
+
+	// walCheckpointWarnThreshold is the consecutive checkpointWAL-failure
+	// count at which the pump escalates the per-failure log line from
+	// DEBUG to WARN. A single failure is routine (a writer held the WAL
+	// lock this cycle) and stays quiet; a sustained streak means the
+	// source WAL may be growing unbounded, which the operator should see
+	// without --log-level=debug (audit 2026-07-08 §4.4). The counter
+	// resets on the first success.
+	walCheckpointWarnThreshold = 3
 )
 
 // committedAtLayout is the change-log captured_at format produced by the trigger
@@ -74,6 +83,11 @@ type CDCReader struct {
 	// checkpointInterval is the cadence at which the pump issues
 	// exec.checkpointWAL to bound the source WAL (Bug 167). Zero disables it.
 	checkpointInterval time.Duration
+
+	// walCheckpointFailures counts CONSECUTIVE checkpointWAL failures for
+	// the DEBUG→WARN escalation (walCheckpointWarnThreshold). Owned by the
+	// pump goroutine; no locking.
+	walCheckpointFailures int
 
 	// pumpCancel cancels the polling goroutine when Close is called.
 	pumpCancel context.CancelFunc
@@ -357,12 +371,10 @@ func (r *CDCReader) pump(ctx context.Context, startID int64, out chan<- ir.Chang
 		// goroutine, between polls, so it never races the poll read on the
 		// executor. A checkpoint failure must NOT break the stream — WAL
 		// management is orthogonal to read/apply correctness — so it is logged
-		// and the loop continues.
+		// and the loop continues (DEBUG per failure, escalating to WARN on a
+		// sustained streak — see runWALCheckpoint).
 		if r.checkpointInterval > 0 && time.Since(lastCheckpoint) >= r.checkpointInterval {
-			if cerr := r.exec.checkpointWAL(ctx); cerr != nil {
-				slog.DebugContext(ctx, "sqlite-trigger: WAL checkpoint failed (non-fatal)",
-					slog.Any("err", cerr))
-			}
+			r.runWALCheckpoint(ctx)
 			lastCheckpoint = time.Now()
 		}
 		if len(events) == r.batchSize {
@@ -371,6 +383,29 @@ func (r *CDCReader) pump(ctx context.Context, startID int64, out chan<- ir.Chang
 			timer.Reset(r.pollInterval)
 		}
 	}
+}
+
+// runWALCheckpoint issues one cadenced checkpointWAL and applies the
+// escalation policy: each failure is non-fatal (the stream continues),
+// logged at DEBUG until walCheckpointWarnThreshold consecutive failures,
+// then at WARN — a sustained streak means the source WAL may be growing
+// unbounded and the operator should see it without --log-level=debug.
+// The first success resets the streak. Pump-goroutine only.
+func (r *CDCReader) runWALCheckpoint(ctx context.Context) {
+	cerr := r.exec.checkpointWAL(ctx)
+	if cerr == nil {
+		r.walCheckpointFailures = 0
+		return
+	}
+	r.walCheckpointFailures++
+	if r.walCheckpointFailures >= walCheckpointWarnThreshold {
+		slog.WarnContext(ctx, "sqlite-trigger: WAL checkpoint failing repeatedly (non-fatal; the source WAL may grow unbounded until a checkpoint succeeds)",
+			slog.Int("consecutive_failures", r.walCheckpointFailures),
+			slog.Any("err", cerr))
+		return
+	}
+	slog.DebugContext(ctx, "sqlite-trigger: WAL checkpoint failed (non-fatal)",
+		slog.Any("err", cerr))
 }
 
 // poll runs one id-ordered fetch and decodes each change-log row into an

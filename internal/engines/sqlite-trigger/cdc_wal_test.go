@@ -15,10 +15,14 @@ package sqlitetrigger
 // than a timing-dependent size-under-load, so they are CI-stable.
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -264,5 +268,66 @@ func TestPumpCheckpointDisabled(t *testing.T) {
 	r.pump(ctx, 0, out)
 	if n := atomic.LoadInt64(&spy.checkpoints); n != 0 {
 		t.Fatalf("checkpoint cadence disabled but pump fired it %d time(s)", n)
+	}
+}
+
+// failingCheckpointExecutor is a spyExecutor whose checkpointWAL fails
+// while fail is true — drives the DEBUG→WARN escalation pin.
+type failingCheckpointExecutor struct {
+	spyExecutor
+	fail bool
+}
+
+func (f *failingCheckpointExecutor) checkpointWAL(context.Context) error {
+	if f.fail {
+		return errors.New("database is locked")
+	}
+	return nil
+}
+
+// TestWALCheckpointFailureEscalatesToWarn pins the audit-2026-07-08
+// §4.4 escalation boundary: consecutive checkpointWAL failures log at
+// DEBUG below walCheckpointWarnThreshold, at WARN from the threshold
+// on, and one success resets the streak so the next failure is DEBUG
+// again.
+func TestWALCheckpointFailureEscalatesToWarn(t *testing.T) {
+	buf := &bytes.Buffer{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	exec := &failingCheckpointExecutor{fail: true}
+	r := &CDCReader{exec: exec}
+	ctx := context.Background()
+
+	// Failures below the threshold stay quiet at WARN level.
+	for i := 1; i < walCheckpointWarnThreshold; i++ {
+		r.runWALCheckpoint(ctx)
+		if out := buf.String(); strings.Contains(out, "WAL checkpoint failing repeatedly") {
+			t.Fatalf("failure %d escalated to WARN before the threshold (%d): %q", i, walCheckpointWarnThreshold, out)
+		}
+	}
+
+	// The threshold-th consecutive failure escalates, naming the streak.
+	r.runWALCheckpoint(ctx)
+	out := buf.String()
+	if !strings.Contains(out, "WAL checkpoint failing repeatedly") {
+		t.Fatalf("failure %d did not escalate to WARN: %q", walCheckpointWarnThreshold, out)
+	}
+	if !strings.Contains(out, `"consecutive_failures":3`) {
+		t.Errorf("WARN does not carry the streak count: %q", out)
+	}
+
+	// One success resets the streak: the next failure is DEBUG again.
+	buf.Reset()
+	exec.fail = false
+	r.runWALCheckpoint(ctx)
+	exec.fail = true
+	r.runWALCheckpoint(ctx)
+	if out := buf.String(); strings.Contains(out, "WAL checkpoint failing repeatedly") {
+		t.Fatalf("streak did not reset on success; post-success failure escalated: %q", out)
+	}
+	if r.walCheckpointFailures != 1 {
+		t.Fatalf("walCheckpointFailures after reset+1 failure = %d; want 1", r.walCheckpointFailures)
 	}
 }
