@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"os"
 	"strings"
 	"testing"
@@ -766,4 +767,70 @@ func TestBundle_TargetHealth_Section(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestBundle_SectionsManifest_NamesFailedSection pins the audit
+// 2026-07-08 §4.4 fix: a section write that FAILS (here: the
+// target-health JSON encode chokes on a NaN reading) must not vanish
+// silently — sections.json names it with status "failed" and a reason,
+// the successful sections are listed as "written", and the bundle as a
+// whole still assembles.
+func TestBundle_SectionsManifest_NamesFailedSection(t *testing.T) {
+	base, full := newFakeTarget("stream-1")
+	target := &fakeEngineFull{fakeEngine: base, full: full}
+
+	var buf bytes.Buffer
+	err := Write(context.Background(), &buf, Request{
+		StreamID:     "stream-1",
+		PrivacyLevel: PrivacyStandard,
+		TargetEngine: target,
+		TargetDSN:    "postgres://u:p@h:5432/db",
+		// NaN is unencodable by encoding/json — forces the section's
+		// writeJSON to fail through the real write path, no test seam.
+		TargetTelemetry: fakeTelemetry{ok: true, snap: ir.TargetHealthSnapshot{
+			SampledAt: time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC),
+			CPUUtil:   math.NaN(),
+			CPUKnown:  true,
+		}},
+		Now: time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("Write: %v (one failed section must not fail the bundle)", err)
+	}
+	files := readBundle(t, &buf)
+
+	raw, ok := files["sections.json"]
+	if !ok {
+		t.Fatalf("missing sections.json; have %v", fileNames(files))
+	}
+	var sections []sectionOutcome
+	if err := json.Unmarshal(raw, &sections); err != nil {
+		t.Fatalf("decode sections.json: %v", err)
+	}
+	byName := map[string]sectionOutcome{}
+	for _, s := range sections {
+		byName[s.Name] = s
+	}
+
+	th, ok := byName["health/target_health.json"]
+	if !ok {
+		t.Fatalf("sections.json does not mention health/target_health.json: %+v", sections)
+	}
+	if th.Status != "failed" || th.Reason == "" {
+		t.Errorf("target_health outcome = %+v; want status failed with a reason", th)
+	}
+	if _, present := files["health/target_health.json"]; present {
+		t.Error("failed section unexpectedly present in the zip")
+	}
+
+	// The healthy sections around it are accounted for as written.
+	for _, name := range []string{"bundle.json", "state/cdc_state.json", "engine/capabilities.json"} {
+		if s := byName[name]; s.Status != "written" {
+			t.Errorf("section %q outcome = %+v; want written", name, s)
+		}
+	}
+	// And an honest-absence section is accounted for as skipped.
+	if s := byName["health/target_metrics_history.json"]; s.Status != "skipped" || s.Reason == "" {
+		t.Errorf("target_metrics_history outcome = %+v; want skipped with a reason", s)
+	}
 }

@@ -87,16 +87,20 @@ type Request struct {
 
 // Write assembles the diagnose bundle described by req and writes it
 // to w as a ZIP archive. Returns an error only on a structural
-// failure (zip writer fails, the request is malformed); per-section
-// probe failures are recorded in the bundle as section-level reason
-// strings and DO NOT fail the overall write.
+// failure (the request is malformed, the manifest itself cannot be
+// written); per-section probe AND write failures are recorded in the
+// bundle — reason files for probe failures, sections.json rows for
+// everything — and DO NOT fail the overall write.
 //
 // Best-effort collection is the design tenet — see [DiagnoseProber]'s
 // doc. The bundle exists to help the operator file a useful GH issue;
 // refusing to write a bundle because one probe couldn't reach the
-// source would defeat the purpose. The one structural error class is
-// "the request itself is invalid" (no stream-id, no privacy level) —
-// those refuse loudly.
+// source would defeat the purpose. What keeps best-effort honest is
+// sections.json: every section attempted lands there as written /
+// skipped(reason) / failed(reason), so a bundle can never silently
+// omit a section (audit 2026-07-08 §4.4). The one structural error
+// class is "the request itself is invalid" (no stream-id, no privacy
+// level) — those refuse loudly.
 func Write(ctx context.Context, w io.Writer, req Request) error {
 	if req.StreamID == "" {
 		return errors.New("diagnose: request StreamID is empty")
@@ -107,6 +111,7 @@ func Write(ctx context.Context, w io.Writer, req Request) error {
 
 	zw := zip.NewWriter(w)
 	defer func() { _ = zw.Close() }()
+	b := &bundleWriter{zw: zw}
 
 	now := req.Now
 	if now.IsZero() {
@@ -144,27 +149,81 @@ func Write(ctx context.Context, w io.Writer, req Request) error {
 	if err := writeJSON(zw, "bundle.json", mf); err != nil {
 		return fmt.Errorf("diagnose: write manifest: %w", err)
 	}
+	b.noteWritten("bundle.json")
 
 	// PrivacyBasic and up: state-table dumps.
-	if err := collectStateTables(ctx, zw, req); err != nil {
-		// Already best-effort inside the helper; an error here means
-		// the zip writer itself failed.
-		return fmt.Errorf("diagnose: collect state tables: %w", err)
-	}
+	collectStateTables(ctx, b, req)
 
 	if req.PrivacyLevel >= PrivacyStandard {
-		if err := collectStandardSections(ctx, zw, req); err != nil {
-			return fmt.Errorf("diagnose: collect standard sections: %w", err)
-		}
+		collectStandardSections(ctx, b, req)
 	}
 
 	if req.PrivacyLevel >= PrivacyVerbose {
-		if err := collectVerboseSections(ctx, zw, req); err != nil {
-			return fmt.Errorf("diagnose: collect verbose sections: %w", err)
-		}
+		collectVerboseSections(ctx, b, req)
+	}
+
+	// sections.json is the bundle's own account of every section it
+	// attempted. A failure to write IT is structural — without the
+	// account, a silently-absent section becomes possible again.
+	if err := writeJSON(zw, "sections.json", b.sections); err != nil {
+		return fmt.Errorf("diagnose: write sections manifest: %w", err)
 	}
 
 	return zw.Close()
+}
+
+// sectionOutcome is one row of sections.json — the bundle's account of
+// a section it attempted. Status values: "written" (the section file
+// landed), "skipped" (an honest-absence reason file was written
+// instead — probe failed, interface not implemented, input not
+// configured), "failed" (the section file itself could not be written
+// — encode or zip error). Failed sections are exactly the class that
+// used to vanish behind `_ = writeJSON(...)`.
+type sectionOutcome struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// bundleWriter pairs the zip writer with the per-section outcome log
+// behind sections.json. Section writes stay best-effort by design
+// (see [Write]); the recorder is what keeps best-effort honest — a
+// write error no longer disappears, it lands in the manifest.
+type bundleWriter struct {
+	zw       *zip.Writer
+	sections []sectionOutcome
+}
+
+// writeJSON writes one JSON section and records its outcome. Never
+// fails the bundle.
+func (b *bundleWriter) writeJSON(name string, payload any) {
+	if err := writeJSON(b.zw, name, payload); err != nil {
+		b.sections = append(b.sections, sectionOutcome{Name: name, Status: "failed", Reason: err.Error()})
+		return
+	}
+	b.noteWritten(name)
+}
+
+// writeReason writes an honest-absence reason file for a section and
+// records it as skipped. Never fails the bundle: if even the reason
+// file cannot be written, the section is recorded as failed with both
+// reasons.
+func (b *bundleWriter) writeReason(prefix, reason string) {
+	if err := writeReason(b.zw, prefix, reason); err != nil {
+		b.sections = append(b.sections, sectionOutcome{
+			Name:   prefix,
+			Status: "failed",
+			Reason: reason + " (and the reason file could not be written: " + err.Error() + ")",
+		})
+		return
+	}
+	b.sections = append(b.sections, sectionOutcome{Name: prefix, Status: "skipped", Reason: reason})
+}
+
+// noteWritten records a section a non-bundleWriter path wrote
+// successfully (bundle.json, the log tail).
+func (b *bundleWriter) noteWritten(name string) {
+	b.sections = append(b.sections, sectionOutcome{Name: name, Status: "written"})
 }
 
 // collectStateTables writes the PrivacyBasic state-table dumps:
@@ -174,22 +233,22 @@ func Write(ctx context.Context, w io.Writer, req Request) error {
 // don't implement a section get a "reason" file rather than a missing
 // section so the recipient can tell "absent because not supported" from
 // "absent because the probe failed".
-func collectStateTables(ctx context.Context, zw *zip.Writer, req Request) error {
+func collectStateTables(ctx context.Context, b *bundleWriter, req Request) {
 	if req.TargetEngine == nil || req.TargetDSN == "" {
-		return writeReason(zw, "state/", "target engine or DSN missing; state-table dump skipped")
+		b.writeReason("state/", "target engine or DSN missing; state-table dump skipped")
+		return
 	}
 	applier, err := req.TargetEngine.OpenChangeApplier(ctx, req.TargetDSN)
 	if err != nil {
-		return writeReason(zw, "state/", fmt.Sprintf("open target applier: %v", err))
+		b.writeReason("state/", fmt.Sprintf("open target applier: %v", err))
+		return
 	}
 	defer closeIfCloser(applier)
 
 	// sluice_cdc_state — scoped to the request's stream-id.
 	streams, lerr := applier.ListStreams(ctx)
 	if lerr != nil {
-		if err := writeReason(zw, "state/cdc_state", fmt.Sprintf("list streams: %v", lerr)); err != nil {
-			return err
-		}
+		b.writeReason("state/cdc_state", fmt.Sprintf("list streams: %v", lerr))
 	} else {
 		var matched []ir.StreamStatus
 		for _, s := range streams {
@@ -197,60 +256,45 @@ func collectStateTables(ctx context.Context, zw *zip.Writer, req Request) error 
 				matched = append(matched, s)
 			}
 		}
-		if err := writeJSON(zw, "state/cdc_state.json", renderStreamStatuses(matched)); err != nil {
-			return err
-		}
+		b.writeJSON("state/cdc_state.json", renderStreamStatuses(matched))
 	}
 
 	// sluice_cdc_schema_history — capped to SchemaHistoryRowCap.
 	if reader, ok := applier.(ir.SchemaHistoryReader); ok {
 		rows, herr := reader.ListSchemaHistory(ctx, req.StreamID, SchemaHistoryRowCap)
 		if herr != nil {
-			if err := writeReason(zw, "state/schema_history", fmt.Sprintf("list schema history: %v", herr)); err != nil {
-				return err
-			}
-		} else if err := writeJSON(zw, "state/schema_history.json", rows); err != nil {
-			return err
+			b.writeReason("state/schema_history", fmt.Sprintf("list schema history: %v", herr))
+		} else {
+			b.writeJSON("state/schema_history.json", rows)
 		}
 	} else {
-		if err := writeReason(zw, "state/schema_history",
-			fmt.Sprintf("engine %q does not implement ir.SchemaHistoryReader", req.TargetEngine.Name())); err != nil {
-			return err
-		}
+		b.writeReason("state/schema_history",
+			fmt.Sprintf("engine %q does not implement ir.SchemaHistoryReader", req.TargetEngine.Name()))
 	}
 
 	// sluice_shard_consolidation_lease — engine-wide listing per ADR-0054.
 	if lister, ok := applier.(ir.ShardConsolidationLeaseLister); ok {
 		leases, lerr := lister.ListLeases(ctx)
 		if lerr != nil {
-			if err := writeReason(zw, "state/shard_consolidation_lease",
-				fmt.Sprintf("list leases: %v", lerr)); err != nil {
-				return err
-			}
-		} else if err := writeJSON(zw, "state/shard_consolidation_lease.json", leases); err != nil {
-			return err
+			b.writeReason("state/shard_consolidation_lease", fmt.Sprintf("list leases: %v", lerr))
+		} else {
+			b.writeJSON("state/shard_consolidation_lease.json", leases)
 		}
 	} else {
-		if err := writeReason(zw, "state/shard_consolidation_lease",
-			fmt.Sprintf("engine %q does not implement ir.ShardConsolidationLeaseLister", req.TargetEngine.Name())); err != nil {
-			return err
-		}
+		b.writeReason("state/shard_consolidation_lease",
+			fmt.Sprintf("engine %q does not implement ir.ShardConsolidationLeaseLister", req.TargetEngine.Name()))
 	}
-
-	return nil
 }
 
 // collectStandardSections writes the PrivacyStandard additions: CLI
 // args (redacted), engine snapshots via ir.DiagnoseProber, health
 // probes mirroring `sluice sync health`.
-func collectStandardSections(ctx context.Context, zw *zip.Writer, req Request) error {
+func collectStandardSections(ctx context.Context, b *bundleWriter, req Request) {
 	// CLI args (redacted) + an effective-config snapshot the bundle
 	// recipient can re-run the sluice invocation against (with
 	// secret material stripped).
 	if len(req.CLIArgs) > 0 {
-		if err := writeJSON(zw, "config/cli_args.json", RedactCLIArgs(req.CLIArgs)); err != nil {
-			return err
-		}
+		b.writeJSON("config/cli_args.json", RedactCLIArgs(req.CLIArgs))
 	}
 
 	// Capabilities — declared shape per engine. Mirrors
@@ -268,16 +312,14 @@ func collectStandardSections(ctx context.Context, zw *zip.Writer, req Request) e
 		c := req.TargetEngine.Capabilities()
 		caps.Target = &c
 	}
-	if err := writeJSON(zw, "engine/capabilities.json", caps); err != nil {
-		return err
-	}
+	b.writeJSON("engine/capabilities.json", caps)
 
 	// Engine snapshots — ir.DiagnoseProber on each side.
 	if req.SourceEngine != nil && req.SourceDSN != "" {
-		probeAndWriteDiagnose(ctx, zw, "engine/source_diagnose", req.SourceEngine, req.SourceDSN, req.StreamID)
+		probeAndWriteDiagnose(ctx, b, "engine/source_diagnose", req.SourceEngine, req.SourceDSN, req.StreamID)
 	}
 	if req.TargetEngine != nil && req.TargetDSN != "" {
-		probeAndWriteDiagnose(ctx, zw, "engine/target_diagnose", req.TargetEngine, req.TargetDSN, req.StreamID)
+		probeAndWriteDiagnose(ctx, b, "engine/target_diagnose", req.TargetEngine, req.TargetDSN, req.StreamID)
 	}
 
 	// Health probe mirrors `sluice sync health` JSON. Only fires
@@ -285,22 +327,20 @@ func collectStandardSections(ctx context.Context, zw *zip.Writer, req Request) e
 	// needs both sides; the standalone target-side freshness lives
 	// in the cdc_state dump already).
 	if req.SourceEngine != nil && req.SourceDSN != "" && req.TargetEngine != nil && req.TargetDSN != "" {
-		probeAndWriteHealth(ctx, zw, "health/sync_health.json", req)
+		probeAndWriteHealth(ctx, b, "health/sync_health.json", req)
 	}
 
 	// Target health — the ADR-0107 control-plane telemetry snapshot
 	// (CPU/mem/storage/lag/conns). Always emitted at PrivacyStandard+ so
 	// the recipient can tell "telemetry not configured" from "configured but
 	// no fresh sample" from a real reading.
-	probeAndWriteTargetHealth(ctx, zw, "health/target_health.json", req)
+	probeAndWriteTargetHealth(ctx, b, "health/target_health.json", req)
 
 	// Target metrics ROLLING HISTORY — the ADR-0107 item 35 persisted trend
 	// (recent rows + current/1m/5m/10m avg+max aggregates for cpu/mem/
 	// storage). Read from the sluice_target_metrics_history table on the
 	// target via the optional ir.TargetMetricsHistoryStore surface.
-	probeAndWriteTargetMetricsHistory(ctx, zw, "health/target_metrics_history.json", req)
-
-	return nil
+	probeAndWriteTargetMetricsHistory(ctx, b, "health/target_metrics_history.json", req)
 }
 
 // targetMetricsHistoryRowCap bounds the rolling-history rows embedded in the
@@ -316,30 +356,30 @@ const targetMetricsHistoryRowCap = 120
 //   - engine's applier doesn't implement ir.TargetMetricsHistoryStore ⇒
 //     reason file (so "not supported" is distinguishable from "no rows"),
 //   - no rows ⇒ {recent: [], aggregates: {...empty windows...}}.
-func probeAndWriteTargetMetricsHistory(ctx context.Context, zw *zip.Writer, name string, req Request) {
+func probeAndWriteTargetMetricsHistory(ctx context.Context, b *bundleWriter, name string, req Request) {
 	if req.TargetEngine == nil || req.TargetDSN == "" {
-		_ = writeReason(zw, name, "target engine or DSN missing; target-metrics history skipped")
+		b.writeReason(name, "target engine or DSN missing; target-metrics history skipped")
 		return
 	}
 	applier, err := req.TargetEngine.OpenChangeApplier(ctx, req.TargetDSN)
 	if err != nil {
-		_ = writeReason(zw, name, fmt.Sprintf("open target applier: %v", err))
+		b.writeReason(name, fmt.Sprintf("open target applier: %v", err))
 		return
 	}
 	defer closeIfCloser(applier)
 
 	store, ok := applier.(ir.TargetMetricsHistoryStore)
 	if !ok {
-		_ = writeReason(zw, name,
+		b.writeReason(name,
 			fmt.Sprintf("engine %q does not implement ir.TargetMetricsHistoryStore", req.TargetEngine.Name()))
 		return
 	}
 	rows, err := store.ListTargetMetricsHistory(ctx, req.StreamID, targetMetricsHistoryRowCap)
 	if err != nil {
-		_ = writeReason(zw, name, fmt.Sprintf("list target-metrics history: %v", err))
+		b.writeReason(name, fmt.Sprintf("list target-metrics history: %v", err))
 		return
 	}
-	_ = writeJSON(zw, name, map[string]any{
+	b.writeJSON(name, map[string]any{
 		"recent":     renderTargetMetricsRows(rows),
 		"aggregates": computeTargetMetricsAggregates(rows),
 	})
@@ -467,14 +507,14 @@ func metricSeries(rows []ir.TargetMetricsHistoryRow, sel func(ir.TargetMetricsHi
 // fresh sample ⇒ {"fresh": false}; a fresh sample ⇒ the distilled
 // CPU/mem/storage/lag/connection view with each value gated by its *Known
 // flag (an unobserved metric is omitted, never reported as 0/idle).
-func probeAndWriteTargetHealth(ctx context.Context, zw *zip.Writer, name string, req Request) {
+func probeAndWriteTargetHealth(ctx context.Context, b *bundleWriter, name string, req Request) {
 	if req.TargetTelemetry == nil {
-		_ = writeReason(zw, name, "target telemetry not configured (no --planetscale-org / metrics token)")
+		b.writeReason(name, "target telemetry not configured (no --planetscale-org / metrics token)")
 		return
 	}
 	snap, ok := req.TargetTelemetry.Sample(ctx)
 	if !ok {
-		_ = writeJSON(zw, name, map[string]any{"fresh": false, "reason": "no fresh telemetry sample available"})
+		b.writeJSON(name, map[string]any{"fresh": false, "reason": "no fresh telemetry sample available"})
 		return
 	}
 	out := map[string]any{
@@ -499,71 +539,69 @@ func probeAndWriteTargetHealth(ctx context.Context, zw *zip.Writer, name string,
 		out["active_connections"] = snap.ActiveConnections
 		out["max_connections"] = snap.MaxConnections
 	}
-	_ = writeJSON(zw, name, out)
+	b.writeJSON(name, out)
 }
 
 // collectVerboseSections writes the PrivacyVerbose additions: per-
 // table row counts (slow path, opt-in-only), log-file tail.
-func collectVerboseSections(ctx context.Context, zw *zip.Writer, req Request) error {
+func collectVerboseSections(ctx context.Context, b *bundleWriter, req Request) {
 	// Per-table row counts on the TARGET. Slow path — the operator
 	// opted in by selecting PrivacyVerbose. Skipped if the target
 	// can't be probed.
 	if req.TargetEngine != nil && req.TargetDSN != "" {
-		probeAndWriteRowCounts(ctx, zw, req)
+		probeAndWriteRowCounts(ctx, b, req)
 	}
 
 	// Log-file tail. The operator must have configured a --log-file
 	// path; sluice does NOT scrape the parent process's stderr.
 	if req.LogFile != "" {
-		if err := writeLogTail(zw, req.LogFile); err != nil {
-			if rerr := writeReason(zw, "logs/log_tail", fmt.Sprintf("read log file %q: %v", req.LogFile, err)); rerr != nil {
-				return rerr
-			}
+		if err := writeLogTail(b.zw, req.LogFile); err != nil {
+			b.writeReason("logs/log_tail", fmt.Sprintf("read log file %q: %v", req.LogFile, err))
+		} else {
+			b.noteWritten("logs/log_tail.txt")
 		}
 	}
-
-	return nil
 }
 
 // probeAndWriteDiagnose runs ir.DiagnoseProber against the given
 // engine + DSN. Errors are surfaced as a reason file rather than
 // propagated.
-func probeAndWriteDiagnose(ctx context.Context, zw *zip.Writer, prefix string, engine ir.Engine, dsn, streamID string) {
+func probeAndWriteDiagnose(ctx context.Context, b *bundleWriter, prefix string, engine ir.Engine, dsn, streamID string) {
 	sr, err := engine.OpenSchemaReader(ctx, dsn)
 	if err != nil {
-		_ = writeReason(zw, prefix, fmt.Sprintf("open schema reader: %v", err))
+		b.writeReason(prefix, fmt.Sprintf("open schema reader: %v", err))
 		return
 	}
 	defer closeIfCloser(sr)
 
 	prober, ok := sr.(ir.DiagnoseProber)
 	if !ok {
-		_ = writeReason(zw, prefix, fmt.Sprintf("engine %q does not implement ir.DiagnoseProber", engine.Name()))
+		b.writeReason(prefix, fmt.Sprintf("engine %q does not implement ir.DiagnoseProber", engine.Name()))
 		return
 	}
 	snap, err := prober.DiagnoseBundle(ctx, streamID)
 	if err != nil {
-		_ = writeReason(zw, prefix, fmt.Sprintf("diagnose probe: %v", err))
+		b.writeReason(prefix, fmt.Sprintf("diagnose probe: %v", err))
 		return
 	}
-	_ = writeJSON(zw, prefix+".json", snap)
+	b.writeJSON(prefix+".json", snap)
 }
 
 // probeAndWriteHealth mirrors `sluice sync health`'s probe surface
 // against the same two-engine wire format. Failures are bundled as
 // reason strings.
-func probeAndWriteHealth(ctx context.Context, zw *zip.Writer, name string, req Request) {
+func probeAndWriteHealth(ctx context.Context, b *bundleWriter, name string, req Request) {
 	// Target side — list streams, find the one matching req.StreamID.
 	applier, err := req.TargetEngine.OpenChangeApplier(ctx, req.TargetDSN)
 	if err != nil {
-		_ = writeReason(zw, name, fmt.Sprintf("open target applier: %v", err))
+		b.writeReason(name, fmt.Sprintf("open target applier: %v", err))
 		return
 	}
 	defer closeIfCloser(applier)
 
 	streams, err := applier.ListStreams(ctx)
 	if err != nil {
-		_ = writeReason(zw, name, fmt.Sprintf("list streams: %v", err))
+		b.writeReason(name, fmt.Sprintf("list streams: %v", err))
 		return
 	}
 	var targetPos ir.Position
@@ -589,7 +627,7 @@ func probeAndWriteHealth(ctx context.Context, zw *zip.Writer, name string, req R
 	sr, err := req.SourceEngine.OpenSchemaReader(ctx, req.SourceDSN)
 	if err != nil {
 		out["source_probe_reason"] = fmt.Sprintf("open source schema reader: %v", err)
-		_ = writeJSON(zw, name, out)
+		b.writeJSON(name, out)
 		return
 	}
 	defer closeIfCloser(sr)
@@ -597,13 +635,13 @@ func probeAndWriteHealth(ctx context.Context, zw *zip.Writer, name string, req R
 	hr, ok := sr.(ir.HealthReporter)
 	if !ok {
 		out["source_probe_reason"] = fmt.Sprintf("engine %q does not implement ir.HealthReporter", req.SourceEngine.Name())
-		_ = writeJSON(zw, name, out)
+		b.writeJSON(name, out)
 		return
 	}
 	pos, err := hr.SourceCurrentPosition(ctx)
 	if err != nil {
 		out["source_probe_reason"] = fmt.Sprintf("source-current-position: %v", err)
-		_ = writeJSON(zw, name, out)
+		b.writeJSON(name, out)
 		return
 	}
 	out["source_position"] = pos.Token
@@ -632,36 +670,36 @@ func probeAndWriteHealth(ctx context.Context, zw *zip.Writer, name string, req R
 		}
 	}
 
-	_ = writeJSON(zw, name, out)
+	b.writeJSON(name, out)
 }
 
 // probeAndWriteRowCounts writes per-table COUNT(*) on the target. The
 // schema is read first to enumerate the filtered table list; counts
 // are best-effort per table.
-func probeAndWriteRowCounts(ctx context.Context, zw *zip.Writer, req Request) {
+func probeAndWriteRowCounts(ctx context.Context, b *bundleWriter, req Request) {
 	reader, err := req.TargetEngine.OpenSchemaReader(ctx, req.TargetDSN)
 	if err != nil {
-		_ = writeReason(zw, "verbose/row_counts", fmt.Sprintf("open target schema reader: %v", err))
+		b.writeReason("verbose/row_counts", fmt.Sprintf("open target schema reader: %v", err))
 		return
 	}
 	defer closeIfCloser(reader)
 
 	schema, err := reader.ReadSchema(ctx)
 	if err != nil {
-		_ = writeReason(zw, "verbose/row_counts", fmt.Sprintf("read target schema: %v", err))
+		b.writeReason("verbose/row_counts", fmt.Sprintf("read target schema: %v", err))
 		return
 	}
 
 	rowReader, err := req.TargetEngine.OpenRowReader(ctx, req.TargetDSN)
 	if err != nil {
-		_ = writeReason(zw, "verbose/row_counts", fmt.Sprintf("open target row reader: %v", err))
+		b.writeReason("verbose/row_counts", fmt.Sprintf("open target row reader: %v", err))
 		return
 	}
 	defer closeIfCloser(rowReader)
 
 	counter, ok := rowReader.(ir.RowCounter)
 	if !ok {
-		_ = writeReason(zw, "verbose/row_counts",
+		b.writeReason("verbose/row_counts",
 			fmt.Sprintf("engine %q row reader does not implement ir.RowCounter", req.TargetEngine.Name()))
 		return
 	}
@@ -692,7 +730,7 @@ func probeAndWriteRowCounts(ctx context.Context, zw *zip.Writer, req Request) {
 		}
 		return out[i].Table < out[j].Table
 	})
-	_ = writeJSON(zw, "verbose/row_counts.json", out)
+	b.writeJSON("verbose/row_counts.json", out)
 }
 
 // writeLogTail reads the last VerboseLogTailLines lines of path and
@@ -757,15 +795,18 @@ func renderStreamStatuses(rows []ir.StreamStatus) []map[string]any {
 // writeJSON encodes payload as indented JSON and writes it into zw at
 // the named path. The leading "byte-order-mark"-free encoding is
 // stable across Go versions; bundles ship as plain UTF-8 JSON.
+// Encoding happens BEFORE the zip entry is created so an encode
+// failure leaves no phantom empty entry masquerading as a section —
+// the failure lands only in sections.json.
 func writeJSON(zw *zip.Writer, name string, payload any) error {
-	w, err := zw.CreateHeader(&zip.FileHeader{Name: name, Method: zip.Deflate})
-	if err != nil {
-		return err
-	}
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(payload); err != nil {
+		return err
+	}
+	w, err := zw.CreateHeader(&zip.FileHeader{Name: name, Method: zip.Deflate})
+	if err != nil {
 		return err
 	}
 	_, err = w.Write(buf.Bytes())
