@@ -35,7 +35,7 @@ func withCommandIO(t *testing.T, stdin string, fn func()) (stdout, stderr string
 	if err != nil {
 		t.Fatalf("stderr pipe: %v", err)
 	}
-	if _, err := io.WriteString(inW, stdin); err != nil {
+	if _, err := inW.WriteString(stdin); err != nil {
 		t.Fatalf("write stdin: %v", err)
 	}
 	_ = inW.Close()
