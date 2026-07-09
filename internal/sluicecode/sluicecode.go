@@ -65,8 +65,9 @@ const (
 	CodeDriverHostMismatch        Code = "SLUICE-E-DRIVER-HOST-MISMATCH"
 	CodeVStreamFloatLossy         Code = "SLUICE-E-VSTREAM-FLOAT-LOSSY"
 
-	CodeBackupSignatureInvalid Code = "SLUICE-E-BACKUP-SIGNATURE-INVALID"
-	CodeBackupSignatureMissing Code = "SLUICE-E-BACKUP-SIGNATURE-MISSING"
+	CodeBackupSignatureInvalid     Code = "SLUICE-E-BACKUP-SIGNATURE-INVALID"
+	CodeBackupSignatureMissing     Code = "SLUICE-E-BACKUP-SIGNATURE-MISSING"
+	CodeBackupSignatureUnsupported Code = "SLUICE-E-BACKUP-SIGNATURE-UNSUPPORTED"
 )
 
 // Class partitions codes by how the process should exit when the
@@ -107,17 +108,18 @@ var registry = map[Code]Info{
 	CodeIndexDirectDDLDisabled:   {ClassRuntime, "PlanetScale safe-migrations blocks direct DDL (errno 1105)"},
 	CodeCDCReplicationPermission: {ClassRuntime, "connecting role lacks the REPLICATION attribute"},
 
-	CodeColdStartTargetNotEmpty:   {ClassRefusal, "cold-start refused: a target table already contains data"},
-	CodeSchemaExtensionNotEnabled: {ClassRefusal, "column type owned by a PG extension not opted into"},
-	CodeValueZeroDate:             {ClassRefusal, "MySQL zero/partial date has no valid calendar value"},
-	CodeValueNULByte:              {ClassRefusal, "string value carries a NUL byte PostgreSQL text types cannot store"},
-	CodeExprBackslashLiteral:      {ClassRefusal, "SQLite expression string literal with a backslash has no faithful MySQL spelling"},
-	CodeConfirmationRequired:      {ClassRefusal, "destructive operation requires explicit --yes confirmation"},
-	CodeDriverHostMismatch:        {ClassRefusal, "the driver cannot drive the DSN's host (e.g. mysql pointed at a PlanetScale endpoint)"},
-	CodeIndexMissing:              {ClassRefusal, "a secondary index the migration was expected to build is absent on the target"},
-	CodeVStreamFloatLossy:         {ClassRefusal, "--strict-float: a VStream-COPY backup FLOAT column cannot be re-read exactly (keyless / over the row cap)"},
-	CodeBackupSignatureInvalid:    {ClassRefusal, "a signed backup manifest's detached signature failed verification (tampered / rolled-back / wrong key)"},
-	CodeBackupSignatureMissing:    {ClassRefusal, "a signed (v6) backup manifest is missing its detached signature"},
+	CodeColdStartTargetNotEmpty:    {ClassRefusal, "cold-start refused: a target table already contains data"},
+	CodeSchemaExtensionNotEnabled:  {ClassRefusal, "column type owned by a PG extension not opted into"},
+	CodeValueZeroDate:              {ClassRefusal, "MySQL zero/partial date has no valid calendar value"},
+	CodeValueNULByte:               {ClassRefusal, "string value carries a NUL byte PostgreSQL text types cannot store"},
+	CodeExprBackslashLiteral:       {ClassRefusal, "SQLite expression string literal with a backslash has no faithful MySQL spelling"},
+	CodeConfirmationRequired:       {ClassRefusal, "destructive operation requires explicit --yes confirmation"},
+	CodeDriverHostMismatch:         {ClassRefusal, "the driver cannot drive the DSN's host (e.g. mysql pointed at a PlanetScale endpoint)"},
+	CodeIndexMissing:               {ClassRefusal, "a secondary index the migration was expected to build is absent on the target"},
+	CodeVStreamFloatLossy:          {ClassRefusal, "--strict-float: a VStream-COPY backup FLOAT column cannot be re-read exactly (keyless / over the row cap)"},
+	CodeBackupSignatureInvalid:     {ClassRefusal, "a signed backup manifest's detached signature failed verification (tampered / rolled-back / wrong key)"},
+	CodeBackupSignatureMissing:     {ClassRefusal, "a signed (v6) backup manifest is missing its detached signature"},
+	CodeBackupSignatureUnsupported: {ClassRefusal, "a signed backup manifest uses a newer signature scheme/canonicalization than this build supports; upgrade sluice (not a tamper signal)"},
 }
 
 // Describe returns the registry metadata for c, and whether c is a

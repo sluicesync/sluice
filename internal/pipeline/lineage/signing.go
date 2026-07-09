@@ -80,6 +80,18 @@ var (
 	// the operator's fix is to upgrade sluice, not to distrust the backup —
 	// so it maps to its own message, never SIGNATURE-INVALID.
 	ErrSignatureUnsupportedVersion = errors.New("detached signature uses a newer canonicalization than this build supports; upgrade sluice")
+
+	// ErrSignatureUnsupportedScheme is the scheme/algorithm sibling of
+	// [ErrSignatureUnsupportedVersion]: a detached signature records a scheme
+	// FAMILY (e.g. a future post-quantum scheme) or a `kms/<algorithm>` whose
+	// algorithm this build cannot verify. Like the version case it is a
+	// forward-incompatibility, NOT tamper — the fix is to upgrade sluice — so
+	// it maps to SLUICE-E-BACKUP-SIGNATURE-UNSUPPORTED, never -INVALID. This
+	// matters because the underlying primitives fail CLOSED (an unknown kms
+	// algorithm collapses to a false MAC; an unknown family would be verified
+	// with the wrong primitive), which is indistinguishable from tamper unless
+	// the caller recognizes the scheme is simply unknown BEFORE verifying.
+	ErrSignatureUnsupportedScheme = errors.New("detached signature uses a signature scheme or algorithm this build does not support; upgrade sluice")
 )
 
 // effectiveManifestScheme returns the scheme a manifest signature at the
@@ -690,12 +702,26 @@ func SignatureInvalidError(err error) error {
 		"restore from an untampered copy; the signature caught exactly the substitution/rollback/truncation it exists to catch", err)
 }
 
+// SignatureUnsupportedError wraps a forward-incompatible verification
+// failure ([ErrSignatureUnsupportedVersion] / [ErrSignatureUnsupportedScheme])
+// in the operator-facing SLUICE-E-BACKUP-SIGNATURE-UNSUPPORTED coded class.
+// It is fail-closed but NOT a tamper accusation: a newer sluice wrote the
+// signature, so the fix is to upgrade, not to distrust the backup.
+func SignatureUnsupportedError(err error) error {
+	return sluicecode.Wrap(sluicecode.CodeBackupSignatureUnsupported,
+		"upgrade sluice to a build that supports this backup's signature scheme/canonicalization; the backup is not necessarily tampered", err)
+}
+
 // CodeForSignatureError maps a raw verification error to its coded form,
-// or returns it unchanged when it is neither Err* sentinel.
+// or returns it unchanged when it is neither Err* sentinel. The
+// UNSUPPORTED cases are checked before INVALID: a forward-incompatible
+// signature is an upgrade prompt, never a tamper accusation.
 func CodeForSignatureError(err error) error {
 	switch {
 	case errors.Is(err, ErrSignatureMissing):
 		return SignatureMissingError(err)
+	case errors.Is(err, ErrSignatureUnsupportedVersion), errors.Is(err, ErrSignatureUnsupportedScheme):
+		return SignatureUnsupportedError(err)
 	case errors.Is(err, ErrSignatureInvalid):
 		return SignatureInvalidError(err)
 	default:

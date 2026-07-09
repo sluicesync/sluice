@@ -236,6 +236,29 @@ func TestVerifyManifestKMS_WrongKeyAndType(t *testing.T) {
 	}
 }
 
+// TestIsSupportedKMSAlgorithm pins the supported-algorithm allow-list in
+// lockstep with VerifyManifestKMS: every algorithm the verifier switches
+// on is reported supported, and anything else (a future algorithm) is
+// reported UNSUPPORTED so the read side can prompt "upgrade sluice" rather
+// than collapse it to a false-MAC tamper signal.
+func TestIsSupportedKMSAlgorithm(t *testing.T) {
+	supported := []string{
+		KMSAlgorithmECDSAP256, KMSAlgorithmECDSAP384, KMSAlgorithmECDSAP521,
+		KMSAlgorithmRSAPSS256, KMSAlgorithmRSAPSS384, KMSAlgorithmRSAPSS512,
+		KMSAlgorithmEd25519,
+	}
+	for _, a := range supported {
+		if !IsSupportedKMSAlgorithm(a) {
+			t.Errorf("IsSupportedKMSAlgorithm(%q) = false, want true", a)
+		}
+	}
+	for _, a := range []string{"", "ecdsa-p999", "rsa-pss-1024", "pqc-dilithium", "ecdsa-p256 ", "kms/ecdsa-p256"} {
+		if IsSupportedKMSAlgorithm(a) {
+			t.Errorf("IsSupportedKMSAlgorithm(%q) = true, want false", a)
+		}
+	}
+}
+
 // TestNewAWSKMSSigner_RefusesEncryptionKey pins that a non-SIGN_VERIFY key
 // (an ENCRYPT_DECRYPT key mistakenly passed as a signing key) is refused
 // loudly at construction, not silently used.

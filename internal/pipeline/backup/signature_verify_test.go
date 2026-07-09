@@ -4,7 +4,9 @@
 package backup
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"testing"
 	"time"
 
@@ -256,5 +258,68 @@ func TestVerifyChainSignatures_UnverifiablePolicy(t *testing.T) {
 	err := verifyChainSignatures(ctx, store, links, verifyMaterial{}, true)
 	if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeBackupSignatureMissing {
 		t.Fatalf("strict policy: got %v, want SIGNATURE-MISSING", err)
+	}
+}
+
+// relabelSchemeInSig rewrites the scheme field of an on-disk `.sig` object
+// — the store-adversary / forward-version relabel — leaving everything
+// else intact.
+func relabelSchemeInSig(t *testing.T, ctx context.Context, store *memStore, path, newScheme string) {
+	t.Helper()
+	rc, err := store.Get(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(rc)
+	_ = rc.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig, err := irbackup.UnmarshalManifestSignature(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig.Scheme = newScheme
+	nb, err := irbackup.MarshalManifestSignature(sig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put(ctx, path, bytes.NewReader(nb)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestVerifyChainSignatures_UnknownSchemeUpgrade pins the forward-compat
+// contract (ADR-0154 follow-up): a signature whose scheme this build does
+// not recognize — a future scheme FAMILY, or a `kms/<algorithm>` whose
+// algorithm is unknown — must fail CLOSED as SIGNATURE-UNSUPPORTED
+// ("upgrade sluice"), NEVER as SIGNATURE-INVALID. An unknown scheme
+// verified with a known primitive yields a false MAC that is
+// indistinguishable from tamper; surfacing that as INVALID would wrongly
+// tell an operator their (newer-sluice-written) backup is compromised.
+func TestVerifyChainSignatures_UnknownSchemeUpgrade(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name      string
+		relabelTo string
+	}{
+		{"unknown scheme family", "pqc-dilithium"},
+		{"unknown kms algorithm", irbackup.SignatureSchemeKMS + "/pqc-foo"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store, env, links := buildSignedChain(t)
+			// ChainSignatureScheme reads lineage.json.sig first, so steering
+			// its scheme steers verifier selection for the whole chain.
+			relabelSchemeInSig(t, ctx, store, lineage.LineageSigFileName, tc.relabelTo)
+			err := verifyChainSignatures(ctx, store, links, verifyMaterial{env: env}, false)
+			ce, ok := sluicecode.FromError(err)
+			if !ok || ce.Code != sluicecode.CodeBackupSignatureUnsupported {
+				t.Fatalf("%s: got %v, want SIGNATURE-UNSUPPORTED (upgrade, not tamper)", tc.name, err)
+			}
+			if ce.Code == sluicecode.CodeBackupSignatureInvalid {
+				t.Fatalf("%s must NOT surface as SIGNATURE-INVALID", tc.name)
+			}
+		})
 	}
 }

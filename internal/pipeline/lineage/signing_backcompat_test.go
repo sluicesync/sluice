@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"io"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/crypto"
@@ -117,6 +118,75 @@ func TestVerifyManifest_FutureVersionUpgrade(t *testing.T) {
 	if errors.Is(err, ErrSignatureInvalid) {
 		t.Fatal("future canon version must NOT surface as SIGNATURE-INVALID (alarming tamper signal)")
 	}
+}
+
+// relabelSigCanonVersion rewrites the canon_version field of an on-disk
+// `.sig` (the downgrade-relabel a store adversary would attempt) without
+// touching the MAC — mirrors relabelSigScheme.
+func relabelSigCanonVersion(t *testing.T, ctx context.Context, store irbackup.Store, path, newVersion string) {
+	t.Helper()
+	rc, err := store.Get(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(rc)
+	_ = rc.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig, err := irbackup.UnmarshalManifestSignature(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig.CanonVersion = newVersion
+	nb, err := irbackup.MarshalManifestSignature(sig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put(ctx, path, bytes.NewReader(nb)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestVerifyManifest_V3RelabelToV2Refused pins the downgrade-relabel
+// direction the dual-version verifier must reject: a v3 signature (whose
+// MAC covers bytes that INCLUDE the scheme token) relabeled to canon v2
+// (which recomputes WITHOUT the scheme token) can never verify. This is
+// the twin of TestVerifyManifest_V2RelabelStillRefused — it proves the
+// dual-version verifier does not become a downgrade oracle.
+func TestVerifyManifest_V3RelabelToV2Refused(t *testing.T) {
+	ctx := context.Background()
+	m := testManifest()
+
+	// (a) HMAC-off-KEK: a real v3 hmac signature relabeled to v2. The v2
+	// recompute drops the scheme token, so the bytes differ and the MAC
+	// fails — SIGNATURE-INVALID (the relabel IS a tamper of the sig).
+	t.Run("hmac", func(t *testing.T) {
+		s := testSigner(t)
+		store := newMemStore()
+		if err := WriteManifestSig(ctx, store, ManifestFileName, m, 0, s); err != nil {
+			t.Fatal(err)
+		}
+		relabelSigCanonVersion(t, ctx, store, ManifestSigPath(ManifestFileName), irbackup.ManifestCanonVersionV2)
+		if err := VerifyManifest(ctx, store, ManifestFileName, m, 0, s); !errors.Is(err, ErrSignatureInvalid) {
+			t.Fatalf("v3->v2 relabel (hmac): got %v, want ErrSignatureInvalid", err)
+		}
+	})
+
+	// (b) Ed25519: relabeling a v3 ed25519 signature to v2 forces the
+	// effective scheme to hmac-kek (v2 predates the scheme token), which no
+	// longer matches the ed25519 verifier — refused at the scheme check.
+	t.Run("ed25519", func(t *testing.T) {
+		signer, verifier := testEd25519Signer(t)
+		store := newMemStore()
+		if err := WriteManifestSig(ctx, store, ManifestFileName, m, 0, signer); err != nil {
+			t.Fatal(err)
+		}
+		relabelSigCanonVersion(t, ctx, store, ManifestSigPath(ManifestFileName), irbackup.ManifestCanonVersionV2)
+		if err := VerifyManifest(ctx, store, ManifestFileName, m, 0, verifier); !errors.Is(err, ErrSignatureInvalid) {
+			t.Fatalf("v3->v2 relabel (ed25519): got %v, want ErrSignatureInvalid", err)
+		}
+	})
 }
 
 // TestVerifyLineage_V2BackCompat pins the dual-version lineage catalog

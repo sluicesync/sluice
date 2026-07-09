@@ -223,6 +223,25 @@ func VerifyManifestKMS(pub stdcrypto.PublicKey, algorithm string, payload, sig [
 	}
 }
 
+// IsSupportedKMSAlgorithm reports whether algorithm is a sluice-canonical
+// KMS signing algorithm THIS build can verify. A composite `kms/<algorithm>`
+// scheme token whose algorithm this returns false for was written by a
+// NEWER sluice — the read side must surface that as "upgrade sluice"
+// (fail-closed), never as SIGNATURE-INVALID, because a bare
+// [VerifyManifestKMS] collapses an unknown algorithm to a false MAC that
+// is indistinguishable from tamper. Kept in lockstep with the switch in
+// [VerifyManifestKMS].
+func IsSupportedKMSAlgorithm(algorithm string) bool {
+	switch algorithm {
+	case KMSAlgorithmECDSAP256, KMSAlgorithmECDSAP384, KMSAlgorithmECDSAP521,
+		KMSAlgorithmRSAPSS256, KMSAlgorithmRSAPSS384, KMSAlgorithmRSAPSS512,
+		KMSAlgorithmEd25519:
+		return true
+	default:
+		return false
+	}
+}
+
 // hashForAlgorithm maps a sluice-canonical KMS algorithm to the stdlib
 // hash function the digest-signing primitives (ECDSA / RSA-PSS) use.
 // Returns 0 for Ed25519 (no external pre-digest) or an unknown algorithm.

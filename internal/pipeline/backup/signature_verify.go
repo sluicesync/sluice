@@ -28,6 +28,7 @@ import (
 	"context"
 	stdcrypto "crypto"
 	"crypto/ed25519"
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -76,21 +77,35 @@ func (m verifyMaterial) signerForScheme(scheme string) (s *lineage.Signer, ok bo
 		}
 		return lineage.NewEd25519Verifier(edPub), true, nil
 	case irbackup.SignatureSchemeKMS:
+		// A composite `kms/<algorithm>` whose algorithm this build cannot
+		// verify was written by a newer sluice. Fail closed as UPGRADE, not
+		// tamper: a bare NewKMSVerifier would collapse the unknown algorithm
+		// to a false MAC = SIGNATURE-INVALID (an alarming, wrong signal).
+		if !crypto.IsSupportedKMSAlgorithm(irbackup.SchemeAlgorithm(scheme)) {
+			return nil, false, fmt.Errorf("kms scheme %q: %w", scheme, lineage.ErrSignatureUnsupportedScheme)
+		}
 		if m.verifyPub == nil {
 			return nil, false, nil
 		}
 		return lineage.NewKMSVerifier(m.verifyPub, irbackup.SchemeAlgorithm(scheme)), true, nil
 	case irbackup.SignatureSchemeHMACKEK:
 		return hmacVerifier(m.env)
-	default:
-		// Unknown / unprobeable scheme (e.g. --require-signature on a chain
-		// with no signature objects at all): prefer an explicit verify key,
-		// else the envelope, so a subsequent VerifyManifest reports the
-		// precise MISSING/INVALID error rather than skipping.
+	case "":
+		// Empty scheme = no signature object present (e.g. --require-signature
+		// on an unsigned / fully-stripped chain): prefer an explicit verify
+		// key, else the envelope, so a subsequent VerifyManifest reports the
+		// precise MISSING error rather than skipping. This is NOT an unknown
+		// scheme — there is simply no scheme to probe.
 		if edPub, isEd := m.verifyPub.(ed25519.PublicKey); isEd {
 			return lineage.NewEd25519Verifier(edPub), true, nil
 		}
 		return hmacVerifier(m.env)
+	default:
+		// A non-empty scheme FAMILY this build does not recognize (e.g. a
+		// future post-quantum scheme) — written by a newer sluice. Fail closed
+		// as UPGRADE, never tamper: verifying it with a known primitive would
+		// yield SIGNATURE-INVALID, wrongly implying the backup is compromised.
+		return nil, false, fmt.Errorf("scheme %q: %w", scheme, lineage.ErrSignatureUnsupportedScheme)
 	}
 }
 
@@ -175,7 +190,7 @@ func verifyManifestSignaturePolicy(
 	}
 	signer, ok, err := chainVerifier(ctx, segStore, mat)
 	if err != nil {
-		return err
+		return lineage.CodeForSignatureError(err) // UNSUPPORTED scheme → upgrade, not tamper
 	}
 	if !ok {
 		return unverifiableSignedManifest(ctx, manifestPath, requireStrict)
@@ -214,7 +229,7 @@ func verifyChainSignatures(
 	}
 	signer, ok, err := chainVerifier(ctx, rootStore, mat)
 	if err != nil {
-		return err
+		return lineage.CodeForSignatureError(err) // UNSUPPORTED scheme → upgrade, not tamper
 	}
 	if !ok {
 		return unverifiableSignedManifest(ctx, "chain", requireStrict)
@@ -261,6 +276,14 @@ func verifyBackupSignatures(ctx context.Context, store irbackup.Store, records [
 	}
 	signer, ok, err := chainVerifier(ctx, store, verifyMaterial{env: opts.Envelope, verifyPub: opts.VerifyKey})
 	if err != nil {
+		if errors.Is(err, lineage.ErrSignatureUnsupportedScheme) {
+			// Forward-incompatibility, not tamper: a newer sluice wrote this
+			// signature scheme. Report as an upgrade prompt (still a failure —
+			// this build cannot confirm the signature).
+			slog.ErrorContext(ctx, "backup verify: signature scheme unsupported by this build — upgrade sluice to verify (not a tamper signal)",
+				slog.String("error", err.Error()))
+			return 1
+		}
 		slog.ErrorContext(ctx, "backup verify: cannot derive verify key", slog.String("error", err.Error()))
 		return 1
 	}
