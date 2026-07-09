@@ -64,6 +64,9 @@ const (
 	CodeConfirmationRequired      Code = "SLUICE-E-CONFIRMATION-REQUIRED"
 	CodeDriverHostMismatch        Code = "SLUICE-E-DRIVER-HOST-MISMATCH"
 	CodeVStreamFloatLossy         Code = "SLUICE-E-VSTREAM-FLOAT-LOSSY"
+
+	CodeBackupSignatureInvalid Code = "SLUICE-E-BACKUP-SIGNATURE-INVALID"
+	CodeBackupSignatureMissing Code = "SLUICE-E-BACKUP-SIGNATURE-MISSING"
 )
 
 // Class partitions codes by how the process should exit when the
@@ -113,6 +116,8 @@ var registry = map[Code]Info{
 	CodeDriverHostMismatch:        {ClassRefusal, "the driver cannot drive the DSN's host (e.g. mysql pointed at a PlanetScale endpoint)"},
 	CodeIndexMissing:              {ClassRefusal, "a secondary index the migration was expected to build is absent on the target"},
 	CodeVStreamFloatLossy:         {ClassRefusal, "--strict-float: a VStream-COPY backup FLOAT column cannot be re-read exactly (keyless / over the row cap)"},
+	CodeBackupSignatureInvalid:    {ClassRefusal, "a signed backup manifest's detached signature failed verification (tampered / rolled-back / wrong key)"},
+	CodeBackupSignatureMissing:    {ClassRefusal, "a signed (v6) backup manifest is missing its detached signature"},
 }
 
 // Describe returns the registry metadata for c, and whether c is a

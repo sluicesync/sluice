@@ -107,7 +107,21 @@ import (
 // an older binary would fail to decrypt with a MISLEADING bare
 // auth-tag error anyway) are stamped 5, turning that into the loud
 // version-refusal at the manifest preflight.
-const BackupFormatVersion = 5
+//
+// v0.99.20x+ introduces FormatVersion=6 for SIGNED encrypted manifests
+// (ADR-0154 Phase 1, audit N-8 residual): the manifest carries a
+// DETACHED HMAC-SHA-256 signature (`<manifest>.sig`) keyed off a key
+// HKDF-derived from the chain KEK, and the chain's lineage catalog
+// carries a sibling `lineage.json.sig`. A v6 manifest ASSERTS it was
+// signed: restore of an encrypted v6 chain (which always has the KEK, so
+// it can always verify) refuses loudly on a missing/invalid signature
+// ([SLUICE-E-BACKUP-SIGNATURE-MISSING] / [-INVALID]). Proportional per
+// the Bug-116 discipline: signing is opt-in (`--sign`), so an ordinary
+// encrypted backup stays on 5 and an unsigned one on 1/2/4; only a
+// backup the operator asked to sign is stamped 6. Pre-v6 manifests
+// carry no signature and restore normally (the version gate means
+// "predates signing", not "untrusted").
+const BackupFormatVersion = 6
 
 // FormatVersionLegacy / FormatVersionSecurityMetadata name the
 // historically-recorded values so callers don't sprinkle bare ints
@@ -153,6 +167,17 @@ const (
 	// per Bug 116); the writers additionally never stamp it onto a
 	// RESUMED pre-v5 encrypted run, whose kept chunks are unbound.
 	FormatVersionEncryptedChunkBinding = 5
+
+	// FormatVersionSignedManifest is the FormatVersion stamped on a
+	// SIGNED encrypted manifest (ADR-0154 Phase 1). It is the read-side
+	// gate for whole-manifest authentication: a manifest at this version
+	// asserts a detached HMAC signature exists and must verify, so a
+	// verifier holding the chain KEK refuses loudly on a
+	// missing/invalid/rolled-back signature. Stamped only when signing
+	// was requested AND the chain is encrypted (proportional per Bug
+	// 116); an unsigned encrypted backup stays on
+	// [FormatVersionEncryptedChunkBinding].
+	FormatVersionSignedManifest = 6
 )
 
 // chooseFormatVersion returns the smallest manifest format version

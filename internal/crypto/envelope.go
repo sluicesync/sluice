@@ -224,6 +224,11 @@ func validateArgon2idParams(params Argon2idParams) error {
 //   - [ResolvedKEKReferencer] — report the exact KEK reference a wrap
 //     actually used (again Azure: the version-pinned key URL) so the
 //     manifest records something unwrap can be retargeted at later.
+//   - [ManifestSigner] — key an HMAC off the KEK to sign the manifest
+//     (ADR-0154 Phase 1); implemented only by envelopes holding LOCAL
+//     KEK material (passphrase mode). KMS envelopes, whose KEK never
+//     leaves the HSM, do not — Phase 1 signing of a KMS-encrypted chain
+//     is unavailable (ADR-0154 Phase 3 covers KMS Sign).
 type EnvelopeEncryption interface {
 	// WrapCEK encrypts cek with the implementation's KEK and returns
 	// the wrapped (opaque) bytes that should be recorded in the
@@ -289,6 +294,23 @@ type BoundEnvelope interface {
 // recorded ref comes from an unauthenticated manifest.
 type ChainKEKRebinder interface {
 	RebindChainKEKRef(recordedRef string)
+}
+
+// ManifestSigner is the optional [EnvelopeEncryption] extension for
+// envelopes that can key an HMAC off their KEK to sign a manifest
+// (ADR-0154 Phase 1, Option A "HMAC-off-KEK"). Only envelopes holding
+// LOCAL KEK material implement it (today [PassphraseEnvelope]); KMS
+// envelopes, whose KEK never leaves the HSM, do NOT — Phase 1 signing of
+// a KMS-encrypted chain is unavailable (ADR-0154 Phase 3 covers KMS
+// Sign). A caller that requested signing against a non-signer envelope
+// must refuse loudly rather than emit an unsigned backup.
+type ManifestSigner interface {
+	EnvelopeEncryption
+
+	// ManifestSigningKey returns the HMAC-SHA-256 key derived from the
+	// envelope's KEK via [DeriveManifestHMACKey]. The derivation label is
+	// on-disk contract — every signature is keyed by it.
+	ManifestSigningKey() ([]byte, error)
 }
 
 // ResolvedKEKReferencer is the optional [EnvelopeEncryption] extension
@@ -358,6 +380,14 @@ func (e *PassphraseEnvelope) Mode() string { return KEKModePassphrase }
 // Callers (chain writer) use this to populate
 // [backup.ChainEncryption.Argon2id] in the manifest.
 func (e *PassphraseEnvelope) Params() Argon2idParams { return e.params }
+
+// ManifestSigningKey implements [ManifestSigner]: the passphrase mode
+// holds the Argon2id-derived KEK locally, so it can key the ADR-0154
+// manifest HMAC off it. The derived signing key is HKDF-separated from
+// every encryption use of the same KEK.
+func (e *PassphraseEnvelope) ManifestSigningKey() ([]byte, error) {
+	return DeriveManifestHMACKey(e.kek)
+}
 
 // WrapCEK encrypts cek with the cached KEK via AES-256-GCM. The
 // returned bytes are `[nonce | ciphertext | authtag]` and are what the

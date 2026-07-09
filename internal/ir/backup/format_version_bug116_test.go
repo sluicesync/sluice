@@ -147,9 +147,9 @@ func TestChooseFormatVersion_Bug116(t *testing.T) {
 // chunk-binding contracts, this test catches the regression at build
 // time.
 func TestBackupFormatVersion_Bumped(t *testing.T) {
-	if BackupFormatVersion != FormatVersionEncryptedChunkBinding {
-		t.Errorf("BackupFormatVersion = %d; want FormatVersionEncryptedChunkBinding=%d (ADR-0152 ceiling)",
-			BackupFormatVersion, FormatVersionEncryptedChunkBinding)
+	if BackupFormatVersion != FormatVersionSignedManifest {
+		t.Errorf("BackupFormatVersion = %d; want FormatVersionSignedManifest=%d (ADR-0154 ceiling)",
+			BackupFormatVersion, FormatVersionSignedManifest)
 	}
 	if FormatVersionLegacy != 1 {
 		t.Errorf("FormatVersionLegacy = %d; must stay 1 (load-bearing for older-binary preflight semantics)", FormatVersionLegacy)
@@ -169,5 +169,9 @@ func TestBackupFormatVersion_Bumped(t *testing.T) {
 	if FormatVersionEncryptedChunkBinding <= FormatVersionStandaloneSequences {
 		t.Errorf("FormatVersionEncryptedChunkBinding (%d) must be strictly greater than FormatVersionStandaloneSequences (%d) — chunk-binding manifests must refuse on every pre-binding binary, whose nil-AAD decrypt would fail with a MISLEADING bare auth error",
 			FormatVersionEncryptedChunkBinding, FormatVersionStandaloneSequences)
+	}
+	if FormatVersionSignedManifest <= FormatVersionEncryptedChunkBinding {
+		t.Errorf("FormatVersionSignedManifest (%d) must be strictly greater than FormatVersionEncryptedChunkBinding (%d) — a signed manifest asserts a signature that pre-signing binaries cannot verify, so they must refuse it at the version gate (ADR-0154)",
+			FormatVersionSignedManifest, FormatVersionEncryptedChunkBinding)
 	}
 }
