@@ -120,7 +120,7 @@ func TestVStream_InterpolationResidualFamilies_ByteExact(t *testing.T) {
 		assertStoredNegZero(t, "vtgate "+leg.name, cols, row, "fl")
 	}
 
-	// The FLOAT read projection (selectColumnExpr's CAST(... AS DOUBLE),
+	// The FLOAT read projection (selectColumnExpr's `(col * 1E0)` DOUBLE promotion,
 	// the full-scan display-rounding fix) must PARSE and evaluate through
 	// vtgate too: a real full-scan read over the vtgate MySQL port must
 	// hand back the exact float32-widened doubles, −0 sign included.
@@ -148,7 +148,7 @@ func TestVStream_InterpolationResidualFamilies_ByteExact(t *testing.T) {
 	for _, col := range []string{"fl", "dbl"} {
 		f, ok := negZeroRow[col].(float64)
 		if !ok || f != 0 || !math.Signbit(f) {
-			t.Errorf("vtgate full-scan %s = %#v (%T); want exact −0.0 through the CAST projection", col, negZeroRow[col], negZeroRow[col])
+			t.Errorf("vtgate full-scan %s = %#v (%T); want exact −0.0 through the DOUBLE-promotion projection", col, negZeroRow[col], negZeroRow[col])
 		}
 	}
 }

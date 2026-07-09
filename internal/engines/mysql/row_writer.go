@@ -757,6 +757,23 @@ func prepareValue(v any, col *ir.Column) (any, error) {
 		return nil, nil
 	}
 	if col == nil {
+		// Type-free negative-zero encoding for the nil-descriptor path
+		// (the applier's cache-miss/unknown-column branches): without the
+		// column type, the ir.Float-gated wart below can't fire, and an
+		// interpolated −0.0 would mangle to +0 while the binary protocol
+		// preserves the sign — the exact divergence the wart exists to
+		// close. Encoding '-0' type-free is safe here: for float-family
+		// targets the string→double conversion preserves the sign on both
+		// protocols, and for every other numeric target the string '-0'
+		// converts to the same zero a bound −0.0 double does (DECIMAL/INT
+		// have no signed zero). The one theoretical asymmetry — a float64
+		// −0.0 bound to a JSON column through a cache miss — parses '-0'
+		// as a JSON number either way (MySQL coerces string literals to
+		// JSON by parsing them), so no cleaner-behaving alternative
+		// exists.
+		if f, ok := v.(float64); ok && f == 0 && math.Signbit(f) {
+			return "-0", nil
+		}
 		return v, nil
 	}
 	t := col.Type

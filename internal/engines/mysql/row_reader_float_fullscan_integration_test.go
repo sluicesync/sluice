@@ -13,7 +13,8 @@
 // protocol (COM_QUERY) — the arg-less full-scan ReadRows on every release,
 // plus a cursor-paged read's first unbounded page. Those pages silently
 // display-rounded every FLOAT column. The fix reads FLOAT columns through
-// `CAST(col AS DOUBLE) AS col` in the shared projection (selectColumnExpr
+// `(col * 1E0) AS col` — a version-universal DOUBLE promotion — in the
+// shared projection (selectColumnExpr
 // — the same seam as the Vector-A temporal CAST): the float32→double
 // widening is exact and sign-preserving, and MySQL prints DOUBLE
 // shortest-round-trip, so the text form is exact. DOUBLE columns need no
@@ -116,7 +117,7 @@ func TestRowReader_FloatFullScan_ExactRoundTrip(t *testing.T) {
 		t.Fatalf("raw repro select: %v", err)
 	}
 	if !raw.Valid || raw.Float64 == float64(float32(8388608)) {
-		t.Errorf("pre-fix repro: bare text-protocol SELECT of stored float32 8388608 returned %v — expected the server's display-rounding (the bug class this fix exists for); if MySQL now prints FLOAT round-trip, the CAST detour in selectColumnExpr can be retired", raw.Float64)
+		t.Errorf("pre-fix repro: bare text-protocol SELECT of stored float32 8388608 returned %v — expected the server's display-rounding (the bug class this fix exists for); if MySQL now prints FLOAT round-trip, the (col * 1E0) detour in selectColumnExpr can be retired", raw.Float64)
 	}
 
 	// Leg 2 — the REAL full-scan reader (arg-less → text protocol + CAST).

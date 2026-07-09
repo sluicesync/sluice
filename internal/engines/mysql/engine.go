@@ -133,7 +133,7 @@ func (e Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, er
 	// round-trip float32 (8.0.46: stored 8388608 prints "8388610"), so a
 	// TEXT-protocol page display-rounds FLOAT columns. That specific
 	// hazard is now ALSO closed at the projection — selectColumnExpr
-	// reads FLOAT through CAST(... AS DOUBLE), which fixed the arg-less
+	// reads FLOAT through the `(col * 1E0)` DOUBLE promotion, fixing the arg-less
 	// full-scan/first-page pages that were text-protocol on every release
 	// (the pre-existing wart the ADR-0153 sweep found) — but the read
 	// sessions stay on the binary protocol as defense in depth: the

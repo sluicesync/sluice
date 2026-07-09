@@ -817,3 +817,34 @@ func TestPrepareValue_RefusesNaNAndInf(t *testing.T) {
 		}
 	}
 }
+
+// TestPrepareValue_NegZeroTypeFreeOnNilColumn pins the nil-descriptor leg
+// of the ADR-0153 negative-zero wart (round-2 review G3): the applier's
+// cache-miss/unknown-column branches call prepareValue with no column
+// type, where the ir.Float-gated encoding can't fire — the type-free
+// branch must still encode −0.0 as the string '-0' so an interpolated
+// statement can't mangle the sign to +0 while binary preserves it.
+func TestPrepareValue_NegZeroTypeFreeOnNilColumn(t *testing.T) {
+	neg := math.Copysign(0, -1)
+	got, err := prepareValue(neg, nil)
+	if err != nil {
+		t.Fatalf("prepareValue(-0, nil): %v", err)
+	}
+	if s, ok := got.(string); !ok || s != "-0" {
+		t.Errorf("prepareValue(-0, nil) = %#v (%T); want the type-free \"-0\" encoding", got, got)
+	}
+	// Through the applier's defensive branches too.
+	if got, err = prepareApplierValue(neg, nil, "dbl"); err != nil || got != "-0" {
+		t.Errorf("prepareApplierValue(-0, nil colTypes) = %#v, %v; want \"-0\"", got, err)
+	}
+	if got, err = prepareApplierValue(neg, map[string]*ir.Column{}, "dbl"); err != nil || got != "-0" {
+		t.Errorf("prepareApplierValue(-0, unknown column) = %#v, %v; want \"-0\"", got, err)
+	}
+	// Positive zero and ordinary floats pass through untouched.
+	for _, v := range []float64{0, 1.5, -1.5} {
+		got, err := prepareValue(v, nil)
+		if err != nil || got != v {
+			t.Errorf("prepareValue(%v, nil) = %#v, %v; want passthrough", v, got, err)
+		}
+	}
+}

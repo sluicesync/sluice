@@ -900,7 +900,7 @@ func TestInterpolation_ReadRowsBatch_DecodeParity(t *testing.T) {
 		for col, cv := range ctl[i] {
 			iv := itp[i][col]
 			// fl compares STRICTLY like everything else: the FLOAT
-			// CAST(... AS DOUBLE) read projection (selectColumnExpr)
+			// `(col * 1E0)` DOUBLE-promotion read projection (selectColumnExpr)
 			// makes the text wire form exact, so the two protocols
 			// agree bit-for-bit — see TestRowReader_FloatFullScan_ExactRoundTrip.
 			if readShapesEquivalent(cv, iv) {

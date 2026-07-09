@@ -293,22 +293,33 @@ func buildSelect(table *ir.Table, qualifyBySchema bool) string {
 // only; ORDER BY / WHERE predicates (e.g. the keyset cursor) reference
 // the real column, so pagination is unaffected.
 //
-// Single-precision FLOAT columns are read through CAST(... AS DOUBLE)
-// for the same silent-corruption reason, on the other protocol: MySQL
-// does NOT round-trip FLOAT in its float→text conversion (ground-truthed
-// on 8.0.46: a stored float32 8388608 — verifiably exact via `fl =
-// 8388608` — renders "8388610" through CAST AS CHAR and the text wire
-// form alike), so any TEXT-protocol page (the arg-less full scan, and a
-// cursor-paged read's first unbounded page — pages without bind args go
-// COM_QUERY) silently display-rounded FLOAT values on every release
-// before ADR-0153's fidelity sweep found it. DOUBLE needs no detour —
-// MySQL prints DOUBLE shortest-round-trip (pinned by the ADR-0153 read
-// torture matrix) — and the widening float32→double CAST is exact and
-// sign-preserving (−0.0 included), identical to what the binary
-// protocol's float32 delivers after decodeFloat's widening. The alias
-// keeps positional and name-based consumers unchanged, NULL passes
-// through CAST as NULL, and predicates still reference the real column.
-// All other columns read directly.
+// Single-precision FLOAT columns are read through `(col * 1E0)` — a
+// promotion to DOUBLE — for the same silent-corruption reason, on the
+// other protocol: MySQL does NOT round-trip FLOAT in its float→text
+// conversion (ground-truthed on 8.0.46: a stored float32 8388608 —
+// verifiably exact via `fl = 8388608` — renders "8388610" through CAST
+// AS CHAR and the text wire form alike), so any TEXT-protocol page (the
+// arg-less full scan, and a cursor-paged read's first unbounded page —
+// pages without bind args go COM_QUERY) silently display-rounded FLOAT
+// values on every release before ADR-0153's fidelity sweep found it.
+// DOUBLE needs no detour — MySQL prints DOUBLE shortest-round-trip
+// (pinned by the ADR-0153 read torture matrix) — and the float32→double
+// promotion is exact, identical to what the binary protocol's float32
+// delivers after decodeFloat's widening.
+//
+// Why `* 1E0` and not CAST(... AS DOUBLE): the CAST form is 8.0.17+
+// syntax, and sluice has no documented floor excluding 5.7/early-8.0
+// sources (Aurora MySQL 2.x is 5.7-compatible and on the managed-guides
+// roadmap); multiplication by the DOUBLE literal 1E0 promotes
+// identically on every version and through vtgate. Why `* 1E0` and not
+// `+ 0E0`: IEEE addition loses the zero's sign (−0.0 + 0.0 = +0.0),
+// silently mangling negative zero — multiplication's sign is the XOR of
+// the operand signs, so −0.0 survives. The −0 leg of
+// TestRowReader_FloatFullScan_ExactRoundTrip fails loudly on anyone
+// "simplifying" this to addition. The alias keeps positional and
+// name-based consumers unchanged, NULL propagates through the
+// multiplication as NULL, and predicates still reference the real
+// column. All other columns read directly.
 func selectColumnExpr(c *ir.Column) string {
 	switch t := c.Type.(type) {
 	case ir.Date, ir.DateTime, ir.Timestamp:
@@ -317,7 +328,7 @@ func selectColumnExpr(c *ir.Column) string {
 	case ir.Float:
 		if t.Precision == ir.FloatSingle {
 			ident := quoteIdent(c.Name)
-			return "CAST(" + ident + " AS DOUBLE) AS " + ident
+			return "(" + ident + " * 1E0) AS " + ident
 		}
 		return quoteIdent(c.Name)
 	default:

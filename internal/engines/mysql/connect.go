@@ -471,31 +471,47 @@ func dsnSetsInterpolateParams(dsn string) bool {
 	return ok
 }
 
-// dsnParamValue returns the raw value of the named parameter from a DSN's
-// query section, and whether the key was present at all. It mirrors the
-// driver's own DSN anatomy — everything after the LAST '/' is
-// `dbname?params` (addresses and passwords may legally contain '/' and '?',
-// which is why a substring search over the whole DSN would be wrong) — and
-// the driver's param split (segments without '=' are skipped, exact
-// case-sensitive key match). Needed because ParseDSN consumes recognised
-// params into Config fields, some of them UNEXPORTED (cfg.charsets) or
+// dsnParamValue reports whether the named parameter is present in the
+// DSN's query section, returning its FIRST occurrence's value. Presence is
+// the only thing its caller ([dsnSetsInterpolateParams]) consumes — with
+// duplicate params, whichever value the driver honors, the key was still
+// explicitly set. Callers that care about WHICH occurrence use
+// [dsnParamValues]. Needed because ParseDSN consumes recognised params
+// into Config fields, some of them UNEXPORTED (cfg.charsets) or
 // explicitness-collapsing (cfg.InterpolateParams).
 func dsnParamValue(dsn, key string) (string, bool) {
+	vals := dsnParamValues(dsn, key)
+	if len(vals) == 0 {
+		return "", false
+	}
+	return vals[0], true
+}
+
+// dsnParamValues returns EVERY occurrence of the named parameter, in DSN
+// order. It mirrors the driver's DSN anatomy — everything after the LAST
+// '/' is `dbname?params` (addresses and passwords may legally contain '/'
+// and '?', so a whole-DSN substring search would be wrong) — and its param
+// split (segments without '=' are skipped; exact case-sensitive key match). The driver's own param loop makes the LAST occurrence win for
+// config-field params; callers that need driver-faithful semantics or an
+// any-occurrence safety posture decide for themselves (see
+// [dsnUnsafeInterpolationCharset]).
+func dsnParamValues(dsn, key string) []string {
 	slash := strings.LastIndexByte(dsn, '/')
 	if slash < 0 {
-		return "", false
+		return nil
 	}
 	rest := dsn[slash+1:]
 	q := strings.IndexByte(rest, '?')
 	if q < 0 {
-		return "", false
+		return nil
 	}
+	var vals []string
 	for _, seg := range strings.Split(rest[q+1:], "&") {
 		if k, v, ok := strings.Cut(seg, "="); ok && k == key {
-			return v, true
+			vals = append(vals, v)
 		}
 	}
-	return "", false
+	return vals
 }
 
 // interpolationUnsafeCharsets is the CHARSET-family counterpart of
@@ -519,20 +535,28 @@ var interpolationUnsafeCharsets = map[string]bool{
 	"gb18030": true,
 }
 
-// dsnUnsafeInterpolationCharset reports the first entry of the DSN's
-// `charset=` list (the driver's SET NAMES candidates, tried in order until
-// one succeeds) that is interpolation-unsafe. ANY unsafe entry disqualifies:
-// which candidate wins depends on the server's charset support at connect
-// time, so the connection charset cannot be assumed safe if an unsafe one
-// is in the list.
+// dsnUnsafeInterpolationCharset reports an interpolation-unsafe entry in
+// the DSN's `charset=` parameter, if any. Two deliberate any-unsafe
+// postures, both strictly safer than mirroring the driver's exact pick:
+//
+//   - ALL `charset=` OCCURRENCES are scanned, not just one. The driver's
+//     param loop makes the LAST occurrence win (`?charset=utf8mb4&
+//     charset=gbk` connects as gbk), so a first-occurrence scanner would
+//     pass a DSN whose live connection is unsafe. Rather than replicate
+//     last-wins — and silently diverge if the driver ever changes it —
+//     ANY occurrence naming an unsafe charset disqualifies; the only
+//     cost is refusing/stepping aside on a degenerate contradictory-
+//     duplicate DSN that might have connected safe.
+//   - within one occurrence, ANY entry of the comma-separated fallback
+//     list disqualifies: the driver tries the SET NAMES candidates in
+//     order until one succeeds, so which wins depends on the server at
+//     connect time.
 func dsnUnsafeInterpolationCharset(dsn string) (string, bool) {
-	raw, ok := dsnParamValue(dsn, "charset")
-	if !ok {
-		return "", false
-	}
-	for _, cs := range strings.Split(raw, ",") {
-		if interpolationUnsafeCharsets[strings.ToLower(strings.TrimSpace(cs))] {
-			return cs, true
+	for _, raw := range dsnParamValues(dsn, "charset") {
+		for _, cs := range strings.Split(raw, ",") {
+			if interpolationUnsafeCharsets[strings.ToLower(strings.TrimSpace(cs))] {
+				return cs, true
+			}
 		}
 	}
 	return "", false

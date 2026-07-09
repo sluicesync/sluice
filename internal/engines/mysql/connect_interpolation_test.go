@@ -234,6 +234,25 @@ func TestInterpolationDefault_UnsafeCharsetSkipsDefault(t *testing.T) {
 		}
 	}
 
+	// Duplicate charset= params: the DRIVER honors the LAST occurrence
+	// (its param loop overwrites), so `?charset=utf8mb4&charset=gbk`
+	// CONNECTS as gbk — the scanner must disqualify it. sluice takes the
+	// strictly-safer any-occurrence posture (either order steps aside;
+	// see dsnUnsafeInterpolationCharset for why not last-wins mirroring).
+	for _, dsn := range []string{
+		"user:pw@tcp(db.example.com:3306)/appdb?charset=utf8mb4&charset=gbk", // driver honors gbk
+		"user:pw@tcp(db.example.com:3306)/appdb?charset=gbk&charset=utf8mb4", // driver honors utf8mb4; any-unsafe still steps aside
+	} {
+		cfg, err := parseDSNForFlavor(dsn, FlavorPlanetScale)
+		if err != nil {
+			t.Errorf("%q: parse error: %v", dsn, err)
+			continue
+		}
+		if cfg.InterpolateParams {
+			t.Errorf("%q: InterpolateParams = true; duplicate charset= params with an unsafe occurrence must step aside", dsn)
+		}
+	}
+
 	// A fully-safe charset list keeps the default.
 	cfg, err := parseDSNForFlavor("user:pw@tcp(db.example.com:3306)/appdb?charset=utf8mb4,utf8", FlavorPlanetScale)
 	if err != nil {
@@ -266,6 +285,15 @@ func TestInterpolationDefault_ExplicitTrueUnsafeCharset_RefusedBySluice(t *testi
 	}
 	if _, err := parseServerDSN("user:pw@tcp(db.example.com:3306)/?charset=cp932,utf8mb4&interpolateParams=true"); err == nil {
 		t.Error("parseServerDSN: explicit interpolateParams=true + unsafe charset parsed clean; want refusal")
+	}
+	// Duplicate-param refusal, both orders (driver honors the LAST).
+	for _, d := range []string{
+		"user:pw@tcp(db.example.com:3306)/appdb?charset=utf8mb4&charset=gbk&interpolateParams=true",
+		"user:pw@tcp(db.example.com:3306)/appdb?charset=gbk&charset=utf8mb4&interpolateParams=true",
+	} {
+		if _, err := parseDSN(d); err == nil {
+			t.Errorf("%q: parsed clean; want refusal (any unsafe charset= occurrence)", d)
+		}
 	}
 	// Explicit FALSE + unsafe charset is fine — binary protocol, no hazard.
 	if _, err := parseDSN("user:pw@tcp(db.example.com:3306)/appdb?charset=gbk&interpolateParams=false"); err != nil {
