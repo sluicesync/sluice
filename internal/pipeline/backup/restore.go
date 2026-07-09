@@ -174,6 +174,12 @@ type Restore struct {
 	// lands on the target.
 	Envelope crypto.EnvelopeEncryption
 
+	// RequireSignature makes the ADR-0154 signature policy strict-always
+	// (see [ChainRestore.RequireSignature]). Threaded into the chain
+	// dispatch. Default false — a legitimate DR restore never fails for a
+	// signature it cannot check; an INVALID signature always refuses.
+	RequireSignature bool
+
 	// chainCEK caches the chain-level CEK after first unwrap so
 	// per-chain mode pays the unwrap cost (Argon2id, KMS Decrypt)
 	// exactly once per Run. Internal — set by Run on the first
@@ -310,6 +316,7 @@ func (r *Restore) Run(ctx context.Context) error {
 				Summary:          r.Summary,
 				ApplyConcurrency: r.ApplyConcurrency,
 				Envelope:         r.Envelope,
+				RequireSignature: r.RequireSignature,
 				TargetSchema:     r.TargetSchema,
 			}
 			return chain.Run(ctx)
@@ -389,6 +396,17 @@ func (r *Restore) Run(ctx context.Context) error {
 	// lands on the target.
 	if err := r.preflightEncryption(manifest); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("restore: %w", err))
+	}
+
+	// 1.6. ADR-0154 signature verification for the single-manifest path
+	// (a lone signed full, sequence 0). When SkipChainDispatch is set,
+	// [ChainRestore] already verified every segment's signatures at its
+	// walked position — re-verifying here would use the wrong sequence
+	// for a later segment's full, so skip.
+	if !r.SkipChainDispatch {
+		if err := verifyManifestSignaturePolicy(ctx, r.Store, lineage.ManifestFileName, manifest, 0, r.Envelope, r.RequireSignature); err != nil {
+			return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("restore: %w", err))
+		}
 	}
 
 	// 2. Filter tables — both at the schema level (so unwanted
@@ -1221,6 +1239,11 @@ type VerifyOptions struct {
 	// Must match the chain root's recorded KEKMode when set; a
 	// mismatch returns an irrecoverable error from VerifyBackup.
 	Envelope crypto.EnvelopeEncryption
+
+	// RequireSignature makes an UNVERIFIABLE signed (v6) chain — one with
+	// no KEK-holding key — a verify failure rather than a WARN. An
+	// INVALID signature is always a failure regardless. Default false.
+	RequireSignature bool
 }
 
 // VerifyBackup walks every chunk referenced by the manifest in store,
@@ -1292,6 +1315,12 @@ func VerifyBackupWith(ctx context.Context, store irbackup.Store, opts VerifyOpti
 			}
 		}
 	}
+	// ADR-0154: report + verify the whole-manifest signatures. Reports
+	// signed/valid, signed/invalid, or unsigned per manifest; an invalid
+	// (or, under RequireSignature, an unverifiable) signature counts as a
+	// verify failure so `backup verify` exits non-zero.
+	failed += verifyBackupSignatures(ctx, store, records, opts)
+
 	for _, rec := range records {
 		manifest := rec.Manifest
 		// Chunk files are addressed relative to the segment's store

@@ -251,6 +251,17 @@ type Backup struct {
 	// shape — the v0.16.x..v0.21.x default.
 	Encryption *lineage.BackupEncryption
 
+	// Sign, when true, writes a detached HMAC-SHA-256 signature over the
+	// manifest (`manifest.json.sig`) and the lineage catalog
+	// (`lineage.json.sig`), keyed off a key HKDF-derived from the chain
+	// KEK (ADR-0154 Phase 1, Option A "HMAC-off-KEK"). Requires
+	// [Backup.Encryption] (Phase 1 signs only encrypted chains — there
+	// is a KEK to key the HMAC) and a passphrase-mode envelope (a
+	// KMS-encrypted chain's KEK never leaves the HSM; KMS Sign is Phase
+	// 3). A signed backup is stamped [irbackup.FormatVersionSignedManifest]
+	// (proportional per Bug 116 — an unsigned backup stays on 5).
+	Sign bool
+
 	// Summary, when non-nil, collects the end-of-run per-table facts
 	// the CLI's `--format json` result envelope renders — filled from
 	// the completed manifest's per-table row counts. nil (the zero
@@ -559,7 +570,43 @@ func (b *Backup) Run(ctx context.Context) error {
 	// recorded-codec accelerator.
 	lineage.UpdateLineageForManifestBestEffort(ctx, b.Store, manifest, lineage.ManifestFileName, blobcodec.ResolveCodec(b.Codec))
 
+	// ADR-0154: sign the manifest + the lineage catalog AFTER both are
+	// durable. The full is segment 0's root manifest (sequence 0). Unlike
+	// the best-effort lineage update, signing is fail-loud: a signed
+	// chain with an unsigned artifact would refuse at restore, so a
+	// signing failure must fail the backup, not leave a half-signed store.
+	if err := b.signBackupArtifacts(ctx, manifest); err != nil {
+		return fmt.Errorf("backup: sign artifacts: %w", err)
+	}
+
 	logBackupComplete(ctx, manifest, b.Summary)
+	return nil
+}
+
+// signBackupArtifacts writes the detached manifest + lineage signatures
+// for a signed (--sign) run. A no-op when signing is off. The envelope's
+// signability was already validated in setupChainEncryption, so a failure
+// here is an I/O problem, not a misconfiguration.
+func (b *Backup) signBackupArtifacts(ctx context.Context, manifest *irbackup.Manifest) error {
+	if !b.Sign {
+		return nil
+	}
+	signer, ok, err := lineage.NewSigner(b.Encryption.Envelope)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("signing envelope became non-signable after preflight (internal inconsistency)")
+	}
+	if err := lineage.WriteManifestSig(ctx, b.Store, lineage.ManifestFileName, manifest, 0, signer); err != nil {
+		return fmt.Errorf("write manifest signature: %w", err)
+	}
+	if err := lineage.SignLineageCatalog(ctx, b.Store, signer); err != nil {
+		return fmt.Errorf("write lineage signature: %w", err)
+	}
+	slog.InfoContext(ctx, "backup: wrote detached signatures (ADR-0154)",
+		slog.String("key_id", signer.KeyID),
+		slog.Int("format_version", manifest.FormatVersion))
 	return nil
 }
 
@@ -1182,6 +1229,10 @@ func (b *Backup) validate() error {
 		return errors.New("backup: SourceDSN is empty")
 	case b.Store == nil:
 		return errors.New("backup: Store is nil")
+	case b.Sign && b.Encryption == nil:
+		// ADR-0154 Phase 1 has no plaintext signing path (that is Ed25519,
+		// Phase 2). Signing an encrypted chain keys the HMAC off its KEK.
+		return errors.New("backup: --sign needs an encrypted chain in this build: signing a plaintext backup needs an explicit signing key, not available until ADR-0154 Phase 2 — add --encrypt (with a passphrase) to sign an encrypted chain")
 	}
 	return nil
 }
@@ -1550,6 +1601,23 @@ func (b *Backup) setupChainEncryption(manifest, prior *irbackup.Manifest) ([]byt
 			slog.Int("format_version", prior.FormatVersion))
 	} else {
 		manifest.FormatVersion = max(manifest.FormatVersion, irbackup.FormatVersionEncryptedChunkBinding)
+	}
+
+	// ADR-0154: a signed backup is stamped the signed-manifest version so
+	// the read side knows a valid signature is required. Fail fast on a
+	// non-signable envelope (KMS: Phase 3) or a resumed pre-binding chain
+	// (unbound chunks can't be brought under a signature) — refusing here,
+	// before the sweep, beats writing chunks we then can't sign.
+	if b.Sign {
+		if resumingPreBinding {
+			return nil, errors.New("backup: --sign cannot extend a resumed pre-chunk-binding encrypted run; start a fresh signed chain with --force-overwrite")
+		}
+		if _, ok, err := lineage.NewSigner(enc.Envelope); err != nil {
+			return nil, fmt.Errorf("backup: --sign: %w", err)
+		} else if !ok {
+			return nil, errors.New("backup: --sign on this encrypted chain is unsupported in ADR-0154 Phase 1: HMAC signing needs a local passphrase-derived key, but a KMS-encrypted chain's KEK never leaves the HSM (KMS Sign is Phase 3). Use passphrase encryption to sign in Phase 1")
+		}
+		manifest.FormatVersion = max(manifest.FormatVersion, irbackup.FormatVersionSignedManifest)
 	}
 
 	chainEnc := &irbackup.ChainEncryption{

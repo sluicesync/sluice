@@ -1,6 +1,6 @@
 # ADR-0154 — Signed backup manifests (whole-manifest authentication)
 
-Status: **Accepted** (2026-07-09; decisions §3/§4/§7 ratified by the operator — build in the §6 phased order, Phase 1 first)
+Status: **Accepted** (2026-07-09; decisions §3/§4/§7 ratified by the operator — build in the §6 phased order, Phase 1 first). **Phase 1 implemented (unreleased)** — see §8.
 Date: 2026-07-09
 Supersedes/extends: ADR-0152 (backup-encryption integrity — chunk AAD binding, KMS EncryptionContext, chunk-header + SchemaHash verification)
 Audit origin: `workspace/repo-audit-2026-07-08-fable-crosscheck.md` finding N-8, "honest boundary" residual
@@ -154,5 +154,20 @@ The usability hazard of signing is **breaking restores of legitimately-unsigned 
 5. **Priority → build now, in the §6 phased order, Phase 1 first.** No production users means it can be sequenced deliberately (not rushed) but the operator has greenlit starting; Phase 1 (FormatVersion 6 + HMAC-off-KEK + verification policy + `backup verify` reporting + intra-chain monotonicity) lands as its own release, Phases 2–3 (Ed25519, KMS) as follow-ups.
 
 ---
+
+## 8. Phase 1 implementation notes — **implemented (unreleased)**
+
+Phase 1 (§6 step 1 + step 4 + freshness option (c)) is implemented on `main`'s worktree, gated behind the CI `-race` Integration job (it touches the concurrent backup/restore paths) and unreleased. Shape as built:
+
+- **FormatVersion 6** (`irbackup.FormatVersionSignedManifest`), the new `BackupFormatVersion` ceiling. Stamped ONLY when `--sign` is set on an encrypted backup (or when extending an already-signed chain); an unsigned encrypted backup stays on 5 (Bug-116 proportionality). The RECORDED version decides signed-vs-unsigned verification — never try-both.
+- **Signing key** — HMAC-SHA-256 keyed off a key HKDF-derived from the chain KEK via label `"sluice-manifest-sig/v1"` (`crypto.DeriveManifestHMACKey`), surfaced through a new optional envelope interface `crypto.ManifestSigner` implemented only by `PassphraseEnvelope`. **Phase 1 signs only passphrase-encrypted chains**: a KMS-encrypted chain's KEK never leaves the HSM, so `--sign` on one refuses loudly (KMS Sign is Phase 3). `--sign` on a plaintext backup refuses ("needs --encrypt … not available until Phase 2"). Scheme tag `hmac-kek`; the detached sig records `key_id` (a non-secret fingerprint) + scheme.
+- **Canonical serialization** — `irbackup.CanonicalManifestBytes(m, seq)`, a deterministic line-oriented text form (versioned `sluice-manifest-canon/v1`) over format version, identity, parent pointer, SchemaHash, ChainEncryption (incl. Argon2id params), the table→row-count map, the full chunk list (row chunks by path; change chunks by ordinal), and the freshness anchors (sequence + chunk-count). Golden-pinned (on-disk contract).
+- **Detached signatures** — `<manifest>.sig` per manifest and `lineage.json.sig` for the chain tip (never inside the manifest). The `lineage.sig` authenticates the link ENUMERATION (closes dropped-newest-link, which the per-manifest sigs alone can't see).
+- **Freshness (option c)** — the per-manifest signed `sequence` is the manifest's flat position in the lineage; chain-restore verifies each link's signed sequence equals its walked position (gap-free — a dropped/reordered middle link fails) and each link's signed chunk-count equals its actual list length (a truncated change-list fails). `lineage.sig`'s signed link count closes the dropped tail.
+- **Verification policy (§4)** — a v6 chain restored with a KEK-holding envelope (encrypted restore always has one) verifies strictly and refuses on missing/invalid/rolled-back/truncated with `SLUICE-E-BACKUP-SIGNATURE-INVALID` / `-MISSING` (new coded errors). No verify key available → WARN-and-proceed by default, refuse under `--require-signature`. Pre-v6 always restores.
+- **Compact/prune (Q4)** — a signed chain refuses to compact/prune without the key; with `--encrypt` supplied it re-signs the whole restructured survivor set + lineage at the new positions.
+- **`backup verify`** — reports each manifest's signature status (valid / invalid / unsigned) + the lineage status; an invalid signature is a verify failure (non-zero exit).
+
+**Deferred to a follow-up (flagged, not silently dropped):** (1) `backup stream` does not yet sign its rollover manifests — it refuses to extend a signed chain rather than emit an un-restorable tail (the rotation/CDC re-sign needs its own `-race` gating); use `backup incremental --sign`. (2) The external high-water anchor (option b, full R1 coverage) — documented opt-in, unbuilt. (3) The write-side signing `sequence` assumes the lineage's `RestorableFromSegment` is 0 at sign time (true for fresh chains + post-prune/compact, which reset it); a signed chain restored from a `RestorableFromSegment > 0` catalog would mis-number and refuse — acceptable (loud) for Phase 1, to revisit if that shape appears.
 
 *Prior art note:* Vitess — a mature, widely-deployed project — shipped backup manifests without cryptographic signing for its entire history; the trust-the-manifest model produced CVE-2026-27965 (manifest-embedded decompressor command → RCE) and CVE-2026-27969 (manifest path traversal → arbitrary file write on restore), both patched July 2026 in v22.0.4 / v23.0.3 by *removing the executable field* and *sanitising paths* — i.e. the two invariants sluice already holds — not by adding signatures. This is direct evidence for the ADR's framing: **the first-order defense against malicious-manifest-field attacks is "the manifest is data, never instructions, and never an unsanitised path"; signing is the second-order defense against whole-manifest substitution.** sluice should keep both, and not conflate them.

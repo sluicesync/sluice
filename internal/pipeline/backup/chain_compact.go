@@ -142,6 +142,13 @@ type CompactOpts struct {
 	// this for deterministic asserts; production leaves nil (the
 	// minter is a random hex string under [generateMergedSegmentID]).
 	newSegmentID func() string
+
+	// Signer, when non-nil, re-signs every manifest + the lineage after
+	// a compact of a SIGNED chain (ADR-0154 Q4). Merging renumbers link
+	// positions and rewrites the merged manifest's content, so the whole
+	// survivor set is re-signed. When the chain is signed and Signer is
+	// nil, compact REFUSES rather than emit an unsigned merged successor.
+	Signer *lineage.Signer
 }
 
 // CompactResult summarises a [CompactChain] run.
@@ -331,6 +338,17 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 	if len(eligible) < 2 {
 		slog.InfoContext(ctx, "backup compact: nothing to compact (fewer than 2 retained segments)")
 		return &CompactResult{}, nil
+	}
+
+	// ADR-0154 Q4: never emit an unsigned merged successor to a signed
+	// chain. Refuse loudly when the chain is signed and no signing key
+	// was supplied; otherwise re-sign the merged result below.
+	signed, err := lineage.ChainIsSigned(ctx, store)
+	if err != nil {
+		return nil, fmt.Errorf("backup compact: probe signed chain: %w", err)
+	}
+	if err := refuseUnsignableMaintenance("backup compact", signed, opts.DryRun, opts.Signer); err != nil {
+		return nil, err
 	}
 
 	// Load per-segment metadata once.
@@ -547,6 +565,13 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 	cat.UpdatedAt = now().UTC()
 	if err := lineage.WriteLineageCatalog(ctx, store, cat); err != nil {
 		return nil, fmt.Errorf("backup compact: rewrite lineage catalog: %w", err)
+	}
+
+	// ADR-0154: re-sign the merged survivor set at its new positions +
+	// the lineage. Runs BEFORE the orphan-delete sweep so the signed
+	// artifacts reflect the authoritative post-compact structure.
+	if err := resignIfSigned(ctx, store, signed, opts.Signer); err != nil {
+		return nil, fmt.Errorf("backup compact: re-sign merged chain: %w", err)
 	}
 
 	// Post-commit delete pass: the merged segment is now authoritative;

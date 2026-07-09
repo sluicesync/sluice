@@ -329,6 +329,11 @@ func (b *BackupStream) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// ADR-0154 Phase 1: `backup stream` does not yet sign its rollover
+	// manifests — refuse to extend a signed chain. See [refuseSignedChain].
+	if err := b.refuseSignedChain(ctx); err != nil {
+		return err
+	}
 	cdc := init.cdc
 	defer func() { migcore.CloseIf(cdc) }()
 	defer init.deregisterStopCh()
@@ -965,6 +970,24 @@ func (b *BackupStream) commitRollover(ctx context.Context, roll rolloverOutcome,
 		runRolloverHook(ctx, b.RolloverHook, roll.Manifest, manifestPath, roll.TotalChanges, roll.TotalBytes, elapsed)
 	}
 	return rolloverCommit{advanced: true, newParent: roll.Manifest, newStartPos: roll.Manifest.EndPosition}, nil
+}
+
+// refuseSignedChain refuses to extend a signed (ADR-0154) chain from
+// `backup stream`. Rollover-manifest signing is a Phase 1 follow-up (the
+// rotation/CDC path needs its own -race-gated re-sign at every rollover +
+// segment-cap); extending a signed chain with unsigned rollovers would
+// produce links that refuse at restore, so refuse loudly up front rather
+// than emit an un-restorable tail. The signal is the chain's
+// lineage.json.sig (not a bare v6 FormatVersion stamp).
+func (b *BackupStream) refuseSignedChain(ctx context.Context) error {
+	signed, err := lineage.ChainIsSigned(ctx, b.Store)
+	if err != nil {
+		return fmt.Errorf("backup stream: probe signed chain: %w", err)
+	}
+	if signed {
+		return errors.New("backup stream: cannot extend a signed (ADR-0154) chain — `backup stream` manifest signing is a Phase 1 follow-up; use `backup incremental --sign` to extend a signed chain, or start a fresh unsigned chain")
+	}
+	return nil
 }
 
 // validate sanity-checks required fields. Mirrors

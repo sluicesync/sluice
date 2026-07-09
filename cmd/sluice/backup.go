@@ -52,6 +52,12 @@ type EncryptionFlags struct {
 	// made omission indistinguishable from an explicit per-chain and left
 	// the inherit path unreachable. The trailing comma admits the empty value.
 	EncryptMode string `name:"encrypt-mode" enum:"per-chain,per-chunk," default:"" help:"Encryption mode. Omit to inherit an existing chain's mode (a fresh full defaults to per-chain): 'per-chain' (single CEK per chain; one KEK derive / KMS Decrypt per restore) or 'per-chunk' (one CEK per chunk; defense-in-depth at the cost of per-chunk wrap). Must match the chain's mode when extending an encrypted chain."`
+
+	// ADR-0154 Phase 1 signing. Sign gates the WRITE side (backup full /
+	// incremental); RequireSignature gates the READ side (restore /
+	// verify) strict-always policy.
+	Sign             bool `name:"sign" help:"Sign the backup manifest + lineage catalog with a detached HMAC-SHA-256 keyed off the chain KEK (ADR-0154 Phase 1). Requires --encrypt (Phase 1 signs only encrypted chains) with a passphrase (KMS signing is Phase 3). A signed backup refuses at restore/verify on a tampered, rolled-back, or truncated manifest. Extending an already-signed chain signs automatically."`
+	RequireSignature bool `name:"require-signature" help:"Strict-always signature policy on restore/verify: a signed (v6) backup that cannot be verified (no key supplied) is refused rather than warned. An INVALID signature is always refused regardless of this flag. Leave off for the DR-safe default (never fail a restore for a signature it cannot check)."`
 }
 
 // resolvePassphrase returns the operator's passphrase from whichever
@@ -349,6 +355,34 @@ func (e *EncryptionFlags) buildReadEnvelope(rootManifest *irbackup.Manifest) (cr
 	return env, nil
 }
 
+// buildSigner derives the ADR-0154 signing key for a maintenance
+// (compact / prune) run that must re-sign a signed chain. Returns nil
+// when --encrypt was not supplied (the pipeline then refuses a signed
+// chain loudly) or when the envelope cannot key an HMAC off its KEK
+// (KMS — Phase 3). Reads the chain-root manifest for the Argon2id
+// params, mirroring buildReadEnvelope.
+func (e *EncryptionFlags) buildSigner(ctx context.Context, store irbackup.Store) (*lineage.Signer, error) {
+	if !e.Encrypt {
+		return nil, nil
+	}
+	rootManifest, err := lineage.ReadRootManifest(ctx, store)
+	if err != nil {
+		return nil, fmt.Errorf("read root manifest for signer: %w", err)
+	}
+	env, err := e.buildReadEnvelope(rootManifest)
+	if err != nil {
+		return nil, err
+	}
+	signer, ok, err := lineage.NewSigner(env)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, nil
+	}
+	return signer, nil
+}
+
 // BackupCmd groups the backup verbs. Phase 1 shipped `full` and
 // `verify`; Phase 3 (v0.17.0) adds `incremental` for chained backups
 // taken on top of a previous full or incremental; Phase 4 (v0.19.0)
@@ -520,6 +554,7 @@ func (b *BackupFullCmd) run(g *Globals, env *envelopeRun) error {
 		BulkParallelMinRows: b.BulkParallelMinRows,
 		ForceOverwrite:      b.ForceOverwrite,
 		Encryption:          encConfig,
+		Sign:                b.Sign,
 		Codec:               codec,
 		// --format json envelope hookup; nil in text mode (no-ops).
 		Summary: env.summary,
@@ -682,6 +717,7 @@ func (b *BackupIncrementalCmd) Run(g *Globals) error {
 		ChunkChanges:  b.ChunkSize,
 		SluiceVersion: version,
 		Encryption:    encConfig,
+		Sign:          b.Sign,
 	}
 	return incr.Run(ctx)
 }
@@ -980,7 +1016,8 @@ func (v *BackupVerifyCmd) Run(_ *Globals) error {
 		)
 	}
 	total, mismatches, err := backup.VerifyBackupWith(ctx, store, backup.VerifyOptions{
-		Envelope: envelope,
+		Envelope:         envelope,
+		RequireSignature: v.RequireSignature,
 	})
 	if err != nil {
 		return err
@@ -1029,6 +1066,11 @@ type BackupPruneCmd struct {
 	KeepDuration     time.Duration `help:"Retain incrementals younger than this duration. Mutually exclusive with --keep-incrementals. Examples: 168h (7d), 720h (30d)." placeholder:"DUR"`
 
 	DryRun bool `help:"Report what would be pruned without deleting or rewriting the catalog."`
+
+	// Pruning a SIGNED (ADR-0154) chain renumbers link positions and must
+	// re-sign the survivors; pass --encrypt + the chain's key to enable
+	// that (a signed chain refuses to prune without it).
+	EncryptionFlags
 }
 
 // Run implements `sluice backup prune`.
@@ -1055,10 +1097,15 @@ func (p *BackupPruneCmd) Run(_ *Globals) error {
 		defer func() { _ = closer() }()
 	}
 
+	signer, err := p.buildSigner(ctx, store)
+	if err != nil {
+		return err
+	}
 	res, err := backup.PruneChain(ctx, store, backup.PruneOpts{
 		KeepIncrementals: p.KeepIncrementals,
 		KeepDuration:     p.KeepDuration,
 		DryRun:           p.DryRun,
+		Signer:           signer,
 	})
 	if err != nil {
 		return err
@@ -1133,6 +1180,11 @@ type BackupCompactCmd struct {
 	SmartCompaction      bool   `name:"smart-compaction" help:"Enable ADR-0064 event-level collapse (INSERT+UPDATE → INSERT, UPDATE+UPDATE → UPDATE, INSERT+DELETE → nothing, UPDATE+DELETE → DELETE) within each merge group's change-chunks. Default off in v1; opt in once update-heavy workload makes the CPU tax worthwhile. Mutually exclusive with --smart-compaction-off."`
 	SmartCompactionOff   bool   `name:"smart-compaction-off" help:"Explicitly disable smart compaction (the v1 default). Useful as an audit trail or as the recovery flag after a corrupt-PK refuse-loudly fail. Mutually exclusive with --smart-compaction."`
 	CompactionPKStrategy string `name:"compaction-pk-strategy" enum:"pk,replica-identity,none" default:"pk" help:"Row-identity strategy for smart compaction. 'pk' (default) uses the table's declared primary key; 'replica-identity' is a PG-targeted alias for 'pk' (v1); 'none' disables per-row collapse (debugging escape hatch). Has no effect without --smart-compaction." placeholder:"STRATEGY"`
+
+	// Compacting a SIGNED (ADR-0154) chain rewrites + renumbers manifests
+	// and must re-sign them; pass --encrypt + the chain's key to enable
+	// that (a signed chain refuses to compact without it).
+	EncryptionFlags
 }
 
 // Run implements `sluice backup compact`.
@@ -1162,11 +1214,16 @@ func (c *BackupCompactCmd) Run(_ *Globals) error {
 		defer func() { _ = closer() }()
 	}
 
+	signer, err := c.buildSigner(ctx, store)
+	if err != nil {
+		return err
+	}
 	res, err := backup.CompactChain(ctx, store, backup.CompactOpts{
 		MergeWindow:     c.MergeWindow,
 		DryRun:          c.DryRun,
 		SmartCompaction: c.SmartCompaction,
 		PKStrategy:      backup.PKStrategy(c.CompactionPKStrategy),
+		Signer:          signer,
 	})
 	if err != nil {
 		return err
@@ -1411,6 +1468,7 @@ func (r *RestoreCmd) run(g *Globals, env *envelopeRun) error {
 		ChunkParallelism: r.BulkParallelism,
 		ApplyConcurrency: r.ApplyConcurrency,
 		Envelope:         envelope,
+		RequireSignature: r.RequireSignature,
 		TargetSchema:     r.TargetSchema,
 		// --format json envelope hookup; nil in text mode (no-ops).
 		Summary: env.summary,

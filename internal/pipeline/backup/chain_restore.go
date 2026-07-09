@@ -117,6 +117,13 @@ type ChainRestore struct {
 	// chains. See [Restore.Envelope].
 	Envelope crypto.EnvelopeEncryption
 
+	// RequireSignature makes the ADR-0154 policy strict-always: a v6
+	// (signed) chain that cannot be verified (no KEK-holding key) refuses
+	// instead of WARN-and-proceeding. The default (false) never fails a
+	// legitimate DR restore for a signature it cannot check; an INVALID
+	// signature always refuses regardless.
+	RequireSignature bool
+
 	// TargetSchema is the per-source target-schema namespace override
 	// (ADR-0031). See [Restore.TargetSchema] for the design. Threaded
 	// through to the chain's full-application step (via Restore) and
@@ -232,6 +239,14 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	// before anything lands on the target.
 	if err := r.verifySchemaHashes(ctx, links); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, err)
+	}
+
+	// 2.8. ADR-0154 whole-manifest signature + freshness verification.
+	// A signed (v6) chain refuses loudly on a missing/invalid/rolled-back
+	// signature, a truncated change-list, or a dropped-newest-link BEFORE
+	// anything lands on the target. Pre-v6 chains are a no-op.
+	if err := verifyChainSignatures(ctx, r.Store, links, r.Envelope, r.RequireSignature); err != nil {
+		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore: %w", err))
 	}
 
 	applier, err := r.Target.OpenChangeApplier(ctx, r.TargetDSN)

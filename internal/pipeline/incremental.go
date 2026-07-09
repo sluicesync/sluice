@@ -129,6 +129,15 @@ type IncrementalBackup struct {
 	// can't be created.
 	Encryption *lineage.BackupEncryption
 
+	// Sign, when true (or forced true because the parent chain is
+	// already signed), writes a detached signature over this
+	// incremental's manifest + re-signs the lineage catalog (ADR-0154
+	// Phase 1). A signed chain's invariant is "every manifest is signed",
+	// so extending a signed (v6) chain MUST sign even without the flag —
+	// the orchestrator refuses loudly if it cannot (no passphrase-mode
+	// envelope), rather than emit an unsigned successor.
+	Sign bool
+
 	// Codec is the operator's --compression choice. Consulted only
 	// when the open segment's codec isn't already pinned in
 	// lineage.json (a segment is single-codec by construction; the
@@ -372,6 +381,12 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	if b.Encryption != nil {
 		manifest.FormatVersion = max(manifest.FormatVersion, irbackup.FormatVersionEncryptedChunkBinding)
 	}
+	// ADR-0154: extend a signed chain as signed (stamps v6 + preflights
+	// the signer before the window opens). See [resolveSigning].
+	signing, err := b.resolveSigning(ctx, manifest)
+	if err != nil {
+		return err
+	}
 
 	deadline := clockNow().Add(windowDur)
 	endPos, totalChanges, captureErr := b.captureWindow(ctx, cdc, changesCh, manifest, chunkSize, deadline, b.MaxChanges, clockNow, chainCEK)
@@ -446,6 +461,17 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	// manifest file is authoritative for the one-segment shape).
 	lineage.UpdateLineageForManifestBestEffort(ctx, b.Store, manifest, manifestPath, b.segCodec)
 
+	// ADR-0154: sign this incremental's manifest + re-sign the lineage
+	// catalog (the enumeration just grew). The manifest signature lives
+	// next to the manifest in the segment store; the lineage signature at
+	// the lineage root. Fail-loud — a signed chain with an unsigned tail
+	// refuses at restore.
+	if signing {
+		if err := b.signIncrementalArtifacts(ctx, manifest, manifestPath); err != nil {
+			return fmt.Errorf("incremental: sign artifacts: %w", err)
+		}
+	}
+
 	slog.InfoContext(
 		ctx, "incremental backup complete",
 		slog.String("backup_id", manifest.BackupID),
@@ -456,6 +482,75 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 		slog.Int("schema_history", len(manifest.SchemaHistory)),
 		slog.String("manifest_path", manifestPath),
 	)
+	return nil
+}
+
+// resolveSigning decides whether this incremental must be signed and, if
+// so, preflights the signer + stamps the signed FormatVersion on manifest
+// BEFORE the window opens (ADR-0154 Q4). Signing is forced when the chain
+// is already signed — detected by the presence of lineage.json.sig, the
+// real signal (a bare v6 FormatVersion stamp with no signature is not a
+// signed chain). Refuses loudly on a plaintext chain or a non-signable
+// (KMS) envelope rather than emit an unsigned successor.
+func (b *IncrementalBackup) resolveSigning(ctx context.Context, manifest *irbackup.Manifest) (bool, error) {
+	chainSigned, err := lineage.ChainIsSigned(ctx, b.Store)
+	if err != nil {
+		return false, fmt.Errorf("incremental: probe signed chain: %w", err)
+	}
+	if !b.Sign && !chainSigned {
+		return false, nil
+	}
+	if b.Encryption == nil {
+		return false, errors.New("incremental: cannot sign a plaintext chain (ADR-0154 Phase 1 signs only encrypted chains); the parent is unsigned/plaintext")
+	}
+	if _, ok, serr := lineage.NewSigner(b.Encryption.Envelope); serr != nil {
+		return false, fmt.Errorf("incremental: signing: %w", serr)
+	} else if !ok {
+		return false, errors.New("incremental: extending a signed chain needs a passphrase-derived signing key, but the envelope cannot key an HMAC off its KEK (KMS Sign is ADR-0154 Phase 3); refusing to emit an unsigned successor to a signed chain")
+	}
+	manifest.FormatVersion = max(manifest.FormatVersion, irbackup.FormatVersionSignedManifest)
+	return true, nil
+}
+
+// signIncrementalArtifacts signs this incremental's manifest at its
+// lineage position and re-signs the lineage catalog (ADR-0154 Phase 1).
+// It first ensures the lineage update is durable (fail-loud, idempotent)
+// — the best-effort update above is inadequate for a signed chain, whose
+// freshness anchor is the signed link enumeration.
+func (b *IncrementalBackup) signIncrementalArtifacts(ctx context.Context, manifest *irbackup.Manifest, manifestPath string) error {
+	signer, ok, err := lineage.NewSigner(b.Encryption.Envelope)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("signing envelope became non-signable after preflight (internal inconsistency)")
+	}
+	// Ensure the catalog durably includes this incremental before we sign
+	// its enumeration (idempotent: dedups on manifest path).
+	if err := lineage.UpdateLineageForManifest(ctx, b.Store, manifest, manifestPath, b.segCodec); err != nil {
+		return fmt.Errorf("ensure lineage catalog durable: %w", err)
+	}
+	cat, ok, err := lineage.LoadLineageCatalog(ctx, b.Store)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("lineage catalog absent after update; cannot assign a signing sequence")
+	}
+	// The just-appended incremental is the newest link in flat order.
+	seq := lineage.ManifestCount(cat) - 1
+	if seq < 0 {
+		seq = 0
+	}
+	if err := lineage.WriteManifestSig(ctx, b.segStore, manifestPath, manifest, seq, signer); err != nil {
+		return fmt.Errorf("write manifest signature: %w", err)
+	}
+	if err := lineage.WriteLineageSig(ctx, b.Store, cat, signer); err != nil {
+		return fmt.Errorf("write lineage signature: %w", err)
+	}
+	slog.InfoContext(ctx, "incremental: wrote detached signatures (ADR-0154)",
+		slog.String("key_id", signer.KeyID),
+		slog.Int("sequence", seq))
 	return nil
 }
 

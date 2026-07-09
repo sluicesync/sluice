@@ -66,6 +66,13 @@ type PruneOpts struct {
 
 	// Now overrides the wall-clock time source for KeepDuration math.
 	Now func() time.Time
+
+	// Signer, when non-nil, re-signs the surviving manifests + lineage
+	// after a prune of a SIGNED chain (ADR-0154 Q4). Pruning renumbers
+	// link positions, so every survivor must be re-signed. When the chain
+	// is signed and Signer is nil, prune REFUSES rather than leave a
+	// signed chain with stale-position signatures / an unsigned lineage.
+	Signer *lineage.Signer
 }
 
 // PruneResult summarises a [PruneChain] run.
@@ -122,6 +129,17 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 	}
 	if cat.RestorableFromSegment < 0 || cat.RestorableFromSegment >= len(cat.Segments) {
 		return nil, fmt.Errorf("prune: lineage restorable_from_segment=%d out of range — corrupt lineage", cat.RestorableFromSegment)
+	}
+
+	// ADR-0154 Q4: a signed chain must be re-signed after prune (positions
+	// renumber). Refuse loudly when we cannot — never leave a signed chain
+	// with an unsigned/stale-signature successor.
+	signed, err := lineage.ChainIsSigned(ctx, store)
+	if err != nil {
+		return nil, fmt.Errorf("prune: probe signed chain: %w", err)
+	}
+	if err := refuseUnsignableMaintenance("prune", signed, opts.DryRun, opts.Signer); err != nil {
+		return nil, err
 	}
 
 	// Flatten the currently-restorable incrementals across segments,
@@ -258,6 +276,10 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 	cat.UpdatedAt = now().UTC()
 	if err := lineage.WriteLineageCatalog(ctx, store, cat); err != nil {
 		return nil, fmt.Errorf("prune: rewrite lineage catalog: %w", err)
+	}
+	// ADR-0154: re-sign the survivor set at its new positions + lineage.
+	if err := resignIfSigned(ctx, store, signed, opts.Signer); err != nil {
+		return nil, fmt.Errorf("prune: re-sign pruned chain: %w", err)
 	}
 	slog.InfoContext(
 		ctx, "prune: lineage pruned",
