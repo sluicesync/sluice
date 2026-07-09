@@ -595,8 +595,31 @@ func (p *fastParser) parseEnvelope(depth int) (any, bool) {
 	return v, true
 }
 
+// parseEnvelopePayload dispatches on the envelope tag to the
+// per-family payload parsers. Split along the tag-family seams
+// (scalar / list / list_str / map) purely for gocyclo headroom — the
+// monolithic switch sat at exactly the lint ceiling, so the NEXT tag
+// added to the codec would have failed Lint. Behaviour is
+// byte-identical to the pre-split switch; the on-disk envelope
+// grammar is pinned by the decode differential tests.
 func (p *fastParser) parseEnvelopePayload(tag string, depth int) (any, bool) {
 	p.skipWS()
+	switch tag {
+	case "bytes", "time", "i64", "u64", "f64", "f64s":
+		return p.parseEnvelopeScalar(tag)
+	case "list":
+		return p.parseEnvelopeList(depth)
+	case "list_str":
+		return p.parseEnvelopeListStr()
+	case "map":
+		return p.parseEnvelopeMap(depth)
+	}
+	return nil, false
+}
+
+// parseEnvelopeScalar parses the single-token envelope payloads:
+// string-carried (bytes/time/u64/f64s) and number-carried (i64/f64).
+func (p *fastParser) parseEnvelopeScalar(tag string) (any, bool) {
 	switch tag {
 	case "bytes":
 		sb, ok := p.parseStringBytes()
@@ -659,101 +682,114 @@ func (p *fastParser) parseEnvelopePayload(tag string, depth int) (any, bool) {
 			return nil, false
 		}
 		return f, true
-	case "list":
-		if !p.consume('[') {
+	}
+	return nil, false
+}
+
+// parseEnvelopeList parses the "list" payload: a JSON array of
+// arbitrary (possibly themselves enveloped) values.
+func (p *fastParser) parseEnvelopeList(depth int) (any, bool) {
+	if !p.consume('[') {
+		return nil, false
+	}
+	out := []any{}
+	p.skipWS()
+	if p.consume(']') {
+		return out, true
+	}
+	for {
+		v, ok := p.parseValue(depth + 1)
+		if !ok {
 			return nil, false
 		}
-		out := []any{}
+		out = append(out, v)
 		p.skipWS()
 		if p.consume(']') {
 			return out, true
 		}
-		for {
-			v, ok := p.parseValue(depth + 1)
+		if !p.consume(',') {
+			return nil, false
+		}
+	}
+}
+
+// parseEnvelopeListStr parses the "list_str" payload: a JSON array of
+// strings.
+func (p *fastParser) parseEnvelopeListStr() (any, bool) {
+	if !p.consume('[') {
+		return nil, false
+	}
+	out := []string{}
+	p.skipWS()
+	if p.consume(']') {
+		return out, true
+	}
+	for {
+		p.skipWS()
+		// Legacy `json.Unmarshal` into []string leaves "" for a
+		// JSON null element without error — replicate.
+		if p.pos < len(p.in) && p.in[p.pos] == 'n' {
+			if !p.literal("null") {
+				return nil, false
+			}
+			out = append(out, "")
+		} else {
+			sb, ok := p.parseStringBytes()
 			if !ok {
 				return nil, false
 			}
-			out = append(out, v)
-			p.skipWS()
-			if p.consume(']') {
-				return out, true
-			}
-			if !p.consume(',') {
-				return nil, false
-			}
+			out = append(out, string(sb))
 		}
-	case "list_str":
-		if !p.consume('[') {
-			return nil, false
-		}
-		out := []string{}
 		p.skipWS()
 		if p.consume(']') {
 			return out, true
 		}
-		for {
-			p.skipWS()
-			// Legacy `json.Unmarshal` into []string leaves "" for a
-			// JSON null element without error — replicate.
-			if p.pos < len(p.in) && p.in[p.pos] == 'n' {
-				if !p.literal("null") {
-					return nil, false
-				}
-				out = append(out, "")
-			} else {
-				sb, ok := p.parseStringBytes()
-				if !ok {
-					return nil, false
-				}
-				out = append(out, string(sb))
-			}
-			p.skipWS()
-			if p.consume(']') {
-				return out, true
-			}
-			if !p.consume(',') {
-				return nil, false
-			}
-		}
-	case "map":
-		if !p.consume('{') {
+		if !p.consume(',') {
 			return nil, false
 		}
-		// NOTE: unlike a bare object, the "map" payload is decoded
-		// per-value with NO "_t" probe on the payload object itself
-		// (legacy decodeTaggedValue's map branch) — a payload key
-		// named "_t" is data here, not an envelope marker.
-		out := make(map[string]any, 8)
+	}
+}
+
+// parseEnvelopeMap parses the "map" payload: a JSON object of
+// arbitrary values.
+//
+// NOTE: unlike a bare object, the "map" payload is decoded
+// per-value with NO "_t" probe on the payload object itself
+// (legacy decodeTaggedValue's map branch) — a payload key
+// named "_t" is data here, not an envelope marker.
+func (p *fastParser) parseEnvelopeMap(depth int) (any, bool) {
+	if !p.consume('{') {
+		return nil, false
+	}
+	out := make(map[string]any, 8)
+	p.skipWS()
+	if p.consume('}') {
+		return out, true
+	}
+	for {
+		p.skipWS()
+		kb, ok := p.parseStringBytes()
+		if !ok {
+			return nil, false
+		}
+		k := p.dec.key(kb)
+		p.skipWS()
+		if !p.consume(':') {
+			return nil, false
+		}
+		v, ok := p.parseValue(depth + 1)
+		if !ok {
+			return nil, false
+		}
+		out[k] = v
 		p.skipWS()
 		if p.consume('}') {
 			return out, true
 		}
-		for {
-			p.skipWS()
-			kb, ok := p.parseStringBytes()
-			if !ok {
-				return nil, false
-			}
-			k := p.dec.key(kb)
-			p.skipWS()
-			if !p.consume(':') {
-				return nil, false
-			}
-			v, ok := p.parseValue(depth + 1)
-			if !ok {
-				return nil, false
-			}
-			out[k] = v
-			p.skipWS()
-			if p.consume('}') {
-				return out, true
-			}
-			if !p.consume(',') {
-				return nil, false
-			}
+		if !p.consume(',') {
+			return nil, false
 		}
 	}
-	return nil, false
 }
 
 // parseNumber parses a strict-JSON-grammar number as float64 (the
