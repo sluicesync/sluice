@@ -2689,7 +2689,16 @@ func (r *vstreamSnapshotRows) ReadRows(ctx context.Context, table *ir.Table) (<-
 		s.mu.Unlock()
 	}
 
-	out := make(chan ir.Row)
+	// Buffered like every other bulk-copy hop (see [rowChanBuffer]) so the
+	// drain's dequeue overlaps the downstream write instead of rendezvous-
+	// alternating with it — this was the engines' last UNBUFFERED ir.Row
+	// channel (audit P′-1), on the VStream cold-copy hot path of all places.
+	// The byte-cap backpressure is untouched: bufferedBytes still tracks
+	// exactly the rows queued in rowBuffer, so the buffer (plus the drain
+	// batch below) merely holds ≤ rowChanBuffer + snapshotDrainBatch already-
+	// debited rows in flight — the same bounded overshoot class every
+	// buffered tee carries on wide rows.
+	out := make(chan ir.Row, rowChanBuffer)
 	go func() {
 		defer close(out)
 		defer func() {
@@ -2704,6 +2713,12 @@ func (r *vstreamSnapshotRows) ReadRows(ctx context.Context, table *ir.Table) (<-
 			s.mu.Unlock()
 		}()
 
+		// batch is the drain's reusable pop scratch: up to snapshotDrainBatch
+		// rows leave the queue per mutex acquisition + cond.Broadcast (audit
+		// P′-1 — was ONE row per lock + broadcast-to-everyone, a client-side
+		// ceiling exactly where the copy is fastest). Entries are nil'd as
+		// they send so a consumed row is GC-eligible immediately.
+		batch := make([]ir.Row, 0, snapshotDrainBatch)
 		for {
 			s.mu.Lock()
 			// Wait for a row, completion, a terminal error, or
@@ -2730,17 +2745,25 @@ func (r *vstreamSnapshotRows) ReadRows(ctx context.Context, table *ir.Table) (<-
 				s.mu.Unlock()
 				return
 			}
-			// Pop the head row, debit its bytes, wake the pump (which
-			// may be backpressured on this table), and release the lock
-			// before the (potentially blocking) send. Nil the popped
-			// slot so the drained row is GC-eligible immediately rather
-			// than pinned by the backing array's head (the queue keeps
-			// growing as the pump appends).
-			row := queue[0]
-			queue[0] = nil
-			s.rowBuffer[tableName] = queue[1:]
-			rowBytes := ir.ApproximateRowBytes(row)
-			s.bufferedBytes -= rowBytes
+			// Pop up to snapshotDrainBatch head rows, debit their bytes, wake
+			// the pump (which may be backpressured on this table) ONCE for
+			// the whole batch, and release the lock before the (potentially
+			// blocking) sends. Nil the popped slots so the drained rows are
+			// GC-eligible rather than pinned by the backing array's head
+			// (the queue keeps growing as the pump appends).
+			n := len(queue)
+			if n > snapshotDrainBatch {
+				n = snapshotDrainBatch
+			}
+			batch = batch[:0]
+			var batchBytes int64
+			for i := 0; i < n; i++ {
+				batch = append(batch, queue[i])
+				batchBytes += ir.ApproximateRowBytes(queue[i])
+				queue[i] = nil
+			}
+			s.rowBuffer[tableName] = queue[n:]
+			s.bufferedBytes -= batchBytes
 			// Concurrent COPY (ADR-0099): also credit the PRODUCING stream's
 			// own sub-budget so its backpressure (enqueueConcurrentRowLocked,
 			// which waits on perStreamBytes[idx] vs perStreamCap) is relieved
@@ -2749,21 +2772,34 @@ func (r *vstreamSnapshotRows) ReadRows(ctx context.Context, table *ir.Table) (<-
 			// exactly one producing stream per table.
 			if s.tableStreamIdx != nil {
 				if idx, ok := s.tableStreamIdx[tableName]; ok {
-					s.perStreamBytes[idx] -= rowBytes
+					s.perStreamBytes[idx] -= batchBytes
 				}
 			}
 			s.cond.Broadcast()
 			s.mu.Unlock()
 
-			select {
-			case out <- row:
-			case <-ctx.Done():
-				return
+			for i, row := range batch {
+				select {
+				case out <- row:
+					batch[i] = nil
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 	}()
 	return out, nil
 }
+
+// snapshotDrainBatch bounds how many buffered rows one ReadRows drain pops
+// per mutex acquisition (audit P′-1). Popping one row per lock +
+// cond.Broadcast made the drain the client-side ceiling on fast targets;
+// popping a small batch amortizes both without restructuring the byte-budget
+// accounting — the debit still happens at pop time, under the same lock, so
+// bufferedBytes remains exactly "bytes queued in rowBuffer". Kept small so
+// the debited-but-unsent overshoot beyond the byte cap stays dominated by the
+// output channel's own rowChanBuffer.
+const snapshotDrainBatch = 16
 
 // vstreamSnapshotChanges is the [ir.CDCReader] half of the snapshot
 // stream. StreamChanges starts the pump goroutine that resumes the
