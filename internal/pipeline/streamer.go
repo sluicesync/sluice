@@ -1365,6 +1365,14 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	// static-cap behaviour bit-for-bit — zero overhead on the
 	// opt-out path.
 	aimdController := s.maybeAttachAIMDController(ctx, applier, streamID)
+	// TEST-ONLY: hand the applier's per-flush observer seat to the seam
+	// when the AIMD controller didn't take it. See the var doc on
+	// [batchApplyObserverForTest]; production runs never set it.
+	if batchApplyObserverForTest != nil && aimdController == nil {
+		if setter, ok := applier.(ir.BatchObserverSetter); ok {
+			setter.SetBatchObserver(batchApplyObserverForTest)
+		}
+	}
 
 	// ---- 1.6. Target-telemetry sidecars for the WHOLE attempt (ADR-0107
 	// items 35 + 36, roadmap item 39) ----
@@ -1722,6 +1730,20 @@ func surfaceSourceError(sourceErrFn func() error) error {
 	}
 	return srcErr
 }
+
+// batchApplyObserverForTest is a TEST-ONLY observability seam (ADR-0077's
+// onTableCopiedObserver disposition): when non-nil, runOnce installs it as
+// the applier's [ir.BatchObserver] so an integration test can count
+// coalesced flushes and per-flush row counts — asserting the batching
+// MECHANISM directly instead of inferring it from timing-sensitive
+// dest-side commit-count deltas (the
+// TestStreamer_PostgresToPostgres_BatchedApply threshold-flake class).
+// Installed only when the AIMD controller didn't take the observer seat,
+// so tests that use it run with AutoTune off; it observes the SERIAL
+// apply path only (the ADR-0104 per-lane path reports to its lane
+// controllers instead), so those tests also pin ApplyConcurrency to 1.
+// Production code never sets it; the cost is a nil check per attempt.
+var batchApplyObserverForTest ir.BatchObserver
 
 // dispatchApply routes the change channel to the applier's batched
 // or per-change Apply path. When ApplyBatchSize > 1 and the applier

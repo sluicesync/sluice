@@ -9,54 +9,68 @@
 // dest, and the test asserts:
 //
 //   - All N rows land on the dest (correctness).
-//   - Far fewer dest commits than per-change apply would produce
-//     (throughput improvement, observed via pg_stat_database).
-//   - Idempotency on rerun: the streamer's warm-resume path with
-//     the same persisted position does not duplicate rows.
+//   - The batching MECHANISM engaged: every row flowed through a
+//     coalesced multi-row flush, observed via the applier's
+//     [ir.BatchObserver] seam (batchApplyObserverForTest) — per-flush
+//     row counts, not timing artifacts.
 //
-// The throughput claim — ~50-100x improvement on bulk CDC traffic —
-// is asserted via the commit count, not wall-clock latency, so the
-// test stays deterministic across CI host load.
-
+// An earlier version asserted a dest-side pg_stat_database commit
+// delta <= a constant tolerance instead; commit counts depend on
+// change-arrival timing against the coalescing window (plus control-
+// table and stat-collector noise), so a loaded runner legitimately
+// produced a few extra flushes and flaked the constant (2026-07-09,
+// `-race` runner: 55 commits vs the pinned 52). The flush observer
+// counts the mechanism itself, which is what the test exists to pin:
+// per-change apply produces one 1-row flush per change (mean rows/
+// flush == 1) and fails the floor below by an order of magnitude.
 package pipeline
 
 import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/ir"
 
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
 
-// readTargetXactCommit reads the cumulative committed-transaction
-// count for the connecting database from pg_stat_database. Mirrors
-// the helper in the postgres engine package.
-func readTargetXactCommit(t *testing.T, dsn string) int64 {
-	t.Helper()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer func() { _ = db.Close() }()
+// flushRecorder is a test [ir.BatchObserver] that records the row count
+// of every successful coalesced flush. Guarded by a mutex: the applier
+// calls ObserveBatch from the apply goroutine while the test polls from
+// its own.
+type flushRecorder struct {
+	mu      sync.Mutex
+	flushes []int
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+var _ ir.BatchObserver = (*flushRecorder)(nil)
 
-	var n int64
-	q := "SELECT xact_commit FROM pg_stat_database WHERE datname = current_database()"
-	if err := db.QueryRowContext(ctx, q).Scan(&n); err != nil {
-		t.Fatalf("read xact_commit: %v", err)
+func (r *flushRecorder) ObserveBatch(_ context.Context, _ time.Duration, rows int, err error) {
+	if err != nil || rows <= 0 {
+		return
 	}
-	return n
+	r.mu.Lock()
+	r.flushes = append(r.flushes, rows)
+	r.mu.Unlock()
+}
+
+// snapshot returns a copy of the recorded per-flush row counts.
+func (r *flushRecorder) snapshot() []int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]int, len(r.flushes))
+	copy(out, r.flushes)
+	return out
 }
 
 // TestStreamer_PostgresToPostgres_BatchedApply drives the whole
-// streamer flow with ApplyBatchSize > 1 and asserts the dest
-// commit count is small relative to per-change apply.
+// streamer flow with ApplyBatchSize > 1 and asserts multi-row
+// coalescing via the applier's flush observer.
 func TestStreamer_PostgresToPostgres_BatchedApply(t *testing.T) {
 	sourceDSN, targetDSN, cleanup := startPostgresLogical(t)
 	defer cleanup()
@@ -80,12 +94,23 @@ func TestStreamer_PostgresToPostgres_BatchedApply(t *testing.T) {
 	const batchSize = 100
 	const totalRows = 200
 
+	// Observe every coalesced flush through the applier's BatchObserver
+	// seam. The seam takes the observer seat only when the AIMD
+	// controller doesn't (AutoTune is off here — the Go zero value), and
+	// it watches the SERIAL batch loop, so ApplyConcurrency is pinned to
+	// 1 (the ADR-0104 lane path reports to per-lane controllers instead;
+	// its coverage lives in the apply-concurrency suites).
+	rec := &flushRecorder{}
+	batchApplyObserverForTest = rec
+	defer func() { batchApplyObserverForTest = nil }()
+
 	streamer := &Streamer{
-		Source:         pgEng,
-		Target:         pgEng,
-		SourceDSN:      sourceDSN,
-		TargetDSN:      targetDSN,
-		ApplyBatchSize: batchSize,
+		Source:           pgEng,
+		Target:           pgEng,
+		SourceDSN:        sourceDSN,
+		TargetDSN:        targetDSN,
+		ApplyBatchSize:   batchSize,
+		ApplyConcurrency: 1,
 	}
 
 	streamCtx, streamCancel := context.WithCancel(context.Background())
@@ -97,16 +122,10 @@ func TestStreamer_PostgresToPostgres_BatchedApply(t *testing.T) {
 	// Wait for the replication slot to exist before committing the
 	// finite source burst below — a commit that lands BEFORE the slot is
 	// created is captured by neither the snapshot nor CDC (the AIMD
-	// "0/250" flake class; see [waitForSourceSlot]). The slot is created
-	// before the bulk-copy phase, so the empty-seed copy's handful of
-	// dest commits may now land inside the measurement window — well
-	// within the tolerance band below.
+	// "0/250" flake class; see [waitForSourceSlot]).
 	waitForSourceSlot(t, sourceDSN, 60*time.Second)
 
-	// Snapshot the dest commit counter, drive a single source-side
-	// transaction with N inserts, then snapshot again.
-	startCommits := readTargetXactCommit(t, targetDSN)
-
+	// Drive a single source-side transaction with N inserts.
 	srcDB, err := sql.Open("pgx", sourceDSN)
 	if err != nil {
 		t.Fatalf("open source: %v", err)
@@ -144,27 +163,31 @@ func TestStreamer_PostgresToPostgres_BatchedApply(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 
-	// pg_stat_database lags slightly; let it stabilise.
-	time.Sleep(500 * time.Millisecond)
-	endCommits := readTargetXactCommit(t, targetDSN)
-	delta := endCommits - startCommits
-
-	// Lower bound: ceil(totalRows/batchSize) = 2 batches. Upper
-	// bound: tolerant of pg_stat reads, control-table updates,
-	// connection pool churn, etc. Per-change apply would produce
-	// >= totalRows commits; the inequality below catches that
-	// regression cleanly.
-	const expectedBatches = totalRows / batchSize
-	const tolerance = 50
-	if delta < expectedBatches {
-		t.Errorf("dest commit delta = %d; want >= %d", delta, expectedBatches)
+	// Mechanism assertions. Every insert must have flowed through an
+	// observed coalesced flush, and the flushes must be genuinely
+	// multi-row: per-change apply (the regression this test guards)
+	// yields totalRows flushes of 1 row — mean rows/flush 1 — an order
+	// of magnitude under the floor. The floor itself is generous: the
+	// ideal is ceil(totalRows/batchSize) = 2 flushes of 100; a loaded
+	// runner splitting the burst into a handful of smaller flushes
+	// still clears mean >= 10 easily, because flush shape depends only
+	// on change-arrival coalescing, not on dest-side commit noise.
+	flushes := rec.snapshot()
+	var flushedRows int
+	for _, n := range flushes {
+		flushedRows += n
 	}
-	if delta > expectedBatches+tolerance {
-		t.Errorf("dest commit delta = %d; want <= %d (per-change apply would be >=%d)",
-			delta, expectedBatches+tolerance, totalRows)
+	if flushedRows < totalRows {
+		t.Errorf("observed %d rows across %d coalesced flushes; want >= %d (per-change Apply bypasses the batch loop and its observer entirely)",
+			flushedRows, len(flushes), totalRows)
 	}
-	t.Logf("batched apply: %d source rows landed in %d dest commits (batchSize=%d)",
-		totalRows, delta, batchSize)
+	const minMeanRowsPerFlush = 10
+	if maxFlushes := totalRows / minMeanRowsPerFlush; len(flushes) > maxFlushes {
+		t.Errorf("%d rows landed in %d flushes (mean %.1f rows/flush); want <= %d flushes (mean >= %d) — batching is not coalescing",
+			flushedRows, len(flushes), float64(flushedRows)/float64(len(flushes)), maxFlushes, minMeanRowsPerFlush)
+	}
+	t.Logf("batched apply: %d source rows landed in %d coalesced flushes %v (batchSize=%d)",
+		flushedRows, len(flushes), flushes, batchSize)
 
 	streamCancel()
 	select {
