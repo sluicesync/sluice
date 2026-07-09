@@ -30,6 +30,11 @@
 # `:latest` is the forward-compat CANARY (continue-on-error) — its failure is
 # the signal that a newer Vitess major diverged from the vendored client (time
 # to bump the client), not a red build.
+#
+# The suite runs with -race (added 2026-07-09): this was the only real-cluster
+# suite outside the race gate — the chaos/reshard legs in extended-suites.yml
+# have carried it since the 2026-07-03 repo audit (item 0.4). Budgets are
+# bumped ~1.5x from the pre-race 40m inner / 45 outer, mirroring those legs.
 
 name: Vitess version matrix
 
@@ -89,10 +94,13 @@ jobs:
     continue-on-error: ${{ matrix.canary }}
     permissions:
       packages: read
-    # 45 (was 30 when the default ran only Bug-27): the full suite runs 5
-    # tests per leg against the booted cluster; the OnlineDDL cutover pair
-    # is the long pole.
-    timeout-minutes: 45
+    # 70: the pre-race 45 (was 30 when the default ran only Bug-27) bumped
+    # ~1.5x for the -race overhead (the chaos/reshard-leg precedent —
+    # -race roughly halves throughput on the CPU-bound stretches). The
+    # full suite runs 5 tests per leg against the booted cluster; the
+    # OnlineDDL cutover pair is the long pole. Inner (60m) stays < outer
+    # so Go's diagnostic timeout-panic fires before the hard job kill.
+    timeout-minutes: 70
     strategy:
       fail-fast: false
       matrix:
@@ -125,6 +133,6 @@ jobs:
           VITESS_LITE_IMAGE: ${{ matrix.image }}
           RUN_FILTER: ${{ github.event.inputs.run || 'TestVitessCluster' }}
         run: |
-          go test -tags='integration vitesscluster' -count=1 -timeout=40m \
+          go test -tags='integration vitesscluster' -race -count=1 -timeout=60m \
             -run "$RUN_FILTER" \
             -v ./internal/engines/mysql/...
