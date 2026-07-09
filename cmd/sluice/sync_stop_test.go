@@ -110,6 +110,13 @@ func TestWaitForStopComplete_Timeout(t *testing.T) {
 	if !strings.Contains(err.Error(), "stream-1") {
 		t.Errorf("err message should name the stream; got %v", err)
 	}
+	// The timeout is a PLAIN error — kong's generic exit 1, per the
+	// helper's doc comment (which once promised an exit-2 error the
+	// code never produced; 2 is reserved for config-load errors).
+	// This pins code and comment staying in agreement.
+	if got := exitCodeLikeKong(err); got != 1 {
+		t.Errorf("timeout exit code = %d; want the generic 1", got)
+	}
 }
 
 // TestWaitForStopComplete_ContextCancel verifies the helper exits

@@ -2082,8 +2082,13 @@ const stopWaitPollInterval = 1 * time.Second
 
 // waitForStopComplete polls the control row until ReadStopRequested
 // returns false (the streamer cleared the flag on graceful exit) or
-// the timeout fires. Returns nil on success, an exitCode-2 error on
-// timeout, and the underlying error on read failure.
+// the timeout fires. Returns nil on success, a plain error on timeout
+// (kong's generic exit 1 — deliberate: the taxonomy reserves 2 for
+// config-load errors and 3 for coded refusals, and a drain still in
+// progress is neither; exitcode-wise it's an ordinary "the command
+// didn't achieve what you asked" failure, with the drain continuing
+// in the background as the message says), and the underlying error on
+// read failure.
 func waitForStopComplete(ctx context.Context, applier ir.ChangeApplier, streamID string, timeout time.Duration) error {
 	reader, ok := applier.(stopFlagReader)
 	if !ok {

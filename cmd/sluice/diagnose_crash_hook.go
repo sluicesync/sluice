@@ -12,8 +12,14 @@ import (
 )
 
 // CrashHookFlags is the embeddable flag group long-running
-// subcommands (sync start, migrate, sync from-backup run) embed to
-// opt into the ADR-0056 auto-on-crash bundle hook.
+// subcommands embed to opt into the ADR-0056 auto-on-crash bundle
+// hook. Today's embedders: MigrateCmd and SyncStartCmd. `sync
+// from-backup run` does NOT embed it (an earlier version of this
+// comment claimed it did): the broker has no source engine, and
+// [crashHookRequestForStreamer] / the bundle assembler have only been
+// exercised with a full source+target Request — wiring the broker in
+// is a small feature (a target-only Request shape), not a one-line
+// embed, and is deferred until demanded.
 //
 // **Default-OFF**: Dir is empty unless the operator passes the flag
 // explicitly. An unattended bundle landing on disk is a privacy risk
