@@ -103,6 +103,49 @@ connection-bound** (a PS-10 pins at 100% CPU under a two-wide copy;
 ADR-0116). Raising copy parallelism past the automatic budget will not
 scale throughput linearly — a larger tier (or Metal) is the real lever.
 
+## MySQL write-path statement protocol: `interpolateParams` (automatic on PlanetScale/Vitess; DSN opt-in elsewhere)
+
+Every parameterized statement on MySQL's default binary protocol is two
+round trips — a hidden `COM_STMT_PREPARE` plus the execute — and sluice
+prepares fresh per statement. go-sql-driver's `interpolateParams=true`
+collapses that to **one `COM_QUERY` round trip** by rendering values
+into the SQL text client-side. Since
+[ADR-0153](adr/adr-0153-mysql-flavor-interpolation-default.md), the
+**`planetscale` and `vitess` drivers default this ON** (their
+deployments are WAN-RTT-shaped); putting `interpolateParams=false` in
+the DSN restores the binary protocol.
+
+**Vanilla MySQL keeps the binary protocol by default, but the opt-in
+works on any flavor:** append `interpolateParams=true` to the DSN (it
+survives sluice's DSN parsing untouched). The benefit scales directly
+with your round-trip time — roughly one saved RTT per bulk INSERT
+statement and per CDC flush; the ADR-0153 real-PlanetScale bench
+measured **−33% bulk copy and −26% CDC burst drain at ~100 ms client
+RTT**. At LAN RTTs the saving is negligible and can be marginally
+negative — interpolated SQL text is fatter on the wire than placeholder
+text plus binary args, especially for binary-heavy rows — which is
+exactly why vanilla stays conservative by default. Bandwidth note:
+interpolated statements typically run ~1.0–1.3× the binary-protocol
+bytes (temporals ~2.3×, doubles ~2–3×, ordinary text/binary ~par; worst
+case ~2× for zero-padded or escape-dense blobs, since the driver
+escapes raw bytes rather than hex-encoding) — this only matters on thin
+uplinks where transfer time competes with RTT, and the PlanetScale
+bench's −33%/−26% figures are net of that inflation.
+
+Fidelity is not a trade-off: the interpolation encoder is pinned
+byte-exact against the binary protocol across the full value-family
+matrix (microsecond temporals, DECIMAL/DOUBLE extremes, binary with
+every octet, 4-byte UTF-8, JSON/BIT/SET/ENUM/GEOMETRY, NULLs) on
+**both** write paths — bulk batched INSERT and CDC coalesced apply —
+for all flavors, including under `NO_BACKSLASH_ESCAPES` sessions. Two
+caveats sluice handles for you: DSNs pinning a
+big5/cp932/gb2312/gbk/sjis/gb18030 collation are unsafe for
+interpolation (the PlanetScale/Vitess default steps aside with a WARN;
+an explicit `interpolateParams=true` there is refused loudly by the
+driver), and a statement whose interpolated text would exceed the
+driver's `maxAllowedPacket` transparently falls back to the prepared
+path for that statement.
+
 ## Sync cold-start cross-table parallelism (per source flavor)
 
 `sluice sync start`'s initial cold-start copy parallelizes across tables like `sluice migrate` does, but the mechanism — and the default — depends on the source flavor, because each flavor has a different consistency story for "N readers, one CDC handoff position":
