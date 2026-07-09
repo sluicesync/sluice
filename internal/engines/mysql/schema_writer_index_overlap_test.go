@@ -8,11 +8,13 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"io"
 	"reflect"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -380,11 +382,13 @@ func pk() *ir.Index {
 
 // --- fake database/sql driver for the index-build + verification pins ---
 //
-// indexFakeDriver answers the indexExists EXISTS probe from a configurable
-// existence flag and records every ALTER … ADD INDEX statement, so a unit
-// test can assert the vstream serial builder actually emits ADD INDEX (not a
-// silent no-op) and that VerifyIndexes flags a missing index — no
-// testcontainers. Mirrors the scriptDriver pattern in
+// indexFakeDriver answers the existence probes — the batched
+// [probeCatalogPairs] chunk query the bulk phases use (audit V-1) and the
+// legacy single-object EXISTS probe the shape appliers kept — from a
+// configurable existence flag, and records every ALTER … ADD INDEX statement,
+// so a unit test can assert the vstream serial builder actually emits ADD
+// INDEX (not a silent no-op) and that VerifyIndexes flags a missing index —
+// no testcontainers. Mirrors the scriptDriver pattern in
 // row_writer_reparent_retry_test.go.
 
 // indexRecorder holds the fake driver's scripted behaviour + instrumentation.
@@ -394,8 +398,15 @@ func pk() *ir.Index {
 type indexRecorder struct {
 	mu       sync.Mutex
 	execs    []string         // recorded ALTER statements, in order
+	queries  []recordedQuery  // recorded catalog probes, in order (the V-1 shape pins)
 	exists   bool             // EXISTS-probe result (false ⇒ build the index)
 	failTbls map[string]error // tableName ⇒ error returned when its ALTER runs
+
+	// answerUppercase makes the batched probe return its (table, name) rows
+	// UPPERCASED — modelling a target whose catalog reports a different
+	// identifier case than the IR carries (lower_case_table_names variance).
+	// The foldCatalogPair pin asserts the set compare still matches.
+	answerUppercase bool
 
 	// transientFailsLeft scripts the reparent-retry pins (audit N-15b):
 	// the table's first N ALTERs return a CLASSIFIED transient
@@ -414,10 +425,31 @@ type indexRecorder struct {
 // un-framed PlanetScale/vtgate reparent surfaces.
 var errSimulatedReparent = errors.New("vttablet: operation interrupted by emergency reparent (simulated)")
 
+// recordedQuery is one catalog probe the fake served: its SQL text and
+// parameter count, enough for the V-1 batched-shape pins to assert "one
+// query, everything parameterized".
+type recordedQuery struct {
+	query string
+	args  int
+}
+
 func (r *indexRecorder) record(q string) {
 	r.mu.Lock()
 	r.execs = append(r.execs, q)
 	r.mu.Unlock()
+}
+
+func (r *indexRecorder) recordQuery(q string, args int) {
+	r.mu.Lock()
+	r.queries = append(r.queries, recordedQuery{query: q, args: args})
+	r.mu.Unlock()
+}
+
+// querySnapshot returns the recorded catalog probes, in order.
+func (r *indexRecorder) querySnapshot() []recordedQuery {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]recordedQuery(nil), r.queries...)
 }
 
 // takeTransientFail reports whether the table's ALTER should fail with the
@@ -434,8 +466,10 @@ func (r *indexRecorder) takeTransientFail(q string) bool {
 	return false
 }
 
-// indexProbeAnswer serves the indexExists EXISTS probe: probeBuilt mode
-// answers from the recorded ALTERs (emitted ⇒ landed), else the static flag.
+// indexProbeAnswer answers the existence probes — per NAME, for both the
+// batched [probeCatalogPairs] chunk and the legacy single EXISTS probe:
+// probeBuilt mode answers from the recorded ALTERs (emitted ⇒ landed), else
+// the static flag.
 func (r *indexRecorder) indexProbeAnswer(indexName string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -495,11 +529,45 @@ func (c indexFakeConn) ExecContext(_ context.Context, query string, _ []driver.N
 	return driver.RowsAffected(0), nil
 }
 
-// QueryContext serves the indexExists EXISTS probe (the only query these
-// paths issue) as a single bool row: rec.probeBuilt answers from the
-// recorded ALTERs (the probe args carry (schema, table, indexName)), else
-// the static rec.exists flag.
-func (c indexFakeConn) QueryContext(_ context.Context, _ string, args []driver.NamedValue) (driver.Rows, error) {
+// QueryContext serves the two existence-probe shapes these paths issue.
+//
+// The batched [probeCatalogPairs] chunk (audit V-1) — recognisable by its two
+// IN groups, args = (schema, tables…, names…) — answers with one (table,
+// name) row for every tables×names combination whose NAME probes true via
+// [indexRecorder.indexProbeAnswer] (probeBuilt answers from recorded ALTERs,
+// else the static exists flag). The cross-product overshoot models "this
+// name exists on every probed table", which the production set-compare
+// tolerates by contract (callers only test wanted-pair membership) and the
+// unit schemas never alias (index names are per-table unique).
+//
+// Anything else is the legacy single-object EXISTS probe (args carry
+// (schema, table, name)), answered as a single bool row exactly as before.
+func (c indexFakeConn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	c.rec.recordQuery(query, len(args))
+	if nTables, nNames, ok := batchedProbeShape(query); ok {
+		if len(args) != 1+nTables+nNames {
+			return nil, fmt.Errorf("batched probe args = %d; want %d (schema + %d tables + %d names): %s",
+				len(args), 1+nTables+nNames, nTables, nNames, query)
+		}
+		argStr := func(i int) string {
+			s, _ := args[i].Value.(string)
+			return s
+		}
+		var pairs [][2]string
+		for t := 0; t < nTables; t++ {
+			for n := 0; n < nNames; n++ {
+				table, name := argStr(1+t), argStr(1+nTables+n)
+				if !c.rec.indexProbeAnswer(name) {
+					continue
+				}
+				if c.rec.answerUppercase {
+					table, name = strings.ToUpper(table), strings.ToUpper(name)
+				}
+				pairs = append(pairs, [2]string{table, name})
+			}
+		}
+		return &pairRows{pairs: pairs}, nil
+	}
 	indexName := ""
 	if len(args) >= 3 {
 		if s, ok := args[2].Value.(string); ok {
@@ -511,6 +579,43 @@ func (c indexFakeConn) QueryContext(_ context.Context, _ string, args []driver.N
 		v = 1
 	}
 	return &boolRow{val: v}, nil
+}
+
+// batchedProbeShape recognises a [probeCatalogPairs] chunk query and returns
+// its two IN groups' placeholder counts. ok=false for any other query.
+func batchedProbeShape(query string) (nTables, nNames int, ok bool) {
+	segs := strings.Split(query, " IN (")
+	if len(segs) != 3 {
+		return 0, 0, false
+	}
+	count := func(seg string) int {
+		group, _, found := strings.Cut(seg, ")")
+		if !found {
+			return 0
+		}
+		return strings.Count(group, "?")
+	}
+	return count(segs[1]), count(segs[2]), true
+}
+
+// pairRows is a two-column driver result streaming (table, name) rows —
+// the batched probe's wire shape.
+type pairRows struct {
+	pairs [][2]string
+	next  int
+}
+
+func (*pairRows) Columns() []string { return []string{"table_name", "name"} }
+func (*pairRows) Close() error      { return nil }
+
+func (r *pairRows) Next(dest []driver.Value) error {
+	if r.next >= len(r.pairs) {
+		return io.EOF
+	}
+	dest[0] = r.pairs[r.next][0]
+	dest[1] = r.pairs[r.next][1]
+	r.next++
+	return nil
 }
 
 // boolRow is a one-column, one-row result carrying an int64 (0/1) the
@@ -532,12 +637,18 @@ func (r *boolRow) Next(dest []driver.Value) error {
 	return nil
 }
 
+// indexFakeSeq disambiguates driver names when one test opens several fake
+// DBs (e.g. the chunking pin's present/absent recorders) — sql.Register is
+// global and panics on a duplicate name, and t.Name() alone is only unique
+// per TEST, not per open.
+var indexFakeSeq atomic.Int64
+
 // newIndexFakeDB registers a driver bound to rec and returns a *sql.DB over
-// it. sql.Register is global and panics on a duplicate name; t.Name() is
-// unique per test within a run, so the name is safe.
+// it. The name combines t.Name() (readable) with a process-wide sequence
+// number (unique across multiple opens within one test).
 func newIndexFakeDB(t *testing.T, rec *indexRecorder) *sql.DB {
 	t.Helper()
-	name := "sluice-index-fake-" + t.Name()
+	name := fmt.Sprintf("sluice-index-fake-%s-%d", t.Name(), indexFakeSeq.Add(1))
 	sql.Register(name, indexFakeDriver{rec: rec})
 	db, err := sql.Open(name, "")
 	if err != nil {

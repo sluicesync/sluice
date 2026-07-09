@@ -356,9 +356,13 @@ func (w *SchemaWriter) CreateIndexes(ctx context.Context, s *ir.Schema) error {
 // the build path built — same inline-skip carve-out (the GitHub #25
 // AUTO_INCREMENT supporting key + the Bug 125 PK-less COPY unique key are
 // emitted at CREATE TABLE, never by the index phase, so probing for them here
-// would false-flag). Each expected index is probed via the same [indexExists]
-// information_schema.statistics read the idempotent build uses — cheap, one
-// catalog read apiece.
+// would false-flag). The expected set is checked against ONE batched
+// information_schema.statistics read per [catalogProbeChunk] expected indexes
+// (audit V-1) — the same catalog the idempotent build's detect-then-skip
+// probes — rather than one probe per index: on a vtgate/PlanetScale target
+// each probe is a serial cluster round trip, so a hundreds-of-index schema
+// paid hundreds of RTTs at verify time on exactly the target the project is
+// sold for.
 //
 // This net exists because the VStream/PlanetScale index-build path silently
 // no-op'd (built NO secondary indexes) for releases — the project's #1
@@ -369,14 +373,21 @@ func (w *SchemaWriter) VerifyIndexes(ctx context.Context, s *ir.Schema) error {
 	if s == nil {
 		return errors.New("mysql: VerifyIndexes: schema is nil")
 	}
-	var missing []string
-	for _, job := range w.indexBuildJobsForTables(orderedTables(s)) {
+	jobs := w.indexBuildJobsForTables(orderedTables(s))
+	var wanted []catalogPair
+	for _, job := range jobs {
 		for _, idx := range job.idxs {
-			exists, err := indexExists(ctx, w.db, w.schema, job.tableName, idx.Name)
-			if err != nil {
-				return fmt.Errorf("mysql: VerifyIndexes: probe index %q on %q: %w", idx.Name, job.tableName, err)
-			}
-			if !exists {
+			wanted = append(wanted, catalogPair{table: job.tableName, name: idx.Name})
+		}
+	}
+	existing, err := probeCatalogPairs(ctx, w.db, w.schema, wanted, statisticsPairsQuery)
+	if err != nil {
+		return fmt.Errorf("mysql: VerifyIndexes: probe expected indexes: %w", err)
+	}
+	var missing []string
+	for _, job := range jobs {
+		for _, idx := range job.idxs {
+			if _, ok := existing[foldCatalogPair(job.tableName, idx.Name)]; !ok {
 				missing = append(missing, job.tableName+"."+idx.Name)
 			}
 		}
@@ -454,8 +465,8 @@ type dbExecer interface {
 }
 
 // buildTableIndexes builds all of one table's eligible secondary indexes
-// (ADR-0080 follow-up). It probes each index, drops the ones that already
-// exist, then emits the minimum set of ALTER statements via
+// (ADR-0080 follow-up). It probes the table's indexes, drops the ones that
+// already exist, then emits the minimum set of ALTER statements via
 // [emitCreateIndexesCombined] — combinable BTREE/UNIQUE indexes share one
 // ALTER (a single InnoDB scan), FULLTEXT and SPATIAL each get their own — and
 // executes them on execer. Shared verbatim by the serial whole-schema path and
@@ -466,17 +477,26 @@ type dbExecer interface {
 // partially-completed index phase, or (on the overlap path) a re-fed
 // copied-not-fully-indexed table — would otherwise fail with MySQL 1061
 // "Duplicate key name". MySQL has no `CREATE INDEX IF NOT EXISTS`, so
-// detect-then-skip per index (the pattern the ADR-0054 shape applier uses).
-// sluice owns these tables, so a same-named index is the one it built. When
-// every index already exists the table is skipped entirely (no ALTER emitted).
+// detect-then-skip per index (the pattern the ADR-0054 shape applier uses),
+// batched into ONE catalog read for the table's whole index set (audit V-1 —
+// was one probe per index, a serial vtgate round trip apiece). The probe runs
+// at ATTEMPT time, so the reparent-retry's replay re-probes and skips any
+// index whose ALTER committed server-side but died unacknowledged — never a
+// double-create. sluice owns these tables, so a same-named index is the one
+// it built. When every index already exists the table is skipped entirely
+// (no ALTER emitted).
 func (w *SchemaWriter) buildTableIndexes(ctx context.Context, execer dbExecer, job indexBuildJob) error {
+	wanted := make([]catalogPair, 0, len(job.idxs))
+	for _, idx := range job.idxs {
+		wanted = append(wanted, catalogPair{table: job.tableName, name: idx.Name})
+	}
+	existing, err := probeCatalogPairs(ctx, w.db, w.schema, wanted, statisticsPairsQuery)
+	if err != nil {
+		return fmt.Errorf("mysql: probe indexes on %q: %w", job.tableName, err)
+	}
 	pending := make([]*ir.Index, 0, len(job.idxs))
 	for _, idx := range job.idxs {
-		exists, err := indexExists(ctx, w.db, w.schema, job.tableName, idx.Name)
-		if err != nil {
-			return fmt.Errorf("mysql: probe index %q on %q: %w", idx.Name, job.tableName, err)
-		}
-		if !exists {
+		if _, ok := existing[foldCatalogPair(job.tableName, idx.Name)]; !ok {
 			pending = append(pending, idx)
 		}
 	}
@@ -520,23 +540,36 @@ func (w *SchemaWriter) CreateConstraints(ctx context.Context, s *ir.Schema) erro
 	if s == nil {
 		return fmt.Errorf("mysql: CreateConstraints: schema is nil")
 	}
-	for _, table := range orderedTables(s) {
+	tables := orderedTables(s)
+	// Idempotent resume (Bug 131 same-class): a prior run that already added
+	// some of these FKs — a resume re-entering phase=constraints — would
+	// otherwise fail with MySQL 1826 "Duplicate foreign key constraint name".
+	// MySQL has no ADD CONSTRAINT IF NOT EXISTS, so detect-then-skip (mirrors
+	// the index/CHECK idempotency), batched into ONE catalog read per
+	// [catalogProbeChunk] FKs up front (audit V-1 — was one probe per FK, a
+	// serial vtgate round trip apiece). Prefetching the whole set before any
+	// ALTER is equivalent to the old lazy per-FK probe: sluice owns these
+	// tables and this loop is the only FK adder, so nothing lands mid-phase
+	// that the prefetch could miss — and the pipeline's DDL-phase retry
+	// re-enters through this prefetch, re-seeing anything a killed attempt
+	// committed. A same-named FK is the one sluice built.
+	var wanted []catalogPair
+	for _, table := range tables {
+		for _, fk := range table.ForeignKeys {
+			wanted = append(wanted, catalogPair{table: table.Name, name: fk.Name})
+		}
+	}
+	existing, err := probeCatalogPairs(ctx, w.db, w.schema, wanted, foreignKeyPairsQuery)
+	if err != nil {
+		return fmt.Errorf("mysql: CreateConstraints: probe existing foreign keys: %w", err)
+	}
+	for _, table := range tables {
 		fks := append([]*ir.ForeignKey(nil), table.ForeignKeys...)
 		sort.Slice(fks, func(i, j int) bool {
 			return fks[i].Name < fks[j].Name
 		})
 		for _, fk := range fks {
-			// Idempotent resume (Bug 131 same-class): a prior run that
-			// already added this FK — a resume re-entering phase=constraints —
-			// would otherwise fail with MySQL 1826 "Duplicate foreign key
-			// constraint name". MySQL has no ADD CONSTRAINT IF NOT EXISTS, so
-			// detect-then-skip (mirrors the index/CHECK idempotency). sluice
-			// owns these tables, so a same-named FK is the one it built.
-			exists, err := foreignKeyExists(ctx, w.db, w.schema, table.Name, fk.Name)
-			if err != nil {
-				return fmt.Errorf("mysql: probe foreign key %q on %q: %w", fk.Name, table.Name, err)
-			}
-			if exists {
+			if _, ok := existing[foldCatalogPair(table.Name, fk.Name)]; ok {
 				continue
 			}
 			stmt, err := emitAddForeignKey(table.Schema, table.Name, fk)
@@ -828,10 +861,13 @@ func columnExists(ctx context.Context, db *sql.DB, schema, table, col string) (b
 
 // indexExists reports whether table.indexName is present in the
 // target's information_schema.statistics. Used by the ADR-0054 Phase
-// 2c shape-applier methods for idempotency — MySQL lacks
-// `CREATE INDEX IF NOT EXISTS` and `DROP INDEX IF EXISTS` in the
-// versions sluice supports (8.0.x), so detect-then-DDL is the
-// portable pattern.
+// 2c shape-applier methods (CreateShapeIndex / DropShapeIndex) for
+// idempotency — MySQL lacks `CREATE INDEX IF NOT EXISTS` and
+// `DROP INDEX IF EXISTS` in the versions sluice supports (8.0.x), so
+// detect-then-DDL is the portable pattern. The bulk index/constraint
+// phases use the batched [probeCatalogPairs] instead (audit V-1);
+// the shape appliers stay on the single probe because CDC schema
+// deltas arrive one object at a time.
 func indexExists(ctx context.Context, db *sql.DB, schema, table, indexName string) (bool, error) {
 	const q = `SELECT EXISTS(SELECT 1 FROM information_schema.statistics
 		WHERE table_schema = ? AND table_name = ? AND index_name = ?)`
@@ -842,20 +878,140 @@ func indexExists(ctx context.Context, db *sql.DB, schema, table, indexName strin
 	return exists, nil
 }
 
-// foreignKeyExists reports whether a FOREIGN KEY constraint named
-// constraintName is present on schema.table. Used by CreateConstraints
-// for idempotent resume (Bug 131 same-class) — MySQL has no
-// ADD CONSTRAINT IF NOT EXISTS, so detect-then-skip is the portable
-// pattern (mirrors indexExists / mysqlCheckConstraintExists).
-func foreignKeyExists(ctx context.Context, db *sql.DB, schema, table, constraintName string) (bool, error) {
-	const q = `SELECT EXISTS(SELECT 1 FROM information_schema.TABLE_CONSTRAINTS
-		WHERE CONSTRAINT_SCHEMA = ? AND TABLE_NAME = ?
-		  AND CONSTRAINT_TYPE = 'FOREIGN KEY' AND CONSTRAINT_NAME = ?)`
-	var exists bool
-	if err := db.QueryRowContext(ctx, q, schema, table, constraintName).Scan(&exists); err != nil {
-		return false, err
+// catalogProbeChunk caps how many wanted (table, name) pairs ride one batched
+// catalog probe; larger sets are split into ceil(n/chunk) queries. Each chunk
+// carries at most 1 + tables + names placeholders (≤ 1 + 2×chunk), far under
+// MySQL's 65,535-placeholder limit and small enough to interpolate cleanly on
+// the PS/Vitess text-protocol default (ADR-0153). At 400, the audit's
+// 200-index PlanetScale schema verifies in ONE metadata query instead of 200
+// serial vtgate round trips.
+const catalogProbeChunk = 400
+
+// catalogPair identifies one named per-table catalog object — a secondary
+// index or a FOREIGN KEY constraint. A struct key, not a "table.name" string
+// concat, so a dotted table name can never alias a sibling's object.
+type catalogPair struct{ table, name string }
+
+// foldCatalogPair normalizes a pair for existence-set membership. MySQL
+// compares these names case-insensitively on the probing plane — index and
+// constraint names always, table names per lower_case_table_names — and the
+// old per-object probes inherited that from information_schema's ci column
+// collation (`WHERE table_name = ?`). The Go-side set compare must keep that
+// semantic: an lctn=1 target stores (and reports) a mixed-case CREATE TABLE
+// name lowercased, and an exact-case compare would false-flag every one of
+// its indexes as missing. ToLower is the simple-case-fold approximation of
+// utf8_general_ci — faithful for identifier-realistic names.
+func foldCatalogPair(table, name string) catalogPair {
+	return catalogPair{table: strings.ToLower(table), name: strings.ToLower(name)}
+}
+
+// probeCatalogPairs reports which of the wanted (table, name) pairs exist on
+// the target, reading the catalog in batched chunks instead of one probe per
+// object (audit V-1: on a vtgate/PlanetScale target every probe is a serial
+// cluster round trip, so the old N+1 shape cost hundreds of RTTs per phase at
+// verify/build time on the exact target the project is sold for). queryFor
+// renders one chunk's SQL for the given table/name placeholder counts —
+// [statisticsPairsQuery] or [foreignKeyPairsQuery]; every value rides a
+// parameter (or the flavor's interpolated equivalent — the same protocol the
+// per-object probes used), never string-built into the query. Returned keys
+// are [foldCatalogPair]-normalized; look them up the same way. The result may
+// carry existing pairs beyond the wanted set (the query is the tables×names
+// cross product); callers only test wanted-pair membership, so the overshoot
+// is never load-bearing.
+func probeCatalogPairs(
+	ctx context.Context,
+	db *sql.DB,
+	schema string,
+	wanted []catalogPair,
+	queryFor func(nTables, nNames int) string,
+) (map[catalogPair]struct{}, error) {
+	out := make(map[catalogPair]struct{}, len(wanted))
+	for start := 0; start < len(wanted); start += catalogProbeChunk {
+		end := start + catalogProbeChunk
+		if end > len(wanted) {
+			end = len(wanted)
+		}
+		if err := probeCatalogPairsChunk(ctx, db, schema, wanted[start:end], queryFor, out); err != nil {
+			return nil, err
+		}
 	}
-	return exists, nil
+	return out, nil
+}
+
+// probeCatalogPairsChunk runs ONE batched catalog query for a chunk of wanted
+// pairs and folds the returned (table, name) rows into out.
+func probeCatalogPairsChunk(
+	ctx context.Context,
+	db *sql.DB,
+	schema string,
+	chunk []catalogPair,
+	queryFor func(nTables, nNames int) string,
+	out map[catalogPair]struct{},
+) error {
+	// Distinct tables/names in first-seen order, so the emitted query is
+	// deterministic for a given work-list (the shape the unit pins assert).
+	tables := make([]string, 0, len(chunk))
+	names := make([]string, 0, len(chunk))
+	seenTables := make(map[string]struct{}, len(chunk))
+	seenNames := make(map[string]struct{}, len(chunk))
+	for _, p := range chunk {
+		if _, ok := seenTables[p.table]; !ok {
+			seenTables[p.table] = struct{}{}
+			tables = append(tables, p.table)
+		}
+		if _, ok := seenNames[p.name]; !ok {
+			seenNames[p.name] = struct{}{}
+			names = append(names, p.name)
+		}
+	}
+	args := make([]any, 0, 1+len(tables)+len(names))
+	args = append(args, schema)
+	for _, t := range tables {
+		args = append(args, t)
+	}
+	for _, n := range names {
+		args = append(args, n)
+	}
+	rows, err := db.QueryContext(ctx, queryFor(len(tables), len(names)), args...)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var table, name string
+		if err := rows.Scan(&table, &name); err != nil {
+			return err
+		}
+		out[foldCatalogPair(table, name)] = struct{}{}
+	}
+	return rows.Err()
+}
+
+// statisticsPairsQuery renders one chunk of the batched index-existence probe
+// for [probeCatalogPairs]. DISTINCT because information_schema.statistics
+// carries one row per indexed COLUMN. Narrowing by index_name too (not just
+// table_name) keeps the fetch proportional to the expected set — a wide table
+// full of unrelated indexes contributes nothing — and mirrors the bounds the
+// per-object probe applied DB-side.
+func statisticsPairsQuery(nTables, nNames int) string {
+	return "SELECT DISTINCT table_name, index_name FROM information_schema.statistics" +
+		" WHERE table_schema = ? AND table_name IN (" + sqlPlaceholders(nTables) + ")" +
+		" AND index_name IN (" + sqlPlaceholders(nNames) + ")"
+}
+
+// foreignKeyPairsQuery renders one chunk of the batched FOREIGN-KEY-existence
+// probe for [probeCatalogPairs] (TABLE_CONSTRAINTS is one row per constraint,
+// so no DISTINCT needed).
+func foreignKeyPairsQuery(nTables, nNames int) string {
+	return "SELECT TABLE_NAME, CONSTRAINT_NAME FROM information_schema.TABLE_CONSTRAINTS" +
+		" WHERE CONSTRAINT_SCHEMA = ? AND CONSTRAINT_TYPE = 'FOREIGN KEY'" +
+		" AND TABLE_NAME IN (" + sqlPlaceholders(nTables) + ")" +
+		" AND CONSTRAINT_NAME IN (" + sqlPlaceholders(nNames) + ")"
+}
+
+// sqlPlaceholders returns n comma-joined `?` placeholders for an IN list.
+func sqlPlaceholders(n int) string {
+	return strings.TrimSuffix(strings.Repeat("?, ", n), ", ")
 }
 
 // columnNullable returns the IS_NULLABLE attribute of the named
