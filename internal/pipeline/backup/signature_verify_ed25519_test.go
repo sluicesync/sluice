@@ -86,7 +86,7 @@ func buildEd25519SignedChain(t *testing.T) (*memStore, ed25519.PublicKey, []line
 // secret, no envelope).
 func TestVerifyChainSignatures_Ed25519_Untampered(t *testing.T) {
 	store, pub, links := buildEd25519SignedChain(t)
-	if err := verifyChainSignatures(context.Background(), store, links, verifyMaterial{verifyKey: pub}, false); err != nil {
+	if err := verifyChainSignatures(context.Background(), store, links, verifyMaterial{verifyPub: pub}, false); err != nil {
 		t.Fatalf("untampered ed25519 chain refused: %v", err)
 	}
 }
@@ -115,7 +115,7 @@ func TestVerifyChainSignatures_Ed25519_TamperMatrix(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			store, pub, links := buildEd25519SignedChain(t)
 			tc.tamper(store, links)
-			err := verifyChainSignatures(ctx, store, links, verifyMaterial{verifyKey: pub}, false)
+			err := verifyChainSignatures(ctx, store, links, verifyMaterial{verifyPub: pub}, false)
 			ce, ok := sluicecode.FromError(err)
 			if !ok || ce.Code != tc.wantCode {
 				t.Fatalf("got %v (code ok=%v), want %s", err, ok, tc.wantCode)
@@ -129,7 +129,7 @@ func TestVerifyChainSignatures_Ed25519_TamperMatrix(t *testing.T) {
 func TestVerifyChainSignatures_Ed25519_WrongKey(t *testing.T) {
 	store, _, links := buildEd25519SignedChain(t)
 	otherPub, _, _ := crypto.GenerateEd25519Keypair()
-	err := verifyChainSignatures(context.Background(), store, links, verifyMaterial{verifyKey: otherPub}, false)
+	err := verifyChainSignatures(context.Background(), store, links, verifyMaterial{verifyPub: otherPub}, false)
 	if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeBackupSignatureInvalid {
 		t.Fatalf("wrong verify key: got %v, want SIGNATURE-INVALID", err)
 	}
@@ -186,7 +186,7 @@ func TestVerifyChainSignatures_SchemeConfusion_Chain(t *testing.T) {
 		store, _, links := buildSignedChain(t)
 		pub, _, _ := crypto.GenerateEd25519Keypair()
 		relabelChainScheme(t, ctx, store, links, irbackup.SignatureSchemeEd25519)
-		err := verifyChainSignatures(ctx, store, links, verifyMaterial{verifyKey: pub}, false)
+		err := verifyChainSignatures(ctx, store, links, verifyMaterial{verifyPub: pub}, false)
 		if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeBackupSignatureInvalid {
 			t.Fatalf("hmac chain relabeled ed25519: got %v, want SIGNATURE-INVALID", err)
 		}

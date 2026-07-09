@@ -533,14 +533,19 @@ func (b *IncrementalBackup) incrementalWriteSigner(ctx context.Context, chainSig
 		}
 	}
 	if b.Ed25519Signer != nil {
-		if chainScheme != "" && chainScheme != irbackup.SignatureSchemeEd25519 {
-			return nil, fmt.Errorf("incremental: --sign-key (Ed25519) cannot extend a %q-signed chain — extend it with the scheme it was signed under; refusing to mix signature schemes in one chain", chainScheme)
+		// b.Ed25519Signer carries any --sign-key signer (Ed25519 OR KMS);
+		// compare its FAMILY against the chain's (a composite kms token
+		// carries the algorithm, so match on family, never the whole token).
+		suppliedFamily := b.Ed25519Signer.Scheme
+		if chainScheme != "" && irbackup.SchemeFamily(chainScheme) != suppliedFamily {
+			return nil, fmt.Errorf("incremental: --sign-key (%s) cannot extend a %q-signed chain — extend it with the scheme it was signed under; refusing to mix signature schemes in one chain", suppliedFamily, chainScheme)
 		}
 		return b.Ed25519Signer, nil
 	}
-	// HMAC-off-KEK path (`--sign`, or extending an HMAC-signed chain).
-	if chainScheme == irbackup.SignatureSchemeEd25519 {
-		return nil, errors.New("incremental: this chain is Ed25519-signed (ADR-0154 Phase 2) — extend it with `backup incremental --sign-key <private-key>`; refusing to emit an unsigned/mis-signed successor to a signed chain")
+	// HMAC-off-KEK path (`--sign`, or extending an HMAC-signed chain). An
+	// asymmetric chain (ed25519 / kms) cannot be extended without --sign-key.
+	if fam := irbackup.SchemeFamily(chainScheme); fam == irbackup.SignatureSchemeEd25519 || fam == irbackup.SignatureSchemeKMS {
+		return nil, fmt.Errorf("incremental: this chain is %q-signed (ADR-0154) — extend it with `backup incremental --sign-key <key|kms://...>` matching that scheme; refusing to emit an unsigned/mis-signed successor to a signed chain", chainScheme)
 	}
 	if b.Encryption == nil {
 		return nil, errors.New("incremental: cannot HMAC-sign a plaintext chain (ADR-0154 HMAC-off-KEK needs a KEK); use --sign-key (Ed25519) for a plaintext chain, or the parent is unsigned/plaintext")

@@ -325,6 +325,10 @@ func kmsActionForOp(op string) string {
 		return "Decrypt"
 	case "describe":
 		return "DescribeKey"
+	case "sign":
+		return "Sign"
+	case "get-public-key":
+		return "GetPublicKey"
 	default:
 		return op
 	}

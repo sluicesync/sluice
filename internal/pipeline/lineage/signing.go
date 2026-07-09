@@ -21,6 +21,7 @@ package lineage
 import (
 	"bytes"
 	"context"
+	stdcrypto "crypto"
 	"crypto/ed25519"
 	"encoding/hex"
 	"errors"
@@ -112,11 +113,18 @@ func effectiveLineageScheme(canonVersion, claimed string) string {
 //     same material signs and verifies.
 //   - [irbackup.SignatureSchemeEd25519] (Phase 2): asymmetric Ed25519.
 //     edPub verifies; edPriv (nil for a verify-only signer) signs.
+//   - [irbackup.SignatureSchemeKMS] (Phase 3): a cloud-KMS asymmetric
+//     signature. kmsSigner is the sign seam (nil for a verify-only
+//     signer); kmsPub + kmsAlgorithm drive the PURE local verify. The
+//     on-disk scheme token is the COMPOSITE `kms/<algorithm>` (see
+//     [Signer.schemeTag]).
 //
 // An empty Scheme is treated as HMAC-off-KEK for backward compatibility
 // (pre-Phase-2 constructions that set only Key/KeyID).
 type Signer struct {
-	// Scheme selects the sign/verify primitive. "" == HMAC-off-KEK.
+	// Scheme selects the sign/verify primitive FAMILY. "" == HMAC-off-KEK.
+	// For the kms family the algorithm lives separately in kmsAlgorithm and
+	// is composed into the on-disk token by [Signer.schemeTag].
 	Scheme string
 
 	// KeyID is a stable, non-secret fingerprint of the signing key,
@@ -130,47 +138,76 @@ type Signer struct {
 	// edPriv is nil for a verify-only signer built from a public key.
 	edPriv ed25519.PrivateKey
 	edPub  ed25519.PublicKey
+
+	// kms* hold the Phase-3 KMS material. kmsSigner is the sign seam (nil
+	// for a verify-only signer); kmsAlgorithm is the sluice-canonical
+	// algorithm bound into the composite scheme token; kmsPub is the
+	// resolved public key the PURE verify runs against; kmsKeyRef is the
+	// advisory versioned key ref recorded in the `.sig`.
+	kmsSigner    crypto.KMSSigner
+	kmsAlgorithm string
+	kmsPub       stdcrypto.PublicKey
+	kmsKeyRef    string
 }
 
-// schemeTag returns the on-disk scheme string for this signer, defaulting
-// an empty Scheme to HMAC-off-KEK (backward compat).
+// schemeTag returns the on-disk scheme TOKEN for this signer. For the kms
+// family it is the COMPOSITE `kms/<algorithm>` (e.g. `kms/ecdsa-p256`) —
+// the algorithm is bound by being inside the token that is folded into the
+// signed canonical bytes. An empty Scheme defaults to HMAC-off-KEK.
 func (s *Signer) schemeTag() string {
-	if s.Scheme == "" {
+	switch s.Scheme {
+	case "":
 		return irbackup.SignatureSchemeHMACKEK
+	case irbackup.SignatureSchemeKMS:
+		return irbackup.SignatureSchemeKMS + "/" + s.kmsAlgorithm
+	default:
+		return s.Scheme
 	}
-	return s.Scheme
 }
 
 // canSign reports whether this signer holds material to PRODUCE a
-// signature (not just verify one). An Ed25519 verify-only signer cannot.
+// signature (not just verify one). An Ed25519 / KMS verify-only signer
+// cannot.
 func (s *Signer) canSign() bool {
-	switch s.schemeTag() {
+	switch s.Scheme {
 	case irbackup.SignatureSchemeEd25519:
 		return len(s.edPriv) == ed25519.PrivateKeySize
+	case irbackup.SignatureSchemeKMS:
+		return s.kmsSigner != nil
 	default:
 		return len(s.Key) > 0
 	}
 }
 
 // sign returns the MAC/signature over payload under this signer's scheme.
-func (s *Signer) sign(payload []byte) ([]byte, error) {
-	switch s.schemeTag() {
+// Only the kms scheme performs ctx/IO (the KMS Sign call); HMAC/Ed25519
+// ignore ctx and stay pure + in-process.
+func (s *Signer) sign(ctx context.Context, payload []byte) ([]byte, error) {
+	switch s.Scheme {
 	case irbackup.SignatureSchemeEd25519:
 		if len(s.edPriv) != ed25519.PrivateKeySize {
 			return nil, errors.New("lineage: ed25519 signer is verify-only (no private key) and cannot sign")
 		}
 		return crypto.SignManifestEd25519(s.edPriv, payload), nil
+	case irbackup.SignatureSchemeKMS:
+		if s.kmsSigner == nil {
+			return nil, errors.New("lineage: kms signer is verify-only (no KMS Sign client) and cannot sign")
+		}
+		return s.kmsSigner.Sign(ctx, payload)
 	default:
 		return crypto.SignManifestHMAC(s.Key, payload), nil
 	}
 }
 
 // verify reports whether sig authenticates payload under this signer's
-// scheme (constant-time for HMAC; ed25519.Verify for Ed25519).
+// scheme. PURE for every scheme (constant-time HMAC; ed25519.Verify; local
+// stdlib ecdsa/rsa/ed25519 for kms — no KMS access needed to verify).
 func (s *Signer) verify(payload, sig []byte) bool {
-	switch s.schemeTag() {
+	switch s.Scheme {
 	case irbackup.SignatureSchemeEd25519:
 		return crypto.VerifyManifestEd25519(s.edPub, payload, sig)
+	case irbackup.SignatureSchemeKMS:
+		return crypto.VerifyManifestKMS(s.kmsPub, s.kmsAlgorithm, payload, sig)
 	default:
 		return crypto.VerifyManifestHMAC(s.Key, payload, sig)
 	}
@@ -220,6 +257,41 @@ func NewEd25519Verifier(pub ed25519.PublicKey) *Signer {
 	}
 }
 
+// NewKMSSigner builds a sign+verify KMS signer from a resolved
+// [crypto.KMSSigner] adapter (ADR-0154 Phase 3). The signing key stays in
+// the HSM; the adapter has already fetched the public key, so this signer
+// can also verify locally (used by compact/prune re-sign, which signs but
+// may self-check). The KeyID comes from the public key so a verifier
+// holding only the exported public key computes the identical id.
+func NewKMSSigner(k crypto.KMSSigner) *Signer {
+	return &Signer{
+		Scheme:       irbackup.SignatureSchemeKMS,
+		KeyID:        k.KeyID(),
+		kmsSigner:    k,
+		kmsAlgorithm: k.Algorithm(),
+		kmsPub:       k.PublicKey(),
+		kmsKeyRef:    k.KeyRef(),
+	}
+}
+
+// NewKMSVerifier builds a verify-only KMS signer from a resolved public
+// key + the sluice-canonical algorithm (parsed from the chain's signed
+// `kms/<algorithm>` scheme token). Verification is PURE and local — a DR
+// host verifies a KMS-signed chain with an exported public key and no KMS
+// access. pub is the OPERATOR's trusted key (an exported PEM, or the public
+// half of the `kms://` key they name), never a key a manifest references.
+func NewKMSVerifier(pub stdcrypto.PublicKey, algorithm string) *Signer {
+	// Best-effort key-id for the reported "recorded vs verifying" message;
+	// an unmarshalable key leaves it empty and the MAC check still governs.
+	keyID, _ := crypto.KMSManifestKeyID(pub)
+	return &Signer{
+		Scheme:       irbackup.SignatureSchemeKMS,
+		KeyID:        keyID,
+		kmsAlgorithm: algorithm,
+		kmsPub:       pub,
+	}
+}
+
 // ManifestSigPath returns the detached-signature object path for a
 // manifest path (`manifest.json` → `manifest.json.sig`).
 func ManifestSigPath(manifestPath string) string {
@@ -227,12 +299,14 @@ func ManifestSigPath(manifestPath string) string {
 }
 
 // SignManifest builds the detached signature for m at chain position seq.
-func (s *Signer) SignManifest(m *irbackup.Manifest, seq int) (*irbackup.ManifestSignature, error) {
+// ctx is used only by the kms scheme (the KMS Sign call); HMAC/Ed25519
+// ignore it.
+func (s *Signer) SignManifest(ctx context.Context, m *irbackup.Manifest, seq int) (*irbackup.ManifestSignature, error) {
 	payload, err := irbackup.CanonicalManifestBytes(m, seq, s.schemeTag())
 	if err != nil {
 		return nil, err
 	}
-	mac, err := s.sign(payload)
+	mac, err := s.sign(ctx, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -240,6 +314,8 @@ func (s *Signer) SignManifest(m *irbackup.Manifest, seq int) (*irbackup.Manifest
 		CanonVersion: irbackup.ManifestCanonVersion,
 		Scheme:       s.schemeTag(),
 		KeyID:        s.KeyID,
+		Algorithm:    s.kmsAlgorithm, // "" (omitted) for non-kms schemes
+		KeyRef:       s.kmsKeyRef,    // "" (omitted) for non-kms schemes
 		Sequence:     seq,
 		ChunkCount:   irbackup.ManifestChunkCount(m),
 		MAC:          hex.EncodeToString(mac),
@@ -249,7 +325,7 @@ func (s *Signer) SignManifest(m *irbackup.Manifest, seq int) (*irbackup.Manifest
 // WriteManifestSig signs m at seq and writes the detached signature next
 // to manifestPath.
 func WriteManifestSig(ctx context.Context, store irbackup.Store, manifestPath string, m *irbackup.Manifest, seq int, s *Signer) error {
-	sig, err := s.SignManifest(m, seq)
+	sig, err := s.SignManifest(ctx, m, seq)
 	if err != nil {
 		return err
 	}
@@ -422,9 +498,9 @@ func lpTok(b *strings.Builder, s string) {
 // reuses the [irbackup.ManifestSignature] envelope (Sequence carries the
 // total manifest count across the lineage — the tip high-water; ChunkCount
 // is unused and left 0).
-func (s *Signer) SignLineage(cat *Catalog) (*irbackup.ManifestSignature, error) {
+func (s *Signer) SignLineage(ctx context.Context, cat *Catalog) (*irbackup.ManifestSignature, error) {
 	payload := CanonicalCatalogBytes(cat, s.schemeTag())
-	mac, err := s.sign(payload)
+	mac, err := s.sign(ctx, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -432,6 +508,8 @@ func (s *Signer) SignLineage(cat *Catalog) (*irbackup.ManifestSignature, error) 
 		CanonVersion: LineageCatalogCanonVersion,
 		Scheme:       s.schemeTag(),
 		KeyID:        s.KeyID,
+		Algorithm:    s.kmsAlgorithm, // "" (omitted) for non-kms schemes
+		KeyRef:       s.kmsKeyRef,    // "" (omitted) for non-kms schemes
 		Sequence:     totalManifestCount(cat),
 		MAC:          hex.EncodeToString(mac),
 	}, nil
@@ -439,7 +517,7 @@ func (s *Signer) SignLineage(cat *Catalog) (*irbackup.ManifestSignature, error) 
 
 // WriteLineageSig signs cat and writes lineage.json.sig.
 func WriteLineageSig(ctx context.Context, store irbackup.Store, cat *Catalog, s *Signer) error {
-	sig, err := s.SignLineage(cat)
+	sig, err := s.SignLineage(ctx, cat)
 	if err != nil {
 		return err
 	}

@@ -4,6 +4,7 @@
 package main
 
 import (
+	"crypto/ed25519"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -37,16 +38,20 @@ func TestBackupKeygen_RoundTrip(t *testing.T) {
 
 	// The generated keypair round-trips: build a signer from the private
 	// key and a verify key from the public, and confirm the ids match.
-	signer, err := (&EncryptionFlags{SignKey: privPath}).buildEd25519Signer()
+	signer, err := (&EncryptionFlags{SignKey: privPath}).buildSignKeySigner()
 	if err != nil || signer == nil {
-		t.Fatalf("buildEd25519Signer: %v (nil=%v)", err, signer == nil)
+		t.Fatalf("buildSignKeySigner: %v (nil=%v)", err, signer == nil)
 	}
 	pub, err := (&EncryptionFlags{VerifyKey: pubPath}).resolveVerifyKey()
 	if err != nil || pub == nil {
 		t.Fatalf("resolveVerifyKey: %v (nil=%v)", err, pub == nil)
 	}
-	if signer.KeyID != crypto.Ed25519KeyID(pub) {
-		t.Fatalf("keygen signer/verifier key-id mismatch: %s != %s", signer.KeyID, crypto.Ed25519KeyID(pub))
+	edPub, ok := pub.(ed25519.PublicKey)
+	if !ok {
+		t.Fatalf("resolveVerifyKey returned %T, want ed25519.PublicKey", pub)
+	}
+	if signer.KeyID != crypto.Ed25519KeyID(edPub) {
+		t.Fatalf("keygen signer/verifier key-id mismatch: %s != %s", signer.KeyID, crypto.Ed25519KeyID(edPub))
 	}
 }
 
@@ -97,7 +102,7 @@ func TestEncryptionFlags_KeyResolution_Env(t *testing.T) {
 	t.Setenv("TEST_SLUICE_SIGN_KEY", string(privPEM))
 	t.Setenv("TEST_SLUICE_VERIFY_KEY", string(pubPEM))
 
-	signer, err := (&EncryptionFlags{SignKey: "env:TEST_SLUICE_SIGN_KEY"}).buildEd25519Signer()
+	signer, err := (&EncryptionFlags{SignKey: "env:TEST_SLUICE_SIGN_KEY"}).buildSignKeySigner()
 	if err != nil || signer == nil {
 		t.Fatalf("env sign key: %v", err)
 	}
@@ -107,7 +112,7 @@ func TestEncryptionFlags_KeyResolution_Env(t *testing.T) {
 	}
 
 	// Empty env var → loud refusal.
-	if _, err := (&EncryptionFlags{SignKey: "env:TEST_SLUICE_ABSENT"}).buildEd25519Signer(); err == nil {
+	if _, err := (&EncryptionFlags{SignKey: "env:TEST_SLUICE_ABSENT"}).buildSignKeySigner(); err == nil {
 		t.Fatal("absent env sign key did not error")
 	}
 	// Garbage PEM → loud refusal.
@@ -116,7 +121,7 @@ func TestEncryptionFlags_KeyResolution_Env(t *testing.T) {
 		t.Fatal("garbage verify key did not error")
 	}
 	// Unset flags resolve to nil (no signing / no verify key).
-	if s, err := (&EncryptionFlags{}).buildEd25519Signer(); err != nil || s != nil {
+	if s, err := (&EncryptionFlags{}).buildSignKeySigner(); err != nil || s != nil {
 		t.Fatalf("empty sign-key: got signer=%v err=%v, want nil/nil", s, err)
 	}
 }

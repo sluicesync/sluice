@@ -166,7 +166,7 @@ func TestEd25519Verifier_CannotSign(t *testing.T) {
 	if verifier.canSign() {
 		t.Fatal("verify-only ed25519 signer reports canSign()==true")
 	}
-	if _, err := verifier.SignManifest(testManifest(), 0); err == nil {
+	if _, err := verifier.SignManifest(context.Background(), testManifest(), 0); err == nil {
 		t.Fatal("verify-only ed25519 signer produced a signature")
 	}
 	if err := ResignLineage(context.Background(), newMemStore(), verifier); err == nil {

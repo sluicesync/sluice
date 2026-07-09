@@ -26,6 +26,7 @@ package backup
 
 import (
 	"context"
+	stdcrypto "crypto"
 	"crypto/ed25519"
 	"fmt"
 	"log/slog"
@@ -35,36 +36,50 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
-// verifyMaterial carries the two possible ADR-0154 verify-key sources —
-// the encryption envelope (HMAC-off-KEK, Phase 1) and an Ed25519 PUBLIC
-// key (`--verify-key`, Phase 2). The verifier for a given chain is chosen
-// from the chain's CLAIMED scheme against whichever of these is present:
-// an HMAC-off-KEK chain needs the envelope; an Ed25519 chain needs the
-// public key (the KEK does NOT verify an Ed25519 signature — the schemes
-// are cryptographically independent).
+// verifyMaterial carries the ADR-0154 verify-key sources — the encryption
+// envelope (HMAC-off-KEK, Phase 1) and an asymmetric PUBLIC key (Ed25519 /
+// ECDSA / RSA, from `--verify-key`, Phase 2/3). The verifier for a given
+// chain is chosen from the chain's CLAIMED scheme FAMILY against whichever
+// of these is present: an HMAC-off-KEK chain needs the envelope; an
+// Ed25519 or KMS chain needs the public key (the KEK does NOT verify an
+// asymmetric signature — the schemes are cryptographically independent).
+// For the kms family, verifyPub is the OPERATOR's trusted key (an exported
+// PEM, or the public half of the `kms://` key they named) — never a key a
+// manifest references, so a rewritten manifest KeyRef cannot redirect
+// trust.
 type verifyMaterial struct {
 	env       crypto.EnvelopeEncryption
-	verifyKey ed25519.PublicKey
+	verifyPub stdcrypto.PublicKey
 }
 
 // signerForScheme builds the [lineage.Signer] that verifies scheme's
-// signatures from the available material. ok is false when no material
-// for that scheme is supplied (the caller then takes the unverifiable
-// warn/refuse path — NEVER a "different scheme so skip" path, so an
-// Ed25519 chain presented with only a KEK does not silently pass). A
-// non-nil error is a real key-derivation failure.
+// signatures from the available material. It dispatches on the scheme
+// FAMILY ([irbackup.SchemeFamily]) so a composite kms token
+// (`kms/ecdsa-p256`) routes to the KMS verifier with the algorithm parsed
+// from the token. ok is false when no material for that scheme is supplied
+// (the caller then takes the unverifiable warn/refuse path — NEVER a
+// "different scheme so skip" path, so an Ed25519/KMS chain presented with
+// only a KEK does not silently pass). A non-nil error is a real
+// key-derivation failure.
 //
 // Selecting the verifier from the claimed scheme is safe: a relabel to a
-// scheme the operator CAN verify still fails, because the scheme is
-// folded into the signed canonical bytes and each per-artifact verify
-// re-checks sig.Scheme against the verifier's scheme.
+// scheme/algorithm the operator CAN verify still fails, because the scheme
+// token (including the kms algorithm) is folded into the signed canonical
+// bytes and each per-artifact verify re-checks sig.Scheme against the
+// verifier's scheme AND runs the scheme-specific primitive.
 func (m verifyMaterial) signerForScheme(scheme string) (s *lineage.Signer, ok bool, err error) {
-	switch scheme {
+	switch irbackup.SchemeFamily(scheme) {
 	case irbackup.SignatureSchemeEd25519:
-		if len(m.verifyKey) == 0 {
+		edPub, isEd := m.verifyPub.(ed25519.PublicKey)
+		if !isEd {
 			return nil, false, nil
 		}
-		return lineage.NewEd25519Verifier(m.verifyKey), true, nil
+		return lineage.NewEd25519Verifier(edPub), true, nil
+	case irbackup.SignatureSchemeKMS:
+		if m.verifyPub == nil {
+			return nil, false, nil
+		}
+		return lineage.NewKMSVerifier(m.verifyPub, irbackup.SchemeAlgorithm(scheme)), true, nil
 	case irbackup.SignatureSchemeHMACKEK:
 		return hmacVerifier(m.env)
 	default:
@@ -72,8 +87,8 @@ func (m verifyMaterial) signerForScheme(scheme string) (s *lineage.Signer, ok bo
 		// with no signature objects at all): prefer an explicit verify key,
 		// else the envelope, so a subsequent VerifyManifest reports the
 		// precise MISSING/INVALID error rather than skipping.
-		if len(m.verifyKey) > 0 {
-			return lineage.NewEd25519Verifier(m.verifyKey), true, nil
+		if edPub, isEd := m.verifyPub.(ed25519.PublicKey); isEd {
+			return lineage.NewEd25519Verifier(edPub), true, nil
 		}
 		return hmacVerifier(m.env)
 	}
@@ -244,7 +259,7 @@ func verifyBackupSignatures(ctx context.Context, store irbackup.Store, records [
 		slog.InfoContext(ctx, "backup verify: chain is unsigned (pre-ADR-0154 / no signature objects); no signatures to check")
 		return 0
 	}
-	signer, ok, err := chainVerifier(ctx, store, verifyMaterial{env: opts.Envelope, verifyKey: opts.VerifyKey})
+	signer, ok, err := chainVerifier(ctx, store, verifyMaterial{env: opts.Envelope, verifyPub: opts.VerifyKey})
 	if err != nil {
 		slog.ErrorContext(ctx, "backup verify: cannot derive verify key", slog.String("error", err.Error()))
 		return 1

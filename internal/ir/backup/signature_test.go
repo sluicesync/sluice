@@ -288,6 +288,48 @@ func TestCanonicalManifestBytes_SchemeBinding(t *testing.T) {
 	if bytes.Equal(hmacBytes, edBytes) {
 		t.Error("hmac-kek and ed25519 canonical bytes collided — scheme is NOT bound into the signature")
 	}
+
+	// Phase 3: the composite kms scheme token binds the ALGORITHM. Signing
+	// the same manifest under kms/ecdsa-p256 vs kms/ecdsa-p384 (an algorithm
+	// downgrade) must produce DIFFERENT bytes, and both must differ from
+	// hmac/ed25519 — so a relabel across scheme OR algorithm changes the
+	// signed bytes.
+	kms256, err := CanonicalManifestBytes(m, 2, SignatureSchemeKMS+"/"+"ecdsa-p256")
+	if err != nil {
+		t.Fatal(err)
+	}
+	kms384, err := CanonicalManifestBytes(m, 2, SignatureSchemeKMS+"/"+"ecdsa-p384")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(kms256, kms384) {
+		t.Error("kms/ecdsa-p256 and kms/ecdsa-p384 canonical bytes collided — the ALGORITHM is NOT bound")
+	}
+	for name, b := range map[string][]byte{"hmac": hmacBytes, "ed25519": edBytes} {
+		if bytes.Equal(kms256, b) {
+			t.Errorf("kms/ecdsa-p256 canonical bytes collided with %s — scheme family not bound", name)
+		}
+	}
+}
+
+// TestSchemeFamilyAlgorithm pins the composite-token parse used by the
+// verifier to select a primitive: family before `/`, algorithm after,
+// robust to non-composite tokens.
+func TestSchemeFamilyAlgorithm(t *testing.T) {
+	cases := []struct{ in, family, algo string }{
+		{"kms/ecdsa-p256", "kms", "ecdsa-p256"},
+		{"kms/rsa-pss-256", "kms", "rsa-pss-256"},
+		{"ed25519", "ed25519", ""},
+		{"hmac-kek", "hmac-kek", ""},
+	}
+	for _, c := range cases {
+		if got := SchemeFamily(c.in); got != c.family {
+			t.Errorf("SchemeFamily(%q)=%q want %q", c.in, got, c.family)
+		}
+		if got := SchemeAlgorithm(c.in); got != c.algo {
+			t.Errorf("SchemeAlgorithm(%q)=%q want %q", c.in, got, c.algo)
+		}
+	}
 }
 
 // TestManifestChunkCount pins the freshness count (row + change chunks).

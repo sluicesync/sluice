@@ -5,7 +5,7 @@ package main
 
 import (
 	"context"
-	"crypto/ed25519"
+	stdcrypto "crypto"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -58,16 +58,17 @@ type EncryptionFlags struct {
 	// ADR-0154 Phase 1 signing. Sign gates the WRITE side (backup full /
 	// incremental); RequireSignature gates the READ side (restore /
 	// verify) strict-always policy.
-	Sign             bool `name:"sign" help:"Sign the backup manifest + lineage catalog with a detached HMAC-SHA-256 keyed off the chain KEK (ADR-0154 Phase 1). Requires --encrypt (HMAC-off-KEK signs only encrypted chains) with a passphrase (KMS signing is Phase 3). For plaintext signing or key-separated verification, use --sign-key (Ed25519) instead. Extending an already-signed chain signs automatically."`
+	Sign             bool `name:"sign" help:"Sign the backup manifest + lineage catalog with a detached HMAC-SHA-256 keyed off the chain KEK (ADR-0154 Phase 1). Requires --encrypt (HMAC-off-KEK signs only encrypted chains) with a passphrase (to sign a KMS-encrypted chain, or for plaintext / key-separated verification, use --sign-key with an Ed25519 key or 'kms://...' instead). Extending an already-signed chain signs automatically."`
 	RequireSignature bool `name:"require-signature" help:"Strict-always signature policy on restore/verify: a signed (v6) backup that cannot be verified (no matching key supplied) is refused rather than warned. An INVALID signature is always refused regardless of this flag. Leave off for the DR-safe default (never fail a restore for a signature it cannot check)."`
 
-	// ADR-0154 Phase 2 (Ed25519 asymmetric signing). SignKey gates the
-	// WRITE side (backup full / incremental) and EXPLICITLY selects the
-	// Ed25519 scheme; VerifyKey gates the READ side (restore / verify) and
-	// is REQUIRED to verify an Ed25519-signed chain (the KEK does not
-	// verify an Ed25519 signature). Both accept `env:VAR` or a file path.
-	SignKey   string `name:"sign-key" help:"Sign the backup with an Ed25519 PRIVATE key (ADR-0154 Phase 2, PKCS#8 PEM), selecting the Ed25519 scheme over the --sign HMAC-off-KEK default. Works on BOTH plaintext AND encrypted (incl. KMS) backups — the keypair is independent of the encryption keystore. Accepts a file path or 'env:VAR'. Generate with 'sluice backup keygen'. The private key is never logged. Mutually exclusive with --sign." placeholder:"PATH|env:VAR"`
-	VerifyKey string `name:"verify-key" help:"Ed25519 PUBLIC key (ADR-0154 Phase 2, SPKI PEM) that verifies an Ed25519-signed chain on restore / verify. REQUIRED for such a chain — the KEK does NOT verify an Ed25519 signature, even on an encrypted chain. Absent it, an Ed25519-signed chain WARNs present-but-unverified and proceeds (DR-safe) unless --require-signature. Accepts a file path or 'env:VAR'." placeholder:"PATH|env:VAR"`
+	// ADR-0154 Phase 2/3 (asymmetric signing). SignKey gates the WRITE side
+	// (backup full / incremental) and EXPLICITLY selects the Ed25519 (Phase
+	// 2) or KMS (Phase 3) scheme; VerifyKey gates the READ side (restore /
+	// verify) and is REQUIRED to verify an asymmetrically-signed chain (the
+	// KEK does not verify an asymmetric signature). Both accept `env:VAR`, a
+	// file path, or a `kms://<provider>/<key-ref>` reference.
+	SignKey   string `name:"sign-key" help:"Sign the backup with an Ed25519 PRIVATE key (ADR-0154 Phase 2, PKCS#8 PEM), OR via a cloud KMS key given as 'kms://aws/<key-arn>' (Phase 3 — the private key stays in the HSM; needs kms:Sign on a SIGN_VERIFY key, which may differ from the --kms-key-arn encryption key). Selects the asymmetric scheme over the --sign HMAC-off-KEK default; works on BOTH plaintext AND encrypted backups. Accepts a file path, 'env:VAR', or 'kms://...'. Generate an Ed25519 pair with 'sluice backup keygen'. Never logged. Mutually exclusive with --sign." placeholder:"PATH|env:VAR|kms://..."`
+	VerifyKey string `name:"verify-key" help:"PUBLIC key that verifies an asymmetrically-signed chain (ADR-0154 Phase 2/3) on restore / verify — an SPKI PEM file (Ed25519 / ECDSA / RSA; the offline DR path, verified locally per the recorded algorithm) OR 'kms://aws/<key-arn>' to fetch the trusted key's public half online. REQUIRED for such a chain — the KEK does NOT verify an asymmetric signature, even on an encrypted chain. The recorded manifest key reference is NEVER trusted; verification anchors on the key YOU name here. Absent it, the chain WARNs present-but-unverified and proceeds (DR-safe) unless --require-signature. Accepts a file path, 'env:VAR', or 'kms://...'." placeholder:"PATH|env:VAR|kms://..."`
 }
 
 // readKeyMaterial resolves a `--sign-key` / `--verify-key` spec: `env:VAR`
@@ -90,12 +91,25 @@ func readKeyMaterial(spec string) ([]byte, error) {
 	return raw, nil
 }
 
-// buildEd25519Signer builds the Ed25519 write-side signer from --sign-key,
-// or nil when the flag is unset. The private key is parsed but never
-// logged.
-func (e *EncryptionFlags) buildEd25519Signer() (*lineage.Signer, error) {
+// buildSignKeySigner builds the write-side signer from --sign-key, or nil
+// when the flag is unset. A `kms://<provider>/<keyref>` value selects the
+// KMS scheme (ADR-0154 Phase 3 — the private key stays in the HSM); any
+// other value is an Ed25519 PKCS#8 PEM private key (Phase 2). The private
+// key / KMS reference is never logged.
+func (e *EncryptionFlags) buildSignKeySigner() (*lineage.Signer, error) {
 	if e.SignKey == "" {
 		return nil, nil
+	}
+	if isKMSURI(e.SignKey) {
+		provider, keyRef, err := parseKMSURI(e.SignKey)
+		if err != nil {
+			return nil, fmt.Errorf("--sign-key: %w", err)
+		}
+		signer, err := buildKMSSigner(provider, keyRef, e.KMSRegion)
+		if err != nil {
+			return nil, fmt.Errorf("--sign-key: %w", err)
+		}
+		return signer, nil
 	}
 	raw, err := readKeyMaterial(e.SignKey)
 	if err != nil {
@@ -108,21 +122,102 @@ func (e *EncryptionFlags) buildEd25519Signer() (*lineage.Signer, error) {
 	return lineage.NewEd25519Signer(priv), nil
 }
 
-// resolveVerifyKey resolves the Ed25519 PUBLIC verify key from
-// --verify-key, or nil when unset.
-func (e *EncryptionFlags) resolveVerifyKey() (ed25519.PublicKey, error) {
+// resolveVerifyKey resolves the asymmetric PUBLIC verify key from
+// --verify-key, or nil when unset. A `kms://<provider>/<keyref>` value
+// fetches the public half of the OPERATOR-NAMED trusted key via the
+// provider's GetPublicKey (online); any other value is an SPKI PEM public
+// key file (offline DR path) parsed for Ed25519 / ECDSA / RSA. The
+// verification primitive is chosen from the chain's SIGNED algorithm, not
+// from this key — so a rewritten manifest key reference cannot redirect
+// trust to a different key.
+func (e *EncryptionFlags) resolveVerifyKey() (stdcrypto.PublicKey, error) {
 	if e.VerifyKey == "" {
 		return nil, nil
+	}
+	if isKMSURI(e.VerifyKey) {
+		provider, keyRef, err := parseKMSURI(e.VerifyKey)
+		if err != nil {
+			return nil, fmt.Errorf("--verify-key: %w", err)
+		}
+		pub, err := fetchKMSPublicKey(provider, keyRef, e.KMSRegion)
+		if err != nil {
+			return nil, fmt.Errorf("--verify-key: %w", err)
+		}
+		return pub, nil
 	}
 	raw, err := readKeyMaterial(e.VerifyKey)
 	if err != nil {
 		return nil, fmt.Errorf("--verify-key: %w", err)
 	}
-	pub, err := crypto.ParseEd25519PublicKeyPEM(raw)
+	pub, err := crypto.ParseManifestPublicKeyPEM(raw)
 	if err != nil {
 		return nil, fmt.Errorf("--verify-key: %w", err)
 	}
 	return pub, nil
+}
+
+// kmsSignURIScheme is the prefix that selects a KMS keystore for
+// --sign-key / --verify-key: `kms://<provider>/<keyref>`. The provider is
+// the segment before the first `/`; the key reference is everything after
+// (ARNs contain their own `:` and `/`, so only the FIRST separator splits
+// provider from ref). Phase 3a supports only `aws`.
+const kmsSignURIScheme = "kms://"
+
+// isKMSURI reports whether spec selects a KMS keystore.
+func isKMSURI(spec string) bool {
+	return strings.HasPrefix(spec, kmsSignURIScheme)
+}
+
+// parseKMSURI splits a `kms://<provider>/<keyref>` value into its provider
+// and key reference. The key reference is passed VERBATIM to the provider
+// (an AWS key ID / ARN / alias), so only the first `/` after the provider
+// is consumed.
+func parseKMSURI(spec string) (provider, keyRef string, err error) {
+	rest := strings.TrimPrefix(spec, kmsSignURIScheme)
+	slash := strings.IndexByte(rest, '/')
+	if slash <= 0 || slash == len(rest)-1 {
+		return "", "", fmt.Errorf("malformed kms:// reference %q (expected kms://<provider>/<key-ref>, e.g. kms://aws/arn:aws:kms:...)", spec)
+	}
+	return rest[:slash], rest[slash+1:], nil
+}
+
+// buildKMSSigner constructs the write-side KMS signer for provider. Phase
+// 3a wires AWS; GCP/Azure are Phase 3b fast-follows.
+func buildKMSSigner(provider, keyRef, region string) (*lineage.Signer, error) {
+	switch provider {
+	case "aws":
+		adapter, err := crypto.NewAWSKMSSigner(kongContext(), keyRef, awsKMSSignOpts(region)...)
+		if err != nil {
+			return nil, err
+		}
+		return lineage.NewKMSSigner(adapter), nil
+	case "gcp", "azure":
+		return nil, fmt.Errorf("kms:// signing provider %q is ADR-0154 Phase 3b (only 'aws' is available in Phase 3a)", provider)
+	default:
+		return nil, fmt.Errorf("unknown kms:// signing provider %q (expected 'aws')", provider)
+	}
+}
+
+// fetchKMSPublicKey resolves the public half of the operator-named trusted
+// KMS key for the online `--verify-key kms://...` path.
+func fetchKMSPublicKey(provider, keyRef, region string) (stdcrypto.PublicKey, error) {
+	switch provider {
+	case "aws":
+		return crypto.FetchAWSKMSPublicKey(kongContext(), keyRef, awsKMSSignOpts(region)...)
+	case "gcp", "azure":
+		return nil, fmt.Errorf("kms:// verify provider %q is ADR-0154 Phase 3b (only 'aws' is available in Phase 3a)", provider)
+	default:
+		return nil, fmt.Errorf("unknown kms:// verify provider %q (expected 'aws')", provider)
+	}
+}
+
+// awsKMSSignOpts builds the AWS-signer option slice, forwarding the shared
+// --kms-region flag.
+func awsKMSSignOpts(region string) []crypto.AWSKMSSignerOption {
+	if region == "" {
+		return nil
+	}
+	return []crypto.AWSKMSSignerOption{crypto.WithAWSKMSSignRegion(region)}
 }
 
 // resolvePassphrase returns the operator's passphrase from whichever
@@ -438,8 +533,8 @@ func (e *EncryptionFlags) buildSigner(ctx context.Context, store irbackup.Store)
 	if err != nil {
 		return nil, err
 	}
-	if ok && scheme != signer.Scheme {
-		return nil, fmt.Errorf("this chain is %q-signed (ADR-0154); re-signing it during compact/prune needs the matching key material (%q supplied) — pass the chain's --encrypt passphrase for hmac-kek, or --sign-key for ed25519", scheme, signer.Scheme)
+	if ok && irbackup.SchemeFamily(scheme) != signer.Scheme {
+		return nil, fmt.Errorf("this chain is %q-signed (ADR-0154); re-signing it during compact/prune needs the matching key material (%q supplied) — pass the chain's --encrypt passphrase for hmac-kek, --sign-key <pem> for ed25519, or --sign-key kms://... for kms", scheme, signer.Scheme)
 	}
 	return signer, nil
 }
@@ -450,7 +545,7 @@ func (e *EncryptionFlags) buildSigner(ctx context.Context, store irbackup.Store)
 // neither is supplied (a signed chain then refuses to compact/prune).
 func (e *EncryptionFlags) buildMaintenanceSigner(ctx context.Context, store irbackup.Store) (*lineage.Signer, error) {
 	if e.SignKey != "" {
-		return e.buildEd25519Signer()
+		return e.buildSignKeySigner()
 	}
 	if !e.Encrypt {
 		return nil, nil
@@ -705,7 +800,7 @@ func (b *BackupFullCmd) run(g *Globals, env *envelopeRun) error {
 	if err != nil {
 		return err
 	}
-	signer, err := b.buildEd25519Signer()
+	signer, err := b.buildSignKeySigner()
 	if err != nil {
 		return err
 	}
@@ -882,7 +977,7 @@ func (b *BackupIncrementalCmd) Run(g *Globals) error {
 	if err != nil {
 		return err
 	}
-	signer, err := b.buildEd25519Signer()
+	signer, err := b.buildSignKeySigner()
 	if err != nil {
 		return err
 	}

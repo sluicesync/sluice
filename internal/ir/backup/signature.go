@@ -89,11 +89,53 @@ const (
 	// encryption keystore. Phase 3 adds "kms".
 	SignatureSchemeEd25519 = "ed25519"
 
+	// SignatureSchemeKMS is the Phase 3 scheme FAMILY tag: an asymmetric
+	// signature produced by a cloud-KMS Sign API (the private key never
+	// leaves the HSM). The signing ALGORITHM is bound INTO the on-disk
+	// scheme token as a COMPOSITE `kms/<algorithm>` (e.g. `kms/ecdsa-p256`,
+	// `kms/rsa-pss-256`): the family before the `/` selects the verification
+	// primitive, and the algorithm after it is authoritatively bound because
+	// the whole composite is the `scheme` token folded into the signed
+	// canonical bytes (v3). No canon bump is needed — the scheme token has
+	// always been an arbitrary length-prefixed string, so a longer composite
+	// value stays injective and leaves the hmac-kek / ed25519 goldens
+	// byte-frozen. An adversary who relabels the algorithm (e.g.
+	// `kms/ecdsa-p521` → `kms/ecdsa-p256`) changes the signed bytes AND the
+	// verifier's chosen primitive, so verification fails closed. Verification
+	// selects the primitive from the recorded-and-signed algorithm and runs
+	// stdlib crypto (ecdsa/rsa/ed25519) against the operator's SUPPLIED
+	// trusted public key — never a key the manifest names — so a rewritten
+	// [ManifestSignature.KeyRef] cannot redirect trust.
+	SignatureSchemeKMS = "kms"
+
 	// SignatureFileSuffix is appended to a manifest's path to name its
 	// detached signature object (`manifest.json` → `manifest.json.sig`).
 	// `.sig` never collides with the `.json` manifest-discovery filters.
 	SignatureFileSuffix = ".sig"
 )
+
+// SchemeFamily returns the family portion of a (possibly composite)
+// scheme token: the part before the first `/`, or the whole string when
+// there is none. For `kms/ecdsa-p256` it is `kms`; for `hmac-kek` /
+// `ed25519` it is the token itself. The family drives verifier selection.
+func SchemeFamily(scheme string) string {
+	if i := strings.IndexByte(scheme, '/'); i >= 0 {
+		return scheme[:i]
+	}
+	return scheme
+}
+
+// SchemeAlgorithm returns the algorithm portion of a composite scheme
+// token — the part after the first `/`, or "" when there is none. For
+// `kms/ecdsa-p256` it is `ecdsa-p256`. The algorithm is authoritatively
+// bound because the composite token is folded into the signed bytes; the
+// verifier selects its crypto primitive from this value.
+func SchemeAlgorithm(scheme string) string {
+	if i := strings.IndexByte(scheme, '/'); i >= 0 {
+		return scheme[i+1:]
+	}
+	return ""
+}
 
 // ManifestSignature is the on-disk shape of a detached `<manifest>.sig`
 // object (indented JSON, operator-inspectable). It records what the
@@ -121,6 +163,25 @@ type ManifestSignature struct {
 	// ([crypto.ManifestSigKeyID]) so rotation is expressible and a
 	// verifier can report which key a signature claims.
 	KeyID string `json:"key_id"`
+
+	// Algorithm is an ADVISORY, operator-facing echo of the KMS signing
+	// algorithm ("ecdsa-p256" / "rsa-pss-256" / …) for the `kms` scheme,
+	// empty for hmac-kek / ed25519. It is NOT the binding — the authoritative
+	// algorithm binding is the composite `kms/<algorithm>` scheme token that
+	// is folded into the signed canonical bytes. Recorded only so an operator
+	// inspecting a `.sig` can read the algorithm without parsing the scheme.
+	Algorithm string `json:"algorithm,omitempty"`
+
+	// KeyRef is an ADVISORY record of the concrete VERSIONED KMS key
+	// reference the signature was produced under (AWS key-ARN, GCP
+	// `.../cryptoKeyVersions/N`, Azure `/keys/K/VERSION`) — the N-9
+	// version-pinning discipline, so rotation does not orphan old
+	// signatures and an online verifier knows which key/version produced
+	// it. It is NOT trusted for verification: the verifier fetches/loads the
+	// OPERATOR-SUPPLIED trusted key, never the key this field names, so a
+	// store adversary rewriting it cannot redirect trust. Empty for
+	// hmac-kek / ed25519.
+	KeyRef string `json:"key_ref,omitempty"`
 
 	// Sequence is this manifest's monotonic position in the lineage's
 	// flat manifest order (the full is 0). Signed (it is in the canonical
