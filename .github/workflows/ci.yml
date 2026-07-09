@@ -601,7 +601,10 @@ jobs:
       # package list; this guard fails CI when a package containing
       # integration-tagged tests is missing from it (the mechanism
       # that let the pgtrigger engine sit outside every shard for
-      # two weeks).
+      # two weeks). Its matching mirrors the matrix's recursion
+      # semantics exactly (audit N-17b): `./internal/pipeline/` is
+      # non-recursive, so an integration test in a pipeline
+      # SUBPACKAGE fails the guard until the shard lists it.
       - name: check integration shard coverage
         run: bash scripts/check-shard-coverage.sh
 
@@ -609,10 +612,15 @@ jobs:
       # job: build-tag additivity means a tagged test can compile
       # vet-clean yet never RUN when its name escapes the job's `-run`
       # regex or its package sits outside the job's path list. This
-      # guard fails CI on any escapee across the vstream, postgis,
-      # chaos, and reshard axes (the postgis-only predecessor caught
-      # the 11 tests hidden through v0.99.53; the generalization caught
-      # four more escapees on the vstream/chaos axes, 2026-07-03).
+      # guard fails CI on any escapee across every filtered axis
+      # (the postgis-only predecessor caught the 11 tests hidden
+      # through v0.99.53; the generalization caught four more escapees
+      # on the vstream/chaos axes, 2026-07-03). It also auto-discovers
+      # the tag-axis set from the tree (audit N-17a) — a brand-new
+      # build tag with no workflow leg and no documented exemption
+      # fails here — and cross-checks each manifest regex verbatim
+      # against its workflow file so the hand-copied mirror can't
+      # drift one-sided.
       - name: check -run filter coverage
         run: bash scripts/check-run-filter-coverage.sh
 

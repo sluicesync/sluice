@@ -36,13 +36,10 @@
 #                      the SCHEDULED default filter — dispatch may
 #                      override it per-run)
 #   - ddlfixture     → extended-suites.yml `ddlfixture` (dispatch-only)
+#   - kmsverify      → extended-suites.yml `kmsverify` (localstack KMS)
 #
-# Tags deliberately WITHOUT an axis here: `psverify` (cron off per
-# operator), `kmsverify` (skip-scaffolding), `jsonbench`/`compressbench`
-# (local/on-demand, no `-run` filter to escape). The ci.yml
-# pipeline integration shards need no axis either: their -run/-skip
-# regexes are a complete partition (the -skip shard catches every name
-# the other two don't), so no name can escape.
+# The leg label's FIRST word must be the workflow filename: the
+# manifest-drift cross-check below greps that file for the regex.
 MANIFEST='
 vstream;TestVStream_;internal/engines/mysql/...;ci.yml integration-vstream
 vstream;^(TestMigrate_VStream|TestStreamer_.*VStream|TestSpikeShapeA_);internal/pipeline;extended-suites.yml vstream-pipeline
@@ -51,10 +48,125 @@ chaos;^TestVitessChaos_;internal/engines/mysql/...;extended-suites.yml chaos
 vitessreshard;^TestVitessReshard_;internal/engines/mysql/...;extended-suites.yml reshard
 vitesscluster!chaos;TestVitessCluster;internal/engines/mysql/...;vitess-version-matrix.yml cluster (weekly default)
 ddlfixture;^TestDDLFixture;internal/translate/...;extended-suites.yml ddlfixture
+kmsverify;^TestBackup_KMSEncryption_;internal/pipeline;extended-suites.yml kmsverify
 '
+
+# Tags deliberately WITHOUT a manifest axis. Each entry needs a
+# rationale here — an undocumented tag fails the axis auto-discovery
+# below (audit N-17a: before that check, a brand-new `integration &&
+# newtag` suite type-checked via vet-tags, passed shard coverage, and
+# ran in NO workflow with zero guard firing — the pre-Bug-125
+# "compiles but never runs" class one level up).
+#   - psverify      → real-PlanetScale verification; its cron is OFF
+#                     per operator decision (paid service), run manually.
+#   - jsonbench     → local/on-demand serializer benchmark harness; no
+#                     workflow, no `-run` filter to escape.
+#   - compressbench → same, compression-algorithm harness.
+# `integration` itself is structurally exempt (hardcoded below, not
+# listed here): its packages are guarded by check-shard-coverage.sh and
+# the ci.yml pipeline shards' -run/-skip regexes are a complete
+# partition (the -skip shard catches every name the other two don't),
+# so no bare-integration test can escape by name.
+EXEMPT_TAGS='psverify jsonbench compressbench'
 
 set -eu
 cd "$(dirname "$0")/.."
+
+# ---- axis auto-discovery (audit N-17a) -------------------------------
+# Derive the set of build tags actually carried by *_test.go files, the
+# same way vet-tags.sh discovers combos: grep the //go:build lines,
+# strip GOOS/GOARCH/toolchain terms (selected by the toolchain, not
+# -tags), split conjunctions/disjunctions into bare tags. Every
+# discovered tag must be a MANIFEST axis or a documented exemption —
+# otherwise a new tagged suite exists that no workflow runs and no
+# guard watches.
+#
+# `git ls-files | xargs grep` rather than `git grep`: see the MSYS
+# argument-mangling note in scripts/vet-tags.sh.
+discovered_tags=$(git ls-files -- '*_test.go' | xargs grep -h '^//go:build ' | awk '
+	BEGIN {
+		split("aix android darwin dragonfly freebsd hurd illumos ios js linux nacl netbsd openbsd plan9 solaris wasip1 wasm windows zos 386 amd64 arm arm64 loong64 mips mips64 mips64le mipsle ppc64 ppc64le riscv64 s390x cgo gc gccgo unix boringcrypto", gl, " ")
+		for (i in gl) goos[gl[i]] = 1
+	}
+	{
+		sub(/^\/\/go:build /, "")
+		gsub(/&&|\|\||[()]/, " ")
+		n = split($0, terms, /[[:space:]]+/)
+		for (i = 1; i <= n; i++) {
+			t = terms[i]
+			sub(/^!/, "", t)
+			if (t == "" || t in goos) continue
+			print t
+		}
+	}' | sort -u)
+
+# Guard against vacuous success (this repo always has tagged test
+# files, so empty discovery means discovery broke).
+if [ -z "$discovered_tags" ]; then
+	echo "::error::check-run-filter-coverage: tag auto-discovery returned no build tags from *_test.go files — discovery is broken, refusing to pass vacuously."
+	exit 1
+fi
+
+axis_tags=$(printf '%s\n' "$MANIFEST" | sed '/^$/d' | cut -d';' -f1 | sed 's/!.*//' | sort -u)
+
+status=0
+
+for t in $discovered_tags; do
+	[ "$t" = "integration" ] && continue # structurally exempt, see EXEMPT_TAGS note
+	known=0
+	for a in $axis_tags; do
+		[ "$t" = "$a" ] && known=1
+	done
+	for e in $EXEMPT_TAGS; do
+		[ "$t" = "$e" ] && known=1
+	done
+	if [ "$known" -eq 0 ]; then
+		echo "::error::new build-tag axis '$t' discovered in *_test.go files but no workflow runs it and no guard watches it — either add a workflow leg with a -run filter AND a MANIFEST entry in scripts/check-run-filter-coverage.sh, or document the tag in EXEMPT_TAGS (with a rationale in the header)"
+		status=1
+	fi
+done
+
+# Symmetric staleness: an EXEMPT_TAGS entry whose tag no longer appears
+# in any test file is residue from a suite removal/rename — drop it so
+# the exemption list can't accumulate dead grants.
+for e in $EXEMPT_TAGS; do
+	found=0
+	for t in $discovered_tags; do
+		[ "$t" = "$e" ] && found=1
+	done
+	if [ "$found" -eq 0 ]; then
+		echo "::error::EXEMPT_TAGS entry '$e' matches no build tag in any *_test.go file — the suite was removed or renamed; drop the stale exemption from scripts/check-run-filter-coverage.sh"
+		status=1
+	fi
+done
+
+# ---- manifest ↔ workflow drift cross-check (audit N-17a) -------------
+# The MANIFEST is a hand-copied mirror of each workflow's -run filter;
+# guards that validate hand-copied mirrors rot when only one side gets
+# edited. Cheap tripwire: each manifest regex must still appear VERBATIM
+# (fixed-string) in the workflow file its leg label names. This catches
+# the common drift (someone edits the workflow filter and forgets the
+# manifest — the stale manifest regex disappears from the file), though
+# not the pathological case where the old regex survives in a comment;
+# full YAML parsing isn't worth the dependency in a POSIX-sh guard.
+while IFS=';' read -r mtag mpattern mscopes mlabel; do
+	[ -n "$mtag" ] || continue
+	wf=${mlabel%% *}
+	wfpath=".github/workflows/$wf"
+	if [ ! -f "$wfpath" ]; then
+		echo "::error::MANIFEST leg '$mlabel' (axis $mtag) names workflow $wf but $wfpath does not exist — fix the label or restore the workflow"
+		status=1
+		continue
+	fi
+	if ! grep -qF -- "$mpattern" "$wfpath"; then
+		echo "::error::MANIFEST regex '$mpattern' (axis $mtag) does not appear verbatim in $wfpath — the workflow's -run filter drifted from the manifest (or vice versa); update them TOGETHER"
+		status=1
+	fi
+done <<EOF
+$MANIFEST
+EOF
+
+# ---- per-axis escapee check ------------------------------------------
 
 # leg_for_dir TAG DIR — print "pattern;label" for the first manifest leg
 # of TAG whose package scope contains DIR; return 1 if none does.
@@ -87,8 +199,6 @@ $MANIFEST
 EOF
 	return 1
 }
-
-status=0
 
 for axis in $(printf '%s\n' "$MANIFEST" | sed '/^$/d' | cut -d';' -f1 | sort -u); do
 	tag=${axis%%!*}
@@ -156,6 +266,6 @@ for axis in $(printf '%s\n' "$MANIFEST" | sed '/^$/d' | cut -d';' -f1 | sort -u)
 done
 
 if [ "$status" -eq 0 ]; then
-	echo "check-run-filter-coverage: every filtered-axis test is name-matched by its job's -run filter and in a covered package."
+	echo "check-run-filter-coverage: every filtered-axis test is name-matched by its job's -run filter, every package covered, every discovered tag axis known, and no manifest/workflow drift."
 fi
 exit $status

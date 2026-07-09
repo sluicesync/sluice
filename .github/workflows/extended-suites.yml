@@ -25,12 +25,14 @@
 # compiles in the per-PR pipeline-migrate shard, but SKIPs there because
 # the dumps are gitignored — this leg fetches them and is where they run.
 #
-# Deliberately NOT here: the `kmsverify` suite
-# (internal/pipeline/backup_kms_localstack_integration_test.go) is
-# scaffolding — every test body t.Skip()s pending localstack + AWS
-# config wiring. Scheduling it would run five skips and report green
-# while testing nothing (the vacuous-pass failure mode). Wire the
-# scaffolding first, then add a localstack job here.
+# The `kmsverify` leg (audit N-17c) runs the AWS-KMS backup/restore
+# suite against a real localstack KMS container. It sat here as a
+# documented deliberate skip while every test body was t.Skip()
+# scaffolding (scheduling it would have run five skips and reported
+# green — the vacuous-pass failure mode); the scaffolding is now
+# wired (round-trip, chain extension, wrong-key + missing-key
+# refusals run for real; only the IAM access-denied case remains a
+# skip, since localstack community edition doesn't enforce IAM).
 
 name: Extended suites
 
@@ -44,7 +46,7 @@ on:
         required: false
         default: "all"
         type: choice
-        options: [all, chaos, reshard, vstream-pipeline, corpus, ddlfixture]
+        options: [all, chaos, reshard, vstream-pipeline, corpus, ddlfixture, kmsverify]
 
 permissions:
   contents: read
@@ -249,6 +251,55 @@ jobs:
         run: |
           go test -tags=integration -race -count=1 -timeout=40m \
             -run '^TestMigrate_Corpus_' -v ./internal/pipeline/
+
+  # The AWS-KMS envelope-encryption suite (audit N-17c):
+  # backup/restore against a real localstack KMS container + real PG —
+  # round-trip (ciphertext chunks, manifest KEK metadata, restore via a
+  # fresh kms.Decrypt), chain extension (full + incremental under the
+  # same key), and the wrong-key / missing-key loud refusals. Weekly +
+  # dispatch: the KMS path only otherwise has unit pins against a
+  # stubbed SDK (internal/crypto/aws_kms_test.go), so this is the one
+  # place a real Encrypt/Decrypt wire round-trip runs.
+  #
+  # Any kmsverify-tagged test MUST carry the TestBackup_KMSEncryption_
+  # prefix or the -run filter below silently skips it (enforced by
+  # scripts/check-run-filter-coverage.sh in ci.yml's Lint job; keep
+  # that script's manifest in sync with this filter).
+  kmsverify:
+    name: KMS localstack suite
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'kmsverify' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TESTCONTAINERS_RYUK_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Log in to ghcr.io + pre-pull the PG image (bounded retry)
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/ci-ghcr-pull.sh ghcr.io/sluicesync/sluice-postgres:16-prebaked
+
+      # localstack has no GHCR mirror (yet); pull docker.io directly
+      # with a small bounded retry so a transient registry blip doesn't
+      # red the leg. Keep the tag in sync with localstackImage in
+      # internal/pipeline/backup_kms_localstack_integration_test.go.
+      - name: Pre-pull localstack (bounded retry)
+        run: |
+          for i in 1 2 3; do
+            docker pull localstack/localstack:4.0 && break
+            echo "pull attempt $i failed; retrying in $((i * 10))s"
+            sleep $((i * 10))
+          done
+
+      - name: Run the KMS localstack suite
+        run: |
+          go test -tags='integration kmsverify' -race -count=1 -timeout=25m \
+            -run '^TestBackup_KMSEncryption_' -v ./internal/pipeline/
 
   # The DDL-fixture harness (internal/translate/ddl_fixture_test.go):
   # sweep the Dolt sqllogictest createtable1 corpus (~4,575 CREATE
