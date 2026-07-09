@@ -70,7 +70,11 @@ type targetStreamLister func(ctx context.Context, driver, dsn, controlKeyspace s
 // keyspaces are queried separately, since their control tables (and thus
 // their stream rows) live in different keyspaces. An applier open / list
 // failure for one target is reported to out and skipped, so one unreachable
-// target doesn't blank the rest of the fleet view.
+// target doesn't blank the rest of the fleet view — but when EVERY
+// target errored, the roll-up returns an error (non-zero exit): an
+// all-dead fleet view rendering an empty-but-successful table would
+// read as "no streams" to a script checking $?, which is exactly the
+// wrong signal.
 func collectFleetStreams(ctx context.Context, fleet *SyncFleetConfig, out io.Writer, list targetStreamLister) ([]ir.StreamStatus, error) {
 	type targetRef struct {
 		driver          string
@@ -79,6 +83,7 @@ func collectFleetStreams(ctx context.Context, fleet *SyncFleetConfig, out io.Wri
 	}
 	seen := make(map[targetRef]bool)
 	var merged []ir.StreamStatus
+	unreachable := 0
 
 	for i := range fleet.Syncs {
 		spec := &fleet.Syncs[i]
@@ -93,9 +98,17 @@ func collectFleetStreams(ctx context.Context, fleet *SyncFleetConfig, out io.Wri
 			// Failure-isolated: report and keep going.
 			fmt.Fprintf(out, "status --all: target %s://%s unreachable: %v\n",
 				ref.driver, dsnEndpoint(ref.dsn), err)
+			unreachable++
 			continue
 		}
 		merged = append(merged, streams...)
+	}
+	if unreachable > 0 && unreachable == len(seen) {
+		// A plain error: the generic exit 1 (the taxonomy's 2 is
+		// config-load, 3 is coded refusals; total unreachability is a
+		// runtime failure). The per-target lines above already name
+		// each endpoint and cause.
+		return nil, fmt.Errorf("status --all: all %d configured target(s) unreachable", unreachable)
 	}
 	return merged, nil
 }

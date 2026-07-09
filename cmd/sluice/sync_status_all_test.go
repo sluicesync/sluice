@@ -101,3 +101,37 @@ func TestCollectFleetStreams_FailureIsolated(t *testing.T) {
 		t.Errorf("expected an inline unreachable report, got %q", out.String())
 	}
 }
+
+// TestCollectFleetStreams_AllUnreachableIsError pins the boundary of
+// the failure-isolation discipline: PARTIAL unreachability keeps exit
+// 0 with per-target lines (the test above), but when EVERY configured
+// target errored the roll-up must return an error — an all-dead fleet
+// rendering an empty-but-successful table would tell a script "no
+// streams" when the truth is "no visibility". The error is a plain
+// (uncoded) one: kong's generic exit 1.
+func TestCollectFleetStreams_AllUnreachableIsError(t *testing.T) {
+	fleet := &SyncFleetConfig{Syncs: []SyncSpec{
+		{StreamID: "a", TargetDriver: "mysql", Target: "mysql://down1/db"},
+		{StreamID: "b", TargetDriver: "postgres", Target: "postgres://down2/db"},
+	}}
+
+	list := func(_ context.Context, _, _, _ string) ([]ir.StreamStatus, error) {
+		return nil, errors.New("connection refused")
+	}
+
+	var out strings.Builder
+	streams, err := collectFleetStreams(context.Background(), fleet, &out, list)
+	if err == nil {
+		t.Fatalf("want an error when every target is unreachable; got nil with %d streams", len(streams))
+	}
+	if !strings.Contains(err.Error(), "all 2 configured target(s) unreachable") {
+		t.Errorf("error should count the dead targets; got %q", err.Error())
+	}
+	if got := exitCodeLikeKong(err); got != 1 {
+		t.Errorf("exit code = %d; want the generic 1", got)
+	}
+	// The per-target diagnosis lines still precede the terminal error.
+	if got := strings.Count(out.String(), "unreachable:"); got != 2 {
+		t.Errorf("want 2 per-target unreachable lines, got %d:\n%s", got, out.String())
+	}
+}
