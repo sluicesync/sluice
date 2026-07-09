@@ -45,10 +45,45 @@ func signatureVerifier(env crypto.EnvelopeEncryption) (s *lineage.Signer, ok boo
 	return lineage.NewSigner(env)
 }
 
+// manifestSigPresent reports whether the detached `.sig` object for
+// manifestPath exists in store.
+func manifestSigPresent(ctx context.Context, store irbackup.Store, manifestPath string) (bool, error) {
+	return store.Exists(ctx, lineage.ManifestSigPath(manifestPath))
+}
+
+// chainHasSignatureArtifacts reports whether ANY ADR-0154 signature
+// object is present across the lineage — the lineage.json.sig or any
+// per-manifest `.sig`. This is the ROBUST signedness signal: it is
+// derived from the PRESENCE of signature files, NEVER from the
+// MAC-covered `FormatVersion` field. So a v6→v5 FormatVersion downgrade
+// with the signatures left in place still forces verification (and then
+// fails the MAC, because format_version is inside the signed canonical
+// bytes). Only stripping the version stamp AND every signature object
+// evades this — the honestly-documented external-anchor residual
+// (ADR-0154 option b, out of Phase 1), which --require-signature closes.
+func chainHasSignatureArtifacts(ctx context.Context, rootStore irbackup.Store, links []lineage.SegmentRecord) (bool, error) {
+	if ok, err := lineage.ChainIsSigned(ctx, rootStore); err != nil {
+		return false, err
+	} else if ok {
+		return true, nil
+	}
+	for i := range links {
+		ok, err := manifestSigPresent(ctx, links[i].Segment.Store(rootStore), links[i].Path)
+		if err != nil {
+			return false, err
+		}
+		if ok {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // verifyManifestSignaturePolicy applies the ADR-0154 §4 policy to a
 // SINGLE manifest at chain position seq, read from segStore at
-// manifestPath. Pre-v6 manifests are a no-op. requireStrict turns an
-// unverifiable v6 signature (no key) from a WARN into a refusal.
+// manifestPath. Verification is forced by the PRESENCE of a signature
+// object (never by the tamperable FormatVersion) or by requireStrict; a
+// genuinely unsigned backup with no signature files is a no-op.
 func verifyManifestSignaturePolicy(
 	ctx context.Context,
 	segStore irbackup.Store,
@@ -58,8 +93,16 @@ func verifyManifestSignaturePolicy(
 	env crypto.EnvelopeEncryption,
 	requireStrict bool,
 ) error {
-	if !irbackup.IsSignedFormat(manifest) {
-		return nil // predates signing
+	sigPresent, err := manifestSigPresent(ctx, segStore, manifestPath)
+	if err != nil {
+		return err
+	}
+	lineageSigPresent, err := lineage.ChainIsSigned(ctx, segStore)
+	if err != nil {
+		return err
+	}
+	if !requireStrict && !sigPresent && !lineageSigPresent {
+		return nil // genuinely unsigned (or fully-stripped residual — option b)
 	}
 	signer, ok, err := signatureVerifier(env)
 	if err != nil {
@@ -79,11 +122,13 @@ func verifyManifestSignaturePolicy(
 }
 
 // verifyChainSignatures verifies every link's signature at its walked
-// position, then the lineage catalog's signed enumeration. A no-op for a
-// pre-v6 (unsigned) chain. The chain is "signed" if ANY link asserts the
-// signed format — a mixed signed/unsigned chain is itself a tamper
-// signal, so an unsigned link inside a signed chain fails the
-// per-link check (missing signature).
+// position, then the lineage catalog's signed enumeration. Verification
+// is forced by the PRESENCE of signature objects (never the FormatVersion
+// field — see [chainHasSignatureArtifacts]) or by requireStrict; a
+// genuinely unsigned chain with no signature files is a no-op. Any link
+// whose signature is absent inside a signed chain fails the per-link
+// check (missing signature) — a mixed/partial-strip chain is a tamper
+// signal.
 func verifyChainSignatures(
 	ctx context.Context,
 	rootStore irbackup.Store,
@@ -91,14 +136,11 @@ func verifyChainSignatures(
 	env crypto.EnvelopeEncryption,
 	requireStrict bool,
 ) error {
-	signed := false
-	for i := range links {
-		if irbackup.IsSignedFormat(links[i].Manifest) {
-			signed = true
-			break
-		}
+	hasArtifacts, err := chainHasSignatureArtifacts(ctx, rootStore, links)
+	if err != nil {
+		return fmt.Errorf("chain restore: probe signature artifacts: %w", err)
 	}
-	if !signed {
+	if !requireStrict && !hasArtifacts {
 		return nil
 	}
 	signer, ok, err := signatureVerifier(env)
@@ -137,15 +179,15 @@ func verifyChainSignatures(
 // an unverifiable signed chain (no key) is a failure only under strict.
 // Reports rather than aborts so a run surfaces EVERY bad artifact.
 func verifyBackupSignatures(ctx context.Context, store irbackup.Store, records []lineage.SegmentRecord, opts VerifyOptions) int {
-	anySigned := false
-	for i := range records {
-		if irbackup.IsSignedFormat(records[i].Manifest) {
-			anySigned = true
-			break
-		}
+	// Signedness is decided by the PRESENCE of signature objects, never
+	// the tamperable FormatVersion field.
+	hasArtifacts, err := chainHasSignatureArtifacts(ctx, store, records)
+	if err != nil {
+		slog.ErrorContext(ctx, "backup verify: cannot probe signature artifacts", slog.String("error", err.Error()))
+		return 1
 	}
-	if !anySigned {
-		slog.InfoContext(ctx, "backup verify: chain is unsigned (pre-ADR-0154); no signatures to check")
+	if !opts.RequireSignature && !hasArtifacts {
+		slog.InfoContext(ctx, "backup verify: chain is unsigned (pre-ADR-0154 / no signature objects); no signatures to check")
 		return 0
 	}
 	signer, ok, err := signatureVerifier(opts.Envelope)
@@ -164,12 +206,6 @@ func verifyBackupSignatures(ctx context.Context, store irbackup.Store, records [
 	failed := 0
 	for i := range records {
 		rec := &records[i]
-		if !irbackup.IsSignedFormat(rec.Manifest) {
-			slog.WarnContext(ctx, "backup verify: signature unsigned (unexpected in a signed chain)",
-				slog.String("manifest", rec.Path))
-			failed++
-			continue
-		}
 		segStore := rec.Segment.Store(store)
 		if err := lineage.VerifyManifest(ctx, segStore, rec.Path, rec.Manifest, i, signer); err != nil {
 			failed++

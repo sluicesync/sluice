@@ -148,6 +148,18 @@ func TestBackup_SignedManifest_DR_RoundTripAndTamper(t *testing.T) {
 		storePut(t, store, fullSigPath, origFullSig)
 		storePut(t, store, incrSigPath, origIncrSig)
 		storePut(t, store, incrPath, incrManifestBytes)
+		storePut(t, store, lineage.ManifestFileName, fullManifestBytes)
+	}
+	// downgradeFormatVersion rewrites a manifest's format_version in place
+	// (keeping its signature), simulating the v6->v5 downgrade attack.
+	downgradeFormatVersion := func(path string, orig []byte) {
+		var m irbackup.Manifest
+		if err := json.Unmarshal(orig, &m); err != nil {
+			t.Fatal(err)
+		}
+		m.FormatVersion = irbackup.FormatVersionEncryptedChunkBinding // 6 -> 5
+		nb, _ := json.Marshal(&m)
+		storePut(t, store, path, nb)
 	}
 
 	tamperCases := []struct {
@@ -178,6 +190,19 @@ func TestBackup_SignedManifest_DR_RoundTripAndTamper(t *testing.T) {
 			apply:    func() { _ = store.Delete(context.Background(), incrSigPath) },
 			undo:     func() {},
 			wantCode: sluicecode.CodeBackupSignatureMissing,
+		},
+		{
+			// CRITICAL: a v6->v5 FormatVersion downgrade (with the .sig
+			// files left intact) must NOT let the verifier skip checks —
+			// format_version is inside the signed bytes, so verification is
+			// forced by the signature's PRESENCE and then fails the MAC.
+			name: "format-version downgrade (v6->v5) with sigs intact",
+			apply: func() {
+				downgradeFormatVersion(lineage.ManifestFileName, fullManifestBytes)
+				downgradeFormatVersion(incrPath, incrManifestBytes)
+			},
+			undo:     func() {},
+			wantCode: sluicecode.CodeBackupSignatureInvalid,
 		},
 		{
 			name: "truncated change-list tail",

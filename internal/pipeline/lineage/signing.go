@@ -29,7 +29,6 @@ import (
 	"strings"
 
 	"sluicesync.dev/sluice/internal/crypto"
-	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
@@ -37,7 +36,7 @@ import (
 // LineageCatalogCanonVersion versions the lineage-catalog canonical
 // serialization the `lineage.json.sig` signature covers. Same on-disk
 // contract discipline as [irbackup.ManifestCanonVersion].
-const LineageCatalogCanonVersion = "sluice-lineage-canon/v1"
+const LineageCatalogCanonVersion = "sluice-lineage-canon/v2"
 
 // LineageSigFileName is the detached signature object for lineage.json.
 const LineageSigFileName = LineageCatalogFileName + irbackup.SignatureFileSuffix
@@ -92,8 +91,11 @@ func ManifestSigPath(manifestPath string) string {
 }
 
 // SignManifest builds the detached signature for m at chain position seq.
-func (s *Signer) SignManifest(m *irbackup.Manifest, seq int) *irbackup.ManifestSignature {
-	payload := irbackup.CanonicalManifestBytes(m, seq)
+func (s *Signer) SignManifest(m *irbackup.Manifest, seq int) (*irbackup.ManifestSignature, error) {
+	payload, err := irbackup.CanonicalManifestBytes(m, seq)
+	if err != nil {
+		return nil, err
+	}
 	mac := crypto.SignManifestHMAC(s.Key, payload)
 	return &irbackup.ManifestSignature{
 		CanonVersion: irbackup.ManifestCanonVersion,
@@ -102,13 +104,16 @@ func (s *Signer) SignManifest(m *irbackup.Manifest, seq int) *irbackup.ManifestS
 		Sequence:     seq,
 		ChunkCount:   irbackup.ManifestChunkCount(m),
 		MAC:          hex.EncodeToString(mac),
-	}
+	}, nil
 }
 
 // WriteManifestSig signs m at seq and writes the detached signature next
 // to manifestPath.
 func WriteManifestSig(ctx context.Context, store irbackup.Store, manifestPath string, m *irbackup.Manifest, seq int, s *Signer) error {
-	sig := s.SignManifest(m, seq)
+	sig, err := s.SignManifest(m, seq)
+	if err != nil {
+		return err
+	}
 	body, err := irbackup.MarshalManifestSignature(sig)
 	if err != nil {
 		return err
@@ -178,7 +183,10 @@ func VerifyManifest(ctx context.Context, store irbackup.Store, manifestPath stri
 	if err != nil {
 		return fmt.Errorf("manifest %q: decode signature mac: %w: %w", manifestPath, err, ErrSignatureInvalid)
 	}
-	payload := irbackup.CanonicalManifestBytes(m, seq)
+	payload, err := irbackup.CanonicalManifestBytes(m, seq)
+	if err != nil {
+		return fmt.Errorf("manifest %q: recompute canonical bytes: %w", manifestPath, err)
+	}
 	if !crypto.VerifyManifestHMAC(s.Key, payload, mac) {
 		return fmt.Errorf("manifest %q (key_id recorded %q, verifying %q): %w",
 			manifestPath, sig.KeyID, s.KeyID, ErrSignatureInvalid)
@@ -195,26 +203,43 @@ func VerifyManifest(ctx context.Context, store irbackup.Store, manifestPath stri
 // sorting is needed (nor wanted — order is part of the structure).
 func CanonicalCatalogBytes(cat *Catalog) []byte {
 	var b strings.Builder
-	b.WriteString(LineageCatalogCanonVersion)
-	b.WriteByte('\n')
-	b.WriteString("format_version=" + strconv.Itoa(cat.FormatVersion) + "\n")
-	b.WriteString("source_engine=" + cat.SourceEngine + "\n")
-	b.WriteString("restorable_from_segment=" + strconv.Itoa(cat.RestorableFromSegment) + "\n")
-	b.WriteString("segment_count=" + strconv.Itoa(len(cat.Segments)) + "\n")
+	lpTok(&b, LineageCatalogCanonVersion)
+	lpTok(&b, "format_version")
+	lpTok(&b, strconv.Itoa(cat.FormatVersion))
+	lpTok(&b, "source_engine")
+	lpTok(&b, cat.SourceEngine)
+	lpTok(&b, "restorable_from_segment")
+	lpTok(&b, strconv.Itoa(cat.RestorableFromSegment))
+	lpTok(&b, "segment_count")
+	lpTok(&b, strconv.Itoa(len(cat.Segments)))
 	for i := range cat.Segments {
 		seg := &cat.Segments[i]
-		b.WriteString("segment=" + strconv.Itoa(i) + "\n")
-		b.WriteString("  id=" + seg.SegmentID + "\n")
-		b.WriteString("  dir=" + seg.Dir + "\n")
-		b.WriteString("  full=" + seg.FullManifestPath + "\n")
-		b.WriteString("  start=" + posToken(seg.StartPosition) + "\n")
-		b.WriteString("  end=" + posToken(seg.EndPosition) + "\n")
-		b.WriteString("  incremental_count=" + strconv.Itoa(len(seg.Incrementals)) + "\n")
+		lpTok(&b, "segment")
+		lpTok(&b, strconv.Itoa(i))
+		lpTok(&b, seg.SegmentID)
+		lpTok(&b, seg.Dir)
+		lpTok(&b, seg.FullManifestPath)
+		lpTok(&b, seg.StartPosition.Engine)
+		lpTok(&b, seg.StartPosition.Token)
+		lpTok(&b, seg.EndPosition.Engine)
+		lpTok(&b, seg.EndPosition.Token)
+		lpTok(&b, strconv.Itoa(len(seg.Incrementals)))
 		for j, ip := range seg.Incrementals {
-			b.WriteString("  incremental=" + strconv.Itoa(j) + ":" + ip + "\n")
+			lpTok(&b, strconv.Itoa(j))
+			lpTok(&b, ip)
 		}
 	}
 	return []byte(b.String())
+}
+
+// lpTok appends one length-prefixed token (`<len>:<bytes>\n`) — the same
+// injective framing as [irbackup] uses, so no path/token byte can forge a
+// structural boundary.
+func lpTok(b *strings.Builder, s string) {
+	b.WriteString(strconv.Itoa(len(s)))
+	b.WriteByte(':')
+	b.WriteString(s)
+	b.WriteByte('\n')
 }
 
 // SignLineage builds the detached signature for the lineage catalog. It
@@ -374,5 +399,3 @@ func totalManifestCount(cat *Catalog) int {
 	}
 	return n
 }
-
-func posToken(p ir.Position) string { return p.Engine + "|" + p.Token }

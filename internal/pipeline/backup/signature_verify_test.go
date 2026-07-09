@@ -163,6 +163,49 @@ func TestVerifyChainSignatures_TamperMatrix(t *testing.T) {
 	}
 }
 
+// TestVerifyChainSignatures_FormatVersionDowngrade is the CRITICAL pin:
+// signedness must NOT be decided from the MAC-covered FormatVersion. An
+// adversary flips every manifest's v6->v5 (the chunk-binding gate is
+// >=5, so v5 and v6 decrypt identically) to make a naive verifier skip
+// all checks. With the .sig files intact the verifier must still verify
+// — and refuse, because format_version is inside the signed bytes.
+func TestVerifyChainSignatures_FormatVersionDowngrade(t *testing.T) {
+	store, env, links := buildSignedChain(t)
+	for i := range links {
+		links[i].Manifest.FormatVersion = irbackup.FormatVersionEncryptedChunkBinding // v6 -> v5
+	}
+	err := verifyChainSignatures(context.Background(), store, links, env, false)
+	if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeBackupSignatureInvalid {
+		t.Fatalf("v6->v5 downgrade with sigs present: got %v, want SIGNATURE-INVALID (verification must not trust FormatVersion)", err)
+	}
+}
+
+// TestVerifyChainSignatures_DowngradeAndStripRequiresStrict pins the
+// residual boundary: stripping BOTH the version stamp AND every signature
+// object evades verification by default (the honestly-documented external
+// -anchor residual, ADR-0154 option b) — but --require-signature closes
+// it (the operator asserts the chain should be signed).
+func TestVerifyChainSignatures_DowngradeAndStripRequiresStrict(t *testing.T) {
+	ctx := context.Background()
+	store, env, links := buildSignedChain(t)
+	// Downgrade + strip every signature object.
+	for i := range links {
+		links[i].Manifest.FormatVersion = irbackup.FormatVersionEncryptedChunkBinding
+		_ = store.Delete(ctx, lineage.ManifestSigPath(links[i].Path))
+	}
+	_ = store.Delete(ctx, lineage.LineageSigFileName)
+
+	// Default policy: no artifacts, not strict → documented residual (no-op).
+	if err := verifyChainSignatures(ctx, store, links, env, false); err != nil {
+		t.Fatalf("fully-stripped chain, default policy: got %v, want nil (documented option-b residual)", err)
+	}
+	// Strict: the operator asserts it should be signed → refuse.
+	err := verifyChainSignatures(ctx, store, links, env, true)
+	if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeBackupSignatureMissing {
+		t.Fatalf("fully-stripped chain, --require-signature: got %v, want SIGNATURE-MISSING", err)
+	}
+}
+
 // TestVerifyChainSignatures_WrongKey pins that a re-keyed chain refuses.
 func TestVerifyChainSignatures_WrongKey(t *testing.T) {
 	store, _, links := buildSignedChain(t)

@@ -29,14 +29,26 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 const (
 	// ManifestCanonVersion versions the canonical serialization the
 	// signature covers. Bumped only on an incompatible change to
-	// [CanonicalManifestBytes]; it is the first line of the canonical
+	// [CanonicalManifestBytes]; it is the first field of the canonical
 	// payload, so a verifier keyed on an old scheme fails closed.
-	ManifestCanonVersion = "sluice-manifest-canon/v1"
+	//
+	// v2 (this build): the encoding is now length-prefixed (provably
+	// INJECTIVE — distinct field tuples can never render to identical
+	// bytes, closing the raw-concatenation forgery where an embedded
+	// newline / delimiter in a source-derived table name or chunk path
+	// let two distinct manifests collide), and it additionally folds
+	// [Manifest.SchemaDelta] (restore drives DDL from it),
+	// [Manifest.SchemaHistory] (replayed into the schema-history table),
+	// and [Manifest.StartPosition]/[Manifest.EndPosition] (resume anchors)
+	// under the signature.
+	ManifestCanonVersion = "sluice-manifest-canon/v2"
 
 	// SignatureSchemeHMACKEK is the Phase 1 scheme tag recorded in the
 	// detached signature: HMAC-SHA-256 keyed off a key HKDF-derived from
@@ -106,30 +118,40 @@ func ManifestChunkCount(m *Manifest) int {
 // manifest's security-relevant fields that the ADR-0154 signature
 // covers: format version, identity (created_at / source_engine / kind /
 // backup_id), the lineage parent pointer, the schema fingerprint, the
-// chain-encryption descriptor, the table→row-count mapping, the full
-// chunk list (row chunks by path; change chunks by ordinal, because
-// change-replay order is semantic — the ADR-0152 rationale), and the
-// freshness anchors (sequence + chunk count).
+// resume anchors (start/end position), the chain-encryption descriptor,
+// the table→row-count mapping, the full chunk list (row chunks by path;
+// change chunks by ordinal, because change-replay order is semantic — the
+// ADR-0152 rationale), the schema deltas (restore drives DDL from them)
+// and schema-history entries (replayed into the schema-history table),
+// and the freshness anchors (sequence + chunk count).
 //
-// The output is line-oriented UTF-8 text with a fixed field order;
-// every collection whose order is not semantic is name-sorted. It is
+// The output is a sequence of LENGTH-PREFIXED tokens (`<len>:<bytes>\n`).
+// Length-prefixing makes the encoding provably injective: the byte stream
+// decodes to exactly one token sequence regardless of what bytes a value
+// contains (embedded `\n` / `=` / `:` / `|` in a source-derived table
+// name or chunk path can no longer forge a structural boundary), so two
+// manifests differing in ANY signed field render to DIFFERENT bytes.
+// Collections whose order is not semantic are sorted first. Returns an
+// error only if a SchemaDelta table cannot be fingerprinted. It is
 // ON-DISK CONTRACT (golden-pinned) — see the package doc.
-func CanonicalManifestBytes(m *Manifest, seq int) []byte {
+func CanonicalManifestBytes(m *Manifest, seq int) ([]byte, error) {
 	var b strings.Builder
-	b.WriteString(ManifestCanonVersion)
-	b.WriteByte('\n')
-	writeLine(&b, "format_version", strconv.Itoa(m.FormatVersion))
-	writeLine(&b, "source_engine", m.SourceEngine)
-	writeLine(&b, "created_at", m.CreatedAt.UTC().Format(time.RFC3339Nano))
-	writeLine(&b, "kind", canonicalKind(m.Kind))
-	writeLine(&b, "backup_id", m.BackupID)
-	writeLine(&b, "parent_backup_id", m.ParentBackupID)
-	writeLine(&b, "schema_hash", m.SchemaHash)
-	writeLine(&b, "sequence", strconv.Itoa(seq))
-	writeLine(&b, "chunk_count", strconv.Itoa(ManifestChunkCount(m)))
-	writeLine(&b, "chain_encryption", canonicalChainEncryption(m.ChainEncryption))
+	tok(&b, ManifestCanonVersion)
+	field(&b, "format_version", strconv.Itoa(m.FormatVersion))
+	field(&b, "source_engine", m.SourceEngine)
+	field(&b, "created_at", m.CreatedAt.UTC().Format(time.RFC3339Nano))
+	field(&b, "kind", canonicalKind(m.Kind))
+	field(&b, "backup_id", m.BackupID)
+	field(&b, "parent_backup_id", m.ParentBackupID)
+	field(&b, "schema_hash", m.SchemaHash)
+	field(&b, "sequence", strconv.Itoa(seq))
+	field(&b, "chunk_count", strconv.Itoa(ManifestChunkCount(m)))
+	canonPosition(&b, "start_position", m.StartPosition)
+	canonPosition(&b, "end_position", m.EndPosition)
+	canonChainEncryption(&b, m.ChainEncryption)
 
-	// Table → row-count mapping, sorted by (schema, name).
+	// Table → row-count mapping, sorted by (schema, name). Schema and name
+	// are SEPARATE tokens, so `(a, b.c)` and `(a.b, c)` no longer collide.
 	tbls := make([]*TableManifest, 0, len(m.Tables))
 	tbls = append(tbls, m.Tables...)
 	sort.SliceStable(tbls, func(i, j int) bool {
@@ -142,7 +164,10 @@ func CanonicalManifestBytes(m *Manifest, seq int) []byte {
 		if t == nil {
 			continue
 		}
-		writeLine(&b, "table:"+t.Schema+"."+t.Name, strconv.FormatInt(t.RowCount, 10))
+		tok(&b, "table")
+		tok(&b, t.Schema)
+		tok(&b, t.Name)
+		tok(&b, strconv.FormatInt(t.RowCount, 10))
 	}
 
 	// Row chunks across every table, sorted by file. A table's rows are a
@@ -160,56 +185,137 @@ func CanonicalManifestBytes(m *Manifest, seq int) []byte {
 		if c == nil {
 			continue
 		}
-		writeLine(&b, "rowchunk:"+c.File, c.SHA256+":"+strconv.FormatInt(c.RowCount, 10))
+		tok(&b, "rowchunk")
+		tok(&b, c.File)
+		tok(&b, c.SHA256)
+		tok(&b, strconv.FormatInt(c.RowCount, 10))
 	}
 
-	// Change chunks in list order, ordinal-prefixed: change-replay order
-	// IS semantic (ADR-0152), so a reorder must change the canonical bytes.
+	// Change chunks in list order, ordinal-tokened: change-replay order IS
+	// semantic (ADR-0152), so a reorder must change the canonical bytes.
 	for i, c := range m.ChangeChunks {
 		if c == nil {
 			continue
 		}
-		writeLine(&b, "changechunk:"+strconv.Itoa(i)+":"+c.File, c.SHA256+":"+strconv.FormatInt(c.RowCount, 10))
+		tok(&b, "changechunk")
+		tok(&b, strconv.Itoa(i))
+		tok(&b, c.File)
+		tok(&b, c.SHA256)
+		tok(&b, strconv.FormatInt(c.RowCount, 10))
 	}
-	return []byte(b.String())
+
+	// Schema deltas in OBSERVATION order (semantic — restore replays them
+	// in slice order and drives DDL from them). The before/after table
+	// shapes are folded as their round-trip-stable fingerprint
+	// ([ComputeSchemaHash] of a single-table schema — the same
+	// canonicalization the manifest's own schema_hash uses, so a legit
+	// manifest's decoded-then-re-fingerprinted delta matches the signer's).
+	for i, d := range m.SchemaDelta {
+		if d == nil {
+			continue
+		}
+		beforeFP, err := deltaTableFingerprint(d.Before)
+		if err != nil {
+			return nil, fmt.Errorf("backup: canonical: schema delta %d before: %w", i, err)
+		}
+		afterFP, err := deltaTableFingerprint(d.After)
+		if err != nil {
+			return nil, fmt.Errorf("backup: canonical: schema delta %d after: %w", i, err)
+		}
+		tok(&b, "schemadelta")
+		tok(&b, strconv.Itoa(i))
+		tok(&b, d.Kind)
+		tok(&b, d.Schema)
+		tok(&b, d.Table)
+		tok(&b, beforeFP)
+		tok(&b, afterFP)
+	}
+
+	// Schema history in emission order. TableJSON is the already-marshalled
+	// bytes recorded in the manifest (byte-identical across a JSON
+	// round-trip via base64), so it is folded verbatim.
+	for i, h := range m.SchemaHistory {
+		if h == nil {
+			continue
+		}
+		tok(&b, "schemahistory")
+		tok(&b, strconv.Itoa(i))
+		tok(&b, h.StreamID)
+		tok(&b, h.Schema)
+		tok(&b, h.Table)
+		tok(&b, h.AnchorPosition.Engine)
+		tok(&b, h.AnchorPosition.Token)
+		tok(&b, string(h.TableJSON))
+	}
+	return []byte(b.String()), nil
 }
 
-// canonicalChainEncryption renders the chain-encryption descriptor
-// deterministically (or "none" for a plaintext chain). The Argon2id KDF
-// params are included because a tampered KDF param is a pre-auth bomb
-// (ADR-0152 N-7) and belongs under the signature.
-func canonicalChainEncryption(enc *ChainEncryption) string {
+// deltaTableFingerprint returns the round-trip-stable fingerprint of a
+// SchemaDelta before/after table (empty for a nil table), reusing the
+// schema-hash canonicalization so a decoded-from-manifest table
+// fingerprints identically to the reader-fresh one the signer saw.
+func deltaTableFingerprint(t *ir.Table) (string, error) {
+	if t == nil {
+		return "", nil
+	}
+	return ComputeSchemaHash(&ir.Schema{Tables: []*ir.Table{t}})
+}
+
+// canonChainEncryption folds the chain-encryption descriptor as a series
+// of length-prefixed tokens (or a single "none" token for a plaintext
+// chain). Every sub-field is its own token — a `|`/`=` in an operator- or
+// KMS-supplied kek_ref cannot forge a boundary. The Argon2id KDF params
+// are included because a tampered KDF param is a pre-auth bomb (ADR-0152
+// N-7) and belongs under the signature.
+func canonChainEncryption(b *strings.Builder, enc *ChainEncryption) {
 	if enc == nil {
-		return "none"
+		tok(b, "chain_encryption")
+		tok(b, "none")
+		return
 	}
-	parts := []string{
-		"algorithm=" + enc.Algorithm,
-		"mode=" + enc.Mode,
-		"kek_mode=" + enc.KEKMode,
-		"kek_ref=" + enc.KEKRef,
-		"wrapped_cek=" + hex.EncodeToString(enc.WrappedCEK),
+	tok(b, "chain_encryption")
+	tok(b, enc.Algorithm)
+	tok(b, enc.Mode)
+	tok(b, enc.KEKMode)
+	tok(b, enc.KEKRef)
+	tok(b, hex.EncodeToString(enc.WrappedCEK))
+	if enc.Argon2id == nil {
+		tok(b, "argon2id_none")
+		return
 	}
-	if enc.Argon2id != nil {
-		a := enc.Argon2id
-		parts = append(
-			parts,
-			"argon2id_salt="+hex.EncodeToString(a.Salt),
-			"argon2id_memory="+strconv.FormatUint(uint64(a.Memory), 10),
-			"argon2id_iterations="+strconv.FormatUint(uint64(a.Iterations), 10),
-			"argon2id_parallelism="+strconv.FormatUint(uint64(a.Parallelism), 10),
-			"argon2id_keylen="+strconv.FormatUint(uint64(a.KeyLen), 10),
-		)
-	}
-	return strings.Join(parts, "|")
+	a := enc.Argon2id
+	tok(b, "argon2id")
+	tok(b, hex.EncodeToString(a.Salt))
+	tok(b, strconv.FormatUint(uint64(a.Memory), 10))
+	tok(b, strconv.FormatUint(uint64(a.Iterations), 10))
+	tok(b, strconv.FormatUint(uint64(a.Parallelism), 10))
+	tok(b, strconv.FormatUint(uint64(a.KeyLen), 10))
 }
 
-// writeLine appends `key=value\n`. `=` and `\n` never appear in a key
-// (keys are fixed literals or table/chunk identifiers, which the store's
-// path sanitisation already constrains), so the framing is unambiguous.
-func writeLine(b *strings.Builder, key, value string) {
-	b.WriteString(key)
-	b.WriteByte('=')
-	b.WriteString(value)
+// canonPosition folds an engine-tagged position as label + engine + token
+// tokens (each length-prefixed, so no delimiter in the opaque token can
+// forge a boundary).
+func canonPosition(b *strings.Builder, label string, p ir.Position) {
+	tok(b, label)
+	tok(b, p.Engine)
+	tok(b, p.Token)
+}
+
+// field writes a fixed field name + its value as two length-prefixed
+// tokens.
+func field(b *strings.Builder, name, value string) {
+	tok(b, name)
+	tok(b, value)
+}
+
+// tok appends one length-prefixed token: the decimal byte length, a ':'
+// separator, the raw bytes, and a '\n'. The length prefix is what makes
+// the encoding injective — a decoder reads exactly len bytes, so no
+// embedded byte (`\n`, `=`, `:`, `|`, …) can be misread as structure.
+func tok(b *strings.Builder, s string) {
+	b.WriteString(strconv.Itoa(len(s)))
+	b.WriteByte(':')
+	b.WriteString(s)
 	b.WriteByte('\n')
 }
 
