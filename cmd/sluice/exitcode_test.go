@@ -54,6 +54,17 @@ func TestExitCodeTaxonomy(t *testing.T) {
 	}{
 		{"nil is success", nil, sluicecode.ExitSuccess},
 		{"plain error is generic failure", errors.New("boom"), sluicecode.ExitFailure},
+		{
+			// The operator declining the destructive-confirm prompt is a
+			// deliberate uncoded sentinel: non-zero (the run did not
+			// complete) but the generic 1, not the refusal 3 — "refused"
+			// names sluice as the decliner, and this decline was the
+			// operator's. The --format json envelope renders it as
+			// status "aborted" (envelope_test.go).
+			"declined destructive confirm exits 1",
+			errConfirmDeclined,
+			sluicecode.ExitFailure,
+		},
 		{"runtime-class coded error keeps 1", runtimeCoded, sluicecode.ExitFailure},
 		{"refusal-class coded error exits 3", refusal, sluicecode.ExitRefusal},
 		{"refusal survives further wrapping", fmt.Errorf("sync: %w", refusal), sluicecode.ExitRefusal},

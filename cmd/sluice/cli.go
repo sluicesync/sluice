@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -209,7 +210,7 @@ type MigrateCmd struct {
 
 	DryRun bool `help:"Read the source schema and print the migration plan without applying changes." short:"n"`
 
-	Format string `help:"Output format: 'text' (default) or 'json' (machine-readable: ONE result envelope on stdout at command end — status completed/refused/failed, per-table stats, next steps — or, with --dry-run, the migration plan as a JSON object instead of the text plan; the slog progress stream stays on stderr in both modes)." default:"text" enum:"text,json" placeholder:"FORMAT"`
+	Format string `help:"Output format: 'text' (default) or 'json' (machine-readable: ONE result envelope on stdout at command end — status completed/aborted/refused/failed, per-table stats, next steps — or, with --dry-run, the migration plan as a JSON object instead of the text plan; the slog progress stream stays on stderr in both modes)." default:"text" enum:"text,json" placeholder:"FORMAT"`
 
 	Resume      bool   `help:"Resume a previously-failed migration. State is read from sluice_migrate_state on the target." short:"r"`
 	MigrationID string `help:"Stable migration identifier; key in sluice_migrate_state. Auto-generated from source/target host info when empty." placeholder:"ID"`
@@ -383,14 +384,13 @@ func (m *MigrateCmd) run(g *Globals, env *envelopeRun) error {
 	}
 
 	if m.ResetTargetData && !m.Yes {
-		ok, err := confirmTypedDestructive(os.Stdin, os.Stdout,
+		ok, err := confirmTypedDestructive(kongContext(), os.Stdin, destructivePromptWriter(env),
 			"This will DROP tables on the target. Type 'reset' to confirm: ", "reset")
 		if err != nil {
 			return err
 		}
 		if !ok {
-			fmt.Fprintln(os.Stdout, "aborted")
-			return nil
+			return errConfirmDeclined
 		}
 	}
 
@@ -817,14 +817,15 @@ func (s *SyncFromBackupCmd) Run(_ *Globals) error {
 	}
 
 	if s.ResetTargetData && !s.Yes {
-		ok, err := confirmTypedDestructive(os.Stdin, os.Stdout,
+		// No --format envelope on this command, so the prompt stays on
+		// stdout (text mode's traditional stream).
+		ok, err := confirmTypedDestructive(ctx, os.Stdin, os.Stdout,
 			"This will DROP tables on the target. Type 'reset' to confirm: ", "reset")
 		if err != nil {
 			return err
 		}
 		if !ok {
-			fmt.Fprintln(os.Stdout, "aborted")
-			return nil
+			return errConfirmDeclined
 		}
 	}
 
@@ -945,7 +946,7 @@ type SyncStartCmd struct {
 	StreamID string `help:"Stream identifier; the key under which position is persisted on the target. Auto-generated from source/target host info when empty." placeholder:"ID"`
 	SlotName string `help:"Replication-slot name suffix for engines that have a slot concept (Postgres). Default 'sluice_slot'. Sluice prepends 'sluice_' if the supplied name doesn't already start with it (so '--slot-name shard_a' creates 'sluice_shard_a'); the convention lets operators find every sluice slot with 'pg_replication_slots WHERE slot_name LIKE sluice\\_%'. Set per-instance to run multiple concurrent sluice instances against the same source — without distinct slot names they collide on the default. Engines without slots (MySQL: binlog stream is the slot) silently ignore this flag." placeholder:"NAME"`
 	DryRun   bool   `short:"n" help:"Print what would happen — cold-start vs warm-resume, source schema summary or persisted position — without modifying the target or starting the stream."`
-	Format   string `help:"Output format: 'text' (default) or 'json' (machine-readable: ONE result envelope on stdout when the stream exits — status completed/refused/failed — or, with --dry-run, the stream plan as a JSON object instead of the text plan; the slog stream stays on stderr in both modes)." default:"text" enum:"text,json" placeholder:"FORMAT"`
+	Format   string `help:"Output format: 'text' (default) or 'json' (machine-readable: ONE result envelope on stdout when the stream exits — status completed/aborted/refused/failed — or, with --dry-run, the stream plan as a JSON object instead of the text plan; the slog stream stays on stderr in both modes)." default:"text" enum:"text,json" placeholder:"FORMAT"`
 
 	ForceColdStart bool `help:"Skip the cold-start pre-flight check that refuses to bulk-copy into a populated target. Use with caution — INSERT into a non-empty table will collide on PRIMARY KEY. Ignored on the warm-resume path."`
 
@@ -1555,14 +1556,13 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 	}
 
 	if s.ResetTargetData && !s.Yes {
-		ok, err := confirmTypedDestructive(os.Stdin, os.Stdout,
+		ok, err := confirmTypedDestructive(kongContext(), os.Stdin, destructivePromptWriter(env),
 			"This will DROP tables on the target. Type 'reset' to confirm: ", "reset")
 		if err != nil {
 			return err
 		}
 		if !ok {
-			fmt.Fprintln(os.Stdout, "aborted")
-			return nil
+			return errConfirmDeclined
 		}
 	}
 
@@ -2164,6 +2164,7 @@ func truncatePositionToken(token string, maxLen int) string {
 // SIGTERM; the underlying pipeline goroutines unwind and the
 // command exits with the cancellation propagated up.
 func kongContext() context.Context {
+	armForceExit()
 	ctx, _ := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	// We deliberately don't capture the cancel func: the signal
 	// notifier itself triggers cancellation, and we want the
@@ -2172,4 +2173,42 @@ func kongContext() context.Context {
 	// context-leak the linter flags here is intentional; see the
 	// nolint directive.
 	return ctx //nolint:contextcheck // ctx is scoped to the process lifetime
+}
+
+// forceExitCode is the conventional shell exit status for a process
+// killed by SIGINT (128 + 2). The second-signal escape hatch exits
+// with it regardless of which signal arrived second — the hatch
+// exists for the Ctrl-C-Ctrl-C human, and one honest code beats a
+// per-signal map.
+const forceExitCode = 130
+
+// forceExitOnce keeps the escape-hatch watcher a singleton even
+// though kongContext is called from many command sites (sometimes
+// several times per run).
+var forceExitOnce sync.Once
+
+// armForceExit installs the second-signal escape hatch alongside the
+// graceful signal.NotifyContext path: the FIRST SIGINT/SIGTERM
+// cancels the context (graceful drain — the pipeline unwinds and
+// persists positions), and a SECOND one exits the process
+// immediately. Without it, an operator whose first Ctrl-C landed
+// somewhere that ignores cancellation (a blocking prompt read, a
+// wedged driver call) had no in-band way to leave.
+func armForceExit() {
+	forceExitOnce.Do(func() {
+		sigs := make(chan os.Signal, 2)
+		signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+		go forceExitAfterSecondSignal(sigs, os.Exit)
+	})
+}
+
+// forceExitAfterSecondSignal consumes signals from sigs and calls
+// exit(forceExitCode) on the second one. The first is left to the
+// NotifyContext machinery (every registered channel gets its own
+// copy of a delivered signal). Split from armForceExit so the
+// counting shape is unit-testable without delivering real signals.
+func forceExitAfterSecondSignal(sigs <-chan os.Signal, exit func(int)) {
+	<-sigs
+	<-sigs
+	exit(forceExitCode)
 }

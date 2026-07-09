@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -67,7 +68,7 @@ func TestConfirmTypedDestructiveAccepts(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			out := &bytes.Buffer{}
 			in := strings.NewReader(c.input)
-			got, err := confirmTypedDestructive(in, out, "Type 'reset' to confirm: ", c.expected)
+			got, err := confirmTypedDestructive(context.Background(), in, out, "Type 'reset' to confirm: ", c.expected)
 			if err != nil {
 				t.Fatalf("confirmTypedDestructive: %v", err)
 			}

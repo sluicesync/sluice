@@ -155,22 +155,58 @@ func confirmDestructive(in io.Reader, out io.Writer, prompt string) (bool, error
 	return answer == "y" || answer == "yes", nil
 }
 
+// errConfirmDeclined is the typed-confirmation abort sentinel: the
+// operator answered a destructive-action prompt with anything other
+// than the expected token. It is a non-nil error on purpose — an
+// aborted run must exit non-zero (the taxonomy's generic 1: no data
+// work was attempted, but the command did NOT complete) and, under
+// --format json, render status "aborted" rather than "completed"
+// (see envelope.go). exitcode_test.go pins the exit code.
+var errConfirmDeclined = errors.New("aborted: destructive-action confirmation declined (type the confirmation token to proceed, or pass --yes)")
+
 // confirmTypedDestructive prompts the operator and accepts only an
 // exact match (after trim) against the supplied expected token. The
 // match is case-sensitive on the token: muscle-memory enter or "y"
 // will not pass. Used by `--reset-target-data` (ADR-0023), which sits
 // at a higher friction tier than `slot drop` because it destroys
 // target data.
-func confirmTypedDestructive(in io.Reader, out io.Writer, prompt, expected string) (bool, error) {
-	fmt.Fprint(out, prompt)
-	scanner := bufio.NewScanner(in)
-	if !scanner.Scan() {
-		if err := scanner.Err(); err != nil {
-			return false, fmt.Errorf("read confirmation: %w", err)
-		}
-		return false, nil
+//
+// ctx-aware: by the time this prompt shows, the caller has usually
+// already installed the process's signal.NotifyContext (engine
+// resolution calls kongContext), so a Ctrl-C no longer kills the
+// process — it cancels ctx. Without the select below the cancellation
+// was swallowed: the blocking stdin read kept the prompt alive and
+// the operator's interrupt was silently ignored. The reader goroutine
+// deliberately leaks when ctx wins the select — it stays blocked on
+// stdin, and the command is about to return/exit anyway.
+func confirmTypedDestructive(ctx context.Context, in io.Reader, out io.Writer, prompt, expected string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
 	}
-	return strings.TrimSpace(scanner.Text()) == expected, nil
+	fmt.Fprint(out, prompt)
+	type answer struct {
+		ok  bool
+		err error
+	}
+	ch := make(chan answer, 1)
+	go func() {
+		scanner := bufio.NewScanner(in)
+		if !scanner.Scan() {
+			if err := scanner.Err(); err != nil {
+				ch <- answer{err: fmt.Errorf("read confirmation: %w", err)}
+				return
+			}
+			ch <- answer{}
+			return
+		}
+		ch <- answer{ok: strings.TrimSpace(scanner.Text()) == expected}
+	}()
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case a := <-ch:
+		return a.ok, a.err
+	}
 }
 
 // isSlotNotFoundErr returns true if err wraps a slot-not-found

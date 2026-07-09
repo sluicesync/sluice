@@ -10,12 +10,14 @@ package main
 //
 // Emission contract: in json mode exactly ONE JSON object is written to
 // stdout, as the last thing the command writes there, on every exit
-// path — completed, refused, and failed. The slog stream stays on
-// stderr untouched, and kong's fatal handler in main.go keeps printing
-// the human error line to stderr on failure — stdout carries the
-// envelope alone, so `sluice migrate --format json | jq .` always
-// parses. Text mode is byte-identical to before this layer existed
-// (finish is a pass-through).
+// path — completed, aborted, refused, and failed. The slog stream stays
+// on stderr untouched, and kong's fatal handler in main.go keeps
+// printing the human error line to stderr on failure — stdout carries
+// the envelope alone, so `sluice migrate --format json | jq .` always
+// parses. Interactive prompts (the --reset-target-data confirmation)
+// go to stderr in json mode for the same reason. Text mode is
+// byte-identical to before this layer existed (finish is a
+// pass-through).
 //
 // Status classification: "refused" covers errors returned BEFORE the
 // pipeline engaged (CLI-side flag/config validation and preflight
@@ -39,6 +41,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -52,8 +55,13 @@ import (
 )
 
 // Envelope status values. Stable strings — agents branch on them.
+// "aborted" is the operator-declined shape: the destructive-action
+// confirmation prompt was answered with anything but the expected
+// token, so sluice stopped before any data work — distinct from
+// "refused" (sluice itself declined) and "failed" (the run broke).
 const (
 	envelopeStatusCompleted = "completed"
+	envelopeStatusAborted   = "aborted"
 	envelopeStatusRefused   = "refused"
 	envelopeStatusFailed    = "failed"
 )
@@ -252,6 +260,13 @@ func (e *envelopeRun) buildResult(err error) resultEnvelope {
 		if !e.engaged {
 			env.Status = envelopeStatusRefused
 		}
+		// The operator declining the destructive confirmation is its own
+		// status: "completed" would be a lie (the fix this pins — the old
+		// nil-return rendered exactly that) and "refused" would misname
+		// who declined.
+		if errors.Is(err, errConfirmDeclined) {
+			env.Status = envelopeStatusAborted
+		}
 		env.Error = &envelopeError{Message: e.scrubText(err.Error())}
 		// A coded error lifts its stable code + remedy hint into the
 		// envelope, and a ClassRefusal reclassifies the status even
@@ -270,6 +285,18 @@ func (e *envelopeRun) buildResult(err error) resultEnvelope {
 	}
 	env.NextSteps = e.nextSteps
 	return env
+}
+
+// destructivePromptWriter returns the stream a destructive-action
+// confirmation prompt writes to: stderr in json mode — stdout must
+// carry the single result envelope and nothing else — and stdout
+// otherwise. A nil env (a command without a --format envelope) keeps
+// the traditional stdout prompt.
+func destructivePromptWriter(env *envelopeRun) io.Writer {
+	if env != nil && env.jsonMode {
+		return os.Stderr
+	}
+	return os.Stdout
 }
 
 // scrubText replaces every registered DSN in s with the

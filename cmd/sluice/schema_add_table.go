@@ -154,7 +154,7 @@ func (s *SchemaAddTableCmd) Run(g *Globals) error {
 	// operator should be deliberate. Dry-run skips the prompt — it
 	// doesn't modify anything.
 	if !s.Yes && !s.DryRun {
-		ok, err := confirmTypedDestructive(os.Stdin, os.Stdout,
+		ok, err := confirmTypedDestructive(kongContext(), os.Stdin, os.Stdout,
 			fmt.Sprintf("This will create table %q on the target, bulk-copy its rows, and extend the source publication. Type %q to confirm: ", s.Table, s.Table),
 			s.Table)
 		if err != nil {

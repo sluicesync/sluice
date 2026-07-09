@@ -125,6 +125,33 @@ func TestEnvelope_RefusedVsFailedClassification(t *testing.T) {
 	}
 }
 
+// TestEnvelope_AbortedStatus pins the operator-declined shape: the
+// destructive-confirm sentinel renders status "aborted" — never the
+// pre-fix "completed" (the nil-return bug) and never "refused" (that
+// names sluice as the decliner) — while still carrying the error
+// message and suppressing next_steps.
+func TestEnvelope_AbortedStatus(t *testing.T) {
+	e := newEnvelopeRun("migrate", "json")
+	buf := captureEnvelope(e)
+	e.setNextSteps("sluice verify ...")
+
+	runErr := fmt.Errorf("sync start: %w", errConfirmDeclined)
+	if got := e.finish(runErr); !errors.Is(got, runErr) {
+		t.Fatalf("finish must return the run error unchanged; got %v", got)
+	}
+	doc := decodeEnvelope(t, buf)
+	if doc["status"] != "aborted" {
+		t.Fatalf("status: got %v, want aborted", doc["status"])
+	}
+	errObj := doc["error"].(map[string]any)
+	if msg, _ := errObj["message"].(string); !strings.Contains(msg, "confirmation declined") {
+		t.Fatalf("error.message: got %v", errObj["message"])
+	}
+	if _, ok := doc["next_steps"]; ok {
+		t.Fatalf("next_steps must be omitted on aborted: %v", doc["next_steps"])
+	}
+}
+
 // TestEnvelope_CodedRefusalReclassifiesAfterEngage pins the
 // sluicecode merge point: a ClassRefusal CodedError surfacing AFTER
 // markEngaged still reports status "refused" (consistent with its
