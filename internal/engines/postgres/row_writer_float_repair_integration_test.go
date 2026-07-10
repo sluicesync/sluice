@@ -70,6 +70,10 @@ func TestRowWriter_UpdateFloatColumnsByPK_Batched(t *testing.T) {
 		Columns: []*ir.Column{
 			{Name: "id", Type: ir.Integer{Width: 64}},
 			{Name: "fl", Type: ir.Float{Precision: ir.FloatSingle}, Nullable: true},
+			// A FLOAT source mapped to a DOUBLE PRECISION target — pins the
+			// `::DOUBLE PRECISION` first-row VALUES cast (the SET-family the
+			// per-row path also covered but this suite had left declared-unused).
+			{Name: "dbl", Type: ir.Float{Precision: ir.FloatDouble}, Nullable: true},
 		},
 		PrimaryKey: &ir.Index{Name: "frepair_pkey", Columns: []ir.IndexColumn{{Column: "id"}}},
 	}
@@ -86,7 +90,7 @@ func TestRowWriter_UpdateFloatColumnsByPK_Batched(t *testing.T) {
 
 	rows := make(chan ir.Row, len(vals))
 	for i, v := range vals {
-		rows <- ir.Row{"id": int64(i + 1), "fl": v}
+		rows <- ir.Row{"id": int64(i + 1), "fl": v, "dbl": v}
 	}
 	close(rows)
 	if err := fw.UpdateFloatColumnsByPK(ctx, table, []string{"id"}, rows); err != nil {
@@ -94,27 +98,33 @@ func TestRowWriter_UpdateFloatColumnsByPK_Batched(t *testing.T) {
 	}
 
 	for i, want := range vals {
-		var got sql.NullFloat64
-		if err := db.QueryRowContext(ctx, "SELECT fl FROM frepair WHERE id = $1", int64(i+1)).Scan(&got); err != nil {
+		var fl, dbl sql.NullFloat64
+		if err := db.QueryRowContext(ctx, "SELECT fl, dbl FROM frepair WHERE id = $1", int64(i+1)).Scan(&fl, &dbl); err != nil {
 			t.Fatalf("read row %d: %v", i+1, err)
 		}
 		if want == nil {
-			if got.Valid {
-				t.Errorf("row %d: NULL leg landed non-NULL %v", i+1, got.Float64)
+			if fl.Valid || dbl.Valid {
+				t.Errorf("row %d: NULL leg landed non-NULL fl=%v dbl=%v", i+1, fl, dbl)
 			}
 			continue
 		}
 		wf := want.(float64)
-		if !got.Valid {
+		if !fl.Valid || !dbl.Valid {
 			t.Errorf("row %d: got NULL; want %v", i+1, wf)
 			continue
 		}
-		if math.Float32bits(float32(got.Float64)) != math.Float32bits(float32(wf)) {
+		if math.Float32bits(float32(fl.Float64)) != math.Float32bits(float32(wf)) {
 			t.Errorf("row %d: REAL repair not float32-exact: got %v (bits %x), want %v (bits %x)",
-				i+1, got.Float64, math.Float32bits(float32(got.Float64)), wf, math.Float32bits(float32(wf)))
+				i+1, fl.Float64, math.Float32bits(float32(fl.Float64)), wf, math.Float32bits(float32(wf)))
 		}
-		if wf == 0 && math.Signbit(wf) && !math.Signbit(got.Float64) {
-			t.Errorf("row %d: repair lost the −0.0 sign: got %v", i+1, got.Float64)
+		// DOUBLE PRECISION stores the float64 exactly — the ::DOUBLE PRECISION
+		// cast must not perturb it.
+		if math.Float64bits(dbl.Float64) != math.Float64bits(wf) {
+			t.Errorf("row %d: DOUBLE repair not float64-exact: got %v (bits %x), want %v (bits %x)",
+				i+1, dbl.Float64, math.Float64bits(dbl.Float64), wf, math.Float64bits(wf))
+		}
+		if wf == 0 && math.Signbit(wf) && (!math.Signbit(fl.Float64) || !math.Signbit(dbl.Float64)) {
+			t.Errorf("row %d: repair lost the −0.0 sign: fl=%v dbl=%v", i+1, fl.Float64, dbl.Float64)
 		}
 	}
 
