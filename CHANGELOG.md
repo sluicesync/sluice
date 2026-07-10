@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.217] - 2026-07-10
+
+### Changed
+
+- **The VStream-COPY exact-FLOAT repair now applies its corrections in batched `UPDATE`-against-`VALUES`-join statements instead of one `UPDATE` per row, cutting the network round-trips ~500× — a repair that took hours-to-days on a WAN PlanetScale target now takes minutes (audit finding PERF-P1; performance only, no value change).** When a PlanetScale/Vitess cold-start COPY lands single-precision FLOAT columns display-rounded, sluice re-reads them exactly and corrects the target rows. That correction previously issued one `UPDATE … SET floats WHERE pk` per row — one round-trip each, so at a ~100 ms WAN RTT a 5M-row FLOAT table needed ~5–6 days of repair before CDC could begin, which pushed operators to disable the fix (`--no-float-exact-reread`) and re-inherit the rounding. The repair now batches 500 rows into a single statement — Postgres `UPDATE … FROM (VALUES …) v WHERE tgt.pk = v.pk`, MySQL `UPDATE … JOIN (SELECT … UNION ALL …) v ON …` — collapsing the round-trips from O(rows) to O(rows/500) (a benchmark shows 50,000 rows going from 50,000 statements to 100), and drops the per-batch `BEGIN`/`COMMIT` in favor of one atomic autocommit statement per batch. **The repaired values are byte-identical to before**: the batched path reuses the exact same value-shaping, a row deleted between copy and re-read is a clean join-miss no-op (never an insert), and the correctness was verified byte-for-byte against real Postgres 16 and MySQL 8 across the full REAL / DOUBLE / NUMERIC × single/composite-PK × NULL / −0.0 matrix. Internally the two ~95%-identical MySQL and Postgres repair writers are now one shared skeleton (audit finding ARCH-F3), so the batching landed in both engines at once.
+
 ## [0.99.216] - 2026-07-10
 
 ### Fixed
