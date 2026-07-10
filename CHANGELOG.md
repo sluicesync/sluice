@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.220] - 2026-07-10
+
+### Changed
+
+- **A tampered or corrupt chunk in an encrypted-but-unsigned backup now fails restore with the coded `SLUICE-E-BACKUP-CHUNK-AUTH-FAILED` refusal (exit 3) instead of a bare exit-1 crypto error — the machine-readable twin of the signed path's `SLUICE-E-BACKUP-SIGNATURE-INVALID`.** An unsigned encrypted backup has no manifest signature, so a swapped/spliced/reordered or bit-rotted chunk is caught at *decrypt* by the AES-GCM AAD binding (the ADR-0152 chunk-position binding plus the v0.99.214/v0.99.219 SEC-F1/SEC-1 parent-table binding) rather than at verify time. That refusal was already loud and fail-closed — no wrong data was ever restored — but it surfaced as an uncoded exit-1 (`crypto: aes-gcm open: cipher: message authentication failed …`), while the equivalent tamper on a *signed* backup gives the coded exit-3 Refusal. The two are now unified: any encrypted chunk that fails its authenticated-decryption check on restore, chain-replay, or broker apply exits with the coded `SLUICE-E-BACKUP-CHUNK-AUTH-FAILED` (a Refusal-class exit 3), so a driving agent gets the same stable, machine-readable signal whether or not the chain was signed. The coding does not conflate tamper with a wrong key: by the time a chunk decrypts, the chain key has already unwrapped (its wrap is itself authenticated), so an auth failure here is always tamper/corruption — a wrong passphrase is caught earlier at the key unwrap and keeps its own error. Non-authentication failures (a SHA-256 mismatch, an I/O error, a too-short ciphertext) are unchanged. Surfaced by the v0.99.219 post-release regression cycle, which observed the unsigned chunk-swap refusing correctly but with an uncoded exit; pinned at the crypto sentinel, the mapping helper, and end-to-end through the real restore path. New registered error code + `docs/operator/error-codes.md` row.
+
 ## [0.99.219] - 2026-07-10
 
 ### Security
