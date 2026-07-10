@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.215] - 2026-07-09
+
+### Fixed
+
+- **`backup verify` no longer panics on a tampered or bit-rotted manifest carrying a null structural element — it now refuses with the coded `SLUICE-E-BACKUP-SIGNATURE-INVALID` (Bug 182; completes the v0.99.214 M0.4 hardening; loud either way, zero data-loss).** v0.99.214's M0.4 guard taught the signature-canonicalization pass to skip a null `*TableManifest` / row-chunk, but a SECOND verify traversal — the chunk-rehash loop in `VerifyBackupWith` — ran unguarded and dereferenced a null from a `"tables":[null]` or `chunks:[null]` manifest, crashing `backup verify` with exit 2 and a Go stack trace instead of the coded refusal (on a signed chain, even after correctly logging the signature as INVALID). Verify already failed CLOSED — it never accepted the tampered backup, and `restore` reconstructs tables from the lineage catalog and was unaffected, so there was no data-loss path — but it crashed where a coded exit is required. A structural-validation pass now rejects any manifest with a null table, row-chunk, or change-chunk up front with the coded `SLUICE-E-BACKUP-SIGNATURE-INVALID` (a Refusal-class exit 3), before any traversal can dereference it; the signer never emits nils, so this fires only on corrupt or tampered input. Found by the v0.99.214 post-release regression cycle (the M0.4 tamper case); pinned by a family-matrix unit test and a wiring test that drives the real `VerifyBackupWith` and asserts the coded refusal rather than a panic.
+
 ## [0.99.214] - 2026-07-09
 
 ### Security
