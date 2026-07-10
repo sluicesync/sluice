@@ -4,6 +4,14 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.216] - 2026-07-10
+
+### Fixed
+
+- **Continuous sync from a Postgres source on a fractional-offset server timezone (Asia/Kolkata +05:30, Asia/Kathmandu +05:45, America/St_Johns -03:30, …) no longer aborts on the first `timestamptz` change (audit finding PROM-P1).** Postgres renders a `timestamptz` zone offset as `±HH`, `±HH:MM`, or `±HH:MM:SS` depending on the session/server TimeZone, but `parsePGTimeText` (the pgoutput CDC decoder) carried only the whole-hour `±HH` layout — so under any non-whole-hour server timezone the logical-replication pump failed to decode the FIRST timestamptz value and the stream aborted, making continuous sync unusable for an entire class of mainstream server configurations. The decoder now handles all three offset widths (every form observed from a live Postgres 16, including the second-level historical LMT offset `+00:19:32`). The non-finite / pre-Gregorian values `infinity` / `-infinity` / `… BC`, which have no representable fixed-width target instant, now refuse by NAME (loud) rather than fall through to an opaque parse error (audit finding PROM-P2).
+
+- **A `postgres-trigger` (slot-less CDC) `timestamptz` applied to a MySQL target now stores the correct UTC INSTANT instead of the source session's wall clock — closing a silent per-row divergence between CDC-applied rows and bulk-copied rows under a non-UTC writer session (audit finding PROM-M1; silent data corruption, the tenet-worst class).** The trigger capture renders a `timestamptz` via `to_jsonb`, producing an ISO string that carries the source session's zone offset (e.g. `2026-02-02T07:32:02.020202+05:30`). The MySQL writer previously STRIPPED the offset, storing `07:32:02` — the Kolkata wall clock — while the bulk-copy path (which binds a pgx `time.Time`) correctly stored the UTC instant `02:02:02`: the SAME source instant landing 5h30m apart depending on which path delivered it, with no error. The writer now parses the offset to a UTC `time.Time` so the driver serializes the same instant the bulk path does; a plain `timestamp` (no offset) and a `time.Time` value (the pgoutput / bulk path) are unchanged, and `time` / `timetz` are untouched (time-of-day has no instant semantics). The MySQL write path also now refuses `infinity` / `-infinity` / `… BC` by name (stripping a `… BC` string would silently drop the era, turning 44 BC into 44 AD). Both fixes are pinned end-to-end by a new cross-engine congruence test that runs a Postgres source on `Asia/Kolkata` through BOTH CDC paths into MySQL and asserts the two targets store the identical instant — the non-UTC leg the prior congruence tests never exercised.
+
 ## [0.99.215] - 2026-07-09
 
 ### Fixed
