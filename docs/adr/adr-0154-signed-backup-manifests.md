@@ -1,6 +1,6 @@
 # ADR-0154 — Signed backup manifests (whole-manifest authentication)
 
-Status: **Accepted** (2026-07-09; decisions §3/§4/§7 ratified by the operator — build in the §6 phased order, Phase 1 first). **Phase 1 shipped (v0.99.208); Phase 2 (Ed25519) shipped (v0.99.209); Phase 3a (KMS Sign — AWS KMS ECDSA/RSA) implemented (unreleased)** — see §8 / §9 / §10.
+Status: **Accepted — fully shipped** (2026-07-09; decisions §3/§4/§7 ratified by the operator — built in the §6 phased order). **Phase 1 shipped (v0.99.208); Phase 2 (Ed25519) shipped (v0.99.209); Phase 3a (KMS Sign — AWS KMS ECDSA/RSA) shipped (v0.99.210, follow-ups v0.99.211); Phase 3b (GCP KMS + Azure Key Vault) shipped (v0.99.212); Bug 181 (GCP versioned-resource preflight ordering) fixed v0.99.213** — see §8 / §9 / §10 / Phase 3b.
 Date: 2026-07-09
 Supersedes/extends: ADR-0152 (backup-encryption integrity — chunk AAD binding, KMS EncryptionContext, chunk-header + SchemaHash verification)
 Audit origin: `workspace/repo-audit-2026-07-08-fable-crosscheck.md` finding N-8, "honest boundary" residual
@@ -155,7 +155,7 @@ The usability hazard of signing is **breaking restores of legitimately-unsigned 
 
 ---
 
-## 8. Phase 1 implementation notes — **implemented (unreleased)**
+## 8. Phase 1 implementation notes — **shipped (v0.99.208)**
 
 Phase 1 (§6 step 1 + step 4 + freshness option (c)) is implemented on `main`'s worktree, gated behind the CI `-race` Integration job (it touches the concurrent backup/restore paths) and unreleased. Shape as built:
 
@@ -176,7 +176,7 @@ Phase 1 (§6 step 1 + step 4 + freshness option (c)) is implemented on `main`'s 
 
 ---
 
-## 9. Phase 2 implementation notes — **implemented (unreleased)**
+## 9. Phase 2 implementation notes — **shipped (v0.99.209)**
 
 Phase 2 (§6 step 2, Option B "Ed25519 keypair") adds an asymmetric signing scheme ALONGSIDE Phase 1's HMAC-off-KEK, reusing Phase 1's whole canonical-serialization + verify-policy + freshness + compact/prune machinery wholesale — only the signing/verifying PRIMITIVE and the key loading are new. Shape as built:
 
@@ -204,7 +204,7 @@ Phase 2 (§6 step 2, Option B "Ed25519 keypair") adds an asymmetric signing sche
 
 ---
 
-## 10. Phase 3a implementation notes — **implemented (unreleased)**
+## 10. Phase 3a implementation notes — **shipped (v0.99.210; follow-ups v0.99.211)**
 
 Phase 3a (§6 step 3, Option C "KMS-backed signing") adds a THIRD signature scheme family — `kms` — alongside Phase 1's `hmac-kek` and Phase 2's `ed25519`, reusing the whole canonical-serialization + verify-policy + freshness + compact/prune machinery. Concrete provider in 3a: **AWS KMS** asymmetric signing (ECDSA P-256/384/521, RSA-PSS-256), ground-truthed on localstack (the `kmsverify` leg). **GCP / Azure are Phase 3b fast-follows** (their SDK Sign/GetPublicKey surfaces diverge materially — request shape, signature encoding, public-key export format — so each needs its own adapter; they will be unit-fake-pinned with real-cloud validation deferred, the N-9 pattern). Shape as built (all three ratified security decisions folded in):
 
