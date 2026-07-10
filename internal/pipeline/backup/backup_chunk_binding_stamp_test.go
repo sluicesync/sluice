@@ -87,15 +87,19 @@ func stampTestEncryption(t *testing.T) *lineage.BackupEncryption {
 }
 
 func TestSetupChainEncryption_FormatVersionStamp(t *testing.T) {
-	t.Run("fresh encrypted run stamps the binding version", func(t *testing.T) {
+	t.Run("fresh encrypted (unsigned) run stamps the table-binding version", func(t *testing.T) {
+		// SEC-1: a fresh encrypted run — even UNSIGNED — table-binds its
+		// row-chunk AAD, so it stamps the table-binding version (v7), not the
+		// old chunk-binding-only v5. GCM enforces the table AAD regardless of
+		// signature, closing the same-column chunk-swap for unsigned backups.
 		b := &Backup{Encryption: stampTestEncryption(t)}
 		m := &irbackup.Manifest{FormatVersion: irbackup.FormatVersionLegacy}
 		if _, err := b.setupChainEncryption(m, nil); err != nil {
 			t.Fatalf("setupChainEncryption: %v", err)
 		}
-		if m.FormatVersion != irbackup.FormatVersionEncryptedChunkBinding {
-			t.Errorf("FormatVersion = %d; want %d — the chunks this run writes are AAD-bound and readers gate on the stamp",
-				m.FormatVersion, irbackup.FormatVersionEncryptedChunkBinding)
+		if m.FormatVersion != irbackup.FormatVersionChunkTableBinding {
+			t.Errorf("FormatVersion = %d; want %d — a fresh encrypted run's chunks are TABLE-bound (SEC-1)",
+				m.FormatVersion, irbackup.FormatVersionChunkTableBinding)
 		}
 	})
 
@@ -147,15 +151,19 @@ func TestSetupChainEncryption_FormatVersionStamp(t *testing.T) {
 		}
 	})
 
-	t.Run("resuming a v5 encrypted run keeps the v5 stamp + bound wrap", func(t *testing.T) {
+	t.Run("resuming a fresh (v7) encrypted run keeps the v7 stamp + bound wrap", func(t *testing.T) {
 		enc := stampTestEncryption(t)
 		b := &Backup{Encryption: enc}
-		// A prior run written by THIS binary: first build it fresh so
-		// the wrap is bound to its identity.
+		// A prior run written by THIS binary: first build it fresh so the
+		// wrap is bound to its identity. Post-SEC-1, a fresh encrypted run is
+		// stamped v7 (table-bound), so resuming it keeps v7.
 		prior := &irbackup.Manifest{FormatVersion: irbackup.FormatVersionLegacy, PartialState: irbackup.BackupStateInProgress}
 		cek, err := b.setupChainEncryption(prior, nil)
 		if err != nil {
 			t.Fatalf("fresh setup: %v", err)
+		}
+		if prior.FormatVersion != irbackup.FormatVersionChunkTableBinding {
+			t.Fatalf("fresh prior FormatVersion = %d; want %d (SEC-1)", prior.FormatVersion, irbackup.FormatVersionChunkTableBinding)
 		}
 		// The resumed manifest adopts the prior identity (CreatedAt et
 		// al are zero on both here), so the bound unwrap must succeed.
@@ -164,13 +172,46 @@ func TestSetupChainEncryption_FormatVersionStamp(t *testing.T) {
 		m := &irbackup.Manifest{FormatVersion: irbackup.FormatVersionLegacy}
 		got, err := (&Backup{Encryption: enc}).setupChainEncryption(m, prior)
 		if err != nil {
-			t.Fatalf("v5 resume: %v (the bound wrap must unwrap under the prior manifest's identity)", err)
+			t.Fatalf("v7 resume: %v (the bound wrap must unwrap under the prior manifest's identity)", err)
 		}
-		if m.FormatVersion != irbackup.FormatVersionEncryptedChunkBinding {
-			t.Errorf("v5 resume FormatVersion = %d; want %d", m.FormatVersion, irbackup.FormatVersionEncryptedChunkBinding)
+		if m.FormatVersion != irbackup.FormatVersionChunkTableBinding {
+			t.Errorf("v7 resume FormatVersion = %d; want %d", m.FormatVersion, irbackup.FormatVersionChunkTableBinding)
 		}
 		if !bytes.Equal(got, cek) {
-			t.Errorf("v5 resume recovered a different chain CEK")
+			t.Errorf("v7 resume recovered a different chain CEK")
+		}
+	})
+
+	t.Run("resuming a genuine v5/v6 encrypted chain keeps its pre-table-binding stamp", func(t *testing.T) {
+		// SEC-1 backcompat: a chain written before the row-chunk TABLE-binding
+		// (v5 unsigned, v6 signed) carries row chunks whose AAD lacks the
+		// parent-table field. Resuming it must NOT jump to v7 — that would
+		// send restore down the table-bound read path against unbound chunks.
+		// Build a fresh (v7) prior, then rewind its stamp to simulate an
+		// old-binary v5 chain: the identity-bound wrap is unchanged, only the
+		// recorded FormatVersion differs.
+		for _, priorFV := range []int{irbackup.FormatVersionEncryptedChunkBinding, irbackup.FormatVersionSignedManifest} {
+			enc := stampTestEncryption(t)
+			b := &Backup{Encryption: enc}
+			prior := &irbackup.Manifest{FormatVersion: irbackup.FormatVersionLegacy, PartialState: irbackup.BackupStateInProgress}
+			cek, err := b.setupChainEncryption(prior, nil)
+			if err != nil {
+				t.Fatalf("fresh setup: %v", err)
+			}
+			prior.FormatVersion = priorFV // simulate a pre-SEC-1 chain
+
+			m := &irbackup.Manifest{FormatVersion: irbackup.FormatVersionLegacy}
+			got, err := (&Backup{Encryption: enc}).setupChainEncryption(m, prior)
+			if err != nil {
+				t.Fatalf("v%d resume: %v", priorFV, err)
+			}
+			if m.FormatVersion >= irbackup.FormatVersionChunkTableBinding {
+				t.Errorf("v%d resume FormatVersion = %d; must stay < %d — the prior chain's chunks are NOT table-bound",
+					priorFV, m.FormatVersion, irbackup.FormatVersionChunkTableBinding)
+			}
+			if !bytes.Equal(got, cek) {
+				t.Errorf("v%d resume recovered a different chain CEK", priorFV)
+			}
 		}
 	})
 }

@@ -167,3 +167,42 @@ func TestChunkAADFor_GatesOnChunkEncryption(t *testing.T) {
 		t.Error("plaintext change chunk must derive no AAD")
 	}
 }
+
+// TestChunkAADFor_TableBoundV7 pins the SEC-F1 / SEC-1 row-chunk table
+// binding: at FormatVersion 7 an encrypted row chunk's read AND write AADs
+// fold `…\nschema=…\ntable=…`, and two same-column-set tables derive DISTINCT
+// AADs — the property the cross-table chunk-swap refusal rests on. The gate
+// is purely the FormatVersion (7), orthogonal to signing: an UNSIGNED
+// encrypted backup stamped v7 (SEC-1) gets the identical table-bound AAD, so
+// a store-write adversary who swaps the chunk lists of orders_2023/orders_2024
+// fails to decrypt on an unsigned backup too.
+func TestChunkAADFor_TableBoundV7(t *testing.T) {
+	m := bindingTestManifest(FormatVersionChunkTableBinding)
+	enc := &ChunkInfo{File: "chunks/orders-0", Encryption: &ChunkEncryption{Algorithm: "AES-256-GCM"}}
+
+	// Golden: the v7 read-side AAD is the base derivation + the table suffix.
+	wantAAD := string(ChunkAAD(m, "chunks/orders-0")) + "\nschema=public\ntable=orders_2023"
+	if got := string(ChunkAADFor(m, enc, "public", "orders_2023")); got != wantAAD {
+		t.Errorf("v7 table-bound AAD:\n got %q\nwant %q\n(on-disk contract — changing it needs a new FormatVersion)", got, wantAAD)
+	}
+	// Write side derives the same bytes for an encrypted chunk.
+	if got := string(ChunkAADForWrite(m, "chunks/orders-0", "public", "orders_2023", []byte("cek"))); got != wantAAD {
+		t.Errorf("v7 write-side AAD %q != read-side %q", got, wantAAD)
+	}
+	// Distinct per parent table — the swap-refusal property. Same column set,
+	// same chunk path, different table ⇒ different AAD ⇒ GCM tag mismatch.
+	a := ChunkAADFor(m, enc, "public", "orders_2023")
+	b := ChunkAADFor(m, enc, "public", "orders_2024")
+	if bytes.Equal(a, b) {
+		t.Error("two same-column tables derived the SAME row-chunk AAD; a cross-table chunk swap would decrypt GREEN into the wrong table")
+	}
+	// Distinct per schema too (multi-tenant clones under different schemas).
+	if bytes.Equal(ChunkAADFor(m, enc, "tenant_a", "orders"), ChunkAADFor(m, enc, "tenant_b", "orders")) {
+		t.Error("same table name under two schemas derived the SAME AAD; a cross-schema chunk swap would decrypt into the wrong tenant")
+	}
+	// Below v7 the table field is absent (the v5/v6 on-disk contract).
+	v6 := bindingTestManifest(FormatVersionSignedManifest)
+	if !bytes.Equal(ChunkAADFor(v6, enc, "public", "orders_2023"), ChunkAAD(v6, "chunks/orders-0")) {
+		t.Error("a v6 encrypted chunk's AAD must NOT carry the table suffix — pre-SEC-F1 chunks were written unbound-on-table")
+	}
+}

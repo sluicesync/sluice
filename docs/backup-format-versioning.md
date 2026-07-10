@@ -42,16 +42,21 @@ Every backup chain root manifest carries a `FormatVersion` field:
   v0.99.208+, ADR-0154 Phase 1). The manifest carries a signature over
   its canonical bytes; an older binary that can't verify the signature
   refuses loudly rather than restoring an unverified signed chain.
-- **`FormatVersion=7`** — a **signed encrypted** manifest whose row
-  chunks additionally bind their **parent table** into the AES-GCM AAD
-  (`--sign` + `--encrypt`, v0.99.214+, ADR-0154 SEC-F1). This closes a
-  store-adversary chunk-reassignment attack (swapping the chunk lists of
-  two same-column-set tables); an older binary that predates the binding
-  refuses loudly rather than decrypting a row chunk against the wrong
-  (un-table-bound) AAD. Stamped only on a *fresh signed-encrypted full* —
-  a plaintext-signed backup stays on 6, an unsigned-encrypted one on 5,
-  and a resumed pre-v7 chain keeps its prior version so its already-
-  written chunks still decrypt.
+- **`FormatVersion=7`** — an **encrypted** manifest whose row chunks
+  additionally bind their **parent table** into the AES-GCM AAD
+  (`--encrypt`, v0.99.214+ signed / v0.99.219+ unsigned, ADR-0154 SEC-F1
+  extended by SEC-1). This closes a store-adversary chunk-reassignment
+  attack (swapping the chunk lists of two same-column-set tables); an
+  older binary that predates the binding refuses loudly rather than
+  decrypting a row chunk against the wrong (un-table-bound) AAD. Stamped
+  on **any fresh encrypted full — signed or not** (SEC-1: AES-GCM enforces
+  the table AAD independently of any signature, so the attack is closed
+  for an unsigned encrypted backup too; the FormatVersion never asserts a
+  signature — signedness is the `.sig` artifact's job). A *plaintext*
+  backup keeps its schema-derived version (a plaintext chunk has no
+  ciphertext to bind; a plaintext-signed backup's table binding rides in
+  the manifest signature instead), and a resumed pre-v7 chain keeps its
+  prior version so its already-written chunks still decrypt.
 
 If your backups don't use RLS, EXCLUDE constraints, or standalone
 sequences, and you don't encrypt or sign, you'll never see a version

@@ -435,8 +435,7 @@ func TestManifestChunkCount(t *testing.T) {
 	}
 }
 
-// TestManifestSignature_RoundTrip pins the detached-sig JSON round-trip
-// and IsSignedFormat gating.
+// TestManifestSignature_RoundTrip pins the detached-sig JSON round-trip.
 func TestManifestSignature_RoundTrip(t *testing.T) {
 	sig := &ManifestSignature{
 		CanonVersion: ManifestCanonVersion,
@@ -456,11 +455,5 @@ func TestManifestSignature_RoundTrip(t *testing.T) {
 	}
 	if *got != *sig {
 		t.Fatalf("round-trip mismatch: %+v != %+v", got, sig)
-	}
-	if !IsSignedFormat(&Manifest{FormatVersion: FormatVersionSignedManifest}) {
-		t.Error("v6 manifest not recognised as signed")
-	}
-	if IsSignedFormat(&Manifest{FormatVersion: FormatVersionEncryptedChunkBinding}) {
-		t.Error("v5 manifest wrongly recognised as signed")
 	}
 }

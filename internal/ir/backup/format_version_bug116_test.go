@@ -175,7 +175,7 @@ func TestBackupFormatVersion_Bumped(t *testing.T) {
 			FormatVersionSignedManifest, FormatVersionEncryptedChunkBinding)
 	}
 	if FormatVersionChunkTableBinding <= FormatVersionSignedManifest {
-		t.Errorf("FormatVersionChunkTableBinding (%d) must be strictly greater than FormatVersionSignedManifest (%d) — a table-bound row chunk decrypts against an AAD pre-v7 binaries cannot reproduce, so they must refuse it at the version gate (ADR-0154 SEC-F1), and it is a strict superset of signed so IsSignedFormat still holds",
+		t.Errorf("FormatVersionChunkTableBinding (%d) must be strictly greater than FormatVersionSignedManifest (%d) — a table-bound row chunk decrypts against an AAD pre-v7 binaries cannot reproduce, so they must refuse it at the version gate (ADR-0154 SEC-F1 / SEC-1)",
 			FormatVersionChunkTableBinding, FormatVersionSignedManifest)
 	}
 }

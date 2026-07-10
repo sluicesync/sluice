@@ -1642,27 +1642,43 @@ func (b *Backup) setupChainEncryption(manifest, prior *irbackup.Manifest) ([]byt
 	// the CEK wrap below so [irbackup.CEKBinding] gates consistently.
 	resumingPreBinding := prior != nil && prior.ChainEncryption != nil &&
 		prior.FormatVersion < irbackup.FormatVersionEncryptedChunkBinding
-	if resumingPreBinding {
-		slog.Info("backup: resuming an encrypted run written before the chunk-binding format; its format version and unbound chunk shape are kept for the whole run",
-			slog.Int("format_version", prior.FormatVersion))
-	} else {
-		manifest.FormatVersion = max(manifest.FormatVersion, irbackup.FormatVersionEncryptedChunkBinding)
-	}
-	// SEC-F1: resuming an encrypted run written before the ROW-CHUNK
-	// TABLE-binding format (v5/v6) keeps that prior version for the whole
-	// run — its already-written row chunks carry the identity+path AAD
-	// WITHOUT the parent-table field, so stamping v7 (below, for a signed
-	// run) would send restore down the table-bound AAD path against chunks
-	// written without it. Same inherit-the-chain's-shape rule as
-	// resumingPreBinding, one tier up.
+	// SEC-F1 / SEC-1: resuming an encrypted run written before the ROW-CHUNK
+	// TABLE-binding format (v5/v6) keeps that prior version for the whole run —
+	// its already-written row chunks carry the identity+path AAD WITHOUT the
+	// parent-table field, so stamping v7 would send restore down the
+	// table-bound AAD path against chunks written without it. Same
+	// inherit-the-chain's-shape rule as resumingPreBinding, one tier up.
 	resumingPreTableBinding := prior != nil && prior.ChainEncryption != nil &&
 		prior.FormatVersion < irbackup.FormatVersionChunkTableBinding
 
-	// ADR-0154: a signed backup is stamped the signed-manifest version so
-	// the read side knows a valid signature is required. Fail fast on a
-	// non-signable envelope (KMS: Phase 3) or a resumed pre-binding chain
-	// (unbound chunks can't be brought under a signature) — refusing here,
-	// before the sweep, beats writing chunks we then can't sign.
+	switch {
+	case resumingPreBinding:
+		slog.Info("backup: resuming an encrypted run written before the chunk-binding format; its format version and unbound chunk shape are kept for the whole run",
+			slog.Int("format_version", prior.FormatVersion))
+	case resumingPreTableBinding:
+		// Resumed v5/v6 encrypted chain: keep its (no-table-AAD) shape so the
+		// unbound chunks already on the store still decrypt.
+		manifest.FormatVersion = max(manifest.FormatVersion, irbackup.FormatVersionEncryptedChunkBinding)
+	default:
+		// SEC-1: a FRESH encrypted backup binds its row-chunk GCM AAD to the
+		// parent (schema, table) — FormatVersion 7 — WHETHER OR NOT it is
+		// signed. GCM enforces the AAD regardless of any signature, so a
+		// store-write adversary who swaps the chunk lists of two same-column-
+		// set tables fails to decrypt (green-tag cross-table restore) on an
+		// UNSIGNED encrypted backup too, not just a signed one. (SEC-F1
+		// originally table-bound only signed-encrypted fulls; signedness is
+		// determined from the .sig artifact, not this version, so binding the
+		// table here does not imply a signature is required.)
+		manifest.FormatVersion = max(manifest.FormatVersion, irbackup.FormatVersionChunkTableBinding)
+	}
+
+	// ADR-0154: a signed backup fails fast on a non-signable envelope (KMS:
+	// Phase 3) or a resumed pre-binding chain (unbound chunks can't be brought
+	// under a signature) — refusing here, before the sweep, beats writing
+	// chunks we then can't sign. The FormatVersion is already table-bound (v7)
+	// for a fresh encrypted run from the stamp above; a resumed pre-v7 signed
+	// run keeps the signed-manifest version (v6) so its kept chunks — written
+	// without the table field — still decrypt.
 	if b.signingRequested() {
 		if resumingPreBinding {
 			return nil, errors.New("backup: signing cannot extend a resumed pre-chunk-binding encrypted run; start a fresh signed chain with --force-overwrite")
@@ -1678,10 +1694,6 @@ func (b *Backup) setupChainEncryption(manifest, prior *irbackup.Manifest) ([]byt
 				return nil, errors.New("backup: --sign on this encrypted chain is unsupported in ADR-0154 Phase 1: HMAC signing needs a local passphrase-derived key, but a KMS-encrypted chain's KEK never leaves the HSM (KMS Sign is Phase 3). Use --sign-key (Ed25519) to sign a KMS-encrypted chain")
 			}
 		}
-		// SEC-F1: a FRESH signed encrypted full binds its row chunks to
-		// their parent table in the AAD, stamped v7. A resumed pre-v7 signed
-		// run keeps the signed-manifest version (v6) so its kept chunks —
-		// written without the table field — still decrypt.
 		signedVersion := irbackup.FormatVersionChunkTableBinding
 		if resumingPreTableBinding {
 			signedVersion = irbackup.FormatVersionSignedManifest
