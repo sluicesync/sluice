@@ -525,14 +525,6 @@ func tok(b *strings.Builder, s string) {
 	b.WriteByte('\n')
 }
 
-// IsSignedFormat reports whether m's recorded FormatVersion asserts a
-// detached signature ([FormatVersionSignedManifest]+). The read side
-// gates verification on this — a v6 manifest MUST carry a valid
-// signature; a pre-v6 manifest carries none.
-func IsSignedFormat(m *Manifest) bool {
-	return m != nil && m.FormatVersion >= FormatVersionSignedManifest
-}
-
 // MarshalManifestSignature serialises sig as indented JSON for the
 // detached `.sig` object.
 func MarshalManifestSignature(sig *ManifestSignature) ([]byte, error) {

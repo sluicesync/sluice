@@ -122,24 +122,26 @@ import (
 // carry no signature and restore normally (the version gate means
 // "predates signing", not "untrusted").
 //
-// v0.99.21x+ introduces FormatVersion=7 for SIGNED ENCRYPTED manifests
-// whose row chunks additionally bind their PARENT TABLE into the GCM AAD
-// (ADR-0154 SEC-F1). Before v7 a row chunk's AAD bound only (manifest
-// identity + chunk path), so swapping the row-chunk lists of two tables
-// with the same column set — same-schema shards, multi-tenant clones,
-// `orders_2023`/`orders_2024` — decrypted GREEN into the wrong table
-// (the signature had the same blind spot; the canon-v4 bump closes the
-// signature side, this closes the decrypt side). A v7 manifest's
-// encrypted row chunks carry `…\nfile=…\nschema=…\ntable=…`; readers
-// derive the shape from this recorded stamp. It is a strict SUPERSET of
-// v6 (signed) so [IsSignedFormat] still holds: v7 is stamped ONLY on a
-// signed ENCRYPTED full (whose row chunks are the only chunks with a
-// table-bound AAD). An unsigned encrypted backup stays on 5 and a
-// PLAINTEXT signed backup stays on 6 — a plaintext chunk has no
-// ciphertext to bind, so its parent-table binding rides in the canon-v4
-// signature alone. Proportional per the Bug-116 discipline; an older
-// binary refuses a v7 manifest loudly at the preflight rather than
-// decrypting its row chunks against the wrong (untable-bound) AAD.
+// v0.99.21x+ introduces FormatVersion=7 for ENCRYPTED manifests whose row
+// chunks additionally bind their PARENT TABLE into the GCM AAD (ADR-0154
+// SEC-F1, extended by SEC-1). Before v7 a row chunk's AAD bound only
+// (manifest identity + chunk path), so swapping the row-chunk lists of two
+// tables with the same column set — same-schema shards, multi-tenant clones,
+// `orders_2023`/`orders_2024` — decrypted GREEN into the wrong table (the
+// signature had the same blind spot; the canon-v4 bump closes the signature
+// side, this closes the decrypt side). A v7 manifest's encrypted row chunks
+// carry `…\nfile=…\nschema=…\ntable=…`; readers derive the shape from this
+// recorded stamp. SEC-1: v7 is stamped on ANY fresh encrypted full, SIGNED
+// OR NOT — GCM enforces the AAD regardless of any signature, so the
+// chunk-swap is closed for an unsigned encrypted backup too, not just a
+// signed one. (Signedness is decided by the detached `.sig` artifact's
+// presence, never by this version, so a v7 stamp does NOT assert a
+// signature.) A PLAINTEXT backup stays on its schema-derived version (a
+// plaintext chunk has no ciphertext to bind); a plaintext SIGNED backup's
+// parent-table binding rides in the canon-v4 signature alone. Proportional
+// per the Bug-116 discipline; an older binary refuses a v7 manifest loudly
+// at the preflight rather than decrypting its row chunks against the wrong
+// (untable-bound) AAD.
 const BackupFormatVersion = 7
 
 // FormatVersionLegacy / FormatVersionSecurityMetadata name the
@@ -198,18 +200,20 @@ const (
 	// [FormatVersionEncryptedChunkBinding].
 	FormatVersionSignedManifest = 6
 
-	// FormatVersionChunkTableBinding is the version stamped on a SIGNED
-	// ENCRYPTED manifest whose row chunks bind their PARENT TABLE into the
-	// GCM AAD (ADR-0154 SEC-F1). It is the read-side gate for that binding:
-	// a row chunk under a manifest at this version or above was written
-	// with `…\nfile=…\nschema=…\ntable=…` ([ChunkAADFor] /
+	// FormatVersionChunkTableBinding is the version stamped on an ENCRYPTED
+	// manifest whose row chunks bind their PARENT TABLE into the GCM AAD
+	// (ADR-0154 SEC-F1, extended by SEC-1). It is the read-side gate for that
+	// binding: a row chunk under a manifest at this version or above was
+	// written with `…\nfile=…\nschema=…\ntable=…` ([ChunkAADFor] /
 	// [ChunkAADForWrite]); below it the AAD ends at `…\nfile=…` and readers
 	// MUST NOT append the table field or the ciphertext fails to decrypt.
-	// A strict SUPERSET of [FormatVersionSignedManifest] (so [IsSignedFormat]
-	// holds), stamped only on a signed encrypted full — the one manifest
-	// shape whose row chunks are encrypted; a resumed pre-v7 encrypted run
-	// keeps its prior version so its already-written untable-bound chunks
-	// still decrypt (the Bug-179 inherit-the-chain's-shape rule).
+	// SEC-1: stamped on ANY fresh encrypted full — SIGNED OR NOT — since GCM
+	// enforces the table AAD independently of any signature; it is a numeric
+	// superset of [FormatVersionSignedManifest] but does NOT assert a
+	// signature (signedness is decided by the `.sig` artifact). A resumed
+	// pre-v7 encrypted run keeps its prior version so its already-written
+	// untable-bound chunks still decrypt (the Bug-179
+	// inherit-the-chain's-shape rule).
 	FormatVersionChunkTableBinding = 7
 )
 
