@@ -135,7 +135,7 @@ func OpenBlobStore(ctx context.Context, urlStr string, opts BlobStoreOptions) (*
 func extractBlobPrefix(urlStr string) (string, error) {
 	u, err := url.Parse(urlStr)
 	if err != nil {
-		return "", fmt.Errorf("blob store: parse URL %q for prefix: %w", urlStr, err)
+		return "", fmt.Errorf("blob store: parse URL %q for prefix: %w", redactBlobURL(urlStr), err)
 	}
 	// fileblob is the lone exception: the URL's path *is* the bucket
 	// (a local directory). gocloud treats the whole thing as the
@@ -333,7 +333,7 @@ func sanitiseBlobKey(path string) (string, error) {
 func annotateBlobURL(urlStr string, opts BlobStoreOptions) (string, error) {
 	u, err := url.Parse(urlStr)
 	if err != nil {
-		return "", fmt.Errorf("blob store: parse URL %q: %w", urlStr, err)
+		return "", fmt.Errorf("blob store: parse URL %q: %w", redactBlobURL(urlStr), err)
 	}
 	if u.Scheme == "" {
 		return "", fmt.Errorf("blob store: URL %q has no scheme (expected s3://, gs://, azblob://, or file://)", urlStr)
@@ -392,17 +392,24 @@ func isFileBlobURL(urlStr string) bool {
 	return err == nil && u.Scheme == "file"
 }
 
-// redactBlobURL strips the query string from a URL for logging. None
-// of the gocloud drivers we register accept secrets via query string
-// today (creds come from the environment), but the principle of least
-// information in log lines is cheap.
+// redactBlobURL strips the query string from a URL for logging AND for
+// error messages that echo the operator's --backup-target. None of the
+// gocloud drivers we register accept secrets via query string today
+// (creds come from the environment), but the principle of least
+// information in log lines is cheap. It is deliberately robust to an
+// UNPARSEABLE input: the callers that embed it in errors do so precisely
+// because url.Parse just failed, so falling back to url.Parse here would
+// re-fail and leak the raw string — instead strip everything from the
+// first '?' by hand so the query never reaches a log or error line.
 func redactBlobURL(s string) string {
-	u, err := url.Parse(s)
-	if err != nil {
-		return s
+	if u, err := url.Parse(s); err == nil {
+		u.RawQuery = ""
+		return u.String()
 	}
-	u.RawQuery = ""
-	return u.String()
+	if i := strings.IndexByte(s, '?'); i >= 0 {
+		return s[:i]
+	}
+	return s
 }
 
 // wrapBlobErr maps a gocloud error to an operator-actionable wrapped

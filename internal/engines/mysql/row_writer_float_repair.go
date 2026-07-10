@@ -11,6 +11,11 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
+// Compile-time pin: keep this *RowWriter satisfying ir.FloatRepairWriter so a
+// signature drift becomes a build break, not a silently-skipped repair (see
+// the postgres sibling; ARCH-F1).
+var _ ir.FloatRepairWriter = (*RowWriter)(nil)
+
 // floatRepairBatchRows bounds how many per-row UPDATEs a single target
 // transaction folds in the FLOAT re-read repair. The repair is a rare
 // corrective pass (only after a VStream cold-start COPY of a FLOAT
