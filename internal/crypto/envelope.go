@@ -421,6 +421,14 @@ func (e *PassphraseEnvelope) WrapCEKBound(cek []byte, binding string) ([]byte, e
 func (e *PassphraseEnvelope) UnwrapCEKBound(wrapped []byte, binding string) ([]byte, error) {
 	cek, err := DecryptChunkWithAAD(wrapped, e.kek, bindingAAD(binding))
 	if err != nil {
+		if errors.Is(err, ErrChunkAuthFailed) {
+			// Re-tag a GCM auth failure on the CEK WRAP as the CEK-unwrap
+			// class, WITHOUT propagating [ErrChunkAuthFailed] — a wrong KEK
+			// (passphrase) or tampered wrap must never look like a chunk-BODY
+			// auth failure to the restore chunk-auth coder (see
+			// [ErrCEKUnwrapFailed]).
+			return nil, fmt.Errorf("crypto: unwrap cek: %w (wrong passphrase/key or tampered CEK wrap)", ErrCEKUnwrapFailed)
+		}
 		return nil, fmt.Errorf("crypto: unwrap cek: %w", err)
 	}
 	if len(cek) != CEKLen {
@@ -522,6 +530,19 @@ func DecryptChunk(ciphertext, cek []byte) ([]byte, error) {
 // package carries only this sentinel; the sluice error CODE is attached
 // by the restore/verify layer that owns the code registry.
 var ErrChunkAuthFailed = errors.New("crypto: chunk failed authenticated decryption")
+
+// ErrCEKUnwrapFailed is wrapped by the CEK-unwrap paths
+// ([PassphraseEnvelope.UnwrapCEK] / [PassphraseEnvelope.UnwrapCEKBound]) when
+// the wrapped chain CEK fails to open — a wrong KEK (wrong passphrase) or a
+// tampered CEK wrap. It is DELIBERATELY DISJOINT from [ErrChunkAuthFailed]:
+// the CEK unwrap runs the same AES-GCM primitive, but its failure is the
+// wrong-key / tampered-wrap class, NOT a chunk-BODY auth failure, so the two
+// sentinels never both appear in one error chain. This lets the restore/verify
+// layer's chunk-auth coding ([lineage.CodeChunkAuthError]) fire ONLY on a
+// genuine chunk-body failure and never mislabel a wrong passphrase as chunk
+// tamper — a robustness guarantee that does not depend on caller routing
+// discipline alone.
+var ErrCEKUnwrapFailed = errors.New("crypto: chain CEK unwrap failed")
 
 // DecryptChunkWithAAD is the inverse of [EncryptChunkWithAAD]. The
 // auth-tag check fails — and the chunk is refused — when aad differs

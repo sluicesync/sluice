@@ -54,4 +54,25 @@ func TestCodeChunkAuthError(t *testing.T) {
 			t.Errorf("non-auth error must NOT gain a code")
 		}
 	})
+
+	t.Run("a real wrong-key CEK-unwrap error is NOT coded as chunk tamper", func(t *testing.T) {
+		// The REALISTIC wrong-passphrase shape (F-1): a CEK-unwrap failure
+		// wraps crypto.ErrCEKUnwrapFailed, which is disjoint from
+		// ErrChunkAuthFailed — so even if such an error reached the mapper it
+		// must pass through uncoded, never relabeled as "spliced/reordered
+		// store" tamper. (The earlier fixture used a plain string that did not
+		// wrap any sentinel, giving false confidence; this exercises the exact
+		// error content the wrong-key path now produces.)
+		in := fmt.Errorf("resolve chunk cek: %w", crypto.ErrCEKUnwrapFailed)
+		out := CodeChunkAuthError(in)
+		if !errors.Is(out, in) {
+			t.Errorf("CEK-unwrap error should pass through identically; got %v", out)
+		}
+		if errors.Is(out, crypto.ErrChunkAuthFailed) {
+			t.Errorf("a CEK-unwrap error must not carry ErrChunkAuthFailed")
+		}
+		if _, ok := sluicecode.FromError(out); ok {
+			t.Errorf("a wrong-key CEK-unwrap error must NOT gain the chunk-auth code")
+		}
+	})
 }

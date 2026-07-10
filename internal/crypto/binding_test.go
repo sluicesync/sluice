@@ -60,6 +60,70 @@ func TestDecryptChunk_AuthFailureWrapsSentinel(t *testing.T) {
 	}
 }
 
+// TestUnwrapCEK_WrongKeyDisjointFromChunkAuth pins the F-1 robustness
+// invariant: a CEK-unwrap failure (wrong passphrase / tampered wrap) wraps
+// [ErrCEKUnwrapFailed] and NOT [ErrChunkAuthFailed], even though both run the
+// same AES-GCM primitive. Keeping the two sentinels disjoint is what lets the
+// restore chunk-auth coder fire only on a genuine chunk-body failure and never
+// relabel a wrong passphrase as chunk tamper — a guarantee independent of
+// caller routing discipline.
+func TestUnwrapCEK_WrongKeyDisjointFromChunkAuth(t *testing.T) {
+	p, err := DefaultArgon2idParams()
+	if err != nil {
+		t.Fatalf("DefaultArgon2idParams: %v", err)
+	}
+	p.Memory, p.Iterations, p.Parallelism = 1024, 1, 1
+	right, err := NewPassphraseEnvelope("right-pass", p) // same salt (shared p), different KEK
+	if err != nil {
+		t.Fatalf("NewPassphraseEnvelope right: %v", err)
+	}
+	wrong, err := NewPassphraseEnvelope("wrong-pass", p)
+	if err != nil {
+		t.Fatalf("NewPassphraseEnvelope wrong: %v", err)
+	}
+	cek, err := GenerateCEK()
+	if err != nil {
+		t.Fatalf("GenerateCEK: %v", err)
+	}
+	const binding = "sluice-cek-binding/v1\ncreated_at=X"
+	wrapped, err := right.WrapCEKBound(cek, binding)
+	if err != nil {
+		t.Fatalf("WrapCEKBound: %v", err)
+	}
+
+	// Both the bound and the legacy-unbound unwrap paths (UnwrapCEK delegates
+	// to UnwrapCEKBound) must land in the CEK-unwrap class, not chunk-auth.
+	for _, tc := range []struct {
+		name string
+		call func() ([]byte, error)
+	}{
+		{"bound", func() ([]byte, error) { return wrong.UnwrapCEKBound(wrapped, binding) }},
+		{"delegated", func() ([]byte, error) { return wrong.UnwrapCEK(mustWrapUnbound(t, right, cek)) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tc.call()
+			if err == nil {
+				t.Fatal("wrong-key unwrap should fail")
+			}
+			if !errors.Is(err, ErrCEKUnwrapFailed) {
+				t.Errorf("wrong-key unwrap should wrap ErrCEKUnwrapFailed; got %v", err)
+			}
+			if errors.Is(err, ErrChunkAuthFailed) {
+				t.Errorf("wrong-key unwrap must NOT carry ErrChunkAuthFailed (restore would mislabel it as chunk tamper); got %v", err)
+			}
+		})
+	}
+}
+
+func mustWrapUnbound(t *testing.T, e *PassphraseEnvelope, cek []byte) []byte {
+	t.Helper()
+	w, err := e.WrapCEKBound(cek, "") // "" → legacy unbound wrap (UnwrapCEK path)
+	if err != nil {
+		t.Fatalf("WrapCEKBound unbound: %v", err)
+	}
+	return w
+}
+
 // TestEncryptDecryptChunkWithAAD_Matrix pins the AAD acceptance
 // matrix on the bulk-chunk primitive: only the identical
 // (cek, aad) pair opens a chunk; every mismatch shape — wrong AAD,
