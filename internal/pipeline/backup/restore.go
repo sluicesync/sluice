@@ -39,6 +39,7 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
+	"sluicesync.dev/sluice/internal/sluicecode"
 	"sluicesync.dev/sluice/internal/translate"
 )
 
@@ -1301,6 +1302,21 @@ func VerifyBackupWith(ctx context.Context, store irbackup.Store, opts VerifyOpti
 	if len(records) == 0 {
 		return 0, 0, errors.New("verify: no manifests found in store")
 	}
+	// M0.4 / Bug 182: a tampered or bit-rotted manifest carrying a null
+	// structural element (a `"tables":[null]` or a `chunks:[null]`) would
+	// nil-deref the signature-canonicalization pass and the chunk-rehash loop
+	// below and CRASH `backup verify` with a Go stack trace instead of a coded
+	// refusal. The signer never emits nils, so reject such a manifest up front
+	// with the coded SIGNATURE-INVALID class — verify fails closed, loud, and
+	// coded, never a panic. (The signature-canon path already skips nils per
+	// M0.4; this closes the second, unguarded verify traversal.)
+	for _, rec := range records {
+		if verr := validateManifestStructure(rec.Manifest); verr != nil {
+			return 0, 0, sluicecode.Wrap(sluicecode.CodeBackupSignatureInvalid,
+				"the backup manifest is structurally invalid (tampered or corrupt) — restore from a known-good chain",
+				fmt.Errorf("verify: manifest %q: %w", rec.Path, verr))
+		}
+	}
 	// Bug 117 closure: when an envelope is supplied AND the chain
 	// root records ChainEncryption, validate the chain-level
 	// envelope eagerly so the operator gets a single clear "wrong
@@ -1408,6 +1424,35 @@ func VerifyBackupWith(ctx context.Context, store irbackup.Store, opts VerifyOpti
 		}
 	}
 	return total, failed, nil
+}
+
+// validateManifestStructure rejects a manifest carrying a null structural
+// element — a null *TableManifest, a null row-chunk, or a null change-chunk.
+// A legitimate manifest never has one (the signer emits no nils); a tampered
+// or bit-rotted `"tables":[null]` / `chunks:[null]` does, and every traversal
+// that dereferences .Chunks / .File would panic on it. Callers turn a non-nil
+// return into the coded SLUICE-E-BACKUP-SIGNATURE-INVALID refusal so verify
+// fails closed and coded instead of crashing (M0.4 / Bug 182).
+func validateManifestStructure(m *irbackup.Manifest) error {
+	if m == nil {
+		return errors.New("nil manifest")
+	}
+	for i, t := range m.Tables {
+		if t == nil {
+			return fmt.Errorf("null table entry at index %d", i)
+		}
+		for j, c := range t.Chunks {
+			if c == nil {
+				return fmt.Errorf("null row-chunk entry in table %q at index %d", t.Name, j)
+			}
+		}
+	}
+	for i, c := range m.ChangeChunks {
+		if c == nil {
+			return fmt.Errorf("null change-chunk entry at index %d", i)
+		}
+	}
+	return nil
 }
 
 // verifyChunk fetches a chunk and recomputes its SHA-256, returning
