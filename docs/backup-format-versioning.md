@@ -33,12 +33,26 @@ Every backup chain root manifest carries a `FormatVersion` field:
   binaries would silently restore a target without the sequence
   object — its custom `START`/`INCREMENT` options and `nextval()`
   topology gone — so they refuse loudly at preflight instead.
+- **`FormatVersion=5`** — an **encrypted** manifest (`--encrypt`,
+  v0.99.202+, ADR-0152). Chunks written under a FormatVersion-5 chain
+  are AES-GCM-bound to their backup identity and position, so an older
+  binary that predates the binding refuses rather than restoring
+  chunks whose tamper-evidence it can't check.
+- **`FormatVersion=6`** — a **signed** encrypted manifest (`--sign`,
+  v0.99.208+, ADR-0154 Phase 1). The manifest carries a signature over
+  its canonical bytes; an older binary that can't verify the signature
+  refuses loudly rather than restoring an unverified signed chain.
 
 If your backups don't use RLS, EXCLUDE constraints, or standalone
-sequences, you'll never see a version above 1 on a finalized manifest
-and cross-version restore behaves exactly as it did pre-v0.94.1. If
-your backups *do* use them, you get the guarantee that older sluice
-can't silently land a restored target with those invariants stripped.
+sequences, and you don't encrypt or sign, you'll never see a version
+above 1 on a finalized manifest and cross-version restore behaves
+exactly as it did pre-v0.94.1. If your backups *do* use any of them,
+you get the guarantee that older sluice can't silently land a restored
+target with those invariants stripped. The current maximum a fresh
+binary stamps is the `BackupFormatVersion` constant in
+`internal/ir/backup/manifest.go` — this list is kept in lock-step with
+it; a version above what your binary knows always means "upgrade
+sluice", never a silent downgrade.
 
 ## Why this exists — the silent-loss class
 
