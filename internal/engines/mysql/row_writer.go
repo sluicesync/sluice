@@ -14,6 +14,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -851,29 +852,9 @@ func prepareValue(v any, col *ir.Column) (any, error) {
 			return stripTimeZoneOffset(string(b)), nil
 		}
 	}
-	// task #72 / Bug-74 family pin: cross-engine trigger-CDC temporal
-	// values. The postgres-trigger CDC reader (cdc_reader.go) decodes a
-	// captured timestamp/timestamptz column into an ISO TEXT string, NOT
-	// the time.Time the pgoutput path's value_decode.go produces. For a
-	// MySQL DATETIME (PG `timestamp`) the bare ISO string is accepted by
-	// the driver as-is — but a PG `timestamptz` (ir.Timestamp{WithTimeZone})
-	// carries a numeric zone offset suffix ("2026-02-02 02:02:02.020202+00")
-	// that MySQL's TIMESTAMP/DATETIME parser rejects with Error 1292,
-	// exactly like the timetz case above. The documented cross-engine
-	// policy flattens the zone (timestamptz → MySQL TIMESTAMP stored in
-	// the session zone); strip the offset so the time-of-day lands. A
-	// time.Time value (same-engine / pgoutput path) is untouched. Plain
-	// ir.DateTime strings have no offset, so stripTimeZoneOffset is a
-	// no-op there — but we route them through it too so a stray offset on
-	// a DateTime-typed column (defensive) doesn't crash the apply.
-	switch t.(type) {
-	case ir.Timestamp, ir.DateTime:
-		if s, ok := v.(string); ok {
-			return stripTimeZoneOffset(s), nil
-		}
-		if b, ok := v.([]byte); ok {
-			return stripTimeZoneOffset(string(b)), nil
-		}
+	// Cross-engine trigger-CDC temporal values (see prepareCrossEngineTemporal).
+	if out, handled, err := prepareCrossEngineTemporal(t, v); handled {
+		return out, err
 	}
 	// task #72 / Bug-74 family pin: cross-engine trigger-CDC bytea values.
 	// The postgres-trigger CDC reader emits a captured `bytea` column as
@@ -996,6 +977,75 @@ func refuseUnrepresentableFloat(v any, col *ir.Column) error {
 // appears before index 8 (a "YYYY-MM-DD HH:..." prefix is >= 11 chars),
 // and the only '-' chars in the date portion are at offsets 4 and 7, so
 // starting the scan at 8 skips them and finds only the zone sign.
+// prepareCrossEngineTemporal shapes a postgres-trigger CDC temporal STRING for
+// the MySQL driver, returning (value, handled=true) when it owns the value.
+// task #72 / Bug-74 family pin: the postgres-trigger CDC reader decodes a
+// captured timestamp/timestamptz column into an ISO TEXT string, NOT the
+// time.Time the pgoutput path's value_decode.go produces (a time.Time is not a
+// string, so it returns handled=false and passes through untouched).
+//
+//   - `timestamptz` (ir.Timestamp{WithTimeZone:true}): the ISO string carries a
+//     numeric zone offset that encodes the INSTANT. PROM-M1: stripping the
+//     offset kept the source SESSION's wall clock, so a non-UTC writer session
+//     landed CDC rows hours off from the bulk-copied rows (which bind a pgx
+//     time.Time instant) — silent per-row instant divergence. Parse the offset
+//     to a UTC time.Time so the driver serializes the SAME instant the bulk
+//     path does. An unparseable offset (defensive) falls back to the legacy
+//     strip — no worse than pre-fix.
+//   - plain `timestamp` (WithTimeZone:false) / ir.DateTime: no offset, the wall
+//     clock IS the value; strip any stray offset (Error-1292 guard) — a no-op
+//     on the common no-offset string.
+func prepareCrossEngineTemporal(t, v any) (out any, handled bool, err error) {
+	str := func() (string, bool) {
+		switch vv := v.(type) {
+		case string:
+			return vv, true
+		case []byte:
+			return string(vv), true
+		}
+		return "", false
+	}
+	switch tt := t.(type) {
+	case ir.Timestamp:
+		s, ok := str()
+		if !ok {
+			return nil, false, nil // time.Time (pgoutput/bulk) passes through
+		}
+		if tt.WithTimeZone {
+			if err := refuseUnrepresentableTimestamptz(s); err != nil {
+				return nil, true, err
+			}
+			if inst, ok := parseTimestamptzToUTC(s); ok {
+				return inst, true, nil
+			}
+		}
+		return stripTimeZoneOffset(s), true, nil
+	case ir.DateTime:
+		if s, ok := str(); ok {
+			return stripTimeZoneOffset(s), true, nil
+		}
+	}
+	return nil, false, nil
+}
+
+// refuseUnrepresentableTimestamptz refuses the non-finite / pre-Gregorian
+// timestamptz values Postgres can emit ("infinity"/"-infinity", "… BC"): they
+// have no representable MySQL TIMESTAMP/DATETIME instant, and stripping the
+// offset would SILENTLY coerce them — "0044-03-15…+00 BC" strips to
+// "0044-03-15…", dropping the BC era (44 BC → 44 AD). Mirrors the postgres
+// decoder's PROM-P2 refusal so the trigger-CDC (LEG B) write path fails loudly
+// by name too, not silently (the postgres refusal only covers the pgoutput /
+// bulk read path).
+func refuseUnrepresentableTimestamptz(s string) error {
+	switch {
+	case s == "infinity" || s == "-infinity":
+		return fmt.Errorf("mysql: postgres timestamptz %q is not representable as a MySQL TIMESTAMP/DATETIME (infinite value)", s)
+	case strings.HasSuffix(s, " BC"):
+		return fmt.Errorf("mysql: postgres timestamp %q is a BC (pre-Gregorian) date with no representable MySQL value", s)
+	}
+	return nil
+}
+
 func stripTimeZoneOffset(s string) string {
 	for i := 8; i < len(s); i++ {
 		if s[i] == '+' || s[i] == '-' {
@@ -1003,6 +1053,37 @@ func stripTimeZoneOffset(s string) string {
 		}
 	}
 	return s
+}
+
+// timestamptzLayouts covers the offset-bearing timestamptz string forms a
+// Postgres source emits: to_jsonb's T-separated ISO form (postgres-trigger
+// path) and the space-separated ::text form, each with a ±HH, ±HH:MM, or
+// ±HH:MM:SS offset (whole-hour, half/quarter-hour, and second-level historical
+// LMT zones respectively — all observed from real Postgres). ".999999999"
+// makes the fractional seconds optional, so each separator × offset-width
+// needs one layout.
+var timestamptzLayouts = []string{
+	"2006-01-02T15:04:05.999999999-07:00:00",
+	"2006-01-02T15:04:05.999999999-07:00",
+	"2006-01-02T15:04:05.999999999-07",
+	"2006-01-02 15:04:05.999999999-07:00:00",
+	"2006-01-02 15:04:05.999999999-07:00",
+	"2006-01-02 15:04:05.999999999-07",
+}
+
+// parseTimestamptzToUTC parses an offset-bearing Postgres timestamptz string
+// and returns the equivalent instant in UTC. The offset encodes the instant,
+// so a value written by a non-UTC source session lands the SAME stored instant
+// as the bulk-copy path (which binds a pgx time.Time) rather than the source
+// session's wall clock (PROM-M1). Returns ok=false when s carries no
+// recognizable offset, so the caller can fall back to the legacy strip.
+func parseTimestamptzToUTC(s string) (time.Time, bool) {
+	for _, layout := range timestamptzLayouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.UTC(), true
+		}
+	}
+	return time.Time{}, false
 }
 
 // decodeHexByteaText recognises PG's `bytea_output = hex` text form (a
