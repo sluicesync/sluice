@@ -92,7 +92,7 @@ func TestCanonicalManifestBytes_MinimalGolden(t *testing.T) {
 		Kind:          BackupKindFull,
 	}
 	want := strings.Join([]string{
-		"24:sluice-manifest-canon/v3",
+		"24:sluice-manifest-canon/v4",
 		"6:scheme", "8:hmac-kek",
 		"14:format_version", "1:6",
 		"13:source_engine", "8:postgres",
@@ -114,16 +114,50 @@ func TestCanonicalManifestBytes_MinimalGolden(t *testing.T) {
 }
 
 // TestCanonicalManifestBytes_FullGolden pins the SHA-256 of the full
-// fixture's canonical bytes — a compact golden over every folded field.
+// fixture's canonical bytes at the NEWEST canon version (v4) — a compact
+// golden over every folded field, including the SEC-F1 row-chunk parent
+// (schema, name) tokens.
 func TestCanonicalManifestBytes_FullGolden(t *testing.T) {
 	b, err := CanonicalManifestBytes(fixedSignedManifest(), 2, SignatureSchemeHMACKEK)
 	if err != nil {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(b)
-	const want = "d194bad3abdbb5cdde7fbb2f66d9324aa4866a71abe3e59a4cfc2ddbdd5e1579"
+	const want = "c8ae25dbf505a9a4cc49814c7078ac431d02e284627af4bbdeb17b1d467f9c64"
 	if got := hex.EncodeToString(sum[:]); got != want {
 		t.Fatalf("full canonical SHA drift (on-disk contract): got %s want %s\n(canonical bytes:\n%q)", got, want, b)
+	}
+}
+
+// TestCanonicalManifestBytes_V3PreservedGolden is the BACK-COMPAT guard for
+// the Phase-2/3 (v0.99.209–21x) canonicalization: v3 must byte-match what
+// those binaries signed — the scheme token present, but row chunks
+// flattened WITHOUT their parent (schema, name). The SHA is the ORIGINAL v3
+// full golden; changing v3 would strand every chain a v0.99.209+ binary
+// signed, so this pin must never move.
+func TestCanonicalManifestBytes_V3PreservedGolden(t *testing.T) {
+	b, err := CanonicalManifestBytesForVersion(fixedSignedManifest(), 2, ManifestCanonVersionV3, SignatureSchemeHMACKEK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(b)
+	const wantSHA = "d194bad3abdbb5cdde7fbb2f66d9324aa4866a71abe3e59a4cfc2ddbdd5e1579"
+	if got := hex.EncodeToString(sum[:]); got != wantSHA {
+		t.Fatalf("v3 canonical SHA drift — this BREAKS every Phase-2/3-signed chain: got %s want %s", got, wantSHA)
+	}
+	// v3 renders each rowchunk token WITHOUT the parent (schema, name) — the
+	// SEC-F1 blind spot v4 closes. Pin that the two same-column-set tables'
+	// chunks are indistinguishable in the v3 bytes (the exact vulnerability):
+	// under v3 the canonical bytes are INVARIANT to which table owns which
+	// chunk, so a swap verifies green.
+	swapped := fixedSignedManifest()
+	swapped.Tables[0].Chunks, swapped.Tables[1].Chunks = swapped.Tables[1].Chunks, swapped.Tables[0].Chunks
+	sb, err := CanonicalManifestBytesForVersion(swapped, 2, ManifestCanonVersionV3, SignatureSchemeHMACKEK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(b, sb) {
+		t.Fatal("v3 rendering unexpectedly changed under a chunk swap — v3 is defined as the pre-SEC-F1 (parent-blind) rendering")
 	}
 }
 
@@ -176,7 +210,7 @@ func TestCanonicalManifestBytes_V2PreservedGolden(t *testing.T) {
 	}
 	// An unknown (future) version is refused with ErrUnsupportedCanonVersion,
 	// NOT a silent wrong-bytes render.
-	if _, err := CanonicalManifestBytesForVersion(m, 0, "sluice-manifest-canon/v4", ""); !errors.Is(err, ErrUnsupportedCanonVersion) {
+	if _, err := CanonicalManifestBytesForVersion(m, 0, "sluice-manifest-canon/v5", ""); !errors.Is(err, ErrUnsupportedCanonVersion) {
 		t.Fatalf("future canon version: got %v, want ErrUnsupportedCanonVersion", err)
 	}
 }
@@ -231,17 +265,24 @@ func TestCanonicalManifestBytes_Injective(t *testing.T) {
 func TestCanonicalManifestBytes_TamperSensitivity(t *testing.T) {
 	base := canon(t, fixedSignedManifest(), 2)
 	mutations := map[string]func(*Manifest){
-		"format_version":   func(m *Manifest) { m.FormatVersion = 5 },
-		"source_engine":    func(m *Manifest) { m.SourceEngine = "mysql" },
-		"created_at":       func(m *Manifest) { m.CreatedAt = m.CreatedAt.Add(time.Second) },
-		"kind":             func(m *Manifest) { m.Kind = BackupKindFull },
-		"backup_id":        func(m *Manifest) { m.BackupID = "x" },
-		"parent_pointer":   func(m *Manifest) { m.ParentBackupID = "x" },
-		"schema_hash":      func(m *Manifest) { m.SchemaHash = "x" },
-		"start_position":   func(m *Manifest) { m.StartPosition.Token = "x" },
-		"end_position":     func(m *Manifest) { m.EndPosition.Token = "x" },
-		"row_count":        func(m *Manifest) { m.Tables[0].RowCount = 99 },
-		"row_chunk_sha":    func(m *Manifest) { m.Tables[0].Chunks[0].SHA256 = "x" },
+		"format_version": func(m *Manifest) { m.FormatVersion = 5 },
+		"source_engine":  func(m *Manifest) { m.SourceEngine = "mysql" },
+		"created_at":     func(m *Manifest) { m.CreatedAt = m.CreatedAt.Add(time.Second) },
+		"kind":           func(m *Manifest) { m.Kind = BackupKindFull },
+		"backup_id":      func(m *Manifest) { m.BackupID = "x" },
+		"parent_pointer": func(m *Manifest) { m.ParentBackupID = "x" },
+		"schema_hash":    func(m *Manifest) { m.SchemaHash = "x" },
+		"start_position": func(m *Manifest) { m.StartPosition.Token = "x" },
+		"end_position":   func(m *Manifest) { m.EndPosition.Token = "x" },
+		"row_count":      func(m *Manifest) { m.Tables[0].RowCount = 99 },
+		"row_chunk_sha":  func(m *Manifest) { m.Tables[0].Chunks[0].SHA256 = "x" },
+		// SEC-F1: reassigning a row chunk to a DIFFERENT parent table (here by
+		// swapping the two tables' Chunks slices) must change the canonical
+		// bytes — the exact cross-table corruption v4's parent-table token
+		// closes. Pre-v4 this was byte-invisible (see the v3-preserved golden).
+		"row_chunk_reassignment": func(m *Manifest) {
+			m.Tables[0].Chunks, m.Tables[1].Chunks = m.Tables[1].Chunks, m.Tables[0].Chunks
+		},
 		"chain_enc_wrap":   func(m *Manifest) { m.ChainEncryption.WrappedCEK = []byte{0x00} },
 		"argon2id_memory":  func(m *Manifest) { m.ChainEncryption.Argon2id.Memory = 1 },
 		"change_sha":       func(m *Manifest) { m.ChangeChunks[0].SHA256 = "x" },
@@ -329,6 +370,58 @@ func TestSchemeFamilyAlgorithm(t *testing.T) {
 		if got := SchemeAlgorithm(c.in); got != c.algo {
 			t.Errorf("SchemeAlgorithm(%q)=%q want %q", c.in, got, c.algo)
 		}
+	}
+}
+
+// TestCanonicalManifestBytes_NilEntriesNoPanic is the M0.4 pin: a
+// tampered/bit-rotted manifest with a nil table or nil row-chunk entry
+// (`"tables":[null]`, `"chunks":[null]`) must NOT panic in the sort
+// comparators (which dereference .Schema / .File) — nil entries are
+// skipped before the sort, so the verifier surfaces the coded
+// signature-invalid error (via the MAC mismatch the normalized bytes
+// produce) instead of a Go stack trace. Table-driven across every nil
+// shape.
+func TestCanonicalManifestBytes_NilEntriesNoPanic(t *testing.T) {
+	base := func() *Manifest {
+		return &Manifest{
+			FormatVersion: FormatVersionChunkTableBinding,
+			SourceEngine:  "postgres",
+			Kind:          BackupKindFull,
+			Tables: []*TableManifest{
+				{Schema: "public", Name: "t", RowCount: 1, Chunks: []*ChunkInfo{{File: "chunks/t-0", SHA256: "s", RowCount: 1}}},
+			},
+		}
+	}
+	cases := map[string]func(*Manifest){
+		"nil table only":       func(m *Manifest) { m.Tables = []*TableManifest{nil} },
+		"nil table among real": func(m *Manifest) { m.Tables = append(m.Tables, nil) },
+		"nil row chunk":        func(m *Manifest) { m.Tables[0].Chunks = []*ChunkInfo{nil} },
+		"nil chunk among real": func(m *Manifest) { m.Tables[0].Chunks = append(m.Tables[0].Chunks, nil) },
+		"nil change chunk":     func(m *Manifest) { m.ChangeChunks = []*ChunkInfo{nil} },
+		"nil table and nil chunk": func(m *Manifest) {
+			m.Tables = append(m.Tables, nil)
+			m.Tables[0].Chunks = append(m.Tables[0].Chunks, nil)
+		},
+		"all nil tables":     func(m *Manifest) { m.Tables = []*TableManifest{nil, nil} },
+		"nil schema delta":   func(m *Manifest) { m.SchemaDelta = []*SchemaDeltaEntry{nil} },
+		"nil schema history": func(m *Manifest) { m.SchemaHistory = []*SchemaHistoryEntry{nil} },
+	}
+	for name, mut := range cases {
+		t.Run(name, func(t *testing.T) {
+			m := base()
+			mut(m)
+			// Recompute at every SUPPORTED version — the nil-skip must hold
+			// across the whole dual-version matrix, not just the newest.
+			for _, v := range []string{ManifestCanonVersionV2, ManifestCanonVersionV3, ManifestCanonVersion} {
+				b, err := CanonicalManifestBytesForVersion(m, 0, v, SignatureSchemeHMACKEK)
+				if err != nil {
+					t.Fatalf("version %s: unexpected error %v (must not fail, just skip nils)", v, err)
+				}
+				if len(b) == 0 {
+					t.Fatalf("version %s: empty canonical bytes", v)
+				}
+			}
+		})
 	}
 }
 

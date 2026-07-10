@@ -59,15 +59,39 @@ const (
 	// signature as `ed25519` (or vice versa) to force a different/weaker
 	// verification path changes the signed bytes and fails verification.
 	//
+	// v4 (ADR-0154 SEC-F1): each row-chunk token now folds in its PARENT
+	// TABLE — the (schema, name) that lists the chunk — as two additional
+	// length-prefixed fields after the (file, sha, rowcount) triple. Before
+	// v4 the row chunks of every table were flattened into ONE globally
+	// file-sorted list with no parent token, so swapping the [Chunks]
+	// slices of two tables with the same column set (`orders_2023` ↔
+	// `orders_2024`, same-schema shards, multi-tenant clones) produced
+	// BYTE-IDENTICAL canonical bytes — both the manifest and lineage
+	// signatures verified GREEN while table B's rows restored into A. v4
+	// binds the parent, so a reassignment now changes the signed bytes and
+	// fails verification. Change chunks (which bind a replay ordinal) and
+	// schema deltas (which bind d.Table) were already parent-bound; this
+	// closes the row-chunk gap. Everything else is byte-identical to v3.
+	//
 	// The WRITER always emits the newest version (this constant); the
 	// VERIFIER is DUAL-VERSION — it recomputes at the signature's OWN
 	// recorded [ManifestSignature.CanonVersion] via
 	// [CanonicalManifestBytesForVersion], so a v2 signature written by the
-	// shipped Phase-1 (v0.99.208) binary still verifies GREEN on a Phase-2
-	// binary (the "newer sluice always reads older" invariant). v2 has NO
-	// scheme token — Phase 1 only had HMAC-off-KEK — so a v2 signature's
-	// scheme is implicitly [SignatureSchemeHMACKEK].
-	ManifestCanonVersion = "sluice-manifest-canon/v3"
+	// shipped Phase-1 (v0.99.208) binary and a v3 signature written by the
+	// Phase-2/3 binary still verify GREEN on this binary (the "newer sluice
+	// always reads older" invariant). v2 has NO scheme token — Phase 1 only
+	// had HMAC-off-KEK — so a v2 signature's scheme is implicitly
+	// [SignatureSchemeHMACKEK]; v3 has the scheme token but NOT the
+	// row-chunk parent-table fields.
+	ManifestCanonVersion = "sluice-manifest-canon/v4"
+
+	// ManifestCanonVersionV3 is the Phase-2/3 (v0.99.209–21x) canonical
+	// serialization: the scheme token folded in, but row chunks flattened
+	// WITHOUT their parent table (the SEC-F1 blind spot). Preserved
+	// verbatim as ON-DISK CONTRACT so the dual-version verifier can still
+	// authenticate every chain a v0.99.209+ binary wrote. NEVER change the
+	// v3 rendering.
+	ManifestCanonVersionV3 = "sluice-manifest-canon/v3"
 
 	// ManifestCanonVersionV2 is the Phase-1 (v0.99.208) canonical
 	// serialization the shipped binary signed with: byte-identical to
@@ -221,8 +245,9 @@ func ManifestChunkCount(m *Manifest) int {
 // source_engine / kind / backup_id), the lineage parent pointer, the
 // schema fingerprint, the resume anchors (start/end position), the
 // chain-encryption descriptor, the table→row-count mapping, the full
-// chunk list (row chunks by path; change chunks by ordinal, because
-// change-replay order is semantic — the ADR-0152 rationale), the schema
+// chunk list (row chunks by path PLUS their parent (schema, name) at v4+
+// — SEC-F1; change chunks by ordinal, because change-replay order is
+// semantic — the ADR-0152 rationale), the schema
 // deltas (restore drives DDL from them) and schema-history entries
 // (replayed into the schema-history table), and the freshness anchors
 // (sequence + chunk count).
@@ -253,12 +278,27 @@ func CanonicalManifestBytes(m *Manifest, seq int, scheme string) ([]byte, error)
 // SIGNATURE-INVALID.
 var ErrUnsupportedCanonVersion = errors.New("backup manifest signed with a newer canonicalization than this build supports; upgrade sluice to restore/verify it")
 
-// manifestCanonHasScheme maps each SUPPORTED manifest canon version to
-// whether it folds the scheme token in. v2 (Phase 1) does not; v3 (Phase
-// 2) does. A version absent from this map is unsupported (future).
-var manifestCanonHasScheme = map[string]bool{
-	ManifestCanonVersionV2: false,
-	ManifestCanonVersion:   true,
+// manifestCanonFeatures describes which optional fields a SUPPORTED
+// manifest canon version folds into the canonical bytes. The dual-version
+// verifier keys on the signature's own recorded version, so each retired
+// version keeps its exact rendering forever (ON-DISK CONTRACT).
+type manifestCanonFeatures struct {
+	// scheme folds the signature-scheme token in (v3+; v2 predates it).
+	scheme bool
+
+	// rowChunkParentTable folds each row chunk's parent (schema, name)
+	// into its token (v4+; v2/v3 flattened row chunks without it — the
+	// SEC-F1 blind spot).
+	rowChunkParentTable bool
+}
+
+// manifestCanonVersions maps each SUPPORTED manifest canon version to its
+// feature set. A version absent from this map is unsupported (a newer
+// sluice wrote it) and renders [ErrUnsupportedCanonVersion].
+var manifestCanonVersions = map[string]manifestCanonFeatures{
+	ManifestCanonVersionV2: {scheme: false, rowChunkParentTable: false},
+	ManifestCanonVersionV3: {scheme: true, rowChunkParentTable: false},
+	ManifestCanonVersion:   {scheme: true, rowChunkParentTable: true},
 }
 
 // CanonicalManifestBytesForVersion renders the canonical bytes at a
@@ -271,13 +311,13 @@ var manifestCanonHasScheme = map[string]bool{
 // only in the version tag and the presence of the scheme token.
 // Returns [ErrUnsupportedCanonVersion] for an unknown (newer) version.
 func CanonicalManifestBytesForVersion(m *Manifest, seq int, canonVersion, scheme string) ([]byte, error) {
-	withScheme, ok := manifestCanonHasScheme[canonVersion]
+	feat, ok := manifestCanonVersions[canonVersion]
 	if !ok {
 		return nil, fmt.Errorf("%w (canon version %q)", ErrUnsupportedCanonVersion, canonVersion)
 	}
 	var b strings.Builder
 	tok(&b, canonVersion)
-	if withScheme {
+	if feat.scheme {
 		field(&b, "scheme", scheme)
 	}
 	field(&b, "format_version", strconv.Itoa(m.FormatVersion))
@@ -295,8 +335,18 @@ func CanonicalManifestBytesForVersion(m *Manifest, seq int, canonVersion, scheme
 
 	// Table → row-count mapping, sorted by (schema, name). Schema and name
 	// are SEPARATE tokens, so `(a, b.c)` and `(a.b, c)` no longer collide.
+	// M0.4: nil entries (a tampered/bit-rotted `"tables":[null]`) are
+	// skipped BEFORE the sort — the comparator dereferences .Schema, so a
+	// nil that reached it would panic with a Go stack trace instead of the
+	// coded signature-invalid error the verify path raises when the
+	// recomputed bytes (with the nil normalized out) fail the MAC.
 	tbls := make([]*TableManifest, 0, len(m.Tables))
-	tbls = append(tbls, m.Tables...)
+	for _, t := range m.Tables {
+		if t == nil {
+			continue
+		}
+		tbls = append(tbls, t)
+	}
 	sort.SliceStable(tbls, func(i, j int) bool {
 		if tbls[i].Schema != tbls[j].Schema {
 			return tbls[i].Schema < tbls[j].Schema
@@ -304,9 +354,6 @@ func CanonicalManifestBytesForVersion(m *Manifest, seq int, canonVersion, scheme
 		return tbls[i].Name < tbls[j].Name
 	})
 	for _, t := range tbls {
-		if t == nil {
-			continue
-		}
 		tok(&b, "table")
 		tok(&b, t.Schema)
 		tok(&b, t.Name)
@@ -315,23 +362,39 @@ func CanonicalManifestBytesForVersion(m *Manifest, seq int, canonVersion, scheme
 
 	// Row chunks across every table, sorted by file. A table's rows are a
 	// SET (chunk order is not semantic; ADR-0149 range workers append out
-	// of order), so the path binding suffices — no ordinal.
-	rowChunks := make([]*ChunkInfo, 0)
+	// of order), so the path binding suffices — no ordinal. Each chunk
+	// carries its PARENT TABLE so the (schema, name) can be folded into the
+	// token at v4+ (SEC-F1): before v4 the flattened list bound only the
+	// path, so a chunk reassigned between two same-column-set tables was
+	// invisible to the signature. nil chunks (M0.4: `"chunks":[null]`) are
+	// dropped here, BEFORE the sort dereferences .File — same panic-vs-coded
+	// -error rationale as the table sort above.
+	type rowChunkRef struct {
+		chunk        *ChunkInfo
+		schema, name string
+	}
+	rowChunks := make([]rowChunkRef, 0)
 	for _, t := range m.Tables {
 		if t == nil {
 			continue
 		}
-		rowChunks = append(rowChunks, t.Chunks...)
-	}
-	sort.SliceStable(rowChunks, func(i, j int) bool { return rowChunks[i].File < rowChunks[j].File })
-	for _, c := range rowChunks {
-		if c == nil {
-			continue
+		for _, c := range t.Chunks {
+			if c == nil {
+				continue
+			}
+			rowChunks = append(rowChunks, rowChunkRef{chunk: c, schema: t.Schema, name: t.Name})
 		}
+	}
+	sort.SliceStable(rowChunks, func(i, j int) bool { return rowChunks[i].chunk.File < rowChunks[j].chunk.File })
+	for _, rc := range rowChunks {
 		tok(&b, "rowchunk")
-		tok(&b, c.File)
-		tok(&b, c.SHA256)
-		tok(&b, strconv.FormatInt(c.RowCount, 10))
+		tok(&b, rc.chunk.File)
+		tok(&b, rc.chunk.SHA256)
+		tok(&b, strconv.FormatInt(rc.chunk.RowCount, 10))
+		if feat.rowChunkParentTable {
+			tok(&b, rc.schema)
+			tok(&b, rc.name)
+		}
 	}
 
 	// Change chunks in list order, ordinal-tokened: change-replay order IS

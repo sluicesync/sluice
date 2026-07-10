@@ -147,9 +147,9 @@ func TestChooseFormatVersion_Bug116(t *testing.T) {
 // chunk-binding contracts, this test catches the regression at build
 // time.
 func TestBackupFormatVersion_Bumped(t *testing.T) {
-	if BackupFormatVersion != FormatVersionSignedManifest {
-		t.Errorf("BackupFormatVersion = %d; want FormatVersionSignedManifest=%d (ADR-0154 ceiling)",
-			BackupFormatVersion, FormatVersionSignedManifest)
+	if BackupFormatVersion != FormatVersionChunkTableBinding {
+		t.Errorf("BackupFormatVersion = %d; want FormatVersionChunkTableBinding=%d (ADR-0154 SEC-F1 ceiling)",
+			BackupFormatVersion, FormatVersionChunkTableBinding)
 	}
 	if FormatVersionLegacy != 1 {
 		t.Errorf("FormatVersionLegacy = %d; must stay 1 (load-bearing for older-binary preflight semantics)", FormatVersionLegacy)
@@ -173,5 +173,9 @@ func TestBackupFormatVersion_Bumped(t *testing.T) {
 	if FormatVersionSignedManifest <= FormatVersionEncryptedChunkBinding {
 		t.Errorf("FormatVersionSignedManifest (%d) must be strictly greater than FormatVersionEncryptedChunkBinding (%d) — a signed manifest asserts a signature that pre-signing binaries cannot verify, so they must refuse it at the version gate (ADR-0154)",
 			FormatVersionSignedManifest, FormatVersionEncryptedChunkBinding)
+	}
+	if FormatVersionChunkTableBinding <= FormatVersionSignedManifest {
+		t.Errorf("FormatVersionChunkTableBinding (%d) must be strictly greater than FormatVersionSignedManifest (%d) — a table-bound row chunk decrypts against an AAD pre-v7 binaries cannot reproduce, so they must refuse it at the version gate (ADR-0154 SEC-F1), and it is a strict superset of signed so IsSignedFormat still holds",
+			FormatVersionChunkTableBinding, FormatVersionSignedManifest)
 	}
 }

@@ -18,6 +18,60 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 )
 
+// TestSetupChainEncryption_SignedTableBindingStamp pins the SEC-F1 write
+// -side stamp: a FRESH signed encrypted run stamps
+// [irbackup.FormatVersionChunkTableBinding] (v7) so its row chunks are
+// written with — and restored against — the parent-table-bound AAD; a
+// RESUMED pre-v7 signed run keeps [irbackup.FormatVersionSignedManifest]
+// (v6) so its already-written untable-bound chunks still decrypt.
+func TestSetupChainEncryption_SignedTableBindingStamp(t *testing.T) {
+	t.Run("fresh signed encrypted run stamps the table-binding version", func(t *testing.T) {
+		_, priv, err := crypto.GenerateEd25519Keypair()
+		if err != nil {
+			t.Fatalf("GenerateEd25519Keypair: %v", err)
+		}
+		b := &Backup{Encryption: stampTestEncryption(t), Ed25519Signer: lineage.NewEd25519Signer(priv)}
+		m := &irbackup.Manifest{FormatVersion: irbackup.FormatVersionLegacy}
+		if _, err := b.setupChainEncryption(m, nil); err != nil {
+			t.Fatalf("setupChainEncryption: %v", err)
+		}
+		if m.FormatVersion != irbackup.FormatVersionChunkTableBinding {
+			t.Errorf("FormatVersion = %d; want %d — a fresh signed encrypted full binds its row chunks to their parent table",
+				m.FormatVersion, irbackup.FormatVersionChunkTableBinding)
+		}
+	})
+
+	t.Run("resuming a pre-v7 signed run keeps the prior (untable-bound) version", func(t *testing.T) {
+		enc := stampTestEncryption(t)
+		_, priv, err := crypto.GenerateEd25519Keypair()
+		if err != nil {
+			t.Fatalf("GenerateEd25519Keypair: %v", err)
+		}
+		// Build a prior run with a bound wrap, then stamp it v6 to stand in
+		// for a signed encrypted full an older (pre-SEC-F1) binary wrote.
+		prior := &irbackup.Manifest{FormatVersion: irbackup.FormatVersionLegacy, PartialState: irbackup.BackupStateInProgress}
+		cek, err := (&Backup{Encryption: enc}).setupChainEncryption(prior, nil)
+		if err != nil {
+			t.Fatalf("fresh prior setup: %v", err)
+		}
+		prior.FormatVersion = irbackup.FormatVersionSignedManifest
+
+		b := &Backup{Encryption: enc, Ed25519Signer: lineage.NewEd25519Signer(priv)}
+		m := &irbackup.Manifest{FormatVersion: irbackup.FormatVersionLegacy}
+		got, err := b.setupChainEncryption(m, prior)
+		if err != nil {
+			t.Fatalf("resume setup: %v", err)
+		}
+		if m.FormatVersion != irbackup.FormatVersionSignedManifest {
+			t.Errorf("resumed FormatVersion = %d; want %d — the prior run's kept row chunks are NOT table-bound, so a v7 stamp would break their decrypt",
+				m.FormatVersion, irbackup.FormatVersionSignedManifest)
+		}
+		if !bytes.Equal(got, cek) {
+			t.Errorf("resumed run recovered a different chain CEK")
+		}
+	})
+}
+
 func stampTestEncryption(t *testing.T) *lineage.BackupEncryption {
 	t.Helper()
 	p, err := crypto.DefaultArgon2idParams()

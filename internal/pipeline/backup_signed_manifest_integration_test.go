@@ -88,8 +88,8 @@ func TestBackup_SignedManifest_DR_RoundTripAndTamper(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadManifest: %v", err)
 	}
-	if full.FormatVersion != irbackup.FormatVersionSignedManifest {
-		t.Fatalf("full FormatVersion = %d; want %d (signed)", full.FormatVersion, irbackup.FormatVersionSignedManifest)
+	if full.FormatVersion != irbackup.FormatVersionChunkTableBinding {
+		t.Fatalf("full FormatVersion = %d; want %d (signed encrypted → row-chunk table binding, SEC-F1)", full.FormatVersion, irbackup.FormatVersionChunkTableBinding)
 	}
 	if signed, _ := lineage.ChainIsSigned(context.Background(), store); !signed {
 		t.Fatal("chain not detected as signed (lineage.json.sig missing)")
@@ -151,13 +151,14 @@ func TestBackup_SignedManifest_DR_RoundTripAndTamper(t *testing.T) {
 		storePut(t, store, lineage.ManifestFileName, fullManifestBytes)
 	}
 	// downgradeFormatVersion rewrites a manifest's format_version in place
-	// (keeping its signature), simulating the v6->v5 downgrade attack.
+	// (keeping its signature), simulating the signed->unsigned downgrade
+	// attack (v7 signed-encrypted -> v5 unsigned-encrypted).
 	downgradeFormatVersion := func(path string, orig []byte) {
 		var m irbackup.Manifest
 		if err := json.Unmarshal(orig, &m); err != nil {
 			t.Fatal(err)
 		}
-		m.FormatVersion = irbackup.FormatVersionEncryptedChunkBinding // 6 -> 5
+		m.FormatVersion = irbackup.FormatVersionEncryptedChunkBinding // signed -> v5
 		nb, _ := json.Marshal(&m)
 		storePut(t, store, path, nb)
 	}
@@ -192,11 +193,11 @@ func TestBackup_SignedManifest_DR_RoundTripAndTamper(t *testing.T) {
 			wantCode: sluicecode.CodeBackupSignatureMissing,
 		},
 		{
-			// CRITICAL: a v6->v5 FormatVersion downgrade (with the .sig
+			// CRITICAL: a signed->v5 FormatVersion downgrade (with the .sig
 			// files left intact) must NOT let the verifier skip checks —
 			// format_version is inside the signed bytes, so verification is
 			// forced by the signature's PRESENCE and then fails the MAC.
-			name: "format-version downgrade (v6->v5) with sigs intact",
+			name: "format-version downgrade (signed->v5) with sigs intact",
 			apply: func() {
 				downgradeFormatVersion(lineage.ManifestFileName, fullManifestBytes)
 				downgradeFormatVersion(incrPath, incrManifestBytes)
