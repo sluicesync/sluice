@@ -249,7 +249,8 @@ func TestFloatExactPatchReader_OverCap_StrictRefuses(t *testing.T) {
 
 // TestPlanBackupFloatRepair_ShapeMatrix pins the backup plan across shapes:
 // repairable, DOUBLE-only (omitted), keyless (omitted), float-PK-only
-// (omitted), composite PK (non-PK float only).
+// (omitted), float-in-composite-PK (omitted — SL-F1), int-composite PK
+// (repairable, non-PK float only).
 func TestPlanBackupFloatRepair_ShapeMatrix(t *testing.T) {
 	fs := func(n string) *ir.Column { return &ir.Column{Name: n, Type: ir.Float{Precision: ir.FloatSingle}} }
 	fd := func(n string) *ir.Column { return &ir.Column{Name: n, Type: ir.Float{Precision: ir.FloatDouble}} }
@@ -267,11 +268,16 @@ func TestPlanBackupFloatRepair_ShapeMatrix(t *testing.T) {
 		{Name: "double_only", Columns: []*ir.Column{i("id"), fd("d")}, PrimaryKey: pkOf("id")},
 		{Name: "keyless", Columns: []*ir.Column{i("id"), fs("fl")}},
 		{Name: "float_pk", Columns: []*ir.Column{fs("fl"), i("v")}, PrimaryKey: pkOf("fl")},
-		{Name: "composite", Columns: []*ir.Column{i("a"), fs("b"), fs("c")}, PrimaryKey: pkOf("a", "b")},
+		// SL-F1: a FLOAT member in a composite PK omits the WHOLE table — the
+		// display-rounded PK on the target can never match the exact re-read
+		// key, so patching the non-PK float c would silently no-op.
+		{Name: "float_in_composite_pk", Columns: []*ir.Column{i("a"), fs("b"), fs("c")}, PrimaryKey: pkOf("a", "b")},
+		// An int-only composite PK + a non-PK float IS repairable.
+		{Name: "int_composite", Columns: []*ir.Column{i("a"), i("b"), fs("c")}, PrimaryKey: pkOf("a", "b")},
 	}}
 	plan := planBackupFloatRepair(schema)
 
-	for _, omit := range []string{"double_only", "keyless", "float_pk"} {
+	for _, omit := range []string{"double_only", "keyless", "float_pk", "float_in_composite_pk"} {
 		if _, ok := plan[omit]; ok {
 			t.Errorf("%s must be omitted from the backup plan", omit)
 		}
@@ -279,12 +285,12 @@ func TestPlanBackupFloatRepair_ShapeMatrix(t *testing.T) {
 	if _, ok := plan["ok"]; !ok {
 		t.Error("ok must be in the plan")
 	}
-	comp, ok := plan["composite"]
+	comp, ok := plan["int_composite"]
 	if !ok {
-		t.Fatal("composite must be in the plan")
+		t.Fatal("int_composite must be in the plan")
 	}
 	if len(comp.floatCols) != 1 || comp.floatCols[0] != "c" {
-		t.Errorf("composite floatCols = %v; want [c] (b is a PK member)", comp.floatCols)
+		t.Errorf("int_composite floatCols = %v; want [c] (a,b are int PK members)", comp.floatCols)
 	}
 }
 

@@ -277,6 +277,17 @@ func planBackupFloatRepair(schema *ir.Schema) map[string]floatPatchTable {
 		if len(pkCols) == 0 {
 			continue
 		}
+		// A single-precision FLOAT in the PK makes the table non-repairable
+		// (SL-F1): the patch map keys on the PK, but floatPatchKey renders the
+		// EXACT re-read PK on one side and the display-rounded COPY PK on the
+		// other, so the keys never match and every non-PK FLOAT silently
+		// retains its rounding while --strict-float (which only refuses tables
+		// absent from the plan) exits 0 with a rounded archive. Omit it here so
+		// its columns land in applyVStreamFloatPolicy's unrepairable set — WARN
+		// + rounded by default, upfront refusal under --strict-float.
+		if migcore.PrimaryKeyHasSinglePrecisionFloat(t) {
+			continue
+		}
 		pkSet := make(map[string]struct{}, len(pkCols))
 		for _, c := range pkCols {
 			pkSet[c] = struct{}{}

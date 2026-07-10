@@ -82,11 +82,21 @@ func TestPlanFloatRepair_FamilyAndShapeMatrix(t *testing.T) {
 			Columns:    []*ir.Column{floatCol("fl", ir.FloatSingle), intCol("v")},
 			PrimaryKey: pk("fl"),
 		},
-		// (e) composite PK + two single floats (one a PK member) → repairable
-		// on the non-PK float only.
+		// (e) composite PK with a FLOAT member (b) + a non-PK single float (c)
+		// → NON-repairable (SL-F1). The COPY wrote b display-rounded, so the
+		// exact re-read's PK never matches the target and c would silently
+		// retain its rounding; the whole table must route to the cannot-repair
+		// WARN, not a false "will repair" promise.
+		{
+			Name:       "float_in_composite_pk",
+			Columns:    []*ir.Column{intCol("a"), floatCol("b", ir.FloatSingle), floatCol("c", ir.FloatSingle)},
+			PrimaryKey: pk("a", "b"),
+		},
+		// (g) composite PK of two INTs + a non-PK single float → repairable
+		// (no PK member is a float, so the re-read key matches the target).
 		{
 			Name:       "composite",
-			Columns:    []*ir.Column{intCol("a"), floatCol("b", ir.FloatSingle), floatCol("c", ir.FloatSingle)},
+			Columns:    []*ir.Column{intCol("a"), intCol("b"), floatCol("c", ir.FloatSingle)},
 			PrimaryKey: pk("a", "b"),
 		},
 		// (f) no FLOAT at all → omitted entirely.
@@ -142,22 +152,34 @@ func TestPlanFloatRepair_FamilyAndShapeMatrix(t *testing.T) {
 		t.Error("float_pk: a table whose only FLOAT is the PK must NOT be repairable")
 	}
 
+	// (e) SL-F1: a composite PK containing a FLOAT member makes the WHOLE
+	// table non-repairable, even though there is a non-PK float that looks
+	// repairable in isolation. Its floatColumns still name BOTH floats for the
+	// cannot-repair WARN, but srcRead is nil (no re-read is planned).
+	fcp := byName["float_in_composite_pk"]
+	if fcp.repairable {
+		t.Error("float_in_composite_pk: a composite PK with a FLOAT member must NOT be repairable (SL-F1)")
+	}
+	if fcp.srcRead != nil {
+		t.Error("float_in_composite_pk: a non-repairable table must not carry a re-read plan")
+	}
+	if len(fcp.floatColumns) != 2 {
+		t.Errorf("float_in_composite_pk: floatColumns = %v; want both single floats named for the WARN", fcp.floatColumns)
+	}
+
 	comp := byName["composite"]
 	if !comp.repairable {
-		t.Error("composite: want repairable=true (non-PK float c)")
+		t.Error("composite: want repairable=true (int-only composite PK + non-PK float c)")
 	}
-	// floatColumns names BOTH single floats (b and c) for the WARN; the
-	// re-read set excludes the PK member b, so srcRead projects a, b, c but
-	// UpdateFloatColumnsByPK only SETs c (b is in the WHERE via the PK).
-	if len(comp.floatColumns) != 2 {
-		t.Errorf("composite: floatColumns = %v; want both single floats named", comp.floatColumns)
+	if len(comp.floatColumns) != 1 {
+		t.Errorf("composite: floatColumns = %v; want [c]", comp.floatColumns)
 	}
 	compCols := map[string]bool{}
 	for _, c := range comp.srcRead.Columns {
 		compCols[c.Name] = true
 	}
-	if !compCols["a"] || !compCols["c"] {
-		t.Errorf("composite: srcRead must project PK cols + repairable float c; got %v", compCols)
+	if !compCols["a"] || !compCols["b"] || !compCols["c"] {
+		t.Errorf("composite: srcRead must project PK cols a,b + repairable float c; got %v", compCols)
 	}
 }
 
