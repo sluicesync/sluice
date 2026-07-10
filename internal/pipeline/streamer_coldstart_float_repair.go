@@ -94,11 +94,18 @@ func planFloatRepair(sourceSchema *ir.Schema) []floatRepairTable {
 				repairCols = append(repairCols, c.Name)
 			}
 		}
+		// A single-precision FLOAT anywhere in the PK makes the whole table
+		// non-repairable (SL-F1): the re-read keys on the exact PK, but the
+		// COPY wrote a display-rounded PK, so the PK-keyed UPDATE matches zero
+		// rows and every non-PK FLOAT (repairCols) silently retains its
+		// rounding. Route it to the honest cannot-repair WARN instead of the
+		// false "sluice will repair it" promise.
+		pkHasFloat := migcore.PrimaryKeyHasSinglePrecisionFloat(t)
 		ft := floatRepairTable{
 			name:         t.Name,
 			pkColumns:    pkCols,
 			floatColumns: floatColumnNames(floatCols),
-			repairable:   len(pkCols) > 0 && len(repairCols) > 0,
+			repairable:   len(pkCols) > 0 && len(repairCols) > 0 && !pkHasFloat,
 		}
 		if ft.repairable {
 			ft.srcRead = trimmedFloatReadTable(t, pkCols, repairCols)

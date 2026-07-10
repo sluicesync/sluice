@@ -81,6 +81,40 @@ func TestCheckVStreamFloatLossy_StrictKeylessRefuses(t *testing.T) {
 	}
 }
 
+// TestCheckVStreamFloatLossy_StrictFloatInCompositePKRefuses pins SL-F1: a
+// table with a FLOAT member in its (composite) PK plus a non-PK FLOAT must
+// refuse upfront under --strict-float, NOT silently archive rounded values.
+// Before the fix the table was in the plan (its non-PK float looked
+// repairable), so unrepairableCols was empty and --strict-float exited 0 with
+// a rounded archive — the exact outcome the flag exists to make impossible.
+func TestCheckVStreamFloatLossy_StrictFloatInCompositePKRefuses(t *testing.T) {
+	b := &Backup{StrictFloat: true}
+	snap := &irbackup.Snapshot{Rows: lossyFloatRows{rounds: true}}
+	schema := &ir.Schema{Tables: []*ir.Table{{
+		Name: "sensor",
+		Columns: []*ir.Column{
+			{Name: "device", Type: ir.Integer{Width: 64}},
+			{Name: "f", Type: ir.Float{Precision: ir.FloatSingle}, Nullable: true},
+			{Name: "g", Type: ir.Float{Precision: ir.FloatSingle}, Nullable: true},
+		},
+		PrimaryKey: &ir.Index{Name: "pk", Columns: []ir.IndexColumn{{Column: "device"}, {Column: "f"}}},
+	}}}
+
+	err := b.applyVStreamFloatPolicy(context.Background(), snap, schema)
+	if err == nil {
+		t.Fatal("--strict-float with a FLOAT-in-composite-PK table must refuse upfront (SL-F1); got nil")
+	}
+	ce, ok := sluicecode.FromError(err)
+	if !ok || ce.Code != sluicecode.CodeVStreamFloatLossy {
+		t.Fatalf("refusal must be the coded VStreamFloatLossy error; got %v", err)
+	}
+	// snap.Rows must be left unwrapped — the refusal is upfront, before any
+	// table is archived.
+	if _, wrapped := snap.Rows.(*floatExactPatchReader); wrapped {
+		t.Error("upfront refusal must not wrap snap.Rows")
+	}
+}
+
 // TestCheckVStreamFloatLossy_DefaultWrapsForExactReread pins that the
 // DEFAULT posture (no flags) wraps snap.Rows in the exact-re-read patch
 // reader so archived FLOAT columns are exact.
