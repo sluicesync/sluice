@@ -42,6 +42,16 @@ Every backup chain root manifest carries a `FormatVersion` field:
   v0.99.208+, ADR-0154 Phase 1). The manifest carries a signature over
   its canonical bytes; an older binary that can't verify the signature
   refuses loudly rather than restoring an unverified signed chain.
+- **`FormatVersion=7`** — a **signed encrypted** manifest whose row
+  chunks additionally bind their **parent table** into the AES-GCM AAD
+  (`--sign` + `--encrypt`, v0.99.214+, ADR-0154 SEC-F1). This closes a
+  store-adversary chunk-reassignment attack (swapping the chunk lists of
+  two same-column-set tables); an older binary that predates the binding
+  refuses loudly rather than decrypting a row chunk against the wrong
+  (un-table-bound) AAD. Stamped only on a *fresh signed-encrypted full* —
+  a plaintext-signed backup stays on 6, an unsigned-encrypted one on 5,
+  and a resumed pre-v7 chain keeps its prior version so its already-
+  written chunks still decrypt.
 
 If your backups don't use RLS, EXCLUDE constraints, or standalone
 sequences, and you don't encrypt or sign, you'll never see a version

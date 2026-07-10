@@ -105,8 +105,9 @@ func RepairByPK(ctx context.Context, table *ir.Table, pkColumns []string, rows <
 	}
 
 	var (
-		batch      []ir.Row
-		setColumns []string
+		batch          []ir.Row
+		setColumns     []string
+		effectiveBatch = batchRows
 	)
 	flush := func() error {
 		if len(batch) == 0 {
@@ -134,12 +135,24 @@ func RepairByPK(ctx context.Context, table *ir.Table, pkColumns []string, rows <
 		}
 		if setColumns == nil {
 			setColumns = cols
+			// PERF-F1: the batched statement binds (join keys + SET columns)
+			// params PER ROW, and both Postgres and MySQL cap a single
+			// statement at 65535 bind params — so a very WIDE table (e.g. 130+
+			// single-precision FLOAT columns) at the full batchRows would
+			// overflow the ceiling and fail the UPDATE. Cap the batch so
+			// rows × params-per-row stays under [maxBindParamsPerBatch]; a
+			// normal (few-column) table keeps the full batchRows.
+			if perRow := len(effPK) + len(setColumns); perRow > 0 {
+				if limit := maxBindParamsPerBatch / perRow; limit >= 1 && limit < effectiveBatch {
+					effectiveBatch = limit
+				}
+			}
 		} else if !slices.Equal(setColumns, cols) {
 			return fmt.Errorf("floatrepair: RepairByPK: table %q: inconsistent repair column set across rows (%v vs %v); "+
 				"every streamed row must carry the same PK+FLOAT shape", table.Name, setColumns, cols)
 		}
 		batch = append(batch, row)
-		if len(batch) >= batchRows {
+		if len(batch) >= effectiveBatch {
 			if err := flush(); err != nil {
 				return err
 			}
@@ -147,6 +160,14 @@ func RepairByPK(ctx context.Context, table *ir.Table, pkColumns []string, rows <
 	}
 	return flush()
 }
+
+// maxBindParamsPerBatch caps a batched-repair statement's total bind
+// parameters below the 65535-param ceiling that BOTH Postgres and MySQL
+// enforce per statement, with headroom. [RepairByPK] divides it by the
+// per-row param count (join keys + SET columns) to derive the effective
+// batch size, so a very wide FLOAT table shrinks the batch instead of
+// overflowing the statement.
+const maxBindParamsPerBatch = 60000
 
 // colTypesByName builds the column-type lookup keyed by unqualified
 // column name — the input NonGeneratedRowKeys (and each engine's value
