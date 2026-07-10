@@ -73,6 +73,65 @@ func streamRows(rows []ir.Row) <-chan ir.Row {
 	return ch
 }
 
+// TestRepairByPK_WideTableBatchCap pins PERF-F1: a very wide single-precision
+// FLOAT table shrinks the batch so rows × (PK + SET) params stays under the
+// 65535 bind-param ceiling (Postgres/MySQL), instead of overflowing at the
+// full 500; a narrow table is unaffected.
+func TestRepairByPK_WideTableBatchCap(t *testing.T) {
+	const floatCols = 200 // 1 PK + 200 SET = 201 params/row
+	cols := []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}
+	setNames := make([]string, floatCols)
+	for i := 0; i < floatCols; i++ {
+		n := fmt.Sprintf("fl%d", i)
+		setNames[i] = n
+		cols = append(cols, &ir.Column{Name: n, Type: ir.Float{Precision: ir.FloatSingle}, Nullable: true})
+	}
+	table := &ir.Table{Name: "wide", Columns: cols, PrimaryKey: &ir.Index{Name: "pk", Columns: []ir.IndexColumn{{Column: "id"}}}}
+
+	const n = 600
+	rows := make([]ir.Row, n)
+	for i := range rows {
+		r := ir.Row{"id": int64(i + 1)}
+		for _, s := range setNames {
+			r[s] = float64(1.5)
+		}
+		rows[i] = r
+	}
+
+	rec := &recordingExecer{}
+	if err := RepairByPK(context.Background(), table, []string{"id"}, streamRows(rows), 500, rec); err != nil {
+		t.Fatal(err)
+	}
+	perRow := 1 + floatCols
+	wantBatch := 60000 / perRow // 298 (< 500 → capped)
+	wantCalls := (n + wantBatch - 1) / wantBatch
+	if rec.calls != wantCalls {
+		t.Errorf("wide table (%d params/row): %d ExecBatch calls, want %d (capped batch %d)", perRow, rec.calls, wantCalls, wantBatch)
+	}
+	for i, bs := range rec.batchSizes {
+		if bs > wantBatch {
+			t.Errorf("batch %d size %d exceeds the derived cap %d", i, bs, wantBatch)
+		}
+		if bs*perRow > 65535 {
+			t.Errorf("batch %d: %d rows × %d params = %d exceeds the 65535 ceiling", i, bs, perRow, bs*perRow)
+		}
+	}
+
+	// Control: a narrow table (id + one FLOAT = 2 params/row) keeps the full
+	// 500-row batch — the cap must not shrink a normal table.
+	narrowRows := make([]ir.Row, n)
+	for i := range narrowRows {
+		narrowRows[i] = ir.Row{"id": int64(i + 1), "fl": float64(1.5)}
+	}
+	rec2 := &recordingExecer{}
+	if err := RepairByPK(context.Background(), floatRepairTable(), []string{"id"}, streamRows(narrowRows), 500, rec2); err != nil {
+		t.Fatal(err)
+	}
+	if want := (n + 499) / 500; rec2.calls != want {
+		t.Errorf("narrow table: %d calls, want %d — the cap must not shrink a normal table", rec2.calls, want)
+	}
+}
+
 func TestRepairByPK_NilTable(t *testing.T) {
 	err := RepairByPK(context.Background(), nil, []string{"id"}, streamRows(nil), 500, &recordingExecer{})
 	if err == nil {

@@ -340,6 +340,16 @@ func (r *Restore) Run(ctx context.Context) error {
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("restore: %w", err))
 	}
+	// Bug 182 (restore-path half): a tampered/bit-rotted manifest with a null
+	// structural element would nil-deref the chunk traversal below and CRASH
+	// restore. `backup verify` rejects it with the coded refusal; so must
+	// restore. (A SIGNED manifest is caught earlier by the signature — a null
+	// chunk bumps the recorded count — but an UNSIGNED one reaches here.)
+	if verr := validateManifestStructure(manifest); verr != nil {
+		return sluicecode.Wrap(sluicecode.CodeBackupSignatureInvalid,
+			"the backup manifest is structurally invalid (tampered or corrupt) — restore from a known-good chain",
+			fmt.Errorf("restore: manifest %q: %w", lineage.ManifestFileName, verr))
+	}
 	// The root segment's recorded codec governs the full's chunks.
 	// Recorded, never sniffed (ADR-0046). Absent lineage → gzip.
 	if r.segCodec == "" {

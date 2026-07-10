@@ -40,6 +40,7 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
+	"sluicesync.dev/sluice/internal/sluicecode"
 	"sluicesync.dev/sluice/internal/translate"
 )
 
@@ -180,6 +181,16 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	}
 	if len(links) == 0 {
 		return errors.New("chain restore: store contains no manifests")
+	}
+	// Bug 182 (restore-path half): reject a tampered/bit-rotted manifest with a
+	// null structural element up front, before any traversal nil-derefs it and
+	// crashes the restore — the coded refusal `backup verify` already raises.
+	for i := range links {
+		if verr := validateManifestStructure(links[i].Manifest); verr != nil {
+			return sluicecode.Wrap(sluicecode.CodeBackupSignatureInvalid,
+				"the backup manifest is structurally invalid (tampered or corrupt) — restore from a known-good chain",
+				fmt.Errorf("chain restore: manifest %q: %w", links[i].Path, verr))
+		}
 	}
 
 	root := links[0]

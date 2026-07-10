@@ -43,6 +43,57 @@ func TestValidateManifestStructure(t *testing.T) {
 	}
 }
 
+// TestRestoreRun_NullStructuralElement_CodedNotPanic pins the restore-path half
+// of Bug 182 (the confirming-audit follow-up): a tampered/bit-rotted UNSIGNED
+// manifest with a null structural element fed to `restore` (not just `verify`)
+// must return the coded SLUICE-E-BACKUP-SIGNATURE-INVALID refusal, NEVER a
+// nil-pointer panic in the chunk traversal. The signature-canon nil-skip meant
+// such a manifest verified/loaded green and then crashed restore before the
+// guard was wired into Restore.Run.
+func TestRestoreRun_NullStructuralElement_CodedNotPanic(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name     string
+		manifest *irbackup.Manifest
+	}{
+		{"null table", &irbackup.Manifest{
+			FormatVersion: irbackup.FormatVersionLegacy,
+			CreatedAt:     time.Date(2026, 7, 10, 0, 0, 0, 0, time.UTC),
+			SourceEngine:  "postgres", Kind: irbackup.BackupKindFull, BackupID: "full0001",
+			Tables: []*irbackup.TableManifest{nil},
+		}},
+		{"null row-chunk", &irbackup.Manifest{
+			FormatVersion: irbackup.FormatVersionLegacy,
+			CreatedAt:     time.Date(2026, 7, 10, 0, 0, 0, 0, time.UTC),
+			SourceEngine:  "postgres", Kind: irbackup.BackupKindFull, BackupID: "full0002",
+			Tables: []*irbackup.TableManifest{{Name: "t", Chunks: []*irbackup.ChunkInfo{nil}}},
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newMemStore()
+			if err := lineage.WriteManifest(ctx, store, tc.manifest); err != nil {
+				t.Fatal(err)
+			}
+			lineage.UpdateLineageForManifestBestEffort(ctx, store, tc.manifest, lineage.ManifestFileName, blobcodec.DefaultCodec)
+
+			// The single-full lineage takes Restore.Run's single-manifest path;
+			// the guard must fire (before any chunk traversal) with the coded
+			// refusal, not a panic. stubEngine satisfies the Target validation;
+			// it is never reached because the guard returns first.
+			r := &Restore{Store: store, Target: stubEngine{}, TargetDSN: "target-dsn"}
+			err := r.Run(ctx)
+			if err == nil {
+				t.Fatal("want a coded refusal, got nil")
+			}
+			ce, ok := sluicecode.FromError(err)
+			if !ok || ce.Code != sluicecode.CodeBackupSignatureInvalid {
+				t.Fatalf("want %s, got %v", sluicecode.CodeBackupSignatureInvalid, err)
+			}
+		})
+	}
+}
+
 // TestVerifyBackupWith_NullStructuralElement_CodedNotPanic pins Bug 182: a
 // manifest carrying a null table/chunk on the store makes `backup verify`
 // return the coded SLUICE-E-BACKUP-SIGNATURE-INVALID refusal (a Refusal-class
