@@ -27,6 +27,7 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 const tamperPassphrase = "tamper-matrix-pass"
@@ -237,6 +238,16 @@ func TestChunkBinding_TamperMatrix(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "does not belong at this position") {
 			t.Errorf("refusal %q should name the spliced-chunk hypothesis", err.Error())
+		}
+		// SEC-1: the decrypt-time tamper refusal on an encrypted (here
+		// UNSIGNED) chain carries the coded SLUICE-E-BACKUP-CHUNK-AUTH-FAILED
+		// Refusal (exit 3) — the machine-readable twin of a signed manifest's
+		// SIGNATURE-INVALID — not a bare exit-1 crypto error.
+		ce, ok := sluicecode.FromError(err)
+		if !ok || ce.Code != sluicecode.CodeBackupChunkAuthFailed {
+			t.Errorf("swap refusal should carry coded %s; got %v", sluicecode.CodeBackupChunkAuthFailed, err)
+		} else if ce.ExitCode() != sluicecode.ExitRefusal {
+			t.Errorf("coded chunk-auth refusal exit = %d; want %d (ExitRefusal)", ce.ExitCode(), sluicecode.ExitRefusal)
 		}
 	})
 

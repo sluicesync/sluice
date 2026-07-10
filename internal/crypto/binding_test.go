@@ -12,9 +12,53 @@ package crypto
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 )
+
+// TestDecryptChunk_AuthFailureWrapsSentinel pins that an AES-GCM auth-tag
+// failure — the whole tamper/splice/wrong-key class — wraps the exported
+// [ErrChunkAuthFailed] sentinel on BOTH the AAD and the legacy nil-AAD
+// paths, so the restore/verify layer can [errors.Is] it and attach the
+// coded refusal (SEC-1). A clean decrypt and a shape error (too-short
+// ciphertext, wrong CEK length) do NOT wrap the sentinel — only the auth
+// tag does.
+func TestDecryptChunk_AuthFailureWrapsSentinel(t *testing.T) {
+	cek, err := GenerateCEK()
+	if err != nil {
+		t.Fatalf("GenerateCEK: %v", err)
+	}
+	pt := []byte("chunk payload bytes")
+	aad := []byte("sluice-chunk-aad/v1\nfile=chunks/a-0")
+	bound, err := EncryptChunkWithAAD(pt, cek, aad)
+	if err != nil {
+		t.Fatalf("EncryptChunkWithAAD: %v", err)
+	}
+	unbound, err := EncryptChunk(pt, cek)
+	if err != nil {
+		t.Fatalf("EncryptChunk: %v", err)
+	}
+
+	// AAD mismatch (the SEC-1 chunk-swap shape) → sentinel.
+	if _, err := DecryptChunkWithAAD(bound, cek, []byte("sluice-chunk-aad/v1\nfile=chunks/b-0")); !errors.Is(err, ErrChunkAuthFailed) {
+		t.Errorf("AAD-mismatch error should wrap ErrChunkAuthFailed; got %v", err)
+	}
+	// Tampered ciphertext on the legacy nil-AAD path → sentinel.
+	corrupt := append([]byte(nil), unbound...)
+	corrupt[len(corrupt)-1] ^= 0xFF
+	if _, err := DecryptChunk(corrupt, cek); !errors.Is(err, ErrChunkAuthFailed) {
+		t.Errorf("tampered nil-AAD ciphertext should wrap ErrChunkAuthFailed; got %v", err)
+	}
+	// Clean decrypt → no sentinel.
+	if _, err := DecryptChunkWithAAD(bound, cek, aad); errors.Is(err, ErrChunkAuthFailed) {
+		t.Errorf("a clean decrypt must not wrap ErrChunkAuthFailed: %v", err)
+	}
+	// A shape error (too-short ciphertext) is NOT an auth failure.
+	if _, err := DecryptChunkWithAAD([]byte("short"), cek, aad); err == nil || errors.Is(err, ErrChunkAuthFailed) {
+		t.Errorf("a too-short ciphertext should error WITHOUT the auth sentinel; got %v", err)
+	}
+}
 
 // TestEncryptDecryptChunkWithAAD_Matrix pins the AAD acceptance
 // matrix on the bulk-chunk primitive: only the identical

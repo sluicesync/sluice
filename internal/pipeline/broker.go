@@ -1121,7 +1121,9 @@ func (b *SyncFromBackup) streamOneChunkWithPosition(
 	}
 	cr, err := blobcodec.NewChangeChunkReader(src, chunk.SHA256, cek, codec, irbackup.ChangeChunkAADFor(owner, chunk, chunkIdx))
 	if err != nil {
-		return fmt.Errorf("open chunk reader: %w", err)
+		// Decrypt-at-open: a tampered/spliced encrypted change chunk fails
+		// its GCM auth tag here → coded refusal (SEC-1).
+		return lineage.CodeChunkAuthError(fmt.Errorf("open chunk reader: %w", err))
 	}
 	for {
 		change, rErr := cr.ReadChange()

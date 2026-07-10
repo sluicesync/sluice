@@ -1065,7 +1065,9 @@ func (r *ChainRestore) streamOneChangeChunk(
 	// in the binding because change-REPLAY order is semantic.
 	cr, err := blobcodec.NewChangeChunkReader(src, chunk.SHA256, cek, codec, irbackup.ChangeChunkAADFor(link.Manifest, chunk, chunkIdx))
 	if err != nil {
-		return fmt.Errorf("open chunk reader: %w", err)
+		// A change chunk decrypts at open; a tampered/spliced encrypted
+		// change chunk fails its GCM auth tag here → coded refusal (SEC-1).
+		return lineage.CodeChunkAuthError(fmt.Errorf("open chunk reader: %w", err))
 	}
 	for {
 		change, err := cr.ReadChange()
