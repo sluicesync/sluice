@@ -198,7 +198,10 @@ func encryptedSniffFixture(t *testing.T, store irbackup.Store, codec blobcodec.C
 			Parallelism: p.Parallelism, KeyLen: p.KeyLen,
 		},
 	}
-	putRealChunk(t, store, chunkPath, codec, cek, irbackup.ChunkAAD(m, chunkPath))
+	// SEC-F1: a v7 row chunk's AAD folds its parent table, so write the
+	// chunk with the SAME table-bound AAD the sniffer will recompute.
+	putRealChunk(t, store, chunkPath, codec, cek,
+		irbackup.ChunkAADFor(m, m.Tables[0].Chunks[0], m.Tables[0].Schema, m.Tables[0].Name))
 	mustWriteManifest(t, store, ManifestFileName, m)
 	return env
 }

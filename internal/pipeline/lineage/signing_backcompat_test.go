@@ -91,7 +91,7 @@ func TestVerifyManifest_V2RelabelStillRefused(t *testing.T) {
 }
 
 // TestVerifyManifest_FutureVersionUpgrade pins that a signature recording
-// a canon version this build doesn't know (a future v4) refuses with the
+// a canon version this build doesn't know (a future v5) refuses with the
 // UPGRADE message, NOT SIGNATURE-INVALID (it's a version gap, not tamper).
 func TestVerifyManifest_FutureVersionUpgrade(t *testing.T) {
 	ctx := context.Background()
@@ -100,7 +100,7 @@ func TestVerifyManifest_FutureVersionUpgrade(t *testing.T) {
 	m := testManifest()
 	// A well-formed sig envelope claiming a future canon version.
 	sig := &irbackup.ManifestSignature{
-		CanonVersion: "sluice-manifest-canon/v4",
+		CanonVersion: "sluice-manifest-canon/v5",
 		Scheme:       irbackup.SignatureSchemeHMACKEK,
 		KeyID:        s.KeyID,
 		Sequence:     0,
@@ -187,6 +187,31 @@ func TestVerifyManifest_V3RelabelToV2Refused(t *testing.T) {
 			t.Fatalf("v3->v2 relabel (ed25519): got %v, want ErrSignatureInvalid", err)
 		}
 	})
+}
+
+// TestVerifyManifest_V4RelabelToV3Refused is the SEC-F1 downgrade-oracle
+// pin: an adversary who reassigns row chunks between two same-column-set
+// tables AND relabels the v4 signature to canon v3 (which recomputes
+// WITHOUT the parent-table tokens, where the swap is invisible) still
+// fails. The MAC was computed over the v4 bytes (with the table tokens);
+// recomputing at v3 drops those tokens, so the bytes differ and the MAC
+// fails — SIGNATURE-INVALID. The dual-version verifier does not become a
+// downgrade oracle that strips the new binding.
+func TestVerifyManifest_V4RelabelToV3Refused(t *testing.T) {
+	ctx := context.Background()
+	s := testSigner(t)
+	store := newMemStore()
+	m := twoTableManifest()
+	if err := WriteManifestSig(ctx, store, ManifestFileName, m, 0, s); err != nil {
+		t.Fatal(err)
+	}
+	// Reassign the chunks between the two same-schema tables and relabel the
+	// signature down to v3 to try to hide the swap.
+	m.Tables[0].Chunks, m.Tables[1].Chunks = m.Tables[1].Chunks, m.Tables[0].Chunks
+	relabelSigCanonVersion(t, ctx, store, ManifestSigPath(ManifestFileName), irbackup.ManifestCanonVersionV3)
+	if err := VerifyManifest(ctx, store, ManifestFileName, m, 0, s); !errors.Is(err, ErrSignatureInvalid) {
+		t.Fatalf("v4->v3 relabel + chunk swap: got %v, want ErrSignatureInvalid (no downgrade oracle)", err)
+	}
 }
 
 // TestVerifyLineage_V2BackCompat pins the dual-version lineage catalog

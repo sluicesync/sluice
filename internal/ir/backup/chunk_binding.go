@@ -61,14 +61,22 @@ func bindingIdentity(m *Manifest) string {
 		"\nkind=" + canonicalKind(m.Kind)
 }
 
-// ChunkAAD returns the AES-GCM additional-authenticated-data a chunk
-// at the given manifest-recorded path carries — or nil when the
-// manifest predates [FormatVersionEncryptedChunkBinding], whose chunks
-// were written unbound and MUST decrypt via the legacy nil-AAD path.
-// This function is the single VERSION gate for both sides: writers call
-// it with the freshly-stamped manifest, readers with the manifest as
-// read from the store, so the shape is always derived from the RECORDED
-// version and never guessed.
+// ChunkAAD returns the BASE AES-GCM additional-authenticated-data a chunk
+// at the given manifest-recorded path carries — manifest identity + path —
+// or nil when the manifest predates [FormatVersionEncryptedChunkBinding],
+// whose chunks were written unbound and MUST decrypt via the legacy
+// nil-AAD path. This function is the single VERSION gate for both sides:
+// writers call it with the freshly-stamped manifest, readers with the
+// manifest as read from the store, so the shape is always derived from the
+// RECORDED version and never guessed.
+//
+// It is the shared base for BOTH chunk kinds and deliberately carries NO
+// parent-table field: change chunks ([ChangeChunkAAD]) are manifest-scoped
+// (they bind a replay ordinal, not a table), and row chunks fold their
+// parent table on top via [ChunkAADFor] / [ChunkAADForWrite] (SEC-F1,
+// gated at [FormatVersionChunkTableBinding]). Row-chunk callers MUST use
+// those wrappers, never this base directly, or a chunk reassigned between
+// two same-column-set tables would decrypt into the wrong one.
 //
 // It does NOT gate on encryption — an incremental's manifest records no
 // ChainEncryption of its own (the chain CEK lives on the segment full),
@@ -90,17 +98,37 @@ func ChunkAAD(m *Manifest, file string) []byte {
 	return []byte(chunkAADPrefix + bindingIdentity(m) + "\nfile=" + file)
 }
 
-// ChunkAADForWrite is the WRITE-side gate for [ChunkAAD]: it returns the
-// position binding only when the chunk is actually being encrypted (a
-// non-nil CEK). A plaintext chunk — including one under a v6
-// (Ed25519-signed) manifest — has no ciphertext to bind, so it must be
-// written with a nil AAD (the chunk writer refuses an AAD without a CEK).
-// The manifest signature covers a plaintext chunk's SHA + position.
-func ChunkAADForWrite(m *Manifest, file string, cek []byte) []byte {
+// rowChunkTableBinding is the parent-table suffix a ROW chunk's AAD carries
+// at [FormatVersionChunkTableBinding]+ (SEC-F1): the (schema, table) that
+// lists the chunk, so a chunk reassigned between two same-column-set tables
+// on a shared store fails to decrypt (its GCM tag was computed against the
+// ORIGINAL table's AAD). Empty for pre-v7 manifests, so their row-chunk
+// AAD stays byte-identical to what shipped — the on-disk contract that
+// keeps every v5/v6 chain decryptable. Uses the same `\nkey=value` framing
+// as [bindingIdentity] and [ChangeChunkAAD]'s `\nindex=`.
+func rowChunkTableBinding(m *Manifest, schema, table string) string {
+	if m == nil || m.FormatVersion < FormatVersionChunkTableBinding {
+		return ""
+	}
+	return "\nschema=" + schema + "\ntable=" + table
+}
+
+// ChunkAADForWrite is the WRITE-side gate for a ROW chunk's AAD: it returns
+// the position binding (manifest identity + path, plus the parent table at
+// v7+) only when the chunk is actually being encrypted (a non-nil CEK). A
+// plaintext chunk — including one under a v6 (Ed25519-signed) manifest —
+// has no ciphertext to bind, so it must be written with a nil AAD (the
+// chunk writer refuses an AAD without a CEK). The manifest signature covers
+// a plaintext chunk's SHA + position + parent table (canon v4).
+func ChunkAADForWrite(m *Manifest, file, schema, table string, cek []byte) []byte {
 	if len(cek) == 0 {
 		return nil
 	}
-	return ChunkAAD(m, file)
+	base := ChunkAAD(m, file)
+	if base == nil {
+		return nil
+	}
+	return append(base, rowChunkTableBinding(m, schema, table)...)
 }
 
 // ChangeChunkAADForWrite is [ChunkAADForWrite] for change chunks (adds the
@@ -112,22 +140,28 @@ func ChangeChunkAADForWrite(m *Manifest, file string, index int, cek []byte) []b
 	return ChangeChunkAAD(m, file, index)
 }
 
-// ChunkAADFor is the READ-side form of [ChunkAAD]: it additionally
+// ChunkAADFor is the READ-side form of a ROW chunk's AAD: it additionally
 // gates on the chunk's own recorded encryption metadata, because only
 // encrypted chunks carry a GCM binding — a plaintext chunk under a
 // v5+ manifest (hand-assembled today; possible for real once a future
 // FormatVersion covers a plaintext feature) has no ciphertext to bind.
-// Writers use [ChunkAAD] directly (they know they are encrypting);
-// readers use this so the shape is derived from what the manifest
-// RECORDS about each chunk. Stripping the Encryption field off a
-// bound chunk's manifest entry doesn't downgrade anything silently:
-// the reader then treats ciphertext as a plaintext codec stream and
-// fails loudly at the codec header.
-func ChunkAADFor(m *Manifest, c *ChunkInfo) []byte {
+// schema/table are the chunk's PARENT table (folded at v7+, SEC-F1); the
+// caller supplies them from the table whose [TableManifest.Chunks] the
+// chunk belongs to — the reader iterates tables → chunks, so the parent is
+// always in hand. Writers use [ChunkAADForWrite]; readers use this so the
+// shape is derived from what the manifest RECORDS about each chunk.
+// Stripping the Encryption field off a bound chunk's manifest entry doesn't
+// downgrade anything silently: the reader then treats ciphertext as a
+// plaintext codec stream and fails loudly at the codec header.
+func ChunkAADFor(m *Manifest, c *ChunkInfo, schema, table string) []byte {
 	if c == nil || c.Encryption == nil {
 		return nil
 	}
-	return ChunkAAD(m, c.File)
+	base := ChunkAAD(m, c.File)
+	if base == nil {
+		return nil
+	}
+	return append(base, rowChunkTableBinding(m, schema, table)...)
 }
 
 // ChangeChunkAAD is [ChunkAAD] for CHANGE chunks, which additionally

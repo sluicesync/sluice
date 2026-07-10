@@ -152,8 +152,8 @@ func TestBackup_SignedManifest_Ed25519_DR(t *testing.T) {
 	if fullB.ChainEncryption == nil {
 		t.Fatal("encrypted backup missing ChainEncryption")
 	}
-	if fullB.FormatVersion != irbackup.FormatVersionSignedManifest {
-		t.Fatalf("encrypted signed full FormatVersion = %d; want %d", fullB.FormatVersion, irbackup.FormatVersionSignedManifest)
+	if fullB.FormatVersion != irbackup.FormatVersionChunkTableBinding {
+		t.Fatalf("encrypted signed full FormatVersion = %d; want %d (SEC-F1 row-chunk table binding)", fullB.FormatVersion, irbackup.FormatVersionChunkTableBinding)
 	}
 
 	// Delta + incremental (Ed25519 signer supplied; chain is Ed25519-signed).

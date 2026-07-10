@@ -55,13 +55,13 @@ func TestChunkAAD_VersionGate(t *testing.T) {
 	// loudly. The version-only [ChunkAAD] still derives bytes for v6 (its
 	// encrypted callers gate on the CEK / recorded chunk encryption).
 	v6 := bindingTestManifest(FormatVersionSignedManifest)
-	if ChunkAADForWrite(v6, "chunks/t-0.jsonl.gz", nil) != nil {
+	if ChunkAADForWrite(v6, "chunks/t-0.jsonl.gz", "public", "t", nil) != nil {
 		t.Error("plaintext (no-CEK) v6 chunk derived a write AAD; nothing to bind")
 	}
 	if ChangeChunkAADForWrite(v6, "chunks/c-0.jsonl.gz", 0, nil) != nil {
 		t.Error("plaintext (no-CEK) v6 change chunk derived a write AAD; nothing to bind")
 	}
-	if ChunkAADForWrite(v6, "chunks/t-0.jsonl.gz", []byte("cek")) == nil {
+	if ChunkAADForWrite(v6, "chunks/t-0.jsonl.gz", "public", "t", []byte("cek")) == nil {
 		t.Error("encrypted v6 chunk derived NO write AAD; the binding is lost")
 	}
 }
@@ -148,14 +148,16 @@ func TestChunkAAD_DistinctPerIdentityAndPosition(t *testing.T) {
 func TestChunkAADFor_GatesOnChunkEncryption(t *testing.T) {
 	m := bindingTestManifest(FormatVersionEncryptedChunkBinding)
 	plain := &ChunkInfo{File: "chunks/t-0"}
-	if aad := ChunkAADFor(m, plain); aad != nil {
+	if aad := ChunkAADFor(m, plain, "public", "t"); aad != nil {
 		t.Errorf("plaintext chunk under a v5 manifest derived AAD %q; plaintext chunks have no ciphertext to bind", aad)
 	}
 	enc := &ChunkInfo{File: "chunks/t-0", Encryption: &ChunkEncryption{Algorithm: "AES-256-GCM"}}
-	if !bytes.Equal(ChunkAADFor(m, enc), ChunkAAD(m, "chunks/t-0")) {
-		t.Error("encrypted chunk's read-side AAD must equal the writer-side derivation")
+	// v5 predates the table binding, so the read-side AAD equals the base
+	// (untable-bound) derivation — the on-disk contract for v5/v6 chains.
+	if !bytes.Equal(ChunkAADFor(m, enc, "public", "t"), ChunkAAD(m, "chunks/t-0")) {
+		t.Error("encrypted v5 chunk's read-side AAD must equal the base (untable-bound) derivation")
 	}
-	if ChunkAADFor(m, nil) != nil {
+	if ChunkAADFor(m, nil, "public", "t") != nil {
 		t.Error("nil chunk must derive no AAD")
 	}
 	if !bytes.Equal(ChangeChunkAADFor(m, enc, 2), ChangeChunkAAD(m, "chunks/t-0", 2)) {

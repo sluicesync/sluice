@@ -121,7 +121,26 @@ import (
 // backup the operator asked to sign is stamped 6. Pre-v6 manifests
 // carry no signature and restore normally (the version gate means
 // "predates signing", not "untrusted").
-const BackupFormatVersion = 6
+//
+// v0.99.21x+ introduces FormatVersion=7 for SIGNED ENCRYPTED manifests
+// whose row chunks additionally bind their PARENT TABLE into the GCM AAD
+// (ADR-0154 SEC-F1). Before v7 a row chunk's AAD bound only (manifest
+// identity + chunk path), so swapping the row-chunk lists of two tables
+// with the same column set — same-schema shards, multi-tenant clones,
+// `orders_2023`/`orders_2024` — decrypted GREEN into the wrong table
+// (the signature had the same blind spot; the canon-v4 bump closes the
+// signature side, this closes the decrypt side). A v7 manifest's
+// encrypted row chunks carry `…\nfile=…\nschema=…\ntable=…`; readers
+// derive the shape from this recorded stamp. It is a strict SUPERSET of
+// v6 (signed) so [IsSignedFormat] still holds: v7 is stamped ONLY on a
+// signed ENCRYPTED full (whose row chunks are the only chunks with a
+// table-bound AAD). An unsigned encrypted backup stays on 5 and a
+// PLAINTEXT signed backup stays on 6 — a plaintext chunk has no
+// ciphertext to bind, so its parent-table binding rides in the canon-v4
+// signature alone. Proportional per the Bug-116 discipline; an older
+// binary refuses a v7 manifest loudly at the preflight rather than
+// decrypting its row chunks against the wrong (untable-bound) AAD.
+const BackupFormatVersion = 7
 
 // FormatVersionLegacy / FormatVersionSecurityMetadata name the
 // historically-recorded values so callers don't sprinkle bare ints
@@ -178,6 +197,20 @@ const (
 	// 116); an unsigned encrypted backup stays on
 	// [FormatVersionEncryptedChunkBinding].
 	FormatVersionSignedManifest = 6
+
+	// FormatVersionChunkTableBinding is the version stamped on a SIGNED
+	// ENCRYPTED manifest whose row chunks bind their PARENT TABLE into the
+	// GCM AAD (ADR-0154 SEC-F1). It is the read-side gate for that binding:
+	// a row chunk under a manifest at this version or above was written
+	// with `…\nfile=…\nschema=…\ntable=…` ([ChunkAADFor] /
+	// [ChunkAADForWrite]); below it the AAD ends at `…\nfile=…` and readers
+	// MUST NOT append the table field or the ciphertext fails to decrypt.
+	// A strict SUPERSET of [FormatVersionSignedManifest] (so [IsSignedFormat]
+	// holds), stamped only on a signed encrypted full — the one manifest
+	// shape whose row chunks are encrypted; a resumed pre-v7 encrypted run
+	// keeps its prior version so its already-written untable-bound chunks
+	// still decrypt (the Bug-179 inherit-the-chain's-shape rule).
+	FormatVersionChunkTableBinding = 7
 )
 
 // chooseFormatVersion returns the smallest manifest format version

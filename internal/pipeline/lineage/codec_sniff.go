@@ -47,11 +47,15 @@ var ErrCodecSniffEncrypted = errors.New(
 // codecProbe identifies one sniffable chunk within a manifest: the
 // chunk plus how to derive its AAD. changeIdx is the chunk's ordinal in
 // [irbackup.Manifest.ChangeChunks] (change chunks bind their replay
-// ordinal into the AAD — ADR-0152), or -1 for a row chunk.
+// ordinal into the AAD — ADR-0152), or -1 for a row chunk. schema/table
+// are the row chunk's parent table (folded into its AAD at v7+, SEC-F1);
+// empty for a change chunk, which is manifest-scoped.
 type codecProbe struct {
 	m         *irbackup.Manifest
 	chunk     *irbackup.ChunkInfo
 	changeIdx int
+	schema    string
+	table     string
 }
 
 // firstProbeableChunk returns m's first chunk reference (row chunks in
@@ -67,7 +71,7 @@ func firstProbeableChunk(m *irbackup.Manifest) *codecProbe {
 		}
 		for _, c := range t.Chunks {
 			if c != nil && c.File != "" {
-				return &codecProbe{m: m, chunk: c, changeIdx: -1}
+				return &codecProbe{m: m, chunk: c, changeIdx: -1, schema: t.Schema, table: t.Name}
 			}
 		}
 	}
@@ -139,7 +143,7 @@ func (s *chainCodecSniffer) sniff(ctx context.Context, p *codecProbe) (blobcodec
 	if p.changeIdx >= 0 {
 		aad = irbackup.ChangeChunkAADFor(p.m, p.chunk, p.changeIdx)
 	} else {
-		aad = irbackup.ChunkAADFor(p.m, p.chunk)
+		aad = irbackup.ChunkAADFor(p.m, p.chunk, p.schema, p.table)
 	}
 	pt, err := crypto.DecryptChunkWithAAD(ct, cek, aad)
 	if err != nil {

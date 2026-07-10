@@ -988,7 +988,7 @@ func (r *Restore) streamChunkRows(
 		_ = src.Close()
 		return 0, fmt.Errorf("resolve chunk cek: %w", err)
 	}
-	cr, err := blobcodec.NewChunkReader(src, chunk.SHA256, cek, r.segCodec, irbackup.ChunkAADFor(r.manifest, chunk))
+	cr, err := blobcodec.NewChunkReader(src, chunk.SHA256, cek, r.segCodec, irbackup.ChunkAADFor(r.manifest, chunk, table.Schema, table.Name))
 	if err != nil {
 		return 0, fmt.Errorf("open chunk reader: %w", err)
 	}
