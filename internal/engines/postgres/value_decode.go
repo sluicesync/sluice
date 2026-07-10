@@ -453,10 +453,30 @@ func decodeTime(raw any) (any, error) {
 // wins. The format strings mirror pgx's internal pgTimestampFormat
 // to stay consistent across pgx-driven and pgoutput-driven paths.
 func parsePGTimeText(s string) (time.Time, error) {
+	// PROM-P2: the non-finite / non-Gregorian timestamptz values Postgres
+	// can emit have no representable target instant. Refuse them by NAME
+	// (loud, coded-at-the-caller) rather than fall through to the opaque
+	// "cannot parse" error — an operator seeing "infinity" needs to know it
+	// is unsupported, not that the parser is broken.
+	switch {
+	case s == "infinity" || s == "-infinity":
+		return time.Time{}, fmt.Errorf("postgres: timestamptz %q is not representable as a fixed-width target timestamp (infinite value)", s)
+	case strings.HasSuffix(s, " BC"):
+		return time.Time{}, fmt.Errorf("postgres: timestamp %q is a BC (pre-Gregorian) date with no representable target value", s)
+	}
 	layouts := []string{
-		// TIMESTAMPTZ — canonical Postgres output is "2006-01-02 15:04:05.999999-07".
+		// TIMESTAMPTZ. Postgres renders the zone offset as ±HH, ±HH:MM, or
+		// ±HH:MM:SS depending on the session TimeZone — whole-hour zones give
+		// "-07", half/quarter-hour zones (Asia/Kolkata +05:30, Asia/Kathmandu
+		// +05:45, America/St_Johns -03:30) give "-07:00", and second-level
+		// historical LMT offsets (e.g. Europe/Amsterdam pre-1937 = +00:19:32)
+		// give "-07:00:00". PROM-P1: only the ±HH form was handled, so the
+		// pgoutput CDC pump aborted on the FIRST timestamptz under any
+		// fractional-offset server timezone. The ".999999999" makes the
+		// fractional seconds optional, so each offset width needs one layout.
+		"2006-01-02 15:04:05.999999999-07:00:00",
+		"2006-01-02 15:04:05.999999999-07:00",
 		"2006-01-02 15:04:05.999999999-07",
-		"2006-01-02 15:04:05-07",
 		// TIMESTAMP without timezone.
 		"2006-01-02 15:04:05.999999999",
 		"2006-01-02 15:04:05",

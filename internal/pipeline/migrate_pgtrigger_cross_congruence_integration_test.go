@@ -280,6 +280,57 @@ func TestMigratePGTrigger_CrossCongruenceVsParent(t *testing.T) {
 	assertPGTrigCrossCongruent(t, tgtSlot, tgtTrig)
 }
 
+// TestMigratePGTrigger_CrossCongruenceVsParent_NonUTCSession is the PROM-P1 +
+// PROM-M1 regression: the SAME cross-engine congruence flow, but with the PG
+// source server pinned to a FRACTIONAL-offset timezone (Asia/Kolkata, +05:30).
+// This is the leg the audit flagged as missing — the prior congruence test only
+// ever ran under the container's default UTC, so it could not see either
+// timestamptz bug.
+//
+// Under Asia/Kolkata a `timestamptz` renders as "...+05:30" on both CDC paths:
+//   - LEG A (pgoutput → mysql): the walsender emits the +05:30 text.
+//     Before the PROM-P1 fix `parsePGTimeText` had only whole-hour "-07"
+//     layouts, so this leg ABORTED on the first timestamptz change — the slot
+//     target would never drain and this test would time out.
+//   - LEG B (postgres-trigger → mysql): to_jsonb emits the +05:30 text.
+//     Before the PROM-M1 fix the MySQL writer STRIPPED the offset, storing the
+//     Kolkata wall clock instead of the UTC instant — a silent divergence from
+//     LEG A's (correct) time.Time instant, which the congruence checksum
+//     catches.
+//
+// With both fixes, both legs store the identical UTC instant and the checksums
+// match — exactly the done-signal the audit specified.
+func TestMigratePGTrigger_CrossCongruenceVsParent_NonUTCSession(t *testing.T) {
+	srcSlot, srcTrig, pgCleanup := startPGCrossCongruencePG(t, "-c", "timezone=Asia/Kolkata")
+	defer pgCleanup()
+	tgtSlot, tgtTrig, myCleanup := startPGCrossCongruenceMySQL(t)
+	defer myCleanup()
+
+	seed := crossCongruenceSeedRows()
+	for _, dsn := range []string{srcSlot, srcTrig} {
+		pgCrossCongruenceExecPG(t, dsn, crossCongruenceSeedDDL)
+		pgCrossCongruenceExecPG(t, dsn, seed)
+	}
+
+	stopA := runCrossCongruenceSlotLeg(t, srcSlot, tgtSlot)
+	defer stopA()
+	stopB := runCrossCongruenceTriggerLeg(t, srcTrig, tgtTrig)
+	defer stopB()
+
+	if !waitForCrossCongruenceDrained(tgtSlot, 120*time.Second) {
+		t.Fatalf("slot-based MySQL target never drained under Asia/Kolkata (PROM-P1: pgoutput timestamptz parse?): %s",
+			crossCongruenceDrainDiag(tgtSlot))
+	}
+	if !waitForCrossCongruenceDrained(tgtTrig, 120*time.Second) {
+		t.Fatalf("trigger-based MySQL target never drained under Asia/Kolkata: %s",
+			crossCongruenceDrainDiag(tgtTrig))
+	}
+
+	// LEG A (pgoutput, correct time.Time instant) == LEG B (trigger): proves
+	// the trigger leg stores the UTC INSTANT, not the +05:30 wall clock.
+	assertPGTrigCrossCongruent(t, tgtSlot, tgtTrig)
+}
+
 // waitForCrossCongruenceDrained polls a MySQL target until it reflects the
 // ENTIRE crossCongruenceCDCDML sequence — not just a row count. Satisfied
 // only when every CDC mutation has landed simultaneously (see the same-
@@ -616,12 +667,24 @@ func assertPGTrigCrossCongruent(t *testing.T, slotDSN, trigDSN string) {
 // is required for the slot-based leg's pgoutput CDC; it's a strict superset
 // of what the trigger leg needs (plain replica), so both legs share the
 // container.
-func startPGCrossCongruencePG(t *testing.T) (srcSlot, srcTrig string, cleanup func()) {
+func startPGCrossCongruencePG(t *testing.T, extraGUC ...string) (srcSlot, srcTrig string, cleanup func()) {
 	t.Helper()
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+
+	cmd := []string{
+		"-c", "wal_level=logical",
+		"-c", "max_wal_senders=8",
+		"-c", "max_replication_slots=8",
+	}
+	// extraGUC lets a caller pin server-level settings — notably
+	// "-c", "timezone=Asia/Kolkata" for the PROM-P1/PROM-M1 non-UTC leg: the
+	// server TimeZone drives BOTH the pgoutput wire text (walsender renders in
+	// the server zone) and the trigger to_jsonb rendering (DML sessions default
+	// to it), so both CDC paths emit fractional-offset timestamptz text.
+	cmd = append(cmd, extraGUC...)
 
 	container, err := pgtc.Run(
 		ctx,
@@ -633,11 +696,7 @@ func startPGCrossCongruencePG(t *testing.T) (srcSlot, srcTrig string, cleanup fu
 		pgPrebakedWaitStrategy(),
 		testcontainers.CustomizeRequest(testcontainers.GenericContainerRequest{
 			ContainerRequest: testcontainers.ContainerRequest{
-				Cmd: []string{
-					"-c", "wal_level=logical",
-					"-c", "max_wal_senders=8",
-					"-c", "max_replication_slots=8",
-				},
+				Cmd: cmd,
 			},
 		}),
 	)

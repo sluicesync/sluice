@@ -463,22 +463,16 @@ func TestPrepareValue_PGTriggerCDCValueFamilies(t *testing.T) {
 			want: "2026-02-02 02:02:02.020202",
 		},
 
-		// timestamptz (PG `timestamptz` -> MySQL TIMESTAMP): ISO string
-		// WITH a +00 zone offset. MySQL's TIMESTAMP parser rejects the
-		// offset (Error 1292) — the LOUD-failure divergence. The fix
-		// strips the offset (documented zone-flatten policy). DANGER family.
-		{
-			name: "timestamptz +00 offset stripped",
-			in:   "2026-02-02 02:02:02.020202+00",
-			t:    ir.Timestamp{Precision: 6, WithTimeZone: true},
-			want: "2026-02-02 02:02:02.020202",
-		},
-		{
-			name: "timestamptz +05:30 offset stripped",
-			in:   "2026-05-02 12:34:56.123456+05:30",
-			t:    ir.Timestamp{Precision: 6, WithTimeZone: true},
-			want: "2026-05-02 12:34:56.123456",
-		},
+		// timestamptz (PG `timestamptz` -> MySQL TIMESTAMP): a postgres-trigger
+		// timestamptz arrives as an offset-bearing ISO string. PROM-M1: the
+		// offset encodes the INSTANT, so prepareValue now converts it to a UTC
+		// time.Time (matching the bulk-copy path) rather than stripping to the
+		// source-session wall clock. Because the result is a time.Time — not a
+		// string — the instant-conversion cases live in
+		// TestPrepareValue_TimestamptzInstantConversion (which compares by
+		// instant, not reflect.DeepEqual on a time.Time's internal fields);
+		// plain-timestamp stripping and time.Time passthrough are pinned in the
+		// sibling tests in row_writer_timestamptz_test.go.
 
 		// bytea (PG `bytea` -> MySQL LONGBLOB): the trigger reader emits
 		// the `\x`-hex TEXT form. Binding it as a string stores the literal
