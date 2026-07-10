@@ -11,6 +11,13 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
+// Compile-time pin: a signature drift on UpdateFloatColumnsByPK would
+// otherwise silently drop this *RowWriter out of the ir.FloatRepairWriter
+// optional-interface assertion at streamer_coldstart_float_repair.go, taking
+// the WARN-skip branch — postgres cold-start FLOAT repair would become a
+// no-op with no compile error (ARCH-F1). This turns that into a build break.
+var _ ir.FloatRepairWriter = (*RowWriter)(nil)
+
 // floatRepairBatchRows bounds how many per-row UPDATEs a single target
 // transaction folds in the FLOAT re-read repair (roadmap open-bug
 // 2026-07-09). See the MySQL sibling for the rationale; each UPDATE is
