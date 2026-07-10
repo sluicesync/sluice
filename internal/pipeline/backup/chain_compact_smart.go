@@ -800,7 +800,11 @@ func applySmartCompactionToIncremental(
 		ccr, err := blobcodec.NewChangeChunkReader(counter, "", cek, codec, irbackup.ChangeChunkAADFor(im, ch, chIdx))
 		if err != nil {
 			_ = rc.Close()
-			return nil, fmt.Errorf("open chunk %q: %w", ch.File, err)
+			// Decrypt-at-open: a tampered/spliced encrypted change chunk met
+			// during compaction fails its GCM tag here → coded refusal, the
+			// same SLUICE-E-BACKUP-CHUNK-AUTH-FAILED the restore paths emit
+			// (parity across restore/replay/compact; SEC-1).
+			return nil, lineage.CodeChunkAuthError(fmt.Errorf("open chunk %q: %w", ch.File, err))
 		}
 		for {
 			c, err := ccr.ReadChange()

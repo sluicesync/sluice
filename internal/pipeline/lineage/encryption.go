@@ -28,6 +28,11 @@ import (
 // passphrase. Non-auth errors — and nil — pass through unchanged, so a wrong
 // key (caught earlier at CEK unwrap), a SHA mismatch, or an I/O error keep
 // their own shape.
+//
+// The wrong-key / tamper separation does NOT rely on caller routing alone: a
+// CEK-unwrap failure wraps [crypto.ErrCEKUnwrapFailed], which is disjoint from
+// [crypto.ErrChunkAuthFailed], so even if a CEK-resolve error were mistakenly
+// handed to this mapper it would NOT be coded as chunk tamper.
 func CodeChunkAuthError(err error) error {
 	if err == nil || !errors.Is(err, crypto.ErrChunkAuthFailed) {
 		return err

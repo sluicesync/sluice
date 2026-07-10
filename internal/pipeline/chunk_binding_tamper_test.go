@@ -16,6 +16,8 @@ package pipeline
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"strings"
 	"testing"
@@ -195,6 +197,33 @@ func swapStoreFiles(t *testing.T, store irbackup.Store, a, b string) {
 	}
 }
 
+// flipStoreByte corrupts one byte of a stored chunk blob and returns the
+// SHA-256 hex digest of the tampered bytes, so a test can fix up the manifest
+// SHA (defeating the SHA layer) and leave only the GCM auth tag to object —
+// the adversary model where the coded chunk-auth refusal must fire.
+func flipStoreByte(t *testing.T, store irbackup.Store, path string) string {
+	t.Helper()
+	ctx := context.Background()
+	rc, err := store.Get(ctx, path)
+	if err != nil {
+		t.Fatalf("get %s: %v", path, err)
+	}
+	data, err := io.ReadAll(rc)
+	_ = rc.Close()
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	if len(data) < 32 {
+		t.Fatalf("stored blob %s too small to tamper (%d bytes)", path, len(data))
+	}
+	data[len(data)/2] ^= 0xFF // flip a byte inside the ciphertext region
+	if err := store.Put(ctx, path, bytes.NewReader(data)); err != nil {
+		t.Fatalf("put %s: %v", path, err)
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
 // TestChunkBinding_TamperMatrix is the ADR-0152 end-to-end tamper
 // matrix against a per-chain encrypted chain. The adversary model is a
 // store-level rewriter who also fixes up the manifest's SHA-256 /
@@ -248,6 +277,39 @@ func TestChunkBinding_TamperMatrix(t *testing.T) {
 			t.Errorf("swap refusal should carry coded %s; got %v", sluicecode.CodeBackupChunkAuthFailed, err)
 		} else if ce.ExitCode() != sluicecode.ExitRefusal {
 			t.Errorf("coded chunk-auth refusal exit = %d; want %d (ExitRefusal)", ce.ExitCode(), sluicecode.ExitRefusal)
+		}
+	})
+
+	t.Run("full ROW chunk tampered (SHA fixed up) → coded refuse (restore.go path)", func(t *testing.T) {
+		// The swap case above exercises the CHANGE-chunk path (chain_restore /
+		// codec_sniff). This one tampers a FULL's ROW chunk so the coded
+		// refusal is asserted through restore.go's streamChunkRows — the
+		// row-chunk decrypt-at-open seam (SEC-1 audit F-3, the row-chunk e2e
+		// gap the change-chunk swap didn't cover).
+		store, _ := encryptedChainFixture(t)
+		fm, err := lineage.ReadManifest(ctx, store)
+		if err != nil {
+			t.Fatalf("read full manifest: %v", err)
+		}
+		if len(fm.Tables) == 0 || len(fm.Tables[0].Chunks) == 0 {
+			t.Fatalf("fixture full has no row chunks to tamper")
+		}
+		chunk := fm.Tables[0].Chunks[0]
+		// Corrupt the ciphertext and fix the manifest SHA so FetchChunkVerified
+		// (SHA layer) passes and only the GCM tag can object.
+		chunk.SHA256 = flipStoreByte(t, store, chunk.File)
+		if err := lineage.WriteManifestAt(ctx, store, lineage.ManifestFileName, fm); err != nil {
+			t.Fatalf("rewrite full manifest: %v", err)
+		}
+		_, err = tamperRestore(t, store)
+		if err == nil {
+			t.Fatal("tampered full row chunk restored cleanly; the row-chunk GCM binding is not enforced")
+		}
+		ce, ok := sluicecode.FromError(err)
+		if !ok || ce.Code != sluicecode.CodeBackupChunkAuthFailed {
+			t.Errorf("tampered row-chunk restore should carry coded %s; got %v", sluicecode.CodeBackupChunkAuthFailed, err)
+		} else if ce.ExitCode() != sluicecode.ExitRefusal {
+			t.Errorf("coded row-chunk refusal exit = %d; want %d (ExitRefusal)", ce.ExitCode(), sluicecode.ExitRefusal)
 		}
 	})
 

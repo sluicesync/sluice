@@ -350,8 +350,8 @@ func resignIfSigned(ctx context.Context, store irbackup.Store, signed bool, sign
 func unverifiableSignedManifest(ctx context.Context, what string, requireStrict bool) error {
 	if requireStrict {
 		return lineage.SignatureMissingError(fmt.Errorf(
-			"%s asserts a signature (FormatVersion %d) but no verification key is available and --require-signature is set",
-			what, irbackup.FormatVersionSignedManifest,
+			"%s requires a verified signature (--require-signature is set) but no verification key is available",
+			what,
 		))
 	}
 	slog.WarnContext(ctx,
