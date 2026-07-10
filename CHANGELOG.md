@@ -4,6 +4,18 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.218] - 2026-07-10
+
+### Fixed
+
+- **`sluice restore` (not just `backup verify`) now refuses a tampered or bit-rotted manifest carrying a null structural element with the coded `SLUICE-E-BACKUP-SIGNATURE-INVALID`, instead of panicking (completes the v0.99.215 Bug-182 fix; loud either way, zero data-loss).** v0.99.215 wired the null-structural-element guard into `backup verify` but not the restore path, so a hand-tampered UNSIGNED manifest with a `"tables":[null]` or `chunks:[null]` fed to `restore` still nil-deref-crashed with a Go stack trace (a SIGNED manifest is caught earlier — a null chunk bumps the recorded count into a signature mismatch). The structural-validation pass now runs up front in both the single-manifest (`Restore.Run`) and chain (`ChainRestore.Run`) restore paths, before any chunk traversal. Found by the 2026-07-10 confirming audit; pinned by a restore-path regression test.
+
+- **The batched exact-FLOAT repair (v0.99.217) no longer risks exceeding the database's bind-parameter limit on a very wide FLOAT table.** The repair binds `(primary-key + FLOAT) × batch` parameters per statement, and both Postgres and MySQL cap a single statement at 65,535 bind parameters — so a table with roughly 130+ single-precision FLOAT columns at the fixed 500-row batch could have overflowed the ceiling and failed the `UPDATE`. The batch size is now derived from the column count (kept under a 60,000-parameter budget), so a wide table transparently uses a smaller batch while a normal (few-column) table keeps the full 500. Found by the 2026-07-10 confirming audit; pinned by a wide-table cap test.
+
+### Documentation
+
+- **`docs/backup-format-versioning.md` now documents backup FormatVersion 7** (the signed-encrypted, row-chunk-parent-table-bound manifest shipped in v0.99.214, ADR-0154 SEC-F1) — the doc previously stopped at FormatVersion 6.
+
 ## [0.99.217] - 2026-07-10
 
 ### Changed
