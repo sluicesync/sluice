@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.221] - 2026-07-10
+
+### Changed
+
+- **Audit cleanup: a wrong backup-encryption passphrase can no longer be mislabeled as chunk tamper, the coded chunk-auth refusal now also covers the compaction path, and three stale docs are corrected — no behavior change for a well-formed backup.** A fresh confirming audit of the v0.99.218→220 delta found no correctness or security defect (the v0.99.219 SEC-1 change survived adversarial refutation on all five attack vectors; zero silent-loss), but surfaced a handful of low-severity fix-quality items in the just-shipped fixes, all closed here. **(1)** The v0.99.220 wrong-key-vs-tamper separation was protected only by which call site an error flowed through, not by the error's content: the CEK-unwrap path runs the same AES-GCM primitive as chunk decryption, so a genuine wrong-passphrase error also carried the chunk-auth sentinel, and a future refactor could have relabeled a wrong key as a "tampered/spliced store" refusal. A new, deliberately **disjoint** `crypto.ErrCEKUnwrapFailed` sentinel now tags CEK-unwrap failures so they can never be coded as chunk tamper regardless of routing — a wrong passphrase stays a wrong passphrase. **(2)** A fifth encrypted-chunk decrypt site — chain **compaction** — failed loudly but without the coded `SLUICE-E-BACKUP-CHUNK-AUTH-FAILED` the four restore/replay paths emit; it is now coded too, so tamper during a `backup compact` reports the same machine-readable refusal restore would. **(3)** The coded refusal gained an end-to-end pin on the full **row-chunk** tamper path (it was previously e2e-tested only on the change-chunk path). **(4, docs)** A `--require-signature` refusal against an unsigned FormatVersion-7 backup no longer prints a misleading "(FormatVersion 6)"; ADR-0154 gained an inline marker so the superseded pre-SEC-1 "v7 is signed-only" wording isn't read as current; and the `backup-chain-operator` skill guide's claim that `prune` takes no encryption flags is corrected (a signed chain's `prune` renumbers link positions and must re-sign the survivors, so it **does** require `--encrypt` + the key — it is not a usage error). Found by the 2026-07-10 confirming audit; all items were LOW/MEDIUM-LOW with no active defect.
+
 ## [0.99.220] - 2026-07-10
 
 ### Changed
