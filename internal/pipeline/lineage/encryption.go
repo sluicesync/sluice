@@ -5,11 +5,37 @@ package lineage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"sluicesync.dev/sluice/internal/crypto"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
+
+// CodeChunkAuthError maps a chunk AES-GCM authentication failure
+// ([crypto.ErrChunkAuthFailed] — a chunk whose ciphertext or AAD does not
+// match what was sealed: tamper, bit-rot, or a spliced/reordered store) to
+// the coded [sluicecode.CodeBackupChunkAuthFailed] refusal. It is the loud,
+// machine-readable TWIN of a signed manifest's SLUICE-E-BACKUP-SIGNATURE-
+// INVALID for a backup that is ENCRYPTED but NOT SIGNED: without a signature
+// the chunk swap/tamper is caught at DECRYPT (the GCM AAD binding — ADR-0152
+// position binding + ADR-0154 SEC-F1/SEC-1 parent-table binding), not at
+// verify, so this gives that decrypt-time refusal the same exit-3 Refusal
+// class and stable code as the signed path. By the time a chunk is decrypted
+// the chain CEK has already unwrapped (its KEK-wrap is itself authenticated),
+// so an auth failure here is a tamper/corruption signal, never a wrong
+// passphrase. Non-auth errors — and nil — pass through unchanged, so a wrong
+// key (caught earlier at CEK unwrap), a SHA mismatch, or an I/O error keep
+// their own shape.
+func CodeChunkAuthError(err error) error {
+	if err == nil || !errors.Is(err, crypto.ErrChunkAuthFailed) {
+		return err
+	}
+	return sluicecode.Wrap(sluicecode.CodeBackupChunkAuthFailed,
+		"an encrypted backup chunk failed authenticated decryption (tampered, corrupt, or a spliced/reordered store); an encrypted-but-unsigned backup catches this at restore rather than verify",
+		err)
+}
 
 // BackupEncryption is the chunk-writer-side encryption configuration
 // shared by [Backup], [IncrementalBackup], and [BackupStream]. Nil

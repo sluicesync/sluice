@@ -147,7 +147,14 @@ func (s *chainCodecSniffer) sniff(ctx context.Context, p *codecProbe) (blobcodec
 	}
 	pt, err := crypto.DecryptChunkWithAAD(ct, cek, aad)
 	if err != nil {
-		return "", fmt.Errorf("codec probe: decrypt chunk %q (wrong passphrase / KMS key, or tampered chunk): %w", p.chunk.File, err)
+		// probeCEK already unwrapped the CEK (its KEK-wrap is authenticated),
+		// so an auth failure here is tamper/corruption, not a wrong key — map
+		// it to the coded SLUICE-E-BACKUP-CHUNK-AUTH-FAILED refusal. This
+		// probe runs before restore's chunk read, so on a swapped/spliced
+		// encrypted chunk it is the FIRST decrypt to fail; without coding it,
+		// the coded refusal would never surface (SEC-1). Non-auth shape errors
+		// pass through with the probe context.
+		return "", CodeChunkAuthError(fmt.Errorf("codec probe: decrypt chunk %q: %w", p.chunk.File, err))
 	}
 	if len(pt) > blobcodec.SniffCodecPrefixLen {
 		pt = pt[:blobcodec.SniffCodecPrefixLen]

@@ -511,6 +511,18 @@ func DecryptChunk(ciphertext, cek []byte) ([]byte, error) {
 	return DecryptChunkWithAAD(ciphertext, cek, nil)
 }
 
+// ErrChunkAuthFailed is wrapped by [DecryptChunkWithAAD] (and thus
+// [DecryptChunk]) on an AES-GCM auth-tag failure, so a higher layer can
+// [errors.Is] the opaque `cipher: message authentication failed` and map
+// it to a coded refusal. By the time a row/change chunk is decrypted the
+// chain CEK has already unwrapped (its KEK-wrap is itself authenticated),
+// so a tag failure HERE means the ciphertext or its AAD does not match
+// what was sealed — tamper, bit-rot, or a spliced/reordered store — not a
+// wrong passphrase (which fails earlier at CEK unwrap). The leaf crypto
+// package carries only this sentinel; the sluice error CODE is attached
+// by the restore/verify layer that owns the code registry.
+var ErrChunkAuthFailed = errors.New("crypto: chunk failed authenticated decryption")
+
 // DecryptChunkWithAAD is the inverse of [EncryptChunkWithAAD]. The
 // auth-tag check fails — and the chunk is refused — when aad differs
 // from the encryption-time value, when the CEK is wrong, or when the
@@ -535,13 +547,14 @@ func DecryptChunkWithAAD(ciphertext, cek, aad []byte) ([]byte, error) {
 	ct := ciphertext[NonceLen:]
 	pt, err := gcm.Open(nil, nonce, ct, aad)
 	if err != nil {
-		// AES-GCM Open returns an opaque error on auth-tag failure;
-		// wrap with operator-actionable context. Distinct from
-		// short-input above so callers can branch on shape vs auth.
+		// AES-GCM Open returns an opaque error on auth-tag failure; wrap
+		// with operator-actionable context AND the [ErrChunkAuthFailed]
+		// sentinel so the restore/verify layer can branch on shape vs auth
+		// (the short-input case above is NOT wrapped with the sentinel).
 		if aad != nil {
-			return nil, fmt.Errorf("crypto: aes-gcm open: %w (wrong key, tampered ciphertext, or a chunk that does not belong at this position in this backup — spliced/replayed store?)", err)
+			return nil, fmt.Errorf("%w: aes-gcm open: %w (wrong key, tampered ciphertext, or a chunk that does not belong at this position in this backup — spliced/replayed store?)", ErrChunkAuthFailed, err)
 		}
-		return nil, fmt.Errorf("crypto: aes-gcm open: %w (wrong key or tampered ciphertext)", err)
+		return nil, fmt.Errorf("%w: aes-gcm open: %w (wrong key or tampered ciphertext)", ErrChunkAuthFailed, err)
 	}
 	return pt, nil
 }

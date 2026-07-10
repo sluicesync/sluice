@@ -1001,7 +1001,11 @@ func (r *Restore) streamChunkRows(
 	}
 	cr, err := blobcodec.NewChunkReader(src, chunk.SHA256, cek, r.segCodec, irbackup.ChunkAADFor(r.manifest, chunk, table.Schema, table.Name))
 	if err != nil {
-		return 0, fmt.Errorf("open chunk reader: %w", err)
+		// A row chunk decrypts entirely at open, so a swapped/tampered
+		// encrypted chunk fails its GCM auth tag HERE. Map that to the coded
+		// SLUICE-E-BACKUP-CHUNK-AUTH-FAILED refusal — the unsigned-encrypted
+		// twin of the signed manifest's SIGNATURE-INVALID (SEC-1).
+		return 0, lineage.CodeChunkAuthError(fmt.Errorf("open chunk reader: %w", err))
 	}
 	// Chunk-header ↔ schema cross-check (ADR-0152, audit N-8 item 3):
 	// the header pins the column list the chunk was written against; a
