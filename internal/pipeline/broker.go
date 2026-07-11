@@ -995,15 +995,32 @@ func (b *SyncFromBackup) applyIncremental(
 	//    idempotent so a re-replay on broker crash is safe.
 	backupID := lineage.ManifestBackupID(link.Manifest)
 	if len(link.Manifest.ChangeChunks) == 0 {
-		// Bug 183: a 0-chunk incremental whose EndPosition ADVANCES beyond
-		// StartPosition claims to cover data it has no chunks to provide — an
-		// emptied change-chunk list (the mirror of the F1 tail-truncation
-		// case, which the streaming path's EndPosition check catches). A legit
-		// schema-only window has EndPosition == StartPosition. Refuse the
-		// emptied case rather than silently advance the broker past it.
-		if end := link.Manifest.EndPosition; (end.Engine != "" || end.Token != "") &&
-			end != link.Manifest.StartPosition &&
-			len(link.Manifest.SchemaDelta) == 0 && len(link.Manifest.SchemaHistory) == 0 {
+		// Bug 183/184: a 0-chunk incremental whose EndPosition ADVANCES beyond
+		// StartPosition claims to cover data it has no change chunks to provide.
+		// The one legitimate 0-chunk shape that advances a position-bearing
+		// EndPosition is a DDL-only window: it observed a DDL but no DML, so
+		// EndPosition == the schema snapshot's own anchor (see
+		// [irbackup.Manifest.SchemaHistoryAnchors]). Anything else with a
+		// posBearing advance and no snapshot at EndPosition is an emptied
+		// change-chunk list — refuse rather than silently advance the broker
+		// past dropped events.
+		//
+		// Bug 184 CORRECTION: the old `SchemaDelta == 0 && SchemaHistory == 0`
+		// carve-out was unsound — every real DATA incremental carries a routine
+		// first-touch schema snapshot (anchored BEFORE its rows on PG/binlog,
+		// never at EndPosition), so mere SchemaHistory presence let an
+		// emptied-DATA window advance the broker past dropped events. Key on the
+		// anchor POSITION instead. And on VStream (CDCPositionCommitsAfterRows) a
+		// snapshot can SHARE a position with a data change, so a schema anchor at
+		// EndPosition proves nothing there — trust the anchor only when the
+		// engine's schema anchor strictly precedes its rows.
+		trustSchemaAnchor := !link.Manifest.CDCPositionCommitsAfterRows
+		end := link.Manifest.EndPosition
+		// With 0 chunks, the only thing that can "reach" a position-bearing
+		// EndPosition is a trusted schema snapshot anchored exactly at it.
+		reachedEnd := trustSchemaAnchor && link.Manifest.SchemaHistoryAnchors(end)
+		if (end.Engine != "" || end.Token != "") &&
+			end != link.Manifest.StartPosition && !reachedEnd {
 			return 0, sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
 				"restore from an untampered copy, or sign the chain so a truncated/emptied change-list is caught at verify time",
 				fmt.Errorf("incremental %s: manifest records EndPosition %+v (StartPosition %+v) but carries no change chunks — the change-chunk list was emptied; refusing to advance the broker past dropped events",

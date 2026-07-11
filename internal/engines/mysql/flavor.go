@@ -148,9 +148,14 @@ var flavorCapabilities = map[Flavor]ir.Capabilities{
 	//                       on the session for OLAP-mode timeouts.)
 	// ---------------------------------------------------------------
 	FlavorPlanetScale: {
-		BulkLoad:    ir.BulkLoadBatchedInsert,
-		CDC:         ir.CDCVStream,
-		SchemaScope: ir.SchemaScopeFlat,
+		BulkLoad: ir.BulkLoadBatchedInsert,
+		CDC:      ir.CDCVStream,
+		// VStream stamps positions per-transaction-commit AFTER the rows
+		// (the VGTID follows its rows), so a schema snapshot and the rows
+		// in the same tx share one position — restore must not trust a
+		// schema anchor at EndPosition as proof of data (Bug 184).
+		CDCPositionCommitsAfterRows: true,
+		SchemaScope:                 ir.SchemaScopeFlat,
 		SupportedTypes: ir.NewTypeSet(
 			ir.ExtEnum,
 			ir.ExtSet,

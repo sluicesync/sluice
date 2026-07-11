@@ -575,6 +575,19 @@ type Manifest struct {
 	// backups' table chunks but live under `chunks/_changes/`.
 	ChangeChunks []*ChunkInfo `json:"change_chunks,omitempty"`
 
+	// CDCPositionCommitsAfterRows records the source engine's
+	// [ir.Capabilities.CDCPositionCommitsAfterRows] at backup time: true
+	// when the engine stamps CDC positions per-transaction-commit AFTER the
+	// rows (Vitess/VStream), so a schema-history snapshot can share a
+	// position with the row changes in its transaction. The restore-side
+	// completeness backstop reads this to decide whether a schema anchor at
+	// EndPosition proves the window's data was applied (see
+	// [Manifest.SchemaHistoryAnchors] and the Bug 184 guard in
+	// chain_restore.go / broker.go): it must NOT trust the anchor when this
+	// is true. Absent (false) on older manifests and on non-VStream engines,
+	// where a schema anchor strictly precedes its rows.
+	CDCPositionCommitsAfterRows bool `json:"cdc_position_commits_after_rows,omitempty"`
+
 	// ChainEncryption, when non-nil, identifies this manifest's chain
 	// as encrypted under Phase 6 client-side envelope encryption. Empty
 	// (the zero default) means plaintext chunks — the v0.16.x..v0.21.x
@@ -586,6 +599,31 @@ type Manifest struct {
 	// [ChainEncryption] to set up the [crypto.EnvelopeEncryption] used
 	// to decrypt every chunk in the chain.
 	ChainEncryption *ChainEncryption `json:"chain_encryption,omitempty"`
+}
+
+// SchemaHistoryAnchors an EndPosition reports whether any SchemaHistory
+// entry is anchored EXACTLY at pos. A schema-only incremental window (a
+// DDL with no DML) advances EndPosition to the schema snapshot's own WAL
+// position, so its last schema-history anchor equals EndPosition — that
+// snapshot is what "reaches" EndPosition even though the window carries no
+// change chunks.
+//
+// This is the schema-side half of the Bug 183/184 completeness backstop
+// (the chunk-side half is "the replayed change-chunk tail ends at
+// EndPosition"). A DATA incremental's routine first-touch schema snapshot
+// is anchored at/before the FIRST row's position (the reader emits the
+// Relation/table-map ahead of its rows), strictly before EndPosition (the
+// LAST row), so it never spuriously satisfies this check — an emptied-data
+// window (chunks deleted, the routine early-anchored snapshot left behind)
+// has NO anchor at EndPosition and is correctly refused. Equality-only, so
+// it is engine-neutral (no LSN/GTID ordering).
+func (m *Manifest) SchemaHistoryAnchors(pos ir.Position) bool {
+	for _, e := range m.SchemaHistory {
+		if e != nil && e.AnchorPosition == pos {
+			return true
+		}
+	}
+	return false
 }
 
 // Manifest partial-state constants. String literals are part of the
