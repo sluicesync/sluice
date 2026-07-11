@@ -1238,6 +1238,9 @@ func (b *BackupStream) runRollover(
 		}
 	}
 
+	// Stamp the CDC-position fold version FIRST (item 57) so ComputeBackupID
+	// folds CDCPositionCommitsAfterRows into the id for a VStream segment.
+	irbackup.StampCDCPositionBinding(manifest)
 	manifest.BackupID = irbackup.ComputeBackupID(manifest)
 	manifest.PartialState = irbackup.BackupStateComplete
 	out.Manifest = manifest

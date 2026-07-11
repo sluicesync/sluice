@@ -114,6 +114,80 @@ func TestComputeBackupID_DeterministicAndDistinguishing(t *testing.T) {
 	}
 }
 
+// TestComputeBackupID_CDCPositionFold pins the item-57 fold: a
+// FormatVersion-8+ manifest folds CDCPositionCommitsAfterRows into its
+// identity (so an unsigned flip is caught), while a pre-8 manifest keeps its
+// LEGACY id regardless of the flag (so existing chains still recompute-verify
+// clean and mixed-version chains stay coherent).
+func TestComputeBackupID_CDCPositionFold(t *testing.T) {
+	base := Manifest{
+		CreatedAt:    time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC),
+		SourceEngine: "mysql",
+		Kind:         BackupKindIncremental,
+		EndPosition:  ir.Position{Engine: "mysql", Token: `{"vgtid":"..."}`},
+	}
+
+	// At FormatVersion 8 the flag is IN the identity → flipping it changes id.
+	v8on := base
+	v8on.FormatVersion = FormatVersionCDCPositionBinding
+	v8on.CDCPositionCommitsAfterRows = true
+	v8off := base
+	v8off.FormatVersion = FormatVersionCDCPositionBinding
+	v8off.CDCPositionCommitsAfterRows = false
+	if ComputeBackupID(&v8on) == ComputeBackupID(&v8off) {
+		t.Error("FV8: flag flip must change the BackupID (fold inactive)")
+	}
+
+	// Below FormatVersion 8 the flag rides OUTSIDE the identity → flipping it
+	// does NOT change the id. This is the backward-compat guarantee: an
+	// existing v224/225 VStream manifest (flag true, recorded pre-8 id)
+	// recompute-verifies clean under the new ComputeBackupID.
+	v7on := base
+	v7on.FormatVersion = FormatVersionChunkTableBinding // 7
+	v7on.CDCPositionCommitsAfterRows = true
+	v7off := base
+	v7off.FormatVersion = FormatVersionChunkTableBinding
+	v7off.CDCPositionCommitsAfterRows = false
+	if ComputeBackupID(&v7on) != ComputeBackupID(&v7off) {
+		t.Error("pre-8: flag must NOT affect the BackupID (legacy id must stay stable)")
+	}
+	// And the pre-8 id equals the flag-agnostic base id (no folded field).
+	if ComputeBackupID(&v7on) != ComputeBackupID(&base) {
+		t.Error("pre-8 id must equal the un-folded base id")
+	}
+}
+
+// TestStampCDCPositionBinding pins the version-stamp helper: it bumps a
+// flag-carrying manifest to FormatVersion 8, is a no-op when the flag is
+// false, is idempotent, and never lowers an already-higher version.
+func TestStampCDCPositionBinding(t *testing.T) {
+	// Flag true → bumped to 8.
+	m := &Manifest{CDCPositionCommitsAfterRows: true, FormatVersion: FormatVersionLegacy}
+	StampCDCPositionBinding(m)
+	if m.FormatVersion != FormatVersionCDCPositionBinding {
+		t.Errorf("flag-true stamp = %d; want %d", m.FormatVersion, FormatVersionCDCPositionBinding)
+	}
+	// Idempotent.
+	StampCDCPositionBinding(m)
+	if m.FormatVersion != FormatVersionCDCPositionBinding {
+		t.Errorf("re-stamp changed version to %d", m.FormatVersion)
+	}
+	// Flag false → no-op (keeps feature-min version).
+	mf := &Manifest{CDCPositionCommitsAfterRows: false, FormatVersion: FormatVersionSecurityMetadata}
+	StampCDCPositionBinding(mf)
+	if mf.FormatVersion != FormatVersionSecurityMetadata {
+		t.Errorf("flag-false stamp changed version to %d; want %d", mf.FormatVersion, FormatVersionSecurityMetadata)
+	}
+	// Never lowers a higher version (max semantics) — hypothetical future >8.
+	mh := &Manifest{CDCPositionCommitsAfterRows: true, FormatVersion: FormatVersionCDCPositionBinding + 5}
+	StampCDCPositionBinding(mh)
+	if mh.FormatVersion != FormatVersionCDCPositionBinding+5 {
+		t.Errorf("stamp lowered a higher version to %d", mh.FormatVersion)
+	}
+	// Nil-safe.
+	StampCDCPositionBinding(nil)
+}
+
 // TestComputeBackupID_NilSafe confirms the helper is safe on nil
 // input and returns the empty string.
 func TestComputeBackupID_NilSafe(t *testing.T) {

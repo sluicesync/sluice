@@ -147,9 +147,9 @@ func TestChooseFormatVersion_Bug116(t *testing.T) {
 // chunk-binding contracts, this test catches the regression at build
 // time.
 func TestBackupFormatVersion_Bumped(t *testing.T) {
-	if BackupFormatVersion != FormatVersionChunkTableBinding {
-		t.Errorf("BackupFormatVersion = %d; want FormatVersionChunkTableBinding=%d (ADR-0154 SEC-F1 ceiling)",
-			BackupFormatVersion, FormatVersionChunkTableBinding)
+	if BackupFormatVersion != FormatVersionCDCPositionBinding {
+		t.Errorf("BackupFormatVersion = %d; want FormatVersionCDCPositionBinding=%d (item 57 fold ceiling)",
+			BackupFormatVersion, FormatVersionCDCPositionBinding)
 	}
 	if FormatVersionLegacy != 1 {
 		t.Errorf("FormatVersionLegacy = %d; must stay 1 (load-bearing for older-binary preflight semantics)", FormatVersionLegacy)
@@ -177,5 +177,9 @@ func TestBackupFormatVersion_Bumped(t *testing.T) {
 	if FormatVersionChunkTableBinding <= FormatVersionSignedManifest {
 		t.Errorf("FormatVersionChunkTableBinding (%d) must be strictly greater than FormatVersionSignedManifest (%d) — a table-bound row chunk decrypts against an AAD pre-v7 binaries cannot reproduce, so they must refuse it at the version gate (ADR-0154 SEC-F1 / SEC-1)",
 			FormatVersionChunkTableBinding, FormatVersionSignedManifest)
+	}
+	if FormatVersionCDCPositionBinding <= FormatVersionChunkTableBinding {
+		t.Errorf("FormatVersionCDCPositionBinding (%d) must be strictly greater than FormatVersionChunkTableBinding (%d) — a manifest that folds CDCPositionCommitsAfterRows into its BackupID recompute-mismatches on any pre-8 binary (which computes the id without the folded field), so they must refuse it at the version gate (item 57 fold)",
+			FormatVersionCDCPositionBinding, FormatVersionChunkTableBinding)
 	}
 }

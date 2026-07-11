@@ -181,6 +181,22 @@ func ComputeBackupID(m *Manifest) string {
 		"end_position_engine=" + m.EndPosition.Engine,
 		"end_position_token=" + m.EndPosition.Token,
 	}
+	// FormatVersion 8+ (item 57 fold) folds CDCPositionCommitsAfterRows into
+	// the identity: that flag flips restore's replay semantics (whether the
+	// recorded EndPosition commits AFTER the window's rows), so on an unsigned
+	// CDC manifest it must invalidate the id if edited, exactly as an
+	// EndPosition edit does. APPENDED (never reordered into the base fields)
+	// and gated on the manifest's OWN recorded version so every pre-8
+	// manifest — whose recorded BackupID was computed before this field
+	// existed — keeps its legacy id and still recompute-verifies clean, and a
+	// mixed-version chain stays coherent (see [StampCDCPositionBinding]).
+	if m.FormatVersion >= FormatVersionCDCPositionBinding {
+		v := "false"
+		if m.CDCPositionCommitsAfterRows {
+			v = "true"
+		}
+		parts = append(parts, "cdc_position_commits_after_rows="+v)
+	}
 	h := sha256.Sum256([]byte(strings.Join(parts, "\n")))
 	return hex.EncodeToString(h[:8])
 }
