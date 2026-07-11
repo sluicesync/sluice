@@ -1473,9 +1473,12 @@ func (b *SyncFromBackup) chunkCEK(chunk *irbackup.ChunkInfo) ([]byte, error) {
 		// manifest level (ANY-chunk-encrypted test); this closes the finer
 		// single-chunk splice that test misses, in per-chain OR per-chunk mode.
 		if b.chainEncrypted {
-			return nil, lineage.CodeChunkAuthError(fmt.Errorf(
-				"plaintext change chunk %q spliced into an encrypted chain — refusing to apply it as cleartext", chunk.File,
-			))
+			// Shared coded refusal (BRK-3 parity with the offline restore
+			// paths — see lineage.PlaintextChunkSplicedError). Previously an
+			// uncoded CodeChunkAuthError(fmt.Errorf(...)) that shipped WITHOUT
+			// the coded class (CodeChunkAuthError only codes errors wrapping
+			// crypto.ErrChunkAuthFailed, which this splice does not).
+			return nil, lineage.PlaintextChunkSplicedError(chunk.File)
 		}
 		return nil, nil
 	}

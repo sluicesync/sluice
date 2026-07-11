@@ -108,6 +108,30 @@ func TestPlanetScaleCapabilities(t *testing.T) {
 	if caps.DDLDialect != ir.DDLDialectMySQL {
 		t.Errorf("planetscale DDLDialect = %v; want DDLDialectMySQL", caps.DDLDialect)
 	}
+	if !caps.CDCPositionCommitsAfterRows {
+		t.Error("planetscale CDCPositionCommitsAfterRows = false; want true (VStream stamps the VGTID after its rows — Bug 184)")
+	}
+}
+
+// TestVStreamFlavorsCommitPositionsAfterRows pins the invariant the
+// 2026-07-10 audit called for: EVERY VStream-CDC flavor must declare
+// CDCPositionCommitsAfterRows=true, and no non-VStream flavor may. The Bug 184
+// completeness guard trusts a manifest's stamped flag, which DEFAULTS to the
+// UNSAFE false; a VStream flavor added to flavorCapabilities without the flag
+// would silently record false and reopen the emptied-data silent-loss on that
+// engine (the v0.99.51 zero-value-default trap). This anchors the
+// flavor→capability wiring the completeness tests otherwise bypass with a
+// synthetic bool.
+func TestVStreamFlavorsCommitPositionsAfterRows(t *testing.T) {
+	for _, f := range []Flavor{FlavorVanilla, FlavorPlanetScale, FlavorVitess} {
+		caps := f.capabilities()
+		if caps.CDC == ir.CDCVStream && !caps.CDCPositionCommitsAfterRows {
+			t.Errorf("flavor %q: CDC==VStream but CDCPositionCommitsAfterRows=false — VStream stamps positions AFTER its rows, so restore must not trust a schema anchor at EndPosition (Bug 184); the default-false flag reopens the emptied-data silent-loss", f)
+		}
+		if caps.CDC != ir.CDCVStream && caps.CDCPositionCommitsAfterRows {
+			t.Errorf("flavor %q: non-VStream CDC (%v) declares CDCPositionCommitsAfterRows=true — only commit-after-rows engines should", f, caps.CDC)
+		}
+	}
 }
 
 // TestVitessCapabilities pins that the self-hosted vitess flavor shares

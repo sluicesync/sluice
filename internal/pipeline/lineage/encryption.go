@@ -42,6 +42,27 @@ func CodeChunkAuthError(err error) error {
 		err)
 }
 
+// PlaintextChunkSplicedError is the coded refusal for a PLAINTEXT chunk
+// (ChunkInfo.Encryption == nil) found in an encrypted chain. Because a
+// plaintext chunk is never decrypted, the GCM/AAD tamper net that
+// [CodeChunkAuthError] gives an encrypted chunk does not apply — a
+// store-write adversary could otherwise swap one chunk to forged cleartext
+// (Encryption=nil + matching SHA on an unsigned chain) and have it applied
+// as attacker rows. Every incremental/full writer stamps ChunkEncryption on
+// EVERY chunk of an encrypted chain, so a nil here is a splice.
+//
+// Shared by the broker AND both offline restore paths (BRK-3 parity) so the
+// three change-apply consumers cannot drift — a fix that lands in one and
+// not its siblings is this codebase's recurring silent-divergence class, and
+// is exactly how this gap (the guard on the broker only) arose. Coded
+// SLUICE-E-BACKUP-CHUNK-AUTH-FAILED — "spliced store" is precisely what that
+// code names; signing (--require-signature) closes the whole class.
+func PlaintextChunkSplicedError(chunkFile string) error {
+	return sluicecode.Wrap(sluicecode.CodeBackupChunkAuthFailed,
+		"an encrypted-but-unsigned backup must never apply a plaintext chunk; restore from an untampered copy, or sign the chain (--sign/--sign-key + --require-signature) for full manifest tamper-proofing",
+		fmt.Errorf("plaintext chunk %q spliced into an encrypted chain — refusing to apply it as cleartext", chunkFile))
+}
+
 // BackupEncryption is the chunk-writer-side encryption configuration
 // shared by [Backup], [IncrementalBackup], and [BackupStream]. Nil
 // means plaintext (the v0.16.x..v0.21.x shape, preserved for backward

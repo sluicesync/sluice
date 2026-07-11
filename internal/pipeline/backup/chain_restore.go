@@ -143,6 +143,14 @@ type ChainRestore struct {
 	// Reused for every change-chunk decrypt across the incremental
 	// walk so Argon2id (passphrase mode) runs once per chain restore.
 	chainCEK []byte
+
+	// chainEncrypted records whether the chain root carries
+	// [irbackup.ChainEncryption] (per-chain OR per-chunk mode). Set in
+	// preflightEncryption. When true, a change chunk with no ChunkEncryption
+	// is a plaintext splice and is refused (BRK-3 parity with the broker;
+	// mirrors SyncFromBackup.chainEncrypted). NOT derivable from chainCEK,
+	// which stays nil in per-chunk mode even on an encrypted chain.
+	chainEncrypted bool
 }
 
 // DefaultChainRestoreBatchSize is the default value of
@@ -567,6 +575,9 @@ func (r *ChainRestore) preflightEncryption(rootManifest *irbackup.Manifest) erro
 	if rootManifest == nil || rootManifest.ChainEncryption == nil {
 		return nil
 	}
+	// The chain is encrypted (per-chain or per-chunk): every legitimate chunk
+	// carries ChunkEncryption, so a plaintext chunk in the walk is a splice.
+	r.chainEncrypted = true
 	enc := rootManifest.ChainEncryption
 	if r.Envelope == nil {
 		return fmt.Errorf("encrypted chain (algorithm=%q kek_mode=%q kek_ref=%q) requires --encrypt + a passphrase / KMS reference; no key was supplied",
@@ -1068,11 +1079,15 @@ func (r *ChainRestore) streamIncrementalChanges(
 	// Threat-model note (ADR-0152 residual shape (4)): CDCPositionCommitsAfterRows
 	// is an unsigned manifest field NOT covered by ComputeBackupID, so a store
 	// adversary on an UNSIGNED backup can flip it true→false alongside emptying
-	// the chunks — a coherent edit, the same signing-closed residual class as a
-	// whole-backup rollback. Signing (--require-signature) closes it; the
-	// signing-independent hardening (recorded-vs-recomputed BackupID verify) is
-	// filed as its own design because rotation/prune mutate BackupID-covered
-	// fields in place, so a naive recompute-verify would false-positive.
+	// the chunks. On a VStream chain this yields the UNRECOVERABLE resume-gap
+	// class (unsigned VStream is strictly weaker than unsigned PG/MySQL, whose
+	// data-emptying F1 net does not depend on this flag). Signing
+	// (--require-signature) closes it. The signing-independent hardening —
+	// recorded-vs-recomputed BackupID verify + folding this flag into
+	// ComputeBackupID — is SAFE to add (no legitimate manifest-mutating op
+	// drifts BackupID: rotation caps the catalog Segment, not the manifest;
+	// compaction touches only the uncovered ParentBackupID) and is scheduled as
+	// roadmap item 57 (v0.99.226).
 	trustSchemaAnchor := !link.Manifest.CDCPositionCommitsAfterRows
 	reachedEnd := lastApplied == end ||
 		(trustSchemaAnchor && link.Manifest.SchemaHistoryAnchors(end))
@@ -1199,6 +1214,13 @@ func (r *ChainRestore) streamOneChangeChunk(
 // own wrapped CEK; plaintext returns nil.
 func (r *ChainRestore) changeChunkCEK(chunk *irbackup.ChunkInfo) ([]byte, error) {
 	if chunk.Encryption == nil {
+		if r.chainEncrypted {
+			// BRK-3 parity: refuse a plaintext chunk spliced into an encrypted
+			// chain rather than opening it as attacker cleartext. checkMixedModeChain
+			// keys on ANY-chunk-encrypted per incremental, so it misses a single
+			// plaintext chunk among encrypted siblings; this catches it.
+			return nil, lineage.PlaintextChunkSplicedError(chunk.File)
+		}
 		return nil, nil
 	}
 	if len(chunk.Encryption.WrappedCEK) > 0 {
