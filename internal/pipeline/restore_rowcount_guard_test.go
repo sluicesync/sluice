@@ -68,4 +68,12 @@ func TestRestore_ZeroedRowCount_Refused(t *testing.T) {
 		// zeroed chunk count that would otherwise disable the per-chunk check.
 		run(t, func(m *irbackup.Manifest) { m.Tables[0].Chunks[0].RowCount = 0 })
 	})
+
+	t.Run("EMPTIED table chunk list (RowCount kept) — Bug 183", func(t *testing.T) {
+		// The empty-list mirror of the zeroed-count case: the adversary
+		// deletes the table's chunk entries but leaves RowCount > 0. Without
+		// the guard the empty-table early-return silently restores it empty;
+		// a populated table (RowCount > 0) with NO chunks must refuse.
+		run(t, func(m *irbackup.Manifest) { m.Tables[0].Chunks = nil })
+	})
 }

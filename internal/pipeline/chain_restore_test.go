@@ -886,7 +886,12 @@ func TestChainRestore_CrossEngineWithIncrementalsSucceeds(t *testing.T) {
 	if err := lineage.WriteManifestAt(context.Background(), store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("write full: %v", err)
 	}
-	incr := makeManifest(t, irbackup.BackupKindIncremental, full, "0/200")
+	// A no-op incremental (no change chunks): its EndPosition does NOT advance
+	// past StartPosition — the real writer records the last change's position,
+	// and a 0-change window never advances it (Bug 183: a 0-chunk incremental
+	// with an ADVANCED EndPosition is the emptied-list attack shape and is
+	// refused).
+	incr := makeManifest(t, irbackup.BackupKindIncremental, full, "0/100")
 	incr.SourceEngine = "postgres"
 	incr.BackupID = irbackup.ComputeBackupID(incr)
 	if err := lineage.WriteManifestAt(context.Background(), store, "manifests/incr-0001.json", incr); err != nil {
