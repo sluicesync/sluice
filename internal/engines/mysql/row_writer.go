@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // defaultMaxRowsPerBatch caps how many rows go into a single INSERT
@@ -954,12 +955,16 @@ func refuseUnrepresentableFloat(v any, col *ir.Column) error {
 	if col != nil {
 		colName = col.Name
 	}
-	return fmt.Errorf(
-		"SLUICE-E-VALUE-UNREPRESENTABLE: column %q carries the float64 value %v, which no MySQL column type "+
-			"can represent (MySQL has no NaN/Infinity); refusing loudly rather than corrupting the value or "+
-			"retry-looping on the server's misleading error — filter or transform the source value "+
-			"(e.g. NULLIF / CASE on the source query)",
-		colName, f,
+	return sluicecode.Wrap(
+		sluicecode.CodeValueUnrepresentable,
+		"filter or transform the source value (e.g. NULLIF / CASE on the source query)",
+		fmt.Errorf(
+			"column %q carries the float64 value %v, which no MySQL column type can represent "+
+				"(MySQL has no NaN/Infinity); refusing loudly rather than corrupting the value or "+
+				"retry-looping on the server's misleading error — filter or transform the source value "+
+				"(e.g. NULLIF / CASE on the source query)",
+			colName, f,
+		),
 	)
 }
 

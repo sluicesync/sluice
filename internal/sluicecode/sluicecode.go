@@ -60,6 +60,7 @@ const (
 	CodeSchemaExtensionNotEnabled Code = "SLUICE-E-SCHEMA-EXTENSION-NOT-ENABLED"
 	CodeValueZeroDate             Code = "SLUICE-E-VALUE-ZERO-DATE"
 	CodeValueNULByte              Code = "SLUICE-E-VALUE-NUL-BYTE"
+	CodeValueUnrepresentable      Code = "SLUICE-E-VALUE-UNREPRESENTABLE"
 	CodeExprBackslashLiteral      Code = "SLUICE-E-EXPR-BACKSLASH-LITERAL"
 	CodeConfirmationRequired      Code = "SLUICE-E-CONFIRMATION-REQUIRED"
 	CodeDriverHostMismatch        Code = "SLUICE-E-DRIVER-HOST-MISMATCH"
@@ -114,6 +115,7 @@ var registry = map[Code]Info{
 	CodeSchemaExtensionNotEnabled:  {ClassRefusal, "column type owned by a PG extension not opted into"},
 	CodeValueZeroDate:              {ClassRefusal, "MySQL zero/partial date has no valid calendar value"},
 	CodeValueNULByte:               {ClassRefusal, "string value carries a NUL byte PostgreSQL text types cannot store"},
+	CodeValueUnrepresentable:       {ClassRefusal, "a value no target column type can represent (e.g. NaN/±Infinity into a MySQL FLOAT/DOUBLE)"},
 	CodeExprBackslashLiteral:       {ClassRefusal, "SQLite expression string literal with a backslash has no faithful MySQL spelling"},
 	CodeConfirmationRequired:       {ClassRefusal, "destructive operation requires explicit --yes confirmation"},
 	CodeDriverHostMismatch:         {ClassRefusal, "the driver cannot drive the DSN's host (e.g. mysql pointed at a PlanetScale endpoint)"},

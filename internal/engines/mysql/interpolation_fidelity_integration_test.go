@@ -62,6 +62,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // interpFidelityDDL renders the family-matrix table under the given name.
@@ -521,7 +522,7 @@ func TestInterpolation_BulkWrite_NaNInfRefusal(t *testing.T) {
 				t.Errorf("%s interpolateParams=%s: write of %v succeeded (stored: %v); want loud refusal", tc.name, proto, tc.val, got)
 				continue
 			}
-			if !strings.Contains(err.Error(), "SLUICE-E-VALUE-UNREPRESENTABLE") {
+			if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeValueUnrepresentable {
 				t.Errorf("%s interpolateParams=%s: refusal %q; want the SLUICE-E-VALUE-UNREPRESENTABLE guard (a server-side error here means the guard did not fire before the driver)", tc.name, proto, err)
 			}
 			// The refusal must be immediate — not a ridden-out retry window.
@@ -695,7 +696,7 @@ func TestInterpolation_ApplierNaN_RefusedNoRetry(t *testing.T) {
 		if err == nil {
 			t.Fatalf("interpolateParams=%s: ApplyBatch(NaN) succeeded; want the SLUICE-E-VALUE-UNREPRESENTABLE refusal", proto)
 		}
-		if !strings.Contains(err.Error(), "SLUICE-E-VALUE-UNREPRESENTABLE") {
+		if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeValueUnrepresentable {
 			t.Errorf("interpolateParams=%s: ApplyBatch(NaN) error %q; want the SLUICE-E-VALUE-UNREPRESENTABLE guard, not a server-side error", proto, err)
 		}
 		var re ir.RetriableError
