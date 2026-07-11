@@ -456,7 +456,11 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 		manifest.SchemaHash = refreshedHash
 	}
 
-	// 6. Compute BackupID and finalise.
+	// 6. Compute BackupID and finalise. Stamp the CDC-position fold version
+	// FIRST (item 57) so ComputeBackupID folds CDCPositionCommitsAfterRows into
+	// the id for a VStream segment; a no-op (legacy id, feature-min version) for
+	// a non-VStream one.
+	irbackup.StampCDCPositionBinding(manifest)
 	manifest.BackupID = irbackup.ComputeBackupID(manifest)
 	manifest.PartialState = irbackup.BackupStateComplete
 

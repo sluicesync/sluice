@@ -142,7 +142,25 @@ import (
 // per the Bug-116 discipline; an older binary refuses a v7 manifest loudly
 // at the preflight rather than decrypting its row chunks against the wrong
 // (untable-bound) AAD.
-const BackupFormatVersion = 7
+//
+// v0.99.228+ introduces FormatVersion=8 for CDC-segment manifests
+// (incremental / streaming) that fold their [Manifest.CDCPositionCommitsAfterRows]
+// flag into the deterministic [ComputeBackupID] (audit item 57 fold). That
+// flag decides whether the recorded EndPosition commits AFTER the window's
+// rows (VStream) — restore reads it to know a schema anchor at EndPosition
+// can't prove the data was applied (Bug 184). Before v8 the flag rode OUTSIDE
+// the BackupID, so on an UNSIGNED CDC manifest it could be flipped without
+// invalidating the id (the signature closes this for signed chains; the fold
+// closes it signing-independently). A v8 manifest's id covers the flag;
+// ComputeBackupID gates the extra field on the manifest's OWN recorded version,
+// so a mixed-version chain stays coherent — pre-v8 segments recompute WITHOUT
+// the flag (their legacy id) and v8 segments WITH it. Proportional per the
+// Bug-116 discipline: ONLY a manifest that actually carries the flag (a VStream
+// CDC segment) is stamped 8; full backups and non-VStream CDC segments keep
+// their feature-minimum version and their legacy id. An older binary refuses a
+// v8 manifest loudly at the preflight rather than recompute-mismatching its
+// BackupID (which it would, computing the id without the folded field).
+const BackupFormatVersion = 8
 
 // FormatVersionLegacy / FormatVersionSecurityMetadata name the
 // historically-recorded values so callers don't sprinkle bare ints
@@ -215,7 +233,35 @@ const (
 	// untable-bound chunks still decrypt (the Bug-179
 	// inherit-the-chain's-shape rule).
 	FormatVersionChunkTableBinding = 7
+
+	// FormatVersionCDCPositionBinding is the version stamped on a CDC-segment
+	// manifest (incremental / streaming) whose [Manifest.CDCPositionCommitsAfterRows]
+	// flag is folded into [ComputeBackupID] (audit item 57 fold). It is the
+	// read-side gate for that fold: a manifest at this version or above had the
+	// flag included in its BackupID, so [ComputeBackupID] appends the
+	// `cdc_position_commits_after_rows=…` field ONLY for a manifest recorded at
+	// this version — below it the id ends at the EndPosition fields and the flag
+	// rides outside the identity (its legacy layout). Stamped ONLY when the flag
+	// is set (a VStream CDC segment), via [StampCDCPositionBinding]; full backups
+	// and non-VStream CDC segments (flag false) keep their feature-minimum version
+	// and legacy id. Unlike the encryption/signing versions this is independent of
+	// them — a VStream CDC segment is stamped 8 whether plaintext, encrypted, or
+	// signed, because the fold is a plaintext-manifest-field binding.
+	FormatVersionCDCPositionBinding = 8
 )
+
+// StampCDCPositionBinding raises m.FormatVersion to
+// [FormatVersionCDCPositionBinding] when the manifest carries
+// [Manifest.CDCPositionCommitsAfterRows], so [ComputeBackupID] folds that flag
+// into the identity (audit item 57 fold). Idempotent and a no-op when the flag
+// is false (the manifest keeps its feature-minimum version and its legacy id).
+// MUST be called before [ComputeBackupID] on any CDC-segment manifest so the
+// recorded id and the recorded version agree.
+func StampCDCPositionBinding(m *Manifest) {
+	if m != nil && m.CDCPositionCommitsAfterRows {
+		m.FormatVersion = max(m.FormatVersion, FormatVersionCDCPositionBinding)
+	}
+}
 
 // chooseFormatVersion returns the smallest manifest format version
 // safe for the supplied schema: [FormatVersionStandaloneSequences]

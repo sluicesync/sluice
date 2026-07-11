@@ -62,6 +62,27 @@ func TestChainRestore_TamperedBackupIDCoveredField_Refused(t *testing.T) {
 			t.Fatalf("legacy empty-BackupID full refused: %v", err)
 		}
 	})
+	t.Run("FV8 fold: flipping CDCPositionCommitsAfterRows without recomputing — REFUSED (item 57 fold)", func(t *testing.T) {
+		// The item-57 fold makes CDCPositionCommitsAfterRows a BackupID-covered
+		// field for a FormatVersion-8 manifest, so an unsigned flip of it — the
+		// flag that decides whether restore trusts a schema anchor at
+		// EndPosition (Bug 184) — is caught the same way a created_at edit is.
+		// (A full fixture is used for setup simplicity; the fold binds the flag
+		// for any FV8 manifest regardless of kind.)
+		dir := t.TempDir()
+		store, _ := blobcodec.NewLocalStore(dir)
+		full := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
+		full.Schema = schema
+		full.CDCPositionCommitsAfterRows = true
+		irbackup.StampCDCPositionBinding(full) // FormatVersion -> 8
+		full.BackupID = irbackup.ComputeBackupID(full)
+		full.CDCPositionCommitsAfterRows = false // tamper: flip WITHOUT recomputing
+		if err := lineage.WriteManifestAt(ctx, store, lineage.ManifestFileName, full); err != nil {
+			t.Fatalf("write full: %v", err)
+		}
+		lineage.UpdateLineageForManifestBestEffort(ctx, store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
+		assertCoded(t, run(store), sluicecode.CodeBackupManifestInvalid)
+	})
 }
 
 // makeManifest returns a manifest with deterministic CreatedAt and
