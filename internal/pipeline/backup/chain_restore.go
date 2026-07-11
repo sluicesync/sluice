@@ -1064,6 +1064,15 @@ func (r *ChainRestore) streamIncrementalChanges(
 	// leaves a snapshot at EndPosition). Only the change-chunk tail proves it
 	// there. Trust the anchor only on engines whose schema anchor strictly
 	// precedes its rows (Postgres / MySQL-binlog).
+	//
+	// Threat-model note (ADR-0152 residual shape (4)): CDCPositionCommitsAfterRows
+	// is an unsigned manifest field NOT covered by ComputeBackupID, so a store
+	// adversary on an UNSIGNED backup can flip it true→false alongside emptying
+	// the chunks — a coherent edit, the same signing-closed residual class as a
+	// whole-backup rollback. Signing (--require-signature) closes it; the
+	// signing-independent hardening (recorded-vs-recomputed BackupID verify) is
+	// filed as its own design because rotation/prune mutate BackupID-covered
+	// fields in place, so a naive recompute-verify would false-positive.
 	trustSchemaAnchor := !link.Manifest.CDCPositionCommitsAfterRows
 	reachedEnd := lastApplied == end ||
 		(trustSchemaAnchor && link.Manifest.SchemaHistoryAnchors(end))

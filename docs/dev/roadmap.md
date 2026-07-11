@@ -790,6 +790,16 @@ So NOTIFY-kick is **demoted** — the poll isn't the bottleneck. Closing the rea
 
 ---
 
+### 57. Signing-independent backup-manifest integrity: recorded-vs-recomputed `BackupID` verification (Bug 184 follow-up, 2026-07-10) — *DESIGN-GATED; documented residual, signing already closes it*
+
+**Why.** ADR-0152 §threat-model now names four unsigned manifest-edit residual shapes; shape (4) is the Bug 184 `CDCPositionCommitsAfterRows` trust-flag, a plain manifest field NOT covered by `ComputeBackupID`, so a store adversary on an *unsigned* co-locating-engine (VStream) backup can flip it `true→false` alongside emptying the change-chunks and re-open the emptied-data bypass. This is the same signing-closed residual class as a whole-backup rollback or an `EndPosition`-down edit (all closed by `--require-signature` today) — no weaker than the pre-existing posture, which is why v0.99.224 shipped without it.
+
+**What.** A recorded-vs-recomputed `BackupID` check at restore/broker (mirroring the ADR-0152 schema-hash recompute-verify): recompute `ComputeBackupID(manifest)` and refuse on mismatch. This would ALSO catch naive single-field edits of the other BackupID-covered fields (`created_at`/`source_engine`/`kind`/`EndPosition`), not just shape (4) — a whole-class signing-independent net.
+
+**The blocking precondition (why it is not a safe drop-in).** Rotation mutates a *prior* segment's `EndPosition = P_N` in place at cap time (`stream_rotation.go`, `prior.EndPosition = pN`) WITHOUT recomputing that manifest's `BackupID`; prune/compact may similarly mutate BackupID-covered fields on an already-written manifest. So a naive recompute-verify would **false-positive on legit rotation-born / pruned / compacted chains** (refusing valid backups — worse than the residual). The design work is: audit every manifest-mutating op for BackupID coherence and make each either recompute `BackupID` or provably not touch a covered field, THEN add the verify. Consider also binding `CDCPositionCommitsAfterRows` (and any future trust-relevant field) into `ComputeBackupID` (contributing only when set, to preserve legacy IDs). Until then, signing is the closure and the residual is documented (ADR-0152 shape (4) + the in-code note at the `trustSchemaAnchor` decision).
+
+---
+
 ### Deferred audit findings (2026-07-08 cross-check)
 
 From `workspace/repo-audit-2026-07-08-fable-crosscheck.md` (§4, N-numbered; that file is gitignored scratch, so each entry below is self-contained). These were deliberately NOT fixed in the 2026-07-08 docs/CI-hygiene wave; each is a fix window awaiting scheduling.
