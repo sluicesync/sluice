@@ -848,6 +848,21 @@ func (b *SyncFromBackup) replayNewIncrementals(
 		batchSize = backup.DefaultChainRestoreBatchSize
 	}
 
+	// BRK-1: the position the broker would RESUME from if the incremental
+	// currently being applied fails partway — the last FULLY-applied backup
+	// id. Each incremental streams its changes at THIS token; it advances to
+	// its own backupID only via the post-stream writePositionDirect (after
+	// every chunk streams cleanly). So a mid-incremental chunk failure
+	// (tamper, dropped blob, transient fetch error) leaves the persisted
+	// position at the parent, and a restart re-applies the whole incremental
+	// (idempotent, ADR-0010) instead of skipping it and silently losing its
+	// un-applied tail. Seed with lastAppliedID, or the chain root (the full)
+	// on a cold warm-resume so the token is never empty.
+	resumeFromID := lastAppliedID
+	if resumeFromID == "" {
+		resumeFromID = lineage.ManifestBackupID(chain[0].Manifest)
+	}
+
 	for i := startIdx; i < len(chain); i++ {
 		// ctx-cancel between incrementals: surface so Run returns
 		// cleanly without applying further incrementals. The
@@ -863,12 +878,13 @@ func (b *SyncFromBackup) replayNewIncrementals(
 		if link.Manifest.Kind == irbackup.BackupKindFull || link.Manifest.Kind == "" {
 			continue
 		}
-		bytesApplied, applyErr := b.applyIncremental(ctx, applier, link, batchSize)
+		bytesApplied, applyErr := b.applyIncremental(ctx, applier, link, batchSize, resumeFromID)
 		if applyErr != nil {
 			return newApplied, totalBytes, fmt.Errorf("incremental %s: %w",
 				lineage.ManifestBackupID(link.Manifest), applyErr)
 		}
 		newApplied = lineage.ManifestBackupID(link.Manifest)
+		resumeFromID = newApplied // this incremental is now fully applied
 		totalBytes += bytesApplied
 		slog.InfoContext(
 			ctx, "broker: incremental applied",
@@ -893,6 +909,7 @@ func (b *SyncFromBackup) applyIncremental(
 	applier ir.ChangeApplier,
 	link *lineage.SegmentRecord,
 	batchSize int,
+	parentResumeID string,
 ) (int64, error) {
 	// 1. Schema deltas first.
 	if len(link.Manifest.SchemaDelta) > 0 {
@@ -924,7 +941,11 @@ func (b *SyncFromBackup) applyIncremental(
 	// persists a position only after consuming the changes ahead of it.
 	changesCh := make(chan ir.Change, migcore.RowChanBuffer)
 	errCh := make(chan error, 1)
-	pos := encodeBrokerPosition(b.ChainURL, backupID)
+	// BRK-1: stream at the PARENT resume token, not this incremental's own
+	// backupID. A partial batch committed before a later-chunk failure then
+	// persists the parent position (safe re-apply on restart); the advance to
+	// backupID happens only in the post-stream writePositionDirect below.
+	pos := encodeBrokerPosition(b.ChainURL, parentResumeID)
 	go func() {
 		defer close(changesCh)
 		errCh <- b.streamIncrementalWithPosition(streamCtx, link, pos, changesCh)
@@ -947,10 +968,12 @@ func (b *SyncFromBackup) applyIncremental(
 		return 0, fmt.Errorf("stream chunks: %w", err)
 	}
 
-	// 4. Some appliers may not emit a position write when the batch
-	//    contains only TxBegin/TxCommit boundary events (e.g. a
-	//    chunk that's a single empty transaction). Defensive write
-	//    here ensures the broker's position advances regardless.
+	// 4. Advance the broker position to THIS incremental's backupID — only
+	//    now, after every chunk has streamed cleanly (BRK-1). The streamed
+	//    changes carried the parent resume token, so the applier's in-batch
+	//    writes never advanced past the parent; this is the single point that
+	//    commits "incremental fully applied". (It also covers appliers that
+	//    emit no position write for a boundary-only batch.)
 	if err := b.writePositionDirect(ctx, applier, backupID); err != nil {
 		return 0, fmt.Errorf("finalise position: %w", err)
 	}
