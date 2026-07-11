@@ -1056,7 +1056,17 @@ func (r *ChainRestore) streamIncrementalChanges(
 	end := link.Manifest.EndPosition
 	posBearing := end.Engine != "" || end.Token != ""
 	claimsAdvance := end != link.Manifest.StartPosition
-	reachedEnd := lastApplied == end || link.Manifest.SchemaHistoryAnchors(end)
+	// On engines that stamp CDC positions per-transaction-commit AFTER their
+	// rows (VStream: the VGTID follows its rows), a schema snapshot and the
+	// row changes in the same transaction share ONE position — so a schema
+	// anchor at EndPosition does NOT prove the window's data was applied
+	// (Bug 184: an emptied-data window whose final tx first-touched a table
+	// leaves a snapshot at EndPosition). Only the change-chunk tail proves it
+	// there. Trust the anchor only on engines whose schema anchor strictly
+	// precedes its rows (Postgres / MySQL-binlog).
+	trustSchemaAnchor := !link.Manifest.CDCPositionCommitsAfterRows
+	reachedEnd := lastApplied == end ||
+		(trustSchemaAnchor && link.Manifest.SchemaHistoryAnchors(end))
 	if posBearing && claimsAdvance && !reachedEnd {
 		return sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
 			"restore from an untampered copy, or sign the chain so a truncated/emptied change-list is caught at verify time",

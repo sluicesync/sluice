@@ -1162,6 +1162,10 @@ func (b *BackupStream) runRollover(
 		ParentBackupID: parent.BackupID,
 		StartPosition:  startPos,
 		SchemaHash:     beforeHash,
+		// Bug 184: record whether this engine's CDC positions commit AFTER
+		// their rows (VStream), so restore knows a schema anchor at
+		// EndPosition cannot prove the window's data was applied.
+		CDCPositionCommitsAfterRows: b.Source.Capabilities().CDCPositionCommitsAfterRows,
 	}
 	if manifest.ParentBackupID == "" {
 		manifest.ParentBackupID = irbackup.ComputeBackupID(parent)

@@ -575,6 +575,19 @@ type Manifest struct {
 	// backups' table chunks but live under `chunks/_changes/`.
 	ChangeChunks []*ChunkInfo `json:"change_chunks,omitempty"`
 
+	// CDCPositionCommitsAfterRows records the source engine's
+	// [ir.Capabilities.CDCPositionCommitsAfterRows] at backup time: true
+	// when the engine stamps CDC positions per-transaction-commit AFTER the
+	// rows (Vitess/VStream), so a schema-history snapshot can share a
+	// position with the row changes in its transaction. The restore-side
+	// completeness backstop reads this to decide whether a schema anchor at
+	// EndPosition proves the window's data was applied (see
+	// [Manifest.SchemaHistoryAnchors] and the Bug 184 guard in
+	// chain_restore.go / broker.go): it must NOT trust the anchor when this
+	// is true. Absent (false) on older manifests and on non-VStream engines,
+	// where a schema anchor strictly precedes its rows.
+	CDCPositionCommitsAfterRows bool `json:"cdc_position_commits_after_rows,omitempty"`
+
 	// ChainEncryption, when non-nil, identifies this manifest's chain
 	// as encrypted under Phase 6 client-side envelope encryption. Empty
 	// (the zero default) means plaintext chunks — the v0.16.x..v0.21.x

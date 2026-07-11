@@ -1007,12 +1007,20 @@ func (b *SyncFromBackup) applyIncremental(
 		//
 		// Bug 184 CORRECTION: the old `SchemaDelta == 0 && SchemaHistory == 0`
 		// carve-out was unsound — every real DATA incremental carries a routine
-		// first-touch schema snapshot (anchored BEFORE its rows, never at
-		// EndPosition), so mere SchemaHistory presence let an emptied-DATA window
-		// advance the broker past dropped events. Keying on the anchor POSITION,
-		// not presence, closes it.
-		if end := link.Manifest.EndPosition; (end.Engine != "" || end.Token != "") &&
-			end != link.Manifest.StartPosition && !link.Manifest.SchemaHistoryAnchors(end) {
+		// first-touch schema snapshot (anchored BEFORE its rows on PG/binlog,
+		// never at EndPosition), so mere SchemaHistory presence let an
+		// emptied-DATA window advance the broker past dropped events. Key on the
+		// anchor POSITION instead. And on VStream (CDCPositionCommitsAfterRows) a
+		// snapshot can SHARE a position with a data change, so a schema anchor at
+		// EndPosition proves nothing there — trust the anchor only when the
+		// engine's schema anchor strictly precedes its rows.
+		trustSchemaAnchor := !link.Manifest.CDCPositionCommitsAfterRows
+		end := link.Manifest.EndPosition
+		// With 0 chunks, the only thing that can "reach" a position-bearing
+		// EndPosition is a trusted schema snapshot anchored exactly at it.
+		reachedEnd := trustSchemaAnchor && link.Manifest.SchemaHistoryAnchors(end)
+		if (end.Engine != "" || end.Token != "") &&
+			end != link.Manifest.StartPosition && !reachedEnd {
 			return 0, sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
 				"restore from an untampered copy, or sign the chain so a truncated/emptied change-list is caught at verify time",
 				fmt.Errorf("incremental %s: manifest records EndPosition %+v (StartPosition %+v) but carries no change chunks — the change-chunk list was emptied; refusing to advance the broker past dropped events",

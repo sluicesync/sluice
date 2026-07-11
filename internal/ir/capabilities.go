@@ -194,6 +194,21 @@ type Capabilities struct {
 	BulkLoad BulkLoadMethod
 	// CDC is the change-data-capture mechanism the engine exposes.
 	CDC CDCMethod
+	// CDCPositionCommitsAfterRows reports that the engine stamps CDC
+	// positions per-transaction-commit, AFTER the rows the commit covers,
+	// so a schema-boundary snapshot and the row changes in the SAME
+	// transaction share the SAME position (Vitess/VStream: the VGTID
+	// arrives after its rows — see internal/engines/mysql/cdc_vstream.go
+	// and cdc_vstream_snapshot.go). A logical-backup restore uses this to
+	// decide whether "a schema-history snapshot is anchored exactly at
+	// EndPosition" proves the window's data was applied: on such engines an
+	// emptied-data window whose final transaction first-touched a table
+	// leaves a snapshot at EndPosition and would spuriously satisfy that
+	// completeness check (Bug 184), so restore must NOT trust the anchor
+	// there. False for engines whose schema anchor strictly precedes its
+	// rows (Postgres: RelationMessage WALStart < row LSNs; MySQL binlog: the
+	// DDL query-event position < the row events it precedes).
+	CDCPositionCommitsAfterRows bool
 	// SchemaScope is the table-namespacing model.
 	SchemaScope SchemaScope
 	// SupportedTypes lists the extension types the engine handles natively.

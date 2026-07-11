@@ -130,17 +130,27 @@ func TestChainRestore_EmptiedChangeChunkList_Refused(t *testing.T) {
 		// schemaAnchorLSN, if non-empty, seeds one SchemaHistory entry
 		// anchored at that LSN (models the routine/DDL schema snapshot).
 		schemaAnchorLSN string
-		wantErr         bool
+		// vstream marks the manifest as produced by an engine that stamps
+		// CDC positions after its rows (Vitess/VStream), where a schema
+		// anchor can coincide with a data change's position.
+		vstream bool
+		wantErr bool
 	}{
-		{"emptied list, no schema, EndPosition ahead of StartPosition", "0/202", "", true},
-		{"emptied list, EndPosition == StartPosition (legit no-op window)", "0/100", "", false},
+		{"emptied list, no schema, EndPosition ahead of StartPosition", "0/202", "", false, true},
+		{"emptied list, EndPosition == StartPosition (legit no-op window)", "0/100", "", false, false},
 		// Bug 184: emptied-DATA window keeps its routine schema snapshot,
 		// anchored at the window START (0/150), BEFORE the overstated
 		// EndPosition (0/202). Presence of SchemaHistory must NOT exempt it.
-		{"Bug 184: emptied DATA list, routine snapshot anchored BEFORE EndPosition", "0/202", "0/150", true},
-		// Legit DDL-only window: the schema snapshot's own anchor IS
-		// EndPosition (the snapshot is what advanced the position). Passes.
-		{"legit DDL-only window, snapshot anchored AT EndPosition", "0/202", "0/202", false},
+		{"Bug 184: emptied DATA list, routine snapshot anchored BEFORE EndPosition", "0/202", "0/150", false, true},
+		// Legit DDL-only window on a non-VStream engine: the schema snapshot's
+		// own anchor IS EndPosition (the snapshot is what advanced the
+		// position). Trusted → passes.
+		{"legit DDL-only window (non-VStream), snapshot anchored AT EndPosition", "0/202", "0/202", false, false},
+		// Bug 184 (Vitess): on VStream a snapshot SHARES its transaction's
+		// position, so an emptied-DATA window whose final tx first-touched a
+		// table leaves a snapshot AT EndPosition. The anchor must NOT be
+		// trusted there — this exact shape passed the position-only check.
+		{"Bug 184 (VStream): emptied DATA list, snapshot AT EndPosition, anchor untrusted", "0/202", "0/202", true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -160,6 +170,7 @@ func TestChainRestore_EmptiedChangeChunkList_Refused(t *testing.T) {
 			incr := makeManifest(t, irbackup.BackupKindIncremental, full, tc.endLSN)
 			incr.Schema = schema
 			incr.ChangeChunks = nil // EMPTIED (the attack) / legitimately empty
+			incr.CDCPositionCommitsAfterRows = tc.vstream
 			if tc.schemaAnchorLSN != "" {
 				incr.SchemaHistory = []*irbackup.SchemaHistoryEntry{{
 					Table:          "users",
@@ -204,18 +215,24 @@ func TestSyncFromBackup_EmptiedChangeChunkList_Refused(t *testing.T) {
 		name            string
 		endLSN          string
 		schemaAnchorLSN string
+		vstream         bool
 		wantErr         bool
 	}{
-		{"emptied list, no schema, EndPosition ahead of StartPosition", "0/202", "", true},
-		{"emptied list, EndPosition == StartPosition (legit no-op window)", "0/100", "", false},
-		{"Bug 184: emptied DATA list, routine snapshot anchored BEFORE EndPosition", "0/202", "0/150", true},
-		{"legit DDL-only window, snapshot anchored AT EndPosition", "0/202", "0/202", false},
+		{"emptied list, no schema, EndPosition ahead of StartPosition", "0/202", "", false, true},
+		{"emptied list, EndPosition == StartPosition (legit no-op window)", "0/100", "", false, false},
+		{"Bug 184: emptied DATA list, routine snapshot anchored BEFORE EndPosition", "0/202", "0/150", false, true},
+		{"legit DDL-only window (non-VStream), snapshot anchored AT EndPosition", "0/202", "0/202", false, false},
+		// Bug 184 (Vitess): a snapshot at EndPosition on a VStream manifest
+		// must NOT be trusted — the broker must refuse, not advance past the
+		// dropped events.
+		{"Bug 184 (VStream): emptied DATA list, snapshot AT EndPosition, anchor untrusted", "0/202", "0/202", true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			full := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
 			incr := makeManifest(t, irbackup.BackupKindIncremental, full, tc.endLSN)
 			incr.ChangeChunks = nil // EMPTIED (the attack) / legitimately empty
+			incr.CDCPositionCommitsAfterRows = tc.vstream
 			if tc.schemaAnchorLSN != "" {
 				incr.SchemaHistory = []*irbackup.SchemaHistoryEntry{{
 					Table:          "users",
