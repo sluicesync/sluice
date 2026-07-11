@@ -1423,6 +1423,15 @@ func (b *SyncFromBackup) preflightChainEncryption(ctx context.Context) error {
 		return fmt.Errorf("read chain root manifest: %w", err)
 	}
 	if root == nil || root.ChainEncryption == nil {
+		// SEC-MIRROR follow-up (parity with the offline restore paths): a
+		// supplied key against a chain that claims PLAINTEXT is refused, not
+		// silently ignored (a whole-chain encrypted→plaintext downgrade on an
+		// unsigned chain).
+		if b.Envelope != nil {
+			return sluicecode.Wrap(sluicecode.CodeBackupChunkAuthFailed,
+				"remove --encrypt if this chain is genuinely unencrypted; if it should be encrypted, its chain-encryption marker was stripped (tampered/downgraded) — sign chains (--sign + --require-signature) to make this tamper-evident",
+				errors.New("broker: an encryption key was supplied but this chain is not encrypted (no chain-encryption metadata) — refusing to apply a plaintext-claiming chain under a key"))
+		}
 		return nil
 	}
 	// BRK-3: remember the chain is encrypted so the per-chunk guard can
