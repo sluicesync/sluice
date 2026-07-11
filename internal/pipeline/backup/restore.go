@@ -776,9 +776,26 @@ func (r *Restore) restoreTable(
 	// across workers compared to the manifest's RowCount — byte-for-byte
 	// as strong as the serial path. A mismatch stays a HARD failure (no
 	// silent corruption).
-	if entry.RowCount > 0 && rowsApplied.Load() != entry.RowCount {
+	//
+	// F3: the `RowCount > 0` predicate must not be an attacker OFF switch.
+	// This point is only reached for a table that HAS chunk entries (the
+	// len==0 empty-table path returned above), and every chunk is flushed
+	// with >= 1 row — so a completed backup records a POSITIVE table
+	// RowCount here. A recorded 0 (or any count) that disagrees with what
+	// actually streamed is a zeroed/tampered manifest that would otherwise
+	// disable this backstop and let a truncated table look empty; refuse
+	// loudly. (A fully-coherent edit that also lowers RowCount to match the
+	// dropped chunks stays the documented, signed-only whole-backup
+	// boundary — that is what signing closes.)
+	switch got := rowsApplied.Load(); {
+	case entry.RowCount > 0 && got != entry.RowCount:
 		return fmt.Errorf("layer-2 row-count mismatch on table %q: manifest says %d, streamed %d",
-			table.Name, entry.RowCount, rowsApplied.Load())
+			table.Name, entry.RowCount, got)
+	case entry.RowCount == 0 && got != 0:
+		return sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
+			"restore from an untampered copy, or sign the chain so a zeroed row-count is caught at verify time",
+			fmt.Errorf("layer-2 row-count anomaly on table %q: manifest records 0 rows but its chunks decoded %d — the recorded RowCount was zeroed (tampered manifest); refusing to treat a populated table as empty",
+				table.Name, got))
 	}
 	slog.InfoContext(
 		ctx, "restore: table complete",
@@ -1041,9 +1058,20 @@ func (r *Restore) streamChunkRows(
 		// it directly rather than continuing.
 		return rows, err
 	}
-	if chunk.RowCount > 0 && rows != chunk.RowCount {
+	// F3 twin of the table-level guard: a row chunk is only ever flushed
+	// with >= 1 row (the chunk writer opens on the first row), so a recorded
+	// 0 that decodes rows is a zeroed entry that would disable this per-chunk
+	// backstop. The table-level ACTUAL-vs-recorded sum catches the loss
+	// regardless; refusing here names the tamper at the chunk that carries it.
+	switch {
+	case chunk.RowCount > 0 && rows != chunk.RowCount:
 		return rows, fmt.Errorf("layer-2 chunk row-count mismatch on %s: manifest says %d, decoded %d",
 			chunk.File, chunk.RowCount, rows)
+	case chunk.RowCount == 0 && rows > 0:
+		return rows, sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
+			"restore from an untampered copy, or sign the chain so a zeroed chunk row-count is caught at verify time",
+			fmt.Errorf("layer-2 chunk row-count anomaly on %s: manifest records 0 rows but decoded %d (zeroed chunk RowCount)",
+				chunk.File, rows))
 	}
 	return rows, nil
 }

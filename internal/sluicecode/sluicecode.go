@@ -69,6 +69,7 @@ const (
 	CodeBackupSignatureMissing     Code = "SLUICE-E-BACKUP-SIGNATURE-MISSING"
 	CodeBackupSignatureUnsupported Code = "SLUICE-E-BACKUP-SIGNATURE-UNSUPPORTED"
 	CodeBackupChunkAuthFailed      Code = "SLUICE-E-BACKUP-CHUNK-AUTH-FAILED"
+	CodeBackupIncomplete           Code = "SLUICE-E-BACKUP-INCOMPLETE"
 )
 
 // Class partitions codes by how the process should exit when the
@@ -122,6 +123,7 @@ var registry = map[Code]Info{
 	CodeBackupSignatureMissing:     {ClassRefusal, "a signed (v6) backup manifest is missing its detached signature"},
 	CodeBackupSignatureUnsupported: {ClassRefusal, "a signed backup manifest uses a newer signature scheme/canonicalization than this build supports; upgrade sluice (not a tamper signal)"},
 	CodeBackupChunkAuthFailed:      {ClassRefusal, "an encrypted backup chunk failed authenticated decryption (tampered / corrupt / spliced or reordered store) — the loud, coded twin of the signed-manifest tamper refusal for backups that are encrypted but not signed"},
+	CodeBackupIncomplete:           {ClassRefusal, "a restored/replayed incremental applied fewer changes than its manifest records (its change-chunk tail was truncated, or a table's chunk row-count was zeroed) — the signing-independent backstop against silent tail-truncation of an unsigned incremental"},
 }
 
 // Describe returns the registry metadata for c, and whether c is a
