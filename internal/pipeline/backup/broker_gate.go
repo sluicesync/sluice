@@ -55,6 +55,14 @@ func VerifySchemaHashes(ctx context.Context, links []lineage.SegmentRecord) erro
 	return verifySchemaHashes(ctx, links)
 }
 
+// VerifyBackupIDs is the exported form of [verifyBackupIDs]: it recomputes
+// every link's deterministic BackupID and refuses on a mismatch with the
+// recorded id, catching a corrupt/lazily-edited BackupID-covered field before
+// the broker applies (audit item 57 — the BackupID twin of VerifySchemaHashes).
+func VerifyBackupIDs(links []lineage.SegmentRecord) error {
+	return verifyBackupIDs(links)
+}
+
 // CheckMixedModeChain is the exported form of [checkMixedModeChain]: it
 // refuses a lineage where a segment full and one of its incrementals
 // disagree on encryption shape (an encrypted chain must not carry a

@@ -961,6 +961,9 @@ func (b *SyncFromBackup) verifyChainIntegrity(ctx context.Context, chain []linea
 	if err := backup.VerifySchemaHashes(ctx, chain); err != nil {
 		return fmt.Errorf("broker: %w", err)
 	}
+	if err := backup.VerifyBackupIDs(chain); err != nil {
+		return fmt.Errorf("broker: %w", err)
+	}
 	if err := backup.VerifyChainSignatures(ctx, b.Store, chain, b.Envelope, b.VerifyKey, b.RequireSignature); err != nil {
 		return fmt.Errorf("broker: verify chain signatures: %w", err)
 	}
