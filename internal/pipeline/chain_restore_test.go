@@ -17,7 +17,52 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
+
+// TestChainRestore_TamperedBackupIDCoveredField_Refused pins audit item 57:
+// editing a BackupID-covered manifest field (created_at / source_engine / kind
+// / EndPosition) WITHOUT recomputing the recorded BackupID is refused at restore
+// (verifyBackupIDs) with SLUICE-E-BACKUP-MANIFEST-INVALID, before any data lands
+// — the corruption / lazy-tamper backstop, the BackupID twin of the schema-hash
+// check. A valid chain restores clean; a legacy full with an empty BackupID is
+// skipped (nothing recorded to verify).
+func TestChainRestore_TamperedBackupIDCoveredField_Refused(t *testing.T) {
+	ctx := context.Background()
+	schema := &ir.Schema{Tables: []*ir.Table{{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}}}
+	newStore := func(t *testing.T, mutate func(*irbackup.Manifest)) irbackup.Store {
+		t.Helper()
+		dir := t.TempDir()
+		store, _ := blobcodec.NewLocalStore(dir)
+		full := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
+		full.Schema = schema
+		full.BackupID = irbackup.ComputeBackupID(full)
+		mutate(full) // tamper a covered field AFTER stamping the id, or clear it
+		if err := lineage.WriteManifestAt(ctx, store, lineage.ManifestFileName, full); err != nil {
+			t.Fatalf("write full: %v", err)
+		}
+		lineage.UpdateLineageForManifestBestEffort(ctx, store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
+		return store
+	}
+	run := func(store irbackup.Store) error {
+		tgt := &chainRestoreRecorderEngine{restoreRecorderEngine: newRestoreRecorderEngine("postgres")}
+		return (&backup.ChainRestore{Target: tgt, TargetDSN: "tgt", Store: store}).Run(ctx)
+	}
+	t.Run("valid chain restores clean", func(t *testing.T) {
+		if err := run(newStore(t, func(*irbackup.Manifest) {})); err != nil {
+			t.Fatalf("valid chain refused: %v", err)
+		}
+	})
+	t.Run("tampered created_at (covered field) without recomputing BackupID — REFUSED", func(t *testing.T) {
+		store := newStore(t, func(m *irbackup.Manifest) { m.CreatedAt = m.CreatedAt.Add(time.Hour) })
+		assertCoded(t, run(store), sluicecode.CodeBackupManifestInvalid)
+	})
+	t.Run("legacy full with empty BackupID — skipped (restores clean)", func(t *testing.T) {
+		if err := run(newStore(t, func(m *irbackup.Manifest) { m.BackupID = "" })); err != nil {
+			t.Fatalf("legacy empty-BackupID full refused: %v", err)
+		}
+	})
+}
 
 // makeManifest returns a manifest with deterministic CreatedAt and
 // position for chain-walk test fixtures.

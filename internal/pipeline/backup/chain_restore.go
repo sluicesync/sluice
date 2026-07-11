@@ -267,6 +267,14 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 		return migcore.WrapWithHint(migcore.PhaseConnect, err)
 	}
 
+	// 2.7b. BackupID recompute check (audit item 57): the schema-hash twin
+	// for the four ComputeBackupID-covered fields (created_at/source_engine/
+	// kind/EndPosition). Catches bit-rot / a truncated rewrite / a lazy edit
+	// of one of those that forgot to recompute the id, before anything lands.
+	if err := verifyBackupIDs(links); err != nil {
+		return migcore.WrapWithHint(migcore.PhaseConnect, err)
+	}
+
 	// 2.8. ADR-0154 whole-manifest signature + freshness verification.
 	// A signed (v6) chain refuses loudly on a missing/invalid/rolled-back
 	// signature, a truncated change-list, or a dropped-newest-link BEFORE
@@ -664,6 +672,38 @@ func verifySchemaHashes(ctx context.Context, links []lineage.SegmentRecord) erro
 		}
 		return fmt.Errorf("chain restore: manifest %s (backup %s) schema hash mismatch: recorded %s, recomputed %s — the manifest's schema does not match the fingerprint written with it (corrupted or partially-rewritten manifest); refusing before any data lands",
 			links[i].Path, lineage.ManifestBackupID(m), m.SchemaHash, got)
+	}
+	return nil
+}
+
+// verifyBackupIDs recomputes every link's deterministic BackupID
+// ([irbackup.ComputeBackupID]) and refuses on a mismatch with the recorded
+// [irbackup.Manifest.BackupID] BEFORE anything lands — the BackupID twin of
+// [verifySchemaHashes] (audit item 57). ComputeBackupID covers created_at,
+// source_engine, kind, and EndPosition, so this catches bit-rot, a truncated
+// rewrite, or a LAZY edit of one of those fields that forgot to recompute the
+// id (corruption or tamper). Like the schema-hash check it is a corruption
+// backstop, not tamper-PROOFING: a fully-coherent edit that also recomputes
+// BackupID and fixes the ParentBackupID chain is signing-closed (ADR-0154 /
+// --require-signature). Unlike the schema-hash case there is no legitimate-
+// drift carve-out: the 2026-07-10 BackupID-coherence audit confirmed no
+// manifest-mutating op re-stamps a covered field in place, so any mismatch on
+// a non-empty recorded id is genuine.
+//
+// Links with an empty recorded BackupID (pre-Phase-3 fulls) are skipped — the
+// walker computes those on demand; there is no recorded value to verify.
+func verifyBackupIDs(links []lineage.SegmentRecord) error {
+	for i := range links {
+		m := links[i].Manifest
+		if m == nil || m.BackupID == "" {
+			continue
+		}
+		if got := irbackup.ComputeBackupID(m); got != m.BackupID {
+			return sluicecode.Wrap(sluicecode.CodeBackupManifestInvalid,
+				"restore from an untampered copy, or sign the chain (--sign/--sign-key + --require-signature) so a manifest edit is caught at verify time",
+				fmt.Errorf("chain restore: manifest %s: recorded BackupID %s does not match its content (recomputed %s) — a BackupID-covered field (created_at/source_engine/kind/EndPosition) was edited without recomputing the id, or the manifest is corrupt; refusing before any data lands",
+					links[i].Path, m.BackupID, got))
+		}
 	}
 	return nil
 }
