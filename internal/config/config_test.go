@@ -155,6 +155,34 @@ keyset_source: file:/etc/sluice/keyset.yaml
 	}
 }
 
+// TestLoadYAML_UnknownKeyRejected pins N-10: an unknown/typo'd YAML key is a
+// LOUD load failure, not a silent drop. The trap this closes: a mistyped
+// `redactions:` block (or a misspelled field inside one) was silently ignored,
+// so the operator believed PII was being redacted while it was not — a
+// compliance-grade silent-loss. Every documented config key is a Config-struct
+// field, so this only rejects genuinely-unsupported keys.
+func TestLoadYAML_UnknownKeyRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		yaml string
+	}{
+		{"top-level typo: `redaction` vs `redactions` (the PII-leak trap)", "redaction:\n  - table: users.email\n    strategy: hash\n"},
+		{"nested field typo: `tabel` vs `table`", "redactions:\n  - tabel: users.email\n    strategy: hash\n"},
+		{"unknown top-level key", "frobnicate: true\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "sluice.yaml")
+			if err := os.WriteFile(path, []byte(tc.yaml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path); err == nil {
+				t.Fatal("Load accepted an unknown/typo'd YAML key — a typo'd redactions block would silently drop PII rules (N-10)")
+			}
+		})
+	}
+}
+
 // TestLoadIncludeExcludeTables checks the table-filter YAML fields
 // round-trip through the loader. Operators put these alongside
 // mappings in sluice.yaml; the orchestrator builds a TableFilter
