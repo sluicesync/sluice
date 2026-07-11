@@ -843,6 +843,13 @@ func (s *SyncFromBackupCmd) Run(_ *Globals) error {
 	if err != nil {
 		return err
 	}
+	// BRK-2: thread the ADR-0154 verify-key + strict policy so the broker's
+	// live-apply path actually honours --verify-key / --require-signature
+	// instead of silently ignoring them.
+	verifyKey, err := s.resolveVerifyKey()
+	if err != nil {
+		return err
+	}
 
 	broker := &pipeline.SyncFromBackup{
 		Target:           target,
@@ -858,6 +865,8 @@ func (s *SyncFromBackupCmd) Run(_ *Globals) error {
 		AtChainID:        s.AtChainID,
 		SluiceVersion:    version,
 		Envelope:         envelope,
+		VerifyKey:        verifyKey,
+		RequireSignature: s.RequireSignature,
 	}
 	return broker.Run(ctx)
 }

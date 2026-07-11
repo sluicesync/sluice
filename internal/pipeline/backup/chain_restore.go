@@ -248,14 +248,14 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	}
 
 	// 2.6. Mixed-mode encryption refusal across the whole lineage.
-	if err := r.checkMixedModeChain(links); err != nil {
+	if err := checkMixedModeChain(links); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("chain restore: %w", err))
 	}
 
 	// 2.7. Schema-fingerprint corruption check across every link
 	// (ADR-0152 — the check [irbackup.Manifest.SchemaHash] documents),
 	// before anything lands on the target.
-	if err := r.verifySchemaHashes(ctx, links); err != nil {
+	if err := verifySchemaHashes(ctx, links); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, err)
 	}
 
@@ -618,7 +618,7 @@ func (r *ChainRestore) preflightEncryption(rootManifest *irbackup.Manifest) erro
 // would trip on; current writers re-hash after the swap). That shape
 // WARNs instead of refusing — refusing legitimate old chains on the DR
 // path would be worse than the narrow miss.
-func (r *ChainRestore) verifySchemaHashes(ctx context.Context, links []lineage.SegmentRecord) error {
+func verifySchemaHashes(ctx context.Context, links []lineage.SegmentRecord) error {
 	for i := range links {
 		m := links[i].Manifest
 		if m == nil || m.SchemaHash == "" {
@@ -653,7 +653,7 @@ func (r *ChainRestore) verifySchemaHashes(ctx context.Context, links []lineage.S
 // ChainEncryption); the uniformity is asserted within each segment.
 // Mixed-mode strongly suggests a tampered / mis-stitched lineage —
 // refuse loudly (DR data).
-func (r *ChainRestore) checkMixedModeChain(chain []lineage.SegmentRecord) error {
+func checkMixedModeChain(chain []lineage.SegmentRecord) error {
 	if len(chain) < 2 {
 		return nil
 	}
@@ -971,11 +971,15 @@ func (r *ChainRestore) streamIncrementalChanges(
 			}
 		}
 	}()
+	// lastApplied tracks the position of the last position-bearing change
+	// emitted across every chunk — the input to the F1 tail-truncation
+	// backstop below. Confined to this producer goroutine.
+	var lastApplied ir.Position
 	for f := range fetchCh {
 		if f.err != nil {
 			return fmt.Errorf("chunk %d (%s): open chunk: %w", f.idx, f.chunk.File, f.err)
 		}
-		if err := r.streamOneChangeChunk(ctx, link, codec, f.idx, f.chunk, f.src, out); err != nil {
+		if err := r.streamOneChangeChunk(ctx, link, codec, f.idx, f.chunk, f.src, out, &lastApplied); err != nil {
 			return fmt.Errorf("chunk %d (%s): %w", f.idx, f.chunk.File, err)
 		}
 		slog.DebugContext(
@@ -984,6 +988,25 @@ func (r *ChainRestore) streamIncrementalChanges(
 			slog.Int("chunk", f.idx),
 			slog.Int64("changes", f.chunk.RowCount),
 		)
+	}
+	// F1 (SLUICE-E-BACKUP-INCOMPLETE): change-chunk tail-truncation backstop.
+	// The window writer sets manifest.EndPosition to the position of the LAST
+	// change it wrote (incremental.go: `lastPos = pos`; stream.go: same). A
+	// store adversary who deletes the tail entries of an unsigned incremental's
+	// ChangeChunks list leaves every survivor with an intact list ordinal (so
+	// the GCM AAD still validates) but the replayed tail now falls SHORT of
+	// EndPosition — a silent exit-0 with fewer events and an EndPosition that
+	// overstates the data, poisoning a subsequent CDC resume. Assert we reached
+	// EndPosition and refuse loudly. A fully-coherent edit that also lowers
+	// EndPosition matches here and stays the documented, recoverable
+	// whole-backup rollback. Skipped for a schema-only window (no change chunks
+	// — nothing to reach) or a non-position-bearing EndPosition.
+	if end := link.Manifest.EndPosition; len(link.Manifest.ChangeChunks) > 0 &&
+		(end.Engine != "" || end.Token != "") && lastApplied != end {
+		return sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
+			"restore from an untampered copy, or sign the chain so a truncated change-list is caught at verify time",
+			fmt.Errorf("incremental %s: replayed change-chunk tail ends at position %+v but the manifest records EndPosition %+v — the change-chunk list is truncated (fewer events than recorded); refusing to report success with a short tail",
+				lineage.ManifestBackupID(link.Manifest), lastApplied, end))
 	}
 	return nil
 }
@@ -1052,6 +1075,7 @@ func (r *ChainRestore) streamOneChangeChunk(
 	chunk *irbackup.ChunkInfo,
 	src io.ReadCloser,
 	out chan<- ir.Change,
+	lastApplied *ir.Position,
 ) error {
 	cek, err := r.changeChunkCEK(chunk)
 	if err != nil {
@@ -1077,6 +1101,14 @@ func (r *ChainRestore) streamOneChangeChunk(
 		if err != nil {
 			_ = cr.Close()
 			return fmt.Errorf("read change: %w", err)
+		}
+		// F1 backstop bookkeeping: remember the last POSITION-BEARING change
+		// we emit so [streamIncrementalChanges] can assert the replayed tail
+		// reaches the manifest's EndPosition. Non-position-bearing changes
+		// (e.g. a bare TxBegin/TxCommit without a source position) don't
+		// advance it, mirroring the window writer's `lastPos` rule.
+		if p := change.Pos(); p.Engine != "" || p.Token != "" {
+			*lastApplied = p
 		}
 		select {
 		case <-ctx.Done():

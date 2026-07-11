@@ -32,9 +32,33 @@ import (
 // run namespace already keys on CreatedAt — Bug 35).
 //
 // Honesty note: the binding authenticates chunks AGAINST the manifest
-// that names them. The manifest itself is unsigned, so presenting a
-// complete older (manifest + chunks) pair — a whole-backup rollback —
-// remains possible; ADR-0152 documents that boundary.
+// that names them. The manifest itself is unsigned, so a store adversary
+// who edits it self-consistently is not caught by the chunk bindings —
+// ADR-0152 documents this boundary, of which there are three named shapes:
+//
+//   - Whole-backup rollback: presenting a complete older (manifest +
+//     chunks) pair. Recoverable (older-but-coherent state).
+//   - Partial change-chunk tail-truncation: deleting the tail entries of
+//     an unsigned incremental's ChangeChunks list. Survivors keep ordinals
+//     0..k so every GCM AAD still validates, and restore/broker would
+//     return exit 0 with fewer events while the intact EndPosition
+//     overstates the data — poisoning a resumed CDC stream (a resume STARTS
+//     past the lost events, unrecoverable). The restore/broker replay path
+//     now backstops this by asserting the applied tail REACHES EndPosition
+//     (SLUICE-E-BACKUP-INCOMPLETE), converting the unrecoverable variant
+//     into a loud refusal; a fully-coherent edit that ALSO lowers
+//     EndPosition stays the recoverable rollback above.
+//   - Coherent two-sided position rewrite: moving a link's EndPosition
+//     forward AND the next link's StartPosition to match. All chunks still
+//     apply (positions don't gate data), but the forged EndPosition is the
+//     CDC resume anchor, so a post-restore position-from-manifest resume
+//     skips past the gap. Not caught by the tail-reach backstop (the tail
+//     DOES reach the forged EndPosition).
+//
+// Signing (ADR-0154) folds the change-chunk ordinal + count + positions
+// into the signed canon and closes all three; these are the unsigned
+// residual, and --require-signature is the operator's opt-in to refuse an
+// unsigned chain outright.
 
 // chunkAADPrefix / cekBindingPrefix version the binding derivations
 // independently of the manifest FormatVersion. Part of the on-disk

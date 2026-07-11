@@ -590,8 +590,10 @@ func TestChainRestore_SchemaHistoryReplayed(t *testing.T) {
 	}
 	lineage.UpdateLineageForManifestBestEffort(context.Background(), store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
 
-	// Incremental: carries SchemaHistory + a single Insert event.
-	incr := makeManifest(t, irbackup.BackupKindIncremental, full, "0/200")
+	// Incremental: carries SchemaHistory + a single Insert event. EndPosition
+	// matches the single change's position (0/180) — the real writer invariant
+	// the F1 tail-truncation backstop relies on.
+	incr := makeManifest(t, irbackup.BackupKindIncremental, full, "0/180")
 	incr.Schema = &ir.Schema{Tables: []*ir.Table{postDDL}}
 	incr.SchemaHistory = []*irbackup.SchemaHistoryEntry{
 		{
@@ -817,7 +819,9 @@ func TestChainRestore_PreChunkDManifest_BackwardCompat(t *testing.T) {
 	}
 	lineage.UpdateLineageForManifestBestEffort(context.Background(), store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
 
-	incr := makeManifest(t, irbackup.BackupKindIncremental, full, "0/200")
+	// EndPosition matches the single change's position (0/180) per the real
+	// writer invariant the F1 tail-truncation backstop relies on.
+	incr := makeManifest(t, irbackup.BackupKindIncremental, full, "0/180")
 	incr.Schema = schema
 	// SchemaHistory deliberately nil (pre-Chunk-D shape).
 	incr.SchemaHistory = nil
@@ -1010,7 +1014,13 @@ func seedMultiChunkIncremental(t *testing.T, store irbackup.Store, schema *ir.Sc
 	}
 	lineage.UpdateLineageForManifestBestEffort(context.Background(), store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
 
-	incr := makeManifest(t, irbackup.BackupKindIncremental, full, "0/300")
+	// EndPosition MUST equal the LAST change's position — the real
+	// incremental/stream writer sets manifest.EndPosition = lastPos (the
+	// last position-bearing change). The last change here is id=9 →
+	// "0/209"; the F1 tail-truncation backstop asserts the replayed tail
+	// reaches EndPosition, so a fixture with an EndPosition ahead of its
+	// last change would (correctly) be refused as a short tail.
+	incr := makeManifest(t, irbackup.BackupKindIncremental, full, "0/209")
 	incr.Schema = schema
 	for chunkIdx := 0; chunkIdx < 3; chunkIdx++ {
 		var changes []ir.Change

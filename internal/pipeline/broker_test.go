@@ -110,7 +110,10 @@ func TestRewritePosition_AllChangeShapes(t *testing.T) {
 		"txbegin":  ir.TxBegin{Position: ir.Position{Token: "old"}},
 		"txcommit": ir.TxCommit{Position: ir.Position{Token: "old"}},
 	} {
-		got := rewritePosition(c, target)
+		got, err := rewritePosition(c, target)
+		if err != nil {
+			t.Fatalf("%s: rewritePosition returned error: %v", name, err)
+		}
 		if got.Pos() != target {
 			t.Errorf("%s: pos = %+v; want %+v", name, got.Pos(), target)
 		}

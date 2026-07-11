@@ -58,6 +58,7 @@ package pipeline
 
 import (
 	"context"
+	stdcrypto "crypto"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -73,6 +74,7 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
+	"sluicesync.dev/sluice/internal/sluicecode"
 	"sluicesync.dev/sluice/internal/translate"
 )
 
@@ -195,9 +197,32 @@ type SyncFromBackup struct {
 	// chain-walk time naming the missing key.
 	Envelope crypto.EnvelopeEncryption
 
+	// VerifyKey, when non-nil, is the asymmetric PUBLIC key (`--verify-key`
+	// — Ed25519 / ECDSA / RSA) that verifies an ADR-0154 signed chain the
+	// broker follows (Ed25519 or KMS scheme). Orthogonal to Envelope
+	// (which carries the HMAC-off-KEK verifier). Threaded through to the
+	// per-tick signature gate and the cold-start ChainRestore. See
+	// [backup.ChainRestore.VerifyKey]. (BRK-2)
+	VerifyKey stdcrypto.PublicKey
+
+	// RequireSignature makes the ADR-0154 policy strict-always for the
+	// broker: a signed chain that cannot be verified (no matching verify
+	// key) refuses instead of WARN-and-proceeding. An INVALID signature
+	// always refuses regardless. See [backup.ChainRestore.RequireSignature].
+	// (BRK-2)
+	RequireSignature bool
+
 	// chainCEK caches the unwrapped per-chain CEK across ticks so
 	// Argon2id (passphrase mode) runs once per broker process.
 	chainCEK []byte
+
+	// chainEncrypted records whether the chain root carries
+	// [irbackup.ChainEncryption], set once by preflightChainEncryption.
+	// It is the per-chunk mixed-mode guard's input (BRK-3): an encrypted
+	// chain must never apply a plaintext chunk, in per-chain OR per-chunk
+	// mode, so the guard cannot key off b.chainCEK alone (nil in per-chunk
+	// mode). Confined to Run's goroutine, like chainCEK.
+	chainEncrypted bool
 
 	// chainCache memoizes the lineage-chain walk across ticks so an
 	// idle tick costs O(1) store GETs instead of O(chain-length); see
@@ -668,6 +693,12 @@ func (b *SyncFromBackup) coldStartReset(ctx context.Context, applier ir.ChangeAp
 		ApplyBatchSize:   b.ApplyBatchSize,
 		ApplyConcurrency: b.ApplyConcurrency,
 		Envelope:         b.Envelope,
+		// BRK-2: a --reset-target-data cold start must verify a signed
+		// chain's Ed25519 / KMS signature too, not just the HMAC-off-KEK
+		// envelope. Without threading these the cold-start restore silently
+		// ignored --verify-key / --require-signature.
+		VerifyKey:        b.VerifyKey,
+		RequireSignature: b.RequireSignature,
 	}
 	if err := rest.Run(ctx); err != nil {
 		return "", fmt.Errorf("broker: chain restore failed: %w", err)
@@ -843,9 +874,32 @@ func (b *SyncFromBackup) replayNewIncrementals(
 		return "", 0, nil
 	}
 
+	// BRK-2/3/4: bring the live-apply path to chain-restore verification
+	// parity before applying any new incremental — structural validation,
+	// mixed-mode refusal, schema-hash corruption, and the ADR-0154 signature
+	// gate. Runs only on a tick that has new work (an idle tick pays nothing).
+	if err := b.verifyChainIntegrity(ctx, chain); err != nil {
+		return "", 0, err
+	}
+
 	batchSize := b.ApplyBatchSize
 	if batchSize <= 0 {
 		batchSize = backup.DefaultChainRestoreBatchSize
+	}
+
+	// BRK-1: the position the broker would RESUME from if the incremental
+	// currently being applied fails partway — the last FULLY-applied backup
+	// id. Each incremental streams its changes at THIS token; it advances to
+	// its own backupID only via the post-stream writePositionDirect (after
+	// every chunk streams cleanly). So a mid-incremental chunk failure
+	// (tamper, dropped blob, transient fetch error) leaves the persisted
+	// position at the parent, and a restart re-applies the whole incremental
+	// (idempotent, ADR-0010) instead of skipping it and silently losing its
+	// un-applied tail. Seed with lastAppliedID, or the chain root (the full)
+	// on a cold warm-resume so the token is never empty.
+	resumeFromID := lastAppliedID
+	if resumeFromID == "" {
+		resumeFromID = lineage.ManifestBackupID(chain[0].Manifest)
 	}
 
 	for i := startIdx; i < len(chain); i++ {
@@ -863,12 +917,13 @@ func (b *SyncFromBackup) replayNewIncrementals(
 		if link.Manifest.Kind == irbackup.BackupKindFull || link.Manifest.Kind == "" {
 			continue
 		}
-		bytesApplied, applyErr := b.applyIncremental(ctx, applier, link, batchSize)
+		bytesApplied, applyErr := b.applyIncremental(ctx, applier, link, batchSize, resumeFromID)
 		if applyErr != nil {
 			return newApplied, totalBytes, fmt.Errorf("incremental %s: %w",
 				lineage.ManifestBackupID(link.Manifest), applyErr)
 		}
 		newApplied = lineage.ManifestBackupID(link.Manifest)
+		resumeFromID = newApplied // this incremental is now fully applied
 		totalBytes += bytesApplied
 		slog.InfoContext(
 			ctx, "broker: incremental applied",
@@ -878,6 +933,38 @@ func (b *SyncFromBackup) replayNewIncrementals(
 		)
 	}
 	return newApplied, totalBytes, nil
+}
+
+// verifyChainIntegrity brings the broker's live-apply path to
+// chain-restore verification parity (BRK-2/3/4). It runs the SAME gates
+// [backup.ChainRestore.Run] runs before applying — structural validation,
+// mixed-mode encryption refusal, schema-fingerprint corruption detection,
+// and the ADR-0154 whole-chain signature + freshness gate — over the whole
+// chain on each tick that has new incrementals to apply. Cheap in-memory
+// checks run first; the signature gate (which reads .sig objects fresh, so
+// tampering is caught even with the manifest cache warm) runs last. A signed
+// chain with a missing/invalid/rolled-back signature, a truncated
+// change-list, or a dropped-newest link is refused before the broker applies
+// anything; --verify-key / --require-signature are honoured, closing BRK-2's
+// silently-ignored-security-flag hole.
+func (b *SyncFromBackup) verifyChainIntegrity(ctx context.Context, chain []lineage.SegmentRecord) error {
+	for i := range chain {
+		if err := backup.ValidateManifestStructure(chain[i].Manifest); err != nil {
+			return sluicecode.Wrap(sluicecode.CodeBackupSignatureInvalid,
+				"the backup manifest is structurally invalid (tampered or corrupt) — restore from a known-good chain",
+				fmt.Errorf("broker: manifest %q: %w", chain[i].Path, err))
+		}
+	}
+	if err := backup.CheckMixedModeChain(chain); err != nil {
+		return fmt.Errorf("broker: %w", err)
+	}
+	if err := backup.VerifySchemaHashes(ctx, chain); err != nil {
+		return fmt.Errorf("broker: %w", err)
+	}
+	if err := backup.VerifyChainSignatures(ctx, b.Store, chain, b.Envelope, b.VerifyKey, b.RequireSignature); err != nil {
+		return fmt.Errorf("broker: verify chain signatures: %w", err)
+	}
+	return nil
 }
 
 // applyIncremental replays one incremental's schema deltas + change
@@ -893,6 +980,7 @@ func (b *SyncFromBackup) applyIncremental(
 	applier ir.ChangeApplier,
 	link *lineage.SegmentRecord,
 	batchSize int,
+	parentResumeID string,
 ) (int64, error) {
 	// 1. Schema deltas first.
 	if len(link.Manifest.SchemaDelta) > 0 {
@@ -924,7 +1012,11 @@ func (b *SyncFromBackup) applyIncremental(
 	// persists a position only after consuming the changes ahead of it.
 	changesCh := make(chan ir.Change, migcore.RowChanBuffer)
 	errCh := make(chan error, 1)
-	pos := encodeBrokerPosition(b.ChainURL, backupID)
+	// BRK-1: stream at the PARENT resume token, not this incremental's own
+	// backupID. A partial batch committed before a later-chunk failure then
+	// persists the parent position (safe re-apply on restart); the advance to
+	// backupID happens only in the post-stream writePositionDirect below.
+	pos := encodeBrokerPosition(b.ChainURL, parentResumeID)
 	go func() {
 		defer close(changesCh)
 		errCh <- b.streamIncrementalWithPosition(streamCtx, link, pos, changesCh)
@@ -947,10 +1039,12 @@ func (b *SyncFromBackup) applyIncremental(
 		return 0, fmt.Errorf("stream chunks: %w", err)
 	}
 
-	// 4. Some appliers may not emit a position write when the batch
-	//    contains only TxBegin/TxCommit boundary events (e.g. a
-	//    chunk that's a single empty transaction). Defensive write
-	//    here ensures the broker's position advances regardless.
+	// 4. Advance the broker position to THIS incremental's backupID — only
+	//    now, after every chunk has streamed cleanly (BRK-1). The streamed
+	//    changes carried the parent resume token, so the applier's in-batch
+	//    writes never advanced past the parent; this is the single point that
+	//    commits "incremental fully applied". (It also covers appliers that
+	//    emit no position write for a boundary-only batch.)
 	if err := b.writePositionDirect(ctx, applier, backupID); err != nil {
 		return 0, fmt.Errorf("finalise position: %w", err)
 	}
@@ -1086,10 +1180,35 @@ func (b *SyncFromBackup) streamIncrementalWithPosition(
 ) error {
 	segStore := link.Segment.Store(b.Store)
 	codec := link.Segment.CodecOrDefault()
+	// lastApplied tracks the ORIGINAL (pre-rewrite) source position of the
+	// last position-bearing change emitted across every chunk — the input to
+	// the F1 tail-truncation backstop below. Confined to this producer
+	// goroutine.
+	var lastApplied ir.Position
 	for chunkIdx, chunk := range link.Manifest.ChangeChunks {
-		if err := b.streamOneChunkWithPosition(ctx, segStore, codec, link.Manifest, chunkIdx, chunk, pos, out); err != nil {
+		if err := b.streamOneChunkWithPosition(ctx, segStore, codec, link.Manifest, chunkIdx, chunk, pos, out, &lastApplied); err != nil {
 			return fmt.Errorf("chunk %d (%s): %w", chunkIdx, chunk.File, err)
 		}
+	}
+	// F1 (SLUICE-E-BACKUP-INCOMPLETE): change-chunk tail-truncation backstop,
+	// mirroring ChainRestore.streamIncrementalChanges. manifest.EndPosition is
+	// the position of the last change the window writer wrote; a store
+	// adversary who drops the tail change-chunk entries leaves survivors with
+	// intact ordinals (GCM AAD still validates) but a replayed tail that falls
+	// SHORT of EndPosition. Refuse loudly rather than advance the broker past a
+	// short tail (which — with EndPosition intact — would poison a later CDC
+	// resume). On this error applyIncremental returns before its
+	// writePositionDirect(backupID), so the broker position stays at the
+	// PARENT (BRK-1) and a restart re-applies the whole incremental — hitting
+	// the same refusal, never a silent skip. Skipped for a schema-only window
+	// (non-position-bearing EndPosition) and reached only for chunk-bearing
+	// incrementals (the caller short-circuits the zero-chunk case).
+	if end := link.Manifest.EndPosition; len(link.Manifest.ChangeChunks) > 0 &&
+		(end.Engine != "" || end.Token != "") && lastApplied != end {
+		return sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
+			"restore from an untampered copy, or sign the chain so a truncated change-list is caught at verify time",
+			fmt.Errorf("incremental %s: replayed change-chunk tail ends at position %+v but the manifest records EndPosition %+v — the change-chunk list is truncated (fewer events than recorded); refusing to advance the broker past a short tail",
+				lineage.ManifestBackupID(link.Manifest), lastApplied, end))
 	}
 	return nil
 }
@@ -1109,6 +1228,7 @@ func (b *SyncFromBackup) streamOneChunkWithPosition(
 	chunk *irbackup.ChunkInfo,
 	pos ir.Position,
 	out chan<- ir.Change,
+	lastApplied *ir.Position,
 ) error {
 	src, err := blobcodec.FetchChunkVerified(ctx, segStore, chunk.File, chunk.SHA256)
 	if err != nil {
@@ -1134,11 +1254,23 @@ func (b *SyncFromBackup) streamOneChunkWithPosition(
 			_ = cr.Close()
 			return fmt.Errorf("read change: %w", rErr)
 		}
+		// F1 backstop bookkeeping: track the ORIGINAL (pre-rewrite) source
+		// position of the last position-bearing change. The broker rewrites
+		// every position to its own token, so this must read the source
+		// position BEFORE the rewrite (mirrors the window writer's `lastPos`).
+		if p := change.Pos(); p.Engine != "" || p.Token != "" {
+			*lastApplied = p
+		}
+		rewritten, rwErr := rewritePosition(change, pos)
+		if rwErr != nil {
+			_ = cr.Close()
+			return rwErr
+		}
 		select {
 		case <-ctx.Done():
 			_ = cr.Close()
 			return ctx.Err()
-		case out <- rewritePosition(change, pos):
+		case out <- rewritten:
 		}
 	}
 	return cr.Close()
@@ -1148,31 +1280,36 @@ func (b *SyncFromBackup) streamOneChunkWithPosition(
 // replaced by pos. Insert / Update / Delete / Truncate / TxBegin /
 // TxCommit are all sealed-interface variants in the IR; we
 // type-switch over the concrete shapes.
-func rewritePosition(c ir.Change, pos ir.Position) ir.Change {
+//
+// BRK-5: an unknown/future [ir.Change] shape is a HARD error, never a
+// silent pass-through. Returning it unchanged would let it ride to the
+// applier carrying its ORIGINAL source position; if it became a batch's
+// last committed change the applier would persist a non-broker token and
+// the next Run would refuse to resume ("owned by a non-broker writer") — a
+// self-inflicted stall. Failing here forces any new change type to be
+// wired into the rewrite deliberately.
+func rewritePosition(c ir.Change, pos ir.Position) (ir.Change, error) {
 	switch v := c.(type) {
 	case ir.Insert:
 		v.Position = pos
-		return v
+		return v, nil
 	case ir.Update:
 		v.Position = pos
-		return v
+		return v, nil
 	case ir.Delete:
 		v.Position = pos
-		return v
+		return v, nil
 	case ir.Truncate:
 		v.Position = pos
-		return v
+		return v, nil
 	case ir.TxBegin:
 		v.Position = pos
-		return v
+		return v, nil
 	case ir.TxCommit:
 		v.Position = pos
-		return v
+		return v, nil
 	}
-	// Unknown shape — return as-is. Future IR additions land here
-	// with their own position untouched; the broker's position
-	// advance still happens via the post-replay direct write.
-	return c
+	return nil, fmt.Errorf("broker: rewritePosition: unhandled ir.Change shape %T — a new change type must be wired into the broker's position rewrite before it can be replayed", c)
 }
 
 // checkStopSignals returns (true, nil) when either the in-process
@@ -1257,6 +1394,10 @@ func (b *SyncFromBackup) preflightChainEncryption(ctx context.Context) error {
 	if root == nil || root.ChainEncryption == nil {
 		return nil
 	}
+	// BRK-3: remember the chain is encrypted so the per-chunk guard can
+	// refuse a spliced plaintext chunk regardless of per-chain / per-chunk
+	// mode.
+	b.chainEncrypted = true
 	enc := root.ChainEncryption
 	if b.Envelope == nil {
 		return fmt.Errorf("chain is encrypted (algorithm=%q kek_mode=%q kek_ref=%q) but no --encrypt + key was supplied",
@@ -1293,6 +1434,18 @@ func (b *SyncFromBackup) preflightChainEncryption(ctx context.Context) error {
 // envelope + cached chain CEK. Mirrors [ChainRestore.changeChunkCEK].
 func (b *SyncFromBackup) chunkCEK(chunk *irbackup.ChunkInfo) ([]byte, error) {
 	if chunk.Encryption == nil {
+		// BRK-3: an encrypted chain must never apply a plaintext chunk. The
+		// incremental writer stamps ChunkEncryption on EVERY chunk of an
+		// encrypted chain, so a plaintext chunk here is a store adversary's
+		// splice — attacker rows the caller would otherwise open as cleartext.
+		// CheckMixedModeChain catches a whole plaintext incremental at the
+		// manifest level (ANY-chunk-encrypted test); this closes the finer
+		// single-chunk splice that test misses, in per-chain OR per-chunk mode.
+		if b.chainEncrypted {
+			return nil, lineage.CodeChunkAuthError(fmt.Errorf(
+				"plaintext change chunk %q spliced into an encrypted chain — refusing to apply it as cleartext", chunk.File,
+			))
+		}
 		return nil, nil
 	}
 	if len(chunk.Encryption.WrappedCEK) > 0 {

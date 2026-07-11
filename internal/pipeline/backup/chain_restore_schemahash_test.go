@@ -42,10 +42,9 @@ func schemaHashLink(t *testing.T, mutate func(m *irbackup.Manifest)) lineage.Seg
 
 func TestVerifySchemaHashes(t *testing.T) {
 	ctx := context.Background()
-	r := &ChainRestore{}
 
 	t.Run("matching hash passes", func(t *testing.T) {
-		if err := r.verifySchemaHashes(ctx, []lineage.SegmentRecord{schemaHashLink(t, nil)}); err != nil {
+		if err := verifySchemaHashes(ctx, []lineage.SegmentRecord{schemaHashLink(t, nil)}); err != nil {
 			t.Errorf("matching hash refused: %v", err)
 		}
 	})
@@ -55,7 +54,7 @@ func TestVerifySchemaHashes(t *testing.T) {
 			m.SchemaHash = ""
 			m.Schema.Tables[0].Name = "whatever" // unverifiable, must not matter
 		})
-		if err := r.verifySchemaHashes(ctx, []lineage.SegmentRecord{link}); err != nil {
+		if err := verifySchemaHashes(ctx, []lineage.SegmentRecord{link}); err != nil {
 			t.Errorf("hash-less manifest refused: %v", err)
 		}
 	})
@@ -64,7 +63,7 @@ func TestVerifySchemaHashes(t *testing.T) {
 		link := schemaHashLink(t, func(m *irbackup.Manifest) {
 			m.Schema.Tables[0].Columns[0].Name = "mangled"
 		})
-		err := r.verifySchemaHashes(ctx, []lineage.SegmentRecord{link})
+		err := verifySchemaHashes(ctx, []lineage.SegmentRecord{link})
 		if err == nil {
 			t.Fatal("mismatched hash passed; the corruption check is gone")
 		}
@@ -84,7 +83,7 @@ func TestVerifySchemaHashes(t *testing.T) {
 			m.Schema.Sequences = []*ir.Sequence{{Name: "s", Increment: 5}}
 			// The recorded hash predates the sequence-option change.
 		})
-		if err := r.verifySchemaHashes(ctx, []lineage.SegmentRecord{link}); err != nil {
+		if err := verifySchemaHashes(ctx, []lineage.SegmentRecord{link}); err != nil {
 			t.Errorf("pre-v5 sequences carve-out refused a legitimate old chain: %v", err)
 		}
 	})
@@ -95,7 +94,7 @@ func TestVerifySchemaHashes(t *testing.T) {
 		link := schemaHashLink(t, func(m *irbackup.Manifest) {
 			m.Schema.Sequences = []*ir.Sequence{{Name: "s", Increment: 5}}
 		})
-		if err := r.verifySchemaHashes(ctx, []lineage.SegmentRecord{link}); err == nil {
+		if err := verifySchemaHashes(ctx, []lineage.SegmentRecord{link}); err == nil {
 			t.Error("v5 manifest with a mismatched hash passed via the sequences carve-out; the carve-out must stay pre-v5-only")
 		}
 	})

@@ -106,7 +106,6 @@ func TestChainRestore_CrossEngine_UUIDValuePreserved(t *testing.T) {
 	}
 	sha, rowCount := writeOneChangeChunk(t, store, "chunks/_changes/changes-0.jsonl.gz", changes)
 
-	incrPos := ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/200"}`}
 	incr := &irbackup.Manifest{
 		FormatVersion:  irbackup.BackupFormatVersion,
 		CreatedAt:      time.Date(2026, 5, 8, 11, 0, 0, 0, time.UTC),
@@ -114,7 +113,8 @@ func TestChainRestore_CrossEngine_UUIDValuePreserved(t *testing.T) {
 		Kind:           irbackup.BackupKindIncremental,
 		ParentBackupID: full.BackupID,
 		StartPosition:  pos,
-		EndPosition:    incrPos,
+		// EndPosition == the last change's position (F1 writer invariant).
+		EndPosition: pos,
 		ChangeChunks: []*irbackup.ChunkInfo{{
 			File: "chunks/_changes/changes-0.jsonl.gz", SHA256: sha, RowCount: rowCount,
 		}},
@@ -185,7 +185,8 @@ func TestChainRestore_CrossEngine_JSONbytesPreserved(t *testing.T) {
 		FormatVersion: irbackup.BackupFormatVersion, CreatedAt: time.Now().UTC(),
 		SourceEngine: "postgres", Kind: irbackup.BackupKindIncremental,
 		ParentBackupID: full.BackupID, StartPosition: pos,
-		EndPosition: ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/200"}`},
+		// EndPosition == the last change's position (F1 writer invariant).
+		EndPosition: pos,
 		ChangeChunks: []*irbackup.ChunkInfo{{
 			File: "chunks/_changes/changes-0.jsonl.gz", SHA256: sha, RowCount: rowCount,
 		}},
@@ -256,7 +257,8 @@ func TestChainRestore_CrossEngine_TimestampPreserved(t *testing.T) {
 		FormatVersion: irbackup.BackupFormatVersion, CreatedAt: time.Now().UTC(),
 		SourceEngine: "postgres", Kind: irbackup.BackupKindIncremental,
 		ParentBackupID: full.BackupID, StartPosition: pos,
-		EndPosition: ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/200"}`},
+		// EndPosition == the last change's position (F1 writer invariant).
+		EndPosition: pos,
 		ChangeChunks: []*irbackup.ChunkInfo{{
 			File: "chunks/_changes/changes-0.jsonl.gz", SHA256: sha, RowCount: rowCount,
 		}},
@@ -327,7 +329,8 @@ func TestChainRestore_CrossEngine_BoolValuePreserved(t *testing.T) {
 		FormatVersion: irbackup.BackupFormatVersion, CreatedAt: time.Now().UTC(),
 		SourceEngine: "mysql", Kind: irbackup.BackupKindIncremental,
 		ParentBackupID: full.BackupID, StartPosition: pos,
-		EndPosition: ir.Position{Engine: "mysql", Token: `gtid:abc:2`},
+		// EndPosition == the last change's position (F1 writer invariant).
+		EndPosition: pos,
 		ChangeChunks: []*irbackup.ChunkInfo{{
 			File: "chunks/_changes/changes-0.jsonl.gz", SHA256: sha, RowCount: rowCount,
 		}},
