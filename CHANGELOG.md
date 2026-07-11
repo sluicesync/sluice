@@ -4,6 +4,16 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.227] - 2026-07-11
+
+### Fixed
+
+- **A mistyped config key is now a loud load error instead of a silent drop — closing a PII-redaction trap (audit N-10).** The base config loader silently ignored unknown/misspelled YAML keys, so a typo'd `redactions:` block (e.g. `redaction:`) — or a misspelled field inside one (`tabel:` for `table:`) — left the redaction list empty, and the operator believed PII was being masked while the data flowed to the target unredacted. The loader now rejects any unknown key loudly (mirroring the fleet loader, which already did). Every documented config key is a real field, so only genuinely-unsupported keys are refused; the documented sample config and every existing config still load unchanged.
+
+- **The MySQL NaN/±Infinity float refusal is now a registered coded error (`SLUICE-E-VALUE-UNREPRESENTABLE`) — audit DEVEX-D2.** The guard that refuses a `NaN`/±`Infinity` float into a MySQL `FLOAT`/`DOUBLE` (which MySQL cannot represent) emitted its code as a raw string in the message, so it was never in the error registry: automation keying on the code missed it, the refusal-class exit code didn't apply, and it was absent from the operator error-codes reference. It is now a first-class coded refusal, in the registry and the docs.
+
+- **Compile-time pins for optional-interface fast paths that were dispatched only by runtime type-assertion (audit ARCH-F1).** Several optional surfaces are discovered at runtime (`x.(ir.FloatRepairWriter)` etc.), so a method-set break — a signature or receiver change — compiled clean and silently downgraded the pipeline to a fallback. The concrete case: a drift in the Postgres FLOAT-repair writer compiled clean and Postgres silently skipped the cold-start FLOAT re-read repair (shipping display-rounded floats), where MySQL had an integration pin and Postgres had none. Added blank-var compile-time assertions for the Postgres/MySQL FLOAT-repair writer, the VStream lossy-float copy-reader that triggers the repair, and the four backup encryption/signing envelope extensions — so a future break is a build error, not a silent runtime downgrade. Compile-time only; no behavior change.
+
 ## [0.99.226] - 2026-07-11
 
 ### Security
