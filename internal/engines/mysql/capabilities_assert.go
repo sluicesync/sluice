@@ -73,6 +73,7 @@ var (
 	// RowWriter optional surfaces.
 	_ ir.BulkTableDropper            = (*RowWriter)(nil)
 	_ ir.CopyDurableProgressReporter = (*RowWriter)(nil)
+	_ ir.FloatRepairWriter           = (*RowWriter)(nil) // cold-start FLOAT re-read repair (ADR-0153; audit ARCH-F1)
 	_ ir.IdempotentCopyWriter        = (*RowWriter)(nil)
 	_ ir.IdempotentRowWriter         = (*RowWriter)(nil)
 	_ ir.MaxBufferBytesSetter        = (*RowWriter)(nil)
@@ -116,7 +117,13 @@ var (
 	_ ir.CopyCheckpointer        = (*vstreamSnapshotRows)(nil)
 	_ ir.CopyDurableProgressSink = (*vstreamSnapshotRows)(nil)
 	_ ir.IdempotentCopyReader    = (*vstreamSnapshotRows)(nil)
-	_ ir.MaxBufferBytesSetter    = (*vstreamSnapshotRows)(nil)
+	// LossyFloatCopyReader signals the VStream COPY phase rounds FLOATs
+	// (the 17-year MySQL display-rounding bug), which TRIGGERS the
+	// cold-start FLOAT repair. Dispatched by runtime type-assertion at
+	// backup.go / streamer_coldstart_float_repair.go; a drift here would
+	// silently skip the repair, shipping rounded floats (audit ARCH-F1).
+	_ ir.LossyFloatCopyReader = (*vstreamSnapshotRows)(nil)
+	_ ir.MaxBufferBytesSetter = (*vstreamSnapshotRows)(nil)
 
 	// Migration-state store.
 	_ ir.MigrationStateStore = (*MigrationStateStore)(nil)

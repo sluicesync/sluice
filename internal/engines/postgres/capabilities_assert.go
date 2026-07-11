@@ -94,16 +94,23 @@ var (
 	// RowWriter optional surfaces.
 	_ ir.BulkTableDropper            = (*RowWriter)(nil)
 	_ ir.CopyDurableProgressReporter = (*RowWriter)(nil)
-	_ ir.IdempotentCopyWriter        = (*RowWriter)(nil)
-	_ ir.IdempotentRowWriter         = (*RowWriter)(nil)
-	_ ir.MaxBufferBytesSetter        = (*RowWriter)(nil)
-	_ ir.RawCopyImporter             = (*RowWriter)(nil)
-	_ ir.RawCopyVersionProber        = (*RowWriter)(nil)
-	_ ir.SchemaSetter                = (*RowWriter)(nil)
-	_ ir.SchemaTypeDropper           = (*RowWriter)(nil)
-	_ ir.TableDropper                = (*RowWriter)(nil)
-	_ ir.TableEmptyChecker           = (*RowWriter)(nil)
-	_ ir.TableTruncator              = (*RowWriter)(nil)
+	// FloatRepairWriter drives the cold-start FLOAT re-read repair
+	// (ADR-0153). It is dispatched by runtime type-assertion at
+	// streamer_coldstart_float_repair.go; without this pin a signature
+	// drift in row_writer_float_repair.go compiles clean and postgres
+	// silently takes the WARN-skip branch (float repair disabled) —
+	// mysql had an integration pin, postgres had none (audit ARCH-F1).
+	_ ir.FloatRepairWriter    = (*RowWriter)(nil)
+	_ ir.IdempotentCopyWriter = (*RowWriter)(nil)
+	_ ir.IdempotentRowWriter  = (*RowWriter)(nil)
+	_ ir.MaxBufferBytesSetter = (*RowWriter)(nil)
+	_ ir.RawCopyImporter      = (*RowWriter)(nil)
+	_ ir.RawCopyVersionProber = (*RowWriter)(nil)
+	_ ir.SchemaSetter         = (*RowWriter)(nil)
+	_ ir.SchemaTypeDropper    = (*RowWriter)(nil)
+	_ ir.TableDropper         = (*RowWriter)(nil)
+	_ ir.TableEmptyChecker    = (*RowWriter)(nil)
+	_ ir.TableTruncator       = (*RowWriter)(nil)
 
 	// ChangeApplier optional surfaces.
 	_ ir.ApplyConcurrencySetter         = (*ChangeApplier)(nil)
