@@ -381,9 +381,18 @@ func Load(path string) (*Config, error) {
 			Result:           &c,
 			WeaklyTypedInput: true,
 			TagName:          "koanf",
+			// N-10: an unknown/typo'd YAML key is now a LOUD load failure
+			// instead of a silent drop. The trap this closes is a mistyped
+			// `redactions:` block (or a misspelled field inside one) that the
+			// operator believes is redacting PII while it silently does
+			// nothing — a compliance-grade silent-loss. Every key in the
+			// documented config surface is a Config-struct field, so this
+			// only rejects genuinely-unsupported keys. Mirrors the fleet
+			// loader (cmd/sluice/sync_run.go), which already sets this.
+			ErrorUnused: true,
 		},
 	}); err != nil {
-		return nil, &sluicecode.ConfigError{Err: fmt.Errorf("config: unmarshal: %w", err)}
+		return nil, &sluicecode.ConfigError{Err: fmt.Errorf("config: unmarshal (unknown/typo'd key? every config key must be a documented field): %w", err)}
 	}
 	return &c, nil
 }
