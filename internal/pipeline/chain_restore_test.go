@@ -709,11 +709,18 @@ func TestChainRestore_SchemaHistoryOnlyManifestReplayed(t *testing.T) {
 
 	incr := makeManifest(t, irbackup.BackupKindIncremental, full, "0/200")
 	incr.Schema = &ir.Schema{Tables: []*ir.Table{postDDL}}
+	// A real DDL-no-DML window advances EndPosition to the schema snapshot's
+	// OWN WAL position (incremental.go: the SchemaSnapshot is position-bearing
+	// and sets lastPos → EndPosition), so its last schema-history anchor equals
+	// EndPosition. Model that: anchor == EndPosition (0/200). Bug 184 pins that
+	// this is what makes a legit 0-chunk window "reach" EndPosition — the
+	// completeness backstop accepts it via SchemaHistoryAnchors, NOT via a
+	// blanket "SchemaHistory present" exemption.
 	incr.SchemaHistory = []*irbackup.SchemaHistoryEntry{
 		{
 			Schema:         "",
 			Table:          "users",
-			AnchorPosition: ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/150"}`},
+			AnchorPosition: ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/200"}`},
 			TableJSON:      postDDLPayload,
 		},
 	}

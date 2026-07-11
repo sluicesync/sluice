@@ -717,16 +717,24 @@ func (r *ChainRestore) applyIncremental(
 	//    no DML, then closed). Replay the schema-history regardless so
 	//    a resumed stream finds the post-DDL version at backup.EndPosition.
 	if len(link.Manifest.ChangeChunks) == 0 && len(link.Manifest.SchemaHistory) == 0 {
-		// Bug 183: a 0-chunk incremental with NO schema content (no SchemaDelta
-		// either) whose EndPosition still ADVANCES beyond StartPosition is a
-		// pure-DATA window whose change-chunk list was emptied — its events are
-		// gone while EndPosition overstates, poisoning a later resume. Refuse
-		// rather than take the "schema-deltas only" early-return. A legit
-		// schema-delta-only window has SchemaDelta > 0; a legit no-op window has
-		// EndPosition == StartPosition. (A SchemaHistory window advances via the
-		// streaming path above, where the same shortfall check applies.)
+		// Bug 183/184: this branch is a 0-chunk AND 0-schema-history window, so
+		// it can carry NO snapshot anchored at EndPosition. The only legitimate
+		// shapes that reach here did NOT advance a position-bearing EndPosition:
+		// a no-op window (EndPosition == StartPosition) or a schema-delta-only
+		// window whose DDL produced no position advance (e.g. a DROP — no
+		// Relation snapshot, so EndPosition stays the zero position and
+		// posBearing is false). A posBearing EndPosition that ADVANCES beyond
+		// StartPosition with neither chunks nor a schema snapshot is an emptied
+		// change-chunk list — its events are gone while EndPosition overstates,
+		// poisoning a later resume. Refuse.
+		//
+		// Bug 184 CORRECTION: the old `SchemaDelta == 0` carve-out was unsound.
+		// A schema delta is an out-of-band before/after diff; it never advances
+		// EndPosition on its own (only a written position-bearing change does),
+		// so leaving SchemaDelta behind must not exempt an emptied data+DDL
+		// window. The posBearing gate already excludes the legit DROP-only case.
 		if end := link.Manifest.EndPosition; (end.Engine != "" || end.Token != "") &&
-			end != link.Manifest.StartPosition && len(link.Manifest.SchemaDelta) == 0 {
+			end != link.Manifest.StartPosition {
 			return sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
 				"restore from an untampered copy, or sign the chain so an emptied change-list is caught at verify time",
 				fmt.Errorf("incremental %s: manifest records EndPosition %+v (StartPosition %+v) with no change chunks and no schema content — the change-chunk list was emptied; refusing to report success with dropped events",
@@ -1016,29 +1024,43 @@ func (r *ChainRestore) streamIncrementalChanges(
 	// EndPosition matches here and stays the documented, recoverable
 	// whole-backup rollback.
 	//
-	// Bug 183: the guard is `EndPosition != StartPosition` (the window claims
-	// to ADVANCE / cover data), NOT `len(ChangeChunks) > 0` — otherwise an
-	// adversary who EMPTIES the change-chunk list (not just truncates its tail)
-	// sets len==0, skips the check, and silently drops every event while
-	// EndPosition still advances. A legitimate schema-only window has
-	// EndPosition == StartPosition (no data advance; `lastPos` never moves), so
-	// this excludes it; an emptied incremental applied 0 changes (lastApplied
-	// stays zero) with EndPosition ahead → refused.
+	// Bug 183/184: assert the replay actually REACHED EndPosition. The window
+	// writer sets manifest.EndPosition to the position of the LAST thing it
+	// wrote — the last change chunk's last change for a data window, or the
+	// last schema snapshot's own anchor for a DDL-only window. A store
+	// adversary who TRUNCATES or EMPTIES an unsigned incremental's ChangeChunks
+	// leaves the survivors' AAD ordinals intact (so they still decrypt) but the
+	// replayed content now falls SHORT of EndPosition — a silent exit-0 with
+	// fewer events and an EndPosition that overstates the data, poisoning a
+	// subsequent CDC resume. Refuse loudly.
 	//
-	// A LEGIT 0-chunk incremental is a schema-only window (SchemaDelta /
-	// SchemaHistory carry its content) and can advance EndPosition without
-	// change chunks — so the 0-chunk refusal fires only when there is ALSO no
-	// schema content to justify the advance (a pure-DATA window whose chunk
-	// list was emptied). An incremental WITH chunks is checked regardless.
+	// "Reached" = the last applied change-chunk position equals EndPosition,
+	// OR a schema-history snapshot is anchored EXACTLY at EndPosition (the
+	// DDL-only case: a window that observed a DDL but no DML advances
+	// EndPosition to the snapshot's own WAL position — see
+	// [irbackup.Manifest.SchemaHistoryAnchors]).
+	//
+	// Bug 184 CORRECTION: keying "legit 0-chunk window" on the mere PRESENCE
+	// of SchemaHistory/SchemaDelta was wrong — every real DATA incremental also
+	// carries a routine first-touch schema snapshot (the reader emits the
+	// Relation/table-map ahead of its rows, so the anchor sits BEFORE the first
+	// row and strictly before EndPosition, the LAST row). That let an
+	// emptied-DATA window (chunks deleted, routine snapshot left behind) pass as
+	// "schema-only." Anchoring the check on the POSITION, not the presence,
+	// closes it: the routine snapshot's early anchor never equals EndPosition,
+	// while a genuine DDL-only window's snapshot anchor does.
+	//
+	// A fully-coherent edit that also lowers EndPosition (and any matching
+	// anchor) matches here and stays the documented, recoverable whole-backup
+	// rollback; signing closes that residue.
 	end := link.Manifest.EndPosition
 	posBearing := end.Engine != "" || end.Token != ""
-	hasChunks := len(link.Manifest.ChangeChunks) > 0
-	schemaOnly := len(link.Manifest.SchemaDelta) > 0 || len(link.Manifest.SchemaHistory) > 0
 	claimsAdvance := end != link.Manifest.StartPosition
-	if posBearing && lastApplied != end && (hasChunks || (!schemaOnly && claimsAdvance)) {
+	reachedEnd := lastApplied == end || link.Manifest.SchemaHistoryAnchors(end)
+	if posBearing && claimsAdvance && !reachedEnd {
 		return sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
 			"restore from an untampered copy, or sign the chain so a truncated/emptied change-list is caught at verify time",
-			fmt.Errorf("incremental %s: replayed changes end at position %+v but the manifest records EndPosition %+v (StartPosition %+v) — the change-chunk list is truncated or emptied (fewer events than recorded); refusing to report success with a short tail",
+			fmt.Errorf("incremental %s: replay reached position %+v but the manifest records EndPosition %+v (StartPosition %+v) with no change chunk or schema snapshot at EndPosition — the change-chunk list is truncated or emptied (fewer events than recorded); refusing to report success with a short tail",
 				lineage.ManifestBackupID(link.Manifest), lastApplied, end, link.Manifest.StartPosition))
 	}
 	return nil

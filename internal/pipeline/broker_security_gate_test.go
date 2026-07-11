@@ -103,28 +103,50 @@ func TestChainRestore_ChangeChunkTailTruncation_Refused(t *testing.T) {
 	}
 }
 
-// TestChainRestore_EmptiedChangeChunkList_Refused pins Bug 183 (the
+// TestChainRestore_EmptiedChangeChunkList_Refused pins Bug 183/184 (the
 // empty-list mirror of F1 tail-truncation): an unsigned incremental whose
-// change-chunk list is EMPTIED (not just truncated) — 0 chunks, no schema
-// content — but whose EndPosition still advances must refuse, not silently
-// apply nothing. A legit empty window (EndPosition == StartPosition) passes,
-// and a schema-only window is covered by TestChainRestore_SchemaHistoryOnly*.
+// change-chunk list is EMPTIED (not just truncated) but whose EndPosition
+// still advances must refuse, not silently apply nothing.
+//
+// Bug 184 is the case v0.99.223 MISSED: an emptied-DATA window still carries
+// its routine first-touch schema-history snapshot (every real data incremental
+// has one), anchored BEFORE the last row — so keying "legit 0-chunk window" on
+// the mere PRESENCE of SchemaHistory let it pass. The completeness backstop now
+// keys on the anchor POSITION: legit iff a change-chunk tail OR a schema-history
+// snapshot is anchored EXACTLY at EndPosition. A DDL-only window's snapshot
+// anchor equals EndPosition (passes); an emptied-data window's routine snapshot
+// is anchored earlier (refused).
 func TestChainRestore_EmptiedChangeChunkList_Refused(t *testing.T) {
+	users := &ir.Table{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}
+	usersJSON, err := ir.MarshalTable(users)
+	if err != nil {
+		t.Fatalf("marshal users: %v", err)
+	}
 	for _, tc := range []struct {
-		name    string
-		endLSN  string
-		wantErr bool
+		name string
+		// endLSN sets the incremental's EndPosition; StartPosition is the
+		// full's EndPosition (0/100).
+		endLSN string
+		// schemaAnchorLSN, if non-empty, seeds one SchemaHistory entry
+		// anchored at that LSN (models the routine/DDL schema snapshot).
+		schemaAnchorLSN string
+		wantErr         bool
 	}{
-		{"emptied list, no schema, EndPosition ahead of StartPosition", "0/202", true},
-		{"emptied list, EndPosition == StartPosition (legit no-op window)", "0/100", false},
+		{"emptied list, no schema, EndPosition ahead of StartPosition", "0/202", "", true},
+		{"emptied list, EndPosition == StartPosition (legit no-op window)", "0/100", "", false},
+		// Bug 184: emptied-DATA window keeps its routine schema snapshot,
+		// anchored at the window START (0/150), BEFORE the overstated
+		// EndPosition (0/202). Presence of SchemaHistory must NOT exempt it.
+		{"Bug 184: emptied DATA list, routine snapshot anchored BEFORE EndPosition", "0/202", "0/150", true},
+		// Legit DDL-only window: the schema snapshot's own anchor IS
+		// EndPosition (the snapshot is what advanced the position). Passes.
+		{"legit DDL-only window, snapshot anchored AT EndPosition", "0/202", "0/202", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			dir := t.TempDir()
 			store, _ := blobcodec.NewLocalStore(dir)
-			schema := &ir.Schema{Tables: []*ir.Table{{
-				Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
-			}}}
+			schema := &ir.Schema{Tables: []*ir.Table{users}}
 
 			full := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
 			full.Schema = schema
@@ -138,6 +160,13 @@ func TestChainRestore_EmptiedChangeChunkList_Refused(t *testing.T) {
 			incr := makeManifest(t, irbackup.BackupKindIncremental, full, tc.endLSN)
 			incr.Schema = schema
 			incr.ChangeChunks = nil // EMPTIED (the attack) / legitimately empty
+			if tc.schemaAnchorLSN != "" {
+				incr.SchemaHistory = []*irbackup.SchemaHistoryEntry{{
+					Table:          "users",
+					AnchorPosition: pgPos(tc.schemaAnchorLSN),
+					TableJSON:      usersJSON,
+				}}
+			}
 			incr.BackupID = irbackup.ComputeBackupID(incr)
 			incrPath := "manifests/incr-0001.json"
 			if err := lineage.WriteManifestAt(ctx, store, incrPath, incr); err != nil {
@@ -152,7 +181,64 @@ func TestChainRestore_EmptiedChangeChunkList_Refused(t *testing.T) {
 				return
 			}
 			if err != nil {
-				t.Fatalf("legit empty window refused: %v", err)
+				t.Fatalf("legit window refused: %v", err)
+			}
+		})
+	}
+}
+
+// TestSyncFromBackup_EmptiedChangeChunkList_Refused is the broker-path
+// mirror of TestChainRestore_EmptiedChangeChunkList_Refused (Bug 183/184).
+// applyIncremental's 0-chunk branch must refuse an emptied-DATA incremental
+// (whose routine schema snapshot sits BEFORE the overstated EndPosition)
+// rather than silently writePositionDirect past the dropped events, while
+// still allowing a genuine DDL-only window (snapshot anchored AT EndPosition)
+// and a no-op window (EndPosition == StartPosition).
+func TestSyncFromBackup_EmptiedChangeChunkList_Refused(t *testing.T) {
+	users := &ir.Table{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}
+	usersJSON, err := ir.MarshalTable(users)
+	if err != nil {
+		t.Fatalf("marshal users: %v", err)
+	}
+	for _, tc := range []struct {
+		name            string
+		endLSN          string
+		schemaAnchorLSN string
+		wantErr         bool
+	}{
+		{"emptied list, no schema, EndPosition ahead of StartPosition", "0/202", "", true},
+		{"emptied list, EndPosition == StartPosition (legit no-op window)", "0/100", "", false},
+		{"Bug 184: emptied DATA list, routine snapshot anchored BEFORE EndPosition", "0/202", "0/150", true},
+		{"legit DDL-only window, snapshot anchored AT EndPosition", "0/202", "0/202", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			full := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
+			incr := makeManifest(t, irbackup.BackupKindIncremental, full, tc.endLSN)
+			incr.ChangeChunks = nil // EMPTIED (the attack) / legitimately empty
+			if tc.schemaAnchorLSN != "" {
+				incr.SchemaHistory = []*irbackup.SchemaHistoryEntry{{
+					Table:          "users",
+					AnchorPosition: pgPos(tc.schemaAnchorLSN),
+					TableJSON:      usersJSON,
+				}}
+			}
+			incr.BackupID = irbackup.ComputeBackupID(incr)
+			link := &lineage.SegmentRecord{
+				ManifestRecord: lineage.ManifestRecord{Path: "manifests/incr-0001.json", Manifest: incr},
+			}
+			b := &SyncFromBackup{ChainURL: "test://brk184", StreamID: "s"}
+			app := &capturingApplier{}
+			_, err := b.applyIncremental(ctx, app, link, 100, "PARENT-RESUME-TOKEN")
+			if tc.wantErr {
+				assertCoded(t, err, sluicecode.CodeBackupIncomplete)
+				if len(app.written) != 0 {
+					t.Errorf("broker advanced its position (%d writes) on a refused emptied incremental", len(app.written))
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("legit window refused: %v", err)
 			}
 		})
 	}

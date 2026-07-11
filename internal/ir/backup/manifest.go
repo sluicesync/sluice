@@ -588,6 +588,31 @@ type Manifest struct {
 	ChainEncryption *ChainEncryption `json:"chain_encryption,omitempty"`
 }
 
+// SchemaHistoryAnchors an EndPosition reports whether any SchemaHistory
+// entry is anchored EXACTLY at pos. A schema-only incremental window (a
+// DDL with no DML) advances EndPosition to the schema snapshot's own WAL
+// position, so its last schema-history anchor equals EndPosition — that
+// snapshot is what "reaches" EndPosition even though the window carries no
+// change chunks.
+//
+// This is the schema-side half of the Bug 183/184 completeness backstop
+// (the chunk-side half is "the replayed change-chunk tail ends at
+// EndPosition"). A DATA incremental's routine first-touch schema snapshot
+// is anchored at/before the FIRST row's position (the reader emits the
+// Relation/table-map ahead of its rows), strictly before EndPosition (the
+// LAST row), so it never spuriously satisfies this check — an emptied-data
+// window (chunks deleted, the routine early-anchored snapshot left behind)
+// has NO anchor at EndPosition and is correctly refused. Equality-only, so
+// it is engine-neutral (no LSN/GTID ordering).
+func (m *Manifest) SchemaHistoryAnchors(pos ir.Position) bool {
+	for _, e := range m.SchemaHistory {
+		if e != nil && e.AnchorPosition == pos {
+			return true
+		}
+	}
+	return false
+}
+
 // Manifest partial-state constants. String literals are part of the
 // on-disk format; renaming requires a BackupFormatVersion bump.
 const (
