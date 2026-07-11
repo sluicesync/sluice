@@ -198,6 +198,114 @@ func TestOfflineRestore_PlaintextChunkSplice_Refused(t *testing.T) {
 	})
 }
 
+// TestVerifyBackup_PlaintextChunkSplice_Flagged pins the SEC-MIRROR follow-up:
+// `backup verify` now FLAGS a plaintext chunk spliced into an encrypted chain.
+// Previously verify was SHA-only + a decrypt-probe that no-ops on nil
+// Encryption, so it reported GREEN and the tamper only surfaced at restore — a
+// false all-clear for an operator who trusts verify.
+func TestVerifyBackup_PlaintextChunkSplice_Flagged(t *testing.T) {
+	ctx := context.Background()
+	store, incrPath := encryptedChainFixture(t)
+	if _, failed, err := backup.VerifyBackup(ctx, store); err != nil || failed != 0 {
+		t.Fatalf("pristine encrypted chain verify: failed=%d err=%v; want failed=0 err=nil", failed, err)
+	}
+	im, err := lineage.ReadManifestAt(ctx, store, incrPath)
+	if err != nil {
+		t.Fatalf("read incr manifest: %v", err)
+	}
+	im.ChangeChunks[0].Encryption = nil // the splice
+	if err := lineage.WriteManifestAt(ctx, store, incrPath, im); err != nil {
+		t.Fatalf("rewrite incr manifest: %v", err)
+	}
+	_, failed, err := backup.VerifyBackup(ctx, store)
+	if err != nil {
+		t.Fatalf("verify spliced store errored: %v", err)
+	}
+	if failed == 0 {
+		t.Fatal("backup verify did NOT flag a plaintext chunk spliced into an encrypted chain (SEC-MIRROR follow-up regressed) — it would report GREEN then restore would refuse")
+	}
+}
+
+// TestRestore_EnvelopeSuppliedButPlaintextChain_Refused pins the SEC-MIRROR
+// follow-up: supplying an encryption key against a chain that claims PLAINTEXT
+// is REFUSED, not silently ignored — the loud signal for a whole-chain
+// encrypted->plaintext downgrade on an unsigned chain (an operator who passes
+// --encrypt EXPECTS encryption). A plaintext restore WITHOUT a key still works.
+func TestRestore_EnvelopeSuppliedButPlaintextChain_Refused(t *testing.T) {
+	ctx := context.Background()
+	store, err := blobcodec.NewLocalStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewLocalStore: %v", err)
+	}
+	schema := &ir.Schema{Tables: []*ir.Table{{
+		Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
+	}}}
+	src := newBackupRecorderEngine("postgres", schema, map[string][]ir.Row{"users": {{"id": int64(1)}}})
+	if err := (&backup.Backup{Source: src, SourceDSN: "src", Store: store}).Run(ctx); err != nil {
+		t.Fatalf("plaintext Backup.Run: %v", err)
+	}
+	// Baseline: a plaintext backup restores WITHOUT a key.
+	tgt := &chainRestoreRecorderEngine{restoreRecorderEngine: newRestoreRecorderEngine("postgres")}
+	if err := (&backup.ChainRestore{Target: tgt, TargetDSN: "tgt", Store: store}).Run(ctx); err != nil {
+		t.Fatalf("plaintext restore (no key) failed: %v", err)
+	}
+	// A key supplied against a plaintext-claiming chain is refused (coded).
+	params, err := crypto.DefaultArgon2idParams()
+	if err != nil {
+		t.Fatalf("DefaultArgon2idParams: %v", err)
+	}
+	env, err := crypto.NewPassphraseEnvelope(tamperPassphrase, params)
+	if err != nil {
+		t.Fatalf("NewPassphraseEnvelope: %v", err)
+	}
+	tgt2 := &chainRestoreRecorderEngine{restoreRecorderEngine: newRestoreRecorderEngine("postgres")}
+	err = (&backup.ChainRestore{Target: tgt2, TargetDSN: "tgt", Store: store, Envelope: env}).Run(ctx)
+	assertCoded(t, err, sluicecode.CodeBackupChunkAuthFailed)
+}
+
+// TestAssertDataWindowEndPositionInvariant pins the writer-side reader-invariant
+// backstop (audit silent-loss F2): on a non-commit-after-rows engine a
+// DATA-bearing window's EndPosition must never coincide with a schema-history
+// anchor (that is the property the restore completeness net relies on to tell a
+// genuine DDL-only window from an emptied-data one). VStream engines legitimately
+// co-locate, so the invariant is asserted only when CDCPositionCommitsAfterRows
+// is false.
+func TestAssertDataWindowEndPositionInvariant(t *testing.T) {
+	end := pgPos("0/200")
+	mk := func(afterRows bool, chunks int, anchor *ir.Position) *irbackup.Manifest {
+		m := &irbackup.Manifest{CDCPositionCommitsAfterRows: afterRows, EndPosition: end}
+		for i := 0; i < chunks; i++ {
+			m.ChangeChunks = append(m.ChangeChunks, &irbackup.ChunkInfo{})
+		}
+		if anchor != nil {
+			m.SchemaHistory = []*irbackup.SchemaHistoryEntry{{AnchorPosition: *anchor}}
+		}
+		return m
+	}
+	early := pgPos("0/150")
+	for _, tc := range []struct {
+		name    string
+		m       *irbackup.Manifest
+		wantErr bool
+	}{
+		{"non-vstream data window, anchor coincides with EndPosition — VIOLATION", mk(false, 1, &end), true},
+		{"non-vstream data window, anchor strictly before EndPosition — ok", mk(false, 1, &early), false},
+		{"non-vstream data window, no schema history — ok", mk(false, 1, nil), false},
+		{"non-vstream schema-only window (0 chunks), anchor==EndPosition — ok (legit DDL-only)", mk(false, 0, &end), false},
+		{"VStream data window, anchor==EndPosition — ok (co-locates by design)", mk(true, 1, &end), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := assertDataWindowEndPositionInvariant(tc.m)
+			if tc.wantErr && err == nil {
+				t.Fatal("want invariant violation, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("want ok, got %v", err)
+			}
+		})
+	}
+}
+
 // tamperRestore runs a chain restore against store with the correct
 // passphrase envelope, returning the applied changes (nil on error).
 func tamperRestore(t *testing.T, store irbackup.Store) ([]ir.Change, error) {

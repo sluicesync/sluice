@@ -573,6 +573,17 @@ func (r *ChainRestore) applyFull(ctx context.Context, full *lineage.SegmentRecor
 // path.
 func (r *ChainRestore) preflightEncryption(rootManifest *irbackup.Manifest) error {
 	if rootManifest == nil || rootManifest.ChainEncryption == nil {
+		// SEC-MIRROR follow-up: a supplied key against a chain that claims
+		// PLAINTEXT is refused, not silently ignored. On an unsigned chain a
+		// store adversary can strip the root ChainEncryption marker and forge
+		// every chunk as plaintext (a whole-chain downgrade); an operator who
+		// passes --encrypt EXPECTS encryption, so "you gave me a key but this
+		// backup says it is unencrypted" is the loud signal that catches it.
+		if r.Envelope != nil {
+			return sluicecode.Wrap(sluicecode.CodeBackupChunkAuthFailed,
+				"remove --encrypt if this backup is genuinely unencrypted; if it should be encrypted, its chain-encryption marker was stripped (tampered/downgraded) — sign chains (--sign + --require-signature) to make this tamper-evident",
+				errors.New("restore: an encryption key was supplied but this backup is not encrypted (no chain-encryption metadata) — refusing to restore a plaintext-claiming chain under a key"))
+		}
 		return nil
 	}
 	// The chain is encrypted (per-chain or per-chunk): every legitimate chunk

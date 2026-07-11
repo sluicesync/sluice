@@ -405,6 +405,9 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 		return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("incremental: capture window: %w", captureErr))
 	}
 	manifest.EndPosition = endPos
+	if err := assertDataWindowEndPositionInvariant(manifest); err != nil {
+		return migcore.WrapWithHint(migcore.PhaseCDC, err)
+	}
 
 	// 5. Read source schema at window end and diff against the start
 	//    snapshot to populate SchemaDelta. The window may produce
@@ -1039,6 +1042,34 @@ func (b *IncrementalBackup) captureWindow(
 			}
 		}
 	}
+}
+
+// assertDataWindowEndPositionInvariant is the writer-side backstop for the
+// Bug 184 / audit silent-loss-F2 soundness invariant. On an engine whose CDC
+// positions do NOT commit after their rows (Postgres, MySQL-binlog — where a
+// schema anchor strictly precedes the rows it introduces), a DATA-bearing
+// incremental window's EndPosition must NEVER coincide with a schema-history
+// anchor. The restore-side completeness net (chain_restore/broker) relies on
+// exactly that to tell a genuine DDL-only window (0 chunks, anchor == EndPosition)
+// apart from an emptied-data window; if a future reader change violated it, an
+// emptied-data window on such an engine could masquerade as schema-only and
+// silently drop data. This converts the implicit reader property into a checked
+// one: fail the backup loudly rather than persist a manifest whose completeness
+// check is unsound. (VStream engines legitimately co-locate a snapshot with its
+// transaction's rows — which is WHY they set CDCPositionCommitsAfterRows and the
+// restore net distrusts their anchors — so the invariant is asserted only when
+// the flag is false.)
+func assertDataWindowEndPositionInvariant(manifest *irbackup.Manifest) error {
+	if manifest.CDCPositionCommitsAfterRows || len(manifest.ChangeChunks) == 0 {
+		return nil
+	}
+	if manifest.SchemaHistoryAnchors(manifest.EndPosition) {
+		return fmt.Errorf(
+			"reader invariant violated: a data-bearing incremental window (%d change chunks) on a non-commit-after-rows engine recorded EndPosition %+v coinciding with a schema-history anchor — the restore-side completeness check would be unsound (an emptied-data window could masquerade as schema-only). This is a CDC-reader bug: on this engine a schema snapshot must be anchored strictly before the rows it introduces",
+			len(manifest.ChangeChunks), manifest.EndPosition,
+		)
+	}
+	return nil
 }
 
 // changeChunkPath returns the conventional path of change chunk

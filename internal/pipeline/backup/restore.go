@@ -1220,6 +1220,15 @@ func manifestTableKey(schema, name string) string {
 // need to supply.
 func (r *Restore) preflightEncryption(manifest *irbackup.Manifest) error {
 	if manifest == nil || manifest.ChainEncryption == nil {
+		// SEC-MIRROR follow-up: a supplied key against a backup that claims
+		// PLAINTEXT is refused, not silently ignored (a whole-backup
+		// encrypted→plaintext downgrade on an unsigned backup). See
+		// ChainRestore.preflightEncryption for the rationale.
+		if r.Envelope != nil {
+			return sluicecode.Wrap(sluicecode.CodeBackupChunkAuthFailed,
+				"remove --encrypt if this backup is genuinely unencrypted; if it should be encrypted, its chain-encryption marker was stripped (tampered/downgraded) — sign backups (--sign + --require-signature) to make this tamper-evident",
+				errors.New("restore: an encryption key was supplied but this backup is not encrypted (no chain-encryption metadata) — refusing to restore a plaintext-claiming backup under a key"))
+		}
 		return nil
 	}
 	// Encrypted backup: every legitimate row chunk carries ChunkEncryption, so
@@ -1422,6 +1431,20 @@ func VerifyBackupWith(ctx context.Context, store irbackup.Store, opts VerifyOpti
 	// verify failure so `backup verify` exits non-zero.
 	failed += verifyBackupSignatures(ctx, store, records, opts)
 
+	// SEC-MIRROR follow-up: an encrypted chain must not carry a plaintext
+	// chunk. verifyChunk is SHA-only and ProbeChunkDecrypt no-ops on a nil
+	// Encryption, so a plaintext-spliced chunk (the exact tamper restore/broker
+	// now refuse) would otherwise pass `backup verify` GREEN and only fail at
+	// restore. Flag it here so verify catches what restore catches. ChainEncryption
+	// lives on the chain root (records[0]); incrementals inherit it by reference.
+	chainEncrypted := len(records) > 0 && records[0].Manifest.ChainEncryption != nil
+	plaintextSplice := func(manifestPath, kind, file string) {
+		failed++
+		slog.ErrorContext(ctx, "verify: plaintext chunk in an encrypted chain (splice)",
+			slog.String("manifest", manifestPath), slog.String("kind", kind), slog.String("file", file),
+			slog.String("error", "chunk carries no encryption metadata on an encrypted chain — refusing (SLUICE-E-BACKUP-CHUNK-AUTH-FAILED at restore)"))
+	}
+
 	for _, rec := range records {
 		manifest := rec.Manifest
 		// Chunk files are addressed relative to the segment's store
@@ -1432,6 +1455,10 @@ func VerifyBackupWith(ctx context.Context, store irbackup.Store, opts VerifyOpti
 		for _, table := range manifest.Tables {
 			for _, chunk := range table.Chunks {
 				total++
+				if chainEncrypted && chunk.Encryption == nil {
+					plaintextSplice(rec.Path, "row chunk ("+table.Name+")", chunk.File)
+					continue
+				}
 				if err := verifyChunk(ctx, segStore, chunk); err != nil {
 					failed++
 					slog.ErrorContext(
@@ -1465,6 +1492,10 @@ func VerifyBackupWith(ctx context.Context, store irbackup.Store, opts VerifyOpti
 		// Change chunks (incremental backups).
 		for _, chunk := range manifest.ChangeChunks {
 			total++
+			if chainEncrypted && chunk.Encryption == nil {
+				plaintextSplice(rec.Path, "change chunk", chunk.File)
+				continue
+			}
 			if err := verifyChunk(ctx, segStore, chunk); err != nil {
 				failed++
 				slog.ErrorContext(

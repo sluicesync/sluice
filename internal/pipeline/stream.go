@@ -1203,6 +1203,9 @@ func (b *BackupStream) runRollover(
 		// next rollover still has a valid resume cursor.
 		manifest.EndPosition = startPos
 	}
+	if err := assertDataWindowEndPositionInvariant(manifest); err != nil {
+		return out, err
+	}
 
 	// Bug 38 fix (v0.20.1): refresh source schema at the rollover
 	// boundary and diff against the parent's schema. Previously the
