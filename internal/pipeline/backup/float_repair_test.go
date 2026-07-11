@@ -247,6 +247,87 @@ func TestFloatExactPatchReader_OverCap_StrictRefuses(t *testing.T) {
 	}
 }
 
+// TestFloatExactPatchReader_ZeroPatchedTripwire pins the M0.1 0-patched-of-N
+// tripwire (audit item 58): a repairable table whose exact re-read returned
+// rows but NONE of whose streamed rows matched a PK key is a systemic
+// PK-rendering divergence that silently leaves every FLOAT display-rounded.
+// Under --strict-float it refuses (surfaced via Err() after the stream
+// drains); the default archives rounded; a PARTIAL match is tolerated; and a
+// legitimately empty exact map (empty source table) never trips.
+func TestFloatExactPatchReader_ZeroPatchedTripwire(t *testing.T) {
+	table := floatTable()
+	// Inner (COPY) rows carry ids {1,2}; the exact source carries DISJOINT
+	// ids {10,11} → a non-empty exact map, zero PK matches.
+	disjointInner := func() *fakeInnerReader {
+		return &fakeInnerReader{rows: []ir.Row{
+			{"id": int64(1), "fl": float64(8388610)},
+			{"id": int64(2), "fl": float64(-123457)},
+		}}
+	}
+	disjointExact := exactSourceEngine{rows: []ir.Row{
+		{"id": int64(10), "fl": float64(float32(8388608))},
+		{"id": int64(11), "fl": float64(float32(-123456.789))},
+	}}
+	plan := planBackupFloatRepair(&ir.Schema{Tables: []*ir.Table{table}})
+
+	drain := func(t *testing.T, pr *floatExactPatchReader) error {
+		t.Helper()
+		ch, err := pr.ReadRows(context.Background(), table)
+		if err != nil {
+			t.Fatalf("ReadRows: %v", err)
+		}
+		n := 0
+		for range ch {
+			n++
+		}
+		if n == 0 {
+			t.Fatal("wrapper streamed no rows — the tripwire needs the inner rows to flow")
+		}
+		return pr.Err()
+	}
+
+	t.Run("strict zero-patched refuses", func(t *testing.T) {
+		pr := newFloatExactPatchReader(disjointInner(), disjointExact, "dsn", plan, 0, true)
+		err := drain(t, pr)
+		if err == nil {
+			t.Fatal("strict + 0-patched-of-N must refuse via Err(); got nil")
+		}
+		ce, ok := sluicecode.FromError(err)
+		if !ok || ce.Code != sluicecode.CodeVStreamFloatLossy {
+			t.Errorf("tripwire code = %v (ok=%v); want %s", ce, ok, sluicecode.CodeVStreamFloatLossy)
+		}
+	})
+
+	t.Run("default zero-patched archives rounded (no error)", func(t *testing.T) {
+		pr := newFloatExactPatchReader(disjointInner(), disjointExact, "dsn", plan, 0, false)
+		if err := drain(t, pr); err != nil {
+			t.Fatalf("default posture must NOT error on 0-patched; got: %v", err)
+		}
+	})
+
+	t.Run("strict partial-patch tolerated (no error)", func(t *testing.T) {
+		// Inner ids {1,2}; exact carries id 1 (matches) + id 11 (miss) → one
+		// row patched → NOT a total miss → tolerated even under --strict-float.
+		partialExact := exactSourceEngine{rows: []ir.Row{
+			{"id": int64(1), "fl": float64(float32(8388608))},
+			{"id": int64(11), "fl": float64(float32(1))},
+		}}
+		pr := newFloatExactPatchReader(disjointInner(), partialExact, "dsn", plan, 0, true)
+		if err := drain(t, pr); err != nil {
+			t.Fatalf("strict + partial patch must NOT refuse (only a TOTAL miss trips); got: %v", err)
+		}
+	})
+
+	t.Run("strict empty exact map never trips", func(t *testing.T) {
+		// An empty source table → empty exact map → nothing to patch → the
+		// exactCount>0 guard keeps --strict-float from a false refusal.
+		pr := newFloatExactPatchReader(disjointInner(), exactSourceEngine{}, "dsn", plan, 0, true)
+		if err := drain(t, pr); err != nil {
+			t.Fatalf("strict + empty exact map must NOT refuse (nothing to patch); got: %v", err)
+		}
+	})
+}
+
 // TestPlanBackupFloatRepair_ShapeMatrix pins the backup plan across shapes:
 // repairable, DOUBLE-only (omitted), keyless (omitted), float-PK-only
 // (omitted), float-in-composite-PK (omitted — SL-F1), int-composite PK

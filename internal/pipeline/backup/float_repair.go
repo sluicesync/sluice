@@ -152,19 +152,42 @@ func (r *floatExactPatchReader) ReadRows(ctx context.Context, table *ir.Table) (
 		return nil, err
 	}
 	out := make(chan ir.Row)
+	exactCount := len(exact)
 	go func() {
 		defer close(out)
+		var streamed, patched int64
 		for row := range inCh {
 			if floats, ok := exact[floatPatchKey(row, p.pkCols)]; ok {
 				for col, v := range floats {
 					row[col] = v
 				}
+				patched++
 			}
+			streamed++
 			select {
 			case out <- row:
 			case <-ctx.Done():
 				return
 			}
+		}
+		// M0.1 0-patched-of-N tripwire (audit item 58). The exact re-read
+		// built a NON-EMPTY map (the source has rows for this table) yet NOT
+		// ONE streamed COPY row matched a PK key — a systemic PK-rendering
+		// divergence (the SL-F2 class: the exact-scan PK and the COPY PK
+		// render differently) that silently leaves every single-precision
+		// FLOAT column display-rounded while --strict-float exits 0. A PER-ROW
+		// miss is a benign temporal skip (a row inserted after the re-read
+		// window — tolerated; see the id-3 case in the tests); only a TOTAL
+		// miss is the silent bypass --strict-float exists to refuse. Fires
+		// ONLY under --strict-float (the default archives rounded); guarded on
+		// exactCount>0 so a legitimately empty source table never trips it.
+		if r.strict && exactCount > 0 && streamed > 0 && patched == 0 {
+			r.mu.Lock()
+			r.err = sluicecode.Wrap(sluicecode.CodeVStreamFloatLossy,
+				"the exact re-read returned rows but none matched a streamed row's primary key — a PK whose exact-scan and COPY renderings diverge; add --no-float-exact-reread for a rounded-but-consistent archive, or drop --strict-float",
+				fmt.Errorf("backup: --strict-float: table %q exact FLOAT re-read patched 0 of %d streamed row(s) despite a %d-row exact map — every single-precision FLOAT column would silently retain its VStream display rounding",
+					table.Name, streamed, exactCount))
+			r.mu.Unlock()
 		}
 	}()
 	return out, nil
