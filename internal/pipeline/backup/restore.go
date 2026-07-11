@@ -726,6 +726,18 @@ func (r *Restore) restoreTable(
 	factory restoreWriterFactory,
 ) error {
 	if len(entry.Chunks) == 0 {
+		// Bug 183: a table with NO chunks but a recorded RowCount > 0 is a
+		// tampered manifest hiding a populated table as empty — the empty-list
+		// mirror of the zeroed-RowCount F3 case (which the row-count
+		// reconciliation below catches only for tables that DO have chunks).
+		// A genuinely-empty table has 0 chunks AND RowCount 0. Refuse the
+		// inconsistent shape rather than silently restore an empty table.
+		if entry.RowCount > 0 {
+			return sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
+				"restore from an untampered copy, or sign the chain so a tampered manifest is caught at verify time",
+				fmt.Errorf("table %q records %d rows but its manifest carries no chunks — refusing to restore a populated table as empty (tampered/emptied manifest)",
+					table.Name, entry.RowCount))
+		}
 		slog.InfoContext(ctx, "restore: empty table; no chunks to apply",
 			slog.String("table", table.Name))
 		r.Summary.RecordTableRows(table.Schema, table.Name, 0)

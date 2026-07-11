@@ -103,6 +103,61 @@ func TestChainRestore_ChangeChunkTailTruncation_Refused(t *testing.T) {
 	}
 }
 
+// TestChainRestore_EmptiedChangeChunkList_Refused pins Bug 183 (the
+// empty-list mirror of F1 tail-truncation): an unsigned incremental whose
+// change-chunk list is EMPTIED (not just truncated) — 0 chunks, no schema
+// content — but whose EndPosition still advances must refuse, not silently
+// apply nothing. A legit empty window (EndPosition == StartPosition) passes,
+// and a schema-only window is covered by TestChainRestore_SchemaHistoryOnly*.
+func TestChainRestore_EmptiedChangeChunkList_Refused(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		endLSN  string
+		wantErr bool
+	}{
+		{"emptied list, no schema, EndPosition ahead of StartPosition", "0/202", true},
+		{"emptied list, EndPosition == StartPosition (legit no-op window)", "0/100", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			dir := t.TempDir()
+			store, _ := blobcodec.NewLocalStore(dir)
+			schema := &ir.Schema{Tables: []*ir.Table{{
+				Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
+			}}}
+
+			full := makeManifest(t, irbackup.BackupKindFull, nil, "0/100")
+			full.Schema = schema
+			full.BackupID = irbackup.ComputeBackupID(full)
+			if err := lineage.WriteManifestAt(ctx, store, lineage.ManifestFileName, full); err != nil {
+				t.Fatalf("write full: %v", err)
+			}
+			lineage.UpdateLineageForManifestBestEffort(ctx, store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
+
+			// StartPosition = full's EndPosition (0/100); EndPosition per tc.
+			incr := makeManifest(t, irbackup.BackupKindIncremental, full, tc.endLSN)
+			incr.Schema = schema
+			incr.ChangeChunks = nil // EMPTIED (the attack) / legitimately empty
+			incr.BackupID = irbackup.ComputeBackupID(incr)
+			incrPath := "manifests/incr-0001.json"
+			if err := lineage.WriteManifestAt(ctx, store, incrPath, incr); err != nil {
+				t.Fatalf("write incr: %v", err)
+			}
+			lineage.UpdateLineageForManifestBestEffort(ctx, store, incr, incrPath, blobcodec.CodecGzip)
+
+			tgt := &chainRestoreRecorderEngine{restoreRecorderEngine: newRestoreRecorderEngine("postgres")}
+			err := (&backup.ChainRestore{Target: tgt, TargetDSN: "tgt", Store: store}).Run(ctx)
+			if tc.wantErr {
+				assertCoded(t, err, sluicecode.CodeBackupIncomplete)
+				return
+			}
+			if err != nil {
+				t.Fatalf("legit empty window refused: %v", err)
+			}
+		})
+	}
+}
+
 // TestSyncFromBackup_ChangeChunkTailTruncation_Refused pins F1 on the
 // LIVE broker path: streamIncrementalWithPosition must refuse a truncated
 // incremental (EndPosition ahead of the last change) so the broker never

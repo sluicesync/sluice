@@ -995,6 +995,20 @@ func (b *SyncFromBackup) applyIncremental(
 	//    idempotent so a re-replay on broker crash is safe.
 	backupID := lineage.ManifestBackupID(link.Manifest)
 	if len(link.Manifest.ChangeChunks) == 0 {
+		// Bug 183: a 0-chunk incremental whose EndPosition ADVANCES beyond
+		// StartPosition claims to cover data it has no chunks to provide — an
+		// emptied change-chunk list (the mirror of the F1 tail-truncation
+		// case, which the streaming path's EndPosition check catches). A legit
+		// schema-only window has EndPosition == StartPosition. Refuse the
+		// emptied case rather than silently advance the broker past it.
+		if end := link.Manifest.EndPosition; (end.Engine != "" || end.Token != "") &&
+			end != link.Manifest.StartPosition &&
+			len(link.Manifest.SchemaDelta) == 0 && len(link.Manifest.SchemaHistory) == 0 {
+			return 0, sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
+				"restore from an untampered copy, or sign the chain so a truncated/emptied change-list is caught at verify time",
+				fmt.Errorf("incremental %s: manifest records EndPosition %+v (StartPosition %+v) but carries no change chunks — the change-chunk list was emptied; refusing to advance the broker past dropped events",
+					backupID, end, link.Manifest.StartPosition))
+		}
 		if err := b.writePositionDirect(ctx, applier, backupID); err != nil {
 			return 0, fmt.Errorf("write position for empty incremental: %w", err)
 		}
