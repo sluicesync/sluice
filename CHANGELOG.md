@@ -4,6 +4,16 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.225] - 2026-07-10
+
+### Security
+
+- **Offline `restore` and `chain restore` now refuse a plaintext chunk spliced into an encrypted chain — closing a silent-injection gap where only the live broker was protected (a confirming-audit HIGH).** The v0.99.222 broker hardening (BRK-3) refuses a change chunk whose manifest entry carries no encryption metadata (`Encryption == nil`) when the chain is encrypted — a store-write adversary's downgrade that would otherwise be opened as cleartext. That guard landed on the *broker* only; the two offline restore paths (`chain restore`'s change-chunk resolver and `restore`'s row-chunk resolver) opened such a chunk via the legacy plaintext codec. Because the mixed-mode check keys on *any* chunk in an incremental being encrypted, a single plaintext chunk among encrypted siblings passed it. So on an encrypted-but-**unsigned** backup a store-write adversary could set one chunk's `Encryption` to nil, write a forged plaintext chunk, fix its recorded SHA-256, and have its rows (insert/update/delete) applied by offline restore — silently, exit 0, defeating the tamper protection encryption alone is supposed to give (an encrypted-but-unsigned backup is designed to catch chunk tamper at *decrypt*; downgrading a chunk to plaintext removes the decrypt step). All three change-apply consumers — the broker and both offline restore paths — now share one coded refusal (`SLUICE-E-BACKUP-CHUNK-AUTH-FAILED`) so the guard cannot drift between them again (a fix landing in one path and not its siblings is exactly how this gap arose). The broker's own refusal, which previously shipped without its coded class, is now coded too. **No behavior change for a legitimate backup:** every chunk of an encrypted chain is stamped with encryption metadata by the writer (full row chunks, incremental change chunks, rotation-born and resnapshot segments, in both per-chain and per-chunk mode), and a genuinely-plaintext backup carries no chain-encryption marker, so its plaintext chunks open exactly as before. Signing (`--sign` / `--sign-key` + `--require-signature`) remains the closure for the coarser whole-chain residuals.
+
+### Fixed
+
+- **A VStream flavor added without declaring `CDCPositionCommitsAfterRows` would have silently reopened the Bug 184 emptied-data silent-loss on that engine — now caught by an invariant test.** The Bug 184 completeness guard trusts a capability the manifest records, which defaults to the unsafe value; a regression test now asserts every VStream-CDC flavor declares it (and no non-VStream flavor does), anchoring the flavor→capability wiring the completeness tests otherwise exercise with a synthetic value. Also corrects the v0.99.224 threat-model documentation: the candidate signing-independent hardening (recorded-vs-recomputed backup-ID verification) was filed as blocked on a misreading of the rotation path (which caps a catalog segment record, not a manifest); the audit confirmed no legitimate operation drifts a manifest's backup-ID, so the hardening is safe and is scheduled for a follow-up.
+
 ## [0.99.224] - 2026-07-10
 
 ### Security
