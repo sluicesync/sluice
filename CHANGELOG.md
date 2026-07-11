@@ -4,6 +4,18 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.226] - 2026-07-11
+
+### Security
+
+- **`backup verify` now flags a plaintext chunk spliced into an encrypted chain, instead of reporting it green (SEC-MIRROR follow-up).** v0.99.225 taught `restore` and the broker to refuse a chunk whose manifest entry carries no encryption metadata on an encrypted chain (a store adversary's downgrade). But `backup verify` only rehashed bytes and ran a decrypt-probe that no-ops on a plaintext chunk, so it reported that same tamper as VALID — a false all-clear for an operator who trusts `verify`, with the refusal only surfacing later at restore. `verify` now flags a plaintext chunk on an encrypted chain (row chunks and change chunks) as a failure, matching what restore refuses.
+
+- **Supplying an encryption key against a backup that claims plaintext is now refused, not silently ignored (SEC-MIRROR follow-up).** On an unsigned chain a store adversary can strip the chain's encryption marker and forge every chunk as plaintext — a whole-chain encrypted→plaintext downgrade. An operator restoring such a chain would pass `--encrypt` (they expect an encrypted backup), but the key was silently ignored (the encryption preflight early-returned on a plaintext-claiming manifest) and the forged plaintext was applied. Restore, chain-restore, and the broker now refuse when an encryption key is supplied but the chain records no encryption metadata (`SLUICE-E-BACKUP-CHUNK-AUTH-FAILED`) — "you gave me a key but this backup says it is unencrypted" is the loud signal that catches the downgrade. Remove `--encrypt` to restore a genuinely-plaintext backup; sign chains (`--sign` + `--require-signature`) to make the marker tamper-evident.
+
+### Fixed
+
+- **A writer-side backstop now converts an implicit CDC-reader soundness property into a checked one (audit hardening).** The Bug 184 completeness net distinguishes a genuine schema-only (DDL) incremental from an emptied-data window by whether a schema snapshot is anchored exactly at the window's `EndPosition`. That is sound only because, on engines whose CDC positions do not commit after their rows (Postgres, MySQL-binlog), a schema anchor strictly precedes the rows it introduces — so a data-bearing window's `EndPosition` (its last row) never coincides with a schema anchor. The incremental writers now assert this invariant when finalizing a manifest and fail the backup loudly if a future reader change ever violated it, rather than persist a manifest whose restore-side completeness check would be unsound. VStream engines legitimately co-locate a snapshot with its transaction's rows (which is why they carry the `CDCPositionCommitsAfterRows` marker and restore distrusts their anchors), so the assertion is scoped to non-VStream engines.
+
 ## [0.99.225] - 2026-07-10
 
 ### Security
