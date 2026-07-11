@@ -142,6 +142,62 @@ func encryptedChainFixture(t *testing.T) (store irbackup.Store, incrManifestPath
 	return store, incrPath
 }
 
+// TestOfflineRestore_PlaintextChunkSplice_Refused pins SEC-MIRROR (audit
+// 2026-07-10): a PLAINTEXT chunk (ChunkInfo.Encryption == nil) spliced into an
+// encrypted-but-unsigned chain must be refused by the OFFLINE restore paths —
+// chain_restore's change-chunk resolver AND restore's row-chunk resolver — not
+// opened as attacker cleartext. The broker had this guard (BRK-3); the two
+// offline paths did not, so a store adversary could downgrade one chunk to
+// forged plaintext (Encryption=nil + matching SHA on an unsigned chain) and
+// have its rows applied. The guard fires at CEK resolution off the manifest's
+// nil Encryption, before the blob is read, so splicing the manifest entry
+// exercises it. Coded SLUICE-E-BACKUP-CHUNK-AUTH-FAILED.
+func TestOfflineRestore_PlaintextChunkSplice_Refused(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("change chunk (chain_restore path)", func(t *testing.T) {
+		store, incrPath := encryptedChainFixture(t)
+		// Baseline: the pristine encrypted chain restores cleanly.
+		if _, err := tamperRestore(t, store); err != nil {
+			t.Fatalf("pristine encrypted chain restore failed: %v", err)
+		}
+		im, err := lineage.ReadManifestAt(ctx, store, incrPath)
+		if err != nil {
+			t.Fatalf("read incr manifest: %v", err)
+		}
+		if len(im.ChangeChunks) == 0 {
+			t.Fatal("fixture produced no change chunks")
+		}
+		// The splice: strip one change chunk's encryption metadata.
+		im.ChangeChunks[0].Encryption = nil
+		if err := lineage.WriteManifestAt(ctx, store, incrPath, im); err != nil {
+			t.Fatalf("rewrite incr manifest: %v", err)
+		}
+		_, err = tamperRestore(t, store)
+		assertCoded(t, err, sluicecode.CodeBackupChunkAuthFailed)
+	})
+
+	t.Run("row chunk (restore path via segment full)", func(t *testing.T) {
+		store, _ := encryptedChainFixture(t)
+		full, err := lineage.ReadManifest(ctx, store)
+		if err != nil {
+			t.Fatalf("read full manifest: %v", err)
+		}
+		if len(full.Tables) == 0 || len(full.Tables[0].Chunks) == 0 {
+			t.Fatal("fixture full produced no row chunks")
+		}
+		// The splice: strip a row chunk's encryption metadata. ChainRestore
+		// restores each segment full via the re-entrant Restore path, so this
+		// exercises Restore.chunkCEK.
+		full.Tables[0].Chunks[0].Encryption = nil
+		if err := lineage.WriteManifestAt(ctx, store, lineage.ManifestFileName, full); err != nil {
+			t.Fatalf("rewrite full manifest: %v", err)
+		}
+		_, err = tamperRestore(t, store)
+		assertCoded(t, err, sluicecode.CodeBackupChunkAuthFailed)
+	})
+}
+
 // tamperRestore runs a chain restore against store with the correct
 // passphrase envelope, returning the applied changes (nil on error).
 func tamperRestore(t *testing.T, store irbackup.Store) ([]ir.Change, error) {

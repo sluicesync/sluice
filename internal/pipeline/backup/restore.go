@@ -196,6 +196,13 @@ type Restore struct {
 	// encrypted-chunk read.
 	chainCEK []byte
 
+	// chainEncrypted records whether this backup's manifest carries
+	// [irbackup.ChainEncryption] (per-chain OR per-chunk). Set in
+	// preflightEncryption. When true, a row chunk with no ChunkEncryption is
+	// a plaintext splice and is refused (BRK-3 parity). NOT derivable from
+	// chainCEK, which stays nil in per-chunk mode even on an encrypted backup.
+	chainEncrypted bool
+
 	// segCodec is the codec recorded for the segment being restored on
 	// the single-manifest path (the root segment for a public restore;
 	// the specific segment ChainRestore is applying when it re-enters
@@ -1215,6 +1222,9 @@ func (r *Restore) preflightEncryption(manifest *irbackup.Manifest) error {
 	if manifest == nil || manifest.ChainEncryption == nil {
 		return nil
 	}
+	// Encrypted backup: every legitimate row chunk carries ChunkEncryption, so
+	// a plaintext chunk is a splice (refused in chunkCEK).
+	r.chainEncrypted = true
 	enc := manifest.ChainEncryption
 	if r.Envelope == nil {
 		return fmt.Errorf("encrypted chain (algorithm=%q kek_mode=%q kek_ref=%q) requires --encrypt + a passphrase / KMS reference; no key was supplied",
@@ -1257,6 +1267,11 @@ func (r *Restore) preflightEncryption(manifest *irbackup.Manifest) error {
 // nil cek to newChunkReader for the legacy plaintext read path.
 func (r *Restore) chunkCEK(chunk *irbackup.ChunkInfo) ([]byte, error) {
 	if chunk.Encryption == nil {
+		if r.chainEncrypted {
+			// BRK-3 parity: a plaintext row chunk spliced into an encrypted
+			// backup is refused, not opened as attacker cleartext.
+			return nil, lineage.PlaintextChunkSplicedError(chunk.File)
+		}
 		return nil, nil
 	}
 	// Per-chunk wrap takes precedence: if the chunk carries its own
