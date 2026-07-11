@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 func TestBuildRowPlaceholder(t *testing.T) {
@@ -788,8 +789,10 @@ func TestPrepareValue_RefusesNaNAndInf(t *testing.T) {
 	for _, v := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
 		if _, err := prepareValue(v, col); err == nil {
 			t.Errorf("prepareValue(%v) = nil error; want SLUICE-E-VALUE-UNREPRESENTABLE refusal", v)
-		} else if !strings.Contains(err.Error(), "SLUICE-E-VALUE-UNREPRESENTABLE") || !strings.Contains(err.Error(), `"dbl"`) {
-			t.Errorf("prepareValue(%v) error %q; want the SLUICE-E-VALUE-UNREPRESENTABLE code naming column dbl", v, err)
+		} else if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeValueUnrepresentable {
+			t.Errorf("prepareValue(%v) error %q; want a CodedError with SLUICE-E-VALUE-UNREPRESENTABLE (DEVEX-D2)", v, err)
+		} else if !strings.Contains(err.Error(), `"dbl"`) {
+			t.Errorf("prepareValue(%v) error %q; want the refusal to name column dbl", v, err)
 		}
 		// The guard fires even with a nil column descriptor (defensive
 		// applier path) — the value is unrepresentable regardless.
