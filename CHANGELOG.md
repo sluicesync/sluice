@@ -4,6 +4,18 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.228] - 2026-07-11
+
+### Fixed
+
+- **The manifest `BackupID` now covers `CDCPositionCommitsAfterRows`, closing the last signing-independent silent-loss vector (audit item 57).** v0.99.228's restore and live-apply broker recompute-verify every manifest's recorded `BackupID` against its content and refuse a mismatch with `SLUICE-E-BACKUP-MANIFEST-INVALID`, backstopping corruption or a lazy post-hoc edit of an identity-covered field before any data is applied (the `BackupID` twin of the existing schema-hash check). This release additionally folds the fifth semantically load-bearing field — `CDCPositionCommitsAfterRows`, the VStream marker restore reads to decide whether a schema anchor at the recorded `EndPosition` can prove the window's rows were applied (Bug 184) — into that identity, so an **unsigned** flip of it can no longer pass unnoticed. Signed chains already caught this via the whole-manifest signature; the fold closes it for unsigned encrypted and plaintext chains too. The fold is gated on a new per-manifest `FormatVersion 8` (`BackupFormatVersion` 7 → 8) so existing backups keep their legacy id and still verify clean, mixed-version chains stay coherent, and an older binary refuses a v8 manifest loudly at the preflight rather than mis-computing its id. Only VStream CDC segments are stamped 8; full backups and non-VStream segments are unaffected.
+
+- **`--strict-float` now refuses a FLOAT re-read that patches zero of N rows (audit M0.1).** A `backup full` on a PlanetScale/Vitess source with `--strict-float` archives single-precision `FLOAT` exactly by re-reading the source and patching each row by primary key. A per-row miss was always tolerated as a benign temporal skip, but a *total* miss — zero of N streamed rows matched, a systemic primary-key-rendering divergence — silently left every `FLOAT` display-rounded while `--strict-float` exited 0. That total-miss case is now refused with `SLUICE-E-VSTREAM-FLOAT-LOSSY` (a third cause under "cannot be re-read exactly"); partial matches stay tolerated and a legitimately empty source table never trips it. Defense-in-depth: the one known instance (a single-precision `FLOAT` in the primary key) is already excluded at plan time, so no current workload triggers this — it is a runtime net for a future key-divergence class.
+
+### Compatibility
+
+- New backups from a **PlanetScale/Vitess (VStream)** source are stamped manifest `FormatVersion 8` and will be refused — loudly, at the preflight, never silently mis-read — by a sluice binary older than v0.99.228. Non-VStream backups (MySQL native, Postgres) are unchanged and remain restorable by older binaries. Existing VStream backups produced by earlier versions restore normally on v0.99.228; their recorded identity is recognized as pre-fold and verified against the legacy scheme.
+
 ## [0.99.227] - 2026-07-11
 
 ### Fixed
