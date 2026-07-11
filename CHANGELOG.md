@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.223] - 2026-07-10
+
+### Security
+
+- **Restore/broker now refuse an EMPTIED chunk list, not just a truncated one — closing the mirror of the v0.99.222 unsigned-backup backstops (Bug 183, a silent-loss the v0.99.222 regression cycle caught).** v0.99.222 refuses a *truncated* change-chunk list (some tail entries deleted) and a *zeroed* row count, but a store-level adversary who instead **empties** the list to `[]` slipped past both: (i) a full-manifest table with no chunks but a recorded row-count restored silently *empty* (the empty-table early return ran before the row-count check), and (ii) an incremental with an empty change-chunk list but an advanced `EndPosition` silently dropped every event (the completeness check was gated on the list being non-empty). Both are now refused loudly (`SLUICE-E-BACKUP-INCOMPLETE`): a table with no chunks but a positive recorded row-count is rejected, and a 0-chunk incremental whose `EndPosition` advances beyond `StartPosition` with no schema content (a pure-data window whose list was emptied) is rejected — on both the offline `restore` and the live `sync from-backup` broker paths. There is **no behavior change for a valid backup**: the writer records an incremental's `EndPosition` as its last change's position, so a real zero-change window has an empty `EndPosition` (skipped by the guard), a real data window carries its chunks, and a schema-only window carries its schema deltas — the refused shape is one the writer never produces. As with the v0.99.222 backstops, signing (`--sign` / `--sign-key` + `--require-signature`) closes the whole class; these are the signing-independent defense for the common delete-the-chunks tamper.
+
 ## [0.99.222] - 2026-07-10
 
 ### Fixed
