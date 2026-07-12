@@ -20,16 +20,19 @@ import (
 )
 
 // TestItem60_AnchorImpliesSchemaDelta_MySQL is the MySQL-binlog half of the
-// item-60 ground truth (see the PG file for the full rationale). MySQL is the
-// DECISIVE engine: unlike PG pgoutput (whose RelationMessage needs a row
-// change, so a pure DDL-only window produces an empty EndPosition and never
-// anchors at EndPosition), the MySQL binlog reader sees the DDL QueryEvent
-// directly and anchors a deferred schema snapshot at the DDL's OWN position —
-// so a legit pure-DDL window DOES produce the SchemaHistoryAnchors(EndPosition)
-// shape the Bug-184 completeness check trusts. This is exactly where the
-// len(SchemaDelta)>0 gate must not false-refuse.
+// item-60 ground truth (see the PG file for the full rationale). OBSERVED here:
+// like PG pgoutput, a pure DDL-only window on MySQL produces an EMPTY
+// EndPosition (posBearing false) and never anchors a snapshot at a
+// position-bearing EndPosition — the MySQL deferred snapshot needs a following
+// row event to acquire a position, so a DDL alone barely advances the stream.
+// (The earlier assumption that MySQL's binlog QueryEvent anchors a DDL-only
+// snapshot AT EndPosition was disproven by this run — audit-2026-07-12.) So on
+// BOTH engines the "anchor AT a position-bearing EndPosition, 0 chunks" shape
+// has no legitimate producer; restore/broker therefore no longer trust the
+// anchor at all and rest completeness on the change-chunk tail.
 //
-// Asserts the same safety invariant:
+// Records the ground truth for both engines and asserts the invariant that
+// justified retiring anchor-trust:
 //
 //	SchemaHistoryAnchors(EndPosition) && posBearing && claimsAdvance
 //	    =>  len(SchemaDelta) > 0

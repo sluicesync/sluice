@@ -18,8 +18,8 @@ import (
 
 // auditVStreamSrcEngine is a minimal registered engine whose Capabilities
 // declare CDCPositionCommitsAfterRows — a stand-in for a VStream flavour
-// (PlanetScale / Vitess) so the audit-2026-07-11 H-1 re-derivation can be
-// exercised without importing a real engine package (which would cycle:
+// (PlanetScale / Vitess) used to show that the emptied-window refusal is
+// engine-agnostic, without importing a real engine package (which would cycle:
 // engines import internal/pipeline).
 type auditVStreamSrcEngine struct{ stubEngineBase }
 
@@ -32,21 +32,6 @@ func (auditVStreamSrcEngine) Capabilities() ir.Capabilities {
 const auditVStreamSrcName = "audit_vstream_src"
 
 func init() { engines.Register(auditVStreamSrcEngine{}) }
-
-// TestSourceEngineCommitsAfterRows pins the audit-2026-07-11 H-1 helper: the
-// authoritative commit-after-rows signal comes from the binary's OWN engine
-// registry (which no manifest edit can influence), not the manifest's
-// tamperable bool. A registered VStream source reports true; a non-VStream and
-// an unknown/unregistered source report false (caller then falls back to the
-// manifest flag).
-func TestSourceEngineCommitsAfterRows(t *testing.T) {
-	if !backup.SourceEngineCommitsAfterRows(auditVStreamSrcName) {
-		t.Errorf("registered VStream source: got false, want true")
-	}
-	if backup.SourceEngineCommitsAfterRows("this_engine_is_not_registered") {
-		t.Errorf("unknown source: got true, want false")
-	}
-}
 
 // TestVerifyBackupIDs_EmptyIDIncremental_Refused pins audit-2026-07-11 H-1
 // facet (b): a CDC segment (incremental / streaming) has recorded a BackupID
@@ -79,16 +64,19 @@ func TestVerifyBackupIDs_EmptyIDIncremental_Refused(t *testing.T) {
 	})
 }
 
-// TestChainRestore_FlippedFlagVStreamSource_Refused pins audit-2026-07-11 H-1
-// facet (a): on an unsigned chain whose SourceEngine is a registered VStream
-// engine, flipping the manifest's CDCPositionCommitsAfterRows false (the
-// keyless-id-recomputable tamper the FV8 fold alone does not stop) must NOT
-// re-open the Bug-184 bypass — restore ORs the flag with the source engine's
-// OWN registered capability, so an emptied-DATA window whose snapshot sits AT
-// EndPosition is still refused. The companion non-VStream case (SourceEngine
-// postgres, same shape) legitimately passes: its anchor genuinely proves the
-// window (a real DDL-only window), so the fix must not false-positive it.
-func TestChainRestore_FlippedFlagVStreamSource_Refused(t *testing.T) {
+// TestChainRestore_EmptiedWindowForgedAnchor_RefusedRegardlessOfEngine pins
+// audit-2026-07-12 (roadmap item 60): an emptied-DATA 0-chunk incremental that
+// advances EndPosition, carrying a forged snapshot anchored AT EndPosition and
+// a forged (no-op) SchemaDelta, is refused — regardless of source engine. The
+// anchor and SchemaDelta fields are outside every signing-independent cover, so
+// trusting them was a bar-raise, not a closure. Ground truth on real Postgres
+// and MySQL (item60_anchor_schemadelta_{pg,mysql} integration tests) shows a
+// LEGITIMATE DDL-only window emits its snapshot with an EMPTY EndPosition
+// (posBearing false → the completeness guard is skipped, never refused), so
+// this "anchor AT a position-bearing EndPosition with 0 chunks" shape is only
+// ever a forgery. Both a registered VStream source (where a snapshot could also
+// share a data row's position — Bug 184) and a Postgres source are refused.
+func TestChainRestore_EmptiedWindowForgedAnchor_RefusedRegardlessOfEngine(t *testing.T) {
 	users := &ir.Table{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}
 	usersJSON, err := ir.MarshalTable(users)
 	if err != nil {
@@ -102,8 +90,8 @@ func TestChainRestore_FlippedFlagVStreamSource_Refused(t *testing.T) {
 		manifest   bool // recorded CDCPositionCommitsAfterRows
 		wantRefuse bool
 	}{
-		{"VStream source, flag flipped false, snapshot AT EndPosition — REFUSED via engine re-derivation", auditVStreamSrcName, false, true},
-		{"non-VStream (postgres) source, snapshot AT EndPosition — legit DDL-only window passes", "postgres", false, false},
+		{"VStream source, snapshot AT EndPosition, emptied chunks — forge REFUSED", auditVStreamSrcName, false, true},
+		{"postgres source, snapshot AT EndPosition, emptied chunks — forge REFUSED (anchor+SchemaDelta both forgeable)", "postgres", false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -129,11 +117,11 @@ func TestChainRestore_FlippedFlagVStreamSource_Refused(t *testing.T) {
 				AnchorPosition: incr.EndPosition, // snapshot AT EndPosition
 				TableJSON:      usersJSON,
 			}}
-			// A realistic DDL-only window carries a SchemaDelta (item-60 ground
-			// truth: a snapshot anchors at EndPosition only for a
-			// column-signature DDL, which DiffSchemas records). The non-VStream
-			// case is a legit such window; the VStream case is refused by the
-			// engine re-derivation regardless of the delta.
+			// The forge appends a no-op SchemaDelta (an AlterTable to the
+			// current shape — apply-skipped) to satisfy the old len(SchemaDelta)>0
+			// gate. Since SchemaDelta is outside every signing-independent cover,
+			// this is free for a store adversary — which is why the gate no longer
+			// trusts the anchor at all: the shape is refused regardless of engine.
 			incr.SchemaDelta = []*irbackup.SchemaDeltaEntry{{
 				Kind:  irbackup.SchemaDeltaAlterTable,
 				Table: "users",
