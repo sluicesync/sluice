@@ -27,11 +27,12 @@ func TestCodeChunkHashError(t *testing.T) {
 	}
 
 	other := errors.New("some codec decode error")
-	if got := CodeChunkHashError(other); got != other {
-		t.Errorf("non-hash error: got %v, want passthrough %v", got, other)
+	got := CodeChunkHashError(other)
+	if _, ok := sluicecode.FromError(got); ok {
+		t.Error("non-hash error was coded; want passthrough with no code")
 	}
-	if _, ok := sluicecode.FromError(CodeChunkHashError(other)); ok {
-		t.Error("non-hash error was coded; want no code")
+	if !errors.Is(got, other) {
+		t.Errorf("non-hash error: got %v, want it to pass through %v unchanged", got, other)
 	}
 
 	hashErr := fmt.Errorf("open chunk: %w", fmt.Errorf("%w: expected X, got Y", blobcodec.ErrChunkHashMismatch))

@@ -18,7 +18,7 @@ import (
 const (
 	colID       = 22
 	colState    = 9
-	colRestarts = 6
+	colRestarts = 8
 	colConsec   = 8
 	colInState  = 9
 	// colGaps is the number of single-space separators between the six
@@ -140,7 +140,7 @@ func (m Model) tableHeader(lastErrW int) string {
 	hdr := strings.Join([]string{
 		cell("STREAM ID", colID),
 		cell("STATE", colState),
-		cell("↻", colRestarts),
+		cell("RESTARTS", colRestarts),
 		cell("CONSEC", colConsec),
 		cell("IN STATE", colInState),
 		cell("LAST ERROR", lastErrW),
@@ -154,7 +154,7 @@ func (m Model) tableHeader(lastErrW int) string {
 func (m Model) renderRow(s fleetSync, selected bool, lastErrW int) string {
 	idC := cell(s.ID, colID)
 	stateC := cell(s.State, colState)
-	restartsC := cell("↻"+strconv.Itoa(s.Restarts), colRestarts)
+	restartsC := cell(strconv.Itoa(s.Restarts), colRestarts)
 	consecC := cell(strconv.Itoa(s.ConsecutiveFailures), colConsec)
 	inStateC := cell(humanizeSeconds(s.SecondsInState), colInState)
 	errC := cell(oneLine(s.LastError), lastErrW)
