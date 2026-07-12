@@ -4,8 +4,11 @@
 package backup
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"math"
+	"strings"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -298,10 +301,53 @@ func TestFloatExactPatchReader_ZeroPatchedTripwire(t *testing.T) {
 		}
 	})
 
-	t.Run("default zero-patched archives rounded (no error)", func(t *testing.T) {
+	t.Run("default zero-patched archives rounded but WARNs (audit-2026-07-11 M-2)", func(t *testing.T) {
+		// The default posture must not stay SILENT where strict refuses —
+		// symmetric with the over-cap / unrepairable rounded-fallbacks, which
+		// both WARN. No error, but a loud WARN naming the table.
+		var logBuf bytes.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		t.Cleanup(func() { slog.SetDefault(prev) })
+
 		pr := newFloatExactPatchReader(disjointInner(), disjointExact, "dsn", plan, 0, false)
 		if err := drain(t, pr); err != nil {
 			t.Fatalf("default posture must NOT error on 0-patched; got: %v", err)
+		}
+		if got := logBuf.String(); !strings.Contains(got, "matched none of the streamed rows") ||
+			!strings.Contains(got, table.Name) {
+			t.Errorf("default 0-patched must WARN loudly naming the table; log = %q", got)
+		}
+	})
+
+	t.Run("streamed==0 with non-empty exact map WARNs, never refuses (audit-2026-07-11 M-2)", func(t *testing.T) {
+		// The COPY delivered no rows though the exact scan found some: a
+		// whole-table copy dropout OR a table empty at the snapshot position
+		// and filled during the window (legit). Ambiguous → WARN loudly in
+		// BOTH postures, but never refuse (refusing would false-positive the
+		// legit empty-at-snapshot case).
+		emptyInner := func() *fakeInnerReader { return &fakeInnerReader{rows: nil} }
+		for _, strict := range []bool{true, false} {
+			var logBuf bytes.Buffer
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+
+			pr := newFloatExactPatchReader(emptyInner(), disjointExact, "dsn", plan, 0, strict)
+			ch, err := pr.ReadRows(context.Background(), table)
+			if err != nil {
+				t.Fatalf("ReadRows: %v", err)
+			}
+			for range ch { //nolint:revive // drain
+			}
+			gotErr := pr.Err()
+			slog.SetDefault(prev)
+
+			if gotErr != nil {
+				t.Fatalf("strict=%v: streamed==0 must NOT refuse (legit empty-at-snapshot); got: %v", strict, gotErr)
+			}
+			if got := logBuf.String(); !strings.Contains(got, "COPY streamed none") || !strings.Contains(got, table.Name) {
+				t.Errorf("strict=%v: streamed==0 must WARN loudly naming the table; log = %q", strict, got)
+			}
 		}
 	})
 

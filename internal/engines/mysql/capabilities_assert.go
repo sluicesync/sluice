@@ -127,4 +127,21 @@ var (
 
 	// Migration-state store.
 	_ ir.MigrationStateStore = (*MigrationStateStore)(nil)
+
+	// audit-2026-07-11 M-3: finish the ARCH-F1 sweep — runtime-dispatched
+	// optional surfaces that were implemented but unpinned, so a method-set
+	// drift would silently disable them. The IndexVerifier / DSNValidator pair
+	// are the silent-loss-adjacent ones (a drift disables the SLUICE-E-INDEX-
+	// MISSING net / the driver-host-mismatch preflight refusal); the rest are
+	// perf/telemetry surfaces that would silently degrade.
+	_ ir.DSNValidator              = Engine{}
+	_ ir.IndexVerifier             = (*SchemaWriter)(nil)
+	_ ir.TransientClassifier       = (*SchemaWriter)(nil)
+	_ ir.GrowGateSetter            = (*RowWriter)(nil)
+	_ ir.ReparentObserverSetter    = (*RowWriter)(nil)
+	_ ir.ParallelCopyWriter        = (*RowWriter)(nil)
+	_ ir.TargetMetricsHistoryStore = (*ChangeApplier)(nil)
+	_ ir.ConcurrentCopyPartitioner = (*concurrentBinlogRows)(nil)
+	_ ir.WorkStealingCopyReader    = (*concurrentBinlogRows)(nil)
+	_ ir.ConcurrentCopyPartitioner = (*vstreamSnapshotRows)(nil)
 )

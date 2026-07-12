@@ -1403,26 +1403,40 @@ func VerifyBackupWith(ctx context.Context, store irbackup.Store, opts VerifyOpti
 	// per-chunk mode it confirms the operator's envelope is
 	// well-formed before per-chunk probes run in the chunk loop.
 	if opts.Envelope != nil {
-		if rootEnc := records[0].Manifest.ChainEncryption; rootEnc != nil {
-			if rootEnc.KEKMode != "" && opts.Envelope.Mode() != rootEnc.KEKMode {
+		rootEnc := records[0].Manifest.ChainEncryption
+		if rootEnc == nil {
+			// SEC-MIRROR parity with the apply paths (restore / chain_restore /
+			// broker preflightEncryption): a key supplied against a chain that
+			// claims PLAINTEXT is refused, not silently ignored. On an unsigned
+			// chain a store adversary can strip the root ChainEncryption marker
+			// and forge every chunk as plaintext (a whole-chain downgrade); with
+			// chainEncrypted then false the per-chunk splice check below is
+			// disabled and every forged plaintext chunk verifies SHA-only, so
+			// `backup verify --encrypt` returns a false GREEN on the exact
+			// downgrade restore refuses. An operator who passes --encrypt EXPECTS
+			// encryption, so this is the loud signal that catches it.
+			return 0, 0, sluicecode.Wrap(sluicecode.CodeBackupChunkAuthFailed,
+				"remove --encrypt if this backup is genuinely unencrypted; if it should be encrypted, its chain-encryption marker was stripped (tampered/downgraded) — sign chains (--sign + --require-signature) to make this tamper-evident",
+				errors.New("verify: an encryption key was supplied but this backup is not encrypted (no chain-encryption metadata) — refusing to report a plaintext-claiming chain as verified under a key"))
+		}
+		if rootEnc.KEKMode != "" && opts.Envelope.Mode() != rootEnc.KEKMode {
+			return 0, 0, fmt.Errorf(
+				"verify: envelope mode %q does not match chain's recorded kek_mode %q",
+				opts.Envelope.Mode(), rootEnc.KEKMode,
+			)
+		}
+		if len(rootEnc.WrappedCEK) > 0 {
+			// ADR-0152 chokepoint: bound unwrap for v5+ roots +
+			// the Azure key-version retarget (audit N-9).
+			if _, uerr := lineage.UnwrapChainCEK(opts.Envelope, rootEnc.WrappedCEK, records[0].Manifest); uerr != nil {
 				return 0, 0, fmt.Errorf(
-					"verify: envelope mode %q does not match chain's recorded kek_mode %q",
-					opts.Envelope.Mode(), rootEnc.KEKMode,
+					"verify: unwrap chain cek (wrong passphrase / KMS key?): %w", uerr,
 				)
 			}
-			if len(rootEnc.WrappedCEK) > 0 {
-				// ADR-0152 chokepoint: bound unwrap for v5+ roots +
-				// the Azure key-version retarget (audit N-9).
-				if _, uerr := lineage.UnwrapChainCEK(opts.Envelope, rootEnc.WrappedCEK, records[0].Manifest); uerr != nil {
-					return 0, 0, fmt.Errorf(
-						"verify: unwrap chain cek (wrong passphrase / KMS key?): %w", uerr,
-					)
-				}
-			} else {
-				// Per-chunk mode: retarget the envelope's key version
-				// before the per-chunk probes in the loop below.
-				lineage.RebindEnvelopeKEK(opts.Envelope, records[0].Manifest)
-			}
+		} else {
+			// Per-chunk mode: retarget the envelope's key version
+			// before the per-chunk probes in the loop below.
+			lineage.RebindEnvelopeKEK(opts.Envelope, records[0].Manifest)
 		}
 	}
 	// ADR-0154: report + verify the whole-manifest signatures. Reports

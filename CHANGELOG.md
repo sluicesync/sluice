@@ -4,6 +4,20 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.229] - 2026-07-11
+
+### Security
+
+- **The unsigned VStream flag-flip is now genuinely closed signing-independently — correcting a v0.99.228 overstatement (audit-2026-07-11 H-1).** v0.99.228 folded `CDCPositionCommitsAfterRows` into the manifest `BackupID` and described that as closing the last signing-independent silent-loss vector. It did not: `BackupID` is a keyless public hash, so a store adversary who flips the flag and *recomputes* the id passes the verify clean (and could also blank an incremental's id to skip the check, or downgrade `FormatVersion` below 8 to escape the fold). Restore and the live-apply broker now re-derive whether a source commits its CDC positions after its rows from the **source engine's own registered capability** — which no manifest edit can influence, since `SourceEngine` is itself `BackupID`-covered and, on encrypted chains, bound into the AES-GCM AAD — and OR it with the manifest flag. So an unsigned flip on any registered VStream source (PlanetScale/Vitess) is caught regardless of the manifest's `FormatVersion` or signedness, and the emptied-data window it would have re-opened (Bug 184) is refused with `SLUICE-E-BACKUP-INCOMPLETE`. An incremental manifest carrying an empty `BackupID` (never writer-legitimate — a CDC segment always records one) is now also refused rather than skipped. The sibling residual — forging a Postgres/MySQL `SchemaHistory` anchor position, whose field is outside every signing-independent cover — remains closed by signing (`--require-signature`); it is filed as roadmap item 60, deferred pending integration ground-truth for a safe fix.
+
+- **`backup verify --encrypt` no longer returns a false GREEN on a whole-chain plaintext downgrade (audit-2026-07-11 M-1).** v0.99.226 taught the three *apply* paths to refuse an encryption key supplied against a chain that records no encryption metadata (a store adversary stripping the chain's encryption marker and forging plaintext chunks), but `backup verify` did not get the same guard: with the marker stripped, its per-chunk splice check was disabled and every forged plaintext chunk verified SHA-only, so `backup verify --encrypt` reported the exact downgrade restore refuses as VALID — a false integrity attestation that could gate retention of the last good copy. `verify` now refuses it too (`SLUICE-E-BACKUP-CHUNK-AUTH-FAILED`), matching restore.
+
+### Fixed
+
+- **A systemic `--strict-float` FLOAT re-read failure is no longer silent under the default posture (audit-2026-07-11 M-2).** v0.99.228's `0-patched-of-N` tripwire only fired under `--strict-float`; under the default posture the same systemic primary-key-rendering divergence archived every single-precision `FLOAT` display-rounded with no signal at all, while the sibling rounded-fallbacks (over-cap, unrepairable) both warn loudly. The default posture now emits a loud WARN naming the table. Separately, a table whose exact re-read found rows but whose COPY streamed none — a whole-table copy dropout, or a table legitimately empty at the snapshot position and filled during the window — now WARNs in both postures (never refuses, since the legit empty-at-snapshot case must not be false-refused).
+
+- **Finished the compile-time interface-pin sweep and coded two more value-refusals (audit-2026-07-11 M-3).** v0.99.227 pinned the FLOAT-repair fast paths; this release pins the remaining runtime-dispatched optional surfaces that were implemented but unpinned, so a method-set drift can no longer silently disable them — most importantly the index-verification net, the driver-host-mismatch preflight, and change-log pruning (an unpinned drift there would let the trigger-CDC change-log grow unbounded), plus the parallel-copy and target-metrics surfaces. And the Postgres/MySQL "infinity / BC timestamp has no representable target" refusals, previously raw errors, are now the registered `SLUICE-E-VALUE-UNREPRESENTABLE` coded refusal (matching the NaN/±Infinity float refusal coded in v0.99.227).
+
 ## [0.99.228] - 2026-07-11
 
 ### Fixed

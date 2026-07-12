@@ -57,6 +57,23 @@ Every backup chain root manifest carries a `FormatVersion` field:
   ciphertext to bind; a plaintext-signed backup's table binding rides in
   the manifest signature instead), and a resumed pre-v7 chain keeps its
   prior version so its already-written chunks still decrypt.
+- **`FormatVersion=8`** — a **CDC-segment** manifest (incremental /
+  streaming) from a **VStream** source (PlanetScale / Vitess) that folds its
+  `CDCPositionCommitsAfterRows` flag into the deterministic `BackupID`
+  (`v0.99.228+`, audit item 57). That flag tells restore whether a schema
+  anchor at `EndPosition` can prove the window's data was applied (Bug 184);
+  folding it in raises the bar so a v8 flip must also recompute the id. It is
+  stamped **only** on a manifest that actually carries the flag (a VStream CDC
+  segment) — full backups and non-VStream CDC segments keep their
+  feature-minimum version and legacy id, and `ComputeBackupID` gates the folded
+  field on the manifest's OWN recorded version so a mixed-version chain stays
+  coherent. Because `BackupID` is a keyless public hash an adversary can
+  recompute, the fold is a corruption/naive-edit backstop, not tamper-proofing;
+  the signing-independent closure for an unsigned flag flip is the restore-side
+  re-derivation of commit-after-rows from the source engine's own registered
+  capability (audit-2026-07-11 H-1), and `--require-signature` closes the whole
+  unsigned manifest-edit class. An older binary refuses a v8 manifest loudly at
+  preflight rather than recompute-mismatching its `BackupID`.
 
 If your backups don't use RLS, EXCLUDE constraints, or standalone
 sequences, and you don't encrypt or sign, you'll never see a version

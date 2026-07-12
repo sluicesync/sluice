@@ -1044,9 +1044,13 @@ func prepareCrossEngineTemporal(t, v any) (out any, handled bool, err error) {
 func refuseUnrepresentableTimestamptz(s string) error {
 	switch {
 	case s == "infinity" || s == "-infinity":
-		return fmt.Errorf("mysql: postgres timestamptz %q is not representable as a MySQL TIMESTAMP/DATETIME (infinite value)", s)
+		return sluicecode.Wrap(sluicecode.CodeValueUnrepresentable,
+			"filter or transform the source value (e.g. NULLIF / CASE on the source query)",
+			fmt.Errorf("mysql: postgres timestamptz %q is not representable as a MySQL TIMESTAMP/DATETIME (infinite value)", s))
 	case strings.HasSuffix(s, " BC"):
-		return fmt.Errorf("mysql: postgres timestamp %q is a BC (pre-Gregorian) date with no representable MySQL value", s)
+		return sluicecode.Wrap(sluicecode.CodeValueUnrepresentable,
+			"filter or transform the source value (e.g. NULLIF / CASE on the source query)",
+			fmt.Errorf("mysql: postgres timestamp %q is a BC (pre-Gregorian) date with no representable MySQL value", s))
 	}
 	return nil
 }

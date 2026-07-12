@@ -150,8 +150,14 @@ import (
 // rows (VStream) — restore reads it to know a schema anchor at EndPosition
 // can't prove the data was applied (Bug 184). Before v8 the flag rode OUTSIDE
 // the BackupID, so on an UNSIGNED CDC manifest it could be flipped without
-// invalidating the id (the signature closes this for signed chains; the fold
-// closes it signing-independently). A v8 manifest's id covers the flag;
+// invalidating the id. The fold RAISES the bar (a v8 flip must also recompute
+// the id) but does NOT by itself close it, because ComputeBackupID is a keyless
+// public hash an adversary can recompute; the actual signing-independent
+// closure for the flag is the restore/broker re-derivation of commit-after-rows
+// from the source engine's OWN registered capability (SourceEngine is
+// BackupID-covered + AAD-bound — see backup.SourceEngineCommitsAfterRows,
+// audit-2026-07-11 H-1). Signing (--require-signature) remains the closure for
+// the sibling PG/MySQL anchor-forge. A v8 manifest's id covers the flag;
 // ComputeBackupID gates the extra field on the manifest's OWN recorded version,
 // so a mixed-version chain stays coherent — pre-v8 segments recompute WITHOUT
 // the flag (their legacy id) and v8 segments WITH it. Proportional per the
