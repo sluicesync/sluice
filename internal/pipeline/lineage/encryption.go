@@ -10,8 +10,31 @@ import (
 
 	"sluicesync.dev/sluice/internal/crypto"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
+
+// CodeChunkHashError maps a chunk SHA-256 integrity failure
+// ([blobcodec.ErrChunkHashMismatch] — a chunk whose STORED bytes do not hash
+// to the SHA-256 recorded for it in the manifest) to the coded
+// [sluicecode.CodeBackupChunkCorrupt] refusal. It is the integrity twin of
+// [CodeChunkAuthError]: where that maps the GCM/AAD authentication failure of
+// an ENCRYPTED chunk, this maps the byte-level SHA-256 check that runs over the
+// stored bytes BEFORE decryption — so it fires on plaintext AND encrypted
+// chunks, at restore, broker replay, and `backup verify` alike. A tamper of an
+// encrypted chunk's ciphertext is caught by whichever fires first (usually this
+// SHA check, since it precedes decrypt); either way the refusal is now coded
+// and exit-3 Refusal-class, matching the signed path. Non-hash errors — and nil
+// — pass through unchanged, so an I/O error or a GCM-auth failure keep their own
+// shape (the latter routed through [CodeChunkAuthError]).
+func CodeChunkHashError(err error) error {
+	if err == nil || !errors.Is(err, blobcodec.ErrChunkHashMismatch) {
+		return err
+	}
+	return sluicecode.Wrap(sluicecode.CodeBackupChunkCorrupt,
+		"a backup chunk's stored bytes do not match the SHA-256 recorded in the manifest (at-rest corruption/bit-rot, or a tamper of the stored bytes); restore from an untampered/healthy copy, or re-fetch the chunk object",
+		err)
+}
 
 // CodeChunkAuthError maps a chunk AES-GCM authentication failure
 // ([crypto.ErrChunkAuthFailed] — a chunk whose ciphertext or AAD does not

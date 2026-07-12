@@ -1076,7 +1076,9 @@ func (r *ChainRestore) streamIncrementalChanges(
 	var lastApplied ir.Position
 	for f := range fetchCh {
 		if f.err != nil {
-			return fmt.Errorf("chunk %d (%s): open chunk: %w", f.idx, f.chunk.File, f.err)
+			// A SHA-256 mismatch (tampered/corrupt stored bytes) surfaces here
+			// before decryption → coded SLUICE-E-BACKUP-CHUNK-CORRUPT.
+			return lineage.CodeChunkHashError(fmt.Errorf("chunk %d (%s): open chunk: %w", f.idx, f.chunk.File, f.err))
 		}
 		if err := r.streamOneChangeChunk(ctx, link, codec, f.idx, f.chunk, f.src, out, &lastApplied); err != nil {
 			return fmt.Errorf("chunk %d (%s): %w", f.idx, f.chunk.File, err)
@@ -1247,7 +1249,9 @@ func (r *ChainRestore) streamOneChangeChunk(
 		case out <- change:
 		}
 	}
-	return cr.Close()
+	// A change-chunk SHA-256 mismatch surfaces at Close → coded
+	// SLUICE-E-BACKUP-CHUNK-CORRUPT (a non-hash Close error passes through).
+	return lineage.CodeChunkHashError(cr.Close())
 }
 
 // changeChunkCEK resolves the CEK for a change chunk: per-chain mode

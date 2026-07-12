@@ -1028,7 +1028,10 @@ func (r *Restore) streamChunkRows(
 ) (int64, error) {
 	src, err := blobcodec.FetchChunkVerified(ctx, r.Store, chunk.File, chunk.SHA256)
 	if err != nil {
-		return 0, fmt.Errorf("open chunk: %w", err)
+		// A SHA-256 mismatch (tampered/corrupt stored bytes) surfaces here
+		// before decryption; map it to the coded SLUICE-E-BACKUP-CHUNK-CORRUPT
+		// refusal (the integrity twin of the GCM-auth code below).
+		return 0, lineage.CodeChunkHashError(fmt.Errorf("open chunk: %w", err))
 	}
 	cek, err := r.chunkCEK(chunk)
 	if err != nil {
@@ -1074,8 +1077,9 @@ func (r *Restore) streamChunkRows(
 	if err := cr.Close(); err != nil {
 		// SHA-256 mismatch surfaces here as a wrapped
 		// ErrChunkHashMismatch; loud-failure tenet means we surface
-		// it directly rather than continuing.
-		return rows, err
+		// it directly rather than continuing — coded as
+		// SLUICE-E-BACKUP-CHUNK-CORRUPT (a non-hash Close error passes through).
+		return rows, lineage.CodeChunkHashError(err)
 	}
 	// F3 twin of the table-level guard: a row chunk is only ever flushed
 	// with >= 1 row (the chunk writer opens on the first row), so a recorded
@@ -1578,7 +1582,7 @@ func validateManifestStructure(m *irbackup.Manifest) error {
 func verifyChunk(ctx context.Context, store irbackup.Store, chunk *irbackup.ChunkInfo) error {
 	rc, err := blobcodec.FetchChunkVerified(ctx, store, chunk.File, chunk.SHA256)
 	if err != nil {
-		return err
+		return lineage.CodeChunkHashError(err)
 	}
-	return rc.Close()
+	return lineage.CodeChunkHashError(rc.Close())
 }
