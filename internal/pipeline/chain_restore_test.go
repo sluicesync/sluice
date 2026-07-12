@@ -775,19 +775,19 @@ func TestChainRestore_SchemaHistoryOnlyManifestReplayed(t *testing.T) {
 
 	incr := makeManifest(t, irbackup.BackupKindIncremental, full, "0/200")
 	incr.Schema = &ir.Schema{Tables: []*ir.Table{postDDL}}
-	// A 0-chunk window whose last schema-history anchor equals EndPosition is
-	// "reached" via SchemaHistoryAnchors (Bug 184) — but only when the window
-	// also carries a SchemaDelta (item-60 gate (b)): item-60 ground truth shows
-	// a snapshot anchors at EndPosition only for a real column-signature DDL,
-	// which DiffSchemas records, so an emptied-DATA window's forged anchor
-	// (empty SchemaDelta) is refused. Model the legit shape: anchor ==
-	// EndPosition (0/200) AND a matching alter_table SchemaDelta.
+	// Model the ground-truth legit DDL-only window (item60_anchor_schemadelta_*
+	// integration tests, real PG + MySQL): a pure DDL-only window emits its
+	// snapshot with an EMPTY EndPosition, so the F1 completeness guard is skipped
+	// (posBearing false) and the synthetic SchemaSnapshot is still delivered —
+	// the branch this test pins. (Before audit-2026-07-12 this fixture modeled an
+	// anchor AT an advancing EndPosition, which ground truth shows is only ever a
+	// store adversary's emptied-DATA forgery, not a legit shape.)
+	incr.EndPosition = ir.Position{}
 	incr.SchemaHistory = []*irbackup.SchemaHistoryEntry{
 		{
-			Schema:         "",
-			Table:          "users",
-			AnchorPosition: ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/200"}`},
-			TableJSON:      postDDLPayload,
+			Schema:    "",
+			Table:     "users",
+			TableJSON: postDDLPayload,
 		},
 	}
 	incr.SchemaDelta = []*irbackup.SchemaDeltaEntry{{

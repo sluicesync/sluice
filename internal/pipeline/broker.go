@@ -999,44 +999,26 @@ func (b *SyncFromBackup) applyIncremental(
 	backupID := lineage.ManifestBackupID(link.Manifest)
 	if len(link.Manifest.ChangeChunks) == 0 {
 		// Bug 183/184: a 0-chunk incremental whose EndPosition ADVANCES beyond
-		// StartPosition claims to cover data it has no change chunks to provide.
-		// The one legitimate 0-chunk shape that advances a position-bearing
-		// EndPosition is a DDL-only window: it observed a DDL but no DML, so
-		// EndPosition == the schema snapshot's own anchor (see
-		// [irbackup.Manifest.SchemaHistoryAnchors]). Anything else with a
-		// posBearing advance and no snapshot at EndPosition is an emptied
-		// change-chunk list — refuse rather than silently advance the broker
-		// past dropped events.
+		// StartPosition claims to cover data it has no change chunks to provide —
+		// refuse rather than silently advance the broker past dropped events.
 		//
-		// Bug 184 CORRECTION: the old `SchemaDelta == 0 && SchemaHistory == 0`
-		// carve-out was unsound — every real DATA incremental carries a routine
-		// first-touch schema snapshot (anchored BEFORE its rows on PG/binlog,
-		// never at EndPosition), so mere SchemaHistory presence let an
-		// emptied-DATA window advance the broker past dropped events. Key on the
-		// anchor POSITION instead. And on VStream (CDCPositionCommitsAfterRows) a
-		// snapshot can SHARE a position with a data change, so a schema anchor at
-		// EndPosition proves nothing there — trust the anchor only when the
-		// engine's schema anchor strictly precedes its rows. OR the manifest flag
-		// with the source engine's OWN registered capability so an unsigned
-		// true→false flip (which rides in the id only at FV8, and even there the
-		// id is recomputable) can't re-open the bypass — SourceEngine is
-		// BackupID-covered and AAD-bound. (Parity with chain_restore.)
-		commitsAfterRows := link.Manifest.CDCPositionCommitsAfterRows ||
-			backup.SourceEngineCommitsAfterRows(link.Manifest.SourceEngine)
-		trustSchemaAnchor := !commitsAfterRows
+		// audit-2026-07-12: a schema anchor at EndPosition is NOT trusted as
+		// proof of a legitimate 0-chunk window. Ground truth on real Postgres and
+		// MySQL (item60_anchor_schemadelta_{pg,mysql}) shows a legitimate
+		// DDL-only window emits its snapshot with an EMPTY EndPosition (posBearing
+		// false → this branch is skipped, no refusal), while the only producer of
+		// "0 chunks + advanced EndPosition" is a store adversary who emptied an
+		// unsigned window's chunks. The anchor position and SchemaDelta such an
+		// adversary can forge are outside every signing-independent cover (not the
+		// BackupID, not the schema hash, not chunk AAD), so gating anchor-trust on
+		// them was a bar-raise, not a closure (the item-57 lesson recurring).
+		// Refusing every 0-chunk advance closes the PG/MySQL anchor-forge (roadmap
+		// item 60) and the VStream shared-position case (Bug 184) at once,
+		// signing-independently; --require-signature remains the
+		// belt-and-suspenders. Parity with chain_restore.
 		end := link.Manifest.EndPosition
-		// With 0 chunks, the only thing that can "reach" a position-bearing
-		// EndPosition is a trusted schema snapshot anchored exactly at it — AND
-		// only when the window carries a non-empty SchemaDelta. That extra
-		// clause closes the PG/MySQL anchor-forge (roadmap item 60): a snapshot
-		// legitimately anchors at EndPosition only for a column-signature DDL,
-		// which DiffSchemas always records, so an emptied-DATA window's forged
-		// anchor (empty SchemaDelta) is refused. Parity with chain_restore.
-		reachedEnd := trustSchemaAnchor &&
-			len(link.Manifest.SchemaDelta) > 0 &&
-			link.Manifest.SchemaHistoryAnchors(end)
 		if (end.Engine != "" || end.Token != "") &&
-			end != link.Manifest.StartPosition && !reachedEnd {
+			end != link.Manifest.StartPosition {
 			return 0, sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
 				"restore from an untampered copy, or sign the chain so a truncated/emptied change-list is caught at verify time",
 				fmt.Errorf("incremental %s: manifest records EndPosition %+v (StartPosition %+v) but carries no change chunks — the change-chunk list was emptied; refusing to advance the broker past dropped events",

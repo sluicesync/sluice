@@ -653,22 +653,23 @@ type Manifest struct {
 	ChainEncryption *ChainEncryption `json:"chain_encryption,omitempty"`
 }
 
-// SchemaHistoryAnchors an EndPosition reports whether any SchemaHistory
-// entry is anchored EXACTLY at pos. A schema-only incremental window (a
-// DDL with no DML) advances EndPosition to the schema snapshot's own WAL
-// position, so its last schema-history anchor equals EndPosition — that
-// snapshot is what "reaches" EndPosition even though the window carries no
-// change chunks.
+// SchemaHistoryAnchors reports whether any SchemaHistory entry is anchored
+// EXACTLY at pos. Equality-only, so it is engine-neutral (no LSN/GTID
+// ordering).
 //
-// This is the schema-side half of the Bug 183/184 completeness backstop
-// (the chunk-side half is "the replayed change-chunk tail ends at
-// EndPosition"). A DATA incremental's routine first-touch schema snapshot
-// is anchored at/before the FIRST row's position (the reader emits the
-// Relation/table-map ahead of its rows), strictly before EndPosition (the
-// LAST row), so it never spuriously satisfies this check — an emptied-data
-// window (chunks deleted, the routine early-anchored snapshot left behind)
-// has NO anchor at EndPosition and is correctly refused. Equality-only, so
-// it is engine-neutral (no LSN/GTID ordering).
+// It is used by the WRITER-side invariant [assertDataWindowEndPositionInvariant]:
+// a DATA incremental's routine first-touch schema snapshot is anchored
+// at/before the FIRST row's position (the reader emits the Relation/table-map
+// ahead of its rows), strictly before EndPosition (the LAST row), so a
+// data-bearing non-VStream window must never anchor a snapshot AT EndPosition —
+// if it does, the writer refuses (an emptied-DATA masquerade).
+//
+// NOTE (audit-2026-07-12): the RESTORE side no longer trusts an anchor at
+// EndPosition as proof of completeness. Ground truth (item60_anchor_schemadelta_*
+// integration tests, real PG + MySQL) shows a legitimate DDL-only window emits
+// its snapshot with an EMPTY EndPosition (never an advancing one), so the only
+// producer of "anchor == a position-bearing EndPosition with 0 chunks" is a
+// forgery — restore/broker rest completeness solely on the change-chunk tail.
 func (m *Manifest) SchemaHistoryAnchors(pos ir.Position) bool {
 	for _, e := range m.SchemaHistory {
 		if e != nil && e.AnchorPosition == pos {

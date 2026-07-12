@@ -35,7 +35,6 @@ import (
 	"log/slog"
 
 	"sluicesync.dev/sluice/internal/crypto"
-	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
@@ -723,33 +722,6 @@ func verifyBackupIDs(links []lineage.SegmentRecord) error {
 	return nil
 }
 
-// SourceEngineCommitsAfterRows reports whether the engine named in a
-// manifest's recorded SourceEngine is a registered engine whose CDC positions
-// commit AFTER the rows they cover (a VStream flavour — PlanetScale / Vitess).
-//
-// It exists because the manifest's own [irbackup.Manifest.CDCPositionCommitsAfterRows]
-// bool is NOT tamper-proof on an unsigned backup: it rides in the id only for
-// FormatVersion >= 8 (item 57 fold), and even there the id is a keyless public
-// hash a store adversary can recompute — so a coherent unsigned flip true→false
-// re-opens the Bug-184 emptied-window bypass (restore would trust a schema
-// anchor at EndPosition that a VStream snapshot legitimately shares with data
-// rows). The binary's OWN engine registry is the authoritative source no
-// manifest edit can influence: SourceEngine is itself BackupID-covered and, on
-// encrypted chains, GCM-AAD-bound, so an adversary cannot relabel a VStream
-// backup as a non-VStream engine without breaking decrypt/verify. Callers OR
-// this with the manifest flag, so the anchor is distrusted whenever EITHER
-// says commit-after-rows.
-//
-// Returns false for an unregistered/unknown SourceEngine (an old or renamed
-// engine), in which case the caller falls back to the manifest flag alone —
-// no worse than before this hardening, and signing closes the residue.
-func SourceEngineCommitsAfterRows(engineName string) bool {
-	if eng, ok := engines.Get(engineName); ok {
-		return eng.Capabilities().CDCPositionCommitsAfterRows
-	}
-	return false
-}
-
 // checkMixedModeChain rejects a lineage where a segment's full and one
 // of that segment's incrementals disagree on encryption shape (one
 // encrypted, one not). Per ADR-0046 the per-chain encryption rule is
@@ -1128,79 +1100,38 @@ func (r *ChainRestore) streamIncrementalChanges(
 	// EndPosition matches here and stays the documented, recoverable
 	// whole-backup rollback.
 	//
-	// Bug 183/184: assert the replay actually REACHED EndPosition. The window
-	// writer sets manifest.EndPosition to the position of the LAST thing it
-	// wrote — the last change chunk's last change for a data window, or the
-	// last schema snapshot's own anchor for a DDL-only window. A store
+	// Bug 183/184: assert the replay actually REACHED EndPosition. A store
 	// adversary who TRUNCATES or EMPTIES an unsigned incremental's ChangeChunks
 	// leaves the survivors' AAD ordinals intact (so they still decrypt) but the
 	// replayed content now falls SHORT of EndPosition — a silent exit-0 with
 	// fewer events and an EndPosition that overstates the data, poisoning a
-	// subsequent CDC resume. Refuse loudly.
-	//
-	// "Reached" = the last applied change-chunk position equals EndPosition,
-	// OR a schema-history snapshot is anchored EXACTLY at EndPosition (the
-	// DDL-only case: a window that observed a DDL but no DML advances
-	// EndPosition to the snapshot's own WAL position — see
-	// [irbackup.Manifest.SchemaHistoryAnchors]).
-	//
-	// Bug 184 CORRECTION: keying "legit 0-chunk window" on the mere PRESENCE
-	// of SchemaHistory/SchemaDelta was wrong — every real DATA incremental also
-	// carries a routine first-touch schema snapshot (the reader emits the
-	// Relation/table-map ahead of its rows, so the anchor sits BEFORE the first
-	// row and strictly before EndPosition, the LAST row). That let an
-	// emptied-DATA window (chunks deleted, routine snapshot left behind) pass as
-	// "schema-only." Anchoring the check on the POSITION, not the presence,
-	// closes it: the routine snapshot's early anchor never equals EndPosition,
-	// while a genuine DDL-only window's snapshot anchor does.
-	//
-	// A fully-coherent edit that also lowers EndPosition (and any matching
-	// anchor) matches here and stays the documented, recoverable whole-backup
-	// rollback; signing closes that residue.
+	// subsequent CDC resume. Refuse loudly. A fully-coherent edit that also
+	// lowers EndPosition (and any matching anchor) matches as reached and stays
+	// the documented, recoverable whole-backup rollback; signing closes that
+	// residue.
 	end := link.Manifest.EndPosition
 	posBearing := end.Engine != "" || end.Token != ""
 	claimsAdvance := end != link.Manifest.StartPosition
-	// On engines that stamp CDC positions per-transaction-commit AFTER their
-	// rows (VStream: the VGTID follows its rows), a schema snapshot and the
-	// row changes in the same transaction share ONE position — so a schema
-	// anchor at EndPosition does NOT prove the window's data was applied
-	// (Bug 184: an emptied-data window whose final tx first-touched a table
-	// leaves a snapshot at EndPosition). Only the change-chunk tail proves it
-	// there. Trust the anchor only on engines whose schema anchor strictly
-	// precedes its rows (Postgres / MySQL-binlog).
-	//
-	// Threat-model note (ADR-0152 residual shape (4)): the manifest's own
-	// CDCPositionCommitsAfterRows bool is not fully tamper-proof on an unsigned
-	// backup — it rides in ComputeBackupID only for FormatVersion >= 8 (item 57
-	// fold), and the id is a keyless public hash a store adversary can recompute,
-	// so a coherent unsigned flip true→false could otherwise re-open the Bug-184
-	// bypass. We therefore OR the manifest flag with the source engine's OWN
-	// registered capability ([SourceEngineCommitsAfterRows]): SourceEngine is
-	// BackupID-covered and, on encrypted chains, GCM-AAD-bound, so the flip is
-	// caught for any registered VStream source regardless of FormatVersion or
-	// signedness.
-	//
-	// The sibling PG/MySQL anchor-forge (roadmap item 60 / audit-2026-07-11
-	// facet c) — editing a routine first-touch SchemaHistory entry's
-	// AnchorPosition to EndPosition on an emptied-DATA window, whose anchor
-	// field is outside every signing-independent cover — is closed by ALSO
-	// requiring a non-empty SchemaDelta before an anchor at EndPosition proves
-	// the window complete. Ground truth (item60_anchor_schemadelta_{pg,mysql}
-	// integration tests, both engines): a snapshot is anchored at EndPosition
-	// ONLY when the window's DDL changed a column's decode signature
-	// (ir.SchemaSignatureOf), which DiffSchemas ALWAYS records as a SchemaDelta;
-	// an emptied-DATA window's forged anchor has an EMPTY SchemaDelta (it was a
-	// data window, no schema change). So this gate refuses the forge with zero
-	// false-positive risk: a legit DDL-only window either carries a SchemaDelta
-	// (trusted here) or emits no snapshot and has an empty EndPosition
-	// (posBearing false → never reaches this branch).
-	commitsAfterRows := link.Manifest.CDCPositionCommitsAfterRows ||
-		SourceEngineCommitsAfterRows(link.Manifest.SourceEngine)
-	trustSchemaAnchor := !commitsAfterRows
-	anchorProvesEnd := trustSchemaAnchor &&
-		len(link.Manifest.SchemaDelta) > 0 &&
-		link.Manifest.SchemaHistoryAnchors(end)
-	reachedEnd := lastApplied == end || anchorProvesEnd
+	// "Reached" = the last applied change-chunk position equals EndPosition.
+	// A schema-history snapshot anchored at EndPosition is NOT trusted as proof
+	// of completeness (audit-2026-07-12). Ground truth on real Postgres and
+	// MySQL (item60_anchor_schemadelta_{pg,mysql} integration tests, both
+	// engines) shows a legitimate window never presents a schema anchor at a
+	// position-bearing EndPosition: a DDL-only window emits its snapshot with an
+	// EMPTY EndPosition (posBearing false → this guard is skipped), and a data
+	// window reaches EndPosition through its change-chunk tail. The only
+	// producer of "anchor == EndPosition with a short/empty chunk tail" is a
+	// store adversary who empties an unsigned window's chunks and re-anchors its
+	// routine first-touch snapshot — and the anchor/SchemaDelta fields it edits
+	// are outside every signing-independent cover (not the BackupID, not the
+	// schema hash, not chunk AAD), so gating anchor-trust on those fields was a
+	// bar-raise, not a closure (the item-57 lesson recurring: audit-2026-07-11
+	// facet c / roadmap item 60). Resting completeness solely on the chunk tail
+	// closes the PG/MySQL anchor-forge AND the VStream shared-position case
+	// (Bug 184, where a snapshot could share a data row's position) at once,
+	// signing-independently. --require-signature remains the belt-and-suspenders
+	// for the whole unsigned manifest-edit class.
+	reachedEnd := lastApplied == end
 	if posBearing && claimsAdvance && !reachedEnd {
 		return sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
 			"restore from an untampered copy, or sign the chain so a truncated/emptied change-list is caught at verify time",

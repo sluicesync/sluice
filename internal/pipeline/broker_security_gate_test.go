@@ -134,10 +134,11 @@ func TestChainRestore_EmptiedChangeChunkList_Refused(t *testing.T) {
 		// CDC positions after its rows (Vitess/VStream), where a schema
 		// anchor can coincide with a data change's position.
 		vstream bool
-		// schemaDelta seeds a non-empty SchemaDelta (models a real DDL).
-		// item-60 ground truth: a snapshot anchors at EndPosition only for a
-		// column-signature DDL, which DiffSchemas always records — so a
-		// trusted anchor requires a non-empty SchemaDelta.
+		// schemaDelta seeds a non-empty (no-op) SchemaDelta. audit-2026-07-12:
+		// a schema anchor at EndPosition is no longer trusted as proof of
+		// completeness (the anchor and SchemaDelta are both outside every
+		// signing-independent cover, so a forged SchemaDelta is free), so this
+		// flag exists to prove the forge is refused EVEN WITH a SchemaDelta.
 		schemaDelta bool
 		wantErr     bool
 	}{
@@ -147,19 +148,20 @@ func TestChainRestore_EmptiedChangeChunkList_Refused(t *testing.T) {
 		// anchored at the window START (0/150), BEFORE the overstated
 		// EndPosition (0/202). Presence of SchemaHistory must NOT exempt it.
 		{"Bug 184: emptied DATA list, routine snapshot anchored BEFORE EndPosition", "0/202", "0/150", false, false, true},
-		// Legit DDL-only window on a non-VStream engine: the schema snapshot's
-		// own anchor IS EndPosition AND the window carries a SchemaDelta (a real
-		// column-signature DDL). Trusted → passes.
-		{"legit DDL-only window (non-VStream), snapshot AT EndPosition WITH SchemaDelta", "0/202", "0/202", false, true, false},
+		// item-60 anchor-forge WITH a forged SchemaDelta: the anchor-at-EndPosition
+		// shape plus a no-op SchemaDelta was ACCEPTED before audit-2026-07-12 (the
+		// len(SchemaDelta)>0 gate). Ground truth (item60 integration tests) shows a
+		// legit DDL-only window has an EMPTY EndPosition, so this shape is only ever
+		// a forgery — now REFUSED regardless of the forged delta.
+		{"item 60 anchor-forge: snapshot AT EndPosition WITH forged SchemaDelta — REFUSED", "0/202", "0/202", false, true, true},
 		// item 60 anchor-forge: the SAME anchor-at-EndPosition shape with an
-		// EMPTY SchemaDelta is an emptied-DATA window with a forged anchor —
-		// now REFUSED (the facet-c fix; the anchor field is otherwise outside
-		// every signing-independent cover).
+		// EMPTY SchemaDelta — REFUSED (the anchor field is outside every
+		// signing-independent cover).
 		{"item 60 anchor-forge: snapshot AT EndPosition, EMPTY SchemaDelta (emptied-data window)", "0/202", "0/202", false, false, true},
 		// Bug 184 (Vitess): on VStream a snapshot SHARES its transaction's
 		// position, so an emptied-DATA window whose final tx first-touched a
-		// table leaves a snapshot AT EndPosition. The anchor must NOT be
-		// trusted there — this exact shape passed the position-only check.
+		// table leaves a snapshot AT EndPosition. Refused (the anchor is never
+		// trusted).
 		{"Bug 184 (VStream): emptied DATA list, snapshot AT EndPosition, anchor untrusted", "0/202", "0/202", true, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -239,16 +241,12 @@ func TestSyncFromBackup_EmptiedChangeChunkList_Refused(t *testing.T) {
 		{"emptied list, EndPosition == StartPosition (legit no-op window)", "0/100", "", false, false},
 		{"Bug 184: emptied DATA list, routine snapshot anchored BEFORE EndPosition", "0/202", "0/150", false, true},
 		// item 60 anchor-forge: a snapshot anchored AT EndPosition on an emptied
-		// window with an EMPTY SchemaDelta is an emptied-DATA window whose
-		// routine first-touch anchor was forged to EndPosition — REFUSED by
-		// gate (b). Before the fix this exact shape was accepted; ground truth
-		// (item60 integration tests) shows a legit anchor-at-EndPosition window
-		// always carries a SchemaDelta. This test uses a minimal applier with no
-		// Target, so it pins only the REFUSE direction; the ACCEPT direction (a
-		// real DDL-only window WITH a SchemaDelta) is covered by
-		// TestChainRestore_EmptiedChangeChunkList_Refused (recorder Target) and
-		// the broker integration tests.
-		{"item 60 anchor-forge: snapshot AT EndPosition, EMPTY SchemaDelta (emptied-data window)", "0/202", "0/202", false, true},
+		// 0-chunk window that advances EndPosition is REFUSED (audit-2026-07-12).
+		// Ground truth (item60 integration tests) shows a legit DDL-only window
+		// has an EMPTY EndPosition, so this shape is only ever a store adversary's
+		// emptied-DATA forgery — the anchor is not trusted as proof (nor is a
+		// forged SchemaDelta, which is outside every signing-independent cover).
+		{"item 60 anchor-forge: snapshot AT EndPosition (emptied-data window) — REFUSED", "0/202", "0/202", false, true},
 		// Bug 184 (Vitess): a snapshot at EndPosition on a VStream manifest
 		// must NOT be trusted — the broker must refuse, not advance past the
 		// dropped events.
