@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.231] - 2026-07-12
+
+### Security
+
+- **The PG/MySQL "anchor-forge" emptied-data bypass is now closed for real — completing and correcting v0.99.230's item-60 fix (audit-2026-07-12).** v0.99.230 accepted a 0-chunk incremental when it carried a schema anchor at `EndPosition` *and* a non-empty `SchemaDelta`, and described that as closing the anchor-forge signing-independently. A fresh audit found it did not: `SchemaDelta` and `SchemaHistory[].AnchorPosition` are *both* outside every signing-independent cover (neither is in the `BackupID`, the schema hash, or chunk AAD), so a store adversary emptying an unsigned window's change chunks could re-anchor its routine snapshot to `EndPosition` and append one no-op `SchemaDelta` entry (an `ALTER TABLE` to the current shape, which restore skips) to pass the gate — silently dropping the window's rows and poisoning the CDC resume position (the Bug-184 class). Trusting the anchor was a bar-raise, not a closure — the same "real but oversold" shape the prior audit caught for item 57. A ground-truth investigation on real Postgres and MySQL established that no legitimate window ever presents a schema anchor at a position-bearing `EndPosition`: a DDL-only window emits its snapshot with an *empty* `EndPosition` (so the completeness check is skipped entirely), and a data window reaches `EndPosition` through its change-chunk tail. Restore and the live-apply broker therefore no longer trust a schema anchor as proof of completeness at all — completeness now rests solely on the signing-independent change-chunk tail, which an adversary deleting chunks cannot satisfy. This closes the PG/MySQL anchor-forge and subsumes the VStream shared-position case (Bug 184) at once, with zero false-positive risk on legitimate DDL-only restores (ground-truth-confirmed on both engines). `--require-signature` remains the belt-and-suspenders for the whole unsigned manifest-edit class. No backup-format change.
+
 ## [0.99.230] - 2026-07-11
 
 ### Security
