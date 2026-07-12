@@ -1178,15 +1178,29 @@ func (r *ChainRestore) streamIncrementalChanges(
 	// registered capability ([SourceEngineCommitsAfterRows]): SourceEngine is
 	// BackupID-covered and, on encrypted chains, GCM-AAD-bound, so the flip is
 	// caught for any registered VStream source regardless of FormatVersion or
-	// signedness. What remains signing-closed is the PG/MySQL anchor-forge
-	// (editing a SchemaHistory entry's AnchorPosition to EndPosition), where the
-	// anchor field itself is outside every signing-independent cover; sign the
-	// chain (--require-signature) to close that.
+	// signedness.
+	//
+	// The sibling PG/MySQL anchor-forge (roadmap item 60 / audit-2026-07-11
+	// facet c) — editing a routine first-touch SchemaHistory entry's
+	// AnchorPosition to EndPosition on an emptied-DATA window, whose anchor
+	// field is outside every signing-independent cover — is closed by ALSO
+	// requiring a non-empty SchemaDelta before an anchor at EndPosition proves
+	// the window complete. Ground truth (item60_anchor_schemadelta_{pg,mysql}
+	// integration tests, both engines): a snapshot is anchored at EndPosition
+	// ONLY when the window's DDL changed a column's decode signature
+	// (ir.SchemaSignatureOf), which DiffSchemas ALWAYS records as a SchemaDelta;
+	// an emptied-DATA window's forged anchor has an EMPTY SchemaDelta (it was a
+	// data window, no schema change). So this gate refuses the forge with zero
+	// false-positive risk: a legit DDL-only window either carries a SchemaDelta
+	// (trusted here) or emits no snapshot and has an empty EndPosition
+	// (posBearing false → never reaches this branch).
 	commitsAfterRows := link.Manifest.CDCPositionCommitsAfterRows ||
 		SourceEngineCommitsAfterRows(link.Manifest.SourceEngine)
 	trustSchemaAnchor := !commitsAfterRows
-	reachedEnd := lastApplied == end ||
-		(trustSchemaAnchor && link.Manifest.SchemaHistoryAnchors(end))
+	anchorProvesEnd := trustSchemaAnchor &&
+		len(link.Manifest.SchemaDelta) > 0 &&
+		link.Manifest.SchemaHistoryAnchors(end)
+	reachedEnd := lastApplied == end || anchorProvesEnd
 	if posBearing && claimsAdvance && !reachedEnd {
 		return sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
 			"restore from an untampered copy, or sign the chain so a truncated/emptied change-list is caught at verify time",

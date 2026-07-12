@@ -775,13 +775,13 @@ func TestChainRestore_SchemaHistoryOnlyManifestReplayed(t *testing.T) {
 
 	incr := makeManifest(t, irbackup.BackupKindIncremental, full, "0/200")
 	incr.Schema = &ir.Schema{Tables: []*ir.Table{postDDL}}
-	// A real DDL-no-DML window advances EndPosition to the schema snapshot's
-	// OWN WAL position (incremental.go: the SchemaSnapshot is position-bearing
-	// and sets lastPos → EndPosition), so its last schema-history anchor equals
-	// EndPosition. Model that: anchor == EndPosition (0/200). Bug 184 pins that
-	// this is what makes a legit 0-chunk window "reach" EndPosition — the
-	// completeness backstop accepts it via SchemaHistoryAnchors, NOT via a
-	// blanket "SchemaHistory present" exemption.
+	// A 0-chunk window whose last schema-history anchor equals EndPosition is
+	// "reached" via SchemaHistoryAnchors (Bug 184) — but only when the window
+	// also carries a SchemaDelta (item-60 gate (b)): item-60 ground truth shows
+	// a snapshot anchors at EndPosition only for a real column-signature DDL,
+	// which DiffSchemas records, so an emptied-DATA window's forged anchor
+	// (empty SchemaDelta) is refused. Model the legit shape: anchor ==
+	// EndPosition (0/200) AND a matching alter_table SchemaDelta.
 	incr.SchemaHistory = []*irbackup.SchemaHistoryEntry{
 		{
 			Schema:         "",
@@ -790,6 +790,11 @@ func TestChainRestore_SchemaHistoryOnlyManifestReplayed(t *testing.T) {
 			TableJSON:      postDDLPayload,
 		},
 	}
+	incr.SchemaDelta = []*irbackup.SchemaDeltaEntry{{
+		Kind:  irbackup.SchemaDeltaAlterTable,
+		Table: "users",
+		After: postDDL,
+	}}
 	incr.ChangeChunks = nil // no DML
 	incr.BackupID = irbackup.ComputeBackupID(incr)
 	incrPath := "manifests/incr-0001.json"
