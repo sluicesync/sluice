@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.230] - 2026-07-11
+
+### Security
+
+- **The PG/MySQL "anchor-forge" emptied-data bypass is now closed signing-independently (audit-2026-07-11 item 60, the last H-1 residual).** The restore/broker completeness net accepts a 0-chunk incremental when a schema-history snapshot is anchored exactly at the recorded `EndPosition` (the legitimate resume-after-DDL case). On an *unsigned* Postgres/MySQL chain a store adversary could take an emptied-data window's routine first-touch snapshot — whose `AnchorPosition` is covered by nothing signing-independent (not the `BackupID`, not the schema hash, not chunk AAD) — and edit it to equal `EndPosition`, so the window's dropped events were silently accepted. Restore and the broker now trust an anchor at `EndPosition` only when the window also carries a non-empty `SchemaDelta`. A ground-truth investigation on real Postgres and MySQL (both engines) established the invariant this rests on: a snapshot anchors at `EndPosition` only for a real column-signature DDL, which the schema diff always records as a `SchemaDelta`, while an emptied-data window's forged anchor has an empty one — so the forge is refused (`SLUICE-E-BACKUP-INCOMPLETE`) with zero false-positive risk on legitimate DDL-only restores. `--require-signature` remains the belt-and-suspenders for the whole unsigned manifest-edit class.
+
 ## [0.99.229] - 2026-07-11
 
 ### Security

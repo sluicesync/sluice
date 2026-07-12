@@ -129,6 +129,16 @@ func TestChainRestore_FlippedFlagVStreamSource_Refused(t *testing.T) {
 				AnchorPosition: incr.EndPosition, // snapshot AT EndPosition
 				TableJSON:      usersJSON,
 			}}
+			// A realistic DDL-only window carries a SchemaDelta (item-60 ground
+			// truth: a snapshot anchors at EndPosition only for a
+			// column-signature DDL, which DiffSchemas records). The non-VStream
+			// case is a legit such window; the VStream case is refused by the
+			// engine re-derivation regardless of the delta.
+			incr.SchemaDelta = []*irbackup.SchemaDeltaEntry{{
+				Kind:  irbackup.SchemaDeltaAlterTable,
+				Table: "users",
+				After: users,
+			}}
 			incr.BackupID = irbackup.ComputeBackupID(incr)
 			incrPath := "manifests/incr-0001.json"
 			if err := lineage.WriteManifestAt(ctx, store, incrPath, incr); err != nil {

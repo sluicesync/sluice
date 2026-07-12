@@ -1026,8 +1026,15 @@ func (b *SyncFromBackup) applyIncremental(
 		trustSchemaAnchor := !commitsAfterRows
 		end := link.Manifest.EndPosition
 		// With 0 chunks, the only thing that can "reach" a position-bearing
-		// EndPosition is a trusted schema snapshot anchored exactly at it.
-		reachedEnd := trustSchemaAnchor && link.Manifest.SchemaHistoryAnchors(end)
+		// EndPosition is a trusted schema snapshot anchored exactly at it — AND
+		// only when the window carries a non-empty SchemaDelta. That extra
+		// clause closes the PG/MySQL anchor-forge (roadmap item 60): a snapshot
+		// legitimately anchors at EndPosition only for a column-signature DDL,
+		// which DiffSchemas always records, so an emptied-DATA window's forged
+		// anchor (empty SchemaDelta) is refused. Parity with chain_restore.
+		reachedEnd := trustSchemaAnchor &&
+			len(link.Manifest.SchemaDelta) > 0 &&
+			link.Manifest.SchemaHistoryAnchors(end)
 		if (end.Engine != "" || end.Token != "") &&
 			end != link.Manifest.StartPosition && !reachedEnd {
 			return 0, sluicecode.Wrap(sluicecode.CodeBackupIncomplete,
