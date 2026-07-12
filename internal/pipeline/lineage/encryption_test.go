@@ -6,12 +6,44 @@ package lineage
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
 
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
+
+// TestCodeChunkHashError pins the SHA-256 integrity mapper (audit-2026-07-12):
+// a wrapped [blobcodec.ErrChunkHashMismatch] becomes the coded
+// SLUICE-E-BACKUP-CHUNK-CORRUPT refusal while preserving errors.Is, and
+// non-hash errors (and nil) pass through UNCHANGED — a codec/decrypt error or
+// a GCM-auth failure must NOT be mis-coded as chunk corruption.
+func TestCodeChunkHashError(t *testing.T) {
+	if got := CodeChunkHashError(nil); got != nil {
+		t.Errorf("nil: got %v, want nil", got)
+	}
+
+	other := errors.New("some codec decode error")
+	if got := CodeChunkHashError(other); got != other {
+		t.Errorf("non-hash error: got %v, want passthrough %v", got, other)
+	}
+	if _, ok := sluicecode.FromError(CodeChunkHashError(other)); ok {
+		t.Error("non-hash error was coded; want no code")
+	}
+
+	hashErr := fmt.Errorf("open chunk: %w", fmt.Errorf("%w: expected X, got Y", blobcodec.ErrChunkHashMismatch))
+	coded := CodeChunkHashError(hashErr)
+	ce, ok := sluicecode.FromError(coded)
+	if !ok || ce.Code != sluicecode.CodeBackupChunkCorrupt {
+		t.Errorf("hash mismatch: got %v, want coded %s", coded, sluicecode.CodeBackupChunkCorrupt)
+	}
+	if !errors.Is(coded, blobcodec.ErrChunkHashMismatch) {
+		t.Error("coded error no longer errors.Is ErrChunkHashMismatch (wrap broke the chain)")
+	}
+}
 
 // failingExistsStore simulates a store whose read path is transiently
 // broken at the Exists probe (auth outage, network partition).

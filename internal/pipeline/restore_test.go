@@ -16,6 +16,7 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // restoreRecorderEngine is a fake [ir.Engine] for restore tests: a
@@ -474,6 +475,15 @@ func TestRestore_HashMismatch_FailsLoudly(t *testing.T) {
 		strings.Contains(es, "checksum") || strings.Contains(es, "row")
 	if !corruptionShaped {
 		t.Errorf("err = %v; want ErrChunkHashMismatch or a clear corruption error", err)
+	}
+	// audit-2026-07-12 (Phase-4 finding): the SHA-256 integrity refusal must
+	// carry the coded SLUICE-E-BACKUP-CHUNK-CORRUPT refusal. FetchChunkVerified
+	// hashes the whole stored chunk upfront, so a stored-byte flip surfaces
+	// ErrChunkHashMismatch (before any codec/decrypt) and is coded here.
+	if errors.Is(err, blobcodec.ErrChunkHashMismatch) {
+		if ce, ok := sluicecode.FromError(err); !ok || ce.Code != sluicecode.CodeBackupChunkCorrupt {
+			t.Errorf("hash-mismatch restore: want coded %s, got %v", sluicecode.CodeBackupChunkCorrupt, err)
+		}
 	}
 }
 

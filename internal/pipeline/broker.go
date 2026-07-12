@@ -1261,7 +1261,9 @@ func (b *SyncFromBackup) streamOneChunkWithPosition(
 ) error {
 	src, err := blobcodec.FetchChunkVerified(ctx, segStore, chunk.File, chunk.SHA256)
 	if err != nil {
-		return fmt.Errorf("open chunk: %w", err)
+		// A SHA-256 mismatch surfaces here before decryption → coded
+		// SLUICE-E-BACKUP-CHUNK-CORRUPT (parity with chain_restore).
+		return lineage.CodeChunkHashError(fmt.Errorf("open chunk: %w", err))
 	}
 	cek, err := b.chunkCEK(chunk)
 	if err != nil {
@@ -1302,7 +1304,9 @@ func (b *SyncFromBackup) streamOneChunkWithPosition(
 		case out <- rewritten:
 		}
 	}
-	return cr.Close()
+	// A change-chunk SHA-256 mismatch surfaces at Close → coded
+	// SLUICE-E-BACKUP-CHUNK-CORRUPT (a non-hash Close error passes through).
+	return lineage.CodeChunkHashError(cr.Close())
 }
 
 // rewritePosition returns a copy of c with its [ir.Position] field
