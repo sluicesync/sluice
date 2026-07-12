@@ -61,6 +61,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/progress"
 )
 
 // lastErrorMaxLen caps the size of the persisted last_error column.
@@ -319,6 +320,11 @@ func headerOnly(state ir.MigrationState) ir.MigrationState {
 // the caller can decide whether to fail-fast (typical) or continue
 // (the resume path's tolerance for older state rows).
 func markPhase(ctx context.Context, rc resumeContext, state *ir.MigrationState, phase ir.MigrationPhase) error {
+	// ADR-0155: announce phase entry to the presentation sink (no-op on
+	// the structured-log sink, so byte-identical on every non-TTY path).
+	// markPhase is the single choke point every phase transition passes
+	// through, so the checklist's "in progress" mark is driven from here.
+	progress.FromContext(ctx).PhaseStarted(phase)
 	state.Phase = phase
 	state.LastError = ""
 	if err := writeState(ctx, rc, headerOnly(*state)); err != nil {

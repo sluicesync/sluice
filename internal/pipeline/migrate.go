@@ -39,6 +39,7 @@ import (
 	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
+	"sluicesync.dev/sluice/internal/progress"
 	"sluicesync.dev/sluice/internal/redact"
 )
 
@@ -513,6 +514,18 @@ type Migrator struct {
 	// needed.
 	UpfrontIndexes bool
 
+	// Progress is the optional TTY-aware presentation sink (ADR-0155).
+	// When nil (the zero value — every test, library embedder, broker /
+	// fleet path, and the sync cold-start), the orchestrator falls back
+	// to the structured-log sink via [progress.FromContext], so the
+	// emitted slog records are byte-for-byte identical to before. The CLI
+	// sets it to a [progress.TTYSink] only for an interactive terminal
+	// run (stdout is a TTY, --log-format=text, no --no-progress); every
+	// other invocation keeps the [progress.LogSink] behaviour. See
+	// [Migrator.Run], which injects the sink into the run context so the
+	// deep bulk-copy ticker can reach it without a threaded parameter.
+	Progress progress.Sink
+
 	// AnalyzeAfter, when true, runs a target-side per-table statistics
 	// refresh (PG ANALYZE / MySQL ANALYZE TABLE / SQLite ANALYZE, via the
 	// optional [ir.TableAnalyzer] surface) AFTER constraints and views
@@ -570,6 +583,14 @@ func (m *Migrator) Run(ctx context.Context) error {
 	if err := m.validate(); err != nil {
 		return err
 	}
+
+	// ADR-0155: attach the presentation sink to the run context once, so
+	// every phase call-site (and the deep bulk-copy ticker) reaches it via
+	// [progress.FromContext] without a threaded parameter. nil Progress is
+	// ignored by NewContext, so FromContext falls back to the byte-identical
+	// structured-log sink — the pre-ADR-0155 behaviour every un-wired caller
+	// keeps.
+	ctx = progress.NewContext(ctx, m.Progress)
 
 	// Driver/host mismatch pre-flight — runs before any reader/writer is
 	// opened (it only needs the engines + DSNs). Refuses e.g. the vanilla
@@ -755,7 +776,7 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 		m.Summary.RecordTable(t.Schema, t.Name)
 	}
 	markComplete(ctx, rc, state)
-	slog.InfoContext(ctx, "migration complete", slog.Int("tables", len(schema.Tables)))
+	progress.FromContext(ctx).Summary(progress.Result{Tables: len(schema.Tables)})
 	return nil
 }
 
@@ -836,9 +857,10 @@ func reportDegradedFKs(ctx context.Context, sw ir.SchemaWriter) {
 	if len(fks) == 0 {
 		return
 	}
+	sink := progress.FromContext(ctx)
 	for _, fk := range fks {
-		slog.WarnContext(
-			ctx, "constraint attached degraded (NOT VALID)",
+		sink.Warn(
+			"constraint attached degraded (NOT VALID)",
 			slog.String("schema", fk.Schema),
 			slog.String("table", fk.Table),
 			slog.String("constraint", fk.ConstraintName),
@@ -847,7 +869,7 @@ func reportDegradedFKs(ctx context.Context, sw ir.SchemaWriter) {
 			slog.String("hint", fk.Hint),
 		)
 	}
-	slog.WarnContext(ctx, "constraints phase: degraded FKs",
+	sink.Warn("constraints phase: degraded FKs",
 		slog.Int("count", len(fks)),
 		slog.String("action_required",
 			"run `ALTER TABLE ... VALIDATE CONSTRAINT <name>` for each after fixing the orphan rows on the child tables"))
@@ -1239,7 +1261,7 @@ func runBulkCopyPhases(
 		err = fmt.Errorf("pipeline: create tables: %w", err)
 		return migcore.WrapWithHint(migcore.PhaseSchemaApply, markFailed(ctx, rc, *state, ir.MigrationPhaseTables, err))
 	}
-	slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseTables)))
+	progress.FromContext(ctx).PhaseCompleted(ir.MigrationPhaseTables)
 
 	// --upfront-indexes (Migrator.UpfrontIndexes): build the secondary indexes
 	// NOW — before the bulk copy — instead of the default deferred post-copy
@@ -1265,7 +1287,7 @@ func runBulkCopyPhases(
 			err = fmt.Errorf("pipeline: create indexes (upfront): %w", err)
 			return migcore.WrapWithHint(migcore.PhaseIndexes, markFailed(ctx, rc, *state, ir.MigrationPhaseIndexes, err))
 		}
-		slog.InfoContext(ctx, "migration: phase complete (upfront)", slog.String("phase", string(ir.MigrationPhaseIndexes)))
+		progress.FromContext(ctx).PhaseCompletedEarly(ir.MigrationPhaseIndexes)
 	}
 
 	// Phase 2: bulk-copy. Per-table state-row updates here so a mid-
@@ -1309,7 +1331,7 @@ func runBulkCopyPhases(
 		); err != nil {
 			return err
 		}
-		slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseBulkCopy)))
+		progress.FromContext(ctx).PhaseCompleted(ir.MigrationPhaseBulkCopy)
 
 		// Phase 3.5: identity sync.
 		if err := markPhase(ctx, rc, state, ir.MigrationPhaseIdentitySync); err != nil {
@@ -1321,7 +1343,7 @@ func runBulkCopyPhases(
 			err = fmt.Errorf("pipeline: sync identity sequences: %w", err)
 			return migcore.WrapWithHint(migcore.PhaseSchemaApply, markFailed(ctx, rc, *state, ir.MigrationPhaseIdentitySync, err))
 		}
-		slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseIdentitySync)))
+		progress.FromContext(ctx).PhaseCompleted(ir.MigrationPhaseIdentitySync)
 	} else if ib, ok := sw.(ir.IncrementalIndexBuilder); ok {
 		if err := runOverlappedCopyAndIndexPhase(
 			ctx, rc, state, &stateMu, schema, rows, sw, rw, ib,
@@ -1329,8 +1351,8 @@ func runBulkCopyPhases(
 		); err != nil {
 			return err
 		}
-		slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseBulkCopy)))
-		slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseIndexes)))
+		progress.FromContext(ctx).PhaseCompleted(ir.MigrationPhaseBulkCopy)
+		progress.FromContext(ctx).PhaseCompleted(ir.MigrationPhaseIndexes)
 
 		// Phase 3.5: identity sync. Runs after the combined copy+index
 		// phase; it depends on the copied rows (sequence high-water mark),
@@ -1345,7 +1367,7 @@ func runBulkCopyPhases(
 			err = fmt.Errorf("pipeline: sync identity sequences: %w", err)
 			return migcore.WrapWithHint(migcore.PhaseSchemaApply, markFailed(ctx, rc, *state, ir.MigrationPhaseIdentitySync, err))
 		}
-		slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseIdentitySync)))
+		progress.FromContext(ctx).PhaseCompleted(ir.MigrationPhaseIdentitySync)
 	} else {
 		// Fallback (MySQL): serial copy → identity-sync → whole-schema
 		// indexes, the pre-ADR-0077 ordering.
@@ -1355,7 +1377,7 @@ func runBulkCopyPhases(
 		); err != nil {
 			return err
 		}
-		slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseBulkCopy)))
+		progress.FromContext(ctx).PhaseCompleted(ir.MigrationPhaseBulkCopy)
 
 		// Phase 3.5: identity sync.
 		if err := markPhase(ctx, rc, state, ir.MigrationPhaseIdentitySync); err != nil {
@@ -1367,7 +1389,7 @@ func runBulkCopyPhases(
 			err = fmt.Errorf("pipeline: sync identity sequences: %w", err)
 			return migcore.WrapWithHint(migcore.PhaseSchemaApply, markFailed(ctx, rc, *state, ir.MigrationPhaseIdentitySync, err))
 		}
-		slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseIdentitySync)))
+		progress.FromContext(ctx).PhaseCompleted(ir.MigrationPhaseIdentitySync)
 
 		// Phase 4: indexes.
 		if err := markPhase(ctx, rc, state, ir.MigrationPhaseIndexes); err != nil {
@@ -1379,7 +1401,7 @@ func runBulkCopyPhases(
 			err = fmt.Errorf("pipeline: create indexes: %w", err)
 			return migcore.WrapWithHint(migcore.PhaseIndexes, markFailed(ctx, rc, *state, ir.MigrationPhaseIndexes, err))
 		}
-		slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseIndexes)))
+		progress.FromContext(ctx).PhaseCompleted(ir.MigrationPhaseIndexes)
 	}
 
 	// Loud-failure safety net (SLUICE-E-INDEX-MISSING): every branch above —
@@ -1426,7 +1448,7 @@ func runBulkCopyPhases(
 		return migcore.WrapWithHint(migcore.PhaseConstraints, markFailed(ctx, rc, *state, ir.MigrationPhaseConstraints, err))
 	}
 	reportDegradedFKs(ctx, sw)
-	slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseConstraints)))
+	progress.FromContext(ctx).PhaseCompleted(ir.MigrationPhaseConstraints)
 
 	// Phase 6: views. Final phase so all referenced base tables
 	// exist by the time the view is created. View-to-view dependency
@@ -1438,7 +1460,7 @@ func runBulkCopyPhases(
 	if err := migcore.RunViewsPhase(ctx, schema, sw); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseViews, markFailed(ctx, rc, *state, ir.MigrationPhaseViews, err))
 	}
-	slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseViews)))
+	progress.FromContext(ctx).PhaseCompleted(ir.MigrationPhaseViews)
 
 	// Advisory post-success phase: `--analyze-after` (perf research delta
 	// 4). Runs LAST — after constraints and views — so the refreshed

@@ -32,6 +32,7 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	pstelemetry "sluicesync.dev/sluice/internal/planetscale/telemetry"
+	"sluicesync.dev/sluice/internal/progress"
 	"sluicesync.dev/sluice/internal/redact"
 )
 
@@ -43,6 +44,13 @@ type Globals struct {
 	Config    string `help:"Path to a YAML config file." short:"c" type:"existingfile" placeholder:"PATH"`
 	LogLevel  string `help:"Log verbosity." short:"l" default:"info" enum:"debug,info,warn,error" placeholder:"LEVEL"`
 	LogFormat string `help:"Log output format: human-readable text or one-JSON-object-per-line (for Loki/Datadog/CloudWatch ingestion of long-running sync)." default:"text" enum:"text,json" placeholder:"FORMAT"`
+
+	// NoProgress forces the plain structured-log presentation even at an
+	// interactive terminal (ADR-0155). The pretty TTY view is the default
+	// only when stdout is a terminal AND --log-format=text; this flag (and
+	// --log-format=json, and any non-TTY stdout) forces the log sink. It is
+	// the escape hatch if the pretty renderer ever misbehaves.
+	NoProgress bool `help:"Force plain structured-log output even at an interactive terminal (disables the pretty progress view)."`
 
 	// PprofListen is the GitHub #23 Phase A operator-diagnostic hook.
 	// When non-empty, starts net/http/pprof's debug endpoints at the
@@ -494,7 +502,20 @@ func (m *MigrateCmd) run(g *Globals, env *envelopeRun) error {
 	// Validation is done; errors past this point classify as "failed"
 	// (not "refused") in the --format json envelope.
 	env.markEngaged()
-	return crashWrap(mig.Run(kongContext()))
+
+	// ADR-0155: pick the presentation sink. The pretty TTY view runs only
+	// for an interactive, single-database, text-log, non-envelope migrate;
+	// every other invocation keeps the byte-identical structured-log sink
+	// (mig.Progress stays nil -> the LogSink default). A multi-namespace
+	// fan-out emits a per-database summary the single live view can't
+	// represent, so it stays on the log sink too.
+	multiNamespace := allNS || len(includeNS) > 0 || len(excludeNS) > 0 || len(mapPairs) > 0
+	pretty := wantPrettyProgress(g, env.jsonMode, m.DryRun, multiNamespace)
+	ctx, cancel := context.WithCancel(kongContext())
+	defer cancel()
+	return runMigrateWithProgress(pretty, cancel, func(s progress.Sink) { mig.Progress = s }, func() error {
+		return crashWrap(mig.Run(ctx))
+	})
 }
 
 // resolveEngines resolves the source + target engines for a migrate run,
