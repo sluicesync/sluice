@@ -170,24 +170,44 @@ func (r *floatExactPatchReader) ReadRows(ctx context.Context, table *ir.Table) (
 				return
 			}
 		}
-		// M0.1 0-patched-of-N tripwire (audit item 58). The exact re-read
-		// built a NON-EMPTY map (the source has rows for this table) yet NOT
-		// ONE streamed COPY row matched a PK key — a systemic PK-rendering
-		// divergence (the SL-F2 class: the exact-scan PK and the COPY PK
-		// render differently) that silently leaves every single-precision
-		// FLOAT column display-rounded while --strict-float exits 0. A PER-ROW
-		// miss is a benign temporal skip (a row inserted after the re-read
-		// window — tolerated; see the id-3 case in the tests); only a TOTAL
-		// miss is the silent bypass --strict-float exists to refuse. Fires
-		// ONLY under --strict-float (the default archives rounded); guarded on
-		// exactCount>0 so a legitimately empty source table never trips it.
-		if r.strict && exactCount > 0 && streamed > 0 && patched == 0 {
+		// M0.1 0-patched-of-N tripwire (audit item 58) + the audit-2026-07-11
+		// M-2 widening. The exact re-read built a NON-EMPTY map (exactCount>0:
+		// the source has rows for this table), so a TOTAL miss is a silent
+		// FLOAT-fidelity loss the default posture must not swallow silently —
+		// the over-cap and unrepairable rounded-fallbacks both WARN, and the
+		// file's contract is "rounded but SIGNALLED", never silent. Two shapes:
+		//
+		//   (1) streamed>0 && patched==0 — a systemic PK-rendering divergence
+		//       (the SL-F2 class: the exact-scan PK and the COPY PK render
+		//       differently), leaving every single-precision FLOAT column
+		//       display-rounded. Unambiguous, so --strict-float REFUSES it
+		//       (a per-row miss is a benign post-re-read temporal skip and is
+		//       tolerated — only a TOTAL miss trips this); the default WARNs.
+		//   (2) streamed==0 — the COPY delivered NO rows though the exact scan
+		//       found some. AMBIGUOUS: a whole-table copy dropout (bad) OR a
+		//       table that was empty at the COPY position and filled during the
+		//       window so only the later exact scan sees rows (legit). Refusing
+		//       would false-positive the legit case, so this WARNs in BOTH
+		//       postures rather than refuses.
+		switch {
+		case exactCount > 0 && streamed > 0 && patched == 0 && r.strict:
 			r.mu.Lock()
 			r.err = sluicecode.Wrap(sluicecode.CodeVStreamFloatLossy,
 				"the exact re-read returned rows but none matched a streamed row's primary key — a PK whose exact-scan and COPY renderings diverge; add --no-float-exact-reread for a rounded-but-consistent archive, or drop --strict-float",
 				fmt.Errorf("backup: --strict-float: table %q exact FLOAT re-read patched 0 of %d streamed row(s) despite a %d-row exact map — every single-precision FLOAT column would silently retain its VStream display rounding",
 					table.Name, streamed, exactCount))
 			r.mu.Unlock()
+		case exactCount > 0 && streamed > 0 && patched == 0:
+			slog.WarnContext(ctx,
+				"backup: exact FLOAT re-read matched none of the streamed rows; archiving this table's single-precision FLOATs VStream display-rounded (pass --strict-float to refuse instead) — a primary key whose exact-scan and COPY renderings diverge",
+				slog.String("table", table.Name),
+				slog.Int64("streamed", streamed),
+				slog.Int("exact_rows", exactCount))
+		case exactCount > 0 && streamed == 0:
+			slog.WarnContext(ctx,
+				"backup: exact FLOAT re-read found rows but the COPY streamed none for this table — a table empty at the snapshot position and filled during the window (legit) or a whole-table copy dropout; verify this table's row count",
+				slog.String("table", table.Name),
+				slog.Int("exact_rows", exactCount))
 		}
 	}()
 	return out, nil

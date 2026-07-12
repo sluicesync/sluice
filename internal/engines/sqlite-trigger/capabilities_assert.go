@@ -24,4 +24,8 @@ import "sluicesync.dev/sluice/internal/ir"
 var (
 	_ ir.Engine    = Engine{}
 	_ ir.CDCReader = (*CDCReader)(nil)
+	// audit-2026-07-11 M-3: ChangeLogPruner drives change-log pruning; a
+	// method-set drift here silently stops pruning → the trigger change-log
+	// grows unbounded (a silent-loss-adjacent resource leak).
+	_ ir.ChangeLogPruner = (*CDCReader)(nil)
 )

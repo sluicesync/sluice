@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // decodeValue converts a single value as returned by the pgx driver
@@ -460,9 +461,13 @@ func parsePGTimeText(s string) (time.Time, error) {
 	// is unsupported, not that the parser is broken.
 	switch {
 	case s == "infinity" || s == "-infinity":
-		return time.Time{}, fmt.Errorf("postgres: timestamptz %q is not representable as a fixed-width target timestamp (infinite value)", s)
+		return time.Time{}, sluicecode.Wrap(sluicecode.CodeValueUnrepresentable,
+			"filter or transform the source value (e.g. NULLIF / CASE on the source query)",
+			fmt.Errorf("postgres: timestamptz %q is not representable as a fixed-width target timestamp (infinite value)", s))
 	case strings.HasSuffix(s, " BC"):
-		return time.Time{}, fmt.Errorf("postgres: timestamp %q is a BC (pre-Gregorian) date with no representable target value", s)
+		return time.Time{}, sluicecode.Wrap(sluicecode.CodeValueUnrepresentable,
+			"filter or transform the source value (e.g. NULLIF / CASE on the source query)",
+			fmt.Errorf("postgres: timestamp %q is a BC (pre-Gregorian) date with no representable target value", s))
 	}
 	layouts := []string{
 		// TIMESTAMPTZ. Postgres renders the zone offset as ±HH, ±HH:MM, or

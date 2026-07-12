@@ -1016,8 +1016,14 @@ func (b *SyncFromBackup) applyIncremental(
 		// anchor POSITION instead. And on VStream (CDCPositionCommitsAfterRows) a
 		// snapshot can SHARE a position with a data change, so a schema anchor at
 		// EndPosition proves nothing there — trust the anchor only when the
-		// engine's schema anchor strictly precedes its rows.
-		trustSchemaAnchor := !link.Manifest.CDCPositionCommitsAfterRows
+		// engine's schema anchor strictly precedes its rows. OR the manifest flag
+		// with the source engine's OWN registered capability so an unsigned
+		// true→false flip (which rides in the id only at FV8, and even there the
+		// id is recomputable) can't re-open the bypass — SourceEngine is
+		// BackupID-covered and AAD-bound. (Parity with chain_restore.)
+		commitsAfterRows := link.Manifest.CDCPositionCommitsAfterRows ||
+			backup.SourceEngineCommitsAfterRows(link.Manifest.SourceEngine)
+		trustSchemaAnchor := !commitsAfterRows
 		end := link.Manifest.EndPosition
 		// With 0 chunks, the only thing that can "reach" a position-bearing
 		// EndPosition is a trusted schema snapshot anchored exactly at it.

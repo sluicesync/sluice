@@ -143,4 +143,13 @@ var (
 	_ ir.SlotManager         = (*SlotManager)(nil)
 	_ ir.SnapshotImporter    = (*SnapshotImporter)(nil)
 	_ ir.MigrationStateStore = (*MigrationStateStore)(nil)
+
+	// audit-2026-07-11 M-3: finish the ARCH-F1 sweep — runtime-dispatched
+	// optional surfaces that were implemented but unpinned (a method-set drift
+	// would silently disable DDL-phase transient retry, the grow-gate, the
+	// parallel-copy exact-count opt-in, or target metrics history).
+	_ ir.TransientClassifier       = (*SchemaWriter)(nil)
+	_ ir.GrowGateSetter            = (*RowWriter)(nil)
+	_ ir.ExactCountEstimateOptIn   = (*RowReader)(nil)
+	_ ir.TargetMetricsHistoryStore = (*ChangeApplier)(nil)
 )

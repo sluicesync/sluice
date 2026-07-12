@@ -35,6 +35,7 @@ import (
 	"log/slog"
 
 	"sluicesync.dev/sluice/internal/crypto"
+	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
@@ -691,11 +692,25 @@ func verifySchemaHashes(ctx context.Context, links []lineage.SegmentRecord) erro
 // a non-empty recorded id is genuine.
 //
 // Links with an empty recorded BackupID (pre-Phase-3 fulls) are skipped — the
-// walker computes those on demand; there is no recorded value to verify.
+// walker computes those on demand; there is no recorded value to verify. That
+// skip is safe ONLY for fulls: a CDC segment (incremental / streaming) has
+// carried a recorded BackupID since Phase 3 introduced them, so an empty one is
+// never writer-legitimate — it is a store adversary blanking the id to slip the
+// recompute check (and, on an FV8 VStream segment, to un-bind the folded
+// CDCPositionCommitsAfterRows flag). Refuse it rather than skip.
 func verifyBackupIDs(links []lineage.SegmentRecord) error {
 	for i := range links {
 		m := links[i].Manifest
-		if m == nil || m.BackupID == "" {
+		if m == nil {
+			continue
+		}
+		if m.BackupID == "" {
+			if m.Kind == irbackup.BackupKindIncremental {
+				return sluicecode.Wrap(sluicecode.CodeBackupManifestInvalid,
+					"restore from an untampered copy, or sign the chain (--sign/--sign-key + --require-signature) so a manifest edit is caught at verify time",
+					fmt.Errorf("chain restore: incremental manifest %s carries an empty BackupID — a CDC segment always records one, so this is a corrupt or blanked-to-evade-verification manifest; refusing before any data lands",
+						links[i].Path))
+			}
 			continue
 		}
 		if got := irbackup.ComputeBackupID(m); got != m.BackupID {
@@ -706,6 +721,33 @@ func verifyBackupIDs(links []lineage.SegmentRecord) error {
 		}
 	}
 	return nil
+}
+
+// SourceEngineCommitsAfterRows reports whether the engine named in a
+// manifest's recorded SourceEngine is a registered engine whose CDC positions
+// commit AFTER the rows they cover (a VStream flavour — PlanetScale / Vitess).
+//
+// It exists because the manifest's own [irbackup.Manifest.CDCPositionCommitsAfterRows]
+// bool is NOT tamper-proof on an unsigned backup: it rides in the id only for
+// FormatVersion >= 8 (item 57 fold), and even there the id is a keyless public
+// hash a store adversary can recompute — so a coherent unsigned flip true→false
+// re-opens the Bug-184 emptied-window bypass (restore would trust a schema
+// anchor at EndPosition that a VStream snapshot legitimately shares with data
+// rows). The binary's OWN engine registry is the authoritative source no
+// manifest edit can influence: SourceEngine is itself BackupID-covered and, on
+// encrypted chains, GCM-AAD-bound, so an adversary cannot relabel a VStream
+// backup as a non-VStream engine without breaking decrypt/verify. Callers OR
+// this with the manifest flag, so the anchor is distrusted whenever EITHER
+// says commit-after-rows.
+//
+// Returns false for an unregistered/unknown SourceEngine (an old or renamed
+// engine), in which case the caller falls back to the manifest flag alone —
+// no worse than before this hardening, and signing closes the residue.
+func SourceEngineCommitsAfterRows(engineName string) bool {
+	if eng, ok := engines.Get(engineName); ok {
+		return eng.Capabilities().CDCPositionCommitsAfterRows
+	}
+	return false
 }
 
 // checkMixedModeChain rejects a lineage where a segment's full and one
@@ -1127,19 +1169,22 @@ func (r *ChainRestore) streamIncrementalChanges(
 	// there. Trust the anchor only on engines whose schema anchor strictly
 	// precedes its rows (Postgres / MySQL-binlog).
 	//
-	// Threat-model note (ADR-0152 residual shape (4)): CDCPositionCommitsAfterRows
-	// is an unsigned manifest field NOT covered by ComputeBackupID, so a store
-	// adversary on an UNSIGNED backup can flip it true→false alongside emptying
-	// the chunks. On a VStream chain this yields the UNRECOVERABLE resume-gap
-	// class (unsigned VStream is strictly weaker than unsigned PG/MySQL, whose
-	// data-emptying F1 net does not depend on this flag). Signing
-	// (--require-signature) closes it. The signing-independent hardening —
-	// recorded-vs-recomputed BackupID verify + folding this flag into
-	// ComputeBackupID — is SAFE to add (no legitimate manifest-mutating op
-	// drifts BackupID: rotation caps the catalog Segment, not the manifest;
-	// compaction touches only the uncovered ParentBackupID) and is scheduled as
-	// roadmap item 57 (v0.99.226).
-	trustSchemaAnchor := !link.Manifest.CDCPositionCommitsAfterRows
+	// Threat-model note (ADR-0152 residual shape (4)): the manifest's own
+	// CDCPositionCommitsAfterRows bool is not fully tamper-proof on an unsigned
+	// backup — it rides in ComputeBackupID only for FormatVersion >= 8 (item 57
+	// fold), and the id is a keyless public hash a store adversary can recompute,
+	// so a coherent unsigned flip true→false could otherwise re-open the Bug-184
+	// bypass. We therefore OR the manifest flag with the source engine's OWN
+	// registered capability ([SourceEngineCommitsAfterRows]): SourceEngine is
+	// BackupID-covered and, on encrypted chains, GCM-AAD-bound, so the flip is
+	// caught for any registered VStream source regardless of FormatVersion or
+	// signedness. What remains signing-closed is the PG/MySQL anchor-forge
+	// (editing a SchemaHistory entry's AnchorPosition to EndPosition), where the
+	// anchor field itself is outside every signing-independent cover; sign the
+	// chain (--require-signature) to close that.
+	commitsAfterRows := link.Manifest.CDCPositionCommitsAfterRows ||
+		SourceEngineCommitsAfterRows(link.Manifest.SourceEngine)
+	trustSchemaAnchor := !commitsAfterRows
 	reachedEnd := lastApplied == end ||
 		(trustSchemaAnchor && link.Manifest.SchemaHistoryAnchors(end))
 	if posBearing && claimsAdvance && !reachedEnd {
