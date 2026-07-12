@@ -4,6 +4,16 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.232] - 2026-07-12
+
+### Added
+
+- **The backup chunk SHA-256 integrity refusal is now the coded `SLUICE-E-BACKUP-CHUNK-CORRUPT`.** When a chunk's stored bytes don't hash to the SHA-256 recorded in the manifest — at-rest corruption / bit-rot, or a tamper that altered the stored bytes — `restore`, broker replay, and `backup verify` already refused loudly and failed safe, but the refusal surfaced as a raw error with no machine-readable code, unlike its sibling GCM-auth refusal (`SLUICE-E-BACKUP-CHUNK-AUTH-FAILED`). This byte-level check runs before decryption, so it fires on plaintext and encrypted chunks alike; operators scripting against backup integrity now have a stable code to match. Surfaced by the v0.99.231 Vultr 75 GB paid-testing run, which flipped a byte in one uploaded chunk and confirmed the refusal. No behavior change beyond the error code and Refusal class.
+
+### Fixed
+
+- **The fleet TUI (`sync tui`) no longer renders a tofu box in the RESTARTS column.** The column used `↻` (U+21BB) for its header and each cell's prefix, which the default Windows terminal font has no glyph for (it renders as a `?`-in-a-box) even though it handles the `·` and `↑↓` used elsewhere in the same view. The header is now the plain word `RESTARTS` and the cells show just the count — pure ASCII, so the dashboard renders correctly on every terminal.
+
 ## [0.99.231] - 2026-07-12
 
 ### Security
