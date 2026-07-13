@@ -806,12 +806,20 @@ func (b *BackupFullCmd) run(g *Globals, env *envelopeRun) error {
 		defer func() { _ = closer() }()
 	}
 
-	slog.InfoContext(
-		ctx, "backup: starting full backup",
-		slog.String("source_engine", source.Name()),
-		slog.String("destination", storeDesc),
-		slog.Int("chunk_size", b.ChunkSize),
-	)
+	// ADR-0155: compute the pretty gate up-front. The pre-run INFO lines below
+	// fire before runWithProgress installs the TTY slog gate, so on the pretty
+	// path they would leak above the live view; suppress them there (the
+	// summary panel is the interactive output). The non-TTY path is unchanged.
+	pretty := wantPrettyProgress(g, env.jsonMode, false, false)
+
+	if !pretty {
+		slog.InfoContext(
+			ctx, "backup: starting full backup",
+			slog.String("source_engine", source.Name()),
+			slog.String("destination", storeDesc),
+			slog.Int("chunk_size", b.ChunkSize),
+		)
+	}
 
 	encConfig, err := b.buildBackupEncryption()
 	if err != nil {
@@ -868,13 +876,15 @@ func (b *BackupFullCmd) run(g *Globals, env *envelopeRun) error {
 		return fmt.Errorf("redactions (YAML): %w", err)
 	}
 	bk.Redactor = redactor
-	logKeysetLoaded(keyset)
-	logRedactionConfig(redactor, "backup full")
+	if !pretty {
+		logKeysetLoaded(keyset)
+		logRedactionConfig(redactor, "backup full")
+	}
 	// Validation is done; errors past this point classify as "failed"
 	// (not "refused") in the --format json envelope.
 	env.markEngaged()
-	// ADR-0155: pretty TTY view for an interactive, non-envelope run.
-	pretty := wantPrettyProgress(g, env.jsonMode, false, false)
+	// ADR-0155: pretty TTY view for an interactive, non-envelope run (pretty
+	// gate computed above so the pre-run INFO lines don't leak over the view).
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	return runWithProgress(pretty, cancel, backup.BackupFullProgressSpec,
@@ -988,13 +998,20 @@ func (b *BackupIncrementalCmd) Run(g *Globals) error {
 		defer func() { _ = closer() }()
 	}
 
-	slog.InfoContext(
-		ctx, "backup: starting incremental",
-		slog.String("source_engine", source.Name()),
-		slog.String("destination", storeDesc),
-		slog.String("since", b.Since),
-		slog.Duration("window", b.Window),
-	)
+	// ADR-0155: pretty gate up-front so the pre-run INFO line doesn't leak
+	// above the live view (it fires before runWithProgress installs the TTY
+	// slog gate). Non-TTY path unchanged.
+	pretty := wantPrettyProgress(g, false, false, false)
+
+	if !pretty {
+		slog.InfoContext(
+			ctx, "backup: starting incremental",
+			slog.String("source_engine", source.Name()),
+			slog.String("destination", storeDesc),
+			slog.String("since", b.Since),
+			slog.Duration("window", b.Window),
+		)
+	}
 
 	encConfig, err := b.buildBackupEncryption()
 	if err != nil {
@@ -1021,8 +1038,6 @@ func (b *BackupIncrementalCmd) Run(g *Globals) error {
 		Sign:          b.Sign,
 		Ed25519Signer: signer,
 	}
-	// ADR-0155: pretty TTY view for an interactive run.
-	pretty := wantPrettyProgress(g, false, false, false)
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	return runWithProgress(pretty, cancel, pipeline.IncrementalProgressSpec,

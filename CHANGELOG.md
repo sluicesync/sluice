@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.238] - 2026-07-13
+
+### Fixed
+
+- **`backup full` / `backup incremental` no longer leak a "starting…" INFO line above the live panel at a TTY (ADR-0155 polish).** The pre-run `slog` line (`backup: starting full backup` / `backup: starting incremental`, plus the keyset/redaction config lines) fired before `runWithProgress` installed the TTY slog gate, so on the pretty path it printed above the summary box. The pretty gate is now computed up front and those pre-run INFO lines are suppressed on the interactive path (the summary panel is the output there). Non-TTY / `--log-format=json` output is unchanged — the lines still emit exactly as before when not rendering the live view.
+
 ## [0.99.237] - 2026-07-13
 
 ### Added
