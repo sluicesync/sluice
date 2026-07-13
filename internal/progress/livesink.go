@@ -50,16 +50,26 @@ var _ Sink = (*LiveTTYSink)(nil)
 // The program runs inline (no alternate screen) so the final line stays in
 // scrollback, mirroring [NewTTYSink].
 func NewLiveTTYSink(w io.Writer, spec Spec, header LiveHeader, stopCmd tea.Cmd, onRendererPanic func(any)) *LiveTTYSink {
-	m := newLivePanel(spec, header, stopCmd, time.Now)
-	p := tea.NewProgram(m, tea.WithOutput(w))
+	return startLiveSink(w, newLivePanel(spec, header, stopCmd, time.Now), onRendererPanic)
+}
+
+// startLiveSink runs panel as a bubbletea program on w in its own goroutine
+// and wraps it in a [LiveTTYSink]. Shared by [NewLiveTTYSink] (the phase-1
+// `sync start` panel) and [NewLiveReadoutTTYSink] (the phases-2/3 readout
+// panels) so the renderer-isolation contract is written once: a panic inside
+// the program is recovered HERE (never unwinding into the command's
+// goroutine) and reported via onRendererPanic.
+func startLiveSink(w io.Writer, panel livePanel, onRendererPanic func(any)) *LiveTTYSink {
+	p := tea.NewProgram(panel, tea.WithOutput(w))
 	s := &LiveTTYSink{prog: p, w: w, done: make(chan struct{}), onRendererPanic: onRendererPanic}
 	go func() {
 		defer close(s.done)
 		defer func() {
 			if r := recover(); r != nil {
 				// Renderer isolation: swallow the panic HERE so it cannot
-				// unwind into (and kill) the sync goroutine. The CLI's handler
-				// restores slog and keeps the stream on the structured-log path.
+				// unwind into (and kill) the command's goroutine. The CLI's
+				// handler restores slog and keeps the command on the
+				// structured-log path.
 				if s.onRendererPanic != nil {
 					s.onRendererPanic(r)
 				}
@@ -69,6 +79,24 @@ func NewLiveTTYSink(w io.Writer, spec Spec, header LiveHeader, stopCmd tea.Cmd, 
 	}()
 	return s
 }
+
+// NewLiveReadoutTTYSink starts a bubbletea program rendering the GENERIC
+// readout panel (ADR-0156 phases 2/3) to w and returns a sink that feeds it.
+// It is the constructor for the broker / backup-stream / metrics-watch
+// panels: same header / events / footer chrome + drain-and-stop as
+// [NewLiveTTYSink], but the body is the ordered label/value list pushed via
+// [LiveTTYSink.Readout] rather than the `sync start` initial-copy checklist /
+// CDC body. header carries the mode word + identity line; stopCmd is the
+// drain-and-stop side effect returned on q/ctrl+c; onRendererPanic (may be
+// nil) is called if the renderer panics.
+func NewLiveReadoutTTYSink(w io.Writer, header LiveHeader, stopCmd tea.Cmd, onRendererPanic func(any)) *LiveTTYSink {
+	return startLiveSink(w, newReadoutPanel(header, stopCmd, time.Now), onRendererPanic)
+}
+
+// Readout pushes one refresh of the GENERIC label/value readout body (ADR-0156
+// phases 2/3). Safe to call from the command's tick/sample loop; the panel
+// replaces its body with the supplied fields on the next frame.
+func (s *LiveTTYSink) Readout(fields []Field) { s.prog.Send(readoutMsg{fields: fields}) }
 
 // --- Sink (initial-copy feed) ---
 

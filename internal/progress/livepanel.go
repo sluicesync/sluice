@@ -67,9 +67,21 @@ func (h liveHealth) String() string {
 
 // LiveHeader is the static identity the panel renders in its header row.
 type LiveHeader struct {
+	// Mode is the panel's brand/mode word rendered after "sluice " in the
+	// header (e.g. "sync", "broker", "backup stream", "metrics-watch").
+	// Empty defaults to "sync" so the phase-1 `sync start` panel's header is
+	// byte-identical.
+	Mode string
+
 	Source   string
 	Target   string
 	StreamID string
+
+	// Detail, when non-empty, REPLACES the "source -> target · stream <id>"
+	// route in the header line — for the readout-mode panels whose identity
+	// isn't a source→target pair (e.g. metrics-watch's "watching <db> ·
+	// <org>"). Empty keeps the route, so `sync start`'s header is unchanged.
+	Detail string
 }
 
 // LiveStatus is one poll of the CDC steady-state signal. It is deliberately
@@ -130,6 +142,12 @@ type (
 		level string
 		text  string
 	}
+	// readoutMsg carries one refresh of the GENERIC mode-appropriate readout
+	// body (ADR-0156 phases 2/3): an ordered label/value list the panel
+	// renders in place of the CDC-specific [LiveStatus] body. Used by the
+	// broker / backup-stream / metrics-watch panels, whose steady-state
+	// signals are a different shape than `sync start`'s position/freshness.
+	readoutMsg struct{ fields []Field }
 	// stopRequestedMsg carries the result of the drain-and-stop side effect
 	// (the [tea.Cmd] the panel returns on q/ctrl+c). A non-nil err means the
 	// RequestStop write failed; the panel surfaces it in the footer but keeps
@@ -149,6 +167,15 @@ type livePanel struct {
 	// per-table bar (with ADR-0155's est-exceeded clamp). Only its
 	// checklistView is used; its summary/quit paths are never driven here.
 	copy model
+
+	// readoutMode marks a GENERIC-readout panel (broker / backup-stream /
+	// metrics-watch, ADR-0156 phases 2/3): it never renders the
+	// `sync start` initial-copy checklist or the CDC-specific body — its
+	// body is the ordered label/value [readout] list. False for the phase-1
+	// `sync start` panel, keeping its View byte-identical.
+	readoutMode bool
+	readout     []Field
+	haveReadout bool
 
 	cdc      bool // flipped once the snapshot hands off to CDC
 	status   LiveStatus
@@ -199,6 +226,18 @@ func newLivePanel(spec Spec, header LiveHeader, stopCmd tea.Cmd, now func() time
 	}
 }
 
+// newReadoutPanel builds a GENERIC-readout continuous panel (ADR-0156 phases
+// 2/3) for the broker / backup-stream / metrics-watch commands. It shares the
+// header / events / footer chrome and the drain-and-stop keybinding with the
+// `sync start` panel, but renders an ordered label/value [readout] body
+// instead of the initial-copy checklist / CDC-specific body. No [Spec] is
+// needed (there is no initial-copy phase list).
+func newReadoutPanel(header LiveHeader, stopCmd tea.Cmd, now func() time.Time) livePanel {
+	m := newLivePanel(Spec{}, header, stopCmd, now)
+	m.readoutMode = true
+	return m
+}
+
 func (m livePanel) Init() tea.Cmd { return nil }
 
 // Update is the pure state transition.
@@ -235,6 +274,10 @@ func (m livePanel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case eventMsg:
 		m.pushEvent(msg.level, msg.text)
+		return m, nil
+	case readoutMsg:
+		m.readout = msg.fields
+		m.haveReadout = true
 		return m, nil
 	case stopRequestedMsg:
 		m.stopErr = msg.err
@@ -314,14 +357,17 @@ func (m *livePanel) pushEvent(level, text string) {
 // program releases the terminal.
 func (m livePanel) View() string {
 	var b strings.Builder
-	b.WriteString(brandStyle.Render("sluice sync"))
+	b.WriteString(brandStyle.Render(m.brandLine()))
 	b.WriteString("  ")
 	b.WriteString(dimStyle.Render(m.headerLine()))
 	b.WriteString("\n\n")
 
-	if m.cdc {
+	switch {
+	case m.readoutMode:
+		b.WriteString(m.readoutBody())
+	case m.cdc:
 		b.WriteString(m.cdcBody())
-	} else {
+	default:
 		b.WriteString(activeStyle.Render("  mode: initial copy"))
 		b.WriteString("\n\n")
 		b.WriteString(m.copy.checklistView())
@@ -333,13 +379,45 @@ func (m livePanel) View() string {
 	return b.String()
 }
 
-// headerLine renders "source -> target · stream <id>".
+// brandLine renders the "sluice <mode>" brand. Mode defaults to "sync" so the
+// phase-1 `sync start` panel's brand ("sluice sync") is byte-identical.
+func (m livePanel) brandLine() string {
+	mode := m.header.Mode
+	if mode == "" {
+		mode = "sync"
+	}
+	return "sluice " + mode
+}
+
+// headerLine renders the panel's identity: the operator-supplied Detail when
+// set (the readout panels' free-form line), else "source -> target · stream
+// <id>".
 func (m livePanel) headerLine() string {
+	if m.header.Detail != "" {
+		return m.header.Detail
+	}
 	route := fmt.Sprintf("%s -> %s", m.header.Source, m.header.Target)
 	if m.header.StreamID != "" {
 		return route + "  ·  stream " + m.header.StreamID
 	}
 	return route
+}
+
+// readoutBody renders the GENERIC mode-appropriate body (ADR-0156 phases
+// 2/3): an ordered label/value list. Before the first [readoutMsg] arrives it
+// shows a dimmed "starting…" placeholder (these panels have no initial-copy
+// checklist to fill the gap).
+func (m livePanel) readoutBody() string {
+	var b strings.Builder
+	if !m.haveReadout {
+		b.WriteString(dimStyle.Render("  starting…"))
+		b.WriteString("\n")
+		return b.String()
+	}
+	for _, f := range m.readout {
+		fmt.Fprintf(&b, "  %-14s %s\n", f.Label, clipLine(f.Value, 72))
+	}
+	return b.String()
 }
 
 // cdcBody renders the steady-state CDC signals: mode, last-applied position,

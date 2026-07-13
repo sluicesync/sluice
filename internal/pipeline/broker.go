@@ -64,6 +64,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -74,6 +75,7 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
+	"sluicesync.dev/sluice/internal/progress"
 	"sluicesync.dev/sluice/internal/sluicecode"
 	"sluicesync.dev/sluice/internal/translate"
 )
@@ -189,6 +191,14 @@ type SyncFromBackup struct {
 	// SluiceVersion is the build identifier of the running binary.
 	// Recorded on log lines for diagnostics. Optional.
 	SluiceVersion string
+
+	// Readout, when non-nil, is the ADR-0156 live-panel hook: each tick
+	// pushes the broker's steady-state signal (last-applied chain position,
+	// cumulative incrementals replayed + chunks applied, last poll instant)
+	// as an ordered label/value list the TTY panel renders. Set ONLY on the
+	// pretty (TTY) path by the CLI; nil everywhere else, so the non-TTY log
+	// stream is byte-identical. Confined to Run's goroutine.
+	Readout func([]progress.Field)
 
 	// Envelope, when non-nil, is the [crypto.EnvelopeEncryption] used
 	// to unwrap CEKs from encrypted manifests. Required when the chain
@@ -493,6 +503,12 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 	//    runs immediately so a freshly-launched broker against a
 	//    chain with pending incrementals catches up without waiting
 	//    a full PollInterval.
+	//
+	// ADR-0156 readout counters (cumulative across ticks; live-panel only).
+	var cumIncrementals, cumChunks int
+	// Push an initial readout so the panel shows the resume floor immediately
+	// rather than "starting…" for a full poll interval on a quiet chain.
+	b.pushBrokerReadout(lastAppliedID, cumIncrementals, cumChunks, now())
 	for {
 		// Stop-request check (cross-machine + in-process). A
 		// ctx-cancel here also short-circuits via the same path.
@@ -513,7 +529,7 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 		}
 
 		started := now()
-		newApplied, totalBytes, applyErr := b.replayNewIncrementals(ctx, applier, lastAppliedID)
+		newApplied, totalBytes, incrN, chunkN, applyErr := b.replayNewIncrementals(ctx, applier, lastAppliedID)
 		elapsed := now().Sub(started)
 
 		if applyErr != nil {
@@ -536,6 +552,8 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 		if newApplied != "" {
 			lastAppliedID = newApplied
 		}
+		cumIncrementals += incrN
+		cumChunks += chunkN
 
 		slog.InfoContext(
 			ctx, "broker tick",
@@ -544,6 +562,11 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 			slog.Int64("bytes_replayed", totalBytes),
 			slog.Duration("elapsed", elapsed),
 		)
+
+		// ADR-0156: refresh the live panel with this tick's cumulative state
+		// (no-op when no panel is attached). Placed after the advance so the
+		// position shown is the one just committed.
+		b.pushBrokerReadout(lastAppliedID, cumIncrementals, cumChunks, now())
 
 		// Heartbeat update — preserves any operator-written
 		// stop_requested_at via the merge helper.
@@ -575,6 +598,25 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 			return nil
 		}
 	}
+}
+
+// pushBrokerReadout feeds the ADR-0156 live panel one refresh of the broker's
+// steady-state signal (a no-op when no panel is attached). The values are the
+// same ones the "broker tick" log line carries, shaped as a label/value list.
+func (b *SyncFromBackup) pushBrokerReadout(lastAppliedID string, incrementals, chunks int, now time.Time) {
+	if b.Readout == nil {
+		return
+	}
+	pos := lastAppliedID
+	if pos == "" {
+		pos = "—"
+	}
+	b.Readout([]progress.Field{
+		{Label: "position", Value: pos},
+		{Label: "incrementals", Value: strconv.Itoa(incrementals)},
+		{Label: "chunks", Value: strconv.Itoa(chunks)},
+		{Label: "last poll", Value: now.UTC().Format(time.RFC3339)},
+	})
 }
 
 // brokerChain returns the lineage chain via the tick-spanning cache.
@@ -829,14 +871,18 @@ func (b *SyncFromBackup) writePositionDirect(ctx context.Context, applier ir.Cha
 // "Not yet applied" semantics: an incremental is new if it appears
 // in the chain AFTER lastAppliedID, where chain order is determined
 // by the linked-list walk in [buildChain].
+//
+// incrCount / chunkCount report how many incrementals were applied this tick
+// and how many change chunks they carried — the ADR-0156 readout's cumulative
+// counters are folded from them by the caller.
 func (b *SyncFromBackup) replayNewIncrementals(
 	ctx context.Context,
 	applier ir.ChangeApplier,
 	lastAppliedID string,
-) (newApplied string, totalBytes int64, err error) {
+) (newApplied string, totalBytes int64, incrCount, chunkCount int, err error) {
 	chain, err := b.brokerChain(ctx)
 	if err != nil {
-		return "", 0, fmt.Errorf("build chain: %w", err)
+		return "", 0, 0, 0, fmt.Errorf("build chain: %w", err)
 	}
 	slog.DebugContext(
 		ctx, "broker: replay tick chain snapshot",
@@ -845,7 +891,7 @@ func (b *SyncFromBackup) replayNewIncrementals(
 		slog.Int("chain_len", len(chain)),
 	)
 	if len(chain) == 0 {
-		return "", 0, nil
+		return "", 0, 0, 0, nil
 	}
 
 	// Find lastAppliedID's position in the chain. Everything after
@@ -861,7 +907,7 @@ func (b *SyncFromBackup) replayNewIncrementals(
 			}
 		}
 		if !found {
-			return "", 0, fmt.Errorf(
+			return "", 0, 0, 0, fmt.Errorf(
 				"broker: last_applied_backup_id %q not found in chain; "+
 					"the chain may have been re-rooted on the source side. Operator action: "+
 					"clear the broker's `sluice_cdc_state` row and re-run with --reset-target-data or --at-chain-id",
@@ -871,7 +917,7 @@ func (b *SyncFromBackup) replayNewIncrementals(
 	}
 	if startIdx >= len(chain) {
 		// No new incrementals.
-		return "", 0, nil
+		return "", 0, 0, 0, nil
 	}
 
 	// BRK-2/3/4: bring the live-apply path to chain-restore verification
@@ -879,7 +925,7 @@ func (b *SyncFromBackup) replayNewIncrementals(
 	// mixed-mode refusal, schema-hash corruption, and the ADR-0154 signature
 	// gate. Runs only on a tick that has new work (an idle tick pays nothing).
 	if err := b.verifyChainIntegrity(ctx, chain); err != nil {
-		return "", 0, err
+		return "", 0, 0, 0, err
 	}
 
 	batchSize := b.ApplyBatchSize
@@ -908,7 +954,7 @@ func (b *SyncFromBackup) replayNewIncrementals(
 		// just-applied incremental's position is durable on the
 		// target via the in-batch position write.
 		if err := ctx.Err(); err != nil {
-			return newApplied, totalBytes, err
+			return newApplied, totalBytes, incrCount, chunkCount, err
 		}
 		link := &chain[i]
 		// Skip the full's manifest (i==0) when no last-applied is
@@ -919,12 +965,14 @@ func (b *SyncFromBackup) replayNewIncrementals(
 		}
 		bytesApplied, applyErr := b.applyIncremental(ctx, applier, link, batchSize, resumeFromID)
 		if applyErr != nil {
-			return newApplied, totalBytes, fmt.Errorf("incremental %s: %w",
+			return newApplied, totalBytes, incrCount, chunkCount, fmt.Errorf("incremental %s: %w",
 				lineage.ManifestBackupID(link.Manifest), applyErr)
 		}
 		newApplied = lineage.ManifestBackupID(link.Manifest)
 		resumeFromID = newApplied // this incremental is now fully applied
 		totalBytes += bytesApplied
+		incrCount++
+		chunkCount += len(link.Manifest.ChangeChunks)
 		slog.InfoContext(
 			ctx, "broker: incremental applied",
 			slog.String("stream_id", b.StreamID),
@@ -932,7 +980,7 @@ func (b *SyncFromBackup) replayNewIncrementals(
 			slog.Int64("bytes", bytesApplied),
 		)
 	}
-	return newApplied, totalBytes, nil
+	return newApplied, totalBytes, incrCount, chunkCount, nil
 }
 
 // verifyChainIntegrity brings the broker's live-apply path to

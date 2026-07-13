@@ -15,6 +15,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/notify"
+	"sluicesync.dev/sluice/internal/progress"
 )
 
 // Standalone target-metrics WATCH loop — the engine behind the
@@ -96,6 +97,21 @@ type MetricsWatchConfig struct {
 	// gauge. Set from the cmd layer's build vars.
 	BuildVersion string
 	BuildCommit  string
+
+	// Readout, when non-nil, is the ADR-0156 live-panel hook: instead of
+	// printing a per-sample line to Out, each tick pushes the sample as an
+	// ordered label/value list the TTY panel renders in place. Set ONLY on
+	// the pretty (TTY) path by the CLI; nil everywhere else, so the non-TTY
+	// sample-line output is byte-identical. When set it takes precedence over
+	// Print.
+	Readout func([]progress.Field)
+
+	// Event, when non-nil, forwards a fired threshold breach into the live
+	// panel's recent-events ring (level "WARN"/"ERROR"). Set ONLY on the
+	// pretty path; nil otherwise. Wired as an extra internal notify sink so
+	// breaches surface in the panel even when no external --notify-* sink is
+	// configured — the panel is a delivery target of its own.
+	Event func(level, text string)
 }
 
 // RunMetricsWatch runs the standalone watch loop against provider until ctx is
@@ -129,6 +145,12 @@ func RunMetricsWatch(ctx context.Context, provider ir.TargetTelemetry, cfg Metri
 
 	rules := buildMetricsNotifyRulesFrom(cfg.StorageUtil, cfg.CPUUtil, cfg.MemUtil, cfg.LagSeconds, cfg.StorageGrowthPerMin)
 	notifier := buildMetricsNotifierFrom(cfg.WebhookURL, cfg.SlackWebhookURL, cfg.SMTP)
+	// ADR-0156: on the pretty path, add an internal sink that forwards fired
+	// breaches into the live panel's events ring, so the panel is a delivery
+	// target even when no external --notify-* sink is configured.
+	if cfg.Event != nil {
+		notifier = notify.NewMultiNotifier(notifier, panelEventNotifier{emit: cfg.Event})
+	}
 	logger := slog.Default()
 	state := newMetricsNotifyState()
 	alerting := notifier != nil && len(rules) > 0
@@ -140,7 +162,14 @@ func RunMetricsWatch(ctx context.Context, provider ir.TargetTelemetry, cfg Metri
 	warmUpForSample(ctx, provider)
 
 	tick := func() {
-		if cfg.Print {
+		switch {
+		case cfg.Readout != nil:
+			// ADR-0156 pretty path: push the sample as a label/value readout
+			// the live panel renders in place (the panel owns stdout, so no
+			// per-sample line is printed).
+			snap, ok := provider.Sample(ctx)
+			cfg.Readout(metricsWatchReadoutFields(time.Now(), snap, ok))
+		case cfg.Print:
 			snap, ok := provider.Sample(ctx)
 			fmt.Fprintln(out, formatWatchLine(time.Now(), snap, ok))
 		}
@@ -240,6 +269,69 @@ func formatWatchLine(now time.Time, snap ir.TargetHealthSnapshot, ok bool) strin
 		snap.SampledAt.UTC().Format(time.RFC3339),
 		snap.Fresh(now, telemetryFreshnessWindow),
 	)
+}
+
+// metricsWatchReadoutFields renders one sample as the ADR-0156 live-panel
+// readout: an ordered label/value list (cpu, mem, storage with used/capacity,
+// lag, connections, fresh?). It honours the same *Known honesty contract as
+// [formatWatchLine] — an unobserved metric renders "n/a", never a misleading
+// 0 — and, when the poll produced no usable sample, collapses to a single
+// status row rather than a wall of "n/a". now is injected for deterministic
+// tests.
+func metricsWatchReadoutFields(now time.Time, snap ir.TargetHealthSnapshot, ok bool) []progress.Field {
+	if !ok {
+		return []progress.Field{{Label: "status", Value: "no fresh sample (provider warming up or last poll failed)"}}
+	}
+	frac := func(known bool, v float64) string {
+		if !known {
+			return "n/a"
+		}
+		return fmt.Sprintf("%.3f", v)
+	}
+	storage := frac(snap.StorageKnown, snap.StorageUtil)
+	if snap.StorageKnown && snap.StorageCapacityBytes > 0 {
+		usedGB := float64(snap.StorageCapacityBytes-snap.StorageAvailableBytes) / 1e9
+		capGB := float64(snap.StorageCapacityBytes) / 1e9
+		storage += fmt.Sprintf(" (used %.1fG/%.1fG)", usedGB, capGB)
+	}
+	lag := "n/a"
+	if snap.LagKnown {
+		lag = fmt.Sprintf("%.1fs", snap.ReplicaLagSeconds)
+	}
+	conns := "n/a"
+	if snap.ConnKnown {
+		conns = fmt.Sprintf("%d/%d", snap.ActiveConnections, snap.MaxConnections)
+	}
+	return []progress.Field{
+		{Label: "cpu", Value: frac(snap.CPUKnown, snap.CPUUtil)},
+		{Label: "mem", Value: frac(snap.MemKnown, snap.MemUtil)},
+		{Label: "storage", Value: storage},
+		{Label: "lag", Value: lag},
+		{Label: "connections", Value: conns},
+		{Label: "fresh", Value: fmt.Sprintf("%t", snap.Fresh(now, telemetryFreshnessWindow))},
+	}
+}
+
+// panelEventNotifier is the ADR-0156 internal notify sink that forwards a
+// fired threshold breach into the live panel's recent-events ring. It maps the
+// notification's severity to the panel's WARN/ERROR level and composes a
+// one-line summary. A never-failing sink (the panel push is in-memory), so it
+// never interferes with the failure-isolated fan-out to the real sinks.
+type panelEventNotifier struct{ emit func(level, text string) }
+
+func (p panelEventNotifier) Name() string { return "live-panel" }
+
+func (p panelEventNotifier) Notify(_ context.Context, n notify.Notification) error {
+	level := "WARN"
+	if n.Level == notify.LevelCritical {
+		level = "ERROR"
+	}
+	text := n.Title
+	if n.Body != "" {
+		text += " — " + n.Body
+	}
+	p.emit(level, text)
+	return nil
 }
 
 // startWatchExporter binds a tiny HTTP server serving GET /metrics (and

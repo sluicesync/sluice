@@ -56,6 +56,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -65,6 +66,7 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
+	"sluicesync.dev/sluice/internal/progress"
 )
 
 // DefaultRolloverWindow is the wall-clock cadence each rollover commits
@@ -262,6 +264,14 @@ type BackupStream struct {
 	// resolves to gzip (pre-ADR default).
 	Codec blobcodec.Codec
 
+	// Readout, when non-nil, is the ADR-0156 live-panel hook: each loop
+	// iteration pushes the stream's rolling state (cumulative incrementals
+	// rolled, current chain position, rollover cadence, last poll instant) as
+	// an ordered label/value list the TTY panel renders. Set ONLY on the
+	// pretty (TTY) path by the CLI; nil everywhere else, so the non-TTY log
+	// stream is byte-identical. Confined to Run's goroutine.
+	Readout func([]progress.Field)
+
 	// Now, when set, overrides the wall-clock-time source for
 	// [irbackup.Manifest.CreatedAt] and `stream_state.json` timestamps. Used
 	// by tests to pin timestamps; in production callers leave it nil
@@ -358,9 +368,13 @@ func (b *BackupStream) Run(ctx context.Context) error {
 	//    abort the loop loudly.
 	currentParent := init.parent
 	startPos := init.startPos
-	rolloverSeq := 0
-	retryConsecutive := 0
+	// totalRollovers is the ADR-0156 lifetime counter (survives the rotation
+	// reset of rolloverSeq); declared with the loop counters to keep Run's
+	// length within the funlen ceiling.
+	rolloverSeq, retryConsecutive, totalRollovers := 0, 0, 0
 	for {
+		// ADR-0156: refresh the live panel each window boundary (no-op absent one).
+		b.pushStreamReadout(currentParent, totalRollovers, rolloverWindow, clockNow())
 		// Stop-request check (cross-machine stop). A ctx cancel here
 		// short-circuits the same way: the captureWindow loop sees
 		// ctx.Done and returns; we drop into the cleanup block below.
@@ -505,7 +519,9 @@ func (b *BackupStream) Run(ctx context.Context) error {
 		}
 		currentParent = rc.newParent
 		startPos = rc.newStartPos
-		rolloverSeq++
+		// totalRollovers is the ADR-0156 lifetime counter; rolloverSeq resets
+		// on rotation, so the two advance together but diverge across a rotate.
+		rolloverSeq, totalRollovers = rolloverSeq+1, totalRollovers+1
 
 		// ADR-0046 §2/§6: in-process rotation. After each successful
 		// rollover, check the rotation thresholds against the OPEN
@@ -970,6 +986,31 @@ func (b *BackupStream) commitRollover(ctx context.Context, roll rolloverOutcome,
 		runRolloverHook(ctx, b.RolloverHook, roll.Manifest, manifestPath, roll.TotalChanges, roll.TotalBytes, elapsed)
 	}
 	return rolloverCommit{advanced: true, newParent: roll.Manifest, newStartPos: roll.Manifest.EndPosition}, nil
+}
+
+// pushStreamReadout feeds the ADR-0156 live panel one refresh of the stream's
+// rolling state (a no-op when no panel is attached). Shows the lifetime
+// incremental count, the current chain position (the parent the next rollover
+// chains off), the rollover cadence, and the poll instant.
+func (b *BackupStream) pushStreamReadout(parent *irbackup.Manifest, rollovers int, cadence time.Duration, now time.Time) {
+	if b.Readout == nil {
+		return
+	}
+	pos := "—"
+	if parent != nil {
+		switch {
+		case parent.BackupID != "":
+			pos = parent.BackupID
+		case parent.EndPosition.Token != "":
+			pos = parent.EndPosition.Token
+		}
+	}
+	b.Readout([]progress.Field{
+		{Label: "incrementals", Value: strconv.Itoa(rollovers)},
+		{Label: "position", Value: pos},
+		{Label: "cadence", Value: cadence.String()},
+		{Label: "last poll", Value: now.UTC().Format(time.RFC3339)},
+	})
 }
 
 // refuseSignedChain refuses to extend a signed (ADR-0154) chain from

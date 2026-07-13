@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -164,6 +165,97 @@ func runSyncStartLivePanel(ctx context.Context, s *SyncStartCmd, source, target 
 		fmt.Fprintln(os.Stdout, "sluice sync stopped.")
 	}
 	return streamerErr
+}
+
+// runReadoutLivePanel runs a continuous command (broker / backup stream /
+// metrics-watch) under the ADR-0156 GENERIC readout panel (phases 2/3). It is
+// the sibling of [runSyncStartLivePanel]: the command's loop runs in its own
+// goroutine (renderer isolation — a panel panic never aborts it), q/ctrl+c
+// drains-and-stops by CANCELLING the run context (which is the graceful stop
+// path for all three of these loops — the broker finishes its in-flight
+// incremental batch, the backup stream drains its in-flight rollover, and the
+// watch finishes its current tick), and WARN/ERROR records are forwarded into
+// the panel's bounded events ring via the same continuous slog gate as phase
+// 1.
+//
+// build is handed the constructed sink so the caller can wire the command's
+// Readout / Event hooks to it, and returns the loop to run against the panel's
+// (cancellable) context.
+func runReadoutLivePanel(
+	ctx context.Context,
+	header progress.LiveHeader,
+	build func(sink *progress.LiveTTYSink) func(context.Context) error,
+) error {
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// The drain-and-stop side effect the panel returns on q/ctrl+c: cancel
+	// the run context. For these loops a cancel IS the graceful drain (each
+	// commits its in-flight unit before returning), so there is no separate
+	// RequestStop to issue — unlike `sync start`'s streamer.
+	var stopCmd tea.Cmd = func() tea.Msg {
+		cancel()
+		return progress.NewStopResultMsg(nil)
+	}
+
+	var restoreOnce sync.Once
+	var restore func()
+	restoreAll := func() {
+		restoreOnce.Do(func() {
+			if restore != nil {
+				restore()
+			}
+		})
+	}
+	onRendererPanic := func(r any) {
+		restoreAll()
+		slog.Error("live panel: renderer panicked; continuing with structured logs",
+			slog.Any("panic", r))
+	}
+
+	sink := progress.NewLiveReadoutTTYSink(os.Stdout, header, stopCmd, onRendererPanic)
+	restore = silenceSlogForLivePanel(sink)
+
+	run := build(sink)
+	runErrCh := make(chan error, 1)
+	go func() { runErrCh <- run(runCtx) }()
+
+	panelDone := make(chan struct{})
+	go func() {
+		sink.Wait()
+		close(panelDone)
+	}()
+
+	var runErr error
+	select {
+	case runErr = <-runErrCh:
+		// The loop exited on its own (graceful drain after q, source EOF, or
+		// an error). Tear the panel down BEFORE restoring slog so no stray log
+		// line interleaves with the final frame.
+		sink.Quit()
+		restoreAll()
+	case <-panelDone:
+		// Operator force-quit (a second q/ctrl+c) while the loop was running:
+		// the panel already released the terminal, so restore slog, then
+		// cancel to stop the loop and collect its error.
+		restoreAll()
+		cancel()
+		runErr = <-runErrCh
+	}
+
+	// A cancel-initiated stop (q/ctrl+c or a process SIGINT) surfaces as nil on
+	// most loop paths but as context.Canceled on a few (e.g. a backup-stream
+	// transient-retry backoff that's interrupted mid-wait). Both are the clean
+	// stop the operator asked for — print "stopped" and exit 0, never an error.
+	if runErr == nil || errors.Is(runErr, context.Canceled) {
+		mode := header.Mode
+		if mode == "" {
+			mode = "sync"
+		}
+		fmt.Fprintf(os.Stdout, "sluice %s stopped.\n", mode)
+		return nil
+	}
+	return runErr
 }
 
 // pickLiveStream selects the stream row the panel tracks: the one matching

@@ -4,12 +4,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"time"
 
 	"sluicesync.dev/sluice/internal/notify"
 	"sluicesync.dev/sluice/internal/pipeline"
+	"sluicesync.dev/sluice/internal/progress"
 )
 
 // MetricsWatchCmd implements `sluice metrics-watch` — the standalone
@@ -89,7 +91,7 @@ func (m *MetricsWatchCmd) smtpConfig() notify.SMTPConfig {
 }
 
 // Run implements `sluice metrics-watch`.
-func (m *MetricsWatchCmd) Run(_ *Globals) error {
+func (m *MetricsWatchCmd) Run(g *Globals) error {
 	if _, err := resolveEngine(m.Engine); err != nil {
 		return operationalError{err: fmt.Errorf("--engine: %w", err)}
 	}
@@ -134,7 +136,33 @@ func (m *MetricsWatchCmd) Run(_ *Globals) error {
 		BuildVersion:        version,
 		BuildCommit:         commit,
 	}
-	if err := pipeline.RunMetricsWatch(ctx, telemetryProviderOrNil(provider), cfg); err != nil {
+	// ADR-0156 phase 3: the TTY-aware live panel. Renders only for an
+	// interactive, text-log, non-once invocation (--once is a scripted
+	// one-shot with no long-lived loop to render); the same [wantPrettyProgress]
+	// gate as the one-shot commands (metrics-watch has no --format json
+	// envelope, dry-run, or multi-namespace shape). Every other invocation
+	// keeps today's byte-identical sample-line stream.
+	pretty := wantPrettyProgress(g, false, false, false) && !m.Once
+	provNil := telemetryProviderOrNil(provider)
+	if pretty {
+		header := progress.LiveHeader{
+			Mode:   "metrics-watch",
+			Detail: "watching " + m.PlanetScaleMetricsDB + "  ·  " + m.PlanetScaleOrg,
+		}
+		err := runReadoutLivePanel(ctx, header, func(sink *progress.LiveTTYSink) func(context.Context) error {
+			cfg.Readout = sink.Readout
+			cfg.Event = sink.Event
+			return func(runCtx context.Context) error {
+				return pipeline.RunMetricsWatch(runCtx, provNil, cfg)
+			}
+		})
+		if err != nil {
+			return operationalError{err: err}
+		}
+		return nil
+	}
+
+	if err := pipeline.RunMetricsWatch(ctx, provNil, cfg); err != nil {
 		return operationalError{err: err}
 	}
 	return nil

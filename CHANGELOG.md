@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.239] - 2026-07-13
+
+### Added
+
+- **The TTY-aware live status panel now covers the remaining continuous commands — `sync from-backup run` (the broker), `backup stream run`, and `metrics-watch` — completing the ADR-0156 rollout.** Following `sync start` (v0.99.236), these long-running commands now render a live, in-place status panel at an interactive terminal instead of a scrolling log: a header with the command's mode, a mode-appropriate readout body that updates in place, a bounded recent-events region that surfaces WARN/ERROR (and, for `metrics-watch`, threshold breaches) as they occur, and a `q` / ctrl+c drain-and-stop footer. The broker shows the chain position, incrementals replayed, and chunks applied; `backup stream run` shows rollovers and position; `metrics-watch` shows the live CPU / memory / storage / lag / connections sample. Gating matches the rest of the pretty rollout exactly — the panel renders only when stdout is a terminal **and** `--log-format=text` **and** `--no-progress` is unset (and, for `metrics-watch`, not `--once`); every other invocation (piped, CI, `--log-format=json`, `--no-progress`) keeps the byte-identical structured output these commands have always emitted. The renderer is isolated from each command's work: a panel panic falls back to structured logging and never aborts the broker, stream, or watch. Notably, `metrics-watch` threshold breaches now surface in the panel even with no external `--notify-*` sink configured — the panel is a delivery target of its own.
+
 ## [0.99.238] - 2026-07-13
 
 ### Fixed

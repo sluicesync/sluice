@@ -1155,13 +1155,20 @@ func (b *BackupStreamCmd) Run(g *Globals) error {
 		defer func() { _ = closer() }()
 	}
 
-	slog.InfoContext(
-		ctx, "backup: starting stream",
-		slog.String("source_engine", source.Name()),
-		slog.String("destination", storeDesc),
-		slog.String("since", b.Since),
-		slog.Duration("rollover_window", b.RolloverWindow),
-	)
+	// ADR-0156: compute the pretty gate up-front. The pre-run INFO line below
+	// fires before runReadoutLivePanel installs the TTY slog gate, so on the
+	// pretty path it would leak above the live view; suppress it there (the
+	// panel is the interactive output). The non-TTY path is unchanged.
+	pretty := wantPrettyProgress(g, false, false, false)
+	if !pretty {
+		slog.InfoContext(
+			ctx, "backup: starting stream",
+			slog.String("source_engine", source.Name()),
+			slog.String("destination", storeDesc),
+			slog.String("since", b.Since),
+			slog.Duration("rollover_window", b.RolloverWindow),
+		)
+	}
 
 	encConfig, err := b.buildBackupEncryption()
 	if err != nil {
@@ -1188,6 +1195,24 @@ func (b *BackupStreamCmd) Run(g *Globals) error {
 		RetainRotateAt:            b.RetainRotateAt,
 		RetainRotateAtChainLength: b.RetainRotateAtChainLength,
 		Codec:                     codec,
+	}
+
+	// ADR-0156 phase 2: the TTY-aware live panel for the rolling-incremental
+	// cadence loop. Same [wantPrettyProgress] gate as the one-shot commands
+	// (this command has no --format json envelope / dry-run / multi-namespace
+	// shape). q/ctrl+c cancels the run context, which is the stream's graceful
+	// drain (it commits the in-flight rollover before exiting); every other
+	// invocation keeps today's byte-identical log stream.
+	if pretty {
+		header := progress.LiveHeader{
+			Mode:   "backup stream",
+			Source: source.Name(),
+			Target: storeDesc,
+		}
+		return runReadoutLivePanel(ctx, header, func(sink *progress.LiveTTYSink) func(context.Context) error {
+			stream.Readout = sink.Readout
+			return stream.Run
+		})
 	}
 	return stream.Run(ctx)
 }

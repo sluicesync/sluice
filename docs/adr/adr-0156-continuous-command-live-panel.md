@@ -1,6 +1,6 @@
 # ADR-0156: TTY-aware live status panel for continuous commands
 
-- Status: Accepted (phase 1 — `sync start` — shipped; phases 2–3 remain)
+- Status: Accepted (phases 1–3 shipped — `sync start`, `sync from-backup run` broker, `backup stream run`, and `metrics-watch` all on the live panel)
 - Date: 2026-07-12
 - Deciders: sluice maintainers
 - Related: ADR-0155 (TTY-aware pretty output for one-shot commands)
@@ -180,6 +180,47 @@ this package's brand styling.
   the panel leads with `freshness` (seconds-since-last-apply) and does not imply
   a byte-lag it cannot compute.
 
-**Remaining rollout:** phase 2 (`sync from-backup run` broker + `backup stream
-run`) and phase 3 (`metrics-watch`) still emit their current output — they are
-unchanged by this chunk and adopt the shared panel later.
+## Implementation notes (phases 2–3 — broker, backup stream, metrics-watch)
+
+Phases 2 (`sync from-backup run` broker + `backup stream run`) and 3
+(`metrics-watch`) reuse the phase-1 `livePanel` / `LiveTTYSink` chrome (header,
+bounded events ring, footer, drain-and-stop) but render a **generic
+mode-appropriate readout body** rather than phase 1's CDC-specific position /
+freshness / rows body — those commands' steady-state signals are a different
+shape.
+
+- **A generic readout path was added, not an overload of `LiveStatus`.** The
+  sink gained `Readout([]progress.Field)` (reusing the existing
+  `progress.Field{Label, Value}`); the panel gained a `readoutMsg`, a
+  `readoutMode` flag (set by the new `newReadoutPanel` / `NewLiveReadoutTTYSink`
+  constructors), and a `readoutBody` that renders the ordered label/value list
+  (a dimmed "starting…" placeholder until the first push). `sync start` KEEPS
+  its `LiveStatus` / `EnterCDC` / `Status` / `cdcBody` path untouched — its panel
+  and non-TTY output stay byte-identical (the phase-1 teatests + the
+  v0.99.236 golden path still pin it). The header gained a `Mode` word (defaulting
+  to "sync" so phase 1's brand is unchanged) and a `Detail` line (metrics-watch's
+  "watching <db> · <org>", which has no source→target route).
+
+- **Each command feeds the readout from its own loop via a nil-safe hook.** The
+  broker's `SyncFromBackup.Readout`, the stream's `BackupStream.Readout`, and
+  `MetricsWatchConfig.Readout` are set ONLY on the pretty (TTY) path by the CLI;
+  nil everywhere else, so the non-TTY log / sample-line stream is byte-identical
+  by construction. The broker pushes each tick (last-applied chain position,
+  cumulative incrementals + chunks, last poll); the stream pushes each window
+  boundary (lifetime incrementals rolled, current position, cadence, last poll);
+  metrics-watch pushes each sample (cpu / mem / storage-with-used/capacity / lag
+  / connections / fresh?).
+
+- **Events + drain-stop are shared, gated identically to phase 1.** WARN/ERROR
+  records forward into the events ring through the same continuous slog gate
+  (`silenceSlogForLivePanel`). For metrics-watch, a threshold breach has no slog
+  line, so an internal `panelEventNotifier` is added to the notify fan-out on the
+  pretty path (making the panel a delivery target of its own — breaches surface
+  even with no external `--notify-*` sink). q/ctrl+c drains-and-stops by
+  CANCELLING the run context, which is the graceful stop for all three loops
+  (the broker finishes its in-flight incremental batch, the stream commits its
+  in-flight rollover, the watch finishes its current tick) — unlike `sync
+  start`, none of these has a separate `RequestStop` to issue. The shared
+  `runReadoutLivePanel` CLI helper wires this (renderer isolation, panel-panic
+  fallback to structured logging, and the final "sluice <mode> stopped." line).
+  `metrics-watch --once` never panels (no long-lived loop).

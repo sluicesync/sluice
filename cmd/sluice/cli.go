@@ -813,7 +813,7 @@ type SyncFromBackupCmd struct {
 }
 
 // Run implements `sluice sync from-backup run`.
-func (s *SyncFromBackupCmd) Run(_ *Globals) error {
+func (s *SyncFromBackupCmd) Run(g *Globals) error {
 	target, err := resolveEngine(s.TargetDriver)
 	if err != nil {
 		return fmt.Errorf("--target-driver: %w", err)
@@ -888,6 +888,25 @@ func (s *SyncFromBackupCmd) Run(_ *Globals) error {
 		Envelope:         envelope,
 		VerifyKey:        verifyKey,
 		RequireSignature: s.RequireSignature,
+	}
+
+	// ADR-0156 phase 2: the TTY-aware live panel for the broker's
+	// poll-and-replay loop. Same [wantPrettyProgress] gate as the one-shot
+	// commands (this command has no --format json envelope / dry-run /
+	// multi-namespace shape). q/ctrl+c cancels the run context, which is the
+	// broker's graceful drain (it finishes the in-flight incremental's batch);
+	// every other invocation keeps today's byte-identical log stream.
+	if wantPrettyProgress(g, false, false, false) {
+		header := progress.LiveHeader{
+			Mode:     "broker",
+			Source:   storeDesc,
+			Target:   target.Name(),
+			StreamID: s.StreamID,
+		}
+		return runReadoutLivePanel(ctx, header, func(sink *progress.LiveTTYSink) func(context.Context) error {
+			broker.Readout = sink.Readout
+			return broker.Run
+		})
 	}
 	return broker.Run(ctx)
 }
