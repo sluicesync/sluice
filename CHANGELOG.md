@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.241] - 2026-07-13
+
+### Fixed
+
+- **`restore` no longer leaks a "restore: starting full restore" INFO line above the live panel at a TTY (ADR-0155 polish).** The pre-run `slog` line fired before `runWithProgress` installed the TTY slog gate, so on the pretty path it printed above the restore checklist panel — the same class of leak v0.99.238 fixed for `backup full` / `backup incremental` and v0.99.240 fixed for `sync start` / `metrics-watch`, but `restore` was missed in that sweep. The pretty gate is now computed up front and both the "starting" INFO and the optional PlanetScale telemetry-enabled INFO are suppressed on the interactive path (the panel is the output there); the telemetry provider itself is unchanged. Non-TTY / `--log-format=json` / `--no-progress` output is byte-identical to prior releases — the lines still emit exactly as before when not rendering the live view. This completes the pre-panel-INFO-leak sweep across every command that renders a live view.
+
 ## [0.99.240] - 2026-07-13
 
 ### Fixed

@@ -1779,6 +1779,13 @@ func (r *RestoreCmd) run(g *Globals, env *envelopeRun) error {
 
 	ctx := kongContext()
 
+	// ADR-0155: whether the pretty TTY view will render. Computed up front —
+	// before the pre-run INFO lines and the telemetry build below — so those
+	// lines can be suppressed on the pretty path; they fire before
+	// runWithProgress installs the TTY slog gate and would otherwise leak above
+	// the live view. (The v238 backup fix, extended to `restore`.)
+	pretty := wantPrettyProgress(g, env.jsonMode, false, false)
+
 	// --control-keyspace is a TARGET concept (the control tables live on the
 	// target): a chain restore's incremental replay creates the CDC control
 	// tables, which a sharded PlanetScale/Vitess target rejects without a
@@ -1803,11 +1810,15 @@ func (r *RestoreCmd) run(g *Globals, env *envelopeRun) error {
 		defer func() { _ = closer() }()
 	}
 
-	slog.InfoContext(
-		ctx, "restore: starting full restore",
-		slog.String("target_engine", target.Name()),
-		slog.String("source", storeDesc),
-	)
+	if !pretty {
+		// Suppressed on the pretty path so it does not leak above the panel; the
+		// live view is the output there (the panel header carries the context).
+		slog.InfoContext(
+			ctx, "restore: starting full restore",
+			slog.String("target_engine", target.Name()),
+			slog.String("source", storeDesc),
+		)
+	}
 
 	// Phase 6.1: read the chain-root manifest first to extract any
 	// recorded Argon2id params, so the restore-side envelope's KEK
@@ -1833,6 +1844,7 @@ func (r *RestoreCmd) run(g *Globals, env *envelopeRun) error {
 		branch:    r.PlanetScaleMetricsBranch,
 		targetDSN: r.Target,
 		engine:    r.TargetDriver,
+		quiet:     pretty, // no telemetry-enabled INFO above the panel (ADR-0156 polish)
 	})
 	if err != nil {
 		return err
@@ -1867,8 +1879,9 @@ func (r *RestoreCmd) run(g *Globals, env *envelopeRun) error {
 	// Validation is done; errors past this point classify as "failed"
 	// (not "refused") in the --format json envelope.
 	env.markEngaged()
-	// ADR-0155: pretty TTY view for an interactive, non-envelope run.
-	pretty := wantPrettyProgress(g, env.jsonMode, false, false)
+	// ADR-0155: pretty TTY view for an interactive, non-envelope run. `pretty`
+	// was computed up front (before the pre-run INFO / telemetry build) so those
+	// lines could be suppressed on the panel path.
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	return runWithProgress(pretty, cancel, backup.RestoreProgressSpec,
