@@ -65,11 +65,29 @@ func TestModelPhaseTransitions(t *testing.T) {
 	tm.Send(summaryMsg{result: Result{Tables: 3, Rows: 12345}})
 
 	tm.WaitFinished(t, teatest.WithFinalTimeout(3*time.Second))
+
+	// The live view clears on quit (View returns "" when done) — the summary
+	// is printed by TTYSink AFTER the program exits, so it is not in the
+	// program's own output. Assert on the final model's summaryView, which is
+	// exactly what TTYSink writes.
+	fm, ok := tm.FinalModel(t).(model)
+	if !ok {
+		t.Fatalf("final model is %T, want progress.model", tm.FinalModel(t))
+	}
+	if !fm.done {
+		t.Fatal("final model not marked done after summaryMsg")
+	}
+	// And the live frames must have cleared cleanly (no leftover checklist in
+	// the final program output).
 	out, err := io.ReadAll(tm.FinalOutput(t))
 	if err != nil {
 		t.Fatalf("read final output: %v", err)
 	}
-	final := string(out)
+	if strings.Contains(string(out), "sluice migrate - complete") {
+		t.Error("summary must be printed post-program by TTYSink, not inside the bubbletea frame")
+	}
+
+	summary := fm.summaryView()
 	for _, want := range []string{
 		"sluice migrate - complete",
 		"Tables",
@@ -80,8 +98,8 @@ func TestModelPhaseTransitions(t *testing.T) {
 		"Warnings",
 		"constraint attached degraded",
 	} {
-		if !strings.Contains(final, want) {
-			t.Errorf("final summary frame missing %q\n---\n%s\n---", want, final)
+		if !strings.Contains(summary, want) {
+			t.Errorf("summary missing %q\n---\n%s\n---", want, summary)
 		}
 	}
 }
@@ -109,6 +127,24 @@ func TestLiveViewSnapshot(t *testing.T) {
 	}, "\n")
 	if got := m.liveView(); got != want {
 		t.Errorf("live view drift:\n got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// TestActiveRowEstExceeded pins Fix B: when the copy passes the row-count
+// estimate (done>total — routine for an undershooting InnoDB estimate), the
+// bar stays full but the row shows "100%+" and "est. exceeded" so it reads
+// as still-progressing rather than stuck.
+func TestActiveRowEstExceeded(t *testing.T) {
+	m := apply(
+		fixedModel(0),
+		phaseStartedMsg{phase: ir.MigrationPhaseBulkCopy},
+		tableProgressMsg{table: "events", done: 1500000, total: 1000000},
+	)
+	row := m.renderActiveTable()
+	for _, want := range []string{"100%+", "1,500,000 rows, est. exceeded", "[####################]"} {
+		if !strings.Contains(row, want) {
+			t.Errorf("est-exceeded active row missing %q\n got: %s", want, row)
+		}
 	}
 }
 
@@ -177,7 +213,10 @@ func TestSummaryWarningTruncatedToWidth(t *testing.T) {
 		warnMsg{text: long},
 		summaryMsg{result: Result{Tables: 1, Rows: 100}},
 	)
-	view := m.View()
+	// Fix A: once done, View() returns "" (the summary is printed by TTYSink
+	// after the program exits, so the inline renderer can't clip the box).
+	// Assert on summaryView() — exactly the string TTYSink writes.
+	view := m.summaryView()
 	if !strings.Contains(view, "...") {
 		t.Errorf("long warning should be truncated with '...'; view:\n%s", view)
 	}

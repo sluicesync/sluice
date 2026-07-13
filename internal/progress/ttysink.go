@@ -34,6 +34,7 @@ import (
 // — it quits the program, which prints the final summary View.
 type TTYSink struct {
 	prog *tea.Program
+	w    io.Writer
 	done chan struct{}
 	// onInterrupt is invoked once, after the program returns, iff the
 	// operator interrupted (ctrl+c) or the program was killed by a
@@ -52,16 +53,22 @@ var _ Sink = (*TTYSink)(nil)
 func NewTTYSink(w io.Writer, onInterrupt func()) *TTYSink {
 	m := newModel(time.Now(), time.Now)
 	p := tea.NewProgram(m, tea.WithOutput(w))
-	s := &TTYSink{prog: p, done: make(chan struct{}), onInterrupt: onInterrupt}
+	s := &TTYSink{prog: p, w: w, done: make(chan struct{}), onInterrupt: onInterrupt}
 	go func() {
 		defer close(s.done)
 		final, err := p.Run()
-		interrupted := err != nil
-		if fm, ok := final.(model); ok && fm.interrupted {
-			interrupted = true
-		}
-		if interrupted && s.onInterrupt != nil {
+		fm, _ := final.(model)
+		if (err != nil || fm.interrupted) && s.onInterrupt != nil {
 			s.onInterrupt()
+		}
+		// Print the summary panel HERE — after bubbletea has released the
+		// terminal — as a plain write, so the inline renderer can't clip the
+		// box's bottom border on quit (View returns "" once done, clearing
+		// the live checklist first). Only when the run reached a summary
+		// (fm.done); an abort/interrupt leaves nothing printed, and its
+		// error surfaces through the CLI's error path.
+		if fm.done && s.w != nil {
+			_, _ = io.WriteString(s.w, fm.summaryView()+"\n")
 		}
 	}()
 	return s

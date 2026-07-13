@@ -164,10 +164,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// View renders the live checklist, or the static summary once done.
+// View renders the live checklist while running. Once done it returns the
+// empty string so bubbletea clears the live view on quit; the static
+// summary is printed by [TTYSink] AFTER the program exits, as a plain write
+// to the terminal. This sidesteps the inline (non-altscreen) renderer
+// clipping the last line of its final frame on Quit — which was dropping
+// the summary box's bottom border.
 func (m model) View() string {
 	if m.done {
-		return m.summaryView()
+		return ""
 	}
 	return m.liveView()
 }
@@ -221,23 +226,33 @@ func (m model) renderPhaseRow(r phaseRow) string {
 }
 
 // renderActiveTable renders the current table's name, bar, and count.
+//
+// The done>total case is routine, not an error: the row-count total is an
+// ESTIMATE (for a MySQL source it is InnoDB's information_schema.table_rows,
+// which routinely undershoots — it can even read 0 for a freshly-loaded
+// table), so a live copy sails past 100%. Clamping the bar to full and
+// leaving it there reads as "stuck". So when the estimate is exceeded we
+// keep the bar full but mark the percentage "100%+" and annotate the
+// (always-climbing) row count "est. exceeded" — the row count is the source
+// of truth and it keeps moving, which resolves the "is it still working?"
+// confusion.
 func (m model) renderActiveTable() string {
 	st := m.tables[m.active]
 	var frac float64
 	pct := ""
-	if st.total > 0 {
+	estExceeded := st.total > 0 && st.done > st.total
+	switch {
+	case estExceeded:
+		frac = 1
+		pct = " 100%+"
+	case st.total > 0:
 		frac = float64(st.done) / float64(st.total)
-		// The row-count total is an ESTIMATE (for a MySQL source it is
-		// InnoDB's information_schema.table_rows, which routinely undershoots
-		// — it can even read 0 for a freshly-loaded table), so done can
-		// exceed it mid-copy. Clamp to 1.0 so the bar/percentage never render
-		// a nonsensical >100%.
-		if frac > 1 {
-			frac = 1
-		}
 		pct = fmt.Sprintf(" %3.0f%%", frac*100)
 	}
 	count := fmt.Sprintf("(%s rows)", humanCount(st.done))
+	if estExceeded {
+		count = fmt.Sprintf("(%s rows, est. exceeded)", humanCount(st.done))
+	}
 	return fmt.Sprintf("%-24s %s%s  %s",
 		clipName(m.active, 24), renderBar(frac, 20), pct, dimStyle.Render(count))
 }
