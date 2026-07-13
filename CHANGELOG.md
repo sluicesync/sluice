@@ -4,6 +4,16 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.237] - 2026-07-13
+
+### Added
+
+- **The `sync start` live panel now shows a truthful cumulative rows-applied count and live throughput (ADR-0156 phase 2).** This fills the v0.99.236 panel's `rows: n/a (phase 1)` gap with a real, persisted counter: sluice now tracks a lifetime cumulative count of row-level changes (INSERT + UPDATE + DELETE) applied to the target in the CDC control table, incremented **in the same transaction that advances the stream position** — so the counter can never lead the durable position, and a rolled-back or failed batch contributes nothing. The panel renders the count and computes throughput itself from successive readings (guarding the first reading and any zero/negative time or non-monotonic delta, so it never shows a negative or a bogus spike). The count is also surfaced on `ir.StreamStatus.RowsApplied` (via `ListStreams`), available for a future `sync status` field. **Semantics (documented, and honest about it):** the counter counts rows *applied* — after a warm-resume, CDC re-delivers a bounded already-applied tail that is re-applied idempotently and re-counted, so the lifetime total can slightly *exceed* the distinct source-change count. It is never an under-count and never counts uncommitted rows. Engines: Postgres and MySQL (the CDC-target appliers; the Postgres-trigger engine inherits it via Postgres). The count is exactly-once across all three apply paths — serial per-change, the batched loop (mid-transaction flushes carry their DML forward and fold it into the boundary write after the commit succeeds), and the concurrent key-hash lane apply (the coordinator aggregates each lane's committed DML at the durable-across-lanes checkpoint boundary).
+
+### Compatibility
+
+- **Additive control-table column, no break.** The `rows_applied BIGINT NOT NULL DEFAULT 0` column is added to the CDC control table on the same detect-then-`ALTER` / `ADD COLUMN IF NOT EXISTS` path as the existing `slot_name` / `source_dsn_fingerprint` / `target_schema` columns; legacy rows and streams that pre-date the column read as `0` and start counting from the first post-upgrade apply (pre-upgrade applies were never tracked). No manual migration; existing streams resume cleanly.
+
 ## [0.99.236] - 2026-07-13
 
 ### Added
