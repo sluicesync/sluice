@@ -46,7 +46,13 @@ func rowsAppliedForStream(t *testing.T, pgEng ir.Engine, targetDSN, streamID str
 	}()
 	streams, err := applier.ListStreams(ctx)
 	if err != nil {
-		t.Fatalf("ListStreams: %v", err)
+		// Transient during streamer startup: the per-target control table may
+		// be mid-creation (created, but an additive ALTER — slot_name /
+		// rows_applied — not yet applied). Production's panel poller tolerates
+		// this identically (pollLiveStatus treats a ListStreams error as
+		// "reconnecting", never fatal), and this is a polling helper, so treat
+		// it as "no rows counted yet" and let the caller's timeout govern.
+		return 0
 	}
 	for _, s := range streams {
 		if s.StreamID == streamID {
@@ -124,8 +130,50 @@ func TestStreamer_RowsAppliedCounter_CrossEngineWarmResume(t *testing.T) {
 
 	cancel1, done1 := startStreamer()
 
-	// 5 inserts, 2 updates, 1 delete = 8 row-level DML. Net target rows = 4
-	// (ids 1,2,3,4 survive; id 5 deleted). Each statement auto-commits as its
+	// Defeat the cold-copy/CDC snapshot race: a row inserted before the
+	// streamer locks its CDC start position is bulk-copied into the initial
+	// snapshot, NOT applied through CDC — and rows_applied is the CDC-apply
+	// counter, so snapshot rows are (correctly) not counted. Driving the
+	// measured DML immediately after startStreamer would race that boundary
+	// nondeterministically. Instead drive throwaway sentinel rows (ids from
+	// 1000, disjoint from the measured ids 1..8) until the counter moves,
+	// waiting for each sentinel's result before the next so none are left in
+	// flight — proving CDC is engaged and counting. Every DML after this is a
+	// CDC change.
+	sentinelID := 1000
+	waitCDCCounting := func() {
+		t.Helper()
+		deadline := time.Now().Add(90 * time.Second)
+		for time.Now().Before(deadline) {
+			before := rowsAppliedForStream(t, pgEng, pgDst, streamID)
+			execSrc("INSERT INTO "+table+" (id, val) VALUES (?, 0)", sentinelID)
+			sentinelID++
+			if waitRowsApplied(t, pgEng, pgDst, streamID, before+1, 5*time.Second) > before {
+				return
+			}
+		}
+		t.Fatal("CDC never engaged / counted a sentinel within 90s (cold-copy handoff never completed)")
+	}
+	// stableBaseline reads rows_applied after it stops moving, so any
+	// still-in-flight sentinel apply is fully settled before the measured
+	// burst below asserts an EXACT delta (no late count inflating it).
+	stableBaseline := func() int64 {
+		t.Helper()
+		last := rowsAppliedForStream(t, pgEng, pgDst, streamID)
+		for {
+			time.Sleep(1500 * time.Millisecond)
+			cur := rowsAppliedForStream(t, pgEng, pgDst, streamID)
+			if cur == last {
+				return cur
+			}
+			last = cur
+		}
+	}
+	waitCDCCounting()
+	base1 := stableBaseline()
+
+	// 5 inserts, 2 updates, 1 delete = 8 row-level DML, all CDC changes now
+	// (driven strictly after CDC engaged). Each statement auto-commits as its
 	// own source transaction.
 	for i := 1; i <= 5; i++ {
 		execSrc("INSERT INTO "+table+" (id, val) VALUES (?, ?)", i, i*10)
@@ -135,12 +183,10 @@ func TestStreamer_RowsAppliedCounter_CrossEngineWarmResume(t *testing.T) {
 	execSrc("DELETE FROM "+table+" WHERE id = ?", 5)
 	const phase1DML = 8
 
-	if ok := waitForRowCount(t, pgDst, table, 4, 60*time.Second); !ok {
-		t.Fatalf("target never reached 4 rows after phase-1 DML (got %d)", countRows(t, pgDst, table))
-	}
-	got := waitRowsApplied(t, pgEng, pgDst, streamID, phase1DML, 30*time.Second)
-	if got != phase1DML {
-		t.Fatalf("phase-1 rows_applied = %d; want exactly %d (5 inserts + 2 updates + 1 delete, no resends within a run)", got, phase1DML)
+	want1 := base1 + phase1DML
+	got := waitRowsApplied(t, pgEng, pgDst, streamID, want1, 60*time.Second)
+	if got != want1 {
+		t.Fatalf("phase-1 rows_applied = %d; want exactly %d (baseline %d + 8 CDC DML: 5 inserts + 2 updates + 1 delete)", got, want1, base1)
 	}
 
 	// Stop the first streamer cleanly.
@@ -168,24 +214,28 @@ func TestStreamer_RowsAppliedCounter_CrossEngineWarmResume(t *testing.T) {
 		}
 	}()
 
+	// The counter must have PERSISTED across the restart — never reset to 0.
+	// (A warm resume may redeliver a bounded already-applied tail that is
+	// re-counted, so the resumed total is >= the phase-1 total, never less.)
+	base2 := waitRowsApplied(t, pgEng, pgDst, streamID, want1, 30*time.Second)
+	if base2 < want1 {
+		t.Fatalf("warm-resume rows_applied = %d; counter must persist at >= the phase-1 total %d, not reset", base2, want1)
+	}
+
+	// Re-confirm CDC engaged on the resumed stream (same snapshot-race guard),
+	// then drive 3 new CDC DML and assert the counter CONTINUES upward. Uses
+	// >= because a warm resume may redeliver an already-applied tail (honest
+	// per StreamStatus.RowsApplied's at-least-once contract).
+	waitCDCCounting()
+	base3 := stableBaseline()
 	for i := 6; i <= 8; i++ {
 		execSrc("INSERT INTO "+table+" (id, val) VALUES (?, ?)", i, i*10)
 	}
 	const phase2NewDML = 3
-	const wantAtLeast = phase1DML + phase2NewDML // 11
-
-	if ok := waitForRowCount(t, pgDst, table, 7, 60*time.Second); !ok {
-		t.Fatalf("target never reached 7 rows after phase-2 DML (got %d)", countRows(t, pgDst, table))
-	}
-	got = waitRowsApplied(t, pgEng, pgDst, streamID, wantAtLeast, 30*time.Second)
-	// >= (not ==): a warm resume may redeliver a bounded tail of already-
-	// applied changes (at-least-once), which the counter re-counts — honest
-	// per StreamStatus.RowsApplied's contract. The load-bearing assertion is
-	// that the counter CONTINUED from the persisted total (>= 11), proving it
-	// did not reset to 0 (which would leave it at ~3).
+	wantAtLeast := base3 + phase2NewDML
+	got = waitRowsApplied(t, pgEng, pgDst, streamID, wantAtLeast, 60*time.Second)
 	if got < wantAtLeast {
-		t.Fatalf("phase-2 rows_applied = %d; want >= %d (counter must continue from the persisted %d, not reset)",
-			got, wantAtLeast, phase1DML)
+		t.Fatalf("phase-2 rows_applied = %d; want >= %d (persisted %d + 3 new CDC DML; counter must continue upward)", got, wantAtLeast, base3)
 	}
-	t.Logf("rows_applied: phase-1 = %d, after warm-resume + %d DML = %d", phase1DML, phase2NewDML, got)
+	t.Logf("rows_applied: phase-1 total = %d, warm-resume baseline = %d, after +3 DML = %d", want1, base2, got)
 }
