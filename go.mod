@@ -48,7 +48,7 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.53.0
 	pgregory.net/rapid v1.3.0
-	vitess.io/vitess v0.24.1
+	vitess.io/vitess v0.24.2
 )
 
 require (
