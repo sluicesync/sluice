@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
+	"sluicesync.dev/sluice/internal/progress"
 )
 
 // CutoverCmd implements `sluice cutover`. The two-phase sequence
@@ -133,10 +135,27 @@ func (c *CutoverCmd) Run(g *Globals) error {
 		Filter:       filter,
 		TargetSchema: c.TargetSchema,
 	}
-	report, runErr := cut.Run(kongContext())
-	// Always render whatever was accumulated — operators piping into
-	// metrics tooling benefit from the partial result on failures.
-	if report != nil {
+
+	// ADR-0155: pretty TTY view only for an interactive text-report run to
+	// stdout (not --format json, and gated by the shared wantPrettyProgress).
+	// When pretty, the live view owns stdout, so the per-table report is
+	// suppressed — the summary panel (driven inside cut.Run) replaces it.
+	pretty := (c.Format == "" || c.Format == "text") &&
+		wantPrettyProgress(g, false, false, false)
+	ctx, cancel := context.WithCancel(kongContext())
+	defer cancel()
+	var report *ir.SequencePrimeReport
+	runErr := runWithProgress(pretty, cancel, pipeline.CutoverProgressSpec,
+		func(s progress.Sink) { cut.Progress = s },
+		func() error {
+			var e error
+			report, e = cut.Run(ctx)
+			return e
+		})
+	// Render whatever was accumulated — operators piping into metrics tooling
+	// benefit from the partial result on failures. Suppressed under the pretty
+	// view, which owns stdout (the summary panel is the interactive rollup).
+	if report != nil && !pretty {
 		renderCutoverReport(report, c.Format)
 	}
 	if runErr != nil {
@@ -164,28 +183,24 @@ func renderCutoverReport(report *ir.SequencePrimeReport, format string) {
 		fmt.Println("cutover: no identity / AUTO_INCREMENT columns or standalone sequences in the source schema (nothing to prime)")
 		return
 	}
-	var primed, noop, skipped, refused int
 	for _, a := range report.Actions {
 		subject := cutoverActionSubject(a)
 		switch a.Outcome {
 		case "primed":
-			primed++
 			fmt.Printf("primed:   %s — source=%d, target=%d -> %d\n",
 				subject, a.SourceValue, a.TargetBefore, a.TargetAfter)
 		case "noop":
-			noop++
 			fmt.Printf("noop:     %s — target=%d already at or above apply point (source=%d)\n",
 				subject, a.TargetBefore, a.SourceValue)
 		case "skipped":
-			skipped++
 			fmt.Printf("skipped:  %s — %s\n", subject, a.Reason)
 		case "refused":
-			refused++
 			fmt.Printf("REFUSED:  %s — %s\n", subject, a.Reason)
 		default:
 			fmt.Printf("unknown:  %s — outcome=%q\n", subject, a.Outcome)
 		}
 	}
+	primed, noop, skipped, refused := report.Counts()
 	fmt.Printf("\ncutover: %d primed, %d noop, %d skipped, %d refused\n",
 		primed, noop, skipped, refused)
 }

@@ -14,7 +14,45 @@ import (
 	sqlitetrigger "sluicesync.dev/sluice/internal/engines/sqlite-trigger"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline"
+	"sluicesync.dev/sluice/internal/progress"
 )
+
+// Trigger pretty-view phases + specs (ADR-0155 phase 2). The `trigger`
+// commands are CLI-orchestrated (single engine calls, no pipeline Run with
+// a Progress field), so the CLI drives these one-phase checklists inline;
+// on the non-TTY path the sink is [progress.Nop] and the historical stdout
+// output is byte-identical. --dry-run always selects the non-pretty path
+// (wantPrettyProgress excludes it) so the DDL preview keeps its exact shape.
+var (
+	triggerPhaseInstall = progress.Phase{Key: "install", Label: "Install"}
+	triggerPhaseRemove  = progress.Phase{Key: "remove", Label: "Remove"}
+	triggerPhasePrune   = progress.Phase{Key: "prune", Label: "Prune"}
+
+	triggerSetupProgressSpec = progress.Spec{
+		Title:      "sluice trigger setup",
+		Phases:     []progress.Phase{triggerPhaseInstall},
+		LabelWidth: 14,
+	}
+	triggerTeardownProgressSpec = progress.Spec{
+		Title:      "sluice trigger teardown",
+		Phases:     []progress.Phase{triggerPhaseRemove},
+		LabelWidth: 14,
+	}
+	triggerPruneProgressSpec = progress.Spec{
+		Title:      "sluice trigger prune",
+		Phases:     []progress.Phase{triggerPhasePrune},
+		LabelWidth: 12,
+	}
+)
+
+// pgtriggerSetupMode names the DDL-detection mode a `trigger setup` plan
+// landed in, shared by the stdout applied-line and the pretty summary panel.
+func pgtriggerSetupMode(plan *pgtrigger.Plan) string {
+	if !plan.EventTriggerSupported {
+		return "polled-fingerprint-only"
+	}
+	return "event-trigger + polling"
+}
 
 // triggerDrivers is the set of trigger-CDC source engines the `sluice trigger`
 // commands install/remove. The default ("postgres-trigger") preserves the
@@ -64,7 +102,7 @@ type TriggerSetupCmd struct {
 }
 
 // Run implements `sluice trigger setup`.
-func (c *TriggerSetupCmd) Run(_ *Globals) error {
+func (c *TriggerSetupCmd) Run(g *Globals) error {
 	if c.DSN == "" {
 		return errors.New("--dsn is required")
 	}
@@ -73,27 +111,55 @@ func (c *TriggerSetupCmd) Run(_ *Globals) error {
 	}
 	switch c.SourceDriver {
 	case triggerDriverSQLite:
-		return c.runSQLiteLike(triggerDriverSQLite, sqlitetrigger.Setup)
+		return c.runSQLiteLike(g, triggerDriverSQLite, sqlitetrigger.Setup)
 	case triggerDriverD1:
-		return c.runSQLiteLike(triggerDriverD1, sqlitetrigger.SetupD1)
+		return c.runSQLiteLike(g, triggerDriverD1, sqlitetrigger.SetupD1)
 	}
-	ctx := kongContext()
-	plan, err := pgtrigger.Setup(ctx, c.DSN, pgtrigger.SetupOptions{
-		Tables:                 c.Tables,
-		Schema:                 c.Schema,
-		DryRun:                 c.DryRun,
-		AllowPolledFingerprint: c.AllowPolledFingerprint,
-		CapturePayload:         pgtrigger.CapturePayload(c.CapturePayload),
-	})
+
+	// ADR-0155: pretty TTY view for an interactive apply. --dry-run excludes
+	// pretty (wantPrettyProgress), so the DDL preview keeps its exact shape;
+	// refusals are printed AFTER the live view tears down (never mid-render).
+	pretty := wantPrettyProgress(g, false, c.DryRun, false)
+	runCtx, cancel := context.WithCancel(kongContext())
+	defer cancel()
+	var (
+		plan *pgtrigger.Plan
+		sink progress.Sink = progress.Nop{}
+	)
+	runErr := runWithProgress(pretty, cancel, triggerSetupProgressSpec,
+		func(s progress.Sink) { sink = s },
+		func() error {
+			sink.PhaseStarted(triggerPhaseInstall)
+			var e error
+			plan, e = pgtrigger.Setup(runCtx, c.DSN, pgtrigger.SetupOptions{
+				Tables:                 c.Tables,
+				Schema:                 c.Schema,
+				DryRun:                 c.DryRun,
+				AllowPolledFingerprint: c.AllowPolledFingerprint,
+				CapturePayload:         pgtrigger.CapturePayload(c.CapturePayload),
+			})
+			if (plan != nil && len(plan.Refusals) > 0) || e != nil {
+				return e
+			}
+			sink.PhaseCompleted(triggerPhaseInstall)
+			if pretty {
+				sink.Summary(progress.Result{Fields: []progress.Field{
+					{Label: "Statements", Value: progress.HumanCount(int64(len(plan.Statements)))},
+					{Label: "DDL detection", Value: pgtriggerSetupMode(plan)},
+					{Label: "PG version", Value: fmt.Sprintf("%d", plan.PGVersionNum)},
+				}})
+			}
+			return nil
+		})
 	if plan != nil && len(plan.Refusals) > 0 {
 		fmt.Fprintln(os.Stderr, "trigger setup refused — see refusals below:")
 		for _, r := range plan.Refusals {
 			fmt.Fprintf(os.Stderr, "  - %s.%s: %s\n      → %s\n", r.Schema, r.Table, r.Reason, r.Hint)
 		}
-		return err
+		return runErr
 	}
-	if err != nil {
-		return err
+	if runErr != nil {
+		return runErr
 	}
 	if c.DryRun {
 		fmt.Fprintf(os.Stdout, "-- pgtrigger setup --dry-run (%d statement(s)) --\n", len(plan.Statements))
@@ -106,14 +172,13 @@ func (c *TriggerSetupCmd) Run(_ *Globals) error {
 		}
 		return nil
 	}
-	mode := "event-trigger + polling"
-	if !plan.EventTriggerSupported {
-		mode = "polled-fingerprint-only"
+	if pretty {
+		return nil // summary panel replaced the applied-line
 	}
 	fmt.Fprintf(
 		os.Stdout,
 		"pgtrigger setup applied (%d statement(s); DDL-detection mode: %s; PG version_num=%d)\n",
-		len(plan.Statements), mode, plan.PGVersionNum,
+		len(plan.Statements), pgtriggerSetupMode(plan), plan.PGVersionNum,
 	)
 	return nil
 }
@@ -124,23 +189,46 @@ func (c *TriggerSetupCmd) Run(_ *Globals) error {
 // and share identical CLI output; only the installer (setupFn) and the label
 // differ. The PG-only flags are not applicable here.
 func (c *TriggerSetupCmd) runSQLiteLike(
+	g *Globals,
 	label string,
 	setupFn func(context.Context, string, sqlitetrigger.SetupOptions) (*sqlitetrigger.Plan, error),
 ) error {
-	ctx := kongContext()
-	plan, err := setupFn(ctx, c.DSN, sqlitetrigger.SetupOptions{
-		Tables: c.Tables,
-		DryRun: c.DryRun,
-	})
+	pretty := wantPrettyProgress(g, false, c.DryRun, false)
+	runCtx, cancel := context.WithCancel(kongContext())
+	defer cancel()
+	var (
+		plan *sqlitetrigger.Plan
+		sink progress.Sink = progress.Nop{}
+	)
+	runErr := runWithProgress(pretty, cancel, triggerSetupProgressSpec,
+		func(s progress.Sink) { sink = s },
+		func() error {
+			sink.PhaseStarted(triggerPhaseInstall)
+			var e error
+			plan, e = setupFn(runCtx, c.DSN, sqlitetrigger.SetupOptions{
+				Tables: c.Tables,
+				DryRun: c.DryRun,
+			})
+			if (plan != nil && len(plan.Refusals) > 0) || e != nil {
+				return e
+			}
+			sink.PhaseCompleted(triggerPhaseInstall)
+			if pretty {
+				sink.Summary(progress.Result{Fields: []progress.Field{
+					{Label: "Statements", Value: progress.HumanCount(int64(len(plan.Statements)))},
+				}})
+			}
+			return nil
+		})
 	if plan != nil && len(plan.Refusals) > 0 {
 		fmt.Fprintln(os.Stderr, "trigger setup refused — see refusals below:")
 		for _, r := range plan.Refusals {
 			fmt.Fprintf(os.Stderr, "  - %s: %s\n      → %s\n", r.Table, r.Reason, r.Hint)
 		}
-		return err
+		return runErr
 	}
-	if err != nil {
-		return err
+	if runErr != nil {
+		return runErr
 	}
 	if c.DryRun {
 		fmt.Fprintf(os.Stdout, "-- %s setup --dry-run (%d statement(s)) --\n", label, len(plan.Statements))
@@ -149,6 +237,9 @@ func (c *TriggerSetupCmd) runSQLiteLike(
 			fmt.Fprintln(os.Stdout)
 		}
 		return nil
+	}
+	if pretty {
+		return nil // summary panel replaced the applied-line
 	}
 	fmt.Fprintf(os.Stdout, "%s setup applied (%d statement(s))\n", label, len(plan.Statements))
 	return nil
@@ -173,16 +264,18 @@ type TriggerTeardownCmd struct {
 }
 
 // Run implements `sluice trigger teardown`.
-func (c *TriggerTeardownCmd) Run(_ *Globals) error {
+func (c *TriggerTeardownCmd) Run(g *Globals) error {
 	if c.DSN == "" {
 		return errors.New("--dsn is required")
 	}
 	switch c.SourceDriver {
 	case triggerDriverSQLite:
-		return c.runSQLiteLike("sqlite-trigger", "SQLite source", sqlitetrigger.Teardown)
+		return c.runSQLiteLike(g, "sqlite-trigger", "SQLite source", sqlitetrigger.Teardown)
 	case triggerDriverD1:
-		return c.runSQLiteLike("d1-trigger", "Cloudflare D1 source", sqlitetrigger.TeardownD1)
+		return c.runSQLiteLike(g, "d1-trigger", "Cloudflare D1 source", sqlitetrigger.TeardownD1)
 	}
+	// The destructive-confirmation prompt reads stdin / writes stdout, so it
+	// MUST run before any live view owns the terminal.
 	if !c.DryRun && !c.Yes {
 		prompt := "Tear down the sluice trigger engine on the source (drop per-table triggers"
 		if c.KeepData {
@@ -199,15 +292,41 @@ func (c *TriggerTeardownCmd) Run(_ *Globals) error {
 			return nil
 		}
 	}
-	ctx := kongContext()
-	plan, err := pgtrigger.Teardown(ctx, c.DSN, pgtrigger.TeardownOptions{
-		Tables:   c.Tables,
-		Schema:   c.Schema,
-		KeepData: c.KeepData,
-		DryRun:   c.DryRun,
-	})
-	if err != nil {
-		return err
+
+	// ADR-0155: pretty TTY view for an interactive teardown. --dry-run
+	// excludes pretty so the DDL preview keeps its exact shape.
+	pretty := wantPrettyProgress(g, false, c.DryRun, false)
+	runCtx, cancel := context.WithCancel(kongContext())
+	defer cancel()
+	var (
+		plan *pgtrigger.Plan
+		sink progress.Sink = progress.Nop{}
+	)
+	runErr := runWithProgress(pretty, cancel, triggerTeardownProgressSpec,
+		func(s progress.Sink) { sink = s },
+		func() error {
+			sink.PhaseStarted(triggerPhaseRemove)
+			var e error
+			plan, e = pgtrigger.Teardown(runCtx, c.DSN, pgtrigger.TeardownOptions{
+				Tables:   c.Tables,
+				Schema:   c.Schema,
+				KeepData: c.KeepData,
+				DryRun:   c.DryRun,
+			})
+			if e != nil {
+				return e
+			}
+			sink.PhaseCompleted(triggerPhaseRemove)
+			if pretty {
+				sink.Summary(progress.Result{Fields: []progress.Field{
+					{Label: "Statements", Value: progress.HumanCount(int64(len(plan.Statements)))},
+					{Label: "Kept data", Value: boolYesNoCLI(c.KeepData)},
+				}})
+			}
+			return nil
+		})
+	if runErr != nil {
+		return runErr
 	}
 	if c.DryRun {
 		fmt.Fprintf(os.Stdout, "-- pgtrigger teardown --dry-run (%d statement(s)) --\n", len(plan.Statements))
@@ -215,6 +334,9 @@ func (c *TriggerTeardownCmd) Run(_ *Globals) error {
 			fmt.Fprintln(os.Stdout, s+";")
 		}
 		return nil
+	}
+	if pretty {
+		return nil // summary panel replaced the applied-line
 	}
 	fmt.Fprintf(os.Stdout, "pgtrigger teardown applied (%d statement(s); keep-data=%v)\n",
 		len(plan.Statements), c.KeepData)
@@ -230,9 +352,12 @@ func (c *TriggerTeardownCmd) Run(_ *Globals) error {
 // triggers MODIFIES the operator's database, so the destructive prompt fires for
 // D1 too (ADR-0136 §5).
 func (c *TriggerTeardownCmd) runSQLiteLike(
+	g *Globals,
 	label, sourceLabel string,
 	teardownFn func(context.Context, string, sqlitetrigger.TeardownOptions) (*sqlitetrigger.Plan, error),
 ) error {
+	// The destructive-confirmation prompt reads stdin / writes stdout, so it
+	// MUST run before any live view owns the terminal.
 	if !c.DryRun && !c.Yes {
 		prompt := "Tear down the sluice trigger engine on the " + sourceLabel + " (drop per-table triggers"
 		if c.KeepData {
@@ -249,14 +374,37 @@ func (c *TriggerTeardownCmd) runSQLiteLike(
 			return nil
 		}
 	}
-	ctx := kongContext()
-	plan, err := teardownFn(ctx, c.DSN, sqlitetrigger.TeardownOptions{
-		Tables:   c.Tables,
-		KeepData: c.KeepData,
-		DryRun:   c.DryRun,
-	})
-	if err != nil {
-		return err
+	pretty := wantPrettyProgress(g, false, c.DryRun, false)
+	runCtx, cancel := context.WithCancel(kongContext())
+	defer cancel()
+	var (
+		plan *sqlitetrigger.Plan
+		sink progress.Sink = progress.Nop{}
+	)
+	runErr := runWithProgress(pretty, cancel, triggerTeardownProgressSpec,
+		func(s progress.Sink) { sink = s },
+		func() error {
+			sink.PhaseStarted(triggerPhaseRemove)
+			var e error
+			plan, e = teardownFn(runCtx, c.DSN, sqlitetrigger.TeardownOptions{
+				Tables:   c.Tables,
+				KeepData: c.KeepData,
+				DryRun:   c.DryRun,
+			})
+			if e != nil {
+				return e
+			}
+			sink.PhaseCompleted(triggerPhaseRemove)
+			if pretty {
+				sink.Summary(progress.Result{Fields: []progress.Field{
+					{Label: "Statements", Value: progress.HumanCount(int64(len(plan.Statements)))},
+					{Label: "Kept data", Value: boolYesNoCLI(c.KeepData)},
+				}})
+			}
+			return nil
+		})
+	if runErr != nil {
+		return runErr
 	}
 	if c.DryRun {
 		fmt.Fprintf(os.Stdout, "-- %s teardown --dry-run (%d statement(s)) --\n", label, len(plan.Statements))
@@ -264,6 +412,9 @@ func (c *TriggerTeardownCmd) runSQLiteLike(
 			fmt.Fprintln(os.Stdout, s+";")
 		}
 		return nil
+	}
+	if pretty {
+		return nil // summary panel replaced the applied-line
 	}
 	fmt.Fprintf(os.Stdout, "%s teardown applied (%d statement(s); keep-data=%v)\n",
 		label, len(plan.Statements), c.KeepData)
@@ -299,7 +450,7 @@ type TriggerPruneCmd struct {
 }
 
 // Run implements `sluice trigger prune`.
-func (c *TriggerPruneCmd) Run(_ *Globals) error {
+func (c *TriggerPruneCmd) Run(g *Globals) error {
 	if c.Source == "" {
 		return errors.New("--source is required")
 	}
@@ -340,8 +491,43 @@ func (c *TriggerPruneCmd) Run(_ *Globals) error {
 		return c.runPruneDryRun(ctx)
 	}
 
-	// Step 3 — engine-dispatched DELETE on the SOURCE.
-	return c.runPrune(ctx, cut)
+	// Step 3 — engine-dispatched DELETE on the SOURCE, under the pretty view
+	// (ADR-0155). The pre-phase steps above stay non-pretty so their stdout
+	// notes / dry-run / no-op output is byte-identical; only the DELETE +
+	// summary render through the live view.
+	pretty := wantPrettyProgress(g, false, false, false)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var (
+		out  triggerPruneOutcome
+		sink progress.Sink = progress.Nop{}
+	)
+	runErr := runWithProgress(pretty, cancel, triggerPruneProgressSpec,
+		func(s progress.Sink) { sink = s },
+		func() error {
+			sink.PhaseStarted(triggerPhasePrune)
+			var e error
+			out, e = c.runPrune(runCtx, cut)
+			if e != nil {
+				return e
+			}
+			sink.PhaseCompleted(triggerPhasePrune)
+			if pretty {
+				sink.Summary(progress.Result{Fields: []progress.Field{
+					{Label: "Deleted", Value: progress.HumanCount(out.deleted)},
+					{Label: "Remaining", Value: progress.HumanCount(out.remaining)},
+					{Label: "Vacuumed", Value: boolYesNoCLI(out.vacuumed)},
+				}})
+			}
+			return nil
+		})
+	if runErr != nil {
+		return runErr
+	}
+	if !pretty {
+		printPruneResult(out.label, cut, out.deleted, out.remainingMin, out.remaining, out.vacuumed)
+	}
+	return nil
 }
 
 // readDurableFrontier opens the TARGET's ChangeApplier, reads the persisted CDC
@@ -459,36 +645,44 @@ func computePruneCut(appliedLastID, keep int64) (cut int64, prune bool) {
 	return cut, true
 }
 
-// runPrune dispatches the SOURCE-side DELETE to the trigger engine and reports
-// the outcome.
-func (c *TriggerPruneCmd) runPrune(ctx context.Context, cut int64) error {
+// triggerPruneOutcome is the engine-neutral result of a SOURCE-side prune,
+// so the caller can either print it (non-TTY, byte-identical) or feed it to
+// the ADR-0155 summary panel (pretty view).
+type triggerPruneOutcome struct {
+	label        string
+	deleted      int64
+	remainingMin int64
+	remaining    int64
+	vacuumed     bool
+}
+
+// runPrune dispatches the SOURCE-side DELETE to the trigger engine and
+// returns the normalized outcome (the caller renders it).
+func (c *TriggerPruneCmd) runPrune(ctx context.Context, cut int64) (triggerPruneOutcome, error) {
 	switch c.SourceDriver {
 	case triggerDriverSQLite:
 		res, err := sqlitetrigger.Prune(ctx, c.Source, sqlitetrigger.PruneOptions{Cut: cut, Vacuum: c.Vacuum})
 		if err != nil {
-			return err
+			return triggerPruneOutcome{}, err
 		}
-		printPruneResult("sqlite-trigger", cut, res.Deleted, res.RemainingMin, res.Remaining, res.Vacuumed)
-		return nil
+		return triggerPruneOutcome{"sqlite-trigger", res.Deleted, res.RemainingMin, res.Remaining, res.Vacuumed}, nil
 	case triggerDriverD1:
 		res, err := sqlitetrigger.PruneD1(ctx, c.Source, sqlitetrigger.PruneOptions{Cut: cut, Vacuum: c.Vacuum})
 		if err != nil {
-			return err
+			return triggerPruneOutcome{}, err
 		}
-		printPruneResult("d1-trigger", cut, res.Deleted, res.RemainingMin, res.Remaining, res.Vacuumed)
-		return nil
+		return triggerPruneOutcome{"d1-trigger", res.Deleted, res.RemainingMin, res.Remaining, res.Vacuumed}, nil
 	case triggerDriverPostgres:
 		if c.Vacuum {
-			return errors.New("--vacuum is not supported for postgres-trigger (PG reclaims space via autovacuum); re-run without --vacuum")
+			return triggerPruneOutcome{}, errors.New("--vacuum is not supported for postgres-trigger (PG reclaims space via autovacuum); re-run without --vacuum")
 		}
 		res, err := pgtrigger.Prune(ctx, c.Source, pgtrigger.PruneOptions{Cut: cut, Schema: c.Schema})
 		if err != nil {
-			return err
+			return triggerPruneOutcome{}, err
 		}
-		printPruneResult("pgtrigger", cut, res.Deleted, res.RemainingMin, res.Remaining, false)
-		return nil
+		return triggerPruneOutcome{"pgtrigger", res.Deleted, res.RemainingMin, res.Remaining, false}, nil
 	default:
-		return fmt.Errorf("unknown --source-driver %q", c.SourceDriver)
+		return triggerPruneOutcome{}, fmt.Errorf("unknown --source-driver %q", c.SourceDriver)
 	}
 }
 

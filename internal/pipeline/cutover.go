@@ -12,7 +12,27 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
+	"sluicesync.dev/sluice/internal/progress"
 )
+
+// Cutover pretty-view phases (ADR-0155 phase 2). Cutover keeps its
+// historical stdout report (rendered by the CLI) on the non-TTY path —
+// the sink is [progress.Nop] there and this checklist drives only the
+// interactive view; the summary panel replaces the stdout report when
+// the live view owns the terminal.
+var (
+	cutoverPhaseConnect = progress.Phase{Key: "connect", Label: "Connect"}
+	cutoverPhaseRead    = progress.Phase{Key: "read", Label: "Read"}
+	cutoverPhasePrime   = progress.Phase{Key: "prime", Label: "Prime"}
+)
+
+// CutoverProgressSpec is the pretty-view [progress.Spec] for `sluice
+// cutover`. The CLI hands it to [progress.NewTTYSink].
+var CutoverProgressSpec = progress.Spec{
+	Title:      "sluice cutover",
+	Phases:     []progress.Phase{cutoverPhaseConnect, cutoverPhaseRead, cutoverPhasePrime},
+	LabelWidth: 12,
+}
 
 // Cutover drives the two-phase cutover sequence priming pass —
 // severity-A finding F10 of the 2026-05-22 Reddit-research run, see
@@ -64,6 +84,22 @@ type Cutover struct {
 	// via [ir.SchemaSetter] so the cutover's pg_get_serial_sequence
 	// lookups hit the namespace the migration landed in.
 	TargetSchema string
+
+	// Progress is the ADR-0155 presentation sink. nil is the [progress.Nop]
+	// default (cutover's own report, rendered by the CLI, is the
+	// byte-identical non-TTY output); the CLI sets a [progress.TTYSink] only
+	// for an interactive terminal, where the summary panel replaces the
+	// stdout report.
+	Progress progress.Sink
+}
+
+// sink returns the presentation sink, defaulting a nil Progress to the
+// no-op sink so every call-site is nil-free.
+func (c *Cutover) sink() progress.Sink {
+	if c.Progress == nil {
+		return progress.Nop{}
+	}
+	return c.Progress
 }
 
 // Run executes the priming pass. Returns the per-table report
@@ -99,6 +135,9 @@ func (c *Cutover) Run(ctx context.Context) (*ir.SequencePrimeReport, error) {
 		margin = ir.CutoverSequenceMarginDefault
 	}
 
+	sink := c.sink()
+	sink.PhaseStarted(cutoverPhaseConnect)
+
 	// Open source SchemaReader.
 	sourceReader, err := c.Source.OpenSchemaReader(ctx, c.SourceDSN)
 	if err != nil {
@@ -133,6 +172,8 @@ func (c *Cutover) Run(ctx context.Context) (*ir.SequencePrimeReport, error) {
 		return nil, fmt.Errorf("cutover: target engine %q does not implement SequencePrimer (sequence/AUTO_INCREMENT priming unsupported)",
 			c.Target.Name())
 	}
+	sink.PhaseCompleted(cutoverPhaseConnect)
+	sink.PhaseStarted(cutoverPhaseRead)
 
 	// Read source schema. Applying the operator-supplied table
 	// filter at this layer keeps the per-engine source reader's
@@ -158,6 +199,8 @@ func (c *Cutover) Run(ctx context.Context) (*ir.SequencePrimeReport, error) {
 		slog.Int("sequence_count", len(sourceStates)),
 		slog.Int64("margin", margin),
 	)
+	sink.PhaseCompleted(cutoverPhaseRead)
+	sink.PhaseStarted(cutoverPhasePrime)
 
 	// Target-side: apply the priming pass.
 	report, primeErr := primer.PrimeSequences(ctx, schema, sourceStates, margin)
@@ -171,6 +214,19 @@ func (c *Cutover) Run(ctx context.Context) (*ir.SequencePrimeReport, error) {
 	if primeErr != nil {
 		return report, primeErr
 	}
+	sink.PhaseCompleted(cutoverPhasePrime)
+
+	// ADR-0155 summary panel (TTY only; Nop ignores it). The CLI's stdout
+	// report is the byte-identical non-TTY output; these Fields are the
+	// interactive rollup that replaces it under the live view.
+	primed, noop, skipped, refused := report.Counts()
+	sink.Summary(progress.Result{Fields: []progress.Field{
+		{Label: "Engines", Value: c.Source.Name() + " -> " + c.Target.Name()},
+		{Label: "Primed", Value: progress.HumanCount(int64(primed))},
+		{Label: "Noop", Value: progress.HumanCount(int64(noop))},
+		{Label: "Skipped", Value: progress.HumanCount(int64(skipped))},
+		{Label: "Refused", Value: progress.HumanCount(int64(refused))},
+	}})
 	return report, nil
 }
 

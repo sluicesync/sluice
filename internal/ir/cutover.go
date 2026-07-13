@@ -145,6 +145,25 @@ func (r *SequencePrimeReport) HasRefusals() bool {
 	return false
 }
 
+// Counts tallies the per-outcome action totals. Shared by the CLI's
+// text renderer (the trailing summary line) and the ADR-0155 pretty
+// summary panel so both report the same numbers from one place.
+func (r *SequencePrimeReport) Counts() (primed, noop, skipped, refused int) {
+	for i := range r.Actions {
+		switch r.Actions[i].Outcome {
+		case "primed":
+			primed++
+		case "noop":
+			noop++
+		case "skipped":
+			skipped++
+		case "refused":
+			refused++
+		}
+	}
+	return primed, noop, skipped, refused
+}
+
 // SequenceStateReader is the optional source-side engine surface that
 // reads each identity / AUTO_INCREMENT column's current value from a
 // live source database. Implemented on the [SchemaReader] of engines

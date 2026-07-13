@@ -12,7 +12,23 @@ import (
 	"time"
 
 	pgkms "sluicesync.dev/sluice/internal/engines/postgres"
+	"sluicesync.dev/sluice/internal/progress"
 )
+
+// Matview pretty-view phases (ADR-0155 phase 2). `matview refresh` is
+// CLI-orchestrated (a single engine call, no pipeline Run with a Progress
+// field), so the CLI drives this one-phase checklist inline; on the
+// non-TTY path the sink is [progress.Nop] and the historical stdout
+// report is byte-identical.
+var matviewPhaseRefresh = progress.Phase{Key: "refresh", Label: "Refresh"}
+
+// matviewRefreshProgressSpec is the pretty-view spec for `sluice matview
+// refresh`.
+var matviewRefreshProgressSpec = progress.Spec{
+	Title:      "sluice matview refresh",
+	Phases:     []progress.Phase{matviewPhaseRefresh},
+	LabelWidth: 12,
+}
 
 // MatviewCmd groups subcommands that operate on PostgreSQL materialized
 // views. Today there's just `refresh` (Phase 2 of view support, see
@@ -56,7 +72,7 @@ type MatviewRefreshCmd struct {
 // the operator's cron job's exit-status branching gets a clean
 // signal. The partial result (matviews refreshed before the failure)
 // is preserved in the rendered output regardless.
-func (m *MatviewRefreshCmd) Run(_ *Globals) error {
+func (m *MatviewRefreshCmd) Run(g *Globals) error {
 	if m.TargetDriver != "postgres" {
 		return fmt.Errorf("--target-driver=%q: matview refresh is PostgreSQL-only (MySQL has no materialized view concept)", m.TargetDriver)
 	}
@@ -82,14 +98,41 @@ func (m *MatviewRefreshCmd) Run(_ *Globals) error {
 		Matviews:     m.Matview,
 		Concurrently: m.Concurrently,
 	}
-	result, err := pgkms.RefreshMatviews(ctx, db, opts)
+
+	// ADR-0155: pretty TTY view only for an interactive text run to stdout
+	// (not --format json, and gated by the shared wantPrettyProgress). When
+	// pretty, the live view owns stdout, so the per-matview report is
+	// suppressed — the summary panel replaces it.
+	pretty := (m.Format == "" || m.Format == "text") &&
+		wantPrettyProgress(g, false, false, false)
+	var (
+		result *pgkms.MatviewRefreshResult
+		sink   progress.Sink = progress.Nop{}
+	)
+	runErr := runWithProgress(pretty, cancel, matviewRefreshProgressSpec,
+		func(s progress.Sink) { sink = s },
+		func() error {
+			sink.PhaseStarted(matviewPhaseRefresh)
+			var e error
+			result, e = pgkms.RefreshMatviews(ctx, db, opts)
+			if e != nil {
+				return e
+			}
+			sink.PhaseCompleted(matviewPhaseRefresh)
+			sink.Summary(progress.Result{Fields: []progress.Field{
+				{Label: "Refreshed", Value: progress.HumanCount(int64(len(result.Refreshed)))},
+				{Label: "Skipped", Value: progress.HumanCount(int64(len(result.Skipped)))},
+			}})
+			return nil
+		})
 	// Render whatever was accumulated regardless of error — operators
 	// piping the output to a metrics scraper benefit from seeing the
-	// per-matview timing even on partial failures.
-	if result != nil {
+	// per-matview timing even on partial failures. Suppressed under the
+	// pretty view, which owns stdout.
+	if result != nil && !pretty {
 		renderMatviewResult(result, m.Format)
 	}
-	return err
+	return runErr
 }
 
 // renderMatviewResult prints the refresh outcome in the chosen format.
