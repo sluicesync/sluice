@@ -11,6 +11,7 @@ import (
 	"text/tabwriter"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/progress"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
@@ -39,7 +40,7 @@ type SlotListCmd struct {
 }
 
 // Run implements `sluice slot list`.
-func (s *SlotListCmd) Run(_ *Globals) error {
+func (s *SlotListCmd) Run(g *Globals) error {
 	mgr, err := openSlotManager(s.SourceDriver, s.Source)
 	if err != nil {
 		return err
@@ -53,6 +54,24 @@ func (s *SlotListCmd) Run(_ *Globals) error {
 	}
 	if len(slots) == 0 {
 		fmt.Fprintln(os.Stdout, "no replication slots on source")
+		return nil
+	}
+
+	// ADR-0155: at an interactive terminal, render the on-brand bordered
+	// table. Everywhere else — piped, CI, --log-format=json, --no-progress —
+	// keep the exact tabwriter output below, byte-identical to prior releases.
+	if wantPrettyProgress(g, false, false, false) {
+		rows := make([][]string, 0, len(slots))
+		for _, slot := range slots {
+			rows = append(rows, []string{
+				slot.Name, slot.Plugin, boolYesNoCLI(slot.Active),
+				walStatusOrDash(slot.WALStatus),
+				lsnOrDash(slot.RestartLSN), lsnOrDash(slot.ConfirmedFlushLSN),
+			})
+		}
+		headers := []string{"NAME", "PLUGIN", "ACTIVE", "WAL_STATUS", "RESTART_LSN", "CONFIRMED_FLUSH_LSN"}
+		// activeCol=2 colours the ACTIVE column (yes=live consumer).
+		fmt.Fprintln(os.Stdout, progress.Table(fmt.Sprintf("Replication slots (%d)", len(slots)), headers, rows, 2))
 		return nil
 	}
 

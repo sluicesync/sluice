@@ -143,6 +143,15 @@ linters:
         - rangeValCopy     # noisy on small structs
 
   exclusions:
+    # The gitignored agent-worktree scratch area (.claude/worktrees/…) holds
+    # full module copies created by background subagents — frequently
+    # in-progress and not ours to lint. Excluding it keeps a whole-tree
+    # `golangci-lint run` from being polluted by an active agent's worktree or
+    # a stale (post-merge, not-yet-pruned) one — the phantom-lint trap noted in
+    # the dev runbook. CI is unaffected: it lints a fresh checkout with no
+    # worktrees present.
+    paths:
+      - \.claude/
     rules:
       # Length/complexity ceilings don't apply to tests: table-driven
       # test functions and integration scenarios are legitimately long,
