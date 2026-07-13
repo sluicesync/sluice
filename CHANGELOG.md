@@ -4,6 +4,16 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.234] - 2026-07-13
+
+### Added
+
+- **The TTY-aware pretty view now covers `verify`, `restore`, `backup full`, `backup incremental`, and `backup verify` (ADR-0155 phase 2).** Each renders a phase checklist and a command-appropriate summary panel at an interactive terminal — `verify` shows tables checked / clean / mismatched / skipped; `backup` shows tables, rows, chunks, encrypted?, signed?, EndPosition; `restore` shows tables and rows. As with `migrate`, the pretty view is purely additive on a TTY: piped output, CI, `--log-format=json`, and `--no-progress` all emit the exact structured records each command has always emitted, byte-for-byte (a per-command golden-tested guarantee). The `progress` framework was generalized to a per-command spec to make this rollout consistent. Per-table live progress bars for these commands are a follow-up; this phase renders phase boundaries + the summary.
+
+### Fixed
+
+- **`backup verify` now returns a coded refusal (exit 3) when a chunk fails, matching `restore` (Bug 185).** v0.99.232 gave `restore` the coded `SLUICE-E-BACKUP-CHUNK-CORRUPT` refusal on a byte-corrupt chunk but `backup verify` still exited with an uncoded `1` on the aggregate, quietly contradicting the release note that operators could script `backup verify` against the code. `backup verify` now exits `3` with the coded refusal — `SLUICE-E-BACKUP-CHUNK-CORRUPT` when a SHA-256 hash mismatch fired, or `SLUICE-E-BACKUP-CHUNK-AUTH-FAILED` for a decrypt/GCM-auth or plaintext-splice failure. The refusal was always loud and data-safe (`verify` never reported a corrupt chunk as valid); this makes the machine-readable exit code match `restore` and the documented contract. **Compatibility:** a script that keyed on `backup verify` exiting `1` on a chunk failure will now see `3` (the Refusal exit class) — the refusal itself is unchanged.
+
 ## [0.99.233] - 2026-07-12
 
 ### Added
