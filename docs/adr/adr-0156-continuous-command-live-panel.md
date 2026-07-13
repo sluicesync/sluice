@@ -1,6 +1,6 @@
 # ADR-0156: TTY-aware live status panel for continuous commands
 
-- Status: Proposed
+- Status: Accepted (phase 1 — `sync start` — shipped; phases 2–3 remain)
 - Date: 2026-07-12
 - Deciders: sluice maintainers
 - Related: ADR-0155 (TTY-aware pretty output for one-shot commands)
@@ -137,3 +137,49 @@ drains and stops the stream (no dropped in-flight changes).
 - **Prettify `sync status` / `sync health` too.** Rejected: those are
   snapshot/cron, exit-code- and `--format json`-oriented; a TUI would break their
   scripted use. They stay machine-first.
+
+## Implementation notes (phase 1 — `sync start`)
+
+Shipped as `internal/progress/{livepanel,livesink}.go` (the continuous
+`livePanel` model + `LiveTTYSink` driver, siblings of ADR-0155's one-shot
+`model`/`TTYSink`) plus `cmd/sluice/live_panel.go` (gating, the continuous slog
+gate, the status poller, and the drain-stop wiring). It reuses the one-shot
+model's checklist + per-table bar (via the extracted `model.checklistView`) and
+this package's brand styling.
+
+- **The orchestrator is untouched.** The initial-copy checklist/bar is fed by
+  the SAME `progress.Sink` events the shared bulk-copy phase already emits via
+  `progress.FromContext`; the CLI just attaches the `LiveTTYSink` to the run
+  context (`progress.NewContext`). No `Streamer` field or emit call was added,
+  so the non-TTY path is byte-identical by construction (the gate and the
+  context-wrap are only installed on the pretty path).
+- **CDC body feed = a CLI-side status poller.** Position + freshness come from
+  `ChangeApplier.ListStreams` on a dedicated control-table connection (the same
+  read `sync status` uses), polled every 1s — not from instrumenting the apply
+  hot path, and NOT the fleet TUI's out-of-process endpoint. The panel flips to
+  CDC on the first known reading (covers both cold-start handoff and warm
+  resume).
+- **Drain-and-stop is the exact `sync stop` path.** `q`/ctrl+c returns a
+  `tea.Cmd` that calls `ChangeApplier.RequestStop` (what `sync stop` writes),
+  tripping the streamer's stop-signal poll so in-flight changes drain; a second
+  press force-quits and the CLI cancels the run context as the backstop.
+- **Renderer isolation** is inherent: the streamer runs in its own goroutine and
+  never references the panel; a renderer panic is recovered in the sink's
+  goroutine and reported via `onRendererPanic`, which restores structured
+  logging while the sync keeps running.
+
+**Named phase-1 gaps (honest, not silent):**
+
+- **Cumulative rows-applied / throughput are not surfaced.** The target control
+  table carries no applied-row counter, and per the loud-failure discipline the
+  panel refuses to fabricate one — it renders `rows  n/a (phase 1)` rather than
+  an invented number. Wiring a truthful applied-row counter (an applier-level
+  signal) is deferred.
+- **`lag_bytes` is omitted entirely** (not shown even for PG→PG in phase 1),
+  because it is a PG-pair-only quantity this cross-engine panel does not compute;
+  the panel leads with `freshness` (seconds-since-last-apply) and does not imply
+  a byte-lag it cannot compute.
+
+**Remaining rollout:** phase 2 (`sync from-backup run` broker + `backup stream
+run`) and phase 3 (`metrics-watch`) still emit their current output — they are
+unchanged by this chunk and adopt the shared panel later.

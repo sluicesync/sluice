@@ -1827,7 +1827,29 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 	// Validation is done; errors past this point classify as "failed"
 	// (not "refused") in the --format json envelope.
 	env.markEngaged()
-	return crashWrap(streamer.Run(kongContext()))
+
+	// ADR-0156: the TTY-aware continuous live status panel. It renders only for
+	// an interactive, single-namespace, text-log, non-envelope, non-dry-run
+	// `sync start` — the same gating as ADR-0155's one-shot pretty view
+	// ([wantPrettyProgress]); every other invocation keeps the byte-identical
+	// structured slog stream (a multi-namespace fan-out has no single stream to
+	// render). `sync health` / `sync status` never get a panel (out of scope).
+	runCtx := kongContext()
+	if !wantPrettyProgress(g, env.jsonMode, s.DryRun, s.multiNamespaceFanout(allNS)) {
+		return crashWrap(streamer.Run(runCtx))
+	}
+	return runSyncStartLivePanel(runCtx, s, source, target, streamer, crashWrap)
+}
+
+// multiNamespaceFanout reports whether this `sync start` fans out across more
+// than one source namespace (multi-database / multi-schema / rename map), in
+// which case there is no single stream for the ADR-0156 live panel to render
+// and the structured-log stream is kept (mirrors the migrate gating).
+func (s *SyncStartCmd) multiNamespaceFanout(allDatabases bool) bool {
+	return allDatabases ||
+		len(s.IncludeDatabase) > 0 || len(s.ExcludeDatabase) > 0 ||
+		len(s.IncludeSchema) > 0 || len(s.ExcludeSchema) > 0 ||
+		len(s.MapDatabase) > 0 || len(s.MapSchema) > 0
 }
 
 // resolveEngines resolves the source + target engines for a sync run,

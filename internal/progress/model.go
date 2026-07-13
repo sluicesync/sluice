@@ -185,14 +185,25 @@ func (m model) liveView() string {
 	var b strings.Builder
 	b.WriteString(brandStyle.Render(m.spec.Title))
 	b.WriteString("\n\n")
-	for _, r := range m.phases {
-		b.WriteString("  ")
-		b.WriteString(m.renderPhaseRow(r))
-		b.WriteString("\n")
-	}
+	b.WriteString(m.checklistView())
 	if len(m.warnings) > 0 {
 		b.WriteString("\n")
 		b.WriteString(warnStyle.Render(fmt.Sprintf("  %d warning(s)", len(m.warnings))))
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// checklistView renders just the phase-checklist rows (each indented and
+// newline-terminated), without the brand title or the warnings summary.
+// Extracted so the continuous [livePanel] can reuse the exact same
+// checklist + inline-bar rendering for its initial-copy section
+// (ADR-0156) rather than duplicating renderPhaseRow / renderActiveTable.
+func (m model) checklistView() string {
+	var b strings.Builder
+	for _, r := range m.phases {
+		b.WriteString("  ")
+		b.WriteString(m.renderPhaseRow(r))
 		b.WriteString("\n")
 	}
 	return b.String()
