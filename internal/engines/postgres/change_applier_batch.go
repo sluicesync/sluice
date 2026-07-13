@@ -163,16 +163,16 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 		Redact:     a.redactChange,
 		StampShard: a.stampShardChange,
 		Classify:   classifyApplierError,
-		WritePosition: func(ctx context.Context, tx appliershared.BatchTx, streamID, token string) error {
+		WritePosition: func(ctx context.Context, tx appliershared.BatchTx, streamID, token string, rowsApplied int64) error {
 			if b, ok := tx.(*pgxBatchTx); ok {
 				// Queue the position upsert onto the batch; it flushes with
 				// the data in Commit's single SendBatch (ADR-0092).
-				a.writePositionPipelined(b, streamID, token)
+				a.writePositionPipelined(b, streamID, token, rowsApplied)
 				return nil
 			}
 			posCtx, posCancel := a.execTimeoutCtx(ctx)
 			defer posCancel()
-			return writePositionTx(posCtx, tx.(*sql.Tx), a.controlSchema, streamID, token, a.slotName, a.sourceFingerprint, a.targetSchema)
+			return writePositionTx(posCtx, tx.(*sql.Tx), a.controlSchema, streamID, token, a.slotName, a.sourceFingerprint, a.targetSchema, rowsApplied)
 		},
 		Commit: func(tx appliershared.BatchTx) error {
 			if b, ok := tx.(*pgxBatchTx); ok {

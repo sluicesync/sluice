@@ -216,14 +216,14 @@ func TestReadStopRequested_Shapes(t *testing.T) {
 }
 
 func streamCols() []string {
-	return []string{"stream_id", "source_position", "updated_at", "slot_name", "source_dsn_fingerprint", "target_schema"}
+	return []string{"stream_id", "source_position", "updated_at", "slot_name", "source_dsn_fingerprint", "target_schema", "rows_applied"}
 }
 
 func TestListStreams_ScanAndEngineStamp(t *testing.T) {
 	updated := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
 	db, cfg, _ := ctFixture(t, []ctStep{{rows: &ctRows{
 		cols: streamCols(),
-		data: [][]driver.Value{{"s1", "tok-1", updated, "slot-a", "fp-a", "schema-a"}},
+		data: [][]driver.Value{{"s1", "tok-1", updated, "slot-a", "fp-a", "schema-a", int64(4242)}},
 	}}})
 	out, err := ListStreams(context.Background(), db, cfg, "Q", "engine-x")
 	if err != nil {
@@ -236,6 +236,7 @@ func TestListStreams_ScanAndEngineStamp(t *testing.T) {
 		SlotName:             "slot-a",
 		SourceDSNFingerprint: "fp-a",
 		TargetSchema:         "schema-a",
+		RowsApplied:          4242,
 	}
 	if len(out) != 1 || out[0] != want {
 		t.Fatalf("out = %+v; want [%+v]", out, want)

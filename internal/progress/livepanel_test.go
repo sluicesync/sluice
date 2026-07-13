@@ -64,6 +64,50 @@ func TestLivePanelInitialCopyToCDC(t *testing.T) {
 	}
 }
 
+// TestLivePanelRowsAndThroughput pins the rows-applied + panel-computed
+// throughput contract (ADR-0156 phase 2):
+//   - the cumulative count renders with thousands separators;
+//   - the FIRST reading shows the count but NO rate (a single reading can't
+//     imply a throughput);
+//   - a SECOND reading a known interval later shows a computed "N rows/s";
+//   - a NON-MONOTONIC reading (counter regressed — stream reset) never renders
+//     a negative or bogus-spike rate: the last good rate is kept.
+func TestLivePanelRowsAndThroughput(t *testing.T) {
+	base := time.Unix(1_000_000, 0)
+	m := newLivePanel(testMigrateSpec, liveHeader(), nil, epoch)
+
+	// First reading: 1000 rows. Count shown, no rate yet.
+	lp := applyLive(m, statusMsg{status: LiveStatus{Position: "p", Freshness: time.Second, Known: true, RowsApplied: 1000, PolledAt: base}})
+	body := lp.cdcBody()
+	if !strings.Contains(body, "1,000") {
+		t.Errorf("first reading should render the count with separators:\n%s", body)
+	}
+	if strings.Contains(body, "rows/s") {
+		t.Errorf("first reading must NOT imply a throughput:\n%s", body)
+	}
+
+	// Second reading 2s later: +100 rows → 50 rows/s.
+	lp = applyLive(lp, statusMsg{status: LiveStatus{Position: "p", Freshness: time.Second, Known: true, RowsApplied: 1100, PolledAt: base.Add(2 * time.Second)}})
+	body = lp.cdcBody()
+	if !strings.Contains(body, "1,100") {
+		t.Errorf("second reading count drift:\n%s", body)
+	}
+	if !strings.Contains(body, "50 rows/s") {
+		t.Errorf("throughput should be 50 rows/s (100 rows / 2s):\n%s", body)
+	}
+
+	// Third reading: counter REGRESSES (stream reset drops it to 5). No
+	// negative rate, no spike — the last good rate (50 rows/s) is kept.
+	lp = applyLive(lp, statusMsg{status: LiveStatus{Position: "p", Freshness: time.Second, Known: true, RowsApplied: 5, PolledAt: base.Add(4 * time.Second)}})
+	body = lp.cdcBody()
+	if strings.Contains(body, "-") && strings.Contains(body, "rows/s") {
+		t.Errorf("a regressed counter must never render a negative rate:\n%s", body)
+	}
+	if !strings.Contains(body, "50 rows/s") {
+		t.Errorf("a regressed reading should keep the last good rate:\n%s", body)
+	}
+}
+
 // TestLivePanelWarmResumeStraightToCDC pins that a warm resume (no cold-copy
 // phases fire) still flips to CDC on the first known status, so the panel is
 // never stuck showing an empty initial-copy checklist.
@@ -91,9 +135,13 @@ func TestLivePanelStatusUnknownStaysHonest(t *testing.T) {
 	if !strings.Contains(body, "freshness    —") {
 		t.Errorf("unknown freshness should render em-dash:\n%s", body)
 	}
-	// Rows are an honest named gap, never a fabricated number; no lag_bytes.
-	if !strings.Contains(body, "n/a (phase 1)") {
-		t.Errorf("rows should be surfaced as an honest n/a gap:\n%s", body)
+	// Rows honor the *Known contract: with no reading yet they render "—",
+	// never a fabricated 0 (or a rate); no lag_bytes.
+	if !strings.Contains(body, "rows         —") {
+		t.Errorf("unknown rows should render em-dash (no fabricated count):\n%s", body)
+	}
+	if strings.Contains(body, "rows/s") {
+		t.Errorf("no throughput may be shown before a rows reading exists:\n%s", body)
 	}
 	if strings.Contains(body, "lag_bytes") {
 		t.Errorf("cross-engine panel must not imply lag_bytes:\n%s", body)

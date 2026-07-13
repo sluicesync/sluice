@@ -37,12 +37,35 @@ import (
 type recorder struct {
 	mu     sync.Mutex
 	events []string
+	// rowsDeltas is every rowsApplied delta the WritePosition hook received,
+	// in order — the rows_applied accounting surface (kept separate from the
+	// ordered event log so the existing event assertions stay unchanged).
+	rowsDeltas []int64
 }
 
 func (r *recorder) add(e string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.events = append(r.events, e)
+}
+
+// addRowsDelta records a rowsApplied delta from the WritePosition hook.
+func (r *recorder) addRowsDelta(d int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rowsDeltas = append(r.rowsDeltas, d)
+}
+
+// totalRowsApplied sums the recorded WritePosition deltas — the cumulative
+// rows_applied the control row would hold after the run.
+func (r *recorder) totalRowsApplied() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var total int64
+	for _, d := range r.rowsDeltas {
+		total += d
+	}
+	return total
 }
 
 func (r *recorder) list() []string {
@@ -109,8 +132,9 @@ func testConfig(t *testing.T, rec *recorder, transactionalDDL bool) *BatchConfig
 		Redact:     func(context.Context, ir.Change) error { return nil },
 		StampShard: func(ir.Change) {},
 		Classify:   func(err error) error { return fmt.Errorf("classified: %w", err) },
-		WritePosition: func(_ context.Context, _ BatchTx, _ string, token string) error {
+		WritePosition: func(_ context.Context, _ BatchTx, _ string, token string, rowsApplied int64) error {
 			rec.add("writePosition:" + token)
+			rec.addRowsDelta(rowsApplied)
 			return nil
 		},
 		Commit: func(tx BatchTx) error {
@@ -580,4 +604,112 @@ type countingObserver struct{ calls atomic.Int64 }
 
 func (o *countingObserver) ObserveBatch(context.Context, time.Duration, int, error) {
 	o.calls.Add(1)
+}
+
+// updateAt / deleteAt / truncateAt round out the row-change family for the
+// rows_applied count pins (insertAt already exists). Truncate is dispatched
+// on the TransactionalDDL=true path but is NOT row-level DML, so it must not
+// advance the counter.
+func updateAt(token string) ir.Change {
+	return ir.Update{Position: pos(token), Schema: "s", Table: "t", Before: ir.Row{"id": int64(1)}, After: ir.Row{"id": int64(2)}}
+}
+
+func deleteAt(token string) ir.Change {
+	return ir.Delete{Position: pos(token), Schema: "s", Table: "t", Before: ir.Row{"id": int64(1)}}
+}
+
+func truncateAt(token string) ir.Change {
+	return ir.Truncate{Position: pos(token), Schema: "s", Table: "t"}
+}
+
+// TestRunBatchLoop_RowsApplied_PerFlushCountsDML (Postgres path,
+// CheckpointOnlyAtTxBoundary=false) pins that every flush's position write
+// carries exactly the row-level DML count of ITS batch — one per
+// Insert/Update/Delete — and that a Truncate riding the batch tx contributes
+// 0. Batch size 1 forces one flush per change so the per-flush deltas are
+// individually observable.
+func TestRunBatchLoop_RowsApplied_PerFlushCountsDML(t *testing.T) {
+	rec := &recorder{}
+	cfg := testConfig(t, rec, true) // TransactionalDDL=true (PG): Truncate rides the batch tx
+
+	// insert, update, delete, truncate → 3 DML + 1 non-DML.
+	ch := feed(true, insertAt("p1"), updateAt("p2"), deleteAt("p3"), truncateAt("p4"))
+	if err := RunBatchLoop(context.Background(), cfg, "stream", ch, 1); err != nil {
+		t.Fatalf("RunBatchLoop: %v", err)
+	}
+	// Four position writes, one per flush; the Truncate's carries 0.
+	if got, want := rec.rowsDeltas, []int64{1, 1, 1, 0}; !equalInt64(got, want) {
+		t.Fatalf("per-flush rows deltas = %v; want %v", got, want)
+	}
+	if got := rec.totalRowsApplied(); got != 3 {
+		t.Fatalf("cumulative rows_applied = %d; want 3 (Truncate excluded)", got)
+	}
+}
+
+// TestRunBatchLoop_RowsApplied_CheckpointOnly_AccumulatesToBoundary is the
+// load-bearing serial-aggregation pin (MySQL path): a source transaction
+// split across several mid-tx flushes (forced by batch size 1) commits its
+// DATA per flush but SKIPS the position write, so the rows_applied increment
+// must DEFER — the whole transaction's DML lands in ONE increment at the
+// TxCommit boundary write, exactly when the position advances. The counter
+// must never advance on a mid-tx flush (which would let it lead the persisted
+// position and double-count on a crash+resume).
+func TestRunBatchLoop_RowsApplied_CheckpointOnly_AccumulatesToBoundary(t *testing.T) {
+	rec := &recorder{}
+	cfg := testConfig(t, rec, false)
+	cfg.CheckpointOnlyAtTxBoundary = true
+
+	// One source tx of three DML rows (insert/update/delete — the full DML
+	// family) then COMMIT, forced to split by cap=1. The COMMIT lands on an
+	// empty batch, so the boundary is persisted via the dedicated
+	// position-only tx (writeBoundaryOnly), which must carry the accumulated 3.
+	ch := feed(true, txBegin("tb"), insertAt("p1"), updateAt("p2"), deleteAt("p3"), txCommit("tc"))
+	if err := RunBatchLoop(context.Background(), cfg, "stream", ch, 1); err != nil {
+		t.Fatalf("RunBatchLoop: %v", err)
+	}
+	// Exactly ONE position write (the boundary), carrying the whole tx's DML.
+	if got, want := rec.rowsDeltas, []int64{3}; !equalInt64(got, want) {
+		t.Fatalf("rows deltas = %v; want [3] (single boundary increment, never mid-tx)", got)
+	}
+	if got := rec.totalRowsApplied(); got != 3 {
+		t.Fatalf("cumulative rows_applied = %d; want 3", got)
+	}
+}
+
+// TestRunBatchLoop_RowsApplied_CheckpointOnly_BoundaryInBatch pins the common
+// case where the whole source tx fits in one batch: the TxCommit boundary
+// flush writes the accumulated DML count atomically with the rows' data (no
+// dedicated position-only tx). Two transactions in a row prove the carry
+// RESETS after each boundary write (the second tx counts only its own rows).
+func TestRunBatchLoop_RowsApplied_CheckpointOnly_BoundaryInBatch(t *testing.T) {
+	rec := &recorder{}
+	cfg := testConfig(t, rec, false)
+	cfg.CheckpointOnlyAtTxBoundary = true
+
+	ch := feed(
+		true,
+		txBegin("tb1"), insertAt("a1"), insertAt("a2"), txCommit("tc1"),
+		txBegin("tb2"), insertAt("b1"), txCommit("tc2"),
+	)
+	if err := RunBatchLoop(context.Background(), cfg, "stream", ch, 100); err != nil {
+		t.Fatalf("RunBatchLoop: %v", err)
+	}
+	if got, want := rec.rowsDeltas, []int64{2, 1}; !equalInt64(got, want) {
+		t.Fatalf("per-boundary rows deltas = %v; want [2 1] (carry resets each boundary)", got)
+	}
+	if got := rec.totalRowsApplied(); got != 3 {
+		t.Fatalf("cumulative rows_applied = %d; want 3", got)
+	}
+}
+
+func equalInt64(a, b []int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

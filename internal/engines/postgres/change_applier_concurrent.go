@@ -357,7 +357,7 @@ func (la *laneApplierAdapter) ClassifyError(err error) error {
 // guard; this does only the durable write. The F7 synchronous_commit pin is
 // applied (the position is durable per ADR-0007's hardening), and each error
 // is classified exactly as the serial position write would be.
-func (la *laneApplierAdapter) WriteCheckpoint(ctx context.Context, pos ir.Position) error {
+func (la *laneApplierAdapter) WriteCheckpoint(ctx context.Context, pos ir.Position, rowsApplied int64) error {
 	a := la.a
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -368,7 +368,7 @@ func (la *laneApplierAdapter) WriteCheckpoint(ctx context.Context, pos ir.Positi
 		return classifyApplierError(err)
 	}
 	posCtx, posCancel := a.execTimeoutCtx(ctx)
-	werr := writePositionTx(posCtx, tx, a.controlSchema, la.streamID, pos.Token, a.slotName, a.sourceFingerprint, a.targetSchema)
+	werr := writePositionTx(posCtx, tx, a.controlSchema, la.streamID, pos.Token, a.slotName, a.sourceFingerprint, a.targetSchema, rowsApplied)
 	posCancel()
 	if werr != nil {
 		_ = tx.Rollback()

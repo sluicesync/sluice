@@ -1063,7 +1063,10 @@ func (a *ChangeApplier) WritePosition(ctx context.Context, streamID string, pos 
 		return err
 	}
 	posCtx, posCancel := a.execTimeoutCtx(ctx)
-	err = writePositionTx(posCtx, tx, a.controlSchema, streamID, pos.Token, a.slotName, a.sourceFingerprint, a.targetSchema)
+	// A bare WritePosition (broker cold-start / schema-delta-only
+	// incremental) applies no row data, so it contributes 0 to the
+	// cumulative rows_applied counter.
+	err = writePositionTx(posCtx, tx, a.controlSchema, streamID, pos.Token, a.slotName, a.sourceFingerprint, a.targetSchema, 0)
 	posCancel()
 	if err != nil {
 		_ = tx.Rollback()
@@ -1280,7 +1283,10 @@ func (a *ChangeApplier) applyOneImpl(ctx context.Context, streamID string, c ir.
 	token := c.Pos().Token
 	if writePosition {
 		posCtx, posCancel := a.execTimeoutCtx(ctx)
-		err = writePositionTx(posCtx, tx, a.controlSchema, streamID, token, a.slotName, a.sourceFingerprint, a.targetSchema)
+		// Serial per-change apply: this change is durable in the same tx as
+		// its position, so it contributes 1 to rows_applied when it is a
+		// row-level DML change and 0 for a Truncate / SchemaSnapshot.
+		err = writePositionTx(posCtx, tx, a.controlSchema, streamID, token, a.slotName, a.sourceFingerprint, a.targetSchema, ir.RowsAppliedDelta(c))
 		posCancel()
 		if err != nil {
 			_ = tx.Rollback()

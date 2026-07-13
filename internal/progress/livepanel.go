@@ -83,13 +83,30 @@ type LiveHeader struct {
 //
 // It carries NO lag_bytes: that is a PG-pair-only quantity this cross-engine
 // panel cannot compute, and ADR-0156 is explicit that the panel must not imply
-// a byte-lag it cannot compute. Cumulative rows-applied / throughput are a
-// named phase-1 gap (see the CDC body view) — the control table does not carry
-// an applied-row counter, so the panel refuses to fabricate one.
+// a byte-lag it cannot compute.
+//
+// RowsApplied is the lifetime cumulative row-level-DML-applied counter the
+// target control table now persists ([ir.StreamStatus.RowsApplied]), valid
+// only when Known (the same control-row reading). Throughput is NOT carried
+// here — the panel computes it itself from the delta between successive
+// RowsApplied readings and their PolledAt instants, so a single reading never
+// implies a rate.
 type LiveStatus struct {
 	Position  string
 	Freshness time.Duration
 	Known     bool
+
+	// RowsApplied is the cumulative rows-applied count from this reading
+	// (valid only when Known). 0 is honest for a legacy pre-counter row or a
+	// stream that has applied no rows yet.
+	RowsApplied int64
+
+	// PolledAt is the wall-clock instant this reading was taken. It is the
+	// denominator clock for the panel's throughput (rows/s = Δrows /
+	// Δ(PolledAt)); carried in the message rather than read from a clock so
+	// the pure-model panel stays teatest-deterministic. Zero disables the
+	// throughput computation for this reading (no fabricated rate).
+	PolledAt time.Time
 }
 
 // liveEvent is one WARN/ERROR record surfaced live in the recent-events ring.
@@ -137,6 +154,19 @@ type livePanel struct {
 	status   LiveStatus
 	health   liveHealth
 	restarts int
+
+	// Throughput is computed panel-side from successive rows-applied readings
+	// (Δrows / Δ(PolledAt)), so a single reading never implies a rate. lastRows
+	// / lastRowsAt hold the previous reading's baseline; haveLastRows guards
+	// the first reading. rate / haveRate hold the last GOOD rate: a
+	// non-monotonic reading (a stream reset / ClearStream drops the counter)
+	// re-baselines without fabricating a negative spike, keeping the last good
+	// rate (or a dash if none yet).
+	lastRows     int64
+	lastRowsAt   time.Time
+	haveLastRows bool
+	rate         float64
+	haveRate     bool
 
 	// events is the bounded recent-events ring (last maxLiveEvents). eventTotal
 	// is the monotonic running counter kept visible after lines age out.
@@ -191,6 +221,7 @@ func (m livePanel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.cdc = true
 		return m, nil
 	case statusMsg:
+		m.updateThroughput(msg.status)
 		m.status = msg.status
 		if msg.status.Known {
 			// A known reading means CDC is applying (or a warm-resume started
@@ -239,6 +270,33 @@ func (m livePanel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, m.stopCmd
 }
 
+// updateThroughput folds one status reading into the panel-side rows/s
+// computation. It computes Δrows / Δ(PolledAt) against the previous reading,
+// guarding: the first reading (no baseline yet → no rate), a missing poll
+// timestamp (either side zero → skip; never divide by a bogus interval), a
+// non-positive time delta (skip), and a NON-MONOTONIC rows delta (a stream
+// reset / ClearStream drops the counter → do NOT show a negative or a bogus
+// spike; keep the last good rate and re-baseline). It always advances the
+// baseline to the current reading so the next delta is measured from here.
+func (m *livePanel) updateThroughput(s LiveStatus) {
+	if !s.Known {
+		return
+	}
+	if m.haveLastRows && !m.lastRowsAt.IsZero() && !s.PolledAt.IsZero() && s.PolledAt.After(m.lastRowsAt) {
+		dRows := s.RowsApplied - m.lastRows
+		dt := s.PolledAt.Sub(m.lastRowsAt).Seconds()
+		if dRows >= 0 && dt > 0 {
+			m.rate = float64(dRows) / dt
+			m.haveRate = true
+		}
+		// dRows < 0: counter regressed (stream reset) — keep the last good
+		// rate (or none) and fall through to re-baseline.
+	}
+	m.lastRows = s.RowsApplied
+	m.lastRowsAt = s.PolledAt
+	m.haveLastRows = true
+}
+
 // pushEvent appends to the bounded recent-events ring and bumps the running
 // total. The ring is trimmed to maxLiveEvents so memory is flat over a
 // days-long run (ADR-0156).
@@ -285,13 +343,14 @@ func (m livePanel) headerLine() string {
 }
 
 // cdcBody renders the steady-state CDC signals: mode, last-applied position,
-// freshness (the load-bearing lag signal, led with), and health.
+// freshness (the load-bearing lag signal, led with), rows-applied +
+// throughput, and health.
 //
-// Rows-applied / throughput are a NAMED phase-1 gap: the target control table
-// carries no applied-row counter, and per the loud-failure discipline the panel
-// refuses to fabricate one — it shows "n/a" with the reason rather than an
-// invented number (the same posture as the omitted PG-only lag_bytes). Wiring a
-// truthful applied-row counter is deferred to a follow-up (ADR-0156 phase 2/3).
+// Rows: the cumulative row-level-DML-applied counter the control table now
+// persists ([ir.StreamStatus.RowsApplied]) plus a panel-computed throughput
+// (rows/s, from successive readings). The *Known honesty contract holds — with
+// no reading yet the panel shows "—", never a fabricated 0; the rate is shown
+// only once two readings bound a positive interval (see updateThroughput).
 func (m livePanel) cdcBody() string {
 	var b strings.Builder
 	b.WriteString(okStyle.Render("  mode: CDC"))
@@ -311,8 +370,7 @@ func (m livePanel) cdcBody() string {
 	}
 	fmt.Fprintf(&b, "  %-12s %s\n", "freshness", fresh)
 
-	// Honest gap: no applied-row counter is surfaced by the control table.
-	fmt.Fprintf(&b, "  %-12s %s\n", "rows", dimStyle.Render("n/a (phase 1)"))
+	fmt.Fprintf(&b, "  %-12s %s\n", "rows", m.rowsLine())
 
 	health := m.health.String()
 	if m.restarts > 0 {
@@ -380,6 +438,54 @@ func (m livePanel) eventWidth() int {
 		maxw = 20
 	}
 	return maxw
+}
+
+// rowsLine renders the rows-applied field: the cumulative count plus, once a
+// rate is known, a "(N rows/s)" throughput. Honors the *Known contract — with
+// no reading yet it shows "—" (dimmed), never a fabricated 0.
+func (m livePanel) rowsLine() string {
+	if !m.status.Known {
+		return dimStyle.Render("—")
+	}
+	line := formatCount(m.status.RowsApplied)
+	if m.haveRate {
+		line += "  " + dimStyle.Render(fmt.Sprintf("(%s)", formatRate(m.rate)))
+	}
+	return line
+}
+
+// formatRate renders a rows/second throughput: one decimal below 10 rows/s
+// (so a slow trickle isn't rounded to "0 rows/s"), whole numbers above.
+func formatRate(r float64) string {
+	if r < 10 {
+		return fmt.Sprintf("%.1f rows/s", r)
+	}
+	return fmt.Sprintf("%.0f rows/s", r)
+}
+
+// formatCount renders an int64 with thousands separators ("1,234,567") for
+// readability in the panel. Handles the (not-expected) negative case for
+// completeness.
+func formatCount(n int64) string {
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	digits := fmt.Sprintf("%d", n)
+	var out strings.Builder
+	if neg {
+		out.WriteByte('-')
+	}
+	pre := len(digits) % 3
+	if pre == 0 {
+		pre = 3
+	}
+	out.WriteString(digits[:pre])
+	for i := pre; i < len(digits); i += 3 {
+		out.WriteByte(',')
+		out.WriteString(digits[i : i+3])
+	}
+	return out.String()
 }
 
 // humanFreshness renders a seconds-since-last-apply duration compactly:

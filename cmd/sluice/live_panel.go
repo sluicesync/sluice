@@ -226,9 +226,11 @@ func pollLiveStatus(ctx context.Context, applier ir.ChangeApplier, wantID string
 			if !st.UpdatedAt.IsZero() {
 				sink.EnterCDC()
 				sink.Status(progress.LiveStatus{
-					Position:  st.Position.Token,
-					Freshness: time.Since(st.UpdatedAt),
-					Known:     true,
+					Position:    st.Position.Token,
+					Freshness:   time.Since(st.UpdatedAt),
+					Known:       true,
+					RowsApplied: st.RowsApplied,
+					PolledAt:    time.Now(),
 				})
 			}
 			sink.HealthConnected(restarts)

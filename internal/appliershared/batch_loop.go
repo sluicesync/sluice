@@ -224,7 +224,17 @@ type BatchConfig struct {
 	// per-exec timeout; errors come back unwrapped (the loop returns
 	// them as-is after rolling back, matching the pre-extraction
 	// loops).
-	WritePosition func(ctx context.Context, tx BatchTx, streamID, token string) error
+	//
+	// rowsApplied is the number of row-level DML changes ([ir.Insert] /
+	// [ir.Update] / [ir.Delete]) this position write makes durable — it
+	// is added to the control row's cumulative rows_applied counter IN
+	// THE SAME UPSERT, so the counter advances iff the position advances
+	// (never counting rows the target didn't commit). On the
+	// CheckpointOnlyAtTxBoundary path a mid-transaction flush that skips
+	// the position write carries its DML forward so the boundary write's
+	// rowsApplied covers the whole inter-boundary window (see
+	// commitBatch); a no-data boundary/position write passes 0.
+	WritePosition func(ctx context.Context, tx BatchTx, streamID, token string, rowsApplied int64) error
 
 	// Commit commits the batch tx under the engine's Bug-56 watchdog
 	// (commitWithTimeout). For the PG pipelined path, Commit is where
@@ -276,6 +286,16 @@ type BatchConfig struct {
 // ApplyBatch) validate streamID and handle the maxBatchSize <= 1
 // fall-through to the per-change Apply path before calling.
 func RunBatchLoop(ctx context.Context, cfg *BatchConfig, streamID string, changes <-chan ir.Change, maxBatchSize int) error {
+	// pendingRowsApplied carries row-level DML across batches whose
+	// position write was skipped mid-transaction (the
+	// CheckpointOnlyAtTxBoundary path): those batches commit their DATA
+	// but defer the position write — and thus the rows_applied
+	// increment — to the next source-tx boundary, so the counter always
+	// advances together with the position (ADR-0007). On the PG path
+	// (CheckpointOnlyAtTxBoundary=false) it stays 0 — every flush writes
+	// the position and consumes its own batch's DML immediately. Owned
+	// here so it survives across RunOneBatch calls within one ApplyBatch.
+	var pendingRowsApplied int64
 	for {
 		// ADR-0052: when an AIMD controller is wired via
 		// SetBatchSizeProvider, consult it before each batch so the
@@ -290,7 +310,7 @@ func RunBatchLoop(ctx context.Context, cfg *BatchConfig, streamID string, change
 				effective = next
 			}
 		}
-		batchN, lastPos, channelClosed, err := RunOneBatch(ctx, cfg, streamID, changes, effective)
+		batchN, lastPos, channelClosed, err := runOneBatch(ctx, cfg, streamID, changes, effective, &pendingRowsApplied)
 		if err != nil {
 			return err
 		}
@@ -318,7 +338,22 @@ func RunBatchLoop(ctx context.Context, cfg *BatchConfig, streamID string, change
 // On error the open transaction is rolled back. On clean exit (row
 // cap, byte cap, idle grace, channel close, TxCommit flush, or a
 // schema-event flush) the transaction is committed.
+//
+// It allocates a per-call rows_applied carry so the exported signature
+// stays stable for the engine test delegates (change_applier_aimd_test.go)
+// that drive one batch cycle directly. Production drains through
+// [RunBatchLoop], which owns the carry across batches so the
+// CheckpointOnlyAtTxBoundary path accumulates skipped-mid-tx DML to the
+// boundary write.
 func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes <-chan ir.Change, maxBatchSize int) (n int, lastPos ir.Position, channelClosed bool, err error) {
+	var pending int64
+	return runOneBatch(ctx, cfg, streamID, changes, maxBatchSize, &pending)
+}
+
+// runOneBatch is the RunOneBatch body threaded with the cross-batch
+// rows_applied carry (pending); see [RunBatchLoop] for why the carry is
+// loop-owned.
+func runOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes <-chan ir.Change, maxBatchSize int, pending *int64) (n int, lastPos ir.Position, channelClosed bool, err error) {
 	// GitHub #18 Phase 1 + roadmap item 18: batch-latency telemetry.
 	// Measure wall-clock for the APPLY WORK only — begin-tx →
 	// dispatch(es) → position write → commit — NOT the time spent
@@ -368,7 +403,7 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 	// shutdown signal; a ctx cancel or a boundary-only position-write
 	// failure surfaces as an error — batchStart is still zero on both,
 	// so the defer's IsZero guard keeps them out of the AIMD window.
-	first, chClosed, werr := waitForFirstChange(ctx, cfg, streamID, changes)
+	first, chClosed, werr := waitForFirstChange(ctx, cfg, streamID, changes, pending)
 	if werr != nil {
 		return 0, ir.Position{}, false, werr
 	}
@@ -418,6 +453,15 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 	n = 1
 	lastPos = first.Pos()
 	batchBytes := ir.ApproximateChangeBytes(first)
+	// rowDML counts ONLY the row-level DML changes (Insert/Update/Delete)
+	// dispatched into this batch — the increment applied to the control
+	// row's cumulative rows_applied at the position write. A PG Truncate /
+	// SchemaSnapshot rides the batch tx and is counted in `n` (for logging)
+	// but NOT here, matching the [ir.StreamStatus.RowsApplied] semantics.
+	rowDML := 0
+	if ir.IsRowDMLChange(first) {
+		rowDML = 1
+	}
 
 	// TransactionalDDL=true (PG): a schema event was just dispatched
 	// onto `tx`. Flush it as a 1-change batch so the commitBatch
@@ -427,10 +471,10 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 	// after commitBatch reports nil (Chunk C cache-after-commit).
 	if cfg.TransactionalDDL {
 		if _, isTruncate := first.(ir.Truncate); isTruncate {
-			return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, true)
+			return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, true, pending)
 		}
 		if snap, isSnap := first.(ir.SchemaSnapshot); isSnap {
-			if err := commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, true); err != nil {
+			if err := commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, true, pending); err != nil {
 				return 0, ir.Position{}, false, err
 			}
 			cfg.CacheSchemaSnapshot(snap)
@@ -447,7 +491,7 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 	// above) and has just dispatched, so the engine's key cache is populated
 	// for the lookup.
 	if cfg.IsKeylessTable != nil && cfg.IsKeylessTable(ctx, first) {
-		return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, false)
+		return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending)
 	}
 
 	// Idle-flush timer: commit a partial batch if no further change
@@ -462,7 +506,7 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 		case c, ok := <-changes:
 			if !ok {
 				channelClosed = true
-				return n, lastPos, channelClosed, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, false)
+				return n, lastPos, channelClosed, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending)
 			}
 			// Source-tx boundary handling (ADR-0027). TxCommit flushes
 			// the in-flight target tx so the apply aligns with the
@@ -474,7 +518,7 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 			// to keep alignment.
 			if _, isTxCommit := c.(ir.TxCommit); isTxCommit {
 				lastPos = c.Pos()
-				return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, true)
+				return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, true, pending)
 			}
 			if _, isTxBegin := c.(ir.TxBegin); isTxBegin {
 				// Reset the idle timer so a TxBegin observed mid-batch
@@ -492,7 +536,7 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 			// the per-change path. Return rows=1 and the event's
 			// position so the outer loop logs it as its own batch.
 			if !cfg.TransactionalDDL && isSchemaEvent(c) {
-				if err := commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, false); err != nil {
+				if err := commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending); err != nil {
 					return 0, ir.Position{}, false, err
 				}
 				logBatchCommitted(ctx, cfg.EngineName, streamID, n, lastPos.Token)
@@ -516,6 +560,9 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 			}
 			n++
 			lastPos = c.Pos()
+			if ir.IsRowDMLChange(c) {
+				rowDML++
+			}
 			batchBytes += ir.ApproximateChangeBytes(c)
 			// TransactionalDDL=true (PG): the schema event's write just
 			// landed on `tx`; flush now so the commitBatch position
@@ -524,10 +571,10 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 			// arrive in later batches) are applied.
 			if cfg.TransactionalDDL {
 				if _, isTruncate := c.(ir.Truncate); isTruncate {
-					return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, true)
+					return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, true, pending)
 				}
 				if snap, isSnap := c.(ir.SchemaSnapshot); isSnap {
-					if err := commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, true); err != nil {
+					if err := commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, true, pending); err != nil {
 						return 0, ir.Position{}, false, err
 					}
 					// ADR-0049 Chunk C cache-after-commit: see the
@@ -546,7 +593,7 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 			// (keyless CDC is at-least-once; see the IsKeylessTable doc and
 			// the first-change branch above; Bug 143).
 			if cfg.IsKeylessTable != nil && cfg.IsKeylessTable(ctx, c) {
-				return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, false)
+				return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending)
 			}
 			// Byte-cap flush (ADR-0028): bounds the in-flight tx's
 			// buffered parameter memory on wide-row streams. Checked
@@ -571,7 +618,7 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 						hinter.NoteByteCapDominant(ctx, n, batchBytes, cfg.ByteCap)
 					}
 				}
-				return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, false)
+				return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending)
 			}
 			// Reset the idle timer for each successful change so the
 			// timer measures gaps between events, not absolute time
@@ -584,14 +631,14 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 				slog.Int("rows", n),
 				slog.Duration("idle", DefaultIdleFlushPeriod),
 			)
-			return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, false)
+			return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending)
 		case <-ctx.Done():
 			_ = tx.Rollback()
 			return 0, ir.Position{}, false, ctx.Err()
 		}
 	}
 
-	return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, false)
+	return n, lastPos, false, commitBatch(ctx, cfg, tx, streamID, lastPos.Token, n, rowDML, false, pending)
 }
 
 // waitForFirstChange blocks until the first row-bearing change of a
@@ -613,7 +660,7 @@ func RunOneBatch(ctx context.Context, cfg *BatchConfig, streamID string, changes
 //     position-only tx (the rows are already durable via serial in-order
 //     apply). Without the flag (PG) this is a pure no-op — PG already
 //     advanced its position on the rows' own flushes.
-func waitForFirstChange(ctx context.Context, cfg *BatchConfig, streamID string, changes <-chan ir.Change) (first ir.Change, channelClosed bool, err error) {
+func waitForFirstChange(ctx context.Context, cfg *BatchConfig, streamID string, changes <-chan ir.Change, pending *int64) (first ir.Change, channelClosed bool, err error) {
 	for {
 		select {
 		case c, ok := <-changes:
@@ -625,7 +672,7 @@ func waitForFirstChange(ctx context.Context, cfg *BatchConfig, streamID string, 
 				continue
 			case ir.TxCommit:
 				if cfg.CheckpointOnlyAtTxBoundary {
-					if err := writeBoundaryOnly(ctx, cfg, streamID, c.Pos().Token); err != nil {
+					if err := writeBoundaryOnly(ctx, cfg, streamID, c.Pos().Token, pending); err != nil {
 						return nil, false, err
 					}
 				}
@@ -653,10 +700,25 @@ func waitForFirstChange(ctx context.Context, cfg *BatchConfig, streamID string, 
 // whole in-flight transaction (see the CheckpointOnlyAtTxBoundary doc for
 // why MySQL file/pos cannot resume mid-transaction). When the flag is
 // false (Postgres) every flush writes the position as before.
-func commitBatch(ctx context.Context, cfg *BatchConfig, tx BatchTx, streamID, token string, rows int, atBoundary bool) error {
+//
+// rowDML is the number of row-level DML changes this batch dispatched.
+// The rows_applied counter must advance IFF the position advances (never
+// counting rows the target didn't durably commit under a durable
+// position), so:
+//   - position written (skipPosition=false): the write carries
+//     *pending + rowDML — this batch's DML plus any DML from prior
+//     mid-tx flushes that skipped their position write — and the carry
+//     resets to 0.
+//   - position skipped (skipPosition=true, the CheckpointOnlyAtTxBoundary
+//     mid-tx case): the data commits but the counter is deferred, so
+//     rowDML is ADDED to *pending (after the commit succeeds) to be
+//     counted at the next boundary write. A crash before that boundary
+//     replays the whole tx from the last boundary and re-counts once on
+//     resume (idempotent apply; the persisted counter never advanced).
+func commitBatch(ctx context.Context, cfg *BatchConfig, tx BatchTx, streamID, token string, rows, rowDML int, atBoundary bool, pending *int64) error {
 	skipPosition := cfg.CheckpointOnlyAtTxBoundary && !atBoundary
 	if !skipPosition {
-		if err := cfg.WritePosition(ctx, tx, streamID, token); err != nil {
+		if err := cfg.WritePosition(ctx, tx, streamID, token, *pending+int64(rowDML)); err != nil {
 			_ = tx.Rollback()
 			slog.WarnContext(
 				ctx, cfg.EngineName+": applier: batch rollback on position-write error",
@@ -676,7 +738,15 @@ func commitBatch(ctx context.Context, cfg *BatchConfig, tx BatchTx, streamID, to
 		)
 		return cfg.Classify(fmt.Errorf("%s: applier: commit: %w", cfg.EngineName, err))
 	}
-	if !skipPosition && cfg.AfterCommit != nil {
+	if skipPosition {
+		// Data durable, position (and thus rows_applied) deferred to the
+		// boundary. Carry this batch's DML forward AFTER the commit
+		// succeeds so a failed commit never inflates the counter.
+		*pending += int64(rowDML)
+		return nil
+	}
+	*pending = 0
+	if cfg.AfterCommit != nil {
 		cfg.AfterCommit(ctx, token)
 	}
 	return nil
@@ -691,12 +761,18 @@ func commitBatch(ctx context.Context, cfg *BatchConfig, tx BatchTx, streamID, to
 // in-order apply), so persisting the boundary afterward never moves the
 // position ahead of durable data (ADR-0007). Mirrors commitBatch's
 // position-then-commit-then-AfterCommit ordering for the one-row-less case.
-func writeBoundaryOnly(ctx context.Context, cfg *BatchConfig, streamID, token string) error {
+//
+// It carries *pending (row-level DML committed in prior mid-tx flushes
+// whose position write was skipped) into the boundary position write so
+// rows_applied advances together with the position, then resets the
+// carry. On the non-CheckpointOnly path this helper is unreachable
+// (waitForFirstChange only calls it under CheckpointOnlyAtTxBoundary).
+func writeBoundaryOnly(ctx context.Context, cfg *BatchConfig, streamID, token string, pending *int64) error {
 	tx, err := cfg.BeginTx(ctx)
 	if err != nil {
 		return err
 	}
-	if err := cfg.WritePosition(ctx, tx, streamID, token); err != nil {
+	if err := cfg.WritePosition(ctx, tx, streamID, token, *pending); err != nil {
 		_ = tx.Rollback()
 		slog.WarnContext(
 			ctx, cfg.EngineName+": applier: boundary-position rollback on write error",
@@ -708,6 +784,7 @@ func writeBoundaryOnly(ctx context.Context, cfg *BatchConfig, streamID, token st
 	if err := cfg.Commit(tx); err != nil {
 		return cfg.Classify(fmt.Errorf("%s: applier: boundary commit: %w", cfg.EngineName, err))
 	}
+	*pending = 0
 	if cfg.AfterCommit != nil {
 		cfg.AfterCommit(ctx, token)
 	}

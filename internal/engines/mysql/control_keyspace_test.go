@@ -171,30 +171,33 @@ func TestSelectControlKeyspace(t *testing.T) {
 
 // TestWritePositionUpsertSQL pins the byte-exactness of the ADR-0007 position
 // write — the atomicity-critical statement that rides the per-change data tx.
-// The unset shape MUST be byte-identical to the historical single-keyspace
-// statement; the set shape qualifies the table AND the three COALESCE column
-// sources (yielding valid three-part `ks`.`table`.column references).
+// The set shape qualifies the table AND every COALESCE column source (yielding
+// valid three-part `ks`.`table`.column references). ADR-0156 phase 2 added the
+// rows_applied ACCUMULATING column (COALESCE(existing, 0) + delta), the last
+// column in both the INSERT list and the ON DUPLICATE KEY UPDATE set.
 func TestWritePositionUpsertSQL(t *testing.T) {
 	const wantBare = "INSERT INTO `sluice_cdc_state` " +
-		"(stream_id, source_position, slot_name, source_dsn_fingerprint, target_schema) " +
-		"VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, '')) " +
+		"(stream_id, source_position, slot_name, source_dsn_fingerprint, target_schema, rows_applied) " +
+		"VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?) " +
 		"AS new ON DUPLICATE KEY UPDATE " +
 		"source_position = new.source_position, " +
 		"slot_name = COALESCE(new.slot_name, `sluice_cdc_state`.slot_name), " +
 		"source_dsn_fingerprint = COALESCE(new.source_dsn_fingerprint, `sluice_cdc_state`.source_dsn_fingerprint), " +
-		"target_schema = COALESCE(new.target_schema, `sluice_cdc_state`.target_schema)"
+		"target_schema = COALESCE(new.target_schema, `sluice_cdc_state`.target_schema), " +
+		"rows_applied = COALESCE(`sluice_cdc_state`.rows_applied, 0) + new.rows_applied"
 	if got := writePositionUpsertSQL(""); got != wantBare {
-		t.Fatalf("writePositionUpsertSQL(\"\") not byte-identical to historical statement:\n got: %s\nwant: %s", got, wantBare)
+		t.Fatalf("writePositionUpsertSQL(\"\") not byte-identical to expected statement:\n got: %s\nwant: %s", got, wantBare)
 	}
 
 	const wantQualified = "INSERT INTO `ctl`.`sluice_cdc_state` " +
-		"(stream_id, source_position, slot_name, source_dsn_fingerprint, target_schema) " +
-		"VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, '')) " +
+		"(stream_id, source_position, slot_name, source_dsn_fingerprint, target_schema, rows_applied) " +
+		"VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?) " +
 		"AS new ON DUPLICATE KEY UPDATE " +
 		"source_position = new.source_position, " +
 		"slot_name = COALESCE(new.slot_name, `ctl`.`sluice_cdc_state`.slot_name), " +
 		"source_dsn_fingerprint = COALESCE(new.source_dsn_fingerprint, `ctl`.`sluice_cdc_state`.source_dsn_fingerprint), " +
-		"target_schema = COALESCE(new.target_schema, `ctl`.`sluice_cdc_state`.target_schema)"
+		"target_schema = COALESCE(new.target_schema, `ctl`.`sluice_cdc_state`.target_schema), " +
+		"rows_applied = COALESCE(`ctl`.`sluice_cdc_state`.rows_applied, 0) + new.rows_applied"
 	if got := writePositionUpsertSQL("ctl"); got != wantQualified {
 		t.Fatalf("writePositionUpsertSQL(\"ctl\"):\n got: %s\nwant: %s", got, wantQualified)
 	}

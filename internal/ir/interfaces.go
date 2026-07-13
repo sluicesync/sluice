@@ -1639,6 +1639,36 @@ type StreamStatus struct {
 	// started without `--target-schema` (treated as "use the DSN
 	// default schema").
 	TargetSchema string
+
+	// RowsApplied is the LIFETIME cumulative count of row-level DML
+	// changes (INSERT + UPDATE + DELETE — see [IsRowDMLChange]) the
+	// applier has durably applied to the target for this stream since
+	// the control row was created. It is incremented in the SAME
+	// write that advances the stream position (ADR-0007), so a partial
+	// apply can never inflate it: a batch (or lane) that fails or rolls
+	// back before its commit contributes nothing (the increment rides
+	// the same tx as the position and rolls back with it), and on a
+	// crash between a data commit and its position write BOTH the
+	// position and this counter stay at the last durable boundary.
+	// TRUNCATE, SchemaSnapshot, and transaction markers are NOT
+	// counted.
+	//
+	// The count is of row-changes APPLIED, at-least-once across a
+	// warm-resume: CDC redelivers a bounded tail of already-applied
+	// changes from the persisted position, and those idempotent
+	// re-applies are counted again — so after a resume the lifetime
+	// total can slightly exceed the number of DISTINCT source changes.
+	// That is honest (the target genuinely received those applies) and
+	// consistent with the apply path's at-least-once resume model; it
+	// is never an UNDER-count, and it never counts a change the target
+	// did not commit.
+	//
+	// Zero for engines that don't persist it, for legacy rows that
+	// pre-date the additive rows_applied column (COALESCE(…, 0) — the
+	// count starts from 0 at the first post-upgrade position write,
+	// which is honest: pre-upgrade applies were never tracked), and
+	// for a freshly-created stream that has not yet applied a row.
+	RowsApplied int64
 }
 
 // SchemaSetter is the optional surface a [SchemaReader], [SchemaWriter],

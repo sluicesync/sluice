@@ -446,13 +446,13 @@ func (b *mysqlBatchTx) flushDeletes(ctx context.Context) error {
 // then writes the stream position on the same tx — the first half of the
 // ADR-0007 position-and-data atomicity contract. Mirrors the serial batch
 // path's WritePosition closure, with the leading flush added.
-func (b *mysqlBatchTx) writePosition(ctx context.Context, streamID, token string) error {
+func (b *mysqlBatchTx) writePosition(ctx context.Context, streamID, token string, rowsApplied int64) error {
 	if err := b.flushPending(ctx); err != nil {
 		return err
 	}
 	posCtx, posCancel := b.a.execTimeoutCtx(ctx)
 	defer posCancel()
-	return writePositionTx(posCtx, b.tx, b.a.controlKeyspace, streamID, token, b.a.slotName, b.a.sourceFingerprint, b.a.targetSchema)
+	return writePositionTx(posCtx, b.tx, b.a.controlKeyspace, streamID, token, b.a.slotName, b.a.sourceFingerprint, b.a.targetSchema, rowsApplied)
 }
 
 // commit flushes any remaining pending run (the CheckpointOnlyAtTxBoundary

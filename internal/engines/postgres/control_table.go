@@ -119,6 +119,16 @@ func ensureControlTable(ctx context.Context, db *sql.DB, schema string) error {
 	if _, err := db.ExecContext(ctx, alter); err != nil {
 		return fmt.Errorf("postgres: ensure control table: add target_schema: %w", err)
 	}
+	// Migration path for pre-ADR-0156-phase-2 deployments: the
+	// rows_applied column is the lifetime cumulative row-level-DML-applied
+	// counter surfaced in `sync start`'s live panel. NOT NULL DEFAULT 0
+	// backfills legacy rows to 0 (an honest cumulative starting point —
+	// pre-upgrade applies were never tracked). ADD COLUMN IF NOT EXISTS is
+	// supported in every PG version sluice targets.
+	alter = "ALTER TABLE " + tableRef + " ADD COLUMN IF NOT EXISTS rows_applied BIGINT NOT NULL DEFAULT 0"
+	if _, err := db.ExecContext(ctx, alter); err != nil {
+		return fmt.Errorf("postgres: ensure control table: add rows_applied: %w", err)
+	}
 	return nil
 }
 
@@ -376,7 +386,8 @@ func listStreams(ctx context.Context, db *sql.DB, schema, engineName string) ([]
 	q := "SELECT stream_id, source_position, updated_at, " +
 		"COALESCE(slot_name, ''), " +
 		"COALESCE(source_dsn_fingerprint, ''), " +
-		"COALESCE(target_schema, '') " +
+		"COALESCE(target_schema, ''), " +
+		"COALESCE(rows_applied, 0) " +
 		"FROM " + controlTableRef(schema)
 	return appliershared.ListStreams(ctx, db, controlCfg, q, engineName)
 }
@@ -417,8 +428,13 @@ func listStreams(ctx context.Context, db *sql.DB, schema, engineName string) ([]
 // preserves the row's existing value (legacy / streams started
 // without --target-schema / chain-handoff WritePosition without
 // streamer context).
-func writePositionTx(ctx context.Context, tx *sql.Tx, schema, streamID, token, slotName, sourceFingerprint, targetSchema string) error {
-	q, args := buildWritePositionSQL(schema, streamID, token, slotName, sourceFingerprint, targetSchema)
+//
+// rowsApplied is the number of row-level DML changes this position write
+// makes durable; it is ADDED to the row's cumulative rows_applied in the
+// SAME upsert so the counter advances atomically with the position
+// (ADR-0156 phase 2). 0 for a no-data position write.
+func writePositionTx(ctx context.Context, tx *sql.Tx, schema, streamID, token, slotName, sourceFingerprint, targetSchema string, rowsApplied int64) error {
+	q, args := buildWritePositionSQL(schema, streamID, token, slotName, sourceFingerprint, targetSchema, rowsApplied)
 	if _, err := tx.ExecContext(ctx, q, args...); err != nil {
 		return fmt.Errorf("postgres: write position: %w", err)
 	}
@@ -436,17 +452,22 @@ func writePositionTx(ctx context.Context, tx *sql.Tx, schema, streamID, token, s
 // back to whichever value the existing row already carries — so a
 // chain-handoff position-write that lacks streamer context doesn't clobber
 // the streamer's previously-recorded values.
-func buildWritePositionSQL(schema, streamID, token, slotName, sourceFingerprint, targetSchema string) (stmt string, args []any) {
+func buildWritePositionSQL(schema, streamID, token, slotName, sourceFingerprint, targetSchema string, rowsApplied int64) (stmt string, args []any) {
 	tableRef := controlTableRef(schema)
-	q := "INSERT INTO " + tableRef + " (stream_id, source_position, updated_at, slot_name, source_dsn_fingerprint, target_schema) " +
-		"VALUES ($1, $2, CURRENT_TIMESTAMP, NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, '')) " +
+	q := "INSERT INTO " + tableRef + " (stream_id, source_position, updated_at, slot_name, source_dsn_fingerprint, target_schema, rows_applied) " +
+		"VALUES ($1, $2, CURRENT_TIMESTAMP, NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, ''), $6) " +
 		"ON CONFLICT (stream_id) DO UPDATE SET " +
 		"source_position = EXCLUDED.source_position, " +
 		"updated_at = EXCLUDED.updated_at, " +
 		"slot_name = COALESCE(EXCLUDED.slot_name, " + tableRef + ".slot_name), " +
 		"source_dsn_fingerprint = COALESCE(EXCLUDED.source_dsn_fingerprint, " + tableRef + ".source_dsn_fingerprint), " +
-		"target_schema = COALESCE(EXCLUDED.target_schema, " + tableRef + ".target_schema)"
-	return q, []any{streamID, token, slotName, sourceFingerprint, targetSchema}
+		"target_schema = COALESCE(EXCLUDED.target_schema, " + tableRef + ".target_schema), " +
+		// rows_applied ACCUMULATES: add this write's delta to the existing
+		// count (COALESCE guards a legacy NULL row, though NOT NULL DEFAULT 0
+		// means the column is never NULL post-migration). EXCLUDED.rows_applied
+		// is the $6 delta, NOT a replacement value.
+		"rows_applied = COALESCE(" + tableRef + ".rows_applied, 0) + EXCLUDED.rows_applied"
+	return q, []any{streamID, token, slotName, sourceFingerprint, targetSchema, rowsApplied}
 }
 
 // readStopRequested returns true when the named stream's row has a

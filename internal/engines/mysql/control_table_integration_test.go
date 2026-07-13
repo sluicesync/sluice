@@ -147,7 +147,7 @@ func TestRequestStop_RoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	if err := writePositionTx(ctx, tx, "", "test-stream", "tok", "", "", ""); err != nil {
+	if err := writePositionTx(ctx, tx, "", "test-stream", "tok", "", "", "", 0); err != nil {
 		t.Fatalf("writePositionTx: %v", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -327,6 +327,102 @@ func TestEnsureControlTable_AddsCrossEngineParityColumns(t *testing.T) {
 	// Calling EnsureControlTable again is still a no-op (idempotent).
 	if err := applier.EnsureControlTable(ctx); err != nil {
 		t.Fatalf("second EnsureControlTable: %v", err)
+	}
+}
+
+// TestWritePositionTx_RowsAppliedAccumulatesAndBackCompat pins the ADR-0156
+// phase 2 rows_applied counter end-to-end against a real MySQL:
+//
+//   - a LEGACY control table (no rows_applied column) picks the column up on
+//     EnsureControlTable, and the existing row backfills to 0 (NOT NULL
+//     DEFAULT 0 — an honest cumulative start);
+//   - each writePositionTx ADDS its delta (COALESCE(existing,0) + delta), so
+//     successive writes ACCUMULATE (never replace); a delta-0 write is a no-op
+//     on the count;
+//   - listStreams round-trips the cumulative value via StreamStatus.RowsApplied.
+func TestWritePositionTx_RowsAppliedAccumulatesAndBackCompat(t *testing.T) {
+	dsn, cleanup := startMySQLForApplier(t)
+	defer cleanup()
+
+	// Legacy shape: no rows_applied column, one pre-existing row.
+	applyMySQLApplier(t, dsn, "CREATE TABLE `sluice_cdc_state` ("+
+		"  stream_id         VARCHAR(255) NOT NULL,"+
+		"  source_position   TEXT         NOT NULL,"+
+		"  updated_at        TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"+
+		"  stop_requested_at TIMESTAMP    NULL,"+
+		"  PRIMARY KEY (stream_id)"+
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"+
+		"INSERT INTO `sluice_cdc_state` (stream_id, source_position) VALUES ('legacy-stream', 'legacy-token');")
+
+	eng := Engine{Flavor: FlavorVanilla}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	applier, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+	if err := applier.EnsureControlTable(ctx); err != nil {
+		t.Fatalf("EnsureControlTable: %v", err)
+	}
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	rowsFor := func(streamID string) int64 {
+		t.Helper()
+		streams, err := applier.ListStreams(ctx)
+		if err != nil {
+			t.Fatalf("ListStreams: %v", err)
+		}
+		for _, s := range streams {
+			if s.StreamID == streamID {
+				return s.RowsApplied
+			}
+		}
+		t.Fatalf("stream %q not found in ListStreams", streamID)
+		return 0
+	}
+	if got := rowsFor("legacy-stream"); got != 0 {
+		t.Fatalf("legacy row rows_applied = %d; want 0 (backfilled)", got)
+	}
+
+	write := func(streamID, token string, delta int64) {
+		t.Helper()
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		if err := writePositionTx(ctx, tx, "", streamID, token, "", "", "", delta); err != nil {
+			t.Fatalf("writePositionTx: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+	}
+
+	write("legacy-stream", "tok-1", 3)
+	write("legacy-stream", "tok-2", 2)
+	write("legacy-stream", "tok-3", 0)
+	if got := rowsFor("legacy-stream"); got != 5 {
+		t.Fatalf("legacy-stream rows_applied = %d; want 5 (3+2+0 accumulated)", got)
+	}
+
+	write("fresh-stream", "f-1", 4)
+	write("fresh-stream", "f-2", 4)
+	if got := rowsFor("fresh-stream"); got != 8 {
+		t.Fatalf("fresh-stream rows_applied = %d; want 8", got)
+	}
+	if got := rowsFor("legacy-stream"); got != 5 {
+		t.Fatalf("legacy-stream rows_applied drifted to %d; want 5 (streams independent)", got)
 	}
 }
 

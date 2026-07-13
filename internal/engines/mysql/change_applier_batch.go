@@ -152,8 +152,8 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 		Redact:     a.redactChange,
 		StampShard: a.stampShardChange,
 		Classify:   classifyApplierError,
-		WritePosition: func(ctx context.Context, tx appliershared.BatchTx, streamID, token string) error {
-			return tx.(*mysqlBatchTx).writePosition(ctx, streamID, token)
+		WritePosition: func(ctx context.Context, tx appliershared.BatchTx, streamID, token string, rowsApplied int64) error {
+			return tx.(*mysqlBatchTx).writePosition(ctx, streamID, token, rowsApplied)
 		},
 		Commit: func(tx appliershared.BatchTx) error {
 			return tx.(*mysqlBatchTx).commit()

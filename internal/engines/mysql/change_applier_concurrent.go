@@ -262,7 +262,7 @@ func (la *laneApplierAdapter) ClassifyError(err error) error {
 // relaxation). The orchestrator owns the frontier read + the seq-monotone
 // guard; this does only the durable write, wrapping each error in
 // classifyApplierError exactly as the GA writeCheckpoint did.
-func (la *laneApplierAdapter) WriteCheckpoint(ctx context.Context, pos ir.Position) error {
+func (la *laneApplierAdapter) WriteCheckpoint(ctx context.Context, pos ir.Position, rowsApplied int64) error {
 	a := la.a
 	posCtx, cancel := a.execTimeoutCtx(ctx)
 	defer cancel()
@@ -270,7 +270,7 @@ func (la *laneApplierAdapter) WriteCheckpoint(ctx context.Context, pos ir.Positi
 	if err != nil {
 		return classifyApplierError(fmt.Errorf("mysql: applier: checkpoint begin: %w", err))
 	}
-	if err := writePositionTx(posCtx, tx, a.controlKeyspace, la.streamID, pos.Token, a.slotName, a.sourceFingerprint, a.targetSchema); err != nil {
+	if err := writePositionTx(posCtx, tx, a.controlKeyspace, la.streamID, pos.Token, a.slotName, a.sourceFingerprint, a.targetSchema, rowsApplied); err != nil {
 		_ = tx.Rollback()
 		return classifyApplierError(fmt.Errorf("mysql: applier: checkpoint position write: %w", err))
 	}

@@ -41,7 +41,7 @@ func (s *recordingSeam) ApplyLaneBatch(_ context.Context, _ int, batch []ir.Chan
 
 func (s *recordingSeam) ClassifyError(err error) error { return err }
 
-func (s *recordingSeam) WriteCheckpoint(_ context.Context, pos ir.Position) error {
+func (s *recordingSeam) WriteCheckpoint(_ context.Context, pos ir.Position, _ int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.checkpoints = append(s.checkpoints, pos.Token)

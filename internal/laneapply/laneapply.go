@@ -141,7 +141,17 @@ type LaneApplier interface {
 	// orchestrator owns the frontier read + the seq-monotone guard; this
 	// method does only the durable write and returns an already-classified
 	// error.
-	WriteCheckpoint(ctx context.Context, pos ir.Position) error
+	//
+	// rowsApplied is the number of row-level DML changes ([ir.Insert] /
+	// [ir.Update] / [ir.Delete]) that became durable across all lanes
+	// between the previously-persisted checkpoint boundary and this one — the
+	// increment added to the control row's cumulative rows_applied IN THE
+	// SAME checkpoint write, so the counter advances together with the
+	// position (never counting a routed change until its boundary is durable
+	// across every lane; see the orchestrator's boundaryRowDML tracking). 0
+	// when the boundary advanced with no intervening DML (e.g. a Truncate
+	// boundary).
+	WriteCheckpoint(ctx context.Context, pos ir.Position, rowsApplied int64) error
 
 	// ApplyBarrierChange applies one barrier-path change on the coordinator
 	// backend (writing its position + data atomically per ADR-0007), and —
@@ -317,6 +327,33 @@ type Orchestrator struct {
 	sinceCheckpoint int    // routed changes since the last checkpoint
 	lastWrittenSeq  uint64 // seq of the last persisted boundary (monotone guard)
 
+	// --- Cumulative rows-applied accounting (ADR-0156 phase 2) ---
+	//
+	// cumRowDML is the running count of row-level DML changes
+	// (Insert/Update/Delete — routed to a lane OR barriered) the
+	// coordinator has PROCESSED so far, keyed by source sequence. It counts
+	// at ROUTE time (before the lane commits), but the counter is only ever
+	// REALIZED at a checkpoint (writeCheckpoint), whose boundary seq is by
+	// definition durable across every lane — so a delta derived from it
+	// reflects only DML that is both committed AND covered by the persisted
+	// position. Coordinator-goroutine-only (all of handle / noteBoundary /
+	// flushPendingBoundary / writeCheckpoint run on the coordinator), so no
+	// lock is needed — mirroring sinceCheckpoint / lastWrittenSeq.
+	cumRowDML uint64
+
+	// boundaryRowDML maps a recorded checkpoint-boundary seq → cumRowDML as
+	// of that seq (the count of DML with source seq ≤ that boundary). Every
+	// frontier.RecordTxBoundary call site records the matching cum here so
+	// writeCheckpoint can look up the chosen boundary's cumulative count and
+	// emit the delta since the last persisted boundary. Pruned as the
+	// persisted checkpoint advances. Coordinator-goroutine-only.
+	boundaryRowDML map[uint64]uint64
+
+	// lastWrittenCum is cumRowDML as of the last persisted checkpoint
+	// boundary; the WriteCheckpoint delta is boundaryRowDML[chosenSeq] −
+	// lastWrittenCum. Coordinator-goroutine-only.
+	lastWrittenCum uint64
+
 	// prevSeq / prevPos drive the position-run boundary heuristic used ONLY on
 	// marker-LESS streams (VStream — see sawTxMarker): a checkpoint boundary is
 	// the highest seq sharing a given source position, detected when the NEXT
@@ -329,6 +366,12 @@ type Orchestrator struct {
 	// path). prevSeq == 0 means "no prior event".
 	prevSeq uint64
 	prevPos ir.Position
+
+	// prevCum is cumRowDML as of prevSeq — the cumulative row-DML count to
+	// record for prevSeq when noteBoundary / flushPendingBoundary settle it
+	// as a checkpoint boundary on a marker-LESS stream. Kept in lockstep
+	// with prevSeq / prevPos. Coordinator-goroutine-only.
+	prevCum uint64
 
 	// lastNotedSeq is the highest prevSeq already handed to the frontier as a
 	// boundary (by noteBoundary or the idle-checkpoint flush). It dedups the
@@ -386,6 +429,7 @@ func NewOrchestrator(cfg Config, la LaneApplier) *Orchestrator {
 		frontier:        NewFrontier(),
 		laneIn:          make([]chan LaneChange, lanes),
 		laneControllers: cfg.LaneControllers,
+		boundaryRowDML:  make(map[uint64]uint64),
 	}
 	// Buffer each lane a batch's worth so the coordinator's routing isn't
 	// gated on a lane's per-change commit latency (the whole point — lanes
@@ -558,11 +602,19 @@ func (o *Orchestrator) handle(ctx context.Context, seq uint64, c ir.Change) erro
 		// The source-transaction boundary: its position is the resume-safe
 		// restart point. Record it — the frontier returns it as the checkpoint
 		// once every lower seq (this tx's rows) is durably committed across all
-		// lanes.
+		// lanes. cumRowDML here already counts every DML change in this tx (they
+		// had lower seqs and were processed first); TxCommit itself is not DML.
 		o.frontier.RecordTxBoundary(seq, c.Pos())
+		o.boundaryRowDML[seq] = o.cumRowDML
 		o.frontier.MarkCommitted(seq)
 		return o.maybeCheckpoint(ctx)
 	case ir.Insert, ir.Update, ir.Delete:
+		// Count the row-level DML change (routed OR — via routeRow's ok=false
+		// fall-through — barriered; both are counted here exactly once, before
+		// the lane/barrier applies it). The counter is only realized at a
+		// durable checkpoint, so counting at route time can never over-count a
+		// change the target didn't commit.
+		o.cumRowDML++
 		// Marker-less (VStream) only: the position-run heuristic. On a marker
 		// stream a row position is mid-transaction and must NOT be a boundary.
 		if !o.sawTxMarker {
@@ -570,13 +622,15 @@ func (o *Orchestrator) handle(ctx context.Context, seq uint64, c ir.Change) erro
 		}
 		return o.routeRow(ctx, seq, c)
 	default:
-		// Truncate, SchemaSnapshot, or any future barrier-class event.
+		// Truncate, SchemaSnapshot, or any future barrier-class event. Not
+		// row-level DML — cumRowDML is unchanged.
 		if o.sawTxMarker {
 			// A Truncate is a DDL statement boundary (auto-committed, not
 			// wrapped in BEGIN/XID), so its position IS a resume-safe restart
 			// point — record it. SchemaSnapshot is NOT (metadata-anchored).
 			if _, isTrunc := c.(ir.Truncate); isTrunc {
 				o.frontier.RecordTxBoundary(seq, c.Pos())
+				o.boundaryRowDML[seq] = o.cumRowDML
 			}
 		} else if !isSchemaSnapshot(c) {
 			o.noteBoundary(seq, c.Pos())
@@ -605,10 +659,14 @@ func isSchemaSnapshot(c ir.Change) bool {
 func (o *Orchestrator) noteBoundary(seq uint64, pos ir.Position) {
 	if o.prevSeq != 0 && pos.Token != o.prevPos.Token && o.prevSeq > o.lastNotedSeq {
 		o.frontier.RecordTxBoundary(o.prevSeq, o.prevPos)
+		o.boundaryRowDML[o.prevSeq] = o.prevCum
 		o.lastNotedSeq = o.prevSeq
 	}
 	o.prevSeq = seq
 	o.prevPos = pos
+	// Snapshot the cum for THIS change; the caller has already incremented
+	// cumRowDML for a DML change, so prevCum = count of DML with seq ≤ seq.
+	o.prevCum = o.cumRowDML
 }
 
 // flushPendingBoundary records the trailing prevSeq/prevPos of a marker-LESS
@@ -625,6 +683,7 @@ func (o *Orchestrator) noteBoundary(seq uint64, pos ir.Position) {
 func (o *Orchestrator) flushPendingBoundary() {
 	if o.prevSeq != 0 && o.prevSeq > o.lastNotedSeq {
 		o.frontier.RecordTxBoundary(o.prevSeq, o.prevPos)
+		o.boundaryRowDML[o.prevSeq] = o.prevCum
 		o.lastNotedSeq = o.prevSeq
 	}
 }
@@ -1015,11 +1074,40 @@ func (o *Orchestrator) writeCheckpoint(ctx context.Context) error {
 	if !ok || seq <= o.lastWrittenSeq {
 		return nil
 	}
-	if err := o.la.WriteCheckpoint(ctx, pos); err != nil {
+	// rows_applied delta: the DML that became durable (frontier ≥ seq) and is
+	// now covered by the persisted position, since the last checkpoint. cum is
+	// recorded at every RecordTxBoundary call site, so a chosen boundary seq
+	// always has an entry. If it were ever missing (defensive; unreachable in
+	// production), leave BOTH the delta at 0 AND lastWrittenCum untouched, so
+	// the next checkpoint still computes its delta from the true baseline
+	// rather than re-counting from 0 — a missed boundary defers its rows, it
+	// never over-counts. cum is monotone in seq, so delta is never negative.
+	cum, ok := o.boundaryRowDML[seq]
+	var delta int64
+	if ok && cum > o.lastWrittenCum {
+		delta = int64(cum - o.lastWrittenCum)
+	}
+	if err := o.la.WriteCheckpoint(ctx, pos, delta); err != nil {
 		return err
 	}
 	o.lastWrittenSeq = seq
+	if ok {
+		o.lastWrittenCum = cum
+	}
+	o.pruneBoundaryRowDML(seq)
 	return nil
+}
+
+// pruneBoundaryRowDML drops boundaryRowDML entries at or below the just-
+// persisted boundary seq — they can never be chosen again (the frontier's
+// CheckpointPosition and the seq-monotone guard both advance past them), so
+// the map stays bounded by the in-flight window. Coordinator-goroutine-only.
+func (o *Orchestrator) pruneBoundaryRowDML(upTo uint64) {
+	for s := range o.boundaryRowDML {
+		if s <= upTo {
+			delete(o.boundaryRowDML, s)
+		}
+	}
 }
 
 func (o *Orchestrator) recordErr(err error) {

@@ -158,6 +158,7 @@ func ensureControlTable(ctx context.Context, db *sql.DB, controlKeyspace string)
 			slot_name              VARCHAR(255) NULL,
 			source_dsn_fingerprint VARCHAR(255) NULL,
 			target_schema          VARCHAR(255) NULL,
+			rows_applied           BIGINT       NOT NULL DEFAULT 0,
 			PRIMARY KEY (stream_id)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
 	if _, err := db.ExecContext(ctx, ddl); err != nil {
@@ -175,7 +176,16 @@ func ensureControlTable(ctx context.Context, db *sql.DB, controlKeyspace string)
 	if err := ensureCrossEngineParityColumn(ctx, db, controlKeyspace, "source_dsn_fingerprint", "VARCHAR(255) NULL"); err != nil {
 		return err
 	}
-	return ensureCrossEngineParityColumn(ctx, db, controlKeyspace, "target_schema", "VARCHAR(255) NULL")
+	if err := ensureCrossEngineParityColumn(ctx, db, controlKeyspace, "target_schema", "VARCHAR(255) NULL"); err != nil {
+		return err
+	}
+	// rows_applied (ADR-0156 phase 2): the lifetime cumulative
+	// row-level-DML-applied counter surfaced in `sync start`'s live
+	// panel. Additive on the SAME detect-then-ALTER path as the
+	// cross-engine parity columns above; NOT NULL DEFAULT 0 backfills
+	// legacy rows to 0 (an honest cumulative starting point — pre-upgrade
+	// applies were never tracked).
+	return ensureCrossEngineParityColumn(ctx, db, controlKeyspace, "rows_applied", "BIGINT NOT NULL DEFAULT 0")
 }
 
 // shardConsolidationLeaseRow aliases the shared lease-row mirror of
@@ -575,7 +585,8 @@ func listStreams(ctx context.Context, db *sql.DB, controlKeyspace, engineName st
 	q := "SELECT stream_id, source_position, updated_at, " +
 		"COALESCE(slot_name, ''), " +
 		"COALESCE(source_dsn_fingerprint, ''), " +
-		"COALESCE(target_schema, '') " +
+		"COALESCE(target_schema, ''), " +
+		"COALESCE(rows_applied, 0) " +
 		"FROM " + controlTableRef(controlKeyspace, controlTableName)
 	cfg := *controlCfg
 	cfg.ListStreamsFallback = func(ctx context.Context, queryErr error) ([]ir.StreamStatus, bool, error) {
@@ -668,7 +679,15 @@ func isMySQLMissingTableErr(err error) bool {
 // is structural-optional and the applier no-ops empty input)
 // produce NULL columns on the row — identical to the pre-v0.32.2
 // shape on the MySQL side.
-func writePositionTx(ctx context.Context, tx *sql.Tx, controlKeyspace, streamID, token, slotName, sourceFingerprint, targetSchema string) error {
+//
+// rowsApplied is the number of row-level DML changes (Insert/Update/
+// Delete) this position write makes durable; it is ADDED to the row's
+// cumulative rows_applied in the SAME UPSERT (COALESCE(existing, 0) +
+// delta) so the counter advances atomically with the position (ADR-0156
+// phase 2). 0 for a no-data position write (broker cold-start,
+// schema-delta-only incrementals, a Truncate/SchemaSnapshot serial
+// apply).
+func writePositionTx(ctx context.Context, tx *sql.Tx, controlKeyspace, streamID, token, slotName, sourceFingerprint, targetSchema string, rowsApplied int64) error {
 	// Sidecar-keyspace feature: when controlKeyspace is set, this UPSERT
 	// still rides the SAME per-change *sql.Tx as the data write (ADR-0007 /
 	// ADR-0049 #4a atomicity) — it is deliberately NOT decoupled onto a
@@ -679,7 +698,7 @@ func writePositionTx(ctx context.Context, tx *sql.Tx, controlKeyspace, streamID,
 	// idempotent apply makes a torn resume safe (a position that committed
 	// without its data, or vice versa, replays cleanly on restart). Empty
 	// controlKeyspace is unchanged single-keyspace, genuinely atomic behaviour.
-	if _, err := tx.ExecContext(ctx, writePositionUpsertSQL(controlKeyspace), streamID, token, slotName, sourceFingerprint, targetSchema); err != nil {
+	if _, err := tx.ExecContext(ctx, writePositionUpsertSQL(controlKeyspace), streamID, token, slotName, sourceFingerprint, targetSchema, rowsApplied); err != nil {
 		return fmt.Errorf("mysql: write position: %w", err)
 	}
 	return nil
@@ -696,13 +715,17 @@ func writePositionTx(ctx context.Context, tx *sql.Tx, controlKeyspace, streamID,
 func writePositionUpsertSQL(controlKeyspace string) string {
 	ref := controlTableRef(controlKeyspace, controlTableName)
 	return "INSERT INTO " + ref + " " +
-		"(stream_id, source_position, slot_name, source_dsn_fingerprint, target_schema) " +
-		"VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, '')) " +
+		"(stream_id, source_position, slot_name, source_dsn_fingerprint, target_schema, rows_applied) " +
+		"VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?) " +
 		"AS new ON DUPLICATE KEY UPDATE " +
 		"source_position = new.source_position, " +
 		"slot_name = COALESCE(new.slot_name, " + ref + ".slot_name), " +
 		"source_dsn_fingerprint = COALESCE(new.source_dsn_fingerprint, " + ref + ".source_dsn_fingerprint), " +
-		"target_schema = COALESCE(new.target_schema, " + ref + ".target_schema)"
+		"target_schema = COALESCE(new.target_schema, " + ref + ".target_schema), " +
+		// rows_applied ACCUMULATES: add this write's delta to the existing
+		// count (COALESCE guards a legacy NULL row, though NOT NULL DEFAULT 0
+		// means the column is never NULL post-migration).
+		"rows_applied = COALESCE(" + ref + ".rows_applied, 0) + new.rows_applied"
 }
 
 // readStopRequested returns true when the named stream's row has a

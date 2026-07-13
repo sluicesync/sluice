@@ -147,7 +147,7 @@ func TestRequestStop_RoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	if err := writePositionTx(ctx, tx, "public", "test-stream", "tok", "", "", ""); err != nil {
+	if err := writePositionTx(ctx, tx, "public", "test-stream", "tok", "", "", "", 0); err != nil {
 		t.Fatalf("writePositionTx: %v", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -315,6 +315,108 @@ func TestEnsureControlTable_AddsTargetSchemaColumn(t *testing.T) {
 	}
 }
 
+// TestWritePositionTx_RowsAppliedAccumulatesAndBackCompat pins the ADR-0156
+// phase 2 rows_applied counter end-to-end against a real Postgres:
+//
+//   - a LEGACY control table (no rows_applied column) picks the column up on
+//     EnsureControlTable, and the existing row backfills to 0 (an honest
+//     cumulative start — pre-upgrade applies were never tracked);
+//   - each writePositionTx ADDS its delta to the row (COALESCE(existing,0) +
+//     delta), so successive writes ACCUMULATE (never replace);
+//   - a delta-0 write (bare position write) leaves the count unchanged;
+//   - listStreams round-trips the cumulative value via StreamStatus.RowsApplied.
+func TestWritePositionTx_RowsAppliedAccumulatesAndBackCompat(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+
+	// Legacy shape: no rows_applied column, one pre-existing row.
+	applyPGApplier(t, dsn, `
+		CREATE TABLE "public"."sluice_cdc_state" (
+			stream_id         VARCHAR(255) NOT NULL,
+			source_position   TEXT         NOT NULL,
+			updated_at        TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			stop_requested_at TIMESTAMP    NULL,
+			PRIMARY KEY (stream_id)
+		);
+		INSERT INTO "public"."sluice_cdc_state" (stream_id, source_position)
+		VALUES ('legacy-stream', 'legacy-token');
+	`)
+
+	eng := Engine{}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	applier, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+	if err := applier.EnsureControlTable(ctx); err != nil {
+		t.Fatalf("EnsureControlTable: %v", err)
+	}
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	// The legacy row backfilled to 0.
+	rowsFor := func(streamID string) int64 {
+		t.Helper()
+		streams, err := applier.ListStreams(ctx)
+		if err != nil {
+			t.Fatalf("ListStreams: %v", err)
+		}
+		for _, s := range streams {
+			if s.StreamID == streamID {
+				return s.RowsApplied
+			}
+		}
+		t.Fatalf("stream %q not found in ListStreams", streamID)
+		return 0
+	}
+	if got := rowsFor("legacy-stream"); got != 0 {
+		t.Fatalf("legacy row rows_applied = %d; want 0 (backfilled)", got)
+	}
+
+	write := func(streamID, token string, delta int64) {
+		t.Helper()
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		if err := writePositionTx(ctx, tx, "public", streamID, token, "", "", "", delta); err != nil {
+			t.Fatalf("writePositionTx: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+	}
+
+	// Accumulate on the legacy stream: +3, +2, +0 → 5.
+	write("legacy-stream", "tok-1", 3)
+	write("legacy-stream", "tok-2", 2)
+	write("legacy-stream", "tok-3", 0)
+	if got := rowsFor("legacy-stream"); got != 5 {
+		t.Fatalf("legacy-stream rows_applied = %d; want 5 (3+2+0 accumulated)", got)
+	}
+
+	// A brand-new stream starts from 0 and accumulates independently.
+	write("fresh-stream", "f-1", 4)
+	write("fresh-stream", "f-2", 4)
+	if got := rowsFor("fresh-stream"); got != 8 {
+		t.Fatalf("fresh-stream rows_applied = %d; want 8", got)
+	}
+	if got := rowsFor("legacy-stream"); got != 5 {
+		t.Fatalf("legacy-stream rows_applied drifted to %d; want 5 (streams independent)", got)
+	}
+}
+
 // TestWritePositionTx_TargetSchemaRoundTrip verifies the Bug 46
 // round-trip: writePositionTx upserts target_schema; listStreams
 // returns it via StreamStatus; SetTargetSchema controls the persisted
@@ -353,7 +455,7 @@ func TestWritePositionTx_TargetSchemaRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	if err := writePositionTx(ctx, tx, "public", "stream-a", "tok-1", "sluice_a", "fp-a", "customer_svc"); err != nil {
+	if err := writePositionTx(ctx, tx, "public", "stream-a", "tok-1", "sluice_a", "fp-a", "customer_svc", 0); err != nil {
 		t.Fatalf("first writePositionTx: %v", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -378,7 +480,7 @@ func TestWritePositionTx_TargetSchemaRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin 2: %v", err)
 	}
-	if err := writePositionTx(ctx, tx, "public", "stream-a", "tok-2", "", "", ""); err != nil {
+	if err := writePositionTx(ctx, tx, "public", "stream-a", "tok-2", "", "", "", 0); err != nil {
 		t.Fatalf("second writePositionTx: %v", err)
 	}
 	if err := tx.Commit(); err != nil {

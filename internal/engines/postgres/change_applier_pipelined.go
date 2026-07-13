@@ -383,8 +383,8 @@ func (a *ChangeApplier) conflictKeyForPipelined(ctx context.Context, schema, tab
 // via the shared buildWritePositionSQL so the row shape / COALESCE
 // semantics are byte-identical to the serial writePositionTx). It is the
 // last statement queued before the SendBatch flush in flushAndCommit.
-func (a *ChangeApplier) writePositionPipelined(b *pgxBatchTx, streamID, token string) {
-	stmt, args := buildWritePositionSQL(a.controlSchema, streamID, token, a.slotName, a.sourceFingerprint, a.targetSchema)
+func (a *ChangeApplier) writePositionPipelined(b *pgxBatchTx, streamID, token string, rowsApplied int64) {
+	stmt, args := buildWritePositionSQL(a.controlSchema, streamID, token, a.slotName, a.sourceFingerprint, a.targetSchema, rowsApplied)
 	b.queue(stmt, args, queuedStmt{schema: a.controlSchema, table: controlTableName, kind: "position"})
 }
 
