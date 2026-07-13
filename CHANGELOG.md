@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.235] - 2026-07-13
+
+### Added
+
+- **The TTY-aware pretty view now covers the remaining one-shot commands: `cutover`, `matview refresh`, and `trigger setup` / `teardown` / `prune` (ADR-0155 phase 2, continued).** Run any of these at an interactive terminal and you get a phase checklist and a command-appropriate summary panel instead of a bare result line — `cutover` shows its Connect → Read → Prime progression and a primed/noop/skipped/refused rollup with the engine pair; `matview refresh` shows refreshed / skipped; `trigger setup` shows statements applied, DDL-detection mode, and PG version; `teardown` shows statements and keep-data; `prune` shows deleted / remaining / vacuumed. As with every command in the rollout, the pretty view is purely additive on a TTY: piped output, CI, `--log-format=json`, `--format json`, `--dry-run`, and `--no-progress` all emit the exact structured records and exit codes these commands have always emitted, byte-for-byte (verified byte-identical against a real Postgres 16). Destructive `teardown` confirmation prompts and `--dry-run` DDL previews stay outside the live view, and a refusal always prints after the view tears down — never mid-render. This completes the ADR-0155 rollout across the one-shot commands; the report-shaped commands (`preview`, schema diff, `slot list`) and the continuous commands (`sync start`, the broker, `backup stream`, `metrics-watch`, under ADR-0156) are the remaining presentation surfaces.
+
 ## [0.99.234] - 2026-07-13
 
 ### Added
