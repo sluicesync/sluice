@@ -11,8 +11,6 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-
-	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TTYSink is the interactive [Sink]: it drives a bubbletea/lipgloss live
@@ -47,11 +45,12 @@ type TTYSink struct {
 var _ Sink = (*TTYSink)(nil)
 
 // NewTTYSink starts a bubbletea program rendering to w and returns a sink
-// that feeds it. onInterrupt (may be nil) is called after the program
-// exits if the operator aborted the view. The program runs inline (no
-// alternate screen) so the final summary stays in scrollback.
-func NewTTYSink(w io.Writer, onInterrupt func()) *TTYSink {
-	m := newModel(time.Now(), time.Now)
+// that feeds it. spec parameterizes the view (title + phase checklist) for
+// the command being run. onInterrupt (may be nil) is called after the
+// program exits if the operator aborted the view. The program runs inline
+// (no alternate screen) so the final summary stays in scrollback.
+func NewTTYSink(w io.Writer, onInterrupt func(), spec Spec) *TTYSink {
+	m := newModel(spec, time.Now(), time.Now)
 	p := tea.NewProgram(m, tea.WithOutput(w))
 	s := &TTYSink{prog: p, w: w, done: make(chan struct{}), onInterrupt: onInterrupt}
 	go func() {
@@ -74,19 +73,19 @@ func NewTTYSink(w io.Writer, onInterrupt func()) *TTYSink {
 	return s
 }
 
-func (s *TTYSink) PhaseStarted(phase ir.MigrationPhase) {
-	s.prog.Send(phaseStartedMsg{phase: phase})
+func (s *TTYSink) PhaseStarted(phase Phase) {
+	s.prog.Send(phaseStartedMsg{key: phase.Key})
 }
 
-func (s *TTYSink) PhaseCompleted(phase ir.MigrationPhase) {
-	s.prog.Send(phaseCompletedMsg{phase: phase})
+func (s *TTYSink) PhaseCompleted(phase Phase) {
+	s.prog.Send(phaseCompletedMsg{key: phase.Key})
 }
 
 // PhaseCompletedEarly marks the same phase done; the "(upfront)"
 // distinction is a log-stream concern (see [LogSink]) with no bearing on
 // the checklist, which just fills the row in.
-func (s *TTYSink) PhaseCompletedEarly(phase ir.MigrationPhase) {
-	s.prog.Send(phaseCompletedMsg{phase: phase})
+func (s *TTYSink) PhaseCompletedEarly(phase Phase) {
+	s.prog.Send(phaseCompletedMsg{key: phase.Key})
 }
 
 func (s *TTYSink) TableProgress(table string, done, total int64) {

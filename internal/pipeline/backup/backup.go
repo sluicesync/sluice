@@ -85,6 +85,7 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
+	"sluicesync.dev/sluice/internal/progress"
 	"sluicesync.dev/sluice/internal/redact"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
@@ -300,6 +301,12 @@ type Backup struct {
 	// [Manifest.CreatedAt]. Used by tests to pin timestamps; in
 	// production callers leave it nil and the default uses time.Now.
 	Now func() time.Time
+
+	// Progress is the ADR-0155 presentation sink. nil is the
+	// [progress.Nop] default: backup's own direct-slog output is the
+	// byte-identical non-TTY stream, so the sink adds nothing there. The
+	// CLI sets a [progress.TTYSink] only for an interactive terminal.
+	Progress progress.Sink
 }
 
 // Run executes the backup. Returns nil on success; a wrapped error on
@@ -312,6 +319,8 @@ func (b *Backup) Run(ctx context.Context) error {
 	if err := b.validate(); err != nil {
 		return err
 	}
+	sink := sinkOrNop(b.Progress)
+	sink.PhaseStarted(backupPhaseSchema)
 
 	// Engine-default exclusions (Bug 22): merge in PlanetScale's
 	// `_vt_*` shadow tables when the source signals them via the
@@ -548,9 +557,13 @@ func (b *Backup) Run(ctx context.Context) error {
 		peers = snap.ExtraReaders
 	}
 
+	sink.PhaseCompleted(backupPhaseSchema)
+	sink.PhaseStarted(backupPhaseCopy)
 	if err := b.runBackupTablePool(ctx, tasks, rr, peers, factory, tableParallelism, chunkRows, committer, chainCEK, within); err != nil {
 		return err
 	}
+	sink.PhaseCompleted(backupPhaseCopy)
+	sink.PhaseStarted(backupPhaseFinalize)
 
 	// 4.5. Record EndPosition — anchored-resume adoption / snapshot-
 	// anchored / v0.17.x post-sweep fallback (see recordEndPosition).
@@ -597,7 +610,51 @@ func (b *Backup) Run(ctx context.Context) error {
 	}
 
 	logBackupComplete(ctx, manifest, b.Summary)
+	sink.PhaseCompleted(backupPhaseFinalize)
+	sink.Summary(backupSummaryResult(manifest, b.signingRequested()))
 	return nil
+}
+
+// backupSummaryResult builds the ADR-0155 TTY summary panel for a
+// completed full/incremental manifest — tables, rows, chunks, and the
+// encrypted/signed/EndPosition posture the operator wants confirmed after
+// a backup. TTY-only; [progress.Nop] ignores it on the non-TTY path.
+func backupSummaryResult(manifest *irbackup.Manifest, signed bool) progress.Result {
+	totalRows := int64(0)
+	totalChunks := 0
+	for _, t := range manifest.Tables {
+		totalRows += t.RowCount
+		totalChunks += len(t.Chunks)
+	}
+	fields := []progress.Field{
+		{Label: "Tables", Value: progress.HumanCount(int64(len(manifest.Tables)))},
+		{Label: "Rows", Value: progress.HumanCount(totalRows)},
+		{Label: "Chunks", Value: progress.HumanCount(int64(totalChunks))},
+		{Label: "Encrypted", Value: yesNo(manifest.ChainEncryption != nil)},
+		{Label: "Signed", Value: yesNo(signed)},
+	}
+	if tok := manifest.EndPosition.Token; tok != "" {
+		fields = append(fields, progress.Field{Label: "EndPosition", Value: clipToken(tok)})
+	}
+	return progress.Result{Fields: fields}
+}
+
+// yesNo renders a bool as the summary panel's "yes"/"no".
+func yesNo(b bool) string {
+	if b {
+		return "yes"
+	}
+	return "no"
+}
+
+// clipToken shortens a CDC position token for the one-line summary field
+// (tokens are JSON blobs that would blow past the box width).
+func clipToken(tok string) string {
+	const maxLen = 48
+	if len(tok) <= maxLen {
+		return tok
+	}
+	return tok[:maxLen-3] + "..."
 }
 
 // signBackupArtifacts writes the detached manifest + lineage signatures

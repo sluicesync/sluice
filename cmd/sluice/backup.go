@@ -22,6 +22,7 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
+	"sluicesync.dev/sluice/internal/progress"
 	"sluicesync.dev/sluice/internal/redact"
 )
 
@@ -872,7 +873,13 @@ func (b *BackupFullCmd) run(g *Globals, env *envelopeRun) error {
 	// Validation is done; errors past this point classify as "failed"
 	// (not "refused") in the --format json envelope.
 	env.markEngaged()
-	return bk.Run(ctx)
+	// ADR-0155: pretty TTY view for an interactive, non-envelope run.
+	pretty := wantPrettyProgress(g, env.jsonMode, false, false)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	return runWithProgress(pretty, cancel, backup.BackupFullProgressSpec,
+		func(s progress.Sink) { bk.Progress = s },
+		func() error { return bk.Run(runCtx) })
 }
 
 // openBackupStore opens the right [irbackup.Store] for the operator's
@@ -1014,7 +1021,13 @@ func (b *BackupIncrementalCmd) Run(g *Globals) error {
 		Sign:          b.Sign,
 		Ed25519Signer: signer,
 	}
-	return incr.Run(ctx)
+	// ADR-0155: pretty TTY view for an interactive run.
+	pretty := wantPrettyProgress(g, false, false, false)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	return runWithProgress(pretty, cancel, pipeline.IncrementalProgressSpec,
+		func(s progress.Sink) { incr.Progress = s },
+		func() error { return incr.Run(runCtx) })
 }
 
 // BackupStreamCmdGroup groups `sluice backup stream` (run) and
@@ -1240,7 +1253,7 @@ type BackupVerifyCmd struct {
 }
 
 // Run implements `sluice backup verify`.
-func (v *BackupVerifyCmd) Run(_ *Globals) error {
+func (v *BackupVerifyCmd) Run(g *Globals) error {
 	if v.FromDir == "" && v.From == "" {
 		return errors.New("one of --from-dir or --from is required")
 	}
@@ -1285,52 +1298,82 @@ func (v *BackupVerifyCmd) Run(_ *Globals) error {
 		)
 		return nil
 	}
-	// Bug 117 closure (v0.94.1): when --encrypt is on, load the
-	// chain-root manifest so the read envelope re-derives the same
-	// Argon2id KEK the writer used, then thread the envelope into
-	// VerifyBackupWith. SHA-only verify silently accepted per-chunk
-	// passphrase rotation; the decrypt probe refuses it.
-	rootManifest, err := lineage.ReadRootManifest(ctx, store)
-	if err != nil {
-		return fmt.Errorf("verify: read root manifest: %w", err)
+	// ADR-0155: pretty TTY view for an interactive run. `backup verify` is
+	// CLI-orchestrated (no pipeline Run with a Progress field), so the sink
+	// is captured here and driven inline; on the non-TTY path it is the
+	// [progress.Nop] and the existing slog lines are byte-identical.
+	pretty := wantPrettyProgress(g, false, false, false)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var sink progress.Sink = progress.Nop{}
+	return runWithProgress(pretty, cancel, backup.VerifyChainProgressSpec,
+		func(s progress.Sink) { sink = s },
+		func() error {
+			sink.PhaseStarted(backup.VerifyPhaseLoad)
+			// Bug 117 closure (v0.94.1): when --encrypt is on, load the
+			// chain-root manifest so the read envelope re-derives the same
+			// Argon2id KEK the writer used, then thread the envelope into
+			// VerifyBackupWith. SHA-only verify silently accepted per-chunk
+			// passphrase rotation; the decrypt probe refuses it.
+			rootManifest, err := lineage.ReadRootManifest(runCtx, store)
+			if err != nil {
+				return fmt.Errorf("verify: read root manifest: %w", err)
+			}
+			envelope, err := v.buildReadEnvelope(rootManifest)
+			if err != nil {
+				return err
+			}
+			if envelope == nil && rootManifest != nil && rootManifest.ChainEncryption != nil {
+				// Encrypted chain + no envelope = SHA-only verify (legacy
+				// behavior). Bug 117's silent passphrase-rotation acceptance
+				// is invisible without a decrypt probe — warn the operator
+				// loudly so they know to re-run with `--encrypt` + their
+				// passphrase for full coverage.
+				slog.WarnContext(
+					runCtx, "backup verify: chain is encrypted but no envelope supplied — running SHA-only verify; passphrase rotation (Bug 117) is undetectable in this mode. Re-run with --encrypt + the chain's passphrase / KMS reference to enable the per-chunk decrypt probe.",
+					slog.String("kek_mode", rootManifest.ChainEncryption.KEKMode),
+					slog.String("kek_ref", rootManifest.ChainEncryption.KEKRef),
+				)
+			}
+			verifyKey, err := v.resolveVerifyKey()
+			if err != nil {
+				return err
+			}
+			sink.PhaseCompleted(backup.VerifyPhaseLoad)
+			sink.PhaseStarted(backup.VerifyPhaseCheck)
+			// Bug 185: VerifyBackupCoded returns a coded Refusal (exit 3)
+			// when chunks fail — SLUICE-E-BACKUP-CHUNK-CORRUPT (SHA-256
+			// mismatch) / -CHUNK-AUTH-FAILED (decrypt/splice) — so operators
+			// can script `backup verify` against the code, matching restore.
+			total, _, err := backup.VerifyBackupCoded(runCtx, store, backup.VerifyOptions{
+				Envelope:         envelope,
+				VerifyKey:        verifyKey,
+				RequireSignature: v.RequireSignature,
+			})
+			if err != nil {
+				return err
+			}
+			slog.InfoContext(
+				runCtx, "backup verify: all chunks OK",
+				slog.Int("chunks", total),
+				slog.Bool("decrypt_probe", envelope != nil),
+			)
+			sink.PhaseCompleted(backup.VerifyPhaseCheck)
+			sink.Summary(progress.Result{Fields: []progress.Field{
+				{Label: "Chunks", Value: progress.HumanCount(int64(total))},
+				{Label: "Mismatched", Value: "0"},
+				{Label: "Decrypt probe", Value: boolYesNoCLI(envelope != nil)},
+			}})
+			return nil
+		})
+}
+
+// boolYesNoCLI renders a bool as the CLI summary panel's "yes"/"no".
+func boolYesNoCLI(b bool) string {
+	if b {
+		return "yes"
 	}
-	envelope, err := v.buildReadEnvelope(rootManifest)
-	if err != nil {
-		return err
-	}
-	if envelope == nil && rootManifest != nil && rootManifest.ChainEncryption != nil {
-		// Encrypted chain + no envelope = SHA-only verify (legacy
-		// behavior). Bug 117's silent passphrase-rotation acceptance
-		// is invisible without a decrypt probe — warn the operator
-		// loudly so they know to re-run with `--encrypt` + their
-		// passphrase for full coverage.
-		slog.WarnContext(
-			ctx, "backup verify: chain is encrypted but no envelope supplied — running SHA-only verify; passphrase rotation (Bug 117) is undetectable in this mode. Re-run with --encrypt + the chain's passphrase / KMS reference to enable the per-chunk decrypt probe.",
-			slog.String("kek_mode", rootManifest.ChainEncryption.KEKMode),
-			slog.String("kek_ref", rootManifest.ChainEncryption.KEKRef),
-		)
-	}
-	verifyKey, err := v.resolveVerifyKey()
-	if err != nil {
-		return err
-	}
-	total, mismatches, err := backup.VerifyBackupWith(ctx, store, backup.VerifyOptions{
-		Envelope:         envelope,
-		VerifyKey:        verifyKey,
-		RequireSignature: v.RequireSignature,
-	})
-	if err != nil {
-		return err
-	}
-	if mismatches > 0 {
-		return fmt.Errorf("verify: %d of %d chunk(s) failed verification", mismatches, total)
-	}
-	slog.InfoContext(
-		ctx, "backup verify: all chunks OK",
-		slog.Int("chunks", total),
-		slog.Bool("decrypt_probe", envelope != nil),
-	)
-	return nil
+	return "no"
 }
 
 // BackupPruneCmd runs `sluice backup prune`. Drops the oldest
@@ -1784,5 +1827,11 @@ func (r *RestoreCmd) run(g *Globals, env *envelopeRun) error {
 	// Validation is done; errors past this point classify as "failed"
 	// (not "refused") in the --format json envelope.
 	env.markEngaged()
-	return restore.Run(ctx)
+	// ADR-0155: pretty TTY view for an interactive, non-envelope run.
+	pretty := wantPrettyProgress(g, env.jsonMode, false, false)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	return runWithProgress(pretty, cancel, backup.RestoreProgressSpec,
+		func(s progress.Sink) { restore.Progress = s },
+		func() error { return restore.Run(runCtx) })
 }

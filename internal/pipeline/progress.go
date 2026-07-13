@@ -46,6 +46,73 @@ import (
 	"sluicesync.dev/sluice/internal/progress"
 )
 
+// migratePhaseLabels maps each migrate phase to its checklist display
+// label (ADR-0155). Kept beside the Spec so the label and the emit-site
+// can't drift.
+var migratePhaseLabels = map[ir.MigrationPhase]string{
+	ir.MigrationPhaseTables:       "Tables",
+	ir.MigrationPhaseBulkCopy:     "Bulk copy",
+	ir.MigrationPhaseIndexes:      "Indexes",
+	ir.MigrationPhaseIdentitySync: "Identity",
+	ir.MigrationPhaseConstraints:  "Constraints",
+	ir.MigrationPhaseViews:        "Views",
+}
+
+// migPhase adapts an [ir.MigrationPhase] onto the command-agnostic
+// [progress.Phase] the sink now speaks (ADR-0155 phase 2). The Key is the
+// phase string — unchanged from phase 1 — so migrate's LogSink lines stay
+// byte-identical; the Label drives the TTY checklist.
+func migPhase(p ir.MigrationPhase) progress.Phase {
+	return progress.Phase{Key: string(p), Label: migratePhaseLabels[p]}
+}
+
+// MigrateProgressSpec is the pretty-view [progress.Spec] for `sluice
+// migrate` — the checklist order the operator reads (which differs
+// slightly from the internal completion order: identity-sync completes
+// before indexes on the MySQL fallback path; a row is marked done whenever
+// its PhaseCompleted arrives, so an out-of-display-order completion still
+// fills in correctly). The CLI hands this to [progress.NewTTYSink].
+var MigrateProgressSpec = progress.Spec{
+	Title: "sluice migrate",
+	Phases: []progress.Phase{
+		migPhase(ir.MigrationPhaseTables),
+		migPhase(ir.MigrationPhaseBulkCopy),
+		migPhase(ir.MigrationPhaseIndexes),
+		migPhase(ir.MigrationPhaseIdentitySync),
+		migPhase(ir.MigrationPhaseConstraints),
+		migPhase(ir.MigrationPhaseViews),
+	},
+	ProgressKey: string(ir.MigrationPhaseBulkCopy),
+	LabelWidth:  11,
+}
+
+// sinkOrNop defaults a nil presentation sink to the no-op sink so the
+// incremental-backup emit call-sites stay nil-free (migrate uses
+// [progress.FromContext] instead; the pipeline package hosts both).
+func sinkOrNop(s progress.Sink) progress.Sink {
+	if s == nil {
+		return progress.Nop{}
+	}
+	return s
+}
+
+// Backup-incremental phases (ADR-0155 phase 2). Incremental backup keeps
+// its historical direct-slog output on the non-TTY path (the sink is
+// [progress.Nop] there); the checklist drives only the interactive view.
+var (
+	incrPhaseConnect  = progress.Phase{Key: "connect", Label: "Connect"}
+	incrPhaseStream   = progress.Phase{Key: "stream", Label: "Stream"}
+	incrPhaseFinalize = progress.Phase{Key: "finalize", Label: "Finalize"}
+)
+
+// IncrementalProgressSpec is the pretty-view spec for `sluice backup
+// incremental`.
+var IncrementalProgressSpec = progress.Spec{
+	Title:      "sluice backup incremental",
+	Phases:     []progress.Phase{incrPhaseConnect, incrPhaseStream, incrPhaseFinalize},
+	LabelWidth: 12,
+}
+
 // runRowTotalKey carries a run-scoped rows-copied accumulator through the
 // context so every per-table / per-chunk [progressTicker] can add its
 // final count without threading a parameter through the concurrent copy

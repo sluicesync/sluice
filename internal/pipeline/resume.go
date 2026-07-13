@@ -324,7 +324,7 @@ func markPhase(ctx context.Context, rc resumeContext, state *ir.MigrationState, 
 	// the structured-log sink, so byte-identical on every non-TTY path).
 	// markPhase is the single choke point every phase transition passes
 	// through, so the checklist's "in progress" mark is driven from here.
-	progress.FromContext(ctx).PhaseStarted(phase)
+	progress.FromContext(ctx).PhaseStarted(migPhase(phase))
 	state.Phase = phase
 	state.LastError = ""
 	if err := writeState(ctx, rc, headerOnly(*state)); err != nil {

@@ -6,15 +6,18 @@ package progress
 import (
 	"context"
 	"log/slog"
-
-	"sluicesync.dev/sluice/internal/ir"
 )
 
-// LogSink is the structured-log [Sink]: it reproduces the exact slog
-// records sluice emitted before ADR-0155, so the --log-format=json
-// ingestion path and every non-TTY/CI/piped invocation are byte-for-byte
-// unchanged. It is the zero value, the [FromContext] default, and the
-// nil-Migrator.Progress fallback.
+// LogSink is migrate's structured-log [Sink]: it reproduces the exact
+// slog records `migrate` emitted before ADR-0155, so the --log-format=json
+// ingestion path and every non-TTY/CI/piped migrate invocation are
+// byte-for-byte unchanged. It is the zero value, the [FromContext]
+// default, and the nil-Migrator.Progress fallback.
+//
+// It is migrate-specific: its lines say "migration: ...". The other
+// commands (verify/backup/restore) do NOT use it on the non-TTY path —
+// they use [Nop], because their historical output is their own
+// report/slog, not routed through this sink.
 //
 // It holds no state — every method routes to [slog.Default] at call time
 // (matching the pre-ADR-0155 call-sites, which also read the default
@@ -36,17 +39,19 @@ var _ Sink = LogSink{}
 
 // PhaseStarted is a no-op: the pre-ADR-0155 orchestrator logged nothing
 // at phase start, so byte-identity means emitting nothing.
-func (LogSink) PhaseStarted(ir.MigrationPhase) {}
+func (LogSink) PhaseStarted(Phase) {}
 
-// PhaseCompleted emits the historical per-phase completion line.
-func (LogSink) PhaseCompleted(phase ir.MigrationPhase) {
-	slog.InfoContext(context.Background(), "migration: phase complete", slog.String("phase", string(phase)))
+// PhaseCompleted emits the historical per-phase completion line. The
+// phase's Key is the `phase=` attr — migrate's Keys are the
+// [ir.MigrationPhase] strings, so the line is byte-identical.
+func (LogSink) PhaseCompleted(phase Phase) {
+	slog.InfoContext(context.Background(), "migration: phase complete", slog.String("phase", phase.Key))
 }
 
 // PhaseCompletedEarly emits the --upfront-indexes variant of the
 // completion line, preserving its distinct "(upfront)" marker.
-func (LogSink) PhaseCompletedEarly(phase ir.MigrationPhase) {
-	slog.InfoContext(context.Background(), "migration: phase complete (upfront)", slog.String("phase", string(phase)))
+func (LogSink) PhaseCompletedEarly(phase Phase) {
+	slog.InfoContext(context.Background(), "migration: phase complete (upfront)", slog.String("phase", phase.Key))
 }
 
 // TableProgress is a deliberate no-op — see the [Sink.TableProgress] doc:

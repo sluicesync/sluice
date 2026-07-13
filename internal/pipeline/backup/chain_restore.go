@@ -40,6 +40,7 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
+	"sluicesync.dev/sluice/internal/progress"
 	"sluicesync.dev/sluice/internal/sluicecode"
 	"sluicesync.dev/sluice/internal/translate"
 )
@@ -151,6 +152,13 @@ type ChainRestore struct {
 	// mirrors SyncFromBackup.chainEncrypted). NOT derivable from chainCEK,
 	// which stays nil in per-chunk mode even on an encrypted chain.
 	chainEncrypted bool
+
+	// Progress is the ADR-0155 presentation sink threaded from the
+	// dispatching [Restore]. nil is the [progress.Nop] default. The chain
+	// walk drives a coarse Schema/Data/Constraints checklist (the
+	// per-segment Restores it constructs keep Progress nil, so the
+	// checklist isn't double-emitted across segments).
+	Progress progress.Sink
 }
 
 // DefaultChainRestoreBatchSize is the default value of
@@ -174,6 +182,8 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	if err := r.validate(); err != nil {
 		return err
 	}
+	sink := sinkOrNop(r.Progress)
+	sink.PhaseStarted(restorePhaseSchema)
 
 	// 1. Build the lineage chain: ordered segments, each with its
 	//    full + incrementals as a flat link list, validated by the
@@ -300,6 +310,9 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 		batchSize = DefaultChainRestoreBatchSize
 	}
 
+	sink.PhaseCompleted(restorePhaseSchema)
+	sink.PhaseStarted(restorePhaseData)
+
 	// 3. Walk every link in lineage order. A full link bulk-copies its
 	//    snapshot (idempotent upsert over prior state — correct
 	//    because seg[i].end <= seg[i+1].start, so a later segment's
@@ -347,6 +360,8 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 				i, link.Path, link.Manifest.Kind)
 		}
 	}
+	sink.PhaseCompleted(restorePhaseData)
+	sink.PhaseStarted(restorePhaseConstraints)
 
 	// 4. Chain-tail standalone-sequence re-prime (item 51, delta
 	//    review finding #2). The base full primed each standalone
@@ -381,6 +396,27 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 		slog.Int("manifests_applied", len(links)),
 		slog.Int("incrementals", incrementalCount),
 	)
+	sink.PhaseCompleted(restorePhaseConstraints)
+	// ADR-0155 summary panel (TTY only; Nop ignores it). Chain restore's
+	// natural rollup is the chain shape (manifests + incrementals applied)
+	// plus the restored table/row totals from the shared RunSummary.
+	chainFields := []progress.Field{
+		{Label: "Manifests", Value: progress.HumanCount(int64(len(links)))},
+		{Label: "Incrementals", Value: progress.HumanCount(int64(incrementalCount))},
+	}
+	if r.Summary != nil {
+		stats := r.Summary.Tables()
+		var rows int64
+		for i := range stats {
+			if stats[i].Rows != nil {
+				rows += *stats[i].Rows
+			}
+		}
+		chainFields = append(chainFields,
+			progress.Field{Label: "Tables", Value: progress.HumanCount(int64(len(stats)))},
+			progress.Field{Label: "Rows", Value: progress.HumanCount(rows)})
+	}
+	sink.Summary(progress.Result{Fields: chainFields})
 	return nil
 }
 
