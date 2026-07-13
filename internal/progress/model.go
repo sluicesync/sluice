@@ -207,8 +207,15 @@ func (m model) renderPhaseRow(r phaseRow) string {
 		label = dimStyle.Render(r.label)
 	}
 	line := mark + " " + label
-	if r.phase == ir.MigrationPhaseBulkCopy && r.status == statusActive && m.active != "" {
-		line += "   " + m.renderActiveTable()
+	if r.phase == ir.MigrationPhaseBulkCopy && r.status == statusActive {
+		if m.active != "" {
+			line += "   " + m.renderActiveTable()
+		} else {
+			// Copy is under way but the first per-table tick (fired by the
+			// 2s ticker) hasn't landed yet — show a hint so a fast copy
+			// still reads as alive rather than a frozen "[..] Bulk copy".
+			line += "   " + dimStyle.Render("(copying...)")
+		}
 	}
 	return line
 }

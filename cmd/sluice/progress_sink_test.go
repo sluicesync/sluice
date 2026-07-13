@@ -4,11 +4,48 @@
 package main
 
 import (
+	"context"
+	"log/slog"
 	"os"
 	"testing"
 
 	"github.com/mattn/go-isatty"
+
+	"sluicesync.dev/sluice/internal/progress"
 )
+
+// recordingSink is a progress.Sink that records Warn calls, for asserting
+// that WARN records emitted during a pretty render are forwarded into the
+// view rather than written raw to the terminal.
+type recordingSink struct {
+	progress.LogSink // no-op embeds for the methods we don't assert on
+	warns            []string
+}
+
+func (s *recordingSink) Warn(msg string, _ ...any) {
+	s.warns = append(s.warns, msg)
+}
+
+// TestSilenceSlogForTTY_ForwardsWarnToSink pins Fix 2: while the pretty
+// view owns the terminal, a WARN record (e.g. the postgres writer's
+// collation drop) is forwarded to the sink so it lands in the summary box's
+// Warnings section — not written raw to stderr where it would collide with
+// the render. INFO/DEBUG records are dropped entirely.
+func TestSilenceSlogForTTY_ForwardsWarnToSink(t *testing.T) {
+	sink := &recordingSink{}
+	restore := silenceSlogForTTY(sink)
+	slog.InfoContext(context.Background(), "phase progress that must be suppressed")
+	slog.WarnContext(context.Background(), "dropped collation on column",
+		slog.String("column", "name"), slog.String("collation", "en_US"))
+	restore(false) // success path: no raw flush
+
+	if len(sink.warns) != 1 {
+		t.Fatalf("want exactly 1 forwarded warn, got %d: %v", len(sink.warns), sink.warns)
+	}
+	if sink.warns[0] != "dropped collation on column" {
+		t.Errorf("forwarded warn = %q, want the collation message", sink.warns[0])
+	}
+}
 
 // TestWantPrettyProgress_NonTerminalSelectsLogSink pins the ADR-0155
 // contract that a non-terminal stdout selects the structured-log sink even

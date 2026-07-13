@@ -763,20 +763,29 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	// reader factory + copy-end release hook when engaged).
 	parallelDeps := m.phaseBuildCopyDeps(ctx, schema, rr, rw, rawCopyOK, withinParallelism, sharedSnap)
 
+	// Attach the run-scoped rows-copied accumulator (ADR-0155): each
+	// bulk-copy ticker folds its final count in, and the summary below
+	// reports the sum. Best-effort total (rows handed to the writer), for
+	// the presentation layer only — no bearing on correctness or the
+	// LogSink line.
+	ctx, rowTotal := withRunRowTotal(ctx)
+
 	if err := runBulkCopyPhases(ctx, rc, &state, schema, rr, sw, rw, resuming, m.BulkBatchSize, parallelDeps, tableParallelism, m.Redactor, m.InjectShardColumn, m.UpfrontIndexes, m.AnalyzeAfter); err != nil {
 		return err
 	}
 
 	// Envelope bookkeeping: mirror the "migration complete" table set
-	// into the optional Summary (nil-safe no-op otherwise). Rows stay
-	// unknown here — the bulk-copy path counts rows per chunk inside
-	// its progress tickers and never aggregates a per-table total, and
-	// inventing one for the envelope is out of scope by design.
+	// into the optional Summary (nil-safe no-op otherwise). The per-table
+	// row count stays out of the JSON envelope by design; the aggregate
+	// migration-wide total is reported to the presentation sink below.
 	for _, t := range schema.Tables {
 		m.Summary.RecordTable(t.Schema, t.Name)
 	}
 	markComplete(ctx, rc, state)
-	progress.FromContext(ctx).Summary(progress.Result{Tables: len(schema.Tables)})
+	progress.FromContext(ctx).Summary(progress.Result{
+		Tables: len(schema.Tables),
+		Rows:   rowTotal.Load(),
+	})
 	return nil
 }
 
