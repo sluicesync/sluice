@@ -146,3 +146,42 @@ func TestCtrlCInterrupts(t *testing.T) {
 		t.Error("ctrl+c did not return a quit command")
 	}
 }
+
+// TestActiveTableClampsPercentOver100 pins that a done count exceeding the
+// (estimated) total — routine for a MySQL source, whose InnoDB row estimate
+// undershoots — renders a bar clamped to 100%, never a nonsensical >100%.
+func TestActiveTableClampsPercentOver100(t *testing.T) {
+	m := apply(
+		fixedModel(time.Second),
+		tableProgressMsg{table: "customers", done: 324887, total: 25000},
+	)
+	view := m.View()
+	if !strings.Contains(view, "100%") {
+		t.Errorf("clamped bar should read 100%%; view:\n%s", view)
+	}
+	if strings.Contains(view, "1299%") || strings.Contains(view, "299%") {
+		t.Errorf("percent must clamp at 100%%, got a >100%% value; view:\n%s", view)
+	}
+}
+
+// TestSummaryWarningTruncatedToWidth pins that a long warning is truncated to
+// the terminal width (with an ASCII "..." marker) so it never overflows the
+// summary box's right edge.
+func TestSummaryWarningTruncatedToWidth(t *testing.T) {
+	long := "postgres: dropping cross-engine column collations (no PG equivalent; " +
+		"the target columns use the database default collation, which may change " +
+		"sort/comparison semantics) table=customers"
+	m := apply(
+		fixedModel(time.Second),
+		tea.WindowSizeMsg{Width: 70},
+		warnMsg{text: long},
+		summaryMsg{result: Result{Tables: 1, Rows: 100}},
+	)
+	view := m.View()
+	if !strings.Contains(view, "...") {
+		t.Errorf("long warning should be truncated with '...'; view:\n%s", view)
+	}
+	if strings.Contains(view, "comparison semantics") {
+		t.Errorf("warning tail should be truncated away at width 70; view:\n%s", view)
+	}
+}

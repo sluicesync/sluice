@@ -227,6 +227,14 @@ func (m model) renderActiveTable() string {
 	pct := ""
 	if st.total > 0 {
 		frac = float64(st.done) / float64(st.total)
+		// The row-count total is an ESTIMATE (for a MySQL source it is
+		// InnoDB's information_schema.table_rows, which routinely undershoots
+		// — it can even read 0 for a freshly-loaded table), so done can
+		// exceed it mid-copy. Clamp to 1.0 so the bar/percentage never render
+		// a nonsensical >100%.
+		if frac > 1 {
+			frac = 1
+		}
 		pct = fmt.Sprintf(" %3.0f%%", frac*100)
 	}
 	count := fmt.Sprintf("(%s rows)", humanCount(st.done))
@@ -248,7 +256,7 @@ func (m model) summaryView() string {
 	if len(m.warnings) > 0 {
 		fmt.Fprintf(&b, "  %-11s %d\n", "Warnings", len(m.warnings))
 		for _, w := range m.warnings {
-			b.WriteString(warnStyle.Render("    - " + oneLine(w)))
+			b.WriteString(warnStyle.Render("    - " + clipLine(oneLine(w), m.warnWidth())))
 			b.WriteString("\n")
 		}
 	}
@@ -286,6 +294,37 @@ func humanCount(n int64) string {
 		return "-" + out.String()
 	}
 	return out.String()
+}
+
+// warnWidth is the max width a summary warning line may occupy before it is
+// truncated, derived from the terminal width with room for the "    - "
+// prefix and the box border/padding. Falls back to a sane default when the
+// width is unknown (no WindowSizeMsg yet — e.g. under teatest), so a long
+// warning never overflows the box's right edge.
+func (m model) warnWidth() int {
+	w := m.width
+	if w <= 0 {
+		w = 100
+	}
+	maxw := w - 12
+	if maxw < 20 {
+		maxw = 20
+	}
+	return maxw
+}
+
+// clipLine truncates s to at most maxw runes, appending an ASCII "..."
+// marker when it overflows (ASCII, not the "…" glyph, per the same
+// render-everywhere discipline as the checklist marks).
+func clipLine(s string, maxw int) string {
+	r := []rune(s)
+	if len(r) <= maxw {
+		return s
+	}
+	if maxw <= 3 {
+		return string(r[:maxw])
+	}
+	return string(r[:maxw-3]) + "..."
 }
 
 // clipName right-pads/truncates a table name to a fixed cell so the bar
