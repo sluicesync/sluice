@@ -7,8 +7,6 @@ import (
 	"bytes"
 	"log/slog"
 	"testing"
-
-	"sluicesync.dev/sluice/internal/ir"
 )
 
 // captureLog swaps slog.Default with a text handler that drops the volatile
@@ -48,12 +46,12 @@ func TestLogSinkGoldenLines(t *testing.T) {
 	}{
 		{
 			"phase complete",
-			func(s LogSink) { s.PhaseCompleted(ir.MigrationPhaseBulkCopy) },
+			func(s LogSink) { s.PhaseCompleted(Phase{Key: "bulk_copy", Label: "Bulk copy"}) },
 			`level=INFO msg="migration: phase complete" phase=bulk_copy` + "\n",
 		},
 		{
 			"phase complete upfront",
-			func(s LogSink) { s.PhaseCompletedEarly(ir.MigrationPhaseIndexes) },
+			func(s LogSink) { s.PhaseCompletedEarly(Phase{Key: "indexes", Label: "Indexes"}) },
 			`level=INFO msg="migration: phase complete (upfront)" phase=indexes` + "\n",
 		},
 		{
@@ -107,7 +105,7 @@ func TestLogSinkSilentMethods(t *testing.T) {
 	buf, restore := captureLog(t)
 	defer restore()
 	s := LogSink{}
-	s.PhaseStarted(ir.MigrationPhaseTables)
+	s.PhaseStarted(Phase{Key: "tables", Label: "Tables"})
 	s.TableProgress("orders", 100, 1000)
 	if buf.Len() != 0 {
 		t.Errorf("expected no output, got: %q", buf.String())
@@ -120,5 +118,25 @@ func TestLogSinkSilentMethods(t *testing.T) {
 func TestFromContextDefaultsToLogSink(t *testing.T) {
 	if _, ok := FromContext(t.Context()).(LogSink); !ok {
 		t.Fatalf("FromContext on a bare context = %T, want progress.LogSink", FromContext(t.Context()))
+	}
+}
+
+// TestNopSinkEmitsNothing pins that the Nop sink — the non-TTY sink for
+// verify/backup/restore — emits NO slog records for ANY method. Those
+// commands own their own report/slog output; the sink must add nothing on
+// the non-TTY path or it would inject lines into their streams (a broken
+// observability contract, the phase-2 analogue of the LogSink golden).
+func TestNopSinkEmitsNothing(t *testing.T) {
+	buf, restore := captureLog(t)
+	defer restore()
+	var s Nop
+	s.PhaseStarted(Phase{Key: "schema"})
+	s.PhaseCompleted(Phase{Key: "schema"})
+	s.PhaseCompletedEarly(Phase{Key: "schema"})
+	s.TableProgress("orders", 1, 2)
+	s.Warn("should not appear", slog.Int("x", 1))
+	s.Summary(Result{Tables: 3, Fields: []Field{{Label: "Tables", Value: "3"}}})
+	if buf.Len() != 0 {
+		t.Errorf("Nop sink must emit nothing, got: %q", buf.String())
 	}
 }

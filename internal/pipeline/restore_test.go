@@ -454,6 +454,21 @@ func TestRestore_HashMismatch_FailsLoudly(t *testing.T) {
 		t.Errorf("VerifyBackup total=%d mismatches=%d; want at least one mismatch", total, mismatches)
 	}
 
+	// Bug 185: the CODED entrypoint the CLI uses must surface an exit-3
+	// coded Refusal (SLUICE-E-BACKUP-CHUNK-CORRUPT for a SHA-256 mismatch),
+	// so `backup verify` is scriptable on the code exactly like restore.
+	// The count-only VerifyBackup above stays uncoded for its existing
+	// count-inspecting callers.
+	_, _, cerr := backup.VerifyBackupCoded(context.Background(), store, backup.VerifyOptions{})
+	if cerr == nil {
+		t.Fatal("VerifyBackupCoded on a corrupt chunk: nil err; want a coded refusal")
+	}
+	if ce, ok := sluicecode.FromError(cerr); !ok || ce.Code != sluicecode.CodeBackupChunkCorrupt {
+		t.Errorf("VerifyBackupCoded: want coded %s, got %v", sluicecode.CodeBackupChunkCorrupt, cerr)
+	} else if ce.ExitCode() != sluicecode.ExitRefusal {
+		t.Errorf("VerifyBackupCoded exit code = %d; want %d (refusal)", ce.ExitCode(), sluicecode.ExitRefusal)
+	}
+
 	// Restore should also fail loudly. Wrap target in recorder so
 	// Run can attempt the restore.
 	tgt := newRestoreRecorderEngine("mysql")

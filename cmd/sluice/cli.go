@@ -513,7 +513,7 @@ func (m *MigrateCmd) run(g *Globals, env *envelopeRun) error {
 	pretty := wantPrettyProgress(g, env.jsonMode, m.DryRun, multiNamespace)
 	ctx, cancel := context.WithCancel(kongContext())
 	defer cancel()
-	return runMigrateWithProgress(pretty, cancel, func(s progress.Sink) { mig.Progress = s }, func() error {
+	return runWithProgress(pretty, cancel, pipeline.MigrateProgressSpec, func(s progress.Sink) { mig.Progress = s }, func() error {
 		return crashWrap(mig.Run(ctx))
 	})
 }

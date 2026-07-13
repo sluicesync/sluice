@@ -39,6 +39,7 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
+	"sluicesync.dev/sluice/internal/progress"
 	"sluicesync.dev/sluice/internal/sluicecode"
 	"sluicesync.dev/sluice/internal/translate"
 )
@@ -253,6 +254,14 @@ type Restore struct {
 	// retarget preserves column names but not necessarily other
 	// attributes. Set by Run after the manifest read.
 	chunkColumns map[string][]string
+
+	// Progress is the ADR-0155 presentation sink. nil is the
+	// [progress.Nop] default: restore's own direct-slog output is the
+	// byte-identical non-TTY stream. The CLI sets a [progress.TTYSink]
+	// only for an interactive terminal; the single-manifest path emits the
+	// phase checklist here, the multi-segment path threads it into
+	// [ChainRestore].
+	Progress progress.Sink
 }
 
 // reparentMark returns the observer callback to wire onto each writer, or
@@ -302,10 +311,35 @@ func (r *Restore) rootSegmentCodec(ctx context.Context) (blobcodec.Codec, error)
 // in addition to the full, Run delegates to [ChainRestore] which
 // walks the chain in order. The single-manifest path remains
 // unchanged for backups produced by `sluice backup full` alone.
+// newChainRestore builds the multi-segment [ChainRestore] the
+// single-manifest [Restore.Run] delegates to when it detects a lineage
+// that needs the walk. The ADR-0155 Progress sink is threaded so the chain
+// path drives its own checklist; the per-segment Restores it constructs
+// leave Progress nil (Nop), so phases aren't double-emitted.
+func (r *Restore) newChainRestore() *ChainRestore {
+	return &ChainRestore{
+		Target:           r.Target,
+		TargetDSN:        r.TargetDSN,
+		Store:            r.Store,
+		Filter:           r.Filter,
+		MaxBufferBytes:   r.MaxBufferBytes,
+		TableParallelism: r.TableParallelism,
+		ChunkParallelism: r.ChunkParallelism,
+		Summary:          r.Summary,
+		ApplyConcurrency: r.ApplyConcurrency,
+		Envelope:         r.Envelope,
+		VerifyKey:        r.VerifyKey,
+		RequireSignature: r.RequireSignature,
+		TargetSchema:     r.TargetSchema,
+		Progress:         r.Progress,
+	}
+}
+
 func (r *Restore) Run(ctx context.Context) error {
 	if err := r.validate(); err != nil {
 		return err
 	}
+	sink := sinkOrNop(r.Progress)
 
 	// 0. Detect lineage shape (ADR-0046). A multi-segment lineage, OR
 	//    a one-segment lineage with incrementals, dispatches to the
@@ -322,22 +356,7 @@ func (r *Restore) Run(ctx context.Context) error {
 			return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("restore: detect lineage: %w", err))
 		}
 		if multi {
-			chain := &ChainRestore{
-				Target:           r.Target,
-				TargetDSN:        r.TargetDSN,
-				Store:            r.Store,
-				Filter:           r.Filter,
-				MaxBufferBytes:   r.MaxBufferBytes,
-				TableParallelism: r.TableParallelism,
-				ChunkParallelism: r.ChunkParallelism,
-				Summary:          r.Summary,
-				ApplyConcurrency: r.ApplyConcurrency,
-				Envelope:         r.Envelope,
-				VerifyKey:        r.VerifyKey,
-				RequireSignature: r.RequireSignature,
-				TargetSchema:     r.TargetSchema,
-			}
-			return chain.Run(ctx)
+			return r.newChainRestore().Run(ctx)
 		}
 	}
 
@@ -493,12 +512,14 @@ func (r *Restore) Run(ctx context.Context) error {
 	//    rotation-segment full — schema already established by
 	//    segment 0; CreateTables IF NOT EXISTS would be a no-op
 	//    anyway, but we skip the whole schema surface for clarity).
+	sink.PhaseStarted(restorePhaseSchema)
 	if !r.DataOnly {
 		if err := sw.CreateTablesWithoutConstraints(ctx, schema); err != nil {
 			return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("restore: create tables: %w", err))
 		}
 		slog.InfoContext(ctx, "restore: tables created", slog.Int("count", len(schema.Tables)))
 	}
+	sink.PhaseCompleted(restorePhaseSchema)
 
 	// 6. Phase 2: bulk-copy from chunks, fanned across a bounded
 	//    cross-table writer pool (ADR-0084; tableParallelism=1 runs the
@@ -532,9 +553,11 @@ func (r *Restore) Run(ctx context.Context) error {
 	if tableParallelism > 1 || chunkParallelism > 1 {
 		factory = r.openTargetRowWriter
 	}
+	sink.PhaseStarted(restorePhaseData)
 	if err := r.runRestoreTablePool(ctx, tasks, rw, factory, tableParallelism, chunkParallelism); err != nil {
 		return err
 	}
+	sink.PhaseCompleted(restorePhaseData)
 
 	// ADR-0113: reconcile any reparent-touched table. The grow-gate calms a
 	// storage-growing target but cannot recover rows its reparent dropped
@@ -558,6 +581,7 @@ func (r *Restore) Run(ctx context.Context) error {
 	// case — Track-C live finding) rides out instead of aborting the whole
 	// restore after a byte-perfect data copy. All four phases are idempotent
 	// on re-run (see migcore.RunDDLPhaseWithReparentRetry's header).
+	sink.PhaseStarted(restorePhaseConstraints)
 	if err := migcore.RunDDLPhaseWithReparentRetry(ctx, "identity-sequences", sw, func(ctx context.Context) error {
 		return sw.SyncIdentitySequences(ctx, schema)
 	}); err != nil {
@@ -585,7 +609,23 @@ func (r *Restore) Run(ctx context.Context) error {
 	}
 
 	slog.InfoContext(ctx, "restore complete", slog.Int("tables", len(schema.Tables)))
+	sink.PhaseCompleted(restorePhaseConstraints)
+	sink.Summary(restoreSummaryResult(len(schema.Tables), manifest))
 	return nil
+}
+
+// restoreSummaryResult builds the ADR-0155 TTY summary panel for a
+// completed single-manifest restore — tables restored + the manifest's
+// total row count. TTY-only; [progress.Nop] ignores it.
+func restoreSummaryResult(tables int, manifest *irbackup.Manifest) progress.Result {
+	rows := int64(0)
+	for _, t := range manifest.Tables {
+		rows += t.RowCount
+	}
+	return progress.Result{Fields: []progress.Field{
+		{Label: "Tables", Value: progress.HumanCount(int64(tables))},
+		{Label: "Rows", Value: progress.HumanCount(rows)},
+	}}
 }
 
 // validate sanity-checks required fields.
@@ -1376,13 +1416,68 @@ func VerifyBackup(ctx context.Context, store irbackup.Store) (total, failed int,
 // unwrapped against the supplied envelope so a passphrase rotation
 // mid-chain (Bug 117) surfaces at verify-time instead of partial-failing
 // the restore.
+//
+// It returns (total, failed, nil) on a completed scan even when chunks
+// failed — the count-inspecting contract every existing caller relies on.
+// The CLI wants a coded exit-3 Refusal on failure instead (Bug 185), so it
+// calls [VerifyBackupCoded]; both share [verifyBackupScan].
 func VerifyBackupWith(ctx context.Context, store irbackup.Store, opts VerifyOptions) (total, failed int, err error) {
+	total, failed, _, _, err = verifyBackupScan(ctx, store, opts)
+	return total, failed, err
+}
+
+// VerifyBackupCoded is [VerifyBackupWith] plus a coded aggregate error when
+// chunks failed (Bug 185): `sluice backup verify` must exit rc=3 with
+// SLUICE-E-BACKUP-CHUNK-CORRUPT (any SHA-256 mismatch) or
+// -CHUNK-AUTH-FAILED (decrypt/GCM-auth failure or a plaintext splice), so
+// operators can script on the code exactly as the restore path lets them.
+// The count-only [VerifyBackupWith] / [VerifyBackup] keep their (total,
+// failed, nil) contract for callers that inspect the failed count directly.
+func VerifyBackupCoded(ctx context.Context, store irbackup.Store, opts VerifyOptions) (total, failed int, err error) {
+	total, failed, sawCorrupt, sawAuth, err := verifyBackupScan(ctx, store, opts)
+	if err != nil {
+		return total, failed, err
+	}
+	if failed == 0 {
+		return total, failed, nil
+	}
+	return total, failed, aggregateVerifyError(total, failed, sawCorrupt, sawAuth)
+}
+
+// aggregateVerifyError wraps the "N of M chunks failed" summary in the
+// right coded Refusal (Bug 185). Prefer -CHUNK-CORRUPT when any SHA-256
+// mismatch was seen (at-rest corruption/bit-rot), else -CHUNK-AUTH-FAILED
+// when an auth/decrypt/splice failure was seen. When neither chunk-kind
+// fired — a manifest-signature-only failure — the aggregate stays uncoded
+// (the signature refusal was already reported per-manifest), matching the
+// pre-Bug-185 shape for that path.
+func aggregateVerifyError(total, failed int, sawCorrupt, sawAuth bool) error {
+	msg := fmt.Errorf("verify: %d of %d chunk(s) failed verification", failed, total)
+	switch {
+	case sawCorrupt:
+		return sluicecode.Wrap(sluicecode.CodeBackupChunkCorrupt,
+			"restore from an untampered/healthy copy, or re-fetch the failing chunk object(s)", msg)
+	case sawAuth:
+		return sluicecode.Wrap(sluicecode.CodeBackupChunkAuthFailed,
+			"restore from an untampered copy; sign the chain (--sign/--sign-key + --require-signature) to make tamper evident earlier", msg)
+	default:
+		return msg
+	}
+}
+
+// verifyBackupScan is the shared verify loop behind [VerifyBackupWith] and
+// [VerifyBackupCoded]. It reports total/failed chunk counts and which
+// failure kind(s) fired (sawCorrupt = SHA-256 mismatch; sawAuth =
+// decrypt/GCM-auth failure or plaintext splice) so the coded entrypoint can
+// pick the right Refusal code. An operational error (bad manifest, wrong
+// key) short-circuits with a non-nil err as before.
+func verifyBackupScan(ctx context.Context, store irbackup.Store, opts VerifyOptions) (total, failed int, sawCorrupt, sawAuth bool, err error) {
 	records, err := lineage.ListAllSegmentManifests(ctx, store)
 	if err != nil {
-		return 0, 0, fmt.Errorf("verify: %w", err)
+		return 0, 0, false, false, fmt.Errorf("verify: %w", err)
 	}
 	if len(records) == 0 {
-		return 0, 0, errors.New("verify: no manifests found in store")
+		return 0, 0, false, false, errors.New("verify: no manifests found in store")
 	}
 	// M0.4 / Bug 182: a tampered or bit-rotted manifest carrying a null
 	// structural element (a `"tables":[null]` or a `chunks:[null]`) would
@@ -1394,7 +1489,7 @@ func VerifyBackupWith(ctx context.Context, store irbackup.Store, opts VerifyOpti
 	// M0.4; this closes the second, unguarded verify traversal.)
 	for _, rec := range records {
 		if verr := validateManifestStructure(rec.Manifest); verr != nil {
-			return 0, 0, sluicecode.Wrap(sluicecode.CodeBackupSignatureInvalid,
+			return 0, 0, false, false, sluicecode.Wrap(sluicecode.CodeBackupSignatureInvalid,
 				"the backup manifest is structurally invalid (tampered or corrupt) — restore from a known-good chain",
 				fmt.Errorf("verify: manifest %q: %w", rec.Path, verr))
 		}
@@ -1419,12 +1514,12 @@ func VerifyBackupWith(ctx context.Context, store irbackup.Store, opts VerifyOpti
 			// `backup verify --encrypt` returns a false GREEN on the exact
 			// downgrade restore refuses. An operator who passes --encrypt EXPECTS
 			// encryption, so this is the loud signal that catches it.
-			return 0, 0, sluicecode.Wrap(sluicecode.CodeBackupChunkAuthFailed,
+			return 0, 0, false, false, sluicecode.Wrap(sluicecode.CodeBackupChunkAuthFailed,
 				"remove --encrypt if this backup is genuinely unencrypted; if it should be encrypted, its chain-encryption marker was stripped (tampered/downgraded) — sign chains (--sign + --require-signature) to make this tamper-evident",
 				errors.New("verify: an encryption key was supplied but this backup is not encrypted (no chain-encryption metadata) — refusing to report a plaintext-claiming chain as verified under a key"))
 		}
 		if rootEnc.KEKMode != "" && opts.Envelope.Mode() != rootEnc.KEKMode {
-			return 0, 0, fmt.Errorf(
+			return 0, 0, false, false, fmt.Errorf(
 				"verify: envelope mode %q does not match chain's recorded kek_mode %q",
 				opts.Envelope.Mode(), rootEnc.KEKMode,
 			)
@@ -1433,7 +1528,7 @@ func VerifyBackupWith(ctx context.Context, store irbackup.Store, opts VerifyOpti
 			// ADR-0152 chokepoint: bound unwrap for v5+ roots +
 			// the Azure key-version retarget (audit N-9).
 			if _, uerr := lineage.UnwrapChainCEK(opts.Envelope, rootEnc.WrappedCEK, records[0].Manifest); uerr != nil {
-				return 0, 0, fmt.Errorf(
+				return 0, 0, false, false, fmt.Errorf(
 					"verify: unwrap chain cek (wrong passphrase / KMS key?): %w", uerr,
 				)
 			}
@@ -1458,6 +1553,7 @@ func VerifyBackupWith(ctx context.Context, store irbackup.Store, opts VerifyOpti
 	chainEncrypted := len(records) > 0 && records[0].Manifest.ChainEncryption != nil
 	plaintextSplice := func(manifestPath, kind, file string) {
 		failed++
+		sawAuth = true // a plaintext splice is coded -CHUNK-AUTH-FAILED (Bug 185)
 		slog.ErrorContext(ctx, "verify: plaintext chunk in an encrypted chain (splice)",
 			slog.String("manifest", manifestPath), slog.String("kind", kind), slog.String("file", file),
 			slog.String("error", "chunk carries no encryption metadata on an encrypted chain — refusing (SLUICE-E-BACKUP-CHUNK-AUTH-FAILED at restore)"))
@@ -1479,6 +1575,7 @@ func VerifyBackupWith(ctx context.Context, store irbackup.Store, opts VerifyOpti
 				}
 				if err := verifyChunk(ctx, segStore, chunk); err != nil {
 					failed++
+					classifyChunkFailure(err, &sawCorrupt, &sawAuth)
 					slog.ErrorContext(
 						ctx, "verify: chunk failed",
 						slog.String("manifest", rec.Path),
@@ -1490,6 +1587,7 @@ func VerifyBackupWith(ctx context.Context, store irbackup.Store, opts VerifyOpti
 				}
 				if perr := lineage.ProbeChunkDecrypt(opts.Envelope, chunk); perr != nil {
 					failed++
+					sawAuth = true // a decrypt-probe failure is a GCM/AAD auth failure
 					slog.ErrorContext(
 						ctx, "verify: chunk decrypt probe failed",
 						slog.String("manifest", rec.Path),
@@ -1516,6 +1614,7 @@ func VerifyBackupWith(ctx context.Context, store irbackup.Store, opts VerifyOpti
 			}
 			if err := verifyChunk(ctx, segStore, chunk); err != nil {
 				failed++
+				classifyChunkFailure(err, &sawCorrupt, &sawAuth)
 				slog.ErrorContext(
 					ctx, "verify: change chunk failed",
 					slog.String("manifest", rec.Path),
@@ -1526,6 +1625,7 @@ func VerifyBackupWith(ctx context.Context, store irbackup.Store, opts VerifyOpti
 			}
 			if perr := lineage.ProbeChunkDecrypt(opts.Envelope, chunk); perr != nil {
 				failed++
+				sawAuth = true // a decrypt-probe failure is a GCM/AAD auth failure
 				slog.ErrorContext(
 					ctx, "verify: change chunk decrypt probe failed",
 					slog.String("manifest", rec.Path),
@@ -1541,7 +1641,26 @@ func VerifyBackupWith(ctx context.Context, store irbackup.Store, opts VerifyOpti
 			)
 		}
 	}
-	return total, failed, nil
+	return total, failed, sawCorrupt, sawAuth, nil
+}
+
+// classifyChunkFailure inspects a per-chunk verify error's coded class and
+// records which Bug-185 failure kind it is: a SHA-256 mismatch
+// ([sluicecode.CodeBackupChunkCorrupt]) sets sawCorrupt; a GCM/AAD auth
+// failure ([sluicecode.CodeBackupChunkAuthFailed]) sets sawAuth. An uncoded
+// error (a missing chunk / I/O fault — "incomplete", not corruption) sets
+// neither, so the aggregate stays uncoded for that path.
+func classifyChunkFailure(err error, sawCorrupt, sawAuth *bool) {
+	ce, ok := sluicecode.FromError(err)
+	if !ok {
+		return
+	}
+	switch ce.Code {
+	case sluicecode.CodeBackupChunkCorrupt:
+		*sawCorrupt = true
+	case sluicecode.CodeBackupChunkAuthFailed:
+		*sawAuth = true
+	}
 }
 
 // validateManifestStructure rejects a manifest carrying a null structural

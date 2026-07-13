@@ -47,6 +47,7 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
+	"sluicesync.dev/sluice/internal/progress"
 )
 
 // DefaultIncrementalWindow is the default value of
@@ -180,6 +181,12 @@ type IncrementalBackup struct {
 	// "unscoped" — preserves the historical behaviour for chains
 	// whose parent has no recorded table list. Bug 110 closure.
 	scope func(tableName string) bool
+
+	// Progress is the ADR-0155 presentation sink. nil is the
+	// [progress.Nop] default: the incremental's own direct-slog output is
+	// the byte-identical non-TTY stream. The CLI sets a [progress.TTYSink]
+	// only for an interactive terminal.
+	Progress progress.Sink
 }
 
 // Run executes the incremental backup. Returns nil on success.
@@ -193,6 +200,8 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	if err := b.validate(); err != nil {
 		return err
 	}
+	sink := sinkOrNop(b.Progress)
+	sink.PhaseStarted(incrPhaseConnect)
 
 	// 0. Resolve the open segment: every incremental lands in the
 	//    lineage's open segment, under its Dir, with its recorded
@@ -346,34 +355,7 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 		chunkSize = DefaultIncrementalChunkChanges
 	}
 
-	manifest := &irbackup.Manifest{
-		// Bug 116 closure: stamp the smallest format version safe for
-		// this incremental's schema. Same proportional rule as fulls.
-		FormatVersion:  irbackup.FormatVersionFor(beforeSchema),
-		SluiceVersion:  b.SluiceVersion,
-		CreatedAt:      now().UTC(),
-		SourceEngine:   b.Source.Name(),
-		Schema:         beforeSchema,
-		Tables:         nil, // incrementals don't carry table-level row chunks
-		PartialState:   irbackup.BackupStateInProgress,
-		Kind:           irbackup.BackupKindIncremental,
-		ParentBackupID: parent.BackupID,
-		StartPosition:  startPos,
-		SchemaHash:     beforeHash,
-		// Bug 184: record whether this engine's CDC positions commit AFTER
-		// their rows (VStream), so restore knows a schema anchor at
-		// EndPosition cannot prove the window's data was applied.
-		CDCPositionCommitsAfterRows: b.Source.Capabilities().CDCPositionCommitsAfterRows,
-	}
-	// If the parent has no BackupID (legacy v0.16.x), compute one
-	// retroactively so chain-walk has a stable link. The retroactive
-	// ID is identical to what `incremental` would compute for the
-	// same content, so a future re-write of the parent manifest
-	// (e.g. with the v0.17.0 backup-full path) doesn't break the
-	// chain.
-	if manifest.ParentBackupID == "" {
-		manifest.ParentBackupID = irbackup.ComputeBackupID(parent)
-	}
+	manifest := b.newInProgressManifest(now, beforeSchema, beforeHash, startPos, parent)
 
 	// Phase 6.1: align this incremental's encryption with the chain
 	// root. The parent full's [irbackup.ChainEncryption] dictates the chain's
@@ -399,11 +381,15 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 		return err
 	}
 
+	sink.PhaseCompleted(incrPhaseConnect)
+	sink.PhaseStarted(incrPhaseStream)
 	deadline := clockNow().Add(windowDur)
 	endPos, totalChanges, captureErr := b.captureWindow(ctx, cdc, changesCh, manifest, chunkSize, deadline, b.MaxChanges, clockNow, chainCEK)
 	if captureErr != nil {
 		return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("incremental: capture window: %w", captureErr))
 	}
+	sink.PhaseCompleted(incrPhaseStream)
+	sink.PhaseStarted(incrPhaseFinalize)
 	manifest.EndPosition = endPos
 	if err := assertDataWindowEndPositionInvariant(manifest); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseCDC, err)
@@ -500,7 +486,78 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 		slog.Int("schema_history", len(manifest.SchemaHistory)),
 		slog.String("manifest_path", manifestPath),
 	)
+	sink.PhaseCompleted(incrPhaseFinalize)
+	sink.Summary(incrementalSummaryResult(manifest, totalChanges, signing))
 	return nil
+}
+
+// incrementalSummaryResult builds the ADR-0155 TTY summary panel for a
+// completed incremental — changes/chunks/schema-delta and the
+// encrypted/signed/EndPosition posture. TTY-only; [progress.Nop] ignores it.
+func incrementalSummaryResult(manifest *irbackup.Manifest, totalChanges int64, signing bool) progress.Result {
+	fields := []progress.Field{
+		{Label: "Changes", Value: progress.HumanCount(totalChanges)},
+		{Label: "Chunks", Value: progress.HumanCount(int64(len(manifest.ChangeChunks)))},
+		{Label: "SchemaDelta", Value: progress.HumanCount(int64(len(manifest.SchemaDelta)))},
+		{Label: "Encrypted", Value: boolYesNo(manifest.ChainEncryption != nil)},
+		{Label: "Signed", Value: boolYesNo(signing)},
+	}
+	if tok := manifest.EndPosition.Token; tok != "" {
+		fields = append(fields, progress.Field{Label: "EndPosition", Value: clipPosToken(tok)})
+	}
+	return progress.Result{Fields: fields}
+}
+
+// newInProgressManifest builds the in-progress incremental manifest from
+// the resolved start baseline. Extracted from Run to keep it within the
+// funlen budget; the fields are exactly as before.
+func (b *IncrementalBackup) newInProgressManifest(now func() time.Time, beforeSchema *ir.Schema, beforeHash string, startPos ir.Position, parent *irbackup.Manifest) *irbackup.Manifest {
+	manifest := &irbackup.Manifest{
+		// Bug 116 closure: stamp the smallest format version safe for
+		// this incremental's schema. Same proportional rule as fulls.
+		FormatVersion:  irbackup.FormatVersionFor(beforeSchema),
+		SluiceVersion:  b.SluiceVersion,
+		CreatedAt:      now().UTC(),
+		SourceEngine:   b.Source.Name(),
+		Schema:         beforeSchema,
+		Tables:         nil, // incrementals don't carry table-level row chunks
+		PartialState:   irbackup.BackupStateInProgress,
+		Kind:           irbackup.BackupKindIncremental,
+		ParentBackupID: parent.BackupID,
+		StartPosition:  startPos,
+		SchemaHash:     beforeHash,
+		// Bug 184: record whether this engine's CDC positions commit AFTER
+		// their rows (VStream), so restore knows a schema anchor at
+		// EndPosition cannot prove the window's data was applied.
+		CDCPositionCommitsAfterRows: b.Source.Capabilities().CDCPositionCommitsAfterRows,
+	}
+	// If the parent has no BackupID (legacy v0.16.x), compute one
+	// retroactively so chain-walk has a stable link. The retroactive
+	// ID is identical to what `incremental` would compute for the
+	// same content, so a future re-write of the parent manifest
+	// (e.g. with the v0.17.0 backup-full path) doesn't break the chain.
+	if manifest.ParentBackupID == "" {
+		manifest.ParentBackupID = irbackup.ComputeBackupID(parent)
+	}
+	return manifest
+}
+
+// boolYesNo renders a bool as the summary panel's "yes"/"no".
+func boolYesNo(b bool) string {
+	if b {
+		return "yes"
+	}
+	return "no"
+}
+
+// clipPosToken shortens a CDC position token for the one-line summary
+// field (tokens are JSON blobs that would overflow the box width).
+func clipPosToken(tok string) string {
+	const maxLen = 48
+	if len(tok) <= maxLen {
+		return tok
+	}
+	return tok[:maxLen-3] + "..."
 }
 
 // resolveSigning decides whether this incremental must be signed and, if

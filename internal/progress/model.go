@@ -10,17 +10,19 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-
-	"sluicesync.dev/sluice/internal/ir"
 )
 
 // The messages the [TTYSink] translates each [Sink] call into and sends
 // to the running bubbletea program. They are the model's whole input
 // surface; the teatest suite drives the model with these directly, no
 // terminal required (mirroring internal/fleettui's pure-Update design).
+//
+// Phases are carried by Key (the stable [Phase.Key]) — the display Label
+// lives in the [Spec] the model was built from, so a message need only
+// name which checklist row to advance.
 type (
-	phaseStartedMsg   struct{ phase ir.MigrationPhase }
-	phaseCompletedMsg struct{ phase ir.MigrationPhase }
+	phaseStartedMsg   struct{ key string }
+	phaseCompletedMsg struct{ key string }
 	tableProgressMsg  struct {
 		table       string
 		done, total int64
@@ -28,6 +30,10 @@ type (
 	warnMsg    struct{ text string }
 	summaryMsg struct{ result Result }
 )
+
+// defaultLabelWidth is the summary-panel label column width when a [Spec]
+// leaves LabelWidth zero. 11 matches migrate's phase-1 panel.
+const defaultLabelWidth = 11
 
 // phaseStatus is a checklist row's state.
 type phaseStatus int
@@ -41,7 +47,7 @@ const (
 // phaseRow is one line of the phase checklist.
 type phaseRow struct {
 	label  string
-	phase  ir.MigrationPhase
+	key    string
 	status phaseStatus
 }
 
@@ -50,15 +56,20 @@ type tableStat struct {
 	done, total int64
 }
 
-// model is the bubbletea model behind the pretty `migrate` view. Update
-// is a pure msg->model function so every transition is teatest-covered
-// without a terminal; the bubbletea/lipgloss dependency is confined to
-// this package.
+// model is the bubbletea model behind the pretty one-shot-command view.
+// It is command-parameterized by a [Spec] (title + ordered phase
+// checklist + which phase carries the inline bar), so the same model
+// renders migrate, verify, backup, or restore — whatever list it's given
+// (ADR-0155 phase 2). Update is a pure msg->model function so every
+// transition is teatest-covered without a terminal; the bubbletea/lipgloss
+// dependency is confined to this package.
 type model struct {
+	spec Spec
+
 	phases []phaseRow
-	// index maps an ir phase to its checklist row. Phases outside the
-	// checklist (pending/complete/failed) are absent and ignored.
-	index map[ir.MigrationPhase]int
+	// index maps a phase Key to its checklist row. Phases outside the
+	// checklist are absent and ignored.
+	index map[string]int
 
 	tables map[string]tableStat
 	active string // most-recently-updated table, drives the inline bar
@@ -69,7 +80,7 @@ type model struct {
 	haveResult bool
 	done       bool
 	// interrupted records a ctrl+c so the TTYSink can cancel the
-	// underlying migration after the program returns.
+	// underlying run after the program returns.
 	interrupted bool
 
 	width int
@@ -80,32 +91,21 @@ type model struct {
 	now       func() time.Time
 }
 
-// checklist is the phase order shown in the view (ADR-0155): the
-// operator-legible sequence, which differs slightly from the internal
-// completion order (identity-sync completes before indexes on the MySQL
-// fallback path). A row is marked done whenever its PhaseCompleted
-// arrives, so an out-of-display-order completion still fills in
-// correctly.
-var checklist = []phaseRow{
-	{label: "Tables", phase: ir.MigrationPhaseTables},
-	{label: "Bulk copy", phase: ir.MigrationPhaseBulkCopy},
-	{label: "Indexes", phase: ir.MigrationPhaseIndexes},
-	{label: "Identity", phase: ir.MigrationPhaseIdentitySync},
-	{label: "Constraints", phase: ir.MigrationPhaseConstraints},
-	{label: "Views", phase: ir.MigrationPhaseViews},
-}
-
-// newModel builds the initial model. startedAt anchors the summary
-// duration; now supplies the end time (injectable for deterministic
-// tests).
-func newModel(startedAt time.Time, now func() time.Time) model {
-	rows := make([]phaseRow, len(checklist))
-	copy(rows, checklist)
-	idx := make(map[ir.MigrationPhase]int, len(rows))
-	for i, r := range rows {
-		idx[r.phase] = i
+// newModel builds the initial model from a command [Spec]. startedAt
+// anchors the summary duration; now supplies the end time (injectable for
+// deterministic tests).
+func newModel(spec Spec, startedAt time.Time, now func() time.Time) model {
+	if spec.LabelWidth <= 0 {
+		spec.LabelWidth = defaultLabelWidth
+	}
+	rows := make([]phaseRow, len(spec.Phases))
+	idx := make(map[string]int, len(spec.Phases))
+	for i, p := range spec.Phases {
+		rows[i] = phaseRow{label: p.Label, key: p.Key}
+		idx[p.Key] = i
 	}
 	return model{
+		spec:      spec,
 		phases:    rows,
 		index:     idx,
 		tables:    map[string]tableStat{},
@@ -120,21 +120,23 @@ func (m model) Init() tea.Cmd { return nil }
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case phaseStartedMsg:
-		if i, ok := m.index[msg.phase]; ok && m.phases[i].status != statusDone {
+		if i, ok := m.index[msg.key]; ok && m.phases[i].status != statusDone {
 			m.phases[i].status = statusActive
 		}
 		return m, nil
 	case phaseCompletedMsg:
-		if i, ok := m.index[msg.phase]; ok {
+		if i, ok := m.index[msg.key]; ok {
 			m.phases[i].status = statusDone
 		}
 		return m, nil
 	case tableProgressMsg:
 		m.tables[msg.table] = tableStat{done: msg.done, total: msg.total}
 		m.active = msg.table
-		// A table reporting progress means the bulk-copy phase is live.
-		if i, ok := m.index[ir.MigrationPhaseBulkCopy]; ok && m.phases[i].status == statusPending {
-			m.phases[i].status = statusActive
+		// A table reporting progress means the bar-carrying phase is live.
+		if m.spec.ProgressKey != "" {
+			if i, ok := m.index[m.spec.ProgressKey]; ok && m.phases[i].status == statusPending {
+				m.phases[i].status = statusActive
+			}
 		}
 		return m, nil
 	case warnMsg:
@@ -152,9 +154,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyMsg:
 		// ctrl+c aborts the view AND (via the TTYSink's post-run
-		// callback) the migration. In raw mode the terminal delivers
-		// ctrl+c as this KeyMsg rather than a process SIGINT, so it must
-		// be handled here or it would be swallowed.
+		// callback) the run. In raw mode the terminal delivers ctrl+c as
+		// this KeyMsg rather than a process SIGINT, so it must be handled
+		// here or it would be swallowed.
 		if msg.Type == tea.KeyCtrlC {
 			m.interrupted = true
 			return m, tea.Quit
@@ -178,10 +180,10 @@ func (m model) View() string {
 }
 
 // liveView renders the phase checklist with an inline bar on the active
-// bulk-copy row.
+// bar-carrying row.
 func (m model) liveView() string {
 	var b strings.Builder
-	b.WriteString(brandStyle.Render("sluice migrate"))
+	b.WriteString(brandStyle.Render(m.spec.Title))
 	b.WriteString("\n\n")
 	for _, r := range m.phases {
 		b.WriteString("  ")
@@ -196,8 +198,9 @@ func (m model) liveView() string {
 	return b.String()
 }
 
-// renderPhaseRow renders one checklist line, appending the active table's
-// bar to the bulk-copy row while it is in progress.
+// renderPhaseRow renders one checklist line. The active bar-carrying row
+// (migrate's bulk copy) gets the inline per-table bar; every other active
+// row gets a "(working...)" hint so it reads as alive.
 func (m model) renderPhaseRow(r phaseRow) string {
 	var mark, label string
 	switch r.status {
@@ -212,7 +215,11 @@ func (m model) renderPhaseRow(r phaseRow) string {
 		label = dimStyle.Render(r.label)
 	}
 	line := mark + " " + label
-	if r.phase == ir.MigrationPhaseBulkCopy && r.status == statusActive {
+	if r.status != statusActive {
+		return line
+	}
+	switch {
+	case m.spec.ProgressKey != "" && r.key == m.spec.ProgressKey:
 		if m.active != "" {
 			line += "   " + m.renderActiveTable()
 		} else {
@@ -221,6 +228,10 @@ func (m model) renderPhaseRow(r phaseRow) string {
 			// still reads as alive rather than a frozen "[..] Bulk copy".
 			line += "   " + dimStyle.Render("(copying...)")
 		}
+	default:
+		// Phases without a per-table bar (verify/backup/restore, and
+		// migrate's non-copy phases) still read as alive while active.
+		line += "   " + dimStyle.Render("(working...)")
 	}
 	return line
 }
@@ -249,29 +260,31 @@ func (m model) renderActiveTable() string {
 		frac = float64(st.done) / float64(st.total)
 		pct = fmt.Sprintf(" %3.0f%%", frac*100)
 	}
-	count := fmt.Sprintf("(%s rows)", humanCount(st.done))
+	count := fmt.Sprintf("(%s rows)", HumanCount(st.done))
 	if estExceeded {
-		count = fmt.Sprintf("(%s rows, est. exceeded)", humanCount(st.done))
+		count = fmt.Sprintf("(%s rows, est. exceeded)", HumanCount(st.done))
 	}
 	return fmt.Sprintf("%-24s %s%s  %s",
 		clipName(m.active, 24), renderBar(frac, 20), pct, dimStyle.Render(count))
 }
 
 // summaryView renders the compact static panel that replaces the live
-// view on completion (so scrollback stays clean).
+// view on completion (so scrollback stays clean). It renders the Spec's
+// title, the command's summary [Field]s (label column at Spec.LabelWidth),
+// the run duration, then any warnings.
 func (m model) summaryView() string {
 	var b strings.Builder
-	b.WriteString(headerStyle.Render("sluice migrate - complete"))
+	b.WriteString(headerStyle.Render(m.spec.Title + " - complete"))
 	b.WriteString("\n\n")
-	fmt.Fprintf(&b, "  %-11s %s\n", "Tables", humanCount(int64(m.result.Tables)))
-	if m.result.Rows > 0 {
-		fmt.Fprintf(&b, "  %-11s %s\n", "Rows", humanCount(m.result.Rows))
+	w := m.spec.LabelWidth
+	for _, f := range m.result.Fields {
+		fmt.Fprintf(&b, "  %-*s %s\n", w, f.Label, f.Value)
 	}
-	fmt.Fprintf(&b, "  %-11s %s\n", "Duration", m.elapsed())
+	fmt.Fprintf(&b, "  %-*s %s\n", w, "Duration", m.elapsed())
 	if len(m.warnings) > 0 {
-		fmt.Fprintf(&b, "  %-11s %d\n", "Warnings", len(m.warnings))
-		for _, w := range m.warnings {
-			b.WriteString(warnStyle.Render("    - " + clipLine(oneLine(w), m.warnWidth())))
+		fmt.Fprintf(&b, "  %-*s %d\n", w, "Warnings", len(m.warnings))
+		for _, wm := range m.warnings {
+			b.WriteString(warnStyle.Render("    - " + clipLine(oneLine(wm), m.warnWidth())))
 			b.WriteString("\n")
 		}
 	}
@@ -291,8 +304,9 @@ func (m model) elapsed() string {
 	return d.Round(100 * time.Millisecond).String()
 }
 
-// humanCount renders n with thousands separators ("1,234,567").
-func humanCount(n int64) string {
+// HumanCount renders n with thousands separators ("1,234,567"). Exported
+// so each command can format its summary [Field] values consistently.
+func HumanCount(n int64) string {
 	s := strconv.FormatInt(n, 10)
 	neg := strings.HasPrefix(s, "-")
 	if neg {

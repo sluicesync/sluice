@@ -112,21 +112,22 @@ func (h *warnGateHandler) WithGroup(name string) slog.Handler {
 	return &warnGateHandler{sink: h.sink, buffer: h.buffer.WithGroup(name)}
 }
 
-// runMigrateWithProgress runs fn (the migration) under the chosen
-// presentation sink. When pretty is false it just runs fn — the sink is
-// the [progress.LogSink] default, byte-identical to before. When pretty is
-// true it starts a [progress.TTYSink] on stdout, silences slog for the
-// render (forwarding WARN/ERROR into the view), sets the sink on the
-// migrator via setSink, runs, then finalizes: quit the view, restore slog,
+// runWithProgress runs fn (a one-shot command's work) under the chosen
+// presentation sink (ADR-0155). When pretty is false it just runs fn — the
+// command keeps its byte-identical non-TTY output (migrate's LogSink lines,
+// or the [progress.Nop] sink for verify/backup/restore, whose own
+// report/slog is untouched). When pretty is true it starts a
+// [progress.TTYSink] on stdout for the command's spec, silences slog for
+// the render (forwarding WARN/ERROR into the view), sets the sink on the
+// command via setSink, runs, then finalizes: quit the view, restore slog,
 // and flush the buffered warnings/error to stderr ONLY on failure (when the
-// summary box never rendered). cancel is the migration context's cancel,
-// wired as the view's ctrl+c handler so an abort at the pretty view
-// actually stops the run.
-func runMigrateWithProgress(pretty bool, cancel func(), setSink func(progress.Sink), fn func() error) error {
+// summary box never rendered). cancel is the run context's cancel, wired as
+// the view's ctrl+c handler so an abort at the pretty view stops the run.
+func runWithProgress(pretty bool, cancel func(), spec progress.Spec, setSink func(progress.Sink), fn func() error) error {
 	if !pretty {
 		return fn()
 	}
-	sink := progress.NewTTYSink(os.Stdout, cancel)
+	sink := progress.NewTTYSink(os.Stdout, cancel, spec)
 	setSink(sink)
 	restore := silenceSlogForTTY(sink)
 	err := fn()

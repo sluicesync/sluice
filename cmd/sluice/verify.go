@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/pipeline"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
+	"sluicesync.dev/sluice/internal/progress"
 )
 
 // VerifyCmd implements `sluice verify`. v0.12.0 ships count-mode
@@ -96,10 +98,28 @@ func (v *VerifyCmd) Run(g *Globals) error {
 		Format:             v.Format,
 		Out:                writer,
 	}
-	result, err := verifier.Run(kongContext())
-	if err != nil {
-		runErr = err
-		return operationalError{err: err}
+
+	// ADR-0155: pretty TTY view only for an interactive text-report run to
+	// stdout (not --format json, not -o FILE, and gated by the shared
+	// wantPrettyProgress). When pretty, the live view owns stdout, so the
+	// report is redirected to io.Discard — the summary panel replaces it.
+	pretty := (v.Format == "" || v.Format == "text") && v.Output == "" &&
+		wantPrettyProgress(g, false, false, false)
+	if pretty {
+		verifier.Out = io.Discard
+	}
+	ctx, cancel := context.WithCancel(kongContext())
+	defer cancel()
+	var result *pipeline.VerifyResult
+	runErr = runWithProgress(pretty, cancel, pipeline.VerifyProgressSpec,
+		func(s progress.Sink) { verifier.Progress = s },
+		func() error {
+			var e error
+			result, e = verifier.Run(ctx)
+			return e
+		})
+	if runErr != nil {
+		return operationalError{err: runErr}
 	}
 	if result != nil && result.HasMismatch() {
 		return driftError{summary: fmt.Sprintf("%d table(s) with row-count mismatch", result.Summary.TablesMismatch)}

@@ -23,7 +23,25 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
+	"sluicesync.dev/sluice/internal/progress"
 )
+
+// Verify pretty-view phases (ADR-0155 phase 2). Verify has no historical
+// slog output — it renders a text/JSON report to [Verifier.Out] — so on
+// the non-TTY path the sink is [progress.Nop] and this checklist drives
+// only the interactive view.
+var (
+	verifyPhaseSchema  = progress.Phase{Key: "schema", Label: "Schema"}
+	verifyPhaseCompare = progress.Phase{Key: "compare", Label: "Compare"}
+)
+
+// VerifyProgressSpec is the pretty-view [progress.Spec] for `sluice
+// verify`. The CLI hands it to [progress.NewTTYSink].
+var VerifyProgressSpec = progress.Spec{
+	Title:      "sluice verify",
+	Phases:     []progress.Phase{verifyPhaseSchema, verifyPhaseCompare},
+	LabelWidth: 12,
+}
 
 // VerifyDepth selects which depth of verification to run. Count is the
 // MVP and the only supported depth in v0.12.0; sample and full are
@@ -91,6 +109,22 @@ type Verifier struct {
 
 	// Out is the destination for the rendered report. Required.
 	Out io.Writer
+
+	// Progress is the ADR-0155 presentation sink. nil is the [progress.Nop]
+	// default (verify's own report to Out is the byte-identical non-TTY
+	// output); the CLI sets a [progress.TTYSink] only for an interactive
+	// terminal, where it also points Out at io.Discard so the report and
+	// the live view don't both write stdout.
+	Progress progress.Sink
+}
+
+// sink returns the presentation sink, defaulting a nil Progress to the
+// no-op sink so every call-site is nil-free.
+func (v *Verifier) sink() progress.Sink {
+	if v.Progress == nil {
+		return progress.Nop{}
+	}
+	return v.Progress
 }
 
 // VerifyResult is the structured outcome of a verify run. The renderer
@@ -188,6 +222,9 @@ func (v *Verifier) Run(ctx context.Context) (*VerifyResult, error) {
 		sampleSeed = DefaultSampleSeed
 	}
 
+	sink := v.sink()
+	sink.PhaseStarted(verifyPhaseSchema)
+
 	sr, err := v.Source.OpenSchemaReader(ctx, v.SourceDSN)
 	if err != nil {
 		return nil, fmt.Errorf("verify: open source schema reader: %w", err)
@@ -248,6 +285,8 @@ func (v *Verifier) Run(ctx context.Context) (*VerifyResult, error) {
 	tables := make([]*ir.Table, 0, len(srcSchema.Tables))
 	tables = append(tables, srcSchema.Tables...)
 	sort.Slice(tables, func(i, j int) bool { return tables[i].Name < tables[j].Name })
+	sink.PhaseCompleted(verifyPhaseSchema)
+	sink.PhaseStarted(verifyPhaseCompare)
 
 	for _, srcTable := range tables {
 		tr := VerifyTableResult{Name: srcTable.Name}
@@ -312,10 +351,21 @@ func (v *Verifier) Run(ctx context.Context) (*VerifyResult, error) {
 		}
 	}
 	result.Summary.TablesChecked = len(result.Tables)
+	sink.PhaseCompleted(verifyPhaseCompare)
 
 	if err := v.render(result); err != nil {
 		return result, fmt.Errorf("verify: render: %w", err)
 	}
+	// ADR-0155 summary panel (TTY only; Nop ignores it). The report to Out
+	// above is the byte-identical non-TTY output; these Fields are the
+	// interactive rollup the operator reads first.
+	s := result.Summary
+	sink.Summary(progress.Result{Fields: []progress.Field{
+		{Label: "Checked", Value: progress.HumanCount(int64(s.TablesChecked))},
+		{Label: "Clean", Value: progress.HumanCount(int64(s.TablesClean))},
+		{Label: "Mismatched", Value: progress.HumanCount(int64(s.TablesMismatch))},
+		{Label: "Skipped", Value: progress.HumanCount(int64(s.TablesSkipped))},
+	}})
 	return result, nil
 }
 
