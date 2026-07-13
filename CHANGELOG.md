@@ -4,6 +4,18 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.236] - 2026-07-13
+
+### Added
+
+- **A TTY-aware live status panel for `sync start` (ADR-0156 phase 1).** Run `sluice sync start` at an interactive terminal and you now get a live, in-place status view instead of a wall of log lines: an initial-copy checklist with a per-table progress bar during the snapshot, then a CDC body showing the last-applied position, freshness (seconds since last apply — the load-bearing cross-engine lag signal), and connection health, with a bounded recent-events region that surfaces WARN/ERROR live as they occur (a days-long run never buffers them to a summary), and a `q` / ctrl+c footer that triggers a **graceful drain-and-stop** — wired to the exact `RequestStop` write `sync stop` performs, so in-flight changes drain rather than being dropped. The renderer is isolated from the stream: a panel failure falls back to structured logging and never aborts the sync. Gating matches ADR-0155 exactly — the panel renders only when stdout is a terminal **and** `--log-format=text` **and** `--no-progress` is unset, for a single-namespace, non-`--format json`, non-`--dry-run` run; every other invocation (piped, CI, `--log-format=json`, `--no-progress`, or a multi-namespace fan-out) keeps the byte-identical structured `slog` stream. Cumulative rows-applied and throughput are a **named phase-1 gap** — they render `n/a (phase 1)` rather than a fabricated number (loud-failure discipline); a truthful counter is the next follow-up. The broker (`sync from-backup run`), `backup stream run`, and `metrics-watch` adopt the same panel in ADR-0156 phases 2–3.
+
+- **`slot list` renders an on-brand bordered table at an interactive terminal (ADR-0155, report-shaped).** `sluice slot list` now shows a rounded-border grid with the ACTIVE column colour-coded (a live consumer stands out at a glance) when run at a TTY. As always, piped / CI / `--log-format=json` / `--no-progress` output is the exact `tabwriter` table sluice has always emitted, byte-for-byte. `schema preview` and `schema diff` deliberately stay plain — they're the most copy-paste- and CI-oriented commands, where a box would get in the way.
+
+### Changed
+
+- **golangci-lint no longer descends into the gitignored `.claude/` agent-worktree scratch area.** A local whole-tree `golangci-lint run` could be polluted by a background agent's in-progress worktree (or a stale, not-yet-pruned one); excluding `.claude/` fixes it. CI is unaffected — it lints a fresh checkout with no worktrees present.
+
 ## [0.99.235] - 2026-07-13
 
 ### Added
