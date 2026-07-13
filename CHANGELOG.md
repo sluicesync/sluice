@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.233] - 2026-07-12
+
+### Added
+
+- **`migrate` now shows a live progress view at an interactive terminal (ADR-0155).** When stdout is a terminal and `--log-format=text` (the default), `sluice migrate` renders a phase checklist (Tables → Bulk copy → Indexes → Identity → Constraints → Views) that fills in as each phase completes, a per-table progress bar during the bulk copy, and a final summary panel (tables, rows, duration, any warnings — warnings render inside the panel, long ones truncated to fit). Everywhere else — piped output, CI, `--log-format=json`, or the new `--no-progress` flag — the exact structured `slog` records sluice has always emitted are unchanged, byte-for-byte, so log ingestion and automation are unaffected. The pretty view is purely additive on top of a TTY; `--no-progress` is the explicit opt-out, and `--log-format=json` / non-TTY select the structured stream automatically. The progress bar reads `100%+` (with the live row count) when the source row-count estimate undershoots — routine for MySQL's InnoDB estimate — so it never shows a nonsensical percentage and stays legible as "still progressing." This is the first command in the ADR-0155 rollout; `verify`/`backup`/`restore`/`trigger` and the other one-shot commands follow, and the continuous commands (`sync start`, the broker, `backup stream`) get a live status panel under ADR-0156.
+
 ## [0.99.232] - 2026-07-12
 
 ### Added
