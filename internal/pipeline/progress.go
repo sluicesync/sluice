@@ -43,7 +43,32 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
+	"sluicesync.dev/sluice/internal/progress"
 )
+
+// runRowTotalKey carries a run-scoped rows-copied accumulator through the
+// context so every per-table / per-chunk [progressTicker] can add its
+// final count without threading a parameter through the concurrent copy
+// graph — the same context-carrier pattern the presentation sink uses.
+type runRowTotalKey struct{}
+
+// withRunRowTotal attaches a fresh rows-copied accumulator to ctx and
+// returns both. The migrate orchestrator reads the accumulator after the
+// copy phases to populate the summary's total row count (best-effort:
+// "rows handed to the writer" summed across every ticker — see the
+// file-level note on that count's exactness). Callers that don't attach
+// one (sync cold-start, tests) leave every ticker's add a nil-safe no-op.
+func withRunRowTotal(ctx context.Context) (context.Context, *atomic.Int64) {
+	c := new(atomic.Int64)
+	return context.WithValue(ctx, runRowTotalKey{}, c), c
+}
+
+// runRowTotalFromContext returns the run's rows-copied accumulator, or nil
+// when none is attached.
+func runRowTotalFromContext(ctx context.Context) *atomic.Int64 {
+	c, _ := ctx.Value(runRowTotalKey{}).(*atomic.Int64)
+	return c
+}
 
 // progressTicker counts rows passing through the bulk-copy pipe and
 // emits a periodic slog line summarising progress. One ticker per
@@ -66,6 +91,20 @@ type progressTicker struct {
 	hasChunk bool // distinguishes "chunk 0 of a parallel run" from "single-reader"
 	interval time.Duration
 	logger   *slog.Logger
+
+	// sink is the run's presentation sink (ADR-0155), resolved from the
+	// context at construction. On the structured-log path it is the
+	// [progress.LogSink], whose TableProgress is a no-op — the rich
+	// "bulk copy progress" slog line below is unchanged and byte-identical.
+	// On the interactive path it is the [progress.TTYSink], which renders
+	// the per-table bar from the (done,total) pair; the slog line is then
+	// harmlessly emitted into the CLI's silenced handler.
+	sink progress.Sink
+
+	// runRows is the run-scoped rows-copied accumulator (nil when the
+	// caller attached none). On a clean Stop this ticker adds its final
+	// row count so the orchestrator can report an accurate migration total.
+	runRows *atomic.Int64
 
 	// total is the source-side row-count estimate for ETA calculation.
 	// Set via setTotalRows once the async COUNT(*) query (or
@@ -94,6 +133,8 @@ func newProgressTicker(ctx context.Context, interval time.Duration, table string
 		chunk:    -1,
 		interval: interval,
 		logger:   slog.Default(),
+		sink:     progress.FromContext(ctx),
+		runRows:  runRowTotalFromContext(ctx),
 		done:     make(chan struct{}),
 	}
 	p.wg.Add(1)
@@ -112,6 +153,8 @@ func newProgressTickerForChunk(ctx context.Context, interval time.Duration, tabl
 		hasChunk: true,
 		interval: interval,
 		logger:   slog.Default(),
+		sink:     progress.FromContext(ctx),
+		runRows:  runRowTotalFromContext(ctx),
 		done:     make(chan struct{}),
 	}
 	p.wg.Add(1)
@@ -239,6 +282,9 @@ func (p *progressTicker) loop(ctx context.Context) {
 			if p.hasChunk {
 				attrs = append(attrs, slog.Int("chunk", p.chunk))
 			}
+			// ADR-0155: feed the interactive per-table bar. No-op on the
+			// LogSink; the rich slog line below stays byte-identical.
+			p.sink.TableProgress(p.table, rows, total)
 			p.logger.LogAttrs(ctx, slog.LevelInfo, "bulk copy progress", attrs...)
 			lastRows = rows
 			lastBytes = bytes
@@ -267,6 +313,20 @@ func (p *progressTicker) Stop(ctx context.Context, err error) {
 		msg := "bulk copy complete"
 		if err != nil {
 			msg = "bulk copy aborted"
+		}
+		// ADR-0155: fill the interactive per-table bar to 100% on a clean
+		// finish (done==total). No-op on the LogSink. On abort we leave the
+		// bar where it stopped — the failure surfaces via the summary panel.
+		// Also fold this ticker's final row count into the run-scoped total
+		// so the orchestrator can report an accurate migration-wide sum
+		// (summing per ticker avoids the model-side undercount where a
+		// chunked table's per-chunk TableProgress calls overwrite by name).
+		if err == nil {
+			done := p.rows.Load()
+			p.sink.TableProgress(p.table, done, done)
+			if p.runRows != nil {
+				p.runRows.Add(done)
+			}
 		}
 		attrs := []slog.Attr{
 			slog.String("table", p.table),
