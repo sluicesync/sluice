@@ -101,6 +101,12 @@ func (m *MetricsWatchCmd) Run(g *Globals) error {
 
 	ctx := kongContext()
 
+	// ADR-0156 phase 3: whether the TTY-aware live panel will render. Computed
+	// BEFORE the telemetry provider is built so its "telemetry enabled" INFO can
+	// be suppressed (quiet) on the panel path — that line fires before the
+	// panel's slog gate installs and would otherwise leak above the panel.
+	// Renders only for an interactive, text-log, non-once invocation.
+	pretty := wantPrettyProgress(g, false, false, false) && !m.Once
 	provider, err := buildTargetTelemetryProvider(ctx, telemetryParams{
 		org:       m.PlanetScaleOrg,
 		tokenID:   m.PlanetScaleMetricsTokenID,
@@ -109,6 +115,7 @@ func (m *MetricsWatchCmd) Run(g *Globals) error {
 		branch:    m.PlanetScaleMetricsBranch,
 		targetDSN: "", // standalone: no data-plane DSN; metrics-db is supplied directly
 		engine:    m.Engine,
+		quiet:     pretty,
 	})
 	if err != nil {
 		return operationalError{err: err}
@@ -136,13 +143,10 @@ func (m *MetricsWatchCmd) Run(g *Globals) error {
 		BuildVersion:        version,
 		BuildCommit:         commit,
 	}
-	// ADR-0156 phase 3: the TTY-aware live panel. Renders only for an
-	// interactive, text-log, non-once invocation (--once is a scripted
-	// one-shot with no long-lived loop to render); the same [wantPrettyProgress]
-	// gate as the one-shot commands (metrics-watch has no --format json
-	// envelope, dry-run, or multi-namespace shape). Every other invocation
-	// keeps today's byte-identical sample-line stream.
-	pretty := wantPrettyProgress(g, false, false, false) && !m.Once
+	// The panel gate (`pretty`) was computed above, before the telemetry build,
+	// so its enable-INFO could be suppressed on the panel path. --once is a
+	// scripted one-shot with no long-lived loop to render; every non-panel
+	// invocation keeps today's byte-identical sample-line stream.
 	provNil := telemetryProviderOrNil(provider)
 	if pretty {
 		header := progress.LiveHeader{

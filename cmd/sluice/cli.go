@@ -1268,9 +1268,16 @@ type telemetryParams struct {
 	branch    string
 	targetDSN string
 	engine    string // target engine registry name (selects the metric-name table)
+
+	// quiet suppresses the one-line "telemetry enabled" INFO on success. Set by
+	// the live-panel commands (sync start, metrics-watch) so that pre-run log
+	// line does not leak ABOVE the panel — it fires before the panel's slog gate
+	// installs. The zero value (false) keeps the INFO for every non-panel caller
+	// (fleet sync run, restore, diagnose), i.e. byte-identical to prior releases.
+	quiet bool
 }
 
-func buildTargetTelemetry(ctx context.Context, s *SyncStartCmd) (*pstelemetry.Provider, error) {
+func buildTargetTelemetry(ctx context.Context, s *SyncStartCmd, quiet bool) (*pstelemetry.Provider, error) {
 	return buildTargetTelemetryProvider(ctx, telemetryParams{
 		org:       s.PlanetScaleOrg,
 		tokenID:   s.PlanetScaleMetricsTokenID,
@@ -1279,6 +1286,7 @@ func buildTargetTelemetry(ctx context.Context, s *SyncStartCmd) (*pstelemetry.Pr
 		branch:    s.PlanetScaleMetricsBranch,
 		targetDSN: s.Target,
 		engine:    s.TargetDriver,
+		quiet:     quiet,
 	})
 }
 
@@ -1330,13 +1338,17 @@ func buildTargetTelemetryProvider(ctx context.Context, p telemetryParams) (*pste
 	if err != nil {
 		return nil, fmt.Errorf("--planetscale-org telemetry: %w", err)
 	}
-	slog.InfoContext(
-		ctx,
-		"PlanetScale target-health telemetry enabled (ADR-0107) — advisory only; apply correctness is unaffected",
-		slog.String("org", p.org),
-		slog.String("database", database),
-		slog.String("branch", branchOrMainLabel(p.branch)),
-	)
+	if !p.quiet {
+		// Suppressed on the live-panel path (p.quiet) so this line does not leak
+		// above the panel; the panel surfaces the same context in its header.
+		slog.InfoContext(
+			ctx,
+			"PlanetScale target-health telemetry enabled (ADR-0107) — advisory only; apply correctness is unaffected",
+			slog.String("org", p.org),
+			slog.String("database", database),
+			slog.String("branch", branchOrMainLabel(p.branch)),
+		)
+	}
 	return provider, nil
 }
 
@@ -1684,12 +1696,18 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 	source = labelEngine(source, s.StreamID)
 	target = labelEngine(target, s.StreamID)
 
+	// Whether the live status panel (ADR-0156 phase 1) will render. Computed
+	// here — before the telemetry provider is built — so its "telemetry enabled"
+	// INFO can be suppressed (quiet) on the panel path; that line fires before
+	// the panel's slog gate installs and would otherwise leak above the panel.
+	prettyPanel := wantPrettyProgress(g, env.jsonMode, s.DryRun, s.multiNamespaceFanout(allNS))
+
 	// ADR-0107 Phase 2: construct the OPTIONAL PlanetScale target-health
 	// telemetry provider when the operator opts in. Wired ONLY here at the
 	// composition root (the sole place allowed to import the PS provider);
 	// the streamer holds it as the engine-neutral ir.TargetTelemetry. Nil
 	// when the operator did not opt in ⇒ byte-identical default sync.
-	telemetryProvider, err := buildTargetTelemetry(kongContext(), s)
+	telemetryProvider, err := buildTargetTelemetry(kongContext(), s, prettyPanel)
 	if err != nil {
 		return err
 	}
@@ -1854,7 +1872,7 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 	// structured slog stream (a multi-namespace fan-out has no single stream to
 	// render). `sync health` / `sync status` never get a panel (out of scope).
 	runCtx := kongContext()
-	if !wantPrettyProgress(g, env.jsonMode, s.DryRun, s.multiNamespaceFanout(allNS)) {
+	if !prettyPanel { // computed above (pre-telemetry), same gate
 		return crashWrap(streamer.Run(runCtx))
 	}
 	return runSyncStartLivePanel(runCtx, s, source, target, streamer, crashWrap)

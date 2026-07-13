@@ -4,14 +4,63 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
+	"strings"
 	"testing"
 )
+
+// TestBuildTargetTelemetry_QuietSuppressesEnableLog pins the ADR-0156 panel-leak
+// fix: the "telemetry enabled" INFO line prints on the default (quiet=false)
+// path but is SUPPRESSED when quiet=true (the live-panel commands set it so the
+// line does not leak above the panel, which installs its slog gate afterward).
+// The provider itself is constructed either way — quiet gates only the log line.
+func TestBuildTargetTelemetry_QuietSuppressesEnableLog(t *testing.T) {
+	base := telemetryParams{
+		org:       "o",
+		tokenID:   "i",
+		token:     "s",
+		metricsDB: "explicit-db",
+		engine:    "planetscale",
+	}
+	for _, tc := range []struct {
+		name      string
+		quiet     bool
+		wantEmbed bool
+	}{
+		{"loud emits enable INFO", false, true},
+		{"quiet suppresses enable INFO", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+			defer slog.SetDefault(prev)
+
+			p := base
+			p.quiet = tc.quiet
+			provider, err := buildTargetTelemetryProvider(context.Background(), p)
+			if err != nil {
+				t.Fatalf("complete opt-in should construct regardless of quiet: %v", err)
+			}
+			if provider == nil {
+				t.Fatal("complete opt-in should yield a provider regardless of quiet")
+			}
+			defer func() { _ = provider.Close() }()
+
+			got := strings.Contains(buf.String(), "target-health telemetry enabled")
+			if got != tc.wantEmbed {
+				t.Errorf("enable-INFO present=%v, want %v (quiet=%v); log=%q", got, tc.wantEmbed, tc.quiet, buf.String())
+			}
+		})
+	}
+}
 
 // TestBuildTargetTelemetry_OffWhenNoOrg pins the default-off contract: no
 // --planetscale-org ⇒ (nil, nil), the byte-identical pre-ADR-0107 path.
 func TestBuildTargetTelemetry_OffWhenNoOrg(t *testing.T) {
-	p, err := buildTargetTelemetry(context.Background(), &SyncStartCmd{})
+	p, err := buildTargetTelemetry(context.Background(), &SyncStartCmd{}, false)
 	if err != nil {
 		t.Fatalf("no-org should be a no-op, got err: %v", err)
 	}
@@ -38,7 +87,7 @@ func TestBuildTargetTelemetry_RefusesIncompleteCreds(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			p, err := buildTargetTelemetry(context.Background(), &tc.cmd)
+			p, err := buildTargetTelemetry(context.Background(), &tc.cmd, false)
 			if err == nil {
 				t.Error("incomplete token should refuse loudly; got nil error")
 			}
@@ -60,7 +109,7 @@ func TestBuildTargetTelemetry_RefusesUndeterminableDB(t *testing.T) {
 		PlanetScaleMetricsToken:   "s",
 		Target:                    "postgres://host", // no path segment
 	}
-	p, err := buildTargetTelemetry(context.Background(), cmd)
+	p, err := buildTargetTelemetry(context.Background(), cmd, false)
 	if err == nil {
 		t.Error("undeterminable database should refuse loudly; got nil error")
 	}
@@ -82,7 +131,7 @@ func TestBuildTargetTelemetry_ConstructsWithCompleteOptIn(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	p, err := buildTargetTelemetry(ctx, cmd)
+	p, err := buildTargetTelemetry(ctx, cmd, false)
 	if err != nil {
 		t.Fatalf("complete opt-in should construct: %v", err)
 	}

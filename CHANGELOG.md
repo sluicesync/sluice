@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.240] - 2026-07-13
+
+### Fixed
+
+- **`sync start` and `metrics-watch` no longer leak a "PlanetScale target-health telemetry enabled" INFO line above the live panel at a TTY (ADR-0156 polish).** When target-health telemetry is opted in (`--planetscale-org`, ADR-0107), the shared telemetry-provider constructor logged a one-line "telemetry enabled" INFO on success — and for the two panel commands that build the provider before rendering their panel, that line fired *before* the panel's TTY slog gate installed, so on the pretty path it printed above the panel (visible for `metrics-watch`, which always builds the provider). The panel gate is now computed up front and passed to the constructor, which suppresses that INFO on the panel path; the panel's own header carries the same org/database context. This is the ADR-0156 counterpart to v0.99.238's `backup` fix. Non-panel callers (fleet `sync run`, `restore`, `diagnose`) and every non-TTY / `--log-format=json` / `--no-progress` invocation are unchanged — the INFO still emits exactly as before.
+
 ## [0.99.239] - 2026-07-13
 
 ### Added
