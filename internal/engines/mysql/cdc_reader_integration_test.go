@@ -14,6 +14,7 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -192,6 +193,116 @@ func TestCDCReader_BasicChangeStream(t *testing.T) {
 		if _, ok, err := decodeBinlogPos(c.Pos()); !ok || err != nil {
 			t.Errorf("change[%d].Pos failed to decode: ok=%v err=%v", i, ok, err)
 		}
+	}
+}
+
+// TestCDCReader_ColumnReorderMidStream pins the one schema-evolution shape the
+// mid-stream suite otherwise skips: a pure column REORDER. MySQL binlog row
+// events carry their values POSITIONALLY, so after `ALTER TABLE ... MODIFY
+// COLUMN ... AFTER ...` the wire order changes under the reader's feet. The
+// reader must re-align its position→name decode — it clear()s the schema cache
+// on the DDL QueryEvent and lazily re-reads information_schema in the new order
+// (cdc_reader.go). If that re-alignment ever regressed, a post-reorder row would
+// silently map each value to the WRONG column name with no error (same column
+// count ⇒ no length guard fires) — the exact silent-corruption class this test
+// guards, and the safety the docs' "Column REORDER = no-op" rests on.
+//
+// The table mixes a string column (color) and an int column (qty) and the
+// reorder swaps their positions, so a stale-cache mis-map is DETECTABLE: color
+// would carry the int 99 and qty the string "blue".
+func TestCDCReader_ColumnReorderMidStream(t *testing.T) {
+	dsn, cleanup := startMySQLForCDC(t)
+	defer cleanup()
+
+	// Initial physical order: id, name, color, qty.
+	const seedDDL = `
+		CREATE TABLE widgets (
+			id    BIGINT      NOT NULL AUTO_INCREMENT,
+			name  VARCHAR(64) NOT NULL,
+			color VARCHAR(32) NOT NULL,
+			qty   INT         NOT NULL,
+			PRIMARY KEY (id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+	`
+	applyMySQL(t, dsn, seedDDL)
+
+	eng := Engine{Flavor: FlavorVanilla}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	rdr, err := eng.OpenCDCReader(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenCDCReader: %v", err)
+	}
+	defer func() {
+		if c, ok := rdr.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+
+	changes, err := rdr.StreamChanges(ctx, ir.Position{})
+	if err != nil {
+		t.Fatalf("StreamChanges: %v", err)
+	}
+	// Let the syncer catch up to "now" before generating events (see
+	// TestCDCReader_BasicChangeStream).
+	time.Sleep(200 * time.Millisecond)
+
+	// Row 1, pre-reorder (wire order id, name, color, qty).
+	applyMySQL(t, dsn, `INSERT INTO widgets (name, color, qty) VALUES ('pre', 'red', 7);`)
+
+	// Reorder mid-stream: move qty ahead of color. New wire order becomes
+	// id, name, qty, color — a DDL QueryEvent that MUST invalidate the reader's
+	// schema cache. Then row 2, post-reorder, with values chosen so a mis-map
+	// is unmistakable.
+	applyMySQL(t, dsn, `ALTER TABLE widgets MODIFY COLUMN qty INT NOT NULL AFTER name;`)
+	applyMySQL(t, dsn, `INSERT INTO widgets (name, color, qty) VALUES ('post', 'blue', 99);`)
+
+	// drainChanges skips the ALTER's SchemaSnapshot + tx boundaries, so the two
+	// row changes are the pre- and post-reorder INSERTs.
+	got := drainChanges(t, ctx, changes, 2, 30*time.Second)
+	if len(got) != 2 {
+		if cdcRdr, ok := rdr.(*CDCReader); ok {
+			if streamErr := cdcRdr.Err(); streamErr != nil {
+				t.Fatalf("got %d changes; want 2 (stream error: %v)", len(got), streamErr)
+			}
+		}
+		t.Fatalf("got %d changes; want 2 (pre + post reorder INSERT)", len(got))
+	}
+
+	// Baseline: the pre-reorder row decodes correctly.
+	pre, ok := got[0].(ir.Insert)
+	if !ok {
+		t.Fatalf("change[0] = %T; want ir.Insert", got[0])
+	}
+	if name, _ := pre.Row["name"].(string); name != "pre" {
+		t.Errorf("pre.Row[name] = %#v; want \"pre\"", pre.Row["name"])
+	}
+	if color, _ := pre.Row["color"].(string); color != "red" {
+		t.Errorf("pre.Row[color] = %#v; want \"red\"", pre.Row["color"])
+	}
+	if qty := fmt.Sprint(pre.Row["qty"]); qty != "7" {
+		t.Errorf("pre.Row[qty] = %#v; want 7", pre.Row["qty"])
+	}
+
+	// THE assertion: after the reorder, each value must still map to the
+	// correct NAME despite its changed wire position. A stale-cache positional
+	// decode would swap color<->qty.
+	post, ok := got[1].(ir.Insert)
+	if !ok {
+		t.Fatalf("change[1] = %T; want ir.Insert (post-reorder)", got[1])
+	}
+	if name, _ := post.Row["name"].(string); name != "post" {
+		t.Errorf("post.Row[name] = %#v; want \"post\"", post.Row["name"])
+	}
+	if color, _ := post.Row["color"].(string); color != "blue" {
+		t.Errorf("post-reorder MISALIGNMENT: Row[color] = %#v; want \"blue\" "+
+			"(schema cache did not re-align to the new column order after the reorder ALTER)", post.Row["color"])
+	}
+	if qty := fmt.Sprint(post.Row["qty"]); qty != "99" {
+		t.Errorf("post-reorder MISALIGNMENT: Row[qty] = %#v; want 99 "+
+			"(schema cache did not re-align to the new column order after the reorder ALTER)", post.Row["qty"])
 	}
 }
 
