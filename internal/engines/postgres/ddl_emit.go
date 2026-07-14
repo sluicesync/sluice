@@ -885,7 +885,7 @@ func warnDroppedForeignCollation(table *ir.Table, colName string, t ir.Type) {
 		return
 	}
 	slog.Warn(
-		"postgres: dropping cross-engine column collation (no PG equivalent; the target column uses the database default collation, which may change sort/comparison semantics)",
+		"postgres: column data is preserved; the source collation has no Postgres equivalent, so the target column uses the database default collation (text sort/comparison order may differ)",
 		slog.String("table", tableNameForLog(table)),
 		slog.String("column", colName),
 		slog.String("collation", collation),
@@ -1274,7 +1274,7 @@ func emitTableDef(schema string, table *ir.Table, opts emitOpts) (string, error)
 	// drop visible instead of silent.
 	if dropped := translate.DroppedCollationColumns(table, "postgres"); len(dropped) > 0 {
 		slog.Warn(
-			"postgres: dropping cross-engine column collations (no PG equivalent; the target columns use the database default collation, which may change sort/comparison semantics)",
+			"postgres: column data is preserved; some source collations have no Postgres equivalent, so those target columns use the database default collation (text sort/comparison order may differ)",
 			slog.String("table", table.Name),
 			slog.String("columns", strings.Join(dropped, ", ")),
 		)

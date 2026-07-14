@@ -228,9 +228,9 @@ func TestActiveTableClampsPercentOver100(t *testing.T) {
 // the terminal width (with an ASCII "..." marker) so it never overflows the
 // summary box's right edge.
 func TestSummaryWarningTruncatedToWidth(t *testing.T) {
-	long := "postgres: dropping cross-engine column collations (no PG equivalent; " +
-		"the target columns use the database default collation, which may change " +
-		"sort/comparison semantics) table=customers"
+	long := "postgres: column data is preserved; some source collations have no " +
+		"Postgres equivalent, so those target columns use the database default " +
+		"collation (text sort/comparison order may differ) table=customers"
 	m := apply(
 		fixedModel(time.Second),
 		tea.WindowSizeMsg{Width: 70},

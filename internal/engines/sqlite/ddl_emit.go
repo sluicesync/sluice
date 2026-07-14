@@ -380,7 +380,7 @@ func emitTableDef(table *ir.Table) (string, error) {
 	// carries) classifies all of them as dropped.
 	if dropped := translate.DroppedCollationColumns(table, "sqlite"); len(dropped) > 0 {
 		slog.Warn(
-			"sqlite: dropping cross-engine column collations (no SQLite equivalent; the target columns use SQLite's default BINARY collation, which may change sort/comparison semantics)",
+			"sqlite: column data is preserved; some source collations have no SQLite equivalent, so those target columns use SQLite's default BINARY collation (text sort/comparison order may differ)",
 			slog.String("table", table.Name),
 			slog.String("columns", strings.Join(dropped, ", ")),
 		)

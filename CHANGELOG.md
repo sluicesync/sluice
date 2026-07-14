@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.242] - 2026-07-14
+
+### Changed
+
+- **The cross-engine collation WARN now leads with "column data is preserved" so it can't be misread as data loss.** On a cross-engine migrate (e.g. MySQL→Postgres), a source column's collation often has no equivalent on the target, so sluice drops the collation attribute and the target column uses its database/table default — the column *values* are untouched, only text sort/comparison order can differ. Because MySQL tags nearly every string column with a collation, this WARN fires on almost every cross-engine migrate, and the old wording ("dropping cross-engine column collations…") read as if data were being discarded. The message (all engines, both the per-column ALTER path and the per-table CREATE path) now opens with "column data is preserved" and states the real effect precisely — "text sort/comparison order may differ." Behavior is unchanged; this is wording only.
+
 ## [0.99.241] - 2026-07-13
 
 ### Fixed

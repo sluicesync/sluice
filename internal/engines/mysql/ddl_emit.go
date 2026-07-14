@@ -440,7 +440,7 @@ func warnDroppedForeignCollation(table *ir.Table, colName string, t ir.Type) {
 		return
 	}
 	slog.Warn(
-		"mysql: dropping cross-engine column collation (no MySQL equivalent; the target column uses the table/database default collation, which may change sort/comparison semantics)",
+		"mysql: column data is preserved; the source collation has no MySQL equivalent, so the target column uses the table/database default collation (text sort/comparison order may differ)",
 		slog.String("table", mysqlTableNameForLog(table)),
 		slog.String("column", colName),
 		slog.String("collation", collation),
@@ -1193,7 +1193,7 @@ func (m mysqlEmitter) emitTableDefWithDomainChecks(table *ir.Table, inlineCheckS
 	// table — makes the drop visible instead of silent.
 	if dropped := translate.DroppedCollationColumns(table, "mysql"); len(dropped) > 0 {
 		slog.Warn(
-			"mysql: dropping cross-engine column collations (no MySQL equivalent; the target columns use the table/database default collation, which may change sort/comparison semantics)",
+			"mysql: column data is preserved; some source collations have no MySQL equivalent, so those target columns use the table/database default collation (text sort/comparison order may differ)",
 			slog.String("table", table.Name),
 			slog.String("columns", strings.Join(dropped, ", ")),
 		)

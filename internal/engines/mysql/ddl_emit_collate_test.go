@@ -96,7 +96,7 @@ func TestEmitTableDef_CrossEngineCollationWarn_MySQL(t *testing.T) {
 		t.Errorf("table def = %q; PG-dialect collation must not reach MySQL DDL", def)
 	}
 	out := buf.String()
-	if got := strings.Count(out, "dropping cross-engine column collations"); got != 1 {
+	if got := strings.Count(out, "source collations have no"); got != 1 {
 		t.Fatalf("want exactly 1 per-table WARN; got %d:\n%s", got, out)
 	}
 	for _, want := range []string{"customers", "region_code (C)"} {

@@ -40,7 +40,7 @@ func TestEmitTableDef_CrossEngineCollationWarn_SQLite(t *testing.T) {
 		t.Errorf("table def = %q; no source collation may reach SQLite DDL", def)
 	}
 	out := buf.String()
-	if got := strings.Count(out, "dropping cross-engine column collations"); got != 1 {
+	if got := strings.Count(out, "source collations have no"); got != 1 {
 		t.Fatalf("want exactly 1 per-table WARN; got %d:\n%s", got, out)
 	}
 	for _, want := range []string{"customers", "region_code (C)", "title (utf8mb4_0900_ai_ci)"} {
