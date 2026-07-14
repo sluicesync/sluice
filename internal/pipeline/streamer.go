@@ -498,6 +498,38 @@ type Streamer struct {
 	// line). Advisory + failure-isolated, never on the value path.
 	NotifySMTP notify.SMTPConfig
 
+	// SuppressSchemaDriftNotify opts OUT of the ADR-0157 schema-drift alert:
+	// a critical notification fired to the SAME sinks as the metrics alerter
+	// (webhook/Slack/SMTP) the moment a source DDL stalls the sync, carrying
+	// the drift detail + the recovery steps so an unattended operator is
+	// paged instead of discovering the stall in the logs. The desired
+	// default is ON, so the field is named for the OPT-OUT it isn't: the
+	// zero value (false) leaves the alert ENABLED for every construction
+	// (the v0.99.51 zero-value-safe posture). The CLI sets it from
+	// `!--notify-schema-drift`. Inert unless a sink is configured; advisory +
+	// failure-isolated + telemetry-independent — it never affects the
+	// (already stalled) sync, and it needs no telemetry provider.
+	SuppressSchemaDriftNotify bool
+
+	// lastSchemaDriftNotified is the ADR-0157 edge-once latch: the message
+	// identity of the last schema-drift refusal we fired an alert on. The
+	// streamer surfaces the SAME pending intercept error while stalled and a
+	// retry loop re-observes it, so this holds the notification to ONCE per
+	// distinct refusal; it re-arms (clears) when no refusal is pending (the
+	// stall cleared). Owned by the settle path
+	// ([Streamer.observeSchemaDriftForNotify], called from
+	// [phaseSettleDispatch]), which runs single-goroutine per attempt with
+	// sequential retries — so a plain field, not an atomic, is sufficient.
+	lastSchemaDriftNotified string
+
+	// schemaDriftNotifierForTest is a TEST-ONLY seam: when non-nil,
+	// [Streamer.observeSchemaDriftForNotify] delivers to it instead of the
+	// sink set assembled from the notify URLs, so a unit/integration test can
+	// capture the fired schema-drift notification without standing up a real
+	// webhook/Slack/SMTP endpoint. nil in production (the cost is one nil
+	// check on the stall path).
+	schemaDriftNotifierForTest notify.Notifier
+
 	// MaxBufferBytes is the soft upper bound on per-batch buffered
 	// memory in the CDC applier (and, on the cold-start branch, the
 	// bulk-copy writer). Each in-flight target transaction tracks

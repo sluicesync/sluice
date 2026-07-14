@@ -940,6 +940,13 @@ func (s *Streamer) phaseSettleDispatch(ctx context.Context, applier ir.ChangeApp
 			dispatchErr = *snapErrPtr
 		}
 	}
+	// ADR-0157: the streamer surfaces a schema-forward refusal here (the
+	// stall point). Fire the advisory schema-drift alert edge-once — a retry
+	// re-observing the same pending refusal does not re-fire; re-arms when no
+	// refusal is pending. Failure-isolated: it never affects the (already
+	// stalled) sync. Reads schemaSnapshotErr itself, so it fires only for a
+	// genuine schema refusal, never a generic apply error.
+	s.observeSchemaDriftForNotify(ctx, streamID)
 	if dispatchErr != nil {
 		// Bug 57 fix (v0.52.2): a wrapped [ir.RetriableError] containing
 		// context.DeadlineExceeded (from --apply-exec-timeout) MUST

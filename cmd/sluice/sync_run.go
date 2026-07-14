@@ -160,6 +160,13 @@ type SyncSpec struct {
 	NotifySyncLagSeconds float64       `koanf:"notify-sync-lag-seconds"`
 	NotifyCooldown       time.Duration `koanf:"notify-cooldown"`
 
+	// NotifySchemaDrift toggles the ADR-0157 schema-drift alert per sync.
+	// Default ON, but a plain bool in a YAML spec gets the Go zero value
+	// (false) when omitted — the v0.99.51 trap — so it is a *bool: nil
+	// (omitted) ⇒ enabled, an explicit `false` ⇒ disabled. See
+	// [schemaDriftSuppressFromSpec].
+	NotifySchemaDrift *bool `koanf:"notify-schema-drift"`
+
 	NotifySMTPHost     string   `koanf:"notify-smtp-host"`
 	NotifySMTPPort     int      `koanf:"notify-smtp-port"`
 	NotifySMTPFrom     string   `koanf:"notify-smtp-from"`
@@ -858,6 +865,8 @@ func buildStreamerFromSpec(ctx context.Context, spec *SyncSpec, g *Globals) (*pi
 		NotifySyncLagSeconds:  spec.NotifySyncLagSeconds,
 		NotifyCooldown:        spec.NotifyCooldown,
 		NotifySMTP:            smtp,
+		// ADR-0157: default-ON schema-drift alert; nil (omitted) ⇒ enabled.
+		SuppressSchemaDriftNotify: schemaDriftSuppressFromSpec(spec.NotifySchemaDrift),
 
 		// ADR-0126: per-sync PlanetScale telemetry config. The provider itself
 		// is built + attached in buildSupervisedFleet (it needs ctx + a poll
@@ -874,6 +883,16 @@ func buildStreamerFromSpec(ctx context.Context, spec *SyncSpec, g *Globals) (*pi
 		BuildVersion: version,
 		BuildCommit:  commit,
 	}, nil
+}
+
+// schemaDriftSuppressFromSpec maps the fleet spec's default-ON
+// *bool NotifySchemaDrift to the streamer's opt-OUT
+// SuppressSchemaDriftNotify (ADR-0157). A YAML spec that omits the key
+// yields nil ⇒ the alert stays ENABLED (the zero-value-safe default holds
+// for the fleet path, not just `sync start`); an explicit `false` disables
+// it. Mirrors [SyncStartCmd.suppressSchemaDriftNotify] for the CLI path.
+func schemaDriftSuppressFromSpec(notifySchemaDrift *bool) bool {
+	return notifySchemaDrift != nil && !*notifySchemaDrift
 }
 
 // smtpConfig assembles the [notify.SMTPConfig] from the spec's

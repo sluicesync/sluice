@@ -1126,6 +1126,7 @@ type SyncStartCmd struct {
 	NotifyStorageGrowthPerMin float64       `help:"Alert when the target's storage utilisation is CLIMBING at or above this fraction-of-capacity per minute (ADR-0107 item 36) — a pre-grow early warning. e.g. 0.02 = +2%/min. 0 disables. Same gating as --notify-storage-util." placeholder:"FRAC_PER_MIN"`
 	NotifyCooldown            time.Duration `help:"Minimum interval between re-fires of a STILL-breached target-metrics alert (ADR-0107 item 36). A sustained breach reminds at most once per this interval rather than every poll. Default 15m." default:"15m" placeholder:"DUR"`
 	NotifySyncLagSeconds      float64       `help:"Alert when sluice's OWN sync lag — seconds the target trails the source's latest applied commit (sluice_sync_lag_seconds, roadmap item 45) — is at or above this value. 0 (default) disables. UNGATED from PlanetScale telemetry: works on MySQL and Postgres alike, needing only a --notify-webhook/--notify-slack sink (NOT --planetscale-org). Distinct from --notify-lag-seconds, which is the PlanetScale control-plane TARGET-INTERNAL replica lag. Edge-triggered + cooldown'd; advisory + failure-isolated." placeholder:"SECONDS"`
+	NotifySchemaDrift         bool          `help:"Fire a critical notification (ADR-0157) to the configured --notify-* sink(s) when a source schema change stalls the sync — a DDL sluice cannot auto-forward (e.g. RENAME COLUMN on MySQL). The alert carries the drift detail + recovery steps. On by default (inert unless a sink is configured); UNGATED from PlanetScale telemetry — works on every engine pair. Pass --notify-schema-drift=false to disable while keeping metrics alerts. Advisory + failure-isolated: a delivery problem never affects the (already stalled) sync." default:"true"`
 
 	// Email / SMTP notification sink (roadmap item 48 — ADR-0107 amendment).
 	// Opt-in (inert unless --notify-smtp-host is set); the password is supplied
@@ -1532,6 +1533,16 @@ func (s *SyncStartCmd) smtpConfig() notify.SMTPConfig {
 	}
 }
 
+// suppressSchemaDriftNotify maps the CLI's default-ON --notify-schema-drift
+// flag to the streamer's opt-OUT SuppressSchemaDriftNotify field (ADR-0157).
+// Kept as a named helper so the CLI-layer pin (Bug 180 lesson: verify the
+// on-by-default holds THROUGH the real kong parser, not a direct field set)
+// can assert the whole chain: kong default `true` → NotifySchemaDrift →
+// suppress=false (enabled). --notify-schema-drift=false → suppress=true.
+func (s *SyncStartCmd) suppressSchemaDriftNotify() bool {
+	return !s.NotifySchemaDrift
+}
+
 // Run implements `sluice sync start`: it wraps the body in the
 // `--format json` result-envelope lifecycle (a pass-through in text
 // mode) so exactly one JSON object reaches stdout on every exit path.
@@ -1790,6 +1801,10 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 		NotifyStorageGrowthPerMin: s.NotifyStorageGrowthPerMin,
 		NotifyCooldown:            s.NotifyCooldown,
 		NotifySyncLagSeconds:      s.NotifySyncLagSeconds,
+		// ADR-0157: schema-drift alert. Default ON; the streamer field is the
+		// opt-OUT, so it stays enabled for every non-CLI construction (the
+		// v0.99.51 zero-value-safe posture). Inert unless a sink is configured.
+		SuppressSchemaDriftNotify: s.suppressSchemaDriftNotify(),
 		// roadmap item 48: email/SMTP sink (inert unless --notify-smtp-host).
 		NotifySMTP:        s.smtpConfig(),
 		HeartbeatInterval: s.HeartbeatInterval,

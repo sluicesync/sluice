@@ -36,8 +36,16 @@ type WebhookNotifier struct {
 
 // webhookPayload is the documented JSON body of a generic-webhook POST. The
 // field names are snake_case + stable so downstream consumers can parse it.
+//
+// Category is the one addition for ADR-0157: it is `omitempty`, so a
+// threshold notification (which leaves Category empty) serializes to the
+// exact byte-identical body it always has, while a schema-drift
+// notification carries `"category":"schema-drift"` so a consumer keys off
+// it (and off title/body) rather than the value/threshold fields — which,
+// having no numeric reading, are the zero 0 for a schema-drift event.
 type webhookPayload struct {
 	Level     string    `json:"level"`
+	Category  string    `json:"category,omitempty"`
 	StreamID  string    `json:"stream_id"`
 	Metric    string    `json:"metric"`
 	Title     string    `json:"title"`
@@ -48,10 +56,13 @@ type webhookPayload struct {
 }
 
 // Notify POSTs n as JSON. A non-2xx response is an error. ctx bounds the
-// request (in addition to the client timeout).
+// request (in addition to the client timeout). For a schema-drift
+// notification the value/threshold fields are 0 (no numeric reading); the
+// operator-facing detail is in title/body and the category discriminator.
 func (w *WebhookNotifier) Notify(ctx context.Context, n Notification) error {
 	body := webhookPayload{
 		Level:     string(n.Level),
+		Category:  string(n.Category),
 		StreamID:  n.StreamID,
 		Metric:    n.Metric,
 		Title:     n.Title,

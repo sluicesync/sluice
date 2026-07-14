@@ -40,13 +40,44 @@ const (
 	LevelCritical Level = "critical"
 )
 
+// Category classifies what KIND of event a notification carries, so the
+// sinks can render the right shape. A threshold alert has a numeric
+// "V ≥ T" reading; a schema-drift alert (ADR-0157) is a discrete stall
+// event with no numeric threshold — just a title + body. The zero value
+// ("") is treated as [CategoryThreshold] everywhere, so every existing
+// metrics notification (which does not set the field) renders byte-for-byte
+// as before.
+type Category string
+
+const (
+	// CategoryThreshold is the metrics-alerter class: a metric reading
+	// breached its configured limit. The default/zero-equivalent — an empty
+	// Category is treated as threshold by every sink.
+	CategoryThreshold Category = "threshold"
+
+	// CategorySchemaDrift is the ADR-0157 class: a source DDL stalled the
+	// sync. No numeric reading; the sinks render Title + Body (the drift
+	// detail + recovery steps) without the "V ≥ T" line.
+	CategorySchemaDrift Category = "schema-drift"
+)
+
+// IsSchemaDrift reports whether c is the schema-drift category. Kept as a
+// helper (rather than an == comparison at each sink) so the "empty ⇒
+// threshold" contract lives in one place: only an explicit
+// [CategorySchemaDrift] takes the event-shaped rendering, and every other
+// value (including the zero value) renders as a threshold alert.
+func (c Category) IsSchemaDrift() bool { return c == CategorySchemaDrift }
+
 // Notification is one operator-facing alert. It is a plain, engine-neutral
 // value: the pipeline alerter fills it from a telemetry snapshot, the
-// sinks render it to their wire shape. Value/Threshold carry the breached
-// metric reading + the configured limit so a sink can compose a readable
-// "0.91 ≥ 0.90" line.
+// sinks render it to their wire shape. For [CategoryThreshold] (the
+// default) Value/Threshold carry the breached metric reading + the
+// configured limit so a sink can compose a readable "0.91 ≥ 0.90" line;
+// for [CategorySchemaDrift] there is no numeric reading and the sinks
+// render Title + Body only.
 type Notification struct {
 	Level     Level
+	Category  Category
 	StreamID  string
 	Metric    string
 	Title     string
