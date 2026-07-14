@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"log/slog"
 	"strings"
 	"testing"
@@ -158,6 +159,14 @@ func TestBinlogTLSFromDSN_RegisteredCustomName(t *testing.T) {
 func TestWarnBinlogTransport(t *testing.T) {
 	insecure := &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}
 	verifying := &tls.Config{ServerName: "db.example.com", MinVersion: tls.VersionTLS12}
+	// verify-ca shape: InsecureSkipVerify AND a VerifyPeerCertificate callback
+	// (the authenticated-chain check). The callback body is irrelevant here —
+	// warnBinlogTransport keys off the "verify-ca" mode label, not the config.
+	verifyCA := &tls.Config{
+		InsecureSkipVerify:    true, //nolint:gosec // test fixture: the verify-ca shape, not a real dial
+		MinVersion:            tls.VersionTLS12,
+		VerifyPeerCertificate: func([][]byte, [][]*x509.Certificate) error { return nil },
+	}
 
 	cases := []struct {
 		name   string
@@ -198,6 +207,14 @@ func TestWarnBinlogTransport(t *testing.T) {
 			name:   "custom verifying config is silent",
 			reader: &CDCReader{binlogTLS: verifying, binlogTLSMode: "sluice-custom"},
 		},
+		{
+			// verify-ca (ADR-0158) sets InsecureSkipVerify (to skip the
+			// hostname) but IS authenticated via VerifyPeerCertificate, so it
+			// must NOT emit the "verification DISABLED" WARN — only the mild
+			// INFO (below the WARN capture level here, so no output).
+			name:   "verify-ca emits no WARN",
+			reader: &CDCReader{binlogTLS: verifyCA, binlogTLSMode: "verify-ca"},
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -219,5 +236,33 @@ func TestWarnBinlogTransport(t *testing.T) {
 				t.Errorf("WARN output %q does not contain %q", out, c.wantContains)
 			}
 		})
+	}
+}
+
+// TestWarnBinlogTransport_VerifyCAInfo pins the verify-ca (ADR-0158) transport
+// message at INFO level: it announces CA-chain verification with the hostname
+// check skipped, and — the security-relevant assertion — never says
+// "DISABLED" (that WARN is reserved for the unauthenticated skip-verify case).
+func TestWarnBinlogTransport_VerifyCAInfo(t *testing.T) {
+	verifyCA := &tls.Config{
+		InsecureSkipVerify:    true, //nolint:gosec // test fixture: the verify-ca shape
+		MinVersion:            tls.VersionTLS12,
+		VerifyPeerCertificate: func([][]byte, [][]*x509.Certificate) error { return nil },
+	}
+	r := &CDCReader{binlogTLS: verifyCA, binlogTLSMode: "verify-ca"}
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	r.warnBinlogTransport(context.Background())
+
+	out := buf.String()
+	if !strings.Contains(out, "verify-ca") {
+		t.Errorf("verify-ca INFO %q does not mention verify-ca", out)
+	}
+	if strings.Contains(out, "DISABLED") {
+		t.Errorf("verify-ca must not emit the \"verification DISABLED\" message; got %q", out)
 	}
 }

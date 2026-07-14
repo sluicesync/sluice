@@ -43,6 +43,9 @@ type VerifyCmd struct {
 
 	Format string `help:"Output format: 'text' (default) or 'json' (machine-readable for CI gates / alertmanager pipes)." default:"text" enum:"text,json" placeholder:"FORMAT"`
 	Output string `help:"Write to FILE instead of stdout. Atomic." short:"o" placeholder:"FILE"`
+
+	sourceTLSCAFlag
+	targetTLSCAFlag
 }
 
 // Run implements `sluice verify`.
@@ -66,6 +69,14 @@ func (v *VerifyCmd) Run(g *Globals) error {
 		return operationalError{err: err}
 	}
 	if target, err = applyEngineOptions(target, g); err != nil {
+		return operationalError{err: err}
+	}
+	// CA-pinned verify-ca TLS (ADR-0158): rewrite the endpoint DSNs so a MySQL
+	// source/target dials verify-ca. Per-endpoint, so applied here.
+	if v.Source, err = applyEndpointTLSCA(source, v.Source, v.SourceTLSCA, "source"); err != nil {
+		return operationalError{err: err}
+	}
+	if v.Target, err = applyEndpointTLSCA(target, v.Target, v.TargetTLSCA, "target"); err != nil {
 		return operationalError{err: err}
 	}
 

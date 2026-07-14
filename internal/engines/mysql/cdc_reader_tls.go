@@ -88,6 +88,15 @@ func (r *CDCReader) warnBinlogTransport(ctx context.Context) {
 				"(source DSN has no tls parameter, or tls=false); add tls=true to the source DSN to encrypt "+
 				"(or tls=skip-verify for a server with a self-signed certificate)",
 		)
+	case r.binlogTLSMode == "verify-ca":
+		// CA-pinned verify-ca (ADR-0158, --source-tls-ca): the server cert is
+		// authenticated against the operator's CA in VerifyPeerCertificate;
+		// only the hostname check is skipped (MySQL certs carry no SAN). This
+		// is NOT the unauthenticated skip-verify case below — say so at INFO,
+		// and never emit the "verification DISABLED" WARN.
+		slog.InfoContext(
+			ctx, "mysql: cdc: binlog TLS: CA-chain verified, hostname check skipped (verify-ca)",
+		)
 	case r.binlogTLSMode == "preferred":
 		slog.WarnContext(
 			ctx, "mysql: cdc: tls=preferred — the binlog replication stream uses TLS WITHOUT certificate "+
