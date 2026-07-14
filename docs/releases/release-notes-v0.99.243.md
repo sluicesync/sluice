@@ -1,0 +1,21 @@
+# sluice v0.99.243
+
+**Two operability additions: get paged when a schema change stalls a sync, and pin MySQL TLS to your own CA.**
+
+## Added
+
+- **Schema-drift notifications — an actionable alert when a source DDL stalls a sync (ADR-0157).** sluice already alerts on target *resource* stalls (storage / replica-lag thresholds). This closes the other stall class: the source schema. When a source schema change **refuses to auto-forward** — a MySQL `RENAME COLUMN` (unprovable from the replication stream), an `ADD COLUMN` with a volatile `DEFAULT`, a multi-shape combo, or a target apply that fails — the stream stalls at that boundary with no data lost (the loud-failure tenet), but until now that stall was invisible on an unattended sync until someone read the logs. Now a **critical notification** fires to the same sinks the metrics alerter uses — webhook, Slack, or email — and it carries both the drift detail (the offending object) **and** the drained-recovery steps (`sluice sync stop --wait` → schema migrate → `sluice sync start --resume`), so the alert tells you exactly what drifted and how to recover. It's event-driven and **edge-once** (fires at the refusal; a retry re-observing the same stall does not re-fire; it re-arms after a successful resume), **telemetry-independent** (works on every engine pair — no PlanetScale telemetry required, unlike the metrics alerts), and **failure-isolated** (a dead sink is logged and swallowed — the notification can never affect the already-stalled sync). Controlled by `--notify-schema-drift` (default **on**, inert unless a `--notify-*` sink is configured; pass `--notify-schema-drift=false` to disable it while keeping metrics alerts), and settable per-sync in a `sync run` fleet spec.
+
+- **CA-pinned TLS for MySQL: `--source-tls-ca` / `--target-tls-ca` (ADR-0158).** MySQL's auto-generated server certificates carry no SubjectAltName, and Go's TLS stack won't fall back to the CN — so a hostname-verifying `tls=true` can never validate them. These flags implement **verify-ca** — exactly what Postgres calls `sslmode=verify-ca`: trust a CA you supply, verify that the presented server certificate **chains to it**, but skip the hostname check. The peer is genuinely authenticated — a certificate that does not chain to your CA fails the handshake (the load-bearing security invariant, pinned by a two-CA wrong-CA-rejected test) — it's simply not bound to a hostname, which is the practical secure mode for MySQL's SAN-less certs. It applies to a MySQL **source** (both the data-plane connection **and** the binlog replication stream, which inherits the same verified config) and a MySQL **target**'s data-plane connection, and the CDC transport advisory now recognizes verify-ca as authenticated (a quiet INFO rather than the "certificate verification is DISABLED" warning). Under the hood the flag builds a verify-ca `*tls.Config`, registers it with the driver (`mysql.RegisterTLSConfig`), and rewrites the endpoint DSN's `tls=` to reference it. Postgres endpoints continue to use `sslrootcert=/path/ca.pem` in the DSN — passing the flag to a Postgres endpoint is refused loudly with that pointer. A CA flag that conflicts with an explicit DSN `tls=` is also refused loudly: supply exactly one.
+
+## Compatibility
+
+- **Fully additive.** Every existing metrics/threshold notification renders byte-for-byte identically — the new notification `Category` discriminator defaults to the threshold shape, so Slack/webhook/email output for those is unchanged. The existing MySQL binlog-TLS advisories (`UNENCRYPTED`, `tls=skip-verify`, `tls=preferred`) fire exactly as before; only the new verify-ca mode adds a quiet INFO. Schema-drift notifications and the TLS-CA flags are opt-in surfaces layered on existing behavior — a sync with no `--notify-*` sink and no `--*-tls-ca` flag behaves identically to prior releases.
+
+## Who needs this
+
+Anyone running a long-lived, unattended sync who wants to be paged the moment a schema change stalls it (not discover it hours later in the logs), and anyone connecting to a MySQL source or target that presents a private-CA / self-signed certificate who wants authenticated TLS without the hostname-SAN requirement `tls=true` imposes.
+
+---
+
+Install / upgrade: see the [README](https://github.com/sluicesync/sluice#install). Verify downloads against `checksums.txt`.

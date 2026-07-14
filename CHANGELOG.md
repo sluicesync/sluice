@@ -4,6 +4,18 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.243] - 2026-07-14
+
+### Added
+
+- **Schema-drift notifications: get paged when a source DDL stalls a sync (ADR-0157).** sluice already alerts on target *resource* stalls (storage/lag thresholds, ADR-0107 item 36); this closes the other stall class. When a source schema change **refuses to auto-forward** — a MySQL RENAME COLUMN (unprovable), an ADD COLUMN with a volatile DEFAULT, a multi-shape combo, or a failed target apply — the stream stalls at the boundary (no data lost) but was previously invisible until someone read the logs. Now a **critical notification** fires to the same sinks the metrics alerter uses (webhook / Slack / email), carrying the drift detail **and** the drained-recovery steps (`sync stop --wait` → schema migrate → `sync start --resume`), so an unattended long-running sync pages you with an actionable alert. Event-driven (fires at the refusal, edge-once — a retry doesn't re-fire), telemetry-**independent** (works on every engine pair, no PlanetScale telemetry needed), and failure-isolated (a dead sink is logged and swallowed — the alert never affects the already-stalled sync). Controlled by `--notify-schema-drift` (default **on**, inert unless a `--notify-*` sink is configured; `=false` disables it while keeping metrics alerts). Per-sync in a `sync run` fleet spec.
+
+- **CA-pinned TLS for MySQL: `--source-tls-ca` / `--target-tls-ca` (ADR-0158).** MySQL's auto-generated server certs carry no SubjectAltName, so hostname-verifying `tls=true` can never validate them (Go won't fall back to CN). These flags implement **verify-ca** — the mode Postgres calls `sslmode=verify-ca`: trust a specified CA, verify the server certificate **chains to it**, but skip the hostname check. The connection is genuinely authenticated (a cert not signed by the CA fails the handshake — the load-bearing security invariant, pinned by a wrong-CA-rejected test), just not hostname-bound. Applies to the MySQL source (both the data-plane connection **and** the binlog replication stream) and a MySQL target's data-plane connection; the CDC transport warning recognizes verify-ca as authenticated (a quiet INFO, never the "verification DISABLED" WARN). Postgres endpoints keep using `sslrootcert=/path/ca.pem` in the DSN (refused loudly with that pointer if given the flag). A CA flag conflicting with an explicit DSN `tls=` is refused loudly — supply exactly one.
+
+### Changed
+
+- **The cross-engine collation WARN and the binlog-TLS advisory are unchanged in substance** — schema-drift notifications and CA-pinned TLS are additive; every existing metrics alert renders byte-for-byte identically (the new notification `Category` defaults to the threshold shape), and the existing UNENCRYPTED / `tls=skip-verify` / `tls=preferred` binlog warnings fire exactly as before.
+
 ## [0.99.242] - 2026-07-14
 
 ### Changed

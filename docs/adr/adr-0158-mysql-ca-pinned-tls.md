@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (impl in progress). Adds `--source-tls-ca` / `--target-tls-ca` for
+Accepted (implemented; shipping). Adds `--source-tls-ca` / `--target-tls-ca` for
 CA-pinned "verify-ca" TLS to MySQL endpoints. Postgres is out of scope (it
 already takes `sslrootcert=` in the DSN).
 
