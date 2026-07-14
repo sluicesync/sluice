@@ -743,6 +743,8 @@ type BackupFullCmd struct {
 
 	Format string `help:"Output format: 'text' (default) or 'json' (machine-readable: ONE result envelope on stdout at command end — status completed/refused/failed, per-table row counts, next steps; the slog progress stream stays on stderr in both modes)." default:"text" enum:"text,json" placeholder:"FORMAT"`
 
+	sourceTLSCAFlag
+
 	EncryptionFlags
 }
 
@@ -770,6 +772,11 @@ func (b *BackupFullCmd) run(g *Globals, env *envelopeRun) error {
 	// Value-fidelity flags (task 2.5): a backup reads source values, so its reader
 	// honors --zero-date / --sqlite-date-encoding / --mysql-sql-mode.
 	if source, err = applyEngineOptions(source, g); err != nil {
+		return err
+	}
+	// CA-pinned verify-ca TLS (ADR-0158): rewrite the source DSN so a MySQL
+	// source (snapshot + binlog/CDC stream) dials verify-ca.
+	if b.Source, err = applyEndpointTLSCA(source, b.Source, b.SourceTLSCA, "source"); err != nil {
 		return err
 	}
 	env.setEngines(source.Name(), "")
@@ -966,6 +973,8 @@ type BackupIncrementalCmd struct {
 
 	ChunkSize int `help:"Maximum changes per chunk file. Smaller chunks restore faster (per-chunk SHA-256 fail-fast) but inflate the manifest." default:"100000" placeholder:"N"`
 
+	sourceTLSCAFlag
+
 	EncryptionFlags
 }
 
@@ -977,6 +986,11 @@ func (b *BackupIncrementalCmd) Run(g *Globals) error {
 	}
 	// Value-fidelity flags (task 2.5): an incremental backup reads source values.
 	if source, err = applyEngineOptions(source, g); err != nil {
+		return err
+	}
+	// CA-pinned verify-ca TLS (ADR-0158): rewrite the source DSN so a MySQL
+	// source (snapshot + binlog/CDC stream) dials verify-ca.
+	if b.Source, err = applyEndpointTLSCA(source, b.Source, b.SourceTLSCA, "source"); err != nil {
 		return err
 	}
 	if b.OutputDir == "" && b.Target == "" {
@@ -1116,6 +1130,8 @@ type BackupStreamCmd struct {
 	ExitAfterAge         string `name:"exit-after-age" hidden:"" help:"REMOVED in v0.67.0."`
 	ExitAfterChainLength string `name:"exit-after-chain-length" hidden:"" help:"REMOVED in v0.67.0."`
 
+	sourceTLSCAFlag
+
 	EncryptionFlags
 }
 
@@ -1130,6 +1146,11 @@ func (b *BackupStreamCmd) Run(g *Globals) error {
 	}
 	// Value-fidelity flags (task 2.5): a backup stream reads source values.
 	if source, err = applyEngineOptions(source, g); err != nil {
+		return err
+	}
+	// CA-pinned verify-ca TLS (ADR-0158): rewrite the source DSN so a MySQL
+	// source (snapshot + binlog/CDC stream) dials verify-ca.
+	if b.Source, err = applyEndpointTLSCA(source, b.Source, b.SourceTLSCA, "source"); err != nil {
 		return err
 	}
 	codec, err := blobcodec.ParseCompression(b.Compression)
@@ -1729,6 +1750,8 @@ type RestoreCmd struct {
 
 	Format string `help:"Output format: 'text' (default) or 'json' (machine-readable: ONE result envelope on stdout at command end — status completed/refused/failed, per-table row counts; the slog progress stream stays on stderr in both modes)." default:"text" enum:"text,json" placeholder:"FORMAT"`
 
+	targetTLSCAFlag
+
 	EncryptionFlags
 }
 
@@ -1758,6 +1781,11 @@ func (r *RestoreCmd) run(g *Globals, env *envelopeRun) error {
 	// Value-fidelity flags (task 2.5): restore WRITES values into the target, so
 	// the target connection's --mysql-sql-mode and the sql_mode-emit policy apply.
 	if target, err = applyEngineOptions(target, g); err != nil {
+		return err
+	}
+	// CA-pinned verify-ca TLS (ADR-0158): rewrite the target DSN so a MySQL
+	// target dials verify-ca.
+	if r.Target, err = applyEndpointTLSCA(target, r.Target, r.TargetTLSCA, "target"); err != nil {
 		return err
 	}
 	env.setEngines("", target.Name())

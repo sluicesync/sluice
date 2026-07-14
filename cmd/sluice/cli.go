@@ -272,6 +272,9 @@ type MigrateCmd struct {
 	Redact       []string `help:"Redact a PII column (repeatable). Format: '[schema.]table.column=STRATEGY[:options]'. Strategies: null (NULLABLE columns only), static:<value>, hash:sha256, hash:hmac-sha256[:<keyname>] (requires --keyset-source), truncate:<n>, mask:inner:<m1>,<m2>[,<char>], mask:outer:<m1>,<m2>[,<char>], mask:ssn, mask:pan, mask:pan-relaxed, mask:email, mask:ca-sin, mask:uk-nin, mask:iban, mask:uuid (Phase 2.b country/format presets, v0.57.0+), randomize:int:<min>,<max>, randomize:email, randomize:us-phone, randomize:uuid (Phase 2.c first wave, v0.59.0+), randomize:ssn, randomize:pan[:<brand>], randomize:ca-sin, randomize:uk-nin, randomize:iban[:<country-code>] (Phase 2.c second wave, v0.60.0+; brand: visa|mastercard|amex; country: DE|GB|FR; all randomize:* require a PK on the source table), randomize:dict:<name>, tokenize:dict:<name>[:<keyname>] (Phase 3 v0.61.0+, keyset-sourced in Phase 4 v0.62.0+; dictionaries declared in YAML 'dictionaries:' block — CLI form REQUIRES YAML config to declare the dictionary content). Examples: --redact users.email=hash:sha256, --redact users.pan=mask:pan, --redact users.id=mask:uuid, --redact users.age=randomize:int:18,90, --redact users.first_name=tokenize:dict:first_names. Bulk-copy + CDC paths both honour --redact. YAML form available under config 'redactions:' block. See docs/dev/notes/prep-pii-redaction-phase-1.md." placeholder:"RULE" sep:"none"`
 	KeysetSource string   `help:"Operator keyset source for keyset-using redaction strategies (hash:hmac-sha256, tokenize:dict). PII Phase 4 (ADR-0041). Forms: 'file:PATH' (keyset YAML on disk), 'env:VARNAME' (keyset YAML in an env var), 'db:DSN' (sluice_keysets table on the named DSN — shared across streams for cross-stream surrogate stability). Resolved ONCE at startup; rotation takes effect on next process restart only (no hot-reload). Required when any --redact / YAML rule uses hash:hmac-sha256 or tokenize:dict — the Phase 1 --redact-key-source flag and the built-in v0.61.0 tokenize key were removed." placeholder:"SRC"`
 
+	sourceTLSCAFlag
+	targetTLSCAFlag
+
 	CrashHookFlags
 }
 
@@ -590,6 +593,15 @@ func (m *MigrateCmd) resolveEngines(ctx context.Context, g *Globals) (source, ta
 		return nil, nil, cleanup, err
 	}
 	if target, err = applyEngineOptions(target, g); err != nil {
+		return nil, nil, cleanup, err
+	}
+	// CA-pinned verify-ca TLS (ADR-0158): rewrite the endpoint DSNs so a MySQL
+	// source/target dials verify-ca. Per-endpoint (source and target may pin
+	// different CAs), so applied here rather than through applyEngineOptions.
+	if m.Source, err = applyEndpointTLSCA(source, m.Source, m.SourceTLSCA, "source"); err != nil {
+		return nil, nil, cleanup, err
+	}
+	if m.Target, err = applyEndpointTLSCA(target, m.Target, m.TargetTLSCA, "target"); err != nil {
 		return nil, nil, cleanup, err
 	}
 	return source, target, cleanup, nil
@@ -1188,6 +1200,9 @@ type SyncStartCmd struct {
 
 	Redact       []string `help:"Redact a PII column (repeatable). Format: '[schema.]table.column=STRATEGY[:options]'. Strategies: null (NULLABLE columns only), static:<value>, hash:sha256, hash:hmac-sha256[:<keyname>] (requires --keyset-source), truncate:<n>, mask:inner:<m1>,<m2>[,<char>], mask:outer:<m1>,<m2>[,<char>], mask:ssn, mask:pan, mask:pan-relaxed, mask:email, mask:ca-sin, mask:uk-nin, mask:iban, mask:uuid (Phase 2.b country/format presets, v0.57.0+), randomize:int:<min>,<max>, randomize:email, randomize:us-phone, randomize:uuid (Phase 2.c first wave, v0.59.0+), randomize:ssn, randomize:pan[:<brand>], randomize:ca-sin, randomize:uk-nin, randomize:iban[:<country-code>] (Phase 2.c second wave, v0.60.0+; brand: visa|mastercard|amex; country: DE|GB|FR; all randomize:* require a PK on the source table), randomize:dict:<name>, tokenize:dict:<name>[:<keyname>] (Phase 3 v0.61.0+, keyset-sourced in Phase 4 v0.62.0+; dictionaries declared in YAML 'dictionaries:' block — CLI form REQUIRES YAML config to declare the dictionary content). Examples: --redact users.email=hash:sha256, --redact users.pan=mask:pan, --redact users.id=mask:uuid, --redact users.age=randomize:int:18,90, --redact users.first_name=tokenize:dict:first_names. Phase 1.5 (v0.54.0+): redaction covers BOTH cold-start bulk-copy AND mid-stream CDC events. Bare 'users.email' matches any source schema; schema-qualified 'public.users.email' takes precedence when both registered. See docs/dev/notes/prep-pii-redaction-phase-1.md." placeholder:"RULE" sep:"none"`
 	KeysetSource string   `help:"Operator keyset source for keyset-using redaction strategies (hash:hmac-sha256, tokenize:dict). PII Phase 4 (ADR-0041). Forms: 'file:PATH' (keyset YAML on disk), 'env:VARNAME' (keyset YAML in an env var), 'db:DSN' (sluice_keysets table on the named DSN — shared across streams for cross-stream surrogate stability). Resolved ONCE at startup; rotation takes effect on next process restart only (no hot-reload). Required when any --redact / YAML rule uses hash:hmac-sha256 or tokenize:dict — the Phase 1 --redact-key-source flag and the built-in v0.61.0 tokenize key were removed." placeholder:"SRC"`
+
+	sourceTLSCAFlag
+	targetTLSCAFlag
 
 	CrashHookFlags
 }
@@ -1949,6 +1964,14 @@ func (s *SyncStartCmd) resolveEngines(ctx context.Context, g *Globals) (source, 
 	// keyspace so a sharded PlanetScale/Vitess target accepts them. Resolve it
 	// (explicit flag, else auto-detect) and record it on the target engine.
 	if target, err = applyControlKeyspace(ctx, target, s.ControlKeyspace, s.Target); err != nil {
+		return nil, nil, err
+	}
+	// CA-pinned verify-ca TLS (ADR-0158): rewrite the endpoint DSNs so a MySQL
+	// source/target dials verify-ca (data plane + binlog/CDC stream).
+	if s.Source, err = applyEndpointTLSCA(source, s.Source, s.SourceTLSCA, "source"); err != nil {
+		return nil, nil, err
+	}
+	if s.Target, err = applyEndpointTLSCA(target, s.Target, s.TargetTLSCA, "target"); err != nil {
 		return nil, nil, err
 	}
 	return source, target, nil

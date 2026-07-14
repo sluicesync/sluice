@@ -324,19 +324,22 @@ func openBinlogCDCReaderShared(ctx context.Context, dsn string, serverScope bool
 		_ = db.Close()
 		return nil, fmt.Errorf("mysql: parse host/port: %w", err)
 	}
+	// The binlog stream inherits the DSN's tls= transport (audit finding N-3);
+	// an unregistered custom tls config name never reaches here — parseDSN
+	// already refused it loudly. A CA-pinned verify-ca config (ADR-0158) is
+	// relabeled "verify-ca" so warnBinlogTransport treats it as authenticated
+	// rather than a blind skip-verify.
+	binlogTLS := binlogTLSFromConfig(cfg, host)
 	return &CDCReader{
-		db:       db,
-		schema:   cfg.DBName,
-		zeroDate: zeroDate,
-		host:     host,
-		port:     port,
-		user:     cfg.User,
-		password: cfg.Passwd,
-		// The binlog stream inherits the DSN's tls= transport (audit
-		// finding N-3); an unregistered custom tls config name never
-		// reaches here — parseDSN already refused it loudly.
-		binlogTLS:      binlogTLSFromConfig(cfg, host),
-		binlogTLSMode:  cfg.TLSConfig,
+		db:             db,
+		schema:         cfg.DBName,
+		zeroDate:       zeroDate,
+		host:           host,
+		port:           port,
+		user:           cfg.User,
+		password:       cfg.Passwd,
+		binlogTLS:      binlogTLS,
+		binlogTLSMode:  binlogTLSModeLabel(cfg.TLSConfig, binlogTLS),
 		serverID:       generateServerID(),
 		tableMap:       make(map[uint64]string),
 		schemaCache:    make(map[string]*tableSchema),
