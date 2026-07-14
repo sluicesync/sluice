@@ -21,6 +21,18 @@
 # to catch slot-CDC / logical-decoding / catalog drift before a user does.
 # `:latest` is the forward-compat canary (allowed to fail in the matrix) —
 # it turns into the next major's drift signal the day upstream rolls it.
+#
+# Beta / rc tags (e.g. postgres:19beta1) are ALSO canaries — the matrix runs
+# the full engines/postgres suite (incl. the cutover-sequence priming tests)
+# against the pre-release major so drift surfaces before GA, but a beta's own
+# churn must never turn the (non-required) matrix red. See the canary-detection
+# rule in pg-version-matrix.yml's setup step. Promote a beta to a pinned line
+# (drop the beta/rc suffix) once its major reaches GA and has been green here.
 postgres:17
 postgres:18
+# PG 19: beta1 landed 2026-06; GA ~2026-09. Tracking it as a canary now — the
+# sequence value-sync feature (CREATE PUBLICATION ... FOR ALL SEQUENCES /
+# ALTER SUBSCRIPTION ... REFRESH SEQUENCES, pg_get_sequence_data()) lands in
+# sluice's sequence/cutover domain; see docs/dev/roadmap.md "Postgres 19".
+postgres:19beta1
 postgres:latest

@@ -36,6 +36,12 @@
 # major as a pinned line in pg-versions.txt — not a red build. Pinned legs
 # (17, 18) failing ARE real regressions against released majors.
 #
+# Pre-release majors (beta / rc tags, e.g. postgres:19beta1) are ALSO canaries
+# (continue-on-error): the matrix runs the full suite against them so we track
+# a coming major before GA, but a beta's own churn must not turn this
+# non-required workflow red. Promote to a pinned line at GA. The canary rule in
+# the setup step matches `latest`, `*beta*`, and `*rc*`.
+#
 # Operator decision point: when a newer major has been green here for a
 # while and PG 16 ages toward EOL, bumping per-PR CI's default off 16 means
 # (1) adding the new major to build-prebaked-images.sh / ci-images.md,
@@ -85,8 +91,15 @@ jobs:
         run: |
           entries=$(grep -vE '^[[:space:]]*#|^[[:space:]]*$' scripts/pg-versions.txt | while read -r ref; do
             tag="${ref##*:}"
+            # Canary (continue-on-error) legs: `latest` (forward-compat canary)
+            # and any pre-release tag (betaN / rcN, e.g. 19beta1) — a pre-GA
+            # major is tracked here but its own churn must not turn the
+            # non-required matrix red. Pinned majors (17, 18) failing ARE real
+            # regressions. Keep this rule in sync with pg-versions.txt's note.
             canary=false
-            [ "$tag" = "latest" ] && canary=true
+            case "$tag" in
+              latest|*beta*|*rc*) canary=true ;;
+            esac
             printf '{"version":"%s","image":"%s","canary":%s}\n' "$tag" "$ref" "$canary"
           done | jq -s -c '.')
           echo "resolved matrix: $entries"
