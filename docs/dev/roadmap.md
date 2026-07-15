@@ -871,7 +871,7 @@ So NOTIFY-kick is **demoted** — the poll isn't the bottleneck. Closing the rea
 
 **Gotchas.** Type-mapping edges are enumerated in the prep doc (UUID/Geometry-WKB-GeoParquet/JSON/Decimal≤38/LIST/Enum/Time/Timestamptz-UTC-normalized) — lossy edges WARN loudly at export, never silently narrow. Value-fidelity review applies (family-dispatched encoder ⇒ the Bug-74 pin matrix: every family × shape, ground-truthed with a real Parquet reader).
 
-### 64. Hardening ideas from the burnside-project review (2026-07-15) — *filed, unscheduled*
+### 64. Hardening ideas from the burnside-project review (2026-07-15) — *(a) SHIPPED v0.99.246 (ADR-0059 implementation note); (b) SHIPPED v0.99.246 (ADR-0160); (c) remains demand-gated*
 
 Cross-checks against `pg-cdc`'s reliability catalog found sluice already covers most of it (TOAST `'u'` preserve-semantics; ADR-0059 slot-pressure thresholds; 10s idle keepalive — verified 2026-07-15, see the research addendum). Two genuine gaps + one demand-gated idea:
 
