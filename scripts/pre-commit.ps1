@@ -43,7 +43,11 @@ if (-not $gofumpt) {
     exit 1
 }
 
-$unformatted = & gofumpt -l .
+# gofumpt walks the FILESYSTEM (unlike go vet's module-scoped ./...),
+# so exclude the gitignored .claude/ agent worktrees — live worktree
+# agents keep mid-edit files there that are not this tree's problem
+# (same reasoning as golangci-lint's .claude/ exclusion, v0.99.236).
+$unformatted = & gofumpt -l . | Where-Object { $_ -notmatch '^\.claude[\\/]' -and $_ -notmatch '[\\/]\.claude[\\/]' }
 if ($unformatted) {
     Red "gofumpt would reformat the following files:"
     $unformatted | ForEach-Object { Write-Host $_ }
