@@ -52,6 +52,15 @@ type csvLexer struct {
 
 	line   int // 1-based physical line of the record being lexed
 	record int // 1-based record ordinal (incl. a header record)
+
+	// width is the established record width (set by the caller after the
+	// first record; 0 = not yet known). It is LOAD-BEARING for the blank-line
+	// rule (ADR-0163 F1): in a ONE-column file, a lone empty unquoted line is
+	// a legitimate record — skipping it as "blank" would silently drop a NULL
+	// row under --csv-null='' and silently bypass the ambiguity refusal
+	// otherwise. Empty lines are treated as blank (skipped) only when the
+	// width is >1 or not yet established.
+	width int
 }
 
 func newCSVLexer(r *bufio.Reader, delim byte, path string) (*csvLexer, error) {
@@ -72,9 +81,10 @@ func (l *csvLexer) errf(format string, args ...any) error {
 }
 
 // next lexes one record. It returns io.EOF (and no fields) at clean end of
-// input. Fully-empty lines are skipped (the encoding/csv convention; an
-// intended one-column empty value must be quoted `""` or use the declared
-// NULL representation).
+// input. Fully-empty lines are skipped (the encoding/csv convention) EXCEPT
+// when the established width is 1 — there an empty line is a one-empty-field
+// record and flows through the NULL contract (ADR-0163 §5). A blank line
+// before the width is established (before the first record) is skipped.
 func (l *csvLexer) next() ([]csvField, error) {
 	for {
 		fields, hadContent, err := l.lexLine()
@@ -126,8 +136,12 @@ func (l *csvLexer) lexLine() (fields []csvField, hadContent bool, err error) {
 		if err := endField(); err != nil {
 			return nil, false, err
 		}
-		// A truly blank line is exactly one unquoted empty field.
-		blank := len(fields) == 1 && !anyQuote && fields[0].text == ""
+		// A truly blank line is exactly one unquoted empty field — but ONLY
+		// when the established record width is not 1 (see the width field):
+		// in a one-column file that shape IS a record, and it must reach the
+		// NULL contract (declared '' → a NULL row; undeclared → the
+		// ambiguity refusal), never a silent skip.
+		blank := len(fields) == 1 && !anyQuote && fields[0].text == "" && l.width != 1
 		if blank {
 			l.record-- // blank lines don't consume a record ordinal
 		}
@@ -296,6 +310,10 @@ func (e Engine) stageCSV(ctx context.Context, r *bufio.Reader, path string, st *
 			cols[i] = fmt.Sprintf("col%d", i+1)
 		}
 	}
+	// Establish the record width on the lexer: from here a lone empty line in
+	// a ONE-column file is a record (routed through the NULL contract), not a
+	// skippable blank (ADR-0163 F1).
+	lex.width = len(cols)
 	if err := st.createTable(ctx, cols); err != nil {
 		return err
 	}
@@ -360,19 +378,26 @@ func (e Engine) fieldValue(f csvField) (any, error) {
 }
 
 // headerNames validates the header record: names must be non-empty and
-// unique (staging quotes them, so any character is otherwise fine).
+// unique CASE-INSENSITIVELY — staged SQLite column names are
+// case-insensitive, so `a` and `A` cannot both be held (refused with a
+// named message rather than the staging database's raw duplicate-column
+// error). Staging quotes the names, so any other character is fine.
 func headerNames(fields []csvField, path string) ([]string, error) {
 	cols := make([]string, len(fields))
-	seen := make(map[string]bool, len(fields))
+	seen := make(map[string]string, len(fields))
 	for i, f := range fields {
 		name := f.text
 		if name == "" {
 			return nil, fmt.Errorf("%q: header column %d is empty — every column needs a name (or use --csv-no-header)", path, i+1)
 		}
-		if seen[name] {
-			return nil, fmt.Errorf("%q: duplicate header column %q — column names must be unique", path, name)
+		if prior, dup := seen[strings.ToLower(name)]; dup {
+			if prior == name {
+				return nil, fmt.Errorf("%q: duplicate header column %q — column names must be unique", path, name)
+			}
+			return nil, fmt.Errorf("%q: header columns %q and %q collide case-insensitively — staged SQLite column "+
+				"names are case-insensitive, so both cannot be held; rename one", path, prior, name)
 		}
-		seen[name] = true
+		seen[strings.ToLower(name)] = name
 		cols[i] = name
 	}
 	return cols, nil

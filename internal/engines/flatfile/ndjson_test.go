@@ -119,6 +119,12 @@ func TestNDJSONRefusals(t *testing.T) {
 		{"empty object before any column", `{}` + "\n" + `{"a":1}` + "\n", "empty object before any column"},
 		{"NUL byte", "{\"a\":\"x\x00y\"}\n", "NUL"},
 		{"invalid UTF-8", "{\"a\":\"x\xffy\"}\n", "not valid UTF-8"},
+		// F3: key-name refusals — at the offending LINE, with named messages,
+		// instead of a late zero-length-identifier / duplicate-column error
+		// from the staging database.
+		{"empty key", `{"":"x"}` + "\n", "empty object key"},
+		{"case-colliding keys in one object", `{"a":1,"A":2}` + "\n", "case-insensitively"},
+		{"case-colliding keys across lines", `{"a":1}` + "\n" + `{"A":2}` + "\n", "case-insensitively"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

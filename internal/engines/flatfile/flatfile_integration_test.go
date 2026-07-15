@@ -49,12 +49,15 @@ const (
 
 // fixtureCSV is the value corpus: every quoting/escape shape from the unit
 // matrix PLUS the infer-types columns — created_at (ISO, promotes to naive
-// timestamp), meta_json (objects, promotes to jsonb), user_uuid (promotes
-// to uuid), customer_id (the cus_* case: hinted but non-conforming — MUST
-// stay text), big/dec (exact digit text in a plain text column).
-const fixtureCSV = "id,name,created_at,meta_json,user_uuid,customer_id,big,dec\n" +
-	"1,\"comma, \"\"quote\"\", and\nnewline\",2024-01-02 03:04:05,\"{\"\"a\"\":1}\",6dfa5e5a-2b64-4c5e-9f6a-0a2b3c4d5e6f,cus_abc123,9007199254740993,007.1500\n" +
-	"2,héllo 🚀,\\N,\\N,0e984725-c51c-4bf4-9960-e1c80e27aba0,cus_def456,18446744073709551615,-0.000\n"
+// timestamp), synced_at (the Postgres `COPY … CSV` timestamptz rendering:
+// space separator + 2-digit UTC offset, with and without a fraction — the
+// F2 flagship input, promotes to timestamptz), meta_json (objects, promotes
+// to jsonb), user_uuid (promotes to uuid), customer_id (the cus_* case:
+// hinted but non-conforming — MUST stay text), big/dec (exact digit text in
+// a plain text column).
+const fixtureCSV = "id,name,created_at,synced_at,meta_json,user_uuid,customer_id,big,dec\n" +
+	"1,\"comma, \"\"quote\"\", and\nnewline\",2024-01-02 03:04:05,2026-07-15 08:09:10.123456+00,\"{\"\"a\"\":1}\",6dfa5e5a-2b64-4c5e-9f6a-0a2b3c4d5e6f,cus_abc123,9007199254740993,007.1500\n" +
+	"2,héllo 🚀,\\N,2026-07-14 09:08:09+02,\\N,0e984725-c51c-4bf4-9960-e1c80e27aba0,cus_def456,18446744073709551615,-0.000\n"
 
 func writeFixtureIT(t *testing.T, name, content string) string {
 	t.Helper()
@@ -222,6 +225,9 @@ func TestIntegration_CSVToPostgres(t *testing.T) {
 	if got := typeOf("created_at"); got != "timestamp without time zone" {
 		t.Errorf("created_at type = %q; want naive timestamp", got)
 	}
+	if got := typeOf("synced_at"); got != "timestamp with time zone" {
+		t.Errorf("synced_at type = %q; want timestamptz (the PG-COPY zoned rendering must classify zoned)", got)
+	}
 	if got := typeOf("meta_json"); got != "jsonb" {
 		t.Errorf("meta_json type = %q; want jsonb", got)
 	}
@@ -239,6 +245,12 @@ func TestIntegration_CSVToPostgres(t *testing.T) {
 		"comma, \"quote\", and\nnewline", "row1 name")
 	wantCell(t, queryText(t, db, `SELECT created_at::text FROM people WHERE id = '1'`),
 		"2024-01-02 03:04:05", "row1 created_at")
+	// Instant-exact through the F2 path: rendered in UTC regardless of the
+	// server TimeZone setting.
+	wantCell(t, queryText(t, db, `SELECT to_char(synced_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') FROM people WHERE id = '1'`),
+		"2026-07-15 08:09:10.123456", "row1 synced_at (PG-COPY +00 rendering)")
+	wantCell(t, queryText(t, db, `SELECT to_char(synced_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') FROM people WHERE id = '2'`),
+		"2026-07-14 07:08:09.000000", "row2 synced_at (+02 offset applied, not stripped)")
 	wantCell(t, queryText(t, db, `SELECT meta_json::text FROM people WHERE id = '1'`),
 		`{"a": 1}`, "row1 meta_json (jsonb-normalized)")
 	wantCell(t, queryText(t, db, `SELECT user_uuid::text FROM people WHERE id = '1'`),
@@ -380,6 +392,14 @@ func TestIntegration_CSVToMySQL(t *testing.T) {
 		"comma, \"quote\", and\nnewline", "row1 name")
 	wantCell(t, queryText(t, db, "SELECT DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') FROM people WHERE id = '1'"),
 		"2024-01-02 03:04:05", "row1 created_at")
+	// The promoted timestamptz column, instant-exact on the MySQL target too:
+	// CONVERT_TZ to a fixed +00:00 makes the assertion session-tz-independent.
+	wantCell(t, queryText(t, db,
+		"SELECT DATE_FORMAT(CONVERT_TZ(synced_at, @@session.time_zone, '+00:00'), '%Y-%m-%d %H:%i:%s.%f') FROM people WHERE id = '1'"),
+		"2026-07-15 08:09:10.123456", "row1 synced_at (PG-COPY +00 rendering)")
+	wantCell(t, queryText(t, db,
+		"SELECT DATE_FORMAT(CONVERT_TZ(synced_at, @@session.time_zone, '+00:00'), '%Y-%m-%d %H:%i:%s.%f') FROM people WHERE id = '2'"),
+		"2026-07-14 07:08:09.000000", "row2 synced_at (+02 offset applied)")
 	wantCell(t, queryText(t, db, "SELECT user_uuid FROM people WHERE id = '1'"),
 		"6dfa5e5a-2b64-4c5e-9f6a-0a2b3c4d5e6f", "row1 user_uuid")
 	wantCell(t, queryText(t, db, "SELECT big FROM people WHERE id = '1'"),

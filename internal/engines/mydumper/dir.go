@@ -103,6 +103,16 @@ func openDumpDir(path string) (*dumpDir, error) {
 		// dump gets the scratch-server recipe and a CSV/SQLite file gets the
 		// right driver named.
 		if kind, derr := dumpsig.Detect(path); derr == nil {
+			// A single .gz/.zst file is almost always ONE chunk of a mydumper
+			// dump — the likelier remedy is pointing at the directory (this
+			// reader decompresses per-table chunks itself), not decompressing.
+			if kind == dumpsig.KindGzip || kind == dumpsig.KindZstd {
+				return nil, dumpsig.RefuseWrongDriver("mydumper",
+					"point --source at the dump DIRECTORY",
+					fmt.Errorf("%q is a single compressed file — the mydumper engine reads the dump DIRECTORY "+
+						"(metadata + *-schema.sql + data chunks; .gz/.zst chunks are decompressed automatically); "+
+						"pass the directory that contains this file", path))
+			}
 			if rerr := dumpsig.RefuseRecognised("mydumper", path, kind, false); rerr != nil {
 				return nil, rerr
 			}

@@ -333,6 +333,104 @@ func TestCSVBOMAndLineEndings(t *testing.T) {
 	})
 }
 
+// TestCSVOneColumnEmptyLines pins the ADR-0163 F1 fix: in a ONE-column file
+// an empty line is a legitimate one-empty-field RECORD, routed through the
+// NULL contract — never a silent blank-skip (the review's probe showed
+// `a\n1\n\n2\n` staging 2 rows under --csv-null=” with exit 0: a silently
+// dropped NULL row). Matrix: {undeclared, --csv-null=”, --csv-null='\N'} ×
+// {interior blank line, trailing newline, trailing blank line}, plus the
+// width>1 skip and the before-first-record skip staying as they were.
+func TestCSVOneColumnEmptyLines(t *testing.T) {
+	const interior = "a\n1\n\n2\n" // header, 1, EMPTY, 2
+
+	t.Run("undeclared: interior empty line refuses CSV-NULL-AMBIGUOUS", func(t *testing.T) {
+		e := csvEngine(t, Options{HeaderDeclared: true, Header: true})
+		path := writeSource(t, "one.csv", interior)
+		_, err := e.OpenSchemaReader(context.Background(), path)
+		wantCode(t, err, sluicecode.CodeCSVNullAmbiguous)
+	})
+	t.Run("declared '': interior empty line is a NULL row", func(t *testing.T) {
+		e := csvEngine(t, Options{HeaderDeclared: true, Header: true, NullRepr: strp("")})
+		path := writeSource(t, "one.csv", interior)
+		_, rows := readStaged(t, e, path)
+		if len(rows) != 3 {
+			t.Fatalf("staged %d rows; want 3 (1, NULL, 2)", len(rows))
+		}
+		wantText(t, rows[0], "a", "1")
+		wantNull(t, rows[1], "a")
+		wantText(t, rows[2], "a", "2")
+	})
+	t.Run("declared non-empty repr: interior empty line is an empty-string row", func(t *testing.T) {
+		e := csvEngine(t, Options{HeaderDeclared: true, Header: true, NullRepr: strp(`\N`)})
+		path := writeSource(t, "one.csv", interior)
+		_, rows := readStaged(t, e, path)
+		if len(rows) != 3 {
+			t.Fatalf("staged %d rows; want 3 (1, empty, 2)", len(rows))
+		}
+		wantText(t, rows[1], "a", "")
+	})
+	t.Run("trailing newline is NOT a phantom row (all postures)", func(t *testing.T) {
+		for name, o := range map[string]Options{
+			"undeclared": {HeaderDeclared: true, Header: true},
+			"empty-repr": {HeaderDeclared: true, Header: true, NullRepr: strp("")},
+			"slash-N":    {HeaderDeclared: true, Header: true, NullRepr: strp(`\N`)},
+		} {
+			e := csvEngine(t, o)
+			path := writeSource(t, "one.csv", "a\n1\n")
+			_, rows := readStaged(t, e, path)
+			if len(rows) != 1 {
+				t.Errorf("%s: staged %d rows; want 1 (the trailing newline is not a record)", name, len(rows))
+			}
+		}
+	})
+	t.Run("declared '': a trailing BLANK LINE is a NULL row", func(t *testing.T) {
+		e := csvEngine(t, Options{HeaderDeclared: true, Header: true, NullRepr: strp("")})
+		path := writeSource(t, "one.csv", "a\n1\n\n")
+		_, rows := readStaged(t, e, path)
+		if len(rows) != 2 {
+			t.Fatalf("staged %d rows; want 2 (1, NULL)", len(rows))
+		}
+		wantNull(t, rows[1], "a")
+	})
+	t.Run("no-header one-column file", func(t *testing.T) {
+		e := csvEngine(t, Options{HeaderDeclared: true, Header: false, NullRepr: strp("")})
+		path := writeSource(t, "one.csv", "1\n\n2\n")
+		_, rows := readStaged(t, e, path)
+		if len(rows) != 3 {
+			t.Fatalf("staged %d rows; want 3", len(rows))
+		}
+		wantNull(t, rows[1], "col1")
+	})
+	t.Run("blank line BEFORE the first record is still skipped", func(t *testing.T) {
+		e := csvEngine(t, Options{HeaderDeclared: true, Header: true, NullRepr: strp("")})
+		path := writeSource(t, "one.csv", "\na\n1\n")
+		table, rows := readStaged(t, e, path)
+		if table.Columns[0].Name != "a" || len(rows) != 1 {
+			t.Fatalf("cols[0]=%q rows=%d; want header 'a' and 1 row", table.Columns[0].Name, len(rows))
+		}
+	})
+	t.Run("width > 1 keeps the blank-line skip", func(t *testing.T) {
+		e := csvEngine(t, Options{HeaderDeclared: true, Header: true, NullRepr: strp("")})
+		path := writeSource(t, "two.csv", "a,b\n1,2\n\n3,4\n")
+		_, rows := readStaged(t, e, path)
+		if len(rows) != 2 {
+			t.Fatalf("staged %d rows; want 2 (blank skipped in a 2-column file)", len(rows))
+		}
+	})
+}
+
+// TestCSVHeaderCaseCollision pins the F3 mirror on the csv side: header
+// names differing only in case cannot both be staged (SQLite column names
+// are case-insensitive) and refuse with a named message.
+func TestCSVHeaderCaseCollision(t *testing.T) {
+	e := csvEngine(t, Options{HeaderDeclared: true, Header: true, NullRepr: strp("")})
+	path := writeSource(t, "cc.csv", "a,A\n1,2\n")
+	_, err := e.OpenSchemaReader(context.Background(), path)
+	if err == nil || !strings.Contains(err.Error(), "collide case-insensitively") {
+		t.Fatalf("want the case-collision refusal; got %v", err)
+	}
+}
+
 // TestTSVAndDelimiter pins the tsv driver (fixed TAB) and the csv driver's
 // --csv-delimiter override, including quoting around tabs.
 func TestTSVAndDelimiter(t *testing.T) {

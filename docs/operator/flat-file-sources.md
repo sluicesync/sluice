@@ -15,7 +15,7 @@ The file lands as one table named from the file's basename (`users-2024.csv` →
 - **NULL representation** — `--csv-null=REPR`, the *unquoted* field text that means SQL NULL. `--csv-null=''` adopts the PostgreSQL COPY CSV convention (an unquoted empty field is NULL); `--csv-null='\N'` or `--csv-null=NULL` declare that literal (unquoted empty fields are then empty strings). A **quoted field is always data**: `"NULL"` is the string, `""` is the empty string. Without the flag, a file containing an unquoted empty field is refused (`SLUICE-E-CSV-NULL-AMBIGUOUS`) — RFC 4180 has no NULL, and NULL-vs-empty-string is the #1 silent-loss class of CSV ingest.
 - **Delimiter** — comma by default; `--csv-delimiter` accepts a single ASCII character or `\t`/`tab`.
 
-Quoting follows RFC 4180 strictly: quoted fields may embed delimiters, quotes (doubled: `""`), and newlines (CRLF or LF); malformed quoting, ragged records, lone CRs, NUL bytes, and non-UTF-8 bytes are refused loudly naming the record. Files must be UTF-8 (a UTF-8 BOM is stripped with a WARN; UTF-16 is refused with a transcode hint). Blank lines are skipped.
+Quoting follows RFC 4180 strictly: quoted fields may embed delimiters, quotes (doubled: `""`), and newlines (CRLF or LF); malformed quoting, ragged records, lone CRs, NUL bytes, and non-UTF-8 bytes are refused loudly naming the record. Files must be UTF-8 (a UTF-8 BOM is stripped with a WARN; UTF-16 is refused with a transcode hint). Blank lines are skipped — except in a one-column file, where an empty line is a real one-empty-field record and follows the NULL contract (`--csv-null=''` → a NULL row; a non-empty repr → an empty-string row; undeclared → the ambiguity refusal).
 
 ## TSV
 

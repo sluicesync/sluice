@@ -159,42 +159,70 @@ func TestDecodeTemporal_ISOUnparseable(t *testing.T) {
 	}
 }
 
-// TestDecodeTemporal_ISOSeparatorZoneMatrix pins the full ISO datetime
-// separator × zone × fraction family (the Bug-74 discipline): both RFC 3339
-// 'T' and SQLite's space separator, naive / 'Z' / explicit-offset zones,
-// with and without fractions. The T-separated NAIVE form was MISSING from
-// isoDateTimeLayouts (the ADR-0144 inference GLOB validates `[ T]` and
-// promotes such a column, then the decode refused it — caught by the
-// ADR-0163 flat-file integration suite); this pins every cell so no
-// separator/zone combination can silently drop out again.
+// TestDecodeTemporal_ISOSeparatorZoneMatrix pins EVERY cell of the ISO
+// datetime layout matrix — separator {space, T} × zone {none, Z, ±hh:mm,
+// ±hhmm, ±hh} × fraction {none, .123456} — with the decoded INSTANT checked
+// per cell, plus the bare date. This set is the ADR-0144/ADR-0163
+// validator==decoder contract: the inference validator classifies exactly
+// these spellings as naive/zoned, so a cell missing from
+// isoDateTimeLayouts makes a promoted column abort mid-copy on a value the
+// validator blessed. Two such gaps shipped and were caught in review: the
+// T-separated naive form, then the space-separated zoned and colon-less
+// offset forms (Postgres `COPY … CSV` renders timestamptz as
+// `… 08:09:10.123456+00` — space + 2-digit offset).
 func TestDecodeTemporal_ISOSeparatorZoneMatrix(t *testing.T) {
-	naive := time.Date(2024, 6, 7, 8, 9, 10, 0, time.UTC)
-	frac := time.Date(2024, 6, 7, 8, 9, 10, 123456000, time.UTC)
-	for _, tc := range []struct {
-		raw  string
-		want time.Time
+	// wall(ns) is the wall-clock 2024-06-07 08:09:10(.ns) read as UTC; a
+	// zoned value's instant is wall minus its offset.
+	wall := func(ns int) time.Time { return time.Date(2024, 6, 7, 8, 9, 10, ns, time.UTC) }
+	zones := []struct {
+		text   string
+		offset time.Duration
 	}{
-		{"2024-06-07 08:09:10", naive},
-		{"2024-06-07T08:09:10", naive}, // the previously-refused cell
-		{"2024-06-07 08:09:10.123456", frac},
-		{"2024-06-07T08:09:10.123456", frac},
-		{"2024-06-07T08:09:10Z", naive},
-		{"2024-06-07T08:09:10.123456Z", frac},
-		{"2024-06-07T09:09:10+01:00", naive.Add(0)}, // same instant, +01:00
-	} {
-		got, err := decodeCell(tc.raw, ir.Timestamp{}, dateEncodingISO)
-		if err != nil {
-			t.Errorf("%q: unexpected refusal: %v", tc.raw, err)
-			continue
+		{"", 0},
+		{"Z", 0},
+		{"+02:00", 2 * time.Hour},
+		{"-05:00", -5 * time.Hour},
+		{"+0530", 5*time.Hour + 30*time.Minute},
+		{"-0800", -8 * time.Hour},
+		{"+02", 2 * time.Hour},
+		{"-08", -8 * time.Hour},
+		{"+00", 0}, // the PG COPY CSV UTC rendering
+	}
+	fracs := []struct {
+		text string
+		ns   int
+	}{
+		{"", 0},
+		{".123456", 123456000},
+	}
+	for _, sep := range []string{" ", "T"} {
+		for _, z := range zones {
+			for _, f := range fracs {
+				raw := "2024-06-07" + sep + "08:09:10" + f.text + z.text
+				want := wall(f.ns).Add(-z.offset)
+				got, err := decodeCell(raw, ir.Timestamp{}, dateEncodingISO)
+				if err != nil {
+					t.Errorf("%q: unexpected refusal: %v", raw, err)
+					continue
+				}
+				tm, ok := got.(time.Time)
+				if !ok {
+					t.Errorf("%q: got %T; want time.Time", raw, got)
+					continue
+				}
+				if !tm.Equal(want) {
+					t.Errorf("%q decoded to %v; want the instant %v", raw, tm.UTC(), want)
+				}
+			}
 		}
-		tm, ok := got.(time.Time)
-		if !ok {
-			t.Errorf("%q: got %T; want time.Time", tc.raw, got)
-			continue
-		}
-		if !tm.Equal(tc.want) {
-			t.Errorf("%q decoded to %v; want the instant %v", tc.raw, tm, tc.want)
-		}
+	}
+	// The bare-date cell.
+	got, err := decodeCell("2024-06-07", ir.Timestamp{}, dateEncodingISO)
+	if err != nil {
+		t.Fatalf("bare date: unexpected refusal: %v", err)
+	}
+	if tm := got.(time.Time); !tm.Equal(time.Date(2024, 6, 7, 0, 0, 0, 0, time.UTC)) {
+		t.Errorf("bare date decoded to %v", tm)
 	}
 }
 

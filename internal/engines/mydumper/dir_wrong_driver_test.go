@@ -48,6 +48,17 @@ func TestOpenDumpDirWrongDriverRefusals(t *testing.T) {
 			t.Errorf("error %q should name the csv driver", err.Error())
 		}
 	})
+	t.Run("single .gz file points at the dump directory, not decompression", func(t *testing.T) {
+		p := write(t, "shop.users.00000.sql.gz", "\x1f\x8b\x08\x00compressed-chunk")
+		_, err := openDumpDir(p)
+		ce, ok := sluicecode.FromError(err)
+		if !ok || ce.Code != sluicecode.CodeSourceWrongDriver {
+			t.Fatalf("error = %v; want SLUICE-E-SOURCE-WRONG-DRIVER", err)
+		}
+		if !strings.Contains(err.Error(), "dump DIRECTORY") {
+			t.Errorf("error %q should point at the dump directory (a lone chunk's remedy), not decompression", err.Error())
+		}
+	})
 	t.Run("unrecognised file keeps the generic refusal", func(t *testing.T) {
 		p := write(t, "notes.txt", "hello\n")
 		_, err := openDumpDir(p)

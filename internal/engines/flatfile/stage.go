@@ -28,6 +28,13 @@ type stager struct {
 	cols     []string
 	colIndex map[string]int
 
+	// lowerIndex maps the lower-cased column name to the spelling that owns
+	// it: SQLite column names are case-insensitive, so a LATER key differing
+	// only in case (`{"a":…}` on line 1, `{"A":…}` on line 9) cannot become a
+	// second column — it is refused with a named collision message instead of
+	// leaking the staging database's raw duplicate-column error.
+	lowerIndex map[string]string
+
 	tx      *sql.Tx
 	stmt    *sql.Stmt
 	pending int
@@ -47,7 +54,7 @@ func newStager(ctx context.Context, dbPath, table string) (*stager, error) {
 	// One connection: the stager is strictly sequential, and a single conn
 	// keeps the tx/stmt lifecycle trivial.
 	db.SetMaxOpenConns(1)
-	return &stager{db: db, table: table, colIndex: map[string]int{}}, nil
+	return &stager{db: db, table: table, colIndex: map[string]int{}, lowerIndex: map[string]string{}}, nil
 }
 
 // createTable creates the staged table with the given TEXT columns (CSV: the
@@ -57,6 +64,7 @@ func (s *stager) createTable(ctx context.Context, cols []string) error {
 	for i, c := range cols {
 		defs[i] = quoteIdent(c) + " TEXT"
 		s.colIndex[c] = i
+		s.lowerIndex[strings.ToLower(c)] = c
 	}
 	s.cols = append([]string(nil), cols...)
 	ddl := "CREATE TABLE " + quoteIdent(s.table) + " (" + strings.Join(defs, ", ") + ")"
@@ -82,6 +90,10 @@ func (s *stager) upsertColumns(ctx context.Context, keys []string) error {
 		if _, ok := s.colIndex[k]; ok {
 			continue
 		}
+		if prior, ok := s.lowerIndex[strings.ToLower(k)]; ok {
+			return fmt.Errorf("key %q collides case-insensitively with earlier key %q — staged SQLite column "+
+				"names are case-insensitive, so both cannot be held; rename one", k, prior)
+		}
 		// New column mid-file: rebuild the insert stmt on next use. ALTER is
 		// fine inside the batch transaction (SQLite DDL is transactional).
 		if err := s.closeStmt(); err != nil {
@@ -96,6 +108,7 @@ func (s *stager) upsertColumns(ctx context.Context, keys []string) error {
 			return fmt.Errorf("stage add column %q: %w", k, err)
 		}
 		s.colIndex[k] = len(s.cols)
+		s.lowerIndex[strings.ToLower(k)] = k
 		s.cols = append(s.cols, k)
 	}
 	return nil

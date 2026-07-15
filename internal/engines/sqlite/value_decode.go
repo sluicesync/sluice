@@ -348,17 +348,28 @@ func temporalInstant(raw any, t ir.Type, enc dateEncoding) (time.Time, error) {
 // fractional layout also matches its no-fraction input — covering SQLite's
 // own date()/datetime() output, the space- and T-separated forms, RFC3339
 // (with zone), and a bare date.
+// The set is the FULL separator {space, T} × zone {none, Z/±hh:mm, ±hhmm,
+// ±hh} × optional-fraction matrix (each `.999999999` fraction is optional,
+// and each `Z…` zone layout also accepts a literal `Z`). This breadth is
+// LOAD-BEARING for ADR-0144/ADR-0163: the inference validator promotes a
+// column it has classified over exactly this matrix, so any cell missing
+// here makes the validator promise what the decoder then refuses (the
+// original T-naive gap, and the space-zoned / colon-less-offset gaps —
+// Postgres `COPY … CSV` itself renders timestamptz as
+// `2026-07-15 08:09:10.123456+00`: space separator, 2-digit offset — were
+// both caught by the flat-file suite). Every cell is pinned by
+// TestDecodeTemporal_ISOSeparatorZoneMatrix; extend the pin with any new
+// layout. Naive forms come first; a zoned value cannot match them (Go's
+// Parse consumes the whole input), so ordering is cosmetic.
 var isoDateTimeLayouts = []string{
 	"2006-01-02 15:04:05.999999999",
-	"2006-01-02T15:04:05.999999999Z07:00",
-	time.RFC3339,
-	// T-separated NAIVE datetime (no zone). Without this layout a
-	// `2024-06-07T08:09:10` value was refused even though the ADR-0144
-	// inference GLOB (`[ T]`, infer_types.go) validates and promotes it —
-	// the validator promised what the decoder then refused (caught by the
-	// flat-file integration suite, ADR-0163). Ordered after the zoned forms
-	// so zoned values keep matching their zone-carrying layouts.
 	"2006-01-02T15:04:05.999999999",
+	"2006-01-02 15:04:05.999999999Z07:00",
+	"2006-01-02T15:04:05.999999999Z07:00",
+	"2006-01-02 15:04:05.999999999Z0700",
+	"2006-01-02T15:04:05.999999999Z0700",
+	"2006-01-02 15:04:05.999999999Z07",
+	"2006-01-02T15:04:05.999999999Z07",
 	"2006-01-02",
 }
 
@@ -439,8 +450,8 @@ func julianToTime(jd float64) time.Time {
 func temporalStorageError(raw any, t ir.Type, enc dateEncoding) error {
 	return fmt.Errorf(
 		"date/time decode mismatch: value stored as %s (%v) is not valid for IR %s under --sqlite-date-encoding=%s; "+
-			"refusing to guess (set --sqlite-date-encoding to the encoding this column actually uses, "+
-			"or --type-override <col>=text to carry the raw value)",
+			"refusing to guess (sqlite/d1 sources: set --sqlite-date-encoding to the encoding this column actually "+
+			"uses; any source, incl. csv/tsv/ndjson: --type-override <col>=text carries the raw value)",
 		storageClass(raw), raw, t.String(), enc,
 	)
 }
@@ -450,8 +461,8 @@ func temporalStorageError(raw any, t ir.Type, enc dateEncoding) error {
 func isoParseError(s string, t ir.Type) error {
 	return fmt.Errorf(
 		"date/time decode mismatch: text value %q matches no ISO layout for IR %s under --sqlite-date-encoding=iso; "+
-			"refusing to guess (set --sqlite-date-encoding to the encoding this column actually uses, "+
-			"or --type-override <col>=text to carry the raw value)",
+			"refusing to guess (sqlite/d1 sources: set --sqlite-date-encoding to the encoding this column actually "+
+			"uses; any source, incl. csv/tsv/ndjson: --type-override <col>=text carries the raw value)",
 		s, t.String(),
 	)
 }

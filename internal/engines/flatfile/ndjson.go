@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -101,7 +102,11 @@ func parseNDJSONLine(raw []byte) (keys []string, vals []any, err error) {
 		return nil, nil, fmt.Errorf("top-level value is %s; NDJSON requires one JSON OBJECT per line", tokenName(tok))
 	}
 
-	seen := map[string]bool{}
+	// seen maps the LOWER-CASED key to the spelling first seen: staged SQLite
+	// column names are case-insensitive, so `{"a":…,"A":…}` cannot be held —
+	// refuse it here with a named message instead of leaking a raw
+	// duplicate-column error from the staging database.
+	seen := map[string]string{}
 	for dec.More() {
 		kt, err := dec.Token()
 		if err != nil {
@@ -111,10 +116,17 @@ func parseNDJSONLine(raw []byte) (keys []string, vals []any, err error) {
 		if !ok {
 			return nil, nil, fmt.Errorf("invalid JSON object key %v", kt)
 		}
-		if seen[key] {
-			return nil, nil, fmt.Errorf("duplicate key %q in one object — a last-wins parse would silently drop the first value", key)
+		if key == "" {
+			return nil, nil, errors.New(`empty object key "" — a column needs a name; rename the key`)
 		}
-		seen[key] = true
+		if prior, dup := seen[strings.ToLower(key)]; dup {
+			if prior == key {
+				return nil, nil, fmt.Errorf("duplicate key %q in one object — a last-wins parse would silently drop the first value", key)
+			}
+			return nil, nil, fmt.Errorf("keys %q and %q collide case-insensitively — staged SQLite column names are "+
+				"case-insensitive, so both cannot be held; rename one", prior, key)
+		}
+		seen[strings.ToLower(key)] = key
 
 		var rawVal json.RawMessage
 		if err := dec.Decode(&rawVal); err != nil {

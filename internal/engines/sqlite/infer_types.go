@@ -48,12 +48,27 @@ const (
 	// corrupt (it aborts the migrate naming the row).
 	isoDateTimeGlob = `[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][ T][0-9][0-9]:[0-9][0-9]:[0-9][0-9]*`
 
-	// offsetGlob matches a value whose LAST six chars are a signed `±HH:MM`
-	// UTC offset (ISO-8601 extended form, with the colon). zuluGlob matches a
-	// trailing `Z`. A value carries an explicit offset iff it matches EITHER —
-	// the timestamptz-vs-timestamp resolution (never invent a zone).
-	offsetGlob = `*[+-][0-9][0-9]:[0-9][0-9]`
-	zuluGlob   = `*Z`
+	// The zone-classification globs: a value carries an explicit zone iff it
+	// matches ANY of these — the timestamptz-vs-timestamp resolution (never
+	// invent a zone). The set mirrors value_decode.go's isoDateTimeLayouts
+	// zone matrix EXACTLY (Z, ±hh:mm, ±hhmm, ±hh — validator==decoder is the
+	// ADR-0163 F2 invariant: a spelling classified here must decode, and a
+	// spelling the decoder accepts must classify, or a promoted column aborts
+	// mid-copy on the value the validator already blessed).
+	//
+	// offsetGlob is the colon form `±HH:MM`; offsetHHMMGlob the compact
+	// `±HHMM`; zuluGlob a trailing `Z`. The bare 2-digit `±HH` form (what
+	// Postgres `COPY … CSV` writes for timestamptz, e.g. `…08:09:10+00`)
+	// CANNOT be a simple `*[+-][0-9][0-9]` — a bare DATE (`2024-01-02`) ends
+	// in exactly that shape and would be misclassified as zoned (an
+	// invented-zone hazard). It is therefore anchored to follow a time:
+	// directly after the seconds (`*:SS±HH`) or after a fractional part
+	// (`*.…±HH`), which no naive/date value can match.
+	offsetGlob            = `*[+-][0-9][0-9]:[0-9][0-9]`
+	offsetHHMMGlob        = `*[+-][0-9][0-9][0-9][0-9]`
+	offsetHHAfterSecsGlob = `*:[0-9][0-9][+-][0-9][0-9]`
+	offsetHHAfterFracGlob = `*.*[+-][0-9][0-9]`
+	zuluGlob              = `*Z`
 
 	// subMicroFracGlob matches a value whose fractional-seconds part has MORE
 	// than 6 digits — a dot followed by at least 7 digits (GLOB has no {n,}
@@ -212,11 +227,14 @@ func validateInferredTimestamp(
 		return false, ir.Timestamp{}, total, nil
 	}
 
-	// noOffset = how many non-NULL values do NOT carry an explicit offset/`Z`.
-	// Zero ⇒ every value is zoned ⇒ timestamptz; otherwise naive timestamp.
+	// noOffset = how many non-NULL values do NOT carry an explicit zone (any
+	// of the Z / ±hh:mm / ±hhmm / anchored-±hh spellings — the decoder's
+	// exact zone matrix). Zero ⇒ every value is zoned ⇒ timestamptz;
+	// otherwise naive timestamp.
 	noOffset, err := count(ctx, fmt.Sprintf(
-		"SELECT COUNT(*) AS n FROM %s WHERE %s IS NOT NULL AND NOT (%s GLOB '%s' OR %s GLOB '%s')",
-		qt, qc, qc, offsetGlob, qc, zuluGlob,
+		"SELECT COUNT(*) AS n FROM %s WHERE %s IS NOT NULL AND NOT (%s GLOB '%s' OR %s GLOB '%s' OR %s GLOB '%s' OR %s GLOB '%s' OR %s GLOB '%s')",
+		qt, qc,
+		qc, offsetGlob, qc, offsetHHMMGlob, qc, offsetHHAfterSecsGlob, qc, offsetHHAfterFracGlob, qc, zuluGlob,
 	))
 	if err != nil {
 		return false, nil, 0, err

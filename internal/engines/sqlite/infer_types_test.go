@@ -128,6 +128,84 @@ func TestValidateInferredType_PerFamily(t *testing.T) {
 	}
 }
 
+// TestValidateInferredType_ZoneSpellingMatrix pins the FULL zone-spelling
+// classification (ADR-0163 F2 — validator==decoder over separator {space,T}
+// × zone {Z, ±hh:mm, ±hhmm, ±hh} × fraction): each spelling column must
+// resolve TIMESTAMPTZ (a spelling classified naive here but zoned by the
+// decoder would abort mid-copy on a value the validator blessed — the
+// original PG-COPY `…+00` finding); bare DATES must stay NAIVE (a date's
+// `-02` tail is exactly the ±hh shape — the false-positive the anchored
+// globs exist to avoid, since a misclassified date column would invent a
+// zone); and a pg-style zoned value mixed with a naive one stays refused.
+func TestValidateInferredType_ZoneSpellingMatrix(t *testing.T) {
+	r := openInferReader(
+		t, `
+		CREATE TABLE z (
+			id        INTEGER PRIMARY KEY,
+			ts_pgcopy TEXT,
+			ts_hh_t   TEXT,
+			ts_hhmm   TEXT,
+			ts_colon  TEXT,
+			ts_zulu   TEXT,
+			ts_dates  TEXT,
+			ts_mix_pg TEXT
+		)`,
+		// Row 1: the Postgres COPY CSV timestamptz rendering (space separator,
+		// fraction, 2-digit offset) and every sibling zone spelling.
+		`INSERT INTO z VALUES (1,
+			'2026-07-15 08:09:10.123456+00',
+			'2026-07-15T08:09:10.123456+02',
+			'2026-07-15 08:09:10+0530',
+			'2026-07-15T08:09:10-05:00',
+			'2026-07-15 08:09:10.123456Z',
+			'2024-01-02',
+			'2026-07-15 08:09:10+00')`,
+		// Row 2: same shapes, no-fraction / negative variants; ts_mix_pg goes
+		// naive here (the mixed refusal), ts_dates stays a bare date.
+		`INSERT INTO z VALUES (2,
+			'2026-07-14 07:08:09+00',
+			'2026-07-14T07:08:09-08',
+			'2026-07-14T07:08:09.5-0800',
+			'2026-07-14 07:08:09+05:30',
+			'2026-07-14T07:08:09Z',
+			'2024-11-30',
+			'2026-07-14 07:08:09')`,
+	)
+
+	tsTZ := ir.Timestamp{Precision: 6, WithTimeZone: true}
+	tsNaive := ir.Timestamp{Precision: 6, WithTimeZone: false}
+	cases := []struct {
+		col          string
+		wantConforms bool
+		wantResolved ir.Type
+	}{
+		{"ts_pgcopy", true, tsTZ},   // the flagship: space + ±hh
+		{"ts_hh_t", true, tsTZ},     // T + ±hh
+		{"ts_hhmm", true, tsTZ},     // compact ±hhmm, both separators
+		{"ts_colon", true, tsTZ},    // ±hh:mm, both separators
+		{"ts_zulu", true, tsTZ},     // Z, both separators
+		{"ts_dates", true, tsNaive}, // bare dates: NOT zone-classified
+		{"ts_mix_pg", false, nil},   // zoned + naive mix → kept text
+	}
+	for _, tc := range cases {
+		t.Run(tc.col, func(t *testing.T) {
+			conforms, resolved, validated, err := r.ValidateInferredType(context.Background(), "z", tc.col, ir.Timestamp{})
+			if err != nil {
+				t.Fatalf("ValidateInferredType(%s): %v", tc.col, err)
+			}
+			if conforms != tc.wantConforms {
+				t.Fatalf("%s: conforms=%v want %v", tc.col, conforms, tc.wantConforms)
+			}
+			if validated != 2 {
+				t.Fatalf("%s: validated=%d want 2", tc.col, validated)
+			}
+			if tc.wantConforms && resolved != tc.wantResolved {
+				t.Fatalf("%s: resolved=%v want %v", tc.col, resolved, tc.wantResolved)
+			}
+		})
+	}
+}
+
 // TestValidateInferredType_EmptyTable pins the zero-row case: nothing is
 // validated, so nothing is promoted (validated=0, conforms=false) regardless of
 // family — the empty/all-NULL decision (ADR-0144).
