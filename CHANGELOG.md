@@ -4,6 +4,26 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.254] - 2026-07-15
+
+### Added
+
+- **`sluice deploy-ddl` — ship one verbatim DDL statement to a PlanetScale production branch through the governed deploy-request channel, with the full ADR-0162 safety wrapper (ADR-0165, roadmap item 66).** Preflight (safe-migrations prerequisite, refused coded, never auto-enabled) → dev branch with the **stale-base freshness gate** (a fresh PS branch can silently propose reverting recent production schema; sluice's schema-compare + one-shot backup-rebase is currently the only implementation of that guard anywhere) → apply the `--ddl` on the branch → deploy request → deploy → skip-revert finalize → always-cleanup. Deterministic dev-branch name (`sluice-ddl-<10-hex>`) preserves the refuse-on-leftover crash story; the tolerant poller and the three ADR-0162 `SLUICE-E-PS-*` codes are reused unchanged (no new failure classes); `--dry-run` is pinned to zero control-plane calls, and the command has no data plane at all. Deliberately NOT raw deploy-request CRUD (the pscale CLI owns that) — the differentiated piece is the wrapper.
+
+- **`sluice control-tables ddl` — the control-table bootstrap printer.** Prints the five-table bootstrap set (`sluice_migrate_state`, `sluice_migrate_table_progress`, `sluice_cdc_state`, `sluice_cdc_schema_history`, `sluice_shard_consolidation_lease`) via the new optional `ir.ControlTableDDLProvider` surface, single-sourced byte-identical with the engine's own Ensure\* DDL (test-pinned). Credential-free, read-only, output composes with any channel; `--engine` defaults to `planetscale`, the whole mysql family prints the same dialect. The safe-migrations bootstrap is now a documented three-command story (printer → `deploy-ddl` per statement → run normally); new section in `docs/managed-services.md`.
+
+- **Internals: the expand-contract deploy-leg machinery extracted into a shared `legRunner`** that expand-contract's two legs and deploy-ddl's single leg compose — behavior-preserving, all prior expand-contract pins pass unchanged.
+
+### Fixed
+
+- **Error 1105 "direct DDL is disabled" at every mysql control-table DDL site is now the coded refusal `SLUICE-E-PS-DIRECT-DDL-BLOCKED` echoing the exact refused statement (deploy-ddl-pasteable), instead of a raw driver error (loud-failure UX fix, zero data risk; every prior release surfaced the raw 1105 on safe-migrations PlanetScale targets).** Sites covered: the bootstrap CREATEs, the `sluice_keysets` and `sluice_target_metrics_history` CREATEs, every detect-then-ALTER column migration, and the item-65a LONGTEXT widen. The message names safe migrations and the `control-tables ddl` → `deploy-ddl` bootstrap path; `ErrSafeMigrationsBlocked` stays in the chain for `errors.Is` callers.
+
+- **The sync applier's three control-table ensures (`sluice_cdc_state`, `sluice_cdc_schema_history`, `sluice_shard_consolidation_lease`) converted from bare `CREATE TABLE IF NOT EXISTS` to detect-then-create, so a bootstrapped `sync` actually starts on a safe-migrations branch.** PlanetScale refuses the CREATE statement whether or not the table exists, so even after shipping the tables via deploy-ddl the next `sync` start would still 1105 on the no-op CREATE. All three now probe `information_schema` first and issue zero DDL when current (pinned per table), mirroring the migrate-state store's v0.99.248 gate. The bare-CREATE shape predates this release by essentially the project's whole history but was only reachable as a loud startup failure on safe-migrations PlanetScale target branches (a workflow only supported since ADR-0162, v0.99.248) — never silent, nothing to re-verify.
+
+### Compatibility
+
+- **Purely additive; no breaking changes.** Two new commands, one new coded refusal, one new optional engine surface; no flag, default, or behavior change to any existing command. The detect-then-create conversion is behavior-preserving — zero DDL when the tables are current, at the cost of up to three extra `information_schema` lookups per applier start; the `legRunner` extraction leaves expand-contract's public behavior unchanged (two guidance strings generalized from "the %s DDL" to "the DDL").
+
 ## [0.99.253] - 2026-07-15
 
 ### Fixed
