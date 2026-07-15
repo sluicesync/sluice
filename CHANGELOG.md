@@ -4,6 +4,18 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.255] - 2026-07-15
+
+### Added
+
+- **Automatic deploy-request index-build fallback for PlanetScale targets (ADR-0148, roadmap item 67).** When migrate's deferred post-copy `ADD INDEX` on a `planetscale` target fails with errno 3024 (the ~900s statement-time wall) or errno 1105 "direct DDL is disabled" (the safe-migrations block) — on either deferred-build call site (whole-schema post-copy build incl. resume/restore, and the VStream serial build-as-copied overlap) — the table's still-pending indexes build through a dev branch + deploy request (VReplication: async, unbounded by the wall) on the already-copied data, with no re-copy. Requires safe migrations already ON — sluice never toggles it; the writer re-probes the catalog first so already-built indexes are never re-sent, batching is one branch + one deploy request per table (multi-statement via the staged-DDL hook — FULLTEXT/SPATIAL must be separate ALTERs), and every branch passes the ADR-0162 stale-base freshness gate (`SLUICE-E-PS-BRANCH-STALE-BASE`). Deterministic `sluice-index-<10-hex>` branch names refuse leftovers by name; `--resume` converges by re-probing and rebuilding only what is still missing.
+- **Arming flags (opportunistic, WARN-at-most, never a refusal):** `migrate --planetscale-org` (env `PLANETSCALE_ORG`), `--planetscale-service-token-id`/`--planetscale-service-token` (env `PLANETSCALE_SERVICE_TOKEN_ID`/`_TOKEN`, the pscale-CLI convention), `--planetscale-database` (defaults from the `--target` DSN's database), `--planetscale-branch` (default `main`), `--planetscale-deploy-timeout` (default 1h). A conservative per-table `information_schema.TABLES` `DATA_LENGTH` probe (64 GiB threshold) routes clearly-huge tables straight to the deploy request, skipping the doomed ~900s direct attempt; a mis-route is harmless in both directions. Speed stated honestly: the fallback's value is unblocking, not speed — when the probe doesn't skip it the direct attempt still burns up to ~900s (a 1105-refused branch fails instantly, no burn), and the VReplication deploy is real wall-clock on large tables.
+- **Internals: the fallback composes the shared ADR-0165 `legRunner`** — one leg machine (branch provision + freshness gate + DR lifecycle + cleanup), three consumers: expand-contract's legs, `deploy-ddl`, and the index fallback (converged in-release from a deliberately collision-free duplicate; plumbing only, all fallback pins pass unmodified). New engine-neutral `ir.IndexBuildFallback`/`ir.IndexBuildFallbackSetter` surface; the pipeline threads it opaquely and the orchestrator stays engine-neutral. ADR-0148 recommends a live psverify run before relying on the fallback in anger (the client/poller/gate are the ADR-0162-hardened ones; the fallback path itself is unit/fake-harness validated).
+
+### Compatibility
+
+- **Purely additive; no breaking changes.** Six new optional `migrate` flags, no new error codes (reuses `SLUICE-E-INDEX-STATEMENT-TIME-LIMIT`, `SLUICE-E-PS-DEPLOY-REQUEST-FAILED`, `SLUICE-E-PS-BRANCH-STALE-BASE`). The never-worse contract: sluice never toggles safe migrations, and unarmed or unavailable (safe migrations off, bad token, non-planetscale target) the ORIGINAL direct error and the existing `--upfront-indexes`/`--resume` hints surface byte-identically — the hints now also name the fallback. Non-PlanetScale targets and all data paths untouched.
+
 ## [0.99.254] - 2026-07-15
 
 ### Added
