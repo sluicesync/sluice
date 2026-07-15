@@ -863,6 +863,22 @@ So NOTIFY-kick is **demoted** — the poll isn't the bottleneck. Closing the rea
 - **Phase 3 (M/L, demand-gated) — PlanetScale expand-contract ORCHESTRATION (operator-flagged follow-up):** drive the whole pattern via the PS API — dev branch → deploy-request ADD COLUMN → phase-1 backfill → deploy-request DROP COLUMN. Couples to the control plane (service token, dev-branch/deploy-request model, safe-migrations prerequisite), so opt-in + separate; **shares its PS-control-plane client with ADR-0148's deferred deploy-request index path** — the two want a common thin PS API client.
 - **Non-goals:** a general `sluice exec <sql>`; cross-engine backfill (that's `migrate`/`sync`); auto-inferring which columns need backfilling; any silent/automatic contract.
 
+### 63. Analytics exit surfaces: `backup export-as-parquet` + DuckDB cookbook recipe (demand evidence landed 2026-07-15) — *research complete (`docs/research/sluice-as-analytics-source.md` = the prep doc); implementation not started*
+
+**Why.** The research doc gated Surface 1 (`backup export-as-parquet`) on "an operator with concrete demand." That evidence arrived externally: burnside-project's `pg-warehouse` (PG→DuckDB local warehouse) and `pg-cdc` (PG WAL→typed Parquet/Iceberg on S3, AWS Marketplace) are two shipping tools + a commercial listing built on exactly the OLTP→columnar personas the doc bell-curved — see the doc's 2026-07-15 prior-art addendum. Both are **PG-only**; sluice's differentiation is engine breadth (one export path over MySQL/Vitess/PlanetScale/PG/SQLite/D1 backup chains via the existing `BackupStore`).
+
+**What.** Per the prep doc: (a) **Surface 1 (M, ~600–1000 LOC)** — one-shot transcode of existing JSON-Lines backup chunks to Parquet via `parquet-go/parquet-go` (now production-proven in `pg-cdc`), exit-only (no read-back), row groups 1:1 with chunks, source-chunk SHA-256 in Parquet metadata, zstd; the doc's five Open Questions (file granularity, encryption pass-through, incremental mode, GeoParquet, unbounded-NUMERIC) have recommendations ready. (b) **Surface 2 (docs-only, ~1 day)** — `docs/cookbook/duckdb-on-sluice-backups.md` recipe, landed alongside (a). **Not in scope:** embedding DuckDB (CGO + arrow-go v18 tail — the prior-art addendum re-confirmed the refusal from both directions); Arrow Flight (stays deferred per the doc); Iceberg catalog commit (possible later extension, noted only).
+
+**Gotchas.** Type-mapping edges are enumerated in the prep doc (UUID/Geometry-WKB-GeoParquet/JSON/Decimal≤38/LIST/Enum/Time/Timestamptz-UTC-normalized) — lossy edges WARN loudly at export, never silently narrow. Value-fidelity review applies (family-dispatched encoder ⇒ the Bug-74 pin matrix: every family × shape, ground-truthed with a real Parquet reader).
+
+### 64. Hardening ideas from the burnside-project review (2026-07-15) — *filed, unscheduled*
+
+Cross-checks against `pg-cdc`'s reliability catalog found sluice already covers most of it (TOAST `'u'` preserve-semantics; ADR-0059 slot-pressure thresholds; 10s idle keepalive — verified 2026-07-15, see the research addendum). Two genuine gaps + one demand-gated idea:
+
+- **(a) Slot-health notifications (S).** ADR-0059's pre-emptive slot WARNs (70%/85% of `max_slot_wal_keep_size`, 30m inactivity) are **slog-only** — an unattended sync's operator never gets paged before the slot invalidates. Wire the WARN/CRITICAL crossings into the ADR-0157 notification sinks (webhook/Slack/email), same edge-once + failure-isolated posture as schema-drift alerts. The signal (`slot_health_reporter.go`) and the sink plumbing both exist; this is wiring + pins.
+- **(b) Backup-store concurrent-writer guard (S/M).** Nothing today stops two writers (two `backup incremental` crons, or a backup + compaction race) from interleaving one chain's manifest. `pg-cdc`'s pattern: CAS manifest writes (S3 If-Match ETag; filesystem O_EXCL/rename) + a dual-writer circuit breaker after N conflicts. Fits the chain-security arc (ADR-0152/0154); needs a per-`BackupStore`-backend capability probe since not every backend has CAS. Audit-adjacent — consider folding into the next backup-security audit window.
+- **(c) RDS/Aurora IAM-token auth (demand-gated).** Short-lived IAM tokens minted per connect (`BeforeConnect` re-resolution) instead of static DSN passwords. New credential surface — file only; build on operator demand.
+
 ---
 
 ### Deferred audit findings (2026-07-08 cross-check)

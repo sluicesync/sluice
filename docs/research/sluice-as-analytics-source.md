@@ -136,6 +136,23 @@ The proto-ADR ([`docs/dev/design/apache-arrow-integration.md`](../dev/design/apa
 - An operator surfaces with Arrow Flight demand → revisit Surface 3's dep-weight assumption against the current upstream state of `apache/arrow-go` (the version may have consolidated or the Substrait / Avro / gonum tail may have been trimmed).
 - DuckDB ships breaking changes to `read_json_auto` / `read_parquet` → re-verify the Surface 2 recipe before promoting it to the cookbook.
 
+## Prior-art update (2026-07-15): burnside-project `pg-warehouse` / `pg-cdc`
+
+Two shipping Apache-2.0 Go tools from one org (operator-flagged 2026-07-15) land squarely on this doc's territory and independently validate its three calls. Both are **PG-only**.
+
+- **[`pg-warehouse`](https://github.com/burnside-project/pg-warehouse)** — local-first PG→DuckDB mirror via `pglogrepl`, with a dbt-like model DAG / contracts / versioned releases over three DuckDB files, plus Parquet/CSV export. Embeds DuckDB via `marcboeker/go-duckdb` — **CGO**, and drags `apache/arrow-go/v18` into the module graph.
+- **[`pg-cdc`](https://github.com/burnside-project/pg-cdc)** — PG WAL → typed, compacted Parquet/**Iceberg** on S3 (AWS Marketplace listing; Glue/Lake Formation governance + an MCP server for AI-agent consumption). Uses **`parquet-go/parquet-go`** in production; snapshot-at-LSN init mirroring sluice's snapshot→CDC handoff; delta-epoch compaction; CAS-committed (If-Match ETag) S3 manifest with a dual-writer circuit breaker; `confirmed_flush_lsn` advanced only after Parquet+manifest are durable.
+
+**What they validate (all three of this doc's calls):**
+
+1. **Surface 1's library choice is production-proven.** `pg-cdc` ships `parquet-go/parquet-go` for exactly the typed-CDC-to-Parquet job, including live schema evolution. The library-risk question on `export-as-parquet` is effectively retired.
+2. **"DuckDB is a recipe, not a subcommand" — confirmed from both directions.** `pg-warehouse` demonstrates the embedded path's cost (CGO + the Arrow v18 tail — exactly what would break sluice's CGO=0 Windows builds and the goreleaser cross-compile matrix), and even `pg-cdc` — whose whole product is this space — delegates queries to DuckDB rather than embedding it in the write path.
+3. **Exit-only columnar is the shared posture.** `pg-cdc` is explicitly a "one-way valve … no return path to PG" — the same collapse of the lossless-round-trip type-mapping problem Surface 1 chose.
+
+**Demand-gate update.** Two shipping tools, a Marketplace listing, and the "governed operational data for AI agents" framing are concrete market evidence for the Persona-2/3 demand this doc gated Surface 1 on. Promoted to roadmap **item 63** (export-as-parquet + the DuckDB cookbook recipe). sluice's differentiation is engine breadth: both tools are PG-only; sluice's export would cover MySQL/Vitess/PlanetScale/SQLite/D1 backup chains through the same `BackupStore` path. `pg-cdc`'s Iceberg catalog commit is noted there as a possible extension, not MVP scope.
+
+**Cross-checks that came back clean (verified against sluice's code, no action):** unchanged-TOAST columns already carry the correct preserve-target semantics (`internal/engines/postgres/cdc_reader.go` `decodeTuple`, DataType `'u'` omits the key — not silently NULL); the slot-retention-pressure signal already exists with pre-emptive 70%/85% thresholds (ADR-0059, `slot_health_reporter.go`); and the reader already keepalives an idle slot every 10s (`keepaliveInterval`), covering the Aurora-Serverless idle case. Two genuinely-borrowable hardening ideas were filed as roadmap **item 64**: promoting the ADR-0059 slot-health WARNs (slog-only today) into the ADR-0157 notification sinks, and a backup-store concurrent-writer guard (CAS/ETag + breaker, the `pg-cdc` manifest pattern). RDS/Aurora IAM-token auth rides along there as demand-gated.
+
 ## References
 
 - [`docs/research/apache-arrow-findings.md`](apache-arrow-findings.md) — the prior Arrow research; Shape A deferred.
