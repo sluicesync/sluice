@@ -370,7 +370,8 @@ func decodeMySQLHexToken(s string) (raw []byte, ok bool) {
 // doubled single-quote (which decodes to one `'`), and passes any other raw
 // byte through. An
 // unknown `\x` escape decodes to the literal `x`, matching MySQL's own
-// string-literal parsing. Returns ok=false for a dangling backslash or a string
+// string-literal parsing — except `\%` / `\_`, whose backslash MySQL keeps
+// (LIKE-pattern escapes). Returns ok=false for a dangling backslash or a string
 // with no closing quote. Trailing text after the closing quote is ignored.
 func decodeMySQLQuotedString(s string) (raw []byte, ok bool) {
 	raw, _, ok = scanMySQLQuotedString(s)
@@ -405,7 +406,18 @@ func scanMySQLQuotedString(s string) (raw []byte, end int, ok bool) {
 			if i+1 >= len(s) {
 				return nil, 0, false // dangling backslash
 			}
-			out = append(out, decodeMySQLStringEscape(s[i+1]))
+			// MySQL's string-literal grammar KEEPS the backslash for \% and
+			// \_ (LIKE-pattern escapes: '\%' evaluates to the two bytes
+			// `\%`, not `%` — the manual's string-literal escape table).
+			// Every other unknown escape drops the backslash. Load-bearing
+			// for the mydumper flat-file decode (ADR-0161 §4); unreachable
+			// in practice on the information_schema paths (MySQL's own
+			// literal printing never emits \% / \_).
+			if next := s[i+1]; next == '%' || next == '_' {
+				out = append(out, '\\', next)
+			} else {
+				out = append(out, decodeMySQLStringEscape(next))
+			}
 			i += 2
 		case '\'':
 			if i+1 < len(s) && s[i+1] == '\'' {
