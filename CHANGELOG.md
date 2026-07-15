@@ -4,6 +4,24 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.251] - 2026-07-15
+
+### Added
+
+- **`sluice backup export-as-parquet` — the analytics exit surface (ADR-0164, roadmap item 63).** One-shot, read-only transcode of an existing backup into one zstd Parquet file per table + a `parquet_index.json` export manifest, for ANY source engine's chain (the export reads the engine-neutral chunk format, not any engine), riding the restore-side machinery wholesale: SHA-256-verified chunk reads, encrypted chains via `--encrypt` with GCM AAD binding + plaintext-splice refusal, signed chains via `--verify-key`/`--require-signature` (ADR-0154 policy), and the per-chunk/per-table layer-2 row-count backstops incl. the Bug-183 tamper refusals. Exit-only: sluice never reads its Parquet output back; `restore` keeps the JSON-Lines path; Parquet files are written plaintext even from an encrypted chain. House CLI shape (`--from-dir`/`--from`, `--output-dir`/`--output`, `--include-table`/`--exclude-table`, shared `EncryptionFlags`); the index is written last as the completion/overwrite sentinel (re-export refuses without `--force-overwrite`).
+
+- **Faithful-or-loud type mapping.** Exact DECIMAL over three physical tiers (INT32/INT64/FLBA16, refuse-don't-round); full-range unsigned INT64; micros temporals (timestamptz UTC-adjusted); WKB + GeoParquet footer metadata; enum/set value universes in footer metadata; row groups 1:1 with source chunks and the full source-chunk SHA-256 list in each footer (`sluice:source_chunks` + backup-id/engine provenance keys). Unrepresentable values refuse with the new coded `SLUICE-E-EXPORT-UNREPRESENTABLE` naming column and remedy — multi-dim array values (the silent alternative is exactly Bug 74's flatten), ±838h MySQL `TIME`, NUMERIC NaN/Infinity, precision/scale overflow, sub-µs temporals; exactly two documented string downgrades (unbounded NUMERIC, TIMETZ) WARN with the exact value text. Pinned by the Bug-74 family×shape matrix ground-truthed at raw-value level by parquet-go's own reader, plus a real-Postgres integration ground truth. `--backup-id` exports an earlier segment's snapshot; trailing incrementals WARN with the excluded count, never fold silently (point-in-time = restore + re-export).
+
+- **DuckDB cookbook recipe, never a dependency** (`docs/cookbook/duckdb-on-sluice-backups.md`): `read_parquet` locally/from S3, footer-metadata inspection, GeoParquet via the spatial extension, and the zero-export JSON-Lines path with its caveats. Writer is `parquet-go/parquet-go` v0.30.1 — pure Go, CGO-free, ~6 small transitive modules, no arrow-go, no gRPC.
+
+### Fixed
+
+- **Pre-land value-fidelity review — verdict SHIP (no silent loss); findings folded before release, never in any published version.** Headline: the parquet-go zero-value-as-NULL wart — its map-row deconstruction nulls every Go ZERO value in an optional column (`false`/`0`/`±0.0`/`""` → NULL, silently; invisible to naive round-trips because a null reads back as the zero value) — closed by `boxLeafValue` pointer-boxing every scalar leaf at one chokepoint, pinned per family plus the `TestPin_UnboxedZeroCollapsesToNull` tripwire that fires if a parquet-go upgrade changes upstream's semantics. Also folded: nested `[]string` (2-D text via blobcodec `list_str`) now gets the multi-dim refusal + `--exclude-table` remedy instead of a misleading contract message; the array-element pin matrix gained FLBA16-tier decimal elements (the closest Bug-74 structural analog), int64-tier decimals, `[]byte` empty≠NULL, JSON, time-of-day incl. out-of-day refusal, and full-range unsigned elements; a JSON body of `null` (a PRESENT SQL value) is pinned to export as the `"null"` bytes, never SQL NULL (the `json.RawMessage`-refactor tripwire).
+
+### Compatibility
+
+- **Purely additive; no breaking changes.** One new subcommand, one new coded refusal, one new direct dependency; no flag, default, or behavior change to any existing command, and no change to the backup or restore formats — existing chains export as-is, restore untouched, the export read-only against the store.
+
 ## [0.99.250] - 2026-07-15
 
 ### Added
