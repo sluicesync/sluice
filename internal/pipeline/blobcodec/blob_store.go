@@ -214,6 +214,51 @@ func (s *BlobStore) Put(ctx context.Context, path string, r io.Reader) error {
 	return nil
 }
 
+// PutIfAbsent implements [irbackup.ConditionalPutter] — the optional
+// create-only conditional write the ADR-0161 chain concurrent-writer
+// guard rides on. gocloud's WriterOptions.IfNotExist maps to the
+// backend-native precondition (S3 `If-None-Match: *`, GCS generation-0,
+// Azure `If-None-Match: *`, fileblob O_EXCL), so of any number of
+// concurrent callers for one key, the provider admits exactly one; the
+// losers surface gcerrors.FailedPrecondition, translated here to
+// [irbackup.ErrPathExists] so the caller can tell "another writer won
+// the slot" from transport failures.
+//
+// S3-COMPATIBLE CAVEAT: providers that predate conditional writes may
+// IGNORE the If-None-Match header (silently behaving like Put) or
+// reject it with a non-412 error. The chain guard treats a non-
+// precondition failure as "capability absent at runtime" and degrades
+// with a WARN (see lineage.claimChainGen) rather than bricking backups
+// against such providers.
+func (s *BlobStore) PutIfAbsent(ctx context.Context, path string, r io.Reader) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	key, err := sanitiseBlobKey(path)
+	if err != nil {
+		return err
+	}
+	key = s.joinBlobKey(key)
+	w, err := s.bucket.NewWriter(ctx, key, &blob.WriterOptions{IfNotExist: true})
+	if err != nil {
+		return fmt.Errorf("blob store: open conditional writer for %q: %w", path, err)
+	}
+	if _, err := io.Copy(w, r); err != nil {
+		_ = w.Close()
+		if gcerrors.Code(err) == gcerrors.FailedPrecondition {
+			return fmt.Errorf("blob store: %q: %w", path, irbackup.ErrPathExists)
+		}
+		return fmt.Errorf("blob store: conditional write %q: %w", path, err)
+	}
+	if err := w.Close(); err != nil {
+		if gcerrors.Code(err) == gcerrors.FailedPrecondition {
+			return fmt.Errorf("blob store: %q: %w", path, irbackup.ErrPathExists)
+		}
+		return wrapBlobErr("close conditional writer", path, err)
+	}
+	return nil
+}
+
 // Get implements [irbackup.Store.Get]. Returns a streaming reader for
 // the contents of path; caller closes.
 func (s *BlobStore) Get(ctx context.Context, path string) (io.ReadCloser, error) {
@@ -427,5 +472,9 @@ func wrapBlobErr(op, path string, err error) error {
 	}
 }
 
-// Compile-time check that BlobStore satisfies irbackup.Store.
-var _ irbackup.Store = (*BlobStore)(nil)
+// Compile-time checks that BlobStore satisfies irbackup.Store and the
+// optional conditional-create capability (chain concurrent-writer guard).
+var (
+	_ irbackup.Store             = (*BlobStore)(nil)
+	_ irbackup.ConditionalPutter = (*BlobStore)(nil)
+)

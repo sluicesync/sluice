@@ -65,7 +65,7 @@ func buildSignedChain(t *testing.T) (*memStore, crypto.EnvelopeEncryption, []lin
 	if err := lineage.WriteManifest(ctx, store, full); err != nil {
 		t.Fatal(err)
 	}
-	lineage.UpdateLineageForManifestBestEffort(ctx, store, full, lineage.ManifestFileName, blobcodec.DefaultCodec)
+	_ = lineage.UpdateLineageForManifestBestEffort(ctx, store, full, lineage.ManifestFileName, blobcodec.DefaultCodec)
 
 	incrPath := "manifests/incr-0001.json"
 	incr := &irbackup.Manifest{
@@ -84,7 +84,7 @@ func buildSignedChain(t *testing.T) (*memStore, crypto.EnvelopeEncryption, []lin
 	if err := lineage.WriteManifestAt(ctx, store, incrPath, incr); err != nil {
 		t.Fatal(err)
 	}
-	lineage.UpdateLineageForManifestBestEffort(ctx, store, incr, incrPath, blobcodec.DefaultCodec)
+	_ = lineage.UpdateLineageForManifestBestEffort(ctx, store, incr, incrPath, blobcodec.DefaultCodec)
 
 	// Sign everything at its flat position + the lineage catalog.
 	if err := lineage.ResignLineage(ctx, store, signer); err != nil {
@@ -233,7 +233,7 @@ func TestVerifyChainSignatures_PreV6NoOp(t *testing.T) {
 	if err := lineage.WriteManifest(ctx, store, full); err != nil {
 		t.Fatal(err)
 	}
-	lineage.UpdateLineageForManifestBestEffort(ctx, store, full, lineage.ManifestFileName, blobcodec.DefaultCodec)
+	_ = lineage.UpdateLineageForManifestBestEffort(ctx, store, full, lineage.ManifestFileName, blobcodec.DefaultCodec)
 	links, err := lineage.ListAllSegmentManifests(ctx, store)
 	if err != nil {
 		t.Fatal(err)

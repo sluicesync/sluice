@@ -118,7 +118,7 @@ func TestShouldRotate_AgeFromOpenSegmentFull(t *testing.T) {
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
 	mustWriteManifest(t, store, lineage.ManifestFileName, full)
-	lineage.UpdateLineageForManifestBestEffort(context.Background(), store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
+	_ = lineage.UpdateLineageForManifestBestEffort(context.Background(), store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
 
 	b := &BackupStream{RetainRotateAt: time.Hour, Store: store}
 	if r := b.shouldRotate(context.Background(), 0, created.Add(2*time.Hour)); r != rotationReasonAge {

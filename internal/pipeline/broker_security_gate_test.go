@@ -72,7 +72,7 @@ func TestChainRestore_ChangeChunkTailTruncation_Refused(t *testing.T) {
 			if err := lineage.WriteManifestAt(ctx, store, lineage.ManifestFileName, full); err != nil {
 				t.Fatalf("write full: %v", err)
 			}
-			lineage.UpdateLineageForManifestBestEffort(ctx, store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
+			_ = lineage.UpdateLineageForManifestBestEffort(ctx, store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
 
 			incr := makeManifest(t, irbackup.BackupKindIncremental, full, tc.endLSN)
 			incr.Schema = schema
@@ -88,7 +88,7 @@ func TestChainRestore_ChangeChunkTailTruncation_Refused(t *testing.T) {
 			if err := lineage.WriteManifestAt(ctx, store, incrPath, incr); err != nil {
 				t.Fatalf("write incr: %v", err)
 			}
-			lineage.UpdateLineageForManifestBestEffort(ctx, store, incr, incrPath, blobcodec.CodecGzip)
+			_ = lineage.UpdateLineageForManifestBestEffort(ctx, store, incr, incrPath, blobcodec.CodecGzip)
 
 			tgt := &chainRestoreRecorderEngine{restoreRecorderEngine: newRestoreRecorderEngine("postgres")}
 			err := (&backup.ChainRestore{Target: tgt, TargetDSN: "tgt", Store: store}).Run(ctx)
@@ -176,7 +176,7 @@ func TestChainRestore_EmptiedChangeChunkList_Refused(t *testing.T) {
 			if err := lineage.WriteManifestAt(ctx, store, lineage.ManifestFileName, full); err != nil {
 				t.Fatalf("write full: %v", err)
 			}
-			lineage.UpdateLineageForManifestBestEffort(ctx, store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
+			_ = lineage.UpdateLineageForManifestBestEffort(ctx, store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
 
 			// StartPosition = full's EndPosition (0/100); EndPosition per tc.
 			incr := makeManifest(t, irbackup.BackupKindIncremental, full, tc.endLSN)
@@ -202,7 +202,7 @@ func TestChainRestore_EmptiedChangeChunkList_Refused(t *testing.T) {
 			if err := lineage.WriteManifestAt(ctx, store, incrPath, incr); err != nil {
 				t.Fatalf("write incr: %v", err)
 			}
-			lineage.UpdateLineageForManifestBestEffort(ctx, store, incr, incrPath, blobcodec.CodecGzip)
+			_ = lineage.UpdateLineageForManifestBestEffort(ctx, store, incr, incrPath, blobcodec.CodecGzip)
 
 			tgt := &chainRestoreRecorderEngine{restoreRecorderEngine: newRestoreRecorderEngine("postgres")}
 			err := (&backup.ChainRestore{Target: tgt, TargetDSN: "tgt", Store: store}).Run(ctx)
@@ -386,7 +386,7 @@ func seedPlainChain(t *testing.T) irbackup.Store {
 	if err := lineage.WriteManifestAt(ctx, store, lineage.ManifestFileName, full); err != nil {
 		t.Fatalf("write full: %v", err)
 	}
-	lineage.UpdateLineageForManifestBestEffort(ctx, store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
+	_ = lineage.UpdateLineageForManifestBestEffort(ctx, store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
 
 	incr := makeManifest(t, irbackup.BackupKindIncremental, full, "0/202")
 	incr.Schema = schema
@@ -402,7 +402,7 @@ func seedPlainChain(t *testing.T) irbackup.Store {
 	if err := lineage.WriteManifestAt(ctx, store, incrPath, incr); err != nil {
 		t.Fatalf("write incr: %v", err)
 	}
-	lineage.UpdateLineageForManifestBestEffort(ctx, store, incr, incrPath, blobcodec.CodecGzip)
+	_ = lineage.UpdateLineageForManifestBestEffort(ctx, store, incr, incrPath, blobcodec.CodecGzip)
 	return store
 }
 

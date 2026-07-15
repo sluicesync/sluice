@@ -120,7 +120,10 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 		now = time.Now
 	}
 
-	cat, ok, err := lineage.LoadLineageCatalog(ctx, store)
+	// Load FOR UPDATE (ADR-0161): the catalog commit below is a CAS on
+	// the chain write-generation observed here, so a backup / compact
+	// landing mid-prune conflicts loudly instead of being clobbered.
+	cat, ok, err := lineage.LoadLineageCatalogForUpdate(ctx, store)
 	if err != nil {
 		return nil, fmt.Errorf("prune: load lineage catalog: %w", err)
 	}
@@ -207,10 +210,8 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 		Pruned: make([]string, 0, len(dropped)),
 	}
 
-	// 1. Delete whole leading segments [RestorableFromSegment, floorSeg).
-	pruneWholeSegments(ctx, store, cat, floorSeg, opts.DryRun, res)
-
-	// 2. Delete the leading incrementals within the floor segment.
+	// Deletion boundaries. The physical deletes themselves run AFTER the
+	// catalog commit below (ADR-0161) — see the post-commit delete pass.
 	floor := &cat.Segments[floorSeg]
 	floorStore := floor.Store(store)
 	keepFromInSeg := 0
@@ -220,7 +221,11 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 		// Everything dropped — keep the floor segment's full only.
 		keepFromInSeg = len(floor.Incrementals)
 	}
-	pruneFloorLeadingIncrementals(ctx, floor, floorStore, keepFromInSeg, opts.DryRun, res)
+	// Snapshot the pre-prune catalog shape for the post-commit delete
+	// pass: cat.Segments is reassigned below, but the helpers enumerate
+	// the ORIGINAL segments/incrementals being dropped. Shallow copy is
+	// enough — the original backing array is never mutated.
+	origCat := *cat
 
 	// Build the post-prune lineage: drop whole leading segments, trim
 	// the floor segment's incrementals, advance the restore floor.
@@ -271,8 +276,18 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 	}
 
 	if opts.DryRun {
+		// Enumerate (without deleting) what a real run would drop.
+		pruneWholeSegments(ctx, store, &origCat, floorSeg, true, res)
+		pruneFloorLeadingIncrementals(ctx, floor, floorStore, keepFromInSeg, true, res)
 		return res, nil
 	}
+	// Catalog commit FIRST (the ADR-0161 CAS linearization point, and the
+	// same commit-then-sweep order compaction uses): the loud concurrent-
+	// writer refusal — or a crash — before this write leaves the chain
+	// byte-untouched, and after it leaves only orphaned (already-
+	// uncatalogued) files for the delete pass below. The pre-ADR-0161
+	// order deleted first, so a failed catalog write stranded a catalog
+	// referencing deleted manifests.
 	cat.UpdatedAt = now().UTC()
 	if err := lineage.WriteLineageCatalog(ctx, store, cat); err != nil {
 		return nil, fmt.Errorf("prune: rewrite lineage catalog: %w", err)
@@ -281,6 +296,11 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 	if err := resignIfSigned(ctx, store, signed, opts.Signer); err != nil {
 		return nil, fmt.Errorf("prune: re-sign pruned chain: %w", err)
 	}
+	// Post-commit delete pass: everything the new catalog no longer
+	// references. Per-file failures are already best-effort inside the
+	// helpers (a leaked orphan is disk, not correctness).
+	pruneWholeSegments(ctx, store, &origCat, floorSeg, false, res)
+	pruneFloorLeadingIncrementals(ctx, floor, floorStore, keepFromInSeg, false, res)
 	slog.InfoContext(
 		ctx, "prune: lineage pruned",
 		slog.Int("segments_dropped", res.SegmentsDropped),

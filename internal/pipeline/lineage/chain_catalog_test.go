@@ -214,7 +214,7 @@ func TestUpdateLineageForManifest_SeedsAndAppends(t *testing.T) {
 		PartialState: irbackup.BackupStateComplete,
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
-	UpdateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, blobcodec.CodecZstd)
+	_ = UpdateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, blobcodec.CodecZstd)
 	cat, ok, _ := LoadLineageCatalog(context.Background(), store)
 	if !ok || len(cat.Segments) != 1 || cat.Segments[0].CodecOrDefault() != blobcodec.CodecZstd {
 		t.Fatalf("after full: %+v; want one zstd segment", cat)
@@ -229,7 +229,7 @@ func TestUpdateLineageForManifest_SeedsAndAppends(t *testing.T) {
 		PartialState:   irbackup.BackupStateComplete,
 	}
 	incr.BackupID = irbackup.ComputeBackupID(incr)
-	UpdateLineageForManifestBestEffort(context.Background(), store, incr, "manifests/incr-1.json", blobcodec.CodecZstd)
+	_ = UpdateLineageForManifestBestEffort(context.Background(), store, incr, "manifests/incr-1.json", blobcodec.CodecZstd)
 	cat, _, _ = LoadLineageCatalog(context.Background(), store)
 	if len(cat.Segments) != 1 || len(cat.Segments[0].Incrementals) != 1 ||
 		cat.Segments[0].Incrementals[0] != "manifests/incr-1.json" {
@@ -239,7 +239,7 @@ func TestUpdateLineageForManifest_SeedsAndAppends(t *testing.T) {
 		t.Errorf("open segment EndPosition = %q; want 0/200", cat.Segments[0].EndPosition.Token)
 	}
 	// Dedup: re-writing the same path doesn't double-append.
-	UpdateLineageForManifestBestEffort(context.Background(), store, incr, "manifests/incr-1.json", blobcodec.CodecZstd)
+	_ = UpdateLineageForManifestBestEffort(context.Background(), store, incr, "manifests/incr-1.json", blobcodec.CodecZstd)
 	cat, _, _ = LoadLineageCatalog(context.Background(), store)
 	if len(cat.Segments[0].Incrementals) != 1 {
 		t.Errorf("re-write incrementals = %d; want 1 (deduped)", len(cat.Segments[0].Incrementals))

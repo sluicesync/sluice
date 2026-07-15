@@ -73,6 +73,7 @@ const (
 	CodeBackupChunkCorrupt         Code = "SLUICE-E-BACKUP-CHUNK-CORRUPT"
 	CodeBackupIncomplete           Code = "SLUICE-E-BACKUP-INCOMPLETE"
 	CodeBackupManifestInvalid      Code = "SLUICE-E-BACKUP-MANIFEST-INVALID"
+	CodeBackupChainConflict        Code = "SLUICE-E-BACKUP-CHAIN-CONFLICT"
 
 	CodeBackfillNoPrimaryKey      Code = "SLUICE-E-BACKFILL-NO-PRIMARY-KEY"
 	CodeBackfillUnsupportedEngine Code = "SLUICE-E-BACKFILL-UNSUPPORTED-ENGINE"
@@ -135,6 +136,7 @@ var registry = map[Code]Info{
 	CodeBackupChunkCorrupt:         {ClassRefusal, "a backup chunk's stored bytes do not match the SHA-256 recorded for it in the manifest — at-rest corruption / bit-rot, or a tamper that altered the stored bytes; caught by rehashing at restore, broker replay, and backup verify, before decryption, so it fires on plaintext and encrypted chunks alike (the integrity twin of -CHUNK-AUTH-FAILED, which is the GCM/AAD check)"},
 	CodeBackupIncomplete:           {ClassRefusal, "a restored/replayed incremental applied fewer changes than its manifest records (its change-chunk tail was truncated, or a table's chunk row-count was zeroed) — the signing-independent backstop against silent tail-truncation of an unsigned incremental"},
 	CodeBackupManifestInvalid:      {ClassRefusal, "a backup manifest's recorded BackupID does not match its content — a BackupID-covered field (created_at / source_engine / kind / EndPosition) was edited without recomputing the id (corruption or lazy tamper)"},
+	CodeBackupChainConflict:        {ClassRefusal, "another writer advanced this backup chain's lineage mid-operation (a duplicate cron backup incremental, a backup racing a compact/prune, or an operator double-start) — the conditional catalog write refused rather than interleave; no catalog change was written"},
 
 	CodeBackfillNoPrimaryKey:      {ClassRefusal, "backfill refused: the table has no usable orderable primary key to drive the keyset-chunked walk"},
 	CodeBackfillUnsupportedEngine: {ClassRefusal, "backfill refused: the engine does not implement the in-place backfill surface"},

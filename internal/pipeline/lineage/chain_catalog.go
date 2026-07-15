@@ -53,6 +53,7 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // LineageCatalogFileName is the filename of the lineage catalog within
@@ -89,6 +90,16 @@ type Catalog struct {
 	// advances it as it drops leading whole segments. Restore refuses
 	// to start before this segment. Zero on an unpruned lineage.
 	RestorableFromSegment int `json:"restorable_from_segment"`
+
+	// guardGen / guardObserved carry the ADR-0161 concurrent-writer
+	// guard's observation from [LoadLineageCatalogForUpdate] to
+	// [WriteLineageCatalog]: the chain write-generation listed BEFORE
+	// this catalog was read, arming the write's compare-and-swap.
+	// Unexported by design — never serialized, and a catalog that was
+	// not loaded for update (read paths, test fixtures) writes
+	// unguarded, today's behavior.
+	guardGen      uint64
+	guardObserved bool
 }
 
 // Segment is one segment within a lineage: a `backup full`
@@ -271,13 +282,42 @@ func LoadLineageCatalog(ctx context.Context, store irbackup.Store) (*Catalog, bo
 // no window in which the lineage is non-authoritative. Atomic at the
 // storage layer from any reader's perspective (object stores: a Put is
 // all-or-nothing; local FS: write-tmp + rename inside LocalStore).
+//
+// ADR-0161: a catalog loaded via [LoadLineageCatalogForUpdate] carries
+// the chain write-generation observed before its read; on a store with
+// the [irbackup.ConditionalPutter] capability this write first CLAIMS
+// the next generation, refusing loudly (coded
+// [sluicecode.CodeBackupChainConflict]) when another writer advanced
+// the chain in between — the catalog is then NOT written. An unstamped
+// catalog (read-path loads, test fixtures) writes unguarded.
 func WriteLineageCatalog(ctx context.Context, store irbackup.Store, cat *Catalog) error {
 	cat.FormatVersion = lineageCatalogFormatVersion
 	b, err := json.MarshalIndent(cat, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal lineage catalog: %w", err)
 	}
-	return store.Put(ctx, LineageCatalogFileName, bytes.NewReader(b))
+	claimed := false
+	if cp, ok := store.(irbackup.ConditionalPutter); ok && cat.guardObserved {
+		won, err := claimChainGen(ctx, cp, cat.guardGen+1, cat.SluiceVersion)
+		if err != nil {
+			return err // the coded concurrent-writer refusal; catalog untouched
+		}
+		if won {
+			// Advance the stamp as soon as the slot is OURS (not after the
+			// Put): a second write of this same loaded catalog — including
+			// a retry after a failed Put — claims the slot AFTER its own
+			// rather than self-conflicting on a generation it consumed.
+			cat.guardGen++
+			claimed = true
+		}
+	}
+	if err := store.Put(ctx, LineageCatalogFileName, bytes.NewReader(b)); err != nil {
+		return err
+	}
+	if claimed {
+		gcChainGenMarkers(ctx, store, cat.guardGen)
+	}
+	return nil
 }
 
 // SegmentRecord pairs a parsed manifest with the path it loaded from
@@ -456,20 +496,33 @@ func ListAllSegmentManifests(ctx context.Context, store irbackup.Store) ([]Segme
 // WARN-logged and recovered on the next write. The codec is recorded
 // from the supplied value so the open segment's Codec is pinned on
 // first write and never changes mid-segment.
+//
+// ONE error class is never swallowed: the ADR-0161 concurrent-writer
+// conflict (coded [sluicecode.CodeBackupChainConflict]) is returned to
+// the caller. A conflict is not a transient store hiccup — it is
+// evidence a SECOND writer is interleaving this chain (a duplicate
+// cron, a racing compact/prune), and the next write would not heal
+// that; the operator must be told loudly.
 func UpdateLineageForManifestBestEffort(
 	ctx context.Context,
 	store irbackup.Store,
 	manifest *irbackup.Manifest,
 	manifestPath string,
 	codec blobcodec.Codec,
-) {
-	if err := UpdateLineageForManifest(ctx, store, manifest, manifestPath, codec); err != nil {
-		slog.WarnContext(
-			ctx, "lineage catalog update failed; lineage.json may be stale until next write",
-			slog.String("manifest_path", manifestPath),
-			slog.String("err", err.Error()),
-		)
+) error {
+	err := UpdateLineageForManifest(ctx, store, manifest, manifestPath, codec)
+	if err == nil {
+		return nil
 	}
+	if ce, ok := sluicecode.FromError(err); ok && ce.Code == sluicecode.CodeBackupChainConflict {
+		return err
+	}
+	slog.WarnContext(
+		ctx, "lineage catalog update failed; lineage.json may be stale until next write",
+		slog.String("manifest_path", manifestPath),
+		slog.String("err", err.Error()),
+	)
+	return nil
 }
 
 // UpdateLineageForManifest is the fail-loud counterpart of
@@ -489,14 +542,16 @@ func UpdateLineageForManifest(
 	if manifest == nil {
 		return errors.New("lineage catalog: nil manifest")
 	}
-	cat, ok, err := LoadLineageCatalog(ctx, store)
+	cat, ok, guard, err := loadCatalogForUpdate(ctx, store)
 	if err != nil {
 		return err
 	}
 	now := time.Now().UTC()
 	if !ok {
 		// First lineage.json write for this backup. Seed a single root
-		// segment over the conventional layout (Dir == "").
+		// segment over the conventional layout (Dir == ""), stamped with
+		// the ADR-0161 observation so even the seeding write is a CAS —
+		// two writers racing to seed one chain conflict loudly.
 		cat = &Catalog{
 			FormatVersion: lineageCatalogFormatVersion,
 			SourceEngine:  manifest.SourceEngine,
@@ -509,6 +564,7 @@ func UpdateLineageForManifest(
 				Codec:            blobcodec.ResolveCodec(codec),
 			}},
 		}
+		stampChainGuard(cat, guard)
 	}
 	seg := &cat.Segments[len(cat.Segments)-1] // the open segment
 	switch CanonicalKind(manifest.Kind) {
@@ -633,6 +689,14 @@ func CanonicalKind(kind string) string {
 // plaintext chains). Only a chain with NO chunks at all falls back to
 // [blobcodec.DefaultCodec], with a WARN naming the assumption.
 func RebuildLineageCatalogAt(ctx context.Context, store irbackup.Store, env crypto.EnvelopeEncryption) (segments, manifests int, err error) {
+	// ADR-0161: observe the chain write-generation BEFORE the walk, so
+	// the rebuild's catalog write below is a CAS — a live writer landing
+	// mid-rebuild conflicts loudly instead of being clobbered by (or
+	// clobbering) the rebuilt record.
+	genN, genObserved, err := observeChainGen(ctx, store)
+	if err != nil {
+		return 0, 0, fmt.Errorf("rebuild: %w", err)
+	}
 	recs, err := ListAllManifestsViaWalk(ctx, store)
 	if err != nil {
 		return 0, 0, err
@@ -689,6 +753,7 @@ func RebuildLineageCatalogAt(ctx context.Context, store irbackup.Store, env cryp
 		UpdatedAt:     now,
 		Segments:      []Segment{root},
 	}
+	stampChainGuard(cat, chainGuardStamp{gen: genN, observed: genObserved})
 	if err := WriteLineageCatalog(ctx, store, cat); err != nil {
 		return 0, 0, err
 	}
@@ -725,7 +790,7 @@ func RebuildLineageCatalogAt(ctx context.Context, store irbackup.Store, env cryp
 // unreachable manifest) — those are left for restore's strict check to
 // surface rather than masked by a heuristic repair.
 func ReconcileOpenSegmentCatalog(ctx context.Context, rootStore, segStore irbackup.Store) error {
-	cat, ok, err := LoadLineageCatalog(ctx, rootStore)
+	cat, ok, err := LoadLineageCatalogForUpdate(ctx, rootStore)
 	if err != nil || !ok || len(cat.Segments) == 0 {
 		return err // nothing catalogued yet — fresh start, nothing to heal
 	}

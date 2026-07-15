@@ -47,7 +47,7 @@ func buildEd25519SignedChain(t *testing.T) (*memStore, ed25519.PublicKey, []line
 	if err := lineage.WriteManifest(ctx, store, full); err != nil {
 		t.Fatal(err)
 	}
-	lineage.UpdateLineageForManifestBestEffort(ctx, store, full, lineage.ManifestFileName, blobcodec.DefaultCodec)
+	_ = lineage.UpdateLineageForManifestBestEffort(ctx, store, full, lineage.ManifestFileName, blobcodec.DefaultCodec)
 
 	incrPath := "manifests/incr-0001.json"
 	incr := &irbackup.Manifest{
@@ -66,7 +66,7 @@ func buildEd25519SignedChain(t *testing.T) (*memStore, ed25519.PublicKey, []line
 	if err := lineage.WriteManifestAt(ctx, store, incrPath, incr); err != nil {
 		t.Fatal(err)
 	}
-	lineage.UpdateLineageForManifestBestEffort(ctx, store, incr, incrPath, blobcodec.DefaultCodec)
+	_ = lineage.UpdateLineageForManifestBestEffort(ctx, store, incr, incrPath, blobcodec.DefaultCodec)
 
 	if err := lineage.ResignLineage(ctx, store, signer); err != nil {
 		t.Fatal(err)

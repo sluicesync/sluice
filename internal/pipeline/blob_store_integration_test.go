@@ -15,6 +15,7 @@ package pipeline
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -34,6 +35,7 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
+	"sluicesync.dev/sluice/internal/sluicecode"
 
 	// Both engines registered for the cross-engine test.
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
@@ -239,6 +241,93 @@ func TestBlobStore_MinIO_RoundTrip(t *testing.T) {
 	// Idempotent Delete.
 	if err := store.Delete(context.Background(), "manifest.json"); err != nil {
 		t.Errorf("idempotent Delete: %v", err)
+	}
+}
+
+// TestBlobStore_MinIO_ConditionalPutChainGuard pins the ADR-0161 chain
+// concurrent-writer guard's S3 leg against a REAL S3-compatible server:
+// gocloud's WriterOptions.IfNotExist becomes an `If-None-Match: *`
+// conditional PUT on the wire, and MinIO (like AWS S3 since 2024)
+// enforces it server-side. Two layers:
+//
+//  1. the raw PutIfAbsent contract (exactly one winner, loser gets
+//     irbackup.ErrPathExists, winner's content intact) — proving the
+//     server ENFORCES the precondition rather than ignoring the header
+//     (an ignoring server would make the second create succeed and
+//     fail this test loudly);
+//  2. the full guard through the lineage layer: two interleaved
+//     catalog writers on the S3 store — first wins, second refuses
+//     with the coded SLUICE-E-BACKUP-CHAIN-CONFLICT.
+func TestBlobStore_MinIO_ConditionalPutChainGuard(t *testing.T) {
+	endpoint, bucket, cleanup := startMinIO(t)
+	defer cleanup()
+	store, storeCleanup := minioBlobStore(t, endpoint, bucket, "guard/")
+	defer storeCleanup()
+	ctx := context.Background()
+
+	// Layer 1: the raw conditional-PUT contract on the wire.
+	first := []byte(`{"claimed_at":"first"}`)
+	if err := store.PutIfAbsent(ctx, "lineage.gen/g-00000000000000000001", bytes.NewReader(first)); err != nil {
+		t.Fatalf("first PutIfAbsent: %v", err)
+	}
+	err := store.PutIfAbsent(ctx, "lineage.gen/g-00000000000000000001", bytes.NewReader([]byte(`{"claimed_at":"second"}`)))
+	if err == nil {
+		t.Fatal("second PutIfAbsent = nil; the server did not enforce If-None-Match — the chain guard would be inert on this backend")
+	}
+	if !errors.Is(err, irbackup.ErrPathExists) {
+		t.Fatalf("second PutIfAbsent = %v; want an error wrapping irbackup.ErrPathExists (the 412 precondition mapping)", err)
+	}
+	rc, err := store.Get(ctx, "lineage.gen/g-00000000000000000001")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	got, err := io.ReadAll(rc)
+	_ = rc.Close()
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !bytes.Equal(got, first) {
+		t.Errorf("marker content = %q; want the first writer's %q", got, first)
+	}
+
+	// Layer 2: the guard end-to-end through the lineage catalog RMW.
+	seed := &lineage.Catalog{
+		SourceEngine: "postgres",
+		Segments: []lineage.Segment{{
+			SegmentID:        "seg0",
+			FullManifestPath: lineage.ManifestFileName,
+		}},
+	}
+	if err := lineage.WriteLineageCatalog(ctx, store, seed); err != nil {
+		t.Fatalf("seed catalog write: %v", err)
+	}
+	a, okA, err := lineage.LoadLineageCatalogForUpdate(ctx, store)
+	if err != nil || !okA {
+		t.Fatalf("writer A load: ok=%v err=%v", okA, err)
+	}
+	b, okB, err := lineage.LoadLineageCatalogForUpdate(ctx, store)
+	if err != nil || !okB {
+		t.Fatalf("writer B load: ok=%v err=%v", okB, err)
+	}
+	a.Segments[0].Incrementals = []string{"manifests/incr-a.json"}
+	if err := lineage.WriteLineageCatalog(ctx, store, a); err != nil {
+		t.Fatalf("writer A write: %v", err)
+	}
+	b.Segments[0].Incrementals = []string{"manifests/incr-b.json"}
+	err = lineage.WriteLineageCatalog(ctx, store, b)
+	if err == nil {
+		t.Fatal("writer B write = nil; want the concurrent-writer refusal")
+	}
+	ce, coded := sluicecode.FromError(err)
+	if !coded || ce.Code != sluicecode.CodeBackupChainConflict {
+		t.Fatalf("writer B err = %v; want code %s", err, sluicecode.CodeBackupChainConflict)
+	}
+	final, okF, err := lineage.LoadLineageCatalog(ctx, store)
+	if err != nil || !okF {
+		t.Fatalf("reload: ok=%v err=%v", okF, err)
+	}
+	if final.Segments[0].Incrementals[0] != "manifests/incr-a.json" {
+		t.Errorf("catalog after conflict = %v; want writer A's update intact", final.Segments[0].Incrementals)
 	}
 }
 

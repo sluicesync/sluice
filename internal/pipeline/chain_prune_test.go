@@ -316,7 +316,7 @@ func TestSchemaHistoryRetentionFloor_Incomparable(t *testing.T) {
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
 	mustWriteManifest(t, store, lineage.ManifestFileName, full)
-	lineage.UpdateLineageForManifestBestEffort(context.Background(), store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
+	_ = lineage.UpdateLineageForManifestBestEffort(context.Background(), store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
 
 	live := ir.Position{Engine: "postgres", Token: "incomparable:B"}
 	_, _, err := backup.SchemaHistoryRetentionFloor(context.Background(), store, live, stubOrderer{})
@@ -339,7 +339,7 @@ func seedLineageChain(t *testing.T, store irbackup.Store, incrementals int) time
 	}
 	full.BackupID = irbackup.ComputeBackupID(full)
 	mustWriteManifest(t, store, lineage.ManifestFileName, full)
-	lineage.UpdateLineageForManifestBestEffort(context.Background(), store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
+	_ = lineage.UpdateLineageForManifestBestEffort(context.Background(), store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
 	parent := full.BackupID
 	for i := 1; i <= incrementals; i++ {
 		m := &irbackup.Manifest{
@@ -353,7 +353,7 @@ func seedLineageChain(t *testing.T, store irbackup.Store, incrementals int) time
 		m.BackupID = irbackup.ComputeBackupID(m)
 		path := "manifests/incr-000" + string(rune('0'+i)) + ".json"
 		mustWriteManifest(t, store, path, m)
-		lineage.UpdateLineageForManifestBestEffort(context.Background(), store, m, path, blobcodec.CodecGzip)
+		_ = lineage.UpdateLineageForManifestBestEffort(context.Background(), store, m, path, blobcodec.CodecGzip)
 		parent = m.BackupID
 	}
 	return base

@@ -50,7 +50,7 @@ func TestVerifyBackupWith_KeyAgainstPlaintextChain_Refused(t *testing.T) {
 		if err := lineage.WriteManifestAt(ctx, store, lineage.ManifestFileName, full); err != nil {
 			t.Fatalf("write full: %v", err)
 		}
-		lineage.UpdateLineageForManifestBestEffort(ctx, store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
+		_ = lineage.UpdateLineageForManifestBestEffort(ctx, store, full, lineage.ManifestFileName, blobcodec.CodecGzip)
 		return store
 	}
 

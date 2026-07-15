@@ -162,6 +162,52 @@ func (s *LocalStore) Append(ctx context.Context, path string, r io.Reader) error
 	return nil
 }
 
+// PutIfAbsent implements [irbackup.ConditionalPutter] — the optional
+// create-only conditional write the ADR-0161 chain concurrent-writer
+// guard rides on. O_EXCL makes the create itself the atomic claim: of
+// any number of concurrent callers for one path, exactly one open
+// succeeds and the rest fail with [irbackup.ErrPathExists].
+//
+// Deliberately NOT tmp+rename like Put: the exclusive create IS the
+// arbitration, and renaming over the path would clobber a concurrent
+// winner. A write failure after a successful create removes the file
+// (best-effort) so a half-written claim doesn't squat on the slot.
+func (s *LocalStore) PutIfAbsent(ctx context.Context, path string, r io.Reader) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	abs, err := s.absPath(path)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
+		return fmt.Errorf("local store: mkdir for %q: %w", path, err)
+	}
+	// 0600 like Put — see the NewLocalStore doc comment.
+	f, err := os.OpenFile(abs, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return fmt.Errorf("local store: %q: %w", path, irbackup.ErrPathExists)
+		}
+		return fmt.Errorf("local store: create-if-absent %q: %w", path, err)
+	}
+	if _, err := io.Copy(f, r); err != nil {
+		_ = f.Close()
+		_ = os.Remove(abs)
+		return fmt.Errorf("local store: write %q: %w", path, err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(abs)
+		return fmt.Errorf("local store: sync %q: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(abs)
+		return fmt.Errorf("local store: close %q: %w", path, err)
+	}
+	return nil
+}
+
 // Get implements [irbackup.Store.Get].
 func (s *LocalStore) Get(ctx context.Context, path string) (io.ReadCloser, error) {
 	if err := ctx.Err(); err != nil {
@@ -291,8 +337,10 @@ func (s *LocalStore) absPath(path string) (string, error) {
 }
 
 // Compile-time checks that LocalStore satisfies irbackup.Store and the
-// optional append capability the progress sidecar rides on.
+// optional capabilities: append (progress sidecar) and conditional
+// create (chain concurrent-writer guard).
 var (
-	_ irbackup.Store    = (*LocalStore)(nil)
-	_ irbackup.Appender = (*LocalStore)(nil)
+	_ irbackup.Store             = (*LocalStore)(nil)
+	_ irbackup.Appender          = (*LocalStore)(nil)
+	_ irbackup.ConditionalPutter = (*LocalStore)(nil)
 )

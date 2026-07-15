@@ -232,7 +232,13 @@ func (b *BackupStream) shouldRotate(ctx context.Context, openSegRolloverSeq int,
 func (b *BackupStream) performRotation(ctx context.Context, in rotateInputs) (rotateResult, error) {
 	var zero rotateResult
 
-	cat, ok, err := lineage.LoadLineageCatalog(ctx, b.Store)
+	// Load FOR UPDATE (ADR-0161): the COMMIT write at the end of the FSM
+	// is a CAS on the chain write-generation observed here — a concurrent
+	// one-shot incremental / compact / prune landing during the (long)
+	// next-segment bulk copy makes the COMMIT conflict, which aborts
+	// stay-open (provisional discarded, prior segment intact) rather than
+	// clobbering the other writer's catalog update.
+	cat, ok, err := lineage.LoadLineageCatalogForUpdate(ctx, b.Store)
 	if err != nil {
 		return zero, fmt.Errorf("load lineage: %w", err)
 	}

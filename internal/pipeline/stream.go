@@ -67,6 +67,7 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/progress"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // DefaultRolloverWindow is the wall-clock cadence each rollover commits
@@ -405,34 +406,7 @@ func (b *BackupStream) Run(ctx context.Context) error {
 			// manifest write so a store call against the just-
 			// cancelled parent doesn't short-circuit the commit.
 			if errors.Is(rErr, context.Canceled) || errors.Is(rErr, context.DeadlineExceeded) {
-				if roll.Manifest != nil && len(roll.Manifest.ChangeChunks) > 0 {
-					commitCtx, commitCancel := context.WithTimeout(context.WithoutCancel(ctx), stopDrainTimeout)
-					manifestPath := buildIncrementalManifestPath(roll.Manifest)
-					if err := lineage.WriteManifestAt(commitCtx, b.segStore, manifestPath, roll.Manifest); err != nil {
-						slog.WarnContext(
-							ctx, "stream: drain-commit of in-flight manifest failed",
-							slog.String("err", err.Error()),
-						)
-					} else {
-						// ADR-0046: append to the open segment in
-						// lineage.json on the drain-commit path too.
-						lineage.UpdateLineageForManifestBestEffort(commitCtx, b.Store, roll.Manifest, manifestPath, b.segCodec)
-						slog.InfoContext(
-							ctx, "stream rollover committed (drain on ctx-cancel)",
-							slog.String("manifest_path", manifestPath),
-							slog.String("backup_id", roll.Manifest.BackupID),
-							slog.Int64("changes", roll.TotalChanges),
-							slog.Int64("bytes", roll.TotalBytes),
-							slog.Duration("elapsed", elapsed),
-						)
-					}
-					commitCancel()
-				} else {
-					slog.InfoContext(
-						ctx, "stream: context cancelled during rollover; in-flight rollover not committed",
-						slog.Duration("elapsed", elapsed),
-					)
-				}
+				b.drainCommitInFlightRollover(ctx, roll, elapsed)
 				return nil
 			}
 			// GitHub #22: classify the rollover error; if it satisfies
@@ -922,6 +896,56 @@ func (b *BackupStream) handleEmptyRollover(ctx context.Context, roll rolloverOut
 	return false
 }
 
+// drainCommitInFlightRollover finalises a rollover interrupted by ctx
+// cancel (the design doc's SIGTERM contract): chunks were already
+// flushed inside captureWindow, so committing the manifest here keeps
+// every change observed before the cancel in the chain. Uses a fresh
+// stopDrainTimeout-bounded ctx for the store writes so a call against
+// the just-cancelled parent doesn't short-circuit the commit. A
+// rollover with no change chunks has nothing to commit.
+//
+// Best-effort by design — the stream is exiting either way. An
+// ADR-0161 concurrent-writer conflict on the lineage append is
+// WARN-logged (with its code) rather than failing the exit: the
+// manifest is durable and the next resume's reconcile re-catalogs it,
+// while that resume's own guarded writes surface a persistent
+// dual-writer loudly.
+func (b *BackupStream) drainCommitInFlightRollover(ctx context.Context, roll rolloverOutcome, elapsed time.Duration) {
+	if roll.Manifest == nil || len(roll.Manifest.ChangeChunks) == 0 {
+		slog.InfoContext(
+			ctx, "stream: context cancelled during rollover; in-flight rollover not committed",
+			slog.Duration("elapsed", elapsed),
+		)
+		return
+	}
+	commitCtx, commitCancel := context.WithTimeout(context.WithoutCancel(ctx), stopDrainTimeout)
+	defer commitCancel()
+	manifestPath := buildIncrementalManifestPath(roll.Manifest)
+	if err := lineage.WriteManifestAt(commitCtx, b.segStore, manifestPath, roll.Manifest); err != nil {
+		slog.WarnContext(
+			ctx, "stream: drain-commit of in-flight manifest failed",
+			slog.String("err", err.Error()),
+		)
+		return
+	}
+	// ADR-0046: append to the open segment in lineage.json on the
+	// drain-commit path too.
+	if uerr := lineage.UpdateLineageForManifestBestEffort(commitCtx, b.Store, roll.Manifest, manifestPath, b.segCodec); uerr != nil {
+		slog.WarnContext(
+			ctx, "stream: drain-commit lineage append refused (concurrent chain writer); the manifest is durable and the next resume re-catalogs it",
+			append([]any{slog.String("err", uerr.Error())}, sluicecode.Attrs(uerr)...)...,
+		)
+	}
+	slog.InfoContext(
+		ctx, "stream rollover committed (drain on ctx-cancel)",
+		slog.String("manifest_path", manifestPath),
+		slog.String("backup_id", roll.Manifest.BackupID),
+		slog.Int64("changes", roll.TotalChanges),
+		slog.Int64("bytes", roll.TotalBytes),
+		slog.Duration("elapsed", elapsed),
+	)
+}
+
 // commitRollover writes a rollover's manifest, appends it to the open
 // segment, releases the chain-ack window, and heartbeats the liveness
 // file. It returns exit=true when a stop was observed (Run returns nil),
@@ -933,8 +957,13 @@ func (b *BackupStream) commitRollover(ctx context.Context, roll rolloverOutcome,
 		return rolloverCommit{}, fmt.Errorf("stream: write rollover manifest: %w", err)
 	}
 	// ADR-0046: append this rollover to the open segment in lineage.json
-	// (best-effort for the non-rotation path).
-	lineage.UpdateLineageForManifestBestEffort(ctx, b.Store, roll.Manifest, manifestPath, b.segCodec)
+	// (best-effort for the non-rotation path). An ADR-0161 concurrent-
+	// writer conflict fails the stream loudly: a second writer is
+	// interleaving this chain (the manifest above is durable; only the
+	// catalog append was refused).
+	if err := lineage.UpdateLineageForManifestBestEffort(ctx, b.Store, roll.Manifest, manifestPath, b.segCodec); err != nil {
+		return rolloverCommit{}, fmt.Errorf("stream: lineage catalog: %w", err)
+	}
 	// The rollover is durable — let the slot release its window's WAL (this
 	// is what bounds source WAL retention to ~one rollover window).
 	releaseChainAckTo(ctx, cdc, roll.Manifest.EndPosition)

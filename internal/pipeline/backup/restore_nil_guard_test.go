@@ -75,7 +75,7 @@ func TestRestoreRun_NullStructuralElement_CodedNotPanic(t *testing.T) {
 			if err := lineage.WriteManifest(ctx, store, tc.manifest); err != nil {
 				t.Fatal(err)
 			}
-			lineage.UpdateLineageForManifestBestEffort(ctx, store, tc.manifest, lineage.ManifestFileName, blobcodec.DefaultCodec)
+			_ = lineage.UpdateLineageForManifestBestEffort(ctx, store, tc.manifest, lineage.ManifestFileName, blobcodec.DefaultCodec)
 
 			// The single-full lineage takes Restore.Run's single-manifest path;
 			// the guard must fire (before any chunk traversal) with the coded
@@ -123,7 +123,7 @@ func TestVerifyBackupWith_NullStructuralElement_CodedNotPanic(t *testing.T) {
 			if err := lineage.WriteManifest(ctx, store, tc.manifest); err != nil {
 				t.Fatal(err)
 			}
-			lineage.UpdateLineageForManifestBestEffort(ctx, store, tc.manifest, lineage.ManifestFileName, blobcodec.DefaultCodec)
+			_ = lineage.UpdateLineageForManifestBestEffort(ctx, store, tc.manifest, lineage.ManifestFileName, blobcodec.DefaultCodec)
 
 			// The rehash traversal would nil-deref here before the fix.
 			_, _, err := VerifyBackupWith(ctx, store, VerifyOptions{})

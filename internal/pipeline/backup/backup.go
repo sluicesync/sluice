@@ -597,8 +597,13 @@ func (b *Backup) Run(ctx context.Context) error {
 	// of a one-segment lineage at the conventional root (Dir == "").
 	// Best-effort — the manifest file is authoritative for the
 	// one-segment shape; lineage.json is the O(1) segment-shape +
-	// recorded-codec accelerator.
-	lineage.UpdateLineageForManifestBestEffort(ctx, b.Store, manifest, lineage.ManifestFileName, blobcodec.ResolveCodec(b.Codec))
+	// recorded-codec accelerator. The one non-best-effort outcome is the
+	// ADR-0161 concurrent-writer conflict: a second writer interleaving
+	// this chain fails the run loudly (the manifest above is durable;
+	// only the catalog append was refused).
+	if err := lineage.UpdateLineageForManifestBestEffort(ctx, b.Store, manifest, lineage.ManifestFileName, blobcodec.ResolveCodec(b.Codec)); err != nil {
+		return fmt.Errorf("backup: lineage catalog: %w", err)
+	}
 
 	// ADR-0154: sign the manifest + the lineage catalog AFTER both are
 	// durable. The full is segment 0's root manifest (sequence 0). Unlike

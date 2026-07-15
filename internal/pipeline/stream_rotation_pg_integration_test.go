@@ -68,7 +68,7 @@ func rotationSeedFull(t *testing.T, store irbackup.Store, eng ir.Engine, sourceD
 	// desyncs the recorded codec from the chunk bytes the moment the
 	// default flips (v0.67.0 gzip→zstd) → restore reads with the wrong
 	// codec. DefaultCodec tracks it.
-	lineage.UpdateLineageForManifestBestEffort(context.Background(), store, full, lineage.ManifestFileName, blobcodec.DefaultCodec)
+	_ = lineage.UpdateLineageForManifestBestEffort(context.Background(), store, full, lineage.ManifestFileName, blobcodec.DefaultCodec)
 	return full
 }
 

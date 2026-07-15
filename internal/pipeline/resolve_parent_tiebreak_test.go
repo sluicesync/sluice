@@ -101,9 +101,9 @@ func TestResolveParent_CreatedAtTieDoesNotBranchChain(t *testing.T) {
 
 	// Seed lineage.json in chain (append) order so an inconsistent
 	// resolveParent pick would branch it.
-	lineage.UpdateLineageForManifestBestEffort(context.Background(), store, full, lineage.ManifestFileName, blobcodec.DefaultCodec)
-	lineage.UpdateLineageForManifestBestEffort(context.Background(), store, incr1, "manifests/incr-0000000000001-aaaaaaaa.json", blobcodec.DefaultCodec)
-	lineage.UpdateLineageForManifestBestEffort(context.Background(), store, incr2, "manifests/incr-0000000000002-bbbbbbbb.json", blobcodec.DefaultCodec)
+	_ = lineage.UpdateLineageForManifestBestEffort(context.Background(), store, full, lineage.ManifestFileName, blobcodec.DefaultCodec)
+	_ = lineage.UpdateLineageForManifestBestEffort(context.Background(), store, incr1, "manifests/incr-0000000000001-aaaaaaaa.json", blobcodec.DefaultCodec)
+	_ = lineage.UpdateLineageForManifestBestEffort(context.Background(), store, incr2, "manifests/incr-0000000000002-bbbbbbbb.json", blobcodec.DefaultCodec)
 
 	src := &fakeCDCEngine{name: "postgres", schemaSequence: []*ir.Schema{schema}}
 

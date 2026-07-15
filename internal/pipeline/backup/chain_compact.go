@@ -323,7 +323,11 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 		mintID = generateMergedSegmentID
 	}
 
-	cat, ok, err := lineage.LoadLineageCatalog(ctx, store)
+	// Load FOR UPDATE (ADR-0161): the catalog swap at the end of this run
+	// is a CAS on the chain write-generation observed here, so a backup /
+	// prune / second compact landing during the (potentially long) merge
+	// window conflicts loudly instead of being clobbered.
+	cat, ok, err := lineage.LoadLineageCatalogForUpdate(ctx, store)
 	if err != nil {
 		return nil, fmt.Errorf("backup compact: load lineage catalog: %w", err)
 	}
