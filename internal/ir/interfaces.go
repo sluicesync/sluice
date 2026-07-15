@@ -2889,3 +2889,85 @@ type InferredTypeValidator interface {
 	// err and the column is left at its safe type.
 	ValidateInferredType(ctx context.Context, table, column string, target Type) (conforms bool, resolved Type, validated int64, err error)
 }
+
+// BackfillSet is one `--set` clause of `sluice backfill` (ADR-0159):
+// assign Column the value of Expr, evaluated per row by the database
+// itself. Column is an identifier the engine quotes; Expr is a native
+// SQL expression over the table's existing columns, emitted VERBATIM
+// — a backfill runs inside ONE database, so there is no cross-dialect
+// translation to do (the same posture `--expr-override` takes).
+type BackfillSet struct {
+	Column string
+	Expr   string
+}
+
+// BackfillExecutor is the optional engine surface behind `sluice
+// backfill` (ADR-0159): a same-database, keyset-chunked, online-safe
+// in-place UPDATE. The orchestrator ([pipeline.Backfiller]) walks the
+// table's primary key in bounded batches — NextChunkUpperBound
+// discovers each batch's inclusive upper PK, ExecBackfillChunk issues
+// one UPDATE clipped to that (after, upper] range — so every
+// statement holds locks for at most one batch and stays under vendor
+// statement-time walls (the PlanetScale errno-3024 class, ADR-0148).
+//
+// Both bound predicates are row-comparisons on the PK tuple
+// (`(pk...) > (...)` / `<= (...)`), compared by the engine in the
+// column's NATIVE collation — the same exactly-once contract
+// [BoundedBatchedRowReader] pins (ADR-0096): the chunk walk and the
+// chunk UPDATE must agree on one total order or a boundary-straddling
+// row lands in no chunk.
+//
+// The operator's `--where` predicate scopes WHICH rows inside a chunk
+// are updated (and, when it self-describes doneness — e.g.
+// `new_col IS NULL` — makes re-runs and crash-replays idempotent);
+// the PK range bounds the statement regardless. where is verbatim
+// native SQL, like [BackfillSet.Expr].
+//
+// Engines without an in-place UPDATE surface (SQLite/D1 today) simply
+// don't implement [BackfillExecutorOpener]; the orchestrator refuses
+// them loudly (SLUICE-E-BACKFILL-UNSUPPORTED-ENGINE) rather than
+// silently doing nothing.
+type BackfillExecutor interface {
+	// NextChunkUpperBound returns the PK tuple of the LAST row in the
+	// next batch of up to limit rows whose PK is strictly greater than
+	// after (nil after = start of table), in PK order, and ok=false
+	// when no rows remain past after. The returned tuple is in PK
+	// column declaration order, with each value normalized to a form
+	// that re-binds into the engine's comparison predicates AND
+	// round-trips the resume store's JSON encoding (e.g. []byte →
+	// string, time.Time → the engine's native literal form).
+	NextChunkUpperBound(ctx context.Context, table *Table, after []any, limit int) (upper []any, ok bool, err error)
+
+	// ExecBackfillChunk issues ONE bounded UPDATE applying sets to the
+	// rows in (after, upper] that also match where (empty where = the
+	// whole range), and returns the driver-reported affected-row count.
+	// after may be nil (first chunk: no lower bound); upper is required
+	// — an unbounded UPDATE is exactly what this surface exists to
+	// avoid.
+	ExecBackfillChunk(ctx context.Context, table *Table, sets []BackfillSet, where string, after, upper []any) (int64, error)
+
+	// BackfillStatement returns the chunk UPDATE exactly as
+	// ExecBackfillChunk executes it mid-walk (both PK bounds present,
+	// placeholders shown symbolically), for `--dry-run` preview. The
+	// first chunk omits the lower-bound predicate.
+	BackfillStatement(table *Table, sets []BackfillSet, where string) (string, error)
+
+	// CountRemaining counts rows still matching where (the `--dry-run`
+	// estimate and the progress/ETA total). Empty where counts all
+	// rows. It also serves as the where-predicate preflight: an
+	// unparsable predicate fails HERE, before any UPDATE runs.
+	CountRemaining(ctx context.Context, table *Table, where string) (int64, error)
+
+	// Close releases the underlying connection pool.
+	Close() error
+}
+
+// BackfillExecutorOpener is the optional engine surface that exposes
+// the in-place backfill executor. Same shape as
+// [MigrationStateStoreOpener]: optional, type-asserted at the call
+// site, so adding a new engine doesn't force every existing engine to
+// grow a stub. MySQL (all flavors — PlanetScale/Vitess ride the same
+// SQL path) and Postgres implement it.
+type BackfillExecutorOpener interface {
+	OpenBackfillExecutor(ctx context.Context, dsn string) (BackfillExecutor, error)
+}

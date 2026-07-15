@@ -142,6 +142,7 @@ type CLI struct {
 	Verify   VerifyCmd   `cmd:"" help:"Verify data integrity between source and target (v0.12.0+ count mode)."`
 	Backup   BackupCmd   `cmd:"" help:"Take and verify logical backups (Phase 1: full snapshot to local filesystem)."`
 	Restore  RestoreCmd  `cmd:"" help:"Restore a logical backup into a target database."`
+	Backfill BackfillCmd `cmd:"" help:"Backfill/transform a column in place — same-database, keyset-chunked, resumable, online-safe UPDATE (the expand-contract 'migrate' step; ADR-0159)."`
 	Matview  MatviewCmd  `cmd:"" help:"Operate on PostgreSQL materialized views (refresh; PG-only)."`
 	Diagnose DiagnoseCmd `cmd:"" help:"Assemble an operator-bundle (cockroach-debug-zip-shape) for filing GitHub issues. ADR-0056."`
 	Cutover  CutoverCmd  `cmd:"" help:"Two-phase sequence priming at cutover — re-read source sequence/AUTO_INCREMENT state and apply to the target with a safety margin (F10, ADR-0062)."`
