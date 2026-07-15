@@ -42,7 +42,7 @@ func parseSchemaFile(content, file string) (*ir.Table, error) {
 		case "":
 			// comment-only fragment
 		case "SET":
-			if err := checkSetStatement(stmt); err != nil {
+			if _, err := checkSetStatement(stmt); err != nil {
 				return nil, fmt.Errorf("mydumper: schema file %s: %w", file, err)
 			}
 		case "CREATE":

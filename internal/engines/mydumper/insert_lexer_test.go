@@ -168,6 +168,19 @@ func TestLiteralToRowValue_Refusals(t *testing.T) {
 		{"temporal/partial-date", ir.DateTime{}, literal{kind: litString, bytes: []byte("2026-00-15 00:00:00")}},
 		{"blob/number", ir.Blob{}, literal{kind: litNumber, text: "5"}},
 		{"decimal/hex", ir.Decimal{}, literal{kind: litHex, bytes: []byte{0x01}}},
+		// Boolean quoted bytes: only the single wire byte 0x00/0x01 is
+		// faithful — the TEXT digit '0' (0x30) would silently invert to
+		// true through a lenient any-non-zero-byte branch.
+		{"bool/text-zero-refused", ir.Boolean{}, literal{kind: litString, bytes: []byte("0")}},
+		{"bool/text-one-refused", ir.Boolean{}, literal{kind: litString, bytes: []byte("1")}},
+		{"bool/empty-refused", ir.Boolean{}, literal{kind: litString, bytes: []byte{}}},
+		{"bool/multibyte-refused", ir.Boolean{}, literal{kind: litHex, bytes: []byte{0x00, 0x01}}},
+		// BIT width overflow: more significant bits than the declared
+		// BIT(N) would silently drop the high bits in BitBytesToString.
+		{"bit/overflow-bitlit", ir.Bit{Length: 5}, literal{kind: litBit, bytes: []byte{0x3F}}},
+		{"bit/overflow-hex", ir.Bit{Length: 5}, literal{kind: litHex, bytes: []byte{0xFF}}},
+		{"bit/overflow-number", ir.Bit{Length: 5}, literal{kind: litNumber, text: "63"}},
+		{"bit/overflow-wide-bytes", ir.Bit{Length: 8}, literal{kind: litHex, bytes: []byte{0x01, 0x00}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

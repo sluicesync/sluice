@@ -406,24 +406,38 @@ func TestSplitMySQLChunk_SyntaxStates(t *testing.T) {
 
 func TestCheckSetStatement(t *testing.T) {
 	cases := []struct {
-		stmt   string
-		wantOK bool
+		stmt    string
+		wantOK  bool
+		wantSaw bool // a recognised (UTC) TIME_ZONE header
 	}{
-		{"/*!40101 SET NAMES binary*/", true},
-		{"SET NAMES utf8mb4", true},
-		{"SET NAMES utf8", true},
-		{"SET NAMES latin1", false},
-		{"SET NAMES cp1251", false},
-		{"/*!40103 SET TIME_ZONE='+00:00' */", true},
-		{"SET TIME_ZONE='+08:00'", false},
-		{"SET FOREIGN_KEY_CHECKS=0", true},
-		{"SET SQL_MODE=''", true},
+		{"/*!40101 SET NAMES binary*/", true, false},
+		{"SET NAMES utf8mb4", true, false},
+		{"SET NAMES utf8", true, false},
+		{"SET NAMES latin1", false, false},
+		{"SET NAMES cp1251", false, false},
+		{"/*!40103 SET TIME_ZONE='+00:00' */", true, true},
+		{"SET TIME_ZONE='+08:00'", false, false},
+		{"SET FOREIGN_KEY_CHECKS=0", true, false},
+		{"SET SQL_MODE=''", true, false},
+		// Every TIME_ZONE spelling MySQL accepts must hit the same gate —
+		// a non-UTC header must not slip past under a qualified form.
+		{"SET SESSION TIME_ZONE='+08:00'", false, false},
+		{"SET GLOBAL TIME_ZONE='+08:00'", false, false},
+		{"SET @@time_zone='+08:00'", false, false},
+		{"SET @@session.time_zone='+08:00'", false, false},
+		{"SET @@SESSION.TIME_ZONE = '-05:00'", false, false},
+		{"SET SESSION TIME_ZONE='+00:00'", true, true},
+		{"SET @@session.time_zone = 'UTC'", true, true},
+		{"SET @@time_zone='+00:00'", true, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.stmt, func(t *testing.T) {
-			err := checkSetStatement(tc.stmt)
+			saw, err := checkSetStatement(tc.stmt)
 			if tc.wantOK && err != nil {
 				t.Fatalf("want ok; got %v", err)
+			}
+			if saw != tc.wantSaw {
+				t.Fatalf("sawTimeZone = %v; want %v", saw, tc.wantSaw)
 			}
 			if !tc.wantOK && err == nil {
 				t.Fatal("want a refusal; got nil")

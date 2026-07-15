@@ -255,40 +255,72 @@ var allowedSetNames = map[string]bool{
 }
 
 // checkSetStatement validates a SET statement found in a data chunk or
-// schema file. `SET NAMES <charset>` outside the UTF-8-compatible
-// allowlist and `SET TIME_ZONE` other than '+00:00' are LOUD refusals
-// (mis-decoded text / shifted instants are the silent alternative); every
-// other session variable a dump sets (sql_mode, FOREIGN_KEY_CHECKS,
-// UNIQUE_CHECKS, character_set_client, …) is irrelevant to a file read and
-// is skipped.
-func checkSetStatement(stmt string) error {
+// schema file, and reports whether it was a (UTC) TIME_ZONE header — the
+// signal [RowReader] uses to WARN on dumps that never declare one. `SET
+// NAMES <charset>` outside the UTF-8-compatible allowlist and a TIME_ZONE
+// assignment other than '+00:00'/UTC are LOUD refusals (mis-decoded text /
+// shifted instants are the silent alternative); every other session
+// variable a dump sets (sql_mode, FOREIGN_KEY_CHECKS, UNIQUE_CHECKS,
+// character_set_client, …) is irrelevant to a file read and is skipped.
+//
+// The TIME_ZONE match covers every spelling MySQL accepts — bare
+// `TIME_ZONE`, scope-qualified `SESSION/GLOBAL/LOCAL TIME_ZONE`, and the
+// system-variable forms `@@time_zone` / `@@session.time_zone` — so a
+// non-UTC header cannot slip past the gate under an alternate spelling.
+func checkSetStatement(stmt string) (sawTimeZone bool, err error) {
 	body := stripLeadingCommentsAndSpace(stmt)
 	fields := strings.Fields(body)
 	if len(fields) < 2 || !strings.EqualFold(fields[0], "SET") {
-		return nil
+		return false, nil
 	}
 	if strings.EqualFold(fields[1], "NAMES") {
 		if len(fields) < 3 {
-			return fmt.Errorf("malformed SET NAMES statement %q", body)
+			return false, fmt.Errorf("malformed SET NAMES statement %q", body)
 		}
 		cs := strings.ToLower(strings.Trim(fields[2], "'\"`;"))
 		if !allowedSetNames[cs] {
-			return fmt.Errorf("dump declares SET NAMES %s — only UTF-8-compatible dump charsets "+
+			return false, fmt.Errorf("dump declares SET NAMES %s — only UTF-8-compatible dump charsets "+
 				"(binary, utf8, utf8mb3, utf8mb4) are supported; re-dump with a UTF-8 connection "+
 				"charset rather than have sluice transcode silently", cs)
 		}
-		return nil
+		return false, nil
 	}
-	// SET TIME_ZONE='+00:00' (the mysqldump --tz-utc form): only UTC is
-	// accepted — temporal literals in the dump are interpreted as UTC, so a
-	// non-UTC session offset would silently shift every instant.
+	// SET TIME_ZONE='+00:00' (mydumper emits it unconditionally; mysqldump
+	// under --tz-utc): only UTC is accepted — temporal literals in the dump
+	// are interpreted as UTC, so a non-UTC session offset would silently
+	// shift every instant.
 	rest := strings.TrimSpace(body[len(fields[0]):])
-	if key, val, ok := strings.Cut(rest, "="); ok && strings.EqualFold(strings.TrimSpace(key), "TIME_ZONE") {
-		tz := strings.Trim(strings.TrimSpace(val), "'\" ;")
-		if tz != "+00:00" && !strings.EqualFold(tz, "UTC") {
-			return fmt.Errorf("dump declares SET TIME_ZONE=%q — only '+00:00'/UTC is supported "+
-				"(temporal values are interpreted as UTC; a non-UTC dump would shift instants silently)", tz)
+	key, val, ok := strings.Cut(rest, "=")
+	if !ok || !isTimeZoneVariable(key) {
+		return false, nil
+	}
+	tz := strings.Trim(strings.TrimSpace(val), "'\" ;")
+	if tz != "+00:00" && !strings.EqualFold(tz, "UTC") {
+		return false, fmt.Errorf("dump declares SET TIME_ZONE=%q — only '+00:00'/UTC is supported "+
+			"(temporal values are interpreted as UTC; a non-UTC dump would shift instants silently)", tz)
+	}
+	return true, nil
+}
+
+// isTimeZoneVariable reports whether the left-hand side of a SET
+// assignment names the session/global time_zone variable, in any of
+// MySQL's accepted spellings: `TIME_ZONE`, `SESSION TIME_ZONE`,
+// `GLOBAL TIME_ZONE`, `LOCAL TIME_ZONE`, `@@time_zone`,
+// `@@session.time_zone`, `@@global.time_zone`, `@@local.time_zone`.
+func isTimeZoneVariable(key string) bool {
+	// The variable name is the LAST whitespace-separated token (scope
+	// keywords precede it in the `SET SESSION time_zone` form).
+	name := key
+	if fs := strings.Fields(key); len(fs) > 0 {
+		name = fs[len(fs)-1]
+	}
+	name = strings.TrimPrefix(name, "@@")
+	lower := strings.ToLower(name)
+	for _, scope := range []string{"session.", "global.", "local."} {
+		if strings.HasPrefix(lower, scope) {
+			lower = lower[len(scope):]
+			break
 		}
 	}
-	return nil
+	return lower == "time_zone"
 }

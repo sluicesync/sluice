@@ -76,6 +76,13 @@ const (
 // documented (ADR-0161 §4) and WARNed by the reader
 // ([warnIfSingleFloatColumns]); the equivalence oracle here pins the
 // faithful-within-the-format cases.
+//
+// DOUBLE values, by contrast, DELIBERATELY require MORE than 6
+// significant digits (3.141592653589793 / 0.1 / 1.7976931348623157e308 —
+// 16-17 digits, shortest-roundtrip) so the equivalence legs PROVE that
+// DOUBLE is not display-rounded like its FLOAT sibling (the Bug-74
+// family-vs-representative discipline: ground-truthed against v1.0.3,
+// where all three dump at full precision).
 const seedDDL = `
 CREATE TABLE families (
   id    BIGINT NOT NULL,
@@ -111,16 +118,16 @@ CREATE TABLE families (
 
 INSERT INTO families VALUES
 (1, -128, 255, -32768, 8388607, -2147483648, 9007199254740993, 18446744073709551615, 1,
- '1234567890123456.7890', -2.5, -1.25e10, 'abcd',
+ '1234567890123456.7890', -2.5, 3.141592653589793, 'abcd',
  CONCAT('it''s', CHAR(10), ' a "q" 100% _x_ \\ ', 0xF09F8D8A), 'long text body',
  X'00FF1A', X'0022275C0A00', X'DEADBEEF00',
  '1999-12-31', '2026-01-02 03:04:05.123456', '2001-02-03 04:05:06.500000', '11:22:33.123', 2077,
  '{"a": 1, "b": [true, null]}', 'it''s', 'x,z', b'10101', b'1'),
 (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0,
- NULL, NULL, NULL, NULL, 'NULL', NULL, NULL, NULL, NULL,
+ NULL, NULL, 0.1, NULL, 'NULL', NULL, NULL, NULL, NULL,
  NULL, NULL, NULL, NULL, NULL, NULL, NULL, '', NULL, NULL),
 (3, 1, 2, 3, 4, 5, 6, 7, 1,
- '0.0001', 1.5, 0.25, 'wxyz', 'plain', 'ascii only',
+ '0.0001', 1.5, 1.7976931348623157e308, 'wxyz', 'plain', 'ascii only',
  X'414243', X'58', X'59',
  '2000-01-01', '2000-01-01 00:00:00.000000', '2000-01-01 00:00:01.000000', '00:00:00.000', 1901,
  '[]', 'alpha', 'y', b'1', b'0');
@@ -150,6 +157,18 @@ CREATE TABLE skipme (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 INSERT INTO skipme VALUES (1), (2);
+
+CREATE TABLE geo (
+  id BIGINT NOT NULL,
+  pt POINT,
+  g  GEOMETRY,
+  PRIMARY KEY (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT INTO geo VALUES
+(1, ST_GeomFromText('POINT(1 2)'), ST_GeomFromText('LINESTRING(0 0,1 1,2 0)')),
+(2, NULL, ST_GeomFromText('POINT(3 4)', 4326)),
+(3, ST_GeomFromText('POINT(-5.5 6.25)'), NULL);
 `
 
 // TestMydumperIntegration_RealDumpEndToEnd is the ground-truth suite. One
@@ -196,11 +215,20 @@ func TestMydumperIntegration_RealDumpEndToEnd(t *testing.T) {
 		TargetTypeOptions: map[string]any{"precision": 20, "scale": 0},
 	}
 
+	// The geo table rides only the MySQL legs and the reader-equivalence
+	// compares: the plain PG target image has no PostGIS, so the PG legs
+	// (oracle AND dump alike) exclude it. The SRID+WKB dump shape is still
+	// validated against real mydumper output on the MySQL side.
+	pgFilter, err := migcore.NewTableFilter(nil, []string{"geo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	// Oracle targets: the live-mysql-source migration into each engine.
 	oracleMy := createMySQLDB(t, mysqlRootDSN, "oracle_my")
 	runMigrate(t, mysqlEng, mysqlEng, srcDSN, oracleMy, migcore.TableFilter{})
 	oraclePG := createPGDB(t, pgAdminDSN, "oracle_pg")
-	runMigrate(t, mysqlEng, pgEng, srcDSN, oraclePG, migcore.TableFilter{}, u64Override)
+	runMigrate(t, mysqlEng, pgEng, srcDSN, oraclePG, pgFilter, u64Override)
 
 	// Leg 1+2: full migrate of the escape-shape and hex-blob dumps into
 	// BOTH targets, compared table-by-table against the live-path oracle.
@@ -212,7 +240,7 @@ func TestMydumperIntegration_RealDumpEndToEnd(t *testing.T) {
 		})
 		t.Run("migrate-"+leg+"-to-postgres", func(t *testing.T) {
 			target := createPGDB(t, pgAdminDSN, "dump_"+leg+"_pg")
-			runMigrate(t, dumpEng, pgEng, dumpDirs[leg], target, migcore.TableFilter{}, u64Override)
+			runMigrate(t, dumpEng, pgEng, dumpDirs[leg], target, pgFilter, u64Override)
 			compareTargets(t, pgEng, oraclePG, target)
 		})
 	}
@@ -256,8 +284,8 @@ func TestMydumperIntegration_RealDumpEndToEnd(t *testing.T) {
 				t.Fatal("skipme migrated despite --exclude-table")
 			}
 		}
-		if len(schema.Tables) != 3 {
-			t.Fatalf("filtered target tables = %d; want 3", len(schema.Tables))
+		if len(schema.Tables) != 4 {
+			t.Fatalf("filtered target tables = %d; want 4 (families, users, posts, geo)", len(schema.Tables))
 		}
 	})
 

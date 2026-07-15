@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math"
+	"math/bits"
 	"strconv"
 	"strings"
 
@@ -395,18 +396,18 @@ func (sc *insertScan) scanNumberValue() (literal, error) {
 // bytes — the same wire shape the MySQL driver hands back for BIT(N)
 // columns, so [mysql.DecodeRowValue]'s BIT decoder consumes it unchanged.
 // MySQL BIT holds at most 64 bits.
-func bitsToBytes(bits string) ([]byte, error) {
-	if bits == "" {
+func bitsToBytes(digits string) ([]byte, error) {
+	if digits == "" {
 		return []byte{0}, nil
 	}
-	if len(bits) > 64 {
-		return nil, fmt.Errorf("bit literal is %d bits; MySQL BIT holds at most 64", len(bits))
+	if len(digits) > 64 {
+		return nil, fmt.Errorf("bit literal is %d bits; MySQL BIT holds at most 64", len(digits))
 	}
 	var v uint64
-	for i := 0; i < len(bits); i++ {
-		v = v<<1 | uint64(bits[i]-'0')
+	for i := 0; i < len(digits); i++ {
+		v = v<<1 | uint64(digits[i]-'0')
 	}
-	out := make([]byte, (len(bits)+7)/8)
+	out := make([]byte, (len(digits)+7)/8)
 	for i := len(out) - 1; i >= 0; i-- {
 		out[i] = byte(v)
 		v >>= 8
@@ -453,9 +454,16 @@ func literalToDriverShape(lit literal, t ir.Type) (any, error) {
 			// BYTE (mydumper's default escape shape emits `_binary "\0"` /
 			// `"\x01"`), NOT boolean text — TINYINT(1) booleans always dump
 			// as bare numbers. Route it through the same []byte branch the
-			// live driver's BIT(1) takes (any non-zero byte = true); the
-			// string branch would misread "\x00" as true (a real bug this
-			// engine's real-dump oracle caught).
+			// live driver's BIT(1) takes; the string branch would misread
+			// "\x00" as true (a real bug this engine's real-dump oracle
+			// caught). BIT(1) holds exactly 0x00/0x01, so anything else —
+			// e.g. the TEXT digit '0' (0x30), which the bytes branch would
+			// silently invert to true — is refused loudly.
+			if len(lit.bytes) != 1 || lit.bytes[0] > 1 {
+				return nil, fmt.Errorf("a quoted %q value cannot faithfully populate a BOOLEAN/BIT(1) "+
+					"column (want the single wire byte \\x00 or \\x01; refusing rather than coercing)",
+					lit.bytes)
+			}
 			return lit.bytes, nil
 		}
 	case ir.Integer:
@@ -507,6 +515,9 @@ func literalToDriverShape(lit literal, t ir.Type) (any, error) {
 	case ir.Bit:
 		switch lit.kind {
 		case litString, litHex, litBit:
+			if err := checkBitWidth(lit.bytes, v.Length); err != nil {
+				return nil, err
+			}
 			return lit.bytes, nil
 		case litNumber:
 			// A bit value dumped as a bare integer: repack as the wire bytes.
@@ -519,11 +530,38 @@ func literalToDriverShape(lit literal, t ir.Type) (any, error) {
 				out[i] = byte(n)
 				n >>= 8
 			}
+			if err := checkBitWidth(out, v.Length); err != nil {
+				return nil, err
+			}
 			return out, nil
 		}
 	}
 	return nil, fmt.Errorf("a %s literal cannot faithfully populate an IR %T column (refusing rather "+
 		"than coercing)", lit.kind, t)
+}
+
+// checkBitWidth refuses a bit value whose SIGNIFICANT bits exceed the
+// column's declared BIT(N) width. Without it, [ir.BitBytesToString]'s
+// keep-the-low-N-bits contract would silently truncate the high bits of an
+// over-wide dump value (b'111111' into BIT(5) would drop the leading 1) —
+// the silent-loss class this engine refuses loudly.
+func checkBitWidth(b []byte, width int) error {
+	if width <= 0 {
+		width = 1 // MySQL's documented default for a bare BIT
+	}
+	sig := 0
+	for i, by := range b {
+		if by == 0 {
+			continue
+		}
+		sig = (len(b)-1-i)*8 + bits.Len8(by)
+		break
+	}
+	if sig > width {
+		return fmt.Errorf("bit value has %d significant bits; column is BIT(%d) — refusing rather than "+
+			"silently truncating the high bits", sig, width)
+	}
+	return nil
 }
 
 // parseExactInteger parses decimal integer text to int64, widening to

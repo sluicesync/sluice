@@ -82,16 +82,49 @@ func (r *RowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.Ro
 	out := make(chan ir.Row, rowChanBuffer)
 	go func() {
 		defer close(out)
+		sawTimeZone := false
 		for _, chunk := range tf.chunks {
-			if err := r.streamChunk(ctx, chunk, table, out); err != nil {
+			sawTZ, err := r.streamChunk(ctx, chunk, table, out)
+			if err != nil {
 				if !errors.Is(err, context.Canceled) {
 					r.setErr(err)
 				}
 				return
 			}
+			sawTimeZone = sawTimeZone || sawTZ
+		}
+		if !sawTimeZone && len(tf.chunks) > 0 {
+			warnIfTimestampsWithoutTZHeader(table)
 		}
 	}()
 	return out, nil
+}
+
+// warnIfTimestampsWithoutTZHeader surfaces the missing-TIME_ZONE-header
+// wart: TIMESTAMP literals in a dump are interpreted as UTC, and mydumper
+// v1.0.3 unconditionally stamps every file with `SET TIME_ZONE='+00:00'`
+// after converting (ground-truthed against a +08:00 server, ADR-0161 §5) —
+// but a dump from another producer with NO header may carry server-local
+// instants, which this reader would silently shift. It cannot know the
+// writing session's zone, so the honest move is a WARN naming the
+// TIMESTAMP columns whenever a table's chunks declared no time zone.
+func warnIfTimestampsWithoutTZHeader(table *ir.Table) {
+	var stamps []string
+	for _, col := range table.Columns {
+		if _, ok := col.Type.(ir.Timestamp); ok {
+			stamps = append(stamps, col.Name)
+		}
+	}
+	if len(stamps) == 0 {
+		return
+	}
+	slog.Warn(
+		"mydumper: no SET TIME_ZONE header in this table's data chunks — TIMESTAMP values are "+
+			"interpreted as UTC; if the dump was written under a non-UTC session zone the instants will "+
+			"shift. mydumper itself always writes the header; verify the producer dumped in UTC.",
+		slog.String("table", table.Name),
+		slog.Any("timestamp_columns", stamps),
+	)
 }
 
 // warnIfSingleFloatColumns surfaces the FLOAT display-rounding wart, once
@@ -123,8 +156,9 @@ func warnIfSingleFloatColumns(table *ir.Table) {
 	)
 }
 
-// streamChunk lexes one data-chunk file and emits its rows.
-func (r *RowReader) streamChunk(ctx context.Context, path string, table *ir.Table, out chan<- ir.Row) error {
+// streamChunk lexes one data-chunk file and emits its rows, reporting
+// whether the chunk declared a (UTC) time zone header.
+func (r *RowReader) streamChunk(ctx context.Context, path string, table *ir.Table, out chan<- ir.Row) (sawTimeZone bool, err error) {
 	return processChunk(ctx, path, table.Name, func(sc *insertScan, columns []string) error {
 		targets, err := resolveInsertColumns(table, columns)
 		if err != nil {
@@ -162,16 +196,17 @@ func (r *RowReader) streamChunk(ctx context.Context, path string, table *ir.Tabl
 
 // processChunk opens one data-chunk file (decompressing by suffix),
 // streams its statements, and dispatches: SET headers are validated
-// (charset / time-zone posture), comments skipped, INSERT/REPLACE handed
-// to onInsert (with the header already consumed and the statement's
-// explicit column list, nil when bare), and ANY other statement refused
-// loudly naming the file — a data chunk holds only extended INSERTs.
+// (charset / time-zone posture; sawTimeZone reports a UTC TIME_ZONE header
+// was present), comments skipped, INSERT/REPLACE handed to onInsert (with
+// the header already consumed and the statement's explicit column list,
+// nil when bare), and ANY other statement refused loudly naming the file —
+// a data chunk holds only extended INSERTs.
 func processChunk(ctx context.Context, path, tableName string,
 	onInsert func(sc *insertScan, columns []string) error,
-) error {
+) (sawTimeZone bool, err error) {
 	f, err := openDumpFile(path)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer func() { _ = f.Close() }()
 
@@ -179,36 +214,38 @@ func processChunk(ctx context.Context, path, tableName string,
 	stream := newStatementStream(f, 0)
 	for {
 		if err := ctx.Err(); err != nil {
-			return err
+			return sawTimeZone, err
 		}
 		stmt, err := stream.Next()
 		if errors.Is(err, io.EOF) {
-			return nil
+			return sawTimeZone, nil
 		}
 		if err != nil {
-			return fmt.Errorf("mydumper: %s: %w", base, err)
+			return sawTimeZone, fmt.Errorf("mydumper: %s: %w", base, err)
 		}
 		switch kw := statementKeyword(stmt); kw {
 		case "":
 			// comment-only fragment
 		case "SET":
-			if err := checkSetStatement(stmt); err != nil {
-				return fmt.Errorf("mydumper: %s: %w", base, err)
+			sawTZ, err := checkSetStatement(stmt)
+			if err != nil {
+				return sawTimeZone, fmt.Errorf("mydumper: %s: %w", base, err)
 			}
+			sawTimeZone = sawTimeZone || sawTZ
 		case "INSERT", "REPLACE":
 			sc, stmtTable, columns, err := parseInsertHeader(stmt, base)
 			if err != nil {
-				return err
+				return sawTimeZone, err
 			}
 			if stmtTable != tableName {
-				return fmt.Errorf("mydumper: %s: chunk for table %s contains an INSERT into %s — "+
+				return sawTimeZone, fmt.Errorf("mydumper: %s: chunk for table %s contains an INSERT into %s — "+
 					"corrupt or mislabelled dump", base, tableName, stmtTable)
 			}
 			if err := onInsert(sc, columns); err != nil {
-				return err
+				return sawTimeZone, err
 			}
 		default:
-			return fmt.Errorf("mydumper: %s: unexpected %s statement in a data chunk (only SET headers "+
+			return sawTimeZone, fmt.Errorf("mydumper: %s: unexpected %s statement in a data chunk (only SET headers "+
 				"and extended INSERTs are valid)", base, kw)
 		}
 	}
@@ -274,7 +311,7 @@ func (d *dumpDir) countTableRows(ctx context.Context, tableName string) (int64, 
 	}
 	var total int64
 	for _, chunk := range tf.chunks {
-		err := processChunk(ctx, chunk, tableName, func(sc *insertScan, _ []string) error {
+		_, err := processChunk(ctx, chunk, tableName, func(sc *insertScan, _ []string) error {
 			var vals []literal
 			for {
 				var done bool

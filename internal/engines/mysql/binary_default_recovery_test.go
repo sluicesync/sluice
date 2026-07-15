@@ -56,6 +56,13 @@ func TestDecodeMySQLQuotedString(t *testing.T) {
 		{"escaped quote \\'", `'\''`, []byte{0x27}},
 		{"escaped double-quote", `'\"'`, []byte{0x22}},
 		{"unknown escape drops backslash", `'\x'`, []byte{'x'}},
+		// MySQL KEEPS the backslash for the LIKE-pattern escapes \% and \_
+		// (manual: string-literal escape table) — load-bearing for the
+		// mydumper flat-file decode (ADR-0161 §4), pinned here beside the
+		// decoder it guards.
+		{"LIKE-escape percent keeps backslash", `'\%'`, []byte(`\%`)},
+		{"LIKE-escape underscore keeps backslash", `'\_'`, []byte(`\_`)},
+		{"LIKE-escapes embedded", `'a\%b\_c'`, []byte(`a\%b\_c`)},
 		// Trailing text after the closing quote is ignored.
 		{"trailing comma ignored", `'ABC',`, []byte{0x41, 0x42, 0x43}},
 		{"empty string", `''`, []byte{}},
