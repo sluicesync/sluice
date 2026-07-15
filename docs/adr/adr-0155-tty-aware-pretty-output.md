@@ -1,6 +1,6 @@
 # ADR-0155: TTY-aware pretty output for one-shot commands
 
-- Status: Proposed
+- Status: Accepted (rolled out across the one-shot commands, v0.99.232–v0.99.241 — `migrate` first, then `verify`/`restore`/`backup*`, `cutover`/`matview`/`trigger*`, `slot list`; pre-panel INFO-leak sweep completed in v0.99.241)
 - Date: 2026-07-12
 - Deciders: sluice maintainers
 
