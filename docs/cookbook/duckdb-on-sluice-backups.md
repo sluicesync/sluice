@@ -6,7 +6,7 @@ the JSON-Lines chunks (zero extra steps) or over a Parquet export
 warehouse, no ETL pipeline, no load on the production database.
 
 DuckDB is deliberately **not** a sluice dependency or subcommand
-(ADR-0163): its ecosystem moves faster than sluice's release cadence,
+(ADR-0164): its ecosystem moves faster than sluice's release cadence,
 and the operator with the appetite for DuckDB already knows how to
 drive it. This recipe is the integration.
 
@@ -76,7 +76,7 @@ What you get at the destination:
   count, row groups, source chunks, and any type-mapping notes.
 
 Worth knowing (full detail in
-[ADR-0163](../adr/adr-0163-backup-export-as-parquet.md)):
+[ADR-0164](../adr/adr-0164-backup-export-as-parquet.md)):
 
 - **The export represents ONE snapshot** — the chain's latest full by
   default, or an earlier one via `--backup-id <id>`. Incremental
@@ -173,5 +173,5 @@ work.
 - [`docs/research/sluice-as-analytics-source.md`](../research/sluice-as-analytics-source.md)
   — why Parquet-export-plus-DuckDB-recipe is the chosen analytics
   surface (and why Arrow Flight isn't, yet).
-- [ADR-0163](../adr/adr-0163-backup-export-as-parquet.md) — the full
+- [ADR-0164](../adr/adr-0164-backup-export-as-parquet.md) — the full
   type-mapping table and the export's integrity guarantees.

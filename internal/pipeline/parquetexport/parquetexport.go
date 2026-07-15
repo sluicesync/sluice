@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package parquetexport maps IR tables and row values onto Apache
-// Parquet for `sluice backup export-as-parquet` (ADR-0163). It is the
+// Parquet for `sluice backup export-as-parquet` (ADR-0164). It is the
 // EXIT-ONLY half of the analytics surface: sluice writes Parquet, it
 // never reads its own Parquet output back — restore keeps the
 // JSON-Lines chunk path. That posture collapses the lossless-round-trip
@@ -251,7 +251,7 @@ func (c *TableCodec) note(format string, args ...any) {
 // sealed Type set — an unknown type is a loud construction error, so a
 // future IR type addition cannot silently export as the wrong shape.
 //
-// The mapping table lives in ADR-0163 (and docs/type-mapping.md's
+// The mapping table lives in ADR-0164 (and docs/type-mapping.md's
 // cross-reference); the load-bearing invariants:
 //
 //   - decimals keep exactness (INT32/INT64/FLBA(16) DECIMAL for

@@ -16,7 +16,7 @@ import (
 )
 
 // BackupExportAsParquetCmd runs `sluice backup export-as-parquet`
-// (ADR-0163): a one-shot, read-only transcode of an existing backup's
+// (ADR-0164): a one-shot, read-only transcode of an existing backup's
 // row chunks into one zstd-compressed Parquet file per table plus a
 // parquet_index.json export manifest — the analytics exit surface over
 // the chain sluice already captured. Exit-only: sluice never reads its
@@ -32,7 +32,7 @@ import (
 // signed chain is verified (and --require-signature makes that
 // strict) before any chunk is decoded. The Parquet files themselves
 // are written PLAINTEXT — the operator chose the analytics
-// destination's encryption posture separately (ADR-0163).
+// destination's encryption posture separately (ADR-0164).
 type BackupExportAsParquetCmd struct {
 	FromDir string `help:"Directory containing the backup to export (the same directory --output-dir wrote to). Mutually exclusive with --from." placeholder:"DIR"`
 	From    string `help:"URL of the backup to export (s3://, gs://, azblob://, file:///). Mutually exclusive with --from-dir." placeholder:"URL"`

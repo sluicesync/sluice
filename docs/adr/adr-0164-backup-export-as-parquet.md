@@ -1,4 +1,4 @@
-# ADR-0163: `backup export-as-parquet` — the analytics exit surface
+# ADR-0164: `backup export-as-parquet` — the analytics exit surface
 
 **Status:** Accepted (implemented; roadmap item 63)
 

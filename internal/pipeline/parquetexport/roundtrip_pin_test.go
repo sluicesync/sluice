@@ -3,7 +3,7 @@
 
 package parquetexport
 
-// The ADR-0163 value-fidelity pin matrix (the Bug-74 discipline): the
+// The ADR-0164 value-fidelity pin matrix (the Bug-74 discipline): the
 // IR→Parquet encoder dispatches on the type FAMILY, so every family —
 // and every shape variant (value / NULL / empty-vs-NULL / negative /
 // extreme / refusal) — is pinned here, ground-truthed by reading the
@@ -372,10 +372,19 @@ func TestPin_JSONFamily(t *testing.T) {
 	for _, binary := range []bool{false, true} {
 		table := oneColTable(ir.JSON{Binary: binary})
 		val := []byte(`{"a": 1, "b": [true, null]}`)
-		data, _ := encodeParquet(t, table, []ir.Row{row(val), row("\"str\""), row(nil)})
+		data, _ := encodeParquet(t, table, []ir.Row{row(val), row("\"str\""), row([]byte("null")), row(nil)})
 		vals := rawLeafValues(t, data, "v")
-		if len(vals) != 3 || !bytes.Equal(vals[0].ByteArray(), val) || string(vals[1].ByteArray()) != "\"str\"" || !vals[2].IsNull() {
+		if len(vals) != 4 || !bytes.Equal(vals[0].ByteArray(), val) || string(vals[1].ByteArray()) != "\"str\"" || !vals[3].IsNull() {
 			t.Fatalf("binary=%v round-trip = %v", binary, vals)
+		}
+		// A JSON body of `null` is a PRESENT SQL value, distinct from
+		// SQL NULL. Tripwire: parquet-go special-cases
+		// json.RawMessage("null") → parquet NULL in its map
+		// deconstruction; the encoder emits plain []byte so it is safe
+		// today, but a refactor to json.RawMessage would silently
+		// collapse this value — this pin is what catches it.
+		if vals[2].IsNull() || string(vals[2].ByteArray()) != "null" {
+			t.Fatalf(`binary=%v JSON body null = %v; want a PRESENT "null" body, not SQL NULL`, binary, vals[2])
 		}
 		info := logicalTypeOf(t, data, "v")
 		if lt := info.node.Type().LogicalType(); lt == nil || lt.Json == nil {
@@ -777,6 +786,101 @@ func TestPin_ArrayElementFamilies(t *testing.T) {
 		}
 	})
 
+	t.Run("decimal int64-tier elements keep exactness", func(t *testing.T) {
+		table := oneColTable(ir.Array{Element: ir.Decimal{Precision: 18, Scale: 6}})
+		data, _ := encodeParquet(t, table, []ir.Row{row([]any{"999999999999.999999", nil, "0"})})
+		vals := rawLeafValues(t, data, "v", "list", "element")
+		if len(vals) != 3 || vals[0].Int64() != 999999999999999999 || !vals[1].IsNull() {
+			t.Fatalf("int64-decimal elements = %v", vals)
+		}
+		if vals[2].IsNull() || vals[2].Int64() != 0 {
+			t.Fatalf("zero decimal element = %v; want present 0", vals[2])
+		}
+	})
+
+	t.Run("decimal flba16-tier elements keep exactness", func(t *testing.T) {
+		// numeric(38,10)[] — the closest structural analog of Bug 74's
+		// numeric[][] (a wide-decimal codec behind a list shape).
+		table := oneColTable(ir.Array{Element: ir.Decimal{Precision: 38, Scale: 10}})
+		data, _ := encodeParquet(t, table, []ir.Row{row([]any{"1.2345678901", nil, "-1.0000000001"})})
+		vals := rawLeafValues(t, data, "v", "list", "element")
+		if len(vals) != 3 || !vals[1].IsNull() {
+			t.Fatalf("flba-decimal elements = %v", vals)
+		}
+		if got := flbaToBigInt(vals[0].ByteArray()); got.Cmp(big.NewInt(12345678901)) != 0 {
+			t.Fatalf("flba element 0 = %s; want 12345678901", got)
+		}
+		if got := flbaToBigInt(vals[2].ByteArray()); got.Cmp(big.NewInt(-10000000001)) != 0 {
+			t.Fatalf("flba element 2 = %s; want -10000000001", got)
+		}
+		if err := encodeErr(t, table, row([]any{[]any{"1.2345678901"}})); !strings.Contains(err.Error(), "multi-dimensional") {
+			t.Fatalf("flba multi-dim refusal: %v", err)
+		}
+	})
+
+	t.Run("bytes elements: empty element is not a NULL element", func(t *testing.T) {
+		table := oneColTable(ir.Array{Element: ir.Blob{}})
+		data, _ := encodeParquet(t, table, []ir.Row{row([]any{[]byte{0x01, 0x02}, []byte{}, nil})})
+		vals := rawLeafValues(t, data, "v", "list", "element")
+		if len(vals) != 3 || !bytes.Equal(vals[0].ByteArray(), []byte{0x01, 0x02}) {
+			t.Fatalf("bytes elements = %v", vals)
+		}
+		if vals[1].IsNull() || len(vals[1].ByteArray()) != 0 {
+			t.Fatalf("empty bytes element = %v; want present empty", vals[1])
+		}
+		if !vals[2].IsNull() {
+			t.Fatal("NULL element lost")
+		}
+	})
+
+	t.Run("json elements carry raw bytes", func(t *testing.T) {
+		table := oneColTable(ir.Array{Element: ir.JSON{Binary: true}})
+		data, _ := encodeParquet(t, table, []ir.Row{row([]any{[]byte(`{"a": 1}`), nil})})
+		vals := rawLeafValues(t, data, "v", "list", "element")
+		if len(vals) != 2 || string(vals[0].ByteArray()) != `{"a": 1}` || !vals[1].IsNull() {
+			t.Fatalf("json elements = %v", vals)
+		}
+	})
+
+	t.Run("time-of-day elements parse to micros", func(t *testing.T) {
+		table := oneColTable(ir.Array{Element: ir.Time{Precision: 6}})
+		data, _ := encodeParquet(t, table, []ir.Row{row([]any{"08:00:00.25", nil, "00:00:00"})})
+		vals := rawLeafValues(t, data, "v", "list", "element")
+		if len(vals) != 3 || vals[0].Int64() != 28800250000 || !vals[1].IsNull() {
+			t.Fatalf("time elements = %v", vals)
+		}
+		if vals[2].IsNull() || vals[2].Int64() != 0 {
+			t.Fatalf("midnight element = %v; want present 0", vals[2])
+		}
+		if err := encodeErr(t, table, row([]any{"24:00:00"})); !strings.Contains(err.Error(), "calendar day") {
+			t.Fatalf("out-of-day element refusal: %v", err)
+		}
+	})
+
+	t.Run("unsigned elements keep the full uint64 range", func(t *testing.T) {
+		table := oneColTable(ir.Array{Element: ir.Integer{Width: 64, Unsigned: true}})
+		data, _ := encodeParquet(t, table, []ir.Row{row([]any{uint64(math.MaxUint64), nil, uint64(0)})})
+		vals := rawLeafValues(t, data, "v", "list", "element")
+		if len(vals) != 3 || uint64(vals[0].Int64()) != math.MaxUint64 || !vals[1].IsNull() {
+			t.Fatalf("unsigned elements = %v", vals)
+		}
+		if vals[2].IsNull() || vals[2].Int64() != 0 {
+			t.Fatalf("zero unsigned element = %v; want present 0", vals[2])
+		}
+	})
+
+	t.Run("nested list_str is the multi-dim refusal, not a contract error", func(t *testing.T) {
+		// A 2-D text array's inner rows can arrive as []string via
+		// blobcodec's list_str tag; the refusal must be the
+		// multi-dimensional one (with the --exclude-table remedy),
+		// never the misleading "upstream codec bug" contract message.
+		table := oneColTable(ir.Array{Element: ir.Text{}})
+		err := encodeErr(t, table, row([]any{[]string{"a", "b"}}))
+		if !strings.Contains(err.Error(), "multi-dimensional") || !strings.Contains(err.Error(), "--exclude-table") {
+			t.Fatalf("nested list_str refusal = %v; want the multi-dim refusal + remedy", err)
+		}
+	})
+
 	t.Run("list_str shape accepted", func(t *testing.T) {
 		// blobcodec's list_str tag round-trips a text-array decode as
 		// []string; the encoder accepts it as the same content.
@@ -838,6 +942,34 @@ func TestPin_RowGroupPerFlush(t *testing.T) {
 	f := openParquet(t, buf.Bytes())
 	if got := len(f.RowGroups()); got != 3 {
 		t.Fatalf("row groups = %d; want 3 (one per flush)", got)
+	}
+}
+
+// TestPin_UnboxedZeroCollapsesToNull proves the boxLeafValue wart is
+// REAL in the pinned parquet-go version: writing a bare Go zero value
+// (here `false`) through the map deconstruction WITHOUT the pointer
+// boxing exports it as parquet NULL. This is the tripwire that keeps
+// the IsNull()==false pins honest — if a parquet-go upgrade makes this
+// fail (the unboxed zero reads back PRESENT), upstream changed its
+// zero-value semantics: re-read boxLeafValue's rationale before
+// removing either (the boxing itself stays harmless).
+func TestPin_UnboxedZeroCollapsesToNull(t *testing.T) {
+	tc, err := NewTableCodec(oneColTable(ir.Boolean{}))
+	if err != nil {
+		t.Fatalf("NewTableCodec: %v", err)
+	}
+	var buf bytes.Buffer
+	w := parquet.NewGenericWriter[map[string]any](&buf, tc.Schema)
+	// Bypass EncodeRow's boxing deliberately: a raw false.
+	if _, err := w.Write([]map[string]any{{"v": false}}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	vals := rawLeafValues(t, buf.Bytes(), "v")
+	if len(vals) != 1 || !vals[0].IsNull() {
+		t.Fatalf("unboxed false read back %v; the parquet-go zero-value-as-null wart is gone — upstream semantics changed, re-evaluate boxLeafValue (see its comment) before adjusting this pin", vals)
 	}
 }
 

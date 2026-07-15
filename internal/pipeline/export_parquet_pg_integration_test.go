@@ -3,7 +3,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-// ADR-0163 end-to-end integration pin: a REAL Postgres source → `backup
+// ADR-0164 end-to-end integration pin: a REAL Postgres source → `backup
 // full` → `backup export-as-parquet` → a real Parquet reader, with the
 // exported values ground-truthed against the exact literals seeded into
 // the source. The corpus spans the IR family matrix on the live path

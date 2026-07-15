@@ -4,7 +4,7 @@
 package backup
 
 // ParquetExport implements `sluice backup export-as-parquet`
-// (ADR-0163, roadmap item 63): a one-shot, read-only transcode of an
+// (ADR-0164, roadmap item 63): a one-shot, read-only transcode of an
 // EXISTING backup's row chunks into one Parquet file per table, plus a
 // parquet_index.json export manifest. Exit-only by design — sluice
 // never reads its Parquet output back; restore keeps the JSON-Lines
@@ -16,7 +16,7 @@ package backup
 // splice refusal, signed-chain verification, layer-2 row counts)
 // holds for the export too.
 //
-// Shape decisions (ADR-0163):
+// Shape decisions (ADR-0164):
 //
 //   - One Parquet file per table (`<schema>.<table>.parquet`), row
 //     groups aligned 1:1 with the source chunks, zstd-compressed;
@@ -124,10 +124,16 @@ type parquetIndex struct {
 
 // parquetIndexTable is one exported table's index entry.
 type parquetIndexTable struct {
-	Schema       string                `json:"schema,omitempty"`
-	Name         string                `json:"name"`
-	File         string                `json:"file"`
-	Rows         int64                 `json:"rows"`
+	Schema string `json:"schema,omitempty"`
+	Name   string `json:"name"`
+	File   string `json:"file"`
+	Rows   int64  `json:"rows"`
+
+	// RowGroups is RECORDED (the source-chunk count — one Flush per
+	// chunk), not re-measured from the written file. The 1:1 alignment
+	// is the writer's contract, pinned by the integration test's
+	// len(f.RowGroups()) check; if parquet-go ever split or merged
+	// groups on its own, that pin fires, not this field.
 	RowGroups    int                   `json:"row_groups"`
 	SourceChunks []*irbackup.ChunkInfo `json:"source_chunks,omitempty"`
 	TypeNotes    []string              `json:"type_notes,omitempty"`
@@ -384,7 +390,7 @@ func (e *ParquetExport) exportTable(
 			return nil, fmt.Errorf("export-as-parquet: table %q chunk %d (%s): %w", table.Name, chunkIdx, chunk.File, err)
 		}
 		rows += chunkRows
-		// Row groups align 1:1 with source chunks (ADR-0163): the
+		// Row groups align 1:1 with source chunks (ADR-0164): the
 		// operator-visible chunk concept survives into the Parquet
 		// file, and the footer's source_chunks list indexes them.
 		if err := w.Flush(); err != nil {

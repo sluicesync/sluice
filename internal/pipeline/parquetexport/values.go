@@ -147,7 +147,14 @@ func encodeArray(elem encodeFunc, colName string) encodeFunc {
 			if e == nil {
 				continue
 			}
-			if _, nested := e.([]any); nested {
+			// A nested element is a multi-dimensional value regardless
+			// of its decode shape: []any (the generic list tag) OR
+			// []string (blobcodec's list_str tag — a 2-D text array's
+			// inner rows arrive this way). Both get the multi-dim
+			// refusal + remedy, never the misleading contract-violation
+			// message a string-leaf element encoder would emit.
+			switch e.(type) {
+			case []any, []string:
 				return nil, fmt.Errorf("column %q holds a multi-dimensional array value: the column type declares no dimensionality, so the Parquet schema is LIST<element> and cannot hold nested lists; exclude this table (--exclude-table) or query the JSON-Lines chunks directly", colName)
 			}
 			enc, err := elem(e)
