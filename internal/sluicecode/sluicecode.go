@@ -84,10 +84,11 @@ const (
 	CodePSDeployRequestFailed    Code = "SLUICE-E-PS-DEPLOY-REQUEST-FAILED"
 	CodePSBranchStaleBase        Code = "SLUICE-E-PS-BRANCH-STALE-BASE"
 
-	CodeSourceForeignDump   Code = "SLUICE-E-SOURCE-FOREIGN-DUMP"
-	CodeSourceWrongDriver   Code = "SLUICE-E-SOURCE-WRONG-DRIVER"
-	CodeCSVNullAmbiguous    Code = "SLUICE-E-CSV-NULL-AMBIGUOUS"
-	CodeCSVHeaderUndeclared Code = "SLUICE-E-CSV-HEADER-UNDECLARED"
+	CodeSourceForeignDump     Code = "SLUICE-E-SOURCE-FOREIGN-DUMP"
+	CodeSourceWrongDriver     Code = "SLUICE-E-SOURCE-WRONG-DRIVER"
+	CodeCSVNullAmbiguous      Code = "SLUICE-E-CSV-NULL-AMBIGUOUS"
+	CodeCSVHeaderUndeclared   Code = "SLUICE-E-CSV-HEADER-UNDECLARED"
+	CodeExportUnrepresentable Code = "SLUICE-E-EXPORT-UNREPRESENTABLE"
 )
 
 // Class partitions codes by how the process should exit when the
@@ -160,6 +161,8 @@ var registry = map[Code]Info{
 	CodePSSafeMigrationsDisabled: {ClassRefusal, "expand-contract refused: the PlanetScale production branch does not have safe migrations enabled (the deploy-request prerequisite); sluice never auto-enables it"},
 	CodePSDeployRequestFailed:    {ClassRuntime, "a PlanetScale deploy request entered a failure state (or never became deployable/complete before the timeout) — the message carries the DR number, state, and URL"},
 	CodePSBranchStaleBase:        {ClassRuntime, "a PlanetScale dev branch's schema still differs from production after a rebase backup — a new dev branch's schema can lag production (intermittent, timing undocumented), and deploying from a stale base would silently revert newer production schema"},
+
+	CodeExportUnrepresentable: {ClassRefusal, "backup export-as-parquet refused: a column type or value has no faithful Parquet representation (multi-dimensional array, out-of-day-range TIME, NUMERIC NaN/Infinity, sub-microsecond timestamp) — exclude the table or query the JSON-Lines chunks directly; sluice never silently narrows a value on export"},
 }
 
 // Describe returns the registry metadata for c, and whether c is a

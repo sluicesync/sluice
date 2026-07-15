@@ -22,6 +22,7 @@ quickstart's "install sluice" preamble.
 | [PostGIS geospatial round-trip](recipe-postgis.md) | PG ↔ MySQL migration of geometry / geography columns with SRID preserved end-to-end. |
 | [Backup chain with at-rest encryption](recipe-backup-encrypted.md) | Periodic full + incremental backups with passphrase-based or AWS-KMS-based encryption. |
 | [PII redaction with persisted keyset](recipe-redaction-keyset.md) | Replicate to a staging/analytics target with PII redacted but deterministic across runs. |
+| [DuckDB analytics on sluice backups](duckdb-on-sluice-backups.md) | Query your existing backups with DuckDB — directly over the JSON-Lines chunks, or via `sluice backup export-as-parquet` for columnar speed and warehouse handoff. |
 
 ## What's not in here
 

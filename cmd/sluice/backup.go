@@ -593,13 +593,14 @@ func (e *EncryptionFlags) buildMaintenanceSigner(ctx context.Context, store irba
 // `docs/dev/design/logical-backups-phase-3.md`, and
 // `docs/dev/design/logical-backups-phase-4.md` for the staged plan.
 type BackupCmd struct {
-	Full        BackupFullCmd        `cmd:"" help:"Take a full logical backup of a source database to a local directory."`
-	Incremental BackupIncrementalCmd `cmd:"" help:"Take an incremental backup chained off a previous full or incremental (Phase 3)."`
-	Stream      BackupStreamCmdGroup `cmd:"" help:"Long-running stream that produces rolling incrementals (Phase 4)."`
-	Verify      BackupVerifyCmd      `cmd:"" help:"Re-checksum every chunk in an existing backup chain and report any mismatches."`
-	Prune       BackupPruneCmd       `cmd:"" help:"Drop the oldest incrementals from an existing chain to bound disk + restore time (GitHub #20 chunk 14c)."`
-	Compact     BackupCompactCmd     `cmd:"" help:"Concatenate consecutive segments whose CreatedAt gaps fall within --merge-window into a single segment (GitHub #20 chunk 14d, Task #15)."`
-	Keygen      BackupKeygenCmd      `cmd:"" help:"Generate an Ed25519 signing keypair for --sign-key / --verify-key (ADR-0154 Phase 2)."`
+	Full            BackupFullCmd            `cmd:"" help:"Take a full logical backup of a source database to a local directory."`
+	Incremental     BackupIncrementalCmd     `cmd:"" help:"Take an incremental backup chained off a previous full or incremental (Phase 3)."`
+	Stream          BackupStreamCmdGroup     `cmd:"" help:"Long-running stream that produces rolling incrementals (Phase 4)."`
+	Verify          BackupVerifyCmd          `cmd:"" help:"Re-checksum every chunk in an existing backup chain and report any mismatches."`
+	ExportAsParquet BackupExportAsParquetCmd `cmd:"" name:"export-as-parquet" help:"Transcode an existing backup's row chunks into one Parquet file per table (analytics exit surface — ADR-0163). Read-only against the backup store."`
+	Prune           BackupPruneCmd           `cmd:"" help:"Drop the oldest incrementals from an existing chain to bound disk + restore time (GitHub #20 chunk 14c)."`
+	Compact         BackupCompactCmd         `cmd:"" help:"Concatenate consecutive segments whose CreatedAt gaps fall within --merge-window into a single segment (GitHub #20 chunk 14d, Task #15)."`
+	Keygen          BackupKeygenCmd          `cmd:"" help:"Generate an Ed25519 signing keypair for --sign-key / --verify-key (ADR-0154 Phase 2)."`
 }
 
 // BackupKeygenCmd runs `sluice backup keygen`. Generates an Ed25519
