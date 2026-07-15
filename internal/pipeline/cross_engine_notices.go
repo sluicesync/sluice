@@ -14,11 +14,12 @@ import (
 // emitCrossEngineTranslationNotices emits the cluster of ADVISORY
 // cross-engine schema-narrowing notices — the MySQL→PG unsigned-bigint
 // range narrowing (Bug 11), the PG→MySQL unconstrained-numeric widening
-// (Bug 69), and the PG→MySQL wide-varchar down-map (Bug 72) — at WARN so
-// they stand out in default-level logs.
+// (Bug 69), the PG→MySQL wide-varchar down-map (Bug 72), and the
+// MySQL→PG TIME duration-range mismatch (Bug 187) — at WARN so they
+// stand out in default-level logs.
 //
 // Each scanner SELF-SHORT-CIRCUITS by engine pair (returns nil for a pair
-// it does not apply to), so this helper calls all three unconditionally
+// it does not apply to), so this helper calls all of them unconditionally
 // and they no-op for non-applicable pairs. A same-engine run (MySQL→MySQL,
 // PG→PG) therefore emits ZERO notices — the bigint-unsigned→MySQL and
 // varchar→PG paths are lossless, and there must be no false WARN on them
@@ -60,6 +61,18 @@ func emitCrossEngineTranslationNotices(ctx context.Context, schema *ir.Schema, s
 	// down-mapped to a MySQL TEXT tier; the scanner short-circuits
 	// non-MySQL targets (PG→PG round-trips unchanged).
 	if noticeErr := translate.WideVarcharNoticeError(
+		schema, sourceName, targetName, mode,
+	); noticeErr != nil {
+		slog.WarnContext(ctx, noticeErr.Error())
+	}
+
+	// ---- MySQL TIME duration-range notice (Bug 187) ----
+	// MySQL TIME is a duration (-838:59:59..838:59:59); PG `time` holds
+	// only a time-of-day, so an out-of-range value refuses loudly
+	// mid-copy. The notice moves that discovery up front and names the
+	// lossless `--type-override TABLE.COL=interval` remedy. The scanner
+	// short-circuits non-MySQL-family→PG pairs.
+	if noticeErr := translate.MySQLTimeRangeNoticeError(
 		schema, sourceName, targetName, mode,
 	); noticeErr != nil {
 		slog.WarnContext(ctx, noticeErr.Error())

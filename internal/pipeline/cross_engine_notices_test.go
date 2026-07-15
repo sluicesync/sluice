@@ -117,6 +117,37 @@ func TestEmitCrossEngineTranslationNotices_NumericAndVarcharPGToMySQL(t *testing
 	}
 }
 
+// TestEmitCrossEngineTranslationNotices_TimeRangeMySQLToPG pins the
+// Bug 187 advisory into the shared preflight helper: a MySQL-family →
+// PG schema with a TIME column WARNs (naming the interval remedy) at
+// both the migrate and sync cold-start surfaces, and the same schema
+// same-engine emits nothing.
+func TestEmitCrossEngineTranslationNotices_TimeRangeMySQLToPG(t *testing.T) {
+	timeSchema := &ir.Schema{Tables: []*ir.Table{{
+		Name: "tfam",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 32}},
+			{Name: "t", Type: ir.Time{Precision: 6}},
+		},
+	}}}
+	for _, src := range []string{"mysql", "planetscale", "vitess", "mydumper"} {
+		logs := captureWarnLogs(t)
+		emitCrossEngineTranslationNotices(context.Background(), timeSchema, src, "postgres", "migrate")
+		out := logs()
+		if !strings.Contains(out, "MySQL TIME") || !strings.Contains(out, "=interval") {
+			t.Errorf("%s→PG: missing TIME range WARN with interval remedy; logs:\n%s", src, out)
+		}
+		if !strings.Contains(out, "tfam.t") {
+			t.Errorf("%s→PG: TIME range WARN does not name the column; logs:\n%s", src, out)
+		}
+	}
+	logs := captureWarnLogs(t)
+	emitCrossEngineTranslationNotices(context.Background(), timeSchema, "mysql", "mysql", "migrate")
+	if out := logs(); strings.TrimSpace(out) != "" {
+		t.Errorf("mysql→mysql with TIME column emitted notices (want zero); logs:\n%s", out)
+	}
+}
+
 // TestEmitCrossEngineTranslationNotices_SameEngineNoOp is the load-bearing
 // Bug-157 ground truth: a same-engine sync (MySQL→MySQL or PG→PG) must emit
 // ZERO notices even when the schema carries unsigned-bigint /

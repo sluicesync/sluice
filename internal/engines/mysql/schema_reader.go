@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -181,20 +182,21 @@ func (r *SchemaReader) readViews(ctx context.Context) ([]*ir.View, error) {
 // name. The map's values are skeleton [ir.Table] structs; populate*
 // methods fill them in.
 //
-// sluice's own bookkeeping tables (sluice_cdc_state from continuous
-// sync, sluice_migrate_state + sluice_migrate_table_progress from
-// resumable migrations — ADR-0082) are excluded
-// — they're persisted on the target as a side effect of running
-// sluice itself, not user data, and including them would surface as
-// "your migration has an extra table" surprises in cross-engine
-// re-migrations.
+// sluice's own bookkeeping tables are excluded — they're persisted as
+// a side effect of running sluice itself, not user data, and including
+// them would surface as "your migration has an extra table" surprises
+// when a promoted ex-target is later read as a migration source (the
+// cutover flow). The full roster lives once in
+// [appliershared.ControlTableNames] (roadmap item 65b — this reader
+// previously excluded a 3-name subset and every later control table
+// missed it).
 func (r *SchemaReader) readTables(ctx context.Context) (map[string]*ir.Table, error) {
-	const q = `
+	q := `
 		SELECT table_name, IFNULL(table_comment, '')
 		FROM   information_schema.tables
 		WHERE  table_schema = ?
 		  AND  table_type   = 'BASE TABLE'
-		  AND  table_name NOT IN ('sluice_cdc_state', 'sluice_migrate_state', 'sluice_migrate_table_progress')
+		  AND  table_name NOT IN (` + appliershared.ControlTableSQLList() + `)
 		ORDER  BY table_name`
 
 	rows, err := r.db.QueryContext(ctx, q, r.schema)

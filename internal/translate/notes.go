@@ -255,6 +255,28 @@ var hintEntries = []hintEntry{
 		suggestedAlias: "timestamptz",
 	},
 
+	// MySQL TIME → PG time. MySQL TIME is a DURATION spanning
+	// -838:59:59..838:59:59; PG time is a time-of-day (00:00-24:00),
+	// so a stored duration outside that window refuses loudly at copy
+	// time (Bug 187). The hint surfaces the range caveat at `schema
+	// preview` and names the lossless `interval` override for
+	// duration-bearing columns; the WARN-level counterpart at
+	// `migrate`/`sync` preflight is ScanMySQLTimeRangeNotices.
+	{
+		matches: func(src, _ *ir.Column, srcEngine, tgtEngine string) bool {
+			if !IsMySQLFamily(srcEngine) {
+				return false
+			}
+			if tgtEngine != "postgres" {
+				return false
+			}
+			_, ok := src.Type.(ir.Time)
+			return ok
+		},
+		message:        "MySQL TIME is a duration (-838:59:59..838:59:59); PG time holds only 00:00-24:00 and out-of-range values refuse loudly at copy — if the column stores durations, override to interval (lossless)",
+		suggestedAlias: "interval",
+	},
+
 	// PG numeric (unbounded) → MySQL DECIMAL(65,30). The MySQL max
 	// is the safest fit but rarely the desired storage shape; if
 	// the operator knows the precision/scale, override.

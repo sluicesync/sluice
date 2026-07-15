@@ -157,7 +157,7 @@ Each leaf type implements `isType()` so the compiler enforces that only IR types
 | `BINARY(n)` / `VARBINARY(n)`  | `Binary{Length: n}` / `Varbinary{Length: n}`       | |
 | `TINYBLOB` … `LONGBLOB`       | `Blob{Size: ...}`                                  | |
 | `DATE`                        | `Date{}`                                           | |
-| `TIME(p)`                     | `Time{Precision: p}`                               | |
+| `TIME(p)`                     | `Time{Precision: p}`                               | MySQL TIME is a *duration* (−838:59:59…838:59:59); PG `time` holds only 00:00–24:00. See [MySQL TIME range](#mysql-time-outside-postgres-times-range-durations--bug-187). |
 | `DATETIME(p)`                 | `DateTime{Precision: p}`                           | |
 | `TIMESTAMP(p)`                | `Timestamp{Precision: p, WithTimeZone: true}`      | MySQL `TIMESTAMP` always stores UTC. |
 | `YEAR`                        | `Integer{Width: 16}`                               | Lossy in name only; values preserved. |
@@ -319,6 +319,16 @@ PostgreSQL has no unsigned integer types.
 **Default policy:** keep the documented `TINYINT(1)`→`Boolean` mapping (changing it would break the overwhelming majority of schemas that *do* mean boolean), but **detect and WARN loudly** when a value outside `{0,1}` is read. The boolean decode collapses every non-zero value to `true`, so `2`/`127`/`-1` lose their real value; sluice now emits a one-time-per-column `WARN` (naming the `table.column` and an example value) on every read path — the bulk-copy / snapshot reader, the binlog CDC reader, and the VStream CDC + cold-start path — instead of doing it silently.
 
 **Override:** for a column that genuinely stores integers, supply `--type-override TABLE.COL=smallint` (or `=int`/`=integer`, or the per-column `mappings:` hook) to preserve the value end-to-end. The override rewrites the IR type the **reader** decodes with, so the cell is read as an integer (not collapsed to a bool) and carried faithfully to the target. `smallint` (16-bit) is the recommended floor: a `TINYINT(1)` value always fits, and — unlike a `tinyint` override — it cannot re-emit a MySQL `TINYINT(1)` target column that would re-trigger the boolean mapping on a round-trip.
+
+### MySQL `TIME` outside Postgres `time`'s range (durations) — Bug 187
+
+MySQL `TIME` is semantically a **duration**, spanning `-838:59:59` … `838:59:59` — negative values and values beyond 24 hours are legal and common in elapsed-time / offset columns. PostgreSQL `time` is a **time-of-day**: `00:00:00` – `24:00:00`, never negative. sluice maps MySQL `TIME(p)` → PG `time(p)` by default (correct for the overwhelmingly common time-of-day usage), so a stored duration outside PG `time`'s window has **no representation on the target**.
+
+**Default policy (unchanged):** keep the `TIME` → `time` mapping. A value outside `00:00:00–24:00:00` **refuses loudly at copy time** — pgx declines to encode it, and the table fails with coded `SLUICE-E-BULKCOPY-TABLE-FAILED` naming the table (zero rows written to it, zero silent loss). Nothing is ever clamped or wrapped.
+
+**The advisory (so the refusal isn't a mid-copy surprise):** `schema preview` emits a per-column hint on every MySQL-family → PG `TIME` column (the duration-range caveat plus the copy-pasteable override), and `migrate` / `sync` preflight WARNs with the same wording before any table is created or row moves — the same two-surface advisory wiring as the unsigned-bigint notice. The notice fires for every MySQL-family source (`mysql`, `planetscale`, `vitess`, `mydumper`) and is suppressed per-column once the operator applies an override.
+
+**Override (lossless):** for a column that stores durations, supply `--type-override TABLE.COL=interval` — PG `interval` holds the full MySQL `TIME` range, and the override is first-class on both `migrate` and continuous sync/CDC (the value is carried as its textual duration form, which PG's interval parser accepts). `--type-override TABLE.COL=text` carries it as raw text instead.
 
 ### Unconstrained Postgres `numeric` (no precision/scale) — owner-surface design call (v0.69.x / Bug #69)
 

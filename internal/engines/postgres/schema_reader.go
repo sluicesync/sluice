@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"strings"
 
+	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -520,41 +521,30 @@ func (r *SchemaReader) readViews(ctx context.Context) ([]*ir.View, error) {
 // sluice's own bookkeeping tables are excluded — they're persisted as
 // a side effect of running sluice itself, not user data, and including
 // them would surface as "your migration has an extra table" surprises
-// in cross-engine re-migrations:
-//
-//   - sluice_cdc_state — continuous-sync position store (target side).
-//   - sluice_migrate_state / sluice_migrate_table_progress —
-//     resumable-migration header + per-table progress rows (target
-//     side, ADR-0082).
-//   - sluice_change_log / sluice_change_log_meta — the postgres-trigger
-//     engine's source-side capture log + meta row (ADR-0066 §2/§3). The
-//     trigger engine reads schema via this reader by delegation
-//     (engines/pgtrigger), so excluding the names here fixes Bug 93 for
-//     BOTH the migrate (Migrator) and sync-start (Streamer) paths
-//     uniformly: without it the capture tables read back as user tables
-//     and a cross-engine `migrate` to MySQL hard-fails at create-tables
-//     (committed_at's statement_timestamp() default is untranslatable).
-//     The names are sluice-reserved, so the exclusion is harmless on a
-//     vanilla `postgres` source (a user table named sluice_change_log
-//     would itself be a name collision with sluice's own artifact). The
-//     literals are duplicated here rather than imported from pgtrigger
-//     to avoid a postgres→pgtrigger import cycle (pgtrigger imports
-//     postgres).
+// when a promoted ex-target is later read as a migration source (the
+// cutover flow). The full roster lives once in
+// [appliershared.ControlTableNames] (roadmap item 65b — this reader
+// previously excluded a 5-name subset and every later control table
+// missed it). Two notes that shaped the original list survive there:
+// the pgtrigger capture tables are in the roster as literals because
+// importing pgtrigger from below would cycle (pgtrigger imports
+// postgres — Bug 93), and the trigger engine reads schema via this
+// reader by delegation, so the exclusion covers BOTH the migrate
+// (Migrator) and sync-start (Streamer) paths uniformly. The names are
+// all sluice-reserved, so the exclusion is harmless on a vanilla
+// `postgres` source (a user table named sluice_change_log would itself
+// be a name collision with sluice's own artifact).
 func (r *SchemaReader) readTables(ctx context.Context) (map[string]*ir.Table, error) {
 	extMembers, err := r.extensionMemberRelations(ctx)
 	if err != nil {
 		return nil, err
 	}
-	const q = `
+	q := `
 		SELECT table_name
 		FROM   information_schema.tables
 		WHERE  table_schema = $1
 		  AND  table_type   = 'BASE TABLE'
-		  AND  table_name NOT IN (
-		           'sluice_cdc_state', 'sluice_migrate_state',
-		           'sluice_migrate_table_progress',
-		           'sluice_change_log', 'sluice_change_log_meta'
-		       )
+		  AND  table_name NOT IN (` + appliershared.ControlTableSQLList() + `)
 		ORDER  BY table_name`
 
 	rows, err := r.catalogQuery(ctx, q, r.schema)

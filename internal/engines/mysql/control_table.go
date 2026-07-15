@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	gomysql "github.com/go-sql-driver/mysql"
+
 	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -147,11 +149,18 @@ func validateControlKeyspace(name string) error {
 //     parity lets MySQL targets faithfully record what the streamer
 //     supplies — no behavior change for MySQL → MySQL flows where
 //     the streamer doesn't supply any of these values.
+//   - source_position TEXT → LONGTEXT widen (roadmap item 65a) — the
+//     engine-opaque position token is a GTID/VGTID set that can exceed
+//     TEXT's 64 KB (≈1000 server-UUID entries, or a very heavily
+//     sharded VGTID); sluice_cdc_schema_history.anchor_position was
+//     already LONGTEXT for exactly this reason. See
+//     [ensureLongTextPositionColumn] for the widen mechanics and the
+//     PlanetScale safe-migrations refusal shape.
 func ensureControlTable(ctx context.Context, db *sql.DB, controlKeyspace string) error {
 	ddl := `
 		CREATE TABLE IF NOT EXISTS ` + controlTableRef(controlKeyspace, controlTableName) + ` (
 			stream_id              VARCHAR(255) NOT NULL,
-			source_position        TEXT         NOT NULL,
+			source_position        LONGTEXT     NOT NULL,
 			updated_at             TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
 				ON UPDATE CURRENT_TIMESTAMP,
 			stop_requested_at      TIMESTAMP    NULL,
@@ -185,7 +194,12 @@ func ensureControlTable(ctx context.Context, db *sql.DB, controlKeyspace string)
 	// cross-engine parity columns above; NOT NULL DEFAULT 0 backfills
 	// legacy rows to 0 (an honest cumulative starting point — pre-upgrade
 	// applies were never tracked).
-	return ensureCrossEngineParityColumn(ctx, db, controlKeyspace, "rows_applied", "BIGINT NOT NULL DEFAULT 0")
+	if err := ensureCrossEngineParityColumn(ctx, db, controlKeyspace, "rows_applied", "BIGINT NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	// source_position TEXT → LONGTEXT widen (roadmap item 65a): tables
+	// created by a pre-widen binary carry the 64 KB TEXT column.
+	return ensureLongTextPositionColumn(ctx, db, controlKeyspace, controlTableName, "source_position", "LONGTEXT NOT NULL")
 }
 
 // shardConsolidationLeaseRow aliases the shared lease-row mirror of
@@ -422,7 +436,7 @@ func ensureShardConsolidationLeaseTable(ctx context.Context, db *sql.DB, control
 			applied_schema_version        BIGINT       NOT NULL DEFAULT 0,
 			applied_at                    TIMESTAMP    NULL,
 			created_at                    TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			anchor_position               TEXT         NULL,
+			anchor_position               LONGTEXT     NULL,
 			source_engine                 TEXT         NULL,
 			PRIMARY KEY (target_table_full_name)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
@@ -437,14 +451,20 @@ func ensureShardConsolidationLeaseTable(ctx context.Context, db *sql.DB, control
 	// reads anchor_position / source_engine; legacy rows have NULL and are
 	// defensively retained by the sweeper.
 	for _, col := range []struct{ name, def string }{
-		{"anchor_position", "TEXT NULL"},
+		{"anchor_position", "LONGTEXT NULL"},
 		{"source_engine", "TEXT NULL"},
 	} {
 		if err := ensureShardLeaseColumn(ctx, db, controlKeyspace, col.name, col.def); err != nil {
 			return err
 		}
 	}
-	return nil
+	// anchor_position TEXT → LONGTEXT widen (roadmap item 65a): tables
+	// created (or column-migrated) by a pre-widen binary carry the 64 KB
+	// TEXT column, but the anchor is the same engine-opaque position
+	// token sluice_cdc_state.source_position holds — a >64 KB GTID/VGTID
+	// set must fit both. No-op when the ADD above just created it as
+	// LONGTEXT.
+	return ensureLongTextPositionColumn(ctx, db, controlKeyspace, shardConsolidationLeaseTableName, "anchor_position", "LONGTEXT NULL")
 }
 
 // ensureShardLeaseColumn adds a column to the lease control table when
@@ -499,6 +519,76 @@ func ensureCrossEngineParityColumn(ctx context.Context, db *sql.DB, controlKeysp
 		return fmt.Errorf("mysql: ensure control table: add %s: %w", columnName, err)
 	}
 	return nil
+}
+
+// ensureLongTextPositionColumn widens a position-token column from
+// TEXT (64 KB) to LONGTEXT when — and ONLY when — the live column is
+// still `text` (roadmap item 65a). The engine-opaque position token is
+// a GTID/VGTID set with no upper bound sluice controls;
+// sluice_cdc_schema_history.anchor_position has been LONGTEXT from the
+// start for the same reason, and a >64 KB write into a TEXT column
+// fails loudly mid-stream (sluice pins STRICT_TRANS_TABLES — never a
+// silent truncation, but an avoidable stream abort).
+//
+// DETECT-FIRST is load-bearing, not an optimization: on a PlanetScale
+// safe-migrations production branch every direct DDL statement is
+// refused (Error 1105 "direct DDL is disabled") regardless of whether
+// it would change anything, so the already-LONGTEXT path must issue no
+// DDL at all — the same lesson as MigrationStateStore.EnsureControlTable's
+// detect-then-create gate (live-caught 2026-07-15). When the column IS
+// still TEXT and the ALTER itself trips the safe-migrations block, the
+// error is surfaced loudly with the exact statement to ship via a
+// deploy request — never a silent skip (see
+// [wrapPositionWidenDDLError]).
+//
+// A missing column (ErrNoRows) is tolerated as a no-op: the fresh
+// CREATEs declare LONGTEXT directly, and the add-column migrations own
+// the column-absent case.
+//
+// columnName / columnDef are internally-defined constants, never
+// operator input (same contract as ensureCrossEngineParityColumn).
+func ensureLongTextPositionColumn(ctx context.Context, db *sql.DB, controlKeyspace, tableName, columnName, columnDef string) error {
+	schemaRHS, schemaArgs := controlSchemaPredicate(controlKeyspace)
+	checkQ := "SELECT DATA_TYPE FROM information_schema.COLUMNS " +
+		"WHERE TABLE_SCHEMA = " + schemaRHS + " AND TABLE_NAME = ? AND COLUMN_NAME = ?"
+	args := append(append([]any{}, schemaArgs...), tableName, columnName)
+	var dataType string
+	switch err := db.QueryRowContext(ctx, checkQ, args...).Scan(&dataType); {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil
+	case err != nil:
+		return fmt.Errorf("mysql: ensure %s: detect %s type: %w", tableName, columnName, err)
+	}
+	if !strings.EqualFold(dataType, "text") {
+		// Already LONGTEXT (or some future shape) — no DDL.
+		return nil
+	}
+	alter := "ALTER TABLE " + controlTableRef(controlKeyspace, tableName) + " MODIFY COLUMN `" + columnName + "` " + columnDef
+	if _, err := db.ExecContext(ctx, alter); err != nil {
+		return wrapPositionWidenDDLError(err, tableName, columnName, alter)
+	}
+	return nil
+}
+
+// wrapPositionWidenDDLError shapes the failure of the item-65a widen
+// ALTER. The PlanetScale safe-migrations refusal (Error 1105 "direct
+// DDL is disabled") gets a dedicated remedy-bearing message carrying
+// the exact statement to ship via a deploy request; every other error
+// keeps the plain wrap. Loud by design: silently skipping the widen
+// would re-arm the >64 KB position-write failure this migration
+// exists to remove.
+func wrapPositionWidenDDLError(err error, tableName, columnName, alter string) error {
+	var mysqlErr *gomysql.MySQLError
+	if errors.As(err, &mysqlErr) && mysqlErr.Number == 1105 &&
+		strings.Contains(mysqlErr.Message, "direct DDL is disabled") {
+		return fmt.Errorf("%w: %w | "+
+			"sluice needs to widen %s.%s from TEXT to LONGTEXT (a GTID/VGTID position "+
+			"set can exceed TEXT's 64 KB), but the target branch has Safe Migrations "+
+			"enabled, which refuses direct DDL. Apply the widen via a PlanetScale "+
+			"deploy request — the exact statement is: %s — then re-run sluice",
+			ErrSafeMigrationsBlocked, err, tableName, columnName, alter)
+	}
+	return fmt.Errorf("mysql: ensure %s: widen %s to LONGTEXT: %w", tableName, columnName, err)
 }
 
 // ensureLiveAddedTablesColumn adds the live_added_tables column to

@@ -155,6 +155,31 @@ func TestHintsFor_MySQL_DATETIME_to_PG(t *testing.T) {
 	}
 }
 
+// TestHintsFor_MySQL_TIME_to_PG pins the Bug 187 preview-surface hint:
+// a MySQL TIME column heading to PG `time` gets the duration-range
+// caveat and the lossless `interval` override, from EVERY MySQL-family
+// source name (pin the class — the Bug 186 lesson), and never on a
+// non-PG target.
+func TestHintsFor_MySQL_TIME_to_PG(t *testing.T) {
+	src := col("elapsed", ir.Time{Precision: 6})
+	tgt := col("elapsed", ir.Time{Precision: 6})
+	for _, srcEngine := range []string{"mysql", "planetscale", "vitess", "mydumper"} {
+		got := HintsFor("shifts", src, tgt, srcEngine, "postgres")
+		if len(got) != 1 {
+			t.Fatalf("%s→postgres: expected 1 hint; got %d (%#v)", srcEngine, len(got), got)
+		}
+		if got[0].SuggestedOverride != "--type-override shifts.elapsed=interval" {
+			t.Errorf("%s→postgres: override = %q; want interval suggestion", srcEngine, got[0].SuggestedOverride)
+		}
+		if !strings.Contains(got[0].Message, "duration") || !strings.Contains(got[0].Message, "24:00") {
+			t.Errorf("%s→postgres: message = %q; want the duration/24h range caveat", srcEngine, got[0].Message)
+		}
+	}
+	if got := HintsFor("shifts", src, tgt, "postgres", "mysql"); len(got) != 0 {
+		t.Errorf("PG→MySQL TIME: expected 0 hints; got %d (%#v)", len(got), got)
+	}
+}
+
 func TestHintsFor_PG_UnboundedNumeric_to_MySQL(t *testing.T) {
 	src := col("amount", ir.Decimal{Unconstrained: true})
 	tgt := col("amount", ir.Decimal{Precision: 65, Scale: 30})
