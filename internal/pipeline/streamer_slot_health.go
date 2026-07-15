@@ -70,7 +70,9 @@ func (s *Streamer) attachSlotHealthProbe(ctx context.Context, streamID string) *
 		close:  func() { migcore.CloseIf(sr) },
 	}
 
-	go slotHealthProbeLoop(probeCtx, reporter, slot, streamID, DefaultSlotHealthThresholds(), slotHealthProbeTickInterval)
+	// Roadmap 64a: threshold crossings also page the configured notify
+	// sinks (nil when suppressed or no sink is set — slog WARNs only).
+	go slotHealthProbeLoop(probeCtx, reporter, slot, streamID, DefaultSlotHealthThresholds(), slotHealthProbeTickInterval, s.slotHealthNotifier())
 
 	slog.InfoContext(
 		ctx, "slot-health probe attached",

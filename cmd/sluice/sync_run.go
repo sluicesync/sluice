@@ -167,6 +167,12 @@ type SyncSpec struct {
 	// [schemaDriftSuppressFromSpec].
 	NotifySchemaDrift *bool `koanf:"notify-schema-drift"`
 
+	// NotifySlotHealth toggles the ADR-0059/roadmap-64a slot-health alerts
+	// per sync. Default ON; a *bool for the same v0.99.51 zero-value reason
+	// as NotifySchemaDrift: nil (omitted) ⇒ enabled, an explicit `false` ⇒
+	// disabled. See [slotHealthSuppressFromSpec].
+	NotifySlotHealth *bool `koanf:"notify-slot-health"`
+
 	NotifySMTPHost     string   `koanf:"notify-smtp-host"`
 	NotifySMTPPort     int      `koanf:"notify-smtp-port"`
 	NotifySMTPFrom     string   `koanf:"notify-smtp-from"`
@@ -867,6 +873,8 @@ func buildStreamerFromSpec(ctx context.Context, spec *SyncSpec, g *Globals) (*pi
 		NotifySMTP:            smtp,
 		// ADR-0157: default-ON schema-drift alert; nil (omitted) ⇒ enabled.
 		SuppressSchemaDriftNotify: schemaDriftSuppressFromSpec(spec.NotifySchemaDrift),
+		// Roadmap 64a: default-ON slot-health alert; nil (omitted) ⇒ enabled.
+		SuppressSlotHealthNotify: slotHealthSuppressFromSpec(spec.NotifySlotHealth),
 
 		// ADR-0126: per-sync PlanetScale telemetry config. The provider itself
 		// is built + attached in buildSupervisedFleet (it needs ctx + a poll
@@ -893,6 +901,14 @@ func buildStreamerFromSpec(ctx context.Context, spec *SyncSpec, g *Globals) (*pi
 // it. Mirrors [SyncStartCmd.suppressSchemaDriftNotify] for the CLI path.
 func schemaDriftSuppressFromSpec(notifySchemaDrift *bool) bool {
 	return notifySchemaDrift != nil && !*notifySchemaDrift
+}
+
+// slotHealthSuppressFromSpec is the same default-ON *bool → opt-OUT
+// mapping for the roadmap-64a slot-health alert (ADR-0059 implementation
+// note): nil (omitted) ⇒ ENABLED, explicit `false` ⇒ suppressed. Mirrors
+// [schemaDriftSuppressFromSpec] / [SyncStartCmd.suppressSlotHealthNotify].
+func slotHealthSuppressFromSpec(notifySlotHealth *bool) bool {
+	return notifySlotHealth != nil && !*notifySlotHealth
 }
 
 // smtpConfig assembles the [notify.SMTPConfig] from the spec's

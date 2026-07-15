@@ -1140,6 +1140,7 @@ type SyncStartCmd struct {
 	NotifyCooldown            time.Duration `help:"Minimum interval between re-fires of a STILL-breached target-metrics alert (ADR-0107 item 36). A sustained breach reminds at most once per this interval rather than every poll. Default 15m." default:"15m" placeholder:"DUR"`
 	NotifySyncLagSeconds      float64       `help:"Alert when sluice's OWN sync lag — seconds the target trails the source's latest applied commit (sluice_sync_lag_seconds, roadmap item 45) — is at or above this value. 0 (default) disables. UNGATED from PlanetScale telemetry: works on MySQL and Postgres alike, needing only a --notify-webhook/--notify-slack sink (NOT --planetscale-org). Distinct from --notify-lag-seconds, which is the PlanetScale control-plane TARGET-INTERNAL replica lag. Edge-triggered + cooldown'd; advisory + failure-isolated." placeholder:"SECONDS"`
 	NotifySchemaDrift         bool          `help:"Fire a critical notification (ADR-0157) to the configured --notify-* sink(s) when a source schema change stalls the sync — a DDL sluice cannot auto-forward (e.g. RENAME COLUMN on MySQL). The alert carries the drift detail + recovery steps. On by default (inert unless a sink is configured); UNGATED from PlanetScale telemetry — works on every engine pair. Pass --notify-schema-drift=false to disable while keeping metrics alerts. Advisory + failure-isolated: a delivery problem never affects the (already stalled) sync." default:"true"`
+	NotifySlotHealth          bool          `help:"Fire notifications (ADR-0059, roadmap item 64a) to the configured --notify-* sink(s) when the source Postgres replication slot crosses a health threshold — WAL retention pressure at 70% (warning) / 85% (critical) of max_slot_wal_keep_size, or 30m slot inactivity (warning) — so an unattended operator is paged before the slot invalidates (wal_status 'lost' forces a full re-snapshot). The alert carries the slot facts + remediation. On by default (inert unless a sink is configured; only fires for Postgres logical-replication sources — the structured slog WARNs fire regardless). Pass --notify-slot-health=false to keep the slog WARNs only. Advisory + failure-isolated: a delivery problem never affects the running sync." default:"true"`
 
 	// Email / SMTP notification sink (roadmap item 48 — ADR-0107 amendment).
 	// Opt-in (inert unless --notify-smtp-host is set); the password is supplied
@@ -1559,6 +1560,14 @@ func (s *SyncStartCmd) suppressSchemaDriftNotify() bool {
 	return !s.NotifySchemaDrift
 }
 
+// suppressSlotHealthNotify maps the CLI's default-ON --notify-slot-health
+// flag to the streamer's opt-OUT SuppressSlotHealthNotify field (ADR-0059
+// implementation note, roadmap item 64a). Same shape + same Bug-180 pin
+// rationale as [SyncStartCmd.suppressSchemaDriftNotify].
+func (s *SyncStartCmd) suppressSlotHealthNotify() bool {
+	return !s.NotifySlotHealth
+}
+
 // Run implements `sluice sync start`: it wraps the body in the
 // `--format json` result-envelope lifecycle (a pass-through in text
 // mode) so exactly one JSON object reaches stdout on every exit path.
@@ -1821,6 +1830,9 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 		// opt-OUT, so it stays enabled for every non-CLI construction (the
 		// v0.99.51 zero-value-safe posture). Inert unless a sink is configured.
 		SuppressSchemaDriftNotify: s.suppressSchemaDriftNotify(),
+		// Roadmap 64a: slot-health crossings page the same sinks. Default ON;
+		// opt-OUT field for the same zero-value-safe reason.
+		SuppressSlotHealthNotify: s.suppressSlotHealthNotify(),
 		// roadmap item 48: email/SMTP sink (inert unless --notify-smtp-host).
 		NotifySMTP:        s.smtpConfig(),
 		HeartbeatInterval: s.HeartbeatInterval,

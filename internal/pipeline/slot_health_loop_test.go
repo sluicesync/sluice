@@ -66,7 +66,7 @@ func TestSlotHealthProbeLoop_TicksAndCancels(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		slotHealthProbeLoop(ctx, r, "sluice_slot", "stream-x", DefaultSlotHealthThresholds(), 20*time.Millisecond)
+		slotHealthProbeLoop(ctx, r, "sluice_slot", "stream-x", DefaultSlotHealthThresholds(), 20*time.Millisecond, nil)
 		close(done)
 	}()
 
@@ -97,7 +97,7 @@ func TestSlotHealthProbeLoop_ProbeErrorDoesNotKillLoop(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		slotHealthProbeLoop(ctx, r, "sluice_slot", "stream-y", DefaultSlotHealthThresholds(), 20*time.Millisecond)
+		slotHealthProbeLoop(ctx, r, "sluice_slot", "stream-y", DefaultSlotHealthThresholds(), 20*time.Millisecond, nil)
 		close(done)
 	}()
 	time.Sleep(150 * time.Millisecond)

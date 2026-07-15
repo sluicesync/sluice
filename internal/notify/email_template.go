@@ -53,17 +53,21 @@ const (
 // committed sample-preview generator, so what an operator previews is exactly
 // what the relay sends.
 //
-// The rendering is category-dependent: a schema-drift alert (ADR-0157) has
-// no numeric reading, so it uses a distinct subject + templates that state
-// the Title and the Body (the drift detail + recovery steps) without the
-// "V ≥ T" line and the metric facts. A threshold alert (empty or
-// CategoryThreshold) renders through the original templates, byte-for-byte
-// unchanged.
+// The rendering is category-dependent: the event categories have no
+// numeric reading, so each uses a distinct subject + templates that state
+// the Title and the Body without the "V ≥ T" line and the metric facts —
+// schema-drift (ADR-0157) carries the drift detail + recovery steps,
+// slot-health (ADR-0059, roadmap item 64a) the slot facts + remediation.
+// A threshold alert (empty or CategoryThreshold) renders through the
+// original templates, byte-for-byte unchanged.
 func renderEmail(n Notification) (subject, htmlBody, textBody string, err error) {
 	v := newEmailView(n)
 	htmlTmpl, textTmpl := emailHTMLTemplate, emailTextTemplate
-	if n.Category.IsSchemaDrift() {
+	switch {
+	case n.Category.IsSchemaDrift():
 		htmlTmpl, textTmpl = emailHTMLTemplateSchemaDrift, emailTextTemplateSchemaDrift
+	case n.Category.IsSlotHealth():
+		htmlTmpl, textTmpl = emailHTMLTemplateSlotHealth, emailTextTemplateSlotHealth
 	}
 	subject = emailSubject(n)
 	var hb bytes.Buffer
@@ -79,12 +83,20 @@ func renderEmail(n Notification) (subject, htmlBody, textBody string, err error)
 
 // emailSubject is the one-line subject. For a threshold alert it is
 // "[sluice] <metric> threshold alert: <stream>"; for a schema-drift alert
-// it is "[sluice] schema change stalled sync: <stream>" (no metric). The
-// stream segment is dropped when the id is empty so the subject never
-// trails a dangling colon.
+// it is "[sluice] schema change stalled sync: <stream>" (no metric); for a
+// slot-health alert it is "[sluice] replication slot health alert:
+// <stream>". The stream segment is dropped when the id is empty so the
+// subject never trails a dangling colon.
 func emailSubject(n Notification) string {
 	if n.Category.IsSchemaDrift() {
 		s := "[sluice] schema change stalled sync"
+		if n.StreamID != "" {
+			s += ": " + n.StreamID
+		}
+		return s
+	}
+	if n.Category.IsSlotHealth() {
+		s := "[sluice] replication slot health alert"
 		if n.StreamID != "" {
 			s += ": " + n.StreamID
 		}
@@ -272,4 +284,81 @@ resolved. Details and recovery steps:
 Advisory alert from sluice. Notifications are failure-isolated — a delivery
 problem never affects the running sync. This alert fires once per distinct
 schema-change stall.
+`))
+
+// emailHTMLTemplateSlotHealth is the slot-health (ADR-0059, roadmap item
+// 64a) HTML body: the same card chrome as the threshold email, but stating
+// the crossing Title and the facts/remediation Body instead of the
+// "value ≥ threshold" block + metric facts. The Body carries the slot name,
+// the retention/inactivity reading, and the remediation verbatim; it is
+// preformatted text, so it is rendered inside a <pre> so the multi-line
+// remediation keeps its shape.
+var emailHTMLTemplateSlotHealth = template.Must(template.New("email_slot_health.html").Parse(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Replication slot health alert</title>
+</head>
+<body style="margin:0; padding:0; background-color:#f4f5f7; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; color:#1f2328;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#f4f5f7; padding:24px 0;">
+<tr><td align="center">
+<table role="presentation" width="520" cellpadding="0" cellspacing="0" style="max-width:520px; width:100%; background-color:#ffffff; border-radius:10px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+<tr>
+<td style="background-color:{{.Accent}}; padding:18px 28px;">
+<div style="font-size:12px; font-weight:700; letter-spacing:0.12em; color:#ffffff; opacity:0.85;">SLUICE &middot; {{.LevelLabel}} ALERT</div>
+<div style="font-size:20px; font-weight:700; color:#ffffff; margin-top:4px;">{{.Title}}</div>
+</td>
+</tr>
+<tr>
+<td style="padding:28px;">
+<div style="font-size:15px; line-height:1.5; color:#3a3f45;">
+The source replication slot for sync <strong>{{.StreamID}}</strong> crossed a
+health threshold. The sync is still running, but if the condition persists
+Postgres can invalidate the slot (wal_status &rarr; 'lost') and a fresh
+re-snapshot would be the only recovery. Details and remediation:
+</div>
+<div style="margin:22px 0; padding:16px 18px; background-color:#f7f8fa; border-left:4px solid {{.Accent}}; border-radius:4px;">
+<pre style="margin:0; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:13px; line-height:1.5; color:#3a3f45; white-space:pre-wrap; word-break:break-word;">{{.Body}}</pre>
+</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:14px; color:#3a3f45; border-collapse:collapse;">
+<tr><td style="padding:6px 0; color:#6a737d; width:130px;">Stream</td><td style="padding:6px 0; font-weight:600;">{{.StreamID}}</td></tr>
+<tr><td style="padding:6px 0; color:#6a737d;">Severity</td><td style="padding:6px 0; font-weight:600;">{{.LevelLabel}}</td></tr>
+<tr><td style="padding:6px 0; color:#6a737d;">Time (UTC)</td><td style="padding:6px 0; font-weight:600;">{{.At}}</td></tr>
+</table>
+</td>
+</tr>
+<tr>
+<td style="padding:16px 28px; background-color:#fafbfc; border-top:1px solid #eaecef; font-size:12px; line-height:1.5; color:#8a929b;">
+Advisory alert from sluice. Notifications are failure-isolated &mdash; a delivery
+problem never affects the running sync. Re-fires are rate-limited while the
+condition persists and re-arm when it clears.
+</td>
+</tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>
+`))
+
+// emailTextTemplateSlotHealth is the slot-health plaintext fallback: the
+// same facts line-oriented, with the facts/remediation Body reproduced
+// verbatim.
+var emailTextTemplateSlotHealth = texttemplate.Must(texttemplate.New("email_slot_health.txt").Parse(`[sluice] {{.LevelLabel}} ALERT — {{.Title}}
+
+The source replication slot for sync {{.StreamID}} crossed a health
+threshold. The sync is still running, but if the condition persists Postgres
+can invalidate the slot (wal_status -> 'lost') and a fresh re-snapshot would
+be the only recovery. Details and remediation:
+
+{{.Body}}
+
+  Stream:      {{.StreamID}}
+  Severity:    {{.LevelLabel}}
+  Time (UTC):  {{.At}}
+
+Advisory alert from sluice. Notifications are failure-isolated — a delivery
+problem never affects the running sync. Re-fires are rate-limited while the
+condition persists and re-arm when it clears.
 `))

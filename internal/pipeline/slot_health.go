@@ -25,6 +25,11 @@ package pipeline
 // inactive → clean emits a "cleared" INFO so operators see "the alarm
 // resolved itself" rather than silence.
 //
+// Roadmap item 64a promotes the same crossings to the notification
+// sinks (webhook/Slack/SMTP) — see slot_health_notify.go and the
+// ADR-0059 implementation note. The notification fires exactly when the
+// slog WARN fires; a clear stays log-only.
+//
 // **Why this is a separate file from streamer.go.** The threshold logic
 // is a pure function (no engine imports, no DB calls) and the rate-limit
 // state is a small map; both belong in their own unit-testable surface.
@@ -38,6 +43,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/notify"
 )
 
 // SlotHealthThresholds carries the configurable bounds the threshold
@@ -309,10 +315,7 @@ func emitSlotHealthWarning(ctx context.Context, snap ir.SlotHealth, streamID str
 			slog.Int64("max_slot_wal_keep_size_bytes", snap.MaxKeepSizeBytes),
 			slog.String("wal_status", snap.WALStatus),
 			slog.Bool("critical", false),
-			slog.String("hint", fmt.Sprintf(
-				"slot %q is holding back %d bytes of WAL (%.1f%% of max_slot_wal_keep_size); the consumer may be falling behind — check that sluice (or whichever consumer owns this slot) is keeping up with source writes, or raise max_slot_wal_keep_size if the workload's burst is legitimate.",
-				snap.SlotName, snap.LagBytes, dec.PercentUsed,
-			)),
+			slog.String("hint", slotHealthHint(snap, dec)),
 			slog.String("see", "ADR-0059"),
 		)
 	case slotWarnRetention85:
@@ -325,10 +328,7 @@ func emitSlotHealthWarning(ctx context.Context, snap ir.SlotHealth, streamID str
 			slog.Int64("max_slot_wal_keep_size_bytes", snap.MaxKeepSizeBytes),
 			slog.String("wal_status", snap.WALStatus),
 			slog.Bool("critical", true),
-			slog.String("hint", fmt.Sprintf(
-				"slot %q is holding back %d bytes of WAL (%.1f%% of max_slot_wal_keep_size); Postgres will invalidate this slot (wal_status -> 'lost') if the lag exceeds 100%% — intervene now: confirm the consumer is alive, drain its backlog, or raise max_slot_wal_keep_size temporarily. If the slot is already lost a fresh re-snapshot is the only recovery.",
-				snap.SlotName, snap.LagBytes, dec.PercentUsed,
-			)),
+			slog.String("hint", slotHealthHint(snap, dec)),
 			slog.String("see", "ADR-0059"),
 		)
 	case slotWarnInactive:
@@ -340,13 +340,36 @@ func emitSlotHealthWarning(ctx context.Context, snap ir.SlotHealth, streamID str
 			slog.Duration("inactive_for", dec.InactiveFor),
 			slog.String("wal_status", snap.WALStatus),
 			slog.Int64("lag_bytes", snap.LagBytes),
-			slog.String("hint", fmt.Sprintf(
-				"slot %q has been inactive for %s; the consumer (sluice or otherwise) is no longer attached — check whether the streamer is still running, the network path to the source is healthy, and the replication connection hasn't been killed by the source-side wal_sender_timeout.",
-				snap.SlotName, dec.InactiveFor.Round(time.Second),
-			)),
+			slog.String("hint", slotHealthHint(snap, dec)),
 			slog.String("see", "ADR-0059"),
 		)
 	}
+}
+
+// slotHealthHint is the single definition of the ADR-0059 operator-
+// actionable remediation text per condition. Shared by the slog WARN
+// (the "hint" field above) and the roadmap-64a notification body
+// ([makeSlotHealthNotification]) so the guidance an operator sees in the
+// log and in the page can never drift apart.
+func slotHealthHint(snap ir.SlotHealth, dec slotWarningDecision) string {
+	switch dec.Kind {
+	case slotWarnRetention70:
+		return fmt.Sprintf(
+			"slot %q is holding back %d bytes of WAL (%.1f%% of max_slot_wal_keep_size); the consumer may be falling behind — check that sluice (or whichever consumer owns this slot) is keeping up with source writes, or raise max_slot_wal_keep_size if the workload's burst is legitimate.",
+			snap.SlotName, snap.LagBytes, dec.PercentUsed,
+		)
+	case slotWarnRetention85:
+		return fmt.Sprintf(
+			"slot %q is holding back %d bytes of WAL (%.1f%% of max_slot_wal_keep_size); Postgres will invalidate this slot (wal_status -> 'lost') if the lag exceeds 100%% — intervene now: confirm the consumer is alive, drain its backlog, or raise max_slot_wal_keep_size temporarily. If the slot is already lost a fresh re-snapshot is the only recovery; if the slot is abandoned (no consumer will ever resume), drop it so it stops retaining WAL.",
+			snap.SlotName, snap.LagBytes, dec.PercentUsed,
+		)
+	case slotWarnInactive:
+		return fmt.Sprintf(
+			"slot %q has been inactive for %s; the consumer (sluice or otherwise) is no longer attached — check whether the streamer is still running, the network path to the source is healthy, and the replication connection hasn't been killed by the source-side wal_sender_timeout.",
+			snap.SlotName, dec.InactiveFor.Round(time.Second),
+		)
+	}
+	return ""
 }
 
 // slotHealthProbeLoop is the per-stream background goroutine that
@@ -358,12 +381,21 @@ func emitSlotHealthWarning(ctx context.Context, snap ir.SlotHealth, streamID str
 // The probe is a single cheap query (one row from pg_replication_slots
 // joined to pg_current_wal_lsn + a pg_settings lookup); calling it
 // every 30s adds negligible source-side load.
+//
+// notifier is the roadmap-64a sink fan-out for threshold crossings
+// (nil ⇒ slog WARNs only, the pre-64a behavior). A notification fires
+// exactly when the slog WARN fires (dec.Emit): crossings and
+// escalations page immediately, in-condition repeats are held to the
+// thresholds' rate-limit window, and a cleared-then-re-entered
+// condition re-fires — one mechanism for both surfaces, per the
+// ADR-0059 implementation note.
 func slotHealthProbeLoop(
 	ctx context.Context,
 	reporter ir.SlotHealthReporter,
 	slotName, streamID string,
 	thresholds SlotHealthThresholds,
 	tickInterval time.Duration,
+	notifier notify.Notifier,
 ) {
 	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
@@ -392,6 +424,7 @@ func slotHealthProbeLoop(
 			}
 			dec := evaluateSlotHealth(snap, state, thresholds, now)
 			emitSlotHealthWarning(ctx, snap, streamID, dec)
+			notifySlotHealthCrossing(ctx, notifier, streamID, snap, dec)
 			recordSlotHealthEmission(state, dec, now)
 		}
 	}

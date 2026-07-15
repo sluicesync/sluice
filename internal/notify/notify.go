@@ -59,6 +59,13 @@ const (
 	// sync. No numeric reading; the sinks render Title + Body (the drift
 	// detail + recovery steps) without the "V ≥ T" line.
 	CategorySchemaDrift Category = "schema-drift"
+
+	// CategorySlotHealth is the ADR-0059 class (roadmap item 64a): the
+	// source Postgres replication slot crossed a health threshold — WAL
+	// retention pressure against max_slot_wal_keep_size, or prolonged
+	// inactivity. No numeric reading; the sinks render Title + Body (the
+	// slot facts + remediation) without the "V ≥ T" line.
+	CategorySlotHealth Category = "slot-health"
 )
 
 // IsSchemaDrift reports whether c is the schema-drift category. Kept as a
@@ -67,6 +74,18 @@ const (
 // [CategorySchemaDrift] takes the event-shaped rendering, and every other
 // value (including the zero value) renders as a threshold alert.
 func (c Category) IsSchemaDrift() bool { return c == CategorySchemaDrift }
+
+// IsSlotHealth reports whether c is the slot-health category. Same posture
+// as [Category.IsSchemaDrift]: only the explicit value takes the
+// event-shaped rendering.
+func (c Category) IsSlotHealth() bool { return c == CategorySlotHealth }
+
+// IsEvent reports whether c is one of the EVENT-shaped categories
+// (schema-drift, slot-health): a discrete operational event with no
+// numeric "V ≥ T" reading, rendered by the sinks as Title + Body. Every
+// other value — including the zero value — renders as a threshold alert,
+// so the pre-Category metrics notifications stay byte-for-byte unchanged.
+func (c Category) IsEvent() bool { return c.IsSchemaDrift() || c.IsSlotHealth() }
 
 // Notification is one operator-facing alert. It is a plain, engine-neutral
 // value: the pipeline alerter fills it from a telemetry snapshot, the

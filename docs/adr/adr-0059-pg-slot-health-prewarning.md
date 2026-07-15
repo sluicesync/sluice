@@ -263,3 +263,17 @@ conversion is correct (64 MB → 67108864 bytes, -1 → -1).
 - PostgreSQL docs: `max_slot_wal_keep_size`,
   `pg_replication_slots.wal_status`, `pg_wal_lsn_diff`,
   `pg_settings`.
+
+## Implementation note (2026-07-14): threshold crossings promoted to the notification sinks (roadmap item 64a)
+
+The slog WARNs above are invisible to an unattended operator — exactly the "set it and forget it" case where the F13 silent-loss window is most costly. Roadmap item 64a promotes the same threshold crossings to the notification sinks the metrics alerter (ADR-0107 item 36) and the schema-drift alert (ADR-0157) use — webhook / Slack / SMTP — so the operator is paged before the slot invalidates:
+
+- **≥ 85% retention pressure** → a `critical` notification.
+- **≥ 70% retention pressure** → a `warning` notification.
+- **≥ 30m slot inactivity** → a `warning` notification with the "is the consumer dead?" framing.
+
+The notification body reuses the slog `hint` text verbatim (single definition, `slotHealthHint`) plus the raw slot facts (`max_slot_wal_keep_size`, `wal_status`, lag bytes), so the page and the log line can never disagree about what happened or what to do. The 85% remediation now also names the third leg of the recovery triangle explicitly: resume/unstick the consumer, raise `max_slot_wal_keep_size`, or drop the slot if it's abandoned.
+
+**One firing mechanism, not two.** A notification fires exactly when the slog WARN fires (`slotWarningDecision.Emit`): state transitions — clean → warn, warn → critical, and a cleared-then-re-entered condition — page immediately; an unchanged in-condition repeat is held to this ADR's existing 5-minute rate-limit window (the sustained-condition reminder, the counterpart of the metrics alerter's cooldown re-fire). This deliberately reuses the evaluator's decision rather than adding an ADR-0157-style separate latch — the evaluator's transition rule already IS the edge-once semantics, and a second latch could drift from the logged surface. The "cleared" transition stays a slog INFO only (resolution is not a page).
+
+**Gating and posture (mirrors ADR-0157 exactly).** `--notify-slot-health` (bool, default **true**) on `sync start`, and `notify-slot-health` per-sync in a `sync run` fleet spec (a `*bool`: omitted ⇒ enabled). Zero-value-safe per the v0.99.51 rule: the streamer stores the opt-OUT `SuppressSlotHealthNotify` (zero value ⇒ enabled) and the CLI sets it from the flag's negation. Inert unless a notify sink is configured AND the source implements `ir.SlotHealthReporter` (today: Postgres logical replication — the probe only attaches on the streamer path, so backup/broker behavior is unchanged); the slog WARNs fire regardless of the flag. The sink set is assembled by the same `buildMetricsNotifierFrom` as every other alert (one definition of the sinks), and delivery is failure-isolated verbatim: a dead sink is logged at WARN and swallowed, never touching the probe loop or the sync.

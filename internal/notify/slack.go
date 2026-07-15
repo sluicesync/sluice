@@ -49,18 +49,18 @@ func (s *SlackNotifier) client() *http.Client {
 //
 // The body shape is category-dependent: a threshold alert renders the
 // numeric "metric V ≥ T" reading, e.g. ":rotating_light: [sluice s1]
-// storage_util 0.91 ≥ 0.90 — target storage approaching capacity"; a
-// schema-drift alert (ADR-0157) has no numeric reading, so it renders the
-// Title as the headline and appends the Body detail, e.g.
-// ":rotating_light: [sluice s1] Schema change stalled sync \"s1\" — <drift
-// + recovery steps>". A threshold notification (empty or CategoryThreshold)
-// renders exactly as before.
+// storage_util 0.91 ≥ 0.90 — target storage approaching capacity"; an
+// EVENT alert (schema-drift, ADR-0157; slot-health, ADR-0059) has no
+// numeric reading, so it renders the Title as the headline and appends
+// the Body detail, e.g. ":rotating_light: [sluice s1] Schema change
+// stalled sync \"s1\" — <drift + recovery steps>". A threshold
+// notification (empty or CategoryThreshold) renders exactly as before.
 func slackText(n Notification) string {
 	emoji := ":warning:"
 	if n.Level == LevelCritical {
 		emoji = ":rotating_light:"
 	}
-	if n.Category.IsSchemaDrift() {
+	if n.Category.IsEvent() {
 		line := fmt.Sprintf("%s [sluice %s] %s", emoji, n.StreamID, n.Title)
 		if n.Body != "" {
 			line += " — " + n.Body

@@ -530,6 +530,28 @@ type Streamer struct {
 	// check on the stall path).
 	schemaDriftNotifierForTest notify.Notifier
 
+	// SuppressSlotHealthNotify opts OUT of the roadmap-64a slot-health alert
+	// (ADR-0059 implementation note): the ADR-0059 threshold crossings —
+	// WAL retention pressure at 70% (warning) / 85% (critical) of
+	// max_slot_wal_keep_size, 30m slot inactivity (warning) — fired to the
+	// SAME sinks as the metrics alerter and the schema-drift alert
+	// (webhook/Slack/SMTP), so an unattended operator is paged before the
+	// slot invalidates instead of discovering wal_status='lost' in the
+	// logs. The desired default is ON, so the field is named for the
+	// OPT-OUT it isn't: the zero value (false) leaves the alert ENABLED
+	// for every construction (the v0.99.51 zero-value-safe posture). The
+	// CLI sets it from `!--notify-slot-health`. Inert unless a sink is
+	// configured AND the source implements [ir.SlotHealthReporter] (today:
+	// Postgres logical replication); the structured slog WARNs fire
+	// regardless. Advisory + failure-isolated — never on the value path.
+	SuppressSlotHealthNotify bool
+
+	// slotHealthNotifierForTest is a TEST-ONLY seam mirroring
+	// schemaDriftNotifierForTest: when non-nil, [Streamer.slotHealthNotifier]
+	// resolves to it instead of the sink set assembled from the notify URLs.
+	// nil in production.
+	slotHealthNotifierForTest notify.Notifier
+
 	// MaxBufferBytes is the soft upper bound on per-batch buffered
 	// memory in the CDC applier (and, on the cold-start branch, the
 	// bulk-copy writer). Each in-flight target transaction tracks
