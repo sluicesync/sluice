@@ -4,6 +4,34 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.253] - 2026-07-15
+
+### Fixed
+
+- **PG foreign tables (FDW) now WARN-and-skip loudly, naming each table and its foreign server (roadmap item 68a; the silent skip existed in every prior release with a Postgres source).** The PG schema reader filters on `table_type='BASE TABLE'`, so foreign tables never entered the migration — correctly (a foreign table holds no local rows; materializing remote data would itself be a surprising side effect) — but with zero signal. A new `relkind='f'` census (`SchemaReader.ForeignTables`, `pg_foreign_table` + `pg_foreign_server`) feeds a preflight WARN naming every skipped foreign table, its server, and the recovery paths (migrate the foreign server directly as its own sluice source, or recreate the FDW wiring on the target); `--exclude-table` per table acknowledges the skip and silences it. No data was ever wrong — the wart was the silence, not the skip.
+
+- **Old-style INHERITS hierarchies now refuse loudly at migrate and sync cold start (roadmap item 68b; the silent duplication affected every prior release — declarative partitions were guarded since v0.92.0's Bug-100 refusal, the legacy twin never was).** Inheritance children are ordinary BASE tables the reader copies independently, but a SELECT on the parent (without `ONLY`) ALSO returns every child's rows — so an unguarded migration landed the child data twice: flattened into the parent's target table AND in each child's. The only catalog signal is a `pg_inherits` parent with `relkind='r'` (new `SchemaReader.InheritanceParents` probe, disjoint from Bug 100's declarative probe). Same gate/skip/in-scope shape as the partition preflight — filter-aware, so `--exclude-table=<parent>` opts out — and the refusal names every offending parent plus three recovery paths (exclude the parents after verifying `SELECT count(*) FROM ONLY <parent>` is 0; exclude the children to deliberately flatten; scope via `--include-table`). Operators who migrated an INHERITS hierarchy on any release through v0.99.252 should verify the target for duplicated child rows.
+
+### Added
+
+- **Coded `SLUICE-E-CDC-POOLER-ENDPOINT` — `sync start` through a connection pooler refuses with the mechanism and the direct-endpoint remedy (item 69e, live-caught on Supabase).** Supavisor/pgbouncer strip the `replication=database` startup parameter, so `CREATE_REPLICATION_SLOT` reaches a normal backend as plain SQL and dies with a bare SQLSTATE 42601 — previously a baffling failure. The classifier at the `createLogicalReplicationSlot` chokepoint matches that exact live-probed signature (42601 on/near the slot command; anything else passes through) and names the pooler, the direct endpoint, and the Supabase IPv4-add-on caveat.
+
+- **Coded `SLUICE-E-CONNECT-IPV6-ONLY` — AAAA-only resolve failures explain themselves (item 69f, live-probed against Supabase, whose free-tier direct endpoints carry only an AAAA record).** `WrapWithHint` gains a structural DNS classifier: on a no-data/not-found `net.DNSError` it probes the host for an AAAA record (bounded at 3s, only on the already-terminal failure path); when the host is resolvable-but-IPv6-only the error gains the remedy — pooler endpoint for bulk migrate, IPv4 add-on or IPv6-capable network for CDC (a pooler cannot proxy replication). No-AAAA hosts fall through to the static registry unchanged.
+
+- **Pooler-host WARN at migrate/sync/backup start (item 69a; live-validated against Neon and Supabase).** New optional `ir.SourceHostAdvisor` engine surface — the WARN sibling of `ir.DSNValidator`, derived from the source DSN's host alone — called at the top of migrate, sync, and the backup CDC paths. The PG engine WARNs on named pooler patterns (Supavisor `*.pooler.supabase.com`, the `-pooler` host label Neon uses, `pgbouncer`): bulk migrate through a pooler works, but parallel copy pins connections inside long-lived snapshot transactions (pool-exhaustion risk at scale) and transaction-mode poolers break pgx's statement cache, silently dropping to the single-reader path. The run proceeds; the WARN recommends the direct endpoint.
+
+- **DigitalOcean Managed MySQL lying-retention advisory at sync/backup start (item 70a, live-probed on a fresh MySQL 8.4 cluster).** DO's platform reaper purges binlogs ~10–15 minutes after creation while `@@binlog_expire_logs_seconds` reads 3 days — the variable lies, so the `*.db.ondigitalocean.com` host pattern is the only reliable signal. CDC-anchoring runs (sync, backup; plain migrate is exempt) WARN with the mechanism and the confirmed fix: DO's config-API knob `binlog_retention_period` (`PATCH /v2/databases/{id}/config`, seconds 600–86400, 86400 recommended; effective immediately, no restart). Without it the hazard is loud only AFTER loss, and a >15-minute cold copy can livelock auto-resnapshot.
+
+- **The `wal_level` refusal remedy is now provider-shaped (item 69b)** and points at the new provider matrix in `docs/postgres-source-prep.md` (self-managed, Neon `enable_logical_replication` — irreversible, validated live; Supabase already logical; PlanetScale Postgres; RDS/Aurora `rds.logical_replication`; CloudSQL; Azure) instead of baking "edit postgresql.conf and restart" into the error text.
+
+- **Within-table-parallel bulk copies emit the table-level "bulk copy complete" INFO line (item 69c)** — rows, chunks, duration, matching the single-reader path's completion vocabulary; previously the parallel path finished with per-chunk/DEBUG lines only and the table-level completion was silent.
+
+- **`docs/managed-services.md` gains live-validated Neon, Supabase, and DigitalOcean Managed MySQL sections (items 69d/69g/70b) plus the ps-discovery acknowledgment** — live-probed facts only (Neon `wal_proposer_slot` internal slot, Supabase session-vs-transaction pooler modes and the IPv6-only direct endpoint, DO private-CA TLS / `ANSI` sql_mode / `sql_require_primary_key`).
+
+### Compatibility
+
+- **Additive; no flag, default, or copy-behavior changes.** New WARNs and coded refusals on previously silent-or-confusing paths; the foreign-table WARN formalizes existing skip behavior (tables were already skipped, now loudly). One new refusal on a previously-proceeding shape: an in-scope old-style INHERITS parent now refuses at preflight instead of silently duplicating child rows — `--exclude-table`/`--include-table` opt back in deliberately, and the refusal message walks through the options.
+
 ## [0.99.252] - 2026-07-15
 
 ### Fixed
