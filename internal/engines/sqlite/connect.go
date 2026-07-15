@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"sluicesync.dev/sluice/internal/engines/internal/dumpsig"
 )
 
 // queryOnlyPragma is appended to every driver DSN so modernc.org/sqlite
@@ -203,9 +205,37 @@ func openReadOnly(ctx context.Context, dsn string) (db *sql.DB, path string, enc
 
 	isBinary, err := sniffSQLiteBinary(path)
 	if err != nil {
+		// A directory can't be a SQLite file — before failing generically, check
+		// whether the operator pointed the sqlite driver at a mydumper dump
+		// directory and name the right driver (roadmap item 55 Phase 3).
+		if info, serr := os.Stat(path); serr == nil && info.IsDir() && dumpsig.LooksLikeMydumperDir(path) {
+			return nil, "", dateEncodingInherit, "", dumpsig.RefuseWrongDriver("sqlite",
+				"use --source-driver mydumper",
+				fmt.Errorf("%q is a mydumper/pscale-dump output directory — use --source-driver mydumper", path))
+		}
 		return nil, "", dateEncodingInherit, "", fmt.Errorf("sqlite: open %q: %w", path, err)
 	}
 	if !isBinary {
+		// Phase 3 of the ADR-0130 sniff (ADR-0163): before treating the file as
+		// a SQLite SQL dump, refuse the well-known foreign formats LOUDLY — a
+		// plain mysqldump/pg_dump `.sql` or a PGDMP archive would otherwise die
+		// mid-materialize on a confusing SQL error; the refusal names the
+		// scratch-server-replay recipe instead. A compressed or UTF-16 file gets
+		// the matching preparation hint.
+		kind, derr := dumpsig.Detect(path)
+		if derr != nil {
+			return nil, "", dateEncodingInherit, "", fmt.Errorf("sqlite: open %q: %w", path, derr)
+		}
+		if rerr := dumpsig.RefuseRecognised("sqlite", path, kind, true); rerr != nil {
+			return nil, "", dateEncodingInherit, "", rerr
+		}
+		// A schema-less flat file (by extension) belongs to the csv/tsv/ndjson
+		// drivers — materializing it as SQL would fail on the first record.
+		if drv, ok := dumpsig.FlatFileExtDriver(path); ok {
+			return nil, "", dateEncodingInherit, "", dumpsig.RefuseWrongDriver("sqlite",
+				"use --source-driver "+drv,
+				fmt.Errorf("%q looks like a %s flat file — use --source-driver %s (the sqlite driver reads binary .db files and `sqlite3 .dump` SQL dumps)", path, drv, drv))
+		}
 		// A SQL text dump (e.g. `wrangler d1 export`): materialize it into a
 		// temp DB and read THAT, keeping `path` pointed at the original dump for
 		// error messages. The read-only pragmas still apply on the temp pool.

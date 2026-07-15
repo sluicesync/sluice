@@ -352,6 +352,13 @@ var isoDateTimeLayouts = []string{
 	"2006-01-02 15:04:05.999999999",
 	"2006-01-02T15:04:05.999999999Z07:00",
 	time.RFC3339,
+	// T-separated NAIVE datetime (no zone). Without this layout a
+	// `2024-06-07T08:09:10` value was refused even though the ADR-0144
+	// inference GLOB (`[ T]`, infer_types.go) validates and promotes it —
+	// the validator promised what the decoder then refused (caught by the
+	// flat-file integration suite, ADR-0163). Ordered after the zoned forms
+	// so zoned values keep matching their zone-carrying layouts.
+	"2006-01-02T15:04:05.999999999",
 	"2006-01-02",
 }
 

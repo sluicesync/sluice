@@ -172,9 +172,12 @@ func TestOpenDumpDir_Refusals(t *testing.T) {
 }
 
 func TestOpenDumpDir_NotADirectory(t *testing.T) {
+	// A mysqldump-signature file now gets the recipe-bearing foreign-dump
+	// refusal instead (ADR-0163, pinned in dir_wrong_driver_test.go); an
+	// unrecognised file keeps the generic not-a-directory shape.
 	dir := t.TempDir()
 	file := filepath.Join(dir, "dump.sql")
-	if err := os.WriteFile(file, []byte("-- MySQL dump"), 0o644); err != nil {
+	if err := os.WriteFile(file, []byte("SELECT 1; -- not any recognised dump signature"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := openDumpDir(file); err == nil || !strings.Contains(err.Error(), "not a directory") {

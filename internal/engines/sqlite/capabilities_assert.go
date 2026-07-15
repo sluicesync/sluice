@@ -43,6 +43,12 @@ var (
 	_ ir.InferredTypeValidator = (*SchemaReader)(nil)
 	_ ir.InferredTypeValidator = (*D1SchemaReader)(nil)
 
+	// File SchemaReader: verify's count depth (ADR-0163 — added with the
+	// flat-file staging shim, and load-bearing for the staged csv/tsv/ndjson
+	// sources). Losing ir.Verifier turns `sluice verify --depth count` against
+	// a sqlite/flat-file endpoint into an "engine not supported" refusal.
+	_ ir.Verifier = (*SchemaReader)(nil)
+
 	// File RowReader: the cursor/batched read family. Losing BatchedRowReader/
 	// BoundedBatchedRowReader silently demotes every large-table copy to the
 	// single-reader path (no within-table parallelism, no per-batch resume);

@@ -33,6 +33,7 @@ import (
 	// register them with the engines registry. Add a new engine by
 	// importing its package here.
 	_ "sluicesync.dev/sluice/internal/engines/d1-trigger"
+	_ "sluicesync.dev/sluice/internal/engines/flatfile"
 	_ "sluicesync.dev/sluice/internal/engines/mydumper"
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/pgtrigger"

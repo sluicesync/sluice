@@ -159,6 +159,45 @@ func TestDecodeTemporal_ISOUnparseable(t *testing.T) {
 	}
 }
 
+// TestDecodeTemporal_ISOSeparatorZoneMatrix pins the full ISO datetime
+// separator × zone × fraction family (the Bug-74 discipline): both RFC 3339
+// 'T' and SQLite's space separator, naive / 'Z' / explicit-offset zones,
+// with and without fractions. The T-separated NAIVE form was MISSING from
+// isoDateTimeLayouts (the ADR-0144 inference GLOB validates `[ T]` and
+// promotes such a column, then the decode refused it — caught by the
+// ADR-0163 flat-file integration suite); this pins every cell so no
+// separator/zone combination can silently drop out again.
+func TestDecodeTemporal_ISOSeparatorZoneMatrix(t *testing.T) {
+	naive := time.Date(2024, 6, 7, 8, 9, 10, 0, time.UTC)
+	frac := time.Date(2024, 6, 7, 8, 9, 10, 123456000, time.UTC)
+	for _, tc := range []struct {
+		raw  string
+		want time.Time
+	}{
+		{"2024-06-07 08:09:10", naive},
+		{"2024-06-07T08:09:10", naive}, // the previously-refused cell
+		{"2024-06-07 08:09:10.123456", frac},
+		{"2024-06-07T08:09:10.123456", frac},
+		{"2024-06-07T08:09:10Z", naive},
+		{"2024-06-07T08:09:10.123456Z", frac},
+		{"2024-06-07T09:09:10+01:00", naive.Add(0)}, // same instant, +01:00
+	} {
+		got, err := decodeCell(tc.raw, ir.Timestamp{}, dateEncodingISO)
+		if err != nil {
+			t.Errorf("%q: unexpected refusal: %v", tc.raw, err)
+			continue
+		}
+		tm, ok := got.(time.Time)
+		if !ok {
+			t.Errorf("%q: got %T; want time.Time", tc.raw, got)
+			continue
+		}
+		if !tm.Equal(tc.want) {
+			t.Errorf("%q decoded to %v; want the instant %v", tc.raw, tm, tc.want)
+		}
+	}
+}
+
 // TestDecodeBoolean_Matrix pins the ADR-0129 boolean decode: INTEGER 0/1 and
 // the case-insensitive truthy/falsy TEXT set decode faithfully; everything
 // else (INTEGER other than 0/1, any REAL, any BLOB, non-truthy TEXT) is

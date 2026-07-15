@@ -22,6 +22,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/engines/flatfile"
 	"sluicesync.dev/sluice/internal/engines/mysql"
 	"sluicesync.dev/sluice/internal/engines/sqlite"
 	"sluicesync.dev/sluice/internal/ir"
@@ -107,6 +108,19 @@ type Globals struct {
 	// default 'iso' assumes ISO-8601 text. PER-SOURCE override: the
 	// sqlite_date_encoding DSN query param on an individual SQLite source.
 	SQLiteDateEncoding string `name:"sqlite-date-encoding" help:"How a SQLite SOURCE decodes columns DECLARED date/time (ADR-0129): 'iso' (default) reads ISO-8601 TEXT; 'unixepoch'/'unixmillis' read INTEGER/REAL unix seconds/milliseconds; 'julian' reads a REAL/INTEGER Julian day. A value whose storage class doesn't match the chosen encoding is refused loudly (naming the row) — never a silently-wrong date; use --type-override <col>=text to carry an outlier raw. PER-SOURCE override: set ?sqlite_date_encoding=iso|unixepoch|unixmillis|julian on an individual SQLite source DSN (the DSN value wins over this flag)." enum:"iso,unixepoch,unixmillis,julian" default:"iso" placeholder:"ENCODING"`
+
+	// The --csv-* flags are the flat-file source declarations (ADR-0163):
+	// a csv/tsv file's NULL representation, header presence, and delimiter
+	// are producer conventions RFC 4180 does not encode, so sluice requires
+	// them declared rather than sniffing (the #1 CSV silent-loss class).
+	// CSVNull is a *string so "not passed" (nil → unquoted empty fields are
+	// refused as ambiguous) is distinguishable from --csv-null='' (the
+	// PG-COPY-CSV empty-unquoted-field-is-NULL convention). Inert for
+	// engines that are not csv/tsv/ndjson sources, like --sqlite-date-encoding.
+	CSVNull      *string `name:"csv-null" help:"csv/tsv sources: the UNQUOTED field text that means SQL NULL (e.g. --csv-null='\\\\N', --csv-null=NULL, or --csv-null='' for the PostgreSQL COPY CSV convention where an unquoted empty field is NULL). A QUOTED field is always data (\\\"NULL\\\" is the string). Without this flag a file containing an unquoted empty field is refused loudly (SLUICE-E-CSV-NULL-AMBIGUOUS) — RFC 4180 has no NULL representation and sluice never guesses. See ADR-0163." placeholder:"REPR"`
+	CSVHeader    bool    `name:"csv-header" help:"csv/tsv sources: declare that the FIRST record carries the column names. Header presence is never sniffed — opening a csv/tsv source without --csv-header or --csv-no-header is refused loudly (a wrong guess silently eats a data row or turns data into column names)."`
+	CSVNoHeader  bool    `name:"csv-no-header" help:"csv/tsv sources: declare that the file has NO header record; columns are named col1..colN in file order. Mutually exclusive with --csv-header."`
+	CSVDelimiter string  `name:"csv-delimiter" help:"csv source only: the field delimiter — a single ASCII character, or '\\\\t'/'tab' for TAB (default ','). The tsv driver is fixed to TAB; use --source-driver csv with this flag for any other delimiter." placeholder:"CHAR"`
 
 	// MaxMemory is a hard soft-ceiling on the Go heap, applied via
 	// runtime/debug.SetMemoryLimit at startup. --max-buffer-bytes only
@@ -547,11 +561,26 @@ func (m *MigrateCmd) resolveEngines(ctx context.Context, g *Globals) (source, ta
 		return nil, nil, cleanup, fmt.Errorf("--target-driver: %w", err)
 	}
 
-	// --infer-types is SQLite/D1-only (ADR-0144). Refuse loudly here — before
-	// any DSN dialing — against any other source; richly-typed sources (MySQL/
-	// PG) already carry the type info, so inference there is risk with no gain.
-	if m.InferTypes && source.Name() != "sqlite" && source.Name() != "d1" {
-		return nil, nil, cleanup, errors.New("--infer-types is only supported for SQLite/D1 sources")
+	// --infer-types is SQLite/D1/flat-file-only (ADR-0144, ADR-0163). Refuse
+	// loudly here — before any DSN dialing — against any other source;
+	// richly-typed sources (MySQL/PG) already carry the type info, so
+	// inference there is risk with no gain.
+	if m.InferTypes && source.Name() != "sqlite" && source.Name() != "d1" && !isFlatFileSource(source.Name()) {
+		return nil, nil, cleanup, errors.New("--infer-types is only supported for SQLite/D1 and csv/tsv/ndjson sources")
+	}
+
+	// A csv/tsv/ndjson source is schema-less: every staged column is TEXT, so
+	// the validated rich-type inference is what recovers timestamps/jsonb/uuid
+	// on the target. AUTO-ENGAGE it (ADR-0163; the roadmap item 55 P2 posture) —
+	// promotions still happen only where every non-NULL value validates, and
+	// an explicit --type-override always wins. Programmatic pipeline callers
+	// keep the zero-value default (no inference — everything lands TEXT, the
+	// safe/lossless posture).
+	if isFlatFileSource(source.Name()) && !m.InferTypes {
+		m.InferTypes = true
+		slog.Info("flat-file source: auto-engaging --infer-types " +
+			"(schema-less input stages as TEXT; validated promotions recover timestamp/jsonb/uuid columns; " +
+			"an explicit --type-override always wins)")
 	}
 
 	// Local staging (Strategy A, ADR-0145): replicate the live D1 into a local
@@ -609,6 +638,13 @@ func (m *MigrateCmd) resolveEngines(ctx context.Context, g *Globals) (source, ta
 		return nil, nil, cleanup, err
 	}
 	return source, target, cleanup, nil
+}
+
+// isFlatFileSource reports whether name is one of the schema-less flat-file
+// source drivers (ADR-0163) — the set that stages into SQLite and rides the
+// validated rich-type inference.
+func isFlatFileSource(name string) bool {
+	return name == "csv" || name == "tsv" || name == "ndjson"
 }
 
 // resolveTableFilterArgs picks the include/exclude list to use,
@@ -761,6 +797,25 @@ func applyEngineOptions(e ir.Engine, g *Globals) (ir.Engine, error) {
 	}); ok {
 		var err error
 		if e, err = c.WithDateEncoding(g.SQLiteDateEncoding); err != nil {
+			return nil, err
+		}
+	}
+	// The flat-file declarations (--csv-*, ADR-0163). The header mutual
+	// exclusion is checked unconditionally so it is caught even when the
+	// engine at hand is not a flat-file source.
+	if g.CSVHeader && g.CSVNoHeader {
+		return nil, errors.New("--csv-header and --csv-no-header are mutually exclusive")
+	}
+	if c, ok := e.(interface {
+		WithFlatFileOptions(flatfile.Options) (ir.Engine, error)
+	}); ok {
+		var err error
+		if e, err = c.WithFlatFileOptions(flatfile.Options{
+			NullRepr:       g.CSVNull,
+			HeaderDeclared: g.CSVHeader || g.CSVNoHeader,
+			Header:         g.CSVHeader,
+			Delimiter:      g.CSVDelimiter,
+		}); err != nil {
 			return nil, err
 		}
 	}

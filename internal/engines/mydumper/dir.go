@@ -15,6 +15,8 @@ import (
 	"strings"
 
 	"github.com/klauspost/compress/zstd"
+
+	"sluicesync.dev/sluice/internal/engines/internal/dumpsig"
 )
 
 // dumpDir is the validated view of a mydumper output directory: the single
@@ -96,6 +98,20 @@ func openDumpDir(path string) (*dumpDir, error) {
 		return nil, fmt.Errorf("mydumper: open source %q: %w", path, err)
 	}
 	if !info.IsDir() {
+		// Cross-driver misuse refusals (roadmap item 55 Phase 3, ADR-0163):
+		// classify the file before failing generically, so a mysqldump/pg_dump
+		// dump gets the scratch-server recipe and a CSV/SQLite file gets the
+		// right driver named.
+		if kind, derr := dumpsig.Detect(path); derr == nil {
+			if rerr := dumpsig.RefuseRecognised("mydumper", path, kind, false); rerr != nil {
+				return nil, rerr
+			}
+		}
+		if drv, ok := dumpsig.FlatFileExtDriver(path); ok {
+			return nil, dumpsig.RefuseWrongDriver("mydumper", "use --source-driver "+drv,
+				fmt.Errorf("%q looks like a %s flat file — use --source-driver %s "+
+					"(the mydumper engine reads a dump DIRECTORY)", path, drv, drv))
+		}
 		return nil, fmt.Errorf("mydumper: source %q is not a directory (the mydumper engine reads a "+
 			"dump DIRECTORY; for a single-file SQL dump see docs/research/flat-file-sources.md)", path)
 	}
