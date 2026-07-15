@@ -83,14 +83,16 @@ func TestBackfillCmd_OmittedOptionalFlagDefaults(t *testing.T) {
 	}
 }
 
-// TestBackfillCmd_RequiredFlags pins that driver/dsn/table/set are all
+// TestBackfillCmd_RequiredFlags pins that driver/dsn/table are all
 // kong-required — omitting any is a parse error, not a Run-time one.
+// --set is deliberately NOT in this list: its kong required:"" was
+// relaxed for --verify-only (Phase 2), so its at-least-one enforcement
+// moved to Run (pinned in TestBackfillCmd_MissingSetIsRunTimeError).
 func TestBackfillCmd_RequiredFlags(t *testing.T) {
 	cases := []struct {
 		name string
 		args []string
 	}{
-		{"missing --set", strings.Fields(backfillBaseArgs)},
 		{"missing --table", []string{"backfill", "--driver=mysql", "--dsn=d", "--set=a = b"}},
 		{"missing --dsn", []string{"backfill", "--driver=mysql", "--table=t", "--set=a = b"}},
 		{"missing --driver", []string{"backfill", "--dsn=d", "--table=t", "--set=a = b"}},
@@ -104,6 +106,61 @@ func TestBackfillCmd_RequiredFlags(t *testing.T) {
 			}
 			if _, err := parser.Parse(tc.args); err == nil {
 				t.Errorf("parse %v succeeded; want a missing-required error", tc.args)
+			}
+		})
+	}
+}
+
+// ---- Phase 2: --verify / --verify-only ----
+
+// TestBackfillCmd_VerifyFlagsParse pins the Phase-2 flags through the
+// real parser: --verify rides a normal spec, and --verify-only parses
+// WITHOUT --set (the relaxed required:"" — the scriptable gate needs
+// no assignment).
+func TestBackfillCmd_VerifyFlagsParse(t *testing.T) {
+	args := append(strings.Fields(backfillBaseArgs), "--set=a = b", "--where=new_col IS NULL", "--verify")
+	if c := parseInto(t, args...).Backfill; !c.Verify || c.VerifyOnly {
+		t.Errorf("Verify=%v VerifyOnly=%v; want true, false", c.Verify, c.VerifyOnly)
+	}
+	voArgs := append(strings.Fields(backfillBaseArgs), "--where=new_col IS NULL", "--verify-only")
+	if c := parseInto(t, voArgs...).Backfill; !c.VerifyOnly || len(c.Set) != 0 {
+		t.Errorf("VerifyOnly=%v Set=%q; want true and no --set required", c.VerifyOnly, c.Set)
+	}
+}
+
+// TestBackfillCmd_MissingSetIsRunTimeError pins that a plain (non-
+// verify-only) run still requires at least one --set: kong now parses
+// it, and Run refuses before touching any database.
+func TestBackfillCmd_MissingSetIsRunTimeError(t *testing.T) {
+	cli := parseInto(t, strings.Fields(backfillBaseArgs)...)
+	err := cli.Backfill.Run(&Globals{})
+	if err == nil || !strings.Contains(err.Error(), "at least one --set") {
+		t.Fatalf("Run without --set = %v; want the at-least-one---set error", err)
+	}
+}
+
+// TestBackfillCmd_ContradictoryCombosRefusedAtParse pins the kong xor
+// groups: the walk-vs-gate flag combinations that cannot mean anything
+// are usage errors before any Run method is reached.
+func TestBackfillCmd_ContradictoryCombosRefusedAtParse(t *testing.T) {
+	base := append(strings.Fields(backfillBaseArgs), "--set=a = b", "--where=x IS NULL")
+	cases := []struct {
+		name  string
+		extra []string
+	}{
+		{"--verify with --dry-run", []string{"--verify", "--dry-run"}},
+		{"--verify-only with --dry-run", []string{"--verify-only", "--dry-run"}},
+		{"--verify-only with --restart", []string{"--verify-only", "--restart"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cli := &CLI{}
+			parser, err := kong.New(cli, kong.Exit(func(int) {}))
+			if err != nil {
+				t.Fatalf("kong.New: %v", err)
+			}
+			if _, err := parser.Parse(append(append([]string{}, base...), tc.extra...)); err == nil {
+				t.Errorf("parse %v succeeded; want an xor usage error", tc.extra)
 			}
 		})
 	}

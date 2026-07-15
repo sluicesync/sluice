@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 
+	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline"
 	"sluicesync.dev/sluice/internal/progress"
 )
@@ -27,12 +28,14 @@ type BackfillCmd struct {
 	DSN    string `help:"Database DSN. Backfill is same-database: it reads and updates this one endpoint." required:"" placeholder:"DSN"`
 	Table  string `help:"Table to backfill." required:"" placeholder:"TABLE"`
 
-	Set   []string `help:"Assignment 'col = <expr>' applied to every matched row (repeatable). The expression is native SQL for the engine, emitted verbatim — split at the FIRST '=', so expressions may themselves contain '='." required:"" placeholder:"'COL = EXPR'" sep:"none"`
+	Set   []string `help:"Assignment 'col = <expr>' applied to every matched row (repeatable; required except with --verify-only). The expression is native SQL for the engine, emitted verbatim — split at the FIRST '=', so expressions may themselves contain '='." placeholder:"'COL = EXPR'" sep:"none"`
 	Where string   `help:"Native-SQL predicate scoping which rows are backfilled. Make it self-describing (e.g. 'new_col IS NULL') so re-runs and crash-resume skip already-done rows." placeholder:"PREDICATE"`
 
-	BatchSize int  `help:"Rows per bounded UPDATE batch (keyset-chunked walk of the primary key). 0 uses sluice's bulk-copy default." placeholder:"N"`
-	DryRun    bool `help:"Print the generated per-chunk UPDATE statement and an affected-row estimate, then exit without writing anything."`
-	Restart   bool `help:"Discard the stored resume cursor for this exact spec (--set/--where) and start over from the beginning of the table."`
+	BatchSize  int  `help:"Rows per bounded UPDATE batch (keyset-chunked walk of the primary key). 0 uses sluice's bulk-copy default." placeholder:"N"`
+	DryRun     bool `help:"Print the generated per-chunk UPDATE statement and an affected-row estimate, then exit without writing anything." xor:"dryrunverify,dryrunverifyonly"`
+	Restart    bool `help:"Discard the stored resume cursor for this exact spec (--set/--where) and start over from the beginning of the table." xor:"restartverifyonly"`
+	Verify     bool `help:"After the run completes, count rows still matching --where: 0 prints the safe-to-contract signal; >0 fails with SLUICE-E-BACKFILL-INCOMPLETE (re-run to catch up, then verify again). Requires --where." xor:"dryrunverify"`
+	VerifyOnly bool `name:"verify-only" help:"Skip the walk and just run the --where remaining-count gate (no UPDATEs, no control-table writes) with the same 0/>0 exit contract — the scriptable post-migration check. Requires --where; --set is optional." xor:"dryrunverifyonly,restartverifyonly"`
 }
 
 // Run implements `sluice backfill`.
@@ -44,26 +47,36 @@ func (b *BackfillCmd) Run(g *Globals) error {
 	if engine, err = applyEngineOptions(engine, g); err != nil {
 		return err
 	}
-	sets, err := pipeline.ParseBackfillSets(b.Set)
-	if err != nil {
-		return err
+	// --verify-only issues no UPDATEs, so --set is optional there (the
+	// natural scripting shape) — any --set given is still parsed so its
+	// column-existence refusal keeps working. Every other mode requires
+	// at least one --set, enforced by ParseBackfillSets now that the
+	// kong tag no longer carries required:"".
+	var sets []ir.BackfillSet
+	if !b.VerifyOnly || len(b.Set) > 0 {
+		if sets, err = pipeline.ParseBackfillSets(b.Set); err != nil {
+			return err
+		}
 	}
 
 	backfiller := &pipeline.Backfiller{
-		Engine:    engine,
-		DSN:       b.DSN,
-		Table:     b.Table,
-		Sets:      sets,
-		Where:     b.Where,
-		BatchSize: b.BatchSize,
-		DryRun:    b.DryRun,
-		Restart:   b.Restart,
-		Out:       os.Stdout,
+		Engine:     engine,
+		DSN:        b.DSN,
+		Table:      b.Table,
+		Sets:       sets,
+		Where:      b.Where,
+		BatchSize:  b.BatchSize,
+		DryRun:     b.DryRun,
+		Restart:    b.Restart,
+		Verify:     b.Verify,
+		VerifyOnly: b.VerifyOnly,
+		Out:        os.Stdout,
 	}
 
-	// ADR-0155: pretty TTY view only for an interactive, non-dry-run
-	// invocation (a dry-run prints a preview, not phase progress).
-	pretty := !b.DryRun && wantPrettyProgress(g, false, false, false)
+	// ADR-0155: pretty TTY view only for an interactive walking run (a
+	// dry-run prints a preview and a verify-only run a one-line report,
+	// not phase progress).
+	pretty := !b.DryRun && !b.VerifyOnly && wantPrettyProgress(g, false, false, false)
 	ctx, cancel := context.WithCancel(kongContext())
 	defer cancel()
 	return runWithProgress(pretty, cancel, pipeline.BackfillProgressSpec,

@@ -95,8 +95,23 @@ type Backfiller struct {
 	// starts the walk over from the beginning of the table.
 	Restart bool
 
-	// Out receives the --dry-run preview and the completed-no-op
-	// notice. nil falls back to [io.Discard].
+	// Verify runs the completion post-pass AFTER the walk (or after the
+	// completed-spec no-op): one whole-table CountRemaining on Where.
+	// Zero remaining is the explicit safe-to-contract signal; a nonzero
+	// count is the coded SLUICE-E-BACKFILL-INCOMPLETE error. Requires a
+	// non-empty Where — without a self-describing guard the count is
+	// the whole table and the signal is meaningless.
+	Verify bool
+
+	// VerifyOnly skips the walk entirely — no UPDATEs, no control-table
+	// reads/writes — and just runs the Verify count with the same exit
+	// contract: the scriptable post-migration gate. Requires a
+	// non-empty Where; Sets are optional (any given are still checked
+	// against the schema). Contradicts DryRun and Restart.
+	VerifyOnly bool
+
+	// Out receives the --dry-run preview, the completed-no-op notice,
+	// and the verify completion report. nil falls back to [io.Discard].
 	Out io.Writer
 
 	// Progress is the ADR-0155 presentation sink. nil is the
@@ -125,8 +140,17 @@ type BackfillResult struct {
 	// `complete`: the run was a no-op and touched no rows.
 	AlreadyComplete bool
 	// Statement is the generated mid-walk chunk UPDATE (placeholders
-	// symbolic). Always populated; the --dry-run preview prints it.
+	// symbolic). Always populated except under VerifyOnly, which
+	// renders no UPDATE; the --dry-run preview prints it.
 	Statement string
+
+	// Verified reports the Verify/VerifyOnly post-pass ran and found
+	// zero rows still matching Where — the safe-to-contract signal.
+	Verified bool
+	// VerifiedRemaining is the post-pass count. Always 0 on a returned
+	// result by construction: a nonzero verify count surfaces as the
+	// coded SLUICE-E-BACKFILL-INCOMPLETE error, not a result.
+	VerifiedRemaining int64
 }
 
 // sink returns the presentation sink, defaulting a nil Progress to the
@@ -215,10 +239,10 @@ func (b *Backfiller) Run(ctx context.Context) (*BackfillResult, error) {
 	sink := b.sink()
 	sink.PhaseStarted(backfillPhaseSchema)
 
-	table, err := b.resolveTable(ctx)
-	if err != nil {
-		return nil, err
-	}
+	// The unsupported-engine check runs BEFORE the table resolves, so
+	// an engine with no backfill surface always gets the coded refusal
+	// — even when the table is also missing (a schema read would
+	// otherwise err first with an uncoded table-not-found).
 	opener, ok := b.Engine.(ir.BackfillExecutorOpener)
 	if !ok {
 		return nil, sluicecode.Wrap(
@@ -227,12 +251,31 @@ func (b *Backfiller) Run(ctx context.Context) (*BackfillResult, error) {
 			fmt.Errorf("backfill: engine %q does not support in-place backfill (no ir.BackfillExecutor implementation)", b.Engine.Name()),
 		)
 	}
+	table, err := b.resolveTable(ctx)
+	if err != nil {
+		return nil, err
+	}
 	ex, err := opener.OpenBackfillExecutor(ctx, b.DSN)
 	if err != nil {
 		return nil, fmt.Errorf("backfill: open executor: %w", err)
 	}
 	defer func() { _ = ex.Close() }()
 	sink.PhaseCompleted(backfillPhaseSchema)
+
+	if b.VerifyOnly {
+		// The standalone post-migration gate: no walk, no control-table
+		// reads/writes — just the whole-table remaining-count on the
+		// guard and the 0-clean / >0-coded-error exit contract.
+		result := &BackfillResult{Table: b.Table}
+		if err := b.verifyComplete(ctx, ex, table, result); err != nil {
+			return nil, err
+		}
+		sink.Summary(progress.Result{Fields: []progress.Field{
+			{Label: "Table", Value: result.Table},
+			{Label: "Verified", Value: "0 rows match the --where guard"},
+		}})
+		return result, nil
+	}
 
 	// CountRemaining doubles as the where-predicate preflight: an
 	// unparsable --where fails HERE, before any UPDATE runs.
@@ -261,12 +304,58 @@ func (b *Backfiller) Run(ctx context.Context) (*BackfillResult, error) {
 		return nil, err
 	}
 	sink.PhaseCompleted(backfillPhaseUpdate)
-	sink.Summary(progress.Result{Fields: []progress.Field{
+	if b.Verify {
+		// The post-pass runs AFTER the walk (and after the completed-
+		// spec no-op) so it sees the WHOLE table, not just the walked
+		// range. A failed verify does NOT mark the migration state
+		// failed: the walk itself succeeded and its persisted work
+		// stands — the count is the online catch-up signal.
+		if err := b.verifyComplete(ctx, ex, table, result); err != nil {
+			return nil, err
+		}
+	}
+	fields := []progress.Field{
 		{Label: "Table", Value: result.Table},
 		{Label: "Rows updated", Value: progress.HumanCount(result.RowsUpdated)},
 		{Label: "Chunks", Value: progress.HumanCount(int64(result.Chunks))},
-	}})
+	}
+	if result.Verified {
+		fields = append(fields, progress.Field{Label: "Verified", Value: "0 rows match the --where guard"})
+	}
+	sink.Summary(progress.Result{Fields: fields})
 	return result, nil
+}
+
+// verifyComplete is the --verify/--verify-only completion gate: one
+// whole-table CountRemaining on the Where guard. Zero rows is the
+// explicit "safe to run the contract step" signal; a nonzero count is
+// the coded SLUICE-E-BACKFILL-INCOMPLETE error — rows written behind
+// the walk's cursor during an online run (or since a completed run)
+// still need a catch-up pass, and on a quiesced database a nonzero
+// count after a clean walk means the guard does not self-describe
+// doneness. Runtime class, not a refusal: the check ran truthfully and
+// found incomplete work (the SLUICE-E-BACKUP-INCOMPLETE analogue).
+func (b *Backfiller) verifyComplete(ctx context.Context, ex ir.BackfillExecutor, table *ir.Table, result *BackfillResult) error {
+	n, err := ex.CountRemaining(ctx, table, b.Where)
+	if err != nil {
+		return fmt.Errorf("backfill: verify count remaining (is --where valid SQL for this engine?): %w", err)
+	}
+	if n > 0 {
+		return sluicecode.Wrap(
+			sluicecode.CodeBackfillIncomplete,
+			"re-run the backfill to pick up the stragglers (a completed spec needs --restart), then verify again; on a quiesced database, fix the --where guard so it self-describes doneness",
+			fmt.Errorf("backfill verify: %d row(s) of %q still match the --where guard (%s) — rows written behind the walk's cursor (or since a completed run) need a catch-up pass",
+				n, b.Table, b.Where),
+		)
+	}
+	result.Verified = true
+	result.VerifiedRemaining = 0
+	fmt.Fprintf(b.out(),
+		"backfill verified complete: 0 rows of %q match the --where guard (%s) — safe to run the contract step (drop/rename the old column)\n",
+		b.Table, b.Where)
+	slog.InfoContext(ctx, "backfill verified complete",
+		"table", b.Table, "where", b.Where, "remaining", int64(0))
+	return nil
 }
 
 // runWalk owns the resume-state lifecycle plus the chunk loop.
@@ -422,8 +511,12 @@ func (b *Backfiller) resolveTable(ctx context.Context) (*ir.Table, error) {
 			)
 		}
 	}
-	if err := validateBackfillPK(table); err != nil {
-		return nil, err
+	// VerifyOnly issues no bounded UPDATEs, so the keyset walk's PK
+	// requirements don't apply: a no-PK table is still verifiable.
+	if !b.VerifyOnly {
+		if err := validateBackfillPK(table); err != nil {
+			return nil, err
+		}
 	}
 	return table, nil
 }
@@ -476,8 +569,16 @@ func (b *Backfiller) validate() error {
 		return errors.New("backfill: DSN is required")
 	case b.Table == "":
 		return errors.New("backfill: Table is required")
-	case len(b.Sets) == 0:
+	case len(b.Sets) == 0 && !b.VerifyOnly:
 		return errors.New("backfill: at least one Set is required")
+	case (b.Verify || b.VerifyOnly) && b.Where == "":
+		return errors.New("backfill: --verify/--verify-only require --where — without a self-describing guard the remaining-count is the whole table and the completion signal is meaningless")
+	case b.VerifyOnly && b.DryRun:
+		return errors.New("backfill: --verify-only and --dry-run are contradictory (a verify-only run already writes nothing)")
+	case b.VerifyOnly && b.Restart:
+		return errors.New("backfill: --verify-only and --restart are contradictory (--verify-only never walks; run the backfill with --restart, then verify)")
+	case b.Verify && b.DryRun:
+		return errors.New("backfill: --verify and --dry-run are contradictory (a dry run writes nothing, so there is nothing to verify)")
 	}
 	return nil
 }

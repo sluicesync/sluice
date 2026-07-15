@@ -2,12 +2,12 @@
 
 ## Status
 
-Accepted (implemented; Phase 1 of roadmap item 62). Ships `sluice backfill
+Accepted (implemented; Phases 1–2 of roadmap item 62). Ships `sluice backfill
 --driver <engine> --dsn <dsn> --table <t> --set 'col = <expr>' [--set ...]
-[--where '<predicate>'] [--batch-size N] [--dry-run] [--restart]` for MySQL
-(all flavors — PlanetScale/Vitess ride the same path) and Postgres. Phase 2
-(verify/preview post-pass) and Phase 3 (PlanetScale expand-contract
-orchestration) are tracked on roadmap item 62.
+[--where '<predicate>'] [--batch-size N] [--dry-run] [--restart] [--verify]
+[--verify-only]` for MySQL (all flavors — PlanetScale/Vitess ride the same
+path) and Postgres. Phase 3 (PlanetScale expand-contract orchestration) is
+tracked on roadmap item 62.
 
 ## Context
 
@@ -112,6 +112,37 @@ reader's predicate builders; the CLI (`cmd/sluice/backfill.go`) reuses
 `resolveEngine` + `applyEngineOptions` + `kongContext` + the ADR-0155
 `runWithProgress` pretty view with a new two-phase `BackfillProgressSpec`;
 error codes ride the `sluicecode` registry + doc-sync test.
+
+### Phase 2: the verify post-pass (`--verify` / `--verify-only`)
+
+The explicit "safe to ship the contract deploy request" signal that closes
+the expand→migrate→contract loop. `--verify` runs one whole-table
+`CountRemaining` on the `--where` guard AFTER the walk completes (or after
+the completed-spec no-op — deliberately post-walk so it sees rows inserted
+behind the cursor during an online run, not just the walked range).
+`--verify-only` is the standalone, scriptable form of the same gate: no walk,
+no control-table reads or writes, no UPDATEs — and therefore none of the
+walk's PK requirements (a no-PK table is verifiable) and no `--set` needed
+(any given is still schema-checked).
+
+The exit contract: 0 remaining prints the safe-to-contract completion line
+and exits 0; a nonzero count is the coded `SLUICE-E-BACKFILL-INCOMPLETE`
+error — **runtime** class (exit 1, mirroring verify/diff's "ran cleanly,
+found work" semantics), not a refusal, because the check ran truthfully and
+found unfinished work: the online catch-up signal (re-run — a completed spec
+needs `--restart` — then verify again), or on a quiesced database, a guard
+that does not self-describe doneness. A failed verify does NOT mark the
+migration state failed — the walk itself succeeded and its persisted work
+stands.
+
+Both verify modes **require `--where`**: without a self-describing guard the
+remaining-count is the whole table and the signal is meaningless.
+Contradictory combinations (`--verify-only` with `--dry-run`/`--restart`,
+`--verify` with `--dry-run`) are refused at both the kong layer (xor groups)
+and the orchestrator. Phase 2 also hoists the unsupported-engine refusal
+ahead of table resolution, so an engine without the backfill surface always
+gets the coded `SLUICE-E-BACKFILL-UNSUPPORTED-ENGINE` answer even when the
+table is also missing.
 
 ## Consequences
 

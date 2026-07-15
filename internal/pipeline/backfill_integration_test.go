@@ -15,6 +15,10 @@
 //     (COALESCE(new_col, 0) + old_col + 1): a double-apply would land
 //     2*old+2 and the assertions would catch it;
 //   - --dry-run writes nothing and reports the estimate;
+//   - the Phase-2 completion gate: --verify reports 0/clean after a
+//     guarded walk, --verify-only over fresh rows is the coded
+//     SLUICE-E-BACKFILL-INCOMPLETE with the right count and writes
+//     nothing, and a --restart catch-up walk turns the gate clean;
 //   - composite-PK walk;
 //   - NULL propagation through the expression + a multi-column --set.
 
@@ -31,6 +35,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/progress"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 func TestBackfill_MySQL_EndToEnd(t *testing.T) {
@@ -292,6 +297,71 @@ func runBackfillScenarios(t *testing.T, db *sql.DB, eng ir.Engine, dsn string) {
 		}
 		if wrong != 0 {
 			t.Errorf("%d composite-PK rows not backfilled correctly", wrong)
+		}
+	})
+
+	t.Run("verify_gate_and_verify_only", func(t *testing.T) {
+		mustExecBF(t, db, "CREATE TABLE bf_verify (id INT PRIMARY KEY, old_col INT NOT NULL, new_col INT NULL)")
+		seedBackfillRows(t, db, "bf_verify", 30)
+
+		// A guarded run with --verify: the post-pass reports 0 and the
+		// safe-to-contract signal, exit clean.
+		var out strings.Builder
+		b := newIntgBackfiller(eng, dsn, "bf_verify", "old_col + 1", "new_col IS NULL", 10)
+		b.Verify = true
+		b.Out = &out
+		res, err := b.Run(ctx)
+		if err != nil {
+			t.Fatalf("verified run: %v", err)
+		}
+		if !res.Verified || res.RowsUpdated != 30 {
+			t.Errorf("Verified=%v RowsUpdated=%d; want true, 30", res.Verified, res.RowsUpdated)
+		}
+		if !strings.Contains(out.String(), "safe to run the contract step") {
+			t.Errorf("verify report %q missing the safe-to-contract signal", out.String())
+		}
+
+		// Fresh rows behind the completed run: the scriptable gate must
+		// return the coded incomplete error with the right count and
+		// write nothing.
+		mustExecBF(t, db, "INSERT INTO bf_verify (id, old_col, new_col) VALUES (31, 31, NULL), (32, 32, NULL), (33, 33, NULL)")
+		vo := &Backfiller{Engine: eng, DSN: dsn, Table: "bf_verify", Where: "new_col IS NULL", VerifyOnly: true}
+		_, err = vo.Run(ctx)
+		if err == nil {
+			t.Fatal("--verify-only over fresh rows returned nil; want SLUICE-E-BACKFILL-INCOMPLETE")
+		}
+		coded, ok := sluicecode.FromError(err)
+		if !ok || coded.Code != sluicecode.CodeBackfillIncomplete {
+			t.Fatalf("err = %v; want code %s", err, sluicecode.CodeBackfillIncomplete)
+		}
+		if !strings.Contains(err.Error(), "3 row(s)") {
+			t.Errorf("err %q should carry the remaining count 3", err)
+		}
+		var still int64
+		if err := db.QueryRow("SELECT COUNT(*) FROM bf_verify WHERE new_col IS NULL").Scan(&still); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		if still != 3 {
+			t.Errorf("rows matching the guard after --verify-only = %d; want 3 (the gate must write nothing)", still)
+		}
+
+		// --restart re-walks the completed spec to pick up the
+		// stragglers; the gate then passes clean.
+		b2 := newIntgBackfiller(eng, dsn, "bf_verify", "old_col + 1", "new_col IS NULL", 10)
+		b2.Restart = true
+		res2, err := b2.Run(ctx)
+		if err != nil {
+			t.Fatalf("--restart catch-up run: %v", err)
+		}
+		if res2.RowsUpdated != 3 {
+			t.Errorf("catch-up RowsUpdated = %d; want 3", res2.RowsUpdated)
+		}
+		res3, err := vo.Run(ctx)
+		if err != nil {
+			t.Fatalf("--verify-only after catch-up: %v", err)
+		}
+		if !res3.Verified {
+			t.Error("Verified = false after the catch-up walk; want true")
 		}
 	})
 

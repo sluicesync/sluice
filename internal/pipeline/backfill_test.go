@@ -120,6 +120,11 @@ type backfillFakeExecutor struct {
 	limitsSeen   []int
 	aftersSeen   [][]any
 	closed       bool
+
+	// afterExec, when set, runs at the end of each ExecBackfillChunk —
+	// the "concurrent writer" lever for the --verify catch-up pins
+	// (e.g. insert a fresh row BEHIND the cursor mid-walk).
+	afterExec func(f *backfillFakeExecutor)
 }
 
 func (f *backfillFakeExecutor) idx(after []any) int {
@@ -165,6 +170,9 @@ func (f *backfillFakeExecutor) ExecBackfillChunk(_ context.Context, _ *ir.Table,
 	}
 	if span > f.maxChunkSpan {
 		f.maxChunkSpan = span
+	}
+	if f.afterExec != nil {
+		f.afterExec(f)
 	}
 	return n, nil
 }
@@ -544,6 +552,218 @@ func TestBackfill_DryRunWritesNothing(t *testing.T) {
 	if !strings.Contains(out.String(), "7") {
 		t.Errorf("dry-run output %q should report the estimate", out.String())
 	}
+}
+
+// ---- Phase 2: the --verify / --verify-only completion gate ----
+
+func TestBackfill_VerifyCleanAfterWalk(t *testing.T) {
+	ex := &backfillFakeExecutor{rows: backfillFakeRows(12)}
+	eng := &backfillFakeEngine{schema: backfillTestSchema(backfillIntPK()), ex: ex, store: newBackfillFakeStore()}
+	b := newTestBackfiller(eng)
+	b.Verify = true
+	var out bytes.Buffer
+	b.Out = &out
+
+	res, err := b.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	// All rows started unfilled, so a 0-remaining verify proves the
+	// count ran AFTER the walk, not before it.
+	if !res.Verified || res.VerifiedRemaining != 0 {
+		t.Errorf("Verified=%v VerifiedRemaining=%d; want true, 0", res.Verified, res.VerifiedRemaining)
+	}
+	if res.RowsUpdated != 12 {
+		t.Errorf("RowsUpdated = %d; want 12 (the walk must still run)", res.RowsUpdated)
+	}
+	if !strings.Contains(out.String(), "safe to run the contract step") {
+		t.Errorf("completion report %q missing the safe-to-contract signal", out.String())
+	}
+}
+
+func TestBackfill_VerifyIncompleteIsCodedAndKeepsCompletedState(t *testing.T) {
+	ex := &backfillFakeExecutor{rows: backfillFakeRows(10)}
+	// A "concurrent writer" inserts a fresh row BEHIND the cursor after
+	// the first chunk: the walk never revisits it, so the post-pass
+	// count must catch it.
+	injected := false
+	ex.afterExec = func(f *backfillFakeExecutor) {
+		if injected {
+			return
+		}
+		injected = true
+		f.rows = append([]backfillFakeRow{{pk: 0, old: 0}}, f.rows...)
+	}
+	store := newBackfillFakeStore()
+	eng := &backfillFakeEngine{schema: backfillTestSchema(backfillIntPK()), ex: ex, store: store}
+	b := newTestBackfiller(eng)
+	b.BatchSize = 4
+	b.Verify = true
+
+	_, err := b.Run(context.Background())
+	wantBackfillCode(t, err, sluicecode.CodeBackfillIncomplete)
+	if !strings.Contains(err.Error(), "1 row(s)") {
+		t.Errorf("err %q should name the remaining count", err)
+	}
+	// The walk itself succeeded: a failed verify must NOT mark the
+	// migration state failed — its persisted work stands.
+	id := BackfillMigrationID(b.Table, b.Sets, b.Where)
+	if got := store.headers[id].Phase; got != ir.MigrationPhaseComplete {
+		t.Errorf("header phase after failed verify = %s; want complete", got)
+	}
+	if got := store.progress[id]["items"].State; got != ir.TableProgressComplete {
+		t.Errorf("table progress after failed verify = %s; want complete", got)
+	}
+}
+
+func TestBackfill_VerifyRunsAfterCompletedNoOp(t *testing.T) {
+	// Pre-set completed state + one fresh row: the no-op short-circuit
+	// walks nothing, and the verify post-pass must still fire and
+	// report the new-writes-since-completion catch-up signal.
+	ex := &backfillFakeExecutor{rows: backfillFakeRows(3)}
+	store := newBackfillFakeStore()
+	eng := &backfillFakeEngine{schema: backfillTestSchema(backfillIntPK()), ex: ex, store: store}
+	b := newTestBackfiller(eng)
+	b.Verify = true
+	id := BackfillMigrationID(b.Table, b.Sets, b.Where)
+	store.headers[id] = ir.MigrationState{MigrationID: id, Phase: ir.MigrationPhaseComplete}
+
+	_, err := b.Run(context.Background())
+	wantBackfillCode(t, err, sluicecode.CodeBackfillIncomplete)
+	if ex.execCalls != 0 {
+		t.Errorf("execCalls = %d; the completed no-op must still touch no rows", ex.execCalls)
+	}
+
+	// Same shape with every row done: the no-op verifies clean.
+	for i := range ex.rows {
+		v := ex.rows[i].old + 1
+		ex.rows[i].new = &v
+	}
+	res, err := b.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run after all rows done: %v", err)
+	}
+	if !res.AlreadyComplete || !res.Verified {
+		t.Errorf("AlreadyComplete=%v Verified=%v; want true, true", res.AlreadyComplete, res.Verified)
+	}
+}
+
+func TestBackfill_VerifyOnlyTouchesNothing(t *testing.T) {
+	ex := &backfillFakeExecutor{rows: backfillFakeRows(4)}
+	for i := range ex.rows {
+		v := ex.rows[i].old + 1
+		ex.rows[i].new = &v
+	}
+	store := newBackfillFakeStore()
+	eng := &backfillFakeEngine{schema: backfillTestSchema(backfillIntPK()), ex: ex, store: store}
+	b := newTestBackfiller(eng)
+	b.VerifyOnly = true
+	var out bytes.Buffer
+	b.Out = &out
+
+	res, err := b.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.Verified {
+		t.Error("Verified = false; want true")
+	}
+	if ex.execCalls != 0 || store.writes != 0 {
+		t.Errorf("execCalls=%d store writes=%d; --verify-only must touch neither rows nor the control table", ex.execCalls, store.writes)
+	}
+	if !strings.Contains(out.String(), "safe to run the contract step") {
+		t.Errorf("report %q missing the safe-to-contract signal", out.String())
+	}
+
+	// The incomplete shape: still no writes, just the coded error.
+	ex.rows[2].new = nil
+	_, err = b.Run(context.Background())
+	wantBackfillCode(t, err, sluicecode.CodeBackfillIncomplete)
+	if ex.execCalls != 0 || store.writes != 0 {
+		t.Errorf("execCalls=%d store writes=%d after incomplete verify; must stay 0", ex.execCalls, store.writes)
+	}
+}
+
+func TestBackfill_VerifyOnlyNeedsNoPKAndNoSets(t *testing.T) {
+	// A verify-only run issues no bounded UPDATEs, so a no-PK table and
+	// an absent --set are both fine — the walk's refusals don't apply.
+	ex := &backfillFakeExecutor{rows: backfillFakeRows(2)}
+	for i := range ex.rows {
+		v := ex.rows[i].old + 1
+		ex.rows[i].new = &v
+	}
+	eng := &backfillFakeEngine{schema: backfillTestSchema(nil), ex: ex, store: newBackfillFakeStore()}
+	b := newTestBackfiller(eng)
+	b.VerifyOnly = true
+	b.Sets = nil
+
+	res, err := b.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.Verified {
+		t.Error("Verified = false; want true")
+	}
+}
+
+func TestBackfill_VerifyOnlyStillRefusesUnknownSetColumn(t *testing.T) {
+	eng := &backfillFakeEngine{schema: backfillTestSchema(backfillIntPK()), ex: &backfillFakeExecutor{}, store: newBackfillFakeStore()}
+	b := newTestBackfiller(eng)
+	b.VerifyOnly = true
+	b.Sets = []ir.BackfillSet{{Column: "nope", Expr: "1"}}
+	_, err := b.Run(context.Background())
+	wantBackfillCode(t, err, sluicecode.CodeBackfillUnknownColumn)
+}
+
+func TestBackfill_VerifyModesRequireWhere(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mut  func(*Backfiller)
+	}{
+		{"--verify", func(b *Backfiller) { b.Verify = true }},
+		{"--verify-only", func(b *Backfiller) { b.VerifyOnly = true }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newTestBackfiller(stubEngine{})
+			b.Where = ""
+			tc.mut(b)
+			if _, err := b.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "--where") {
+				t.Errorf("err = %v; want the --where-required refusal", err)
+			}
+		})
+	}
+}
+
+func TestBackfill_VerifyContradictoryCombos(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mut  func(*Backfiller)
+	}{
+		{"--verify-only with --dry-run", func(b *Backfiller) { b.VerifyOnly = true; b.DryRun = true }},
+		{"--verify-only with --restart", func(b *Backfiller) { b.VerifyOnly = true; b.Restart = true }},
+		{"--verify with --dry-run", func(b *Backfiller) { b.Verify = true; b.DryRun = true }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newTestBackfiller(stubEngine{})
+			tc.mut(b)
+			if _, err := b.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "contradictory") {
+				t.Errorf("err = %v; want a contradictory-flags refusal", err)
+			}
+		})
+	}
+}
+
+// TestBackfill_UnsupportedEngineWinsOverMissingTable pins the Phase-2
+// refusal-order hoist: an engine with no backfill surface gets the
+// coded refusal even when the table is ALSO missing — the coded,
+// operator-actionable answer must not be shadowed by an uncoded
+// table-not-found from the schema read.
+func TestBackfill_UnsupportedEngineWinsOverMissingTable(t *testing.T) {
+	eng := &noBackfillEngine{schema: backfillTestSchema(backfillIntPK())}
+	b := newTestBackfiller(eng)
+	b.Table = "absent"
+	_, err := b.Run(context.Background())
+	wantBackfillCode(t, err, sluicecode.CodeBackfillUnsupportedEngine)
 }
 
 func TestBackfill_ValidateRequiredFields(t *testing.T) {
