@@ -487,8 +487,11 @@ func parseCreateTable(stmt, file string) (*ir.Table, error) {
 	if len(t.Columns) == 0 {
 		return nil, fmt.Errorf("mydumper: %s: CREATE TABLE %s has no columns", file, tableName)
 	}
+	// A charset violation returns the PARSED TABLE with the typed
+	// refusal, so schema readers can defer it to first use (Bug 188);
+	// every other error above returns a nil table as before.
 	if err := b.checkCharsets(); err != nil {
-		return nil, err
+		return t, err
 	}
 	return t, nil
 }
@@ -942,9 +945,33 @@ var utf8CompatibleCharsets = map[string]bool{
 	"binary":  true,
 }
 
+// CharsetRefusalError is the ADR-0161 §5 unsupported-charset refusal,
+// typed so callers can DEFER it to the table's first actual use instead
+// of failing the whole schema read (Bug 188: one legacy latin1 table
+// blocked migrating the REST of a dump even under --exclude-table,
+// because the refusal fired inside ReadSchema — before the pipeline's
+// table filter could route around it). parseCreateTable returns the
+// PARSED TABLE alongside this error, so schema readers can carry the
+// table and surface the refusal only when the table is actually read.
+type CharsetRefusalError struct {
+	File    string
+	Table   string
+	Column  string
+	Charset string
+}
+
+func (e *CharsetRefusalError) Error() string {
+	return fmt.Sprintf("mydumper: %s: table %s column %s has charset %s — the flat-file reader "+
+		"carries dump bytes verbatim and supports only UTF-8-compatible charsets "+
+		"(utf8mb4/utf8/utf8mb3/ascii/binary); convert the source column, migrate from the "+
+		"live database instead, or --exclude-table the table (ADR-0161 §5)",
+		e.File, e.Table, e.Column, e.Charset)
+}
+
 // checkCharsets refuses any string-family column whose EFFECTIVE charset
 // (explicit column charset, else the table default, else the assumed
-// utf8mb4) is not UTF-8-compatible.
+// utf8mb4) is not UTF-8-compatible. The returned error is always a
+// *CharsetRefusalError so callers can defer it (see the type doc).
 func (b *tableBuilder) checkCharsets() error {
 	for _, col := range b.table.Columns {
 		switch col.Type.(type) {
@@ -960,11 +987,9 @@ func (b *tableBuilder) checkCharsets() error {
 			effective = "utf8mb4"
 		}
 		if !utf8CompatibleCharsets[effective] {
-			return fmt.Errorf("mydumper: %s: table %s column %s has charset %s — the flat-file reader "+
-				"carries dump bytes verbatim and supports only UTF-8-compatible charsets "+
-				"(utf8mb4/utf8/utf8mb3/ascii/binary); convert the source column or migrate from the "+
-				"live database instead (ADR-0161 §5)",
-				b.p.file, b.table.Name, col.Name, effective)
+			return &CharsetRefusalError{
+				File: b.p.file, Table: b.table.Name, Column: col.Name, Charset: effective,
+			}
 		}
 	}
 	return nil

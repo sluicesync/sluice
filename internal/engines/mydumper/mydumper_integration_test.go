@@ -289,6 +289,44 @@ func TestMydumperIntegration_RealDumpEndToEnd(t *testing.T) {
 		}
 	})
 
+	// Bug 188: one unsupported-charset table in a dump must not block
+	// migrating the REST of the dump — the ADR-0161 §5 refusal is
+	// deferred past the table filter, so --exclude-table routes around
+	// it, while an INCLUDED violating table still refuses up front
+	// (before any table copies — not mid-run).
+	t.Run("charset-refusal-deferred-past-exclude", func(t *testing.T) {
+		stained := t.TempDir()
+		copyDumpDir(t, dumpDirs["escape"], stained)
+		dbPrefix := dumpDatabasePrefix(t, stained)
+		writeDumpFile(t, stained, dbPrefix+".legacy_latin1-schema.sql",
+			"CREATE TABLE `legacy_latin1` (`id` bigint NOT NULL, `txt` varchar(20)) DEFAULT CHARSET=latin1;")
+		writeDumpFile(t, stained, dbPrefix+".legacy_latin1.00000.sql",
+			"INSERT INTO `legacy_latin1` VALUES (1,'a');")
+
+		// (a) Included → loud up-front refusal naming column + remedy,
+		// with ZERO tables landed (pre-DDL, not mid-migration).
+		target := createMySQLDB(t, mysqlRootDSN, "dump_stained_refused")
+		err := runMigrateErr(t, dumpEng, mysqlEng, stained, target, migcore.TableFilter{})
+		if err == nil || !strings.Contains(err.Error(), "latin1") ||
+			!strings.Contains(err.Error(), "--exclude-table") {
+			t.Fatalf("stained dump migrate = %v; want the charset refusal naming latin1 + the exclude remedy", err)
+		}
+		if n := len(readSchemaIT(t, mysqlEng, target).Tables); n != 0 {
+			t.Fatalf("refused migrate landed %d table(s); want 0 (refusal must fire before DDL)", n)
+		}
+
+		// (b) Excluded → the rest of the dump migrates cleanly.
+		filter, ferr := migcore.NewTableFilter(nil, []string{"legacy_latin1"})
+		if ferr != nil {
+			t.Fatal(ferr)
+		}
+		target2 := createMySQLDB(t, mysqlRootDSN, "dump_stained_excluded")
+		runMigrate(t, dumpEng, mysqlEng, stained, target2, filter)
+		if n := len(readSchemaIT(t, mysqlEng, target2).Tables); n != 5 {
+			t.Fatalf("excluded-run target tables = %d; want the 5 non-latin1 tables", n)
+		}
+	})
+
 	// verify --depth count: the dump source vs a migrated target is clean.
 	t.Run("verify-count-depth", func(t *testing.T) {
 		verifier := &pipeline.Verifier{
@@ -585,6 +623,68 @@ func runMigrate(t *testing.T, source, target ir.Engine, srcDSN, tgtDSN string, f
 	if err := mig.Run(ctx); err != nil {
 		t.Fatalf("Migrator.Run(%s → %s): %v", source.Name(), target.Name(), err)
 	}
+}
+
+// runMigrateErr is runMigrate's expected-to-fail sibling: it returns
+// the Migrator error instead of failing the test, for refusal pins.
+func runMigrateErr(t *testing.T, source, target ir.Engine, srcDSN, tgtDSN string, filter migcore.TableFilter,
+	mappings ...config.Mapping,
+) error {
+	t.Helper()
+	mig := &pipeline.Migrator{
+		Source:    source,
+		Target:    target,
+		SourceDSN: srcDSN,
+		TargetDSN: tgtDSN,
+		Filter:    filter,
+		Mappings:  mappings,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	return mig.Run(ctx)
+}
+
+// copyDumpDir copies every regular file of a dump directory into dst
+// (flat layout — mydumper dirs have no subdirectories).
+func copyDumpDir(t *testing.T, src, dst string) {
+	t.Helper()
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(src, e.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dst, e.Name()), raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// dumpDatabasePrefix returns the `<database>` filename prefix of a dump
+// dir, discovered from any table schema file.
+func dumpDatabasePrefix(t *testing.T, dir string) string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		name, _ := stripCompressionSuffix(e.Name())
+		if !strings.HasSuffix(name, "-schema.sql") || strings.HasSuffix(name, "-schema-create.sql") {
+			continue
+		}
+		if dot := strings.IndexByte(name, '.'); dot > 0 {
+			return name[:dot]
+		}
+	}
+	t.Fatal("no table schema file found to derive the database prefix")
+	return ""
 }
 
 func readSchemaIT(t *testing.T, eng ir.Engine, dsn string) *ir.Schema {

@@ -58,7 +58,7 @@ func ScanGeneratedColRefGeneratedCol(
 	if schema == nil {
 		return nil
 	}
-	if !strings.EqualFold(sourceEngine, "mysql") || !strings.EqualFold(targetEngine, "postgres") {
+	if !IsMySQLFamily(sourceEngine) || !strings.EqualFold(targetEngine, "postgres") {
 		return nil
 	}
 

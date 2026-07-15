@@ -97,6 +97,12 @@ func (m *Migrator) phaseReadSourceSchema(ctx context.Context, scope *multiDBScop
 	if err := migcore.ApplyTableFilter(ctx, schema, m.Filter); err != nil {
 		return sr, nil, err
 	}
+	// Post-filter, pre-DDL: refuse loudly if any REMAINING table is
+	// known-doomed to fail at read time (deferred flat-file refusals —
+	// an excluded doomed table no longer blocks the run, Bug 188).
+	if err := migcore.PreflightTableReads(sr, schema); err != nil {
+		return sr, nil, err
+	}
 	applyViewFilter(ctx, schema, m.ViewFilter, m.SkipViews)
 
 	// ---- 1.3. Skip ORM/framework migration-bookkeeping tables (ADR-0143) ----

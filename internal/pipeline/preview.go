@@ -310,6 +310,9 @@ func (p *Previewer) Run(ctx context.Context) error {
 	if err := migcore.ApplyTableFilter(ctx, srcSchema, p.Filter); err != nil {
 		return err
 	}
+	if err := migcore.PreflightTableReads(sr, srcSchema); err != nil {
+		return err
+	}
 	applyViewFilter(ctx, srcSchema, p.ViewFilter, p.SkipViews)
 
 	// ---- 3. Apply mappings ----

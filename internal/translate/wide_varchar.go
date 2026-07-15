@@ -96,7 +96,7 @@ func ScanWideVarcharNotices(schema *ir.Schema, sourceEngine, targetEngine string
 	if schema == nil {
 		return nil
 	}
-	if !strings.EqualFold(sourceEngine, "postgres") || !isMySQLTarget(targetEngine) {
+	if !strings.EqualFold(sourceEngine, "postgres") || !IsMySQLFamily(targetEngine) {
 		return nil
 	}
 

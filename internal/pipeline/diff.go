@@ -200,6 +200,9 @@ func (d *Differ) Run(ctx context.Context) (*irdiff.SchemaDiff, error) {
 	if err := migcore.ApplyTableFilter(ctx, srcSchema, d.Filter); err != nil {
 		return nil, err
 	}
+	if err := migcore.PreflightTableReads(sr, srcSchema); err != nil {
+		return nil, err
+	}
 	applyViewFilter(ctx, srcSchema, d.ViewFilter, d.SkipViews)
 
 	expected, err := translate.ApplyMappings(srcSchema, d.Mappings)

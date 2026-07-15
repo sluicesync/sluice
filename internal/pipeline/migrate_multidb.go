@@ -376,6 +376,9 @@ func (m *Migrator) applyDeferredConstraints(ctx context.Context, scope *multiDBS
 	if err := migcore.ApplyTableFilter(ctx, schema, m.Filter); err != nil {
 		return err
 	}
+	if err := migcore.PreflightTableReads(sr, schema); err != nil {
+		return err
+	}
 	// ADR-0143: prune the ORM tables here too so this deferred cross-database
 	// constraints pass matches the per-database run that already skipped them
 	// — without it CreateConstraints would target tables that were never

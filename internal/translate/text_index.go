@@ -87,7 +87,7 @@ type TextIndexNotice struct {
 // Results follow schema declaration order (table order × PK-then-
 // Indexes × key-part order) so rendering is stable.
 func ScanTextIndexNotices(schema *ir.Schema, sourceEngine, targetEngine string) []TextIndexNotice {
-	if schema == nil || !isPGFamilySource(sourceEngine) || !isMySQLTarget(targetEngine) {
+	if schema == nil || !isPGFamilySource(sourceEngine) || !IsMySQLFamily(targetEngine) {
 		return nil
 	}
 

@@ -73,6 +73,19 @@ func (r *RowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.Ro
 		return nil, fmt.Errorf("mydumper: ReadRows: table %q has no schema file in %q", table.Name, r.dir.path)
 	}
 
+	// Defense in depth for the deferred ADR-0161 §5 charset refusal
+	// (Bug 188): the pipeline's post-filter preflight is the designed
+	// surface, but a caller that skips it must still never stream
+	// bytes-verbatim values from an unsupported-charset table. The
+	// schema file is small; re-parsing it here is one cheap read per
+	// table, ahead of streaming its chunks.
+	if content, rerr := readDumpFileAll(tf.schemaFile, schemaFileMaxBytes); rerr == nil {
+		var charsetErr *CharsetRefusalError
+		if _, perr := parseSchemaFile(content, filepath.Base(tf.schemaFile)); errors.As(perr, &charsetErr) {
+			return nil, charsetErr
+		}
+	}
+
 	r.mu.Lock()
 	r.err = nil
 	r.mu.Unlock()

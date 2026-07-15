@@ -250,3 +250,31 @@ func matchesAny(patterns []string, name string) bool {
 	}
 	return false
 }
+
+// PreflightTableReads consults reader's optional
+// [ir.TableReadPreflighter] surface for every table remaining in
+// schema — call it immediately AFTER [ApplyTableFilter], so a doomed
+// table the operator --exclude-table'd never blocks the run (Bug 188),
+// while an INCLUDED doomed table refuses loudly up front, before any
+// DDL or data moves, with every violation named in one pass. Readers
+// without the surface are a no-op.
+func PreflightTableReads(reader ir.SchemaReader, schema *ir.Schema) error {
+	p, ok := reader.(ir.TableReadPreflighter)
+	if !ok || schema == nil {
+		return nil
+	}
+	var errs []error
+	for _, t := range schema.Tables {
+		if t == nil {
+			continue
+		}
+		if err := p.PreflightTableRead(t.Name); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) == 0 {
+		return nil
+	}
+	return fmt.Errorf("pipeline: %d table(s) cannot be read from this source (--exclude-table routes around them): %w",
+		len(errs), errors.Join(errs...))
+}

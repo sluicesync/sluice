@@ -1233,6 +1233,23 @@ type TableEmptyChecker interface {
 	IsTableEmpty(ctx context.Context, table *Table) (bool, error)
 }
 
+// TableReadPreflighter is the optional surface a [SchemaReader] can
+// implement when some tables it returned are KNOWN-DOOMED to refuse at
+// read time (a flat-file reader whose dump carries a table in an
+// unsupported encoding, say). The pipeline consults it AFTER the
+// include/exclude table filter and BEFORE any DDL or data moves, so an
+// --exclude-table'd doomed table never blocks the rest of the run
+// (Bug 188), while an INCLUDED doomed table still refuses loudly up
+// front — not mid-migration after other tables copied.
+//
+// PreflightTableRead returns nil for a table it can read (or does not
+// know), and the loud, remedy-bearing refusal otherwise. Readers that
+// can always read every table they returned simply don't implement
+// this.
+type TableReadPreflighter interface {
+	PreflightTableRead(table string) error
+}
+
 // ShardDiscoverer is the optional surface a source [Engine] can
 // implement to report the source's shard layout. A sharded source — a
 // Vitess/PlanetScale keyspace fronted by vtgate, which transparently

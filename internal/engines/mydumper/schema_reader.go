@@ -27,6 +27,13 @@ type SchemaReader struct {
 // order is the sorted table-name order (deterministic for diffs/logs).
 // Views/triggers/routines are not carried — their auxiliary files were
 // WARN-skipped at open (see [openDumpDir]).
+//
+// A table with an unsupported charset is INCLUDED in the returned
+// schema rather than failing the read: its ADR-0161 §5 refusal is
+// deferred to [SchemaReader.PreflightTableRead] (and the row reader's
+// own guard), which the pipeline consults after the table filter — so
+// --exclude-table can route around one legacy latin1 table instead of
+// the whole dump being unreadable (Bug 188).
 func (r *SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 	s := &ir.Schema{}
 	for _, name := range r.dir.tableOrder {
@@ -35,12 +42,37 @@ func (r *SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 		}
 		tf := r.dir.tables[name]
 		table, err := r.parseTableSchema(tf)
+		var charsetErr *CharsetRefusalError
+		if errors.As(err, &charsetErr) && table != nil {
+			s.Tables = append(s.Tables, table)
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
 		s.Tables = append(s.Tables, table)
 	}
 	return s, nil
+}
+
+// PreflightTableRead implements [ir.TableReadPreflighter]: it returns
+// the deferred ADR-0161 §5 charset refusal for a table ReadSchema
+// carried past it, nil for a readable (or unknown) table. Stateless —
+// it re-parses the table's small schema file, so it answers correctly
+// whether or not ReadSchema ran first.
+func (r *SchemaReader) PreflightTableRead(table string) error {
+	tf, ok := r.dir.tables[table]
+	if !ok {
+		return nil
+	}
+	_, err := r.parseTableSchema(tf)
+	var charsetErr *CharsetRefusalError
+	if errors.As(err, &charsetErr) {
+		return charsetErr
+	}
+	// Any other parse error already failed ReadSchema (or will); the
+	// preflight's job is only the deferred-refusal class.
+	return nil
 }
 
 // parseTableSchema reads and parses one table's schema file, cross-
@@ -53,14 +85,18 @@ func (r *SchemaReader) parseTableSchema(tf *tableFiles) (*ir.Table, error) {
 		return nil, err
 	}
 	table, err := parseSchemaFile(content, base)
-	if err != nil {
+	var charsetErr *CharsetRefusalError
+	deferrable := errors.As(err, &charsetErr) && table != nil
+	if err != nil && !deferrable {
 		return nil, err
 	}
 	if table.Name != tf.name {
 		return nil, fmt.Errorf("mydumper: schema file %s declares CREATE TABLE %s — filename and "+
 			"statement disagree; corrupt or mislabelled dump", base, table.Name)
 	}
-	return table, nil
+	// err is nil, or the deferred *CharsetRefusalError riding with the
+	// parsed table (Bug 188) — the caller decides where it surfaces.
+	return table, err
 }
 
 // ExactRowCount implements [ir.Verifier] for `sluice verify --depth count`:

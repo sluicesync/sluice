@@ -246,6 +246,10 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context) (*ir.Schema, [
 		migcore.CloseIf(sr)
 		return nil, nil, err
 	}
+	if err := migcore.PreflightTableReads(sr, schema); err != nil {
+		migcore.CloseIf(sr)
+		return nil, nil, err
+	}
 	applyViewFilter(ctx, schema, s.ViewFilter, s.SkipViews)
 
 	// ADR-0143: skip ORM/framework migration-bookkeeping tables before the

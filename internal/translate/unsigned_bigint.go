@@ -71,7 +71,7 @@ func ScanUnsignedBigintNotices(schema *ir.Schema, sourceEngine, targetEngine str
 	if schema == nil {
 		return nil
 	}
-	if !isMySQLSource(sourceEngine) || !strings.EqualFold(targetEngine, "postgres") {
+	if !IsMySQLFamily(sourceEngine) || !strings.EqualFold(targetEngine, "postgres") {
 		return nil
 	}
 
@@ -106,15 +106,6 @@ func ScanUnsignedBigintNotices(schema *ir.Schema, sourceEngine, targetEngine str
 		return out[i].Column < out[j].Column
 	})
 	return out
-}
-
-// isMySQLSource reports whether engine is a MySQL-family source name.
-// PlanetScale is MySQL-wire-compatible and shares the same unsigned
-// semantics, so it's covered too — mirrors the gap scanner's intent
-// even though ScanMySQLToPGGaps keys strictly on "mysql".
-func isMySQLSource(engine string) bool {
-	return strings.EqualFold(engine, "mysql") ||
-		strings.EqualFold(engine, "planetscale")
 }
 
 // UnsignedBigintNoticeError renders an advisory (non-fatal) error

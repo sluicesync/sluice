@@ -34,3 +34,8 @@ var (
 	// RowReader is the whole bulk-copy read surface for this engine.
 	_ ir.RowReader = (*RowReader)(nil)
 )
+
+// The schema reader implements the deferred per-table read preflight
+// (Bug 188): the pipeline consults it after the table filter so an
+// --exclude-table'd unsupported-charset table never blocks the run.
+var _ ir.TableReadPreflighter = (*SchemaReader)(nil)

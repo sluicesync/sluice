@@ -89,6 +89,44 @@ func TestScanUnsignedBigintNotices_PlanetScaleSourceCovered(t *testing.T) {
 	}
 }
 
+// TestScanUnsignedBigintNotices_EveryMySQLFamilySourceCovered pins the
+// Bug 186 class: the SAME schema must produce the SAME advisory through
+// every MySQL-family source name — the live driver, the flavors, and
+// the mydumper dump reader (which folds through the same translator).
+// Bug 186's shape was exactly this asymmetry: WARN via "mysql", silence
+// via "mydumper"/"vitess". The family list itself is pinned against the
+// engine registry's DDLDialect in mysql_family_registry_test.go.
+func TestScanUnsignedBigintNotices_EveryMySQLFamilySourceCovered(t *testing.T) {
+	for _, src := range []string{"mysql", "planetscale", "vitess", "mydumper"} {
+		if got := ScanUnsignedBigintNotices(ormSchema(), src, "postgres"); len(got) != 3 {
+			t.Errorf("%s→PG notices = %d; want 3 (Bug 186: the advisory must not depend on which MySQL-family door the schema came through)", src, len(got))
+		}
+		if err := UnsignedBigintNoticeError(ormSchema(), src, "postgres", "migrate"); err == nil {
+			t.Errorf("%s→PG UnsignedBigintNoticeError = nil; want the advisory (Bug 186)", src)
+		}
+	}
+}
+
+// TestScanMySQLToPGGaps_EveryMySQLFamilySourceCovered pins the sibling
+// half of the Bug 186 class sweep: the expression-gap scanner keyed
+// strictly on "mysql", silently skipping planetscale/vitess/mydumper
+// sources whose IR carries the identical mysql-dialect expressions.
+func TestScanMySQLToPGGaps_EveryMySQLFamilySourceCovered(t *testing.T) {
+	s := &ir.Schema{Tables: []*ir.Table{{
+		Name: "t",
+		Columns: []*ir.Column{{
+			Name: "c", Type: ir.Integer{Width: 64},
+			GeneratedExpr:        "SHA2(payload, 256)",
+			GeneratedExprDialect: "mysql",
+		}},
+	}}}
+	for _, src := range []string{"mysql", "planetscale", "vitess", "mydumper"} {
+		if got := ScanMySQLToPGGaps(s, src, "postgres", nil); len(got) == 0 {
+			t.Errorf("%s→PG gaps = 0; want the sha1 gap regardless of the MySQL-family source name (Bug 186 sweep)", src)
+		}
+	}
+}
+
 func TestUnsignedBigintNoticeError_LoudAndActionable(t *testing.T) {
 	err := UnsignedBigintNoticeError(ormSchema(), "mysql", "postgres", "migrate")
 	if err == nil {
