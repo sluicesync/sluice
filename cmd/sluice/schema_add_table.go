@@ -100,7 +100,7 @@ func (s *SchemaAddTableCmd) Run(g *Globals) error {
 	}
 	// Value-fidelity flags (task 2.5): add-table reads the source table and emits
 	// target DDL, so the value-decode + sql_mode-emit policies apply.
-	if source, err = applyEngineOptions(source, g); err != nil {
+	if source, err = applySourceEngineOptions(source, g); err != nil {
 		return err
 	}
 	if target, err = applyEngineOptions(target, g); err != nil {

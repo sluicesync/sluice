@@ -4,6 +4,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/engines"
@@ -71,5 +72,37 @@ func TestApplyEngineOptions_Postgres(t *testing.T) {
 	}
 	if got != e {
 		t.Errorf("applyEngineOptions should pass a non-option engine through unchanged; got %T", got)
+	}
+}
+
+// TestApplySourceEngineOptions_CSVFlagsRefusedOffFlatFile pins Bug 189:
+// the --csv-* flags on a non-flat-file SOURCE refuse loudly instead of
+// being silently ignored — while a TARGET engine (applyEngineOptions,
+// no source wrapper) never trips on them, so csv → mysql keeps working.
+func TestApplySourceEngineOptions_CSVFlagsRefusedOffFlatFile(t *testing.T) {
+	eng, ok := engines.Get("mysql")
+	if !ok {
+		t.Fatal("mysql engine not registered")
+	}
+	null := ""
+	cases := []Globals{
+		{CSVNull: &null},
+		{CSVHeader: true},
+		{CSVNoHeader: true},
+		{CSVDelimiter: ";"},
+	}
+	for i, g := range cases {
+		if _, err := applySourceEngineOptions(eng, &g); err == nil {
+			t.Errorf("case %d: csv flag silently ignored on a mysql SOURCE; want the Bug 189 refusal", i)
+		} else if !strings.Contains(err.Error(), "--source-driver csv|tsv|ndjson") {
+			t.Errorf("case %d: refusal %q should name the flat-file drivers", i, err)
+		}
+		if _, err := applyEngineOptions(eng, &g); err != nil {
+			t.Errorf("case %d: TARGET-side applyEngineOptions must tolerate csv flags (csv→mysql); got %v", i, err)
+		}
+	}
+	// No flags set: the source wrapper is a pass-through.
+	if _, err := applySourceEngineOptions(eng, &Globals{}); err != nil {
+		t.Errorf("no csv flags: want pass-through; got %v", err)
 	}
 }

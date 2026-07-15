@@ -44,7 +44,7 @@ func (b *BackfillCmd) Run(g *Globals) error {
 	if err != nil {
 		return fmt.Errorf("--driver: %w", err)
 	}
-	if engine, err = applyEngineOptions(engine, g); err != nil {
+	if engine, err = applySourceEngineOptions(engine, g); err != nil {
 		return err
 	}
 	// --verify-only issues no UPDATEs, so --set is optional there (the

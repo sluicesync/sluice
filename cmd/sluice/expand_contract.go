@@ -66,7 +66,7 @@ func (c *ExpandContractCmd) Run(g *Globals) error {
 	if err != nil {
 		return err
 	}
-	if engine, err = applyEngineOptions(engine, g); err != nil {
+	if engine, err = applySourceEngineOptions(engine, g); err != nil {
 		return err
 	}
 

@@ -65,7 +65,7 @@ func (v *VerifyCmd) Run(g *Globals) error {
 	}
 	// Value-fidelity flags (task 2.5): verify reads source + target values, so
 	// its readers honor --zero-date / --sqlite-date-encoding / --mysql-sql-mode.
-	if source, err = applyEngineOptions(source, g); err != nil {
+	if source, err = applySourceEngineOptions(source, g); err != nil {
 		return operationalError{err: err}
 	}
 	if target, err = applyEngineOptions(target, g); err != nil {

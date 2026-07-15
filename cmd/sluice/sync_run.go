@@ -807,7 +807,7 @@ func buildStreamerFromSpec(ctx context.Context, spec *SyncSpec, g *Globals) (*pi
 	// sync's per-spec DSN param still wins over these defaults — in particular the
 	// per-spec zero-date is folded into the source DSN below, which overrides the
 	// engine default the same way a per-command DSN param does.
-	if source, err = applyEngineOptions(source, g); err != nil {
+	if source, err = applySourceEngineOptions(source, g); err != nil {
 		return nil, err
 	}
 	if target, err = applyEngineOptions(target, g); err != nil {

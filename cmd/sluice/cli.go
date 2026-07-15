@@ -622,7 +622,7 @@ func (m *MigrateCmd) resolveEngines(ctx context.Context, g *Globals) (source, ta
 	// --sqlite-date-encoding) onto the resolved engines (task 2.5, replacing the
 	// former process-wide globals). Applied AFTER any D1→SQLite staging re-resolve
 	// so the staged `sqlite` source carries the operator's --sqlite-date-encoding.
-	if source, err = applyEngineOptions(source, g); err != nil {
+	if source, err = applySourceEngineOptions(source, g); err != nil {
 		return nil, nil, cleanup, err
 	}
 	if target, err = applyEngineOptions(target, g); err != nil {
@@ -820,6 +820,25 @@ func applyEngineOptions(e ir.Engine, g *Globals) (ir.Engine, error) {
 		}
 	}
 	return e, nil
+}
+
+// applySourceEngineOptions is applyEngineOptions plus the SOURCE-scoped
+// csv-flag consumption check (Bug 189): the --csv-* flags configure the
+// flat-file source drivers only, and were silently ignored on any other
+// source engine — contradicting the documented refuse-loudly contract
+// (an ignored --csv-null is exactly the kind of silently-dropped intent
+// sluice refuses elsewhere). The check lives in a source-only wrapper
+// because applyEngineOptions also runs for TARGET engines, where the
+// flags legitimately belong to the OTHER side of the run (csv → mysql
+// must not refuse on the mysql target).
+func applySourceEngineOptions(e ir.Engine, g *Globals) (ir.Engine, error) {
+	_, isFlatFile := e.(interface {
+		WithFlatFileOptions(flatfile.Options) (ir.Engine, error)
+	})
+	if !isFlatFile && (g.CSVNull != nil || g.CSVHeader || g.CSVNoHeader || g.CSVDelimiter != "") {
+		return nil, fmt.Errorf("source engine %q does not read CSV/TSV/NDJSON files — the --csv-null/--csv-header/--csv-no-header/--csv-delimiter flags apply only to --source-driver csv|tsv|ndjson; remove them or switch the source driver", e.Name())
+	}
+	return applyEngineOptions(e, g)
 }
 
 // SyncCmd groups the continuous-sync subcommands. Continuous sync is
@@ -2011,7 +2030,7 @@ func (s *SyncStartCmd) resolveEngines(ctx context.Context, g *Globals) (source, 
 
 	// Precedence is unchanged: the per-source DSN param still wins over
 	// these defaults inside each engine.
-	if source, err = applyEngineOptions(source, g); err != nil {
+	if source, err = applySourceEngineOptions(source, g); err != nil {
 		return nil, nil, err
 	}
 	if target, err = applyEngineOptions(target, g); err != nil {

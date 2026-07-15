@@ -83,7 +83,7 @@ func (s *SchemaPreviewCmd) Run(g *Globals) error {
 	}
 	// Value-fidelity flags (task 2.5): preview emits target DDL, so the
 	// --mysql-sql-mode backslash policy reaches the schema emitter.
-	if source, err = applyEngineOptions(source, g); err != nil {
+	if source, err = applySourceEngineOptions(source, g); err != nil {
 		return err
 	}
 	if target, err = applyEngineOptions(target, g); err != nil {

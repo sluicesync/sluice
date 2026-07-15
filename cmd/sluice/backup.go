@@ -772,7 +772,7 @@ func (b *BackupFullCmd) run(g *Globals, env *envelopeRun) error {
 	}
 	// Value-fidelity flags (task 2.5): a backup reads source values, so its reader
 	// honors --zero-date / --sqlite-date-encoding / --mysql-sql-mode.
-	if source, err = applyEngineOptions(source, g); err != nil {
+	if source, err = applySourceEngineOptions(source, g); err != nil {
 		return err
 	}
 	// CA-pinned verify-ca TLS (ADR-0158): rewrite the source DSN so a MySQL
@@ -986,7 +986,7 @@ func (b *BackupIncrementalCmd) Run(g *Globals) error {
 		return fmt.Errorf("--source-driver: %w", err)
 	}
 	// Value-fidelity flags (task 2.5): an incremental backup reads source values.
-	if source, err = applyEngineOptions(source, g); err != nil {
+	if source, err = applySourceEngineOptions(source, g); err != nil {
 		return err
 	}
 	// CA-pinned verify-ca TLS (ADR-0158): rewrite the source DSN so a MySQL
@@ -1146,7 +1146,7 @@ func (b *BackupStreamCmd) Run(g *Globals) error {
 		return fmt.Errorf("--source-driver: %w", err)
 	}
 	// Value-fidelity flags (task 2.5): a backup stream reads source values.
-	if source, err = applyEngineOptions(source, g); err != nil {
+	if source, err = applySourceEngineOptions(source, g); err != nil {
 		return err
 	}
 	// CA-pinned verify-ca TLS (ADR-0158): rewrite the source DSN so a MySQL

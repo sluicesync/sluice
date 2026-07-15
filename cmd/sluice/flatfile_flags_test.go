@@ -218,17 +218,19 @@ func TestFlatFileAutoEngagesInferTypes(t *testing.T) {
 	})
 }
 
-// TestCSVFlagsInertOnOtherEngines pins that the --csv-* flags do not break
-// a non-flat-file resolve (they are inert, the --sqlite-date-encoding
-// posture) — and that the tsv delimiter contradiction is caught at resolve.
+// TestCSVFlagsInertOnOtherEngines pins the Bug 189 contract: the
+// --csv-* flags on a non-flat-file SOURCE refuse loudly (they were
+// silently ignored, contradicting the documented refuse-loudly
+// contract) — and the tsv delimiter contradiction is caught at resolve.
 func TestCSVFlagsInertOnOtherEngines(t *testing.T) {
-	t.Run("csv flags inert on mysql source", func(t *testing.T) {
+	t.Run("csv flags refused on mysql source (Bug 189)", func(t *testing.T) {
 		cli := parseMigrate(t,
 			"--source-driver=mysql", "--source=u:p@tcp(h:3306)/db",
 			"--target-driver=sqlite", "--target=ignored.db",
 			"--csv-header", "--csv-null=NULL")
-		if _, err := resolveSource(t, cli); err != nil {
-			t.Fatalf("csv flags must be inert on a mysql source: %v", err)
+		_, err := resolveSource(t, cli)
+		if err == nil || !strings.Contains(err.Error(), "--source-driver csv|tsv|ndjson") {
+			t.Fatalf("csv flags on a mysql source must refuse naming the flat-file drivers (Bug 189); got %v", err)
 		}
 	})
 	t.Run("tsv driver refuses a contradicting delimiter at resolve", func(t *testing.T) {

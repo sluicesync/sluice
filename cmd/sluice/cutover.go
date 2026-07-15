@@ -101,7 +101,7 @@ func (c *CutoverCmd) Run(g *Globals) error {
 		return fmt.Errorf("--target-driver: %w", err)
 	}
 	// Value-fidelity flags (task 2.5): cutover opens source + target connections.
-	if source, err = applyEngineOptions(source, g); err != nil {
+	if source, err = applySourceEngineOptions(source, g); err != nil {
 		return err
 	}
 	if target, err = applyEngineOptions(target, g); err != nil {
