@@ -128,37 +128,75 @@ func (s *MigrationStateStore) Close() error {
 // FormatLegacyBlob, which is exactly what it is — Read detects it and
 // the first write upgrades it to per-table progress rows.
 func (s *MigrationStateStore) EnsureControlTable(ctx context.Context) error {
-	const hdrDDL = `
-		CREATE TABLE IF NOT EXISTS ` + "`" + migrateStateTableName + "`" + ` (
-			migration_id    VARCHAR(255) NOT NULL,
-			phase           VARCHAR(32)  NOT NULL,
-			table_progress  TEXT         NULL,
-			state_format    INT          NOT NULL DEFAULT 1,
-			started_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
-				ON UPDATE CURRENT_TIMESTAMP,
-			last_error      TEXT         NULL,
-			PRIMARY KEY (migration_id)
-		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
-	if _, err := s.db.ExecContext(ctx, hdrDDL); err != nil {
-		return fmt.Errorf("mysql: ensure migrate-state table: %w", err)
+	// Detect-then-create, NOT bare CREATE TABLE IF NOT EXISTS: Vitess
+	// under PlanetScale safe migrations refuses every direct DDL
+	// STATEMENT (Error 1105 "direct DDL is disabled") regardless of
+	// whether the table exists, so the exists-already path must issue
+	// no DDL at all. On a safe-migrations production branch the tables
+	// arrive via the expand deploy request (expand-contract stages them
+	// on the dev branch); this detect gate is what lets the backfill
+	// then open the store there without tripping the DDL block
+	// (live-caught 2026-07-15).
+	hdrExists, err := s.controlTableExists(ctx, migrateStateTableName)
+	if err != nil {
+		return err
+	}
+	if !hdrExists {
+		const hdrDDL = `
+			CREATE TABLE IF NOT EXISTS ` + "`" + migrateStateTableName + "`" + ` (
+				migration_id    VARCHAR(255) NOT NULL,
+				phase           VARCHAR(32)  NOT NULL,
+				table_progress  TEXT         NULL,
+				state_format    INT          NOT NULL DEFAULT 1,
+				started_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
+					ON UPDATE CURRENT_TIMESTAMP,
+				last_error      TEXT         NULL,
+				PRIMARY KEY (migration_id)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
+		if _, err := s.db.ExecContext(ctx, hdrDDL); err != nil {
+			return fmt.Errorf("mysql: ensure migrate-state table: %w", err)
+		}
 	}
 	if err := s.ensureStateFormatColumn(ctx); err != nil {
 		return err
 	}
-	const progDDL = `
-		CREATE TABLE IF NOT EXISTS ` + "`" + migrateProgressTableName + "`" + ` (
-			migration_id    VARCHAR(255) NOT NULL,
-			table_name      VARCHAR(255) NOT NULL,
-			progress        TEXT         NOT NULL,
-			updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
-				ON UPDATE CURRENT_TIMESTAMP,
-			PRIMARY KEY (migration_id, table_name)
-		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
-	if _, err := s.db.ExecContext(ctx, progDDL); err != nil {
-		return fmt.Errorf("mysql: ensure migrate-state progress table: %w", err)
+	progExists, err := s.controlTableExists(ctx, migrateProgressTableName)
+	if err != nil {
+		return err
+	}
+	if !progExists {
+		const progDDL = `
+			CREATE TABLE IF NOT EXISTS ` + "`" + migrateProgressTableName + "`" + ` (
+				migration_id    VARCHAR(255) NOT NULL,
+				table_name      VARCHAR(255) NOT NULL,
+				progress        TEXT         NOT NULL,
+				updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
+					ON UPDATE CURRENT_TIMESTAMP,
+				PRIMARY KEY (migration_id, table_name)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
+		if _, err := s.db.ExecContext(ctx, progDDL); err != nil {
+			return fmt.Errorf("mysql: ensure migrate-state progress table: %w", err)
+		}
 	}
 	return nil
+}
+
+// controlTableExists reports whether a migrate-state control table is
+// already present in the connected schema, so EnsureControlTable can
+// skip the CREATE statement entirely (see the safe-migrations note
+// there).
+func (s *MigrationStateStore) controlTableExists(ctx context.Context, table string) (bool, error) {
+	const q = `
+		SELECT COUNT(*)
+		FROM   information_schema.TABLES
+		WHERE  TABLE_SCHEMA = DATABASE()
+		  AND  TABLE_NAME   = ?`
+	var n int
+	if err := s.db.QueryRowContext(ctx, q, table).Scan(&n); err != nil {
+		return false, fmt.Errorf("mysql: ensure migrate-state table: detect %s: %w", table, err)
+	}
+	return n > 0, nil
 }
 
 // ensureStateFormatColumn adds the ADR-0082 state_format column to a

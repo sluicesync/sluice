@@ -235,3 +235,68 @@ func TestClient_DeployRequestVerbs(t *testing.T) {
 		}
 	}
 }
+
+// TestClient_GetDeployRequest_RealResponseShape pins GetDeployRequest
+// against the shape the real API serves for GET
+// /deploy-requests/{number}: the deployable flag lives ONLY inside the
+// nested "deployment" object — there is no top-level "deployable"
+// field. The fixture below is a sanitized verbatim capture from a real
+// deploy request (sluicesync/sluice-ec-demo DR #2, 2026-07-15), kept
+// to the fields the client reads plus enough real siblings to prove
+// tolerant decoding. The first cut of the client read a top-level
+// "deployable" — authored into its hand-written fixtures, so every
+// unit test passed while every REAL run timed out at --deploy-timeout.
+// Self-consistent fixtures (marshal the client's own struct) cannot
+// catch this class; this pin decodes raw captured JSON instead.
+func TestClient_GetDeployRequest_RealResponseShape(t *testing.T) {
+	const realGetByNumber = `{
+	  "id": "abc123",
+	  "type": "DeployRequest",
+	  "branch": "sluice-expand-286cee0f33",
+	  "into_branch": "main",
+	  "approved": false,
+	  "state": "open",
+	  "deployment_state": "ready",
+	  "number": 2,
+	  "deployment": {
+	    "id": "def456",
+	    "type": "Deployment",
+	    "into_branch": "main",
+	    "deploy_request_number": 2,
+	    "deployable": true,
+	    "state": "ready",
+	    "strategy": "online"
+	  },
+	  "html_url": "https://app.planetscale.com/o/d/deploy-requests/2"
+	}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(realGetByNumber))
+	}))
+	defer srv.Close()
+
+	dr, err := newTestClient(srv, nil).GetDeployRequest(context.Background(), "o", "d", 2)
+	if err != nil {
+		t.Fatalf("GetDeployRequest: %v", err)
+	}
+	if !dr.CanDeploy() {
+		t.Fatalf("CanDeploy() = false on the real GET-by-number shape (deployment.deployable=true); the poller would wait out --deploy-timeout")
+	}
+	if dr.Deployable {
+		t.Fatalf("top-level Deployable = true; the real GET-by-number response has no top-level field, so this must stay zero")
+	}
+	if dr.DeploymentState != "ready" || dr.Number != 2 {
+		t.Fatalf("dr = %+v; want deployment_state ready, number 2", dr)
+	}
+}
+
+// TestDeployRequest_CanDeploy_TopLevelTolerated keeps the top-level
+// flag honoured for response shapes that do carry it there.
+func TestDeployRequest_CanDeploy_TopLevelTolerated(t *testing.T) {
+	var dr DeployRequest
+	if err := json.Unmarshal([]byte(`{"number":1,"deployable":true}`), &dr); err != nil {
+		t.Fatal(err)
+	}
+	if !dr.CanDeploy() {
+		t.Fatal("CanDeploy() = false; top-level deployable:true must be honoured")
+	}
+}

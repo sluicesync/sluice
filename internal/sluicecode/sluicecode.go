@@ -82,6 +82,7 @@ const (
 
 	CodePSSafeMigrationsDisabled Code = "SLUICE-E-PS-SAFE-MIGRATIONS-DISABLED"
 	CodePSDeployRequestFailed    Code = "SLUICE-E-PS-DEPLOY-REQUEST-FAILED"
+	CodePSBranchStaleBase        Code = "SLUICE-E-PS-BRANCH-STALE-BASE"
 )
 
 // Class partitions codes by how the process should exit when the
@@ -148,6 +149,7 @@ var registry = map[Code]Info{
 
 	CodePSSafeMigrationsDisabled: {ClassRefusal, "expand-contract refused: the PlanetScale production branch does not have safe migrations enabled (the deploy-request prerequisite); sluice never auto-enables it"},
 	CodePSDeployRequestFailed:    {ClassRuntime, "a PlanetScale deploy request entered a failure state (or never became deployable/complete before the timeout) — the message carries the DR number, state, and URL"},
+	CodePSBranchStaleBase:        {ClassRuntime, "a PlanetScale dev branch's schema still differs from production after a rebase backup — a new dev branch's schema can lag production (intermittent, timing undocumented), and deploying from a stale base would silently revert newer production schema"},
 }
 
 // Describe returns the registry metadata for c, and whether c is a

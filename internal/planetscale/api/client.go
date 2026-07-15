@@ -287,9 +287,16 @@ type BranchPassword struct {
 }
 
 // DeployRequest is the subset of the deploy-request object the
-// expand-contract poller drives: Deployable gates the deploy call,
+// expand-contract poller drives: CanDeploy gates the deploy call,
 // DeploymentState walks the lifecycle (ADR-0148 ground truth:
 // open/pending → ready → queued → … → complete_pending_revert).
+//
+// The real GET /deploy-requests/{number} response carries the
+// deployable flag ONLY inside the nested "deployment" object — there
+// is no top-level "deployable" field (live-verified 2026-07-15 on a
+// real deploy request; the first cut read it top-level, so every real
+// run timed out at --deploy-timeout). Both locations are read so a
+// response shape that does carry it top-level keeps working.
 type DeployRequest struct {
 	Number          int    `json:"number"`
 	Branch          string `json:"branch"`
@@ -297,7 +304,19 @@ type DeployRequest struct {
 	State           string `json:"state"`
 	DeploymentState string `json:"deployment_state"`
 	Deployable      bool   `json:"deployable"`
-	HTMLURL         string `json:"html_url"`
+	Deployment      struct {
+		State      string `json:"state"`
+		Deployable bool   `json:"deployable"`
+	} `json:"deployment"`
+	HTMLURL string `json:"html_url"`
+}
+
+// CanDeploy reports whether PlanetScale will accept a deploy call for
+// this request, reading the deployable flag from wherever the response
+// shape carried it (nested deployment object on the GET-by-number
+// endpoint; tolerated top-level for other shapes).
+func (dr *DeployRequest) CanDeploy() bool {
+	return dr.Deployable || dr.Deployment.Deployable
 }
 
 // branchesPath builds the escaped org/database branch collection path.
@@ -379,6 +398,57 @@ func (c *Client) GetDeployRequest(ctx context.Context, org, db string, number in
 func (c *Client) Deploy(ctx context.Context, org, db string, number int) (*DeployRequest, error) {
 	var out DeployRequest
 	if err := c.post(ctx, deployRequestsPath(org, db)+"/"+strconv.Itoa(number)+"/deploy", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// SchemaTable is one table of a branch's rendered schema (the raw DDL
+// leg of GET /branches/{branch}/schema; live-verified shape
+// 2026-07-15: {"data":[{"name","html","raw","annotated"}]}).
+type SchemaTable struct {
+	Name string `json:"name"`
+	Raw  string `json:"raw"`
+}
+
+// GetBranchSchema returns a branch's rendered per-table schema DDL —
+// the freshness gate's comparison input (a just-created
+// PlanetScale branch's schema can lag production — observed live
+// 2026-07-15, intermittent — and a deploy request from a lagging
+// branch would silently revert the missing changes).
+func (c *Client) GetBranchSchema(ctx context.Context, org, db, branch string) ([]SchemaTable, error) {
+	var out struct {
+		Data []SchemaTable `json:"data"`
+	}
+	if err := c.Get(ctx, branchesPath(org, db)+"/"+url.PathEscape(branch)+"/schema", &out); err != nil {
+		return nil, err
+	}
+	return out.Data, nil
+}
+
+// Backup is the subset of the backup object the branch-rebase flow
+// drives: State walks pending/running → success (live-verified shape
+// 2026-07-15).
+type Backup struct {
+	ID    string `json:"id"`
+	State string `json:"state"`
+}
+
+// CreateBackup starts an on-demand backup of branch — the rebase
+// vehicle for a stale dev-branch base (a fresh backup makes the next
+// branch creation seed from current production schema).
+func (c *Client) CreateBackup(ctx context.Context, org, db, branch string) (*Backup, error) {
+	var out Backup
+	if err := c.post(ctx, branchesPath(org, db)+"/"+url.PathEscape(branch)+"/backups", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// GetBackup fetches one backup for state polling.
+func (c *Client) GetBackup(ctx context.Context, org, db, branch, id string) (*Backup, error) {
+	var out Backup
+	if err := c.Get(ctx, branchesPath(org, db)+"/"+url.PathEscape(branch)+"/backups/"+url.PathEscape(id), &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

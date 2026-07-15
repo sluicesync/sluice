@@ -51,6 +51,17 @@ type fakePS struct {
 	// NEWLY created DR walks before / after its deploy call.
 	preStates  []string
 	postStates []string
+
+	// staleNextBranches marks the next N created dev branches as
+	// seeded from a stale backup: their /schema differs from
+	// production's until recreated (the PlanetScale
+	// branch-from-last-backup behavior, live-caught 2026-07-15).
+	staleNextBranches int
+	staleBranch       map[string]bool
+	// backups counts on-demand backups taken; backupStates scripts the
+	// GET-backup state walk (default: immediately "success").
+	backups      int
+	backupStates []string
 }
 
 type fakeDR struct {
@@ -73,6 +84,7 @@ func newFakePS(t *testing.T) *fakePS {
 		drs:            map[int]*fakeDR{},
 		nextDR:         1,
 		postStates:     []string{"queued", "in_progress", "complete_pending_revert"},
+		staleBranch:    map[string]bool{},
 	}
 }
 
@@ -124,7 +136,33 @@ func (f *fakePS) handleBranches(w http.ResponseWriter, r *http.Request, rest []s
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		br := &api.Branch{Name: body.Name, ParentBranch: body.ParentBranch, Ready: true}
 		f.branches[body.Name] = br
+		if f.staleNextBranches > 0 {
+			f.staleNextBranches--
+			f.staleBranch[body.Name] = true
+		}
 		writeJSON(w, br)
+	case len(rest) == 2 && rest[1] == "schema" && r.Method == http.MethodGet:
+		if _, ok := f.branches[rest[0]]; !ok {
+			writeNotFound(w)
+			return
+		}
+		raw := "CREATE TABLE `items` (id bigint) -- current"
+		if f.staleBranch[rest[0]] {
+			raw = "CREATE TABLE `items` (id bigint) -- stale backup base"
+		}
+		writeJSON(w, map[string]any{"data": []map[string]string{{"name": "items", "raw": raw}}})
+	case len(rest) == 2 && rest[1] == "backups" && r.Method == http.MethodPost:
+		f.backups++
+		writeJSON(w, api.Backup{ID: "bk" + strconv.Itoa(f.backups), State: "pending"})
+	case len(rest) == 3 && rest[1] == "backups" && r.Method == http.MethodGet:
+		state := "success"
+		if len(f.backupStates) > 0 {
+			state = f.backupStates[0]
+			if len(f.backupStates) > 1 {
+				f.backupStates = f.backupStates[1:]
+			}
+		}
+		writeJSON(w, api.Backup{ID: rest[2], State: state})
 	case len(rest) == 1 && r.Method == http.MethodGet:
 		br, ok := f.branches[rest[0]]
 		if !ok {
@@ -140,6 +178,7 @@ func (f *fakePS) handleBranches(w http.ResponseWriter, r *http.Request, rest []s
 			return
 		}
 		delete(f.branches, rest[0])
+		delete(f.staleBranch, rest[0])
 		f.deleted = append(f.deleted, rest[0])
 		writeJSON(w, map[string]any{})
 	case len(rest) == 2 && rest[1] == "passwords" && r.Method == http.MethodPost:
@@ -203,7 +242,11 @@ func (f *fakePS) handleDeployRequests(w http.ResponseWriter, r *http.Request, re
 	}
 }
 
-// snapshot advances the scripted state walk one step per GET.
+// snapshot advances the scripted state walk one step per GET. The
+// deployable flag is served ONLY inside the nested deployment object,
+// mirroring the real GET-by-number response shape (which has no
+// top-level "deployable" — the live-caught 2026-07-15 field-location
+// bug); these tests must exercise the shape the real API serves.
 func (fd *fakeDR) snapshot() *api.DeployRequest {
 	out := *fd.dr
 	if !fd.deployed {
@@ -212,11 +255,13 @@ func (fd *fakeDR) snapshot() *api.DeployRequest {
 			if len(fd.preStates) > 1 {
 				fd.preStates = fd.preStates[1:]
 			}
-			out.Deployable = out.DeploymentState == "ready"
+			out.Deployment.State = out.DeploymentState
+			out.Deployment.Deployable = out.DeploymentState == "ready"
 			return &out
 		}
 		out.DeploymentState = "ready"
-		out.Deployable = true
+		out.Deployment.State = "ready"
+		out.Deployment.Deployable = true
 		return &out
 	}
 	out.DeploymentState = fd.states[0]
@@ -452,10 +497,12 @@ func ecRows(n int) []ecRow {
 	return rows
 }
 
-// ddlRecorder is the injected ExecDDL fake.
+// ddlRecorder is the injected ExecDDL + EnsureStateOnBranch fake.
 type ddlRecorder struct {
-	mu   sync.Mutex
-	ddls []string
+	mu            sync.Mutex
+	ddls          []string
+	stateStagings int
+	stateErr      error
 }
 
 func (d *ddlRecorder) exec(_ context.Context, pw *api.BranchPassword, _, ddl string) error {
@@ -468,6 +515,19 @@ func (d *ddlRecorder) exec(_ context.Context, pw *api.BranchPassword, _, ddl str
 	return nil
 }
 
+func (d *ddlRecorder) ensureState(_ context.Context, pw *api.BranchPassword, _ string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if pw == nil || pw.PlainText == "" {
+		return errors.New("no branch password")
+	}
+	if d.stateErr != nil {
+		return d.stateErr
+	}
+	d.stateStagings++
+	return nil
+}
+
 // newTestOrchestrator wires a full happy-path orchestrator; tests
 // mutate what they need.
 func newTestOrchestrator(t *testing.T, ps *fakePS) (*Orchestrator, *ecFakeEngine, *ddlRecorder, *bytes.Buffer) {
@@ -477,21 +537,22 @@ func newTestOrchestrator(t *testing.T, ps *fakePS) (*Orchestrator, *ecFakeEngine
 	rec := &ddlRecorder{}
 	out := &bytes.Buffer{}
 	return &Orchestrator{
-		API:           client,
-		Org:           "o",
-		Database:      "d",
-		Engine:        eng,
-		DSN:           "dsn",
-		Table:         "items",
-		Sets:          []ir.BackfillSet{{Column: "new_col", Expr: "old_col"}},
-		Where:         "new_col IS NULL",
-		ExpandDDL:     "ALTER TABLE items ADD COLUMN new_col BIGINT",
-		ContractDDL:   "ALTER TABLE items DROP COLUMN old_col",
-		Yes:           true,
-		PollInterval:  time.Millisecond,
-		DeployTimeout: 5 * time.Second,
-		Out:           out,
-		ExecDDL:       rec.exec,
+		API:                 client,
+		Org:                 "o",
+		Database:            "d",
+		Engine:              eng,
+		DSN:                 "dsn",
+		Table:               "items",
+		Sets:                []ir.BackfillSet{{Column: "new_col", Expr: "old_col"}},
+		Where:               "new_col IS NULL",
+		ExpandDDL:           "ALTER TABLE items ADD COLUMN new_col BIGINT",
+		ContractDDL:         "ALTER TABLE items DROP COLUMN old_col",
+		Yes:                 true,
+		PollInterval:        time.Millisecond,
+		DeployTimeout:       5 * time.Second,
+		Out:                 out,
+		ExecDDL:             rec.exec,
+		EnsureStateOnBranch: rec.ensureState,
 	}, eng, rec, out
 }
 
@@ -528,6 +589,14 @@ func TestExpandContract_HappyPathFullPattern(t *testing.T) {
 	if len(rec.ddls) != 2 || rec.ddls[0] != o.ExpandDDL || rec.ddls[1] != o.ContractDDL {
 		t.Errorf("DDLs applied = %q; want expand then contract", rec.ddls)
 	}
+	// The migrate-state control tables are staged on the EXPAND dev
+	// branch only (they ship to production inside the expand deploy
+	// request — safe migrations blocks creating them there directly;
+	// live-caught 2026-07-15). Exactly once: the contract leg must not
+	// re-stage.
+	if rec.stateStagings != 1 {
+		t.Errorf("state stagings = %d; want exactly 1 (expand leg only)", rec.stateStagings)
+	}
 	// Both scripted deploys ended in complete_pending_revert, so both
 	// must have been finalized via skip-revert.
 	for n, fdr := range ps.drs {
@@ -546,6 +615,78 @@ func TestExpandContract_HappyPathFullPattern(t *testing.T) {
 	}
 	if eng.ex.execCalls == 0 {
 		t.Error("backfill executed no chunks")
+	}
+}
+
+// TestExpandContract_StateStagingFailureFailsExpandLeg pins that a
+// failure staging the migrate-state tables on the expand dev branch
+// fails the run loudly BEFORE a deploy request opens (nothing to ship
+// without the state tables — the migrate leg would die on production's
+// safe-migrations DDL block).
+func TestExpandContract_StateStagingFailureFailsExpandLeg(t *testing.T) {
+	ps := newFakePS(t)
+	o, _, rec, _ := newTestOrchestrator(t, ps)
+	rec.stateErr = errors.New("branch conn refused")
+
+	_, err := o.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "branch conn refused") {
+		t.Fatalf("err = %v; want the staging failure surfaced", err)
+	}
+	if len(ps.drs) != 0 {
+		t.Errorf("a deploy request was opened (%d) despite the staging failure", len(ps.drs))
+	}
+	// Cleanup still removed the expand dev branch.
+	if len(ps.deleted) != 1 || !strings.HasPrefix(ps.deleted[0], "sluice-expand-") {
+		t.Errorf("deleted = %v; want just the expand dev branch", ps.deleted)
+	}
+}
+
+// TestExpandContract_StaleBranchRebasedViaBackup pins the freshness
+// gate's self-heal: a dev branch seeded from a stale backup
+// (PlanetScale branches from the parent's most recent backup — a
+// branch created 14 minutes after a deploy still lacked the deployed
+// column, live-caught 2026-07-15) is detected by schema comparison,
+// deleted, and recreated after an on-demand production backup; the
+// run then completes normally. Without the gate, the deploy request
+// from the stale base silently REVERTS every production schema change
+// newer than the backup — on the contract leg that drops the freshly
+// backfilled expand column.
+func TestExpandContract_StaleBranchRebasedViaBackup(t *testing.T) {
+	ps := newFakePS(t)
+	ps.staleNextBranches = 1
+	o, _, _, out := newTestOrchestrator(t, ps)
+
+	result, err := o.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !result.ContractRun || !result.Verified {
+		t.Errorf("result = %+v; want full pattern", result)
+	}
+	if ps.backups != 1 {
+		t.Errorf("backups taken = %d; want exactly 1 (the rebase)", ps.backups)
+	}
+	if !strings.Contains(out.String(), "taking a fresh backup to rebase") {
+		t.Errorf("narration missing the rebase explanation:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "now matches") {
+		t.Errorf("narration missing the rebased-branch confirmation:\n%s", out.String())
+	}
+}
+
+// TestExpandContract_StillStaleAfterBackupRefusesCoded pins the
+// bounded end of the self-heal: when the recreated branch STILL
+// differs from production after a fresh backup, the run refuses with
+// the coded error instead of deploying a schema-reverting DR.
+func TestExpandContract_StillStaleAfterBackupRefusesCoded(t *testing.T) {
+	ps := newFakePS(t)
+	ps.staleNextBranches = 2 // the rebased branch comes back stale too
+	o, _, _, _ := newTestOrchestrator(t, ps)
+
+	_, err := o.Run(context.Background())
+	wantCode(t, err, sluicecode.CodePSBranchStaleBase)
+	if len(ps.drs) != 0 {
+		t.Errorf("a deploy request was opened (%d) from a stale base", len(ps.drs))
 	}
 }
 
