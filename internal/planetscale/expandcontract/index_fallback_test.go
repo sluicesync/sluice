@@ -8,7 +8,7 @@
 // engine's revert-to-hint contract rides on them), the once-per-run
 // preflight cache, the deterministic-branch leftover refusal, the coded
 // deploy-request failure, and the stale-base freshness gate riding the
-// shared LegRunner.
+// shared legRunner (ADR-0165).
 
 package expandcontract
 
@@ -169,7 +169,7 @@ func TestIndexFallback_DeployFailureIsCoded(t *testing.T) {
 }
 
 // TestIndexFallback_StaleBranchRebasedViaBackup pins the ADR-0162
-// freshness gate riding the shared LegRunner: a dev branch that comes up
+// freshness gate riding the shared legRunner: a dev branch that comes up
 // with a stale schema base is deleted, production is backed up, and the
 // recreated branch proceeds — without it, the index deploy request would
 // silently REVERT newer production schema.

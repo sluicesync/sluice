@@ -8,11 +8,12 @@
 // statement-time wall (errno 3024) or the safe-migrations direct-DDL
 // block (errno 1105), the MySQL writer hands the table's still-pending
 // index DDL here, and it builds them through PlanetScale's deploy-request
-// workflow on a dev branch — the [LegRunner] machine, freshness gate
-// included. Lives in this package (not its own) so it composes the
-// ADR-0162 machinery and the fakePS test harness directly; the
-// engine-neutral pipeline and the mysql engine never import it — the CLI
-// is the composer.
+// workflow on a dev branch — composing the same [legRunner] machine
+// (ADR-0165) the expand-contract legs and `sluice deploy-ddl` ride,
+// freshness gate included. Lives in this package so it composes that
+// machinery and the fakePS test harness directly; the engine-neutral
+// pipeline and the mysql engine never import it — the CLI is the
+// composer.
 //
 // Posture (the item-67 simplification of ADR-0148's open questions):
 // safe migrations must ALREADY be ON — sluice never toggles it (the
@@ -84,6 +85,9 @@ var _ ir.IndexBuildFallback = (*IndexFallback)(nil)
 // statement for it (the writer batches combinable indexes into combined
 // ALTERs already, so a multi-index table ships as one deploy).
 func (f *IndexFallback) BuildIndexDDL(ctx context.Context, table string, ddls []string, cause error) error {
+	if len(ddls) == 0 {
+		return nil
+	}
 	if err := f.preflight(ctx); err != nil {
 		return err
 	}
@@ -96,19 +100,58 @@ func (f *IndexFallback) BuildIndexDDL(ctx context.Context, table string, ddls []
 		slog.String("dev_branch", branchName),
 		slog.Bool("preemptive", cause == nil))
 
-	runner := &LegRunner{
-		API:           f.API,
-		Org:           f.Org,
-		Database:      f.Database,
-		Branch:        f.Branch,
-		Op:            "index-fallback",
-		PollInterval:  f.PollInterval,
-		DeployTimeout: f.DeployTimeout,
-		Out:           &slogLineWriter{ctx: ctx},
-		ExecDDL:       f.ExecDDL,
+	out := &slogLineWriter{ctx: ctx}
+	exec := f.execDDLFunc()
+	r := &legRunner{
+		api:           f.API,
+		org:           f.Org,
+		database:      f.Database,
+		branch:        f.branch(),
+		pollInterval:  f.pollInterval(),
+		deployTimeout: f.deployTimeout(),
+		out:           out,
+		execDDL:       exec,
+		name:          "index-fallback",
+		errPrefix:     "index-fallback",
+		passwordName:  "sluice-index-fallback",
+
+		// migrate's recovery is always --resume: the index phase
+		// re-probes the target and rebuilds only what is still missing,
+		// so an already-deployed DR's indexes are detected and skipped.
+		leftoverAdvice:        "continue with --resume (the index phase re-probes the target and rebuilds only what is still missing)",
+		alreadyDeployedAdvice: "close the DR, delete the dev branch, and re-run with --resume — the index phase detects already-built indexes and skips them",
+		reviewTimeoutAdvice:   "approve it and re-run with --resume",
+		deployTimeoutAdvice:   "watch it at the URL and re-run with --resume once it completes — already-deployed indexes are detected and skipped",
 	}
-	dr, err := runner.RunDDLLeg(ctx, branchName, ddls,
-		"Then re-run with --resume: the index phase re-probes the target and rebuilds only what is still missing.")
+	// The leg machine applies ONE ddl before opening the deploy request;
+	// a multi-index table's remainder (each FULLTEXT/SPATIAL must be its
+	// own statement) rides the post-DDL stage hook, on the same branch
+	// and password, so everything still ships in the ONE deploy request.
+	if len(ddls) > 1 {
+		rest := ddls[1:]
+		r.stage = func(ctx context.Context, pw *api.BranchPassword) error {
+			for _, ddl := range rest {
+				if err := exec(ctx, pw, f.Database, ddl); err != nil {
+					return fmt.Errorf("apply DDL on dev branch %q: %w", branchName, err)
+				}
+				fmt.Fprintf(out, "index-fallback: applied DDL on %q: %s\n", branchName, ddl)
+			}
+			return nil
+		}
+	}
+
+	// Per-call cleanup: the dev branch is deleted on every exit path
+	// (best-effort, cancel-immune — the branchCleanup contract).
+	cleanup := &branchCleanup{
+		api:      f.API,
+		org:      f.Org,
+		database: f.Database,
+		out:      out,
+		command:  "index-fallback",
+	}
+	defer cleanup.run(ctx)
+
+	dr, err := r.run(ctx, branchName, ddls[0], cleanup)
 	if err != nil {
 		return err
 	}
@@ -117,30 +160,19 @@ func (f *IndexFallback) BuildIndexDDL(ctx context.Context, table string, ddls []
 	return nil
 }
 
-// preflight runs the one cached control-plane gate: the token/org/
-// database/branch must resolve and the production branch must have safe
-// migrations enabled (the deploy-request prerequisite, ADR-0148 finding
-// #1). Any failure is the [ir.ErrIndexBuildFallbackUnavailable] shape —
-// the writer then keeps the pre-fallback surface, so a broken token can
-// never fail a migrate that would otherwise have surfaced the plain
-// errno-3024 hint.
+// preflight runs the one cached control-plane gate, reusing the shared
+// [preflightSafeMigrations] (token/org/database/branch resolve + the
+// safe-migrations prerequisite, ADR-0148 finding #1 — never auto-enabled,
+// findings #1/#7). Any failure is wrapped in the
+// [ir.ErrIndexBuildFallbackUnavailable] shape — the writer then keeps the
+// pre-fallback surface, so a broken token or a safe-migrations-off branch
+// can never fail a migrate that would otherwise have surfaced the plain
+// errno-3024 hint (the coded refusal inside is only ever logged, never
+// the run error).
 func (f *IndexFallback) preflight(ctx context.Context) error {
 	f.preflightOnce.Do(func() {
-		br, err := f.API.GetBranch(ctx, f.Org, f.Database, f.branch())
-		if err != nil {
-			f.preflightErr = fmt.Errorf("%w: control-plane preflight of %s/%s branch %q failed: %w",
-				ir.ErrIndexBuildFallbackUnavailable, f.Org, f.Database, f.branch(), err)
-			return
-		}
-		if !br.SafeMigrations {
-			// Never auto-enable (ADR-0162 posture; ADR-0148 findings
-			// #1/#7): enabling changes how every future schema change on
-			// the operator's branch must ship, and the toggle's
-			// propagation lag makes a wrap-around flip unsafe.
-			f.preflightErr = fmt.Errorf(
-				"%w: branch %q of %s/%s does not have safe migrations enabled — PlanetScale refuses deploy requests into it, and sluice never enables the toggle for you; enable it (`pscale branch safe-migrations enable %s %s --org %s`) or use --upfront-indexes",
-				ir.ErrIndexBuildFallbackUnavailable, f.branch(), f.Org, f.Database, f.Database, f.branch(), f.Org,
-			)
+		if err := preflightSafeMigrations(ctx, f.API, f.Org, f.Database, f.branch(), "index-fallback"); err != nil {
+			f.preflightErr = fmt.Errorf("%w: %w", ir.ErrIndexBuildFallbackUnavailable, err)
 		}
 	})
 	return f.preflightErr
@@ -153,11 +185,32 @@ func (f *IndexFallback) branch() string {
 	return f.Branch
 }
 
+func (f *IndexFallback) pollInterval() time.Duration {
+	if f.PollInterval <= 0 {
+		return 10 * time.Second
+	}
+	return f.PollInterval
+}
+
+func (f *IndexFallback) deployTimeout() time.Duration {
+	if f.DeployTimeout <= 0 {
+		return time.Hour
+	}
+	return f.DeployTimeout
+}
+
+func (f *IndexFallback) execDDLFunc() func(ctx context.Context, pw *api.BranchPassword, database, ddl string) error {
+	if f.ExecDDL != nil {
+		return f.ExecDDL
+	}
+	return execBranchDDL
+}
+
 // indexFallbackBranchName derives the DETERMINISTIC dev-branch name from
-// the table + its pending DDL (the [legBranchName] scheme), so a crashed
-// run's branch is found — and refused on — by name instead of minting
-// sluice-branch litter. The DDL statements are hashed in order; a
-// different pending set (some indexes landed before the wall) is a
+// the table + its pending DDL (the shared [legBranchName] scheme), so a
+// crashed run's branch is found — and refused on — by name instead of
+// minting sluice-branch litter. The DDL statements are hashed in order;
+// a different pending set (some indexes landed before the wall) is a
 // different branch, which is correct — its diff is different too.
 func indexFallbackBranchName(table string, ddls []string) string {
 	joined := ""
@@ -167,8 +220,8 @@ func indexFallbackBranchName(table string, ddls []string) string {
 	return legBranchName("index", table, joined)
 }
 
-// slogLineWriter adapts the LegRunner's io.Writer narration to migrate's
-// slog stream: each written line becomes one INFO record. LegRunner
+// slogLineWriter adapts the legRunner's io.Writer narration to migrate's
+// slog stream: each written line becomes one INFO record. The runner
 // writes whole lines per step, so the trailing-newline trim is the only
 // shaping needed.
 type slogLineWriter struct {
