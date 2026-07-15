@@ -4,6 +4,16 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.245] - 2026-07-14
+
+### Added
+
+- **`sluice backfill --verify` / `--verify-only` — the explicit, scriptable "safe to run the contract step" completion gate (ADR-0159, roadmap item 62 Phase 2).** Phase 1's walk exits 0 when the walk finishes — but on a live table, rows inserted **behind the walk's cursor** during the run still match the guard, so "the walk finished" is not "the table is done." `--verify` runs one whole-table remaining-count on the `--where` guard AFTER the walk completes (and equally after the completed-spec no-op re-run, deliberately post-walk so it sees the whole table, not just the walked range): 0 remaining prints the safe-to-contract completion line and exits clean; >0 fails with the new coded `SLUICE-E-BACKFILL-INCOMPLETE` — **runtime** class (exit 1, the "ran cleanly, found work" semantics, not a refusal) — with the catch-up remedy in the hint (re-run to pick up the stragglers, a `complete` spec needs `--restart`, then verify again; on a quiesced database a nonzero count means the `--where` guard doesn't self-describe doneness — fix the predicate, e.g. `new_col IS NULL`). A failed verify never marks the migration state failed — the walk succeeded and every persisted chunk stands. `--verify-only` is the standalone, scriptable form for deploy pipelines: no walk, no UPDATEs, no control-table reads or writes — and therefore no PK requirement (a no-PK table is verifiable) and `--set` is optional (any given is still schema-checked). Both modes **require `--where`** (without a self-describing guard the count is the whole table and the signal is meaningless); contradictory combos (`--verify-only` + `--dry-run`/`--restart`, `--verify` + `--dry-run`) are refused at both the kong layer (xor) and the library layer. The code is documented in `docs/operator/error-codes.md`.
+
+### Changed
+
+- **`backfill`'s unsupported-engine refusal now fires before table resolution**, so an engine with no backfill surface (SQLite/D1) always gets the coded `SLUICE-E-BACKFILL-UNSUPPORTED-ENGINE` answer even when the named table is also missing — previously the schema read ran first and surfaced an uncoded table-not-found (observed in the v0.99.244 regression cycle). Also, `--set`'s at-least-one requirement moved from kong parse-time to run-time validation (it had to become optional for `--verify-only`); a missing `--set` still fails up front before any connection or UPDATE, and every existing valid invocation shape behaves identically. Both changes are scoped to `backfill`; no other command is affected.
+
 ## [0.99.244] - 2026-07-14
 
 ### Added
