@@ -4,6 +4,16 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.252] - 2026-07-15
+
+### Fixed
+
+- **Bug 189 — `--csv-null` / `--csv-header` / `--csv-no-header` / `--csv-delimiter` on a source that isn't `csv`/`tsv`/`ndjson` now refuse loudly, naming the flat-file drivers (affected: v0.99.250–v0.99.251; found by the v0.99.250 release's own regression cycle).** The flags configure the flat-file source drivers only, but on any other source engine they were silently ignored — contradicting the documented refuse-loudly contract. Zero data risk (the flags never influenced non-flat-file reads); the gap was purely the loudness contract. The check is source-scoped by construction (`applySourceEngineOptions`): a TARGET engine still tolerates the flags, so `csv → mysql` keeps working. The feature's own test had pinned the buggy "inert" behavior; that pin now asserts the documented refusal, alongside a dedicated source-vs-target pin.
+
+### Compatibility
+
+- **Drop-in.** The only behavior change is that a previously-ignored `--csv-*` flag on a non-flat-file source is now a loud up-front error — such a flag was doing nothing; remove it or switch the source driver as the message says.
+
 ## [0.99.251] - 2026-07-15
 
 ### Added
