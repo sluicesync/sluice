@@ -1,8 +1,8 @@
-# ADR-0161: backup-chain concurrent-writer guard (lineage CAS + `SLUICE-E-BACKUP-CHAIN-CONFLICT`)
+# ADR-0160: backup-chain concurrent-writer guard (lineage CAS + `SLUICE-E-BACKUP-CHAIN-CONFLICT`)
 
 ## Status
 
-Accepted (implemented; roadmap item 64(b)). Numbered 0161 because 64(a) (slot-health notifications) was in flight for 0160 when this chunk started; if 0160 remained free, renumbering is a mechanical rename (the code cites "ADR-0161" in comments).
+Accepted (implemented; roadmap item 64(b)). Numbered 0161 because 64(a) (slot-health notifications) was in flight for 0160 when this chunk started; if 0160 remained free, renumbering is a mechanical rename (the code cites "ADR-0160" in comments).
 
 ## Context
 
@@ -71,6 +71,7 @@ Pre-existing hazard the guard would have amplified: prune deleted manifests/chun
 
 ## Residuals
 
+- **The claim→Put gap (the create-only-CAS residual).** The claim and the catalog Put are two operations, not one: a competitor whose *observation* lands inside another writer's claim→Put window (normally milliseconds — the claim marker PUT immediately followed by the catalog PUT of an already-marshaled body) reads the pre-Put catalog, claims the NEXT generation, and both writers then Put unconditionally — last-write-wins again, undetected. True closure needs conditional *overwrite* (If-Match ETag on `lineage.json` itself), which gocloud does not portably expose; the guard therefore shrinks the silently-vulnerable window from the whole seconds-wide load→mutate→Put span (today's exposure) to that millisecond gap, rather than eliminating it. Accepted for v1; revisit if gocloud grows portable conditional overwrite (or with per-provider SDK writes) — added at review, 2026-07-15.
 - **Marker-GC slot-reopen window.** Deleting old markers can theoretically re-open a claimed slot: a writer stalled mid-RMW across ≥ `chainGenKeepTrailing` (8) *complete* competing catalog writes could claim a re-opened generation and clobber. The RMW window is seconds; competing writes are minutes-to-hours apart; and today's exposure is an *infinite* unguarded window — accepted, documented on the constant.
 - **GCS/Azure legs are code-path-covered, not emulator-pinned.** The gocloud `IfNotExist` mapping is pinned through three real drivers (fileblob, memblob, s3blob-on-MinIO); no GCS/Azurite emulator runs in the suite. The per-driver precondition plumbing is upstream-tested (gocloud drivertest); first real-cloud validation should note it here.
 - **`rotation_state.json` / `stream_state.json`** remain owned by the (stream-state-guarded) stream process and are not CAS-protected; they are recovery markers, not the structural record.

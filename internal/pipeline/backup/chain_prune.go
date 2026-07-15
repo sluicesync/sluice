@@ -120,7 +120,7 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 		now = time.Now
 	}
 
-	// Load FOR UPDATE (ADR-0161): the catalog commit below is a CAS on
+	// Load FOR UPDATE (ADR-0160): the catalog commit below is a CAS on
 	// the chain write-generation observed here, so a backup / compact
 	// landing mid-prune conflicts loudly instead of being clobbered.
 	cat, ok, err := lineage.LoadLineageCatalogForUpdate(ctx, store)
@@ -211,7 +211,7 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 	}
 
 	// Deletion boundaries. The physical deletes themselves run AFTER the
-	// catalog commit below (ADR-0161) — see the post-commit delete pass.
+	// catalog commit below (ADR-0160) — see the post-commit delete pass.
 	floor := &cat.Segments[floorSeg]
 	floorStore := floor.Store(store)
 	keepFromInSeg := 0
@@ -281,11 +281,11 @@ func PruneChain(ctx context.Context, store irbackup.Store, opts PruneOpts) (*Pru
 		pruneFloorLeadingIncrementals(ctx, floor, floorStore, keepFromInSeg, true, res)
 		return res, nil
 	}
-	// Catalog commit FIRST (the ADR-0161 CAS linearization point, and the
+	// Catalog commit FIRST (the ADR-0160 CAS linearization point, and the
 	// same commit-then-sweep order compaction uses): the loud concurrent-
 	// writer refusal — or a crash — before this write leaves the chain
 	// byte-untouched, and after it leaves only orphaned (already-
-	// uncatalogued) files for the delete pass below. The pre-ADR-0161
+	// uncatalogued) files for the delete pass below. The pre-ADR-0160
 	// order deleted first, so a failed catalog write stranded a catalog
 	// referencing deleted manifests.
 	cat.UpdatedAt = now().UTC()

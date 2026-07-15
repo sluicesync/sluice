@@ -232,7 +232,7 @@ func (b *BackupStream) shouldRotate(ctx context.Context, openSegRolloverSeq int,
 func (b *BackupStream) performRotation(ctx context.Context, in rotateInputs) (rotateResult, error) {
 	var zero rotateResult
 
-	// Load FOR UPDATE (ADR-0161): the COMMIT write at the end of the FSM
+	// Load FOR UPDATE (ADR-0160): the COMMIT write at the end of the FSM
 	// is a CAS on the chain write-generation observed here — a concurrent
 	// one-shot incremental / compact / prune landing during the (long)
 	// next-segment bulk copy makes the COMMIT conflict, which aborts

@@ -11,7 +11,7 @@ import (
 
 // ErrPathExists is the sentinel a [ConditionalPutter.PutIfAbsent]
 // failure wraps when the path is already occupied. Callers arbitrating
-// a create-only claim (the chain concurrent-writer guard, ADR-0161)
+// a create-only claim (the chain concurrent-writer guard, ADR-0160)
 // match it with errors.Is to distinguish "another writer won the slot"
 // from transport/auth failures.
 var ErrPathExists = errors.New("path already exists")
@@ -26,7 +26,7 @@ var ErrPathExists = errors.New("path already exists")
 //
 // Same optional-capability shape as [Appender]: callers type-assert
 // and degrade gracefully when the store doesn't implement it. The
-// backup-chain concurrent-writer guard (ADR-0161) rides on this to
+// backup-chain concurrent-writer guard (ADR-0160) rides on this to
 // turn the lineage catalog's read-modify-write into a compare-and-swap.
 type ConditionalPutter interface {
 	// PutIfAbsent writes the contents of r to the named path within

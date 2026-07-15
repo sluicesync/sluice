@@ -3,7 +3,7 @@
 
 package lineage
 
-// # The chain concurrent-writer guard (ADR-0161)
+// # The chain concurrent-writer guard (ADR-0160)
 //
 // lineage.json is the one read-modify-write object every chain writer
 // shares: full-backup finalize, incremental/stream rollovers, the
@@ -35,7 +35,7 @@ package lineage
 // conditional-PUT support fails at runtime) keep today's unguarded
 // last-write-wins behavior — the guard WARNs and steps aside rather
 // than bricking backups (see claimChainGen). Which backends are
-// guarded is recorded in ADR-0161's support matrix.
+// guarded is recorded in ADR-0160's support matrix.
 
 import (
 	"bytes"
@@ -65,7 +65,7 @@ const ChainGenPrefix = "lineage.gen/"
 // lost update past the guard — requires that writer to stall mid-cycle
 // across this many COMPLETE competing catalog writes, which the
 // seconds-long load→write window makes practically unreachable.
-// Documented as ADR-0161's accepted residual.
+// Documented as ADR-0160's accepted residual.
 const chainGenKeepTrailing = 8
 
 // chainGenMarker is the claim marker's JSON body. Purely forensic —
@@ -188,7 +188,7 @@ func stampChainGuard(cat *Catalog, s chainGuardStamp) {
 //     `If-None-Match`). The guard DEGRADES with a WARN rather than
 //     bricking backups against such providers: the catalog write
 //     proceeds unguarded, exactly today's shipped behavior. Named wart;
-//     see ADR-0161 "runtime degradation".
+//     see ADR-0160 "runtime degradation".
 func claimChainGen(ctx context.Context, cp irbackup.ConditionalPutter, claim uint64, sluiceVersion string) (bool, error) {
 	host, _ := os.Hostname()
 	body, err := json.Marshal(chainGenMarker{

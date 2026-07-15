@@ -3,7 +3,7 @@
 
 package blobcodec
 
-// Pins for the [irbackup.ConditionalPutter] capability (ADR-0161): the
+// Pins for the [irbackup.ConditionalPutter] capability (ADR-0160): the
 // create-only conditional write both store backends expose so the chain
 // concurrent-writer guard can claim write-generations. Exactly-one-
 // winner semantics + the [irbackup.ErrPathExists] error contract are

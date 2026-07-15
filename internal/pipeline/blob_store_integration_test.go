@@ -244,7 +244,7 @@ func TestBlobStore_MinIO_RoundTrip(t *testing.T) {
 	}
 }
 
-// TestBlobStore_MinIO_ConditionalPutChainGuard pins the ADR-0161 chain
+// TestBlobStore_MinIO_ConditionalPutChainGuard pins the ADR-0160 chain
 // concurrent-writer guard's S3 leg against a REAL S3-compatible server:
 // gocloud's WriterOptions.IfNotExist becomes an `If-None-Match: *`
 // conditional PUT on the wire, and MinIO (like AWS S3 since 2024)

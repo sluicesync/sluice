@@ -905,7 +905,7 @@ func (b *BackupStream) handleEmptyRollover(ctx context.Context, roll rolloverOut
 // rollover with no change chunks has nothing to commit.
 //
 // Best-effort by design — the stream is exiting either way. An
-// ADR-0161 concurrent-writer conflict on the lineage append is
+// ADR-0160 concurrent-writer conflict on the lineage append is
 // WARN-logged (with its code) rather than failing the exit: the
 // manifest is durable and the next resume's reconcile re-catalogs it,
 // while that resume's own guarded writes surface a persistent
@@ -957,7 +957,7 @@ func (b *BackupStream) commitRollover(ctx context.Context, roll rolloverOutcome,
 		return rolloverCommit{}, fmt.Errorf("stream: write rollover manifest: %w", err)
 	}
 	// ADR-0046: append this rollover to the open segment in lineage.json
-	// (best-effort for the non-rotation path). An ADR-0161 concurrent-
+	// (best-effort for the non-rotation path). An ADR-0160 concurrent-
 	// writer conflict fails the stream loudly: a second writer is
 	// interleaving this chain (the manifest above is durable; only the
 	// catalog append was refused).

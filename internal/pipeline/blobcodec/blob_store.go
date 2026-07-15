@@ -215,7 +215,7 @@ func (s *BlobStore) Put(ctx context.Context, path string, r io.Reader) error {
 }
 
 // PutIfAbsent implements [irbackup.ConditionalPutter] — the optional
-// create-only conditional write the ADR-0161 chain concurrent-writer
+// create-only conditional write the ADR-0160 chain concurrent-writer
 // guard rides on. gocloud's WriterOptions.IfNotExist maps to the
 // backend-native precondition (S3 `If-None-Match: *`, GCS generation-0,
 // Azure `If-None-Match: *`, fileblob O_EXCL), so of any number of

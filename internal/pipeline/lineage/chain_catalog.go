@@ -91,7 +91,7 @@ type Catalog struct {
 	// to start before this segment. Zero on an unpruned lineage.
 	RestorableFromSegment int `json:"restorable_from_segment"`
 
-	// guardGen / guardObserved carry the ADR-0161 concurrent-writer
+	// guardGen / guardObserved carry the ADR-0160 concurrent-writer
 	// guard's observation from [LoadLineageCatalogForUpdate] to
 	// [WriteLineageCatalog]: the chain write-generation listed BEFORE
 	// this catalog was read, arming the write's compare-and-swap.
@@ -283,7 +283,7 @@ func LoadLineageCatalog(ctx context.Context, store irbackup.Store) (*Catalog, bo
 // storage layer from any reader's perspective (object stores: a Put is
 // all-or-nothing; local FS: write-tmp + rename inside LocalStore).
 //
-// ADR-0161: a catalog loaded via [LoadLineageCatalogForUpdate] carries
+// ADR-0160: a catalog loaded via [LoadLineageCatalogForUpdate] carries
 // the chain write-generation observed before its read; on a store with
 // the [irbackup.ConditionalPutter] capability this write first CLAIMS
 // the next generation, refusing loudly (coded
@@ -497,7 +497,7 @@ func ListAllSegmentManifests(ctx context.Context, store irbackup.Store) ([]Segme
 // from the supplied value so the open segment's Codec is pinned on
 // first write and never changes mid-segment.
 //
-// ONE error class is never swallowed: the ADR-0161 concurrent-writer
+// ONE error class is never swallowed: the ADR-0160 concurrent-writer
 // conflict (coded [sluicecode.CodeBackupChainConflict]) is returned to
 // the caller. A conflict is not a transient store hiccup — it is
 // evidence a SECOND writer is interleaving this chain (a duplicate
@@ -550,7 +550,7 @@ func UpdateLineageForManifest(
 	if !ok {
 		// First lineage.json write for this backup. Seed a single root
 		// segment over the conventional layout (Dir == ""), stamped with
-		// the ADR-0161 observation so even the seeding write is a CAS —
+		// the ADR-0160 observation so even the seeding write is a CAS —
 		// two writers racing to seed one chain conflict loudly.
 		cat = &Catalog{
 			FormatVersion: lineageCatalogFormatVersion,
@@ -689,7 +689,7 @@ func CanonicalKind(kind string) string {
 // plaintext chains). Only a chain with NO chunks at all falls back to
 // [blobcodec.DefaultCodec], with a WARN naming the assumption.
 func RebuildLineageCatalogAt(ctx context.Context, store irbackup.Store, env crypto.EnvelopeEncryption) (segments, manifests int, err error) {
-	// ADR-0161: observe the chain write-generation BEFORE the walk, so
+	// ADR-0160: observe the chain write-generation BEFORE the walk, so
 	// the rebuild's catalog write below is a CAS — a live writer landing
 	// mid-rebuild conflicts loudly instead of being clobbered by (or
 	// clobbering) the rebuilt record.

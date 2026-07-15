@@ -3,7 +3,7 @@
 
 package pipeline
 
-// ADR-0161 pin for the PRUNE writer: a concurrent chain writer landing
+// ADR-0160 pin for the PRUNE writer: a concurrent chain writer landing
 // between prune's catalog load and its catalog commit makes the run
 // refuse with the coded SLUICE-E-BACKUP-CHAIN-CONFLICT — and, because
 // prune now commits the catalog BEFORE its delete pass (the compaction

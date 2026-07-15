@@ -3,7 +3,7 @@
 
 package lineage
 
-// Pins for the ADR-0161 chain concurrent-writer guard: the lineage
+// Pins for the ADR-0160 chain concurrent-writer guard: the lineage
 // catalog read-modify-write is a compare-and-swap on stores with the
 // [irbackup.ConditionalPutter] capability — the losing writer refuses
 // loudly with the coded SLUICE-E-BACKUP-CHAIN-CONFLICT refusal and
@@ -297,7 +297,7 @@ func (s *failingCatalogPutStore) Put(ctx context.Context, path string, r io.Read
 // TestChainGuard_NoCapabilityStoreUnchanged pins the graceful degrade:
 // a store WITHOUT the ConditionalPutter capability keeps today's
 // unguarded last-write-wins behavior — no markers, no refusal. This is
-// the deliberate compatibility posture, recorded in ADR-0161.
+// the deliberate compatibility posture, recorded in ADR-0160.
 func TestChainGuard_NoCapabilityStoreUnchanged(t *testing.T) {
 	ctx := context.Background()
 	store := newMemStore() // plain — no PutIfAbsent
@@ -362,7 +362,7 @@ func TestChainGuard_OrphanedClaimDoesNotBrick(t *testing.T) {
 // tradeoff for backends whose conditional-PUT support fails at runtime
 // (an S3-compatible predating conditional writes): the claim's NON-
 // conflict failure degrades to an unguarded write with a WARN instead
-// of bricking the chain. Named wart; ADR-0161 "runtime degradation".
+// of bricking the chain. Named wart; ADR-0160 "runtime degradation".
 func TestChainGuard_DegradeOnNonConflictClaimError(t *testing.T) {
 	ctx := context.Background()
 	store := &casMemStore{

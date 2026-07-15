@@ -323,7 +323,7 @@ func CompactChain(ctx context.Context, store irbackup.Store, opts CompactOpts) (
 		mintID = generateMergedSegmentID
 	}
 
-	// Load FOR UPDATE (ADR-0161): the catalog swap at the end of this run
+	// Load FOR UPDATE (ADR-0160): the catalog swap at the end of this run
 	// is a CAS on the chain write-generation observed here, so a backup /
 	// prune / second compact landing during the (potentially long) merge
 	// window conflicts loudly instead of being clobbered.

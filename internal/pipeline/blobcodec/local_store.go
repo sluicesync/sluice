@@ -163,7 +163,7 @@ func (s *LocalStore) Append(ctx context.Context, path string, r io.Reader) error
 }
 
 // PutIfAbsent implements [irbackup.ConditionalPutter] — the optional
-// create-only conditional write the ADR-0161 chain concurrent-writer
+// create-only conditional write the ADR-0160 chain concurrent-writer
 // guard rides on. O_EXCL makes the create itself the atomic claim: of
 // any number of concurrent callers for one path, exactly one open
 // succeeds and the rest fail with [irbackup.ErrPathExists].

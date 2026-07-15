@@ -463,7 +463,7 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	// ADR-0046: append this incremental to the open segment in
 	// lineage.json (best-effort for the non-rotation path; the
 	// manifest file is authoritative for the one-segment shape). An
-	// ADR-0161 concurrent-writer conflict is the one loud outcome: a
+	// ADR-0160 concurrent-writer conflict is the one loud outcome: a
 	// second writer on this chain fails the run (the manifest above is
 	// durable; only the catalog append was refused).
 	if err := lineage.UpdateLineageForManifestBestEffort(ctx, b.Store, manifest, manifestPath, b.segCodec); err != nil {
