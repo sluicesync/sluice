@@ -4,6 +4,16 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.99.247] - 2026-07-15
+
+### Added
+
+- **`--source-driver mydumper` — migrate straight from a mydumper or `pscale database dump` directory, no live source database needed (ADR-0161, roadmap item 55 Phase 1).** sluice's first flat-file source engine reads the per-table dump layout (a `metadata` file with binlog position/GTID — parsed and logged at open as the future dump→CDC-handoff hook, recorded not built; one CREATE TABLE per `-schema.sql`; extended-INSERT data chunks, .gz/.zst transparent) and migrates it into any target; PlanetScale's own `pscale database dump` writes exactly this format, so this is the provider-export and air-gapped migration path. Source-only (the d1 capability shape: writers/CDC/snapshot refuse with `ErrNotImplemented`; `verify --depth count` works via chunk re-scan, sample depth is a documented refusal). The schema parse is a deliberately bounded exception to the IR-first tenet on the ADR-0133 precedent — exactly one CREATE TABLE per file, anything else or any unrecognised attribute refuses loudly naming file+token — and the type mapping is NOT forked: parsed columns fold into the live MySQL engine's own translator through a narrow shim. Values decode through a faithful MySQL string-literal lexer (full escape set, doubled quotes, `_binary` introducers, double-quoted strings, `0x…` hex-blob AND PlanetScale's no-hex-blob backslash-escaped binary, `b'…'` bit literals, CONVERT-wrapped JSON) and the live engine's decoder; integers parse from decimal text, never through a float, so >2^53 and uint64-max round-trip exactly. Ground-truthed against real mydumper v1.0.3 dumps with the live database as oracle across every value family × dump shape × compression (the Bug-74 pin discipline), which caught two real divergences pre-release: BIT(1)-as-Boolean quoted wire bytes (fixed, held to exactly one byte ≤ 0x01) and mydumper's own ~6-significant-digit FLOAT display-rounding at dump time — a named wart (the loss is in the file; per-table WARN naming the FLOAT columns, remedy = migrate from live; DOUBLE proven unaffected, not assumed). Loud-failure posture throughout: torn dumps, unrecognised files, multi-database dirs, non-UTF-8 charsets (three gates), non-UTC `TIME_ZONE` headers in every spelling MySQL accepts, zero/partial dates, BIT width overflow, and any literal-kind × type mismatch all refuse — never a silent transform; a TIMESTAMP table whose chunks declared no time zone WARNs once (mydumper always stamps UTC; another producer's dump might not). Non-goals: plain mysqldump `.sql` / pg_dump formats refused (Phase 3 adds recipe-bearing refusals), CSV/NDJSON is Phase 2, Parquet Phase 4.
+
+### Compatibility
+
+- **Purely additive.** One new engine name; no flag, default, or behavior change to any existing command. One shared-decoder note: the mysql package's quoted-string decoder now keeps the backslash for `\%`/`\_` per MySQL's string-literal grammar (LIKE-pattern escapes) — load-bearing for dump decode, unreachable in practice on the live information_schema paths (MySQL's own literal printing never emits those escapes), so no live-source migration changes behavior.
+
 ## [0.99.246] - 2026-07-15
 
 ### Added
