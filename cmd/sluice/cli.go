@@ -143,6 +143,9 @@ type CLI struct {
 	Backup   BackupCmd   `cmd:"" help:"Take and verify logical backups (Phase 1: full snapshot to local filesystem)."`
 	Restore  RestoreCmd  `cmd:"" help:"Restore a logical backup into a target database."`
 	Backfill BackfillCmd `cmd:"" help:"Backfill/transform a column in place — same-database, keyset-chunked, resumable, online-safe UPDATE (the expand-contract 'migrate' step; ADR-0159)."`
+
+	ExpandContract ExpandContractCmd `cmd:"" name:"expand-contract" help:"Drive the full expand→migrate→contract pattern on a PlanetScale database: deploy-request the ADD COLUMN, run the backfill, verify, and (with --yes) deploy-request the DROP COLUMN (ADR-0162)."`
+
 	Matview  MatviewCmd  `cmd:"" help:"Operate on PostgreSQL materialized views (refresh; PG-only)."`
 	Diagnose DiagnoseCmd `cmd:"" help:"Assemble an operator-bundle (cockroach-debug-zip-shape) for filing GitHub issues. ADR-0056."`
 	Cutover  CutoverCmd  `cmd:"" help:"Two-phase sequence priming at cutover — re-read source sequence/AUTO_INCREMENT state and apply to the target with a safety margin (F10, ADR-0062)."`

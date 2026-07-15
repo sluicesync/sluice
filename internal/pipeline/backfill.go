@@ -482,24 +482,9 @@ func (b *Backfiller) failWalk(ctx context.Context, store ir.MigrationStateStore,
 // resolveTable reads the schema, locates Table, and runs the coded
 // refusals: unknown --set column, and no/non-orderable primary key.
 func (b *Backfiller) resolveTable(ctx context.Context) (*ir.Table, error) {
-	sr, err := b.Engine.OpenSchemaReader(ctx, b.DSN)
+	table, err := lookupBackfillTable(ctx, b.Engine, b.DSN, b.Table)
 	if err != nil {
-		return nil, fmt.Errorf("backfill: open schema reader: %w", err)
-	}
-	defer migcore.CloseIf(sr)
-	schema, err := sr.ReadSchema(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("backfill: read schema: %w", err)
-	}
-	var table *ir.Table
-	for _, t := range schema.Tables {
-		if t.Name == b.Table {
-			table = t
-			break
-		}
-	}
-	if table == nil {
-		return nil, fmt.Errorf("backfill: table %q not found in the database (%d table(s) visible)", b.Table, len(schema.Tables))
+		return nil, err
 	}
 	for _, s := range b.Sets {
 		if migcore.LookupColumn(table, s.Column) == nil {
@@ -519,6 +504,43 @@ func (b *Backfiller) resolveTable(ctx context.Context) (*ir.Table, error) {
 		}
 	}
 	return table, nil
+}
+
+// lookupBackfillTable reads the schema at dsn and locates table.
+func lookupBackfillTable(ctx context.Context, engine ir.Engine, dsn, table string) (*ir.Table, error) {
+	sr, err := engine.OpenSchemaReader(ctx, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("backfill: open schema reader: %w", err)
+	}
+	defer migcore.CloseIf(sr)
+	schema, err := sr.ReadSchema(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("backfill: read schema: %w", err)
+	}
+	for _, t := range schema.Tables {
+		if t.Name == table {
+			return t, nil
+		}
+	}
+	return nil, fmt.Errorf("backfill: table %q not found in the database (%d table(s) visible)", table, len(schema.Tables))
+}
+
+// ResolveBackfillTable is the walk-eligibility preflight as a
+// standalone: table exists + a usable orderable primary key — the
+// coded refusals a keyset backfill needs answered BEFORE anything
+// irreversible happens. `sluice expand-contract` (ADR-0162) runs it
+// up front so a doomed run refuses before any branch is created; it
+// deliberately does NOT check --set column existence, because the
+// expand leg is what creates those columns.
+func ResolveBackfillTable(ctx context.Context, engine ir.Engine, dsn, table string) (*ir.Table, error) {
+	t, err := lookupBackfillTable(ctx, engine, dsn, table)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateBackfillPK(t); err != nil {
+		return nil, err
+	}
+	return t, nil
 }
 
 // validateBackfillPK refuses tables whose primary key cannot drive the

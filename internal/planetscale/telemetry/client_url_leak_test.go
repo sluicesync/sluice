@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"sluicesync.dev/sluice/internal/planetscale/api"
 )
 
 // closedServer returns the URL and host:port of a loopback listener
@@ -61,11 +63,13 @@ func TestScrape_TransportErrorNeverLeaksSignedURL(t *testing.T) {
 func TestDiscover_TransportErrorStripsRequestURL(t *testing.T) {
 	baseURL, _ := closedServer(t)
 	c := &client{
-		httpClient: &http.Client{Timeout: 2 * time.Second},
-		baseURL:    baseURL,
-		org:        "leaky-org-name",
-		tokenID:    "tok-id",
-		token:      "tok-secret",
+		api: api.New(api.Config{
+			TokenID:    "tok-id",
+			Token:      "tok-secret",
+			BaseURL:    baseURL,
+			HTTPClient: &http.Client{Timeout: 2 * time.Second},
+		}),
+		org: "leaky-org-name",
 	}
 	_, err := c.discover(context.Background(), "db", "main")
 	if err == nil {

@@ -337,10 +337,11 @@ func TestBuildScrapeURL(t *testing.T) {
 
 // guard against accidental token leakage into the SD URL path.
 func TestDiscoverURL_NoTokenInPath(t *testing.T) {
-	c := &client{baseURL: "https://api.planetscale.com", org: "myorg", tokenID: "id", token: "secret"}
-	// Reconstruct the endpoint the same way discover does and assert the
-	// secret is not in it (it belongs only in the Authorization header).
-	endpoint := fmt.Sprintf("%s/v1/organizations/%s/metrics", strings.TrimRight(c.baseURL, "/"), c.org)
+	c := &client{org: "myorg"}
+	// Reconstruct the SD path the same way discover does and assert the
+	// secret is not in it (it belongs only in the Authorization header,
+	// which the shared api.Client owns).
+	endpoint := "/v1/organizations/" + c.org + "/metrics"
 	if strings.Contains(endpoint, "secret") {
 		t.Errorf("token leaked into SD URL: %q", endpoint)
 	}

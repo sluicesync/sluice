@@ -79,6 +79,9 @@ const (
 	CodeBackfillUnsupportedEngine Code = "SLUICE-E-BACKFILL-UNSUPPORTED-ENGINE"
 	CodeBackfillUnknownColumn     Code = "SLUICE-E-BACKFILL-UNKNOWN-COLUMN"
 	CodeBackfillIncomplete        Code = "SLUICE-E-BACKFILL-INCOMPLETE"
+
+	CodePSSafeMigrationsDisabled Code = "SLUICE-E-PS-SAFE-MIGRATIONS-DISABLED"
+	CodePSDeployRequestFailed    Code = "SLUICE-E-PS-DEPLOY-REQUEST-FAILED"
 )
 
 // Class partitions codes by how the process should exit when the
@@ -142,6 +145,9 @@ var registry = map[Code]Info{
 	CodeBackfillUnsupportedEngine: {ClassRefusal, "backfill refused: the engine does not implement the in-place backfill surface"},
 	CodeBackfillUnknownColumn:     {ClassRefusal, "backfill refused: a --set column does not exist on the table"},
 	CodeBackfillIncomplete:        {ClassRuntime, "backfill verify found rows still matching the --where guard after the walk — online catch-up needed (rows written behind the cursor), or the guard does not self-describe doneness"},
+
+	CodePSSafeMigrationsDisabled: {ClassRefusal, "expand-contract refused: the PlanetScale production branch does not have safe migrations enabled (the deploy-request prerequisite); sluice never auto-enables it"},
+	CodePSDeployRequestFailed:    {ClassRuntime, "a PlanetScale deploy request entered a failure state (or never became deployable/complete before the timeout) — the message carries the DR number, state, and URL"},
 }
 
 // Describe returns the registry metadata for c, and whether c is a

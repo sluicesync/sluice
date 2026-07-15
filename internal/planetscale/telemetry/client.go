@@ -5,15 +5,14 @@ package telemetry
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"strings"
 
 	"sluicesync.dev/sluice/internal/diagnose"
+	"sluicesync.dev/sluice/internal/planetscale/api"
 )
 
 // sdTarget is one element of the PlanetScale per-org metrics
@@ -36,51 +35,25 @@ const (
 )
 
 // client owns the two-step PlanetScale metrics fetch: the authenticated
-// per-org service-discovery call, then the SIGNED (no-auth) per-branch
-// scrape. It holds no PlanetScale-go dependency — just a *http.Client, the
-// base URL, and the service-token credential.
+// per-org service-discovery call (via the shared control-plane client in
+// internal/planetscale/api — one client for every PlanetScale API feature,
+// ADR-0162), then the SIGNED (no-auth) per-branch scrape, which goes to
+// the metrics host rather than the API and keeps its own *http.Client.
 type client struct {
+	api        *api.Client
 	httpClient *http.Client
-	baseURL    string // SD endpoint host root, default https://api.planetscale.com
 	org        string
-	tokenID    string
-	token      string
 }
 
 // discover fetches the per-org metrics SD document and returns the element
 // for the target branch (matched by database name, branch=main unless a
 // non-empty branch is requested). It returns a clear error — never the raw
-// token — on auth/HTTP/JSON failure or when no element matches.
+// token, never the request URL (the shared client strips both) — on
+// auth/HTTP/JSON failure or when no element matches.
 func (c *client) discover(ctx context.Context, database, branch string) (sdTarget, error) {
-	endpoint := fmt.Sprintf("%s/v1/organizations/%s/metrics",
-		strings.TrimRight(c.baseURL, "/"), url.PathEscape(c.org))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, http.NoBody)
-	if err != nil {
-		return sdTarget{}, fmt.Errorf("telemetry: build SD request: %w", diagnose.SafeParseError(err))
-	}
-	// PlanetScale service-token auth: `Authorization: {TOKEN_ID}:{TOKEN}`.
-	// The token value is NEVER logged; only this header carries it.
-	req.Header.Set("Authorization", c.tokenID+":"+c.token)
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		// client.Do wraps failures in *url.Error, whose Error() embeds the
-		// full request URL; SafeParseError strips the wrapper (audit N-12 —
-		// same treatment as the signed scrape leg below, for consistency).
-		return sdTarget{}, fmt.Errorf("telemetry: SD request failed: %w", diagnose.SafeParseError(err))
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return sdTarget{}, fmt.Errorf("telemetry: SD endpoint returned HTTP %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
-	if err != nil {
-		return sdTarget{}, fmt.Errorf("telemetry: read SD body: %w", err)
-	}
 	var targets []sdTarget
-	if err := json.Unmarshal(body, &targets); err != nil {
-		return sdTarget{}, fmt.Errorf("telemetry: parse SD JSON: %w", err)
+	if err := c.api.Get(ctx, "/v1/organizations/"+url.PathEscape(c.org)+"/metrics", &targets); err != nil {
+		return sdTarget{}, fmt.Errorf("telemetry: service discovery: %w", err)
 	}
 	return selectBranch(targets, database, branch)
 }

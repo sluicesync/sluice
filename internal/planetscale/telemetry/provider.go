@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/planetscale/api"
 )
 
 // Default poll cadence and clamp bounds. The cadence is plumbed FROM the
@@ -160,11 +161,14 @@ func New(ctx context.Context, cfg Config) (*Provider, error) {
 	loopCtx, cancel := context.WithCancel(ctx)
 	p := &Provider{
 		client: &client{
+			api: api.New(api.Config{
+				TokenID:    cfg.TokenID,
+				Token:      cfg.Token,
+				BaseURL:    baseURL,
+				HTTPClient: httpClient,
+			}),
 			httpClient: httpClient,
-			baseURL:    baseURL,
 			org:        cfg.Org,
-			tokenID:    cfg.TokenID,
-			token:      cfg.Token,
 		},
 		database:  cfg.Database,
 		branch:    branch,
