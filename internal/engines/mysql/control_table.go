@@ -12,10 +12,9 @@ import (
 	"strings"
 	"time"
 
-	gomysql "github.com/go-sql-driver/mysql"
-
 	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // controlTableName is the per-target table that holds CDC stream
@@ -112,8 +111,8 @@ func validateControlKeyspace(name string) error {
 }
 
 // ensureControlTable creates the per-target sluice_cdc_state table
-// if it doesn't exist. Idempotent — second-and-later calls are no-
-// ops courtesy of CREATE TABLE IF NOT EXISTS.
+// if it doesn't exist. Idempotent — second-and-later calls detect the
+// table and issue no DDL at all.
 //
 // The table lives in the connection's default database (DBName from
 // the DSN). MySQL has a flat namespace so no schema-qualification is
@@ -156,22 +155,27 @@ func validateControlKeyspace(name string) error {
 //     already LONGTEXT for exactly this reason. See
 //     [ensureLongTextPositionColumn] for the widen mechanics and the
 //     PlanetScale safe-migrations refusal shape.
+//
+// Detect-then-create (roadmap item 66, mirroring
+// MigrationStateStore.EnsureControlTable's v0.99.248 gate): Vitess
+// under PlanetScale safe migrations refuses every direct DDL STATEMENT
+// (Error 1105 "direct DDL is disabled") regardless of whether the
+// table exists, so the exists-already path must issue no DDL at all —
+// that is what lets a sync stream start against a safe-migrations
+// branch whose control tables were bootstrapped via `sluice
+// deploy-ddl`. When the CREATE is genuinely needed and refused, the
+// failure is the coded bootstrap refusal
+// (SLUICE-E-PS-DIRECT-DDL-BLOCKED) naming that channel.
 func ensureControlTable(ctx context.Context, db *sql.DB, controlKeyspace string) error {
-	ddl := `
-		CREATE TABLE IF NOT EXISTS ` + controlTableRef(controlKeyspace, controlTableName) + ` (
-			stream_id              VARCHAR(255) NOT NULL,
-			source_position        LONGTEXT     NOT NULL,
-			updated_at             TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
-				ON UPDATE CURRENT_TIMESTAMP,
-			stop_requested_at      TIMESTAMP    NULL,
-			slot_name              VARCHAR(255) NULL,
-			source_dsn_fingerprint VARCHAR(255) NULL,
-			target_schema          VARCHAR(255) NULL,
-			rows_applied           BIGINT       NOT NULL DEFAULT 0,
-			PRIMARY KEY (stream_id)
-		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
-	if _, err := db.ExecContext(ctx, ddl); err != nil {
-		return fmt.Errorf("mysql: ensure control table: %w", wrapDDLError(err))
+	exists, err := controlTableExists(ctx, db, controlKeyspace, controlTableName)
+	if err != nil {
+		return fmt.Errorf("mysql: ensure control table: %w", err)
+	}
+	if !exists {
+		ddl := controlTableDDL(controlKeyspace)
+		if _, err := db.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("mysql: ensure control table: %w", wrapControlTableBootstrapError(wrapDDLError(err), ddl))
+		}
 	}
 	if err := ensureStopRequestedColumn(ctx, db, controlKeyspace); err != nil {
 		return err
@@ -200,6 +204,42 @@ func ensureControlTable(ctx context.Context, db *sql.DB, controlKeyspace string)
 	// source_position TEXT → LONGTEXT widen (roadmap item 65a): tables
 	// created by a pre-widen binary carry the 64 KB TEXT column.
 	return ensureLongTextPositionColumn(ctx, db, controlKeyspace, controlTableName, "source_position", "LONGTEXT NOT NULL")
+}
+
+// controlTableDDL renders the sluice_cdc_state CREATE statement — the
+// single source for both [ensureControlTable] and the bootstrap
+// printer ([Engine.ControlTableDDL] / `sluice control-tables ddl`,
+// ADR-0165).
+func controlTableDDL(controlKeyspace string) string {
+	return `CREATE TABLE IF NOT EXISTS ` + controlTableRef(controlKeyspace, controlTableName) + ` (
+	stream_id              VARCHAR(255) NOT NULL,
+	source_position        LONGTEXT     NOT NULL,
+	updated_at             TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
+		ON UPDATE CURRENT_TIMESTAMP,
+	stop_requested_at      TIMESTAMP    NULL,
+	slot_name              VARCHAR(255) NULL,
+	source_dsn_fingerprint VARCHAR(255) NULL,
+	target_schema          VARCHAR(255) NULL,
+	rows_applied           BIGINT       NOT NULL DEFAULT 0,
+	PRIMARY KEY (stream_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
+}
+
+// controlTableExists reports whether a control table is already
+// present, scoped to the connection's default database or the sidecar
+// control keyspace (see [controlSchemaPredicate]) — the detect half of
+// the detect-then-create gate the safe-migrations constraint imposes
+// on every control-table ensure.
+func controlTableExists(ctx context.Context, db *sql.DB, controlKeyspace, table string) (bool, error) {
+	schemaRHS, schemaArgs := controlSchemaPredicate(controlKeyspace)
+	q := "SELECT COUNT(*) FROM information_schema.TABLES " +
+		"WHERE TABLE_SCHEMA = " + schemaRHS + " AND TABLE_NAME = ?"
+	args := append(append([]any{}, schemaArgs...), table)
+	var n int
+	if err := db.QueryRowContext(ctx, q, args...).Scan(&n); err != nil {
+		return false, fmt.Errorf("detect %s: %w", table, err)
+	}
+	return n > 0, nil
 }
 
 // shardConsolidationLeaseRow aliases the shared lease-row mirror of
@@ -425,23 +465,20 @@ func selectShardLease(ctx context.Context, db *sql.DB, controlKeyspace, tableNam
 //
 // See ADR-0054 §1 for the row schema and state machine, §2 for the
 // timing defaults that govern lease_expires_at extension cadence.
+// Detect-then-create for the same reason as [ensureControlTable]: on a
+// safe-migrations branch the exists-already path must issue no DDL at
+// all, and a genuinely-needed CREATE that gets refused is the coded
+// bootstrap refusal.
 func ensureShardConsolidationLeaseTable(ctx context.Context, db *sql.DB, controlKeyspace string) error {
-	ddl := `
-		CREATE TABLE IF NOT EXISTS ` + controlTableRef(controlKeyspace, shardConsolidationLeaseTableName) + ` (
-			target_table_full_name        VARCHAR(512) NOT NULL,
-			lease_holder_stream_id        VARCHAR(64)  NULL,
-			lease_expires_at              TIMESTAMP    NULL,
-			ddl_text                      TEXT         NULL,
-			ddl_checksum                  VARCHAR(64)  NULL,
-			applied_schema_version        BIGINT       NOT NULL DEFAULT 0,
-			applied_at                    TIMESTAMP    NULL,
-			created_at                    TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			anchor_position               LONGTEXT     NULL,
-			source_engine                 TEXT         NULL,
-			PRIMARY KEY (target_table_full_name)
-		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
-	if _, err := db.ExecContext(ctx, ddl); err != nil {
-		return fmt.Errorf("mysql: ensure shard consolidation lease table: %w", wrapDDLError(err))
+	exists, err := controlTableExists(ctx, db, controlKeyspace, shardConsolidationLeaseTableName)
+	if err != nil {
+		return fmt.Errorf("mysql: ensure shard consolidation lease table: %w", err)
+	}
+	if !exists {
+		ddl := shardConsolidationLeaseTableDDL(controlKeyspace)
+		if _, err := db.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("mysql: ensure shard consolidation lease table: %w", wrapControlTableBootstrapError(wrapDDLError(err), ddl))
+		}
 	}
 	// Migration path for v0.75.0 deployments whose
 	// sluice_shard_consolidation_lease table pre-dates the v0.76.0 anchor
@@ -467,6 +504,26 @@ func ensureShardConsolidationLeaseTable(ctx context.Context, db *sql.DB, control
 	return ensureLongTextPositionColumn(ctx, db, controlKeyspace, shardConsolidationLeaseTableName, "anchor_position", "LONGTEXT NULL")
 }
 
+// shardConsolidationLeaseTableDDL renders the ADR-0054 lease-table
+// CREATE statement — single-sourced between
+// [ensureShardConsolidationLeaseTable] and the bootstrap printer
+// ([Engine.ControlTableDDL], ADR-0165).
+func shardConsolidationLeaseTableDDL(controlKeyspace string) string {
+	return `CREATE TABLE IF NOT EXISTS ` + controlTableRef(controlKeyspace, shardConsolidationLeaseTableName) + ` (
+	target_table_full_name        VARCHAR(512) NOT NULL,
+	lease_holder_stream_id        VARCHAR(64)  NULL,
+	lease_expires_at              TIMESTAMP    NULL,
+	ddl_text                      TEXT         NULL,
+	ddl_checksum                  VARCHAR(64)  NULL,
+	applied_schema_version        BIGINT       NOT NULL DEFAULT 0,
+	applied_at                    TIMESTAMP    NULL,
+	created_at                    TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	anchor_position               LONGTEXT     NULL,
+	source_engine                 TEXT         NULL,
+	PRIMARY KEY (target_table_full_name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
+}
+
 // ensureShardLeaseColumn adds a column to the lease control table when
 // missing. Same shape as ensureCrossEngineParityColumn but scoped to the
 // lease table — keeps the additive migration portable to MySQL 8.0.x
@@ -485,7 +542,7 @@ func ensureShardLeaseColumn(ctx context.Context, db *sql.DB, controlKeyspace, co
 	}
 	alter := "ALTER TABLE " + controlTableRef(controlKeyspace, shardConsolidationLeaseTableName) + " ADD COLUMN `" + columnName + "` " + columnDef
 	if _, err := db.ExecContext(ctx, alter); err != nil {
-		return fmt.Errorf("mysql: ensure shard consolidation lease table: add %s: %w", columnName, err)
+		return fmt.Errorf("mysql: ensure shard consolidation lease table: add %s: %w", columnName, wrapControlTableBootstrapError(err, alter))
 	}
 	return nil
 }
@@ -516,7 +573,7 @@ func ensureCrossEngineParityColumn(ctx context.Context, db *sql.DB, controlKeysp
 	}
 	alter := "ALTER TABLE " + controlTableRef(controlKeyspace, controlTableName) + " ADD COLUMN `" + columnName + "` " + columnDef
 	if _, err := db.ExecContext(ctx, alter); err != nil {
-		return fmt.Errorf("mysql: ensure control table: add %s: %w", columnName, err)
+		return fmt.Errorf("mysql: ensure control table: add %s: %w", columnName, wrapControlTableBootstrapError(err, alter))
 	}
 	return nil
 }
@@ -573,20 +630,24 @@ func ensureLongTextPositionColumn(ctx context.Context, db *sql.DB, controlKeyspa
 // wrapPositionWidenDDLError shapes the failure of the item-65a widen
 // ALTER. The PlanetScale safe-migrations refusal (Error 1105 "direct
 // DDL is disabled") gets a dedicated remedy-bearing message carrying
-// the exact statement to ship via a deploy request; every other error
-// keeps the plain wrap. Loud by design: silently skipping the widen
-// would re-arm the >64 KB position-write failure this migration
-// exists to remove.
+// the exact statement to ship via a deploy request, coded
+// SLUICE-E-PS-DIRECT-DDL-BLOCKED like every other control-table DDL
+// site (roadmap item 66 — `sluice deploy-ddl` is the channel that
+// ships it); every other error keeps the plain wrap. Loud by design:
+// silently skipping the widen would re-arm the >64 KB position-write
+// failure this migration exists to remove.
 func wrapPositionWidenDDLError(err error, tableName, columnName, alter string) error {
-	var mysqlErr *gomysql.MySQLError
-	if errors.As(err, &mysqlErr) && mysqlErr.Number == 1105 &&
-		strings.Contains(mysqlErr.Message, "direct DDL is disabled") {
-		return fmt.Errorf("%w: %w | "+
-			"sluice needs to widen %s.%s from TEXT to LONGTEXT (a GTID/VGTID position "+
-			"set can exceed TEXT's 64 KB), but the target branch has Safe Migrations "+
-			"enabled, which refuses direct DDL. Apply the widen via a PlanetScale "+
-			"deploy request — the exact statement is: %s — then re-run sluice",
-			ErrSafeMigrationsBlocked, err, tableName, columnName, alter)
+	if isDirectDDLDisabledErr(err) {
+		return sluicecode.Wrap(
+			sluicecode.CodePSDirectDDLBlocked,
+			"apply the widen via a PlanetScale deploy request (`sluice deploy-ddl --ddl '"+alter+"'`), then re-run",
+			fmt.Errorf("%w: %w | "+
+				"sluice needs to widen %s.%s from TEXT to LONGTEXT (a GTID/VGTID position "+
+				"set can exceed TEXT's 64 KB), but the target branch has Safe Migrations "+
+				"enabled, which refuses direct DDL. Apply the widen via a PlanetScale "+
+				"deploy request — the exact statement is: %s — then re-run sluice",
+				ErrSafeMigrationsBlocked, err, tableName, columnName, alter),
+		)
 	}
 	return fmt.Errorf("mysql: ensure %s: widen %s to LONGTEXT: %w", tableName, columnName, err)
 }
@@ -616,7 +677,7 @@ func ensureLiveAddedTablesColumn(ctx context.Context, db *sql.DB, controlKeyspac
 	}
 	alter := "ALTER TABLE " + controlTableRef(controlKeyspace, controlTableName) + " ADD COLUMN live_added_tables TEXT NULL"
 	if _, err := db.ExecContext(ctx, alter); err != nil {
-		return fmt.Errorf("mysql: ensure control table: add live_added_tables: %w", err)
+		return fmt.Errorf("mysql: ensure control table: add live_added_tables: %w", wrapControlTableBootstrapError(err, alter))
 	}
 	return nil
 }
@@ -642,7 +703,7 @@ func ensureStopRequestedColumn(ctx context.Context, db *sql.DB, controlKeyspace 
 	}
 	alter := "ALTER TABLE " + controlTableRef(controlKeyspace, controlTableName) + " ADD COLUMN stop_requested_at TIMESTAMP NULL"
 	if _, err := db.ExecContext(ctx, alter); err != nil {
-		return fmt.Errorf("mysql: ensure control table: add stop_requested_at: %w", err)
+		return fmt.Errorf("mysql: ensure control table: add stop_requested_at: %w", wrapControlTableBootstrapError(err, alter))
 	}
 	return nil
 }

@@ -159,6 +159,8 @@ type CLI struct {
 	Backfill BackfillCmd `cmd:"" help:"Backfill/transform a column in place — same-database, keyset-chunked, resumable, online-safe UPDATE (the expand-contract 'migrate' step; ADR-0159)."`
 
 	ExpandContract ExpandContractCmd `cmd:"" name:"expand-contract" help:"Drive the full expand→migrate→contract pattern on a PlanetScale database: deploy-request the ADD COLUMN, run the backfill, verify, and (with --yes) deploy-request the DROP COLUMN (ADR-0162)."`
+	DeployDDL      DeployDDLCmd      `cmd:"" name:"deploy-ddl" help:"Ship ONE verbatim DDL statement to a PlanetScale production branch safely: dev branch (stale-base freshness gate), apply, deploy request, deploy, finalize, cleanup (ADR-0165)."`
+	ControlTables  ControlTablesCmd  `cmd:"" name:"control-tables" help:"Operate on sluice's own control tables (print the bootstrap CREATE statements for safe-migrations targets; ADR-0165)."`
 
 	Matview  MatviewCmd  `cmd:"" help:"Operate on PostgreSQL materialized views (refresh; PG-only)."`
 	Diagnose DiagnoseCmd `cmd:"" help:"Assemble an operator-bundle (cockroach-debug-zip-shape) for filing GitHub issues. ADR-0056."`

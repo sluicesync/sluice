@@ -50,9 +50,11 @@ type schemaHistoryQueryer interface {
 
 // ensureSchemaHistoryTable creates the per-target
 // sluice_cdc_schema_history table if it doesn't exist. Idempotent —
-// second-and-later calls are no-ops courtesy of CREATE TABLE IF NOT
-// EXISTS. ADDITIVE: it never touches sluice_cdc_state or any existing
-// data; a target that already has cdc-state rows is unaffected.
+// second-and-later calls detect the table and issue no DDL at all
+// (detect-then-create, the safe-migrations constraint — see
+// [ensureControlTable]). ADDITIVE: it never touches sluice_cdc_state
+// or any existing data; a target that already has cdc-state rows is
+// unaffected.
 //
 // Same MySQL-can't-CREATE-in-an-explicit-tx caveat as
 // ensureControlTable — callers run this from the *sql.DB pool at
@@ -83,20 +85,15 @@ type schemaHistoryQueryer interface {
 // is collision-free and index-safe; the natural columns remain stored
 // (NOT NULL) so the resolver round-trips the full anchor token.
 func ensureSchemaHistoryTable(ctx context.Context, db *sql.DB, controlKeyspace string) error {
-	ddl := `
-		CREATE TABLE IF NOT EXISTS ` + controlTableRef(controlKeyspace, schemaHistoryTableName) + ` (
-			version_key     CHAR(64)     NOT NULL,
-			stream_id       VARCHAR(255) NOT NULL,
-			schema_name     VARCHAR(255) NOT NULL,
-			table_name      VARCHAR(255) NOT NULL,
-			anchor_position LONGTEXT     NOT NULL,
-			ir_schema_json  LONGTEXT     NOT NULL,
-			source_engine   VARCHAR(64)  NULL,
-			created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			PRIMARY KEY (version_key)
-		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
-	if _, err := db.ExecContext(ctx, ddl); err != nil {
-		return fmt.Errorf("mysql: ensure schema-history table: %w", wrapDDLError(err))
+	exists, err := controlTableExists(ctx, db, controlKeyspace, schemaHistoryTableName)
+	if err != nil {
+		return fmt.Errorf("mysql: ensure schema-history table: %w", err)
+	}
+	if !exists {
+		ddl := schemaHistoryTableDDL(controlKeyspace)
+		if _, err := db.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("mysql: ensure schema-history table: %w", wrapControlTableBootstrapError(wrapDDLError(err), ddl))
+		}
 	}
 	// Migration path for v0.70.0 deployments whose
 	// sluice_cdc_schema_history table pre-dates the source_engine column
@@ -108,6 +105,23 @@ func ensureSchemaHistoryTable(ctx context.Context, db *sql.DB, controlKeyspace s
 	// engineNameMySQL (the pre-fix behaviour, correct for same-engine
 	// streams).
 	return ensureSchemaHistorySourceEngineColumn(ctx, db, controlKeyspace)
+}
+
+// schemaHistoryTableDDL renders the ADR-0049 schema-history CREATE
+// statement — single-sourced between [ensureSchemaHistoryTable] and
+// the bootstrap printer ([Engine.ControlTableDDL], ADR-0165).
+func schemaHistoryTableDDL(controlKeyspace string) string {
+	return `CREATE TABLE IF NOT EXISTS ` + controlTableRef(controlKeyspace, schemaHistoryTableName) + ` (
+	version_key     CHAR(64)     NOT NULL,
+	stream_id       VARCHAR(255) NOT NULL,
+	schema_name     VARCHAR(255) NOT NULL,
+	table_name      VARCHAR(255) NOT NULL,
+	anchor_position LONGTEXT     NOT NULL,
+	ir_schema_json  LONGTEXT     NOT NULL,
+	source_engine   VARCHAR(64)  NULL,
+	created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (version_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
 }
 
 // ensureSchemaHistorySourceEngineColumn adds the source_engine column
@@ -129,7 +143,7 @@ func ensureSchemaHistorySourceEngineColumn(ctx context.Context, db *sql.DB, cont
 	}
 	alter := "ALTER TABLE " + controlTableRef(controlKeyspace, schemaHistoryTableName) + " ADD COLUMN source_engine VARCHAR(64) NULL"
 	if _, err := db.ExecContext(ctx, alter); err != nil {
-		return fmt.Errorf("mysql: ensure schema-history table: add source_engine: %w", err)
+		return fmt.Errorf("mysql: ensure schema-history table: add source_engine: %w", wrapControlTableBootstrapError(err, alter))
 	}
 	return nil
 }

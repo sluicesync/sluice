@@ -254,6 +254,21 @@ retains the rounding under the default (WARNed) and is refused under
 `--strict-float`. A target-side `--type-override` to `DOUBLE` does **not**
 help — the source value is already rounded on the wire.
 
+### Safe migrations: shipping DDL with `sluice deploy-ddl`, and bootstrapping sluice's control tables
+
+A PlanetScale branch with **safe migrations** enabled refuses every direct DDL statement (Error 1105 `direct DDL is disabled`) — including the `CREATE TABLE IF NOT EXISTS` for sluice's own control tables (`sluice_migrate_state`, `sluice_cdc_state`, and siblings). sluice's ensure paths are detect-first (no DDL at all when the tables are current), and when the DDL is genuinely needed the refusal is the coded `SLUICE-E-PS-DIRECT-DDL-BLOCKED`, naming the way through.
+
+That way through is one command per statement ([ADR-0165](adr/adr-0165-deploy-ddl-and-control-table-bootstrap.md)):
+
+```
+sluice control-tables ddl        # prints the exact CREATE statements (mysql dialect)
+sluice deploy-ddl --org <org> --database <db> --ddl '<one statement>'
+```
+
+`deploy-ddl` drives the full governed flow for ONE verbatim statement — dev branch (with the ADR-0162 **stale-base freshness gate**: a fresh PS branch can silently propose *reverting* recent production schema, and sluice's schema comparison + one-shot backup-rebase is the guard), apply the DDL on the branch, deploy request, deploy, skip-revert finalize, cleanup. `--dry-run` prints the plan with zero control-plane calls. It reuses the expand-contract machinery and error codes; safe migrations must be ON (that is the deploy-request prerequisite — without it, direct DDL works and you don't need this command). Ship the five printed control-table statements once, and `backfill` / `sync` / `migrate` then run normally against the branch.
+
+It is also the general escape hatch for any ad-hoc schema change on a safe-migrations branch — the safety wrapper (freshness gate, tolerant deploy poller, cleanup) applies to whatever single statement you pass.
+
 ### Sharded targets: control tables and `--control-keyspace`
 
 A continuous sync stores three control tables on the target

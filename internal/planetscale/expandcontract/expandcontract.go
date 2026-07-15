@@ -21,20 +21,15 @@ package expandcontract
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
-	"sort"
 	"strings"
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline"
 	"sluicesync.dev/sluice/internal/planetscale/api"
-	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // Leg names the resume points of the pattern. There is deliberately no
@@ -55,12 +50,6 @@ const (
 	// leg — the backfill already completed.
 	LegContract Leg = "contract"
 )
-
-// branch-readiness polling gets its own (generous, fixed) deadline:
-// branch creation is near-instant next to a deploy, and reusing the
-// operator's whole --deploy-timeout here would just delay the real
-// error.
-const branchReadyTimeout = 5 * time.Minute
 
 // Orchestrator drives one expand-contract run. Same shape as
 // pipeline.Backfiller: hold config, call Run.
@@ -191,7 +180,10 @@ func (o *Orchestrator) Run(ctx context.Context) (*Result, error) {
 	}
 
 	result := &Result{}
-	cleanup := &branchCleanup{o: o}
+	cleanup := &branchCleanup{
+		api: o.API, org: o.Org, database: o.Database,
+		keep: o.KeepBranches, out: o.out(), command: "expand-contract",
+	}
 	defer cleanup.run(ctx)
 
 	if o.resumeFrom() == LegExpand {
@@ -322,122 +314,56 @@ func (o *Orchestrator) contractBranchName() string {
 	return legBranchName("contract", o.Table, o.ContractDDL)
 }
 
-func legBranchName(kind, table, ddl string) string {
-	h := sha256.New()
-	h.Write([]byte(table))
-	h.Write([]byte{0})
-	h.Write([]byte(ddl))
-	return "sluice-" + kind + "-" + hex.EncodeToString(h.Sum(nil))[:10]
-}
-
 // ---- preflight ----
 
 // preflightControlPlane verifies the service token / org / database /
 // branch in one GET, then the safe-migrations prerequisite.
 func (o *Orchestrator) preflightControlPlane(ctx context.Context) error {
-	br, err := o.API.GetBranch(ctx, o.Org, o.Database, o.branch())
-	if err != nil {
-		if api.IsNotFound(err) {
-			return fmt.Errorf("expand-contract preflight: branch %q of %s/%s not found — check --org/--database/--branch: %w",
-				o.branch(), o.Org, o.Database, err)
-		}
-		return fmt.Errorf("expand-contract preflight: read branch %q: %w", o.branch(), err)
-	}
-	if !br.SafeMigrations {
-		// The deploy-request prerequisite (ADR-0148 finding #1).
-		// Enabling it is a behavior change on the operator's production
-		// branch (direct DDL becomes blocked), so sluice REFUSES and
-		// names the toggle rather than flipping it (contain-complexity
-		// tenet); the enable/disable propagation lag (finding #7) makes
-		// a toggle-around-the-run design unsafe anyway.
-		return sluicecode.Wrap(
-			sluicecode.CodePSSafeMigrationsDisabled,
-			"enable the branch's \"Safe migrations\" setting in the PlanetScale UI, or run `pscale branch safe-migrations enable "+o.Database+" "+o.branch()+" --org "+o.Org+"` — note this blocks direct DDL on the branch from then on",
-			fmt.Errorf("expand-contract: branch %q of %s/%s does not have safe migrations enabled — PlanetScale refuses deploy requests into it, and sluice never enables the toggle for you (it changes how every future schema change on the branch must ship)",
-				o.branch(), o.Org, o.Database),
-		)
-	}
-	return nil
+	return preflightSafeMigrations(ctx, o.API, o.Org, o.Database, o.branch(), "expand-contract")
 }
 
 // ---- deploy legs ----
 
-// runDeployLeg drives one branch → DDL → deploy-request → deploy →
-// finalize cycle: the expand and contract legs are the same machine
-// with different DDL.
+// runDeployLeg composes the shared legRunner (legrunner.go, ADR-0165)
+// with expand-contract's narration prefixes and resume guidance: the
+// expand and contract legs are the same machine with different DDL,
+// and `sluice deploy-ddl` composes the identical machine for its
+// single leg.
 func (o *Orchestrator) runDeployLeg(ctx context.Context, kind, branchName, ddl string, cleanup *branchCleanup) (*api.DeployRequest, error) {
-	out := o.out()
+	r := &legRunner{
+		api:           o.API,
+		org:           o.Org,
+		database:      o.Database,
+		branch:        o.branch(),
+		pollInterval:  o.pollInterval(),
+		deployTimeout: o.deployTimeout(),
+		out:           o.out(),
+		execDDL:       o.execDDLFunc(),
+		name:          kind,
+		errPrefix:     "expand-contract " + kind,
+		passwordName:  "sluice-expand-contract",
 
-	// Refuse-on-leftover: a branch with our deterministic name means a
-	// previous run died mid-leg. Guessing whether its DDL/DR state is
-	// reusable would be the silent path; name it and let the operator
-	// decide.
-	if _, err := o.API.GetBranch(ctx, o.Org, o.Database, branchName); err == nil {
-		return nil, fmt.Errorf(
-			"expand-contract %s: dev branch %q already exists — a previous run left it behind. Inspect its deploy request in PlanetScale; if the %s DDL already deployed, continue with --resume-from %s; otherwise delete the branch (`pscale branch delete %s %s --org %s`) and re-run",
-			kind, branchName, kind, legAfter(kind), o.Database, branchName, o.Org,
-		)
-	} else if !api.IsNotFound(err) {
-		return nil, fmt.Errorf("expand-contract %s: probe dev branch %q: %w", kind, branchName, err)
+		leftoverAdvice:        "continue with --resume-from " + legAfter(kind),
+		alreadyDeployedAdvice: "close the DR, delete the dev branch, and continue with --resume-from " + legAfter(kind),
+		reviewTimeoutAdvice:   "approve it and re-run with --resume-from " + string(o.resumeFrom()),
+		deployTimeoutAdvice:   "watch it at the URL and re-run with --resume-from " + legAfter(kind) + " once it completes",
 	}
-
-	if err := o.provisionFreshBranch(ctx, kind, branchName, cleanup); err != nil {
-		return nil, err
-	}
-
-	pw, err := o.API.CreateBranchPassword(ctx, o.Org, o.Database, branchName, "sluice-expand-contract")
-	if err != nil {
-		return nil, fmt.Errorf("expand-contract %s: create branch password for %q: %w", kind, branchName, err)
-	}
-	if err := o.execDDL(ctx, pw, ddl); err != nil {
-		return nil, fmt.Errorf("expand-contract %s: apply DDL on dev branch %q: %w", kind, branchName, err)
-	}
-	fmt.Fprintf(out, "%s: applied DDL on %q: %s\n", kind, branchName, ddl)
-
-	// Expand leg only: stage the migrate-state control tables on the
-	// dev branch so the deploy request ships them to production —
-	// safe migrations blocks the backfill from creating them there
-	// directly. Idempotent: when production already carries them the
-	// branch inherits them and this adds nothing to the diff.
 	if kind == "expand" {
-		if err := o.ensureStateOnBranch(ctx, pw); err != nil {
-			return nil, fmt.Errorf("expand-contract %s: %w", kind, err)
+		// Expand leg only: stage the migrate-state control tables on
+		// the dev branch so the deploy request ships them to production
+		// — safe migrations blocks the backfill from creating them
+		// there directly. Idempotent: when production already carries
+		// them the branch inherits them and this adds nothing to the
+		// diff.
+		r.stage = func(ctx context.Context, pw *api.BranchPassword) error {
+			return o.ensureStateOnBranch(ctx, pw)
 		}
-		fmt.Fprintf(out, "%s: staged sluice migrate-state tables on %q (they ship with this deploy request; safe migrations blocks direct creation on %q)\n",
-			kind, branchName, o.branch())
+		r.stageNote = fmt.Sprintf(
+			"%s: staged sluice migrate-state tables on %q (they ship with this deploy request; safe migrations blocks direct creation on %q)\n",
+			kind, branchName, o.branch(),
+		)
 	}
-
-	dr, err := o.API.CreateDeployRequest(ctx, o.Org, o.Database, branchName, o.branch())
-	if err != nil {
-		return nil, fmt.Errorf("expand-contract %s: create deploy request %q → %q: %w", kind, branchName, o.branch(), err)
-	}
-	fmt.Fprintf(out, "%s: opened deploy request #%d (%s)\n", kind, dr.Number, dr.HTMLURL)
-
-	if err := o.waitDeployable(ctx, kind, dr.Number); err != nil {
-		return nil, err
-	}
-	if _, err := o.API.Deploy(ctx, o.Org, o.Database, dr.Number); err != nil {
-		return nil, fmt.Errorf("expand-contract %s: deploy request #%d: %w", kind, dr.Number, err)
-	}
-	final, err := o.waitDeployed(ctx, kind, dr.Number)
-	if err != nil {
-		return nil, err
-	}
-
-	// Finalize the revert window: PlanetScale holds a
-	// complete_pending_revert deployment "in progress" and blocks
-	// lifecycle ops (branch/database deletes) until it closes
-	// (ADR-0148 finding #4). The schema change itself IS applied at
-	// this point, so a skip-revert failure is a loud WARN, not a run
-	// failure — the operator can finalize from the DR page.
-	if final.DeploymentState == "complete_pending_revert" {
-		if _, err := o.API.SkipRevert(ctx, o.Org, o.Database, dr.Number); err != nil {
-			slog.WarnContext(ctx, "expand-contract: skip-revert failed; finalize the deployment manually from the deploy-request page",
-				"leg", kind, "deploy_request", dr.Number, "url", final.HTMLURL, "err", err.Error())
-		}
-	}
-	fmt.Fprintf(out, "%s: deploy request #%d deployed\n", kind, dr.Number)
-	return final, nil
+	return r.run(ctx, branchName, ddl, cleanup)
 }
 
 // legAfter names the --resume-from value that skips past a completed
@@ -449,12 +375,13 @@ func legAfter(kind string) string {
 	return string(LegContract)
 }
 
-func (o *Orchestrator) execDDL(ctx context.Context, pw *api.BranchPassword, ddl string) error {
-	exec := o.ExecDDL
-	if exec == nil {
-		exec = execBranchDDL
+// execDDLFunc resolves the injected ExecDDL fake or the real
+// go-sql-driver implementation (ddl_exec.go).
+func (o *Orchestrator) execDDLFunc() func(ctx context.Context, pw *api.BranchPassword, database, ddl string) error {
+	if o.ExecDDL != nil {
+		return o.ExecDDL
 	}
-	return exec(ctx, pw, o.Database, ddl)
+	return execBranchDDL
 }
 
 func (o *Orchestrator) ensureStateOnBranch(ctx context.Context, pw *api.BranchPassword) error {
@@ -463,276 +390,6 @@ func (o *Orchestrator) ensureStateOnBranch(ctx context.Context, pw *api.BranchPa
 		return ensureStateOnBranch(ctx, o.Engine, pw, o.Database)
 	}
 	return ensure(ctx, pw, o.Database)
-}
-
-// provisionFreshBranch creates the dev branch and guarantees its
-// schema base matches production before any DDL is applied.
-//
-// A new branch's schema base can LAG production (live-caught
-// 2026-07-15, intermittent: a branch created 14 minutes after a
-// deploy still lacked the deployed column, and a deploy request from
-// it diffed as DROPPING that column from production; a branch created
-// one minute after another deploy was current). Deploying from a stale base silently reverts every
-// production schema change newer than the backup — for the contract
-// leg, that would drop the freshly backfilled expand column. The
-// guarantee: create → compare branch schema to production via the API
-// → if stale, delete the branch, take an on-demand backup of
-// production, recreate, recheck → still stale is a coded runtime
-// refusal.
-func (o *Orchestrator) provisionFreshBranch(ctx context.Context, kind, branchName string, cleanup *branchCleanup) error {
-	out := o.out()
-	if err := o.createBranchAndWait(ctx, kind, branchName, cleanup); err != nil {
-		return err
-	}
-	stale, err := o.branchBaseStale(ctx, branchName)
-	if err != nil {
-		return fmt.Errorf("expand-contract %s: compare dev-branch schema to %q: %w", kind, o.branch(), err)
-	}
-	if !stale {
-		return nil
-	}
-
-	fmt.Fprintf(out, "%s: dev branch %q came up with a schema older than %q's current one (a new PlanetScale branch's base can lag production); taking a fresh backup to rebase\n",
-		kind, branchName, o.branch())
-	if err := o.API.DeleteBranch(ctx, o.Org, o.Database, branchName); err != nil {
-		return fmt.Errorf("expand-contract %s: delete stale dev branch %q: %w", kind, branchName, err)
-	}
-	cleanup.remove(branchName)
-	if err := o.backupProduction(ctx, kind); err != nil {
-		return err
-	}
-	if err := o.createBranchAndWait(ctx, kind, branchName, cleanup); err != nil {
-		return err
-	}
-	if stale, err = o.branchBaseStale(ctx, branchName); err != nil {
-		return fmt.Errorf("expand-contract %s: recheck dev-branch schema against %q: %w", kind, o.branch(), err)
-	}
-	if stale {
-		return sluicecode.Wrap(sluicecode.CodePSBranchStaleBase,
-			"take a fresh backup of the production branch (pscale backup create), then re-run",
-			fmt.Errorf(
-				"expand-contract %s: dev branch %q still differs from %q after a fresh backup — deploying from it would silently revert newer production schema; inspect `pscale branch schema %s %s --org %s` vs %q and retry once the schemas converge",
-				kind, branchName, o.branch(), o.Database, branchName, o.Org, o.branch(),
-			))
-	}
-	fmt.Fprintf(out, "%s: rebased dev branch %q now matches %q\n", kind, branchName, o.branch())
-	return nil
-}
-
-// createBranchAndWait creates the dev branch, registers it for
-// cleanup, and waits for PlanetScale to report it ready.
-func (o *Orchestrator) createBranchAndWait(ctx context.Context, kind, branchName string, cleanup *branchCleanup) error {
-	if _, err := o.API.CreateBranch(ctx, o.Org, o.Database, branchName, o.branch()); err != nil {
-		return fmt.Errorf("expand-contract %s: create dev branch %q off %q: %w", kind, branchName, o.branch(), err)
-	}
-	cleanup.add(branchName)
-	fmt.Fprintf(o.out(), "%s: created dev branch %q off %q\n", kind, branchName, o.branch())
-	if err := o.waitBranchReady(ctx, branchName); err != nil {
-		return fmt.Errorf("expand-contract %s: %w", kind, err)
-	}
-	return nil
-}
-
-// branchBaseStale reports whether the dev branch's schema differs from
-// the production branch's — the from-a-stale-backup signal.
-func (o *Orchestrator) branchBaseStale(ctx context.Context, branchName string) (bool, error) {
-	dev, err := o.API.GetBranchSchema(ctx, o.Org, o.Database, branchName)
-	if err != nil {
-		return false, err
-	}
-	prod, err := o.API.GetBranchSchema(ctx, o.Org, o.Database, o.branch())
-	if err != nil {
-		return false, err
-	}
-	return renderSchema(dev) != renderSchema(prod), nil
-}
-
-// renderSchema canonicalizes a branch schema for comparison: raw DDL
-// concatenated in table-name order (both sides come from the same
-// PlanetScale renderer, so identical schemas render identically).
-func renderSchema(tables []api.SchemaTable) string {
-	sorted := append([]api.SchemaTable(nil), tables...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
-	var b strings.Builder
-	for _, t := range sorted {
-		b.WriteString(t.Name)
-		b.WriteString("\x00")
-		b.WriteString(t.Raw)
-		b.WriteString("\x00")
-	}
-	return b.String()
-}
-
-// backupProduction takes an on-demand backup of the production branch
-// and polls it to success, bounded by the deploy timeout (backup
-// duration scales with database size; the narration names what's
-// happening so a long wait is explained).
-func (o *Orchestrator) backupProduction(ctx context.Context, kind string) error {
-	bk, err := o.API.CreateBackup(ctx, o.Org, o.Database, o.branch())
-	if err != nil {
-		return fmt.Errorf("expand-contract %s: create rebase backup of %q: %w", kind, o.branch(), err)
-	}
-	fmt.Fprintf(o.out(), "%s: backup of %q started (rebase base for the dev branch; duration scales with database size)\n", kind, o.branch())
-	deadline := time.Now().Add(o.deployTimeout())
-	for {
-		cur, err := o.API.GetBackup(ctx, o.Org, o.Database, o.branch(), bk.ID)
-		if err != nil {
-			return fmt.Errorf("expand-contract %s: poll rebase backup: %w", kind, err)
-		}
-		switch cur.State {
-		case "success":
-			return nil
-		case "failed", "canceled", "cancelled":
-			return sluicecode.Wrap(sluicecode.CodePSBranchStaleBase,
-				"take a fresh backup of the production branch (pscale backup create), then re-run",
-				fmt.Errorf(
-					"expand-contract %s: rebase backup of %q ended %q — a fresh backup is required for the dev branch to see current production schema",
-					kind, o.branch(), cur.State,
-				))
-		}
-		if time.Now().After(deadline) {
-			return sluicecode.Wrap(sluicecode.CodePSBranchStaleBase,
-				"take a fresh backup of the production branch (pscale backup create), then re-run",
-				fmt.Errorf(
-					"expand-contract %s: rebase backup of %q still %q after %s — re-run once it completes (the backup keeps running in PlanetScale)",
-					kind, o.branch(), cur.State, o.deployTimeout(),
-				))
-		}
-		if err := o.sleepPoll(ctx); err != nil {
-			return err
-		}
-	}
-}
-
-// waitBranchReady polls the dev branch until PlanetScale reports it
-// ready (branch provisioning is async).
-func (o *Orchestrator) waitBranchReady(ctx context.Context, branchName string) error {
-	deadline := time.Now().Add(branchReadyTimeout)
-	for {
-		br, err := o.API.GetBranch(ctx, o.Org, o.Database, branchName)
-		if err != nil {
-			return fmt.Errorf("poll dev branch %q readiness: %w", branchName, err)
-		}
-		if br.Ready {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("dev branch %q did not become ready within %s", branchName, branchReadyTimeout)
-		}
-		if err := o.sleepPoll(ctx); err != nil {
-			return err
-		}
-	}
-}
-
-// Deploy-request lifecycle classification (ADR-0148 finding #3 ground
-// truth: open/pending → ready (deployable=true) → queued →
-// complete_pending_revert). The poller is deliberately TOLERANT of
-// state names it doesn't know: terminal-success and terminal-failure
-// are matched by name, everything else keeps waiting until the
-// deadline — a new intermediate PlanetScale state must not fail a
-// healthy deploy, and the timeout bounds the unknown-terminal risk.
-var (
-	drSuccessStates = map[string]bool{
-		"complete":                true,
-		"complete_pending_revert": true,
-	}
-	drFailureStates = map[string]bool{
-		"error":                 true,
-		"complete_error":        true,
-		"cancelled":             true,
-		"complete_cancel":       true,
-		"complete_revert":       true,
-		"complete_revert_error": true,
-	}
-)
-
-// waitDeployable polls until the deploy request is deployable (the
-// diff computed and PlanetScale accepts a deploy call).
-func (o *Orchestrator) waitDeployable(ctx context.Context, kind string, number int) error {
-	deadline := time.Now().Add(o.deployTimeout())
-	for {
-		dr, err := o.API.GetDeployRequest(ctx, o.Org, o.Database, number)
-		if err != nil {
-			return fmt.Errorf("expand-contract %s: poll deploy request #%d: %w", kind, number, err)
-		}
-		switch {
-		case dr.CanDeploy():
-			return nil
-		case dr.DeploymentState == "no_changes":
-			// The branch's diff against production is empty — the DDL
-			// is almost certainly already deployed (a crashed earlier
-			// run). Deploying nothing would silently "succeed", so
-			// refuse with the resume path instead.
-			return o.drFailure(kind, dr, fmt.Sprintf(
-				"deploy request #%d has no schema changes — the %s DDL looks already deployed; close the DR, delete the dev branch, and continue with --resume-from %s",
-				number, kind, legAfter(kind),
-			))
-		case drFailureStates[dr.DeploymentState] || dr.State == "closed":
-			return o.drFailure(kind, dr, fmt.Sprintf(
-				"deploy request #%d cannot be deployed (state %q, deployment_state %q)",
-				number, dr.State, dr.DeploymentState,
-			))
-		}
-		if time.Now().After(deadline) {
-			return o.drFailure(kind, dr, fmt.Sprintf(
-				"deploy request #%d did not become deployable within %s (deployment_state %q) — if your organization requires deploy-request review, approve it and re-run with --resume-from %s",
-				number, o.deployTimeout(), dr.DeploymentState, string(o.resumeFrom()),
-			))
-		}
-		if err := o.sleepPoll(ctx); err != nil {
-			return err
-		}
-	}
-}
-
-// waitDeployed polls a deploying request to a terminal state.
-func (o *Orchestrator) waitDeployed(ctx context.Context, kind string, number int) (*api.DeployRequest, error) {
-	deadline := time.Now().Add(o.deployTimeout())
-	for {
-		dr, err := o.API.GetDeployRequest(ctx, o.Org, o.Database, number)
-		if err != nil {
-			return nil, fmt.Errorf("expand-contract %s: poll deploy request #%d: %w", kind, number, err)
-		}
-		switch {
-		case drSuccessStates[dr.DeploymentState]:
-			return dr, nil
-		case drFailureStates[dr.DeploymentState]:
-			return nil, o.drFailure(kind, dr, fmt.Sprintf(
-				"deploy request #%d failed (deployment_state %q)", number, dr.DeploymentState,
-			))
-		}
-		if time.Now().After(deadline) {
-			return nil, o.drFailure(kind, dr, fmt.Sprintf(
-				"deploy request #%d still deploying after %s (deployment_state %q) — the deploy keeps running in PlanetScale; watch it at the URL and re-run with --resume-from %s once it completes",
-				number, o.deployTimeout(), dr.DeploymentState, legAfter(kind),
-			))
-		}
-		if err := o.sleepPoll(ctx); err != nil {
-			return nil, err
-		}
-	}
-}
-
-// drFailure wraps a deploy-request failure/timeout in the coded
-// runtime error, always carrying the DR state and URL.
-func (o *Orchestrator) drFailure(kind string, dr *api.DeployRequest, msg string) error {
-	return sluicecode.Wrap(
-		sluicecode.CodePSDeployRequestFailed,
-		"inspect the deploy request in PlanetScale: "+dr.HTMLURL,
-		fmt.Errorf("expand-contract %s: %s: %s", kind, msg, dr.HTMLURL),
-	)
-}
-
-func (o *Orchestrator) sleepPoll(ctx context.Context) error {
-	t := time.NewTimer(o.pollInterval())
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-t.C:
-		return nil
-	}
 }
 
 // ---- migrate + verify legs ----
@@ -865,48 +522,4 @@ func humanRows(br *pipeline.BackfillResult) string {
 		return "walk skipped"
 	}
 	return fmt.Sprintf("%d row(s) updated", br.RowsUpdated)
-}
-
-// ---- cleanup ----
-
-// branchCleanup deletes the dev branches this run created — always,
-// including on failure (best-effort with a WARN), unless the operator
-// asked to keep them for debugging. It runs on a cancel-immune context
-// so a Ctrl-C mid-deploy still tears the branches down.
-type branchCleanup struct {
-	o        *Orchestrator
-	branches []string
-}
-
-func (c *branchCleanup) add(name string) { c.branches = append(c.branches, name) }
-
-// remove forgets a branch the orchestrator already deleted itself
-// (the stale-base rebase path), so cleanup doesn't re-delete it.
-func (c *branchCleanup) remove(name string) {
-	kept := c.branches[:0]
-	for _, b := range c.branches {
-		if b != name {
-			kept = append(kept, b)
-		}
-	}
-	c.branches = kept
-}
-
-func (c *branchCleanup) run(ctx context.Context) {
-	if len(c.branches) == 0 {
-		return
-	}
-	if c.o.KeepBranches {
-		fmt.Fprintf(c.o.out(), "cleanup: keeping dev branches (--keep-branches): %s\n", strings.Join(c.branches, ", "))
-		return
-	}
-	deleteCtx := context.WithoutCancel(ctx)
-	for _, name := range c.branches {
-		if err := c.o.API.DeleteBranch(deleteCtx, c.o.Org, c.o.Database, name); err != nil && !api.IsNotFound(err) {
-			slog.WarnContext(deleteCtx, "expand-contract: could not delete dev branch; delete it manually",
-				"branch", name, "err", err.Error())
-			continue
-		}
-		fmt.Fprintf(c.o.out(), "cleanup: deleted dev branch %q\n", name)
-	}
 }

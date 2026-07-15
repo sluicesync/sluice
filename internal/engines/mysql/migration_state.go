@@ -142,20 +142,9 @@ func (s *MigrationStateStore) EnsureControlTable(ctx context.Context) error {
 		return err
 	}
 	if !hdrExists {
-		const hdrDDL = `
-			CREATE TABLE IF NOT EXISTS ` + "`" + migrateStateTableName + "`" + ` (
-				migration_id    VARCHAR(255) NOT NULL,
-				phase           VARCHAR(32)  NOT NULL,
-				table_progress  TEXT         NULL,
-				state_format    INT          NOT NULL DEFAULT 1,
-				started_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-				updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
-					ON UPDATE CURRENT_TIMESTAMP,
-				last_error      TEXT         NULL,
-				PRIMARY KEY (migration_id)
-			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
-		if _, err := s.db.ExecContext(ctx, hdrDDL); err != nil {
-			return fmt.Errorf("mysql: ensure migrate-state table: %w", err)
+		ddl := migrateStateHeaderDDL()
+		if _, err := s.db.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("mysql: ensure migrate-state table: %w", wrapControlTableBootstrapError(err, ddl))
 		}
 	}
 	if err := s.ensureStateFormatColumn(ctx); err != nil {
@@ -166,20 +155,43 @@ func (s *MigrationStateStore) EnsureControlTable(ctx context.Context) error {
 		return err
 	}
 	if !progExists {
-		const progDDL = `
-			CREATE TABLE IF NOT EXISTS ` + "`" + migrateProgressTableName + "`" + ` (
-				migration_id    VARCHAR(255) NOT NULL,
-				table_name      VARCHAR(255) NOT NULL,
-				progress        TEXT         NOT NULL,
-				updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
-					ON UPDATE CURRENT_TIMESTAMP,
-				PRIMARY KEY (migration_id, table_name)
-			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
-		if _, err := s.db.ExecContext(ctx, progDDL); err != nil {
-			return fmt.Errorf("mysql: ensure migrate-state progress table: %w", err)
+		ddl := migrateProgressDDL()
+		if _, err := s.db.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("mysql: ensure migrate-state progress table: %w", wrapControlTableBootstrapError(err, ddl))
 		}
 	}
 	return nil
+}
+
+// migrateStateHeaderDDL / migrateProgressDDL render the migrate-state
+// CREATE statements — single-sourced between
+// [MigrationStateStore.EnsureControlTable] and the bootstrap printer
+// ([Engine.ControlTableDDL] / `sluice control-tables ddl`, ADR-0165).
+// Unqualified names: the migrate-state tables always live in the
+// connection's default database (no sidecar-keyspace variant).
+func migrateStateHeaderDDL() string {
+	return `CREATE TABLE IF NOT EXISTS ` + "`" + migrateStateTableName + "`" + ` (
+	migration_id    VARCHAR(255) NOT NULL,
+	phase           VARCHAR(32)  NOT NULL,
+	table_progress  TEXT         NULL,
+	state_format    INT          NOT NULL DEFAULT 1,
+	started_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
+		ON UPDATE CURRENT_TIMESTAMP,
+	last_error      TEXT         NULL,
+	PRIMARY KEY (migration_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
+}
+
+func migrateProgressDDL() string {
+	return `CREATE TABLE IF NOT EXISTS ` + "`" + migrateProgressTableName + "`" + ` (
+	migration_id    VARCHAR(255) NOT NULL,
+	table_name      VARCHAR(255) NOT NULL,
+	progress        TEXT         NOT NULL,
+	updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
+		ON UPDATE CURRENT_TIMESTAMP,
+	PRIMARY KEY (migration_id, table_name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
 }
 
 // controlTableExists reports whether a migrate-state control table is
@@ -220,7 +232,7 @@ func (s *MigrationStateStore) ensureStateFormatColumn(ctx context.Context) error
 	}
 	const alter = "ALTER TABLE `" + migrateStateTableName + "` ADD COLUMN state_format INT NOT NULL DEFAULT 1"
 	if _, err := s.db.ExecContext(ctx, alter); err != nil {
-		return fmt.Errorf("mysql: ensure migrate-state table: add state_format: %w", err)
+		return fmt.Errorf("mysql: ensure migrate-state table: add state_format: %w", wrapControlTableBootstrapError(err, alter))
 	}
 	return nil
 }

@@ -85,6 +85,7 @@ const (
 	CodePSSafeMigrationsDisabled Code = "SLUICE-E-PS-SAFE-MIGRATIONS-DISABLED"
 	CodePSDeployRequestFailed    Code = "SLUICE-E-PS-DEPLOY-REQUEST-FAILED"
 	CodePSBranchStaleBase        Code = "SLUICE-E-PS-BRANCH-STALE-BASE"
+	CodePSDirectDDLBlocked       Code = "SLUICE-E-PS-DIRECT-DDL-BLOCKED"
 
 	CodeSourceForeignDump     Code = "SLUICE-E-SOURCE-FOREIGN-DUMP"
 	CodeSourceWrongDriver     Code = "SLUICE-E-SOURCE-WRONG-DRIVER"
@@ -165,6 +166,7 @@ var registry = map[Code]Info{
 	CodePSSafeMigrationsDisabled: {ClassRefusal, "expand-contract refused: the PlanetScale production branch does not have safe migrations enabled (the deploy-request prerequisite); sluice never auto-enables it"},
 	CodePSDeployRequestFailed:    {ClassRuntime, "a PlanetScale deploy request entered a failure state (or never became deployable/complete before the timeout) — the message carries the DR number, state, and URL"},
 	CodePSBranchStaleBase:        {ClassRuntime, "a PlanetScale dev branch's schema still differs from production after a rebase backup — a new dev branch's schema can lag production (intermittent, timing undocumented), and deploying from a stale base would silently revert newer production schema"},
+	CodePSDirectDDLBlocked:       {ClassRefusal, "PlanetScale safe migrations refused the direct DDL sluice needs for its own control tables (Error 1105) — bootstrap them through the governed channel: `sluice control-tables ddl` prints the statements, `sluice deploy-ddl` ships each one via a deploy request"},
 
 	CodeExportUnrepresentable: {ClassRefusal, "backup export-as-parquet refused: a column type or value has no faithful Parquet representation (multi-dimensional array, out-of-day-range TIME, NUMERIC NaN/Infinity, sub-microsecond timestamp) — exclude the table or query the JSON-Lines chunks directly; sluice never silently narrows a value on export"},
 }

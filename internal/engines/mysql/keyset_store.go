@@ -72,7 +72,12 @@ func (s *mysqlKeysetStore) EnsureKeysetTable(ctx context.Context) error {
 			PRIMARY KEY (name, generation)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
 	if _, err := s.db.ExecContext(ctx, ddl); err != nil {
-		return fmt.Errorf("mysql: ensure keyset table: %w", wrapDDLError(err))
+		// The safe-migrations refusal is classified into the coded
+		// bootstrap refusal like every control-table create site
+		// (roadmap item 66); sluice_keysets is not in the printed
+		// bootstrap set (it lives wherever `db:` keysets point), so the
+		// operator ships this exact echoed statement via deploy-ddl.
+		return fmt.Errorf("mysql: ensure keyset table: %w", wrapControlTableBootstrapError(wrapDDLError(err), ddl))
 	}
 	return nil
 }

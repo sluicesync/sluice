@@ -64,7 +64,11 @@ func ensureTargetMetricsHistoryTable(ctx context.Context, db *sql.DB) error {
 			KEY idx_stream_sampled (stream_id, sampled_at)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
 	if _, err := db.ExecContext(ctx, ddl); err != nil {
-		return fmt.Errorf("mysql: ensure target-metrics-history table: %w", wrapDDLError(err))
+		// Coded bootstrap classification (roadmap item 66):
+		// sluice_target_metrics_history is not in the printed bootstrap
+		// set (telemetry-opt-in, failure-isolated sidecar), so the coded
+		// refusal echoes the exact statement for deploy-ddl.
+		return fmt.Errorf("mysql: ensure target-metrics-history table: %w", wrapControlTableBootstrapError(wrapDDLError(err), ddl))
 	}
 	return nil
 }

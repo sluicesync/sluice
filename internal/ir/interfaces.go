@@ -3028,3 +3028,28 @@ type BackfillExecutor interface {
 type BackfillExecutorOpener interface {
 	OpenBackfillExecutor(ctx context.Context, dsn string) (BackfillExecutor, error)
 }
+
+// ControlTableStatement names one sluice control table together with
+// the exact CREATE statement the engine executes to create it.
+type ControlTableStatement struct {
+	// Table is the control table's unqualified name (e.g.
+	// "sluice_cdc_state").
+	Table string
+
+	// DDL is the CREATE statement, byte-identical to what the engine's
+	// own Ensure* path executes — single-sourced so the printed
+	// bootstrap DDL can never drift from what sluice would create.
+	DDL string
+}
+
+// ControlTableDDLProvider is the optional engine surface behind
+// `sluice control-tables ddl`: it renders the CREATE statements for
+// sluice's own control tables (migrate-state + cdc-state) so an
+// operator can pre-create them through a governed channel when the
+// target refuses direct DDL — the PlanetScale safe-migrations
+// bootstrap (ship each statement via `sluice deploy-ddl`). Same shape
+// as [MigrationStateStoreOpener]: optional, type-asserted at the call
+// site. The MySQL family (all flavors) implements it.
+type ControlTableDDLProvider interface {
+	ControlTableDDL() []ControlTableStatement
+}
