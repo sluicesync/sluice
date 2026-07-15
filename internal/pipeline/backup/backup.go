@@ -322,6 +322,12 @@ func (b *Backup) Run(ctx context.Context) error {
 	sink := sinkOrNop(b.Progress)
 	sink.PhaseStarted(backupPhaseSchema)
 
+	// Managed-host advisories (items 69a/70a). cdc=true — a full backup
+	// anchors the chain's CDC position (EndPosition), so retention traps
+	// like DigitalOcean's out-of-band binlog purger apply to any
+	// incremental that will chain off this run.
+	migcore.WarnSourceHostAdvisories(ctx, b.Source, b.SourceDSN, true)
+
 	// Engine-default exclusions (Bug 22): merge in PlanetScale's
 	// `_vt_*` shadow tables when the source signals them via the
 	// optional [ir.DefaultTableExcluder] surface.

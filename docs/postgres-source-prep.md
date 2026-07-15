@@ -26,10 +26,22 @@ If `wal_level` is not `logical`, sluice's CDC reader fails the precondition chec
 
 ```
 postgres: cdc: wal_level is "replica"; must be 'logical' for logical replication
-(set wal_level=logical in postgresql.conf and restart)
+(self-managed: set wal_level=logical in postgresql.conf and restart; managed providers
+expose it as a setting — e.g. Neon's enable_logical_replication toggle;
+see docs/postgres-source-prep.md for the provider matrix)
 ```
 
-To change `wal_level`, edit `postgresql.conf` (or the managed-service equivalent) and restart the cluster. It cannot be changed live.
+How you change it depends on who runs the server — `wal_level` cannot be changed live anywhere, but managed providers wrap the restart (or pre-enable it) differently:
+
+| Provider | How to get `wal_level=logical` | Notes |
+|----------|-------------------------------|-------|
+| Self-managed | `wal_level = logical` in `postgresql.conf`, then restart the cluster | The classic path; plan the restart window. |
+| Neon | Project setting **`enable_logical_replication`** (console: Settings → Logical replication, or the project-update API) | **Irreversible**; takes effect in seconds with no visible downtime (validated live 2026-07-15). |
+| Supabase | Nothing — `logical` is on by default | Note the direct-vs-pooler endpoint constraints in [managed-services](managed-services.md#supabase-postgres). |
+| PlanetScale Postgres | On by default on current provisioning; verify with `SHOW wal_level` | Older/custom-provisioned databases may differ. |
+| AWS RDS / Aurora | Parameter group: `rds.logical_replication = 1`, then reboot | The GUC itself is read-only on RDS; the rds.* parameter drives it. |
+| GCP CloudSQL | Flag `cloudsql.logical_decoding = on`, then restart | |
+| Azure Database for PostgreSQL | Server parameter `wal_level = logical`, then restart | |
 
 ### WAL volume cost of `wal_level = logical`
 

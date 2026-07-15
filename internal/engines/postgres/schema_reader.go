@@ -471,6 +471,87 @@ func (r *SchemaReader) PartitionedTables(ctx context.Context) ([]string, error) 
 	return names, rows.Err()
 }
 
+// ForeignTables returns the FDW foreign tables (relkind='f') in the
+// reader's active namespace, mapped name → foreign-server name.
+//
+// [readTables] filters information_schema on table_type='BASE TABLE',
+// so foreign tables never enter the schema — and before roadmap item
+// 68a that skip was SILENT: an FDW-fronted table simply vanished from
+// the migration with no signal. The pipeline's [warnForeignTables]
+// uses this census to name every skipped foreign table (and the
+// server its data actually lives on) at WARN. The skip itself stays:
+// a foreign table holds no local rows, so not copying it loses no
+// local data — the wart was the silence, not the skip.
+//
+// Returns an empty map on a schema with no foreign tables; nil only
+// on a query failure.
+func (r *SchemaReader) ForeignTables(ctx context.Context) (map[string]string, error) {
+	const q = `
+		SELECT c.relname, s.srvname
+		FROM   pg_foreign_table  ft
+		JOIN   pg_class          c ON c.oid = ft.ftrelid
+		JOIN   pg_foreign_server s ON s.oid = ft.ftserver
+		JOIN   pg_namespace      n ON n.oid = c.relnamespace
+		WHERE  n.nspname = $1
+		ORDER  BY c.relname`
+	rows, err := r.catalogQuery(ctx, q, r.schema)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[string]string{}
+	for rows.Next() {
+		var name, server string
+		if err := rows.Scan(&name, &server); err != nil {
+			return nil, err
+		}
+		out[name] = server
+	}
+	return out, rows.Err()
+}
+
+// InheritanceParents returns the names of every OLD-STYLE (non-
+// declarative) inheritance parent in the reader's active namespace: a
+// plain table (relkind='r') that appears as inhparent in pg_inherits.
+// Declarative partition parents are relkind='p' and are the Bug 100
+// preflight's territory ([PartitionedTables]); the relkind filter
+// keeps the two probes disjoint.
+//
+// Used by the pipeline's [preflightInheritanceTables] (roadmap item
+// 68b) to refuse loudly: inheritance children are ordinary BASE
+// TABLEs the reader copies independently, while a SELECT on the
+// parent (no ONLY) ALSO returns every child's rows — so an unguarded
+// migration lands the child rows twice (once flattened into the
+// parent's target heap, once in each child's), the legacy twin of the
+// Bug 100 silent-duplication class.
+//
+// Returns an empty slice on a schema with no legacy inheritance; nil
+// only on a query failure.
+func (r *SchemaReader) InheritanceParents(ctx context.Context) ([]string, error) {
+	const q = `
+		SELECT DISTINCT p.relname
+		FROM   pg_inherits  i
+		JOIN   pg_class     p ON p.oid = i.inhparent
+		JOIN   pg_namespace n ON n.oid = p.relnamespace
+		WHERE  n.nspname = $1
+		  AND  p.relkind = 'r'
+		ORDER  BY p.relname`
+	rows, err := r.catalogQuery(ctx, q, r.schema)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
+}
+
 func (r *SchemaReader) readViews(ctx context.Context) ([]*ir.View, error) {
 	extMembers, err := r.extensionMemberRelations(ctx)
 	if err != nil {

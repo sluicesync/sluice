@@ -336,6 +336,11 @@ type BackupStream struct {
 // rollover to commitRollover / handleEmptyRollover and keeping the
 // transient-retry and in-process rotation-FSM logic inline.
 func (b *BackupStream) Run(ctx context.Context) error {
+	// Managed-host advisories (items 69a/70a). cdc=true — the stream
+	// lives on the source's change log; a lying retention window (the
+	// DigitalOcean binlog purger) is exactly what kills it.
+	migcore.WarnSourceHostAdvisories(ctx, b.Source, b.SourceDSN, true)
+
 	init, err := b.newRolloverLoop(ctx)
 	if err != nil {
 		return err

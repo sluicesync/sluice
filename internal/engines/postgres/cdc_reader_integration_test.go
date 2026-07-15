@@ -743,9 +743,15 @@ func TestCDCReader_RejectsWrongWALLevel(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected wal_level precondition error; got nil")
 	}
-	// The error should name wal_level so a user can fix it.
+	// The error should name wal_level so a user can fix it, and point
+	// at the provider matrix (item 69b: "edit postgresql.conf" is
+	// self-managed-only advice — on Neon the fix is the
+	// enable_logical_replication toggle).
 	if !contains(err.Error(), "wal_level") {
 		t.Errorf("error should mention wal_level; got %q", err.Error())
+	}
+	if !contains(err.Error(), "postgres-source-prep") {
+		t.Errorf("error should point at the docs/postgres-source-prep.md provider matrix; got %q", err.Error())
 	}
 }
 

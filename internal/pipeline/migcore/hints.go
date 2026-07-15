@@ -254,7 +254,15 @@ func WrapWithHint(phase string, err error) error {
 	if err == nil {
 		return nil
 	}
-	h, ok := matchErrorHint(phase, err)
+	// Dynamic classifiers first: they match on error STRUCTURE (a
+	// [net.DNSError] in the chain) rather than message substrings, so a
+	// structural match beats the static registry. Phase-independent —
+	// an IPv6-only resolve failure means the same thing at connect, at
+	// CDC open, everywhere. See hints_dns.go.
+	h, ok := dnsResolveHint(err)
+	if !ok {
+		h, ok = matchErrorHint(phase, err)
+	}
 	if !ok {
 		return err
 	}

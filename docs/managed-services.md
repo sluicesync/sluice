@@ -134,6 +134,10 @@ end so re-runs are idempotent.
   because the situation is more likely on a managed service where
   network blips can interrupt the streamer.
 
+### Coming from ps-discovery?
+
+PlanetScale's `ps-discovery` tool is a metadata census — it inventories what your source contains; sluice is the execution engine that enforces the hazards at run time. If ps-discovery flagged your schema, note what sluice checks automatically before any data moves: declaratively-partitioned tables (loud refusal), old-style `INHERITS` hierarchies (loud refusal — silent-duplication class), FDW foreign tables (loud WARN naming each skipped table and its server), RLS-filtered snapshots, XID-wraparound proximity, and replication-role/slot preconditions.
+
 ## PlanetScale MySQL (and other Vitess deployments)
 
 **Status**: Supported via the `planetscale` engine (a flavor of the
@@ -437,6 +441,84 @@ Each lane runs its own AIMD controller and recovers in-lane from a
 PlanetScale tx-killer / deadlock (shrink + idempotent split-retry, no
 stream restart). Exactly-once is preserved for keyed tables. Pass
 `--apply-concurrency 1` to force the legacy serial apply.
+
+## Neon (Postgres)
+
+**Status**: Live-validated 2026-07-15 (v0.99.249) as a migration + CDC **source** (Neon free tier → PlanetScale Postgres). Fidelity was byte-identical on md5 ground truth, including the hard value families: `NaN` inside `numeric[]`, ±Infinity, denormal floats, and 2-D arrays with NULL elements. The snapshot→CDC handoff and post-handoff convergence were clean. The vanilla `postgres` engine is the right driver.
+
+### Direct vs pooler endpoints
+
+Neon gives every branch two hostnames: the **direct** endpoint (`ep-…<id>.<region>.aws.neon.tech`) and the **pooled** endpoint (same name with a `-pooler` suffix on the first label), which is pgbouncer in transaction mode.
+
+- **CDC requires the direct endpoint.** A pooler cannot proxy replication-protocol commands (it strips `replication=database`); `sync start` against the pooled host fails at slot creation with the coded `SLUICE-E-CDC-POOLER-ENDPOINT` refusal.
+- **Bulk migrate through the pooler works** — a full snapshot-pinned parallel migrate passed through it at the validation scale — but sluice's parallel copy pins server connections inside long-lived snapshot transactions, which risks pool exhaustion mid-copy at higher parallelism/scale with a confusing failure. sluice emits a preflight **WARN** when the source host matches the `-pooler` pattern; prefer the direct endpoint.
+
+### Enabling logical replication (`wal_level`)
+
+Neon defaults to `wal_level=replica`; sluice's CDC preflight refuses loudly. The fix is **not** postgresql.conf — it's Neon's project setting `enable_logical_replication` (console: Settings → Logical replication; also settable via the project-update API). Two things to know: the toggle is **irreversible**, and it takes effect in seconds with no visible downtime (validated live). See [postgres-source-prep](postgres-source-prep.md) for the provider matrix.
+
+### Operational notes
+
+- **`wal_proposer_slot` is Neon-internal.** Every Neon endpoint carries an always-present *physical* replication slot named `wal_proposer_slot` (part of Neon's safekeeper architecture). sluice's slot-health monitoring correctly ignores it; any external slot-enumeration tooling (or future sluice tooling) must whitelist it rather than flagging it as a leaked consumer.
+- **TLS**: Neon DSNs work with `sslmode=require`; `verify-full` also works with the standard system roots.
+- **Region co-location matters.** The validation runs were cross-provider; co-locating the sluice process (or the target) with the Neon region measurably reduces snapshot wall-clock.
+- **Autosuspend / cold-start is unprobed.** The validation project stayed active throughout, so scale-to-zero resume latency under a sluice snapshot has not been characterized — if you run against an autosuspending endpoint and see slow first-connection behaviour, that's the place to look.
+
+## Supabase (Postgres)
+
+**Status**: Live-validated 2026-07-15 as a bulk-migration **source** — bit-exact fidelity through **both** Supavisor pooler modes. CDC from Supabase was environment-blocked in the validation (IPv4-only network + IPv6-only direct endpoint — see below), not a sluice defect: `wal_level=logical` is on out of the box (contrast Neon).
+
+### The IPv6-only direct endpoint (the thing that bites first)
+
+Supabase free-tier **direct** endpoints (`db.<ref>.supabase.co`) have **only an AAAA record** — IPv4 connectivity to the direct endpoint is a paid add-on. From an IPv4-only machine the connection fails in about a second with the platform resolver's cryptic no-data error. sluice detects this class: on a resolve failure it probes for an AAAA record and, when the host is IPv6-only, extends the error with the remedy (coded `SLUICE-E-CONNECT-IPV6-ONLY`).
+
+- **Bulk migrate**: use the pooler endpoint (`aws-…pooler.supabase.com` — it has an A record).
+- **CDC**: the direct endpoint is required (a pooler cannot proxy replication), so from an IPv4-only network you need the IPv4 add-on or an IPv6-capable network. `sync start` through Supavisor fails at slot creation with the coded `SLUICE-E-CDC-POOLER-ENDPOINT` refusal explaining exactly this.
+
+### Session vs transaction pooler modes
+
+Supavisor exposes two ports on the pooler hostname:
+
+- **Session mode (`:5432`)** — bulk migrate works, including parallel copy. Validated bit-exact.
+- **Transaction mode (`:6543`)** — server connections rotate per transaction, which trips pgx's statement cache (SQLSTATE 42P05, "prepared statement already exists"). sluice WARNs and falls back to the single-reader copy path, which completes correctly — but **parallel copy is silently unavailable** in this mode. Prefer session mode (or the direct endpoint) for large copies.
+
+sluice's pooler-host preflight WARN fires for both (the hostname matches the `pooler.supabase.com` pattern).
+
+### Float display is not float identity
+
+Supabase servers default `extra_float_digits=0`, so **text-level** float comparisons against a Supabase source lie (a value can print rounded while the stored bits are exact). sluice's copy was proven bit-exact via `float8send` ground truth; if you diff sluice's output with external tooling that compares text, pin `SET extra_float_digits = 1` (or better, compare `float8send`/`float4send` bytes).
+
+### Platform schemas
+
+Supabase ships its platform schemas (`auth`, `storage`, `realtime`, …) alongside `public`. sluice's default `public` scoping ignores them correctly; nothing to exclude manually.
+
+## DigitalOcean Managed MySQL
+
+**Status**: cold copy + CDC handoff validated live 2026-07-15 (throwaway `db-s-1vcpu-1gb`, MySQL 8.4). Uses the vanilla `mysql` engine. One platform behaviour is dangerous enough to headline:
+
+### The lying binlog-retention window (read this before `sync start`)
+
+On DO Managed MySQL **defaults**, an out-of-band platform reaper purges **every binlog file ~13–16 minutes after creation** — while `@@binlog_expire_logs_seconds` reads **259200 (3 days)** and the DO config API shows no retention field until you first set one. The server variable **lies**: no SQL-level check can see the real window, so the DSN host pattern (`*.db.ondigitalocean.com`) is the only reliable preflight signal. sluice emits a loud **WARN** at `sync`/backup start on that host pattern.
+
+Why it matters: a CDC position older than the window is unrecoverable (`ErrPositionInvalid`, "binlog purged"), and a cold copy that takes longer than the window can **livelock auto-resnapshot** — each retry re-copies, exceeds the window again, and loses its position again.
+
+The fix (confirmed working): set the retention knob through DO's database config API —
+
+```
+PATCH /v2/databases/{id}/config
+{"config": {"binlog_retention_period": 86400}}
+```
+
+Seconds, accepted range 600–86400; **86400 (24 h) is the right value for migrations**. It takes effect immediately, no restart, and pre-existing binlogs stop being purged. (Aiven-hosted MySQL likely shares the purger behaviour — same platform lineage — but has not been probed.)
+
+Open question (unprobed): whether an *attached* binlog-dump connection holds the purger back — i.e. whether a live caught-up stream is safe indefinitely at default retention or only between purge ticks. Until answered, treat the config-API knob as required for any DO CDC use.
+
+### Connection + schema gotchas
+
+- **TLS CA is required.** DO clusters use a private CA; fetch it from `GET /v2/databases/{id}/ca` and pass it via `--source-tls-ca` (custom-CA support shipped in ADR-0158).
+- **`doadmin` has the replication grants** sluice's binlog CDC needs; no extra GRANTs required on defaults.
+- **Default `sql_mode` includes `ANSI`** — double-quoted strings are *identifiers* on this server. Anything you run manually against the source with `"double quotes"` behaves differently than on a stock MySQL.
+- **`sql_require_primary_key=true`** by default — keyless tables cannot be created on a DO target, and restoring keyless-table dumps there fails until the setting is relaxed.
 
 ## Other managed services
 

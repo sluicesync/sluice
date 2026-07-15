@@ -43,6 +43,7 @@ var (
 	_ ir.SnapshotExporter               = Engine{}
 	_ ir.SnapshotImporterOpener         = Engine{}
 	_ ir.SnapshotStreamWithSlotOpener   = Engine{}
+	_ ir.SourceHostAdvisor              = Engine{}
 	_ ir.TargetConnectionBudgetProber   = Engine{}
 	_ ir.TargetStaleBackendReaper       = Engine{}
 
@@ -63,6 +64,12 @@ var (
 	_ ir.TableScoper                         = (*SchemaReader)(nil)
 	_ ir.VerbatimExtensionAware              = (*SchemaReader)(nil)
 	_ ir.Verifier                            = (*SchemaReader)(nil)
+	// The pipeline's preflight probers are pipeline-side interfaces
+	// (partitionPreflightProber & co.) discovered by runtime assertion;
+	// their method SHAPES are pinned by the pipeline unit tests, and the
+	// items 68a/68b census methods (ForeignTables / InheritanceParents)
+	// are additionally integration-pinned against a real PG in
+	// schema_reader_census_integration_test.go.
 
 	// SchemaWriter optional surfaces.
 	_ ir.ColumnDDLPreviewer      = (*SchemaWriter)(nil)

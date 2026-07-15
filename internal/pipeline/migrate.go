@@ -601,6 +601,12 @@ func (m *Migrator) Run(ctx context.Context) error {
 		return err
 	}
 
+	// Managed-host advisories (items 69a/70a): WARN-level sibling of the
+	// refusal above — e.g. a PG source host matching a known connection-
+	// pooler pattern. cdc=false: migrate never returns to the source's
+	// change stream, so CDC-retention advisories stay quiet.
+	migcore.WarnSourceHostAdvisories(ctx, m.Source, m.SourceDSN, false)
+
 	// Multi-database fan-out (ADR-0074). When any database-scope flag is
 	// set, resolve the database set and run a per-database snapshot loop;
 	// each iteration re-opens a single-database reader/writer (a DSN

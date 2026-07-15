@@ -203,6 +203,11 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	sink := sinkOrNop(b.Progress)
 	sink.PhaseStarted(incrPhaseConnect)
 
+	// Managed-host advisories (items 69a/70a). cdc=true — an incremental
+	// resumes the source's change stream from the parent's EndPosition,
+	// exactly where a lying binlog-retention window bites.
+	migcore.WarnSourceHostAdvisories(ctx, b.Source, b.SourceDSN, true)
+
 	// 0. Resolve the open segment: every incremental lands in the
 	//    lineage's open segment, under its Dir, with its recorded
 	//    codec (ADR-0046). For a never-rotated backup that's the root

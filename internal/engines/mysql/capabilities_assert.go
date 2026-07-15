@@ -135,6 +135,7 @@ var (
 	// MISSING net / the driver-host-mismatch preflight refusal); the rest are
 	// perf/telemetry surfaces that would silently degrade.
 	_ ir.DSNValidator              = Engine{}
+	_ ir.SourceHostAdvisor         = Engine{}
 	_ ir.IndexVerifier             = (*SchemaWriter)(nil)
 	_ ir.TransientClassifier       = (*SchemaWriter)(nil)
 	_ ir.GrowGateSetter            = (*RowWriter)(nil)

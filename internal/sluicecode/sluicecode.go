@@ -55,6 +55,8 @@ const (
 	CodeIndexDirectDDLDisabled   Code = "SLUICE-E-INDEX-DIRECT-DDL-DISABLED"
 	CodeIndexMissing             Code = "SLUICE-E-INDEX-MISSING"
 	CodeCDCReplicationPermission Code = "SLUICE-E-CDC-REPLICATION-PERMISSION"
+	CodeCDCPoolerEndpoint        Code = "SLUICE-E-CDC-POOLER-ENDPOINT"
+	CodeConnectIPv6Only          Code = "SLUICE-E-CONNECT-IPV6-ONLY"
 
 	CodeColdStartTargetNotEmpty   Code = "SLUICE-E-COLDSTART-TARGET-NOT-EMPTY"
 	CodeSchemaExtensionNotEnabled Code = "SLUICE-E-SCHEMA-EXTENSION-NOT-ENABLED"
@@ -128,6 +130,8 @@ var registry = map[Code]Info{
 	CodeIndexStatementTimeLimit:  {ClassRuntime, "index build hit PlanetScale's statement-time limit (errno 3024)"},
 	CodeIndexDirectDDLDisabled:   {ClassRuntime, "PlanetScale safe-migrations blocks direct DDL (errno 1105)"},
 	CodeCDCReplicationPermission: {ClassRuntime, "connecting role lacks the REPLICATION attribute"},
+	CodeCDCPoolerEndpoint:        {ClassRuntime, "the source appears to be a connection pooler (Supavisor/pgbouncer), which cannot proxy replication-protocol commands; CDC needs the direct endpoint"},
+	CodeConnectIPv6Only:          {ClassRuntime, "the DSN host resolves to an AAAA record only (IPv6-only) and this network appears IPv4-only"},
 
 	CodeColdStartTargetNotEmpty:    {ClassRefusal, "cold-start refused: a target table already contains data"},
 	CodeSchemaExtensionNotEnabled:  {ClassRefusal, "column type owned by a PG extension not opted into"},

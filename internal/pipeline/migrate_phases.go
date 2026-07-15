@@ -169,6 +169,21 @@ func (m *Migrator) phaseReadSourceSchema(ctx context.Context, scope *multiDBScop
 		return sr, nil, err
 	}
 
+	// Legacy-inheritance preflight (roadmap item 68b) — the Bug 100
+	// twin for old-style INHERITS hierarchies: children copy
+	// independently while the parent SELECT also returns their rows,
+	// so proceeding would silently duplicate the child data.
+	if err := preflightInheritanceTables(ctx, sr, m.Source.Capabilities(), schema); err != nil {
+		return sr, nil, err
+	}
+
+	// Foreign-table census (roadmap item 68a) — WARN, not refuse: FDW
+	// foreign tables are filtered out of the schema read (they hold no
+	// local rows), and before this the skip was silent.
+	if err := warnForeignTables(ctx, sr, m.Source.Capabilities(), m.Filter); err != nil {
+		return sr, nil, err
+	}
+
 	return sr, schema, nil
 }
 

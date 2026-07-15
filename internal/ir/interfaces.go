@@ -1299,6 +1299,46 @@ type DSNValidator interface {
 	ValidateDSN(dsn string) error
 }
 
+// SourceHostAdvisory is one operator advisory a [SourceHostAdvisor]
+// derives from a source DSN's host pattern. Message is the full
+// WARN-level line (host + hazard + remedy, self-contained); Hint is
+// the concise remedy the orchestrator attaches as a structured `hint`
+// attribute on the log record.
+type SourceHostAdvisory struct {
+	Message string
+	Hint    string
+}
+
+// SourceHostAdvisor is the optional surface an [Engine] implements to
+// emit operator advisories it can derive from the SOURCE DSN's host
+// alone, with no connection — the WARN-level sibling of
+// [DSNValidator]'s refusal. The orchestrator calls it for the source
+// at the top of migrate, sync, and the backup CDC paths and logs each
+// returned advisory at WARN; the run proceeds.
+//
+// It exists for managed-service host classes where the hazard is real
+// but not certain enough (or not fatal enough) to refuse:
+//
+//   - The Postgres engine warns when the host matches a known
+//     connection-pooler pattern (Neon `-pooler`, Supabase Supavisor,
+//     pgbouncer): CDC/logical replication needs the direct endpoint,
+//     and long-lived snapshot transactions can exhaust the pool
+//     mid-copy.
+//   - The MySQL engine warns on DigitalOcean Managed MySQL hosts when
+//     cdc is true: the platform purges binlogs out-of-band ~10-15
+//     minutes after creation regardless of what
+//     @@binlog_expire_logs_seconds reports, so the host pattern is
+//     the ONLY reliable preflight signal (the variable lies).
+//
+// cdc reports whether the run will anchor or consume a CDC position
+// (sync, backup full/incremental/stream) — advisories about
+// change-stream retention are suppressed for a plain migrate, which
+// never returns to the source's log. Engines that don't implement the
+// surface are a silent no-op.
+type SourceHostAdvisor interface {
+	SourceHostAdvisories(dsn string, cdc bool) []SourceHostAdvisory
+}
+
 // ReshardReopener is the optional surface a [CDCReader] implements to
 // follow a source reshard (a Vitess shard split / merge / MoveTables)
 // without losing or duplicating events across the seam (ADR-0094).

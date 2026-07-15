@@ -397,6 +397,8 @@ func tryParallelCopyTable(
 		}
 	}
 
+	copyStart := time.Now()
+
 	// Compute or reload boundaries.
 	chunks, err := resolveChunks(ctx, state, stateMu, rc, primaryRows, table, deps, resuming)
 	if err != nil {
@@ -420,6 +422,23 @@ func tryParallelCopyTable(
 		return false, err
 	}
 
+	// Table-level completion line (roadmap item 69c). The per-chunk
+	// tickers log per-CHUNK completion (and the raw-copy lane only logs
+	// at DEBUG), so before this line a within-table-parallel table
+	// finished SILENTLY at INFO — only verify proved the copy. Emit the
+	// single-reader path's "bulk copy complete" sibling with the whole-
+	// table totals. Rows are read from the terminal per-chunk state
+	// (accurate across all three chunk branches — idempotent, fast
+	// loader, raw byte-pipe), summed under stateMu because peer tables
+	// in the cross-table pool mutate the shared map concurrently.
+	stateMu.Lock()
+	var tableRows int64
+	for _, c := range state.TableProgress[table.Name].Chunks {
+		tableRows += c.RowsCopied
+	}
+	stateMu.Unlock()
+	logParallelCopyComplete(ctx, table.Name, tableRows, len(chunks), copyStart)
+
 	// All chunks complete: record terminal state. The bare-string
 	// "complete" wins on the next read; the verbose chunked entry is
 	// no longer load-bearing. Persist via setTableProgressAndWrite so
@@ -430,6 +449,23 @@ func tryParallelCopyTable(
 	setTableProgressAndWrite(ctx, rc, state, stateMu, table.Name,
 		ir.TableProgress{State: ir.TableProgressComplete})
 	return true, nil
+}
+
+// logParallelCopyComplete emits the whole-table completion summary for
+// the within-table-parallel copy path (item 69c): the message matches
+// the single-reader ticker's "bulk copy complete" so log consumers see
+// one completion vocabulary, with `chunks` (the lane count) and
+// `duration` distinguishing the parallel shape. Split out as a small
+// helper so the line's shape is unit-pinned without scaffolding the
+// whole chunk orchestrator.
+func logParallelCopyComplete(ctx context.Context, tableName string, rows int64, lanes int, started time.Time) {
+	slog.InfoContext(
+		ctx, "bulk copy complete",
+		slog.String("table", tableName),
+		slog.Int64("rows", rows),
+		slog.Int("chunks", lanes),
+		slog.Duration("duration", time.Since(started).Round(time.Millisecond)),
+	)
 }
 
 // resolveChunks returns the chunk layout for this table. On a fresh

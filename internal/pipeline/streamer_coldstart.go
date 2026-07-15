@@ -313,6 +313,19 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context) (*ir.Schema, [
 		migcore.CloseIf(sr)
 		return nil, nil, err
 	}
+	// Legacy-inheritance preflight (roadmap item 68b) — same shape as
+	// the migrate preflight: refuses upfront on old-style INHERITS
+	// parents, whose child rows would otherwise copy twice.
+	if err := preflightInheritanceTables(ctx, sr, s.Source.Capabilities(), schema); err != nil {
+		migcore.CloseIf(sr)
+		return nil, nil, err
+	}
+	// Foreign-table census (roadmap item 68a) — WARN-and-proceed on
+	// FDW foreign tables the schema read silently filtered out.
+	if err := warnForeignTables(ctx, sr, s.Source.Capabilities(), s.Filter); err != nil {
+		migcore.CloseIf(sr)
+		return nil, nil, err
+	}
 	migcore.CloseIf(sr)
 
 	return schema, snapshotTables, nil

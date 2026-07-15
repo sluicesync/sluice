@@ -2020,7 +2020,12 @@ func decodeTuple(tuple *pglogrepl.TupleData, cols []relationColumn) (ir.Row, err
 // checkWALLevel verifies the source has wal_level=logical configured
 // before any replication command is issued. Surfacing this as a
 // startup error matches the "Contain Postgres complexity" tenet —
-// we name the GUC and what's required.
+// we name the GUC and what's required. The remedy is provider-shaped
+// (item 69b): "edit postgresql.conf and restart" is self-managed-only
+// advice — on Neon the fix is the console/API enable_logical_replication
+// toggle — so the message points at the provider matrix in
+// docs/postgres-source-prep.md rather than baking one provider's
+// console flow into the error text.
 func checkWALLevel(ctx context.Context, db *sql.DB) error {
 	var level string
 	if err := db.QueryRowContext(ctx, "SHOW wal_level").Scan(&level); err != nil {
@@ -2028,7 +2033,10 @@ func checkWALLevel(ctx context.Context, db *sql.DB) error {
 	}
 	if level != "logical" {
 		return fmt.Errorf(
-			"postgres: cdc: wal_level is %q; must be 'logical' for logical replication (set wal_level=logical in postgresql.conf and restart)",
+			"postgres: cdc: wal_level is %q; must be 'logical' for logical replication "+
+				"(self-managed: set wal_level=logical in postgresql.conf and restart; managed providers "+
+				"expose it as a setting — e.g. Neon's enable_logical_replication toggle; "+
+				"see docs/postgres-source-prep.md for the provider matrix)",
 			level,
 		)
 	}

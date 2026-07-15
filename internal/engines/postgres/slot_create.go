@@ -133,7 +133,12 @@ func createLogicalReplicationSlot(
 	}
 
 	if version >= pgVersionFailoverSupport {
-		return createSlotRawProtocol(ctx, replConn, slotName, opts)
+		consistentPoint, snapshotName, err = createSlotRawProtocol(ctx, replConn, slotName, opts)
+		// A pooler (Supavisor/pgbouncer) strips replication=database, so
+		// this first replication-protocol command lands on a normal
+		// backend as SQL and fails 42601 — classify that exact signature
+		// into the coded pooler refusal (item 69e). See pooler_detect.go.
+		return consistentPoint, snapshotName, classifyPoolerStripError(err)
 	}
 
 	if !opts.temporary {
@@ -141,7 +146,8 @@ func createLogicalReplicationSlot(
 		// for a slot whose contract is "dies with this session".
 		warnNoFailoverSupport(slotName, version)
 	}
-	return createSlotViaPglogrepl(ctx, replConn, slotName, opts)
+	consistentPoint, snapshotName, err = createSlotViaPglogrepl(ctx, replConn, slotName, opts)
+	return consistentPoint, snapshotName, classifyPoolerStripError(err)
 }
 
 // buildCreateReplicationSlotCommand renders the raw PG 17+
