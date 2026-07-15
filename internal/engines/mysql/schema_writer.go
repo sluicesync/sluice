@@ -77,6 +77,18 @@ type SchemaWriter struct {
 	// any build worker goroutine.
 	tableIndexedCallback func(table *ir.Table)
 
+	// indexBuildFallback is the optional out-of-band index-build channel
+	// (ADR-0148: the PlanetScale deploy-request fallback for the errno-3024
+	// statement-time wall / errno-1105 safe-migrations direct-DDL block),
+	// threaded via [SetIndexBuildFallback] before any index phase runs. nil
+	// (the zero value every non-CLI construction gets) keeps the direct
+	// ALTER path byte-identical to before — the fallback only ever ADDS a
+	// recovery for a build that would otherwise fail. Consulted by the two
+	// deferred-build paths a PlanetScale target takes: the whole-schema
+	// [CreateIndexes] and the VStream serial overlap
+	// ([buildEachAsCopiedSerial]); see schema_writer_index_fallback.go.
+	indexBuildFallback ir.IndexBuildFallback
+
 	// rlsWarnOnce gates the cross-engine PG → MySQL RLS-drop WARN
 	// (ADR-0063 — task #52 sub-deliverable 3). A PG source carrying
 	// any RLS-enabled table or attached policy logs a single WARN
@@ -340,7 +352,13 @@ func (w *SchemaWriter) CreateIndexes(ctx context.Context, s *ir.Schema) error {
 	// alphabetical index order, combined-ALTER grouping — byte-identical on
 	// both paths.
 	for _, job := range w.indexBuildJobsForTables(orderedTables(s)) {
-		if err := w.buildTableIndexes(ctx, w.db, job); err != nil {
+		// The deploy-request fallback wrapper (ADR-0148) is a pass-through
+		// when no fallback is configured — the direct build below is then
+		// byte-identical to before.
+		direct := func(ctx context.Context, job indexBuildJob) error {
+			return w.buildTableIndexes(ctx, w.db, job)
+		}
+		if err := w.buildTableIndexesWithDeployFallback(ctx, job, direct); err != nil {
 			return err
 		}
 	}

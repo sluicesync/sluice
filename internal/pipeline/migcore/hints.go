@@ -169,23 +169,27 @@ var hintRegistry = []errorHint{
 	// interrupted, maximum statement execution time exceeded"), leaving
 	// the data copied but the declared secondary indexes uncreated.
 	// --upfront-indexes builds them during the copy (maintained
-	// per-row) so no post-copy ALTER is ever issued. (ADR-0148 tracks a
-	// possible future auto-fallback via PlanetScale deploy requests.)
+	// per-row) so no post-copy ALTER is ever issued. When the ADR-0148
+	// deploy-request fallback is armed (planetscale target + a service
+	// token + safe migrations ON) sluice recovers automatically and this
+	// hint never fires — it remains the no-token / no-safe-migrations
+	// path.
 	{
 		phase:    PhaseIndexes,
 		contains: "maximum statement execution time",
-		hint:     "the index build hit PlanetScale's statement-time limit (errno 3024); the data is already copied, so --resume finishes just the indexes with NO re-copy (increase the PlanetScale resource size first — a larger cluster builds the index faster, more likely under the limit). Alternatively start fresh with --upfront-indexes to build indexes during the copy",
+		hint:     "the index build hit PlanetScale's statement-time limit (errno 3024); the data is already copied, so --resume finishes just the indexes with NO re-copy (increase the PlanetScale resource size first — a larger cluster builds the index faster, more likely under the limit). Alternatively start fresh with --upfront-indexes to build indexes during the copy — or, with safe migrations ON, give sluice a PlanetScale service token (--planetscale-org + PLANETSCALE_SERVICE_TOKEN_ID/_TOKEN) and it builds the index via a deploy request automatically (ADR-0148)",
 		code:     sluicecode.CodeIndexStatementTimeLimit,
 	},
 	// Indexes: PlanetScale safe-migrations blocks direct DDL. With
 	// safe-migrations enabled on the target branch, a direct ALTER is
 	// rejected with "direct DDL is disabled" (1105). --upfront-indexes
-	// does NOT help here (its ALTER is also direct DDL) — the fix is
-	// operator-side.
+	// does NOT help here (its ALTER is also direct DDL) — the recovery is
+	// the ADR-0148 deploy-request fallback (needs a service token), which
+	// engages automatically when armed; this hint is the no-token path.
 	{
 		phase:    PhaseIndexes,
 		contains: "direct ddl is disabled",
-		hint:     "PlanetScale safe-migrations is enabled on the target branch, which blocks direct DDL; disable it for the migration (sluice does not yet drive PlanetScale deploy requests)",
+		hint:     "PlanetScale safe-migrations is enabled on the target branch, which blocks direct DDL; give sluice a service token (--planetscale-org + PLANETSCALE_SERVICE_TOKEN_ID/_TOKEN env) and it builds the indexes through a deploy request automatically (ADR-0148), or disable safe migrations on the branch for the migration",
 		code:     sluicecode.CodeIndexDirectDDLDisabled,
 	},
 

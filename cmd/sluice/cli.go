@@ -275,6 +275,23 @@ type MigrateCmd struct {
 
 	UpfrontIndexes bool `help:"Create secondary indexes before the bulk copy (maintained during load) instead of the default deferred post-copy build. Useful for large PlanetScale-MySQL targets where a deferred ADD INDEX can exceed the statement-time limit; trades slower load for no post-copy index build."`
 
+	// ADR-0148 (roadmap item 67): OPTIONAL control-plane credentials that arm
+	// the automatic deploy-request index-build fallback on a planetscale
+	// target. When a deferred post-copy ADD INDEX hits PlanetScale's
+	// statement-time wall (errno 3024) or the safe-migrations direct-DDL block
+	// (errno 1105), sluice builds that index through a dev branch + deploy
+	// request instead (VReplication: async, unbounded by the wall) — but ONLY
+	// when safe migrations is already ON (never toggled) and these credentials
+	// resolve. Unarmed (any piece missing, or a non-planetscale target), the
+	// index phase behaves exactly as before, ending at the --upfront-indexes /
+	// --resume hint.
+	PlanetScaleOrg            string        `name:"planetscale-org" help:"PlanetScale org slug; arms the automatic deploy-request index-build fallback on a planetscale target (ADR-0148) — when a deferred post-copy ADD INDEX hits the statement-time wall (errno 3024) or the safe-migrations direct-DDL block (errno 1105), sluice builds it via a dev branch + deploy request instead (requires safe migrations ON — sluice never toggles it — plus the service token). Control-plane only, distinct from the data-plane --target DSN; ignored on non-planetscale targets. Off when unset (the migrate is unchanged)." env:"PLANETSCALE_ORG" placeholder:"ORG"`
+	PlanetScaleDatabase       string        `name:"planetscale-database" help:"PlanetScale database name for the ADR-0148 index-build fallback. Defaults to the --target DSN's database name. Only consulted when --planetscale-org is set." placeholder:"DB"`
+	PlanetScaleBranch         string        `name:"planetscale-branch" help:"PlanetScale production branch the --target DSN points at, for the ADR-0148 index-build fallback (deploy requests merge into it). Only consulted when --planetscale-org is set." default:"main" placeholder:"BRANCH"`
+	PlanetScaleServiceTokenID string        `name:"planetscale-service-token-id" help:"PlanetScale service-token ID (branch + deploy-request scopes) for the ADR-0148 index-build fallback. Prefer the env var so it never lands in shell history." env:"PLANETSCALE_SERVICE_TOKEN_ID" placeholder:"ID"`
+	PlanetScaleServiceToken   string        `name:"planetscale-service-token" help:"PlanetScale service-token secret for the ADR-0148 index-build fallback. Set via the env var (never on the command line); never logged." env:"PLANETSCALE_SERVICE_TOKEN" placeholder:"SECRET"`
+	PlanetScaleDeployTimeout  time.Duration `name:"planetscale-deploy-timeout" help:"Per-deploy-request deadline for the ADR-0148 index-build fallback (a large table's index deploys via VReplication — real wall-clock, but async and unbounded by errno 3024). On timeout the deploy keeps running in PlanetScale and --resume picks up: the index phase re-probes and rebuilds only what is still missing." default:"1h" placeholder:"DUR"`
+
 	AnalyzeAfter bool `help:"Refresh the target's planner statistics after the migration completes: one per-table ANALYZE (Postgres ANALYZE / MySQL ANALYZE TABLE / SQLite ANALYZE) once constraints and views are in place. A freshly bulk-loaded table has stale statistics, so the first post-cutover queries plan badly until autovacuum or a background ANALYZE catches up — this closes that window at cutover time (pgcopydb runs a per-table VACUUM ANALYZE by default for the same reason). Advisory: a per-table failure WARNs and never fails the migration. Default off."`
 
 	TargetSchema string `help:"Per-source target schema namespace (Postgres-only). When set, every emitted CREATE TABLE / ALTER TABLE / CREATE INDEX / CREATE TYPE prefixes the table reference with this schema. Use to land multiple sluice streams on the same target without table-name collisions (Shape B microservices → analytics warehouse, ADR-0031). The schema is auto-created on the target if it doesn't exist. The control table sluice_cdc_state stays in the DSN's default schema regardless. MySQL operators use a different --target DSN database instead — schemas and databases collapse on MySQL." placeholder:"NAME"`
@@ -490,6 +507,11 @@ func (m *MigrateCmd) run(g *Globals, env *envelopeRun) error {
 	if env.jsonMode && m.DryRun {
 		mig.PlanSink = env.captureMigratePlan
 	}
+	// ADR-0148 (item 67): arm the automatic deploy-request index-build
+	// fallback when the target is planetscale and the control-plane
+	// credentials resolve; nil (unarmed) leaves the index phase
+	// byte-identical to before. See migrate_index_fallback.go.
+	mig.IndexBuildFallback = m.planetScaleIndexFallback()
 	keysetSource := m.KeysetSource
 	if keysetSource == "" {
 		keysetSource = cfg.KeysetSource

@@ -514,6 +514,21 @@ type Migrator struct {
 	// needed.
 	UpfrontIndexes bool
 
+	// IndexBuildFallback is the optional out-of-band index-build channel
+	// (ADR-0148: the PlanetScale deploy-request fallback for the errno-3024
+	// statement-time wall / errno-1105 safe-migrations direct-DDL block),
+	// threaded onto the target SchemaWriter via the optional
+	// [ir.IndexBuildFallbackSetter] surface right after it opens. The
+	// orchestrator stays engine-neutral: the value is composed by the CLI
+	// (which knows the target is PlanetScale and holds the control-plane
+	// credentials) and passed through opaquely; engines without the setter
+	// skip cleanly.
+	//
+	// Zero-value-safe: nil (every programmatic / broker / test caller)
+	// leaves the direct index build byte-identical to before the fallback
+	// existed.
+	IndexBuildFallback ir.IndexBuildFallback
+
 	// Progress is the optional TTY-aware presentation sink (ADR-0155).
 	// When nil (the zero value — every test, library embedder, broker /
 	// fleet path, and the sync cold-start), the orchestrator falls back
@@ -687,6 +702,7 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	migcore.ApplyTargetSchema(sw, m.TargetSchema)
 	applyIndexBuildMem(sw, m.IndexBuildMem)
 	applyIndexBuildParallelism(sw, m.IndexBuildParallelism)
+	applyIndexBuildFallback(sw, m.IndexBuildFallback)
 	if err := applyEnabledPGExtensions(ctx, sw, m.EnabledPGExtensions); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, markFailed(ctx, rc, state, ir.MigrationPhasePending,
 			fmt.Errorf("pipeline: enable PG extensions on target: %w", err)))

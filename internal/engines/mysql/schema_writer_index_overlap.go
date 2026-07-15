@@ -336,7 +336,11 @@ func (w *SchemaWriter) buildEachAsCopiedSerial(ctx context.Context, completedTab
 				// is the one every production PlanetScale/Vitess target takes,
 				// i.e. exactly the platform where reparents happen. The pooled
 				// *sql.DB re-acquires a fresh connection implicitly on retry.
-				if err := w.buildTableIndexesOnPoolWithReparentRetry(ctx, job); err != nil {
+				// The deploy-request fallback wrapper (ADR-0148) around it is
+				// a pass-through when no fallback is configured; when armed it
+				// catches the errno-3024 / errno-1105 wall this exact serial
+				// PlanetScale path is the one to hit.
+				if err := w.buildTableIndexesWithDeployFallback(ctx, job, w.buildTableIndexesOnPoolWithReparentRetry); err != nil {
 					return err
 				}
 			}

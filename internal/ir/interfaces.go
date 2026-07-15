@@ -5,6 +5,7 @@ package ir
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -1886,6 +1887,51 @@ type IndexBuildBudgetSetter interface {
 // surface is a no-op — the net simply doesn't run for that engine.
 type IndexVerifier interface {
 	VerifyIndexes(ctx context.Context, s *Schema) error
+}
+
+// IndexBuildFallback is the OPTIONAL out-of-band channel a [SchemaWriter]
+// routes a deferred secondary-index build through when the target refuses
+// (or would refuse) the direct `ALTER … ADD INDEX` — today the PlanetScale
+// deploy-request fallback for the errno-3024 statement-time wall and the
+// errno-1105 safe-migrations direct-DDL block (ADR-0148, roadmap item 67).
+//
+// The contract is deliberately engine-vocabulary-only: table names the
+// target table, ddls carries the writer's OWN emitted DDL statements for
+// every still-pending index of that table (one call per table, so the
+// implementation can batch them into one control-plane operation), and
+// cause is the direct attempt's failure — nil when the writer routed the
+// table preemptively (e.g. a size probe says the direct attempt is doomed).
+// The implementation must build the indexes durably before returning nil;
+// the orchestrator's [IndexVerifier] net re-checks them afterwards either
+// way.
+//
+// An implementation that discovers it cannot engage (a control-plane
+// prerequisite is missing — no safe migrations, bad credentials) returns
+// an error wrapping [ErrIndexBuildFallbackUnavailable]; the writer then
+// falls back to the pre-fallback behaviour — surfacing the ORIGINAL direct
+// error (with its existing operator hint) for a failed attempt, or running
+// the direct attempt after all for a preemptive route — so the fallback
+// can never make a run fail in a way the status quo would not have.
+type IndexBuildFallback interface {
+	BuildIndexDDL(ctx context.Context, table string, ddls []string, cause error) error
+}
+
+// ErrIndexBuildFallbackUnavailable is the sentinel an [IndexBuildFallback]
+// wraps when its prerequisites don't hold (safe migrations disabled on the
+// production branch, an unusable service token, …). Writers match it with
+// errors.Is and revert to the direct-attempt behaviour; the wrapping error's
+// text carries the human-readable reason for the writer's WARN.
+var ErrIndexBuildFallbackUnavailable = errors.New("index-build fallback unavailable")
+
+// IndexBuildFallbackSetter is the OPTIONAL setter the orchestrator uses to
+// thread a configured [IndexBuildFallback] onto a freshly-opened target
+// [SchemaWriter] before any index phase runs. Engines without the surface
+// skip cleanly; a nil fallback (the zero value every non-CLI construction
+// gets) leaves the writer's behaviour byte-identical to before the
+// fallback existed. MySQL implements it (the PlanetScale flavor is the
+// only current consumer); PG has no statement-time-wall class to route.
+type IndexBuildFallbackSetter interface {
+	SetIndexBuildFallback(f IndexBuildFallback)
 }
 
 // TableAnalyzer is the OPTIONAL surface a [SchemaWriter] implements so
