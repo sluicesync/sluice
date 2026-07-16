@@ -136,6 +136,7 @@ var (
 	// perf/telemetry surfaces that would silently degrade.
 	_ ir.DSNValidator              = Engine{}
 	_ ir.SourceHostAdvisor         = Engine{}
+	_ ir.SourceProbedAdvisor       = Engine{}
 	_ ir.IndexVerifier             = (*SchemaWriter)(nil)
 	_ ir.TransientClassifier       = (*SchemaWriter)(nil)
 	_ ir.GrowGateSetter            = (*RowWriter)(nil)

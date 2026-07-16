@@ -185,13 +185,21 @@ func (e Engine) openBinlogSnapshotStreamConcurrent(ctx context.Context, dsn stri
 	conns, file, pos, serverUUID, err := acquireConsistentSnapshot(ctx, db, n)
 	if err != nil {
 		if errors.Is(err, errFTWRLUnavailable) {
+			// "Grant RELOAD" is a dead end on AWS RDS (the master user
+			// holds it; the platform blocks FTWRL itself) — name the
+			// platform reality there instead of unactionable advice.
+			remedy := "needs the RELOAD privilege; grant it to the source user to re-enable, or set " +
+				"--copy-table-parallelism=1 to opt into serial and silence this."
+			if isRDSMySQLAddr(cfg.Addr) {
+				remedy = "needs FLUSH TABLES WITH READ LOCK, which AWS RDS blocks regardless of grants " +
+					"(the master user already holds RELOAD) — this fallback is EXPECTED on RDS; set " +
+					"--copy-table-parallelism=1 to opt into serial and silence this."
+			}
 			slog.WarnContext(ctx,
 				"mysql: snapshot(concurrent): FLUSH TABLES WITH READ LOCK failed; "+
 					"falling back to the SERIAL single-snapshot cold-copy — cross-table "+
 					"concurrency DISABLED, consistency preserved. The N-way concurrent "+
-					"cold-copy (the default since the perf-parity gap-3 chunk) needs the "+
-					"RELOAD privilege; grant it to the source user to re-enable, or set "+
-					"--copy-table-parallelism=1 to opt into serial and silence this.",
+					"cold-copy (the default since the perf-parity gap-3 chunk) "+remedy,
 				slog.Int("requested_parallelism", n),
 				slog.String("error", err.Error()))
 			_ = db.Close()

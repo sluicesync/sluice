@@ -258,10 +258,17 @@ func (e Engine) openBackupSnapshotCoordinated(ctx context.Context, cfg *gomysql.
 	}
 	if _, err := coord.ExecContext(ctx, "FLUSH TABLES WITH READ LOCK"); err != nil {
 		// The common managed-tier case: the role lacks RELOAD /
-		// FLUSH_TABLES. Serial is the safe, correct fallback (no LOCK
-		// TABLES in v1). Loud INFO names the reason.
+		// FLUSH_TABLES — except on AWS RDS, where the master user holds
+		// RELOAD and the platform blocks FTWRL itself, so the likely-
+		// cause parenthetical is provider-aware. Serial is the safe,
+		// correct fallback (no LOCK TABLES in v1). Loud INFO names the
+		// reason.
+		cause := "the source role likely lacks the RELOAD privilege"
+		if isRDSMySQLAddr(cfg.Addr) {
+			cause = "AWS RDS blocks FLUSH TABLES WITH READ LOCK regardless of grants; the serial fallback is expected on RDS"
+		}
 		slog.InfoContext(
-			ctx, "mysql: backup snapshot: FLUSH TABLES WITH READ LOCK denied or failed; falling back to serial single-reader backup (the source role likely lacks the RELOAD privilege)",
+			ctx, "mysql: backup snapshot: FLUSH TABLES WITH READ LOCK denied or failed; falling back to serial single-reader backup ("+cause+")",
 			slog.Int("requested_readers", n),
 			slog.String("err", err.Error()),
 		)

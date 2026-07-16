@@ -347,12 +347,22 @@ func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, 
 	// back to the lock-free capture (the prior behaviour) rather than
 	// failing the run — keyless/least-privilege single-DB users who never
 	// hit the window keep working; the warning tells multi-DB/root users
-	// to grant RELOAD to close the gap.
+	// to grant RELOAD to close the gap. On AWS RDS the grant advice is a
+	// dead end (RDS validation 2026-07-16): the master user HOLDS RELOAD
+	// yet the platform blocks FTWRL itself with 1045 — so the remedy is
+	// provider-aware.
 	locked := false
 	if _, err := conn.ExecContext(ctx, "FLUSH TABLES WITH READ LOCK"); err != nil {
+		remedy := "Grant RELOAD to close this gap."
+		if isRDSMySQLAddr(cfg.Addr) {
+			remedy = "On AWS RDS no grant closes it — the platform blocks FLUSH TABLES WITH READ LOCK " +
+				"even for the master user (which already holds RELOAD); quiesce writers during the snapshot " +
+				"capture if the no-freeze window matters, and configure binlog retention first " +
+				"(CALL mysql.rds_set_configuration('binlog retention hours', 24))."
+		}
 		slog.Warn("mysql: snapshot: FLUSH TABLES WITH READ LOCK failed; "+
 			"capturing snapshot position without a write freeze (a concurrent "+
-			"commit during capture could be lost). Grant RELOAD to close this gap.",
+			"commit during capture could be lost). "+remedy,
 			"error", err)
 	} else {
 		locked = true

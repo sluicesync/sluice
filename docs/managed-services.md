@@ -535,6 +535,35 @@ Open question (unprobed): whether an *attached* binlog-dump connection holds the
 - **Default `sql_mode` includes `ANSI`** — double-quoted strings are *identifiers* on this server. Anything you run manually against the source with `"double quotes"` behaves differently than on a stock MySQL.
 - **`sql_require_primary_key=true`** by default — keyless tables cannot be created on a DO target, and restoring keyless-table dumps there fails until the setting is relaxed.
 
+## AWS RDS for MySQL
+
+**Status**: cold copy + CDC handoff validated live 2026-07-16 (throwaway db.t4g.micro, MySQL 8.4.9). Uses the vanilla `mysql` engine. Aurora MySQL shares the endpoint suffix and the retention procedure below.
+
+### Binlogs purge in ~5-11 minutes on defaults (but the truth is SQL-visible)
+
+With no retention configured, RDS purges each binlog file on a ~5-minute sweep once it has been uploaded by automated backups — observed lifetime **~5-11 minutes per file** — while `@@binlog_expire_logs_seconds` reads 30 days. The variable lies (same class as DigitalOcean), but unlike DO the real setting is visible in SQL: `CALL mysql.rds_show_configuration` → `binlog retention hours`, default NULL ("as soon as possible"). A CDC position older than the window is unrecoverable (`ErrPositionInvalid`), and a cold copy longer than it can livelock auto-resnapshot — RDS's window is *tighter* than DO's.
+
+Before `sync start` / `backup`:
+
+```sql
+CALL mysql.rds_set_configuration('binlog retention hours', 24);  -- max 168 (7 days)
+```
+
+Effective immediately, no restart. **An attached caught-up stream does NOT hold the purger back** (live-proven: files the stream had already read were purged on schedule while it ran) — set the knob first, and note the 168 h cap means paused streams beyond 7 days are impossible on RDS MySQL. Retained binlogs count against allocated storage; on tiny instances set it back to NULL (or lower) after cutover. Automated backups must be ON (retention ≥ 1 day) or RDS disables binary logging entirely.
+
+sluice checks this for you: on `sync`/`backup` runs against an `*.rds.amazonaws.com` host it queries the retention setting and WARNs when it is NULL or under 24 h — a correctly configured source stays silent (detection beats DO's pattern-only advisory, which is the best DO's API-only setting allows).
+
+### Version + parameter-group gotchas
+
+- **MySQL 8.4 default parameter group is CDC-ready** (`binlog_format=ROW`). **MySQL 8.0 defaults to `binlog_format=MIXED`** — create a custom parameter group with `binlog_format=ROW` (dynamic; reconnect, no reboot).
+- `gtid_mode=OFF_PERMISSIVE` by default; sluice's file/pos CDC works as-is.
+
+### Connection + privilege gotchas
+
+- **TLS**: defaults allow plaintext (`require_secure_transport=OFF`). `?tls=true` fails — the RDS CA is not in system roots; pass the public regional bundle via `--source-tls-ca` (`https://truststore.pki.rds.amazonaws.com/<region>/<region>-bundle.pem`). No API call needed (contrast DO, whose CA comes from an authenticated API endpoint).
+- **`FLUSH TABLES WITH READ LOCK` is blocked by the platform even though the master user holds RELOAD** — sluice falls back to serial cold copy and a no-freeze snapshot (WARNs; the messages name the RDS reality on RDS hosts). No grant fixes it; quiesce writers during the snapshot if exactness of the handoff position matters, or accept the WARN on idle sources.
+- The master user has the replication grants CDC needs out of the box.
+
 ## AWS RDS for Postgres
 
 **Status**: Live-validated 2026-07-16 (v0.99.261 validation run, RDS for PostgreSQL 16.14) as a **bulk-migration source** — byte-identical on md5 ground truth including NaN-in-`numeric[]`, ±Infinity, denormal floats, and 2-D arrays with NULL elements. Trigger-CDC (`postgres-trigger`) was validated end-to-end in the same run (that run also surfaced a provider-independent trigger-engine defect — array-column CDC payloads crash-looping the apply — fixed since, with the full array-family matrix pinned). Slot-based CDC was blocked in that run by a sluice-side false refusal — the replication-capability preflight only understood `rolsuper OR rolreplication`, while RDS grants slot creation via `rds_replication` role *membership* (the platform itself was proven slot-capable); the preflight has since been taught the membership model, so slot CDC is expected to work with the master user. Aurora Postgres uses the same role model.
@@ -561,8 +590,9 @@ The following haven't been formally verified but should work on the
 basis of vendor compatibility statements. If you migrate against one
 of these and hit anything sluice-side, please open an issue.
 
-- **AWS RDS for MySQL / Aurora MySQL** — uses the vanilla `mysql`
-  engine.
+- **Aurora MySQL** — uses the vanilla `mysql` engine. Shares RDS for
+  MySQL's endpoint suffix and `mysql.rds_set_configuration` retention
+  procedure; see the validated RDS MySQL section above.
 - **Aurora Postgres** — uses the vanilla `postgres` engine. Shares
   RDS for Postgres's role model and parameter-group settings
   (`rds.logical_replication=1`); see the validated RDS section above.

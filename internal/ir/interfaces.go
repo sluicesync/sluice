@@ -1340,6 +1340,25 @@ type SourceHostAdvisor interface {
 	SourceHostAdvisories(dsn string, cdc bool) []SourceHostAdvisory
 }
 
+// SourceProbedAdvisor is the connection-probing sibling of
+// [SourceHostAdvisor], for managed-host classes where the ground truth
+// is QUERYABLE in-session — detection beats pattern-guessing: the host
+// pattern only gates WHETHER to probe (so non-matching hosts cost
+// nothing), and the probe result decides WHAT to say, so a correctly
+// configured host stays silent instead of collecting a blind WARN on
+// every run. Contrast [SourceHostAdvisor]'s DigitalOcean advisory,
+// which MUST warn unconditionally because DO's retention truth is not
+// SQL-visible; AWS RDS MySQL exposes its real retention via
+// mysql.rds_configuration, so its advisory probes first.
+//
+// The orchestrator calls it from the same chokepoint as
+// SourceHostAdvisories, with the same cdc gate. A probe failure must
+// degrade to a conservative advisory (or silence), never block the
+// run. Engines that don't implement the surface are a silent no-op.
+type SourceProbedAdvisor interface {
+	SourceProbedAdvisories(ctx context.Context, dsn string, cdc bool) []SourceHostAdvisory
+}
+
 // ReshardReopener is the optional surface a [CDCReader] implements to
 // follow a source reshard (a Vitess shard split / merge / MoveTables)
 // without losing or duplicating events across the seam (ADR-0094).
