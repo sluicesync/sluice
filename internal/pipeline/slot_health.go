@@ -47,6 +47,12 @@ package pipeline
 // mattered most (observed live on PG16). The latch lives for the probe
 // attachment's lifetime, i.e. one runOnce attempt: a restart (including
 // an auto-re-snapshot restart) re-attaches the probe with fresh state.
+// "Once" means once DELIVERED for the notification half (audit
+// 2026-07-16 M1.2, the ADR-0157 latch-on-delivery principle): the slog
+// ERROR latches immediately (a log write cannot fail), but if the sink
+// was dead when the terminal page fired, the loop re-attempts delivery
+// on every subsequent tick until one lands — never more than one
+// successful delivery, never zero because of a transient sink outage.
 //
 // Roadmap item 64a promotes the same crossings to the notification
 // sinks (webhook/Slack/SMTP) — see slot_health_notify.go and the
@@ -190,6 +196,19 @@ type slotHealthState struct {
 	// attachment (one runOnce attempt); a restart re-attaches with
 	// fresh state.
 	terminalLatched bool
+
+	// pendingTerminalPage carries a terminal page whose SINK delivery
+	// failed at the moment it fired (audit 2026-07-16 M1.2, mirroring
+	// the ADR-0157 schema-drift latch-on-delivery fix). The slog ERROR
+	// half of a terminal emission cannot fail and latches immediately
+	// (terminalLatched above), but the notification is the operator's
+	// ONLY page for an unrecoverable event — a transiently dead sink at
+	// exactly that moment must not swallow it forever. Non-nil means the
+	// probe loop re-attempts delivery of THIS notification on every
+	// subsequent tick until one lands, then clears it; non-terminal
+	// pages never park here (they re-fire naturally via the rate-limit
+	// window).
+	pendingTerminalPage *notify.Notification
 
 	// pendingDowngradeKind / pendingDowngradeArmed implement the
 	// LOW-D0-18 hysteresis: a DOWNGRADE transition (85%→70%,
@@ -611,6 +630,17 @@ func slotHealthProbeLoop(
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
+			if state.pendingTerminalPage != nil {
+				// M1.2 latch-on-delivery: the terminal page fired (slog)
+				// but its sink delivery failed. Re-attempt each tick until
+				// it lands — the terminal latch already silences every
+				// evaluator decision, so the probe itself has nothing left
+				// to say and is skipped while the retry is outstanding.
+				if deliverSlotHealthNotification(ctx, notifier, streamID, slotName, *state.pendingTerminalPage) {
+					state.pendingTerminalPage = nil
+				}
+				continue
+			}
 			snap, ok, err := reporter.SlotHealth(ctx, slotName)
 			if err != nil {
 				probeFailures++
@@ -660,16 +690,29 @@ func slotHealthProbeLoop(
 				if dec.Emit {
 					gone := ir.SlotHealth{SlotName: slotName}
 					emitSlotHealthWarning(ctx, gone, streamID, dec)
-					notifySlotHealthCrossing(ctx, notifier, streamID, gone, dec)
+					undelivered := notifySlotHealthCrossing(ctx, notifier, streamID, gone, dec)
 					recordSlotHealthEmission(state, dec, now)
+					parkTerminalPage(state, dec, undelivered)
 				}
 				continue
 			}
 			dec := evaluateSlotHealth(snap, state, thresholds, now)
 			emitSlotHealthWarning(ctx, snap, streamID, dec)
-			notifySlotHealthCrossing(ctx, notifier, streamID, snap, dec)
+			undelivered := notifySlotHealthCrossing(ctx, notifier, streamID, snap, dec)
 			recordSlotHealthEmission(state, dec, now)
+			parkTerminalPage(state, dec, undelivered)
 		}
+	}
+}
+
+// parkTerminalPage records an undelivered TERMINAL page for the loop's
+// per-tick delivery retry (M1.2 — see slotHealthState.pendingTerminalPage).
+// Non-terminal undelivered pages are deliberately dropped: they re-fire
+// through the rate-limit window on their own, so parking them would only
+// duplicate that mechanism.
+func parkTerminalPage(st *slotHealthState, dec slotWarningDecision, undelivered *notify.Notification) {
+	if undelivered != nil && isTerminalSlotWarning(dec.Kind) {
+		st.pendingTerminalPage = undelivered
 	}
 }
 

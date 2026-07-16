@@ -71,6 +71,10 @@ sluice migrate --source-driver mydumper --source /path/to/dumpdir \
 
 (See ADR-0161 for the mydumper reader's contract: per-table schema files, extended-INSERT data chunks, gz/zstd, UTF-8-compatible charsets only, faithful escape/hex binary decode.) Handing the wrong input to the wrong driver — a mydumper directory to `csv`, a CSV to `mydumper`, a binary SQLite `.db` to `csv`, a gzipped/UTF-16 file anywhere — is refused with `SLUICE-E-SOURCE-WRONG-DRIVER`, naming the right driver or preparation step.
 
+### The pscale-dump count-less blind spot (zero-chunk tables)
+
+A table whose dump directory carries a schema file but **zero data chunk files** streams as an **empty table**. That shape is legitimate: real mydumper writes no data file for an empty table unless `--build-empty-files` is set (ground-truthed against v1.0.3). But a dump whose chunk files were all lost or deleted looks *identical* — and whether sluice can tell the two apart depends on the dump's own row counts. Modern mydumper (≥0.12) records per-table `rows =` counts in the dump-wide metadata, so a genuinely empty table is corroborated (`rows = 0`, silent) while a mutilated one contradicts itself (`rows > 0` with no chunks — sluice WARNs naming the recorded count, and the post-stream row-count tripwire fires as well). **`pscale database dump` records no row counts at all** (its per-table `-metadata` companions are empty), so for those dumps a wholesale chunk-file loss is undetectable from the directory alone: sluice WARNs on every count-less zero-chunk table saying it cannot tell the difference. If a WARNed table should have rows, cross-check the live source (`SELECT COUNT(*)`) before trusting the migration — and prefer keeping dump directories intact (don't hand-prune files inside them).
+
 ## Related docs
 
 - `docs/operator/sqlite-d1-import.md` — SQLite `.db` / `.sql`-dump / Cloudflare D1 sources (the machinery the flat-file staging rides).

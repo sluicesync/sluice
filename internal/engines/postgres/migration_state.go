@@ -82,21 +82,34 @@ func newMigrationStateStore(db *sql.DB, schema string) *MigrationStateStore {
 				// insert, preserved on conflict by simply not being in
 				// the SET list — the "set once" semantics resume runs
 				// rely on.
+				//
+				// UTC contract (audit 2026-07-16 M1.3, the task-#44
+				// lease-TZ class): started_at/updated_at are naive
+				// TIMESTAMP columns and pgx reads a naive timestamp back
+				// as UTC digits. CURRENT_TIMESTAMP casts through the
+				// SESSION TimeZone, so on a server set to, say,
+				// America/Los_Angeles the stored digits were 7h behind
+				// what the reader assumed — the backfill concurrent-run
+				// heartbeat guard (pipeline.backfill, 5m freshness on
+				// UpdatedAt) then missed live runs on TZ-behind servers
+				// and over-refused for hours on TZ-ahead ones. Writing
+				// timezone('utc', now()) — naive UTC digits — makes the
+				// stored value exactly what the read path assumes.
 				UpsertHeader: "INSERT INTO " + hdr + " " +
 					"(migration_id, phase, table_progress, state_format, started_at, updated_at, last_error) " +
-					"VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, $5) " +
+					"VALUES ($1, $2, $3, $4, timezone('utc', now()), timezone('utc', now()), $5) " +
 					"ON CONFLICT (migration_id) DO UPDATE SET " +
 					"phase = EXCLUDED.phase, " +
 					"table_progress = EXCLUDED.table_progress, " +
 					"state_format = EXCLUDED.state_format, " +
-					"updated_at = CURRENT_TIMESTAMP, " +
+					"updated_at = timezone('utc', now()), " +
 					"last_error = EXCLUDED.last_error",
 				UpsertProgressRow: "INSERT INTO " + prog + " " +
 					"(migration_id, table_name, progress, updated_at) " +
-					"VALUES ($1, $2, $3, CURRENT_TIMESTAMP) " +
+					"VALUES ($1, $2, $3, timezone('utc', now())) " +
 					"ON CONFLICT (migration_id, table_name) DO UPDATE SET " +
 					"progress = EXCLUDED.progress, " +
-					"updated_at = CURRENT_TIMESTAMP",
+					"updated_at = timezone('utc', now())",
 				MarkUpgraded: "UPDATE " + hdr +
 					" SET table_progress = $1, state_format = $2 WHERE migration_id = $3",
 				DeleteHeader:       "DELETE FROM " + hdr + " WHERE migration_id = $1",
@@ -126,14 +139,19 @@ func (s *MigrationStateStore) Close() error {
 func (s *MigrationStateStore) EnsureControlTable(ctx context.Context) error {
 	hdr := quoteIdent(s.schema) + "." + quoteIdent(migrateStateTableName)
 	prog := quoteIdent(s.schema) + "." + quoteIdent(migrateProgressTableName)
+	// Timestamp defaults use timezone('utc', now()) — naive UTC digits —
+	// not CURRENT_TIMESTAMP, whose session-TZ cast skews the read-back
+	// (M1.3; see the UpsertHeader comment). The upserts always supply
+	// both columns explicitly, so the defaults only matter for rows
+	// written by hand or by future statements that omit them.
 	hdrDDL := `
 		CREATE TABLE IF NOT EXISTS ` + hdr + ` (
 			migration_id    VARCHAR(255) NOT NULL,
 			phase           VARCHAR(32)  NOT NULL,
 			table_progress  TEXT         NULL,
 			state_format    INT          NOT NULL DEFAULT 1,
-			started_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			started_at      TIMESTAMP    NOT NULL DEFAULT (timezone('utc', now())),
+			updated_at      TIMESTAMP    NOT NULL DEFAULT (timezone('utc', now())),
 			last_error      TEXT         NULL,
 			PRIMARY KEY (migration_id)
 		)`
@@ -150,7 +168,7 @@ func (s *MigrationStateStore) EnsureControlTable(ctx context.Context) error {
 			migration_id    VARCHAR(255) NOT NULL,
 			table_name      VARCHAR(255) NOT NULL,
 			progress        TEXT         NOT NULL,
-			updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at      TIMESTAMP    NOT NULL DEFAULT (timezone('utc', now())),
 			PRIMARY KEY (migration_id, table_name)
 		)`
 	if _, err := s.db.ExecContext(ctx, progDDL); err != nil {

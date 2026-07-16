@@ -1259,7 +1259,12 @@ func (b *IncrementalBackup) alignEncryption(ctx context.Context, parent *irbacku
 	case parentEnc == nil && b.Encryption == nil:
 		return nil, nil
 	case parentEnc == nil && b.Encryption != nil:
-		return nil, errors.New("incremental: parent chain is plaintext but --encrypt was supplied; cannot extend a plaintext chain with encrypted incrementals")
+		// Coded like its sibling below (audit 2026-07-16 M3.1): both
+		// directions of the plaintext/encrypted conflict key the same
+		// operator retry loop.
+		return nil, sluicecode.Wrap(sluicecode.CodeBackupEncryptionMismatch,
+			"drop --encrypt to extend this plaintext chain, or start a fresh full backup with --encrypt to begin an encrypted chain",
+			errors.New("incremental: parent chain is plaintext but --encrypt was supplied; cannot extend a plaintext chain with encrypted incrementals"))
 	case parentEnc != nil && b.Encryption == nil:
 		// Write-side face of the read-side preflights (audit M3): same
 		// coded class so an operator's retry loop keys on one code.
@@ -1296,9 +1301,13 @@ func (b *IncrementalBackup) alignEncryption(ctx context.Context, parent *irbacku
 	// operator's (mismatched) mode. Inherit it when omitted so
 	// resolveChunkCEK agrees with the chain.
 	if b.Encryption.Mode != "" && b.Encryption.Mode != mode {
-		return nil, fmt.Errorf("incremental: --encrypt-mode=%q conflicts with the chain's encryption mode %q; "+
-			"an encrypted chain uses one mode for every segment (omit --encrypt-mode to inherit it, or start a fresh full backup)",
-			b.Encryption.Mode, mode)
+		// The Bug-179 mode-conflict twin, coded with the same class as
+		// the other encryption-state conflicts in this function (M3.1).
+		return nil, sluicecode.Wrap(sluicecode.CodeBackupEncryptionMismatch,
+			"omit --encrypt-mode to inherit the chain's recorded mode, or start a fresh full backup to choose a new one",
+			fmt.Errorf("incremental: --encrypt-mode=%q conflicts with the chain's encryption mode %q; "+
+				"an encrypted chain uses one mode for every segment (omit --encrypt-mode to inherit it, or start a fresh full backup)",
+				b.Encryption.Mode, mode))
 	}
 	b.Encryption.Mode = mode
 	if mode == crypto.EncryptModePerChain {

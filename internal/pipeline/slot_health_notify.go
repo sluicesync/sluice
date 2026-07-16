@@ -61,7 +61,8 @@ func makeSlotHealthNotification(streamID string, snap ir.SlotHealth, dec slotWar
 		level = notify.LevelCritical
 		title = fmt.Sprintf("Replication slot past retention cap on sync %q — invalidation at next checkpoint", streamID)
 	case slotWarnLost:
-		// Terminal (MED-D0-9): this page fires once and latches — it is
+		// Terminal (MED-D0-9): this page fires once — once DELIVERED
+		// (M1.2: a dead sink retries per tick) — and latches; it is
 		// the only one the operator will get for this slot's loss.
 		level = notify.LevelCritical
 		title = fmt.Sprintf("Replication slot LOST on sync %q — re-snapshot required", streamID)
@@ -90,19 +91,42 @@ func makeSlotHealthNotification(streamID string, snap ir.SlotHealth, dec slotWar
 // a notify error is logged at WARN and SWALLOWED, never propagated — the
 // notification is advisory, and a dead sink must not disturb the probe
 // loop or the sync it watches.
-func notifySlotHealthCrossing(ctx context.Context, notifier notify.Notifier, streamID string, snap ir.SlotHealth, dec slotWarningDecision) {
+//
+// Returns the built notification when a sink WAS configured but delivery
+// failed (nil otherwise — delivered, no sink, or nothing to send). The
+// probe loop parks a TERMINAL undelivered page for per-tick delivery
+// retries (audit 2026-07-16 M1.2); non-terminal pages re-fire through
+// the rate-limit window on their own, so callers ignore those.
+func notifySlotHealthCrossing(ctx context.Context, notifier notify.Notifier, streamID string, snap ir.SlotHealth, dec slotWarningDecision) (undelivered *notify.Notification) {
 	if notifier == nil || !dec.Emit {
-		return
+		return nil
 	}
 	n := makeSlotHealthNotification(streamID, snap, dec, time.Now())
+	if !deliverSlotHealthNotification(ctx, notifier, streamID, snap.SlotName, n) {
+		return &n
+	}
+	return nil
+}
+
+// deliverSlotHealthNotification attempts one sink delivery, reporting
+// whether it landed. A nil notifier reports true — with no sink there is
+// nothing left to retry. The error handling is the shared slot-health
+// failure-isolation contract: logged at WARN, swallowed, never
+// propagated.
+func deliverSlotHealthNotification(ctx context.Context, notifier notify.Notifier, streamID, slotName string, n notify.Notification) bool {
+	if notifier == nil {
+		return true
+	}
 	if err := notifier.Notify(ctx, n); err != nil {
 		slog.WarnContext(
 			ctx, "slot-health alert: notify failed (advisory only, sync unaffected)",
 			slog.String("stream_id", streamID),
-			slog.String("slot", snap.SlotName),
+			slog.String("slot", slotName),
 			slog.String("error", err.Error()),
 		)
+		return false
 	}
+	return true
 }
 
 // makeSlotProbeFailureNotification maps a sustained probe outage

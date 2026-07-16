@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -115,4 +116,30 @@ func TestResolveWriteSigner_ExclusivityBeforeKMSBuild(t *testing.T) {
 			t.Fatalf("err = %v; want the unknown-provider refusal from buildKMSSigner", err)
 		}
 	})
+}
+
+// TestBuildMaintenanceSigner_Exclusivity is the audit 2026-07-16 M3.2
+// pin: the maintenance door (compact/prune re-sign) refuses the
+// --sign + --sign-key combo exactly like resolveWriteSigner, and does
+// so BEFORE any --sign-key resolution — same probe technique as the
+// write-side pin (a kms:// spec whose provider would itself refuse:
+// seeing the exclusivity error proves the build was never entered).
+// The store is nil on purpose: the refusal must fire before any store
+// read too.
+func TestBuildMaintenanceSigner_Exclusivity(t *testing.T) {
+	e := &EncryptionFlags{Sign: true, SignKey: "kms://bogus-provider/some-key"}
+	_, err := e.buildMaintenanceSigner(context.Background(), nil)
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("err = %v; want the --sign/--sign-key exclusivity refusal", err)
+	}
+	if strings.Contains(err.Error(), "unknown kms://") {
+		t.Errorf("err = %v reached buildKMSSigner; the exclusivity check must run first", err)
+	}
+
+	// --sign-key alone keeps working through the maintenance door.
+	solo := &EncryptionFlags{SignKey: "kms://bogus-provider/some-key"}
+	_, err = solo.buildMaintenanceSigner(context.Background(), nil)
+	if err == nil || !strings.Contains(err.Error(), "unknown kms:// signing provider") {
+		t.Fatalf("err = %v; want the unknown-provider refusal from buildKMSSigner (proving --sign-key alone still resolves)", err)
+	}
 }

@@ -455,3 +455,110 @@ func TestMigrateShapeGate_SkippedOnResume(t *testing.T) {
 		t.Errorf("resume must re-create idempotently (full set); got %v", tgt.createdTables)
 	}
 }
+
+// TestMigrateShapeGate_CharsetSameEngineMySQL is the audit 2026-07-16
+// M1.6 pin at the gate level: on a same-storage-family MySQL pair, a
+// pre-existing table whose string column resolves to a DIFFERENT
+// charset than the intent (the latin1-vs-utf8mb4 live repro, which
+// pre-fix passed the compare and died mid-copy on the first non-latin1
+// row) refuses PRE-COPY, coded, naming both charsets — while a
+// non-MySQL pair with the same IR stays inert (charset is translation
+// noise cross-engine), and a side that surfaces no charset makes no
+// claim.
+func TestMigrateShapeGate_CharsetSameEngineMySQL(t *testing.T) {
+	mkSchema := func(charset, collation string) *ir.Schema {
+		return &ir.Schema{Tables: []*ir.Table{gateTable(
+			"items",
+			&ir.Column{Name: "id", Type: ir.Integer{Width: 64}},
+			&ir.Column{Name: "name", Type: ir.Varchar{Length: 255, Charset: charset, Collation: collation}, Nullable: true},
+		)}}
+	}
+	utf8Intent := mkSchema("utf8mb4", "utf8mb4_0900_ai_ci")
+	latin1Existing := mkSchema("latin1", "latin1_swedish_ci")
+
+	t.Run("mysql→mysql latin1 pre-existing refuses naming the charset", func(t *testing.T) {
+		m, _ := gateMigrator("mysql", "mysql", latin1Existing)
+		_, err := m.phasePlanExistingTables(context.Background(), utf8Intent)
+		if err == nil {
+			t.Fatal("want the coded charset refusal; got nil (the pre-fix mid-copy death)")
+		}
+		coded, ok := sluicecode.FromError(err)
+		if !ok || coded.Code != sluicecode.CodeTargetTableShapeMismatch {
+			t.Fatalf("err = %v; want %s", err, sluicecode.CodeTargetTableShapeMismatch)
+		}
+		for _, want := range []string{"CHARACTER SET utf8mb4", "CHARACTER SET latin1"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("refusal %q missing %q", err.Error(), want)
+			}
+		}
+	})
+
+	t.Run("charset-silent side makes no claim (mydumper-shaped IR skips)", func(t *testing.T) {
+		m, _ := gateMigrator("mydumper", "mysql", latin1Existing)
+		got, err := m.phasePlanExistingTables(context.Background(), mkSchema("", ""))
+		if err != nil {
+			t.Fatalf("charset-silent intent must not refuse: %v", err)
+		}
+		if len(got.Tables) != 0 {
+			t.Errorf("equal-modulo-unclaimed-charset table not skipped")
+		}
+	})
+
+	t.Run("pg→pg pair keeps charset out of the compare", func(t *testing.T) {
+		m, _ := gateMigrator("postgres", "postgres", latin1Existing)
+		got, err := m.phasePlanExistingTables(context.Background(), utf8Intent)
+		if err != nil {
+			t.Fatalf("non-MySQL pair must not compare charset: %v", err)
+		}
+		if len(got.Tables) != 0 {
+			t.Errorf("charset-only difference blocked a non-MySQL pair")
+		}
+	})
+}
+
+// TestMigrateShapeGate_PrimaryKeyPresence is the audit 2026-07-16 M1.7
+// pin at the gate level, both directions: a PK-less pre-existing table
+// under a PK-carrying intent refuses coded with the "primary key:
+// expected (…), target has none" phrasing; the reverse (an extra
+// target-side PK the intent doesn't declare) is tolerated with a WARN
+// naming the key, and the table is still skipped.
+func TestMigrateShapeGate_PrimaryKeyPresence(t *testing.T) {
+	intended := &ir.Schema{Tables: []*ir.Table{gateTable("items", gateCols()...)}}
+	pkless := &ir.Schema{Tables: []*ir.Table{{
+		Name:    "items",
+		Columns: gateCols(),
+		// No PrimaryKey — the pre-existing keyless table.
+	}}}
+
+	t.Run("expected PK, target has none → coded refusal", func(t *testing.T) {
+		m, _ := gateMigrator("mysql", "mysql", pkless)
+		_, err := m.phasePlanExistingTables(context.Background(), intended)
+		if err == nil {
+			t.Fatal("want the coded PK-presence refusal; got nil")
+		}
+		coded, ok := sluicecode.FromError(err)
+		if !ok || coded.Code != sluicecode.CodeTargetTableShapeMismatch {
+			t.Fatalf("err = %v; want %s", err, sluicecode.CodeTargetTableShapeMismatch)
+		}
+		if !strings.Contains(err.Error(), "primary key: expected (id), target has none") {
+			t.Errorf("refusal %q missing the named primary-key phrasing", err.Error())
+		}
+	})
+
+	t.Run("extra target-side PK → WARN and skip", func(t *testing.T) {
+		logs := captureLogs(t)
+		m, _ := gateMigrator("mysql", "mysql", intended)
+		got, err := m.phasePlanExistingTables(context.Background(), pkless)
+		if err != nil {
+			t.Fatalf("extra actual-side PK must be tolerated: %v", err)
+		}
+		if len(got.Tables) != 0 {
+			t.Errorf("table with extra PK not skipped; create set = %d tables", len(got.Tables))
+		}
+		out := logs.String()
+		if !strings.Contains(out, "PRIMARY KEY the source schema does not declare") ||
+			!strings.Contains(out, "(id)") {
+			t.Errorf("tolerated-PK WARN missing or not naming the key:\n%s", out)
+		}
+	})
+}

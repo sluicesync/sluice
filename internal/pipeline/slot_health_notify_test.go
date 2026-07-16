@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -326,6 +327,110 @@ func TestSlotHealthProbeLoop_DeliversNotification(t *testing.T) {
 	}
 	if !strings.Contains(n.Body, `slot "sluice_slot"`) {
 		t.Errorf("Body %q should name the slot", n.Body)
+	}
+}
+
+// healingNotifier fails every Notify until healed, tracking attempts and
+// successful deliveries separately — the M1.2 dead-sink-then-heal double.
+type healingNotifier struct {
+	mu        sync.Mutex
+	attempts  int
+	delivered []notify.Notification
+	dead      bool
+}
+
+func (h *healingNotifier) Notify(_ context.Context, n notify.Notification) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.attempts++
+	if h.dead {
+		return errors.New("sink down")
+	}
+	h.delivered = append(h.delivered, n)
+	return nil
+}
+
+func (h *healingNotifier) Name() string { return "healing" }
+
+func (h *healingNotifier) setDead(dead bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.dead = dead
+}
+
+func (h *healingNotifier) counts() (attempts, delivered int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.attempts, len(h.delivered)
+}
+
+// TestSlotHealthProbeLoop_TerminalPageRetriesUntilDelivered is the audit
+// 2026-07-16 M1.2 pin (the ADR-0157 latch-on-delivery principle applied
+// to the slot-health terminal page): a slot that goes terminal while the
+// sink is DEAD keeps re-attempting delivery on subsequent ticks, and once
+// the sink heals the operator receives EXACTLY ONE terminal CRITICAL —
+// never zero (pre-fix: the latch advanced before delivery, so a transient
+// sink outage at the loss moment swallowed the only page forever), and
+// never a duplicate after it lands.
+func TestSlotHealthProbeLoop_TerminalPageRetriesUntilDelivered(t *testing.T) {
+	r := &stubSlotHealthReporter{}
+	lost := pressureSnap(0, 100)
+	lost.WALStatus = "lost"
+	r.setSnap(lost, true)
+	sink := &healingNotifier{}
+	sink.setDead(true)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		slotHealthProbeLoop(ctx, r, "sluice_slot", "stream-t", DefaultSlotHealthThresholds(), 5*time.Millisecond, sink)
+		close(done)
+	}()
+
+	// The dead-sink phase: attempts keep accruing (the per-tick retry),
+	// deliveries stay at zero.
+	deadline := time.After(5 * time.Second)
+	for {
+		attempts, delivered := sink.counts()
+		if delivered != 0 {
+			t.Fatalf("dead sink delivered a page: %d", delivered)
+		}
+		if attempts >= 3 {
+			break // ≥3 attempts proves the retry, not a single fire-and-forget
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("terminal page not retried: attempts = %d; want >= 3 within 5s", attempts)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	// Heal the sink: exactly one delivery lands, then the latch holds.
+	sink.setDead(false)
+	deadline = time.After(5 * time.Second)
+	for {
+		if _, delivered := sink.counts(); delivered >= 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("healed sink never received the terminal page within 5s")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	time.Sleep(100 * time.Millisecond) // many more ticks: no re-page
+	cancel()
+	<-done
+
+	_, delivered := sink.counts()
+	if delivered != 1 {
+		t.Fatalf("dead-sink-then-heal delivered %d terminal pages; want exactly 1", delivered)
+	}
+	sink.mu.Lock()
+	n := sink.delivered[0]
+	sink.mu.Unlock()
+	if n.Level != notify.LevelCritical || !strings.Contains(n.Title, "LOST") {
+		t.Errorf("delivered page = %+v; want the terminal slot-LOST critical", n)
 	}
 }
 

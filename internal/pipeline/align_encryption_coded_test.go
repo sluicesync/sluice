@@ -46,8 +46,23 @@ func TestAlignEncryption_MismatchIsCoded(t *testing.T) {
 		},
 	}
 
+	// A plaintext parent (no ChainEncryption anywhere in its chain) for
+	// the reverse-direction conflict (audit 2026-07-16 M3.1).
+	plaintextParent := &irbackup.Manifest{Kind: "full"}
+	alignAgainst := map[string]func(parent *irbackup.Manifest, enc *lineage.BackupEncryption) ([]byte, error){
+		"incremental": func(parent *irbackup.Manifest, enc *lineage.BackupEncryption) ([]byte, error) {
+			b := &IncrementalBackup{segStore: newMemStore(), Encryption: enc}
+			return b.alignEncryption(ctx, parent)
+		},
+		"stream": func(parent *irbackup.Manifest, enc *lineage.BackupEncryption) ([]byte, error) {
+			b := &BackupStream{segStore: newMemStore(), Encryption: enc}
+			return b.alignEncryption(ctx, parent)
+		},
+	}
+
 	for name, alignFn := range align {
 		alignFn := alignFn
+		alignParent := alignAgainst[name]
 		t.Run(name, func(t *testing.T) {
 			t.Run("encrypted parent + no --encrypt → coded mismatch", func(t *testing.T) {
 				_, err := alignFn(nil)
@@ -57,6 +72,12 @@ func TestAlignEncryption_MismatchIsCoded(t *testing.T) {
 			t.Run("envelope kek_mode differs from the chain's → coded mismatch", func(t *testing.T) {
 				enc := &lineage.BackupEncryption{Envelope: cheapTestEnvelope(t)} // passphrase mode vs recorded aws-kms
 				_, err := alignFn(enc)
+				assertCoded(t, err, sluicecode.CodeBackupEncryptionMismatch)
+			})
+
+			t.Run("plaintext parent + --encrypt → coded mismatch (M3.1)", func(t *testing.T) {
+				enc := &lineage.BackupEncryption{Envelope: cheapTestEnvelope(t)}
+				_, err := alignParent(plaintextParent, enc)
 				assertCoded(t, err, sluicecode.CodeBackupEncryptionMismatch)
 			})
 		})

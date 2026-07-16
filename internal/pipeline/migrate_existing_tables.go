@@ -119,6 +119,15 @@ func (m *Migrator) phasePlanExistingTables(ctx context.Context, schema *ir.Schem
 		expTables[t.Name] = t
 	}
 
+	// Charset/collation joins the compare only for same-storage-family
+	// MySQL pairs (audit 2026-07-16 M1.6): there both catalogs resolve
+	// them to concrete values, and a conflict (the latin1 pre-existing
+	// table under a utf8mb4 intent) died mid-copy pre-fix. Cross-engine
+	// pairs keep charset out — translation noise, not drift.
+	shapeOpts := irdiff.ShapeCompareOptions{
+		CompareCharset: translate.IsMySQLFamily(m.Source.Name()) && translate.IsMySQLFamily(m.Target.Name()),
+	}
+
 	skip := make(map[string]struct{})
 	var refusals []string
 	for _, t := range schema.Tables {
@@ -126,8 +135,17 @@ func (m *Migrator) phasePlanExistingTables(ctx context.Context, schema *ir.Schem
 		if !exists {
 			continue
 		}
-		mismatches := irdiff.TableColumnShape(expTables[t.Name], act)
+		mismatches := irdiff.TableColumnShapeWithOptions(expTables[t.Name], act, shapeOpts)
 		if len(mismatches) == 0 {
+			if pk, extra := irdiff.UnexpectedPrimaryKey(expTables[t.Name], act); extra {
+				// M1.7's tolerated direction: an extra target-side PK
+				// doesn't stop the copy, but a duplicate-carrying source
+				// will fail loudly on it mid-copy — say so up front.
+				slog.WarnContext(ctx,
+					"migration: pre-existing target table carries a PRIMARY KEY the source schema does not declare — tolerated (the copy proceeds), but source rows that collide on it will fail loudly mid-copy; drop the key or --exclude-table if that is not what you want",
+					slog.String("table", t.Name),
+					slog.String("primary_key", pk))
+			}
 			skip[t.Name] = struct{}{}
 			slog.InfoContext(ctx,
 				"migration: target table exists with matching column shape — skipping create",
@@ -205,7 +223,9 @@ func (m *Migrator) readTargetTablesForShapeGate(ctx context.Context) (map[string
 }
 
 // renderShapeMismatch renders one table's refusal fragment: the table
-// name plus the first few differing columns (expected vs actual).
+// name plus the first few differing columns (expected vs actual). The
+// M1.7 primary-key-presence sentinel gets its own phrasing — it is not
+// a column.
 func renderShapeMismatch(table string, mismatches []irdiff.ColumnShapeMismatch) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "table %q (", table)
@@ -216,6 +236,10 @@ func renderShapeMismatch(table string, mismatches []irdiff.ColumnShapeMismatch) 
 		}
 		if i > 0 {
 			b.WriteString(", ")
+		}
+		if mm.Column == irdiff.PrimaryKeyMismatchColumn {
+			fmt.Fprintf(&b, "primary key: expected %s, target has %s", mm.Expected, mm.Actual)
+			continue
 		}
 		fmt.Fprintf(&b, "column %q: want %s, target has %s", mm.Column, mm.Expected, mm.Actual)
 	}

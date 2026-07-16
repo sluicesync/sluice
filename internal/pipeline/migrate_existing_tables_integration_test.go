@@ -138,6 +138,32 @@ func TestMigrate_ExistingTableGate_MySQL(t *testing.T) {
 			t.Errorf("gate_fresh created despite the upfront refusal (n=%d, err=%v)", n, err)
 		}
 	})
+
+	t.Run("latin1 pre-created table refuses pre-copy naming the charset", func(t *testing.T) {
+		// Audit 2026-07-16 M1.6, the live repro: a pre-existing table
+		// identical in every compared axis EXCEPT charset (latin1 vs the
+		// utf8mb4 intent) pre-fix passed the gate and died mid-copy on
+		// the first non-latin1 byte. Same column set as the source DDL,
+		// same PK — only the charset differs — proving the refusal is
+		// the CHARSET compare, not a column/type/PK mismatch.
+		applyMySQLDDL(t, sourceDSN, `DROP DATABASE target_db; CREATE DATABASE target_db;`)
+		applyMySQLDDL(t, targetDSN, strings.Replace(existingGateMySQLDDL,
+			"DEFAULT CHARSET=utf8mb4", "DEFAULT CHARSET=latin1", 1))
+
+		mig := &Migrator{Source: mysqlEng, Target: mysqlEng, SourceDSN: sourceDSN, TargetDSN: targetDSN, MigrationID: "gate-charset"}
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		err := mig.Run(ctx)
+		assertShapeMismatchRefusal(t, err, "gate_users")
+		for _, want := range []string{"CHARACTER SET utf8mb4", "CHARACTER SET latin1"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("refusal %q missing %q (must name both charsets)", err.Error(), want)
+			}
+		}
+
+		db := openSQLDB(t, "mysql", targetDSN)
+		assertRowCount(t, db, "gate_users", 0)
+	})
 }
 
 // existingGatePGDDL is the shared table shape for the PG leg — again

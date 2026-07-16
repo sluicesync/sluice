@@ -31,15 +31,7 @@ func execBranchDDL(ctx context.Context, pw *api.BranchPassword, database, ddl st
 	if pw == nil || pw.AccessHostURL == "" {
 		return errors.New("expand-contract: branch password carries no access host")
 	}
-	cfg := gomysql.NewConfig()
-	cfg.User = pw.Username
-	cfg.Passwd = pw.PlainText
-	cfg.Net = "tcp"
-	cfg.Addr = pw.AccessHostURL // port 3306 default; PlanetScale hosts require TLS
-	cfg.DBName = database
-	cfg.TLSConfig = "true"
-
-	connector, err := gomysql.NewConnector(cfg)
+	connector, err := gomysql.NewConnector(branchMySQLConfig(pw, database))
 	if err != nil {
 		return fmt.Errorf("expand-contract: build branch connection: %w", err)
 	}
@@ -51,6 +43,26 @@ func execBranchDDL(ctx context.Context, pw *api.BranchPassword, database, ddl st
 		return fmt.Errorf("expand-contract: branch DDL failed (%s): %w", ddl, err)
 	}
 	return nil
+}
+
+// branchMySQLConfig builds the go-sql-driver config for a direct
+// connection to a PlanetScale dev branch from a just-minted branch
+// password: TCP + mandatory TLS, port 3306 by default (the driver's
+// normalize fills it in when AccessHostURL carries none). The single
+// definition feeds both execBranchDDL (as a connector) and
+// ensureStateOnBranch (as a FormatDSN string) — the latter previously
+// spliced the credentials through fmt.Sprintf, where a minted password
+// containing DSN metacharacters ('@', '/', ':', '?') silently corrupted
+// the parse (audit 2026-07-16 M3.6).
+func branchMySQLConfig(pw *api.BranchPassword, database string) *gomysql.Config {
+	cfg := gomysql.NewConfig()
+	cfg.User = pw.Username
+	cfg.Passwd = pw.PlainText
+	cfg.Net = "tcp"
+	cfg.Addr = pw.AccessHostURL
+	cfg.DBName = database
+	cfg.TLSConfig = "true"
+	return cfg
 }
 
 // ensureStateOnBranch creates sluice's migrate-state control tables on
@@ -74,9 +86,7 @@ func ensureStateOnBranch(ctx context.Context, engine ir.Engine, pw *api.BranchPa
 	if !ok {
 		return fmt.Errorf("expand-contract: engine %q does not implement ir.MigrationStateStoreOpener", engine.Name())
 	}
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:3306)/%s?tls=true",
-		pw.Username, pw.PlainText, pw.AccessHostURL, database)
-	store, err := opener.OpenMigrationStateStore(ctx, dsn)
+	store, err := opener.OpenMigrationStateStore(ctx, branchMySQLConfig(pw, database).FormatDSN())
 	if err != nil {
 		return fmt.Errorf("expand-contract: open migrate-state store on dev branch: %w", err)
 	}

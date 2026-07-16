@@ -31,6 +31,7 @@ import (
 	"net/url"
 	"strings"
 
+	smithy "github.com/aws/smithy-go"
 	"gocloud.dev/blob"
 	"gocloud.dev/gcerrors"
 
@@ -224,6 +225,20 @@ func (s *BlobStore) Put(ctx context.Context, path string, r io.Reader) error {
 // [irbackup.ErrPathExists] so the caller can tell "another writer won
 // the slot" from transport failures.
 //
+// Real S3 has a SECOND loser shape (ground-truthed 2026-07-16, AWS
+// us-east-1 — the s3-cas-probe): a TRULY SIMULTANEOUS conditional-PUT
+// loser can receive 409 `ConditionalRequestConflict` instead of 412,
+// which gocloud does NOT map to FailedPrecondition — pre-fix it fell
+// through to the chain guard's degrade-WARN path, whose "the store may
+// not support conditional PUTs" wording was wrong in exactly that
+// instant. A 409 means "another conditional request on this key is in
+// flight, nothing was written": the body is buffered (conditional
+// writes are small control objects — claim markers) so the PUT is
+// retried ONCE; a clean retry means this writer won after all, and any
+// still-contended outcome (409 again, or 412 because the racer landed)
+// is a conditional-PUT LOSS → ErrPathExists, routing to the coded
+// conflict refusal, never the degrade path.
+//
 // S3-COMPATIBLE CAVEAT: providers that predate conditional writes may
 // IGNORE the If-None-Match header (silently behaving like Put) or
 // reject it with a non-412 error. The chain guard treats a non-
@@ -239,11 +254,24 @@ func (s *BlobStore) PutIfAbsent(ctx context.Context, path string, r io.Reader) e
 		return err
 	}
 	key = s.joinBlobKey(key)
+	body, err := io.ReadAll(r)
+	if err != nil {
+		return fmt.Errorf("blob store: read conditional-write body for %q: %w", path, err)
+	}
+	return conditionalPutWithConflictRetry(path, func() error {
+		return s.putIfAbsentOnce(ctx, path, key, body)
+	})
+}
+
+// putIfAbsentOnce is one conditional-PUT attempt: 412/FailedPrecondition
+// (the portable loser shape) maps to ErrPathExists; everything else is
+// returned raw for [conditionalPutWithConflictRetry] to classify.
+func (s *BlobStore) putIfAbsentOnce(ctx context.Context, path, key string, body []byte) error {
 	w, err := s.bucket.NewWriter(ctx, key, &blob.WriterOptions{IfNotExist: true})
 	if err != nil {
 		return fmt.Errorf("blob store: open conditional writer for %q: %w", path, err)
 	}
-	if _, err := io.Copy(w, r); err != nil {
+	if _, err := w.Write(body); err != nil {
 		_ = w.Close()
 		if gcerrors.Code(err) == gcerrors.FailedPrecondition {
 			return fmt.Errorf("blob store: %q: %w", path, irbackup.ErrPathExists)
@@ -257,6 +285,37 @@ func (s *BlobStore) PutIfAbsent(ctx context.Context, path string, r io.Reader) e
 		return wrapBlobErr("close conditional writer", path, err)
 	}
 	return nil
+}
+
+// conditionalPutWithConflictRetry runs one attempt, retrying a single
+// time when the failure is S3's 409 ConditionalRequestConflict (see
+// PutIfAbsent's doc comment). A second conflict-shaped failure — 409
+// again, or the 412-mapped ErrPathExists because the racing writer
+// landed — resolves to ErrPathExists: the caller lost the slot.
+// Factored free of the bucket so the routing is unit-testable without
+// a real S3 endpoint.
+func conditionalPutWithConflictRetry(path string, attempt func() error) error {
+	err := attempt()
+	if err == nil || !isConditionalRequestConflict(err) {
+		return err
+	}
+	err = attempt()
+	switch {
+	case err == nil:
+		return nil // won on retry: the conflicting racer did not land
+	case isConditionalRequestConflict(err):
+		return fmt.Errorf("blob store: %q: conditional put lost a simultaneous-writer race (S3 409 ConditionalRequestConflict, twice): %w", path, irbackup.ErrPathExists)
+	default:
+		return err // incl. the 412-mapped ErrPathExists from the attempt itself
+	}
+}
+
+// isConditionalRequestConflict reports whether err carries S3's 409
+// ConditionalRequestConflict API error code anywhere in its chain —
+// the truly-simultaneous conditional-PUT loser gocloud leaves unmapped.
+func isConditionalRequestConflict(err error) bool {
+	var apiErr smithy.APIError
+	return errors.As(err, &apiErr) && apiErr.ErrorCode() == "ConditionalRequestConflict"
 }
 
 // Get implements [irbackup.Store.Get]. Returns a streaming reader for

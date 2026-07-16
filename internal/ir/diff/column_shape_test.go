@@ -207,3 +207,126 @@ func TestTableColumnShape_SortedDeterministic(t *testing.T) {
 		t.Errorf("mismatches not sorted by column: %+v", got)
 	}
 }
+
+// TestTableColumnShape_PrimaryKeyPresence pins the M1.7 axis in BOTH
+// directions: expected-has-PK vs actual-has-none is a mismatch (named
+// via the PrimaryKeyMismatchColumn sentinel with the expected column
+// list); actual-has-PK vs expected-has-none is NOT a mismatch — it is
+// the tolerated direction surfaced separately by UnexpectedPrimaryKey.
+func TestTableColumnShape_PrimaryKeyPresence(t *testing.T) {
+	cols := func() []*ir.Column {
+		return []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "ts", Type: ir.Timestamp{}},
+			{Name: "name", Type: ir.Varchar{Length: 255}, Nullable: true},
+		}
+	}
+	withPK := shapeTable("t", intPK("id", "ts"), cols()...)
+	// The PK-less twin must declare its former PK members NOT NULL
+	// explicitly: engines force PK members NOT NULL, and the compare
+	// normalizes PK-member nullability only via EXPECTED's PK set.
+	noPKCols := cols()
+	noPK := shapeTable("t", nil, noPKCols...)
+
+	t.Run("expected PK, actual none → named mismatch", func(t *testing.T) {
+		got := TableColumnShape(withPK, noPK)
+		if len(got) != 1 || got[0].Column != PrimaryKeyMismatchColumn {
+			t.Fatalf("got %+v; want exactly the primary-key presence mismatch", got)
+		}
+		if got[0].Expected != "(id, ts)" || got[0].Actual != "none" {
+			t.Errorf("mismatch sides = %q vs %q; want \"(id, ts)\" vs \"none\"", got[0].Expected, got[0].Actual)
+		}
+	})
+
+	t.Run("actual has extra PK → tolerated, no mismatch", func(t *testing.T) {
+		if got := TableColumnShape(noPK, withPK); len(got) != 0 {
+			t.Fatalf("extra actual-side PK produced mismatches %+v; want none (tolerated with WARN)", got)
+		}
+		pk, extra := UnexpectedPrimaryKey(noPK, withPK)
+		if !extra || pk != "(id, ts)" {
+			t.Errorf("UnexpectedPrimaryKey = %q,%v; want \"(id, ts)\",true", pk, extra)
+		}
+	})
+
+	t.Run("both have PKs → no presence mismatch and no WARN", func(t *testing.T) {
+		if got := TableColumnShape(withPK, withPK); len(got) != 0 {
+			t.Fatalf("got %+v; want none", got)
+		}
+		if _, extra := UnexpectedPrimaryKey(withPK, withPK); extra {
+			t.Error("UnexpectedPrimaryKey fired with a PK on both sides")
+		}
+	})
+}
+
+// TestTableColumnShape_CharsetCompare pins the M1.6 opt-in charset/
+// collation compare across EVERY string-leaf family that carries one —
+// Char, Varchar, Text (the Bug 74 lesson: the compare dispatches per
+// type, so a green Varchar pin proves nothing about Text) — times the
+// three claim shapes: both sides resolved and conflicting (refuse-
+// worthy mismatch), one side silent (no claim → tolerated), both equal
+// (silent). Plus: the zero-value options keep charset OUT (cross-engine
+// callers unchanged), and collation participates independently.
+func TestTableColumnShape_CharsetCompare(t *testing.T) {
+	opts := ShapeCompareOptions{CompareCharset: true}
+	families := []struct {
+		name string
+		mk   func(charset, collation string) ir.Type
+	}{
+		{"char", func(cs, coll string) ir.Type { return ir.Char{Length: 8, Charset: cs, Collation: coll} }},
+		{"varchar", func(cs, coll string) ir.Type { return ir.Varchar{Length: 255, Charset: cs, Collation: coll} }},
+		{"text", func(cs, coll string) ir.Type { return ir.Text{Size: ir.TextLong, Charset: cs, Collation: coll} }},
+	}
+	table := func(typ ir.Type) *ir.Table {
+		return shapeTable("t", nil, &ir.Column{Name: "c", Type: typ, Nullable: true})
+	}
+
+	for _, fam := range families {
+		t.Run(fam.name, func(t *testing.T) {
+			utf8 := table(fam.mk("utf8mb4", "utf8mb4_0900_ai_ci"))
+			latin1 := table(fam.mk("latin1", "latin1_swedish_ci"))
+			silent := table(fam.mk("", ""))
+
+			t.Run("both resolved, conflicting → mismatch naming the charset", func(t *testing.T) {
+				got := TableColumnShapeWithOptions(utf8, latin1, opts)
+				if len(got) != 1 {
+					t.Fatalf("got %+v; want exactly one charset mismatch", got)
+				}
+				if !strings.Contains(got[0].Expected, "CHARACTER SET utf8mb4") ||
+					!strings.Contains(got[0].Actual, "CHARACTER SET latin1") {
+					t.Errorf("mismatch must name both charsets: want=%q actual=%q", got[0].Expected, got[0].Actual)
+				}
+			})
+
+			t.Run("one side silent → no claim, tolerated", func(t *testing.T) {
+				if got := TableColumnShapeWithOptions(silent, latin1, opts); len(got) != 0 {
+					t.Errorf("silent-expected vs resolved-actual mismatched: %+v", got)
+				}
+				if got := TableColumnShapeWithOptions(utf8, silent, opts); len(got) != 0 {
+					t.Errorf("resolved-expected vs silent-actual mismatched: %+v", got)
+				}
+			})
+
+			t.Run("both equal → silent", func(t *testing.T) {
+				other := table(fam.mk("utf8mb4", "utf8mb4_0900_ai_ci"))
+				if got := TableColumnShapeWithOptions(utf8, other, opts); len(got) != 0 {
+					t.Errorf("equal charsets mismatched: %+v", got)
+				}
+			})
+
+			t.Run("collation-only conflict under one charset → mismatch", func(t *testing.T) {
+				a := table(fam.mk("utf8mb4", "utf8mb4_0900_ai_ci"))
+				b := table(fam.mk("utf8mb4", "utf8mb4_general_ci"))
+				got := TableColumnShapeWithOptions(a, b, opts)
+				if len(got) != 1 || !strings.Contains(got[0].Actual, "utf8mb4_general_ci") {
+					t.Errorf("collation conflict: got %+v; want one mismatch naming the collation", got)
+				}
+			})
+
+			t.Run("zero-value options exclude charset entirely", func(t *testing.T) {
+				if got := TableColumnShape(utf8, latin1); len(got) != 0 {
+					t.Errorf("default compare included charset: %+v", got)
+				}
+			})
+		})
+	}
+}

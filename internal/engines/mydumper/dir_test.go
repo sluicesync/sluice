@@ -393,3 +393,74 @@ func TestOpenDumpDir_MetadataRowCounts(t *testing.T) {
 		}
 	})
 }
+
+// TestOpenDumpDir_ZeroChunkTableWarn pins the audit 2026-07-16 M1.4
+// zero-chunk loss net across its three shapes: a chunk-less table with
+// NO recorded count WARNs (the pscale-dump blind spot — a wholesale
+// chunk loss is indistinguishable from an empty table), one whose
+// metadata records rows > 0 WARNs naming the contradiction (the
+// mutilated-dump fixture: every chunk file deleted), and one whose
+// metadata records rows = 0 stays silent (corroborated empty — the
+// modern-mydumper noise-free shape). Never a refusal: a real empty
+// table legitimately dumps as schema-only (mydumper v1.0.3 ground
+// truth, --build-empty-files off by default).
+func TestOpenDumpDir_ZeroChunkTableWarn(t *testing.T) {
+	const marker = "NO data chunk files"
+
+	t.Run("count-less dump warns the blind spot", func(t *testing.T) {
+		dir := t.TempDir()
+		writeDumpFile(t, dir, "metadata", traditionalMetadata) // no rows= counts (the pscale-dump shape)
+		writeDumpFile(t, dir, "shop.users-schema.sql", "CREATE TABLE `users` (`id` bigint NOT NULL);")
+		logs := captureSlog(t)
+		if _, err := openDumpDir(dir); err != nil {
+			t.Fatalf("openDumpDir: %v (zero chunks is a WARN, not a refusal)", err)
+		}
+		out := logs.String()
+		if !strings.Contains(out, marker) || !strings.Contains(out, "table=users") ||
+			!strings.Contains(out, "cannot tell the difference") {
+			t.Fatalf("want the count-less zero-chunk WARN naming the table:\n%s", out)
+		}
+	})
+
+	t.Run("mutilated dump: metadata rows>0 with zero chunks warns the contradiction", func(t *testing.T) {
+		dir := t.TempDir()
+		writeDumpFile(t, dir, "metadata", "[`shop`.`users`]\nrows = 7\n")
+		writeDumpFile(t, dir, "shop.users-schema.sql", "CREATE TABLE `users` (`id` bigint NOT NULL);")
+		logs := captureSlog(t)
+		if _, err := openDumpDir(dir); err != nil {
+			t.Fatalf("openDumpDir: %v", err)
+		}
+		out := logs.String()
+		if !strings.Contains(out, marker) || !strings.Contains(out, "metadata_rows=7") ||
+			!strings.Contains(out, "missing") {
+			t.Fatalf("want the rows-recorded contradiction WARN with the count:\n%s", out)
+		}
+	})
+
+	t.Run("corroborated-empty (rows=0) is silent", func(t *testing.T) {
+		dir := t.TempDir()
+		writeDumpFile(t, dir, "metadata", "[`shop`.`users`]\nrows = 0\n")
+		writeDumpFile(t, dir, "shop.users-schema.sql", "CREATE TABLE `users` (`id` bigint NOT NULL);")
+		logs := captureSlog(t)
+		if _, err := openDumpDir(dir); err != nil {
+			t.Fatalf("openDumpDir: %v", err)
+		}
+		if strings.Contains(logs.String(), marker) {
+			t.Fatalf("zero-chunk WARN fired for a rows=0-corroborated empty table:\n%s", logs.String())
+		}
+	})
+
+	t.Run("table with chunks is silent", func(t *testing.T) {
+		dir := t.TempDir()
+		writeDumpFile(t, dir, "metadata", traditionalMetadata)
+		writeDumpFile(t, dir, "shop.users-schema.sql", "CREATE TABLE `users` (`id` bigint NOT NULL);")
+		writeDumpFile(t, dir, "shop.users.00000.sql", "INSERT INTO `users` VALUES (1);")
+		logs := captureSlog(t)
+		if _, err := openDumpDir(dir); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(logs.String(), marker) {
+			t.Fatalf("zero-chunk WARN fired for a table WITH chunks:\n%s", logs.String())
+		}
+	})
+}

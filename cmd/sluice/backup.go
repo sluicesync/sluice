@@ -101,10 +101,23 @@ func readKeyMaterial(spec string) ([]byte, error) {
 // credential resolution / network attempt — previously the exclusivity
 // check ran on the BUILT signer, after that attempt.
 func (e *EncryptionFlags) resolveWriteSigner() (*lineage.Signer, error) {
-	if e.Sign && e.SignKey != "" {
-		return nil, errors.New("--sign (HMAC-off-KEK) and --sign-key (Ed25519 / kms://) are mutually exclusive — choose one signing scheme")
+	if err := e.refuseSignSchemeConflict(); err != nil {
+		return nil, err
 	}
 	return e.buildSignKeySigner()
+}
+
+// refuseSignSchemeConflict is the single definition of the --sign +
+// --sign-key exclusivity refusal, shared by the write-side
+// (resolveWriteSigner) and maintenance-side (buildMaintenanceSigner)
+// entries so the two doors can never disagree (audit 2026-07-16 M3.2:
+// the maintenance entry previously skipped the check and silently let
+// --sign-key win).
+func (e *EncryptionFlags) refuseSignSchemeConflict() error {
+	if e.Sign && e.SignKey != "" {
+		return errors.New("--sign (HMAC-off-KEK) and --sign-key (Ed25519 / kms://) are mutually exclusive — choose one signing scheme")
+	}
+	return nil
 }
 
 // buildSignKeySigner builds the write-side signer from --sign-key, or nil
@@ -575,7 +588,13 @@ func (e *EncryptionFlags) buildSigner(ctx context.Context, store irbackup.Store)
 // flags: Ed25519 (--sign-key) takes precedence and is independent of
 // --encrypt; otherwise HMAC-off-KEK from the chain envelope. nil when
 // neither is supplied (a signed chain then refuses to compact/prune).
+// The --sign/--sign-key exclusivity refusal mirrors resolveWriteSigner,
+// and fires BEFORE any resolution — a kms:// --sign-key must never
+// reach a cloud client build under an invalid flag combo (M3.2).
 func (e *EncryptionFlags) buildMaintenanceSigner(ctx context.Context, store irbackup.Store) (*lineage.Signer, error) {
+	if err := e.refuseSignSchemeConflict(); err != nil {
+		return nil, err
+	}
 	if e.SignKey != "" {
 		return e.buildSignKeySigner()
 	}

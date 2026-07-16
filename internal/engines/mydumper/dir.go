@@ -294,7 +294,63 @@ func openDumpDir(path string) (*dumpDir, error) {
 	if err := d.parseMetadata(); err != nil {
 		return nil, err
 	}
+	// The zero-chunk loss net runs LAST so it sees the merged row counts
+	// (companion + dump-wide metadata) — the count decides which of the
+	// three shapes a chunk-less table is.
+	for _, name := range d.tableOrder {
+		warnIfTableHasNoChunks(d.tables[name])
+	}
 	return d, nil
+}
+
+// warnIfTableHasNoChunks is the zero-chunk loss net (audit 2026-07-16
+// M1.4): a table whose dump carries a schema file but NO data chunks
+// streams as EMPTY, and for a count-less dump nothing else would ever
+// say so. This is a WARN, not a refusal, because the shape is
+// legitimate: ground-truthed against real mydumper v1.0.3, an EMPTY
+// table dumps as schema-file-only — no data chunk is written unless
+// --build-empty-files — so refusing would block every dump of a schema
+// with an empty table. Three shapes:
+//
+//   - the dump's own metadata records rows = 0 → corroborated empty,
+//     silent (modern mydumper always records counts, so its dumps stay
+//     noise-free);
+//   - the metadata records rows > 0 → the dump CONTRADICTS itself: its
+//     chunk files are missing (lost/deleted) or its count is stale —
+//     WARN naming the recorded count (kept a WARN, not a refusal, per
+//     the MED-D0-2 owner decision: dump-metadata counts are a tripwire,
+//     not an oracle);
+//   - no recorded count at all → the count-less blind spot. pscale-dump
+//     NEVER records row counts (its per-table -metadata companions are
+//     empty — Bug 188 probe), so a wholesale chunk-file loss is
+//     indistinguishable from a genuinely empty table; WARN says exactly
+//     that and points at the live source. Documented in
+//     docs/operator/flat-file-sources.md.
+func warnIfTableHasNoChunks(t *tableFiles) {
+	if len(t.chunks) > 0 {
+		return
+	}
+	if t.hasMetadataRows && t.metadataRows == 0 {
+		return // the dump's own count corroborates "empty"
+	}
+	if t.hasMetadataRows {
+		slog.Warn(
+			"mydumper: table has NO data chunk files but the dump's own metadata records rows for it — "+
+				"the chunk files are missing (deleted or lost?) or the recorded count is stale; the table "+
+				"would stream as EMPTY, so verify the dump (or re-dump) before trusting this table",
+			slog.String("table", t.name),
+			slog.Int64("metadata_rows", t.metadataRows),
+		)
+		return
+	}
+	slog.Warn(
+		"mydumper: table has a schema file but NO data chunk files — it will stream as EMPTY. A truly "+
+			"empty table dumps this way (mydumper writes no data file without --build-empty-files), but a "+
+			"dump whose chunk files were all lost looks IDENTICAL, and this dump records no row count for "+
+			"the table (pscale-dump never does), so sluice cannot tell the difference — cross-check the "+
+			"live source if this table should have rows",
+		slog.String("table", t.name),
+	)
 }
 
 // warnIfChunkNumberGaps surfaces a non-contiguous chunk-number sequence,

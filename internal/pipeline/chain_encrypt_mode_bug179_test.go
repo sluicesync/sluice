@@ -14,6 +14,7 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
 	"sluicesync.dev/sluice/internal/pipeline/lineage"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // TestChainEncryptModeInheritAndRefuse_Bug179 pins the fix for Bug 179: a
@@ -195,6 +196,9 @@ func TestChainEncryptModeInheritAndRefuse_Bug179(t *testing.T) {
 				if !strings.Contains(err.Error(), "conflicts with the chain's encryption mode") {
 					t.Errorf("%s: refuse error = %q; want 'conflicts with the chain's encryption mode'", ex.name, err.Error())
 				}
+				// Coded since audit 2026-07-16 M3.1: same class as the
+				// other encryption-state conflicts.
+				assertCoded(t, err, sluicecode.CodeBackupEncryptionMismatch)
 			}
 		})
 	}

@@ -12,6 +12,7 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 	"time"
 
@@ -159,5 +160,86 @@ func TestMigrationStateStore_ReadMissingTolerated(t *testing.T) {
 	}
 	if ok {
 		t.Error("Read ok=true on missing table")
+	}
+}
+
+// TestMigrationStateStore_TimezoneProof is the audit 2026-07-16 M1.3
+// pin (the task-#44 lease-TZ class, applied to migrate-state
+// timestamps): started_at/updated_at are naive TIMESTAMP columns that
+// pgx reads back as UTC digits, so they must be WRITTEN as UTC digits
+// — timezone('utc', now()), never CURRENT_TIMESTAMP's session-TZ cast.
+// Pinned on a database whose timezone is set to America/Los_Angeles
+// (UTC-behind: pre-fix the read-back lagged real time by hours, so the
+// backfill concurrent-run heartbeat guard saw a LIVE walk as stale and
+// let a second walk interleave) AND Europe/Berlin (UTC-ahead: the
+// read-back led real time, so the guard over-refused for hours after
+// a finished run) — both skew directions, per-database GUC so every
+// pooled connection the store opens inherits it.
+func TestMigrationStateStore_TimezoneProof(t *testing.T) {
+	for _, tc := range []struct {
+		name, db, tz string
+	}{
+		{"utc-behind-server", "tz_la_db", "America/Los_Angeles"},
+		{"utc-ahead-server", "tz_berlin_db", "Europe/Berlin"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dsn, cleanup := newSharedPGDB(t, tc.db)
+			defer cleanup()
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+
+			// Skew the database's timezone BEFORE the store opens its
+			// pool: per-database GUCs apply at connection start.
+			admin, err := sql.Open("pgx", dsn)
+			if err != nil {
+				t.Fatalf("open admin: %v", err)
+			}
+			if _, err := admin.ExecContext(ctx,
+				"ALTER DATABASE "+tc.db+" SET timezone = '"+tc.tz+"'"); err != nil {
+				_ = admin.Close()
+				t.Fatalf("set database timezone: %v", err)
+			}
+			_ = admin.Close()
+
+			eng := Engine{}
+			store, err := eng.OpenMigrationStateStore(ctx, dsn)
+			if err != nil {
+				t.Fatalf("OpenMigrationStateStore: %v", err)
+			}
+			defer func() { _ = store.Close() }()
+			if err := store.EnsureControlTable(ctx); err != nil {
+				t.Fatalf("EnsureControlTable: %v", err)
+			}
+
+			// Exercise BOTH write paths: the header upsert and the
+			// per-table progress upsert (the backfill heartbeat rides on
+			// whichever is most recent).
+			state := ir.MigrationState{MigrationID: "tz-proof", Phase: ir.MigrationPhaseBulkCopy}
+			if err := store.Write(ctx, state); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			if err := store.WriteTableProgress(ctx, "tz-proof", "users",
+				ir.TableProgress{State: ir.TableProgressInProgress, RowsCopied: 1}); err != nil {
+				t.Fatalf("WriteTableProgress: %v", err)
+			}
+
+			got, ok, err := store.Read(ctx, "tz-proof")
+			if err != nil || !ok {
+				t.Fatalf("Read: ok=%v err=%v", ok, err)
+			}
+			// The heartbeat guard's exact computation: a just-written row
+			// must read as FRESH (age ≈ 0) regardless of the server TZ.
+			// Pre-fix: LA read ~+7h stale, Berlin ~-2h (in the future).
+			for _, ts := range []struct {
+				name string
+				at   time.Time
+			}{{"updated_at", got.UpdatedAt}, {"started_at", got.StartedAt}} {
+				age := time.Since(ts.at)
+				if age < -time.Minute || age > 2*time.Minute {
+					t.Errorf("%s under timezone=%s reads back with age %s; want ~0 (naive-TIMESTAMP digits must be UTC)",
+						ts.name, tc.tz, age.Round(time.Second))
+				}
+			}
+		})
 	}
 }

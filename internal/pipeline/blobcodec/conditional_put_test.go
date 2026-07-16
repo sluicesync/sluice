@@ -17,8 +17,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"testing"
+
+	smithy "github.com/aws/smithy-go"
 
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
 )
@@ -113,4 +116,83 @@ func TestBlobStore_PutIfAbsent_MemBlob(t *testing.T) {
 	}
 	defer func() { _ = store.Close() }()
 	conditionalPutContract(t, store)
+}
+
+// s3ConflictErr fabricates the wire shape a truly-simultaneous S3
+// conditional-PUT loser surfaces: a smithy APIError with code
+// ConditionalRequestConflict, wrapped the way gocloud propagates driver
+// errors (unmapped — NOT FailedPrecondition).
+func s3ConflictErr() error {
+	return fmt.Errorf("blob (key \"lineage.gen/g-1\") (code=Unknown): %w",
+		&smithy.GenericAPIError{Code: "ConditionalRequestConflict", Message: "A conflicting conditional operation is currently in progress against this resource."})
+}
+
+// TestConditionalPutConflictRetry pins the audit 2026-07-16 S3-probe
+// follow-up: S3's 409 ConditionalRequestConflict routes to the
+// CONFLICT outcome (ErrPathExists → the chain guard's coded refusal),
+// never the degrade-WARN path — with one retry, because a 409 writes
+// nothing and the racer that caused it may itself have failed.
+func TestConditionalPutConflictRetry(t *testing.T) {
+	t.Run("409 twice → ErrPathExists (conflict, not degrade)", func(t *testing.T) {
+		calls := 0
+		err := conditionalPutWithConflictRetry("p", func() error { calls++; return s3ConflictErr() })
+		if !errors.Is(err, irbackup.ErrPathExists) {
+			t.Fatalf("err = %v; want an ErrPathExists-wrapping conflict", err)
+		}
+		if calls != 2 {
+			t.Errorf("attempts = %d; want exactly 2 (one retry)", calls)
+		}
+	})
+
+	t.Run("409 then clean → won on retry", func(t *testing.T) {
+		calls := 0
+		err := conditionalPutWithConflictRetry("p", func() error {
+			calls++
+			if calls == 1 {
+				return s3ConflictErr()
+			}
+			return nil
+		})
+		if err != nil || calls != 2 {
+			t.Fatalf("err = %v calls = %d; want nil after the single retry", err, calls)
+		}
+	})
+
+	t.Run("409 then 412-mapped → ErrPathExists (the racer landed)", func(t *testing.T) {
+		calls := 0
+		err := conditionalPutWithConflictRetry("p", func() error {
+			calls++
+			if calls == 1 {
+				return s3ConflictErr()
+			}
+			return fmt.Errorf("blob store: %q: %w", "p", irbackup.ErrPathExists)
+		})
+		if !errors.Is(err, irbackup.ErrPathExists) {
+			t.Fatalf("err = %v; want ErrPathExists", err)
+		}
+	})
+
+	t.Run("non-conflict errors pass through with NO retry (the degrade class)", func(t *testing.T) {
+		calls := 0
+		sentinel := errors.New("NotImplemented: If-None-Match not supported")
+		err := conditionalPutWithConflictRetry("p", func() error { calls++; return sentinel })
+		if !errors.Is(err, sentinel) || errors.Is(err, irbackup.ErrPathExists) {
+			t.Fatalf("err = %v; want the raw error (degrade stays available for genuinely unsupporting stores)", err)
+		}
+		if calls != 1 {
+			t.Errorf("attempts = %d; want 1 (no retry for non-409 failures)", calls)
+		}
+	})
+
+	t.Run("classifier matches the code through wrapping, nothing else", func(t *testing.T) {
+		if !isConditionalRequestConflict(s3ConflictErr()) {
+			t.Error("wrapped ConditionalRequestConflict not recognised")
+		}
+		if isConditionalRequestConflict(&smithy.GenericAPIError{Code: "PreconditionFailed"}) {
+			t.Error("PreconditionFailed misclassified as the 409 conflict")
+		}
+		if isConditionalRequestConflict(errors.New("ConditionalRequestConflict")) {
+			t.Error("plain-string match must not classify (smithy APIError only)")
+		}
+	})
 }
