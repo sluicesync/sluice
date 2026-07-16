@@ -80,9 +80,14 @@ func (r *SchemaReader) SlotHealth(ctx context.Context, slotName string) (ir.Slot
 		return ir.SlotHealth{}, false, fmt.Errorf("postgres: SlotHealth: %w", err)
 	}
 
-	// lag_bytes can be NULL when restart_lsn is itself NULL (a slot
-	// that exists but hasn't been used). Treat as zero lag for the
-	// threshold path; that's accurate (nothing to retain).
+	// lag_bytes can be NULL when restart_lsn is itself NULL — a slot
+	// that exists but hasn't been used, or a slot Postgres has
+	// INVALIDATED (restart_lsn is nulled on invalidation). Treat as
+	// zero lag for the threshold path; that's accurate for the unused
+	// case (nothing to retain), and the invalidated case is dispatched
+	// on wal_status='lost' by the evaluator BEFORE any percentage math
+	// (audit MED-D0-9: percent 0 on a lost slot used to read as "clean"
+	// and emit a false "condition cleared").
 	if lagBytes.Valid {
 		h.LagBytes = lagBytes.Int64
 	}

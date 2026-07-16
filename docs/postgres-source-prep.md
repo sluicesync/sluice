@@ -181,7 +181,9 @@ A logical slot can transition through these states (visible in `pg_replication_s
 
 The transition is driven by `max_slot_wal_keep_size`: when WAL backed up by a slot exceeds that cap, the slot is marked `unreserved` and, after the next checkpoint, `lost`. The default of `-1` means "unlimited" — slots will retain WAL until disk fills, which is its own bad day. The middle ground (PlanetScale's recommendation) is `> 4GB`: gives slots room to recover from short consumer outages without letting one stuck slot fill the disk.
 
-When sluice sees a slot in `unreserved` or `lost` state, it refuses to start replication and surfaces a clear error pointing at the recovery path:
+A running sync watches these states continuously (the ADR-0059 slot-health probe, 30s cadence): `unreserved` pages **critical** immediately — invalidation lands at the next checkpoint, the last window where catching the consumer up can still save the slot — and `lost` (or the slot being dropped out from under a sync that already had a health condition outstanding) is a **terminal** critical page: it fires exactly once and then latches for the rest of the stream — no repeats, and never a "condition cleared" — because the loss is unrecoverable and the only remaining action is the re-snapshot recovery below. If the slot-health probe itself starts failing (revoked role, killed connection), sluice warns and pages after 5 consecutive probe failures rather than going silently blind.
+
+When sluice sees a slot in `unreserved` or `lost` state at startup, it refuses to start replication and surfaces a clear error pointing at the recovery path:
 
 ```
 postgres: replication slot "sluice_slot" has wal_status="lost" — required WAL has been

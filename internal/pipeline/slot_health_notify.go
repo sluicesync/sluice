@@ -57,6 +57,18 @@ func makeSlotHealthNotification(streamID string, snap ir.SlotHealth, dec slotWar
 		title = fmt.Sprintf("Replication slot under WAL retention pressure on sync %q — %.1f%% of max_slot_wal_keep_size", streamID, dec.PercentUsed)
 	case slotWarnInactive:
 		title = fmt.Sprintf("Replication slot inactive for %s on sync %q — is the consumer dead?", dec.InactiveFor.Round(time.Second), streamID)
+	case slotWarnUnreserved:
+		level = notify.LevelCritical
+		title = fmt.Sprintf("Replication slot past retention cap on sync %q — invalidation at next checkpoint", streamID)
+	case slotWarnLost:
+		// Terminal (MED-D0-9): this page fires once and latches — it is
+		// the only one the operator will get for this slot's loss.
+		level = notify.LevelCritical
+		title = fmt.Sprintf("Replication slot LOST on sync %q — re-snapshot required", streamID)
+	case slotWarnDropped:
+		// Terminal (LOW-D0-17): same once-and-latch contract as lost.
+		level = notify.LevelCritical
+		title = fmt.Sprintf("Replication slot dropped mid-stream on sync %q — CDC cannot resume", streamID)
 	}
 	return notify.Notification{
 		Level:    level,
@@ -88,6 +100,44 @@ func notifySlotHealthCrossing(ctx context.Context, notifier notify.Notifier, str
 			ctx, "slot-health alert: notify failed (advisory only, sync unaffected)",
 			slog.String("stream_id", streamID),
 			slog.String("slot", snap.SlotName),
+			slog.String("error", err.Error()),
+		)
+	}
+}
+
+// makeSlotProbeFailureNotification maps a sustained probe outage
+// (MED-D0-11 — [slotHealthProbeFailureEscalateAfter] consecutive
+// failures) into the operator-facing warning page. Pure, mirroring
+// [makeSlotHealthNotification]. Warning (not critical): the slot may be
+// perfectly healthy — what's broken is sluice's ability to watch it.
+func makeSlotProbeFailureNotification(streamID, slotName string, failures int, probeErr error, at time.Time) notify.Notification {
+	return notify.Notification{
+		Level:    notify.LevelWarning,
+		Category: notify.CategorySlotHealth,
+		StreamID: streamID,
+		Title:    fmt.Sprintf("Slot-health probe failing on sync %q — slot alerts are blind", streamID),
+		Body: fmt.Sprintf(
+			"the slot-health probe for slot %q has failed %d consecutive times (last error: %s). While the probe is failing, retention-pressure and slot-invalidation alerts CANNOT fire — check that the probe connection's role still has access to pg_replication_slots and that the network path to the source is healthy.",
+			slotName, failures, probeErr,
+		),
+		At: at,
+	}
+}
+
+// notifySlotProbeFailure delivers the MED-D0-11 probe-outage page. Same
+// contract as [notifySlotHealthCrossing]: no-op on a nil notifier, and
+// failure-isolated — a notify error is logged at WARN and SWALLOWED
+// (the probe loop rides through; the page is advisory).
+func notifySlotProbeFailure(ctx context.Context, notifier notify.Notifier, streamID, slotName string, failures int, probeErr error) {
+	if notifier == nil {
+		return
+	}
+	n := makeSlotProbeFailureNotification(streamID, slotName, failures, probeErr, time.Now())
+	if err := notifier.Notify(ctx, n); err != nil {
+		slog.WarnContext(
+			ctx, "slot-health alert: notify failed (advisory only, sync unaffected)",
+			slog.String("stream_id", streamID),
+			slog.String("slot", slotName),
 			slog.String("error", err.Error()),
 		)
 	}

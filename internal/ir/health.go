@@ -176,10 +176,12 @@ type SlotHealth struct {
 	MaxKeepSizeBytes int64
 
 	// WALStatus mirrors `pg_replication_slots.wal_status` (PG 13+). One
-	// of "reserved", "extended", "unreserved", "lost". Informational —
-	// the threshold logic doesn't depend on it, but it's useful in the
-	// WARN log line so operators can correlate sluice's view with the
-	// raw PG view.
+	// of "reserved", "extended", "unreserved", "lost". Load-bearing for
+	// the threshold evaluator: "unreserved" pages CRITICAL (invalidation
+	// lands at the next checkpoint) and "lost" is the TERMINAL page (the
+	// slot is invalidated; percentage math is meaningless there because
+	// a lost slot reports NULL lag). Also carried on every WARN log line
+	// so operators can correlate sluice's view with the raw PG view.
 	WALStatus string
 }
 

@@ -169,16 +169,37 @@ func TestObserveSchemaDriftForNotify_Gating(t *testing.T) {
 }
 
 // TestObserveSchemaDriftForNotify_FailureIsolated pins that a dead sink is
-// swallowed (never propagated — observe has no error return) and the latch
-// still advances so the failed fire is not retried into a spam loop.
+// swallowed (never propagated — observe has no error return), and — audit
+// MED-D0-10 — that the latch advances only on a DELIVERED page: a failed
+// delivery leaves the latch un-advanced so the next settle tick re-attempts,
+// and once a delivery lands the edge-once hold resumes. Pre-fix, one
+// transient sink error at the stall moment permanently swallowed the only
+// page a persistent stall gets.
 func TestObserveSchemaDriftForNotify_FailureIsolated(t *testing.T) {
 	captured := &capturingNotifier{failWith: errors.New("sink down")}
 	s := &Streamer{schemaDriftNotifierForTest: captured}
 	storeRefusal(s, errors.New("refused ... recovery: drained model"))
 
+	// Two observes against a dead sink: swallowed both times, and the
+	// delivery is RE-attempted (the latch must not advance on failure).
 	s.observeSchemaDriftForNotify(context.Background(), "s1")
 	s.observeSchemaDriftForNotify(context.Background(), "s1")
-	if captured.count() != 1 {
-		t.Fatalf("a dead sink must be attempted once and swallowed, not retried: attempts = %d", captured.count())
+	if captured.count() != 2 {
+		t.Fatalf("a failed delivery must be re-attempted on the next settle tick (MED-D0-10): attempts = %d; want 2", captured.count())
+	}
+
+	// The sink heals: the next observe delivers, advancing the latch.
+	captured.failWith = nil
+	s.observeSchemaDriftForNotify(context.Background(), "s1")
+	if captured.count() != 3 {
+		t.Fatalf("healed sink must receive the pending page: attempts = %d; want 3", captured.count())
+	}
+
+	// Delivered → edge-once hold resumes: re-observing the same refusal
+	// makes no further attempts.
+	s.observeSchemaDriftForNotify(context.Background(), "s1")
+	s.observeSchemaDriftForNotify(context.Background(), "s1")
+	if captured.count() != 3 {
+		t.Fatalf("edge-once after successful delivery violated: attempts = %d; want 3", captured.count())
 	}
 }

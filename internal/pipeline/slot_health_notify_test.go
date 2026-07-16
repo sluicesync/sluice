@@ -81,6 +81,36 @@ func TestMakeSlotHealthNotification(t *testing.T) {
 				"wal_sender_timeout", `wal_status="extended"`,
 			},
 		},
+		{
+			name:      "unreserved → critical with the next-checkpoint deadline",
+			dec:       slotWarningDecision{Kind: slotWarnUnreserved, Emit: true},
+			wantLevel: notify.LevelCritical,
+			wantTitle: []string{"app-prod", "past retention cap", "next checkpoint"},
+			wantBody: []string{
+				`slot "sluice_slot"`, "unreserved", "NEXT CHECKPOINT",
+				"raise max_slot_wal_keep_size",
+			},
+		},
+		{
+			name:      "lost → terminal critical naming the re-snapshot recovery",
+			dec:       slotWarningDecision{Kind: slotWarnLost, Emit: true},
+			wantLevel: notify.LevelCritical,
+			wantTitle: []string{"app-prod", "LOST", "re-snapshot required"},
+			wantBody: []string{
+				`slot "sluice_slot"`, "INVALIDATED", "re-snapshot",
+				"terminal", "will not repeat or clear",
+			},
+		},
+		{
+			name:      "dropped → terminal critical naming the mid-stream drop",
+			dec:       slotWarningDecision{Kind: slotWarnDropped, Emit: true},
+			wantLevel: notify.LevelCritical,
+			wantTitle: []string{"app-prod", "dropped mid-stream", "CDC cannot resume"},
+			wantBody: []string{
+				`slot "sluice_slot"`, "no longer exists",
+				"terminal", "will not repeat or clear",
+			},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -125,9 +155,12 @@ func notifyTick(t *testing.T, sink notify.Notifier, st *slotHealthState, snap ir
 
 // TestSlotHealthNotify_EdgeSemantics pins the roadmap-64a firing contract
 // against the real evaluator: a crossing fires when entered, an unchanged
-// in-condition repeat inside the rate-limit window is suppressed, a clear
-// does not page, and a cleared-then-re-entered condition re-fires — even
-// inside the original rate-limit window (the state-transition rule).
+// in-condition repeat inside the rate-limit window is suppressed, a
+// GENUINE clear (persisting past the LOW-D0-18 hysteresis tick) does not
+// page, and a cleared-then-re-entered condition re-fires — even inside
+// the original rate-limit window (the state-transition rule). A clear
+// that does NOT persist (a boundary flap) no longer re-fires on
+// re-entry; that's pinned by TestEvaluateSlotHealth_FlappingDamped.
 func TestSlotHealthNotify_EdgeSemantics(t *testing.T) {
 	captured := &capturingNotifier{}
 	t0 := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
@@ -148,8 +181,10 @@ func TestSlotHealthNotify_EdgeSemantics(t *testing.T) {
 		t.Fatalf("in-window repeat must be suppressed: fires = %d; want 1", captured.count())
 	}
 
-	// Condition clears (10%) → no page (the clear stays a slog INFO).
+	// Condition clears (10%) and PERSISTS one extra tick (the
+	// hysteresis) → no page either way (the clear stays a slog INFO).
 	notifyTick(t, captured, st, pressureSnap(10, 100), t0.Add(2*time.Minute))
+	notifyTick(t, captured, st, pressureSnap(10, 100), t0.Add(150*time.Second))
 	if captured.count() != 1 {
 		t.Fatalf("clear must not page: fires = %d; want 1", captured.count())
 	}
@@ -292,4 +327,142 @@ func TestSlotHealthProbeLoop_DeliversNotification(t *testing.T) {
 	if !strings.Contains(n.Body, `slot "sluice_slot"`) {
 		t.Errorf("Body %q should name the slot", n.Body)
 	}
+}
+
+// TestMakeSlotProbeFailureNotification pins the MED-D0-11 mapping: a
+// sustained probe outage pages a WARNING that says the net is blind,
+// names the slot, the failure count, and the underlying error.
+func TestMakeSlotProbeFailureNotification(t *testing.T) {
+	at := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	n := makeSlotProbeFailureNotification("app-prod", "sluice_slot", 5, errors.New("permission denied for view pg_replication_slots"), at)
+	if n.Level != notify.LevelWarning {
+		t.Errorf("Level = %q; want warning (the slot may be healthy — the WATCHER is broken)", n.Level)
+	}
+	if n.Category != notify.CategorySlotHealth {
+		t.Errorf("Category = %q; want slot-health", n.Category)
+	}
+	for _, want := range []string{"app-prod", "probe failing", "blind"} {
+		if !strings.Contains(n.Title, want) {
+			t.Errorf("Title %q missing %q", n.Title, want)
+		}
+	}
+	for _, want := range []string{
+		`slot "sluice_slot"`, "5 consecutive times",
+		"permission denied for view pg_replication_slots",
+		"CANNOT fire", "pg_replication_slots",
+	} {
+		if !strings.Contains(n.Body, want) {
+			t.Errorf("Body %q missing %q", n.Body, want)
+		}
+	}
+	if !n.At.Equal(at) {
+		t.Errorf("At = %v; want %v", n.At, at)
+	}
+}
+
+// TestSlotHealthProbeLoop_SustainedProbeFailureEscalates is the
+// MED-D0-11 loop pin: probe failures are DEBUG-only until
+// [slotHealthProbeFailureEscalateAfter] consecutive failures, then WARN
+// + page exactly once per outage streak; a successful probe re-arms the
+// escalation so a second outage pages again.
+func TestSlotHealthProbeLoop_SustainedProbeFailureEscalates(t *testing.T) {
+	r := &stubSlotHealthReporter{}
+	r.setErr(errors.New("role revoked"))
+	captured := &capturingNotifier{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		slotHealthProbeLoop(ctx, r, "sluice_slot", "stream-f", DefaultSlotHealthThresholds(), 5*time.Millisecond, captured)
+		close(done)
+	}()
+
+	waitFor := func(want int, what string) {
+		t.Helper()
+		deadline := time.After(5 * time.Second)
+		for captured.count() < want {
+			select {
+			case <-deadline:
+				t.Fatalf("%s: pages = %d; want %d within 5s", what, captured.count(), want)
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+	}
+
+	// First outage: exactly one page after N consecutive failures.
+	waitFor(1, "first outage")
+	n := captured.got[0]
+	if n.Level != notify.LevelWarning || n.Category != notify.CategorySlotHealth {
+		t.Errorf("outage page = %+v; want warning slot-health", n)
+	}
+	// Many more failing ticks: still one page (once per streak).
+	time.Sleep(100 * time.Millisecond)
+	if got := captured.count(); got != 1 {
+		t.Fatalf("sustained outage paged %d times; want 1 per streak", got)
+	}
+
+	// Recovery, then a second outage: the escalation re-arms and pages
+	// again.
+	r.setSnap(pressureSnap(10, 100), true)
+	time.Sleep(100 * time.Millisecond) // several successful probes reset the counter
+	r.setErr(errors.New("role revoked again"))
+	waitFor(2, "second outage")
+
+	cancel()
+	<-done
+}
+
+// TestSlotHealthProbeLoop_DroppedSlotPagesTerminalOnce is the LOW-D0-17
+// loop pin: a slot that vanishes (ok=false) while a condition is
+// outstanding pages terminal CRITICAL exactly once, and stays silent
+// afterwards — even if the reporter later shows a healthy slot again.
+func TestSlotHealthProbeLoop_DroppedSlotPagesTerminalOnce(t *testing.T) {
+	r := &stubSlotHealthReporter{}
+	r.setSnap(pressureSnap(90, 100), true) // critical retention condition
+	captured := &capturingNotifier{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		slotHealthProbeLoop(ctx, r, "sluice_slot", "stream-d", DefaultSlotHealthThresholds(), 5*time.Millisecond, captured)
+		close(done)
+	}()
+
+	waitFor := func(want int, what string) {
+		t.Helper()
+		deadline := time.After(5 * time.Second)
+		for captured.count() < want {
+			select {
+			case <-deadline:
+				t.Fatalf("%s: pages = %d; want %d within 5s", what, captured.count(), want)
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+	}
+
+	// Page 1: the 85% crossing.
+	waitFor(1, "retention crossing")
+
+	// The slot row vanishes mid-stream → page 2, terminal.
+	r.setSnap(ir.SlotHealth{}, false)
+	waitFor(2, "dropped-slot terminal")
+	n := captured.got[1]
+	if n.Level != notify.LevelCritical {
+		t.Errorf("dropped page level = %q; want critical", n.Level)
+	}
+	if !strings.Contains(n.Title, "dropped mid-stream") {
+		t.Errorf("dropped page title = %q; want the dropped-mid-stream framing", n.Title)
+	}
+
+	// Latched: further ok=false ticks — and even a reappearing healthy
+	// slot — page nothing.
+	time.Sleep(60 * time.Millisecond)
+	r.setSnap(pressureSnap(0, 100), true)
+	time.Sleep(60 * time.Millisecond)
+	if got := captured.count(); got != 2 {
+		t.Fatalf("terminal latch violated: pages = %d; want exactly 2", got)
+	}
+
+	cancel()
+	<-done
 }

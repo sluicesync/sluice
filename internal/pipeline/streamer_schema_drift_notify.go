@@ -79,7 +79,11 @@ func schemaDriftLatchDecision(pending, lastFired string) (fire bool, newLatch st
 // [phaseSettleDispatch]. It reads the pending refusal from
 // [Streamer.schemaSnapshotErr], applies the edge-once latch
 // ([schemaDriftLatchDecision]) so a retry re-observing the same refusal does
-// NOT re-fire, and re-arms when no refusal is pending.
+// NOT re-fire, and re-arms when no refusal is pending. "Once" means once
+// DELIVERED (audit MED-D0-10): the latch advances only after a successful
+// Notify, so a transiently dead sink at the stall moment doesn't
+// permanently swallow the stall's only page — delivery is re-attempted on
+// each subsequent settle tick until it lands.
 //
 // Gated (zero-value-safe): fires only when NOT SuppressSchemaDriftNotify AND
 // a sink is configured. Telemetry-independent — it never consults the
@@ -101,15 +105,19 @@ func (s *Streamer) observeSchemaDriftForNotify(ctx context.Context, streamID str
 		pendingID = pending.Error()
 	}
 	fire, newLatch := schemaDriftLatchDecision(pendingID, s.lastSchemaDriftNotified)
-	s.lastSchemaDriftNotified = newLatch
 	if !fire {
+		// HOLD (already alerted) or RE-ARM (stall cleared) — both commit
+		// the latch unconditionally; neither involves a delivery.
+		s.lastSchemaDriftNotified = newLatch
 		return
 	}
 	notifier := s.schemaDriftNotifier()
 	if notifier == nil {
 		// No sink configured — inert (the "opt in by configuring a sink"
-		// model, same as the metrics alerts). The latch has already advanced,
-		// which is fine: with no sink we never fire regardless.
+		// model, same as the metrics alerts). Advance the latch anyway:
+		// with no sink we never deliver regardless, and re-checking a
+		// pending refusal forever buys nothing.
+		s.lastSchemaDriftNotified = newLatch
 		return
 	}
 	n := makeSchemaDriftNotification(streamID, pending, time.Now())
@@ -117,12 +125,25 @@ func (s *Streamer) observeSchemaDriftForNotify(ctx context.Context, streamID str
 		// Failure isolation (load-bearing): a dead sink is logged and
 		// SWALLOWED — never propagated, never fatal. The sync is already
 		// stalled on the drift; the notification is advisory only.
+		//
+		// Audit finding MED-D0-10: the latch does NOT advance on a failed
+		// delivery. This alert is the ONLY page a persistent stall gets
+		// (every subsequent settle retry re-observes the same refusal and
+		// HOLDs), so advancing the latch before delivery let one transient
+		// sink error at the stall moment permanently swallow it. Leaving
+		// the latch un-advanced makes each settle-retry tick re-attempt
+		// delivery (each failure logged here) until one succeeds — chosen
+		// over a separate re-fire timer because it reuses the existing
+		// edge-latch shape and adds no new state or cadence to reason
+		// about; the retry cadence is the settle path's own.
 		slog.WarnContext(
-			ctx, "schema-drift alert: notify failed (advisory only, sync unaffected)",
+			ctx, "schema-drift alert: notify failed (will retry on next settle tick)",
 			slog.String("stream_id", streamID),
 			slog.String("error", err.Error()),
 		)
+		return
 	}
+	s.lastSchemaDriftNotified = newLatch
 }
 
 // schemaDriftNotifier resolves the sink set for the schema-drift alert. It
