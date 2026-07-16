@@ -68,11 +68,13 @@ func TestTableColumnShape_EqualAcrossFamilies(t *testing.T) {
 // both PK/non-PK positions pinned, plus the guard that a REAL type
 // difference on the same column still refuses.
 func TestTableColumnShape_AutoIncrementExcluded(t *testing.T) {
-	expected := shapeTable("t", intPK("id"),
+	expected := shapeTable(
+		"t", intPK("id"),
 		&ir.Column{Name: "id", Type: ir.Integer{Width: 64, AutoIncrement: true}},
 		&ir.Column{Name: "n", Type: ir.Integer{Width: 32, AutoIncrement: true}, Nullable: true},
 	)
-	actual := shapeTable("t", intPK("id"),
+	actual := shapeTable(
+		"t", intPK("id"),
 		&ir.Column{Name: "id", Type: ir.Integer{Width: 64}},
 		&ir.Column{Name: "n", Type: ir.Integer{Width: 32}, Nullable: true},
 	)
@@ -84,7 +86,8 @@ func TestTableColumnShape_AutoIncrementExcluded(t *testing.T) {
 		t.Errorf("AutoIncrement-only diff (reverse): got %+v; want empty", got)
 	}
 	// Guard: a genuine width difference on the same column still refuses.
-	narrower := shapeTable("t", intPK("id"),
+	narrower := shapeTable(
+		"t", intPK("id"),
 		&ir.Column{Name: "id", Type: ir.Integer{Width: 32}},
 		&ir.Column{Name: "n", Type: ir.Integer{Width: 32}, Nullable: true},
 	)
