@@ -31,6 +31,12 @@ const schemaFileMaxBytes = 64 << 20
 // content (comments/SET + exactly one CREATE TABLE) and parses the CREATE
 // TABLE into an IR table. file is the filename used in every error.
 func parseSchemaFile(content, file string) (*ir.Table, error) {
+	// Strip a UTF-8 BOM at file start (lossless, WARNed — the flatfile
+	// engines' posture); anywhere else it falls to the keyword-less refusal.
+	if strings.HasPrefix(content, utf8BOM) {
+		content = strings.TrimPrefix(content, utf8BOM)
+		slog.Warn("mydumper: stripped a UTF-8 byte-order mark at schema-file start", slog.String("file", file))
+	}
 	stmts, carry := splitMySQLChunk(content)
 	if rest := strings.TrimSpace(carry); rest != "" {
 		stmts = append(stmts, rest)
@@ -40,7 +46,11 @@ func parseSchemaFile(content, file string) (*ir.Table, error) {
 	for _, stmt := range stmts {
 		switch kw := statementKeyword(stmt); kw {
 		case "":
-			// comment-only fragment
+			// Skippable ONLY when pure comment/whitespace; anything else is
+			// torn/re-encoded content and refuses (audit 2026-07-15 CRITICAL-1).
+			if err := errNonSQLFragment(stmt); err != nil {
+				return nil, fmt.Errorf("mydumper: schema file %s: %w", file, err)
+			}
 		case "SET":
 			if _, err := checkSetStatement(stmt); err != nil {
 				return nil, fmt.Errorf("mydumper: schema file %s: %w", file, err)

@@ -4,6 +4,7 @@
 package mydumper
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -224,7 +225,16 @@ func processChunk(ctx context.Context, path, tableName string,
 	defer func() { _ = f.Close() }()
 
 	base := filepath.Base(path)
-	stream := newStatementStream(f, 0)
+	br := bufio.NewReader(f)
+	// Strip a UTF-8 BOM at file start (lossless, WARNed — the flatfile
+	// engines' posture). Left in place it would prefix the first statement,
+	// whose keyword would lex empty and whose INSERT would fall to the
+	// keyword-less refusal below instead of being read.
+	if head, herr := br.Peek(len(utf8BOM)); herr == nil && string(head) == utf8BOM {
+		_, _ = br.Discard(len(utf8BOM))
+		slog.Warn("mydumper: stripped a UTF-8 byte-order mark at data-chunk start", slog.String("file", base))
+	}
+	stream := newStatementStream(br, 0)
 	for {
 		if err := ctx.Err(); err != nil {
 			return sawTimeZone, err
@@ -238,7 +248,12 @@ func processChunk(ctx context.Context, path, tableName string,
 		}
 		switch kw := statementKeyword(stmt); kw {
 		case "":
-			// comment-only fragment
+			// Skippable ONLY when pure comment/whitespace; a severed INSERT
+			// tail or re-encoded bytes must refuse, not vanish (the verify
+			// count path rides this same switch — audit 2026-07-15 CRITICAL-1).
+			if err := errNonSQLFragment(stmt); err != nil {
+				return sawTimeZone, fmt.Errorf("mydumper: %s: %w", base, err)
+			}
 		case "SET":
 			sawTZ, err := checkSetStatement(stmt)
 			if err != nil {

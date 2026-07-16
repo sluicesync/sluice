@@ -224,6 +224,38 @@ func dropLine(s string) string {
 	return ""
 }
 
+// utf8BOM is the UTF-8 byte-order mark. mydumper itself never writes one,
+// but a dump re-copied through a BOM-happy editor or shell can gain it; it
+// is stripped (losslessly — a BOM is not data) at file start with a WARN,
+// the flatfile engines' posture. A BOM anywhere ELSE in a file falls to
+// [errNonSQLFragment] — left alone it would glue itself to the following
+// statement, whose keyword would lex empty.
+const utf8BOM = "\xef\xbb\xbf"
+
+// fragmentHeadBytes bounds the quoted excerpt a non-SQL-fragment refusal
+// carries: enough to recognise the offending bytes, not a log flood.
+const fragmentHeadBytes = 40
+
+// errNonSQLFragment classifies a statement whose keyword lexed empty. A
+// pure comment/whitespace fragment is legitimate — nil, skip it. Anything
+// else is content with no leading SQL keyword — a severed INSERT tail
+// (torn dump), re-encoded bytes, an unterminated comment — and MUST refuse
+// naming the bytes: the bare `case "":` skip this replaces dropped such
+// statements silently, and the verify count path rode the same skip, so
+// `verify --depth count` CONFIRMED the loss (audit 2026-07-15 CRITICAL-1).
+func errNonSQLFragment(stmt string) error {
+	frag := stripLeadingCommentsAndSpace(stmt)
+	if frag == "" {
+		return nil
+	}
+	head := frag
+	if len(head) > fragmentHeadBytes {
+		head = head[:fragmentHeadBytes] + "…"
+	}
+	return fmt.Errorf("statement fragment %q does not begin with a SQL keyword — severed INSERT "+
+		"fragment or non-SQL content (torn or re-encoded dump); re-copy the dump", head)
+}
+
 // statementKeyword returns the statement's first word, uppercased —
 // "CREATE", "SET", "INSERT", … — after comment stripping. Empty for a
 // comment-only fragment.
