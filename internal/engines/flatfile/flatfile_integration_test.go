@@ -51,13 +51,16 @@ const (
 // matrix PLUS the infer-types columns — created_at (ISO, promotes to naive
 // timestamp), synced_at (the Postgres `COPY … CSV` timestamptz rendering:
 // space separator + 2-digit UTC offset, with and without a fraction — the
-// F2 flagship input, promotes to timestamptz), meta_json (objects, promotes
-// to jsonb), user_uuid (promotes to uuid), customer_id (the cus_* case:
-// hinted but non-conforming — MUST stay text), big/dec (exact digit text in
-// a plain text column).
-const fixtureCSV = "id,name,created_at,synced_at,meta_json,user_uuid,customer_id,big,dec\n" +
-	"1,\"comma, \"\"quote\"\", and\nnewline\",2024-01-02 03:04:05,2026-07-15 08:09:10.123456+00,\"{\"\"a\"\":1}\",6dfa5e5a-2b64-4c5e-9f6a-0a2b3c4d5e6f,cus_abc123,9007199254740993,007.1500\n" +
-	"2,héllo 🚀,\\N,2026-07-14 09:08:09+02,\\N,0e984725-c51c-4bf4-9960-e1c80e27aba0,cus_def456,18446744073709551615,-0.000\n"
+// F2 flagship input, promotes to timestamptz), padded_at (zoned values with
+// a trailing space / tab — the audit-HIGH-2 shape: a whitespace tail must
+// not hide the zone from classification, which pre-fix resolved the column
+// NAIVE and silently UTC-shifted every wall clock), meta_json (objects,
+// promotes to jsonb), user_uuid (promotes to uuid), customer_id (the cus_*
+// case: hinted but non-conforming — MUST stay text), big/dec (exact digit
+// text in a plain text column).
+const fixtureCSV = "id,name,created_at,synced_at,padded_at,meta_json,user_uuid,customer_id,big,dec\n" +
+	"1,\"comma, \"\"quote\"\", and\nnewline\",2024-01-02 03:04:05,2026-07-15 08:09:10.123456+00,\"2026-07-15 08:09:10.123456+05:30 \",\"{\"\"a\"\":1}\",6dfa5e5a-2b64-4c5e-9f6a-0a2b3c4d5e6f,cus_abc123,9007199254740993,007.1500\n" +
+	"2,héllo 🚀,\\N,2026-07-14 09:08:09+02,\"2026-07-14 09:08:09+02\t\",\\N,0e984725-c51c-4bf4-9960-e1c80e27aba0,cus_def456,18446744073709551615,-0.000\n"
 
 func writeFixtureIT(t *testing.T, name, content string) string {
 	t.Helper()
@@ -228,6 +231,9 @@ func TestIntegration_CSVToPostgres(t *testing.T) {
 	if got := typeOf("synced_at"); got != "timestamp with time zone" {
 		t.Errorf("synced_at type = %q; want timestamptz (the PG-COPY zoned rendering must classify zoned)", got)
 	}
+	if got := typeOf("padded_at"); got != "timestamp with time zone" {
+		t.Errorf("padded_at type = %q; want timestamptz (a whitespace tail must not hide the zone — audit HIGH-2)", got)
+	}
 	if got := typeOf("meta_json"); got != "jsonb" {
 		t.Errorf("meta_json type = %q; want jsonb", got)
 	}
@@ -251,6 +257,13 @@ func TestIntegration_CSVToPostgres(t *testing.T) {
 		"2026-07-15 08:09:10.123456", "row1 synced_at (PG-COPY +00 rendering)")
 	wantCell(t, queryText(t, db, `SELECT to_char(synced_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') FROM people WHERE id = '2'`),
 		"2026-07-14 07:08:09.000000", "row2 synced_at (+02 offset applied, not stripped)")
+	// The padded column: the stored instant must equal the source wall clock
+	// at its offset — the pre-fix failure resolved this column NAIVE and stored
+	// the offset-shifted clock (row1 would read 02:39:10 as a naive wall time).
+	wantCell(t, queryText(t, db, `SELECT to_char(padded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') FROM people WHERE id = '1'`),
+		"2026-07-15 02:39:10.123456", "row1 padded_at (trailing space; +05:30 applied, instant exact)")
+	wantCell(t, queryText(t, db, `SELECT to_char(padded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') FROM people WHERE id = '2'`),
+		"2026-07-14 07:08:09.000000", "row2 padded_at (trailing tab; +02 applied)")
 	wantCell(t, queryText(t, db, `SELECT meta_json::text FROM people WHERE id = '1'`),
 		`{"a": 1}`, "row1 meta_json (jsonb-normalized)")
 	wantCell(t, queryText(t, db, `SELECT user_uuid::text FROM people WHERE id = '1'`),

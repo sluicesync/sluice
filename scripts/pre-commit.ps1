@@ -80,23 +80,50 @@ if ($LASTEXITCODE -ne 0) {
 # These two run in CI's Lint job; without them here, adding
 # integration-tagged tests in an uncovered package (or a tagged test
 # whose name escapes its job's -run filter) passes the full local gate
-# and only fails in CI. They are POSIX-sh scripts; Git for Windows
-# ships sh.exe, so soft-skip only if sh is genuinely absent (CI remains
-# the source of truth, same policy as the golangci-lint soft-skip).
+# and only fails in CI — exactly how the flatfile COVERED_PACKAGES miss
+# shipped to a red main (6080ee74 -> ee6468ed) while this block still
+# soft-skipped on a missing `sh`. They are POSIX-sh scripts; `sh` is
+# rarely on PATH on Windows, but Git for Windows (already a hard
+# prerequisite of a git hook) bundles it — so resolve <git-root>\bin\
+# sh.exe from git.exe's location before giving up. That wrapper is the
+# one that sets up the MSYS PATH; usr\bin\sh.exe is NOT equivalent (it
+# can't find dirname/awk/xargs and the guards fail spuriously). If sh
+# STILL cannot be found, FAIL with instructions — a silently skipped
+# CI-required guard is how the miss above reached main.
 $sh = Get-Command sh -ErrorAction SilentlyContinue
 if ($sh) {
-    & sh scripts/check-shard-coverage.sh
-    if ($LASTEXITCODE -ne 0) {
-        Red "check-shard-coverage failed (integration tests outside every CI shard)."
-        exit 1
-    }
-    & sh scripts/check-run-filter-coverage.sh
-    if ($LASTEXITCODE -ne 0) {
-        Red "check-run-filter-coverage failed (a tagged test would never run in any workflow)."
-        exit 1
-    }
+    $shExe = $sh.Source
 } else {
-    Write-Host "sh not found; skipping coverage guards (they still run in CI's Lint job)" -ForegroundColor Yellow
+    $shExe = $null
+    $git = Get-Command git -ErrorAction SilentlyContinue
+    if ($git) {
+        # git.exe lives at <root>\cmd\git.exe, <root>\bin\git.exe, or
+        # <root>\mingw64\bin\git.exe — walk up to two levels looking
+        # for the bin\sh.exe wrapper beside/above it.
+        $dir = Split-Path $git.Source -Parent
+        foreach ($root in @((Split-Path $dir -Parent), (Split-Path (Split-Path $dir -Parent) -Parent))) {
+            if (-not $root) { continue }
+            $candidate = Join-Path $root 'bin\sh.exe'
+            if (Test-Path $candidate) { $shExe = $candidate; break }
+        }
+    }
+}
+if (-not $shExe) {
+    Red "sh not found (neither on PATH nor under Git for Windows' bin\) - cannot run the CI coverage guards."
+    Write-Host "check-shard-coverage.sh and check-run-filter-coverage.sh are required CI Lint gates;"
+    Write-Host "skipping them locally is how a shard-coverage miss ships to a red main."
+    Write-Host "Install Git for Windows (bundles sh.exe) or put sh on PATH, then re-run."
+    exit 1
+}
+& $shExe scripts/check-shard-coverage.sh
+if ($LASTEXITCODE -ne 0) {
+    Red "check-shard-coverage failed (integration tests outside every CI shard)."
+    exit 1
+}
+& $shExe scripts/check-run-filter-coverage.sh
+if ($LASTEXITCODE -ne 0) {
+    Red "check-run-filter-coverage failed (a tagged test would never run in any workflow)."
+    exit 1
 }
 
 # ---- go test (fast, no DB) ----

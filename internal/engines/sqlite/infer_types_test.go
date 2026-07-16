@@ -5,7 +5,11 @@ package sqlite
 
 import (
 	"context"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
+	"unicode"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -137,39 +141,77 @@ func TestValidateInferredType_PerFamily(t *testing.T) {
 // `-02` tail is exactly the ±hh shape — the false-positive the anchored
 // globs exist to avoid, since a misclassified date column would invent a
 // zone); and a pg-style zoned value mixed with a naive one stays refused.
+//
+// Every zone spelling also has a whitespace-PADDED twin (the 2026-07-15
+// audit's HIGH-2, Bug-74 discipline: each spelling family × the padded
+// shape): the end-anchored zone globs run over the TRIMmed value, so a
+// padded tail must not hide the zone suffix and demote the column to naive
+// (which would silently UTC-shift every value at decode). Each twin uses a
+// DIFFERENT pad character — space, tab, CR, CRLF, and NBSP — so the pin also
+// covers the trim charset's Unicode breadth (wsTrimSQL == strings.TrimSpace).
 func TestValidateInferredType_ZoneSpellingMatrix(t *testing.T) {
 	r := openInferReader(
 		t, `
 		CREATE TABLE z (
-			id        INTEGER PRIMARY KEY,
-			ts_pgcopy TEXT,
-			ts_hh_t   TEXT,
-			ts_hhmm   TEXT,
-			ts_colon  TEXT,
-			ts_zulu   TEXT,
-			ts_dates  TEXT,
-			ts_mix_pg TEXT
+			id           INTEGER PRIMARY KEY,
+			ts_pgcopy    TEXT,
+			ts_hh_t      TEXT,
+			ts_hhmm      TEXT,
+			ts_colon     TEXT,
+			ts_zulu      TEXT,
+			ts_dates     TEXT,
+			ts_mix_pg    TEXT,
+			ts_pg_pad    TEXT,
+			ts_hh_t_pad  TEXT,
+			ts_hhmm_pad  TEXT,
+			ts_colon_pad TEXT,
+			ts_zulu_pad  TEXT,
+			ts_dates_pad TEXT,
+			ts_naive_pad TEXT,
+			ts_mix_pad   TEXT,
+			ts_blank     TEXT
 		)`,
 		// Row 1: the Postgres COPY CSV timestamptz rendering (space separator,
-		// fraction, 2-digit offset) and every sibling zone spelling.
-		`INSERT INTO z VALUES (1,
-			'2026-07-15 08:09:10.123456+00',
-			'2026-07-15T08:09:10.123456+02',
-			'2026-07-15 08:09:10+0530',
-			'2026-07-15T08:09:10-05:00',
-			'2026-07-15 08:09:10.123456Z',
-			'2024-01-02',
-			'2026-07-15 08:09:10+00')`,
-		// Row 2: same shapes, no-fraction / negative variants; ts_mix_pg goes
-		// naive here (the mixed refusal), ts_dates stays a bare date.
-		`INSERT INTO z VALUES (2,
-			'2026-07-14 07:08:09+00',
-			'2026-07-14T07:08:09-08',
-			'2026-07-14T07:08:09.5-0800',
-			'2026-07-14 07:08:09+05:30',
-			'2026-07-14T07:08:09Z',
-			'2024-11-30',
-			'2026-07-14 07:08:09')`,
+		// fraction, 2-digit offset), every sibling zone spelling, and the
+		// padded twins (built with Go escapes — the pad bytes are literal).
+		"INSERT INTO z VALUES (1,\n"+
+			"'2026-07-15 08:09:10.123456+00',\n"+
+			"'2026-07-15T08:09:10.123456+02',\n"+
+			"'2026-07-15 08:09:10+0530',\n"+
+			"'2026-07-15T08:09:10-05:00',\n"+
+			"'2026-07-15 08:09:10.123456Z',\n"+
+			"'2024-01-02',\n"+
+			"'2026-07-15 08:09:10+00',\n"+
+			"'2026-07-15 08:09:10.123456+00 ',\n"+ // trailing space (the audit's exact repro shape)
+			"'2026-07-15T08:09:10.123456+02\t',\n"+ // trailing tab
+			"'2026-07-15 08:09:10+0530\r',\n"+ // trailing CR (CRLF-file residue)
+			"'2026-07-15T08:09:10-05:00\r\n',\n"+ // trailing CRLF
+			"'2026-07-15 08:09:10.123456Z\u00a0',\n"+ // trailing NBSP (the Unicode-wide charset)
+			"'2024-01-02 ',\n"+
+			"'2026-07-15 08:09:10 ',\n"+
+			"'2026-07-15 08:09:10+02 ',\n"+ // padded zoned half of the mix
+			"'2026-07-15 08:09:10')",
+		// Row 2: same shapes, no-fraction / negative / leading-pad variants;
+		// ts_mix_pg and ts_mix_pad go naive here (the mixed refusal), ts_dates
+		// stays a bare date, ts_blank is ALL whitespace (trims to '' → the
+		// whole column is kept text).
+		"INSERT INTO z VALUES (2,\n"+
+			"'2026-07-14 07:08:09+00',\n"+
+			"'2026-07-14T07:08:09-08',\n"+
+			"'2026-07-14T07:08:09.5-0800',\n"+
+			"'2026-07-14 07:08:09+05:30',\n"+
+			"'2026-07-14T07:08:09Z',\n"+
+			"'2024-11-30',\n"+
+			"'2026-07-14 07:08:09',\n"+
+			"' 2026-07-14 07:08:09+00 ',\n"+ // leading AND trailing
+			"'2026-07-14T07:08:09-08\t',\n"+
+			"'2026-07-14T07:08:09.5-0800\r',\n"+
+			"'2026-07-14 07:08:09+05:30\r\n',\n"+
+			"'2026-07-14T07:08:09Z\u00a0',\n"+
+			"'\t2024-11-30',\n"+ // leading tab on the bare date
+			"'2026-07-14 07:08:09\r\n',\n"+
+			"'2026-07-14 07:08:09',\n"+ // naive half of the mix
+			"'   ')",
 	)
 
 	tsTZ := ir.Timestamp{Precision: 6, WithTimeZone: true}
@@ -186,6 +228,16 @@ func TestValidateInferredType_ZoneSpellingMatrix(t *testing.T) {
 		{"ts_zulu", true, tsTZ},     // Z, both separators
 		{"ts_dates", true, tsNaive}, // bare dates: NOT zone-classified
 		{"ts_mix_pg", false, nil},   // zoned + naive mix → kept text
+
+		{"ts_pg_pad", true, tsTZ},       // space + ±hh, space-padded → still zoned
+		{"ts_hh_t_pad", true, tsTZ},     // T + ±hh, tab-padded
+		{"ts_hhmm_pad", true, tsTZ},     // ±hhmm, CR-padded
+		{"ts_colon_pad", true, tsTZ},    // ±hh:mm, CRLF-padded
+		{"ts_zulu_pad", true, tsTZ},     // Z, NBSP-padded
+		{"ts_dates_pad", true, tsNaive}, // padded bare dates: conform, stay naive
+		{"ts_naive_pad", true, tsNaive}, // padded naive: unchanged (no invented zone)
+		{"ts_mix_pad", false, nil},      // padded-zoned + naive mix → still kept text
+		{"ts_blank", false, nil},        // an all-whitespace value conforms to nothing
 	}
 	for _, tc := range cases {
 		t.Run(tc.col, func(t *testing.T) {
@@ -203,6 +255,88 @@ func TestValidateInferredType_ZoneSpellingMatrix(t *testing.T) {
 				t.Fatalf("%s: resolved=%v want %v", tc.col, resolved, tc.wantResolved)
 			}
 		})
+	}
+}
+
+// TestValidateInferredType_PaddedValidatorDecoderParity is the end-to-end
+// audit-HIGH-2 pin: for whitespace-padded rows the validator's resolution and
+// the decoder's parse must AGREE — zoned+pad resolves TIMESTAMPTZ and decodes
+// to the source instant (pre-fix it resolved NAIVE and the decode UTC-shifted
+// the wall clock, silently, exit 0), naive+pad and bare-date+pad stay naive
+// with the wall clock intact. The decode leg runs the promoted column's raw
+// PADDED text through the REAL decoder (decodeCell, iso encoding) under the
+// exact type the validator resolved.
+func TestValidateInferredType_PaddedValidatorDecoderParity(t *testing.T) {
+	tsTZ := ir.Timestamp{Precision: 6, WithTimeZone: true}
+	tsNaive := ir.Timestamp{Precision: 6, WithTimeZone: false}
+	rows := []struct {
+		col          string
+		raw          string
+		wantResolved ir.Timestamp
+		wantInstant  time.Time
+	}{
+		// +05:30 with a trailing space: the instant is the wall clock MINUS
+		// the offset. A naive mis-resolution would store 02:39 as the wall
+		// clock — the 5.5-hour silent shift this test exists to catch.
+		{
+			"zoned_pad", "2026-07-15 08:09:10.123456+05:30 ", tsTZ,
+			time.Date(2026, 7, 15, 2, 39, 10, 123456000, time.UTC),
+		},
+		{
+			"naive_pad", "2026-07-15 08:09:10\t", tsNaive,
+			time.Date(2026, 7, 15, 8, 9, 10, 0, time.UTC),
+		},
+		{
+			"date_pad", "2026-07-15\r\n", tsNaive,
+			time.Date(2026, 7, 15, 0, 0, 0, 0, time.UTC),
+		},
+	}
+
+	r := openInferReader(
+		t,
+		`CREATE TABLE p (id INTEGER PRIMARY KEY, zoned_pad TEXT, naive_pad TEXT, date_pad TEXT)`,
+		"INSERT INTO p VALUES (1, '"+rows[0].raw+"', '"+rows[1].raw+"', '"+rows[2].raw+"')",
+	)
+	for _, tc := range rows {
+		t.Run(tc.col, func(t *testing.T) {
+			conforms, resolved, _, err := r.ValidateInferredType(context.Background(), "p", tc.col, ir.Timestamp{})
+			if err != nil {
+				t.Fatalf("ValidateInferredType(%s): %v", tc.col, err)
+			}
+			if !conforms || resolved != tc.wantResolved {
+				t.Fatalf("%s: conforms=%v resolved=%v; want true/%v", tc.col, conforms, resolved, tc.wantResolved)
+			}
+			// The decoder half of the parity: the same padded raw text, decoded
+			// under the resolved type, must land the expected instant.
+			got, err := decodeCell(tc.raw, resolved, dateEncodingISO)
+			if err != nil {
+				t.Fatalf("%s: decoder refused the value the validator blessed: %v", tc.col, err)
+			}
+			tm, ok := got.(time.Time)
+			if !ok {
+				t.Fatalf("%s: decoded %T; want time.Time", tc.col, got)
+			}
+			if !tm.Equal(tc.wantInstant) {
+				t.Fatalf("%s: decoded instant %v; want %v (validator promised %v)", tc.col, tm.UTC(), tc.wantInstant, resolved)
+			}
+		})
+	}
+}
+
+// TestWSTrimSQL pins the validator's SQL trim charset to EXACTLY the set
+// strings.TrimSpace trims (unicode.IsSpace) — the validator==decoder
+// whitespace parity is by construction, and this fails if either side ever
+// drifts (a validator trimming LESS re-opens the padded-zone UTC shift; one
+// trimming MORE promises values the decoder then refuses).
+func TestWSTrimSQL(t *testing.T) {
+	var cps []string
+	for r := rune(0); r <= unicode.MaxRune; r++ {
+		if unicode.IsSpace(r) {
+			cps = append(cps, strconv.Itoa(int(r)))
+		}
+	}
+	if want := "char(" + strings.Join(cps, ",") + ")"; wsTrimSQL != want {
+		t.Fatalf("wsTrimSQL = %s; want %s", wsTrimSQL, want)
 	}
 }
 

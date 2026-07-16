@@ -7,7 +7,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"unicode"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -64,6 +66,10 @@ const (
 	// invented-zone hazard). It is therefore anchored to follow a time:
 	// directly after the seconds (`*:SS±HH`) or after a fractional part
 	// (`*.…±HH`), which no naive/date value can match.
+	//
+	// All of these are END-ANCHORED, so every temporal GLOB is evaluated over
+	// the whitespace-TRIMmed column (see wsTrimSQL) — a padded tail must not
+	// hide the zone suffix from classification (the 2026-07-15 audit HIGH-2).
 	offsetGlob            = `*[+-][0-9][0-9]:[0-9][0-9]`
 	offsetHHMMGlob        = `*[+-][0-9][0-9][0-9][0-9]`
 	offsetHHAfterSecsGlob = `*:[0-9][0-9][+-][0-9][0-9]`
@@ -91,6 +97,48 @@ func buildUUIDGlob() string {
 	const h = `[0-9a-fA-F]`
 	seg := func(n int) string { return strings.Repeat(h, n) }
 	return seg(8) + "-" + seg(4) + "-" + seg(4) + "-" + seg(4) + "-" + seg(12)
+}
+
+// wsTrimSQL is the SQL fragment `char(9,10,…)` holding EVERY Unicode
+// White_Space code point — the trim charset the temporal GLOBs run under.
+// The zone-classification globs above are end-anchored, and the decoder
+// (parseISOTemporal, value_decode.go) strings.TrimSpace's the raw text before
+// layout matching — so classifying the RAW column while decoding the TRIMMED
+// one let a whitespace tail hide the zone suffix from the validator: a column
+// where EVERY value was `…+05:00␠` counted as all-naive (the mixed refusal
+// never fired), promoted to naive timestamp, and the decoder then parsed the
+// offset and stored the instant UTC-SHIFTED — a silent wall-clock change (the
+// 2026-07-15 audit's HIGH-2). The fix: every temporal GLOB runs over
+// TRIM(col, wsTrimSQL) so classification and decoding see the same bytes.
+//
+// The charset is built from Go's own unicode.White_Space table (exactly what
+// strings.TrimSpace trims), NOT a hand-picked ` \t\r\n` — a validator that
+// trims LESS than the decoder re-opens the shift for an exotic space (NBSP,
+// U+2028, …), and one that trims MORE promises what the decoder then refuses.
+// TestWSTrimSQL pins the two sets equal. SQLite's TRIM(X, Y) strips any
+// characters in Y from both ends of X (UTF-8-aware, and identical on D1), and
+// char(…) assembles the set without embedding raw control bytes in the SQL.
+var wsTrimSQL = buildWSTrimSQL()
+
+func buildWSTrimSQL() string {
+	var cps []string
+	for _, r := range unicode.White_Space.R16 {
+		for c := uint32(r.Lo); c <= uint32(r.Hi); c += uint32(r.Stride) {
+			cps = append(cps, strconv.FormatUint(uint64(c), 10))
+		}
+	}
+	for _, r := range unicode.White_Space.R32 {
+		for c := r.Lo; c <= r.Hi; c += r.Stride {
+			cps = append(cps, strconv.FormatUint(uint64(c), 10))
+		}
+	}
+	return "char(" + strings.Join(cps, ",") + ")"
+}
+
+// trimmedTemporal renders the whitespace-trimmed view of an already-quoted
+// column — the operand every temporal GLOB must run over (see wsTrimSQL).
+func trimmedTemporal(qc string) string {
+	return "TRIM(" + qc + ", " + wsTrimSQL + ")"
 }
 
 // ValidateInferredType implements [ir.InferredTypeValidator] for the file
@@ -216,9 +264,15 @@ func validateInferredType(
 func validateInferredTimestamp(
 	ctx context.Context, count scalarCounter, qt, qc string, total int64,
 ) (conforms bool, resolved ir.Type, validated int64, err error) {
+	// tqc is the whitespace-trimmed view of the column. Every GLOB below runs
+	// over it so the validator classifies exactly the bytes the decoder will
+	// parse (parseISOTemporal TrimSpaces first) — see wsTrimSQL for the padded
+	// `…+05:00␠` silent-shift this closes.
+	tqc := trimmedTemporal(qc)
+
 	bad, err := count(ctx, fmt.Sprintf(
 		"SELECT COUNT(*) AS n FROM %s WHERE %s IS NOT NULL AND NOT (%s GLOB '%s' OR %s GLOB '%s')",
-		qt, qc, qc, isoDateGlob, qc, isoDateTimeGlob,
+		qt, qc, tqc, isoDateGlob, tqc, isoDateTimeGlob,
 	))
 	if err != nil {
 		return false, nil, 0, err
@@ -234,7 +288,7 @@ func validateInferredTimestamp(
 	noOffset, err := count(ctx, fmt.Sprintf(
 		"SELECT COUNT(*) AS n FROM %s WHERE %s IS NOT NULL AND NOT (%s GLOB '%s' OR %s GLOB '%s' OR %s GLOB '%s' OR %s GLOB '%s' OR %s GLOB '%s')",
 		qt, qc,
-		qc, offsetGlob, qc, offsetHHMMGlob, qc, offsetHHAfterSecsGlob, qc, offsetHHAfterFracGlob, qc, zuluGlob,
+		tqc, offsetGlob, tqc, offsetHHMMGlob, tqc, offsetHHAfterSecsGlob, tqc, offsetHHAfterFracGlob, tqc, zuluGlob,
 	))
 	if err != nil {
 		return false, nil, 0, err
@@ -245,7 +299,9 @@ func validateInferredTimestamp(
 	// store them UTC-SHIFTED — a silent wall-clock change (e.g. `+05:00` lands 5h
 	// off) — while a timestamptz resolution would invent a zone for the naive
 	// ones. Neither is faithful, so the column is kept as text. (An offset value
-	// can ONLY reach a naive-resolved column via this mixed case, so refusing it
+	// can ONLY reach a naive-resolved column via this mixed case — the zone
+	// GLOBs run over the TRIMmed value, so a padded `…+05:00␠` classifies zoned
+	// like the decoder parses it, never naive (audit HIGH-2) — so refusing it
 	// closes the silent-shift path: all-offset stays timestamptz [instant exact],
 	// all-naive stays timestamp [wall-clock exact].)
 	if noOffset != 0 && noOffset != total {
@@ -257,7 +313,7 @@ func validateInferredTimestamp(
 	// Keep such a column as text rather than round.
 	subMicro, err := count(ctx, fmt.Sprintf(
 		"SELECT COUNT(*) AS n FROM %s WHERE %s IS NOT NULL AND %s GLOB '%s'",
-		qt, qc, qc, subMicroFracGlob,
+		qt, qc, tqc, subMicroFracGlob,
 	))
 	if err != nil {
 		return false, nil, 0, err
