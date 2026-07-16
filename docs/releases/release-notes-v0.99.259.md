@@ -1,5 +1,7 @@
 # sluice v0.99.259
 
+> **Correction (2026-07-16, same day):** two of this release's claims were falsified by its own regression cycle within hours. (1) The statement-stream speedup below was measured at the splitter layer and did NOT materialize end-to-end — the value decoder one layer down kept the pipeline quadratic (Bug 191; the pipeline-level fix shipped in v0.99.261, where the same 49 MiB shape drops from ~342s to ~2.3s). (2) The `--planetscale-org` reconciliation's "fallback-only arming no longer trips the telemetry refusal" contract did not hold off-planetscale (Bug 192; fixed in v0.99.261). Everything else stands.
+
 The audit's performance batch plus its two remaining leverage items: fallback mode-parity and an independent-reader gate for the parquet boundary.
 
 ## Added
